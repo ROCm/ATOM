@@ -1,24 +1,23 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Per-process lifecycle of opt-in aiter in-tree ops that own their dispatch.
+"""Per-process lifecycle of opt-in aiter ops served through aiter providers.
 
-Such an op is a neutral aiter op (one public entry, aiter's own fused /
-native dispatch inside); ATOM's part is the policy and its timing:
+ATOM's part is the policy and its timing (``aiter.plugin``; see
+:mod:`atom.aiter_provider`):
 
 * :func:`configure_aiter_fused_ops` -- called by ``ModelRunner.__init__``
   after ``_setup_device_and_distributed()`` and before
   ``_build_and_load_model()``, i.e. before any model layer is built, any
-  warm-up forward, KV allocation or CUDA-graph capture. It hands each enabled
-  op's ``Config`` policy to aiter (``aiter.ops.<op>.configure``) and logs one
-  startup line. Default off: nothing imported.
+  warm-up forward, KV allocation or CUDA-graph capture: enables the configured
+  providers (``aiter.plugin.configure``), then sets up each opt-in call site
+  that an enabled provider serves. Default off: nothing imported.
 * :func:`prewarm_aiter_fused_ops` -- called after the KV cache is allocated
-  and bound, before CUDA-graph capture: aiter builds the kernel variants the
-  bound caches can select.
+  and bound, before CUDA-graph capture: the providers warm up (compile / load)
+  what the bound caches can select.
 
-Both never raise: an aiter without the op's lifecycle API keeps ATOM's own
-implementation, logged once. Not ``atom/plugin/`` (ATOM's vLLM/SGLang/rtp-llm
-frontend adapter) and not ``aiter.plugin`` (aiter's out-of-tree provider
-interface, unused here).
+Both never raise: an aiter without the interface / routed op, or a missing
+provider, keeps ATOM's own implementation, logged once. Not ``atom/plugin/``
+(ATOM's vLLM/SGLang/rtp-llm frontend adapter).
 """
 
 from __future__ import annotations
@@ -30,7 +29,8 @@ logger = logging.getLogger("atom")
 
 def _qsa_index_scorer_active(config) -> bool:
     cfg = getattr(config, "qsa_index_scorer", None)
-    return cfg is not None and bool(getattr(cfg, "active", False))
+    observed = cfg is not None and bool(getattr(cfg, "active", False))
+    return observed or bool(getattr(config, "aiter_provider_enable", ()))
 
 
 def configure_aiter_fused_ops(config, rank_name: str = "") -> dict:
@@ -40,6 +40,10 @@ def configure_aiter_fused_ops(config, rank_name: str = "") -> dict:
     off: nothing imported). Never raises.
     """
     out: dict = {}
+    if getattr(config, "aiter_provider_enable", ()):
+        from atom.aiter_provider import configure_aiter_providers
+
+        out["aiter_providers"] = configure_aiter_providers(config, rank_name)
     if _qsa_index_scorer_active(config):
         try:
             from atom.model_ops.qwen4_exp.qsa_index_scorer import configure

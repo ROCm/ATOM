@@ -1,5 +1,17 @@
 # QSA index scorer: aiter's neutral op `aiter.ops.qsa.qsa_paged_mqa_logits` (Qwen3.8-Flash-Next)
 
+> **Provider route (this branch).** The scorer is enabled by `--aiter-provider-enable
+> qsa-index-scorer-provider` (`Config.aiter_provider_enable`, env
+> `ATOM_AITER_PROVIDER_ENABLE`): every worker calls `aiter.plugin.configure(source="atom
+> <version>", enable=[...])` in `ModelRunner.__init__` before the model is built; when an enabled
+> provider declares aiter's routed op `qsa_paged_mqa_logits` and this aiter routes it, the
+> indexer scores through `aiter.ops.qsa.qsa_paged_mqa_logits` (provider on the classes it
+> covers, aiter native otherwise; ATOM adds no fallback). After KV allocation and before
+> CUDA-graph capture ATOM calls the provider's `warmup(payload, device=...)` once per bound
+> index-cache layout. `--qsa-index-scorer-capture` asks `aiter.plugin.explain` once per class.
+> `--qsa-index-scorer-profile`, `ATOM_QSA_INDEX_SCORER_PROFILE` and `aiter.ops.qsa.configure /
+> prewarm / status` are gone (the profile is the provider's). The sections below still describe
+> the previous in-tree revision and are to be rewritten.
 The Qwen QSA indexer scores compressed key groups with ATOM's own
 `qsa_paged_mqa_logits` (`atom/model_ops/qwen4_exp/ops/qsa.py`, unchanged: the
 frozen golden reference, sha256 `c2e46e50…` LF / `aaa78f43…` CRLF). With

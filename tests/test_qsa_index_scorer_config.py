@@ -1,65 +1,44 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""CPU tests: QSA index scorer config + CLI + env switch (default OFF, hash-neutral)."""
+"""CPU tests: aiter provider enablement + QSA scorer observer config, CLI and env
+(default OFF, hash-neutral)."""
 
 from __future__ import annotations
 
 import argparse
-import ast
 import dataclasses
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from atom.aiter_provider import normalize_provider_names
 from atom.config import Config, QSAIndexScorerConfig
 
-ROOT = Path(__file__).resolve().parents[1]
+PROVIDER = "qsa-index-scorer-provider"
 
 
 def test_default_off():
     cfg = QSAIndexScorerConfig()
-    assert cfg.profile == "" and cfg.capture == ""
-    assert not cfg.enabled and not cfg.active
-    assert cfg.hash_factors() == []
-
-
-def test_config_field_defaults_off():
-    f = {x.name: x for x in dataclasses.fields(Config)}["qsa_index_scorer"]
-    assert f.default_factory() == QSAIndexScorerConfig()
-
-
-def test_enabled_profile_keys_hash_capture_does_not():
-    on = QSAIndexScorerConfig(profile="qsa_page4_gfx1250_v1")
-    assert on.enabled and on.active
-    assert on.hash_factors() == [("qsa_index_scorer", "qsa_page4_gfx1250_v1")]
-    cap = QSAIndexScorerConfig(capture="/tmp/cap.json")
-    assert cap.active and not cap.enabled and cap.hash_factors() == []
-
-
-def test_profile_validation():
-    assert QSAIndexScorerConfig(profile=" /x/y/p.json ").profile == "/x/y/p.json"
-    with pytest.raises(ValueError):
-        QSAIndexScorerConfig(profile="bad name;rm")
+    assert cfg.capture == "" and not cfg.active
+    assert QSAIndexScorerConfig(capture=" /tmp/c.json ").capture == "/tmp/c.json"
     with pytest.raises(ValueError, match="Unknown qsa_index_scorer"):
-        QSAIndexScorerConfig.from_dict({"profle": "x"})
+        QSAIndexScorerConfig.from_dict({"profile": "x"})  # the old knob is gone
     assert QSAIndexScorerConfig.from_dict(None) == QSAIndexScorerConfig()
 
 
-def test_compute_hash_extends_only_hash_factors():
-    """compute_hash appends the scorer factors via hash_factors() (empty when OFF)."""
-    src = (ROOT / "atom" / "config.py").read_text(encoding="utf-8")
-    tree = ast.parse(src)
-    cls = next(
-        n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Config"
-    )
-    fn = next(
-        n
-        for n in cls.body
-        if isinstance(n, ast.FunctionDef) and n.name == "compute_hash"
-    )
-    body = ast.unparse(fn)
-    assert "factors.extend(qsa_index_scorer.hash_factors())" in body
+def test_config_fields_default_off():
+    f = {x.name: x for x in dataclasses.fields(Config)}
+    assert f["qsa_index_scorer"].default_factory() == QSAIndexScorerConfig()
+    assert f["aiter_provider_enable"].default == ()
+
+
+def test_normalize_provider_names():
+    assert normalize_provider_names(None) == ()
+    assert normalize_provider_names("") == ()
+    assert normalize_provider_names(" a, b ,a,,") == ("a", "b")
+    assert normalize_provider_names(["b", "a", "b"]) == ("b", "a")
+    with pytest.raises(TypeError):
+        normalize_provider_names([1])
 
 
 def _hash(**overrides):
@@ -86,54 +65,57 @@ def _hash(**overrides):
 
 
 def test_hash_unchanged_when_off_keyed_when_on():
-    base = _hash()  # a config without the field, i.e. the pre-feature hash
-    assert _hash(qsa_index_scorer=QSAIndexScorerConfig()) == base
+    base = _hash()  # a config without the fields, i.e. the pre-feature hash
+    assert _hash(aiter_provider_enable=()) == base
     assert _hash(qsa_index_scorer=QSAIndexScorerConfig(capture="/tmp/c.json")) == base
-    on = _hash(qsa_index_scorer=QSAIndexScorerConfig(profile="qsa_page4_gfx1250_v1"))
+    on = _hash(aiter_provider_enable=(PROVIDER,))
     assert on != base
-    other = _hash(qsa_index_scorer=QSAIndexScorerConfig(profile="other_profile"))
+    other = _hash(aiter_provider_enable=("other", PROVIDER))
     assert other not in (on, base)
 
 
-def test_cli_flags_round_trip():
+def _engine_args():
     try:
         from atom.model_engine.arg_utils import EngineArgs
     except Exception as exc:  # noqa: BLE001 -- engine deps (zmq, aiter) absent
         pytest.skip(f"arg_utils not importable: {exc!r}")
+    return EngineArgs
+
+
+def test_cli_flags_round_trip(monkeypatch):
+    EngineArgs = _engine_args()
+    monkeypatch.delenv("ATOM_AITER_PROVIDER_ENABLE", raising=False)
     parser = EngineArgs.add_cli_args(argparse.ArgumentParser())
     off = EngineArgs.from_cli_args(parser.parse_args([]))
-    assert off.qsa_index_scorer_profile == "" and off.qsa_index_scorer_capture == ""
+    assert off.aiter_provider_enable == "" and off.qsa_index_scorer_capture == ""
     kw = off._get_engine_kwargs()
     assert kw["qsa_index_scorer"] == QSAIndexScorerConfig()
-    assert "qsa_index_scorer_profile" not in kw and "qsa_index_scorer_capture" not in kw
+    assert kw["aiter_provider_enable"] == ()
+    assert "qsa_index_scorer_capture" not in kw
     on = EngineArgs.from_cli_args(
         parser.parse_args(
             [
-                "--qsa-index-scorer-profile",
-                "qsa_page4_gfx1250_v1",
+                "--aiter-provider-enable",
+                f"{PROVIDER},other",
                 "--qsa-index-scorer-capture",
                 "/tmp/c_{rank}.json",
             ]
         )
     )
     kw = on._get_engine_kwargs()
-    assert kw["qsa_index_scorer"] == QSAIndexScorerConfig(
-        profile="qsa_page4_gfx1250_v1", capture="/tmp/c_{rank}.json"
-    )
+    assert kw["aiter_provider_enable"] == (PROVIDER, "other")
+    assert kw["qsa_index_scorer"] == QSAIndexScorerConfig(capture="/tmp/c_{rank}.json")
 
 
 def test_env_override_only_when_flag_absent(monkeypatch):
-    try:
-        from atom.model_engine.arg_utils import EngineArgs
-    except Exception as exc:  # noqa: BLE001 -- engine deps (zmq, aiter) absent
-        pytest.skip(f"arg_utils not importable: {exc!r}")
+    EngineArgs = _engine_args()
     parser = EngineArgs.add_cli_args(argparse.ArgumentParser())
-    monkeypatch.delenv("ATOM_QSA_INDEX_SCORER_PROFILE", raising=False)
+    monkeypatch.delenv("ATOM_AITER_PROVIDER_ENABLE", raising=False)
     kw = EngineArgs.from_cli_args(parser.parse_args([]))._get_engine_kwargs()
-    assert not kw["qsa_index_scorer"].enabled
-    monkeypatch.setenv("ATOM_QSA_INDEX_SCORER_PROFILE", "qsa_page4_gfx1250_v1")
+    assert kw["aiter_provider_enable"] == ()
+    monkeypatch.setenv("ATOM_AITER_PROVIDER_ENABLE", PROVIDER)
     kw = EngineArgs.from_cli_args(parser.parse_args([]))._get_engine_kwargs()
-    assert kw["qsa_index_scorer"].profile == "qsa_page4_gfx1250_v1"
-    flag = parser.parse_args(["--qsa-index-scorer-profile", "other_profile"])
+    assert kw["aiter_provider_enable"] == (PROVIDER,)
+    flag = parser.parse_args(["--aiter-provider-enable", "other"])
     kw = EngineArgs.from_cli_args(flag)._get_engine_kwargs()
-    assert kw["qsa_index_scorer"].profile == "other_profile"  # the flag wins
+    assert kw["aiter_provider_enable"] == ("other",)  # the flag wins

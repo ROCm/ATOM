@@ -7,6 +7,7 @@ import logging
 from dataclasses import dataclass, fields
 
 from atom import LLMEngine
+from atom.aiter_provider import normalize_provider_names
 from atom.config import (
     CompilationConfig,
     CUDAGraphMode,
@@ -189,7 +190,7 @@ class EngineArgs:
     eplb_enable: bool = False
     eplb_config: dict | None = None
     dcp_config: dict | None = None
-    qsa_index_scorer_profile: str = ""
+    aiter_provider_enable: str = ""
     qsa_index_scorer_capture: str = ""
 
     @staticmethod
@@ -857,22 +858,22 @@ class EngineArgs:
                 """"biased"}'"""
             ),
         )
-        qsa_group = parser.add_argument_group("QSA index scorer options")
-        qsa_group.add_argument(
-            "--qsa-index-scorer-profile",
+        provider_group = parser.add_argument_group("aiter kernel providers")
+        provider_group.add_argument(
+            "--aiter-provider-enable",
             type=str,
             default="",
             help=(
-                "Score the Qwen QSA indexer with aiter's op "
-                "aiter.ops.qsa.qsa_paged_mqa_logits, configured with this "
-                "profile name or JSON path (e.g. qsa_page4_gfx1250_v1): aiter "
-                "runs its fused kernel on the call classes the profile covers "
-                "and its native paths on the rest. Default empty = OFF "
-                "(nothing imported, ATOM's own scorer); when absent, "
-                "$ATOM_QSA_INDEX_SCORER_PROFILE is used. See "
-                "docs/qsa_index_scorer.md."
+                "Comma-separated out-of-tree aiter kernel providers to enable "
+                "(aiter.plugin.configure(enable=[...]), preference order), e.g. "
+                "qsa-index-scorer-provider. Default empty = OFF (nothing "
+                "imported; aiter's routed ops run native). When absent, "
+                "$ATOM_AITER_PROVIDER_ENABLE is used. A provider declaring "
+                "qsa_paged_mqa_logits also moves the Qwen QSA indexer onto "
+                "aiter.ops.qsa.qsa_paged_mqa_logits. See docs/qsa_index_scorer.md."
             ),
         )
+        qsa_group = parser.add_argument_group("QSA index scorer options")
         qsa_group.add_argument(
             "--qsa-index-scorer-capture",
             type=str,
@@ -884,8 +885,8 @@ class EngineArgs:
                 "({rank}/{pid} placeholders allowed) for the coverage matrix "
                 "and aiter gen_profile --plan-file, and log per-path call "
                 "counts at exit. Off by default (no wrapper installed). "
-                "Without --qsa-index-scorer-profile it observes ATOM's own "
-                "scorer."
+                "Without an enabled provider for qsa_paged_mqa_logits it "
+                "observes ATOM's own scorer."
             ),
         )
 
@@ -986,15 +987,16 @@ class EngineArgs:
         # --dcp-config (JSON dict) → DCPConfig object, passed through as
         # Config.dcp_config.
         kwargs["dcp_config"] = DCPConfig.from_dict(kwargs.pop("dcp_config"))
-        # --qsa-index-scorer-{profile,capture} → QSAIndexScorerConfig, passed
-        # through as Config.qsa_index_scorer (default OFF). An absent flag takes
-        # the operator override ATOM_QSA_INDEX_SCORER_PROFILE, read once here.
-        qsa_profile = (kwargs.pop("qsa_index_scorer_profile", "") or "").strip()
+        # --qsa-index-scorer-capture → QSAIndexScorerConfig (default OFF).
         kwargs["qsa_index_scorer"] = QSAIndexScorerConfig.from_dict(
-            {
-                "profile": qsa_profile or envs.ATOM_QSA_INDEX_SCORER_PROFILE,
-                "capture": kwargs.pop("qsa_index_scorer_capture", ""),
-            }
+            {"capture": kwargs.pop("qsa_index_scorer_capture", "")}
+        )
+        # --aiter-provider-enable → Config.aiter_provider_enable (tuple, default
+        # OFF). An absent flag takes the operator override
+        # ATOM_AITER_PROVIDER_ENABLE, read once here.
+        providers = (kwargs.pop("aiter_provider_enable", "") or "").strip()
+        kwargs["aiter_provider_enable"] = normalize_provider_names(
+            providers or envs.ATOM_AITER_PROVIDER_ENABLE
         )
 
         # DP topology -> ParallelConfig. `data_parallel_size` stays in kwargs

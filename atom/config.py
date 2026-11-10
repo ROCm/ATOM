@@ -1784,64 +1784,35 @@ class EPLBConfig:
         return cls(**cfg)
 
 
-_QSA_INDEX_SCORER_PROFILE_NAME = re.compile(r"[A-Za-z0-9_.\-]+")
-
-
 @dataclass
 class QSAIndexScorerConfig:
-    """Opt-in scoring of the Qwen QSA indexer by aiter's neutral op.
+    """Observability of the Qwen QSA indexer scorer (debug / coverage only).
 
-    OFF by default. With ``profile`` empty nothing is imported, the indexer
-    calls ATOM's own ``qsa_paged_mqa_logits`` through the stock
-    ``qsa_select_paged_tokens``, and the config hash is unchanged.
+    The scorer itself is chosen by ``Config.aiter_provider_enable``: when an
+    enabled aiter provider declares aiter's routed op ``qsa_paged_mqa_logits``
+    (e.g. ``qsa-index-scorer-provider``) and this aiter routes it, the indexer
+    scores through ``aiter.ops.qsa.qsa_paged_mqa_logits`` (the provider serves the
+    call classes it covers, aiter's native paths the rest; ATOM adds no fallback).
+    Otherwise ATOM's own scorer runs.
 
     Fields:
-      - profile: aiter QSA profile name (e.g. ``qsa_page4_gfx1250_v1``) or a
-        path to a profile JSON. Each worker process hands it to aiter once,
-        ``aiter.ops.qsa.configure(profile=..., source="atom:...")``, before
-        the model is built; the indexer then scores through
-        ``aiter.ops.qsa.qsa_paged_mqa_logits``, which runs its fused kernel
-        on the call classes the profile covers and aiter's native paths on
-        the rest (ATOM adds no fallback). An aiter without
-        ``aiter.ops.qsa.configure`` keeps ATOM's own scorer (logged once).
-      - capture: debug/coverage only. Path of a JSON file that receives every
-        scorer call class (shapes, dtypes, strides, buckets, cache layouts,
-        rank, and ``aiter.ops.qsa.explain()``'s path) for the coverage matrix
-        and aiter's ``gen_profile --plan-file``. May hold ``{rank}`` /
-        ``{pid}``; without them ``.rank<r>.pid<p>`` is appended. With
-        ``profile`` empty it observes ATOM's own scorer. Never keys the hash.
+      - capture: path of a JSON file that receives every scorer call class
+        (shapes, dtypes, strides, buckets, cache layouts, rank, and
+        ``aiter.plugin.explain``'s route) for the coverage matrix and the
+        provider's ``gen_profile --plan-file``. May hold ``{rank}`` / ``{pid}``;
+        without them ``.rank<r>.pid<p>`` is appended. Without an enabled
+        provider it observes ATOM's own scorer. Never keys the hash.
     """
 
-    profile: str = ""
     capture: str = ""
 
     def __post_init__(self):
-        self.profile = "" if self.profile is None else str(self.profile).strip()
         self.capture = "" if self.capture is None else str(self.capture).strip()
-        if self.profile and not (
-            self.profile.endswith(".json")
-            or _QSA_INDEX_SCORER_PROFILE_NAME.fullmatch(self.profile)
-        ):
-            raise ValueError(
-                "qsa_index_scorer.profile must be a profile name "
-                f"([A-Za-z0-9_.-]+) or a path ending in .json, got {self.profile!r}"
-            )
-
-    @property
-    def enabled(self) -> bool:
-        """The fused scorer may run (a profile is named)."""
-        return bool(self.profile)
 
     @property
     def active(self) -> bool:
-        """The indexer looks at the switch at all (profile and/or capture)."""
-        return bool(self.profile or self.capture)
-
-    def hash_factors(self) -> list:
-        """Contribution to ``Config.compute_hash``: empty while OFF, so turning
-        the feature off leaves every existing cache key unchanged. Capture only
-        observes, so it never keys anything."""
-        return [("qsa_index_scorer", self.profile)] if self.enabled else []
+        """The observer is requested."""
+        return bool(self.capture)
 
     @classmethod
     def from_dict(cls, cfg: dict | None) -> "QSAIndexScorerConfig":
@@ -2242,9 +2213,13 @@ class Config:
     # EngineArgs) and pickled into every worker. Read sites use `config.dspark.*`
     # (no os.environ lookups). Defaults to all-off.
     dspark: DSparkConfig = field(default_factory=DSparkConfig)
-    # Opt-in QSA indexer scoring by aiter.ops.qsa (--qsa-index-scorer-profile /
-    # --qsa-index-scorer-capture). Default OFF: nothing imported, stock path.
+    # Opt-in QSA indexer scorer observer (--qsa-index-scorer-capture).
     qsa_index_scorer: QSAIndexScorerConfig = field(default_factory=QSAIndexScorerConfig)
+    # Out-of-tree aiter kernel providers to enable (--aiter-provider-enable /
+    # ATOM_AITER_PROVIDER_ENABLE), in preference order; handed to
+    # aiter.plugin.configure(enable=...) once per worker process. Default ():
+    # nothing imported, aiter's default-deny (every routed op native).
+    aiter_provider_enable: tuple[str, ...] = ()
 
     enable_tbo: bool = False
     enable_tbo_decode: bool = False
@@ -2562,6 +2537,11 @@ class Config:
             )
         else:
             raise TypeError("qsa_index_scorer must be QSAIndexScorerConfig or dict")
+        from atom.aiter_provider import normalize_provider_names
+
+        self.aiter_provider_enable = normalize_provider_names(
+            self.aiter_provider_enable
+        )
         # assert os.path.isdir(self.model)
 
         # The forced-acceptance schedule spends its whole budget on the first
@@ -3264,11 +3244,12 @@ class Config:
         # (DeepSeek-V4's `kv_fp8` branches, the DSpark drafter's fp8 plan), so a
         # bf16 <-> fp8 restart traces a different graph.
         factors.append(self.kv_cache_dtype)
-        # aiter's QSA scorer profile swaps the scorer kernel. Keyed only while
-        # ON, so every hash computed with the feature off is unchanged.
-        qsa_index_scorer = getattr(self, "qsa_index_scorer", None)
-        if qsa_index_scorer is not None:
-            factors.extend(qsa_index_scorer.hash_factors())
+        # Enabled aiter providers swap kernels behind routed ops (and the QSA
+        # indexer's scorer call site). Keyed only while ON, so every hash
+        # computed with no provider enabled is unchanged.
+        aiter_provider_enable = tuple(getattr(self, "aiter_provider_enable", ()) or ())
+        if aiter_provider_enable:
+            factors.append(("aiter_provider_enable", aiter_provider_enable))
         # The drafter graph bakes its draft width in as a constant (DSpark traces
         # `[bs, num_draft]`), so a run that only changes --num-speculative-tokens
         # would otherwise load the other width's artifact: draft 6 over a draft 3

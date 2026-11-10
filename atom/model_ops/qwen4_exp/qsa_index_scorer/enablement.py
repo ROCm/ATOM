@@ -1,27 +1,29 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Per-process enablement of aiter's neutral QSA scorer op.
+"""Per-process enablement of aiter's routed QSA scorer op.
 
-aiter owns the op and its dispatch: ``aiter.ops.qsa.qsa_paged_mqa_logits``
-(the 12 leading parameters of ATOM's own scorer) serves every valid call --
-its fused FlyDSL kernel where the configured profile covers the call class,
-aiter's native paths otherwise. ATOM only:
+aiter owns the op ``aiter.ops.qsa.qsa_paged_mqa_logits`` (contract
+``qsa_paged_mqa_logits`` v1, routed through ``aiter.plugin``; the 12 leading
+parameters of ATOM's own scorer): an enabled provider (e.g.
+``qsa-index-scorer-provider``, the fused FlyDSL gfx1250 scorer) serves the call
+classes it covers, aiter's native paths serve the rest. ATOM only:
 
 * :func:`configure` -- once per worker process, from ``ModelRunner.__init__``
   after ``_setup_device_and_distributed()`` and before
-  ``_build_and_load_model()``: ``aiter.ops.qsa.configure(profile=...,
-  source="atom:...")`` and one startup line from ``aiter.ops.qsa.status()``.
-  Fail-open: an aiter without ``aiter.ops.qsa.configure`` (an image older
-  than the neutral op), or one whose ``configure`` raises, leaves ATOM's own
-  scorer in place -- logged once, never raised.
+  ``_build_and_load_model()`` (after :func:`atom.aiter_provider.
+  configure_aiter_providers`): the indexer uses aiter's op only when an enabled
+  provider declares ``qsa_paged_mqa_logits`` and this aiter routes it. Fail-open:
+  otherwise ATOM's own scorer stays in place -- logged once, never raised.
 * :func:`index_scorer` -- what ``Qwen4ExpAttention`` injects into the stock
   selection loop: aiter's op itself (no wrapper, no ATOM fallback), or None
   for ATOM's own scorer.
-* :func:`prewarm` -- after KV allocation, before CUDA-graph capture:
-  ``aiter.ops.qsa.prewarm(...)`` once per distinct bound index-cache layout.
+* :func:`prewarm` -- after KV allocation, before CUDA-graph capture: the
+  providers' ``warmup(payload, device=...)`` once per distinct bound
+  index-cache layout (compiles / loads every variant the cache can select; the
+  per-bucket eager warm-up forward then decides every class before capture).
 * The opt-in class observer (``--qsa-index-scorer-capture``,
-  :class:`ClassObserver`): one ``aiter.ops.qsa.explain()`` per call class,
-  per-path call counters and the capture JSON. Not installed by default.
+  :class:`ClassObserver`): one ``aiter.plugin.explain()`` per call class,
+  per-route call counters and the capture JSON. Not installed by default.
 
 Nothing here imports aiter at module scope; with the switch off nothing of
 this package is imported at all.
@@ -41,32 +43,31 @@ from typing import Any
 
 logger = logging.getLogger("atom")
 
-#: The neutral op's module (aiter in-tree, contract ``qsa_paged_mqa_logits`` v1).
+#: aiter's routed op (contract ``qsa_paged_mqa_logits`` v1) and its module.
+OP_NAME = "qsa_paged_mqa_logits"
 AITER_QSA_MODULE = "aiter.ops.qsa"
-#: ``source`` passed to ``aiter.ops.qsa.configure``: provenance of the policy.
-CONFIGURE_SOURCE = "atom:Config.qsa_index_scorer.profile"
 #: Query-position dtype ATOM's QSA metadata carries (``logical_positions``).
 QUERY_POSITION_DTYPES = ("int64",)
 
 # Why ATOM's own scorer stayed in place (fail-open reasons, logged once).
+NO_PROVIDER = "no_enabled_provider_for_op"  # providers off / none declares the op
 AITER_UNAVAILABLE = "aiter_qsa_unavailable"  # import of aiter.ops.qsa failed
-AITER_WITHOUT_CONFIGURE = "aiter_qsa_without_configure"  # pre-neutral-op aiter
-CONFIGURE_FAILED = "aiter_qsa_configure_failed"  # configure() raised
-CAPTURE_ONLY = "capture_only"  # no profile: capture observes ATOM's scorer
+OP_NOT_ROUTED = "aiter_qsa_not_routed"  # this aiter's op is not routed
+CAPTURE_ONLY = "capture_only"  # no provider: capture observes ATOM's scorer
 
-#: Path recorded for ATOM's own scorer in the capture (not an aiter path).
+#: Path recorded for ATOM's own scorer in the capture (not an aiter route).
 ATOM_PATH = "atom"
 
 
 @dataclass
 class ScorerState:
-    """Outcome of the per-process ``configure`` for one profile."""
+    """Outcome of the per-process ``configure``."""
 
-    profile: str
-    #: ``aiter.ops.qsa.qsa_paged_mqa_logits`` when aiter accepted the profile,
-    #: else None (ATOM's own scorer).
+    #: enabled providers that declare the op (preference order)
+    providers: tuple
+    #: ``aiter.ops.qsa.qsa_paged_mqa_logits`` when usable, else None (ATOM's own)
     op: Callable | None = None
-    api: Any = None
+    plugin: Any = None
     reason: str = ""
     status: dict = field(default_factory=dict)
 
@@ -74,97 +75,81 @@ class ScorerState:
     def enabled(self) -> bool:
         return self.op is not None
 
+    # the capture JSON still names its policy field "profile"
+    @property
+    def profile(self) -> str:
+        return ",".join(self.providers)
+
 
 _LOCK = threading.Lock()
-_STATES: dict[str, ScorerState] = {}
+_STATES: dict[tuple, ScorerState] = {}
 _PREWARMED: dict[tuple, tuple | None] = {}
 _OBSERVERS: dict[str, ClassObserver] = {}
 
 
-def _profile_of(config) -> str:
-    cfg = getattr(config, "qsa_index_scorer", None)
-    return "" if cfg is None else str(getattr(cfg, "profile", "") or "")
-
-
-def _status_text(status: dict) -> str:
-    return " ".join(f"{k}={status[k]}" for k in sorted(status, key=str))
-
-
 def configure(config, rank_name: str = "") -> ScorerState | None:
-    """``aiter.ops.qsa.configure(profile=..., source=...)`` once per process.
+    """Decide once per process whether the indexer scores through aiter's op.
 
-    Returns None while no profile is set (nothing imported). Idempotent per
-    profile; never raises. Must run before the first scorer call of the
-    process (``ModelRunner.__init__``, before the model is built), so the
-    eager pre-capture warm-up already sees the configured policy.
+    Returns None while no provider is enabled (nothing imported). Idempotent;
+    never raises. Runs before the first scorer call of the process
+    (``ModelRunner.__init__``, before the model is built).
     """
-    profile = _profile_of(config)
-    if not profile:
+    enable = tuple(getattr(config, "aiter_provider_enable", ()) or ())
+    if not enable:
         return None
     with _LOCK:
-        state = _STATES.get(profile)
+        state = _STATES.get(enable)
         if state is not None:
             return state
-        state = _STATES[profile] = _configure(profile)
+        state = _STATES[enable] = _configure(config, rank_name)
     who = rank_name or "-"
     if state.enabled:
-        st = state.status
-        fused_on = bool(st.get("enabled", True))
         logger.info(
-            "QSA index scorer [%s]: %s profile=%s source=%s op=%s.%s status: %s",
+            "QSA index scorer [%s]: aiter op %s.%s (route %s) providers=%s",
             who,
-            "enabled" if fused_on else "configured (aiter reports fused off)",
-            profile,
-            CONFIGURE_SOURCE,
             AITER_QSA_MODULE,
-            "qsa_paged_mqa_logits",
-            _status_text(st),
+            OP_NAME,
+            OP_NAME,
+            list(state.providers),
         )
     else:
         logger.warning(
-            "QSA index scorer [%s]: DISABLED (ATOM scorer) profile=%s reason=%s",
+            "QSA index scorer [%s]: DISABLED (ATOM scorer) enabled=%s reason=%s",
             who,
-            profile,
+            list(enable),
             state.reason,
         )
     return state
 
 
-def _configure(profile: str) -> ScorerState:
+def _configure(config, rank_name: str) -> ScorerState:
+    from atom.aiter_provider import configure_aiter_providers
+
+    pstate = configure_aiter_providers(config, rank_name)
+    providers = () if pstate is None else pstate.serves(OP_NAME)
+    if not providers:
+        reason = NO_PROVIDER if pstate is None else (pstate.reason or NO_PROVIDER)
+        return ScorerState((), reason=reason)
     try:
         api = importlib.import_module(AITER_QSA_MODULE)
+        plugin = importlib.import_module("aiter.plugin")
     except Exception as exc:  # noqa: BLE001 -- fail-open: ATOM's scorer
-        return ScorerState(profile, reason=f"{AITER_UNAVAILABLE}: {exc!r}")
-    if not callable(getattr(api, "configure", None)) or not callable(
-        getattr(api, "qsa_paged_mqa_logits", None)
-    ):
-        return ScorerState(profile, reason=AITER_WITHOUT_CONFIGURE)
-    try:
-        api.configure(profile=profile, source=CONFIGURE_SOURCE)
-    except Exception as exc:  # noqa: BLE001 -- fail-open: ATOM's scorer
-        return ScorerState(profile, reason=f"{CONFIGURE_FAILED}: {exc!r}")
-    status: dict = {}
-    status_fn = getattr(api, "status", None)
-    if callable(status_fn):
-        try:
-            status = dict(status_fn())
-        except Exception as exc:  # noqa: BLE001 -- observability only
-            status = {"status_error": repr(exc)}
+        return ScorerState(providers, reason=f"{AITER_UNAVAILABLE}: {exc!r}")
+    op = getattr(api, "qsa_paged_mqa_logits", None)
+    if not callable(op) or getattr(op, "__aiter_plugin_op__", None) is None:
+        return ScorerState(providers, reason=OP_NOT_ROUTED)
     return ScorerState(
-        profile,
-        op=api.qsa_paged_mqa_logits,
-        api=api,
-        reason="configured",
-        status=status,
+        providers, op=op, plugin=plugin, reason="routed", status=dict(pstate.status)
     )
 
 
 def index_scorer(config) -> Callable | None:
     """The scorer ``Qwen4ExpAttention`` injects, or None for ATOM's own.
 
-    * profile set, aiter configured: ``aiter.ops.qsa.qsa_paged_mqa_logits``
-      itself -- the same object, so the call site costs nothing extra;
-    * profile set, aiter without the neutral op (or configure failed): None;
+    * an enabled provider declares the op and this aiter routes it:
+      ``aiter.ops.qsa.qsa_paged_mqa_logits`` itself -- the same object, so the
+      call site costs nothing extra;
+    * otherwise: None;
     * ``capture`` set: the scorer above (or ATOM's own) behind the opt-in
       :class:`ClassObserver`.
 
@@ -183,7 +168,7 @@ def index_scorer(config) -> Callable | None:
         from atom.model_ops.qwen4_exp.ops.qsa import qsa_paged_mqa_logits
 
         return observer(capture, qsa_paged_mqa_logits, None, state)
-    return observer(capture, op, state.api, state)
+    return observer(capture, op, state.plugin, state)
 
 
 # ---------------------------------------------------------------------------
@@ -210,21 +195,22 @@ def _layout(t) -> tuple | None:
 
 
 def prewarm(caches, rank_name: str = "") -> dict:
-    """``aiter.ops.qsa.prewarm`` once per distinct bound index-cache layout.
+    """The providers' ``warmup`` once per distinct bound index-cache layout.
 
     ``caches``: ``(compressed_k_cache, compressed_k_scale)`` pairs of the
-    layers that call aiter's op. Builds what those caches can select (their
-    page size and dtype, ATOM's int64 positions) so no variant compiles inside
-    the per-bucket capture warm-up or serving. A raising prewarm is logged
-    once and not retried: variants then build on first use (eager, before
-    capture). Never raises. Returns ``{layout: built variants or None}``.
+    layers that call aiter's op. Each provider that declares the op compiles /
+    loads what those caches can select (their page size and dtype, ATOM's int64
+    positions) so no variant compiles inside the per-bucket capture warm-up or
+    serving. A failing warm-up is logged once and not retried: variants then
+    build on first use (eager, before capture). Never raises. Returns
+    ``{layout: {provider: ok} or None}``.
     """
     out: dict = {}
     for cache, scale in caches:
         if cache is None or getattr(cache, "ndim", 0) != 4:
             continue
         state = next((s for s in _STATES.values() if s.enabled), None)
-        if state is None or not callable(getattr(state.api, "prewarm", None)):
+        if state is None:
             return out
         key = (_layout(cache), _layout(scale))
         if key in out:
@@ -239,45 +225,41 @@ def prewarm(caches, rank_name: str = "") -> dict:
 def _prewarm_one(state: ScorerState, cache, scale, rank_name: str):
     import torch
 
+    from atom.aiter_provider import warmup_aiter_providers
+
     page = int(cache.shape[1])
     dtype = cache_dtype_name(cache, scale)
-    pos_dtypes = tuple(getattr(torch, n) for n in QUERY_POSITION_DTYPES)
+    payload = {
+        "page_sizes": (page,),
+        "cache_dtypes": (dtype,),
+        "pos_dtypes": tuple(getattr(torch, n) for n in QUERY_POSITION_DTYPES),
+        "compressed_k_cache": cache,
+        "compressed_k_scale": scale,
+    }
     t0 = time.perf_counter()
     try:
-        built = tuple(
-            state.api.prewarm(
-                page_sizes=(page,),
-                cache_dtypes=(dtype,),
-                pos_dtypes=pos_dtypes,
-                compressed_k_cache=cache,
-                compressed_k_scale=scale,
-                device=cache.device,
-            )
-            or ()
+        warmed = warmup_aiter_providers(
+            OP_NAME, payload, device=cache.device, rank_name=rank_name
         )
     except Exception as exc:  # noqa: BLE001 -- lazy build stays correct
-        logger.warning(
-            "QSA index scorer [%s]: prewarm page=%d cache=%s failed after %.2f s "
-            "(variants build on first use): %r",
-            rank_name or "-",
-            page,
-            dtype,
-            time.perf_counter() - t0,
-            exc,
-        )
-        return None
-    logger.info(
-        "QSA index scorer [%s]: prewarm page=%d cache=%s pos=%s -> %d variant(s) "
-        "in %.2f s: %s",
+        warmed = None
+        err = repr(exc)
+    else:
+        err = ""
+    level = logging.INFO if warmed and all(warmed.values()) else logging.WARNING
+    logger.log(
+        level,
+        "QSA index scorer [%s]: provider warm-up page=%d cache=%s pos=%s -> %s in "
+        "%.2f s%s",
         rank_name or "-",
         page,
         dtype,
         ",".join(QUERY_POSITION_DTYPES),
-        len(built),
+        warmed,
         time.perf_counter() - t0,
-        ", ".join(map(str, built)),
+        f" ({err}; variants build on first use)" if err else "",
     )
-    return built
+    return warmed
 
 
 # ---------------------------------------------------------------------------
@@ -334,19 +316,21 @@ def _class_key(a: tuple) -> tuple:
 class ClassObserver:
     """Opt-in scorer wrapper: counts calls per class and asks aiter once.
 
-    The first call of each class runs ``aiter.ops.qsa.explain(*12 args)`` (a
-    host-side decision; under CUDA graphs the first call of a class is the
-    eager per-bucket warm-up, outside the recording) and records the class in
+    The first call of each class runs ``aiter.plugin.explain(op, *12 args)``
+    (a host-side dry run of the routing decision; under CUDA graphs the first
+    call of a class is the eager per-bucket warm-up, outside the recording; it
+    calls the providers' ``select``, which decides and caches the class) and
+    records the class in
     the capture JSON. Every call then goes to ``op`` unchanged -- the observer
     never re-runs or replaces a call. Python-level counts: a captured call
     counts once, replays run no Python.
     """
 
-    def __init__(self, path: str, op: Callable, api, state: ScorerState | None):
+    def __init__(self, path: str, op: Callable, plugin, state: ScorerState | None):
         from .capture import get_capture
 
         self.op = op
-        self.api = api
+        self.plugin = plugin
         self.profile = "" if state is None else state.profile
         self.reason = CAPTURE_ONLY if state is None else state.reason
         self.capture = get_capture(path)
@@ -355,16 +339,21 @@ class ClassObserver:
         self.calls: collections.Counter = collections.Counter()
 
     def _explain(self, a: tuple) -> tuple[str, str]:
-        if self.api is None:
+        if self.plugin is None:
             return ATOM_PATH, self.reason
-        explain = getattr(self.api, "explain", None)
+        explain = getattr(self.plugin, "explain", None)
         if not callable(explain):
             return "aiter", "explain_unavailable"
         try:
-            d = explain(*a)
+            d = explain(OP_NAME, *a).decision
         except Exception as exc:  # noqa: BLE001 -- observability only
             return "aiter", f"explain_error:{type(exc).__name__}"
-        return str(getattr(d, "path", "aiter")), str(getattr(d, "reason", ""))
+        if d is None:  # AITER_PLUGINS=0: routing off, native
+            return "native", "kill_switch"
+        route = str(getattr(d, "route", "aiter"))
+        provider = getattr(d, "provider", None)
+        path = f"{route}:{provider}" if route == "provider" and provider else route
+        return path.replace(":", "/"), str(getattr(d, "reason", ""))
 
     def __call__(self, *args, **kwargs):
         a = bind_args(args, kwargs)
@@ -387,12 +376,12 @@ class ClassObserver:
         return dict(out)
 
 
-def observer(path: str, op: Callable, api, state) -> ClassObserver:
+def observer(path: str, op: Callable, plugin, state) -> ClassObserver:
     """One observer per capture path and process (all layers share it)."""
     with _LOCK:
         obs = _OBSERVERS.get(path)
         if obs is None:
-            obs = _OBSERVERS[path] = ClassObserver(path, op, api, state)
+            obs = _OBSERVERS[path] = ClassObserver(path, op, plugin, state)
             if len(_OBSERVERS) == 1:
                 atexit.register(log_decisions)
     return obs

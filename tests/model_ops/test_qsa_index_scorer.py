@@ -1,15 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""CPU tests: the QSA indexer scoring through aiter's neutral op.
+"""CPU tests: the QSA indexer scoring through aiter's routed op.
 
-No GPU. ``aiter.ops.qsa`` is a fake module placed in ``sys.modules``
-(``configure`` / ``status`` / ``prewarm`` / ``explain`` /
-``qsa_paged_mqa_logits``), so these run with any or no aiter installed.
-Covered: per-process configure (ordering, idempotence, fail-open), the call
-site (flag off -> ATOM's stock select; on -> the neutral op itself, all 12
-arguments, no ATOM fallback), prewarm placement and arguments, the opt-in
-explain() observer / capture, and the AST drift guards against the frozen
-``qsa.py``.
+No GPU. ``aiter.plugin`` (``API_VERSION`` / ``configure`` / ``status`` /
+``explain``) and ``aiter.ops.qsa`` (the routed ``qsa_paged_mqa_logits``) are fake
+modules placed in ``sys.modules``, and the provider entry point is a fake with a
+``warmup`` hook, so these run with any or no aiter installed. Covered:
+per-process provider enablement + scorer configure (ordering, idempotence,
+fail-open), the call site (flag off -> ATOM's stock select; on -> the routed op
+itself, all 12 arguments, no ATOM fallback), provider warm-up placement and
+payload, the opt-in explain() observer / capture, and the AST drift guards
+against the frozen ``qsa.py``.
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from atom import aiter_provider as AP
 from atom.config import QSAIndexScorerConfig
 from atom.model_ops.qwen4_exp.qsa_index_scorer import capture as C
 from atom.model_ops.qwen4_exp.qsa_index_scorer import enablement as E
@@ -47,32 +49,35 @@ FROZEN_QSA_SHA256 = "aaa78f43255cf950bfbdf5d618246f9a7a671f0262cff2398b2ca4ea703
 FROZEN_QSA_SHA256_LF = (
     "c2e46e50cd9b8bdbdc4b6a09b29cafc5c971dfff4246799a3c8dc32f8b4d14b9"
 )
-P = "qsa_page4_gfx1250_v1"
+P = "qsa-index-scorer-provider"
 
 
 @pytest.fixture(autouse=True)
 def _fresh_state():
     E._reset_for_testing()
+    AP._reset_for_testing()
     yield
     E._reset_for_testing()
+    AP._reset_for_testing()
 
 
 # ---------------------------------------------------------------------------
-# fake aiter.ops.qsa
+# fake aiter.plugin + routed aiter.ops.qsa + provider entry point
 # ---------------------------------------------------------------------------
-Decision = collections.namedtuple("Decision", "path reason vid")
+Decision = collections.namedtuple("Decision", "route reason provider")
 
 
-def make_fake_api(
+def make_fake_aiter(
     *,
-    configure=True,
-    configure_raises=None,
-    prewarm_raises=None,
+    plugin=True,
+    api_version=1,
+    routed=True,
+    providers=((P, ("qsa_paged_mqa_logits",)),),
+    warmup_raises=None,
     op_raises=None,
-    status=None,
 ):
-    api = types.ModuleType(E.AITER_QSA_MODULE)
     calls = collections.defaultdict(list)
+    api = types.ModuleType(E.AITER_QSA_MODULE)
 
     def qsa_paged_mqa_logits(
         q,
@@ -87,7 +92,7 @@ def make_fake_api(
         row_starts=None,
         allow_flydsl=False,
         compressed_k_scale=None,
-        stacked_decode=False,
+        stacked_decode=None,
         *,
         logits=None,
         visible_groups=None,
@@ -112,76 +117,67 @@ def make_fake_api(
             torch.full((q.shape[0],), cols, dtype=torch.int32),
         )
 
+    if routed:
+        qsa_paged_mqa_logits.__aiter_plugin_op__ = ("qsa_paged_mqa_logits", 1)
     api.qsa_paged_mqa_logits = qsa_paged_mqa_logits
 
-    if configure:
+    plug = types.ModuleType("aiter.plugin")
+    plug.API_VERSION = api_version
 
-        def _configure(*, profile, source):
-            calls["configure"].append((profile, source))
-            if configure_raises is not None:
-                raise configure_raises
-
-        api.configure = _configure
+    def _configure(*, source, enable=()):
+        calls["configure"].append((source, tuple(enable)))
 
     def _status():
         calls["status"].append(1)
-        return (
-            {
-                "enabled": True,
-                "profile": P,
-                "kernel_sha256": "6b537f3b",
-                "api_version": 1,
-                "origin": "atom:Config.qsa_index_scorer.profile",
-            }
-            if status is None
-            else status
-        )
+        return {
+            "enabled": tuple(x for c in calls["configure"][-1:] for x in c[1]),
+            "providers": [
+                {"name": n, "op_versions": {op: [1] for op in ops}}
+                for n, ops in providers
+            ],
+            "skipped_providers": [],
+            "routed_ops": ["qsa_paged_mqa_logits"] if routed else [],
+        }
 
-    def _prewarm(
-        *,
-        page_sizes,
-        cache_dtypes,
-        pos_dtypes=(torch.int64,),
-        compressed_k_cache=None,
-        compressed_k_scale=None,
-        device=None,
-    ):
-        calls["prewarm"].append(
-            {
-                "page_sizes": page_sizes,
-                "cache_dtypes": cache_dtypes,
-                "pos_dtypes": pos_dtypes,
-                "cache": compressed_k_cache,
-                "scale": compressed_k_scale,
-            }
-        )
-        if prewarm_raises is not None:
-            raise prewarm_raises
-        return [f"v_p{page_sizes[0]}_{cache_dtypes[0]}"]
-
-    def _explain(*args):
-        assert len(args) == 12
+    def _explain(op, *args):
+        assert op == "qsa_paged_mqa_logits" and len(args) == 12
         calls["explain"].append(args)
-        cols = args[8]
-        return Decision("fused" if cols == 64 else "native-triton", "r", "vid0")
+        if args[8] == 64:
+            d = Decision("provider", "selected", P)
+        else:
+            d = Decision("native", "provider-declined", None)
+        return types.SimpleNamespace(decision=d)
 
-    api.status, api.prewarm, api.explain = _status, _prewarm, _explain
-    return api, calls
+    plug.configure, plug.status, plug.explain = _configure, _status, _explain
+
+    class Provider:
+        name = P
+
+        def warmup(self, payload, *, device=None):
+            calls["warmup"].append({**payload, "device": device})
+            if warmup_raises is not None:
+                raise warmup_raises
+            return True
+
+    return api, plug if plugin else None, Provider(), calls
 
 
 @pytest.fixture
-def fake_api(monkeypatch):
+def fake_aiter(monkeypatch):
     def install(**kw):
-        api, calls = make_fake_api(**kw)
+        api, plug, provider, calls = make_fake_aiter(**kw)
         monkeypatch.setitem(sys.modules, E.AITER_QSA_MODULE, api)
+        monkeypatch.setitem(sys.modules, "aiter.plugin", plug)  # None: ImportError
+        monkeypatch.setattr(AP, "load_provider", lambda name: provider)
         return api, calls
 
     return install
 
 
-def cfg(profile=P, capture=""):
+def cfg(providers=(P,), capture=""):
     return SimpleNamespace(
-        qsa_index_scorer=QSAIndexScorerConfig(profile=profile, capture=capture)
+        aiter_provider_enable=tuple(providers),
+        qsa_index_scorer=QSAIndexScorerConfig(capture=capture),
     )
 
 
@@ -301,7 +297,8 @@ def test_attention_imports_the_package_only_when_active():
         if isinstance(n, (ast.Import, ast.ImportFrom)):
             assert "qsa_index_scorer" not in (getattr(n, "module", "") or "")
     src = ATTN_PY.read_text(encoding="utf-8")
-    assert "if scorer_cfg is not None and scorer_cfg.active:" in src
+    assert "if (scorer_cfg is not None and scorer_cfg.active) or getattr(" in src
+    assert '"aiter_provider_enable", ()' in src
     assert (
         "qsa_select_paged_tokens if self.qsa_select is None else self.qsa_select" in src
     )
@@ -383,72 +380,77 @@ def test_off_imports_and_configures_nothing(monkeypatch):
         raise AssertionError(f"imported {name}")
 
     monkeypatch.setattr(E.importlib, "import_module", boom)
-    assert configure_aiter_fused_ops(cfg(profile=""), rank_name="r0") == {}
+    monkeypatch.setattr(AP.importlib, "import_module", boom)
+    assert configure_aiter_fused_ops(cfg(providers=()), rank_name="r0") == {}
     assert configure_aiter_fused_ops(SimpleNamespace(), rank_name="r0") == {}
-    assert prewarm_aiter_fused_ops(cfg(profile=""), [], rank_name="r0") == {}
-    assert E.configure(cfg(profile="")) is None
-    assert E.index_scorer(cfg(profile="")) is None
+    assert prewarm_aiter_fused_ops(cfg(providers=()), [], rank_name="r0") == {}
+    assert E.configure(cfg(providers=())) is None
+    assert E.index_scorer(cfg(providers=())) is None
 
 
-def test_configure_once_per_process_with_profile_and_source(fake_api, caplog):
+def test_configure_once_per_process_with_source_and_enable(fake_aiter, caplog):
     from atom.aiter_fused_ops import configure_aiter_fused_ops
 
-    api, calls = fake_api()
+    api, calls = fake_aiter()
     with caplog.at_level(logging.INFO, logger="atom"):
         out = configure_aiter_fused_ops(cfg(), rank_name="dp0_tp0")
         configure_aiter_fused_ops(cfg(), rank_name="dp0_tp0")
         E.index_scorer(cfg())
     state = out["qsa_index_scorer"]
     assert state.enabled and state.op is api.qsa_paged_mqa_logits
-    assert calls["configure"] == [(P, "atom:Config.qsa_index_scorer.profile")]
+    assert state.providers == (P,)
+    ((source, enable),) = calls["configure"]
+    assert source.startswith("atom ") and enable == (P,)
     assert len(calls["status"]) == 1
     lines = [
         r.getMessage()
         for r in caplog.records
         if r.getMessage().startswith("QSA index scorer [dp0_tp0]")
     ]
-    assert len(lines) == 1
-    assert f"enabled profile={P}" in lines[0] and "kernel_sha256=6b537f3b" in lines[0]
-
-
-def test_status_reporting_fused_off_still_uses_the_op(fake_api, caplog):
-    api, _ = fake_api(status={"enabled": False, "profile": P})  # e.g. AITER_QSA_FUSED=0
-    with caplog.at_level(logging.INFO, logger="atom"):
-        assert E.index_scorer(cfg()) is api.qsa_paged_mqa_logits
-    assert any("aiter reports fused off" in r.getMessage() for r in caplog.records)
+    assert len(lines) == 1 and f"providers=['{P}']" in lines[0]
+    assert any(
+        r.getMessage().startswith("aiter providers [dp0_tp0]: enabled=")
+        for r in caplog.records
+    )
 
 
 @pytest.mark.parametrize(
     "kind,reason",
     [
-        ("no_configure", E.AITER_WITHOUT_CONFIGURE),
-        ("import_error", E.AITER_UNAVAILABLE),
-        ("configure_raises", E.CONFIGURE_FAILED),
+        ("no_plugin", "aiter.plugin unavailable"),
+        ("api_version", "aiter.plugin API 2"),
+        ("not_routed", E.NO_PROVIDER),
+        ("other_provider", E.NO_PROVIDER),
+        ("op_not_routed", E.OP_NOT_ROUTED),
     ],
 )
-def test_fail_open_keeps_atom_scorer(fake_api, monkeypatch, caplog, kind, reason):
+def test_fail_open_keeps_atom_scorer(fake_aiter, caplog, kind, reason):
     from atom.aiter_fused_ops import configure_aiter_fused_ops
 
-    calls = {}
-    if kind == "no_configure":
-        _, calls = fake_api(configure=False)
-    elif kind == "configure_raises":
-        _, calls = fake_api(configure_raises=ValueError("unknown profile"))
-    else:
-        monkeypatch.setitem(sys.modules, E.AITER_QSA_MODULE, None)  # ImportError
+    if kind == "no_plugin":
+        _, calls = fake_aiter(plugin=False)
+    elif kind == "api_version":
+        _, calls = fake_aiter(api_version=2)
+    elif kind == "not_routed":
+        _, calls = fake_aiter(routed=False)
+    elif kind == "other_provider":
+        _, calls = fake_aiter(providers=((P, ("sp_qkv_fused",)),))
+    else:  # status says routed, but the op object carries no route marker
+        _, calls = fake_aiter()
+        del sys.modules[E.AITER_QSA_MODULE].qsa_paged_mqa_logits.__aiter_plugin_op__
     with caplog.at_level(logging.INFO, logger="atom"):
         state = configure_aiter_fused_ops(cfg(), rank_name="r0")["qsa_index_scorer"]
         assert E.index_scorer(cfg()) is None
         assert E.index_scorer(cfg()) is None
-    assert not state.enabled and state.reason.startswith(reason)
+    assert not state.enabled and state.reason.startswith(reason), state.reason
     warn = [r for r in caplog.records if "DISABLED (ATOM scorer)" in r.getMessage()]
     assert len(warn) == 1 and warn[0].levelno == logging.WARNING
-    assert not calls or not calls.get("op")
+    assert not calls.get("op")
 
 
-def test_index_scorer_is_the_neutral_op_itself(fake_api):
+def test_index_scorer_is_the_routed_op_itself(fake_aiter):
     """Default ON path: no ATOM wrapper, nothing per call."""
-    api, _ = fake_api()
+    api, _ = fake_aiter()
     assert E.index_scorer(cfg()) is api.qsa_paged_mqa_logits
 
 
@@ -483,10 +485,10 @@ def select_mod(stub_load, monkeypatch):
 
 
 @pytest.mark.parametrize("fp8", [False, True])
-def test_select_scores_through_the_neutral_op_with_all_12_args(
-    select_mod, fake_api, fp8
+def test_select_scores_through_the_routed_op_with_all_12_args(
+    select_mod, fake_aiter, fp8
 ):
-    _api, calls = fake_api()
+    _api, calls = fake_aiter()
     (q, cache, table, t2r, pos, ctx), kw = call_args(rows=10, fp8=fp8)
     out = select_mod.qsa_select_paged_tokens_with_scorer(
         q,
@@ -511,12 +513,12 @@ def test_select_scores_through_the_neutral_op_with_all_12_args(
         assert c["compressed_k_scale"] is kw["compressed_k_scale"]
         assert c["row_starts"] is not None and c["row_starts"].dtype == torch.int32
         # ATOM passes the contract's 12 leading params only (aiter's 13th,
-        # stacked_decode, stays at its default).
-        assert c["stacked_decode"] is False
+        # stacked_decode, stays at its default None = aiter decides).
+        assert c["stacked_decode"] is None
 
 
 def test_op_errors_propagate_without_an_atom_fallback(
-    stub_load, select_mod, fake_api, monkeypatch
+    stub_load, select_mod, fake_aiter, monkeypatch
 ):
     qsa_ops = stub_load("atom.model_ops.qwen4_exp.ops.qsa")
     monkeypatch.setattr(
@@ -524,7 +526,7 @@ def test_op_errors_propagate_without_an_atom_fallback(
         "qsa_paged_mqa_logits",
         lambda *a, **k: pytest.fail("ATOM's scorer ran after the op"),
     )
-    _, calls = fake_api(op_raises=RuntimeError("kernel failed"))
+    _, calls = fake_aiter(op_raises=RuntimeError("kernel failed"))
     (q, cache, table, t2r, pos, ctx), _ = call_args()
     with pytest.raises(RuntimeError, match="kernel failed"):
         select_mod.qsa_select_paged_tokens_with_scorer(
@@ -583,9 +585,9 @@ def test_call_site_flag_off_uses_the_stock_select(stub_load, monkeypatch):
     assert a[:2] == ("index_q", "ccache") and "scorer" not in k
 
 
-def test_call_site_flag_on_injects_the_neutral_op(stub_load, fake_api, monkeypatch):
+def test_call_site_flag_on_injects_the_routed_op(stub_load, fake_aiter, monkeypatch):
     M = stub_load(ATTN)
-    api, _ = fake_api()
+    api, _ = fake_aiter()
     monkeypatch.setattr(
         M, "qsa_select_paged_tokens", lambda *a, **k: pytest.fail("stock called")
     )
@@ -639,10 +641,10 @@ def _model(*caches):
 
 
 @pytest.mark.parametrize("block", [16, 32, 64])
-def test_prewarm_once_per_bound_layout_with_atom_dtypes(fake_api, block, caplog):
+def test_warmup_once_per_bound_layout_with_atom_dtypes(fake_aiter, block, caplog):
     from atom.aiter_fused_ops import prewarm_aiter_fused_ops
 
-    _, calls = fake_api()
+    _, calls = fake_aiter()
     E.configure(cfg())
     page = block // 4
     shared = torch.zeros(32, page, 1, 128, dtype=torch.bfloat16)
@@ -651,45 +653,50 @@ def test_prewarm_once_per_bound_layout_with_atom_dtypes(fake_api, block, caplog)
     with caplog.at_level(logging.INFO, logger="atom"):
         prewarm_aiter_fused_ops(cfg(), [target, draft], rank_name="r0")
         prewarm_aiter_fused_ops(cfg(), [target, draft], rank_name="r0")
-    (pw,) = calls["prewarm"]  # same layout everywhere, once per process
+    (pw,) = calls["warmup"]  # same layout everywhere, once per process
     assert pw["page_sizes"] == (page,) and pw["cache_dtypes"] == ("bf16",)
-    assert pw["pos_dtypes"] == (torch.int64,) and pw["cache"] is shared
-    assert pw["scale"] is None
+    assert pw["pos_dtypes"] == (torch.int64,) and pw["compressed_k_cache"] is shared
+    assert pw["compressed_k_scale"] is None and pw["device"] == shared.device
     assert any(
-        f"prewarm page={page} cache=bf16" in r.getMessage() for r in caplog.records
+        f"provider warm-up page={page} cache=bf16" in r.getMessage()
+        for r in caplog.records
     )
 
 
-def test_prewarm_fp8_cache_passes_its_scale(fake_api):
-    _, calls = fake_api()
+def test_warmup_fp8_cache_passes_its_scale(fake_aiter):
+    _, calls = fake_aiter()
     E.configure(cfg())
     (_, cache, *_), kw = call_args(fp8=True)
     E.prewarm([(cache, kw["compressed_k_scale"])])
-    (pw,) = calls["prewarm"]
-    assert pw["cache_dtypes"] == ("fp8",) and pw["scale"] is kw["compressed_k_scale"]
+    (pw,) = calls["warmup"]
+    assert pw["cache_dtypes"] == ("fp8",)
+    assert pw["compressed_k_scale"] is kw["compressed_k_scale"]
 
 
-def test_prewarm_failure_is_logged_not_raised(fake_api, caplog):
-    _, calls = fake_api(prewarm_raises=RuntimeError("no compiler"))
+def test_warmup_failure_is_logged_not_raised(fake_aiter, caplog):
+    _, calls = fake_aiter(warmup_raises=RuntimeError("no compiler"))
     E.configure(cfg())
     with caplog.at_level(logging.INFO, logger="atom"):
         out = E.prewarm([(torch.zeros(4, 4, 1, 128, dtype=torch.bfloat16), None)])
-    assert list(out.values()) == [None] and len(calls["prewarm"]) == 1
-    assert any("variants build on first use" in r.getMessage() for r in caplog.records)
+    assert list(out.values()) == [{P: False}] and len(calls["warmup"]) == 1
+    assert any(
+        "provider warm-up" in r.getMessage() and r.levelno == logging.WARNING
+        for r in caplog.records
+    )
 
 
-def test_no_prewarm_without_an_enabled_op(fake_api):
-    _, calls = fake_api(configure=False)
+def test_no_warmup_without_an_enabled_op(fake_aiter):
+    _, calls = fake_aiter(routed=False)
     E.configure(cfg())
     assert E.prewarm([(torch.zeros(4, 4, 1, 128), None)]) == {}
-    assert not calls["prewarm"]
+    assert not calls["warmup"]
 
 
 # ---------------------------------------------------------------------------
-# opt-in observer: explain() per class, counters, capture
+# opt-in observer: aiter.plugin.explain() per class, counters, capture
 # ---------------------------------------------------------------------------
-def test_observer_explains_once_per_class_and_counts(fake_api, tmp_path, caplog):
-    api, calls = fake_api()
+def test_observer_explains_once_per_class_and_counts(fake_aiter, tmp_path, caplog):
+    api, calls = fake_aiter()
     path = str(tmp_path / "cap_{rank}.json")
     scorer = E.index_scorer(cfg(capture=path))
     assert isinstance(scorer, E.ClassObserver) and scorer.op is api.qsa_paged_mqa_logits
@@ -700,11 +707,12 @@ def test_observer_explains_once_per_class_and_counts(fake_api, tmp_path, caplog)
     scorer(*a32, 4, **kw32)
     assert logits.shape == (8, 64) and visible.dtype == torch.int32
     assert len(calls["explain"]) == 2 and len(calls["op"]) == 4
-    assert E.decisions() == {"fused": 3, "native-triton": 1}
+    served = f"provider/{P}"
+    assert E.decisions() == {served: 3, "native": 1}
     with caplog.at_level(logging.INFO, logger="atom"):
         E.log_decisions()
     assert any(
-        "QSA index scorer decisions: fused=3, native-triton=1" in r.getMessage()
+        f"QSA index scorer decisions: native=1, {served}=3" in r.getMessage()
         for r in caplog.records
     )
     scorer.capture.flush()
@@ -713,7 +721,10 @@ def test_observer_explains_once_per_class_and_counts(fake_api, tmp_path, caplog)
     got = {
         c["signature"]["columns"]: (c["count"], c["decisions"]) for c in data["classes"]
     }
-    assert got == {64: (3, {"fused:r": 3}), 32: (1, {"native-triton:r": 1})}
+    assert got == {
+        64: (3, {f"{served}:selected": 3}),
+        32: (1, {"native:provider-declined": 1}),
+    }
     assert len(data["plan"]) == 2
 
 

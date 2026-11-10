@@ -330,14 +330,17 @@ class Qwen4ExpAttention(nn.Module):
             self.kv_format = self.index_format = "bf16"
             self.qsa_row_space = "qsa_draft"
         self.profile_block_size = getattr(atom_config, "kv_cache_block_size", 64)
-        # Opt-in aiter scorer (`--qsa-index-scorer-profile`): the selection
-        # loop scores through aiter's neutral op `aiter.ops.qsa.
-        # qsa_paged_mqa_logits`, which dispatches (fused / native) itself.
-        # OFF, or an aiter without the op: None, `_select_tokens` keeps the
-        # stock call (ATOM's own scorer) and nothing of the op is imported.
+        # Opt-in aiter scorer (`--aiter-provider-enable` naming a provider of
+        # aiter's routed op `qsa_paged_mqa_logits`): the selection loop scores
+        # through `aiter.ops.qsa.qsa_paged_mqa_logits` (provider or aiter
+        # native). OFF, or an aiter / provider that cannot: None,
+        # `_select_tokens` keeps the stock call (ATOM's own scorer) and nothing
+        # of the op is imported.
         self.qsa_select = None
         scorer_cfg = getattr(atom_config, "qsa_index_scorer", None)
-        if scorer_cfg is not None and scorer_cfg.active:
+        if (scorer_cfg is not None and scorer_cfg.active) or getattr(
+            atom_config, "aiter_provider_enable", ()
+        ):
             from atom.model_ops.qwen4_exp.qsa_index_scorer import index_scorer
 
             scorer = index_scorer(atom_config)
