@@ -646,6 +646,9 @@ class TestTheTierVotes:
         def could_serve(self, h):
             return h in self.hashes
 
+        def want_touch(self, h):
+            pass
+
     @staticmethod
     def coordinator(num_units=40, offload=None):
         from atom.model_engine.page_unit_checkpoint import (

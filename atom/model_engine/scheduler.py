@@ -2674,7 +2674,18 @@ class Scheduler:
             ):
                 self.waiting.appendleft(seq)
                 break
-            if not self._allocate_admitted_prefill(seq, hbm_probe, num_cached_blocks):
+            allocated = self._allocate_admitted_prefill(
+                seq, hbm_probe, num_cached_blocks
+            )
+            if allocated is None:
+                # Held a pass for the state offload's verdict on the image it
+                # would load; a gone image is forgotten and the retry plans
+                # without it. Base scheduler only: DecodeScheduler's
+                # `allocate_waiting` never passes `defer_unverified`, so it
+                # never holds.
+                prefix_waiters.append(seq)
+                continue
+            if not allocated:
                 # A state-less joint boundary could not be privatised without
                 # risking a shared decoding sequence's blocks (finding #2).
                 # Return the seq to waiting for a clean recompute once the pool
@@ -3917,11 +3928,17 @@ class Scheduler:
 
     def _allocate_admitted_prefill(
         self, seq: Sequence, hbm_probe: AdmissionProbe, num_cached_blocks: int
-    ) -> bool:
+    ) -> bool | None:
         """Admission's allocation (Phase 2 and early load): commit the probe,
         allocate keeping `num_cached_blocks` of HBM hit, and the draft round's
-        lookahead. False, with the seq deallocated, when `allocate` refused."""
-        self.block_manager.record_allocation(seq, hbm_probe)
+        lookahead. None, with nothing committed, when the state offload holds
+        the admission for a verdict on the image it would load
+        (`record_allocation(defer_unverified=True)`); retry a pass later. False,
+        with the seq deallocated, when `allocate` refused."""
+        if not self.block_manager.record_allocation(
+            seq, hbm_probe, defer_unverified=True
+        ):
+            return None
         if not self.block_manager.allocate(seq, num_cached_blocks):
             self.block_manager.deallocate(seq)
             return False
@@ -4154,6 +4171,9 @@ class Scheduler:
         # Guarded like the `_settle_state_load` / `_publish_state_stores`
         # siblings: a scheduler built without a block manager (the connector
         # test doubles) would otherwise AttributeError on the bare deref.
+        offload = getattr(getattr(self, "block_manager", None), "state_offload", None)
+        if offload is not None:
+            offload.publish_touches(self.kv_connector)
         take = getattr(getattr(self, "block_manager", None), "take_state_loads", None)
         if take is None:
             return
@@ -4343,7 +4363,10 @@ class Scheduler:
                     state.skip(seq.id, "max_frac")
                     state.retry_at[seq.id] = state.tick + self._EARLY_LOAD_RETRY_TICKS
                     continue
-            if self._early_load_admit(seq, hbm_probe, needs_remote_load):
+            admitted = self._early_load_admit(seq, hbm_probe, needs_remote_load)
+            if admitted is None:
+                continue  # held for a state verdict; retried later
+            if admitted:
                 parked += 1
             else:
                 break  # the pool refused the allocation
@@ -4356,11 +4379,13 @@ class Scheduler:
         seq: Sequence,
         hbm_probe: AdmissionProbe,
         needs_remote_load: bool,
-    ) -> bool:
+    ) -> bool | None:
         """Phase 2's admission up to the park, for a request not at its turn.
 
         Returns False when the pool could not take the request (nothing is
-        changed); True otherwise, whether the request parked or was taken back.
+        changed); None when the state offload holds it for a verdict (nothing is
+        changed; retried after `_EARLY_LOAD_RETRY_TICKS`); True otherwise,
+        whether the request parked or was taken back.
         Phase 2's steps, through the same helpers (`_allocate_admitted_prefill`,
         `_finish_prefill_admission`, `_confirm_remote_load_after_alloc`,
         `_drop_state_leg_of_kv_load`); what differs is that a result that would
@@ -4368,9 +4393,14 @@ class Scheduler:
         """
         state = self._early_load
         prev_hit = seq.prefix_cache_hit_tokens
-        if not self._allocate_admitted_prefill(
+        allocated = self._allocate_admitted_prefill(
             seq, hbm_probe, hbm_probe.num_cached_blocks
-        ):
+        )
+        if allocated is None:
+            state.skip(seq.id, "state_unverified")
+            state.retry_at[seq.id] = state.tick + self._EARLY_LOAD_RETRY_TICKS
+            return None
+        if not allocated:
             seq.prefix_cache_hit_tokens = prev_hit
             return False
         self._finish_prefill_admission(seq)
@@ -5613,6 +5643,9 @@ class Scheduler:
         # against a `get` that must miss.
         bm = getattr(self, "block_manager", None)
         offload = getattr(bm, "state_offload", None)
+        if offload is not None:
+            # Touch verdicts, before the next admission pass reads them.
+            offload.collect_touch_verdicts(self.kv_connector)
         take = getattr(self.kv_connector, "take_state_reports", None)
         if offload is not None and take is not None:
             indexed, failed = take()
