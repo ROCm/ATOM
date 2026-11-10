@@ -1265,6 +1265,49 @@ def test_offload_tier_profile_reads_the_kv_transfer_config(monkeypatch):
     assert both.loads
 
 
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("multi", [False, True])
+@pytest.mark.parametrize("different", ["master", "metadata", None])
+def test_store_prefix_tier_requires_one_pool(nested, multi, different):
+    from types import SimpleNamespace
+
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+    first = {"master": "127.0.0.1:50051", "metadata": "http://127.0.0.1:8080"}
+    second = dict(first)
+    if different:
+        second[different] = (
+            "127.0.0.1:50052" if different == "master" else "http://127.0.0.1:8081"
+        )
+    extras = {"mooncake_store.pools": {"rdma0": first, "rdma1": second}}
+    leaf = {"kv_connector": "mooncake_store", "kv_role": "offload"}
+    leaf.update({"kv_connector_extra_config": extras} if nested else extras)
+    kvc = {"kv_connector": "multi", "connectors": [leaf]} if multi else leaf
+    config = SimpleNamespace(kv_transfer_config=kvc)
+    if different:
+        with pytest.raises(ValueError, match="requires one shared Mooncake Store pool"):
+            KVConnectorFactory.offload_tier(config)
+    else:
+        assert KVConnectorFactory.offload_tier(config).loads
+
+
+@pytest.mark.parametrize("pools", [None, {}, [], "invalid", {"rdma0": {}}])
+def test_store_prefix_tier_validates_explicit_pool_config(pools):
+    from types import SimpleNamespace
+
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+    config = SimpleNamespace(
+        kv_transfer_config={
+            "kv_connector": "mooncake_store",
+            "kv_role": "offload",
+            "kv_connector_extra_config": {"mooncake_store.pools": pools},
+        }
+    )
+    with pytest.raises(ValueError):
+        KVConnectorFactory.offload_tier(config)
+
+
 @pytest.mark.parametrize(
     "local,hit,min_load,credit",
     [

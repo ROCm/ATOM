@@ -56,6 +56,11 @@ standalone offload connector in `--kv-transfer-config`. This is a
 single-node (non-P/D) setup: V4.1 does not admit a `multi` connector, so the
 Store cannot be combined with Mooncake P/D in the same server. Store capacity is a deployment choice, not reserved by these flags.
 
+If using `mooncake_store.pools` to name requester NICs, every NIC alias must
+resolve to the same `(master, metadata)` pair. Active `prefix_spread` rejects
+distinct per-NIC pools: the destination worker cannot load another pool's
+prefix. Other routing policies can still use distinct pools.
+
 ## Validation and performance
 
 Before interpreting throughput, verify positive `loaded_tokens`, zero

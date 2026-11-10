@@ -1103,6 +1103,7 @@ class Scheduler:
             return prefillable, min(pending, budget)
         # A chunk counts the rows its forward computes, not the reused prefix.
         slots = self.max_num_seqs - len(self.running)
+        parked = self._num_parked_remote_kv
         for seq in self._waiting_prefills():
             offload_resume = self._is_offload_prefill_resume(seq)
             if offload_resume:
@@ -1116,7 +1117,7 @@ class Scheduler:
                 cached_blocks = self.block_manager.can_allocate_memoized(seq)
                 if cached_blocks < 0:
                     break  # Phase 2 also stops at the first allocation refusal.
-                if slots <= self._num_parked_remote_kv:
+                if slots <= parked:
                     # A connector query can pin remote KV, so leave it to
                     # admission. Do not count uncertain remote-slot fit as
                     # fill or mistake an individually fitting request for idle.
@@ -1151,6 +1152,10 @@ class Scheduler:
             prefillable = True
             pending += chunk
             slots -= 1
+            # The resume just consumed its virtual running slot; do not also
+            # reserve that same request in the fresh-admission parked count.
+            if offload_resume and getattr(seq, "_counted_as_inflight_load", False):
+                parked -= 1
             if pending >= budget:
                 return True, budget
             if slots == 0:

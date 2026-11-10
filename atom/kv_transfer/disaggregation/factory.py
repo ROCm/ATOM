@@ -203,6 +203,25 @@ class KVConnectorFactory:
                 "kv_role", "offload"
             )
             if cls.is_offload_backend(name) and role in ("offload", "kv_both"):
+                if name == "mooncake_store":
+                    from atom.kv_transfer.offload.config import connector_extras
+                    from atom.kv_transfer.offload.mooncake_store.config import (
+                        parse_mooncake_store_config,
+                    )
+
+                    # A worker can read only its NIC's pool. Backend-wide
+                    # prefix credit is valid only when all NIC aliases address
+                    # the same master/metadata pair. Other routing policies do
+                    # not ask for this profile and retain per-NIC pools.
+                    extras = connector_extras(sub.kv_transfer_config)
+                    if "mooncake_store.pools" in extras:
+                        store = parse_mooncake_store_config(sub.kv_transfer_config)
+                        if len(store.store_masters()) > 1:
+                            raise ValueError(
+                                "--dp-load-balance prefix_spread requires one shared "
+                                "Mooncake Store pool; mooncake_store.pools addresses "
+                                "distinct master/metadata pairs"
+                            )
                 tier = True
                 shared |= cls._shared_tier.get(name, False)
                 hook = cls._chunk_tokens.get(name)

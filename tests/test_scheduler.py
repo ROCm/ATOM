@@ -3698,3 +3698,64 @@ def test_abort_after_forward_keeps_actual_prefill_completion(
     )
     assert seq in finished
     assert seq.prefill_completed == final_chunk
+
+
+@pytest.mark.parametrize("resumes", [1, 2])
+@pytest.mark.parametrize("settled", ["loaded", "failed"])
+@pytest.mark.parametrize("counted", [False, True])
+def test_coalescing_ready_resume_consumes_one_slot(
+    seq_factory, resumes, settled, counted
+):
+    sched = _probe_sched(max_num_seqs=resumes + 2, max_num_batched_tokens=64)
+    sched.kv_connector = SimpleNamespace(is_offload=True)
+    decode = seq_factory([1000] * 4)
+    assert sched.block_manager.allocate(decode)
+    decode.status = SequenceStatus.RUNNING
+    decode.num_cached_tokens = 4
+    decode.append_token(1001)
+    decode.type = SequenceType.DECODE
+    sched.running.append(decode)
+    for i in range(resumes):
+        resume = seq_factory([2000 + i] * 16)
+        assert sched.block_manager.allocate(resume)
+        resume.num_cached_tokens = 8
+        resume.status = SequenceStatus.WAITING
+        setattr(
+            resume,
+            "offload_loaded" if settled == "loaded" else "offload_load_failed",
+            True,
+        )
+        if counted:
+            sched._count_inflight_load(resume)
+        sched.waiting.append(resume)
+    fresh = seq_factory([3000] * 16)
+    sched.waiting.append(fresh)
+    before = (
+        sched._num_parked_remote_kv,
+        [(q.status, list(q.block_table), q.num_cached_tokens) for q in sched.waiting],
+    )
+    assert sched._local_prefill_pending_work() == (True, resumes * 8 + 16)
+    assert (
+        sched._num_parked_remote_kv,
+        [(q.status, list(q.block_table), q.num_cached_tokens) for q in sched.waiting],
+    ) == before
+
+
+def test_coalescing_keeps_inflight_load_slot_reserved(seq_factory):
+    sched = _probe_sched(max_num_seqs=2, max_num_batched_tokens=64)
+    sched.kv_connector = SimpleNamespace(is_offload=True)
+    ready = seq_factory([2000] * 16)
+    assert sched.block_manager.allocate(ready)
+    ready.num_cached_tokens = 8
+    ready.status = SequenceStatus.WAITING
+    ready.offload_loaded = True
+    sched._count_inflight_load(ready)
+    inflight = seq_factory([2100] * 16)
+    assert sched.block_manager.allocate(inflight)
+    inflight.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+    sched._count_inflight_load(inflight)
+    fresh = seq_factory([3000] * 16)
+    sched.waiting.extend([ready, inflight, fresh])
+    assert sched._local_prefill_pending_work() == (True, 8)
+    assert sched._num_parked_remote_kv == 2
+    assert inflight.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
