@@ -1273,23 +1273,39 @@ class TestExplicitPlan:
         ubatch[0] = 0
         assert self._call(ba, owner=step, cache_owner=step) is ub0
 
-    def test_explicit_plan_api_accepts_required_or_optional_none(self, monkeypatch):
-        """ATOM always passes a plan; aiter may also allow callers to omit it."""
+    def test_explicit_plan_api_ignores_the_plan_default(self, monkeypatch):
+        """aiter defaults work_plan to None for MXFP4; ATOM always passes one."""
         from atom.model_ops import base_attention as ba
 
         mod = importlib.import_module("aiter.ops.flydsl.pa_decode")
 
-        def optional_plan(output, *a, work_plan=None, max_context_length=None):
+        def required(output, *a, work_plan, max_context_length=None):
+            raise AssertionError("not called")
+
+        def optional_none(output, *a, work_plan=None, max_context_length=None):
+            raise AssertionError("not called")
+
+        def other_default(output, *a, work_plan=..., max_context_length=None):
+            raise AssertionError("not called")
+
+        def pre_5809(output, query, work_plan=None):
             raise AssertionError("not called")
 
         def no_bound(output, *a, work_plan, sinks=None):
             raise AssertionError("not called")
 
+        cases = (
+            (required, True),
+            (optional_none, True),
+            (other_default, True),
+            (pre_5809, False),
+            (no_bound, False),
+        )
         try:
-            for old, expected in ((optional_plan, True), (no_bound, False)):
-                monkeypatch.setattr(mod, "pa_decode", old)
+            for fake, expected in cases:
+                monkeypatch.setattr(mod, "pa_decode", fake)
                 ba._flydsl_explicit_plan_api.cache_clear()
-                assert ba._flydsl_explicit_plan_api() is expected, old.__name__
+                assert ba._flydsl_explicit_plan_api() is expected, fake.__name__
         finally:
             monkeypatch.undo()
             ba._flydsl_explicit_plan_api.cache_clear()
