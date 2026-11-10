@@ -1306,10 +1306,12 @@ def sparse_attn_v4_paged_decode(
         )
     gfx = get_gfx()
     if gfx == "gfx1250" or gfx.startswith("gfx94"):
+        # BF16 AITER decode accepts independent output strides.
         return call_with_output(
             pa_decode_sparse,
             (q, unified_kv, kv_indices, kv_indptr, attn_sink, softmax_scale),
             out,
+            supports_strided_output=True,
             has_invalid=False,
             kv_scales=kv_scales,
         )

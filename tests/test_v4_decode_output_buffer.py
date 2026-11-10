@@ -6,6 +6,7 @@ import torch
 
 pytest.importorskip("aiter")
 from atom.model_ops.v4_kernels import paged_decode
+from atom.model_ops.v4_kernels.output_buffer import _accepts_output
 from atom.model_ops.v4_kernels.v4_quant import quantize_bf16_to_v4_2buff
 
 
@@ -136,3 +137,99 @@ def test_output_api_is_compile_safe(legacy):
     out = torch.empty(4)
     torch.compile(run, fullgraph=True, backend="eager")(torch.ones(4), out)
     torch.testing.assert_close(out, torch.full((4,), 2.0))
+
+
+def _decode_output_slice(q, layout):
+    n, heads, dim = q.shape
+    shape = (n + 2, heads, dim)
+    if layout == "rows":
+        shape = (2 * n + 2, heads, dim)
+    elif layout == "features":
+        shape = (n + 2, heads, 2 * dim)
+    elif layout == "transposed":
+        shape = (n + 2, dim, heads)
+    parent = torch.full(shape, -99.0, dtype=q.dtype, device=q.device)
+    if layout == "rows":
+        out = parent[1:-1:2]
+    elif layout == "features":
+        out = parent[1:-1, :, ::2]
+    elif layout == "transposed":
+        out = parent[1:-1].transpose(1, 2)
+    else:
+        out = parent[1:-1]
+    out.zero_()
+    return parent, out, parent == -99
+
+
+@pytest.mark.parametrize("gfx", ["gfx942", "gfx1250"])
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize(
+    "layout", ["allocate", "contiguous", "rows", "features", "transposed"]
+)
+def test_aiter_bf16_decode_output_dispatch(monkeypatch, gfx, legacy, layout):
+    monkeypatch.setattr(paged_decode, "get_gfx", lambda: gfx)
+    q = torch.arange(24.0).reshape(3, 2, 4)
+    seen = []
+
+    def current(*args, out=None, has_invalid=True, kv_scales=None):
+        assert has_invalid is False and kv_scales is None
+        seen.append(out)
+        return q + 1 if out is None else torch.add(q, 1, out=out)
+
+    def old(*args, has_invalid=True, kv_scales=None):
+        return current(*args, has_invalid=has_invalid, kv_scales=kv_scales)
+
+    monkeypatch.setattr(paged_decode, "pa_decode_sparse", old if legacy else current)
+    parent, out, untouched = _decode_output_slice(q, layout)
+    out = None if layout == "allocate" else out
+    result = paged_decode.sparse_attn_v4_paged_decode(
+        q,
+        q[0],
+        torch.empty(0, dtype=torch.int32),
+        torch.zeros(4, dtype=torch.int32),
+        torch.zeros(2),
+        0.5,
+        out=out,
+    )
+    assert len(seen) == 1 and seen[0] is (None if legacy else out)
+    if out is not None:
+        assert result is out
+    torch.testing.assert_close(result, q + 1)
+    assert torch.all(parent[untouched] == -99)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires ROCm GPU")
+@pytest.mark.parametrize("kv_splits", [1, 2])
+@pytest.mark.parametrize("layout", ["contiguous", "rows", "features", "transposed"])
+def test_aiter_bf16_decode_direct_output_on_device(monkeypatch, kv_splits, layout):
+    gfx = paged_decode.get_gfx()
+    if not (gfx.startswith("gfx94") or gfx in ("gfx950", "gfx1250")):
+        pytest.skip("requires a supported ROCm architecture")
+    kernel = paged_decode.pa_decode_sparse
+    if not _accepts_output(kernel):
+        pytest.skip("requires AITER's output-capable BF16 decode API")
+    seen = []
+
+    def record_destination(*args, out=None, **kwargs):
+        seen.append(out)
+        # Explicit block_h selects the shared Triton BF16 kernel on gfx950,
+        # where ATOM normally uses its native decode path instead of AITER.
+        return kernel(*args, out=out, block_h=16, kv_splits=kv_splits, **kwargs)
+
+    monkeypatch.setattr(paged_decode, "pa_decode_sparse", record_destination)
+    if gfx == "gfx950":
+        monkeypatch.setattr(paged_decode, "get_gfx", lambda: "gfx942")
+    torch.manual_seed(41)
+    n, heads, dim = 3, 16, 512
+    q = torch.randn(n, heads, dim, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(15, dim, device="cuda", dtype=q.dtype)
+    indices = torch.arange(15, device="cuda", dtype=torch.int32)
+    indptr = torch.tensor([0, 3, 8, 15], device="cuda", dtype=torch.int32)
+    sink = torch.randn(heads, device="cuda", dtype=torch.float32)
+    args = (q, kv, indices, indptr, sink, dim**-0.5)
+    expected = paged_decode.sparse_attn_v4_paged_decode(*args)
+    parent, out, untouched = _decode_output_slice(q, layout)
+    result = paged_decode.sparse_attn_v4_paged_decode(*args, out=out)
+    assert result is out and len(seen) == 2 and seen[1] is out
+    torch.testing.assert_close(result, expected, rtol=0, atol=0)
+    assert torch.all(parent[untouched] == -99)

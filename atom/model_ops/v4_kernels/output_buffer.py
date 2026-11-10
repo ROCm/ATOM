@@ -24,12 +24,20 @@ def _accepts_output(kernel):
 
 
 def call_with_output(
-    kernel, args, out, *, output_strides=None, supports_output=None, **kwargs
+    kernel,
+    args,
+    out,
+    *,
+    output_strides=None,
+    supports_strided_output=False,
+    supports_output=None,
+    **kwargs,
 ):
     """Write directly only when the destination satisfies the backend's layout.
 
     The default requires contiguous storage. Backends sharing Q/O strides
     supply ``output_strides``; their temporary must preserve those strides too.
+    Backends with independent output strides set ``supports_strided_output``.
     ``supports_output`` may be set for APIs whose output argument is guaranteed
     (native wrappers and the existing BF16 OPUS API). Other AITER APIs are
     inspected once. Kernel TypeErrors always propagate unchanged.
@@ -41,7 +49,7 @@ def call_with_output(
     )
     if accepts_output:
         compatible = (
-            out.is_contiguous()
+            supports_strided_output or out.is_contiguous()
             if output_strides is None
             else out.stride() == output_strides
         )

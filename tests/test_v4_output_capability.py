@@ -182,3 +182,35 @@ def test_contiguous_backend_stages_strided_output():
     assert result is out and seen == [None]
     torch.testing.assert_close(out, torch.full((3,), 2.0))
     assert torch.all(parent[[0, 2, 4, 6, 7]] == -9)
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("compiled", [False, True])
+def test_independent_output_strides_preserve_api_compatibility(legacy, compiled):
+    parent = torch.full((8,), -9.0)
+    out = parent[1:7:2]
+    seen = []
+
+    def old(x):
+        seen.append(None)
+        return x + 1
+
+    def current(x, *, out=None):
+        assert out is not None, "strided output took the allocating fallback"
+        seen.append(out)
+        return out.copy_(x).add_(1)
+
+    kernel = old if legacy else current
+
+    def run(x, out):
+        return output_buffer.call_with_output(
+            kernel, (x,), out, supports_strided_output=True
+        )
+
+    if compiled:
+        run = torch.compile(run, fullgraph=True, backend="eager")
+    result = run(torch.ones(3), out)
+    assert result is out and len(seen) == 1
+    assert seen[0] is (None if legacy else out)
+    torch.testing.assert_close(out, torch.full((3,), 2.0))
+    assert torch.all(parent[[0, 2, 4, 6, 7]] == -9)
