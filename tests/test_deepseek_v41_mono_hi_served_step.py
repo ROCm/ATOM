@@ -80,6 +80,7 @@ def test_the_anchors_are_the_next_ids_on_every_step(
     positions = torch.arange(12)
     rows = torch.tensor([5, 11])
     _context(monkeypatch, proposer_module, service)
-    staged = _proposer(proposer_module, [])._stage_anchors(2, ids, positions, rows)
+    proposer = _proposer(proposer_module, [])
+    staged = proposer._stage_anchors(proposer.block, 2, ids, positions, rows)
     assert staged["anchor_ids"].tolist() == [7, 9]
     assert staged["anchor_positions"].tolist() == [5, 11]
