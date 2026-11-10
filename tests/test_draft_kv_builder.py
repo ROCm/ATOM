@@ -346,3 +346,30 @@ def test_a_flash_pool_binds_entry_wide_flash_views_and_a_unit_scale(
     assert module.k_cache.shape[1] == pool.entry_tokens
     assert module.v_cache.shape == pool.fa_views(0)[1].shape
     assert module.k_scale.numel() == 1 and float(module.k_scale) == 1.0
+
+
+@pytest.mark.parametrize("declared", [True, False])
+def test_a_declared_pool_on_a_backend_that_cannot_own_one_is_refused(
+    monkeypatch, declared
+):
+    """A draft that declares a pool of its own on a backend that owns none is
+    refused here, not dropped: the target would still stage its slots and
+    fail later without a builder. A draft that declares none gets None."""
+    pytest.importorskip("aiter")
+    from atom.spec_decode.draft_kv import DraftKvPoolSpec, draft_kv_builder
+    from atom.utils import selector
+
+    class _Backend:
+        DRAFT_OWNS_KV_POOL = False
+
+    class _Draft:
+        kv_pool_spec = DraftKvPoolSpec() if declared else None
+
+    monkeypatch.setattr(selector, "get_attn_backend", lambda _family: _Backend)
+    monkeypatch.setattr(selector, "attn_family", lambda _cfg: None)
+    runner = SimpleNamespace(config=SimpleNamespace(kv_cache_dtype="bf16"))
+    if declared:
+        with pytest.raises(ValueError, match="cannot own a draft pool"):
+            draft_kv_builder(runner, None, _Draft())
+    else:
+        assert draft_kv_builder(runner, None, _Draft()) is None

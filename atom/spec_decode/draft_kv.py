@@ -60,10 +60,15 @@ def draft_kv_builder(model_runner, draft_hf, model):
     from atom.utils.selector import attn_family, get_attn_backend
 
     backend = get_attn_backend(attn_family(draft_hf))
+    spec = getattr(model, "kv_pool_spec", None)
     if not backend.DRAFT_OWNS_KV_POOL:
+        if spec is not None:
+            raise ValueError(
+                f"{type(model).__name__} declares a KV pool of its own, but its "
+                f"attention backend {backend.__name__} cannot own a draft pool"
+            )
         return None
 
-    spec = getattr(model, "kv_pool_spec", None)
     if spec is None:
         spec_kwargs, block_size = {}, None
     else:
@@ -77,6 +82,9 @@ def draft_kv_builder(model_runner, draft_hf, model):
         kv_dtype=dtypes.d_dtypes[model_runner.config.kv_cache_dtype],
         **spec_kwargs,
     )
+    # A way to build it, not the pool: how many rows it has is the walk's to
+    # say, and this runs from the proposer's `__init__` -- `build_drafter`
+    # still running, `runner.drafter` not yet set, nothing to walk.
     return DraftKvBuilder(model_runner, make_pool, block_size=block_size)
 
 
@@ -89,10 +97,10 @@ class DraftKvBuilder(PoolRowsMixin):
     target's builder. It does NOT drive prepare_decode/prepare_prefill; it
     piggybacks on the target builder's metadata flow during propose.
 
-    The caller that resolved the draft's flavor hands over a way to build the
-    pool, and the pool's own construction decides the views and the scale
-    binding. What is left is the part that is genuinely about being a draft --
-    its blocks are the target's blocks.
+    It knows nothing about attention: the caller that resolved the draft's
+    flavor hands over a way to build the pool. What is left is the part that is
+    genuinely about being a draft -- its blocks are the target's blocks,
+    re-paged at its own block size.
 
     `block_size` is the block the pool is built at; None takes the target
     builder's, which does not exist yet when this is constructed.
