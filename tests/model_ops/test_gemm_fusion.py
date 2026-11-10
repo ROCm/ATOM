@@ -25,6 +25,7 @@ import atom.model_ops.gemm_fusion.site as site_mod
 @pytest.fixture(autouse=True)
 def _reset_process_gate(monkeypatch):
     monkeypatch.setattr(site_mod, "_ENSURE_DONE", False)
+    monkeypatch.setattr(site_mod, "_PLUGIN", None)
 
 
 def _fwd_ctx():
@@ -80,7 +81,7 @@ class _Linear:
         return torch.zeros((x.shape[0], self.output_size), dtype=torch.bfloat16)
 
 
-def _site(mode="dense", provider_enabled=True):
+def _site(mode="dense", provider_enabled=True, kv_ready=True):
     attn = SimpleNamespace(
         impl=_impl(mode),
         sp_head_exchange=None,
@@ -91,7 +92,9 @@ def _site(mode="dense", provider_enabled=True):
         max_num_batched_tokens=8,
         aiter_provider_enable=("sp-qkv-provider",) if provider_enabled else (),
     )
-    return site_mod.QkvSite("layer0.qkv", attn, _Linear(), mode, config, out_width=2048)
+    site = site_mod.QkvSite("layer0.qkv", attn, _Linear(), mode, config, out_width=2048)
+    site.kv_ready = kv_ready
+    return site
 
 
 def _x():
@@ -307,6 +310,43 @@ def test_no_provider_enabled_never_touches_the_interface(monkeypatch):
     _install_gate(monkeypatch, route="native")
     site = _site(provider_enabled=False)
     assert site.run(_x(), torch.zeros((2, 1)), _positions(), None) == "OUT"
+
+
+def test_provider_deferred_until_kv_pool_ready(monkeypatch):
+    calls = _install_gate(monkeypatch, route="provider")
+    site = _site(kv_ready=False)
+    assert site.run(_x(), torch.zeros((2, 1)), _positions(), None) == "OUT"
+    assert calls == []
+    assert site._routes == {}
+    site.mark_kv_ready()
+    assert site.run(_x(), torch.zeros((2, 1)), _positions(), None) == "OUT"
+    assert len(calls) == 1
+
+
+def test_prepare_resets_provider_and_marks_sites_kv_ready(monkeypatch):
+    import atom.model_ops.gemm_fusion as gf
+
+    events = []
+    site = SimpleNamespace(
+        _routes={2: True},
+        mark_kv_ready=lambda: (
+            events.append("kv-ready"),
+            site._routes.clear(),
+        ),
+    )
+    monkeypatch.setattr(
+        provider,
+        "shutdown_aiter_providers",
+        lambda config, group=None: events.append("shutdown"),
+    )
+    monkeypatch.setattr(gf, "_warmup", lambda config, sites: events.append("warmup"))
+    monkeypatch.setattr(site_mod, "_sp_group", lambda: None)
+    registry = gf.GemmFusionSites(
+        [site], SimpleNamespace(aiter_provider_enable=("sp-qkv-provider",))
+    )
+    registry.prepare(None)
+    assert events == ["shutdown", "kv-ready", "warmup"]
+    assert site._routes == {}
 
 
 def test_provider_flag_on_without_interface_falls_back(monkeypatch):

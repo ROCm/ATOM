@@ -5089,6 +5089,10 @@ class RapidServeModelRunner(ModelRunner):
         from atom.utils.forward_context import set_kv_cache_data
 
         set_kv_cache_data(kv_cache_data)
+        if self.gemm_fusion is not None:
+            # IPC-imported pool replaces the one the sites may have prepared
+            # against; reset/re-warm before any fused call sees this final pool.
+            self.gemm_fusion.prepare(kv_cache_data)
 
     # ------------------------------------------------------------------
     # CU-masked stream pools + prefill forward

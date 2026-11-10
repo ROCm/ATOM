@@ -102,9 +102,16 @@ def configure_aiter_providers(config) -> bool:
         return False
 
     try:
+        import importlib
+
         import aiter
 
-        plugin = getattr(aiter, "plugin", None)
+        try:
+            plugin = importlib.import_module("aiter.plugin")
+        except Exception:  # noqa: BLE001 - test doubles/absent submodule
+            # A module attribute is only valid when something imported the
+            # submodule already; keep it as the fallback for test doubles.
+            plugin = getattr(aiter, "plugin", None)
         if plugin is None:
             raise AttributeError("aiter.plugin")
     except Exception:  # noqa: BLE001 - released aiter has no provider interface

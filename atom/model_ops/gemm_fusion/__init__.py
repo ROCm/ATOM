@@ -26,7 +26,30 @@ class GemmFusionSites:
         self.config = config
 
     def prepare(self, kv_cache_data):
-        """KV caches are bound by the provider on its first call."""
+        """The (re)allocated KV pool is now final: reset before any fused call.
+
+        The provider binds address-stable KV/output pointers at first prepare;
+        a dummy/compile-only run or an earlier pool must never be bound.  Drop
+        the provider session and every site's per-M gate verdict, mark the sites
+        KV-ready, then re-warm against the final pool.  Called from both the
+        allocating and the IPC-import cache paths, before warmup/capture.
+        """
+        from atom.aiter_provider import shutdown_aiter_providers
+
+        try:
+            from .site import _sp_group
+
+            group = _sp_group()
+        except Exception:  # noqa: BLE001 - teardown is best effort
+            group = None
+        logger.info(
+            "provider session: reset for final KV pool (%d sites); re-warming",
+            len(self.sites),
+        )
+        shutdown_aiter_providers(self.config, group=group)
+        for site in self.sites:
+            site.mark_kv_ready()
+        _warmup(self.config, self.sites)
 
     def before_step(self):
         pass
@@ -75,6 +98,8 @@ def _warmup(config, sites):
             "gemm_fusion: provider warmup did not succeed; every routed call "
             "will fall back to the non-fused path"
         )
+    else:
+        logger.info("provider session: created (warmup) for %d sites", len(sites))
     return warmed
 
 

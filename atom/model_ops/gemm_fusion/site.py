@@ -70,6 +70,24 @@ def _aiter():
     return aiter
 
 
+# Cached module-level import: `import aiter; aiter.plugin` is only valid when
+# something already imported the submodule in THIS process (spawn workers often
+# have not), so the forward process must import it explicitly.
+_PLUGIN = None
+
+
+def _aiter_plugin():
+    global _PLUGIN
+    if _PLUGIN is None:
+        import importlib
+
+        try:
+            _PLUGIN = importlib.import_module("aiter.plugin")
+        except Exception:  # noqa: BLE001 - interface absent/not a package in tests
+            _PLUGIN = getattr(_aiter(), "plugin", None)
+    return _PLUGIN
+
+
 # Process-local: the site-side enablement is idempotent at the point of use.
 _ENSURE_DONE = False
 
@@ -237,6 +255,13 @@ class QkvSite:
         self._group = None
         self._eps = float(attn.impl.q_norm.variance_epsilon)
         self._logged = set()
+        # False until GemmFusionSites.prepare() has seen the final KV pool.
+        self.kv_ready = False
+
+    def mark_kv_ready(self):
+        """The KV pool is final: drop per-M gate verdicts from any earlier pool."""
+        self.kv_ready = True
+        self._routes.clear()
 
     def _outputs(self, local_m):
         """Caller outputs for a provider-selected cell (shared, address-stable)."""
@@ -376,13 +401,24 @@ class QkvSite:
         """The init/first-use ``aiter.plugin.explain`` gate, cached per local M."""
         if not self.provider_enabled:
             return False
+        if not self.kv_ready:
+            # The provider binds address-stable caches/outputs at first prepare;
+            # never let a dummy/compile-only or pre-pool forward bind a temporary
+            # KV pool. ATOM's prepare(kv_cache_data) hook flips this after the
+            # final pool exists and resets the provider/gate caches.
+            self._log_once(
+                "kv-pending",
+                "gemm_fusion %s: provider deferred until the final KV pool",
+                self.name,
+            )
+            return False
         cached = self._routes.get(m)
         if cached is not None:
             return cached
         served = False
         try:
             aiter = _aiter()
-            plugin = getattr(aiter, "plugin", None)
+            plugin = _aiter_plugin()
             if plugin is None:
                 raise AttributeError("aiter.plugin")
             # Re-assert enablement at the point of use: the process running this
@@ -398,6 +434,14 @@ class QkvSite:
                 exc_info=True,
             )
         self._routes[m] = served
+        if served:
+            self._log_once(
+                "first-prepare",
+                "provider session: first-prepare %s mode=%s m=%d",
+                self.name,
+                self.mode,
+                m,
+            )
         self._log_once(
             "route" if served else f"fallback-{m}",
             "gemm_fusion %s: %s local M=%d",
