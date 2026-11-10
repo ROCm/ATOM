@@ -115,7 +115,7 @@ def test_first_served_step_writes_the_taps():
     m.r_a = {i: torch.zeros(1, 4, 8, dtype=torch.bfloat16) for i in AUX}
     bufs = [torch.zeros(4, 8, dtype=torch.bfloat16) for _ in AUX]
     cfg = types.SimpleNamespace(dspark_target_layer_ids=list(AUX))
-    m.cx_drafter = types.SimpleNamespace(_aux_buffers=bufs,
+    m.cx_drafter = types.SimpleNamespace(_aux_buffers=bufs, aux_extract=None,
                                          speculative_config=types.SimpleNamespace(draft_model_hf_config=cfg))  # fmt: skip
     taps = m._taps()
     assert [b for _, b in taps] == bufs and [r for r, _ in taps] == [
