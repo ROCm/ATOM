@@ -3,6 +3,8 @@ import time
 from threading import Event
 from types import SimpleNamespace
 
+import pytest
+
 from atom.kv_transfer.disaggregation.multi.multi_connector import (
     MultiConnectorScheduler,
 )
@@ -214,6 +216,65 @@ def test_a_hung_store_call_does_not_keep_the_process_alive():
         check=False,
     )
     assert "closed" in done.stdout, done.stderr
+    assert time.monotonic() - started < 20
+
+
+@pytest.mark.parametrize("pools", [1, 2])
+def test_a_hung_store_master_does_not_keep_the_process_alive(pools):
+    """The real lookup client, asking one shared pool or two per-NIC pools at
+    once, with a master RPC that never returns: after close() the process
+    exits. Two pools are asked on per-pool workers, which must be daemons."""
+    import subprocess
+    import sys
+    import textwrap
+
+    script = textwrap.dedent(f"""
+        import threading
+        from atom.kv_transfer.offload.mooncake_store import scheduler as S
+        from atom.kv_transfer.offload.mooncake_store.async_lookup import AsyncStoreLookup
+        from atom.kv_transfer.offload.mooncake_store.config import (
+            parse_mooncake_store_config,
+        )
+        from atom.model_engine.sequence import Sequence
+
+        entered = threading.Event()
+
+        class HungClient:
+            def __init__(self, **kwargs):
+                pass
+
+            def exists(self, keys):
+                entered.set()
+                threading.Event().wait()  # the master never answers
+
+        S.store_client.MooncakeStoreClient = HungClient
+        if {pools} == 1:
+            extra = {{"mooncake_store.master": "127.0.0.1:1",
+                      "mooncake_store.metadata": "http://127.0.0.1:2/metadata"}}
+        else:
+            extra = {{"mooncake_store.pools": {{
+                f"nic{{i}}": {{"master": f"127.0.0.{{i + 1}}:1",
+                              "metadata": f"http://127.0.0.{{i + 1}}:2/metadata"}}
+                for i in range({pools})}}}}
+        cfg = parse_mooncake_store_config({{"kv_connector_extra_config": extra}})
+        lookup = AsyncStoreLookup(
+            S._StoreLookup(cfg, namespace="t", world=1, chunk_tokens=cfg.chunk_tokens)
+        )
+        assert lookup.submit(Sequence(list(range(4 * cfg.chunk_tokens)), 16), "1")
+        assert entered.wait(10)
+        lookup.close()
+        print("closed", flush=True)
+        """)
+    started = time.monotonic()
+    done = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert "closed" in done.stdout, done.stderr
+    assert done.returncode == 0, done.stderr
     assert time.monotonic() - started < 20
 
 
