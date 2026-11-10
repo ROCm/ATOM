@@ -315,3 +315,43 @@ def test_the_manager_counts_stale_placements_from_rank_reports():
     _route(mgr._store_router, _seq(2, PREFIX), backlog, reqs)
     mgr._note_dp_reuse_locked([(2, 0), ("unknown", 0)])
     assert mgr._dp_route_counters["share_cache_stale_total"] == 1
+
+
+def test_share_cache_refuses_a_store_split_into_per_nic_pools():
+    """Each worker uses its own NIC's pool: with two pools a prefix one DP rank
+    saved is a hit another rank's load misses, so placing a request on any rank
+    would fail its load and recompute."""
+    import pytest
+
+    one = {
+        "mooncake_store.master": "127.0.0.1:1",
+        "mooncake_store.metadata": "http://127.0.0.1:2/metadata",
+    }
+    two = {
+        "mooncake_store.pools": {
+            f"nic{i}": {
+                "master": f"127.0.0.{i + 1}:1",
+                "metadata": f"http://127.0.0.{i + 1}:2/metadata",
+            }
+            for i in range(2)
+        }
+    }
+
+    def build(extra, ranks):
+        mgr = _bare_mgr(ranks)
+        mgr.global_engine_count = ranks
+        mgr._dp_session_affinity_enabled = False
+        mgr._dp_lb_req_equiv = 512
+        config = SimpleNamespace(
+            enable_prefix_caching=True,
+            kv_transfer_config={
+                "kv_connector": "mooncake_store",
+                "kv_connector_extra_config": extra,
+            },
+        )
+        return mgr._build_store_router(config)
+
+    assert isinstance(build(one, 2), ShareCacheRouter)
+    assert isinstance(build(two, 1), ShareCacheRouter)  # one rank: nothing to share
+    with pytest.raises(ValueError, match="splits it into 2 pools"):
+        build(two, 2)
