@@ -441,15 +441,11 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
     def _start_state_stores(self, metadata) -> None:
         """Hand this step's ready checkpoints to the tier's executor.
 
-        No staging copy: the source is the checkpoint's PAGE units, reserved
-        out of the KV pool and pinned by the engine, so the packer gathers
-        straight from where they sit. It does need a producer fence. The engine
-        marks a checkpoint READY once the batch whose `build()` copies the
-        Active Slot into those units has been *issued*, not run, and on a PP
-        stage that copy may sit a whole pipeline depth behind in the compute
-        stream. Metadata reaches each stage after every batch scheduled before
-        it, so one event recorded here on the compute stream orders the gather
-        after the copy.
+        No staging copy: the source is the checkpoint's PAGE units, reserved out
+        of the KV pool and pinned by the engine, so the packer gathers straight
+        from where they sit. A checkpoint is READY once the batch carrying its
+        slot->PAGE copy was issued, not once the copy ran, so every store waits
+        on one event recorded on the current stream here, behind that copy.
 
         A store with no tier is reported failed rather than dropped -- the
         engine holds those units pinned against a report, and silence would
@@ -468,12 +464,9 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
                 self._store_failed_no_tier.add(op)
             return
         try:
-            producer_event = torch.cuda.Event()
-            producer_event.record(torch.cuda.current_stream())
+            ready_event = torch.cuda.Event()
+            ready_event.record(torch.cuda.current_stream())
         except Exception:
-            # Nothing has read the units yet, so failing the step's stores
-            # releases them safely; an unfenced gather could store a stale image
-            # under a valid hash.
             logger.exception(
                 "kimi_k3 offload: state store fence creation failed; failing "
                 "%d store(s).",
@@ -489,9 +482,7 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
             # reconciler's full timeout, without escaping past super().
             try:
                 self._state_tier.submit_store(
-                    op,
-                    tuple(int(u) for u in unit_ids),
-                    producer_event=producer_event,
+                    op, tuple(int(u) for u in unit_ids), ready_event
                 )
             except Exception:
                 logger.exception(
