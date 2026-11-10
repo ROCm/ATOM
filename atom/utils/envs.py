@@ -539,12 +539,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 0 to disable this soft budget; chunking still enforces aiter's hard 2 GiB
     # buffer-descriptor cap, above which the kernel fails to compile and aborts
     # the process (see atom/model_ops/sparse_indexer_chunk.py).
-    # It also sizes the shared FP8 prefill/decode logits workspace, allocated
-    # before profiling so the KV budget counts it. Lowering the budget saves
-    # memory by scoring fewer query rows per launch, without changing the
-    # scheduler's max_num_batched_tokens.
+    # It also sizes the decode logits workspace (`max_model_len` wide, held for
+    # the server's life and counted in the KV budget) and so its band count:
+    # lowering it saves memory but splits decode into more launches.
     "ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB": lambda: int(
-        os.getenv("ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB", "1024")
+        os.getenv("ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB", "2048")
     ),
     # DeepSeek-V4 prefill indexer under plain TP: each TP rank scores and
     # top-ks only every TP-th query row (each against the full key set) and the

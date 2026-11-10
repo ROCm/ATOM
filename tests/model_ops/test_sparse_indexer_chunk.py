@@ -26,7 +26,7 @@ from atom.model_ops.sparse_indexer_chunk import (
 )
 from atom.utils import envs
 
-_DEFAULT_BUDGET_MB = 1024
+_DEFAULT_BUDGET_MB = 2048
 
 
 def _logits_bytes(rows: int, row_width: int) -> int:
@@ -47,11 +47,8 @@ def _logits_bytes(rows: int, row_width: int) -> int:
         (128, 4 * 1024 * 1024),  # below one 128-row tile
     ],
 )
-@pytest.mark.parametrize("budget_mb", [_DEFAULT_BUDGET_MB, 2048])
-def test_chunk_keeps_the_buffer_strictly_under_the_2gib_cap(
-    total_rows, row_width, budget_mb
-):
-    rows = sparse_indexer_row_chunk(total_rows, row_width, budget_mb)
+def test_chunk_keeps_the_buffer_strictly_under_the_2gib_cap(total_rows, row_width):
+    rows = sparse_indexer_row_chunk(total_rows, row_width, _DEFAULT_BUDGET_MB)
     assert 0 < rows <= total_rows
     assert _logits_bytes(rows, row_width) < _BUFFER_DESCRIPTOR_LIMIT_BYTES
 
@@ -83,9 +80,9 @@ def test_chunks_land_on_the_kernels_128_row_tile():
 
 
 def test_below_one_tile_it_degrades_by_powers_of_two_not_to_one():
-    # A row so wide that the budget affords only 31 of them (8 MiB x 4 B each).
+    # A row so wide that the budget affords only 63 of them (8 MiB x 4 B each).
     rows = sparse_indexer_row_chunk(4096, 8 * 1024 * 1024, _DEFAULT_BUDGET_MB)
-    assert rows == 16
+    assert rows == 32
     assert _logits_bytes(rows, 8 * 1024 * 1024) < _BUFFER_DESCRIPTOR_LIMIT_BYTES
 
 
@@ -112,7 +109,7 @@ def budget(monkeypatch):
 @pytest.mark.parametrize("next_n", [1, 2, 3, 4, 8])
 @pytest.mark.parametrize("bs", [1, 7, 96, 129, 512])
 @pytest.mark.parametrize("width", [8192, 131072, _GLM52_WIDTH, 3 << 20])
-@pytest.mark.parametrize("budget_mb", [0, 64, _DEFAULT_BUDGET_MB, 2048])
+@pytest.mark.parametrize("budget_mb", [0, 64, 2048])
 def test_a_decode_band_is_whole_requests_within_the_budget(
     budget, next_n, bs, width, budget_mb
 ):
@@ -144,8 +141,8 @@ def test_a_batch_that_fits_is_one_band(budget):
     assert decode_band_rows(32 * 4, _GLM52_WIDTH, 4) == 128
 
 
-def test_glm52_mtp3_at_bs512_is_sixteen_bands_of_32_requests(budget):
-    assert decode_band_rows(512 * 4, _GLM52_WIDTH, 4) == 128
+def test_glm52_mtp3_at_bs512_is_six_bands_of_96_requests(budget):
+    assert decode_band_rows(512 * 4, _GLM52_WIDTH, 4) == 384
 
 
 def test_the_workspace_capacity_clamps_the_band(budget):

@@ -290,7 +290,7 @@ events belong to `EngramStaging` and are reused across forwards.
 
 Eager prefill expands index tile tables only through the largest request end,
 including cached prefixes. Paged scoring bounds each logits band by both its
-addressing limit and `ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB` (default 1024 MiB).
+addressing limit and `ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB` (default 2048 MiB).
 Decode retains fixed-width metadata for graph replay. TBO uses the existing
 single warmup and KV sizing calculation, with no additional budget policy.
 
