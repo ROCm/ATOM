@@ -15,7 +15,7 @@ One program per row, one wave: the rows are independent and short.
 import torch
 import triton
 import triton.language as tl
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx_runtime
 
 EXPERTS = 384
 MAX_ROWS = 1024  # the multiwave kernel's row range in topk_gating
@@ -167,7 +167,7 @@ def _v41_route_topk_kernel(
 
 def route_topk_supported(gating_output, bias, topk, renormalize) -> bool:
     return (
-        get_gfx() in ("gfx1250", "gfx1250-strict")
+        get_gfx_runtime() == "gfx1250"
         and renormalize
         and 1 <= topk <= 8
         and gating_output.dim() == 2
