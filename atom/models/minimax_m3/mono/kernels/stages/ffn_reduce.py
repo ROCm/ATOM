@@ -30,6 +30,13 @@ def ffn_reduce_defs(k4ctx):
     sym = k4ctx["sym"]
     tid = k4ctx["tid"]
     tokens = k4ctx["tokens"]
+    # gfx1250: a token's next-layer K1 inputs from the finished rows (row_pair,
+    # 16 a token in order), ``ffn_next(t, token, row_pair, row, sum0, sum1)``
+    ffn_next = k4ctx.get("ffn_next")
+    ffn_next_pre = k4ctx.get("ffn_next_pre")
+    # the barrier after the partial rows' push (gfx1250: LDS alone, the stores
+    # not waited for)
+    push_barrier = k4ctx.get("push_barrier", gpu.barrier)
 
     def ffn_finish(t):
         """misc (row group t's bf16 partial rows, token k's DN_ROWS from k DN_ROWS)
@@ -40,9 +47,15 @@ def ffn_reduce_defs(k4ctx):
         if const_expr(W > 1):  # push bf16 partial rows: wave w -> peer w
             # (with AG_RS to the row group's owner rank only)
             push_rows("ffn", t * DN_ROWS, DN_ROWS, t % W if AG_RS else None)
-            gpu.barrier()
+            push_barrier()
         if tid < DN_ROWS // 2 * tokens:
             row = t * DN_ROWS + row_pair * 2
+            # gfx1250: the next layer's inputs' loads out before the peers' wait
+            pre = (
+                ffn_next_pre(t, row_tok, row_pair, row)
+                if ffn_next_pre is not None
+                else None
+            )
             if const_expr(W == 1):
                 t0 = fx.ptr_load(misc + tid * 2)
                 t1 = fx.ptr_load(misc + (tid * 2 + 1))
@@ -86,5 +99,7 @@ def ffn_reduce_defs(k4ctx):
                 rsrc(ar_out),
                 row_tok * HIDDEN + row,
             )
+            if const_expr(ffn_next is not None):
+                ffn_next(t, row_tok, row_pair, row, t0, t1, pre)
 
     return {"ffn_finish": ffn_finish}
