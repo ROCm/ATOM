@@ -10,6 +10,10 @@ from types import SimpleNamespace
 import pytest
 
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+from atom.kv_transfer.disaggregation.multi.multi_connector import (
+    MultiConnectorScheduler,
+)
+from atom.kv_transfer.disaggregation.types import ConnectorCompletion, StateTouchId
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload.connector import (
     LMCacheOffloadConnector,
@@ -24,6 +28,11 @@ from atom.kv_transfer.offload.hybrid.dsv4.connector import (
     DSV4OffloadConnector,
     DSV4OffloadScheduler,
 )
+from atom.kv_transfer.offload.hybrid.kimi_k3.connector import (
+    STATE_TOUCH_CHANNEL,
+    KimiK3OffloadScheduler,
+)
+from atom.model_engine.state_offload import StateOffloadIndex
 
 
 def _config(*, compress_ratios=None, layout=None):
@@ -147,3 +156,32 @@ def test_scheduler_shell_forwards_statistics():
     shell._impl = SimpleNamespace(get_statistics=lambda: expected)
 
     assert shell.get_statistics() is expected
+
+
+@pytest.mark.parametrize("composite", [False, True], ids=["shell", "multi"])
+def test_state_touches_round_trip_through_the_scheduler_shells(
+    composite, offload_clock
+):
+    impl = KimiK3OffloadScheduler.__new__(KimiK3OffloadScheduler)
+    impl._pending_state_touches = []
+    impl._touch_generation = 0
+    impl._state_touch_verdicts = {}
+    connector = LMCacheOffloadConnectorScheduler.__new__(
+        LMCacheOffloadConnectorScheduler
+    )
+    connector._impl = impl
+    if composite:
+        shell = connector
+        connector = MultiConnectorScheduler.__new__(MultiConnectorScheduler)
+        connector._connectors = [SimpleNamespace(), shell]
+    idx = StateOffloadIndex(verified_for_s=5.0)
+    idx.note_stored(7)
+    offload_clock[0] += 1
+    idx.want_touch(7)
+    idx.publish_touches(connector)
+    assert idx.refresh_hits, "the touch reached the tier"
+    impl.connector_completion(
+        ConnectorCompletion(STATE_TOUCH_CHANNEL, StateTouchId(7, 0), False)
+    )
+    idx.collect_touch_verdicts(connector)
+    assert not idx.could_serve(7), "the verdict came back"

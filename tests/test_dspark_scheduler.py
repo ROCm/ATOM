@@ -629,11 +629,14 @@ def test_ell_stage_ring_allocates_on_cpu_under_a_gpu_default_device():
     vs = _fresh_scheduler()
     vs.runner = _StubRunner()
 
+    previous = _torch.get_default_device()
     _torch.set_default_device("cuda")
     try:
         slot = vs._ell_stage(4)
     finally:
-        _torch.set_default_device(None)
+        # `None` would leave torch's global device context empty for every
+        # later test that reads the default device.
+        _torch.set_default_device(previous)
 
     assert slot.device.type == "cpu"
     assert slot.is_pinned()
@@ -945,6 +948,7 @@ def _decode_batch(width, num_spec_step):
     from types import SimpleNamespace
 
     return SimpleNamespace(
+        has_prefill=False,
         total_tokens_num_prefill=0,
         total_seqs_num_decode=1,
         total_tokens_num_decode=width,

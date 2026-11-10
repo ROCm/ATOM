@@ -55,8 +55,14 @@ import torch
 import triton
 import triton.language as tl
 
+from atom.model_ops.blockscale_kernels.quantization import (
+    fp4_groups,
+    fp4_pack,
+    fp8_groups,
+)
 from atom.model_ops.v4_kernels.compress_plan import CompressPlan
 from atom.model_ops.v4_kernels.pool_index import row_offset
+from atom.model_ops.v4_kernels.state_writes import write_compressor_state_row
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
 
@@ -74,6 +80,9 @@ except Exception:  # noqa: BLE001 - an optional kernel probe, not an error path
     # below is correct for every one of those failures.
     flydsl_fused_compress_attn = None
     flydsl_hca_compress_attn = None
+
+# `quant_mode` -> the kernel's PACKED: CSA2 main rows, values then scales
+PACKED_ROWS = {"packed_fp8": 1, "packed_fp4": 2}
 
 # Supported (head_dim, rope_head_dim, ratio, overlap) tuples for the flydsl
 # kernel — matches V4-Pro Main (D=512) and Indexer-inner (D=128) compressors.
@@ -112,11 +121,9 @@ def _fused_compress_attn_kernel(
     cos_cache_ptr,  # [max_seq, rope_head_dim/2] bf16 (after .squeeze)
     sin_cache_ptr,
     cos_sin_pos_stride,  # = rope_head_dim // 2
-    # ── Optional latent echoes, before and after the rotation ───────────
+    # ── Optional latent echo, before the rotation ───────────────────────
     latent_out_ptr,  # [plan_capacity, head_dim]; dummy ptr when LATENT_OUT=0
     latent_out_row_stride,
-    rotated_out_ptr,  # same shape; dummy ptr when ROTATED_OUT=0
-    rotated_out_row_stride,
     # ── KV cache scatter (paged) ────────────────────────────────────────
     kv_cache_ptr,  # bf16: [NB, k_per_block, head_dim] / fp8: [NB, k_per_block, head_dim]
     kv_cache_block_stride,
@@ -128,6 +135,9 @@ def _fused_compress_attn_kernel(
     k_per_block,
     head_dim,
     rope_head_dim,
+    # ── The ring update, in the same launch (WRITE_RING) ────────────────
+    write_plan_ptr,  # [num_write, 4] int32; dummy ptr when WRITE_RING=0
+    compress_programs,  # programs past this many run write-plan rows
     # ── constexpr ───────────────────────────────────────────────────────
     BLOCK_D: tl.constexpr,  # = next_pow2(head_dim)
     HALF_ROPE: tl.constexpr,  # = rope_head_dim // 2
@@ -141,7 +151,12 @@ def _fused_compress_attn_kernel(
     #   ≤ STATE_SIZE; used for `s = position - K + 1 + k_static` loop bound
     HAS_BLOCK_TABLE: tl.constexpr,
     LATENT_OUT: tl.constexpr,  # echo the post-norm pre-RoPE latent (CSA2 index key)
-    ROTATED_OUT: tl.constexpr,  # echo the rotated latent (CSA2 packed main)
+    # `update_compressor_states`'s rows as this launch's last programs
+    WRITE_RING: tl.constexpr,
+    BLOCK_RING: tl.constexpr,  # = next_pow2(dim_full)
+    # CSA2 main rows as values then scales, a row a kv_cache token (uint8):
+    # 0 none, 1 E4M3 + E8M0 a 32, 2 E2M1 + E4M3 a 16 (`PACKED_ROWS`)
+    PACKED: tl.constexpr,
     QUANT: tl.constexpr,  # 0 = raw BF16 (CSA/HCA Main), 1 = FP8 e4m3 + ue8m0 scale (Indexer)
     USE_UE8M0: tl.constexpr,  # round scale to power-of-2 (only when QUANT == 1)
     PRESHUFFLE: tl.constexpr,  # MFMA 16x16 preshuffled FP8 layout (only when QUANT == 1)
@@ -156,6 +171,30 @@ def _fused_compress_attn_kernel(
     are sentinel-marked (position == -1) and bail before any load /
     store / scatter."""
     pid = tl.program_id(0)
+    # a constexpr gate outside, a runtime condition inside: not one `and`
+    if WRITE_RING:  # noqa: SIM102
+        if pid >= compress_programs:
+            write_compressor_state_row(
+                pid - compress_programs,
+                kv_in_ptr,
+                kv_in_row_stride,
+                score_in_ptr,
+                score_in_row_stride,
+                ape_ptr,
+                write_plan_ptr,
+                state_slot_mapping_ptr,
+                kv_state_ptr,
+                kv_state_slot_stride,
+                kv_state_pos_stride,
+                score_state_ptr,
+                score_state_slot_stride,
+                score_state_pos_stride,
+                dim_full,
+                STATE_SIZE,
+                RATIO,
+                BLOCK_RING,
+            )
+            return
     plan_base = plan_ptr + pid * 4
     ragged_id = tl.load(plan_base + 0)
     batch_id = tl.load(plan_base + 1)
@@ -169,6 +208,29 @@ def _fused_compress_attn_kernel(
 
     d = tl.arange(0, BLOCK_D)
     d_mask = d < head_dim
+
+    # Every load that does not depend on the pool goes out ahead of it, so its
+    # latency hides under the pool's rather than following it.
+    rms_w = tl.load(rms_weight_ptr + d, mask=d_mask, other=0.0)
+    comp_pos = (position // RATIO) * RATIO
+    NUM_PAIRS: tl.constexpr = BLOCK_D // 2
+    pair_idx = tl.arange(0, NUM_PAIRS)
+    is_rope_pair = pair_idx >= (head_dim - rope_head_dim) // 2
+    # Every pair reads the table row, unmasked so the reads stay contiguous
+    # (the host holds the NoPE width to whole table rows); a NoPE pair then
+    # takes cos 1 with sin 0, the identity rotation.
+    cos_sin_off = comp_pos * cos_sin_pos_stride + pair_idx % HALF_ROPE
+    cos_row = tl.load(cos_cache_ptr + cos_sin_off)
+    sin_row = tl.load(sin_cache_ptr + cos_sin_off)
+    if HAS_BLOCK_TABLE:
+        # block_table[batch_id, ci // k_per_block] → physical_block.
+        # slot_in_block = ci % k_per_block. Same address resolution as
+        # `indexer_k_quant_and_cache` (which used a pre-flattened slot_mapping
+        # = physical_block * k_per_block + slot_in_block).
+        ci = position // RATIO
+        physical_block = tl.load(
+            block_table_ptr + batch_id * block_table_seq_stride + ci // k_per_block
+        ).to(tl.int64)
 
     # ── 1. Per-source-position load + online softmax-pool ──────────────
     # Two-phase split (vs. the older single masked loop): for each program
@@ -276,7 +338,6 @@ def _fused_compress_attn_kernel(
     compressed = kv_acc / w_acc  # [BLOCK_D] fp32
 
     # ── 2. RMSNorm (fp32) ──────────────────────────────────────────────
-    rms_w = tl.load(rms_weight_ptr + d, mask=d_mask, other=0.0)
     compressed_masked = tl.where(d_mask, compressed, 0.0)
     var = tl.sum(compressed_masked * compressed_masked, axis=0) / head_dim
     rrms = tl.rsqrt(var + rms_eps)
@@ -294,43 +355,14 @@ def _fused_compress_attn_kernel(
         )
 
     # ── 3. RoPE on rope_head_dim segment (GPT-J interleaved, fp32) ────
-    comp_pos = (position // RATIO) * RATIO
-    NUM_PAIRS: tl.constexpr = BLOCK_D // 2
-    NOPE_PAIRS = (head_dim - rope_head_dim) // 2
-
     pair_2d = tl.reshape(normed, (NUM_PAIRS, 2))
     even_v, odd_v = tl.split(pair_2d)  # each [NUM_PAIRS]
-
-    pair_idx = tl.arange(0, NUM_PAIRS)
-    rope_pair_local = pair_idx - NOPE_PAIRS
-    is_rope_pair = rope_pair_local >= 0
-    cs_idx = tl.maximum(rope_pair_local, 0)
-
-    cos_per_pair = tl.load(
-        cos_cache_ptr + comp_pos * cos_sin_pos_stride + cs_idx,
-        mask=is_rope_pair,
-        other=1.0,
-    ).to(tl.float32)
-    sin_per_pair = tl.load(
-        sin_cache_ptr + comp_pos * cos_sin_pos_stride + cs_idx,
-        mask=is_rope_pair,
-        other=0.0,
-    ).to(tl.float32)
+    cos_per_pair = tl.where(is_rope_pair, cos_row.to(tl.float32), 1.0)
+    sin_per_pair = tl.where(is_rope_pair, sin_row.to(tl.float32), 0.0)
 
     new_even = even_v * cos_per_pair - odd_v * sin_per_pair
     new_odd = odd_v * cos_per_pair + even_v * sin_per_pair
     rotated = tl.interleave(new_even, new_odd)  # [BLOCK_D] fp32
-
-    # A pool this kernel cannot scatter into still wants the value it would
-    # have written -- packed CSA2 quantizes and interleaves it host-side, and
-    # rotating a second time in torch would put a different BF16 rounding on
-    # the two paths, which the FP4 grid then turns into whole-level flips.
-    if ROTATED_OUT:
-        tl.store(
-            rotated_out_ptr + pid * rotated_out_row_stride + d,
-            rotated.to(rotated_out_ptr.dtype.element_ty),
-            mask=d_mask,
-        )
 
     # ── 4. Cache scatter (paged) ───────────────────────────────────────
     # The Compressor's BF16 return value was historically consumed by sparse
@@ -339,18 +371,36 @@ def _fused_compress_attn_kernel(
     # indexer pool. So no caller-visible `out` write; the cache scatter IS
     # the only output.
     if HAS_BLOCK_TABLE:
-        # block_table[batch_id, ci // k_per_block] → physical_block.
-        # slot_in_block = ci % k_per_block. Same address resolution as
-        # `indexer_k_quant_and_cache` (which used a pre-flattened slot_mapping
-        # = physical_block * k_per_block + slot_in_block).
-        ci = position // RATIO
-        block_in_seq = ci // k_per_block
         slot_in_block = ci % k_per_block
-        physical_block = tl.load(
-            block_table_ptr + batch_id * block_table_seq_stride + block_in_seq
-        ).to(tl.int64)
 
-        if QUANT:
+        if PACKED:
+            row = (
+                kv_cache_ptr
+                + physical_block * kv_cache_block_stride
+                + slot_in_block * kv_cache_token_stride
+            )
+            # The row's BF16 value is what is quantized: the rounding a BF16
+            # pool stores, then `quantize_fp8` / `quantize_fp4`'s rule on it
+            x = rotated.to(tl.bfloat16).to(tl.float32)
+            if PACKED == 1:
+                q, code, _ = fp8_groups(tl.reshape(x, (BLOCK_D // 32, 32)))
+                tl.store(row + d, tl.reshape(q, (BLOCK_D,)).to(tl.uint8, bitcast=True))
+                g = tl.arange(0, BLOCK_D // 32)
+                tl.store(row + BLOCK_D + g, code.to(tl.uint8))
+            else:
+                code, sign, scale, _ = fp4_groups(
+                    tl.reshape(x, (BLOCK_D // 16, 16)), True
+                )
+                tl.store(
+                    row + tl.arange(0, BLOCK_D // 2),
+                    tl.reshape(fp4_pack(code, sign), (BLOCK_D // 2,)),
+                )
+                g = tl.arange(0, BLOCK_D // 16)
+                tl.store(
+                    row + BLOCK_D // 2 + g,
+                    scale.to(tl.float8e4nv).to(tl.uint8, bitcast=True),
+                )
+        elif QUANT:
             # FP8 e4m3 quantization: per-row amax → ue8m0 (or raw) scale →
             # clamp+cast to fp8 → write preshuffled (MFMA 16x16 tile) or
             # linear layout into the FP8 region; write the fp32 scale into
@@ -444,7 +494,8 @@ def fused_compress_attn(
     use_ue8m0: bool = True,  # round scale to power-of-2 (UE8M0); only when quant=True
     preshuffle: bool = True,  # MFMA 16x16 preshuffled FP8 layout; only when quant=True
     fp8_max: float | None = None,  # E4M3 max; required for FP8 quant
-    # none | fp8_per_row | fp8_group | fp4 | fp4_gfx950_flydsl | fp4_gfx950_opus
+    # none | fp8_per_row | fp8_group | fp4 | fp4_gfx950_flydsl | fp4_gfx950_opus |
+    # packed_fp8 | packed_fp4
     quant_mode: str | None = None,
     # V4-Main native fp8 2buff path (CSA/HCA Main under --kv_cache_dtype fp8).
     # Distinct from `quant` (Indexer-inner per-row preshuffle): writes per-64-tile
@@ -456,15 +507,17 @@ def fused_compress_attn(
     # row. V4 has no use for it -- its indexer compresses its own projection --
     # so this stays None on every V4 call and the store is constexpr'd away.
     latent_out: torch.Tensor | None = None,  # [plan_capacity, head_dim]
-    # The same echo after the rotation, for a pool whose layout this kernel
-    # cannot scatter into. Also V4.1-only.
-    rotated_out: torch.Tensor | None = None,
+    # `update_compressor_states`' write plan, run as this launch's last
+    # programs. The caller vouches that no ring
+    # slot it writes is one a boundary here reads: the two launches order
+    # read before write, one launch does not (`compress_batch`).
+    write_plan: torch.Tensor | None = None,
     prefix: str = "",
 ) -> None:
     """Batched fused per-source-position pool + RMSNorm + RoPE + cache scatter,
     dispatched via SGLang-style packed plan.
 
-    Two scatter modes (constexpr-selected by `quant`):
+    Scatter modes (constexpr-selected by `quant` / `quant_mode`):
 
       - quant=False (CSA Main / HCA Main): writes BF16 rows into the paged
         BF16 kv_cache (compressed slot = `position // ratio`).
@@ -475,19 +528,27 @@ def fused_compress_attn(
         same allocation). Bit-exact match for `indexer_k_quant_and_cache` /
         `cp_gather_indexer_k_quant_cache` (cache_kernels.cu:1145+).
 
-    Side-effecting: cache scatter IS the only output (Main path's BF16
-    return tensor was vestigial — paged_decode/paged_2src read directly
-    from `unified_kv` and the indexer FP8 pool, not from the kernel return).
-    Grid is always `plan_capacity` (CUDAGraph-safe); inactive plan rows are
-    sentinel-skipped (`position == -1`) inside the kernel.
+      - "packed_fp8" / "packed_fp4" (CSA2 Main, V4.1's FP8 / FP4 pools): the
+        rotated row rounded to BF16, then `quantize_fp8` (group 32, E8M0) /
+        `quantize_fp4` (group 16, E4M3)'s codes, values then scales, into a
+        uint8 kv_cache token row at the same slot.
 
-    Caller MUST invoke BEFORE `update_compressor_states` (state cache reads
-    must see previous-fwd data).
+    Side-effecting: the cache scatter, plus the pre-RoPE latent rows into
+    `latent_out` when given (CSA2's index key source), are the outputs (Main
+    path's BF16 return tensor was vestigial — paged_decode/paged_2src read
+    directly from `unified_kv` and the indexer FP8 pool, not from the kernel
+    return). Grid is always `plan_capacity` (CUDAGraph-safe); inactive plan
+    rows are sentinel-skipped (`position == -1`) inside the kernel.
+
+    The state cache reads must see previous-fwd data: a caller either invokes
+    this BEFORE `update_compressor_states`, or hands that write plan in as
+    `write_plan`, run by this launch's last programs alongside the compress
+    ones -- it then vouches that no ring slot written is one a boundary reads.
     """
     plan_capacity = plan.compress_plan_gpu.shape[0]
     num_compress = plan.num_compress
-    if plan_capacity == 0:
-        return  # nothing to do — no plan rows ever populated.
+    if plan_capacity == 0 and write_plan is None:
+        return
 
     # Resolve quant mode (single source of truth). `quant_mode` is the unified
     # selector; the legacy `quant` bool is only a fallback for callers that don't
@@ -507,6 +568,7 @@ def fused_compress_attn(
         "fp4_gfx950_flydsl",
         "fp4_gfx950_opus",
     )
+    packed = PACKED_ROWS.get(_mode, 0)
 
     # ------------------------------------------------------------------
     # flydsl dispatch. Pure-GPU time on V4-Pro beats Triton 0.9x→2.9x
@@ -517,25 +579,25 @@ def fused_compress_attn(
     _flydsl_mode = envs.ATOM_FUSED_COMPRESS_USE_FLYDSL
     _shape_key = (head_dim, rope_head_dim, ratio, overlap)
     _flydsl_shape_ok = _shape_key in _FLYDSL_SUPPORTED
-    # The flydsl kernel has no latent echo, and a caller that asked for one
-    # needs it: dropping to Triton is the only correct answer, and saying so
-    # under `always` beats returning a buffer nobody wrote.
+    # The flydsl kernel has no latent echo, no packed rows and no ring update,
+    # and a caller that asked for one needs it: dropping to Triton is the only
+    # correct answer, and saying so under `always` beats a buffer nobody wrote.
+    _triton_only = latent_out is not None or packed or write_plan is not None
     _flydsl_use = (
         flydsl_fused_compress_attn is not None
         and _flydsl_mode in ("auto", "always")
         and _flydsl_shape_ok
-        and latent_out is None
-        and rotated_out is None
+        and not _triton_only
     )
     if _flydsl_mode == "always" and not _flydsl_shape_ok:
         raise RuntimeError(
             f"ATOM_FUSED_COMPRESS_USE_FLYDSL=always but shape "
             f"{_shape_key} is not in supported set {_FLYDSL_SUPPORTED}"
         )
-    if _flydsl_mode == "always" and (latent_out is not None or rotated_out is not None):
+    if _flydsl_mode == "always" and _triton_only:
         raise RuntimeError(
             "ATOM_FUSED_COMPRESS_USE_FLYDSL=always but this call wants a latent "
-            "echo, which only the Triton path writes"
+            "echo, packed rows or the ring update, which only the Triton path writes"
         )
     # HCA 2-kernel-split: BF16-only on V4-Pro HCA Main shape
     # (D=512 ratio=128 overlap=False). HCA wins single-kernel at all N
@@ -683,9 +745,21 @@ def fused_compress_attn(
             assert (
                 k_per_block % 16 == 0
             ), f"preshuffle requires k_per_block%16==0, got {k_per_block}"
+    if packed:
+        assert has_bt, f"{_mode} requires block_tables for slot resolution"
+        assert kv_cache.dtype == torch.uint8, f"{_mode} writes a uint8 kv_cache"
+        # whole quant groups, no masked lanes: the row is the power-of-two block
+        assert (
+            head_dim == triton.next_power_of_2(head_dim) and head_dim % 32 == 0
+        ), f"{_mode} requires a power-of-two head_dim, got {head_dim}"
 
     BLOCK_D = triton.next_power_of_2(head_dim)
     HALF_ROPE = rope_head_dim // 2
+    # the kernel reads the cos / sin row at `pair % HALF_ROPE`: a NoPE width of
+    # whole rows puts the first RoPE pair at entry 0
+    assert (
+        head_dim - rope_head_dim
+    ) % rope_head_dim == 0, f"NoPE width {head_dim - rope_head_dim} is not whole {rope_head_dim}-wide RoPE rows"
     K = K_pool  # pool window reduce-dim (constexpr; not equal to ring modulo)
 
     # Cache-scale args (only consumed by the quant path; pass placeholders
@@ -699,9 +773,13 @@ def fused_compress_attn(
         cache_scale_block_stride_arg = 0
         fp8_max_arg = 1.0  # placeholder; FP8_MAX is constexpr, must be > 0
 
-    # Fixed grid for CUDAGraph compat: launch one program per plan row;
-    # sentinel rows (position=-1) skip inside the kernel.
-    grid = (plan_capacity,)
+    # Fixed grid for CUDAGraph compat: launch one program per plan row (then
+    # one per write-plan row); sentinel rows (position=-1) skip in the kernel.
+    write_rows = 0 if write_plan is None else write_plan.shape[0]
+    if write_plan is not None:
+        assert write_plan.dim() == 2 and write_plan.shape[1] == 4
+        assert write_plan.dtype == torch.int32
+    grid = (plan_capacity + write_rows,)
     _fused_compress_attn_kernel[grid](
         kv_in,
         kv_in.stride(0),
@@ -724,8 +802,6 @@ def fused_compress_attn(
         cos_cache.stride(0),
         latent_out if latent_out is not None else cos_cache,  # placeholder
         latent_out.stride(0) if latent_out is not None else 0,
-        rotated_out if rotated_out is not None else cos_cache,  # placeholder
-        rotated_out.stride(0) if rotated_out is not None else 0,
         kv_cache if has_bt else cos_cache,  # placeholder when no scatter
         kv_cache.stride(0) if has_bt else 0,
         kv_cache.stride(1) if has_bt else 0,
@@ -736,6 +812,8 @@ def fused_compress_attn(
         k_per_block,
         head_dim,
         rope_head_dim,
+        write_plan if write_plan is not None else state_slot_mapping,  # placeholder
+        plan_capacity,
         BLOCK_D=BLOCK_D,
         HALF_ROPE=HALF_ROPE,
         OVERLAP=int(overlap),
@@ -744,7 +822,9 @@ def fused_compress_attn(
         K=K,
         HAS_BLOCK_TABLE=int(has_bt),
         LATENT_OUT=int(latent_out is not None),
-        ROTATED_OUT=int(rotated_out is not None),
+        WRITE_RING=int(write_plan is not None),
+        BLOCK_RING=triton.next_power_of_2(dim_full),
+        PACKED=packed,
         QUANT=int(quant),
         FP8_MAX=fp8_max_arg,
         USE_UE8M0=int(use_ue8m0),

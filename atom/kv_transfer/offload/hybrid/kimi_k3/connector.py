@@ -13,9 +13,12 @@ from __future__ import annotations
 import logging
 import time
 
+import torch
+
 from atom.kv_transfer.disaggregation.types import (
     ConnectorCompletion,
     StateStoreOperationId,
+    StateTouchId,
     raw_req_id,
 )
 from atom.kv_transfer.offload import config as offcfg
@@ -31,7 +34,10 @@ from atom.kv_transfer.offload.dense.connector import (
     DenseOffloadScheduler,
 )
 from atom.kv_transfer.offload.hybrid.kimi_k3.staging import StagedTransfer
-from atom.kv_transfer.offload.hybrid.kimi_k3.state_object import StateByteCodec
+from atom.kv_transfer.offload.hybrid.kimi_k3.state_object import (
+    StateByteCodec,
+    TouchResult,
+)
 from atom.kv_transfer.offload.hybrid.kimi_k3.state_tier import (
     StateOffloadTier,
     _JointPark,
@@ -61,6 +67,14 @@ STATE_SOURCE_CHANNEL = "k3_state_source"
 #: the aggregator reaches quorum on the same step the KV load report does,
 #: rather than leaving a partially-reported key pending forever.
 STATE_LOAD_DISPOSITION_CHANNEL = "k3_state_load_disposition"
+
+#: One verdict per `StateTouchId`: `succeeded` is whether the image is still
+#: resident. Failure-dominant across TP: one missing shard and a load misses.
+STATE_TOUCH_CHANNEL = "k3_state_touch"
+
+#: Same id: `succeeded=False` when the image was present but not refreshed
+#: (outside LocalCPU's hot cache).
+STATE_TOUCH_REFRESH_CHANNEL = "k3_state_touch_refresh"
 
 #: The connector's standalone stall clock, used only when reclamation is
 #: disabled (`LMCACHE_EC_PIN_TIMEOUT_SEC <= 0`) so there is no abandon window to
@@ -116,6 +130,10 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
         # the no-tier store path and took the whole step's KV loads/saves down
         # with it (super().start_load_kv never ran).
         self._store_failed_no_tier: set[StateStoreOperationId] = set()
+        # Touch verdicts since the last `get_finished`.
+        self._touch_verdicts: dict[StateTouchId, TouchResult] = {}
+        # Only the first touch whose codec call raised is logged.
+        self._warned_touch_failure = False
 
     def close(self) -> None:
         """Drain then join the state tier before the base executors.
@@ -279,11 +297,42 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
         # KV submit to run even when arming half-completed -- an arriving KV
         # completion then settles or evicts whatever the arm did file.
         try:
+            self._touch_states(metadata)
             self._arm_joint_loads(metadata)
             self._start_state_loads(metadata)
             self._start_state_stores(metadata)
         finally:
             super().start_load_kv(metadata)
+
+    def _touch_states(self, metadata) -> None:
+        """Refresh the voted state images and record whether each is still
+        there. Inline, not on the tier's executors: a touch is one dict move
+        and must not queue behind an image-sized store. With no tier every
+        image is gone."""
+        touches = getattr(metadata, "state_touches", None)
+        if not touches:
+            return
+        tier = self._state_tier
+        if tier is None:
+            self._touch_verdicts.update(dict.fromkeys(touches, TouchResult.GONE))
+            return
+        for touch_id in touches:
+            try:
+                result = tier.codec.touch(touch_id.prefix_hash)
+            except Exception:
+                # Says nothing about the bytes: kept, not refreshed. One
+                # traceback, since a drifted LMCache raises on every touch.
+                if not self._warned_touch_failure:
+                    self._warned_touch_failure = True
+                    logger.warning(
+                        "kimi_k3 offload: touch of state hash %d failed; failed "
+                        "touches keep the image indexed and are counted in "
+                        "state_touches_unrefreshed",
+                        touch_id.prefix_hash,
+                        exc_info=True,
+                    )
+                result = TouchResult.PRESENT
+            self._touch_verdicts[touch_id] = result
 
     def _arm_joint_loads(self, metadata) -> None:
         """Hold a request owning both legs until both report.
@@ -400,9 +449,11 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
     def _start_state_stores(self, metadata) -> None:
         """Hand this step's ready checkpoints to the tier's executor.
 
-        No producer fence and no staging copy: the source is the checkpoint's
-        PAGE units, reserved out of the KV pool and pinned by the engine, so the
-        packer gathers straight from where they sit.
+        No staging copy: the source is the checkpoint's PAGE units, reserved out
+        of the KV pool and pinned by the engine, so the packer gathers straight
+        from where they sit. A checkpoint is READY once the batch carrying its
+        slot->PAGE copy was issued, not once the copy ran, so every store waits
+        on one event recorded on the current stream here, behind that copy.
 
         A store with no tier is reported failed rather than dropped -- the
         engine holds those units pinned against a report, and silence would
@@ -420,13 +471,27 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
             for op, _units in stores:
                 self._store_failed_no_tier.add(op)
             return
+        try:
+            ready_event = torch.cuda.Event()
+            ready_event.record(torch.cuda.current_stream())
+        except Exception:
+            logger.exception(
+                "kimi_k3 offload: state store fence creation failed; failing "
+                "%d store(s).",
+                len(stores),
+            )
+            for op, _units in stores:
+                self._store_failed_no_tier.add(op)
+            return
         for op, unit_ids in stores:
             # Isolate each submit (finding #4): route a submit failure into the
             # same no-tier failure channel (get_finished drains it) so the engine
             # releases the store's pinned PAGE units now rather than on the
             # reconciler's full timeout, without escaping past super().
             try:
-                self._state_tier.submit_store(op, tuple(int(u) for u in unit_ids))
+                self._state_tier.submit_store(
+                    op, tuple(int(u) for u in unit_ids), ready_event
+                )
             except Exception:
                 logger.exception(
                     "kimi_k3 offload: submit_store failed for %s; failing it.",
@@ -464,6 +529,9 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
                     ConnectorCompletion(STATE_SOURCE_CHANNEL, op, True)
                 )
             self._store_failed_no_tier = set()
+        # Before the tier-None return too: `_touch_states` answers for a
+        # missing tier, and the engine may be holding an admission for it.
+        self._emit_touch_verdicts(out)
         if self._state_tier is None:
             # `_arm_joint_loads` armed these even with no tier and
             # `_fail_state_loads` failed their state leg; drain the park here,
@@ -550,6 +618,24 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
                 )
             )
 
+    def _emit_touch_verdicts(self, out) -> None:
+        """Two completions per touch since the last call: still resident, and
+        refreshed (GONE counts as refreshed: nothing was left unrefreshed)."""
+        for touch_id, result in self._touch_verdicts.items():
+            out.connector_completions.add(
+                ConnectorCompletion(
+                    STATE_TOUCH_CHANNEL, touch_id, result is not TouchResult.GONE
+                )
+            )
+            out.connector_completions.add(
+                ConnectorCompletion(
+                    STATE_TOUCH_REFRESH_CHANNEL,
+                    touch_id,
+                    result is not TouchResult.PRESENT,
+                )
+            )
+        self._touch_verdicts = {}
+
     def _reclaim_stale_parks(self) -> None:
         """Evict joint parks whose report never came (finding #3).
 
@@ -606,6 +692,10 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
         # block ids, no chunking -- only the park/report lifecycle.
         self._pending_state_loads: list[tuple] = []
         self._pending_state_stores: list[tuple] = []
+        self._pending_state_touches: list[StateTouchId] = []
+        self._touch_generation = 0
+        self._state_touch_verdicts: dict[int, bool] = {}
+        self._state_touches_unrefreshed = 0
         # A finished request whose save is queued keeps its blocks pinned
         # (`should_defer_free`), so the queue depth is also how much of the pool
         # a slow backend can hold. Same knob and default the DSV4 layout bounds
@@ -643,6 +733,28 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
         self._pending_state_stores.extend(stores)
         return True
 
+    def enqueue_state_touches(self, hashes) -> bool:
+        """Queue touches for the next metadata, each under its own generation."""
+        for h in hashes:
+            self._pending_state_touches.append(
+                StateTouchId(int(h), self._touch_generation)
+            )
+            self._touch_generation += 1
+        return True
+
+    def take_state_touch_verdicts(self) -> dict[int, bool]:
+        """`{hash: resident}` from the touches that reached TP quorum."""
+        verdicts = self._state_touch_verdicts
+        self._state_touch_verdicts = {}
+        return verdicts
+
+    def get_statistics(self) -> dict[str, int]:
+        # Touches that only confirmed presence, without refreshing the LRU.
+        return {
+            **super().get_statistics(),
+            "state_touches_unrefreshed": self._state_touches_unrefreshed,
+        }
+
     def build_connector_meta(self) -> LMCacheOffloadMetadata:
         self._refresh_save_stall()
         meta = super().build_connector_meta()
@@ -655,6 +767,8 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
         # already released.
         meta.state_stores = self._pending_state_stores
         self._pending_state_stores = []
+        meta.state_touches = self._pending_state_touches
+        self._pending_state_touches = []
         return meta
 
     def _may_emit_save(self) -> bool:
@@ -680,6 +794,7 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
             super().has_pending_work()
             or bool(self._pending_state_loads)
             or bool(self._pending_state_stores)
+            or bool(self._pending_state_touches)
         )
 
     # -- save stall --------------------------------------------------------
@@ -846,7 +961,7 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
         return max(hbm, min(joint, lmc)) if joint else max(hbm, lmc)
 
     # -- connector-owned channels -----------------------------------------
-    def connector_completion(self, completion) -> bool:
+    def connector_completion(self, completion) -> bool | None:
         if completion.channel == STATE_SOURCE_CHANNEL:
             self._state_source_released.add(completion.operation_id)
             return True
@@ -858,6 +973,18 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
             )
             target.add(completion.operation_id)
             return True
+        if completion.channel == STATE_TOUCH_CHANNEL:
+            h = completion.operation_id.prefix_hash
+            self._state_touch_verdicts[h] = (
+                self._state_touch_verdicts.get(h, True) and completion.succeeded
+            )
+            # Handled, but not a terminal save: `process_completions` would
+            # file the touch id under `finished_saving`.
+            return None
+        if completion.channel == STATE_TOUCH_REFRESH_CHANNEL:
+            if not completion.succeeded:
+                self._state_touches_unrefreshed += 1
+            return None
         if completion.channel == STATE_LOAD_DISPOSITION_CHANNEL:
             # Finding #6: a state load whose bytes survived a failed pair. Record
             # only the survivors -- their `failed_loading` report must abandon

@@ -78,7 +78,7 @@ class DecoderGraph:
             stages = decoder_stages(
                 forward,
                 self.model.parallel_config,
-                plan.tail.width,
+                plan.tail.running_tokens,
                 requests,
                 replaying=True,
             )

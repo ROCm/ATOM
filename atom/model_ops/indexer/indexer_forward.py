@@ -234,12 +234,6 @@ def sparse_attn_indexer(
     if forward_context.context.is_dummy_run:
         # dummy runner
         return
-    # For MTP verify decode, max_seqlen_q > 1 so total decode tokens = batch_size * max_seqlen_q
-    num_decode_tokens = (
-        context.scheduled_bs * attn_metadata.max_seqlen_q
-        if not context.is_prefill
-        else 0
-    )
     runner_block_size = get_current_atom_config().kv_cache_block_size
     cp_kv_cache_interleave_size = get_current_atom_config().dcp_config.interleave_size
     # Which width this indexer's cache is in -- the one thing the arguments
@@ -363,25 +357,27 @@ def sparse_attn_indexer(
     if not context.is_prefill and get_dcp_world_size() > 1:
         # The fused exchange scores this rank's own shard and writes the KV
         # slots it owns -- ownership filter, slot localize and compaction all
-        # inside the op -- straight into sparse_kv_indices_buffer and
-        # dcp_sparse_kv_indptr_buffer, so nothing below is left to do.
+        # inside the op -- straight into the forward's selection and its DCP
+        # compact offsets, so nothing below is left to do.
         dcp_decode_candidate_exchange_fused(
             attn_metadata,
-            q_quant[:num_decode_tokens].reshape(
-                context.scheduled_bs, -1, *q_quant.shape[1:]
+            # The running rows, padding included: every DCP rank exchanges the
+            # same shape, an idle one too.
+            q_quant[: context.running_tokens].reshape(
+                context.running_bs, -1, *q_quant.shape[1:]
             ),
             kv_cache if indexer_fp4 else kv_cache.unsqueeze(-2),
             weights_mqa,
             get_dcp_rank(),
-            num_decode_tokens,
+            context.running_tokens,
             topk_tokens,
             max_model_len,
             runner_block_size,
             stable_topk,
             cp_kv_cache_interleave_size,
-            out_kv_indices=sparse_kv_indices_buffer,
-            out_kv_indptr=dcp_sparse_kv_indptr_buffer,
-            owned_counts=dcp_owned_counts_buffer,
+            out_kv_indices=attn_metadata.sparse_kv_indices,
+            out_kv_indptr=attn_metadata.dcp_sparse_kv_indptr,
+            owned_counts=attn_metadata.dcp_owned_counts,
             q_scale=q_fp4_scale,
             kv_scale=indexer_module.k_cache.kv_cache_scale if indexer_fp4 else None,
             weights_scale=weights_scale,
@@ -425,7 +421,7 @@ def sparse_attn_indexer(
                 attn_metadata.kv_indices,
                 attn_metadata.kv_indptr,
                 NUM_TOPK_TOKENS=topk_tokens,
-                out=sparse_kv_indices_buffer,
+                out=attn_metadata.sparse_kv_indices,
             )
         else:
             triton_convert_req_index_to_global_index(
@@ -435,7 +431,7 @@ def sparse_attn_indexer(
                 attn_metadata.kv_indices,
                 topk_indices,
                 NUM_TOPK_TOKENS=topk_tokens,
-                out=sparse_kv_indices_buffer,
+                out=attn_metadata.sparse_kv_indices,
             )
     elif get_dcp_world_size() > 1:
         # Keep only the positions this rank owns, mapped through the
@@ -452,10 +448,10 @@ def sparse_attn_indexer(
             get_dcp_rank(),
             get_dcp_world_size(),
             runner_block_size,
-            out_kv_indptr=dcp_sparse_kv_indptr_buffer,
-            owned_counts=dcp_owned_counts_buffer,
+            out_kv_indptr=attn_metadata.dcp_sparse_kv_indptr,
+            owned_counts=attn_metadata.dcp_owned_counts,
             NUM_TOPK_TOKENS=topk_tokens,
-            out=sparse_kv_indices_buffer,
+            out=attn_metadata.sparse_kv_indices,
             cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
         )
     else:
@@ -468,7 +464,7 @@ def sparse_attn_indexer(
             attn_metadata.cu_seqlens_k,
             NUM_TOPK_TOKENS=topk_tokens,
             PAGE_SIZE=runner_block_size,
-            out=sparse_kv_indices_buffer,
+            out=attn_metadata.sparse_kv_indices,
             row_starts=None if rows.concat is None else rows.concat.row_starts,
         )
 
@@ -487,6 +483,9 @@ def _index_cache(indexer, kv_cache, attn_metadata, is_prefill) -> IndexCache:
     return IndexCache(kv_cache, scales, block)
 
 
+# The selection buffers are declared mutated so a compiled graph orders the
+# write before every sparse MLA layer's read; the op writes the forward's own
+# share of them (`AttentionMetaData.sparse_kv_indices`).
 direct_register_custom_op(
     op_name="sparse_attn_indexer",
     op_func=sparse_attn_indexer,

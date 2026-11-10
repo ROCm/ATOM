@@ -156,7 +156,7 @@ def _query_rows(step, rows):
         rows,
         step.positions[rows],
         replace(step, batch_ids=ids),
-        torch.cat((rows, torch.tensor([step.width], device="cuda"))),
+        torch.cat((rows, torch.tensor([step.running_tokens], device="cuda"))),
     )
 
 
@@ -223,7 +223,7 @@ def test_a_replay_plan_runs_each_finishing_request_on_its_last_rows():
         (102, 64, 5),
     ]
     # laid out for the step's three requests, a window each
-    assert tail.width == 3 * 128 and plan.filled == 133
+    assert tail.running_tokens == 3 * 128 and plan.filled == 133
     real = list(range(172, 300)) + list(range(500, 505))
     assert plan.tail_rows.tolist() == real + [504] * (384 - 133)
     assert tail.cu_seqlens_q.tolist() == [0, 128, 133, 133]
@@ -248,7 +248,7 @@ def test_a_forward_finishing_no_prompt_publishes_a_tail_of_padding():
     step = _forward_step(cache, [300], [0], [False])
     plan = step.decoder
     assert not plan.tail.requests and plan.filled == 0
-    assert plan.tail.width == 128 and plan.last_rows.numel() == 0
+    assert plan.tail.running_tokens == 128 and plan.last_rows.numel() == 0
 
 
 @cuda
@@ -290,7 +290,7 @@ def test_carried_selections_come_from_layers_that_do_not_run_on_the_rows():
 
     cache = _cache(pages=128, window=128)
     step = _forward_step(cache, [300], [0], [True])
-    width = step.width
+    width = step.running_tokens
     rows = torch.arange(width, device="cuda", dtype=torch.int32)
     step.selected = {
         14: rows.view(1, width, 1).expand(1, width, 3).contiguous(),
@@ -366,8 +366,8 @@ def _forward(lengths, **overrides):
             RequestSpan(i, 0, sum(lengths[:i]), n, i) for i, n in enumerate(lengths)
         ),
         decode=False,
-        width=sum(lengths),
-        scheduled=sum(lengths),
+        running_tokens=sum(lengths),
+        scheduled_tokens=sum(lengths),
         decoder=object(),
     )
     metadata = SimpleNamespace(step=step, image_mask=None)
@@ -404,7 +404,7 @@ def _forward(lengths, **overrides):
         ({"step.decode": True}, False),
         # image rows replay: the router reads its rows' slice of the mask
         ({"md.image_mask": torch.ones(1, 500, dtype=torch.bool)}, True),
-        ({"step.width": 512}, False),  # a width the forward does not run
+        ({"step.running_tokens": 512}, False),  # rows the forward does not run
     ],
 )
 def test_which_prefills_replay(overrides, expected):
@@ -414,7 +414,7 @@ def test_which_prefills_replay(overrides, expected):
 
 def test_a_prefill_padded_to_its_token_graph_bucket_replays():
     """The padding rows belong to no request, so no tail picks them."""
-    forward = _forward([500], **{"step.width": 512})
+    forward = _forward([500], **{"step.running_tokens": 512})
     assert replayable(forward, 512)
 
 
@@ -491,7 +491,6 @@ def test_a_replayed_history_marks_image_positions_dead(image):
     builder.config = SimpleNamespace(image_token_id=image)
     resumes, floors, cached, histories = builder._replay_layout(
         {1: Replay(384, True, (5, 7), 256)},
-        np.array([0, 1]),
         [RequestSpan(1, 0, 0, 10, 0), RequestSpan(2, 256, 10, 200, 1)],
     )
     assert (resumes.tolist(), floors.tolist(), cached.tolist()) == (

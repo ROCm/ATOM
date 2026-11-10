@@ -62,6 +62,7 @@ from atom.sampling_params import RequiredChannel
 from atom.structured_output import is_structured
 from atom.structured_output.validation import (
     configure_request,
+    configure_tool_call_grammar,
     declared_tool_names,
     schema_from_format,
     strict_tool_schemas,
@@ -2267,6 +2268,20 @@ async def _chat_completions(
             kv_transfer=request.kv_transfer_params,
             multimodal=_has_multimodal_content(messages),
         )
+        if schema is None and not strict_schemas and tool_call_parser_cls is not None:
+            await configure_tool_call_grammar(
+                engine,
+                _get_engine_config(),
+                sampling_params,
+                _reasoning,
+                parser_cls=tool_call_parser_cls,
+                tools=request_tools(request),
+                tool_choice=request.tool_choice,
+                kv_transfer=request.kv_transfer_params,
+                multimodal=_has_multimodal_content(messages),
+                relaxed_mtp=envs.ATOM_ENABLE_RELAXED_MTP,
+                synthetic=synthetic_token_text is not None,
+            )
 
         _reasoning = structured_response_channel(
             _reasoning, schema, bool(strict_schemas)
@@ -2312,8 +2327,9 @@ async def _chat_completions(
                 usage_on_finish=compatibility.usage_on_finish,
                 include_usage=bool((request.stream_options or {}).get("include_usage")),
             )
-            if schema is not None or strict_schemas:
-
+            if sampling_params.json_schema is not None or strict_schemas:
+                # Also a tool-call grammar: its decode error ends the stream
+                # with an error event, not a truncated success.
                 gen = validate_chat_stream(
                     gen, schema, strict_schemas, declared_tool_names(request.tools)
                 )

@@ -39,7 +39,7 @@ import ast
 import collections
 import inspect
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import numpy as np
 import pytest
@@ -1028,14 +1028,24 @@ def test_pcp_reindex_builds_work_plan_only_when_read(monkeypatch, nonps, plans):
         dtype_kv=None,
         model_runner=SimpleNamespace(forward_vars=collections.defaultdict(object)),
     )
+    forward_vars = builder.model_runner.forward_vars
+    forward_vars["sparse_cu_seqlens_q"] = SimpleNamespace(
+        gpu=torch.arange(5, dtype=torch.int32)
+    )
+    forward_vars["sparse_kv_last_page_lens"] = SimpleNamespace(
+        gpu=torch.ones(4, dtype=torch.int32)
+    )
+    builder._sparse_prefill_work_plan = MethodType(
+        aiter_mla.AiterMLAMetadataBuilder._sparse_prefill_work_plan, builder
+    )
     md = SimpleNamespace(
         cu_seqlen_ks=torch.zeros(4, dtype=torch.int32),
         cu_seqlen_ke=torch.arange(4, dtype=torch.int32),
-        batch_id_per_q_token=torch.zeros(4, dtype=torch.int32),
         slot_mapping=torch.arange(4),
+        batch_id_per_q_token=torch.zeros(4, dtype=torch.int32),
     )
     aiter_mla.AiterMLAMetadataBuilder._apply_pcp_reindex(
-        builder, md, 4, np.array([1, 2, 3, 4])
+        builder, md, 4, np.array([1, 2, 3, 4]), ""
     )
     assert len(built) == plans
     assert hasattr(md, "sparse_prefill_work_meta_data") == bool(plans)
@@ -1274,6 +1284,7 @@ def test_sparse_prefill_builder_allocates_for_its_consumer(
         index_cache_dtype="fp8",
         attn_prefill_chunk_size=0,
         enable_tbo=False,
+        enable_tbo_decode=False,
         compilation_config=SimpleNamespace(static_forward_context={}),
     )
     runner = SimpleNamespace(

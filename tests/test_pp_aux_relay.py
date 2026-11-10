@@ -39,7 +39,9 @@ class _FakeTarget(nn.Module):
         self.embed_tokens = nn.Identity() if with_embed else PPMissingLayer()
 
 
-_CTX = types.SimpleNamespace(is_draft=False, ubatch_token_offset=0)
+_CTX = types.SimpleNamespace(
+    is_draft=False, ubatch_token_offset=0, ubatch_token_order=None
+)
 
 
 @pytest.fixture(autouse=True)
@@ -268,3 +270,43 @@ def test_relay_hook_compiles_without_an_in_place_update():
         handle.remove()
         torch._dynamo.reset()
     assert "update" not in names
+
+
+@pytest.mark.parametrize("pp_size", [1, 2])
+def test_pp_refuses_eagle3_whose_taps_it_cannot_relay(monkeypatch, pp_size):
+    """EAGLE3 taps target layers with no config-only spec; under PP its taps on
+    earlier stages never fire, so the runner refuses it."""
+    runner_mod = pytest.importorskip(
+        "atom.model_engine.model_runner", exc_type=ImportError
+    )
+    from atom.spec_decode.eagle_proposer import EagleProposer
+
+    monkeypatch.setattr(
+        runner_mod, "get_pp_group", lambda: types.SimpleNamespace(world_size=pp_size)
+    )
+    runner = object.__new__(runner_mod.ModelRunner)
+    runner.config = types.SimpleNamespace()
+    drafter = object.__new__(EagleProposer)
+    drafter._captures_aux = True  # as EagleProposer.arm_aux_capture leaves it
+    if pp_size == 1:
+        runner._refuse_unrelayed_pp_taps(drafter)
+        return
+    with pytest.raises(NotImplementedError, match="EAGLE3"):
+        runner._refuse_unrelayed_pp_taps(drafter)
+
+
+def test_pp_keeps_a_drafter_whose_taps_the_config_declares(monkeypatch):
+    runner_mod = pytest.importorskip(
+        "atom.model_engine.model_runner", exc_type=ImportError
+    )
+    monkeypatch.setattr(
+        runner_mod, "get_pp_group", lambda: types.SimpleNamespace(world_size=4)
+    )
+    runner = object.__new__(runner_mod.ModelRunner)
+    runner.config = types.SimpleNamespace()
+    # DSpark's shape: the spec comes from the config, so every stage relays it.
+    drafter = types.SimpleNamespace(
+        captures_aux=True, aux_capture_spec=lambda config: object()
+    )
+    runner._refuse_unrelayed_pp_taps(drafter)
+    runner._refuse_unrelayed_pp_taps(None)

@@ -132,9 +132,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_OTEL_TRACE": lambda: os.getenv("ATOM_ENABLE_OTEL_TRACE", "0").lower()
     in {"1", "true"},
     "ATOM_TRACE_VERSION": lambda: os.getenv("ATOM_TRACE_VERSION", "unknown"),
-    # Forward metadata transport: direct or packed. Both keep source checks.
-    # Single-member groups and strided bindings retain direct copies.
-    "ATOM_H2D_BACKEND": lambda: os.getenv("ATOM_H2D_BACKEND", "packed"),
     # Opt-in single-HCA engine pool: "auto" or explicit comma-separated HCAs.
     "ATOM_MOONCAKE_MATCHED_RAILS": lambda: os.getenv("ATOM_MOONCAKE_MATCHED_RAILS", ""),
     # Prefill (`kv_producer`, plain `mooncake`) only: gather the MLA tokens a
@@ -222,6 +219,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # and reads as 0. Keep it >= max_num_seqs; a smaller cap truncates every
     # rank's running batch. CoreManager warns when that happens.
     "ATOM_DP_DISPATCH_DEPTH": lambda: _nonnegative_int_env("ATOM_DP_DISPATCH_DEPTH", 0),
+    # `--dp-load-balance prefix_spread`: a rank with less queued prefill than
+    # this is about to idle and may take requests from a prefix's rank with
+    # over twice this queued. Must be positive; the default is two 16k prefill
+    # chunks.
+    "ATOM_DP_PREFIX_IDLE_TOKENS": lambda: _optional_int_env(
+        "ATOM_DP_PREFIX_IDLE_TOKENS", min_value=1
+    )
+    or 32768,
     # Place a new agent session on the lightest DP rank, then keep every later
     # request on that immutable cache owner. Existing sessions never spill;
     # child correlation ids are independently load-placed rather than
@@ -455,6 +460,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_DS_QKNORM_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_DS_QKNORM_FUSION", "1") == "1"
     ),
+    # DeepSeek-V4/V4.1 shared expert: clamp + silu(gate)*up + FP8 quant in one
+    # aiter triton kernel feeding w2. Ranks whose intermediate width is not a
+    # multiple of 128 keep the unfused path.
+    "ATOM_V4_USE_TRITON_FUSION": lambda: (
+        os.getenv("ATOM_V4_USE_TRITON_FUSION", "0") == "1"
+    ),
     "ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION", "1") == "1"
     ),
@@ -615,14 +626,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # leaves the fused indexer running exactly as it does with CP off.
     "ATOM_GLM52_INDEXER_CP": lambda: os.getenv("ATOM_GLM52_INDEXER_CP", "0") == "1",
     # Debug: run each mono layer next to the original one and log the difference
-    # (atom/models/minimax_m3/mono/check.py). Use with --enforce-eager.
+    # (atom/models/minimax_m3/mono/check.py; the gfx1250 V4.1 step: the launch
+    # beside the production forward, mono/gfx1250/debug.py). Use with --enforce-eager.
     "ATOM_MONO_CHECK": lambda: os.getenv("ATOM_MONO_CHECK", "0") == "1",
     # Debug: append every mono step's input tokens, positions and top-2 logits to
     # this file (rank 0; check.trace_logits). Use with --enforce-eager.
     "ATOM_MONO_TRACE": lambda: os.getenv("ATOM_MONO_TRACE"),
     # Debug: the mono layer kernels' per-phase stamps, a few steps per decode
-    # token count saved under this path prefix (mono/timeline.py). Use with
-    # --enforce-eager.
+    # token count saved under this path prefix (mono/timeline.py; the gfx1250
+    # V4.1 step: where its time goes, averaged every 64 steps, logged and
+    # appended to <prefix>_r<rank>.jsonl). Use with --enforce-eager.
     "ATOM_MONO_TIMELINE": lambda: os.getenv("ATOM_MONO_TIMELINE"),
     # Debug: the mono kernels bound every mailbox wait (10 s): a wait that gives up
     # records its region, pair and tags, and the runner raises with them at the end
@@ -636,6 +649,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # periods and the noise floor under them are in the environment doc, and
     # end-to-end throughput is too coarse to see an effect that size.
     "ATOM_DSV41_SIDE_STREAMS": lambda: int(os.getenv("ATOM_DSV41_SIDE_STREAMS", "0")),
+    # DeepSeek-V4.1 mono decode's high-interactivity (hi) monokernels (the
+    # `mono/hi` package, imported only with this on): on the decode steps it
+    # serves, every decoder layer, the verify head, the DSpark draft and the
+    # round's glue run the hi programs (atom/models/deepseek_v41/mono/hi_*.py).
+    # "auto" (default): on for the deployment they serve (MI355X, TP4, BF16 KV,
+    # DSpark, ...: `mono/hi_gate.py`), any other keeps ATOM's mono path; "1":
+    # on, or an error naming why not; "0": off.
+    "ATOM_DSV41_MONO_HI": lambda: os.getenv("ATOM_DSV41_MONO_HI", "auto"),
     # Token-bucket TR graphs for prefill (`atom/utils/region_graph.py`): the
     # comma-separated token counts to record. A prefill longer than the largest
     # runs eagerly; empty records none. The default tops out at 3072 because
@@ -701,7 +722,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # DSpark block sampling: replace the Markov head's
     #   bias = W1[x] @ W2.float().t() ; argmax(base_logits + bias)
-    # with one fused Triton kernel (atom/model_ops/dspark_markov_sample.py).
+    # with one fused Triton kernel (atom/model_ops/dspark_markov_argmax.py).
     # The unfused spelling casts the whole [V, r] W2 table to fp32 INSIDE the
     # T-iteration loop (~252MB of traffic per iteration for a table that never
     # changes) and materializes two [B, V] fp32 tensors per iteration (42MB
@@ -724,9 +745,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # regression is suspected -- the fastest way to rule this kernel in or out,
     # since the two paths are not bit-identical by construction. Read once when
     # the Markov head is built, so it must be set before the server starts.
+    # Once ATOM_SPEC_LOSSLESS_SAMPLING arms, Kimi-K3 honours this only on steps
+    # that replay the greedy block (no row draws q).
     "ATOM_DSPARK_FUSED_MARKOV_SAMPLE": lambda: (
         os.getenv("ATOM_DSPARK_FUSED_MARKOV_SAMPLE", "1") == "1"
     ),
+    # Lossless speculative sampling: the DSpark draft samples its block from q
+    # and the verify accepts by the probability ratio (u * q < p). Off by
+    # default; needs an aiter with ROCm/aiter#6954 under TP; where it arms,
+    # ATOM_ENABLE_RELAXED_MTP is refused. See docs/model_ops_guide.md.
+    "ATOM_SPEC_LOSSLESS_SAMPLING": lambda: _flag_env("ATOM_SPEC_LOSSLESS_SAMPLING"),
     # Replicate the vocab embedding on every TP rank (full table per rank, purely
     # local lookup) instead of TP-sharding it — eliminates the post-embedding
     # all-reduce. Applies to BOTH the main/target model and the speculative draft
@@ -1054,6 +1082,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # keep that expert placement for the rest of the process. Rebalances the
     # balancedness gate skips do not count. 0 (default) = no limit.
     "ATOM_EPLB_MAX_REBALANCES": lambda: _int_env("ATOM_EPLB_MAX_REBALANCES", 0),
+    # --- Structured output ---
+    # Hold tool calls to the declared schemas when the tool parser declares a
+    # grammar for them (Kimi-K3) and the structured-output extra is installed.
+    "ATOM_TOOL_CALL_GRAMMAR": lambda: (
+        os.getenv("ATOM_TOOL_CALL_GRAMMAR", "0").lower() == "1"
+    ),
     # --- MTP (relaxed mtp for quantized mtp) ---
     "ATOM_ENABLE_RELAXED_MTP": lambda: (
         os.getenv("ATOM_ENABLE_RELAXED_MTP", "0").lower() == "1"
@@ -1243,12 +1277,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # claims. "0" walks block by block with a token compare per block.
     "ATOM_PREFIX_FAST_WALK": lambda: os.getenv("ATOM_PREFIX_FAST_WALK", "1") == "1",
     # --- TBO prefill ubatch splitting ---
-    # Split prefill ubatches at the exact token midpoint (vLLM-DBO style),
-    # cutting through a request if needed for perfectly balanced 50/50 ubatches.
-    # Default on; set "0" to fall back to the request-boundary balanced split.
-    "ATOM_TBO_PREFILL_TOKEN_SPLIT": lambda: (
-        os.getenv("ATOM_TBO_PREFILL_TOKEN_SPLIT", "1") == "1"
-    ),
     # Minimum prefill tokens (per rank) required to TBO-split.
     "ATOM_TBO_PREFILL_MIN_TOKENS": lambda: int(
         os.getenv("ATOM_TBO_PREFILL_MIN_TOKENS", "8192")
@@ -1294,6 +1322,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # to 0 to fall back. Anything that would make it unsafe -- no CUDA, more TP
     # ranks than hash heads, a registration that will not fit -- falls back on
     # its own, so the switch is for taking the host path deliberately.
+    # Also governs the Qwen3.8 PLE n-gram table (~95 GiB): page-locked on the
+    # host and read over UVA by default on gfx950 / gfx942, in HBM elsewhere,
+    # for a dummy load, under the SGLang / RTP-LLM plugins and with 0, except
+    # where Qwen Mono serves the deployment (`atom/models/qwen38/mono/ple.py`),
+    # which ignores it.
     "ATOM_ENGRAM_UVA": lambda: os.getenv("ATOM_ENGRAM_UVA", "1") == "1",
     # How the UVA path page-locks a shard (`engram.host_memory`): 1 copies it
     # into page-locked memory of exactly its size (hipHostMalloc on base pages,
@@ -1307,6 +1340,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # rather than copied once per rank -- and copies only if that is refused.
     # `tools/engram/bench_uva_shard.py` measures both.
     "ATOM_ENGRAM_UVA_COPY": lambda: os.getenv("ATOM_ENGRAM_UVA_COPY", "1") == "1",
+    # Optional override of the file that serializes shared in-place
+    # registration. Empty: host_memory names one from the checkpoint path.
+    "ATOM_ENGRAM_REG_LOCK": lambda: os.getenv("ATOM_ENGRAM_REG_LOCK", ""),
     # Where the compressed-vocab table is cached between runs. The table is
     # reproducible from the tokenizer, so this only trades startup time for
     # disk; point it at shared storage to let several servers build it once.
@@ -1418,6 +1454,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # rejected as not implemented). A kv_connector_extra_config
     # "lmcache.mp.mp_transfer_mode" takes precedence.
     "LMCACHE_MP_TRANSFER_MODE": lambda: os.getenv("LMCACHE_MP_TRANSFER_MODE", "auto"),
+    # LMCache's own chunk size, as the connector configures LMCache with it.
+    # Read on the ATOM side only by `prefix_spread`, which predicts loads with
+    # it and checks it against an LMCache MP server's chunk at registration.
+    "LMCACHE_CHUNK_SIZE": lambda: _int_env("LMCACHE_CHUNK_SIZE", 256),
 }
 
 

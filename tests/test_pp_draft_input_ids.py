@@ -21,6 +21,7 @@ def test_drafts_fill_only_their_rows_columns():
     spec = np.array([[10, 11], [-1, -1], [20, -1]], dtype=np.int32)
     batch = SimpleNamespace(
         scheduled_tokens=anchors,
+        has_prefill=False,
         total_tokens_num_prefill=0,
         total_tokens_num_decode=6,
         total_seqs_num_prefill=0,

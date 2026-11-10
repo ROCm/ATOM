@@ -152,6 +152,7 @@ def _stub_v4_runtime_imports():
         "pcp_reindex_ragged",
     ):
         setattr(pcp_utils, name, lambda *args, **kwargs: None)
+    pcp_utils.PcpBalGroup = tuple
 
     backends = types.ModuleType("atom.model_ops.attentions.backends")
     for name in (
@@ -166,6 +167,7 @@ def _stub_v4_runtime_imports():
         "build_v4_paged_decode_indptr",
         "fp4_indexer_enabled",
         "hca_compress_paged_offsets",
+        "make_compress_plans",
         "plan_context_lens",
         "v4_decode_split_plan",
         "v4_uniform_split_table",
@@ -780,6 +782,7 @@ def mooncake_page_writer():
     import ast
     import logging
     import time
+    from dataclasses import dataclass
 
     from atom.kv_transfer.disaggregation.port_offset import consumer_region_indices
 
@@ -787,14 +790,22 @@ def mooncake_page_writer():
         "atom/kv_transfer/disaggregation/mooncake/mooncake_connector.py"
     )
     tree = ast.parse(path.read_text())
-    names = {"_execute_block_slot_transfer", "_consumer_region_map"}
+    names = {
+        "_execute_block_slot_transfer",
+        "_consumer_region_map",
+        "_block_plan",
+        "_RdmaBatch",
+        "_UnitPlan",
+    }
     methods = [
         node
         for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef) and node.name in names
+        if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in names
     ]
     namespace = {
         "KVTransferRegion": KVTransferRegion,
+        "dataclass": dataclass,
+        "np": np,
         "consumer_region_indices": consumer_region_indices,
         "logger": logging.getLogger(__name__),
         "time": time,
@@ -828,6 +839,10 @@ def _fp4_pd_pair(builder_cls, writer, kv_dtype="fp8", coalesce=False):
             for r in src.block_regions
         ),
         _block_region_consumer_indices=None,
+        _block_unit_specs=None,  # MLA: matched by position and role
+        _block_head_major_runs=(),
+        _per_block_bytes_list=[r.unit_bytes for r in src.block_regions],
+        _MAX_RDMA_ENTRIES_PER_BATCH=4096,
         _block_mr_ends=[[r.total_bytes] for r in src.block_regions],
         _swa_block_regions=src.swa_block_regions,
         _slot_regions=[],
@@ -838,7 +853,7 @@ def _fp4_pd_pair(builder_cls, writer, kv_dtype="fp8", coalesce=False):
         pp_size=1,
         tp_rank=0,
     )
-    for name in ("_execute_block_slot_transfer", "_consumer_region_map"):
+    for name in ("_execute_block_slot_transfer", "_consumer_region_map", "_block_plan"):
         setattr(conn, name, types.MethodType(writer[name], conn))
     req = {
         # FP4 consumers advertise under the FP4-only key (version fence).
@@ -1054,24 +1069,37 @@ def _prefill_step(builder, module, monkeypatch, positions, rows, n_committed):
     def concat(row_ends, keys, split):
         handed.update(row_ends=row_ends, keys=keys, split=split)
 
+    staged = {}
+
+    def stage(name, values, publication_group=None):
+        staged[name] = SimpleNamespace(
+            np=np.asarray(values), gpu=torch.as_tensor(values)
+        )
+
     builder._index_rows = index_rows
-    builder._stage = lambda name, values: torch.as_tensor(values)
+    builder._stage = stage
+    builder.csa_layers = [0]
+    builder.model_runner = SimpleNamespace(forward_vars=staged)
     monkeypatch.setitem(module, "concat_rows", concat)
     monkeypatch.setitem(module, "ConcatKeys", lambda **kwargs: kwargs)
     monkeypatch.setitem(module, "pcp_owned_rows_by_request", _rows_by_request)
+    # No padding request: every running one is scheduled.
+    running_bs = len(n_committed)
+    running_tokens = int(rows.sum())
+    split = builder._prefill_row_split(running_tokens, rows, n_committed)
     metadata = SimpleNamespace(
         n_committed_csa_per_seq_cpu=n_committed,
+        index_row_split=split,
         batch_id_per_q_token=_batch_ids(rows),
-        block_tables=None,
+        block_tables=torch.zeros((running_bs, 1), dtype=torch.int32),
     )
-    builder._build_v4_prefill_index_rows(
+    builder._stage_prefill_index_keys(n_committed, running_bs, split, rows)
+    builder._attach_v4_index_rows(
         metadata,
+        running_bs,
+        running_tokens,
         positions,
-        rows.shape[0],
-        int(rows.sum()),
         "the step's starts",
-        "",
-        rows,
     )
     return handed
 
@@ -1229,8 +1257,8 @@ class _Metadata(SimpleNamespace):
 def test_prepare_prefill_gates_the_split_by_each_request_s_new_rows(
     v4_builder_cls, monkeypatch
 ):
-    """`prepare_prefill` hands the split each scheduled request's new rows, not
-    its context: lost on the way, no prefill would ever split."""
+    """A prefill hands the split each scheduled request's new rows, not its
+    context: lost on the way, no prefill would ever split."""
     builder, module = _split_builder(v4_builder_cls, monkeypatch, world=8, fp4=True)
     starts, rows = [8, 16, 0], [3, 5, 3]
     cu = np.cumsum([0, *rows], dtype=np.int32)
@@ -1245,19 +1273,37 @@ def test_prepare_prefill_gates_the_split_by_each_request_s_new_rows(
         batch_id_per_q_token=torch.zeros(11, dtype=torch.long),
     )
     monkeypatch.setitem(module, "AttentionMetaData_DSV4", _Metadata)
-    # `_stub_v4_runtime_imports` leaves the base builder an empty class.
+    # `_stub_v4_runtime_imports` leaves the base builder an empty class: its
+    # staging hands back the common metadata, its finish does nothing.
+    base = v4_builder_cls.__mro__[1]
     monkeypatch.setattr(
-        v4_builder_cls.__mro__[1],
-        "prepare_prefill",
-        lambda self, batch, running_bs, running_tokens: (metadata, positions),
+        base,
+        "stage_prefill",
+        lambda self, batch, running_bs, running_tokens, group: (metadata, positions),
         raising=False,
+    )
+    monkeypatch.setattr(base, "finish_prefill", lambda *args: None, raising=False)
+    monkeypatch.setattr(
+        base, "_check_metadata_writable", lambda *args: None, raising=False
     )
     builder.model_runner = SimpleNamespace(
         forward_vars={
-            "positions": SimpleNamespace(np=positions.numpy()),
+            "positions": SimpleNamespace(np=positions.numpy(), gpu=positions),
             "cu_seqlens_q": SimpleNamespace(np=cu),
             "context_lens": SimpleNamespace(np=context),
-        }
+            "batch_id_per_q_token": SimpleNamespace(
+                gpu=torch.zeros(11, dtype=torch.int32)
+            ),
+            **{
+                name: SimpleNamespace(
+                    np=np.arange(3, dtype=np.int32),
+                    gpu=torch.arange(3, dtype=torch.int32),
+                )
+                for name in ("v4_meta_state_slot_out", "v4_meta_state_slot_in")
+            },
+        },
+        # No state pool yet: no paged-prefill inputs to stage.
+        pool_plan=SimpleNamespace(entries={}),
     )
     builder.csa_layers = [0]
     builder._populate_state_slot_mappings = lambda *args, **kwargs: (
@@ -1269,7 +1315,6 @@ def test_prepare_prefill_gates_the_split_by_each_request_s_new_rows(
         "_build_compress_plans",
         "_attach_v4_per_fwd_meta",
         "_build_paged_prefill_meta",
-        "_attach_tbo_prefill_cpu_lens",
         "_index_rows",
     ):
         setattr(builder, name, lambda *args, **kwargs: None)
@@ -1279,12 +1324,13 @@ def test_prepare_prefill_gates_the_split_by_each_request_s_new_rows(
         total_seqs_num_prefill=3, total_tokens_num_prefill=11, is_dummy_run=False
     )
 
-    builder.prepare_prefill(batch, 3, 11)
+    staged, _ = builder.stage_prefill(batch, 3, 11, None)
+    builder.finish_prefill(batch, staged, 3, 11)
 
+    # Decided once where the keys are staged; the rows read it back.
     [(tokens, new_rows, n_committed)] = asked
     assert tokens == 11
     assert new_rows.tolist() == rows
-    # Handed through only: the metadata above set it; its setter is stubbed.
     assert n_committed.tolist() == (context // 4).tolist()
 
 
@@ -1480,3 +1526,26 @@ def test_the_startup_gather_is_the_split_s(v4_builder_cls, monkeypatch):
     [(out, mine, group)] = gathers
     assert group == "tp" and out.numel() == 8
     assert mine.numel() == 1 and mine.data_ptr() == out[3:].data_ptr()
+
+
+@pytest.mark.parametrize(
+    "n_committed, running_bs, expected",
+    [([5, 3], 4, [0, 5, 8, 8, 8]), ([], 1, [0, 1])],
+    ids=["padded", "idle"],
+)
+def test_fp8_committed_keys_span_every_block_table_row(
+    v4_builder_cls, monkeypatch, n_committed, running_bs, expected
+):
+    """The gather gives each of the `running_bs` block-table rows a thread that
+    claims its `cu_committed` span: a padding request's is empty, and with no
+    committed key the dummy row is the last span's."""
+    builder, _ = _split_builder(v4_builder_cls, monkeypatch, world=1, fp4=False)
+    staged = {}
+    builder._stage = lambda name, values, publication_group=None: staged.update(
+        {name: np.asarray(values)}
+    )
+    builder.csa_layers = [0]
+    builder._stage_prefill_index_keys(
+        np.asarray(n_committed, dtype=np.int32), running_bs
+    )
+    assert staged["v4_indexer_cu_committed"].tolist() == expected

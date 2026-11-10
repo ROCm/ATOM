@@ -197,12 +197,11 @@ HIP_VISIBLE_DEVICES=0,1,2,3 python -m atom.entrypoints.openai_server \
   --attn-prefill-chunk-size 16384
 ```
 
-Idle ranks participate in collectives using empty cache-request metadata in the
-same pool buffers that graph capture used. Padding rows carry batch ID -1 and
-sentinel write plans, so captured attention kernels neither read nor write state.
-The runner's dummy query segment remains nonempty for sampling and DSpark to
-select a valid anchor row. Startup warmup,
-before pool allocation, continues to use its private scratch cache.
+Idle ranks schedule no request: every row they run is padding, in the same pool
+buffers that graph capture used. Padding rows carry batch ID -1 and sentinel
+write plans, so captured attention kernels neither read nor write state.
+Startup warmup, before pool allocation, continues to use its private scratch
+cache.
 
 Engram follows the attention TP group: under DPA each rank reads all hash
 heads for its own requests. Each Flash rank registers about 183 GiB of mapped
@@ -222,8 +221,7 @@ TP4 with the default DP size of 1 launches four DP-attention ranks and is accept
 Plain TP and effective single-rank DPA are rejected. Microbatches use
 the configured compilation level; decode keeps its CUDA Graph path.
 The existing `ATOM_TBO_PREFILL_MIN_TOKENS` threshold applies.
-`ATOM_TBO_PREFILL_TOKEN_SPLIT=1` is the default and can split within a request;
-set it to `0` to split only at request boundaries. Eligibility
+A prefill splits at its token midpoint, within a request if one straddles it. Eligibility
 is agreed across DP ranks; an idle or incompatible peer selects ordinary execution.
 
 Parent preparation and TBO children both preserve the explicit prefill phase.

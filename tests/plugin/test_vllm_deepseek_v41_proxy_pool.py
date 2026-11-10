@@ -23,6 +23,7 @@ from atom.plugin.vllm.deepseek_v41_bridge import (
     ATOM_DEEPSEEK_V41_BLOCK_SIZE,
     AtomDeepseekV41ProxyAttention,
     _v41_dummy_batch,
+    _v41_dummy_lengths,
     _v41_scheduled_batch,
     is_deepseek_v41_vllm_config,
     snapshot_v41_batch,
@@ -366,9 +367,9 @@ class TestDummyBatch:
 
     def _split(self, running_tokens, max_reqs=64):
         return _v41_dummy_batch(
-            running_tokens,
-            max_req_tokens=self.MAX_REQ_TOKENS,
-            max_reqs=max_reqs,
+            _v41_dummy_lengths(
+                running_tokens, max_req_tokens=self.MAX_REQ_TOKENS, max_reqs=max_reqs
+            )
         )
 
     @pytest.mark.parametrize(
@@ -405,8 +406,7 @@ class TestDummyBatch:
         assert batch.total_tokens_num == sum(batch.num_scheduled_tokens) < 40_000
 
     def test_every_row_carries_a_token(self):
-        # `_prepare` skips zero-token rows, so an empty row would silently
-        # shrink the batch it published a width for.
+        # A request is a row with tokens: `begin_step` refuses an empty span.
         for running_tokens in (1, 3, 17, 16385):
             batch = self._split(running_tokens)
             assert min(batch.num_scheduled_tokens) >= 1

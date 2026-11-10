@@ -108,8 +108,8 @@ def write_packed_window(values, scales, pool, step, window, dim, cached_until=No
     """`values` / `scales`: a token's FP8 bytes and E8M0 codes, rows of any
     stride. `cached_until`: as `swa_write`'s, per request the position below
     which its ring keeps the rows it holds; None writes every row."""
-    if step.width:
-        _write_window[(step.width,)](
+    if step.running_tokens:
+        _write_window[(step.running_tokens,)](
             values.view(torch.uint8),
             scales.view(torch.uint8),
             values.stride(-2),

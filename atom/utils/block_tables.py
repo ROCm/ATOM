@@ -50,9 +50,7 @@ class BlockTableState:
         self.checked = None
 
     def _acquire(self):
-        binding = getattr(self.buffer, "_publication", None)
-        if binding is not None:
-            binding.acquire_write()
+        self.buffer.acquire_write()
 
     def _begin_write(self):
         self._acquire()
@@ -175,19 +173,6 @@ class BlockTableState:
                     rows[i][start:] if start else rows[i]
                 )
 
-    def pad(self, scheduled_bs, running_bs):
-        """Finalize the padded range before publication, including draft rows."""
-        if not 0 <= scheduled_bs <= running_bs <= self.cpu.shape[0]:
-            raise ValueError("Invalid block-table padding range")
-        if scheduled_bs != len(self.lengths) or running_bs > self.zero_to:
-            versions = self.versions[:scheduled_bs]
-            lengths = self.lengths[:scheduled_bs]
-            self._begin_write()
-            self.bytes[scheduled_bs:running_bs] = 0
-            self.versions, self.lengths = versions, lengths
-            self.zero_to = running_bs
-        return self
-
     def slice_to(self, buffer, start, count, *, pad_to):
         """Prepare a TBO destination using the source snapshot's row revisions."""
         stop = start + count
@@ -200,27 +185,32 @@ class BlockTableState:
         keys = self.versions[start:stop], self.lengths[start:stop]
         return block_table_state(buffer).prepare(rows, pad_to=pad_to, _keys=keys)
 
-    def publish(self, count, *, group=None):
-        """Publish a changed table, optionally with the caller's metadata group.
-
-        Omitting a table from a group does not omit its GPU view from metadata.
-        Record the revision only after the entire publication succeeds.
-        """
-        if count is None:
-            if group is not None:
-                group.publish(group.counts)
-            return None
+    def _dirty(self, count):
         key = (self.revision, count)
         previous = self.published
         dirty = (
             previous is None or previous[0] is not self.buffer.gpu or previous[1] != key
         )
-        if group is not None:
-            group.set_count(self.buffer, count if dirty else None)
-            group.publish(group.counts)
-        elif dirty:
-            self.buffer.copy_to_gpu(count)
+        return dirty, key
+
+    def stage(self, count, group):
+        """Count a changed table into ``group``, whose owner publishes it.
+
+        Omitting a table from a group does not omit its GPU view from metadata.
+        The revision is recorded once that publish has succeeded.
+        """
+        dirty, key = self._dirty(count)
+        group.set_count(self.buffer, count if dirty else None)
         if dirty:
+            gpu = self.buffer.gpu
+            group.after_publish(lambda: setattr(self, "published", (gpu, key)))
+        return self.buffer.gpu[:count]
+
+    def publish(self, count):
+        """Upload a changed table on its own."""
+        dirty, key = self._dirty(count)
+        if dirty:
+            self.buffer.copy_to_gpu(count)
             self.published = (self.buffer.gpu, key)
         return self.buffer.gpu[:count]
 

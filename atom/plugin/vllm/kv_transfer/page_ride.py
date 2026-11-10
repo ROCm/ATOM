@@ -5,12 +5,12 @@
 
 Under the ``mp`` backend a state checkpoint is not a leg of its own: its PAGE
 units ride the transfer as a native-state image (`NativeStateTransfer.
-unit_ids`), registered by the worker through `native_state_layout`. The V4.1
-MP scheduler (`v41_mp_scheduler`) asks for those units here; this mixin is the
-answer for state that is a vLLM-hashed, block-addressed boundary --
-DeepSeek-V4.1's state-checkpoint groups, where the block in group ``j`` is
-image unit ``j``. Which group ids hold the boundary and on what grid it may sit
-are attributes of the host planner.
+unit_ids`), registered by the worker through `native_state_layout`. The MP
+scheduler (`ride_mp_scheduler`) asks for those units here; this mixin is the
+answer for state that is a vLLM-hashed, block-addressed boundary, where the
+block in group ``j`` is image unit ``j`` -- DeepSeek-V4.1's state-checkpoint
+groups, and Kimi-K3's KDA mamba groups. Which group ids hold the boundary and
+on what grid it may sit are attributes of the host planner.
 
 The host planner must provide:
 

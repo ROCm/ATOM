@@ -44,7 +44,6 @@ def _layer():
     layer._dpa_persistent_supported = True
     layer.dcp_persistent_supported = True
     layer.sparse_dcp_metadata_rebuild = False
-    layer.sparse_kv_indices_buffer = torch.zeros(64, dtype=torch.int32)
     layer._pad_decode_query_heads = lambda q: q
     layer._restore_decode_query_heads = lambda o, heads: o
     layer._v_up_proj_and_o_proj = lambda o: o
@@ -56,6 +55,7 @@ def _metadata(planned_tokens):
     metadata.sparse_cu_seqlens_q = torch.zeros(planned_tokens + 1, dtype=torch.int32)
     metadata.sparse_kv_indptr = torch.zeros(planned_tokens + 1, dtype=torch.int32)
     metadata.sparse_kv_last_page_lens = torch.ones(planned_tokens, dtype=torch.int32)
+    metadata.sparse_kv_indices = torch.zeros(64, dtype=torch.int32)
     for name in (
         "work_meta_data",
         "work_indptr",
@@ -106,7 +106,8 @@ def test_dcp_rebuild_plans_only_the_rows_q_holds(monkeypatch):
     layer.sparse_dcp_metadata_rebuild = True
     layer.owns_sparse_indexer = True
     layer.dcp_kernel_num_heads = HEADS
-    layer.dcp_sparse_kv_indptr_buffer = torch.zeros(64 * Q_LEN, dtype=torch.int32)
+    metadata = _metadata(40 * Q_LEN)
+    metadata.dcp_sparse_kv_indptr = torch.zeros(64 * Q_LEN, dtype=torch.int32)
     seen = []
 
     def fake_rebuild(md, q, kv, cu_seqlens_q, kv_indptr, last_page_lens, *a, **k):
@@ -116,7 +117,7 @@ def test_dcp_rebuild_plans_only_the_rows_q_holds(monkeypatch):
     layer._rebuild_sparse_dcp_persistent_metadata = fake_rebuild
     q = torch.zeros(39 * Q_LEN, HEADS, RANK + ROPE)
     with pytest.raises(StopIteration):
-        layer._forward_decode(q, torch.zeros(8, RANK + ROPE), _metadata(40 * Q_LEN))
+        layer._forward_decode(q, torch.zeros(8, RANK + ROPE), metadata)
     assert seen == [(39 * Q_LEN + 1, 39 * Q_LEN + 1, 39 * Q_LEN)]
 
 

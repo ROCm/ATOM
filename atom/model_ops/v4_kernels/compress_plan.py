@@ -99,8 +99,7 @@ def make_compress_plans(
     unique_ratios_overlap: Iterable[tuple[int, bool]],
     *,
     plan_buffers: dict,
-    publication_group=None,
-    defer_to=None,
+    group=None,
     running_bs: int | None = None,
     max_q_len: int | None = None,
     decode_capacity_per_ratio: dict[int, int] | None = None,
@@ -127,12 +126,9 @@ def make_compress_plans(
                     calls (CUDAGraph requirement). Fresh per-call alloc is
                     not supported — that pattern caused allocator-churn
                     races (see `write_v4_paged_decode_indices` docstring).
-      publication_group: optional prebound owner group for these plan buffers.
-                    All sources are filled before a single checked publication.
-                    Independent callers without a group keep direct uploads.
-      defer_to: optional combined group that will publish these plan buffers.
-                    The caller owns its counts and must publish before any GPU
-                    plan consumer; used by V4.1's combined metadata preparation.
+      group: the phase group the plan buffers are counted into; the caller
+                    publishes it before any GPU plan consumer. Independent
+                    callers without one keep direct uploads.
       running_bs: optional int — the CUDAGraph-padded batch size (>= bs). When
                     PROVIDED this selects the DECODE CUDAGraph path: both
                     `compress_plan_gpu` and `write_plan_gpu` are sliced to a
@@ -199,26 +195,17 @@ def make_compress_plans(
     """
     # Check every source acquired by the owner before touching a pinned plan. A
     # repeated call in the same forward must fail before overwriting an
-    # earlier publication, including when that call used checked direct.
-    if defer_to is not None and publication_group is None:
-        raise ValueError("Deferred plans require a publication group")
-    group = publication_group if defer_to is None else defer_to
-    if publication_group is not None:
-        publication_group.check_writable()
-        if defer_to is None:
-            for i in range(len(group.counts)):
-                group.counts[i] = None
+    # earlier publication.
+    if group is not None:
+        for buffers in plan_buffers.values():
+            for buffer in buffers.values():
+                buffer.acquire_write()
 
     def publish(buffer, count):
         if group is None:
             return buffer.copy_to_gpu(count)
         group.set_count(buffer, count)
         return buffer.gpu[:count]
-
-    def finish():
-        if group is not None and defer_to is None:
-            group.publish(group.counts)
-        return out
 
     bs = len(extend_lens_cpu)
     extend_lens_cpu = np.ascontiguousarray(extend_lens_cpu, dtype=np.int32)
@@ -287,7 +274,7 @@ def make_compress_plans(
                     plan_buffers, ratio, cbuf, ccap, publish
                 ),
             )
-        return finish()
+        return out
 
     # Per-token columns shared across ratios.
     batch_ids = np.repeat(np.arange(bs, dtype=np.int32), extend_lens_cpu)
@@ -382,4 +369,4 @@ def make_compress_plans(
                 plan_buffers, ratio, cbuf, compress_slice, publish
             ),
         )
-    return finish()
+    return out

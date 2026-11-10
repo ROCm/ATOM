@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import numpy as np
 import torch
 from aiter.dist.parallel_state import get_tp_group
 
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
-from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.state_runtime import StateTransfer
 from atom.model_ops.attention_mla import MLAAttention
 from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
@@ -16,7 +16,7 @@ from atom.model_ops.glm5_next.geometry import (
     pooled_path_enabled,
     speculative_kpool_history_size,
 )
-from atom.utils import envs
+from atom.utils import CpuGpuBuffer, envs
 
 from .aiter_mla import (
     MLA_ROWS,
@@ -27,6 +27,7 @@ from .backends import AttentionBackend
 from .gdn_attn import LINEAR_STATE_ROWS, GDNStateMixin
 from .pool_layout.page_unit_geometry import PageUnitGeometryMixin
 from .pool_layout.sub_pool_spec import SubPoolSpec, page_pool, state_pool
+from .token_layout.slots import slot_mapping
 from .triton_mla import TritonMLAMetadataBuilder
 
 
@@ -49,6 +50,22 @@ class KimiMLAGDNBackend(AttentionBackend):
 class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
     def __init__(self, model_runner):
         super().__init__(model_runner=model_runner)
+        self._declare_draft_ctx_slots(model_runner)
+
+    def _declare_draft_ctx_slots(self, model_runner) -> None:
+        """A draft that declares a pool of its own stores every token of the
+        target forward at that pool's entry size. Under DCP that is not what
+        the target's slots address (DCP-filtered, `block_size` tokens), so it
+        gets slots of its own; at DCP 1 it writes through the target's."""
+        drafter = getattr(model_runner, "drafter", None)
+        spec = getattr(getattr(drafter, "model", None), "kv_pool_spec", None)
+        if spec is not None and spec.needs_own_ctx_slots(model_runner.config):
+            model_runner.forward_vars["draft_ctx_slots"] = CpuGpuBuffer(
+                self.max_num_batched_tokens,
+                dtype=torch.int64,
+                device=self.device,
+                publication_group="draft_ctx_slots",
+            )
 
     def spec_honours_state_fork(self) -> bool:
         # K3's KDA forward reads the fork table; glm5_next's does not.
@@ -82,7 +99,13 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         TP-replicated even though the MLA KV beside it is.
         """
         transfer = super().get_kv_transfer_tensors()
-        if transfer is None or not self._uses_paged_checkpoints():
+        # Under PP an op names every stage's image at once, which a per-stage
+        # LMCache MP worker cannot store; it keeps refusing K3 there.
+        if (
+            transfer is None
+            or not self._uses_paged_checkpoints()
+            or self.model_runner.config.pipeline_parallel_size > 1
+        ):
             return self._with_kda_disagg_regions(transfer)
         spec = self.model_runner.state_runtime.checkpoint_spec
         if spec is None:
@@ -166,21 +189,21 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         tensors.slot_regions, tensors.num_slots = self.state_slot_regions()
         return tensors
 
+    # Every PP stage scatters its own layers' state into the unit ids the head
+    # names; `ModelRunner._agree_pipeline_checkpoint_spec` sizes them.
+    paged_checkpoints_span_pipeline = True
+
     def _uses_paged_checkpoints(self) -> bool:
         """Whether this run keeps checkpoints as PAGE images rather than slots.
 
-        Off under pipeline parallelism and RapidServe, which `get_num_blocks`
-        *raises* on when the transfer copies. Answering yes there would turn
-        "K3 under PP keeps no state cache" into "K3 under PP does not start".
+        Off under RapidServe, which `get_num_blocks` *raises* on when the
+        transfer copies. Answering yes there would turn "K3 under RapidServe
+        keeps no state cache" into "K3 under RapidServe does not start".
 
         One predicate for both `state_transfer` and `state_spec`, because the
         two disagreeing would size a pool for one mechanism and run the other.
         """
-        config = self.model_runner.config
-        return not (
-            config.pipeline_parallel_size > 1
-            or getattr(config, "enable_rapidserve", False)
-        )
+        return not getattr(self.model_runner.config, "enable_rapidserve", False)
 
     def state_transfer(self) -> StateTransfer:
         """A PAGE-image copy, not `GDNStateMixin`'s fork.
@@ -461,6 +484,7 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             row = self.pool_rows[MLA_ROWS][module]
             kv_cache = self.kv_pool.layer("kv", row).view(-1, 1, self.kv_pool.entry_dim)
             module.max_model_len = runner.config.max_model_len
+            index_cache = None
             if runner.has_mla_indexer and getattr(module, "indexer", None) is not None:
                 # The module's own global layer number, not the bind
                 # ordinal: the map is keyed globally, and on a non-first PP
@@ -496,51 +520,70 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
                 v_cache=None,
                 k_scale=None,
                 v_scale=None,
+                index_cache=index_cache,
             )
 
         return None
 
-    def prepare_prefill(
-        self, batch: ScheduledBatch, running_bs: int, running_tokens: int
-    ):
-        attn_metadata, positions = super().prepare_prefill(
-            batch, running_bs, running_tokens
-        )
-        if batch.block_tables == []:
-            attn_metadata.gdn_metadata = None
-            return attn_metadata, positions
-        attn_metadata.gdn_metadata = self.prepare_gdn_metadata(
-            batch,
-            attn_metadata,
-            is_prefill=True,
-            prepare_block_tables=False,
-        )
-        return attn_metadata, positions
+    def h2d_group_members(self) -> dict[str, tuple[str, ...]]:
+        # The draft's slots go up with either phase's attention metadata
+        # (`stage_prefill` / `stage_decode`).
+        members = super().h2d_group_members()
+        if "draft_ctx_slots" in self.model_runner.forward_vars:
+            for phase in ("prefill_metadata", "decode_metadata"):
+                members[phase] = members.get(phase, ()) + ("draft_ctx_slots",)
+        return members
 
-    def prepare_decode(
-        self,
-        batch: ScheduledBatch,
-        running_bs: int,
-        running_tokens: int,
-        max_seqlen_q: int,
-    ):
-        attn_metadata, positions = super().prepare_decode(
-            batch, running_bs, running_tokens, max_seqlen_q
+    def stage_prefill(self, batch, running_bs, running_tokens, group):
+        built = super().stage_prefill(batch, running_bs, running_tokens, group)
+        scheduled_bs = batch.total_seqs_num_prefill
+        self._stage_draft_ctx_slots(
+            batch, batch.num_scheduled_tokens[:scheduled_bs], running_tokens, group
         )
-        self._attach_gdn_decode_metadata(
-            batch,
-            attn_metadata,
-            prepare_block_tables=False,
+        return built
+
+    def stage_decode(self, batch, running_bs, running_tokens, max_seqlen_q, group):
+        built = super().stage_decode(
+            batch, running_bs, running_tokens, max_seqlen_q, group
         )
-        return attn_metadata, positions
+        _, lengths, _ = self.decode_spans(batch)
+        self._stage_draft_ctx_slots(batch, lengths, running_tokens, group)
+        return built
 
-    def _capture_needs_nonempty_kv(self, max_q_len: int) -> bool:
-        # Kimi's dense MLA warmup needs a page even with page_size=1.
-        # The parent owns the single upload, including DCP + MTP capture.
-        return True
+    def _stage_draft_ctx_slots(
+        self, batch, seqlens_q: np.ndarray, rows: int, group
+    ) -> None:
+        """The draft's own slot for each scheduled token, `-1` out to `rows`,
+        the width the target's `slot_mapping` goes up at, counted into
+        ``group``.
 
-    def build_for_cudagraph_capture(self, bs: int):
-        attn_metadata, context = super().build_for_cudagraph_capture(bs)
+        Runs after the target's staging, whose host positions and packed
+        block table it reads. No DCP filter, as the draft stores every token,
+        and `entry_tokens` per block id.
+        """
+        var = self.model_runner.forward_vars
+        buf = var.get("draft_ctx_slots")
+        if buf is None or batch.is_dummy_run:
+            return
+        n = int(seqlens_q.sum())
+        buf.np[n:rows] = -1
+        if batch.block_tables:
+            slot_mapping(
+                var["positions"].np[:n],
+                seqlens_q,
+                var["block_tables"].np,
+                self.model_runner.draft_kv_builder.kv_pool.entry_tokens,
+                out=buf.np[:n],
+                scratch=self.token_axis_scratch,
+            )
+        else:
+            buf.np[:n] = -1
+        group.set_count(buf, rows)
+
+    def build_for_cudagraph_capture(self, bs: int, *, decode_ubatch_slices=None):
+        attn_metadata, context = super().build_for_cudagraph_capture(
+            bs, decode_ubatch_slices=decode_ubatch_slices
+        )
         attn_metadata.gdn_metadata = self._build_gdn_capture_metadata(bs)
         return attn_metadata, context
 

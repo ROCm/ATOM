@@ -69,6 +69,7 @@ def _builder_bases():
 
     return _module(
         "atom.model_ops.attentions.backends",
+        PERSISTENT_WORK_BUFFERS=(),
         AttentionBackend=AttentionBackend,
         CommonAttentionBuilder=CommonAttentionBuilder,
     )
@@ -99,7 +100,11 @@ def mha_export_method():
         for node in builder.body
         if isinstance(node, ast.FunctionDef) and node.name == "get_kv_transfer_tensors"
     )
-    namespace = {}
+    namespace = {
+        "INDEX_ROWS": "index",
+        "ASM_PAGE_SIZE": 16,
+        "_is_indexed_sparse_attention": lambda module: False,
+    }
     exec(  # noqa: S102 -- execute the local exporter under the CPU fixture
         compile(ast.Module(body=[method], type_ignores=[]), str(source), "exec"),
         namespace,
@@ -212,6 +217,9 @@ def mla_builder_cls():
             HEADS=128,
             SparsePrefillHeadGroups=noop,
         ),
+        "atom.model_ops.attentions.selection_pack": _module(
+            "atom.model_ops.attentions.selection_pack", pack_row_selections=noop
+        ),
         "atom.model_ops.attentions.backends": _builder_bases(),
         "atom.model_ops.attentions.pool_layout.sub_pool_spec": _sub_pool_module(),
     }
@@ -248,13 +256,28 @@ def test_minimax_m3_builder_publishes_gqa_and_index_views_without_tp_collapse(
         extra_fields=(EntryField("index", 1, (128 * 128,), torch.uint8),),
     )
     pool.allocate(num_blocks, "cpu")
-    builder = SimpleNamespace(kv_pools={"gqa4": pool})
+    layers = [type("Layer", (), {"layer_num": n})() for n in range(2)]
+    builder = SimpleNamespace(
+        kv_pools={"gqa4": pool},
+        # Both layers' KV and the first one's indexer keys (128 FP8 a token).
+        pool_rows={"gqa4": dict(zip(layers, range(2))), "index": {layers[0]: 0}},
+        block_size=128,
+        block_ratio=1,
+        _index_cache_spec=lambda entry_tokens: SimpleNamespace(
+            view_dtype=torch.float8_e4m3fnuz, view_shape=(-1, 128, 128)
+        ),
+    )
 
     transfer = mha_export_method(builder)
     transfer.set_block_count(num_blocks)
 
     assert transfer.tp_replication_factor == 1
     assert len(transfer.block_regions) == 4 * 2 + 1
+    # Every KV unit is one head-major run of the rank's one head; the indexer
+    # keys are the same on every rank.
+    assert [page.head_major_runs for page in transfer.pages] == [(1, 1)] * 8 + [None]
+    index = transfer.pages[-1].unit_spec
+    assert (index.layer, index.dim, index.dtype) == (0, 128, "torch.float8_e4m3fnuz")
     assert all(
         region.semantic_role.startswith("mha.gqa4.")
         for region in transfer.block_regions

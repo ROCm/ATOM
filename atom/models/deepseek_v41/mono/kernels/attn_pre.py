@@ -77,6 +77,7 @@ from atom.mono.device.mx import (
     code_ceil,
     mfma_scaled,
     pow2,
+    rcp_pow2,
 )
 from atom.mono.device.ops import (
     CM_NT,
@@ -614,7 +615,7 @@ def stage_norm(c, t):
             amax = fx.max(amax, abs(y))
         amax = fx.max(butterfly(amax, (1, 2), fx.max), fx.Float32(AMAX_FLOOR))
         code = code_ceil(amax * fx.Float32(1.0 / FP8_MAX))
-        step = pow2(code)
+        inv = rcp_pow2(code)
         if mine & (cols[ch] < HIDDEN):
             if const_expr(c["index"] or c["ffn"]):
                 for j in range_constexpr(8):
@@ -637,8 +638,8 @@ def stage_norm(c, t):
                             c["put_bf"](dst, tg * HIDDEN + col, ys[0:4])
                             c["put_bf"](dst, tg * HIDDEN + col + 4, ys[4:8])
             if const_expr(not c["ffn"]):
-                w0 = fp8_pack4(*[clamp_fp8(ys[i] / step) for i in range(4)])
-                w1 = fp8_pack4(*[clamp_fp8(ys[4 + i] / step) for i in range(4)])
+                w0 = fp8_pack4(*[clamp_fp8(ys[i] * inv) for i in range(4)])
+                w1 = fp8_pack4(*[clamp_fp8(ys[4 + i] * inv) for i in range(4)])
                 c["put_words"](c["x8"], t * X8_WORDS + col // 4, [w0, w1])
                 if tt % 4 == 0:
                     c["put"](c["x8s"], t * (HIDDEN // 32) + col // 32, code)
@@ -950,7 +951,7 @@ def stage_qkv(c, t):
     for y in ys:
         amax = fx.max(amax, abs(y))
     code = code_round(fx.max(butterfly(amax, (1, 2), fx.max), fx.Float32(AMAX_FLOOR)))
-    mul = pow2(254 - code)
+    mul = rcp_pow2(code)
     if mine & (tt * 8 < Q_RANK):
         w0 = fp8_pack4(*[ys[i] * mul for i in range(4)])
         w1 = fp8_pack4(*[ys[4 + i] * mul for i in range(4)])
@@ -984,7 +985,7 @@ def stage_qkv(c, t):
     amax = butterfly(fx.max(abs(e0), abs(e1)), (1, 2, 4, 8), fx.max)
     code = code_ceil(fx.max(amax, fx.Float32(AMAX_FLOOR)) * fx.Float32(1.0 / FP8_MAX))
     step = pow2(code)
-    scaled = [clamp_fp8(v / step) for v in (e0, e1)]
+    scaled = [clamp_fp8(v * rcp_pow2(code)) for v in (e0, e1)]
     # the step's row of this token (int32, -1: none) past the layer's ring start
     row = rel + a["ring_off"]
     if const_expr(c["kv_fp8"]):
