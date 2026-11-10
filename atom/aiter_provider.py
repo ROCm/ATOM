@@ -241,6 +241,47 @@ def warmup_aiter_providers(config, payload, *, group=None, device=None) -> bool:
     return warmed
 
 
+def prepare_aiter_providers(config, payload, *, group=None, device=None) -> bool:
+    """Pre-bind the enabled providers for a capture M class (prepare-only API).
+
+    The interface has no capture hook; a compatible provider exposes
+    ``prepare(payload, *, group=None, device=None) -> bool`` (no launch,
+    cache-hit safe). Fail-open: a missing API or False leaves ATOM's capture
+    path non-fused for that cell. Returns True when a provider prepared.
+    """
+    enabled = _enabled_providers(config)
+    if not enabled:
+        return False
+    has_api = False
+    prepared = False
+    for name in enabled:
+        provider = _load_provider(name)
+        prepare = getattr(provider, "prepare", None)
+        if not callable(prepare):
+            logger.warning(
+                "aiter providers: %r has no prepare(); capture stays non-fused", name
+            )
+            continue
+        has_api = True
+        try:
+            ok = bool(prepare(payload, group=group, device=device))
+        except Exception:
+            logger.warning(
+                "aiter providers: %r prepare() failed; capture non-fused",
+                name,
+                exc_info=True,
+            )
+            ok = False
+        logger.info("aiter providers: %s capture prepare=%s", name, ok)
+        prepared = prepared or ok
+    if not has_api:
+        logger.warning(
+            "aiter providers: no enabled provider exposes prepare(); "
+            "capture stays non-fused"
+        )
+    return prepared
+
+
 def shutdown_aiter_providers(config, *, group=None, device=None) -> None:
     """Best-effort provider teardown (the interface has no lifecycle hook)."""
     for name in _enabled_providers(config):

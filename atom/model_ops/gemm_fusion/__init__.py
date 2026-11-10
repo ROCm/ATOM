@@ -10,6 +10,8 @@ function returns None and the model keeps #3084's completely unfused path.
 
 import logging
 
+import torch
+
 logger = logging.getLogger("atom")
 
 
@@ -50,6 +52,79 @@ class GemmFusionSites:
         for site in self.sites:
             site.mark_kv_ready()
         _warmup(self.config, self.sites)
+
+    def prepare_capture(self, local_m):
+        """Pre-bind the provider for one capture M class before capture starts.
+
+        The capture trace must not allocate a new provider binding: build the
+        capture-time payload (final layer KV state, weight/norm/cos/sin objects,
+        the site's shared output set for this M) and call the provider's
+        prepare-only API once per (site, mode, M). Missing API/False leaves that
+        cell on the non-fused path in capture (the eager path is unchanged).
+        """
+        from atom.aiter_provider import prepare_aiter_providers
+        from atom.utils.forward_context import get_forward_context
+
+        try:
+            fwd_ctx = get_forward_context()
+        except Exception:  # noqa: BLE001 - no capture context: nothing to do
+            return
+        try:
+            device = torch.cuda.current_device()
+        except Exception:  # noqa: BLE001 - CPU/test process
+            device = None
+        for site in self.sites:
+            if not site.provider_enabled or not site.kv_ready:
+                continue
+            key = (site.mode, int(local_m))
+            if key in site._capture_prepared or key in site._capture_declined:
+                continue
+            try:
+                gate_args, gate_kwargs = site.capture_gate_args(local_m, fwd_ctx)
+                served = site._serves(
+                    local_m, gate_args, gate_kwargs, capture_gate=True
+                )
+                if not served:
+                    site._capture_declined.add(key)
+                    logger.info(
+                        "provider capture %s mode=%s m=%d: fallback " "(gate declined)",
+                        site.name,
+                        site.mode,
+                        local_m,
+                    )
+                    continue
+                payload = site.capture_prepare_payload(local_m, fwd_ctx)
+                ok = prepare_aiter_providers(
+                    self.config,
+                    payload,
+                    group=site._group_value(),
+                    device=device,
+                )
+            except Exception:
+                logger.warning(
+                    "provider capture %s mode=%s m=%d: prepare failed",
+                    site.name,
+                    site.mode,
+                    local_m,
+                    exc_info=True,
+                )
+                ok = False
+            if ok:
+                site._capture_prepared.add(key)
+                logger.info(
+                    "provider capture %s mode=%s m=%d: fused (prepare)",
+                    site.name,
+                    site.mode,
+                    local_m,
+                )
+            else:
+                site._capture_declined.add(key)
+                logger.warning(
+                    "provider capture %s mode=%s m=%d: fallback (prepare unavailable)",
+                    site.name,
+                    site.mode,
+                    local_m,
+                )
 
     def before_step(self):
         pass

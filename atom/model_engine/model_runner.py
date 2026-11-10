@@ -4408,6 +4408,11 @@ class ModelRunner:
                         ub_tokens_across_dp=ub_tokens_across_dp,
                     )
 
+                    if self.gemm_fusion is not None:
+                        # Capture cannot allocate a new provider binding: pre-bind
+                        # this capture M class with the final-pool tensors first.
+                        self.gemm_fusion.prepare_capture(sp_local_len(running_tokens))
+
                     # Warmup
                     model_positions = (
                         self._mrope_positions_view(running_tokens)
@@ -4638,6 +4643,8 @@ class ModelRunner:
             running_tokens_per_dp_rank=self.running_tokens_per_dp_rank,
             in_hipgraph=True,
         )
+        if self.gemm_fusion is not None:
+            self.gemm_fusion.prepare_capture(sp_local_len(context.scheduled_tokens))
         get_forward_context().tr_graph = mode
         self.model(
             self.forward_vars["input_ids"].gpu[: context.scheduled_tokens],

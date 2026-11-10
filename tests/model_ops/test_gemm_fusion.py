@@ -20,6 +20,7 @@ import torch
 
 import atom.aiter_provider as provider
 import atom.model_ops.gemm_fusion.site as site_mod
+from atom.model_ops.gemm_fusion import GemmFusionSites
 
 
 @pytest.fixture(autouse=True)
@@ -453,6 +454,113 @@ def test_initialize_is_none_without_the_provider_flag():
 
     config = SimpleNamespace(aiter_provider_enable=())
     assert initialize_gemm_fusion(None, config) is None
+
+
+def test_capture_gate_requires_preprepare(monkeypatch):
+    _install_gate(monkeypatch, route="provider")
+    site = _site()
+    monkeypatch.setattr(site_mod, "_in_hipgraph", lambda: True)
+    assert site._serves(2, [], {}) is False  # no pre-bound capture cell
+    monkeypatch.setattr(site_mod, "_in_hipgraph", lambda: False)
+    assert site._serves(2, [], {}) is True  # eager path unchanged
+    site._capture_prepared.add(("dense", 2))
+    monkeypatch.setattr(site_mod, "_in_hipgraph", lambda: True)
+    assert site._serves(2, [], {}) is True
+
+
+def test_provider_prepare_api_is_called_and_fail_open(monkeypatch):
+    calls = []
+
+    class _Prepared:
+        def prepare(self, payload, *, group=None, device=None):
+            calls.append((payload, group, device))
+            return True
+
+    monkeypatch.setattr(provider, "_load_provider", lambda name: _Prepared())
+    config = SimpleNamespace(aiter_provider_enable=("sp-qkv-provider",))
+    assert provider.prepare_aiter_providers(config, {"payload": 1}, group="g", device=2)
+    assert calls == [({"payload": 1}, "g", 2)]
+
+    class _NoAPI:
+        pass
+
+    monkeypatch.setattr(provider, "_load_provider", lambda name: _NoAPI())
+    assert provider.prepare_aiter_providers(config, {"payload": 1}) is False
+
+
+class _CaptureSite:
+    mode = "dense"
+    provider_enabled = True
+    kv_ready = True
+    name = "capture-site"
+
+    def __init__(self):
+        self._capture_prepared = set()
+        self._capture_declined = set()
+        self._serves_value = True
+
+    def capture_gate_args(self, local_m, fwd_ctx):
+        return [], {}
+
+    def _serves(self, local_m, args, kwargs, *, capture_gate=False):
+        assert capture_gate is True
+        return self._serves_value
+
+    def capture_prepare_payload(self, local_m, fwd_ctx):
+        return {"sentinel": int(local_m)}
+
+    def _group_value(self):
+        return "group"
+
+
+def test_prepare_capture_payload_once_per_cell(monkeypatch):
+    site = _CaptureSite()
+    calls = []
+    monkeypatch.setattr(
+        provider,
+        "prepare_aiter_providers",
+        lambda config, payload, group=None, device=None: (
+            calls.append((payload, group, device)),
+            True,
+        )[1],
+    )
+    registry = GemmFusionSites(
+        [site], SimpleNamespace(aiter_provider_enable=("sp-qkv-provider",))
+    )
+    registry.prepare_capture(2)
+    registry.prepare_capture(2)
+    assert calls == [({"sentinel": 2}, "group", None)]
+    assert site._capture_prepared == {("dense", 2)}
+
+
+def test_prepare_capture_false_falls_back_and_caches(monkeypatch):
+    site = _CaptureSite()
+    calls = []
+    monkeypatch.setattr(
+        provider,
+        "prepare_aiter_providers",
+        lambda config, payload, group=None, device=None: (
+            calls.append(1),
+            False,
+        )[1],
+    )
+    registry = GemmFusionSites(
+        [site], SimpleNamespace(aiter_provider_enable=("sp-qkv-provider",))
+    )
+    registry.prepare_capture(2)
+    registry.prepare_capture(2)
+    assert len(calls) == 1
+    assert site._capture_declined == {("dense", 2)}
+    assert site._capture_prepared == set()
+
+
+def test_mark_kv_ready_clears_capture_prepare_cache(monkeypatch):
+    site = _site()
+    site._capture_prepared.add(("dense", 2))
+    site._capture_declined.add(("dense", 3))
+    site.mark_kv_ready()
+    assert site._capture_prepared == set()
+    assert site._capture_declined == set()
 
 
 # ---------------------------------------------------------------- import proof

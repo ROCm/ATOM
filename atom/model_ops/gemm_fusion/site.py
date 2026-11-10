@@ -27,6 +27,23 @@ logger = logging.getLogger("atom")
 
 _OP_NAME = "sp_qkv_fused"
 _SP_WORLD = 4
+_POSITIONAL_KEYS = (
+    "q",
+    "x",
+    "x_scale",
+    "w",
+    "w_scale",
+    "q_norm_w",
+    "k_norm_w",
+    "cos_cache",
+    "sin_cache",
+    "positions",
+    "slot_mapping",
+    "k_cache",
+    "v_cache",
+    "k_scale",
+    "v_scale",
+)
 
 # One output set per (device, mode, geometry, rows), shared by all sites.  The
 # provider stages its own padded outputs and copies the real rows into these
@@ -131,6 +148,14 @@ def _ensure_plugin_enabled(aiter, plugin, enabled):
                 tuple(status.get("routed_ops", {}) or {}),
             )
     return status
+
+
+def _in_hipgraph() -> bool:
+    """Whether the current forward is a capture/warmup pass under hipgraph."""
+    try:
+        return bool(getattr(get_forward_context().context, "in_hipgraph", False))
+    except Exception:  # noqa: BLE001 - no context means ordinary eager
+        return False
 
 
 def _shared_outputs(device, mode, impl, rows):
@@ -257,11 +282,16 @@ class QkvSite:
         self._logged = set()
         # False until GemmFusionSites.prepare() has seen the final KV pool.
         self.kv_ready = False
+        # Capture cells pre-bound through the provider prepare-only API.
+        self._capture_prepared: set[tuple[str, int]] = set()
+        self._capture_declined: set[tuple[str, int]] = set()
 
     def mark_kv_ready(self):
-        """The KV pool is final: drop per-M gate verdicts from any earlier pool."""
+        """The KV pool is final: drop gate/prepare verdicts from an earlier pool."""
         self.kv_ready = True
         self._routes.clear()
+        self._capture_prepared.clear()
+        self._capture_declined.clear()
 
     def _outputs(self, local_m):
         """Caller outputs for a provider-selected cell (shared, address-stable)."""
@@ -362,6 +392,47 @@ class QkvSite:
         }
         return args, kwargs
 
+    def _capture_state(self, fwd_ctx):
+        return self.attn.impl.gemm_fusion_prologue_state(fwd_ctx)
+
+    def capture_gate_args(self, local_m, fwd_ctx):
+        """The explain payload for a capture M class (non-executing meta outputs)."""
+        state = self._capture_state(fwd_ctx)
+        positions = torch.empty(
+            (self.world * local_m,), dtype=torch.int64, device="meta"
+        )
+        meta = self.build_meta(state, positions, state["slot_mapping"])
+        x = torch.empty(
+            (local_m, self.linear.input_size),
+            dtype=torch.float8_e4m3fn,
+            device="meta",
+        )
+        x_scale = torch.empty((local_m,), dtype=torch.float32, device="meta")
+        return self._args(x, x_scale, meta, None, None, meta_outputs=True)
+
+    def capture_prepare_payload(self, local_m, fwd_ctx):
+        """The prepare-only payload with the capture-time baked tensor objects.
+
+        Per-call tensors (x/x_scale/positions/stream) are placeholders; the
+        provider's binding only bakes KV caches/scales, weights/norm weights,
+        cos/sin and its own staging, which are taken from the final layer state
+        and the site's shared output set for this M class.
+        """
+        state = self._capture_state(fwd_ctx)
+        dev = self.linear.weight.device
+        positions = torch.empty((self.world * local_m,), dtype=torch.int64, device=dev)
+        meta = self.build_meta(state, positions, state["slot_mapping"])
+        x = torch.empty(
+            (local_m, self.linear.input_size),
+            dtype=torch.float8_e4m3fn,
+            device=dev,
+        )
+        x_scale = torch.empty((local_m,), dtype=torch.float32, device=dev)
+        args, kwargs = self._args(x, x_scale, meta, self._outputs(local_m), None)
+        payload = dict(zip(_POSITIONAL_KEYS, args))
+        payload.update(kwargs)
+        return payload
+
     def _group_value(self):
         if self._group is None:
             try:
@@ -437,7 +508,7 @@ class QkvSite:
             return False, "provider-declined"
         return False, "rank-disagreement"
 
-    def _serves(self, m, args, kwargs):
+    def _serves(self, m, args, kwargs, *, capture_gate=False):
         """The rank-uniform ``aiter.plugin.explain`` gate, cached per (mode, M)."""
         if not self.provider_enabled:
             return False
@@ -453,6 +524,11 @@ class QkvSite:
             )
             return False
         key = (self.mode, int(m))
+        # Capture may only take the fused path after the capture seam pre-bound
+        # this M class through the provider prepare-only API; otherwise the
+        # capture trace gets the non-fused path (no new binding inside capture).
+        if not capture_gate and _in_hipgraph() and key not in self._capture_prepared:
+            return False
         cached = self._routes.get(key)
         if cached is not None:
             return cached
