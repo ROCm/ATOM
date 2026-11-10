@@ -107,6 +107,33 @@ def receive_success(seq, *, as_str=False):
     )
 
 
+class SizedSeq(SimpleNamespace):
+    """A request with one prompt token per block of its `block_table`."""
+
+    def __len__(self):
+        return len(self.block_table)
+
+
+NO_HIT = SimpleNamespace(num_cached_blocks=0, block_hashes=[])
+
+
+def standalone(max_bytes, metrics=None):
+    """A controller over a one-token-per-block pool and a full-transfer connector."""
+    connector = SimpleNamespace(pd_receive_block_offset=lambda seq, n, cached: 0)
+    block_manager = SimpleNamespace(
+        num_pool_blocks=lambda tokens: tokens,
+        kv=SimpleNamespace(lookup=lambda h: -1),
+    )
+    return PdAdmissionController(max_bytes, 1024, connector, block_manager, metrics)
+
+
+def try_admit(policy, seq):
+    admitted, plan = policy.check(seq, NO_HIT)
+    if admitted:
+        policy.commit(seq, plan)
+    return admitted
+
+
 @pytest.mark.parametrize("chunked", [False, True])
 def test_ready_credit_held_until_first_batch(build, chunked):
     sched, request = build(chunked=chunked)
@@ -561,3 +588,38 @@ def test_physical_targets_are_deduplicated_and_release_is_idempotent():
     assert policy.pending_bytes == 2048
     policy.release(b)
     assert policy.pending_bytes == 0
+
+
+def test_admission_metrics_follow_credit_lifecycle(monkeypatch):
+    from prometheus_client import CollectorRegistry
+
+    from atom.metrics.scheduler import SchedulerMetrics
+    from atom.kv_transfer.disaggregation import pd_admission
+
+    clock = [100.0]
+    monkeypatch.setattr(pd_admission.time, "perf_counter", lambda: clock[0])
+    registry = CollectorRegistry()
+    policy = standalone(2048, SchedulerMetrics(registry=registry))
+    seq = SizedSeq(id=1, block_table=[1, 2])
+    other = SizedSeq(id=2, block_table=[3])
+    labels = {"dp_rank": "0", "engine_role": "default"}
+
+    def sample(name, **extra):
+        return registry.get_sample_value(f"atom:pd_admission_{name}", labels | extra)
+
+    assert try_admit(policy, seq)
+    assert sample("pending_requests", state="receiving") == 1
+    assert not try_admit(policy, other)
+    clock[0] += 2
+    assert not try_admit(policy, other)
+    assert sample("deferred_total", reason="bytes") == 1
+    policy.received(seq.id)
+    assert sample("pending_requests", state="ready") == 1
+    clock[0] += 3
+    policy.scheduled([seq])
+    assert sample("pending_kv_bytes") == 0
+    assert sample("ready_wait_seconds_count") == 1
+    assert try_admit(policy, other)
+    # SEQ entered at once; OTHER waited from its first deferral at t=100.
+    assert sample("credit_wait_seconds_count") == 2
+    assert sample("credit_wait_seconds_sum") == 5

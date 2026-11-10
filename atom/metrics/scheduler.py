@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass
 
 import numpy as np
-from prometheus_client import Gauge, Histogram
+from prometheus_client import Counter, Gauge, Histogram
 
 from atom.metrics.histogram import LATENCY_BUCKETS
 
@@ -80,6 +80,46 @@ class SchedulerMetrics:
         self.pd_transfer = Histogram(
             "atom:pd_kv_transfer_seconds",
             "Decode-side PD KV load wait until all workers complete; includes dispatch, handshake and notification.",
+            labels,
+            buckets=LATENCY_BUCKETS,
+            registry=registry,
+        ).labels(**labels)
+        self.pd_admission_pending = Gauge(
+            "atom:pd_admission_pending_requests",
+            "PD requests holding admission credits through their first scheduled forward.",
+            [*labels, "state"],
+            registry=registry,
+            multiprocess_mode="livesum",
+        )
+        self.pd_admission_bytes = Gauge(
+            "atom:pd_admission_pending_kv_bytes",
+            "Physical receive-target bytes held by pending PD requests per D rank.",
+            labels,
+            registry=registry,
+            multiprocess_mode="livesum",
+        ).labels(**labels)
+        self.pd_admission_deferred = Counter(
+            "atom:pd_admission_deferred_total",
+            "PD requests deferred by a credit limit, counted once per request and limit.",
+            [*labels, "reason"],
+            registry=registry,
+        )
+        self.pd_admission_credit_wait = Histogram(
+            "atom:pd_admission_credit_wait_seconds",
+            "Time a PD request waited for admission credits before D reserved its receive targets; 0 when admitted on its first attempt.",
+            labels,
+            buckets=LATENCY_BUCKETS,
+            registry=registry,
+        ).labels(**labels)
+        self.pd_admission_oversized = Counter(
+            "atom:pd_admission_oversized_total",
+            "Isolated PD requests allowed above the soft receive-byte limit.",
+            labels,
+            registry=registry,
+        ).labels(**labels)
+        self.pd_admission_ready_wait = Histogram(
+            "atom:pd_admission_ready_wait_seconds",
+            "Time from PD receive completion to first scheduled local forward.",
             labels,
             buckets=LATENCY_BUCKETS,
             registry=registry,

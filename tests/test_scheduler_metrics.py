@@ -313,6 +313,20 @@ def test_pool_partition_and_waiting_queue_exclusion():
     pool.free(used.block_id)
 
 
+def test_deferred_free_counts_shared_blocks_once():
+    scheduler = Scheduler(MockConfig())
+    handler = EngineUtilityHandler(None, Queue(), scheduler=scheduler)
+    assert handler.collect_metrics()["kv_blocks_deferred_free"] == 0
+    # Two finished P/D sources sharing a prefix block, both awaiting their send.
+    scheduler.deferred_free_blocks = {
+        1: SimpleNamespace(block_table=[3, 4]),
+        2: SimpleNamespace(block_table=[3, 5, 6]),
+    }
+    snapshot = handler.collect_metrics()
+    assert snapshot["requests_deferred_free"] == 2
+    assert snapshot["kv_blocks_deferred_free"] == 4
+
+
 def test_cache_tiers_preserve_admitted_reuse_through_snapshots():
     from aiter_stub import stubbed_aiter
 

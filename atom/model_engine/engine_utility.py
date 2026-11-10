@@ -969,6 +969,11 @@ class EngineUtilityHandler:
             }
             if kv_pool is not None:
                 reusable = kv_pool.num_reusable_free
+                # Finished requests whose blocks wait for every KV owner: on
+                # P/D prefill, the source KV that decode has not pulled yet.
+                deferred_free = getattr(
+                    self.scheduler, "deferred_free_blocks", {}
+                ).values()
                 result |= {
                     "kv_blocks_used": kv_pool.num_used,
                     "kv_blocks_free": kv_pool.num_free,
@@ -976,6 +981,12 @@ class EngineUtilityHandler:
                     "kv_blocks_indexed": kv_pool.num_indexed,
                     "kv_blocks_evictable": reusable,
                     "kv_blocks_vacant": kv_pool.num_free - reusable,
+                    "requests_deferred_free": len(deferred_free),
+                    # Physical blocks: a prefix shared by several finished
+                    # requests is counted once.
+                    "kv_blocks_deferred_free": len(
+                        {block for seq in deferred_free for block in seq.block_table}
+                    ),
                 }
 
             metrics = getattr(self.scheduler, "metrics", None)
