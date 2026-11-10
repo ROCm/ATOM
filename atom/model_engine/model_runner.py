@@ -3797,6 +3797,12 @@ class ModelRunner:
             if connector is not None:
                 connector.start_load_kv(connector_meta_output)
 
+    def register_chunked_admissions(self, admissions):
+        """Register chunked P/D admissions the PP head shipped ahead of a batch."""
+        register = getattr(get_kvconnector(), "register_chunked_admissions", None)
+        if callable(register):
+            register(admissions)
+
     @torch.inference_mode()
     def async_proc_aggregation(self) -> KVConnectorOutput:
         """Collect finished send/recv status from the KV connector."""

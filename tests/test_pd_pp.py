@@ -1731,6 +1731,65 @@ def test_pp_downstream_sends_output_whatever_the_ack_flag():
     stage.pp_transport.send_completion.assert_called_once_with([7], "fwd-out")
 
 
+@pytest.mark.parametrize("behind_batches", [False, True])
+def test_pp_downstream_registers_admissions_ahead_of_queued_batches(
+    monkeypatch, behind_batches
+):
+    """A registration skips the batches ahead of it, and so does its report."""
+    monkeypatch.setenv("ATOM_PP_EAGER_CHUNKED_ADMISSION", "1")
+    PPEngineCoreProc = _pp_engine_core_cls()
+    from atom.kv_transfer.disaggregation.types import (
+        ConnectorCompletion,
+        KVConnectorOutput,
+    )
+    from atom.model_engine.pp_engine_core import ChunkedAdmissions
+
+    batches = [_fake_batch([1], None), _fake_batch([2], None)]
+    for batch in batches:
+        batch.produces_output = lambda: True
+    admission = ChunkedAdmissions({9: "xfer-9"})
+    messages = deque(
+        [batches[0], admission, batches[1]] if behind_batches else [admission]
+    )
+    ready = KVConnectorOutput(
+        connector_completions={ConnectorCompletion("pd_admission_ready", 9, True)}
+    )
+    # The poll in flight predates the registration; the next one reports it.
+    polls = deque([KVConnectorOutput(), ready])
+    events = []
+    stage = PPEngineCoreProc.__new__(PPEngineCoreProc)
+    stage.kv_transfer_enabled = True
+    stage.is_last = True
+    stage.scheduler = MagicMock()
+    stage.scheduler.kv_connector = SimpleNamespace(
+        is_producer=True, enable_chunked_transfer=True
+    )
+    stage.utility_handler = MagicMock()
+    stage.utility_queue = MagicMock()
+    stage._is_idle_rl_weights_offloaded = lambda: False
+    stage.pull_and_process_input_queue = MagicMock(side_effect=[False, False, True])
+    stage.runner_mgr = MagicMock()
+    stage.runner_mgr.call_func.side_effect = lambda name, *args, **kwargs: (
+        events.append((name, *args))
+    )
+    stage.runner_mgr.call_func_with_aggregation.side_effect = lambda name: (
+        polls.popleft() if polls else KVConnectorOutput()
+    )
+    stage.pp_transport = MagicMock()
+    stage.pp_transport.recv_metadata.side_effect = lambda timeout_ms: (
+        messages.popleft() if messages else None
+    )
+    stage.pp_transport.send_kv_status.side_effect = lambda out: events.append(out)
+
+    PPEngineCoreProc._downstream_busy_loop(stage)
+
+    expected = [("register_chunked_admissions", {9: "xfer-9"}), ready]
+    if behind_batches:
+        expected += [("forward", batches[0]), ("forward", batches[1])]
+    flush = ("flush_pp_send",)
+    assert [e for e in events if e != flush] == expected
+
+
 def _head_for_batch(batch, *, dynamic_chunking_active=False):
     PPEngineCoreProc = _pp_engine_core_cls()
     head = SimpleNamespace(
@@ -1813,6 +1872,36 @@ def test_pp_head_rejects_a_final_chunk_whose_tokens_are_out_of_order():
 
     with pytest.raises(AssertionError, match="PP token ordering violated"):
         PPEngineCoreProc._pp_head_step(head)
+
+
+def test_pp_head_ships_chunked_admissions_while_the_pipeline_is_full(monkeypatch):
+    """Registrations must not wait for a free slot and the next batch."""
+    monkeypatch.setenv("ATOM_PP_EAGER_CHUNKED_ADMISSION", "1")
+    from atom.model_engine.pp_engine_core import ChunkedAdmissions
+
+    PPEngineCoreProc, head = _head_for_batch(_fake_batch([7], None))
+    head.kv_transfer_enabled = True
+    head._ship_chunked_admissions = PPEngineCoreProc._ship_chunked_admissions.__get__(
+        head
+    )
+    head._in_flight.extend((_fake_batch([i], None), {}, True) for i in (1, 2))
+    head.pp_transport.recv_completion.return_value = None
+    take = head.scheduler.kv_connector.take_chunked_admissions
+    take.return_value = {9: "xfer-9"}
+
+    PPEngineCoreProc._pp_head_step(head)
+
+    head.scheduler.schedule.assert_not_called()
+    head.runner_mgr.call_func.assert_any_call(
+        "register_chunked_admissions", {9: "xfer-9"}
+    )
+    head.pp_transport.send_metadata.assert_called_once_with(
+        ChunkedAdmissions({9: "xfer-9"})
+    )
+
+    take.return_value = {}
+    PPEngineCoreProc._pp_head_step(head)
+    head.pp_transport.send_metadata.assert_called_once()
 
 
 def test_dcp_block_descriptors_are_streamed_in_bounded_batches():

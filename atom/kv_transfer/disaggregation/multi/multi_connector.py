@@ -314,6 +314,12 @@ class MultiConnector(KVConnectorBase):
             if callable(callback):
                 callback(req_ids)
 
+    def register_chunked_admissions(self, admissions: dict) -> None:
+        for connector in self._connectors:
+            register = getattr(connector, "register_chunked_admissions", None)
+            if callable(register):
+                register(admissions)
+
     def get_finished(self) -> KVConnectorOutput:
         recv: set = set()
         failed: set = set()
@@ -562,6 +568,14 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         return MultiConnectorMetadata(
             metas=[c.build_connector_meta() for c in self._connectors]
         )
+
+    def take_chunked_admissions(self) -> dict:
+        admissions = {}
+        for c in self._connectors:
+            take = getattr(c, "take_chunked_admissions", None)
+            if callable(take):
+                admissions.update(take())
+        return admissions
 
     def update_state_after_alloc(self, seq: Any) -> None:
         for c in self._connectors:

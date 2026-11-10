@@ -588,6 +588,12 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
 
         return 0, False
 
+    def take_chunked_admissions(self) -> dict[ReqId, TransferId]:
+        """Hand the PP head the registrations no batch metadata carried yet."""
+        admissions = self._pending_chunked_admissions
+        self._pending_chunked_admissions = {}
+        return admissions
+
     def build_connector_meta(self) -> ConnectorMetadata:
         # Sweep even behind a capacity-blocked head, and on idle PP ticks.
         # Expiry queues the existing cancellation protocol; it never frees D's
@@ -1737,6 +1743,31 @@ class MooncakeConnector(KVConnectorBase):
         with self._completed_prefills_lock:
             self._kv_cache_ready_events.pop(req_id, None)
 
+    def register_chunked_admissions(self, admissions: dict[ReqId, TransferId]) -> None:
+        """Producer: register requests waiting for D ahead of their batch metadata.
+
+        Leaves the metadata snapshot of request-to-transfer IDs alone: the
+        batches ahead still apply theirs in order.
+        """
+        if not self.is_producer or not admissions:
+            return
+        with self._completed_prefills_lock:
+            self._register_chunked_admissions(admissions)
+        self._dispatch_ready_chunked_requests()
+
+    def _register_chunked_admissions(self, admissions: dict[ReqId, TransferId]) -> None:
+        """Caller holds `_completed_prefills_lock`."""
+        for req_id, transfer_id in admissions.items():
+            if req_id in self._chunked_local_ids:
+                continue
+            if transfer_id in self._chunked_local_ids.values():
+                self._admission_results.add(
+                    ConnectorCompletion("pd_admission_ready", req_id, False)
+                )
+            else:
+                self._chunked_local_ids[req_id] = transfer_id
+                self._chunked_admissions[req_id] = transfer_id
+
     def start_load_kv(self, metadata: ConnectorMetadata) -> None:
         """Initiate KV transfers for pending requests.
 
@@ -1755,15 +1786,7 @@ class MooncakeConnector(KVConnectorBase):
         # Producer: cache block_ids + slot_index from completed prefills
         if self.is_producer:
             with self._completed_prefills_lock:
-                for req_id, transfer_id in metadata.chunked_admissions.items():
-                    if req_id not in self._chunked_local_ids:
-                        if transfer_id in self._chunked_local_ids.values():
-                            self._admission_results.add(
-                                ConnectorCompletion("pd_admission_ready", req_id, False)
-                            )
-                        else:
-                            self._chunked_local_ids[req_id] = transfer_id
-                            self._chunked_admissions[req_id] = transfer_id
+                self._register_chunked_admissions(metadata.chunked_admissions)
             for req_id, meta in metadata.reqs_to_save.items():
                 if meta.chunked_transfer:
                     with self._completed_prefills_cv:

@@ -1645,6 +1645,49 @@ def test_admission_requires_all_tp_dcp_and_pp_ranks(monkeypatch, seq_factory, ea
             assert not worker._chunked_prefills  # Readiness itself allocates nothing.
 
 
+@pytest.mark.parametrize("pull_first", [False, True])
+def test_registration_ahead_of_batch_metadata_reaches_pp_quorum(
+    monkeypatch, seq_factory, pull_first
+):
+    """The PP head may register a waiting request before any batch carries it."""
+    from atom.kv_transfer.disaggregation.multi.multi_connector import (
+        MultiConnector,
+        MultiConnectorScheduler,
+    )
+
+    connector = scheduler_connector(monkeypatch, True, 2)
+    scheduler = MultiConnectorScheduler.__new__(MultiConnectorScheduler)
+    scheduler._connectors = [connector]
+    seq = pd_sequence(seq_factory)
+    assert not scheduler.admission_ready(seq)
+    admissions = scheduler.take_chunked_admissions()
+    assert admissions == {seq.id: "xfer-a"}
+    assert not scheduler.build_connector_meta().has_work()
+    pp = PPKVAggregator(2)
+    for stage in range(2):
+        worker, request, _, _ = idle_producer(stage, 2)
+        worker.request_id_to_transfer_id = {"earlier": "snapshot"}
+        multi = MultiConnector.__new__(MultiConnector)
+        multi._connectors = [worker]
+        if pull_first:
+            dispatch(worker, request)
+        multi.register_chunked_admissions(admissions)
+        if not pull_first:
+            dispatch(worker, request)
+        # Batches still ahead of the registration apply their own snapshot.
+        assert worker.request_id_to_transfer_id == {"earlier": "snapshot"}
+        out = worker.get_finished()
+        assert out.connector_completions == {
+            ConnectorCompletion("pd_admission_ready", seq.id, True)
+        }
+        connector.process_pd_completions(pp.ingest(stage, out))
+        assert connector.admission_ready(seq) is (stage == 1)
+        late = ConnectorMetadata()
+        late.chunked_admissions = dict(admissions)
+        worker.start_load_kv(late)
+        assert worker.get_finished().is_empty()
+
+
 def test_capacity_wait_does_not_expire_ready_or_queued_requests(
     monkeypatch, seq_factory
 ):

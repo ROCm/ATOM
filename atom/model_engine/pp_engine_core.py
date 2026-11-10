@@ -8,6 +8,7 @@ import logging
 import queue
 import time
 from collections import deque
+from dataclasses import dataclass
 
 from atom.distributed.pp_transport import PPStageTransport
 from atom.kv_transfer.disaggregation.pp_kv_aggregator import PPKVAggregator
@@ -25,6 +26,19 @@ logger = logging.getLogger("atom")
 # Collect poll timeout when the step made no other progress: bounds both
 # new-request admission latency and busy-spinning while batches are in flight.
 _PP_IDLE_POLL_MS = 1
+# Messages a downstream stage reads ahead of its next forward to find chunked
+# P/D registrations. The head keeps only a few batches in flight.
+_PP_METADATA_READ_AHEAD = 64
+# How long a stage that just registered admissions waits for a KV status poll
+# started behind them. An idle worker answers in well under a millisecond.
+_PP_ADMISSION_REPORT_WAIT_S = 0.005
+
+
+@dataclass(frozen=True)
+class ChunkedAdmissions:
+    """Chunked P/D registrations the head broadcasts ahead of any batch."""
+
+    admissions: dict
 
 
 class PPEngineCoreProc(EngineCore):
@@ -105,6 +119,8 @@ class PPEngineCoreProc(EngineCore):
             self.scheduler.shutdown_kv_events()
 
     def _pp_head_step(self):
+        if envs.ATOM_PP_EAGER_CHUNKED_ADMISSION and self.kv_transfer_enabled:
+            self._ship_chunked_admissions()
         launched = 0
         max_in_flight = envs.ATOM_PP_MAX_IN_FLIGHT or self.pp_size
         while len(self._in_flight) < max_in_flight:
@@ -300,6 +316,21 @@ class PPEngineCoreProc(EngineCore):
         self.runner_mgr.call_func("process_kvconnector_output", meta)
         self.pp_transport.send_metadata(batch)
 
+    def _ship_chunked_admissions(self) -> None:
+        """Register the requests that wait for D on every stage, on arrival.
+
+        D's pull makes a request schedulable only once every stage reports
+        it. In the next batch's metadata the registration would first wait for
+        a free pipeline slot, then on each stage for the batches ahead of it.
+        """
+        connector = getattr(self.scheduler, "kv_connector", None)
+        take = getattr(connector, "take_chunked_admissions", None)
+        admissions = take() if callable(take) else None
+        if not admissions:
+            return
+        self.runner_mgr.call_func("register_chunked_admissions", admissions)
+        self.pp_transport.send_metadata(ChunkedAdmissions(admissions))
+
     def _poll_kv_transfer_progress(self):
         """Aggregate KV transfer status from local TP workers AND downstream
         PP stages, then feed the result to the scheduler.
@@ -395,13 +426,14 @@ class PPEngineCoreProc(EngineCore):
         # When all requests wait, no forward wakes recv_metadata. Poll status
         # at the head's idle cadence instead of adding up to 100 ms to TTFT.
         connector = getattr(self.scheduler, "kv_connector", None)
-        metadata_poll_ms = (
-            _PP_IDLE_POLL_MS
-            if self.kv_transfer_enabled
+        chunked_producer = bool(
+            self.kv_transfer_enabled
             and getattr(connector, "is_producer", False)
             and getattr(connector, "enable_chunked_transfer", False)
-            else 100
         )
+        metadata_poll_ms = _PP_IDLE_POLL_MS if chunked_producer else 100
+        read_ahead = chunked_producer and envs.ATOM_PP_EAGER_CHUNKED_ADMISSION
+        backlog: deque = deque()
         shutdown = False
         metrics_interval = envs.ATOM_METRICS_UPDATE_INTERVAL_S
         next_metrics_push = 0.0
@@ -417,7 +449,10 @@ class PPEngineCoreProc(EngineCore):
                     break
                 if self._is_idle_rl_weights_offloaded():
                     continue
-                batch = self.pp_transport.recv_metadata(timeout_ms=metadata_poll_ms)
+                if read_ahead:
+                    batch = self._next_metadata(backlog, metadata_poll_ms)
+                else:
+                    batch = self.pp_transport.recv_metadata(timeout_ms=metadata_poll_ms)
                 if batch is None:
                     if self.kv_transfer_enabled:
                         self._poll_and_send_kv_status()
@@ -465,6 +500,59 @@ class PPEngineCoreProc(EngineCore):
             except Exception:
                 logger.exception("KV event publish during shutdown failed")
             self.scheduler.shutdown_kv_events()
+
+    def _next_metadata(self, backlog: deque, timeout_ms: int):
+        """Downstream: next batch, after registering every admission received.
+
+        A stage reads its socket only between forwards, so a registration the
+        head broadcast on arrival would otherwise wait out every batch ahead
+        of it. Batches keep their order.
+        """
+        if not backlog:
+            message = self.pp_transport.recv_metadata(timeout_ms=timeout_ms)
+            if message is None:
+                return None
+            backlog.append(message)
+        for _ in range(_PP_METADATA_READ_AHEAD):
+            message = self.pp_transport.recv_metadata(timeout_ms=0)
+            if message is None:
+                break
+            backlog.append(message)
+        admissions = [m for m in backlog if isinstance(m, ChunkedAdmissions)]
+        if admissions:
+            batches = [m for m in backlog if not isinstance(m, ChunkedAdmissions)]
+            backlog.clear()
+            backlog.extend(batches)
+            for message in admissions:
+                self.runner_mgr.call_func(
+                    "register_chunked_admissions", message.admissions
+                )
+            self._send_kv_status_after_registration()
+        return backlog.popleft() if backlog else None
+
+    def _send_kv_status_after_registration(self) -> None:
+        """Downstream: send the first KV status poll issued after a registration.
+
+        One poll is always in flight, so the next one to complete predates the
+        registration. Waiting for the one after it reports the requests whose
+        D pulls have already arrived now rather than after the next forward.
+        """
+        deadline = time.monotonic() + _PP_ADMISSION_REPORT_WAIT_S
+        predates = True
+        while True:
+            kvoutput = self.runner_mgr.call_func_with_aggregation(
+                "async_proc_aggregation"
+            )
+            if kvoutput is not None:
+                if not kvoutput.is_empty():
+                    self.pp_transport.send_kv_status(kvoutput)
+                if not predates:
+                    return
+                predates = False
+            if time.monotonic() >= deadline:
+                return
+            # Yield the GIL to the thread that receives the workers' replies.
+            time.sleep(0.0001)
 
     def _poll_and_send_kv_status(self):
         """Downstream: collect TP-aggregated KV status and send to head."""

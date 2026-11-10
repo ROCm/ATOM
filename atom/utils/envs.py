@@ -1233,6 +1233,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PP_MAX_IN_FLIGHT": lambda: _optional_int_env(
         "ATOM_PP_MAX_IN_FLIGHT", min_value=1
     ),
+    # Chunked P/D producer under PP: register the requests that wait for D on
+    # every stage as they arrive. 0 = they ride the next batch's metadata,
+    # which waits for a free pipeline slot and, on each stage, for the batches
+    # ahead of it; D's pull cannot make a request schedulable until then.
+    "ATOM_PP_EAGER_CHUNKED_ADMISSION": lambda: _flag_env(
+        "ATOM_PP_EAGER_CHUNKED_ADMISSION", "0"
+    ),
     # Engram: read the n-gram tables with a device kernel over UVA instead of
     # gathering them on the host. Each rank's shard stays in host memory,
     # page-locked (see ATOM_ENGRAM_UVA_COPY for how), not copied to HBM; the
