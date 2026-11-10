@@ -88,6 +88,7 @@ class EngineCore:
 
     def __init__(self, config: Config, input_address: str, output_address: str):
         self.label = "Engine Core"
+        self._kv_progress_event = threading.Event()
         self.input_queue = queue.Queue[Sequence]()
         self.output_queue = queue.Queue[list[Sequence]]()
         self.stream_output_queue = (
@@ -152,6 +153,7 @@ class EngineCore:
                 config.runner_qualname,
                 config,
                 on_worker_failure=self._send_engine_dead,
+                kv_progress_event=self._kv_progress_event,
             )
             self._post_model_load_hook()
             block_info = self.runner_mgr.call_func("get_num_blocks", wait_out=True)
@@ -516,6 +518,10 @@ class EngineCore:
             self.runner_mgr.call_func("release_multimodal_requests", request_ids)
 
     def _process_engine_step_inner(self):
+        # Clear before scheduling/polling, never between checking progress and
+        # waiting. Arrivals during this step remain latched until the next step.
+        if self.kv_transfer_enabled:
+            self._kv_progress_event.clear()
         result = self.scheduler.schedule()
 
         # Surface admit-rejected seqs (those `_unschedulable_reason` flags in
@@ -538,9 +544,8 @@ class EngineCore:
             return False
 
         # Dispatch KV connector metadata to workers (triggers async KV load)
-        if (
-            self.kv_transfer_enabled
-            and scheduled_batch.connector_meta_output is not None
+        if self.kv_transfer_enabled and connector_metadata_has_work(
+            scheduled_batch.connector_meta_output
         ):
             self.runner_mgr.call_func(
                 "process_kvconnector_output", scheduled_batch.connector_meta_output
@@ -567,14 +572,22 @@ class EngineCore:
                 )
 
         # Aggregate KV transfer status from all workers (only when PD disaggregation is active)
-        self._poll_kv_transfer_progress()
+        kv_progress = self._poll_kv_transfer_progress()
 
         if not has_seqs:
             logger.debug("%s: Empty scheduled batch, skipping postprocess", self.label)
+            if self.kv_transfer_enabled and not kv_progress:
+                self._wait_for_kv_progress()
             return False
 
         self._postprocess(seqs.values(), fwd_out, scheduled_batch)
         return True
+
+    def _wait_for_kv_progress(self) -> None:
+        # Work queued before the event was cleared must also prevent sleeping.
+        if not self.input_queue.empty() or not self.utility_queue.empty():
+            return
+        self._kv_progress_event.wait(KV_IDLE_DRAIN_INTERVAL_S)
 
     def _postprocess(self, seqs, fwd_out, batch):
         # Pass stream_output_queue to postprocess for streaming callbacks
@@ -694,11 +707,12 @@ class EngineCore:
         )
         self._fresh_kv_poll_stats = FreshKVPollStats(start=now)
 
-    def _poll_kv_transfer_progress(self) -> None:
+    def _poll_kv_transfer_progress(self) -> bool:
         if not self.kv_transfer_enabled:
-            return
+            return False
         kvoutput = self.runner_mgr.call_func_with_aggregation("async_proc_aggregation")
         self.scheduler._update_from_kv_xfer_finished(kvoutput)
+        progressed = kvoutput is not None and not kvoutput.is_empty()
         wait_s = self._fresh_kv_poll_s
         if (
             kvoutput is not None
@@ -714,12 +728,14 @@ class EngineCore:
             )
             self._record_fresh_poll(time.perf_counter() - t0, fresh is not None)
             self.scheduler._update_from_kv_xfer_finished(fresh)
+            progressed |= fresh is not None and not fresh.is_empty()
         # Reclaim any offload save whose completion report never came (LMCache
         # force-unpinned it upstream). Self-throttled, so calling it on every
         # poll is cheap; without it a stalled save hangs the engine forever.
         reconcile = getattr(self.scheduler, "_reconcile_stalled_deferred_saves", None)
         if callable(reconcile):
             reconcile()
+        return progressed
 
     def _poll_dynamic_chunking_calibration(self) -> None:
         """Install a freshly calibrated chunk latency model, if one is ready.
@@ -884,15 +900,18 @@ class EngineCore:
                             f"{self.label}: input get {request_type} {req_ids}"
                         )
                         self.input_queue.put_nowait(reqs)
+                        self._kv_progress_event.set()
                         self._offer_tier_lookups(reqs)
                     elif request_type == EngineCoreRequestType.UTILITY:
                         cmd = reqs.get("cmd") if isinstance(reqs, dict) else None
                         logger.debug(f"{self.label}: input get UTILITY command: {cmd}")
                         self.utility_queue.put_nowait((cmd, reqs))
                         self._has_pending_utility = True
+                        self._kv_progress_event.set()
                     elif request_type == EngineCoreRequestType.SHUTDOWN:
                         logger.debug(f"{self.label}: input get {request_type}")
                         self.input_queue.put_nowait([get_exit_sequence()])
+                        self._kv_progress_event.set()
                         alive = False
                         reason = request_type
             logger.debug(f"{self.label}: input thread exit due to {reason}")
