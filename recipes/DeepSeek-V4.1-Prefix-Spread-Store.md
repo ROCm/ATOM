@@ -27,12 +27,17 @@ export ATOM_KV_OFFLOAD_EXTRA_CONFIG='{
   "mooncake_store.protocol": "rdma",
   "mooncake_store.rdma_devices": "rdma0",
   "mooncake_store.local_hostname": "MODEL_IP",
+  "mooncake_store.chunk_tokens": 512,
   "mooncake_store.load_pool_mib": 1024,
   "mooncake_store.save_pool_mib": 256
 }'
 export ATOM_FRONTEND_PREFIX_HASH=1
-export OFFLOAD_MIN_LOAD_TOKENS=512
+export OFFLOAD_MIN_LOAD_TOKENS=8192
 export OFFLOAD_MAX_PENDING_SAVES=8
+# Bound coalescing for both waiting requests and running partial prefills.
+# These are scheduling bounds, not a 250 ms end-to-end TTFT guarantee.
+export ATOM_PREFILL_DELAYER_MAX_QUEUE_MS=250
+export ATOM_PREFILL_DELAYER_PARTIAL_MAX_TICKS=2
 # Required in every Mooncake process (see the offload README).
 export MC_NUM_QP_PER_EP=1
 unset ATOM_DP_SESSION_AFFINITY
@@ -60,3 +65,32 @@ GPU assignment, prefill budget, HBM memory fraction and warmup identical across
 comparisons.
 
 Native Store lookup is synchronous. KV restoration starts at admission.
+
+The minimum applies to the missing, chunk-aligned prefix beyond the selected
+rank's local HBM hit. For example, an owner with 16384 cached tokens and an
+idle target with 13312 cached tokens differ by 3072: the request still goes
+to the target, skips Store loading and recomputes the remainder. Short prompts
+continue to participate in prefix routing.
+
+The 8192-token minimum was measured with V4.1-Flash on MI355X, TP2/DPA2,
+512-token Store chunks, a 16384-token published owner prefix and a 16385-token
+request. Two warm pairs per difference gave these idle-target TTFT medians:
+
+| Missing prefix tokens | Load (ms) | Recompute (ms) |
+| ---: | ---: | ---: |
+| 3072 | 399 | 277 |
+| 6144 | 396 | 367 |
+| 8192 | 386 | 407 |
+
+For this comparison only, the loading arm allowed 512-token loads; the recipe
+retains 8192. With two real decoding requests filling the owner, the normal
+8192-token load took a median 756 ms versus 1526 ms for recomputation, with
+the owner still decoding when the request completed. These are request TTFTs,
+including replay and scheduling, rather than isolated copy times. They do not
+establish an optimum for other models, parallelism or links.
+
+The queue-age bound releases a waiting suffix after a load. It does not cover
+a partial prefill already in the running list; the separate two-tick partial
+bound prevents that request from waiting through the default 100-tick partial
+coalescing window. Both settings were tested together. Their effect on
+throughput was not benchmarked; this recipe favors prompt latency.

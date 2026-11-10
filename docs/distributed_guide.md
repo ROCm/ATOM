@@ -235,6 +235,10 @@ For V4.1, use the [native Mooncake Store recipe](../recipes/DeepSeek-V4.1-Prefix
 to recover shared PAGEs without LMCache MP. Local HBM hits remain local. V4.1
 needs bounded replay on the Store (the default; refused at startup without it);
 this does not enable other hybrid models that require an independent state tier.
+The recipe uses a measured 8192-token minimum and bounds both waiting-queue
+coalescing and running partial-prefill coalescing. A queue-age bound alone
+does not limit a partial request already in the running list. Its measured
+latency results and configuration limits are recorded in the recipe.
 
 
 When `ATOM_DP_SESSION_AFFINITY=1`, session routing adds a cache-locality layer
