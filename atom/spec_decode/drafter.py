@@ -116,11 +116,9 @@ def _resolve_embedding(target_model: nn.Module) -> nn.Module:
 
 def tap_is_resident(layers: nn.Module, lid: int) -> bool:
     """Whether aux tap ``lid`` runs on this PP stage: a layer owned by another
-    stage is a ``PPMissingLayer``. The embedding runs only on the first stage,
-    though the last may hold a copy for its drafter. Out-of-range ids are not
-    resident."""
-    if lid == -1:
-        return get_pp_group().is_first_rank
+    stage is a ``PPMissingLayer``, and the embedding (``-1``) runs on the stage
+    that owns layer 0. Out-of-range ids are not resident."""
+    lid = 0 if lid == -1 else lid
     return 0 <= lid < len(layers) and not isinstance(layers[lid], PPMissingLayer)
 
 
