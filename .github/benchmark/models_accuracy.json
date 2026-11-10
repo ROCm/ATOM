@@ -24,6 +24,20 @@
     "_baseline_note": "Full-eval (1319 samples) 3-shot flexible-extract = 0.9522 ± 0.0059"
   },
   {
+    "model_name": "DeepSeek-V4-Pro TP4 PCP2",
+    "model_path": "deepseek-ai/DeepSeek-V4-Pro",
+    "extraArgs": "--kv_cache_dtype fp8 -tp 4 -pcp 2",
+    "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1",
+    "runner": "linux-atom-do-mi350x-8",
+    "test_level": "pr",
+    "kv_block_ranks": 8,
+    "accuracy_threshold": 0.94,
+    "accuracy_timeout_minutes": 60,
+    "accuracy_baseline": 0.96,
+    "accuracy_baseline_model": "deepseek-ai/DeepSeek-V4-Pro",
+    "_baseline_note": "Bar of the TP8 entry, with the PCP guide's TP4 + PCP2 launch. Checks that all 8 TP x PCP ranks build one KV block count"
+  },
+  {
     "model_name": "DeepSeek-V4-Pro DSpark",
     "model_path": "deepseek-ai/DeepSeek-V4-Pro-DSpark",
     "extraArgs": "--kv_cache_dtype fp8 --index_cache_dtype fp4 -tp 8 --method dspark --num-speculative-tokens 7 --cudagraph-mode TR_HYBRID --enable-dp-attention --dspark-config '{\"confidence_schedule\": true, \"ragged\": true, \"ragged_graph_sizes\": \"8\"}'",
@@ -197,6 +211,19 @@
     "_baseline_note": "No public GSM8K baseline; HF card has no GSM8K"
   },
   {
+    "model_name": "Meta-Llama-3-8B-Instruct TP2",
+    "model_path": "meta-llama/Meta-Llama-3-8B-Instruct",
+    "extraArgs": "--kv_cache_dtype fp8 -tp 2 --gpu-memory-utilization 0.3",
+    "env_vars": "HSA_NO_SCRATCH_RECLAIM=1",
+    "runner": "linux-atom-do-mi350x-8",
+    "test_level": "pr",
+    "kv_block_ranks": 2,
+    "accuracy_threshold": 0.73,
+    "accuracy_baseline": 0.75,
+    "accuracy_baseline_model": "meta-llama/Meta-Llama-3-8B-Instruct",
+    "_baseline_note": "Bar of the former TP1 entry. Checks that both TP ranks build one KV block count"
+  },
+  {
     "model_name": "gpt-oss-120b (2 GPUs)",
     "model_path": "openai/gpt-oss-120b",
     "extraArgs": "--kv_cache_dtype fp8 -tp 2 --enable-dp-attention --enable-expert-parallel --enable-tbo all --gpu-memory-utilization 0.5",
@@ -361,6 +388,20 @@
     "accuracy_baseline": 0.9363,
     "accuracy_baseline_model": "amd/MiniMax-M3-MXFP4",
     "_baseline_note": "FP4 M3 tp8. GSM8K 5-shot chat (apply_chat_template + fewshot_as_multiturn, num_concurrent=32, max_gen_toks=16384)"
+  },
+  {
+    "model_name": "MiniMax-M3-MXFP4 SP4",
+    "model_path": "amd/MiniMax-M3-MXFP4",
+    "extraArgs": "--kv_cache_dtype fp8 -tp 1 -sp 4 --trust-remote-code --gpu-memory-utilization 0.8 --block-size 128 --max-model-len 32768 --max-num-seqs 128 --max-num-batched-tokens 32768 --no-enable_prefix_caching",
+    "client_command": "lm_eval --model local-chat-completions --apply_chat_template --fewshot_as_multiturn --model_args model=${MODEL_PATH},base_url=http://localhost:8000/v1/chat/completions,num_concurrent=32,max_retries=3,max_gen_toks=16384,tokenized_requests=False,trust_remote_code=True --tasks gsm8k --num_fewshot 5 --output_path ${OUTPUT_PATH}",
+    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_FORCE_ATTN_TRITON=1\nAITER_QUICK_REDUCE_CAST_BF16_TO_FP16=0",
+    "runner": "linux-atom-do-mi350x-8",
+    "test_level": "pr",
+    "kv_block_ranks": 4,
+    "accuracy_threshold": 0.93,
+    "accuracy_baseline": 0.9363,
+    "accuracy_baseline_model": "amd/MiniMax-M3-MXFP4",
+    "_baseline_note": "Bar of the TP8 entry; SP4 is the validated Ulysses SP setup. Checks that all 4 SP ranks build one KV block count"
   },
   {
     "model_name": "MiniMax-M3-MXFP4 Eagle3",
