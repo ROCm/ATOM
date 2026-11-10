@@ -22,7 +22,7 @@ pytest.importorskip(
 )
 
 from atom.models.utils import PPMissingLayer, get_pp_indices
-from atom.spec_decode.drafter import AuxCaptureSpec
+from atom.spec_decode.drafter import AuxCaptureSpec, check_shared_embedding
 from atom.spec_decode.pp_aux_relay import PPAuxRelay
 
 
@@ -274,3 +274,23 @@ def test_relay_hook_compiles_without_an_in_place_update():
         handle.remove()
         torch._dynamo.reset()
     assert "update" not in names
+
+
+def test_k3_draft_shares_the_last_stages_embedding():
+    # Under PP the draft drafts from the last stage's copy of the target's
+    # embedding, never its own (Kimi-K3.1-DSpark ships none).
+    from atom.models.kimi_k3_dspark import KimiK3DSpark
+
+    embed = nn.Embedding(16, 4)
+    target = types.SimpleNamespace(
+        model=types.SimpleNamespace(embed_tokens=embed), lm_head=nn.Identity()
+    )
+    draft = types.SimpleNamespace(hf_config=types.SimpleNamespace(vocab_size=16))
+    KimiK3DSpark.share_with_target(draft, target, set())
+    assert draft.embed_tokens is embed
+    check_shared_embedding(draft)
+
+
+def test_a_draft_sharing_a_missing_embedding_is_refused():
+    with pytest.raises(TypeError, match="pp_speculative_methods"):
+        check_shared_embedding(types.SimpleNamespace(embed_tokens=PPMissingLayer()))
