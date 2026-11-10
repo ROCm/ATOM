@@ -102,7 +102,11 @@ def configure_aiter_providers(config) -> bool:
         return False
 
     try:
-        from aiter import plugin
+        import aiter
+
+        plugin = getattr(aiter, "plugin", None)
+        if plugin is None:
+            raise AttributeError("aiter.plugin")
     except Exception:  # noqa: BLE001 - released aiter has no provider interface
         logger.warning(
             "aiter providers requested (%s) but this aiter has no aiter.plugin; "
@@ -119,6 +123,16 @@ def configure_aiter_providers(config) -> bool:
             _SUPPORTED_PLUGIN_API,
         )
         return False
+
+    # A routed op can be a LAZY export: `@plugin.route` registration happens only
+    # when `aiter.<op>` is resolved, so status()["routed_ops"] is empty until
+    # then. Resolve the ops ATOM expects before reading status, so the preflight
+    # log/asserts see the truth and the first explain() cannot KeyError.
+    for name in _EXPECTED_ROUTED_OPS:
+        try:
+            getattr(aiter, name)
+        except Exception:  # noqa: BLE001 - absent/optional export; status() decides
+            logger.debug("aiter provider op %r is not importable yet", name)
 
     try:
         plugin.configure(source=f"atom {atom_version()}", enable=enable)

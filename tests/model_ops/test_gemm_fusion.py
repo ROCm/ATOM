@@ -165,6 +165,35 @@ def test_configure_called_once_with_source_when_enabled(monkeypatch):
     assert configured[0]["source"].startswith("atom ")
 
 
+def test_configure_resolves_lazy_routed_ops_before_status(monkeypatch):
+    """A lazy aiter export registers its route on attribute access."""
+    events = []
+    resolved = [False]
+    module = types.ModuleType("aiter")
+
+    def lazy(name):
+        if name == "sp_qkv_fused":
+            events.append("getattr")
+            resolved[0] = True
+            return object()
+        raise AttributeError(name)
+
+    module.__getattr__ = lazy
+    module.plugin = SimpleNamespace(
+        API_VERSION=1,
+        configure=lambda **kwargs: events.append("configure"),
+        status=lambda: (
+            events.append("status"),
+            {"routed_ops": {"sp_qkv_fused": {}} if resolved[0] else {}},
+        )[1],
+    )
+    monkeypatch.setitem(sys.modules, "aiter", module)
+    config = SimpleNamespace(aiter_provider_enable=("sp-qkv-provider",))
+    assert provider.configure_aiter_providers(config) is True
+    assert resolved[0] is True
+    assert events.index("getattr") < events.index("status")
+
+
 def test_provider_warmup_is_framework_owned_and_fail_open(monkeypatch):
     warmed = []
 

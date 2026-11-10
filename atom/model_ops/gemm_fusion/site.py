@@ -335,8 +335,11 @@ class QkvSite:
             return cached
         served = False
         try:
-            plugin = _aiter().plugin
-            explanation = plugin.explain(_OP_NAME, *args, **kwargs)
+            aiter = _aiter()
+            # The op is a lazy export; resolving it also completes its
+            # @route registration before explain() looks it up.
+            getattr(aiter, _OP_NAME)
+            explanation = aiter.plugin.explain(_OP_NAME, *args, **kwargs)
             decision = getattr(explanation, "decision", None)
             served = getattr(decision, "route", None) == "provider"
         except Exception:
