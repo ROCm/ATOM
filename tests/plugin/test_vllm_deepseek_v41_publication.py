@@ -32,7 +32,7 @@ def _builder(*, speculative_tokens=2, max_tokens=12):
     for name in ("positions", "batch_id_per_q_token"):
         buffers[name].publication_group = "v41_step"
     buffers["cu_seqlens_q"].publication_group = "early"
-    buffers["block_tables"].publication_group = "prefill"
+    buffers["block_tables"].publication_group = "seq_metadata"
     builder.model_runner = SimpleNamespace(
         forward_vars=buffers, v41_graphs_enabled=False
     )
@@ -334,7 +334,9 @@ def test_capture_scratch_covers_split_dummy_pages_and_keeps_addresses():
     builder.model_runner.v41_graphs_enabled = True
     scratch = builder._capture_dummy_cache(1, 1, 1)
     pointers = _scratch_storage(scratch)
-    batch = bridge._v41_dummy_batch(96, max_req_tokens=64, max_reqs=4)
+    batch = bridge._v41_dummy_batch(
+        bridge._v41_dummy_lengths(96, max_req_tokens=64, max_reqs=4)
+    )
     assert batch.num_scheduled_tokens == (48, 48)
     for lengths, expected_rows in [
         ((48, 48), [[0, 1], [2, 3]]),

@@ -98,7 +98,7 @@ from atom.models.deepseek_v41.mono.kernels.peer_layout import peer_offsets
 from atom.models.deepseek_v41.mono.kernels.token_par import own_count, own_view
 from atom.models.deepseek_v41.mono.kernels.topk import lds_words
 from atom.models.deepseek_v41.mono.sources import SOURCES
-from atom.mono.device.mx import FP8_MAX, clamp_fp8, code_ceil, pow2
+from atom.mono.device.mx import FP8_MAX, clamp_fp8, code_ceil, rcp_pow2
 from atom.mono.device.ops import (
     bf16_round,
     butterfly,
@@ -150,6 +150,8 @@ class AttnPostBuild:
     # the index plane is FP4: its scorer is ``index_score_fp4`` (``iqs``,
     # ``pscale`` and the FULL layers' task plan ``iplan``)
     index_fp4: bool = False
+    # FP4 keys in OPUS 64-row groups; the query remains Mono's own layout.
+    index_mfma: bool = False
     # the TP size: every width a rank holds (``Dims``)
     tp: int = 4
     timeline: bool = field(default=False, metadata={"sym": "tl"})
@@ -287,7 +289,7 @@ def irq_group(c, t, tile, dc, out, rope):
     o1 = o * cs - e * sn
     amax = butterfly(fx.max(abs(e1), abs(o1)), (1, 2, 4, 8), fx.max)
     code = code_ceil(fx.max(amax, fx.Float32(AMAX_FLOOR)) * fx.Float32(1.0 / FP8_MAX))
-    inv = pow2(254 - code)
+    inv = rcp_pow2(code)
     # this thread's two bytes and its neighbour's make a word (4 dims)
     q0, q1 = clamp_fp8(e1 * inv), clamp_fp8(o1 * inv)
     n0, n1 = xshfl(q0, 1), xshfl(q1, 1)
@@ -362,7 +364,7 @@ def stage_woa(c, task, ops, t0=0, n=None):
     )
     amax = fx.max(butterfly(abs(y), (1, 2, 4, 8, 16), fx.max), fx.Float32(AMAX_FLOOR))
     code = code_ceil(amax * fx.Float32(1.0 / FP8_MAX))
-    q = clamp_fp8(y / pow2(code))
+    q = clamp_fp8(y * rcp_pow2(code))
     # rows row .. row + 3 (row a multiple of 4) make a word
     lane = c["lane"]
     w = fp8_pack4(
@@ -593,7 +595,8 @@ def attn_post_context(key, s, lds, mb, bases, layout, scratch, args, rank, sym):
         "poll": mb.poll, "peer_addr": lambda p: bases[p], "rank": rank, "sym": sym,
         "peer": peer_offsets(s, Dims(key.tp)),
         "fold": True, "index": False, "aux": False, "ffn": True,
-        "index_fp4": key.index_fp4, "tok_par": key.tok_par, "kv_fp8": key.kv_fp8,
+        "index_fp4": key.index_fp4, "index_mfma": key.index_mfma,
+        "tok_par": key.tok_par, "kv_fp8": key.kv_fp8,
         "args": args, "d": Dims(key.tp),
     }  # fmt: skip
     for region, (off, _) in layout.items():
@@ -779,6 +782,7 @@ def build_attn_post(key: AttnPostBuild):
         tl=int(timeline),
         ix=int(bound_max > 0),
         i4=int(key.index_fp4),
+        im=int(key.index_mfma),
     )
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])

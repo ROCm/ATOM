@@ -458,10 +458,17 @@ class AsyncIOProcManager:
     )
 
     def __init__(
-        self, finalizer, proc_num: int, runner: str, *args, on_worker_failure=None
+        self,
+        finalizer,
+        proc_num: int,
+        runner: str,
+        *args,
+        on_worker_failure=None,
+        kv_progress_event: threading.Event | None = None,
     ):
         self.parent_finalizer = finalizer
         self.on_worker_failure = on_worker_failure
+        self.kv_progress_event = kv_progress_event
         self.proc_num = proc_num
 
         io_addrs = [get_open_zmq_ipc_path(), get_open_zmq_ipc_path()]
@@ -633,6 +640,8 @@ class AsyncIOProcManager:
                 obj = output_socket.recv(copy=False)
                 obj = pickle.loads(obj)
                 self.kv_outputs_queues[worker_id].put_nowait(obj)
+                if self.kv_progress_event is not None:
+                    self.kv_progress_event.set()
         finally:
             output_socket.close(linger=0)
             logger.debug(f"{self.label}: kv output thread {worker_id} exit")

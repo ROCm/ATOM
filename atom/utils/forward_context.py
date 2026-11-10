@@ -16,8 +16,11 @@ from atom.config import Config, KVCacheTensor, ParallelConfig
 
 # A module, not its names: `region_graph` reads this one back at call time.
 from atom.utils import region_graph
+from atom.utils.tbo.ubatch_splitting import UBatchSlice, decode_bucket_splits
+from atom.utils.tbo.ubatching import sync_dp_metadata
 
 if TYPE_CHECKING:
+    from atom.distributed.pcp_utils import PcpBalGroup
     from atom.model_ops.indexer import IndexRows
 
 
@@ -163,12 +166,20 @@ class ForwardMode:
     # The DP group replays request graphs as one this step: a decode's whole
     # forward (`use_cudagraph`), a prefill's decoder (`DecoderGraph`).
     req_graphs: bool = False
-    # The decode batch this step's TBO micro-batches are cut from
-    # (`decode_ubatch_request_ranges`), and so the one every backend lays its
-    # per-ubatch metadata out for: the padded bucket when the step replays a
-    # TBO graph, which recorded that split; the scheduled requests on an eager
-    # TBO split. None when the step does not split a decode.
-    ubatch_split_bs: int | None = None
+    # The step's TBO micro-batches, cut once on the settled shape
+    # (`ModelRunner._cut_ubatches`): the attention backends lay each
+    # micro-batch's metadata out from it and the wrapper runs it. None when
+    # the step does not split.
+    ubatch_slices: "tuple[UBatchSlice, ...] | None" = None
+    # A PCP prefill's request groups, one a micro-batch of `ubatch_slices`,
+    # each striped and reindexed on its own. None unless a PCP prefill splits.
+    pcp_groups: "tuple[PcpBalGroup, ...] | None" = None
+
+    @property
+    def decode_ubatch_slices(self) -> "tuple[UBatchSlice, ...] | None":
+        """`ubatch_slices` on a decode, whose micro-batches each run their
+        requests' tokens in their own half (`decode_ubatch_token_order`)."""
+        return None if self.is_prefill else self.ubatch_slices
 
     @classmethod
     def decide(
@@ -186,10 +197,13 @@ class ForwardMode:
         max_seqlen_q: int,
         running_tokens_per_dp_rank: np.ndarray,
         graph_shapes: Container[tuple[int, int]] | None = None,
+        tbo_decode: bool = False,
         tbo_decode_graphs: bool = False,
     ) -> "ForwardMode":
         """Run the step's DP collective and settle its shape from the result.
 
+        ``tbo_decode``: a decode every rank runs splits into TBO micro-batches
+        where its bucket does (`decode_bucket_splits`); it casts no vote.
         ``tbo_decode_graphs``: every decode bucket that splits
         (`decode_bucket_splits`) was recorded as a TBO graph, so a decode the
         group splits replays like any other.
@@ -202,11 +216,7 @@ class ForwardMode:
         the step (`AttentionMetadataBuilder.step_needs_eager`); the DP group
         agrees on it.
         """
-        # Lazy: `atom.utils.tbo`'s package init reaches back into this module.
-        from atom.utils.tbo.ubatch_splitting import decode_bucket_splits
-        from atom.utils.tbo.ubatching import sync_dp_metadata
-
-        is_prefill = batch.total_tokens_num_prefill > 0
+        is_prefill = batch.has_prefill
         scheduled_tokens = batch.total_tokens_num
         # The whole batch, never a per-kind count: `schedule` returns its
         # prefill batch before it can add a decode row, so the two are equal
@@ -222,6 +232,7 @@ class ForwardMode:
             scheduled_bs=scheduled_bs,
             is_prefill=is_prefill,
             tbo_on=tbo_on,
+            running_tokens_per_dp_rank=running_tokens_per_dp_rank,
             needs_eager=step_needs_eager,
             final_requests=batch.final_prefill_requests(),
             local_meets_min_tokens=meets_min,
@@ -236,7 +247,11 @@ class ForwardMode:
         # than its peers.
         if sync.max_seqlen_q_across_dp is not None:
             max_seqlen_q = sync.max_seqlen_q_across_dp
-        unified_bs = sync.max_bs_across_dp
+        # A rank with no request has no phase of its own: it runs the group's.
+        if not scheduled_bs:
+            is_prefill = sync.any_rank_has_prefill
+        # A group with no request still forwards one padding request.
+        unified_bs = max(sync.max_bs_across_dp, 1)
         tbo_collective_active = sync.tbo_collective_active
         # One meaning and only one: every rank runs one height. Every rank
         # decoding, the group max pads them level and `scheduled_tokens`
@@ -262,6 +277,17 @@ class ForwardMode:
         rung = int(np.searchsorted(capture_sizes, unified_bs))
         on_ladder = rung < len(capture_sizes)
         running_bs = int(capture_sizes[rung]) if on_ladder else unified_bs
+        # A decode splits the group's `running_bs`, on every rank alike, when
+        # every rank decodes.
+        if not is_prefill:
+            if tbo_decode and not on_ladder:
+                # Even, as every rung is under decode TBO (`Config.capture_sizes`).
+                running_bs += running_bs % 2
+            tbo_collective_active = (
+                tbo_decode
+                and not sync.any_rank_has_prefill
+                and decode_bucket_splits(running_bs)
+            )
 
         # ---- dispatch: a different question, asked separately ----------
         # Whether the TARGET replays. It no longer decides how wide anything
@@ -293,23 +319,20 @@ class ForwardMode:
         if replayable and not shape_captured:
             _warn_uncaptured_decode_shape(running_bs, max_seqlen_q)
         use_cudagraph = replayable and shape_captured
-        # A replayed bucket that splits was recorded split at the bucket, on
-        # every rank alike, whatever each rank scheduled into it; an eager
-        # split cuts this rank's scheduled requests.
-        if use_cudagraph and tbo_decode_graphs and decode_bucket_splits(running_bs):
-            ubatch_split_bs = running_bs
-        elif tbo_collective_active and not is_prefill:
-            ubatch_split_bs = scheduled_bs
-        else:
-            ubatch_split_bs = None
+        # A replayed bucket that splits was recorded split at the bucket, and
+        # an eager split cuts the same bucket: on every rank alike, whatever
+        # each rank scheduled into it.
+        splits_decode = tbo_collective_active and not is_prefill
 
         running_tokens, decode_recorded = cls._running_tokens(
             is_prefill=is_prefill,
             unified=unified,
             running_bs=running_bs,
             scheduled_tokens=scheduled_tokens,
-            scheduled_tokens_per_dp_rank=sync.scheduled_tokens_per_dp_rank,
-            is_block_drafter=is_block_drafter,
+            running_tokens_per_dp_rank=running_tokens_per_dp_rank,
+            # A split decode's micro-batches are cut by request, each
+            # `max_seqlen_q` running tokens a request wide.
+            packed_decode=is_block_drafter and not splits_decode,
             max_seqlen_q=max_seqlen_q,
         )
         token_graph = cls._pad_to_token_graph(
@@ -334,15 +357,14 @@ class ForwardMode:
             token_graph=bool(token_graph) or (decode_recorded and graphable),
             prefill_token_graph=bool(token_graph),
             req_graphs=req_graphs,
-            ubatch_split_bs=ubatch_split_bs,
         )
 
     @staticmethod
     def _pad_to_token_graph(graphable, sync, running_tokens_per_dp_rank) -> int:
-        """Settle every rank's running tokens into ``running_tokens_per_dp_rank``
-        -- its scheduled ones, or on a step some rank prefills every rank's
-        raised to the prefill bucket holding the group's largest
-        (`TokenGraph.bucket`) -- and return that bucket, 0 for none.
+        """On a step some rank prefills, raise every rank's running tokens in
+        ``running_tokens_per_dp_rank`` to the prefill bucket holding the
+        group's largest (`TokenGraph.bucket`) and return that bucket, 0 for
+        none.
 
         One bucket for every rank, a decoding one and an idle rank's dummy step
         included: a recording's collectives are sized by its bucket and hold
@@ -353,7 +375,6 @@ class ForwardMode:
         still runs the decode it scheduled.
         """
         running = running_tokens_per_dp_rank
-        np.copyto(running, sync.scheduled_tokens_per_dp_rank)
         if not graphable or not any(sync.prefill_across_dp):
             return 0
         group = region_graph.TokenGraph.bucket(int(running.max()), "prefill")
@@ -369,8 +390,8 @@ class ForwardMode:
         unified: bool,
         running_bs: int,
         scheduled_tokens: int,
-        scheduled_tokens_per_dp_rank,
-        is_block_drafter: bool,
+        running_tokens_per_dp_rank,
+        packed_decode: bool,
         max_seqlen_q: int,
     ) -> tuple[int, bool]:
         """``(running_tokens, recorded)``: the decode's width, and whether a
@@ -381,10 +402,11 @@ class ForwardMode:
         forward will produce.
         """
         if not unified or is_prefill:
-            # Nothing padded the tensor -- the varlen gather sends each rank its
-            # own count, and a prompt is ragged, so no product recovers a
-            # height -- and this rank's own count is the whole answer.
-            return scheduled_tokens, False
+            # The varlen gather sends each rank its own count, and a prompt is
+            # ragged, so no product recovers it: this rank's own count is the
+            # whole answer -- its scheduled tokens, or with none the running
+            # tokens `sync_dp_metadata` gave it, which is the table's minimum.
+            return scheduled_tokens or int(running_tokens_per_dp_rank.min()), False
 
         # The batch was rounded onto the ladder AFTER the sync, so this runs rows
         # no rank reported; group-agreed all the same, both factors having come
@@ -394,18 +416,18 @@ class ForwardMode:
         captured = region_graph.TokenGraph.captured_sizes("decode")
         if not captured:
             return running_tokens, False
-        if not is_block_drafter:
-            # Rectangular layout: one row per (seq, query), which every per-token
-            # buffer spans and `slot_mapping[i * q + j]` addresses through. Anything
-            # under the product would leave the tail of that rectangle unwritten.
+        if not packed_decode:
+            # One row per (seq, query), which every per-token buffer spans and
+            # `slot_mapping[i * q + j]` addresses through. Anything under the
+            # product would leave rows of it unwritten.
             return running_tokens, running_tokens in captured
 
         # Marker-driven layout: the rows are one flat run, so the width is the
         # smallest recorded one that holds it, not a product -- q-divisible
         # because the per-seq structures tile the run at that stride. Every rank
-        # is decoding here, so `scheduled_tokens` IS a decode count on each of
-        # them and row 0's reduction is the group's run.
-        run = int(scheduled_tokens_per_dp_rank.max())
+        # is decoding here, so every rank's count is a decode count and the
+        # table's maximum is the group's run.
+        run = int(running_tokens_per_dp_rank.max())
         recorded = region_graph.TokenGraph.bucket(run, "decode", multiple_of=q)
         if recorded is None:
             # Nothing recorded holds the run, so forward it eagerly rather than
@@ -533,11 +555,15 @@ class Context:
     # that need the token ids but cannot receive them as a function arg
     # (the op signature is fixed by the consumer's plugin contract).
     input_ids: torch.Tensor | None = None
-    # Row offset of this (micro-)batch's tokens on the full forward's token
-    # axis. 0 except inside a TBO micro-batch. Anything writing into a
-    # whole-forward buffer from inside the model must add it, or the ubatches
-    # land on each other's rows. Read per-thread (the context is thread-local).
+    # Where this TBO micro-batch's running tokens start with the step's laid
+    # end to end, none overlapping (`UBatchSlice.token_slice`); 0 outside one.
+    # Whole-forward scratch is addressed here. Read per-thread (the context is
+    # thread-local).
     ubatch_token_offset: int = 0
+    # A split decode micro-batch's tokens at their packed positions in the
+    # step (`decode_ubatch_token_order`); None otherwise, where its tokens are
+    # the step's from `ubatch_token_offset` on.
+    ubatch_token_order: torch.Tensor | None = None
     # This pass's rows are this rank's 1/pcp shard of the tokens: round-robin
     # under PCP, a contiguous range under SP. Set where the split is made;
     # FusedMoE reads it to gather its routed rows across the PCP group
@@ -576,6 +602,7 @@ class Context:
         forward_mode: ForwardMode | None = None,
         input_ids: torch.Tensor | None = None,
         ubatch_token_offset: int = 0,
+        ubatch_token_order: torch.Tensor | None = None,
         draft_anchor_overrides: torch.Tensor | None = None,
         pcp_split: bool = False,
         target_pcp_split: bool = False,
@@ -594,6 +621,7 @@ class Context:
         self.forward_mode = forward_mode
         self.input_ids = input_ids
         self.ubatch_token_offset = ubatch_token_offset
+        self.ubatch_token_order = ubatch_token_order
         self.draft_anchor_overrides = draft_anchor_overrides
         self.pcp_split = pcp_split
         self.target_pcp_split = target_pcp_split
@@ -639,6 +667,14 @@ class AttentionMetaData:
     # DSA + DCP indexer: MTP verify gives each draft position its own window.
     # The padded running-width buffer is shared by eager, graph and TBO paths.
     dcp_local_context_lens: torch.Tensor | None = None
+    # Where this forward's sparse (DSA) selection lives: the selected KV slots
+    # at `sparse_kv_indptr`, and under DCP each query token's compacted
+    # offsets and owned counts. The indexer writes them and every sparse MLA
+    # layer reads them, a layer reusing an earlier layer's selection
+    # (IndexShare) included, so a forward's share is never another's.
+    sparse_kv_indices: torch.Tensor | None = None
+    dcp_sparse_kv_indptr: torch.Tensor | None = None
+    dcp_owned_counts: torch.Tensor | None = None
     # Whether this prefill runs sparse (DSA) MLA, decided once a step by the
     # attention builder: the indexer, MLA and PCP all follow it.
     run_sparse: bool = False
@@ -667,6 +703,18 @@ class AttentionMetaData:
     total_kv: int | None = None
     num_cached_tokens: torch.Tensor | None = None
     seq_starts: torch.Tensor | None = None
+
+    # A TBO step's micro-batches' metadata, one per `ForwardMode.ubatch_slices`
+    # slice, built with the step's (`finish_ubatch_decode` /
+    # `finish_ubatch_prefill`). None when the step does not split.
+    ubatches: "list[AttentionMetaData] | None" = None
+    # A split decode's packed tokens in its micro-batches' order
+    # (`decode_ubatch_token_order`), which the TBO wrapper gathers its inputs
+    # by and scatters its outputs back through; None otherwise.
+    ubatch_token_order: torch.Tensor | None = None
+    # A decode micro-batch's own scheduled tokens on the device (`[1]`
+    # int32); None on a step's metadata and a prefill micro-batch's.
+    scheduled_tokens_gpu: torch.Tensor | None = None
 
     def __init__(
         self,
@@ -836,11 +884,9 @@ class ForwardContext:
 
     ubatch_slices: list[Any] | None = None
 
-    # Cross-DP MAX of per-ubatch token counts, reduced in the step's one packed
-    # all_gather (``ForwardMode.decide``) and propagated here so
-    # ``UBatchWrapper._compute_ub_graph_bs`` no longer needs its own
-    # per-ubatch all_reduce. Shape: tuple of length N == len(ubatch_slices).
-    # None when TBO is not active this step.
+    # Cross-DP MAX of per-ubatch token counts, set by the SGLang plugin's TBO
+    # path. Shape: tuple of length N == len(ubatch_slices). None when TBO is
+    # not active this step.
     ub_max_tokens_across_dp: tuple | None = None
     # The same counts UNREDUCED: per ubatch, every rank's. The MAX above is one
     # reduction of it and an all2all's receive width wants the SUM, so consumers
