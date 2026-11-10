@@ -72,7 +72,8 @@ idle target with 13312 cached tokens differ by 3072: the request still goes
 to the target, skips Store loading and recomputes the remainder. Short prompts
 continue to participate in prefix routing.
 
-The recipe starts with a configurable 4096-token minimum. Measurements used
+The final recipe uses 4096 as a configurable, unmeasured policy cutoff, not a
+measured break-even point. Measurements used
 V4.1-Flash on MI355X, TP2/DPA2,
 512-token Store chunks, a 16384-token published owner prefix and a 16385-token
 request. Two warm pairs per difference gave these idle-target TTFT medians:
@@ -87,10 +88,13 @@ For this comparison only, the loading arm allowed 512-token loads; the recipe
 uses 4096 as an initial policy cutoff: loading 3072 tokens was clearly slower,
 while the 6144- and 8192-token comparisons were closer to break-even. This is
 not a measured optimum: loading at 6144 was still about 29 ms slower in this
-idle case, and no 4096-token crossover measurement was taken. Tune the minimum
+idle case, and no 4096-token crossover measurement was taken. The final 4096
+setting therefore permits that measured slower 6144-token load; deployments
+prioritizing the measured idle-case latency can raise the minimum to 8192.
+Tune the minimum
 for the deployment's load and latency goals. With two real decoding requests
-filling the owner, a separate measurement using an 8192-token minimum found an
-8192-token load took a median 756 ms versus 1526 ms for recomputation, with
+filling the owner, a separate measurement using an 8192-token minimum found that
+an 8192-token load took a median 756 ms versus 1526 ms for recomputation, with
 the owner still decoding when the request completed. These are request TTFTs,
 including replay and scheduling, rather than isolated copy times. They do not
 establish an optimum for other models, parallelism or links.
