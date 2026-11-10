@@ -18,6 +18,7 @@ from atom.model_ops.minimax_m3.sparse_attn import (
     make_sparse_decode_metadata,
     make_sparse_prefill_metadata,
 )
+from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace
 from atom.utils import CpuGpuBuffer, envs
 from atom.utils.block_convert import (
     block_table_convert_triton,
@@ -296,7 +297,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             )
         # The MXFP4 index scorer's work map buffer, by ubatch prefix ("" the whole step).
         self._index_work_maps = {}
-        self._index_scores = {}  # its score storage, by the same prefix
+        self._index_score_workspaces = {}  # its LogitsWorkspace, by the same prefix
         self._index_work_map_blocks = 0
         if (
             self._has_sparse_attention
@@ -315,7 +316,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             self._index_work_maps[""] = self._alloc_index_work_map(
                 self.max_bs, max_qlen
             )
-            self._index_scores[""] = self._alloc_index_scores(self.max_bs * max_qlen)
+            self._index_score_workspaces[""] = self._alloc_index_score_workspace(
+                self.max_bs * max_qlen
+            )
         self._pa_decode_bf16_asm_enabled = (
             use_pa_decode_bf16_asm() and model_runner.block_size == 256
         )
@@ -370,16 +373,18 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                     rows, 1
                 )
                 # and its own scores, for the same reason
-                self._index_scores[f"ub{ub_idx}_"] = self._alloc_index_scores(rows)
+                self._index_score_workspaces[f"ub{ub_idx}_"] = (
+                    self._alloc_index_score_workspace(rows)
+                )
 
-    def _alloc_index_scores(self, max_rows: int):
-        """Score storage for up to ``max_rows`` query rows at the work map's width,
-        allocated once (a captured graph bakes its pointer) and never filled: see
-        `MiniMaxM3SparseMetadata.index_score_out`."""
-        return torch.empty(
-            self._num_idx_heads * max_rows * self._index_work_map_blocks,
-            dtype=torch.float32,
-            device=self.device,
+    def _alloc_index_score_workspace(self, max_rows: int) -> LogitsWorkspace:
+        """Score storage for up to ``max_rows`` query rows at the work map's width, the
+        indexers' `LogitsWorkspace` at an explicit capacity. Allocated once, here in
+        the builder's constructor, so the memory profile counts it and a captured graph
+        bakes a stable pointer; never filled (see
+        `MiniMaxM3SparseMetadata.index_score_workspace`)."""
+        return LogitsWorkspace(
+            self._num_idx_heads * max_rows * self._index_work_map_blocks, self.device
         )
 
     def _alloc_index_work_map(self, max_batch: int, max_query_len: int):
@@ -730,7 +735,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         return {
             "index_work_map_out": work_map,
             "index_work_map_max_block": self._index_work_map_blocks,
-            "index_score_out": self._index_scores[prefix],
+            "index_score_workspace": self._index_score_workspaces[prefix],
         }
 
     def _get_sparse_attention_block_tables(

@@ -301,14 +301,18 @@ def test_a_graph_replays_a_padded_step_like_the_scheduled_batch(S, heads, fill):
 
 
 def _scores(running, S, bound, heads=HEADS):
-    """The builder's persistent score storage: flat, at the map's width, and never
+    """The builder's persistent score workspace: at the map's width, and never
     filled -- here with values no selector may read (NaN, +-inf, a huge finite)."""
-    flat = torch.empty(heads * running * S * bound, dtype=torch.float32, device="cuda")
+    from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace
+
+    n = heads * running * S * bound
+    workspace = LogitsWorkspace(n, "cuda")
     junk = torch.tensor(
         [float("nan"), float("inf"), -float("inf"), 3e38], device="cuda"
     )
+    flat = workspace.logits(1, n)
     flat.copy_(junk[torch.randint(0, 4, flat.shape, device="cuda")])
-    return flat
+    return workspace
 
 
 def _select_persistent(q, cache, table, seq, S, md, scores, heads=HEADS):
@@ -321,7 +325,7 @@ def _select_persistent(q, cache, table, seq, S, md, scores, heads=HEADS):
         index_mxfp4=True, pages_per_block=1,
         n_valid_column_per_row=md.n_valid_column_per_row,
         index_work_map=md.index_work_map, index_work_map_max_block=bound,
-        index_score_out=scores,
+        index_score_workspace=scores,
     )  # fmt: skip
 
 
@@ -358,3 +362,47 @@ def test_a_persistent_unfilled_score_buffer_selects_like_the_allocated_one(
         for g, w in zip(got, want):
             assert torch.equal(g, w), f"step {step}"
         _assert_pad_rows_are_empty(got, scheduled * S, heads)
+
+
+@pytest.mark.parametrize("S,heads", [(8, 1), (4, 4)])
+def test_a_graph_replays_into_its_score_workspace_like_the_allocated_scores(S, heads):
+    """The workspace's pointer is baked into the graph: captured once with 8 requests,
+    replayed after the builder's refill with 3 scheduled and 5 pad rows, the selection
+    is what the allocated scores give for that batch, and the workspace is the same
+    storage before and after."""
+    running, scheduled = 8, 3
+    cache, table, seq, q = make_case(running, S, seed=95 + S, heads=heads)
+    bound = table.shape[1]
+    buffers, nvalid = _buffers(running, S, bound, heads)
+    workspace = _scores(running, S, bound, heads)
+    ptr = workspace.logits(1, 1).data_ptr()
+    static = [x.clone() for x in (table, seq, q)]
+
+    def refill():
+        return _metadata(static[0], static[1], S, buffers, nvalid, heads)
+
+    def run(md):
+        return _select_persistent(
+            static[2], cache, static[0], static[1], S, md, workspace, heads
+        )
+
+    md = refill()
+    run(md)  # JIT outside the capture
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        got = run(md)
+    t, s, x = _pad(
+        table[:scheduled], seq[:scheduled], q[: scheduled * S], S, running, 0x7FFFFFFF
+    )
+    for dst, src in zip(static, (t, s, x)):
+        dst.copy_(src)
+    refill()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert workspace.logits(1, 1).data_ptr() == ptr
+    bufs = _buffers(scheduled, S, bound, heads)
+    md = _metadata(table[:scheduled], seq[:scheduled], S, *bufs, heads)
+    want = _select(q[: scheduled * S], cache, table[:scheduled], seq[:scheduled], S, md, heads)  # fmt: skip
+    _assert_live_rows_match(got, want, scheduled * S, heads)
+    _assert_pad_rows_are_empty(got, scheduled * S, heads)

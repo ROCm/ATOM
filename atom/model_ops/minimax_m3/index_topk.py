@@ -770,7 +770,7 @@ def _select_with_aiter(
     Declines rather than raises: k past the wave width, or a survivor buffer
     past the LDS budget, are shapes the Triton selector still handles. `topk_idx` is contiguous, so its
     flattening is a view; `score` is too unless the scorer allocated it transposed
-    (MXFP4, several index heads, no persistent ``index_score_out``), which only the
+    (MXFP4, several index heads, no persistent ``index_score_workspace``), which only the
     stride-aware Triton selector reads.
     """
     if topk_per_row_small_k is None or not score.is_contiguous():
@@ -1388,7 +1388,7 @@ def minimax_m3_index_topk_decode(
     pages_per_block: int = PAGES_PER_SPARSE_BLOCK,
     index_work_map=None,
     index_work_map_max_block: int = 0,
-    index_score_out=None,
+    index_score_workspace=None,
 ):
     """Decode index block-score + top-k, both split-K (cudagraph-safe).
 
@@ -1401,12 +1401,12 @@ def minimax_m3_index_topk_decode(
     (`make_sparse_decode_metadata`) -- and the ``index_work_map_max_block`` it was
     built against, which must not move between graph replays (the work map's row
     count is the scorer's grid); omitted, it builds its own map. Given no
-    ``index_score_out`` it allocates the fp32 scores per call, filled with its -inf
+    ``index_score_workspace`` it allocates the fp32 scores per call, filled with its -inf
     sentinel (``alloc_score``), as ``[heads, rows, max_block]`` -- or the transposed,
     non-contiguous layout of it when ``S * heads >= 16``, which the Triton selector
-    reads and the aiter one declines. ``index_score_out`` is persistent flat fp32
-    storage (the builder's, so a captured graph's pointer is stable) the scorer writes
-    a contiguous ``[heads, rows, max_block]`` view of instead: no per-layer allocation,
+    reads and the aiter one declines. ``index_score_workspace`` is a persistent
+    `LogitsWorkspace` (the builder's, so a captured graph's pointer is stable) the scorer
+    writes a contiguous ``[heads, rows, max_block]`` view of instead: no per-layer allocation,
     no fill (both selectors read a row only up to its valid blocks, which the scorer
     writes every step), and the aiter selector stays eligible at any ``S * heads``.
 
@@ -1471,17 +1471,10 @@ def minimax_m3_index_topk_decode(
         score_max_block = max(max_block, index_work_map_max_block)
         _require_packable(score_max_block)
         score_out = None
-        if index_score_out is not None:
-            size = num_idx_heads * total_q * score_max_block
-            if index_score_out.numel() < size:
-                raise ValueError(
-                    f"index_score_out holds {index_score_out.numel()} scores, the "
-                    f"step needs {size} ({num_idx_heads} x {total_q} x "
-                    f"{score_max_block})"
-                )
-            score_out = index_score_out[:size].view(
-                num_idx_heads, total_q, score_max_block
-            )
+        if index_score_workspace is not None:  # fails if the step outgrows it
+            score_out = index_score_workspace.logits(
+                num_idx_heads * total_q, score_max_block
+            ).view(num_idx_heads, total_q, score_max_block)
         k_data, k_scale = page_views(index_kv_cache)
         score = minimax_m3_index_score_fp4_flydsl(
             idx_q,

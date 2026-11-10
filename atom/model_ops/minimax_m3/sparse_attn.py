@@ -23,6 +23,7 @@ import triton.language as tl
 from aiter.ops.attention import pa_fwd_asm_supports_arch
 
 from atom.model_ops.minimax_m3.index_topk import build_n_valid_column_per_row
+from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace
 
 # One sparse block == one KV page.
 SPARSE_BLOCK_SIZE = 128
@@ -107,10 +108,11 @@ class MiniMaxM3SparseMetadata:
     """The block count `index_work_map` was built at (0 with no map); the scorer
     must be given the same one, so it travels with the map and is not derived again.
     """
-    index_score_out: torch.Tensor | None = None
+    index_score_workspace: LogitsWorkspace | None = None
     """Persistent fp32 storage the MXFP4 decode scorer writes its block scores into,
     viewed ``[heads, rows, index_work_map_max_block]`` contiguous (the aiter selector
-    reads only that layout). Never filled: every selector reads only the first
+    reads only that layout): the same `LogitsWorkspace` the other indexers score
+    into. Never filled: every selector reads only the first
     ``n_valid_column_per_row`` columns of a row, which the scorer writes each step.
     None where there is no work map; the scorer then allocates (and fills) its own.
     """
@@ -172,10 +174,10 @@ def make_sparse_decode_metadata(
     n_valid_column_per_row_out: torch.Tensor | None = None,
     index_work_map_out: torch.Tensor | None = None,
     index_work_map_max_block: int = 0,
-    index_score_out: torch.Tensor | None = None,
+    index_score_workspace: LogitsWorkspace | None = None,
 ) -> MiniMaxM3SparseMetadata:
-    """``index_score_out`` is the scorer's score storage (flat, at least ``heads *
-    rows * index_work_map_max_block`` fp32), carried through to the selection.
+    """``index_score_workspace`` is the scorer's score storage (capacity at least
+    ``heads * rows * index_work_map_max_block``), carried through to the selection.
     ``index_work_map_out`` is the persistent storage of an MXFP4 index cache's
     scorer's work map (the builder allocates it only then): given, the step's map is
     built into it here, once, at ``index_work_map_max_block`` blocks (the model
@@ -222,7 +224,9 @@ def make_sparse_decode_metadata(
         index_work_map_max_block=(
             index_work_map_max_block if index_work_map is not None else 0
         ),
-        index_score_out=index_score_out if index_work_map is not None else None,
+        index_score_workspace=(
+            index_score_workspace if index_work_map is not None else None
+        ),
     )
 
 

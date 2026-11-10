@@ -16,6 +16,8 @@ import types
 import pytest
 import torch
 
+from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace
+
 BOUND, HEADS, MAX_BS = 64, 2, 16
 
 
@@ -31,7 +33,7 @@ def builder(mod, mxfp4=True, tbo_decode=True, forward_vars=None):
     b = object.__new__(mod.AiterAttentionMetadataBuilder)
     b._index_work_map_blocks = BOUND if mxfp4 else 0
     b._index_work_maps = {}
-    b._index_scores = {}
+    b._index_score_workspaces = {}
     b._num_idx_heads = HEADS
     b.max_bs = MAX_BS
     b.device = "cpu"
@@ -81,7 +83,12 @@ def test_the_ubatch_buffers_are_for_a_decode_tbo_at_one_token_a_request(
     max_qlen = 8  # a speculative config: the TBO sparse decode still runs one token
     if mxfp4:
         b._index_work_maps[""] = b._alloc_index_work_map(max_bs, max_qlen)
-        b._index_scores[""] = b._alloc_index_scores(max_bs * max_qlen)
+        b._index_score_workspaces[""] = b._alloc_index_score_workspace(
+            max_bs * max_qlen
+        )
+        assert b._index_score_workspaces[""].capacity == (
+            HEADS * max_bs * max_qlen * BOUND
+        )
         capacity_args.clear()
     # each ubatch's requests, from the split every backend's ubatch metadata follows
     import numpy as np
@@ -103,17 +110,19 @@ def test_the_ubatch_buffers_are_for_a_decode_tbo_at_one_token_a_request(
     if not (mxfp4 and tbo_decode):
         assert not [n for n in names if n in maps] and not capacity_args
         return
-    scores = b._index_scores
+    scores = b._index_score_workspaces
     for i in (0, 1):
         assert maps[names[i]].shape == (100, 2)
         assert maps[names[i]].dtype == torch.int32
         # the scores of that ubatch's requests, one token each, at the map's width
-        assert scores[names[i]].shape == (HEADS * rows[i] * BOUND,)
-        assert scores[names[i]].dtype == torch.float32
+        assert scores[names[i]].capacity == HEADS * rows[i] * BOUND
+        assert scores[names[i]].nbytes == 4 * scores[names[i]].capacity
+        assert isinstance(scores[names[i]], LogitsWorkspace)
     assert capacity_args == [(rows[0], BOUND, 1, HEADS), (rows[1], BOUND, 1, HEADS)]
     # each ubatch has its own map
     assert maps[names[1]].data_ptr() != maps[names[0]].data_ptr()
-    assert scores[names[1]].data_ptr() != scores[names[0]].data_ptr()
+    ptr = [scores[n].logits(1, 1).data_ptr() for n in names]
+    assert ptr[0] != ptr[1]
 
 
 def test_the_ubatch_metadata_is_built_with_its_own_buffers(mod, monkeypatch):
@@ -132,7 +141,7 @@ def test_the_ubatch_metadata_is_built_with_its_own_buffers(mod, monkeypatch):
     )
     b = builder(mod, forward_vars=var)
     b._index_work_maps = {"ub0_": object(), "ub1_": object()}
-    b._index_scores = {"ub0_": object(), "ub1_": object()}
+    b._index_score_workspaces = {"ub0_": object(), "ub1_": object()}
     ub = types.SimpleNamespace(running_bs=rows)
     attn = types.SimpleNamespace(
         block_tables=torch.zeros(rows, 4),
@@ -145,7 +154,7 @@ def test_the_ubatch_metadata_is_built_with_its_own_buffers(mod, monkeypatch):
     for i, kw in enumerate(seen):
         assert kw["index_work_map_out"] is b._index_work_maps[f"ub{i}_"]
         assert kw["index_work_map_max_block"] == BOUND
-        assert kw["index_score_out"] is b._index_scores[f"ub{i}_"]
+        assert kw["index_score_workspace"] is b._index_score_workspaces[f"ub{i}_"]
     assert seen[0]["index_work_map_out"] is not seen[1]["index_work_map_out"]
     # another index cache allocated none: nothing to pass
     assert builder(mod)._index_scorer_kwargs("ub0_") == {}
@@ -272,7 +281,7 @@ def test_the_row_rule_and_its_refusal_are_the_mxfp4_indexs(
     )
     b = builder(mod, mxfp4=mxfp4)
     if mxfp4:
-        b._index_work_maps[""] = b._index_scores[""] = object()
+        b._index_work_maps[""] = b._index_score_workspaces[""] = object()
     b.refresh_flydsl_plan = lambda *_a, **_k: None
     b._get_sparse_attention_block_tables = lambda bt, sl, bs: bt
     b._n_valid_column_per_row_buffer = lambda: None
@@ -311,11 +320,11 @@ def test_the_scorer_is_given_the_bound_its_map_was_built_at():
         num_prefills=0,
         index_work_map=wmap,
         index_work_map_max_block=37,
-        index_score_out=scores,
+        index_score_workspace=scores,
     )
     kw = impl._mxfp4_select_kwargs(md, decode=True)
     assert kw["index_work_map"] is wmap and kw["index_work_map_max_block"] == 37
-    assert kw["index_score_out"] is scores
+    assert kw["index_score_workspace"] is scores
     assert "index_work_map" not in impl._mxfp4_select_kwargs(md, decode=False)
 
 
@@ -365,9 +374,9 @@ def test_the_caller_can_own_the_output(monkeypatch, planned):
 
 
 def test_the_scorer_writes_a_contiguous_view_of_the_persistent_scores(monkeypatch):
-    """`index_score_out` is flat storage: the scorer is handed a contiguous
+    """`index_score_workspace` is a `LogitsWorkspace`: the scorer is handed a contiguous
     [heads, rows, width] view of its head (the layout the aiter selector needs), the
-    selection reads that same tensor, and storage too small for the step is refused
+    selection reads that same tensor, and a workspace too small for the step is refused
     rather than overrun."""
     pytest.importorskip("aiter")
     from aiter.ops import flydsl
@@ -399,13 +408,13 @@ def test_the_scorer_writes_a_contiguous_view_of_the_persistent_scores(monkeypatc
             idx_q, torch.zeros(1), table, seq, width * 128, 2, 1, 1, heads, 1.0,
             max_query_len=1, index_mxfp4=True,
             index_work_map=object(), index_work_map_max_block=width,
-            index_score_out=storage,
+            index_score_workspace=storage,
         )  # fmt: skip
 
-    storage = torch.empty(heads * rows * width + 5)  # a buffer sized for more
+    storage = LogitsWorkspace(heads * rows * width + 5, "cpu")  # sized for more
     call(storage)
     out = seen["out"]
     assert out.shape == (heads, rows, width) and out.is_contiguous()
-    assert out.data_ptr() == storage.data_ptr() and seen["sel"] is out
-    with pytest.raises(ValueError, match="index_score_out holds"):
-        call(torch.empty(heads * rows * width - 1))
+    assert out.data_ptr() == storage.logits(1, 1).data_ptr() and seen["sel"] is out
+    with pytest.raises(ValueError, match="exceeds its workspace"):
+        call(LogitsWorkspace(heads * rows * width - 1, "cpu"))
