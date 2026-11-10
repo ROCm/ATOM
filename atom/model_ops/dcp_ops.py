@@ -19,6 +19,7 @@ Also here: the sparse indexer's DCP support -- the decode candidate exchange
 (fused into one aiter op) and the sparse-prefill owned-slot filter.
 """
 
+import inspect
 import logging
 
 import numpy as np
@@ -865,13 +866,16 @@ def mask_empty_dcp_lse(
 # the same order -- which a DCP group's lock-step decode does. Each token count
 # is its own kernel build (~0.4-0.8 s on first use), so only graph-captured
 # steps take it: the build lands in capture, and eager steps stay on a2a.
+# Sparse MLA's empty rows (owned_counts == 0) are masked inside the combine
+# through its ``row_counts``; an aiter without that argument keeps a2a.
 
 _MAILBOX_WORKSPACES: dict = {}
 # Largest merge (tokens x all heads x head dim) the mailbox takes. Its tagged
 # system-scope stores beat pack -> RCCL -> combine while the merge is latency
-# bound and lose once it is bandwidth bound: on MI355X the two cross between
-# about 2.6e5 and 3.9e5 elements (GLM-5.2 DCP4 16 x 256, Kimi-K3 DCP8 12 x 128).
-_MAILBOX_MAX_ELEMS = 1 << 18
+# bound and lose once it is bandwidth bound. On MI355X (token tiling,
+# row_counts) GLM-5.2 DCP4 16 x 256 leads through 1.18e6 elements and loses
+# from 1.31e6; Kimi-K3 DCP8 12 x 128 still leads at 1.57e6.
+_MAILBOX_MAX_ELEMS = 1 << 20
 logger = logging.getLogger("atom")
 
 
@@ -893,22 +897,22 @@ def prepare_dcp_mailbox(cp_group, heads, dim, max_tokens) -> bool:
     ``cp_group`` in the same order, before any CUDA graph is captured. Its
     memory sits outside torch's allocator, so it must exist before the KV
     cache is sized. Returns False on every rank, and the merge stays on
-    all-to-all, when any rank's aiter has no mailbox combine or the peer
-    memory cannot be mapped.
+    all-to-all, when any rank's aiter has no mailbox combine (or one without
+    ``row_counts``) or the peer memory cannot be mapped.
     """
     key = _mailbox_key(cp_group, heads, dim)
     if key in _MAILBOX_WORKSPACES:  # None: tried, and it fell back
         return _MAILBOX_WORKSPACES[key] is not None
     _MAILBOX_WORKSPACES[key] = None
     try:
-        from aiter.ops.flydsl.dcp_mailbox import CombineWorkspace
+        from aiter.ops.flydsl.dcp_mailbox import CombineWorkspace, dcp_lse_combine
+
+        usable = "row_counts" in inspect.signature(dcp_lse_combine).parameters
     except ImportError:
-        CombineWorkspace = None
+        usable = False
     # agree first: a rank that skipped the mapping would leave its peers
     # waiting in it
-    ok = torch.tensor(
-        [int(CombineWorkspace is not None)], dtype=torch.int32, device="cpu"
-    )
+    ok = torch.tensor([int(usable)], dtype=torch.int32, device="cpu")
     torch.distributed.all_reduce(
         ok, op=torch.distributed.ReduceOp.MIN, group=cp_group.cpu_group
     )
@@ -951,10 +955,13 @@ def _dcp_mailbox_merge(cp_attn_out, cp_attn_lse, cp_group, owned_counts, quant_d
         return None
     from aiter.ops.flydsl.dcp_mailbox import dcp_lse_combine
 
-    lse = cp_attn_lse.to(torch.float32)
-    if owned_counts is not None:
-        lse = mask_empty_dcp_lse(lse, owned_counts)
-    out = dcp_lse_combine(ws, cp_attn_out, lse.contiguous(), base_e=True)
+    out = dcp_lse_combine(
+        ws,
+        cp_attn_out,
+        cp_attn_lse.to(torch.float32).contiguous(),
+        base_e=True,
+        row_counts=owned_counts,
+    )
     # No quantizing combine here: hand back the bf16 rows unquantized, which
     # the caller then quantizes as it would without the fused path.
     return out if quant_dtype is None else (out, None)

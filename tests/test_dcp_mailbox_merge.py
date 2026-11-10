@@ -77,22 +77,25 @@ def test_a_call_the_workspace_cannot_take_is_all_to_all(
 
 
 @needs_dcp_ops
-@pytest.mark.parametrize("tokens,taken", [(16, True), (17, False)])
+@pytest.mark.parametrize("extra,taken", [(0, True), (1, False)])
 def test_a_merge_past_the_size_limit_is_all_to_all(
-    monkeypatch, a2a_calls, capturing, tokens, taken
+    monkeypatch, a2a_calls, capturing, extra, taken
 ):
-    """16 tokens x 64 heads x 256 is the largest merge the mailbox takes."""
+    """The widest merge under the element limit takes the mailbox; one token
+    more takes all-to-all, with the workspace still wide enough for it."""
+    tokens = dcp_ops._MAILBOX_MAX_ELEMS // (64 * 256) + extra
     group = _group()
     key = dcp_ops._mailbox_key(group, 16, 256)
     monkeypatch.setitem(
-        dcp_ops._MAILBOX_WORKSPACES, key, SimpleNamespace(max_tokens=64)
+        dcp_ops._MAILBOX_WORKSPACES, key, SimpleNamespace(max_tokens=tokens + 1)
     )
     combined = []
     monkeypatch.setitem(
         sys.modules,
         "aiter.ops.flydsl.dcp_mailbox",
         SimpleNamespace(
-            dcp_lse_combine=lambda ws, o, l, base_e: combined.append(o) or o
+            dcp_lse_combine=lambda ws, o, l, base_e, row_counts=None: combined.append(o)
+            or o
         ),
     )
     out = torch.zeros(tokens, 64, 256, dtype=torch.bfloat16)
@@ -100,6 +103,58 @@ def test_a_merge_past_the_size_limit_is_all_to_all(
     dcp_ops.dcp_lse_merge(out, lse, group, backend="mailbox")
     assert len(combined) == int(taken)
     assert a2a_calls == ([] if taken else [None])
+
+
+@needs_dcp_ops
+def test_empty_rows_are_masked_by_the_combine(monkeypatch, capturing):
+    """Sparse MLA's owned_counts reach the combine as its row_counts, with the
+    LSE handed over unmasked."""
+    group = _group()
+    key = dcp_ops._mailbox_key(group, 4, 128)
+    monkeypatch.setitem(dcp_ops._MAILBOX_WORKSPACES, key, SimpleNamespace(max_tokens=8))
+    seen = {}
+
+    def combine(ws, o, l, base_e, row_counts=None):
+        seen.update(lse=l, row_counts=row_counts)
+        return o
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.ops.flydsl.dcp_mailbox",
+        SimpleNamespace(dcp_lse_combine=combine),
+    )
+    out = torch.zeros(2, 16, 128, dtype=torch.bfloat16)
+    lse = torch.ones(2, 16)
+    owned = torch.tensor([3, 0], dtype=torch.int32)
+    dcp_ops.dcp_lse_merge(out, lse, group, backend="mailbox", owned_counts=owned)
+    assert seen["row_counts"] is owned
+    assert torch.equal(seen["lse"], lse)
+
+
+@needs_dcp_ops
+def test_an_aiter_without_row_counts_keeps_all_to_all(monkeypatch):
+    """Its combine would raise mid-capture on row_counts: no workspace at all."""
+
+    class Workspace:
+        def __init__(self, *a):
+            raise AssertionError("the mapping must not start")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.ops.flydsl.dcp_mailbox",
+        SimpleNamespace(
+            CombineWorkspace=Workspace,
+            dcp_lse_combine=lambda ws, out, lse, base_e=True: out,
+        ),
+    )
+    votes = []
+    monkeypatch.setattr(
+        torch.distributed, "all_reduce", lambda t, op, group: votes.append(t.item())
+    )
+    monkeypatch.setattr(dcp_ops, "_MAILBOX_WORKSPACES", {})
+    group = SimpleNamespace(world_size=4, rank_in_group=0, cpu_group="gloo")
+    assert not dcp_ops.prepare_dcp_mailbox(group, 16, 256, 64)
+    assert votes == [0]
 
 
 @needs_dcp_ops
@@ -246,11 +301,13 @@ def test_a_layer_without_a_workspace_merges_with_all_to_all(
 
 # ------------------------------------------------------------ across ranks
 def _mailbox_available():
+    import inspect
+
     try:
-        from aiter.ops.flydsl.dcp_mailbox import dcp_lse_combine  # noqa: F401
+        from aiter.ops.flydsl.dcp_mailbox import dcp_lse_combine
     except ImportError:
         return False
-    return True
+    return "row_counts" in inspect.signature(dcp_lse_combine).parameters
 
 
 def _worker(rank, world, init, results):
@@ -264,8 +321,18 @@ def _worker(rank, world, init, results):
         cpu_group=dist.new_group(backend="gloo"),
         device_group=dist.group.WORLD,
     )
-    heads, dim, tokens = 4, 128, 8
-    assert dcp_ops.prepare_dcp_mailbox(group, heads, dim, max_tokens=16)
+    heads, dim = 4, 128
+    assert dcp_ops.prepare_dcp_mailbox(group, heads, dim, max_tokens=64)
+    # 8 tokens: one token a CTA; 49: multi-token CTAs ending in a partial tile
+    for tokens in (8, 49):
+        _check_mailbox_merge(rank, world, group, heads, dim, tokens)
+    torch.cuda.synchronize()
+    dist.barrier()
+    results[rank] = True
+    dist.destroy_process_group()
+
+
+def _check_mailbox_merge(rank, world, group, heads, dim, tokens):
     gen = torch.Generator(device="cuda").manual_seed(100 + rank)
     out = torch.randn(
         tokens, world * heads, dim, device="cuda", dtype=torch.bfloat16, generator=gen
@@ -315,10 +382,6 @@ def _worker(rank, world, init, results):
         torch.testing.assert_close(rows, ref, rtol=1e-2, atol=1e-2)
     else:
         assert rows.dtype == torch.float8_e4m3fn and scale.shape[0] == tokens
-    torch.cuda.synchronize()
-    dist.barrier()
-    results[rank] = True
-    dist.destroy_process_group()
 
 
 @needs_dcp_ops
@@ -326,7 +389,9 @@ def _worker(rank, world, init, results):
     not torch.cuda.is_available() or torch.cuda.device_count() < 2,
     reason="needs two GPUs",
 )
-@pytest.mark.skipif(not _mailbox_available(), reason="aiter has no dcp_mailbox")
+@pytest.mark.skipif(
+    not _mailbox_available(), reason="aiter has no dcp_mailbox with row_counts"
+)
 def test_the_mailbox_merges_what_all_to_all_merges():
     import torch.multiprocessing as mp
 
