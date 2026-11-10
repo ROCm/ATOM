@@ -15,36 +15,51 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, Any
+
+from atom.model_engine.dp_route import (
+    PREFIX_COLD,
+    PREFIX_DECISIONS,
+    PREFIX_MOVED,
+    PREFIX_MOVED_TOKENS,
+    PREFIX_OWNER,
+    Route,
+)
 
 if TYPE_CHECKING:
-    # Annotation only: importing the factory at runtime pulls in torch, and the
-    # metrics exporter imports this module for its decision names.
-    from atom.kv_transfer.disaggregation.factory import OffloadTierProfile
+    from atom.kv_transfer.offload.tier import OffloadTierProfile
 
 
-class Route(NamedTuple):
-    """One placement: the rank, its route counter (`CoreManager.
-    _record_dp_route_locked`), and for a move the prefix tokens the target
-    loads from the tier."""
+class _PrefixInterval:
+    """A compressed radix edge of consecutive chained block hashes."""
 
-    rank: int
-    decision: str
-    moved_tokens: int = 0
+    __slots__ = ("children", "domain", "hashes", "hbs", "parent", "root_hash", "start")
+
+    def __init__(self, hashes, start, hbs, parent, domain):
+        self.hashes = hashes
+        self.start = start
+        self.hbs = hbs
+        self.domain = domain
+        self.root_hash = hashes[0] if parent is None else parent.root_hash
+        self.parent = parent
+        self.children = {}
+
+    @property
+    def end(self):
+        return self.start + len(self.hashes)
 
 
 class PrefixSpreadRouter:
     """Prefix ownership index, in-flight prefill state and the placement rule."""
 
-    # Index every complete frontend hash block. The transfer threshold applies
-    # to missing tier tokens, not to prefix discovery or prompt length. CAP
-    # bounds hash entries; the token history it covers depends on block size.
-    CAP = 1 << 17
+    # Token budget for unique radix edges, matching the former 4096-stride
+    # history coverage. Active edges are pinned and may exceed this budget.
+    CAP = 1 << 29
 
     # Route counters `select` returns, for `CoreManager`'s route statistics and
     # the metrics exporter.
-    DECISIONS = ("prefix_owner_total", "prefix_moved_total", "prefix_cold_total")
-    MOVED_TOKENS = "prefix_moved_tokens"
+    DECISIONS = PREFIX_DECISIONS
+    MOVED_TOKENS = PREFIX_MOVED_TOKENS
 
     def __init__(
         self, idle_tokens: int, tier: OffloadTierProfile, max_seqs: int
@@ -59,16 +74,19 @@ class PrefixSpreadRouter:
         # hold from an offload tier. Without one a moved request recomputes
         # what it does not hold.
         self.tier = tier
-        # Prompt-block hash -> {rank: request whose prefill puts that
-        # part on the rank}; most recent last.
-        self.index: OrderedDict[int, dict] = OrderedDict()
-        # seq id -> (rank, hashes whose entry it relies on before its prefill
-        # completes), and (hash, rank) -> unfinished requests relying on that
-        # not-yet-confirmed entry.
+        # Compressed hash intervals -> {rank: request that produces that
+        # interval}; most recent rank last. Each edge owns only its hash slice.
+        self.index: OrderedDict[_PrefixInterval, dict] = OrderedDict()
+        self._roots: dict = {}
+        self._evictable: OrderedDict[_PrefixInterval, None] = OrderedDict()
+        self.indexed_tokens = 0
+        # One continuous chain per active request. Each provisional interval
+        # names just its producer; followers are not copied into every edge.
         self.seq_hashes: dict = {}
+        self._active: dict = {}
+        self._next_ordinal = 0
         self.pending: dict = {}
-        # The prefix each request was credited at `select`, until `charge`.
-        self._est_hit: dict = {}
+        self._produced: dict = {}
         # Requests routed here whose prefill has not completed -> the prefix
         # credit each still owns. Membership is "still prefilling" (kept apart
         # from the token charge, which is 0 for a fully cached prompt that is
@@ -79,25 +97,28 @@ class PrefixSpreadRouter:
     def reset(self) -> None:
         """Forget in-flight state. The index stays: it describes the ranks'
         prefix caches, which outlive a batch."""
-        for h, rank in self.pending:
-            holders = self.index.get(h)
+        affected = {edge for edge, _rank in self.pending}
+        for edge, rank in self.pending:
+            holders = self.index.get(edge)
             if holders is not None:
                 holders.pop(rank, None)
-                if not holders:
-                    del self.index[h]
         self.seq_hashes.clear()
+        self._active.clear()
         self.pending.clear()
-        self._est_hit.clear()
+        self._produced.clear()
         self._in_flight.clear()
+        self._prune_empty(affected)
+        for edge in affected:
+            self._refresh_evictable(edge)
+        self._trim_history()
 
     # -- request lifecycle (called by CoreManager under its lock) --------------
 
-    def charge(self, seq_id) -> int:
+    def charge(self, seq_id, credit: int) -> int:
         """Mark `seq_id` in flight; returns the prefix it was credited at
         `select`."""
-        hit = self._est_hit.pop(seq_id, 0)
-        self._in_flight[seq_id] = hit
-        return hit
+        self._in_flight[seq_id] = credit
+        return credit
 
     def prefilling(self, seq_id) -> bool:
         return seq_id in self._in_flight
@@ -105,24 +126,36 @@ class PrefixSpreadRouter:
     def prefill_complete(self, seq_id) -> None:
         """`seq_id` completed its prefill: the entries it relied on are real."""
         self._in_flight.pop(seq_id, None)
-        entry = self.seq_hashes.pop(seq_id, None)
+        entry = self._remove_request(seq_id)
         if entry is None:
             return
-        rank, hashes = entry
-        for h, _start in hashes:
-            self.pending.pop((h, rank), None)
-            holders = self.index.get(h)
+        rank, chain, ordinal = entry
+        for edge, _end in self._path(chain):
+            producer = self.pending.get((edge, rank))
+            if producer is None:
+                continue  # already-confirmed reuse did not rely on this edge
+            producer_entry = self.seq_hashes.get(producer)
+            if producer != seq_id and (
+                producer_entry is None or producer_entry[2] > ordinal
+            ):
+                continue  # this producer arrived after the completing request
+            del self.pending[(edge, rank)]
+            produced = self._produced.get(producer)
+            if produced is not None:
+                produced.discard(edge)
+                if not produced:
+                    del self._produced[producer]
+            holders = self.index.get(edge)
             if holders is not None and rank in holders:
-                # The part is the rank's latest use (owner ties go to the
-                # latest, `_rank_hits`). An entry still naming a prefilling
-                # producer now names the request that confirmed it, so the
-                # producer leaving cannot take a real prefix with it.
-                holder = holders.pop(rank)
-                holders[rank] = seq_id if holder in self._in_flight else holder
+                # Confirmed history must not retain a request id: recycling
+                # that id for a new prefill cannot turn old history provisional.
+                holders.pop(rank)
+                holders[rank] = None
+                self._refresh_evictable(edge)
+        self._trim_history()
 
     def release(self, seq_id) -> dict:
         """Release a request; return extra prefill charges for its successors."""
-        self._est_hit.pop(seq_id, None)
         if seq_id not in self._in_flight:
             self.prefill_complete(seq_id)
             return {}
@@ -156,14 +189,12 @@ class PrefixSpreadRouter:
           this is what lets the request reuse it from HBM.
         """
         chain = getattr(seq, "prompt_hash_chain", None)
-        hits, owner, _source = self._rank_hits(chain, len(rank_tokens))
+        hits, owner = self._rank_hits(chain, len(rank_tokens))
         if owner is None:
             rank = lightest()
             self._record(chain, rank, seq.id, 0)
-            return Route(rank, "prefix_cold_total")
+            return Route(rank, PREFIX_COLD)
 
-        # An owner is a rank holding a complete hash block, so `hit` > 0.
-        hit = hits[owner]
         rank = owner
         if (
             rank_tokens[owner] > 2 * self.idle_tokens
@@ -173,36 +204,29 @@ class PrefixSpreadRouter:
             if target is not None:
                 rank = target
 
-        local = hits.get(rank, 0)
-        if rank == owner:
-            est_hit = hit
-        else:
-            # The tier serves the prefix once some request finished prefilling
-            # it, and the connector loads only what clears its load threshold.
-            in_tier = self._tier_hit(chain, hit)
-            loaded = (
-                self.tier.loadable_tokens(local, in_tier, seq.num_prompt_tokens)
-                if in_tier > local
-                else 0
-            )
-            est_hit = local + loaded
-        self._est_hit[seq.id] = est_hit
+        est_hit, loaded = self._credit(seq, rank, hits, owner)
         self._record(chain, rank, seq.id, est_hit)
         if rank == owner:
-            return Route(rank, "prefix_owner_total")
-        return Route(rank, "prefix_moved_total", max(0, est_hit - local))
+            return Route(rank, PREFIX_OWNER, est_hit)
+        return Route(rank, PREFIX_MOVED, est_hit, loaded)
 
-    def place(self, seq: Any, rank: int, n_ranks: int) -> None:
-        """Index a request placed on `rank` from outside (an explicit
-        `data_parallel_rank`): it is credited the part of its prefix that
-        rank already holds, and `rank` becomes a holder of the rest."""
+    def place(self, seq: Any, rank: int, n_ranks: int) -> Route:
+        """Index explicit placement with the same local/tier credit as a move."""
         chain = getattr(seq, "prompt_hash_chain", None)
         if chain is None or not 0 <= rank < n_ranks:
-            return
-        hits, _owner, _source = self._rank_hits(chain, n_ranks)
+            return Route(rank, "explicit_total")
+        hits, owner = self._rank_hits(chain, n_ranks)
+        credit, loaded = self._credit(seq, rank, hits, owner)
+        self._record(chain, rank, seq.id, credit)
+        return Route(rank, "explicit_total", credit, loaded)
+
+    def _credit(self, seq, rank, hits, owner):
         local = hits.get(rank, 0)
-        self._est_hit[seq.id] = local
-        self._record(chain, rank, seq.id, local)
+        if rank == owner:
+            return local, 0
+        in_tier = self._tier_hit(seq.prompt_hash_chain)
+        loaded = self.tier.loadable_tokens(local, in_tier, seq.num_prompt_tokens)
+        return local + loaded, loaded
 
     def _idle_target(
         self,
@@ -236,165 +260,260 @@ class PrefixSpreadRouter:
 
     # -- prefix index ---------------------------------------------------------
 
-    def _tier_hit(self, chain, hit: int) -> int:
-        """How much of this prompt's first `hit` tokens the tier has: the
-        longest block-aligned part that some request finished prefilling, on
-        any rank. The newest holder at the full length (the owner's) may still be
-        prefilling while an older, shorter copy elsewhere is already there."""
-        hbs = int(chain.hash_block_size)
-        for i in range(hit // hbs - 1, -1, -1):
-            holders = self.index.get(chain.hashes[i])
-            if holders is not None and any(
-                seq_id not in self._in_flight for seq_id in holders.values()
+    def _path(self, chain, *, create=False, boundary=0):
+        """Walk compressed edges; split only at a branch or credit boundary.
+
+        Chained hashes identify the entire prefix up to their position. Equal
+        hashes at an equal depth therefore let us binary-search a common prefix,
+        under the same collision assumption used by the block cache.
+        """
+        if chain is None or not chain.hashes:
+            return []
+        hashes, hbs = chain.hashes, int(chain.hash_block_size)
+        domain = (hbs, chain.cache_seed)
+        children = (
+            self._roots.setdefault(domain, {})
+            if create
+            else self._roots.get(domain, {})
+        )
+        parent = None
+        pos, length, path = 0, len(hashes), []
+        while pos < length:
+            edge = children.get(hashes[pos])
+            if edge is None:
+                if not create:
+                    break
+                edge = _PrefixInterval(hashes[pos:], pos, hbs, parent, domain)
+                children[hashes[pos]] = edge
+                self.index[edge] = {}
+                self.indexed_tokens += len(edge.hashes) * hbs
+            limit = min(len(edge.hashes), length - pos)
+            lo, hi = 0, limit
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                if edge.hashes[mid - 1] == hashes[pos + mid - 1]:
+                    lo = mid
+                else:
+                    hi = mid - 1
+            matched = lo
+            if not matched:
+                break
+            cut = matched
+            if create and pos < boundary < pos + cut:
+                cut = boundary - pos
+            if create and cut < len(edge.hashes):
+                edge = self._split(edge, cut, children)
+                matched = cut
+            path.append((edge, (pos + matched) * hbs))
+            if matched < len(edge.hashes):
+                break
+            pos += matched
+            parent, children = edge, edge.children
+        return path
+
+    def _split(self, edge, count, siblings):
+        prefix = _PrefixInterval(
+            edge.hashes[:count], edge.start, edge.hbs, edge.parent, edge.domain
+        )
+        siblings[prefix.hashes[0]] = prefix
+        edge.hashes = edge.hashes[count:]
+        edge.start += count
+        edge.parent = prefix
+        prefix.children[edge.hashes[0]] = edge
+        self.index[prefix] = dict(self.index[edge])
+        # Splitting copies interval ownership, not the requests relying on it.
+        # Each request continues to retain one chain independent of tree depth.
+        for rank in self.index[edge]:
+            producer = self.pending.get((edge, rank))
+            if producer is None:
+                continue
+            self.pending[(prefix, rank)] = producer
+            self._produced.setdefault(producer, set()).add(prefix)
+        return prefix
+
+    def _tier_hit(self, chain) -> int:
+        """Longest matching prefix with a finished holder on any rank."""
+        for edge, hit in reversed(self._path(chain)):
+            if any(
+                seq_id not in self._in_flight for seq_id in self.index[edge].values()
             ):
-                return (i + 1) * hbs
+                return hit
         return 0
 
     def _rank_hits(self, chain, n: int):
-        """Per rank, the longest block-aligned prefix of this prompt it holds.
+        """Longest prefix per rank; equal-length owners use last-recorded order.
 
-        Returns ({rank: tokens}, owner, source): the owner is the rank with the
-        longest prefix (on a tie, the one that recorded or confirmed it last:
-        `_record`, `prefill_complete`), source the request whose
-        prefill puts it there. A rank other than the owner counts a part only
-        once its source finished prefilling it.
+        Other ranks' unfinished producers do not supply a local hit. Seed and
+        block-size domains are separate even if a supplied hash collides.
         """
-        if chain is None or not self.index:
-            return {}, None, None
-        hbs = int(chain.hash_block_size)
-        hashes = chain.hashes
-        hits: dict[int, int] = {}
-        owner, source = None, None
-        for i in range(len(hashes) - 1, -1, -1):
-            holders = self.index.get(hashes[i])
-            if not holders:
-                continue
+        hits = {}
+        owner = None
+        for edge, hit in reversed(self._path(chain)):
+            holders = self.index[edge]
             for rank, seq_id in reversed(holders.items()):
                 if not 0 <= rank < n or rank in hits:
                     continue
-                # A remote restore is provisional even if its source finished.
-                # Keep local in-flight producers as owners for HBM followers.
-                if (hashes[i], rank) in self.pending and seq_id not in self._in_flight:
+                if (edge, rank) in self.pending and seq_id not in self._in_flight:
                     continue
                 if owner is None:
-                    owner, source = rank, seq_id
+                    owner = rank
                 elif seq_id in self._in_flight:
-                    continue  # a shorter, finished part may still count below
-                hits[rank] = (i + 1) * hbs
+                    continue
+                hits[rank] = hit
             if len(hits) == n:
                 break
-        return hits, owner, source
+        return hits, owner
 
     def _record(self, chain, rank: int, seq_id, hit: int) -> None:
-        """Record that `rank` holds this prompt's complete hash blocks.
+        """Record one continuous interval, split only where prefixes diverge.
 
-        Each entry names the request whose prefill puts that part on the rank:
-        `seq_id` for the part it computes or loads from the tier; for the part
-        it reuses in HBM (the first `hit` tokens) the rank's existing holder.
-        So a follower that only reuses a prefix never becomes its busy source.
-        Every entry this request adds or rewrites stays provisional until a
-        request relying on it completes its prefill (`prefill_complete`); if
-        all of them leave first, it is removed (`_left_unprefilled`).
+        A request depends on the provisional intervals it uses. History cannot
+        evict any interval with active waiters, including its producer.
         """
         if chain is None:
             return
-        hbs = int(chain.hash_block_size)
-        index, pending = self.index, self.pending
-        relied = []
-        for i, h in enumerate(chain.hashes):
-            holders = index.get(h)
-            if holders is None:
-                holders = index[h] = {}
-            else:
-                index.move_to_end(h)
-            # History eviction must not erase an in-flight producer or the
-            # credit its followers borrowed. Restore that rank's producer
-            # from the separate lifecycle record if this hash is indexed again.
-            waiters = pending.get((h, rank))
-            if rank not in holders and waiters:
-                holders[rank] = next(iter(waiters))
-            reused = (i + 1) * hbs <= hit
+        path = self._path(
+            chain, create=True, boundary=hit // int(chain.hash_block_size)
+        )
+        for edge, end in path:
+            holders = self.index[edge]
+            key = (edge, rank)
+            reused = end <= hit
             had = rank in holders
-            if (
-                had
-                and (h, rank) not in pending
-                and holders[rank] not in self._in_flight
-            ):
-                # Confirmed: the rank holds this part. A request that computes
-                # it again reuses the rank's blocks; it neither becomes the
-                # holder nor relies on the entry, so its leaving cannot
-                # delete what the rank really holds. It is the rank's latest
-                # use, though, which owner ties go by.
+            if had and key not in self.pending and holders[rank] not in self._in_flight:
                 holders[rank] = holders.pop(rank)
+                self._refresh_evictable(edge)
                 continue
             if had and holders[rank] in self._in_flight:
-                # A newcomer must not erase another request computing this
-                # prefix locally. It joins that producer's ordered waiters.
-                producer = holders.pop(rank)
+                # A shared active interval is already pinned. There is no
+                # follower table to update and no history LRU to touch here.
+                if next(reversed(holders)) != rank:
+                    holders[rank] = holders.pop(rank)
+                continue
             elif reused:
-                # A rank that holds the part keeps its holder. One that does
-                # not is loading it from the tier for this request, which then
-                # produces it there: naming the source on another rank would
-                # leave this rank's entry to a request that never computes on
-                # it.
                 producer = holders.pop(rank, seq_id)
             else:
                 holders.pop(rank, None)
                 producer = seq_id
             holders[rank] = producer
-            key = (h, rank)
-            if not had or not reused:
-                pending.setdefault(key, {})[seq_id] = None
-                relied.append((h, i * hbs))
-            elif key in pending:
-                pending[key][seq_id] = None
-                relied.append((h, i * hbs))
-        if relied:
-            self.seq_hashes[seq_id] = (rank, relied)
-        while len(index) > self.CAP:
-            index.popitem(last=False)
-            # pending/seq_hashes are active request lifecycle records, not
-            # cached history. Completion, cancellation or reset releases them.
+            if key not in self.pending and (not had or not reused):
+                self.pending[key] = producer
+                self._produced.setdefault(producer, set()).add(edge)
+            self._refresh_evictable(edge)
+        if path:
+            ordinal = self._next_ordinal
+            self._next_ordinal += 1
+            self.seq_hashes[seq_id] = (rank, chain, ordinal)
+            key = (
+                rank,
+                (int(chain.hash_block_size), chain.cache_seed),
+                chain.hashes[0],
+            )
+            self._active.setdefault(key, {})[seq_id] = (chain, ordinal)
+        self._trim_history()
+
+    def _remove_request(self, seq_id):
+        entry = self.seq_hashes.pop(seq_id, None)
+        if entry is not None:
+            rank, chain, _ordinal = entry
+            key = (
+                rank,
+                (int(chain.hash_block_size), chain.cache_seed),
+                chain.hashes[0],
+            )
+            candidates = self._active[key]
+            candidates.pop(seq_id)
+            if not candidates:
+                del self._active[key]
+        return entry
+
+    def _drop_edge(self, edge):
+        """Drop a leaf; internal edges remain to locate their descendants."""
+        siblings = (
+            self._roots[edge.domain] if edge.parent is None else edge.parent.children
+        )
+        siblings.pop(edge.hashes[0], None)
+        if edge.parent is None and not siblings:
+            del self._roots[edge.domain]
+        self.index.pop(edge)
+        self._evictable.pop(edge, None)
+        self.indexed_tokens -= len(edge.hashes) * edge.hbs
+        if edge.parent is not None:
+            self._refresh_evictable(edge.parent)
+
+    def _refresh_evictable(self, edge):
+        holders = self.index.get(edge)
+        if (
+            holders is None
+            or edge.children
+            or any((edge, rank) in self.pending for rank in holders)
+        ):
+            self._evictable.pop(edge, None)
+        else:
+            self._evictable[edge] = None
+            self._evictable.move_to_end(edge)
+
+    def _prune_empty(self, edges):
+        # Only a released interval and its ancestors can have become empty.
+        # Iterate rather than recurse: one-token endpoint extensions can form
+        # a deep tree, and other independent histories need no inspection.
+        todo = list(edges)
+        while todo:
+            edge = todo.pop()
+            if edge in self.index and not self.index[edge] and not edge.children:
+                parent = edge.parent
+                self._drop_edge(edge)
+                if parent is not None:
+                    todo.append(parent)
+
+    def _trim_history(self):
+        if self.indexed_tokens <= self.CAP:
+            return
+        # The budget covers unique edges, not replicated rank holders. Pinned
+        # active edges may exceed it; releasing them makes them evictable.
+        while self.indexed_tokens > self.CAP and self._evictable:
+            edge = next(iter(self._evictable))
+            self._drop_edge(edge)
 
     def _left_unprefilled(self, seq_id) -> dict:
-        """`seq_id` left before its prefill completed (abort, reject, failed
-        send). Hand provisional entries to the oldest remaining waiter on
-        that rank. Its credited prefix above the first lost hash block
-        becomes conservative prefill debt; CoreManager applies it under the
-        same lock as this handoff."""
-        charges: dict = {}
-        entry = self.seq_hashes.pop(seq_id, None)
+        """Transfer an unfinished producer's intervals and credit debt once."""
+        charges = {}
+        entry = self._remove_request(seq_id)
         if entry is None:
             return charges
-        rank, hashes = entry
-        for h, start in hashes:
-            key = (h, rank)
-            waiters = self.pending.get(key)
-            if waiters is None:
+        rank, _chain, ordinal = entry
+        edges = self._produced.pop(seq_id, ())
+        for edge in edges:
+            key = (edge, rank)
+            if self.pending.get(key) != seq_id:
                 continue
-            holders = self.index.get(h)
-            # The first waiter is the producer even when CAP evicted the
-            # routing entry. Later waiters borrowed its prefix credit.
-            producer = holders.get(rank) if holders is not None else None
-            if producer is None:
-                producer = next(iter(waiters))
-            produced = producer == seq_id
-            waiters.pop(seq_id, None)
-            if waiters and not produced:
-                continue
-            if waiters:
-                successor = next(iter(waiters))
-                if holders is not None:
-                    holders[rank] = successor
+            holders = self.index[edge]
+            successor = next(
+                (
+                    sid
+                    for sid, (chain, placed_at) in self._active.get(
+                        (rank, edge.domain, edge.root_hash), {}
+                    ).items()
+                    if sid in self._in_flight
+                    and placed_at > ordinal
+                    and len(chain.hashes) >= edge.end
+                    and chain.hashes[edge.end - 1] == edge.hashes[-1]
+                ),
+                None,
+            )
+            if successor is not None:
+                holders[rank] = successor
+                self.pending[key] = successor
+                self._produced.setdefault(successor, set()).add(edge)
                 credited = self._in_flight.get(successor, 0)
-                retained = min(credited, start)
+                retained = min(credited, edge.start * edge.hbs)
                 if retained < credited:
                     self._in_flight[successor] = retained
                     charges[successor] = charges.get(successor, 0) + credited - retained
-                continue
-            del self.pending[key]
-            if holders is not None and rank in holders:
-                del holders[rank]
-                if not holders:
-                    del self.index[h]
+            else:
+                del self.pending[key]
+                holders.pop(rank, None)
+            self._refresh_evictable(edge)
+        self._prune_empty(edges)
+        self._trim_history()
         return charges

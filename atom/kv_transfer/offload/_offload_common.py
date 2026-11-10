@@ -727,7 +727,7 @@ class OffloadSchedulerMixin(ABC):
         """A reference that does not keep an aborted request's prompt alive.
 
         A request can leave the waiting queue without ever reaching
-        `request_finished` -- `Scheduler._reject_aborted_waiting` is one such
+        `request_finished` -- `Scheduler._finish_rejected_waiting` is one such
         path -- and an entry holding the sequence strongly would pin its whole
         `token_ids` list for the life of the process.
         """

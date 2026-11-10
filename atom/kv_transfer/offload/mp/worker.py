@@ -39,7 +39,7 @@ from atom.kv_transfer.offload._offload_common import validated_kv_role
 from atom.kv_transfer.offload.chunked_scheduler import (
     DENSE_PAGE_STORE_CHANNEL,
 )
-from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata, LMCacheReqMeta
+from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata
 from atom.kv_transfer.offload.mp import deployment
 from atom.kv_transfer.offload.mp.deployment import (
     _make_worker_adapter,
@@ -49,6 +49,7 @@ from atom.kv_transfer.offload.mp.deployment import (
     _validate_mp_config,
     require_native_state_server,
 )
+from atom.kv_transfer.offload.mp.metadata import MPReqMeta
 from atom.kv_transfer.offload.mp.native_state_layout import (
     build_native_state_mp_layout,
     stores_state_images,
@@ -162,7 +163,7 @@ class LMCacheMPConnector(KVConnectorBase):
         self._fences: _ProducerFences | None = None
         # Same-step saves of the current step, held until their forward is
         # enqueued (`after_forward`) -- and, inline, until it has finished.
-        self._after_forward_saves: list[LMCacheReqMeta] = []
+        self._after_forward_saves: list[MPReqMeta] = []
         self._after_forward_ran = False
         self._late_flush_logged = False
         # Polling transfer thread only. Submissions it has queued, by request:
@@ -499,7 +500,7 @@ class LMCacheMPConnector(KVConnectorBase):
     def _dispatch(
         self,
         submit: Any,
-        req: LMCacheReqMeta,
+        req: MPReqMeta,
         event: Any,
         ready: Callable[[], bool] | None = None,
     ) -> None:
@@ -515,7 +516,7 @@ class LMCacheMPConnector(KVConnectorBase):
             self._queued_requests[owner] = self._queued_requests.get(owner, 0) + 1
         transfer.submit(self._submit_queued, submit, req, event, ready=ready)
 
-    def _submit_queued(self, submit: Any, req: LMCacheReqMeta, event: Any) -> None:
+    def _submit_queued(self, submit: Any, req: MPReqMeta, event: Any) -> None:
         """One queued submission, on a polling transfer thread."""
         try:
             submit(req, event)
@@ -546,7 +547,7 @@ class LMCacheMPConnector(KVConnectorBase):
                 transfer.take_returned(_RETURNED_FUTURES_BATCH)
         transfer.raise_error()
 
-    def _block_slice(self, req: LMCacheReqMeta, start: int, end: int) -> list[int]:
+    def _block_slice(self, req: MPReqMeta, start: int, end: int) -> list[int]:
         if start < 0 or end < start:
             raise ValueError(f"invalid LMCache MP token range [{start}, {end})")
         if start % self.block_size or end % self.block_size:
@@ -566,7 +567,7 @@ class LMCacheMPConnector(KVConnectorBase):
         return block_ids
 
     def _transfer_block_ids(
-        self, req: LMCacheReqMeta, start: int, end: int, *, loading: bool
+        self, req: MPReqMeta, start: int, end: int, *, loading: bool
     ) -> list[list[int]]:
         """The block-id list per engine group that one transfer names."""
         if self._native_layout is not None:
@@ -580,7 +581,7 @@ class LMCacheMPConnector(KVConnectorBase):
 
     def _native_block_ids(
         self,
-        req: LMCacheReqMeta,
+        req: MPReqMeta,
         start: int,
         end: int,
         *,
@@ -625,7 +626,7 @@ class LMCacheMPConnector(KVConnectorBase):
             raise ValueError("checkpoint PAGE units must not overlap KV PAGE blocks")
         return self._native_layout.transfer_block_ids(pages, unit_ids, count)
 
-    def _submit_load(self, req: LMCacheReqMeta, event: Any) -> None:
+    def _submit_load(self, req: MPReqMeta, event: Any) -> None:
         from lmcache.integration.atom import AtomMPTransferSpec
 
         assert req.load_spec is not None
@@ -697,7 +698,7 @@ class LMCacheMPConnector(KVConnectorBase):
                 future=transfer,
             )
 
-    def _submit_save(self, req: LMCacheReqMeta, event: Any) -> None:
+    def _submit_save(self, req: MPReqMeta, event: Any) -> None:
         from lmcache.integration.atom import AtomMPTransferSpec
 
         assert req.save_spec is not None

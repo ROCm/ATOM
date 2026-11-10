@@ -12,12 +12,9 @@ worker-side connector inside :class:`LMCacheOffloadMetadata`.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import torch
-
-if TYPE_CHECKING:
-    from atom.kv_transfer.offload.mp.token_shipping import ShippedTokens
 
 from atom.kv_transfer.disaggregation.types import (
     ConnectorMetadata,
@@ -153,10 +150,9 @@ class LMCacheReqMeta:
     req_id: ReqId
     # Token ids covering the prefix being moved (used to derive chunk-256 keys via
     # LMCache's ChunkedTokenDatabase). For load: prompt[:lmcache_cached_tokens];
-    # for save: computed token ids. LMCache MP ships `ShippedTokens` (the part the
-    # workers do not hold yet); its worker shell resolves it to the token ids
-    # (`TokenPrefix`) before anything reads this.
-    token_ids: list[int] | ShippedTokens
+    # for save: computed token ids. Transports with a different wire representation
+    # define their request metadata separately.
+    token_ids: list[int]
     # The sequence's GPU block table (logical block ids). A chunk spanning token
     # range [start, end) maps to blocks block_ids[start // bs : ceil(end / bs)].
     block_ids: list[int]
@@ -206,17 +202,12 @@ class LMCacheOffloadMetadata(ConnectorMetadata):
         "lookup_requests_in_step",
         "state_loads",
         "state_stores",
-        "token_drops",
         "state_touches",
     )
 
     def __init__(self) -> None:
         super().__init__()
         self.requests: list[LMCacheReqMeta] = []
-        # Request ids whose worker-side token copy (LMCache MP's incremental
-        # token shipping) is dropped: finished requests, even with no transfer
-        # left to carry the news.
-        self.token_drops: tuple = ()
         # req_ids whose worker-side lookup pin can be released this step.
         self.lookup_requests_in_step: list[str] = []
         # (req_id, state_hash, target_group) for the K3 state tier. A separate

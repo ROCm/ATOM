@@ -221,7 +221,7 @@ def test_scheduler_abort_releases_pending_metric_state(clock):
     )
     scheduler.add(seq)
     scheduler._count_inflight_load(seq)
-    scheduler._reject_aborted_waiting(seq)
+    scheduler._finish_rejected_waiting(seq)
     scheduler._update_from_kv_xfer_finished(
         KVConnectorOutput(finished_recving={seq.id})
     )

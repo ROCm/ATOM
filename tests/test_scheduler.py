@@ -460,7 +460,7 @@ class TestSchedule:
         sched._num_parked_remote_kv = 1
         sched.kv_connector = SimpleNamespace(is_offload=False)
 
-        sched._reject_aborted_waiting(seq)
+        sched._finish_rejected_waiting(seq)
 
         assert sched.deferred_free_blocks == {seq.id: seq}
         assert sched._num_parked_remote_kv == 1
@@ -590,7 +590,7 @@ class TestSchedule:
         sched.block_manager = SimpleNamespace(
             deallocate=lambda value: events.append(("deallocate", value.id))
         )
-        sched._reject_aborted_waiting(seq)
+        sched._finish_rejected_waiting(seq)
 
         assert sched.deferred_free_blocks == {seq.id: seq}
         assert seq._awaiting_aborted_load_cleanup is True
@@ -1047,9 +1047,60 @@ class TestSchedule:
         sched.failed_recving_kv_req_ids = []
         sched.kv_connector = None  # P/D: resolved at admission
 
-        sched._resolve_finished_receives()
+        sched._prioritize_ready_remote_kv_requests()
 
         assert [seq.id for seq in sched.waiting] == [2, 1, 3]
+
+    @pytest.mark.parametrize("failed", [False, True])
+    def test_settled_offload_resume_precedes_a_preempted_head(self, failed):
+        sched = Scheduler(
+            MockConfig(
+                max_num_seqs=4,
+                max_num_batched_tokens=32,
+                num_kvcache_blocks=3,
+                kv_cache_block_size=16,
+            )
+        )
+
+        class _Connector(_OffloadMixinStub):
+            _do_load = False
+
+            def get_num_new_matched_tokens(self, seq):
+                return 0, False
+
+            def build_connector_meta(self):
+                return None
+
+        sched.kv_connector = _Connector()
+        preempted = Sequence(list(range(16)), 16)
+        resume = Sequence(list(range(100, 132)), 16)
+        assert sched.block_manager.allocate(preempted)
+        assert sched.block_manager.allocate(resume)
+        preempted.num_cached_tokens = 16
+        preempted.status = SequenceStatus.RUNNING
+        preempted.append_token(77)
+        resume.status = SequenceStatus.WAITING
+        resume.num_cached_tokens = 16
+        resume.offload_loaded = not failed
+        resume.offload_load_failed = failed
+        sched._count_inflight_load(resume)
+        sched.waiting.append(resume)
+
+        # The finished id has already been consumed. A decode now needs a
+        # second block, preempts, and returns ahead of the allocated resume.
+        assert not sched.block_manager.can_append(preempted, 1, 0)
+        assert sched.preempt(preempted)
+        assert list(sched.waiting) == [preempted, resume]
+        assert sched.block_manager.can_allocate(preempted) < 0
+        assert not sched.finished_recving_kv_req_ids
+
+        batch, _ = sched.schedule()
+
+        assert list(batch.req_ids) == [resume.id]
+        assert list(batch.num_scheduled_tokens) == [16]
+        assert resume in sched.running
+        assert preempted in sched.waiting
+        assert sched._num_parked_remote_kv == 0
 
     def test_offload_parked_count_released_only_after_resume(self, seq_factory):
         sched = Scheduler(
@@ -1301,14 +1352,14 @@ class TestWaitingNewTokenCount:
         self, seq_factory, monkeypatch
     ):
         """A prompt over max_model_len leaves without running: the schedule
-        hands it to the abort teardown (`_reject_aborted_waiting`) with its own
+        hands it to the abort teardown (`_finish_rejected_waiting`) with its own
         reason."""
         sched = self._sched()
         calls = []
-        real = sched._reject_aborted_waiting
+        real = sched._finish_rejected_waiting
         monkeypatch.setattr(
             sched,
-            "_reject_aborted_waiting",
+            "_finish_rejected_waiting",
             lambda seq, reason="aborted": (calls.append(reason), real(seq, reason)),
         )
         oversized = seq_factory(list(range(200)))  # > max_model_len=64
@@ -1337,7 +1388,7 @@ class TestWaitingNewTokenCount:
 
         sched.kv_connector = _Connector()
         seq = seq_factory(list(range(200)))
-        sched._reject_aborted_waiting(seq, reason="unschedulable: too long")
+        sched._finish_rejected_waiting(seq, reason="unschedulable: too long")
         assert seq.leave_reason == "unschedulable: too long"
         assert events == [("cancel", seq.id), ("finished", seq.id, False)]
 

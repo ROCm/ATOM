@@ -94,16 +94,8 @@ _FIELDS = tuple(field.name for field in fields(MooncakeStoreOffloadConfig))
 
 def store_chunk_tokens(kv_transfer_config: Mapping[str, Any] | None) -> int:
     """The transfer granularity shared by routing and the Store connector."""
-    kvc = kv_transfer_config or {}
-    extra = kvc.get("kv_connector_extra_config", kvc) or {}
-    if not isinstance(extra, Mapping):
-        raise ValueError(  # noqa: TRY004  # configuration errors use ValueError
-            "kv_connector_extra_config must be a JSON object"
-        )
-    return offcfg._strict_integer(
-        "mooncake_store.chunk_tokens",
-        extra.get("mooncake_store.chunk_tokens", 256),
-        minimum=1,
+    return offcfg.connector_integer(
+        offcfg.connector_extras(kv_transfer_config), "mooncake_store.chunk_tokens", 256
     )
 
 
@@ -119,12 +111,7 @@ def parse_mooncake_store_config(
             type or out of range, neither a shared master nor pools, or pools
             without rdma.
     """
-    kvc = kv_transfer_config or {}
-    extra = kvc.get("kv_connector_extra_config", kvc) or {}
-    if not isinstance(extra, Mapping):
-        raise ValueError(  # noqa: TRY004  # a settings error, like every other
-            "kv_connector_extra_config must be a JSON object"
-        )
+    extra = offcfg.connector_extras(kv_transfer_config)
     values: dict[str, Any] = {}
     for key, value in extra.items():
         if not (isinstance(key, str) and key.startswith(KEY_PREFIX)):
@@ -182,7 +169,9 @@ def parse_mooncake_store_config(
         ),
         protocol=protocol,
         local_hostname=_text("mooncake_store.local_hostname", local_hostname),
-        chunk_tokens=store_chunk_tokens(kvc),
+        chunk_tokens=offcfg.connector_integer(
+            extra, "mooncake_store.chunk_tokens", 256
+        ),
         load_pool_mib=offcfg._strict_integer(
             "mooncake_store.load_pool_mib", values.get("load_pool_mib", 1024), minimum=1
         ),

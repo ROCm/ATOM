@@ -3828,7 +3828,7 @@ def test_pure_page_codec_rejects_missing_or_invalid_count(blocks):
     from atom.kv_transfer.offload.page_codec import pure_page_codec
 
     with pytest.raises(ValueError, match="positive num_blocks"):
-        pure_page_codec([object()], blocks)
+        pure_page_codec(SimpleNamespace(block_regions=[object()]), blocks)
 
 
 def test_pure_page_codec_rejects_missing_fused_staging(monkeypatch):
@@ -3841,7 +3841,7 @@ def test_pure_page_codec_rejects_missing_fused_staging(monkeypatch):
         lambda **kw: SimpleNamespace(has_fused_chunk_major_staging=False),
     )
     with pytest.raises(RuntimeError, match="fused chunk-major PAGE"):
-        page_codec.pure_page_codec([object()], 8)
+        page_codec.pure_page_codec(SimpleNamespace(block_regions=[object()]), 8)
 
 
 def test_plain_v4_is_refused_before_weights_load():

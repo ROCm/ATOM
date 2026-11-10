@@ -1,36 +1,27 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Shared replay capability and PAGE-only byte-codec construction."""
+"""Complete PAGE-only byte-codec geometry validation and construction."""
 
 from __future__ import annotations
 
-from typing import Any
-
 import torch
 
+from atom.kv_transfer.disaggregation.types import KVTransferTensors
 from atom.kv_transfer.offload.hybrid.dsv4.codec import DSV4PageSlotCodec
 
 
-def replays_state(transfer_tensors: Any) -> bool:
-    """Whether the backend rebuilds its per-request state at every hit.
-
-    A `replay` state transfer keeps no checkpoint: a prefix hit resumes with a
-    fresh state slot and the forward recomputes the hash block below it
-    (`BlockManager.replay_start`), so a PAGE-only load is resumable as is.
-    """
-
-    builder = getattr(transfer_tensors, "state_backend", None)
-    state_transfer = getattr(builder, "state_transfer", None)
-    return callable(state_transfer) and bool(
-        getattr(state_transfer(), "replays", False)
-    )
-
-
-def pure_page_codec(regions, num_blocks):
+def pure_page_codec(
+    transfer_tensors: KVTransferTensors | None, num_blocks: int | None = None
+) -> DSV4PageSlotCodec:
     """Construct the complete PAGE codec; reject unusable geometry/staging."""
+    regions = getattr(transfer_tensors, "block_regions", None)
     if not regions:
         raise ValueError("PAGE offload requires non-empty block_regions")
+    if getattr(transfer_tensors, "slot_regions", ()):
+        raise ValueError("PAGE offload requires empty SLOT regions")
+    if num_blocks is None:
+        num_blocks = getattr(transfer_tensors, "num_blocks", None)
     if num_blocks is None or int(num_blocks) <= 0:
         raise ValueError("PAGE offload requires a positive num_blocks value")
     codec = DSV4PageSlotCodec(

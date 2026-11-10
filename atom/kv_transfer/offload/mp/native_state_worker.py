@@ -17,8 +17,9 @@ from atom.kv_transfer.disaggregation.types import (
     KVConnectorOutput,
 )
 from atom.kv_transfer.offload._offload_common import max_pending_saves
-from atom.kv_transfer.offload.metadata import LMCacheReqMeta, NativeStateTransfer
+from atom.kv_transfer.offload.metadata import NativeStateTransfer
 from atom.kv_transfer.offload.mp.deployment import _mp_session_id
+from atom.kv_transfer.offload.mp.metadata import MPReqMeta
 from atom.kv_transfer.offload.mp.token_shipping import token_list
 from atom.kv_transfer.offload.mp.transfer import (
     _chunk_ranges,
@@ -39,7 +40,7 @@ NATIVE_STATE_MP_STORE_CHANNEL = "native_state_mp_store"
 
 @dataclass
 class _NativePending:
-    request: LMCacheReqMeta
+    request: MPReqMeta
     future: Any
     restore_event: Any = None
     restore_succeeded: bool = False
@@ -91,7 +92,7 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
         if callable(reserve):
             reserve(self._restore_descriptor_slots)
 
-    def _submit_native(self, req: LMCacheReqMeta, event: Any, *, loading: bool) -> None:
+    def _submit_native(self, req: MPReqMeta, event: Any, *, loading: bool) -> None:
         from lmcache.integration.atom import AtomMPTransferSpec
 
         completion = req.load_operation if loading else req.save_operation
@@ -180,10 +181,10 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
         with self._lock:
             entry.future = future
 
-    def _submit_load(self, req: LMCacheReqMeta, event: Any) -> None:
+    def _submit_load(self, req: MPReqMeta, event: Any) -> None:
         self._submit_native(req, event, loading=True)
 
-    def _submit_save(self, req: LMCacheReqMeta, event: Any) -> None:
+    def _submit_save(self, req: MPReqMeta, event: Any) -> None:
         self._submit_native(req, event, loading=False)
 
     def _begin_restore(self, pending: _NativePending) -> bool:

@@ -2440,8 +2440,6 @@ def test_drops_reach_the_workers_without_a_transfer():
     transfer is left to carry it."""
     import array
 
-    from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata
-
     sched, shell, _ = _shipping_pair()
     seq = SimpleNamespace(id=7, token_ids=array.array("i", range(64)))
     _send(
@@ -2449,7 +2447,9 @@ def test_drops_reach_the_workers_without_a_transfer():
     )
     assert 7 in shell._tokens._held
     sched._token_shipper.drop(7, seq)
-    meta = LMCacheOffloadMetadata()
+    from atom.kv_transfer.offload.mp.metadata import MPOffloadMetadata
+
+    meta = MPOffloadMetadata()
     meta.token_drops = sched._token_shipper.take_drops()
     assert meta.has_work()
     _start(shell, meta)

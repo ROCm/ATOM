@@ -422,8 +422,9 @@ class Sequence:
         # garbage sampled tokens from intermediate chunks and to skip the
         # scheduler's Phase 1 scan when no partials exist.
         self.is_partial_prefill = False
-        # Set only after the prompt forward completes, never at schedule time.
-        # The router uses this even for an abort with no sampled output.
+        # Set after the local prompt forward completes, or when P/D admission
+        # confirms the producer's completed prompt KV. The router uses this
+        # even for an abort with no sampled output.
         self.prefill_completed = False
         # `new_block_table` is main's: an array("i") rather than a list,
         # because every forward marshals these into the int32 buffer.

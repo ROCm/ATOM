@@ -2087,11 +2087,11 @@ class Scheduler:
         num_scheduled_tokens: list[int] = []
         scheduled_spec_decode_tokens: dict[int, np.ndarray] = {}
 
-        self._resolve_finished_receives()
+        self._prioritize_ready_remote_kv_requests()
         self._park_ready_offload_partial_prefills()
         # Reclaim aborted heads even when decode protection vetoes Phase 2.
         while self.waiting and self.waiting[0].status == SequenceStatus.ABORTED:
-            self._reject_aborted_waiting(self.waiting.popleft())
+            self._finish_rejected_waiting(self.waiting.popleft())
         if self.enable_dynamic_chunking:
             self._record_prefill_supply()
         if self.kv_connector is not None and self.waiting:
@@ -2258,7 +2258,7 @@ class Scheduler:
             # `can_allocate` refuses one outright with the pool empty.
             # `deallocate` is a no-op for a seq that really held nothing.
             if seq.status == SequenceStatus.ABORTED:
-                self._reject_aborted_waiting(seq)
+                self._finish_rejected_waiting(seq)
                 continue
 
             # Drop seqs the static-capacity check at submit-time flagged as
@@ -2272,11 +2272,11 @@ class Scheduler:
             # Re-check here (not just at submit) since pool state may change.
             unschedulable = self._unschedulable_reason(seq)
             if unschedulable is not None:
-                # Leaves from the waiting queue, holding no blocks, like an
-                # abort: the same teardown, and a P/D producer hands nothing
-                # off (`produced_no_handoff`), even for a preempted request
-                # whose prefill had completed.
-                self._reject_aborted_waiting(
+                # Use the abort teardown for any blocks and pending transfers
+                # it holds. A P/D producer hands nothing off
+                # (`produced_no_handoff`), even for a preempted request whose
+                # prefill had completed.
+                self._finish_rejected_waiting(
                     seq, reason=f"unschedulable: {unschedulable}"
                 )
                 continue
@@ -3023,7 +3023,7 @@ class Scheduler:
         admission.
 
         With an offload tier every receive is resolved once, at the top of the
-        tick (`_resolve_finished_receives`): one still waiting here is in
+        tick (`_prioritize_ready_remote_kv_requests`): one still waiting here is in
         flight and is requeued, never taken down the P/D first-decode path
         (which would skip its suffix prefill).
 
@@ -3126,9 +3126,11 @@ class Scheduler:
         seq.prefill_completed = True
         tracing.prefill_complete(seq)
 
-    def _reject_aborted_waiting(self, seq: Sequence, reason: str = "aborted") -> None:
-        """End a waiting request that never ran: aborted, or rejected as
-        unschedulable (`reason`)."""
+    def _finish_rejected_waiting(self, seq: Sequence, reason: str = "aborted") -> None:
+        """Finish an aborted or unschedulable waiting request.
+
+        A preempted request may already have run before this rejection.
+        """
         self._inflight_prefix_wait.pop(seq.id, None)
         self._lookup_detach_declined.discard(seq.id)
         has_inflight_load = bool(getattr(seq, "_counted_as_inflight_load", False))
@@ -3164,7 +3166,7 @@ class Scheduler:
             if seq.id == req_id:
                 self.waiting.remove(seq)
                 seq.status = SequenceStatus.ABORTED
-                self._reject_aborted_waiting(seq)
+                self._finish_rejected_waiting(seq)
                 return True
         for seq in self.running:
             if seq.id == req_id:
@@ -3201,7 +3203,7 @@ class Scheduler:
         logger.error("KV receive failed for request %s; aborting it", req_id)
         self.waiting.remove(seq)
         seq.status = SequenceStatus.ABORTED
-        self._reject_aborted_waiting(seq)
+        self._finish_rejected_waiting(seq)
         # This failure is the terminal report the abort waits for.
         self._finish_aborted_load_cleanup(seq.id)
 
@@ -3209,8 +3211,9 @@ class Scheduler:
         if hasattr(seq, "_awaiting_aborted_load_cleanup"):
             delattr(seq, "_awaiting_aborted_load_cleanup")
         self._uncount_inflight_load(seq)
-        # A request that never ran went through no `postprocess`, so it
-        # finishes the request here rather than before the park.
+        # This rejection does not go through forward postprocess, so finish
+        # the connector lifecycle here, including requests that ran before
+        # preemption and are now rejected during readmission.
         callback = getattr(self.kv_connector, "request_finished", None)
         if callable(callback):
             callback(seq)
@@ -5015,21 +5018,22 @@ class Scheduler:
             seq.status = SequenceStatus.WAITING
             self._mark_offload_load_ready(seq)
 
-    def _resolve_finished_receives(self) -> None:
-        """Resolve admitted loads before sizing prefill; prioritize their resumes.
+    def _prioritize_ready_remote_kv_requests(self) -> None:
+        """Prioritize completed remote requests before sizing prefill work.
 
-        These requests were admitted at the queue head and already own blocks.
-        A fresh head cannot block their progress and reclamation. With an
-        offload tier configured (`is_offload`, which a `multi` P/D + offload
-        connector also reports), every finished receive is resolved here as a
-        tier load; a P/D-only consumer resolves at admission and goes to its
-        first decode.
+        Offload completions are resolved once here, but a settled resume that
+        keeps its blocks stays ahead of fresh or preempted admissions on every
+        tick. Otherwise a preempted head can fail allocation while the resume
+        behind it holds the blocks needed to make progress. A P/D-only receive
+        is only reordered here; admission resolves it before its first decode.
         """
-        if not self.waiting or not (
+        if not self.waiting:
+            return
+        resolve = self._connector_flag("is_offload")
+        if not resolve and not (
             self.finished_recving_kv_req_ids or self.failed_recving_kv_req_ids
         ):
             return
-        resolve = self._connector_flag("is_offload")
         ready: deque[Sequence] = deque()
         blocked: deque[Sequence] = deque()
         while self.waiting:
@@ -5040,6 +5044,11 @@ class Scheduler:
             ):
                 if resolve:
                     self._resolve_offload_load(seq)
+                ready.append(seq)
+            elif (
+                seq.status == SequenceStatus.WAITING
+                and self._is_offload_prefill_resume(seq)
+            ):
                 ready.append(seq)
             else:
                 blocked.append(seq)

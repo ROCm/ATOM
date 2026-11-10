@@ -596,7 +596,7 @@ def test_deallocate_forgets_the_kv_only_load(monkeypatch):
 
 def test_a_finished_load_is_sized_as_a_resume_without_rewalking_its_hit():
     """A finished tier load is resolved into a resume at the top of the tick
-    (`_resolve_finished_receives`). The delayer's probes then size it
+    (`_prioritize_ready_remote_kv_requests`). The delayer's probes then size it
     as that resume and do not re-ask the hit walk, which would rewrite the
     `replays_hit` flag it was admitted with."""
     engine, seq = _engine_with_a_replayed_head(budget=64)
@@ -615,7 +615,7 @@ def test_a_finished_load_is_sized_as_a_resume_without_rewalking_its_hit():
     real = bm.can_allocate_memoized
     bm.can_allocate_memoized = lambda s: walks.append(s) or real(s)
     assert not engine._local_prefill_pending_work()[0]  # not resolved yet
-    engine._resolve_finished_receives()
+    engine._prioritize_ready_remote_kv_requests()
     assert seq.status == SequenceStatus.WAITING and seq.num_cached_tokens == 36
     assert engine._local_prefill_pending_work()[0]
     engine._estimate_prefill_chunk_cost()

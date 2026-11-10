@@ -19,8 +19,6 @@ from prometheus_client import CollectorRegistry, generate_latest
 from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
 from prometheus_client.exposition import CONTENT_TYPE_LATEST
 
-from atom.model_engine.prefix_spread import PrefixSpreadRouter
-
 Snapshot = dict[str, Any]
 SnapshotState = tuple[Snapshot, int, float]
 
@@ -207,8 +205,8 @@ class _AtomMetricsCollector:
             metric.add_metric([], float(value))
             yield metric
 
-        decisions = PrefixSpreadRouter.DECISIONS
-        if all(key in dp_router for key in decisions):
+        decisions = dp_router.get("prefix_route")
+        if decisions is not None:
             # Present only under `--dp-load-balance prefix_spread`.
             routed = CounterMetricFamily(
                 "atom:dp_prefix_route",
@@ -218,20 +216,15 @@ class _AtomMetricsCollector:
                 "for it, that rank restores it there) or cold (no known prefix).",
                 labels=["decision"],
             )
-            for key in decisions:
-                routed.add_metric(
-                    [key.removeprefix("prefix_").removesuffix("_total")],
-                    float(dp_router[key]),
-                )
+            for label, value in decisions.items():
+                routed.add_metric([label], float(value))
             yield routed
             moved_tokens = CounterMetricFamily(
                 "atom:dp_prefix_moved_tokens",
                 "Prefix tokens credited to moved prefix-spread requests at "
                 "placement (an estimate, not completed restores).",
             )
-            moved_tokens.add_metric(
-                [], float(dp_router.get(PrefixSpreadRouter.MOVED_TOKENS, 0))
-            )
+            moved_tokens.add_metric([], float(dp_router["prefix_moved_tokens"]))
             yield moved_tokens
 
         metric = CounterMetricFamily(

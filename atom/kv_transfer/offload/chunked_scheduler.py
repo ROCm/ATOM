@@ -49,6 +49,8 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
     is_offload = True
     # Only transports that publish source-safe completion groups may opt in.
     _supports_early_block_release = False
+    _request_meta_type = LMCacheReqMeta
+    _step_meta_type = LMCacheOffloadMetadata
 
     def __init__(
         self,
@@ -657,7 +659,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         is_last_prefill: bool,
     ) -> LMCacheReqMeta | None:
         """Admit any layout-specific sources before advancing the watermark."""
-        return LMCacheReqMeta(
+        return self._request_meta_type(
             req_id=seq.id,
             token_ids=self._transfer_tokens(seq, aligned),
             block_ids=block_ids,
@@ -720,7 +722,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         Ships the prompt prefix the transfer covers, from which the worker
         derives the chunk keys. A transport keyed differently overrides this.
         """
-        return LMCacheReqMeta(
+        return self._request_meta_type(
             req_id=seq.id,
             token_ids=self._transfer_tokens(seq, transfer_end),
             block_ids=list(seq.block_table),
@@ -793,7 +795,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
 
     def build_connector_meta(self) -> LMCacheOffloadMetadata:
         _perf_t0 = time.perf_counter()
-        meta = LMCacheOffloadMetadata()
+        meta = self._step_meta_type()
 
         # Loads
         logger.debug("[OFFLOAD-BUILD] reqs_need_recv=%d", len(self._reqs_need_recv))

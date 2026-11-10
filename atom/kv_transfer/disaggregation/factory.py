@@ -14,13 +14,14 @@ from __future__ import annotations
 import importlib
 import logging
 from collections.abc import Iterable
-from dataclasses import dataclass
 from typing import Any, ClassVar
 
 from atom.kv_transfer.disaggregation.base import (
     KVConnectorBase,
     KVConnectorSchedulerBase,
 )
+from atom.kv_transfer.offload import register_backends
+from atom.kv_transfer.offload.tier import OffloadTierProfile
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -59,43 +60,6 @@ def pd_transfer_config(kv_transfer_config: dict | None) -> dict | None:
                 return sub
         return None
     return cfg if name in PD_TRANSFER_BACKENDS else None
-
-
-@dataclass(frozen=True)
-class OffloadTierProfile:
-    """What the configured offload tier offers DP routing, read off the registry once at startup (`KVConnectorFactory.offload_tier`).
-
-    `loads`: a rank can load a prefix another DP rank computed from the tier
-    (some configured transport, ``multi`` expanded, is an offload backend
-    whose role both saves and loads and whose tier the DP ranks share).
-
-    `min_load_tokens`: the shortest tier hit, beyond the HBM prefix, that the
-    connector loads rather than recomputes.
-    """
-
-    loads: bool = False
-    min_load_tokens: int = 0
-    # The tier's transfer granularity in tokens (`register(chunk_tokens=...)`).
-    load_chunk_tokens: int = 1
-
-    def loadable_tokens(
-        self, local: int, hit: int, num_prompt: int | None = None
-    ) -> int:
-        """Tokens a rank with `local` cached tokens loads from a tier hit of
-        `hit` tokens: what the offload scheduler will load (`load_math`), so the
-        router charges the rest as prefill. 0 when the load is under the
-        minimum."""
-        if not self.loads:
-            return 0
-        from atom.kv_transfer.offload.load_math import loadable_hit, tier_load_tokens
-
-        chunk = self.load_chunk_tokens
-        return tier_load_tokens(
-            local,
-            loadable_hit(hit, num_prompt, chunk),
-            chunk,
-            self.min_load_tokens,
-        )
 
 
 class KVConnectorFactory:
@@ -482,10 +446,6 @@ KVConnectorFactory.register(
 )
 
 
-# ATOM standalone CPU/NVMe KV offload backend (registers "lmcache_offload").
-# Import is lightweight (offload/__init__ only records module paths as strings;
-# the connector module is imported lazily by create_connector when selected).
-try:
-    import atom.kv_transfer.offload  # noqa: F401,E402
-except Exception as _e:  # pragma: no cover - offload optional (needs lmcache)
-    logger.debug("lmcache_offload backend not registered: %s", _e)
+# Registration is explicit after the factory exists; importing an offload
+# value type does not recursively import this factory.
+register_backends(KVConnectorFactory)

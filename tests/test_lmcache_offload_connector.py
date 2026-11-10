@@ -3775,7 +3775,7 @@ def test_aborted_parked_load_defers_owned_resources_until_terminal(
     host._num_parked_remote_kv = 1
     host._rejected = []
 
-    host._reject_aborted_waiting(seq)
+    host._finish_rejected_waiting(seq)
 
     assert host._rejected == [seq]
     assert host.deferred_free_blocks[seq.id] is seq
@@ -3843,7 +3843,7 @@ def test_aborted_parked_load_consumes_already_queued_terminal(queued_field):
     host._num_parked_remote_kv = 1
     host._rejected = []
 
-    host._reject_aborted_waiting(seq)
+    host._finish_rejected_waiting(seq)
 
     assert events == [
         ("request_finished", seq.id),
@@ -3926,7 +3926,7 @@ def test_abort_cleans_load_whose_terminal_was_already_consumed(
     assert host.failed_recving_kv_req_ids == []
 
     seq.status = SequenceStatus.ABORTED
-    host._reject_aborted_waiting(seq)
+    host._finish_rejected_waiting(seq)
 
     assert events == [
         (terminal_callback, seq.id),

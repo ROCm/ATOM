@@ -21,7 +21,6 @@ from atom.kv_transfer.offload._offload_common import validated_kv_role
 from atom.kv_transfer.offload.chunked_scheduler import (
     ChunkedOffloadSchedulerBase,
 )
-from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata
 from atom.kv_transfer.offload.mp.deployment import (
     _extra_config,
     _make_scheduler_adapter,
@@ -30,6 +29,7 @@ from atom.kv_transfer.offload.mp.deployment import (
 )
 from atom.kv_transfer.offload.mp.lookup import _DEFAULT_READ_TTL_S, _MPLookupClient
 from atom.kv_transfer.offload.mp.lookup_driver import _LockedAdapter
+from atom.kv_transfer.offload.mp.metadata import MPOffloadMetadata, MPReqMeta
 from atom.kv_transfer.offload.mp.token_shipping import ShippedTokens, TokenShipper
 from atom.kv_transfer.offload.mp.transfer import (
     _SCHEDULER_DEADLINE_MARGIN_S,
@@ -47,6 +47,8 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
     """Scheduler-side LMCache MP connector for generic PAGE offload."""
 
     _supports_early_block_release = True
+    _request_meta_type = MPReqMeta
+    _step_meta_type = MPOffloadMetadata
     # Whether a save may cover KV the current step computes (see
     # `note_scheduled_tokens`). A subclass whose save reads more than the
     # PAGE blocks that forward writes turns it off.
@@ -234,7 +236,7 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
     def _transfer_tokens(self, seq: Any, end: int) -> ShippedTokens:
         return self._token_shipper.ship(seq, end)
 
-    def build_connector_meta(self) -> LMCacheOffloadMetadata:
+    def build_connector_meta(self) -> MPOffloadMetadata:
         try:
             metadata = super().build_connector_meta()
         finally:

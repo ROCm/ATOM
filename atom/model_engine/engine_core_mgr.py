@@ -32,6 +32,14 @@ from atom.model_engine.collective_rpc import (
     checked_timeout,
     engine_budget,
 )
+from atom.model_engine.dp_policy import LoadPolicy, PrefixPolicy, SessionPolicy
+from atom.model_engine.dp_route import (
+    PREFIX_LABELS,
+    PREFIX_MOVED_TOKENS,
+    PREFIX_OWNER,
+    Route,
+)
+from atom.model_engine.dp_routing import prefix_spread_enabled
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import (
     FIRE_AND_FORGET_UTILITY_CMDS,
@@ -312,8 +320,8 @@ class CoreManager:
         }
         # Prefix-spread routing (`atom/model_engine/prefix_spread.py`): keeps a
         # request on the rank holding its prompt's prefix unless that rank has
-        # a prefill backlog and another is about to idle. Set exactly when
-        # dp_load_balance is "prefix_spread".
+        # a prefill backlog and another is about to idle. Created only when
+        # this manager actually routes between eligible DP ranks.
         self._prefix_router = self._build_prefix_router(config)
         if self._prefix_router is not None:
             self._dp_route_counters.update(
@@ -356,10 +364,10 @@ class CoreManager:
         # after the caller has already seen the error. ``reset_dp_router``
         # clears it.
         self._bp_dispatch_paused = False
-        if self._bp_depth > 0 and self._prefix_router is not None:
+        if self._bp_depth > 0 and self._get_dp_policy().stateful:
             logger.warning(
                 "%s: ATOM_DP_DISPATCH_DEPTH=%d is ignored under "
-                "dp_load_balance=prefix_spread, which places every request "
+                "the configured stateful DP policy, which places every request "
                 "itself (offline batches are sent at once)",
                 label,
                 self._bp_depth,
@@ -1087,10 +1095,9 @@ class CoreManager:
         DP rank, or pipeline parallelism (requests enter at stage 0). The
         strategy has no effect there, so its requirements are not enforced.
         """
-        if self._dp_lb_strategy != "prefix_spread":
-            return None
-        pp_size = int(getattr(config, "pipeline_parallel_size", 1) or 1)
-        if self._routable_engine_count <= 1 or pp_size > 1:
+        if not prefix_spread_enabled(
+            config, routable_engines=self._routable_engine_count
+        ):
             return None
         if self._dp_session_affinity_enabled:
             # Both place every request by their own rule; a session pin
@@ -1178,8 +1185,7 @@ class CoreManager:
         if (
             getattr(self, "_bp_depth", 0) > 0
             and getattr(self, "_bp_offline_batch", False)
-            and not self._dp_session_affinity_enabled
-            and self._prefix_router is None
+            and not self._get_dp_policy().stateful
             and all(h is None for h in hints)
         ):
             self._bp_dispatch_or_refill(new_seqs=seqs, raise_on_error=True)
@@ -1188,16 +1194,17 @@ class CoreManager:
         # round_robin normally skips load bookkeeping. Session affinity still
         # needs queued-prefill counters even if the fallback strategy is RR.
         track_load = (
-            self._dp_lb_strategy != "round_robin" or self._dp_session_affinity_enabled
+            self._dp_lb_strategy != "round_robin" or self._get_dp_policy().stateful
         )
         engine_count = self._routable_engine_count
         dp_seqs = [[] for _ in range(engine_count)]
         reqs_snapshot = tokens_snapshot = None
         with self._lb_lock:
             for seq, hint in zip(seqs, hints):
-                dp_rank = self._select_dp_rank_for_seq_locked(seq, hint)
+                route = self._select_dp_rank_for_seq_locked(seq, hint)
+                dp_rank = route.rank
                 if track_load:
-                    self._charge_seq_load_locked(seq, dp_rank)
+                    self._charge_seq_load_locked(seq, dp_rank, credit=route.credit)
                 dp_seqs[dp_rank].append(seq)
             # Copy the counters under the lock so the snapshot log below is a
             # consistent instant, not a torn read racing a release.
@@ -1404,7 +1411,7 @@ class CoreManager:
             )
         )
 
-    def _select_dp_rank_locked(self) -> int:
+    def _select_dp_rank_locked(self, *, strategy: str | None = None) -> int:
         """Pick a DP engine rank for a new request. Caller must hold _lb_lock.
 
         - "round_robin": load-agnostic rotation.
@@ -1412,14 +1419,16 @@ class CoreManager:
           the lighter in-flight prompt-token load. Request count keeps the
           lockstep DP ranks in phase; the token tie-break packs pending prefill
           work evenly across the equal-request ranks.
-        - "least_tokens": lowest combined load ``tokens + req_equiv * reqs``
+        - "least_tokens" and cold "prefix_spread": lowest combined load
+          ``tokens + req_equiv * reqs``
           (prefill pressure + decode-slot pressure).
 
         Fully-tied ranks are resolved by a rotating cursor so selection does not
         always fall on rank 0. See docs/distributed_guide.md for the rationale.
         """
         n = self._routable_engine_count
-        if self._dp_lb_strategy == "round_robin":
+        strategy = self._dp_lb_strategy if strategy is None else strategy
+        if strategy == "round_robin":
             dp_rank = self._rank_rotation_cursor % n
             self._rank_rotation_cursor += 1
             return dp_rank
@@ -1427,7 +1436,9 @@ class CoreManager:
         # argmin over per-rank load, scanned from a rotating start offset so a run
         # of fully-equal ranks spreads evenly. Scores are computed inline (no
         # intermediate list) — the loop reads the counters directly.
-        least_requests = self._dp_lb_strategy == "least_requests"
+        least_requests = strategy == "least_requests"
+        if strategy not in ("least_requests", "least_tokens", "prefix_spread"):
+            raise ValueError(f"Unknown DP load-balancing strategy {strategy!r}")
         best_rank = 0
         best_score = None
         offset = self._rank_rotation_cursor % n
@@ -1437,7 +1448,7 @@ class CoreManager:
                 # Lexicographic (request count, prompt-token load): tuples compare
                 # element-wise, so tokens only decide among request-count ties.
                 score = (self._rank_reqs[r], self._rank_tokens[r])
-            else:  # "least_tokens"
+            else:  # explicitly least_tokens or prefix_spread's cold placement
                 score = self._rank_load(r)
             if best_score is None or score < best_score:
                 best_score = score
@@ -1507,84 +1518,46 @@ class CoreManager:
         self._rank_routed_total[rank] += 1
         return rank
 
+    def _get_dp_policy(self) -> LoadPolicy:
+        """The configured placement policy; lifecycle calls share this object."""
+        policy = getattr(self, "_dp_policy", None)
+        router = self._prefix_router
+        if router is not None:
+            if not isinstance(policy, PrefixPolicy) or policy.router is not router:
+                policy = PrefixPolicy(
+                    router,
+                    lambda: self._rank_tokens,
+                    lambda: self._rank_reqs,
+                    self._rank_load,
+                    lambda: self._select_dp_rank_locked(strategy="least_tokens"),
+                )
+        elif self._dp_session_affinity_enabled:
+            if not isinstance(policy, SessionPolicy):
+                policy = SessionPolicy(
+                    self._select_dp_rank_locked,
+                    self._select_new_session_rank_locked,
+                    self._dp_session_owners,
+                    self._dp_session_prompt_tokens,
+                    self._routable_engine_count,
+                    self._record_ignored_parent,
+                )
+        elif policy is None or type(policy) is not LoadPolicy:
+            policy = LoadPolicy(self._select_dp_rank_locked)
+        self._dp_policy = policy
+        return policy
+
+    def _record_ignored_parent(self) -> None:
+        self._dp_route_counters["affinity_parent_ignored_total"] += 1
+
     def _select_dp_rank_for_seq_locked(
         self, seq: Sequence, explicit_rank: int | None
-    ) -> int:
-        """Route one sequence using explicit hint, then `prefix_spread` when it
-        is the strategy, else strict session owner, then load.
-
-        This intentionally matches SGLang Model Gateway's agentic routing
-        semantics: a stable correlation/session id selects one DP rank, and
-        every later turn stays there. Load cannot move an existing session;
-        doing so turns a cheap cache hit into a potentially huge prefill.
-
-        Parent lineage does not affect placement. Each child correlation id is
-        its own sticky session, preventing sibling subagents from dogpiling the
-        root's rank. Requests without a session retain normal load balancing.
-        """
-        if explicit_rank is not None:
-            if self._dp_session_affinity_enabled:
-                # An explicit placement is authoritative and becomes the
-                # session's owner for subsequent unhinted requests.
-                session_id = getattr(seq, "dp_session_id", None)
-                if session_id:
-                    old_owner = self._dp_session_owners.get(session_id)
-                    if old_owner is not None and old_owner != explicit_rank:
-                        # The new rank cannot be assumed to own the old prefix.
-                        self._dp_session_prompt_tokens.pop(session_id, None)
-                    self._dp_session_owners[session_id] = explicit_rank
-            if self._prefix_router is not None:
-                # Its prefix lands there all the same: index it, so a later
-                # request with that prefix finds its owner.
-                self._prefix_router.place(
-                    seq, explicit_rank, self._routable_engine_count
-                )
-            return self._record_dp_route_locked("explicit_total", explicit_rank)
-
-        if self._prefix_router is not None:
-            return self._select_prefix_spread_locked(seq)
-        session_id = getattr(seq, "dp_session_id", None)
-        parent_id = getattr(seq, "dp_parent_session_id", None)
-        if not self._dp_session_affinity_enabled or not session_id:
-            rank = self._select_dp_rank_locked()
-            return self._record_dp_route_locked("load_balanced_total", rank)
-
-        owner = self._dp_session_owners.get(session_id)
-        if owner is None or not 0 <= owner < self._routable_engine_count:
-            owner = self._select_new_session_rank_locked(session_id)
-            self._dp_session_owners[session_id] = owner
-            if parent_id:
-                self._dp_route_counters["affinity_parent_ignored_total"] += 1
-            logger.debug(
-                "%s: DPA load-aware affinity new session=%s parent=%s owner=rank%d "
-                "load=%d tokens=%d reqs=%d",
-                self.label,
-                session_id,
-                parent_id,
-                owner,
-                self._rank_load(owner),
-                self._rank_tokens[owner],
-                self._rank_reqs[owner],
-            )
-            return self._record_dp_route_locked("affinity_new_total", owner)
-
-        return self._record_dp_route_locked("affinity_owner_hit_total", owner)
-
-    def _select_prefix_spread_locked(self, seq: Sequence) -> int:
-        """Prefix-spread placement (`PrefixSpreadRouter.select`); a new prefix
-        goes where `least_tokens` would put it."""
-        route = self._prefix_router.select(
-            seq,
-            self._rank_tokens,
-            self._rank_reqs,
-            self._rank_load,
-            self._select_dp_rank_locked,
-        )
-        if route.decision == "prefix_moved_total":
-            self._dp_route_counters[
-                PrefixSpreadRouter.MOVED_TOKENS
-            ] += route.moved_tokens
-        return self._record_dp_route_locked(route.decision, route.rank)
+    ) -> Route:
+        """Place a request and return its accounting from the selected policy."""
+        route = self._get_dp_policy().select(seq, explicit_rank)
+        if PREFIX_MOVED_TOKENS in self._dp_route_counters:
+            self._dp_route_counters[PREFIX_MOVED_TOKENS] += route.moved_tokens
+        self._record_dp_route_locked(route.decision, route.rank)
+        return route
 
     def get_dp_router_statistics(self) -> dict:
         """Return a consistent, non-mutating snapshot of DP routing state."""
@@ -1593,7 +1566,7 @@ class CoreManager:
             for rank in self._dp_session_owners.values():
                 if 0 <= rank < self._routable_engine_count:
                     sessions_per_rank[rank] += 1
-            return {
+            snapshot = {
                 "enabled": self._routable_engine_count > 1,
                 **self._dp_route_counters,
                 "requests_per_rank": list(self._rank_routed_total),
@@ -1601,23 +1574,20 @@ class CoreManager:
                 "queued_prefill_tokens_per_rank": list(self._rank_tokens),
                 "session_count_per_rank": sessions_per_rank,
             }
+            if PREFIX_OWNER in self._dp_route_counters:
+                snapshot["prefix_route"] = {
+                    label: self._dp_route_counters[name]
+                    for name, label in PREFIX_LABELS
+                }
+            return snapshot
 
-    def _charge_seq_load_locked(self, seq: Sequence, dp_rank: int) -> None:
+    def _charge_seq_load_locked(
+        self, seq: Sequence, dp_rank: int, credit: int = 0
+    ) -> None:
         """Record a seq's in-flight load on dp_rank. Caller must hold _lb_lock."""
         req_cost = 1
         prompt_tokens = int(getattr(seq, "num_prompt_tokens", 0) or 0)
-        tok_cost = prompt_tokens
-        session_id = getattr(seq, "dp_session_id", None)
-        if self._prefix_router is not None:
-            tok_cost = max(0, prompt_tokens - self._prefix_router.charge(seq.id))
-        elif self._dp_session_affinity_enabled and session_id:
-            previous_prompt_tokens = self._dp_session_prompt_tokens.get(session_id)
-            if previous_prompt_tokens is not None:
-                # Agentic turns normally extend their previous prompt.  Charge
-                # only that extension; request-equivalent load still accounts
-                # for lookup/decode pressure when the delta is zero.
-                tok_cost = max(0, prompt_tokens - previous_prompt_tokens)
-            self._dp_session_prompt_tokens[session_id] = prompt_tokens
+        tok_cost = max(0, prompt_tokens - self._get_dp_policy().charge(seq, credit))
         self._rank_reqs[dp_rank] += req_cost
         self._rank_tokens[dp_rank] += tok_cost
         self._seq_load[seq.id] = (dp_rank, req_cost, tok_cost)
@@ -1702,12 +1672,12 @@ class CoreManager:
         self._release_load_locked(seq_id)
 
     def _release_route_locked(self, seq_id) -> None:
-        """Release a seq's prefix-router state. A request leaving before its
-        prefill completed hands its provisional entries to a waiter, which
-        is charged the credit it loses (`PrefixSpreadRouter.release`)."""
-        if self._prefix_router is None:
-            return
-        for successor, extra in self._prefix_router.release(seq_id).items():
+        """Release the selected policy's state and apply any successor debt.
+
+        A prefix producer leaving before prefill hands its provisional entries
+        to a waiter, which is charged the credit it loses.
+        """
+        for successor, extra in self._get_dp_policy().release(seq_id).items():
             successor_load = self._seq_load.get(successor)
             if successor_load is not None:
                 rank, req_cost, tok_cost = successor_load
@@ -1728,14 +1698,13 @@ class CoreManager:
         # abort, which leaves the router's state to this thread). Avoid taking
         # the router lock for a no-op; re-read under the lock before changing
         # counters because abort/finish may release the charge concurrently.
-        router = self._prefix_router
-        if router is None or not router.prefilling(seq_id):
+        policy = self._get_dp_policy()
+        if not policy.prefilling(seq_id):
             entry = self._seq_load.get(seq_id)
             if entry is None or entry[2] == 0:
                 return
         with self._lb_lock:
-            if router is not None:
-                router.prefill_complete(seq_id)
+            policy.prefill_complete(seq_id)
             entry = self._seq_load.get(seq_id)
             if entry is None:
                 return
@@ -1768,11 +1737,14 @@ class CoreManager:
                     len(self._seq_load),
                 )
             self._rank_rotation_cursor = 0
-            self._rank_reqs = [0] * self._routable_engine_count
-            self._rank_tokens = [0] * self._routable_engine_count
+            self._rank_reqs[:] = [0] * self._routable_engine_count
+            self._rank_tokens[:] = [0] * self._routable_engine_count
             self._seq_load.clear()
-            if self._prefix_router is not None:
-                self._prefix_router.reset()
+            self._get_dp_policy().reset()
+            # Clear dormant session bookkeeping too, including after a policy
+            # replacement; the public reset applies to all routing state.
+            self._dp_session_owners.clear()
+            self._dp_session_prompt_tokens.clear()
             pending = getattr(self, "_bp_pending", None)
             if pending:
                 logger.warning(
@@ -1782,8 +1754,6 @@ class CoreManager:
                     len(pending),
                 )
                 pending.clear()
-            self._dp_session_owners.clear()
-            self._dp_session_prompt_tokens.clear()
             self._bp_dispatch_paused = False
 
     def send_utility_command(self, cmd: str, dp_rank: int | None = None):
@@ -2372,6 +2342,9 @@ class DisaggCoreManager(CoreManager):
     The two processes coordinate via direct ZMQ PUSH/PULL sockets whose
     addresses are established here before spawning and passed through config.
     """
+
+    def _build_prefix_router(self, config) -> None:
+        """The prefill/decode pair fans out requests; neither engine is a DP target."""
 
     def __init__(self, config: Config):
         import copy

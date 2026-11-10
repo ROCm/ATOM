@@ -20,10 +20,10 @@ from atom.kv_transfer.disaggregation.base import (
 )
 from atom.kv_transfer.disaggregation.types import KVConnectorOutput
 from atom.kv_transfer.offload._offload_common import validated_kv_role
+from atom.kv_transfer.offload.capabilities import replays_state
 from atom.kv_transfer.offload.mp import deployment
 from atom.kv_transfer.offload.mp import scheduler as mp_scheduler
 from atom.kv_transfer.offload.mp import worker as mp_worker
-from atom.kv_transfer.offload.page_codec import replays_state
 
 
 def _publishes_native_state(transfer_tensors: Any) -> bool:

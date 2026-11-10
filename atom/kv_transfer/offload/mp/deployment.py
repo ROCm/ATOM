@@ -16,6 +16,7 @@ from dataclasses import replace
 from typing import Any
 
 from atom.kv_transfer.offload import config as offcfg
+from atom.model_engine.dp_routing import prefix_spread_enabled
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -24,24 +25,22 @@ _MP_LAYOUT_VERSION = 3
 
 
 def _extra_config(config: Any) -> dict[str, Any]:
-    kvc = getattr(config, "kv_transfer_config", {}) or {}
-    extra = kvc.get("kv_connector_extra_config", {}) or {}
-    if not isinstance(extra, dict):
-        raise TypeError("kv_connector_extra_config must be a dictionary")
-    return extra
+    return dict(offcfg.connector_extras(getattr(config, "kv_transfer_config", None)))
 
 
 def _storage_kv_transfer_config(config: Any) -> dict[str, Any]:
     """Remove MP transport-only options before LMCache storage parsing."""
 
     kvc = dict(getattr(config, "kv_transfer_config", {}) or {})
-    extra = kvc.get("kv_connector_extra_config")
-    if isinstance(extra, dict):
-        kvc["kv_connector_extra_config"] = {
-            key: value
-            for key, value in extra.items()
-            if not (isinstance(key, str) and key.startswith("lmcache.mp."))
-        }
+    extra = {
+        key: value
+        for key, value in offcfg.connector_extras(kvc).items()
+        if not (isinstance(key, str) and key.startswith("lmcache.mp."))
+    }
+    if "kv_connector_extra_config" in kvc:
+        kvc["kv_connector_extra_config"] = extra
+    else:
+        kvc = extra
     return kvc
 
 
@@ -55,20 +54,7 @@ def require_chunk_matches_server(adapter: Any, config: Any) -> None:
     so other strategies and runs with only one routable engine are not
     checked. Called by both worker registrations (PAGE-only and native-state).
     """
-    if getattr(config, "dp_load_balance", None) != "prefix_spread":
-        return
-    parallel = getattr(config, "parallel_config", None)
-    engines = int(
-        getattr(
-            parallel, "data_parallel_size", getattr(config, "data_parallel_size", 1)
-        )
-        or 1
-    )
-    if getattr(config, "enable_dp_attention", False):
-        # CoreManager expands DP by TP and sets TP to 1 before spawning workers.
-        # This also handles a config before that normalization.
-        engines *= int(getattr(config, "tensor_parallel_size", 1) or 1)
-    if engines <= 1:
+    if not prefix_spread_enabled(config):
         return
     configured = offcfg.lmcache_chunk_tokens(_storage_kv_transfer_config(config))
     server = int(adapter.lmcache_tokens_per_chunk)

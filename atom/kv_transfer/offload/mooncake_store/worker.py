@@ -54,6 +54,7 @@ from atom.kv_transfer.offload._block_gpu_connector import (
     BlockGPUConnector,
 )
 from atom.kv_transfer.offload._offload_common import pp_aware_rank_and_world
+from atom.kv_transfer.offload.capabilities import replays_state
 from atom.kv_transfer.offload.dense.connector import DenseOffloadConnector
 from atom.kv_transfer.offload.dense.kv_byte_codec import DenseKVByteCodec
 from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata, LMCacheReqMeta
@@ -83,7 +84,7 @@ from atom.kv_transfer.offload.mooncake_store.scheduler import (
     require_monotonic_clock_id,
 )
 from atom.kv_transfer.offload.mooncake_store.taint import TaintMarker
-from atom.kv_transfer.offload.page_codec import pure_page_codec, replays_state
+from atom.kv_transfer.offload.page_codec import pure_page_codec
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -249,14 +250,7 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
                 raise ValueError(
                     "Mooncake Store V4.1 requires the PAGE replay contract"
                 )
-            page_num_blocks = (
-                num_blocks
-                if num_blocks is not None
-                else getattr(transfer_tensors, "num_blocks", None)
-            )
-            self._codec = pure_page_codec(
-                getattr(transfer_tensors, "block_regions", None), page_num_blocks
-            )
+            self._codec = pure_page_codec(transfer_tensors, num_blocks)
         else:
             self._codec = DenseKVByteCodec(
                 kv_caches,

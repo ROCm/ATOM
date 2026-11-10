@@ -10,11 +10,6 @@ in a `ShippedTokens` that rides in `LMCacheReqMeta.token_ids`. Each worker
 (`WorkerTokens`) appends it to its own `array('i')` copy of the request's
 prefix (4 bytes a token).
 
-What this does not remove: `AtomMPTransferSpec` takes the whole `[0, end)`
-prefix, and LMCache turns it into a tuple, so a rank that submits a transfer
-still builds an O(prefix) sequence for it (`token_list`, built only there).
-Removing that needs incremental specs in LMCache MP.
-
 A finished request's copy is dropped through the metadata's `token_drops`,
 which counts as pending work (`has_drops`), so the drop is delivered even when
 no transfer is left.
