@@ -36,7 +36,7 @@ OTHER = {
     "index_own": 1, "timeline": True, "index_topk": False, "fuse_k1": False,
     "sm_scale": 0.09, "eps": 1e-5, "route_scale": 2.0, "shared_weight": 0.5,
     "swiglu_limit": 8.0, "debug": True, "xn_flag": 1,
-    "shared_mxfp8": True,
+    "shared_mxfp8": True, "mid_flag": 1,
 }  # fmt: skip
 
 
@@ -46,7 +46,7 @@ def _compile(key: K4Build) -> None:
         key.npes, key.sm_scale, key.eps, key.route_scale, key.shared_weight,
         key.swiglu_limit, key.init_blocks, key.local_blocks, key.tokens,
         timeline=key.timeline, fuse_k1=key.fuse_k1, heads=heads, debug=key.debug,
-        index_topk=key.index_topk, xn_flag=key.xn_flag, shared_mxfp8=key.shared_mxfp8,
+        index_topk=key.index_topk, xn_flag=key.xn_flag, shared_mxfp8=key.shared_mxfp8, mid_flag=key.mid_flag,
     )  # fmt: skip
     with compile_only():
         launch(*K4_ABI.zeros())

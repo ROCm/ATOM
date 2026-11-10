@@ -164,6 +164,7 @@ class K4Build:
     debug: bool
     xn_flag: int = 0
     shared_mxfp8: bool = False
+    mid_flag: int = 0
 
 
 def build_post_attn_kernel(
@@ -183,6 +184,7 @@ def build_post_attn_kernel(
     index_topk: bool = True,
     xn_flag: int = 0,
     shared_mxfp8: bool = False,
+    mid_flag: int = 0,
 ):
     """``@flyc.jit`` launcher of K4 for one rank of an ``npes``-way TP group and a
     decode step of ``tokens`` (<= MAX_TOKENS) rows, ``q_len`` consecutive rows a
@@ -206,13 +208,15 @@ def build_post_attn_kernel(
         index_topk=index_topk, fuse_k1=fuse_k1, sm_scale=sm_scale, eps=eps,
         route_scale=route_scale, shared_weight=shared_weight,
         swiglu_limit=swiglu_limit, debug=debug, xn_flag=xn_flag,
-        shared_mxfp8=shared_mxfp8,
+        shared_mxfp8=shared_mxfp8, mid_flag=mid_flag,
     )  # fmt: skip
     build_key = key_tuple(key, SOURCES)  # the launcher references it: keyed
     # a debug build's wait records name a region by its ``region_id``
     REGION_IDS = region_ids(
         d.name
-        for d in mailbox_regions(tokens, heads.count, fuse_k1, index_topk, xn_flag)
+        for d in mailbox_regions(
+            tokens, heads.count, fuse_k1, index_topk, xn_flag, mid_flag
+        )
     )
     W = npes
     G = BLOCKS
@@ -226,6 +230,8 @@ def build_post_attn_kernel(
     # the logits), not as tagged pairs
     XN_FLAG = WIDE or xn_flag != 0
     XN_EARLY = xn_flag == 2 and not WIDE
+    # the narrow MoE's mid rows likewise: plain bf16 behind one flag a up / gate task
+    MID_FLAG = mid_flag != 0 and not WIDE
     POOL = pool_words(tokens)
     U_MAX = TOP_K * tokens + 1  # distinct routed experts at most, then the shared
 

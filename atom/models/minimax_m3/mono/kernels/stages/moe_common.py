@@ -37,7 +37,18 @@ from atom.models.minimax_m3.mono.layout import (
     XSC_ROW,
 )
 from atom.mono.device.mx import FP4, FP8, fp4_tile_load, mfma_scaled, scale_index
-from atom.mono.device.ops import CM_NT, bf16_round, row_sum, rsrc, traced, uniform
+from atom.mono.device.ops import (
+    CM_DEV,
+    CM_NT,
+    bf16_pair,
+    bf16_round,
+    row_sum,
+    rsrc,
+    traced,
+    uniform,
+    xshfl,
+)
+from atom.mono.device.sync import publish
 
 
 @traced
@@ -49,6 +60,7 @@ def moe_common_defs(k4ctx):
     DN_UPW = k4ctx["DN_UPW"]
     G = k4ctx["G"]
     ROUTED_TASKS = k4ctx["ROUTED_TASKS"]
+    MID_FLAG = k4ctx["MID_FLAG"]
     SH8 = k4ctx["shared_mxfp8"]
     SH_UPW = k4ctx["SH_UPW"]
     TPT = k4ctx["TPT"]
@@ -62,6 +74,7 @@ def moe_common_defs(k4ctx):
     lane = k4ctx["lane"]
     lds_b8 = k4ctx["lds_b8"]
     lds_i32 = k4ctx["lds_i32"]
+    mb = k4ctx["mb"]
     mb_put = k4ctx["mb_put"]
     mr = k4ctx["mr"]
     opart = k4ctx["opart"]
@@ -83,6 +96,23 @@ def moe_common_defs(k4ctx):
     w2s = k4ctx["w2s"]
     w13s = k4ctx["w13s"]
     wave = k4ctx["wave"]
+
+    def put_mid(idx, y):
+        """Mid element ``idx`` (even for a lane r % 2 == 0) := ``y``: a tagged pair, or
+        (``MID_FLAG``) a bf16 pair word from every even lane (its neighbor's value
+        beside its own), plain (the task's flag follows the CTA's stores)."""
+        if const_expr(not MID_FLAG):
+            mb_put(mr("mid"), idx, bf16_round(y))
+            return
+        y = bf16_round(y)
+        nb = xshfl(y, 1)
+        if idx % 2 == 0:
+            bo.buffer_store(
+                bf16_pair(y, nb).bitcast(fx.Int32),
+                rsrc(mb("mid")),
+                idx // 2,
+                cache_modifier=CM_DEV,
+            )
 
     def ug_task_id(it):
         """(this CTA's it-th routed task, clamped; whether it exists)."""
@@ -160,11 +190,9 @@ def moe_common_defs(k4ctx):
             gsum = row_sum(red, r, col)
             usum = row_sum(opart, r, col)
             y = swiglu_mul_batch([gsum], [usum], fx.Float32(-swiglu_limit))[0]
-            mb_put(
-                mr("mid"),
-                (kk * MOE_SLOTS + slot) * INTER + cg * UG_ROWS + r,
-                bf16_round(y),
-            )
+            put_mid((kk * MOE_SLOTS + slot) * INTER + cg * UG_ROWS + r, y)
+        if const_expr(MID_FLAG):
+            publish(mb_put, mr("ugdone"), t, fx.Int32(1), tid == 0)
         gpu.barrier()
 
     def fp8_tile_load(r_w, row, cols, kc):
@@ -268,11 +296,9 @@ def moe_common_defs(k4ctx):
             gsum = row_sum(red, r, col)
             usum = row_sum(red, r + 8, col)
             y = swiglu_mul_batch([gsum], [usum], fx.Float32(-swiglu_limit))[0]
-            mb_put(
-                mr("mid"),
-                (col * MOE_SLOTS + TOP_K) * INTER + j * SH_ROWS + r,
-                bf16_round(y),
-            )
+            put_mid((col * MOE_SLOTS + TOP_K) * INTER + j * SH_ROWS + r, y)
+        if const_expr(MID_FLAG):
+            publish(mb_put, mr("ugdone"), ROUTED_TASKS + j, fx.Int32(1), tid == 0)
         gpu.barrier()
 
     def down_load(k, td, has_dn):

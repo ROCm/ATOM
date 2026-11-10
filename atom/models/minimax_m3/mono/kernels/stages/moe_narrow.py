@@ -36,8 +36,10 @@ def moe_narrow_defs(k4ctx):
     """The functions of the per-(token, slot) MoE (S <= 4)."""
     BASE = k4ctx["BASE"]
     CPT = k4ctx["CPT"]
+    ROUTED_TASKS = k4ctx["ROUTED_TASKS"]
     MID16_WORDS = k4ctx["MID16_WORDS"]
     MID8_LDS = k4ctx["MID8_LDS"]
+    MID_FLAG = k4ctx["MID_FLAG"]
     MID8_WORDS = k4ctx["MID8_WORDS"]
     MIDSC_LDS = k4ctx["MIDSC_LDS"]
     MIDSC_WORDS = k4ctx["MIDSC_WORDS"]
@@ -265,8 +267,21 @@ def moe_narrow_defs(k4ctx):
                     )
 
         # every token's mid in one go: they land together (S = 4: -1.1 us)
-        for k in range_constexpr(tokens):
-            stage_mids(k)
+        if const_expr(MID_FLAG):
+            # plain bf16 rows behind a flag a up / gate task (routed, then shared)
+            n_f = ROUTED_TASKS + SH_TASKS
+            mb_poll(
+                [
+                    (mr("ugdone"), fx.min(tid + THREADS * i, n_f - 1), 1)
+                    for i in range((n_f + THREADS - 1) // THREADS)
+                ]
+            )
+            gpu.barrier()
+            acquire()
+            rows_to_lds(tid, mb("mid"), tokens, MID16_WORDS, xs, MID16_WORDS)
+        else:
+            for k in range_constexpr(tokens):
+                stage_mids(k)
         stamp(10)
         gpu.barrier()
         # then MXFP8 in a pass of its own: quantizing inside stage_mids (after

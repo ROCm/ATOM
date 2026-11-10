@@ -157,6 +157,7 @@ def mailbox_regions(
     fuse_k1: bool,
     index_topk: bool = True,
     xn_flag: int = 0,
+    mid_flag: int = 0,
 ) -> list[RegionDecl]:
     """The fused layer kernel's mailbox regions for a build: each one's space and
     the one stage that puts it (``atom.mono.plan.check``; the stages are the ones
@@ -164,7 +165,8 @@ def mailbox_regions(
     select_long, split, merge (S > 1), o, router, ug, down). Without
     ``index_topk`` (a build reusing a selection) the indexer's regions are gone.
     ``xn_flag``: a narrow build's xn goes out as plain words behind a flag a router
-    task (as the wide one's always does), not as pairs."""
+    task (as the wide one's always does), not as pairs; ``mid_flag``: the same for its
+    mid rows (plain bf16 behind a flag a up / gate task)."""
     S, P = Space.SCRATCH, Space.PEER
     regions = []
     if fuse_k1:
@@ -199,7 +201,9 @@ def mailbox_regions(
             regions.append(RegionDecl("xndone", S, "router"))
         else:
             regions += [RegionDecl(n, S, "router") for n in ("xn8", "xsc")]
-        regions.append(RegionDecl("mid", S, "ug"))
+        regions.append(
+            RegionDecl("ugdone", S, "ug") if mid_flag else RegionDecl("mid", S, "ug")
+        )
     regions.append(RegionDecl("sel", S, "ug"))  # the routing record (tests)
     regions.append(RegionDecl("ffn", P, "down", exchange=True))
     if tokens >= AG_RS_FROM:

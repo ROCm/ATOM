@@ -33,6 +33,7 @@ def build_layer(
     index_topk: bool = True,
     xn_flag: int = 0,
     shared_mxfp8: bool = False,
+    mid_flag: int = 0,
 ):
     """The layer kernel for ``tokens`` and ``index_heads`` (1 or TP), K1 fused in
     or not (``fuse_k1``), selecting or reusing a selection (``index_topk``), its
@@ -41,7 +42,7 @@ def build_layer(
     heads = IndexHeads(index_heads, 0)
     return build_post_attn_kernel(
         TP, 0.088, 1e-6, 1.0, 1.0, 7.0, 1, 1, tokens, fuse_k1=fuse_k1, heads=heads,
-        index_topk=index_topk, xn_flag=xn_flag, shared_mxfp8=shared_mxfp8,
+        index_topk=index_topk, xn_flag=xn_flag, shared_mxfp8=shared_mxfp8, mid_flag=mid_flag,
     )  # fmt: skip
 
 
@@ -57,12 +58,15 @@ def check_build(
     index_topk: bool = True,
     xn_flag: int = 0,
     shared_mxfp8: bool = False,
+    mid_flag: int = 0,
 ) -> None:
     """Trace ``build_layer`` and check its hand-offs; raises ``ContractError``."""
     check_traced(
-        build_layer(tokens, index_heads, fuse_k1, index_topk, xn_flag, shared_mxfp8),
+        build_layer(
+            tokens, index_heads, fuse_k1, index_topk, xn_flag, shared_mxfp8, mid_flag
+        ),
         K4_ABI,
-        mailbox_regions(tokens, index_heads, fuse_k1, index_topk, xn_flag),
+        mailbox_regions(tokens, index_heads, fuse_k1, index_topk, xn_flag, mid_flag),
     )
 
 
@@ -83,5 +87,7 @@ if __name__ == "__main__":
                         " contract holds"
                     )
             if s < WIDE_FROM:
+                check_build(s, ih, xn_flag=1, mid_flag=1)
+                print(f"S={s} index heads={ih} xn_flag=1 mid_flag=1: contract holds")
                 check_build(s, ih, shared_mxfp8=True)
                 print(f"S={s} index heads={ih} shared_mxfp8: contract holds")
