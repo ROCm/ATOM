@@ -365,6 +365,8 @@ class ParallelLMHead(VocabParallelEmbedding):
         vshard = self.num_embeddings // world
         vocab = slice(rank * vshard, (rank + 1) * vshard)
         bias = None if self.bias is None else self.bias[vocab]
+        if out is None:
+            return tgemm.mm(x, self.weight[vocab], bias)
         return tgemm.mm(x, self.weight[vocab], bias, out=out)
 
     def _sp_sharded_logits(self, x: torch.Tensor) -> torch.Tensor:

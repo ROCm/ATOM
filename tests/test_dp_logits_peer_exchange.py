@@ -99,6 +99,19 @@ def _validate_peer_exchange():
         actual = exchange(x, local_rows)
         torch.cuda.synchronize()
         assert torch.equal(expected.view(torch.int16), actual.view(torch.int16))
+        # The lm_head's entry: a GEMM writes this rank's shard into the pool.
+        hidden = torch.randn(
+            (4 * rows, 64), generator=generator, device=device, dtype=torch.bfloat16
+        )
+        head = torch.randn(
+            (64, 32320), generator=generator, device=device, dtype=torch.bfloat16
+        )
+        expected = reference(torch.mm(hidden, head), local_rows)
+        actual = exchange.produce(
+            lambda dst, a=hidden, b=head: torch.mm(a, b, out=dst), rows, local_rows
+        )
+        torch.cuda.synchronize()
+        assert torch.equal(expected.view(torch.int16), actual.view(torch.int16))
         graph, actual = _capture(
             lambda x=x, local_rows=local_rows: exchange(x, local_rows), stream
         )
