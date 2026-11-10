@@ -64,7 +64,7 @@ def step_supported(input_ids: torch.Tensor, inputs_embeds, dp_ranks: int = 0) ->
     step = getattr(md, "step", None)
     if step is None or getattr(md, "image_mask", None) is not None:
         return False
-    return step.decode and step.width == rows
+    return step.decode and step.running_tokens == rows
 
 
 class MonoDecodeModel(nn.Module):

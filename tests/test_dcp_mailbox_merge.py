@@ -232,6 +232,9 @@ class _PerTokenFp8Proj:
         return x
 
 
+_METADATA = SimpleNamespace(dcp_owned_counts=torch.ones(8, dtype=torch.int32))
+
+
 def _merge_layer(monkeypatch, seen):
     """An MLA layer under DCP whose attention and projections are stubs, with
     its merge recorded as (backend, quant dtype)."""
@@ -249,7 +252,6 @@ def _merge_layer(monkeypatch, seen):
     layer.dcp_comm_backend = "mailbox"
     layer.dcp_world_size = 4
     layer.is_sparse_mla = True
-    layer.dcp_owned_counts_buffer = torch.ones(8, dtype=torch.int32)
     layer._cp_triton_ctx = None
     layer.dcp_prefill_merge_bf16_ok = True
     layer.dcp_sparse_prefill_num_heads = 16
@@ -268,7 +270,7 @@ def _merge_layer(monkeypatch, seen):
 def test_decode_hands_its_merge_to_the_mailbox(monkeypatch):
     seen = []
     layer = _merge_layer(monkeypatch, seen)
-    layer._dcp_decode(torch.zeros(2, 16, 576), None, None, use_qrep=True)
+    layer._dcp_decode(torch.zeros(2, 16, 576), None, _METADATA, use_qrep=True)
     assert seen == [("mailbox", torch.float8_e4m3fn)]
 
 
@@ -276,7 +278,7 @@ def test_decode_hands_its_merge_to_the_mailbox(monkeypatch):
 def test_prefill_keeps_all_to_all_and_its_fused_quant(monkeypatch):
     seen = []
     layer = _merge_layer(monkeypatch, seen)
-    layer._dcp_sparse_prefill(torch.zeros(2, 16, 576), None, None, use_qrep=True)
+    layer._dcp_sparse_prefill(torch.zeros(2, 16, 576), None, _METADATA, use_qrep=True)
     assert seen == [("a2a", torch.float8_e4m3fn)]
 
 

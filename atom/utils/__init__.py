@@ -738,6 +738,12 @@ class CpuGpuBuffer:
                 )
             self.np = self.cpu.numpy()
 
+    def acquire_write(self) -> None:
+        """Claim the host source before writing it: a bound buffer waits for
+        its last publication's upload; an unbound one has nothing to wait for."""
+        if self._publication is not None:
+            self._publication.acquire_write()
+
     def copy_to_gpu(
         self, n: int | None = None, *, republish_reason: str | None = None
     ) -> torch.Tensor:

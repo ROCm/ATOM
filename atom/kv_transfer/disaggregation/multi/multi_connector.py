@@ -679,6 +679,21 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             return False
         return bool(c.enqueue_state_stores(stores))
 
+    def enqueue_state_touches(self, hashes) -> bool:
+        """State touches to the sub hosting the tier (`_state_tier_sub`);
+        False if none does."""
+        c = self._state_tier_sub()
+        if c is None:
+            return False
+        return bool(c.enqueue_state_touches(hashes))
+
+    def take_state_touch_verdicts(self) -> dict:
+        """`{hash: resident}` from the tier sub; empty if none."""
+        c = self._state_tier_sub()
+        if c is None:
+            return {}
+        return c.take_state_touch_verdicts()
+
     def take_state_reports(self):
         """`(indexed, failed)` from the tier sub, else two empty sets.
 
