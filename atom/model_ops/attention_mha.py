@@ -1815,10 +1815,14 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         scores with aiter's FlyDSL scorer into its workspace; without one the
         Triton scorer reads the BF16/FP8 cache.
         """
-        from atom.distributed.indexer_cp import exchange_candidates
+        from atom.distributed.indexer_cp import (
+            candidate_mailbox,
+            exchange_candidates,
+        )
         from atom.model_ops.minimax_m3.indexer_candidate_exchange import (
             local_candidate_keys,
             merge_candidate_keys,
+            select_exchanged_candidates,
         )
         from atom.model_ops.minimax_m3.indexer_context_parallel import (
             indexer_context_scores,
@@ -1848,6 +1852,22 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 self.indexer_cp_world,
                 max_query_len,
                 self.scale,
+            )
+        # The shape decides the path, so every rank takes the same one.
+        mailbox = candidate_mailbox()
+        if mailbox is not None and mailbox.fits(scores.shape[1], self.topk):
+            return select_exchanged_candidates(
+                scores,
+                seq_lens,
+                block_table,
+                self.topk,
+                self.indexer_cp_rank,
+                self.indexer_cp_world,
+                max_query_len,
+                self.init_blocks,
+                self.local_blocks,
+                mailbox,
+                **self._select_page_kwargs,
             )
         # Forced blocks are pinned in BOTH passes on purpose: one that lost its
         # owner shard's top-k would never arrive at the merge to be pinned.
