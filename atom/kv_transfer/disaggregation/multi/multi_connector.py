@@ -120,6 +120,26 @@ def _build_subconnectors(config: Any, role: str) -> list:
             "multi permits at most one offload sub-connector; got "
             + ", ".join(offload_subs)
         )
+    # A P/D consumer (decode instance) with an offload tier: the scheduler
+    # keys its handling of a completed receive on the connector being an
+    # offload one, so a received prefill would be resumed as a tier load and
+    # its prompt prefilled again, never handed to first decode. No recipe runs
+    # this; refuse it rather than recompute every received prompt.
+    consumers = [
+        sub["kv_connector"]
+        for sub in subs
+        if not KVConnectorFactory.is_offload_backend(
+            KVConnectorFactory.canonical_name(sub["kv_connector"])
+        )
+        and sub.get("kv_role") == "kv_consumer"
+    ]
+    if offload_subs and consumers:
+        raise ValueError(
+            "multi does not support a P/D consumer with an offload tier ("
+            + ", ".join(consumers + offload_subs)
+            + "): a received prefill would be prefilled again on the decode "
+            "instance. Run the decode instance with the P/D connector alone."
+        )
 
     connectors = []
     for i, sub in enumerate(subs):

@@ -218,6 +218,7 @@ Summed across DP ranks by `LLMEngine.get_metrics_statistics()`.
 | `atom:dp_share_cache_hit` | Counter | `share_cache` routing: requests placed on a prefix the shared tier holds. |
 | `atom:dp_share_cache_source_rank` | Counter | `share_cache` routing: requests placed on the rank still prefilling their prefix. |
 | `atom:dp_share_cache_cold` | Counter | `share_cache` routing: requests placed without a known prefix. |
+| `atom:dp_share_cache_stale` | Counter | `share_cache` routing: placements whose rank reused less of the prefix than the index listed (the tier no longer held it, or its save had not landed); the stale index entries were dropped. |
 | `atom:dp_route_explicit` / `atom:dp_route_load_balanced` | Counter | Requests routed by explicit rank / by the load balancer. Under `--dp-load-balance share_cache` the `atom:dp_share_cache_*` counters above take the place of `load_balanced`, which stays 0. |
 | `atom:dp_requests_routed` | Counter, requests | Cumulative requests per rank. Label: `rank`. |
 | `atom:dp_inflight_requests` | Gauge, requests | In-flight requests charged to each rank. Label: `rank`. |

@@ -258,3 +258,60 @@ def test_a_promoted_backup_that_also_aborts_takes_the_entry_with_it():
     assert not router.index and not router.backups
     router.select(_seq("C", PREFIX + [9] * 2_000), [0, 0], [0, 0])
     assert router.charge("C") == 0  # the prefix is cold again
+
+
+def test_a_rank_that_did_not_find_the_prefix_drops_the_stale_entries():
+    """The tier lost the prefix (failed save, eviction): the rank reports how
+    much it reused, the entries past that are dropped, and the request that
+    computes them becomes their producer."""
+    router = ShareCacheRouter(min_load_tokens=512, req_equiv=512)
+    backlog, reqs = [0, 0], [0, 0]
+    _route(router, _seq(1, PREFIX), backlog, reqs)
+    router.prefill_complete(1)
+    route, cost = _route(router, _seq(2, PREFIX + [7] * 2_000), backlog, reqs)
+    assert cost < 42_000  # placed on the prefix the index lists
+    # Its rank found only 8192 tokens.
+    assert router.note_reuse(2, 8192)
+    _, src_rank, src_seq = router._longest_hit(_seq(3, PREFIX).prompt_hash_chain)
+    assert src_seq == 2 and src_rank == route.rank  # seq 2 produces the rest
+    assert router.prefilling(2)
+    # Once seq 2 completes, the whole prefix counts as loadable again.
+    router.prefill_complete(2)
+    _, cost3 = _route(router, _seq(3, PREFIX), backlog, reqs)
+    assert cost3 == 40_000 - (40_000 // 1024) * 1024
+    # A report at the estimate (one hash block of replay below it) drops nothing.
+    assert not router.note_reuse(3, (40_000 // 1024) * 1024 - HBS)
+
+
+def test_reuse_reports_leave_entries_of_a_producer_still_prefilling():
+    router = ShareCacheRouter(min_load_tokens=512, req_equiv=512)
+    backlog, reqs = [0, 0], [0, 0]
+    first, _ = _route(router, _seq(1, PREFIX), backlog, reqs)
+    backlog[1 - first.rank] = 10**9  # keep the second on the producer's rank
+    route, cost = _route(router, _seq(2, PREFIX + [7] * 2_000), backlog, reqs)
+    assert route.rank == first.rank and cost < 42_000
+    assert not router.note_reuse(2, 0)  # seq 1 is still prefilling it
+    assert router._longest_hit(_seq(3, PREFIX).prompt_hash_chain)[2] == 1
+
+
+def test_a_released_placement_forgets_its_reuse_report():
+    router = ShareCacheRouter(min_load_tokens=512, req_equiv=512)
+    backlog, reqs = [0, 0], [0, 0]
+    _route(router, _seq(1, PREFIX), backlog, reqs)
+    router.prefill_complete(1)
+    _route(router, _seq(2, PREFIX), backlog, reqs)
+    router.release(2)
+    assert not router.note_reuse(2, 0)
+    assert router._placed == {}
+
+
+def test_the_manager_counts_stale_placements_from_rank_reports():
+    mgr = _bare_mgr()
+    mgr._store_router = ShareCacheRouter(min_load_tokens=512, req_equiv=512)
+    mgr._dp_route_counters = dict.fromkeys(ShareCacheRouter.DECISIONS, 0)
+    backlog, reqs = [0, 0], [0, 0]
+    _route(mgr._store_router, _seq(1, PREFIX), backlog, reqs)
+    mgr._store_router.prefill_complete(1)
+    _route(mgr._store_router, _seq(2, PREFIX), backlog, reqs)
+    mgr._note_dp_reuse_locked([(2, 0), ("unknown", 0)])
+    assert mgr._dp_route_counters["share_cache_stale_total"] == 1

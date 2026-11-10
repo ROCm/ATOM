@@ -79,6 +79,7 @@ class EngineCore:
         # left) pair reported to the CoreManager (`_report_prefill_backlog`).
         self._ingested_seqs = 0
         self._last_backlog_report: tuple[int, int] | None = None
+        self._next_backlog_report = 0.0
         self._kv_progress_event = threading.Event()
         self.input_queue = queue.Queue[Sequence]()
         self.output_queue = queue.Queue[list[Sequence]]()
@@ -779,19 +780,35 @@ class EngineCore:
             self._ingested_seqs += len(recv_reqs)
         return False
 
-    def _report_prefill_backlog(self) -> None:
-        """Push (seqs ingested, prefill tokens still to compute) when it changed.
+    # How often the backlog is recomputed. Walking `waiting` costs about 0.25 us
+    # a request (240 us at the 1024 the walk is capped at), on the engine
+    # thread every DP rank waits for; between two reports the CoreManager adds
+    # the charges of the requests it sent since, so a 10 ms old figure is fine.
+    BACKLOG_REPORT_INTERVAL_S = 0.01
+
+    def _report_prefill_backlog(self, now: float) -> None:
+        """Push (seqs ingested, prefill tokens still to compute, reuse reports)
+        when it changed, at most every `BACKLOG_REPORT_INTERVAL_S`.
 
         For `share_cache` DP routing, which balances on what each rank really
         has left to prefill (`Scheduler.pending_prefill_tokens`). A running seq
         that has produced tokens is decoding and counts nothing; a preempted one
-        waits to prefill again and counts what it must recompute.
+        waits to prefill again and counts what it must recompute. The reuse
+        reports (`Scheduler.dp_reuse_reports`) let the router drop prefixes this
+        rank did not find.
         """
+        if now < self._next_backlog_report:
+            return
+        self._next_backlog_report = now + self.BACKLOG_REPORT_INTERVAL_S
+        reuse = getattr(self.scheduler, "dp_reuse_reports", None)
+        reports = ()
+        if reuse:
+            reports, self.scheduler.dp_reuse_reports = reuse, []
         backlog = prefill_backlog(self.scheduler)
         report = (self._ingested_seqs, backlog)
-        if report != self._last_backlog_report:
+        if report != self._last_backlog_report or reports:
             self._last_backlog_report = report
-            self.output_queue.put_nowait(("PREFILL_BACKLOG", report))
+            self.output_queue.put_nowait(("PREFILL_BACKLOG", (*report, reports)))
 
     def _offer_tier_lookups(self, reqs) -> None:
         """Let an offload connector start tier lookups for arrived requests.
@@ -998,7 +1015,7 @@ class DPEngineCoreProc(EngineCore):
                 self.scheduler.heartbeat_throughput(now)
                 shutdown = shutdown or self.pull_and_process_input_queue()
                 if self._report_backlog:
-                    self._report_prefill_backlog()
+                    self._report_prefill_backlog(time.monotonic())
                 local_unfinished = not self.scheduler.is_finished() and not (
                     self._is_rl_weights_offloaded or self._weight_sync_fenced
                 )

@@ -832,8 +832,9 @@ class CoreManager:
                         self.latest_metrics[dp_rank] = data
                     elif request_type == EngineCoreRequestType.PREFILL_BACKLOG:
                         with self._lb_lock:
-                            self._backlog_report[dp_rank] = data
+                            self._backlog_report[dp_rank] = data[:2]
                             self._backlog_pop_seen_locked(dp_rank)
+                            self._note_dp_reuse_locked(data[2] if len(data) > 2 else ())
                     elif request_type == EngineCoreRequestType.UTILITY_RESPONSE:
                         self._route_utility_response(dp_rank, data)
                     elif request_type == EngineCoreRequestType.ADD:
@@ -1552,6 +1553,16 @@ class CoreManager:
         while self._backlog_popped[dp_rank] < target and q:
             self._backlog_unseen_tokens[dp_rank] -= q.popleft()
             self._backlog_popped[dp_rank] += 1
+
+    def _note_dp_reuse_locked(self, reports) -> None:
+        """A rank's (seq id, prompt tokens reused) reports for requests placed
+        on an estimated prefix; the router drops what the rank did not find."""
+        router = self._store_router
+        if router is None:
+            return
+        for seq_id, reused in reports:
+            if router.note_reuse(seq_id, reused):
+                self._dp_route_counters["share_cache_stale_total"] += 1
 
     def _backlog_effective_tokens_locked(self) -> list[int]:
         """Per rank: reported prefill left plus the charges of seqs sent after

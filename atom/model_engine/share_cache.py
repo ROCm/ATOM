@@ -19,6 +19,12 @@ request will compute there.
 the tier, so every rank is charged ``prompt - hit`` (a hit under the
 connector's load threshold is recomputed, so only the producer's rank gets it).
 A prefix still being prefilled is reusable only on its producer's rank.
+
+The index is a hint: a prefix it lists can be gone from the tier (a save still
+in flight or failed, an eviction) or from the producer's HBM. The rank finds
+out when it admits the request, and reports how much it really reused
+(`note_reuse`); the entries past that are dropped and the request, which
+computes them, becomes their producer.
 """
 
 from __future__ import annotations
@@ -49,6 +55,10 @@ class ShareCacheRouter:
             "Requests placed on the rank still prefilling their prefix."
         ),
         "share_cache_cold_total": "Requests placed without a known prefix.",
+        "share_cache_stale_total": (
+            "Placements whose rank reused less of the prefix than the index "
+            "listed; the stale entries were dropped."
+        ),
     }
 
     def __init__(self, min_load_tokens: int, req_equiv: int) -> None:
@@ -65,6 +75,9 @@ class ShareCacheRouter:
         self._backing: dict[Any, list[int]] = {}
         self._prefilling: set = set()
         self._est_hit: dict = {}
+        # seq id -> (prompt hash chain, estimated reuse, rank) of a placement
+        # that counted on a prefix, until its rank reports the reuse it found.
+        self._placed: dict = {}
         # Rotating tie-break, so fully tied ranks do not all go to rank 0.
         self._cursor = 0
 
@@ -75,6 +88,7 @@ class ShareCacheRouter:
         self._backing.clear()
         self._prefilling.clear()
         self._est_hit.clear()
+        self._placed.clear()
 
     # -- request lifecycle (CoreManager calls these under its lock) -----------
 
@@ -104,6 +118,7 @@ class ShareCacheRouter:
     def release(self, seq_id) -> None:
         """`seq_id` left (finished, aborted, rejected, failed send)."""
         self._est_hit.pop(seq_id, None)
+        self._placed.pop(seq_id, None)
         if seq_id not in self._prefilling:
             self.prefill_complete(seq_id)
             return
@@ -160,12 +175,51 @@ class ShareCacheRouter:
         )
         est = prompt - cost(best)
         self._est_hit[seq.id] = est
+        if est:
+            self._placed[seq.id] = (chain, est, best)
         self._record(chain, best, seq.id, reused=est)
         if hit and best == src_rank:
             return StoreRoute(best, "share_cache_source_rank_total")
         return StoreRoute(
             best, "share_cache_hit_total" if est else "share_cache_cold_total"
         )
+
+    def note_reuse(self, seq_id, reused: int) -> bool:
+        """`seq_id`'s rank admitted it and reused `reused` prompt tokens (HBM
+        hit plus tier load). Entries of the prefix it was placed on that lie
+        past that are stale: drop them, and let `seq_id`, which computes that
+        part, produce it. An entry whose producer is still prefilling is left
+        alone (its prefix is on its way). Returns whether any was dropped."""
+        placed = self._placed.pop(seq_id, None)
+        if placed is None:
+            return False
+        chain, est, rank = placed
+        hbs = int(chain.hash_block_size)
+        # The resume point can sit one hash block under the reused prefix
+        # (replay); that is not a miss.
+        if reused + hbs >= est:
+            return False
+        stride = max(1, self.STRIDE_TOKENS // hbs)
+        producing = seq_id in self._prefilling
+        dropped = False
+        for i in range(stride - 1, len(chain.hashes), stride):
+            end = (i + 1) * hbs
+            if end > est:
+                break
+            if end <= reused + hbs:
+                continue
+            h = chain.hashes[i]
+            entry = self.index.get(h)
+            if entry is None or entry[1] == seq_id or entry[1] in self._prefilling:
+                continue
+            dropped = True
+            if producing:
+                self.index[h] = (rank, seq_id)
+                self.index.move_to_end(h)
+                self.produced.setdefault(seq_id, []).append(h)
+            else:
+                del self.index[h]
+        return dropped
 
     # -- prefix index ----------------------------------------------------------
 

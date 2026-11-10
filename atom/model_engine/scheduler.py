@@ -982,6 +982,9 @@ class Scheduler:
         self._inflight_prefix_wait: dict[int, int] = {}
         # Tier loads started early, and the skip reasons of those not started.
         self._early_load = EarlyLoadState()
+        # (seq id, prompt tokens reused) of requests `share_cache` routing placed
+        # on an estimated prefix, for the CoreManager (`_note_dp_reuse`).
+        self.dp_reuse_reports: list[tuple] = []
 
     def _group_prefill_tick(self, decision: PrefillDecision) -> bool:
         """Whether some DP rank prefills this tick, from the delayer's reduce.
@@ -2671,16 +2674,13 @@ class Scheduler:
             ):
                 self.waiting.appendleft(seq)
                 break
-            self.block_manager.record_allocation(seq, hbm_probe)
-            if not self.block_manager.allocate(seq, num_cached_blocks):
+            if not self._allocate_admitted_prefill(seq, hbm_probe, num_cached_blocks):
                 # A state-less joint boundary could not be privatised without
                 # risking a shared decoding sequence's blocks (finding #2).
                 # Return the seq to waiting for a clean recompute once the pool
                 # has room, and stop admitting this pass.
-                self.block_manager.deallocate(seq)
                 self.waiting.appendleft(seq)
                 break
-            self._allocate_prefill_draft_lookahead(seq)
 
             # Detached before the alloc notification, which reads the save
             # floor `detach_lookup` sets.
@@ -2697,29 +2697,7 @@ class Scheduler:
                 self.waiting.appendleft(seq)
                 break
 
-            # The hit the request kept, not the one `can_allocate` offered:
-            # `allocate` may disown the boundary, and `num_cached_blocks` is the
-            # pre-disown count. `seq.num_cached_tokens` also gets the unit right
-            # under DCP, and is what EngineStats uses, so the user-visible number
-            # and the internal hit rate cannot disagree.
-            #
-            # Guard: PD decode consumer inherits hit from prefill node;
-            # don't clobber with the local hit (always 0 on consumer).
-            if not seq.prefix_cache_hit_tokens:
-                # The gated HBM hit, not the chunk floor `allocate` may have
-                # lowered `num_cached_tokens` to. `[floor, hbm)` is refilled
-                # from CPU but was already resident; recording the floor makes
-                # that slice look like a CPU-tier load.
-                recorded = seq.num_cached_tokens
-                if (
-                    seq.offload_joint.boundary_tokens
-                    and seq.offload_joint.hbm_hit_tokens > recorded
-                ):
-                    recorded = seq.offload_joint.hbm_hit_tokens
-                seq.prefix_cache_hit_tokens = recorded
-
-            self._lookup_detach_declined.discard(seq.id)
-            self._notify_connector_after_prefill_alloc(seq)
+            self._finish_prefill_admission(seq)
 
             # A replay that loads its KV first parks for that load whatever the
             # lookup answered: the answer was the state-carrying hit, which a
@@ -2730,25 +2708,13 @@ class Scheduler:
             )
 
             if needs_remote_load:
-                oj = seq.offload_joint
-                if oj.load_hash != -1 and not oj.boundary_tokens:
-                    # Two transfers but one report: the first completion would
-                    # unpark the request while the other is still writing. Only
-                    # reachable when the legs were decided separately -- a joint
-                    # load arrives as one event via `_JointPark`.
-                    logger.warning(
-                        "seq %s has both a remote KV load and a state load "
-                        "pending, with no joint boundary; dropping the state "
-                        "load.",
-                        seq.id,
-                    )
-                    if not self.block_manager.cancel_state_load(seq):
-                        # Disown could not be backed (finding #2); requeue for a
-                        # clean recompute instead of parking a load into shared
-                        # blocks.
-                        self.block_manager.deallocate(seq)
-                        self.waiting.appendleft(seq)
-                        break
+                if not self._drop_state_leg_of_kv_load(seq):
+                    # Disown could not be backed (finding #2); requeue for a
+                    # clean recompute instead of parking a load into shared
+                    # blocks.
+                    self.block_manager.deallocate(seq)
+                    self.waiting.appendleft(seq)
+                    break
                 self._park_for_remote_load(seq, skipped_waiting_requests)
                 self._inflight_prefix_wait.pop(seq.id, None)
                 continue
@@ -3939,6 +3905,7 @@ class Scheduler:
         num_seqs_prefill += 1
         self._early_load.note_prefill(seq.id)
         self._record_cache_reuse(seq)
+        self._note_dp_reuse(seq)
         self._tick_cost += self._chunk_cost(seq.num_cached_tokens, chunk)
         num_batched_tokens += chunk
         seq.status = SequenceStatus.RUNNING
@@ -3947,6 +3914,73 @@ class Scheduler:
         scheduled_seqs[seq.id] = seq
         num_scheduled_tokens.append(chunk)
         return num_seqs_prefill, num_batched_tokens
+
+    def _allocate_admitted_prefill(
+        self, seq: Sequence, hbm_probe: AdmissionProbe, num_cached_blocks: int
+    ) -> bool:
+        """Admission's allocation (Phase 2 and early load): commit the probe,
+        allocate keeping `num_cached_blocks` of HBM hit, and the draft round's
+        lookahead. False, with the seq deallocated, when `allocate` refused."""
+        self.block_manager.record_allocation(seq, hbm_probe)
+        if not self.block_manager.allocate(seq, num_cached_blocks):
+            self.block_manager.deallocate(seq)
+            return False
+        self._allocate_prefill_draft_lookahead(seq)
+        return True
+
+    def _finish_prefill_admission(self, seq: Sequence) -> None:
+        """After `_allocate_admitted_prefill`: record the prefix hit and tell
+        the connector about the allocation."""
+        # The hit the request kept, not the one `can_allocate` offered:
+        # `allocate` may disown the boundary, and the probe's block count is the
+        # pre-disown count. `seq.num_cached_tokens` also gets the unit right
+        # under DCP, and is what EngineStats uses, so the user-visible number
+        # and the internal hit rate cannot disagree.
+        #
+        # Guard: PD decode consumer inherits hit from prefill node;
+        # don't clobber with the local hit (always 0 on consumer).
+        if not seq.prefix_cache_hit_tokens:
+            # The gated HBM hit, not the chunk floor `allocate` may have
+            # lowered `num_cached_tokens` to. `[floor, hbm)` is refilled
+            # from CPU but was already resident; recording the floor makes
+            # that slice look like a CPU-tier load.
+            recorded = seq.num_cached_tokens
+            if (
+                seq.offload_joint.boundary_tokens
+                and seq.offload_joint.hbm_hit_tokens > recorded
+            ):
+                recorded = seq.offload_joint.hbm_hit_tokens
+            seq.prefix_cache_hit_tokens = recorded
+        self._lookup_detach_declined.discard(seq.id)
+        self._notify_connector_after_prefill_alloc(seq)
+
+    def _drop_state_leg_of_kv_load(self, seq: Sequence) -> bool:
+        """For a request about to park for a KV load: drop a state load pending
+        beside it with no joint boundary. Two transfers but one report: the
+        first completion would unpark the request while the other is still
+        writing. Only reachable when the legs were decided separately -- a
+        joint load arrives as one event via `_JointPark`. False when the state
+        load could not be cancelled (its disown could not be backed); the
+        caller must not park then."""
+        oj = seq.offload_joint
+        if oj.load_hash == -1 or oj.boundary_tokens:
+            return True
+        logger.warning(
+            "seq %s has both a remote KV load and a state load pending, with no "
+            "joint boundary; dropping the state load.",
+            seq.id,
+        )
+        return bool(self.block_manager.cancel_state_load(seq))
+
+    def _note_dp_reuse(self, seq: Sequence) -> None:
+        """Report, once, how much of its prompt `seq` reused, if `share_cache`
+        routing placed it on an estimated prefix (`dp_est_cached_tokens`): the
+        router drops index entries this rank did not find
+        (`ShareCacheRouter.note_reuse`)."""
+        est = getattr(seq, "dp_est_cached_tokens", 0)
+        if est:
+            seq.dp_est_cached_tokens = 0
+            self.dp_reuse_reports.append((seq.id, int(seq.num_cached_tokens)))
 
     def _allocate_prefill_draft_lookahead(self, seq: Sequence) -> None:
         """Allocate the blocks past the prompt that its draft round writes.
@@ -4327,43 +4361,25 @@ class Scheduler:
 
         Returns False when the pool could not take the request (nothing is
         changed); True otherwise, whether the request parked or was taken back.
-        The steps and their order are Phase 2's; what differs is that a result
-        that would prefill locally (a refused load) is undone instead.
-
-        TODO: this repeats Phase 2's admission sequence (record, allocate,
-        draft lookahead, prefix-hit bookkeeping, connector notification, remote
-        load confirmation, park). Factor that sequence into one helper both
-        Phase 2 and this call, so the two cannot drift apart.
+        Phase 2's steps, through the same helpers (`_allocate_admitted_prefill`,
+        `_finish_prefill_admission`, `_confirm_remote_load_after_alloc`,
+        `_drop_state_leg_of_kv_load`); what differs is that a result that would
+        prefill locally (a refused load) is undone instead.
         """
         state = self._early_load
         prev_hit = seq.prefix_cache_hit_tokens
-        self.block_manager.record_allocation(seq, hbm_probe)
-        if not self.block_manager.allocate(seq, hbm_probe.num_cached_blocks):
-            self.block_manager.deallocate(seq)
+        if not self._allocate_admitted_prefill(
+            seq, hbm_probe, hbm_probe.num_cached_blocks
+        ):
             seq.prefix_cache_hit_tokens = prev_hit
             return False
-        self._allocate_prefill_draft_lookahead(seq)
-        if not seq.prefix_cache_hit_tokens:
-            recorded = seq.num_cached_tokens
-            if (
-                seq.offload_joint.boundary_tokens
-                and seq.offload_joint.hbm_hit_tokens > recorded
-            ):
-                recorded = seq.offload_joint.hbm_hit_tokens
-            seq.prefix_cache_hit_tokens = recorded
-        self._lookup_detach_declined.discard(seq.id)
-        self._notify_connector_after_prefill_alloc(seq)
+        self._finish_prefill_admission(seq)
         parks = self._confirm_remote_load_after_alloc(
             seq, needs_remote_load or seq.replay_kv_load
         )
         oj = seq.offload_joint
         if parks:
-            # Two transfers, one report (see Phase 2): drop the state one.
-            if (
-                oj.load_hash != -1
-                and not oj.boundary_tokens
-                and not self.block_manager.cancel_state_load(seq)
-            ):
+            if not self._drop_state_leg_of_kv_load(seq):
                 self._early_load_take_back(seq, prev_hit, cancel_state=False)
                 return True
         elif oj.boundary_tokens or oj.load_hash == -1:

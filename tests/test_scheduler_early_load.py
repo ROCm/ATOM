@@ -688,3 +688,21 @@ def test_a_finished_tier_load_has_an_age_and_a_failed_one_is_not_admittable(
     sched.finished_recving_kv_req_ids = [failed.id]
     assert list(sched._waiting_prefills()) == []
     assert sched._oldest_waiting_prefill_age_ms() == 0.0
+
+
+def test_a_routed_estimate_is_reported_once_with_the_reuse_found(
+    monkeypatch, seq_factory
+):
+    """`share_cache` routing placed the request on a 48-token prefix; the rank
+    reports what it really reused, once, when the request first prefills."""
+    sched = _sched(monkeypatch)
+    seq = seq_factory(list(range(64)))
+    seq.dp_est_cached_tokens = 48
+    seq.num_cached_tokens = 16
+    for _ in range(2):
+        sched._note_dp_reuse(seq)
+    assert sched.dp_reuse_reports == [(seq.id, 16)]
+    assert seq.dp_est_cached_tokens == 0
+    unplaced = seq_factory(list(range(64)))
+    sched._note_dp_reuse(unplaced)
+    assert sched.dp_reuse_reports == [(seq.id, 16)]

@@ -1028,6 +1028,32 @@ def test_two_offload_subs_are_refused_before_either_is_built(monkeypatch, sub_na
     assert built == []
 
 
+@pytest.mark.parametrize("pd", ["mooncake", "moriio"])
+def test_a_pd_consumer_with_an_offload_tier_is_refused(monkeypatch, pd):
+    """The scheduler would resume a received prefill as a tier load and prefill
+    the prompt again on the decode instance, never reaching first decode."""
+    built = []
+    import atom.kv_transfer.disaggregation.factory as factory_mod
+
+    monkeypatch.setattr(
+        factory_mod.KVConnectorFactory,
+        "create_connector",
+        staticmethod(lambda config, role: built.append(config)),
+    )
+    config = SimpleNamespace(
+        kv_transfer_config={
+            "kv_connector": "multi",
+            "connectors": [
+                {"kv_connector": pd, "kv_role": "kv_consumer"},
+                {"kv_connector": "mooncake_store"},
+            ],
+        }
+    )
+    with pytest.raises(ValueError, match="P/D consumer with an offload tier"):
+        mc_module._build_subconnectors(config, role="scheduler")
+    assert built == []
+
+
 def test_one_offload_sub_beside_a_producer_is_built(monkeypatch):
     _patch_factory(
         monkeypatch,
