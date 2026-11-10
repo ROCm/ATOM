@@ -226,8 +226,7 @@ def triton_topk_softmax_rows(
     scoring_func = fused_shared_experts_scoring_func
     num_shared = 0 if scoring_func is None else num_fused_shared_experts
     if not (
-        renormalize
-        and scoring_func in (None, "sigmoid")
+        scoring_func in (None, "sigmoid")
         and 32 <= num_experts <= 512
         and num_experts & (num_experts - 1) == 0
         and 4 <= topk <= 32
@@ -265,7 +264,6 @@ def rocm_aiter_topk_softmax_impl(
     device = gating_output.device
     if num_fused_shared_experts > 0:
         total_topk_weights, total_topk_ids = topk_meta_rows(token)
-        # The kernel scores the shared columns too when given a scoring func.
         topk_weights = total_topk_weights
         topk_ids = total_topk_ids[:, :topk]
     else:
@@ -277,6 +275,9 @@ def rocm_aiter_topk_softmax_impl(
     num_scored_shared = (
         0 if fused_shared_experts_scoring_func is None else num_fused_shared_experts
     )
+    # Auto-gate: runs Triton for small batches on supported HW.
+    # Must call triton_topk_softmax_rows with the original scoring_func
+    # (before None→"" conversion) so that None matches properly.
     triton_max_rows = triton_topk_softmax_rows(
         gating_output.shape[1] - num_scored_shared,
         topk,
@@ -296,6 +297,7 @@ def rocm_aiter_topk_softmax_impl(
             gating_output,
             fused_shared_experts_for_kernel,
             num_valid_rows,
+            renormalize=renormalize,
         )
     else:
         topk_softmax(

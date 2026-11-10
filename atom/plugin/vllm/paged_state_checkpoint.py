@@ -47,6 +47,17 @@ logger = logging.getLogger("atom")
 # ---------------------------------------------------------------------------
 
 
+def native_checkpoint_defaults() -> tuple[int, bool]:
+    """ATOM's own defaults for the checkpoint interval and on-demand stores."""
+    from atom.config import Config
+
+    fields = Config.__dataclass_fields__
+    return (
+        int(fields["state_checkpoint_interval_tokens"].default),
+        bool(fields["state_checkpoint_demand"].default),
+    )
+
+
 class PagedStateCheckpointAdapter:
     """One model family's side of the state checkpoint path.
 
@@ -69,6 +80,10 @@ class PagedStateCheckpointAdapter:
     backend_cls: type | None = None
     #: The drafters ``drafter_state_in_checkpoint`` accepts, for the refusal message.
     state_checkpoint_drafters: str = ""
+    #: Whether `_kv_cache_configs_hook` sizes the pool with checkpoints off. A
+    #: family that withholds its STATE tail elsewhere then sets it False, so
+    #: the tail is withheld once.
+    sizes_pool_without_checkpoints: bool = True
 
     @property
     def proxy_layer_name(self) -> str:
@@ -88,7 +103,22 @@ class PagedStateCheckpointAdapter:
 
     def checkpoint_defaults(self) -> tuple[int, bool]:
         """Native (state_checkpoint_interval_tokens, state_checkpoint_demand)."""
-        raise NotImplementedError
+        return native_checkpoint_defaults()
+
+    #: Tokens a prefix hit leaves to compute under speculative decoding; see
+    #: `prefill_tail`. One is vLLM's own floor.
+    speculative_prefill_tail: int = 1
+
+    def prefill_tail(self, vllm_config) -> int:
+        """Tokens a prefix hit must leave to compute in this run.
+
+        The one owner of the rule: the checkpoint scheduler's anchor and chunk
+        cut, the local hit cap, and an offload connector's external hit cap
+        and lookup extent all read it, so they cannot disagree.
+        """
+        if getattr(vllm_config, "speculative_config", None) is None:
+            return 1
+        return int(self.speculative_prefill_tail)
 
     def drafter_state_in_checkpoint(self, vllm_config) -> bool:
         """Whether the configured speculative drafter keeps all of its state in
@@ -406,6 +436,8 @@ def _kv_cache_configs_hook(original, vllm_config, kv_cache_specs, available_memo
 
     bs = adapter.block_size
     pc = state_checkpoints_on(adapter, vllm_config)
+    if not pc and not adapter.sizes_pool_without_checkpoints:
+        return original(vllm_config, kv_cache_specs, available_memory)
     if pc:
         adapter.check_state_checkpoints_supported(vllm_config)
         spec = getattr(vllm_config, "speculative_config", None)
@@ -605,7 +637,11 @@ def store_counts() -> dict:
 
 
 def register_slot_allocator(allocator) -> None:
-    """``allocator.release(req_ids)`` gets vLLM's finished / preempted / resumed ids."""
+    """``allocator.release(req_ids)`` gets vLLM's finished / preempted / resumed ids.
+
+    Anything that keys per-slot records by request id registers here, so the
+    records go when the request does.
+    """
     if not any(a is allocator for a in _slot_allocators):
         _slot_allocators.append(allocator)
 
@@ -821,10 +857,19 @@ def execute_state_checkpoint_restores(copier, slots, units) -> None:
     copier.execute_paged_state_copies([], _ops(copier, slots, units, False), 0)
 
 
-def execute_state_checkpoint_stores(copier, slots, units) -> None:
+#: Descriptor buffers: restores on 0, boundary stores on 1, decode keeps on 2.
+#: A step can store both a prefill boundary and a decode keep; sharing one
+#: buffer made the second wait on the CPU for the first's upload, which is
+#: queued behind the whole forward.
+_DECODE_KEEP_DESCRIPTOR_SLOT = 2
+
+
+def execute_state_checkpoint_stores(copier, slots, units, descriptor_slot=1) -> None:
     if not slots:
         return
-    copier.execute_paged_state_copies(_ops(copier, slots, units, True), [], 1)
+    copier.execute_paged_state_copies(
+        _ops(copier, slots, units, True), [], descriptor_slot
+    )
 
 
 def flush_state_checkpoint_stores(model) -> None:
@@ -860,8 +905,14 @@ def plan_state_checkpoint_ops(
     block: int,
     is_target: bool,
     name: str,
+    starts=None,
 ) -> None:
     """Restores for this step's prefix hits; stores where the scheduler hashed.
+
+    ``starts``: each row's exact first position this step, when the caller
+    already derived it from the step's own ``seq_lens - query_lens``. Without
+    it the decode keeps read the input batch (`_exact_starts`), whose V2
+    count is an optimistic upper bound.
 
     A row bound to a fresh slot with ``chunk_start > 0`` resumes from a cached
     prefix (a cross-request hit, or a preempted request's own blocks): its slot
@@ -897,7 +948,8 @@ def plan_state_checkpoint_ops(
 
     req_ids = list(get_current_req_ids() or [])[:rows]
     if worker.decode_candidates or _decode_plan:
-        starts = _exact_starts(rows, name)
+        if starts is None:
+            starts = _exact_starts(rows, name)
         store_decode_keeps(worker, req_ids, starts, fresh_rows)
         record_decode_candidates(worker, req_ids, slots, starts, lens, block, name)
     for i in resumed:
@@ -981,7 +1033,9 @@ def store_decode_keeps(worker, req_ids, starts, fresh_rows) -> None:
             raise RuntimeError(
                 "decode keep state checkpoint stores reached a CUDA graph capture"
             )
-        execute_state_checkpoint_stores(worker.copier, slots, units)
+        execute_state_checkpoint_stores(
+            worker.copier, slots, units, _DECODE_KEEP_DESCRIPTOR_SLOT
+        )
         _store_counts["decode_keep"] += len(slots)
 
 

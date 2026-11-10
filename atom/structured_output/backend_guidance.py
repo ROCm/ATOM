@@ -9,7 +9,13 @@ from llguidance import LLMatcher, LLTokenizer, TokenizerWrapper
 from llguidance.hf import from_tokenizer
 from llguidance.torch import fill_next_token_bitmask
 
-from .schema import check_schema_safety, normalize_schema
+from .dsml_grammar import dsml_grammar
+from .schema import check_schema_safety, expansion_budget, normalize_schema
+
+
+def _prepare_schema(value, budget):
+    check_schema_safety(value)
+    return normalize_schema(value, budget)
 
 
 class _VisibleAddedTokenAdapter:
@@ -30,7 +36,26 @@ class _VisibleAddedTokenAdapter:
         return self.source.tokenize_bytes(value)
 
 
+def tiktoken_tokenizer(encoding, vocab_size, stop_ids):
+    """The trie of a slow tiktoken tokenizer (Kimi-K3), which has no
+    serializable fast backend for `from_tokenizer`. Its special tokens stay
+    special: a grammar names them as tokens and text rules cannot match them."""
+    return LLTokenizer.from_tiktoken(
+        encoder=encoding._mergeable_ranks,
+        special_tokens=encoding._special_tokens,
+        pattern=encoding._pat_str,
+        eos_token=list(stop_ids),
+        n_vocab=vocab_size,
+        slices=[],
+    )
+
+
 def grammar_tokenizer(tokenizer, vocab_size, stop_ids):
+    encoding = getattr(tokenizer, "model", None)
+    if getattr(tokenizer, "backend_tokenizer", None) is None and hasattr(
+        encoding, "_mergeable_ranks"
+    ):
+        return tiktoken_tokenizer(encoding, vocab_size, stop_ids)
     source = from_tokenizer(tokenizer, n_vocab=vocab_size, eos_token=stop_ids)
     # llguidance 1.9.1 classifies HF added tokens as grammar specials even
     # when HF marks them special=False. Its mask can then allow <think> as
@@ -75,43 +100,40 @@ class GrammarCompiler:
         self.tokenizer = tokenizer
 
     def compile_json_schema(self, schema, tool_format=None, reasoning_end=""):
-        value = json.loads(schema)
-        check_schema_safety(value)
-        value = normalize_schema(value)
-        if isinstance(value, dict):
-            # This is an API JSON Schema, not a backend configuration object.
-            # In particular, clients must not enable lenient/coerce_one_of or
-            # replace JSON punctuation through an x-guidance annotation.
-            value.pop("x-guidance", None)
-        grammar = LLMatcher.grammar_from_json_schema(
-            value, overrides={"lenient": False, "coerce_one_of": False}
-        )
+        """Compile a JSON Schema answer, DSML tool calls, or either of them, or
+        a tool-call grammar a parser declared (``"kind": "lark"``).
+
+        ``schema`` is ``None`` when only strict tools constrain the reply.
+        The answer and every strict parameter are normalized from one
+        expansion budget, as a single schema's siblings are.
+        """
+        if tool_format and json.loads(tool_format).get("kind") == "lark":
+            # A tool-call grammar the parser declared; no response schema.
+            grammar = LLMatcher.grammar_from_lark(json.loads(tool_format)["grammar"])
+            return self._matcher(grammar)
+        budget = expansion_budget()
+        value = None
+        if schema is not None:
+            value = _prepare_schema(json.loads(schema), budget)
+            if isinstance(value, dict):
+                # This is an API JSON Schema, not a backend configuration object.
+                # In particular, clients must not enable lenient/coerce_one_of or
+                # replace JSON punctuation through an x-guidance annotation.
+                value.pop("x-guidance", None)
         if tool_format:
-            spec = json.loads(tool_format)
-            prefix, section = spec["prefix"], spec["section"]
-            # Only the response text is constrained by response_format. Normal
-            # function calls use the parser's native envelope, not beta strict
-            # argument schemas. Names and structural strings are quoted literals.
-            q = json.dumps
-            headers = " | ".join(
-                q("<" + prefix + 'invoke name="' + name + '">')
-                for name in spec["names"]
-            )
-            root = "calls" if spec["required"] else "answer | calls"
-            value = (
-                dict(
-                    value, **{"x-guidance": {"lenient": False, "coerce_one_of": False}}
-                )
-                if isinstance(value, dict)
-                else value
-            )
-            lark = (
-                f"start: {root}\nanswer: %json {q(value)}\n"
-                f"calls: {q('<' + prefix + section + '>')} invoke+ {q('</' + prefix + section + '>')}\n"
-                f"invoke: INVOKE_OPEN body\nINVOKE_OPEN: {headers}\n"
-                f"body[suffix={q('</' + prefix + 'invoke>')}]: /(.|\\n)*/\n%ignore /[ \\t\\r\\n]+/\n"
+            # Only the response text is constrained by response_format; a
+            # function call uses the parser's native envelope, its arguments
+            # constrained only for strict tools.
+            lark = dsml_grammar(
+                json.loads(tool_format),
+                value,
+                lambda parameter: _prepare_schema(parameter, budget),
             )
             grammar = {"grammars": [{"lark_grammar": lark}]}
+        else:
+            grammar = LLMatcher.grammar_from_json_schema(
+                value, overrides={"lenient": False, "coerce_one_of": False}
+            )
         if reasoning_end:
             q = json.dumps
             if not tool_format:
@@ -119,6 +141,9 @@ class GrammarCompiler:
             lark = lark.replace("start: ", "start: reasoning response\nresponse: ", 1)
             lark += f"reasoning[suffix={q(reasoning_end)}]: /(.|\\n)*/\n"
             grammar = {"grammars": [{"lark_grammar": lark}]}
+        return self._matcher(grammar)
+
+    def _matcher(self, grammar):
         matcher = LLMatcher(self.tokenizer, grammar, log_level=0)
         if matcher.is_error():
             raise ValueError(matcher.get_error())
