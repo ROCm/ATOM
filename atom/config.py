@@ -2432,6 +2432,11 @@ class Config:
                 or self.parallel_config.data_parallel_size_local != 8
             ):
                 raise ValueError("mega_internode requires two-node EP16")
+            if not (self.enable_dp_attention or self.moe_ep_flatten_tp_across_dp):
+                raise ValueError(
+                    "mega_internode requires enable_dp_attention or "
+                    "moe_ep_flatten_tp_across_dp to shard experts across DP ranks"
+                )
             if self.enable_tbo or self.enable_tbo_decode:
                 raise ValueError(
                     "mega_internode supports one in-flight forward per instance; disable TBO"

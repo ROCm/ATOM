@@ -699,10 +699,16 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                     "unsupported on the inter-node MoRI kernels."
                 )
 
-            from atom.model_ops.fused_moe.mori_chunked_experts import benchmark_chunk_size
+            from atom.model_ops.fused_moe.mori_chunked_experts import (
+                benchmark_chunk_size,
+            )
 
             moe_chunk_size = benchmark_chunk_size()
-            mori_capacity = min(moe.max_num_tokens, moe_chunk_size) if moe_chunk_size else moe.max_num_tokens
+            mori_capacity = (
+                min(moe.max_num_tokens, moe_chunk_size)
+                if moe_chunk_size
+                else moe.max_num_tokens
+            )
             all_to_all_args = {
                 "rank": all2all_manager.rank,
                 "num_ep_ranks": all2all_manager.world_size,
@@ -796,11 +802,16 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             )
 
             if isinstance(prepare_finalize, MoriPrepareAndFinalize):
-                from atom.model_ops.fused_moe.mori_chunked_experts import MoriChunkedExperts, benchmark_chunk_size
+                from atom.model_ops.fused_moe.mori_chunked_experts import (
+                    MoriChunkedExperts,
+                    benchmark_chunk_size,
+                )
 
                 chunk_size = benchmark_chunk_size()
                 if chunk_size:
-                    self.fused_experts = MoriChunkedExperts(self.fused_experts, chunk_size)
+                    self.fused_experts = MoriChunkedExperts(
+                        self.fused_experts, chunk_size
+                    )
 
             # The v2 fused transport (MegaMoE) runs the whole layer, so it must be
             # told the expert-GEMM recipe that only the layer + this quant method
@@ -2645,6 +2656,25 @@ class MegaInternodeMxfp4MoEMethod(Mxfp4MoEMethod):
     """MXFP4 routed experts backed by the two-node EP16 A4W4 pipeline."""
 
     def __init__(self, quant_config: LayerQuantConfig, moe: FusedMoEConfig):
+        parallel = moe.moe_parallel_config
+        if (
+            not parallel.use_ep
+            or parallel.ep_size != 16
+            or parallel.dp_size != 16
+            or parallel.local_ep_size != 8
+            or parallel.dp_logical_ratio != 1
+        ):
+            raise ValueError(
+                "mega_internode requires actual two-node EP16 expert sharding"
+            )
+        # The inherited routing/layout/forward paths use this selector to keep
+        # rows local. Refuse the DP-gather fallback before allocating weights.
+        if not parallel.use_mori_kernels:
+            raise ValueError(
+                "mega_internode requires the MoRI all-to-all path: use "
+                "moe_all2all_backend='auto' or 'mori', install MoRI, and unset "
+                "ATOM_DISABLE_MORI_EP"
+            )
         super().__init__(quant_config, moe)
         self.use_triton = False
         self.use_triton_ep = False

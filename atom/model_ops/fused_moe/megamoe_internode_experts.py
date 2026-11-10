@@ -30,8 +30,11 @@ checkpoint layout (gate rows then up rows).
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 from contextlib import ExitStack
+from pathlib import Path
 
 import torch
 
@@ -101,9 +104,19 @@ def _rank_world():
 
 
 def _get_instance(
-    mtpr, *, model_dim, inter_dim, experts, topk, layer, activation, swiglu_limit
+    mtpr,
+    *,
+    model_dim,
+    inter_dim,
+    experts,
+    topk,
+    layer,
+    activation,
+    swiglu_limit,
+    situ_beta=1.0,
+    situ_linear_beta=1.0,
 ):
-    # activation/swiglu_limit are baked into GEMM1 at compile time: part of the key.
+    # Activation parameters are baked into GEMM1 at compile time.
     rank, world = _rank_world()
     key = (
         torch.cuda.current_device(),
@@ -116,6 +129,8 @@ def _get_instance(
         topk,
         activation,
         swiglu_limit,
+        situ_beta,
+        situ_linear_beta,
     )
     inst = _INSTANCES.get(key)
     if inst is None:
@@ -125,7 +140,7 @@ def _get_instance(
             )
         from aiter.ops.flydsl.kernels.mega_moe_internode import MegaMoEInternode
 
-        with torch.inference_mode(False), torch.no_grad():
+        with ExitStack() as cleanup, torch.inference_mode(False), torch.no_grad():
             op = MegaMoEInternode(
                 rank=rank,
                 world_size=world,
@@ -141,37 +156,26 @@ def _get_instance(
                 max_tok_per_rank=mtpr,
                 act=activation,
                 swiglu_limit=swiglu_limit,
+                situ_beta=situ_beta,
+                situ_linear_beta=situ_linear_beta,
             )
-        dev = op.device
-        epr = experts // world
-        inst = {
-            "op": op,
-            "x": torch.zeros(mtpr, model_dim, dtype=torch.bfloat16, device=dev),
-            "ids": torch.full((mtpr, topk), -1, dtype=torch.int32, device=dev),
-            "wts": torch.zeros(mtpr, topk, dtype=torch.float32, device=dev),
-        }
-        import json
-        import os
-        from pathlib import Path
-
-        audit = {"rank": rank, "capacity": mtpr, "quant": op.quant,
-                 "stage1": op._s1_tile, "paired_tune": op._s2_tuned,
-                 "gemm2_bn": op._gemm2_bn, "gemm2_bm": op._gemm2_bm,
-                 "gemm2_cu": op._gemm2_cu, "return_chunk_tokens": op._chunk_tokens,
-                 "stage2_sdma": op._stage2_sdma,
-                 "stage1_kernel": op.stage1_kernel_name,
-                 "tune_path": os.environ.get("AITER_CONFIG_MEGAMOE_INTERNODE")}
-        audit_dir = Path(os.environ["ATOM_TORCH_PROFILER_DIR"]).parent / "tune_audit"
-        audit_dir.mkdir(exist_ok=True)
-        (audit_dir / f"rank{rank}_capacity{mtpr}.json").write_text(json.dumps(audit, indent=2) + "\n")
-        logger.info("[MEGA-TUNE] %s", json.dumps(audit))
-        _INSTANCES[key] = inst
+            cleanup.callback(op.close)
+            dev = op.device
+            inst = {
+                "op": op,
+                "x": torch.zeros(mtpr, model_dim, dtype=torch.bfloat16, device=dev),
+                "ids": torch.full((mtpr, topk), -1, dtype=torch.int32, device=dev),
+                "wts": torch.zeros(mtpr, topk, dtype=torch.float32, device=dev),
+            }
+            _INSTANCES[key] = inst
+            cleanup.pop_all()  # The cache now owns the operator's teardown.
+        _write_tune_audit(op, rank, mtpr)
         if rank == 0:
             logger.info(
                 "[MEGA-INTERNODE] built capacity=%d ep=%d experts/rank=%d topk=%d",
                 mtpr,
                 world,
-                epr,
+                experts // world,
                 topk,
             )
             logger.info(
@@ -181,6 +185,36 @@ def _get_instance(
                 op._single_kernel,
             )
     return inst
+
+
+def _write_tune_audit(op, rank, mtpr) -> None:
+    """Optional profiler artifact; an audit failure must not break serving."""
+    profiler_dir = os.environ.get("ATOM_TORCH_PROFILER_DIR")
+    if not profiler_dir:
+        return
+    try:
+        audit = {
+            "rank": rank,
+            "capacity": mtpr,
+            "quant": op.quant,
+            "stage1": op._s1_tile,
+            "paired_tune": op._s2_tuned,
+            "gemm2_bn": op._gemm2_bn,
+            "gemm2_bm": op._gemm2_bm,
+            "gemm2_cu": op._gemm2_cu,
+            "return_chunk_tokens": op._chunk_tokens,
+            "stage2_sdma": op._stage2_sdma,
+            "stage1_kernel": op.stage1_kernel_name,
+            "tune_path": os.environ.get("AITER_CONFIG_MEGAMOE_INTERNODE"),
+        }
+        audit_dir = Path(profiler_dir).parent / "tune_audit"
+        audit_dir.mkdir(parents=True, exist_ok=True)
+        (audit_dir / f"rank{rank}_capacity{mtpr}.json").write_text(
+            json.dumps(audit, indent=2) + "\n", encoding="utf-8"
+        )
+        logger.info("[MEGA-TUNE] %s", json.dumps(audit))
+    except (OSError, TypeError, ValueError, AttributeError):
+        logger.warning("[MEGA-TUNE] unable to write optional tune audit", exc_info=True)
 
 
 def _run_chunk(inst, layer, x, ids, wts, start, n):
@@ -235,6 +269,7 @@ class MegaInternodeFusedExperts:
         apply_router_weight_on_input: bool = False,
         expert_map=None,
         x_scale=None,
+        moe_extra_args=None,
         **_ignored,
     ) -> torch.Tensor:
         from aiter import ActivationType
@@ -244,9 +279,17 @@ class MegaInternodeFusedExperts:
             raise NotImplementedError("mega_internode: apply_router_weight_on_input")
         if activation == ActivationType.Situv2:
             act, limit = "situv2", 0.0
+            extra = moe_extra_args or {}
+            beta = extra.get("beta", getattr(self._layer, "activation_situ_beta", None))
+            linear_beta = extra.get(
+                "linear_beta", getattr(self._layer, "activation_situ_linear_beta", None)
+            )
+            beta = 1.0 if beta is None else float(beta)
+            linear_beta = 1.0 if linear_beta is None else float(linear_beta)
         elif activation in (None, ActivationType.Silu):
             # SwiGLU; a positive swiglu_limit (DeepSeek-V4: 10) clamps it.
             act, limit = "silu", float(getattr(self._layer, "swiglu_limit", 0.0) or 0.0)
+            beta = linear_beta = 1.0
         else:
             raise NotImplementedError(
                 f"mega_internode: unsupported activation {activation}"
@@ -266,6 +309,8 @@ class MegaInternodeFusedExperts:
             "layer": layer,
             "activation": act,
             "swiglu_limit": limit,
+            "situ_beta": beta,
+            "situ_linear_beta": linear_beta,
         }
         # Same construction order on every rank (symmetric allocations).
         inst_p = _get_instance(self._prefill_mtpr, **build)

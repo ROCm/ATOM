@@ -28,8 +28,15 @@ class RoutedRowsWire:
         if self.quant_type is None:
             return x, None
         if x.shape[0] == 0:
+            # FP4 packs two hidden elements per byte, including empty chunks
+            # sent by a rank that exhausts its input before its peers.
+            shape = (
+                (*x.shape[:-1], x.shape[-1] // 2)
+                if self.dtype == dtypes.fp4x2
+                else x.shape
+            )
             return (
-                torch.empty(x.shape, dtype=self.dtype, device=x.device),
+                torch.empty(shape, dtype=self.dtype, device=x.device),
                 torch.empty(
                     (0, self.scale_dim), dtype=self.scale_dtype, device=x.device
                 ),
