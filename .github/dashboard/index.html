@@ -514,7 +514,6 @@ const rawData = window.BENCHMARK_DATA || {
   entries: {},
 };
 const DASHBOARD_MODES = ['AgentX', 'Aggregated', 'Disaggregated'];
-const NON_AGENTX_MODES = ['Aggregated', 'Disaggregated'];
 const ATOMESH_DATA = {
   updatedAt: Date.UTC(2026, 6, 3, 7, 9, 0),
   backend: 'ATOMesh',
@@ -1339,6 +1338,12 @@ const allAgentxModels = [...new Set(agentxAllRows.map(row => row.model))].sort(_
 const allAgentxFrameworks = AGENTX_FRAMEWORKS.map(fw => fw.key);
 const allAgentxConc = [...new Set(agentxAllRows.map(row => row.concurrency))].sort((a, b) => a - b);
 const allAgentxHardware = [...new Set(agentxAllRows.map(row => row.hardware || 'unknown'))].sort(_lc);
+// Hardware with data in each mode; that mode's hardware filter offers only these.
+const MODE_HARDWARE = {
+  AgentX: allAgentxHardware,
+  Aggregated: [...new Set(Object.values(latestConfigs).map(cfg => cfg.hardware || 'unknown'))].sort(_lc),
+  Disaggregated: [...new Set(fixedSeqAtomeshRows.map(row => row.hardware || 'unknown'))].sort(_lc),
+};
 
 const state = {
   dashboardMode: 'Aggregated',
@@ -1351,7 +1356,6 @@ const state = {
   trendModelKey: allTrendModelKeys[0] || '',
   atomeshTrendModel: '',
   agentxIntvtyMetric: ATOMESH_INTERACTIVITY_METRICS[0].key,
-  lastNonAgentxMode: 'Aggregated',
   agentxShowAll: false,
   dataView: 'table',
   dataSort: { column: 'date', direction: 'desc' },
@@ -1700,7 +1704,8 @@ const agentxFilterDefs = [
 ];
 
 function activeFilterDefs() {
-  return state.dashboardMode === 'AgentX' ? agentxFilterDefs : filterDefs;
+  if (state.dashboardMode === 'AgentX') return agentxFilterDefs;
+  return filterDefs.map(d => (d.id === 'hardware' ? { ...d, options: MODE_HARDWARE[state.dashboardMode] } : d));
 }
 
 function isNumericFilter(id) {
@@ -1711,38 +1716,34 @@ function getFilterState(id) {
   return isNumericFilter(id) ? state.filters[id].map(String) : state.filters[id];
 }
 
+// Non-AgentX is the Aggregated view. Disaggregated opens only from #mode=Disaggregated
+// and is listed here only while it is open, so the selector can leave it.
 function appendDashboardModeSelector(bar) {
-  const isAgentx = state.dashboardMode === 'AgentX';
+  const options = [['AgentX', 'AgentX'], ['Aggregated', 'Non-AgentX']];
+  if (state.dashboardMode === 'Disaggregated') options.push(['Disaggregated', 'Disaggregated']);
+  const current = options.find(([mode]) => mode === state.dashboardMode)[1];
   const group = document.createElement('div');
   group.className = 'filter-group dashboard-mode-group';
-  group.innerHTML = `<button class="filter-btn" data-filter="dashboard-mode">${isAgentx ? 'AgentX' : 'Non-AgentX'} ▾</button>
+  group.innerHTML = `<button class="filter-btn" data-filter="dashboard-mode">${current} ▾</button>
     <div class="filter-dropdown" id="fd-dashboard-mode">
-      ${['AgentX', 'Non-AgentX'].map(mode => `<label><input type="radio" name="dashboard-mode" value="${mode}" ${(mode === 'AgentX') === isAgentx ? 'checked' : ''}> ${mode}</label>`).join('')}
+      ${options.map(([mode, label]) => `<label><input type="radio" name="dashboard-mode" value="${mode}" ${state.dashboardMode === mode ? 'checked' : ''}> ${label}</label>`).join('')}
     </div>`;
   bar.appendChild(group);
-  if (isAgentx) return;
-  const serving = document.createElement('div');
-  serving.className = 'filter-group';
-  serving.innerHTML = `<button class="filter-btn" data-filter="serving-mode">${state.dashboardMode} ▾</button>
-    <div class="filter-dropdown" id="fd-serving-mode">
-      ${NON_AGENTX_MODES.map(mode => `<label><input type="radio" name="serving-mode" value="${mode}" ${state.dashboardMode === mode ? 'checked' : ''}> ${mode}</label>`).join('')}
-    </div>`;
-  bar.appendChild(serving);
 }
 
-// Moves AgentX onto hardware that has AgentX points; leaves it alone when none exist.
-function ensureAgentxHardware() {
-  if (!allAgentxHardware.length || allAgentxHardware.includes(selectedHardware())) return false;
-  state.filters.hardware = [allAgentxHardware.includes(defaultHardware) ? defaultHardware : allAgentxHardware[0]];
+// Moves the current mode onto hardware it has data for; leaves it alone when it has none.
+function ensureModeHardware() {
+  const options = MODE_HARDWARE[state.dashboardMode] || [];
+  if (!options.length || options.includes(selectedHardware())) return false;
+  state.filters.hardware = [options.includes(defaultHardware) ? defaultHardware : options[0]];
   return true;
 }
 
 function setDashboardMode(mode) {
   if (!DASHBOARD_MODES.includes(mode) || state.dashboardMode === mode) return;
   state.dashboardMode = mode;
-  if (NON_AGENTX_MODES.includes(mode)) state.lastNonAgentxMode = mode;
   if (!dashboardTabs().includes(state.activeTab)) state.activeTab = 'performance';
-  if (mode === 'AgentX') ensureAgentxHardware();
+  ensureModeHardware();
   renderFilters();
   updateHeaderGpuMeta();
   renderKPICards();
@@ -1818,7 +1819,7 @@ function renderFilters() {
     state.filters.axModels = [...allAgentxModels];
     state.filters.axFrameworks = [...allAgentxFrameworks];
     state.filters.axConc = [...allAgentxConc];
-    if (state.dashboardMode === 'AgentX') ensureAgentxHardware();
+    ensureModeHardware();
     renderFilters();
     updateHeaderGpuMeta();
     renderActiveTab();
@@ -1864,10 +1865,6 @@ function bindFilterDropdownEvents(bar) {
     dd.addEventListener('change', (e) => {
       const filterId = dd.id.replace('fd-', '');
       if (filterId === 'dashboard-mode') {
-        if (e.target.type === 'radio') setDashboardMode(e.target.value === 'AgentX' ? 'AgentX' : state.lastNonAgentxMode);
-        return;
-      }
-      if (filterId === 'serving-mode') {
         if (e.target.type === 'radio') setDashboardMode(e.target.value);
         return;
       }
@@ -3452,10 +3449,7 @@ function readFromHash() {
   for (const part of hash.split('&')) {
     const [k, v = ''] = part.split('=');
     const list = v ? v.split(',') : [];
-    if (k === 'mode' && DASHBOARD_MODES.includes(v)) {
-      state.dashboardMode = v;
-      if (NON_AGENTX_MODES.includes(v)) state.lastNonAgentxMode = v;
-    }
+    if (k === 'mode' && DASHBOARD_MODES.includes(v)) state.dashboardMode = v;
     if (k === 'backend') state.filters.backends = list.filter(b => allBackends.includes(b));
     if (k === 'model') state.filters.models = list.filter(m => allModels.includes(m));
     if (k === 'isl') {
@@ -3473,7 +3467,7 @@ function readFromHash() {
     if (k === 'tab' && v) state.activeTab = v;
   }
   if (openAgentx) state.dashboardMode = 'AgentX';
-  const movedHardware = state.dashboardMode === 'AgentX' && ensureAgentxHardware();
+  const movedHardware = ensureModeHardware();
   if (openAgentx || movedHardware) syncToHash();
 }
 
