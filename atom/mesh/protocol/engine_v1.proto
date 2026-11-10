@@ -385,6 +385,7 @@ message Completions {
 message StreamBatch {
   repeated uint64 seq_ids = 1;
   reserved 2;  // request_ids: always the seq_id
+  reserved "request_ids";
   repeated uint32 token_counts = 3;  // how many of `tokens` each entry owns
   repeated int32 tokens = 4;         // every entry's output tokens, in order
   repeated bool finished = 5;

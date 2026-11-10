@@ -67,7 +67,9 @@ impl CoreLink {
         self.input.lock().send(frames)
     }
 
-    /// Abort and Shutdown.
+    /// Abort, Utility, AdminCommand and Shutdown, per the protocol: every
+    /// client -> Core message except SubmitBatch. They travel apart from input
+    /// so that none of them queues behind a large SubmitBatch.
     pub fn send_control(&self, frames: Vec<Vec<u8>>) -> Result<(), String> {
         self.control.lock().send(frames)
     }
