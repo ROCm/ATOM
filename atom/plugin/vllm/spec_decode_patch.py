@@ -276,7 +276,7 @@ def _groups_have_v41_proxy(kv_cache_groups) -> bool:
 def _spec_has_heterogeneous_mla_mha_backend(kv_cache_spec) -> bool:
     try:
         from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec
-    except Exception:
+    except ImportError:
         return False
     try:
         from vllm.v1.kv_cache_interface import KpoolTailSpec

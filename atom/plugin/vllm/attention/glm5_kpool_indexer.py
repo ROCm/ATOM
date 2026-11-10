@@ -280,7 +280,7 @@ def sparse_attn_indexer_kpool_plugin_mode(
     topk_out_width: int,
     scale_fmt: str,
     stable_topk: bool,
-) -> torch.Tensor:
+) -> None:
     from vllm.forward_context import get_forward_context as get_vllm_forward_context
     from vllm.forward_context import is_forward_context_available
 
@@ -289,16 +289,15 @@ def sparse_attn_indexer_kpool_plugin_mode(
         triton_convert_req_index_to_global_index,
     )
 
-    result = weights.to(dtype=torch.float32, copy=True)
     if not is_forward_context_available():
-        return result
+        return
     attn_metadata_dict = get_vllm_forward_context().attn_metadata
     if attn_metadata_dict is None or k_cache_prefix not in attn_metadata_dict:
         # Profile / dummy run: the caches do not exist yet.
-        return result
+        return
     indexer_meta = attn_metadata_dict[k_cache_prefix]
     if indexer_meta is None:
-        return result
+        return
     sparse_meta = _get_sparse_mla_metadata(attn_metadata_dict, k_cache_prefix)
     if sparse_meta is None:
         raise RuntimeError(
@@ -322,7 +321,7 @@ def sparse_attn_indexer_kpool_plugin_mode(
     n_tokens = hidden_states.shape[0]
     n_actual = int(indexer_meta.num_actual_tokens)
     if n_actual == 0:
-        return result
+        return
     num_reqs = indexer_meta.num_reqs
     tail_meta = attn_metadata_dict.get(tail_prefix)
     if tail_meta is None:
@@ -535,37 +534,11 @@ def sparse_attn_indexer_kpool_plugin_mode(
         BLOCK_SIZE=sparse_meta.block_size,
         NUM_TOPK_TOKENS=topk_out_width,
     )
-    return result
-
-
-def sparse_attn_indexer_kpool_fake(
-    hidden_states: torch.Tensor,
-    k_cache_prefix: str,
-    tail_prefix: str,
-    kv_cache: torch.Tensor,
-    tail_kv_cache: torch.Tensor,
-    tail_ring: int,
-    q_fp8: torch.Tensor,
-    k: torch.Tensor,
-    gate_score: torch.Tensor,
-    weights: torch.Tensor,
-    compress_ape: torch.Tensor,
-    positions: torch.Tensor,
-    sparse_kv_indices_buffer: torch.Tensor,
-    topk_tokens: int,
-    index_kpool: int,
-    head_dim: int,
-    max_model_len: int,
-    topk_out_width: int,
-    scale_fmt: str,
-    stable_topk: bool,
-) -> torch.Tensor:
-    return torch.empty_like(weights, dtype=torch.float32)
 
 
 direct_register_custom_op(
     op_name="sparse_attn_indexer_kpool_plugin_mode",
     op_func=sparse_attn_indexer_kpool_plugin_mode,
     mutates_args=["sparse_kv_indices_buffer", "kv_cache", "tail_kv_cache"],
-    fake_impl=sparse_attn_indexer_kpool_fake,
+    fake_impl=lambda *_args, **_kwargs: None,
 )
