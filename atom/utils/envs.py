@@ -634,6 +634,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # periods and the noise floor under them are in the environment doc, and
     # end-to-end throughput is too coarse to see an effect that size.
     "ATOM_DSV41_SIDE_STREAMS": lambda: int(os.getenv("ATOM_DSV41_SIDE_STREAMS", "0")),
+    # DeepSeek-V4.1 mono decode's high-interactivity (hi) monokernels (the
+    # `mono/hi` package, imported only with this on): on the decode steps it
+    # serves, every decoder layer, the verify head, the DSpark draft and the
+    # round's glue run the hi programs (atom/models/deepseek_v41/mono/hi_*.py).
+    # "auto" (default): on for the deployment they serve (MI355X, TP4, BF16 KV,
+    # DSpark, ...: `mono/hi_gate.py`), any other keeps ATOM's mono path; "1":
+    # on, or an error naming why not; "0": off.
+    "ATOM_DSV41_MONO_HI": lambda: os.getenv("ATOM_DSV41_MONO_HI", "auto"),
     # Token-bucket TR graphs for prefill (`atom/utils/region_graph.py`): the
     # comma-separated token counts to record. A prefill longer than the largest
     # runs eagerly; empty records none. The default tops out at 3072 because

@@ -673,6 +673,11 @@ class DSparkProposer(Drafter):
         `next_token_ids` is unused: DSpark drafts from aux hidden states.
         """
         del next_token_ids
+        # A step the model's decode round served wrote its context rows inside
+        # the target forward (`AttentionMetaData.served_by_round`).
+        metadata = get_forward_context().attn_metadata
+        if metadata is not None and metadata.served_by_round:
+            return
         aux_hidden_states = self.aux_for(hidden_states)
         if aux_hidden_states is None:
             return

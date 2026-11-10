@@ -11,6 +11,7 @@ import math
 import os
 import time
 from collections import OrderedDict
+from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from functools import partial, wraps
@@ -104,7 +105,7 @@ from atom.model_ops.eplb import (
     with_eplb_forward_monitor,
 )
 from atom.model_ops.indexer.schedule import skips_index_topk
-from atom.model_ops.rejection_sampler import RejectionSampler
+from atom.model_ops.rejection_sampler import RELAXED_TOP_N, RejectionSampler
 from atom.model_ops.required_channel import (
     DeviceChannel,
     advance_states,
@@ -338,6 +339,13 @@ class tokenIDProcessor:
     def recv_spec_status(self) -> tuple[np.ndarray | None, np.ndarray | None]:
         return self.spec_status_queue.receive() or (None, None)
 
+    def take_deferred_spec_status(self) -> None:
+        """After the target's launch: the status `prepare_input_ids` deferred
+        (`defer_spec_status`), what `postprocess` reports."""
+        if self.spec_status_owed:
+            self.spec_status_owed = False
+            self.prev_rejected_num, self.prev_bonus_num = self.recv_spec_status()
+
     def _wait_for_pending_copies(self) -> None:
         """Wait for every queued D2H before its entry (and source) is dropped."""
         for _, copy_done, _ in getattr(self, "token_ids_cpu", ()):
@@ -373,6 +381,10 @@ class tokenIDProcessor:
         )
         self.num_rejected: np.ndarray | None = None
         self.num_bonus: np.ndarray | None = None
+        # The previous verify's status this step deferred
+        # (`prepare_input_ids`' `defer_spec_status`), owed until
+        # `take_deferred_spec_status`.
+        self.spec_status_owed = False
 
     def verify_ctx_lens(self, context_lens: np.ndarray) -> np.ndarray:
         """`batch.context_lens` moved back to the start of this verify window.
@@ -519,6 +531,7 @@ class tokenIDProcessor:
         batch: ScheduledBatch,
         max_seqlen_q: int,
         publication_group,
+        defer_spec_status: bool = False,
     ) -> torch.Tensor:
         """Prepare the input IDs for the current batch, then take the previous
         step's speculative status.
@@ -531,6 +544,12 @@ class tokenIDProcessor:
         filling the ids need none of it, so they go first and run while the
         GPU still works; only what follows (the attention metadata, through
         `num_rejected`) reads the status.
+
+        ``defer_spec_status``: the attention builder advances this step from
+        the previous verdict on the device
+        (`AttentionMetadataBuilder.consumes_device_verdict`), so the step is
+        built as if no draft had been rejected (zero counts) and the wait is
+        owed until after the target's launch (`take_deferred_spec_status`).
         """
         bs = batch.total_seqs_num
         self.batch_info.np[:] = (
@@ -547,7 +566,14 @@ class tokenIDProcessor:
         # whose deferred tokens the NEXT output-producing step will surface.
         # Draining it here would hand that step `num_rejected=None`.
         if batch.produces_output():
-            self.prev_rejected_num, self.prev_bonus_num = self.recv_spec_status()
+            if defer_spec_status:
+                # A count a request of the forward the status is for.
+                prev = self.prev_batch
+                zeros = np.zeros(0 if prev is None else prev.total_seqs_num, np.int32)
+                self.prev_rejected_num, self.prev_bonus_num = zeros, zeros.copy()
+                self.spec_status_owed = True
+            else:
+                self.prev_rejected_num, self.prev_bonus_num = self.recv_spec_status()
         if locs is not None:
             # Map the previous step's rejected/bonus counts onto this batch's
             # order (prev_idx -> curr_idx) for the carried-over sequences.
@@ -763,6 +789,13 @@ def _profile_runner_stage(method):
 
 
 class ModelRunner:
+    # The installed model's own head output (its `compute_head`, resolved at
+    # install: `_head_output`), None for a model whose head output is its
+    # logits; whether this step deferred the previous verify's status past
+    # the target's launch (`prepare_model`).
+    compute_head: Callable | None = None
+    spec_status_deferred = False
+
     def __init__(self, rank: int, config: Config):
         self.config = config
         self.structured_output = None
@@ -985,6 +1018,9 @@ class ModelRunner:
                 getattr(self, "drafter", None),
                 metadata_builder=self.attn_metadata_builder,
             )
+        # The installed model's own head output, where it has one: its
+        # forward's logits, or a verify's token ids and verdict (`_head_output`).
+        self.compute_head = getattr(self.model, "compute_head", None)
         # A model that can run a whole decode step itself (sampling and
         # verification included); see run_model.
         self._step_override = (
@@ -2944,10 +2980,19 @@ class ModelRunner:
             spec_decode_indices = self.drafter.prepare_spec_decode_indices(
                 lens, cu[1:], token_group
             )
+        # A builder that advances this step from the previous verdict on the
+        # device builds it without that verify's host-side status: its wait
+        # follows the target's launch (`forward`).
+        self.spec_status_deferred = self.attn_metadata_builder.consumes_device_verdict(
+            batch, forward_mode.max_seqlen_q
+        )
         # No GPU consumer runs between these host producers and this
         # upload. Token assembly publishes before launching its kernel.
         input_ids = self.tokenID_processor.prepare_input_ids(
-            batch, forward_mode.max_seqlen_q, token_group
+            batch,
+            forward_mode.max_seqlen_q,
+            token_group,
+            defer_spec_status=self.spec_status_deferred,
         )
         self.prepare_inputs(
             batch,
@@ -3334,7 +3379,9 @@ class ModelRunner:
                     # The LM head and a drafter run the running tokens;
                     # `postprocess` cuts to the scheduled ones.
                     hidden_states = model_output[: forward_mode.running_tokens]
-                    logits = self.model.compute_logits(hidden_states)
+                    logits = self._step_head(
+                        self._head_output(hidden_states), hidden_states, batch
+                    )
         else:
             # decode[bs=128 tok=128 d=128] / decode[... p=2 d=126 spec=3] /
             # dummy_decode[...] — see build_run_label.
@@ -3351,7 +3398,9 @@ class ModelRunner:
                     # model_output is always a plain Tensor; drafter aux capture
                     # (if any) already wrote its own buffers inside the forward.
                     hidden_states = model_output[:running_tokens]
-                    logits = self.model.compute_logits(hidden_states)
+                    logits = self._step_head(
+                        self._head_output(hidden_states), hidden_states, batch
+                    )
                     return logits, hidden_states
 
                 if self._step_override is not None:
@@ -3364,16 +3413,82 @@ class ModelRunner:
                 graph_key = request_bucket(
                     running_bs, forward_context.attn_metadata.max_seqlen_q
                 )
-                logits = self.req_graph.replay(key=graph_key)
+                # The head output the capture recorded (`_head_output`), or
+                # None.
+                head = self.req_graph.replay(key=graph_key)
                 hidden_states = self.forward_vars["outputs"][:running_tokens]
                 # Drafter aux buffers (if any) refresh on replay: their in-place
                 # copy ops were captured into the graph.
-                if logits is not None:
-                    logits = logits[:scheduled_tokens]
-                else:
-                    logits = self.model.compute_logits(hidden_states)
+                if isinstance(head, torch.Tensor):
+                    head = head[:scheduled_tokens]
+                logits = self._step_head(head, hidden_states, batch)
 
         return logits, hidden_states
+
+    def _head_output(self, hidden_states: torch.Tensor, logits: bool = True):
+        """The head output of the forward that just ran, on its rows
+        (`hidden_states`): the model's own where it gives one
+        (`compute_head`: the logits, or a verify's output token ids
+        [requests, num_spec_steps + 1] and verdict [3, requests] -- accepted,
+        rejected, anchor row -- as the rejection sampler lays them out, for
+        the forward's requests each verifying the full draft span); else,
+        with `logits`, the logits. A decode graph's capture records it
+        (`capture_cudagraph`), the logits at TP 1."""
+        head = None if self.compute_head is None else self.compute_head(hidden_states)
+        if head is None and logits:
+            head = self.model.compute_logits(hidden_states)
+        return head
+
+    def _step_head(self, head, hidden_states: torch.Tensor, batch):
+        """This step's head output from the forward's (`head`: `_head_output`'s
+        or a replay's, None for none recorded): a verify's ids and verdict
+        where they stand for the step (`_head_ids_serve`), else the logits."""
+        if isinstance(head, tuple) and self._head_ids_serve(head, batch):
+            return head
+        if head is None or isinstance(head, tuple):
+            return self.model.compute_logits(hidden_states)
+        return head
+
+    def _head_ids_serve(self, head, batch) -> bool:
+        """Whether a head output's ids and verdict stand for this step in
+        place of the logits: a speculative verify that reads nothing of them
+        but each row's pick (no logprobs, structured output or required
+        channel; exact or forced acceptance; no prefill context parallelism),
+        every request verifying the full draft span the verdict is laid out
+        for, and its rows all greedy or all sampled from temperature and top-p
+        alone. ATOM's verify of such a sampled step is sample-and-match; a
+        head that gives ids draws each such row from the (T, top_p) its
+        model's builder published with the step."""
+        spec = get_forward_context().spec_decode_metadata
+        if (
+            spec is None
+            or batch is None
+            or getattr(self, "rejection_sampler", None) is None
+            or batch.any_logprobs
+            or getattr(batch, "structured_requests", None)
+            or batch.required_channel is not None
+            or RELAXED_TOP_N > 1
+            or get_pcp_world_size() > 1
+        ):
+            return False
+        tokens, verdict = head
+        bs, steps = batch.total_seqs_num, spec.num_spec_steps
+        if (
+            tokens.shape[0] < bs
+            or tokens.shape[1] != steps + 1
+            or verdict.shape[1] < bs
+            or (np.asarray(spec.num_draft_tokens_np) != steps).any()
+        ):
+            return False
+        temperatures = batch.temperatures[:bs]
+        if not temperatures.any():
+            return True
+        noise = getattr(batch, "needs_independent_noise", None)
+        return bool(
+            (temperatures > SAMPLER_EPS).all()
+            and (batch.top_ks[:bs] == -1).all()
+            and not (noise is not None and noise.any())
+        )
 
     def flush_pp_send(self) -> bool:
         """Flush pending PP isend. Returns True for call_func wait_out."""
@@ -3448,7 +3563,8 @@ class ModelRunner:
     def postprocess(
         self,
         batch: ScheduledBatch,
-        logits: torch.Tensor,
+        # The step's head output (`_step_head`): logits, or ids and verdict.
+        logits: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         temperatures: torch.Tensor,
         top_ks: int | torch.Tensor | None,
         top_ps: float | torch.Tensor | None,
@@ -3518,6 +3634,18 @@ class ModelRunner:
             # No drafts scored -> no verdict; the drafter anchors on each
             # segment's last row.
             anchors = None
+        elif isinstance(logits, tuple):
+            # The model's head picked every row and gave the verdict inside
+            # the forward (`_head_output`: greedy, or draws seeded alike on
+            # every rank): the step's requests' output ids and verdict, as
+            # the rejection sampler gives them. The next ids are gathered
+            # below from the broadcast ids, as on the logits path.
+            channel = None
+            sampled_tokens, verdict = logits
+            sampled_tokens, verdict = sampled_tokens[:bs], verdict[:, :bs]
+            num_bonus_tokens, num_reject_tokens, anchors = verdict
+            next_token_locs = num_bonus_tokens
+            spec_counts = verdict[:2]
         elif self._served is not None:
             # The step override verified on the GPU: the rejection sampler's
             # (output_token_ids [bs, k + 1], verdict [3, bs]).
@@ -3795,6 +3923,9 @@ class ModelRunner:
                 batch, get_forward_context().spec_decode_metadata
             )
         logits, hidden_states = self.run_model(input_ids, batch)
+        # The status this step deferred (`prepare_model`), after the launch.
+        if self.spec_status_deferred:
+            self.tokenID_processor.take_deferred_spec_status()
         self._settle_target_pcp_split()
         drafter = getattr(self, "drafter", None)
 
@@ -4270,11 +4401,12 @@ class ModelRunner:
             self.forward_vars["sparse_kv_indptr"].gpu.zero_()
 
         # A decode step's whole forward per request bucket (`ReqGraph`), its
-        # logits too when `logits_in_graph`. Under TBO decode a bucket that
-        # splits (`decode_bucket_splits`) is recorded split, its micro-batches
-        # cut at the bucket, so a decode the group splits replays it
-        # (`ForwardMode.decide`). Token graphs have no such recording: under
-        # TR_HYBRID a split decode runs eagerly.
+        # head output too (`_head_output`): the model's own where it gives
+        # one, else its logits when `logits_in_graph`. Under TBO decode a
+        # bucket that splits (`decode_bucket_splits`) is recorded split, its
+        # micro-batches cut at the bucket, so a decode the group splits
+        # replays it (`ForwardMode.decide`). Token graphs have no such
+        # recording: under TR_HYBRID a split decode runs eagerly.
         self.req_graph = ReqGraph()
         self.tbo_decode_graphs = self.config.enable_tbo_decode and not tr_hybrid
         if self.config.enable_tbo_decode and tr_hybrid and self.rank == 0:
@@ -4424,8 +4556,7 @@ class ModelRunner:
                         input_ids[:running_tokens], model_positions
                     )
                     outputs[:running_tokens] = model_output
-                    if logits_in_graph:
-                        self.model.compute_logits(outputs[:running_tokens])
+                    self._head_output(outputs[:running_tokens], logits_in_graph)
 
                     if tr_hybrid:
                         # TR_HYBRID: no manual whole-forward graph. The model's
@@ -4454,9 +4585,7 @@ class ModelRunner:
                         # forward and writes its own buffers (in-graph).
                         def full_forward(n=running_tokens, pos=model_positions):
                             outputs[:n] = self.model(input_ids[:n], pos)
-                            if logits_in_graph:
-                                return self.model.compute_logits(outputs[:n])
-                            return None
+                            return self._head_output(outputs[:n], logits_in_graph)
 
                         self.req_graph.record(
                             full_forward, key=request_bucket(bs, max_q_len)
@@ -4864,6 +4993,8 @@ class RapidServeModelRunner(ModelRunner):
             ) = self.prepare_model(batch)
             self._mark_staging_h2d_enqueued()
             logits, hidden_states = self.run_model(input_ids, batch)
+            if self.spec_status_deferred:
+                self.tokenID_processor.take_deferred_spec_status()
             self._settle_target_pcp_split()
         self._model_fwd_event.record(stream)
         torch.cuda.current_stream().wait_event(self._model_fwd_event)

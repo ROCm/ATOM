@@ -6,7 +6,7 @@ import threading
 from collections.abc import Container
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import Enum, IntEnum
 from typing import TYPE_CHECKING, Any, Union
 
 import numpy as np
@@ -45,6 +45,29 @@ class AttnState(Enum):
     DECODE = "decode"
     PREFILL_NATIVE = "prefill_native"
     PREFILL_PREFIX = "prefill_prefix"
+
+
+class RoundService(IntEnum):
+    """How much of a step the model's decode round takes over
+    (``model_engine.model_hooks.DecodeRound``, the attention builder's):
+    ``AttentionMetaData.served_by_round``, decided once a step by the attention
+    builder (``DecodeRound.service``). Each level includes the ones below it;
+    ``NONE`` (falsy) is every other step.
+
+    - ``FORWARD``: the model's own forward path runs every layer of the step,
+      looks its Engram rows up itself (no staging lookup) and writes the
+      DSpark draft's context KV.
+    - ``LEAN``: nothing the step runs reads its compress plans or step
+      planners: the builder lays it out without them.
+    - ``DEVICE``: its positions are advanced on the device from the previous
+      verdict: no state probe, and the host builds it as if no draft had been
+      rejected (``AttentionMetadataBuilder.consumes_device_verdict``).
+    """
+
+    NONE = 0
+    FORWARD = 1
+    LEAN = 2
+    DEVICE = 3
 
 
 @dataclass(frozen=True)
@@ -697,6 +720,11 @@ class AttentionMetaData:
     reduce_indptr: torch.Tensor | None = None
     reduce_final_map: torch.Tensor | None = None
     reduce_partial_map: torch.Tensor | None = None
+
+    # The model's decode round's share of this step (`RoundService`): set once
+    # by the attention builder; the builder, its cache, Engram staging, the
+    # DSpark proposer and the model's forward read it.
+    served_by_round: RoundService = RoundService.NONE
 
     # for prefix cache
     has_cached: bool = False

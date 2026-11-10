@@ -146,6 +146,41 @@ def _hip_runtime():
     return None
 
 
+@functools.cache
+def _host_get_device_pointer():
+    """`hipHostGetDevicePointer` of the HIP runtime that page-locks
+    (`_hip_runtime`), resolved once; None without one."""
+    hip = _hip_runtime()
+    fn = None if hip is None else getattr(hip, "hipHostGetDevicePointer", None)
+    if fn is not None:
+        fn.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_uint]
+    return fn
+
+
+def device_address(
+    host_ptr: int, base: int | None = None, *, identity_without_hip: bool = False
+) -> int:
+    """The device's address of `host_ptr`, a byte of the page-locked host
+    range starting at `base` (default: `host_ptr` itself). Not always the host
+    address: memory registered in place is mapped at another device address,
+    and a kernel handed the host one faults.
+
+    Without a HIP runtime to ask it raises, or with `identity_without_hip`
+    returns `host_ptr` itself (where the caller's host memory is read at its
+    host address: copies the HIP allocator page-locked, or no device at all)."""
+    fn = _host_get_device_pointer()
+    if fn is None:
+        if identity_without_hip:
+            return host_ptr
+        raise RuntimeError("no HIP runtime loaded: no device address of host memory")
+    base = host_ptr if base is None else base
+    dev = ctypes.c_void_p()
+    rc = fn(ctypes.byref(dev), base, 0)
+    if rc != 0 or not dev.value:
+        raise RuntimeError(f"hipHostGetDevicePointer({base:#x}) failed ({rc})")
+    return dev.value + (host_ptr - base)
+
+
 def _clear_hip_error() -> None:
     """Reset HIP's last error after a refused or failed call.
 

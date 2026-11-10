@@ -45,6 +45,18 @@ Key entry points:
 - Server: `atom/entrypoints/openai_server.py`
 - Engine: `atom/model_engine/llm_engine.py` → `engine_core.py` → `scheduler.py` → `model_runner.py`
 - Models: `atom/models/` — registered in `atom/models/registry.py:support_model_arch_dict`
+- Head output and deferred status: a model may give `ModelRunner` its own head
+  output (`compute_head`: the forward's logits, or a verify's output ids and
+  verdict; `ModelRunner._head_output`, recorded with a decode graph as the logits
+  are at TP 1); an attention builder may say a step consumes the previous
+  verdict on the device (`AttentionMetadataBuilder.consumes_device_verdict`:
+  the runner then takes the speculative status after the target's launch)
+- Model hooks: `atom/model_engine/model_hooks.py` — `DecodeRound`, the part of a
+  step a model's install hands DeepSeek-V4.1's metadata builder
+  (`DeepseekV41MetadataBuilder.use_decode_round`); `DecodeRound.service` is the
+  step's one routing decision (`AttentionMetaData.served_by_round`,
+  `RoundService`) that the builder, its cache, Engram staging, the DSpark
+  proposer and the model's forward all read
 - Ops: `atom/model_ops/` — AITER kernel wrappers (linear, attention, fused_moe)
 - Structured output: `atom/structured_output/` — request validation, schema compilation, grammar state and asynchronous token/mask transfers
 - Config: `atom/config.py` (Config, KVCacheConfig, CompilationConfig)
@@ -109,9 +121,13 @@ Key entry points:
   implementations side by side — `PeerBuffer` (aiter's heap) and
   `SymmetricPeerBuffer` (HIP directly, GLM-5.2's) — because they are different
   implementations rather than two copies, and merging them is a GPU behaviour
-  change, not a move; both allocate through `runtime/uncached.py`, as do every
-  model's step scratch buffers (uncached device memory: a hand-off's polls
-  never hit a stale cache line). Qwen3.8-Flash-Next's kernels (`qwen38/mono/`, beside
+  change, not a move; both allocate through `runtime/uncached.py`, as do the
+  other models' step scratch buffers (uncached device memory: a hand-off's polls
+  never hit a stale cache line). DeepSeek-V4.1's high-interactivity monokernels
+  (below) keep a third, their own: the hi programs' peer groups
+  (`deepseek_v41/mono/hi/runtime/peer.py`, `PeerGroup`) and uncached scratch
+  arenas (`hi/runtime/uncached.py`, a block retired and reused, never freed), both
+  over `runtime/hip_ipc.py`. Qwen3.8-Flash-Next's kernels (`qwen38/mono/`, beside
   the single-file `qwen4_exp.py`) are whole-layer programs composed from FlyDSL stages
   (`kernels/blocks/`, `kernels/recipe.py`); its MTP drafter is wrapped at install like
   V4.1's (`draft_model.MonoDraftModel`). Where a model ships a
@@ -119,7 +135,13 @@ Key entry points:
   hand-offs without a GPU with `FLYDSL_RUNTIME_ENABLE_CACHE=0 ARCH=gfx950
   python -m atom.models.<model>.mono.contract`; GLM-5.2's `contract.py` is the
   per-step input check only, and Kimi-K3 ships neither it nor a `check.py`
-  yet)
+  yet). DeepSeek-V4.1 also has the high-interactivity monokernels
+  (`ATOM_DSV41_MONO_HI`, on by default where `deepseek_v41/mono/hi_gate.py`
+  says they serve: MI355X, TP4, DSpark): one persistent FlyDSL launch a layer
+  (the runtime in `deepseek_v41/mono/hi/`), the host hook in `hi_runner.py` /
+  `hi_compose.py` / `hi_dispatch.py`, its head output
+  (`HiDecodeModel.compute_head`: `round/post_verify.py`) and its decode round in
+  `round/` (`HiRound`)
 - Diffusion: `atom/diffusion/` — framework at the top level (`pipeline.py`,
   `attention.py`, `ulysses.py`), engine in `engine/`, server in `entrypoints/`,
   and one package per model in `models/<family>/`. Extras: `pip install -e ".[diffusion]"`
