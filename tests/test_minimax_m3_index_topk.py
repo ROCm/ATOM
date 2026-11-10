@@ -885,21 +885,23 @@ def test_decode_chunk_policy_scores_selection_and_replay(
 
 @pytest.mark.parametrize("arch", ["gfx942", "gfx950", "gfx1250"])
 @pytest.mark.parametrize("batch", [1, 2, 8])
-def test_cp_retains_shared_chunk_policy(monkeypatch, arch, batch):
+def test_cp_grid_ignores_native_chunk_policy(monkeypatch, arch, batch):
     from atom.model_ops.minimax_m3 import indexer_context_parallel as cp
 
     monkeypatch.setattr(m, "get_gfx", lambda: arch)
-    assert cp._decode_score_chunks is m._decode_score_chunks
-    for local_pages in (1, 8, 16, 64, 128, 256, 257, 512, 823, 1024):
-        assert cp._decode_score_chunks(batch, local_pages) == (
-            _previous_decode_score_chunks(batch, local_pages)
+    for policy in ("_decode_score_chunks", "_native_decode_score_chunks"):
+        monkeypatch.setattr(
+            m, policy, lambda *args: pytest.fail("CP uses its own score grid")
         )
+    for local_pages in (1, 8, 16, 64, 128, 256, 257, 512, 823, 1024):
+        programs = cp._context_score_programs(batch, local_pages)
+        assert 1 <= programs <= -(-local_pages // cp.CP_SCORE_MIN_SPAN)
 
 
 @gpu
 @pytest.mark.parametrize("batch", [1, 2])
 @pytest.mark.parametrize("pages", [64, 1024])
-def test_cp_actual_launch_grid_and_replay_unchanged(monkeypatch, batch, pages):
+def test_cp_actual_launch_grid_and_replay(monkeypatch, batch, pages):
     from atom.model_ops.minimax_m3 import indexer_context_parallel as cp
 
     if m.get_gfx() != "gfx1250":
@@ -932,13 +934,10 @@ def test_cp_actual_launch_grid_and_replay_unchanged(monkeypatch, batch, pages):
         )
 
     local_pages = (pages + world - 1) // world
-    expected_grid = (batch, _previous_decode_score_chunks(batch, local_pages))
+    expected_grid = (batch, cp._context_score_programs(batch, local_pages))
     actual = call()
     assert grids == [expected_grid]
-    with monkeypatch.context() as legacy:
-        legacy.setattr(cp, "_decode_score_chunks", _previous_decode_score_chunks)
-        expected = call()
-    assert torch.equal(actual, expected)
+    assert torch.equal(actual, call())
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
@@ -949,11 +948,6 @@ def test_cp_actual_launch_grid_and_replay_unchanged(monkeypatch, batch, pages):
             q.neg_()
             lengths.fill_(length)
             graph.replay()
-            with monkeypatch.context() as legacy:
-                legacy.setattr(
-                    cp, "_decode_score_chunks", _previous_decode_score_chunks
-                )
-                expected = call()
-            assert torch.equal(replayed, expected)
+            assert torch.equal(replayed, call())
     torch.cuda.current_stream().wait_stream(stream)
     assert all(grid == expected_grid for grid in grids)
