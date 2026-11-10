@@ -3353,6 +3353,21 @@ class Config:
         return hash_str
 
 
+def local_device_index(config: Config, rank: int) -> int:
+    """Node-local GPU index of worker ``rank`` (0..tp*pcp-1) of its stage.
+
+    On a single node the physical GPU index equals the global distributed rank
+    in the DPxPPxPCPxTP layout: each EngineCore (one per (dp,pp) stage) owns a
+    contiguous slice of `tp_world_size * pcp_group_size` GPUs.
+    """
+    pc = config.parallel_config
+    engine_index = (
+        pc.data_parallel_rank_local or 0
+    ) * config.pipeline_parallel_size + pc.pipeline_parallel_rank
+    stage_span = config.tp_world_size * config.pcp_group_size
+    return engine_index * stage_span + rank
+
+
 _current_atom_config: Config | None = None
 
 

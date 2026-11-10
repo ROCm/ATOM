@@ -882,9 +882,8 @@ class Scheduler:
         # Seqs whose last chunk ended on a state-checkpoint rung not yet filed,
         # by that chunk's end; prefill skips them. Under PP the next chunk would
         # otherwise overwrite the state slot before it is filed under the rung's
-        # hash. Keyed on advance_on_schedule, which only PP sets.
-        # shortcut: holds prefill until the rung's chunk completes; #2709 files
-        # the checkpoint at schedule time and drops the hold for most requests.
+        # hash. Keyed on advance_on_schedule, which only PP sets. Only a class
+        # that must file at retire lands here; see `_finalize_prefill_chunk`.
         self._checkpoint_holds: dict[int, int] = {}
 
         from atom.utils.forward_context import get_kvconnector
@@ -3692,10 +3691,18 @@ class Scheduler:
         ):
             chunk = bm.state.min_fork_tokens
             on_rung = False
-        # With several forwards in flight, hold the next chunk until this
-        # checkpoint is filed. PP refuses PAGE checkpoints, so a rung here is
-        # strictly inside the prompt and there always is a next chunk.
-        if on_rung and self.advance_on_schedule and bm.enable_prefix_caching:
+        # With several forwards in flight, the next chunk would write the slot
+        # before this one retires. File the checkpoint now where the class
+        # allows it, else hold the next chunk until it is filed. A rung at
+        # prompt end needs neither: the first decode is already held by
+        # `_pp_inflight_token_block`.
+        if (
+            on_rung
+            and self.advance_on_schedule
+            and bm.enable_prefix_caching
+            and start + chunk < seq.num_prompt_tokens
+            and not bm.checkpoint_when_scheduled(seq, start + chunk)
+        ):
             self._checkpoint_holds[seq.id] = start + chunk
         return chunk
 
