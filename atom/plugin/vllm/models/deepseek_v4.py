@@ -243,7 +243,7 @@ class DeepseekV4AttentionVllm(DeepseekV4AttentionBase):
                         # Keep the caller's storage and zero only the
                         # padded rows within the supplied slice.
                         out[num_real:].zero_()
-                        return out.view(num_in, -1)
+                        return out.reshape(num_in, -1)
                     return torch.nn.functional.pad(o, (0, 0, 0, num_in - num_real))
         return super()._sparse_attention(
             qkn,

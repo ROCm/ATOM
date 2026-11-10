@@ -2416,6 +2416,8 @@ class DeepseekV4Attention(nn.Module):
         ``out`` optionally supplies a ``[num_tokens, n_local_heads, head_dim]``
         destination. Supported backends write into it directly; legacy APIs
         and reference fallbacks copy their result into the same buffer.
+        The flattened return may be a copy if the destination's strides do
+        not allow the head and feature dimensions to be viewed as one.
 
         Every launch here is sized by the token count -- `csa_translate_pack`'s grid
         is `(T, ...)`, the paged kernels take `N = qo_indptr.numel()-1`, the FP8
@@ -2443,7 +2445,7 @@ class DeepseekV4Attention(nn.Module):
             # the paged kernels would read OOB. Same guard the core has always
             # carried; this half now runs outside it. See `_qk_norm_rope`.
             if out is not None:
-                return out.zero_().view(num_tokens, -1)
+                return out.zero_().reshape(num_tokens, -1)
             return q_rows.new_zeros(
                 (num_tokens, self.n_local_heads * self.head_dim),
                 dtype=torch.bfloat16,

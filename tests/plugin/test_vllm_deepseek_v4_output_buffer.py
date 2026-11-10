@@ -35,8 +35,9 @@ def layer():
 
 @pytest.mark.parametrize("path", ["padded_prefill", "prefill", "decode", "no_metadata"])
 @pytest.mark.parametrize("supplied_output", [False, True])
+@pytest.mark.parametrize("transposed", [False, True])
 def test_sparse_output_clipping_and_padding(
-    monkeypatch, device, layer, path, supplied_output
+    monkeypatch, device, layer, path, supplied_output, transposed
 ):
     num_in = 6
     num_real = 3 if path == "padded_prefill" else num_in
@@ -55,6 +56,8 @@ def test_sparse_output_clipping_and_padding(
     positions = torch.arange(num_in, device=device)
     tensors = [torch.ones(num_in, 2, device=device) for _ in range(6)]
     parent = torch.full((num_in + 2, 2, 2), -9.0, device=device)
+    if transposed:
+        parent = parent.transpose(1, 2)
     output = parent[1:-1] if supplied_output else None
     calls = []
 
@@ -71,7 +74,7 @@ def test_sparse_output_clipping_and_padding(
             assert out is None
             out = torch.empty(num_real, 2, 2, device=device)
         out.copy_(query[:num_real] + 10)
-        return out.view(num_real, -1)
+        return out.reshape(num_real, -1)
 
     monkeypatch.setattr(native.DeepseekV4Attention, "_sparse_attention", sparse)
     kwargs = {"out": output} if supplied_output else {}
@@ -81,20 +84,29 @@ def test_sparse_output_clipping_and_padding(
     torch.testing.assert_close(result, expected.view(num_in, -1))
     assert calls == [num_real]
     if supplied_output:
-        assert result.data_ptr() == output.data_ptr()
+        assert (result.data_ptr() == output.data_ptr()) == (not transposed)
         torch.testing.assert_close(output, expected)
     else:
         assert torch.all(parent == -9)
     assert torch.all(parent[[0, -1]] == -9)
 
 
-def test_dummy_forward_zeros_the_supplied_slice(monkeypatch, device, layer):
-    fc = NS(context=NS(is_dummy_run=True), attn_metadata=None)
+@pytest.mark.parametrize("transposed", [False, True])
+@pytest.mark.parametrize("bypass", [False, True])
+def test_dummy_forward_zeros_the_supplied_slice(
+    monkeypatch, device, layer, transposed, bypass
+):
+    fc = NS(context=NS(is_dummy_run=not bypass), attn_metadata=None)
+    monkeypatch.setenv("ATOM_V4_BYPASS_ATTN", "1" if bypass else "0")
     monkeypatch.setattr(plugin, "get_forward_context", lambda: fc)
     monkeypatch.setattr(native, "get_forward_context", lambda: fc)
     parent = torch.full((5, 2, 2), -9.0, device=device)
+    if transposed:
+        parent = parent.transpose(1, 2)
     output = parent[1:4]
     qkn = QKNormRopeOut(q_sa=torch.ones_like(output))
     result = layer._sparse_attention(qkn, torch.arange(3, device=device), out=output)
-    assert result.shape == (3, 4) and result.data_ptr() == output.data_ptr()
+    assert result.shape == (3, 4)
+    assert (result.data_ptr() == output.data_ptr()) == (not transposed)
+    assert torch.all(result == 0)
     assert torch.all(output == 0) and torch.all(parent[[0, -1]] == -9)
