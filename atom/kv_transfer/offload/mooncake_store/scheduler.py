@@ -16,7 +16,6 @@ from __future__ import annotations
 import functools
 import logging
 import time
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from atom.kv_transfer.disaggregation.types import LoadOperationId, SaveOperationId
@@ -28,7 +27,10 @@ from atom.kv_transfer.offload._offload_common import (
 from atom.kv_transfer.offload.chunked_scheduler import ChunkedOffloadSchedulerBase
 from atom.kv_transfer.offload.metadata import LMCacheReqMeta, LoadSpec, SaveSpec
 from atom.kv_transfer.offload.mooncake_store import client as store_client
-from atom.kv_transfer.offload.mooncake_store.async_lookup import AsyncStoreLookup
+from atom.kv_transfer.offload.mooncake_store.async_lookup import (
+    AsyncStoreLookup,
+    DaemonExecutor,
+)
 from atom.kv_transfer.offload.mooncake_store.config import (
     MooncakeStoreOffloadConfig,
     StorePool,
@@ -150,11 +152,14 @@ class _PoolLookups:
     and holds nothing for the lookups from then on.
     """
 
-    __slots__ = ("client", "paused_until", "pool", "tainted")
+    __slots__ = ("client", "executor", "paused_until", "pool", "tainted")
 
     def __init__(self, pool: StorePool) -> None:
         self.pool = pool
         self.client: store_client.MooncakeStoreClient | None = None
+        # Its own daemon worker when several pools are asked at once
+        # (`_StoreLookup._exists_on`); None for a single pool.
+        self.executor: DaemonExecutor | None = None
         self.paused_until = 0.0
         self.tainted = False
 
@@ -203,16 +208,12 @@ class _StoreLookup:
         # Exact while every server on these pools puts each rank on the same
         # NIC; see the offload README for what a different placement costs.
         self._pools = [_PoolLookups(pool) for pool in cfg.store_masters()]
-        # Several pools are asked at once; the executor starts no thread until
-        # the first lookup.
-        self._executor = (
-            ThreadPoolExecutor(
-                max_workers=len(self._pools),
-                thread_name_prefix="mooncake-store-lookup",
-            )
-            if len(self._pools) > 1
-            else None
-        )
+        # Several pools are asked at once, each on a daemon worker of its own:
+        # a master RPC that hangs must not keep the engine process alive at
+        # exit, as a `ThreadPoolExecutor` worker would (it is joined then).
+        if len(self._pools) > 1:
+            for index, pool in enumerate(self._pools):
+                pool.executor = DaemonExecutor(f"mooncake-store-lookup-{index}")
         # Per pool master: when its next warning may be logged.
         self._next_warning_at: dict[str, float] = {}
         # Answered lookups; those where the ranks held prefixes of different
@@ -302,6 +303,12 @@ class _StoreLookup:
     def clear_lookup_status(self, lookup_id: str) -> None:
         """Nothing to release: a Store read lease expires by itself."""
 
+    def close(self) -> None:
+        """Stop the pool workers; one inside a hung RPC is a daemon thread."""
+        for pool in self._pools:
+            if pool.executor is not None:
+                pool.executor.shutdown()
+
     def _ask(self, keys: list[str]) -> list[int | None] | None:
         """Per key: 1 if a pool holds it, 0 if a pool answered and none holds
         it, None if no pool answered. None when no pool answered any key.
@@ -352,8 +359,8 @@ class _StoreLookup:
         asked = [STORE_TAINT_KEY, *keys]
         asked_at = time.monotonic()
         futures = (
-            [self._executor.submit(pool.client.exists, asked) for pool in pools]
-            if self._executor is not None
+            [pool.executor.submit(pool.client.exists, asked) for pool in pools]
+            if all(pool.executor is not None for pool in pools)
             else None
         )
         answers: list[list[int] | None] = []

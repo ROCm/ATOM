@@ -26,7 +26,7 @@ RENEW_TIMEOUT_S = 1.0
 FALLBACK_LOOKUP_TIMEOUT_S = 2.0
 
 
-class _DaemonExecutor:
+class DaemonExecutor:
     """One worker thread that cannot hold the interpreter's exit.
 
     A `ThreadPoolExecutor` worker is joined at interpreter shutdown, and
@@ -99,11 +99,11 @@ class AsyncStoreLookup:
         self.backend = backend
         self.capacity = capacity
         self.lock = RLock()
-        self.executor = _DaemonExecutor("store-query", limit=capacity)
+        self.executor = DaemonExecutor("store-query", limit=capacity)
         # Renewals ride their own worker so a burst of arrival-time queries
         # cannot queue one behind it; the lock keeps the synchronous Store
         # client (and the pool state around it) to one call at a time.
-        self.renew_executor = _DaemonExecutor("store-renew", limit=64)
+        self.renew_executor = DaemonExecutor("store-renew", limit=64)
         self.backend_lock = Lock()
         self.pending = {}
         self.discarded = set()
@@ -250,3 +250,7 @@ class AsyncStoreLookup:
         # Daemon workers: a hung Store RPC does not hold engine exit.
         self.executor.shutdown()
         self.renew_executor.shutdown()
+        # And the backend's own workers (the Store's per-pool lookups).
+        close = getattr(self.backend, "close", None)
+        if callable(close):
+            close()

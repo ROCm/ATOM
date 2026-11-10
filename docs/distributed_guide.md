@@ -228,21 +228,29 @@ where it lands and the router balances purely by work:
 
 - **Request cost**: a rank-agnostic index of sampled prompt-block hashes
   (`atom/model_engine/share_cache.py`) gives the longest prefix any rank has
-  already computed. Once that request's prefill completed the prefix is in the
-  tier, and every rank is charged only `prompt - hit`; while it is still
+  already computed. Once that request's prefill completed the prefix counts as
+  in the tier, and every rank is charged only `prompt - hit`; while it is still
   prefilling, only its own rank is. A hit below `OFFLOAD_MIN_LOAD_TOKENS` is
-  recomputed and not credited elsewhere.
+  recomputed and not credited elsewhere. The index is a hint: a save still in
+  flight or failed, or an eviction, can leave it listing a prefix the tier no
+  longer holds. When a placed request is admitted, its rank reports how much of
+  the prompt it reused; the router drops the entries past that, the request
+  that computes them becomes their producer, and `atom:dp_share_cache_stale`
+  counts it.
 - **Rank backlog**: each DP engine core reports `(requests ingested, prefill
-  tokens left)` whenever it changes (`EngineCoreRequestType.PREFILL_BACKLOG`).
+  tokens left)` when it changed, at most every 10 ms
+  (`EngineCoreRequestType.PREFILL_BACKLOG`, which also carries the reuse
+  reports above).
   A started request counts `prompt - num_cached_tokens`, so HBM hits, tier
   loads and finished chunks all shrink it as they happen; a request not yet
   allocated counts the router's estimate. The CoreManager adds the charges of
   requests sent after the rank's last report.
 
 It needs `--enable_prefix_caching` and `ATOM_FRONTEND_PREFIX_HASH=1`, and is
-mutually exclusive with `ATOM_DP_SESSION_AFFINITY=1`. Pair it with a low
-`OFFLOAD_MIN_LOAD_TOKENS`/`OFFLOAD_MIN_SAVE_TOKENS` (e.g. 256-1024, so the tier
-holds what HBM holds).
+mutually exclusive with `ATOM_DP_SESSION_AFFINITY=1`. With a Mooncake Store
+`OFFLOAD_MIN_LOAD_TOKENS` defaults to 512. With `lmcache_mp` set
+`OFFLOAD_MIN_LOAD_TOKENS` and `OFFLOAD_MIN_SAVE_TOKENS` low yourself (e.g.
+256-1024), so the tier holds what HBM holds.
 
 When `ATOM_DP_SESSION_AFFINITY=1`, session routing adds a cache-locality layer
 above the configured fallback strategy. A new correlation/session ID is placed
