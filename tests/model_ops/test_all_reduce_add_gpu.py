@@ -8,10 +8,12 @@ the same bits on every rank, at V4.1-Flash's MoE combine width (5120 bf16).
 The fused kernel is aiter's HIP Lamport one-shot all-reduce
 (``CustomAllreduce.lamport_ar_add``, ROCm/aiter#7499). Every row count that
 kernel accepts must call it, including over a HIP-graph capture; the row past
-its cap must not. Requires 4 gfx1250 GPUs and ROCm/aiter#7499.
+its cap must not. The cap is aiter's TP4 default, 8 MiB, not whatever
+``should_lamport_ar_add`` reports. Requires 4 gfx1250 GPUs and ROCm/aiter#7499.
 """
 
 import multiprocessing as mp
+import os
 import time
 
 import pytest
@@ -23,9 +25,14 @@ pytest.importorskip(
 
 _WORLD = 4
 _DIM = 5120
-# Decode sizes, plus one prefill size past any Lamport cap. The cap row and the
-# row just past it are added from the kernel's own predicate.
-_ROWS = (1, 8, 48, 96, 288, 4096)
+# One prefill size past the TP4 Lamport cap. The search stops here.
+_PAST_CAP_ROWS = 4096
+# Decode and verify sizes this fused add is meant to take.
+_DECODE_ROWS = (1, 8, 48, 96, 288)
+_ROWS = _DECODE_ROWS + (_PAST_CAP_ROWS,)
+# aiter's unset TP4 limit, 8 MiB, in rows of 5120 bf16. 819.
+_DEFAULT_CAP_ROWS = (8 << 20) // (_DIM * 2)
+_CAP_ENV = "AITER_CUSTOM_AR_LAMPORT_RMS_MAX_SIZE"
 _GRAPH_ROWS = (48, 8, 288, 1)
 _REPLAYS = 10
 
@@ -71,16 +78,18 @@ def _restore_lamport(original):
 
 
 def _cap_rows(accepts):
-    """Largest row count ``accepts`` takes. The cap is a byte limit, so once a
-    row count is rejected every larger one is too."""
+    """Largest row count ``accepts`` takes, searching only below
+    ``_PAST_CAP_ROWS``.
+
+    The cap is a byte limit, so once a row count is rejected every larger one
+    is too. ``None`` means ``_PAST_CAP_ROWS`` itself was accepted: that probe
+    is the last tensor this search builds.
+    """
+    if accepts(_PAST_CAP_ROWS):
+        return None
     if not accepts(1):
         return 0
-    lo = hi = 1
-    while accepts(hi):
-        lo = hi
-        hi *= 2
-        if hi > 1_000_000:
-            return lo
+    lo, hi = 1, _PAST_CAP_ROWS
     while lo + 1 < hi:
         mid = (lo + hi) // 2
         if accepts(mid):
@@ -106,9 +115,24 @@ def _checks(rank):
         return ca.should_lamport_ar_add(*_pair(rows, 0, rank))
 
     cap_rows = _cap_rows(accepts)
-    for probe in (1, 8, 48):
-        if not accepts(probe):
-            return {"error": f"Lamport declined {probe} rows at {_DIM} bf16"}
+    if cap_rows is None:
+        return {"error": f"Lamport accepted {_PAST_CAP_ROWS} rows at {_DIM} bf16"}
+    if cap_rows < _DECODE_ROWS[-1]:
+        return {
+            "error": (
+                f"Lamport cap is {cap_rows} rows, below decode size "
+                f"{_DECODE_ROWS[-1]}"
+            )
+        }
+    # Unset (and blank) is aiter's 8 MiB TP4 default. A predicate that agrees
+    # with itself at a smaller cap still fails this.
+    if os.environ.get(_CAP_ENV, "").strip() == "" and cap_rows != _DEFAULT_CAP_ROWS:
+        return {
+            "error": (
+                f"Lamport cap is {cap_rows} rows, expected {_DEFAULT_CAP_ROWS} "
+                f"at the unset TP4 limit of 8 MiB"
+            )
+        }
     rows = sorted(set(_ROWS + (cap_rows, cap_rows + 1)))
 
     calls = []
