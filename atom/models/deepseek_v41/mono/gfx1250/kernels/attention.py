@@ -38,6 +38,7 @@ KC = KEYS // CL
 KG_TOPK = 512    # sel row stride (index_plan TOPK)
 KG_RING = 133    # ring_slots (window 128 + 5): set by the build from the cache geometry (the runner checks it against the cache geometry)
 KG_ROW = 512     # pool row stride in bf16 elements (geometry.row_bytes / 2)
+KV8_ROWB = KVD + KVD // 32   # an FP8 pool's row (c["kv8"]): 512 E4M3 then 16 E8M0 codes, one a 32-dim group (528 B)
 KMETA = 4   # kmeta words a token: first, count, (table offset), base
 WG = CL + 4   # LDS row of the merge weights (16 + 1/den, padded to 16 B)
 HP = HD + 8
@@ -68,16 +69,33 @@ def i64(x):
     return fx.Int64(x)
 
 
-def smem_layout(TR):
+K8S = KV8_ROWB   # LDS row of an FP8 key (stage D, kv8): its 512 E4M3 bytes then 16 E8M0 codes, as the pool row
+Q8S = KV8_ROWB   # LDS row of an MXFP8 query head (kv8): 512 E4M3 bytes then 16 codes
+
+
+def smem_layout(TR, kv8=False):
+    """Stage D's LDS (and stage A's sums past SMEM). kv8: the query held as MXFP8 rows (q), the keys staged as FP8 rows
+    (k8) for the scaled QK WMMA, the bf16 keys (k) converted from them for PV."""
     RPC = 2 if TR <= 32 else 3
     QV = RPC * H
     o, off = {}, 0
-    for name, nbytes in (("k", RPC * 48 * HP * 2), ("q", QV * HP * 2), ("s", QV * 48 * 4), ("p", QV * KP * 2),
-                         ("m", QV * 4), ("l", QV * 4), ("red", QV * 5 * 4), ("red2", QV * 5 * 4),
-                         ("wgt", QV * WG * 4), ("ids", RPC * KC * 4), ("kvl", 16)):
+    regions = [("k", RPC * 48 * HP * 2), ("q", QV * (Q8S if kv8 else HP * 2)), ("s", QV * 48 * 4), ("p", QV * KP * 2),
+               ("m", QV * 4), ("l", QV * 4), ("red", QV * 5 * 4), ("red2", QV * 5 * 4),
+               ("wgt", QV * WG * 4), ("ids", RPC * KC * 4), ("kvl", 16)]
+    if kv8:
+        regions.append(("k8", RPC * 48 * K8S))
+    for name, nbytes in regions:
         o[name] = off
         off += nbytes
-    return dict(TR=TR, MT=(TR + 15) // 16, RPC=RPC, QV=QV, o=o, SMEM=off, LDS=off + 512)
+    # past SMEM: stage A's per-row sum of squares and amax [T] each
+    return dict(TR=TR, MT=(TR + 15) // 16, RPC=RPC, QV=QV, o=o, SMEM=off, LDS=off + max(512, 8 * T), kv8=kv8)
+
+
+def m_tiles(MT, w3):
+    """The M tiles of a wave of the GEMV stages that give 3 waves the M dimension (w3 < 3, traced): one tile up to 3 row
+    tiles (48 rows); past that the tiles w3 and w3 + 3 sharing every weight operand the wave loads (a second tile past
+    the build's MT computes on the buffers' unused rows: every row buffer holds T_MAX = 6 tiles)."""
+    return [w3] if MT <= 3 else [w3, w3 + 3]
 
 
 # ------------------------------------------------------------------ device math
@@ -137,6 +155,30 @@ def mx_loop(n, fa, fb, D=4):
     return c
 
 
+def mx_loop_m(n, fas, fb, D=4):
+    """mx_loop for several A operands (M tiles) that share each B operand: one B load a K step, one WMMA a tile.
+    fas: one fa a tile; returns one accumulator a tile."""
+    if len(fas) == 1:
+        return [mx_loop(n, fas[0], fb, D)]
+    m = len(fas)
+    A, B = [[None] * m for _ in range(D)], [None] * D
+    for i in range(min(D, n)):
+        B[i] = fb(i)
+        A[i] = [fa(i) for fa in fas]
+    _sbar()
+    c = [fx.Vector.filled(8, 0.0, F32) for _ in range(m)]
+    for ks in range(0, n, D):
+        for i in range(D):
+            if ks + i < n:
+                for j in range(m):
+                    c[j] = hx.wmma_mx(A[i][j][0], A[i][j][1], B[i][0], B[i][1], c[j])
+                if ks + i + D < n:
+                    A[i] = [fa(ks + i + D) for fa in fas]
+                    B[i] = fb(ks + i + D)
+                    _sbar()
+    return c
+
+
 def _sbar():
     hx.intrin(None, "llvm.amdgcn.sched.barrier", [I32(0)])
 
@@ -184,68 +226,78 @@ def stage_A(c):
         kh = b % 2
         n0 = nt * 16
         if (w < 6) & (w % 3 < MT):
-            mi = w % 3
+            mis = m_tiles(MT, w % 3)
             kk0 = kh * 20 + (w // 3) * 10
-            arow = c["x8"] + i64(mi * 16 + l % 16) * HID
             brow = c["wqkv"] + i64(n0 + l % 16) * HID
 
-            def fa(i):
-                kb = (kk0 + i) * 128
-                xv = hx.gload(c["xs"] + i64((mi * 16 + l % 16) * (HID // 32) + kb // 32) * 4, I32, 4)
-                return ld_op(arow, kb, l), (xv[0] & 255) | ((xv[1] & 255) << 8) | ((xv[2] & 255) << 16) | ((xv[3] & 255) << 24)
+            def fa_of(mi):
+                arow = c["x8"] + i64(mi * 16 + l % 16) * HID
+
+                def fa(i):
+                    kb = (kk0 + i) * 128
+                    xv = hx.gload(c["xs"] + i64((mi * 16 + l % 16) * (HID // 32) + kb // 32) * 4, I32, 4)
+                    return ld_op(arow, kb, l), (xv[0] & 255) | ((xv[1] & 255) << 8) | ((xv[2] & 255) << 16) | ((xv[3] & 255) << 24)
+                return fa
 
             def fb(i):
                 kb = (kk0 + i) * 128
                 return ld_op(brow, kb, l), hx.gload(c["wqkv_s"] + i64(((n0 + l % 16) // 32) * (HID // 32) + kb // 32), I32)
 
-            acc = mx_loop(10, fa, fb)
-            hx.lstore(sm + ((w * 32 + l) * 8) * 4, acc)
+            accs = mx_loop_m(10, [fa_of(mi) for mi in mis], fb)
+            for j in range_constexpr(len(mis)):   # LDS [tile slot j][wave][lane][8]
+                hx.lstore(sm + (((j * 8 + w) * 32 + l) * 8) * 4, accs[j])
             gpu.barrier()
             if (w < 3) & (w < MT):
-                r0v = hx.lload(sm + ((w * 32 + l) * 8) * 4, F32, 8)
-                r1v = hx.lload(sm + (((w + 3) * 32 + l) * 8) * 4, F32, 8)
-                for i in range_constexpr(8):
-                    v = r0v[i] + r1v[i]
-                    hx.gstore(c["qkv_part"] + i64((kh * T + mi * 16 + (l // 16) * 8 + i) * NQKV + n0 + l % 16) * 4, v)
+                for j in range_constexpr(len(mis)):
+                    r0v = hx.lload(sm + (((j * 8 + w) * 32 + l) * 8) * 4, F32, 8)
+                    r1v = hx.lload(sm + (((j * 8 + w + 3) * 32 + l) * 8) * 4, F32, 8)
+                    for i in range_constexpr(8):
+                        v = r0v[i] + r1v[i]
+                        hx.gstore(c["qkv_part"] + i64((kh * T + mis[j] * 16 + (l // 16) * 8 + i) * NQKV + n0 + l % 16) * 4, v)
         else:
             gpu.barrier()
     cluster_sync()
     if (b < 224) & (b % 4 == 0):
         c0 = (b // 4) * 32
         rss = sm + c["SMEM"]
-        gmx = rss + 48 * 4
-        if t < 48:
+        gmx = rss + T * 4
+        if t < T:
             hx.lstore(rss + t * 4, F32(0.0))
             hx.lstore(gmx + t * 4, I32(0))
         gpu.barrier()
-        r = fx.min(t // 4, I32(TR - 1))
         qq = t % 4
         cc = c0 + qq * 8
-        act = t < TR * 4
-        p0 = hx.gload(c["qkv_part"] + i64(r * NQKV + cc) * 4, F32, 8)
-        p1 = hx.gload(c["qkv_part"] + i64((T + r) * NQKV + cc) * 4, F32, 8)
-        hb = [bf(p0[e] + p1[e]) for e in range(8)]
-        xsq = F32(0.0)
-        am = F32(0.0)
-        vv = []
-        for e in range_constexpr(8):
-            x = hb[e].to(F32)
-            xsq = xsq + x * x
-            v = (c0 < QL).select(x * hx.gload(c["qnw"] + i64(cc + e) * 4, F32), x)
-            vv.append(v)
-            am = fx.max(am, abs(v))
-        if act:
-            c["stx"](c["qkv"] + i64(r * NQKV + cc) * 2, fx.Vector.from_elements(hb, BF16))
-            hx.latomic_add_f32(rss + r * 4, xsq)
-            hx.latomic_max_u32(gmx + r * 4, am.bitcast(I32))
+        qn = [(c0 < QL).select(hx.gload(c["qnw"] + i64(cc + e) * 4, F32), F32(1.0)) for e in range(8)]
+        held = []
+        for rh in range_constexpr((TR * 4 + THREADS - 1) // THREADS):   # 4 threads a row: 64 rows a pass
+            r = fx.min(t // 4 + rh * (THREADS // 4), I32(TR - 1))
+            act = t + rh * THREADS < TR * 4
+            p0 = hx.gload(c["qkv_part"] + i64(r * NQKV + cc) * 4, F32, 8)
+            p1 = hx.gload(c["qkv_part"] + i64((T + r) * NQKV + cc) * 4, F32, 8)
+            hb = [bf(p0[e] + p1[e]) for e in range(8)]
+            xsq = F32(0.0)
+            am = F32(0.0)
+            vv = []
+            for e in range_constexpr(8):
+                x = hb[e].to(F32)
+                xsq = xsq + x * x
+                v = (c0 < QL).select(x * qn[e], x)
+                vv.append(v)
+                am = fx.max(am, abs(v))
+            if act:
+                c["stx"](c["qkv"] + i64(r * NQKV + cc) * 2, fx.Vector.from_elements(hb, BF16))
+                hx.latomic_add_f32(rss + r * 4, xsq)
+                hx.latomic_max_u32(gmx + r * 4, am.bitcast(I32))
+            held.append((r, act, vv))
         gpu.barrier()
-        if (c0 < QL) & act:
-            code = e8m0_of(hx.lload(gmx + r * 4, I32).bitcast(F32))
-            inv = inv_pow2(code)
-            bts = [to_e4m3(vv[e] * inv) for e in range(8)]
-            c["stx"](c["qr8"] + i64(r * QL + cc), fx.Vector.from_elements([pack4(bts[:4]), pack4(bts[4:])], I32))
-            if qq == 0:
-                c["stx"](c["qrs"] + i64(r * (QL // 32) + c0 // 32), code.to(fx.Int8))
+        for (r, act, vv) in held:
+            if (c0 < QL) & act:
+                code = e8m0_of(hx.lload(gmx + r * 4, I32).bitcast(F32))
+                inv = inv_pow2(code)
+                bts = [to_e4m3(vv[e] * inv) for e in range(8)]
+                c["stx"](c["qr8"] + i64(r * QL + cc), fx.Vector.from_elements([pack4(bts[:4]), pack4(bts[4:])], I32))
+                if qq == 0:
+                    c["stx"](c["qrs"] + i64(r * (QL // 32) + c0 // 32), code.to(fx.Int8))
         if t < TR:
             hx.atomic_fadd(c["ss"] + i64((c0 < QL).select(I32(0), I32(T)) + t) * 4, hx.lload(rss + t * 4, F32))
 
@@ -254,7 +306,8 @@ def stage_A(c):
 @ASTRewriter.transform
 def stage_kv(c):
     t, b, TR = c["t"], c["b"], c["TR"]
-    if b < 12:
+    kv8 = c.get("kv8", False)   # (a Python bool: read once, outside the traced branches)
+    if b < max(12, (TR + 3) // 4):   # 4 rows a CTA
         for it in range_constexpr((4 * (KVD // 8) + THREADS - 1) // THREADS):
             i = t + it * THREADS
             r = b * 4 + i // (KVD // 8)
@@ -285,14 +338,22 @@ def stage_kv(c):
                 stp = (code << 23).bitcast(F32)
                 cl = [fx.min(fx.max(xr[e] * inv, F32(-448.0)), F32(448.0)) for e in range(8)]
                 rot = []
+                wds = []
                 for h in range_constexpr(2):
                     wd = hx.cvt_pk_fp8_w(hx.cvt_pk_fp8_w(0, cl[4 * h], cl[4 * h + 1], False), cl[4 * h + 2], cl[4 * h + 3], True)
+                    wds.append(wd)
                     a0, a1 = hx.fp8x2_to_f32(wd, False)
                     a2, a3 = hx.fp8x2_to_f32(wd, True)
                     rot += [(a0 * stp).to(BF16), (a1 * stp).to(BF16), (a2 * stp).to(BF16), (a3 * stp).to(BF16)]
                 kw = hx.gload(c["kvw"] + i64(r) * 4, I32)   # this token's ring row (-1: a pad row, not written)
                 if kw >= 0:
-                    c["stx"](c["kv"] + (i64(kw + c["kring_off"]) * KG_ROW + i64(c8)) * 2, fx.Vector.from_elements(rot, BF16))
+                    if fx.const_expr(kv8):   # the FP8 row: its E4M3 bytes, the group's code
+                        rowp = c["kv"] + i64(kw + c["kring_off"]) * KV8_ROWB
+                        c["stx"](rowp + i64(c8), fx.Vector.from_elements(wds, I32))
+                        if c8 % 32 == 0:
+                            c["stx"](rowp + i64(KVD + c8 // 32), code.to(fx.Int8))
+                    else:
+                        c["stx"](c["kv"] + (i64(kw + c["kring_off"]) * KG_ROW + i64(c8)) * 2, fx.Vector.from_elements(rot, BF16))
 
 
 # ------------------------------------------------------------------ C: wq_b (rstd after the GEMM, RoPE)
@@ -301,33 +362,39 @@ def stage_C(c):
     t, b, w, l, MT = c["t"], c["b"], c["w"], c["l"], c["MT"]
     if (w < 6) & (w % 3 < MT):
         j = w // 3
-        mi = w % 3
+        mis = m_tiles(MT, w % 3)
         n0 = (b + j * CTAS) * 16
-        arow = c["qr8"] + i64(mi * 16 + l % 16) * QL
         brow = c["wqb"] + i64(n0 + l % 16) * QL
 
-        def fa(i):
-            kb = i * 128
-            return ld_op(arow, kb, l), hx.gload(c["qrs"] + i64((mi * 16 + l % 16) * (QL // 32) + kb // 32), I32, align=4)
+        def fa_of(mi):
+            arow = c["qr8"] + i64(mi * 16 + l % 16) * QL
+
+            def fa(i):
+                kb = i * 128
+                return ld_op(arow, kb, l), hx.gload(c["qrs"] + i64((mi * 16 + l % 16) * (QL // 32) + kb // 32), I32, align=4)
+            return fa
 
         def fb(i):
             kb = i * 128
             return ld_op(brow, kb, l), hx.gload(c["wqb_s"] + i64(((n0 + l % 16) // 32) * (QL // 32) + kb // 32), I32, align=4)
 
-        acc = mx_loop(QL // 128, fa, fb)
-        cv = [acc[i] * rsq(hx.gload(c["ss"] + i64(mi * 16 + (l // 16) * 8 + i) * 4, F32) / F32(QL) + F32(NORM_EPS)) for i in range(8)]
+        accs = mx_loop_m(QL // 128, [fa_of(mi) for mi in mis], fb)
         is_rope = n0 % HD >= HD - 64
         fi = fx.max((n0 % HD + l % 16 - (HD - 64)) // 2, I32(0))
         odd = (l & 1) == 1
-        res = []
-        for i in range_constexpr(8):
-            r = mi * 16 + (l // 16) * 8 + i
-            x = cv[i].to(BF16).to(F32)
-            y = cv[i].shuffle_xor(1, 32).to(BF16).to(F32)
-            cs, sn = rope_cs(c, r, fi)
-            res.append(is_rope.select(odd.select(y * sn + x * cs, x * cs - y * sn), cv[i]))
-        for i in range_constexpr(8):
-            c["stx"](c["q"] + i64((mi * 16 + (l // 16) * 8 + i) * NQ + n0 + l % 16) * 2, res[i].to(BF16))
+        for jt in range_constexpr(len(mis)):
+            mi = mis[jt]
+            acc = accs[jt]
+            cv = [acc[i] * rsq(hx.gload(c["ss"] + i64(mi * 16 + (l // 16) * 8 + i) * 4, F32) / F32(QL) + F32(NORM_EPS)) for i in range(8)]
+            res = []
+            for i in range_constexpr(8):
+                r = mi * 16 + (l // 16) * 8 + i
+                x = cv[i].to(BF16).to(F32)
+                y = cv[i].shuffle_xor(1, 32).to(BF16).to(F32)
+                cs, sn = rope_cs(c, r, fi)
+                res.append(is_rope.select(odd.select(y * sn + x * cs, x * cs - y * sn), cv[i]))
+            for i in range_constexpr(8):
+                c["stx"](c["q"] + i64((mi * 16 + (l // 16) * 8 + i) * NQ + n0 + l % 16) * 2, res[i].to(BF16))
 
 
 # ------------------------------------------------------------------ D: attention (gathered keys), o as MXFP8
@@ -355,11 +422,124 @@ def _kg_rows(c, t, r0, jj, sm, o, RPC, TR):
             hx.lstore(sm + o["kvl"] + rr * 4, kvl)
 
 
+def _mx8_words(x):
+    """x (8 f32 of a lane; lanes t ^ 1, t ^ 2 the rest of its 32-dim group) as MXFP8: (2 words of E4M3 bytes, the group's
+    ceil E8M0 code) -- rope_window._quantized_row's rule."""
+    am = abs(x[0])
+    for e in range(1, 8):
+        am = fx.max(am, abs(x[e]))
+    am = fx.max(am, am.shuffle_xor(1, 32))
+    am = fx.max(am, am.shuffle_xor(2, 32))
+    code = e8m0_of(am)
+    inv = inv_pow2(code)
+    cl = [fx.min(fx.max(x[e] * inv, F32(-448.0)), F32(448.0)) for e in range(8)]
+    return [hx.cvt_pk_fp8_w(hx.cvt_pk_fp8_w(0, cl[4 * h], cl[4 * h + 1], False), cl[4 * h + 2], cl[4 * h + 3], True)
+            for h in range(2)], code
+
+
+@ASTRewriter.transform
+def _query_fp8(c, t, sm, o, r0, TR, RPC, QV):
+    """The cluster's QV query rows (8 bf16 dims a lane a pass; 4 consecutive lanes a 32-dim group) as MXFP8 (the FP8
+    pool's attention reads the query as MXFP8: rope_window._quantized_row's rule) -> the query LDS rows (Q8S: E4M3
+    bytes, then the codes). Every pass's load is issued before the first is used."""
+    NP = QV * HD // 8 // THREADS
+    vs = []
+    for it in range_constexpr(NP):
+        i = t + it * THREADS
+        qv = i // (HD // 8)
+        cc = i % (HD // 8)
+        qrow = r0 + qv // H
+        if fx.const_expr(TR % RPC != 0):
+            qrow = fx.min(qrow, I32(TR - 1))
+        vs.append(hx.gload(c["q"] + i64((qrow * H + qv % H) * HD + cc * 8) * 2, BF16, 8))
+    for it in range_constexpr(NP):
+        i = t + it * THREADS
+        qv = i // (HD // 8)
+        cc = i % (HD // 8)
+        words, code = _mx8_words([vs[it][e].to(F32) for e in range(8)])
+        qrow8 = sm + o["q"] + qv * Q8S
+        hx.lstore(qrow8 + cc * 8, fx.Vector.from_elements(words, I32))
+        if cc % 4 == 0:   # (4 lanes a 32-dim group: one stores its code)
+            hx.lstore(qrow8 + HD + cc // 4, code.to(fx.Int8))
+
+
+@ASTRewriter.transform
+def _keys_fp8(c, t, sm, o, RPC):
+    """The cluster rows' KC keys each from an FP8 pool (528-byte rows, 33 16-byte chunks) into the FP8 key LDS (k8),
+    by async copies (the QK WMMA reads them as they are); slots KC..47 zeroed (E4M3 0, codes 0)."""
+    NCH = K8S // 16
+    for rr in range_constexpr(RPC):
+        for it in range((KC * NCH + THREADS - 1) // THREADS):
+            i = t + it * THREADS
+            if i < KC * NCH:
+                key = i // NCH
+                ch = i % NCH
+                idv = hx.lload(sm + o["ids"] + (rr * KC + key) * 4, I32)   # absolute pool row
+                hx.async_to_lds_b128(c["kv"] + i64(idv) * KV8_ROWB + i64(ch * 16),
+                                     sm + o["k8"] + (rr * 48 + key) * K8S + ch * 16, 0)
+    NZ8 = RPC * (48 - KC) * NCH
+    for it in range((NZ8 + THREADS - 1) // THREADS):
+        i = t + it * THREADS
+        if i < NZ8:
+            bb = i // ((48 - KC) * NCH)
+            rem = i % ((48 - KC) * NCH)
+            hx.lstore(sm + o["k8"] + (bb * 48 + KC + rem // NCH) * K8S + (rem % NCH) * 16, fx.Vector.filled(4, 0, I32))
+
+
+@ASTRewriter.transform
+def _keys_fp8_to_bf16(t, sm, o, RPC):
+    """The FP8 keys (k8) -> bf16 (E4M3 x 2^(code - 127): exact) in the bf16 key LDS (k), which PV reads as values."""
+    NCK = HD // 16
+    for it in range((RPC * KC * NCK + THREADS - 1) // THREADS):
+        i = t + it * THREADS
+        if i < RPC * KC * NCK:
+            rr = i // (KC * NCK)
+            key = (i // NCK) % KC
+            cc = i % NCK
+            row8 = sm + o["k8"] + (rr * 48 + key) * K8S
+            wv = hx.lload(row8 + cc * 16, I32, 4)
+            cw = hx.lload(row8 + HD + (cc // 8) * 4, I32)   # the dword of codes holding this chunk's group (cc // 2)
+            code = (cw >> (((cc // 2) % 4) * 8)) & 255
+            stp = (code << 23).bitcast(F32)
+            vals = []
+            for k in range_constexpr(4):
+                a0, a1 = hx.fp8x2_to_f32(wv[k], False)
+                a2, a3 = hx.fp8x2_to_f32(wv[k], True)
+                vals += [a0 * stp, a1 * stp, a2 * stp, a3 * stp]
+            dst = sm + o["k"] + ((rr * 48 + key) * HP + cc * 16) * 2
+            hx.lstore(dst, fx.Vector.from_elements([vals[e].to(BF16) for e in range(8)], BF16))
+            hx.lstore(dst + 16, fx.Vector.from_elements([vals[e].to(BF16) for e in range(8, 16)], BF16))
+
+
+def _ld8_lds(row, ks, l):
+    """An MXFP8 WMMA operand (lane l's 64 bytes of K step ks, the ld_op pattern) from an LDS row."""
+    p = row + ks * 128 + (l // 16) * 16
+    parts = [hx.lload(p + cc * 32, I32, 4) for cc in range(4)]
+    return fx.Vector.from_elements([parts[cc][e] for cc in range(4) for e in range(4)], I32)
+
+
+def d_rounds(TR, RPC):
+    """Rounds of stage D: the CTAS // CL clusters take RPC rows each a round (ceil(TR / RPC) clusters of rows)."""
+    return -(-(-(-TR // RPC)) // (CTAS // CL))
+
+
 @ASTRewriter.transform
 def stage_D(c):
+    """Sparse attention, RPC rows a 16-CTA cluster: one round up to 48 rows, past that 2 (the 16 clusters' second RPC
+    rows: their own partials, the LDS of one round reused)."""
+    if fx.const_expr(d_rounds(c["TR"], c["RPC"]) == 1):
+        _stage_D_round(c, I32(0))
+    else:
+        for rnd in range(hx.opaque_s(I32(d_rounds(c["TR"], c["RPC"])))):
+            _stage_D_round(c, rnd)
+
+
+@ASTRewriter.transform
+def _stage_D_round(c, rnd):
     t, b, w, l, sm, o = c["t"], c["b"], c["w"], c["l"], c["sm"], c["o"]
+    kv8 = c.get("kv8", False)   # (a Python bool: read once, outside the traced branches)
     TR, RPC, QV = c["TR"], c["RPC"], c["QV"]
-    cl = b // CL
+    cl = b // CL + rnd * (CTAS // CL)   # the round's cluster: partials apart / aml at its CTA slot cl * CL + jj
     jj = b % CL
     r0 = cl * RPC
     # every row: ceil(TR / RPC) clusters (a draft width 5 B need not be a multiple of RPC)
@@ -374,23 +554,27 @@ def stage_D(c):
         rcv = hx.gload(c["rcos"] + (rpp * 32 + i64(rf0)) * 2, BF16, 16)
         rsv = hx.gload(c["rsin"] + (rpp * 32 + i64(rf0)) * 2, BF16, 16)
         gpu.barrier()
-        for rr in range_constexpr(RPC):
-            for it in range(KC * HD // 8 // THREADS):   # runtime loops in D: smaller code (I-cache, see icache-probe)
+        if fx.const_expr(kv8):   # the FP8 pool: keys converted to bf16, the query on the MXFP8 grid
+            _keys_fp8(c, t, sm, o, RPC)
+            _query_fp8(c, t, sm, o, r0, TR, RPC, QV)
+        else:
+            for rr in range_constexpr(RPC):
+                for it in range(KC * HD // 8 // THREADS):   # runtime loops in D: smaller code (I-cache, see icache-probe)
+                    i = t + it * THREADS
+                    key = i // (HD // 8)
+                    cc = i % (HD // 8)
+                    idv = hx.lload(sm + o["ids"] + (rr * KC + key) * 4, I32)   # absolute pool row
+                    hx.async_to_lds_b128(c["kv"] + (i64(idv) * KG_ROW + i64(cc * 8)) * 2,
+                                         sm + o["k"] + ((rr * 48 + key) * HP + cc * 8) * 2, 0)
+            for it in range(QV * HD // 8 // THREADS):
                 i = t + it * THREADS
-                key = i // (HD // 8)
+                qv = i // (HD // 8)
                 cc = i % (HD // 8)
-                idv = hx.lload(sm + o["ids"] + (rr * KC + key) * 4, I32)   # absolute pool row
-                hx.async_to_lds_b128(c["kv"] + (i64(idv) * KG_ROW + i64(cc * 8)) * 2,
-                                     sm + o["k"] + ((rr * 48 + key) * HP + cc * 8) * 2, 0)
-        for it in range(QV * HD // 8 // THREADS):
-            i = t + it * THREADS
-            qv = i // (HD // 8)
-            cc = i % (HD // 8)
-            qrow = r0 + qv // H
-            if fx.const_expr(TR % RPC != 0):
-                qrow = fx.min(qrow, I32(TR - 1))
-            hx.async_to_lds_b128(c["q"] + i64((qrow * H + qv % H) * HD + cc * 8) * 2,
-                                 sm + o["q"] + (qv * HP + cc * 8) * 2, 0)
+                qrow = r0 + qv // H
+                if fx.const_expr(TR % RPC != 0):
+                    qrow = fx.min(qrow, I32(TR - 1))
+                hx.async_to_lds_b128(c["q"] + i64((qrow * H + qv % H) * HD + cc * 8) * 2,
+                                     sm + o["q"] + (qv * HP + cc * 8) * 2, 0)
         NZ = RPC * (48 - KC) * HD // 8
         for it in range(hx.opaque_s(I32((NZ + THREADS - 1) // THREADS))):
             i = t + it * THREADS
@@ -398,7 +582,7 @@ def stage_D(c):
                 bb = i // ((48 - KC) * HD // 8)
                 rem = i % ((48 - KC) * HD // 8)
                 hx.lstore(sm + o["k"] + ((bb * 48 + KC + rem // (HD // 8)) * HP + (rem % (HD // 8)) * 8) * 2, fx.Vector.filled(4, 0, I32))
-        pp = c["apart"] + i64(b * QV * HD) * 2
+        pp = c["apart"] + i64((cl * CL + jj) * QV * HD) * 2
         hx.wait_asynccnt0()
         gpu.barrier()
         for tt in range(hx.opaque_s(I32(2))):   # (opaque trip count: kept a loop)
@@ -407,13 +591,22 @@ def stage_D(c):
                 mi = tile // 3
                 ni = tile % 3
                 acc = fx.Vector.filled(8, 0.0, F32)
-                for ks in range(HD // 32):
-                    d0 = ks * 32 + (l // 16) * 16
-                    av = hx.lload(sm + o["q"] + ((mi * H + l % 16) * HP + d0) * 2, BF16, 16)
-                    bv = hx.lload(sm + o["k"] + ((mi * 48 + ni * 16 + l % 16) * HP + d0) * 2, BF16, 16)
-                    acc = hx.wmma_bf16(av, bv, acc)
+                if fx.const_expr(kv8):   # MXFP8 query x FP8 keys: the scaled WMMA, 4 K steps of 128
+                    qrow8 = sm + o["q"] + (mi * H + l % 16) * Q8S
+                    krow8 = sm + o["k8"] + (mi * 48 + ni * 16 + l % 16) * K8S
+                    for ks in range_constexpr(HD // 128):
+                        acc = hx.wmma_mx(_ld8_lds(qrow8, ks, l), hx.lload(qrow8 + HD + ks * 4, I32),
+                                         _ld8_lds(krow8, ks, l), hx.lload(krow8 + HD + ks * 4, I32), acc)
+                else:
+                    for ks in range(HD // 32):
+                        d0 = ks * 32 + (l // 16) * 16
+                        av = hx.lload(sm + o["q"] + ((mi * H + l % 16) * HP + d0) * 2, BF16, 16)
+                        bv = hx.lload(sm + o["k"] + ((mi * 48 + ni * 16 + l % 16) * HP + d0) * 2, BF16, 16)
+                        acc = hx.wmma_bf16(av, bv, acc)
                 for i in range_constexpr(8):
                     hx.lstore(sm + o["s"] + ((mi * H + (l // 16) * 8 + i) * 48 + ni * 16 + l % 16) * 4, acc[i] * c["scale"])
+        if fx.const_expr(kv8):   # the values PV reads: the FP8 keys as bf16 (k is not read by the QK above)
+            _keys_fp8_to_bf16(t, sm, o, RPC)
         gpu.barrier()
         sg = t % 5
         a5 = t < QV * 5
@@ -479,8 +672,8 @@ def stage_D(c):
                           fx.Vector.from_elements([acc[i].to(BF16) for i in range(8)], BF16))
         gpu.barrier()
         if t < QV:
-            hx.gstore(c["aml"] + i64(b * QV * 2 + t * 2) * 4, hx.lload(sm + o["m"] + t * 4, F32))
-            hx.gstore(c["aml"] + i64(b * QV * 2 + t * 2 + 1) * 4, hx.lload(sm + o["l"] + t * 4, F32))
+            hx.gstore(c["aml"] + i64((cl * CL + jj) * QV * 2 + t * 2) * 4, hx.lload(sm + o["m"] + t * 4, F32))
+            hx.gstore(c["aml"] + i64((cl * CL + jj) * QV * 2 + t * 2 + 1) * 4, hx.lload(sm + o["l"] + t * 4, F32))
         cluster_sync()
         c0 = cl * CL
         # merge: thread g < QV*4 owns dim dd = g // (QV/8) of this CTA's 32 and 8 consecutive qv: one b128 load a partial
@@ -561,38 +754,45 @@ def stage_E(c):
     nb = cgp * 32
     if (w < 6) & (w % 3 < MT):
         jt = w // 3
-        mi = w % 3
+        mis = m_tiles(MT, w % 3)
         n0 = nb + jt * 16
-        arow = c["o8"] + i64((mi * 16 + l % 16) * NQ + g * KWOA + kq * 1024)
         brow = c["woa"] + i64((n0 + l % 16) * KWOA + kq * 1024)
 
-        def fa(i):
-            kb = i * 128
-            return ld_op(arow, kb, l), hx.gload(c["os"] + i64((mi * 16 + l % 16) * (NQ // 32) + (g * KWOA + kq * 1024 + kb) // 32), I32, align=4)
+        def fa_of(mi):
+            arow = c["o8"] + i64((mi * 16 + l % 16) * NQ + g * KWOA + kq * 1024)
+
+            def fa(i):
+                kb = i * 128
+                return ld_op(arow, kb, l), hx.gload(c["os"] + i64((mi * 16 + l % 16) * (NQ // 32) + (g * KWOA + kq * 1024 + kb) // 32), I32, align=4)
+            return fa
 
         def fb(i):
             kb = i * 128
             return ld_op(brow, kb, l), hx.gload(c["woa_s"] + i64(((n0 + l % 16) // 32) * (KWOA // 32) + (kq * 1024 + kb) // 32), I32, align=4)
 
-        acc = mx_loop(8, fa, fb)
+        accs = mx_loop_m(8, [fa_of(mi) for mi in mis], fb)
         yp = c["ypart"] + i64(b * T * 32) * 4
-        for i in range_constexpr(8):
-            hx.gstore(yp + i64((mi * 16 + (l // 16) * 8 + i) * 32 + jt * 16 + l % 16) * 4, acc[i])
+        for j in range_constexpr(len(mis)):
+            for i in range_constexpr(8):
+                hx.gstore(yp + i64((mis[j] * 16 + (l // 16) * 8 + i) * 32 + jt * 16 + l % 16) * 4, accs[j][i])
     cluster_sync()
-    if (t < 12 * 16) & (kq * 12 + t // 16 < TR):
-        r = kq * 12 + t // 16
-        cp = (t % 16) * 2
-        v0 = F32(0.0)
-        v1 = F32(0.0)
-        for qq in range_constexpr(4):
-            ypq = c["ypart"] + i64(((cgp * 4 + qq) * T + r) * 32 + cp) * 4
-            v0 = v0 + hx.gload(ypq, F32)
-            v1 = v1 + hx.gload(ypq + i64(4), F32)
-        hx.lstore(sm + ((t // 16) * 32 + cp) * 4, v0.to(BF16).to(F32))
-        hx.lstore(sm + ((t // 16) * 32 + cp + 1) * 4, v1.to(BF16).to(F32))
+    RQ = max(12, (TR + 3) // 4)   # rows a K-quarter CTA of the group finishes (16 threads a row)
+    for rh in range_constexpr((RQ * 16 + THREADS - 1) // THREADS):
+        tr = t + rh * THREADS
+        if (tr < RQ * 16) & (kq * RQ + tr // 16 < TR):
+            r = kq * RQ + tr // 16
+            cp = (tr % 16) * 2
+            v0 = F32(0.0)
+            v1 = F32(0.0)
+            for qq in range_constexpr(4):
+                ypq = c["ypart"] + i64(((cgp * 4 + qq) * T + r) * 32 + cp) * 4
+                v0 = v0 + hx.gload(ypq, F32)
+                v1 = v1 + hx.gload(ypq + i64(4), F32)
+            hx.lstore(sm + ((tr // 16) * 32 + cp) * 4, v0.to(BF16).to(F32))
+            hx.lstore(sm + ((tr // 16) * 32 + cp + 1) * 4, v1.to(BF16).to(F32))
     gpu.barrier()
-    if (t < 12) & (kq * 12 + t < TR):
-        r = kq * 12 + t
+    if (t < RQ) & (kq * RQ + t < TR):
+        r = kq * RQ + t
         vq = [hx.lload(sm + (t * 32 + 4 * k) * 4, F32, 4) for k in range(8)]
         vals = [vq[e // 4][e % 4] for e in range(32)]
         amax = F32(0.0)
@@ -616,26 +816,39 @@ def stage_F_cluster(c):
     kq = b % 4
     cb = cg * 80
     op = c["opart"] + i64(b * T * 80) * 4
-    for pp_ in range_constexpr(2):
+    # tasks: (N tile nt of 5, M tile mi) up to 3 row tiles; past that (nt, M group mg of 3 tiles: one weight load for 3)
+    MG = 1 if MT <= 3 else 3
+    NTASK = 5 * ((MT + MG - 1) // MG) if MT > 3 else 15
+    for pp_ in range_constexpr((NTASK + 7) // 8):
         pr = w + pp_ * 8
-        nt = pr // 3
-        mi = pr % 3
-        if (pr < 15) & (mi < MT):
+        if fx.const_expr(MT <= 3):
+            nt = pr // 3
+            mis = [pr % 3]
+            live = (pr < 15) & (pr % 3 < MT)
+        else:
+            nt = pr // 2
+            mis = [(pr % 2) * 3 + j for j in range(3)]
+            live = pr < NTASK
+        if live:
             n0 = cb + nt * 16
-            arow = c["y8"] + i64((mi * 16 + l % 16) * NWOA + kq * 512)
             brow = c["wob"] + i64((n0 + l % 16) * NWOA + kq * 512)
 
-            def fa(i):
-                kb = i * 128
-                return ld_op(arow, kb, l), hx.gload(c["ys"] + i64((mi * 16 + l % 16) * (NWOA // 32) + (kq * 512 + kb) // 32), I32, align=4)
+            def fa_of(mi):
+                arow = c["y8"] + i64((mi * 16 + l % 16) * NWOA + kq * 512)
+
+                def fa(i):
+                    kb = i * 128
+                    return ld_op(arow, kb, l), hx.gload(c["ys"] + i64((mi * 16 + l % 16) * (NWOA // 32) + (kq * 512 + kb) // 32), I32, align=4)
+                return fa
 
             def fb(i):
                 kb = i * 128
                 return ld_op(brow, kb, l), hx.gload(c["wob_s"] + i64(((n0 + l % 16) // 32) * (NWOA // 32) + (kq * 512 + kb) // 32), I32, align=4)
 
-            acc = mx_loop(4, fa, fb)
-            for i in range_constexpr(8):
-                hx.gstore(op + i64((mi * 16 + (l // 16) * 8 + i) * 80 + nt * 16 + l % 16) * 4, acc[i])
+            accs = mx_loop_m(4, [fa_of(mi) for mi in mis], fb)
+            for j in range_constexpr(len(mis)):   # (opart holds T_MAX rows: a tile past MT lands in unread rows)
+                for i in range_constexpr(8):
+                    hx.gstore(op + i64((mis[j] * 16 + (l // 16) * 8 + i) * 80 + nt * 16 + l % 16) * 4, accs[j][i])
     cluster_sync()
     for it in range_constexpr((TR * 20 + THREADS - 1) // THREADS):
         i = t + it * THREADS
@@ -649,48 +862,53 @@ def stage_F_cluster(c):
 
 
 # ------------------------------------------------------------------ TP push-then-reduce (tagged b128, all-reduce)
+TP_TG = CTAS * ((T * 10 + 2) // 3)   # 16-byte words a (region, source) block of the receive buffers: every CTA's TPG
+
+
 @ASTRewriter.transform
 def tp_allreduce(c, region, tag):
     """This CTA's 20 cols x TR rows (fp32 in LDS [r][20]) -> bf16 pairs, 3 pairs + tag a 16-byte word, pushed
     nontemporally to every peer's receive region (region * 4 + src); the 3 peers' words polled together and summed ->
-    tpout and (device scope) row-major bf16 [row][5120] at ytgt (the next front's input y)."""
+    tpout and (device scope) row-major bf16 [row][5120] at ytgt (the next front's input y). A thread a word (two past
+    76 rows: TPG > 256)."""
     t, b, TR = c["t"], c["b"], c["TR"]
-    TP_TG = 40960
     TPG = (TR * 10 + 2) // 3   # ceil: TR * 10 words need not be a multiple of 3 (draft rows 5 a request)
     NWD = TR * 10
     rank = c["rank"]
-    if t < TPG:
-        lo, hi, wv = [], [], []
-        for k in range_constexpr(3):
-            wi = t * 3 + k
-            lo.append(hx.lload(c["sm"] + ((wi // 10) * 20 + 2 * (wi % 10)) * 4, F32))
-            hi.append(hx.lload(c["sm"] + ((wi // 10) * 20 + 2 * (wi % 10) + 1) * 4, F32))
-            wv.append(lo[k].to(BF16).bitcast(fx.Int16).to(I32) & 0xFFFF | (hi[k].to(BF16).bitcast(fx.Int16).to(I32) << 16))
-        v = fx.Vector.from_elements([wv[0], wv[1], wv[2], I32(tag)], I32)
-        for o in range_constexpr(4):
-            if o != rank:
-                hx.gstore(c["recv"][o] + (i64((region * 4) * TP_TG) + i64(rank * TP_TG) + i64(b * TPG + t)) * 16, v, nt=True)
-        # the 3 peers' tags polled together (3 loads in flight an iteration), then the 3 words loaded together
-        sl = [lo[k].to(BF16).to(F32) for k in range(3)]
-        sh = [hi[k].to(BF16).to(F32) for k in range(3)]
-        gps = [c["recv"][rank] + (i64((region * 4) * TP_TG) + i64(o * TP_TG) + i64(b * TPG + t)) * 16 for o in range(4) if o != rank]
-        t0 = hx.clock()
-        while ((hx.gload(gps[0] + i64(12), I32, nt=True) != tag) | (hx.gload(gps[1] + i64(12), I32, nt=True) != tag)
-               | (hx.gload(gps[2] + i64(12), I32, nt=True) != tag)) & (hx.clock() - t0 < fx.Int64(hx.POLL_TICKS)):
-            hx.s_sleep(0)
-        hx.note_timeout(t0, 6)
-        gots = [hx.gload(gp, I32, 4, nt=True) for gp in gps]
-        for got in gots:
+    for it in range_constexpr((TPG + THREADS - 1) // THREADS):
+        tw = t + it * THREADS
+        if tw < TPG:
+            lo, hi, wv = [], [], []
+            for k in range_constexpr(3):
+                wi = tw * 3 + k
+                lo.append(hx.lload(c["sm"] + ((wi // 10) * 20 + 2 * (wi % 10)) * 4, F32))
+                hi.append(hx.lload(c["sm"] + ((wi // 10) * 20 + 2 * (wi % 10) + 1) * 4, F32))
+                wv.append(lo[k].to(BF16).bitcast(fx.Int16).to(I32) & 0xFFFF | (hi[k].to(BF16).bitcast(fx.Int16).to(I32) << 16))
+            v = fx.Vector.from_elements([wv[0], wv[1], wv[2], I32(tag)], I32)
+            for o in range_constexpr(4):
+                if o != rank:
+                    hx.gstore(c["recv"][o] + (i64((region * 4) * TP_TG) + i64(rank * TP_TG) + i64(b * TPG + tw)) * 16, v, nt=True)
+            # the 3 peers' tags polled together (3 loads in flight an iteration), then the 3 words loaded together
+            sl = [lo[k].to(BF16).to(F32) for k in range(3)]
+            sh = [hi[k].to(BF16).to(F32) for k in range(3)]
+            gps = [c["recv"][rank] + (i64((region * 4) * TP_TG) + i64(o * TP_TG) + i64(b * TPG + tw)) * 16 for o in range(4) if o != rank]
+            t0 = hx.clock()
+            while ((hx.gload(gps[0] + i64(12), I32, nt=True) != tag) | (hx.gload(gps[1] + i64(12), I32, nt=True) != tag)
+                   | (hx.gload(gps[2] + i64(12), I32, nt=True) != tag)) & (hx.clock() - t0 < fx.Int64(hx.POLL_TICKS)):
+                hx.s_sleep(0)
+            hx.note_timeout(t0, 6)
+            gots = [hx.gload(gp, I32, 4, nt=True) for gp in gps]
+            for got in gots:
+                for q in range_constexpr(3):
+                    sl[q] = sl[q] + (got[q] << 16).bitcast(F32)
+                    sh[q] = sh[q] + (got[q] & I32(-65536)).bitcast(F32)
             for q in range_constexpr(3):
-                sl[q] = sl[q] + (got[q] << 16).bitcast(F32)
-                sh[q] = sh[q] + (got[q] & I32(-65536)).bitcast(F32)
-        for q in range_constexpr(3):
-            wq = sl[q].to(BF16).bitcast(fx.Int16).to(I32) & 0xFFFF | (sh[q].to(BF16).bitcast(fx.Int16).to(I32) << 16)
-            hx.gstore(c["tpout"] + i64(b * TPG * 3 + t * 3 + q) * 4, wq)
-            wi = t * 3 + q
-            col = (b // 4) * 80 + (b % 4) * 20 + 2 * (wi % 10)
-            if fx.const_expr(NWD % 3 == 0 or q == 0):
-                hx.stx_dev(c["ytgt"] + (i64(wi // 10) * HID + i64(col)) * 2, wq)
-            else:
-                if wi < NWD:   # the last thread's padding words: no row
+                wq = sl[q].to(BF16).bitcast(fx.Int16).to(I32) & 0xFFFF | (sh[q].to(BF16).bitcast(fx.Int16).to(I32) << 16)
+                hx.gstore(c["tpout"] + i64(b * TPG * 3 + tw * 3 + q) * 4, wq)
+                wi = tw * 3 + q
+                col = (b // 4) * 80 + (b % 4) * 20 + 2 * (wi % 10)
+                if fx.const_expr(NWD % 3 == 0 or q == 0):
                     hx.stx_dev(c["ytgt"] + (i64(wi // 10) * HID + i64(col)) * 2, wq)
+                else:
+                    if wi < NWD:   # the last thread's padding words: no row
+                        hx.stx_dev(c["ytgt"] + (i64(wi // 10) * HID + i64(col)) * 2, wq)

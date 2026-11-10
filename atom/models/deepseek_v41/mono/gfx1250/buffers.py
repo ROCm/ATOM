@@ -19,8 +19,9 @@ Each name is one of:
 
 SCRATCH, PEER, WEIGHT, STEP, STATE = "scratch", "peer", "weight", "step", "state"
 
-T_MAX = 48  # target rows: 8 requests x (5 drafts + 1)
-TD_MAX = 40  # draft rows: 8 requests x 5
+MAX_REQ = 16  # requests a step
+T_MAX = MAX_REQ * 6  # target rows: 16 requests x (5 drafts + 1)
+TD_MAX = MAX_REQ * 5  # draft rows: 16 requests x 5
 
 # fp table (FPTRS), in order
 FPTRS_ROLE = {
@@ -219,6 +220,10 @@ def scratch_bytes(K, nlt: int) -> dict[str, int]:
     M = K["step"]
     T, H = T_MAX, FS.H
     QV = S.smem_layout(T)["QV"]
+    NRD = S.d_rounds(
+        T, S.smem_layout(T)["RPC"]
+    )  # stage D's rounds at the widest step (each its own partials)
+    TPG = (T * 10 + 2) // 3  # TP words a CTA at the widest step
     G = FS.NG * FS.CL * FS.TG
     return {
         # attention
@@ -230,8 +235,8 @@ def scratch_bytes(K, nlt: int) -> dict[str, int]:
         "qrs": T * S.QL // 32,
         "kvn": T * S.KVD * 2,
         "q": T * S.NQ * 2,
-        "apart": 256 * QV * S.HD * 2,
-        "aml": 256 * QV * 2 * 4,
+        "apart": NRD * 256 * QV * S.HD * 2,
+        "aml": NRD * 256 * QV * 2 * 4,
         "o8": T * S.NQ,
         "os_": T * S.NQ // 32,
         "y8": T * S.NWOA,
@@ -239,7 +244,7 @@ def scratch_bytes(K, nlt: int) -> dict[str, int]:
         "ypart": 256 * T * 32 * 4,
         "out": T * S.HID * 4,
         "opart": 256 * T * 80 * 4,
-        "tpout": 256 * 480 * 4,
+        "tpout": 256 * TPG * 3 * 4,
         "x8": T * S.HID,
         "xs": T * S.HID // 32 * 4,
         # FFN front, MoE
@@ -261,15 +266,15 @@ def scratch_bytes(K, nlt: int) -> dict[str, int]:
         "ncomb": T * 64,
         "ids": T * FS.TOPK * 4,
         "wts": T * FS.TOPK * 4,
-        "mout": (48 * 6 + 48 + 1) * H * 4,
-        "mid8": MS.NE * MS.MAXTOK * MS.MROW,
-        "midc": MS.NE * MS.MAXTOK * MS.CROW,
+        "mout": (T * 6 + T + 1) * H * 4,
+        "mid8": MS.NEX * MS.MAXTOK * MS.MROW,
+        "midc": MS.NEX * MS.MAXTOK * MS.CROW,
         "aRout": T * 4 * H * 2,
         "axn": T * H * 2,
         "anpre": T * 16,
         "anpost": T * 16,
         "ancomb": T * 64,
-        "tp2out": 256 * 480 * 4,
+        "tp2out": 256 * TPG * 3 * 4,
         "cyc": 256 * 32 * 8 * 2,
         "y1": T * H * 2,
         "y2": T * H * 2,
@@ -296,7 +301,7 @@ def scratch_bytes(K, nlt: int) -> dict[str, int]:
         "eng8": T * 6144,
         "engs": T * 192,
         "engkv": T * 25600 * 2,
-        "engpart": 768 * 16 * 4,
+        "engpart": G * 16 * 4,
         # step tail
         "xh": T * HF.HID * 2,
         "logits": T * HF.VR * 4,
@@ -307,8 +312,8 @@ def scratch_bytes(K, nlt: int) -> dict[str, int]:
         "prow": T * 8 * 4,
         "sids": T * 4,
         "outtok": T * 4,
-        "verdict": 24 * 4,
-        "anc": 8 * 4,
+        "verdict": 3 * MAX_REQ * 4,
+        "anc": MAX_REQ * 4,
         "dh": T * HF.HID * 2,
         "dlog": T * HF.VR * 4,
         "mids": TD_MAX * 4,

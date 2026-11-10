@@ -25,6 +25,9 @@ SCORE = 48  # indexer score done
 SELECT0 = 52  # selection pass p done: SELECT0 + 4 p (p < 2 IDX_LEVELS)
 SELECT_PASSES = 6  # room for 6 passes (52 .. 72)
 X8_PUB = 92  # FFN front's x8 / xs out (the early shared-expert UG waits on it)
+MOE_DYN = (
+    96  # MoE: the next routed UG unit (moe_plan.dynamic_units: a wave's atomic take)
+)
 TP1_GROUPS = 128  # wo_b + TP1 column groups: 16 x 4 B
 TP2_GROUPS = 192  # combine + TP2 column groups: 16 x 4 B
 GROUPS = 16
@@ -43,7 +46,7 @@ TARGET_FRONT = 448  # target entry: attention front done
 
 # --- fixed LDS regions --------------------------------------------------------------------------------------------
 TP_PAYLOAD = 0  # [TR][20] f32 TP reduction payload, kept across the FFN front
-FRONT_LDS = 4096  # the fronts' / MoE's LDS (after the TP payload)
+FRONT_LDS = 8192  # the fronts' / MoE's LDS (after the TP payload: 96 rows x 80 B)
 RKEEP = 294912  # the residual streams kept between the fronts
 
 # --- layer-table rows -------------------------------------------------------------------------------------------------
@@ -68,6 +71,7 @@ def layer_slots() -> dict:
         "SCORE": (SCORE, 4),
         "SELECT": (SELECT0, 4 * SELECT_PASSES),
         "X8_PUB": (X8_PUB, 4),
+        "MOE_DYN": (MOE_DYN, 4),
         "TP1_GROUPS": (TP1_GROUPS, 4 * GROUPS),
         "TP2_GROUPS": (TP2_GROUPS, 4 * GROUPS),
     }
