@@ -216,14 +216,10 @@ def _rope_window_kernel(
     query_rows = tokens * QUERY_PROGRAMS
     is_query = pid < query_rows
     token = tl.where(is_query, pid // max(QUERY_PROGRAMS, 1), pid - query_rows)
-    slot = tl.where(is_query, pid % max(QUERY_PROGRAMS, 1), QUERY_PROGRAMS)
     position = tl.load(positions + token)
     dim = tl.arange(0, D)
-    if HEAD_BLOCK:
-        query_slot = slot == 0
-    else:
-        query_slot = slot < HEADS // FP8_HEADS
-    if query_slot:
+    if is_query:
+        slot = pid % max(QUERY_PROGRAMS, 1)
         if HEAD_BLOCK:
             _rotate_heads(query, token, position, cos, sin, HEADS, D, ROPE)
         elif EMIT_QUERY_FP8 and FP8_HEADS > 1:
