@@ -471,6 +471,18 @@ def test_state_shape_widens_the_conv_window_for_draft_tokens():
     assert state3 == state0
 
 
+def test_kda_metadata_keeps_verify_rows_on_the_write_slot():
+    """ATOM's shared KDA forward reads a state read-side index for plain and
+    verify rows alike; vLLM's metadata has neither, and None keeps both on
+    the slot vLLM writes."""
+    from vllm.models.kimi_k3.nvidia.kda_metadata import KimiK3KDAMetadata
+
+    import atom.plugin.vllm.kda_backend  # noqa: F401
+
+    assert KimiK3KDAMetadata.non_spec_state_indices_in_tensor is None
+    assert KimiK3KDAMetadata.spec_state_indices_in_tensor is None
+
+
 def test_mtp_draft_is_registered_with_the_deepseek_mtp_contract():
     from atom.plugin.vllm import model_wrapper as mw
     from atom.plugin.vllm import register
