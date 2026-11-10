@@ -242,7 +242,7 @@ def _scatter_offsets(n, offsets):
     return offsets[:k]
 
 
-def lane_reduce_scatter(vs, offsets, lane):
+def lane_reduce_scatter(vs, offsets, lane, architecture: Architecture = GFX950):
     """``butterflies(vs, offsets)`` (a power-of-two count of f32 sums over the
     lanes the offsets span) when a lane needs one of the sums: over the first
     log2(len(vs)) offsets a lane keeps half of what it carries -- the values
@@ -254,7 +254,7 @@ def lane_reduce_scatter(vs, offsets, lane):
     for off in scat:
         h = len(vs) // 2
         bit = (lane & off) != 0
-        if off == 16:
+        if off == 16 and architecture.native_permlane_exchange:
             # v_permlane16_swap(x, y): the even row gets (its x, the odd row's
             # x), the odd row (the even row's y, its y): the low half's sum on
             # the even row, the high half's on the odd -- low + high both
@@ -264,18 +264,21 @@ def lane_reduce_scatter(vs, offsets, lane):
         else:
             keep = [bit.select(vs[i + h], vs[i]) for i in range(h)]
             send = [bit.select(vs[i], vs[i + h]) for i in range(h)]
-            vs = [fx.Float32(k) + xshfl(fx.Float32(s), off) for k, s in zip(keep, send)]
+            vs = [
+                fx.Float32(k) + xshfl(fx.Float32(s), off, architecture)
+                for k, s in zip(keep, send)
+            ]
         row = row + bit.select(fx.Int32(h), fx.Int32(0))
     (v,) = vs
-    return butterfly(v, offsets[len(scat) :]), row
+    return butterfly(v, offsets[len(scat) :], architecture=architecture), row
 
 
-def lane_all_gather(v, n, offsets, lane):
+def lane_all_gather(v, n, offsets, lane, architecture: Architecture = GFX950):
     """Every lane all n sums of ``lane_reduce_scatter(.., offsets, ..)`` from its own
     one (v), in ``vs``' order: the halving undone, the last offset first."""
     vs = [v]
     for off in reversed(_scatter_offsets(n, offsets)):
-        if off == 16:
+        if off == 16 and architecture.native_permlane_exchange:
             # x = y: the even row gets (its own, the odd row's), the odd row
             # (the even row's, its own) -- (low half's, high half's) both
             pairs = [permlane_swap(16, x.bitcast(fx.Int32), x.bitcast(fx.Int32))
@@ -285,7 +288,7 @@ def lane_all_gather(v, n, offsets, lane):
             ]
         else:
             bit = (lane & off) != 0
-            other = [xshfl(x, off) for x in vs]
+            other = [xshfl(x, off, architecture) for x in vs]
             vs = [fx.Float32(bit.select(o, x)) for x, o in zip(vs, other)] + [
                 fx.Float32(bit.select(x, o)) for x, o in zip(vs, other)
             ]

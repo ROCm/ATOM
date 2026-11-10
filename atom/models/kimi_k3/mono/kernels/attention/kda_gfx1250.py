@@ -38,6 +38,8 @@ from atom.mono.device.ops import (
     butterfly,
     hw_exp2,
     hw_rsq,
+    lane_all_gather,
+    lane_reduce_scatter,
     ld_i32,
     mma_bf16,
     rsrc,
@@ -51,6 +53,7 @@ LOG2E = 1.0 / math.log(2.0)
 HEADS = 12
 HEAD_DIM = GATE_K
 STATE_CHUNKS = 8
+LANE_OFFSETS = (16, 8, 4, 2, 1)
 VALUE_CHUNK = 16
 NPROJ = 6288
 SEAM_COLUMNS = 128
@@ -486,8 +489,10 @@ def kda_recur_head(c, k, request, head):
     """Advance a whole head: wave ``w`` owns chunk ``w``'s sixteen state rows.
 
     Every row is an independent recurrence over the head's q/k/decay, so one
-    token loop advances all of a wave's rows and their reduction chains
-    overlap; partial output norms stay CTA-local."""
+    token loop advances all of a wave's rows. A row's projection is
+    reduce-scattered then gathered back to every lane and its output only
+    reduce-scattered, adding the pairs a butterfly adds: the same bits.
+    Partial output norms stay CTA-local."""
 
     L, lane, wave = c["L"], c["lane"], c["wave"]
     args = c["args"]
@@ -531,33 +536,44 @@ def kda_recur_head(c, k, request, head):
         # Every lane holds the same slot; a VGPR one would put each state
         # store below in its own waterfall loop over the descriptor.
         slot = uniform(fx.ptr_load(c["slots"] + token))
+        decayed = [
+            [state[4 * row + element] * decay[element] for element in range(4)]
+            for row in range(ROWS)
+        ]
+        projection, _ = lane_reduce_scatter(
+            [
+                d[0] * key[0] + d[1] * key[1] + d[2] * key[2] + d[3] * key[3]
+                for d in decayed
+            ],
+            LANE_OFFSETS,
+            lane,
+            architecture=GFX1250,
+        )
+        projections = lane_all_gather(
+            projection, ROWS, LANE_OFFSETS, lane, architecture=GFX1250
+        )
         updated = []
         outputs = []
         for row in range_constexpr(ROWS):
-            row_state = [state[4 * row + element] * decay[element] for element in range(4)]
-            projection = (
-                row_state[0] * key[0]
-                + row_state[1] * key[1]
-                + row_state[2] * key[2]
-                + row_state[3] * key[3]
-            )
-            projection = butterfly(projection, (16, 8, 4, 2, 1), architecture=GFX1250)
             value = (
-                fx.ptr_load(c["vloc"] + token * HEAD_DIM + row0 + row) - projection
+                fx.ptr_load(c["vloc"] + token * HEAD_DIM + row0 + row)
+                - projections[row]
             ) * beta
-            row_state = [row_state[element] + value * key[element] for element in range(4)]
-            output = (
+            row_state = [
+                decayed[row][element] + value * key[element] for element in range(4)
+            ]
+            outputs.append(
                 row_state[0] * q[0]
                 + row_state[1] * q[1]
                 + row_state[2] * q[2]
                 + row_state[3] * q[3]
             )
-            output = _bf16_round(
-                butterfly(output, (16, 8, 4, 2, 1), architecture=GFX1250)
-            )
             updated.extend(row_state)
-            outputs.append(live.select(output, fx.Float32(0.0)))
         state = updated
+        output, output_row = lane_reduce_scatter(
+            outputs, LANE_OFFSETS, lane, architecture=GFX1250
+        )
+        output = live.select(_bf16_round(output), fx.Float32(0.0))
         if (slot >= 0) & live:
             destination = rsrc(
                 args["rstate"] + fx.Int64(slot) * fx.Int64(args["rs_seq"]) * 4
@@ -568,12 +584,14 @@ def kda_recur_head(c, k, request, head):
                     destination,
                     (head * GATE_K + row0 + row) * GATE_K + column,
                 )
-        square_sum = fx.Float32(0.0)
-        for row in range_constexpr(ROWS):
-            square_sum = square_sum + outputs[row] * outputs[row]
+        # Lanes 2r and 2r + 1 hold row r's output.
+        if lane % 2 == 0:
+            fx.ptr_store(output, c["ol"] + token * HEAD_DIM + row0 + output_row)
         if lane == 0:
+            square_sum = fx.Float32(0.0)
             for row in range_constexpr(ROWS):
-                fx.ptr_store(outputs[row], c["ol"] + token * HEAD_DIM + row0 + row)
+                written = fx.ptr_load(c["ol"] + token * HEAD_DIM + row0 + row)
+                square_sum = square_sum + written * written
             fx.ptr_store(square_sum, c["head_onrm"] + token * STATE_CHUNKS + wave)
         token = token + fx.Int32(1)
     gpu.barrier()
