@@ -17,7 +17,7 @@ address on every replay.
 """
 
 import logging
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from functools import wraps
 
 import numpy as np
@@ -76,6 +76,30 @@ def _v41_publication_epoch(owner, *, resume=False):
         raise
     else:
         owner.finish()
+
+
+@contextmanager
+def _unverified_steps(cache):
+    """Begin `cache`'s steps as non-verifying while inside.
+
+    Native `_prepare_step` verifies every tentative step with requests (#3136
+    dropped its `not batch.is_dummy_run`: native capture batches are not
+    dummies). A plugin dummy batch is fabricated on private scratch with its
+    requests at position 0, which `begin_step` refuses to verify. It keeps the
+    verify write grid `tentative` selects; only its step is not a
+    verification, as before #3136.
+    """
+    begin_step = cache.begin_step
+
+    def begin_unverified(*args, **kwargs):
+        kwargs["tentative"] = False
+        return begin_step(*args, **kwargs)
+
+    cache.begin_step = begin_unverified
+    try:
+        yield
+    finally:
+        del cache.begin_step
 
 
 def _publish_v41_metadata(prepare):
@@ -240,19 +264,24 @@ class VllmDeepseekV41MetadataBuilder(DeepseekV41MetadataBuilder):
         self.publish_query_metadata(
             np.asarray(batch.num_scheduled_tokens, np.int32), running_bs, running_tokens
         )
-        return self._prepare_step(
-            batch,
-            spans,
-            rows,
-            cache,
-            running_bs,
-            running_tokens,
-            max_q_len=max_q_len,
-            tentative=tentative,
-            is_prefill=is_prefill,
-            engram_live=engram_live,
-            replay_layout=(resumes, floors, cached_until, histories),
-        )
+        with (
+            _unverified_steps(cache)
+            if tentative and batch.is_dummy_run
+            else nullcontext()
+        ):
+            return self._prepare_step(
+                batch,
+                spans,
+                rows,
+                cache,
+                running_bs,
+                running_tokens,
+                max_q_len=max_q_len,
+                tentative=tentative,
+                is_prefill=is_prefill,
+                engram_live=engram_live,
+                replay_layout=(resumes, floors, cached_until, histories),
+            )
 
 
 # ---------------------------------------------------------------------------
