@@ -9,6 +9,7 @@ on:
     paths-ignore:
       - '**/*.md'
       - 'docs/**'
+      - '.claude/**'
       - 'atom/plugin/**'
       - 'atom/mesh/**'
       - '.github/benchmark/models_atomesh.yaml'
