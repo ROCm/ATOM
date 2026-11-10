@@ -84,7 +84,7 @@ def _publish_v41_metadata(prepare):
         runner = self.model_runner
         if not hasattr(runner, "h2d_owner"):
             owner, groups = _v41_publication_owner(runner.forward_vars, self.device)
-            for name, names in self.h2d_group_members.items():
+            for name, names in self.h2d_group_members().items():
                 groups[name] = owner.group(
                     name, [runner.forward_vars[item]._publication for item in names]
                 )
