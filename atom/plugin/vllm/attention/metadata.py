@@ -2596,6 +2596,26 @@ class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
         )
 
 
+def expand_block_table_rows(
+    block_table: torch.Tensor,
+    decode_lens: torch.Tensor,
+    out: torch.Tensor,
+    num_rows: int,
+) -> None:
+    """Repeat each request's block-table row once per decode token into `out`.
+
+    `out` is sized for `max_model_len` in kernel blocks. vLLM can hand over a
+    wider table: it rounds every request up to whole manager blocks, and a
+    hybrid model's indexer group can get a manager block several times the
+    attention one (GLM-5.3-Flash's dense indexer: 8192 tokens, 128 kernel
+    blocks, at max_model_len 2048, where `out` holds 32). The extra columns
+    address no position below `max_model_len`, so they are dropped.
+    """
+    out[:num_rows] = torch.repeat_interleave(
+        block_table[:, : out.shape[1]], decode_lens, dim=0, output_size=num_rows
+    )
+
+
 class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
     reorder_batch_threshold = 1
@@ -2941,10 +2961,11 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
 
                 # Give each of the flattened entries the same block table row as the
                 # original request.
-                self.expanded_block_table_buffer[:actual_expanded] = (
-                    torch.repeat_interleave(
-                        block_table, decode_lens, dim=0, output_size=actual_expanded
-                    )
+                expand_block_table_rows(
+                    block_table,
+                    decode_lens,
+                    self.expanded_block_table_buffer,
+                    actual_expanded,
                 )
                 if actual_expanded < num_decode_tokens:
                     self.expanded_block_table_buffer[

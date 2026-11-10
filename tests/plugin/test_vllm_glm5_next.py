@@ -459,8 +459,27 @@ def test_mtp_is_allowed_and_other_speculation_is_refused(monkeypatch):
     with pytest.raises(ValueError, match="'eagle3'"):
         mod._check_unsupported(_vllm_config(_config(), spec=_mtp(method="eagle3")))
     monkeypatch.setattr(mod, "pooled_path_enabled", lambda _k: False)
-    with pytest.raises(ValueError, match="dense indexer"):
-        mod._check_unsupported(_vllm_config(_config(), spec=_mtp()))
+    mod._check_unsupported(_vllm_config(_config(), spec=_mtp()))
+
+
+def test_expanded_block_table_drops_columns_past_max_model_len():
+    """MTP verify rows on the dense indexer: vLLM rounds the indexer group's
+    block table to whole manager blocks (128 kernel blocks), the expansion
+    buffer holds the 32 that max_model_len 2048 can address."""
+    from atom.plugin.vllm.attention.metadata import expand_block_table_rows
+
+    table = torch.arange(2 * 128, dtype=torch.int32).reshape(2, 128)
+    decode_lens = torch.tensor([3, 1])
+    out = torch.full((8, 32), -1, dtype=torch.int32)
+    expand_block_table_rows(table, decode_lens, out, 4)
+    assert torch.equal(out[:3], table[0, :32].expand(3, 32))
+    assert torch.equal(out[3], table[1, :32])
+    assert bool((out[4:] == -1).all())
+
+    # A table exactly as wide as the buffer is copied whole.
+    same = torch.arange(2 * 32, dtype=torch.int32).reshape(2, 32)
+    expand_block_table_rows(same, decode_lens, out, 4)
+    assert torch.equal(out[3], same[1])
 
 
 def test_state_shape_widens_the_conv_window_for_draft_tokens():
