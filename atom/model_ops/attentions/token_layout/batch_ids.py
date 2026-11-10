@@ -56,6 +56,36 @@ def build_batch_ids(
     return out
 
 
+def build_query_layout(
+    lengths: np.ndarray,
+    running_bs: int,
+    running_tokens: int,
+    *,
+    cu_seqlens_q: np.ndarray,
+    batch_ids: np.ndarray,
+) -> None:
+    """Write a step's `cu_seqlens_q` (out to `running_bs + 1`) and
+    `batch_id_per_q_token` (out to `running_tokens`) for the scheduled
+    requests' query `lengths`.
+
+    The rows past `scheduled_bs` repeat the last offset: they are zero long, so
+    attention running at `running_bs` reads nothing for them.
+    """
+    build_cu_seqlens(lengths, running_bs, out=cu_seqlens_q)
+    build_batch_ids(lengths, pad_to=running_tokens, out=batch_ids)
+
+
+def build_cu_seqlens(lengths: np.ndarray, running_bs: int, *, out: np.ndarray) -> None:
+    """`build_query_layout`'s `cu_seqlens_q` alone, into ``out``."""
+    scheduled_bs = len(lengths)
+    assert (
+        running_bs >= scheduled_bs
+    ), f"running_bs={running_bs} < scheduled_bs={scheduled_bs}"
+    out[0] = 0
+    np.cumsum(lengths, out=out[1 : scheduled_bs + 1])
+    out[scheduled_bs + 1 : running_bs + 1] = out[scheduled_bs]
+
+
 def build_batch_ids_device(seqlens: torch.Tensor, *, total: int) -> torch.Tensor:
     """`build_batch_ids` for a result too wide to stage through a host buffer.
 

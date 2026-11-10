@@ -57,7 +57,7 @@ class _Step:
     """The fields the window write reads: one request and one padding row."""
 
     def __init__(self, tokens, slot, device):
-        self.width = tokens
+        self.running_tokens = tokens
         self.positions = torch.arange(tokens, device=device, dtype=torch.int32)
         self.batch_ids = torch.zeros(tokens, device=device, dtype=torch.int32)
         self.batch_ids[-1] = -1
@@ -332,8 +332,7 @@ def test_fused_seam_head_block_matches_a_program_a_head(monkeypatch, heads, sink
     )
     fp8_heads = 8 if sink == "query_fp8" and heads % 8 == 0 else 1
     expected_grid = (
-        tokens,
-        (1 if head_block else query_heads // fp8_heads) + kv_half,
+        tokens * ((1 if head_block else query_heads // fp8_heads) + kv_half),
     )
 
     def run(flag):
@@ -379,7 +378,7 @@ def test_fused_seam_head_block_matches_a_program_a_head(monkeypatch, heads, sink
         return out, spy.launches
 
     (expected, default_launches), (actual, launches) = run(False), run(True)
-    assert default_launches == [((tokens, query_heads + kv_half), False, 1)]
+    assert default_launches == [((tokens * (query_heads + kv_half),), False, 1)]
     assert launches == [(expected_grid, head_block, fp8_heads)]
     if sink in ("packed_ring", "bf16_ring", "prefill", "query"):
         assert not torch.equal(expected["query"], query)
@@ -420,7 +419,7 @@ def test_fp8_query_groups_heads_from_the_query_row_threshold(
         scales=scales,
         query_fp8=query_fp8,
     )
-    assert spy.launches == [((tokens, heads // fp8_heads + 1), False, fp8_heads)]
+    assert spy.launches == [((tokens * (heads // fp8_heads + 1),), False, fp8_heads)]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
