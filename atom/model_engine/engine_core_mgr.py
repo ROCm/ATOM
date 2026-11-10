@@ -1510,6 +1510,25 @@ class CoreManager:
                 f"rank shares ({', '.join(sorted(SHARED_TIER_CONNECTORS))}); "
                 f"the KV connectors are {names!r}"
             )
+        for name, leaf in leaves:
+            if name != "mooncake_store" or self.global_engine_count < 2:
+                continue
+            from atom.kv_transfer.offload.mooncake_store.config import (
+                parse_mooncake_store_config,
+            )
+
+            masters = parse_mooncake_store_config(
+                leaf.kv_transfer_config
+            ).store_masters()
+            if len(masters) > 1:
+                # Each worker reads and writes its own NIC's pool, so a prefix
+                # one DP rank saved is a lookup hit another rank's load misses.
+                raise ValueError(
+                    "--dp-load-balance share_cache needs one Mooncake Store every "
+                    f"DP rank reaches; mooncake_store.pools splits it into "
+                    f"{len(masters)} pools, so a request placed on another rank "
+                    "fails its load and recomputes"
+                )
         return ShareCacheRouter(min_load_tokens(config), self._dp_lb_req_equiv)
 
     def _backlog_note_charged_locked(self, seq, dp_rank: int) -> None:
