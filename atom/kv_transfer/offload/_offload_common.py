@@ -29,6 +29,7 @@ from atom.kv_transfer.disaggregation.types import (
     KVConnectorOutput,
     LoadCompletionId,
     SaveCompletionId,
+    raw_req_id,
 )
 from atom.kv_transfer.offload import config as offcfg
 from atom.utils import envs
@@ -364,9 +365,9 @@ class OffloadWorkerMixin:
             logger.exception(
                 "offload %s failed for %s",
                 getattr(fn, "__name__", kind),
-                getattr(req, "req_id", req),
+                raw_req_id(req),
             )
-            rid = getattr(req, "req_id", req)
+            rid = raw_req_id(req)
             if kind == "load":
                 self._on_load_fail(rid)
                 with self._lock:
@@ -516,12 +517,12 @@ class OffloadSchedulerMixin(ABC):
         """Apply offload-specific completions and expose plain request IDs."""
 
         loaded = {
-            value.req_id if hasattr(value, "req_id") else value
+            raw_req_id(value)
             for value in output.finished_loading
             if self.load_finished(value) is not False
         }
         failed = {
-            value.req_id if hasattr(value, "req_id") else value
+            raw_req_id(value)
             for value in output.failed_loading
             if self.load_failed(value) is not False
         }
@@ -540,10 +541,10 @@ class OffloadSchedulerMixin(ABC):
             # non-terminal milestone such as PAGE source-safety.
             if handled is True:
                 value = completion.operation_id
-                terminal_saves.add(value.req_id if hasattr(value, "req_id") else value)
+                terminal_saves.add(raw_req_id(value))
         for value in output.finished_saving:
             self.save_finished(value)
-            terminal_saves.add(value.req_id if hasattr(value, "req_id") else value)
+            terminal_saves.add(raw_req_id(value))
 
         output.finished_loading = loaded
         output.failed_loading = failed
@@ -800,7 +801,7 @@ class OffloadSchedulerMixin(ABC):
         if self._tier_hit_memo:
             self._tier_hit_memo.pop(sid, None)
 
-    def _ensure_lookup_pin(self, seq, sid: str, spec) -> bool:
+    def _ensure_lookup_pin(self, seq, sid: str, spec) -> bool | None:
         """Re-take the worker-side lookup pin before a load is committed.
 
         An answer served from the remembered hit carries no pin: the metadata
@@ -810,9 +811,11 @@ class OffloadSchedulerMixin(ABC):
         A transfer does: it must not read an entry that nothing is holding. So
         the step that turns a load spec into a dispatched retrieve asks the tier
         for real, and the load stands only if the tier still holds at least what
-        the spec promised. If it holds less -- evicted in the steps since -- the
-        load is dropped and the request prefills, which is what would have
-        happened with no tier at all.
+        the spec promised. If it holds less -- evicted in the steps since -- this
+        answers False, and None if the lookup did not answer (a timeout or an
+        RPC error); the caller drops the load either way, and reopens its saves
+        only on False, when the tier has lost what the request recomputes. The
+        request prefills, which is what would have happened with no tier at all.
 
         Confirming rather than re-deriving is deliberate: by this point the spec
         may have been shaped by something this mixin does not own (the unaligned
@@ -847,8 +850,7 @@ class OffloadSchedulerMixin(ABC):
                 hit,
                 int(spec.lmcache_cached_tokens),
             )
-            self._clear_pending_load(sid)
-            return False
+            return None if hit is None else False
         return True
 
     def _repeat_load_suppressed(self, seq, sid: str) -> bool:
@@ -874,6 +876,19 @@ class OffloadSchedulerMixin(ABC):
         failed_seq = self._load_lifecycles.get(sid)
         if failed_seq is not None:
             self._load_failed_seqs[sid] = failed_seq
+
+    def _reopen_saves(self, sid: str) -> None:
+        """A tier hit that is not loaded (the tier lost it, or the load failed)
+        is recomputed from the HBM frontier the dispatch recorded: let
+        `[hbm, hit)` be stored again rather than treated as persisted.
+
+        A promise withdrawn before dispatch records none and reopens nothing:
+        the tier still holds what the request recomputes.
+        """
+        floor = self._load_save_floors.get(sid)
+        entry = self._save_tracker.get(sid)
+        if floor is not None and entry is not None:
+            entry[1] = min(int(entry[1]), int(floor))
 
     def _release_failed_load_attempt(self, sid: str, seq) -> None:
         """Drop the mark when its sequence is done with the request ID."""
