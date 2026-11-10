@@ -655,7 +655,9 @@ def test_workflow_wiring_preserves_existing_checks_and_separates_noop_reviews():
             assert gate_env["CI_GATE_PR_CHECK_JOB"] == "Offline inference smoke test"
             smoke = config["jobs"]["offline-smoke-test"]
             assert smoke["needs"] == ["ci-gate"]
-            assert smoke["if"] == "${{ !cancelled() }}"
+            assert "!cancelled()" in smoke["if"]
+            assert "github.event_name != 'pull_request'" in smoke["if"]
+            assert "!github.event.pull_request.head.repo.fork" in smoke["if"]
             requested = (
                 "github.event_name != 'pull_request_review' || "
                 "needs.ci-gate.outputs.pr_check_takeover == 'true'"

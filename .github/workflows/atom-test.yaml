@@ -171,7 +171,7 @@ jobs:
 
   offline-smoke-test:
     needs: [ci-gate]
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) }}
     # Not behind the approval/label gate: this runs on every PR, unlike the
     # accuracy matrix, which only opens on an approval or a ci:* label. It
     # needs `ci-gate` only so an approval run can take over the check from a
