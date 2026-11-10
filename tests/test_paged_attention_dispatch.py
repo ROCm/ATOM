@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import inspect
 import sys
 from types import SimpleNamespace
 
@@ -1343,19 +1344,31 @@ class TestExplicitPlan:
         assert self._call(ba, owner=step, cache_owner=step) is ub0
 
     def test_old_aiter_api_takes_gluon(self, monkeypatch):
-        """An aiter without #5809's required work plan must not be routed."""
+        """An aiter without #5809's keyword-only work plan must not be routed."""
         from atom.model_ops import base_attention as ba
 
         mod = importlib.import_module("aiter.ops.flydsl.pa_decode")
 
-        def optional_plan(output, *a, work_plan=None, max_context_length=None):
+        # Before #5809: the plan rides positionally behind the partition count.
+        def positional_plan(
+            output,
+            query,
+            key_cache,
+            value_cache,
+            context_lengths,
+            block_tables,
+            softmax_scale,
+            query_length,
+            max_context_partition_num,
+            work_plan=None,
+        ):
             raise AssertionError("not called")
 
         def no_bound(output, *a, work_plan, sinks=None):
             raise AssertionError("not called")
 
         try:
-            for old in (optional_plan, no_bound):
+            for old in (positional_plan, no_bound):
                 monkeypatch.setattr(mod, "pa_decode", old)
                 ba._flydsl_explicit_plan_api.cache_clear()
                 assert ba._flydsl_explicit_plan_api() is False, old.__name__
@@ -1363,6 +1376,37 @@ class TestExplicitPlan:
             monkeypatch.undo()
             ba._flydsl_explicit_plan_api.cache_clear()
         assert ba._flydsl_explicit_plan_api() is True
+
+    @pytest.mark.parametrize("default", [inspect.Parameter.empty, None])
+    def test_keyword_plan_api_is_routed(self, monkeypatch, default):
+        """#5809's required plan and #7056's None default (gfx950 MXFP4) both route."""
+        from atom.model_ops import base_attention as ba
+
+        mod = importlib.import_module("aiter.ops.flydsl.pa_decode")
+        plan = inspect.Parameter(
+            "work_plan", inspect.Parameter.KEYWORD_ONLY, default=default
+        )
+        bound = inspect.Parameter(
+            "max_context_length", inspect.Parameter.KEYWORD_ONLY, default=None
+        )
+
+        def pa_decode(output, *a, **kw):
+            raise AssertionError("not called")
+
+        pa_decode.__signature__ = inspect.Signature(
+            [
+                inspect.Parameter("output", inspect.Parameter.POSITIONAL_OR_KEYWORD),
+                plan,
+                bound,
+            ]
+        )
+        try:
+            monkeypatch.setattr(mod, "pa_decode", pa_decode)
+            ba._flydsl_explicit_plan_api.cache_clear()
+            assert ba._flydsl_explicit_plan_api() is True
+        finally:
+            monkeypatch.undo()
+            ba._flydsl_explicit_plan_api.cache_clear()
 
     def test_dense_site_leaves_the_bound_to_the_block_table(self):
         """max_seqlen_k differs between graph and eager and picks the kernel."""
