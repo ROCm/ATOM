@@ -8,6 +8,7 @@ from weakref import WeakKeyDictionary
 
 import pytest
 from conftest import MockConfig
+from test_lmcache_mp_async_lookup import _Adapter, _Client
 
 from atom.kv_transfer.disaggregation.types import (
     ConnectorCompletion,
@@ -808,6 +809,34 @@ def test_engine_holds_back_a_restore_while_every_restore_slot_is_taken(monkeypat
     assert connector.lookup_pending(fourth) is True
     assert impl._lookup_client.lookup(fourth.token_ids, str(fourth.id)) == 0
     assert connector.lookup_pending(fourth) is False
+
+
+class _AsyncAdapter(_Adapter):
+    lmcache_tokens_per_chunk = 8
+
+    def end_session(self, request_id):
+        pass
+
+
+@pytest.mark.parametrize("third, runs", [(0, True), (2, False)])
+def test_engine_gates_a_prefetched_answer_while_every_restore_slot_is_taken(
+    monkeypatch, third, runs
+):
+    # Prefetched lookups answer in order: two 2-chunk hits, then `third` chunks.
+    engine, _connector, _adapter = engine_scheduler(
+        monkeypatch, adapter=_AsyncAdapter(_Client(0, status=[2, 2, third]))
+    )
+    seqs = [
+        Sequence(list(range(100 * i, 100 * i + 24)), 4, has_per_req_cache=True)
+        for i in range(3)
+    ]
+    for seq in seqs:
+        engine.add(seq)
+    _, scheduled = engine.schedule()
+    assert [seq.status for seq in seqs] == [
+        SequenceStatus.WAITING_FOR_REMOTE_KVS
+    ] * 2 + [SequenceStatus.RUNNING if runs else SequenceStatus.WAITING]
+    assert scheduled == ({seqs[2].id: seqs[2]} if runs else {})
 
 
 @pytest.mark.parametrize("succeeded", [True, False])

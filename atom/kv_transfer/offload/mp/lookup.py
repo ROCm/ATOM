@@ -687,6 +687,11 @@ class _MPLookupClient:
         return None if state is None else state.hit
 
     @_locked
+    def answered_hit(self, lookup_id: str) -> int | None:
+        """`hit_tokens`, or the answer of an async lookup not consumed yet."""
+        return self._async_hits.get(lookup_id, self.hit_tokens(lookup_id))
+
+    @_locked
     def clear_lookup_status(self, lookup_id: str) -> None:
         state = self._lookups.pop(lookup_id, None)
         request_id = _mp_session_id(self._config, lookup_id)
