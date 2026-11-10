@@ -4108,6 +4108,18 @@ models:
           decode:
             <<: *issue382_a9_pernic4352_tuned_icp_env_decode
             DECODE_KV_TRANSFER_CONFIG: '{"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","ib_enable_alternate_hca":true,"ib_hca_count":8,"pd_admission":{"enabled":true,"max_pending_kv_fraction":0.3,"min_free_kv_fraction":0.1}}'
+      # P without chunked transfer schedules a request on arrival. With it, a
+      # request waits until every PP stage reports D's pull, and the stages
+      # register it only as its metadata passes the batches in flight: 0.81 s
+      # (p50) after D admits it at C240, while P's stages are 63-84% busy.
+      # P then holds the computed KV until D pulls it.
+      - <<: *issue382_a9_1p2d_c240_pernic4352_tuned_mem90
+        name: issue382-a9-1p2d-c240-pernic4352-tuned-mem90-icp-nochunk
+        env:
+          <<: *issue382_a9_pernic4352_tuned_icp_env
+          prefill:
+            <<: *issue382_a9_pernic4352_tuned_env_prefill
+            PREFILL_KV_TRANSFER_CONFIG: '{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","enable_chunked_transfer":false}'
       - <<: *issue382_a9_1p3d_c264
         name: issue382-a9-1p3d-c330
         concurrency:
