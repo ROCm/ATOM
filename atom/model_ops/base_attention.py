@@ -3,7 +3,6 @@
 
 # from flash_attn import flash_attn_with_kvcache
 import functools
-import importlib
 import logging
 import os
 from abc import ABC, abstractmethod
@@ -335,15 +334,9 @@ def _flydsl_plan_max_batch() -> int:
     the planner's LDS: the 16-byte-rounded task_ends array plus scan storage
     must fit one block (81792 sequences on gfx1250).
     """
-    import inspect
-
     from aiter.jit.utils.chip_info import get_gfx_runtime
 
-    planner = importlib.import_module("aiter.ops.flydsl.pa_decode").plan_pa_decode
-    if (
-        get_gfx_runtime() != "gfx1250"
-        or "max_batch_size" not in inspect.signature(planner).parameters
-    ):
+    if get_gfx_runtime() != "gfx1250":
         return _FLYDSL_PLAN_MAX_BATCH
     lds = torch.cuda.get_device_properties(
         torch.cuda.current_device()

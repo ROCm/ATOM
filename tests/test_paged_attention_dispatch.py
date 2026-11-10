@@ -1918,27 +1918,14 @@ class TestNoGluonFlyDSLRouting:
         layer.sliding_window = -1
         assert not layer._flydsl_takes_decode(None, None, None, None)
 
-    @pytest.mark.parametrize(
-        "arch, takes_max_batch", [("gfx950", True), ("gfx1250", False)]
-    )
-    def test_plan_cap_stays_4096_unless_gfx1250_planner_takes_it(
-        self, monkeypatch, arch, takes_max_batch
-    ):
-        """gfx942/gfx950 keep aiter's cap; an aiter before #6462 has no
-        max_batch_size to raise it with."""
-        import aiter.ops.flydsl.pa_decode as fly
+    @pytest.mark.parametrize("arch", ["gfx942", "gfx950"])
+    def test_plan_cap_stays_4096_off_gfx1250(self, monkeypatch, arch):
+        """Only gfx1250, without gluon for sparse decode, raises aiter's cap."""
         from aiter.jit.utils import chip_info
 
         from atom.model_ops import base_attention as ba
 
-        def with_cap(lengths, num_kv_heads, *, max_batch_size=None): ...
-
-        def without_cap(lengths, num_kv_heads): ...
-
         monkeypatch.setattr(chip_info, "get_gfx_runtime", lambda: arch)
-        monkeypatch.setattr(
-            fly, "plan_pa_decode", with_cap if takes_max_batch else without_cap
-        )
         ba._flydsl_plan_max_batch.cache_clear()
         try:
             assert ba._flydsl_plan_max_batch() == ba._FLYDSL_PLAN_MAX_BATCH
@@ -1947,15 +1934,11 @@ class TestNoGluonFlyDSLRouting:
 
     def test_plan_cap_follows_lds_on_gfx1250(self, monkeypatch):
         """320 KiB of LDS per block: (327680 - 512) // 16 * 16 // 4 = 81792."""
-        import aiter.ops.flydsl.pa_decode as fly
         from aiter.jit.utils import chip_info
 
         from atom.model_ops import base_attention as ba
 
-        def with_cap(lengths, num_kv_heads, *, max_batch_size=None): ...
-
         monkeypatch.setattr(chip_info, "get_gfx_runtime", lambda: "gfx1250")
-        monkeypatch.setattr(fly, "plan_pa_decode", with_cap)
         monkeypatch.setattr(ba.torch.cuda, "current_device", lambda: 0)
         monkeypatch.setattr(
             ba.torch.cuda,
