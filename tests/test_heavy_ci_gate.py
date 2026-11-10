@@ -657,8 +657,12 @@ def test_workflow_wiring_preserves_existing_checks_and_separates_noop_reviews():
             assert smoke["needs"] == ["ci-gate"]
             assert smoke["if"] == "${{ !cancelled() }}"
             requested = (
-                "github.event_name != 'pull_request_review' || "
-                "needs.ci-gate.outputs.pr_check_takeover == 'true'"
+                "needs.ci-gate.outputs.should_run == 'true' || "
+                "needs.ci-gate.outputs.pr_check_takeover == 'true' || "
+                "(github.event_name != 'pull_request_review' && "
+                "needs.ci-gate.outputs.reason != 'ignored-paths-only' && "
+                "needs.ci-gate.outputs.reason != 'draft-pull-request' && "
+                "needs.ci-gate.outputs.reason != 'pull-request-closed')"
             )
             assert smoke["env"]["SMOKE_REQUESTED"] == "${{ " + requested + " }}"
             assert requested in smoke["runs-on"]
@@ -676,3 +680,14 @@ def test_workflow_wiring_preserves_existing_checks_and_separates_noop_reviews():
             assert "'Offline inference smoke test'" in smoke["name"]
             assert config["jobs"]["atom-test"]["name"] == "Accuracy"
             assert {"push", "schedule", "workflow_dispatch"} <= events.keys()
+
+
+def test_evaluate_test_gate_action_rejects_undecidable_scope():
+    action = yaml.safe_load(
+        (REPO_ROOT / ".github/actions/evaluate-test-gate/action.yml").read_text()
+    )
+    script = action["runs"]["steps"][0]["run"]
+    assert "*-query-failed" in script
+    assert "missing-event-payload" in script
+    assert "missing-pr-context" in script
+    assert "scope was undecidable" in script
