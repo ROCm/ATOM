@@ -4120,6 +4120,20 @@ models:
           prefill:
             <<: *issue382_a9_pernic4352_tuned_env_prefill
             PREFILL_KV_TRANSFER_CONFIG: '{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","enable_chunked_transfer":false}'
+      # The timeline cell with P's head broadcasting each registration to every
+      # stage on arrival, and the stages reading it ahead of their queued
+      # batches. In the next batch's metadata it first waits for one of the 4
+      # pipeline slots, then on each stage for every batch ahead of it.
+      - <<: *issue382_a9_1p2d_c240_pernic4352_tuned_mem90
+        name: issue382-a9-1p2d-c240-pernic4352-tuned-mem90-icp-tl-eager
+        env:
+          <<: *issue382_a9_pernic4352_tuned_icp_env
+          common:
+            <<: *issue382_a9_pernic4352_tuned_env_common
+            ATOM_PD_TIMELINE: '1'
+          prefill:
+            <<: *issue382_a9_pernic4352_tuned_env_prefill
+            ATOM_PP_EAGER_CHUNKED_ADMISSION: '1'
       - <<: *issue382_a9_1p3d_c264
         name: issue382-a9-1p3d-c330
         concurrency:
