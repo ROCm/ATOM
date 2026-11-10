@@ -1096,43 +1096,22 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
-        router_logits: torch.Tensor,
-        top_k: int,
-        renormalize: bool,
-        use_grouped_topk: bool = False,
-        topk_group: int | None = None,
-        num_expert_group: int | None = None,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
         global_num_experts: int = -1,
         expert_map: torch.Tensor | None = None,
-        custom_routing_function: Callable | None = None,
-        scoring_func: str = "softmax",
-        e_score_correction_bias: torch.Tensor | None = None,
-        fused_shared_experts_scoring_func: str | None = None,
         apply_router_weight_on_input: bool = False,
         activation: ActivationType = ActivationType.Silu,
         prefix: str = "",
+        x_scale: torch.Tensor | None = None,
+        scheduled_tokens_gpu: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if activation != ActivationType.Silu:
             raise ValueError(f"IQ2R does not support {activation} here")
-
-        topk_weights, topk_ids = FusedMoE.select_experts(
-            hidden_states=x,
-            router_logits=router_logits,
-            use_grouped_topk=use_grouped_topk,
-            top_k=top_k,
-            renormalize=renormalize,
-            topk_group=topk_group,
-            num_expert_group=num_expert_group,
-            custom_routing_function=custom_routing_function,
-            scoring_func=scoring_func,
-            e_score_correction_bias=e_score_correction_bias,
-            num_routing_experts=global_num_experts,
-            num_fused_shared_experts=layer.num_fused_shared_experts,
-            fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
-            routed_scaling_factor=layer.routed_scaling_factor,
-        )
-        topk_ids = topk_ids.to(torch.int32).contiguous()
-        topk_weights = topk_weights.to(torch.float32).contiguous()
+        if x_scale is not None:
+            raise ValueError("IQ2R quantizes its own activations; it needs BF16 rows")
+        if apply_router_weight_on_input:
+            raise ValueError("IQ2R applies the router weights in its reduction")
 
         from aiter.iq2r_glm53 import iq2r_glm53_moe_out
 
@@ -1143,8 +1122,8 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
             layer.w13_weight_scale,
             layer.w2_weight,
             layer.w2_weight_scale,
-            topk_weights,
-            topk_ids,
+            topk_weights.to(torch.float32).contiguous(),
+            topk_ids.to(torch.int32).contiguous(),
             output,
             self._glm53_workspace(x.device),
         )
