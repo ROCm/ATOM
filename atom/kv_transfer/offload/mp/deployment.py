@@ -52,10 +52,23 @@ def require_chunk_matches_server(adapter: Any, config: Any) -> None:
     The router reads the configured chunk before any server is asked; a
     different server chunk would skew its load estimates. Nothing else reads
     the configured value -- the connector itself runs on the server's chunk --
-    so other strategies are not checked. Called by both worker registrations
-    (PAGE-only and native-state).
+    so other strategies and runs with only one routable engine are not
+    checked. Called by both worker registrations (PAGE-only and native-state).
     """
     if getattr(config, "dp_load_balance", None) != "prefix_spread":
+        return
+    parallel = getattr(config, "parallel_config", None)
+    engines = int(
+        getattr(
+            parallel, "data_parallel_size", getattr(config, "data_parallel_size", 1)
+        )
+        or 1
+    )
+    if getattr(config, "enable_dp_attention", False):
+        # CoreManager expands DP by TP and sets TP to 1 before spawning workers.
+        # This also handles a config before that normalization.
+        engines *= int(getattr(config, "tensor_parallel_size", 1) or 1)
+    if engines <= 1:
         return
     configured = offcfg.lmcache_chunk_tokens(_storage_kv_transfer_config(config))
     server = int(adapter.lmcache_tokens_per_chunk)

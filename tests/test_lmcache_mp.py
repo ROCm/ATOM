@@ -2456,17 +2456,33 @@ def test_drops_reach_the_workers_without_a_transfer():
     assert 7 not in shell._tokens._held
 
 
-def test_a_chunk_configured_differently_from_the_mp_server_stops_startup(monkeypatch):
+@pytest.mark.parametrize(
+    "dp,tp,enable_dp_attention,requires_match",
+    [
+        (1, 1, False, False),
+        (1, 2, False, False),
+        (2, 1, False, True),
+        (1, 2, True, True),
+        (2, 1, True, True),
+    ],
+)
+def test_a_chunk_configured_differently_from_the_mp_server_stops_startup(
+    monkeypatch, dp, tp, enable_dp_attention, requires_match
+):
     """Only `prefix_spread` reads the configured chunk (to predict loads), so
-    only it is refused when the server runs on another one; any other strategy
-    keeps running on the server's chunk, as before."""
+    only an active prefix router is refused when the server runs on another
+    one. Ordinary DP=1 and other strategies use the server's chunk as before;
+    DP-attention's TP ranks are routable engines too."""
     monkeypatch.setenv("LMCACHE_CHUNK_SIZE", "256")
     server_512 = SimpleNamespace(lmcache_tokens_per_chunk=512)
-    config = _config()
+    config = _config(dp=dp, tp=tp, enable_dp_attention=enable_dp_attention)
     config.dp_load_balance = "least_requests"
     deployment.require_chunk_matches_server(server_512, config)
     config.dp_load_balance = "prefix_spread"
-    with pytest.raises(ValueError, match="configured chunk to match the server"):
+    if requires_match:
+        with pytest.raises(ValueError, match="configured chunk to match the server"):
+            deployment.require_chunk_matches_server(server_512, config)
+    else:
         deployment.require_chunk_matches_server(server_512, config)
     deployment.require_chunk_matches_server(
         SimpleNamespace(lmcache_tokens_per_chunk=256), config
