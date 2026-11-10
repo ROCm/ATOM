@@ -23,11 +23,36 @@ def _accepts_output(kernel):
     )
 
 
-def call_with_output(kernel, args, out, **kwargs):
-    """Detect each callable once; kernel TypeErrors always propagate unchanged."""
+def call_with_output(
+    kernel, args, out, *, output_strides=None, supports_output=None, **kwargs
+):
+    """Write directly only when the destination satisfies the backend's layout.
+
+    The default requires contiguous storage. Backends sharing Q/O strides
+    supply ``output_strides``; their temporary must preserve those strides too.
+    ``supports_output`` may be set for APIs whose output argument is guaranteed
+    (native wrappers and the existing BF16 OPUS API). Other AITER APIs are
+    inspected once. Kernel TypeErrors always propagate unchanged.
+    """
     if out is None:
         return kernel(*args, **kwargs)
-    if _accepts_output(kernel):
-        return kernel(*args, out=out, **kwargs)
+    accepts_output = (
+        _accepts_output(kernel) if supports_output is None else supports_output
+    )
+    if accepts_output:
+        compatible = (
+            out.is_contiguous()
+            if output_strides is None
+            else out.stride() == output_strides
+        )
+        if compatible:
+            return kernel(*args, out=out, **kwargs)
+        if output_strides is not None:
+            # empty_like can compact a row-strided Q, which is unsafe when
+            # the kernel uses Q's strides for output stores as well.
+            temporary = torch.empty_strided(
+                out.shape, output_strides, dtype=out.dtype, device=out.device
+            )
+            return out.copy_(kernel(*args, out=temporary, **kwargs))
     out.copy_(kernel(*args, **kwargs))
     return out

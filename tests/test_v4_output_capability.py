@@ -103,3 +103,82 @@ def test_real_aiter_guard_accepts_legacy_output_api(monkeypatch, expose_body):
     actual = output_buffer.call_with_output(kernel, (torch.ones(4),), out)
     assert actual is out
     torch.testing.assert_close(out, torch.full((4,), 2.0))
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+def test_real_aiter_guard_writes_directly_to_output(compiled):
+    guard = pytest.importorskip("aiter.jit.utils.torch_guard").torch_compile_guard
+    destinations = []
+
+    def body(x: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+        assert out is not None, "output-capable guard took the allocating fallback"
+        destinations.append(out.data_ptr())
+        return torch.add(x, 1, out=out)
+
+    body.__name__ = f"test_v4_mutating_output_{compiled}"
+    kernel = guard(mutates_args=["out"], gen_fake=lambda x, out=None: out)(body)
+
+    def run(x, out):
+        return output_buffer.call_with_output(kernel, (x,), out)
+
+    if compiled:
+        run = torch.compile(run, fullgraph=True, backend="eager")
+    parent = torch.full((6,), -9.0)
+    out = parent[1:-1]
+    result = run(torch.ones(4), out)
+    assert result is out
+    assert destinations == [out.data_ptr()]
+    torch.testing.assert_close(out, torch.full((4,), 2.0))
+    assert torch.all(parent[[0, -1]] == -9)
+
+
+@pytest.mark.parametrize("query_rows_strided", [False, True])
+@pytest.mark.parametrize("layout", ["contiguous", "rows", "features", "transposed"])
+def test_shared_query_output_strides(query_rows_strided, layout):
+    q = torch.arange(48.0).reshape(6, 2, 4)
+    q = q[::2] if query_rows_strided else q[:3].contiguous()
+    if layout == "rows":
+        parent = torch.full((8, 2, 4), -99.0)
+        out = parent[1:7:2]
+    elif layout == "features":
+        parent = torch.full((5, 2, 8), -99.0)
+        out = parent[1:-1, :, ::2]
+    elif layout == "transposed":
+        parent = torch.full((5, 4, 2), -99.0)
+        out = parent[1:-1].transpose(1, 2)
+    else:
+        parent = torch.full((5, 2, 4), -99.0)
+        out = parent[1:-1]
+    out.fill_(0)
+    untouched = parent == -99
+    seen = []
+
+    def shared_strides(x, *, out=None):
+        assert out is not None
+        assert out.stride() == x.stride()
+        seen.append(out.data_ptr())
+        return out.copy_(x + 1)
+
+    result = output_buffer.call_with_output(
+        shared_strides, (q,), out, output_strides=q.stride()
+    )
+    assert result is out
+    assert (seen[0] == out.data_ptr()) == (out.stride() == q.stride())
+    torch.testing.assert_close(out, q + 1)
+    assert torch.all(parent[untouched] == -99)
+
+
+def test_contiguous_backend_stages_strided_output():
+    parent = torch.full((8,), -9.0)
+    out = parent[1:7:2]
+    seen = []
+
+    def contiguous_only(x, *, out=None):
+        assert out is None or out.is_contiguous()
+        seen.append(out)
+        return x + 1 if out is None else out.copy_(x + 1)
+
+    result = output_buffer.call_with_output(contiguous_only, (torch.ones(3),), out)
+    assert result is out and seen == [None]
+    torch.testing.assert_close(out, torch.full((3,), 2.0))
+    assert torch.all(parent[[0, 2, 4, 6, 7]] == -9)

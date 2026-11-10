@@ -695,17 +695,22 @@ def sparse_attn_v4_paged_2src(
     # object (bf16 only — fp16 raises and falls through).
     if not envs.ATOM_FORCE_ATTN_TRITON and _HAS_OPUS:
         try:
-            return pa_sparse_prefill_opus(
-                q,
-                unified_kv,
-                kv_indices_prefix,
-                kv_indptr_prefix,
-                kv,
-                kv_indices_extend,
-                kv_indptr_extend,
-                attn_sink,
-                softmax_scale,
-                out=out,
+            return call_with_output(
+                pa_sparse_prefill_opus,
+                (
+                    q,
+                    unified_kv,
+                    kv_indices_prefix,
+                    kv_indptr_prefix,
+                    kv,
+                    kv_indices_extend,
+                    kv_indptr_extend,
+                    attn_sink,
+                    softmax_scale,
+                ),
+                out,
+                output_strides=q.stride(),
+                supports_output=True,
             )
         except RuntimeError:
             pass
@@ -725,15 +730,20 @@ def sparse_attn_v4_paged_2src(
             ),
             out,
         )
-    return _sparse_attn_v4_paged_2src_triton(
-        q,
-        unified_kv,
-        kv_indices_prefix,
-        kv_indptr_prefix,
-        kv,
-        kv_indices_extend,
-        kv_indptr_extend,
-        attn_sink,
-        softmax_scale,
-        out=out,
+    return call_with_output(
+        _sparse_attn_v4_paged_2src_triton,
+        (
+            q,
+            unified_kv,
+            kv_indices_prefix,
+            kv_indptr_prefix,
+            kv,
+            kv_indices_extend,
+            kv_indptr_extend,
+            attn_sink,
+            softmax_scale,
+        ),
+        out,
+        output_strides=q.stride(),
+        supports_output=True,
     )
