@@ -179,6 +179,22 @@ def test_late_draft_uploads_are_staged_by_prepare_model():
     assert not _attribute_calls(compute_draft_kv, "anchors_to_gpu")
 
 
+def test_kv_block_count_is_reconciled_over_the_whole_pcp_group():
+    """Ulysses SP runs over the PCP group with PCP=1, so the reduction over
+    that group must be gated on the group's size, not on PCP alone."""
+    method = _method("get_num_blocks")
+    gates = [
+        node
+        for node in ast.walk(method)
+        if isinstance(node, ast.If)
+        and any(
+            isinstance(stmt, ast.Expr) and "get_pcp_group" in ast.unparse(stmt)
+            for stmt in node.body
+        )
+    ]
+    assert [ast.unparse(gate.test) for gate in gates] == ["config.pcp_group_size > 1"]
+
+
 def test_kv_budget_refuses_free_memory_below_the_connector_reserve():
     """The KV connector allocates its buffers after the KV cache is sized.
 

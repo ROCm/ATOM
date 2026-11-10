@@ -2159,6 +2159,26 @@ class ModelRunner:
             num_kvcache_blocks = int(t.item())
             plan = plan.with_paged_entries(num_kvcache_blocks)
 
+        # Every TP / PCP worker of this engine builds its pool at the count
+        # rank 0 reports (`call_func` returns rank 0's answer), so no worker
+        # may report more than the smallest of them can hold. Ulysses SP runs
+        # over the PCP group too, so it spans more than one rank with PCP=1.
+        if torch.distributed.is_initialized():
+            groups = [get_tp_group()]
+            if config.pcp_group_size > 1:
+                groups.append(get_pcp_group())
+            reduced = num_kvcache_blocks
+            for group in groups:
+                if group.world_size > 1:
+                    t = torch.tensor([reduced], dtype=torch.int64, device="cpu")
+                    torch.distributed.all_reduce(
+                        t, op=torch.distributed.ReduceOp.MIN, group=group.cpu_group
+                    )
+                    reduced = int(t.item())
+            if reduced != num_kvcache_blocks:
+                num_kvcache_blocks = reduced
+                plan = plan.with_paged_entries(num_kvcache_blocks)
+
         block_bytes = plan.entry_bytes[plan.paged_class]
         # The whole plan travels to the engine process; BlockManager, the
         # sliding-window pool and the attention builder each index it by the
