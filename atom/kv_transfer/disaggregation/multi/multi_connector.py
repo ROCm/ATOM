@@ -77,20 +77,16 @@ logger = logging.getLogger("atom")
 # ---------------------------------------------------------------------------
 
 
-def _build_subconnectors(config: Any, role: str) -> list:
-    """Instantiate each sub-connector listed in ``kv_transfer_config.connectors``.
-
-    Each entry is a full ``kv_transfer_config`` dict (with its own
-    ``kv_connector`` name). We shallow-copy the engine config, swap in the
-    sub-dict, and route through the normal factory — no recursion, since each
-    sub names a concrete backend (moriio / lmcache_offload / ...), not ``multi``.
+def validate_multi_config(kv_transfer_config: dict) -> list:
+    """The sub-connector configs of a ``multi`` transfer config, after refusing
+    a topology the composite cannot run. Builds nothing, so `Config` calls it
+    before the model loads and `_build_subconnectors` before any sub is built.
     """
     # Imported lazily: the factory module registers backends at import time and
     # we must not create an import cycle with it.
     from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 
-    kvc = getattr(config, "kv_transfer_config", None) or {}
-    subs = kvc.get("connectors")
+    subs = kv_transfer_config.get("connectors")
     if not subs:
         raise ValueError(
             "multi connector requires a non-empty 'connectors' list in "
@@ -140,6 +136,23 @@ def _build_subconnectors(config: Any, role: str) -> list:
             + "): a received prefill would be prefilled again on the decode "
             "instance. Run the decode instance with the P/D connector alone."
         )
+    return subs
+
+
+def _build_subconnectors(config: Any, role: str) -> list:
+    """Instantiate each sub-connector listed in ``kv_transfer_config.connectors``.
+
+    Each entry is a full ``kv_transfer_config`` dict (with its own
+    ``kv_connector`` name). We shallow-copy the engine config, swap in the
+    sub-dict, and route through the normal factory — no recursion, since each
+    sub names a concrete backend (moriio / lmcache_offload / ...), not ``multi``.
+    """
+    # Imported lazily: the factory module registers backends at import time and
+    # we must not create an import cycle with it.
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+    kvc = getattr(config, "kv_transfer_config", None) or {}
+    subs = validate_multi_config(kvc)
 
     connectors = []
     for i, sub in enumerate(subs):
