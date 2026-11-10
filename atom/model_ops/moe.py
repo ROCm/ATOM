@@ -925,11 +925,12 @@ _IQ2R_GLM53_TILE_N = 128
 
 
 class Iq2rMoEMethod(FusedMoEMethodBase):
-    """AITER IQ2R experts in the ``glm53-packed-v1`` layout.
+    """AITER IQ2R-v2 experts in the ``glm53-packed-v2`` layout.
 
-    The layout covers GLM-5.3 with the shared expert fused as expert 256, at
-    TP4/TP8. The checkpoint holds full layers; each rank slices its share of
-    the intermediate dimension as it loads.
+    The layout covers GLM-5.3's 256 routed experts at TP4/TP8; the shared
+    expert stays block-FP8 and runs as an ordinary MLP outside the MoE. The
+    checkpoint holds full layers; each rank slices its share of the
+    intermediate dimension as it loads.
     """
 
     def __init__(
@@ -940,10 +941,10 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
     ):
         super().__init__(moe)
         self.quant_config = quant_config
-        if layout != "glm53-packed-v1":
+        if layout != "glm53-packed-v2":
             raise ValueError(
                 f"unsupported IQ2R layout {layout!r}; ATOM runs only "
-                "'glm53-packed-v1' checkpoints"
+                "'glm53-packed-v2' checkpoints"
             )
 
     def create_weights(
@@ -961,36 +962,40 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
         if (
             parallel.tp_size not in (4, 8)
             or parallel.ep_size != 1
+            or parallel.dp_size != 1
             or layer.has_bias
-            or layer.num_fused_shared_experts != 1
+            or layer.num_fused_shared_experts != 0
         ):
             raise NotImplementedError(
-                "the glm53-packed-v1 IQ2R layout runs at TP4/TP8 without EP, "
-                "with the shared expert fused"
+                "the glm53-packed-v2 IQ2R layout runs at TP4/TP8 without EP or DP, "
+                "with the shared expert outside the MoE"
             )
         self.tp_size = parallel.tp_size
         self.tp_rank = parallel.tp_rank
 
-        from aiter.iq2r_glm53 import iq2r_glm53_gate_bytes
+        from aiter.iq2r_glm53 import iq2r_glm53_aux_bytes, iq2r_glm53_gate_bytes
         from aiter.ops.iq2r_format import IQ2RMetadata
+        from aiter.ops.iq2r_v2 import IQ2R_V2_LEVELS_C4
 
-        gate_metadata = IQ2RMetadata(
-            logical_n=2 * intermediate_size_per_partition,
-            logical_k=hidden_size,
-        )
+        # IQ2R-v2 auxiliaries hold the codebook copies, a d table and the
+        # output gains (aiter/ops/iq2r_v2.py).
+        self.classes = IQ2R_V2_LEVELS_C4.classes
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size_per_partition
+        gate_n = 2 * intermediate_size_per_partition
         down_metadata = IQ2RMetadata(
             logical_n=hidden_size,
             logical_k=intermediate_size_per_partition,
         )
-        self.num_experts = num_experts
-        self.hidden_size = hidden_size
-        self.intermediate_size = intermediate_size_per_partition
-        layer.iq2r_down_metadata = down_metadata
         shapes = {
-            "w13_weight": iq2r_glm53_gate_bytes(gate_metadata.logical_n),
-            "w13_weight_scale": gate_metadata.auxiliary_bytes,
+            "w13_weight": iq2r_glm53_gate_bytes(gate_n),
+            "w13_weight_scale": iq2r_glm53_aux_bytes(
+                gate_n, hidden_size, self.classes, gate=True
+            ),
             "w2_weight": down_metadata.data_bytes,
-            "w2_weight_scale": down_metadata.auxiliary_bytes,
+            "w2_weight_scale": iq2r_glm53_aux_bytes(
+                hidden_size, intermediate_size_per_partition, self.classes, gate=False
+            ),
         }
         tensors = {
             name: torch.empty((num_experts, nbytes), dtype=torch.uint8)
@@ -1015,7 +1020,7 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
             if loaded_weight.tolist() != [_IQ2R_GLM53_TILE_N]:
                 raise ValueError(
                     f"IQ2R {name} is {loaded_weight.tolist()}, but the "
-                    f"glm53-packed-v1 kernels need {_IQ2R_GLM53_TILE_N}"
+                    f"glm53-packed-v2 kernels need {_IQ2R_GLM53_TILE_N}"
                 )
         elif self.tp_size > 1:
             loaded_weight = self._glm53_tp_slice(name, loaded_weight)
@@ -1028,23 +1033,20 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
 
     def _glm53_tp_slice(self, name: str, weight: torch.Tensor) -> torch.Tensor:
         """This rank's intermediate-dimension shard of a full packed layer."""
-        from aiter.iq2r_glm53 import iq2r_glm53_slice_gate
-        from aiter.ops.iq2r_format import (
-            IQ2RMetadata,
-            iq2r_slice_input_data,
-            iq2r_slice_output_auxiliary,
+        from aiter.iq2r_glm53 import (
+            iq2r_glm53_slice_down_aux,
+            iq2r_glm53_slice_gate,
+            iq2r_glm53_slice_gate_aux,
         )
+        from aiter.ops.iq2r_format import IQ2RMetadata, iq2r_slice_input_data
 
         shard = self.intermediate_size
         full = shard * self.tp_size
         if name == "w13_weight":
             return iq2r_glm53_slice_gate(weight, 2 * shard * self.tp_rank, 2 * shard)
         if name == "w13_weight_scale":
-            return iq2r_slice_output_auxiliary(
-                weight,
-                IQ2RMetadata(logical_n=2 * full, logical_k=self.hidden_size),
-                2 * shard * self.tp_rank,
-                2 * shard,
+            return iq2r_glm53_slice_gate_aux(
+                weight, 2 * shard * self.tp_rank, 2 * shard, 2 * full, self.classes
             )
         if name == "w2_weight":
             return iq2r_slice_input_data(
@@ -1053,22 +1055,23 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
                 shard * self.tp_rank,
                 shard,
             )
-        # Down codebooks and exponents cover all output columns.
-        return weight
+        # The d table runs along the down input, so it shards like the data.
+        return iq2r_glm53_slice_down_aux(
+            weight, shard * self.tp_rank, shard, full, self.classes
+        )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        from aiter.ops.iq2r_format import iq2r_validate_expert_weights
+        from aiter.ops.iq2r_format import IQ2R_CODEBOOK_BYTES
+        from aiter.ops.iq2r_v2 import iq2r_v2_check_codebook
 
-        # Only the down records keep the canonical layout the validator checks.
-        # `--load_dummy` writes no codebooks, so their reserved all-zero entry
-        # is checked only for checkpoint weights.
-        iq2r_validate_expert_weights(
-            layer.w2_weight,
-            layer.w2_weight_scale,
-            layer.iq2r_down_metadata,
-            expert_count=self.num_experts,
-            verify_reserved_zero=not get_current_atom_config().load_dummy,
-        )
+        # load_weight checked every shape. Most kernels form codebook copies
+        # 1-3 from copy 0, exact only for bytes 0x08..0x78; `--load_dummy`
+        # writes no codebooks.
+        if not get_current_atom_config().load_dummy:
+            for aux in (layer.w13_weight_scale, layer.w2_weight_scale):
+                iq2r_v2_check_codebook(
+                    aux[:, :IQ2R_CODEBOOK_BYTES].view(torch.float8_e4m3fn)
+                )
         self._glm53_workspace(layer.w13_weight.device)
 
     def _glm53_workspace(self, device: torch.device):
