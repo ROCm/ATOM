@@ -3384,7 +3384,6 @@ class Config:
         factors.append(bool(getattr(self.dcp_config, "indexer_dcp_only", False)))
         factors.append(self.enable_dp_attention)
         factors.append(self.index_cache_dtype)
-        factors.append(self.kv_cache_dtype == "fp4")
         # DeepSeek-V4.1 decoder SWA bounded replay compiles the backbone as two
         # graphs (early + late layers) instead of one; both compile under the
         # `backbone` tag, so the flag must key the artifacts.
@@ -3460,7 +3459,7 @@ class Config:
             else (
                 spec.method,
                 spec.num_speculative_tokens,
-                getattr(spec, "kv_cache_dtype", None),
+                spec.kv_cache_dtype,
             )
         )
 
