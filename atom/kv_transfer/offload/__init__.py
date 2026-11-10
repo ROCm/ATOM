@@ -3,7 +3,7 @@
 
 """ATOM KV-offload connectors.
 
-Defines three backends registered by the shared KV connector factory:
+Defines four backends registered by the shared KV connector factory:
 
 * ``lmcache_offload`` -- the legacy in-process LMCache engine. Enable via
   ``ATOM_KV_OFFLOAD=lmcache`` (or the equivalent
@@ -21,6 +21,13 @@ Defines three backends registered by the shared KV connector factory:
   ``mooncake_store.metadata``, or ``mooncake_store.pools``). Moves the dense
   KV layout, MiniMax-M3/M3.1 PAGE layout, and V4.1's PAGE regions (state is
   rebuilt by replay). Other stateful layouts and DCP greater than 1 stay
+  refused.
+* ``umbp_store`` -- put and get KV chunks to a Mori UMBP standalone server
+  that runs outside ATOM: start ``umbp_standalone_server`` and select
+  ``{"kv_connector":"umbp_store","kv_role":"offload",
+  "kv_connector_extra_config":{"umbp_store.address":"unix:///..."}}``. A
+  backend of its own, copied from ``mooncake_store``; dense and
+  MiniMax-M3/M3.1 PAGE layouts, stateful layouts and DCP greater than 1
   refused.
 """
 
@@ -88,5 +95,24 @@ def register_backends(factory) -> None:
         # startup; see `check_engine_compatibility`.
         reads_block_regions=offload_layout_reads_block_regions,
         # Dense and PAGE codecs preserve all planes, including FP4 index scales.
+        copies_whole_block_regions=True,
+    )
+
+    factory.register(
+        "umbp_store",
+        worker_module="atom.kv_transfer.offload.umbp_store.worker",
+        worker_class="UMBPStoreOffloadConnector",
+        scheduler_module="atom.kv_transfer.offload.umbp_store.scheduler",
+        scheduler_class="UMBPStoreOffloadScheduler",
+        requires_pd_staging=False,
+        offload=True,
+        # One UMBP standalone server per node, shared by every DP rank there.
+        shared_tier=True,
+        chunk_tokens="atom.kv_transfer.offload.umbp_store.config:store_chunk_tokens",
+        # Dense ignores the region map, the M3 PAGE layout reads it (its NSA
+        # index cache included). Other layouts are refused at startup; see
+        # `check_engine_compatibility`.
+        reads_block_regions=offload_layout_reads_block_regions,
+        # Dense and PAGE codecs preserve all planes.
         copies_whole_block_regions=True,
     )
