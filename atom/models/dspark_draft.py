@@ -441,9 +441,14 @@ class DSparkDraftModel(nn.Module):
         """One DSpark block: parallel backbone pass + sequential Markov
         sampling. Returns ``(draft_token_ids [B, T], confidence | None)``.
 
-        Implement as the composition of the two halves below, so the whole
-        block and the captured block cannot drift apart."""
-        raise NotImplementedError
+        The composition of the two halves below, so the whole block and the
+        captured block cannot drift apart: the proposer captures the backbone
+        and runs the head as its epilogue."""
+        return self.head_and_sample(
+            self.block_backbone(input_ids, positions, num_draft),
+            input_ids,
+            num_draft,
+        )
 
     def block_backbone(
         self,
@@ -470,9 +475,11 @@ class DSparkDraftModel(nn.Module):
         """The sequential half: LM head, then Markov sampling over the block.
 
         ``out`` is what ``block_backbone`` returned; ``anchor_ids`` is the one
-        argument whose shape says how many requests there are.
+        argument whose shape says how many requests there are. By default a
+        draft with no confidence head: ``(draft_token_ids [B, T], None)``.
         """
-        raise NotImplementedError
+        base_logits = self.lm_head(out).view(anchor_ids.shape[0], num_draft, -1)
+        return self._sample_block(base_logits, anchor_ids), None
 
     def _sample_block(
         self,

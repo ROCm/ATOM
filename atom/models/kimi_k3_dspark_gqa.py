@@ -490,11 +490,3 @@ class KimiK3DSparkGQA(DSparkDraftModel):
             hidden, residual = layer(positions, hidden, residual)
         hidden, _ = self.norm(hidden, residual)
         return hidden
-
-    def head_and_sample(self, out, anchor_ids: torch.Tensor, num_draft: int):
-        base_logits = self.lm_head(out).view(anchor_ids.shape[0], num_draft, -1)
-        return self._sample_block(base_logits, anchor_ids), None
-
-    def forward_spec(self, input_ids, positions, num_draft=None):
-        out = self.block_backbone(input_ids, positions, num_draft)
-        return self.head_and_sample(out, input_ids, num_draft)

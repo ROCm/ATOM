@@ -530,13 +530,6 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         attn_metadata.dspark_bt16_rows = self._bt16_rows[:rows]
         attn_metadata.dspark_ctx_rows = self._ctx_rows[:rows]
 
-    def forward_spec(self, input_ids, positions, num_draft):
-        return self.head_and_sample(
-            self.block_backbone(input_ids, positions, num_draft),
-            input_ids,
-            num_draft,
-        )
-
     def block_backbone(
         self,
         input_ids: torch.Tensor,  # [B]   verified anchor token per request

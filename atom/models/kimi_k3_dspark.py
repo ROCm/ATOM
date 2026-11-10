@@ -615,31 +615,6 @@ class KimiK3DSpark(DSparkDraftModel):
         """
         return self.context_norm(linear_out(self.context_proj(aux_concat)))
 
-    def forward_spec(
-        self,
-        input_ids: torch.Tensor,  # [B]   verified anchor token per request
-        positions: torch.Tensor,  # [B*T] block absolute positions
-        num_draft: int,
-    ):
-        """One DSpark block: parallel backbone pass + sequential Markov sampling.
-
-        Returns ``(draft_token_ids [B, T], confidence)``. ``confidence`` is
-        always ``None`` here -- this checkpoint's confidence head is
-        training-only (see ``skip_weight_prefixes``). The proposer already
-        handles ``None`` by leaving the verify length fixed.
-
-        The two halves below are also callable separately, which is how the
-        proposer declares this block as a capturable pass: the backbone is the
-        recorded forward and the head is its epilogue. Kept as the composition
-        so the whole block still has one name, and so nothing that only wants a
-        block has to know it is made of two pieces.
-        """
-        return self.head_and_sample(
-            self.block_backbone(input_ids, positions, num_draft),
-            input_ids,
-            num_draft,
-        )
-
     def block_backbone(
         self,
         input_ids: torch.Tensor,  # [B]   verified anchor token per request
@@ -668,17 +643,3 @@ class KimiK3DSpark(DSparkDraftModel):
             hidden, residual = layer(positions, hidden, residual)
         hidden, _ = self.final_norm(hidden, residual)
         return hidden
-
-    def head_and_sample(
-        self,
-        hidden: torch.Tensor,  # [B*T, hidden] post-final-norm
-        anchor_ids: torch.Tensor,  # [B]
-        num_draft: int,
-    ):
-        """The sequential half: LM head, then Markov sampling over the block.
-
-        Batch comes from ``anchor_ids`` rather than from ``hidden``, which is
-        flat over ``B*T`` and so cannot say which of the two axes it holds.
-        """
-        base_logits = self.lm_head(hidden).view(anchor_ids.shape[0], num_draft, -1)
-        return self._sample_block(base_logits, anchor_ids), None

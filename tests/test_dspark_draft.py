@@ -199,6 +199,20 @@ def test_default_sample_block_chains_each_token_into_the_next():
     assert ids.tolist() == [[11, 12, 13], [21, 22, 23]]
 
 
+def test_default_forward_spec_is_the_backbone_then_the_head():
+    """The whole block is the captured backbone with the head as its
+    epilogue, and the default head scores with the LM head and samples."""
+    import torch
+
+    draft = _stub_draft()
+    draft.block_backbone = lambda ids, pos, t: torch.ones(ids.shape[0] * t, 4)
+    draft.lm_head = lambda out: out.sum(-1, keepdim=True).expand(-1, 5)
+    draft._sample_block = lambda logits, ids: (logits.shape, ids.tolist())
+    ids, confidence = draft.forward_spec(torch.tensor([7, 8]), None, 3)
+    assert ids == (torch.Size([2, 3, 5]), [7, 8])
+    assert confidence is None
+
+
 def test_the_draft_fans_its_slots_out_to_every_context_layer(monkeypatch):
     """`DSparkDraftModel.write_context_kv` passes the slots to each layer."""
     import torch
