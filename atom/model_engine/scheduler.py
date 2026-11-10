@@ -2504,7 +2504,16 @@ class Scheduler:
             ):
                 self.waiting.appendleft(seq)
                 break
-            self.block_manager.record_allocation(seq, hbm_probe)
+            if not self.block_manager.record_allocation(
+                seq, hbm_probe, defer_unverified=True
+            ):
+                # Held a pass for the state offload's verdict on the image it
+                # would load; a gone image is forgotten and the retry plans
+                # without it. Base scheduler only: DecodeScheduler's
+                # `allocate_waiting` never passes `defer_unverified`, so it
+                # never holds.
+                prefix_waiters.append(seq)
+                continue
             if not self.block_manager.allocate(seq, num_cached_blocks):
                 # A state-less joint boundary could not be privatised without
                 # risking a shared decoding sequence's blocks (finding #2).
@@ -3976,6 +3985,9 @@ class Scheduler:
         # Guarded like the `_settle_state_load` / `_publish_state_stores`
         # siblings: a scheduler built without a block manager (the connector
         # test doubles) would otherwise AttributeError on the bare deref.
+        offload = getattr(getattr(self, "block_manager", None), "state_offload", None)
+        if offload is not None:
+            offload.publish_touches(self.kv_connector)
         take = getattr(getattr(self, "block_manager", None), "take_state_loads", None)
         if take is None:
             return
@@ -5196,6 +5208,9 @@ class Scheduler:
         # against a `get` that must miss.
         bm = getattr(self, "block_manager", None)
         offload = getattr(bm, "state_offload", None)
+        if offload is not None:
+            # Touch verdicts, before the next admission pass reads them.
+            offload.collect_touch_verdicts(self.kv_connector)
         take = getattr(self.kv_connector, "take_state_reports", None)
         if offload is not None and take is not None:
             indexed, failed = take()

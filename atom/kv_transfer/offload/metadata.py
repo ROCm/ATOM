@@ -24,6 +24,7 @@ from atom.kv_transfer.disaggregation.types import (
     LoadOperationId,
     ReqId,
     SaveOperationId,
+    StateTouchId,
 )
 
 
@@ -206,6 +207,7 @@ class LMCacheOffloadMetadata(ConnectorMetadata):
         "state_loads",
         "state_stores",
         "token_drops",
+        "state_touches",
     )
 
     def __init__(self) -> None:
@@ -228,6 +230,9 @@ class LMCacheOffloadMetadata(ConnectorMetadata):
         # generation) is what the source-release and index reports carry back to
         # settle the pin and index the hash.
         self.state_stores: list[tuple] = []
+        # StateTouchId per voted state image, refreshed and reported by each
+        # worker.
+        self.state_touches: list[StateTouchId] = []
 
     def add_request(self, meta: LMCacheReqMeta) -> None:
         self.requests.append(meta)
