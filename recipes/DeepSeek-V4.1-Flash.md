@@ -106,6 +106,14 @@ python -m atom.entrypoints.openai_server --model <V4.1 checkpoint> \
   the rank with the least prefill left, charging it only what it will compute.
 - The Store tier loads from 512 tokens (`OFFLOAD_MIN_LOAD_TOKENS`) and starts a load
   as soon as the lookup answers (early tier load), without a flag.
+- Set `ATOM_PREFILL_DELAYER_TARGET_FILL=0.8` (default 0.9). At 0.9 a DP4 shared
+  Store had a median TTFT well above main's; at 0.8, against main with session
+  affinity (DP4, AgentX, 1800 s, same time), 256 concurrency gave throughput +5.0%,
+  mean TTFT -47.5%, median -17.9%, ITL -0.3%; 512 gave +2.8%, -27.1%, -31.8%, and
+  ITL +5.9%.
+- Use one Store every DP rank reaches. `share_cache` refuses per-NIC
+  `mooncake_store.pools` with more than one pool: each worker reads its own
+  NIC's pool, so a request placed on another rank would miss every load.
 - Give the owner enough DRAM for the prefixes you expect (512 GB held a 30-minute
   agentic run at 256 concurrency), and watch `OFFLOAD-STORE-STATS`: repeated
   `NO_AVAILABLE_HANDLE` failures mean the master dropped the owner's segment (raise
