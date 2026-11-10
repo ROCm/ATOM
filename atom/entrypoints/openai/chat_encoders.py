@@ -323,7 +323,16 @@ def apply_chat_template(
     if tools:
         kwargs["tools"] = tools
     rendered = tokenizer.apply_chat_template(messages, **kwargs)
-    return list(rendered) if kwargs["tokenize"] else rendered
+    if not kwargs["tokenize"]:
+        return rendered
+    # A tokenizer that rendered text (or a BatchEncoding) despite tokenize=True
+    # would otherwise reach the engine as characters or keys taken for ids.
+    if not isinstance(rendered, list) or not all(isinstance(i, int) for i in rendered):
+        raise TypeError(
+            f"{type(tokenizer).__name__}.apply_chat_template(tokenize=True) "
+            f"returned {type(rendered).__name__}, expected a list of token ids"
+        )
+    return rendered
 
 
 def encodes_chat_segments(tokenizer: Any) -> bool:

@@ -1075,6 +1075,26 @@ class TestPreparePrompt:
         assert engine_input == list(range(90))
         assert starts is False
 
+    def test_ids_from_the_template_skip_the_engine_encode(self, prepare, monkeypatch):
+        # A segment-encoding tokenizer (Kimi-K3) hands back ids: they go to the
+        # engine as they are, and the channel is read from their decode.
+        monkeypatch.setattr(
+            api_server, "apply_chat_template", lambda *_a, **_kw: [7, 8, 9]
+        )
+        monkeypatch.setattr(
+            api_server.engine.io_processor,
+            "encode_prompt",
+            lambda _text: pytest.fail("ids must not be encoded again"),
+        )
+        monkeypatch.setattr(
+            api_server,
+            "tokenizer",
+            SimpleNamespace(decode=lambda ids, **_kw: "x<think>"),
+        )
+        engine_input, starts = prepare("unused", max_tokens=10)
+        assert engine_input == [7, 8, 9]
+        assert starts is True
+
     @pytest.mark.parametrize("max_tokens", [100, 1024])
     def test_no_room_for_a_prompt_is_refused(self, prepare, max_tokens):
         with pytest.raises(ValueError, match="no room for a prompt"):
