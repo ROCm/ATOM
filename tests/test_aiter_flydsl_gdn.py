@@ -248,6 +248,43 @@ def test_triton_decode_vk_fallback():
     torch.testing.assert_close(vk, state, rtol=0.008, atol=2e-6)
 
 
+def test_triton_decode_skips_padding_rows_with_tokens(monkeypatch):
+    # A graph capture runs a token through every row, PAD_SLOT_ID ones too.
+    # Buffer ops would drop the negative offset in hardware; a pool view deep
+    # in a large allocation gets plain pointers, which do not.
+    monkeypatch.setenv("AMDGCN_USE_BUFFER_OPS", "0")
+    q, k, v, a, b, log, bias = inputs(3)
+    # The row before the pool is what a PAD index would address.
+    storage = torch.randn(7, 24, 128, 128, device="cuda", dtype=torch.bfloat16) * 0.1
+    original = storage.clone()
+    pool = storage[1:]
+    reads = torch.tensor([0, -1, 2], device="cuda", dtype=torch.int32)
+    writes = torch.tensor([3, -1, 5], device="cuda", dtype=torch.int32)
+    # The output is allocated uninitialized: hand it the memory of a NaN
+    # tensor, so a padding row left unwritten reads as NaN, not as zero.
+    bait = torch.full_like(v, float("nan"))
+    del bait
+    out = baseline_decode(q, k, v, a, b, pool, log, bias, reads, writes)
+    assert (out[:, 1] == 0).all()
+    reference = original[1:].clone()
+    live = [0, 2]
+    expected = baseline_decode(
+        q[:, live].contiguous(),
+        k[:, live].contiguous(),
+        v[:, live].contiguous(),
+        a[live],
+        b[live],
+        reference,
+        log,
+        bias,
+        reads[live],
+        writes[live],
+    )
+    torch.testing.assert_close(out[:, live], expected, rtol=0, atol=0)
+    torch.testing.assert_close(pool, reference, rtol=0, atol=0)
+    torch.testing.assert_close(storage[0], original[0], rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("replayssm", [False, True])
 @pytest.mark.parametrize("supported_arch", [False, True])
 @pytest.mark.parametrize("decode_backend", ["auto", "triton", "flydsl"])

@@ -399,8 +399,13 @@ class ScheduledBatch:
         # its length, and at decode a window is a single token. `extend`
         # between two `array("i")` is a memcpy. 4x at bs=256.
         staged = new_token_ids()
+        # Whether any request prefills. A batch with none (an idle DP rank's
+        # dummy) has no phase of its own: `ForwardMode.decide` gives it the
+        # group's.
+        self.has_prefill = False
         for i, (seq, num) in enumerate(zip(seqs.values(), num_scheduled_tokens)):
             if seq.type == SequenceType.PREFILL:
+                self.has_prefill = True
                 offset = self.num_cached_tokens[i]
             elif is_deferred_out or num_spec_step == 0:
                 offset = seq.num_tokens - num_rejected[i] - num
@@ -688,8 +693,8 @@ class Scheduler:
     ):
         # The runners recorded prefill token graphs
         # (`ModelRunner.prefill_token_graphs`), not merely configured them: a
-        # backend without `supports_token_graph` records none, and its idle DP
-        # rank has no bucket to dummy-prefill on.
+        # backend without `supports_token_graph` records none, and its decoding
+        # rank has no bucket to yield its decode to.
         self.prefill_token_graphs = prefill_token_graphs
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
@@ -877,9 +882,8 @@ class Scheduler:
         # Seqs whose last chunk ended on a state-checkpoint rung not yet filed,
         # by that chunk's end; prefill skips them. Under PP the next chunk would
         # otherwise overwrite the state slot before it is filed under the rung's
-        # hash. Keyed on advance_on_schedule, which only PP sets.
-        # shortcut: holds prefill until the rung's chunk completes; #2709 files
-        # the checkpoint at schedule time and drops the hold for most requests.
+        # hash. Keyed on advance_on_schedule, which only PP sets. Only a class
+        # that must file at retire lands here; see `_finalize_prefill_chunk`.
         self._checkpoint_holds: dict[int, int] = {}
 
         from atom.utils.forward_context import get_kvconnector
@@ -973,9 +977,6 @@ class Scheduler:
         self._arrived_requests = 0
         self._local_prefill_coalescing = False
         self._inflight_prefix_wait: dict[int, int] = {}
-        # This tick is the DP group's prefill step and this rank has none of its
-        # own: EngineCore runs a dummy prefill instead of a decode.
-        self.dummy_prefill = False
 
     def _group_prefill_tick(self, decision: PrefillDecision) -> bool:
         """Whether some DP rank prefills this tick, from the delayer's reduce.
@@ -996,8 +997,16 @@ class Scheduler:
 
     def _wait_for_inflight_prefix(self, seq: Sequence, cached_tokens: int) -> bool:
         """Bounded wait for a hybrid producer's planned prompt-end checkpoint."""
+        if not self._waits_for_inflight_prefix(seq, cached_tokens):
+            return False
+        self._inflight_prefix_wait.setdefault(
+            seq.id, self._schedule_tick + self.prefill_delayer.ttft_max_ticks
+        )
+        return True
+
+    def _waits_for_inflight_prefix(self, seq: Sequence, cached_tokens: int) -> bool:
+        """Whether `_wait_for_inflight_prefix` would wait; starts no deadline."""
         bm = self.block_manager
-        delayer = self.prefill_delayer
         if (
             not bm.enable_prefix_caching
             or not bm.state.enabled
@@ -1042,9 +1051,6 @@ class Scheduler:
                 np.frombuffer(seq.token_ids, dtype=np.int32, count=anchor),
                 np.frombuffer(producer.token_ids, dtype=np.int32, count=anchor),
             ):
-                self._inflight_prefix_wait.setdefault(
-                    seq.id, self._schedule_tick + delayer.ttft_max_ticks
-                )
                 return True
         return False
 
@@ -1095,7 +1101,7 @@ class Scheduler:
         prefillable = pending > 0
         if pending >= budget or len(self.running) >= self.max_num_seqs:
             return prefillable, min(pending, budget)
-        probed_tokens = 0
+        # A chunk counts the rows its forward computes, not the reused prefix.
         slots = self.max_num_seqs - len(self.running)
         for seq in self._waiting_prefills():
             offload_resume = self._is_offload_prefill_resume(seq)
@@ -1106,11 +1112,8 @@ class Scheduler:
                     seq, resume, hit=self.block_manager.tier_resume_replays(seq)
                 )
             else:
-                if probed_tokens >= budget:
-                    break
                 # The exact probe's answer; the walk is memoised across ticks.
                 cached_blocks = self.block_manager.can_allocate_memoized(seq)
-                probed_tokens += seq.num_tokens
                 if cached_blocks < 0:
                     break  # Phase 2 also stops at the first allocation refusal.
                 if slots <= self._num_parked_remote_kv:
@@ -1120,6 +1123,10 @@ class Scheduler:
                     prefillable = True
                     break
                 resume = cached_blocks * self.block_manager.hash_block_size
+                if self._waits_for_inflight_prefix(
+                    seq, max(resume, seq.offload_joint.kv_prefix_tokens)
+                ):
+                    break  # Admission defers it; the seqs behind it go uncounted.
                 cached = self.block_manager.replay_start(seq, resume, hit=True)
             remaining = (
                 seq.num_tokens - cached
@@ -2175,7 +2182,7 @@ class Scheduler:
 
         # Before the early return below: an idle rank keeps its peers' prefill
         # company too.
-        self.dummy_prefill = self._group_prefill_tick(decision)
+        group_prefill_tick = self._group_prefill_tick(decision)
 
         if self.cost_balance and delayer_allows and self.prefill_delayer is not None:
             self._balance_prefill_step(prefill_cost)
@@ -2494,7 +2501,16 @@ class Scheduler:
             ):
                 self.waiting.appendleft(seq)
                 break
-            self.block_manager.record_allocation(seq, hbm_probe)
+            if not self.block_manager.record_allocation(
+                seq, hbm_probe, defer_unverified=True
+            ):
+                # Held a pass for the state offload's verdict on the image it
+                # would load; a gone image is forgotten and the retry plans
+                # without it. Base scheduler only: DecodeScheduler's
+                # `allocate_waiting` never passes `defer_unverified`, so it
+                # never holds.
+                prefix_waiters.append(seq)
+                continue
             if not self.block_manager.allocate(seq, num_cached_blocks):
                 # A state-less joint boundary could not be privatised without
                 # risking a shared decoding sequence's blocks (finding #2).
@@ -2827,9 +2843,9 @@ class Scheduler:
 
             return (prefill_batch, scheduled_seqs)
 
-        if self.dummy_prefill:
+        if group_prefill_tick:
             # The group's prefill step, with no prefill of this rank's own: it
-            # keeps its peers company on a dummy prefill rather than decode, so
+            # keeps its peers company on an idle step rather than decode, so
             # every rank's forward replays its token graph (`ForwardMode.decide`).
             return None
 
@@ -3648,10 +3664,18 @@ class Scheduler:
         ):
             chunk = bm.state.min_fork_tokens
             on_rung = False
-        # With several forwards in flight, hold the next chunk until this
-        # checkpoint is filed. PP refuses PAGE checkpoints, so a rung here is
-        # strictly inside the prompt and there always is a next chunk.
-        if on_rung and self.advance_on_schedule and bm.enable_prefix_caching:
+        # With several forwards in flight, the next chunk would write the slot
+        # before this one retires. File the checkpoint now where the class
+        # allows it, else hold the next chunk until it is filed. A rung at
+        # prompt end needs neither: the first decode is already held by
+        # `_pp_inflight_token_block`.
+        if (
+            on_rung
+            and self.advance_on_schedule
+            and bm.enable_prefix_caching
+            and start + chunk < seq.num_prompt_tokens
+            and not bm.checkpoint_when_scheduled(seq, start + chunk)
+        ):
             self._checkpoint_holds[seq.id] = start + chunk
         return chunk
 
@@ -3926,6 +3950,9 @@ class Scheduler:
         # Guarded like the `_settle_state_load` / `_publish_state_stores`
         # siblings: a scheduler built without a block manager (the connector
         # test doubles) would otherwise AttributeError on the bare deref.
+        offload = getattr(getattr(self, "block_manager", None), "state_offload", None)
+        if offload is not None:
+            offload.publish_touches(self.kv_connector)
         take = getattr(getattr(self, "block_manager", None), "take_state_loads", None)
         if take is None:
             return
@@ -5135,6 +5162,9 @@ class Scheduler:
         # against a `get` that must miss.
         bm = getattr(self, "block_manager", None)
         offload = getattr(bm, "state_offload", None)
+        if offload is not None:
+            # Touch verdicts, before the next admission pass reads them.
+            offload.collect_touch_verdicts(self.kv_connector)
         take = getattr(self.kv_connector, "take_state_reports", None)
         if offload is not None and take is not None:
             indexed, failed = take()

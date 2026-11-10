@@ -134,8 +134,9 @@ def _identity_extract(output: Any, _module: nn.Module) -> torch.Tensor:
 
 
 def _aux_hook(extract, write):
-    """A target-layer forward hook handing ``write(tensor, row_offset)`` the
-    tap's aux tensor, on target forwards only."""
+    """A target-layer forward hook handing ``write(tensor, tokens)`` the tap's
+    aux tensor and the step's tokens it is for (a slice, or a split decode
+    micro-batch's packed positions), on target forwards only."""
 
     def _hook(module, _inputs, output):
         ctx = get_forward_context().context
@@ -147,10 +148,14 @@ def _aux_hook(extract, write):
         tensor = extract(output, module)
         if tensor is None:
             return
-        # The offset is 0 except under TBO, where this hook fires once per
-        # micro-batch on a disjoint token slice — writing at row 0
-        # unconditionally would make the ubatches overwrite each other.
-        write(tensor, ctx.ubatch_token_offset)
+        # Under TBO this hook fires once per micro-batch on its own tokens --
+        # writing at token 0 unconditionally would make the ubatches overwrite
+        # each other.
+        tokens = ctx.ubatch_token_order
+        if tokens is None:
+            offset = ctx.ubatch_token_offset
+            tokens = slice(offset, offset + tensor.shape[0])
+        write(tensor, tokens)
 
     return _hook
 
@@ -238,6 +243,9 @@ class Drafter(abc.ABC):
 
     # The leading taps' rows relayed from earlier PP stages, as one block.
     _relayed_aux: torch.Tensor | None = None
+    # Whether a serial draft's steps 1+ reuse step 0's sparse top-k
+    # (`EagleProposer`); read once by the attention builder.
+    share_mtp_indices = False
 
     def __init__(self, atom_config: Config, device: torch.device, runner):
         self.config = atom_config
@@ -505,9 +513,9 @@ class Drafter(abc.ABC):
     def _make_aux_hook(self, buf_idx: int, extract):
         buffer = self._aux_buffers[buf_idx]
 
-        def write(tensor, off):
+        def write(tensor, tokens):
             # In-place write into the fixed buffer (cudagraph-safe).
-            buffer[off : off + tensor.shape[0]].copy_(tensor)
+            buffer[tokens] = tensor
 
         return _aux_hook(extract, write)
 
@@ -550,8 +558,7 @@ class Drafter(abc.ABC):
         """
         n = len(anchors)
         buf = self.runner.forward_vars["draft_next_tokens"]
-        if buf._publication is not None:
-            buf._publication.acquire_write()
+        buf.acquire_write()
         buf.np[:n] = anchors
         return buf.copy_to_gpu(n)
 
@@ -792,27 +799,22 @@ class Drafter(abc.ABC):
         var["target_logits_indices"].np[:sum_drafted_tokens] = target_logits_indices
         var["cu_num_draft_tokens"].np[:scheduled_bs] = cu_num_draft_tokens
         var["bonus_logits_indices"].np[:scheduled_bs] = bonus_logits_indices
-        group = publication_group
-        counts = group.counts
-        counts[group.indices["target_logits_indices"]] = sum_drafted_tokens
-        counts[group.indices["cu_num_draft_tokens"]] = scheduled_bs
-        counts[group.indices["bonus_logits_indices"]] = scheduled_bs
+        publication_group.set_counts(
+            {
+                "target_logits_indices": sum_drafted_tokens,
+                "cu_num_draft_tokens": scheduled_bs,
+                "bonus_logits_indices": scheduled_bs,
+            }
+        )
         return num_draft_tokens, sum_drafted_tokens
 
     def calc_spec_decode_metadata(
         self,
-        num_sampled_tokens: np.ndarray,
-        cu_num_sampled_tokens: np.ndarray,
         input_ids: torch.Tensor,
-        *,
-        prepared_indices: tuple[np.ndarray, int] | None = None,
+        prepared_indices: tuple[np.ndarray, int],
     ) -> SpecDecodeMetadata:
-        if prepared_indices is None:
-            group = self.runner.h2d_groups["spec_decode"]
-            prepared_indices = self.prepare_spec_decode_indices(
-                num_sampled_tokens, cu_num_sampled_tokens, group
-            )
-            group.publish(group.counts)
+        """The verify's index views, published with the token inputs
+        (`prepare_spec_decode_indices` returned ``prepared_indices``)."""
         num_draft_tokens, sum_drafted_tokens = prepared_indices
         scheduled_bs = len(num_draft_tokens)
         var = self.runner.forward_vars

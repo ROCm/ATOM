@@ -184,7 +184,6 @@ class VllmDeepseekV41MetadataBuilder(DeepseekV41MetadataBuilder):
         tentative=False,
         is_prefill=False,
         start_positions=None,
-        query_prefix_ready=False,
         engram_live=True,
         cache_override=None,
     ):
@@ -193,19 +192,6 @@ class VllmDeepseekV41MetadataBuilder(DeepseekV41MetadataBuilder):
         ``cache_override`` selects private profiling capture storage without
         changing the serving binding or forcing a verify batch into prefill.
         """
-        # Once graphs bind the serving pool, an idle DP rank must publish
-        # padding into that pool's metadata. A fresh scratch cache would refill
-        # different indptr addresses while replay still reads the captured ones.
-        if self._idle(batch) and cache_override is None:
-            return self._prepare_idle(
-                batch,
-                running_bs,
-                running_tokens,
-                max_q_len=max_q_len,
-                tentative=tentative,
-                is_prefill=is_prefill,
-                query_prefix_ready=query_prefix_ready,
-            )
         spans, rows, offset, next_page = [], [], 0, 0
         slots = batch.state_slots_committed
         if not batch.is_dummy_run and len(slots) != batch.total_seqs_num:
@@ -214,8 +200,6 @@ class VllmDeepseekV41MetadataBuilder(DeepseekV41MetadataBuilder):
             zip(batch.req_ids, batch.num_scheduled_tokens, batch.context_lens)
         ):
             length, end = int(length), int(end)
-            if length == 0:
-                continue
             if batch.is_dummy_run:
                 # Warmup uses private scratch. A dummy rank may never mutate
                 # a live slot or PAGE, even when its fabricated block ID is 0.
@@ -235,15 +219,14 @@ class VllmDeepseekV41MetadataBuilder(DeepseekV41MetadataBuilder):
             offset += length
         if offset != batch.total_tokens_num or running_tokens < offset:
             raise ValueError("CSA2 batch token spans disagree with the runner")
-        # Each span's batch index: zero-token scheduler rows have none.
-        scheduled = np.flatnonzero(batch.num_scheduled_tokens)
         resumes, floors, cached_until, histories = (
             (None,) * 4
             if batch.is_dummy_run or not batch.replaying
-            else self._replay_layout(batch.replaying, scheduled, spans)
+            else self._replay_layout(batch.replaying, spans)
         )
         cache = cache_override
         if cache is None:
+            # Fabricated requests get private scratch.
             cache = (
                 self._capture_dummy_cache(
                     max(next_page, 1), max(len(spans), 1), running_tokens
@@ -253,7 +236,10 @@ class VllmDeepseekV41MetadataBuilder(DeepseekV41MetadataBuilder):
             )
         if cache is None:
             raise RuntimeError("CSA2 cache must be allocated before serving")
-        compacted = len(spans) != len(batch.req_ids)
+        # No runner token inputs carry the query metadata here.
+        self.publish_query_metadata(
+            np.asarray(batch.num_scheduled_tokens, np.int32), running_bs, running_tokens
+        )
         return self._prepare_step(
             batch,
             spans,
@@ -264,14 +250,7 @@ class VllmDeepseekV41MetadataBuilder(DeepseekV41MetadataBuilder):
             max_q_len=max_q_len,
             tentative=tentative,
             is_prefill=is_prefill,
-            query_prefix_ready=query_prefix_ready and not compacted,
-            query_prefix_republish_reason=(
-                "compact zero-token scheduler rows for CSA2 after input assembly"
-                if query_prefix_ready and compacted
-                else None
-            ),
             engram_live=engram_live,
-            scheduled=scheduled,
             replay_layout=(resumes, floors, cached_until, histories),
         )
 

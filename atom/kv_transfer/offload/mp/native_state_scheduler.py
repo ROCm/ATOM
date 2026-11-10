@@ -316,7 +316,7 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
             return False
         if len(self._native_loads) < restore_slot_count(self._max_pending_saves):
             return False
-        return self._lookup_client.hit_tokens(str(seq.id)) != 0
+        return self._lookup_client.answered_hit(str(seq.id)) != 0
 
     def should_park_for_load_after_alloc(self, seq: Any) -> bool:
         parks = super().should_park_for_load_after_alloc(seq)
