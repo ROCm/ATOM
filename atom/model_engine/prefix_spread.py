@@ -145,11 +145,15 @@ class PrefixSpreadRouter:
         """Where `seq` goes; `charge` returns the prefix it is credited.
 
         - No known prefix: the lightest rank (`least_tokens` score).
-        - The prefix's rank (owner) has a backlog (over 2 x idle queued
-          prefill) and another rank is about to idle (under idle): that idle
-          rank (`_idle_target`). This applies even while the request computing
-          the prefix is still prefilling; the tier cannot supply it yet, so
-          the request is charged everything but the target's own part.
+        - The prefix's rank (owner) has a backlog -- over 2 x idle queued
+          prefill, or every request slot taken (`max_seqs`), so the request
+          could not start there -- and another rank is about to idle (under
+          idle, with a free slot): that idle rank (`_idle_target`). It is
+          credited what it holds plus what the tier can load: the longest part
+          some request finished prefilling (`_tier_hit`). If the request
+          computing the prefix is still prefilling and no shorter copy is
+          finished, the tier has nothing and the request is charged everything
+          but the target's own part.
         - Otherwise the owner. While the prefix's source is still prefilling
           this is what lets the request reuse it from HBM.
         """
@@ -163,7 +167,10 @@ class PrefixSpreadRouter:
         # An owner is a rank holding a sampled part, so `hit` > 0.
         hit = hits[owner]
         rank = owner
-        if rank_tokens[owner] > 2 * self.idle_tokens:
+        if (
+            rank_tokens[owner] > 2 * self.idle_tokens
+            or rank_reqs[owner] >= self.max_seqs
+        ):
             target = self._idle_target(owner, hits, rank_tokens, rank_reqs, rank_load)
             if target is not None:
                 rank = target

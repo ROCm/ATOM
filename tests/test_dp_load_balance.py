@@ -1340,3 +1340,49 @@ def test_owner_ties_go_to_the_rank_that_used_the_prefix_last():
     router.place(reuse, 0, 2)
     mgr._charge_seq_load_locked(reuse, 0)
     assert router._rank_hits(probe, 2)[1] == 0
+
+
+def test_an_owner_with_every_slot_taken_sends_its_prefix_to_an_idle_rank():
+    """The owner queues no prefill but runs `max_seqs` decodes, so a request
+    could not start there; with another rank idle the prefix's requests go
+    there instead of piling onto the full owner."""
+    mgr = _make_spread_mgr()
+    router = mgr._prefix_router
+    router.max_seqs = 32
+    (owner,) = _route(mgr, [_chain_seq(1, 100_000)])
+    mgr._mark_seq_prefill_complete(1)
+    mgr._rank_tokens = [0, 0]
+    mgr._rank_reqs = [0, 0]
+    mgr._rank_reqs[owner] = 32
+    ranks = _route(mgr, [_chain_seq(100 + i, 100_000) for i in range(40)])
+    assert ranks.count(owner) == 0
+    assert mgr._rank_reqs[owner] == 32
+
+
+@pytest.mark.parametrize(
+    "ranks,pp,builds", [(1, 1, False), (2, 2, False), (2, 1, True)]
+)
+def test_prefix_spread_is_checked_and_built_only_where_it_routes(
+    monkeypatch, ranks, pp, builds
+):
+    """One DP rank, or pipeline parallelism, routes nothing: the strategy has
+    no effect, so a missing prompt hash chain does not stop startup. With DP
+    ranks to route between it does."""
+    from types import SimpleNamespace
+
+    mgr = _make_mgr(ranks, strategy="prefix_spread")
+    mgr.global_engine_count = ranks
+    config = SimpleNamespace(
+        enable_prefix_caching=True,
+        pipeline_parallel_size=pp,
+        max_num_seqs=256,
+        kv_transfer_config=None,
+    )
+    monkeypatch.setenv("ATOM_FRONTEND_PREFIX_HASH", "0")
+    if builds:
+        with pytest.raises(ValueError, match="ATOM_FRONTEND_PREFIX_HASH"):
+            mgr._build_prefix_router(config)
+        monkeypatch.setenv("ATOM_FRONTEND_PREFIX_HASH", "1")
+        assert mgr._build_prefix_router(config) is not None
+    else:
+        assert mgr._build_prefix_router(config) is None

@@ -1297,51 +1297,49 @@ class TestWaitingNewTokenCount:
         sched.waiting = deque([normal, oversized])
         assert sched._waiting_new_token_count() == 8
 
-    def test_an_unschedulable_reject_releases_only_the_offload_tier(self, seq_factory):
-        """A prompt over max_model_len is rejected before it runs. A `multi`
-        P/D + offload connector releases its offload sub only: the P/D sub
-        would treat the request as a finished prefill and fail on its missing
-        first token. Without an offload tier nothing is called (as before)."""
+    def test_an_unschedulable_reject_takes_the_abort_teardown(
+        self, seq_factory, monkeypatch
+    ):
+        """A prompt over max_model_len leaves without running: the schedule
+        hands it to the abort teardown (`_reject_aborted_waiting`) with its own
+        reason."""
+        sched = self._sched()
+        calls = []
+        real = sched._reject_aborted_waiting
+        monkeypatch.setattr(
+            sched,
+            "_reject_aborted_waiting",
+            lambda seq, reason="aborted": (calls.append(reason), real(seq, reason)),
+        )
+        oversized = seq_factory(list(range(200)))  # > max_model_len=64
+        sched.add(oversized)
+        sched._lookup_detach_declined.add(oversized.id)
+        sched.schedule()
+        assert len(calls) == 1 and calls[0].startswith("unschedulable")
+        assert oversized.leave_reason == calls[0]
+        assert oversized in sched._rejected
+        assert oversized.id not in sched._lookup_detach_declined
+
+    def test_the_abort_teardown_tells_connectors_the_prefill_never_ran(
+        self, seq_factory
+    ):
+        sched = self._sched()
         events = []
 
-        class _Multi:
+        class _Connector:
             is_offload = True
 
             def cancel_pending_load(self, seq):
                 events.append(("cancel", seq.id))
 
-            def offload_request_finished(self, seq):
-                events.append(("offload_finished", seq.id))
-
             def request_finished(self, seq):
-                raise IndexError("a P/D producer reads output_tokens[0]")
+                events.append(("finished", seq.id, seq.prefill_completed))
 
-        sched = self._sched()
-        oversized = seq_factory(list(range(200)))  # > max_model_len=64
-        sched.kv_connector = _Multi()
-        sched._release_unrun_offload(oversized)
-        assert events == [
-            ("cancel", oversized.id),
-            ("offload_finished", oversized.id),
-        ]
-
-        sched.kv_connector = SimpleNamespace(
-            is_offload=False,
-            request_finished=lambda seq: pytest.fail("P/D only: not called"),
-        )
-        sched._release_unrun_offload(oversized)
-
-    def test_the_unschedulable_branch_releases_the_offload_tier(
-        self, seq_factory, monkeypatch
-    ):
-        sched = self._sched()
-        released = []
-        monkeypatch.setattr(sched, "_release_unrun_offload", released.append)
-        oversized = seq_factory(list(range(200)))
-        sched.add(oversized)
-        sched.schedule()
-        assert released == [oversized]
-        assert oversized.leave_reason.startswith("unschedulable")
+        sched.kv_connector = _Connector()
+        seq = seq_factory(list(range(200)))
+        sched._reject_aborted_waiting(seq, reason="unschedulable: too long")
+        assert seq.leave_reason == "unschedulable: too long"
+        assert events == [("cancel", seq.id), ("finished", seq.id, False)]
 
     def test_saturates_at_cap(self, seq_factory):
         sched = Scheduler(

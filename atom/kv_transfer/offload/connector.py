@@ -272,11 +272,6 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
     def request_finished(self, seq) -> None:
         self._impl.request_finished(seq)
 
-    def offload_request_finished(self, seq) -> None:
-        # The tier is all this connector is (`MultiConnectorScheduler` narrows
-        # the same call to its offload sub).
-        self._impl.request_finished(seq)
-
     def source_blocks_released(self, seq) -> None:
         self._impl.source_blocks_released(seq)
 

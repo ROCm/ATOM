@@ -580,17 +580,6 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             if hasattr(c, "request_finished"):
                 c.request_finished(seq)
 
-    def offload_request_finished(self, seq: Any) -> None:
-        """`request_finished` for the offload subs alone.
-
-        For a request rejected before it ran: a P/D sub would treat it as a
-        finished prefill and publish a handoff for output it never produced.
-        """
-        self._load_winner.pop(getattr(seq, "id", None), None)
-        for c in self._connectors:
-            if getattr(c, "is_offload", False) and hasattr(c, "request_finished"):
-                c.request_finished(seq)
-
     def source_blocks_released(self, seq: Any) -> None:
         # The terminal half of `request_finished` for whichever sub deferred
         # the free. Fanned to all: only the offload sub keeps block-lifetime

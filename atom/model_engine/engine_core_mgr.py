@@ -314,30 +314,8 @@ class CoreManager:
         # request on the rank holding its prompt's prefix unless that rank has
         # a prefill backlog and another is about to idle. Set exactly when
         # dp_load_balance is "prefix_spread".
-        self._prefix_router: PrefixSpreadRouter | None = None
-        if self._dp_lb_strategy == "prefix_spread":
-            if self._dp_session_affinity_enabled:
-                # Both place every request by their own rule; a session pin
-                # would undo every move.
-                raise ValueError(
-                    "--dp-load-balance prefix_spread and ATOM_DP_SESSION_AFFINITY=1 "
-                    "are two routing policies; set only one"
-                )
-            if not (
-                getattr(config, "enable_prefix_caching", False)
-                and envs.ATOM_FRONTEND_PREFIX_HASH
-            ):
-                # No prompt hash chain reaches the router: every request is
-                # cold and goes to the lightest rank.
-                raise ValueError(
-                    "--dp-load-balance prefix_spread needs --enable_prefix_caching "
-                    "and ATOM_FRONTEND_PREFIX_HASH=1 (the frontend prompt hash chain)"
-                )
-            self._prefix_router = PrefixSpreadRouter(
-                envs.ATOM_DP_PREFIX_IDLE_TOKENS,
-                KVConnectorFactory.offload_tier(config),
-                config.max_num_seqs,
-            )
+        self._prefix_router = self._build_prefix_router(config)
+        if self._prefix_router is not None:
             self._dp_route_counters.update(
                 dict.fromkeys(
                     PrefixSpreadRouter.DECISIONS + (PrefixSpreadRouter.MOVED_TOKENS,), 0
@@ -1101,6 +1079,41 @@ class CoreManager:
             self._send_request(0, _add_frame(seqs))
         else:
             self._dispatch_to_dp_ranks(seqs)
+
+    def _build_prefix_router(self, config) -> PrefixSpreadRouter | None:
+        """The `prefix_spread` router, or None.
+
+        None for another strategy, and when there is nothing to route: one
+        DP rank, or pipeline parallelism (requests enter at stage 0). The
+        strategy has no effect there, so its requirements are not enforced.
+        """
+        if self._dp_lb_strategy != "prefix_spread":
+            return None
+        pp_size = int(getattr(config, "pipeline_parallel_size", 1) or 1)
+        if self._routable_engine_count <= 1 or pp_size > 1:
+            return None
+        if self._dp_session_affinity_enabled:
+            # Both place every request by their own rule; a session pin
+            # would undo every move.
+            raise ValueError(
+                "--dp-load-balance prefix_spread and ATOM_DP_SESSION_AFFINITY=1 "
+                "are two routing policies; set only one"
+            )
+        if not (
+            getattr(config, "enable_prefix_caching", False)
+            and envs.ATOM_FRONTEND_PREFIX_HASH
+        ):
+            # No prompt hash chain reaches the router: every request is
+            # cold and goes to the lightest rank.
+            raise ValueError(
+                "--dp-load-balance prefix_spread needs --enable_prefix_caching "
+                "and ATOM_FRONTEND_PREFIX_HASH=1 (the frontend prompt hash chain)"
+            )
+        return PrefixSpreadRouter(
+            envs.ATOM_DP_PREFIX_IDLE_TOKENS,
+            KVConnectorFactory.offload_tier(config),
+            config.max_num_seqs,
+        )
 
     @property
     def _routable_engine_count(self) -> int:

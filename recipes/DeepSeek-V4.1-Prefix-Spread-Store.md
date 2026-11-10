@@ -47,9 +47,9 @@ these options to the V4.1 model command:
 ```
 
 The Store extra config names the shared pool. Do not also pass a second
-standalone offload connector in `--kv-transfer-config`. The single-node path
-above does not configure a P/D handoff; P/D composition must be configured
-separately. Store capacity is a deployment choice, not reserved by these flags.
+standalone offload connector in `--kv-transfer-config`. This is a
+single-node (non-P/D) setup: V4.1 does not admit a `multi` connector, so the
+Store cannot be combined with Mooncake P/D in the same server. Store capacity is a deployment choice, not reserved by these flags.
 
 ## Validation and performance
 

@@ -2272,14 +2272,11 @@ class Scheduler:
             # Re-check here (not just at submit) since pool state may change.
             unschedulable = self._unschedulable_reason(seq)
             if unschedulable is not None:
-                self._inflight_prefix_wait.pop(seq.id, None)
-                self._lookup_detach_declined.discard(seq.id)
-                seq.status = SequenceStatus.FINISHED
-                seq.leave_reason = f"unschedulable: {unschedulable}"
-                seq.multimodal_data = None
-                tracing.finish(seq, reason=seq.leave_reason)
-                self._rejected.append(seq)
-                self._release_unrun_offload(seq)
+                # Leaves without running, like an abort: the same teardown
+                # (connectors see no completed prefill: `produced_no_handoff`).
+                self._reject_aborted_waiting(
+                    seq, reason=f"unschedulable: {unschedulable}"
+                )
                 continue
 
             if len(self.running) >= self.max_num_seqs:
@@ -3127,14 +3124,16 @@ class Scheduler:
         seq.prefill_completed = True
         tracing.prefill_complete(seq)
 
-    def _reject_aborted_waiting(self, seq: Sequence) -> None:
+    def _reject_aborted_waiting(self, seq: Sequence, reason: str = "aborted") -> None:
+        """End a waiting request that never ran: aborted, or rejected as
+        unschedulable (`reason`)."""
         self._inflight_prefix_wait.pop(seq.id, None)
         self._lookup_detach_declined.discard(seq.id)
         has_inflight_load = bool(getattr(seq, "_counted_as_inflight_load", False))
         seq.status = SequenceStatus.FINISHED
-        seq.leave_reason = "aborted"
+        seq.leave_reason = reason
         seq.multimodal_data = None
-        tracing.finish(seq, reason="aborted")
+        tracing.finish(seq, reason=reason)
         self._rejected.append(seq)
         if not has_inflight_load:
             # A lookup can pin CPU KV before HBM allocation succeeds.
@@ -3204,31 +3203,12 @@ class Scheduler:
         # This failure is the terminal report the abort waits for.
         self._finish_aborted_load_cleanup(seq.id)
 
-    def _release_unrun_offload(self, seq: Sequence) -> None:
-        """Release what an offload tier kept for a request rejected as
-        unschedulable before it ran (a lookup, an MP session, its worker token
-        copy).
-
-        Only the offload tier is told: a P/D connector would treat the request
-        as a finished prefill (a Mooncake chunked producer reads its first
-        output token, which does not exist) and publish a handoff. Without an
-        offload tier nothing is called.
-        """
-        if self.kv_connector is None or not self._connector_flag("is_offload"):
-            return
-        self.kv_connector.cancel_pending_load(seq)
-        finish_offload = getattr(self.kv_connector, "offload_request_finished", None)
-        if callable(finish_offload):
-            finish_offload(seq)  # a `multi`: its offload sub alone
-        else:
-            self.kv_connector.request_finished(seq)
-
     def _cleanup_aborted_load(self, seq: Sequence) -> None:
         if hasattr(seq, "_awaiting_aborted_load_cleanup"):
             delattr(seq, "_awaiting_aborted_load_cleanup")
         self._uncount_inflight_load(seq)
-        # An aborted request never went through `postprocess`, so it finishes
-        # the request here rather than before the park.
+        # A request that never ran went through no `postprocess`, so it
+        # finishes the request here rather than before the park.
         callback = getattr(self.kv_connector, "request_finished", None)
         if callable(callback):
             callback(seq)

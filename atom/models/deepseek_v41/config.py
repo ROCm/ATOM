@@ -375,10 +375,13 @@ def validate_runtime_config(config):
             config.enable_tbo and not config.enable_dp_attention,
         ),
         (
-            # MP and Store move PAGEs and rebuild STATE through replay;
-            # Mooncake P/D moves whole PAGE units plus the request's one
-            # STATE slot (`get_kv_transfer_tensors`). MoRI-IO and in-process
-            # offload read SLOT codecs this runtime does not publish.
+            # The Store moves PAGEs and rebuilds STATE through replay (it is
+            # refused without bounded replay, below). `lmcache_mp` moves PAGEs
+            # and either replays STATE or, without bounded replay, carries
+            # native-state images. Mooncake P/D moves whole PAGE units plus the
+            # request's one STATE slot (`get_kv_transfer_tensors`). MoRI-IO and
+            # in-process offload read SLOT codecs this runtime does not publish.
+            # A `multi` (P/D plus an offload tier) is not admitted.
             "KV transfer other than lmcache_mp, mooncake or mooncake_store",
             KVConnectorFactory.connector_name(config.kv_transfer_config)
             not in (None, "lmcache_mp", "mooncake", "mooncake_store"),
