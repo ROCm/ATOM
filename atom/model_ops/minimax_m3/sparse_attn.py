@@ -98,7 +98,7 @@ class MiniMaxM3SparseMetadata:
     indexer. `index_topk` consumes it and never derives its own.
     """
     index_work_map: torch.Tensor | None = None
-    """The MXFP4 decode index scorer's work map (index_mxfp4), built once a step at
+    """The MXFP4 decode index scorer's work map (aiter's FlyDSL scorer), built once a step at
     `ceil(max_model_len / 128)` blocks, which must not move between graph replays.
     None on prefill, on an empty batch and wherever the index cache is not MXFP4; the
     scorer then builds its own map, correctly but per layer.

@@ -1343,11 +1343,6 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         # Bound by AiterAttentionMetadataBuilder.build_kv_cache_tensor (Task 6):
         # the page-128 indexer-key cache. None until the runner binds it.
         self.index_cache: torch.Tensor | None = None
-        # --kv-cache-dtype fp4: the bound k/v caches are uint8 [pages, Hkv,
-        # 8704] MXFP4 pages (minimax_m3/mxfp4_pages.py), written by the fused kernel
-        # directly together with an fp8 main q. `--index-cache-dtype fp4` makes
-        # index_cache uint8 [pages, 8704] the same way. Fixed here: every layer of
-        # this impl is an indexed sparse one, which is what the flag makes MXFP4.
         # Optional shared dict bound by the metadata builder. It is scoped to the
         # current sparse metadata object and carries the last full layer top-k.
         self.index_topk_cache_state: dict | None = None
@@ -1404,10 +1399,9 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             k_cache, v_cache, k_scale, v_scale = to_page16_shuffle(
                 layer.k_cache, layer.v_cache, layer.k_scale, layer.v_scale
             )
-
-        # The layout the base class's SHUFFLE readers assume. Not read for MXFP4
-        # pages, which only `sparse_pa_mxfp4` reads.
-        self._cache_format = "SHUFFLE"
+            # the layout the base class's SHUFFLE readers assume (MXFP4 pages are
+            # read only by `sparse_pa_mxfp4`, which does not look)
+            self._cache_format = "SHUFFLE"
 
         sparse_metadata = getattr(attn_metadata, "sparse_attention_metadata", None)
         if sparse_metadata is None:

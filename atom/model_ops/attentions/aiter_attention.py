@@ -237,10 +237,10 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                     model_runner.block_size,
                 )
         super().__init__(model_runner)
-        # Keyed by `(num_kv_heads, head_dim)` and filled by
+        # Keyed by `KvGeometry` and filled by
         # `allocate_kv_cache_tensors`, which runs long after construction --
         # on the P/D decode side too, over the imported pool.
-        self.kv_pools: dict[tuple[int, int], MhaKvPool] = {}
+        self.kv_pools: dict[KvGeometry, MhaKvPool] = {}
         config = model_runner.config
         hf_config = config.hf_config
         # `self.num_attention_heads` set by CommonAttentionBuilder.__init__.
@@ -303,7 +303,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         ):
             from atom.model_ops.minimax_m3.sparse_attn import SPARSE_BLOCK_SIZE
 
-            # The MXFP4 decode scorer's persistent dispatch map (index_mxfp4): its row
+            # The MXFP4 decode scorer's persistent dispatch map (aiter's FlyDSL scorer): its row
             # count is the grid, so the bound is the model length, and the buffer is
             # CAPACITY -- the exact grid is not monotonic in the batch. Sized at the
             # widest step; a plain decode step (S=1) builds into the same buffer. The

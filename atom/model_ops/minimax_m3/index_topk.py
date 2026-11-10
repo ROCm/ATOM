@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Triton kernels for MiniMax M3 lightning-indexer block scoring + top-k.
+"""MiniMax M3 lightning-indexer block scoring + top-k.
 
 Index queries score each 128-token block of index keys (max over the block),
 then the top-k blocks (plus forced init/local blocks) are selected per query
@@ -8,10 +8,15 @@ token. The KV page size is forced to equal the sparse block size (128), so one
 sparse block maps to exactly one page.
 
 The two phases score differently -- prefill over whole query tiles, decode over
-one request's rows at a time -- and then share a selector.
+one request's rows at a time -- and then share a selector. A bf16 / fp8 index cache
+is scored by the Triton kernels here; an MXFP4 one (``--index-cache-dtype fp4``) by
+aiter's FlyDSL scorers, which write the same fp32 block scores (see
+:func:`minimax_m3_index_topk_decode` for their layout). The selector after either is
+this module's Triton one, or aiter's per-row one where it is cheaper.
 
-Index-K cache layout: ``(num_blocks, 128, idx_head_dim)``. The indexer is MQA:
-index_q carries num_idx_heads heads, index_k one, shared by all of them.
+Index-K cache layout: ``(num_blocks, 128, idx_head_dim)`` for bf16 / fp8, uint8
+``(num_blocks, 8704)`` MXFP4 pages otherwise. The indexer is MQA: index_q carries
+num_idx_heads heads, index_k one, shared by all of them.
 
 Only the paths MiniMax M3 uses are implemented: score_type="max", index value
 disabled (score-only indexer). The selected block ids feed the block-sparse
@@ -1155,7 +1160,8 @@ def minimax_m3_index_topk(
 
     With ``index_mxfp4`` (``--index-cache-dtype fp4``) ``index_kv_cache`` is the
     uint8 ``[num_blocks, 8704]`` MXFP4 page cache and the scores come from aiter's
-    FlyDSL scorer (index_mxfp4.py); the selection after it is this module's.
+    FlyDSL prefill scorer (``minimax_m3_index_score_prefill_fp4_flydsl``); the
+    selection after it is this module's.
     ``pages_per_block`` / ``block_page_stride`` describe the emitted block table:
     8 / 8 for the page-16 SHUFFLE cache, 1 / 1 for page-128 caches (MXFP4 KV).
 
@@ -1164,10 +1170,11 @@ def minimax_m3_index_topk(
     per-index-head top-k maps 1:1 to kv heads (no index-head reduction needed).
 
     When ``emit_sparse_block_table`` is True the topk kernel ALSO fuses the
-    per-query-token page-16 SHUFFLE block-table
-    compaction and returns ``(topk_idx, sparse_bt [total_q, topk*8], sparse_ctx
-    [total_q])`` ready for the ASM prefill kernel -- saving a separate build
-    launch + topk_idx HBM round-trip.
+    per-query-token block-table compaction and returns ``(topk_idx, sparse_bt
+    [total_q, topk * pages_per_block], sparse_ctx [total_q])`` ready for the
+    prefill attention kernel (``pages_per_block`` is 8 for the page-16 SHUFFLE
+    cache, 1 for an MXFP4 KV) -- saving a separate build launch + topk_idx HBM
+    round-trip.
 
     ``block_page_stride`` is the distance in physical 16-pages between two
     consecutive logical 128-blocks in the KV cache. It defaults to
@@ -1385,9 +1392,18 @@ def minimax_m3_index_topk_decode(
     """Decode index block-score + top-k, both split-K (cudagraph-safe).
 
     ``index_mxfp4`` and ``pages_per_block`` as in :func:`minimax_m3_index_topk`.
-    The MXFP4 scorer takes the step's ``index_work_map`` and the
-    ``index_work_map_max_block`` it was built against (which does not move between
-    graph replays); omitted, it builds its own map. The scorer allocates the scores per call.
+
+    The MXFP4 scorer (aiter's ``minimax_m3_index_score_fp4_flydsl``) reads the index
+    cache as the two views of ``mxfp4_pages.page_views`` and the query as e4m3, as
+    the fused writer emits it (cast as stored, no per-tensor scale). It takes the
+    step's ``index_work_map`` -- built once a step in the metadata, outside any graph
+    (`make_sparse_decode_metadata`) -- and the ``index_work_map_max_block`` it was
+    built against, which must not move between graph replays (the work map's row
+    count is the scorer's grid); omitted, it builds its own map. It allocates the
+    fp32 scores per call, filled with its -inf sentinel (``alloc_score``), as
+    ``[heads, rows, max_block]`` -- or the transposed, non-contiguous layout of it
+    when ``S * heads >= 16``, which the Triton selector reads and the aiter one
+    declines.
 
     Returns topk_idx [num_kv_heads, total_q, topk] (0-indexed block ids, -1 pad).
     For spec-decode (``max_query_len = num_spec+1``) each of the ``max_query_len``
@@ -1395,10 +1411,11 @@ def minimax_m3_index_topk_decode(
     ``causal_len = seq_len - max_query_len + tok + 1``; ``max_query_len == 1`` is
     plain decode (one token per request).
 
-    When ``emit_sparse_block_table`` is True the selector ALSO fuses the page-16
-    SHUFFLE block-table compaction and returns ``(topk_idx, sparse_bt [total_q,
-    topk*8], sparse_ctx [total_q])`` ready for the ASM/gluon decode kernel --
-    saving a separate build launch + topk_idx HBM round-trip.
+    When ``emit_sparse_block_table`` is True the selector ALSO fuses the block-table
+    compaction and returns ``(topk_idx, sparse_bt [total_q, topk * pages_per_block],
+    sparse_ctx [total_q])`` ready for the decode attention kernel (``pages_per_block``
+    is 8 for the page-16 SHUFFLE cache, 1 for an MXFP4 KV) -- saving a separate build
+    launch + topk_idx HBM round-trip.
 
     ``block_page_stride`` is the distance in physical 16-pages between two
     consecutive logical 128-blocks in the KV cache. It defaults to
