@@ -120,8 +120,12 @@ def test_decode_matches_diffusers(diffusers_pair, channels_last, batch):
 
 
 def test_bf16_decode_tracks_diffusers(diffusers_pair):
-    """bf16 is the dtype the AITER kernels run in; on CPU it should stay
-    within bf16 rounding of Diffusers' own bf16 run.
+    """bf16 is the dtype the AITER kernels run in: decoding in it must be as
+    accurate as Diffusers decoding in it, both measured against fp32.
+
+    Not a max-diff bound between the two bf16 runs: each sits ~0.045 from
+    fp32 on its own, so their mutual max diff has no stable bound. A 10%
+    error in one norm's gamma costs ~4 dB here; the bar allows ~1.8.
 
     NCDHW: torch's CPU bf16 conv3d on channels_last_3d input is not
     deterministic (the same call repeated differs), which would make this
@@ -130,10 +134,13 @@ def test_bf16_decode_tracks_diffusers(diffusers_pair):
     ref, ours = diffusers_pair
     latents = torch.randn(1, Z_DIM, 2, 4, 6, generator=torch.Generator().manual_seed(9))
     with torch.no_grad():
-        expected = ref.to(torch.bfloat16).decode(latents.bfloat16()).sample
+        exact = ref.decode(latents).sample
+        ref_bf16 = ref.to(torch.bfloat16).decode(latents.bfloat16()).sample
     video = ours(False).to(torch.bfloat16).decode(latents)
     assert video.dtype == torch.bfloat16
-    torch.testing.assert_close(video.float(), expected.float(), rtol=0, atol=5e-2)
+    ours_mse = torch.mean((video.float() - exact) ** 2)
+    ref_mse = torch.mean((ref_bf16.float() - exact) ** 2)
+    assert ours_mse <= 1.5 * ref_mse, (ours_mse.item(), ref_mse.item())
 
 
 def test_normalization_round_trips_and_uses_config_stats():
