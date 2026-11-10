@@ -4,7 +4,7 @@ import torch
 
 from atom.model_ops.fused_moe.config import FusedMoEConfig
 from atom.model_ops.fused_moe.expert_layout import MoEExpertLayout, SharedExpertMode
-from atom.model_ops.fused_moe.shared_expert_dispatch import _remap_torch
+from atom.model_ops.fused_moe.shared_expert_dispatch import remap_topk_to_dispatch
 
 
 def test_backend_config_widens_every_rank_block_by_the_shared_slot():
@@ -64,7 +64,7 @@ def test_remap_preserves_routed_owner_and_local_slot():
     ids = torch.arange(8, dtype=torch.int32).reshape(1, 8)
     weights = torch.zeros((1, 8))
 
-    _, out_ids = _remap_torch(
+    _, out_ids = remap_topk_to_dispatch(
         weights,
         ids,
         8,
@@ -86,7 +86,7 @@ def test_remap_appends_shared_without_rewriting_sentinels():
     weights = torch.tensor([[0.7, 0.3], [0.6, 0.0]])
 
     # ep_rank 1 of 2, 4 routed slots each -> shared base 1*5 + 4 = 9.
-    out_weights, out_ids = _remap_torch(weights, ids, 8, 4, 9, 1, 0.5)
+    out_weights, out_ids = remap_topk_to_dispatch(weights, ids, 8, 4, 9, 1, 0.5)
 
     assert out_ids.tolist() == [[0, 5, 9], [3, -1, 9]]
     assert torch.equal(out_weights[:, :2], weights)

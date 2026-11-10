@@ -201,8 +201,8 @@ def reassign_gathered_shared_ids(layer, topk_ids: torch.Tensor) -> None:
         f"but {rows} rows were gathered."
     )
     top_k = layer.top_k
-    # Routing has already marked padded and DP-dummy rows with -1. Restoring
-    # a shared id on those rows would make the gathered dummy run that expert.
+    # The routed columns mark padded and DP-dummy rows with -1. Copy shared
+    # IDs only onto valid rows so reassignment does not reactivate padding.
     copy_shared_expert_ids_(topk_ids, total_topk_ids[:rows, top_k:], top_k)
 
 

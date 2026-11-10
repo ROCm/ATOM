@@ -21,14 +21,6 @@ import torch
 
 from atom.model_ops.fused_moe.expert_layout import topk_padding_mask
 
-try:
-    import triton
-    import triton.language as tl
-
-    _HAS_TRITON = True
-except ImportError:  # pragma: no cover - CPU-only builds
-    _HAS_TRITON = False
-
 
 def _remap_torch(
     topk_weights: torch.Tensor,
@@ -39,7 +31,7 @@ def _remap_torch(
     num_fused_shared_experts: int,
     shared_weight: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Reference path, and the fallback without triton."""
+    """CPU reference for dispatch-space placement."""
     num_tokens = topk_ids.shape[0]
     shifted = topk_ids + num_fused_shared_experts * (topk_ids // routed_per_rank)
     # Out-of-range ids pass through: floor division would send -1 to -2.
@@ -65,81 +57,6 @@ def _remap_torch(
     )
 
 
-if _HAS_TRITON:
-
-    @triton.jit
-    def _copy_shared_ids_kernel(
-        ids_ptr,
-        template_ptr,
-        n_out,
-        IDS_ROW_STRIDE: tl.constexpr,
-        IDS_COL_STRIDE: tl.constexpr,
-        TEMPLATE_ROW_STRIDE: tl.constexpr,
-        TEMPLATE_COL_STRIDE: tl.constexpr,
-        TOP_K: tl.constexpr,
-        NUM_SHARED: tl.constexpr,
-        BLOCK: tl.constexpr,
-    ):
-        offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-        mask = offs < n_out
-        row, col = offs // NUM_SHARED, offs % NUM_SHARED
-        # Same padding convention as topk_padding_mask: the first routed ID.
-        routed = tl.load(ids_ptr + row * IDS_ROW_STRIDE, mask=mask, other=-1)
-        shared = tl.load(
-            template_ptr + row * TEMPLATE_ROW_STRIDE + col * TEMPLATE_COL_STRIDE,
-            mask=mask,
-            other=-1,
-        )
-        tl.store(
-            ids_ptr + row * IDS_ROW_STRIDE + (TOP_K + col) * IDS_COL_STRIDE,
-            tl.where(routed < 0, -1, shared),
-            mask=mask,
-        )
-
-    @triton.jit
-    def _remap_kernel(
-        topk_ids_ptr,  # [ntok, topk]      routed physical ids
-        topk_w_ptr,  # [ntok, topk]      routed weights
-        out_ids_ptr,  # [ntok, out_width] dispatch-space ids
-        out_w_ptr,  # [ntok, out_width] weights
-        num_routed_physical,
-        routed_per_rank,
-        shared_base,
-        shared_weight,
-        topk,
-        n_out,
-        out_width,
-        NUM_SHARED: tl.constexpr,
-        BLOCK: tl.constexpr,
-    ):
-        """Iterates over output elements, so the shared column is written in
-        place instead of concatenated."""
-        pid = tl.program_id(0)
-        offs = pid * BLOCK + tl.arange(0, BLOCK)
-        mask = offs < n_out
-
-        row = offs // out_width
-        col = offs % out_width
-        is_routed = col < topk
-        rmask = mask & is_routed
-
-        in_off = row * topk + col
-        phys = tl.load(topk_ids_ptr + in_off, mask=rmask, other=-1).to(tl.int64)
-
-        in_range = (phys >= 0) & (phys < num_routed_physical)
-        shifted = phys + NUM_SHARED * (phys // routed_per_rank)
-        disp = tl.where(in_range, shifted, phys)
-
-        # A pad row (routed to -1 throughout) takes no shared expert either.
-        pad = tl.load(topk_ids_ptr + row * topk, mask=mask & ~is_routed, other=0) < 0
-        sid = tl.where(pad, -1, shared_base + (col - topk))
-        tl.store(out_ids_ptr + offs, tl.where(is_routed, disp, sid), mask=mask)
-
-        w = tl.load(topk_w_ptr + in_off, mask=rmask, other=0.0)
-        sw = tl.where(pad, 0.0, shared_weight)
-        tl.store(out_w_ptr + offs, tl.where(is_routed, w, sw), mask=mask)
-
-
 def copy_shared_expert_ids_(
     topk_ids: torch.Tensor, shared_template: torch.Tensor, top_k: int
 ) -> None:
@@ -154,13 +71,17 @@ def copy_shared_expert_ids_(
     n_out = rows * num_shared
     if n_out == 0:
         return
-    if not _HAS_TRITON or not topk_ids.is_cuda:
+    if not topk_ids.is_cuda:
         shared_ids = topk_ids[:, top_k:]
         shared_ids.copy_(shared_template)
         shared_ids.masked_fill_(topk_padding_mask(topk_ids), -1)
         return
 
-    _copy_shared_ids_kernel[(triton.cdiv(n_out, 256),)](
+    from atom.model_ops.fused_moe.shared_expert_dispatch_triton import (
+        _copy_shared_ids_kernel,
+    )
+
+    _copy_shared_ids_kernel[((n_out + 255) // 256,)](
         topk_ids,
         shared_template,
         n_out,
@@ -197,8 +118,10 @@ def remap_topk_to_dispatch(
     ntok, topk = topk_ids.shape
     out_width = topk + num_fused_shared_experts
     n_out = ntok * out_width
-    if not _HAS_TRITON or n_out == 0:
+    if not topk_ids.is_cuda or n_out == 0:
         return _remap_torch(topk_weights, topk_ids, *args)
+
+    from atom.model_ops.fused_moe.shared_expert_dispatch_triton import _remap_kernel
 
     out_ids = torch.empty(
         (ntok, out_width), dtype=topk_ids.dtype, device=topk_ids.device
@@ -208,7 +131,7 @@ def remap_topk_to_dispatch(
     )
 
     def grid(meta_kw):
-        return (triton.cdiv(n_out, meta_kw["BLOCK"]),)
+        return ((n_out + meta_kw["BLOCK"] - 1) // meta_kw["BLOCK"],)
 
     _remap_kernel[grid](
         topk_ids.contiguous(),
