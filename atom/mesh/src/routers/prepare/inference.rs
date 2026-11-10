@@ -1,7 +1,7 @@
 //! Validated routing views; callers retain raw request bodies.
 use crate::protocols::{
-    chat::ChatCompletionRequest,
-    common::{GenerationRequest, InputIds, StringOrArray},
+    chat::{ChatCompletionRequest, ChatMessage, MessageContent},
+    common::{ContentPart, GenerationRequest, InputIds, StringOrArray},
     completion::CompletionRequest,
     generate::GenerateRequest,
     validated::Normalizable,
@@ -52,7 +52,10 @@ impl InferenceRequest for ChatCompletionRequest {
             route: "/v1/chat/completions",
             model: Some(self.model.clone()),
             text: if include_text {
-                self.extract_text_for_routing()
+                match with_media_digests(self) {
+                    Some(routed) => routed.extract_text_for_routing(),
+                    None => self.extract_text_for_routing(),
+                }
             } else {
                 String::new()
             },
@@ -62,6 +65,69 @@ impl InferenceRequest for ChatCompletionRequest {
         }
     }
 }
+/// A routing copy of `request` with each image and video replaced in place by
+/// a text digest of its URL, or `None` when it has no media. Routing text and
+/// template tokens otherwise drop media or render it as an identity-free
+/// placeholder, so requests differing only in media would share a prefix the
+/// engine's media-keyed prefix cache never shares.
+pub(crate) fn with_media_digests(request: &ChatCompletionRequest) -> Option<ChatCompletionRequest> {
+    let has_media = request.messages.iter().filter_map(message_content).any(
+        |content| matches!(content, MessageContent::Parts(parts) if parts.iter().any(is_media)),
+    );
+    if !has_media {
+        return None;
+    }
+    let mut routed = request.clone();
+    for message in &mut routed.messages {
+        let content = match message {
+            ChatMessage::System { content, .. }
+            | ChatMessage::User { content, .. }
+            | ChatMessage::Tool { content, .. }
+            | ChatMessage::Developer { content, .. } => content,
+            ChatMessage::Assistant {
+                content: Some(content),
+                ..
+            } => content,
+            ChatMessage::Assistant { content: None, .. } | ChatMessage::Function { .. } => continue,
+        };
+        let MessageContent::Parts(parts) = content else {
+            continue;
+        };
+        for part in parts {
+            let digest = match part {
+                ContentPart::ImageUrl { image_url } => media_digest("image", &image_url.url),
+                ContentPart::VideoUrl { video_url } => media_digest("video", &video_url.url),
+                ContentPart::Text { .. } => continue,
+            };
+            *part = ContentPart::Text { text: digest };
+        }
+    }
+    Some(routed)
+}
+
+fn message_content(message: &ChatMessage) -> Option<&MessageContent> {
+    match message {
+        ChatMessage::System { content, .. }
+        | ChatMessage::User { content, .. }
+        | ChatMessage::Tool { content, .. }
+        | ChatMessage::Developer { content, .. } => Some(content),
+        ChatMessage::Assistant { content, .. } => content.as_ref(),
+        ChatMessage::Function { .. } => None,
+    }
+}
+
+fn is_media(part: &ContentPart) -> bool {
+    !matches!(part, ContentPart::Text { .. })
+}
+
+/// Control characters keep a digest from matching client text.
+fn media_digest(kind: &str, url: &str) -> String {
+    format!(
+        "\u{1}{kind}:{:016x}\u{1}",
+        xxhash_rust::xxh3::xxh3_64(url.as_bytes())
+    )
+}
+
 impl InferenceRequest for CompletionRequest {
     fn metadata(&self) -> InferenceMetadata {
         self.metadata_with_text(true)
@@ -404,6 +470,58 @@ mod tests {
                 (route, batch, stream, logprobs)
             );
         }
+    }
+
+    fn chat_routing_text(body: &str) -> String {
+        ParsedInference::parse("/v1/chat/completions", body.as_bytes())
+            .unwrap()
+            .metadata()
+            .text
+    }
+
+    fn image_chat(url: &str) -> String {
+        format!(
+            r#"{{"model":"m","messages":[{{"role":"system","content":"sys"}},{{"role":"user","content":[{{"type":"text","text":"describe"}},{{"type":"image_url","image_url":{{"url":"{url}"}}}},{{"type":"text","text":"briefly"}}]}}]}}"#
+        )
+    }
+
+    #[test]
+    fn text_only_chat_routing_text_is_unchanged() {
+        let body = r#"{"model":"m","messages":[{"role":"system","content":"sys"},{"role":"user","content":[{"type":"text","text":"a"},{"type":"text","text":"b"}]},{"role":"assistant","content":"c","reasoning_content":"r"}]}"#;
+        let request: ChatCompletionRequest = serde_json::from_str(body).unwrap();
+        assert!(with_media_digests(&request).is_none());
+        assert_eq!(chat_routing_text(body), request.extract_text_for_routing());
+    }
+
+    #[test]
+    fn chat_routing_text_distinguishes_media_in_place() {
+        let first = chat_routing_text(&image_chat("data:image/png;base64,AAAA"));
+        let second = chat_routing_text(&image_chat("data:image/png;base64,BBBB"));
+        assert_eq!(
+            first,
+            chat_routing_text(&image_chat("data:image/png;base64,AAAA"))
+        );
+        assert_ne!(first, second);
+        assert!(!first.contains("AAAA"));
+        let shared = first
+            .chars()
+            .zip(second.chars())
+            .take_while(|(a, b)| a == b)
+            .count();
+        let before_digest = "sys describe \u{1}image:".len();
+        assert!(first.starts_with("sys describe \u{1}image:"));
+        assert!((before_digest..before_digest + 16).contains(&shared));
+        assert!(first.ends_with("\u{1} briefly"));
+    }
+
+    #[test]
+    fn video_digest_differs_from_image_digest_of_the_same_url() {
+        let image = image_chat("https://example.com/m");
+        let video = image.replace(
+            r#""type":"image_url","image_url""#,
+            r#""type":"video_url","video_url""#,
+        );
+        assert_ne!(chat_routing_text(&image), chat_routing_text(&video));
     }
 
     #[test]
