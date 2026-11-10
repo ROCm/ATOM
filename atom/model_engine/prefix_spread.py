@@ -66,14 +66,14 @@ class PrefixSpreadRouter:
         # not-yet-confirmed entry.
         self.seq_hashes: dict = {}
         self.pending: dict = {}
-        # Requests routed here whose prefill has not completed (kept apart from
-        # the token charge, which is 0 for a fully cached prompt that is
-        # nevertheless still prefilling), and the prefix each was credited.
-        self._prefilling: set = set()
+        # The prefix each request was credited at `select`, until `charge`.
         self._est_hit: dict = {}
-        # Prefix credit still owned by each in-flight request. A follower
-        # taking over an aborted producer loses that credit exactly once.
-        self._credited_hit: dict = {}
+        # Requests routed here whose prefill has not completed -> the prefix
+        # credit each still owns. Membership is "still prefilling" (kept apart
+        # from the token charge, which is 0 for a fully cached prompt that is
+        # nevertheless still prefilling). A follower taking over an aborted
+        # producer loses its credit exactly once (`_left_unprefilled`).
+        self._in_flight: dict = {}
 
     def reset(self) -> None:
         """Forget in-flight state. The index stays: it describes the ranks'
@@ -86,27 +86,24 @@ class PrefixSpreadRouter:
                     del self.index[h]
         self.seq_hashes.clear()
         self.pending.clear()
-        self._prefilling.clear()
         self._est_hit.clear()
-        self._credited_hit.clear()
+        self._in_flight.clear()
 
     # -- request lifecycle (called by CoreManager under its lock) --------------
 
     def charge(self, seq_id) -> int:
         """Mark `seq_id` in flight; returns the prefix it was credited at
         `select`."""
-        self._prefilling.add(seq_id)
         hit = self._est_hit.pop(seq_id, 0)
-        self._credited_hit[seq_id] = hit
+        self._in_flight[seq_id] = hit
         return hit
 
     def prefilling(self, seq_id) -> bool:
-        return seq_id in self._prefilling
+        return seq_id in self._in_flight
 
     def prefill_complete(self, seq_id) -> None:
         """`seq_id` completed its prefill: the entries it relied on are real."""
-        self._prefilling.discard(seq_id)
-        self._credited_hit.pop(seq_id, None)
+        self._in_flight.pop(seq_id, None)
         entry = self.seq_hashes.pop(seq_id, None)
         if entry is None:
             return
@@ -120,16 +117,15 @@ class PrefixSpreadRouter:
                 # producer now names the request that confirmed it, so the
                 # producer leaving cannot take a real prefix with it.
                 holder = holders.pop(rank)
-                holders[rank] = seq_id if holder in self._prefilling else holder
+                holders[rank] = seq_id if holder in self._in_flight else holder
 
     def release(self, seq_id) -> dict:
         """Release a request; return extra prefill charges for its successors."""
         self._est_hit.pop(seq_id, None)
-        if seq_id not in self._prefilling:
+        if seq_id not in self._in_flight:
             self.prefill_complete(seq_id)
             return {}
-        self._prefilling.discard(seq_id)
-        self._credited_hit.pop(seq_id, None)
+        del self._in_flight[seq_id]
         return self._left_unprefilled(seq_id)
 
     # -- placement ------------------------------------------------------------
@@ -248,7 +244,7 @@ class PrefixSpreadRouter:
         for i in range(hit // hbs - 1, -1, -stride):
             holders = self.index.get(chain.hashes[i])
             if holders is not None and any(
-                seq_id not in self._prefilling for seq_id in holders.values()
+                seq_id not in self._in_flight for seq_id in holders.values()
             ):
                 return (i + 1) * hbs
         return 0
@@ -278,11 +274,11 @@ class PrefixSpreadRouter:
                     continue
                 # A remote restore is provisional even if its source finished.
                 # Keep local in-flight producers as owners for HBM followers.
-                if (hashes[i], rank) in self.pending and seq_id not in self._prefilling:
+                if (hashes[i], rank) in self.pending and seq_id not in self._in_flight:
                     continue
                 if owner is None:
                     owner, source = rank, seq_id
-                elif seq_id in self._prefilling:
+                elif seq_id in self._in_flight:
                     continue  # a shorter, finished part may still count below
                 hits[rank] = (i + 1) * hbs
             if len(hits) == n:
@@ -318,7 +314,7 @@ class PrefixSpreadRouter:
             if (
                 had
                 and (h, rank) not in pending
-                and holders[rank] not in self._prefilling
+                and holders[rank] not in self._in_flight
             ):
                 # Confirmed: the rank holds this part. A request that computes
                 # it again reuses the rank's blocks; it neither becomes the
@@ -327,7 +323,7 @@ class PrefixSpreadRouter:
                 # use, though, which owner ties go by.
                 holders[rank] = holders.pop(rank)
                 continue
-            if had and holders[rank] in self._prefilling:
+            if had and holders[rank] in self._in_flight:
                 # A newcomer must not erase another request computing this
                 # prefix locally. It joins that producer's ordered waiters.
                 producer = holders.pop(rank)
@@ -380,10 +376,10 @@ class PrefixSpreadRouter:
             if waiters and holders is not None:
                 successor = next(iter(waiters))
                 holders[rank] = successor
-                credited = self._credited_hit.get(successor, 0)
+                credited = self._in_flight.get(successor, 0)
                 retained = min(credited, start)
                 if retained < credited:
-                    self._credited_hit[successor] = retained
+                    self._in_flight[successor] = retained
                     charges[successor] = charges.get(successor, 0) + credited - retained
                 continue
             del self.pending[key]

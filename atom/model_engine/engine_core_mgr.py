@@ -279,7 +279,7 @@ class CoreManager:
         # --- DP request load balancing (see _select_dp_rank_locked) ---
         # A subclass may fan out through its own add_request() and never charge
         # load at all, but the inherited output thread still calls
-        # _release_seq_load() on every finished sequence, so these MUST exist.
+        # _release_seq() on every finished sequence, so these MUST exist.
         # Strategy: "round_robin" | "least_requests" | "least_tokens" |
         # "prefix_spread" (validated at the CLI by argparse
         # choices=DP_LB_STRATEGIES).
@@ -809,7 +809,7 @@ class CoreManager:
                                 # The router is released by the finished
                                 # sequence (`_release_terminal_seq`), which
                                 # knows whether its prefill completed.
-                                self._release_seq_load(seq_id, route=False)
+                                self._release_load(seq_id)
                                 if dbg:
                                     logger.debug(
                                         f"{self.label}: Cleaned up callback for finished sequence {seq_id}"
@@ -1200,7 +1200,7 @@ class CoreManager:
                     self._charge_seq_load_locked(seq, dp_rank)
                 dp_seqs[dp_rank].append(seq)
             # Copy the counters under the lock so the snapshot log below is a
-            # consistent instant, not a torn read racing _release_seq_load.
+            # consistent instant, not a torn read racing a release.
             if track_load:
                 reqs_snapshot = list(self._rank_reqs)
                 tokens_snapshot = list(self._rank_tokens)
@@ -1226,7 +1226,7 @@ class CoreManager:
                     f"rank{dp_rank}: {len(rank_seqs)} req / {batch_prefill_tokens} tok"
                 )
         except Exception:
-            # Roll back only ranks we never handed off. _release_seq_load is
+            # Roll back only ranks we never handed off. _release_seq is
             # idempotent (pops from _seq_load), so even if a failing send had
             # already delivered its frames and the engine finished + released
             # those seqs on an output thread, this rollback cannot double-count:
@@ -1235,7 +1235,7 @@ class CoreManager:
                 for dp_rank, rank_seqs in enumerate(dp_seqs):
                     if rank_seqs and not dispatched[dp_rank]:
                         for seq in rank_seqs:
-                            self._release_seq_load(seq.id)
+                            self._release_seq(seq.id)
             raise
 
         # One line per add: the per-rank delta this add placed, plus (for the
@@ -1357,7 +1357,7 @@ class CoreManager:
         with self._lb_lock:
             for _rank, rank_seqs in reversed(failed):
                 for seq in rank_seqs:
-                    self._release_seq_load_locked(seq.id)
+                    self._release_seq_locked(seq.id)
                 self._bp_pending.extendleft(reversed(rank_seqs))
             stalled = sum(self._rank_reqs) == 0 and bool(self._bp_pending)
             if pause_always or stalled:
@@ -1664,31 +1664,26 @@ class CoreManager:
         )
         return True
 
-    def _release_seq_load(self, seq_id, *, route: bool = True) -> None:
-        """Undo a seq's in-flight load when it finishes or is aborted.
+    # Two releases. `_release_load` undoes a seq's per-rank charge only;
+    # `_release_seq` also releases its prefix-router state, then the charge.
+    # Both are idempotent: a seq is charged once and released once, so a
+    # repeated call (e.g. finish followed by abort) is a no-op.
+    #
+    # Only a caller that knows whether the prefill completed may release the
+    # router state: the finished sequence (`_release_terminal_seq`) and a
+    # dispatch rolled back before any engine saw the seq. An abort on the API
+    # thread and the finished STREAM on the output thread release the load
+    # alone. Releasing the router there, racing the STREAM that completes the
+    # prefill, would see the request still prefilling and drop prefix entries
+    # its prefill did produce.
 
-        Idempotent: a seq is only charged once and released once, so a repeated
-        call (e.g. finish followed by abort) is a no-op.
-
-        `route=False` (an abort on the API thread, and the finished-STREAM path
-        on the output thread) leaves the prefix router alone: it is released by
-        the finished sequence (`_release_terminal_seq`), which knows whether its
-        prefill completed. A release racing the STREAM that completes the
-        prefill would otherwise see the request still prefilling and drop
-        prefix entries its prefill did produce.
-        """
+    def _release_load(self, seq_id) -> None:
+        """Undo a seq's per-rank charge; leaves the prefix router alone."""
         with self._lb_lock:
-            self._release_seq_load_locked(seq_id, route=route)
+            self._release_load_locked(seq_id)
 
-    def _release_seq_load_locked(self, seq_id, *, route: bool = True) -> None:
-        """``_release_seq_load`` for a caller that already holds ``_lb_lock``."""
-        if route and self._prefix_router is not None:
-            for successor, extra in self._prefix_router.release(seq_id).items():
-                successor_load = self._seq_load.get(successor)
-                if successor_load is not None:
-                    rank, req_cost, tok_cost = successor_load
-                    self._rank_tokens[rank] += extra
-                    self._seq_load[successor] = (rank, req_cost, tok_cost + extra)
+    def _release_load_locked(self, seq_id) -> None:
+        """``_release_load`` for a caller that already holds ``_lb_lock``."""
         entry = self._seq_load.pop(seq_id, None)
         if entry is None:
             return
@@ -1696,12 +1691,35 @@ class CoreManager:
         self._rank_reqs[dp_rank] -= req_cost
         self._rank_tokens[dp_rank] -= tok_cost
 
+    def _release_seq(self, seq_id) -> None:
+        """Release a seq's prefix-router state, then its per-rank charge."""
+        with self._lb_lock:
+            self._release_seq_locked(seq_id)
+
+    def _release_seq_locked(self, seq_id) -> None:
+        """``_release_seq`` for a caller that already holds ``_lb_lock``."""
+        self._release_route_locked(seq_id)
+        self._release_load_locked(seq_id)
+
+    def _release_route_locked(self, seq_id) -> None:
+        """Release a seq's prefix-router state. A request leaving before its
+        prefill completed hands its provisional entries to a waiter, which
+        is charged the credit it loses (`PrefixSpreadRouter.release`)."""
+        if self._prefix_router is None:
+            return
+        for successor, extra in self._prefix_router.release(seq_id).items():
+            successor_load = self._seq_load.get(successor)
+            if successor_load is not None:
+                rank, req_cost, tok_cost = successor_load
+                self._rank_tokens[rank] += extra
+                self._seq_load[successor] = (rank, req_cost, tok_cost + extra)
+
     def _release_terminal_seq(self, seq) -> None:
         """Release a returned sequence using its completed-forward fact,
         including an abort before its first sampled token."""
         if getattr(seq, "prefill_completed", False):
             self._mark_seq_prefill_complete(seq.id)
-        self._release_seq_load(seq.id)
+        self._release_seq(seq.id)
 
     def _mark_seq_prefill_complete(self, seq_id) -> None:
         """Release only a sequence's prefill-token charge, once."""
@@ -1835,10 +1853,10 @@ class CoreManager:
         pending_seq = self._bp_take_pending(req_id)
         # Release DP load bookkeeping now: an aborted seq may never emit a
         # finished STREAM output, so relying on the finish path alone would leak
-        # its in-flight count. _release_seq_load is idempotent. A pending seq
+        # its in-flight count. _release_load is idempotent. A pending seq
         # was never charged, so this is a no-op for it. The prefix router is
         # released by the terminal output the abort leads to.
-        self._release_seq_load(req_id, route=False)
+        self._release_load(req_id)
         if pending_seq is not None:
             if not getattr(pending_seq, "leave_reason", None):
                 pending_seq.leave_reason = "aborted"

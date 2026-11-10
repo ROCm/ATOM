@@ -321,7 +321,7 @@ def test_release_restores_counts():
     seqs = [_FakeSeq(i, num_prompt_tokens=50) for i in range(6)]
     _route(mgr, seqs)
     for seq in seqs:
-        mgr._release_seq_load(seq.id)
+        mgr._release_seq(seq.id)
     assert mgr._rank_reqs == [0, 0, 0]
     assert mgr._rank_tokens == [0, 0, 0]
     assert mgr._seq_load == {}
@@ -330,11 +330,11 @@ def test_release_restores_counts():
 def test_release_is_idempotent_no_leak_no_negative():
     mgr = _make_mgr(2, strategy="least_tokens")
     _route(mgr, [_FakeSeq("a", num_prompt_tokens=20)])
-    mgr._release_seq_load("a")
+    mgr._release_seq("a")
     # Second release (e.g. abort after finish) must be a no-op.
-    mgr._release_seq_load("a")
+    mgr._release_seq("a")
     # Unknown id must also be a no-op.
-    mgr._release_seq_load("never-seen")
+    mgr._release_seq("never-seen")
     assert mgr._rank_reqs == [0, 0]
     assert mgr._rank_tokens == [0, 0]
 
@@ -350,7 +350,7 @@ def test_first_output_releases_prefill_tokens_but_not_request_count():
     assert mgr._rank_tokens[rank] == 0
     assert mgr._rank_reqs[rank] == 1
 
-    mgr._release_seq_load(seq.id)
+    mgr._release_seq(seq.id)
     assert mgr._rank_reqs == [0, 0]
 
 
@@ -767,7 +767,9 @@ def test_idle_ratio_load_wins_over_a_partial_prefix():
 
 def test_partial_holder_still_prefilling_is_not_an_hbm_hit():
     mgr = _dp4_idle_ratio_mgr()
-    mgr._prefix_router._prefilling.add(2)  # rank2's 48k part is still being prefilled
+    mgr._prefix_router._in_flight.setdefault(
+        2, 0
+    )  # rank2's 48k part is still being prefilled
     hits, owner, _ = mgr._prefix_router._rank_hits(
         _chain_seq(3, 110_000).prompt_hash_chain, 4
     )
@@ -802,13 +804,13 @@ def test_followers_sharing_a_prefix_do_not_convoy_onto_one_rank():
 def test_a_prefix_record_is_rolled_back_when_its_request_leaves_unprefilled():
     mgr = _make_spread_mgr()
     _route(mgr, [_chain_seq(1, 100_000)])
-    mgr._release_seq_load(1)  # aborted / rejected before its first output
+    mgr._release_seq(1)  # aborted / rejected before its first output
     assert not mgr._prefix_router.index
     second = _chain_seq(2, 100_000)
     _route(mgr, [second])
     assert _est(mgr, second) == 0  # no fake HBM hit
     mgr._mark_seq_prefill_complete(2)
-    mgr._release_seq_load(2)  # finished normally: the record stays
+    mgr._release_seq(2)  # finished normally: the record stays
     assert mgr._prefix_router.index
 
 
@@ -831,7 +833,7 @@ def test_an_aborted_move_leaves_no_hit_on_its_destination():
         return seq
 
     moved(2)
-    mgr._release_seq_load(2)  # aborted before its load
+    mgr._release_seq(2)  # aborted before its load
     hits, _, _ = mgr._prefix_router._rank_hits(
         _chain_seq(9, 100_000).prompt_hash_chain, 2
     )
@@ -839,7 +841,7 @@ def test_an_aborted_move_leaves_no_hit_on_its_destination():
 
     moved(3)
     mgr._mark_seq_prefill_complete(3)
-    mgr._release_seq_load(3)
+    mgr._release_seq(3)
     hits, _, _ = mgr._prefix_router._rank_hits(
         _chain_seq(9, 100_000).prompt_hash_chain, 2
     )
@@ -854,18 +856,18 @@ def test_a_producer_abort_hands_the_prefix_and_debt_to_its_follower():
     follower = _chain_seq(2, 110_000)
     assert _route(mgr, [follower]) == [owner]
     assert _est(mgr, follower) == 98_304
-    mgr._release_seq_load(1)
+    mgr._release_seq(1)
     assert mgr._seq_load[2][2] == 110_000
     assert mgr._rank_tokens[owner] == 110_000
     router = mgr._prefix_router
     hits, src_owner, source = router._rank_hits(follower.prompt_hash_chain, 2)
     assert src_owner == owner and source == 2 and hits[owner] == 106_496
     assert router.pending
-    mgr._release_seq_load(1)  # repeated producer release cannot charge twice
+    mgr._release_seq(1)  # repeated producer release cannot charge twice
     assert mgr._rank_tokens[owner] == 110_000
     mgr._mark_seq_prefill_complete(2)
     assert not router.pending
-    mgr._release_seq_load(2)
+    mgr._release_seq(2)
     assert mgr._rank_tokens[owner] == 0
     assert router._rank_hits(follower.prompt_hash_chain, 2)[0][owner] == 106_496
 
@@ -891,7 +893,7 @@ def test_an_aborted_move_does_not_replace_a_local_prefill_producer():
         for h in local.prompt_hash_chain.hashes
         if h in router.index
     )
-    mgr._release_seq_load(2)
+    mgr._release_seq(2)
     assert all(
         router.index[h][1] == 3
         for h in local.prompt_hash_chain.hashes
@@ -909,19 +911,19 @@ def test_successive_producer_aborts_transfer_debt_without_leaking_it():
         owner,
         owner,
     ]
-    mgr._release_seq_load(1, route=False)  # API abort precedes terminal output
-    mgr._release_seq_load(1)
+    mgr._release_load(1)  # API abort precedes terminal output
+    mgr._release_seq(1)
     assert mgr._seq_load[2][2] == 110_000
-    mgr._release_seq_load(2)
+    mgr._release_seq(2)
     assert mgr._seq_load[3][2] == 120_000
     assert mgr._rank_tokens[owner] == 120_000
-    mgr._release_seq_load(2)
+    mgr._release_seq(2)
     assert mgr._rank_tokens[owner] == 120_000
     mgr._mark_seq_prefill_complete(3)
-    mgr._release_seq_load(3)
+    mgr._release_seq(3)
     assert mgr._rank_tokens[owner] == 0
     assert not mgr._prefix_router.pending
-    assert not mgr._prefix_router._credited_hit
+    assert not mgr._prefix_router._in_flight
     assert mgr._prefix_router.index
 
 
@@ -929,15 +931,15 @@ def test_producer_handoff_preserves_an_earlier_completed_prefix_credit():
     mgr = _make_spread_mgr()
     (owner,) = _route(mgr, [_chain_seq(1, 4096)])
     mgr._mark_seq_prefill_complete(1)
-    mgr._release_seq_load(1)
+    mgr._release_seq(1)
     assert _route(mgr, [_chain_seq(2, 8192), _chain_seq(3, 12288)]) == [owner, owner]
     assert mgr._seq_load[3][2] == 4096
-    mgr._release_seq_load(2)
+    mgr._release_seq(2)
     # Only the provisional 4K..8K part loses credit, not the confirmed first 4K.
     assert mgr._seq_load[3][2] == 8192
     assert mgr._rank_tokens[owner] == 8192
     mgr._mark_seq_prefill_complete(3)
-    mgr._release_seq_load(3)
+    mgr._release_seq(3)
     assert mgr._rank_tokens[owner] == 0
 
 
@@ -948,10 +950,10 @@ def test_an_abort_racing_the_first_stream_keeps_the_prefix():
     releases the request with its prefix kept."""
     mgr = _make_spread_mgr()
     (owner,) = _route(mgr, [_chain_seq(1, 100_000)])
-    mgr._release_seq_load(1, route=False)  # abort_request
+    mgr._release_load(1)  # abort_request
     assert mgr._prefix_router.prefilling(1)
     mgr._mark_seq_prefill_complete(1)  # the STREAM, on the output thread
-    mgr._release_seq_load(1)  # the terminal output
+    mgr._release_seq(1)  # the terminal output
     assert not mgr._prefix_router.prefilling(1)
     hits, src_owner, _ = mgr._prefix_router._rank_hits(
         _chain_seq(9, 100_000).prompt_hash_chain, 2
@@ -1073,7 +1075,7 @@ def test_reset_keeps_the_prefix_index_across_batches():
     mgr = _make_spread_mgr()
     (owner,) = _route(mgr, [_chain_seq(1, 65_536)])
     mgr._mark_seq_prefill_complete(1)
-    mgr._release_seq_load(1)
+    mgr._release_seq(1)
     mgr.reset_dp_router()
     second = _chain_seq(2, 70_000)
     assert _route(mgr, [second]) == [owner]
@@ -1189,7 +1191,7 @@ def test_a_follower_completing_confirms_the_prefix_it_reused():
     assert _route(mgr, [b]) == [owner]
     mgr._mark_seq_prefill_complete(2)
     assert all(
-        seq_id not in router._prefilling
+        seq_id not in router._in_flight
         for holders in router.index.values()
         for seq_id in holders.values()
     ), "a confirmed entry still names an unfinished producer"
@@ -1200,8 +1202,8 @@ def test_a_follower_completing_confirms_the_prefix_it_reused():
     mgr._rank_tokens[1 - owner] = 200_000
     c = _chain_seq(3, 8192)
     router.place(c, owner, 2)
-    mgr._release_seq_load(1)
-    mgr._release_seq_load(3)
+    mgr._release_seq(1)
+    mgr._release_seq(3)
     assert router._rank_hits(a.prompt_hash_chain, 2)[0].get(owner) == 8192
 
 

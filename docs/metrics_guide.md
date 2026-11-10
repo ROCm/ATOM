@@ -215,7 +215,7 @@ Summed across DP ranks by `LLMEngine.get_metrics_statistics()`.
 | `atom:dp_affinity_owner_hit` | Counter | Requests routed to an existing session cache owner. |
 | `atom:dp_affinity_spill` | Counter | Existing sessions moved off their cache owner; strict affinity keeps this at 0. |
 | `atom:dp_affinity_parent_ignored` | Counter | New child sessions placed independently instead of inheriting a parent owner. |
-| `atom:dp_route_explicit` / `atom:dp_route_load_balanced` | Counter | Requests routed by explicit rank / by the load balancer. |
+| `atom:dp_route_explicit` / `atom:dp_route_load_balanced` | Counter | Requests routed by explicit rank / sessionless requests placed by `round_robin`, `least_requests` or `least_tokens`. Not counted: placements by the offline backpressure pool (`ATOM_DP_DISPATCH_DEPTH`), and every placement under `prefix_spread`, which `atom:dp_prefix_route` counts instead (`atom:dp_route_load_balanced` stays 0 there). |
 | `atom:dp_prefix_route` | Counter | `prefix_spread` only. Placements by `decision`: `owner` (kept on the rank holding the prefix), `moved` (to an idle rank, which loads the prefix from the offload tier) or `cold` (no known prefix, placed by `least_tokens`). |
 | `atom:dp_prefix_moved_tokens` | Counter, tokens | `prefix_spread` only. Tier tokens credited to moved requests at placement: an estimate that excludes an unaligned head and loads under the minimum, not a count of completed restores. |
 | `atom:dp_requests_routed` | Counter, requests | Cumulative requests per rank. Label: `rank`. |

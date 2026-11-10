@@ -195,8 +195,10 @@ class _AtomMetricsCollector:
             (
                 "atom:dp_route_load_balanced",
                 (
-                    "Number of sessionless requests routed by the configured load "
-                    "balancer."
+                    "Number of sessionless requests placed by round_robin, "
+                    "least_requests or least_tokens (not by the offline "
+                    "backpressure pool). 0 under prefix_spread, whose placements "
+                    "are atom:dp_prefix_route."
                 ),
                 dp_router.get("load_balanced_total", 0),
             ),
