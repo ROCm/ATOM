@@ -21,7 +21,7 @@ from atom.model_ops.deepseek_v41.dspark import (
     draft_attention,
     draft_attention_csr,
     draft_attention_fp8,
-    draft_rows,
+    draft_csr_indices,
     draft_step_indices,
     fused_draft_kv_tail,
 )
@@ -631,8 +631,8 @@ class DeepseekV41DSpark(DSparkDraftModel):
                 indices,
                 # The sparse MLA kernel's draft read is measured on gfx1250;
                 # elsewhere the stages keep the concatenating path.
-                rows=(
-                    draft_rows(indices, cache.geometry.ring_slots)
+                csr_indices=(
+                    draft_csr_indices(indices, cache.geometry.ring_slots)
                     if get_gfx_runtime() == "gfx1250"
                     else None
                 ),

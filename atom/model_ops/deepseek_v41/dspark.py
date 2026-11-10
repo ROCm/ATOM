@@ -20,15 +20,15 @@ from atom.model_ops.v4_kernels import sparse_attn_v4_paged_2src
 def draft_attention(query, context_kv, draft_kv, sink, step, scale):
     """All draft rows attend to the whole draft block, plus valid target rows.
 
-    With `step.rows` (`draft_rows`), the window and the block are the two
+    With `step.csr_indices` (`draft_csr_indices`), the window and the block are the two
     sources of the sparse MLA kernel the target's BF16 path uses: no
     concatenated copy, and one workgroup per row for all heads instead of a
     program per row and head tile that re-reads every key. Without it, joins
     the two by concatenating. Neither touches `context_kv`.
     """
-    rows = getattr(step, "rows", None)
+    csr = getattr(step, "csr_indices", None)
     if (
-        rows is not None
+        csr is not None
         and query.is_contiguous()
         and context_kv.is_contiguous()
         and draft_kv.is_contiguous()
@@ -37,11 +37,11 @@ def draft_attention(query, context_kv, draft_kv, sink, step, scale):
         output = sparse_attn_v4_paged_2src(
             query.view(batch * width, heads, dim),
             context_kv.view(-1, dim),
-            rows[0],
-            rows[1],
+            csr[0],
+            csr[1],
             draft_kv.view(-1, dim),
-            rows[2],
-            rows[3],
+            csr[2],
+            csr[3],
             sink,
             scale,
         )
@@ -51,7 +51,7 @@ def draft_attention(query, context_kv, draft_kv, sink, step, scale):
 
 
 @triton.jit
-def _draft_rows_count_kernel(
+def _draft_csr_count_kernel(
     indices_ptr, counts_ptr, ring, width, rows, ENTRIES: tl.constexpr
 ):
     """Per draft row: how many ring and block entries are not -1 (`counts` is
@@ -68,7 +68,7 @@ def _draft_rows_count_kernel(
 
 
 @triton.jit
-def _draft_rows_fill_kernel(
+def _draft_csr_fill_kernel(
     indices_ptr,
     ends_ptr,
     ptrs_ptr,
@@ -111,7 +111,7 @@ def _draft_rows_fill_kernel(
         tl.store(ptrs_ptr + rows + 1, 0)
 
 
-def draft_rows(indices, ring):
+def draft_csr_indices(indices, ring):
     """`draft_step_indices`' `[B, width, ring + width]` list as the CSR pair
     `draft_attention` hands the sparse MLA kernel: `(context rows, indptr,
     block rows, indptr)`, int32, -1 entries dropped.
@@ -130,11 +130,11 @@ def draft_rows(indices, ring):
         return context, ptrs[0], block, ptrs[1]
     entries = triton.next_power_of_2(total)
     counts = torch.empty(2, rows, dtype=torch.int32, device=device)
-    _draft_rows_count_kernel[(rows,)](
+    _draft_csr_count_kernel[(rows,)](
         indices, counts, ring, width, rows, ENTRIES=entries, num_warps=4
     )
     ends = torch.cumsum(counts, 1, dtype=torch.int32)
-    _draft_rows_fill_kernel[(rows,)](
+    _draft_csr_fill_kernel[(rows,)](
         indices,
         ends,
         ptrs,
