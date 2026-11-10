@@ -30,16 +30,6 @@ class SharedExpertMode(Enum):
     EPLB_ROUTED = auto()
 
 
-def topk_padding_mask(topk_ids: torch.Tensor) -> torch.Tensor:
-    """Broadcastable ``[rows, 1]`` mask for rows that take no experts.
-
-    Routing marks every routed ID as -1 on padding, including DP dummy rows.
-    The first routed column identifies those rows; shared-expert placement
-    must not append a valid expert ID to them.
-    """
-    return topk_ids[:, :1] < 0
-
-
 @dataclass(frozen=True)
 class MoEExpertLayout:
     mode: SharedExpertMode

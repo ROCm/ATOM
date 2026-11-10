@@ -5,7 +5,7 @@ tensor. CPU only: the group is a stand-in for two ranks, rank 1 holding
 `peer_rows` rows of zeros."""
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -157,11 +157,12 @@ def test_gathered_shared_ids_split_the_rows_between_ep_ranks(monkeypatch):
     assert runs[0] == {0, 2} and runs[1] == {1, 3}
 
 
-@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("rank", [None, 0, 1], ids=["tp", "ep-0", "ep-1"])
 @pytest.mark.parametrize("num_shared", [1, 3])
+@pytest.mark.parametrize("rows", [0, 4], ids=["empty", "mixed"])
 @pytest.mark.parametrize("compiled", [False, True], ids=["eager", "compiled"])
 def test_gather_does_not_restore_shared_experts_on_dummy_or_padded_rows(
-    monkeypatch, rank, num_shared, compiled
+    monkeypatch, rank, num_shared, rows, compiled
 ):
     layer = SimpleNamespace(
         expert_layout=SimpleNamespace(mode=SharedExpertMode.LEGACY_AITER),
@@ -169,11 +170,18 @@ def test_gather_does_not_restore_shared_experts_on_dummy_or_padded_rows(
     )
     # Rank 0's dummy followed by rank 1's two real rows and one padded row.
     # Shared columns were prefilled before routing masked the routed columns.
-    routed = torch.tensor([[-1, -1], [0, 1], [1, 2], [-1, -1]], dtype=torch.int32)
-    ids = torch.cat((routed, torch.full((4, num_shared), 8, dtype=torch.int32)), 1)
+    routed = torch.tensor([[-1, -1], [0, 1], [1, -1], [-1, -1]], dtype=torch.int32)[
+        :rows
+    ]
+    ids = torch.cat((routed, torch.full((rows, num_shared), 8, dtype=torch.int32)), 1)
     template = torch.zeros_like(ids)
-    template[:, 2:] = 9  # fake shared id on this rank's unassigned rows
-    template[rank::2, 2:] = 8
+    shared_ids = torch.arange(8, 8 + num_shared, dtype=torch.int32)
+    if rank is None:
+        # TP computes every real token's shared-expert weight shard.
+        template[:, 2:] = shared_ids
+    else:
+        template[:, 2:] = 8 + num_shared  # fake ID on unassigned EP rows
+        template[rank::2, 2:] = shared_ids
     before = template.clone()
     monkeypatch.setattr(topK, "aiter_topK_meta_data", (torch.ones_like(ids), template))
 
@@ -182,14 +190,37 @@ def test_gather_does_not_restore_shared_experts_on_dummy_or_padded_rows(
         reassign = torch.compile(reassign, backend="eager", fullgraph=True)
     reassign(layer, ids)
 
-    assert (ids[[0, 3]] == -1).all()
+    invalid = routed[:, 0] < 0
+    assert (ids[invalid] == -1).all()
     assert torch.equal(ids[:, :2], routed)
-    assert torch.equal(ids[1:3, 2:], template[1:3, 2:])
+    assert torch.equal(ids[~invalid, 2:], template[~invalid, 2:])
     assert torch.equal(template, before)
     # A subsequent real replay must still find the complete prefilled table.
     real = torch.zeros_like(ids)
     reassign(layer, real)
     assert torch.equal(real[:, 2:], before[:, 2:])
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        SharedExpertMode.NONE,
+        SharedExpertMode.LOCAL_REPLICA,
+        SharedExpertMode.EPLB_ROUTED,
+    ],
+)
+def test_gathered_shared_reassignment_bypasses_other_layouts(monkeypatch, mode):
+    layer = SimpleNamespace(expert_layout=SimpleNamespace(mode=mode))
+    ids = torch.tensor([[0, 4], [-1, -1]], dtype=torch.int32)
+    before = ids.clone()
+    copy = Mock(side_effect=AssertionError("non-legacy layout reached shared copying"))
+    monkeypatch.setattr(topK, "copy_shared_expert_ids_", copy)
+    monkeypatch.setattr(topK, "aiter_topK_meta_data", None)
+
+    topK.reassign_gathered_shared_ids(layer, ids)
+
+    copy.assert_not_called()
+    assert torch.equal(ids, before)
 
 
 @pytest.mark.parametrize("placement", ["local-replica", "eplb"])

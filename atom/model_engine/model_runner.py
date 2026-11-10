@@ -251,8 +251,8 @@ class tokenIDProcessor:
         )
         # [scheduled requests, scheduled tokens, scheduled draft tokens]: each
         # pass's real row count (its `Context.scheduled_tokens_gpu` is the
-        # entry), zero on an idle DP placeholder. Not `cu_seqlens_q[-1]`: a
-        # token-graph bucket was recorded at its own request count.
+        # entry). Not `cu_seqlens_q[-1]`: a token-graph bucket was recorded at
+        # its own request count.
         self.batch_info = CpuGpuBuffer(
             3, dtype=torch.int32, device=device, publication_group="input_ids"
         )

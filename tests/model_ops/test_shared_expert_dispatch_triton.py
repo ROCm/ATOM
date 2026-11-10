@@ -9,9 +9,9 @@ import torch
 
 pytest.importorskip("triton", reason="Triton dispatch tests require triton")
 
+from atom.model_ops.fused_moe.gathered_shared_ids import copy_shared_expert_ids_
 from atom.model_ops.fused_moe.shared_expert_dispatch import (
     _remap_torch,
-    copy_shared_expert_ids_,
     remap_topk_to_dispatch,
 )
 
