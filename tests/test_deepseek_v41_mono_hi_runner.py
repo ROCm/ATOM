@@ -292,7 +292,8 @@ def test_postprocess_takes_the_heads_verdict_and_the_broadcast_ids(
         spec_status_queue=SimpleNamespace(send=lambda t, **kw: sent.append(t)),
         input_ids=SimpleNamespace(gpu=torch.zeros(16, dtype=torch.int32)),
     )
-    runner.forward_done_event = SimpleNamespace(record=lambda: None)
+    runner.forward_done_event = SimpleNamespace(record=lambda stream=None: None)
+    runner._served = None  # (no step override served this step)
     runner.drafter = object()
     runner.structured_output = None
     runner.propose_draft_token_ids = propose

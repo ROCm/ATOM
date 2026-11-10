@@ -459,6 +459,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
     `config.kv_cache_block_size` (config.py forces the same value for V4).
     """
 
+    # TBO's comm stream runs at high priority, as V4.1's does, so a ubatch's
+    # gather / reduce-scatter is scheduled while the other ubatch computes
+    # instead of waiting for the compute queue to drain.
+    tbo_comm_stream_priority = -1
+
     block_size = 256
 
     # Set by a subclass that rotates an index key at its compression group's
