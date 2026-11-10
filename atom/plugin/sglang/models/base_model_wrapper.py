@@ -100,6 +100,30 @@ class _AtomDSparkLmHeadView(nn.Module):
         return self.head.weight
 
 
+def _extract_dspark_v4_aux(output, block):
+    """Completed DeepSeek-V4 layer state, averaged over the mHC axis.
+
+    The decoder layer returns its HCState before the FFN output is posted
+    back into the residual. ``hc_post`` finishes that mix. The state carries
+    ``res_preshuffle``, and the fused post kernel reads that layout.
+    """
+    residual = getattr(output, "residual", None)
+    if residual is None:
+        return None
+    x_prev = getattr(output, "x_prev", None)
+    post = getattr(output, "post_mix", None)
+    comb = getattr(output, "comb_mix", None)
+    if x_prev is not None and post is not None and comb is not None:
+        residual = block.hc_post(
+            x_prev,
+            residual,
+            post,
+            comb,
+            res_preshuffle=bool(getattr(output, "res_preshuffle", False)),
+        )
+    return residual.mean(dim=1)
+
+
 class _AtomCausalLMBaseForSglang(nn.Module):
     """Base ATOM model wrapper conforming to sglang's model interface.
 
@@ -309,22 +333,31 @@ class _AtomCausalLMBaseForSglang(nn.Module):
             )
         return embed, _AtomDSparkLmHeadView(head)
 
-    def get_input_embeddings(self):
-        """Return the target embedding DSpark samples from when sharing weights."""
-        shared = getattr(self, "get_dspark_shared_modules", None)
-        if self.model_arch == "DeepseekV4ForCausalLM" and shared is not None:
-            return self.get_dspark_shared_modules()[0]
-        if hasattr(self.model, "get_input_embeddings"):
-            return self.model.get_input_embeddings()
+    def get_input_embeddings(self, input_ids: torch.Tensor | None = None):
+        """Return the embedding module, or embed ``input_ids`` when they are given.
+
+        DeepSeek-V4 with no ids returns the module DSpark shares. Other ATOM
+        models take the ids in their own ``get_input_embeddings``.
+        """
+        if self.model_arch == "DeepseekV4ForCausalLM":
+            embed = self.get_dspark_shared_modules()[0]
+            if input_ids is None:
+                return embed
+            return embed(input_ids)
+        if input_ids is not None and hasattr(self.model, "get_input_embeddings"):
+            return self.model.get_input_embeddings(input_ids)
         embed_owner, _ = self._embed_and_head_owners()
-        return embed_owner.embed_tokens
+        if input_ids is None:
+            return embed_owner.embed_tokens
+        return embed_owner.embed_tokens(input_ids)
 
     def set_dspark_layers_to_capture(self, layer_ids: Iterable[int] | None = None):
         """Capture the target layers DSpark uses as draft context.
 
-        SGLang calls this before the first forward. The ATOM V4 model returns
-        those completed layer states alongside its normal residual, and this
-        wrapper already forwards that second value as auxiliary hidden states.
+        SGLang calls this before the first forward. The taps are drafter-owned
+        forward hooks, the same mechanism native ATOM uses. The shared V4
+        forward still returns only its residual; this wrapper reads the hook
+        buffers after that forward and passes them as auxiliary hidden states.
         """
         if self.model_arch != "DeepseekV4ForCausalLM":
             raise RuntimeError(
@@ -332,21 +365,113 @@ class _AtomCausalLMBaseForSglang(nn.Module):
                 f"DeepseekV4ForCausalLM, got {self.model_arch!r}."
             )
         if layer_ids is None:
-            raise ValueError("DSPARK requires explicit layer_ids for aux hidden capture.")
-        inner = getattr(self.model, "model", None)
-        layers = getattr(inner, "layers", None)
-        if layers is None:
-            raise RuntimeError("ATOM DeepSeek-V4 model does not expose decoder layers.")
-        requested = tuple(int(layer_id) for layer_id in layer_ids)
-        if any(layer_id < 0 or layer_id >= len(layers) for layer_id in requested):
             raise ValueError(
-                "DSPARK capture layer ids are outside the ATOM decoder: "
-                f"{requested}, num_layers={len(layers)}."
+                "DSPARK requires explicit layer_ids for aux hidden capture."
             )
-        self.capture_aux_hidden_states = True
-        inner.dspark_capture_mask = tuple(
-            layer_id in requested for layer_id in range(len(layers))
+        requested = tuple(int(layer_id) for layer_id in layer_ids)
+        installed = getattr(self, "_dspark_aux_layer_ids", None)
+        if installed == requested:
+            return
+        if installed:
+            raise RuntimeError(
+                "DSpark aux taps are already installed for "
+                f"{installed}, not {requested}."
+            )
+        from atom.spec_decode.drafter import (
+            AuxCaptureSpec,
+            _aux_hook,
+            install_aux_taps,
         )
+
+        hidden_size = int(getattr(self.config, "hidden_size", 0) or 0)
+        if hidden_size <= 0:
+            raise RuntimeError(
+                "DeepSeek-V4 config does not define hidden_size for DSpark aux capture."
+            )
+        self._dspark_aux_buffers = [None] * len(requested)
+        install_aux_taps(
+            self.model,
+            AuxCaptureSpec(
+                layer_ids=requested,
+                hidden_size=hidden_size,
+                extract=_extract_dspark_v4_aux,
+            ),
+            requested,
+            lambda lid, extract: self._make_dspark_aux_hook(
+                requested.index(lid), extract, _aux_hook
+            ),
+        )
+        self._dspark_aux_layer_ids = requested
+        self.capture_aux_hidden_states = True
+
+    def _make_dspark_aux_hook(self, index, extract, aux_hook):
+        def write(tensor, off):
+            end = off + tensor.shape[0]
+            buffers = self._dspark_aux_buffers
+            buf = buffers[index]
+            width = int(tensor.shape[-1])
+            capacity = 0 if buf is None else buf.shape[0]
+            if (
+                buf is None
+                or capacity < end
+                or buf.shape[-1] != width
+                or buf.dtype != tensor.dtype
+                or buf.device != tensor.device
+            ):
+                grown = tensor.new_empty((max(end, capacity), width))
+                if buf is not None and capacity > 0:
+                    grown[:capacity].copy_(buf)
+                buffers[index] = grown
+                buf = grown
+            buf[off:end].copy_(tensor)
+
+        return aux_hook(extract, write)
+
+    def _dspark_aux_for(self, hidden_states):
+        layer_ids = getattr(self, "_dspark_aux_layer_ids", None)
+        if not layer_ids or not torch.is_tensor(hidden_states):
+            return None
+        buffers = self._dspark_aux_buffers
+        if any(buf is None for buf in buffers):
+            raise RuntimeError(
+                "DSpark aux taps did not run for layers "
+                f"{layer_ids}; the target forward did not reach them."
+            )
+        from atom.distributed.pcp_utils import (
+            get_pcp_world_size,
+            pcp_allgather_rerange,
+            pcp_pad_len,
+        )
+        from atom.utils.forward_context import get_forward_context
+        from atom.utils.tbo.ubatching import tbo_active
+
+        n = int(hidden_states.shape[0])
+        ctx = get_forward_context().context
+        pcp_ws = get_pcp_world_size()
+        # The hooks see this rank's shard. Gather them when the returned
+        # hidden state was already restored to global token order. Two-batch
+        # overlap defers that gather, so the buffers stay rank-local with it.
+        if (
+            pcp_ws > 1
+            and n > 0
+            and getattr(ctx, "pcp_split", False)
+            and not tbo_active()
+        ):
+            n_local = pcp_pad_len(n, pcp_ws) // pcp_ws
+            if any(buf.shape[0] < n_local for buf in buffers):
+                raise RuntimeError(
+                    "DSpark aux buffers are shorter than this rank's PCP shard: "
+                    f"need {n_local} rows, layers {layer_ids}."
+                )
+            return [
+                pcp_allgather_rerange(buf[:n_local], pcp_ws)[:n] for buf in buffers
+            ]
+        if any(buf.shape[0] < n for buf in buffers):
+            raise RuntimeError(
+                "DSpark aux buffers are shorter than the target hidden state: "
+                f"need {n} rows, layers {layer_ids}."
+            )
+        return [buf[:n] for buf in buffers]
 
     def _embed_and_head_owners(self):
         if hasattr(self.model, "language_model"):
@@ -549,6 +674,8 @@ class _AtomCausalLMBaseForSglang(nn.Module):
                 hidden_states, aux_hidden_states = self._split_aux_hidden_states(
                     hidden_states
                 )
+                if aux_hidden_states is None:
+                    aux_hidden_states = self._dspark_aux_for(hidden_states)
                 hidden_states = runtime.trim_output(hidden_states)
                 aux_hidden_states = self._trim_aux_hidden_states(
                     runtime, aux_hidden_states

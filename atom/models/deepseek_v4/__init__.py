@@ -3704,31 +3704,17 @@ class DeepseekV4Model(nn.Module):
             res_preshuffle=res_preshuffle,
         )
 
-        capture_mask = getattr(self, "dspark_capture_mask", None)
-        aux_hidden_states = [] if capture_mask is not None else None
-        for layer_id, layer in enumerate(self.layers):
+        for layer in self.layers:
             hc_state = layer(hc_state, positions)
-            if aux_hidden_states is not None and capture_mask[layer_id]:
-                completed = layer.hc_post(
-                    hc_state.x_prev,
-                    hc_state.residual,
-                    hc_state.post_mix,
-                    hc_state.comb_mix,
-                    res_preshuffle=hc_state.res_preshuffle,
-                )
-                aux_hidden_states.append(completed.mean(dim=1))
 
         last_layer = self.layers[-1]
-        hidden_states = last_layer.hc_post(
+        return last_layer.hc_post(
             hc_state.x_prev,
             hc_state.residual,
             hc_state.post_mix,
             hc_state.comb_mix,
             res_preshuffle=hc_state.res_preshuffle,
         )
-        if aux_hidden_states is not None:
-            return hidden_states, aux_hidden_states
-        return hidden_states
 
 
 # The recording unit, not `DeepseekV4Model`: the DP-attention ids gather below
@@ -3871,12 +3857,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             positions = pcp_round_robin_split(positions, pcp_size)
 
         ctx.context.input_ids = input_ids
-        model_out = self.model(input_ids, positions)
-        aux_hidden_states = None
-        if isinstance(model_out, tuple):
-            h, aux_hidden_states = model_out
-        else:
-            h = model_out
+        h = self.model(input_ids, positions)
 
         # ----- PCP: all-gather shards, restore original order, drop pad -----
         if use_pcp:
@@ -3889,8 +3870,6 @@ class DeepseekV4ForCausalLM(nn.Module):
                 h = pcp_allgather_rerange(h, pcp_size)
                 if pad > 0:
                     h = h[:n_global]
-        if aux_hidden_states is not None:
-            return h, aux_hidden_states
         return h
 
     def compute_logits(

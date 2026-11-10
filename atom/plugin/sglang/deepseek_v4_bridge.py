@@ -971,11 +971,13 @@ def install_deepseek_v4_proxy_pool_patch() -> None:
         return
 
     def _build_dsv4_kv_pool(self, *args, **kwargs):
+        # Only the DSpark draft needs SGLang's native pool: its attention writes
+        # SWA keys through set_swa_key_buffer_radix. EAGLE/MTP drafts are ATOM
+        # models that read the proxy's carved views, so they keep the proxy.
+        use_native_pool = self.is_draft_worker and self.spec_algorithm.is_dspark()
         saved = kv_configurator.DeepSeekV4TokenToKVPool
         kv_configurator.DeepSeekV4TokenToKVPool = (
-            original_pool_cls
-            if self.is_draft_worker
-            else ATOMDeepSeekV4ProxyKVPool
+            original_pool_cls if use_native_pool else ATOMDeepSeekV4ProxyKVPool
         )
         try:
             return builder(self, *args, **kwargs)
