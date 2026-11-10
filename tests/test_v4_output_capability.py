@@ -1,0 +1,105 @@
+# SPDX-License-Identifier: MIT
+"""AITER wrappers must not turn an old output API into an advertised new one."""
+
+import importlib.util
+import sys
+from pathlib import Path
+
+import pytest
+import torch
+
+# This helper has no AITER dependency; keep its compatibility tests in CPU CI.
+_path = (
+    Path(__file__).resolve().parents[1] / "atom/model_ops/v4_kernels/output_buffer.py"
+)
+_spec = importlib.util.spec_from_file_location("v4_output_buffer_test", _path)
+output_buffer = importlib.util.module_from_spec(_spec)
+sys.modules[_spec.name] = output_buffer
+_spec.loader.exec_module(output_buffer)
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("expose_body", [False, True])
+def test_opaque_wrapper_preserves_output_slice(legacy, expose_body):
+    calls = []
+
+    def old(x):
+        calls.append(None)
+        return x + 1
+
+    def new(x, *, out=None):
+        calls.append(out)
+        return x + 1 if out is None else torch.add(x, 1, out=out)
+
+    body = old if legacy else new
+
+    def wrapper(*args, **kwargs):
+        return body(*args, **kwargs)
+
+    if expose_body:
+        wrapper._eager_body = body
+    parent = torch.full((6,), -9.0)
+    out = parent[1:-1]
+    actual = output_buffer.call_with_output(wrapper, (torch.ones(4),), out)
+    assert actual is out
+    torch.testing.assert_close(out, torch.full((4,), 2.0))
+    torch.testing.assert_close(parent[[0, -1]], torch.full((2,), -9.0))
+    assert len(calls) == 1
+    assert calls[0] is (out if expose_body and not legacy else None)
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("expose_body", [False, True])
+def test_opaque_output_api_compiles(legacy, expose_body):
+    def old(x):
+        return x + 1
+
+    def new(x, *, out=None):
+        return x + 1 if out is None else torch.add(x, 1, out=out)
+
+    body = old if legacy else new
+
+    def wrapper(*args, **kwargs):
+        return body(*args, **kwargs)
+
+    if expose_body:
+        wrapper._eager_body = body
+
+    def run(x, out):
+        return output_buffer.call_with_output(wrapper, (x,), out)
+
+    out = torch.empty(4)
+    actual = torch.compile(run, fullgraph=True, backend="eager")(torch.ones(4), out)
+    assert actual is out
+    torch.testing.assert_close(out, torch.full((4,), 2.0))
+
+
+@pytest.mark.parametrize("accepts_output", [False, True])
+def test_kernel_type_errors_propagate(accepts_output):
+    def legacy(x):
+        raise TypeError("invalid packed tensor dtype")
+
+    def current(x, *, out=None):
+        raise TypeError("invalid packed tensor dtype")
+
+    kernel = current if accepts_output else legacy
+    with pytest.raises(TypeError, match="invalid packed tensor dtype"):
+        output_buffer.call_with_output(kernel, (torch.empty(1),), torch.empty(1))
+
+
+@pytest.mark.parametrize("expose_body", [False, True])
+def test_real_aiter_guard_accepts_legacy_output_api(monkeypatch, expose_body):
+    guard = pytest.importorskip("aiter.jit.utils.torch_guard").torch_compile_guard
+
+    def legacy_body(x: torch.Tensor) -> torch.Tensor:
+        return x + 1
+
+    # Each parametrization owns its registered torch operator.
+    legacy_body.__name__ = f"test_v4_legacy_output_{expose_body}"
+    kernel = guard(mutates_args=[])(legacy_body)
+    if not expose_body:
+        monkeypatch.delattr(kernel, "_eager_body", raising=False)
+    out = torch.empty(4)
+    actual = output_buffer.call_with_output(kernel, (torch.ones(4),), out)
+    assert actual is out
+    torch.testing.assert_close(out, torch.full((4,), 2.0))
