@@ -95,7 +95,6 @@ from atom.model_ops.linear import (
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.sparse_indexer_fp4 import (
     assert_fp4_indexer_supported,
-    fp4_cache_layout,
     require_opus_api,
     sparse_indexer_fp4_enabled,
 )
@@ -1529,14 +1528,11 @@ class Indexer(nn.Module):
             atom_config.index_cache_dtype, config
         )
         self._index_cache_layout = (
-            fp4_cache_layout() if self._indexer_fp4 else "preshuffle"
+            (atom_config.index_cache_layout or "preshuffle")
+            if self._indexer_fp4
+            else "preshuffle"
         )
         self._indexer_opus = self._indexer_fp4 and self._index_cache_layout == "mfma"
-        index_layout = getattr(atom_config, "index_cache_layout", None)
-        if self._indexer_fp4 and index_layout not in (None, self._index_cache_layout):
-            raise ValueError(
-                "DSA FP4 layout differs from the config-time cache namespace"
-            )
         # self.indexer_cfg = config.attn_module_list_cfg[0]["attn_index"]
         self.topk_tokens = config.index_topk
         self.n_head = config.index_n_heads  # 64
@@ -1630,7 +1626,7 @@ class Indexer(nn.Module):
         self._weights_scale = self.softmax_scale * self.n_head**-0.5
         if self._indexer_fp4:
             assert_fp4_indexer_supported(
-                fused_writer=self.use_qk_rope_cache_fusion or self._indexer_opus,
+                packed_writer=self.use_qk_rope_cache_fusion or self._indexer_opus,
                 prefill_context_parallel=pcp_is_enabled(),
                 prefill_ubatching=get_current_atom_config().enable_tbo,
             )

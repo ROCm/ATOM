@@ -106,9 +106,9 @@ def indexer_qk_rope_quant_and_cache(
     slot_mapping: torch.Tensor,
     norm_weight: torch.Tensor,
     norm_bias: torch.Tensor,
-    positions: torch.Tensor,
-    cos_cache: torch.Tensor,
-    sin_cache: torch.Tensor,
+    positions: torch.Tensor | None,
+    cos_cache: torch.Tensor | None,
+    sin_cache: torch.Tensor | None,
     epsilon: float,
     quant_block_size: int,
     scale_fmt: str | None,
@@ -117,6 +117,9 @@ def indexer_qk_rope_quant_and_cache(
     is_neox: bool = True,
     q_scale_out: torch.Tensor | None = None,
     kv_cache_scale: torch.Tensor | None = None,
+    *,
+    scale_layout: str = "flydsl",
+    rope_dim: int = 64,
 ) -> None:
     """Run the fused indexer cache op with ATOM's DCP query semantics.
 
@@ -125,6 +128,8 @@ def indexer_qk_rope_quant_and_cache(
     accepts the FP8 call -- the same version tolerance the seg-variant import
     above keeps. One without the other would fall back to FP8 and write that
     layout into FP4-shaped buffers, so it is refused here rather than passed on.
+    OPUS accepts NoPE and always publishes all Q rows. Legacy calls omit the
+    new layout keywords so that existing FP8/FlyDSL deployments still work.
     """
     if (q_scale_out is None) != (kv_cache_scale is None):
         raise ValueError(
@@ -136,6 +141,10 @@ def indexer_qk_rope_quant_and_cache(
         if q_scale_out is not None
         else {}
     )
+    if scale_layout != "flydsl" or rope_dim != 64:
+        if q_scale_out is None:
+            raise ValueError("An explicit FP4 layout requires both scale buffers")
+        fp4_out.update(scale_layout=scale_layout, rope_dim=rope_dim)
     _indexer_qk_rope_quant_and_cache(
         q,
         q_out,
@@ -155,7 +164,8 @@ def indexer_qk_rope_quant_and_cache(
         weights_scale,
         preshuffle=preshuffle,
         is_neox=is_neox,
-        compute_all_q_rope=get_dcp_world_size() > 1,
+        # OPUS has always published every Q row, including negative K slots.
+        compute_all_q_rope=scale_layout == "opus" or get_dcp_world_size() > 1,
         **fp4_out,
     )
 

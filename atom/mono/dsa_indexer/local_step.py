@@ -15,6 +15,8 @@ from flydsl.expr.typing import Int32, Int64, T
 
 from atom.mono.device.ops import CM_DEV, CM_SYS, ballot, load_ptr64, rsrc
 from atom.mono.dsa_indexer.kernel import scratch_layout
+from atom.mono.dsa_indexer.plan import SCORE_KEYS
+from atom.mono.dsa_indexer.select import SHORT_VERIFY_CTX
 from atom.mono.plan.execution import BLOCKS, THREADS
 from atom.mono.runtime.step_begin import (
     ARRIVED,
@@ -56,7 +58,7 @@ def build(rows, qlen, world, debug=False, compact=()):
                 rsrc(ctx), fx.max(request, fx.Int32(0)), vec_width=1, dtype=T.i32
             )
         )
-        large = (lane < rows // qlen) & (request >= 0) & (length > 8192)
+        large = (lane < rows // qlen) & (request >= 0) & (length > SHORT_VERIFY_CTX)
         local = ballot(large) == 0
         first, stride = bid * THREADS + tid, BLOCKS * THREADS
         if ~local:
@@ -78,8 +80,8 @@ def build(rows, qlen, world, debug=False, compact=()):
             prefix, flag_stride, suffix, total = compact
             _zero(scratch, fx.Int64(prefix), first, stride)
             _zero(scratch + fx.Int64(suffix), fx.Int64(total - suffix), first, stride)
-            # Only the first 64 units of a short row can be polled.
-            short_flags = min(64, flag_stride // 8)
+            # Only score units in the runtime short-context window are polled.
+            short_flags = min(-(-SHORT_VERIFY_CTX // SCORE_KEYS), flag_stride // 8)
             for i in range(first, rows * short_flags, stride):
                 flag_row, chunk = i // short_flags, i % short_flags
                 at = prefix + flag_row * flag_stride + chunk * 8

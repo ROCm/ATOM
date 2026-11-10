@@ -76,7 +76,6 @@ from atom.model_ops.indexer import (
 from atom.model_ops.indexer.schedule import any_layer_skips_index_topk
 from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace
 from atom.model_ops.sparse_indexer_fp4 import (
-    fp4_cache_layout,
     fp4_index_scale_rows,
     sparse_indexer_fp4_enabled,
 )
@@ -1436,6 +1435,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 "index_dtype": dtypes.fp8,
                 "index_head_dim": hf_config.index_head_dim,
                 "index_fp4": self._indexer_fp4,
+                "index_layout": getattr(runner.config, "index_cache_layout", None)
+                or "preshuffle",
             }
             if runner.has_mla_indexer
             else {}
@@ -2729,7 +2730,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             heads=self.index_n_heads,
             page_size=self.model_runner.block_size,
             storage=self._fp4_launches[ubatch],
-            layout=fp4_cache_layout(),
+            layout=getattr(self.model_runner.config, "index_cache_layout", None)
+            or "preshuffle",
         )
 
     def _mtp_index_rows(self, rows: IndexRows | None, first: int) -> IndexRows | None:
@@ -2824,7 +2826,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             heads=self.index_n_heads,
             page_size=self.model_runner.block_size,
             split=split,
-            layout=fp4_cache_layout(),
+            layout=getattr(self.model_runner.config, "index_cache_layout", None)
+            or "preshuffle",
         )
 
     def _publish_prefill_pool_rows(

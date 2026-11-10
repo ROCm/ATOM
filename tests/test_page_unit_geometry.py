@@ -152,10 +152,9 @@ class TestPageUnitAddressesAreArithmetic:
 
 
 @pytest.mark.parametrize("fp4", [False, True])
-def test_sparse_page_units_include_every_index_plane(fp4, monkeypatch):
+def test_sparse_page_units_include_every_index_plane(fp4):
     from atom.model_ops.attentions.mla_kv_pool import MlaKvPool
 
-    monkeypatch.setenv("ATOM_DSA_FP4_OPUS", "1")
     pool = MlaKvPool(
         layers=3,
         block_size=64,
@@ -167,6 +166,7 @@ def test_sparse_page_units_include_every_index_plane(fp4, monkeypatch):
         index_dtype=torch.uint8,
         index_head_dim=128,
         index_fp4=fp4,
+        index_layout="mfma",
     )
     pool.allocate(5, "cpu")
 

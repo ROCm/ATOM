@@ -135,6 +135,7 @@ class EngineArgs:
     port: int = 8006
     kv_cache_dtype: str = "bf16"
     index_cache_dtype: str | None = None
+    index_cache_layout: str | None = None
     block_size: int = 16
     max_model_len: int | None = None
     max_num_batched_tokens: int = 16384
@@ -159,9 +160,7 @@ class EngineArgs:
     prefill_admit_policy: str = "interval"
     max_num_seqs: int = 512
     gpu_memory_utilization: float = 0.9
-    cudagraph_capture_sizes: str = (
-        "[1,2,3,4,5,6,7,8,16,32,48,64,128,160,192,224,256,512]"
-    )
+    cudagraph_capture_sizes: str = "[1,2,3,4,5,6,7,8,16,32,48,64,128,256,512]"
     level: int = 3
     cudagraph_mode: str = "FULL"
     load_dummy: str | None = None
@@ -335,6 +334,13 @@ class EngineArgs:
             help="Index cache type. Native single-node DeepSeek-V4 defaults to "
             "'fp4' except on gfx942, which defaults to 'fp8'; other models "
             "default to --kv_cache_dtype.",
+        )
+        parser.add_argument(
+            "--index-cache-layout",
+            choices=["preshuffle", "mfma", "natural"],
+            default=None,
+            help="FP4 index cache layout. DSA defaults to preshuffle; use mfma "
+            "for OPUS. V4/V4.1 must match the configured scorer backend.",
         )
         parser.add_argument(
             "--block-size", type=int, default=16, help="KV cache block size."

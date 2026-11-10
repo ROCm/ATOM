@@ -157,25 +157,27 @@ quantization configuration and accepts the first DSA-layer weight prefix.
 No weights are included; no checkpoint file or runtime model identifier is renamed.
 Run only on idle GPUs; do not stop other jobs.
 
+The runner now sets `index_cache_layout="mfma"` for FP4 and requires the
+AITER DSA writer's `scale_layout="opus"` mode, as in the updated GLM commands.
+The recorded tables are historical measurements, not a rerun of this migration.
+
 ```bash
 PREFIX=language_model.model.layers.3.self_attn.indexer
 for cache in fp8 fp4; do
-  opus=0
-  [ "$cache" = fp4 ] && opus=1
-  ATOM_DSA_FP4_OPUS=$opus torchrun --standalone --nproc-per-node=8 \
+  torchrun --standalone --nproc-per-node=8 \
     tests/benchmarks/dsa_indexer/benchmark.py \
     --model "$MODEL" --weight-prefix "$PREFIX" --output /tmp/dsa_indexer_results \
     --cache "$cache" --dcp 1 --contexts 8192 --batches 1 8 16 24 32 40 \
     --repeats 9 --replays 64 --boundary --tag "k3_1_pro_short_${cache}"
   for dcp in 1 8; do
-    ATOM_DSA_FP4_OPUS=$opus torchrun --standalone --nproc-per-node=8 \
+    torchrun --standalone --nproc-per-node=8 \
       tests/benchmarks/dsa_indexer/benchmark.py \
       --model "$MODEL" --weight-prefix "$PREFIX" --output /tmp/dsa_indexer_results \
       --cache "$cache" --dcp "$dcp" --contexts 163840 \
       --batches 1 8 16 24 32 40 42 --repeats 9 --replays 64 --boundary \
       --tag "k3_1_pro_long_dcp${dcp}_${cache}"
   done
-  ATOM_DSA_FP4_OPUS=$opus torchrun --standalone --nproc-per-node=8 \
+  torchrun --standalone --nproc-per-node=8 \
     tests/benchmarks/dsa_indexer/benchmark.py \
     --model "$MODEL" --weight-prefix "$PREFIX" --output /tmp/dsa_indexer_results \
     --cache "$cache" --dcp 1 --contexts 8192 --batches 42 \

@@ -8,16 +8,19 @@ short-context hybrid.
 
 ## Opt In
 
-Use `ATOM_DSA_FP4_OPUS=1` together with `--index-cache-dtype fp4 --block-size 64`.
+Use `--index-cache-layout mfma --index-cache-dtype fp4 --block-size 64`.
 Keep the checkpoint quantization configuration and do not add online weight
 quantization. Mono uses the checkpoint's BF16 `wq_b`; a quantized `wq_b` or
 quantized Q latent remains unsupported by Mono.
 
-The native prefill/fallback path also uses the OPUS layout when this flag is
-enabled. It requires AITER's `mqa_logits_mxfp4_config` / `mqa_logits_mxfp4` API
-from PR 6952. All TP/DCP ranks must use the same flag from process startup.
-Never change the flag on a live cache or reuse a legacy FlyDSL FP4 cache.
-Without the flag, the legacy FP4 cache layout is unchanged. FP8 also receives
+The native prefill/fallback path uses the same resolved layout. It requires
+AITER's `mqa_logits_mxfp4_config` / `mqa_logits_mxfp4` API from PR 6952 and
+the `scale_layout="opus"` mode of `indexer_qk_rope_quant_and_cache`.
+The DSA writer extension is a separate AITER change; PR 7128's V4 query and
+compressor writers alone do not provide this entry point.
+`Config` resolves the layout once and passes it to every TP/DCP worker and
+the offload namespace. Never change it on a live cache or reuse a legacy
+FlyDSL FP4 cache. The default remains `preshuffle`. FP8 also receives
 the wide-width planner and short-context improvements in this change.
 
 ## Cache ABI
@@ -45,9 +48,9 @@ The standalone kernel accepts complete 64-row page groups; the production
 DSA FP4 pool currently requires block size 64.
 
 DCP1 and DCP=TP with interleave 1 are supported. The FP8-specific 512-CTA
-tuning is not enabled for FP4. PCP, prefill micro-batching, plugin backends
-and cache transfer/offload are not supported by the experimental OPUS DSA
-route and are rejected. Whole-model quality has not been qualified.
+tuning is not enabled for FP4. Standalone `lmcache_mp` supports both planes,
+including TP8+DCP8. PCP, prefill micro-batching, plugin backends and other
+cache-transfer connectors are rejected by the experimental OPUS DSA route.
 
 For DCP1 qlen-6 verification (and the existing narrow qlen-8 domain), a
 device-side whole-batch predicate selects independent rank-local work when
@@ -56,6 +59,8 @@ peer collaboration. DCP8 keeps communication because the cache is sharded.
 The predicate is evaluated inside the captured graph, not at capture time.
 The standalone DSA runner uses a matching conditional reset; runners that
 share buffers with whole-model Mono kernels retain their original fence.
+Intermediate wide graph buckets are opt-in via `--cudagraph-capture-sizes`,
+for example `[64,128,160,192,224,256]`; global capture defaults are unchanged.
 
 ### Short-Context Qlen-6 Tuning
 

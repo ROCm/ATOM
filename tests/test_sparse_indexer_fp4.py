@@ -128,7 +128,7 @@ def test_unsupported_fp4_requests_name_the_knob_that_blocked_them():
     def check(**overrides):
         assert_fp4_indexer_supported(
             **{
-                "fused_writer": True,
+                "packed_writer": True,
                 "prefill_context_parallel": False,
                 "prefill_ubatching": False,
                 **overrides,
@@ -137,7 +137,7 @@ def test_unsupported_fp4_requests_name_the_knob_that_blocked_them():
 
     check()
     with pytest.raises(ValueError, match="fused QK/RoPE/cache"):
-        check(fused_writer=False)
+        check(packed_writer=False)
     # PCP's candidate exchange needs fp32 weights that the FP4 writer does not
     # produce, independently of the native custom op's side-effect-only ABI.
     with pytest.raises(ValueError, match="does not support PCP"):

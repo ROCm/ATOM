@@ -235,28 +235,48 @@ def sparse_attn_indexer(
         indexer_fp4
         and getattr(indexer_module, "_index_cache_layout", "preshuffle") == "mfma"
     ):
-        from atom.model_ops.dsa_fp4 import publish
-
         if kv_cache_scale is None:
             raise ValueError(
                 "OPUS DSA FP4 requires its mutated scale plane as an op argument"
             )
-        q_quant, q_fp4_scale = publish(
+        q_quant = torch.empty(
+            (*q_input.shape[:-1], head_dim // 2),
+            device=q_input.device,
+            dtype=torch.uint8,
+        )
+        q_fp4_scale = torch.empty(
+            fp4_q_scale_shape(
+                q_input.shape[0], q_input.shape[1], head_dim, layout="mfma"
+            ),
+            device=q_input.device,
+            dtype=torch.uint8,
+        )
+        weights_mqa = torch.empty(
+            weights.shape, device=weights.device, dtype=weights.dtype
+        )
+        indexer_qk_rope_quant_and_cache(
             q_input,
+            q_quant,
+            weights,
+            weights_mqa,
             k,
             kv_cache,
-            kv_cache_scale,
             slot_mapping,
             k_norm_weight,
             k_norm_bias,
-            eps=k_norm_eps,
-            rope_dim=indexer_module.rope_dim,
+            positions,
+            cos_cache,
+            sin_cache,
+            k_norm_eps,
+            FP4_QUANT_BLOCK_SIZE,
+            scale_fmt,
+            weights_scale,
             is_neox=is_neox_style,
-            positions=positions,
-            cos=cos_cache,
-            sin=sin_cache,
+            q_scale_out=q_fp4_scale,
+            kv_cache_scale=kv_cache_scale,
+            scale_layout="opus",
+            rope_dim=indexer_module.rope_dim,
         )
-        weights_mqa = weights.contiguous()
     elif indexer_fp4:
         # `weights_out` comes back unscaled in q's dtype: the FP4 mqa-logits
         # kernels apply the per-group q scale inside the MFMA and take

@@ -324,13 +324,12 @@ def test_mla_builder_publishes_latent_and_index_views(
 @pytest.mark.parametrize("opus", [False, True])
 @pytest.mark.parametrize("dcp", [1, 8])
 def test_mla_builder_publishes_fp4_index_scale_plane_to_lmcache_mp(
-    mla_builder_cls, monkeypatch, opus, dcp
+    mla_builder_cls, opus, dcp
 ):
     # The FP4 sparse indexer keeps packed E2M1 and its e8m0 exponents as two
     # planes. `lmcache_mp` groups regions by per-block shape and copies whole
     # blocks, so the scale plane is published as one more region per layer and
     # both planes round-trip. 64 rows is the block size FP4 requires.
-    monkeypatch.setenv("ATOM_DSA_FP4_OPUS", str(int(opus)))
     runner = SimpleNamespace(
         config=SimpleNamespace(
             tensor_parallel_size=8,
@@ -347,6 +346,7 @@ def test_mla_builder_publishes_fp4_index_scale_plane_to_lmcache_mp(
         index_rows_per_block=64,
         index_head_dim=128,
         index_fp4=True,
+        index_layout="mfma" if opus else "preshuffle",
     )
     pool.allocate(2, "cpu")
     builder = mla_builder_cls.__new__(mla_builder_cls)

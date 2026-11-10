@@ -131,7 +131,6 @@ def test_opus_constructor_admits_only_standalone_mp(
         raise PastGate
 
     monkeypatch.setattr(deepseek_v2, "sparse_indexer_fp4_enabled", lambda *a: True)
-    monkeypatch.setattr(deepseek_v2, "fp4_cache_layout", lambda: "mfma")
     monkeypatch.setattr(deepseek_v2, "require_opus_api", lambda: None)
     monkeypatch.setattr(deepseek_v2, "ReplicatedLinear", allocate)
     config = SimpleNamespace(
@@ -158,7 +157,7 @@ def test_opus_constructor_admits_only_standalone_mp(
         construct()
     config.plugin_config = None
     config.index_cache_layout = "preshuffle"
-    with pytest.raises(ValueError, match="config-time cache namespace"):
+    with pytest.raises(PastGate):
         construct()
 
 

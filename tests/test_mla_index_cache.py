@@ -552,13 +552,12 @@ def test_build_kv_cache_tensor_publishes_both_fp4_index_planes():
 
 
 @pytest.mark.parametrize("fp4", [False, True])
-def test_kimi_builder_binds_packed_index_planes(fp4, monkeypatch):
+def test_kimi_builder_binds_packed_index_planes(fp4):
     from atom.model_ops.attentions.kimi_mla_gdn_attn import (
         KimiAiterMLAGDNMetadataBuilder,
     )
     from atom.model_ops.attentions.mla_kv_pool import MlaKvPool
 
-    monkeypatch.setenv("ATOM_DSA_FP4_OPUS", "1")
     module = _MlaLayer(
         layer_num=5,
         indexer=SimpleNamespace(
@@ -581,6 +580,7 @@ def test_kimi_builder_binds_packed_index_planes(fp4, monkeypatch):
         index_dtype=torch.uint8,
         index_head_dim=128,
         index_fp4=fp4,
+        index_layout="mfma",
     )
     builder.kv_pool.allocate(3, "cpu")
     cache = builder.build_kv_cache_tensor(module)

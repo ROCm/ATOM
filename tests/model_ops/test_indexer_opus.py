@@ -168,7 +168,9 @@ def test_v41_candidate_band_forwards_packed_offsets(monkeypatch):
     assert seen["args"][4] is weights
 
 
-@pytest.mark.parametrize("page_size,pages_per_block", [(64, 1), (128, 1), (128, 2)])
+@pytest.mark.parametrize(
+    "page_size,pages_per_block", [(8, 1), (8, 16), (64, 1), (128, 1), (128, 2)]
+)
 def test_mfma_blocks_preserve_their_rows_in_opus_config(
     monkeypatch, page_size, pages_per_block
 ):

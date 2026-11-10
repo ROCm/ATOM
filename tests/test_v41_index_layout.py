@@ -130,16 +130,36 @@ def test_dsa_fp4_layout_separates_mp_namespaces(monkeypatch, nested):
     )
     cfg = SimpleNamespace(chunk_size=256)
     namespaces = []
-    for opus, expected in (("0", "preshuffle"), ("1", "mfma")):
-        monkeypatch.setenv("ATOM_DSA_FP4_OPUS", opus)
+    for requested, expected in ((None, "preshuffle"), ("mfma", "mfma")):
+        config.index_cache_layout = requested
         Config._resolve_index_cache_layout(config)
         assert config.index_cache_layout == expected
         worker = pickle.loads(pickle.dumps(config))
         namespace = offcfg.build_page_namespace(config, cfg, 8)
-        monkeypatch.setenv("ATOM_DSA_FP4_OPUS", str(1 - int(opus)))
+        monkeypatch.setenv("ATOM_V4_UNIFIED_MQA", "flydsl")
+        config.index_cache_layout = "natural"
+        assert worker.index_cache_layout == expected
         assert offcfg.build_page_namespace(worker, cfg, 8) == namespace
         namespaces.append(namespace)
     assert namespaces[0] != namespaces[1]
+
+
+@pytest.mark.parametrize(
+    "dtype,layout,index_topk,error",
+    [
+        ("fp8", "mfma", 2048, "requires --index-cache-dtype fp4"),
+        ("fp4", "natural", 2048, "preshuffle or mfma"),
+        ("fp4", "mfma", None, "requires a supported indexer"),
+    ],
+)
+def test_dsa_rejects_incompatible_explicit_layout(dtype, layout, index_topk, error):
+    config = SimpleNamespace(
+        hf_config=SimpleNamespace(model_type="glm_moe_dsa", index_topk=index_topk),
+        index_cache_dtype=dtype,
+        index_cache_layout=layout,
+    )
+    with pytest.raises(ValueError, match=error):
+        Config._resolve_index_cache_layout(config)
 
 
 @pytest.fixture

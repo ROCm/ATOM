@@ -535,6 +535,7 @@ def main():
         kv_cache_block_size=args.page,
         kv_cache_dtype="fp8",
         index_cache_dtype=args.cache,
+        index_cache_layout="mfma" if args.cache == "fp4" else None,
         online_quant_config=None,
         enable_prefix_caching=False,
     )

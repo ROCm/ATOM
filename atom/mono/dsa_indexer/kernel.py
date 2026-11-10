@@ -540,13 +540,7 @@ def stage_iquant(c, bid, tokens):
         ready_offset = bid // BLOCKS * BLOCKS
         bid = bid % BLOCKS
         tokens = tokens // 2
-    elif const_expr(c["short_owned_verify"] and not c.get("local_short", False)):
-        offset = isel.short_verify_step(c).select(
-            c["rank"] * c["qlen"] * sh.heads, fx.Int32(0)
-        )
     n = fx.Int32(tokens * sh.heads)
-    if const_expr(c["short_owned_verify"] and not c.get("local_short", False)):
-        n = isel.short_verify_step(c).select(fx.Int32(c["qlen"] * sh.heads), n)
     rounds = -(-(tokens * sh.heads) // (BLOCKS * WAVES))
     groups = sh.head_dim // gemv.ROWS
     if tid < groups:

@@ -153,25 +153,28 @@ from ROCm/aiter#6952 and #7128. The measured AITER checkout was
 Set `MODEL` to your GLM-5.3-MXFP4 checkpoint. No model weights are included.
 Run only on idle GPUs; the commands do not stop other jobs.
 
+The commands below use the current configuration API. The runner sets
+`index_cache_layout="mfma"` for FP4 and requires the AITER DSA writer's
+`scale_layout="opus"` mode. The tables above retain their recorded source
+revisions; updating these commands is not a performance rerun.
+
 ```bash
 python tests/benchmarks/dsa_indexer/check_planner.py --output /tmp/dsa_planner.json
 for cache in fp8 fp4; do
-  opus=0
-  [ "$cache" = fp4 ] && opus=1
-  ATOM_DSA_FP4_OPUS=$opus torchrun --standalone --nproc-per-node=8 \
+  torchrun --standalone --nproc-per-node=8 \
     tests/benchmarks/dsa_indexer/benchmark.py \
     --model "$MODEL" --output /tmp/dsa_indexer_results \
     --cache "$cache" --dcp 1 --contexts 8192 --batches 1 8 16 24 32 40 \
     --repeats 9 --replays 64 --boundary --tag "short_${cache}"
   for dcp in 1 8; do
-    ATOM_DSA_FP4_OPUS=$opus torchrun --standalone --nproc-per-node=8 \
+    torchrun --standalone --nproc-per-node=8 \
       tests/benchmarks/dsa_indexer/benchmark.py \
       --model "$MODEL" --output /tmp/dsa_indexer_results \
       --cache "$cache" --dcp "$dcp" --contexts 163840 \
       --batches 1 8 16 24 32 40 42 --repeats 9 --replays 64 --boundary \
       --tag "long_dcp${dcp}_${cache}"
   done
-  ATOM_DSA_FP4_OPUS=$opus torchrun --standalone --nproc-per-node=8 \
+  torchrun --standalone --nproc-per-node=8 \
     tests/benchmarks/dsa_indexer/benchmark.py \
     --model "$MODEL" --output /tmp/dsa_indexer_results \
     --cache "$cache" --dcp 1 --contexts 8192 --batches 42 \
