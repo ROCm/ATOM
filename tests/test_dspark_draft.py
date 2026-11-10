@@ -375,3 +375,39 @@ def test_k3_dspark_mla_rope_kwargs_are_unchanged():
     kw = kwargs_fn(_inferact_rope_cfg(rope_parameters=None))
     assert kw["base"] == 50000.0
     assert kw["rope_scaling"] is None
+
+
+def test_a_cache_binding_is_bound_once_a_pool_is():
+    """Warmup runs before the pool is allocated, with the empty init tensor."""
+    import torch
+
+    from atom.models.dspark_draft import KVCacheBinding
+
+    kv = KVCacheBinding(0)
+    assert not kv.bound
+    kv.k_cache = torch.zeros(2, 4)
+    assert kv.bound
+
+
+def _spec_of(cfg):
+    from atom.config import QuantizationConfig
+
+    spec = QuantizationConfig(cfg).global_spec
+    return spec.quant_type, spec.quant_dtype
+
+
+def test_a_draft_ignores_the_targets_quantization():
+    """The draft atom config is a copy of the target's; its quant config, and
+    the online re-quantization it carries, must not reach the draft. Only the
+    draft's own `quantization_config` counts, and only a pair it accepts."""
+    from atom.models.dspark_draft import draft_quant_config
+
+    bf16 = types.SimpleNamespace(quantization_config=None)
+    qc = draft_quant_config(bf16, draft="test")
+    assert qc.quant_method == "" and qc.online_quant is False
+
+    fp8 = types.SimpleNamespace(quantization_config={"quant_method": "fp8"})
+    with pytest.raises(ValueError, match="test draft does not support"):
+        draft_quant_config(fp8, draft="test")
+    accepted = draft_quant_config(fp8, draft="test", accepted={_spec_of(fp8)})
+    assert accepted.quant_method == "fp8"

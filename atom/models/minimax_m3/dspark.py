@@ -77,6 +77,7 @@ from atom.models.dspark_draft import (
     DSparkGQADecoderLayer,
     DSparkMarkovHead,
     KVCacheBinding,
+    draft_quant_config,
     linear_out,
 )
 from atom.models.minimax_m3.model import MiniMaxM3MLP
@@ -94,30 +95,6 @@ def _draft_rope_theta(config) -> float:
     if not theta:
         raise ValueError("MiniMax-M3 DSpark draft config names no rope_theta.")
     return float(theta)
-
-
-def _draft_quant_config(config) -> QuantizationConfig:
-    """The draft's own quantization, independent of the target's.
-
-    The draft checkpoint is MXFP8 (``quant_method: mxfp8``, ``[1, 32]`` blocks)
-    whatever the target is -- the M3.1 targets come as MXFP8 + NVFP4 experts,
-    Quark MXFP4, or BF16 -- so the target's config, which ``_build_draft_model``
-    copies onto the draft, cannot be trusted to describe these weights. The
-    checkpoint's own block goes through the registered parser here; a draft
-    config without one is BF16.
-    """
-    draft_qc = QuantizationConfig(config)
-    spec = draft_qc.global_spec
-    if draft_qc.quant_method and (spec.quant_type, spec.quant_dtype) != (
-        QuantType.per_1x32,
-        dtypes.fp8,
-    ):
-        raise ValueError(
-            "MiniMax-M3 DSpark draft supports MXFP8 [1, 32] or BF16 weights, "
-            f"got quant_method={draft_qc.quant_method!r} ({spec.quant_type}, "
-            f"{spec.quant_dtype})."
-        )
-    return draft_qc
 
 
 def _page16_table(
@@ -253,7 +230,7 @@ class M3DSparkAttention(nn.Module):
         off % 16), only the view differs.
         """
         kv = self.kv
-        if kv.k_cache.numel() == 0:
+        if not kv.bound:
             return None
         return to_page16_shuffle(kv.k_cache, kv.v_cache, kv.k_scale, kv.v_scale)
 
@@ -413,7 +390,14 @@ class MiniMaxM3DSpark(DSparkDraftModel):
             )
         config = atom_config.hf_config
         self.hf_config = config
-        quant_config = _draft_quant_config(config)
+        # The draft checkpoint is MXFP8 (``[1, 32]`` blocks) whatever the
+        # target is -- the M3.1 targets come as MXFP8 + NVFP4 experts, Quark
+        # MXFP4, or BF16.
+        quant_config = draft_quant_config(
+            config,
+            draft="MiniMax-M3 DSpark",
+            accepted={(QuantType.per_1x32, dtypes.fp8)},
+        )
 
         self.hidden_size = config.hidden_size
         self.noise_token_id = int(config.dspark_noise_token_id)

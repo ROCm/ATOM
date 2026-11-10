@@ -35,6 +35,7 @@ from typing import ClassVar
 import torch
 from torch import nn
 
+from atom.config import QuantizationConfig
 from atom.spec_decode.draft_kv import DraftKvPoolSpec
 from atom.utils import envs
 
@@ -73,6 +74,25 @@ def draft_rope_kwargs(config, *, is_neox_style: bool, rope_type=None) -> dict:
         "rope_scaling": rope_scaling,
         "is_neox_style": is_neox_style,
     }
+
+
+def draft_quant_config(config, *, draft: str, accepted=()) -> QuantizationConfig:
+    """A standalone draft's own quantization, independent of the target's.
+
+    The atom config copied onto the draft carries the TARGET's offline and
+    online quantization, which does not describe the draft checkpoint, so the
+    draft's own block goes through the registered parser here; a draft config
+    without one is BF16. ``accepted`` holds the ``(quant_type, quant_dtype)``
+    pairs the ``draft`` runs besides BF16; anything else is refused.
+    """
+    draft_qc = QuantizationConfig(config)
+    spec = draft_qc.global_spec
+    if draft_qc.quant_method and (spec.quant_type, spec.quant_dtype) not in accepted:
+        raise ValueError(
+            f"the {draft} draft does not support quant_method="
+            f"{draft_qc.quant_method!r} ({spec.quant_type}, {spec.quant_dtype})"
+        )
+    return draft_qc
 
 
 class DSparkMarkovHead(nn.Module):
@@ -231,6 +251,13 @@ class KVCacheBinding(nn.Module):
         self.max_model_len = 0
         self.k_cache = self.v_cache = torch.tensor([])
         self.k_scale = self.v_scale = None
+
+    @property
+    def bound(self) -> bool:
+        """Whether a pool is bound. Unbound is a real state, not an error:
+        `warmup_model()` runs before `allocate_kv_cache()`, so the binding still
+        holds its empty init tensor."""
+        return self.k_cache.numel() > 0
 
 
 class AllocationCap:

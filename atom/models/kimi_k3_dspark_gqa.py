@@ -42,7 +42,6 @@ from aiter.rotary_embedding import get_rope
 from aiter.tuned_gemm import tgemm
 from torch import nn
 
-from atom.config import QuantizationConfig
 from atom.model_ops.kimi_k3.dspark_block_attn import DSparkGQABlockAttention
 from atom.model_ops.layernorm import DualRMSNorm, RMSNorm
 from atom.model_ops.linear import (
@@ -56,6 +55,7 @@ from atom.models.dspark_draft import (
     DSparkGQADecoderLayer,
     DSparkMarkovHead,
     KVCacheBinding,
+    draft_quant_config,
     draft_rope_kwargs,
     linear_out,
 )
@@ -157,12 +157,12 @@ class KimiK3DSparkGQAAttention(nn.Module):
         q, k = self.rotary_emb(positions, q, k)
 
         n = q.shape[0]
-        k_cache, v_cache = self._caches()
-        if k_cache is None:
+        if not self.kv.bound:
             # Warmup runs before the pool is allocated, and still has to run
             # the rest of the block so profiling counts its activations.
             o = q.new_zeros((n, self.num_heads * self.head_dim))
             return linear_out(self.o_proj(o))
+        k_cache, v_cache = self.kv.k_cache, self.kv.v_cache
 
         # The write goes FIRST: the read takes the block's own T rows out of
         # the pool with the prefix, and the next block's prefix is these rows.
@@ -213,16 +213,6 @@ class KimiK3DSparkGQAAttention(nn.Module):
         )
         return o.reshape(-1, self.num_heads * self.head_dim)
 
-    def _caches(self):
-        """This layer's bound pool rows in FLASH layout, or `(None, None)`.
-
-        Unbound is a real state, not an error: `warmup_model()` runs before
-        `allocate_kv_cache()`, so the binding still holds its empty init tensor.
-        """
-        if self.kv.k_cache.numel() == 0:
-            return None, None
-        return self.kv.k_cache, self.kv.v_cache
-
     def write_context_kv(
         self,
         ctx_hidden: torch.Tensor,  # [N, hidden] projected aux context
@@ -232,7 +222,7 @@ class KimiK3DSparkGQAAttention(nn.Module):
         """Project the target-derived context and cache it as this layer's K/V.
 
         Only the k and v rows of the fused QKV weight run: the context rows
-        never need a query. The draft is BF16 (`_draft_quant_config`), whose
+        never need a query. The draft is BF16 (`draft_quant_config`), whose
         merged weight is the shards' rows laid end to end, so the row slice is a
         contiguous view of exactly the k and v shards.
         """
@@ -292,24 +282,6 @@ def _check_rope_covers(max_model_len: int, rope_rows: int) -> None:
         )
 
 
-def _draft_quant_config(config) -> QuantizationConfig:
-    """The draft's own quantization: none.
-
-    The atom config copied onto the draft carries the TARGET's offline and
-    online quantization, which do not describe this checkpoint (BF16, no
-    `quantization_config`). Taken as is, `--online_quant_config` would
-    re-quantize every draft linear its exclude list misses, and the draft would
-    run as a model it was not validated as.
-    """
-    draft_qc = QuantizationConfig(config)
-    if draft_qc.quant_method:
-        raise ValueError(
-            "the Kimi-K3 DSpark GQA draft supports BF16 weights only, got "
-            f"quant_method={draft_qc.quant_method!r}"
-        )
-    return draft_qc
-
-
 class KimiK3DSparkGQA(DSparkDraftModel):
     """The Kimi-K3 DSpark GQA draft (the RadixArk SpecForge DFlash checkpoint).
 
@@ -340,7 +312,9 @@ class KimiK3DSparkGQA(DSparkDraftModel):
     def __init__(self, atom_config, layer_offset: int = 0):
         super().__init__()
         config = atom_config.hf_config
-        quant_config = _draft_quant_config(config)
+        # BF16 only: `--online_quant_config` would otherwise re-quantize every
+        # draft linear its exclude list misses.
+        quant_config = draft_quant_config(config, draft="Kimi-K3 DSpark GQA")
 
         self.config = config
         self.vocab_size = int(config.vocab_size)
