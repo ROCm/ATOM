@@ -24,7 +24,7 @@ def test_postprocess_submits_prefill_or_final_broadcast_counts(
     bs = 2
     verdict = torch.tensor([[1, 2], [4, 3], [91, 92]], dtype=torch.int32)
     broadcast_verdict = torch.tensor([[2, 1], [3, 4], [93, 94]], dtype=torch.int32)
-    sampled = torch.tensor([[3, 4], [5, 6]], dtype=torch.int32)
+    sampled = torch.tensor([[3, 4, 0], [5, 6, 0]], dtype=torch.int32)
     spec = (
         SimpleNamespace(
             bonus_logits_indices=torch.tensor([1, 3]),
@@ -62,7 +62,7 @@ def test_postprocess_submits_prefill_or_final_broadcast_counts(
         prev_batch=None,
         prev_rejected_num=None,
         prev_bonus_num=None,
-        prepare_sampled_ids=mock.Mock(return_value=({7: (3,), 8: (5,), -1: 1}, None)),
+        prepare_sampled_ids=mock.Mock(return_value=({7: (3,), 8: (5,)}, None)),
         spec_status_queue=SimpleNamespace(send=send_status),
     )
     runner = SimpleNamespace(
@@ -81,7 +81,10 @@ def test_postprocess_submits_prefill_or_final_broadcast_counts(
         runner_module.ModelRunner.postprocess(
             runner,
             SimpleNamespace(
-                total_seqs_num=bs, return_logprobs=[False] * bs, required_channel=None
+                total_seqs_num=bs,
+                return_logprobs=[False] * bs,
+                required_channel=None,
+                num_spec_step=2 if verified else 0,
             ),
             torch.zeros(4, 8),
             torch.ones(bs),

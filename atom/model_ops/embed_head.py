@@ -260,7 +260,10 @@ class ParallelLMHead(VocabParallelEmbedding):
             attn_metadata = forward_context.attn_metadata
             # context = get_context()
             if context.is_prefill and not context.is_draft:
-                last_indices = attn_metadata.cu_seqlens_q[1:] - 1
+                # The scheduled requests' last tokens only: a padding request
+                # has none.
+                bs = context.scheduled_bs
+                last_indices = attn_metadata.cu_seqlens_q[1 : bs + 1] - 1
                 # Under Ulysses SP, x is this rank's token shard.
                 x = sp_gather_rows(x, last_indices)
             if self._can_use_dp_sharded_head(context):

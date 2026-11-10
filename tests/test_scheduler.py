@@ -11,6 +11,7 @@ from unittest import mock
 import numpy as np
 import pytest
 from conftest import MockConfig
+from test_state_checkpoint import ckpt_config, make_scheduler, stateful_seq
 
 from atom.kv_transfer.disaggregation.types import (
     KVConnectorOutput,
@@ -1298,6 +1299,150 @@ class TestPartialPrefillRemainingTokens:
         sched.running = deque([big])
         sched._partial_prefill_count = 1
         assert sched._partial_prefill_remaining_tokens() == 16  # capped
+
+
+_PREFIX = list(range(1, 37))  # 9 whole 4-token blocks
+
+
+def _probe_sched(**overrides):
+    config = {
+        "enable_prefix_caching": True,
+        "enable_chunked_prefill": True,
+        "kv_cache_block_size": 4,
+        "num_kvcache_blocks": 200,
+        "max_num_seqs": 8,
+        "max_num_batched_tokens": 32,
+        "max_model_len": 128,
+    }
+    config.update(overrides)
+    return Scheduler(MockConfig(**config))
+
+
+def _step(sched, batch, req_ids):
+    sched.postprocess(
+        list(sched.running),
+        ScheduledBatchOutput(
+            req_ids=list(req_ids),
+            token_ids=[(999,)] * len(req_ids),
+            num_rejected=None,
+            num_bonus=None,
+            draft_token_ids=None,
+        ),
+        batch=batch,
+    )
+
+
+def _cache_prefix(sched, seq_factory):
+    """Prefill a prompt starting with `_PREFIX`; it stays running, decoding."""
+    seed = seq_factory(
+        _PREFIX + [500, 501, 502, 503], sampling_params=SamplingParams(max_tokens=64)
+    )
+    sched.add(seed)
+    for _ in range(8):
+        if seed in sched.running and not seed.is_partial_prefill:
+            return
+        batch, _ = sched.schedule()
+        _step(sched, batch, [seed.id])
+    assert seed in sched.running and not seed.is_partial_prefill
+
+
+def _count_fits(sched, monkeypatch):
+    calls = []
+    fit = sched.block_manager.can_allocate_memoized
+    monkeypatch.setattr(
+        sched.block_manager,
+        "can_allocate_memoized",
+        lambda seq: calls.append(seq) or fit(seq),
+    )
+    return calls
+
+
+def test_probe_scans_past_long_cached_prompts(seq_factory):
+    # Two 40-token prompts, each over the 32-token budget, with 4 uncached rows.
+    sched = _probe_sched()
+    _cache_prefix(sched, seq_factory)
+    for tail in ([600, 601, 602, 603], [700, 701, 702, 703]):
+        sched.add(seq_factory(_PREFIX + tail))
+    assert sched._local_prefill_pending_work() == (True, 8)
+    batch, _ = sched.schedule()
+    assert batch.total_tokens_num_prefill == 8
+
+
+def test_probe_stops_once_the_budget_is_filled(seq_factory, monkeypatch):
+    sched = _probe_sched()
+    _cache_prefix(sched, seq_factory)
+    for i in range(3):  # 16 uncached rows each; two fill the budget
+        sched.add(seq_factory(_PREFIX + [600 + 16 * i + j for j in range(16)]))
+    fits = _count_fits(sched, monkeypatch)
+    # Scanning on would report the same; the stop saves the third fit.
+    assert sched._local_prefill_pending_work() == (True, 32)
+    assert len(fits) == 2
+    batch, _ = sched.schedule()
+    assert batch.total_tokens_num_prefill == 32
+
+
+def test_probe_stops_once_the_slots_are_used(seq_factory, monkeypatch):
+    sched = _probe_sched(max_num_seqs=2)  # the decoding seed takes one slot
+    _cache_prefix(sched, seq_factory)
+    for i in range(3):
+        sched.add(seq_factory(_PREFIX + [600 + 4 * i + j for j in range(4)]))
+    fits = _count_fits(sched, monkeypatch)
+    # Scanning on would report the same; the stop saves the other fits.
+    assert sched._local_prefill_pending_work() == (True, 4)
+    assert len(fits) == 1
+    batch, _ = sched.schedule()
+    assert batch.total_tokens_num_prefill == 4
+
+
+class _LocalDelayer:
+    """A local coalescer that releases prefill every tick."""
+
+    is_local = True
+    max_queue_ms = None
+    ttft_max_ticks = 5
+    rank_prefill_costs = ()
+
+    def protects_decode(self, running_decode_batch):
+        return False
+
+    def should_allow_prefill(self, prefillable, pending_tokens, **kwargs):
+        return PrefillDecision(allow=True, prefillable_ranks=1)
+
+
+def test_probe_stops_at_a_seq_waiting_for_an_inflight_prefix():
+    # A hybrid producer is prefilling a 200-token prompt; the consumer resends
+    # it with 8 more tokens, so admission defers it until the producer's
+    # prompt-end checkpoint. The probe must not count the consumer as fill.
+    sched = make_scheduler(
+        ckpt_config(
+            state_checkpoint_interval_tokens=-1,
+            enable_chunked_prefill=True,
+            max_num_batched_tokens=64,
+            max_num_seqs=8,
+            pool_entries={"state": 8},
+            long_prefill_token_threshold=16,
+        )
+    )
+    sched.set_prefill_delayer(_LocalDelayer())
+    producer = stateful_seq(list(range(3, 203)))
+    sched.add(producer)
+    batch, _ = sched.schedule()
+    _step(sched, batch, [])
+    assert producer.is_partial_prefill
+    consumer = stateful_seq(list(range(3, 203)) + list(range(900, 908)))
+    behind = stateful_seq(list(range(5000, 5020)))
+    sched.add(consumer)
+    sched.add(behind)
+
+    # The scan stops at the consumer: only the producer's next chunk counts,
+    # not a full budget. Admission still admits the request behind it.
+    assert sched._local_prefill_pending_work() == (True, 16)
+    assert sched._inflight_prefix_wait == {}  # the probe starts no deadline
+    batch, _ = sched.schedule()
+    assert batch.num_scheduled_tokens[0] == 16
+    assert behind in sched.running
+    assert consumer not in sched.running
+    assert consumer.id in sched._inflight_prefix_wait
 
 
 class TestOldestWaitingPrefillAge:
