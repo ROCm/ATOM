@@ -975,10 +975,13 @@ def _sparse_attn_v4_paged_decode_prefill_asm(
             f"least N+1={n + 1} entries, got {empty_kv_indptr.numel()}"
         )
 
-    return call_with_output(
+    # The gfx1250 ASM dispatcher requires a contiguous destination.
+    # Allocate through the backend for a strided caller-owned slice.
+    kernel_out = out if out is None or out.is_contiguous() else None
+    result = call_with_output(
         mla_sparse_prefill_fp8_asm,
         (),
-        out,
+        kernel_out,
         q_nope=q_packed_in,
         q_rope=q_rope_in,
         unified_kv_nope=unified_kv,
@@ -992,6 +995,7 @@ def _sparse_attn_v4_paged_decode_prefill_asm(
         attn_sink=attn_sink,
         softmax_scale=softmax_scale,
     )
+    return result if out is None or result is out else out.copy_(result)
 
 
 # aiter never picks more than 16 KV splits for the v4 nm decode kernel.

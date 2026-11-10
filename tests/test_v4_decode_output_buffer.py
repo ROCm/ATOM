@@ -51,6 +51,73 @@ def test_decode_writes_only_the_supplied_slice(monkeypatch, fp8, heads, strided)
         assert torch.all(parent[:, :, 1::2] == -99)
 
 
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("layout", ["allocate", "contiguous", "strided"])
+def test_prefill_asm_decode_output(monkeypatch, device, legacy, layout):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires a GPU")
+    from aiter.ops import mla_sparse_prefill
+
+    monkeypatch.setenv("ATOM_USE_V4_PREFILL_ASM_FOR_DECODE", "1")
+    monkeypatch.setattr(paged_decode, "get_gfx", lambda: "gfx1250")
+    n, heads, dim = 3, 128, 512
+    expected = torch.arange(n * heads * dim, device=device, dtype=torch.float32)
+    expected = (expected % 37).to(torch.bfloat16).reshape(n, heads, dim)
+    calls = []
+
+    def current(*, out=None, **kwargs):
+        # The real gfx1250 ASM dispatcher rejects noncontiguous output.
+        if out is not None and not out.is_contiguous():
+            raise RuntimeError("ASM output must be contiguous")
+        assert kwargs["kv_indptr_prefix"].numel() == n + 1
+        assert kwargs["kv_indptr_extend"].numel() == n + 1
+        calls.append(out)
+        return expected.clone() if out is None else out.copy_(expected)
+
+    def old(**kwargs):
+        assert "out" not in kwargs
+        return current(**kwargs)
+
+    monkeypatch.setattr(
+        mla_sparse_prefill, "mla_sparse_prefill_fp8_asm", old if legacy else current
+    )
+    parent = torch.full(
+        (n + 2, heads, dim * (2 if layout == "strided" else 1)),
+        -99.0,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    out = None
+    if layout == "contiguous":
+        out = parent[1:-1]
+    elif layout == "strided":
+        out = parent[1:-1, :, ::2]
+    result = paged_decode.sparse_attn_v4_paged_decode(
+        None,
+        torch.zeros(15, 512, device=device, dtype=torch.uint8),
+        torch.zeros(15, device=device, dtype=torch.int32),
+        torch.zeros(n + 4, device=device, dtype=torch.int32),
+        torch.zeros(heads, device=device),
+        dim**-0.5,
+        unified_kv_rope=torch.zeros(15, 64, device=device, dtype=torch.bfloat16),
+        q_packed_in=torch.zeros(n, heads, 512, device=device, dtype=torch.uint8),
+        q_rope_in=torch.zeros(n, heads, 64, device=device, dtype=torch.bfloat16),
+        empty_kv_indptr=torch.zeros(n + 4, device=device, dtype=torch.int32),
+        out=out,
+    )
+    torch.testing.assert_close(result, expected, rtol=0, atol=0)
+    assert len(calls) == 1
+    assert calls[0] is (out if layout == "contiguous" and not legacy else None)
+    if out is not None:
+        assert result is out
+    else:
+        assert torch.all(parent == -99)
+    assert torch.all(parent[[0, -1]] == -99)
+    if layout == "strided":
+        assert torch.all(parent[:, :, 1::2] == -99)
+
+
 @pytest.mark.parametrize("legacy", [False, True])
 def test_output_api_is_compile_safe(legacy):
     from atom.model_ops.v4_kernels.output_buffer import call_with_output
