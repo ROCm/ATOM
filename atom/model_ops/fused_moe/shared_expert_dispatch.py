@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Remap a routed topk into the all2all backend's id space.
+"""Shared-expert ID placement for dispatch and gathered rows.
 
 The backend derives the destination rank from the raw expert id (MoRI:
 `destExpert / numExpertPerRank`), so a shared expert pinned on every rank costs
@@ -11,8 +11,10 @@ each rank a slot and pushes the routed ids out of alignment:
     routed physical p -> p + num_fused_shared_experts * (p // routed_per_rank)
     this rank's shared ->  r*S + routed_per_rank
 
-Only for SharedExpertMode.LOCAL_REPLICA; under EPLB the shared expert is an
-ordinary routed logical expert and placement handles it.
+The dispatch remap is only for SharedExpertMode.LOCAL_REPLICA; under EPLB the
+shared expert is an ordinary routed logical expert and placement handles it.
+Gathered LEGACY_AITER rows instead copy their destination rank's shared IDs,
+keeping padding invalid.
 """
 
 import torch
@@ -66,6 +68,35 @@ def _remap_torch(
 if _HAS_TRITON:
 
     @triton.jit
+    def _copy_shared_ids_kernel(
+        ids_ptr,
+        template_ptr,
+        n_out,
+        IDS_ROW_STRIDE: tl.constexpr,
+        IDS_COL_STRIDE: tl.constexpr,
+        TEMPLATE_ROW_STRIDE: tl.constexpr,
+        TEMPLATE_COL_STRIDE: tl.constexpr,
+        TOP_K: tl.constexpr,
+        NUM_SHARED: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n_out
+        row, col = offs // NUM_SHARED, offs % NUM_SHARED
+        # Same padding convention as topk_padding_mask: the first routed ID.
+        routed = tl.load(ids_ptr + row * IDS_ROW_STRIDE, mask=mask, other=-1)
+        shared = tl.load(
+            template_ptr + row * TEMPLATE_ROW_STRIDE + col * TEMPLATE_COL_STRIDE,
+            mask=mask,
+            other=-1,
+        )
+        tl.store(
+            ids_ptr + row * IDS_ROW_STRIDE + (TOP_K + col) * IDS_COL_STRIDE,
+            tl.where(routed < 0, -1, shared),
+            mask=mask,
+        )
+
+    @triton.jit
     def _remap_kernel(
         topk_ids_ptr,  # [ntok, topk]      routed physical ids
         topk_w_ptr,  # [ntok, topk]      routed weights
@@ -107,6 +138,38 @@ if _HAS_TRITON:
         w = tl.load(topk_w_ptr + in_off, mask=rmask, other=0.0)
         sw = tl.where(pad, 0.0, shared_weight)
         tl.store(out_w_ptr + offs, tl.where(is_routed, w, sw), mask=mask)
+
+
+def copy_shared_expert_ids_(
+    topk_ids: torch.Tensor, shared_template: torch.Tensor, top_k: int
+) -> None:
+    """Copy shared IDs in place, preserving invalid routed rows.
+
+    One GPU launch, with no temporary mask/output tensor. The template is
+    read-only, including across a real -> idle -> real graph replay.
+    """
+    rows, width = topk_ids.shape
+    num_shared = width - top_k
+    assert shared_template.shape == (rows, num_shared)
+    n_out = rows * num_shared
+    if n_out == 0:
+        return
+    if not _HAS_TRITON or not topk_ids.is_cuda:
+        shared_ids = topk_ids[:, top_k:]
+        shared_ids.copy_(shared_template)
+        shared_ids.masked_fill_(topk_padding_mask(topk_ids), -1)
+        return
+
+    _copy_shared_ids_kernel[(triton.cdiv(n_out, 256),)](
+        topk_ids,
+        shared_template,
+        n_out,
+        *topk_ids.stride(),
+        *shared_template.stride(),
+        top_k,
+        num_shared,
+        BLOCK=256,
+    )
 
 
 def remap_topk_to_dispatch(
