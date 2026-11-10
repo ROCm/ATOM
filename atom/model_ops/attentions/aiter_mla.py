@@ -79,6 +79,7 @@ from atom.model_ops.indexer import (
 from atom.model_ops.indexer.schedule import any_layer_skips_index_topk
 from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace
 from atom.model_ops.sparse_indexer_fp4 import (
+    fp4_cache_layout,
     fp4_index_scale_rows,
     sparse_indexer_fp4_enabled,
 )
@@ -1884,11 +1885,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # MLA's latent projection is replicated across TP. Sparse MLA's
             # index-key projection/cache is replicated as well; only the query
             # heads and absorbed KV-B/output projections are TP-sharded.
-            # Consequently every PAGE byte published above is identical on
-            # every TP worker (DCP/PCP are separate axes and are rejected by
-            # the current LMCache MP connector).
-            tp_replication_factor=int(
-                getattr(runner.config, "tensor_parallel_size", 1) or 1
+            # DCP shards the token axis, so its PAGE bytes must stay per rank.
+            tp_replication_factor=(
+                1
+                if int(getattr(runner.config, "decode_context_parallel_size", 1) or 1)
+                > 1
+                else int(getattr(runner.config, "tensor_parallel_size", 1) or 1)
             ),
         )
 
@@ -2830,6 +2832,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             heads=self.index_n_heads,
             page_size=self.model_runner.block_size,
             storage=self._fp4_launches[ubatch],
+            layout=fp4_cache_layout(),
         )
 
     def _mtp_index_rows(
@@ -2958,6 +2961,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             heads=self.index_n_heads,
             page_size=self.model_runner.block_size,
             split=split,
+            layout=fp4_cache_layout(),
         )
 
     @staticmethod

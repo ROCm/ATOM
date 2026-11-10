@@ -151,6 +151,58 @@ class TestPageUnitAddressesAreArithmetic:
         assert stub._page_unit_regions() is not first
 
 
+@pytest.mark.parametrize("fp4", [False, True])
+def test_sparse_page_units_include_every_index_plane(fp4, monkeypatch):
+    from atom.model_ops.attentions.mla_kv_pool import MlaKvPool
+
+    monkeypatch.setenv("ATOM_DSA_FP4_OPUS", "1")
+    pool = MlaKvPool(
+        layers=3,
+        block_size=64,
+        entry_dim=576,
+        kv_dtype=torch.uint8,
+        index_layers=2,
+        index_rows_per_block=64,
+        index_dim=144,
+        index_dtype=torch.uint8,
+        index_head_dim=128,
+        index_fp4=fp4,
+    )
+    pool.allocate(5, "cpu")
+
+    class Geometry(PageUnitGeometryMixin):
+        def _page_unit_index_cache(self):
+            return tuple(pool.index.view(field.name) for field in pool.index.fields)
+
+    geometry = Geometry()
+    geometry.kv_pool = pool
+    spec = SimpleNamespace(page_unit_bytes=pool.entry_bytes)
+    geometry.model_runner = SimpleNamespace(
+        block_size=64, state_runtime=SimpleNamespace(checkpoint_spec=spec)
+    )
+    units = [3, 1]
+    regions = pool.region_tensors()
+    sizes = geometry._page_unit_stream_sizes(len(units))
+    views = geometry.page_unit_views(units)
+    expected = [tensor[unit] for unit in units for _, tensor in regions]
+    assert sizes.sum() == len(units) * pool.entry_bytes
+    assert [view.data_ptr() for view in views] == [view.data_ptr() for view in expected]
+    assert [view.numel() * view.element_size() for view in views] == sizes.tolist()
+    assert geometry._page_unit_bases([units])[0].tolist() == [
+        view.data_ptr() for view in expected
+    ]
+    cached = geometry._page_unit_regions()
+    assert geometry._page_unit_regions() is cached
+    pool.allocate(4, "cpu")
+    assert geometry._page_unit_regions() is not cached
+    # End inside the final index plane, including a partial scale plane in FP4.
+    spec.image_bytes = pool.entry_bytes - 7
+    assert (
+        sum(v.numel() * v.element_size() for v in geometry.page_unit_views([2]))
+        == spec.image_bytes
+    )
+
+
 class TestPageUnitViewsNameTheSameBytes:
     """`page_unit_views` is the CPU tier's seam onto the PAGE units.
 

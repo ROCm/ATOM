@@ -2955,6 +2955,13 @@ class Config:
             for a in arches
         )
         if not (is_v4 or is_v41):
+            hf = getattr(self.hf_config, "text_config", self.hf_config)
+            if getattr(hf, "index_topk", None):
+                from atom.model_ops.sparse_indexer_fp4 import fp4_cache_layout
+
+                # DSA OPUS and legacy FP4 have equal byte widths but different
+                # permutations. Keep their prefix/offload namespaces apart.
+                self.index_cache_layout = fp4_cache_layout()
             return
         from aiter.jit.utils.chip_info import get_gfx_runtime
 

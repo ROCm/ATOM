@@ -168,9 +168,45 @@ def test_v41_candidate_band_forwards_packed_offsets(monkeypatch):
     assert seen["args"][4] is weights
 
 
+@pytest.mark.parametrize("page_size,pages_per_block", [(64, 1), (128, 1), (128, 2)])
+def test_mfma_blocks_preserve_their_rows_in_opus_config(
+    monkeypatch, page_size, pages_per_block
+):
+    seen = {}
+
+    def config(device, **bounds):
+        seen.update(bounds)
+        return SimpleNamespace(block_table_width=1)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.ops.opus.pa_mqa_logits_mxfp4",
+        SimpleNamespace(mqa_logits_mxfp4_config=config, mqa_logits_mxfp4_schedule=None),
+    )
+    table = torch.tensor([[3]], dtype=torch.int32)
+    sequences = rows_module.Fp4MqaRaggedMetadata(
+        torch.tensor([0, 1], dtype=torch.int32), 1, table, pages_per_block
+    )
+    rows = rows_module.fp4_rows(
+        torch.tensor([1], dtype=torch.int32),
+        page_size * pages_per_block,
+        None,
+        sequences,
+        heads=32,
+        page_size=page_size,
+        layout=rows_module.MFMA,
+    )
+    assert seen["page_size"] == min(page_size, 64)
+    assert seen["page_size"] * seen["pages_per_block"] == page_size * pages_per_block
+    assert rows.fp4_bands[0]["block_tables"] is table
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
-@pytest.mark.parametrize("qlen", [1, 4, 6, 8, 9])
-def test_gfx950_query_layout_logits_and_graph_replay(qlen):
+@pytest.mark.parametrize(
+    "qlen,heads,page_size",
+    [(qlen, 64, 64) for qlen in (1, 4, 6, 8, 9)] + [(6, 32, 64), (6, 32, 128)],
+)
+def test_gfx950_query_layout_logits_and_graph_replay(qlen, heads, page_size):
     from aiter.jit.utils.chip_info import get_gfx
 
     from atom.model_ops.indexer.query import quantize_query
@@ -180,7 +216,7 @@ def test_gfx950_query_layout_logits_and_graph_replay(qlen):
         pytest.skip("gfx950 OPUS layout")
     torch.manual_seed(901)
     dev, count = "cuda", 2 * qlen + 1
-    q = torch.randn(count, 64, 128, device=dev).bfloat16()
+    q = torch.randn(count, heads, 128, device=dev).bfloat16()
     angles = torch.randn(count, 32)
     cos, sin = angles.cos().bfloat16().to(dev), angles.sin().bfloat16().to(dev)
     positions = torch.arange(count, device=dev)
@@ -193,32 +229,37 @@ def test_gfx950_query_layout_logits_and_graph_replay(qlen):
     torch.testing.assert_close(query[0], natural[0], rtol=0, atol=0)
 
     def permute_scales(scale):
+        n, h = scale.shape[:2]
         return (
-            scale.reshape(-1, 2, 32, 2, 2)
+            scale.reshape(n, h // 32, 32, 2, 2)
             .permute(0, 4, 2, 3, 1)
-            .reshape(-1, 2, 32, 4)
+            .reshape(n, 2, 32, h // 16)
             .contiguous()
         )
 
     torch.testing.assert_close(
-        query[1].squeeze(1), permute_scales(natural[1]), rtol=0, atol=0
+        query[1].squeeze(1), permute_scales(natural[1].squeeze(1)), rtol=0, atol=0
     )
     kv = torch.randint(0, 256, (4, 64, 64), dtype=torch.uint8, device=dev)
     ks = torch.randint(122, 129, (4, 64, 4), dtype=torch.uint8, device=dev)
     cache = rows_module.IndexCache(
         kv.reshape(4, 64, 4, 16).permute(0, 2, 1, 3).contiguous(),
         permute_scales(ks),
-        64,
+        page_size,
         rows_module.MFMA,
     )
-    table = torch.tensor([[2, 0], [3, 1]], dtype=torch.int32, device=dev)
+    table = torch.tensor(
+        [[2, 0], [3, 1]] if page_size == 64 else [[1], [0]],
+        dtype=torch.int32,
+        device=dev,
+    )
     starts = torch.tensor([0, qlen, 2 * qlen], dtype=torch.int32, device=dev)
     ends = torch.tensor(
         [*range(65 - qlen, 65), *range(129 - qlen, 129), 0],
         dtype=torch.int32,
         device=dev,
     )
-    weights = torch.randn(count, 64, dtype=torch.bfloat16, device=dev)
+    weights = torch.randn(count, heads, dtype=torch.bfloat16, device=dev)
     storage = rows_module.Fp4LaunchStorage(dev, count, 2)
     logits = torch.full((count, 128), float("nan"), device=dev)
     selected = torch.empty(count, 16, dtype=torch.int32, device=dev)
@@ -230,8 +271,8 @@ def test_gfx950_query_layout_logits_and_graph_replay(qlen):
             128,
             None,
             sequences,
-            heads=64,
-            page_size=64,
+            heads=heads,
+            page_size=page_size,
             layout=rows_module.MFMA,
             is_decode=True,
             storage=storage,
@@ -263,7 +304,7 @@ def test_gfx950_query_layout_logits_and_graph_replay(qlen):
         )
 
     qd = dequant(natural[0].squeeze(1), natural[1].squeeze(1))
-    kd = dequant(kv, ks)[table.long()].reshape(2, 128, 128)
+    kd = dequant(kv, ks).reshape(-1, page_size, 128)[table.long()].reshape(2, 128, 128)
     owners = torch.tensor([0] * qlen + [1] * (qlen + 1), device=dev)
     expected = (
         torch.einsum("rhd,rkd->rhk", qd, kd[owners]).relu()

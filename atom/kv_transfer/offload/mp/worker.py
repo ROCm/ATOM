@@ -41,6 +41,7 @@ from atom.kv_transfer.offload.chunked_scheduler import (
 )
 from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata, LMCacheReqMeta
 from atom.kv_transfer.offload.mp.deployment import (
+    _logical_block_size,
     _make_worker_adapter,
     _mp_session_id,
     _published_tp_replication_factor,
@@ -120,11 +121,7 @@ class LMCacheMPConnector(KVConnectorBase):
         self.kv_role = validated_kv_role(kvc)
         self._do_save = self.kv_role in ("offload", "kv_both", "kv_producer")
         self._do_load = self.kv_role in ("offload", "kv_both", "kv_consumer")
-        self.block_size = offcfg._strict_integer(
-            "LMCache MP block size",
-            config.kv_cache_block_size,
-            minimum=1,
-        )
+        self.block_size = _logical_block_size(config)
         self.chunk_size: int | None = None
         # Set only when the backend publishes PAGE-backed checkpoint images
         # (`_register_native_state_layout`); every transfer then carries one.

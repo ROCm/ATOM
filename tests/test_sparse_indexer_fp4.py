@@ -75,6 +75,20 @@ def _pool(**overrides):
     return MlaKvPool(**args)
 
 
+def test_index_cache_scale_exists_before_pool_allocation():
+    model = _import_or_skip("atom.models.deepseek_v2")
+    cache = model.DeepseekV32IndexerCache(
+        head_dim=132, dtype=torch.uint8, prefix="indexer.k_cache", cache_config="fp8"
+    )
+    # OPUS passes the scale plane to its custom op even in the dummy forward.
+    assert cache.kv_cache_scale.dtype == torch.uint8
+    assert cache.kv_cache_scale.numel() == 0
+    assert cache.kv_cache[0].numel() == 0
+    allocated = torch.empty((2, 4, 64), dtype=torch.uint8)
+    cache.kv_cache_scale = allocated
+    assert cache.kv_cache_scale is allocated
+
+
 def test_predicate_is_structural_and_never_probes_the_chip_for_fp8(monkeypatch):
     monkeypatch.setattr(sparse_indexer_fp4, "_gfx", lambda: "gfx950")
     assert sparse_indexer_fp4_enabled("fp4", DSA)

@@ -578,6 +578,53 @@ def test_build_kv_cache_tensor_publishes_both_fp4_index_planes():
     assert cache_tensor.index_scale.identity == ("index_scale", 1)
 
 
+@pytest.mark.parametrize("fp4", [False, True])
+def test_kimi_builder_binds_packed_index_planes(fp4, monkeypatch):
+    from atom.model_ops.attentions.kimi_mla_gdn_attn import (
+        KimiAiterMLAGDNMetadataBuilder,
+    )
+    from atom.model_ops.attentions.mla_kv_pool import MlaKvPool
+
+    monkeypatch.setenv("ATOM_DSA_FP4_OPUS", "1")
+    module = _MlaLayer(
+        layer_num=5,
+        indexer=SimpleNamespace(
+            k_cache=SimpleNamespace(kv_cache=[None]), _indexer_fp4=fp4
+        ),
+    )
+    base = _bind_builder(module, {3: 0, 5: 1}, rows_before=2)
+    builder = object.__new__(KimiAiterMLAGDNMetadataBuilder)
+    builder.model_runner = base.model_runner
+    builder.invalidate_pool_rows()
+    builder._indexer_fp4 = fp4
+    builder.kv_pool = MlaKvPool(
+        layers=3,
+        block_size=64,
+        entry_dim=576,
+        kv_dtype=torch.uint8,
+        index_layers=2,
+        index_rows_per_block=64,
+        index_dim=144,
+        index_dtype=torch.uint8,
+        index_head_dim=128,
+        index_fp4=fp4,
+    )
+    builder.kv_pool.allocate(3, "cpu")
+    cache = builder.build_kv_cache_tensor(module)
+    keys = builder.kv_pool.layer("index", 1)
+    assert cache.index_cache.data_ptr() == keys.data_ptr()
+    assert module.indexer.k_cache.kv_cache[0].data_ptr() == keys.data_ptr()
+    assert len(builder._page_unit_index_cache()) == (2 if fp4 else 1)
+    if fp4:
+        assert module.indexer.k_cache.kv_cache[0].shape == keys.shape
+        scale = builder.kv_pool.layer("index_scale", 1)
+        assert cache.index_scale.data_ptr() == scale.data_ptr()
+        assert module.indexer.k_cache.kv_cache_scale.data_ptr() == scale.data_ptr()
+    else:
+        assert module.indexer.k_cache.kv_cache[0].shape == (3 * 64, 1, 144)
+        assert cache.index_scale is None
+
+
 def test_build_shared_layer_keeps_main_kv_without_index_slice():
     module = _MlaLayer(
         layer_num=1,
