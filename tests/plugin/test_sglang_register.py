@@ -9,6 +9,7 @@ under test.
 """
 
 import importlib
+import os
 import sys
 from types import ModuleType
 from unittest.mock import MagicMock, patch
@@ -409,3 +410,43 @@ def test_sglang_plugin_registration_does_not_require_kimi_k3_pool_modules():
 
     register_processor.assert_called_once_with()
     apply_load_config_patch.assert_called_once_with()
+
+
+# ---------------------------------------------------------------------------
+# _sglang_draft_extend_capture_disabled — the Qwen3.8 drafter's draft-extend
+# CUDA graph stays plugin-built (SGLang >= 0.5.22 would capture its own, which
+# the plugin then dropped, leaving draft extend eager on every decode step).
+# ---------------------------------------------------------------------------
+
+_DRAFT_EXTEND_ENV = "SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH"
+
+
+def test_draft_extend_capture_disabled_during_init_then_unset(monkeypatch):
+    from atom.plugin import register
+
+    monkeypatch.delenv(_DRAFT_EXTEND_ENV, raising=False)
+    with register._sglang_draft_extend_capture_disabled(True):
+        assert os.environ[_DRAFT_EXTEND_ENV] == "1"
+    assert _DRAFT_EXTEND_ENV not in os.environ
+
+
+def test_draft_extend_capture_restores_user_value(monkeypatch):
+    from atom.plugin import register
+
+    monkeypatch.setenv(_DRAFT_EXTEND_ENV, "0")
+    with (
+        pytest.raises(RuntimeError),
+        register._sglang_draft_extend_capture_disabled(True),
+    ):
+        assert os.environ[_DRAFT_EXTEND_ENV] == "1"
+        raise RuntimeError("graph init failed")
+    assert os.environ[_DRAFT_EXTEND_ENV] == "0"
+
+
+def test_draft_extend_capture_untouched_for_other_drafters(monkeypatch):
+    from atom.plugin import register
+
+    monkeypatch.delenv(_DRAFT_EXTEND_ENV, raising=False)
+    with register._sglang_draft_extend_capture_disabled(False):
+        assert _DRAFT_EXTEND_ENV not in os.environ
+    assert _DRAFT_EXTEND_ENV not in os.environ
