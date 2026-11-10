@@ -487,12 +487,14 @@ class DSparkProposer(Drafter):
         if bound.dtype != from_config:
             layer_num = self.model.first_attention_layer_num
             logger.warning(
-                "DSpark draft layer_%d is bound to a %s KV cache, but "
-                "--kv_cache_dtype=%s implies %s. Using the bound tensor's dtype "
-                "for q_out so the fused write agrees -- but the two should not "
-                "be able to differ, since the draft binds into the pool the "
-                "engine allocated from that same flag. Check that layer_%d "
-                "resolved to a draft row and not to a target layer.",
+                "DSpark draft layer_%d is bound to a %s KV cache, but the draft's "
+                "KV dtype (speculative_config.kv_cache_dtype: the target's "
+                "--kv-cache-dtype, or --spec-decode-kv-cache-dtype for a draft with "
+                "a pool of its own, resolved once by Config) is %s, implying %s. "
+                "Using the bound tensor's dtype for q_out so the fused write agrees "
+                "-- but the pool the draft binds into is allocated at that same "
+                "resolved dtype, so the two should not be able to differ. Check that "
+                "layer_%d resolved to a draft row and not to a target layer.",
                 layer_num,
                 bound.dtype,
                 kv_cache_dtype,
