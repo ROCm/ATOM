@@ -159,8 +159,17 @@ def test_share_cache_accepts_a_pd_multi_connector_with_a_shared_tier():
     from atom.model_engine.engine_core_mgr import CoreManager
 
     pd = {"kv_connector": "mooncake", "kv_role": "kv_producer"}
-    store = {"kv_connector": "mooncake_store", "kv_role": "offload"}
-    mgr = SimpleNamespace(_dp_session_affinity_enabled=False, _dp_lb_req_equiv=512)
+    store = {
+        "kv_connector": "mooncake_store",
+        "kv_role": "offload",
+        "kv_connector_extra_config": {
+            "mooncake_store.master": "127.0.0.1:1",
+            "mooncake_store.metadata": "http://127.0.0.1:2/metadata",
+        },
+    }
+    mgr = SimpleNamespace(
+        _dp_session_affinity_enabled=False, _dp_lb_req_equiv=512, global_engine_count=2
+    )
     cfg = SimpleNamespace(
         enable_prefix_caching=True,
         kv_transfer_config={"kv_connector": "multi", "connectors": [pd, store]},
