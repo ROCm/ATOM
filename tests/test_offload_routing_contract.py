@@ -58,3 +58,27 @@ def test_lmcache_env_integer_default_and_invalid_input(monkeypatch):
     monkeypatch.setenv("LMCACHE_CHUNK_SIZE", "512.5")
     with pytest.raises(ValueError, match="LMCACHE_CHUNK_SIZE"):
         offcfg.lmcache_chunk_tokens({})
+
+
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("environment", [None, "", "1024", "bad", "0", "512.5"])
+def test_lmcache_explicit_chunk_overrides_environment(
+    monkeypatch, nested, environment
+):
+    if environment is None:
+        monkeypatch.delenv("LMCACHE_CHUNK_SIZE", raising=False)
+    else:
+        monkeypatch.setenv("LMCACHE_CHUNK_SIZE", environment)
+    extras = {"lmcache.chunk_size": "512"}
+    config = {"kv_connector_extra_config": extras} if nested else extras
+    assert offcfg.lmcache_chunk_tokens(config) == 512
+
+
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("value", [None, True, "bad", "512.5", 0])
+def test_lmcache_invalid_override_does_not_fall_back(monkeypatch, nested, value):
+    monkeypatch.setenv("LMCACHE_CHUNK_SIZE", "1024")
+    extras = {"lmcache.chunk_size": value}
+    config = {"kv_connector_extra_config": extras} if nested else extras
+    with pytest.raises(ValueError, match="lmcache.chunk_size"):
+        offcfg.lmcache_chunk_tokens(config)

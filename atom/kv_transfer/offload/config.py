@@ -678,11 +678,12 @@ def lmcache_chunk_tokens(kv_transfer_config: Mapping[str, Any] | None) -> int:
     ``lmcache.chunk_size`` extra, else ``LMCACHE_CHUNK_SIZE`` (`envs`), else
     LMCache's default 256. Needs no LMCache import, so DP routing can read it
     at startup."""
-    return connector_integer(
-        connector_extras(kv_transfer_config),
-        "lmcache.chunk_size",
-        envs.LMCACHE_CHUNK_SIZE,
-    )
+    extra = connector_extras(kv_transfer_config)
+    # Python evaluates function arguments eagerly. An explicit override must
+    # not read (or validate) the lower-priority environment fallback.
+    if "lmcache.chunk_size" in extra:
+        return connector_integer(extra, "lmcache.chunk_size", 256)
+    return connector_integer(extra, "lmcache.chunk_size", envs.LMCACHE_CHUNK_SIZE)
 
 
 def apply_extra_overrides(cfg, kv_transfer_config: dict[str, Any] | None) -> None:
