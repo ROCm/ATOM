@@ -49,7 +49,11 @@ def test_only_fp4_is_refused_for_other_attention_families(
 def test_csa2_keeps_model_specific_fp4_handling(model_type, arch):
     config = SimpleNamespace(
         kv_cache_dtype="fp4",
-        hf_config=SimpleNamespace(model_type=model_type, architectures=[arch]),
+        hf_config=SimpleNamespace(
+            model_type=model_type, architectures=[arch], num_attention_heads=64
+        ),
+        tensor_parallel_size=4,
+        enable_dp_attention=False,
     )
     Config._check_kv_cache_dtype(config)
 

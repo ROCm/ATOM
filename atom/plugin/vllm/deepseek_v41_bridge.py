@@ -172,23 +172,33 @@ def _build_v41_pool_geometry(
 def v41_kv_cache_dtype(vllm_config) -> str:
     """Map vLLM's ``--kv-cache-dtype`` onto ATOM's V4.1 pool dtype.
 
-    V4.1's pool is either unpacked bf16 or the packed fp4 layout; there is no
-    fp8 variant, so the fp8 spellings are refused rather than silently
-    downgraded -- the choice changes ``paged_bytes`` and therefore the proxy
-    layer's ``head_size``, and a mismatch between the sizing vLLM allocated
-    with and the geometry the kernels read would corrupt the pool.
+    Proxy sizing, runtime cache binding and KV transport use this spelling
+    normalization. Explicit NVFP4 remains FP4 on every supported head count.
+    FP8 denotes ATOM's MXFP8 source planes, not a vLLM FP8 page layout.
     """
+    resolved = getattr(vllm_config, "_atom_v41_kv_cache_dtype", None)
+    if resolved is not None:
+        return resolved
     cache_config = getattr(vllm_config, "cache_config", None)
     cache_dtype = getattr(cache_config, "cache_dtype", None) if cache_config else None
     dtype = str(cache_dtype or "auto")
     if dtype == "nvfp4":
-        return "fp4"
-    if dtype in ("auto", "bfloat16", "float16"):
-        return "bf16"
-    raise ValueError(
-        f"DeepSeek-V4.1 on the vLLM plugin supports --kv-cache-dtype auto/"
-        f"bfloat16/nvfp4 (nvfp4 selects ATOM's packed fp4 pool); got {dtype!r}"
-    )
+        resolved = "fp4"
+    elif dtype in ("fp8", "fp8_e4m3"):
+        resolved = "fp8"
+    elif dtype in ("auto", "bfloat16", "float16"):
+        resolved = "bf16"
+    else:
+        raise ValueError(
+            "DeepSeek-V4.1 on the vLLM plugin supports --kv-cache-dtype "
+            "auto/bfloat16/float16/fp8/fp8_e4m3/nvfp4; "
+            f"got {dtype!r}"
+        )
+    try:
+        vllm_config._atom_v41_kv_cache_dtype = resolved
+    except AttributeError:  # pragma: no cover - frozen config
+        pass
+    return resolved
 
 
 def v41_speculative_tokens(vllm_config) -> int:

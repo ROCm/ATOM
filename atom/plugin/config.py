@@ -461,10 +461,9 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
 
     vllm_enable_dbo = getattr(vllm_parallel_config, "enable_dbo", False)
 
-    # DeepSeek-V4.1's pool is either unpacked bf16 or ATOM's packed fp4; it has
-    # no fp8 variant and no "auto". The chosen dtype fixes the proxy layer's
-    # page size, so it has to be resolved here -- before Config.__post_init__
-    # runs the V4.1 runtime gate on it -- rather than left as vLLM's spelling.
+    # Normalize V4.1's BF16/FP8/FP4 pool dtype before Config admission.
+    # Proxy sizing and KV transport use the same spelling normalization;
+    # explicit FP4 remains FP4 on all supported head counts.
     kv_cache_dtype = vllm_cache_config.cache_dtype
     kv_transfer_config = _vllm_kv_transfer_config(config)
     from atom.plugin.vllm.deepseek_v41_bridge import (

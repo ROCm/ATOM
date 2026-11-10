@@ -2969,7 +2969,7 @@ class Config:
             self.state_replay_tokens = state_replay_tokens(self)
 
     def _check_kv_cache_dtype(self) -> None:
-        """FP4 KV requires the CSA2 cache's model-specific data/scale layout."""
+        """Validate FP4 support and report performance guidance before sizing."""
         if self.kv_cache_dtype != "fp4":
             return
         from atom.utils.selector import Family, attn_family
@@ -2979,6 +2979,14 @@ class Config:
                 "--kv_cache_dtype=fp4 is only supported by the DeepSeek-V4.1 "
                 "(CSA2) attention backend; use bf16 or fp8 for this model."
             )
+        from atom.models.deepseek_v41.kv_cache_policy import warn_fp4_performance
+
+        warn_fp4_performance(
+            num_heads=self.hf_config.num_attention_heads,
+            attention_tp_size=(
+                1 if self.enable_dp_attention else self.tensor_parallel_size
+            ),
+        )
 
     def _resolve_index_cache_layout(self) -> None:
         self.index_cache_layout = None

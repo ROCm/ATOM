@@ -39,11 +39,13 @@ def nvfp4(planes):
     return values * scale.view(torch.float8_e4m3fn).float().repeat_interleave(16, -1)
 
 
-def make_case(heads, decode, ratio=2):
+def make_case(heads, decode, ratio=2, *, cache_dtype="fp4"):
     if not torch.cuda.is_available():
         pytest.skip("GPU required")
-    backend = select_a8w4_backend(heads, 512, 512**-0.5)
-    if backend is None:
+    backend = (
+        select_a8w4_backend(heads, 512, 512**-0.5) if cache_dtype == "fp4" else None
+    )
+    if cache_dtype == "fp4" and backend is None:
         pytest.skip("This AITER/device combination has no A8W4 backend")
     torch.manual_seed(7407 + heads + ratio)
     geo = V41PoolGeometry(
@@ -53,7 +55,7 @@ def make_case(heads, decode, ratio=2):
         8,
         512,
         128,
-        kv_dtype="fp4",
+        kv_dtype=cache_dtype,
         speculative_tokens=3,
         layer_ratios=(0, 2),
         index_topk=4,
@@ -61,7 +63,9 @@ def make_case(heads, decode, ratio=2):
     cache = PagedAttentionCache(geo, 7, 4, "cuda", max_tokens=4)
     data, scale = cache.main_view(0)
     raw = torch.randn(data.shape[0], 512, device="cuda", dtype=torch.bfloat16)
-    packed, scales = quantize_fp4(raw, **MAIN_FP4)
+    packed, scales = (
+        quantize_fp4(raw, **MAIN_FP4) if cache_dtype == "fp4" else quantize_fp8(raw)
+    )
     data.copy_(packed.view(torch.uint8))
     scale.copy_(scales.view(torch.uint8))
     data, scale = cache.ring_view(0)
@@ -141,7 +145,11 @@ def run_case(case, splits=None):
 
 def reference(case, inputs):
     query, main, source, (pi, pp, wi, wp) = inputs
-    q, csa, swa = mxfp8(query), nvfp4(main), mxfp8(source)
+    q, csa, swa = (
+        mxfp8(query),
+        nvfp4(main) if case.cache.packed else mxfp8(main),
+        mxfp8(source),
+    )
     pp, wp = pp.tolist(), wp.tolist()
     out = torch.zeros_like(q)
     for row in range(q.shape[0]):
@@ -184,6 +192,108 @@ def test_a8w4_graph_replay_changes_live_rows(decode):
         )
         case.step.cu_seqlens_q[-1] = active * 2
         case.step.slots[-1] = 0 if active == 2 else -1
+        graph.replay()
+        torch.testing.assert_close(
+            output, reference(case, inputs), rtol=0.03, atol=0.02
+        )
+
+
+@pytest.mark.parametrize("heads", [64, 128])
+@pytest.mark.parametrize("decode", [False, True])
+@pytest.mark.parametrize("cache_dtype", ["fp4", "fp8"])
+@torch.inference_mode()
+def test_gfx950_preserves_requested_cache_and_attention(
+    heads, decode, cache_dtype, monkeypatch
+):
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    from atom.config import Config
+    from atom.models.deepseek_v41 import attention as model_attention
+    from atom.models.deepseek_v41.attention import Attention
+    from atom.utils import forward_context
+
+    if not torch.cuda.is_available() or get_gfx_runtime() != "gfx950":
+        pytest.skip("This regression exercises gfx950 OPUS attention")
+    monkeypatch.setenv("ATOM_DSV41_A8W4_ATTN", "auto")
+    cfg = SimpleNamespace(
+        kv_cache_dtype=cache_dtype,
+        hf_config=SimpleNamespace(
+            model_type="deepseek_v41_text", num_attention_heads=heads
+        ),
+        tensor_parallel_size=4,
+        enable_dp_attention=True,
+    )
+    Config._check_kv_cache_dtype(cfg)
+    assert cfg.kv_cache_dtype == cache_dtype
+    case = make_case(heads, decode, cache_dtype=cfg.kv_cache_dtype)
+    cache, step = case.cache, case.step
+    packed = cache_dtype == "fp4"
+    assert cache.packed == packed
+    assert cache.kv_fp8 == (not packed)
+    owner = SimpleNamespace(
+        spec=case.spec,
+        attn_sink=case.sink,
+        softmax_scale=512**-0.5,
+        _a8w4_backend=select_a8w4_backend(heads, 512, 512**-0.5),
+    )
+    owner._a8w4_attention_backend = (
+        lambda query, cache: Attention._a8w4_attention_backend(owner, query, cache)
+    )
+    monkeypatch.setattr(
+        forward_context,
+        "_forward_context",
+        SimpleNamespace(
+            in_hipgraph=False,
+            main_stream=torch.cuda.current_stream(),
+            attn_metadata=SimpleNamespace(cache=cache, step=step, queries=None),
+        ),
+    )
+    calls = []
+    name = "sparse_attn_v41_a8w4_paged_2src" if packed else "sparse_attn_v41_paged_2src"
+    attention = getattr(model_attention, name)
+
+    def attend(*args, **kwargs):
+        calls.append(True)
+        return attention(*args, **kwargs)
+
+    monkeypatch.setattr(model_attention, name, attend)
+    other = (
+        "sparse_attn_v41_paged_2src" if packed else "sparse_attn_v41_a8w4_paged_2src"
+    )
+    for name in (other, "packed_prefill", "packed_decode"):
+        monkeypatch.setattr(
+            model_attention,
+            name,
+            lambda *a, **kw: pytest.fail("attention does not match requested KV dtype"),
+        )
+
+    def run():
+        step.begin_forward()
+        step.selected[0] = case.selected
+        prepared = Attention._attention_inputs(
+            owner, case.query, case.kv, cache, step, case.rope, None
+        )
+        assert prepared[0] == ("opus" if packed else None)
+        assert prepared[1] is not None
+        output = Attention._attend(owner, case.query, cache, step, None, prepared)
+        source = cache.ring_view(0) if decode else prepared[2]
+        inputs = (
+            tuple(part.flatten(0, 1) for part in prepared[1]),
+            cache.main_view(0),
+            source,
+            cache.attention_indices(case.spec, step, a8w4=packed),
+        )
+        return output, inputs
+
+    output, inputs = run()
+    torch.testing.assert_close(output, reference(case, inputs), rtol=0.03, atol=0.02)
+    assert calls
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output, inputs = run()
+    for _ in range(2):
+        case.query.normal_()
+        case.kv.normal_()
         graph.replay()
         torch.testing.assert_close(
             output, reference(case, inputs), rtol=0.03, atol=0.02

@@ -111,15 +111,16 @@ class TestKVCacheDtype:
     def test_unquantized_spellings_select_the_bf16_pool(self, spelling):
         assert v41_kv_cache_dtype(_vllm_config(cache_dtype=spelling)) == "bf16"
 
-    def test_nvfp4_selects_the_packed_pool(self):
+    def test_nvfp4_keeps_the_packed_pool(self):
         assert v41_kv_cache_dtype(_vllm_config(cache_dtype="nvfp4")) == "fp4"
 
-    @pytest.mark.parametrize("spelling", ["fp8", "fp8_e4m3", "fp8_e5m2"])
-    def test_fp8_is_refused_rather_than_downgraded(self, spelling):
-        # V4.1 has no fp8 pool. Silently serving bf16 instead would size the
-        # proxy layer for one geometry and address another.
+    @pytest.mark.parametrize("spelling", ["fp8", "fp8_e4m3"])
+    def test_fp8_selects_the_mxfp8_pool(self, spelling):
+        assert v41_kv_cache_dtype(_vllm_config(cache_dtype=spelling)) == "fp8"
+
+    def test_e5m2_is_refused(self):
         with pytest.raises(ValueError, match="kv-cache-dtype"):
-            v41_kv_cache_dtype(_vllm_config(cache_dtype=spelling))
+            v41_kv_cache_dtype(_vllm_config(cache_dtype="fp8_e5m2"))
 
 
 class TestProxyBlockSizing:
