@@ -62,9 +62,7 @@ def test_lmcache_env_integer_default_and_invalid_input(monkeypatch):
 
 @pytest.mark.parametrize("nested", [False, True])
 @pytest.mark.parametrize("environment", [None, "", "1024", "bad", "0", "512.5"])
-def test_lmcache_explicit_chunk_overrides_environment(
-    monkeypatch, nested, environment
-):
+def test_lmcache_explicit_chunk_overrides_environment(monkeypatch, nested, environment):
     if environment is None:
         monkeypatch.delenv("LMCACHE_CHUNK_SIZE", raising=False)
     else:
