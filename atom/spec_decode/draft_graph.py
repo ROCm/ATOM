@@ -38,10 +38,12 @@ def _owned(value: Any, staged: tuple[torch.Tensor, ...] = ()) -> Any:
 
 @dataclass(frozen=True)
 class StagedInput:
-    """One staged input's type: everything but the leading batch axis."""
+    """One staged input's type: everything but the batch axis, which sits at
+    ``batch_dim`` (``1`` for MRoPE positions, ``[3, N]``)."""
 
     shape: tuple[int, ...] = ()
     dtype: torch.dtype = torch.int32
+    batch_dim: int = 0
 
 
 @dataclass
@@ -113,7 +115,11 @@ class DraftGraph:
         )
         self._buffers = {
             role: torch.zeros(
-                (config.max_num_seqs, *staged.shape),
+                (
+                    *staged.shape[: staged.batch_dim],
+                    config.max_num_seqs,
+                    *staged.shape[staged.batch_dim :],
+                ),
                 dtype=staged.dtype,
                 device=device,
             )
@@ -142,12 +148,13 @@ class DraftGraph:
     def stage(
         self, running_bs: int, srcs: "Mapping[str, torch.Tensor]"
     ) -> dict[str, torch.Tensor]:
-        """Copy every input into its fixed buffer, widening the batch to ``running_bs``.
-
-        How many rows are real comes from the sources, never from the caller: a
-        count that cannot disagree with the tensor it describes.
-        """
-        counts = {t.shape[0] for t in srcs.values()}
+        """Copy every input, ``running_bs`` rows each, into its fixed buffer."""
+        undeclared = sorted(srcs.keys() - self._buffers.keys())
+        assert not undeclared, (
+            f"{self.name} has no staged inputs {undeclared}; "
+            f"declared roles are {sorted(self._buffers)}"
+        )
+        counts = {t.shape[self.inputs[role].batch_dim] for role, t in srcs.items()}
         assert len(counts) <= 1, (
             f"{self.name} was handed batches of {sorted(counts)}; they "
             f"describe one step, so one of them is not this step's"
@@ -157,36 +164,31 @@ class DraftGraph:
         }
 
     def buffer(self, role: str, bs: int) -> torch.Tensor:
-        """Return the fixed-storage view a producer may fill for the real rows.
+        """Return the fixed-storage view a producer may fill in place.
 
-        A following :meth:`stage` still owns padding ``bs`` to ``running_bs``.
-        The caller must not mutate this view between that stage and the pass
-        consuming it.
+        The caller must not mutate this view between a :meth:`stage` of it and
+        the pass consuming it.
         """
         assert role in self._buffers, (
             f"{self.name} has no staged input {role!r}; "
             f"declared roles are {sorted(self._buffers)}"
         )
-        buf = self._buffers[role]
-        assert 0 <= bs <= buf.shape[0], (
+        buf, d = self._buffers[role], self.inputs[role].batch_dim
+        assert 0 <= bs <= buf.shape[d], (
             f"{self.name} requested {bs} rows from draft input {role!r}, "
-            f"whose capacity is {buf.shape[0]}"
+            f"whose capacity is {buf.shape[d]}"
         )
-        return buf[:bs]
+        return buf.narrow(d, 0, bs)
 
     def _stage_one(self, role: str, running_bs: int, src: torch.Tensor | None):
-        """Copy ``src`` into this input's fixed buffer, tail-repeating its last row.
-
-        Every input repeats the same last index, so a pad row is a coherent copy
-        of the last real one and only redoes work that row already does. Zeros
-        instead faulted 8/8 ranks at the first padded decode step, and repeating
-        one input alone -- an incoherent mix -- faulted too.
+        """Copy ``src``, ``running_bs`` rows along ``batch_dim``, into this
+        input's fixed buffer.
 
         ``src=None`` hands back the view unwritten: warmup wants a well-formed
         batch, not a particular one.
         """
-        buf = self._buffers[role]
-        out = buf[:running_bs]
+        buf, d = self._buffers[role], self.inputs[role].batch_dim
+        out = buf.narrow(d, 0, running_bs)
         if src is None:
             return out
         assert src.dtype == buf.dtype, (
@@ -195,22 +197,17 @@ class DraftGraph:
         )
         assert src.ndim == buf.ndim, (
             f"draft input '{role}' of {self.name} arrived as {tuple(src.shape)}, "
-            f"whose leading axis is not the batch; this pass stages "
-            f"{tuple(buf.shape[1:])} per sequence. MRoPE positions ([3, N]) are "
-            f"the case that reaches here"
+            f"but this pass stages {self.inputs[role].shape} per sequence with "
+            f"the batch at axis {d}"
         )
-        scheduled_bs = src.shape[0]
-        dst = out[:scheduled_bs]
-        assert src.shape == dst.shape, (
+        assert src.shape == out.shape, (
             f"draft input '{role}' of {self.name} arrived as {tuple(src.shape)}, "
-            f"but its fixed storage expects {tuple(dst.shape)}"
+            f"but its fixed storage expects {tuple(out.shape)}"
         )
         # A producer may have written straight into this exact fixed-storage
         # view. Do not turn that into a self-copy launch.
-        if src.data_ptr() != dst.data_ptr() or src.stride() != dst.stride():
-            dst.copy_(src)
-        if running_bs > scheduled_bs:
-            out[scheduled_bs:].copy_(src[-1])  # broadcasts; no expand needed
+        if src.data_ptr() != out.data_ptr() or src.stride() != out.stride():
+            out.copy_(src)
         return out
 
     def is_captured(self, running_bs: int) -> bool:

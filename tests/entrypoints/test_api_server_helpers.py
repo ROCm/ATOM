@@ -75,7 +75,7 @@ def _install_api_server_stubs() -> list[str]:
         def from_cli_args(cls, args):
             return cls()
 
-        def create_engine(self, tokenizer=None):
+        def create_engine(self, tokenizer=None, **kwargs):
             return None
 
     _try_import_else_stub(
@@ -876,6 +876,217 @@ def test_tracing_initializes_off_event_loop_before_lifespan_yields(monkeypatch):
     assert events == ["initialize", "serving", "shutdown"]
 
 
+# ---- --api-server-count: the worker side of api_server ----
+
+
+def test_engine_routes_are_the_management_endpoints():
+    # Registered with `_engine_route`: a worker relays exactly these to the
+    # hub. Everything else, inference and /debug/gc_census included, is served
+    # where it arrives, so a new route is local unless it says otherwise.
+    assert api_server._ENGINE_ROUTES == {
+        "/health",
+        "/metrics",
+        "/debug/mtp_stats",
+        "/debug/cache_stats",
+        "/kv_transfer_info",
+        "/server_info",
+        "/start_profile",
+        "/stop_profile",
+    }
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Unix socket")
+def test_worker_relays_engine_routes_to_the_hub_over_its_unix_socket(
+    monkeypatch, tmp_path
+):
+    from aiohttp import web
+    from fastapi.testclient import TestClient
+
+    seen = []
+
+    async def hub_handler(request):
+        seen.append(
+            (request.method, request.path, request.query_string, await request.read())
+        )
+        return web.json_response({"from": "hub"}, status=503)
+
+    uds = str(tmp_path / "hub.sock")
+    ready = threading.Event()
+    stop = {}
+
+    def serve():
+        loop = asyncio.new_event_loop()
+        hub = web.Application()
+        hub.router.add_route("*", "/{tail:.*}", hub_handler)
+        runner = web.AppRunner(hub)
+        loop.run_until_complete(runner.setup())
+        loop.run_until_complete(web.UnixSite(runner, uds).start())
+        stop["loop"], stop["runner"] = loop, runner
+        ready.set()
+        loop.run_forever()
+        loop.run_until_complete(runner.cleanup())
+        loop.close()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    assert ready.wait(5)
+    monkeypatch.setattr(api_server, "_frontend_hub_uds", uds)
+    monkeypatch.setattr(api_server, "model_name", "m")
+    client = TestClient(api_server.app)
+    try:
+        # Each TestClient call runs on a fresh loop; a worker has one.
+        api_server._frontend_hub_session = None
+        reply = client.get("/health?a=1&a=2")
+        assert reply.status_code == 503 and reply.json() == {"from": "hub"}
+        api_server._frontend_hub_session = None
+        reply = client.post("/start_profile", content=b"x")
+        assert reply.json() == {"from": "hub"}
+        assert seen == [
+            ("GET", "/health", "a=1&a=2", b""),
+            ("POST", "/start_profile", "", b"x"),
+        ]
+        # Served by the worker itself, never relayed.
+        api_server._frontend_hub_session = None
+        assert client.get("/v1/models").json()["data"][0]["id"] == "m"
+        assert client.get("/no/such/route").status_code == 404
+        assert len(seen) == 2
+    finally:
+        api_server._frontend_hub_session = None
+        stop["loop"].call_soon_threadsafe(stop["loop"].stop)
+        thread.join(5)
+
+
+def test_health_is_unavailable_once_a_frontend_worker_dies(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(
+        api_server,
+        "engine",
+        SimpleNamespace(core_mgr=SimpleNamespace(is_healthy=lambda: True)),
+    )
+    dead = []
+    monkeypatch.setattr(
+        api_server, "_frontend_hub", SimpleNamespace(dead_workers=lambda: dead)
+    )
+    client = TestClient(api_server.app)
+    assert client.get("/health").status_code == 200
+    dead.append(2)
+    reply = client.get("/health")
+    assert reply.status_code == 503 and "[2]" in reply.json()["detail"]
+
+
+def test_hub_flush_runs_even_when_the_local_flush_fails():
+    # The engine output thread's flush with a hub. A failing local flush must
+    # not keep the step's outputs from the workers' clients.
+    calls = []
+
+    def local():
+        calls.append("local")
+        raise RuntimeError("local flush")
+
+    hub = SimpleNamespace(flush=lambda: calls.append("hub"))
+    flush = api_server._flush_local_and_hub(local, hub)
+    with pytest.raises(RuntimeError):
+        flush()
+    assert calls == ["local", "hub"]
+    calls.clear()
+    api_server._flush_local_and_hub(None, hub)()
+    assert calls == ["hub"]
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Unix socket")
+def test_relay_answers_503_while_the_hub_is_not_serving(monkeypatch, tmp_path):
+    # Workers are serving before the hub binds its socket (and after it exits).
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(api_server, "_frontend_hub_uds", str(tmp_path / "none.sock"))
+    api_server._frontend_hub_session = None
+    try:
+        reply = TestClient(api_server.app).get("/health")
+    finally:
+        api_server._frontend_hub_session = None
+    assert reply.status_code == 503
+    assert reply.json()["detail"] == "Engine hub is not serving"
+
+
+class TestPreparePrompt:
+    """`_prepare_prompt`: render, tokenize the engine's way, cut to the
+    context, on the executor, for /v1/messages and /v1/responses."""
+
+    @pytest.fixture
+    def prepare(self, monkeypatch):
+        from atom.model_engine.segment_tokenizer import PrefixEncoding
+
+        encoded = {}
+
+        def encode_prompt(text):
+            # One id per character; with a block-hash chain when asked.
+            ids = list(range(len(text)))
+            return PrefixEncoding(ids, "chain") if encoded.get("chain") else ids
+
+        monkeypatch.setattr(
+            api_server,
+            "engine",
+            SimpleNamespace(
+                config=SimpleNamespace(max_model_len=100),
+                io_processor=SimpleNamespace(encode_prompt=encode_prompt),
+            ),
+        )
+        monkeypatch.setattr(
+            api_server,
+            "tokenizer",
+            SimpleNamespace(decode=lambda ids, **_kw: "k" * len(ids)),
+        )
+        monkeypatch.setattr(api_server, "custom_message_encoder", None)
+        rendered = {}
+        monkeypatch.setattr(
+            api_server,
+            "apply_chat_template",
+            lambda _tok, _enc, messages, **kwargs: rendered.setdefault(
+                "text", messages
+            ),
+        )
+
+        def run(prompt, max_tokens, chain=False, kv=None):
+            encoded["chain"] = chain
+            rendered.clear()
+            return api_server._prepare_prompt(
+                prompt,
+                {},
+                tools=None,
+                preserve_tool_call_arguments=False,
+                max_tokens=max_tokens,
+                kv_transfer_params=kv,
+            )
+
+        return run
+
+    def test_a_prompt_that_fits_goes_to_the_engine_as_encoded(self, prepare):
+        engine_input, text = prepare("x" * 50, max_tokens=10, chain=True)
+        # The engine's own encoding, chain included, so preprocess reuses it.
+        assert engine_input.token_ids == list(range(50))
+        assert engine_input.block_hashes == "chain"
+        assert text == "x" * 50
+
+    def test_an_over_long_prompt_is_cut_to_the_context(self, prepare):
+        # 100-token context, 10 reserved for output: 90 kept.
+        engine_input, text = prepare("x" * 150, max_tokens=10, chain=True)
+        assert engine_input == list(range(90))
+        assert text == "k" * 90
+
+    @pytest.mark.parametrize("max_tokens", [100, 1024])
+    def test_no_room_for_a_prompt_is_refused(self, prepare, max_tokens):
+        with pytest.raises(ValueError, match="no room for a prompt"):
+            prepare("x" * 5, max_tokens=max_tokens)
+
+    def test_an_empty_cut_is_refused(self, prepare, monkeypatch):
+        monkeypatch.setattr(
+            api_server, "tokenizer", SimpleNamespace(decode=lambda ids, **_kw: "")
+        )
+        with pytest.raises(ValueError, match="empty after truncation"):
+            prepare("x" * 150, max_tokens=10)
+
+
 class TestDeploymentDefaultOutputCap:
     @pytest.mark.parametrize("explicit", [False, True])
     def test_small_deployment_distinguishes_default_from_explicit(
@@ -929,3 +1140,44 @@ class TestDeploymentDefaultOutputCap:
                 seq, NS(max_tokens_is_default=False)
             )
         assert seq.max_tokens == 512
+
+
+def test_reasoning_and_tool_setup_publishes_every_module_global(monkeypatch):
+    # Front-end workers run this split-out part of main(); an assignment
+    # without its `global` would set a local and leave the module default.
+    names = (
+        "reasoning_dialect",
+        "model_starts_in_reasoning",
+        "reasoning_toggle",
+        "tool_call_parser_cls",
+        "preserve_tool_call_arguments",
+        "required_tool_channel",
+    )
+    for name in names:
+        monkeypatch.setattr(api_server, name, "unset", raising=False)
+    dialect = SimpleNamespace(think_end_marker="</think>")
+    stubs = {
+        "chat_template_source": lambda *_a: "template",
+        "resolve_dialect": lambda *_a: (dialect, True),
+        "render_probe_prompt": lambda *_a, **_kw: "probe",
+        "template_opens_reasoning_implicitly": lambda *_a: True,
+        "resolve_reasoning_toggle": lambda *_a: ("thinking", False, True),
+        "resolve_tool_call_parser": lambda *_a, **_kw: "parser",
+        "template_keeps_tool_call_arguments": lambda *_a: True,
+        "required_call_channel": lambda *_a: "channel",
+    }
+    for name, stub in stubs.items():
+        monkeypatch.setattr(api_server, name, stub)
+    monkeypatch.setattr(api_server, "tokenizer", object())
+    monkeypatch.setattr(api_server, "custom_message_encoder", None)
+
+    api_server._setup_reasoning_and_tools(
+        SimpleNamespace(tool_call_parser="auto", model="m")
+    )
+
+    assert api_server.reasoning_dialect is dialect
+    assert api_server.model_starts_in_reasoning is True
+    assert api_server.reasoning_toggle == ("thinking", False, True)
+    assert api_server.tool_call_parser_cls == "parser"
+    assert api_server.preserve_tool_call_arguments is True
+    assert api_server.required_tool_channel == "channel"

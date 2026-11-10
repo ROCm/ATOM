@@ -5,6 +5,14 @@ pub(crate) struct ConfigValidator;
 
 impl ConfigValidator {
     pub(crate) fn validate(config: &RouterConfig) -> ConfigResult<()> {
+        config.resolved_prepare_pool()?;
+        if config.resolved_max_tokenize_bytes() == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "prepare_pool.max_tokenize_bytes".to_string(),
+                value: "0".to_string(),
+                reason: "Must be greater than zero".to_string(),
+            });
+        }
         #[cfg(feature = "ext-proc")]
         config.ext_proc.validate(config)?;
         Self::validate_mode(&config.mode)?;
@@ -401,6 +409,56 @@ impl ConfigValidator {
 mod tests {
     use super::*;
     use crate::core::ConnectionMode;
+
+    #[test]
+    fn prepare_pool_validation_is_independent_of_ext_proc() {
+        for invalidate in [
+            |config: &mut PreparePoolConfig| config.workers = Some(0),
+            |config: &mut PreparePoolConfig| config.workers = Some(usize::MAX),
+            |config: &mut PreparePoolConfig| config.queue_capacity = Some(0),
+            |config: &mut PreparePoolConfig| config.queue_capacity = Some(usize::MAX),
+            |config: &mut PreparePoolConfig| config.queue_timeout_ms = 0,
+            |config: &mut PreparePoolConfig| config.prepare_timeout_ms = 0,
+            |config: &mut PreparePoolConfig| config.max_tokenize_bytes = Some(0),
+        ] {
+            let mut config = RouterConfig::default();
+            invalidate(&mut config.prepare_pool);
+            let error = config.validate().unwrap_err();
+            assert!(error.to_string().contains("prepare_pool."), "{error}");
+        }
+        RouterConfig::default().validate().unwrap();
+    }
+
+    #[test]
+    fn automatic_and_legacy_prepare_capacity_is_validated_after_resolution() {
+        for workers in [
+            usize::MAX / 10 + 1,
+            tokio::sync::Semaphore::MAX_PERMITS / 10 + 1,
+        ] {
+            let mut config = RouterConfig::default();
+            config.prepare_pool.workers = Some(workers);
+            let error = config.validate().unwrap_err();
+            assert!(
+                error.to_string().contains("prepare_pool.queue_capacity"),
+                "{error}"
+            );
+        }
+        // Enabled legacy ext-proc options are validated after resolution.
+        #[cfg(feature = "ext-proc")]
+        for invalidate in [
+            |config: &mut RouterConfig| {
+                config.ext_proc.parser_concurrency = Some(usize::MAX / 10 + 1)
+            },
+            |config: &mut RouterConfig| config.ext_proc.parser_concurrency = Some(0),
+            |config: &mut RouterConfig| config.ext_proc.max_tokenize_bytes = Some(0),
+        ] {
+            let mut config = RouterConfig::default();
+            config.ext_proc.enabled = true;
+            invalidate(&mut config);
+            let error = config.validate().unwrap_err();
+            assert!(error.to_string().contains("prepare_pool."), "{error}");
+        }
+    }
 
     #[test]
     fn test_validate_regular_mode() {

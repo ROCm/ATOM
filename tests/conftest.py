@@ -75,6 +75,7 @@ class MockConfig:
             "eos_token_id": 2,
             "stop_token_ids": [],
             "scheduler_delay_factor": 0.0,
+            "prefill_admit_policy": "interval",
             "speculative_config": None,
             # Scheduler.__init__ reads config.hf_config.architectures for V4
             # SWA-warmup detection; a non-V4 stub keeps that path inert.
@@ -292,6 +293,14 @@ def req_graph_recordings(monkeypatch):
     monkeypatch.setattr(ReqGraph, "replay", lambda self, key=None, **_: held[key]())
     monkeypatch.setattr(ReqGraph, "release_graphs", release_graphs)
     return recordings
+
+
+@pytest.fixture
+def offload_clock(monkeypatch):
+    """`state_offload`'s monotonic clock, advanced by hand."""
+    now = [1000.0]
+    monkeypatch.setattr("atom.model_engine.state_offload.monotonic", lambda: now[0])
+    return now
 
 
 @pytest.fixture(autouse=True)

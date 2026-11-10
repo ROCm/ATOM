@@ -76,6 +76,8 @@ def _bare_manager(cls, **kwargs):
             dp_load_balance="round_robin",
             tp_world_size=1,
             prefill_context_parallel_size=1,
+            keep_finished_outputs=kwargs.get("keep_finished_outputs", False),
+            asyncio_mode=kwargs.get("asyncio_mode", False),
         ),
         label=cls.__name__,
         local_engine_count=kwargs.get("local_engine_count", 2),
@@ -129,6 +131,37 @@ class OutputThreadStateTest(unittest.TestCase):
             self.assertEqual(observed, [False])
         finally:
             sender.close(linger=0)
+
+    def test_finished_sequences_are_queued_only_if_the_config_keeps_them(self):
+        # Off by default: online front ends take every output through the
+        # callbacks, and a queued Sequence would stay for the process's life.
+        # asyncio_mode reads the queue, so it keeps them too.
+        for keep, asyncio_mode in ((True, False), (False, True), (False, False)):
+            mgr = _bare_manager(
+                CoreManager, keep_finished_outputs=keep, asyncio_mode=asyncio_mode
+            )
+            self.addCleanup(mgr.ctx.term)
+            mgr._deliver_terminal_output = lambda seq: False
+            mgr._release_seq_load = lambda seq_id: None
+            mgr._shutdown_engine_core_rank = lambda rank: None
+            url = f"inproc://outputs-{uuid.uuid4().hex}"
+            receiver = mgr.ctx.socket(zmq.PULL)
+            receiver.bind(url)
+            sender = mgr.ctx.socket(zmq.PUSH)
+            sender.connect(url)
+            thread = mgr._create_output_thread(0, receiver, url + "-shutdown")
+            thread.start()
+            try:
+                seqs = [SimpleNamespace(id=7)]
+                sender.send(pickle.dumps((EngineCoreRequestType.ADD, seqs)))
+                sender.send(pickle.dumps((EngineCoreRequestType.SHUTDOWN, None)))
+                thread.join(timeout=3)
+                self.assertFalse(thread.is_alive())
+                self.assertEqual(
+                    mgr.outputs_queue.qsize(), 1 if keep or asyncio_mode else 0
+                )
+            finally:
+                sender.close(linger=0)
 
     def _terminate(self):
         for mgr in self.managers:
