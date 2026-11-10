@@ -3,13 +3,15 @@
 
 """`tensor_model_parallel_all_reduce_add(routed, shared)` against what
 `MoE.combine_outputs` did before, `tensor_model_parallel_all_reduce(routed + shared)`:
-the same bits on every rank, at V4.1-Flash's MoE combine width (5120 bf16), for
-decode row counts the fused Gluon kernel takes and prefill ones past its cap, eager
-and replayed in a HIP graph. Needs 4 gfx1250 GPUs and aiter's fused op
-(ROCm/aiter#7488)."""
+the same bits on every rank, at V4.1-Flash's MoE combine width (5120 bf16).
+
+The fused kernel is aiter's HIP Lamport one-shot all-reduce
+(``CustomAllreduce.lamport_ar_add``, ROCm/aiter#7499). Every row count that
+kernel accepts must call it, including over a HIP-graph capture; the row past
+its cap must not. Requires 4 gfx1250 GPUs and ROCm/aiter#7499.
+"""
 
 import multiprocessing as mp
-import os
 import time
 
 import pytest
@@ -21,8 +23,9 @@ pytest.importorskip(
 
 _WORLD = 4
 _DIM = 5120
-_FUSED_ROWS = (1, 8, 48, 96, 288, 409)  # 409 x 5120 bf16 is the 4 MiB Gluon cap
-_FALLBACK_ROWS = (410, 4096)
+# Decode sizes, plus one prefill size past any Lamport cap. The cap row and the
+# row just past it are added from the kernel's own predicate.
+_ROWS = (1, 8, 48, 96, 288, 4096)
 _GRAPH_ROWS = (48, 8, 288, 1)
 _REPLAYS = 10
 
@@ -38,56 +41,135 @@ def _differ(a, b):
     return int((a.view(torch.int16) != b.view(torch.int16)).sum())
 
 
+def _nbytes(tensor):
+    return tensor.numel() * tensor.element_size()
+
+
+def _install_lamport_counter(calls):
+    """Count bytes passed to the HIP kernel. Returns the original method."""
+    from aiter.dist.device_communicators import custom_all_reduce
+
+    cls = custom_all_reduce.CustomAllreduce
+    original = getattr(cls, "lamport_ar_add", None)
+    if original is None:
+        return None
+
+    def counting(self, inp, other):
+        calls.append(_nbytes(inp))
+        return original(self, inp, other)
+
+    cls.lamport_ar_add = counting
+    return original
+
+
+def _restore_lamport(original):
+    if original is None:
+        return
+    from aiter.dist.device_communicators import custom_all_reduce
+
+    custom_all_reduce.CustomAllreduce.lamport_ar_add = original
+
+
+def _cap_rows(accepts):
+    """Largest row count ``accepts`` takes. The cap is a byte limit, so once a
+    row count is rejected every larger one is too."""
+    if not accepts(1):
+        return 0
+    lo = hi = 1
+    while accepts(hi):
+        lo = hi
+        hi *= 2
+        if hi > 1_000_000:
+            return lo
+    while lo + 1 < hi:
+        mid = (lo + hi) // 2
+        if accepts(mid):
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
 def _checks(rank):
-    """(fused kernel calls, elements differing from the add + all-reduce, elements
-    differing across ranks, elements differing over graph replays)."""
-    import aiter.ops.triton.comms.all_reduce as gluon
+    """Per-rank bit and dispatch report. ``error`` is empty on success."""
     import torch.distributed as dist
     from aiter.dist.parallel_state import get_tp_group
 
     import atom.model_ops.communication_op as comm
 
     comm._tbo_aware_tp_reduce = lambda tp_size: False  # no ATOM config here
-    fused_calls = [0]
-    plain = gluon.all_reduce
+    ca = getattr(get_tp_group().device_communicator, "ca_comm", None)
+    if ca is None or not hasattr(ca, "should_lamport_ar_add"):
+        return {"error": "aiter has no HIP Lamport all-reduce add"}
 
-    def counting(*args, **kwargs):
-        fused_calls[0] += kwargs.get("x2") is not None
-        return plain(*args, **kwargs)
+    def accepts(rows):
+        return ca.should_lamport_ar_add(*_pair(rows, 0, rank))
 
-    gluon.all_reduce = counting
-    group = get_tp_group().device_group
-    differ = across = 0
-    for i, rows in enumerate(_FUSED_ROWS + _FALLBACK_ROWS):
-        routed, shared = _pair(rows, i, rank)
-        want = comm.tensor_model_parallel_all_reduce(routed + shared)
-        got = comm.tensor_model_parallel_all_reduce_add(routed, shared)
-        ranks = [torch.empty_like(got) for _ in range(_WORLD)]
-        dist.all_gather(ranks, got, group=group)
-        differ += _differ(got, want)
-        across += sum(_differ(r, got) for r in ranks)
-    eager_fused = fused_calls[0]
+    cap_rows = _cap_rows(accepts)
+    for probe in (1, 8, 48):
+        if not accepts(probe):
+            return {"error": f"Lamport declined {probe} rows at {_DIM} bf16"}
+    rows = sorted(set(_ROWS + (cap_rows, cap_rows + 1)))
 
-    ins = [tuple(torch.empty_like(t) for t in _pair(r, 0, rank)) for r in _GRAPH_ROWS]
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        got = [comm.tensor_model_parallel_all_reduce_add(a, b) for a, b in ins]
-        want = [comm.tensor_model_parallel_all_reduce(a + b) for a, b in ins]
-    replay_differ = 0
-    for rep in range(_REPLAYS):
-        for j, (a, b) in enumerate(ins):
-            new_a, new_b = _pair(_GRAPH_ROWS[j], 100 + rep * 10 + j, rank)
-            a.copy_(new_a)
-            b.copy_(new_b)
-        graph.replay()
+    calls = []
+    original = _install_lamport_counter(calls)
+    if original is None:
+        return {"error": "aiter has no HIP Lamport all-reduce add"}
+    try:
+        group = get_tp_group().device_group
+        differ = across = 0
+        eager = []
+        for i, n in enumerate(rows):
+            routed, shared = _pair(n, i, rank)
+            expect = (
+                [_nbytes(routed)] if ca.should_lamport_ar_add(routed, shared) else []
+            )
+            before = len(calls)
+            want = comm.tensor_model_parallel_all_reduce(routed + shared)
+            got = comm.tensor_model_parallel_all_reduce_add(routed, shared)
+            eager.append((n, calls[before:], expect))
+            ranks = [torch.empty_like(got) for _ in range(_WORLD)]
+            dist.all_gather(ranks, got, group=group)
+            differ += _differ(got, want)
+            across += sum(_differ(got, other) for other in ranks)
+        ins = [
+            tuple(torch.empty_like(t) for t in _pair(n, 0, rank)) for n in _GRAPH_ROWS
+        ]
+        expected_graph = [
+            _nbytes(routed)
+            for routed, shared in ins
+            if ca.should_lamport_ar_add(routed, shared)
+        ]
+        calls.clear()
         torch.cuda.synchronize()
-        replay_differ += sum(_differ(g, w) for g, w in zip(got, want))
-    return eager_fused, differ, across, replay_differ
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            got = [comm.tensor_model_parallel_all_reduce_add(a, b) for a, b in ins]
+            want = [comm.tensor_model_parallel_all_reduce(a + b) for a, b in ins]
+        graph_calls = list(calls)
+        replay_differ = 0
+        for rep in range(_REPLAYS):
+            for j, (routed, shared) in enumerate(ins):
+                new_routed, new_shared = _pair(_GRAPH_ROWS[j], 100 + rep * 10 + j, rank)
+                routed.copy_(new_routed)
+                shared.copy_(new_shared)
+            graph.replay()
+            torch.cuda.synchronize()
+            replay_differ += sum(_differ(g, w) for g, w in zip(got, want))
+        return {
+            "error": "",
+            "eager": eager,
+            "graph_calls": graph_calls,
+            "expected_graph": expected_graph,
+            "differ": differ,
+            "across": across,
+            "replay": replay_differ,
+        }
+    finally:
+        _restore_lamport(original)
 
 
 def _rank(rank, init_method, results):
-    os.environ["AITER_GLUON_FUSED_AR"] = "1"  # what ATOM_ENABLE_GLUON_FUSED_AR sets
     from aiter.dist.parallel_state import (
         destroy_distributed_environment,
         destroy_model_parallel,
@@ -114,12 +196,15 @@ def test_all_reduce_add_matches_add_then_all_reduce():
     if not torch.cuda.is_available() or torch.cuda.device_count() < _WORLD:
         pytest.skip(f"needs {_WORLD} GPUs")
     from aiter.dist import communication_op
+    from aiter.dist.device_communicators import custom_all_reduce
     from aiter.jit.utils.chip_info import get_gfx
 
     if get_gfx() != "gfx1250":
-        pytest.skip("the fused all-reduce add is gfx1250 only")
+        pytest.skip("the HIP Lamport all-reduce add is gfx1250 only")
     if not hasattr(communication_op, "tensor_model_parallel_all_reduce_add"):
         pytest.skip("aiter predates tensor_model_parallel_all_reduce_add")
+    if not hasattr(custom_all_reduce.CustomAllreduce, "lamport_ar_add"):
+        pytest.skip("needs the HIP Lamport all-reduce add (ROCm/aiter#7499)")
     from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
 
     init_method = get_distributed_init_method(get_ip(), get_open_port())
@@ -130,18 +215,39 @@ def test_all_reduce_add_matches_add_then_all_reduce():
             ctx.Process(target=_rank, args=(r, init_method, results))
             for r in range(_WORLD)
         ]
-        for p in procs:
-            p.start()
+        for proc in procs:
+            proc.start()
         deadline = time.monotonic() + 300
-        for p in procs:
-            p.join(timeout=max(0.0, deadline - time.monotonic()))
-        hung = [p for p in procs if p.is_alive()]
-        for p in hung:  # never leave a rank behind for interpreter exit to join
-            p.terminate()
-            p.join(timeout=10)
-            if p.is_alive():
-                p.kill()
-        assert not hung and all(p.exitcode == 0 for p in procs)
-        # Every decode row count took the fused kernel; nothing differs anywhere.
-        want = (len(_FUSED_ROWS), 0, 0, 0)
-        assert dict(results) == {r: want for r in range(_WORLD)}
+        for proc in procs:
+            proc.join(timeout=max(0.0, deadline - time.monotonic()))
+        hung = [proc for proc in procs if proc.is_alive()]
+        for proc in hung:  # never leave a rank behind for interpreter exit to join
+            proc.terminate()
+            proc.join(timeout=10)
+            if proc.is_alive():
+                proc.kill()
+        assert not hung and all(proc.exitcode == 0 for proc in procs)
+        for rank in range(_WORLD):
+            result = results[rank]
+            assert result["error"] == "", (rank, result["error"])
+            for rows, took, expected in result["eager"]:
+                assert took == expected, (rank, rows, took, expected)
+            assert result["expected_graph"], (
+                rank,
+                "graph capture took no Lamport call",
+            )
+            assert result["graph_calls"] == result["expected_graph"], (
+                rank,
+                result["graph_calls"],
+                result["expected_graph"],
+            )
+            assert (result["differ"], result["across"], result["replay"]) == (
+                0,
+                0,
+                0,
+            ), (
+                rank,
+                result["differ"],
+                result["across"],
+                result["replay"],
+            )

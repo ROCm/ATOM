@@ -61,11 +61,18 @@ def tensor_model_parallel_all_reduce(x: torch.Tensor) -> torch.Tensor:
 def tensor_model_parallel_all_reduce_add(
     x: torch.Tensor, y: torch.Tensor
 ) -> torch.Tensor:
-    """TP all_reduce of ``x + y``: the sum over ranks of each rank's ``x + y``, not
-    ``all_reduce(x) + y``. aiter's ``tensor_model_parallel_all_reduce_add``
-    (ROCm/aiter#7488) adds each rank's pair as the gfx1250 Gluon all-reduce loads it,
-    to the bits of `tensor_model_parallel_all_reduce(x + y)`. On the TBO path, and
-    with an aiter that predates the op, it is that add and all-reduce.
+    """All-reduce ``x + y`` across the TP group.
+
+    The result is the sum over ranks of each rank's ``x + y``, not
+    ``all_reduce(x) + y``. On gfx1250, aiter serves this with the HIP Lamport
+    one-shot kernel (``CustomAllreduce.lamport_ar_add``, ROCm/aiter#7499):
+    bf16 or fp16, up to 16 MiB at TP2 and 8 MiB at TP4
+    (``AITER_CUSTOM_AR_LAMPORT_RMS_MAX_SIZE``). The add happens as the kernel
+    sends, and the bits match ``tensor_model_parallel_all_reduce(x + y)``.
+
+    This function adds and all-reduces only on the TBO path and when aiter has
+    no fused op. Inputs the Lamport kernel does not take are added and
+    all-reduced inside aiter.
     """
     from aiter.dist import communication_op as aiter_comm
     from aiter.dist.parallel_state import get_tp_group

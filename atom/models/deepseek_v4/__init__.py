@@ -3027,8 +3027,10 @@ class MoE(nn.Module):
         shared: torch.Tensor | None,  # [num_tokens, dim] or None
         prefix: str = "",
     ) -> torch.Tensor:  # [num_tokens, dim]
-        """Add shared-expert contribution (when not fused into routed) and
-        all-reduce across TP ranks.
+        """Add the shared-expert contribution (when it is not already fused into
+        the routed output) and all-reduce across TP ranks.
+
+        At TP > 1 the shared-expert add is folded into that all-reduce.
         """
         if shared is not None:
             # Both on this rank's rows: the routed experts' PCP reduction
