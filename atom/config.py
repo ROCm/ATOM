@@ -2610,6 +2610,18 @@ class Config:
                 import ast
 
                 self.kv_transfer_config = ast.literal_eval(self.kv_transfer_config)
+        if (
+            isinstance(self.kv_transfer_config, dict)
+            and str(self.kv_transfer_config.get("kv_connector", "")).strip().casefold()
+            == "multi"
+        ):
+            # Refuse a composite the engine cannot run now, not when a worker
+            # builds it after the weights are loaded.
+            from atom.kv_transfer.disaggregation.multi.multi_connector import (
+                validate_multi_config,
+            )
+
+            validate_multi_config(self.kv_transfer_config)
         if self.sequence_parallel_size > 1:
             self._init_sequence_parallel()
         # transformers 5+ exposes rope_parameters; <5 often only rope_scaling + rope_theta.

@@ -1121,3 +1121,22 @@ def test_waits_for_transfer_report_needs_every_deferring_sub():
     assert not multi(sub(True, True), sub(True)).waits_for_transfer_report(seq)
     assert not multi(sub(True, True), sub(True, False)).waits_for_transfer_report(seq)
     assert not multi(sub(False, True)).waits_for_transfer_report(seq)
+
+
+def test_config_refuses_a_pd_consumer_with_an_offload_tier_before_the_model_loads():
+    """`Config` runs the multi checks itself: the refusal must not wait for a
+    worker to build the connector after the weights are loaded."""
+    from atom.kv_transfer.disaggregation.multi.multi_connector import (
+        validate_multi_config,
+    )
+
+    consumer = {"kv_connector": "mooncake", "kv_role": "kv_consumer"}
+    producer = {"kv_connector": "mooncake", "kv_role": "kv_producer"}
+    store = {"kv_connector": "mooncake_store"}
+    with pytest.raises(ValueError, match="P/D consumer with an offload tier"):
+        validate_multi_config(
+            {"kv_connector": "multi", "connectors": [consumer, store]}
+        )
+    assert validate_multi_config(
+        {"kv_connector": "multi", "connectors": [producer, store]}
+    ) == [producer, store]
