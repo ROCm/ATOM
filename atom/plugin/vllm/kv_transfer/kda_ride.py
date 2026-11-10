@@ -90,14 +90,33 @@ def refuse_kda_ride_without_prerequisites(vllm_config) -> None:
         )
 
 
-def _layer_page_bytes(group) -> list[int]:
-    """Page bytes of each layer of *group*, in vLLM's ``layer_names`` order."""
+def _attention_layer_bytes(group) -> list[int]:
+    """Bytes per block each attention layer publishes, in PAGE order.
+
+    The order and grouping `build_kv_cache_tensors` publishes: one layer per
+    owner, sorted by `_layer_sort_key`, with a DSA indexer's cache folded into
+    the layer that owns it (`index_cache_owner`). A layer may publish several
+    planes (its cache, an index cache), so this sums them per layer; how many
+    planes that is, the worker reads off the regions it publishes.
+    """
+    from .kv_cache_layout import _layer_sort_key, index_cache_owner
+
     spec = group.kv_cache_spec
     members = getattr(spec, "kv_cache_specs", None)
-    names = list(group.layer_names)
-    if isinstance(members, dict) and members:
-        return [int(members[name].page_size_bytes) for name in names]
-    return [int(spec.page_size_bytes)] * len(names)
+    per_layer: dict[str, int] = {}
+    for name in group.layer_names:
+        member = members[name] if isinstance(members, dict) and members else spec
+        owner = index_cache_owner(name) or name
+        per_layer[owner] = per_layer.get(owner, 0) + int(member.page_size_bytes)
+    return [per_layer[name] for name in sorted(per_layer, key=_layer_sort_key)]
+
+
+def _published_layer(region) -> int:
+    """The attention layer a published PAGE region belongs to.
+
+    `build_mp_transfer_tensors` names each region ``L<layer>.<role>``.
+    """
+    return int(str(region.semantic_role).split(".", 1)[0].removeprefix("L"))
 
 
 def _describe_spec(spec) -> str:
@@ -121,15 +140,16 @@ def _describe_spec(spec) -> str:
 class KdaRideGeometry:
     """Where K3's KDA state sits in the PAGE unit, and the image it makes.
 
-    ``state_planes`` is how many leading PAGE planes the mamba groups alias:
-    the most layers any of them has. Only those planes make up the
-    checkpoint's PAGE unit (`paged_state_region_count`), so an image moves the
-    state groups' bytes and not the MLA planes no KDA layer shares.
+    ``state_layers`` is how many leading attention layers the mamba groups
+    alias: the most layers any of them has. Every PAGE plane those layers
+    publish -- the MLA cache, and an index cache where a layer has one -- makes
+    up the checkpoint's PAGE unit (`paged_state_region_count`), so an image
+    moves the state groups' bytes and not the layers no KDA layer shares.
     """
 
     group_ids: tuple[int, ...]
     layers_per_group: tuple[int, ...]
-    state_planes: int
+    state_layers: int
     spec: Any
 
 
@@ -144,8 +164,8 @@ def kda_ride_geometry(
     the worker holds that prediction against the registered tensors
     (`publish_kda_ride_state`), which is where a wrong one would show.
 
-    One unit per mamba group, each the leading ``state_planes`` PAGE planes
-    whole: the image bytes are ``groups x state_planes x page`` -- on K3,
+    One unit per mamba group, each every plane of the leading
+    ``state_layers`` attention layers whole: on K3 (no index cache),
     3 x 23 x 884,736 B, of which 3 x 23 x 832,512 B are state and the rest the
     page padding behind it.
     """
@@ -161,24 +181,24 @@ def kda_ride_geometry(
     layers_per_group = tuple(
         len(groups[group_id].layer_names) for group_id in group_ids
     )
-    plane_bytes = _layer_page_bytes(groups[attention_group_id])
-    state_planes = max(layers_per_group)
-    if not state_planes or state_planes > len(plane_bytes):
+    layer_bytes = _attention_layer_bytes(groups[attention_group_id])
+    state_layers = max(layers_per_group)
+    if not state_layers or state_layers > len(layer_bytes):
         raise ValueError(
             "ATOM offload connector: a mamba group has "
-            f"{state_planes} layers but the attention group publishes "
-            f"{len(plane_bytes)} PAGE planes; vLLM aliases mamba layer j onto "
-            "attention layer j, so the KDA state would sit outside the PAGE "
-            "units a transfer moves"
+            f"{state_layers} layers but the attention group has "
+            f"{len(layer_bytes)}; vLLM aliases mamba layer j onto attention "
+            "layer j, so the KDA state would sit outside the PAGE units a "
+            "transfer moves"
         )
-    page_unit_bytes = sum(plane_bytes[:state_planes])
+    page_unit_bytes = sum(layer_bytes[:state_layers])
     image_bytes = len(group_ids) * page_unit_bytes
     layout_id = "|".join(
         (
             f"vllm-kda-ride-v{_RIDE_LAYOUT_VERSION}",
             "groups=" + ",".join(str(n) for n in layers_per_group),
-            f"state_planes={state_planes}",
-            "planes=" + ",".join(str(b) for b in plane_bytes[:state_planes]),
+            f"state_layers={state_layers}",
+            "layers=" + ",".join(str(b) for b in layer_bytes[:state_layers]),
             *(_describe_spec(spec) for _, spec in mamba_groups),
         )
     )
@@ -193,7 +213,7 @@ def kda_ride_geometry(
     return KdaRideGeometry(
         group_ids=group_ids,
         layers_per_group=layers_per_group,
-        state_planes=state_planes,
+        state_layers=state_layers,
         spec=spec,
     )
 
@@ -224,13 +244,15 @@ def publish_kda_ride_state(transfer_tensors, tensors_by_group, geometry) -> None
     """Declare the KDA image on a PAGE layout, after proving the state is in it.
 
     *tensors_by_group* is every mamba group's registered layers, in
-    ``geometry.group_ids`` order (`gather_group_tensors`). Each layer has to
-    start where one of the leading ``geometry.state_planes`` PAGE planes
-    starts, stride by that plane's unit, and keep a block's state inside one
-    unit -- or a transfer of unit ``b`` would move somebody else's bytes for
-    block ``b``. Checked on addresses, not shapes: two planes of one size are
-    indistinguishable by shape, and the aliasing is a property of vLLM's
-    allocator that nothing in the specs states.
+    ``geometry.group_ids`` order (`gather_group_tensors`). The image covers
+    every plane the leading ``geometry.state_layers`` attention layers publish,
+    which PAGE publication puts first (layer-major). Each mamba layer has to
+    start where one of those planes starts, stride by that plane's unit, and
+    keep a block's state inside one unit -- or a transfer of unit ``b`` would
+    move somebody else's bytes for block ``b``. Checked on addresses, not
+    shapes: two planes of one size are indistinguishable by shape, and the
+    aliasing is a property of vLLM's allocator that nothing in the specs
+    states.
 
     The four fields are the ones native K3 publishes
     (`KimiMLAGDNBackend.get_kv_transfer_tensors`). The state holds TP-sharded
@@ -239,20 +261,26 @@ def publish_kda_ride_state(transfer_tensors, tensors_by_group, geometry) -> None
     """
     pages = list(getattr(transfer_tensors, "pages", None) or ())
     num_blocks = int(getattr(transfer_tensors, "num_blocks", 0) or 0)
-    state_planes = int(geometry.state_planes)
+    state_layers = int(geometry.state_layers)
     spec = geometry.spec
-    if len(pages) < state_planes:
+    layers = [_published_layer(page.region) for page in pages]
+    state_planes = sum(1 for layer in layers if layer < state_layers)
+    if layers[:state_planes] != sorted(layers[:state_planes]) or any(
+        layer < state_layers for layer in layers[state_planes:]
+    ):
         raise ValueError(
-            f"ATOM offload connector: {len(pages)} PAGE planes published, but "
-            f"the KDA image spans the leading {state_planes}"
+            "ATOM offload connector: the PAGE planes of the leading "
+            f"{state_layers} attention layers are not the leading planes "
+            f"published ({layers}); the KDA image covers a leading run of them"
         )
     unit_bytes = sum(int(page.region.unit_bytes) for page in pages[:state_planes])
     if unit_bytes != int(spec.page_unit_bytes):
         raise ValueError(
-            "ATOM offload connector: the leading "
-            f"{state_planes} PAGE planes hold {unit_bytes} B per block, but the "
-            f"KDA image was sized from vLLM's specs at {spec.page_unit_bytes} B; "
-            "the scheduler and the workers would name different namespaces"
+            f"ATOM offload connector: the {state_planes} PAGE planes of the "
+            f"leading {state_layers} attention layers hold {unit_bytes} B per "
+            f"block, but the KDA image was sized from vLLM's specs at "
+            f"{spec.page_unit_bytes} B; the scheduler and the workers would "
+            "name different namespaces"
         )
     plane_at = {int(page.region.base_addr): index for index, page in enumerate(pages)}
     if len(tensors_by_group) != len(geometry.group_ids):
@@ -305,10 +333,11 @@ def publish_kda_ride_state(transfer_tensors, tensors_by_group, geometry) -> None
     )
     logger.info(
         "ATOM LMCache offload: KDA state rides the PAGE object as %d unit(s) "
-        "over the leading %d planes (%s layers), %d B of state per boundary in "
-        "a %d B image",
+        "over the %d planes of the leading %d attention layers (mamba groups "
+        "of %s layers), %d B of state per boundary in a %d B image",
         len(geometry.group_ids),
         state_planes,
+        state_layers,
         ",".join(str(n) for n in geometry.layers_per_group),
         state,
         int(spec.image_bytes),

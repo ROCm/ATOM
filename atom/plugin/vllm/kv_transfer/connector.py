@@ -52,6 +52,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 
 from atom.kv_transfer.disaggregation.types import ConnectorCompletion, req_id_of
 from atom.kv_transfer.offload._offload_common import offload_save_abandon_timeout_s
+from atom.kv_transfer.offload.config import select_offload_layout
 from atom.plugin.vllm.kv_transfer.kda_ride import (
     KdaRidePlanner,
     kda_ride_geometry,
@@ -304,6 +305,9 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
     # -- takes the non-V4.1 path rather than raising AttributeError from a
     # branch that has nothing to do with what is under test.
     _is_deepseek_v41 = False
+    # Kimi-K3 (the `kimi_k3` offload layout), whose KDA state may ride the PAGE
+    # object over MP; see `_state_rides_mp`.
+    _is_kimi_k3 = False
     # The same, for the boundary planners: a stub that sets neither has none.
     _kda_planner = None
     _v41_planner = None
@@ -449,11 +453,23 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         self._requests: dict[str, Any] = {}
 
         self._offload_backend = self._resolve_offload_backend()
+        self._is_kimi_k3 = bool(self._mamba_groups) and (
+            select_offload_layout(self._config) == "kimi_k3"
+        )
         if self._is_deepseek_v41:
             self._refuse_v41_without_ride()
         elif self._state_rides_mp:
-            # A mamba model's boundary state rides the PAGE object (`kda_ride`).
+            # Kimi-K3's boundary state rides the PAGE object (`kda_ride`).
             refuse_kda_ride_without_prerequisites(vllm_config)
+        elif self._mamba_groups and self._offload_backend == "mp":
+            # The ride is sized and checked for K3's KDA layers over MLA planes
+            # only; another recurrent model's state has no leg on MP.
+            raise ValueError(
+                "ATOM offload connector: over the LMCache MP server only "
+                "Kimi-K3's KDA state rides the PAGE object; offload this "
+                "model's recurrent state in-process "
+                "(atom.offload.backend='inproc')."
+            )
         elif role == KVConnectorRole.SCHEDULER:
             self._warn_unless_recompute()
 
@@ -579,18 +595,20 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
     def _state_rides_mp(self) -> bool:
         """True when recurrent state rides the PAGE object to the MP server.
 
-        Two models get there. DeepSeek-V4.1's checkpoint groups are PAGE units
-        of its proxy pool; a mamba model's groups (Kimi-K3's KDA) alias the
-        leading attention planes (`kda_ride`). Either way the state at a
+        Two models get there, and only these two. DeepSeek-V4.1's checkpoint
+        groups are PAGE units of its proxy pool; Kimi-K3's KDA mamba groups
+        alias its leading MLA planes (`kda_ride`). Either way the state at a
         boundary is PAGE units, so every transfer names them as a native-state
         image (`ride_mp_scheduler`) and the worker registers them through the
-        native layout.
+        native layout. K3 is named by its offload layout rather than by its
+        mamba type: its KDA layers report `GDN_ATTN`, as Qwen's GDN layers do,
+        and those are refused on MP in `__init__`.
         """
         if self._offload_backend != "mp":
             return False
         if self._is_deepseek_v41:
             return bool(self._v41_checkpoint_group_ids)
-        return bool(self._mamba_groups)
+        return self._is_kimi_k3 and bool(self._mamba_groups)
 
     def _ride_checkpoint_spec(self):
         """The checkpoint spec the riding state's namespace is named by.

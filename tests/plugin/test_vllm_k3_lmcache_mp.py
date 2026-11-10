@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from atom.plugin.vllm.kv_transfer.connector import AtomLMCacheOffloadConnector
 from atom.plugin.vllm.kv_transfer.kda_ride import (
     KdaRidePlanner,
     kda_ride_geometry,
@@ -77,11 +78,21 @@ def _mamba_spec(*, block, page, state):
     return spec
 
 
-def _kv_cache_config(*, attention, mamba, page, block=1536, state=832512):
+def _kv_cache_config(*, attention, mamba, page, block=1536, state=832512, index=0):
+    """vLLM's groups: MLA layers (each with a DSA index cache when *index* is
+    its page bytes), then the mamba groups."""
+    pages = {f"mla.{j}": page for j in range(attention)}
+    if index:
+        pages.update({f"mla.{j}.index_cache": index for j in range(attention)})
     groups = [
         SimpleNamespace(
-            layer_names=[f"mla.{j}" for j in range(attention)],
-            kv_cache_spec=SimpleNamespace(page_size_bytes=page),
+            layer_names=list(pages),
+            kv_cache_spec=SimpleNamespace(
+                kv_cache_specs={
+                    name: SimpleNamespace(page_size_bytes=size)
+                    for name, size in pages.items()
+                }
+            ),
         )
     ]
     for g, layers in enumerate(mamba):
@@ -95,11 +106,11 @@ def _kv_cache_config(*, attention, mamba, page, block=1536, state=832512):
     return SimpleNamespace(kv_cache_groups=groups), mamba_groups
 
 
-def test_k3s_image_is_three_units_over_the_leading_23_planes():
+def test_k3s_image_is_three_units_over_the_leading_23_layers():
     pytest.importorskip("vllm")
     config, mamba = _kv_cache_config(attention=29, mamba=(23, 23, 23), page=884736)
     geometry = kda_ride_geometry(config, 0, mamba)
-    assert geometry.state_planes == 23
+    assert geometry.state_layers == 23
     assert geometry.spec.page_unit_bytes == 23 * 884736
     assert geometry.spec.image_bytes == 3 * 23 * 884736
     assert geometry.spec.units_per_checkpoint == 3
@@ -108,18 +119,21 @@ def test_k3s_image_is_three_units_over_the_leading_23_planes():
 _N, _PAGE, _STATE = 5, 64, 48  # blocks, page bytes, state bytes per block
 
 
-def _pool(*, alias=True):
+def _pool(*, alias=True, index=0):
     """vLLM's allocation in miniature: one buffer, every group layer-outer
-    from byte 0, so mamba layer j shares MLA plane j's bytes."""
+    from byte 0, so mamba layer j shares MLA plane j's bytes; index caches
+    after the MLA planes, as vLLM lays out MLA with a DSA indexer."""
     from atom.config import KVCacheTensor
     from atom.plugin.vllm.kv_transfer.mp_page_layout import build_mp_transfer_tensors
 
-    buffer = torch.zeros(4 * _N * _PAGE, dtype=torch.uint8)
-    planes = [buffer[j * _N * _PAGE :][: _N * _PAGE].view(_N, _PAGE) for j in range(4)]
-    transfer = build_mp_transfer_tensors(
-        [KVCacheTensor(layer_num=j, k_cache=p) for j, p in enumerate(planes)],
-        num_blocks=_N,
-    )
+    buffer = torch.zeros(4 * _N * (_PAGE + index), dtype=torch.uint8)
+    tensors = []
+    for j in range(4):
+        k = buffer[j * _N * _PAGE :][: _N * _PAGE].view(_N, _PAGE)
+        at = 4 * _N * _PAGE + j * _N * index
+        idx = buffer[at:][: _N * index].view(_N, index) if index else None
+        tensors.append(KVCacheTensor(layer_num=j, k_cache=k, index_cache=idx))
+    transfer = build_mp_transfer_tensors(tensors, num_blocks=_N)
     state_buffer = buffer if alias else torch.zeros_like(buffer)
     kda = [
         [
@@ -134,22 +148,25 @@ def _pool(*, alias=True):
         for _ in range(2)
     ]
     config, groups = _kv_cache_config(
-        attention=4, mamba=(3, 3), page=_PAGE, block=16, state=_STATE
+        attention=4, mamba=(3, 3), page=_PAGE, block=16, state=_STATE, index=index
     )
     return transfer, kda, kda_ride_geometry(config, 0, groups)
 
 
-def test_the_state_rides_as_the_native_layout_registers_it():
+@pytest.mark.parametrize("index", [0, 16], ids=["mla", "mla+dsa_index"])
+def test_the_state_rides_as_the_native_layout_registers_it(index):
     """Image unit ``j`` of the layout the worker registers holds mamba group
-    ``j``'s state in the block that unit names."""
+    ``j``'s state in the block that unit names; a DSA index plane between the
+    MLA planes is carried along, not mistaken for the next layer."""
     pytest.importorskip("vllm")
     from atom.kv_transfer.offload.mp.native_state_layout import (
         build_native_state_mp_layout,
     )
 
-    transfer, kda, geometry = _pool()
+    transfer, kda, geometry = _pool(index=index)
+    per_layer = 2 if index else 1
     publish_kda_ride_state(transfer, kda, geometry)
-    assert transfer.paged_state_region_count == 3
+    assert transfer.paged_state_region_count == 3 * per_layer
     assert transfer.native_state_tp_replication_factor == 1
     # One block pool: each group writes only the blocks vLLM gave it.
     owned = {0: (1, 3), 1: (2, 4)}
@@ -164,7 +181,8 @@ def test_the_state_rides_as_the_native_layout_registers_it():
     pages = len(transfer.pages)
     for ordinal, unit in enumerate(units):
         for j in range(3):
-            got = layout.tensors[pages + 3 * ordinal + j][unit, 0, :_STATE]
+            alias = layout.tensors[pages + 3 * per_layer * ordinal + per_layer * j]
+            got = alias[unit, 0, :_STATE]
             assert torch.equal(got.view(torch.int8), kda[ordinal][j][unit].flatten())
             assert int(got[0]) == 10 * ordinal + j + 1
 
@@ -263,3 +281,17 @@ def test_the_ride_refuses_a_deployment_it_cannot_serve(cache, policy, match):
     )
     with pytest.raises(ValueError, match=match):
         refuse_kda_ride_without_prerequisites(config)
+
+
+@pytest.mark.parametrize("kimi_k3, rides", [(True, True), (False, False)])
+def test_only_kimi_k3s_mamba_state_rides_mp(kimi_k3, rides):
+    """Qwen's GDN layers report K3's mamba type; only K3 is sized for the ride,
+    and `__init__` refuses any other mamba model on MP."""
+    stub = SimpleNamespace(
+        _offload_backend="mp",
+        _is_deepseek_v41=False,
+        _v41_checkpoint_group_ids=(),
+        _mamba_groups=[(1, None)],
+        _is_kimi_k3=kimi_k3,
+    )
+    assert AtomLMCacheOffloadConnector._state_rides_mp.fget(stub) is rides
