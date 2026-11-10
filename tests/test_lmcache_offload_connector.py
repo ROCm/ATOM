@@ -7,7 +7,7 @@ import logging
 import sys
 import threading
 import types
-from collections import deque
+from collections import OrderedDict, deque
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -45,6 +45,8 @@ from atom.kv_transfer.disaggregation.types import (
     LoadOperationId,
     SaveOperationId,
     StateStoreOperationId,
+    StateTouchId,
+    connector_metadata_has_work,
 )
 from atom.kv_transfer.offload import _block_gpu_connector
 from atom.kv_transfer.offload import config as offcfg
@@ -74,9 +76,15 @@ from atom.kv_transfer.offload.hybrid.dsv4.policy import (
 )
 from atom.kv_transfer.offload.hybrid.kimi_k3.connector import (
     STATE_INDEX_CHANNEL,
+    STATE_TOUCH_CHANNEL,
+    STATE_TOUCH_REFRESH_CHANNEL,
     KimiK3OffloadConnector,
     KimiK3OffloadScheduler,
     save_stall_seconds,
+)
+from atom.kv_transfer.offload.hybrid.kimi_k3.state_object import (
+    StateByteCodec,
+    TouchResult,
 )
 from atom.kv_transfer.offload.hybrid.kimi_k3.state_tier import _JointPark
 from atom.kv_transfer.offload.hybrid.qwen.connector import QwenOffloadScheduler
@@ -5870,6 +5878,10 @@ def _k3_scheduler() -> KimiK3OffloadScheduler:
     s._save_rr_last = None
     s._pending_state_loads = []
     s._pending_state_stores = []
+    s._pending_state_touches = []
+    s._touch_generation = 0
+    s._state_touch_verdicts = {}
+    s._state_touches_unrefreshed = 0
     s._save_inflight_since = {}
     s._save_stalled = False
     s._warned_save_stalled = False
@@ -6393,6 +6405,12 @@ def test_a_step_whose_only_work_is_a_state_store_reaches_the_worker():
 
     meta = LMCacheOffloadMetadata()
     meta.state_stores = [(111, (1, 2))]
+    assert connector_metadata_has_work(meta)
+
+
+def test_a_step_whose_only_work_is_a_state_touch_reaches_the_worker():
+    meta = LMCacheOffloadMetadata()
+    meta.state_touches = [StateTouchId(7, 0)]
     assert connector_metadata_has_work(meta)
 
 
@@ -7214,6 +7232,394 @@ class TestStateStoreCompletionsCarryAGeneration:
         indexed, failed = s.take_state_reports()
         assert indexed == {op}
         assert failed == set()
+
+
+class _Obj:
+    """A MemoryObj's reference count, and nothing else."""
+
+    def __init__(self, size: int = 1024) -> None:
+        self.refs = 1
+        self.size = size
+
+    def ref_count_up(self) -> None:
+        self.refs += 1
+
+    def ref_count_down(self) -> None:
+        assert self.refs > 0, "reference discharged twice"
+        self.refs -= 1
+
+    def get_ref_count(self) -> int:
+        return self.refs
+
+    def get_size(self) -> int:
+        return self.size
+
+
+class _LRUPolicy:
+    """LMCache's `LRUCachePolicy.update_on_hit`."""
+
+    def update_on_hit(self, key, cache) -> None:
+        cache.move_to_end(key)
+
+
+class _LocalCPU:
+    """`storage_manager` over LocalCPU's rules.
+
+    `batched_put` adopts an object with its own reference unless the key is
+    already resident (LocalCPU refuses duplicates), then drops the caller's.
+    `get` does not touch the LRU (`get_blocking` only takes a reference).
+    `evict_oldest` is the pool making room for KV: oldest first, skipping
+    anything another holder still references.
+    """
+
+    def __init__(self) -> None:
+        self.hot: OrderedDict = OrderedDict()
+        # A second backend (LocalDisk) for presence only: `contains` answers
+        # from it, `get` does not read it (no test loads a disk-only image).
+        self.disk: dict = {}
+        self.puts = 0
+        self.local_cpu_backend = SimpleNamespace(
+            cpu_lock=threading.Lock(), hot_cache=self.hot, cache_policy=_LRUPolicy()
+        )
+
+    def batched_put(self, keys, objs) -> None:
+        self.puts += 1
+        for k, o in zip(keys, objs, strict=True):
+            if k not in self.hot:
+                o.ref_count_up()
+                self.hot[k] = o
+            o.ref_count_down()
+
+    def get(self, key):
+        o = self.hot.get(key)
+        if o is not None:
+            o.ref_count_up()
+        return o
+
+    def contains(self, key):
+        if key in self.hot:
+            return "LocalCPUBackend"
+        return "LocalDiskBackend" if key in self.disk else None
+
+    def spill_to_disk(self, key) -> None:
+        """LocalCPU evicted `key`; the disk backend still holds a copy."""
+        self.disk[key] = True
+        self.hot.pop(key).ref_count_down()
+
+    def remove(self, key) -> int:
+        o = self.hot.pop(key, None)
+        if o is None:
+            return 0
+        o.ref_count_down()
+        return 1
+
+    def evict_oldest(self):
+        for k, o in self.hot.items():
+            if o.get_ref_count() == 1:
+                self.hot.pop(k).ref_count_down()
+                return k
+        return None
+
+
+def _lru_codec(storage, max_entries):
+    codec = StateByteCodec(
+        backend=SimpleNamespace(
+            page_unit_views=lambda units: [], state_entry_views=lambda slot: []
+        ),
+        staged=SimpleNamespace(pack=lambda views, obj: None, unpack=lambda o, v: None),
+        entry_bytes=1024,
+        model_name="qwen",
+        world_size=1,
+        worker_id=0,
+        layout_id="L",
+        max_cache_bytes=None if max_entries is None else max_entries * 1024,
+    )
+    codec.bind_storage_manager(storage)
+    allocated = []
+
+    def allocate(nbytes):
+        allocated.append(_Obj(nbytes))
+        return allocated[-1]
+
+    codec._allocate = allocate
+    return codec, allocated
+
+
+def _kv(pool, name):
+    pool.hot[name] = _Obj()
+
+
+# ── the codec: touch, get and re-store refresh LMCache's LRU ───────────────
+
+
+class TestCodecRefresh:
+    def test_a_touch_moves_the_image_past_older_kv(self, lmcache_key):
+        pool = _LocalCPU()
+        codec, _ = _lru_codec(pool, max_entries=None)
+        assert codec.put(1, [])
+        _kv(pool, "kv-chunk")
+        assert codec.touch(1) is TouchResult.REFRESHED
+        assert pool.evict_oldest() == "kv-chunk"
+        assert codec.key(1) in pool.hot
+
+    def test_a_touch_reports_an_evicted_image_gone(self, lmcache_key):
+        pool = _LocalCPU()
+        codec, _ = _lru_codec(pool, max_entries=3)
+        assert codec.put(1, []) and codec.put(2, []) and codec.put(3, [])
+        assert pool.remove(codec.key(2))
+        assert codec.touch(2) is TouchResult.GONE
+        assert codec.put(4, [])
+        assert codec.key(1) in pool.hot, "a gone image no longer counts against the cap"
+
+    def test_a_resume_refreshes_the_image(self, lmcache_key):
+        """`get_blocking` takes a reference and nothing else."""
+        pool = _LocalCPU()
+        codec, objs = _lru_codec(pool, max_entries=None)
+        assert codec.put(1, [])
+        _kv(pool, "kv-chunk")
+        assert codec.get(1, 0)
+        assert objs[0].refs == 1, "the load's reference is discharged"
+        assert pool.evict_oldest() == "kv-chunk"
+
+    def test_a_resident_image_is_refreshed_not_stored_twice(self, lmcache_key):
+        pool = _LocalCPU()
+        codec, objs = _lru_codec(pool, max_entries=2)
+        released = []
+        assert codec.put(1, [])
+        _kv(pool, "kv-chunk")
+        assert codec.put(1, [], on_source_released=lambda: released.append(True))
+
+        assert len(objs) == 1, "no second image-sized allocation and D2H"
+        assert released == [True], "the source units must still be handed back"
+        assert pool.evict_oldest() == "kv-chunk"
+
+    def test_an_evicted_image_is_stored_again(self, lmcache_key):
+        pool = _LocalCPU()
+        codec, objs = _lru_codec(pool, max_entries=2)
+        assert codec.put(1, [])
+        pool.evict_oldest()
+        assert codec.put(1, [])
+        assert len(objs) == 2 and codec.key(1) in pool.hot
+
+    def test_the_cap_retires_the_least_recently_used_image(self, lmcache_key):
+        """Not the oldest store: the image a touch kept warm survives."""
+        pool = _LocalCPU()
+        codec, objs = _lru_codec(pool, max_entries=2)
+        assert codec.put(1, []) and codec.put(2, [])
+        assert codec.touch(1) is TouchResult.REFRESHED
+        assert codec.put(3, [])
+
+        assert codec.key(2) not in pool.hot
+        assert objs[1].refs == 0, "a retired image goes back to the allocator"
+        assert codec.key(1) in pool.hot and codec.key(3) in pool.hot
+
+    @pytest.mark.parametrize(
+        "missing",
+        [
+            "local_cpu_backend",
+            "local_cpu_backend.cpu_lock",
+            "local_cpu_backend.hot_cache",
+            "local_cpu_backend.cache_policy",
+            "cache_policy.update_on_hit",
+        ],
+    )
+    def test_without_the_lru_internals_a_touch_only_confirms_presence(
+        self, lmcache_key, missing, caplog
+    ):
+        """An LMCache whose internals moved keeps serving loads; bind warns
+        once, naming what is missing, and a touch adds no second warning."""
+        pool = _LocalCPU()
+        if missing == "local_cpu_backend":
+            del pool.local_cpu_backend
+        elif missing == "cache_policy.update_on_hit":
+            pool.local_cpu_backend.cache_policy = SimpleNamespace()
+        else:
+            setattr(pool.local_cpu_backend, missing.split(".")[1], None)
+        with caplog.at_level(logging.WARNING, logger="atom"):
+            codec, _ = _lru_codec(pool, max_entries=None)
+            assert codec.put(1, [])
+            assert codec.touch(1) is TouchResult.PRESENT
+        warned = [r.message for r in caplog.records]
+        assert len(warned) == 1 and missing in warned[0]
+        pool.hot.clear()
+        assert codec.touch(1) is TouchResult.GONE
+
+    def test_the_lru_is_resolved_once_at_bind(self, lmcache_key):
+        pool = _LocalCPU()
+        codec, _ = _lru_codec(pool, max_entries=None)
+        assert codec.put(1, [])
+        _kv(pool, "kv-chunk")
+        pool.local_cpu_backend = None
+        assert codec.touch(1) is TouchResult.REFRESHED
+        assert pool.evict_oldest() == "kv-chunk"
+
+    def test_a_presence_only_touch_is_warned_once(self, lmcache_key, caplog):
+        """A disk-only image is still readable, but its LRU was not refreshed:
+        that must not be silent, and must not be one warning per touch."""
+        pool = _LocalCPU()
+        codec, _ = _lru_codec(pool, max_entries=None)
+        assert codec.put(1, []) and codec.put(2, [])
+        pool.spill_to_disk(codec.key(2))
+        with caplog.at_level(logging.WARNING, logger="atom"):
+            assert codec.touch(1) is TouchResult.REFRESHED
+            assert codec.touch(2) is TouchResult.PRESENT
+            assert codec.touch(2) is TouchResult.PRESENT
+            assert codec.touch(3) is TouchResult.GONE
+        warned = [r for r in caplog.records if "touches_unrefreshed" in r.message]
+        assert len(warned) == 1
+
+    def test_a_disk_only_image_is_stored_back_into_the_cpu_tier(self, lmcache_key):
+        """The put fast path is for an image LocalCPU still holds, not for
+        one only the disk does."""
+        pool = _LocalCPU()
+        codec, objs = _lru_codec(pool, max_entries=None)
+        assert codec.put(1, [])
+        pool.spill_to_disk(codec.key(1))
+        released = []
+        assert codec.put(1, [], on_source_released=lambda: released.append(True))
+        assert pool.puts == 2 and len(objs) == 2
+        assert codec.key(1) in pool.hot
+        assert released == [True]
+
+
+# ── the connector: touches out in the metadata, verdicts back by quorum ────
+
+
+def _touch_worker(tier):
+    c = KimiK3OffloadConnector.__new__(KimiK3OffloadConnector)
+    c._state_tier = tier
+    c._touch_verdicts = {}
+    c._warned_touch_failure = False
+    return c
+
+
+def _reported(worker):
+    out = KVConnectorOutput()
+    worker._emit_touch_verdicts(out)
+    return out.connector_completions
+
+
+def _reports(touch_id, *, resident, refreshed):
+    return {
+        ConnectorCompletion(STATE_TOUCH_CHANNEL, touch_id, resident),
+        ConnectorCompletion(STATE_TOUCH_REFRESH_CHANNEL, touch_id, refreshed),
+    }
+
+
+class TestConnectorTouches:
+    def test_the_worker_touches_and_reports_each_verdict(self):
+        touched = []
+
+        found = {1: TouchResult.REFRESHED, 2: TouchResult.GONE, 3: TouchResult.PRESENT}
+
+        def touch(h):
+            touched.append(h)
+            return found[h]
+
+        worker = _touch_worker(SimpleNamespace(codec=SimpleNamespace(touch=touch)))
+        ids = [StateTouchId(1, 0), StateTouchId(2, 1), StateTouchId(3, 2)]
+        worker._touch_states(SimpleNamespace(state_touches=ids))
+        assert touched == [1, 2, 3]
+        # Only a present-but-unrefreshed image reports unrefreshed.
+        assert _reported(worker) == (
+            _reports(ids[0], resident=True, refreshed=True)
+            | _reports(ids[1], resident=False, refreshed=True)
+            | _reports(ids[2], resident=True, refreshed=False)
+        )
+        assert _reported(worker) == set(), "drained once"
+
+    def test_start_load_kv_touches(self, monkeypatch):
+        monkeypatch.setattr(DenseOffloadConnector, "start_load_kv", lambda s, m: None)
+        worker = _touch_worker(
+            SimpleNamespace(
+                codec=SimpleNamespace(touch=lambda h: TouchResult.REFRESHED)
+            )
+        )
+        meta = LMCacheOffloadMetadata()
+        meta.state_touches = [StateTouchId(7, 0)]
+        worker.start_load_kv(meta)
+        assert _reported(worker) == _reports(
+            StateTouchId(7, 0), resident=True, refreshed=True
+        )
+
+    def test_with_no_tier_every_image_is_gone(self):
+        worker = _touch_worker(None)
+        worker._touch_states(SimpleNamespace(state_touches=[StateTouchId(1, 0)]))
+        assert _reported(worker) == _reports(
+            StateTouchId(1, 0), resident=False, refreshed=True
+        )
+
+    def test_a_failing_touch_is_unrefreshed_and_logged_once(self, caplog):
+        """A raising touch keeps the image (resident) but is not a refresh;
+        a drifted LMCache raises on every touch, so one traceback."""
+
+        def touch(h):
+            raise RuntimeError("backend hiccup")
+
+        worker = _touch_worker(SimpleNamespace(codec=SimpleNamespace(touch=touch)))
+        ids = [StateTouchId(1, 0), StateTouchId(2, 1), StateTouchId(1, 2)]
+        with caplog.at_level(logging.WARNING, logger="atom"):
+            worker._touch_states(SimpleNamespace(state_touches=ids[:2]))
+            worker._touch_states(SimpleNamespace(state_touches=ids[2:]))
+        assert _reported(worker) == set().union(
+            *(_reports(i, resident=True, refreshed=False) for i in ids)
+        )
+        assert [r.exc_info is not None for r in caplog.records] == [True]
+
+    def _scheduler(self, monkeypatch):
+        monkeypatch.setattr(
+            DenseOffloadScheduler,
+            "build_connector_meta",
+            lambda self: LMCacheOffloadMetadata(),
+        )
+        s = _k3_scheduler()
+        s._refresh_save_stall = lambda: None
+        return s
+
+    def test_each_touch_is_a_distinct_identity_drained_once(self, monkeypatch):
+        s = self._scheduler(monkeypatch)
+        assert s.enqueue_state_touches([5, 5])
+        meta = s.build_connector_meta()
+        assert meta.state_touches == [StateTouchId(5, 0), StateTouchId(5, 1)]
+        assert s.build_connector_meta().state_touches == []
+
+    def test_one_rank_missing_the_image_makes_it_gone(self, monkeypatch):
+        s = self._scheduler(monkeypatch)
+        for op, ok in ((StateTouchId(5, 0), True), (StateTouchId(5, 1), False)):
+            handled = s.connector_completion(
+                ConnectorCompletion(STATE_TOUCH_CHANNEL, op, ok)
+            )
+            assert handled is None, "handled, but not a terminal save"
+        s.connector_completion(
+            ConnectorCompletion(STATE_TOUCH_CHANNEL, StateTouchId(6, 2), True)
+        )
+        assert s.take_state_touch_verdicts() == {5: False, 6: True}
+        assert s.take_state_touch_verdicts() == {}
+
+    def test_both_touch_reports_reach_quorum_across_tp(self, monkeypatch):
+        """Each rank files a residency and a refresh report per touch; one
+        rank that only found the image present counts the touch unrefreshed
+        without making it gone."""
+        touch = StateTouchId(5, 0)
+        outputs = []
+        for result in (TouchResult.REFRESHED, TouchResult.PRESENT):
+            worker = _touch_worker(
+                SimpleNamespace(codec=SimpleNamespace(touch=lambda h, r=result: r))
+            )
+            worker._touch_states(SimpleNamespace(state_touches=[touch]))
+            outputs.append(KVConnectorOutput(connector_completions=_reported(worker)))
+        merged = KVOutputAggregator(world_size=2).aggregate(outputs)
+        s = self._scheduler(monkeypatch)
+        monkeypatch.setattr(
+            OffloadSchedulerMixin, "get_statistics", lambda self: {"load_requests": 3}
+        )
+        for completion in merged.connector_completions:
+            assert s.connector_completion(completion) is None, "not a save"
+        assert s.take_state_touch_verdicts() == {5: True}
+        assert s.get_statistics() == {
+            "load_requests": 3,
+            "state_touches_unrefreshed": 1,
+        }
 
 
 # ── kimi_k3: loads must not queue behind a backlog of stores ───────────────
