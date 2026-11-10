@@ -139,6 +139,7 @@ def test_dpa_media_rejected_before_tokenization_and_sequence_creation(
     draft_tokens, entry
 ):
     from atom.model_engine.llm_engine import InputOutputProcessor
+    from atom.sampling_params import SamplingParams
 
     def unexpected_encode(prompt):
         pytest.fail("Unsupported media reached tokenization")
@@ -159,12 +160,12 @@ def test_dpa_media_rejected_before_tokenization_and_sequence_creation(
             LLMEngine.add_request(
                 engine,
                 ["image prompt"],
-                SimpleNamespace(n=2),
+                SamplingParams(n=2),
                 multimodal_data_list=[{"image": 1}],
             )
         else:
             getattr(processor, entry)(
                 "image prompt",
-                SimpleNamespace(n=1 if entry == "preprocess" else 2),
+                SamplingParams(n=1 if entry == "preprocess" else 2),
                 multimodal_data={"image": 1},
             )

@@ -5,7 +5,6 @@ import torch
 from aiter.dist.parallel_state import get_tp_group
 
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
-from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.state_runtime import StateTransfer
 from atom.model_ops.attention_mla import MLAAttention
 from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
@@ -49,6 +48,10 @@ class KimiMLAGDNBackend(AttentionBackend):
 class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
     def __init__(self, model_runner):
         super().__init__(model_runner=model_runner)
+
+    def spec_honours_state_fork(self) -> bool:
+        # K3's KDA forward reads the fork table; glm5_next's does not.
+        return self.model_runner.hf_text_config.model_type == "kimi_linear"
 
     def _module_kinds(self, module) -> tuple:
         """Two row spaces: the MLA pool's rows, and the KDA state slots.
@@ -496,47 +499,10 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
 
         return None
 
-    def prepare_prefill(
-        self, batch: ScheduledBatch, running_bs: int, running_tokens: int
-    ):
-        attn_metadata, positions = super().prepare_prefill(
-            batch, running_bs, running_tokens
+    def build_for_cudagraph_capture(self, bs: int, *, decode_ubatch_slices=None):
+        attn_metadata, context = super().build_for_cudagraph_capture(
+            bs, decode_ubatch_slices=decode_ubatch_slices
         )
-        if batch.block_tables == []:
-            attn_metadata.gdn_metadata = None
-            return attn_metadata, positions
-        attn_metadata.gdn_metadata = self.prepare_gdn_metadata(
-            batch,
-            attn_metadata,
-            is_prefill=True,
-            prepare_block_tables=False,
-        )
-        return attn_metadata, positions
-
-    def prepare_decode(
-        self,
-        batch: ScheduledBatch,
-        running_bs: int,
-        running_tokens: int,
-        max_seqlen_q: int,
-    ):
-        attn_metadata, positions = super().prepare_decode(
-            batch, running_bs, running_tokens, max_seqlen_q
-        )
-        self._attach_gdn_decode_metadata(
-            batch,
-            attn_metadata,
-            prepare_block_tables=False,
-        )
-        return attn_metadata, positions
-
-    def _capture_needs_nonempty_kv(self, max_q_len: int) -> bool:
-        # Kimi's dense MLA warmup needs a page even with page_size=1.
-        # The parent owns the single upload, including DCP + MTP capture.
-        return True
-
-    def build_for_cudagraph_capture(self, bs: int):
-        attn_metadata, context = super().build_for_cudagraph_capture(bs)
         attn_metadata.gdn_metadata = self._build_gdn_capture_metadata(bs)
         return attn_metadata, context
 

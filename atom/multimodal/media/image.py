@@ -14,10 +14,16 @@ if TYPE_CHECKING:
 
 
 def load_image(data: ImageItem, connector: MediaConnector) -> Image.Image:
-    from PIL import Image, UnidentifiedImageError
+    """Decode an image and return it in its decoded mode.
+
+    Color conversion is left to the model's processor: converting here would
+    drop the alpha channel and palette transparency before a processor that
+    handles them sees the image.
+    """
+    from PIL import Image
 
     if isinstance(data, Image.Image):
-        return data.convert("RGB")
+        return data
     if isinstance(data, EncodedMedia):
         image_bytes = data.data
     elif isinstance(data, bytes):
@@ -25,7 +31,9 @@ def load_image(data: ImageItem, connector: MediaConnector) -> Image.Image:
     else:
         image_bytes = connector.read(data)
     try:
-        with Image.open(io.BytesIO(image_bytes)) as image:
-            return image.convert("RGB")
-    except UnidentifiedImageError as exc:
+        image = Image.open(io.BytesIO(image_bytes))
+        # Decode now, so invalid data fails here rather than in the processor.
+        image.load()
+    except OSError as exc:  # UnidentifiedImageError included
         raise ValueError("Invalid image data") from exc
+    return image

@@ -27,16 +27,72 @@ def ceil_pow2_code(value):
 
 
 @triton.jit
+def pow2_reciprocal(code):
+    """1 / 2**(code - 127) for an E8M0 code. Exact, so a multiply by it rounds
+    as the division by the scale does; a code past the finite range (an Inf
+    amax) gives 0, which multiplies as the division by Inf does."""
+    return (tl.maximum(254 - code.to(tl.int32), 0) << 23).to(tl.float32, bitcast=True)
+
+
+@triton.jit
+def fp8_groups(x):
+    """``x`` [groups, 32] f32 as E4M3 with an E8M0 scale a group: (values,
+    biased exponent codes, scales)."""
+    amax = tl.maximum(tl.max(tl.abs(x), 1), AMAX_FLOOR)
+    code = ceil_pow2_code(amax * (1.0 / FP8_MAX))
+    scale = (code << 23).to(tl.float32, bitcast=True)
+    q = tl.minimum(
+        tl.maximum(x * pow2_reciprocal(code)[:, None], -FP8_MAX), FP8_MAX
+    ).to(FP8_TL_DTYPE)
+    return q, code, scale
+
+
+@triton.jit
+def fp4_groups(x, E4M3_SCALE: tl.constexpr):
+    """``x`` [groups, GROUP] f32 as E2M1 with a scale a group, E4M3 or E8M0:
+    (magnitude codes, sign bits, scales, E8M0 exponents -- zero under E4M3)."""
+    amax = tl.max(tl.abs(x), 1)
+    if E4M3_SCALE:
+        scale = (
+            (tl.maximum(amax, 6.0 * 2.0**-9) * (1.0 / 6.0))
+            .to(tl.float8e4nv)
+            .to(tl.float32)
+        )
+        exponent = tl.zeros_like(amax).to(tl.uint32)
+        magnitude = tl.abs(x / scale[:, None])
+    else:
+        exponent = ceil_pow2_code(tl.maximum(amax, 6.0 * 2.0**-126) * (1.0 / 6.0))
+        scale = (exponent << 23).to(tl.float32, bitcast=True)
+        magnitude = tl.abs(x * pow2_reciprocal(exponent)[:, None])
+    # E2M1 nearest-even rounding, including the asymmetric midpoint comparisons.
+    code = (magnitude > 0.25).to(tl.uint8)
+    code = tl.where(magnitude >= 0.75, 2, code)
+    code = tl.where(magnitude > 1.25, 3, code)
+    code = tl.where(magnitude >= 1.75, 4, code)
+    code = tl.where(magnitude > 2.5, 5, code)
+    code = tl.where(magnitude >= 3.5, 6, code)
+    code = tl.where(magnitude > 5.0, 7, code)
+    sign = (x.to(tl.uint32, bitcast=True) >> 31).to(tl.uint8)
+    return code, sign, scale, exponent
+
+
+@triton.jit
+def fp4_pack(code, sign):
+    """`fp4_groups`' codes and signs [groups, GROUP] as bytes [groups,
+    GROUP // 2], each element's E2M1 nibble low first."""
+    pairs = tl.reshape(code | (sign << 3), (code.shape[0], code.shape[1] // 2, 2))
+    lo, hi = tl.split(pairs)
+    return lo | (hi << 4)
+
+
+@triton.jit
 def quantize_fp8_kernel(X, Y, S, SIZE, DEQUANT: tl.constexpr):
     # SIZE is the token count. A `tl.constexpr` here builds one kernel per
     # prefill chunk length and per batch size, and it only bounds the tiles.
     groups = tl.program_id(0) * 32 + tl.arange(0, 32)
     offsets = groups[:, None] * 32 + tl.arange(0, 32)[None, :]
     x = tl.load(X + offsets, offsets < SIZE, other=0).to(tl.float32)
-    amax = tl.maximum(tl.max(tl.abs(x), 1), AMAX_FLOOR)
-    code = ceil_pow2_code(amax * (1.0 / FP8_MAX))
-    scale = (code << 23).to(tl.float32, bitcast=True)
-    q = tl.minimum(tl.maximum(x / scale[:, None], -FP8_MAX), FP8_MAX).to(FP8_TL_DTYPE)
+    q, code, scale = fp8_groups(x)
     if DEQUANT:
         tl.store(Y + offsets, q.to(tl.float32) * scale[:, None], offsets < SIZE)
     else:
@@ -57,26 +113,7 @@ def quantize_fp4_kernel(
     groups = tl.program_id(0) * 32 + tl.arange(0, 32)
     offsets = groups[:, None] * GROUP + tl.arange(0, GROUP)[None, :]
     x = tl.load(X + offsets, offsets < SIZE, other=0).to(tl.float32)
-    amax = tl.max(tl.abs(x), 1)
-    if E4M3_SCALE:
-        scale = (
-            (tl.maximum(amax, 6.0 * 2.0**-9) * (1.0 / 6.0))
-            .to(tl.float8e4nv)
-            .to(tl.float32)
-        )
-    else:
-        exponent = ceil_pow2_code(tl.maximum(amax, 6.0 * 2.0**-126) * (1.0 / 6.0))
-        scale = (exponent << 23).to(tl.float32, bitcast=True)
-    magnitude = tl.abs(x / scale[:, None])
-    # E2M1 nearest-even rounding, including the asymmetric midpoint comparisons.
-    code = (magnitude > 0.25).to(tl.uint8)
-    code = tl.where(magnitude >= 0.75, 2, code)
-    code = tl.where(magnitude > 1.25, 3, code)
-    code = tl.where(magnitude >= 1.75, 4, code)
-    code = tl.where(magnitude > 2.5, 5, code)
-    code = tl.where(magnitude >= 3.5, 6, code)
-    code = tl.where(magnitude > 5.0, 7, code)
-    sign = (x.to(tl.uint32, bitcast=True) >> 31).to(tl.uint8)
+    code, sign, scale, exponent = fp4_groups(x, E4M3_SCALE)
     if DEQUANT:
         value = tl.where(
             code < 4, code * 0.5, tl.where(code < 6, code - 2.0, (code - 4.0) * 2.0)
@@ -84,12 +121,10 @@ def quantize_fp4_kernel(
         value = tl.where(sign != 0, -value, value)
         tl.store(Y + offsets, value * scale[:, None], offsets < SIZE)
     else:
-        code = (code | (sign << 3)).reshape(32, GROUP // 2, 2)
-        packed = tl.sum(code.to(tl.int32) << (tl.arange(0, 2)[None, None, :] * 4), 2)
         packed_offsets = (
             groups[:, None] * (GROUP // 2) + tl.arange(0, GROUP // 2)[None, :]
         )
-        tl.store(Y + packed_offsets, packed.to(tl.uint8), packed_offsets < SIZE // 2)
+        tl.store(Y + packed_offsets, fp4_pack(code, sign), packed_offsets < SIZE // 2)
         if E4M3_SCALE:
             tl.store(S + groups, scale, groups < SIZE // GROUP)
         else:

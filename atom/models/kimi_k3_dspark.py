@@ -49,13 +49,19 @@ Checkpoint layout (Inferact/Kimi-K3-DSpark, 68 tensors, single-file BF16):
   layers.{i}.mlp.down_proj.weight               [7168, 14336]
   markov_head.markov_w{1,2}.weight              [163840, 256]
   confidence_head.proj.{weight,bias}            SKIPPED (training-only)
-  embed_tokens.weight                           SKIPPED (target's is shared)
+  embed_tokens.weight                           SKIPPED (target's is shared;
+                                                loaded on PP stages > 0)
+
+Inferact/Kimi-K3.1-DSpark (67 tensors) is the same tree with 96 heads (q_b_proj
+[18432, 1536], kv_b_proj [24576, 512], o_proj [7168, 12288]), Markov rank 512
+and no embed_tokens; its ``rope_interleave: true`` is the same interleaved rope.
 """
 
 from typing import TYPE_CHECKING, ClassVar
 
 import torch
 from aiter import QuantType, dtypes
+from aiter.dist.parallel_state import get_pp_group
 from aiter.rotary_embedding import get_rope
 from torch import nn
 
@@ -66,6 +72,7 @@ from atom.model_ops.attention_mla import (
     qrep_tp_override,
 )
 from atom.model_ops.base_attention import Attention
+from atom.model_ops.embed_head import VocabParallelEmbedding
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import (
     ColumnParallelLinear,
@@ -73,11 +80,13 @@ from atom.model_ops.linear import (
     MergedReplicatedLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    mxfp4_k_pad_align,
     uses_mxfp4_n32k4_scale,
 )
 from atom.models.deepseek_v2 import _fuse_rmsnorm_quant, yarn_get_mscale
 from atom.models.dspark_draft import DSparkDraftModel, DSparkMarkovHead, linear_out
 from atom.models.kimi_k3 import _RMS_FUSABLE_QUANT_TYPES
+from atom.models.utils import is_neox_rope_style
 from atom.quant_spec import effective_layer_quant
 
 if TYPE_CHECKING:
@@ -227,8 +236,10 @@ class K3DSparkMLAAttention(nn.Module):
             max_position=config.max_position_embeddings,
             base=rope_theta,
             rope_scaling=rope_scaling,
-            # DeepSeek-style MLA rope is interleaved unless told otherwise.
-            is_neox_style=bool(getattr(config, "rope_interleave", False)),
+            # DeepSeek's MLA rope: interleaved when unspecified
+            is_neox_style=is_neox_rope_style(
+                config, "rope_interleave", default_is_neox=False
+            ),
         )
         if rope_scaling:
             mscale = yarn_get_mscale(
@@ -402,12 +413,16 @@ class K3DSparkMLP(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        # An MXFP4 down_proj cannot take an unaligned K (its per-rank
+        # intermediate); the pair pads it together. See mxfp4_k_pad_align.
+        intermediate_pad = mxfp4_k_pad_align(quant_config, f"{prefix}.down_proj")
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj",
+            output_pad_align=intermediate_pad,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -415,6 +430,7 @@ class K3DSparkMLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.down_proj",
+            input_pad_align=intermediate_pad,
         )
         self.act_fn = SiluAndMul()
 
@@ -531,11 +547,14 @@ class KimiK3DSpark(DSparkDraftModel):
     #   embed_tokens: a 2.35GB copy of the target's table. The target's is
     #     shared instead (share_with_target), so loading it would just burn
     #     memory and risk drifting from the target's.
-    skip_weight_prefixes: ClassVar[list[str]] = [
+    #
+    # Under PP, __init__ drops embed_tokens from this list on non-first stages.
+    # A tuple, not a ClassVar: the per-stage override rebinds, never mutates.
+    skip_weight_prefixes: tuple[str, ...] = (
         "confidence_head.",
         "embed_tokens.",
         "lm_head.",
-    ]
+    )
 
     def __init__(self, atom_config: "Config", layer_offset: int = 0) -> None:
         super().__init__()
@@ -578,7 +597,18 @@ class KimiK3DSpark(DSparkDraftModel):
         self.vocab_size = int(config.vocab_size)
 
         # Bound by share_with_target(); both are skipped at load.
-        self.embed_tokens = None
+        # Exception: under PP the drafter lives on the last stage, whose target
+        # embedding is a PPMissingLayer, so load the checkpoint's own copy.
+        self.own_embed_tokens = not get_pp_group().is_first_rank
+        if self.own_embed_tokens:
+            self.skip_weight_prefixes = tuple(
+                p for p in self.skip_weight_prefixes if p != "embed_tokens."
+            )
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size, config.hidden_size, prefix="embed_tokens"
+            )
+        else:
+            self.embed_tokens = None
         self.lm_head = None
         # vLLM 0.28 probes this attribute before enabling adaptive verification.
         # This checkpoint deliberately skips the training-only head.
@@ -594,14 +624,16 @@ class KimiK3DSpark(DSparkDraftModel):
         The vocabularies must agree or the shared LM head would silently score
         the wrong rows.
         """
-        target_vocab = target_base.model.embed_tokens.num_embeddings
+        # Not embed_tokens.num_embeddings: under PP it may be a PPMissingLayer.
+        target_vocab = target_base.model.vocab_size
         if target_vocab != self.hf_config.vocab_size:
             raise ValueError(
                 f"DSpark draft vocab {self.hf_config.vocab_size} != target vocab "
                 f"{target_vocab}. The draft shares the target's embedding and LM "
                 "head, so the two must agree."
             )
-        self.embed_tokens = target_base.model.embed_tokens
+        if not self.own_embed_tokens:
+            self.embed_tokens = target_base.model.embed_tokens
         self.lm_head = target_base.lm_head
 
     # ---- drafting entry points (called by the proposer) --------------------

@@ -25,8 +25,10 @@ def _stats(**kw) -> EngineStats:
     return EngineStats(**kw)
 
 
-def test_time_mode_is_unchanged_by_default():
+def test_time_mode_is_unchanged_by_default(monkeypatch):
     """Default construction keeps the clock; steps are inert."""
+    # Use exactly representable times for the inclusive interval boundary.
+    monkeypatch.setattr(engine_stats, "time", SimpleNamespace(monotonic=lambda: 100.0))
     s = _stats(throughput_log_interval_s=10.0)
     assert s.throughput_log_interval_steps == 0
     for _ in range(1000):
@@ -324,8 +326,9 @@ def test_ranks_stay_aligned_when_only_one_of_them_has_work():
 
 
 @pytest.mark.parametrize("steps", [-5, -1])
-def test_a_negative_interval_falls_back_to_the_clock(steps):
+def test_a_negative_interval_falls_back_to_the_clock(steps, monkeypatch):
     """Clamped rather than raised: a bad value must not stop the engine."""
+    monkeypatch.setattr(engine_stats, "time", SimpleNamespace(monotonic=lambda: 100.0))
     s = _stats(throughput_log_interval_s=10.0, throughput_log_interval_steps=steps)
     assert s.throughput_log_interval_steps == 0
     s.bump_step()

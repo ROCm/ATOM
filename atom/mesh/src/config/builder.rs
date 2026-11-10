@@ -1,6 +1,7 @@
 use super::{
     AtomPdRankMappingPolicy, BackendType, CircuitBreakerConfig, ConfigResult, HealthCheckConfig,
-    MetricsConfig, PolicyConfig, RetryConfig, RouterConfig, RoutingMode, TokenizerCacheConfig,
+    MetricsConfig, PolicyConfig, PreparePoolConfig, RetryConfig, RouterConfig, RoutingMode,
+    TokenizerCacheConfig,
 };
 use crate::core::ConnectionMode;
 
@@ -12,6 +13,11 @@ pub struct RouterConfigBuilder {
 }
 
 impl RouterConfigBuilder {
+    pub fn prepare_pool(mut self, config: PreparePoolConfig) -> Self {
+        self.config.prepare_pool = config;
+        self
+    }
+
     #[cfg(feature = "ext-proc")]
     pub fn ext_proc(mut self, config: crate::ext_proc::ExtProcConfig) -> Self {
         self.config.ext_proc = config;
