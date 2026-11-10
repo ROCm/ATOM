@@ -416,6 +416,48 @@ def test_an_own_pool_draft_without_a_flag_keeps_the_targets_dtype(monkeypatch, t
         assert config.speculative_config.kv_cache_dtype == target
 
 
+def _v41_dspark_spec():
+    """A V4.1 DSpark draft: CSA2, which only native ATOM has a backend for."""
+    hf = PretrainedConfig(
+        architectures=["DeepseekV41DSparkModel"], model_type="deepseek_v41_dspark"
+    )
+    return SpeculativeConfig(
+        method="dspark",
+        model="draft",
+        num_speculative_tokens=3,
+        draft_model_hf_config=hf,
+    )
+
+
+def test_a_plugin_config_with_a_v41_dspark_draft_never_asks_the_selector(
+    monkeypatch,
+):
+    """vLLM / SGLang have no CSA2 backend, and V4.1 DSpark is a supported plugin
+    deployment: whether the draft owns a pool is a native runner's question, so
+    `Config` must not route it through the selector (which raises for CSA2)."""
+    from atom.plugin import prepare
+    from atom.utils import selector
+
+    monkeypatch.setattr(prepare, "_CURRENT_FRAMEWORK", "vllm")
+    asked = []
+    # the autouse stub above answers every family; the real answer for CSA2 under
+    # vLLM is `get_attn_backend_cls`'s refusal
+    monkeypatch.setattr(
+        selector,
+        "get_attn_backend",
+        lambda family: asked.append(family)
+        or selector.get_attn_backend_cls(family, False, True),
+    )
+    config = _m3(
+        monkeypatch,
+        kv_cache_dtype="bf16",
+        index_cache_dtype="bf16",
+        speculative_config=_v41_dspark_spec(),
+    )
+    assert asked == []
+    assert config.speculative_config.kv_cache_dtype == "bf16"
+
+
 def test_a_draft_dtype_beside_the_targets_cannot_share_the_offload_namespace(
     monkeypatch,
 ):

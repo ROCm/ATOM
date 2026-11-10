@@ -12,6 +12,28 @@ logger = logging.getLogger("atom")
 DRAFT_KV_ROWS = "draft_kv"
 
 
+def draft_owns_kv_pool(config) -> bool:
+    """Whether `config`'s speculative draft caches into a KV pool of its own.
+
+    What `draft_kv_builder` will answer for the same draft, decided from the config
+    alone so `Config` and the offload deployment checks can ask it before any runner
+    exists. Only DSpark has such a pool, and only the native runner builds it: under
+    a plugin the framework owns the KV cache and the selector has no backend for
+    every draft flavor (CSA2 raises), so the answer there is no without asking it.
+    """
+    from atom.plugin import is_plugin_mode
+
+    spec = getattr(config, "speculative_config", None)  # test stubs omit it
+    draft_hf = getattr(spec, "draft_model_hf_config", None)
+    if getattr(spec, "method", None) != "dspark" or draft_hf is None:
+        return False
+    if is_plugin_mode():
+        return False
+    from atom.utils.selector import attn_family, get_attn_backend
+
+    return bool(get_attn_backend(attn_family(draft_hf)).DRAFT_OWNS_KV_POOL)
+
+
 def draft_kv_builder(model_runner, draft_hf):
     """The KV builder a draft needs of its own, or None if it needs none.
 

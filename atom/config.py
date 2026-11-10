@@ -2989,16 +2989,14 @@ class Config:
                     else self.kv_cache_dtype
                 )
         if self.speculative_config is not None:
-            from atom.kv_transfer.offload.mp.deployment import (
-                _config_has_own_pool_draft,
-            )
+            from atom.spec_decode.draft_kv import draft_owns_kv_pool
 
             spec = self.speculative_config
             # The one place the draft's pool and dtype are settled: everything
             # downstream (the draft builder, the proposer, the calibration identity)
             # reads `spec.kv_cache_dtype`.
             spec.kv_cache_dtype = resolve_draft_kv_dtype(
-                spec, self.kv_cache_dtype, own_pool=_config_has_own_pool_draft(self)
+                spec, self.kv_cache_dtype, own_pool=draft_owns_kv_pool(self)
             )
         if is_m3:
             from atom.models.minimax_m3.config import validate_runtime_config
