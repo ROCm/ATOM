@@ -50,9 +50,7 @@ from atom.plugin.sglang.deepseek_v4_bridge import (
     ATOMDeepSeekV4ProxyKVPool,
     _geometry_serves_ratio,
     _geometry_supports_shared_prefill_writer,
-    _init_v4_split_plans,
     _proxy_pool_geometry,
-    _publish_fp4_decode_topk,
     _resolve_v4_pool_geometry,
     _write_dense_only_prefill_indices,
     build_atom_v4_verify_graph_metadata_from_sglang,
@@ -327,17 +325,6 @@ def test_draft_extend_graph_metadata_uses_reconstructed_positions():
     # Four tokens at the chunk start contribute 1+2+3+4 extend rows per request.
     assert int(md.kv_indices_extend[0]) == 0
     assert int(md.kv_indptr_extend[-1]) == bs * 10
-
-
-def test_sglang_v4_metadata_declares_fp4_decode_topk():
-    metadata = SimpleNamespace()
-    _init_v4_split_plans(metadata)
-    assert metadata.fp4_decode_topk is None
-
-    storage = torch.arange(8, dtype=torch.int32).reshape(2, 4)
-    _publish_fp4_decode_topk(metadata, 2, storage)
-    # No ATOM config in this test, so the FP4 scorer stays off.
-    assert metadata.fp4_decode_topk is None
 
 
 def test_draft_extend_swa_patch_does_not_pass_removed_kernel_kwargs():

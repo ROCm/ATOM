@@ -9,8 +9,7 @@ import pytest
 import torch
 
 from atom.models.utils import get_pp_indices
-from atom.utils.forward_context import get_published_dcp_local_context_lens
-from atom.utils.tbo.ubatch_splitting import decode_ubatch_request_ranges
+from atom.utils.tbo.ubatch_splitting import cut_decode_ubatches
 
 try:
     import aiter  # noqa: F401
@@ -21,9 +20,37 @@ try:
         _pad_prefill_mla_draft_tail,
         indexes_by_token_table,
     )
-    from atom.model_ops.indexer import ConcatKeys, concat_rows
 except (ImportError, RuntimeError) as exc:
     pytest.skip(f"aiter MLA backend unavailable: {exc}", allow_module_level=True)
+
+
+@pytest.mark.parametrize("persistent", [False, True])
+def test_the_persistent_decode_is_any_mla_layers(persistent):
+    """The step's dense work plan is read on the persistent kernel when any
+    MLA layer decodes there (`MLAAttention.decode_is_persistent`); a ragged
+    step is refused then, its plan laying sequences `max_seqlen_q` apart."""
+
+    def impl(on_persistent):
+        cls = type(
+            "Impl",
+            (aiter_mla.MLAAttention,),
+            {"decode_is_persistent": lambda self: on_persistent},
+        )
+        return cls.__new__(cls)
+
+    sfc = {
+        "layers.0.attn": SimpleNamespace(impl=impl(False)),
+        "layers.1.attn": SimpleNamespace(impl=impl(persistent)),
+        "layers.1.mlp": SimpleNamespace(),
+    }
+    builder = SimpleNamespace(
+        model_runner=SimpleNamespace(
+            config=SimpleNamespace(
+                compilation_config=SimpleNamespace(static_forward_context=sfc)
+            )
+        )
+    )
+    assert AiterMLAMetadataBuilder._decode_runs_persistent(builder) is persistent
 
 
 def test_global_index_cache_layout_excludes_shared_and_keeps_mtp():
@@ -667,57 +694,29 @@ def _capture_metadata_builder(dcp_world_size, *, is_sparse):
     builder.indexes_by_token_table = indexes_by_token_table(
         is_sparse, dcp_world_size, builder.index_kpool
     )
-    builder._tbo_ubatch_request_ranges = []
     builder.dtype_q = None
+    builder.index_topk_out = 2
+    builder._sparse_kv_indices_gpu = torch.zeros(bs * 2, dtype=torch.int32)
+    builder._dcp_sparse_kv_indptr_gpu = torch.zeros(bs + 1, dtype=torch.int32)
+    builder._dcp_owned_counts_gpu = torch.zeros(bs, dtype=torch.int32)
     builder.set_mla_persistent_worker_buffers = lambda *args, **kwargs: {}
     return builder, var
 
 
-def test_cudagraph_capture_publishes_dcp_local_context_lens():
-    builder, var = _capture_metadata_builder(dcp_world_size=4, is_sparse=True)
-
-    metadata, _ = builder.build_for_cudagraph_capture(bs=4)
-
-    torch.testing.assert_close(
-        metadata.dcp_local_context_lens, torch.ones(4, dtype=torch.int32)
-    )
-    assert var["dcp_local_context_lens"].copy_sizes == [4]
-    assert (
-        get_published_dcp_local_context_lens(metadata, 4)
-        is metadata.dcp_local_context_lens
-    )
-
-
 @pytest.mark.parametrize(
-    ("dcp_world_size", "is_sparse"),
-    [(1, True), (4, False)],
-)
-def test_cudagraph_capture_keeps_non_sparse_dcp_paths_independent(
-    dcp_world_size, is_sparse
-):
-    builder, var = _capture_metadata_builder(
-        dcp_world_size=dcp_world_size, is_sparse=is_sparse
-    )
-    assert "dcp_local_context_lens" not in var
-
-    metadata, _ = builder.build_for_cudagraph_capture(bs=4)
-
-    assert metadata.dcp_local_context_lens is None
-
-
-@pytest.mark.parametrize(
-    ("scheduled_bs", "expected"),
-    # ubatch 1 starts where its micro-batch's requests do, not at half the
-    # padded batch: 3 scheduled requests split [0, 1) / [1, 3).
+    ("running_bs", "expected"),
+    # ubatch 1 holds the step's last requests: 4 split [0, 2) / [2, 4), 3
+    # split [0, 1) / [1, 3).
     [(4, [13, 14]), (3, [12, 13])],
 )
-def test_ubatch_metadata_views_full_dcp_local_context_buffer(scheduled_bs, expected):
+def test_a_decode_micro_batch_reads_its_own_copy_of_the_per_token_rows(
+    running_bs, expected
+):
+    """A replayed micro-batch reads fixed addresses, so its per-token index
+    rows are its own buffer's, copied from its own tokens -- never a view of
+    the step's at an offset the recording fixed."""
     builder, var = _capture_metadata_builder(dcp_world_size=4, is_sparse=True)
-    builder._tbo_ubatch_request_ranges = decode_ubatch_request_ranges(scheduled_bs, 2)
-    builder._set_ubatch_mla_buffers = lambda *args, **kwargs: None
-    var["dcp_local_context_lens"].gpu.copy_(
-        torch.tensor([11, 12, 13, 14], dtype=torch.int32)
-    )
+    var["dcp_local_context_lens"].np[:4] = [11, 12, 13, 14]
     p = "ub1_"
     for name, size in (
         ("slot_mapping", 2),
@@ -729,6 +728,7 @@ def test_ubatch_metadata_views_full_dcp_local_context_buffer(scheduled_bs, expec
         ("kv_last_page_lens", 2),
         ("sparse_kv_indptr", 3),
         ("g_kv_indptr", 3),
+        ("dcp_local_context_lens", 2),
     ):
         var[f"{p}{name}"] = _FakeMetadataBuffer(size)
     for name in (
@@ -741,37 +741,53 @@ def test_ubatch_metadata_views_full_dcp_local_context_buffer(scheduled_bs, expec
     ):
         var[f"{p}{name}"] = torch.empty(1)
 
-    metadata = builder.build_ubatch_metadata(ubatch_idx=1, running_bs=2)
+    ub = cut_decode_ubatches(running_bs, running_bs, np.ones(running_bs, np.int32))[1]
+    group = SimpleNamespace(set_counts=lambda counts: None)
+    lens = np.ones(ub.scheduled_bs(running_bs), np.int32)
+    metadata = builder._stage_decode_ubatch(1, ub, lens, None, 1, group)
 
-    torch.testing.assert_close(
-        metadata.dcp_local_context_lens,
-        torch.tensor(expected, dtype=torch.int32),
+    rows = var[f"{p}dcp_local_context_lens"]
+    assert rows.np.tolist() == expected
+    assert metadata.dcp_local_context_lens.data_ptr() == rows.gpu.data_ptr()
+    # Its selection starts at its own first token: a layer reusing an earlier
+    # layer's top-k never reads the other micro-batch's. Its compact indptr
+    # one entry later still, past the other's closing one.
+    first = ub.token_slice.start
+    selections = (
+        (metadata.sparse_kv_indices, builder._sparse_kv_indices_gpu, 2 * first),
+        (metadata.dcp_sparse_kv_indptr, builder._dcp_sparse_kv_indptr_gpu, first + 1),
+        (metadata.dcp_owned_counts, builder._dcp_owned_counts_gpu, first),
     )
-    assert "ub1_dcp_local_context_lens" not in var
+    for view, buffer, offset in selections:
+        assert view.data_ptr() == buffer[offset:].data_ptr()
 
 
-@pytest.mark.parametrize("world", [1, 2])
-def test_a_tbo_prefill_ubatch_scores_against_the_whole_steps_keys(world):
-    """A token split can cut a request in two: the second ubatch's rows of it
-    see keys the first ubatch's tokens wrote, so an ubatch scores against the
-    step's gathered keys -- row starts unrebased -- and under DCP this rank's
-    share of its own rows."""
-    keys = ConcatKeys(
-        block_tables=torch.zeros(2, 4, dtype=torch.int32),
-        cu_committed=torch.tensor([0, 6, 10], dtype=torch.int32),
-        total=10,
-        row_starts=torch.tensor([0] * 6 + [6] * 4, dtype=torch.int32),
+def test_pooled_prefill_spans_every_block_table_row():
+    """The gather gives each of the `running_bs` block-table rows a thread that
+    claims its pool span: a padding request's is empty, and the row runs start
+    past all of them."""
+    host = np.zeros(64, dtype=np.int32)
+    builder = SimpleNamespace(
+        index_kpool=4,
+        _pool_row_slices=AiterMLAMetadataBuilder._pool_row_slices,
+        model_runner=SimpleNamespace(
+            forward_vars={
+                "cu_seqlens_q": SimpleNamespace(np=np.array([0, 8, 12])),
+                "index_pool_rows": SimpleNamespace(np=host),
+            }
+        ),
     )
-    step = concat_rows(torch.arange(1, 11, dtype=torch.int32), keys)
-    builder = SimpleNamespace(dcp_rank=world - 1, dcp_world_size=world)
-    # Tokens 4..10: the last two of request 0, then request 1.
-    ub_slice = SimpleNamespace(token_slice=slice(4, 10), request_slice=slice(0, 2))
-
-    rows = AiterMLAMetadataBuilder._ubatch_prefill_index_rows(
-        builder, step, None, None, ub_slice
+    row_ends = np.arange(1, 13, dtype=np.int32)
+    staged = AiterMLAMetadataBuilder._stage_prefill_pool_rows(
+        builder,
+        2,
+        4,
+        row_ends,
+        False,
+        SimpleNamespace(set_counts=lambda counts: None),
+        "",
     )
-
-    assert rows.row_ends.tolist() == list(range(5, 11))
-    assert rows.concat.total == 10
-    assert rows.concat.row_starts.tolist() == [0, 0, 6, 6, 6, 6]
-    assert rows.split.world == world
+    assert staged.pools == 3
+    assert host[:5].tolist() == [0, 2, 3, 3, 3]
+    # Row starts follow the 4 + 1 prefix: request 0's 8 rows, then request 1's.
+    assert host[5:17].tolist() == [0] * 8 + [2] * 4
