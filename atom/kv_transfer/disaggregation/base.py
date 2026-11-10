@@ -106,6 +106,7 @@ class KVConnectorSchedulerBase(ABC):
     chunk_size: int = 0
     lowers_hbm_hit_to_chunk: bool = False
     supports_early_load: bool = False
+    pending_load_partial_token_cap: int = 0
 
     def lookup_ready(self, seq: Any) -> bool:
         """Whether `seq`'s tier answer can be consumed without a round trip."""

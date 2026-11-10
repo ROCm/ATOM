@@ -718,6 +718,7 @@ class Scheduler:
         # see `_prefill_room`.
         self._tick_cost_limit = math.inf
         self._tick_cost = 0.0
+        self._tick_cold_partial_cap = 0
         # steps, tokens, own cost, target, steps shrunk
         self._balance_stats = [0, 0, 0.0, 0.0, 0]
         self.long_prefill_token_threshold = config.long_prefill_token_threshold
@@ -1145,6 +1146,7 @@ class Scheduler:
     def _probe_local_prefill_work(self) -> tuple[bool, int]:
         budget = self.max_num_batched_tokens
         pending = 0
+        cold_tokens = 0
         if self._partial_prefill_count:
             for seq in self.running:
                 if not seq.is_partial_prefill:
@@ -1160,10 +1162,13 @@ class Scheduler:
                     resume,
                     pending,
                     cap_from=max(resume, seq.replay_until),
+                    cold_tokens=cold_tokens,
                 )
                 if not chunk:
                     break
                 chunk = self._preview_prefill_chunk(seq, start, resume, chunk)
+                if self._slice_cold_partial(seq, start, resume):
+                    cold_tokens += chunk
                 pending += chunk
                 if pending >= budget:
                     break
@@ -1349,6 +1354,7 @@ class Scheduler:
         estimate -- the real admission may park or skip some of these seqs."""
         token_cap = self.max_num_batched_tokens
         tokens, cost = 0, 0.0
+        cold_tokens = 0
         if self._partial_prefill_count > 0:
             for seq in self.running:
                 if not seq.is_partial_prefill:
@@ -1363,8 +1369,13 @@ class Scheduler:
                         - seq.num_cached_tokens
                     )
                 k = min(remaining, token_cap - tokens)
+                resume = seq.num_cached_tokens
+                start = self.block_manager.replay_start(seq, resume, hit=False)
+                if self._slice_cold_partial(seq, start, resume):
+                    k = min(k, max(0, self._tick_cold_partial_cap - cold_tokens))
+                    cold_tokens += k
                 if k <= 0:
-                    return cost
+                    break
                 cost += self._chunk_cost(seq.num_cached_tokens, k)
                 tokens += k
         for seq in itertools.islice(self._waiting_prefills(), self.max_num_seqs):
@@ -1422,6 +1433,38 @@ class Scheduler:
                 self.max_num_batched_tokens,
             )
 
+    def _pending_store_partial_cap(self) -> int:
+        """Bound cold GPU work only while a Store restore is really in flight."""
+        cap = getattr(self.kv_connector, "pending_load_partial_token_cap", 0)
+        if not cap or not self._partial_prefill_count:
+            return 0
+        cap = min(int(cap), self.max_num_batched_tokens)
+        alignment = self._chunk_alignment()
+        cap = cap // alignment * alignment
+        if cap <= 0:
+            return 0
+        for seq in self.waiting:
+            if (
+                getattr(seq, "_counted_as_inflight_load", False)
+                and len(seq.block_table) > 0
+                and self._still_loading(seq)
+                and not getattr(seq, "offload_loaded", False)
+                and not getattr(seq, "offload_load_failed", False)
+            ):
+                return cap
+        return 0
+
+    def _slice_cold_partial(self, seq: Sequence, start: int, resume: int) -> bool:
+        # Do not shrink replay or a rollback needed to produce final logits.
+        # The existing replay progress/alignment rules retain full control.
+        return bool(
+            self._tick_cold_partial_cap
+            and seq.is_partial_prefill
+            and start == resume
+            and seq.replay_until <= resume
+            and not getattr(seq, "offload_loaded", False)
+        )
+
     def _partial_prefill_chunk(
         self,
         seq: Sequence,
@@ -1430,6 +1473,7 @@ class Scheduler:
         batched_tokens: int,
         *,
         cap_from: int | None = None,
+        cold_tokens: int = 0,
     ) -> int:
         """The next chunk of a running prefill that resumes at `resume` and
         starts at `start`, or 0. A chunk ending at or below `resume` only
@@ -1442,6 +1486,10 @@ class Scheduler:
         remaining = seq.num_tokens - start
         if 0 < self.long_prefill_token_threshold < seq.num_tokens - cap_from:
             remaining = self.long_prefill_token_threshold + cap_from - start
+        if self._slice_cold_partial(seq, start, resume):
+            remaining = min(
+                remaining, max(0, self._tick_cold_partial_cap - cold_tokens)
+            )
         chunk = self._chunked_prefill_size(
             remaining,
             self._prefill_room(batched_tokens, start),
@@ -2231,6 +2279,7 @@ class Scheduler:
         # balancing decision and must not see the previous step's cost limit.
         self._tick_cost_limit = math.inf
         self._tick_cost = 0.0
+        self._tick_cold_partial_cap = 0
         skipped_waiting_requests: deque[Sequence] = deque()
         num_scheduled_tokens: list[int] = []
         scheduled_spec_decode_tokens: dict[int, np.ndarray] = {}
@@ -2257,6 +2306,7 @@ class Scheduler:
         # FIRE is not spent on nothing). Local to this rank: no collective, and
         # nothing is scheduled for prefill here.
         self._early_load_tier_prefixes()
+        self._tick_cold_partial_cap = self._pending_store_partial_cap()
 
         # should_allow_prefill() runs a cross-DP all_reduce and MUST be called
         # every tick on every rank for lockstep — hence before the early-return.
@@ -2353,6 +2403,7 @@ class Scheduler:
         # Phase 2 in lockstep. Inside that, skip the running-queue scan entirely
         # when no seq is mid-prefill — the common steady-state decode case —
         # using the counter maintained by postprocess / preempt / finished-removal.
+        cold_partial_tokens = 0
         if delayer_allows and self._partial_prefill_count > 0:
             for seq in self.running:
                 if num_seqs_prefill >= self.max_num_seqs:
@@ -2369,12 +2420,15 @@ class Scheduler:
                     resume,
                     num_batched_tokens,
                     cap_from=max(resume, seq.replay_until),
+                    cold_tokens=cold_partial_tokens,
                 )
                 if chunk:
                     self._resume_prefill(seq, start, hit=False)
                     chunk = self._finalize_prefill_chunk(seq, start, chunk)
                 if chunk <= 0:
                     break
+                if self._slice_cold_partial(seq, start, resume):
+                    cold_partial_tokens += chunk
                 self._tick_cost += self._chunk_cost(seq.num_cached_tokens, chunk)
                 num_batched_tokens += chunk
                 num_seqs_prefill += 1

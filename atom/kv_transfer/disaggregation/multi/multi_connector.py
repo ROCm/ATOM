@@ -432,6 +432,10 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         )
 
     @property
+    def pending_load_partial_token_cap(self):
+        return getattr(self._prefetch_tier(), "pending_load_partial_token_cap", 0)
+
+    @property
     def chunk_size(self):
         tier = self._prefetch_tier()
         return 0 if tier is None else tier.chunk_size

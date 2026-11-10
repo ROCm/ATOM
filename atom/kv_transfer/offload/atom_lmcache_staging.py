@@ -119,6 +119,17 @@ class _PipelineStage:
     run: Callable[[Any, torch.Tensor], None]
 
 
+def fence_submitted_work(stream) -> None:
+    """Wait for this submission point without draining later forward work.
+
+    Keep the host wait: a device wait on a side stream can deadlock with
+    persistent compute kernels. Recovery still fences whole affected streams.
+    """
+    completion = torch.cuda.Event(blocking=False)
+    completion.record(stream)
+    completion.synchronize()
+
+
 def run_staged_pipeline(
     state: _ThreadTransferState,
     groups: Sequence[Any],
@@ -175,7 +186,7 @@ def run_staged_pipeline(
                 staging_buffer.free_event_valid = True
             if stage_b_enqueued is not None:
                 stage_b_enqueued(group, stage_b.stream)
-        stage_b.stream.synchronize()
+        fence_submitted_work(stage_b.stream)
     except Exception:
         buffer_safe_to_release = bool(
             recover_buffer is not None

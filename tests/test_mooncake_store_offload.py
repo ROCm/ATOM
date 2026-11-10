@@ -3249,6 +3249,21 @@ def test_the_kv_budget_holds_back_a_staging_buffer_per_copy_thread(
         worker.close()
 
 
+def test_replay_page_metadata_budget_includes_every_copy_thread(monkeypatch):
+    from atom.kv_transfer.offload.metadata_lease import METADATA_GPU_RESERVE_BYTES
+
+    monkeypatch.setenv("OFFLOAD_COPY_WORKERS", "2")
+    monkeypatch.setenv("OFFLOAD_LOAD_WORKERS", "3")
+    monkeypatch.delenv("OFFLOAD_GPU_STAGING_MAX_BYTES", raising=False)
+    config = _config(extra=_extra(save_pool_mib=3, load_pool_mib=5))
+    dense = KVConnectorFactory.kv_budget_reserve_bytes(config)
+    config.hf_config.model_type = "deepseek_v41"
+    assert (
+        KVConnectorFactory.kv_budget_reserve_bytes(config)
+        == dense + 5 * METADATA_GPU_RESERVE_BYTES
+    )
+
+
 def test_a_failed_probe_stops_startup_and_releases_the_pool(cluster, one_rank):
     cluster.silent_gets = True
     worker = MooncakeStoreOffloadConnector(_registering_config())
@@ -3784,3 +3799,44 @@ def test_an_answer_taken_late_is_as_old_as_its_store_query(cluster):
     scheduler._ensure_lookup_pin(seq, sid, spec)
     assert renewed  # an old answer is confirmed again before the get
     scheduler.close()
+
+
+def test_pool_strided_view_preserves_alignment_gaps(cluster):
+    pool = TransferSlotPool(
+        device="cpu",
+        chunk_bytes=739840,
+        save_bytes=4 * 741376,
+        load_bytes=4 * 741376,
+        client=_client(),
+    )
+    slots = pool.acquire("load", 4)
+    assert pool.slot_stride == 741376
+    assert pool.contiguous_view(slots) is None
+    view = pool.strided_view(slots)
+    assert view.data_ptr() == slots[0].ptr
+    assert view.numel() == 3 * 741376 + 739840
+    assert pool.strided_view([slots[0], slots[2]]) is None
+    assert pool.strided_view(list(reversed(slots))) is None
+    original_ptr = slots[1].ptr
+    slots[1].ptr += 1
+    assert pool.strided_view(slots) is None
+    slots[1].ptr = original_ptr
+    assert pool.strided_view([]) is None
+    pool.release(slots)
+    pool.close()
+
+
+@pytest.fixture(autouse=True)
+def _synthetic_stream_operation_completion(monkeypatch):
+    # Synthetic CPU streams model completion via synchronize(). Real streams
+    # keep the actual event fence; its ordering has dedicated contract tests.
+    from atom.kv_transfer.offload import atom_lmcache_staging as staging
+
+    original = staging.fence_submitted_work
+
+    def complete(stream):
+        if hasattr(stream, "cuda_stream"):
+            return original(stream)
+        return stream.synchronize()
+
+    monkeypatch.setattr(staging, "fence_submitted_work", complete)

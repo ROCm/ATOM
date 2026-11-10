@@ -491,6 +491,9 @@ class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
     # `BlockManager.lower_hit_to_chunk`).
     lowers_hbm_hit_to_chunk = True
 
+    # A shared forward stream cannot interrupt a long cold prefill for restore.
+    pending_load_partial_token_cap = 8192
+
     # Workers publish one source-safe group per chunk once its GPU pack is
     # done (the block GPU connector), separately from the store terminal.
     _supports_early_block_release = True
