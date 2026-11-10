@@ -134,3 +134,19 @@ def test_transfer_evidence_is_thread_local_and_returned_as_a_snapshot(monkeypatc
     assert results == [0, -1]
     assert connector.last_transfer_stats()["chunks"] == 0
     assert connector.last_transfer_stats()["stats_available"] == 1
+
+
+@pytest.fixture(autouse=True)
+def _synthetic_stream_operation_completion(monkeypatch):
+    # Synthetic CPU streams model completion via synchronize(). Real streams
+    # keep the actual event fence; its ordering has dedicated contract tests.
+    from atom.kv_transfer.offload import atom_lmcache_staging as staging
+
+    original = staging.fence_submitted_work
+
+    def complete(stream):
+        if hasattr(stream, "cuda_stream"):
+            return original(stream)
+        return stream.synchronize()
+
+    monkeypatch.setattr(staging, "fence_submitted_work", complete)

@@ -843,3 +843,19 @@ class TestEarlyReleaseDefaultsOn:
         assert scheduler._early_release is True
         assert scheduler.protected_block_ids(seq) == frozenset({0, 1})
         assert scheduler.should_defer_free(seq) is True
+
+
+@pytest.fixture(autouse=True)
+def _synthetic_stream_operation_completion(monkeypatch):
+    # Synthetic CPU streams model completion via synchronize(). Real streams
+    # keep the actual event fence; its ordering has dedicated contract tests.
+    from atom.kv_transfer.offload import atom_lmcache_staging as staging
+
+    original = staging.fence_submitted_work
+
+    def complete(stream):
+        if hasattr(stream, "cuda_stream"):
+            return original(stream)
+        return stream.synchronize()
+
+    monkeypatch.setattr(staging, "fence_submitted_work", complete)

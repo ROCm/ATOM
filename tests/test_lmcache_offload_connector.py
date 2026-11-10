@@ -7996,6 +7996,20 @@ class TestStateLoadsAndStoresRunInSeparateLanes:
             tier.shutdown()
 
 
+@pytest.fixture(autouse=True)
+def _synthetic_stream_operation_completion(monkeypatch):
+    # Synthetic CPU streams model completion via synchronize(). Real streams
+    # keep the actual event fence; its ordering has dedicated contract tests.
+    from atom.kv_transfer.offload import atom_lmcache_staging as staging
+
+    original = staging.fence_submitted_work
+
+    def complete(stream):
+        if hasattr(stream, "cuda_stream"):
+            return original(stream)
+        return stream.synchronize()
+
+    monkeypatch.setattr(staging, "fence_submitted_work", complete)
 @pytest.mark.parametrize("cache_seed, salt", [(11, "11"), (12, "12"), (-1, "")])
 def test_a_dsv4_prompt_carries_its_media_salt_to_lookup_save_and_load(cache_seed, salt):
     asked = []
