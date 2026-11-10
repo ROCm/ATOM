@@ -40,20 +40,20 @@ class StagedTransfer:
     constant, so a single object of a different size breaks both invariants.
     State is not a member of that loop.
 
-    **This class does not choose the producer fence; the caller supplies it.**
-    `pack` issues its gather on a private `pack_stream`, and the two
-    `_StagingBuffer` events only order this worker's own streams against each
-    other. The two callers fence the source by different means:
+    **This class does not fence the producer; the caller keeps the source
+    quiescent.** Nothing here waits on the forward's compute stream: `pack`
+    issues its gather on a private `pack_stream`, and the two `_StagingBuffer`
+    events only order this worker's own streams against each other. The two
+    callers make the source safe by different means:
 
     * KV -- `connector.py` records the fence commit 7427e05e added to fix KV
       corruption on reload on the RPC thread and `synchronize()`s it through
       `save_ready_event` before handing the blocks over.
-    * State -- `state_tier.submit_store` passes the event the connector records
-      on the compute stream at dispatch as `pack(..., producer_event=)`. The
-      PAGE units are engine-pinned, so nothing *later* writes them, but the
-      checkpoint copy that fills them rides an earlier batch's `build()` and
-      may still be queued on the compute stream when the store is dispatched
-      -- under PP a downstream stage can be a whole pipeline depth behind.
+    * State -- the PAGE units are reserved out of the KV pool and
+      engine-pinned for the whole transfer, so nothing writes them after the
+      copy that filled them; `connector._start_state_stores` records an event
+      behind that copy and `state_tier._do_store` synchronizes it before the
+      gather.
 
     Do not delete the KV `save_ready_event` believing this class covers it:
     without it the gather reads the staging entry's previous occupant, which is
@@ -132,9 +132,7 @@ class StagedTransfer:
             return torch.cuda.device(self.device)
         return _NullCtx()
 
-    def pack(
-        self, segments: list[torch.Tensor], dst: Any, producer_event: Any = None
-    ) -> None:
+    def pack(self, segments: list[torch.Tensor], dst: Any) -> None:
         """Gather `segments` into one contiguous object via the Triton packer.
 
         The existing kernel needs no modification: it is already a fully
@@ -149,11 +147,12 @@ class StagedTransfer:
         packer requires a CUDA uint8 contiguous destination, so the general
         path packs into the bounded GPU staging buffer and D2H's from there.
         The event around that copy makes the *consumer* side safe: whoever
-        reads the MemoryObj next must not see a D2H still in flight. The
-        *producer* side is `producer_event`: when given, the gather waits for it
-        on `pack_stream` (a host wait without CUDA), so it reads what the
-        forward wrote rather than what the units held before; see the class
-        docstring.
+        reads the MemoryObj next must not see a D2H still in flight. It says
+        nothing about the *producer* side -- this gather runs on a private
+        stream and does not wait for the forward that wrote the entry. Keeping
+        the source quiescent is the caller's job (KV via `save_ready_event`,
+        state via pinned units and the `ready_event` `state_tier._do_store`
+        waits on); see the class docstring.
         """
         from atom.kv_transfer.offload.dense.triton_kv_staging import (
             fused_pack_chunk_major,
@@ -165,10 +164,9 @@ class StagedTransfer:
             sum(seg_bytes),
             dst,
             lambda buf: fused_pack_chunk_major(segments, seg_bytes, [1], [0], buf),
-            producer_event,
         )
 
-    def pack_segments(self, ptrs, sizes, dst: Any, producer_event: Any = None) -> None:
+    def pack_segments(self, ptrs, sizes, dst: Any) -> None:
         """`pack` for segments given as raw device addresses and byte sizes.
 
         For a store whose image is thousands of small segments: the metadata
@@ -195,25 +193,14 @@ class StagedTransfer:
             prepared.nbytes,
             dst,
             lambda buf: fused_pack_segments(prepared, ptrs, buf),
-            producer_event,
         )
 
-    def _gather(
-        self, nbytes: int, dst: Any, launch, producer_event: Any = None
-    ) -> None:
-        """Run `launch(device_buf)` on `pack_stream` and land the bytes in `dst`.
-
-        The launch first waits for `producer_event` when one is given.
-        """
+    def _gather(self, nbytes: int, dst: Any, launch) -> None:
+        """Run `launch(device_buf)` on `pack_stream` and land the bytes in `dst`."""
         dst_tensor = memory_object_as_uint8(dst, nbytes)
         with self._device_ctx():
             state = self.thread_state()
             staging_buffer = state.staging_buffer
-            if producer_event is not None:
-                if state.pack_stream is not None:
-                    state.pack_stream.wait_event(producer_event)
-                else:
-                    producer_event.synchronize()
             if dst_tensor.is_cuda and dst_tensor.device == self.device:
                 # Direct-to-device fast path: no staging hop, but the gather
                 # still reads the source units on `pack_stream`. If the kernel
