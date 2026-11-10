@@ -41,6 +41,7 @@ def moe_narrow_defs(k4ctx):
     MID8_WORDS = k4ctx["MID8_WORDS"]
     MIDSC_LDS = k4ctx["MIDSC_LDS"]
     MIDSC_WORDS = k4ctx["MIDSC_WORDS"]
+    SH_FMT = k4ctx["SH_FMT"]
     UG_ITERS = k4ctx["UG_ITERS"]
     XN_FLAG = k4ctx["XN_FLAG"]
     XN8_WORDS = k4ctx["XN8_WORDS"]
@@ -306,7 +307,7 @@ def moe_narrow_defs(k4ctx):
                     + g4
                 ),
                 c=fx.Vector.filled(4, 0.0, fx.Float32),
-                a_fmt=FP4,
+                a_fmt=SH_FMT,
             )
             sh = [sh[j4] + cu[j4] * wgt for j4 in range(4)]
         fx.ptr_store(

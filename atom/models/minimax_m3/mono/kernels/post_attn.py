@@ -123,6 +123,7 @@ from atom.mono.plan.build_key import key_tuple, symbol_params
 from atom.mono.plan.execution import BLOCKS, THREADS, WAVES, first_task
 from atom.mono.plan.trace import enter_stage
 from atom.mono.runtime.abi import KernelAbi
+from atom.mono.runtime.consensus import MonoUnsupported
 from atom.mono.runtime.debug import region_ids
 
 # The launch goes on the caller's current stream (graph capture included).
@@ -136,7 +137,7 @@ K4_ABI = KernelAbi(
         "h_in", "q", "block_table", "seq_lens", "k_cache", "v_cache", "k_scale",
         "v_scale", "w_o", "s_o", "g_post", "w_gate", "bias", "w13", "s13", "w2", "s2",
         "h_mid", "ar_out", "scratch", "sym", "peers", "rank", "layer", "bt_width",
-        "q_len", "tl", "k1_args", "positions", "slot_mapping", "res", "batch_ids",
+        "q_len", "tl", "k1_args", "positions", "slot_mapping", "res", "batch_ids", "w13s", "s13s", "w2s", "s2s",
     )
 )  # fmt: skip
 
@@ -162,6 +163,7 @@ class K4Build:
     swiglu_limit: float
     debug: bool
     xn_flag: int = 0
+    shared_mxfp8: bool = False
 
 
 def build_post_attn_kernel(
@@ -180,6 +182,7 @@ def build_post_attn_kernel(
     debug: bool = False,
     index_topk: bool = True,
     xn_flag: int = 0,
+    shared_mxfp8: bool = False,
 ):
     """``@flyc.jit`` launcher of K4 for one rank of an ``npes``-way TP group and a
     decode step of ``tokens`` (<= MAX_TOKENS) rows, ``q_len`` consecutive rows a
@@ -190,14 +193,20 @@ def build_post_attn_kernel(
     a wait that gives up recorded in scratch ``diag`` (``Mailbox``).
     ``index_topk``: the layer scores and selects its blocks; else (the original
     path's ``skip_index_topk`` layer) it attends over the sparse table the last
-    selecting layer of the step left in scratch."""
+    selecting layer of the step left in scratch. ``shared_mxfp8``: the shared
+    expert is not one of the MXFP4 experts (``w13`` / ``w2`` hold the routed 128)
+    but an MXFP8 MLP of its own (``w13s`` / ``s13s`` / ``w2s`` / ``s2s``: row-major
+    fp8 weights and their per-1x32 E8M0 scales), run by the narrow MoE (S <= 4)."""
     assert 1 <= tokens <= MAX_TOKENS
+    if shared_mxfp8 and wide_moe(tokens):
+        raise MonoUnsupported(f"an MXFP8 shared expert at {tokens} tokens (S <= 4)")
     key = K4Build(
         npes=npes, tokens=tokens, init_blocks=init_blocks, local_blocks=local_blocks,
         index_heads=heads.count, index_own=heads.own, timeline=timeline,
         index_topk=index_topk, fuse_k1=fuse_k1, sm_scale=sm_scale, eps=eps,
         route_scale=route_scale, shared_weight=shared_weight,
         swiglu_limit=swiglu_limit, debug=debug, xn_flag=xn_flag,
+        shared_mxfp8=shared_mxfp8,
     )  # fmt: skip
     build_key = key_tuple(key, SOURCES)  # the launcher references it: keyed
     # a debug build's wait records name a region by its ``region_id``
@@ -298,6 +307,10 @@ def build_post_attn_kernel(
         slot_mapping: Int64,
         res: Int64,
         batch_ids: Int64,
+        w13s: Int64,
+        s13s: Int64,
+        w2s: Int64,
+        s2s: Int64,
     ):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
@@ -597,6 +610,10 @@ def build_post_attn_kernel(
         slot_mapping: Int64,
         res: Int64,
         batch_ids: Int64,
+        w13s: Int64,
+        s13s: Int64,
+        w2s: Int64,
+        s2s: Int64,
         stream: fx.Stream = _CURRENT_STREAM,
     ):
         _ = build_key  # every build parameter in the JIT cache key
@@ -633,6 +650,10 @@ def build_post_attn_kernel(
             slot_mapping,
             res,
             batch_ids,
+            w13s,
+            s13s,
+            w2s,
+            s2s,
         ).launch(grid=(G,), block=(THREADS,), stream=stream)
 
     K4_ABI.check(post_attn_kernel, launch_post_attn)

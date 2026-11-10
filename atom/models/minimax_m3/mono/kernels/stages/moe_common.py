@@ -18,12 +18,16 @@ from atom.models.minimax_m3.mono.config import (
 )
 from atom.models.minimax_m3.mono.kernels.stages.shared import (
     S2_BYTES,
+    S2S_BYTES,
     S13_BYTES,
+    S13S_BYTES,
     W2_BYTES,
     W2_SCALE_COLS,
+    W2S_BYTES,
     W13_BYTES,
     W13_ROWS,
     W13_SCALE_COLS,
+    W13S_BYTES,
 )
 from atom.models.minimax_m3.mono.layout import (
     SH_ROWS,
@@ -32,7 +36,7 @@ from atom.models.minimax_m3.mono.layout import (
     XN8_ROW,
     XSC_ROW,
 )
-from atom.mono.device.mx import FP4, fp4_tile_load, mfma_scaled, scale_index
+from atom.mono.device.mx import FP4, FP8, fp4_tile_load, mfma_scaled, scale_index
 from atom.mono.device.ops import CM_NT, bf16_round, row_sum, rsrc, traced, uniform
 
 
@@ -45,6 +49,7 @@ def moe_common_defs(k4ctx):
     DN_UPW = k4ctx["DN_UPW"]
     G = k4ctx["G"]
     ROUTED_TASKS = k4ctx["ROUTED_TASKS"]
+    SH8 = k4ctx["shared_mxfp8"]
     SH_UPW = k4ctx["SH_UPW"]
     TPT = k4ctx["TPT"]
     UG_CPW = k4ctx["UG_CPW"]
@@ -65,6 +70,8 @@ def moe_common_defs(k4ctx):
     rwt = k4ctx["rwt"]
     s13 = k4ctx["s13"]
     s2 = k4ctx["s2"]
+    s2s = k4ctx["s2s"]
+    s13s = k4ctx["s13s"]
     shared_weight = k4ctx["shared_weight"]
     stamp = k4ctx["stamp"]
     start = k4ctx["start"]
@@ -73,6 +80,8 @@ def moe_common_defs(k4ctx):
     tokens = k4ctx["tokens"]
     w13 = k4ctx["w13"]
     w2 = k4ctx["w2"]
+    w2s = k4ctx["w2s"]
+    w13s = k4ctx["w13s"]
     wave = k4ctx["wave"]
 
     def ug_task_id(it):
@@ -158,10 +167,50 @@ def moe_common_defs(k4ctx):
             )
         gpu.barrier()
 
+    def fp8_tile_load(r_w, row, cols, kc):
+        """A lane's 32 B of an MXFP8 weight (row-major fp8 [rows, ``cols``]), row
+        ``row`` at 128-k chunk ``kc``: k 16 g .. + 16 and 64 + 16 g .. + 16 (g =
+        lane // 16), the f8f6f4 MFMA's operand layout (the B operand's, ``lds_b8``)."""
+        dw = row * (cols // 4) + kc * 32 + g4 * 4
+        halves = [
+            fx.Vector(
+                bo.buffer_load(
+                    r_w, dw + 16 * h, vec_width=4, dtype=T.i32, cache_modifier=CM_NT
+                )
+            )
+            for h in range(2)
+        ]
+        return fx.Vector.from_elements(
+            [halves[h][e] for h in range(2) for e in range(4)], fx.Int32
+        )
+
+    def fp8_scale_load(r_s, row, cols, kc):
+        """The E8M0 scale dword of row ``row``'s 128-k chunk ``kc`` (the four
+        32-blocks' bytes) shifted to this lane's block (g): its low byte, as the
+        MFMA takes it."""
+        w = fx.Int32(
+            bo.buffer_load(
+                r_s, row * (cols // 128) + kc, vec_width=1, dtype=T.i32,
+            )
+        )  # fmt: skip
+        return w >> (g4 * 8)
+
     def sh_load(j, has=None):
         """The shared expert's half task j: gate rows 8 j .. + 8 on lanes l16 < 8,
         the up rows alike on the rest -- one MFMA tile; the waves split k."""
         row = (l16 < 8).select(SH_ROWS * j + l16, INTER + SH_ROWS * j + l16 - 8)
+        if const_expr(SH8):
+            sizes = (W13S_BYTES, S13S_BYTES)
+            if const_expr(has is None):
+                r_w, r_s = rsrc(w13s), rsrc(s13s)
+            else:  # a CTA without the task reads through zero-sized buffers
+                r_w = rsrc(w13s, has.select(fx.Int32(sizes[0]), fx.Int32(0)))
+                r_s = rsrc(s13s, has.select(fx.Int32(sizes[1]), fx.Int32(0)))
+            kcs = [wave * UG_CPW + i for i in range(UG_CPW)]
+            return (
+                [fp8_tile_load(r_w, row, HIDDEN, kc) for kc in kcs],
+                [fp8_scale_load(r_s, row, HIDDEN, kc) for kc in kcs],
+            )
         rg = row // 16
         if const_expr(has is None):
             r_w = rsrc(w13 + fx.Int64(SHARED_EXPERT) * W13_BYTES)
@@ -208,7 +257,7 @@ def moe_common_defs(k4ctx):
         for i in range_constexpr(UG_CPW):
             kc = wave * UG_CPW + i
             c = mfma_scaled(
-                wts[i], lds_b8(col * XN8_ROW + kc * 32), c, scs[i], sbs[i], a_fmt=FP4
+                wts[i], lds_b8(col * XN8_ROW + kc * 32), c, scs[i], sbs[i], a_fmt=SH_FMT
             )
         fx.ptr_store(c, red + (wave * 64 + lane) * 4)
         gpu.barrier()
@@ -259,10 +308,27 @@ def moe_common_defs(k4ctx):
 
     def down_load_shared(td, has_dn):
         """The shared expert's down units of row group td (every token's)."""
-        dn_bytes = has_dn.select(fx.Int32(W2_BYTES), fx.Int32(0))
-        dn_scale_bytes = has_dn.select(fx.Int32(S2_BYTES), fx.Int32(0))
         rg_d = td * 2 + wave // 4
         units = []
+        if const_expr(SH8):
+            r_w = rsrc(w2s, has_dn.select(fx.Int32(W2S_BYTES), fx.Int32(0)))
+            r_s = rsrc(s2s, has_dn.select(fx.Int32(S2S_BYTES), fx.Int32(0)))
+            for i in range_constexpr(SH_UPW):
+                j = (wave % 4) + 4 * i
+                kc = fx.min(j, DN_KC - 1)
+                wgt = (j < DN_KC).select(fx.Float32(shared_weight), fx.Float32(0.0))
+                row = rg_d * 16 + l16
+                units.append(
+                    (
+                        fp8_tile_load(r_w, row, INTER, kc),
+                        fp8_scale_load(r_s, row, INTER, kc),
+                        kc,
+                        wgt,
+                    )
+                )
+            return units
+        dn_bytes = has_dn.select(fx.Int32(W2_BYTES), fx.Int32(0))
+        dn_scale_bytes = has_dn.select(fx.Int32(S2_BYTES), fx.Int32(0))
         for i in range_constexpr(SH_UPW):
             j = (wave % 4) + 4 * i
             kc = fx.min(j, DN_KC - 1)
@@ -282,7 +348,10 @@ def moe_common_defs(k4ctx):
             units.append((wv, sc, kc, wgt))
         return units
 
+    SH_FMT = FP8 if SH8 else FP4
+
     return {
+        "SH_FMT": SH_FMT,
         "ug_task_id": ug_task_id,
         "ug_task": ug_task,
         "ug_load": ug_load,

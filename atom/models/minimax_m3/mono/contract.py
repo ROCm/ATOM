@@ -18,7 +18,11 @@ from atom.models.minimax_m3.mono.kernels.dense_post import (
     build_dense_post_kernel,
 )
 from atom.models.minimax_m3.mono.kernels.post_attn import K4_ABI, build_post_attn_kernel
-from atom.models.minimax_m3.mono.layout import dense_mailbox_regions, mailbox_regions
+from atom.models.minimax_m3.mono.layout import (
+    WIDE_FROM,
+    dense_mailbox_regions,
+    mailbox_regions,
+)
 from atom.mono.runtime.compile import check_traced
 
 
@@ -28,14 +32,16 @@ def build_layer(
     fuse_k1: bool = True,
     index_topk: bool = True,
     xn_flag: int = 0,
+    shared_mxfp8: bool = False,
 ):
     """The layer kernel for ``tokens`` and ``index_heads`` (1 or TP), K1 fused in
-    or not (``fuse_k1``), selecting or reusing a selection (``index_topk``), its xn behind flags
-    (``xn_flag``)."""
+    or not (``fuse_k1``), selecting or reusing a selection (``index_topk``), its
+    xn behind flags (``xn_flag``), the shared expert an MXFP8 MLP of its own
+    (``shared_mxfp8``)."""
     heads = IndexHeads(index_heads, 0)
     return build_post_attn_kernel(
         TP, 0.088, 1e-6, 1.0, 1.0, 7.0, 1, 1, tokens, fuse_k1=fuse_k1, heads=heads,
-        index_topk=index_topk, xn_flag=xn_flag,
+        index_topk=index_topk, xn_flag=xn_flag, shared_mxfp8=shared_mxfp8,
     )  # fmt: skip
 
 
@@ -50,10 +56,11 @@ def check_build(
     fuse_k1: bool = True,
     index_topk: bool = True,
     xn_flag: int = 0,
+    shared_mxfp8: bool = False,
 ) -> None:
     """Trace ``build_layer`` and check its hand-offs; raises ``ContractError``."""
     check_traced(
-        build_layer(tokens, index_heads, fuse_k1, index_topk, xn_flag),
+        build_layer(tokens, index_heads, fuse_k1, index_topk, xn_flag, shared_mxfp8),
         K4_ABI,
         mailbox_regions(tokens, index_heads, fuse_k1, index_topk, xn_flag),
     )
@@ -75,3 +82,6 @@ if __name__ == "__main__":
                         f"S={s} index heads={ih} index_topk={it} xn_flag={xf}:"
                         " contract holds"
                     )
+            if s < WIDE_FROM:
+                check_build(s, ih, shared_mxfp8=True)
+                print(f"S={s} index heads={ih} shared_mxfp8: contract holds")

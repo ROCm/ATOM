@@ -220,12 +220,20 @@ class MonoDecodeRunner:
         experts = layers[N_DENSE].block_sparse_moe.experts
         eps = config.rms_norm_eps
         route_scale = float(layers[N_DENSE].block_sparse_moe.routed_scaling_factor)
-        # the fused shared expert's routing weight is whatever the topK metadata holds
-        # read through the module: the metadata is assigned after this file is imported
-        total_w, total_ids = topk_meta.aiter_topK_meta_data
-        if int(total_ids[0, TOP_K].item()) != N_ROUTED:
-            raise MonoUnsupported("fused shared expert id")
-        shared_weight = float(total_w[0, TOP_K].item())
+        self.shared_mxfp8 = self.sparse[0].shared_mxfp8
+        if any(lw.shared_mxfp8 != self.shared_mxfp8 for lw in self.sparse):
+            raise MonoUnsupported("shared expert fused in some layers only")
+        if self.shared_mxfp8:
+            # the unfused shared expert is added to the routed sum as it is
+            shared_weight = 1.0
+        else:
+            # the fused shared expert's routing weight is whatever the topK metadata
+            # holds, read through the module: the metadata is assigned after this
+            # file is imported
+            total_w, total_ids = topk_meta.aiter_topK_meta_data
+            if int(total_ids[0, TOP_K].item()) != N_ROUTED:
+                raise MonoUnsupported("fused shared expert id")
+            shared_weight = float(total_w[0, TOP_K].item())
         self.sm_scale = impl.scale
         if abs(self.sm_scale - HEAD_DIM**-0.5) > 1e-12:
             raise MonoUnsupported(f"softmax scale {self.sm_scale}")
@@ -260,6 +268,7 @@ class MonoDecodeRunner:
             heads=heads,
             debug=self.debug,
             xn_flag=envs.ATOM_MONO_XN_FLAG,
+            shared_mxfp8=self.shared_mxfp8,
         )
         # a dense layer's kernels around its original attention
         if self.dense_mono:
@@ -494,6 +503,10 @@ class MonoDecodeRunner:
             "k1_args": _ptr(self.k1_args[i]), "positions": _ptr(positions),
             "slot_mapping": _ptr(sparse_md.slot_mapping), "res": _ptr(res),
             "batch_ids": _ptr(fwd.attn_metadata.batch_id_per_q_token),
+            "w13s": _ptr(lw.w13s) if lw.shared_mxfp8 else 0,
+            "s13s": _ptr(lw.s13s) if lw.shared_mxfp8 else 0,
+            "w2s": _ptr(lw.w2s) if lw.shared_mxfp8 else 0,
+            "s2s": _ptr(lw.s2s) if lw.shared_mxfp8 else 0,
         }  # fmt: skip
         _run_compiled(self.k4[n][lw.index_topk], *K4_ABI.pack(args), stream)
         return self.h_mids[(i + 1) % 2][:n]

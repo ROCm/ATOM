@@ -61,6 +61,39 @@ def _ptpc_fp8(
     return w.data, s.data.view(rows)
 
 
+def _mxfp8(
+    linear, rows: int, cols: int, name: str
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Weight + per-1x32 E8M0 scale of a native MXFP8 linear (the checkpoint's
+    bytes, row-major: neither preshuffled nor requantized)."""
+    w, s = linear.weight, getattr(linear, "weight_scale", None)
+    _need(
+        linear.quant_type.value == QuantType.per_1x32.value,
+        f"{name}: not per-1x32",
+    )
+    _need(
+        w.dtype == dtypes.fp8 and tuple(w.shape) == (rows, cols) and w.is_contiguous(),
+        f"{name}: weight {w.dtype} {tuple(w.shape)}",
+    )
+    _need(
+        not weight_is_stored_preshuffled(
+            linear.quant_type,
+            linear.params_dtype,
+            native_group_rows=getattr(linear, "native_a8_group_rows", None),
+        ),
+        f"{name}: preshuffled",
+    )
+    _need(not getattr(linear, "is_output_padded", False), f"{name}: output padded")
+    _need(
+        s is not None
+        and s.dtype in (torch.uint8, dtypes.fp8_e8m0)
+        and s.numel() == rows * cols // 32
+        and s.is_contiguous(),
+        f"{name}: scale {None if s is None else (s.dtype, tuple(s.shape))}",
+    )
+    return w.data, s.data
+
+
 def _bf16_vec(t: torch.Tensor, n: int, name: str) -> torch.Tensor:
     _need(
         t.dtype == torch.bfloat16 and t.numel() == n and t.is_contiguous(),
@@ -109,6 +142,13 @@ class SparseMoeLayer:
     s13: torch.Tensor
     w2: torch.Tensor
     s2: torch.Tensor
+    # an unfused shared expert (``shared_mxfp8``): its own MXFP8 MLP, gate | up
+    # rows in one weight; ``w13`` / ``w2`` then hold the 128 routed experts only
+    shared_mxfp8: bool = False
+    w13s: torch.Tensor | None = None
+    s13s: torch.Tensor | None = None
+    w2s: torch.Tensor | None = None
+    s2s: torch.Tensor | None = None
 
     @staticmethod
     def from_layer(layer, layer_id: int, heads: IndexHeads) -> "SparseMoeLayer":
@@ -146,11 +186,29 @@ class SparseMoeLayer:
         moe = layer.block_sparse_moe
         experts = moe.experts
         qm = experts.quant_method
-        E = N_ROUTED + 1
-        _need(
-            moe.fuse_shared_experts and experts.num_fused_shared_experts == 1,
-            f"layer {layer_id}: shared expert",
-        )
+        shared8 = not moe.fuse_shared_experts
+        # the shared expert is the 129th expert of the MXFP4 tables, or an MXFP8 MLP
+        # of its own next to the 128 routed ones
+        E = N_ROUTED + (0 if shared8 else 1)
+        if shared8:
+            _need(
+                experts.num_fused_shared_experts == 0
+                and moe.shared_experts is not None,
+                f"layer {layer_id}: shared expert",
+            )
+            sh = moe.shared_experts
+            w13s, s13s = _mxfp8(
+                sh.gate_up_proj, 2 * INTER, HIDDEN, f"layer {layer_id} shared gate_up"
+            )
+            w2s, s2s = _mxfp8(
+                sh.down_proj, HIDDEN, INTER, f"layer {layer_id} shared down_proj"
+            )
+        else:
+            _need(
+                experts.num_fused_shared_experts == 1,
+                f"layer {layer_id}: shared expert",
+            )
+            w13s = s13s = w2s = s2s = None
         _need(
             experts.top_k == TOP_K and not getattr(qm, "is_guinterleave", True),
             f"layer {layer_id}: moe layout",
@@ -213,6 +271,11 @@ class SparseMoeLayer:
             s13=s13.data,
             w2=w2.data,
             s2=s2.data,
+            shared_mxfp8=shared8,
+            w13s=w13s,
+            s13s=s13s,
+            w2s=w2s,
+            s2s=s2s,
         )
 
 
