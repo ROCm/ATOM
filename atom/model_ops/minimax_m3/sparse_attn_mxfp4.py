@@ -47,8 +47,13 @@ def sparse_pa_mxfp4(
     *,
     planned: bool = False,
     plan_step_owner=None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Attention of every row over its selected pages; ``[rows, num_heads, 128]``.
+
+    ``out`` is that tensor, of ``out_dtype`` and contiguous, when the caller owns the
+    output (a DP step's pad rows past ``rows`` live in a larger buffer it slices);
+    else it is allocated here. Returned either way.
 
     ``planned`` runs the decode path, with plans from the shared cache. Not planned
     runs plan-free, one task a row, written directly (prefill); every row then needs
@@ -82,11 +87,18 @@ def sparse_pa_mxfp4(
     v_data, v_scale = page_views(v_flat)
     n = rows * num_kv_heads
     q_rows = q.view(n, group, HEAD_DIM)
-    out = torch.empty((n, group, HEAD_DIM), dtype=out_dtype, device=q.device)
+    if out is None:
+        out = torch.empty((rows, num_heads, HEAD_DIM), dtype=out_dtype, device=q.device)
+    elif out.shape != q.shape or out.dtype != out_dtype or not out.is_contiguous():
+        raise ValueError(
+            f"out must be a contiguous {tuple(q.shape)} {out_dtype} tensor, got "
+            f"{tuple(out.shape)} {out.dtype}"
+        )
+    out_rows = out.view(n, group, HEAD_DIM)
     bound = sparse_bt.shape[1] * PAGE_TOKENS
     if not planned:
         pa_decode(
-            out,
+            out_rows,
             q_rows,
             k_data,
             v_data,
@@ -99,7 +111,7 @@ def sparse_pa_mxfp4(
             work_plan=None,
             max_context_length=bound,
         )
-        return out.view(rows, num_heads, HEAD_DIM)
+        return out
     for seg, start in enumerate(range(0, n, _FLYDSL_PLAN_MAX_BATCH)):
         end = min(start + _FLYDSL_PLAN_MAX_BATCH, n)
         ctx = sparse_ctx[start:end]
@@ -120,7 +132,7 @@ def sparse_pa_mxfp4(
             plan, 1, group, HEAD_DIM, out_dtype, q.device
         )
         pa_decode(
-            out[start:end],
+            out_rows[start:end],
             q_rows[start:end],
             k_data,
             v_data,
@@ -136,4 +148,4 @@ def sparse_pa_mxfp4(
             max_logits=max_logits,
             temporary_output=tmp,
         )
-    return out.view(rows, num_heads, HEAD_DIM)
+    return out

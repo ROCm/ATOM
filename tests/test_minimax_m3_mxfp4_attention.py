@@ -197,3 +197,20 @@ def test_plan_free_rows_attend_their_selected_pages(rows, hkv):
     out = sparse_pa_mxfp4(q, k, v, bt, ctx, hkv, SCALE, torch.bfloat16)
     assert out.shape == q.shape and out.dtype == torch.bfloat16
     assert rel(out, reference(k, v, bt, ctx, q, hkv)) < 3e-3
+
+
+@pytest.mark.parametrize("planned", [True, False])
+def test_out_is_the_allocated_result_in_the_callers_buffer(planned):
+    """`out=` (a slice of a larger buffer, as a DP step's pad rows leave it) holds
+    exactly what the allocated result is and the rows past it are left alone."""
+    from atom.model_ops.minimax_m3.sparse_attn_mxfp4 import sparse_pa_mxfp4
+
+    rows = 37
+    k, v, bt, ctx, q = make(rows, 2, seed=11)
+    args = (q, k, v, bt, ctx, 2, SCALE, torch.bfloat16)
+    step = types.SimpleNamespace()
+    want = sparse_pa_mxfp4(*args, planned=planned, plan_step_owner=step)
+    buf = torch.full((rows + 3, *q.shape[1:]), 7.0, dtype=torch.bfloat16, device="cuda")
+    got = sparse_pa_mxfp4(*args, planned=planned, plan_step_owner=step, out=buf[:rows])
+    assert got.data_ptr() == buf.data_ptr()
+    assert torch.equal(buf[:rows], want) and (buf[rows:] == 7).all()

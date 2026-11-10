@@ -172,7 +172,8 @@ def test_the_sparse_decode_runs_only_the_rows_the_metadata_covers(
 
     def attend_fp4(q, k_cache, v_cache, sparse_bt, sparse_ctx, *a, **kw):
         seen["attend"] = (q.shape[0], sparse_bt.shape[0] // heads, sparse_ctx.numel())
-        return torch.ones(q.shape[0], hq, 8)
+        kw["out"].fill_(1)  # written in place; the pad rows past it stay the caller's
+        seen["out"] = (kw["out"].shape[0], kw["out"].dtype)
 
     def attend_fp8(
         q, k_cache, v_cache, topk_idx, bt, seq_lens, hkv, scale, output, **kw
@@ -221,6 +222,8 @@ def test_the_sparse_decode_runs_only_the_rows_the_metadata_covers(
     assert seen["scorer"] == (rows, batch, batch)
     assert seen["attend"][0] == rows and seen["attend"][1] == rows
     assert (out[:rows] == 1).all() and (out[rows:] == 0).all()
+    if kv == "fp4":
+        assert seen["out"] == (rows, v.dtype)
 
     # a skip-index layer holds no index_q, only the unsliced shape's key
     seen.clear()
@@ -303,3 +306,48 @@ def test_the_scorer_is_given_the_bound_its_map_was_built_at():
     kw = impl._mxfp4_select_kwargs(md, decode=True)
     assert kw["index_work_map"] is wmap and kw["index_work_map_max_block"] == 37
     assert "index_work_map" not in impl._mxfp4_select_kwargs(md, decode=False)
+
+
+@pytest.mark.parametrize("planned", [True, False])
+def test_the_caller_can_own_the_output(monkeypatch, planned):
+    """`out=` is written in place and returned, on the planned and the plan-free path;
+    its dtype is `out_dtype` (the query is e4m3), and nothing else is accepted.
+    The kernels are doubles: the segments' views must land in the caller's buffer."""
+    import sys
+
+    pytest.importorskip("aiter")
+    from atom.model_ops.minimax_m3 import sparse_attn_mxfp4 as m
+
+    def pa_decode(out, q, *a, **kw):
+        out.copy_(torch.arange(out.shape[0], dtype=out.dtype).view(-1, 1, 1))
+
+    fake_pa = types.ModuleType("aiter.ops.flydsl.pa_decode")
+    fake_pa.pa_decode = pa_decode
+    fake_gluon = types.ModuleType("aiter.ops.triton.gluon.pa_decode_gluon")
+    fake_gluon.get_recommended_splits = lambda *_a: 1
+    monkeypatch.setitem(sys.modules, "aiter.ops.flydsl.pa_decode", fake_pa)
+    monkeypatch.setitem(
+        sys.modules, "aiter.ops.triton.gluon.pa_decode_gluon", fake_gluon
+    )
+    monkeypatch.setattr(m, "_FLYDSL_PLAN_MAX_BATCH", 4)  # 3 segments of 5 rows
+    monkeypatch.setattr(m, "_flydsl_prepare_explicit_plan", lambda **kw: None)
+    monkeypatch.setattr(m, "_flydsl_plan_scratch", lambda *a: (None, None, None))
+
+    rows, hkv, heads = 5, 2, 4
+    k = torch.zeros(3, hkv, 8704, dtype=torch.uint8)
+    q = torch.zeros(rows, heads, 128, dtype=torch.float8_e4m3fn)
+    bt = torch.zeros(rows * hkv, 2, dtype=torch.int32)
+    ctx = torch.ones(rows * hkv, dtype=torch.int32)
+    buf = torch.full((rows + 2, heads, 128), -1.0, dtype=torch.bfloat16)  # 2 pad rows
+    args = (q, k, k, bt, ctx, hkv, 1.0, torch.bfloat16)
+
+    got = m.sparse_pa_mxfp4(*args, planned=planned, out=buf[:rows])
+    assert got.data_ptr() == buf.data_ptr() and got.shape == q.shape
+    per_pair = got.view(rows * hkv, heads // hkv, 128)[:, 0, 0]
+    # each segment's call numbers its own rows from 0, the plan-free one all of them
+    want = [i % 4 for i in range(rows * hkv)] if planned else list(range(rows * hkv))
+    assert per_pair.tolist() == [float(w) for w in want]
+    assert (buf[rows:] == -1).all()  # the pad rows are not touched
+
+    with pytest.raises(ValueError, match="out must be"):
+        m.sparse_pa_mxfp4(*args, out=torch.empty(q.shape, dtype=torch.float32))

@@ -1897,10 +1897,16 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             )
         else:
             topk_idx, sparse_bt, sparse_ctx = cached_topk
-        if self.kv_cache_dtype == "fp4":
+        # one output, its pad rows (past the metadata's) zero, written in place; the
+        # MXFP4 KV's q is e4m3, so its output takes the value dtype instead
+        fp4_kv = self.kv_cache_dtype == "fp4"
+        output = torch.empty_like(q, dtype=v.dtype if fp4_kv else None)
+        if rows < q.shape[0]:
+            output[rows:].zero_()
+        if fp4_kv:
             from atom.model_ops.minimax_m3.sparse_attn_mxfp4 import sparse_pa_mxfp4
 
-            output = sparse_pa_mxfp4(
+            sparse_pa_mxfp4(
                 q[:rows],
                 k_cache,
                 v_cache,
@@ -1911,13 +1917,9 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 v.dtype,
                 planned=True,
                 plan_step_owner=sparse_metadata if self.local_blocks >= 1 else None,
+                out=output[:rows],
             )
-            if rows < q.shape[0]:
-                output = nn.functional.pad(output, (0, 0, 0, 0, 0, q.shape[0] - rows))
         else:
-            output = torch.empty_like(q)
-            if rows < q.shape[0]:
-                output[rows:].zero_()
             minimax_m3_sparse_attn_decode_asm(
                 q[:rows],
                 k_cache,
