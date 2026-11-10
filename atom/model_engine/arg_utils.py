@@ -7,6 +7,7 @@ import logging
 from dataclasses import dataclass, fields
 
 from atom import LLMEngine
+from atom.aiter_provider import normalize_provider_names
 from atom.config import (
     CompilationConfig,
     CUDAGraphMode,
@@ -171,7 +172,9 @@ class EngineArgs:
     enable_tbo: str | None = None
     all2all_backend: str | None = None
     moe_backend: str = "standard"
-    gemm_fusion_profile: str | None = None
+    # Comma-separated aiter Provider names, order = preference order. Parsed to
+    # the Config tuple in `_get_engine_kwargs()`; empty (default) = OFF.
+    aiter_provider_enable: str = ""
     method: str | None = None
     num_speculative_tokens: int = 1
     kv_transfer_config: str = "{}"
@@ -444,12 +447,17 @@ class EngineArgs:
             "or AITER MegaMoeTP under --sequence-parallel-size.",
         )
         parser.add_argument(
-            "--gemm-fusion-profile",
+            "--aiter-provider-enable",
             type=str,
-            default=None,
-            help="AITER gemm_fusion profile (e.g. minimax_m3_sp4_gfx950_v1) "
-            "that fuses the attention QKV GEMM with the Ulysses SP exchange. "
-            "Requires --sequence-parallel-size > 1. Default: off.",
+            default="",
+            help=(
+                "Comma-separated aiter kernel Provider names to enable, in preference "
+                "order (aiter.plugin.configure(enable=...)). Unset/empty (default) is "
+                "OFF: ATOM never calls configure(), every routed op runs native, and "
+                "MiniMax-M3 SP4 keeps the non-fused QKV path. A named provider serves "
+                "the neutral sp_qkv_fused prologue when its explain() gate accepts the "
+                "call; AITER_PLUGINS=0 is aiter's own kill switch."
+            ),
         )
         parser.add_argument(
             "--method",
@@ -975,6 +983,12 @@ class EngineArgs:
         if base_port is not None:
             parallel_config_kwargs["data_parallel_base_port"] = base_port
         kwargs["parallel_config"] = ParallelConfig(**parallel_config_kwargs)
+
+        # --aiter-provider-enable (comma list) -> Config tuple; parsed here so the
+        # raw CLI string never reaches the pickled Config.
+        kwargs["aiter_provider_enable"] = normalize_provider_names(
+            kwargs.pop("aiter_provider_enable", "")
+        )
 
         logger.info(f"Engine kwargs: {kwargs}")
 

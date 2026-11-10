@@ -839,6 +839,17 @@ class ModelRunner:
         self.attn_backend = get_attn_backend(self.attn_family)
         self._setup_device_and_distributed(rank, config)
 
+        # aiter kernel providers: opt-in, one configure() per worker process,
+        # after device/distributed state is up and before the model is built /
+        # loaded / warmed / captured. aiter snapshots config+discovery at the
+        # first dispatch, so a later hook would silently serve native; every
+        # spawned worker is its own interpreter and must configure here.
+        # Default off: configure_aiter_providers() returns without calling
+        # aiter.plugin.configure(), so the non-fused path is unchanged.
+        from atom.aiter_provider import configure_aiter_providers
+
+        configure_aiter_providers(self.config)
+
         self.capture_sizes = [0]  # for eager fallback
         # The same ladder as an ASCENDING int32 array, which is what
         # `ForwardMode.decide` searches. Separate from the list because the list
@@ -4397,6 +4408,11 @@ class ModelRunner:
                         ub_tokens_across_dp=ub_tokens_across_dp,
                     )
 
+                    if self.gemm_fusion is not None:
+                        # Capture cannot allocate a new provider binding: pre-bind
+                        # this capture M class with the final-pool tensors first.
+                        self.gemm_fusion.prepare_capture(sp_local_len(running_tokens))
+
                     # Warmup
                     model_positions = (
                         self._mrope_positions_view(running_tokens)
@@ -4627,6 +4643,8 @@ class ModelRunner:
             running_tokens_per_dp_rank=self.running_tokens_per_dp_rank,
             in_hipgraph=True,
         )
+        if self.gemm_fusion is not None:
+            self.gemm_fusion.prepare_capture(sp_local_len(context.scheduled_tokens))
         get_forward_context().tr_graph = mode
         self.model(
             self.forward_vars["input_ids"].gpu[: context.scheduled_tokens],
@@ -5078,6 +5096,10 @@ class RapidServeModelRunner(ModelRunner):
         from atom.utils.forward_context import set_kv_cache_data
 
         set_kv_cache_data(kv_cache_data)
+        if self.gemm_fusion is not None:
+            # IPC-imported pool replaces the one the sites may have prepared
+            # against; reset/re-warm before any fused call sees this final pool.
+            self.gemm_fusion.prepare(kv_cache_data)
 
     # ------------------------------------------------------------------
     # CU-masked stream pools + prefill forward

@@ -1,25 +1,56 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""One attention layer's fused QKV: the GEMM and the Ulysses exchange run as
-an AITER gemm_fusion plan, and the impl continues after the stages the plan
-covered. Every per-call choice depends only on shapes, dtypes and the
-broadcast batch, so all SP ranks take the same path.
+"""MiniMax-M3 SP4 QKV prologue through the neutral routed ``sp_qkv_fused`` op.
+
+#3084's gemm_fusion plan/bucket machinery is gone; this module keeps only the
+per-layer site hook, the attention tail and #3084's non-fused fallback.  A
+site's forward either
+* serves the call from the installed AITER provider (``aiter.sp_qkv_fused``
+  after an init/first-use ``aiter.plugin.explain`` gate), or
+* takes #3084's ordinary non-fused path (``qkv_proj`` + ``ulysses_attention``
+  + head gather) when the provider declines that (mode, M) class.
+The choice is made per ``(site, mode, M)`` outside graph capture; there is no
+try/except around a fused forward and no ATOM bucket planning -- padding is the
+provider's job.
 """
 
 import logging
+import types
 
 import torch
 
-from atom.model_ops.sp_attention import (
-    attend_exchanged,
-    gather_heads,
-    ulysses_attention,
-)
+from atom.config import get_current_atom_config
+from atom.utils import mark_spliting_op
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
 
-_KV_DTYPES = {"fp8": torch.float8_e4m3fn, "bf16": torch.bfloat16}
+_OP_NAME = "sp_qkv_fused"
+_SP_WORLD = 4
+_POSITIONAL_KEYS = (
+    "q",
+    "x",
+    "x_scale",
+    "w",
+    "w_scale",
+    "q_norm_w",
+    "k_norm_w",
+    "cos_cache",
+    "sin_cache",
+    "positions",
+    "slot_mapping",
+    "k_cache",
+    "v_cache",
+    "k_scale",
+    "v_scale",
+)
+
+# One output set per (device, mode, geometry, rows), shared by all sites.  The
+# provider stages its own padded outputs and copies the real rows into these
+# caller buffers; caller pointers are not part of its binding, and the buffer is
+# allocated only for a cell explain() actually selects (the provider owns the
+# coverage/padding decision, ATOM owns no bucket planning).
+_OUTPUTS: dict[tuple, dict] = {}
 
 
 def rows2d(t):
@@ -27,67 +58,14 @@ def rows2d(t):
     return t if t.dim() == 2 else t.reshape(t.shape[0], -1)
 
 
-def cache_layout_reason(impl, state, *, page, with_index):
-    """Why the bound caches are not the SHUFFLE layout the plan writes through
-    raw pointers, or None. K ``[N, kv, hd/x, page, x]``, V ``[N, kv, page/x,
-    hd, x]``; FP8 adds float32 ``[N, kv, page]`` scales; the indexer keys are
-    FP8 ``[N, 128, 128]``."""
-    want = _KV_DTYPES.get(impl.kv_cache_dtype)
-    if want is None:
-        return "kv_layout"
-    x = 16 // want.itemsize
-    nkv, hd = impl.num_kv_heads, impl.head_dim
-    k = state["k_cache"]
-    v = state.get("v_cache_shuffle", state["v_cache"])
-    if (
-        k.dim() != 5
-        or v.dim() != 5
-        or k.dtype != want
-        or v.dtype != want
-        or tuple(k.shape[1:]) != (nkv, hd // x, page, x)
-        or tuple(v.shape) != (k.shape[0], nkv, page // x, hd, x)
-        or k.stride(4) != 1
-        or k.stride(3) != x
-        or v.stride(4) != 1
-        or v.stride(3) != x
-    ):
-        return "kv_layout"
-    scales = (state["k_scale"], state["v_scale"])
-    if impl.kv_cache_dtype == "fp8":
-        for s in scales:
-            if (
-                s is None
-                or s.dtype != torch.float32
-                or tuple(s.shape) != (k.shape[0], nkv, page)
-                or s.stride(2) != 1
-            ):
-                return "kv_layout"
-    elif any(s is not None for s in scales):
-        return "kv_layout"
-    if with_index:
-        ic = impl.index_cache
-        if (
-            ic is None
-            or impl.index_cache_dtype != "fp8"
-            or impl.index_head_dim != 128
-            or ic.dtype != torch.float8_e4m3fn
-            or tuple(ic.shape[1:]) != (128, 128)
-            or not ic.is_contiguous()
-        ):
-            return "index_layout"
-    return None
-
-
 def static_weight_reason(lin):
-    """Why the plan cannot take the QKV weight as is (a 16x16-preshuffled FP8
-    ``[N, K]`` with at least N scale rows), or None."""
+    """Why the neutral contract cannot take the QKV weight as is, or None."""
     w = lin.weight
     if getattr(w, "is_shuffled", False) is not True:
         return "weight_layout"
     n, k = lin.output_size, lin.input_size
     if w.dim() != 2 or w.shape[1] != k:
         return "weight_shape"
-    # A preshuffled weight padded on N keeps its first N rows contiguous.
     if w.shape[0] < n or (w.shape[0] != n and not lin.is_output_padded):
         return "weight_shape"
     scale = getattr(lin, "weight_scale", None)
@@ -96,50 +74,230 @@ def static_weight_reason(lin):
     return None
 
 
-def native_reason(*, dummy_run, x, x_scale, input_size, positions=None, slot=None):
-    """Why this call must take the native path, or None. ``positions`` and
-    ``slot`` are given for a plan that runs the prologue, whose kernel reads
-    one position and slot per real token."""
-    if dummy_run:
-        return "dummy_run"
-    if x_scale is None or x.dtype != torch.float8_e4m3fn:
-        return "unquantized_input"
+def _sp_group():
+    """The SP group's torch.distributed ProcessGroup (the op's execution context)."""
+    from aiter.dist.parallel_state import get_pcp_group
+
+    return get_pcp_group().device_group
+
+
+def _aiter():
+    import aiter
+
+    return aiter
+
+
+# Cached module-level import: `import aiter; aiter.plugin` is only valid when
+# something already imported the submodule in THIS process (spawn workers often
+# have not), so the forward process must import it explicitly.
+_PLUGIN = None
+
+
+def _aiter_plugin():
+    global _PLUGIN
+    if _PLUGIN is None:
+        import importlib
+
+        try:
+            _PLUGIN = importlib.import_module("aiter.plugin")
+        except Exception:  # noqa: BLE001 - interface absent/not a package in tests
+            _PLUGIN = getattr(_aiter(), "plugin", None)
+    return _PLUGIN
+
+
+# Process-local: the site-side enablement is idempotent at the point of use.
+_ENSURE_DONE = False
+
+
+def _ensure_plugin_enabled(aiter, plugin, enabled):
+    """Make this process's aiter.plugin configuration match the deployment.
+
+    ModelRunner configures before model build, but the forward path can run in a
+    worker/child context that never saw that call (fork/spawn, model
+    re-instantiation).  The aiter interface has one process-local config, so the
+    site re-asserts it once, at the first routed call, and logs the resulting
+    ``enabled``/``routed_ops`` so an empty case is loud.
+    """
+    global _ENSURE_DONE
+    status = None
+    try:
+        # A lazy-op export registers its @route entry on first attribute access.
+        getattr(aiter, _OP_NAME)
+        status = plugin.status()
+        if not tuple(status.get("enabled", ()) or ()) and enabled:
+            from atom.aiter_provider import atom_version
+
+            plugin.configure(source=f"atom {atom_version()}", enable=enabled)
+            status = plugin.status()
+    except Exception:
+        logger.warning(
+            "gemm_fusion: could not re-assert aiter provider enablement; "
+            "explain() will decide",
+            exc_info=True,
+        )
+    if not _ENSURE_DONE:
+        _ENSURE_DONE = True
+        if status is None:
+            logger.warning(
+                "aiter plugin status unavailable; provider explain will decline"
+            )
+        else:
+            logger.info(
+                "aiter plugin enabled=%s routed=%s",
+                tuple(status.get("enabled", ()) or ()),
+                tuple(status.get("routed_ops", {}) or {}),
+            )
+    return status
+
+
+def _in_hipgraph() -> bool:
+    """Whether the current forward is a capture/warmup pass under hipgraph."""
+    try:
+        return bool(getattr(get_forward_context().context, "in_hipgraph", False))
+    except Exception:  # noqa: BLE001 - no context means ordinary eager
+        return False
+
+
+def _shared_outputs(device, mode, impl, rows):
+    key = (
+        str(device),
+        mode,
+        int(impl.num_heads),
+        int(impl.num_kv_heads),
+        int(impl.head_dim),
+        int(getattr(impl, "num_idx_heads", 0)),
+        int(getattr(impl, "index_head_dim", 0)),
+        int(rows),
+    )
+    outs = _OUTPUTS.get(key)
+    if outs is None:
+        q = torch.empty(
+            (rows, impl.num_heads, impl.head_dim), device=device, dtype=torch.bfloat16
+        )
+        outs = {"q": q}
+        if mode in ("dense", "reuse"):
+            k = torch.empty(
+                (rows, impl.num_kv_heads, impl.head_dim),
+                device=device,
+                dtype=torch.bfloat16,
+            )
+            outs.update(k=k, v=torch.empty_like(k))
+        if mode == "indexer":
+            outs["index_q"] = torch.empty(
+                (rows, impl.num_idx_heads, impl.index_head_dim),
+                device=device,
+                dtype=torch.bfloat16,
+            )
+        _OUTPUTS[key] = outs
+    return outs
+
+
+def _sparse_class():
+    from atom.models.minimax_m3.model import MiniMaxM3SparseAttention
+
+    return MiniMaxM3SparseAttention
+
+
+def _skip_reason(module, config):
+    """Why this layer cannot take the neutral prologue, or None.
+
+    These are #3084's static site gates; the provider's own explain() remains
+    authoritative for a concrete call.
+    """
+    from atom.models.minimax_m3.model import _linear_consumes_per_token_fp8
+
+    attn, impl = module.attn, module.attn.impl
+    rot = impl.rotary_emb
+    if int(getattr(config, "sequence_parallel_size", 1)) != _SP_WORLD:
+        return "world"
+    if not attn.per_token_fp8_out or not _linear_consumes_per_token_fp8(module.o_proj):
+        return "o_proj_input"
+    if not impl.gemm_fusion_prologue_supported() or not rot.is_neox_style:
+        return "prologue"
+    cos = getattr(rot, "cos_cache", None)
     if (
-        x_scale.dtype != torch.float32
-        or x_scale.numel() != x.shape[0]
-        or not x_scale.is_contiguous()
+        cos is None
+        or cos.dtype != torch.bfloat16
+        or 2 * rows2d(cos).shape[1] != rot.rotary_dim
     ):
-        return "xscale_layout"
-    if x.dim() != 2 or x.shape[1] != input_size or x.stride(1) != 1:
-        return "x_layout"
-    if positions is None:
-        return None
-    real = positions.shape[-1]
-    if positions.numel() != real or slot.numel() < real:
-        return "meta_len"
-    for t in (positions, slot):
-        if t.dtype != torch.int64 or not t.is_contiguous() or t.numel() == 0:
-            return "meta_layout"
-    return None
+        return "rope_cache"
+    if isinstance(module, _sparse_class()):
+        mode = "reuse" if module.skip_index_topk else "indexer"
+        if impl.indexer_cp_group is not None:
+            return "indexer_cp"
+        if mode == "indexer" and (
+            impl.index_cache_dtype != "fp8" or impl.index_head_dim != 128
+        ):
+            return "index_cache"
+    return static_weight_reason(module.qkv_proj)
+
+
+def _site(layer_name):
+    ctx = get_current_atom_config().compilation_config.static_forward_context
+    return ctx[layer_name].gemm_fusion_site
+
+
+def _fake(x, x_scale, positions, layer_name, scale):
+    site = _site(layer_name)
+    return torch.empty(
+        (x.shape[0], site.out_width), device=x.device, dtype=torch.float8_e4m3fn
+    )
+
+
+@mark_spliting_op(is_custom=True, gen_fake=_fake, mutates_args=["scale"])
+def sp_qkv_prologue_attention(
+    x: torch.Tensor,
+    x_scale: torch.Tensor | None,
+    positions: torch.Tensor,
+    layer_name: str,
+    scale: torch.Tensor,
+) -> torch.Tensor:
+    return _site(layer_name).run(x, x_scale, positions, scale)
+
+
+def _forward(self, positions, hidden_states, hidden_states_scale=None):
+    scale = hidden_states.new_empty((hidden_states.shape[0], 1), dtype=torch.float32)
+    out = torch.ops.aiter.sp_qkv_prologue_attention(
+        hidden_states, hidden_states_scale, positions, self.attn.layer_name, scale
+    )
+    return self.o_proj(out, scale)
 
 
 class QkvSite:
-    """The fused QKV of one attention layer."""
+    """The neutral prologue of one attention layer, with a non-fused fallback."""
 
-    def __init__(self, name, attn, linear, spec, mode, runtime, out_width):
+    def __init__(self, name, attn, linear, mode, config, out_width):
         self.name = name
         self.attn = attn
         self.linear = linear
-        self.spec = spec
         self.mode = mode
-        self.runtime = runtime
         self.out_width = out_width
-        # Bucket M -> the plan prepared for it.
-        self.plans = {}
-        # One site advances the device step counter once per forward.
-        self.ticks = False
+        self.world = int(config.sequence_parallel_size)
+        self.provider_enable = tuple(getattr(config, "aiter_provider_enable", ()) or ())
+        self.provider_enabled = bool(self.provider_enable)
         self._norm_f32 = {}
+        self._routes = {}
+        self._group = None
+        self._eps = float(attn.impl.q_norm.variance_epsilon)
         self._logged = set()
+        # False until GemmFusionSites.prepare() has seen the final KV pool.
+        self.kv_ready = False
+        # Capture cells pre-bound through the provider prepare-only API.
+        self._capture_prepared: set[tuple[str, int]] = set()
+        self._capture_declined: set[tuple[str, int]] = set()
+
+    def mark_kv_ready(self):
+        """The KV pool is final: drop gate/prepare verdicts from an earlier pool."""
+        self.kv_ready = True
+        self._routes.clear()
+        self._capture_prepared.clear()
+        self._capture_declined.clear()
+
+    def _outputs(self, local_m):
+        """Caller outputs for a provider-selected cell (shared, address-stable)."""
+        return _shared_outputs(
+            self.linear.weight.device, self.mode, self.attn.impl, self.world * local_m
+        )
 
     def _f32(self, key, t):
         cached = self._norm_f32.get(key)
@@ -169,94 +327,406 @@ class QkvSite:
             meta["index_k_norm_w"] = self._f32("ik", impl.index_k_norm.weight)
         return meta
 
-    def _log_once(self, path, reason, m):
-        if (path, reason) not in self._logged:
-            self._logged.add((path, reason))
-            logger.info(
-                "gemm_fusion %s: %s (%s) first at local M %d",
+    def _args(self, x, x_scale, meta, outs, stream, *, meta_outputs=False):
+        rows = self.world * x.shape[0]
+        if meta_outputs:
+            # explain() is non-executing; the large band needs no caller outputs,
+            # so a meta q/k/v payload lets the provider classify that cell class
+            # without allocating its sized buffers.
+            q = torch.empty(
+                (rows, self.attn.impl.num_heads, self.attn.impl.head_dim),
+                dtype=torch.bfloat16,
+                device="meta",
+            )
+            k = v = index_q = None
+            if self.mode in ("dense", "reuse"):
+                k = torch.empty(
+                    (rows, self.attn.impl.num_kv_heads, self.attn.impl.head_dim),
+                    dtype=torch.bfloat16,
+                    device="meta",
+                )
+                v = torch.empty_like(k)
+            if self.mode == "indexer":
+                index_q = torch.empty(
+                    (
+                        rows,
+                        self.attn.impl.num_idx_heads,
+                        self.attn.impl.index_head_dim,
+                    ),
+                    dtype=torch.bfloat16,
+                    device="meta",
+                )
+        else:
+            q = outs["q"][:rows]
+            k = outs.get("k")
+            v = outs.get("v")
+            index_q = outs.get("index_q")
+        args = [
+            q,
+            x,
+            x_scale,
+            self.linear.weight,
+            self.linear.weight_scale,
+            meta["q_norm_w"],
+            meta["k_norm_w"],
+            meta["cos_cache"],
+            meta["sin_cache"],
+            meta["positions"],
+            meta["slot_mapping"],
+            meta["k_cache"],
+            meta["v_cache"],
+            meta["k_scale"],
+            meta["v_scale"],
+        ]
+        kwargs = {
+            "mode": self.mode,
+            "k": None if k is None else k[:rows],
+            "v": None if v is None else v[:rows],
+            "index_q": None if index_q is None else index_q[:rows],
+            "index_q_norm_w": meta.get("index_q_norm_w"),
+            "index_k_norm_w": meta.get("index_k_norm_w"),
+            "index_cache": meta.get("index_cache"),
+            "eps": self._eps,
+            "group": self._group_value(),
+            "stream": stream,
+        }
+        return args, kwargs
+
+    def _capture_state(self, fwd_ctx):
+        return self.attn.impl.gemm_fusion_prologue_state(fwd_ctx)
+
+    def capture_gate_args(self, local_m, fwd_ctx):
+        """The explain payload for a capture M class (non-executing meta outputs)."""
+        state = self._capture_state(fwd_ctx)
+        positions = torch.empty(
+            (self.world * local_m,), dtype=torch.int64, device="meta"
+        )
+        meta = self.build_meta(state, positions, state["slot_mapping"])
+        x = torch.empty(
+            (local_m, self.linear.input_size),
+            dtype=torch.float8_e4m3fn,
+            device="meta",
+        )
+        x_scale = torch.empty((local_m,), dtype=torch.float32, device="meta")
+        return self._args(x, x_scale, meta, None, None, meta_outputs=True)
+
+    def capture_prepare_payload(self, local_m, fwd_ctx):
+        """The prepare-only payload with the capture-time baked tensor objects.
+
+        Per-call tensors (x/x_scale/positions/stream) are placeholders; the
+        provider's binding only bakes KV caches/scales, weights/norm weights,
+        cos/sin and its own staging, which are taken from the final layer state
+        and the site's shared output set for this M class.
+        """
+        state = self._capture_state(fwd_ctx)
+        dev = self.linear.weight.device
+        positions = torch.empty((self.world * local_m,), dtype=torch.int64, device=dev)
+        meta = self.build_meta(state, positions, state["slot_mapping"])
+        x = torch.empty(
+            (local_m, self.linear.input_size),
+            dtype=torch.float8_e4m3fn,
+            device=dev,
+        )
+        x_scale = torch.empty((local_m,), dtype=torch.float32, device=dev)
+        args, kwargs = self._args(x, x_scale, meta, self._outputs(local_m), None)
+        payload = dict(zip(_POSITIONAL_KEYS, args))
+        payload.update(kwargs)
+        return payload
+
+    def _group_value(self):
+        if self._group is None:
+            try:
+                self._group = _sp_group()
+            except Exception:  # noqa: BLE001 - no interface/group: explain declines
+                self._group = False
+        return None if self._group is False else self._group
+
+    def _log_once(self, key, msg, *args):
+        if key not in self._logged:
+            self._logged.add(key)
+            logger.info(msg, *args)
+
+    def _layout_ok(self, x, x_scale, positions, slot):
+        """#3084's static call-shape checks, without its plan machinery."""
+        if x_scale is None or x.dtype != torch.float8_e4m3fn:
+            return False
+        if (
+            x_scale.dtype != torch.float32
+            or x_scale.numel() != x.shape[0]
+            or not x_scale.is_contiguous()
+        ):
+            return False
+        if x.dim() != 2 or x.shape[1] != self.linear.input_size or x.stride(1) != 1:
+            return False
+        if positions is None:
+            return False
+        real = positions.shape[-1]
+        if positions.numel() != real or slot.numel() < real:
+            return False
+        return all(
+            t.dtype == torch.int64 and t.is_contiguous() and t.numel() != 0
+            for t in (positions, slot)
+        )
+
+    def _rank_uniform(self, local_served, m):
+        """Agree the local explain verdict and M class across the SP group.
+
+        The provider's exchange/call-id/readback protocol requires every rank to
+        issue the same call sequence, so a site serves only when every rank's
+        explain selects the provider **and** every rank presents the same local
+        M (equal local M means the same provider bucket). Different M across
+        ranks is an uneven-SP step: the safest functional policy is all-rank
+        fallback (no padded payload construction here).
+
+        Returns ``(served, reason)``. With no group (single rank/CPU) the local
+        verdict is the decision.
+        """
+        group = self._group_value()
+        if group is None:
+            return bool(local_served), "single-rank"
+        try:
+            import torch.distributed as dist
+
+            gathered = [None] * self.world
+            dist.all_gather_object(gathered, (bool(local_served), int(m)), group=group)
+        except Exception:
+            logger.warning(
+                "provider gate %s mode=%s m=%d: collective failed; non-fused path",
                 self.name,
-                path,
-                reason,
+                self.mode,
+                m,
+                exc_info=True,
+            )
+            return False, "collective-error"
+        if any(item is None for item in gathered):
+            return False, "collective-incomplete"
+        all_served = all(bool(item[0]) for item in gathered)
+        same_m = len({int(item[1]) for item in gathered}) == 1
+        if all_served and same_m:
+            return True, "all-ranks"
+        if not any(bool(item[0]) for item in gathered):
+            return False, "provider-declined"
+        return False, "rank-disagreement"
+
+    def _serves(self, m, args, kwargs, *, capture_gate=False):
+        """The rank-uniform ``aiter.plugin.explain`` gate, cached per (mode, M)."""
+        if not self.provider_enabled:
+            return False
+        if not self.kv_ready:
+            # The provider binds address-stable caches/outputs at first prepare;
+            # never let a dummy/compile-only or pre-pool forward bind a temporary
+            # KV pool. ATOM's prepare(kv_cache_data) hook flips this after the
+            # final pool exists and resets the provider/gate caches.
+            self._log_once(
+                "kv-pending",
+                "gemm_fusion %s: provider deferred until the final KV pool",
+                self.name,
+            )
+            return False
+        key = (self.mode, int(m))
+        # Capture may only take the fused path after the capture seam pre-bound
+        # this M class through the provider prepare-only API; otherwise the
+        # capture trace gets the non-fused path (no new binding inside capture).
+        if not capture_gate and _in_hipgraph() and key not in self._capture_prepared:
+            return False
+        cached = self._routes.get(key)
+        if cached is not None:
+            return cached
+        local_served = False
+        try:
+            aiter = _aiter()
+            plugin = _aiter_plugin()
+            if plugin is None:
+                raise AttributeError("aiter.plugin")
+            # Re-assert enablement at the point of use: the process running this
+            # forward is not necessarily the process ModelRunner initialized.
+            _ensure_plugin_enabled(aiter, plugin, self.provider_enable)
+            explanation = plugin.explain(_OP_NAME, *args, **kwargs)
+            decision = getattr(explanation, "decision", None)
+            local_served = getattr(decision, "route", None) == "provider"
+        except Exception:
+            logger.warning(
+                "gemm_fusion %s: provider explain() unavailable; non-fused path",
+                self.name,
+                exc_info=True,
+            )
+        served, reason = self._rank_uniform(local_served, m)
+        self._routes[key] = served
+        if served:
+            logger.info(
+                "provider gate %s mode=%s m=%d: fused (all ranks)",
+                self.name,
+                self.mode,
                 m,
             )
+            self._log_once(
+                "first-prepare",
+                "provider session: first-prepare %s mode=%s m=%d",
+                self.name,
+                self.mode,
+                m,
+            )
+        else:
+            logger.info(
+                "provider gate %s mode=%s m=%d: fallback (%s)",
+                self.name,
+                self.mode,
+                m,
+                reason,
+            )
+        self._log_once(
+            "route" if served else f"fallback-{m}",
+            "gemm_fusion %s: %s local M=%d",
+            self.name,
+            "provider sp_qkv_fused" if served else "non-fused fallback",
+            m,
+        )
+        return served
+
+    def warmup_payload(self):
+        """A first-call-shaped payload for the provider's framework-owned warmup.
+
+        Only shapes/dtypes are read by the provider's coverage check; the real
+        QKV weight/norm weights/rotary caches are passed so a weight/rope layout
+        the provider cannot serve declines here.
+        """
+        impl = self.attn.impl
+        t = self.world
+        page = 128 if self.mode == "dense" else 16
+        fp8 = torch.float8_e4m3fn
+        bf16 = torch.bfloat16
+        fp32 = torch.float32
+
+        def empty(dtype, *shape):
+            return torch.empty(shape, dtype=dtype, device="meta")
+
+        payload = {
+            "q": empty(bf16, t, impl.num_heads, impl.head_dim),
+            "x": empty(fp8, 1, self.linear.input_size),
+            "x_scale": empty(fp32, 1),
+            "w": self.linear.weight,
+            "w_scale": self.linear.weight_scale,
+            "q_norm_w": self._f32("q", impl.q_norm.weight),
+            "k_norm_w": self._f32("k", impl.k_norm.weight),
+            "cos_cache": rows2d(impl.rotary_emb.cos_cache),
+            "sin_cache": rows2d(impl.rotary_emb.sin_cache),
+            "positions": empty(torch.int64, t),
+            "slot_mapping": empty(torch.int64, t),
+            "k_cache": empty(fp8, 2, impl.num_kv_heads, impl.head_dim // 16, page, 16),
+            "v_cache": empty(fp8, 2, impl.num_kv_heads, page // 16, impl.head_dim, 16),
+            "k_scale": empty(fp32, 2, impl.num_kv_heads, page),
+            "v_scale": empty(fp32, 2, impl.num_kv_heads, page),
+            # Every contract key is present even when the mode does not use it:
+            # the provider's payload validator rejects missing/extra keys.
+            "mode": self.mode,
+            "k": None,
+            "v": None,
+            "index_q": None,
+            "index_q_norm_w": None,
+            "index_k_norm_w": None,
+            "index_cache": None,
+            "eps": self._eps,
+            "group": self._group_value(),
+            "stream": None,
+        }
+        if self.mode == "indexer":
+            payload.update(
+                index_q=empty(bf16, t, impl.num_idx_heads, impl.index_head_dim),
+                index_q_norm_w=self._f32("iq", impl.index_q_norm.weight),
+                index_k_norm_w=self._f32("ik", impl.index_k_norm.weight),
+                index_cache=empty(fp8, 2, 128, 128),
+            )
+        else:
+            payload.update(
+                k=empty(bf16, t, impl.num_kv_heads, impl.head_dim),
+                v=empty(bf16, t, impl.num_kv_heads, impl.head_dim),
+            )
+        return payload
+
+    def _tail(self, fwd_ctx, state, outs, positions):
+        real = positions.shape[-1]
+        index_q = outs.get("index_q")
+        return self.attn.impl.forward_after_prologue(
+            outs["q"][:real],
+            outs["k"][:real] if "k" in outs else None,
+            outs["v"][:real] if "v" in outs else None,
+            state["k_cache"],
+            state["v_cache"],
+            state["k_scale"],
+            state["v_scale"],
+            fwd_ctx,
+            index_q=None if index_q is None else index_q[:real],
+        )
+
+    def _native(self, x, x_scale, positions, scale):
+        from atom.model_ops.sp_attention import gather_heads, ulysses_attention
+
+        self._log_once("native", "gemm_fusion %s: non-fused path", self.name)
+        qkv = self.linear(x, x_scale=x_scale)
+        out, rows = ulysses_attention(self.attn, None, None, None, positions, None, qkv)
+        return gather_heads(out, rows, self.attn.sp_head_exchange, scale)
 
     def run(self, x, x_scale, positions, scale):
-        """The layer's per-token FP8 attention output; its scales go to
-        ``scale``."""
-        rt = self.runtime
-        if self.ticks and rt.ready:
-            rt.step.add_(1)
-        attn, lin = self.attn, self.linear
-        m = x.shape[0]
-        tokens = rt.world * m
-        fwd_ctx = get_forward_context()
-        plan = self.plans.get(rt.bucket(self.spec, m)) if rt.ready else None
-        state = slot = None
-        if plan is None:
-            reason = "no_plan"
-        else:
-            if plan.n_stages == 2:
-                state = attn.impl.gemm_fusion_prologue_state(fwd_ctx)
-                slot = state["slot_mapping"]
-            reason = native_reason(
-                dummy_run=fwd_ctx.context.is_dummy_run,
-                x=x,
-                x_scale=x_scale,
-                input_size=lin.input_size,
-                positions=positions if state is not None else None,
-                slot=slot,
-            )
-        call_id = None
-        if reason is None:
-            call_id = rt.call_id(self, tokens, plan)
-            if call_id is None:
-                reason = "call_id_refused"
-        if reason is not None:
-            self._log_once("native", reason, m)
-            qkv = lin(x, x_scale=x_scale)
-            out, rows = ulysses_attention(attn, None, None, None, positions, None, qkv)
-            return gather_heads(out, rows, attn.sp_head_exchange, scale)
+        """This layer's per-token FP8 attention output; its scales go to ``scale``."""
+        from atom.model_ops.sp_attention import gather_heads
 
-        self._log_once("fused", f"{plan.vid} n_stages={plan.n_stages}", m)
+        fwd_ctx = get_forward_context()
+        if fwd_ctx.context.is_dummy_run:
+            return self._native(x, x_scale, positions, scale)
+        impl = self.attn.impl
+        state = impl.gemm_fusion_prologue_state(fwd_ctx)
+        slot = state["slot_mapping"]
+        if not self._layout_ok(x, x_scale, positions, slot):
+            return self._native(x, x_scale, positions, scale)
+        meta = self.build_meta(state, positions, slot)
         stream = torch.cuda.current_stream()
-        if plan.n_stages == 2:
-            outs = rt.outs[self.mode]
-            plan.run(
-                x=x,
-                x_scale=x_scale,
-                w=lin.weight,
-                w_scale=lin.weight_scale,
-                outs=outs,
-                meta=self.build_meta(state, positions, slot),
-                res=rt.res,
-                stream=stream,
-                call_id=call_id,
+        # The gate is non-executing and sees a meta-output payload, so it can
+        # classify any local M without allocating that cell's caller buffers.
+        gate_args, gate_kwargs = self._args(
+            x, x_scale, meta, None, stream, meta_outputs=True
+        )
+        if self._serves(x.shape[0], gate_args, gate_kwargs):
+            outs = self._outputs(x.shape[0])
+            args, kwargs = self._args(x, x_scale, meta, outs, stream)
+            aiter = _aiter()
+            aiter.sp_qkv_fused(*args, **kwargs)
+            out = self._tail(fwd_ctx, state, outs, positions)
+            return gather_heads(
+                out, self.world * x.shape[0], self.attn.sp_head_exchange, scale
             )
-            real = positions.shape[-1]
-            index_q = outs.get("index_q")
-            out = attn.impl.forward_after_prologue(
-                outs["q"][:real],
-                outs["k"][:real] if "k" in outs else None,
-                outs["v"][:real] if "v" in outs else None,
-                state["k_cache"],
-                state["v_cache"],
-                state["k_scale"],
-                state["v_scale"],
-                fwd_ctx,
-                index_q=None if index_q is None else index_q[:real],
-            )
+        return self._native(x, x_scale, positions, scale)
+
+
+def install_minimax_m3(model, config):
+    """Install a site on every eligible attention module; returns the sites."""
+    from atom.models.minimax_m3.model import (
+        MiniMaxM3Attention,
+        MiniMaxM3SparseAttention,
+    )
+
+    sites = []
+    for module in model.modules():
+        if isinstance(module, MiniMaxM3SparseAttention):
+            mode = "reuse" if module.skip_index_topk else "indexer"
+        elif isinstance(module, MiniMaxM3Attention):
+            mode = "dense"
         else:
-            plan.run(
-                x=x,
-                x_scale=x_scale,
-                w=lin.weight,
-                w_scale=lin.weight_scale,
-                res=rt.res,
-                stream=stream,
-                call_id=call_id,
-            )
-            # A view of the receive window, consumed on this stream before
-            # this rank's next large launch.
-            packed = plan.recv_view(rt.res, m)
-            out = attend_exchanged(attn, packed, positions)
-        return gather_heads(out, tokens, attn.sp_head_exchange, scale)
+            continue
+        attn = module.attn
+        name = attn.layer_name.rsplit(".", 1)[0] + ".qkv"
+        reason = _skip_reason(module, config)
+        if reason is not None:
+            logger.info("gemm_fusion %s: native (%s)", name, reason)
+            continue
+        site = QkvSite(
+            name,
+            attn,
+            module.qkv_proj,
+            mode,
+            config,
+            out_width=module.num_heads * module.head_dim,
+        )
+        attn.gemm_fusion_site = site
+        module.forward = types.MethodType(_forward, module)
+        sites.append(site)
+    return sites
