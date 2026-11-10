@@ -81,17 +81,17 @@ def _lean_world():
         plan={},
     )
     batch = SimpleNamespace(is_dummy_run=False, multimodal_data={})
-    base = dict(
-        hook=hook,
-        batch=batch,
-        spans=(span,),
-        running_bs=1,
-        running_tokens=6,
-        max_q_len=6,
-        tentative=True,
-        is_prefill=False,
-        resumes=None,
-    )
+    base = {
+        "hook": hook,
+        "batch": batch,
+        "spans": (span,),
+        "running_bs": 1,
+        "running_tokens": 6,
+        "max_q_len": 6,
+        "tentative": True,
+        "is_prefill": False,
+        "resumes": None,
+    }
     return span, hook, base
 
 
@@ -99,34 +99,34 @@ def test_lean_predicate_takes_a_served_one_request_verify_only(lh):
     span, hook, base = _lean_world()
     assert lh.lean_step(**base)
     cases = {
-        "no hook": dict(hook=None),
-        "not every layer": dict(
-            hook=SimpleNamespace(**{**vars(hook), "runs_every_layer": False})
-        ),
-        "width never served": dict(
-            hook=SimpleNamespace(**{**vars(hook), "served_widths": {4}})
-        ),
-        "dummy": dict(batch=SimpleNamespace(is_dummy_run=True, multimodal_data={})),
-        "prefill": dict(is_prefill=True),
-        "not a verify": dict(tentative=False),
-        "recomputed rows": dict(resumes=[3]),
-        "two requests": dict(
-            running_bs=2,
-            running_tokens=12,
-            spans=(span, SimpleNamespace(request_id=8, length=6)),
-        ),
-        "padded bs": dict(running_bs=2),
-        "no q bucket": dict(max_q_len=None),
-        "width != bucket": dict(running_tokens=8),
-        "other bucket": dict(max_q_len=3, running_tokens=3),
-        "span longer than bucket": dict(
-            spans=(SimpleNamespace(request_id=7, length=7),)
-        ),
-        "image rows": dict(
-            batch=SimpleNamespace(
+        "no hook": {"hook": None},
+        "not every layer": {
+            "hook": SimpleNamespace(**{**vars(hook), "runs_every_layer": False})
+        },
+        "width never served": {
+            "hook": SimpleNamespace(**{**vars(hook), "served_widths": {4}})
+        },
+        "dummy": {"batch": SimpleNamespace(is_dummy_run=True, multimodal_data={})},
+        "prefill": {"is_prefill": True},
+        "not a verify": {"tentative": False},
+        "recomputed rows": {"resumes": [3]},
+        "two requests": {
+            "running_bs": 2,
+            "running_tokens": 12,
+            "spans": (span, SimpleNamespace(request_id=8, length=6)),
+        },
+        "padded bs": {"running_bs": 2},
+        "no q bucket": {"max_q_len": None},
+        "width != bucket": {"running_tokens": 8},
+        "other bucket": {"max_q_len": 3, "running_tokens": 3},
+        "span longer than bucket": {
+            "spans": (SimpleNamespace(request_id=7, length=7),)
+        },
+        "image rows": {
+            "batch": SimpleNamespace(
                 is_dummy_run=False, multimodal_data={7: {"embedding_spans": [(0, 4)]}}
             )
-        ),
+        },
     }
     assert [k for k, over in cases.items() if lh.lean_step(**{**base, **over})] == []
     # a shorter verify of the same request in the served bucket stays lean (the bucket is the graph that replays)
@@ -145,17 +145,17 @@ def test_lean_predicate_at_batch_widths_and_the_ragged_guard(lh):
         bmax=4,
     )
     batch = SimpleNamespace(is_dummy_run=False, multimodal_data={})
-    base = dict(
-        hook=hook,
-        batch=batch,
-        spans=tuple(sp[:2]),
-        running_bs=2,
-        running_tokens=12,
-        max_q_len=6,
-        tentative=True,
-        is_prefill=False,
-        resumes=None,
-    )
+    base = {
+        "hook": hook,
+        "batch": batch,
+        "spans": tuple(sp[:2]),
+        "running_bs": 2,
+        "running_tokens": 12,
+        "max_q_len": 6,
+        "tentative": True,
+        "is_prefill": False,
+        "resumes": None,
+    }
     assert lh.lean_step(**base)
     assert lh.lean_step(
         **{**base, "spans": tuple(sp), "running_bs": 4, "running_tokens": 24}
@@ -164,19 +164,21 @@ def test_lean_predicate_at_batch_widths_and_the_ragged_guard(lh):
         **{**base, "spans": sp[:1], "running_bs": 1, "running_tokens": 6}
     )
     cases = {
-        "three requests (width not served)": dict(
-            spans=tuple(sp[:3]), running_bs=3, running_tokens=18
-        ),
-        "ragged": dict(spans=(sp[0], SimpleNamespace(request_id=1, length=3))),
-        "padded batch": dict(spans=tuple(sp[:1])),
-        "other bucket": dict(max_q_len=3, running_tokens=6),
-        "batch width never served": dict(
-            hook=SimpleNamespace(**{**vars(hook), "served_widths": {6}})
-        ),
-        "prefill": dict(is_prefill=True),
-        "image rows": dict(
-            batch=SimpleNamespace(is_dummy_run=False, multimodal_data={1: {"x": 1}})
-        ),
+        "three requests (width not served)": {
+            "spans": tuple(sp[:3]),
+            "running_bs": 3,
+            "running_tokens": 18,
+        },
+        "ragged": {"spans": (sp[0], SimpleNamespace(request_id=1, length=3))},
+        "padded batch": {"spans": tuple(sp[:1])},
+        "other bucket": {"max_q_len": 3, "running_tokens": 6},
+        "batch width never served": {
+            "hook": SimpleNamespace(**{**vars(hook), "served_widths": {6}})
+        },
+        "prefill": {"is_prefill": True},
+        "image rows": {
+            "batch": SimpleNamespace(is_dummy_run=False, multimodal_data={1: {"x": 1}})
+        },
     }
     assert [k for k, over in cases.items() if lh.lean_step(**{**base, **over})] == []
     wrong = []
@@ -222,8 +224,8 @@ def test_service_is_the_steps_one_routing_decision():
     assert lean_host.install(hook) and hook.lean_host
     rnd = HiRound(hook)
     batch = SimpleNamespace(is_dummy_run=False, multimodal_data={})
-    base = dict(batch=batch, spans=(span,), running_bs=1, running_tokens=6, max_q_len=6, decode=True,
-                tentative=True, is_prefill=False, resumes=None, image_rows=False)  # fmt: skip
+    base = {"batch": batch, "spans": (span,), "running_bs": 1, "running_tokens": 6, "max_q_len": 6, "decode": True,
+                "tentative": True, "is_prefill": False, "resumes": None, "image_rows": False}  # fmt: skip
 
     def service(**over):
         a = {**base, **over}
@@ -239,21 +241,21 @@ def test_service_is_the_steps_one_routing_decision():
     cases = {
         # the DSpark draft's context write: a prefill of the served shape (6 new tokens) is ATOM's
         "6-token prefill": (
-            dict(is_prefill=True, tentative=False, decode=False),
+            {"is_prefill": True, "tentative": False, "decode": False},
             S.NONE,
         ),
         # Engram staging and the forward: an image row keeps both on ATOM's path
-        "image rows": (dict(image_rows=True), S.NONE),
-        "not a decode": (dict(decode=False), S.NONE),
-        "other bucket": (dict(max_q_len=3), S.NONE),
-        "other width": (dict(running_tokens=8, max_q_len=8), S.NONE),
+        "image rows": ({"image_rows": True}, S.NONE),
+        "not a decode": ({"decode": False}, S.NONE),
+        "other bucket": ({"max_q_len": 3}, S.NONE),
+        "other width": ({"running_tokens": 8, "max_q_len": 8}, S.NONE),
         # a capture's dummy step, and a width no served forward recorded yet: served, laid out in full
         "dummy (capture)": (
-            dict(batch=SimpleNamespace(is_dummy_run=True, multimodal_data={})),
+            {"batch": SimpleNamespace(is_dummy_run=True, multimodal_data={})},
             S.FORWARD,
         ),
         "width not recorded": (
-            dict(running_tokens=12, running_bs=2, spans=(span, span)),
+            {"running_tokens": 12, "running_bs": 2, "spans": (span, span)},
             S.FORWARD,
         ),
     }
@@ -360,19 +362,19 @@ def test_advance_kernel(dr, dt):
 
 
 def _batch(req=7, **over):
-    b = dict(
-        is_dummy_run=False,
-        total_seqs_num_prefill=0,
-        total_seqs_num=1,
-        total_tokens_num=6,
-        num_spec_step=5,
-        req_ids=[req],
-        multimodal_data={},
-        replaying={},
-        context_lens=[112],
-        num_rejected=[0],
-        out=True,
-    )
+    b = {
+        "is_dummy_run": False,
+        "total_seqs_num_prefill": 0,
+        "total_seqs_num": 1,
+        "total_tokens_num": 6,
+        "num_spec_step": 5,
+        "req_ids": [req],
+        "multimodal_data": {},
+        "replaying": {},
+        "context_lens": [112],
+        "num_rejected": [0],
+        "out": True,
+    }
     b.update(over)
     b = SimpleNamespace(**b)
     b.produces_output = lambda: b.out
@@ -500,10 +502,10 @@ def _round_world(dr, monkeypatch):
         span = SimpleNamespace(request_id=b.req_ids[0], length=6)
         service = (
             rnd.service(b, (span,), running_bs, running_tokens, max_q_len=6, decode=True, tentative=True,
-                        is_prefill=False, resumes=None, image_rows=False)  # fmt: skip
+                        is_prefill=False, resumes=None, image_rows=False)
             if served_now[0]
             else RoundService.NONE
-        )
+        )  # fmt: skip
         step = SimpleNamespace(
             positions=torch.zeros(6, dtype=torch.int64),
             tentative=True,

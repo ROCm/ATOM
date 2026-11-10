@@ -48,11 +48,11 @@ from atom.mono.device.ops import (  # noqa: F401 - re-exported: the blocks impor
     uniform,
 )
 
+from ...plan import trace
+from ...target import MI355X
 from . import buffer_ops as bo
 from . import dual
 from .dpp_utils import update_dpp_i32
-from ...plan import trace
-from ...target import MI355X
 
 THREADS = MI355X.threads
 WAVES = MI355X.waves

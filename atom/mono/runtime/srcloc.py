@@ -25,7 +25,7 @@ import inspect
 import logging
 import os
 from contextlib import contextmanager
-from functools import lru_cache
+from functools import cache
 
 from flydsl._mlir import ir
 from flydsl.compiler import ast_rewriter, kernel_function
@@ -50,7 +50,7 @@ _SOURCE: dict = (
 )  # co_filename -> the location's filename (``inspect.getsourcefile`` + ``meta.file_location``)
 
 
-@lru_cache(maxsize=None)
+@cache
 def _fingerprint() -> str:
     h = hashlib.sha256()
     for fn in (_ORIGINAL, meta.file_location):
@@ -123,7 +123,7 @@ def capture_user_location() -> ir.Location:
     return ir.Location.callsite(callee, callers)
 
 
-@lru_cache(maxsize=None)
+@cache
 def _warn_miss() -> None:
     """Once a process: FlyDSL's location capture is not the one this module reproduces."""
     logger.warning(

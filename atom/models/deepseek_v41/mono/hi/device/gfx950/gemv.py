@@ -44,7 +44,7 @@ import torch
 from flydsl.expr import rocdl
 from flydsl.expr.typing import T
 
-from atom.mono.device.mx import clamp_fp8, rcp_pow2  # noqa: F401 - re-exported
+from atom.mono.device.mx import clamp_fp8, rcp_pow2
 
 from . import buffer_ops as bo
 from .ops import CM_NT, fp8_pack4, xred

@@ -52,8 +52,8 @@ import hashlib
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 
-from .trace import Space
 from ..target import MI355X, Target
+from .trace import Space
 
 PAIR_BYTES = 8  # a (value, tag) pair
 HOST = (

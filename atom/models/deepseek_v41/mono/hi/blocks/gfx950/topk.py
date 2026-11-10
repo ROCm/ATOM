@@ -42,12 +42,12 @@ from functools import partial
 import flydsl.expr as fx
 from flydsl.expr import const_expr
 
-from ..base import Block, Channel, Fmt
 from ...device.gfx950 import mailbox as mb
 from ...device.gfx950 import peer, topk
 from ...device.gfx950.ops import ld_i32, traced, uniform
 from ...device.gfx950.topk import THREADS, key_bits, order_key
 from ...plan.program import Region, Scenario, Space, Stage
+from ..base import Block, Channel, Fmt
 
 SEG = 8192  # values a CTA ranks by default (ATOM K2a's choice)
 MAX_PER_THREAD = 64  # keys a thread holds in registers (32768 a CTA)

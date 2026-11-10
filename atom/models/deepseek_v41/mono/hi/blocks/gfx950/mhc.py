@@ -75,8 +75,6 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
-from ..base import Block, Channel, Fmt
-from .norm import dot2_bf16
 from ...device.gfx950 import buffer_ops as bo
 from ...device.gfx950 import channels as chan
 from ...device.gfx950 import mailbox as mb
@@ -94,6 +92,8 @@ from ...device.gfx950.ops import (
 from ...plan.program import Region, Scenario, Stage
 from ...plan.trace import Space, note
 from ...target import MI355X
+from ..base import Block, Channel, Fmt
+from .norm import dot2_bf16
 
 THREADS, WAVES = MI355X.threads, MI355X.waves
 HC = 4

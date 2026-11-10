@@ -56,12 +56,22 @@ def official_cis(seqlen, **kw):
     return torch.polar(torch.ones_like(freqs), freqs)
 
 
-WINDOW = dict(
-    dim=64, original_seq_len=0, base=10000.0, factor=1, beta_fast=32, beta_slow=1
-)
-YARN = dict(
-    dim=64, original_seq_len=65536, base=160000, factor=16, beta_fast=32, beta_slow=1
-)
+WINDOW = {
+    "dim": 64,
+    "original_seq_len": 0,
+    "base": 10000.0,
+    "factor": 1,
+    "beta_fast": 32,
+    "beta_slow": 1,
+}
+YARN = {
+    "dim": 64,
+    "original_seq_len": 65536,
+    "base": 160000,
+    "factor": 16,
+    "beta_fast": 32,
+    "beta_slow": 1,
+}
 
 
 @pytest.fixture(scope="module")

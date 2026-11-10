@@ -112,10 +112,6 @@ import torch
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
-from ..base import Block, Channel, Fmt
-from . import norm as nq
-from .hc import HCWrite
-from .warm import idle_issue, idle_sink
 from ...device.gfx950 import buffer_ops as bo
 from ...device.gfx950 import channels as chan
 from ...device.gfx950 import gemv, gemv16, peer
@@ -130,6 +126,10 @@ from ...geometry import NormGeometry
 from ...plan.program import PlanError, Region, Scenario, Stage
 from ...plan.trace import Space, note
 from ...target import MI355X
+from ..base import Block, Channel, Fmt
+from . import norm as nq
+from .hc import HCWrite
+from .warm import idle_issue, idle_sink
 
 WAVES = MI355X.waves
 WAVE_LANES = MI355X.wave
@@ -1688,7 +1688,7 @@ def _tp_reduce(k, p, ok, e, vals):
     ``ok`` False: zeros. "consumer": the push only (the consumer sums: ``peer.sum_partials``).
     """
     t0, t1, t2, t3 = fx.Float32(0.0), fx.Float32(0.0), fx.Float32(0.0), fx.Float32(0.0)
-    if ok:
+    if ok:  # noqa: SIM102 (traced)
         if const_expr(
             p.tp_sum == "rs"
         ):  # two-shot: to the columns' owner only (a task's columns: one owner)

@@ -53,17 +53,17 @@ def _runner(runner_module, model):
 
 def _batch(temps=(0.0,), **over):
     n = len(temps)
-    b = dict(
-        total_seqs_num=n,
-        temperatures=np.asarray(temps, dtype=np.float32),
-        top_ks=np.full(n, -1, dtype=np.int32),
-        top_ps=np.ones(n, dtype=np.float32),
-        num_scheduled_tokens=np.full(n, 6, dtype=np.int32),
-        any_logprobs=False,
-        structured_requests={},
-        required_channel=None,
-        needs_independent_noise=np.zeros(n, dtype=bool),
-    )
+    b = {
+        "total_seqs_num": n,
+        "temperatures": np.asarray(temps, dtype=np.float32),
+        "top_ks": np.full(n, -1, dtype=np.int32),
+        "top_ps": np.ones(n, dtype=np.float32),
+        "num_scheduled_tokens": np.full(n, 6, dtype=np.int32),
+        "any_logprobs": False,
+        "structured_requests": {},
+        "required_channel": None,
+        "needs_independent_noise": np.zeros(n, dtype=bool),
+    }
     b.update(over)
     return SimpleNamespace(**b)
 
@@ -156,9 +156,9 @@ def test_greedy_verify_takes_the_head_ids(runner_module, spec_step):
     runner = _runner(runner_module, _Model())
     assert runner._head_ids_serve(_head(), _batch())
     for over in (
-        dict(any_logprobs=True),
-        dict(structured_requests={0: object()}),
-        dict(required_channel=object()),
+        {"any_logprobs": True},
+        {"structured_requests": {0: object()}},
+        {"required_channel": object()},
     ):
         assert not runner._head_ids_serve(_head(), _batch(**over))
     assert not runner._head_ids_serve(_head(), None)
@@ -209,9 +209,9 @@ def test_sampled_verify(runner_module, spec_step):
 @pytest.mark.parametrize(
     "over",
     [
-        dict(top_ks=np.full(1, 20, dtype=np.int32)),
-        dict(needs_independent_noise=np.ones(1, dtype=bool)),
-        dict(temperatures=np.asarray([1e-12], dtype=np.float32)),
+        {"top_ks": np.full(1, 20, dtype=np.int32)},
+        {"needs_independent_noise": np.ones(1, dtype=bool)},
+        {"temperatures": np.asarray([1e-12], dtype=np.float32)},
     ],
 )
 def test_a_sampled_step_the_head_does_not_draw(runner_module, spec_step, over):

@@ -146,55 +146,55 @@ def test_any_block_size_flag_takes_atoms_v41_page(mi355x, block):
 
 
 UNSUPPORTED = {
-    "TP1": (dict(tensor_parallel_size=1), {}, "TP1"),
-    "TP2": (dict(tensor_parallel_size=2), {}, "TP2"),
-    "TP8": (dict(tensor_parallel_size=8), {}, "TP8"),
-    "DP attention": ({}, dict(dp_ranks=2), "DP attention"),
-    "fp8 KV": (dict(kv_cache_dtype="fp8"), {}, "kv_cache_dtype fp8"),
-    "fp8 index cache": (dict(index_cache_dtype="fp8"), {}, "index-cache-dtype fp8"),
+    "TP1": ({"tensor_parallel_size": 1}, {}, "TP1"),
+    "TP2": ({"tensor_parallel_size": 2}, {}, "TP2"),
+    "TP8": ({"tensor_parallel_size": 8}, {}, "TP8"),
+    "DP attention": ({}, {"dp_ranks": 2}, "DP attention"),
+    "fp8 KV": ({"kv_cache_dtype": "fp8"}, {}, "kv_cache_dtype fp8"),
+    "fp8 index cache": ({"index_cache_dtype": "fp8"}, {}, "index-cache-dtype fp8"),
     "gfx1250's FP4 index layout": (
-        dict(index_cache_layout="natural"),
+        {"index_cache_layout": "natural"},
         {},
         "FP4 index cache layout natural",
     ),
     "another KV page": (
-        dict(kv_cache_block_size=256),
+        {"kv_cache_block_size": 256},
         {},
         "KV cache pages of 256 tokens",
     ),
-    "no MTP": (dict(speculative_config=None), dict(drafter=None), "no DSpark draft"),
+    "no MTP": ({"speculative_config": None}, {"drafter": None}, "no DSpark draft"),
     "another drafter": (
-        dict(
-            speculative_config=SimpleNamespace(
+        {
+            "speculative_config": SimpleNamespace(
                 method="eagle3", num_speculative_tokens=3
             )
-        ),
+        },
         {},
         "no DSpark draft",
     ),
     "DSpark without the block draft": (
         {},
-        dict(drafter=SimpleNamespace(model=object())),
+        {"drafter": SimpleNamespace(model=object())},
         "block draft",
     ),
     "3 drafts": (
-        dict(
-            speculative_config=SimpleNamespace(
+        {
+            "speculative_config": SimpleNamespace(
                 method="dspark", num_speculative_tokens=3
             )
-        ),
+        },
         {},
         "3 speculative tokens",
     ),
-    "other geometry": (dict(hf=dict(hidden_size=7168)), {}, "geometry"),
-    "context past the bucket": (dict(max_model_len=2 * 1048576), {}, "context bucket"),
-    "P/D": (dict(kv_transfer_config={"kv_role": "kv_consumer"}), {}, "KV transfer"),
-    "no metadata builder": ({}, dict(builder=None), "metadata builder"),
-    "no Engram": ({}, dict(builder=_builder(engram=False)), "Engram runtime"),
-    "Engram without UVA": ({}, dict(builder=_builder(uva=False)), "UVA"),
+    "other geometry": ({"hf": {"hidden_size": 7168}}, {}, "geometry"),
+    "context past the bucket": ({"max_model_len": 2 * 1048576}, {}, "context bucket"),
+    "P/D": ({"kv_transfer_config": {"kv_role": "kv_consumer"}}, {}, "KV transfer"),
+    "no metadata builder": ({}, {"builder": None}, "metadata builder"),
+    "no Engram": ({}, {"builder": _builder(engram=False)}, "Engram runtime"),
+    "Engram without UVA": ({}, {"builder": _builder(uva=False)}, "UVA"),
     "Engram without overlap staging": (
         {},
-        dict(builder=_builder(overlap=False)),
+        {"builder": _builder(overlap=False)},
         "overlap",
     ),
 }
@@ -203,7 +203,7 @@ UNSUPPORTED = {
 @pytest.mark.parametrize("case", sorted(UNSUPPORTED))
 def test_auto_leaves_any_other_deployment_on_atoms_path(mi355x, served, caplog, case):
     over, args, why = UNSUPPORTED[case]
-    call = {**dict(drafter=_drafter(), builder=_builder(), dp_ranks=0), **args}
+    call = {"drafter": _drafter(), "builder": _builder(), "dp_ranks": 0, **args}
     with caplog.at_level(logging.INFO, logger="atom"):
         assert not hi_gate.decide(
             _config(served, **over), call["drafter"], call["builder"], call["dp_ranks"]
@@ -271,13 +271,13 @@ def test_an_unknown_mode_is_an_error(mi355x, served, monkeypatch):
 @pytest.mark.parametrize(
     "over, why",
     [
-        (dict(enable_tbo=True), "two-batch overlap"),
-        (dict(enable_tbo_decode=True), "two-batch overlap"),
-        (dict(hf=dict(vocab_size=102400)), "geometry"),
-        (dict(hf=dict(rms_norm_eps=1e-6)), "geometry"),
-        (dict(hf=dict(sliding_window=256)), "geometry"),
-        (dict(hf=dict(dspark_target_layer_ids=[36, 37, 38, 39])), "geometry"),
-        (dict(hf=dict(engram_max_ngram_size=3)), "geometry"),
+        ({"enable_tbo": True}, "two-batch overlap"),
+        ({"enable_tbo_decode": True}, "two-batch overlap"),
+        ({"hf": {"vocab_size": 102400}}, "geometry"),
+        ({"hf": {"rms_norm_eps": 1e-6}}, "geometry"),
+        ({"hf": {"sliding_window": 256}}, "geometry"),
+        ({"hf": {"dspark_target_layer_ids": [36, 37, 38, 39]}}, "geometry"),
+        ({"hf": {"engram_max_ngram_size": 3}}, "geometry"),
     ],
 )
 def test_the_loaded_models_assumptions_are_the_gates(mi355x, served, over, why):
@@ -460,8 +460,10 @@ def _install_world(hi_dispatch, monkeypatch, *, local=None, others=(None, None, 
         (
             "padding",
             (None, None, None),
-            "refused at install: rank 1: MonoUnsupported: V4.1 mono hi weights: a routed expert's padding scale code "
-            "is 255 (E8M0 NaN)",
+            (
+                "refused at install: rank 1: MonoUnsupported: V4.1 mono hi weights: a routed expert's padding scale "
+                "code is 255 (E8M0 NaN)"
+            ),
         ),
         # another rank's; this one passed
         (

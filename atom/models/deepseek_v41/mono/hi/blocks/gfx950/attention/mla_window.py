@@ -38,14 +38,11 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
-from ...base import Block, Channel, Fmt
 from ....device.gfx950 import buffer_ops as bo
 from ....device.gfx950 import channels as chan
 from ....device.gfx950 import gemv
 from ....device.gfx950 import mailbox as mb
 from ....device.gfx950.ops import (
-    rope_cs,
-    rope_sin,
     bf2_f32,
     bf16_pair,
     bf16_round,
@@ -53,12 +50,15 @@ from ....device.gfx950.ops import (
     div_rn,
     ld_i32,
     mfma_bf16,
+    rope_cs,
+    rope_sin,
     rsrc,
     traced,
     uniform,
 )
 from ....plan.program import Region, Scenario, Stage
 from ....target import MI355X
+from ...base import Block, Channel, Fmt
 
 THREADS, WAVES = MI355X.threads, MI355X.waves
 HEADS, HD, ROPE, WINDOW = 64, 512, 64, 128
@@ -738,7 +738,7 @@ def _ring_write(k, r, p: _RPlan):
     )  # (a ragged last tile counts: ``_APlan.tiles``)
     if k.tid < p.spec * tiles:
         mb.poll([(k.mb[p.done], b * p.spec * tiles + k.tid, 1)], k.tag)
-    if const_expr(p.mper > 0):
+    if const_expr(p.mper > 0):  # noqa: SIM102 (traced)
         if k.tid < p.spec * p.mper:
             mb.poll([(k.mb[p.mdone], b * p.spec * p.mper + k.tid, 1)], k.tag)
     gpu.barrier()

@@ -223,7 +223,7 @@ def _stage_ctx(program: Program, base: SimpleNamespace, stage) -> SimpleNamespac
     )
     rows_of = _region_rows(program) if program.dyn_rows else {}
     pairs_of = {r.name: r.pairs for r in program.regions} if rows_of else {}
-    row_kw = lambda name: (  # noqa: E731  (``Program.dyn_rows``: the row-major regions, gfx950's mailbox)
+    row_kw = lambda name: (
         {"row_pairs": pairs_of[name] // rows_of[name], "nbytes": pairs_of[name] * 8}
         if name in rows_of
         else {}
@@ -610,7 +610,7 @@ def build(program: Program):
         table: Int64,
         scratch: Int64,
         priv: Int64,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008 - FlyDSL's launch default
     ):
         _ = keyed
         mono(step, layer, table, scratch, priv).launch(

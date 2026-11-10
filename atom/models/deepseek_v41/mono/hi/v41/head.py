@@ -32,7 +32,6 @@ fallback head on the same step; ATOM's ``collapse`` of a settled state is one la
 
 from __future__ import annotations
 
-
 import torch
 
 from ..blocks.base import Block, Channel, Fmt
@@ -209,9 +208,9 @@ def head_program(name: str, sc, chain: bool = False, dyn: bool = False, **knobs)
     """The head's ``Program`` (``head_blocks``); ``chain``: after a ``push_moe`` layer launch, sharing its peer
     group (the chain's regions declared and pinned first). ``dyn``: a ``Program.dyn_rows`` build (a batch band's head,
     launched with the step's live rows)."""
+    from ..plan.program import Program
     from .layer import chain_peer_first, residual_layout
     from .schedules import KEY_TP
-    from ..plan.program import Program
 
     stages = place(
         [

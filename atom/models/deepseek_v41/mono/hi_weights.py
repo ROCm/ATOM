@@ -203,7 +203,7 @@ def _unshuffled_codes(
     """The codes in row-major order: gate / up [E, 2, pad, groups] (aiter's ``shuffle_scale``: ``[E, n1, k1, kl,
     nl, kp, g]`` of the rows ``[E, g, n1, nl]`` and the groups ``[k1, kp, kl]``) and down [E, H, padded groups]
     (``[E, n1, k1, kl, nl, kp, np]`` of the rows ``[E, n1, np, nl]``)."""
-    e, n2, kb, hidden, pad, live, groups, s13, s2, g2 = _expert_layout(
+    e, _n2, _kb, hidden, pad, _live, groups, s13, s2, g2 = _expert_layout(
         experts, inter, tp
     )
     c13 = (

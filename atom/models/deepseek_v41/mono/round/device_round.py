@@ -55,8 +55,8 @@ import torch
 import triton
 import triton.language as tl
 
-from atom.utils.forward_context import RoundService
 from atom.models.deepseek_v41.mono.hi_gate import log_once
+from atom.utils.forward_context import RoundService
 
 logger = logging.getLogger("atom")
 

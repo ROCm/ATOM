@@ -56,6 +56,30 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
+from ....device.gfx950 import buffer_ops as bo
+from ....device.gfx950 import channels as chan
+from ....device.gfx950 import gemv, paged
+from ....device.gfx950 import mailbox as mb
+from ....device.gfx950.ops import (
+    CM_DEV,
+    bf16_pair,
+    bf16_round,
+    butterfly,
+    global_load,
+    lds_read_tr16,
+    mfma_bf16,
+    rope_cs,
+    rope_sin,
+    rsrc,
+    traced,
+    uniform,
+    xred,
+    xshfl,
+)
+from ....plan.program import Region, Scenario, Stage
+from ....plan.trace import note
+from ....target import MI355X
+from ...base import Block, Channel, Fmt
 from . import mla_window as mw
 from .mla_window import (
     CH,
@@ -78,31 +102,6 @@ from .mla_window import (
     _scores_all,
     _softmax_all,
 )
-from ...base import Block, Channel, Fmt
-from ....device.gfx950 import buffer_ops as bo
-from ....device.gfx950 import channels as chan
-from ....device.gfx950 import gemv
-from ....device.gfx950 import mailbox as mb
-from ....device.gfx950 import paged
-from ....device.gfx950.ops import (
-    rope_cs,
-    rope_sin,
-    CM_DEV,
-    bf16_pair,
-    bf16_round,
-    butterfly,
-    lds_read_tr16,
-    mfma_bf16,
-    global_load,
-    rsrc,
-    traced,
-    uniform,
-    xred,
-    xshfl,
-)
-from ....plan.program import Region, Scenario, Stage
-from ....plan.trace import note
-from ....target import MI355X
 
 THREADS, WAVES = MI355X.threads, MI355X.waves
 SEL = 512  # the selected compressed positions a row

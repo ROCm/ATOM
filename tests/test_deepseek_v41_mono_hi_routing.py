@@ -8,10 +8,10 @@ and the draft's context write on the hook's side while the forward takes ATOM's.
 embedding rows into the hi layers' input; its head output is the hook's in-graph verify (``compute_head``).
 """
 
-from types import SimpleNamespace
-
 import sys
 import types
+from types import SimpleNamespace
+from typing import ClassVar
 
 import pytest
 import torch
@@ -154,7 +154,7 @@ def test_a_served_forward_takes_atoms_embedding_rows(D, monkeypatch):
     emb = torch.arange(rows * hidden, dtype=torch.float32).view(rows, hidden)
 
     class Model:
-        topology = [SimpleNamespace(layer_id=i) for i in range(3)]
+        topology: ClassVar[list] = [SimpleNamespace(layer_id=i) for i in range(3)]
 
         def embed(self, ids):
             calls.append(("embed", ids.numel()))
@@ -171,7 +171,7 @@ def test_a_served_forward_takes_atoms_embedding_rows(D, monkeypatch):
     out = torch.zeros(rows, hidden)
 
     class Hook:
-        served_widths = set()
+        served_widths: ClassVar[set] = set()
 
         def begin_step(self, cache, step, n, h, staged=None, input_ids=None):
             calls.append(("begin_step", n, torch.equal(h, emb), input_ids.numel()))

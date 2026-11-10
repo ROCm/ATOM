@@ -29,9 +29,9 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import arith, llvm
 from flydsl.expr.typing import as_ir_value
 
+from ...plan import trace
 from . import dual
 from .ops import ld_i32, uniform
-from ...plan import trace
 
 PAGE = 128  # ATOM's V4.1 page in positions (``hi_gate.BLOCK_SIZE``)
 ROW_BYTES = 1024  # a main row: bf16 [512]

@@ -74,9 +74,6 @@ from flydsl.expr import gpu, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
-from ..base import Block, Channel, Fmt
-from .linear import BF16Out, Linear
-from .norm import e8m0_code
 from ...device.gfx950 import buffer_ops as bo
 from ...device.gfx950 import mailbox as mb
 from ...device.gfx950.ops import (
@@ -98,6 +95,9 @@ from ...plan.program import Region, Scenario, Stage
 from ...plan.trace import Space
 from ...target import MI355X
 from ...weights.mx import fp8_block_to_mxfp8
+from ..base import Block, Channel, Fmt
+from .linear import BF16Out, Linear
+from .norm import e8m0_code
 
 THREADS, WAVES = MI355X.threads, MI355X.waves
 HIDDEN, HC, HEAD_DIM, NGRAM, NHEADS = 5120, 4, 256, 4, 8
@@ -678,7 +678,7 @@ class Engram(Block):
     def stages(self, sc: Scenario) -> list[Stage]:
         p = self.plan(sc)
         key = ("engram",) + (p,)
-        n = lambda s: f"{self.name}.{s}"  # noqa: E731
+        n = lambda s: f"{self.name}.{s}"
         _, lin = self.channels(sc.tp, sc.rows)
         st = []
         if self.mode != "gate":

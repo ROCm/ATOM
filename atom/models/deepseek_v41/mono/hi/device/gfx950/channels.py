@@ -25,9 +25,9 @@ Bulk + flag (``Proto.FLAG``) in device terms:
 import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 
+from ...plan.trace import note
 from . import mailbox as mb
 from .ops import CM_DEV, spin_pause, traced
-from ...plan.trace import note
 
 # ---- dense words (FLAG channels)
 

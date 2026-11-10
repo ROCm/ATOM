@@ -93,23 +93,16 @@ from __future__ import annotations
 
 import logging
 import time
+
 import numpy as np
 import torch
 import triton
 import triton.language as tl
 
+from atom.model_ops.engram.host_memory import device_address
 from atom.models.deepseek_v41.mono import hi_bridge as ml
-from atom.mono.runtime.consensus import MonoUnsupported
 from atom.models.deepseek_v41.mono import hi_plan
 from atom.models.deepseek_v41.mono import hi_weights as hw
-from atom.models.deepseek_v41.mono.hi_draft import (
-    CTX_LAUNCH,
-    HiDraft,
-    _Arena,
-    _buffers,
-    _end_step,
-    _Streams,
-)  # noqa: F401
 from atom.models.deepseek_v41.mono.hi_bands import LiveWords, plan_widths  # noqa: F401
 from atom.models.deepseek_v41.mono.hi_compose import (  # noqa: F401 (re-exported)
     BANDS,
@@ -122,13 +115,21 @@ from atom.models.deepseek_v41.mono.hi_compose import (  # noqa: F401 (re-exporte
     _DraftLaunch,
     _DraftPlan,
 )
+from atom.models.deepseek_v41.mono.hi_draft import (
+    CTX_LAUNCH,
+    HiDraft,
+    _Arena,
+    _buffers,
+    _end_step,
+    _Streams,
+)
 from atom.models.deepseek_v41.mono.hi_gate import (  # noqa: F401 (REQ_ROWS re-exported)
     BLOCK_SIZE,
     MAX_CTX,
     REQ_ROWS,
+    log_once,
 )
-from atom.model_ops.engram.host_memory import device_address
-from atom.models.deepseek_v41.mono.hi_gate import log_once
+from atom.mono.runtime.consensus import MonoUnsupported
 
 logger = logging.getLogger("atom")
 
@@ -156,8 +157,8 @@ class HiLayers(HiDraft, HiPrograms):
             get_tp_group,
         )
 
-        from .hi.v41 import layer as L
         from .hi.runtime.peer import PeerGroup
+        from .hi.v41 import layer as L
 
         t0 = time.time()
         self.tp = get_tensor_model_parallel_world_size()
@@ -794,9 +795,11 @@ class HiLayers(HiDraft, HiPrograms):
         ``_fold_args``)."""
         dummy = self.pos
         if not self.eng:
-            return [dummy, 0, dummy, dummy, 0, dummy, dummy, 0, dummy], dict(
-                NE0=0, NE1=0, EHIST=0
-            )
+            return [dummy, 0, dummy, dummy, 0, dummy, dummy, 0, dummy], {
+                "NE0": 0,
+                "NE1": 0,
+                "EHIST": 0,
+            }
         flat = [
             dummy,
             0,
@@ -912,12 +915,12 @@ class HiLayers(HiDraft, HiPrograms):
         # ATOM's collapse after the planar segment, into the runner's outputs (``HiDecodeModel._hi_forward``): a
         # segment a 1024-wide block of the hidden
         segs += -(-hidden // 1024)
-        ke = dict(
-            col_res=self.r_h,
-            col_out=self.collapse_view(rows),
-            COLLAPSE=1,
-            enable_fp_fusion=False,
-        )
+        ke = {
+            "col_res": self.r_h,
+            "col_out": self.collapse_view(rows),
+            "COLLAPSE": 1,
+            "enable_fp_fusion": False,
+        }
         ml._end_step_kernel[(segs * rows,)](
             cache.pool, step.positions, step.batch_ids, step.slots, self.rings, self.ring_layers,
             *self._geo(cache), rows, *tp, last.gate_f, self.pre, self.post, self.comb, self.imp, NMF=len(self.mf),

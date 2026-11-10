@@ -56,24 +56,24 @@ from types import SimpleNamespace
 import flydsl.expr as fx
 from flydsl.expr.typing import T
 
+from ..blocks.base import Block, Channel, Fmt, Proto
 from ..blocks.gfx950 import norm
+from ..blocks.gfx950.attention.dsa_indexer import Indexer
 from ..blocks.gfx950.attention.mla_sparse import MLASparseAttn
 from ..blocks.gfx950.attention.mla_window import KVPrep, MLAWindowAttn, RingWrite
-from ..blocks.base import Block, Channel, Fmt, Proto
 from ..blocks.gfx950.compressor import Compressor
 from ..blocks.gfx950.gathered import DotNorm
-from ..blocks.gfx950.moe_experts import MoEExperts
-from ..blocks.gfx950.router import MoERouter
-from ..blocks.gfx950.attention.dsa_indexer import Indexer
 from ..blocks.gfx950.linear import BF16Out, Linear, MXFP8Out, NormIn, SwiGLU
 from ..blocks.gfx950.mhc import GATHER_TILE, MIX, HCSeam, PeerPartial
+from ..blocks.gfx950.moe_experts import MoEExperts
+from ..blocks.gfx950.router import MoERouter
 from ..device.gfx950 import buffer_ops as bo
 from ..device.gfx950 import channels as chan
 from ..device.gfx950 import mailbox as mb
 from ..device.gfx950.ops import rsrc, traced
+from ..plan.program import Scenario, Stage, numa_stages
 from . import schedules
 from .config import G
-from ..plan.program import Scenario, Stage, numa_stages
 
 HIDDEN, QR, KVD, HEADS, HD, OGROUPS, ORANK = (
     G.hidden,
@@ -168,9 +168,7 @@ def _norm_splits(k) -> dict[str, int]:
     """``NORM_SPLIT`` resolved: {norm stage: tasks a row} ("auto": ffn_norm in ``FFN_NORM_SPLIT`` tasks)."""
     if k.NORM_SPLIT == "auto":
         return {"ffn_norm": k.FFN_NORM_SPLIT}
-    return dict(
-        (e.split(":")[0], int(e.split(":")[1])) for e in k.NORM_SPLIT.split(";") if e
-    )
+    return {e.split(":")[0]: int(e.split(":")[1]) for e in k.NORM_SPLIT.split(";") if e}
 
 
 def _nq(name, src, out, gamma, width, threads, wps, bf16_out=None, splits=None, nsplit=0, gathered=False,

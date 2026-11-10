@@ -34,8 +34,8 @@ from flydsl._mlir.dialects import llvm
 from flydsl._mlir.extras import types as T
 from flydsl.expr.meta import dsl_loc_tracing
 
-from . import dual
 from ...plan import trace
+from . import dual
 
 __all__ = [
     "BufferResourceDescriptor",

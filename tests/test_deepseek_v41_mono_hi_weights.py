@@ -103,7 +103,7 @@ def hi_order_scales(
         _unshuffled_codes,
     )
 
-    e, n2, kb, hidden, pad, live, groups, s13, s2, g2 = _expert_layout(
+    e, _n2, _kb, hidden, pad, live, groups, _s13, _s2, _g2 = _expert_layout(
         experts, inter, tp
     )
     c13, c2 = _unshuffled_codes(experts, inter, tp)
@@ -212,8 +212,8 @@ def test_a_layer_packed_from_atoms_tensors_is_the_checkpoints():
     g = torch.Generator().manual_seed(11)
     H, QL, INTER, NE = L.HIDDEN, 1280, 2304, 4
     OUT = OGROUPS * ORANK
-    bf = lambda *s: torch.randn(*s, generator=g).bfloat16()  # noqa: E731
-    f32 = lambda *s: torch.randn(*s, generator=g)  # noqa: E731
+    bf = lambda *s: torch.randn(*s, generator=g).bfloat16()
+    f32 = lambda *s: torch.randn(*s, generator=g)
     w = {}
 
     def lin(name, n, k):
@@ -254,8 +254,8 @@ def test_a_layer_packed_from_atoms_tensors_is_the_checkpoints():
     theirs = L.pack(3, w, raw, device="cpu", tp=TP, rank=RANK, engram=True, experts=NE)
 
     # ATOM's tensors: this rank's slices, the fused projections, the FP8 preshuffle
-    sc = lambda n: w[f"{n}.scale"]  # noqa: E731
-    p = lambda t: torch.nn.Parameter(t.contiguous(), requires_grad=False)  # noqa: E731
+    sc = lambda n: w[f"{n}.scale"]
+    p = lambda t: torch.nn.Parameter(t.contiguous(), requires_grad=False)
     attn = SimpleNamespace(
         wqkv_a=_linear(torch.cat((w["attn.wq_a.weight"].view(torch.uint8), w["attn.wkv.weight"].view(torch.uint8)))
                        .view(torch.float8_e4m3fn), torch.cat((sc("attn.wq_a"), sc("attn.wkv"))), output_sizes=[QL, HD]),

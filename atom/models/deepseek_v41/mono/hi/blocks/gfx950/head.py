@@ -109,8 +109,6 @@ import torch
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
-from ..base import Block, Channel, Fmt
-from .linear import _land_batch, _try_batch
 from ...device.gfx950 import buffer_ops as bo
 from ...device.gfx950 import gemv
 from ...device.gfx950 import mailbox as mb
@@ -137,6 +135,8 @@ from ...device.gfx950.topk import INT_MIN, key_bits, order_key, ult
 from ...plan.program import Region, Scenario, Stage
 from ...plan.trace import Space
 from ...target import MI355X
+from ..base import Block, Channel, Fmt
+from .linear import _land_batch, _try_batch
 
 THREADS, WAVES = MI355X.threads, MI355X.waves
 RG = 16  # vocab rows a row group (the MFMA's M)
@@ -300,7 +300,8 @@ class _Plan:
     ) -> (
         int
     ):  # the sampling scans' slices of at most SCAN_SPECS specs a thread (1 to 32768 ids)
-        return -(-(-(-self.quads // THREADS)) // SCAN_SPECS)
+        tasks = -(-self.quads // THREADS)
+        return -(-tasks // SCAN_SPECS)
 
     @property
     def lg(self) -> str:
@@ -1022,7 +1023,7 @@ def _pick_out_s(k, p, r, kk, ii, t, race=None):
             bo.buffer_store(ib, rsrc(k.args[f"{p.name}.ids"]), r)
             if const_expr(p.vals):
                 bo.buffer_store(key_bits(kb), rsrc(k.args[f"{p.name}.vals"]), r)
-        if const_expr(race is not None):
+        if const_expr(race is not None):  # noqa: SIM102 (traced)
             if (
                 race != 0
             ):  # the dot's race winner; vals -inf: every id kept (the scans' value at top_p 1)
@@ -1334,7 +1335,7 @@ def _level2(k, p, r):
             above = above + cnt[j]
         win = _wave_max_i64(win)
         tau = -_wave_max_i32(-tau)
-        lo, hi = _words(win)
+        lo, _hi = _words(win)
         if lane == 0:
             bo.buffer_store(fx.Int32(0x7FFFFFFF) - lo, rsrc(k.args[f"{p.name}.ids"]), r)
             if const_expr(

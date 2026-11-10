@@ -144,7 +144,7 @@ def bound(addr, nbytes):
     hit = _of_addr(addr)
     if hit is None:
         return nbytes
-    r, (rv, spread, _) = hit
+    _r, (rv, spread, _) = hit
     import flydsl.expr as fx
 
     if not spread:

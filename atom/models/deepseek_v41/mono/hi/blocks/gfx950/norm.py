@@ -84,7 +84,6 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T, as_ir_value
 
-from ..base import Block, Channel, Fmt
 from ...device.gfx950 import buffer_ops as bo
 from ...device.gfx950 import channels as chan
 from ...device.gfx950 import mailbox as mb
@@ -102,6 +101,7 @@ from ...device.gfx950.ops import (
 )
 from ...geometry import NormGeometry
 from ...plan.program import Scenario, Stage
+from ..base import Block, Channel, Fmt
 
 GROUP = 32
 GROUP_WORDS = GROUP // 2

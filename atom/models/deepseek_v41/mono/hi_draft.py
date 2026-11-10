@@ -246,8 +246,8 @@ class HiDraft:
         model ``draft``, ``mtp[s]``, 128 experts; the head's ``norm`` = ``mtp[2].norm``, its LM head the verify head's
         packed tensor or this rank's ``model.head.weight`` packed the same way). -> bytes held.
         """
-        from .hi.v41 import head as H
         from .hi.runtime.peer import PeerGroup
+        from .hi.v41 import head as H
 
         D, W = self.D, self.dr_width
         self.dr_peers = PeerGroup(

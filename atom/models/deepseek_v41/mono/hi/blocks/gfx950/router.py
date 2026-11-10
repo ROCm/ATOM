@@ -57,8 +57,6 @@ from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
-from ..base import Block, Channel, Fmt
-from .gathered import DotNorm, GatheredDot
 from ...device.gfx950 import buffer_ops as bo
 from ...device.gfx950 import mailbox as mb
 from ...device.gfx950.ops import (
@@ -77,6 +75,8 @@ from ...device.gfx950.topk import (
 )
 from ...plan.program import Scenario, Stage
 from ...target import MI355X
+from ..base import Block, Channel, Fmt
+from .gathered import DotNorm, GatheredDot
 
 WAVES = MI355X.waves
 LN2 = 0.6931471805599453
@@ -308,7 +308,7 @@ def _route_tail(k, p, rowc, live, vals, bias, per):
     """The scores, the top-k and the puts, by the waves whose results are used: with the slice partials (a task a
     row) wave 0 only (the other waves only competed for its SIMDs); else a row a wave.
     """
-    if const_expr(p.part != ""):
+    if const_expr(p.part != ""):  # noqa: SIM102 (traced)
         if k.wave == 0:
             _route_rows(k, p, rowc, live, vals, bias, per)
 

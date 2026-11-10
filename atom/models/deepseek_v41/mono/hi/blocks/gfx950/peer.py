@@ -38,7 +38,6 @@ from functools import partial
 import flydsl.expr as fx
 from flydsl.expr import range_constexpr
 
-from ..base import Block, Channel, Fmt
 from ...device.gfx950 import buffer_ops as bo
 from ...device.gfx950 import mailbox as mb
 from ...device.gfx950.ops import bf2_f32, bf16_pair, rsrc, traced
@@ -46,6 +45,7 @@ from ...device.gfx950.peer import from_rank, to_rank
 from ...plan.program import Region, Scenario, Stage
 from ...plan.trace import Space
 from ...target import MI355X
+from ..base import Block, Channel, Fmt
 
 THREADS = MI355X.threads
 AUTO_SPREAD_WORDS = (

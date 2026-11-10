@@ -40,9 +40,6 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
-from ..base import Block, Channel, Fmt
-from . import head as ah
-from .linear import _land_batch, _try_batch
 from ...device.gfx950 import buffer_ops as bo
 from ...device.gfx950 import mailbox as mb
 from ...device.gfx950.ops import (
@@ -60,6 +57,9 @@ from ...device.gfx950.topk import INT_MIN, order_key
 from ...plan.program import Region, Scenario, Stage
 from ...plan.trace import Space
 from ...target import MI355X
+from ..base import Block, Channel, Fmt
+from . import head as ah
+from .linear import _land_batch, _try_batch
 
 THREADS, WAVES = MI355X.threads, MI355X.waves
 VT = WAVES * ah.RG  # ids a task: 128
@@ -609,7 +609,7 @@ def _w1_row(k, p: _MPlan, xp, b=0):
 @traced
 def _wave_best(k, p: _MPlan, kk, ii, b=0):
     """Lane 0: the wave's best (request ``b``'s slot of ``a_red``)."""
-    if k.lane == 0:
+    if k.lane == 0:  # noqa: SIM102 (traced)
         if const_expr(b == 0):
             fx.ptr_store(kk, k.lds + (p.a_red + k.wave * 2))
             fx.ptr_store(ii, k.lds + (p.a_red + k.wave * 2 + 1))

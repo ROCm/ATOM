@@ -85,6 +85,7 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import Int32
 
+from ...target import MI355X
 from .dpp_utils import update_dpp_i32
 from .ops import (
     ballot,
@@ -99,7 +100,6 @@ from .ops import (
     wave_max,
     xshfl,
 )
-from ...target import MI355X
 
 THREADS = MI355X.threads
 WAVES = MI355X.waves

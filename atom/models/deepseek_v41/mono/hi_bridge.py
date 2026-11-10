@@ -518,7 +518,7 @@ def _end_step_kernel(
     seg = pid // rows
     j = pid % rows
     rq = rows // NB
-    if TRACK:
+    if TRACK:  # noqa: SIM102 - Triton: a constexpr and a runtime if
         if pid < NB:
             _, s0, live0, c0 = _request(
                 pid, rq, positions, batch_ids, slots, num_slots, max_pos

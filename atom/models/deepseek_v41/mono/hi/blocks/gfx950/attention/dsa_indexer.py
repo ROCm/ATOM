@@ -73,18 +73,11 @@ from flydsl.expr import const_expr, gpu, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
-from .mla_window import _rope_pair
-from ...base import Block, Channel, Fmt
-from ..gathered import GatheredDot
-from ..linear import BF16Out, Linear
-from ..topk import SEG, TopK
 from ....device.gfx950 import buffer_ops as bo
 from ....device.gfx950 import channels as chan
 from ....device.gfx950 import mailbox as mb
 from ....device.gfx950 import paged
 from ....device.gfx950.ops import (
-    rope_cs,
-    rope_sin,
     CM_DEV,
     bf2_f32,
     bf16_round,
@@ -94,6 +87,8 @@ from ....device.gfx950.ops import (
     hw_exp2,
     ld_i32,
     popcount,
+    rope_cs,
+    rope_sin,
     rsrc,
     traced,
     uniform,
@@ -102,6 +97,11 @@ from ....device.gfx950.ops import (
 from ....plan.program import Scenario, Stage
 from ....plan.trace import note
 from ....target import MI355X
+from ...base import Block, Channel, Fmt
+from ..gathered import GatheredDot
+from ..linear import BF16Out, Linear
+from ..topk import SEG, TopK
+from .mla_window import _rope_pair
 
 HEADS, IHD, ROPE, QR, HIDDEN, TOPK_K = 32, 128, 64, 1280, 5120, 512
 OOB_WORD = (
@@ -903,7 +903,7 @@ def _score(k, t, p: _Plan):
     t0 = tile * p.tile
     first = None
     if p.sp:  # this rank's share of the request's positions (``_share``)
-        first, n, n_hi = _share(k, p, pos)
+        first, n, _n_hi = _share(k, p, pos)
         live = t0 < n
         t0 = first + t0
     elif p.clist:  # a row a task: its compact columns below min(its bound, CW)
@@ -927,7 +927,7 @@ def _cmask(k, t, p: _Plan, cand: str, out: str, lds: bool = False):
 
 @traced
 def _cmask_list_if(k, t, p, cand, out, live, lds=False):
-    if live:
+    if live:  # noqa: SIM102 (traced)
         if const_expr(lds):
             _cmask_bits(k, t, p, cand, out)
 

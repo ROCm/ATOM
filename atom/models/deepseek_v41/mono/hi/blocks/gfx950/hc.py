@@ -58,8 +58,6 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
-from ..base import Block, Channel, Fmt
-from . import norm as nq
 from ...device.gfx950 import buffer_ops as bo
 from ...device.gfx950 import channels as chan
 from ...device.gfx950 import gemv, gemv16
@@ -82,6 +80,8 @@ from ...geometry import HCGeometry
 from ...plan.program import PlanError, Region, Scenario, Stage
 from ...plan.trace import note
 from ...target import MI355X
+from ..base import Block, Channel, Fmt
+from . import norm as nq
 
 WAVES = MI355X.waves
 THREADS = MI355X.threads
@@ -1420,9 +1420,7 @@ def _up(k, t, p):
     else:
         _lowrank(k, p, t, xspecs, xraw)
     gpu.barrier()
-    for i, (r, valid, units, st, half, gwords, hspecs, hraw) in enumerate(
-        mine
-    ):  # noqa: B007
+    for i, (r, valid, units, st, half, gwords, hspecs, hraw) in enumerate(mine):
         acc = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(p.tiles)]
         for ku, a in enumerate(ops[i]):
             for tl in range(p.tiles):

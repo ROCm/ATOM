@@ -94,7 +94,7 @@ def _toolchain() -> tuple:
     rocm = os.environ.get("ROCM_PATH", "/opt/rocm")
     try:
         lld = subprocess.run([os.path.join(rocm, "llvm", "bin", "ld.lld"), "--version"], capture_output=True,
-                             text=True, timeout=30).stdout.strip().splitlines()[:1]  # fmt: skip
+                             text=True, timeout=30, check=False).stdout.strip().splitlines()[:1]  # fmt: skip
     except (OSError, subprocess.SubprocessError):
         lld = []
     try:
@@ -167,9 +167,9 @@ def compile_traced(launcher, program: Program):
             ARCH=arch,
             FLYDSL_GPU_ARCH=arch,
         ),
+        srcloc.scoped(),  # (the source locations at a fraction of FlyDSL's cost)
     ):
-        with srcloc.scoped():  # (the source locations at a fraction of FlyDSL's cost)
-            launcher(0, 0, 0, 0, 0)
+        launcher(0, 0, 0, 0, 0)
     if serve:
         return rec
     if not rec.stages:
@@ -208,7 +208,7 @@ def resources(launcher, arch: str | None = None) -> list[dict]:
     return out
 
 
-_PRIVATE_OPS = re.compile(r"^\s*(scratch_|flat_)", re.M)
+_PRIVATE_OPS = re.compile(r"^\s*(scratch_|flat_)", re.MULTILINE)
 _PRIVATE_REGS = re.compile(
     r"\b(flat_scratch(_lo|_hi)?|src_private_(base|limit)|src_flat_scratch_base_(lo|hi))\b"
 )
@@ -248,6 +248,7 @@ def scratch_ops(elf: bytes, arch: str | None) -> int | None:
                 run + ["-D", "--section=.rodata", f.name],
                 capture_output=True,
                 text=True,
+                check=False,
             ).stdout
     except (OSError, subprocess.CalledProcessError):
         return None

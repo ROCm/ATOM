@@ -29,6 +29,8 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
+from ...plan import trace
+from ...plan.trace import Space, note
 from . import buffer_ops as bo
 from .ops import (
     CM_DEV,
@@ -38,8 +40,6 @@ from .ops import (
     spin_pause,
     traced,
 )
-from ...plan import trace
-from ...plan.trace import Space, note
 
 POLL_MAX = 12  # pair specs per poll batch: bounds live registers
 _SCOPE_CM = {Space.SCRATCH: CM_DEV, Space.PEER: CM_SYS}
@@ -295,9 +295,9 @@ def poll(specs, tag, batch=POLL_MAX, live=None):
         return fx.Vector.from_elements(words, fx.Int32)
 
     nw = sum(2 * n for _, _, n in specs)
-    if live is not None:  # each tag word's spec (dead specs' tags are not checked)
-        if all(live[j] is True for j in range(len(specs))):
-            live = None  # all of them: the code of before
+    # each tag word's spec (dead specs' tags are not checked); all of them: the code of before
+    if live is not None and all(live[j] is True for j in range(len(specs))):
+        live = None
     if live is None:
 
         def pending(v):

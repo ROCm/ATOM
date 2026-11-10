@@ -50,7 +50,6 @@ import torch
 from flydsl.expr import gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
-from ..base import Block, Channel, Fmt
 from ...device.gfx950 import buffer_ops as bo
 from ...device.gfx950 import mailbox as mb
 from ...device.gfx950.ops import (
@@ -65,6 +64,7 @@ from ...device.gfx950.ops import (
 )
 from ...plan.program import Scenario, Stage
 from ...target import MI355X
+from ..base import Block, Channel, Fmt
 
 COLS = 16  # columns per task: two per wave
 WAVES, THREADS = MI355X.waves, MI355X.threads

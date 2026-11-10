@@ -8,13 +8,13 @@ from types import SimpleNamespace
 
 import torch
 
-from ..blocks.gfx950.compressor import Compressor
-from ..blocks.gfx950.moe_experts import pack_experts, pack_shared
 from ..blocks.gfx950.attention.dsa_indexer import Indexer
+from ..blocks.gfx950.compressor import Compressor
 from ..blocks.gfx950.linear import Linear
+from ..blocks.gfx950.moe_experts import pack_experts, pack_shared
+from ..weights.mx import fp8_block_to_mxfp8
 from . import schedules
 from .recipe import EXPERTS, HD, HEADS, OGROUPS, ORANK, Source, window_layer_blocks
-from ..weights.mx import fp8_block_to_mxfp8
 
 
 def pack(
@@ -110,8 +110,8 @@ def pack(
                 for k, v in pack_shared(sh, "moe", tp, rank, local=local).items()
             }
         )
-    f32 = lambda t: t.float().contiguous().to(device)  # noqa: E731
-    bf = lambda t: t.bfloat16().contiguous().to(device)  # noqa: E731
+    f32 = lambda t: t.float().contiguous().to(device)
+    bf = lambda t: t.bfloat16().contiguous().to(device)
     args.update({
         "hca.fn": f32(w["hc_attn_fn"]), "hca.scale": f32(w["hc_attn_scale"]), "hca.base": f32(w["hc_attn_base"]),
         "hcf.fn": f32(w["hc_ffn_fn"]), "hcf.scale": f32(w["hc_ffn_scale"]), "hcf.base": f32(w["hc_ffn_base"]),

@@ -73,8 +73,6 @@ import flydsl.expr as fx
 import torch
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 
-from ..base import Block, Channel, Fmt
-from .peer import PeerAllReduce
 from ...device.gfx950 import buffer_ops as bo
 from ...device.gfx950 import channels as chan
 from ...device.gfx950 import gemv
@@ -101,6 +99,8 @@ from ...device.gfx950.peer import (
 from ...plan.program import LdsKeep, Region, Scenario, Stage
 from ...plan.trace import Space, note
 from ...target import MI355X
+from ..base import Block, Channel, Fmt
+from .peer import PeerAllReduce
 
 WAVES, THREADS = MI355X.waves, MI355X.threads
 TILE = 16  # picks a slot: an MFMA's N
@@ -1388,7 +1388,7 @@ def _down_body(k, c: _Cfg, s, part, e, npick, sh=False, ch=None):
     )
     pitch, spitch = (inter // 2 + 4 if c.b16 else inter // 4 + 4), inter // 32 + 1
     cta = c.route_mode == "cta" and not sh
-    pick_lds, wt_lds = _pick_lds(k, c, s, cta)
+    pick_lds, _wt_lds = _pick_lds(k, c, s, cta)
     pre = "sh.down" if sh else "down"
     stage_b = (_rows_sh(k, c, pick_lds, c.sh, inter, 0, inter, pitch, spitch, ch=ch, npick=npick) if sh else
                _rows_rt(k, c, npick, pick_lds, c.mid, c.k * inter, inter, inter, pitch, spitch) if cta else
@@ -1981,7 +1981,7 @@ class MoEExperts(Block):
             own_quads=self.own_quads,
             out_arg=self.out_arg,
             rplan=(self.route_from.route_plan(sc) if self.route_from is not None
-                   and (sc.tp == 1 or self.route_from.consumer) else None),  # fmt: skip
+                   and (sc.tp == 1 or self.route_from.consumer) else None),
             ug_ring=self.ug_ring if not own else 0,
             down_ring=self.down_ring if not own else 0,
             rs_fmt=self.rs_fmt if sc.tp > 1 and self.reduce == "2shot" else "f32",
@@ -2145,11 +2145,11 @@ class MoEExperts(Block):
         return (
             stages
             + [Stage(f"{c.name}.combine", tasks, partial(_combine, c=c),
-                     writes=part.regions(sc.rows, (f"{c.name}.combine",)), key=("moe_combine", c))]  # fmt: skip
+                     writes=part.regions(sc.rows, (f"{c.name}.combine",)), key=("moe_combine", c))]
             + PeerAllReduce(f"{c.name}.reduce", part, out=red, proto=self.reduce).stages(sc)
             + [Stage(f"{c.name}.finish", tasks, partial(_finish, c=c),
-                     writes=self.out.regions(sc.rows, (f"{c.name}.finish",)), key=("moe_finish", c))]  # fmt: skip
-        )
+                     writes=self.out.regions(sc.rows, (f"{c.name}.finish",)), key=("moe_finish", c))]
+        )  # fmt: skip
 
     def pack(self, layer) -> dict[str, torch.Tensor]:
         """``layer.experts``: per expert an object with ``w1`` / ``w3`` / ``w2`` (``.packed`` MXFP4 [N, K / 2] bytes,

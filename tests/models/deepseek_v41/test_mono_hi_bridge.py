@@ -258,7 +258,7 @@ def check_hc():
     # ATOM's settle (expand_residual's torch body) of the hi runtime's outputs == the hi runtime's fold, comb[i_in][o_out]
     try:
         from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
-    except Exception as e:  # aiter-free image
+    except Exception as e:  # noqa: BLE001 - an aiter-free image
         print(
             f"  [4] settle orientation: skipped here ({type(e).__name__}); checked in ATOM's image"
         )
@@ -359,7 +359,9 @@ def check_fused(engram: bool = False):
         g = torch.Generator().manual_seed(ctx)
         writes = {"rings": torch.randn(base["rings"].shape, generator=g)}
 
-        def hi_writes(w):  # the layers' writes between the import and the export
+        def hi_writes(
+            w, writes=writes
+        ):  # the layers' writes between the import and the export
             for k, v in writes.items():
                 w[k].copy_(v)
 
@@ -403,10 +405,10 @@ def check_fused(engram: bool = False):
             s0, s1 = w["staged"][0, :, :kin], w["staged"][1, :, :kin]
             eflat = [s0, s0.stride(0), w["eng_rows0"], s1, s1.stride(0), w["eng_rows1"], w["cursor"],
                      w["cursor"].stride(0), w["hist"]]  # fmt: skip
-            ek = dict(NE0=rows, NE1=rows, KIN=kin, EHIST=1)
+            ek = {"NE0": rows, "NE1": rows, "KIN": kin, "EHIST": 1}
         else:
             d = w["pos"]
-            eflat, ek = [d, 0, d, d, 0, d, d, 0, d], dict(NE0=0, NE1=0, EHIST=0)
+            eflat, ek = [d, 0, d, d, 0, d, d, 0, d], {"NE0": 0, "NE1": 0, "EHIST": 0}
         grid = len(mf) * win + rows + ek["NE0"] + ek["NE1"] + ek["EHIST"]
         ml._begin_step_kernel[(grid,)](w["pool"], positions, batch, slot_map, w["rings"], ids, w["pos"], w["bounds"], *geo,
                                        rows, w["hidden"], w["hidden"].stride(0), w["h_in"], w["step"],
@@ -634,7 +636,7 @@ class _BatchWorld:
     """
 
     dim, win, hid, RB = 512, 128, 2048, 32
-    mf = [0, 2, 3, 20, 39]
+    mf = (0, 2, 3, 20, 39)
     ring_start0, ring_slots, slot_rows, num_slots = 37000, 134, 6000, 6
 
     def __init__(self, bm: int, rows: int, seed: int):
@@ -1039,9 +1041,8 @@ def check_bands():
         for n in ast.walk(tree)
         if isinstance(n, ast.FunctionDef) and n.name == "_band_step"
     ]
-    exec(
-        compile(ast.Module(body=code, type_ignores=[]), "hi_runner", "exec"), ns
-    )  # noqa: S102 (the hook's own source)
+    hook = compile(ast.Module(body=code, type_ignores=[]), "hi_runner", "exec")
+    exec(hook, ns)  # noqa: S102 - the hook's own source
     ok, notes = True, []
     # _band_step on a stand-in: live words staged, the dead slots' records cleared
     step = torch.tensor([9, 0, 0, 0], dtype=torch.int32)

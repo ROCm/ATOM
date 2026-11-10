@@ -15,10 +15,10 @@ Every helper is a free function of explicit values.
 import flydsl.expr as fx
 from flydsl.expr.typing import T
 
-from .mailbox import Addr, shift
-from .ops import load_ptr64, traced, uniform
 from ...plan.program import PAIR_BYTES
 from ...plan.trace import Space, note
+from .mailbox import Addr, shift
+from .ops import load_ptr64, traced, uniform
 
 
 def _slot_bytes(k, region: str, src, tag=None) -> object:
@@ -314,7 +314,7 @@ def sum_partials3(k, region: str, e, tp: int, tag=None):
         bad = None
         for q in range(3 * tp):
             # (`== False`: an fx boolean, which `not` would test as a Python object)
-            b = _tags_ok([v[4 * q + i] for i in range(4)], tag) == False  # noqa: E712
+            b = _tags_ok([v[4 * q + i] for i in range(4)], tag) == False
             bad = b if bad is None else bad | b
         return bad
 
@@ -395,9 +395,7 @@ def _sum_p(k, region, e, tp, tag):
         bad = None
         for s_ in range(tp):
             # (`== False`: an fx boolean, which `not` would test as a Python object)
-            stale = (
-                _tags_ok([v[6 * s_ + j] for j in range(4)], tag) == False  # noqa: E712
-            )
+            stale = _tags_ok([v[6 * s_ + j] for j in range(4)], tag) == False
             b = stale | (v[6 * s_ + 5] != fx.Int32(tag))
             bad = b if bad is None else bad | b
         return bad

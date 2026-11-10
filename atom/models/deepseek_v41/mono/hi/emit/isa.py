@@ -47,7 +47,7 @@ def disassemble(kern, mcpu: str | None = None) -> str:
     return out
 
 
-_ADDR = re.compile(r"^\s*[0-9a-f]+:\s*", re.M)
+_ADDR = re.compile(r"^\s*[0-9a-f]+:\s*", re.MULTILINE)
 _LABEL = re.compile(r"<[^>]+>")
 _COMMENT = re.compile(r"\s*//.*$")
 

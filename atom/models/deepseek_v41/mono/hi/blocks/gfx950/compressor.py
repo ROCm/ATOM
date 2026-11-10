@@ -60,17 +60,11 @@ from flydsl.expr import const_expr, gpu
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
-from .attention.mla_window import _rope_pair
-from ..base import Block, Channel, Fmt
-from .gathered import GatheredDot
-from .norm import dot2_bf16
 from ...device.gfx950 import buffer_ops as bo
 from ...device.gfx950 import channels as chan
 from ...device.gfx950 import mailbox as mb
 from ...device.gfx950 import paged
 from ...device.gfx950.ops import (
-    rope_cs,
-    rope_sin,
     bf2_f32,
     bf16_pair,
     bf16_round,
@@ -78,6 +72,8 @@ from ...device.gfx950.ops import (
     hw_exp2,
     hw_rsq,
     ld_i32,
+    rope_cs,
+    rope_sin,
     rsrc,
     traced,
     uniform,
@@ -86,6 +82,10 @@ from ...device.gfx950.ops import (
 )
 from ...plan.program import Region, Scenario, Stage
 from ...target import MI355X
+from ..base import Block, Channel, Fmt
+from .attention.mla_window import _rope_pair
+from .gathered import GatheredDot
+from .norm import dot2_bf16
 
 THREADS = MI355X.threads
 HD, ROPE, HIDDEN, IHD = 512, 64, 5120, 128  # IHD: the indexer's key width
@@ -286,7 +286,7 @@ def _state_at(k, p: _Plan, b, slot):
 @traced
 def _store_state(k, p: _Plan, b, slot, c, kv, sc, ok, wait):
     if ok:
-        if const_expr(p.flag):
+        if const_expr(p.flag):  # noqa: SIM102 (traced)
             if wait:  # the step's first row has read its state: the slot may change now
                 mb.poll([(k.mb[p.rd], b, 1)], k.tag)
         i = _state_at(k, p, b, slot) + c
@@ -445,7 +445,7 @@ class Compressor(Block):
         )
         self.wkv, self.wgate, self.aux = f"{name}.wkv", f"{name}.wgate", f"{name}.aux"
         self.index_out = index_out
-        mk = lambda n, w: GatheredDot(f"{name}.{n}", x, w, Channel(f"{name}.{n}", HD, Fmt.F32),  # noqa: E731
+        mk = lambda n, w: GatheredDot(f"{name}.{n}", x, w, Channel(f"{name}.{n}", HD, Fmt.F32),
                                       kslices=kslices, sum_stage=False, tiles=tiles)  # fmt: skip
         self.dots = [mk("kv", self.wkv)] + (
             [mk("score", self.wgate)] if ratio == 2 else []
@@ -487,7 +487,7 @@ class Compressor(Block):
         """``layer``: a dict of the layer's tensors as the checkpoint names them
         (``attn.compressor.{wkv,wgate,norm}.weight``), any device; returns bf16 tensors on that device.
         """
-        bf = lambda n: layer[n].to(torch.bfloat16).contiguous()  # noqa: E731
+        bf = lambda n: layer[n].to(torch.bfloat16).contiguous()
         out = {self.wkv: bf("attn.compressor.wkv.weight")}
         if self.ratio == 2:
             out[self.wgate] = bf("attn.compressor.wgate.weight")

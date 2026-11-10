@@ -517,7 +517,6 @@ class PagedAttentionCache:
             )
         if step.tentative:
             self.pending = TentativeState(self, step)
-        return None
 
     def prepare_state(self, step, *, histories=True):
         """Read restored cursors; reset recycled slots before any layer writes.

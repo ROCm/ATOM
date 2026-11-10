@@ -63,10 +63,10 @@ from ..device.gfx950 import buffer_ops as bo
 from ..device.gfx950 import mailbox as mb
 from ..device.gfx950.ops import ld_i32, rsrc, traced, uniform
 from ..device.gfx950.peer import from_rank, to_rank
-from .config import G
 from ..plan.program import Program, Region, Scenario, Stage
 from ..plan.trace import Space
 from ..target import MI355X
+from .config import G
 
 THREADS = MI355X.threads
 HIDDEN, KVD, EPS = G.hidden, G.head_dim, G.eps
@@ -312,16 +312,16 @@ class RingStore(Block):
 def channels(tp: int, cols: str = "shard"):
     """The context program's channels (``cols``: "shard" = main_proj column-sharded at TP, "rep" = replicated)."""
     local = HIDDEN // tp if tp > 1 and cols == "shard" else HIDDEN
-    return dict(
-        auxq=Channel("cx_auxq", AUX_W, Fmt.MXFP8),
-        fcol=Channel("cx_fcol", local, Fmt.BF16),
-        fco=Channel("cx_fco", HIDDEN, Fmt.BF16),
-        mnq=Channel("cx_mnq", HIDDEN, Fmt.MXFP8),
-        kv=[Channel(f"cx_kv{s}", KVD, Fmt.BF16) for s in range(STAGES)],
-        kvq=[Channel(f"cx_kvq{s}", KVD, Fmt.MXFP8) for s in range(STAGES)],
-        kvb=[Channel(f"cx_kvb{s}", KVD, Fmt.BF16) for s in range(STAGES)],
-        kvn=[Channel(f"cx_kvn{s}", KVD, Fmt.BF16) for s in range(STAGES)],
-    )
+    return {
+        "auxq": Channel("cx_auxq", AUX_W, Fmt.MXFP8),
+        "fcol": Channel("cx_fcol", local, Fmt.BF16),
+        "fco": Channel("cx_fco", HIDDEN, Fmt.BF16),
+        "mnq": Channel("cx_mnq", HIDDEN, Fmt.MXFP8),
+        "kv": [Channel(f"cx_kv{s}", KVD, Fmt.BF16) for s in range(STAGES)],
+        "kvq": [Channel(f"cx_kvq{s}", KVD, Fmt.MXFP8) for s in range(STAGES)],
+        "kvb": [Channel(f"cx_kvb{s}", KVD, Fmt.BF16) for s in range(STAGES)],
+        "kvn": [Channel(f"cx_kvn{s}", KVD, Fmt.BF16) for s in range(STAGES)],
+    }
 
 
 # the Linears' K slices (None: the plan's choice). main_proj in 3 (240 tasks; the plan's 2: 160): 20.8 vs 22.1 µs a
@@ -443,7 +443,7 @@ def pack(
     ):  # (the weight layout does not depend on the knobs)
         if isinstance(b, Linear):
             out.update(b.pack(lay))
-    bf = lambda t: t.bfloat16().contiguous().to(device)  # noqa: E731
+    bf = lambda t: t.bfloat16().contiguous().to(device)
     out["cx.main_norm.g"] = bf(raw["mtp.0.main_norm.weight"])
     for s in range(STAGES):
         out[f"cx.kv_norm{s}.g"] = bf(raw[f"mtp.{s}.attn.kv_norm.weight"])
@@ -537,7 +537,7 @@ def pack_stage(stage: int, w: dict, raw: dict, tp: int = 4, rank: int = 0, devic
 DRAFT_PREFETCH = {10: 32, 15: 24, 20: 16}
 
 
-def DRAFT_KPARTS(rows: int) -> int:  # noqa: N802 - a rule beside DRAFT_PREFETCH
+def DRAFT_KPARTS(rows: int) -> int:
     """x's K slices at least (``MarkovHead(kparts=)``; 0: the fewest that fit) at a draft of ``rows`` positions: 10
     past 20 rows (5-6 requests of 5: the fewest that fit spill 18-20 VGPRs to memory, 10 build at prefetch 8 and 16;
     7-8 requests spill 10-18 at any K slices: the B requests' side-by-side Markov steps, not x; compile only, TP4).

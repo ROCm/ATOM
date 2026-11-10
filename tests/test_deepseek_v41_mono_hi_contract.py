@@ -15,7 +15,7 @@ pytest.importorskip("aiter")
 pytest.importorskip("flydsl")
 pytest.importorskip("triton")
 
-from atom.models.deepseek_v41.mono import hi_contract  # noqa: E402
+from atom.models.deepseek_v41.mono import hi_contract
 
 CONFIG = Path(__file__).parent / "models" / "deepseek_v41" / "fixtures" / "config.json"
 

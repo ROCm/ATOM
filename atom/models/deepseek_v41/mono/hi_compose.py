@@ -14,9 +14,9 @@ import logging
 from dataclasses import dataclass
 
 from atom.models.deepseek_v41.mono import hi_plan
-from atom.mono.runtime.consensus import MonoUnsupported
 from atom.models.deepseek_v41.mono.hi_bands import plan_widths
 from atom.models.deepseek_v41.mono.hi_gate import INDEX_LAYOUTS, MAX_CTX, REQ_ROWS
+from atom.mono.runtime.consensus import MonoUnsupported
 
 logger = logging.getLogger("atom")
 
@@ -82,11 +82,11 @@ class HiPrograms:
 
     def __init__(self, cfg, topology, widths, max_ctx: int, tp: int, group=None,
                  index_layout: str = "preshuffle"):  # fmt: skip
-        from .hi.v41 import draft as D
-        from .hi.v41 import layer as L
         from .hi.plan import program as mf_program
         from .hi.plan.program import Program, Scenario
         from .hi.runtime.kernel import MonoKernel
+        from .hi.v41 import draft as D
+        from .hi.v41 import layer as L
 
         self.L, self.tp = L, tp
         # ATOM's FP4 index plane's layout (``config.index_cache_layout``), which the index sources' programs address
@@ -162,9 +162,8 @@ class HiPrograms:
                 try:
                     kern = self._head_program(s, self.chain, (b, rq))
                     self.head_mode[s] = "wide"
-                except (
-                    Exception
-                ) as e:  # PlanError / ResourceError: the hi runtime's head at B
+                # PlanError / ResourceError: the hi runtime's head at B
+                except Exception as e:  # noqa: BLE001 - a build refusal
                     logger.info("V4.1 mono hi: the verify head at %d x %d rows does not build (%s: %s): %d "
                                 "launches of the %d-row head", b, rq, type(e).__name__, str(e)[:160], b, rq)  # fmt: skip
                 if not self._agree(
@@ -321,7 +320,7 @@ class HiPrograms:
         # B requests of rq rows (one request: Scenario(1, s))
         L, sc = self.L, Scenario(nb, rq, self.tp)
         # the row-count-dependent choices (the 6-row MoE / seam exchanges)
-        ch = dict(push_moe=push, prev_moe=prev, rows=s)
+        ch = {"push_moe": push, "prev_moe": prev, "rows": s}
         # a DSpark aux tap's R_A whole under a sharded residual (``full_r_a``)
         if full_r_a:
             ch["full_r_a"] = True
@@ -377,9 +376,9 @@ class HiPrograms:
         scenario (default one request): ``chain``, its fold sums the last layer's pushed MoE partials
         (``hi_plan.chain_role``); its R into ``r_h``. One program a (rows, requests, chain), shared by the widths that run
         it."""
-        from .hi.v41 import head as H
         from .hi.plan.program import Scenario
         from .hi.runtime.kernel import MonoKernel
+        from .hi.v41 import head as H
 
         self.H = H
         nb, rq = split or (1, s)
@@ -466,9 +465,8 @@ class HiPrograms:
                 )
                 for s in range(3)
             ]
-        except (
-            Exception
-        ) as e:  # noqa: BLE001 - this the hi runtime's stages at n requests
+        # this the hi runtime's stages at n requests
+        except Exception as e:  # noqa: BLE001 - a build refusal
             logger.info("V4.1 mono hi: the draft stages at %d requests do not build (%s: %s): one request at a time",
                         n, type(e).__name__, str(e)[:160])  # fmt: skip
         if not self._agree(

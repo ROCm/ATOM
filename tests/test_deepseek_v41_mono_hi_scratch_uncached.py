@@ -39,12 +39,12 @@ def test_programs_share_one_arena(monkeypatch):
 
     class Kernel:
         def __init__(self, name, nbytes, dual_bytes):
-            self.program = type("P", (), dict(name=name, scratch_bytes=nbytes, dual_bytes=dual_bytes,
-                                              dual_on=dual_bytes > 0))()  # fmt: skip
+            self.program = type("P", (), {"name": name, "scratch_bytes": nbytes, "dual_bytes": dual_bytes,
+                                          "dual_on": dual_bytes > 0})()  # fmt: skip
 
         def buffers(self, device="cuda", scratch=None, uncached=False, word=None):
             seen.append((self.program.name, scratch.data_ptr(), uncached, word))
-            return type("B", (), dict(scratch=scratch, private=torch.zeros(4)))()
+            return type("B", (), {"scratch": scratch, "private": torch.zeros(4)})()
 
     kerns = {
         6: Kernel("a6", 1000, 512),

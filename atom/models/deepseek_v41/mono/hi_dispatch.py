@@ -193,7 +193,7 @@ def install_hi(
     refused = None
     try:
         hi_runner.check(model, atom_config, metadata_builder.engram, draft, world, rank)
-    except Exception as error:
+    except Exception as error:  # noqa: BLE001 - any error is this rank's refusal
         refused = error
     try:
         tp_uniform_local_validation(
