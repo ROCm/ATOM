@@ -32,7 +32,7 @@ export ATOM_KV_OFFLOAD_EXTRA_CONFIG='{
   "mooncake_store.save_pool_mib": 256
 }'
 export ATOM_FRONTEND_PREFIX_HASH=1
-export OFFLOAD_MIN_LOAD_TOKENS=8192
+export OFFLOAD_MIN_LOAD_TOKENS=4096
 export OFFLOAD_MAX_PENDING_SAVES=8
 # Bound coalescing for both waiting requests and running partial prefills.
 # These are scheduling bounds, not a 250 ms end-to-end TTFT guarantee.
@@ -72,7 +72,8 @@ idle target with 13312 cached tokens differ by 3072: the request still goes
 to the target, skips Store loading and recomputes the remainder. Short prompts
 continue to participate in prefix routing.
 
-The 8192-token minimum was measured with V4.1-Flash on MI355X, TP2/DPA2,
+The recipe starts with a configurable 4096-token minimum. Measurements used
+V4.1-Flash on MI355X, TP2/DPA2,
 512-token Store chunks, a 16384-token published owner prefix and a 16385-token
 request. Two warm pairs per difference gave these idle-target TTFT medians:
 
@@ -83,7 +84,12 @@ request. Two warm pairs per difference gave these idle-target TTFT medians:
 | 8192 | 386 | 407 |
 
 For this comparison only, the loading arm allowed 512-token loads; the recipe
-retains 8192. With two real decoding requests filling the owner, the normal
+uses 4096 as an initial policy cutoff: loading 3072 tokens was clearly slower,
+while the 6144- and 8192-token comparisons were closer to break-even. This is
+not a measured optimum: loading at 6144 was still about 29 ms slower in this
+idle case, and no 4096-token crossover measurement was taken. Tune the minimum
+for the deployment's load and latency goals. With two real decoding requests
+filling the owner, a separate measurement using an 8192-token minimum found an
 8192-token load took a median 756 ms versus 1526 ms for recomputation, with
 the owner still decoding when the request completed. These are request TTFTs,
 including replay and scheduling, rather than isolated copy times. They do not
