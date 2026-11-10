@@ -179,20 +179,31 @@ def test_late_draft_uploads_are_staged_by_prepare_model():
     assert not _attribute_calls(compute_draft_kv, "anchors_to_gpu")
 
 
-def test_kv_block_count_is_reconciled_over_the_whole_pcp_group():
-    """Ulysses SP runs over the PCP group with PCP=1, so the reduction over
-    that group must be gated on the group's size, not on PCP alone."""
+def test_kv_block_count_is_the_minimum_over_tp_and_pcp_groups():
+    """Every TP and PCP-group worker builds its pool at rank 0's count, so the
+    count must be the minimum over each group's CPU group, folded back into
+    the plan. Ulysses SP runs over the PCP group with PCP=1, so that group is
+    gated on the group's size, not on PCP alone."""
     method = _method("get_num_blocks")
-    gates = [
+    block = next(
         node
         for node in ast.walk(method)
         if isinstance(node, ast.If)
-        and any(
-            isinstance(stmt, ast.Expr) and "get_pcp_group" in ast.unparse(stmt)
-            for stmt in node.body
-        )
-    ]
-    assert [ast.unparse(gate.test) for gate in gates] == ["config.pcp_group_size > 1"]
+        and ast.unparse(node.body[0]) == "groups = [get_tp_group()]"
+    )
+    pcp_gate = next(
+        node
+        for node in ast.walk(block)
+        if isinstance(node, ast.If)
+        and ast.unparse(node.body[0]) == "groups.append(get_pcp_group())"
+    )
+    assert ast.unparse(pcp_gate.test) == "config.pcp_group_size > 1"
+    assigns = {ast.unparse(n) for n in ast.walk(block) if isinstance(n, ast.Assign)}
+    assert {
+        "reduced = group_min(reduced, group.cpu_group)",
+        "num_kvcache_blocks = reduced",
+        "plan = plan.with_paged_entries(num_kvcache_blocks)",
+    } <= assigns
 
 
 def test_kv_budget_refuses_free_memory_below_the_connector_reserve():

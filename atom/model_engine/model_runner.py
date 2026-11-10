@@ -2170,11 +2170,7 @@ class ModelRunner:
             reduced = num_kvcache_blocks
             for group in groups:
                 if group.world_size > 1:
-                    t = torch.tensor([reduced], dtype=torch.int64, device="cpu")
-                    torch.distributed.all_reduce(
-                        t, op=torch.distributed.ReduceOp.MIN, group=group.cpu_group
-                    )
-                    reduced = int(t.item())
+                    reduced = group_min(reduced, group.cpu_group)
             if reduced != num_kvcache_blocks:
                 num_kvcache_blocks = reduced
                 plan = plan.with_paged_entries(num_kvcache_blocks)
