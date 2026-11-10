@@ -176,7 +176,7 @@ class ScheduledBatch:
 | `total_seqs_num` | `int` | Total number of sequences in the batch |
 | `total_seqs_num_prefill` | `int` | Number of prefill sequences |
 | `total_seqs_num_decode` | `int` | Number of decode sequences |
-| `is_dummy_run` | `bool` | Whether this is a dummy/warmup run |
+| `is_dummy_run` | `bool` | A fabricated batch: the warmup forward (before the KV pool is bound) or a dynamic-chunking profile; never an idle DP rank's step, which has no request |
 | `num_spec_step` | `int` | Number of speculative decode steps (`mtp_k`) |
 | `scheduled_spec_decode_tokens` | `np.ndarray[int32]` | Draft tokens from the prior speculative step, densified to `[bs, num_spec_step]` in batch order (the constructor takes them keyed by request ID) |
 

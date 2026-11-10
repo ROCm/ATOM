@@ -8,6 +8,7 @@ from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, ClassVar, Generic, TypeVar
 
 if TYPE_CHECKING:
+    from atom.distributed.pcp_utils import PcpBalGroup
     from atom.kv_transfer.disaggregation.types import KVTransferTensors
 
 import numpy as np
@@ -28,23 +29,28 @@ from atom.model_ops.attention_mla import MLAModules
 from atom.model_ops.attentions.pool_layout.paged_state_copy import DescriptorStaging
 from atom.model_ops.attentions.pool_layout.pool_rows import PoolRowsMixin
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import SubPoolSpec
+from atom.model_ops.attentions.sparse_mla_head_groups import PERSISTENT_WORK_BUFFERS
 from atom.model_ops.attentions.token_layout.batch_ids import (
-    build_batch_ids,
     build_batch_ids_device,
+    build_cu_seqlens,
+    build_query_layout,
 )
-from atom.model_ops.attentions.token_layout.prefill import prefill_positions
+from atom.model_ops.attentions.token_layout.prefill import (
+    PrefillBatch,
+    prefill_positions,
+)
 from atom.model_ops.attentions.token_layout.slots import slot_mapping
 from atom.model_ops.dcp_ops import dcp_prefill_slot_mapping
 from atom.utils import CpuGpuBuffer
+from atom.utils.block_convert import kv_indices_generate_triton
 from atom.utils.block_tables import block_table_state
-from atom.utils.forward_context import AttentionMetaData, AttnState, ForwardMode
+from atom.utils.forward_context import AttentionMetaData, AttnState
 from atom.utils.h2d import h2d_producer
 from atom.utils.tbo.ubatch_splitting import (
+    NUM_TBO_UBATCHES,
     UBatchSlice,
-    attach_tbo_cpu_lens,
-    split_attn_metadata,
+    decode_ubatch_token_order,
 )
-from atom.utils.tbo.ubatching import tbo_enabled
 
 logger = logging.getLogger("atom")
 T = TypeVar("T")
@@ -112,12 +118,18 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         running_bs: int,
         running_tokens: int,
         max_seqlen_q: int,
+        decode_ubatch_slices: tuple[UBatchSlice, ...] | None = None,
     ):
         raise NotImplementedError
 
     @abstractmethod
     def prepare_prefill(
-        self, batch: ScheduledBatch, running_bs: int, running_tokens: int
+        self,
+        batch: ScheduledBatch,
+        running_bs: int,
+        running_tokens: int,
+        ubatch_slices: tuple[UBatchSlice, ...] | None = None,
+        pcp_groups: "tuple[PcpBalGroup, ...] | None" = None,
     ):
         raise NotImplementedError
 
@@ -129,9 +141,24 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         running_tokens: int,
         max_seqlen_q: int,
         *,
-        ubatch_split_bs: int | None = None,
+        is_prefill: bool,
+        ubatch_slices: tuple[UBatchSlice, ...] | None = None,
+        pcp_groups: "tuple[PcpBalGroup, ...] | None" = None,
     ):
         raise NotImplementedError
+
+    def h2d_group_members(self) -> dict[str, tuple[str, ...]]:
+        """The buffers each phase group publishes beside its producers' groups'
+        (`ModelRunner._init_h2d_publication` composes them): a fresh dict, a
+        builder adding to its base's."""
+        return {}
+
+    def query_lengths(
+        self, batch: ScheduledBatch, is_prefill: bool, running_tokens: int
+    ) -> np.ndarray:
+        """The query lengths a step's query layout lays out
+        (`prepare_query_metadata`): its scheduled requests'."""
+        return np.asarray(batch.num_scheduled_tokens[: batch.total_seqs_num], np.int32)
 
     def commit_speculative_state(self, metadata, last_token_indices):
         """Commit accepted target rows before draft reads and state checkpoints.
@@ -191,7 +218,15 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         raise NotImplementedError
 
     @abstractmethod
-    def build_for_cudagraph_capture(self, bs: int) -> AttentionMetaData:
+    def build_for_cudagraph_capture(
+        self,
+        bs: int,
+        *,
+        decode_ubatch_slices: tuple[UBatchSlice, ...] | None = None,
+    ) -> AttentionMetaData:
+        """``decode_ubatch_slices``: the micro-batches a bucket records as a TBO
+        graph, whose metadata the capture hangs on `AttentionMetaData.ubatches`
+        (`capture_ubatch_decode`)."""
         raise NotImplementedError
 
     def cache_write_targets(self) -> list[CpuGpuBuffer]:
@@ -215,8 +250,7 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         """
         targets = self.cache_write_targets()
         for buf in targets:
-            if getattr(buf, "_publication", None) is not None:
-                buf._publication.acquire_write()
+            buf.acquire_write()
         for buf in targets:
             buf.np[:] = PAD_SLOT_ID
             buf.copy_to_gpu()
@@ -496,8 +530,6 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
 
 
 class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic[T]):
-    capture_owns_cu_seqlens_q = False
-
     def __init__(self, model_runner):
         self.model_runner = model_runner
         assert model_runner.block_size % self.block_size == 0
@@ -547,30 +579,39 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         i64_kwargs = {"dtype": torch.int64, "device": self.device}
         i32_kwargs = {"dtype": torch.int32, "device": self.device}
 
-        prefill_i64 = dict(i64_kwargs, publication_group="prefill")
-        prefill_i32 = dict(i32_kwargs, publication_group="prefill")
+        # A request's attention metadata, written by either phase.
+        seq_i64 = dict(i64_kwargs, publication_group="seq_metadata")
+        seq_i32 = dict(i32_kwargs, publication_group="seq_metadata")
 
         attn_metadata = {
-            "slot_mapping": CpuGpuBuffer(self.max_num_batched_tokens, **prefill_i64),
-            "context_lens": CpuGpuBuffer(self.max_bs, **prefill_i32),
-            "block_tables": CpuGpuBuffer(
-                self.max_bs, self.block_table_cols, **prefill_i32
-            ),
+            "slot_mapping": CpuGpuBuffer(self.max_num_batched_tokens, **seq_i64),
+            "context_lens": CpuGpuBuffer(self.max_bs, **seq_i32),
+            "block_tables": CpuGpuBuffer(self.max_bs, self.block_table_cols, **seq_i32),
             "cu_seqlens_q": CpuGpuBuffer(
                 self.max_bs + 1, **i32_kwargs, publication_group="early"
             ),
-            "cu_seqlens_k": CpuGpuBuffer(self.max_bs + 1, **prefill_i32),
+            "cu_seqlens_k": CpuGpuBuffer(self.max_bs + 1, **seq_i32),
             # Uploaded only on a prefix-cache hit, so consumers read
             # `AttentionMetaData.num_cached_tokens is None` as "no row has any".
-            "num_cached_tokens": CpuGpuBuffer(self.max_bs, **prefill_i32),
+            "num_cached_tokens": CpuGpuBuffer(self.max_bs, **seq_i32),
             # seq_starts for cp_mha_gather_cache: always zeros (prefix at position 0)
-            "seq_starts": CpuGpuBuffer(self.max_bs, **prefill_i32),
+            "seq_starts": CpuGpuBuffer(self.max_bs, **seq_i32),
             # token -> seq over this fwd's QUERY tokens; `-1` on the CUDAGraph
-            # pad tail. Every backend needs it (see token_layout/batch_ids.py).
+            # pad tail. Every backend needs it (see token_layout/batch_ids.py);
+            # `prepare_query_metadata` builds it with the query prefix.
             "batch_id_per_q_token": CpuGpuBuffer(
-                self.max_num_batched_tokens, **i32_kwargs
+                self.max_num_batched_tokens, **i32_kwargs, publication_group="early"
             ),
         }
+        if config.enable_tbo_decode:
+            # A split decode's packed tokens in its micro-batches' order, and
+            # each micro-batch's scheduled tokens (`decode_ubatch_token_order`).
+            attn_metadata["ubatch_token_order"] = CpuGpuBuffer(
+                self.max_num_batched_tokens, **i64_kwargs, publication_group="early"
+            )
+            attn_metadata["ubatch_scheduled_tokens"] = CpuGpuBuffer(
+                NUM_TBO_UBATCHES, **i32_kwargs, publication_group="early"
+            )
 
         attn_metadata["cu_seqlens_q"].cpu.copy_(
             torch.arange(0, self.max_bs + 1, step=1, dtype=torch.int32)
@@ -580,12 +621,28 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         attn_metadata["seq_starts"].copy_to_gpu()
         self.model_runner.forward_vars.update(attn_metadata)
 
-    def _publish_token_block_tables(
-        self, attn_metadata, running_bs: int, max_seqlen_q: int
-    ) -> None:
-        """Nothing to publish: this backend has no sparse indexer.
+    def h2d_group_members(self) -> dict[str, tuple[str, ...]]:
+        # A micro-batch's buffers, tagged `ub{i}_metadata`, go up as one packed
+        # upload with whichever phase it runs.
+        groups = super().h2d_group_members()
+        var = self.model_runner.forward_vars
+        for ub_idx in range(NUM_TBO_UBATCHES):
+            name = f"ub{ub_idx}_metadata"
+            members = tuple(
+                key
+                for key, buffer in var.items()
+                if isinstance(buffer, CpuGpuBuffer) and buffer.publication_group == name
+            )
+            if members:
+                groups[name] = members
+        return groups
 
-        `EagleProposer` publishes on whatever builder the target uses, so every
+    def _build_token_block_tables(
+        self, attn_metadata, running_tokens: int, max_seqlen_q: int
+    ) -> None:
+        """Nothing to build: this backend has no sparse indexer.
+
+        `EagleProposer` builds on whatever builder the target uses, so every
         backend a draft can run against has to answer. Only the MLA one
         overrides.
         """
@@ -595,6 +652,376 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         return block_table_state(
             self.model_runner.forward_vars["block_tables"]
         ).prepare(batch.block_tables, pad_to=running_bs)
+
+    def prepare_decode(
+        self,
+        batch: ScheduledBatch,
+        running_bs: int,
+        running_tokens: int,
+        max_seqlen_q: int,
+        decode_ubatch_slices: tuple[UBatchSlice, ...] | None = None,
+    ):
+        """`stage_decode` (and a split decode's `stage_ubatch_decode`), the
+        phase's uploads, then `finish_decode` (and `finish_ubatch_decode`)."""
+        group = self.model_runner.h2d_groups["decode_metadata"]
+        attn_metadata, positions = self.stage_decode(
+            batch, running_bs, running_tokens, max_seqlen_q, group
+        )
+        ubatch_groups = (
+            self.stage_ubatch_decode(
+                attn_metadata,
+                *self.decode_spans(batch),
+                decode_ubatch_slices,
+                max_seqlen_q,
+            )
+            if decode_ubatch_slices
+            else ()
+        )
+        for staged in (group, *ubatch_groups):
+            staged.publish()
+        self.finish_decode(
+            batch, attn_metadata, running_bs, running_tokens, max_seqlen_q
+        )
+        if decode_ubatch_slices:
+            self.finish_ubatch_decode(
+                attn_metadata,
+                batch.total_seqs_num_decode,
+                decode_ubatch_slices,
+                max_seqlen_q,
+            )
+        return attn_metadata, positions
+
+    def stage_decode(
+        self,
+        batch: ScheduledBatch,
+        running_bs: int,
+        running_tokens: int,
+        max_seqlen_q: int,
+        group,
+    ):
+        """Write the step's decode metadata on the host and count it into
+        ``group``; return the metadata over GPU views the publish fills. A
+        builder adds its own sources after `super()`."""
+        raise NotImplementedError
+
+    def finish_decode(
+        self,
+        batch: ScheduledBatch,
+        attn_metadata: AttentionMetaData,
+        running_bs: int,
+        running_tokens: int,
+        max_seqlen_q: int,
+    ) -> None:
+        """The GPU work reading the step's uploaded decode metadata. A builder
+        adds its own after `super()`."""
+
+    def _ubatch_share(self, rows: int) -> int:
+        """A TBO micro-batch's most of the step's ``rows`` tokens: half, cut at
+        the token midpoint -- all of them under PCP, whose micro-batches are
+        whole request groups."""
+        if self.model_runner.config.prefill_context_parallel_size > 1:
+            return rows
+        return -(-rows // NUM_TBO_UBATCHES)
+
+    def _ubatch_tokens(self) -> int:
+        """The most tokens a TBO micro-batch runs."""
+        return self._ubatch_share(self.max_num_batched_tokens)
+
+    def _ubatch_buffer_shapes(self) -> dict[str, tuple[int, ...]]:
+        """The step's buffers each TBO micro-batch stages its own copy of
+        (`_allocate_ubatch_buffers`), by shape: a prefill micro-batch runs up
+        to every request of the step, either phase's up to `_ubatch_tokens`.
+        A builder adds its own to `super()`'s."""
+        var = self.model_runner.forward_vars
+        bs, tokens = self.max_bs, self._ubatch_tokens()
+        shapes = {
+            "cu_seqlens_q": (bs + 1,),
+            "batch_id_per_q_token": (tokens,),
+            "slot_mapping": (tokens,),
+            "context_lens": (bs,),
+            "block_tables": (bs, self.block_table_cols),
+            "cu_seqlens_k": (bs + 1,),
+            "num_cached_tokens": (bs,),
+            "seq_starts": (bs,),
+        }
+        # What `_ubatch_decode_metadata` and `finish_ubatch` read, where the
+        # builder has it.
+        if "kv_indptr" in var:
+            shapes["kv_indptr"] = (bs + 1,)
+        if "kv_indices" in var:
+            shapes["kv_indices"] = tuple(var["kv_indices"].cpu.shape)
+        for name in PERSISTENT_WORK_BUFFERS:
+            if name in var:
+                shapes[name] = tuple(var[name].shape)
+        return shapes
+
+    def _allocate_ubatch_buffers(self, max_seqlen_q: int) -> None:
+        """Each TBO micro-batch's ``ub{i}_`` copies of `_ubatch_buffer_shapes`,
+        of the step's dtypes; a published one in the micro-batch's
+        ``ub{i}_metadata`` group, which both phases' groups publish
+        (`h2d_group_members`). A builder calls it once its own step buffers
+        exist."""
+        var = self.model_runner.forward_vars
+        for ub_idx in range(NUM_TBO_UBATCHES):
+            prefix = f"ub{ub_idx}_"
+            for name, shape in self._ubatch_buffer_shapes().items():
+                src = var[name]
+                if isinstance(src, torch.Tensor):
+                    var[prefix + name] = torch.empty(
+                        shape, dtype=src.dtype, device=self.device
+                    )
+                    continue
+                var[prefix + name] = CpuGpuBuffer(
+                    *shape,
+                    dtype=src.cpu.dtype,
+                    device=self.device,
+                    publication_group=(
+                        f"{prefix}metadata" if src.publication_group else None
+                    ),
+                )
+            # A recorded decode reads it before any step stages it.
+            cu_seqlens_q = var[f"{prefix}cu_seqlens_q"]
+            cu_seqlens_q.cpu.copy_(
+                torch.arange(cu_seqlens_q.cpu.shape[0], dtype=torch.int32)
+                * max_seqlen_q
+            )
+            cu_seqlens_q.copy_to_gpu()
+
+    def _ubatch_decode_rows(self) -> tuple[str, ...]:
+        """A TBO decode micro-batch's per-request host rows, sliced off the
+        step's. A builder adds its own to `super()`'s."""
+        return ("context_lens",)
+
+    def _ubatch_decode_indptrs(self) -> tuple[str, ...]:
+        """The step's prefix sums a micro-batch rebases to its first request."""
+        return ("kv_indptr",)
+
+    def _ubatch_decode_token_rows(self) -> tuple[str, ...]:
+        """A TBO decode micro-batch's per-token host rows past `slot_mapping`,
+        its own tokens' sliced off the step's, zero past them. A builder adds
+        its own to `super()`'s."""
+        return ()
+
+    def stage_ubatch_decode(
+        self,
+        attn_metadata: AttentionMetaData,
+        scheduled_bs: int,
+        lens: np.ndarray,
+        cu: np.ndarray,
+        decode_ubatch_slices: tuple[UBatchSlice, ...],
+        max_seqlen_q: int,
+    ) -> list:
+        """Split the step's staged decode host mirrors -- ``scheduled_bs``
+        requests of query ``lens``, prefix ``cu`` -- into one ``ub{i}_`` set per
+        micro-batch of ``decode_ubatch_slices``, counted into its group, and
+        hang each micro-batch's metadata on ``attn_metadata.ubatches``; return
+        the groups. A builder writes its own per micro-batch in
+        `_stage_decode_ubatch`."""
+        names = tuple(f"ub{i}_metadata" for i in range(len(decode_ubatch_slices)))
+        self._check_metadata_writable(*names)
+        var = self.model_runner.forward_vars
+        rows = self._ubatch_decode_rows()
+        groups, ubatches = [], []
+        for ub_idx, (ub, name) in enumerate(zip(decode_ubatch_slices, names)):
+            prefix = f"ub{ub_idx}_"
+            start = ub.request_slice.start
+            ub_scheduled_bs = ub.scheduled_bs(scheduled_bs)
+            group = self.model_runner.h2d_groups[name]
+            self._slice_ubatch_rows(prefix, rows, start, ub_scheduled_bs, ub.running_bs)
+            group.set_counts({prefix + row: ub.running_bs for row in rows})
+            block_table_state(var[f"{prefix}block_tables"]).stage(ub.running_bs, group)
+            ubatches.append(
+                self._stage_decode_ubatch(
+                    ub_idx,
+                    ub,
+                    lens[start : start + ub_scheduled_bs],
+                    cu,
+                    max_seqlen_q,
+                    group,
+                )
+            )
+            groups.append(group)
+        attn_metadata.ubatches = ubatches
+        self._attach_decode_ubatch_order(attn_metadata, decode_ubatch_slices)
+        return groups
+
+    def _attach_decode_ubatch_order(
+        self,
+        attn_metadata: AttentionMetaData,
+        decode_ubatch_slices: tuple[UBatchSlice, ...],
+    ) -> None:
+        """Hand a split decode's metadata the token order its micro-batches
+        run in, and each micro-batch its own scheduled tokens, both staged
+        with the query prefix (`prepare_query_metadata`)."""
+        var = self.model_runner.forward_vars
+        attn_metadata.ubatch_token_order = var["ubatch_token_order"].gpu[
+            : decode_ubatch_slices[-1].token_slice.stop
+        ]
+        scheduled = var["ubatch_scheduled_tokens"].gpu
+        for ub_idx, ub_attn in enumerate(attn_metadata.ubatches):
+            ub_attn.scheduled_tokens_gpu = scheduled[ub_idx : ub_idx + 1]
+
+    def _stage_decode_ubatch(
+        self,
+        ubatch_idx: int,
+        ub: UBatchSlice,
+        lens: np.ndarray,
+        cu: np.ndarray,
+        max_seqlen_q: int,
+        group,
+    ) -> AttentionMetaData:
+        """Micro-batch ``ub``'s own host rows past its per-request ones -- its
+        requests' query ``lens``, the step's prefix ``cu`` -- counted into
+        ``group``; return its metadata (`_ubatch_decode_metadata`)."""
+        var = self.model_runner.forward_vars
+        prefix = f"ub{ubatch_idx}_"
+        start = ub.request_slice.start
+        ub_scheduled_bs = len(lens)
+        scheduled = ub.scheduled_token_slice
+        ub_scheduled_tokens = ub.scheduled_tokens
+        counts = {}
+        for name in self._ubatch_decode_indptrs():
+            full, indptr = var[name].np, var[prefix + name].np
+            indptr[: ub_scheduled_bs + 1] = (
+                full[start : start + ub_scheduled_bs + 1] - full[start]
+            )
+            indptr[ub_scheduled_bs + 1 : ub.running_bs + 1] = indptr[ub_scheduled_bs]
+            counts[prefix + name] = ub.running_bs + 1
+        slots = var[f"{prefix}slot_mapping"].np
+        slots[:ub_scheduled_tokens] = var["slot_mapping"].np[scheduled]
+        slots[ub_scheduled_tokens : ub.running_tokens] = -1
+        for name in self._ubatch_decode_token_rows():
+            rows = var[prefix + name].np
+            rows[:ub_scheduled_tokens] = var[name].np[scheduled]
+            rows[ub_scheduled_tokens : ub.running_tokens] = 0
+            counts[prefix + name] = ub.running_tokens
+        build_cu_seqlens(lens, ub.running_bs, out=var[f"{prefix}cu_seqlens_q"].np)
+        counts[f"{prefix}slot_mapping"] = ub.running_tokens
+        counts[f"{prefix}cu_seqlens_q"] = ub.running_bs + 1
+        group.set_counts(counts)
+        return self._ubatch_decode_metadata(ubatch_idx, ub, max_seqlen_q)
+
+    def _ubatch_decode_metadata(
+        self, ubatch_idx: int, ub: UBatchSlice, max_seqlen_q: int
+    ) -> AttentionMetaData:
+        """Micro-batch ``ub``'s decode metadata over its ``ub{i}_`` GPU views,
+        filled by its upload and `finish_ubatch`."""
+        var = self.model_runner.forward_vars
+        prefix = f"ub{ubatch_idx}_"
+        running_bs = ub.running_bs
+        attn = AttentionMetaData(
+            slot_mapping=var[f"{prefix}slot_mapping"].gpu[: ub.running_tokens],
+            context_lens=var[f"{prefix}context_lens"].gpu[:running_bs],
+            block_tables=var[f"{prefix}block_tables"].gpu[:running_bs],
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=self.model_runner.config.max_model_len,
+            cu_seqlens_q=var[f"{prefix}cu_seqlens_q"].gpu[: running_bs + 1],
+            kv_indptr=var[f"{prefix}kv_indptr"].gpu[: running_bs + 1],
+            kv_indices=var[f"{prefix}kv_indices"].gpu,
+        )
+        for name in PERSISTENT_WORK_BUFFERS:
+            if prefix + name in var:
+                setattr(attn, name, var[prefix + name])
+        return attn
+
+    def _slice_ubatch_rows(
+        self, prefix: str, names, start: int, scheduled_bs: int, running_bs: int
+    ) -> None:
+        """Copy the step's per-request host rows ``names`` and block table,
+        ``scheduled_bs`` from ``start``, into a micro-batch's ``prefix`` set,
+        zero out to its ``running_bs``."""
+        var = self.model_runner.forward_vars
+        for name in names:
+            rows = var[prefix + name].np
+            rows[:scheduled_bs] = var[name].np[start : start + scheduled_bs]
+            rows[scheduled_bs:running_bs] = 0
+        block_table_state(var["block_tables"]).slice_to(
+            var[f"{prefix}block_tables"], start, scheduled_bs, pad_to=running_bs
+        )
+
+    def finish_ubatch_decode(
+        self,
+        attn_metadata: AttentionMetaData,
+        scheduled_bs: int,
+        decode_ubatch_slices: tuple[UBatchSlice, ...],
+        max_seqlen_q: int,
+    ) -> None:
+        """Each micro-batch's GPU work over its uploaded ``ub{i}_`` metadata
+        (`finish_ubatch`), of a step of ``scheduled_bs`` requests."""
+        for ub_idx, (ub, ub_attn) in enumerate(
+            zip(decode_ubatch_slices, attn_metadata.ubatches)
+        ):
+            self.finish_ubatch(ub_idx, ub, ub_attn, max_seqlen_q)
+
+    def finish_ubatch(
+        self,
+        ubatch_idx: int,
+        ub: UBatchSlice,
+        ub_attn: AttentionMetaData,
+        max_seqlen_q: int,
+    ) -> None:
+        """One decode micro-batch's GPU work into ``ub_attn``. A builder adds
+        its own after `super()`."""
+        var = self.model_runner.forward_vars
+        prefix = f"ub{ubatch_idx}_"
+        running_bs = ub.running_bs
+        kv_indices_generate_triton(
+            var[f"{prefix}block_tables"].gpu[:running_bs],
+            var[f"{prefix}kv_indices"].gpu,
+            var[f"{prefix}kv_indptr"].gpu[: running_bs + 1],
+            self.block_ratio,
+            int(var[f"{prefix}context_lens"].np[:running_bs].max(initial=0)),
+        )
+
+    def capture_ubatch_decode(
+        self,
+        attn_metadata: AttentionMetaData,
+        scheduled_bs: int,
+        decode_ubatch_slices: tuple[UBatchSlice, ...],
+        max_seqlen_q: int,
+    ) -> None:
+        """A captured TBO bucket's (of ``scheduled_bs`` requests) micro-batch
+        metadata, staged as a replay's is (`stage_ubatch_decode`) off the
+        step's capture layout (`publish_capture_layout`), published, then
+        finished: the ``ub{i}_`` buffers the recording reads hold that layout,
+        not what the step before the capture left in them."""
+        lens = np.full(scheduled_bs, max_seqlen_q, dtype=np.int32)
+        cu = np.arange(scheduled_bs + 1, dtype=np.int32) * max_seqlen_q
+        for group in self.stage_ubatch_decode(
+            attn_metadata, scheduled_bs, lens, cu, decode_ubatch_slices, max_seqlen_q
+        ):
+            group.publish()
+        self.finish_ubatch_decode(
+            attn_metadata, scheduled_bs, decode_ubatch_slices, max_seqlen_q
+        )
+
+    def publish_capture_layout(self, bs: int, max_seqlen_q: int) -> None:
+        """Publish the decode a capture records over into the step's decode
+        rows: ``bs`` requests of ``max_seqlen_q`` tokens, each reading one key
+        in block 0's first slot and writing none. The capture's eager warmup
+        reads defined values -- not what the step before it left, which a
+        prefill's are -- and a TBO bucket's micro-batches slice them as a
+        replay's (`capture_ubatch_decode`). A builder adds its own rows to
+        `super()`'s counts (`_capture_layout_counts`)."""
+        self._check_metadata_writable("decode_metadata")
+        group = self.model_runner.h2d_groups["decode_metadata"]
+        group.set_counts(self._capture_layout_counts(bs, max_seqlen_q))
+        var = self.model_runner.forward_vars
+        block_table_state(var["block_tables"]).prepare(
+            np.zeros((bs, self.block_table_cols), dtype=np.int32)
+        )
+        block_table_state(var["block_tables"]).stage(bs, group)
+        group.publish()
+        var["kv_indices"].gpu[:bs].zero_()
+
+    def _capture_layout_counts(self, bs: int, max_seqlen_q: int) -> dict[str, int]:
+        """`publish_capture_layout`'s host rows, written; their counts."""
+        var = self.model_runner.forward_vars
+        tokens = bs * max_seqlen_q
+        var["context_lens"].np[:bs] = 1
+        var["kv_indptr"].np[: bs + 1] = np.arange(bs + 1, dtype=np.int32)
+        var["slot_mapping"].np[:tokens] = PAD_SLOT_ID
+        return {"context_lens": bs, "kv_indptr": bs + 1, "slot_mapping": tokens}
 
     def _check_metadata_writable(self, *group_names: str) -> None:
         """Preflight persistent host sources before any producer mutates them."""
@@ -613,27 +1040,22 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
             .reshape(3, num_tokens)
         )
 
-    def _copy_mrope_to_gpu(self, num_tokens: int) -> torch.Tensor:
+    def _stage_mrope(self, num_tokens: int, group) -> torch.Tensor:
+        """Count the MRoPE planes into the phase's ``group``; return their view."""
         buf = self.model_runner.forward_vars["mrope_positions"]
-        if getattr(buf, "_publication", None) is not None:
-            group = self.model_runner.h2d_groups["mrope"]
-            group.counts[0] = 3 * num_tokens
-            group.publish(group.counts)
-        else:
-            # Independent, unregistered builder callers retain flat semantics.
-            buf.gpu.reshape(-1)[: 3 * num_tokens].copy_(
-                buf.cpu.reshape(-1)[: 3 * num_tokens], non_blocking=True
-            )
+        group.set_count(buf, 3 * num_tokens)
         return self.model_runner._mrope_positions_view(num_tokens)
 
     def _build_mrope_prefill_positions(
-        self, batch: ScheduledBatch
+        self, batch: ScheduledBatch, running_tokens: int, group
     ) -> torch.Tensor | None:
         if not getattr(self.model_runner, "use_mrope", False):
             return None
 
         scheduled_tokens = batch.total_tokens_num_prefill
-        positions = self._mrope_cpu_view(scheduled_tokens)
+        # The running tokens are the axis stride, as for decode.
+        positions = self._mrope_cpu_view(running_tokens)
+        positions[:, scheduled_tokens:] = 0
         offset = 0
         for req_id, seqlen, cached_seqlen in zip(
             batch.req_ids, batch.context_lens, batch.num_cached_tokens
@@ -650,13 +1072,13 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
                 ]
             offset += num_tokens
 
-        return self._copy_mrope_to_gpu(scheduled_tokens)
+        return self._stage_mrope(running_tokens, group)
 
     def _build_mrope_decode_positions(
         self,
         batch: ScheduledBatch,
         context_lens: np.ndarray,
-        max_seqlen_q: int,
+        group,
         *,
         running_tokens: int | None = None,
     ) -> torch.Tensor | None:
@@ -669,59 +1091,87 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         width = scheduled_tokens if running_tokens is None else running_tokens
         positions = self._mrope_cpu_view(width)
         positions[:, scheduled_tokens:] = 0
+        lengths = batch.num_scheduled_tokens[: len(context_lens)]
         offset = 0
-        for req_id, context_len in zip(batch.req_ids, context_lens):
-            start = int(context_len) - max_seqlen_q
+        for req_id, context_len, length in zip(batch.req_ids, context_lens, lengths):
+            start = int(context_len) - int(length)
             stop = int(context_len)
             delta = batch.mrope_position_deltas.get(req_id)
             if delta is None:
                 base = np.arange(start, stop, dtype=np.int64)
             else:
                 base = np.arange(start + int(delta), stop + int(delta), dtype=np.int64)
-            positions[:, offset : offset + max_seqlen_q] = base[None, :]
-            offset += max_seqlen_q
+            positions[:, offset : offset + int(length)] = base[None, :]
+            offset += int(length)
 
-        return self._copy_mrope_to_gpu(width)[:, :scheduled_tokens]
-
-    def publish_cu_seqlens_q(
-        self, batch: ScheduledBatch, forward_mode: ForwardMode
-    ) -> None:
-        count = self.prepare_cu_seqlens_q(batch, forward_mode)
-        self.model_runner.forward_vars["cu_seqlens_q"].copy_to_gpu(count)
+        return self._stage_mrope(width, group)
 
     @h2d_producer("early", runner="model_runner")
-    def prepare_cu_seqlens_q(
-        self, batch: ScheduledBatch, forward_mode: ForwardMode
-    ) -> int:
-        """Publish this step's `cu_seqlens_q`. The only writer.
+    def prepare_query_metadata(
+        self,
+        lengths: np.ndarray,
+        running_bs: int,
+        running_tokens: int,
+        decode_ubatch_slices: tuple[UBatchSlice, ...] | None = None,
+    ) -> dict[str, int]:
+        """Stage the query-side metadata of ``lengths`` (each scheduled
+        request's query tokens): what depends on the query layout alone, and
+        is the same for every backend. KV-side metadata stays in each builder's
+        `prepare_prefill` / `prepare_decode`.
 
-        Lives here because this class declares the buffer and defines its
-        layout, but is CALLED from `prepare_model` before `prepare_input_ids`,
-        which addresses each request's span through it and so cannot wait for
-        `build()`. `prepare_prefill` cross-checks against this rather than
-        deriving its own. Slot 0 is 0 from allocation.
-
-        The tail out to `running_bs` gets the flat cumsum: attention runs at
-        that width whether or not a graph is replayed, and a zero-length row
-        reads nothing. Left unwritten it holds the previous step's.
+        `cu_seqlens_q`, the token -> request map (`batch_id_per_q_token`, out
+        to `running_tokens`, `-1` past the scheduled tokens), and a split
+        decode's token order (`decode_ubatch_token_order`) with each
+        micro-batch's scheduled tokens. Returns each staged buffer's count:
+        `prepare_model` publishes them with the token inputs, everything else
+        through `publish_query_metadata`.
         """
-        scheduled_bs = batch.total_seqs_num
-        assert forward_mode.running_bs >= scheduled_bs, (
-            f"running_bs={forward_mode.running_bs} < scheduled_bs={scheduled_bs}; "
-            "ForwardMode.decide invariant violated"
+        var = self.model_runner.forward_vars
+        build_query_layout(
+            lengths,
+            running_bs,
+            running_tokens,
+            cu_seqlens_q=var["cu_seqlens_q"].np,
+            batch_ids=var["batch_id_per_q_token"].np,
         )
-        cu = self.model_runner.forward_vars["cu_seqlens_q"]
-        cu.np[1 : scheduled_bs + 1] = np.cumsum(batch.num_scheduled_tokens)
-        cu.np[scheduled_bs + 1 : forward_mode.running_bs + 1] = batch.total_tokens_num
-        # Caller publishes alone or with sampling/IDs before token assembly.
-        return forward_mode.running_bs + 1
+        counts = {
+            "cu_seqlens_q": running_bs + 1,
+            "batch_id_per_q_token": running_tokens,
+        }
+        if decode_ubatch_slices:
+            counts["ubatch_token_order"] = decode_ubatch_token_order(
+                decode_ubatch_slices,
+                int(lengths.sum()),
+                var["ubatch_token_order"].np,
+            )
+            var["ubatch_scheduled_tokens"].np[: len(decode_ubatch_slices)] = [
+                ub.scheduled_tokens for ub in decode_ubatch_slices
+            ]
+            counts["ubatch_scheduled_tokens"] = len(decode_ubatch_slices)
+        return counts
+
+    def publish_query_metadata(
+        self,
+        lengths: np.ndarray,
+        running_bs: int,
+        running_tokens: int,
+        decode_ubatch_slices: tuple[UBatchSlice, ...] | None = None,
+    ) -> None:
+        """`prepare_query_metadata`, published on its own: for a step no token
+        inputs carry (a capture, the vLLM plugin)."""
+        counts = self.prepare_query_metadata(
+            lengths, running_bs, running_tokens, decode_ubatch_slices
+        )
+        group = self.model_runner.h2d_groups["early"]
+        group.set_counts(counts)
+        group.publish()
 
     def decode_spans(self, batch: ScheduledBatch) -> tuple[int, np.ndarray, np.ndarray]:
         """A pure-decode step's `(bs, per-request lengths, exclusive prefix sum)`.
 
         One place, so no caller can pair a length vector with someone else's
         cumsum: both come off `num_scheduled_tokens` and the buffer
-        `publish_cu_seqlens_q` published from it -- which is also why this is
+        `prepare_query_metadata` staged from it -- which is also why this is
         only valid after that call, not from the shrink helpers that run before.
         """
         bs = batch.total_seqs_num_decode
@@ -731,10 +1181,11 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
             self.model_runner.forward_vars["cu_seqlens_q"].np[: bs + 1],
         )
 
-    def _publish_prefill_seq_lens(
-        self, context_lens: np.ndarray, scheduled_bs: int, running_bs: int
+    def _stage_prefill_seq_lens(
+        self, context_lens: np.ndarray, running_bs: int, prefix: str = ""
     ) -> int:
-        """Write the two per-sequence length mirrors; return the batch's total KV.
+        """Write the two per-sequence length mirrors of the ``prefix`` set;
+        return the requests' total KV.
 
         Straight into the mirrors: this step is their only writer, so a
         temporary would just be copied over.
@@ -745,48 +1196,43 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         read nothing; left unwritten they hold the previous step's, and the
         drafter attends to a since-freed request's blocks.
         """
-        cu_k = self.model_runner.forward_vars["cu_seqlens_k"].np
-        cu_k[0] = 0
-        np.cumsum(context_lens, out=cu_k[1 : scheduled_bs + 1])
-        cu_k[scheduled_bs + 1 : running_bs + 1] = cu_k[scheduled_bs]
-        lens = self.model_runner.forward_vars["context_lens"].np
+        var = self.model_runner.forward_vars
+        scheduled_bs = len(context_lens)
+        cu_k = var[f"{prefix}cu_seqlens_k"].np
+        build_cu_seqlens(context_lens, running_bs, out=cu_k)
+        lens = var[f"{prefix}context_lens"].np
         lens[:scheduled_bs] = context_lens
         lens[scheduled_bs:running_bs] = 0
         return int(cu_k[scheduled_bs])
 
     def _write_prefill_slots(
         self,
-        batch: ScheduledBatch,
-        scheduled_bs: int,
+        batch: PrefillBatch,
         positions: np.ndarray,
-        seqlens_q: np.ndarray,
-        cached_lens: np.ndarray,
-        context_lens: np.ndarray,
+        prefix: str = "",
     ) -> None:
-        """Place every scheduled token's KV slot into the `slot_mapping` mirror.
+        """Place every scheduled token's KV slot into the ``prefix`` set's
+        `slot_mapping` mirror, off its packed `block_tables` mirror.
 
         `-1` means "written nowhere": either the batch carries no block tables
         at all, or under DCP this token belongs to another rank.
         """
-        block_size = self.model_runner.block_size
         var = self.model_runner.forward_vars
-        slots = var["slot_mapping"].np[: positions.shape[0]]
+        slots = var[f"{prefix}slot_mapping"].np[: positions.shape[0]]
+        scheduled_bs = batch.scheduled_bs
         if not batch.block_tables:
             slots[:] = -1
             return
-        assert len(batch.block_tables) >= scheduled_bs, (
-            f"block_tables has {len(batch.block_tables)} rows for a batch "
-            f"whose first {scheduled_bs} are being prefilled"
+        assert len(batch.block_tables) == scheduled_bs, (
+            f"block_tables has {len(batch.block_tables)} rows for a prefill "
+            f"of {scheduled_bs} requests"
         )
-        # Marshalled every step, not only on the steps that upload it: the dense
-        # path below reads this buffer rather than the batch's ragged rows, so
-        # one pack serves both readers. The upload stays gated on `has_cached`.
-        self.prepare_block_tables(batch)
+        block_size = self.model_runner.block_size
         if self.dcp_world_size > 1:
             dcp_slots = dcp_prefill_slot_mapping(
-                batch.block_tables[:scheduled_bs],
-                cached_lens.tolist(),
-                context_lens.tolist(),
+                batch.block_tables,
+                batch.cached_lens.tolist(),
+                batch.context_lens.tolist(),
                 block_size,
                 self.dcp_world_size,
                 self.dcp_rank,
@@ -794,112 +1240,251 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
             )
             assert len(dcp_slots) == slots.shape[0], (
                 f"dcp slot mapping is {len(dcp_slots)} long, not the "
-                f"{slots.shape[0]} tokens this step forwards"
+                f"{slots.shape[0]} tokens this prefill forwards"
             )
             slots[:] = dcp_slots
             return
         slot_mapping(
             positions,
-            seqlens_q,
-            var["block_tables"].np,
+            batch.seqlens_q,
+            var[f"{prefix}block_tables"].np,
             block_size,
             out=slots,
             scratch=self.token_axis_scratch,
         )
 
-    def publish_batch_ids(
-        self, seqlens: np.ndarray, pad_to: int | None = None
-    ) -> torch.Tensor:
-        """Build the token -> seq map into the shared buffer and upload it."""
-        buf = self.model_runner.forward_vars["batch_id_per_q_token"]
-        if getattr(buf, "_publication", None) is not None:
-            buf._publication.acquire_write()
-        build_batch_ids(seqlens, pad_to=pad_to, out=buf.np)
-        return buf.copy_to_gpu(pad_to or int(seqlens.sum()))
-
-    def _prefill_block_table_rows(self, scheduled_bs, running_bs, has_cached):
-        return scheduled_bs if has_cached else None
-
-    def _upload_prefill_mirrors(
-        self,
-        scheduled_bs: int,
-        running_bs: int,
-        scheduled_tokens: int,
-        has_cached: bool,
-        cached_lens: np.ndarray,
-    ) -> dict:
-        """Send this step's mirrors to the device; return them keyed for
-        `AttentionMetaData`.
-
-        Which ones go depends on `has_cached`: with no prefix hit nothing reads
-        the block tables, the zero `seq_starts`, or the cached prefix, so the
-        step does not pay for uploading them. `num_cached_tokens` staying
-        absent is also how a consumer learns there is no prefix at all.
-        """
+    def _pad_tokens(self, scheduled_tokens: int, running_tokens: int) -> None:
+        """The padding tokens `[scheduled_tokens, running_tokens)`: position 0
+        and no KV slot. The builder that writes the scheduled tokens' entries
+        calls it and publishes both buffers out to `running_tokens`."""
         var = self.model_runner.forward_vars
-        vars_used = [
-            ("cu_seqlens_k", running_bs + 1),
-            ("slot_mapping", scheduled_tokens),
-            ("context_lens", running_bs),
-        ]
-        if has_cached:
-            # `cached_lens`, not `batch.num_cached_tokens`: the same numbers,
-            # already an int32 array rather than a Python list.
-            var["num_cached_tokens"].np[:scheduled_bs] = cached_lens
-            vars_used += [
-                ("seq_starts", scheduled_bs),
-                ("num_cached_tokens", scheduled_bs),
-            ]
-        block_rows = self._prefill_block_table_rows(
-            scheduled_bs, running_bs, has_cached
-        )
-        if block_rows is not None:
-            vars_used.append(("block_tables", block_rows))
-        groups = self.model_runner.h2d_groups
-        combined = "prefill_inputs" in groups and not self.model_runner.use_mrope
-        group = groups["prefill_inputs" if combined else "prefill"]
-        counts = group.counts
-        for i in range(len(counts)):
-            counts[i] = None
-        for name, count in vars_used:
-            counts[group.indices[name]] = count
-        if combined:
-            counts[group.indices["positions"]] = scheduled_tokens
-        block_table_state(var["block_tables"]).publish(block_rows, group=group)
-        ctx = {name: var[name].gpu[:count] for name, count in vars_used}
-        # Already on the device: `publish_cu_seqlens_q` uploads it for every
-        # step, so this is a view. One writer AND one upload for this buffer.
-        ctx["cu_seqlens_q"] = var["cu_seqlens_q"].gpu[: running_bs + 1]
-        return ctx
+        var["positions"].np[scheduled_tokens:running_tokens] = 0
+        var["slot_mapping"].np[scheduled_tokens:running_tokens] = -1
 
-    @h2d_producer("prefill", "positions", runner="model_runner")
-    def prepare_prefill(
-        self, batch: ScheduledBatch, running_bs: int, running_tokens: int
+    def _prefill_block_table_rows(
+        self, batch: PrefillBatch, running_bs: int, has_cached: bool
     ):
+        """How many block-table rows a prefill uploads, `running_bs` like a
+        decode's; None for none. A drafter's steps after this prefill read the
+        table as a decode does, so it goes up whenever there is one."""
+        if has_cached or hasattr(self.model_runner, "drafter"):
+            return running_bs
+        return None
+
+    def prepare_prefill(
+        self,
+        batch: ScheduledBatch,
+        running_bs: int,
+        running_tokens: int,
+        ubatch_slices: tuple[UBatchSlice, ...] | None = None,
+        pcp_groups: "tuple[PcpBalGroup, ...] | None" = None,
+    ):
+        """`stage_prefill` (and a split prefill's `stage_ubatch_prefill`), the
+        phase's uploads, then `finish_prefill` (and `finish_ubatch_prefill`),
+        the micro-batches cut once (`_prefill_ubatches`)."""
+        group = self.model_runner.h2d_groups["prefill_metadata"]
+        attn_metadata, positions = self.stage_prefill(
+            batch, running_bs, running_tokens, group
+        )
+        ubatches = (
+            self._prefill_ubatches(batch, ubatch_slices, pcp_groups)
+            if ubatch_slices
+            else ()
+        )
+        ubatch_groups = (
+            self.stage_ubatch_prefill(batch, attn_metadata, ubatches, pcp_groups)
+            if ubatches
+            else ()
+        )
+        for staged in (group, *ubatch_groups):
+            staged.publish()
+        self.finish_prefill(batch, attn_metadata, running_bs, running_tokens)
+        if ubatches:
+            self.finish_ubatch_prefill(batch, attn_metadata, ubatches, pcp_groups)
+        return attn_metadata, positions
+
+    def stage_ubatch_prefill(
+        self,
+        batch: ScheduledBatch,
+        attn_metadata: AttentionMetaData,
+        ubatches: list[tuple[UBatchSlice, PrefillBatch]],
+        pcp_groups: "tuple[PcpBalGroup, ...] | None",
+    ) -> list:
+        """Stage each micro-batch of ``ubatches`` (`_prefill_ubatches`) as a
+        prefill of its own, into its ``ub{i}_`` buffers, counted into its
+        ``ub{i}_metadata`` group, its metadata hung on
+        ``attn_metadata.ubatches``; return the groups."""
+        names = tuple(f"ub{i}_metadata" for i in range(len(ubatches)))
+        self._check_metadata_writable(*names)
+        var = self.model_runner.forward_vars
+        groups, ubatch_metadata = [], []
+        for ub_idx, ((ub, ub_batch), name) in enumerate(zip(ubatches, names)):
+            prefix = f"ub{ub_idx}_"
+            group = self.model_runner.h2d_groups[name]
+            build_query_layout(
+                ub_batch.seqlens_q,
+                ub.running_bs,
+                ub.running_tokens,
+                cu_seqlens_q=var[f"{prefix}cu_seqlens_q"].np,
+                batch_ids=var[f"{prefix}batch_id_per_q_token"].np,
+            )
+            group.set_counts(
+                {
+                    f"{prefix}cu_seqlens_q": ub.running_bs + 1,
+                    f"{prefix}batch_id_per_q_token": ub.running_tokens,
+                }
+            )
+            ubatch_metadata.append(
+                self._stage_prefill_batch(
+                    ub_batch,
+                    var["positions"].np[
+                        ub.token_slice.start : ub.token_slice.start
+                        + ub_batch.scheduled_tokens
+                    ],
+                    ub.running_bs,
+                    ub.running_tokens,
+                    group,
+                    prefix,
+                )
+            )
+            groups.append(group)
+        attn_metadata.ubatches = ubatch_metadata
+        return groups
+
+    def _prefill_ubatches(
+        self,
+        batch: ScheduledBatch,
+        ubatch_slices: tuple[UBatchSlice, ...],
+        pcp_groups: "tuple[PcpBalGroup, ...] | None",
+    ) -> list[tuple[UBatchSlice, PrefillBatch]]:
+        """Each micro-batch of a split prefill, in the step's token axis, and
+        its batch (`PrefillBatch.cut`): a slice of ``ubatch_slices``, or under
+        PCP its request group's tokens. A prefill with no request has each
+        micro-batch's padding a request of its own (`PrefillBatch.padding`),
+        neither resuming the other's."""
+        if pcp_groups is not None:
+            ubatch_slices = tuple(
+                UBatchSlice(
+                    request_slice=slice(group.req_start, group.req_stop),
+                    token_slice=slice(group.tok_start, group.tok_end),
+                )
+                for group in pcp_groups
+            )
+        if not batch.total_seqs_num_prefill:
+            return [
+                (ub, PrefillBatch.padding(ub.running_tokens, batch.is_dummy_run))
+                for ub in ubatch_slices
+            ]
+        prefill = self.prefill_batch(batch, ubatch_slices[-1].token_slice.stop)
+        cu_seqlens_q = self.model_runner.forward_vars["cu_seqlens_q"].np[
+            : prefill.scheduled_bs + 1
+        ]
+        return [
+            (
+                ub,
+                prefill.cut(ub.request_slice, ub.scheduled_token_slice, cu_seqlens_q),
+            )
+            for ub in ubatch_slices
+        ]
+
+    def finish_ubatch_prefill(
+        self,
+        batch: ScheduledBatch,
+        attn_metadata: AttentionMetaData,
+        ubatches: list[tuple[UBatchSlice, PrefillBatch]],
+        pcp_groups: "tuple[PcpBalGroup, ...] | None",
+    ) -> None:
+        """Each micro-batch's GPU work over its uploaded ``ub{i}_`` metadata
+        (`_finish_prefill_batch`)."""
+        for ub_idx, ((_, ub_batch), ub_attn) in enumerate(
+            zip(ubatches, attn_metadata.ubatches)
+        ):
+            self._finish_prefill_batch(ub_batch, ub_attn, f"ub{ub_idx}_")
+
+    def finish_prefill(
+        self,
+        batch: ScheduledBatch,
+        attn_metadata: AttentionMetaData,
+        running_bs: int,
+        running_tokens: int,
+    ) -> None:
+        """The GPU work reading the step's uploaded prefill metadata
+        (`_finish_prefill_batch`). A builder adds its own step-wide work
+        after `super()`."""
+        self._finish_prefill_batch(
+            self.prefill_batch(batch, running_tokens), attn_metadata
+        )
+
+    def _finish_prefill_batch(
+        self,
+        batch: PrefillBatch,
+        attn_metadata: AttentionMetaData,
+        prefix: str = "",
+    ) -> None:
+        """The GPU work reading a prefill's uploaded metadata -- the step's or a
+        micro-batch's, of the ``prefix`` set. A builder adds its own after
+        `super()`."""
+        if attn_metadata.has_cached:
+            # Layer-invariant, so built once here rather than in every layer's
+            # prefix gather. On the device: `total_kv` has no upper bound.
+            # `context_lens` is `running_bs` wide and its padded tail is zero,
+            # so it still sums to exactly `total_kv` -- which is handed over so
+            # the build does not stop the device to measure itself.
+            attn_metadata.batch_id_per_k_token = build_batch_ids_device(
+                attn_metadata.context_lens, total=attn_metadata.total_kv
+            )
+
+    def query_lengths(
+        self, batch: ScheduledBatch, is_prefill: bool, running_tokens: int
+    ) -> np.ndarray:
+        # A prefill with no request lays out its padding request.
+        if is_prefill and not batch.total_seqs_num:
+            return self.prefill_batch(batch, running_tokens).seqlens_q
+        return super().query_lengths(batch, is_prefill, running_tokens)
+
+    def prefill_batch(self, batch: ScheduledBatch, running_tokens: int) -> PrefillBatch:
+        """The step's prefill batch: its first `total_seqs_num_prefill`
+        requests, or with none its ``running_tokens`` of padding as one
+        request (`PrefillBatch.padding`) -- what its query layout lays out
+        (`query_lengths`)."""
+        bs = batch.total_seqs_num_prefill
+        if not bs:
+            return PrefillBatch.padding(running_tokens, batch.is_dummy_run)
+        return PrefillBatch(
+            context_lens=batch.context_lens[:bs],
+            seqlens_q=batch.num_scheduled_tokens[:bs],
+            block_tables=batch.block_tables[:bs],
+            is_dummy_run=batch.is_dummy_run,
+        )
+
+    @h2d_producer("seq_metadata", "positions", runner="model_runner")
+    def stage_prefill(
+        self, batch: ScheduledBatch, running_bs: int, running_tokens: int, group
+    ):
+        """Write the step's positions and prefill metadata on the host and
+        count them into ``group``; return the metadata over GPU views the
+        publish fills (`_stage_prefill_batch`), and the positions."""
+        prefill = self.prefill_batch(batch, running_tokens)
         scheduled_bs = batch.total_seqs_num_prefill
         scheduled_tokens = batch.total_tokens_num_prefill
         var = self.model_runner.forward_vars
-
-        # The cached prefix is subtracted out of the two arrays this step
-        # already holds rather than read from `batch.num_cached_tokens`, so it
-        # cannot disagree with the query lengths the rest of the step uses.
-        context_lens = batch.context_lens[:scheduled_bs]
-        seqlens_q = batch.num_scheduled_tokens[:scheduled_bs]
-        cached_lens = context_lens - seqlens_q
-        cu_seqlens_q = var["cu_seqlens_q"].np[: scheduled_bs + 1]
+        cu_seqlens_q = var["cu_seqlens_q"].np[: prefill.scheduled_bs + 1]
         # Two asserts because there are two ways this can be wrong and only one
-        # of them is about the buffer. The first says `publish_cu_seqlens_q` ran
-        # over these rows; the second is the cross-check the derivation above
-        # would otherwise have cost -- `context_lens` is
+        # of them is about the buffer. The first says `prepare_query_metadata` ran
+        # over these rows; the second is the cross-check the derivation of
+        # `cached_lens` would otherwise have cost -- `context_lens` is
         # `num_cached_tokens + num_scheduled_tokens` for a PREFILL row and
         # `seq.num_tokens` for a DECODE one (`scheduler.py`), so a decode row
         # among the first `scheduled_bs` shows up here elementwise even in the
         # cases where the totals still happen to agree.
-        assert cu_seqlens_q[scheduled_bs] == scheduled_tokens, (
-            f"published cu_seqlens_q ends at {cu_seqlens_q[scheduled_bs]}, not the "
-            f"{scheduled_tokens} tokens scheduled for prefill: the batch's "
-            f"first {scheduled_bs} rows are not its prefill rows"
+        assert cu_seqlens_q[prefill.scheduled_bs] == prefill.scheduled_tokens, (
+            f"published cu_seqlens_q ends at {cu_seqlens_q[prefill.scheduled_bs]}, "
+            f"not the {prefill.scheduled_tokens} tokens of the prefill's "
+            f"{prefill.scheduled_bs} requests: the batch's first rows are not its "
+            "prefill rows"
         )
+        # The scheduled requests' alone: a padding request has no position.
+        cached_lens = prefill.cached_lens[:scheduled_bs]
         # `.tolist()` against the list, not `np.array_equal` against it: the
         # latter rebuilds an array from the list every step and costs 6x for
         # the same answer (6.1 vs 1.0 us at bs=256).
@@ -907,95 +1492,97 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
             f"derived cached prefix {cached_lens.tolist()} != the scheduler's "
             f"{batch.num_cached_tokens[:scheduled_bs]}"
         )
-        # `> 0`, not a truth test: the asserts above are what stand between this
-        # and a decode row, and a decode row's prefix comes out negative.
-        has_cached = bool((cached_lens > 0).any())
-        max_seqlen_q = int(seqlens_q.max(initial=0))
-        max_seqlen_k = int(context_lens.max(initial=0))
-
-        total_kv = self._publish_prefill_seq_lens(
-            context_lens, scheduled_bs, running_bs
-        )
-        positions = prefill_positions(
+        prefill_positions(
             self.model_runner.arange_np[:scheduled_tokens],
             cached_lens,
-            cu_seqlens_q,
-            seqlens_q,
+            cu_seqlens_q[: scheduled_bs + 1],
+            prefill.seqlens_q[:scheduled_bs],
             out=var["positions"].np[:scheduled_tokens],
         )
-        self._write_prefill_slots(
-            batch, scheduled_bs, positions, seqlens_q, cached_lens, context_lens
+        var["positions"].np[scheduled_tokens:running_tokens] = 0
+        attn_metadata = self._stage_prefill_batch(
+            prefill,
+            var["positions"].np[: prefill.scheduled_tokens],
+            running_bs,
+            running_tokens,
+            group,
         )
+        mrope_positions = self._build_mrope_prefill_positions(
+            batch, running_tokens, group
+        )
+        if mrope_positions is not None:
+            return attn_metadata, mrope_positions
+        # Published with the prefill mirrors (`prefill_metadata`).
+        group.set_counts({"positions": running_tokens})
+        return attn_metadata, var["positions"].gpu[:running_tokens]
 
-        ctx = self._upload_prefill_mirrors(
-            scheduled_bs, running_bs, scheduled_tokens, has_cached, cached_lens
+    def _stage_prefill_batch(
+        self,
+        batch: PrefillBatch,
+        positions: np.ndarray,
+        running_bs: int,
+        running_tokens: int,
+        group,
+        prefix: str = "",
+    ) -> AttentionMetaData:
+        """Write a prefill ``batch``'s metadata -- the step's, or a
+        micro-batch's in the ``prefix`` set -- at its tokens' ``positions``, on
+        the host, and count it into ``group``; return it over GPU views the
+        publish fills. Its query layout (`cu_seqlens_q`, `batch_id_per_q_token`)
+        is staged already. A builder adds its own sources after `super()`.
+
+        Which mirrors go depends on `has_cached`: with no prefix hit nothing
+        reads the block tables, the zero `seq_starts`, or the cached prefix, so
+        the step does not pay for uploading them. `num_cached_tokens` staying
+        absent is also how a consumer learns there is no prefix at all.
+        """
+        var = self.model_runner.forward_vars
+        scheduled_bs = batch.scheduled_bs
+        cached_lens = batch.cached_lens
+        # `> 0`, not a truth test: a decode row's prefix comes out negative.
+        has_cached = bool((cached_lens > 0).any())
+        total_kv = self._stage_prefill_seq_lens(batch.context_lens, running_bs, prefix)
+        # Packed every step, out to `running_bs`, not only on the steps that
+        # upload it (`_prefill_block_table_rows`): the slots are read off it.
+        block_table_state(var[f"{prefix}block_tables"]).prepare(
+            batch.block_tables, pad_to=running_bs
         )
-        if has_cached or tbo_enabled():
-            # Layer-invariant, so built once here rather than in every layer's
-            # prefix gather. On the device: `total_kv` has no upper bound.
-            # `context_lens` is `running_bs` wide and its padded tail is zero,
-            # so it still sums to exactly `total_kv` -- which is handed over so
-            # the build does not stop the device to measure itself.
-            # Built with no prefix of its own under TBO, because `has_cached`
-            # can turn on AFTER the split: the ubatch whose first request
-            # straddles it re-attaches the half its partner wrote. Its K
-            # geometry is then `cached + all_new` per request -- the request
-            # range `split_attn_metadata` already slices out of this -- so the
-            # only way to get that slice wrong is to have nothing to slice.
-            ctx["batch_id_per_k_token"] = build_batch_ids_device(
-                ctx["context_lens"], total=total_kv
+        self._write_prefill_slots(batch, positions, prefix)
+        var[f"{prefix}slot_mapping"].np[len(positions) : running_tokens] = -1
+
+        vars_used = [
+            ("cu_seqlens_k", running_bs + 1),
+            ("slot_mapping", running_tokens),
+            ("context_lens", running_bs),
+        ]
+        if has_cached:
+            var[f"{prefix}num_cached_tokens"].np[:scheduled_bs] = cached_lens
+            vars_used += [
+                ("seq_starts", scheduled_bs),
+                ("num_cached_tokens", scheduled_bs),
+            ]
+        group.set_counts({prefix + name: count for name, count in vars_used})
+        ctx = {name: var[prefix + name].gpu[:count] for name, count in vars_used}
+        block_rows = self._prefill_block_table_rows(batch, running_bs, has_cached)
+        if block_rows is not None:
+            ctx["block_tables"] = block_table_state(var[f"{prefix}block_tables"]).stage(
+                block_rows, group
             )
-        attn_metadata = AttentionMetaData(
-            # Cast to python int — numpy.int32 leaks in via batch.context_lens
-            # (numpy array) and breaks downstream Triton kernel constexpr
+        ctx["cu_seqlens_q"] = var[f"{prefix}cu_seqlens_q"].gpu[: running_bs + 1]
+        ctx["batch_id_per_q_token"] = var[f"{prefix}batch_id_per_q_token"].gpu[
+            :running_tokens
+        ]
+        return AttentionMetaData(
+            # Python ints: a numpy scalar breaks downstream Triton constexpr
             # binding (`tl.minimum` rejects numpy scalars).
-            max_seqlen_q=int(max_seqlen_q),
-            max_seqlen_k=int(max_seqlen_k),
+            max_seqlen_q=int(batch.seqlens_q.max(initial=0)),
+            max_seqlen_k=int(batch.context_lens.max(initial=0)),
             min_seqlen_q=0,
             dropout_p=0.0,
             has_cached=has_cached,
             total_kv=int(total_kv),
             state=AttnState.PREFILL_PREFIX if has_cached else AttnState.PREFILL_NATIVE,
             **ctx,
-        )
-        mrope_positions = self._build_mrope_prefill_positions(batch)
-        if mrope_positions is not None:
-            positions = mrope_positions
-        elif "prefill_inputs" in self.model_runner.h2d_groups:
-            positions = var["positions"].gpu[:scheduled_tokens]
-        else:
-            positions = var["positions"].copy_to_gpu(scheduled_tokens)
-
-        return attn_metadata, positions
-
-    def build_ubatch_prefill_metadata(
-        self,
-        attn_metadata: AttentionMetaData,
-        ub_slice: UBatchSlice,
-        running_bs: int,
-        ubatch_idx: int = 0,
-    ) -> AttentionMetaData:
-        del ubatch_idx  # only used by builders with per-ubatch plan buffers
-        return split_attn_metadata(attn_metadata, ub_slice, running_bs)
-
-    def _attach_tbo_prefill_cpu_lens(
-        self, attn_metadata: AttentionMetaData, bs: int
-    ) -> None:
-        """Publish CPU (numpy) copies of the per-request length arrays so that
-        split_attn_metadata can recompute per-ubatch max_seqlen_q/k and total_kv
-        on the host with zero device sync.
-        """
-        if not tbo_enabled():
-            return
-        var = self.model_runner.forward_vars
-        attach_tbo_cpu_lens(
-            attn_metadata, "context_lens", var["context_lens"].np[:bs].copy()
-        )
-        attach_tbo_cpu_lens(
-            attn_metadata, "cu_seqlens_q", var["cu_seqlens_q"].np[: bs + 1].copy()
-        )
-        attach_tbo_cpu_lens(
-            attn_metadata, "cu_seqlens_k", var["cu_seqlens_k"].np[: bs + 1].copy()
         )
 
     def build(
@@ -1005,13 +1592,19 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         running_tokens: int,
         max_seqlen_q: int,
         *,
-        ubatch_split_bs: int | None = None,
+        is_prefill: bool,
+        ubatch_slices: tuple[UBatchSlice, ...] | None = None,
+        pcp_groups: "tuple[PcpBalGroup, ...] | None" = None,
     ):
         """Build this step's metadata at the shape `prepare_inputs` settled.
 
-        ``ubatch_split_bs`` is the decode batch the step's TBO micro-batches
-        are cut from (`ForwardMode.ubatch_split_bs`), which a backend's
-        per-ubatch metadata covers (`_ubatch_split_bs`).
+        ``is_prefill`` is the step's phase as `ForwardMode.decide` settled it,
+        the group's for a batch with no request.
+
+        ``ubatch_slices``: the TBO micro-batches the step is cut into
+        (`ForwardMode.ubatch_slices`), whose metadata the backend builds with
+        the step's onto `AttentionMetaData.ubatches`; ``pcp_groups`` a PCP
+        prefill's request groups (`ForwardMode.pcp_groups`).
 
         The step's two units and nothing else: `running_bs` sizes everything
         per-sequence, `running_tokens` everything per-row. Both arrive as
@@ -1020,16 +1613,13 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         neither is derivable from the other, since a ragged step replays a flat
         token bucket rather than a `running_bs * q` grid.
 
-        Prefill and decode take both alike. A prefill's rows are the prompt's,
-        so `running_tokens` exceeds them only when the step padded it to a
-        token-graph bucket, which only a builder with `supports_token_graph`
-        builds; its per-sequence tail still pads to `running_bs` for the draft
-        pass that follows. That padding is visible
-        past attention -- `cu_seqlens_q` doubles as the selector for the
-        sampler's rows, so the LM head emits `running_bs` of them. `postprocess`
-        cuts back to the scheduled batch, and that is the one place it does.
+        Prefill and decode take both alike: `running_tokens` past the scheduled
+        tokens is padding (a token-graph bucket, or an idle DP rank's share of
+        a ragged step), and the per-sequence tail pads to `running_bs` for the
+        draft pass that follows. A decode's padding is visible past attention:
+        the LM head runs every running token, and `postprocess` cuts back to
+        the scheduled ones, the one place it does.
         """
-        self._ubatch_split_bs = ubatch_split_bs
         # Run state maintenance on the compute stream before the forward.
         state_ops = batch.state_maintenance_ops
         if state_ops.relocations:
@@ -1038,27 +1628,25 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
             self.execute_paged_state_copies(
                 state_ops.checkpoint_stores, state_ops.checkpoint_restores
             )
-        is_prefill = batch.total_tokens_num_prefill > 0
         if is_prefill:
-            if (
-                running_tokens != batch.total_tokens_num
-                and not self.supports_token_graph
-            ):
-                raise ValueError(
-                    f"{type(self).__name__} cannot pad a prefill to a "
-                    "token-graph bucket"
-                )
-            return self.prepare_prefill(batch, running_bs, running_tokens)
+            built = self.prepare_prefill(
+                batch, running_bs, running_tokens, ubatch_slices, pcp_groups
+            )
         else:
-            return self.prepare_decode(batch, running_bs, running_tokens, max_seqlen_q)
+            built = self.prepare_decode(
+                batch, running_bs, running_tokens, max_seqlen_q, ubatch_slices
+            )
+        attn_metadata = built[0]
+        if attn_metadata.batch_id_per_q_token is None:
+            # Published with the query prefix (`prepare_query_metadata`).
+            attn_metadata.batch_id_per_q_token = self.model_runner.forward_vars[
+                "batch_id_per_q_token"
+            ].gpu[:running_tokens]
+        return built
 
-    # The decode batch this step's TBO micro-batches are cut from (`build`).
-    # None: they cut the scheduled requests, as an eager split does.
-    _ubatch_split_bs: int | None = None
-
-    # Whether `prepare_prefill` builds a prefill padded past its scheduled rows
-    # (`running_tokens`), as a token-graph bucket pads it
-    # (`ForwardMode.token_graph`).
+    # Whether a prefill replays token graphs (`ForwardMode.token_graph`): every
+    # launch outside the model's eager regions is sized by the token count
+    # alone.
     supports_token_graph = False
 
     # The `running_bs` a prefill's model records some of its layers at as
