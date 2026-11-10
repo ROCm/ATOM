@@ -746,3 +746,60 @@ def test_dsv4_comm_fused_dual_stream_requires_shared_join(
             atom_modules.deepseek_v4.MoE.dual_stream_moe_forward(moe, hidden_states)
         routed_stream.wait_stream.assert_not_called()
     assert alt_stream.wait_stream.call_args_list[0].args == (routed_stream,)
+
+
+@pytest.mark.parametrize("consumed", [False, True])
+def test_dsv4_shared_in_combine_adds_the_shared_output_once(
+    monkeypatch, atom_modules, consumed
+):
+    """The routed combine either adds the shared output (and marks it
+    consumed) or leaves it to the caller: the sum has it exactly once."""
+    moe = _new_v4_moe(atom_modules)
+    hidden_states = torch.randn(4, 8)
+    routed = torch.randn_like(hidden_states)
+    shared = torch.randn_like(hidden_states)
+    routed_stream, alt_stream = _mock_streams(monkeypatch, atom_modules)
+    monkeypatch.setattr(
+        atom_modules.deepseek_v4.torch.cuda, "Event", lambda: MagicMock(name="ready")
+    )
+    monkeypatch.setattr(torch.Tensor, "record_stream", lambda _self, _stream: None)
+    experts = _new_fused_moe(atom_modules)
+    experts.combine_accepts_shared = lambda rows: True
+    seen = []
+
+    def fused_experts(_x, _router_logits, _shared_partial):
+        pending = experts.pending_shared_add()
+        seen.append(pending)
+        if not consumed:
+            return routed, False
+        pending.consumed = True
+        return routed + pending.tensor, False
+
+    experts.forward_maybe_comm_fused = fused_experts
+    moe.experts = experts
+    moe.alt_stream = alt_stream
+    moe.gate = MagicMock(return_value=torch.zeros(4, 2))
+    moe.shared_experts = MagicMock()
+    moe.shared_experts.forward.return_value = shared
+    moe.combine_outputs = lambda out, extra, prefix: (
+        out if extra is None else out + extra
+    )
+
+    result = atom_modules.deepseek_v4.MoE.dual_stream_moe_forward(moe, hidden_states)
+
+    torch.testing.assert_close(result, routed + shared, rtol=0, atol=0)
+    assert seen[0].tensor is shared and seen[0].consumed is consumed
+    assert experts.pending_shared_add() is None
+    if consumed:
+        routed_stream.wait_stream.assert_not_called()
+    else:
+        routed_stream.wait_stream.assert_called_once_with(alt_stream)
+
+
+def test_fused_moe_combine_accepts_shared_only_off_the_comm_fused_path(atom_modules):
+    layer = _new_fused_moe(atom_modules)
+    assert not layer.combine_accepts_shared(4)  # no modular kernel at all
+    layer.quant_method = SimpleNamespace(fused_experts=object())
+    assert not layer.combine_accepts_shared(4)  # not the mori v2 kernel
+    layer._comm_fused_moe = SimpleNamespace(supports=lambda rows: rows <= 8)
+    assert not layer.combine_accepts_shared(4)  # comm-fused takes this step

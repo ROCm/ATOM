@@ -97,7 +97,7 @@ from atom.model_ops.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-from atom.model_ops.moe import FusedMoE
+from atom.model_ops.moe import FusedMoE, PendingSharedAdd
 from atom.model_ops.quant_v4 import act_quant_inplace
 from atom.model_ops.sparse_attn_v4 import (
     hc_split_sinkhorn,
@@ -3124,23 +3124,11 @@ class MoE(nn.Module):
         )
 
     def _shared_into_combine(self, rows: int) -> bool:
-        """Whether the routed experts' combine can add the shared output itself:
-        MegaMoE behind the mori v2 modular kernel, on a step the comm-fused
-        backend (which joins the shared output its own way) does not take."""
+        """Whether the routed experts' combine adds the shared output itself
+        on this step (`FusedMoE.combine_accepts_shared`)."""
         experts = getattr(self, "experts", None)
-        backend = getattr(experts, "_comm_fused_moe", None)
-        if backend is not None and backend.supports(rows):
-            return False
-        fused_experts = getattr(
-            getattr(experts, "quant_method", None), "fused_experts", None
-        )
-        if fused_experts is None:
-            return False
-        from atom.model_ops.fused_moe.mori_v2_prepare_finalize import (
-            MoriV2ModularKernel,
-        )
-
-        return isinstance(fused_experts, MoriV2ModularKernel)
+        accepts = getattr(experts, "combine_accepts_shared", None)
+        return accepts is not None and accepts(rows)
 
     def _dual_stream_shared_in_combine(
         self, x: torch.Tensor, routed_stream: torch.cuda.Stream
@@ -3154,10 +3142,6 @@ class MoE(nn.Module):
         then a separate add; when the combine cannot take it the add happens
         here as before.
         """
-        from atom.model_ops.fused_moe.mori_v2_prepare_finalize import (
-            PendingSharedAdd,
-        )
-
         router_logits = self.gate(x)
         with torch.cuda.stream(self.alt_stream):
             shared = self.shared_experts.forward(x)
@@ -3165,13 +3149,10 @@ class MoE(nn.Module):
             ready.record(self.alt_stream)
         shared.record_stream(routed_stream)
         pending = PendingSharedAdd(shared, ready)
-        self.experts._pending_shared_add = pending
-        try:
+        with self.experts.with_shared_add(pending):
             routed, is_complete = self.experts.forward_maybe_comm_fused(
                 x, router_logits, None
             )
-        finally:
-            self.experts._pending_shared_add = None
         if is_complete:
             raise RuntimeError("a comm-fused step reached the shared-in-combine path")
         if pending.consumed:

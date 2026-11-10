@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import contextlib
 import logging
 from abc import abstractmethod
 from collections.abc import Callable
@@ -121,6 +122,22 @@ from atom.utils.tbo.ubatching import (
 logger = logging.getLogger("atom")
 
 _NUM_TBO_UBATCHES = 2
+
+
+@dataclass
+class PendingSharedAdd:
+    """A shared expert's output, handed to the routed combine to add
+    (`FusedMoE.with_shared_add`).
+
+    ``ready`` is recorded on the stream that produced ``tensor``; the combine's
+    stream waits on it right before the combine, so the producer still runs
+    beside dispatch and the expert GEMMs. ``consumed`` tells the caller whether
+    the routed output already includes it.
+    """
+
+    tensor: torch.Tensor
+    ready: torch.cuda.Event
+    consumed: bool = False
 
 
 class MoEActivationQuant(Enum):
@@ -2462,9 +2479,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 num_local_tokens=scheduled_tokens_gpu,
                 **moe_extra_args,
             )
-        # A caller that left its shared expert's output on the layer
-        # (`PendingSharedAdd`) has the modular kernel's combine add it.
-        pending_shared = getattr(layer, "_pending_shared_add", None)
+        # A shared expert output handed over by `FusedMoE.with_shared_add` is
+        # added by the modular kernel's combine.
+        pending_shared = (
+            layer.pending_shared_add() if hasattr(layer, "pending_shared_add") else None
+        )
         if pending_shared is not None:
             moe_extra_args = {**moe_extra_args, "shared_add": pending_shared}
         return self.fused_experts(
@@ -5337,6 +5356,45 @@ class FusedMoE(torch.nn.Module):
         return torch.ops.aiter.moe_forward(
             hidden_states, router_logits, self.layer_name
         )
+
+    def combine_accepts_shared(self, rows: int) -> bool:
+        """Whether this layer's routed combine can add a shared-expert output
+        (`with_shared_add`) on a `rows`-row step: MegaMoE behind the mori v2
+        modular kernel, on a step the comm-fused backend (which joins the
+        shared output its own way) does not take."""
+        backend = getattr(self, "_comm_fused_moe", None)
+        if backend is not None and backend.supports(rows):
+            return False
+        fused_experts = getattr(
+            getattr(self, "quant_method", None), "fused_experts", None
+        )
+        if fused_experts is None:
+            return False
+        try:
+            from atom.model_ops.fused_moe.mori_v2_prepare_finalize import (
+                MoriV2ModularKernel,
+            )
+        except ImportError:
+            return False
+        return isinstance(fused_experts, MoriV2ModularKernel)
+
+    @contextlib.contextmanager
+    def with_shared_add(self, pending: PendingSharedAdd):
+        """Hand `pending` to the combine of the forward run inside the block.
+
+        The combine sets `pending.consumed` when it added the shared output;
+        otherwise (a quant method or kernel that cannot take it) the caller
+        adds it itself, so a missed handoff costs the fusion, never the sum.
+        """
+        self._pending_shared_add = pending
+        try:
+            yield pending
+        finally:
+            self._pending_shared_add = None
+
+    def pending_shared_add(self) -> PendingSharedAdd | None:
+        """The shared output `with_shared_add` handed to this forward, if any."""
+        return getattr(self, "_pending_shared_add", None)
 
     def forward_maybe_comm_fused(
         self,

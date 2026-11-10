@@ -19,7 +19,6 @@ topk_ids carry only routed expert ids and mori routes them cleanly.
 """
 
 import contextlib
-import dataclasses
 import inspect
 import logging
 import os
@@ -639,21 +638,6 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             "MegaMoE combines its own rows; MoriV2ModularKernel never walks "
             "prepare()/finalize()"
         )
-
-
-@dataclasses.dataclass
-class PendingSharedAdd:
-    """The shared expert's output, handed to MegaMoE so its combine adds it.
-
-    ``ready`` is recorded on the stream that produced ``tensor``; the combine's
-    stream waits on it right before the combine, so the producer still runs
-    beside dispatch and the expert GEMMs. ``consumed`` tells the caller whether
-    the routed output already includes it.
-    """
-
-    tensor: torch.Tensor
-    ready: torch.cuda.Event
-    consumed: bool = False
 
 
 @cache
