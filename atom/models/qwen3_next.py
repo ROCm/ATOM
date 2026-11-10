@@ -11,6 +11,7 @@ from aiter.dist.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.rotary_embedding import get_rope
 from einops import rearrange
 from torch import nn
@@ -67,7 +68,10 @@ from atom.model_ops.sigmoid_gate import (
     shared_expert_gate_add,
 )
 from atom.model_ops.topK import (
+    init_aiter_topK_meta_data,
     is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config,
+    rocm_aiter_topk_softmax,
+    topk_meta_rows,
 )
 from atom.model_ops.triton_mrope import (
     gfx1250_fused_qk_norm_mrope_cache_applies,
@@ -86,6 +90,7 @@ from atom.models.utils import (
 from atom.plugin.prepare import is_plugin_mode, is_vllm
 from atom.utils import envs
 from atom.utils.decorators import support_torch_compile
+from atom.utils.forward_context import pass_scheduled_tokens_gpu
 from atom.utils.region_graph import token_graph
 
 ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
@@ -219,6 +224,72 @@ class Qwen3NextMLP(nn.Module):
 
 
 _SHARED_EXPERT_STREAM: torch.cuda.Stream | None = None
+# ATOM_QWEN_FHMOE: one zero [tokens, hidden] buffer every block's MoEGatedSum
+# hands the next norm as its (already summed) shared part, and whether the
+# top-k buffer with the prefilled shared column is set up.
+_FHMOE_ZEROS: torch.Tensor | None = None
+_FHMOE_TOPK_READY = False
+
+
+def _fhmoe_setup(block) -> None:
+    """The shared-column top-k buffer (topk_softmax writes the routed columns
+    and scores the shared one) and the zero shared rows, sized to the MoE's
+    token capacity. Once for every block."""
+    global _FHMOE_ZEROS, _FHMOE_TOPK_READY
+    from atom.model_ops.moe import moe_kernel_token_capacity
+
+    cfg = block.experts.moe_parallel_config
+    capacity = moe_kernel_token_capacity(
+        get_current_atom_config(),
+        dp_size=cfg.dp_size,
+        use_all2all=cfg.use_all2all_kernels,
+        dp_logical_ratio=cfg.dp_logical_ratio,
+    )
+    if not _FHMOE_TOPK_READY:
+        init_aiter_topK_meta_data(
+            n_routed_experts=block.n_routed_experts,
+            n_shared_experts=1,
+            top_k=block.experts.top_k,
+            tp_rank=0,
+            tp_size=1,
+            max_num_tokens=capacity,
+        )
+        _FHMOE_TOPK_READY = True
+    hidden = block.experts.hidden_size
+    if _FHMOE_ZEROS is None or _FHMOE_ZEROS.shape[1] != hidden:
+        _FHMOE_ZEROS = torch.zeros(
+            (capacity, hidden), dtype=torch.bfloat16, device="cuda"
+        )
+
+
+_FHMOE_DEFER: bool | None = None
+
+
+def _fhmoe_defer_topk() -> bool:
+    """Whether FHMoE leaves its top-k to aiter's fused top-k + route + quant
+    (ATOM_MOE_FUSED_TOPK_ROUTE_QUANT and an aiter whose deferral takes the
+    shared column); never under micro-batching (one deferral at a time)."""
+    global _FHMOE_DEFER
+    if _FHMOE_DEFER is None:
+        ok = False
+        if envs.ATOM_MOE_FUSED_TOPK_ROUTE_QUANT:
+            try:
+                import inspect
+
+                from aiter.ops.flydsl.grouped_moe_gfx1250 import defer_topk_softmax
+
+                ok = (
+                    "num_fused_shared_experts"
+                    in inspect.signature(defer_topk_softmax).parameters
+                )
+            except ImportError:
+                ok = False
+        _FHMOE_DEFER = ok
+    if not _FHMOE_DEFER:
+        return False
+    from atom.utils.tbo.ubatching import tbo_active
+
+    return not tbo_active()
 
 
 def _shared_expert_stream() -> torch.cuda.Stream:
@@ -254,6 +325,9 @@ class Qwen3NextSparseMoeBlock(nn.Module):
     # ATOM_FUSED_ROUTER_SHARED_EXPERT: the router weight padded to whole 16-row
     # groups (gate.weight is a view of its first rows), set at load.
     router_padded = None
+    # ATOM_QWEN_FHMOE: set in __init__ (a block built without it runs the base
+    # path).
+    fhmoe = False
 
     def __init__(
         self, config, quant_config, prefix: str = "", reduce_results: bool = True
@@ -369,6 +443,20 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 else None
             ),
         )
+        # ATOM_QWEN_FHMOE (gfx1250, TP1): decode-size steps run the shared expert
+        # inside the routed grouped MoE (see `fhmoe_forward`); the experts' quant
+        # method builds its operands at load from the shared expert handed here.
+        self.fhmoe = bool(
+            envs.ATOM_QWEN_FHMOE
+            and self.shared_expert is not None
+            and self.tp_size == 1
+            and not self.is_rocm_aiter_fusion_shared_expert_enabled
+            and get_gfx() == "gfx1250"
+        )
+        if self.fhmoe:
+            # Not a submodule: the shared expert stays this block's.
+            object.__setattr__(self.experts, "fhmoe_shared_mlp", self.shared_expert)
+            _fhmoe_setup(self)
         # The same padding for experts quantized online at load: the MTP layer's
         # experts are unquantized in the checkpoint and become MXFP4 there.
         # ATOM_QWEN_MONO_MOE's kernel needs 128 (TP4) either way.
@@ -433,6 +521,55 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             mlp.down_proj.weight,
             prefill=m > envs.ATOM_FUSED_ROUTER_SHARED_EXPERT_MAX_TOKENS,
         )
+
+    def fhmoe_forward(self, hidden_states: torch.Tensor) -> torch.Tensor | MoEGatedSum:
+        """ATOM_QWEN_FHMOE: the router GEMM, the top-k that also scores the
+        shared column (route id E, weight sigmoid of its logit; deferred to the
+        MoE's fused top-k + route + quant where it can) and one aiter FHMoE
+        grouped MoE over the routed experts and the shared expert. The next
+        norm still takes the sum (MoEGatedSum, its shared part zero)."""
+        ex = self.experts
+        logits = self.gate(hidden_states)
+        nvt = pass_scheduled_tokens_gpu(hidden_states.shape[0])
+        if _fhmoe_defer_topk():
+            # ATOM_MOE_FUSED_TOPK_ROUTE_QUANT: the top-k (shared column too) is
+            # left to aiter's grouped MoE, which computes it with the routing
+            # and the routed activation quant in one fused kernel (two above
+            # 512 rows). The buffers are the prefilled shared-column rows.
+            from aiter.ops.flydsl.grouped_moe_gfx1250 import defer_topk_softmax
+
+            weights, ids = topk_meta_rows(hidden_states.shape[0])
+            defer_topk_softmax(
+                weights, ids, logits, ex.renormalize, nvt, num_fused_shared_experts=1
+            )
+        else:
+            weights, ids = rocm_aiter_topk_softmax(
+                logits,
+                ex.top_k,
+                ex.renormalize,
+                num_fused_shared_experts=1,
+                num_routing_experts=self.n_routed_experts,
+                fused_shared_experts_scoring_func="sigmoid",
+                num_valid_rows=nvt,
+            )
+        apply = ex.quant_method.apply_fhmoe
+        if self.defer_gather and not torch.compiler.is_compiling():
+            from aiter.ops.flydsl.grouped_moe_gfx1250 import defer_gather_reduce
+
+            with defer_gather_reduce() as req:
+                out = apply(ex, hidden_states, weights, ids, nvt)
+            if req.taken:
+                out = GatheredRouted(
+                    req.grouped, req.route_rows, req.weights, req.num_valid_tokens
+                )
+        else:
+            out = apply(ex, hidden_states, weights, ids, nvt)
+        if self.defer_gated_sum:
+            zeros = _FHMOE_ZEROS[: hidden_states.shape[0]]
+            return MoEGatedSum(out, zeros, None)
+        if isinstance(out, GatheredRouted):
+            out = out.materialize()
+        return out
 
     def combine_tail_forward(
         self, hidden_states: torch.Tensor, residual: torch.Tensor
@@ -586,6 +723,14 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         _num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
+        if (
+            self.fhmoe
+            and residual is None
+            and hidden_states.shape[0] <= envs.ATOM_QWEN_FHMOE_MAX_TOKENS
+            and not torch.compiler.is_compiling()
+        ):
+            out = self.fhmoe_forward(hidden_states)
+            return out if isinstance(out, MoEGatedSum) else out.view(orig_shape)
         if (
             residual is not None
             and self.combine_tail_norm is not None
