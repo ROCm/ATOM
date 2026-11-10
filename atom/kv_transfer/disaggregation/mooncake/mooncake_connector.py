@@ -444,6 +444,23 @@ class MooncakeAgentMetadata(
 # ===================================================================
 
 
+def _receive_block_offset(
+    num_blocks: int,
+    num_source_blocks: int,
+    cached: int,
+    source_skip_factor: int,
+    chunked: bool,
+) -> int:
+    """The same prefix slice for scheduler admission and worker dispatch."""
+    if (
+        cached < 0
+        or cached >= num_blocks
+        or (not chunked and cached * source_skip_factor >= num_source_blocks)
+    ):
+        return 0
+    return cached
+
+
 class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
     def __init__(self, config: Config) -> None:
         kv_transfer_config = config.kv_transfer_config
@@ -492,6 +509,34 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         # Bidirectional transfer_id <-> request_id mapping
         self.request_id_to_transfer_id: dict[ReqId, TransferId] = {}
         self.transfer_id_to_request_id: dict[TransferId, ReqId] = {}
+
+    @property
+    def supports_pd_admission(self) -> bool:
+        return not self.is_producer
+
+    def _receive_prefix(self, seq, num_cached_blocks: int) -> tuple[int, int]:
+        geometry = self._remote_page_geometry(seq.kv_transfer_params or {})
+        if geometry is None or seq.has_per_req_cache:
+            return 0, 1
+        return num_cached_blocks, self.dcp_size // geometry[1]
+
+    def pd_receive_block_offset(self, seq, num_blocks, num_cached_blocks):
+        params = seq.kv_transfer_params or {}
+        if self.is_producer or not params.get("do_remote_prefill"):
+            return None
+        if seq.has_per_req_cache:
+            raise ValueError("PD admission supports paged KV receives only")
+        cached, factor = self._receive_prefix(seq, num_cached_blocks)
+        # Chunked P has not allocated its source table when D reserves the
+        # full prompt destination. Match worker dispatch: a missing source
+        # table does not invalidate a compatible local prefix in this mode.
+        return _receive_block_offset(
+            num_blocks,
+            len(params.get("remote_block_ids") or []),
+            cached,
+            factor,
+            bool(params.get("chunked_transfer")),
+        )
 
     def _remote_page_geometry(self, params: dict[str, Any]) -> tuple[int, int] | None:
         """Return ``(producer_block_size, producer_dcp_size)`` when incremental
@@ -632,9 +677,9 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             # PD incremental: skip leading blocks already in the decode node's
             # prefix cache. Per-request state (including the SWA ring slot) is
             # not covered by a block-only delta, so it takes a full transfer.
-            num_computed_blocks = 0
-            # Number of producer source blocks represented by one consumer block.
-            src_block_skip_factor = 1
+            num_computed_blocks, src_block_skip_factor = self._receive_prefix(
+                seq, seq.num_cached_tokens // self.hash_block_size
+            )
             remote_geometry = self._remote_page_geometry(params)
             if remote_geometry is None:
                 logger.warning(
@@ -648,10 +693,6 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
                     self.block_size,
                     self.dcp_size,
                 )
-            elif not seq.has_per_req_cache and self.hash_block_size > 0:
-                _, remote_dcp_size = remote_geometry
-                num_computed_blocks = seq.num_cached_tokens // self.hash_block_size
-                src_block_skip_factor = self.dcp_size // remote_dcp_size
             params["num_computed_blocks"] = num_computed_blocks
             params["src_block_skip_factor"] = src_block_skip_factor
             logger.debug(
@@ -1887,15 +1928,13 @@ class MooncakeConnector(KVConnectorBase):
             remote_block_ids = meta.remote_block_ids or []
             off = meta.num_computed_blocks
             src_block_skip_factor = max(1, meta.src_block_skip_factor)
-            if (
-                off < 0
-                or off >= len(meta.local_block_ids)
-                or (
-                    not meta.chunked_transfer
-                    and off * src_block_skip_factor >= len(remote_block_ids)
-                )
-            ):
-                off = 0
+            off = _receive_block_offset(
+                len(meta.local_block_ids),
+                len(remote_block_ids),
+                off,
+                src_block_skip_factor,
+                meta.chunked_transfer,
+            )
             dst_block_ids = meta.local_block_ids[off:]
             src_block_ids = remote_block_ids[off * src_block_skip_factor :]
 
