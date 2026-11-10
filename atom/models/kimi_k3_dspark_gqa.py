@@ -56,7 +56,7 @@ from atom.models.dspark_draft import (
     DSparkGQADecoderLayer,
     DSparkMarkovHead,
     KVCacheBinding,
-    draft_rope_scaling,
+    draft_rope_kwargs,
     linear_out,
 )
 from atom.models.qwen3 import Qwen3MLP
@@ -131,7 +131,9 @@ class KimiK3DSparkGQAAttention(nn.Module):
         )
 
         self.rotary_emb = get_rope(
-            self.head_dim, rotary_dim=self.head_dim, **_draft_rope_kwargs(config)
+            self.head_dim,
+            rotary_dim=self.head_dim,
+            **draft_rope_kwargs(config, is_neox_style=True),
         )
 
         self.kv = KVCacheBinding(layer_num)
@@ -272,21 +274,6 @@ class KimiK3DSparkGQADecoderLayer(DSparkGQADecoderLayer):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-
-
-def _draft_rope_kwargs(config) -> dict:
-    """`get_rope` arguments from the DRAFT's own config, never the target's.
-
-    The two ropes differ, and the target's loads clean, so nothing would catch
-    the draft inheriting it.
-    """
-    rope_theta, rope_scaling = draft_rope_scaling(config)
-    return {
-        "max_position": config.max_position_embeddings,
-        "base": rope_theta,
-        "rope_scaling": rope_scaling,
-        "is_neox_style": True,
-    }
 
 
 def _check_rope_covers(max_model_len: int, rope_rows: int) -> None:

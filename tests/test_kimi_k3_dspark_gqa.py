@@ -22,32 +22,7 @@ GQA draft (64 q / 16 kv heads, head_dim 64) for the Kimi-K3 MLA+KDA target.
 import types
 
 import pytest
-
-
-def _gpu_stack_import(name):
-    """Import an atom module that may need the aiter/triton GPU stack.
-
-    Tries the import first, so a module that imports fine without the stack
-    still runs on the CPU-only CI runner. A failure is turned into a skip only
-    when the stack is genuinely absent -- no aiter or triton, or no GPU for
-    aiter to probe the arch of at import. On a GPU host any import error FAILS.
-    """
-    import importlib
-
-    try:
-        return importlib.import_module(name)
-    except Exception:
-        try:
-            importlib.import_module("aiter")
-            importlib.import_module("triton")
-            import torch
-
-            gpu = torch.cuda.is_available()
-        except Exception as e:  # noqa: BLE001 - any failure here means no stack
-            pytest.skip(f"{name} needs the aiter/triton stack, absent here: {e}")
-        if not gpu:
-            pytest.skip(f"{name} needs a GPU: aiter probes the arch at import")
-        raise
+from conftest import gpu_stack_import
 
 
 def _radixark_cfg(**overrides):
@@ -137,8 +112,12 @@ def test_gqa_draft_rope_is_the_drafts_own():
     theta 10000 / YaRN x16 from 65536, neox-style -- not the target's theta
     50000 / x32. A wrong rope loads clean and only moves acceptance."""
     from atom.config import SpeculativeConfig
+    from atom.models.dspark_draft import draft_rope_kwargs
 
-    kwargs_fn = _draft_rope_kwargs_fn("kimi_k3_dspark_gqa.py")
+    def kwargs_fn(cfg):
+        # What `KimiK3DSparkGQAAttention` passes.
+        return draft_rope_kwargs(cfg, is_neox_style=True)
+
     hf = _radixark_cfg()
     SpeculativeConfig.hf_config_override(hf, model_path=None)
     kw = kwargs_fn(hf)
@@ -153,42 +132,10 @@ def test_gqa_draft_rope_is_the_drafts_own():
     assert kwargs_fn(plain)["rope_scaling"] is None
 
 
-def _lift_fn(module_file, name, ns):
-    """A draft module's top-level function `name`, runnable without the aiter
-    stack.
-
-    The draft modules import aiter at load, so the one function is lifted from
-    the source and bound to the CPU-importable names in `ns` it calls.
-    """
-    import ast
-    import pathlib
-
-    from atom.models import dspark_draft
-
-    path = pathlib.Path(dspark_draft.__file__).with_name(module_file)
-    tree = ast.parse(path.read_text())
-    (fn,) = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name]
-    exec(  # noqa: S102 - execute only AST nodes from this repository's source.
-        compile(ast.Module(body=[fn], type_ignores=[]), str(path), "exec"), ns
-    )
-    return ns[name]
-
-
-def _draft_rope_kwargs_fn(module_file):
-    """A draft module's `_draft_rope_kwargs`, bound to the shared parser."""
-    from atom.models import dspark_draft, utils
-
-    ns = {
-        "draft_rope_scaling": dspark_draft.draft_rope_scaling,
-        "is_neox_rope_style": utils.is_neox_rope_style,
-    }
-    return _lift_fn(module_file, "_draft_rope_kwargs", ns)
-
-
 def test_gqa_draft_refuses_a_max_model_len_past_the_rope_cache():
     """A length equal to the cache rows -- the shipped pair's default -- fits;
     one more row is refused at startup."""
-    check = _lift_fn("kimi_k3_dspark_gqa.py", "_check_rope_covers", {})
+    check = gpu_stack_import("atom.models.kimi_k3_dspark_gqa")._check_rope_covers
     rows = 65536 * 16
     check(rows, rows)
     check(4096, rows)
@@ -202,7 +149,7 @@ def test_gqa_context_write_clamps_verify_rows_to_the_rope_cache(monkeypatch):
     target's positions are left as they were."""
     import torch
 
-    mod = _gpu_stack_import("atom.models.kimi_k3_dspark_gqa")
+    mod = gpu_stack_import("atom.models.kimi_k3_dspark_gqa")
     seen = {}
     monkeypatch.setattr(
         mod.DSparkDraftModel,
@@ -282,7 +229,7 @@ def test_gqa_draft_resolves_to_mha_not_mla():
 
     Kept off `get_attn_backend`, which reads the GPU arch through rocminfo.
     """
-    selector = _gpu_stack_import("atom.utils.selector")
+    selector = gpu_stack_import("atom.utils.selector")
 
     assert selector.attn_family(_radixark_cfg()) is selector.Family.MHA
     # The MLA draft it sits beside must still resolve the other way.
@@ -329,7 +276,7 @@ def test_gqa_draft_pool_footprint_is_dcp_invariant(tp, dcp):
     This pins the arithmetic; `test_gqa_draft_pool_entry_is_dcp_blocks` pins that
     `draft_kv_builder` builds this geometry.
     """
-    _gpu_stack_import("atom.model_ops.attentions.mha_kv_pool")
+    gpu_stack_import("atom.model_ops.attentions.mha_kv_pool")
     pool = _pool(block_size=128, world_size=tp, blocks_per_entry=dcp)
 
     # Full TP, every dcp: 16 KV heads over 8 ranks is 2 each.
@@ -386,8 +333,8 @@ def _make_kv_pool_kwargs(runner, model=None):
     """
     from unittest import mock
 
-    dk = _gpu_stack_import("atom.spec_decode.draft_kv")
-    _gpu_stack_import("atom.model_ops.attentions.aiter_attention")
+    dk = gpu_stack_import("atom.spec_decode.draft_kv")
+    gpu_stack_import("atom.model_ops.attentions.aiter_attention")
     from atom.utils import selector
 
     seen = {}
@@ -408,7 +355,7 @@ def _make_kv_pool_kwargs(runner, model=None):
             runner,
             _normalized_radixark(),
             model=model
-            or _gpu_stack_import("atom.models.kimi_k3_dspark_gqa").KimiK3DSparkGQA,
+            or gpu_stack_import("atom.models.kimi_k3_dspark_gqa").KimiK3DSparkGQA,
         )
 
     assert builder is not None
@@ -474,7 +421,7 @@ def test_a_draft_without_a_pool_spec_gets_the_generic_pool(model):
     if model == "eagle3":
         draft = types.SimpleNamespace()
     else:
-        draft = _gpu_stack_import("atom.models.minimax_m3.dspark").MiniMaxM3DSpark
+        draft = gpu_stack_import("atom.models.minimax_m3.dspark").MiniMaxM3DSpark
         assert draft.kv_pool_spec is None
     seen = _make_kv_pool_kwargs(_stub_runner(dcp=8), model=draft)
     builder = seen.pop("builder")
@@ -538,7 +485,7 @@ def _fake_attn_res_kernel(monkeypatch, calls):
         )
         return result, None
 
-    ops = _gpu_stack_import("atom.model_ops.kimi_k3")
+    ops = gpu_stack_import("atom.model_ops.kimi_k3")
     monkeypatch.setattr(ops, "apply_attn_res", apply_attn_res)
     return calls
 
@@ -553,7 +500,7 @@ def _k3_target_stub(hidden=16, n_layers=16, block_size=4, enabled=True):
     """
     import torch
 
-    layer_cls = _gpu_stack_import("atom.models.kimi_k3.model").KimiDecoderLayer
+    layer_cls = gpu_stack_import("atom.models.kimi_k3.model").KimiDecoderLayer
     torch.manual_seed(0)
     layers = []
     for i in range(n_layers):
@@ -582,7 +529,7 @@ def _gqa_spec(target, layer_ids, hidden=16):
     constructing the real draft would want a loaded checkpoint, a TP group and
     a GPU.
     """
-    mod = _gpu_stack_import("atom.models.kimi_k3_dspark_gqa")
+    mod = gpu_stack_import("atom.models.kimi_k3_dspark_gqa")
     return mod.KimiK3DSparkGQA.target_aux_capture_spec(
         None, layer_ids, hidden, target.layers
     )
@@ -596,7 +543,7 @@ def test_gqa_draft_owns_a_capture_spec_that_feeds_the_aggregate(monkeypatch):
     the feature itself.
     """
     torch = pytest.importorskip("torch")
-    proposer = _gpu_stack_import("atom.spec_decode.dspark_proposer")
+    proposer = gpu_stack_import("atom.spec_decode.dspark_proposer")
 
     hidden, block_size = 16, 4
     target = _k3_target_stub(hidden=hidden, n_layers=16, block_size=block_size)
@@ -756,7 +703,7 @@ def _stage(stub, seqlens, rows, tables, dummy=False):
     count it recorded into the group (None if it recorded none)."""
     import numpy as np
 
-    kimi = _gpu_stack_import("atom.model_ops.attentions.kimi_mla_gdn_attn")
+    kimi = gpu_stack_import("atom.model_ops.attentions.kimi_mla_gdn_attn")
     buf = stub.model_runner.forward_vars.get("draft_ctx_slots")
     batch = types.SimpleNamespace(is_dummy_run=dummy, block_tables=tables)
     group = _Group()
@@ -810,7 +757,7 @@ def test_a_request_less_prefill_drops_every_padded_row(monkeypatch):
     stages them all `-1`, out to the width the target's slots go up at."""
     import numpy as np
 
-    kimi = _gpu_stack_import("atom.model_ops.attentions.kimi_mla_gdn_attn")
+    kimi = gpu_stack_import("atom.model_ops.attentions.kimi_mla_gdn_attn")
     monkeypatch.setattr(
         kimi.GDNStateMixin, "stage_prefill", lambda self, *a: ("md", "pos")
     )
@@ -835,7 +782,7 @@ def test_a_ragged_decode_stages_each_request_at_its_own_length(monkeypatch):
     target's positions use, not a uniform `max_seqlen_q` per request."""
     import numpy as np
 
-    kimi = _gpu_stack_import("atom.model_ops.attentions.kimi_mla_gdn_attn")
+    kimi = gpu_stack_import("atom.model_ops.attentions.kimi_mla_gdn_attn")
     monkeypatch.setattr(
         kimi.GDNStateMixin, "stage_decode", lambda self, *a: ("md", "pos")
     )
@@ -889,7 +836,7 @@ def test_the_builder_skips_dummy_runs_and_drafts_without_a_pool():
 
 def _fold_mod():
     pytest.importorskip("torch")
-    return _gpu_stack_import("atom.model_ops.kimi_k3.dspark_block_attn")
+    return gpu_stack_import("atom.model_ops.kimi_k3.dspark_block_attn")
 
 
 @pytest.mark.parametrize("bs,T,hkv,g", [(1, 7, 2, 4), (3, 7, 2, 4), (2, 4, 1, 8)])
@@ -1113,14 +1060,14 @@ def test_block_writes_and_reads_stay_inside_the_allocated_blocks():
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available():
         pytest.skip("needs a GPU: pinned staging and a CUDA event")
-    m = _gpu_stack_import("atom.models.kimi_k3_dspark_gqa")
+    m = gpu_stack_import("atom.models.kimi_k3_dspark_gqa")
     draft = m.KimiK3DSparkGQA.__new__(m.KimiK3DSparkGQA)
     vblock, T = 1024, 3
     # The bound FLASH page is one entry wide.
     k_cache = torch.empty(1, vblock, 1, 1, device="cuda")
     kv = types.SimpleNamespace(k_cache=k_cache)
     draft.layers = [types.SimpleNamespace(self_attn=types.SimpleNamespace(kv=kv))]
-    draft._alloc_cap = _gpu_stack_import("atom.models.dspark_draft").AllocationCap(
+    draft._alloc_cap = gpu_stack_import("atom.models.dspark_draft").AllocationCap(
         4, "cuda"
     )
     # Row 0 holds one block and its block crosses into a second; row 1 holds
@@ -1138,7 +1085,7 @@ def test_block_writes_and_reads_stay_inside_the_allocated_blocks():
 def test_the_draft_ignores_the_targets_quantization():
     """The draft atom config is a copy of the target's; its quant config, and
     the online re-quantization it carries, must not reach this BF16 draft."""
-    m = _gpu_stack_import("atom.models.kimi_k3_dspark_gqa")
+    m = gpu_stack_import("atom.models.kimi_k3_dspark_gqa")
     qc = m._draft_quant_config(_radixark_cfg())
     assert qc.quant_method == "" and qc.online_quant is False
     with pytest.raises(ValueError, match="BF16 weights only"):

@@ -6,8 +6,8 @@
   (Kimi-K3 DSpark GQA, MiniMax-M3.1 DSpark)
 - `DSparkDraftModel`'s default target sharing, block sampling and context-KV
   fan-out, and the draft layers' slot hand-off
-- `draft_rope_scaling`, the drafts' shared rope parser, and the Kimi-K3 MLA
-  draft's rope arguments built on it
+- `draft_rope_kwargs`, the drafts' shared rope arguments, and the Kimi-K3 MLA
+  draft's
 
 Kept apart from `test_dspark.py`, which skips whole without aiter, so these
 run on the CPU-only CI job.
@@ -16,32 +16,7 @@ run on the CPU-only CI job.
 import types
 
 import pytest
-
-
-def _gpu_stack_import(name):
-    """Import an atom module that may need the aiter/triton GPU stack.
-
-    Tries the import first, so a module that imports fine without the stack
-    still runs on the CPU-only CI runner. A failure is turned into a skip only
-    when the stack is genuinely absent -- no aiter or triton, or no GPU for
-    aiter to probe the arch of at import. On a GPU host any import error FAILS.
-    """
-    import importlib
-
-    try:
-        return importlib.import_module(name)
-    except Exception:
-        try:
-            importlib.import_module("aiter")
-            importlib.import_module("triton")
-            import torch
-
-            gpu = torch.cuda.is_available()
-        except Exception as e:  # noqa: BLE001 - any failure here means no stack
-            pytest.skip(f"{name} needs the aiter/triton stack, absent here: {e}")
-        if not gpu:
-            pytest.skip(f"{name} needs a GPU: aiter probes the arch at import")
-        raise
+from conftest import gpu_stack_import
 
 
 @pytest.fixture
@@ -271,7 +246,7 @@ def test_the_draft_layer_writes_at_the_slots_it_is_handed(module, layer):
     from `compute_draft_kv` alone."""
     import torch
 
-    layer_cls = getattr(_gpu_stack_import(module), layer)
+    layer_cls = getattr(gpu_stack_import(module), layer)
     seen = {}
     stub = types.SimpleNamespace(
         self_attn=types.SimpleNamespace(
@@ -302,19 +277,19 @@ def _rope_cfg(**overrides):
     return cfg
 
 
-def test_draft_rope_scaling_leaves_the_type_to_the_caller():
-    """The shared parser copies the config's scaling dict; a caller's override
-    of the rope type never reaches the config."""
-    from atom.models.dspark_draft import draft_rope_scaling
+def test_draft_rope_kwargs_leave_the_config_untouched():
+    """The YaRN dict is a copy: a caller's rope type never reaches the
+    config. Without YaRN fields the rope is plain."""
+    from atom.models.dspark_draft import draft_rope_kwargs
 
     cfg = _rope_cfg()
-    theta, scaling = draft_rope_scaling(cfg)
-    assert theta == 10000.0
-    assert scaling == cfg.rope_parameters
-    scaling["rope_type"] = "deepseek_yarn"
+    kw = draft_rope_kwargs(cfg, rope_type="deepseek_yarn", is_neox_style=True)
+    assert kw["base"] == 10000.0
+    assert kw["rope_scaling"]["rope_type"] == "deepseek_yarn"
     assert cfg.rope_parameters["rope_type"] == "yarn"
 
-    assert draft_rope_scaling(_rope_cfg(rope_parameters={}))[1] is None
+    plain = _rope_cfg(rope_parameters={"rope_theta": 10000.0})
+    assert draft_rope_kwargs(plain, is_neox_style=True)["rope_scaling"] is None
 
 
 def _inferact_rope_cfg(**overrides):
@@ -338,43 +313,18 @@ def _inferact_rope_cfg(**overrides):
     return cfg
 
 
-def _lift_fn(module_file, name, ns):
-    """A draft module's top-level function `name`, runnable without the aiter
-    stack.
-
-    The draft modules import aiter at load, so the one function is lifted from
-    the source and bound to the CPU-importable names in `ns` it calls.
-    """
-    import ast
-    import pathlib
-
-    from atom.models import dspark_draft
-
-    path = pathlib.Path(dspark_draft.__file__).with_name(module_file)
-    tree = ast.parse(path.read_text())
-    (fn,) = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name]
-    exec(  # noqa: S102 - execute only AST nodes from this repository's source.
-        compile(ast.Module(body=[fn], type_ignores=[]), str(path), "exec"), ns
-    )
-    return ns[name]
-
-
-def _draft_rope_kwargs_fn(module_file):
-    """A draft module's `_draft_rope_kwargs`, bound to the shared parser."""
-    from atom.models import dspark_draft, utils
-
-    ns = {
-        "draft_rope_scaling": dspark_draft.draft_rope_scaling,
-        "is_neox_rope_style": utils.is_neox_rope_style,
-    }
-    return _lift_fn(module_file, "_draft_rope_kwargs", ns)
-
-
 def test_k3_dspark_mla_rope_kwargs_are_unchanged():
     """The MLA draft's `get_rope` arguments, key order included (it is part of
     aiter's rope cache key): DeepSeek YaRN, interleaved, the draft's own theta.
     """
-    kwargs_fn = _draft_rope_kwargs_fn("kimi_k3_dspark.py")
+    from atom.models.dspark_draft import draft_rope_kwargs
+    from atom.models.utils import is_neox_rope_style
+
+    def kwargs_fn(cfg):
+        # What `K3DSparkMLAAttention` passes.
+        neox = is_neox_rope_style(cfg, "rope_interleave", default_is_neox=False)
+        return draft_rope_kwargs(cfg, rope_type="deepseek_yarn", is_neox_style=neox)
+
     kw = kwargs_fn(_inferact_rope_cfg())
     assert kw == {
         "max_position": 1048576,

@@ -44,28 +44,35 @@ def linear_out(output):
     return output[0] if isinstance(output, tuple) else output
 
 
-def draft_rope_scaling(config) -> "tuple[float, dict | None]":
-    """The rope theta and YaRN scaling dict of a standalone draft's own config.
+def draft_rope_kwargs(config, *, is_neox_style: bool, rope_type=None) -> dict:
+    """`get_rope` arguments from a standalone draft's OWN config.
 
     A draft is trained with its own rope, not the target's, and the context
-    rows it writes are rotated with it, so both must be read from the draft
-    config. The scaling dict is ``None`` for a plain rope. Only the parsing is
-    shared: the rope type, neox style and any attention-scale correction are
-    the caller's, because they differ between drafts and a wrong one loads
-    clean.
+    rows it writes are rotated with it, so it must be read from the draft
+    config: the target's loads clean, so nothing would catch the draft
+    inheriting it. The neox style and, for YaRN, the ``rope_type`` are the
+    caller's, because they differ between drafts. ``rope_scaling`` is ``None``
+    for a plain rope.
     """
     rope_params = dict(getattr(config, "rope_parameters", None) or {})
     rope_theta = rope_params.get("rope_theta") or getattr(config, "rope_theta", 10000.0)
     use_yarn = rope_params.get("rope_type") in ("yarn", "deepseek_yarn") or (
         rope_params.get("factor", 1.0) not in (1.0, None)
     )
-    if not use_yarn:
-        return rope_theta, None
-    rope_scaling = dict(rope_params)
-    rope_scaling.setdefault(
-        "original_max_position_embeddings", config.max_position_embeddings
-    )
-    return rope_theta, rope_scaling
+    rope_scaling = None
+    if use_yarn:
+        rope_scaling = dict(rope_params)
+        if rope_type is not None:
+            rope_scaling["rope_type"] = rope_type
+        rope_scaling.setdefault(
+            "original_max_position_embeddings", config.max_position_embeddings
+        )
+    return {
+        "max_position": config.max_position_embeddings,
+        "base": rope_theta,
+        "rope_scaling": rope_scaling,
+        "is_neox_style": is_neox_style,
+    }
 
 
 class DSparkMarkovHead(nn.Module):

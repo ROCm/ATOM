@@ -87,7 +87,7 @@ from atom.models.deepseek_v2 import _fuse_rmsnorm_quant, yarn_get_mscale
 from atom.models.dspark_draft import (
     DSparkDraftModel,
     DSparkMarkovHead,
-    draft_rope_scaling,
+    draft_rope_kwargs,
     linear_out,
 )
 from atom.models.kimi_k3 import _RMS_FUSABLE_QUANT_TYPES
@@ -107,26 +107,6 @@ def _dspark_block_width(draft_config, atom_config) -> int:
     spec_config = getattr(atom_config, "speculative_config", None)
     num_spec = getattr(spec_config, "num_speculative_tokens", None)
     return int(num_spec or getattr(draft_config, "dspark_block_size", 0) or 0)
-
-
-def _draft_rope_kwargs(config) -> dict:
-    """`get_rope` arguments from the DRAFT's own config, never the target's.
-
-    YaRN here is DeepSeek's MLA variant, and the rope is DeepSeek's MLA
-    rope: interleaved when unspecified; rope_interleave=true is that same
-    interleaved rope.
-    """
-    rope_theta, rope_scaling = draft_rope_scaling(config)
-    if rope_scaling is not None:
-        rope_scaling["rope_type"] = "deepseek_yarn"
-    return {
-        "max_position": config.max_position_embeddings,
-        "base": rope_theta,
-        "rope_scaling": rope_scaling,
-        "is_neox_style": is_neox_rope_style(
-            config, "rope_interleave", default_is_neox=False
-        ),
-    }
 
 
 class K3DSparkMLAAttention(nn.Module):
@@ -236,13 +216,21 @@ class K3DSparkMLAAttention(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
 
-        # The softmax scale takes the YaRN mscale^2 correction, as the MLA
-        # target's does.
-        rope_kwargs = _draft_rope_kwargs(config)
+        # DeepSeek's MLA YaRN and rope: interleaved when unspecified;
+        # rope_interleave=true is that same interleaved rope.
+        rope_kwargs = draft_rope_kwargs(
+            config,
+            rope_type="deepseek_yarn",
+            is_neox_style=is_neox_rope_style(
+                config, "rope_interleave", default_is_neox=False
+            ),
+        )
         rope_scaling = rope_kwargs["rope_scaling"]
         self.rotary_emb = get_rope(
             self.qk_rope_head_dim, rotary_dim=self.qk_rope_head_dim, **rope_kwargs
         )
+        # The softmax scale takes the YaRN mscale^2 correction, as the MLA
+        # target's does.
         if rope_scaling:
             mscale = yarn_get_mscale(
                 float(rope_scaling["factor"]),
