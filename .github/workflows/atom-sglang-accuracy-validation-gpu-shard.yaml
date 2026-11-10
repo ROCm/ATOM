@@ -22,6 +22,9 @@ on:
 jobs:
   sglang-model-accuracy:
     name: SGLANG Model Accuracy (${{ matrix.model_name }})
+    # Defense-in-depth: current callers are schedule/workflow_dispatch only.
+    # Keep forked PRs off these self-hosted runners if a PR caller is added later.
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(inputs.model_matrix_json) }}

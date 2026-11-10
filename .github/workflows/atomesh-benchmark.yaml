@@ -554,7 +554,9 @@ jobs:
   rdma-smoke-test:
     name: Mooncake RDMA smoke test
     needs: [load-config]
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.suite == 'smoke' }}
+    # Defense-in-depth: the current smoke path is workflow_dispatch-only.
+    # Keep forked PRs off ATOMesh self-hosted runners if that changes later.
+    if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && github.event_name == 'workflow_dispatch' && inputs.suite == 'smoke' }}
     runs-on: ${{ inputs.atomesh_slurm_submit_runner }}
     timeout-minutes: 75
     env:
