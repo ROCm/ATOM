@@ -3,11 +3,15 @@
 
 import argparse
 import random
+
 from transformers import AutoTokenizer
 
 from atom import SamplingParams
 from atom.model_engine.arg_utils import EngineArgs
+from atom.utils import envs
 from atom.utils.arg_parser import FlexibleArgumentParser
+
+DEFAULT_PROFILER_DIR = "./profiler_traces"
 
 parser = FlexibleArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
@@ -41,15 +45,36 @@ parser.add_argument(
 )
 
 
+def resolve_profiler_dir(cli_value: str | None) -> tuple[str, str | None]:
+    """Resolve the trace directory, and the notice to print when it was not given.
+
+    The precedence is the one every other entry point uses: an explicit value,
+    then ``ATOM_TORCH_PROFILER_DIR`` (where empty reads as unset), then this
+    example's own ``./profiler_traces``. It ends with a directory rather than
+    ``None`` because the example always profiles; an empty
+    ``--torch-profiler-dir`` counts as not given, like an empty environment
+    value.
+    """
+    if cli_value:
+        return cli_value, None
+    env_dir = envs.ATOM_TORCH_PROFILER_DIR
+    if env_dir is not None:
+        return env_dir, (
+            "Warning: --torch-profiler-dir not specified, using "
+            f"ATOM_TORCH_PROFILER_DIR: {env_dir}"
+        )
+    return DEFAULT_PROFILER_DIR, (
+        "Warning: --torch-profiler-dir not specified and "
+        f"ATOM_TORCH_PROFILER_DIR unset, using default: {DEFAULT_PROFILER_DIR}"
+    )
+
+
 def main():
     args = parser.parse_args()
 
-    # Set default torch_profiler_dir to current directory if not provided
-    if args.torch_profiler_dir is None:
-        args.torch_profiler_dir = "./profiler_traces"
-        print(
-            "Warning: --torch-profiler-dir not specified, using default: ./profiler_traces"
-        )
+    args.torch_profiler_dir, notice = resolve_profiler_dir(args.torch_profiler_dir)
+    if notice is not None:
+        print(notice)
 
     print("\nInitializing LLM engine...")
     engine_args = EngineArgs.from_cli_args(args)

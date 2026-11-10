@@ -2,6 +2,7 @@
 # Tests for atom/utils/envs.py — lazy env var evaluation
 
 import logging
+from pathlib import Path
 
 import pytest
 
@@ -29,6 +30,9 @@ _ATOM_ENV_VARS = [
     "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT",
     "ATOM_USE_MODEL_SENSITIVE_RMSNORM",
     "ATOM_TORCH_PROFILER_DIR",
+    "ATOM_ONLINE_QUANT_INFO_DIR",
+    "ATOM_ENGRAM_CACHE_DIR",
+    "ATOM_RTL_TRACE_DIR",
     "ATOM_ENABLE_METRICS_DEVICE_TIMER",
     "ATOM_METRICS_UPDATE_INTERVAL_S",
     "ATOM_SHUTDOWN_TIMEOUT_S",
@@ -110,6 +114,17 @@ class TestEnvsDefaults:
     def test_torch_profiler_dir_default(self):
         assert _get_envs().ATOM_TORCH_PROFILER_DIR is None
 
+    def test_online_quant_info_dir_default(self):
+        assert _get_envs().ATOM_ONLINE_QUANT_INFO_DIR is None
+
+    def test_engram_cache_dir_default(self):
+        assert _get_envs().ATOM_ENGRAM_CACHE_DIR == str(
+            Path.home() / ".cache" / "atom" / "engram"
+        )
+
+    def test_rtl_trace_dir_default(self):
+        assert _get_envs().ATOM_RTL_TRACE_DIR is None
+
     def test_metrics_device_timer_default_disabled(self):
         assert _get_envs().ATOM_ENABLE_METRICS_DEVICE_TIMER is False
 
@@ -189,6 +204,54 @@ class TestEnvsOverrides:
     def test_torch_profiler_dir_override(self, monkeypatch):
         monkeypatch.setenv("ATOM_TORCH_PROFILER_DIR", "/tmp/prof")
         assert _get_envs().ATOM_TORCH_PROFILER_DIR == "/tmp/prof"
+
+    def test_empty_torch_profiler_dir_reads_as_unset(self, monkeypatch):
+        # `VAR=` is how a launcher clears it inline. Handing "" to Config would
+        # abort startup on os.makedirs("") instead.
+        monkeypatch.setenv("ATOM_TORCH_PROFILER_DIR", "")
+        assert _get_envs().ATOM_TORCH_PROFILER_DIR is None
+
+    def test_online_quant_info_dir_override(self, monkeypatch):
+        monkeypatch.setenv("ATOM_ONLINE_QUANT_INFO_DIR", "/tmp/oq")
+        assert _get_envs().ATOM_ONLINE_QUANT_INFO_DIR == "/tmp/oq"
+
+    @pytest.mark.parametrize("value", [None, ""])
+    def test_online_quant_info_dir_falls_back_to_profiler_dir(self, monkeypatch, value):
+        # The dump lived under ATOM_TORCH_PROFILER_DIR before it had a knob of
+        # its own; unset or empty keeps landing there.
+        if value is not None:
+            monkeypatch.setenv("ATOM_ONLINE_QUANT_INFO_DIR", value)
+        monkeypatch.setenv("ATOM_TORCH_PROFILER_DIR", "/tmp/prof")
+        assert _get_envs().ATOM_ONLINE_QUANT_INFO_DIR == "/tmp/prof"
+
+    def test_online_quant_info_dir_beats_profiler_dir(self, monkeypatch):
+        monkeypatch.setenv("ATOM_ONLINE_QUANT_INFO_DIR", "/tmp/oq")
+        monkeypatch.setenv("ATOM_TORCH_PROFILER_DIR", "/tmp/prof")
+        assert _get_envs().ATOM_ONLINE_QUANT_INFO_DIR == "/tmp/oq"
+
+    def test_online_quant_info_dir_ignores_empty_profiler_dir(self, monkeypatch):
+        monkeypatch.setenv("ATOM_TORCH_PROFILER_DIR", "")
+        assert _get_envs().ATOM_ONLINE_QUANT_INFO_DIR is None
+
+    def test_engram_cache_dir_override(self, monkeypatch):
+        monkeypatch.setenv("ATOM_ENGRAM_CACHE_DIR", "/tmp/engram")
+        assert _get_envs().ATOM_ENGRAM_CACHE_DIR == "/tmp/engram"
+
+    def test_empty_engram_cache_dir_reads_as_its_default(self, monkeypatch):
+        # Path("") is the working directory, so an empty value would otherwise
+        # drop the compressed-vocab cache beside wherever the server started.
+        monkeypatch.setenv("ATOM_ENGRAM_CACHE_DIR", "")
+        assert _get_envs().ATOM_ENGRAM_CACHE_DIR == str(
+            Path.home() / ".cache" / "atom" / "engram"
+        )
+
+    def test_rtl_trace_dir_override(self, monkeypatch):
+        monkeypatch.setenv("ATOM_RTL_TRACE_DIR", "/tmp/rtl")
+        assert _get_envs().ATOM_RTL_TRACE_DIR == "/tmp/rtl"
+
+    def test_empty_rtl_trace_dir_reads_as_unset(self, monkeypatch):
+        monkeypatch.setenv("ATOM_RTL_TRACE_DIR", "")
+        assert _get_envs().ATOM_RTL_TRACE_DIR is None
 
     def test_profiler_more_enabled(self, monkeypatch):
         monkeypatch.setenv("ATOM_PROFILER_MORE", "1")
