@@ -17,14 +17,6 @@ from typing import NamedTuple
 
 import numpy as np
 import torch
-from aiter.jit.utils.chip_info import get_gfx
-
-try:
-    from aiter.ops.opus.pa_mqa_logits_mxfp4 import mqa_logits_mxfp4_lane_max_elems
-except ImportError:
-    # An aiter whose scorer writes no lane maxima: none are allocated, and the
-    # scorer and top-k are called as before.
-    mqa_logits_mxfp4_lane_max_elems = None
 
 from atom.model_ops.sparse_indexer_chunk import (
     LogitsWorkspace,
@@ -95,6 +87,21 @@ class PackedRows(NamedTuple):
     bands: tuple[tuple[int, int], ...]
 
 
+def _lane_max_elems():
+    """aiter's lane-maxima sizing where this chip's OPUS scorer writes them,
+    else None. Imported on use: a non-GPU install has no `aiter.jit`, and an
+    older aiter's scorer writes no lane maxima (the scorer and top-k are then
+    called as before)."""
+    try:
+        from aiter.jit.utils.chip_info import get_gfx
+        from aiter.ops.opus.pa_mqa_logits_mxfp4 import (
+            mqa_logits_mxfp4_lane_max_elems,
+        )
+    except ImportError:
+        return None
+    return mqa_logits_mxfp4_lane_max_elems if get_gfx() == "gfx1250" else None
+
+
 class ScoreWorkspace(LogitsWorkspace):
     """The scorer's logits plane (`LogitsWorkspace`) and each ratio's tile
     table, at their largest, and the row starts of one-row sequences. The FP4 plane has no tile tables:
@@ -162,15 +169,15 @@ class ScoreWorkspace(LogitsWorkspace):
         )
         # The packed logits' lane maxima, which gfx1250's OPUS scorer writes
         # beside them for the top-k of the same band (`packed_lane_max`).
+        # Allocated here with the rest, so the memory profile counts them.
+        lane_max_elems = _lane_max_elems() if self.packed else None
         self._lane_max = (
             torch.empty(
-                mqa_logits_mxfp4_lane_max_elems(self.capacity, max_tokens),
+                lane_max_elems(self.capacity, max_tokens),
                 dtype=torch.float32,
                 device=device,
             )
-            if self.packed
-            and get_gfx() == "gfx1250"
-            and mqa_logits_mxfp4_lane_max_elems is not None
+            if lane_max_elems is not None
             else None
         )
         self._row_starts = torch.arange(
