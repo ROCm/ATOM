@@ -602,7 +602,113 @@ def test_prefix_spread_keeps_prefix_owner_without_a_backlog():
     assert _route(mgr, [second]) == [owner]
     assert _count(mgr, "prefix_owner_total") == 1
     # Only the uncached extension is charged as prefill debt.
-    assert mgr._seq_load[2][2] == 110_000 - 98_304
+    assert mgr._seq_load[2][2] == 110_000 - 99_968
+
+
+def test_short_prefix_keeps_affinity_even_below_the_load_threshold():
+    mgr = _make_spread_mgr()
+    (owner,) = _route(mgr, [_chain_seq(1, 2048)])
+    mgr._mark_seq_prefill_complete(1)
+    mgr._rank_tokens = [0, 0]
+    mgr._rank_tokens[owner] = 30_000
+    follower = _chain_seq(2, 3072)
+    assert _route(mgr, [follower]) == [owner]
+    assert _est(mgr, follower) == 2048
+    assert mgr._seq_load[follower.id][2] == 1024
+
+
+@pytest.mark.parametrize("minimum,moved", [(3072, 3072), (3073, 0), (4096, 0)])
+def test_small_missing_prefix_still_places_on_the_idle_partial_holder(minimum, moved):
+    from atom.kv_transfer.disaggregation.factory import OffloadTierProfile
+
+    mgr = _make_spread_mgr(tier=OffloadTierProfile(True, minimum, 512))
+    for seq_id, rank, length in ((1, 1, 13312), (2, 0, 16384)):
+        warm = _chain_seq(seq_id, length)
+        mgr._prefix_router.place(warm, rank, 2)
+        mgr._charge_seq_load_locked(warm, rank)
+        mgr._mark_seq_prefill_complete(seq_id)
+    mgr._rank_tokens = [200_000, 0]
+    request = _chain_seq(3, 16512)
+    assert _route(mgr, [request]) == [1]
+    assert _est(mgr, request) == 13312 + moved
+    assert mgr._seq_load[request.id][2] == 16512 - 13312 - moved
+    assert _count(mgr, "prefix_moved_tokens") == moved
+
+
+@pytest.mark.parametrize("minimum,moved", [(4095, 4096), (4096, 4096), (4097, 0)])
+def test_transfer_threshold_applies_to_the_chunk_aligned_difference(minimum, moved):
+    from atom.kv_transfer.disaggregation.factory import OffloadTierProfile
+
+    mgr = _make_spread_mgr(tier=OffloadTierProfile(True, minimum, 512))
+    for seq_id, rank, length in ((1, 1, 12288), (2, 0, 16384)):
+        warm = _chain_seq(seq_id, length)
+        mgr._prefix_router.place(warm, rank, 2)
+        mgr._charge_seq_load_locked(warm, rank)
+        mgr._mark_seq_prefill_complete(seq_id)
+    mgr._rank_tokens = [200_000, 0]
+    request = _chain_seq(3, 16512)
+    assert _route(mgr, [request]) == [1]
+    assert _est(mgr, request) == 12288 + moved
+    assert _count(mgr, "prefix_moved_tokens") == moved
+
+
+def test_prefix_credit_is_not_rounded_to_the_old_sampling_interval():
+    mgr = _make_spread_mgr()
+    (owner,) = _route(mgr, [_chain_seq(1, 12000)])
+    mgr._mark_seq_prefill_complete(1)
+    mgr._rank_tokens = [0, 0]
+    request = _chain_seq(2, 12544)
+    assert _route(mgr, [request]) == [owner]
+    # Complete 128-token hash blocks cover 11904 tokens, not 8192.
+    assert _est(mgr, request) == 11904
+
+
+def test_history_eviction_preserves_a_producers_follower_debt():
+    mgr = _make_spread_mgr()
+    router = mgr._prefix_router
+    router.CAP = 32
+    producer = _chain_seq(1, 4096)
+    router.place(producer, 0, 2)
+    mgr._charge_seq_load_locked(producer, 0)
+    follower = _chain_seq(2, 4224)
+    mgr._rank_tokens[1] = 40_000
+    assert _route(mgr, [follower]) == [0]
+    assert _est(mgr, follower) == 4096
+    unrelated = _chain_seq(3, 8192, first_block=10000)
+    router.place(unrelated, 1, 2)
+    mgr._charge_seq_load_locked(unrelated, 1)
+    mgr._mark_seq_prefill_complete(unrelated.id)
+    assert len(router.index) == router.CAP
+    assert not set(producer.prompt_hash_chain.hashes).intersection(router.index)
+    mgr._release_seq(producer.id)
+    assert _est(mgr, follower) == 0
+    assert mgr._seq_load[follower.id][2] == 4224
+    mgr._release_seq(producer.id)
+    assert mgr._seq_load[follower.id][2] == 4224
+    mgr._mark_seq_prefill_complete(follower.id)
+    assert not router.pending
+
+
+def test_reindexing_an_evicted_prefix_keeps_its_inflight_producer():
+    mgr = _make_spread_mgr()
+    router = mgr._prefix_router
+    router.CAP = 32
+    producer = _chain_seq(1, 4096)
+    router.place(producer, 0, 2)
+    mgr._charge_seq_load_locked(producer, 0)
+    unrelated = _chain_seq(2, 8192, first_block=10000)
+    router.place(unrelated, 1, 2)
+    mgr._charge_seq_load_locked(unrelated, 1)
+    mgr._mark_seq_prefill_complete(unrelated.id)
+    newcomer = _chain_seq(3, 4096)
+    router.place(newcomer, 0, 2)
+    mgr._charge_seq_load_locked(newcomer, 0)
+    assert all(holders[0] == producer.id for holders in router.index.values())
+    mgr._release_seq(newcomer.id)
+    assert all(holders[0] == producer.id for holders in router.index.values())
+    mgr._release_seq(producer.id)
+    assert not router.pending
+    assert not router.seq_hashes
 
 
 def test_prefix_spread_ignores_sessions_for_new_prefixes():
@@ -707,7 +813,7 @@ def test_prefix_spread_charges_full_prompt_when_a_moved_hit_is_not_loaded():
     mgr._rank_reqs = [0, 0]
     stay = _chain_seq(3, 5_000)
     assert _route(mgr, [stay]) == [rank]
-    assert mgr._seq_load[3][2] == 5_000 - 4_096
+    assert mgr._seq_load[3][2] == 5_000 - 4_992
 
 
 def test_prefix_spread_moves_only_to_an_idle_rank():
@@ -754,8 +860,8 @@ def test_idle_ratio_prefers_idle_rank_holding_part_of_the_prefix():
     seq = _chain_seq(3, 110_000)
     (rank,) = _route(mgr, [seq])
     assert rank == 2  # 4k above the lightest, holds 48k of the prefix
-    assert _est(mgr, seq) == 98_304  # 48k local + 48k loaded from the tier
-    assert _count(mgr, "prefix_moved_tokens") == 98_304 - 49_152
+    assert _est(mgr, seq) == 99_968  # Local prefix plus transferable remainder.
+    assert _count(mgr, "prefix_moved_tokens") == 99_968 - 49_152
 
 
 def test_idle_ratio_load_wins_over_a_partial_prefix():
@@ -845,7 +951,7 @@ def test_an_aborted_move_leaves_no_hit_on_its_destination():
     hits, _, _ = mgr._prefix_router._rank_hits(
         _chain_seq(9, 100_000).prompt_hash_chain, 2
     )
-    assert hits.get(other) == 98_304
+    assert hits.get(other) == 99_968
 
 
 def test_a_producer_abort_hands_the_prefix_and_debt_to_its_follower():
@@ -855,13 +961,13 @@ def test_a_producer_abort_hands_the_prefix_and_debt_to_its_follower():
     mgr._rank_tokens[other] = 40_000
     follower = _chain_seq(2, 110_000)
     assert _route(mgr, [follower]) == [owner]
-    assert _est(mgr, follower) == 98_304
+    assert _est(mgr, follower) == 99_968
     mgr._release_seq(1)
     assert mgr._seq_load[2][2] == 110_000
     assert mgr._rank_tokens[owner] == 110_000
     router = mgr._prefix_router
     hits, src_owner, source = router._rank_hits(follower.prompt_hash_chain, 2)
-    assert src_owner == owner and source == 2 and hits[owner] == 106_496
+    assert src_owner == owner and source == 2 and hits[owner] == 109_952
     assert router.pending
     mgr._release_seq(1)  # repeated producer release cannot charge twice
     assert mgr._rank_tokens[owner] == 110_000
@@ -869,7 +975,7 @@ def test_a_producer_abort_hands_the_prefix_and_debt_to_its_follower():
     assert not router.pending
     mgr._release_seq(2)
     assert mgr._rank_tokens[owner] == 0
-    assert router._rank_hits(follower.prompt_hash_chain, 2)[0][owner] == 106_496
+    assert router._rank_hits(follower.prompt_hash_chain, 2)[0][owner] == 109_952
 
 
 def test_an_aborted_move_does_not_replace_a_local_prefill_producer():
@@ -958,7 +1064,7 @@ def test_an_abort_racing_the_first_stream_keeps_the_prefix():
     hits, src_owner, _ = mgr._prefix_router._rank_hits(
         _chain_seq(9, 100_000).prompt_hash_chain, 2
     )
-    assert src_owner == owner and hits[owner] == 98_304
+    assert src_owner == owner and hits[owner] == 99_968
     assert mgr._rank_reqs == [0, 0] and mgr._rank_tokens == [0, 0]
 
 
@@ -1116,7 +1222,7 @@ def test_a_terminal_output_completes_the_prefill_only_after_forward():
     hits, src_owner, _ = mgr._prefix_router._rank_hits(
         _chain_seq(9, 100_000).prompt_hash_chain, 2
     )
-    assert src_owner == owner and hits[owner] == 98_304
+    assert src_owner == owner and hits[owner] == 99_968
     assert mgr._rank_reqs == [0, 0] and mgr._rank_tokens == [0, 0]
 
 
@@ -1132,12 +1238,12 @@ def test_an_explicit_rank_indexes_the_prefix_it_lands():
     follower = _chain_seq(2, 110_000)
     assert _route(mgr, [follower]) == [1]
     assert _count(mgr, "prefix_owner_total") == 1
-    assert _est(mgr, follower) == 98_304
+    assert _est(mgr, follower) == 99_968
     # A second pinned request credits what that rank holds, as a kept one.
     again = _chain_seq(3, 100_000)
     again.data_parallel_rank = 1
     _route(mgr, [again])
-    assert _est(mgr, again) == 98_304
+    assert _est(mgr, again) == 99_968
 
 
 def test_reset_removes_provisional_holders_but_keeps_completed():

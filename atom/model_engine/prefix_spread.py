@@ -5,7 +5,8 @@
 
 A request stays on the rank holding its prompt's prefix, unless that rank has a
 prefill backlog while another rank is about to run out of prefill work; then it
-goes to that idle rank, which loads the prefix from the offload tier.
+goes to that idle rank, reusing its local prefix and loading the missing part
+from the offload tier only when it clears the tier's minimum load threshold.
 `CoreManager` owns the per-rank load counters and calls into this router with
 them under its lock.
 """
@@ -35,9 +36,9 @@ class Route(NamedTuple):
 class PrefixSpreadRouter:
     """Prefix ownership index, in-flight prefill state and the placement rule."""
 
-    # Sampled prefix hashes, `STRIDE_TOKENS` apart: 2^17 entries cover 512M
-    # tokens of prefix history.
-    STRIDE_TOKENS = 4096
+    # Index every complete frontend hash block. The transfer threshold applies
+    # to missing tier tokens, not to prefix discovery or prompt length. CAP
+    # bounds hash entries; the token history it covers depends on block size.
     CAP = 1 << 17
 
     # Route counters `select` returns, for `CoreManager`'s route statistics and
@@ -58,7 +59,7 @@ class PrefixSpreadRouter:
         # hold from an offload tier. Without one a moved request recomputes
         # what it does not hold.
         self.tier = tier
-        # Sampled prompt-block hash -> {rank: request whose prefill puts that
+        # Prompt-block hash -> {rank: request whose prefill puts that
         # part on the rank}; most recent last.
         self.index: OrderedDict[int, dict] = OrderedDict()
         # seq id -> (rank, hashes whose entry it relies on before its prefill
@@ -149,7 +150,8 @@ class PrefixSpreadRouter:
           some request finished prefilling (`_tier_hit`). If the request
           computing the prefix is still prefilling and no shorter copy is
           finished, the tier has nothing and the request is charged everything
-          but the target's own part.
+          but the target's own part. A load below the minimum also keeps this
+          target: it reuses its own part and recomputes the missing prefix.
         - Otherwise the owner. While the prefix's source is still prefilling
           this is what lets the request reuse it from HBM.
         """
@@ -160,7 +162,7 @@ class PrefixSpreadRouter:
             self._record(chain, rank, seq.id, 0)
             return Route(rank, "prefix_cold_total")
 
-        # An owner is a rank holding a sampled part, so `hit` > 0.
+        # An owner is a rank holding a complete hash block, so `hit` > 0.
         hit = hits[owner]
         rank = owner
         if (
@@ -236,12 +238,11 @@ class PrefixSpreadRouter:
 
     def _tier_hit(self, chain, hit: int) -> int:
         """How much of this prompt's first `hit` tokens the tier has: the
-        longest sampled part that some request finished prefilling, on any
-        rank. The newest holder at the full length (the owner's) may still be
+        longest block-aligned part that some request finished prefilling, on
+        any rank. The newest holder at the full length (the owner's) may still be
         prefilling while an older, shorter copy elsewhere is already there."""
         hbs = int(chain.hash_block_size)
-        stride = max(1, self.STRIDE_TOKENS // hbs)
-        for i in range(hit // hbs - 1, -1, -stride):
+        for i in range(hit // hbs - 1, -1, -1):
             holders = self.index.get(chain.hashes[i])
             if holders is not None and any(
                 seq_id not in self._in_flight for seq_id in holders.values()
@@ -250,7 +251,7 @@ class PrefixSpreadRouter:
         return 0
 
     def _rank_hits(self, chain, n: int):
-        """Per rank, the longest sampled prefix of this prompt it holds.
+        """Per rank, the longest block-aligned prefix of this prompt it holds.
 
         Returns ({rank: tokens}, owner, source): the owner is the rank with the
         longest prefix (on a tie, the one that recorded or confirmed it last:
@@ -261,11 +262,10 @@ class PrefixSpreadRouter:
         if chain is None or not self.index:
             return {}, None, None
         hbs = int(chain.hash_block_size)
-        stride = max(1, self.STRIDE_TOKENS // hbs)
         hashes = chain.hashes
         hits: dict[int, int] = {}
         owner, source = None, None
-        for i in range((len(hashes) // stride) * stride - 1, -1, -stride):
+        for i in range(len(hashes) - 1, -1, -1):
             holders = self.index.get(hashes[i])
             if not holders:
                 continue
@@ -286,7 +286,7 @@ class PrefixSpreadRouter:
         return hits, owner, source
 
     def _record(self, chain, rank: int, seq_id, hit: int) -> None:
-        """Record that `rank` holds this prompt's sampled prefix.
+        """Record that `rank` holds this prompt's complete hash blocks.
 
         Each entry names the request whose prefill puts that part on the rank:
         `seq_id` for the part it computes or loads from the tier; for the part
@@ -299,16 +299,20 @@ class PrefixSpreadRouter:
         if chain is None:
             return
         hbs = int(chain.hash_block_size)
-        stride = max(1, self.STRIDE_TOKENS // hbs)
         index, pending = self.index, self.pending
         relied = []
-        for i in range(stride - 1, len(chain.hashes), stride):
-            h = chain.hashes[i]
+        for i, h in enumerate(chain.hashes):
             holders = index.get(h)
             if holders is None:
                 holders = index[h] = {}
             else:
                 index.move_to_end(h)
+            # History eviction must not erase an in-flight producer or the
+            # credit its followers borrowed. Restore that rank's producer
+            # from the separate lifecycle record if this hash is indexed again.
+            waiters = pending.get((h, rank))
+            if rank not in holders and waiters:
+                holders[rank] = next(iter(waiters))
             reused = (i + 1) * hbs <= hit
             had = rank in holders
             if (
@@ -341,21 +345,21 @@ class PrefixSpreadRouter:
             key = (h, rank)
             if not had or not reused:
                 pending.setdefault(key, {})[seq_id] = None
-                relied.append((h, (i + 1 - stride) * hbs))
+                relied.append((h, i * hbs))
             elif key in pending:
                 pending[key][seq_id] = None
-                relied.append((h, (i + 1 - stride) * hbs))
+                relied.append((h, i * hbs))
         if relied:
             self.seq_hashes[seq_id] = (rank, relied)
         while len(index) > self.CAP:
-            old, holders = index.popitem(last=False)
-            for r in holders:
-                pending.pop((old, r), None)
+            index.popitem(last=False)
+            # pending/seq_hashes are active request lifecycle records, not
+            # cached history. Completion, cancellation or reset releases them.
 
     def _left_unprefilled(self, seq_id) -> dict:
         """`seq_id` left before its prefill completed (abort, reject, failed
         send). Hand provisional entries to the oldest remaining waiter on
-        that rank. Its credited prefix above the first lost sampled block
+        that rank. Its credited prefix above the first lost hash block
         becomes conservative prefill debt; CoreManager applies it under the
         same lock as this handoff."""
         charges: dict = {}
@@ -368,14 +372,20 @@ class PrefixSpreadRouter:
             waiters = self.pending.get(key)
             if waiters is None:
                 continue
-            waiters.pop(seq_id, None)
             holders = self.index.get(h)
-            produced = holders is not None and holders.get(rank) == seq_id
+            # The first waiter is the producer even when CAP evicted the
+            # routing entry. Later waiters borrowed its prefix credit.
+            producer = holders.get(rank) if holders is not None else None
+            if producer is None:
+                producer = next(iter(waiters))
+            produced = producer == seq_id
+            waiters.pop(seq_id, None)
             if waiters and not produced:
                 continue
-            if waiters and holders is not None:
+            if waiters:
                 successor = next(iter(waiters))
-                holders[rank] = successor
+                if holders is not None:
+                    holders[rank] = successor
                 credited = self._in_flight.get(successor, 0)
                 retained = min(credited, start)
                 if retained < credited:
