@@ -227,8 +227,8 @@ def _flydsl_explicit_plan_api() -> bool:
         # By module path: aiter.ops.flydsl lazily exports a `pa_decode`
         # function, which `from aiter.ops.flydsl import pa_decode` can return.
         mod = importlib.import_module("aiter.ops.flydsl.pa_decode")
-    except ImportError:
-        ok, sig = False, None
+    except ImportError as e:
+        ok, detail = False, f"import failed: {e}"
     else:
         sig = inspect.signature(mod.pa_decode)
         plan = sig.parameters.get("work_plan")
@@ -238,6 +238,7 @@ def _flydsl_explicit_plan_api() -> bool:
             and plan.kind is inspect.Parameter.KEYWORD_ONLY
             and "max_context_length" in sig.parameters
         )
+        detail = f"pa_decode{sig}"
     if not ok:
         fallback = (
             "using gluon"
@@ -246,8 +247,8 @@ def _flydsl_explicit_plan_api() -> bool:
         )
         logger.warning(
             "FlyDSL paged decode is enabled but aiter lacks the #5809 explicit-plan "
-            "decode API (pa_decode signature: %s); %s.",
-            sig,
+            "decode API (%s); %s.",
+            detail,
             fallback,
         )
     return ok

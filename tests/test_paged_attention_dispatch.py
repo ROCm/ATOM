@@ -1288,7 +1288,10 @@ class TestExplicitPlan:
         def other_default(output, *a, work_plan=..., max_context_length=None):
             raise AssertionError("not called")
 
-        def pre_5809(output, query, work_plan=None):
+        def positional_plan(output, work_plan=None, max_context_length=None):
+            raise AssertionError("not called")
+
+        def no_plan(output, *a, max_context_length=None):
             raise AssertionError("not called")
 
         def no_bound(output, *a, work_plan, sinks=None):
@@ -1298,7 +1301,8 @@ class TestExplicitPlan:
             (required, True),
             (optional_none, True),
             (other_default, True),
-            (pre_5809, False),
+            (positional_plan, False),
+            (no_plan, False),
             (no_bound, False),
         )
         try:
@@ -1306,6 +1310,10 @@ class TestExplicitPlan:
                 monkeypatch.setattr(mod, "pa_decode", fake)
                 ba._flydsl_explicit_plan_api.cache_clear()
                 assert ba._flydsl_explicit_plan_api() is expected, fake.__name__
+            monkeypatch.setattr(mod, "pa_decode", required)
+            monkeypatch.delattr(mod, "plan_pa_decode")
+            ba._flydsl_explicit_plan_api.cache_clear()
+            assert ba._flydsl_explicit_plan_api() is False, "no plan_pa_decode"
         finally:
             monkeypatch.undo()
             ba._flydsl_explicit_plan_api.cache_clear()
