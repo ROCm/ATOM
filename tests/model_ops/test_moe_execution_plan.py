@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 """Exercise real MoE entry points with only the GPU/collective boundaries mocked."""
 
+from dataclasses import asdict, replace
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -25,12 +26,15 @@ def _plan(backend="standard", all2all="none"):
     )
 
 
-@pytest.mark.parametrize("backend, gather", [("standard", True), ("mega", False)])
+@pytest.mark.parametrize(
+    "backend, all2all, gather",
+    [("standard", "none", True), ("standard", "auto", False), ("mega", "none", False)],
+)
 def test_forward_uses_plan_for_dp_collectives(
-    monkeypatch, atom_modules, backend, gather
+    monkeypatch, atom_modules, backend, all2all, gather
 ):
     moe = atom_modules.moe
-    plan = _plan(backend)
+    plan = _plan(backend, all2all)
     x = torch.arange(12).reshape(3, 4).float()
     w = torch.ones(3, 1)
     ids = torch.zeros(3, 1, dtype=torch.int32)
@@ -41,7 +45,7 @@ def test_forward_uses_plan_for_dp_collectives(
             select_experts=Mock(return_value=(w, ids)), routed_rows_wire=None
         ),
         _run_experts=run,
-        reduce_results=False,
+        reduce_results=True,
     )
     # A plugin may flatten DP without the native DP-attention flag. The plan
     # must still gather; conversely Mega must always receive only local rows.
@@ -53,6 +57,10 @@ def test_forward_uses_plan_for_dp_collectives(
     ctx = SimpleNamespace(context=SimpleNamespace(running_tokens_are_unified=True))
     monkeypatch.setattr(moe, "get_forward_context", lambda: ctx)
     monkeypatch.setattr(moe, "get_dp_group", lambda: object())
+    tp_reduce = Mock(side_effect=lambda out, **_: out)
+    monkeypatch.setattr(
+        moe, "get_tp_group", lambda: SimpleNamespace(all_reduce=tp_reduce)
+    )
     monkeypatch.setattr(moe, "tbo_active", lambda: False)
     gather_rows = Mock(
         side_effect=lambda rows, *_: (tuple(t.repeat(2, 1) for t in rows), 3, [3, 3])
@@ -68,6 +76,7 @@ def test_forward_uses_plan_for_dp_collectives(
     assert run.call_args.args[0].shape[0] == (6 if gather else 3)
     assert run.call_args.args[-1] is gather
     assert gather_rows.call_count == scatter.call_count == int(gather)
+    assert tp_reduce.call_count == int(gather)
 
 
 def test_mega_skips_standard_prepare_finalize(monkeypatch, atom_modules):
@@ -83,6 +92,20 @@ def test_mega_skips_standard_prepare_finalize(monkeypatch, atom_modules):
     )
     assert moe.FusedMoEMethodBase.maybe_make_prepare_finalize(method) is None
     build.assert_not_called()
+
+
+def test_parallel_facade_cannot_diverge_from_its_plan(atom_modules):
+    plan = _plan()
+    parallel = atom_modules.moe.FusedMoEParallelConfig(
+        **asdict(plan.mapping), requested_all2all_backend="none", execution_plan=plan
+    )
+    for overrides in (
+        {"ep_rank": 1},
+        {"low_latency": True},
+        {"requested_all2all_backend": "rccl"},
+    ):
+        with pytest.raises(ValueError, match="must agree with its execution plan"):
+            replace(parallel, **overrides)
 
 
 @pytest.mark.parametrize(

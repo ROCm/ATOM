@@ -230,6 +230,12 @@ class FusedMoEParallelConfig(MoEParallelMapping):
     execution_plan: MoEExecutionPlan | None = field(default=None, repr=False)
 
     def __post_init__(self):
+        mapping = MoEParallelMapping(
+            **{
+                name: getattr(self, name)
+                for name in MoEParallelMapping.__dataclass_fields__
+            }
+        )
         if self.execution_plan is None:
             # Direct construction remains available to external callers. The
             # normal worker path below supplies a plan from Config's snapshot.
@@ -241,14 +247,19 @@ class FusedMoEParallelConfig(MoEParallelMapping):
                     enable_low_latency=self.low_latency,
                 )
             )
-            mapping = MoEParallelMapping(
-                **{
-                    name: getattr(self, name)
-                    for name in MoEParallelMapping.__dataclass_fields__
-                }
-            )
             object.__setattr__(
                 self, "execution_plan", resolve_moe_execution_plan(mapping, backend)
+            )
+            object.__setattr__(
+                self, "requested_all2all_backend", backend.all2all_backend
+            )
+        elif mapping != self.execution_plan.mapping or (
+            self.requested_all2all_backend
+            != self.execution_plan.backend_config.all2all_backend
+            or self.low_latency != self.execution_plan.backend_config.low_latency
+        ):
+            raise ValueError(
+                "FusedMoEParallelConfig must agree with its execution plan"
             )
 
     @property
