@@ -128,3 +128,64 @@ def test_mono_block_scores_equal_the_aiter_nvfp4_scorer_bit_for_bit(
         mine.topk(k, dim=-1).indices.sort(-1).values,
         theirs.topk(k, dim=-1).indices.sort(-1).values,
     )
+
+
+def _row_store_launcher(n_tokens: int):
+    """A launch of ``nvfp4_row_store`` the way K1's index_k head task makes it: a
+    token a half wave, lane l holding elements 4 l .. 4 l + 3."""
+    import flydsl.compiler as flyc
+    import flydsl.expr as fx
+    from aiter.ops.flydsl.kernels import buffer_ops as bo
+    from flydsl.expr.typing import Int32, Int64, T
+
+    from atom.models.minimax_m3.mono.kernels.common import ld_bf16x4, nvfp4_row_store
+    from atom.mono.device.ops import rsrc
+
+    blocks = (n_tokens + 1) // 2
+
+    @flyc.kernel(name="mono_nvfp4_row_store_test", known_block_size=[64, 1, 1])
+    def kernel(rows: Int64, slots: Int64, cache: Int64, n: Int32):
+        tid = fx.thread_idx.x
+        tk = fx.block_idx.x * 2 + tid // 32
+        l32 = tid % 32
+        if tk < n:
+            slot = fx.Int32(
+                bo.buffer_load(rsrc(slots), 2 * tk, vec_width=1, dtype=T.i32)
+            )
+            vals = ld_bf16x4(rsrc(rows), tk * HEAD_DIM + l32 * 4)
+            if slot >= 0:
+                nvfp4_row_store(rsrc(cache), slot, vals, l32)
+
+    @flyc.jit
+    def launch(
+        rows: Int64,
+        slots: Int64,
+        cache: Int64,
+        n: Int32,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+    ):
+        kernel(rows, slots, cache, n).launch(grid=(blocks,), block=(64,), stream=stream)
+
+    return launch
+
+
+@pytest.mark.parametrize("scale", [1.0, 1e-3, 40.0, 600.0])
+def test_the_index_k_row_store_is_vllms_writer_byte_for_byte(scale):
+    _, ref = _reference_modules()
+    t, blocks = 61, 6
+    g = torch.Generator(device="cuda").manual_seed(3)
+    rows = (torch.randn(t, HEAD_DIM, device="cuda", generator=g) * scale).to(
+        torch.bfloat16
+    )
+    rows[3, :64] = 0  # whole groups of zeros: a zero scale
+    rows[5, 16:32] = 1e-7  # tiny: a subnormal-range scale
+    slots = torch.randperm(blocks * 128, device="cuda", generator=g)[:t].to(torch.int64)
+    slots[7] = -1
+    want = torch.zeros(blocks, 128, 72, device="cuda", dtype=torch.uint8)
+    ref.insert_nvfp4_index(want, rows, slots)
+    got = torch.zeros(blocks, NVFP4_PAGE_BYTES, device="cuda", dtype=torch.uint8)
+    _row_store_launcher(t)(rows.data_ptr(), slots.data_ptr(), got.data_ptr(), t)
+    torch.cuda.synchronize()
+    assert int((want != 0).sum()) > 1000  # not a vacuous comparison
+    bad = (got != want.view(blocks, -1)).nonzero()
+    assert bad.numel() == 0, f"{bad.shape[0]} bytes differ, first {bad[:6].tolist()}"
