@@ -2,7 +2,9 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import ctypes
+import dataclasses
 import gc
+import hashlib
 import inspect
 import logging
 import math
@@ -30,7 +32,7 @@ from aiter.dist.utils import get_distributed_init_method
 from torch.profiler import record_function
 
 from atom import structured_output
-from atom.config import Config, set_current_atom_config
+from atom.config import Config, local_device_index, set_current_atom_config
 from atom.distributed.group_agreement import group_min
 from atom.distributed.pcp_utils import (
     PcpBalGroup,
@@ -109,7 +111,7 @@ from atom.model_ops.required_channel import (
     advance_states,
     constrain_logits,
 )
-from atom.model_ops.sampler import SAMPLER_EPS, Sampler
+from atom.model_ops.sampler import SAMPLER_EPS, sampler_from_config
 from atom.models.registry import mono_decode_installers, support_model_arch_dict
 from atom.sampling_params import RequiredChannel
 from atom.spec_decode.drafter import Drafter
@@ -888,7 +890,7 @@ class ModelRunner:
             use_spec,
             self.num_spec_tokens,
         )
-        self.sampler = Sampler()
+        self.sampler = sampler_from_config(config)
         # Each `RequiredChannel` a batch has carried, as the kernels read it.
         self._device_channels: dict[RequiredChannel, DeviceChannel] = {}
         self.arange_np = np.arange(
@@ -1092,11 +1094,7 @@ class ModelRunner:
     def _setup_device_and_distributed(self, rank: int, config: Config):
         if sp_is_enabled():
             check_aiter_sp_api()
-        # Calculate local device rank considering DP, PP and PCP.
-        # On a single node the physical GPU index equals the global distributed
-        # rank in the DPxPPxPCPxTP layout: each EngineCore (one per (dp,pp)
-        # stage) owns a contiguous tp*pcp GPU slice. `rank` is this worker's
-        # local index (0..tp*pcp-1) within its stage.
+        # `rank` is this worker's local index (0..tp*pcp-1) within its stage.
         dp_rank_local = config.parallel_config.data_parallel_rank_local or 0
         pp_rank = config.parallel_config.pipeline_parallel_rank
         pp_size = config.pipeline_parallel_size
@@ -1105,8 +1103,7 @@ class ModelRunner:
             reject_simulated_tp(config, "pipeline parallel")
         # tp_world_size: how many GPUs this stage actually occupies.
         stage_span = config.tp_world_size * config.pcp_group_size
-        engine_index = dp_rank_local * pp_size + pp_rank
-        local_device_rank = engine_index * stage_span + rank
+        local_device_rank = local_device_index(config, rank)
         num_gpus = torch.cuda.device_count()
         if local_device_rank >= num_gpus:
             raise ValueError(
@@ -1904,6 +1901,94 @@ class ModelRunner:
         """
         return freeze_gc_heap(worker_process_name(self.config, self.rank))
 
+    def _local_checkpoint_spec(
+        self, plan: PoolPlan, transfer, slot_bytes: int
+    ) -> PagedStateCheckpointSpec:
+        """This worker's own checkpoint geometry, before any PP agreement."""
+        # None means the backend has not narrowed its image: carry it all.
+        narrowed = self.attn_metadata_builder.checkpoint_image_bytes()
+        # The charged entry can be larger than the bytes a transfer
+        # publishes: MHA alignment padding is not a region, and a draft
+        # pool merged into the same class is ordinary KV after the
+        # checkpoint regions. The backend names the published unit.
+        page_unit_bytes = int(plan.entry_bytes[plan.paged_class])
+        published_unit = getattr(
+            self.attn_metadata_builder, "checkpoint_page_unit_bytes", None
+        )
+        if callable(published_unit):
+            published = published_unit()
+            if published is not None:
+                published = int(published)
+                if published <= 0 or published > page_unit_bytes:
+                    raise RuntimeError(
+                        f"checkpoint PAGE unit is {published} B but the "
+                        f"paged pool entry is {page_unit_bytes} B"
+                    )
+                page_unit_bytes = published
+        return PagedStateCheckpointSpec(
+            page_unit_bytes=page_unit_bytes,
+            slot_bytes=slot_bytes,
+            image_bytes=slot_bytes if narrowed is None else int(narrowed),
+            layout_id=transfer.paged_layout_id,
+        )
+
+    def _agree_pipeline_checkpoint_spec(
+        self, spec: PagedStateCheckpointSpec | None
+    ) -> PagedStateCheckpointSpec:
+        """Put every PP stage's checkpoint images on one set of unit ids.
+
+        Only the head schedules, so a store or restore op it builds names the
+        same unit ids on every stage. Each stage holds its own layers' state in
+        its own unit size, so the stages need different counts; all take the
+        largest, and a stage needing fewer leaves its tail units unwritten. An
+        op is checked against the joint layout id and the summed image bytes,
+        which change whenever any stage's geometry does. Collective over the
+        PP group, which holds one rank per stage in stage order.
+
+        A stage that holds no recurrent state passes None, and then every
+        stage refuses with the same error: one raising alone would leave the
+        others waiting here for its geometry.
+        """
+        pp = get_pp_group()
+        stages: list = [None] * pp.world_size
+        torch.distributed.all_gather_object(
+            stages,
+            (
+                None
+                if spec is None
+                else (
+                    spec.layout_id,
+                    spec.image_bytes,
+                    spec.page_unit_bytes,
+                    spec.units_per_checkpoint,
+                )
+            ),
+            group=pp.cpu_group,
+        )
+        stateless = [i for i, entry in enumerate(stages) if entry is None]
+        if stateless:
+            raise RuntimeError(
+                f"PP stages {stateless} of {len(stages)} hold no recurrent "
+                "state, so they cannot keep PAGE-backed state checkpoints; "
+                "give every stage a linear-attention layer "
+                "(VLLM_PP_LAYER_PARTITION)"
+            )
+        units = max(entry[3] for entry in stages)
+        op_bytes = sum(entry[1] for entry in stages)
+        largest_image = max(entry[1] for entry in stages)
+        digest = hashlib.sha256(repr(stages).encode()).hexdigest()[:16]
+        layout_id = f"pp{len(stages)}-joint:{digest}"
+        logger.info(
+            "PAGE-backed state checkpoints span %d PP stages: units=%d "
+            "(per stage %s), op_bytes=%d, layout=%s",
+            len(stages),
+            units,
+            [entry[3] for entry in stages],
+            op_bytes,
+            layout_id,
+        )
+        return spec.for_pipeline(layout_id, units, op_bytes, largest_image)
+
     def get_num_blocks(self) -> dict[str, object]:
         torch.set_default_device(self.device)
         config = self.config
@@ -2039,7 +2124,13 @@ class ModelRunner:
         # Keep runtime state metadata out of Config.
         transfer = self.attn_metadata_builder.state_transfer()
         uses_paged_state = transfer.copies
-        if uses_paged_state and config.pipeline_parallel_size > 1:
+        if (
+            uses_paged_state
+            and config.pipeline_parallel_size > 1
+            and not getattr(
+                self.attn_metadata_builder, "paged_checkpoints_span_pipeline", False
+            )
+        ):
             raise RuntimeError(
                 "PAGE-backed state checkpoints do not yet support pipeline "
                 "parallelism: every stage must first agree on one atomic "
@@ -2056,33 +2147,33 @@ class ModelRunner:
                 raise RuntimeError(
                     "PAGE-backed state checkpoints require a PAGE sub-pool"
                 )
+            is_pp = config.pipeline_parallel_size > 1
+            if is_pp and not torch.distributed.is_initialized():
+                raise RuntimeError(
+                    "PAGE-backed state checkpoints under PP need the "
+                    "distributed groups initialized first"
+                )
             slot_bytes = int(plan.entry_bytes[STATE_SLOT_CLASS])
-            # None means the backend has not narrowed its image: carry it all.
-            narrowed = self.attn_metadata_builder.checkpoint_image_bytes()
-            # The charged entry can be larger than the bytes a transfer
-            # publishes: MHA alignment padding is not a region, and a draft
-            # pool merged into the same class is ordinary KV after the
-            # checkpoint regions. The backend names the published unit.
-            page_unit_bytes = int(plan.entry_bytes[plan.paged_class])
-            published_unit = getattr(
-                self.attn_metadata_builder, "checkpoint_page_unit_bytes", None
+            # A PP stage without a linear-attention layer has no image.
+            local_spec = (
+                self._local_checkpoint_spec(plan, transfer, slot_bytes)
+                if slot_bytes
+                else None
             )
-            if callable(published_unit):
-                published = published_unit()
-                if published is not None:
-                    published = int(published)
-                    if published <= 0 or published > page_unit_bytes:
-                        raise RuntimeError(
-                            f"checkpoint PAGE unit is {published} B but the "
-                            f"paged pool entry is {page_unit_bytes} B"
-                        )
-                    page_unit_bytes = published
-            checkpoint_spec = PagedStateCheckpointSpec(
-                page_unit_bytes=page_unit_bytes,
-                slot_bytes=slot_bytes,
-                image_bytes=slot_bytes if narrowed is None else int(narrowed),
-                layout_id=transfer.paged_layout_id,
-            )
+            if is_pp:
+                # Every stage joins, a stateless one with None: raising before
+                # the collective would leave its peers waiting in it.
+                checkpoint_spec = self._agree_pipeline_checkpoint_spec(local_spec)
+                transfer = dataclasses.replace(
+                    transfer, paged_layout_id=checkpoint_spec.layout_id
+                )
+            elif local_spec is None:
+                raise RuntimeError(
+                    "PAGE-backed state checkpoints need recurrent state, but "
+                    "this model holds none"
+                )
+            else:
+                checkpoint_spec = local_spec
             logger.info(
                 "PAGE-backed state checkpoints enabled: unit_bytes=%d, "
                 "slot_bytes=%d, image_bytes=%d (%.1f%% of a slot), "

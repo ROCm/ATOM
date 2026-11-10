@@ -127,6 +127,17 @@ The engine-side counterpart of the state tier lives outside this directory:
 store/finished/failed hash sets that `hybrid/kimi_k3/state_tier.py` reports back,
 so a later prefix hit knows which checkpoints the CPU tier can actually serve.
 
+State images and paged KV share one LocalCPU pool and one LRU, and a state hit
+is answered by the index rather than an LMCache lookup. So every voted hit is
+also sent to the workers as a touch (`LMCacheOffloadMetadata.state_touches`):
+each rank refreshes the image (`StateByteCodec.touch`) and reports on
+`k3_state_touch` whether it is still there; a gone image leaves the index. An
+admission that would load an image not confirmed within `tier_verified_for_s`
+(sized from `LMCACHE_MAX_LOCAL_CPU_SIZE`) is held a pass, at most
+`OFFLOAD_LOOKUP_DEFER_S`, for that verdict. Touches that only confirmed presence
+(the image is held by another backend only, or the touch raised) are counted in
+the connector statistic `state_touches_unrefreshed`.
+
 ## LMCache Multiprocess (`lmcache_mp`)
 
 The `lmcache_mp` connector selects one of two paths from capabilities published
@@ -1479,6 +1490,7 @@ LMCache version, these are what to re-check.**
 | `get_or_create(…, lambda t,s: None, lambda o,s: o)` | LMCache's trailing token-processing / output-transform callbacks | We don't use LMCache's token-shaping hooks — our codec moves raw bytes | Passed as no-op / identity callables |
 | `cfg.lookup_server_worker_ids = [0]` | default: every rank answers lookup, client takes `min()` | At TP>1 a non-rank-0 shard returning 0 would zero out a real hit; rank 0 is made authoritative | `config.py` (see [TP > 1 Notes](#tp--1-notes)) |
 | `cfg.use_gds = False` | LMCache may enable cufile GDS | cufile init hangs without NVMe-GDS hardware here | `config.py` |
+| `StateByteCodec.touch` | `LocalCPUBackend.touch_cache()` after `contains(pin=True)` | A pin needs a paired unpin, and `keys_in_request` belongs to the concurrent KV lookup | `cache_policy.update_on_hit(key, hot_cache)` under `cpu_lock`, resolved once at bind; if one is missing it warns and touches only confirm presence |
 
 ### 3. Fully delegated to LMCache (we never touch the implementation)
 
