@@ -79,13 +79,13 @@ class StateCheckpointPlacement:
             return 0
         return num_prompt_tokens // self.interval * self.interval
 
-    def anchor(self, num_prompt_tokens: int, num_tokens: int) -> int:
+    def anchor(self, num_prompt_tokens: int, num_tokens: int, tail: int = 1) -> int:
         if self.interval == 0:
             return 0
         end = num_prompt_tokens // self.block * self.block
-        # Never past the last block a lookup can match (the last one is always
-        # recomputed for logits).
-        end = min(end, (-(-num_tokens // self.block) - 1) * self.block)
+        # Never past the last block a hit can end on: it leaves `tail` tokens
+        # to compute (one for the logits).
+        end = min(end, (num_tokens - tail) // self.block * self.block)
         return max(end, 0)
 
     def demand_pos(self, hit: int, compressed_hit: int, has_room: bool) -> int:
@@ -94,14 +94,32 @@ class StateCheckpointPlacement:
         return compressed_hit if has_room else 0
 
     def cut(
-        self, start: int, end: int, num_prompt_tokens: int, demand: int, anchor: int
+        self,
+        start: int,
+        end: int,
+        num_prompt_tokens: int,
+        demand: int,
+        anchor: int,
+        tail: int = 1,
+        num_tokens: int | None = None,
     ) -> int:
-        """Earliest position in ``(start, end]`` a forward must end on, or 0."""
+        """Earliest position in ``(start, end]`` a forward must end on, or 0.
+
+        Never one that leaves fewer than ``tail`` tokens to compute (out of
+        ``num_tokens``, the prompt by default): under speculation that last
+        token would run as a one-row prefill step beside verify rows, and a hit
+        there is never served (`anchor` stops short for the same reason).
+        """
         rung = 0
         if limit := self.limit(num_prompt_tokens):
             rung = min(end, limit)
             rung -= rung % self.interval
-        candidates = [p for p in (rung, demand, anchor) if p and start < p <= end]
+        total = num_prompt_tokens if num_tokens is None else num_tokens
+        candidates = [
+            p
+            for p in (rung, demand, anchor)
+            if p and start < p <= end and not 0 < total - p < tail
+        ]
         return min(candidates) if candidates else 0
 
     def keeps(self, pos: int, num_prompt_tokens: int, demand: int, anchor: int) -> bool:
@@ -190,6 +208,7 @@ class SchedulerStateCheckpoints:
         # ``hash_decode_blocks`` at the committed end) and the worker stores it
         # at the next build.
         self.spec = int(getattr(scheduler, "num_spec_tokens", 0) or 0) > 0
+        self.prefill_tail = 1
         # req_id -> spacing threshold of a decode row in this schedule().
         self.decode_rows: dict[str, int] = {}
         # schedule() count, and each step's requests that continue on their
@@ -223,7 +242,7 @@ class SchedulerStateCheckpoints:
     def on_admission(self, request, blocks, hit: int, shared_prefix_boundary: int):
         p = self.placement
         request._atom_img_anchor = p.anchor(
-            int(request.num_prompt_tokens), int(request.num_tokens)
+            int(request.num_prompt_tokens), int(request.num_tokens), self.prefill_tail
         )
         # The proxy-only hit: vLLM reports it as the shared-prefix junction
         # exactly when the state checkpoint groups cut the hit short.
@@ -271,7 +290,13 @@ class SchedulerStateCheckpoints:
         end = start + num_new_tokens
         demand, anchor = request_marks(request)
         target = self.placement.cut(
-            start, end, int(request.num_prompt_tokens), demand, anchor
+            start,
+            end,
+            int(request.num_prompt_tokens),
+            demand,
+            anchor,
+            tail=self.prefill_tail,
+            num_tokens=int(request.num_tokens),
         )
         request._atom_img_step = ("prefill", target or end)
         if not target:
@@ -712,6 +737,7 @@ def bind_scheduler_state_checkpoints(scheduler) -> SchedulerStateCheckpoints | N
     st = SchedulerStateCheckpoints(
         scheduler, placement, proxy, state_checkpoints, name=adapter.name
     )
+    st.prefill_tail = adapter.prefill_tail(getattr(scheduler, "vllm_config", None))
 
     orig_gcb = kvm.get_computed_blocks
 
@@ -851,6 +877,7 @@ def apply_scheduler_patches() -> bool:
         return out
 
     __init__._atom_state_checkpoint_patched = True
+    _mamba_block_aligned_split._atom_state_checkpoint_patched = True
     Scheduler.__init__ = __init__
     Scheduler._mamba_block_aligned_split = _mamba_block_aligned_split
     Scheduler.schedule = schedule
