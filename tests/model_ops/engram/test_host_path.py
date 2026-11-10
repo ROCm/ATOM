@@ -1518,6 +1518,39 @@ def test_a_refused_shared_registration_falls_back_to_a_copy(monkeypatch):
     assert allocator.live == {}
 
 
+@pytest.mark.parametrize("env, shared", [(None, True), ("0", False)])
+def test_copy_copies_whatever_the_setting_and_shared_say(monkeypatch, env, shared):
+    import gc
+
+    from atom.model_ops.engram import host_memory
+
+    if env is not None:
+        monkeypatch.setenv("ATOM_ENGRAM_UVA_COPY", env)
+    allocator = FakeHostAllocator()
+    cudart = FakeCudart()
+    monkeypatch.setattr(host_memory, "_host_allocator", lambda: allocator)
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
+    rows = torch.arange(1 << 18, dtype=torch.float32)
+    pinned = host_memory.pin_rows([rows], shared=shared, copy=True)
+    assert pinned is not None and torch.equal(pinned[0], rows)
+    assert (len(allocator.live), cudart.calls) == (1, 0)
+    del pinned
+    gc.collect()
+    assert allocator.live == {}
+
+
+@pytest.mark.parametrize("shared", [False, True])
+def test_copy_without_an_allocator_is_a_failure(monkeypatch, shared):
+    """With no page-locked allocator `copy=True` fails."""
+    from atom.model_ops.engram import host_memory
+
+    cudart = FakeCudart()
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
+    rows = torch.ones(1 << 18)
+    assert host_memory.pin_rows([rows], shared=shared, copy=True) is None
+    assert cudart.calls == 0
+
+
 def test_a_shared_read_only_mapping_registers_in_place_read_only(monkeypatch, tmp_path):
     """The shared mapping cannot be written, so it is registered read-only --
     and in place: the view is the page cache, the same pages for every rank."""
