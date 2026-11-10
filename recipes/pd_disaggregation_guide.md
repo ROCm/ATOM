@@ -26,7 +26,8 @@ still apply. See [the implementation and CPU verification notes](../docs/pd_chun
 Mooncake reserves D's destination KV blocks before P writes them, so a backlog
 of pending receives can hold most of D's KV pool while few requests decode.
 The opt-in `pd_admission` policy defers a new receive while the receive targets
-already pending would exceed a per-rank byte budget. Set it in the consumer's
+already pending would exceed a per-rank byte budget, and can keep part of D's
+pool free for requests that are already decoding. Set it in the consumer's
 top-level `--kv-transfer-config`; with `multi`, put it next to `connectors` and
 list the Mooncake consumer first:
 
@@ -36,14 +37,15 @@ list the Mooncake consumer first:
 
 | Option | Default when enabled | Meaning |
 | --- | --- | --- |
-| `max_pending_kv_fraction` | `0.15` | Fraction of each D rank's paged KV pool, converted to bytes at startup. |
+| `max_pending_kv_fraction` | `0.15` | Fraction of each D rank's paged KV pool, converted to bytes at startup. `null` disables the byte budget when `min_free_kv_fraction` is set. |
 | `max_pending_kv_bytes` | unset | Bytes per D rank, instead of a fraction. |
+| `min_free_kv_fraction` | `null` | Fraction of D's paged pool that must stay free after a new receive allocates its blocks, local prefix hits included. Reusable cached blocks count as free. |
 
-Only blocks Mooncake transfers are charged; local prefix hits are not.
-Whole-prompt and chunked receives share the budget. A request holds its credit
-until its first local forward; preemption, a failed receive and a cancelled one
-(once its writes drain) return it. With nothing pending, one request may exceed
-the budget, so long prompts are not starved. D must have PP=1, DCP=1, PCP=1,
+Only blocks Mooncake transfers are charged to the byte budget; local prefix
+hits are not. Whole-prompt and chunked receives share the budget. A request
+holds its credit until its first local forward; preemption, a failed receive
+and a cancelled one (once its writes drain) return it. With nothing pending,
+one request may exceed either limit, so long prompts are not starved. D must have PP=1, DCP=1, PCP=1,
 SP=1 and a single paged KV pool. Metrics are listed under `atom:pd_admission_*`
 in the [metrics guide](../docs/metrics_guide.md#scheduler).
 
