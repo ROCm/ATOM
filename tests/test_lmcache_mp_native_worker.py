@@ -102,8 +102,13 @@ def config(**extra):
     )
 
 
-def _make_worker(*, images=True):
-    instance = NativeStateLMCacheMPConnector(config())
+def _make_worker(*, images=True, dcp=1):
+    cfg = config()
+    if dcp > 1:
+        cfg.tensor_parallel_size = 8
+        cfg.decode_context_parallel_size = dcp
+        cfg.hf_config.model_type = "kimi_linear"
+    instance = NativeStateLMCacheMPConnector(cfg)
     page = torch.zeros((32, 1, 32), dtype=torch.uint8)
     spec = PagedStateCheckpointSpec(32, 128, "native-test-v1", 80)
     tensors = KVTransferTensors(
@@ -120,9 +125,9 @@ def _make_worker(*, images=True):
     )
     tensors.set_block_count(32)
     instance._native_layout = build_native_state_mp_layout(
-        tensors, block_size=4, chunk_size=8, images=images
+        tensors, block_size=instance.block_size, chunk_size=8 * dcp, images=images
     )
-    instance.chunk_size = 8
+    instance.chunk_size = 8 * dcp
     instance.submitted = []
     instance.submitted_request_ids = []
     instance.future = Future()
@@ -160,6 +165,29 @@ def request(*, loading=False, units=(0, 25, 31), generation=1, hbm=0):
         load_operation=LoadOperationId(7, generation) if loading else None,
         native_state=NativeStateTransfer(units, 16, 998, 2 if loading else None),
     )
+
+
+@pytest.mark.parametrize("loading", [False, True])
+def test_dcp8_transfers_local_pages_with_the_full_native_image(loading):
+    worker = _make_worker(dcp=8)
+    req = request(loading=loading)
+    req.token_ids = list(range(128))
+    req.native_state = replace(req.native_state, boundary_tokens=128)
+    if loading:
+        req.load_spec = LoadSpec(64, 128)
+        worker._submit_load(req, object())
+    else:
+        req.save_spec = SaveSpec(64)
+        worker._submit_save(req, object())
+    assert worker.submitted[0].start == 64
+    assert worker.submitted[0].end == 128
+    assert worker.submitted[0].block_ids == [[3, 4], [0], [25], [31]]
+    assert [g.tokens_per_block for g in worker._native_layout.kernel_groups] == [
+        32,
+        64,
+        64,
+        64,
+    ]
 
 
 def test_store_transmits_page_zero_as_real_native_unit(worker):

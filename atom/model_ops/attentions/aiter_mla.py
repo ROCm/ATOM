@@ -1818,11 +1818,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # MLA's latent projection is replicated across TP. Sparse MLA's
             # index-key projection/cache is replicated as well; only the query
             # heads and absorbed KV-B/output projections are TP-sharded.
-            # Consequently every PAGE byte published above is identical on
-            # every TP worker (DCP/PCP are separate axes and are rejected by
-            # the current LMCache MP connector).
-            tp_replication_factor=int(
-                getattr(runner.config, "tensor_parallel_size", 1) or 1
+            # DCP shards the token axis, so its PAGE bytes must stay per rank.
+            tp_replication_factor=(
+                1
+                if int(getattr(runner.config, "decode_context_parallel_size", 1) or 1)
+                > 1
+                else int(getattr(runner.config, "tensor_parallel_size", 1) or 1)
             ),
         )
 

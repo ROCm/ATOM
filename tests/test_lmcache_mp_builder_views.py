@@ -322,8 +322,9 @@ def test_mla_builder_publishes_latent_and_index_views(
 
 
 @pytest.mark.parametrize("opus", [False, True])
+@pytest.mark.parametrize("dcp", [1, 8])
 def test_mla_builder_publishes_fp4_index_scale_plane_to_lmcache_mp(
-    mla_builder_cls, monkeypatch, opus
+    mla_builder_cls, monkeypatch, opus, dcp
 ):
     # The FP4 sparse indexer keeps packed E2M1 and its e8m0 exponents as two
     # planes. `lmcache_mp` groups regions by per-block shape and copies whole
@@ -333,6 +334,7 @@ def test_mla_builder_publishes_fp4_index_scale_plane_to_lmcache_mp(
     runner = SimpleNamespace(
         config=SimpleNamespace(
             tensor_parallel_size=8,
+            decode_context_parallel_size=dcp,
             kv_transfer_config={"kv_connector": "lmcache_mp"},
         ),
     )
@@ -374,7 +376,7 @@ def test_mla_builder_publishes_fp4_index_scale_plane_to_lmcache_mp(
         "mla.index_scale.layer_0",
         "mla.index_scale.layer_1",
     ]
-    assert transfer.tp_replication_factor == 8
+    assert transfer.tp_replication_factor == (8 if dcp == 1 else 1)
     _assert_region_view_geometry(transfer)
     cache_views = _build_cache_views(transfer, num_blocks=2)
     assert cache_views.bytes_per_block == 2 * kv_bytes + 2 * 4096 + 2 * 256
