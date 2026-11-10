@@ -458,6 +458,9 @@ def test_mtp_is_allowed_and_other_speculation_is_refused(monkeypatch):
     mod._check_unsupported(_vllm_config(_config(), spec=_mtp()))
     with pytest.raises(ValueError, match="'eagle3'"):
         mod._check_unsupported(_vllm_config(_config(), spec=_mtp(method="eagle3")))
+    monkeypatch.setattr(mod, "pooled_path_enabled", lambda _k: False)
+    with pytest.raises(ValueError, match="dense indexer"):
+        mod._check_unsupported(_vllm_config(_config(), spec=_mtp()))
 
 
 def test_state_shape_widens_the_conv_window_for_draft_tokens():

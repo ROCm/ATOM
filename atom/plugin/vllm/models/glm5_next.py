@@ -93,9 +93,10 @@ def _check_unsupported(vllm_config: VllmConfig) -> None:
     `Config.__post_init__` and its GLM-5.3-Flash guard run -- but vLLM's PCP and
     DCP sizes are never forwarded into it, so that guard always sees 1 and would
     admit both. KV transfer is refused because this plugin path does not
-    implement it for the pooled indexer, and speculative decoding other than
-    the checkpoint's own MTP layer is untested. An unsupported combination
-    would otherwise start and produce wrong output.
+    implement it for the pooled indexer. Speculative decoding other than the
+    checkpoint's own MTP layer is untested, and MTP on the dense indexer fails
+    at graph capture. An unsupported combination would otherwise start and
+    produce wrong output or crash later.
     """
     unsupported = []
     parallel = vllm_config.parallel_config
@@ -107,6 +108,11 @@ def _check_unsupported(vllm_config: VllmConfig) -> None:
     method = getattr(speculative, "method", None)
     if speculative is not None and method != "mtp":
         unsupported.append(f"speculative decoding method {method!r}")
+    # The dense indexer's metadata builder flattens multi-token decode rows
+    # into a buffer sized from the indexer's kernel block, narrower than the
+    # hybrid model's block table, and fails at graph capture.
+    if speculative is not None and not pooled_path_enabled(_pool_size(vllm_config)):
+        unsupported.append("speculative decoding with the dense indexer")
     if unsupported:
         raise ValueError(
             "GLM-5.3-Flash on the vllm-atom backend does not yet support "
