@@ -2804,6 +2804,7 @@ def _compute_draft_kv(
 
     proposer = importlib.import_module("atom.spec_decode.dspark_proposer")
     from atom.utils import CpuGpuBuffer
+    from atom.utils.forward_context import RoundService
 
     slots = CpuGpuBuffer(16, dtype=torch.int64, device="cpu", pin_memory=False)
     slots.gpu.copy_(torch.arange(16) + 100)
@@ -2824,7 +2825,8 @@ def _compute_draft_kv(
     fwd = types.SimpleNamespace(
         context=types.SimpleNamespace(scheduled_bs=1),
         attn_metadata=types.SimpleNamespace(
-            slot_mapping=torch.arange(16) + 500 if target_slots else None
+            slot_mapping=torch.arange(16) + 500 if target_slots else None,
+            served_by_round=RoundService.NONE,
         ),
     )
     orig = proposer.get_forward_context
