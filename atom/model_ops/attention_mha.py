@@ -1856,7 +1856,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             max_query_len,
             sparse_metadata.max_seq_len,
         )
-        # MXFP4 index: the rows the metadata was built for (`decode_rows_batch`). On a
+        # MXFP4 index: the rows the metadata was built for. On a
         # DP step q has more (a prefill bucket's pad); the selector writes, and so
         # attention may read, only these -- the rest of the output is zero. After the
         # cache key: skip-index layers hold only the full shape.

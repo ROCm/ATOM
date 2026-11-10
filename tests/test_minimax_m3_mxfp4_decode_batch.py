@@ -5,8 +5,7 @@ MXFP4 index cache, and that scorer's per-ubatch buffers (CPU).
 The MXFP4 scorer takes its batch off the rows of ``idx_q``, so the lengths and
 block-table rows it is handed must be that many, on a padded step (a graph bucket,
 or an eager step padded for DP) and a ragged one alike; and under decode TBO each
-ubatch needs a work map of its own. The row rule
-(`decode_rows_batch`) is pure and runs everywhere. The
+ubatch needs a work map of its own. The
 builder tests drive `AiterAttentionMetadataBuilder` with its collaborators stubbed
 and need ``aiter`` importable (CI's no-aiter job skips them); the scorer itself is
 in test_minimax_m3_mxfp4_index.py.
@@ -47,44 +46,6 @@ def builder(mod, mxfp4=True, tbo_decode=True, forward_vars=None):
         ),
     )
     return b
-
-
-# (scheduled_bs, running_bs, running_tokens, q) -> the requests whose rows run
-@pytest.mark.parametrize(
-    "scheduled,running,tokens,q,want",
-    [
-        (3, 8, 8, 1, 8),  # graph bucket / eager pad, plain decode
-        (3, 8, 64, 8, 8),  # ... verify step
-        (3, 3, 3, 1, 3),  # nothing padded
-        (0, 8, 8, 1, 8),  # an idle DP rank still runs the group's rows
-        (3, 8, 24, 8, 3),  # DP step a prefilling peer made ragged: no pad rows
-        (2, 4, 2048, 1, 4),  # a decoding DP rank in a prefill bucket
-        (2, 4, 2048, 3, 4),  # ... whose bucket is no multiple of the query width
-        (3, 4, 64, 8, 4),  # a DSpark decode bucket wider than running_bs * q
-    ],
-)
-def test_the_sparse_decode_runs_the_rows_the_metadata_covers(
-    scheduled, running, tokens, q, want
-):
-    from atom.utils.forward_context import decode_rows_batch
-
-    assert decode_rows_batch(scheduled, running, tokens, q) == want
-
-
-@pytest.mark.parametrize(
-    "scheduled,running,tokens,q",
-    [
-        (3, 8, 13, 8),  # not a whole number of requests
-        (3, 8, 16, 8),  # fewer requests than were scheduled
-    ],
-)
-def test_rows_that_are_not_a_batch_are_refused_not_clamped(
-    scheduled, running, tokens, q
-):
-    from atom.utils.forward_context import decode_rows_batch
-
-    with pytest.raises(ValueError, match="decode rows"):
-        decode_rows_batch(scheduled, running, tokens, q)
 
 
 class _Buf:

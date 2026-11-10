@@ -167,8 +167,9 @@ def make_sparse_decode_metadata(
     built into it here, once, at ``index_work_map_max_block`` blocks (the model
     length's); an empty batch builds none.
     ``seq_lens`` and ``block_table`` must be the requests whose rows the scorer,
-    selector and attention run (`decode_rows_batch`; pad requests of a padded step:
-    length 0): the map's encoding and grid and the head offsets of ``n_valid_column_per_row`` all follow that batch.
+    selector and attention run (pad requests of a padded step: length 0): the map's
+    encoding and grid and the head offsets of ``n_valid_column_per_row`` all follow
+    that batch.
     """
     decode = MiniMaxM3SparseDecodeMetadata(
         seq_lens=seq_lens, block_table=block_table, max_query_len=max_query_len
