@@ -611,6 +611,7 @@ class ScheduledBatch:
     )
     _SEGMENT_FIELDS = frozenset(
         (
+            "has_prefill",
             "any_logprobs",
             "logprob_requested",
             "logprob_request_indices",
@@ -708,6 +709,7 @@ class ScheduledBatch:
         result.total_seqs_num_decode = (
             result.total_seqs_num - result.total_seqs_num_prefill
         )
+        result.has_prefill = result.total_seqs_num_prefill > 0
         result.total_tokens_num = token_stop - token_start
         result.total_tokens_num_prefill = int(
             result.num_scheduled_tokens[: result.total_seqs_num_prefill].sum()
@@ -1303,7 +1305,6 @@ class Scheduler:
                 cached_blocks = self.block_manager.can_allocate_memoized(
                     seq, reserved_decode_blocks=limits.reserved_decode_blocks
                 )
-                probed_tokens += seq.num_tokens
                 if cached_blocks < 0:
                     break  # Phase 2 also stops at the first allocation refusal.
                 if slots <= self._num_parked_remote_kv:
@@ -3033,7 +3034,7 @@ class Scheduler:
         # and mixed batches share the settlement, snapshot and advance below.
         admit_decode = num_seqs_prefill == 0 or self.enable_mixed_prefill_decode
 
-        if self.dummy_prefill and not scheduled_seqs:
+        if group_prefill_tick and not scheduled_seqs:
             # The group's prefill step, with no prefill of this rank's own: it
             # keeps its peers company on an idle step rather than decode, so
             # every rank's forward replays its token graph (`ForwardMode.decide`).

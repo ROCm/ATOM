@@ -18,7 +18,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from atom.utils.tbo.ubatching import local_tbo_precompute
+from atom.utils import envs
+from atom.utils.tbo.ubatching import mixed_tbo_vote, prefill_tbo_vote
 
 
 @pytest.fixture(autouse=True)
@@ -34,7 +35,7 @@ class _Config:
 
 
 class _Batch:
-    """Only the attributes `local_tbo_precompute` reads."""
+    """Only the attributes the runner vote reads."""
 
     def __init__(
         self,
@@ -46,6 +47,7 @@ class _Batch:
         total_tokens_num_prefill=0,
         is_dummy_run=False,
     ):
+        self.has_prefill = total_seqs_num_prefill > 0
         self.is_mixed = is_mixed
         self.total_seqs_num_prefill = total_seqs_num_prefill
         self.total_seqs_num_decode = total_seqs_num_decode
@@ -61,73 +63,28 @@ _PREFILL_TOKENS = [8192, 8192]
 
 
 def test_pure_prefill_can_split():
-    meets_min, can_split, ub0, ub1 = local_tbo_precompute(
-        _Config(),
-        _Batch(total_seqs_num_prefill=2),
-        True,
-        np.asarray(_PREFILL_TOKENS, dtype=np.int64),
+    meets_min, can_split, ub0, ub1 = prefill_tbo_vote(sum(_PREFILL_TOKENS))
+    assert meets_min and can_split and ub0 + ub1 == sum(_PREFILL_TOKENS)
+
+
+@pytest.mark.parametrize(
+    "prefill,decode,can_split", [(16384, 4, True), (16, 128, False)]
+)
+def test_mixed_vote_keeps_decode_in_the_last_child(prefill, decode, can_split):
+    meets_min, actual, ub0, ub1 = mixed_tbo_vote(
+        np.asarray([prefill, decode]), 2, prefill, 8192
     )
-    assert can_split is True and meets_min is True
-    assert ub0 > 0 and ub1 > 0
+    assert actual == can_split
+    if can_split:
+        assert meets_min and 0 < ub0 < prefill and ub0 + ub1 == prefill + decode
+    else:
+        assert (ub0, ub1) == (0, 0)
 
 
-def test_mixed_batch_takes_the_mixed_split():
-    """The cut lands inside the prefill rows: two prefill-mode ubatches whose
-    sizes cover the whole batch, decode rows included."""
-    toks = _PREFILL_TOKENS + [1, 1, 1, 1]
-    meets_min, can_split, ub0, ub1 = local_tbo_precompute(
-        _Config(),
-        _Batch(
-            is_mixed=True,
-            total_seqs_num_prefill=2,
-            total_seqs_num_decode=4,
-            total_tokens_num=sum(toks),
-            total_tokens_num_prefill=sum(_PREFILL_TOKENS),
-        ),
-        True,
-        np.asarray(toks, dtype=np.int64),
-    )
-    assert can_split is True and meets_min is True
-    assert ub0 > 0 and ub1 > 0 and ub0 + ub1 == sum(toks)
-    assert ub0 < sum(_PREFILL_TOKENS)
-
-
-def test_decode_heavy_mixed_batch_refuses():
-    """A midpoint at or past the prefill tokens would leave ubatch 1 pure
-    decode under a prefill-mode parent: refused as can_split=False."""
-    toks = [16] + [8] * 16  # 16 prefill tokens, 128 decode tokens
-    _, can_split, ub0, ub1 = local_tbo_precompute(
-        _Config(),
-        _Batch(
-            is_mixed=True,
-            total_seqs_num_prefill=1,
-            total_seqs_num_decode=16,
-            total_tokens_num=sum(toks),
-            total_tokens_num_prefill=16,
-        ),
-        True,
-        np.asarray(toks, dtype=np.int64),
-    )
-    assert can_split is False
-    assert (ub0, ub1) == (0, 0)
-
-
-@pytest.mark.parametrize("is_prefill", [True, False])
-def test_tbo_off_reports_no_split(is_prefill):
-    """With TBO off nothing splits, mixed or not."""
-    _, can_split, _, _ = local_tbo_precompute(
-        _Config(enable_tbo=False),
-        _Batch(
-            is_mixed=True,
-            total_seqs_num_prefill=2,
-            total_seqs_num_decode=2,
-            total_tokens_num=sum(_PREFILL_TOKENS) + 2,
-            total_tokens_num_prefill=sum(_PREFILL_TOKENS),
-        ),
-        is_prefill,
-        np.asarray(_PREFILL_TOKENS + [1, 1], dtype=np.int64),
-    )
-    assert can_split is False
+def test_tbo_off_reports_no_split(runner_tbo_eligibility):
+    runner = SimpleNamespace(config=_Config(enable_tbo=False))
+    batch = _Batch(is_mixed=True, total_seqs_num_prefill=2, total_seqs_num_decode=2)
+    assert runner_tbo_eligibility(runner, batch) == (False, False, 0, 0)
 
 
 @pytest.fixture(scope="module")
@@ -148,7 +105,9 @@ def runner_tbo_eligibility():
     )
     scope = {
         "ScheduledBatch": SimpleNamespace,
-        "local_tbo_precompute": local_tbo_precompute,
+        "mixed_tbo_vote": mixed_tbo_vote,
+        "prefill_tbo_vote": prefill_tbo_vote,
+        "envs": envs,
     }
     exec(  # noqa: S102 - execute the trusted repository method, not GPU imports
         compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"), scope
@@ -175,4 +134,7 @@ def test_runner_sizes_supported_mixed_and_pcp_collectives(
     batch.num_scheduled_tokens = np.asarray(tokens, dtype=np.int64)
     meets_min, can_split, ub0, ub1 = runner_tbo_eligibility(runner, batch)
     assert meets_min and can_split
-    assert ub0 + ub1 == sum(tokens) // pcp_size
+    if pcp_size == 1:
+        assert ub0 + ub1 == sum(tokens)
+    else:
+        assert (ub0, ub1) == (0, 0)  # PCP cuts request groups after voting.

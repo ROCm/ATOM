@@ -199,7 +199,9 @@ def test_runtime_guard_with_live_steps_and_aux_hooks(
                 forward_context.ForwardContext(
                     attn_metadata=metadata,
                     no_compile_layers=config.compilation_config.static_forward_context,
-                    context=SimpleNamespace(is_draft=False, ubatch_token_offset=0),
+                    context=SimpleNamespace(
+                        is_draft=False, ubatch_token_offset=0, ubatch_token_order=None
+                    ),
                 ),
             )
             tokens = torch.arange(rows, device="cuda", dtype=torch.int64)

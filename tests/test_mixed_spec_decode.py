@@ -35,6 +35,53 @@ N_P_TOKENS = sum(PREFILL_LENS)
 NUM_SCHEDULED = np.array(PREFILL_LENS + [K + 1] * N_D, dtype=np.int32)
 
 
+def test_pipeline_mixed_drafts_leave_prefill_tokens_untouched(monkeypatch):
+    from atom.model_ops.attentions.deepseek_v4_attn import (
+        DeepseekV4AttentionMetadataBuilder,
+    )
+    from tests.test_h2d_runner_publication import runner_with_buffers
+
+    runner = runner_with_buffers(
+        monkeypatch,
+        pp_size=2,
+        speculative=True,
+        builder_cls=DeepseekV4AttentionMetadataBuilder,
+    )
+    processor = runner.tokenID_processor
+    processor.use_spec = True
+    runner._gate_staging_reuse()
+    batch = SimpleNamespace(
+        has_prefill=True,
+        is_mixed=True,
+        num_spec_step=3,
+        total_seqs_num=3,
+        total_seqs_num_prefill=1,
+        total_seqs_num_decode=2,
+        total_tokens_num=9,
+        total_tokens_num_prefill=3,
+        total_tokens_num_decode=6,
+        scheduled_tokens=np.asarray(
+            [7, 8, 9, 100, -1, -1, -1, 200, -1], dtype=np.int32
+        ),
+        scheduled_spec_decode_tokens=np.asarray(
+            [[0, 0, 0], [101, 102, 103], [201, 202, 203]], dtype=np.int32
+        ),
+        num_scheduled_tokens=np.asarray([3, 4, 2], dtype=np.int32),
+        num_rejected=np.zeros(3, dtype=np.int32),
+        num_bonus=np.zeros(3, dtype=np.int32),
+        produces_output=lambda: False,
+    )
+    group = runner.h2d_groups["token_inputs"]
+    group.set_counts(
+        runner.attn_metadata_builder.prepare_query_metadata(
+            batch.num_scheduled_tokens[1:], 2, 6
+        )
+    )
+    ids = processor.prepare_input_ids(batch, 4, group).clone()
+    runner._mark_staging_h2d_enqueued()
+    assert ids.cpu().tolist() == [7, 8, 9, 100, 101, 102, 103, 200, 201]
+
+
 def _mixed_batch(**overrides):
     fields = {
         "is_mixed": True,
@@ -73,12 +120,24 @@ def test_verify_spans_put_prefill_rows_at_one_sample_each():
     assert cu_end.tolist() == [1, 2, 6, 10]  # ends at the 10 logit rows
 
 
-def test_verify_spans_skip_pure_prefill_and_dummies():
+def test_verify_spans_skip_pure_prefill_and_idle_ranks():
     from atom.model_engine.model_runner import ModelRunner
 
     runner = _spec_runner()
     assert ModelRunner._verify_spans(runner, _mixed_batch(is_mixed=False)) is None
-    assert ModelRunner._verify_spans(runner, _mixed_batch(is_dummy_run=True)) is None
+    assert (
+        ModelRunner._verify_spans(
+            runner,
+            _mixed_batch(
+                is_mixed=False,
+                is_dummy_run=True,
+                total_seqs_num_prefill=0,
+                total_seqs_num_decode=0,
+                total_seqs_num=0,
+            ),
+        )
+        is None
+    )
     assert (
         ModelRunner._verify_spans(_spec_runner(drafter=False), _mixed_batch()) is None
     )
@@ -125,6 +184,9 @@ def test_spec_indices_and_draft_gather_over_the_mixed_layout():
     group = SimpleNamespace(
         counts=[None] * 3, indices={n: i for i, n in enumerate(names)}
     )
+    group.set_counts = lambda counts: [
+        group.counts.__setitem__(group.indices[n], v) for n, v in counts.items()
+    ]
     num_draft, total = Drafter.prepare_spec_decode_indices(drafter, lens, cu_end, group)
     var = runner.forward_vars
     assert num_draft.tolist() == [0, 0, 3, 3]
@@ -318,9 +380,8 @@ def test_batch_slice_preserves_spec_fields():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="stages through the GPU")
-@pytest.mark.parametrize("transport", ["direct", "packed"])
 @pytest.mark.parametrize("previous_dummy", [False, True])
-def test_mixed_deferred_inputs_under_spec(monkeypatch, transport, previous_dummy):
+def test_mixed_deferred_inputs_under_spec(monkeypatch, previous_dummy):
     """Every kind of row a mixed spec step can hold, in one batch:
 
     - 40: a prefill middle chunk that was ALSO in the previous batch -- must not
@@ -331,16 +392,21 @@ def test_mixed_deferred_inputs_under_spec(monkeypatch, transport, previous_dummy
       drafts come from the propose on that prefill row.
     - 50: a decode row not in the previous batch: scheduler-staged drafts.
     """
+    from atom.model_ops.attentions.deepseek_v4_attn import (
+        DeepseekV4AttentionMetadataBuilder,
+    )
     from tests.test_h2d_runner_publication import runner_with_buffers
 
-    runner = runner_with_buffers(monkeypatch, transport, speculative=True, mixed=True)
+    runner = runner_with_buffers(
+        monkeypatch, speculative=True, builder_cls=DeepseekV4AttentionMetadataBuilder
+    )
     processor = runner.tokenID_processor
     processor.use_spec = True
     processor.num_spec_tokens = K
     runner._gate_staging_reuse()
 
     processor.prev_batch = SimpleNamespace(
-        req_ids=[10, 20, 30, 40], is_dummy_run=previous_dummy
+        req_ids=[] if previous_dummy else [10, 20, 30, 40], is_dummy_run=previous_dummy
     )
     processor.prev_token_ids = torch.tensor(
         [100, 200, 300, 400], dtype=torch.int32, device="cuda"
@@ -358,6 +424,7 @@ def test_mixed_deferred_inputs_under_spec(monkeypatch, transport, previous_dummy
     spec[3] = [501, 502, 503]
     batch = SimpleNamespace(
         num_spec_step=K,
+        has_prefill=True,
         is_mixed=True,
         is_dummy_run=False,
         req_ids=[40, 10, 30, 50],
@@ -377,13 +444,16 @@ def test_mixed_deferred_inputs_under_spec(monkeypatch, transport, previous_dummy
         # False: keep the status set above rather than drain the (empty) queue.
         produces_output=lambda: False,
     )
-    runner.attn_metadata_builder.publish_cu_seqlens_q(
-        batch, SimpleNamespace(running_bs=4)
+    group = runner.h2d_groups["token_inputs"]
+    group.set_counts(
+        runner.attn_metadata_builder.prepare_query_metadata(
+            batch.num_scheduled_tokens[1:], 3, 12
+        )
     )
     # Decode-local spans, from 0, anchor + 3 drafts each.
     assert runner.forward_vars["cu_seqlens_q"].np[:4].tolist() == [0, 4, 8, 12]
 
-    ids = processor.prepare_input_ids(batch, K + 1).clone()
+    ids = processor.prepare_input_ids(batch, K + 1, group).clone()
     runner._mark_staging_h2d_enqueued()
     runner.h2d_owner.completion.synchronize()
     expected = (

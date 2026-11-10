@@ -533,8 +533,6 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
 
 
 class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic[T]):
-    capture_owns_cu_seqlens_q = False
-
     def __init__(self, model_runner):
         self.model_runner = model_runner
         assert model_runner.block_size % self.block_size == 0
@@ -1124,15 +1122,12 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         is the same for every backend. KV-side metadata stays in each builder's
         `prepare_prefill` / `prepare_decode`.
 
-        Lives here because this class declares the buffer and defines its
-        layout, but is CALLED from `prepare_model` before `prepare_input_ids`,
-        which addresses each request's span through it and so cannot wait for
-        `build()`. `prepare_prefill` cross-checks against this rather than
-        deriving its own. Slot 0 is 0 from allocation.
-
-        The tail out to `running_bs` gets the flat cumsum: attention runs at
-        that width whether or not a graph is replayed, and a zero-length row
-        reads nothing. Left unwritten it holds the previous step's.
+        `cu_seqlens_q`, the token -> request map (`batch_id_per_q_token`, out
+        to `running_tokens`, `-1` past the scheduled tokens), and a split
+        decode's token order (`decode_ubatch_token_order`) with each
+        micro-batch's scheduled tokens. Returns each staged buffer's count:
+        `prepare_model` publishes them with the token inputs, everything else
+        through `publish_query_metadata`.
         """
         var = self.model_runner.forward_vars
         build_query_layout(
@@ -1142,13 +1137,37 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
             cu_seqlens_q=var["cu_seqlens_q"].np,
             batch_ids=var["batch_id_per_q_token"].np,
         )
-        cu = self.model_runner.forward_vars["cu_seqlens_q"]
-        lens = batch.num_scheduled_tokens
-        n = len(lens)
-        cu.np[1 : n + 1] = np.cumsum(lens)
-        cu.np[n + 1 : forward_mode.running_bs + 1] = cu.np[n]
-        # Caller publishes alone or with sampling/IDs before token assembly.
-        return forward_mode.running_bs + 1
+        counts = {
+            "cu_seqlens_q": running_bs + 1,
+            "batch_id_per_q_token": running_tokens,
+        }
+        if decode_ubatch_slices:
+            counts["ubatch_token_order"] = decode_ubatch_token_order(
+                decode_ubatch_slices,
+                int(lengths.sum()),
+                var["ubatch_token_order"].np,
+            )
+            var["ubatch_scheduled_tokens"].np[: len(decode_ubatch_slices)] = [
+                ub.scheduled_tokens for ub in decode_ubatch_slices
+            ]
+            counts["ubatch_scheduled_tokens"] = len(decode_ubatch_slices)
+        return counts
+
+    def publish_query_metadata(
+        self,
+        lengths: np.ndarray,
+        running_bs: int,
+        running_tokens: int,
+        decode_ubatch_slices: tuple[UBatchSlice, ...] | None = None,
+    ) -> None:
+        """`prepare_query_metadata`, published on its own: for a step no token
+        inputs carry (a capture, the vLLM plugin)."""
+        counts = self.prepare_query_metadata(
+            lengths, running_bs, running_tokens, decode_ubatch_slices
+        )
+        group = self.model_runner.h2d_groups["early"]
+        group.set_counts(counts)
+        group.publish()
 
     def decode_spans(self, batch: ScheduledBatch) -> tuple[int, np.ndarray, np.ndarray]:
         """The decode region's `(bs, per-request lengths, exclusive prefix sum)`.
@@ -1612,12 +1631,8 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
             self.execute_paged_state_copies(
                 state_ops.checkpoint_stores, state_ops.checkpoint_restores
             )
-
-        # Mixed dispatch comes AFTER state maintenance: it returns early, and a
-        # mixed batch needs the same relocations / checkpoint copies as any other.
         if batch.is_mixed:
-            return self.prepare_mixed(batch, running_bs)
-        is_prefill = batch.total_tokens_num_prefill > 0
+            return self.prepare_mixed(batch, running_bs, running_tokens, ubatch_slices)
         if is_prefill:
             built = self.prepare_prefill(
                 batch, running_bs, running_tokens, ubatch_slices, pcp_groups
@@ -1644,7 +1659,7 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
     # (`ModelRunner._record_prefill_req_graphs`). Empty: none.
     prefill_req_graph_sizes: tuple[int, ...] = ()
 
-    def prepare_mixed(self, batch: ScheduledBatch, bs: int):
+    def prepare_mixed(self, batch, running_bs, running_tokens, ubatch_slices=None):
         raise NotImplementedError(
             f"{type(self).__name__} does not support mixed prefill+decode "
             "batches: this metadata builder has no prepare_mixed. Disable "

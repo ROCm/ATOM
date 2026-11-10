@@ -5,7 +5,7 @@
 
 Three properties, none of them obvious from either function alone:
 
-1. `_precompute_mixed_token_split` and `split_mixed_token_midpoint` must agree
+1. `mixed_tbo_vote` and `split_mixed_token_midpoint` must agree
    on the ub0/ub1 token counts. The former's numbers are MAX-reduced across DP
    to size the per-ubatch buffers; if the slices the latter builds are a
    different size, the all_gather mismatches and the group hangs.
@@ -24,13 +24,20 @@ Three properties, none of them obvious from either function alone:
 Everything here is pure arithmetic -- no GPU, no model.
 """
 
+import ast
 import itertools
+from dataclasses import dataclass, replace
+from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
-from atom.utils.tbo.ubatch_splitting import split_mixed_token_midpoint
-from atom.utils.tbo.ubatching import _precompute_mixed_token_split
+from atom.utils.tbo.ubatch_splitting import (
+    cut_prefill_ubatches,
+    split_mixed_token_midpoint,
+)
+from atom.utils.tbo.ubatching import mixed_tbo_vote
 
 
 def _mixed(n_pref_seqs, pref_len, n_dec_seqs, dec_len=1):
@@ -68,7 +75,7 @@ _REFUSED = [
 def test_precompute_and_slices_agree(n_pref_seqs, pref_len, n_dec_seqs):
     """Property 1: the reported ub0/ub1 are the sizes actually produced."""
     toks, n_reqs, n_ps, n_pt = _mixed(n_pref_seqs, pref_len, n_dec_seqs)
-    _, can_split, ub0, ub1 = _precompute_mixed_token_split(toks, n_reqs, n_pt, 0)
+    _, can_split, ub0, ub1 = mixed_tbo_vote(toks, n_reqs, n_pt, 0)
     assert can_split
 
     slices = split_mixed_token_midpoint(n_reqs, n_ps, n_pt, toks)
@@ -86,7 +93,7 @@ def test_decode_heavy_is_refused_by_both(n_pref_seqs, pref_len, n_dec_seqs):
     its peers' two.
     """
     toks, n_reqs, n_ps, n_pt = _mixed(n_pref_seqs, pref_len, n_dec_seqs)
-    _, can_split, ub0, ub1 = _precompute_mixed_token_split(toks, n_reqs, n_pt, 0)
+    _, can_split, ub0, ub1 = mixed_tbo_vote(toks, n_reqs, n_pt, 0)
     assert can_split is False
     assert (ub0, ub1) == (0, 0)
     assert split_mixed_token_midpoint(n_reqs, n_ps, n_pt, toks) is None
@@ -141,7 +148,7 @@ def test_ubatch0_pure_prefill_ubatch1_mixed(n_pref_seqs, pref_len, n_dec_seqs):
 def test_too_small_to_split():
     toks = np.asarray([1], dtype=np.int64)
     assert split_mixed_token_midpoint(1, 0, 0, toks) is None
-    _, can_split, _, _ = _precompute_mixed_token_split(toks, 1, 0, 0)
+    _, can_split, _, _ = mixed_tbo_vote(toks, 1, 0, 0)
     assert can_split is False
 
 
@@ -152,75 +159,73 @@ def test_min_token_bar_keys_off_prefill_only():
     can_split says yes, meets_min_tokens says not worth it.
     """
     toks, n_reqs, _, n_pt = _mixed(1, 100, 50)  # 100 prefill, 50 decode
-    meets_min, can_split, _, _ = _precompute_mixed_token_split(toks, n_reqs, n_pt, 8192)
+    meets_min, can_split, _, _ = mixed_tbo_vote(toks, n_reqs, n_pt, 8192)
     assert can_split is True
     assert meets_min is False
 
 
-def test_maybe_create_ubatch_slices_dispatches_to_mixed():
-    """The factory must route a mixed batch to the mixed splitter.
-
-    Regression: the mixed splitter existed and was unit-tested while nothing
-    called it -- `maybe_create_ubatch_slices` still took the prefill path,
-    which counts only `num_scheduled_tokens[:num_prefill_seqs]` and would have
-    produced slices that do not cover the decode rows.
-    """
-    from atom.utils.tbo.ubatch_splitting import maybe_create_ubatch_slices
-
-    # The shape the first end-to-end attempt actually produced.
-    toks = np.asarray([605] * 27 + [1], dtype=np.int64)
-    total = int(toks.sum())
-    slices = maybe_create_ubatch_slices(
-        num_reqs=28,
-        scheduled_tokens=total,
-        is_prefill=True,
-        num_scheduled_tokens=toks,
-        force=True,
-        num_prefill_seqs=27,
-        num_prefill_tokens=27 * 605,
+@pytest.fixture
+def runner_cut():
+    path = Path(__file__).resolve().parents[1] / "atom/model_engine/model_runner.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    method = next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "_cut_ubatches"
     )
-    assert slices is not None and len(slices) == 2
-    # Mixed splitter ran: only it fills these in.
-    assert all(s.num_prefill_tokens is not None for s in slices)
-    # And the slices span the whole batch, decode rows included.
-    assert slices[0].token_slice.start == 0
-    assert slices[-1].token_slice.stop == total
-
-
-@pytest.mark.parametrize("missing", ["num_scheduled_tokens", "num_prefill_seqs"])
-def test_maybe_create_ubatch_slices_mixed_refuses_missing_counts(missing):
-    """A mixed call without the row counts must fail loudly, not split on None."""
-    from atom.utils.tbo.ubatch_splitting import maybe_create_ubatch_slices
-
-    toks = np.asarray([605] * 27 + [1], dtype=np.int64)
-    kwargs = {
-        "num_reqs": 28,
-        "scheduled_tokens": int(toks.sum()),
-        "is_prefill": True,
-        "num_scheduled_tokens": toks,
-        "force": True,
-        "num_prefill_seqs": 27,
-        "num_prefill_tokens": 27 * 605,
+    scope = {
+        "ForwardMode": SimpleNamespace,
+        "ScheduledBatch": SimpleNamespace,
+        "replace": replace,
+        "split_mixed_token_midpoint": split_mixed_token_midpoint,
+        "cut_prefill_ubatches": cut_prefill_ubatches,
     }
-    kwargs[missing] = None
-    with pytest.raises(RuntimeError, match="mixed split needs"):
-        maybe_create_ubatch_slices(**kwargs)
-
-
-def test_maybe_create_ubatch_slices_leaves_prefill_path_alone():
-    """Without the mixed args the factory must behave exactly as before."""
-    from atom.utils.tbo.ubatch_splitting import maybe_create_ubatch_slices
-
-    toks = np.asarray([4096] * 4, dtype=np.int64)
-    slices = maybe_create_ubatch_slices(
-        num_reqs=4,
-        scheduled_tokens=int(toks.sum()),
-        is_prefill=True,
-        num_scheduled_tokens=toks,
-        force=True,
+    exec(  # noqa: S102 - execute the repository's CPU method without GPU imports
+        compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"), scope
     )
-    assert slices is not None
-    assert all(s.num_prefill_tokens is None for s in slices)
+    return scope["_cut_ubatches"]
+
+
+@dataclass
+class _Mode:
+    running_tokens: int
+    tbo_collective_active: bool = True
+    is_prefill: bool = True
+    ubatch_slices: object = None
+    pcp_groups: object = None
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_runner_routes_the_collective_cut(runner_cut, mixed):
+    tokens = [605] * 27 + ([1] if mixed else [])
+    batch = SimpleNamespace(
+        is_mixed=mixed,
+        is_dummy_run=False,
+        total_seqs_num=len(tokens),
+        total_seqs_num_prefill=27,
+        total_tokens_num_prefill=27 * 605,
+        num_scheduled_tokens=np.asarray(tokens),
+    )
+    runner = SimpleNamespace(config=SimpleNamespace(prefill_context_parallel_size=1))
+    result = runner_cut(runner, _Mode(sum(tokens)), batch)
+    assert len(result.ubatch_slices) == 2
+    assert result.ubatch_slices[0].token_slice.start == 0
+    assert result.ubatch_slices[-1].token_slice.stop == sum(tokens)
+    assert all(
+        (s.num_prefill_tokens is not None) == mixed for s in result.ubatch_slices
+    )
+
+
+def test_runner_rejects_invalid_mixed_collective_cut(runner_cut):
+    batch = SimpleNamespace(
+        is_mixed=True,
+        total_seqs_num=3,
+        total_seqs_num_prefill=1,
+        total_tokens_num_prefill=1,
+        num_scheduled_tokens=np.asarray([1, 8, 8]),
+    )
+    with pytest.raises(RuntimeError, match="invalid mixed split"):
+        runner_cut(SimpleNamespace(), _Mode(17), batch)
 
 
 def test_precompute_and_split_agree_on_random_batches():
@@ -229,12 +234,12 @@ def test_precompute_and_split_agree_on_random_batches():
     whether a split happens at all. A disagreement sizes the per-ubatch
     all_gathers differently across ranks: a hang, not an error."""
     from atom.utils.tbo.ubatch_splitting import (
-        _split_prefill_token_midpoint,
+        cut_prefill_ubatches,
         split_mixed_token_midpoint,
     )
     from atom.utils.tbo.ubatching import (
-        _precompute_mixed_token_split,
-        _precompute_prefill_token_split,
+        mixed_tbo_vote,
+        prefill_tbo_vote,
     )
 
     rng = np.random.default_rng(0)
@@ -249,8 +254,8 @@ def test_precompute_and_split_agree_on_random_batches():
         ).astype(np.int64)
         n_pref_tokens = int(toks[:n_pref].sum())
 
-        _, can, ub0, ub1 = _precompute_prefill_token_split(toks, n_pref, 0)
-        slices = _split_prefill_token_midpoint(n_pref, toks, 2) if n_pref else None
+        _, can, ub0, ub1 = prefill_tbo_vote(n_pref_tokens)
+        slices = cut_prefill_ubatches(n_pref, toks, n_pref_tokens) if n_pref else None
         assert can == (slices is not None)
         if can:
             assert [s.token_slice.stop - s.token_slice.start for s in slices] == [
@@ -258,7 +263,7 @@ def test_precompute_and_split_agree_on_random_batches():
                 ub1,
             ]
 
-        _, can, ub0, ub1 = _precompute_mixed_token_split(toks, n, n_pref_tokens, 0)
+        _, can, ub0, ub1 = mixed_tbo_vote(toks, n, n_pref_tokens, 0)
         slices = split_mixed_token_midpoint(n, n_pref, n_pref_tokens, toks)
         assert can == (slices is not None)
         if can:

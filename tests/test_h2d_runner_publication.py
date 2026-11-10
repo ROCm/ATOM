@@ -18,9 +18,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def runner_with_buffers(
-    monkeypatch, transport, pp_size=1, speculative=False, mixed=False, builder_cls=None
-):
+def runner_with_buffers(monkeypatch, pp_size=1, speculative=False, builder_cls=None):
     from atom.model_engine.model_runner import ModelRunner, tokenIDProcessor
 
     if builder_cls is None:
@@ -67,12 +65,9 @@ def runner_with_buffers(
     runner.forward_vars["cu_seqlens_q"] = CpuGpuBuffer(
         9, dtype=torch.int32, device=runner.device, publication_group="early"
     )
-    if mixed:
-        from atom.model_ops.attentions.deepseek_v4_attn import (
-            DeepseekV4AttentionMetadataBuilder,
-        )
-
-        builder_cls = DeepseekV4AttentionMetadataBuilder
+    runner.forward_vars["batch_id_per_q_token"] = CpuGpuBuffer(
+        64, dtype=torch.int32, device=runner.device, publication_group="early"
+    )
     builder = builder_cls.__new__(builder_cls)
     builder.model_runner = runner
     # Only the query prefix is allocated here; the backend's own phase
@@ -85,58 +80,7 @@ def runner_with_buffers(
 
 
 @pytest.mark.parametrize("pp_size", [1, 2])
-def test_mixed_query_spans_reach_independent_device_banks(
-    monkeypatch, transport, pp_size
-):
-    """Check the device consumers, including ring reuse and ragged decode rows."""
-    runner = runner_with_buffers(monkeypatch, transport, pp_size, mixed=True)
-    builder = runner.attn_metadata_builder
-    builder.build_mixed_prefill_banks()
-    observed = []
-    # Non-spec, rectangular spec, shrunk spec, then equal-total ragged layouts.
-    cases = (
-        ([5, 3], [1, 1, 1], [0, 5, 8], [0, 1, 2, 3]),
-        ([9], [8, 8], [0, 9], [0, 8, 16]),
-        ([2, 6], [4, 4], [0, 2, 8], [0, 4, 8]),
-        ([1, 7], [1, 3], [0, 1, 8], [0, 1, 4]),
-        ([3], [3, 1], [0, 3], [0, 3, 4]),
-    )
-    for prefill, decode, expected_prefill, expected_decode in cases * 2:
-        runner._advance_forward_vars()
-        runner._gate_staging_reuse()
-        live = runner.forward_vars["cu_seqlens_q"]
-        bank, _, _ = builder._get_mixed_prefill_bank()
-        private = bank["cu_seqlens_q"]
-        assert private.cpu.is_pinned() and live.cpu.is_pinned()
-        assert private.gpu.data_ptr() != live.gpu.data_ptr()
-        live.gpu.fill_(-99)
-        private.gpu.fill_(-99)
-        batch = SimpleNamespace(
-            is_mixed=True,
-            total_seqs_num=len(prefill) + len(decode),
-            total_seqs_num_prefill=len(prefill),
-            num_scheduled_tokens=np.array(prefill + decode, dtype=np.int32),
-        )
-        torch.cuda._sleep(2_000_000)
-        builder.publish_cu_seqlens_q(
-            batch, SimpleNamespace(running_bs=batch.total_seqs_num)
-        )
-        with builder.mixed_prefill_bank_active(batch) as variables:
-            prefill_gpu = variables["cu_seqlens_q"].gpu[: len(prefill) + 1].clone()
-        decode_gpu = live.gpu[: len(decode) + 1].clone()
-        observed.extend(
-            ((prefill_gpu, expected_prefill), (decode_gpu, expected_decode))
-        )
-        runner._mark_staging_h2d_enqueued()
-        runner._record_forward_vars_event()
-    torch.cuda.synchronize()
-    for actual, expected in observed:
-        assert actual.cpu().tolist() == expected
-
-
-@pytest.mark.parametrize("transport", ["direct", "packed"])
-@pytest.mark.parametrize("pp_size", [1, 2])
-def test_sampling_optional_members_and_scalar_filters(monkeypatch, transport, pp_size):
+def test_sampling_optional_members_and_scalar_filters(monkeypatch, pp_size):
     from atom.model_ops.sampler import SAMPLER_EPS
 
     runner = runner_with_buffers(monkeypatch, pp_size)
@@ -560,13 +504,14 @@ def test_packed_spec_indices_follow_decode_prefill_and_dummy_transitions(monkeyp
         bs, tokens = (0, 0) if idle else (3, 7)
         batch = SimpleNamespace(
             is_mixed=False,
-            scheduled_tokens=np.arange(7, dtype=np.int32) + 10,
-            total_tokens_num=7,
-            total_tokens_num_prefill=7 if prefill else 0,
-            total_tokens_num_decode=0 if prefill else 7,
-            total_seqs_num_prefill=3 if prefill else 0,
-            total_seqs_num_decode=0 if prefill else 3,
-            total_seqs_num=3,
+            scheduled_tokens=(np.arange(7, dtype=np.int32) + 10)[:tokens],
+            total_tokens_num=tokens,
+            has_prefill=prefill,
+            total_tokens_num_prefill=tokens if prefill else 0,
+            total_tokens_num_decode=0 if prefill else tokens,
+            total_seqs_num_prefill=bs if prefill else 0,
+            total_seqs_num_decode=0 if prefill else bs,
+            total_seqs_num=bs,
             num_spec_step=3,
             req_ids=[20, 30, 10][:bs],
             is_dummy_run=False,
@@ -735,7 +680,9 @@ def test_logprob_request_indices_share_sampling_publication(monkeypatch):
             return_logprobs=mask,
             total_tokens_num_prefill=1,
             total_seqs_num_prefill=3,
+            total_seqs_num_decode=0,
             is_mixed=False,
+            has_prefill=True,
             any_logprobs=any(mask),
             logprob_requested=tuple(i for i, enabled in enumerate(mask) if enabled),
         )
@@ -778,9 +725,10 @@ def test_logprob_host_rows_survive_step_and_slot_transitions(monkeypatch, pp_siz
         batch = SimpleNamespace(
             total_seqs_num=3,
             total_seqs_num_decode=0 if lengths is None else 3,
-            total_tokens_num_prefill=3 if lengths is None else 0,
             total_seqs_num_prefill=3 if lengths is None else 0,
             is_mixed=False,
+            total_tokens_num_prefill=3 if lengths is None else 0,
+            has_prefill=lengths is None,
             is_dummy_run=False,
             temperatures=np.ones(3),
             top_ks=np.full(3, -1),
@@ -826,16 +774,11 @@ def test_logprob_host_rows_survive_step_and_slot_transitions(monkeypatch, pp_siz
                 ]
 
 
-@pytest.mark.parametrize("transport", ["direct", "packed"])
 @pytest.mark.parametrize("pp_size", [1, 2])
-def test_mixed_logprobs_score_prefill_and_ragged_decode_rows(
-    monkeypatch, transport, pp_size
-):
+def test_mixed_logprobs_score_prefill_and_ragged_decode_rows(monkeypatch, pp_size):
     from atom.model_engine.token_logprobs import gather_token_logprobs
 
-    runner = runner_with_buffers(
-        monkeypatch, transport, pp_size, speculative=True, mixed=True
-    )
+    runner = runner_with_buffers(monkeypatch, pp_size, speculative=True)
     # Two prompt rows yield one logit each; decode contributes 4 then 2.
     # Exercise ring reuse as requests turn logprobs on and off.
     for mask in ([True, False, True, True], [False] * 4, [False, True, False, True]):
@@ -844,6 +787,7 @@ def test_mixed_logprobs_score_prefill_and_ragged_decode_rows(
         batch = SimpleNamespace(
             total_seqs_num=4,
             total_seqs_num_prefill=2,
+            total_seqs_num_decode=2,
             total_tokens_num_prefill=8,
             num_scheduled_tokens=np.asarray([5, 3, 4, 2]),
             is_mixed=True,
@@ -857,7 +801,9 @@ def test_mixed_logprobs_score_prefill_and_ragged_decode_rows(
             any_logprobs=any(mask),
             logprob_requested=tuple(i for i, enabled in enumerate(mask) if enabled),
         )
-        runner.prepare_sample(batch)
+        group = runner.h2d_groups["token_inputs"]
+        runner.prepare_sample(batch, group)
+        group.publish()
         if any(mask):
             # Distinct distributions make a wrong row observable in the scores.
             logits = torch.sin(torch.arange(56, device="cuda").reshape(8, 7).float())

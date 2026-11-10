@@ -94,8 +94,8 @@ def test_lm_head_selects_prefill_ends_and_all_decode_tokens(monkeypatch, decode_
     torch.testing.assert_close(actual, expected)
 
 
-@pytest.mark.parametrize("fn", ["prepare_mixed", "_build_ubatch_mixed_metadata"])
-def test_both_builders_assemble_the_carrier_through_the_helper(fn):
+def test_whole_batch_and_ubatch_use_the_carrier_helper():
+    fn = "prepare_mixed"
     """A second hand-built copy is how the two drifted apart before."""
     tree = ast.parse(_V4_ATTN.read_text(encoding="utf-8"))
     body = next(
@@ -142,6 +142,7 @@ def test_prepare_mixed_calls_both_halves_with_their_real_signatures(
     builder.model_runner = SimpleNamespace(
         forward_vars={"cu_seqlens_q": SimpleNamespace(np=cu)},
         tokenID_processor=SimpleNamespace(num_rejected=None),
+        h2d_groups={"decode_metadata": SimpleNamespace(publish=lambda: None)},
     )
     monkeypatch.setattr(
         builder_cls,
@@ -152,15 +153,16 @@ def test_prepare_mixed_calls_both_halves_with_their_real_signatures(
         builder_cls, "prepare_prefill", _stub("prepare_prefill", torch.arange(16))
     )
     monkeypatch.setattr(
-        builder_cls, "prepare_decode", _stub("prepare_decode", torch.arange(3))
+        builder_cls, "stage_decode", _stub("stage_decode", torch.arange(3))
     )
+    monkeypatch.setattr(builder_cls, "finish_decode", lambda *a: None)
     monkeypatch.setattr(v4, "_mixed_carrier", lambda *a: SimpleNamespace(args=a))
 
-    merged, positions = builder.prepare_mixed(batch, n_p + n_d)
+    merged, positions = builder.prepare_mixed(batch, n_p + n_d, p_tokens + n_d)
 
     pre = calls["prepare_prefill"]
     assert (pre["running_bs"], pre["running_tokens"]) == (n_p, p_tokens)
-    dec = calls["prepare_decode"]
+    dec = calls["stage_decode"]
     if num_spec_step == 0:
         assert dec["batch"].scheduled_spec_decode_tokens is None
     assert (dec["running_bs"], dec["running_tokens"], dec["max_seqlen_q"]) == (
@@ -233,12 +235,12 @@ def test_prefill_bank_clones_only_its_writers_and_preserves_live_bindings(
     groups = {
         "positions": "positions",
         "cu_seqlens_q": "early",
-        "block_tables": "prefill",
+        "block_tables": "seq_metadata",
         "v4_state": "v4_state",
         "plans": "v4_plans",
         "indexer": "v4_indexer",
-        "ub_inputs": "ub0_v4_inputs",
-        "ub_plans": "ub1_v4_plans",
+        "ub_inputs": "ub0_metadata",
+        "ub_plans": "ub1_metadata",
         "batch_id_per_q_token": None,
         "input_ids": "input_ids",
         "sampling": "sampling",

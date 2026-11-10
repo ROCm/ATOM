@@ -371,29 +371,16 @@ class UBatchWrapper(nn.Module):
         the step's in its micro-batches' order, ``token_order`` that order."""
         ub_attn = ctx.attn_metadata.ubatches[ubatch_idx]
 
-        if ctx.context.is_prefill:
-            ub_attn = self.attn_metadata_builder.build_ubatch_prefill_metadata(
-                ctx.attn_metadata,
-                ub_slice,
-                ub_running_bs,
-                ubatch_idx=ubatch_idx,
-            )
-        else:
-            attn_bs = actual_num_reqs if actual_num_reqs is not None else ub_running_bs
-            ub_attn = self.attn_metadata_builder.build_ubatch_metadata(
-                ubatch_idx,
-                attn_bs,
-            )
-
-        # Split Context
-        ub_scheduled_tokens = ub_slice.token_slice.stop - ub_slice.token_slice.start
-        if ub_running_tokens is not None:
-            running_tokens = ub_running_tokens
-        elif ctx.context.is_prefill:
-            running_tokens = ub_scheduled_tokens
-        else:
-            running_tokens = ub_running_bs * int(
-                getattr(ctx.attn_metadata, "max_seqlen_q", 1) or 1
+        # Split Context. Its tokens past its own requests' are padding.
+        ts = ub_slice.token_slice
+        ub_scheduled_bs = ub_slice.scheduled_bs(ctx.context.scheduled_bs)
+        ub_token_order = None if token_order is None else token_order[ts]
+        scheduled_tokens_gpu = ub_attn.scheduled_tokens_gpu
+        if scheduled_tokens_gpu is None:
+            scheduled_tokens_gpu = self._ubatch_scheduled_tokens_gpu(
+                ctx.context.scheduled_tokens_gpu,
+                ts.start,
+                ub_slice.scheduled_token_slice.stop,
             )
         ub_context = Context(
             positions=positions[..., ts],

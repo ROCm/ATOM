@@ -10,6 +10,7 @@ import torch
 pytest.importorskip("aiter")
 
 from atom.model_ops.attentions.deepseek_v4_attn import (
+    AttentionMetaData_DSV4,
     DeepseekV4AttentionMetadataBuilder,
     _mixed_carrier,
 )
@@ -52,7 +53,7 @@ def test_unequal_dp_rows_keep_token_padding_and_restore_full_draft_state(
     device = torch.device("cuda", torch.cuda.current_device())
 
     def metadata(lengths, slots, state):
-        return SimpleNamespace(
+        return AttentionMetaData_DSV4(
             cu_seqlens_q=torch.tensor(
                 [0, *np.cumsum(lengths)], device=device, dtype=torch.int32
             ),
@@ -84,17 +85,29 @@ def test_unequal_dp_rows_keep_token_padding_and_restore_full_draft_state(
         forward_vars={"v4_meta_state_slot_out": SimpleNamespace(gpu=published)}
     )
 
-    def rebuild_prefill(source, part, running_bs, ubatch_idx):
-        # Only the prefill kernel-plan construction is stubbed. Exercise the
-        # real mixed rebuild, carrier, wrapper workers and final state publish.
+    def prefill_child(part):
+        # Metadata is built before the worker contexts, as on a serving step.
         rs, ts = part.request_slice, part.token_slice
+        rs = slice(rs.start, min(rs.stop, len(prefill)))
         cu = np.asarray([0, *np.cumsum(prefill)])
         lens = np.minimum(cu[rs.start + 1 : rs.stop + 1], ts.stop) - np.maximum(
             cu[rs.start : rs.stop], ts.start
         )
         return metadata(lens, pslots[rs], AttnState.PREFILL_PREFIX)
 
-    monkeypatch.setattr(builder, "_rebuild_prefill_segment", rebuild_prefill)
+    first, last = splits[rank]
+    parent.ubatches = [
+        prefill_child(first),
+        _mixed_carrier(
+            prefill_child(last),
+            parent.decode_attn_metadata,
+            last.num_prefill_seqs,
+            len(decode),
+            last.num_prefill_tokens,
+            sum(decode),
+            last.running_bs,
+        ),
+    ]
     tokens = sum(prefill + decode)
     positions = torch.arange(tokens, device=device)
     ctx = ForwardContext(
@@ -111,7 +124,6 @@ def test_unequal_dp_rows_keep_token_padding_and_restore_full_draft_state(
         ),
         dp_metadata=DPMetadata(np.asarray([sum(p + d) for p, d in layouts])),
         ubatch_slices=splits[rank],
-        ub_max_tokens_across_dp=maxima,
         ub_tokens_across_dp=per_ubatch,
     )
     observed = []
@@ -126,7 +138,8 @@ def test_unequal_dp_rows_keep_token_padding_and_restore_full_draft_state(
             assert child.attn_metadata.state_slot_out.numel() == local_rows
             assert child.spec_decode_metadata is None
             padded, local_tokens = pad_for_all_gather(ids.float()[:, None], fill=0)
-            assert padded.shape == (maxima[i], 1)
+            assert padded.shape == (part.running_tokens, 1)
+            assert child.context.running_tokens_across_dp == per_ubatch[i]
             assert child.dp_metadata.max_tokens_across_dp == maxima[i]
             observed.append((i, local_rows, padded.shape[0]))
             return padded[:local_tokens]

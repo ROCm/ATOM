@@ -290,7 +290,12 @@ def test_the_non_deferred_branch_refuses_a_batch_carrying_drafts(is_mixed):
         batch.num_bonus = None
 
     with pytest.raises(NotImplementedError, match="num_spec_step=3"):
-        tokenIDProcessor.prepare_input_ids(processor, batch, 4)
+        tokenIDProcessor.prepare_input_ids(
+            processor,
+            _decode_batch(num_spec_step=3),
+            4,
+            processor.runner.h2d_groups["input_ids"],
+        )
 
 
 @pytest.mark.parametrize(("is_pd_producer", "expected_q"), [(False, 4), (True, 1)])

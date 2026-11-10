@@ -18,5 +18,9 @@ def capture_aux(tensor: torch.Tensor, buffer: torch.Tensor) -> None:
     """
     ctx = get_forward_context().context
     if not ctx.is_draft:
-        start = ctx.ubatch_token_offset
-        buffer[start : start + tensor.shape[0]].copy_(tensor)
+        tokens = ctx.ubatch_token_order
+        if tokens is None:
+            start = ctx.ubatch_token_offset
+            buffer[start : start + tensor.shape[0]].copy_(tensor)
+        else:
+            buffer.index_copy_(0, tokens, tensor)

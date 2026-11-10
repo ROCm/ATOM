@@ -259,14 +259,11 @@ class ParallelLMHead(VocabParallelEmbedding):
             context = forward_context.context
             attn_metadata = forward_context.attn_metadata
             # context = get_context()
-            # Mixed must be checked BEFORE is_prefill: a mixed batch carries
-            # prefill rows so context.is_prefill is also True, but it needs the
-            # combined gather (prefill last-tokens + all decode tokens), not the
-            # prefill-only gather.
             if getattr(attn_metadata, "is_mixed", False) and not context.is_draft:
                 x = x[attn_metadata.sampled_token_indices].contiguous()
             elif context.is_prefill and not context.is_draft:
-                last_indices = attn_metadata.cu_seqlens_q[1:] - 1
+                bs = context.scheduled_bs
+                last_indices = attn_metadata.cu_seqlens_q[1 : bs + 1] - 1
                 # Under Ulysses SP, x is this rank's token shard.
                 x = sp_gather_rows(x, last_indices)
             if self._can_use_dp_sharded_head(context):

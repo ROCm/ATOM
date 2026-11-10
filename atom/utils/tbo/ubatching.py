@@ -10,12 +10,7 @@ import torch
 
 from atom.config import get_current_atom_config
 from atom.utils import envs
-from atom.utils.tbo.ubatch_splitting import (
-    decode_bucket_splits,
-    decode_ubatch_request_ranges,
-    mixed_cut_inside_prefill,
-    token_midpoint_cuts,
-)
+from atom.utils.tbo.ubatch_splitting import NUM_TBO_UBATCHES, prefill_token_halves
 
 
 def tbo_overlap_enabled() -> bool:
@@ -34,148 +29,10 @@ def tbo_enabled() -> bool:
 # =====================================================================
 
 
-def _precompute_prefill_token_split(
-    num_scheduled_tokens: np.ndarray,
-    num_pref_reqs: int,
-    min_pref: int,
-) -> tuple[bool, bool, int, int]:
-    """Prefill, token-midpoint split (ATOM_TBO_PREFILL_TOKEN_SPLIT=1).
-
-    Cut at the exact token midpoint — this can slice THROUGH a request, so
-    request count is irrelevant (bs==1 still splits). Only the token total
-    matters. MUST mirror `_split_prefill_token_midpoint` in
-    ubatch_splitting.py, or the cross-DP MAX-reduced ub0/ub1 disagree with
-    the realised slices → all_gather size mismatch → RCCL hang.
-    """
-    num_pref_tokens = int(
-        np.asarray(num_scheduled_tokens[:num_pref_reqs], dtype=np.int64).sum()
-    )
-    # can_split: need >= 2 tokens to cut into two non-empty halves.
-    if num_pref_tokens < 2:
-        return False, False, 0, 0
-    # meets_min_tokens: this rank's prefill reached the min-token bar
-    # (ATOM_TBO_PREFILL_MIN_TOKENS, e.g. 8k) — big enough to be worth TBO.
-    meets_min_tokens = not (min_pref > 0 and num_pref_tokens < min_pref)
-    _, cut, end = token_midpoint_cuts(num_pref_tokens, 2)
-    return meets_min_tokens, True, cut, end - cut
-
-
-def _precompute_prefill_req_split(
-    num_scheduled_tokens: np.ndarray,
-    num_pref_reqs: int,
-    min_pref: int,
-) -> tuple[bool, bool, int, int]:
-    """Prefill, request-boundary balanced split (ATOM_TBO_PREFILL_TOKEN_SPLIT=0).
-
-    Split on a request boundary closest to the token midpoint, so each ubatch
-    gets a whole number of requests. Needs >= 2 requests to put at least one in
-    each ubatch.
-
-    Same two-bit contract as the token-split path, only the can_split structural
-    gate differs: here it's bs>=2 (request boundaries) instead of tokens>=2.
-    The min-token (8k) bar stays the soft OR-reduced `meets_min_tokens`, so one
-    rank clearing it turns TBO on for all and under-filled peers force-split.
-    """
-    # can_split: need >= 2 requests to give each ubatch at least one.
-    if num_pref_reqs < 2:
-        return False, False, 0, 0
-    toks = np.asarray(num_scheduled_tokens[:num_pref_reqs], dtype=np.int64)
-    num_pref_tokens = int(toks.sum())
-    # meets_min_tokens: this rank's prefill reached the min-token bar
-    # (ATOM_TBO_PREFILL_MIN_TOKENS, e.g. 8k) — big enough to be worth TBO.
-    meets_min_tokens = not (min_pref > 0 and num_pref_tokens < min_pref)
-    target = num_pref_tokens // 2
-    cumsum = 0
-    split_idx = 1
-    for j in range(num_pref_reqs):
-        cumsum += int(toks[j])
-        if cumsum >= target:
-            prev = cumsum - int(toks[j])
-            if j > 0 and (target - prev) < (cumsum - target):
-                split_idx = j
-            else:
-                split_idx = j + 1
-            break
-    split_idx = max(1, min(split_idx, num_pref_reqs - 1))
-    ub0 = int(toks[:split_idx].sum())
-    ub1 = num_pref_tokens - ub0
-    return meets_min_tokens, True, ub0, ub1
-
-
-def _precompute_mixed_token_split(
-    num_scheduled_tokens: np.ndarray,
-    num_reqs: int,
-    num_pref_tokens: int,
-    min_pref: int,
-) -> tuple[bool, bool, int, int]:
-    """Mixed ``[prefill | decode]``, token-midpoint split over the WHOLE batch.
-
-    Differs from `_precompute_prefill_token_split` in what it counts: that one
-    sums only ``num_scheduled_tokens[:num_pref_reqs]``, which for a mixed batch
-    silently drops every decode row and produces ub0/ub1 that do not add up to
-    the tokens actually forwarded.
-
-    ``meets_min_tokens`` still keys off the PREFILL tokens alone: the bar exists
-    to skip TBO when there is not enough prefill compute to hide communication
-    behind, and a few hundred decode rows do not change that.
-
-    MUST mirror `split_mixed_token_midpoint` in ubatch_splitting.py -- the
-    cross-DP MAX-reduce of ub0/ub1 sizes the per-ubatch buffers, so the two
-    disagreeing is an all_gather size mismatch, i.e. a hang.
-    """
-    total_tokens = int(
-        np.asarray(num_scheduled_tokens[:num_reqs], dtype=np.int64).sum()
-    )
-    # can_split: two non-empty halves, cut where the split itself cuts.
-    cuts = token_midpoint_cuts(total_tokens, 2)
-    if cuts is None:
-        return False, False, 0, 0
-
-    # Both children inherit prefill mode, so the cut must stay inside
-    # prefill: child 0 is pure prefill; child 1 owns the decode suffix.
-    if not mixed_cut_inside_prefill(cuts, num_pref_tokens):
-        return False, False, 0, 0
-
-    meets_min_tokens = not (min_pref > 0 and num_pref_tokens < min_pref)
-    _, cut, end = cuts
-    return meets_min_tokens, True, cut, end - cut
-
-
-def _precompute_decode(batch) -> tuple[bool, bool, int, int]:
-    """Decode, split by request count (uniform tokens per request).
-
-    can_split gate is `decode_bucket_splits`: it must be at least as strict as
-    the strictest backend's per-ubatch metadata / CUDAGraph-capture threshold,
-    or a rank can report "can_split" for a batch size that has no captured
-    graph / no prepared ubatch meta, tripping build_ubatch_metadata's assert.
-    Decode buckets record as TBO graphs on the same gate (model_runner) and V4
-    prepares meta only past it. Decode has no min-token bar, so
-    meets_min_tokens is always True here — if it can split, it's worth
-    splitting.
-    """
-    scheduled_bs = batch.total_seqs_num_decode
-    if not decode_bucket_splits(scheduled_bs):
-        return False, False, 0, 0
-    scheduled_tokens = batch.total_tokens_num
-    tokens_per_req = scheduled_tokens // scheduled_bs if scheduled_bs else 1
-    (ub0_start, ub0_end), _ = decode_ubatch_request_ranges(scheduled_bs, 2)
-    ub0 = (ub0_end - ub0_start) * tokens_per_req
-    ub1 = scheduled_tokens - ub0
-    return True, True, ub0, ub1
-
-
-def local_tbo_precompute(
-    config,
-    batch,
-    is_prefill: bool,
-    num_scheduled_tokens: np.ndarray,
-) -> tuple[bool, bool, int, int]:
-    """Decide locally this rank's TBO status, split into two bits.
-
-    Dispatches to exactly one of three paths:
-      * prefill + ATOM_TBO_PREFILL_TOKEN_SPLIT=1 -> token-midpoint split
-      * prefill + ATOM_TBO_PREFILL_TOKEN_SPLIT=0 -> request-boundary split
-      * decode                                    -> request-count split
+def prefill_tbo_vote(prefill_tokens: int) -> tuple[bool, bool, int, int]:
+    """This rank's TBO vote on a prefill of ``prefill_tokens``, cut at the
+    token midpoint (`prefill_token_halves`, the cut `cut_prefill_ubatches`
+    runs); a decode does not vote (`decide` splits the group's `running_bs`).
 
     Returns ``(meets_min_tokens, can_split, ub0_tokens, ub1_tokens)``:
 
@@ -195,35 +52,9 @@ def local_tbo_precompute(
     halves = prefill_token_halves(prefill_tokens)
     if halves is None:
         return False, False, 0, 0
-
-    if batch.is_mixed:
-        # With TBO on, a mixed batch takes the mixed split. Whatever it cannot
-        # split it refuses HERE, as can_split=False, not later in
-        # `_maybe_create_tbo_slices`: `can_split` is AND-reduced across DP so
-        # that one rank's refusal turns TBO off for everyone, and a rank that
-        # bailed out later would run 1 ubatch while its peers ran 2.
-        return _precompute_mixed_token_split(
-            num_scheduled_tokens,
-            batch.total_seqs_num,
-            batch.total_tokens_num_prefill,
-            envs.ATOM_TBO_PREFILL_MIN_TOKENS,
-        )
-
-    if is_prefill:
-        num_pref_reqs = batch.total_seqs_num_prefill
-        min_pref = envs.ATOM_TBO_PREFILL_MIN_TOKENS
-        if envs.ATOM_TBO_PREFILL_TOKEN_SPLIT:
-            return _precompute_prefill_token_split(
-                num_scheduled_tokens, num_pref_reqs, min_pref
-            )
-        return _precompute_prefill_req_split(
-            num_scheduled_tokens, num_pref_reqs, min_pref
-        )
-
-    # Decode path
-    if not config.enable_tbo_decode or batch.is_dummy_run:
-        return False, False, 0, 0
-    return _precompute_decode(batch)
+    min_tokens = envs.ATOM_TBO_PREFILL_MIN_TOKENS
+    meets_min_tokens = not (min_tokens > 0 and prefill_tokens < min_tokens)
+    return meets_min_tokens, True, *halves
 
 
 @dataclass
@@ -728,3 +559,32 @@ def make_tbo_contexts(
         ctx.partner = ctxs[(i + 1) % num_micro_batches]
 
     return ctxs
+
+
+def mixed_tbo_vote(
+    num_scheduled_tokens: np.ndarray,
+    num_reqs: int,
+    num_pref_tokens: int,
+    min_pref: int,
+) -> tuple[bool, bool, int, int]:
+    """Vote using a midpoint over all prefill and decode tokens.
+
+    The minimum-work threshold counts only prefill tokens. The split uses
+    the same `prefill_token_halves` boundary as `split_mixed_token_midpoint`
+    so the per-microbatch collective sizes match the slices being forwarded.
+    """
+    total_tokens = int(
+        np.asarray(num_scheduled_tokens[:num_reqs], dtype=np.int64).sum()
+    )
+    # can_split: two non-empty halves, cut where the split itself cuts.
+    halves = prefill_token_halves(total_tokens)
+    if halves is None:
+        return False, False, 0, 0
+
+    # Both children inherit prefill mode, so the cut must stay inside
+    # prefill: child 0 is pure prefill; child 1 owns the decode suffix.
+    if halves[0] >= num_pref_tokens:
+        return False, False, 0, 0
+
+    meets_min_tokens = not (min_pref > 0 and num_pref_tokens < min_pref)
+    return meets_min_tokens, True, *halves

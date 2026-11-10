@@ -35,6 +35,7 @@ def test_decode_rollback_and_positions(width, explicit, deferred, expected):
     variables = {
         "positions": SimpleNamespace(np=np.zeros(8, dtype=np.int32)),
         "context_lens": SimpleNamespace(np=np.zeros(2, dtype=np.int32)),
+        "batch_id_per_q_token": SimpleNamespace(np=np.repeat(np.arange(2), width)),
     }
     lens = np.full(2, width, dtype=np.int32)
     processor = SimpleNamespace(num_rejected=np.array([1, 2]), is_deferred_out=deferred)
@@ -47,6 +48,8 @@ def test_decode_rollback_and_positions(width, explicit, deferred, expected):
         ),
         decode_spans=lambda batch: (2, lens, np.array([0, width, 2 * width])),
         prepare_block_tables=stop_after_positions,
+        _check_metadata_writable=lambda *a: None,
+        _pad_tokens=lambda *a: None,
     )
     batch = SimpleNamespace(
         context_lens=[20, 24],
@@ -56,8 +59,8 @@ def test_decode_rollback_and_positions(width, explicit, deferred, expected):
     )
     counts = np.array([1, 2]) if explicit else None
     with pytest.raises(Prepared):
-        DeepseekV4AttentionMetadataBuilder.prepare_decode(
-            builder, batch, 2, 2 * width, width, num_rejected=counts
+        DeepseekV4AttentionMetadataBuilder.stage_decode(
+            builder, batch, 2, 2 * width, width, None, num_rejected=counts
         )
     assert variables["context_lens"].np.tolist() == expected
     positions = np.concatenate(
@@ -65,8 +68,8 @@ def test_decode_rollback_and_positions(width, explicit, deferred, expected):
     )
     np.testing.assert_array_equal(variables["positions"].np[: 2 * width], positions)
     with pytest.raises(ValueError, match="aligned"):
-        DeepseekV4AttentionMetadataBuilder.prepare_decode(
-            builder, batch, 2, 2 * width, width, num_rejected=np.array([1, 2, 3])
+        DeepseekV4AttentionMetadataBuilder.stage_decode(
+            builder, batch, 2, 2 * width, width, None, num_rejected=np.array([1, 2, 3])
         )
 
 
@@ -151,7 +154,9 @@ def test_aux_capture_uses_live_offsets(monkeypatch, compiled, mixed):
     from atom.spec_decode.drafter import Drafter
     from atom.utils import forward_context as fc
 
-    context = SimpleNamespace(is_draft=False, ubatch_token_offset=0)
+    context = SimpleNamespace(
+        is_draft=False, ubatch_token_offset=0, ubatch_token_order=None
+    )
     monkeypatch.setattr(
         fc._forward_context_local,
         "ctx",
@@ -193,6 +198,8 @@ def test_aux_capture_uses_live_offsets(monkeypatch, compiled, mixed):
         run(first)
     context.ubatch_token_offset = 3
     run(torch.full((2, 2), 2.0, device="cuda"))
+    context.ubatch_token_order = torch.tensor([5, 2], device="cuda")
+    run(torch.full((2, 2), 3.0, device="cuda"))
     context.is_draft = True
     run(torch.full((2, 2), 99.0, device="cuda"))
-    assert buffer[:, 0].tolist() == [1, 1, -1, 2, 2, -1]
+    assert buffer[:, 0].tolist() == [1, 1, 3, 2, 2, 3]

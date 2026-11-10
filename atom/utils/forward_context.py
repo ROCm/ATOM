@@ -703,6 +703,18 @@ class AttentionMetaData:
     num_cached_tokens: torch.Tensor | None = None
     seq_starts: torch.Tensor | None = None
 
+    # A TBO step's micro-batches' metadata, one per `ForwardMode.ubatch_slices`
+    # slice, built with the step's (`finish_ubatch_decode` /
+    # `finish_ubatch_prefill`). None when the step does not split.
+    ubatches: "list[AttentionMetaData] | None" = None
+    # A split decode's packed tokens in its micro-batches' order
+    # (`decode_ubatch_token_order`), which the TBO wrapper gathers its inputs
+    # by and scatters its outputs back through; None otherwise.
+    ubatch_token_order: torch.Tensor | None = None
+    # A decode micro-batch's own scheduled tokens on the device (`[1]`
+    # int32); None on a step's metadata and a prefill micro-batch's.
+    scheduled_tokens_gpu: torch.Tensor | None = None
+
     def __init__(
         self,
         cu_seqlens_q: torch.Tensor | None = None,

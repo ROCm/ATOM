@@ -878,9 +878,12 @@ microbatch is pure prefill and the second holds the remaining prefill tokens
 and every decode token. Both use the same carrier construction and SWA-mask
 rules as an unsplit mixed batch. Segment state is checked when that carrier
 is built, rather than repeatedly in every model layer.
+The builder stages, publishes, and finishes both segments before launching
+the TBO workers. Prefill microbatch metadata lives in the private prefill
+bank; the last mixed microbatch reuses the already-built decode metadata.
 With either setting of the mixed flag, DSpark aux hooks read the live
-microbatch offset through an opaque operation so compiled target regions do
-not retain a stale offset.
+microbatch offset or decode token permutation through an opaque operation
+so compiled target regions do not retain a stale write destination.
 
 ### Startup memory profiling
 
