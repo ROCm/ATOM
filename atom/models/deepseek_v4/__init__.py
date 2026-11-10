@@ -1216,14 +1216,21 @@ class Compressor(nn.Module):
             persistent=False,
         )
 
+    def project(self, x: torch.Tensor) -> torch.Tensor:
+        """`[num_tokens, dim]` -> `[num_tokens, 2 * coff * head_dim]`, the kv and
+        score `forward` pools. Single fused BF16 GEMM via tgemm."""
+        assert (
+            x.dim() == 2 and x.shape[-1] == self.dim
+        ), f"Compressor expects [num_tokens, {self.dim}], got {tuple(x.shape)}"
+        return self.wkv_gate(x)
+
     def forward(
         self,
-        x: torch.Tensor,  # [num_tokens, dim]
+        projected: torch.Tensor,  # [num_tokens, 2*coff*head_dim]
         plan: "CompressPlan",
         state_slot_in: torch.Tensor,  # [bs] int32
         state_slot_out: torch.Tensor,  # [bs] int32
         block_tables: torch.Tensor | None = None,  # [bs, max_blocks_per_seq] int32
-        combined: torch.Tensor | None = None,  # [T_full, 2*coff*head_dim]
     ) -> None:
         """Batched plan-style compress: one fused kernel call for the whole
         fwd's batch (across all seqs).
@@ -1252,7 +1259,9 @@ class Compressor(nn.Module):
         because the input act_quant simulation is applied upstream.
 
         Args:
-            x:           [num_tokens, dim] flat ragged batch hidden state.
+            projected:   `project(x)` of the flat ragged batch hidden state,
+                         gathered to the full sequence under PCP
+                         (`_pcp_gather_compressor_inputs`).
             plan:        CompressPlan from attn_metadata.compress_plans[ratio]
                          (or a synthetic bs=1 plan during warmup).
             state_slot_in:  [bs] int32 — state group each seq READS its incoming
@@ -1264,29 +1273,21 @@ class Compressor(nn.Module):
             block_tables: [bs, max_blocks_per_seq] int32 — physical block IDs
                          per seq; None during warmup (skips kv_cache scatter).
                          Required for the Indexer FP8 path (slot resolution).
-            combined:    `wkv_gate(x)`, already gathered to the full sequence
-                         under PCP (`_pcp_gather_compressor_inputs`); None
-                         projects `x` here.
         """
         assert self.rotary_emb is not None, "compressor.rotary_emb must be set by owner"
-        assert (
-            x.dim() == 2 and x.shape[-1] == self.dim
-        ), f"Compressor expects [num_tokens, {self.dim}], got {tuple(x.shape)}"
         ratio = self.compress_ratio
         overlap = self.overlap
         d = self.head_dim
         rd = self.rope_head_dim
 
-        # Single fused BF16 GEMM via tgemm. (Probing whether dropping the
-        # otype=fp32 upcast — relying on fused_compress_attn's internal fp32
-        # accumulator instead — is accuracy-neutral.) torch.split returns
-        # zero-copy strided views; downstream kernels (fused_compress_attn,
-        # update_compressor_states) accept strided kv/score (only inner
-        # stride must be 1).
+        # torch.split returns zero-copy strided views; downstream kernels
+        # (fused_compress_attn, update_compressor_states) accept strided
+        # kv/score (only inner stride must be 1).
         coff_d = (1 + overlap) * d
-        if combined is None:
-            combined = self.wkv_gate(x)
-        kv, score = torch.split(combined, [coff_d, coff_d], dim=-1)
+        assert projected.dim() == 2 and projected.shape[-1] == 2 * coff_d, tuple(
+            projected.shape
+        )
+        kv, score = torch.split(projected, [coff_d, coff_d], dim=-1)
 
         # ====== Unified fused kernel path (CSA + Indexer) ======
         # Order is critical: fused kernel reads state cache as-of-end-of-
@@ -2015,26 +2016,28 @@ class DeepseekV4Attention(nn.Module):
         )
         side = self._compressors_async()
         pairs = self._compressor_streams()
-        combined = (
+        gathered = (
             self._pcp_gather_compressor_inputs(x, [c for c, _ in pairs])
             if pairs and _pcp_active()
             else [None] * len(pairs)
         )
-        for (compressor, stream), comb in zip(pairs, combined):
+        for (compressor, stream), projected in zip(pairs, gathered):
             if side:
                 stream.wait_stream(fc.main_stream)
-                if comb is not None:
+                if projected is not None:
                     # Made on the main stream, which may reuse it once this
                     # returns: hold it until the side stream has read it.
-                    comb.record_stream(stream)
+                    projected.record_stream(stream)
             with torch.cuda.stream(stream) if side else nullcontext():
+                # Without PCP the projection runs on the side stream too.
+                if projected is None:
+                    projected = compressor.project(x)
                 compressor(
-                    x,
+                    projected,
                     plan=plan,
                     state_slot_in=attn_md.state_slot_in,
                     state_slot_out=attn_md.state_slot_out,
                     block_tables=attn_md.block_tables,
-                    combined=comb,
                 )
 
     @staticmethod
@@ -2046,7 +2049,7 @@ class DeepseekV4Attention(nn.Module):
         while a compressor pools `ratio` consecutive tokens; its plan and
         state slots are already full-sequence. Mirrors SGLang's
         compute_kv_score: gather after the projection, before the pooling."""
-        projected = [c.wkv_gate(x) for c in compressors]
+        projected = [c.project(x) for c in compressors]
         return tbo_on_comm(pcp_allgather_rerange_many, projected, get_pcp_world_size())
 
     def _compressor_streams(self):

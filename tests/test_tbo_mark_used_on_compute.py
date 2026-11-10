@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""`tbo_mark_used_on_compute`: a tensor allocated on the TBO comm stream and
+"""`_tbo_mark_used_on_compute`: a tensor allocated on the TBO comm stream and
 read on the compute stream must not be handed to the next comm-stream
 allocation while the compute stream has yet to read it. Under PCP+TBO the
 gathered extend K was overwritten that way by the other ubatch's gather."""
@@ -36,7 +36,7 @@ def _next_comm_allocation_takes_it(monkeypatch, mark: bool) -> bool:
     compute.wait_stream(comm)
     with torch.cuda.stream(compute):
         if mark:
-            ubatching.tbo_mark_used_on_compute(gathered)
+            ubatching._tbo_mark_used_on_compute(gathered)
         torch.cuda._sleep(100_000_000)  # the attention kernel, still queued
         gathered.sum()
     del gathered  # the forward returns; the host frees it
@@ -82,7 +82,7 @@ def test_marking_while_a_graph_records(monkeypatch):
         gathered = x * 2
         compute.wait_stream(comm)
         with torch.cuda.stream(compute):
-            ubatching.tbo_mark_used_on_compute(gathered)
+            ubatching._tbo_mark_used_on_compute(gathered)
             out = gathered + 1
         comm.wait_stream(compute)
     del gathered

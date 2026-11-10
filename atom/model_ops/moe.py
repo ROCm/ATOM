@@ -28,8 +28,8 @@ from atom.config import (
     QuantizationConfig,
     get_current_atom_config,
 )
+from atom.distributed.comm_utils import gather_rows
 from atom.distributed.pcp_utils import (
-    gather_rows,
     pcp_all_reduce,
     pcp_reduce_scatter,
 )

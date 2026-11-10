@@ -88,7 +88,7 @@ def test_uniform_rows_travel_in_one_collective(monkeypatch):
         sent, False, SimpleNamespace(), group
     )
 
-    # Every dtype travels as is but one-byte ones (`pcp_utils.gather_rows`).
+    # Every dtype travels as is but one-byte ones (`comm_utils.gather_rows`).
     assert group.calls == [([torch.bfloat16, torch.float32, torch.int32], [3, 3])]
     assert local_tokens == 3 and sizes is None
     _check(rows, sent, 3)

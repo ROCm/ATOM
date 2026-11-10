@@ -6,7 +6,6 @@ what it returns for the compute stream that reads it (why:
 test_tbo_mark_used_on_compute.py). CPU only: the TBO hooks and
 `record_stream` are monkeypatched."""
 
-import inspect
 import sys
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -23,7 +22,7 @@ def tbo(monkeypatch):
     log = []
     monkeypatch.setattr(ub, "tbo_active", lambda: True)
     monkeypatch.setattr(
-        ub, "tbo_yield_and_switch_from_compute_to_comm", lambda: log.append("comm")
+        ub, "_tbo_yield_and_switch_from_compute_to_comm", lambda: log.append("comm")
     )
     monkeypatch.setattr(ub, "tbo_switch_to_compute_sync", lambda: log.append("compute"))
     ctx = SimpleNamespace(compute_stream="compute stream")
@@ -70,7 +69,7 @@ def test_both_compressor_projections_are_held(tbo, monkeypatch):
         return list(gathered)
 
     monkeypatch.setattr(v4, "pcp_allgather_rerange_many", gather)
-    compressors = [SimpleNamespace(wkv_gate=lambda x, k=k: x + k) for k in (1, 2)]
+    compressors = [SimpleNamespace(project=lambda x, k=k: x + k) for k in (1, 2)]
     x = torch.zeros(4, 3)
     out = v4.DeepseekV4Attention._pcp_gather_compressor_inputs(x, compressors)
     assert [id(t) for t in out] == [id(t) for t in gathered]
@@ -118,7 +117,7 @@ def test_side_stream_compressors_hold_their_gathered_inputs(monkeypatch):
     combined = [torch.zeros(2), torch.ones(2)]
     streams = [SimpleNamespace(wait_stream=lambda s: None) for _ in combined]
     read = []
-    pairs = [(lambda x, combined, **kw: read.append(combined), s) for s in streams]
+    pairs = [(lambda projected, **kw: read.append(projected), s) for s in streams]
     attn = SimpleNamespace(
         compress_ratio=4,
         _compressors_async=lambda: True,
@@ -142,18 +141,87 @@ def test_side_stream_compressors_hold_their_gathered_inputs(monkeypatch):
     assert log == [(id(c), s) for c, s in zip(combined, streams)]
 
 
-def test_tbo_comm_phases_go_through_tbo_on_comm():
+def test_comm_phase_primitives_are_private():
     """A comm phase written out by hand -- yield, collective, switch back --
-    skips the hold: the PCP+TBO extend K was overwritten that way. Mori's
-    dispatch / combine return views of its own buffers, which the caching
-    allocator never hands out, so its hand-written phases stay."""
+    skips the hold: the PCP+TBO extend K was overwritten that way. So the
+    switch into a comm phase and the hold are not exported, and only MoRI
+    reaches the switch: its dispatch / combine return views of its own
+    buffers, which the caching allocator never hands out."""
+    import pathlib
+
+    import atom
+    import atom.utils.tbo as tbo_pkg
+
+    for name in ("yield_and_switch_from_compute_to_comm", "mark_used_on_compute"):
+        assert not hasattr(tbo_pkg, f"tbo_{name}"), name
+        assert not hasattr(tbo_pkg, f"_tbo_{name}"), name
+        assert not hasattr(ub, f"tbo_{name}"), name
+    root = pathlib.Path(atom.__file__).parent
+    users = {
+        str(p.relative_to(root))
+        for p in root.rglob("*.py")
+        if "_tbo_yield_and_switch_from_compute_to_comm" in p.read_text()
+    }
+    assert users == {
+        "utils/tbo/ubatching.py",
+        "model_ops/fused_moe/mori_prepare_finalize.py",
+    }, users
+
+
+def test_without_pcp_the_projection_runs_on_the_side_stream(monkeypatch):
+    """The compressor GEMM is part of what the side streams overlap with the
+    Q/KV projections."""
     v4 = pytest.importorskip("atom.models.deepseek_v4")
-    moe = pytest.importorskip("atom.model_ops.moe")
-    mdo = pytest.importorskip("atom.model_ops.module_dispatch_ops")
-    for src in (
-        inspect.getsource(v4),
-        inspect.getsource(moe.FusedMoE._run_experts),
-        inspect.getsource(moe.FusedMoE.forward_impl_graph),
-        inspect.getsource(mdo.tbo_all_reduce),
-    ):
-        assert "tbo_yield_and_switch_from_compute_to_comm(" not in src
+    log = []
+
+    class _Stream:
+        def __init__(self, name):
+            self.name = name
+
+        def wait_stream(self, s):
+            pass
+
+        def __enter__(self):
+            log.append(("enter", self.name))
+
+        def __exit__(self, *exc):
+            log.append(("exit", self.name))
+
+    class _Compressor:
+        def __init__(self, name):
+            self.name = name
+
+        def project(self, x):
+            log.append(("project", self.name))
+            return x + 1
+
+        def __call__(self, projected, **kw):
+            log.append(("compress", self.name))
+
+    monkeypatch.setattr(torch.cuda, "stream", lambda s: s)
+    monkeypatch.delenv("ATOM_V4_BYPASS_ATTN", raising=False)
+    pairs = [(_Compressor(n), _Stream(n)) for n in ("main", "indexer")]
+    attn = SimpleNamespace(
+        compress_ratio=4,
+        _compressors_async=lambda: True,
+        _compressor_streams=lambda: pairs,
+        _pcp_gather_compressor_inputs=lambda x, cs: pytest.fail(),
+    )
+    fc = SimpleNamespace(
+        context=SimpleNamespace(is_dummy_run=False),
+        attn_metadata=SimpleNamespace(
+            compress_plans={4: None},
+            state_slot_in=None,
+            state_slot_out=None,
+            block_tables=None,
+        ),
+        main_stream=None,
+    )
+    monkeypatch.setattr(v4, "get_forward_context", lambda: fc)
+    monkeypatch.setattr(v4, "_pcp_active", lambda: False)
+    v4.DeepseekV4Attention._launch_compressors(attn, torch.zeros(2))
+    assert log == [
+        (step, n)
+        for n in ("main", "indexer")
+        for step in ("enter", "project", "compress", "exit")
+    ]

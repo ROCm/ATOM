@@ -13,7 +13,7 @@ from torch import nn
 from atom.config import Config
 from atom.distributed.pcp_utils import (
     get_pcp_world_size,
-    pcp_allgather_rerange,
+    pcp_allgather_rerange_many,
     pcp_pad_len,
 )
 from atom.model_loader.loader import load_model
@@ -545,16 +545,25 @@ class Drafter(abc.ABC):
         """
         if not self._captures_aux:
             return None
-        blocks = self._aux_buffers
-        if self._relayed_aux is not None:
-            relayed = self._relayed_aux.shape[-1] // blocks[0].shape[-1]
-            blocks = [self._relayed_aux, *blocks[relayed:]]
+        blocks = self._aux_blocks()
         n = target_hidden_states.shape[0]
         n_local = pcp_aux_rows(n)
         if n_local is not None:
             pcp_ws = get_pcp_world_size()
-            return [pcp_allgather_rerange(buf[:n_local], pcp_ws)[:n] for buf in blocks]
+            gathered = pcp_allgather_rerange_many(
+                [buf[:n_local] for buf in blocks], pcp_ws
+            )
+            return [g[:n] for g in gathered]
         return [buf[:n] for buf in blocks]
+
+    def _aux_blocks(self) -> list[torch.Tensor]:
+        """The capture buffers, the leading ones replaced by the block relayed
+        from earlier PP stages (`take_relayed_aux`), if any."""
+        blocks = self._aux_buffers
+        if self._relayed_aux is not None:
+            relayed = self._relayed_aux.shape[-1] // blocks[0].shape[-1]
+            blocks = [self._relayed_aux, *blocks[relayed:]]
+        return blocks
 
     def take_relayed_aux(self, block: torch.Tensor) -> None:
         """This forward's leading taps, relayed from earlier PP stages as one

@@ -7,12 +7,6 @@ from torch import nn
 from torch.profiler import record_function
 
 from atom.distributed.dcp_utils import get_dcp_rank, get_dcp_world_size
-from atom.distributed.pcp_utils import (
-    get_pcp_world_size,
-    pcp_allgather_rerange_many,
-    pcp_pad_dense,
-    pcp_round_robin_split,
-)
 from atom.spec_decode.draft_graph import DraftGraph, StagedInput
 from atom.spec_decode.drafter import AuxCaptureSpec, Drafter, pcp_aux_rows
 from atom.spec_decode.dspark_verify import VerifyScheduler
@@ -618,13 +612,14 @@ class DSparkProposer(Drafter):
 
         Called once by the runner right after each target forward, while the
         forward context still holds the TARGET's slot mapping / cu_seqlens. Each
-        backbone overrides ``model.write_context_kv`` for its own storage:
+        backbone places the rows in its own storage, e.g.:
           * V4 (inline draft): scatter into a private rolling target-KV window.
           * Kimi-K3 (standalone draft): scatter into the paged sibling latent
             pool at the verified tokens' slots.
-        Both take the same ``(main_hidden_all, positions)`` contract, so this
-        hook stays flavor-agnostic -- the per-request geometry (window span vs
-        slot mapping) lives inside the model, read off the live forward context.
+        All take the same ``write_context_kv(aux, positions, pcp_num_tokens=None)``
+        contract, so this hook stays flavor-agnostic -- the per-request geometry
+        (window span vs slot mapping) lives inside the model, read off the live
+        forward context.
 
         Every scheduled row is written, prefill and decode alike: the read side
         gathers by absolute position without checking what was written, so
@@ -632,54 +627,26 @@ class DSparkProposer(Drafter):
         rows are harmless -- they land on future positions, unread until the
         step that accepts them rewrites them.
 
-        After a PCP row-split prefill a draft that projects row by row takes
-        `_write_split_context_kv` instead.
+        After a PCP row-split prefill the aux hooks hold this rank's stripe;
+        it goes to the model as is, which gathers what it needs.
 
         `next_token_ids` is unused: DSpark drafts from aux hidden states.
         """
         del next_token_ids
-        n_local = pcp_aux_rows(hidden_states.shape[0])
-        if n_local is not None and self._captures_aux and self.model.context_kv_by_rows:
-            self._write_split_context_kv(positions, hidden_states.shape[0], n_local)
+        if not self._captures_aux:
             return
-        aux_hidden_states = self.aux_for(hidden_states)
-        if aux_hidden_states is None:
-            return
-        forward_context = get_forward_context()
-        scheduled_bs = forward_context.context.scheduled_bs
-        # One block when every tap was relayed from earlier PP stages.
-        if len(aux_hidden_states) == 1:
-            main_hidden_all = aux_hidden_states[0]
-        else:
-            main_hidden_all = torch.cat(aux_hidden_states, dim=-1)
-        with record_function(
-            f"draft_kv[bs={scheduled_bs} tok={main_hidden_all.shape[0]}]"
-        ):
-            self.model.write_context_kv(main_hidden_all, positions)
-
-    def _write_split_context_kv(
-        self, positions: torch.Tensor, n: int, n_local: int
-    ) -> None:
-        """`compute_draft_kv` after a PCP row-split prefill of `n` rows, whose
-        aux hooks hold this rank's round-robin `n_local`. The context and its
-        window KV are projected row by row, so project these rows only and
-        gather each stage's KV rows (1 KiB a row) instead of the aux hidden
-        states."""
-        pcp_ws = get_pcp_world_size()
-        aux_local = torch.cat([buf[:n_local] for buf in self._aux_buffers], dim=-1)
-        local_positions = pcp_round_robin_split(
-            pcp_pad_dense(positions[:n], n_local * pcp_ws - n), pcp_ws
-        )
+        n = hidden_states.shape[0]
+        n_local = pcp_aux_rows(n)
         scheduled_bs = get_forward_context().context.scheduled_bs
         with record_function(f"draft_kv[bs={scheduled_bs} tok={n}]"):
-            ctx_local = self.model.project_context(aux_local)
-            layers = list(self.model.context_layers)
-            kv_rows = pcp_allgather_rerange_many(
-                [layer.context_kv_rows(ctx_local, local_positions) for layer in layers],
-                pcp_ws,
-            )
-            for layer, rows in zip(layers, kv_rows):
-                layer.write_context_kv_rows(rows[:n], positions)
+            if n_local is None:
+                aux = self.aux_for(hidden_states)
+                # One block when every tap was relayed from earlier PP stages.
+                aux = aux[0] if len(aux) == 1 else torch.cat(aux, dim=-1)
+                self.model.write_context_kv(aux, positions)
+            else:
+                aux = torch.cat([b[:n_local] for b in self._aux_blocks()], dim=-1)
+                self.model.write_context_kv(aux, positions, pcp_num_tokens=n)
 
     def propose(
         self,

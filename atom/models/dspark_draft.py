@@ -185,11 +185,6 @@ class DSparkDraftModel(nn.Module):
     # the proposer plans. A draft that attends its block another way (MiniMax-
     # M3.1's per-row MHA decode) builds what it reads in `prepare_paged_block`.
     block_attention_is_mla = True
-    # Whether `project_context` works row by row and every context layer splits
-    # `write_context_kv` into `context_kv_rows` (also row by row) and
-    # `write_context_kv_rows`, so a PCP prefill projects each rank's own rows
-    # and gathers the projected KV, not the aux states.
-    context_kv_by_rows = False
 
     def prepare_block(self, metadata_builder, num_draft, scheduled_bs, running_bs):
         """Mask padded writes for models whose draft pass mutates private KV."""
@@ -226,6 +221,7 @@ class DSparkDraftModel(nn.Module):
         self,
         aux_concat: torch.Tensor,  # [N, target_hidden * num_target_layers]
         positions: torch.Tensor,  # [N] absolute positions
+        pcp_num_tokens: int | None = None,
     ) -> None:
         """Absorb one target forward's hidden states into this draft's KV.
 
@@ -240,6 +236,10 @@ class DSparkDraftModel(nn.Module):
         ``aux_concat``. A drafter that has already retargeted the metadata to
         its own block pass (see ``DSparkProposer._propose_with_draft``) is
         past the point where these rows can be placed.
+
+        After a PCP row-split target prefill of ``pcp_num_tokens`` rows,
+        ``aux_concat`` is only this rank's round-robin stripe of them
+        (``pcp_aux_rows``); see ``write_split_context_kv``.
         """
         from atom.utils.forward_context import get_forward_context
 
@@ -251,9 +251,26 @@ class DSparkDraftModel(nn.Module):
         # the memory-profiling pass, so it must still run.
         if get_forward_context().context.is_dummy_run:
             return
+        if pcp_num_tokens is not None:
+            self.write_split_context_kv(aux_concat, positions, pcp_num_tokens)
+            return
         ctx_hidden = self.project_context(aux_concat)
         for layer in self.context_layers:
             layer.write_context_kv(ctx_hidden, positions)
+
+    def write_split_context_kv(
+        self,
+        aux_local: torch.Tensor,  # this PCP rank's round-robin stripe
+        positions: torch.Tensor,  # [num_tokens] absolute positions
+        num_tokens: int,
+    ) -> None:
+        """`write_context_kv` from this rank's stripe of the aux rows: gather
+        them, then write as usual. A draft that projects its context KV row by
+        row overrides this to gather the (smaller) KV rows instead."""
+        from atom.distributed.pcp_utils import pcp_allgather_rerange
+
+        aux = pcp_allgather_rerange(aux_local)[:num_tokens]
+        self.write_context_kv(aux, positions)
 
     def project_context(self, aux_concat: torch.Tensor) -> torch.Tensor:
         """Fuse the concatenated target aux hidden states into one [N, hidden]

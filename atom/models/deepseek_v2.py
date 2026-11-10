@@ -53,6 +53,7 @@ from atom.config import Config, QuantizationConfig, get_current_atom_config
 from atom.distributed.pcp_utils import (
     get_pcp_world_size,
     pcp_allgather_rerange,
+    pcp_allgather_rerange_many,
     pcp_is_enabled,
     pcp_pad_dense,
     pcp_pad_len,
@@ -1728,8 +1729,7 @@ class Indexer(nn.Module):
             if pcp:
                 pcp_ws = get_pcp_world_size()
                 # k is 1/pcp (from 1/pcp hidden); gather to full padded [S_pad].
-                k = pcp_allgather_rerange(k, pcp_ws)
-                positions_op = pcp_allgather_rerange(positions, pcp_ws)
+                k, positions_op = pcp_allgather_rerange_many([k, positions], pcp_ws)
             k = self.k_norm(k)
             if self.rope_dim:
                 q_pe, _ = torch.split(
@@ -2852,9 +2852,12 @@ class DeepseekV2ForCausalLM(nn.Module):
         # forward IntermediateTensors (already 1/pcp) unchanged.
         if pcp and get_pp_group().is_last_rank:
             if isinstance(hidden_states, tuple):
-                hs, aux = hidden_states
-                hs = pcp_allgather_rerange(hs, pcp_ws)[:n_global]
-                aux = [pcp_allgather_rerange(a, pcp_ws)[:n_global] for a in aux]
+                hs, *aux = (
+                    g[:n_global]
+                    for g in pcp_allgather_rerange_many(
+                        [hidden_states[0], *hidden_states[1]], pcp_ws
+                    )
+                )
                 hidden_states = (hs, aux)
             elif isinstance(hidden_states, torch.Tensor):
                 hidden_states = pcp_allgather_rerange(hidden_states, pcp_ws)[:n_global]

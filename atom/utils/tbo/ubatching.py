@@ -486,8 +486,10 @@ def tbo_get_compute_stream() -> torch.cuda.Stream:
     return _get_current_tbo_context().compute_stream
 
 
-def tbo_yield_and_switch_from_compute_to_comm():
-    """Record compute-done event, yield to other thread, switch to comm stream."""
+def _tbo_yield_and_switch_from_compute_to_comm():
+    """Record compute-done event, yield to other thread, switch to comm stream.
+    Private: a comm phase goes through `tbo_on_comm`, which also holds its
+    outputs for the compute stream. MoRI is the one caller outside it."""
     _get_current_tbo_context().yield_and_switch_from_compute_to_comm()
 
 
@@ -496,7 +498,7 @@ def tbo_switch_to_compute_sync():
     _get_current_tbo_context().switch_to_compute_sync()
 
 
-def tbo_mark_used_on_compute(*tensors):
+def _tbo_mark_used_on_compute(*tensors):
     """Mark `tensors`, allocated on this ubatch's comm stream, as in use on its
     compute stream, which reads them. Freed without it, their memory goes back
     to the comm stream at once, and the comm stream waits only on its own
@@ -522,10 +524,10 @@ def tbo_on_comm(fn: Callable, *args):
     just `fn(*args)`."""
     if not tbo_active():
         return fn(*args)
-    tbo_yield_and_switch_from_compute_to_comm()
+    _tbo_yield_and_switch_from_compute_to_comm()
     out = fn(*args)
     tbo_switch_to_compute_sync()
-    tbo_mark_used_on_compute(*(out if isinstance(out, (list, tuple)) else (out,)))
+    _tbo_mark_used_on_compute(out)
     return out
 
 
