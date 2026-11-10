@@ -32,6 +32,7 @@ from atom.model_engine.sequence import (
 )
 from atom.model_engine.state_runtime import StateRuntime
 from atom.observability import tracing
+from atom.structured_output import is_structured
 from atom.utils import (
     engine_process_name,
     envs,
@@ -70,6 +71,7 @@ class EngineCore:
 
     def __init__(self, config: Config, input_address: str, output_address: str):
         self.label = "Engine Core"
+        self._kv_progress_event = threading.Event()
         self.input_queue = queue.Queue[Sequence]()
         self.output_queue = queue.Queue[list[Sequence]]()
         self.stream_output_queue = (
@@ -130,10 +132,11 @@ class EngineCore:
             # the first tp_world_size shards get a process.
             self.runner_mgr = AsyncIOProcManager(
                 self._finalizer,
-                config.tp_world_size * config.prefill_context_parallel_size,
+                config.tp_world_size * config.pcp_group_size,
                 config.runner_qualname,
                 config,
                 on_worker_failure=self._send_engine_dead,
+                kv_progress_event=self._kv_progress_event,
             )
             self._post_model_load_hook()
             block_info = self.runner_mgr.call_func("get_num_blocks", wait_out=True)
@@ -210,7 +213,10 @@ class EngineCore:
             if (
                 config.parallel_config.data_parallel_size == 1
                 and config.pipeline_parallel_size == 1
-                and envs.ATOM_PREFILL_DECODE_INTERVAL > 0
+                and (
+                    envs.ATOM_PREFILL_DECODE_INTERVAL > 0
+                    or config.prefill_admit_policy == "adaptive"
+                )
             ):
                 self._init_prefill_delayer(config)
 
@@ -262,6 +268,7 @@ class EngineCore:
                 prefill_decode_interval=envs.ATOM_PREFILL_DECODE_INTERVAL,
                 exchange_prefill_costs=self.scheduler.cost_balance,
                 cost_gate=envs.ATOM_PREFILL_DELAYER_COST_GATE,
+                admit_policy=config.prefill_admit_policy,
             )
         )
 
@@ -479,7 +486,10 @@ class EngineCore:
             except Exception:
                 logger.exception("KV event publish in engine-step finally failed")
 
-    def _release_multimodal_requests(self, sequences):
+    def _release_request_resources(self, sequences):
+        structured_ids = [seq.id for seq in sequences if is_structured(seq)]
+        if structured_ids:
+            self.runner_mgr.call_func("release_structured_requests", structured_ids)
         request_ids = [
             seq.id for seq in sequences if getattr(seq, "cache_seed", -1) != -1
         ]
@@ -489,6 +499,10 @@ class EngineCore:
             self.runner_mgr.call_func("release_multimodal_requests", request_ids)
 
     def _process_engine_step_inner(self):
+        # Clear before scheduling/polling, never between checking progress and
+        # waiting. Arrivals during this step remain latched until the next step.
+        if self.kv_transfer_enabled:
+            self._kv_progress_event.clear()
         result = self.scheduler.schedule()
 
         # Surface admit-rejected seqs (those `_unschedulable_reason` flags in
@@ -497,7 +511,7 @@ class EngineCore:
         # the rejected seq will never produce.
         rejected = self.scheduler.take_rejected()
         if rejected:
-            self._release_multimodal_requests(rejected)
+            self._release_request_resources(rejected)
             self.output_queue.put_nowait(rejected)
 
         if result is None:
@@ -511,9 +525,8 @@ class EngineCore:
             return False
 
         # Dispatch KV connector metadata to workers (triggers async KV load)
-        if (
-            self.kv_transfer_enabled
-            and scheduled_batch.connector_meta_output is not None
+        if self.kv_transfer_enabled and connector_metadata_has_work(
+            scheduled_batch.connector_meta_output
         ):
             self.runner_mgr.call_func(
                 "process_kvconnector_output", scheduled_batch.connector_meta_output
@@ -535,17 +548,27 @@ class EngineCore:
                 # Arm post-prefill decode protection only after the prefill
                 # forward really completed. A delayer FIRE merely grants
                 # admission and can still result in a decode/empty batch.
-                self.scheduler.prefill_delayer.notify_prefill_executed()
+                self.scheduler.prefill_delayer.notify_prefill_executed(
+                    scheduled_batch.total_tokens_num_prefill
+                )
 
         # Aggregate KV transfer status from all workers (only when PD disaggregation is active)
-        self._poll_kv_transfer_progress()
+        kv_progress = self._poll_kv_transfer_progress()
 
         if not has_seqs:
             logger.debug("%s: Empty scheduled batch, skipping postprocess", self.label)
+            if self.kv_transfer_enabled and not kv_progress:
+                self._wait_for_kv_progress()
             return False
 
         self._postprocess(seqs.values(), fwd_out, scheduled_batch)
         return True
+
+    def _wait_for_kv_progress(self) -> None:
+        # Work queued before the event was cleared must also prevent sleeping.
+        if not self.input_queue.empty() or not self.utility_queue.empty():
+            return
+        self._kv_progress_event.wait(KV_IDLE_DRAIN_INTERVAL_S)
 
     def _postprocess(self, seqs, fwd_out, batch):
         # Pass stream_output_queue to postprocess for streaming callbacks
@@ -566,7 +589,7 @@ class EngineCore:
             pass
 
         if finished_seqs:
-            self._release_multimodal_requests(finished_seqs)
+            self._release_request_resources(finished_seqs)
             self.output_queue.put_nowait(finished_seqs)
 
     def has_pending_kv_work(self) -> bool:
@@ -644,9 +667,9 @@ class EngineCore:
         except Exception:
             logger.exception("KV transfer drain during shutdown failed")
 
-    def _poll_kv_transfer_progress(self) -> None:
+    def _poll_kv_transfer_progress(self) -> bool:
         if not self.kv_transfer_enabled:
-            return
+            return False
         kvoutput = self.runner_mgr.call_func_with_aggregation("async_proc_aggregation")
         self.scheduler._update_from_kv_xfer_finished(kvoutput)
         # Reclaim any offload save whose completion report never came (LMCache
@@ -655,6 +678,7 @@ class EngineCore:
         reconcile = getattr(self.scheduler, "_reconcile_stalled_deferred_saves", None)
         if callable(reconcile):
             reconcile()
+        return kvoutput is not None and not kvoutput.is_empty()
 
     def _poll_dynamic_chunking_calibration(self) -> None:
         """Install a freshly calibrated chunk latency model, if one is ready.
@@ -745,6 +769,23 @@ class EngineCore:
             self.scheduler.extend(recv_reqs)
         return False
 
+    def _offer_tier_lookups(self, reqs) -> None:
+        """Let an offload connector start tier lookups for arrived requests.
+
+        Runs on this IO thread, so a lookup is sent while the engine thread is
+        still inside a forward instead of when it next schedules. Only a
+        connector with a lookup thread defines `offer_lookups`.
+        """
+        connector = getattr(getattr(self, "scheduler", None), "kv_connector", None)
+        offer = getattr(connector, "offer_lookups", None)
+        if not callable(offer):
+            return
+        try:
+            offer(reqs)
+        except Exception:
+            # The scheduler's own prefetch still sends these lookups.
+            logger.warning(f"{self.label}: offering tier lookups failed", exc_info=True)
+
     def process_input_sockets(self, input_address: str, control_address: str):
         """Input IO thread, serving both the request and control sockets.
 
@@ -802,14 +843,18 @@ class EngineCore:
                             f"{self.label}: input get {request_type} {req_ids}"
                         )
                         self.input_queue.put_nowait(reqs)
+                        self._kv_progress_event.set()
+                        self._offer_tier_lookups(reqs)
                     elif request_type == EngineCoreRequestType.UTILITY:
                         cmd = reqs.get("cmd") if isinstance(reqs, dict) else None
                         logger.debug(f"{self.label}: input get UTILITY command: {cmd}")
                         self.utility_queue.put_nowait((cmd, reqs))
                         self._has_pending_utility = True
+                        self._kv_progress_event.set()
                     elif request_type == EngineCoreRequestType.SHUTDOWN:
                         logger.debug(f"{self.label}: input get {request_type}")
                         self.input_queue.put_nowait([get_exit_sequence()])
+                        self._kv_progress_event.set()
                         alive = False
                         reason = request_type
             logger.debug(f"{self.label}: input thread exit due to {reason}")
@@ -876,8 +921,6 @@ class DPEngineCoreProc(EngineCore):
         self.dp_rank = config.parallel_config.data_parallel_rank
         # self.dp_group = config.parallel_config.stateless_init_dp_group()
         super().__init__(config, input_address, output_address)
-        # Initialize to True so first iteration reaches all_reduce
-        self.engines_running = True
         self._shutting_down = False
 
         self._init_prefill_delayer(config, self.dp_group)
@@ -947,11 +990,7 @@ class DPEngineCoreProc(EngineCore):
                     time.sleep(0.01)
                     continue
 
-                if not global_has_unfinished and not self.engines_running:
-                    self.engines_running = False
-                    # Pass one never lands here -- `engines_running` starts
-                    # True so the first all_reduce runs -- so window one also
-                    # carries that rendezvous. The first line is warmup.
+                if not global_has_unfinished:
                     # Global, not local: a locally idle rank reaching the pair
                     # below is running a dummy for its peers, which is work.
                     self.scheduler.engine_stats.note_idle(now)
@@ -971,8 +1010,6 @@ class DPEngineCoreProc(EngineCore):
                 # After the pair, so the idle rank's dummy counts too: that is
                 # what keeps every rank's step number equal. See `bump_step`.
                 self.scheduler.engine_stats.bump_step()
-
-                self.engines_running = global_has_unfinished
         finally:
             try:
                 # Isolate the final publish so a publisher hiccup cannot skip
@@ -987,11 +1024,9 @@ class DPEngineCoreProc(EngineCore):
                 tracing.shutdown()
 
     def _execute_dummy_batch(self):
-        prefill = self.scheduler.dummy_prefill
-        fwd_out = self.runner_mgr.call_func("dummy_execution", prefill, wait_out=True)
-        if prefill and self.scheduler.running:
-            # This rank decoded last step and gave this tick to its peers'
-            # prefill: the tokens that step sampled come back with this
+        fwd_out = self.runner_mgr.call_func("dummy_execution", wait_out=True)
+        if self.scheduler.running:
+            # The tokens this rank's last real step sampled come back with this
             # forward (deferred output), and land like any step's.
             self._postprocess((), fwd_out, None)
 

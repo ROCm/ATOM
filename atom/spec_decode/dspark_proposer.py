@@ -34,13 +34,15 @@ def _stage_anchors_kernel(
     scheduled_bs,
     vocab_max,
 ):
-    """One row of the padded batch; a pad row repeats the last real one."""
+    """One of the `running_bs` rows; one past `scheduled_bs` is token 0 at
+    position 0."""
     i = tl.program_id(0)
-    src = tl.minimum(i, scheduled_bs - 1)
+    real = i < scheduled_bs
     # Seatbelt: markov_w1 is a raw nn.Embedding, so a -1 anchor traps it.
-    token = tl.load(next_token_ids + src)
+    token = tl.load(next_token_ids + i, mask=real, other=0)
     tl.store(ids_out + i, tl.minimum(tl.maximum(token, 0), vocab_max))
-    tl.store(positions_out + i, tl.load(positions + tl.load(rows + src)))
+    row = tl.load(rows + i, mask=real, other=0)
+    tl.store(positions_out + i, tl.load(positions + row, mask=real, other=0))
 
 
 class DSparkProposer(Drafter):
@@ -191,9 +193,10 @@ class DSparkProposer(Drafter):
                 num_warps=1,
             )
         else:
-            src = torch.arange(running_bs).clamp_(max=scheduled_bs - 1)
-            ids.copy_(next_token_ids[src].clamp(0, vocab_max))
-            anchor_positions.copy_(positions[rows[src]])
+            ids.zero_()
+            anchor_positions.zero_()
+            ids[:scheduled_bs] = next_token_ids.clamp(0, vocab_max)
+            anchor_positions[:scheduled_bs] = positions[rows[:scheduled_bs]]
         return self.block.stage(
             running_bs, {"anchor_ids": ids, "anchor_positions": anchor_positions}
         )
@@ -447,9 +450,9 @@ class DSparkProposer(Drafter):
         Whether there is paged state to describe is a property of the POOL, not
         of ``is_dummy_run``. Two passes carry that flag and only one of them
         lacks a pool: ``warmup_model()`` runs before ``allocate_kv_cache()``,
-        while ``dummy_execution()``'s DP-alignment step is a dummy whose pool is
-        fully bound. Gating on the flag would let the second one through
-        describing whatever the previous real step left behind.
+        while a dynamic-chunking profile runs after it, its pool fully bound.
+        Gating on the flag would let the second one through describing
+        whatever the previous real step left behind.
         """
         layer_num = self.model.first_attention_layer_num
         cache_data = forward_context.kv_cache_data or {}
@@ -515,24 +518,41 @@ class DSparkProposer(Drafter):
         return self._verify_scheduler
 
     # ---- aux-hidden-state ownership (declarative; base owns the hook machinery) ----
-    def _aux_capture_spec(self, target_model: nn.Module) -> AuxCaptureSpec:
-        """Resolve the draft's feature contract; the base owns capture buffers."""
-        draft_cfg = self.speculative_config.draft_model_hf_config
+    @classmethod
+    def aux_capture_spec(cls, config) -> AuxCaptureSpec | None:
+        """Default DSpark aux-capture spec, from config alone (None if no DSpark)."""
+        spec_cfg = getattr(config, "speculative_config", None)
+        if spec_cfg is None or not spec_cfg.use_dspark():
+            return None
+        draft_cfg = spec_cfg.draft_model_hf_config
         layer_ids = tuple(
-            int(i) for i in getattr(draft_cfg, "dspark_target_layer_ids", ())
+            int(i) for i in (getattr(draft_cfg, "dspark_target_layer_ids", None) or ())
         )
         if not layer_ids:
             raise ValueError(
                 "DSpark requires dspark_target_layer_ids on the draft config."
             )
-        own = getattr(self.model, "target_aux_capture_spec", None)
-        if own is not None:
-            return own(layer_ids, self.config.hf_config.hidden_size)
         return AuxCaptureSpec(
             layer_ids=layer_ids,
-            hidden_size=self.config.hf_config.hidden_size,
-            extract=self._extract_layer_hidden,
+            hidden_size=config.hf_config.hidden_size,
+            extract=cls._extract_layer_hidden,
         )
+
+    def _aux_capture_spec(self) -> AuxCaptureSpec:
+        """Resolve the draft's feature contract; the base owns capture buffers."""
+        spec = self.aux_capture_spec(self.config)
+        own = getattr(self.model, "target_aux_capture_spec", None)
+        if own is None:
+            return spec
+        if int(getattr(self.config, "pipeline_parallel_size", 1) or 1) > 1:
+            # Drafterless PP stages can only rebuild the default spec; relaying
+            # it to a draft with its own contract would be silently wrong.
+            raise NotImplementedError(
+                f"{type(self.model).__name__} declares its own "
+                "target_aux_capture_spec, which pipeline parallelism cannot "
+                "reconstruct on a drafterless stage."
+            )
+        return own(spec.layer_ids, spec.hidden_size)
 
     @staticmethod
     def _extract_layer_hidden(output, block: nn.Module):
@@ -627,7 +647,11 @@ class DSparkProposer(Drafter):
             return
         forward_context = get_forward_context()
         scheduled_bs = forward_context.context.scheduled_bs
-        main_hidden_all = torch.cat(aux_hidden_states, dim=-1)
+        # One block when every tap was relayed from earlier PP stages.
+        if len(aux_hidden_states) == 1:
+            main_hidden_all = aux_hidden_states[0]
+        else:
+            main_hidden_all = torch.cat(aux_hidden_states, dim=-1)
         with record_function(
             f"draft_kv[bs={scheduled_bs} tok={main_hidden_all.shape[0]}]"
         ):
@@ -812,9 +836,9 @@ class DSparkProposer(Drafter):
         exactly the block, slot -1 -- and both halves of that are load-bearing.
 
         Slot -1 is the cache-store kernel's drop value. Unlike V4's, this block
-        WRITES the KV it attends, and `DraftGraph._stage_one` tail-repeats the
-        last real anchor, so a pad row addressing normally would scribble draft
-        KV into the pages of the request that anchor belongs to.
+        WRITES the KV it attends, and a row past `scheduled_bs` anchors
+        (`_stage_anchors`) at position 0, a real position, so one addressing
+        normally would scribble draft KV into a live page.
 
         The non-empty CONTEXT is why this tail may NOT follow `prepare_decode`,
         which zeroes both `context_lens` and `kv_last_page_lens`. A pad row
@@ -1102,19 +1126,11 @@ class DSparkProposer(Drafter):
         T = self.draft_tokens_per_seq
         context = forward_context.context
         running_bs = context.running_bs
-        # A DP-alignment dummy (`dummy_execution`) arrives with the pool bound
-        # but not one row that owns a page: its sequence is fabricated and its
-        # block table is [0]. It still has to run -- the peers mirror the
-        # collectives this pass carries -- so describe every row as PAD, which
-        # is the shape that already means "aimed at nowhere, writes nothing".
-        # `scheduled_bs` itself keeps counting the real rows: it is what the
-        # caller's ids are sliced back to.
-        described_bs = 0 if context.is_dummy_run else scheduled_bs
         self._build_paged_block_metadata(
             forward_context,
             attn_metadata,
             staged["anchor_positions"],
-            scheduled_bs=described_bs,
+            scheduled_bs=scheduled_bs,
             # Upper bound rather than a .max() host sync: every context_len is
             # at most the target pass's longest sequence plus the block.
             max_seqlen_k=int(attn_metadata.max_seqlen_k) + T,

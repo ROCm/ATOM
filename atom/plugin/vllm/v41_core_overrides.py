@@ -184,7 +184,6 @@ class VllmDeepseekV41MetadataBuilder(DeepseekV41MetadataBuilder):
         tentative=False,
         is_prefill=False,
         start_positions=None,
-        query_prefix_ready=False,
         engram_live=True,
         cache_override=None,
     ):
@@ -193,19 +192,6 @@ class VllmDeepseekV41MetadataBuilder(DeepseekV41MetadataBuilder):
         ``cache_override`` selects private profiling capture storage without
         changing the serving binding or forcing a verify batch into prefill.
         """
-        # Once graphs bind the serving pool, an idle DP rank must publish
-        # padding into that pool's metadata. A fresh scratch cache would refill
-        # different indptr addresses while replay still reads the captured ones.
-        if self._idle(batch) and cache_override is None:
-            return self._prepare_idle(
-                batch,
-                running_bs,
-                running_tokens,
-                max_q_len=max_q_len,
-                tentative=tentative,
-                is_prefill=is_prefill,
-                query_prefix_ready=query_prefix_ready,
-            )
         spans, rows, offset, next_page = [], [], 0, 0
         slots = batch.state_slots_committed
         if not batch.is_dummy_run and len(slots) != batch.total_seqs_num:
@@ -214,8 +200,6 @@ class VllmDeepseekV41MetadataBuilder(DeepseekV41MetadataBuilder):
             zip(batch.req_ids, batch.num_scheduled_tokens, batch.context_lens)
         ):
             length, end = int(length), int(end)
-            if length == 0:
-                continue
             if batch.is_dummy_run:
                 # Warmup uses private scratch. A dummy rank may never mutate
                 # a live slot or PAGE, even when its fabricated block ID is 0.
@@ -235,15 +219,14 @@ class VllmDeepseekV41MetadataBuilder(DeepseekV41MetadataBuilder):
             offset += length
         if offset != batch.total_tokens_num or running_tokens < offset:
             raise ValueError("CSA2 batch token spans disagree with the runner")
-        # Each span's batch index: zero-token scheduler rows have none.
-        scheduled = np.flatnonzero(batch.num_scheduled_tokens)
         resumes, floors, cached_until, histories = (
             (None,) * 4
             if batch.is_dummy_run or not batch.replaying
-            else self._replay_layout(batch.replaying, scheduled, spans)
+            else self._replay_layout(batch.replaying, spans)
         )
         cache = cache_override
         if cache is None:
+            # Fabricated requests get private scratch.
             cache = (
                 self._capture_dummy_cache(
                     max(next_page, 1), max(len(spans), 1), running_tokens
@@ -253,7 +236,10 @@ class VllmDeepseekV41MetadataBuilder(DeepseekV41MetadataBuilder):
             )
         if cache is None:
             raise RuntimeError("CSA2 cache must be allocated before serving")
-        compacted = len(spans) != len(batch.req_ids)
+        # No runner token inputs carry the query metadata here.
+        self.publish_query_metadata(
+            np.asarray(batch.num_scheduled_tokens, np.int32), running_bs, running_tokens
+        )
         return self._prepare_step(
             batch,
             spans,
@@ -264,14 +250,7 @@ class VllmDeepseekV41MetadataBuilder(DeepseekV41MetadataBuilder):
             max_q_len=max_q_len,
             tentative=tentative,
             is_prefill=is_prefill,
-            query_prefix_ready=query_prefix_ready and not compacted,
-            query_prefix_republish_reason=(
-                "compact zero-token scheduler rows for CSA2 after input assembly"
-                if query_prefix_ready and compacted
-                else None
-            ),
             engram_live=engram_live,
-            scheduled=scheduled,
             replay_layout=(resumes, floors, cached_until, histories),
         )
 
@@ -296,8 +275,21 @@ class VllmDeepseekV41MetadataBuilder(DeepseekV41MetadataBuilder):
 # alone.
 
 
+def _is_vllm_warmup_request(req_id) -> bool:
+    """vLLM's synthetic warmup request, by vLLM's own naming."""
+    text = str(req_id)
+    return text.startswith("_warmup_") and text.endswith("_")
+
+
 class VllmBackedPagedAttentionCache(PagedAttentionCache):
     """`PagedAttentionCache` over a slab somebody else owns."""
+
+    #: Set by the state-checkpoint runtime when checkpoints are on. Called with
+    #: `[(slot, wanted_position, request_id)]` for exactly the rows whose cursor
+    #: is not where the scheduler wants it; returns how many it restored.
+    checkpoint_restore = None
+    #: The requests the previous `prepare_state` saw; see `_may_restore`.
+    _last_step_ids: frozenset = frozenset()
 
     def __init__(self, *args, backing: torch.Tensor, **kwargs):
         # Set before `super().__init__`, which calls `_allocate_backing` while
@@ -307,24 +299,107 @@ class VllmBackedPagedAttentionCache(PagedAttentionCache):
         super().__init__(*args, **kwargs)
 
     def prepare_state(self, step, *, histories=True):
-        """Keep the blocking probe workaround on this frontend by default.
+        """Defer the cursor read as native ATOM does, where that is measured.
 
-        A concurrent FULL_AND_PIECEWISE run reported stale state with the
-        deferred probe while the later cursor dump was consistent. Those are
-        different observation times, not proof that the probe buffer raced.
-        Explicit metadata publication does not establish the probe's safety;
-        keep this workaround until a separate test does.
-
-        `ATOM_V41_BLOCKING_STATE_PROBE=0` opts back out.
+        The caller's deferred read (`histories=False`) is kept only while
+        `serving_synchronously`: the host there waits for each step's sampled
+        tokens before it builds the next, so the rows a step shipped have
+        landed by the next call. Under async scheduling, which is where this
+        frontend's deferred read reported state that was not stale, and
+        during vLLM's warmup, the read blocks. A step that may restore a state
+        checkpoint (`_may_restore`) restores first and then blocks too, so the
+        contract judges what the restore produced before the reset and the
+        Engram staging.
         """
-        import os
+        from atom.plugin.vllm.req_id_passthrough_patch import serving_synchronously
 
-        override = os.environ.get("ATOM_V41_BLOCKING_STATE_PROBE")
-        if override is not None and override != "":
-            blocking = override not in ("0", "false", "False")
-        else:
+        blocking = not serving_synchronously()
+        # Tracked every step, so the previous step's rows are known when a
+        # step goes without the read.
+        if self.checkpoint_restore is not None and self._may_restore(step):
+            self._restore_stale_rows(step)
             blocking = True
-        return super().prepare_state(step, histories=histories or blocking)
+        histories = histories or blocking
+        pending = self._probe_claim is not None and self._probe_done is not None
+        if not histories and pending:
+            # The judge skips rows that have not landed, and the deferred read
+            # then ships over them: that step's verdict would be dropped
+            # unread. Waiting keeps every deferred read judged.
+            self._probe_done.synchronize()
+        return super().prepare_state(step, histories=histories)
+
+    def _may_restore(self, step) -> bool:
+        """Whether a row of this step could need a checkpoint restore.
+
+        Only a row that starts above its floor (what `prepare_state` calls not
+        fresh) and did not run in the previous step: an admission at a prefix
+        hit, or a preempted request coming back. A row that ran last step on
+        its own slot left its state there, which is what `_restore_stale_rows`
+        must not overwrite anyway.
+        """
+        count = step.scheduled_bs
+        ids = [span.request_id for span in step.requests[:count]]
+        seen, self._last_step_ids = self._last_step_ids, frozenset(ids)
+        above_floor = (
+            step.request_positions[:count] != step.request_floors[:count]
+        ) | (step.request_cached_until[:count] > 0)
+        return any(
+            bool(above) and rid not in seen for rid, above in zip(ids, above_floor)
+        )
+
+    def _restore_stale_rows(self, step) -> None:
+        """Restore checkpoints into the rows the contract is about to reject.
+
+        Only those rows: restoring every row every step overwrites live state
+        with a checkpoint nothing has written, measured as a prefill chunk
+        arriving at `computed=4096` with `cursor=0`. Fresh rows and where each
+        state has to be are worked out as `prepare_state` does, so the two
+        cannot drift apart; core then reads the cursors again and judges what
+        the restore produced, so a row-order mistake hands over somebody
+        else's state and dies loudly there rather than answering from it.
+        """
+        count = step.scheduled_bs
+        starts = step.request_positions[:count]
+        resumes = step.request_cached_until[:count]
+        fresh = (starts == step.request_floors[:count]) & (resumes == 0)
+        wanted = np.where(resumes > 0, resumes, starts)
+        cursors = torch.index_select(self.cursor, 0, step.slots[:count]).cpu().numpy()
+        wrong = np.flatnonzero(~fresh & (cursors[:, 0] != wanted))
+        if not wrong.size:
+            return
+        # The third element is the request id, not the row index: the checkpoint
+        # block table is addressed in the batch's own row space, which is not
+        # this step's. Handing over the step row read another request's block
+        # ids (measured: a store wrote units 14..21 and the restore read
+        # 192..185 for what should have been the same checkpoint).
+        rows = [
+            (
+                int(step.requests[int(i)].slot),
+                int(wanted[int(i)]),
+                step.requests[int(i)].request_id,
+            )
+            for i in wrong
+        ]
+        try:
+            self.checkpoint_restore(rows)
+        except Exception:
+            logger.warning("DeepSeek-V4.1 checkpoint restore failed", exc_info=True)
+
+    def _report_stale_state(self, cursors, starts, requests, fresh):
+        """The contract, with vLLM's synthetic warmup rows left out.
+
+        Registering the checkpoint layers makes the model hybrid, and vLLM
+        warms its SSM groups with `_warmup_N_` requests at position 2, through
+        slots nothing wrote, discarding the output; without this the engine
+        dies before serving its first request. Keyed on vLLM's own naming, so
+        a rename brings the contract back rather than silencing it.
+        """
+        warmup = np.fromiter(
+            (_is_vllm_warmup_request(r) for r in requests[: len(fresh)]),
+            dtype=bool,
+            count=len(fresh),
+        )
+        super()._report_stale_state(cursors, starts, requests, fresh | warmup)
 
     def _allocate_backing(self, size, device):
         """The slab, trimmed and zeroed to core's contract.

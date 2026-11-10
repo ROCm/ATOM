@@ -17,6 +17,7 @@ ATOM (AiTer Optimized Model) wraps AITER kernels with model-level abstractions f
 | Shared DSA indexer scorer | `indexer/` | `deepgemm_fp8_paged_mqa_logits`, `fp8_mqa_logits`, `flydsl_pa_mqa_logits_fp4`, `pa_mqa_logits_mxfp4`, `top_k_per_row_decode`, `top_k_per_row_prefill` | Scoring and top-k for every DSA indexer (DeepSeek-V3.2 / GLM-5.x, GLM-5.3 kpool, DeepSeek-V4, V4.1): the attention builder publishes a step's rows once (`attn_metadata.index_rows`: `fp8_rows`, `fp4_rows`, `concat_rows`, a DCP or TP rank's share by `RowSplit`) cut to its logits plane (`LogitsWorkspace`), and a model calls `score_topk` against its cache (`IndexCache`) |
 | DSA FP4 index cache | `sparse_indexer_fp4.py` | `indexer_qk_rope_quant_and_cache` | FP4 (E2M1 + e8m0) index-cache geometry and the DSA FP4 predicate |
 | `Fp4MqaRaggedMetadata` | `fp4_mqa_ragged_metadata.py` | `make_fp4_mqa_plan` | FP4 MQA scoring's ragged rows (DeepSeek-V4, V4.1, V3.2 decode and its DCP shard): rows grouped into sequences (`query_start_loc`, `max_qlen`, block tables, `pages_per_block`), each row's bound, and their shape-only launch plan |
+| `pack_row_selections` | `attentions/selection_pack.py` | Triton `_pack_selections_kernel` | Sparse MLA's MTP draft steps 1+ reuse step 0's top-k: chosen rows' selections packed in place to the front of the sparse index buffer, one program a sequence, each waiting on its predecessors' published lengths (an epoch-tagged flag, so eager-only) |
 | `FusedMoE` | `moe.py` | `aiter.fused_moe.fused_moe`, `asm_moe` | Mixture of experts |
 | `RMSNorm` | `layernorm.py` | `rmsnorm2d_fwd`, `rmsnorm2d_fwd_with_add`, `fused_add_rmsnorm_pad` | RMS normalization |
 | `LayerNorm` | `layernorm.py` | `layernorm2d_fwd`, `layernorm2d_fwd_with_add` | Layer normalization |
@@ -26,6 +27,7 @@ ATOM (AiTer Optimized Model) wraps AITER kernels with model-level abstractions f
 | `RotaryEmbedding` | `rotary_embedding.py` | `aiter.rope_cached_positions_2c_fwd_inplace` | Rotary position embedding |
 | `Sampler` | `sampler.py` | `aiter.mixed_sample_outer_exponential`, `aiter.ops.triton.topk.topk`, `aiter.ops.triton.softmax.softmax` | Token sampling |
 | `RejectionSampler` | `rejection_sampler.py` | Triton `rejection_greedy_sample_kernel` | Speculative decoding |
+| `apply_packed_bitmask` | `triton_structured_output.py` | Triton packed-bitmask kernel | JSON grammar masks on selected target logits |
 | `constrain_logits`, `advance_states` | `required_channel.py` | Triton `_constrain_logits_kernel`, `_advance_states_kernel` | `tool_choice="required"` channel mask (Kimi-K3) |
 
 ## AITER integration overview
@@ -90,7 +92,7 @@ LinearBase (nn.Module)
 | `per_Token` (INT8) | INT8 | `gemm_a8w8` | `[output_size, 1]` |
 | `per_Token` (FP8) | FP8 | `gemm_a8w8_bpreshuffle` | `[output_size, 1]` |
 | `per_1x128` | FP8 | `gemm_a8w8_blockscale_bpreshuffle` | `[ceil(N/128), ceil(K/128)]` |
-| `per_1x32` | MXFP4 (`fp4x2`) | `gemm_a4w4` | `[N, ceil(K/32)]` (e8m0) |
+| `per_1x32` | MXFP4 (`fp4x2`) | `gemm_a4w4` (preshuffled: K a multiple of 256, see MXFP4 K alignment) | `[N, ceil(K/32)]` (e8m0) |
 
 When `x_scale` is not provided, the input is dynamically quantized via `get_hip_quant(quant_type)`.
 
@@ -107,6 +109,7 @@ After loading, `process_weights_after_loading()` handles:
 - **e4m3fn to e4m3fnuz normalization** (AMD FP8 format conversion).
 - **Weight reshuffling** via `shuffle_weights()` for pre-shuffled GEMM kernels.
 - **Scale reshuffling** via `fp4_utils.e8m0_shuffle()` for MXFP4 block scales.
+- **MXFP4 K alignment**: a preshuffled MXFP4 weight must have K a multiple of 256 (`MXFP4_PRESHUFFLE_K_ALIGN`); the preshuffled GEMMs walk K in 256-wide steps and do not mask a tail. A `gate_up -> act -> down` MLP whose per-rank intermediate is unaligned pads it as a pair, like MoE's `intermediate_pad`: pass `mxfp4_k_pad_align(quant_config, down_prefix)` as `output_pad_align` to `MergedColumnParallelLinear` and `input_pad_align` to `RowParallelLinear`. Only a pair that is MXFP4 or bf16 in the checkpoint is padded (a bf16 pair may be quantized online; its zeroed rows quantize to zero): the padded parameters are zeroed when allocated, and every load path writes the real shard at the front of its padded slot (requires `act(0, 0) == 0`). A padded layer requantized online from a quantized source (NVFP4, FP8), or a static pair whose halves aren't both MXFP4 or bf16, is refused at construction. Any preshuffled MXFP4 weight still unaligned is refused here at load. Exempt: the gfx1250 32x4 scale layout, whose kernels take K % 128 (`mxfp4_k_pad_align` pads to 128 there), and `ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM=1`, whose GEMM reads the raw layout. A refused layer can be kept out of MXFP4 (online quant: `exclude_layer`).
 - **Per-tensor requantization** via `requantize_with_max_scale()` when multiple output partitions have separate scales.
 
 ## Attention operations
@@ -221,7 +224,7 @@ The `AttentionBackend` abstract class defines three required methods:
 - `get_builder_cls()` — Returns the `AttentionMetadataBuilder` subclass.
 - `get_impl_cls()` — Returns the attention implementation class.
 
-`CommonAttentionBuilder` provides shared metadata preparation (slot mapping, block tables, cumulative sequence lengths) used by both `AiterBackend` and `AiterMLABackend`. It marshals `block_tables` on every prefill step, whether or not that step also uploads the buffer, because the slot arithmetic in `token_layout/prefill.py` reads the packed table back rather than the batch's ragged rows.
+`CommonAttentionBuilder` provides shared metadata preparation (slot mapping, block tables, cumulative sequence lengths) used by both `AiterBackend` and `AiterMLABackend`. It marshals `block_tables` on every prefill step out to `running_bs`, zero rows past the scheduled requests, whether or not that step also uploads the buffer, because the slot arithmetic in `token_layout/prefill.py` reads the packed table back rather than the batch's ragged rows. A prefill that uploads it (`_prefill_block_table_rows`) uploads `running_bs` rows, like a decode.
 
 ### KV cache operations
 
@@ -278,7 +281,9 @@ The ASM MoE path (`asm_moe` from `aiter.fused_moe_bf16_asm`) is used by FP8 meth
 | `rocm_aiter_grouped_topk` | `aiter.grouped_topk` | Grouped top-k (DeepSeek) |
 | `rocm_aiter_biased_grouped_topk` | `aiter.biased_grouped_topk` | Biased grouped top-k (DeepSeek V3) |
 
-**Shared expert fusion:** When `is_rocm_aiter_fusion_shared_expert_enabled()` returns `True`, the top-k buffers are extended with shared expert IDs appended after routed expert IDs. This allows shared expert computation to be fused into the same MoE kernel call. The metadata is initialized via `init_aiter_topK_meta_data()`.
+`rocm_aiter_topk_softmax` runs `triton_topk_softmax` instead (bit-identical) in launches of up to `triton_topk_softmax_rows` rows: 20 per CU on gfx950, for the shapes it takes. Under an `HSA_CU_MASK` set outside ATOM, export `CU_NUM` (the CUs it leaves) at process start: the cutoff counts AITER's cached `get_cu_num()`, which ignores the mask.
+
+**Shared expert fusion:** When `is_rocm_aiter_fusion_shared_expert_enabled()` returns `True`, the top-k buffers are extended with shared expert IDs appended after routed expert IDs. This allows shared expert computation to be fused into the same MoE kernel call. The metadata is initialized via `init_aiter_topK_meta_data()`. Under DP attention with MoRI EP, fusion is wired up only for MXFP4 / NVFP4 routed experts; FP8 MoE models such as DeepSeek-V3 must run with `ATOM_FUSE_SHARED_EXPERT=0`, or `FusedMoE` raises `NotImplementedError`.
 
 ### `FusedMoEParallelConfig`
 
@@ -566,6 +571,7 @@ ATOM uses fused kernels to reduce memory traffic by combining multiple operation
 | `embed_head.py` | `VocabParallelEmbedding`, `ParallelLMHead` |
 | `rotary_embedding.py` | `RotaryEmbedding`, `get_rope` |
 | `topK.py` | `rocm_aiter_topk_softmax`, `rocm_aiter_grouped_topk`, `init_aiter_topK_meta_data` |
+| `triton_topk_softmax.py` | `triton_topk_softmax` -- renormalized softmax top-k, bit-identical to AITER's `topk_softmax` |
 | `sampler.py` | `Sampler` — unified greedy/random sampling |
 | `rejection_sampler.py` | `RejectionSampler` — speculative decoding rejection sampling |
 | `required_channel.py` | `constrain_logits`, `advance_states` — `tool_choice="required"` channel mask (Kimi-K3) |
@@ -616,7 +622,7 @@ positions are ragged, and the one-token decode slot mapping comes from
 | `token_layout/prefill.py` | `prefill_positions` — where a ragged prefill chunk's tokens sit in their own sequences |
 | `token_layout/decode.py` | `decode_positions` — the same for the rectangular speculative decode step |
 | `token_layout/slots.py` | `slot_mapping` — which KV slot a token is written to, one gather for both sides |
-| `token_layout/batch_ids.py` | `build_batch_ids` — builds the token → sequence map every kernel resolves per-sequence data through. Query lengths in gives `batch_id_per_q_token`, context lengths in gives `batch_id_per_k_token`; the two axes are not interchangeable |
+| `token_layout/batch_ids.py` | `build_batch_ids` — builds the token → sequence map every kernel resolves per-sequence data through. Query lengths in gives `batch_id_per_q_token`, context lengths in gives `batch_id_per_k_token`; the two axes are not interchangeable. `build_query_layout` writes a step's `cu_seqlens_q` and `batch_id_per_q_token` out to its running width, `build_cu_seqlens` the offsets alone |
 
 ### `atom/model_ops/fused_moe/`
 

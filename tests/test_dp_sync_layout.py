@@ -10,6 +10,7 @@ hang on eight ranks, not as a failure here.
 The collective itself is faked, so this runs on CPU with no DP group.
 """
 
+import numpy as np
 import torch
 
 from atom.utils.tbo.ubatching import sync_dp_metadata
@@ -39,6 +40,7 @@ def _sync(monkeypatch, *, peers, **kw):
     return sync_dp_metadata(
         dp_group=_FakeGroup(peers),
         dp_size=1 + len(peers),
+        running_tokens_per_dp_rank=np.zeros(1 + len(peers), dtype=np.int32),
         **kw,
     )
 
@@ -140,7 +142,7 @@ def test_the_tbo_rows_survive_the_batch_being_folded_in(monkeypatch):
         ),
     )
     assert r.tbo_collective_active
-    assert r.ub_max_tokens_across_dp == (4, 6)
+    assert [max(row) for row in r.ub_tokens_across_dp] == [4, 6]
 
     # One rank that cannot split vetoes the whole group.
     vetoed = _sync(
@@ -154,6 +156,31 @@ def test_the_tbo_rows_survive_the_batch_being_folded_in(monkeypatch):
         ),
     )
     assert not vetoed.tbo_collective_active
+
+
+def test_an_idle_rank_splits_its_padding_beside_a_prefill(monkeypatch):
+    """A rank with no request runs two tokens of padding beside a TBO prefill
+    and splits them 1 + 1: it neither vetoes nor turns on TBO."""
+
+    def idle(local):
+        peer = local.clone()
+        peer[0] = peer[1] = peer[2] = peer[5] = peer[6] = peer[7] = peer[8] = 0
+        return peer
+
+    r = _sync(
+        monkeypatch,
+        peers=[idle],
+        **_base(
+            scheduled_tokens=10,
+            is_prefill=True,
+            tbo_on=True,
+            local_meets_min_tokens=True,
+            local_can_split=True,
+            local_ub_tokens=(4, 6),
+        ),
+    )
+    assert r.tbo_collective_active
+    assert r.ub_tokens_across_dp == ((4, 1), (6, 1))
 
 
 def test_the_dspark_block_starts_after_the_tbo_block_in_both_widths(monkeypatch):
@@ -200,6 +227,6 @@ def test_final_requests_are_max_reduced_from_their_own_row(monkeypatch):
     )
     assert r.max_final_requests_across_dp == 6
     assert not r.any_rank_needs_eager
-    assert r.ub_max_tokens_across_dp == (4, 7)
+    assert [max(row) for row in r.ub_tokens_across_dp] == [4, 7]
     alone = _sync(monkeypatch, peers=[], **_base(final_requests=3))
     assert alone.max_final_requests_across_dp == 3

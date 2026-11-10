@@ -524,7 +524,7 @@ def test_real_scheduler_pins_from_first_chunk_through_final_handoff(
             publish(state, int(batch.context_lens[0]))
         result = ScheduledBatchOutput(
             [seq.id],
-            [(42, 43, 44, 45) if sched.spec_decode_local else (42,)],
+            [(42, 43, 44, 45) if sched.use_spec else (42,)],
             np.array([0]),
             np.array([0]),
             np.array([[43, 44, 45]]) if draft_tokens else None,
@@ -1887,6 +1887,9 @@ def test_last_unadmitted_cancel_reaches_worker_despite_idle_throttle(
         dispatch(worker, request)
     assert p.abort_request(seq.id)
     core = EngineCore.__new__(EngineCore)
+    core._kv_progress_event = threading.Event()
+    core.input_queue = queue.Queue()
+    core.utility_queue = queue.Queue()
     core.scheduler = p
     core.kv_transfer_enabled = True
     core.label = "pd-cancel"

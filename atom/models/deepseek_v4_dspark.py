@@ -627,7 +627,7 @@ class DSparkLayer(Block):  # type: ignore[misc]
 
         fc = get_forward_context()
         attn_md = fc.attn_metadata
-        B = fc.context.scheduled_bs
+        B = fc.context.running_bs
         cu_seqlens_q = attn_md.cu_seqlens_q[: B + 1]
         a = self.attn
         if a.swa_plane.dtype != torch.bfloat16:

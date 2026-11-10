@@ -68,7 +68,7 @@ def _fake_proposer(num_attention_heads, *, fused, returns_slots=False):
         prepare_mtp_decode=prepare_mtp_decode,
     )
     proposer = types.SimpleNamespace(
-        _share_mtp_indices=False,
+        share_mtp_indices=False,
         device=torch.device("cpu"),
         runner=types.SimpleNamespace(attn_metadata_builder=builder),
         # The real rewrite drops the metadata to one row per sequence and

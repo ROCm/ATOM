@@ -46,6 +46,7 @@ support_model_arch_dict = {
 # Model-specific Mono setup runs after the drafter arms the original layers.
 # An installer may wrap the model or finish binding routing already inside it.
 mono_decode_installers = {
+    "Qwen4ExpForConditionalGeneration": "atom.models.qwen38.mono.dispatch.install_mono_decode",
     "DeepseekV4ForCausalLM": (
         "atom.models.deepseek_v4.mono.dispatch.install_mono_decode"
     ),
@@ -63,4 +64,9 @@ mono_decode_installers = {
     "MiniMaxM3SparseForConditionalGeneration": (
         "atom.models.minimax_m3.mono.dispatch.install_mono_decode"
     ),
+}
+# Speculative methods each architecture serves under pipeline_parallel_size > 1
+# (its drafts verified per stage, its drafter's aux taps relayed across stages).
+pp_speculative_methods = {
+    "KimiK3ForConditionalGeneration": ("dspark",),
 }
