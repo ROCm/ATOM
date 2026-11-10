@@ -5,6 +5,7 @@ shares (one TP group on one node, decode steps in the model's own graph), which
 a model's own list extends."""
 
 from atom.config import CompilationLevel
+from atom.model_engine.capabilities import pcp_group_size_of
 from atom.mono.plan.execution import BLOCKS
 from atom.mono.plan.shard import shard_refusal
 from atom.plugin.prepare import is_sglang, is_vllm
@@ -139,7 +140,7 @@ def common_refusals(
             not refuse_decode_cp or atom_config.decode_context_parallel_size == 1,
             "decode CP",
         ),
-        (atom_config.prefill_context_parallel_size == 1, "prefill CP"),
+        (pcp_group_size_of(atom_config) == 1, "prefill CP or Ulysses SP"),
         (not (atom_config.enable_tbo or atom_config.enable_tbo_decode), "TBO"),
         (not (is_vllm() or is_sglang()), "plugin mode"),
         (
@@ -181,10 +182,13 @@ def _cu_count() -> int | None:
     ).multi_processor_count
 
 
-def resident_grid_refusals(atom_config) -> list[tuple[bool, str]]:
+def resident_grid_refusals(atom_config, connectors=()) -> list[tuple[bool, str]]:
     """``(holds, why not)`` of a kernel whose CTAs, one a CU, are all resident
-    and spin on each other (``plan.execution.BLOCKS``)."""
+    and spin on each other (``plan.execution.BLOCKS``). ``connectors``: the KV
+    connectors a model admits, whose copy kernels finish on their own."""
     cus = _cu_count()
+    kv = getattr(atom_config, "kv_transfer_config", None)
+    connector = kv.get("kv_connector") if isinstance(kv, dict) else None
     return [
         # a spin wait on another CTA only makes progress while that CTA runs
         (cus in (None, BLOCKS), f"{cus} CUs, the kernels need {BLOCKS}"),
@@ -192,7 +196,7 @@ def resident_grid_refusals(atom_config) -> list[tuple[bool, str]]:
         # which wedges a kernel that waits on every one of them. The field is a
         # dict that defaults to empty, so this is a truthiness test, as every
         # other reader of it in ATOM does: `is None` refuses every deployment.
-        (not getattr(atom_config, "kv_transfer_config", None), "KV connector"),
+        (not kv or connector in connectors, f"KV connector {connector}"),
     ]
 
 

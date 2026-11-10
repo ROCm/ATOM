@@ -245,10 +245,16 @@ def test_settle_target_pcp_split_snapshots_pcp_split(monkeypatch):
     assert not hasattr(mr.ModelRunner._settle_target_pcp_split, "__wrapped__")
     ctx = SimpleNamespace(pcp_split=True, target_pcp_split=None)
     monkeypatch.setattr(mr, "get_forward_context", lambda: SimpleNamespace(context=ctx))
+    monkeypatch.setattr(mr, "pcp_is_enabled", lambda: True)
     runner = SimpleNamespace(drafter=object())
     mr.ModelRunner._settle_target_pcp_split(runner)
     assert ctx.target_pcp_split is True
     ctx.pcp_split = False
+    mr.ModelRunner._settle_target_pcp_split(runner)
+    assert ctx.target_pcp_split is False
+    # SP splits every pass too, but into contiguous shards, not round-robin.
+    ctx.pcp_split = True
+    monkeypatch.setattr(mr, "pcp_is_enabled", lambda: False)
     mr.ModelRunner._settle_target_pcp_split(runner)
     assert ctx.target_pcp_split is False
 
@@ -268,7 +274,9 @@ def test_aux_gathers_exactly_when_the_target_forward_split(monkeypatch):
     monkeypatch.setattr(dr, "get_pcp_world_size", lambda: ws)
     monkeypatch.setattr(dr, "pcp_allgather_rerange", fake_gather)
     monkeypatch.setattr(dr, "get_forward_context", lambda: ctx)
-    drafter = SimpleNamespace(_captures_aux=True, _aux_buffers=[torch.ones(16, 2)])
+    drafter = SimpleNamespace(
+        _captures_aux=True, _aux_buffers=[torch.ones(16, 2)], _relayed_aux=None
+    )
     hidden = torch.zeros(n, 2)
 
     (aux,) = dr.Drafter.aux_for(drafter, hidden)

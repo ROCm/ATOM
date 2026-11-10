@@ -292,10 +292,6 @@ class Sequence:
         # every defaulting Sequence would be a mutable default in all but name.
         if sampling_params is None:
             sampling_params = SamplingParams()
-        if num_draft_tokens and sampling_params.logprobs:
-            raise ValueError(
-                "Token logprobs are not supported with speculative decoding"
-            )
         self.block_size = block_size
         self.id = id or next(Sequence.counter)
         self.external_request_id = request_id
@@ -418,6 +414,11 @@ class Sequence:
         # `1 + accepted` puts it, and there the grid is unreachable — see
         # `BlockManager.checkpointers_at`, which measures spacing from here.
         self.last_checkpoint_pos = 0
+        # The furthest prompt position whose checkpoint was decided when its
+        # chunk was scheduled (`BlockManager.checkpoint_when_scheduled`) rather
+        # than when it retired. Retire files nothing at or before it: with
+        # forwards in flight the slot has moved on by then.
+        self.scheduled_checkpoint_pos = 0
         self.prefix_cache_hit_tokens = 0
         # True iff this seq is mid-prefill (chunked prefill produced KV for
         # some prompt tokens but not all). Maintained by the scheduler:
@@ -485,6 +486,7 @@ class Sequence:
         # collector a slot to walk for each one. `json.dumps` is the only
         # consumer that needs a list, and it converts at its own boundary.
         self.logprobs: array.array = array.array("d")
+        self.top_logprobs = sampling_params.top_logprobs
         self.structured_cursor = 0
         self.structured_started = False
         self.json_schema = sampling_params.json_schema

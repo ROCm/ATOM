@@ -55,15 +55,14 @@ def test_scalar_filters_match_legacy_tensor_sampling(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
-@pytest.mark.parametrize("transport", ["direct", "packed"])
-def test_runner_uniform_filters_reach_sampler_without_readback(monkeypatch, transport):
+def test_runner_uniform_filters_reach_sampler_without_readback(monkeypatch):
     from types import SimpleNamespace
 
     import numpy as np
 
     from tests.test_h2d_runner_publication import runner_with_buffers
 
-    runner = runner_with_buffers(monkeypatch, transport)
+    runner = runner_with_buffers(monkeypatch)
     batch = SimpleNamespace(
         total_seqs_num=3,
         temperatures=np.ones(3, dtype=np.float32),
@@ -72,12 +71,9 @@ def test_runner_uniform_filters_reach_sampler_without_readback(monkeypatch, tran
         required_channel=None,
     )
     runner._gate_staging_reuse()
-    group = runner.h2d_groups.get("token_inputs")
-    temperatures, k, p, greedy, noise = runner.prepare_sample(
-        batch, publication_group=group
-    )
-    if group is not None:
-        group.publish(group.counts)
+    group = runner.h2d_groups["token_inputs"]
+    temperatures, k, p, greedy, noise = runner.prepare_sample(batch, group)
+    group.publish()
     runner._mark_staging_h2d_enqueued()
     logits = torch.full((3, 4096), -1000.0, device="cuda")
     logits[:, 7] = 0

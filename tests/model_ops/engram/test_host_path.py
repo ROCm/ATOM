@@ -1909,6 +1909,39 @@ def test_a_refused_shared_registration_falls_back_to_a_copy(monkeypatch):
     assert allocator.live == {}
 
 
+@pytest.mark.parametrize("env, shared", [(None, True), ("0", False)])
+def test_copy_copies_whatever_the_setting_and_shared_say(monkeypatch, env, shared):
+    import gc
+
+    from atom.model_ops.engram import host_memory
+
+    if env is not None:
+        monkeypatch.setenv("ATOM_ENGRAM_UVA_COPY", env)
+    allocator = FakeHostAllocator()
+    cudart = FakeCudart()
+    monkeypatch.setattr(host_memory, "_host_allocator", lambda: allocator)
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
+    rows = torch.arange(1 << 18, dtype=torch.float32)
+    pinned = host_memory.pin_rows([rows], shared=shared, copy=True)
+    assert pinned is not None and torch.equal(pinned[0], rows)
+    assert (len(allocator.live), cudart.calls) == (1, 0)
+    del pinned
+    gc.collect()
+    assert allocator.live == {}
+
+
+@pytest.mark.parametrize("shared", [False, True])
+def test_copy_without_an_allocator_is_a_failure(monkeypatch, shared):
+    """With no page-locked allocator `copy=True` fails."""
+    from atom.model_ops.engram import host_memory
+
+    cudart = FakeCudart()
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
+    rows = torch.ones(1 << 18)
+    assert host_memory.pin_rows([rows], shared=shared, copy=True) is None
+    assert cudart.calls == 0
+
+
 def test_a_shared_read_only_mapping_registers_in_place_read_only(monkeypatch, tmp_path):
     """The shared mapping cannot be written, so it is registered read-only --
     and in place: the view is the page cache, the same pages for every rank."""
@@ -2116,7 +2149,7 @@ def test_tp_shards_are_not_shared(monkeypatch):
     import sys
 
     sys.modules["aiter.dist.parallel_state"].get_dp_group = lambda: FakeGroup(4)
-    monkeypatch.setattr(engram_host.dist, "all_reduce", lambda *a, **k: None)
+    monkeypatch.setattr(engram_host, "group_agree", lambda ok, group: ok)
     rt = make_runtime()
     heads = rt.prefetcher._hash_mapping.config.num_hash_heads
     assert rt._enable_uva(rt.prefetcher, heads) is True
@@ -2163,10 +2196,7 @@ def test_uva_is_the_groups_decision_not_this_ranks(monkeypatch):
     monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
     patch_tp_group(monkeypatch, FakeGroup(world_size=2))
 
-    def refused(tensor, op=None, group=None):
-        tensor.fill_(0)
-
-    monkeypatch.setattr(engram_host.dist, "all_reduce", refused)
+    monkeypatch.setattr(engram_host, "group_agree", lambda ok, group: False)
     rt = make_runtime()
     assert (
         rt._enable_uva(rt.prefetcher, rt.prefetcher._hash_mapping.config.num_hash_heads)
@@ -2188,16 +2218,17 @@ def test_a_table_that_raises_votes_no_instead_of_leaving_the_vote(monkeypatch):
     patch_tp_group(monkeypatch, FakeGroup(world_size=2))
     votes = []
 
-    def vote(tensor, op=None, group=None):
-        votes.append(int(tensor))
+    def vote(ok, group):
+        votes.append(ok)
+        return ok
 
-    monkeypatch.setattr(engram_host.dist, "all_reduce", vote)
+    monkeypatch.setattr(engram_host, "group_agree", vote)
     rt = make_runtime()
     tables = list(rt.prefetcher._tables.values())
     tables[-1].enable_uva(0, 1)  # holds another range: its enable_uva raises
     heads = rt.prefetcher._hash_mapping.config.num_hash_heads
     assert rt._enable_uva(rt.prefetcher, heads) is False
-    assert votes == [0]
+    assert votes == [False]
     assert rt._pinned_tables == []
     tables[-1].disable_uva()
     assert cudart.registered == []
@@ -2216,7 +2247,7 @@ def test_an_empty_shard_registers_nothing(monkeypatch):
     monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
     # Every peer registered, so this rank's own answer is the only thing that
     # can turn the group around.
-    monkeypatch.setattr(engram_host.dist, "all_reduce", lambda *a, **k: None)
+    monkeypatch.setattr(engram_host, "group_agree", lambda ok, group: ok)
     rt = make_runtime()
     heads = rt.prefetcher._hash_mapping.config.num_hash_heads
     patch_tp_group(
@@ -2234,7 +2265,7 @@ def test_uva_survives_a_group_that_agrees(monkeypatch):
     cudart = FakeCudart()
     monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
     patch_tp_group(monkeypatch, FakeGroup(world_size=2))
-    monkeypatch.setattr(engram_host.dist, "all_reduce", lambda *a, **k: None)
+    monkeypatch.setattr(engram_host, "group_agree", lambda ok, group: ok)
     rt = make_runtime()
     heads = rt.prefetcher._hash_mapping.config.num_hash_heads
     assert rt._enable_uva(rt.prefetcher, heads) is True

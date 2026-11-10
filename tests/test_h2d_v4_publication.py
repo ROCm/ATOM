@@ -21,7 +21,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def v41_runner(monkeypatch, transport, pp_size):
+def v41_runner(monkeypatch, pp_size):
     from atom.model_engine.model_runner import ModelRunner
     from atom.model_ops.attentions.deepseek_v41.backend import (
         DeepseekV41MetadataBuilder,
@@ -31,37 +31,33 @@ def v41_runner(monkeypatch, transport, pp_size):
 
     runner = ModelRunner.__new__(ModelRunner)
     runner.device = torch.device("cuda", 0)
-    runner.config = SimpleNamespace(pipeline_parallel_size=pp_size)
+    runner.config = SimpleNamespace(pipeline_parallel_size=pp_size, enable_tbo=False)
     runner.enforce_eager = True
     geometry = V41PoolGeometry(
         2, ((0, 1), (1, 2)), 32, 4, 128, 32, speculative_tokens=3
     )
     runner.forward_vars = metadata_buffers(4, 32, 4, runner.device, geometry)
-    for name in ("positions", "batch_id_per_q_token"):
-        runner.forward_vars[name].publication_group = "v41_step"
-    runner.forward_vars["cu_seqlens_q"].publication_group = "early"
-    runner.forward_vars["block_tables"].publication_group = "prefill"
-    runner.forward_vars["decode_src"] = CpuGpuBuffer(
-        4, dtype=torch.int32, device="cuda"
-    )
+    runner.forward_vars["positions"].publication_group = "v41_step"
+    for name in ("cu_seqlens_q", "batch_id_per_q_token"):
+        runner.forward_vars[name].publication_group = "early"
+    runner.forward_vars["block_tables"].publication_group = "seq_metadata"
+    for name in ("input_ids", "decode_src", "batch_info"):
+        runner.forward_vars[name] = CpuGpuBuffer(4, dtype=torch.int32, device="cuda")
     runner.tokenID_processor = SimpleNamespace()
     builder = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)
     builder.geometry = geometry
+    builder.score_workspace = None
     builder.model_runner = runner
     runner.attn_metadata_builder = builder
-    monkeypatch.setenv("ATOM_H2D_BACKEND", transport)
     runner._init_forward_vars_ring()
     runner._init_h2d_publication()
     return runner, builder
 
 
-@pytest.mark.parametrize("transport", ["direct", "packed"])
 @pytest.mark.parametrize("pp_size", [1, 2])
-def test_v41_plans_and_step_replay_preserve_padding_and_slots(
-    monkeypatch, transport, pp_size
-):
+def test_v41_plans_and_step_replay_preserve_padding_and_slots(monkeypatch, pp_size):
 
-    runner, builder = v41_runner(monkeypatch, transport, pp_size)
+    runner, builder = v41_runner(monkeypatch, pp_size)
     graphs, copies = [], []
     for variables in runner._fv_ring:
         destinations = {
@@ -91,6 +87,7 @@ def test_v41_plans_and_step_replay_preserve_padding_and_slots(
         plans = builder._build_compress_plans(
             lengths, starts + lengths, running_bs=4, max_q_len=4, extra_write=3
         )
+        step_group = runner.h2d_groups["v41_step"]
         metadata = prepare_step(
             spans,
             runner.device,
@@ -100,13 +97,15 @@ def test_v41_plans_and_step_replay_preserve_padding_and_slots(
             max_q_len=4,
             ratios=(1, 2),
             state_slot_out=torch.arange(4, device="cuda", dtype=torch.int32),
-            publication_group=runner.h2d_groups["v41_step"],
+            publication_group=step_group,
         )
+        step_group.publish()
         expected = {}
         for group_name in ("v4_plans", "v41_step"):
             group = runner.h2d_groups[group_name]
             for member, count in zip(group.members, group.counts):
-                expected[member.name] = (member.source[:count].clone(), count)
+                if count is not None:
+                    expected[member.name] = (member.source[:count].clone(), count)
         # The second invocation must fail BEFORE it can overwrite a live source.
         before = {n: variables[n].cpu.clone() for n in expected}
         with pytest.raises(PublicationError, match="republish_reason"):
@@ -141,7 +140,7 @@ def test_v41_plans_and_step_replay_preserve_padding_and_slots(
         for name, (values, count) in expected.items():
             assert torch.equal(
                 actual[name][:count].cpu().view(torch.uint8), values.view(torch.uint8)
-            )
+            ), name
             assert torch.all(actual[name][count:].cpu() == 77)
         expected_positions = [
             p for span in spans for p in range(span.position, span.end)
@@ -152,8 +151,7 @@ def test_v41_plans_and_step_replay_preserve_padding_and_slots(
         assert batch_ids.cpu().tolist() == expected_ids + [-1] * (16 - n)
 
 
-@pytest.mark.parametrize("transport", ["direct", "packed"])
-def test_v4_tbo_plan_allocations_follow_actual_runner_slots(monkeypatch, transport):
+def test_v4_tbo_plan_allocations_follow_actual_runner_slots(monkeypatch):
     from atom.model_engine.model_runner import ModelRunner
     from atom.model_ops.attentions.deepseek_v4_attn import (
         DeepseekV4AttentionMetadataBuilder,
@@ -162,13 +160,30 @@ def test_v4_tbo_plan_allocations_follow_actual_runner_slots(monkeypatch, transpo
     runner = ModelRunner.__new__(ModelRunner)
     runner.device = torch.device("cuda", 0)
     runner.config = SimpleNamespace(
-        pipeline_parallel_size=2, enable_tbo=True, enable_tbo_decode=True
+        pipeline_parallel_size=2,
+        enable_tbo=True,
+        enable_tbo_decode=True,
+        prefill_context_parallel_size=1,
     )
     runner.enforce_eager = True
     runner.forward_vars = {
         name: CpuGpuBuffer(32, dtype=torch.int32, device="cuda")
-        for name in ("input_ids", "decode_src")
+        for name in ("input_ids", "decode_src", "batch_info")
     }
+    # The step buffers a micro-batch takes its common copies of.
+    for name, size, dtype in (
+        ("cu_seqlens_q", (5,), torch.int32),
+        ("batch_id_per_q_token", (32,), torch.int32),
+        ("slot_mapping", (32,), torch.int64),
+        ("context_lens", (4,), torch.int32),
+        ("block_tables", (4, 4), torch.int32),
+        ("cu_seqlens_k", (5,), torch.int32),
+        ("num_cached_tokens", (4,), torch.int32),
+        ("seq_starts", (4,), torch.int32),
+    ):
+        runner.forward_vars[name] = CpuGpuBuffer(
+            *size, dtype=dtype, device="cuda", publication_group="seq_metadata"
+        )
     runner.tokenID_processor = SimpleNamespace()
     builder = DeepseekV4AttentionMetadataBuilder.__new__(
         DeepseekV4AttentionMetadataBuilder
@@ -185,7 +200,6 @@ def test_v4_tbo_plan_allocations_follow_actual_runner_slots(monkeypatch, transpo
     builder._indexer_fp4 = False
     builder._unique_compress_ratios_overlap = [(4, True)]
     builder._alloc_v4_metadata_buffers()
-    monkeypatch.setenv("ATOM_H2D_BACKEND", transport)
     runner._init_forward_vars_ring()
     runner._init_h2d_publication()
     previous = None
@@ -193,8 +207,7 @@ def test_v4_tbo_plan_allocations_follow_actual_runner_slots(monkeypatch, transpo
     for step in range(5):
         runner._advance_forward_vars()
         runner._gate_staging_reuse()
-        current = builder._get_ubatch_compress_plan_buffers(0)[4]["compress"]
-        assert current is runner.forward_vars["ub0_v4_compress_plan_4"]
+        current = runner.forward_vars["ub0_v4_compress_plan_4"]
         assert current is not previous
         previous = current
         torch.cuda._sleep(2_000_000)
@@ -255,6 +268,8 @@ def test_v4_mtp_uses_immutable_prefix_after_verify_owner_is_sealed(monkeypatch):
     builder._mtp_layers_are_swa_only = True
     builder.window_size = 4
     builder._kv_fp8 = True
+    # The fp8 decode kernel's split plan is not under test here.
+    builder._decode_split_plan = lambda rows, kv_len: None
     builder.row_ids = torch.arange(8, device="cuda", dtype=torch.int32)
     builder.pool_geometry = object()
     builder._dest_row_buffers = dict
@@ -277,7 +292,7 @@ def test_v4_mtp_uses_immutable_prefix_after_verify_owner_is_sealed(monkeypatch):
 def test_v41_combined_publication_precedes_indptr_consumer(monkeypatch, pp_size):
     from atom.model_ops.attentions.deepseek_v41 import cache as cache_module
 
-    runner, builder = v41_runner(monkeypatch, "packed", pp_size)
+    runner, builder = v41_runner(monkeypatch, pp_size)
     builder.device = runner.device
     builder.block_size = builder.geometry.block_size
     builder.cache = cache_module.PagedAttentionCache(
@@ -287,16 +302,17 @@ def test_v41_combined_publication_precedes_indptr_consumer(monkeypatch, pp_size)
     observed = []
 
     def consume(step, geometry, buffers):
-        group = runner.h2d_groups["v41_metadata"]
+        group = runner.h2d_groups["step_metadata"]
         assert group._backend.kernel is not None
         assert runner.h2d_groups["v4_plans"]._backend is None
         assert runner.h2d_groups["v41_step"]._backend is None
         # Clone before the real first consumer, on the same stream: this sees
         # the bytes available to indptr construction, including all padding.
+        # The counts the publish consumed (`publish` clears the producers').
         observed.append(
             [
                 (member.destination[:count].clone(), member.source[:count].clone())
-                for member, count in zip(group.members, group.counts)
+                for member, count in zip(group.members, group._counts)
                 if count is not None
             ]
         )
@@ -318,11 +334,13 @@ def test_v41_combined_publication_precedes_indptr_consumer(monkeypatch, pp_size)
             block_tables=blocks,
             total_seqs_num=len(lengths),
             total_tokens_num=sum(lengths),
+            replaying=None,
+            is_final_chunk=None,
         )
         torch.cuda._sleep(2_000_000)
         metadata, _ = builder._prepare(batch, 4, 16, max_q_len=4, tentative=True)
-        group = runner.h2d_groups["v41_metadata"]
-        table_count = group.counts[group.indices["block_tables"]]
+        group = runner.h2d_groups["step_metadata"]
+        table_count = group._counts[group.indices["block_tables"]]
         assert table_count == (None if keys.get(runner._fv_idx) == blocks else 4)
         keys[runner._fv_idx] = blocks
         assert metadata.state_slot_out.shape == (4,)
@@ -347,7 +365,7 @@ def test_v41_combined_publication_precedes_indptr_consumer(monkeypatch, pp_size)
 @pytest.mark.parametrize("source", ["query_prefix", "block_tables"])
 def test_v41_standalone_producer_rejects_before_source_rewrite(monkeypatch, source):
 
-    runner, _ = v41_runner(monkeypatch, "direct", 1)
+    runner, _ = v41_runner(monkeypatch, 1)
     var = runner.forward_vars
     spans = [PagedRequest(0, 4, 0, 1, 0, (7,))]
     runner._gate_staging_reuse()
@@ -394,6 +412,7 @@ def test_dummy_storage_isolation_survives_shared_metadata():
     builder = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)
     builder.geometry = V41PoolGeometry(1, ((0, 2),), 32, 4, 512, 32)
     builder.block_size, builder.device = 32, "cuda"
+    builder.score_workspace = None
     builder.model_runner = SimpleNamespace(
         forward_vars=metadata_buffers(4, 36, 4, "cuda", builder.geometry)
     )
@@ -409,18 +428,32 @@ def test_dummy_storage_isolation_survives_shared_metadata():
         block_tables=((0,), (0,)),
         total_seqs_num=2,
         total_tokens_num=36,
+        replaying=None,
+        is_final_chunk=None,
     )
     metadata, _ = builder._prepare(batch, 4, 36)
     private, step = metadata.cache, metadata.step
     assert private is not serving and metadata.dummy
     assert not hasattr(step.requests[0], "block_ids")
     assert step.block_tables[:2, :2].tolist() == [[0, 1], [2, 0]]
-    kv = torch.full((1, step.width, 512), 3, dtype=torch.bfloat16, device="cuda")
+    kv = torch.full(
+        (1, step.running_tokens, 512), 3, dtype=torch.bfloat16, device="cuda"
+    )
     old_state, old_pages = private.state_bytes.clone(), private.page_bytes.clone()
     private.write_window(0, kv, step)
-    n = step.plans[2].compress_plan_gpu.shape[0]
-    compressed = torch.full((1, n, 512), 5, dtype=torch.bfloat16, device="cuda")
-    private._scatter_rows(private.pages.view("main_0")[0], step, compressed, 2)
+    projected = torch.full(
+        (1, step.running_tokens, 512), 5, dtype=torch.float32, device="cuda"
+    )
+    compressor = SimpleNamespace(
+        ratio=2,
+        ape=torch.zeros(2, 512, dtype=torch.float32, device="cuda"),
+        norm=SimpleNamespace(
+            weight=torch.ones(512, dtype=torch.float32, device="cuda"), eps=1e-6
+        ),
+    )
+    angles = torch.zeros(64, 32, dtype=torch.bfloat16, device="cuda")
+    rope = SimpleNamespace(cos_cache=angles + 1, sin_cache=angles, rope_dim=64)
+    private.compress(0, compressor, projected, projected, step, rope)
     torch.cuda.synchronize()
     assert torch.equal(serving.backing, before)
     assert not torch.equal(private.state_bytes, old_state)
