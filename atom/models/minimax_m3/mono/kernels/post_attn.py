@@ -161,6 +161,7 @@ class K4Build:
     shared_weight: float
     swiglu_limit: float
     debug: bool
+    xn_flag: int = 0
 
 
 def build_post_attn_kernel(
@@ -178,6 +179,7 @@ def build_post_attn_kernel(
     heads: IndexHeads = ONE_INDEX_HEAD,
     debug: bool = False,
     index_topk: bool = True,
+    xn_flag: int = 0,
 ):
     """``@flyc.jit`` launcher of K4 for one rank of an ``npes``-way TP group and a
     decode step of ``tokens`` (<= MAX_TOKENS) rows, ``q_len`` consecutive rows a
@@ -195,12 +197,13 @@ def build_post_attn_kernel(
         index_heads=heads.count, index_own=heads.own, timeline=timeline,
         index_topk=index_topk, fuse_k1=fuse_k1, sm_scale=sm_scale, eps=eps,
         route_scale=route_scale, shared_weight=shared_weight,
-        swiglu_limit=swiglu_limit, debug=debug,
+        swiglu_limit=swiglu_limit, debug=debug, xn_flag=xn_flag,
     )  # fmt: skip
     build_key = key_tuple(key, SOURCES)  # the launcher references it: keyed
     # a debug build's wait records name a region by its ``region_id``
     REGION_IDS = region_ids(
-        d.name for d in mailbox_regions(tokens, heads.count, fuse_k1, index_topk)
+        d.name
+        for d in mailbox_regions(tokens, heads.count, fuse_k1, index_topk, xn_flag)
     )
     W = npes
     G = BLOCKS
@@ -209,6 +212,11 @@ def build_post_attn_kernel(
     # fuse_k1: K1's outputs are read device-coherent (K1 stores them so)
     CM_K1 = CM_DEV if fuse_k1 else 0
     WIDE = wide_moe(tokens)
+    # the router tasks' xn goes out as plain words behind one flag a task (always
+    # in the wide MoE; ``xn_flag`` 1 / 2 in the narrow one: the flag after / before
+    # the logits), not as tagged pairs
+    XN_FLAG = WIDE or xn_flag != 0
+    XN_EARLY = xn_flag == 2 and not WIDE
     POOL = pool_words(tokens)
     U_MAX = TOP_K * tokens + 1  # distinct routed experts at most, then the shared
 

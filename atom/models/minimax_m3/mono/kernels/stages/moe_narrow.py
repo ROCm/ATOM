@@ -24,6 +24,7 @@ from atom.mono.device.ops import (
     bf16_round,
     fp8_pack4,
     row_sum,
+    rows_to_lds,
     traced,
 )
 from atom.mono.plan.execution import THREADS, WAVES
@@ -41,9 +42,11 @@ def moe_narrow_defs(k4ctx):
     MIDSC_LDS = k4ctx["MIDSC_LDS"]
     MIDSC_WORDS = k4ctx["MIDSC_WORDS"]
     UG_ITERS = k4ctx["UG_ITERS"]
+    XN_FLAG = k4ctx["XN_FLAG"]
     XN8_WORDS = k4ctx["XN8_WORDS"]
     XSC_LDS = k4ctx["XSC_LDS"]
     XSC_WORDS = k4ctx["XSC_WORDS"]
+    acquire = k4ctx["acquire"]
     bid = k4ctx["bid"]
     down_load = k4ctx["down_load"]
     down_load_shared = k4ctx["down_load_shared"]
@@ -53,6 +56,7 @@ def moe_narrow_defs(k4ctx):
     lane = k4ctx["lane"]
     lds_b8 = k4ctx["lds_b8"]
     lds_i32 = k4ctx["lds_i32"]
+    mb = k4ctx["mb"]
     mb_poll = k4ctx["mb_poll"]
     mb_put = k4ctx["mb_put"]
     misc = k4ctx["misc"]
@@ -95,11 +99,39 @@ def moe_narrow_defs(k4ctx):
             if tid < XSC_WORDS:
                 fx.ptr_store(got[n_xw][0], xs + (XSC_LDS + k * XSC_ROW + tid))
 
+        def fetch_xn_flagged(tok=None):
+            """``fetch_xn`` for plain words behind a flag a router task: wave 0 polls
+            the tasks' flags, then the rows are read as plain words."""
+            n_f = (tokens if tok is None else 1) * N_ROUTER
+            f0 = 0 if tok is None else tok * N_ROUTER
+            if wave == 0:
+                mb_poll([(mr("xndone"), f0 + fx.min(lane, n_f - 1), 1)])
+            gpu.barrier()
+            acquire()
+
+            def rows(k):
+                for base, n_row, lds_w, lds_row in (
+                    (mb("xn8p"), XN8_WORDS, k * XN8_ROW, XN8_ROW),
+                    (mb("xscp"), XSC_WORDS, XSC_LDS + k * XSC_ROW, XSC_ROW),
+                ):
+                    rows_to_lds(
+                        tid, base + fx.Int64(k) * (n_row * 4), 1, n_row, xs + lds_w,
+                        lds_row,
+                    )  # fmt: skip
+
+            if const_expr(tok is None):
+                for k in range_constexpr(tokens):
+                    rows(k)
+            else:
+                rows(tok)
+
         def fetch_xn(tok=None):
             """Token tok's (default: every token's) MXFP8 xn and scales -> xs. Wave
             0 first polls the last word of each router task's slice: all 512
             threads of 256 CTAs spinning on the whole of it (S = 4) held the
             shared-expert CTAs' xn back 3 us."""
+            if const_expr(XN_FLAG):
+                return fetch_xn_flagged(tok)
             gate_tok = fx.min(lane // N_ROUTER, tokens - 1) if tok is None else tok
             if wave == 0:
                 mb_poll(

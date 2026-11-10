@@ -23,14 +23,19 @@ from atom.mono.runtime.compile import check_traced
 
 
 def build_layer(
-    tokens: int, index_heads: int, fuse_k1: bool = True, index_topk: bool = True
+    tokens: int,
+    index_heads: int,
+    fuse_k1: bool = True,
+    index_topk: bool = True,
+    xn_flag: int = 0,
 ):
     """The layer kernel for ``tokens`` and ``index_heads`` (1 or TP), K1 fused in
-    or not (``fuse_k1``), selecting or reusing a selection (``index_topk``)."""
+    or not (``fuse_k1``), selecting or reusing a selection (``index_topk``), its xn behind flags
+    (``xn_flag``)."""
     heads = IndexHeads(index_heads, 0)
     return build_post_attn_kernel(
         TP, 0.088, 1e-6, 1.0, 1.0, 7.0, 1, 1, tokens, fuse_k1=fuse_k1, heads=heads,
-        index_topk=index_topk,
+        index_topk=index_topk, xn_flag=xn_flag,
     )  # fmt: skip
 
 
@@ -40,13 +45,17 @@ def build_dense(tokens: int):
 
 
 def check_build(
-    tokens: int, index_heads: int, fuse_k1: bool = True, index_topk: bool = True
+    tokens: int,
+    index_heads: int,
+    fuse_k1: bool = True,
+    index_topk: bool = True,
+    xn_flag: int = 0,
 ) -> None:
     """Trace ``build_layer`` and check its hand-offs; raises ``ContractError``."""
     check_traced(
-        build_layer(tokens, index_heads, fuse_k1, index_topk),
+        build_layer(tokens, index_heads, fuse_k1, index_topk, xn_flag),
         K4_ABI,
-        mailbox_regions(tokens, index_heads, fuse_k1, index_topk),
+        mailbox_regions(tokens, index_heads, fuse_k1, index_topk, xn_flag),
     )
 
 
@@ -60,5 +69,9 @@ if __name__ == "__main__":
     for s in sizes:
         for ih in (1, TP):
             for it in (True, False):
-                check_build(s, ih, index_topk=it)
-                print(f"S={s} index heads={ih} index_topk={it}: contract holds")
+                for xf in (0, 1, 2):
+                    check_build(s, ih, index_topk=it, xn_flag=xf)
+                    print(
+                        f"S={s} index heads={ih} index_topk={it} xn_flag={xf}:"
+                        " contract holds"
+                    )

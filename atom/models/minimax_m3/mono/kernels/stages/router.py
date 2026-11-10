@@ -40,7 +40,8 @@ def router_defs(k4ctx):
     CM_K1 = k4ctx["CM_K1"]
     G = k4ctx["G"]
     SY = k4ctx["SY"]
-    WIDE = k4ctx["WIDE"]
+    XN_EARLY = k4ctx["XN_EARLY"]
+    XN_FLAG = k4ctx["XN_FLAG"]
     XN8_WORDS = k4ctx["XN8_WORDS"]
     XSC_WORDS = k4ctx["XSC_WORDS"]
     acquire = k4ctx["acquire"]
@@ -263,7 +264,7 @@ def router_defs(k4ctx):
                 word = fp8_pack4(*[mx8_q(v, inv) for v in f])
                 xw = k * XN8_WORDS + t * (XN_SLICE // 4) + tid
                 xsw = k * XSC_WORDS + t * (XN_SLICE // 32) + tid // 8
-                if const_expr(WIDE):
+                if const_expr(XN_FLAG):
                     # plain words, flagged once the task is done (below)
                     bo.buffer_store(word, rsrc(mb("xn8p")), xw, cache_modifier=CM_DEV)
                     if tid % 8 == 0:
@@ -272,6 +273,9 @@ def router_defs(k4ctx):
                     mb_put_words(mr("xn8"), xw, [word])
                     if tid % 8 == 0:
                         mb_put_words(mr("xsc"), xsw, [e])
+            if const_expr(XN_EARLY):
+                # the slice is out: its flag in front of the logits
+                publish(mb_put, mr("xndone"), tt, fx.Int32(1), tid == 0)
             stamp(26)
             # bf16 pair dot products, one accumulator per pair position: four
             # 12-long chains instead of one 96-long FMA chain behind 192 widenings
@@ -298,7 +302,7 @@ def router_defs(k4ctx):
             rk = route_key(sc + bias_r, e_r)
             if lane < SCORE_COPIES:
                 mb_put_words(scores_copy(lane, k), e_r * 2, [rk, sc.bitcast(fx.Int32)])
-            if const_expr(WIDE):
+            if const_expr(XN_FLAG and not XN_EARLY):
                 # this task's xn slice is out: its flag (after the logits, not
                 # in front of them)
                 publish(mb_put, mr("xndone"), tt, fx.Int32(1), tid == 0)

@@ -259,6 +259,7 @@ class MonoDecodeRunner:
             timeline=self.timeline is not None,
             heads=heads,
             debug=self.debug,
+            xn_flag=envs.ATOM_MONO_XN_FLAG,
         )
         # a dense layer's kernels around its original attention
         if self.dense_mono:
