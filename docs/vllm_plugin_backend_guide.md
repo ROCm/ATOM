@@ -202,9 +202,9 @@ and each request's open pool is kept in a vLLM-managed ring block
 (`KpoolTailSpec`) that is never prefix-cached. The plugin path serves the text
 backbone with prefix caching and the checkpoint's MTP layer
 (`--speculative-config '{"method": "mtp", ...}'`); PCP, DCP, other speculative
-methods and KV transfer are refused at startup. Two PR CI cells run it at TP4
-with fp8 KV: one plain, one with prefix caching and MTP3, which runs GSM8K
-twice on one server and gates the second pass, where the prompts hit.
+methods and KV transfer are refused at startup. The PR CI cell runs it at TP4
+with fp8 KV, prefix caching and MTP3, and runs GSM8K twice on one server to
+gate the second pass, where the prompts hit.
 
 DeepSeek-V4.1 pages out of a proxy KV cache: ATOM declares one fake attention
 layer whose block is exactly one 256-token CSA2 PAGE, lets vLLM size and

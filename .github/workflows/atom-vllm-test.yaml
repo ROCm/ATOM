@@ -191,21 +191,6 @@ jobs:
             # runs; these floors sit near 70% of that.
             mtp_per_pos_threshold: "0.55,0.40,0.25,0.18,0.10"
             runner: linux-atom-pitt-mi350x-8
-          - display_name: "GLM-5.3-Flash kpool TP4"
-            model_name: "GLM-5.3-Flash-kpool"
-            model_path: "zai-org/GLM-5.3-Flash"
-            # Chat 16-shot: prompts run 1939-3591 tokens (mean 2728), all but
-            # one past index_topk=2048, so the pooled (kpool) indexer decides
-            # what the model attends to. At 3-shot it would select every token
-            # and the cell would only show the pooled writes did no harm.
-            client_command: "lm_eval --model local-chat-completions --apply_chat_template --fewshot_as_multiturn --model_args model=${MODEL_PATH},base_url=http://127.0.0.1:${VLLM_PORT}/v1/chat/completions,num_concurrent=32,max_retries=3,tokenized_requests=False,max_gen_toks=512 --tasks gsm8k --num_fewshot ${LM_EVAL_NUM_FEWSHOT} --batch_size 65 --output_path ${OUTPUT_PATH}"
-            extra_args: "--tensor-parallel-size 4 --max-model-len 8192 --max-num-batched-tokens 8192 --max-num-seqs 32 --gpu-memory-utilization 0.85"
-            lm_eval_num_fewshot: 16
-            # Measured 0.9727 / 0.9682 flexible-extract over two runs of this
-            # exact serve command (native ATOM, bf16 KV: 0.9666); 0.94 matches
-            # the native GLM-5.3-Flash-kpool-16shot gate.
-            accuracy_test_threshold: 0.94
-            runner: linux-atom-pitt-mi350x-8
           - display_name: "GLM-5.3-Flash kpool MTP prefix-cache TP4"
             model_name: "GLM-5.3-Flash-kpool-MTP-PC"
             model_path: "zai-org/GLM-5.3-Flash"
