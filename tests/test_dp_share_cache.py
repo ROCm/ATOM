@@ -355,3 +355,97 @@ def test_share_cache_refuses_a_store_split_into_per_nic_pools():
     assert isinstance(build(two, 1), ShareCacheRouter)  # one rank: nothing to share
     with pytest.raises(ValueError, match="splits it into 2 pools"):
         build(two, 2)
+
+
+def test_a_same_rank_reuser_carries_the_prefix_if_its_producer_aborts():
+    """B reuses, on A's rank, a prefix A is still prefilling. A aborts and B
+    computes the prefix: it must stay in the index."""
+    router = ShareCacheRouter(min_load_tokens=512, req_equiv=512)
+    backlog, reqs = [0, 0], [0, 0]
+    first, _ = _route(router, _seq("A", PREFIX), backlog, reqs)
+    backlog[1 - first.rank] = 10_000_000  # B stays on A's rank
+    second, cost = _route(router, _seq("B", PREFIX + [7] * 2_000), backlog, reqs)
+    assert second.rank == first.rank and cost < 42_000  # reuses A's prefix
+    router.release("A")
+    router.prefill_complete("B")
+    router.select(_seq("C", PREFIX + [9] * 2_000), [0, 0], [0, 0])
+    assert router.charge("C") > 0
+
+
+def test_every_backup_of_a_prefix_is_kept():
+    """A owns a prefix; B, then C, compute it beside A. B completes, then A and
+    C abort: B computed it, so it stays credited."""
+    router = ShareCacheRouter(min_load_tokens=512, req_equiv=512)
+    backlog, reqs = [0, 0], [0, 0]
+    first, _ = _route(router, _seq("A", PREFIX), backlog, reqs)
+    backlog[first.rank] = 10_000_000
+    _route(router, _seq("B", PREFIX), backlog, reqs)
+    _route(router, _seq("C", PREFIX), backlog, reqs)
+    router.prefill_complete("B")
+    router.release("A")
+    router.release("C")
+    router.select(_seq("D", PREFIX + [9] * 2_000), [0, 0], [0, 0])
+    assert router.charge("D") > 0
+    # And with A and B gone unprefilled, C (completing) still carries it.
+    router = ShareCacheRouter(min_load_tokens=512, req_equiv=512)
+    backlog, reqs = [0, 0], [0, 0]
+    first, _ = _route(router, _seq("A", PREFIX), backlog, reqs)
+    backlog[first.rank] = 10_000_000
+    _route(router, _seq("B", PREFIX), backlog, reqs)
+    _route(router, _seq("C", PREFIX), backlog, reqs)
+    router.release("A")
+    router.release("B")
+    router.prefill_complete("C")
+    router.select(_seq("D", PREFIX + [9] * 2_000), [0, 0], [0, 0])
+    assert router.charge("D") > 0
+    assert not router.backups
+
+
+def test_a_readmitted_partial_prefill_counts_in_the_backlog():
+    from atom.model_engine.prefill_backlog import prefill_backlog
+    from atom.model_engine.sequence import SequenceStatus
+
+    readmitted = SimpleNamespace(
+        status=SequenceStatus.RUNNING,
+        tokens=700,
+        num_completion_tokens=12,  # kept from before its preemption
+        is_partial_prefill=True,
+    )
+    decoding = SimpleNamespace(
+        status=SequenceStatus.RUNNING,
+        tokens=500,
+        num_completion_tokens=3,
+        is_partial_prefill=False,
+    )
+    assert prefill_backlog(_scheduler_with([], [readmitted, decoding])) == 700
+
+
+def test_reuse_reports_are_queued_ahead_of_the_step_outputs():
+    """The engine flushes them first in `_postprocess`; a request's report then
+    reaches the router before its first output completes its placement."""
+    import queue
+
+    from atom.model_engine.prefill_backlog import flush_dp_reuse
+
+    out = queue.Queue()
+    sched = SimpleNamespace(dp_reuse_reports=[(1, 4096)])
+    flush_dp_reuse(sched, out)
+    out.put_nowait(("STREAM", [(1, "token")]))
+    flush_dp_reuse(sched, out)  # nothing new: nothing queued
+    assert out.get_nowait() == ("DP_REUSE", [(1, 4096)])
+    assert out.get_nowait()[0] == "STREAM" and out.empty()
+    assert sched.dp_reuse_reports == []
+
+
+def test_a_reuse_report_before_the_first_output_reassigns_the_prefix():
+    """Report first (the queue order), then the first output: the request that
+    recomputed the prefix owns it and, once complete, it is credited again."""
+    router = ShareCacheRouter(min_load_tokens=512, req_equiv=512)
+    backlog, reqs = [0, 0], [0, 0]
+    _route(router, _seq(1, PREFIX), backlog, reqs)
+    router.prefill_complete(1)
+    _route(router, _seq(2, PREFIX), backlog, reqs)
+    assert router.note_reuse(2, 0)
+    router.prefill_complete(2)
+    router.select(_seq(3, PREFIX), [0, 0], [0, 0])
+    assert router.charge(3) > 0

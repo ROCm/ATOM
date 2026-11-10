@@ -36,3 +36,6 @@ class EngineCoreRequestType(enum.Enum):
     # (seqs ingested so far, prefill tokens still to compute), pushed by a DP
     # engine core when either changes; read by `share_cache` DP routing.
     PREFILL_BACKLOG = b"\x0a"
+    # [(seq id, prompt tokens reused)] of requests `share_cache` placed on an
+    # estimated prefix, sent ahead of their first output.
+    DP_REUSE = b"\x0b"
