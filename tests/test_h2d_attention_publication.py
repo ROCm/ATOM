@@ -9,8 +9,12 @@ import pytest
 import torch
 
 from atom.utils import CpuGpuBuffer
-from atom.utils.h2d import PublicationError
-from atom.utils.tbo import decode_ubatch_request_ranges
+from atom.utils.forward_context import (
+    AttentionMetaData,
+    get_published_dcp_local_context_lens,
+)
+from atom.utils.h2d import BufferPublication, PublicationError
+from atom.utils.tbo import cut_decode_ubatches, cut_prefill_ubatches
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_H2D_GPU_TESTS") != "1", reason="set RUN_H2D_GPU_TESTS=1"
@@ -30,16 +34,16 @@ def make_runner(
     tbo=True,
     base=None,
     bind=True,
-    transport="direct",
 ):
+    from atom.distributed import ulysses_sp
     from atom.model_engine.model_runner import ModelRunner
     from atom.model_ops.attentions import aiter_attention, aiter_mla, backends
 
-    monkeypatch.setenv("ATOM_H2D_BACKEND", transport)
+    for module in (ulysses_sp, backends):
+        monkeypatch.setattr(module, "attn_head_shard_size", lambda: 1)
     monkeypatch.setenv("ATOM_MLA_PAGE_SIZE", "1")
     monkeypatch.setenv("ATOM_USE_UNIFIED_ATTN", "0")
     monkeypatch.setenv("ATOM_USE_TRITON_MLA", "0")
-    monkeypatch.setattr(backends, "tbo_enabled", lambda: tbo)
     for module in (backends, aiter_attention, aiter_mla):
         if hasattr(module, "get_tp_group"):
             monkeypatch.setattr(
@@ -67,6 +71,7 @@ def make_runner(
         max_num_batched_tokens=runner.max_num_batched_tokens,
         enable_tbo=tbo,
         enable_tbo_decode=tbo,
+        prefill_context_parallel_size=1,
         kv_cache_dtype="bf16",
         index_cache_dtype="fp4" if fp4 else "fp8",
         attn_prefill_chunk_size=0,
@@ -107,7 +112,6 @@ def make_runner(
     if kind == "mla":
         builder.set_mla_persistent_worker_buffers = lambda *a, **kw: {}
         builder._set_mla_persistent_worker_buffers_sparse_mtp = lambda *a, **kw: {}
-        builder._set_ubatch_mla_buffers = lambda *a, **kw: None
     runner.attn_metadata_builder = builder
     runner._init_forward_vars_ring()
     if bind:
@@ -118,6 +122,7 @@ def make_runner(
 def decode_batch(count, q=1, step=0):
     lens = np.array([17 + 3 * i + step for i in range(count)], dtype=np.int32)
     return SimpleNamespace(
+        req_ids=list(range(count)),
         total_seqs_num_decode=count,
         total_tokens_num_decode=count * q,
         total_seqs_num_prefill=0,
@@ -138,15 +143,34 @@ def decode_batch(count, q=1, step=0):
     )
 
 
+def publish_query_prefix(builder, batch, running_bs, running_tokens):
+    """`prepare_model`'s query-prefix producer, published on its own."""
+    builder.publish_query_metadata(
+        np.asarray(batch.num_scheduled_tokens[: batch.total_seqs_num], np.int32),
+        running_bs,
+        running_tokens,
+    )
+
+
 def start_decode(runner, builder, batch, q):
     runner._advance_forward_vars()
     runner._gate_staging_reuse()
-    builder.publish_cu_seqlens_q(batch, SimpleNamespace(running_bs=4))
+    publish_query_prefix(builder, batch, 4, 4 * q)
 
 
 def finish(runner):
     runner._mark_staging_h2d_enqueued()
     runner._record_forward_vars_event()
+
+
+def stage_ubatch_decode(builder, batch, slices, q, attn_metadata=None):
+    """`prepare_decode`'s micro-batch staging, over the step's decode spans."""
+    return builder.stage_ubatch_decode(
+        AttentionMetaData() if attn_metadata is None else attn_metadata,
+        *builder.decode_spans(batch),
+        slices,
+        q,
+    )
 
 
 def assert_repeat_does_not_write(runner, call):
@@ -203,7 +227,6 @@ def test_sparse_mtp_verify_plans_only_the_real_tokens(monkeypatch):
     finish(runner)
 
 
-@pytest.mark.parametrize("transport", ["direct", "packed"])
 @pytest.mark.parametrize("pp", [1, 2])
 @pytest.mark.parametrize(
     "kind,q,dcp,sparse,tbo,fp4",
@@ -219,7 +242,7 @@ def test_sparse_mtp_verify_plans_only_the_real_tokens(monkeypatch):
     ],
 )
 def test_decode_csr_tbo_delayed_slot_reuse(
-    monkeypatch, pp, kind, q, dcp, sparse, tbo, fp4, transport
+    monkeypatch, pp, kind, q, dcp, sparse, tbo, fp4
 ):
     runner, builder = make_runner(
         monkeypatch,
@@ -230,14 +253,26 @@ def test_decode_csr_tbo_delayed_slot_reuse(
         sparse=sparse,
         fp4=fp4,
         tbo=tbo,
-        transport=transport,
     )
+    direct = []
+    copy = BufferPublication._copy
+
+    def record_direct(binding, count):
+        direct.append(binding.name)
+        copy(binding, count)
+
+    monkeypatch.setattr(BufferPublication, "_copy", record_direct)
     saved = []
     for step, count in enumerate((3, 1, 4, 2, 1, 3)):
+        # A TBO runner's decode is a split one (`ForwardMode.decode_ubatch_slices`).
+        slices = cut_decode_ubatches(4, 4 * q, np.full(count, q)) if tbo else None
         batch = decode_batch(count, q, step)
         start_decode(runner, builder, batch, q)
         torch.cuda._sleep(3_000_000)
-        md, _ = builder.prepare_decode(batch, 4, 4 * q, q)
+        direct.clear()
+        md, _ = builder.prepare_decode(batch, 4, 4 * q, q, slices)
+        # The whole step's metadata is one upload, no buffer its own copy.
+        assert direct == [], direct
         names = ["kv_indptr"]
         if kind == "mla":
             names.append("kv_last_page_lens")
@@ -304,39 +339,44 @@ def test_decode_csr_tbo_delayed_slot_reuse(
                 )
             )
         if tbo:
-            # Each ubatch holds the scheduled requests its micro-batch runs,
-            # not half the padded batch: count=3 is ubatch 0 = [0, 1).
-            for ub, (lo, hi) in enumerate(decode_ubatch_request_ranges(count, 2)):
-                n = hi - lo
+            # Each ubatch holds its scheduled requests first, padded out to its
+            # own running_bs: count=1 leaves ubatch 1 all padding.
+            for ub, ub_slice in enumerate(slices):
+                lo = ub_slice.request_slice.start
+                n = ub_slice.request_slice.stop - lo
                 p = f"ub{ub}_"
+                width = ub_slice.running_bs + 1
                 expected_ub = [
-                    expected[lo + min(j, n)] - expected[lo] for j in range(3)
+                    expected[lo + min(j, n)] - expected[lo] for j in range(width)
                 ]
                 saved.append(
-                    (runner.forward_vars[p + "kv_indptr"].gpu[:3].clone(), expected_ub)
+                    (
+                        runner.forward_vars[p + "kv_indptr"].gpu[:width].clone(),
+                        expected_ub,
+                    )
                 )
                 saved.append(
                     (
                         runner.forward_vars[p + "context_lens"].gpu[:n].clone(),
-                        runner.forward_vars["context_lens"].np[lo:hi].tolist(),
+                        runner.forward_vars["context_lens"].np[lo : lo + n].tolist(),
                     )
                 )
                 saved.append(
                     (
-                        runner.forward_vars[p + "cu_seqlens_q"].gpu[:3].clone(),
-                        [0] + [min(j, n) * q for j in (1, 2)],
+                        runner.forward_vars[p + "cu_seqlens_q"].gpu[:width].clone(),
+                        [min(j, n) * q for j in range(width)],
                     )
                 )
             assert_repeat_does_not_write(
                 runner,
-                lambda count=count, lengths=lengths: builder._prepare_ubatch_decode(
-                    count, 4, q, lengths
+                lambda batch=batch, slices=slices: stage_ubatch_decode(
+                    builder, batch, slices, q
                 ),
             )
         assert_repeat_does_not_write(
             runner,
-            lambda count=count, step=step: builder.prepare_decode(
-                decode_batch(count, q, step + 50), 4, 4 * q, q
+            lambda count=count, step=step, slices=slices: builder.prepare_decode(
+                decode_batch(count, q, step + 50), 4, 4 * q, q, slices
             ),
         )
         finish(runner)
@@ -345,11 +385,75 @@ def test_decode_csr_tbo_delayed_slot_reuse(
         assert actual.cpu().tolist() == expected
 
 
+@pytest.mark.parametrize("dcp, sparse", [(2, True), (1, True), (2, False)])
+def test_a_capture_publishes_its_dcp_local_lens(monkeypatch, dcp, sparse):
+    """A sparse DCP capture's per-token local lengths are its layout's one key
+    a row, published with it; without sparse DCP there are none."""
+    runner, builder = make_runner(monkeypatch, "mla", dcp=dcp, sparse=sparse, tbo=False)
+    runner._advance_forward_vars()
+    runner._gate_staging_reuse()
+    builder.publish_query_metadata(np.ones(4, dtype=np.int32), 4, 4)
+    md, _ = builder.build_for_cudagraph_capture(4)
+    torch.cuda.synchronize()
+    if dcp > 1 and sparse:
+        assert md.dcp_local_context_lens.tolist() == [1] * 4
+        assert get_published_dcp_local_context_lens(md, 4) is md.dcp_local_context_lens
+    else:
+        assert md.dcp_local_context_lens is None
+    finish(runner)
+
+
+@pytest.mark.parametrize("prefill_first", [False, True])
+def test_a_tbo_capture_reads_its_layout_not_a_split_prefills(
+    monkeypatch, prefill_first
+):
+    """A split prefill stages its micro-batches into the same `ub{i}_` rows a
+    decode micro-batch reads -- per token where a decode's are per request. A
+    capture that follows it (the warmup prefill, then the graphs) records over
+    the capture layout, not the prefill's leftovers, which once walked the
+    sparse decode off its selection."""
+    from atom.model_ops.attentions import aiter_mla
+
+    monkeypatch.setattr(aiter_mla, "get_mla_metadata_v1", lambda *a, **kw: None)
+    runner, builder = make_runner(monkeypatch, "mla", sparse=True, tbo=True)
+    if prefill_first:
+        counts = np.asarray([20], dtype=np.int32)
+        batch = decode_batch(1)
+        batch.total_seqs_num_decode = batch.total_tokens_num_decode = 0
+        batch.total_seqs_num_prefill = 1
+        batch.total_tokens_num_prefill = batch.total_tokens_num = 20
+        batch.num_scheduled_tokens = counts
+        batch.context_lens = counts.copy()
+        batch.num_cached_tokens = [0]
+        runner._advance_forward_vars()
+        runner._gate_staging_reuse()
+        publish_query_prefix(builder, batch, 1, 20)
+        slices = cut_prefill_ubatches(1, counts, 20)
+        builder.prepare_prefill(batch, 1, 20, ubatch_slices=slices)
+        finish(runner)
+    runner._advance_forward_vars()
+    runner._gate_staging_reuse()
+    slices = cut_decode_ubatches(4, 4, np.ones(4, dtype=np.int32))
+    builder.publish_query_metadata(np.ones(4, dtype=np.int32), 4, 4, slices)
+    md, _ = builder.build_for_cudagraph_capture(4, decode_ubatch_slices=slices)
+    torch.cuda.synchronize()
+    for ub in md.ubatches:
+        assert ub.sparse_kv_indptr.tolist() == [0, 1, 2]
+        assert ub.kv_indptr.tolist() == [0, 1, 2]
+        assert ub.context_lens.tolist() == [1, 1]
+    finish(runner)
+
+
 @pytest.mark.parametrize("kind", ["mla", "mha"])
 def test_tbo_empty_batch_and_preflight_all_sources(monkeypatch, kind):
     runner, builder = make_runner(monkeypatch, kind)
+    batch = decode_batch(0)
+    slices = cut_decode_ubatches(4, 4, np.zeros(1))
     runner._gate_staging_reuse()
-    builder._prepare_ubatch_decode(0, 4, 1, np.array([], dtype=np.int32))
+    md = AttentionMetaData()
+    for group in stage_ubatch_decode(builder, batch, slices, 1, md):
+        group.publish()
+    builder.finish_ubatch_decode(md, batch.total_seqs_num_decode, slices, 1)
     finish(runner)
     torch.cuda.synchronize()
     for ub in range(2):
@@ -360,7 +464,7 @@ def test_tbo_empty_batch_and_preflight_all_sources(monkeypatch, kind):
     runner.forward_vars["ub1_kv_indptr"].copy_to_gpu(0)
     assert_repeat_does_not_write(
         runner,
-        lambda: builder._prepare_ubatch_decode(0, 4, 1, np.array([], dtype=np.int32)),
+        lambda: stage_ubatch_decode(builder, batch, slices, 1),
     )
     finish(runner)
 
@@ -387,11 +491,94 @@ def test_kimi_capture_has_one_publication_and_rejects_rewrite(monkeypatch, dcp, 
     assert saved.tolist() == [0, 1, 2, 3]
 
 
-def make_qwen_runner(monkeypatch, pp=1, *, bind=True):
+@pytest.mark.parametrize("kind", ["mla", "mha"])
+@pytest.mark.parametrize("pp", [1, 2])
+@pytest.mark.parametrize("q,replay", [(1, False), (4, False), (4, True)])
+def test_gdn_decode_publishes_slots_with_attention_metadata(
+    monkeypatch, kind, pp, q, replay
+):
+    """Kimi (MLA + GDN) and Qwen3-Next (MHA + GDN): one upload a decode."""
     from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadataBuilder
+    from atom.model_ops.attentions.kimi_mla_gdn_attn import (
+        KimiAiterMLAGDNMetadataBuilder,
+    )
+
+    monkeypatch.setenv("ATOM_ENABLE_REPLAYSSM", str(int(replay)))
+    runner, builder = make_runner(monkeypatch, kind, pp=pp, q=q, tbo=False, bind=False)
+    # Reuse production attention allocation; the hybrids' pools are unrelated.
+    builder.__class__ = (
+        KimiAiterMLAGDNMetadataBuilder if kind == "mla" else GDNAttentionMetadataBuilder
+    )
+    runner.drafter = SimpleNamespace(mtp_k=q - 1, runner=runner)
+    runner.tokenID_processor.num_bonus = None
+    runner.replayssm_write_pos = torch.full(
+        (64,), -1, dtype=torch.int32, device=runner.device
+    )
+    builder._init_gdn_state(runner)
+    runner._init_forward_vars_ring()
+    runner._init_h2d_publication()
+    assert {"spec_state_indices", "kv_indptr", "block_tables"} <= {
+        b.name for b in runner.h2d_groups["decode_metadata"].members
+    }
+
+    direct = []
+    copy = BufferPublication._copy
+
+    def record_direct(binding, count):
+        direct.append(binding.name)
+        copy(binding, count)
+
+    monkeypatch.setattr(BufferPublication, "_copy", record_direct)
+    spec = q > 1
+    saved = []
+    for step, count in enumerate((3, 1, 4, 2)):
+        batch = decode_batch(count, q, step)
+        width = 1 if replay or not spec else q
+        batch.state_slots = [
+            [step + 3 * i + 1 + 7 * j for j in range(width)] for i in range(count)
+        ]
+        batch.state_fork_srcs = []
+        start_decode(runner, builder, batch, q)
+        torch.cuda._sleep(3_000_000)
+        direct.clear()
+        md, _ = builder.prepare_decode(batch, 4, 4 * q, q)
+        assert direct == [], direct
+        gdn = md.gdn_metadata
+        var = runner.forward_vars
+        firsts = [slots[0] for slots in batch.state_slots] + [-1] * (4 - count)
+        if spec:
+            rows = np.full((4, q), -1, dtype=np.int32)
+            for i, slots in enumerate(batch.state_slots):
+                rows[i] = 0
+                rows[i, : len(slots)] = slots
+            saved.append((var["spec_state_indices"].gpu[:4].clone(), rows.tolist()))
+            assert gdn.spec_state_indices_tensor.data_ptr() == (
+                var["spec_state_indices"].gpu.data_ptr()
+            )
+        else:
+            saved.append((var["non_spec_state_indices_in"].gpu[:4].clone(), firsts))
+        if replay or not spec:
+            saved.append((var["non_spec_state_indices"].gpu[:4].clone(), firsts))
+        finish(runner)
+    torch.cuda.synchronize()
+    for actual, expected in saved:
+        assert actual.cpu().tolist() == expected
+
+
+def make_qwen_runner(monkeypatch, pp=1, *, bind=True):
+    from atom.model_ops.attentions.gdn_attn import (
+        GDNAttentionMetadataBuilder,
+        GDNStateMixin,
+    )
     from atom.model_ops.attentions.qwen4_exp_attn import Qwen4ExpMetadataBuilder
 
     runner, _ = make_runner(monkeypatch, "mha", pp=1, tbo=False, bind=False)
+    # The GDN state is not allocated here: publish none of it.
+    monkeypatch.setattr(
+        GDNStateMixin,
+        "h2d_group_members",
+        lambda self: super(GDNStateMixin, self).h2d_group_members(),
+    )
 
     # Invoke the real Qwen allocation while using the already allocated base.
     def init(self, model_runner, **kwargs):
@@ -458,9 +645,13 @@ def test_qsa_ple_ragged_padding_delayed_graph_consumer(monkeypatch, pp):
         batch = SimpleNamespace(num_cached_tokens=cached)
         var["ple_has_initial_state"].gpu.fill_(True)
         torch.cuda._sleep(3_000_000)
-        args = (md, len(counts), 12, np.asarray(counts, dtype=np.int64), n)
-        qsa = builder._build_qsa_metadata(*args)
-        ple = builder._build_ple_metadata(batch, md, len(counts), is_prefill=True)
+        group = builder.model_runner.h2d_groups["prefill_metadata"]
+        args = (12, np.asarray(counts, dtype=np.int64), n, group)
+        builder._stage_qsa(*args)
+        builder._stage_ple(batch, len(counts), True, group)
+        group.publish()
+        qsa = builder._finish_qsa(md, len(counts), 12)
+        ple = builder._finish_ple(md, len(counts))
         graphs[runner._fv_idx].replay()
         ids = [i for i, count in enumerate(counts) for _ in range(count)]
         saved.append(
@@ -487,12 +678,12 @@ def test_qsa_ple_ragged_padding_delayed_graph_consumer(monkeypatch, pp):
             )
         )
         assert_repeat_does_not_write(
-            runner, lambda args=args: builder._build_qsa_metadata(*args)
+            runner, lambda args=args: builder._stage_qsa(*args)
         )
         assert_repeat_does_not_write(
             runner,
-            lambda batch=batch, md=md, counts=counts: builder._build_ple_metadata(
-                batch, md, len(counts), is_prefill=True
+            lambda batch=batch, counts=counts, group=group: builder._stage_ple(
+                batch, len(counts), True, group
             ),
         )
         finish(runner)
@@ -507,8 +698,9 @@ def test_qsa_capture_rejected_before_raw_source_write(monkeypatch):
     before = runner.forward_vars["qsa_token_to_req"].cpu.clone()
     # Preflight must fail before a host fill even for an empty publication.
     graph = torch.cuda.CUDAGraph()
+    group = runner.h2d_groups["prefill_metadata"]
     with torch.cuda.graph(graph), pytest.raises(PublicationError, match="capture"):
-        builder._build_qsa_metadata(None, 0, 0, np.array([], dtype=np.int64), 0)
+        builder._stage_qsa(0, np.array([], dtype=np.int64), 0, group)
     assert torch.equal(before, runner.forward_vars["qsa_token_to_req"].cpu)
     finish(runner)
 
@@ -536,7 +728,7 @@ def test_mla_sparse_prefill_prefixes_and_tail(monkeypatch, pp, cached):
         batch.last_block_num_tokens = ((lens - 1) % 16 + 1).tolist()
         runner._advance_forward_vars()
         runner._gate_staging_reuse()
-        builder.publish_cu_seqlens_q(batch, SimpleNamespace(running_bs=4))
+        publish_query_prefix(builder, batch, 4, tokens)
         for name in (
             "cu_seqlen_ks",
             "sparse_kv_indptr",
@@ -556,7 +748,11 @@ def test_mla_sparse_prefill_prefixes_and_tail(monkeypatch, pp, cached):
         saved.extend(
             [
                 (md.cu_seqlen_ks.clone(), starts),
-                (md.batch_id_per_q_token.clone(), bids),
+                # Published with the query prefix; `build()` hands it over.
+                (
+                    runner.forward_vars["batch_id_per_q_token"].gpu[:tokens].clone(),
+                    bids,
+                ),
                 (md.sparse_kv_indptr.clone(), [0] + np.cumsum(selected).tolist()),
                 (
                     runner.forward_vars["cu_seqlen_ks"].gpu[tokens:].clone(),
@@ -583,17 +779,12 @@ def test_mla_sparse_prefill_prefixes_and_tail(monkeypatch, pp, cached):
         assert actual.cpu().tolist() == expected
 
 
-@pytest.mark.parametrize("transport", ["direct", "packed"])
 @pytest.mark.parametrize("producer", ["prefill", "mrope_prefill", "mrope_decode"])
-def test_attention_reentry_preserves_sources_and_first_consumer(
-    monkeypatch, transport, producer
-):
+def test_attention_reentry_preserves_sources_and_first_consumer(monkeypatch, producer):
     from tests.test_h2d_runner_publication import runner_with_buffers
 
     if producer == "prefill":
-        runner, builder = make_runner(
-            monkeypatch, "mha", tbo=False, transport=transport
-        )
+        runner, builder = make_runner(monkeypatch, "mha", tbo=False)
 
         def produce(changed):
             batch = decode_batch(2)
@@ -614,7 +805,7 @@ def test_attention_reentry_preserves_sources_and_first_consumer(
         cu.cpu[:5] = torch.tensor([0, 3, 5, 5, 5])
         cu.gpu.copy_(cu.cpu)
     else:
-        runner = runner_with_buffers(monkeypatch, transport)
+        runner = runner_with_buffers(monkeypatch)
         builder = runner.attn_metadata_builder
 
         def produce(changed):
@@ -622,17 +813,25 @@ def test_attention_reentry_preserves_sources_and_first_consumer(
             batch = SimpleNamespace(
                 total_tokens_num_decode=4,
                 total_tokens_num_prefill=4,
+                num_scheduled_tokens=np.full(2, 2, dtype=np.int32),
                 req_ids=[10, 20],
                 context_lens=ends,
                 num_cached_tokens=ends - 2,
                 mrope_positions_by_req={},
                 mrope_position_deltas={},
             )
-            if producer == "mrope_prefill":
-                return builder._build_mrope_prefill_positions(batch)
-            return builder._build_mrope_decode_positions(
-                batch, ends, 2, running_tokens=8
-            )
+            prefill = producer == "mrope_prefill"
+            group = builder.model_runner.h2d_groups[
+                "prefill_metadata" if prefill else "decode_metadata"
+            ]
+            if prefill:
+                positions = builder._build_mrope_prefill_positions(batch, 8, group)
+            else:
+                positions = builder._build_mrope_decode_positions(
+                    batch, ends, group, running_tokens=8
+                )
+            group.publish()
+            return positions
 
         names = ("mrope_positions",)
 
@@ -663,14 +862,11 @@ def test_attention_reentry_preserves_sources_and_first_consumer(
 
 
 @pytest.mark.parametrize("kind", ["mha", "mla"])
-@pytest.mark.parametrize("transport", ["direct", "packed"])
 @pytest.mark.parametrize("pp", [1, 2])
-def test_shared_maps_skip_h2d_per_slot_and_tbo_buffer(monkeypatch, kind, transport, pp):
+def test_shared_maps_skip_h2d_per_slot_and_tbo_buffer(monkeypatch, kind, pp):
     from atom.model_engine.sequence import new_block_table
 
-    runner, builder = make_runner(
-        monkeypatch, kind, pp=pp, tbo=True, transport=transport
-    )
+    runner, builder = make_runner(monkeypatch, kind, pp=pp, tbo=True)
     rows = [new_block_table(row) for row in decode_batch(3).block_tables]
     published = {}
     observed = []
@@ -683,13 +879,15 @@ def test_shared_maps_skip_h2d_per_slot_and_tbo_buffer(monkeypatch, kind, transpo
         batch.block_tables = rows
         start_decode(runner, builder, batch, 1)
         torch.cuda._sleep(2_000_000)
-        builder.prepare_decode(batch, 4, 4, 1)
-        # 3 scheduled requests split [0, 1) / [1, 3), each padded to half of 4.
-        (lo0, hi0), (lo1, hi1) = decode_ubatch_request_ranges(3, 2)
+        builder.prepare_decode(
+            batch, 4, 4, 1, cut_decode_ubatches(4, 4, np.ones(3, np.int32))
+        )
+        # Two requests a half: ubatch 0 holds the first two, ubatch 1 the
+        # third and a padding request.
         for name, selected, width in (
             ("block_tables", rows, 4),
-            ("ub0_block_tables", rows[lo0:hi0], 2),
-            ("ub1_block_tables", rows[lo1:hi1], 2),
+            ("ub0_block_tables", rows[0:2], 2),
+            ("ub1_block_tables", rows[2:3], 2),
         ):
             buf = runner.forward_vars[name]
             mapping = tuple(tuple(row) for row in selected)
@@ -705,3 +903,18 @@ def test_shared_maps_skip_h2d_per_slot_and_tbo_buffer(monkeypatch, kind, transpo
     torch.cuda.synchronize()
     for actual, expected in observed:
         assert torch.equal(actual.cpu(), expected)
+
+
+@pytest.mark.parametrize("has_drafter", [False, True])
+def test_a_cold_prefill_uploads_the_block_tables_a_drafter_reads(has_drafter):
+    """A drafter's steps after a prefill read the block tables as a decode
+    does: with no cached prefix the prefill must still upload them, or the
+    draft writes its KV through the previous step's pages."""
+    from atom.model_ops.attentions import backends
+
+    runner = SimpleNamespace(drafter=object()) if has_drafter else SimpleNamespace()
+    stub = SimpleNamespace(model_runner=runner)
+    rows = backends.CommonAttentionBuilder._prefill_block_table_rows(
+        stub, None, 4, has_cached=False
+    )
+    assert rows == (4 if has_drafter else None)

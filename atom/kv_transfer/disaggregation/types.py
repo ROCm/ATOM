@@ -134,12 +134,25 @@ class StateStoreOperationId:
             raise ValueError("state store generation must be nonnegative")
 
 
+@dataclass(frozen=True)
+class StateTouchId:
+    """One LRU refresh of a voted state image. Every TP worker reports on its
+    own shard under this id, so the failure-dominant quorum says gone when any
+    shard is. `generation` keeps repeated touches of one hash distinct
+    identities.
+    """
+
+    prefix_hash: int
+    generation: int
+
+
 ConnectorCompletionId = (
     ReqId
     | SaveOperationId
     | SaveSourceGroupId
     | LoadOperationId
     | StateStoreOperationId
+    | StateTouchId
 )
 ConnectorCompletionKey = tuple[str, ConnectorCompletionId]
 
