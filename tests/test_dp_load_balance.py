@@ -1682,3 +1682,87 @@ def test_prefix_spread_is_checked_and_built_only_where_it_routes(
         assert mgr._build_prefix_router(config) is not None
     else:
         assert mgr._build_prefix_router(config) is None
+
+
+@pytest.mark.parametrize("tier_tokens", [0, 3584, 4096, 4608, 16384, 32768])
+@pytest.mark.parametrize("finished", [False, True])
+@pytest.mark.parametrize("entry", ["place", "select"])
+@pytest.mark.parametrize("chunk", [256, 512])
+def test_cancel_preserves_only_independent_tier_credit(
+    tier_tokens, finished, entry, chunk
+):
+    from atom.kv_transfer.offload.tier import OffloadTierProfile
+
+    profile = OffloadTierProfile(True, 4096, chunk)
+    router = _make_spread_mgr(n_ranks=3, tier=profile)._prefix_router
+
+    def place(seq_id, length, rank):
+        seq = _chain_seq(seq_id, length)
+        if entry == "select" and seq_id in (4, 5):
+            route = router.select(seq, [0, 0, 0], [0, 1, 0], lambda _: 0, lambda: 1)
+            assert route.rank == rank
+        else:
+            route = router.place(seq, rank, 3)
+        router.charge(seq_id, route.credit)
+        return seq, route.credit
+
+    if tier_tokens:
+        warm, _ = place(1, tier_tokens, 2)
+        if finished:
+            router.prefill_complete(warm.id)
+            router.release(warm.id)
+    source, _ = place(2, 32768, 0)
+    producer, _ = place(3, 32768, 1)
+    follower, credited = place(4, 32768, 1)
+    later, later_credit = place(5, 32768, 1)
+    expected = profile.loadable_tokens(0, tier_tokens if finished else 0, 32768)
+    assert router.release(source.id) == {}
+    charges = router.release(producer.id)
+    assert router._in_flight[follower.id] == expected
+    assert charges.get(follower.id, 0) == credited - expected
+    assert router.release(producer.id) == {}
+    charges = router.release(follower.id)
+    assert router._in_flight[later.id] == expected
+    assert charges.get(later.id, 0) == later_credit - expected
+    router.prefill_complete(later.id)
+    router.release(later.id)
+    if tier_tokens and not finished:
+        router.release(1)
+    assert not router._independent_credit
+    assert not router._in_flight
+    assert not router.pending
+
+
+def test_cancel_preserves_confirmed_local_credit_without_a_tier():
+    from atom.kv_transfer.offload.tier import OffloadTierProfile
+
+    router = _make_spread_mgr(tier=OffloadTierProfile())._prefix_router
+    for seq_id, length in [(1, 4096), (2, 8192), (3, 12288)]:
+        route = router.place(_chain_seq(seq_id, length), 0, 2)
+        router.charge(seq_id, route.credit)
+        if seq_id == 1:
+            router.prefill_complete(seq_id)
+            router.release(seq_id)
+    assert router.release(2) == {3: 4096}
+    assert router._in_flight[3] == 4096
+    router.release(3)
+    assert not router._independent_credit
+
+
+def test_independent_credit_does_not_survive_request_id_reuse_or_reset():
+    from atom.kv_transfer.offload.tier import OffloadTierProfile
+
+    router = _make_spread_mgr(tier=OffloadTierProfile(True, 4096, 512))._prefix_router
+    route = router.place(_chain_seq(1, 8192), 0, 2)
+    router.charge(1, route.credit)
+    router.prefill_complete(1)
+    route = router.place(_chain_seq(2, 8192), 1, 2)
+    router.charge(2, route.credit)
+    assert router._independent_credit[2] > 0
+    router.release(2)
+    assert 2 not in router._independent_credit
+    route = router.place(_chain_seq(2, 8192, first_block=99999), 1, 2)
+    router.charge(2, route.credit)
+    assert router._independent_credit[2] == 0
+    router.reset()
+    assert not router._independent_credit

@@ -93,6 +93,8 @@ class PrefixSpreadRouter:
         # nevertheless still prefilling). A follower taking over an aborted
         # producer loses its credit exactly once (`_left_unprefilled`).
         self._in_flight: dict = {}
+        # Placement-time credit backed independently of any pending producer.
+        self._independent_credit: dict = {}
 
     def reset(self) -> None:
         """Forget in-flight state. The index stays: it describes the ranks'
@@ -107,6 +109,7 @@ class PrefixSpreadRouter:
         self.pending.clear()
         self._produced.clear()
         self._in_flight.clear()
+        self._independent_credit.clear()
         self._prune_empty(affected)
         for edge in affected:
             self._refresh_evictable(edge)
@@ -205,7 +208,9 @@ class PrefixSpreadRouter:
                 rank = target
 
         est_hit, loaded = self._credit(seq, rank, hits, owner)
-        self._record(chain, rank, seq.id, est_hit)
+        self._record(
+            chain, rank, seq.id, est_hit, self._independent_hit(seq, rank, est_hit)
+        )
         if rank == owner:
             return Route(rank, PREFIX_OWNER, est_hit)
         return Route(rank, PREFIX_MOVED, est_hit, loaded)
@@ -217,7 +222,9 @@ class PrefixSpreadRouter:
             return Route(rank, "explicit_total")
         hits, owner = self._rank_hits(chain, n_ranks)
         credit, loaded = self._credit(seq, rank, hits, owner)
-        self._record(chain, rank, seq.id, credit)
+        self._record(
+            chain, rank, seq.id, credit, self._independent_hit(seq, rank, credit)
+        )
         return Route(rank, "explicit_total", credit, loaded)
 
     def _credit(self, seq, rank, hits, owner):
@@ -227,6 +234,28 @@ class PrefixSpreadRouter:
         in_tier = self._tier_hit(seq.prompt_hash_chain)
         loaded = self.tier.loadable_tokens(local, in_tier, seq.num_prompt_tokens)
         return local + loaded, loaded
+
+    def _independent_hit(self, seq, rank, credit):
+        """Credit available without waiting for a same-rank producer.
+
+        Keep the placement-time confirmed local prefix and load policy: an
+        unrelated completed tier copy does not disappear when that producer
+        aborts. Unfinished tier copies and sub-threshold loads supply no floor.
+        """
+        local = 0
+        for edge, hit in reversed(self._path(seq.prompt_hash_chain)):
+            holders = self.index[edge]
+            if (
+                rank in holders
+                and (edge, rank) not in self.pending
+                and holders[rank] not in self._in_flight
+            ):
+                local = hit
+                break
+        loaded = self.tier.loadable_tokens(
+            local, self._tier_hit(seq.prompt_hash_chain), seq.num_prompt_tokens
+        )
+        return min(credit, local + loaded)
 
     def _idle_target(
         self,
@@ -364,7 +393,9 @@ class PrefixSpreadRouter:
                 break
         return hits, owner
 
-    def _record(self, chain, rank: int, seq_id, hit: int) -> None:
+    def _record(
+        self, chain, rank: int, seq_id, hit: int, independent_credit: int = 0
+    ) -> None:
         """Record one continuous interval, split only where prefixes diverge.
 
         A request depends on the provisional intervals it uses. History cannot
@@ -404,6 +435,7 @@ class PrefixSpreadRouter:
             ordinal = self._next_ordinal
             self._next_ordinal += 1
             self.seq_hashes[seq_id] = (rank, chain, ordinal)
+            self._independent_credit[seq_id] = independent_credit
             key = (
                 rank,
                 (int(chain.hash_block_size), chain.cache_seed),
@@ -414,6 +446,7 @@ class PrefixSpreadRouter:
 
     def _remove_request(self, seq_id):
         entry = self.seq_hashes.pop(seq_id, None)
+        self._independent_credit.pop(seq_id, None)
         if entry is not None:
             rank, chain, _ordinal = entry
             key = (
@@ -506,7 +539,13 @@ class PrefixSpreadRouter:
                 self.pending[key] = successor
                 self._produced.setdefault(successor, set()).add(edge)
                 credited = self._in_flight.get(successor, 0)
-                retained = min(credited, edge.start * edge.hbs)
+                retained = min(
+                    credited,
+                    max(
+                        edge.start * edge.hbs,
+                        self._independent_credit.get(successor, 0),
+                    ),
+                )
                 if retained < credited:
                     self._in_flight[successor] = retained
                     charges[successor] = charges.get(successor, 0) + credited - retained
