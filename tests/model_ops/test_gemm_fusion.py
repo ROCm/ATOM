@@ -282,7 +282,7 @@ def test_explain_gate_is_cached_per_local_m(monkeypatch):
     for _ in range(2):
         site.run(_x(), torch.zeros((2, 1)), _positions(), None)
     assert len(calls) == 2  # provider op runs per call
-    assert site._routes == {2: True}  # explain asked once for m=2
+    assert site._routes == {("dense", 2): True}  # explain asked once for m=2
 
 
 def test_indexer_payload_carries_index_tensors_only(monkeypatch):
@@ -303,7 +303,50 @@ def test_provider_decline_keeps_3084_non_fused_path(monkeypatch):
     site = _site()
     assert site.run(_x(), torch.zeros((2, 1)), _positions(), None) == "OUT"
     assert calls == []
-    assert site._routes == {2: False}
+    assert site._routes == {("dense", 2): False}
+
+
+class _FakeGroup:
+    def __init__(self, verdicts):
+        self.verdicts = verdicts
+
+
+def _fake_rank_gather(monkeypatch, group):
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather_object",
+        lambda output, obj, group=None: output.__setitem__(slice(None), group.verdicts),
+    )
+
+
+def test_rank_disagreement_falls_back_on_every_rank(monkeypatch):
+    _install_gate(monkeypatch, route="provider")
+    site = _site()
+    group = _FakeGroup([(True, 2), (False, 2), (True, 2), (True, 2)])
+    site._group = group
+    _fake_rank_gather(monkeypatch, group)
+    assert site._serves(2, [], {}) is False
+    assert site._routes == {("dense", 2): False}
+
+
+def test_rank_agreement_serves_as_one_sequence(monkeypatch):
+    _install_gate(monkeypatch, route="provider")
+    site = _site()
+    group = _FakeGroup([(True, 2), (True, 2), (True, 2), (True, 2)])
+    site._group = group
+    _fake_rank_gather(monkeypatch, group)
+    assert site._serves(2, [], {}) is True
+    assert site._routes == {("dense", 2): True}
+
+
+def test_rank_m_mismatch_falls_back_on_every_rank(monkeypatch):
+    _install_gate(monkeypatch, route="provider")
+    site = _site()
+    group = _FakeGroup([(True, 2), (True, 2), (True, 3), (True, 2)])
+    site._group = group
+    _fake_rank_gather(monkeypatch, group)
+    assert site._serves(2, [], {}) is False
+    assert site._routes == {("dense", 2): False}
 
 
 def test_no_provider_enabled_never_touches_the_interface(monkeypatch):
@@ -402,7 +445,7 @@ def test_large_band_asks_explain_then_keeps_the_fallback(monkeypatch):
     x_scale = torch.zeros((512, 1))
     assert site.run(x, x_scale, _positions(), None) == "OUT"
     assert calls == []  # no provider call for the large cell
-    assert site._routes == {512: False}
+    assert site._routes == {("dense", 512): False}
 
 
 def test_initialize_is_none_without_the_provider_flag():

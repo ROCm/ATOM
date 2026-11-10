@@ -397,8 +397,48 @@ class QkvSite:
             for t in (positions, slot)
         )
 
+    def _rank_uniform(self, local_served, m):
+        """Agree the local explain verdict and M class across the SP group.
+
+        The provider's exchange/call-id/readback protocol requires every rank to
+        issue the same call sequence, so a site serves only when every rank's
+        explain selects the provider **and** every rank presents the same local
+        M (equal local M means the same provider bucket). Different M across
+        ranks is an uneven-SP step: the safest functional policy is all-rank
+        fallback (no padded payload construction here).
+
+        Returns ``(served, reason)``. With no group (single rank/CPU) the local
+        verdict is the decision.
+        """
+        group = self._group_value()
+        if group is None:
+            return bool(local_served), "single-rank"
+        try:
+            import torch.distributed as dist
+
+            gathered = [None] * self.world
+            dist.all_gather_object(gathered, (bool(local_served), int(m)), group=group)
+        except Exception:
+            logger.warning(
+                "provider gate %s mode=%s m=%d: collective failed; non-fused path",
+                self.name,
+                self.mode,
+                m,
+                exc_info=True,
+            )
+            return False, "collective-error"
+        if any(item is None for item in gathered):
+            return False, "collective-incomplete"
+        all_served = all(bool(item[0]) for item in gathered)
+        same_m = len({int(item[1]) for item in gathered}) == 1
+        if all_served and same_m:
+            return True, "all-ranks"
+        if not any(bool(item[0]) for item in gathered):
+            return False, "provider-declined"
+        return False, "rank-disagreement"
+
     def _serves(self, m, args, kwargs):
-        """The init/first-use ``aiter.plugin.explain`` gate, cached per local M."""
+        """The rank-uniform ``aiter.plugin.explain`` gate, cached per (mode, M)."""
         if not self.provider_enabled:
             return False
         if not self.kv_ready:
@@ -412,10 +452,11 @@ class QkvSite:
                 self.name,
             )
             return False
-        cached = self._routes.get(m)
+        key = (self.mode, int(m))
+        cached = self._routes.get(key)
         if cached is not None:
             return cached
-        served = False
+        local_served = False
         try:
             aiter = _aiter()
             plugin = _aiter_plugin()
@@ -426,21 +467,36 @@ class QkvSite:
             _ensure_plugin_enabled(aiter, plugin, self.provider_enable)
             explanation = plugin.explain(_OP_NAME, *args, **kwargs)
             decision = getattr(explanation, "decision", None)
-            served = getattr(decision, "route", None) == "provider"
+            local_served = getattr(decision, "route", None) == "provider"
         except Exception:
             logger.warning(
                 "gemm_fusion %s: provider explain() unavailable; non-fused path",
                 self.name,
                 exc_info=True,
             )
-        self._routes[m] = served
+        served, reason = self._rank_uniform(local_served, m)
+        self._routes[key] = served
         if served:
+            logger.info(
+                "provider gate %s mode=%s m=%d: fused (all ranks)",
+                self.name,
+                self.mode,
+                m,
+            )
             self._log_once(
                 "first-prepare",
                 "provider session: first-prepare %s mode=%s m=%d",
                 self.name,
                 self.mode,
                 m,
+            )
+        else:
+            logger.info(
+                "provider gate %s mode=%s m=%d: fallback (%s)",
+                self.name,
+                self.mode,
+                m,
+                reason,
             )
         self._log_once(
             "route" if served else f"fallback-{m}",
