@@ -39,6 +39,7 @@ def moe_narrow_defs(k4ctx):
     ROUTED_TASKS = k4ctx["ROUTED_TASKS"]
     MID16_WORDS = k4ctx["MID16_WORDS"]
     MID8_LDS = k4ctx["MID8_LDS"]
+    MID_BF = k4ctx["MID_BF"]
     MID_FLAG = k4ctx["MID_FLAG"]
     MID8_WORDS = k4ctx["MID8_WORDS"]
     MIDSC_LDS = k4ctx["MIDSC_LDS"]
@@ -242,8 +243,31 @@ def moe_narrow_defs(k4ctx):
         """Every token's route-weighted down GEMV of row group ``t`` -> push bf16
         partial rows -> rank-ordered sum -> ar_out."""
 
+        def stage_mids_bf(k):
+            """``stage_mids`` for bf16 pairs behind a tag each: 4 elements a spec."""
+            mids = mb_poll(
+                [
+                    (
+                        mr("mid"),
+                        k * MOE_SLOTS * INTER // 2
+                        + fx.min((tid + i * THREADS) * 2, MOE_SLOTS * INTER // 2 - 2),
+                        2,
+                    )
+                    for i in range(2)
+                ]
+            )
+            for i in range_constexpr(2):
+                if (tid + i * THREADS) * 4 < MOE_SLOTS * INTER:
+                    for q in range_constexpr(2):
+                        fx.ptr_store(
+                            mids[i][q],
+                            xs + (k * MID16_WORDS + (tid + i * THREADS) * 2 + q),
+                        )
+
         def stage_mids(k):
             """Token k's mid rows (every slot) -> xs, as bf16 pairs."""
+            if const_expr(MID_BF):
+                return stage_mids_bf(k)
             mids = mb_poll(
                 [
                     (

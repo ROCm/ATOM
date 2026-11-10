@@ -202,7 +202,9 @@ def mailbox_regions(
         else:
             regions += [RegionDecl(n, S, "router") for n in ("xn8", "xsc")]
         regions.append(
-            RegionDecl("ugdone", S, "ug") if mid_flag else RegionDecl("mid", S, "ug")
+            RegionDecl("ugdone", S, "ug")
+            if mid_flag == 1
+            else RegionDecl("mid", S, "ug")
         )
     regions.append(RegionDecl("sel", S, "ug"))  # the routing record (tests)
     regions.append(RegionDecl("ffn", P, "down", exchange=True))

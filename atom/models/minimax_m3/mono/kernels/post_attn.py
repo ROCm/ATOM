@@ -231,7 +231,9 @@ def build_post_attn_kernel(
     XN_FLAG = WIDE or xn_flag != 0
     XN_EARLY = xn_flag == 2 and not WIDE
     # the narrow MoE's mid rows likewise: plain bf16 behind one flag a up / gate task
-    MID_FLAG = mid_flag != 0 and not WIDE
+    # (``mid_flag`` 1), or (2) bf16 pairs with a tag each, half the bytes of f32 ones
+    MID_FLAG = mid_flag == 1 and not WIDE
+    MID_BF = mid_flag == 2 and not WIDE
     POOL = pool_words(tokens)
     U_MAX = TOP_K * tokens + 1  # distinct routed experts at most, then the shared
 

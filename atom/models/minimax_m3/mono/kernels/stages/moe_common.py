@@ -60,6 +60,7 @@ def moe_common_defs(k4ctx):
     DN_UPW = k4ctx["DN_UPW"]
     G = k4ctx["G"]
     ROUTED_TASKS = k4ctx["ROUTED_TASKS"]
+    MID_BF = k4ctx["MID_BF"]
     MID_FLAG = k4ctx["MID_FLAG"]
     SH8 = k4ctx["shared_mxfp8"]
     SH_UPW = k4ctx["SH_UPW"]
@@ -76,6 +77,7 @@ def moe_common_defs(k4ctx):
     lds_i32 = k4ctx["lds_i32"]
     mb = k4ctx["mb"]
     mb_put = k4ctx["mb_put"]
+    mb_put_bf = k4ctx["mb_put_bf"]
     mr = k4ctx["mr"]
     opart = k4ctx["opart"]
     red = k4ctx["red"]
@@ -101,11 +103,15 @@ def moe_common_defs(k4ctx):
         """Mid element ``idx`` (even for a lane r % 2 == 0) := ``y``: a tagged pair, or
         (``MID_FLAG``) a bf16 pair word from every even lane (its neighbor's value
         beside its own), plain (the task's flag follows the CTA's stores)."""
-        if const_expr(not MID_FLAG):
+        if const_expr(not (MID_FLAG or MID_BF)):
             mb_put(mr("mid"), idx, bf16_round(y))
             return
         y = bf16_round(y)
         nb = xshfl(y, 1)
+        if const_expr(MID_BF):
+            if idx % 2 == 0:
+                mb_put_bf(mr("mid"), idx, [y, nb])
+            return
         if idx % 2 == 0:
             bo.buffer_store(
                 bf16_pair(y, nb).bitcast(fx.Int32),
