@@ -2927,7 +2927,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # MTP: `seq.num_tokens` runs past this fwd's window by
         # `verify_ctx_lens()` (`num_rejected` deferred, 1 undeferred/PP);
         # roll ctx back so positions overwrite last fwd's rejected-draft slots.
-        # None on dummy runs and before the first sampler output.
+        # Counts are absent before the first sampler output; idle DP steps
+        # have no request contexts to shift.
         # The rolled-back ctx is also what anchors `positions` (at `ctx -
         # full_q`, below), and every compress count is now `visible_*(pos)`, so
         # a rejected slot's KV falls out of range on its own — `block_tables`

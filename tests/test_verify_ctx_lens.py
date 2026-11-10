@@ -84,6 +84,35 @@ def test_no_shift_without_counts():
         assert _verify_ctx_lens(ctx, None, deferred) is ctx
 
 
+@pytest.mark.parametrize("deferred", [True, False])
+@pytest.mark.parametrize("previous_rows", [1, 9])
+def test_empty_verify_context_leaves_existing_status_untouched(deferred, previous_rows):
+    ctx = np.empty(0, dtype=np.int32)
+    rejected = np.arange(previous_rows, dtype=np.int64) % NUM
+    processor = SimpleNamespace(num_rejected=rejected, is_deferred_out=deferred)
+    verify = runner_module.tokenIDProcessor.verify_ctx_lens
+
+    assert verify(processor, ctx) is ctx
+    assert processor.num_rejected is rejected
+    real_ctx = np.full(previous_rows, 100, dtype=np.int32)
+    np.testing.assert_array_equal(
+        verify(processor, real_ctx), real_ctx - (rejected if deferred else 1)
+    )
+
+
+@pytest.mark.parametrize("deferred", [True, False])
+@pytest.mark.parametrize("explicit", [True, False])
+def test_nonempty_decode_still_rejects_misaligned_status(deferred, explicit):
+    processor = SimpleNamespace(
+        num_rejected=np.array([1, 2], dtype=np.int32), is_deferred_out=deferred
+    )
+    kwargs = {"num_rejected": np.array([1], dtype=np.int32)} if explicit else {}
+    with pytest.raises(ValueError, match="not aligned with decode rows"):
+        runner_module.tokenIDProcessor.verify_ctx_lens(
+            processor, np.array([10, 20, 30], dtype=np.int32), **kwargs
+        )
+
+
 @pytest.mark.parametrize("num_rejected", [0, 1, MTP_K])
 def test_undeferred_shift_is_one_whatever_was_rejected(num_rejected):
     # The undeferred window is fixed by the placeholder run postprocess left,

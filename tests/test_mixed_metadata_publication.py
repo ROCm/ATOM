@@ -11,6 +11,7 @@ pytest.importorskip("aiter")
 
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.model_runner import ModelRunner, tokenIDProcessor
+from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attentions import backends
 from atom.model_ops.attentions import deepseek_v4_attn as v4
 from atom.spec_decode.dspark_scheduler import resize_decode_tokens
@@ -84,6 +85,32 @@ def _runner(monkeypatch, slots):
     runner._init_h2d_publication()
     builder.build_mixed_prefill_banks()
     return runner, builder
+
+
+@pytest.mark.parametrize("slots", [1, 2])
+@pytest.mark.parametrize("query_width", [1, 2])
+def test_idle_v4_decode_publishes_padding_with_previous_spec_status(
+    monkeypatch, slots, query_width
+):
+    runner, builder = _runner(monkeypatch, slots)
+    previous_rejected = np.array([0, 1, 1], dtype=np.int32)
+    runner.tokenID_processor.num_rejected = previous_rejected
+    batch = ScheduledBatch({}, [], 0, num_spec_step=1)
+    assert batch.total_seqs_num_decode == 0 and not batch.is_mixed
+
+    runner._advance_forward_vars()
+    runner._gate_staging_reuse()
+    builder.publish_query_metadata(batch.num_scheduled_tokens, 4, 4 * query_width)
+    metadata, positions = builder.prepare_decode(batch, 4, 4 * query_width, query_width)
+    runner._mark_staging_h2d_enqueued()
+    runner._record_forward_vars_event()
+
+    assert metadata.context_lens.numel() == 0
+    assert metadata.cu_seqlens_q.cpu().tolist() == [0] * 5
+    assert positions.cpu().tolist() == [0] * (4 * query_width)
+    assert metadata.state_slot_out.cpu().tolist() == [0] * 4
+    assert runner.tokenID_processor.num_rejected is previous_rejected
+    np.testing.assert_array_equal(previous_rejected, [0, 1, 1])
 
 
 @pytest.mark.parametrize("slots", [1, 2])

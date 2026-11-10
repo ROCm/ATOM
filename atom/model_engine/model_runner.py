@@ -381,6 +381,10 @@ class tokenIDProcessor:
         there is nothing to shift. Only a verify step has a window, so every
         caller sits behind `max_seqlen_q > 1`, or supplies mixed segment counts.
         """
+        # Idle DP steps run only padding, while the previous step's status
+        # may still be present. There are no request contexts to correct.
+        if len(context_lens) == 0:
+            return context_lens
         rejected = self.num_rejected if num_rejected is None else num_rejected
         if rejected is None:
             return context_lens
