@@ -1890,6 +1890,9 @@ def test_last_unadmitted_cancel_reaches_worker_despite_idle_throttle(
         dispatch(worker, request)
     assert p.abort_request(seq.id)
     core = EngineCore.__new__(EngineCore)
+    core._kv_progress_event = threading.Event()
+    core.input_queue = queue.Queue()
+    core.utility_queue = queue.Queue()
     core.scheduler = p
     core.kv_transfer_enabled = True
     core.label = "pd-cancel"

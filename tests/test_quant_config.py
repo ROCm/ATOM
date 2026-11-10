@@ -87,6 +87,12 @@ def _temporary_mocks():
     mock_atom_utils = types.ModuleType("atom.utils")
     mock_atom_utils.envs = MagicMock()
     mock_atom_utils.get_open_port = MagicMock(return_value=8000)
+    mock_atom_utils.get_hf_text_config = MagicMock()
+
+    mock_selector = types.ModuleType("atom.utils.selector")
+    mock_selector.Family = MagicMock()
+    mock_selector.attn_family = MagicMock()
+    mock_selector.has_mla_indexer = MagicMock(return_value=False)
 
     mock_dist_utils = types.ModuleType("atom.utils.distributed.utils")
     mock_dist_utils.stateless_init_torch_distributed_process_group = MagicMock()
@@ -109,6 +115,7 @@ def _temporary_mocks():
         "atom.utils": mock_atom_utils,
         "atom.utils.distributed": types.ModuleType("atom.utils.distributed"),
         "atom.utils.distributed.utils": mock_dist_utils,
+        "atom.utils.selector": mock_selector,
         "atom.plugin": mock_plugin,
         "atom.plugin.config": mock_plugin_config,
     }

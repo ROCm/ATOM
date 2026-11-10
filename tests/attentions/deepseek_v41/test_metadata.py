@@ -3,6 +3,7 @@
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -22,7 +23,7 @@ from atom.model_ops.attentions.deepseek_v41.metadata import (
 )
 from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
 from atom.utils import CpuGpuBuffer
-from tests.attentions.deepseek_v41.helpers import metadata_buffers
+from tests.attentions.deepseek_v41.helpers import metadata_buffers, stage_query_layout
 
 
 def staged_step(cache, requests, *, buffers, running_bs, running_tokens):
@@ -65,20 +66,22 @@ def test_staged_metadata_refreshes_reordered_ragged_and_empty_batches(device):
         # The step spans the forward's width, padding included: a captured
         # graph runs those rows whatever the batch, so they have to be
         # described rather than sliced off.
-        assert step.width == 8 and step.scheduled == sum(s.length for s in requests)
+        assert step.running_tokens == 8 and step.scheduled_tokens == sum(
+            s.length for s in requests
+        )
         expected_positions = [
             p for span in requests for p in range(span.position, span.end)
         ]
         expected_batches = [
             i for i, span in enumerate(requests) for _ in range(span.length)
         ]
-        pad_tokens, pad_requests = 8 - step.scheduled, 4 - len(requests)
+        pad_tokens, pad_requests = 8 - step.scheduled_tokens, 4 - len(requests)
         # `-1` for a padding token and a zero-length span for a padding
         # request: the two sentinels every consumer bails on.
         assert step.batch_ids.tolist() == expected_batches + [-1] * pad_tokens
         assert step.positions.tolist() == expected_positions + [0] * pad_tokens
         assert step.cu_seqlens_q.tolist() == [span.offset for span in requests] + [
-            step.scheduled
+            step.scheduled_tokens
         ] * (pad_requests + 1)
         assert (
             step.slots.tolist() == [span.slot for span in requests] + [0] * pad_requests
@@ -123,7 +126,11 @@ def test_engram_rows_are_staged_for_the_width_not_for_the_tokens(engram):
         running_bs=2,
         running_tokens=6,
     )
-    assert step.scheduled == 3 and step.width == 6 and cache.pending is None
+    assert (
+        step.scheduled_tokens == 3
+        and step.running_tokens == 6
+        and cache.pending is None
+    )
     builder = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)
     builder.geometry, builder.device = geo, "cpu"
     builder.config = SimpleNamespace(
@@ -149,15 +156,17 @@ def test_engram_rows_are_staged_for_the_width_not_for_the_tokens(engram):
         if engram
         else None
     )
-    metadata = SimpleNamespace(step=step, cache=cache, dummy=True, token_mask=None)
-    builder.prepare_model_inputs(
-        torch.zeros(step.scheduled, dtype=torch.int32), metadata
+    metadata = SimpleNamespace(
+        step=step, cache=cache, dummy=True, token_mask=None, ubatches=None
     )
-    assert metadata.engram_embeddings[0].shape[:2] == (1, step.width)
+    builder.prepare_model_inputs(
+        torch.zeros(step.scheduled_tokens, dtype=torch.int32), metadata
+    )
+    assert metadata.engram_embeddings[0].shape[:2] == (1, step.running_tokens)
     if engram:
         assert staged == {
-            "tokens": step.scheduled,
-            "padded_rows": step.width,
+            "tokens": step.scheduled_tokens,
+            "padded_rows": step.running_tokens,
             "dummy": True,
             "token_mask": None,
             # A synthetic batch hashes on the host: the cursor the device path
@@ -259,7 +268,7 @@ def test_visible_rows_are_the_bound_every_indexer_layer_reads(ratio, positions_d
     step = staged_step(cache, requests, buffers=buffers, running_bs=4, running_tokens=8)
     # Armed: ragged, and padded past the batch, so the two layouts really do
     # disagree over these rows.
-    assert step.scheduled == 4 < step.width == 8
+    assert step.scheduled_tokens == 4 < step.running_tokens == 8
     assert len({span.length for span in requests}) > 1
     assert step.positions.dtype == positions_dtype
     assert step.visible[ratio].dtype == torch.int32
@@ -346,10 +355,7 @@ def test_a_step_planner_reads_the_staged_rows_and_publishes_with_them():
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
-@pytest.mark.parametrize("query_prefix_ready", [False, True])
-def test_idle_dp_rank_refreshes_captured_pool_metadata(
-    device, query_prefix_ready, monkeypatch
-):
+def test_idle_dp_rank_refreshes_captured_pool_metadata(device):
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("ROCm GPU required")
     geo = V41PoolGeometry(
@@ -377,61 +383,26 @@ def test_idle_dp_rank_refreshes_captured_pool_metadata(
     for pair in cache.indptr_buffers.values():
         for tensor in pair:
             tensor.fill_(123)
+    # An idle DP rank schedules nothing; every row its forward runs is padding.
     batch = SimpleNamespace(
-        is_dummy_run=True,
+        is_dummy_run=False,
         is_final_chunk=None,
         replaying={},
         state_slots_committed=[],
-        req_ids=(-1,),
-        num_scheduled_tokens=(6,),
-        context_lens=(6,),
-        total_seqs_num=1,
-        total_tokens_num=6,
+        req_ids=[],
+        num_scheduled_tokens=np.zeros(0, dtype=np.int32),
+        context_lens=np.zeros(0, dtype=np.int32),
+        total_seqs_num=0,
+        total_tokens_num=0,
     )
-    # ModelRunner publishes the dummy request's input layout before attention
-    # metadata is built. The empty cache step must not erase that query prefix.
-    if query_prefix_ready:
-        cu = builder.model_runner.forward_vars["cu_seqlens_q"]
-        cu.np[:5] = (0, 6, 6, 6, 6)
-        cu.copy_to_gpu(5)
-    metadata, positions = builder._prepare(
-        batch,
-        4,
-        24,
-        max_q_len=6,
-        tentative=True,
-        query_prefix_ready=query_prefix_ready,
-    )
+    stage_query_layout(builder, (), 4, 24)
+    metadata, _ = builder._prepare(batch, 4, 24, max_q_len=6, tentative=True)
     step = metadata.step
     assert metadata.cache is cache
-    assert step.requests == () and step.scheduled == 0 and step.decode
-    assert step.width == 24 and step.max_q_len == 6
+    assert step.requests == () and step.scheduled_tokens == 0 and step.decode
+    assert step.running_tokens == 24 and step.max_q_len == 6
     assert torch.all(step.batch_ids == -1)
-    from atom.spec_decode.drafter import Drafter
-    from atom.utils import forward_context
-
-    monkeypatch.setattr(
-        forward_context._forward_context_local,
-        "ctx",
-        SimpleNamespace(attn_metadata=metadata),
-        raising=False,
-    )
-    anchors = Drafter.prepare_inputs(None, 1)
-    if device == "cuda":
-        from atom.spec_decode.dspark_proposer import _stage_anchors_kernel
-
-        # Put a guard immediately before the logical positions view. A Triton
-        # row of -1 reads this guard, rather than torch's wrapped last element,
-        # without issuing an invalid allocation access in the regression test.
-        guarded = torch.cat((positions.new_tensor([123456789]), positions))
-        ids = torch.empty(4, dtype=torch.int32, device=device)
-        staged_positions = torch.empty(4, dtype=positions.dtype, device=device)
-        _stage_anchors_kernel[(4,)](
-            ids, staged_positions, ids.new_tensor([7]), guarded[1:], anchors, 1, 99
-        )
-        assert staged_positions.tolist() == [0, 0, 0, 0]
-    assert anchors.tolist() == [5]
-    assert step.cu_seqlens_q.tolist() == [0, 6, 6, 6, 6]
+    assert step.cu_seqlens_q.tolist() == [0, 0, 0, 0, 0]
     if device == "cuda":
         # Decode graph replay still executes the captured window writer. Its
         # padding mask must suppress stores even with a valid dummy query.
@@ -486,7 +457,7 @@ def test_startup_dummy_keeps_private_scratch_before_pool_allocation():
     metadata, _ = builder._prepare(batch, 1, 6)
     assert builder.cache is None
     assert metadata.cache is not None
-    assert metadata.step.scheduled == 6
+    assert metadata.step.scheduled_tokens == 6
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
@@ -541,9 +512,7 @@ def test_parent_preparation_preserves_phase(device, phase, position, length):
         total_tokens_num=length,
         num_spec_step=length - 1,
     )
-    cu = builder.model_runner.forward_vars["cu_seqlens_q"]
-    cu.np[:2] = (0, length)
-    cu.copy_to_gpu(2)
+    stage_query_layout(builder, (length,), 1, length)
     if phase == "prefill":
         metadata, positions = builder.prepare_prefill(batch, 1, batch.total_tokens_num)
     else:

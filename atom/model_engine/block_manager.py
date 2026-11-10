@@ -143,11 +143,13 @@ class AdmissionProbe:
 _RECENT_INDEX_CHANGES = 8192
 
 
-def draft_kv_lookahead(num_speculative_tokens: int) -> int:
-    """KV positions past `len(seq)` that one forward's MTP draft round writes.
+def draft_kv_lookahead(
+    num_speculative_tokens: int, *, block_drafter: bool = False
+) -> int:
+    """KV positions past `len(seq)` that one forward's draft round writes.
 
-    `EagleProposer.propose` runs the draft `k = num_speculative_tokens` times
-    per forward. Step 0 writes the target's own slots; each of the `k - 1`
+    Serial MTP (`EagleProposer.propose`) runs the draft `k = num_speculative_tokens`
+    times per forward. Step 0 writes the target's own slots; each of the `k - 1`
     mid-steps after it bumps `context_lens` and writes one token at
     `context_lens - 1`. So a forward whose target context ends at `C` writes
     draft KV through position `C + k - 2`, and `C <= len(seq)` at schedule time
@@ -155,11 +157,22 @@ def draft_kv_lookahead(num_speculative_tokens: int) -> int:
     placeholders the scheduler appended assume full acceptance). The draft
     therefore needs `k - 1` positions past `len(seq)`.
 
+    A block drafter (DSpark) instead writes its whole block in one pass: the
+    `T = k` positions `anchor + 1 .. anchor + k` after the last verified token
+    (`DSparkProposer._build_paged_block_metadata`). The anchor is at most
+    `C - 1`, so it writes through `C + k - 1` and needs `k` positions past
+    `len(seq)` -- one more than the serial count.
+
     A position past the row's allocated blocks reads its block id from the
     zeroed tail of the block table, so the write lands in physical block 0 --
-    another request's KV, or the units of a PAGE state checkpoint.
+    another request's KV, or the units of a PAGE state checkpoint. For a
+    block drafter that is not hypothetical: a fully accepted step whose last
+    block position starts a new block writes the draft rows of physical
+    block 0, and a PAGE state checkpoint stored there is then restored
+    corrupted by every later request that hits its prefix.
     """
-    return max(0, int(num_speculative_tokens or 0) - 1)
+    k = max(0, int(num_speculative_tokens or 0))
+    return k if block_drafter else max(0, k - 1)
 
 
 # Blocks `_hit_walk` hashes per round past the cached prompt chain, doubling
@@ -337,6 +350,7 @@ class BlockManager:
             state_tier_capability,
             state_tier_chunk_tokens,
             state_tier_cpu_entries,
+            state_tier_verified_for_s,
         )
 
         # A capability derived from the whole config, not the connector's name.
@@ -515,6 +529,7 @@ class BlockManager:
                     if checkpoint_spec is not None
                     else None
                 ),
+                verified_for_s=state_tier_verified_for_s(config),
             )
             # Attached rather than passed at construction: the coordinator is
             # built before the switch is read (it needs `checkpoint_spec`,
@@ -1536,14 +1551,80 @@ class BlockManager:
             or self.kv.lookup(memo.boundary_hash) == memo.boundary_id
         )
 
-    def record_allocation(self, seq: Sequence, probe: AdmissionProbe) -> None:
-        """Commit the fit probe before any allocation changes the pool."""
+    def record_allocation(
+        self,
+        seq: Sequence,
+        probe: AdmissionProbe,
+        *,
+        defer_unverified: bool = False,
+    ) -> bool:
+        """Commit the fit probe before any allocation changes the pool.
+
+        With `defer_unverified`, returns False and commits nothing when the
+        state offload asks to hold the admission over the state it would
+        restore from outside HBM (`StateOffloadIndex.hold_admission`). The
+        caller retries the request a pass later.
+        """
         if self.enable_prefix_caching:
             decision = self._joint_kv_boundary(
                 seq, probe.num_cached_blocks, probe.block_hashes
             )
             decision = self._fit_joint(decision, probe)
+            if (
+                defer_unverified
+                and self.state_offload is not None
+                and self.state_offload.hold_admission(
+                    self._resume_hash_off_hbm(
+                        seq, probe.num_cached_blocks, probe.block_hashes, decision
+                    )
+                )
+            ):
+                return False
             self._commit_joint_boundary(seq, decision)
+        return True
+
+    def _resume_hash_off_hbm(
+        self,
+        seq: Sequence,
+        num_cached_blocks: int,
+        block_hashes: list[int],
+        decision: JointBoundaryDecision,
+    ) -> int:
+        """The `_state_resume_hash` `allocate` would restore from, when HBM
+        does not hold it; -1 for no state, an HBM-held one, or a replay."""
+        if not seq.has_per_req_cache:
+            return -1
+        joint = decision.skip_reason is None
+        if joint and decision.state_from_hbm:
+            return -1
+        hit_hash = (
+            block_hashes[num_cached_blocks - 1]
+            if 0 < num_cached_blocks <= len(block_hashes)
+            else -1
+        )
+        h = self._state_resume_hash(
+            seq, decision.boundary_hash if joint else -1, hit_hash
+        )
+        if h != -1 and not joint:
+            in_hbm = (
+                self.paged_state_checkpoints.contains(h)
+                if self.paged_state_checkpoints is not None
+                else self.state.lookup(h) >= 0
+            )
+            if in_hbm:
+                return -1
+        return h
+
+    def _state_resume_hash(self, seq: Sequence, joint_hash: int, hit_hash: int) -> int:
+        """The hash whose state `seq` resumes from, or -1 for none.
+
+        The joint boundary when there is one (above the HBM hit by
+        construction), else the HBM hit's last block. A replay rebuilds the
+        state instead of restoring it, so it resumes from none.
+        """
+        if joint_hash != -1:
+            return joint_hash
+        return -1 if self.tier_resume_replays(seq) else hit_hash
 
     def retreat_joint_to_hbm(self, seq: Sequence) -> bool:
         """Drop a failed unaligned joint and resume at the HBM hit it lowered.
@@ -1740,13 +1821,16 @@ class BlockManager:
             # last one actually claimed, whichever way the loop exits.
             if i < num_cached_blocks:
                 hit_hash = h
-        if self.state_replay_tokens and seq.replays_hit:
-            # A replay starts from a fresh state slot, never a checkpoint: it
-            # rebuilds the state below whatever the claim above reached.
-            hit_hash = -1
-            if num_cached_blocks < requested_blocks:
-                # A KV-only load past the hit would start above a gap.
-                seq.replay_kv_load = False
+        # A replay starts from a fresh state slot, never a checkpoint: it
+        # rebuilds the state below whatever the claim above reached
+        # (`_state_resume_hash` gives it none). A KV-only load past the hit
+        # would start above a gap.
+        if (
+            self.state_replay_tokens
+            and seq.replays_hit
+            and num_cached_blocks < requested_blocks
+        ):
+            seq.replay_kv_load = False
         # Pin the restore before fresh blocks can evict its checkpoint.
         state_holds = True
         if seq.has_per_req_cache and self.paged_state_checkpoints is not None:
@@ -1762,9 +1846,9 @@ class BlockManager:
             # joint boundary and `_claim_after_load` raised `num_cached_tokens`
             # to it, so the forward resumed over a prefix the state does not
             # cover. Silent wrong output, no exception.
-            joint_hash = seq.offload_joint.boundary_hash
             state_holds = self._attach_state_slots(
-                seq, joint_hash if joint_hash != -1 else hit_hash
+                seq,
+                self._state_resume_hash(seq, seq.offload_joint.boundary_hash, hit_hash),
             )
         for _ in range(len(seq.block_table), self.num_pool_blocks(len(seq))):
             seq.block_table.append(self._fresh_block())
@@ -1781,9 +1865,9 @@ class BlockManager:
             # above the HBM hit by construction. `num_cached_tokens` stays at
             # the HBM prefix until the KV leg lands, so the forward covers
             # `[hbm, num_prompt)` if anything goes wrong from here.
-            joint_hash = seq.offload_joint.boundary_hash
             state_holds = self._attach_state_slots(
-                seq, joint_hash if joint_hash != -1 else hit_hash
+                seq,
+                self._state_resume_hash(seq, seq.offload_joint.boundary_hash, hit_hash),
             )
         if seq.has_per_req_cache:
             seq._state_initialized_after_alloc = False

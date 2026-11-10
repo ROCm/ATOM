@@ -1525,6 +1525,10 @@ class V4MonoSession:
                 validate_device_values=False,
                 supported=True,
             )
+            # Forward consumes the eager/lane selection. A continuing C3 tail
+            # still uses the C4 capture key, but updates only the C3 buffers;
+            # reselect before the engine decides whether to replay FULL C4.
+            self.select_graph_execution(graph_key, self.adapter.graph_layout())
             self._remember_continuation(graph_key, batch_contract)
             width = graph_key[0] * graph_key[1]
             self.fast_publications_by_width[width] = (
