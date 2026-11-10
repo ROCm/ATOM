@@ -30,12 +30,12 @@ from atom.models.minimax_m3.mono.kernels.stages.shared import (
     W13S_BYTES,
 )
 from atom.models.minimax_m3.mono.layout import (
-    mxfp8_tile_dword,
     SH_ROWS,
     UG_PER_SLOT,
     UG_ROWS,
     XN8_ROW,
     XSC_ROW,
+    mxfp8_tile_dword,
 )
 from atom.mono.device.mx import FP4, FP8, fp4_tile_load, mfma_scaled, scale_index
 from atom.mono.device.ops import (
