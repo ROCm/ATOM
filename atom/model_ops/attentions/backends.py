@@ -144,7 +144,6 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         is_prefill: bool,
         ubatch_slices: tuple[UBatchSlice, ...] | None = None,
         pcp_groups: "tuple[PcpBalGroup, ...] | None" = None,
-        use_cudagraph: bool = False,
     ):
         raise NotImplementedError
 
@@ -1596,7 +1595,6 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         is_prefill: bool,
         ubatch_slices: tuple[UBatchSlice, ...] | None = None,
         pcp_groups: "tuple[PcpBalGroup, ...] | None" = None,
-        use_cudagraph: bool = False,
     ):
         """Build this step's metadata at the shape `prepare_inputs` settled.
 
@@ -1622,7 +1620,6 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         the LM head runs every running token, and `postprocess` cuts back to
         the scheduled ones, the one place it does.
         """
-        self._step_use_cudagraph = use_cudagraph
         # Run state maintenance on the compute stream before the forward.
         state_ops = batch.state_maintenance_ops
         if state_ops.relocations:
@@ -1646,13 +1643,6 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
                 "batch_id_per_q_token"
             ].gpu[:running_tokens]
         return built
-
-    # Whether this step's decode forward is replayed as a request graph
-    # (`ForwardMode.use_cudagraph`), whose kernels keep the widths they were
-    # recorded at. False: the attention runs eagerly (an eager step, or a token
-    # graph, whose attention is an eager region), so the step's own widths do.
-    # Only `build` sets it; `build_for_cudagraph_capture` is a capture by definition.
-    _step_use_cudagraph: bool = False
 
     # Whether a prefill replays token graphs (`ForwardMode.token_graph`): every
     # launch outside the model's eager regions is sized by the token count

@@ -2610,7 +2610,6 @@ class ModelRunner:
             is_prefill=is_prefill,
             ubatch_slices=forward_mode.ubatch_slices,
             pcp_groups=forward_mode.pcp_groups,
-            use_cudagraph=forward_mode.use_cudagraph,
         )
         self.attn_metadata_builder.prepare_model_inputs(input_ids, attn_metadata)
         context = Context(

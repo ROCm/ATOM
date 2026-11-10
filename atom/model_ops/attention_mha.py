@@ -1658,8 +1658,14 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             kw.update(pages_per_block=1, block_page_stride=1)
         if self.index_cache_dtype == "fp4":
             kw["index_mxfp4"] = True
-            if decode:
+            if decode and sparse_metadata.index_work_map is not None:
+                from atom.model_ops.minimax_m3.sparse_attn import SPARSE_BLOCK_SIZE
+
                 kw["index_work_map"] = sparse_metadata.index_work_map
+                # The bound the builder built the map at (`_index_work_map_blocks`).
+                kw["index_work_map_max_block"] = -(
+                    -self.max_model_len // SPARSE_BLOCK_SIZE
+                )
         return kw
 
     @mark_trace(prefix="sparse_attention_prefill", torch_compile=False)

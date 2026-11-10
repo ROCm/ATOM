@@ -1380,13 +1380,14 @@ def minimax_m3_index_topk_decode(
     index_mxfp4: bool = False,
     pages_per_block: int = PAGES_PER_SPARSE_BLOCK,
     index_work_map=None,
+    index_work_map_max_block: int = 0,
 ):
     """Decode index block-score + top-k, both split-K (cudagraph-safe).
 
     ``index_mxfp4`` and ``pages_per_block`` as in :func:`minimax_m3_index_topk`.
-    The MXFP4 scorer takes the step's ``index_work_map`` (``IndexWorkMapStep``: work map
-    and the block bound it was built against, which does not move between graph
-    replays); omitted, it builds its own map. The scorer allocates the scores per call.
+    The MXFP4 scorer takes the step's ``index_work_map`` and the
+    ``index_work_map_max_block`` it was built against (which does not move between
+    graph replays); omitted, it builds its own map. The scorer allocates the scores per call.
 
     Returns topk_idx [num_kv_heads, total_q, topk] (0-indexed block ids, -1 pad).
     For spec-decode (``max_query_len = num_spec+1``) each of the ``max_query_len``
@@ -1445,8 +1446,7 @@ def minimax_m3_index_topk_decode(
 
         from atom.model_ops.minimax_m3.mxfp4_pages import page_views
 
-        step = index_work_map
-        score_max_block = max(max_block, step.max_block if step else 0)
+        score_max_block = max(max_block, index_work_map_max_block)
         _require_packable(score_max_block)
         k_data, k_scale = page_views(index_kv_cache)
         score = minimax_m3_index_score_fp4_flydsl(
@@ -1459,7 +1459,7 @@ def minimax_m3_index_topk_decode(
             num_idx_heads,
             sm_scale,
             score_max_block,
-            work_map=step.work_map if step else None,
+            work_map=index_work_map,
         )
     else:
         score = _triton_decode_score(

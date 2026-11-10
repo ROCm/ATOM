@@ -295,14 +295,13 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 num_head_k * self.max_bs * max_qlen,
                 **i32_kwargs,
             )
-        # The MXFP4 index scorer's `IndexWorkMap`, by ubatch prefix ("" the whole step).
+        # The MXFP4 index scorer's work map buffer, by ubatch prefix ("" the whole step).
         self._index_work_maps = {}
         self._index_work_map_blocks = 0
         if (
             self._has_sparse_attention
             and self.model_runner.config.index_cache_dtype == "fp4"
         ):
-            from atom.model_ops.minimax_m3.index_mxfp4 import IndexWorkMap
             from atom.model_ops.minimax_m3.sparse_attn import SPARSE_BLOCK_SIZE
 
             # The MXFP4 decode scorer's persistent dispatch map (index_mxfp4): its row
@@ -313,12 +312,8 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             self._index_work_map_blocks = cdiv(
                 self.model_runner.config.max_model_len, SPARSE_BLOCK_SIZE
             )
-            self._index_work_maps[""] = IndexWorkMap.alloc(
-                self.max_bs,
-                max_qlen,
-                num_head_k,
-                self._index_work_map_blocks,
-                self.device,
+            self._index_work_maps[""] = self._alloc_index_work_map(
+                self.max_bs, max_qlen
             )
         self._pa_decode_bf16_asm_enabled = (
             use_pa_decode_bf16_asm() and model_runner.block_size == 256
@@ -367,18 +362,27 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             # decode raises above that), so q == 1 here whatever `max_seqlen_q` is.
             # A decode split cuts a batch of `running_bs` requests at
             # `running_bs // 2` (`cut_decode_ubatches`).
-            from atom.model_ops.minimax_m3.index_mxfp4 import IndexWorkMap
-
             first = self.max_bs // 2
             for ub_idx, rows in enumerate((first, self.max_bs - first)):
                 # Each ubatch's own map: its capacity is not additive.
-                self._index_work_maps[f"ub{ub_idx}_"] = IndexWorkMap.alloc(
-                    rows,
-                    1,
-                    self._num_idx_heads,
-                    self._index_work_map_blocks,
-                    self.device,
+                self._index_work_maps[f"ub{ub_idx}_"] = self._alloc_index_work_map(
+                    rows, 1
                 )
+
+    def _alloc_index_work_map(self, max_batch: int, max_query_len: int):
+        """Work map buffer for up to ``max_batch`` requests of up to ``max_query_len``
+        tokens, allocated once: a captured graph bakes its pointer."""
+        rows = 0
+        if max_batch > 0:
+            from aiter.ops.flydsl import minimax_m3_index_score_work_map_capacity
+
+            rows = minimax_m3_index_score_work_map_capacity(
+                max_batch,
+                self._index_work_map_blocks,
+                max_query_len,
+                self._num_idx_heads,
+            )
+        return torch.empty((rows, 2), dtype=torch.int32, device=self.device)
 
     def h2d_group_members(self) -> dict[str, tuple[str, ...]]:
         # Ready together before the CSR kernel, sharing prefill destinations
@@ -702,13 +706,18 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         ]
 
     def _index_work_map_kwargs(self, prefix: str = "") -> dict:
-        """The MXFP4 decode scorer's work map, for `make_sparse_decode_metadata`;
+        """The MXFP4 decode scorer's work map buffer, for `make_sparse_decode_metadata`;
         nothing for any other index cache. `prefix`
-        selects the ubatch's set (`ub<i>_`): both ubatches' metadata are alive at once
+        selects the ubatch's buffer (`ub<i>_`): both ubatches' metadata are alive at once
         on one stream, so a shared map would be overwritten by the second before the
         first one's layers ran."""
         work_map = self._index_work_maps.get(prefix)
-        return {} if work_map is None else {"index_work_map": work_map}
+        if work_map is None:
+            return {}
+        return {
+            "index_work_map_out": work_map,
+            "index_work_map_max_block": self._index_work_map_blocks,
+        }
 
     def _get_sparse_attention_block_tables(
         self,
@@ -1146,7 +1155,6 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 num_idx_heads=self._num_idx_heads,
                 n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(),
                 **self._index_work_map_kwargs(),
-                index_work_map_eager=not self._step_use_cudagraph,
             )
 
     def finish_ubatch(

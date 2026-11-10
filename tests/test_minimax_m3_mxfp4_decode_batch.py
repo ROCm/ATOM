@@ -12,7 +12,6 @@ and need ``aiter`` importable (CI's no-aiter job skips them); the scorer itself 
 in test_minimax_m3_mxfp4_index.py.
 """
 
-import sys
 import types
 
 import pytest
@@ -48,36 +47,6 @@ def builder(mod, mxfp4=True, tbo_decode=True, forward_vars=None):
         ),
     )
     return b
-
-
-def _stand_in_scorer_module(monkeypatch):
-    """A stand-in for aiter's flydsl package: local logic only."""
-    parents = ("aiter", "aiter.ops", "aiter.ops.flydsl", "aiter.ops.flydsl.kernels")
-    name = "aiter.ops.flydsl.kernels.minimax_m3_index_score"
-    for mod_name in (*parents, name):
-        monkeypatch.setitem(sys.modules, mod_name, types.ModuleType(mod_name))
-
-
-def test_an_eager_step_scores_at_its_own_block_count_a_graph_step_at_the_models(
-    monkeypatch,
-):
-    from atom.model_ops.minimax_m3 import index_mxfp4
-
-    _stand_in_scorer_module(monkeypatch)
-    built = []
-    flydsl = sys.modules["aiter.ops.flydsl"]
-    flydsl.minimax_m3_index_score_work_map_capacity = lambda *a: 4
-    flydsl.minimax_m3_index_score_work_map = (
-        lambda seq_lens, max_block, *a, **kw: built.append(max_block)
-        or torch.zeros(1, 2)
-    )
-    buffers = index_mxfp4.IndexWorkMap.alloc(4, 2, 1, 64, "cpu")
-    seq = torch.tensor([300, 1000, 0])
-    graph = buffers.begin_step(seq, 2, 1000)
-    eager = buffers.begin_step(seq, 2, 1000, eager=True)
-    huge = buffers.begin_step(seq, 2, 10**9, eager=True)  # never past the model's
-    assert [graph.max_block, eager.max_block, huge.max_block] == [64, 8, 64]
-    assert built == [64, 8, 64]
 
 
 # (scheduled_bs, running_bs, running_tokens, q) -> the requests whose rows run
@@ -133,8 +102,6 @@ class _Buf:
 def test_the_ubatch_buffers_are_for_a_decode_tbo_at_one_token_a_request(
     mod, monkeypatch, mxfp4, tbo_decode, max_bs
 ):
-    from atom.model_ops.minimax_m3 import index_mxfp4
-
     capacity_args = []
 
     def capacity(*args):
@@ -151,9 +118,7 @@ def test_the_ubatch_buffers_are_for_a_decode_tbo_at_one_token_a_request(
     b.max_bs = max_bs
     max_qlen = 8  # a speculative config: the TBO sparse decode still runs one token
     if mxfp4:
-        b._index_work_maps[""] = index_mxfp4.IndexWorkMap.alloc(
-            max_bs, max_qlen, HEADS, BOUND, "cpu"
-        )
+        b._index_work_maps[""] = b._alloc_index_work_map(max_bs, max_qlen)
         capacity_args.clear()
     # each ubatch's requests, from the split every backend's ubatch metadata follows
     import numpy as np
@@ -176,12 +141,11 @@ def test_the_ubatch_buffers_are_for_a_decode_tbo_at_one_token_a_request(
         assert not [n for n in names if n in maps] and not capacity_args
         return
     for i in (0, 1):
-        ub = maps[names[i]]
-        assert ub.work_map.shape == (100, 2) and ub.work_map.dtype == torch.int32
-        assert (ub.max_block, ub.num_idx_heads) == (BOUND, HEADS)
+        assert maps[names[i]].shape == (100, 2)
+        assert maps[names[i]].dtype == torch.int32
     assert capacity_args == [(rows[0], BOUND, 1, HEADS), (rows[1], BOUND, 1, HEADS)]
     # each ubatch has its own map
-    assert maps[names[1]].work_map.data_ptr() != maps[names[0]].work_map.data_ptr()
+    assert maps[names[1]].data_ptr() != maps[names[0]].data_ptr()
 
 
 def test_the_ubatch_metadata_is_built_with_its_own_buffers(mod, monkeypatch):
@@ -210,8 +174,9 @@ def test_the_ubatch_metadata_is_built_with_its_own_buffers(mod, monkeypatch):
     for i in (0, 1):
         b.finish_ubatch(i, ub, attn, 1)
     for i, kw in enumerate(seen):
-        assert kw["index_work_map"] is b._index_work_maps[f"ub{i}_"]
-    assert seen[0]["index_work_map"] is not seen[1]["index_work_map"]
+        assert kw["index_work_map_out"] is b._index_work_maps[f"ub{i}_"]
+        assert kw["index_work_map_max_block"] == BOUND
+    assert seen[0]["index_work_map_out"] is not seen[1]["index_work_map_out"]
     # another index cache allocated none: nothing to pass
     assert builder(mod)._index_work_map_kwargs("ub0_") == {}
 

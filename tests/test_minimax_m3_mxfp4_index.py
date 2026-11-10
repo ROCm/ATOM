@@ -102,7 +102,6 @@ def work_map(seq, max_block, S, out=None):
     [(5, 8, 1, False), (17, 8, 1, True), (6, 1, 1, False), (5, 8, 8, True)],
 )
 def test_decode_selection_and_block_table(batch, S, ppb, fp8_q):
-    from atom.model_ops.minimax_m3.index_mxfp4 import IndexWorkMapStep
     from atom.model_ops.minimax_m3.index_topk import minimax_m3_index_topk_decode
 
     cache, table, seq, q = make_case(batch, S, seed=batch * 10 + S, fp8_q=fp8_q)
@@ -112,7 +111,7 @@ def test_decode_selection_and_block_table(batch, S, ppb, fp8_q):
         q, cache, table, seq, int(seq.max()), TOPK, 0, 1, HEADS, SM_SCALE,
         emit_sparse_block_table=True, max_query_len=S, block_page_stride=ppb,
         index_mxfp4=True, pages_per_block=ppb,
-        index_work_map=IndexWorkMapStep(wmap, max_block),
+        index_work_map=wmap, index_work_map_max_block=max_block,
     )  # fmt: skip
     _, picks, ctx = reference(cache, table, seq, q, S)
     assert sbt.shape == (batch * S, TOPK * ppb) and sctx.shape == (batch * S,)
@@ -204,7 +203,8 @@ def _metadata(table, seq, S, buffers, nvalid, heads=HEADS):
         num_idx_heads=heads,
         max_query_len=S,
         n_valid_column_per_row_out=nvalid,
-        index_work_map=buffers,
+        index_work_map_out=buffers,
+        index_work_map_max_block=bound,
     )
 
 
@@ -218,14 +218,15 @@ def _select(q, cache, table, seq, S, md, heads=HEADS):
         emit_sparse_block_table=True, max_query_len=S, block_page_stride=1,
         index_mxfp4=True, pages_per_block=1,
         n_valid_column_per_row=md.n_valid_column_per_row,
-        index_work_map=md.index_work_map,
+        index_work_map=md.index_work_map, index_work_map_max_block=bound,
     )  # fmt: skip
 
 
 def _buffers(running, S, bound, heads=HEADS):
-    from atom.model_ops.minimax_m3.index_mxfp4 import IndexWorkMap
+    from aiter.ops.flydsl import minimax_m3_index_score_work_map_capacity
 
-    buffers = IndexWorkMap.alloc(running, S, heads, bound, "cuda")
+    rows = minimax_m3_index_score_work_map_capacity(running, bound, S, heads)
+    buffers = torch.empty((rows, 2), dtype=torch.int32, device="cuda")
     nvalid = torch.empty(heads * running * S, dtype=torch.int32, device="cuda")
     return buffers, nvalid
 
@@ -297,48 +298,3 @@ def test_a_graph_replays_a_padded_step_like_the_scheduled_batch(S, heads, fill):
     want = _select(q[: scheduled * S], cache, table[:scheduled], seq[:scheduled], S, md, heads)  # fmt: skip
     _assert_live_rows_match(got, want, scheduled * S, heads)
     _assert_pad_rows_are_empty(got, scheduled * S, heads)
-
-
-@pytest.mark.parametrize("S,heads", [(8, 1), (1, 2)])
-def test_an_eager_step_at_the_batch_block_count_selects_like_the_model_width(S, heads):
-    """The step's own block count (`eager`) must not change what is selected: the
-    scorer's grid, the score width and the selector's inputs shrink, the selection
-    does not. The batch is much shorter than the buffers' model-length bound."""
-    from atom.model_ops.minimax_m3.index_mxfp4 import IndexWorkMap
-    from atom.model_ops.minimax_m3.index_topk import minimax_m3_index_topk_decode
-    from atom.model_ops.minimax_m3.sparse_attn import make_sparse_decode_metadata
-
-    batch = 5
-    cache, table, seq, q = make_case(
-        batch, S, seed=90 + S, max_len=128 * 12, heads=heads
-    )
-    model_blocks = 64  # the buffers' bound: far past this batch's 12 blocks
-    # the block table is as wide as the model, as the builder's is
-    table = torch.nn.functional.pad(table, (0, model_blocks - table.shape[1]))
-    max_seq = int(seq.max())
-    buffers = IndexWorkMap.alloc(batch, S, heads, model_blocks, "cuda")
-    nvalid = torch.empty(heads * batch * S, dtype=torch.int32, device="cuda")
-    outs = []
-    for eager in (False, True):
-        md = make_sparse_decode_metadata(
-            seq_lens=seq,
-            block_table=table,
-            slot_mapping=torch.zeros(batch * S, dtype=torch.int64, device="cuda"),
-            max_seq_len=max_seq,
-            num_idx_heads=heads,
-            max_query_len=S,
-            n_valid_column_per_row_out=nvalid,
-            index_work_map=buffers,
-            index_work_map_eager=eager,
-        )
-        assert md.index_work_map.max_block == (-(-max_seq // 128) if eager else 64)
-        out = minimax_m3_index_topk_decode(
-            q, cache, table, seq, max_seq, TOPK, 0, 1, heads, SM_SCALE,
-            emit_sparse_block_table=True, max_query_len=S, block_page_stride=1,
-            index_mxfp4=True, pages_per_block=1,
-            n_valid_column_per_row=md.n_valid_column_per_row,
-            index_work_map=md.index_work_map,
-        )  # fmt: skip
-        outs.append(out)
-    for graph_width, eager_width in zip(*outs):
-        assert torch.equal(graph_width, eager_width)
