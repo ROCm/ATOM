@@ -87,10 +87,12 @@ every layer. An index group's layers share one selection plane. The OPUS kernel
 splits each token's keys across blocks when the step has too few tokens to
 fill the GPU.
 
-Packed PAGE writes reuse V4's sentinel-aware `swa_scatter_rows`. A zero-copy
-view preserves gaps between PAGE fields, and compression-plan offsets select
-the destination rows. Padding rows are skipped on the device, including during
-graph replay.
+A compressed main row is written by the compressor's own kernel
+(`fused_compress_attn`) in the pool's row format: BF16, or on the FP8 / FP4
+pools (`quant_mode` "packed_fp8" / "packed_fp4") the row rounded to BF16 and
+quantized by `quantize_fp8` / `quantize_fp4`'s rule, values then scales. The
+kernel resolves each plan row's PAGE through the block table; padding rows are
+skipped on the device, including during graph replay.
 
 ## Graph ownership
 

@@ -224,4 +224,4 @@ class SGLangPluginUBatchWrapper(UBatchWrapper):
                 raise error
 
         sorted_results = [value for _, value in sorted(results)]
-        return self._concat_ubatch_outputs(sorted_results)
+        return self._merge_ubatch_outputs(sorted_results)
