@@ -528,7 +528,9 @@ def kda_recur_head(c, k, request, head):
             for element in range(4)
         ]
         beta = fx.ptr_load(c["beta"] + token)
-        slot = fx.ptr_load(c["slots"] + token)
+        # Every lane holds the same slot; a VGPR one would put each state
+        # store below in its own waterfall loop over the descriptor.
+        slot = uniform(fx.ptr_load(c["slots"] + token))
         updated = []
         outputs = []
         for row in range_constexpr(ROWS):
@@ -804,7 +806,9 @@ def kda_recur(c, k, req, head, chunk):
             for element in range(4)
         ]
         beta = fx.ptr_load(c["beta"] + token)
-        slot = fx.ptr_load(c["slots"] + token)
+        # Every lane holds the same slot; a VGPR one would put each state
+        # store below in its own waterfall loop over the descriptor.
+        slot = uniform(fx.ptr_load(c["slots"] + token))
         updated = []
         outputs = []
         for row_index in range_constexpr(2):
