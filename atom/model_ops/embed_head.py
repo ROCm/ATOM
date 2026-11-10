@@ -259,9 +259,9 @@ class ParallelLMHead(VocabParallelEmbedding):
             context = forward_context.context
             attn_metadata = forward_context.attn_metadata
             # context = get_context()
-            if context.is_prefill and not context.is_draft:
-                # The scheduled requests' last tokens only: a padding request
-                # has none.
+            if getattr(attn_metadata, "is_mixed", False) and not context.is_draft:
+                x = x[attn_metadata.sampled_token_indices].contiguous()
+            elif context.is_prefill and not context.is_draft:
                 bs = context.scheduled_bs
                 last_indices = attn_metadata.cu_seqlens_q[1 : bs + 1] - 1
                 # Under Ulysses SP, x is this rank's token shard.

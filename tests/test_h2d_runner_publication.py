@@ -161,6 +161,7 @@ def test_input_ids_deferred_and_new_requests_share_one_publication(monkeypatch):
     processor.prev_batch = SimpleNamespace(req_ids=[10, 20], is_dummy_run=False)
     processor.prev_token_ids = torch.tensor([71, 82], dtype=torch.int32, device="cuda")
     batch = SimpleNamespace(
+        is_mixed=False,
         scheduled_tokens=np.array([-1, 93, -1], dtype=np.int32),
         total_tokens_num=3,
         has_prefill=False,
@@ -204,6 +205,7 @@ def test_prefill_and_first_decode_ids_rotate_with_the_runner(monkeypatch, pp_siz
         assert processor.batch_info is runner.forward_vars["batch_info"]
         prefill = i % 2 == 0
         batch = SimpleNamespace(
+            is_mixed=False,
             scheduled_tokens=np.array([i + 1, i + 2], dtype=np.int32),
             total_tokens_num=2,
             total_seqs_num=1 if prefill else 2,
@@ -395,6 +397,7 @@ def test_prepare_model_publishes_sampling_and_query_prefix_before_token_consumer
             [71, 82], dtype=torch.int32, device="cuda"
         )
     batch = SimpleNamespace(
+        is_mixed=False,
         scheduled_tokens=np.array([51, 93, 61], dtype=np.int32),
         total_tokens_num=3,
         has_prefill=prefill,
@@ -500,6 +503,7 @@ def test_packed_spec_indices_follow_decode_prefill_and_dummy_transitions(monkeyp
         # An idle DP rank's step: no request.
         bs, tokens = (0, 0) if idle else (3, 7)
         batch = SimpleNamespace(
+            is_mixed=False,
             scheduled_tokens=(np.arange(7, dtype=np.int32) + 10)[:tokens],
             total_tokens_num=tokens,
             has_prefill=prefill,
@@ -598,6 +602,7 @@ def test_producer_reentry_preserves_sources_and_first_consumer(
         elif producer in ("prefill_ids", "deferred_ids"):
             prefill = producer == "prefill_ids"
             batch = SimpleNamespace(
+                is_mixed=False,
                 scheduled_tokens=np.array([11, 12, 13], dtype=np.int32) + changed * 10,
                 total_tokens_num=3,
                 has_prefill=prefill,
@@ -674,6 +679,9 @@ def test_logprob_request_indices_share_sampling_publication(monkeypatch):
             required_channel=None,
             return_logprobs=mask,
             total_tokens_num_prefill=1,
+            total_seqs_num_prefill=3,
+            total_seqs_num_decode=0,
+            is_mixed=False,
             has_prefill=True,
             any_logprobs=any(mask),
             logprob_requested=tuple(i for i, enabled in enumerate(mask) if enabled),
@@ -712,11 +720,13 @@ def test_logprob_host_rows_survive_step_and_slot_transitions(monkeypatch, pp_siz
         runner.attn_metadata_builder.decode_spans = lambda batch, lengths=lengths: (
             None,
             np.asarray(lengths),
-            None,
+            np.concatenate(([0], np.cumsum(lengths))),
         )
         batch = SimpleNamespace(
             total_seqs_num=3,
             total_seqs_num_decode=0 if lengths is None else 3,
+            total_seqs_num_prefill=3 if lengths is None else 0,
+            is_mixed=False,
             total_tokens_num_prefill=3 if lengths is None else 0,
             has_prefill=lengths is None,
             is_dummy_run=False,
@@ -762,3 +772,53 @@ def test_logprob_host_rows_survive_step_and_slot_transitions(monkeypatch, pp_siz
                     [min(i, lengths[1] - 1) for i in range(4)],
                     [lengths[1] + min(i, lengths[2] - 1) for i in range(4)],
                 ]
+
+
+@pytest.mark.parametrize("pp_size", [1, 2])
+def test_mixed_logprobs_score_prefill_and_ragged_decode_rows(monkeypatch, pp_size):
+    from atom.model_engine.token_logprobs import gather_token_logprobs
+
+    runner = runner_with_buffers(monkeypatch, pp_size, speculative=True)
+    # Two prompt rows yield one logit each; decode contributes 4 then 2.
+    # Exercise ring reuse as requests turn logprobs on and off.
+    for mask in ([True, False, True, True], [False] * 4, [False, True, False, True]):
+        runner._advance_forward_vars()
+        runner._gate_staging_reuse()
+        batch = SimpleNamespace(
+            total_seqs_num=4,
+            total_seqs_num_prefill=2,
+            total_seqs_num_decode=2,
+            total_tokens_num_prefill=8,
+            num_scheduled_tokens=np.asarray([5, 3, 4, 2]),
+            is_mixed=True,
+            is_dummy_run=False,
+            temperatures=np.ones(4),
+            top_ks=np.full(4, -1),
+            top_ps=np.ones(4),
+            required_channel=None,
+            return_logprobs=mask,
+            top_logprobs=[2] * 4,
+            any_logprobs=any(mask),
+            logprob_requested=tuple(i for i, enabled in enumerate(mask) if enabled),
+        )
+        group = runner.h2d_groups["token_inputs"]
+        runner.prepare_sample(batch, group)
+        group.publish()
+        if any(mask):
+            # Distinct distributions make a wrong row observable in the scores.
+            logits = torch.sin(torch.arange(56, device="cuda").reshape(8, 7).float())
+            ids = torch.tensor(
+                [[1] * 4, [2] * 4, [0, 1, 2, 3], [4, 5, 0, 0]], device="cuda"
+            )
+            values, _, _ = gather_token_logprobs(
+                logits, ids, batch, rows=batch.logprob_rows
+            )
+            model_rows = torch.tensor(
+                [[0] * 4, [1] * 4, [2, 3, 4, 5], [6, 7, 7, 7]], device="cuda"
+            )
+            expected = logits.log_softmax(-1)[model_rows, ids]
+            torch.testing.assert_close(values[..., 0], expected[mask])
+        else:
+            assert batch.logprob_rows is None
+        runner._mark_staging_h2d_enqueued()
+        runner._record_forward_vars_event()

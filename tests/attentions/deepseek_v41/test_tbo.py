@@ -1127,6 +1127,7 @@ def test_fp4_page_budget_includes_persistent_microbatch_metadata(monkeypatch):
             speculative_config=None,
             kv_cache_dtype="bf16",
             index_cache_dtype="fp4",
+            index_cache_layout="preshuffle",
             enable_tbo=True,
             load_dummy=True,
             gpu_memory_utilization=0.75,

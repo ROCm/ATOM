@@ -64,6 +64,7 @@ from atom.kv_transfer.disaggregation import (
 from atom.metrics.gpu import GPUForwardMetrics, record_gpu_forward
 from atom.model_engine.dynamic_chunking_worker import DynamicChunkingWorker
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
+from atom.model_engine.mixed_profile import profile_mixed_memory
 from atom.model_engine.output_transfer import D2HQueue
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
 from atom.model_engine.run_labels import build_run_label
@@ -137,7 +138,7 @@ from atom.utils.forward_context import (
     set_kv_cache_data,
 )
 from atom.utils.gc_utils import freeze_gc_heap
-from atom.utils.h2d import h2d_producer
+from atom.utils.h2d import PublicationOwner, PublicationRegistry, h2d_producer
 from atom.utils.region_graph import ReqGraph, TokenGraph
 from atom.utils.selector import attn_family, get_attn_backend, has_mla_indexer
 from atom.utils.sp_wrapper import SPModelWrapper
@@ -145,7 +146,9 @@ from atom.utils.tbo import (
     cut_decode_ubatches,
     cut_prefill_ubatches,
     decode_bucket_splits,
+    mixed_tbo_vote,
     prefill_tbo_vote,
+    split_mixed_token_midpoint,
 )
 from atom.utils.tbo.ubatch_wrapper import UBatchWrapper
 
@@ -367,18 +370,27 @@ class tokenIDProcessor:
         self.num_rejected: np.ndarray | None = None
         self.num_bonus: np.ndarray | None = None
 
-    def verify_ctx_lens(self, context_lens: np.ndarray) -> np.ndarray:
+    def verify_ctx_lens(
+        self, context_lens: np.ndarray, *, num_rejected: np.ndarray | None = None
+    ) -> np.ndarray:
         """`batch.context_lens` moved back to the start of this verify window.
 
         Deferred output: the last step's `num_rejected` slots are still in
         `context_lens`. Undeferred (PP): postprocess already left one run of
         `mtp_k + 1` placeholders, so the shift is 1. Before any sampler output
         there is nothing to shift. Only a verify step has a window, so every
-        caller sits behind `max_seqlen_q > 1`.
+        caller sits behind `max_seqlen_q > 1`, or supplies mixed segment counts.
         """
-        if self.num_rejected is None:
+        # Idle DP steps run only padding, while the previous step's status
+        # may still be present. There are no request contexts to correct.
+        if len(context_lens) == 0:
             return context_lens
-        shift = self.num_rejected if self.is_deferred_out else 1
+        rejected = self.num_rejected if num_rejected is None else num_rejected
+        if rejected is None:
+            return context_lens
+        if len(rejected) != len(context_lens):
+            raise ValueError("num_rejected is not aligned with decode rows")
+        shift = rejected if self.is_deferred_out else 1
         return context_lens - np.asarray(shift, dtype=context_lens.dtype)
 
     @staticmethod
@@ -464,9 +476,12 @@ class tokenIDProcessor:
         self.prev_channel_states = channel_states
         return token_id_dict, logprobs_map
 
-    def get_token_locations(self, batch: ScheduledBatch) -> TokenLocations:
+    def get_token_locations(
+        self, batch: ScheduledBatch, row_offset: int = 0
+    ) -> TokenLocations:
+        """Map decode-local rows to the previous output-producing batch."""
         prev_req_ids = self.prev_batch.req_ids
-        cur_req_ids = batch.req_ids
+        cur_req_ids = batch.req_ids[row_offset:]
         num_prev = len(prev_req_ids)
         num_cur = len(cur_req_ids)
 
@@ -568,51 +583,55 @@ class tokenIDProcessor:
         scheduled_tokens = batch.scheduled_tokens  # tokens per req
         total_tokens_prefill = batch.total_tokens_num_prefill
         total_tokens_decode = batch.total_tokens_num_decode
+        total_reqs_prefill = batch.total_seqs_num_prefill
+        is_mixed = batch.is_mixed
 
-        # TODO: remove this when we support mixed prefill and decode in one batch
-        if batch.has_prefill:
-            # Decode does not publish an empty prefill prefix: an explicit
-            # zero copy is still a publication in this forward's ledger.
-            self.input_ids.np[:total_tokens_prefill] = scheduled_tokens[
-                :total_tokens_prefill
-            ]
-            return (
-                self._publish_input_ids(total_tokens_prefill, publication_group),
-                None,
-            )
+        # Both paths stage the whole batch once. Only decode rows may gather
+        # last step's GPU outputs; prefill tokens always keep the scheduler's
+        # exact ids, including a partial prompt also present in prev_batch.
+        total_tokens = batch.total_tokens_num
+        self.input_ids.np[:total_tokens] = scheduled_tokens[:total_tokens]
+        if is_mixed and self.use_spec:
+            self.num_rejected = batch.num_rejected
+            self.num_bonus = batch.num_bonus
+            if self.num_rejected is not None:
+                self.num_rejected[:total_reqs_prefill] = 0
+                self.num_bonus[:total_reqs_prefill] = 0
+        if not total_tokens_decode:
+            return self._publish_input_ids(total_tokens, publication_group), None
 
         if not self.is_deferred_out:
-            token_ids = scheduled_tokens[
-                total_tokens_prefill : total_tokens_prefill + total_tokens_decode
-            ]
-            self.input_ids.np[:total_tokens_decode] = token_ids
             # A P/D producer never speculates (its DP dummy included), so no
             # row here carries drafts. One that did would need the deferred
             # branch's per-request staging: under DP a block drafter's
             # `max_seqlen_q` is the group's maximum, not this batch's row
             # width. Under PP only a producer is held to it; a PP consumer
             # verifies its own drafts below.
-            if not self.is_pipeline_parallel or self.is_pd_producer:
-                assert batch.num_spec_step == 0, (
+            if (
+                not self.is_pipeline_parallel or self.is_pd_producer
+            ) and batch.num_spec_step:
+                raise NotImplementedError(
                     "non-deferred decode got a speculative batch "
                     f"(num_spec_step={batch.num_spec_step})"
                 )
             if not self.is_pipeline_parallel:
                 return (
-                    self._publish_input_ids(total_tokens_decode, publication_group),
+                    self._publish_input_ids(total_tokens, publication_group),
                     None,
                 )
             if self.use_spec and batch.num_spec_step > 0:
                 # PP: the host already holds each row's anchor, so fill only
                 # the draft columns.
                 bs, lens, cu_np = self.runner.attn_metadata_builder.decode_spans(batch)
-                spec = batch.scheduled_spec_decode_tokens[:bs]
+                spec = batch.scheduled_spec_decode_tokens[
+                    total_reqs_prefill : total_reqs_prefill + bs
+                ]
                 cols = np.arange(spec.shape[1])
                 # Row i's drafts land right after its anchor at cu_np[i].
                 drafted = cols < (lens[:, None] - 1)
-                self.input_ids.np[(cu_np[:bs, None] + 1 + cols)[drafted]] = spec[
-                    drafted
-                ]
+                self.input_ids.np[
+                    (total_tokens_prefill + cu_np[:bs, None] + 1 + cols)[drafted]
+                ] = spec[drafted]
             # Previous step's acceptance counts, read off the batch so every
             # stage (not just the sampling one) rolls its linear-attention
             # state back correctly; unset, GDN assumes 1 accepted token.
@@ -620,24 +639,16 @@ class tokenIDProcessor:
                 self.num_rejected = batch.num_rejected
                 self.num_bonus = batch.num_bonus
             return (
-                self._publish_input_ids(total_tokens_decode, publication_group),
+                self._publish_input_ids(total_tokens, publication_group),
                 None,
             )
 
         # PD consumer first decode: no prior prefill step initialized
         # prev_batch, so use scheduled_tokens directly for this step.
         if self.prev_batch is None:
-            token_ids = scheduled_tokens[
-                total_tokens_prefill : total_tokens_prefill + total_tokens_decode
-            ]
-            self.input_ids.np[:total_tokens_decode] = token_ids
-            return (
-                self._publish_input_ids(total_tokens_decode, publication_group),
-                None,
-            )
+            return self._publish_input_ids(total_tokens, publication_group), None
 
-        """for decode: input ids are from prev_sampled_token_ids"""
-        locs = self.get_token_locations(batch)
+        locs = self.get_token_locations(batch, row_offset=total_reqs_prefill)
         deferred_curr_indices = locs.deferred_curr
         deferred_prev_indices = locs.deferred_prev
         new_curr_indices = locs.new_curr
@@ -654,12 +665,6 @@ class tokenIDProcessor:
         # already published; a second copy is what let the two disagree under DP.
         bs, lens, cu_np = self.runner.attn_metadata_builder.decode_spans(batch)
 
-        # Stage the scheduler's ids over the whole region. For a request the
-        # scheduler just admitted this is already its real anchor (and drafts);
-        # for a carried-over one it is a placeholder the kernel overwrites.
-        self.input_ids.np[:total_tokens_decode] = scheduled_tokens[
-            total_tokens_prefill : total_tokens_prefill + total_tokens_decode
-        ]
         # A newly admitted request has no row in `prev_token_ids`, so
         # `fill_deferred_decode_ids` skips it (`src < 0`) and its draft columns
         # must be staged here -- `scheduled_tokens` gave it committed history,
@@ -675,29 +680,28 @@ class tokenIDProcessor:
             for i in new_curr_indices:
                 n_draft = int(lens[i]) - 1
                 if n_draft > 0:
-                    s = int(cu_np[i]) + 1
-                    self.input_ids.np[s : s + n_draft] = spec[i, :n_draft]
+                    s = total_tokens_prefill + int(cu_np[i]) + 1
+                    row = total_reqs_prefill + i
+                    self.input_ids.np[s : s + n_draft] = spec[row, :n_draft]
         src_np = self.decode_src.np[:bs]
         src_np.fill(NEW_SEQUENCE)
         src_np[deferred_curr_indices] = deferred_prev_indices
         group = publication_group
-        group.set_counts(
-            {"input_ids": total_tokens_decode, "decode_src": bs, "batch_info": 3}
-        )
+        group.set_counts({"input_ids": total_tokens, "decode_src": bs, "batch_info": 3})
         group.publish()
         # How wide the forward reads: a replayed decode graph takes a fixed
         # `running_bs * tokens_per_seq` whatever the batch scheduled, and `bs`
         # sits between two captured buckets on most steps -- a 65-request batch
         # replays the 128 graph. The kernel zeroes the difference.
         fill_to = total_tokens_decode
-        if not self.runner.enforce_eager:
+        if not is_mixed and not self.runner.enforce_eager:
             gbs = next(
                 (g for g in reversed(self.runner.capture_sizes) if g >= bs), None
             )
             if gbs is not None:
                 fill_to = max(fill_to, int(gbs) * tokens_per_seq)
         fill_deferred_decode_ids(
-            self.input_ids.gpu,
+            self.input_ids.gpu[total_tokens_prefill:],
             self.runner.forward_vars["cu_seqlens_q"].gpu[: bs + 1],
             self.decode_src.gpu[:bs],
             self.prev_token_ids,
@@ -706,11 +710,15 @@ class tokenIDProcessor:
             width=fill_to,
         )
 
-        # Slice by the width this path actually staged. Prefill returned above,
-        # so the decode total is the whole batch; a worker-side speculative q
-        # shrink rewrites it, and reading any other total here would leave the
-        # attention metadata wider than input_ids.
-        return self.input_ids.gpu[:total_tokens_decode], locs
+        # Status remapping addresses the whole batch, while the shared gather
+        # above addresses only its decode region.
+        if total_reqs_prefill:
+            locs = TokenLocations(
+                locs.deferred_curr + total_reqs_prefill,
+                locs.deferred_prev,
+                locs.new_curr + total_reqs_prefill,
+            )
+        return self.input_ids.gpu[:total_tokens], locs
 
     def prepare_draft_ids(
         self, batch: ScheduledBatch, draft_token_ids: torch.Tensor
@@ -979,6 +987,9 @@ class ModelRunner:
             )
         self._init_forward_vars_ring()
         self._init_h2d_publication()
+        if config.enable_mixed_prefill_decode:
+            # Before warmup's memory profile, so the KV budget counts them.
+            self.attn_metadata_builder.build_mixed_prefill_banks()
         self.forward_done_event = torch.cuda.Event()
         initialize_eplb_runtime(self)
         self._maybe_warmup()
@@ -1050,9 +1061,7 @@ class ModelRunner:
         logger.info(f"Model warmup done: {self.config.model}")
 
     def _kv_budget_extra_reserve(self, total_bytes: int) -> int:
-        """Extra GPU bytes to hold back from the KV cache budget beyond the
-        base overhead. Base runner reserves nothing; override point for
-        setups that share the GPU with another process."""
+        """Override point for processes sharing the GPU (e.g. RapidServe)."""
         return 0
 
     def _setup_device_and_distributed(self, rank: int, config: Config):
@@ -1183,7 +1192,6 @@ class ModelRunner:
         #    are non-daemon, so leaving them running wedges interpreter shutdown
         #    or races an in-flight copy against atexit. Must run BEFORE the KV
         #    pool it copies out of is dropped and before the dist env goes away.
-        #    Guarded: only offload workers define close() (moriio etc. do not).
         connector = get_kvconnector()
         close = getattr(connector, "close", None) if connector is not None else None
         if callable(close):
@@ -1573,9 +1581,7 @@ class ModelRunner:
         logger.info(f"forward_vars ring: {pp_size} slots (pipeline parallel)")
 
     def _init_h2d_publication(self):
-        from atom.utils.h2d import PublicationOwner, PublicationRegistry
-
-        registry = PublicationRegistry()
+        self.publication_registry = PublicationRegistry()
         self._h2d_owners = []
         self._h2d_groups = []
         for index, variables in enumerate(self._fv_ring):
@@ -1584,61 +1590,67 @@ class ModelRunner:
                 if self._fv_slot_events is None
                 else self._fv_slot_events[index]
             )
-            owner = PublicationOwner(self.device, event, registry=registry)
-            members = {}
-            for name, buffer in variables.items():
-                if isinstance(buffer, CpuGpuBuffer) and buffer.publication_group:
-                    binding = owner.bind(buffer, name, unit=buffer.publication_unit)
-                    members.setdefault(buffer.publication_group, []).append(binding)
-            groups = {name: owner.group(name, items) for name, items in members.items()}
-            # One upload immediately before token assembly's first GPU
-            # consumer. Sampling has no earlier device consumer.
-            if all(name in groups for name in ("sampling", "early", "input_ids")):
-                token_members = ("sampling", "early", "input_ids")
-                if "spec_decode" in groups:
-                    token_members += ("spec_decode",)
-                groups["token_inputs"] = owner.group(
-                    "token_inputs",
-                    [b for name in token_members for b in groups[name].members],
-                )
-            # One upload per phase: `prefill_metadata` / `decode_metadata`, and
-            # `ub{i}_` of each for a TBO micro-batch. A builder's declared
-            # members join the group of that name, sharing destinations other
-            # groups also publish (e.g. MHA decode's block tables).
-            composed = {}
-            if "seq_metadata" in groups and "positions" in groups:
-                composed["prefill_metadata"] = [
-                    *groups["seq_metadata"].members,
-                    *groups["positions"].members,
-                ]
-            builder = getattr(self, "attn_metadata_builder", None)
-            builder_members = {} if builder is None else builder.h2d_group_members()
-            for name, names in builder_members.items():
-                members = composed.setdefault(name, [])
-                for item in names:
-                    binding = variables[item]._publication
-                    if binding not in members:
-                        members.append(binding)
-            # The MRoPE planes go up with either phase's metadata.
-            if "mrope" in groups:
-                for name in ("prefill_metadata", "decode_metadata"):
-                    composed.setdefault(name, []).extend(groups["mrope"].members)
-            for name, members in composed.items():
-                groups[name] = owner.group(name, members)
-            for group in owner.use_packed_transport({"token_inputs", *composed}):
-                logger.info(
-                    "H2D group %s: %s%s",
-                    group.name,
-                    group.transport,
-                    f" ({group.fallback_reason})" if group.fallback_reason else "",
-                )
-            # Cover constructor uploads, ring clones and transport pointer
-            # tables before the first preparation, even on another stream.
-            event.record()
+            owner, groups = self.build_h2d_slot(variables, event)
             self._h2d_owners.append(owner)
             self._h2d_groups.append(groups)
         self.h2d_owner = self._h2d_owners[self._fv_idx]
         self.h2d_groups = self._h2d_groups[self._fv_idx]
+
+    def build_h2d_slot(self, variables, event, *, partial=False):
+        owner = PublicationOwner(self.device, event, registry=self.publication_registry)
+        members = {}
+        for name, buffer in variables.items():
+            if isinstance(buffer, CpuGpuBuffer) and buffer.publication_group:
+                binding = owner.bind(buffer, name, unit=buffer.publication_unit)
+                members.setdefault(buffer.publication_group, []).append(binding)
+        groups = {name: owner.group(name, items) for name, items in members.items()}
+        # One upload immediately before token assembly's first GPU
+        # consumer. Sampling has no earlier device consumer.
+        if all(name in groups for name in ("sampling", "early", "input_ids")):
+            token_members = ("sampling", "early", "input_ids")
+            if "spec_decode" in groups:
+                token_members += ("spec_decode",)
+            groups["token_inputs"] = owner.group(
+                "token_inputs",
+                [b for name in token_members for b in groups[name].members],
+            )
+        # One upload per phase: `prefill_metadata` / `decode_metadata`, and
+        # `ub{i}_` of each for a TBO micro-batch. A builder's declared
+        # members join the group of that name, sharing destinations other
+        # groups also publish (e.g. MHA decode's block tables).
+        composed = {}
+        if "seq_metadata" in groups and "positions" in groups:
+            composed["prefill_metadata"] = [
+                *groups["seq_metadata"].members,
+                *groups["positions"].members,
+            ]
+        builder = getattr(self, "attn_metadata_builder", None)
+        builder_members = {} if builder is None else builder.h2d_group_members()
+        for name, names in builder_members.items():
+            if partial and any(item not in variables for item in names):
+                continue
+            members = composed.setdefault(name, [])
+            for item in names:
+                binding = variables[item]._publication
+                if binding not in members:
+                    members.append(binding)
+        # The MRoPE planes go up with either phase's metadata.
+        if "mrope" in groups:
+            for name in ("prefill_metadata", "decode_metadata"):
+                composed.setdefault(name, []).extend(groups["mrope"].members)
+        for name, members in composed.items():
+            groups[name] = owner.group(name, members)
+        for group in owner.use_packed_transport({"token_inputs", *composed}):
+            logger.info(
+                "H2D group %s: %s%s",
+                group.name,
+                group.transport,
+                f" ({group.fallback_reason})" if group.fallback_reason else "",
+            )
+        # Cover constructor uploads, ring clones and transport pointer
+        # tables before the first preparation, even on another stream.
+        event.record()
+        return owner, groups
 
     def _advance_forward_vars(self):
         """Rotate to the next in-flight slot before any buffer is written.
@@ -1953,6 +1965,63 @@ class ModelRunner:
         )
         return spec.for_pipeline(layout_id, units, op_bytes, largest_image)
 
+    def _state_runtime_for_plan(self, plan: PoolPlan) -> StateRuntime:
+        config = self.config
+        # Keep runtime state metadata out of Config.
+        transfer = self.attn_metadata_builder.state_transfer()
+        uses_paged_state = transfer.copies
+        if (
+            uses_paged_state
+            and config.pipeline_parallel_size > 1
+            and not getattr(
+                self.attn_metadata_builder, "paged_checkpoints_span_pipeline", False
+            )
+        ):
+            raise RuntimeError(
+                "PAGE-backed state checkpoints do not yet support pipeline "
+                "parallelism: every stage must first agree on one atomic "
+                "checkpoint/unit ownership transaction"
+            )
+        if uses_paged_state and config.enable_rapidserve:
+            raise RuntimeError(
+                "PAGE-backed state checkpoints do not yet support RapidServe "
+                "prefill/decode disaggregation"
+            )
+        checkpoint_spec = None
+        if uses_paged_state:
+            if plan.paged_class is None:
+                raise RuntimeError(
+                    "PAGE-backed state checkpoints require a PAGE sub-pool"
+                )
+            is_pp = config.pipeline_parallel_size > 1
+            if is_pp and not torch.distributed.is_initialized():
+                raise RuntimeError(
+                    "PAGE-backed state checkpoints under PP need the "
+                    "distributed groups initialized first"
+                )
+            slot_bytes = int(plan.entry_bytes[STATE_SLOT_CLASS])
+            # A PP stage without a linear-attention layer has no image.
+            local_spec = (
+                self._local_checkpoint_spec(plan, transfer, slot_bytes)
+                if slot_bytes
+                else None
+            )
+            if is_pp:
+                # Every stage joins, a stateless one with None: raising before
+                # the collective would leave its peers waiting in it.
+                checkpoint_spec = self._agree_pipeline_checkpoint_spec(local_spec)
+                transfer = dataclasses.replace(
+                    transfer, paged_layout_id=checkpoint_spec.layout_id
+                )
+            elif local_spec is None:
+                raise RuntimeError(
+                    "PAGE-backed state checkpoints need recurrent state, but "
+                    "this model holds none"
+                )
+            else:
+                checkpoint_spec = local_spec
+        return StateRuntime(transfer=transfer, checkpoint_spec=checkpoint_spec)
+
     def get_num_blocks(self) -> dict[str, object]:
         torch.set_default_device(self.device)
         config = self.config
@@ -1969,7 +2038,29 @@ class ModelRunner:
         # torch-reserved. Ignoring it over-allocates KV and OOMs at runtime.
         non_torch = max((total - free) - torch.cuda.memory_reserved(), 0)
 
+        # Preserve the ordinary warmup estimate before the eager mixed sweep
+        # resets allocator peaks. Mixed workspace does not belong to graph pools.
         cudagraph_overhead = self._estimate_cudagraph_overhead()
+        specs = self._sub_pool_specs()
+        if config.enable_mixed_prefill_decode:
+            torch.set_default_device(None)
+            old_plan = self.pool_plan
+            old_state = self.state_runtime
+            try:
+                # Geometry only; the profiler backs a bounded scratch pool.
+                self.pool_plan = plan_pools(specs, total, config.max_num_seqs)
+                self.state_runtime = self._state_runtime_for_plan(self.pool_plan)
+                mixed_peak, mixed_non_torch = profile_mixed_memory(self)
+            finally:
+                self.pool_plan = old_plan
+                self.state_runtime = old_state
+            peak_torch = max(peak_torch, mixed_peak)
+            free, total = torch.cuda.mem_get_info()
+            non_torch = max(
+                non_torch,
+                mixed_non_torch,
+                (total - free) - torch.cuda.memory_reserved(),
+            )
         safety_margin = int(total * 0.02)
 
         budget = int(total * config.gpu_memory_utilization)
@@ -2003,8 +2094,6 @@ class ModelRunner:
         available_for_kv = min(available_for_kv_budget, free_for_kv)
 
         torch.set_default_device(None)
-
-        specs = self._sub_pool_specs()
 
         # Sub-pool sizing is pure arithmetic over the byte budget — see
         # atom/model_ops/attentions/pool_layout/sub_pool_spec.py. STATE classes (GDN
@@ -2085,59 +2174,10 @@ class ModelRunner:
         self.pool_plan = plan
         config.pool_entries = dict(plan.entries)
         config.pool_entries_per_req = dict(plan.entries_per_req)
-        # Keep runtime state metadata out of Config.
-        transfer = self.attn_metadata_builder.state_transfer()
-        uses_paged_state = transfer.copies
-        if (
-            uses_paged_state
-            and config.pipeline_parallel_size > 1
-            and not getattr(
-                self.attn_metadata_builder, "paged_checkpoints_span_pipeline", False
-            )
-        ):
-            raise RuntimeError(
-                "PAGE-backed state checkpoints do not yet support pipeline "
-                "parallelism: every stage must first agree on one atomic "
-                "checkpoint/unit ownership transaction"
-            )
-        if uses_paged_state and config.enable_rapidserve:
-            raise RuntimeError(
-                "PAGE-backed state checkpoints do not yet support RapidServe "
-                "prefill/decode disaggregation"
-            )
-        checkpoint_spec = None
-        if uses_paged_state:
-            if plan.paged_class is None:
-                raise RuntimeError(
-                    "PAGE-backed state checkpoints require a PAGE sub-pool"
-                )
-            is_pp = config.pipeline_parallel_size > 1
-            if is_pp and not torch.distributed.is_initialized():
-                raise RuntimeError(
-                    "PAGE-backed state checkpoints under PP need the "
-                    "distributed groups initialized first"
-                )
-            slot_bytes = int(plan.entry_bytes[STATE_SLOT_CLASS])
-            # A PP stage without a linear-attention layer has no image.
-            local_spec = (
-                self._local_checkpoint_spec(plan, transfer, slot_bytes)
-                if slot_bytes
-                else None
-            )
-            if is_pp:
-                # Every stage joins, a stateless one with None: raising before
-                # the collective would leave its peers waiting in it.
-                checkpoint_spec = self._agree_pipeline_checkpoint_spec(local_spec)
-                transfer = dataclasses.replace(
-                    transfer, paged_layout_id=checkpoint_spec.layout_id
-                )
-            elif local_spec is None:
-                raise RuntimeError(
-                    "PAGE-backed state checkpoints need recurrent state, but "
-                    "this model holds none"
-                )
-            else:
-                checkpoint_spec = local_spec
+        state_runtime = self._state_runtime_for_plan(plan)
+        self.state_runtime = state_runtime
+        checkpoint_spec = state_runtime.checkpoint_spec
+        if checkpoint_spec is not None:
             logger.info(
                 "PAGE-backed state checkpoints enabled: unit_bytes=%d, "
                 "slot_bytes=%d, image_bytes=%d (%.1f%% of a slot), "
@@ -2149,11 +2189,6 @@ class ModelRunner:
                 checkpoint_spec.units_per_checkpoint,
                 checkpoint_spec.layout_id,
             )
-        state_runtime = StateRuntime(
-            transfer=transfer,
-            checkpoint_spec=checkpoint_spec,
-        )
-        self.state_runtime = state_runtime
         for name in sorted(plan.entries):
             logger.info(
                 f"sub-pool {name}: entries={plan.entries[name]}, "
@@ -2170,6 +2205,7 @@ class ModelRunner:
             f"non_torch={non_torch / (1 << 30):.2f}GB, "
             f"cudagraph_est={cudagraph_overhead / (1 << 30):.2f}GB, "
             f"safety={safety_margin / (1 << 30):.2f}GB, "
+            f"extra_reserve={extra_reserve / (1 << 30):.2f}GB, "
             f"available_for_kv={available_for_kv / (1 << 30):.2f}GB, "
             f"block_bytes={block_bytes}, "
             f"num_kvcache_blocks={num_kvcache_blocks}"
@@ -2478,6 +2514,13 @@ class ModelRunner:
                 and batch.total_tokens_num_prefill // pcp_size >= 2
             )
             return (eligible, eligible, 0, 0)
+        if batch.is_mixed:
+            return mixed_tbo_vote(
+                batch.num_scheduled_tokens,
+                batch.total_seqs_num,
+                batch.total_tokens_num_prefill,
+                envs.ATOM_TBO_PREFILL_MIN_TOKENS,
+            )
         return prefill_tbo_vote(batch.total_tokens_num_prefill)
 
     def _cut_ubatches(
@@ -2496,6 +2539,18 @@ class ModelRunner:
                 forward_mode.running_tokens,
                 np.asarray(batch.num_scheduled_tokens[:scheduled_bs]),
             )
+        elif batch.is_mixed:
+            ubatch_slices = split_mixed_token_midpoint(
+                batch.total_seqs_num,
+                batch.total_seqs_num_prefill,
+                batch.total_tokens_num_prefill,
+                batch.num_scheduled_tokens,
+            )
+            if ubatch_slices is None:
+                raise RuntimeError(
+                    "collective TBO decision admitted an invalid mixed split"
+                )
+            ubatch_slices = tuple(ubatch_slices)
         elif self.config.prefill_context_parallel_size > 1 and not batch.is_dummy_run:
             ubatch_slices, pcp_groups = cut_pcp_prefill_ubatches(
                 batch.num_scheduled_tokens,
@@ -2522,7 +2577,7 @@ class ModelRunner:
 
         Mutates only the worker's batch copy (counts + scheduled_spec_decode_
         tokens truncated to q-1); KV stays reserved at mtp_k+1. No-op unless
-        DSpark confidence scheduling is on and this is a pure-decode batch.
+        DSpark confidence scheduling is on and the batch has decode rows.
         The bucket math lives in `apply_q_bucket` so CPU CI can run it without
         importing this module (which loads AITER).
         """
@@ -2553,10 +2608,24 @@ class ModelRunner:
 
         tp = getattr(self, "tokenID_processor", None)
         prev_b = getattr(tp, "prev_batch", None) if tp is not None else None
-        cur_req = list(batch.req_ids[:scheduled_bs])
-        prev_req = list(prev_b.req_ids) if prev_b is not None else None
-        # Shrinking needs the previous batch to be exactly this decode set in
-        # the same order (no new/prefill seqs, no reorder), because the per-
+        row0 = batch.total_seqs_num_prefill
+        cur_req = list(batch.req_ids[row0 : row0 + scheduled_bs])
+        prev_req = (
+            list(
+                prev_b.req_ids[
+                    (
+                        prev_b.total_seqs_num_prefill
+                        if self.config.enable_mixed_prefill_decode
+                        else 0
+                    ) :
+                ]
+            )
+            if prev_b is not None and not prev_b.is_dummy_run
+            else None
+        )
+        # Keep the decode set and order stable across steps. Prefill rows may
+        # change independently; their bonus counts never bound decode spans.
+        # This excludes a first decode after prefill, because the per-
         # request lengths below are read off that batch's `num_bonus`. Any
         # deviation → boundary step.
         if prev_req is None or prev_req != cur_req:
@@ -2565,11 +2634,12 @@ class ModelRunner:
         # Positional, which is what the `prev_req == cur_req` guard buys: entry
         # i is request i's own count from the step that produced it, before
         # `prepare_input_ids` remaps the deferred rows.
-        nb = batch.num_bonus[:scheduled_bs]
+        nb = batch.num_bonus[row0 : row0 + scheduled_bs]
 
         from atom.spec_decode.dspark_scheduler import (
             quantize_to_bucket,
             ragged_verify_lens,
+            resize_decode_tokens,
             resolve_q_buckets,
         )
 
@@ -2577,15 +2647,15 @@ class ModelRunner:
         # segment) and old_nst[i] (a stale ell must not grow a seq past what the
         # scheduler scheduled). None -> some request's bounds cross.
         new_len = ragged_verify_lens(
-            (by_req.get(rid) for rid in batch.req_ids[:scheduled_bs]),
+            (by_req.get(rid) for rid in cur_req),
             full_q,
             nb,
-            old_nst[:scheduled_bs],
+            old_nst[row0 : row0 + scheduled_bs],
         )
         if new_len is None:
             return  # stay rectangular
 
-        if not (new_len < old_nst[:scheduled_bs]).any():
+        if not (new_len < old_nst[row0 : row0 + scheduled_bs]).any():
             return  # nothing to shrink this step -> Phase-1 layout
 
         # q_eff, and the replay-shape feasibility check, BEFORE anything on the
@@ -2599,7 +2669,7 @@ class ModelRunner:
         #     running_tokens, bucketed from the scheduled tokens' real sum, so a
         #     long-tail seq no longer inflates the batch row count.
         buckets = resolve_q_buckets(self.config.dspark.ragged_graph_sizes, full_q)
-        if self.enforce_eager:
+        if self.enforce_eager or batch.is_mixed:
             # Eager: no graph → capacity == exact Σ (no bucket). Scalar = batch max
             # real len (positions/attn bound); layout is pure flat Σ.
             q_eff = int(new_len.max()) if scheduled_bs > 0 else full_q
@@ -2625,28 +2695,7 @@ class ModelRunner:
             if not self._tr_hybrid_active():
                 return  # stay rectangular
 
-        # Rebuild scheduled_tokens (flat) to the ragged per-seq layout: keep the
-        # first new_len[i] of each seq's old segment (token[0]=anchor, rest=draft
-        # placeholders already populated by the scheduler from seq.token_ids).
-        sched = np.asarray(batch.scheduled_tokens)
-        old_cu = np.zeros(scheduled_bs + 1, dtype=np.int64)
-        np.cumsum(old_nst[:scheduled_bs], out=old_cu[1:])
-        new_cu = np.zeros(scheduled_bs + 1, dtype=np.int64)
-        np.cumsum(new_len, out=new_cu[1:])
-        total_new = int(new_cu[-1])
-        new_sched = np.empty(total_new, dtype=sched.dtype)
-        for i in range(scheduled_bs):
-            s_old = int(old_cu[i])
-            s_new = int(new_cu[i])
-            new_sched[s_new : s_new + new_len[i]] = sched[s_old : s_old + new_len[i]]
-        batch.scheduled_tokens = new_sched
-
-        nst = old_nst.copy()
-        nst[:scheduled_bs] = new_len
-        batch.num_scheduled_tokens = nst
-        prefill_tok = int(batch.total_tokens_num_prefill)
-        batch.total_tokens_num_decode = total_new
-        batch.total_tokens_num = prefill_tok + total_new
+        resize_decode_tokens(batch, new_len)
         # No marker is published for "this step shrank": a shrunk step is
         # `num_scheduled_tokens` with smaller entries, and every reader reads
         # those. `scheduled_spec_decode_tokens` keeps its full width --
@@ -2668,6 +2717,28 @@ class ModelRunner:
             and batch.total_seqs_num_decode > 0
         )
 
+    def _verify_spans(
+        self, batch: ScheduledBatch
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        """Sample counts and cumulative ends in logit-row space."""
+        n_p = batch.total_seqs_num_prefill
+        is_mixed = batch.is_mixed
+        # A mixed step verifies its decode rows as a pure decode would, so it
+        # asks `_verifies_drafts` the decode question; pure prefill samples
+        # without verification.
+        if not self._verifies_drafts(batch, is_prefill=n_p > 0 and not is_mixed):
+            return None
+        if n_p == 0:
+            _, lens, cu = self.attn_metadata_builder.decode_spans(batch)
+            return lens, cu[1:]
+        lens = np.concatenate(
+            [
+                np.ones(n_p, dtype=np.int32),
+                np.asarray(batch.num_scheduled_tokens[n_p:], dtype=np.int32),
+            ]
+        )
+        return lens, np.cumsum(lens, dtype=np.int32)
+
     def prepare_inputs(
         self,
         batch: ScheduledBatch,
@@ -2680,6 +2751,7 @@ class ModelRunner:
         # lives). The q-bucket shrink ran there too, so `batch` is already
         # reduced here.
         is_prefill = forward_mode.is_prefill
+        is_mixed = batch.is_mixed
         scheduled_tokens = batch.total_tokens_num
         sync = forward_mode.sync
         running_tokens_are_unified = forward_mode.running_tokens_are_unified
@@ -2689,10 +2761,6 @@ class ModelRunner:
         running_bs = forward_mode.running_bs
         running_tokens = forward_mode.running_tokens
         spec_decode_metadata = None
-        if self._verifies_drafts(batch, is_prefill):
-            spec_decode_metadata = self.drafter.calc_spec_decode_metadata(
-                input_ids, spec_decode_indices
-            )
         attn_metadata, positions = self.attn_metadata_builder.build(
             batch=batch,
             running_bs=running_bs,
@@ -2702,6 +2770,16 @@ class ModelRunner:
             ubatch_slices=forward_mode.ubatch_slices,
             pcp_groups=forward_mode.pcp_groups,
         )
+        spans = self._verify_spans(batch)
+        if spans is not None:
+            sampled_ids = (
+                input_ids[attn_metadata.sampled_token_indices]
+                if is_mixed
+                else input_ids
+            )
+            spec_decode_metadata = self.drafter.calc_spec_decode_metadata(
+                sampled_ids, spec_decode_indices
+            )
         self.attn_metadata_builder.prepare_model_inputs(input_ids, attn_metadata)
         context = Context(
             positions=positions,
@@ -2778,8 +2856,9 @@ class ModelRunner:
         batch.logprob_rows = None
         if getattr(batch, "any_logprobs", False):
             lengths, width = None, 1
-            if self._verifies_drafts(batch, batch.has_prefill):
-                _, lengths, _ = self.attn_metadata_builder.decode_spans(batch)
+            spans = self._verify_spans(batch)
+            if spans is not None:
+                lengths, _ = spans
                 width = self.drafter.mtp_k + 1
             requested, model_rows, sample_rows = host_logprob_rows(
                 batch.logprob_requested, lengths, width
@@ -2854,22 +2933,37 @@ class ModelRunner:
         temperatures, top_ks, top_ps, all_greedy, needs_independent_noise = (
             self.prepare_sample(batch, token_group)
         )
-        query_counts = self.attn_metadata_builder.prepare_query_metadata(
-            self.attn_metadata_builder.query_lengths(
+        builder = self.attn_metadata_builder
+        if batch.is_mixed:
+            # Token assembly consumes decode-local spans. Prefill publishes
+            # its independent query layout in the private metadata bank.
+            lengths = batch.num_scheduled_tokens[batch.total_seqs_num_prefill :]
+            query_bs, query_tokens = (
+                batch.total_seqs_num_decode,
+                batch.total_tokens_num_decode,
+            )
+        else:
+            lengths = builder.query_lengths(
                 batch, forward_mode.is_prefill, forward_mode.running_tokens
-            ),
-            forward_mode.running_bs,
-            forward_mode.running_tokens,
-            forward_mode.decode_ubatch_slices,
+            )
+            query_bs, query_tokens = (
+                forward_mode.running_bs,
+                forward_mode.running_tokens,
+            )
+        token_group.set_counts(
+            builder.prepare_query_metadata(
+                lengths,
+                query_bs,
+                query_tokens,
+                forward_mode.decode_ubatch_slices,
+            )
         )
-        token_group.set_counts(query_counts)
         spec_group = self.h2d_groups.get("spec_decode")
-        if spec_group is not None and self._verifies_drafts(
-            batch, forward_mode.is_prefill
-        ):
-            _, lens, cu = self.attn_metadata_builder.decode_spans(batch)
+        spans = self._verify_spans(batch)
+        if spec_group is not None and spans is not None:
+            lens, cu_end = spans
             spec_decode_indices = self.drafter.prepare_spec_decode_indices(
-                lens, cu[1:], token_group
+                lens, cu_end, token_group
             )
         # No GPU consumer runs between these host producers and this
         # upload. Token assembly publishes before launching its kernel.
@@ -3363,6 +3457,35 @@ class ModelRunner:
             request_ids,
         )
 
+    def _settle_mixed_verdict(
+        self,
+        batch: ScheduledBatch,
+        num_reject_tokens: torch.Tensor,
+        anchors: torch.Tensor,
+    ) -> None:
+        """Re-express a mixed step's verdict in the batch's TOKEN rows, in place.
+
+        The rejection verdict is computed over LOGIT rows: `anchors` is each
+        request's bonus logit row minus its drafts plus its accepts, and
+        `num_reject` is `mtp_k - accepted`. On a pure-decode step logit rows are
+        token rows. On a mixed step the LM head keeps one row per prefill seq
+        (its last token) and then every decode token, so:
+
+        * a prefill row (they lead the batch) verified a 0-draft span. It
+          rejects nothing, as a pure-prefill step reports it -- left at
+          `mtp_k`, the next step rolls that request's ctx back K positions the
+          moment it decodes, shifting its positions and KV slots, and the
+          acceptance stats count K rejected drafts it never had. Its anchor is
+          its chunk's last TOKEN row, not its logit row.
+        * a decode row's logit row `n_p + j` is token row `n_p_tokens + j`.
+        """
+        if not batch.is_mixed:
+            return
+        n_p = batch.total_seqs_num_prefill
+        num_reject_tokens[:n_p] = 0
+        rows = get_forward_context().attn_metadata.sampled_token_indices
+        anchors.copy_(rows[anchors.long()])
+
     @_profile_runner_stage
     def postprocess(
         self,
@@ -3478,6 +3601,10 @@ class ModelRunner:
             if get_pcp_world_size() > 1 and hasattr(self, "drafter"):
                 verdict = get_pcp_group().broadcast(verdict, src=0)
             num_bonus_tokens, num_reject_tokens, anchors = verdict
+            # Only a mixed step's verdict needs re-expressing in token rows; a
+            # pure step keeps postprocess free of the mixed path entirely.
+            if batch.is_mixed:
+                self._settle_mixed_verdict(batch, num_reject_tokens, anchors)
             next_token_locs = num_bonus_tokens
             spec_counts = verdict[:2]
 
@@ -3884,6 +4011,10 @@ class ModelRunner:
         self.attn_metadata_builder.commit_speculative_state(
             forward_context.attn_metadata, last_token_indices
         )
+        if batch.is_mixed:
+            self.attn_metadata_builder.publish_draft_state(
+                forward_context.attn_metadata
+            )
 
         draft_token = self.drafter.propose(
             target_token_ids=input_ids,

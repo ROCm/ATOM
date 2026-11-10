@@ -559,3 +559,32 @@ def make_tbo_contexts(
         ctx.partner = ctxs[(i + 1) % num_micro_batches]
 
     return ctxs
+
+
+def mixed_tbo_vote(
+    num_scheduled_tokens: np.ndarray,
+    num_reqs: int,
+    num_pref_tokens: int,
+    min_pref: int,
+) -> tuple[bool, bool, int, int]:
+    """Vote using a midpoint over all prefill and decode tokens.
+
+    The minimum-work threshold counts only prefill tokens. The split uses
+    the same `prefill_token_halves` boundary as `split_mixed_token_midpoint`
+    so the per-microbatch collective sizes match the slices being forwarded.
+    """
+    total_tokens = int(
+        np.asarray(num_scheduled_tokens[:num_reqs], dtype=np.int64).sum()
+    )
+    # can_split: two non-empty halves, cut where the split itself cuts.
+    halves = prefill_token_halves(total_tokens)
+    if halves is None:
+        return False, False, 0, 0
+
+    # Both children inherit prefill mode, so the cut must stay inside
+    # prefill: child 0 is pure prefill; child 1 owns the decode suffix.
+    if halves[0] >= num_pref_tokens:
+        return False, False, 0, 0
+
+    meets_min_tokens = not (min_pref > 0 and num_pref_tokens < min_pref)
+    return meets_min_tokens, True, *halves

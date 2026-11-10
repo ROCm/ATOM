@@ -41,7 +41,8 @@ import logging
 import math
 import os
 from collections.abc import Sequence
-from dataclasses import dataclass
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from typing import Any, cast
 
 import numpy as np
@@ -427,6 +428,135 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     kv_indptr_extend: torch.Tensor | None = None
     """[total_tokens + 1] int32 GPU — packed cumsum of `extend_count`."""
 
+    # Mixed target layout; TBO carriers use their own local token coordinates.
+    prefill_attn_metadata: "AttentionMetaData_DSV4 | None" = None
+    decode_attn_metadata: "AttentionMetaData_DSV4 | None" = None
+    num_prefill_tokens: int = 0
+    num_prefill_seqs: int = 0
+    num_decode_tokens: int = 0
+    sampled_token_indices: torch.Tensor | None = None
+
+    @property
+    def is_mixed(self) -> bool:
+        return (
+            self.prefill_attn_metadata is not None
+            and self.decode_attn_metadata is not None
+        )
+
+
+def _mixed_carrier_spans(
+    prefill_meta,
+    decode_meta,
+    n_p_seqs: int,
+    n_d_seqs: int,
+    n_p_tokens: int,
+    running_bs: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """A mixed carrier's whole-batch `(cu_seqlens_q, state_slot_out)`.
+
+    The target forward never reads these on a mixed step: each segment runs
+    under `_segment_forward_context`, which swaps in its own metadata. What
+    reads the carrier is everything around it -- the LM head's mixed gather,
+    and the DSpark drafter (`write_context_kv`, `Drafter.prepare_inputs`, the
+    block pass), which index the whole `[prefill | decode]` batch by request.
+    Built on the device from the two published halves: no H2D, so nothing is
+    published twice.
+
+    `cu_seqlens_q` is the prefill spans, then the decode spans shifted past the
+    prefill tokens; its first `n_p_seqs + 1` entries ARE the prefill spans,
+    which is all the LM head reads. `state_slot_out` is per request, padded to
+    `running_bs` with 0 as `prepare_decode` pads it: under DP `running_bs` is
+    the group's ladder rung and can exceed this rank's batch, and the draft
+    block runs at that width and masks the pad rows' writes itself
+    (`prepare_block`).
+    """
+    cu_seqlens_q = torch.cat(
+        [
+            prefill_meta.cu_seqlens_q[: n_p_seqs + 1],
+            decode_meta.cu_seqlens_q[1 : n_d_seqs + 1] + n_p_tokens,
+        ]
+    )
+    n = n_p_seqs + n_d_seqs
+    state_slot_out = torch.zeros(
+        max(running_bs, n),
+        dtype=prefill_meta.state_slot_out.dtype,
+        device=prefill_meta.state_slot_out.device,
+    )
+    state_slot_out[:n_p_seqs] = prefill_meta.state_slot_out[:n_p_seqs]
+    state_slot_out[n_p_seqs:n] = decode_meta.state_slot_out[:n_d_seqs]
+    return cu_seqlens_q, state_slot_out
+
+
+def _mixed_carrier(
+    prefill_meta: "AttentionMetaData_DSV4",
+    decode_meta: "AttentionMetaData_DSV4",
+    n_p_seqs: int,
+    n_d_seqs: int,
+    n_p_tokens: int,
+    n_d_tokens: int,
+    running_bs: int,
+) -> "AttentionMetaData_DSV4":
+    """The top-level metadata of a mixed batch, or of a TBO ubatch of one.
+
+    The one place it is assembled: `prepare_mixed` builds it for the whole
+    batch and its straddling micro-batch, and a
+    field added to one and not the other is what a second copy invites.
+    """
+    if (
+        prefill_meta.state is AttnState.DECODE
+        or decode_meta.state is not AttnState.DECODE
+    ):
+        raise ValueError("mixed attention requires prefill then decode metadata")
+    cu_seqlens_q, state_slot_out = _mixed_carrier_spans(
+        prefill_meta, decode_meta, n_p_seqs, n_d_seqs, n_p_tokens, running_bs
+    )
+    merged = AttentionMetaData_DSV4(
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=None,
+        max_seqlen_q=max(prefill_meta.max_seqlen_q, decode_meta.max_seqlen_q),
+        max_seqlen_k=max(prefill_meta.max_seqlen_k, decode_meta.max_seqlen_k),
+        min_seqlen_q=0,
+        dropout_p=0.0,
+        has_cached=prefill_meta.has_cached,
+        total_kv=(prefill_meta.total_kv or 0) + (decode_meta.total_kv or 0),
+        state=AttnState.PREFILL_PREFIX,  # mixed always carries a prefill row
+    )
+    merged.prefill_attn_metadata = prefill_meta
+    merged.decode_attn_metadata = decode_meta
+    merged.state_slot_out = state_slot_out
+    # Marker the forward reads to take the mixed branch.
+    merged.num_prefill_tokens = n_p_tokens
+    merged.num_prefill_seqs = n_p_seqs
+    merged.num_decode_tokens = n_d_tokens
+    merged.sampled_token_indices = torch.cat(
+        [
+            cu_seqlens_q[1 : n_p_seqs + 1] - 1,
+            torch.arange(
+                n_p_tokens,
+                n_p_tokens + n_d_tokens,
+                dtype=cu_seqlens_q.dtype,
+                device=cu_seqlens_q.device,
+            ),
+        ]
+    )
+    # One QK-norm/RoPE launch for the whole batch. Negative row IDs mask
+    # prefill's SWA stores: its prefix must survive until prefill attention
+    # finishes. Decode stores remain fused, including in the mixed TBO tail.
+    if decode_meta.swa_dest_rows is not None:
+        merged.batch_id_per_q_token = torch.cat(
+            [
+                torch.full(
+                    (n_p_tokens,), -1, dtype=torch.int32, device=cu_seqlens_q.device
+                ),
+                decode_meta.batch_id_per_q_token[:n_d_tokens],
+            ]
+        )
+        merged.swa_dest_rows = {
+            ratio: torch.cat([rows.new_zeros(n_p_tokens), rows[:n_d_tokens]])
+            for ratio, rows in decode_meta.swa_dest_rows.items()
+        }
+    return merged
+
 
 class DeepseekV4Backend(AttentionBackend):
     """Backend selector entry for V4 hybrid attention.
@@ -459,6 +589,24 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
     `config.kv_cache_block_size` (config.py forces the same value for V4).
     """
 
+    # The prefill builder also publishes compressor/indexer metadata. TBO
+    # rebuilds need their own input, state, indexer and plan groups, but never
+    # the decode-only destination/attention buffers or sampling/input-id groups.
+    mixed_prefill_groups = frozenset(
+        (
+            "early",
+            "seq_metadata",
+            "positions",
+            "v4_state",
+            "v4_indexer",
+            "v4_prefill",
+            "v4_plans",
+            "ub0_metadata",
+            "ub1_metadata",
+        )
+    )
+
+    capture_owns_cu_seqlens_q = True
     block_size = 256
 
     # Set by a subclass that rotates an index key at its compression group's
@@ -1470,6 +1618,64 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 ),
             ]
         return [(runner.v4_csa_idx_kv, "dsv4.csa_indexer")]
+
+    @contextmanager
+    def temporary_profile_cache(self, blocks: int):
+        """Bind scratch KV before sizing the serving pool; no graph uses it."""
+        runner = self.model_runner
+        old_plan = runner.pool_plan
+        old_geometry, old_blocks = self.pool_geometry, self.num_blocks
+        missing = object()
+        saved_runner = {}
+        saved_modules = []
+        try:
+            runner.pool_plan = old_plan.with_paged_entries(blocks)
+            pools = self.allocate_kv_cache_tensors(blocks=blocks, buf=None)
+            for name, value in pools.items():
+                saved_runner[name] = getattr(runner, name, missing)
+                setattr(runner, name, value)
+            pools = self.allocate_per_req_cache(runner.pool_plan.entries)
+            for name, value in pools.items():
+                saved_runner[name] = getattr(runner, name, missing)
+                setattr(runner, name, value)
+            del pools, value
+            self.warmup_per_req_cache()
+            models = [runner.model]
+            if hasattr(runner, "drafter"):
+                models.append(runner.drafter.model)
+            for model in models:
+                for module in model.modules():
+                    before = dict(module.__dict__)
+                    # Assigning an existing registered buffer changes the
+                    # _buffers mapping, not module.__dict__. Keep both axes
+                    # so no warmup placeholder retains the temporary pool.
+                    buffers = dict(module._buffers)
+                    self.build_kv_cache_tensor(module)
+                    changes = {
+                        name: before.get(name, missing)
+                        for name, value in module.__dict__.items()
+                        if value is not before.get(name, missing)
+                    }
+                    saved_modules.append((module, changes, buffers))
+            yield
+        finally:
+            torch.cuda.synchronize()
+            for module, changes, buffers in reversed(saved_modules):
+                for name, value in changes.items():
+                    if value is missing:
+                        delattr(module, name)
+                    else:
+                        setattr(module, name, value)
+                module._buffers.clear()
+                module._buffers.update(buffers)
+            self._invalidate_pool_caches()
+            for name, value in saved_runner.items():
+                if value is missing:
+                    delattr(runner, name)
+                else:
+                    setattr(runner, name, value)
+            self.pool_geometry, self.num_blocks = old_geometry, old_blocks
+            runner.pool_plan = old_plan
 
     def allocate_kv_cache_tensors(self, *, blocks: int, buf) -> dict[str, torch.Tensor]:
         """Allocate KV pools that depend only on `num_blocks`.
@@ -2503,6 +2709,199 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         #   - v4 indexer meta (Indexer — only present when ratio == 4)
         return {}
 
+    def _get_mixed_prefill_bank(self):
+        """Return the preallocated metadata publication bank for this ring slot.
+
+        Prefill uploads and decode staging use separate buffers. The bank shares
+        the slot lifetime; uploads and forward reads are ordered on its stream."""
+        banks = getattr(self, "_mixed_prefill_banks", None)
+        if banks is None:
+            # Building here would allocate mid-serve, after the KV cache took
+            # the memory the profile left.
+            raise RuntimeError(
+                "mixed prefill banks were not built: the runner calls "
+                "build_mixed_prefill_banks() before warmup when "
+                "--enable-mixed-prefill-decode is set"
+            )
+        return banks[getattr(self.model_runner, "_fv_idx", 0)]
+
+    def build_mixed_prefill_banks(self) -> None:
+        """Allocate V4 prefill metadata banks before warmup so memory profiling includes them."""
+        runner = self.model_runner
+        ring = getattr(runner, "_fv_ring", None) or [runner.forward_vars]
+        private_groups = getattr(
+            self, "mixed_prefill_groups", self.mixed_prefill_groups
+        )
+        banks = {}
+        for slot, forward_vars in enumerate(ring):
+            # `clone()` carries `pin_memory`: an unpinned source would make
+            # `copy_(non_blocking=True)` synchronous.
+            private = {
+                name: val.clone()
+                for name, val in forward_vars.items()
+                if isinstance(val, CpuGpuBuffer)
+                and (
+                    val.publication_group in private_groups
+                    or name == "batch_id_per_q_token"
+                )
+            }
+            variables = {**forward_vars, **private}
+            owner = groups = None
+            if getattr(runner, "h2d_groups", None) is not None:
+                # Binding a shared buffer again would steal it from the live
+                # slot's owner. Only the clones belong to this publication slot.
+                owner, groups = runner.build_h2d_slot(
+                    private, torch.cuda.Event(), partial=True
+                )
+            banks[slot] = (variables, owner, groups)
+        self._mixed_prefill_banks = banks
+
+    @contextmanager
+    def mixed_prefill_bank_selected(self):
+        """Select and restore the V4 prefill bank and its H2D publication state."""
+        runner = self.model_runner
+        variables, owner, groups = self._get_mixed_prefill_bank()
+        saved = (
+            runner.forward_vars,
+            getattr(runner, "h2d_owner", None),
+            getattr(runner, "h2d_groups", None),
+        )
+        runner.forward_vars = variables
+        if owner is not None:
+            runner.h2d_owner, runner.h2d_groups = owner, groups
+        try:
+            yield variables
+        finally:
+            # Restore even on error so a failed mixed build can't leave the
+            # runner pointed at the bank.
+            runner.forward_vars = saved[0]
+            if owner is not None:
+                runner.h2d_owner, runner.h2d_groups = saved[1], saved[2]
+
+    @contextmanager
+    def mixed_prefill_bank_active(self, batch: ScheduledBatch):
+        """Build the prefill half of a mixed batch inside the bank.
+
+        Selects the bank, and opens one publication epoch on its owner, sealed
+        on exit, so the prefill producers publish into it under the same ledger
+        rules as an ordinary step. A failure fails the bank's owner, as it would
+        the runner's.
+
+        Also publishes the bank's `cu_seqlens_q`. It is the one buffer the
+        prefill path READS rather than fills (`prepare_prefill` cross-checks
+        against it), and `publish_query_metadata` gives the runner's own copy the
+        decode segment's spans on a mixed step -- so the prefill segment's spans
+        are written here, from the same `num_scheduled_tokens`.
+        """
+        _, owner, _ = self._get_mixed_prefill_bank()
+        if owner is not None:
+            owner.begin()
+        try:
+            with self.mixed_prefill_bank_selected() as variables:
+                n_p_seqs = batch.total_seqs_num_prefill
+                self.publish_query_metadata(
+                    np.asarray(batch.num_scheduled_tokens[:n_p_seqs], dtype=np.int32),
+                    n_p_seqs,
+                    batch.total_tokens_num_prefill,
+                )
+                yield variables
+        except BaseException:
+            if owner is not None:
+                owner.fail()
+            raise
+        else:
+            if owner is not None:
+                owner.finish()
+
+    def prepare_mixed(self, batch, running_bs, running_tokens, ubatch_slices=None):
+        """Build each segment once using the ordinary stage/publish/finish path.
+
+        Mixed TBO cuts inside prefill, leaving decode entirely in the last
+        micro-batch. Build the prefill children in their private bank and
+        attach that same decode metadata to the last child.
+        """
+        n_p = batch.total_seqs_num_prefill
+        n_d = batch.total_seqs_num_decode
+        t_p = batch.total_tokens_num_prefill
+        t_d = batch.total_tokens_num_decode
+        prefill_batch = batch.slice_rows(0, n_p)
+        decode_batch = batch.slice_rows(n_p, batch.total_seqs_num)
+        prefill_slices = None
+        if ubatch_slices:
+            if any(ub.token_slice.stop >= t_p for ub in ubatch_slices[:-1]):
+                raise ValueError("mixed TBO must keep decode in its final micro-batch")
+            prefill_slices = tuple(
+                replace(
+                    ub,
+                    request_slice=slice(
+                        ub.request_slice.start, min(ub.request_slice.stop, n_p)
+                    ),
+                    token_slice=slice(
+                        ub.token_slice.start, min(ub.token_slice.stop, t_p)
+                    ),
+                    scheduled_token_slice=slice(
+                        ub.token_slice.start, min(ub.token_slice.stop, t_p)
+                    ),
+                    running_bs=ub.num_prefill_seqs,
+                    num_prefill_tokens=None,
+                    num_prefill_seqs=None,
+                )
+                for ub in ubatch_slices
+            )
+        with self.mixed_prefill_bank_active(prefill_batch):
+            prefill_meta, prefill_positions = self.prepare_prefill(
+                prefill_batch, n_p, t_p, prefill_slices, None
+            )
+
+        if decode_batch.block_table_rows != list(
+            range(n_d)
+        ) or decode_batch.state_rows != list(range(n_d)):
+            raise ValueError("V4 decode rows must each have KV pages and a state slot")
+        rejected = self.model_runner.tokenID_processor.num_rejected
+        if rejected is not None and len(rejected) != batch.total_seqs_num:
+            raise ValueError("num_rejected is not aligned with mixed batch rows")
+        rejected = np.zeros(n_d, dtype=np.int32) if rejected is None else rejected[n_p:]
+        lengths = np.asarray(decode_batch.num_scheduled_tokens, dtype=np.int32)
+        cu = self.model_runner.forward_vars["cu_seqlens_q"].np[: n_d + 1]
+        if cu[0] != 0 or not np.array_equal(cu[1:], np.cumsum(lengths)):
+            raise RuntimeError("cu_seqlens_q does not contain decode-local spans")
+        max_q = int(lengths.max())
+        group = self.model_runner.h2d_groups["decode_metadata"]
+        decode_meta, decode_positions = self.stage_decode(
+            decode_batch,
+            n_d,
+            t_d,
+            max_q,
+            group,
+            num_rejected=rejected if batch.num_spec_step else None,
+        )
+        group.publish()
+        self.finish_decode(decode_batch, decode_meta, n_d, t_d, max_q)
+        merged = _mixed_carrier(
+            prefill_meta, decode_meta, n_p, n_d, t_p, t_d, running_bs
+        )
+        if ubatch_slices:
+            children = list(prefill_meta.ubatches)
+            last = ubatch_slices[-1]
+            children[-1] = _mixed_carrier(
+                children[-1],
+                decode_meta,
+                last.num_prefill_seqs,
+                n_d,
+                last.num_prefill_tokens,
+                t_d,
+                last.running_bs,
+            )
+            merged.ubatches = children
+        positions = torch.cat((prefill_positions[:t_p], decode_positions[:t_d]))
+        return merged, positions
+
+    def publish_draft_state(self, metadata):
+        """Publish whole-batch state slots to the draft graph's fixed input buffer."""
+        slots = metadata.state_slot_out
+        buf = self.model_runner.forward_vars["v4_meta_state_slot_out"].gpu
+        buf[: slots.shape[0]].copy_(slots)
+
     def stage_decode(
         self,
         batch: ScheduledBatch,
@@ -2510,6 +2909,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         running_tokens: int,
         max_seqlen_q: int,
         group,
+        *,
+        num_rejected: np.ndarray | None = None,
     ):
         """V4-style decode staging: positions, context lens, block tables, the
         state slots and the compression plans, counted into ``group``."""
@@ -2526,14 +2927,15 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # MTP: `seq.num_tokens` runs past this fwd's window by
         # `verify_ctx_lens()` (`num_rejected` deferred, 1 undeferred/PP);
         # roll ctx back so positions overwrite last fwd's rejected-draft slots.
-        # None on dummy runs and before the first sampler output.
+        # Counts are absent before the first sampler output; idle DP steps
+        # have no request contexts to shift.
         # The rolled-back ctx is also what anchors `positions` (at `ctx -
         # full_q`, below), and every compress count is now `visible_*(pos)`, so
         # a rejected slot's KV falls out of range on its own — `block_tables`
         # needs no truncation here.
-        if max_seqlen_q > 1:
+        if max_seqlen_q > 1 or num_rejected is not None:
             context_lens_np = self.model_runner.tokenID_processor.verify_ctx_lens(
-                context_lens_np
+                context_lens_np, num_rejected=num_rejected
             )
         # DSpark q-shrink: anchor the forwarded q tokens to the draft span HEAD
         # (ctx-full_q), not the tail, so they stay in [ctx-full_q .. ctx-1] (never

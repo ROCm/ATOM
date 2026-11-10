@@ -4,9 +4,11 @@ ATOM (AiTer Optimized Model) uses a prefill-first scheduler with paged KV cache 
 
 ## Quick reference
 
-| Class | File | Purpose |
+| Component | File | Purpose |
 |---|---|---|
 | `Scheduler` | `atom/model_engine/scheduler.py` | Orchestrates prefill/decode scheduling, preemption, and postprocessing |
+| `profile_mixed_memory` | `atom/model_engine/mixed_profile.py` | Mixed attention workspace profiling before KV sizing |
+| `capture_aux` | `atom/spec_decode/aux_capture.py` | Runtime aux capture for compiled target forwards |
 | `EngineStats` | `atom/model_engine/engine_stats.py` | MTP acceptance, prefix-cache hit, and throughput statistics |
 | `ScheduledBatch` | `atom/model_engine/scheduler.py` | Immutable snapshot of a scheduled batch sent to the model runner |
 | `ScheduledBatchOutput` | `atom/model_engine/scheduler.py` | Holds sampled token IDs and draft token IDs returned from forward pass |
@@ -360,7 +362,7 @@ That number, `successor_room`, is mutability quantified. A rolling state (GDN re
 
 **A store takes what its image needs and nothing more.** `begin_store` asks for `units_per_checkpoint`, and `ensure_free_units` spends checkpoints only for the shortfall — free units come first, and `pop` hands out never-used blocks before cached ones, so a store reaches for the cache only once the pool has nothing spare. A store whose units are not reachable is dropped and counted in `checkpoints_dropped`, and it is dropped *before* evicting anything: eviction gives up only after it has emptied the cache, so an unreachable request would destroy the cache on its way to refusing.
 
-**There is no floor held back for live KV, and there cannot usefully be one.** `_fresh_block` raises when the pool is dry and nothing is evictable, so it is worth stating why the cache cannot take it there. A READY unpinned checkpoint is *already* available to live KV — `has_available_units` counts it and `ensure_free_units` will spend it — so the size of the cache is not the variable. What competes is the unevictable set, a checkpoint that is `COPYING` or held by a restore pin, and that set is confined to one pass: `schedule` publishes the previous batch's stores and releases its pins before it allocates anything, and this batch's stores are taken at batch construction, after every allocation. The one overlap is `allocate`, which pins a restore and then asks for fresh blocks in the same pass — and its own `can_allocate` counted that pin, protecting the checkpoint it is about to take and skipping the pins earlier admissions took. `may_append` never overlaps at all: the decode loop runs only in a pass that scheduled no prefill, so its pins were released at the top of it. Under contention the reachable outcome is therefore a refused admission, which the next pass retries, and never the raise. A floor would not improve on that in any case: live KV's demand is unbounded and legitimate — `allocate` takes a whole prompt's blocks, up to `max_model_len` of them — so no reserved quantity can promise it a block. *(The decode half of this rests on prefill and decode never sharing a pass; the mixed batch the scheduler has a TODO for would need the argument redone.)*
+**There is no floor held back for live KV, and there cannot usefully be one.** `_fresh_block` raises when the pool is dry and nothing is evictable, so it is worth stating why the cache cannot take it there. A READY unpinned checkpoint is *already* available to live KV — `has_available_units` counts it and `ensure_free_units` will spend it — so the size of the cache is not the variable. What competes is the unevictable set, a checkpoint that is `COPYING` or held by a restore pin, and that set is confined to one pass: `schedule` publishes the previous batch's stores and releases its pins before it allocates anything, and this batch's stores are taken at batch construction, after every allocation. The one overlap is `allocate`, which pins a restore and then asks for fresh blocks in the same pass — and its own `can_allocate` counted that pin, protecting the checkpoint it is about to take and skipping the pins earlier admissions took. `may_append` follows `can_append`, and the two ask about the same eligible set (`_is_evictable`): pins a mixed step's prefill admissions took earlier in the pass are outside it for both, and nothing is consumed between them -- the decode loop may preempt in between, which only frees. Under contention the reachable outcome is therefore a refused admission or a skipped decode, which the next pass retries, and never the raise. A floor would not improve on that in any case: live KV's demand is unbounded and legitimate — `allocate` takes a whole prompt's blocks, up to `max_model_len` of them — so no reserved quantity can promise it a block. *(The decode half used to rest on prefill and decode never sharing a pass; under mixed batching they do, and the argument above is the one that holds.)*
 
 **Eligibility and eviction policy are separate.** `_is_evictable` says whether a checkpoint may be spent — READY, unpinned, not the one the caller is protecting — and is the single rule `has_available_units` and `ensure_free_units` share. `_next_victim` says which eligible one to spend first, and is the only place the policy lives: least recently used today, one method to replace for another. `has_available_units` asks whether the eligible set reaches a count, which the order it is walked in cannot change -- only how soon the loop gets there -- so a new policy can change which checkpoint is spent and never what the gate answers. The refusal for an unreachable count sits in `ensure_free_units` itself rather than in a caller, because the bare loop gives up only after it has emptied the cache.
 
@@ -812,8 +814,103 @@ def num_tokens(self, value):
 |---|---|
 | `atom/model_engine/scheduler.py` | `Scheduler`, `ScheduledBatch`, `ScheduledBatchOutput` — scheduling algorithm, postprocessing |
 | `atom/model_engine/engine_stats.py` | `EngineStats` — speculative-decode acceptance, prefix-cache hit, and throughput statistics |
+| `atom/model_engine/mixed_profile.py` | Real mixed attention workspace profiling before KV sizing |
+| `atom/spec_decode/aux_capture.py` | Runtime aux capture for compiled target forwards |
 | `atom/model_engine/block_manager.py` | `Block`, `BlockManager` — paged KV cache block pool, allocation/deallocation, prefix caching with xxhash64 |
 | `atom/model_engine/sequence.py` | `Sequence`, `SequenceStatus`, `SequenceType` — request lifecycle, token management, timing |
 | `atom/model_engine/request.py` | `RequestOutput` — streaming output dataclass with `request_id`, `output_tokens`, `finished`, `finish_reason` |
 | `atom/config.py` | `Config` — scheduling-related fields (`max_num_seqs`, `max_num_batched_tokens`, `kv_cache_block_size`, `enable_prefix_caching`, `scheduler_delay_factor`), `SpeculativeConfig` |
 | `atom/sampling_params.py` | `SamplingParams` — `temperature`, `max_tokens`, `ignore_eos`, `stop_strings` |
+
+## Mixed prefill and decode on DeepSeek V4
+
+`--enable-mixed-prefill-decode` packs a batch as `[prefill | decode]`.
+The feature requires chunked prefill. DSpark and TBO are supported;
+PCP, DCP, EPLB, TR_HYBRID graph modes, other speculative methods, and
+speculative decoding with pipeline parallelism are rejected at startup.
+Expert parallelism alone does not enable EPLB.
+
+### Scheduling
+
+Prefill and decode share `max_num_batched_tokens`. A decode row costs
+`decode_spec_width + 1` tokens, including speculative verification. The
+scheduler reserves that demand for running decodes while retaining at least
+one eighth of the token budget for prefill progress. At high decode load,
+decode admission follows FCFS order. Tail requests may wait until earlier
+decodes finish or the long prefill ends; this policy does not rotate them.
+
+New-prompt admission also reserves the eligible running decodes' append-page
+demand. A new prompt that would consume those pages stays in the waiting
+queue, rather than forcing an older decode to discard its KV and recompute.
+The scheduler calculates token and page reservations once per tick and
+passes them to the delayer, pending/cost/head probes, and actual admission.
+This reservation does not allocate pages and includes speculative lookahead.
+It excludes requests already scheduled as prefill in the current step, while
+including completed prefills waiting for their first decode.
+
+### Attention execution
+
+Dense projection, QK normalization, RoPE, and the output projection run on
+the combined token tensor. The attention tail dispatches the prefill and
+decode segments to their respective compressors, indexer, and sparse kernels.
+The combined QK/RoPE kernel fuses decode SWA stores. Prefill tokens carry a
+negative store mask, so their window is written only after prefill attention
+has consumed the preceding chunk's KV.
+BF16 attention writes each segment's output into its consumed query slice;
+FP8 attention allocates a separate BF16 output buffer.
+
+`ScheduledBatch.slice_rows` owns the distinction between request fields,
+token fields, request-keyed maps, and filtered state/page rows. It rejects
+unclassified fields rather than passing parent data through to a segment.
+The V4 builder passes resolved rejection counts explicitly to decode
+preparation, which uses the common context rollback helper. The V4 carrier
+owns segment boundaries and a sampled-token row map shared by the LM head,
+draft verification, and anchor settlement; Context does not duplicate them.
+
+V4 owns separate publication banks for prefill metadata and decode metadata.
+Each bank has its own host sources, device destinations, and H2D ownership.
+They are allocated before memory profiling and follow forward-slot reuse.
+The common attention builder retains whole-batch query-span semantics;
+only V4 publishes decode-local spans for its mixed dispatch.
+
+TBO splits mixed batches only when the cut lies inside prefill. Its first
+microbatch is pure prefill and the second holds the remaining prefill tokens
+and every decode token. Both use the same carrier construction and SWA-mask
+rules as an unsplit mixed batch. Segment state is checked when that carrier
+is built, rather than repeatedly in every model layer.
+The builder stages, publishes, and finishes both segments before launching
+the TBO workers. Prefill microbatch metadata lives in the private prefill
+bank; the last mixed microbatch reuses the already-built decode metadata.
+With either setting of the mixed flag, DSpark aux hooks read the live
+microbatch offset or decode token permutation through an opaque operation
+so compiled target regions do not retain a stale write destination.
+
+### Startup memory profiling
+
+Dummy warmup does not exercise V4 attention because KV has not been bound.
+Mixed startup therefore binds a temporary KV pool and runs real forwards
+before the serving pool is sized. It samples prefill-heavy, balanced, and
+decode-heavy shapes within the configured token and sequence limits, at
+short contexts, then with one prefill request and one decode request at the
+maximum valid context. The remaining histories stay short, bounding logical
+KV work instead of multiplying the context limit by maximum concurrency.
+Both sweeps retain the full scheduled token and sequence shapes; the persistent
+decode logits workspace is already included in the memory baseline.
+DSpark covers both full-width verification
+and q=1, retaining the full draft width in both cases. With TBO enabled, it
+profiles both the configured path and unsplit forwards: a decode-only DP
+rank can veto splitting for the whole group, increasing the per-forward
+workspace without changing the scheduled token budget. Allocator caches
+are retained across both sweeps, and the original TBO settings are restored
+before serving.
+
+Old history can share a read-only zero page during this allocation profile;
+current writes use private pages and state slots. Temporary KV bindings are
+released before allocating the serving pool. The budget uses the measured
+allocation/cache high-water mark with temporary KV subtracted, along with
+the non-PyTorch and safety allowances. The graph estimate is saved from
+ordinary warmup before the eager mixed sweep; mixed workspace is counted
+once, without increasing graph-pool estimates. The sweep returns its peak
+and non-PyTorch usage to a single final KV budget calculation. There is no fixed
+5% mixed reserve. The sampled peak is configuration-dependent; it does not
+prove that every future allocator fragmentation pattern is bounded.

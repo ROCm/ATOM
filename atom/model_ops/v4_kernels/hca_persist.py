@@ -174,6 +174,7 @@ def hca_persist_decode(
     unified_kv_rope: torch.Tensor,
     q_packed_in: torch.Tensor,
     q_rope_in: torch.Tensor,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """HCA decode of the ``N = q_packed_in.shape[0]`` rows the ASM path would
     run (``kv_indptr[:N + 1]``; an eager forward may have N < T_pad)."""
@@ -190,9 +191,15 @@ def hca_persist_decode(
             "hca_persist: no workspace on this device and the stream is "
             "capturing; call prepare() before CUDA-graph capture"
         )
-    out = torch.empty((n, HEADS, _DIM), dtype=torch.bfloat16, device=q_packed_in.device)
+    destination = out
+    if out is None or not out.is_contiguous():
+        out = torch.empty(
+            (n, HEADS, _DIM), dtype=torch.bfloat16, device=q_packed_in.device
+        )
     if n == 0:
-        return out
+        return (
+            out if destination is None or destination is out else destination.copy_(out)
+        )
     mla_decode_fwd_v4_nm_ps(
         q_packed_in.contiguous(),
         q_rope_in.contiguous(),
@@ -214,4 +221,4 @@ def hca_persist_decode(
         idx,
         n,
     )
-    return out
+    return out if destination is None or destination is out else destination.copy_(out)

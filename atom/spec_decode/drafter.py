@@ -18,6 +18,7 @@ from atom.distributed.pcp_utils import (
 )
 from atom.model_loader.loader import load_model
 from atom.models.utils import PPMissingLayer
+from atom.spec_decode.aux_capture import capture_aux
 from atom.spec_decode.draft_graph import DraftGraph
 from atom.utils import CpuGpuBuffer, resolve_obj_by_qualname
 from atom.utils.forward_context import (
@@ -513,11 +514,12 @@ class Drafter(abc.ABC):
     def _make_aux_hook(self, buf_idx: int, extract):
         buffer = self._aux_buffers[buf_idx]
 
-        def write(tensor, tokens):
-            # In-place write into the fixed buffer (cudagraph-safe).
-            buffer[tokens] = tensor
+        def hook(module, _inputs, output):
+            tensor = extract(output, module)
+            if tensor is not None:
+                capture_aux(tensor, buffer)
 
-        return _aux_hook(extract, write)
+        return hook
 
     def aux_for(self, target_hidden_states: torch.Tensor) -> list[torch.Tensor] | None:
         """The target aux hidden states captured during the last forward,

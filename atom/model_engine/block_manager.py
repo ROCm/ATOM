@@ -136,6 +136,7 @@ class AdmissionProbe:
     num_cached_blocks: int = -1
     block_hashes: list[int] = field(default_factory=list)
     num_new_blocks: int | None = None
+    reserved_decode_blocks: int = 0
 
 
 # Evicted or remapped hashes kept for `_CachedWalk` revalidation; a memo
@@ -632,24 +633,21 @@ class BlockManager:
 
         The raise is unreachable through `Scheduler` and the checkpoint cache
         cannot make it reachable: a READY unpinned checkpoint counts as
-        available, and both callers sit behind a pin-aware check in the same
-        pass. `allocate` protects the checkpoint it is about to pin -- the
-        joint boundary when that image is in HBM, otherwise the HBM-hit
-        checkpoint -- and sees the pin taken before the fresh blocks.
-        `may_append` runs only in a pass that scheduled no prefill
-        (`scheduler.py`, `if num_seqs_prefill > 0` returns first), so every
-        pin was already released at the top of that pass -- except for the
-        draft lookahead an admission allocates right after its `allocate`.
-        `can_allocate` charged those blocks (`draft_lookahead_blocks`) against
-        the HBM-hit checkpoint; when a joint needs more, `_fit_joint` charges
-        that same demand plus the private tail against the checkpoint
-        `allocate` will pin. Under contention the reachable outcome is a
-        refused admission, not this.
-
-        That second half rests on prefill and decode never sharing a pass. If
-        the mixed batch that `scheduler.py` has a TODO for lands, `may_append`
-        starts running alongside this pass's pins and the argument has to be
-        redone.
+        available, and each caller sits right behind a pin-aware check that
+        counts the same set. `allocate` protects the checkpoint it is about to
+        pin -- the joint boundary when that image is in HBM, otherwise the
+        HBM-hit checkpoint -- and sees the pin taken before the fresh blocks,
+        and the draft lookahead an admission allocates right after its
+        `allocate` included: `can_allocate` charged those blocks
+        (`draft_lookahead_blocks`) against the HBM-hit checkpoint, and when a
+        joint needs more, `_fit_joint` charges that same demand plus the private
+        tail against the checkpoint `allocate` will pin. `may_append` follows
+        `can_append`, and both ask about the same eligible set (`_is_evictable`:
+        READY, unpinned): pins this pass's prefill admissions took -- a mixed
+        step's -- are outside it for both, and nothing is consumed between the
+        two (the scheduler's decode loop may preempt in between, which only
+        frees). Under contention the reachable outcome is a refused admission
+        or a skipped decode, not this.
         """
         if not self._ensure_page_units(1):
             raise AssertionError("No PAGE unit available for a fresh KV block")
@@ -1184,6 +1182,7 @@ class BlockManager:
         *,
         block_hashes: list[int] | None = None,
         probe: AdmissionProbe | None = None,
+        reserved_decode_blocks: int = 0,
     ) -> int:
         """Return number of cache-hit blocks (>=0) if seq fits, else -1.
 
@@ -1210,11 +1209,23 @@ class BlockManager:
         avoiding a second hash pass.
         """
         if probe is None:
-            return self._evaluate(seq, self._admission_walk, record, block_hashes)
+            return self._evaluate(
+                seq,
+                self._admission_walk,
+                record,
+                block_hashes,
+                reserved_decode_blocks=reserved_decode_blocks,
+            )
         assert block_hashes is None, "the probe carries its own chain"
         probe.num_new_blocks = None
+        probe.reserved_decode_blocks = reserved_decode_blocks
         probe.num_cached_blocks = self._evaluate(
-            seq, self._admission_walk, record, probe.block_hashes, probe
+            seq,
+            self._admission_walk,
+            record,
+            probe.block_hashes,
+            probe,
+            reserved_decode_blocks=reserved_decode_blocks,
         )
         return probe.num_cached_blocks
 
@@ -1225,6 +1236,8 @@ class BlockManager:
         record: bool,
         block_hashes: list[int] | None,
         probe: AdmissionProbe | None = None,
+        *,
+        reserved_decode_blocks: int = 0,
     ) -> int:
         """`can_allocate` over the walk `walk_of(seq)` returns; everything but
         the walk is asked afresh on every call. `probe.num_new_blocks` is set
@@ -1238,9 +1251,12 @@ class BlockManager:
             block_hashes.clear()
         if seq.has_per_req_cache and not self.state.has_free(self.state_slots_per_req):
             return -1
+        reserved = reserved_decode_blocks
         if not self.enable_prefix_caching:
             if not self._has_page_units(
-                self.num_pool_blocks(len(seq)) + self.draft_lookahead_blocks(len(seq))
+                self.num_pool_blocks(len(seq))
+                + self.draft_lookahead_blocks(len(seq))
+                + reserved
             ):
                 return -1
             return 0
@@ -1301,7 +1317,7 @@ class BlockManager:
             protected_hash=protected_hash,
         )
         self._record_checkpoint_end(seq)
-        if not self._has_page_units(num_new_blocks, protected_hash):
+        if not self._has_page_units(num_new_blocks + reserved, protected_hash):
             return -1
         # `record_allocation` re-checks a joint against this demand instead of
         # walking the hit again.
@@ -1376,7 +1392,9 @@ class BlockManager:
         if not decision.state_from_hbm and extra == 0:
             return decision
         protected = decision.boundary_hash if decision.state_from_hbm else None
-        if self._has_page_units(num_new_blocks + extra, protected):
+        if self._has_page_units(
+            num_new_blocks + extra + probe.reserved_decode_blocks, protected
+        ):
             return decision
         reason = (
             "partial_chunk_no_room"
@@ -1488,7 +1506,9 @@ class BlockManager:
             return None
         return walk
 
-    def can_allocate_memoized(self, seq: Sequence) -> int:
+    def can_allocate_memoized(
+        self, seq: Sequence, *, reserved_decode_blocks: int = 0
+    ) -> int:
         """`can_allocate(seq, record=False)` for the delayer and the DP chunk
         cost, with the walk memoised per seq. The same `_evaluate`, so state
         room, the gates, the replay, checkpoint demand/end, the used hit blocks
@@ -1502,7 +1522,9 @@ class BlockManager:
         by a publish of that hash), and token count and seed are unchanged.
         """
         walk_of = self._memoised_walk if self.walk_memo else self._walk_prefix
-        return self._evaluate(seq, walk_of, False, None)
+        return self._evaluate(
+            seq, walk_of, False, None, reserved_decode_blocks=reserved_decode_blocks
+        )
 
     def _memoised_walk(self, seq: Sequence) -> _PrefixWalk:
         memo = self._cached_walks.get(seq)
@@ -3651,13 +3673,21 @@ class BlockManager:
         (`mtp_k - 1`), so the lookahead never raises the bar there; it is
         passed so the check states what it covers.
         """
+        return self._has_page_units(
+            self.append_blocks_needed(seq, num_new_tokens, lookahead)
+        )
+
+    def append_blocks_needed(
+        self, seq: Sequence, num_new_tokens: int = 1, lookahead: int = 0
+    ) -> int:
+        """Free pages needed by the decode admission check, before allocating."""
         seq_len = len(seq)
         current_blocks = len(seq.block_table)
         ebs = self._effective_block_size()
         reach = seq_len + max(num_new_tokens, lookahead)
         needed_blocks = (reach + ebs - 1) // ebs
         new_blocks_needed = max(0, needed_blocks - current_blocks)
-        return self._has_page_units(new_blocks_needed)
+        return new_blocks_needed
 
     def may_append(self, seq: Sequence, num_new_tokens: int = 1, lookahead: int = 0):
         """Allocate every block this step's KV writes land in.
