@@ -37,6 +37,29 @@ def test_bf16_opus_row_strided_destination(monkeypatch):
     torch.testing.assert_close(out, q + 1)
 
 
+def test_native_triton_receives_original_strided_output(monkeypatch):
+    q = torch.arange(24.0).reshape(3, 2, 4)
+    parent = torch.full((8, 2, 4), -99.0)
+    out = parent[1:7:2]
+    seen = []
+
+    def native(*args, out=None):
+        seen.append(out)
+        return out.copy_(q + 1)
+
+    monkeypatch.setattr(paged_2src.envs, "ATOM_FORCE_ATTN_TRITON", True)
+    monkeypatch.setattr(paged_2src, "get_gfx", lambda: "gfx950")
+    monkeypatch.setattr(paged_2src, "_sparse_attn_v4_paged_2src_triton", native)
+    indices = torch.empty(0, dtype=torch.int32)
+    indptr = torch.zeros(4, dtype=torch.int32)
+    result = paged_2src.sparse_attn_v4_paged_2src(
+        q, q[0], indices, indptr, q[0], indices, indptr, torch.zeros(2), 0.5, out=out
+    )
+    assert result is out and len(seen) == 1 and seen[0] is out
+    torch.testing.assert_close(out, q + 1)
+    assert torch.all(parent[[0, 2, 4, 6, 7]] == -99)
+
+
 @pytest.mark.parametrize("backend", ["opus", "asm", "asm_fallback"])
 @pytest.mark.parametrize("legacy", [False, True])
 @pytest.mark.parametrize("supplied_output", [False, True])
@@ -280,5 +303,42 @@ def test_bf16_opus_prefill_output_layout(monkeypatch, query_rows_strided, layout
     assert result is out and len(calls) == 2
     assert calls[1].stride() == q.stride()
     assert (calls[1] is out) == (out.stride() == q.stride())
+    torch.testing.assert_close(result, expected, rtol=0, atol=0)
+    assert torch.all(parent[untouched] == -99)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires ROCm GPU")
+@pytest.mark.parametrize("layout", ["contiguous", "rows", "features", "transposed"])
+def test_native_triton_prefill_preserves_output_on_device(monkeypatch, layout):
+    if paged_2src.get_gfx() == "gfx1250":
+        pytest.skip("gfx1250 dispatches to the AITER fallback")
+    monkeypatch.setattr(paged_2src.envs, "ATOM_FORCE_ATTN_TRITON", True)
+    native = paged_2src._sparse_attn_v4_paged_2src_triton
+    seen = []
+
+    def record_destination(*args, **kwargs):
+        seen.append(kwargs.get("out"))
+        return native(*args, **kwargs)
+
+    monkeypatch.setattr(
+        paged_2src, "_sparse_attn_v4_paged_2src_triton", record_destination
+    )
+    torch.manual_seed(41)
+    n, heads, dim = 3, 16, 512
+    q = torch.randn(n, heads, dim, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(15, dim, device="cuda", dtype=q.dtype)
+    extend = torch.randn(n, dim, device="cuda", dtype=q.dtype)
+    indices = torch.arange(15, device="cuda", dtype=torch.int32)
+    indptr = torch.tensor([0, 3, 8, 15], device="cuda", dtype=torch.int32)
+    ext_indices = torch.tensor([0, 0, 1, 0, 1, 2], device="cuda", dtype=torch.int32)
+    ext_indptr = torch.tensor([0, 1, 3, 6], device="cuda", dtype=torch.int32)
+    sink = torch.randn(heads, device="cuda", dtype=torch.float32)
+    args = (q, kv, indices, indptr, extend, ext_indices, ext_indptr, sink, dim**-0.5)
+    expected = paged_2src.sparse_attn_v4_paged_2src(*args)
+    parent, out = _output_slice(n, heads, dim, q.dtype, layout)
+    out.zero_()
+    untouched = parent == -99
+    result = paged_2src.sparse_attn_v4_paged_2src(*args, out=out)
+    assert result is out and len(seen) == 2 and seen[1] is out
     torch.testing.assert_close(result, expected, rtol=0, atol=0)
     assert torch.all(parent[untouched] == -99)

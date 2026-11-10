@@ -730,20 +730,16 @@ def sparse_attn_v4_paged_2src(
             ),
             out,
         )
-    return call_with_output(
-        _sparse_attn_v4_paged_2src_triton,
-        (
-            q,
-            unified_kv,
-            kv_indices_prefix,
-            kv_indptr_prefix,
-            kv,
-            kv_indices_extend,
-            kv_indptr_extend,
-            attn_sink,
-            softmax_scale,
-        ),
-        out,
-        output_strides=q.stride(),
-        supports_output=True,
+    # Native Triton kernels use independent Q and output strides.
+    return _sparse_attn_v4_paged_2src_triton(
+        q,
+        unified_kv,
+        kv_indices_prefix,
+        kv_indptr_prefix,
+        kv,
+        kv_indices_extend,
+        kv_indptr_extend,
+        attn_sink,
+        softmax_scale,
+        out=out,
     )
