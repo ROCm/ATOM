@@ -437,10 +437,11 @@ class EngineArgs:
             "--moe-backend",
             type=str,
             default="standard",
-            choices=["standard", "mega"],
+            choices=["standard", "mega", "mega_internode"],
             help="MoE implementation. 'standard' uses the existing "
             "prepare/GEMM/finalize path; 'mega' uses fused FlyDSL MegaMoE, "
-            "or AITER MegaMoeTP under --sequence-parallel-size.",
+            "or AITER MegaMoeTP under --sequence-parallel-size; "
+            "'mega_internode' uses aiter MegaMoEInternode for two-node EP16 A4W4.",
         )
         parser.add_argument(
             "--method",

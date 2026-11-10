@@ -23,6 +23,10 @@ def is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
     routed_expert_prefix: str | None = None,
 ) -> bool:
     config = get_current_atom_config()
+    if getattr(config, "moe_backend", "standard") == "mega_internode":
+        # The internode kernel owns contiguous routed experts; shared experts
+        # retain their independent MLP and quantization.
+        return False
     if quant_config is None:
         quant_config = config.quant_config
 

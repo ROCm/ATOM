@@ -699,6 +699,10 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                     "unsupported on the inter-node MoRI kernels."
                 )
 
+            from atom.model_ops.fused_moe.mori_chunked_experts import benchmark_chunk_size
+
+            moe_chunk_size = benchmark_chunk_size()
+            mori_capacity = min(moe.max_num_tokens, moe_chunk_size) if moe_chunk_size else moe.max_num_tokens
             all_to_all_args = {
                 "rank": all2all_manager.rank,
                 "num_ep_ranks": all2all_manager.world_size,
@@ -708,7 +712,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 "token_hidden_size": moe.hidden_dim,
                 "scale_dim": scale_dim,
                 "scale_type_size": scale_type_size,
-                "max_num_tokens_per_dp_rank": moe.max_num_tokens,
+                "max_num_tokens_per_dp_rank": mori_capacity,
                 # input_dtype=moe.in_dtype,
                 "input_dtype": moe.in_dtype,
                 "num_local_experts": moe.num_local_experts,
@@ -734,7 +738,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
 
             prepare_finalize = MoriPrepareAndFinalize(
                 mori_ops,
-                max_tokens_per_rank=moe.max_num_tokens,
+                max_tokens_per_rank=mori_capacity,
                 num_dispatchers=all2all_manager.world_size,
                 dispatch_format=dispatch_format,
                 low_latency=low_latency,
@@ -790,6 +794,13 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 # layer.shared_experts,
                 quant_config=self.moe_quant_config,
             )
+
+            if isinstance(prepare_finalize, MoriPrepareAndFinalize):
+                from atom.model_ops.fused_moe.mori_chunked_experts import MoriChunkedExperts, benchmark_chunk_size
+
+                chunk_size = benchmark_chunk_size()
+                if chunk_size:
+                    self.fused_experts = MoriChunkedExperts(self.fused_experts, chunk_size)
 
             # The v2 fused transport (MegaMoE) runs the whole layer, so it must be
             # told the expert-GEMM recipe that only the layer + this quant method
@@ -2630,11 +2641,66 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
         return views
 
 
+class MegaInternodeMxfp4MoEMethod(Mxfp4MoEMethod):
+    """MXFP4 routed experts backed by the two-node EP16 A4W4 pipeline."""
+
+    def __init__(self, quant_config: LayerQuantConfig, moe: FusedMoEConfig):
+        super().__init__(quant_config, moe)
+        self.use_triton = False
+        self.use_triton_ep = False
+        self.use_triton_decode = False
+        if self.fp8_activations:
+            raise ValueError(
+                "mega_internode uses A4W4; set ATOM_DSV41_MOE_FP8_ACTIVATIONS=0 "
+                "for DSv4.1"
+            )
+
+    def _process_weight_layout_after_loading(self, layer) -> None:
+        from atom.model_ops.fused_moe.megamoe_internode_experts import (
+            build_internode_weights,
+        )
+
+        if layer.w13_bias is not None or layer.w2_bias is not None:
+            raise NotImplementedError("mega_internode does not support expert biases")
+        build_internode_weights(layer)
+        for name in ("w13_weight", "w2_weight"):
+            tensor = getattr(layer, name)
+            tensor.data = torch.empty(0, dtype=tensor.dtype, device=tensor.device)
+        logger.info("Prepared MegaMoEInternode A4W4 weights for fused MoE layer")
+
+    def init_prepare_finalize(self, layer: torch.nn.Module):
+        from atom.model_ops.fused_moe.megamoe_internode_experts import (
+            MegaInternodeFusedExperts,
+        )
+
+        self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+        self.fused_experts = MegaInternodeFusedExperts(
+            layer,
+            model_dim=self.hidden_size,
+            inter_dim=self.intermediate_size,
+            max_tokens=self.moe.max_num_tokens,
+        )
+        self.routed_rows_wire = None
+
+    def get_eplb_weight_views(self, layer: torch.nn.Module) -> list[torch.Tensor]:
+        local_experts = layer.local_num_experts
+        views = []
+        for name in ("_mi_w1", "_mi_w1_scale", "_mi_w2", "_mi_w2_scale"):
+            tensor = getattr(layer, name)
+            if not tensor.is_contiguous() or tensor.numel() % local_experts:
+                raise RuntimeError(f"mega_internode weight {name} is not expert-major")
+            views.append(tensor.view(local_experts, -1))
+        return views
+
+
 def _make_mxfp4_moe_method(
     quant_config: LayerQuantConfig, moe: FusedMoEConfig
 ) -> Mxfp4MoEMethod:
     # Under SP, `mega` runs SP MegaMoE over the native weights instead.
-    if get_current_atom_config().moe_backend == "mega" and not sp_is_enabled():
+    backend = get_current_atom_config().moe_backend
+    if backend == "mega_internode":
+        return MegaInternodeMxfp4MoEMethod(quant_config, moe)
+    if backend == "mega" and not sp_is_enabled():
         return MegaMxfp4MoEMethod(quant_config, moe)
     return Mxfp4MoEMethod(quant_config, moe)
 
@@ -3913,6 +3979,12 @@ class FusedMoE(torch.nn.Module):
         self._validate_moe_backend()
 
     def _validate_moe_backend(self) -> None:
+        if get_current_atom_config().moe_backend == "mega_internode":
+            if not isinstance(self.quant_method, MegaInternodeMxfp4MoEMethod):
+                raise TypeError("mega_internode supports only MXFP4 routed experts")
+            if self.num_fused_shared_experts:
+                raise ValueError("mega_internode requires separate shared experts")
+            return
         if get_current_atom_config().moe_backend != "mega" or sp_is_enabled():
             return
         if not isinstance(self.quant_method, MegaMxfp4MoEMethod):

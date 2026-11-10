@@ -2414,22 +2414,38 @@ class Config:
 
     def _init_moe_backend(self) -> None:
         self.moe_backend = self.moe_backend.strip().lower()
-        if self.moe_backend not in ("standard", "mega"):
+        if self.moe_backend not in ("standard", "mega", "mega_internode"):
             raise ValueError(
-                "moe_backend must be one of {'standard', 'mega'}, "
+                "moe_backend must be one of {'standard', 'mega', 'mega_internode'}, "
                 f"got {self.moe_backend!r}"
             )
         # Under Ulysses SP, `mega` selects SP MegaMoE (sp_mega_moe.py) instead.
-        if self.moe_backend != "mega" or self.sequence_parallel_size > 1:
+        if self.moe_backend == "mega_internode":
+            if self.sequence_parallel_size > 1:
+                raise ValueError("mega_internode requires sequence_parallel_size=1")
+            if (
+                not self.enable_expert_parallel
+                or self.tensor_parallel_size != 1
+                or self.pipeline_parallel_size != 1
+                or self.prefill_context_parallel_size != 1
+                or self.parallel_config.data_parallel_size != 16
+                or self.parallel_config.data_parallel_size_local != 8
+            ):
+                raise ValueError("mega_internode requires two-node EP16")
+            if self.enable_tbo or self.enable_tbo_decode:
+                raise ValueError(
+                    "mega_internode supports one in-flight forward per instance; disable TBO"
+                )
+        elif self.moe_backend != "mega" or self.sequence_parallel_size > 1:
             return
         if not self.enable_expert_parallel:
             raise ValueError(
-                "moe_backend='mega' requires expert parallelism; pass "
+                f"moe_backend={self.moe_backend!r} requires expert parallelism; pass "
                 "--enable-expert-parallel, or --sequence-parallel-size for SP MegaMoE."
             )
         if self.moe_all2all_backend == "rccl":
             raise ValueError(
-                "moe_backend='mega' owns its MoRI transport and cannot use the "
+                f"moe_backend={self.moe_backend!r} owns its transport and cannot use the "
                 "experimental RCCL prepare/finalize backend"
             )
 

@@ -5,7 +5,8 @@ The two models share this layer. Routing is `sqrtsoftplus` with a
 selection-only per-expert bias, renormalized top-k and a `routed_scaling_factor`;
 the experts use the inherited V4 quantization, clamped SwiGLU and whole-expert
 ownership. The routed FP4 experts take MXFP8 activations, as the checkpoint's
-reference runs them: aiter's gfx950 default for them is MXFP4, which put the
+reference runs them by default. ATOM_DSV41_MOE_FP8_ACTIVATIONS=0 explicitly
+selects A4W4 for both standard and internode deployment. MXFP4 put the
 routed output ~12% off the reference and cost ~1.4pp of GSM8K. Activation
 format, routing-weight placement and kernel dispatch are owned by V4/FusedMoE.
 `DeepseekV4Args` reads all of it off the V4.1 config by its HF names, so V4's
@@ -38,6 +39,7 @@ from atom.model_ops.topK import mm_topk
 from atom.model_ops.utils import atom_parameter
 from atom.models.deepseek_v4 import DeepseekV4Args
 from atom.models.deepseek_v4 import MoE as V4MoE
+from atom.utils import envs
 from atom.utils.forward_context import get_forward_context, pass_scheduled_tokens_gpu
 
 
@@ -62,7 +64,7 @@ class MoE(V4MoE):
     ):
         args = DeepseekV4Args.from_hf_config(config)
         args.quant_config = quant_config
-        args.moe_fp8_activations = True
+        args.moe_fp8_activations = envs.ATOM_DSV41_MOE_FP8_ACTIVATIONS
         super().__init__(layer_id, args, prefix=prefix, alt_stream=alt_stream)
         self.gate.bias_vl = atom_parameter(
             torch.empty(args.n_routed_experts, dtype=torch.float32)

@@ -423,6 +423,7 @@ async def async_request_openai_chat_completions(
                                 generated_text += content or ""
                             if usage := data.get("usage"):
                                 output.output_tokens = usage.get("completion_tokens")
+                                output.prompt_len = usage.get("prompt_tokens", output.prompt_len)
 
                             most_recent_timestamp = timestamp
 
