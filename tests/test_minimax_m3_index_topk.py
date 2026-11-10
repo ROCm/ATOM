@@ -66,6 +66,54 @@ def test_prefill_score_launch_config(monkeypatch, arch, dtype, want):
         m._prefill_score_launch_config.cache_clear()
 
 
+@pytest.mark.parametrize(
+    "arch,is_fp8,q_len,max_block,batch,heads,want",
+    [
+        ("gfx950", True, 2517, 823, 1, 1, (128, None, None, None, 1, False, False)),
+        (
+            "gfx1250",
+            False,
+            2517,
+            823,
+            1,
+            1,
+            (128, None, None, None, 1, False, False),
+        ),
+        (
+            "gfx1250",
+            True,
+            32769,
+            640,
+            1,
+            4,
+            (128, None, None, None, 1, False, False),
+        ),
+        ("gfx1250", True, 2517, 823, 1, 1, (64, 22, 2, 3, 4, True, True)),
+        (
+            "gfx1250",
+            True,
+            2048,
+            640,
+            1,
+            4,
+            (128, None, None, None, 1, False, False),
+        ),
+        ("gfx1250", True, 4096, 640, 1, 4, (256, 40, 2, 1, 4, False, True)),
+        (
+            "gfx1250",
+            True,
+            32768,
+            640,
+            1,
+            4,
+            (128, None, None, None, 1, False, False),
+        ),
+    ],
+)
+def test_prefill_score_policy(arch, is_fp8, q_len, max_block, batch, heads, want):
+    assert m._prefill_score_config(arch, is_fp8, q_len, max_block, batch, heads) == want
+
+
 class TestPrefillTileWidth:
     """clamp(next_pow2(max_block), MIN, MAX), and the two ends of the clamp."""
 
@@ -304,7 +352,13 @@ def test_emitted_order_is_full_blocks_by_score_then_the_partial_tail():
     total_q, max_block = sum(qlens), triton.cdiv(kw["max_seq_len"], SPARSE_BLOCK_SIZE)
     score = torch.empty((heads, total_q, max_block), dtype=torch.float32, device="cuda")
     q_tiles = triton.cdiv(kw["max_query_len"], m.SCORE_BLOCK_SIZE_Q)
-    cb = m._score_chunk_blocks(max_block, q_tiles, len(qlens), heads, torch.device("cuda"))  # fmt: skip
+    cb = m._score_chunk_blocks(
+        max_block,
+        q_tiles,
+        len(qlens),
+        heads,
+        torch.device("cuda"),
+    )
     m._index_block_score_kernel[(q_tiles, len(qlens) * heads, triton.cdiv(max_block, cb))](
         kw["idx_q"], kw["index_kv_cache"], score, kw["block_table"], kw["cu_seqlens_q"],
         kw["seq_lens"], kw["prefix_lens"], heads, HEAD_DIM, kw["sm_scale"], cb,
@@ -604,16 +658,10 @@ def test_the_two_selectors_agree_where_the_dispatch_switches():
 def test_prefill_launch_policy_preserves_scores_and_selection(
     monkeypatch, heads, strided_q, cache_dtype, qlens, prefixes, q_zero
 ):
-    """The launch-only optimization must preserve the previous PR's exact output.
-
-    Compare every causally valid score and all top-k/page-table outputs against
-    the previous (8 warps, FP8 stages=1 / BF16 stages=3) launch, on identical
-    tensor values. This supplements rather than replaces the independent
-    selector/oracle tests above.
-    """
+    """Compare the full tuned launch with the previous scorer configuration."""
     import triton
 
-    if m.get_gfx() != "gfx1250":
+    if m.get_gfx_runtime() != "gfx1250":
         pytest.skip("gfx1250 launch-policy regression")
     kw = _inputs(qlens, prefixes, heads, "cuda")
     q = kw["idx_q"]
@@ -634,8 +682,6 @@ def test_prefill_launch_policy_preserves_scores_and_selection(
     ).reshape(kw["block_table"].shape)
     total_q = sum(qlens)
     max_block = triton.cdiv(kw["max_seq_len"], SPARSE_BLOCK_SIZE)
-    q_tiles = triton.cdiv(kw["max_query_len"], m.SCORE_BLOCK_SIZE_Q)
-    chunk = m._score_chunk_blocks(max_block, q_tiles, len(qlens), heads, q.device)
     valid_counts = torch.cat(
         [
             (torch.arange(length, device=q.device) + prefix + SPARSE_BLOCK_SIZE)
@@ -648,7 +694,9 @@ def test_prefill_launch_policy_preserves_scores_and_selection(
         < valid_counts[None, :, None]
     ).expand(heads, -1, -1)
 
-    def score(config):
+    def score(block_q, chunk, warps, stages, kernel_config):
+        q_tiles = triton.cdiv(kw["max_query_len"], block_q)
+        store_group, prefetch_pages, post_reduce_scale = kernel_config
         result = torch.full((heads, total_q, max_block), float("nan"), device=q.device)
         m._index_block_score_kernel[
             (q_tiles, len(qlens) * heads, triton.cdiv(max_block, chunk))
@@ -668,16 +716,57 @@ def test_prefill_launch_policy_preserves_scores_and_selection(
             *cache.stride(),
             *result.stride(),
             kw["block_table"].stride(0),
-            BLOCK_SIZE_Q=m.SCORE_BLOCK_SIZE_Q,
+            BLOCK_SIZE_Q=block_q,
             BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
-            num_warps=config[0],
-            num_stages=config[1],
+            STORE_GROUP=store_group,
+            PREFETCH_PAGES=prefetch_pages,
+            POST_REDUCE_SCALE=post_reduce_scale,
+            num_warps=warps,
+            num_stages=stages,
         )
         return result
 
-    old_config = (8, 1 if cache_dtype == torch.float8_e4m3fn else m.SCORE_NUM_STAGES)
-    new_config = m._prefill_score_launch_config(cache_dtype)
-    old_score, new_score = score(old_config), score(new_config)
+    arch, is_fp8 = m.get_gfx_runtime(), cache_dtype in m._FP8_DTYPES
+    old_warps, old_stages = m._prefill_score_launch_config(cache_dtype)
+    old_q_tiles = triton.cdiv(kw["max_query_len"], m.SCORE_BLOCK_SIZE_Q)
+    old_chunk = m._score_chunk_blocks(
+        max_block, old_q_tiles, len(qlens), heads, q.device
+    )
+    (
+        new_block_q,
+        measured_chunk,
+        measured_warps,
+        measured_stages,
+        store_group,
+        prefetch_pages,
+        post_reduce_scale,
+    ) = m._prefill_score_config(
+        arch,
+        is_fp8,
+        kw["max_query_len"],
+        max_block,
+        len(qlens),
+        heads,
+    )
+    new_q_tiles = triton.cdiv(kw["max_query_len"], new_block_q)
+    new_chunk = measured_chunk or m._score_chunk_blocks(
+        max_block,
+        new_q_tiles,
+        len(qlens),
+        heads,
+        q.device,
+    )
+    kernel_config = store_group, prefetch_pages, post_reduce_scale
+    old_score = score(
+        m.SCORE_BLOCK_SIZE_Q, old_chunk, old_warps, old_stages, (1, False, False)
+    )
+    new_score = score(
+        new_block_q,
+        new_chunk,
+        measured_warps or old_warps,
+        measured_stages or old_stages,
+        kernel_config,
+    )
     torch.cuda.synchronize()
     assert torch.isfinite(old_score[valid]).all()
     assert torch.equal(old_score[valid], new_score[valid])
@@ -685,7 +774,19 @@ def test_prefill_launch_policy_preserves_scores_and_selection(
     # Exercise the production wrapper too; do not validate only a raw launch.
     new_outputs = m.minimax_m3_index_topk(**kw, emit_sparse_block_table=True)
     with monkeypatch.context() as patch:
-        patch.setattr(m, "_prefill_score_launch_config", lambda dtype: old_config)
+        patch.setattr(
+            m,
+            "_prefill_score_config",
+            lambda *args: (
+                m.SCORE_BLOCK_SIZE_Q,
+                None,
+                None,
+                None,
+                1,
+                False,
+                False,
+            ),
+        )
         old_outputs = m.minimax_m3_index_topk(**kw, emit_sparse_block_table=True)
     torch.cuda.synchronize()
     for old_output, new_output in zip(old_outputs, new_outputs):
@@ -951,3 +1052,40 @@ def test_cp_actual_launch_grid_and_replay(monkeypatch, batch, pages):
             assert torch.equal(replayed, call())
     torch.cuda.current_stream().wait_stream(stream)
     assert all(grid == expected_grid for grid in grids)
+
+
+@gpu
+@pytest.mark.parametrize("q_zero", [False, True])
+@pytest.mark.parametrize(
+    "q_len,prefix_len",
+    [(2369, 95_935), (2517, 102_784), (2688, 128_384)],
+)
+def test_gfx1250_issue_341_tp4_launch_is_bit_exact(
+    monkeypatch, q_zero, q_len, prefix_len
+):
+    """The measured #341 launch changes only geometry, including tie-heavy rows."""
+    if m.get_gfx_runtime() != "gfx1250":
+        pytest.skip("gfx1250 #341 launch regression")
+    kw = _inputs([q_len], [prefix_len], 1, "cuda")
+    kw["index_kv_cache"] = kw["index_kv_cache"].to(torch.float8_e4m3fn)
+    if q_zero:
+        kw["idx_q"].zero_()
+
+    tuned = m.minimax_m3_index_topk(**kw, emit_sparse_block_table=True)
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            m,
+            "_prefill_score_config",
+            lambda *args: (
+                m.SCORE_BLOCK_SIZE_Q,
+                None,
+                None,
+                None,
+                1,
+                False,
+                False,
+            ),
+        )
+        previous = m.minimax_m3_index_topk(**kw, emit_sparse_block_table=True)
+    torch.cuda.synchronize()
+    assert all(torch.equal(a, b) for a, b in zip(tuned, previous))
