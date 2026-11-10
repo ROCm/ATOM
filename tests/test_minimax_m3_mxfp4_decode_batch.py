@@ -150,18 +150,25 @@ def test_the_ubatch_buffers_are_for_a_decode_tbo_at_one_token_a_request(
     b = builder(mod, mxfp4=mxfp4, tbo_decode=tbo_decode)
     b.max_bs = max_bs
     max_qlen = 8  # a speculative config: the TBO sparse decode still runs one token
-    var = b.model_runner.forward_vars
     if mxfp4:
         b._index_work_maps[""] = index_mxfp4.IndexWorkMap.alloc(
             max_bs, max_qlen, HEADS, BOUND, "cpu"
         )
         capacity_args.clear()
     # each ubatch's requests, from the split every backend's ubatch metadata follows
-    from atom.utils.tbo.ubatch_splitting import decode_ubatch_request_ranges
+    import numpy as np
 
-    rows = [hi - lo for lo, hi in decode_ubatch_request_ranges(max_bs, 2)]
-    # the work plan sizes are not under test
-    b._allocate_ubatch_buffers(max_qlen, *([1, torch.int32] * 6))
+    from atom.utils.tbo.ubatch_splitting import cut_decode_ubatches
+
+    cut = cut_decode_ubatches(max_bs, max_bs, np.ones(max_bs, dtype=np.int32))
+    rows = [ub.running_bs for ub in cut]
+    # the base's buffers are not under test
+    monkeypatch.setattr(
+        mod.AiterAttentionMetadataBuilder.__mro__[1],
+        "_allocate_ubatch_buffers",
+        lambda self, max_seqlen_q: None,
+    )
+    b._allocate_ubatch_buffers(max_qlen)
     # `enable_tbo` alone is the prefill split, which never scores a decode
     names = ["ub0_", "ub1_"]
     maps = b._index_work_maps
@@ -175,39 +182,33 @@ def test_the_ubatch_buffers_are_for_a_decode_tbo_at_one_token_a_request(
     assert capacity_args == [(rows[0], BOUND, 1, HEADS), (rows[1], BOUND, 1, HEADS)]
     # each ubatch has its own map
     assert maps[names[1]].work_map.data_ptr() != maps[names[0]].work_map.data_ptr()
-    # the other per-ubatch buffers stay at max_bs
-    assert var["ub0_context_lens"].gpu.numel() == max_bs
 
 
 def test_the_ubatch_metadata_is_built_with_its_own_buffers(mod, monkeypatch):
-    from atom.model_ops.minimax_m3 import sparse_attn
-
-    var = {"max_qlen": 1}
     rows = 4
-    for i in (0, 1):
-        p = f"ub{i}_"
-        for name in ("slot_mapping", "context_lens", "block_tables", "kv_indptr"):
-            var[p + name] = types.SimpleNamespace(gpu=torch.zeros(rows + 1, 4))
-        for name in ("cu_seqlens_q", "kv_indices"):
-            var[p + name] = types.SimpleNamespace(gpu=torch.zeros(rows + 1))
-        for name in (
-            "work_meta_data",
-            "work_indptr",
-            "work_info_set",
-            "reduce_indptr",
-            "reduce_final_map",
-            "reduce_partial_map",
-        ):
-            var[p + name] = None
-        var[p + "sparse_attention_n_valid_column_per_row"] = torch.zeros(1)
+    var = {
+        f"ub{i}_sparse_attention_n_valid_column_per_row": torch.zeros(1) for i in (0, 1)
+    }
     seen = []
     monkeypatch.setattr(
-        sparse_attn, "make_sparse_decode_metadata", lambda **kw: seen.append(kw)
+        mod, "make_sparse_decode_metadata", lambda **kw: seen.append(kw)
+    )
+    monkeypatch.setattr(
+        mod.AiterAttentionMetadataBuilder.__mro__[1],
+        "finish_ubatch",
+        lambda self, *a: None,
     )
     b = builder(mod, forward_vars=var)
     b._index_work_maps = {"ub0_": object(), "ub1_": object()}
+    ub = types.SimpleNamespace(running_bs=rows)
+    attn = types.SimpleNamespace(
+        block_tables=torch.zeros(rows, 4),
+        context_lens=torch.zeros(rows),
+        slot_mapping=torch.zeros(rows),
+        max_seqlen_k=8,
+    )
     for i in (0, 1):
-        b.build_ubatch_metadata(i, rows)
+        b.finish_ubatch(i, ub, attn, 1)
     for i, kw in enumerate(seen):
         assert kw["index_work_map"] is b._index_work_maps[f"ub{i}_"]
     assert seen[0]["index_work_map"] is not seen[1]["index_work_map"]

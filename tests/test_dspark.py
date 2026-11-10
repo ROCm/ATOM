@@ -2319,8 +2319,8 @@ def test_the_borrowed_page_is_given_back_even_when_the_generator_raises(monkeypa
 def test_the_metadata_build_is_gated_on_the_pool_not_on_the_dummy_flag(monkeypatch):
     """`is_dummy_run` covers two passes and only one of them lacks a pool.
 
-    `warmup_model()` runs before `allocate_kv_cache()`; `dummy_execution()`'s
-    DP-alignment step is a dummy whose pool is fully bound. Returning early on
+    `warmup_model()` runs before `allocate_kv_cache()`; a dynamic-chunking
+    profile runs after it, its pool fully bound. Returning early on
     the flag leaves a replay writing through the last real step's slots.
     """
     T = 7
@@ -2340,11 +2340,11 @@ def test_the_metadata_build_is_gated_on_the_pool_not_on_the_dummy_flag(monkeypat
         assert stale is not expect_written, f"pool bound={bound}: slots stale={stale}"
 
 
-def test_a_dp_sync_dummy_describes_every_row_of_the_block_as_pad(monkeypatch):
-    """The dummy has to RUN -- the peers mirror its collectives -- but its one
-    sequence is fabricated and its block table is [0], so no row of it owns a
-    page. Describing it as pad is what makes the pass write nothing, and the
-    width must not shrink: `scheduled_bs` still slices the ids the caller gets.
+def test_rows_past_scheduled_bs_are_described_as_pad(monkeypatch):
+    """Every row past `scheduled_bs` is described as pad, all of them for a
+    step that schedules none (an idle DP rank's, which still runs for its
+    peers' collectives), and the width does not shrink: `scheduled_bs` slices
+    the caller's ids.
     """
     p, _, _ = _paged_proposer(monkeypatch, max_model_len=256, block_size=64)
     T = p.draft_tokens_per_seq
@@ -2366,18 +2366,18 @@ def test_a_dp_sync_dummy_describes_every_row_of_the_block_as_pad(monkeypatch):
         run=lambda bs, **staged: (torch.zeros(bs, T, dtype=torch.int32), None),
     )
 
-    for dummy, expect in ((False, 1), (True, 0)):
-        fc = _paged_fc(is_dummy_run=dummy)
+    for scheduled_bs in (1, 0):
+        fc = _paged_fc()
         fc.context.running_bs = 4
         out = p._propose_with_draft(
             fc,
             fc.attn_metadata,
             {"anchor_positions": torch.zeros(4, dtype=torch.int64)},
-            1,
+            scheduled_bs,
         )
-        assert seen["described_bs"] == expect, f"is_dummy_run={dummy}"
+        assert seen["described_bs"] == scheduled_bs
         assert seen["rows"] == 4, "the width is the agreed batch either way"
-        assert out.shape == (1, T), "the ids are still sliced to the real rows"
+        assert out.shape == (scheduled_bs, T), "the ids are sliced to real rows"
 
 
 def _persistent_probe(monkeypatch, *, page_size, dcp_world_size, dcp_persistent):
@@ -2466,7 +2466,10 @@ def test_the_premise_check_passes_the_configuration_k3_actually_ships(monkeypatc
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
-def test_staged_anchors_clamp_the_id_and_repeat_the_last_row_into_the_pad():
+@pytest.mark.parametrize("scheduled_bs", [4, 0])
+def test_staged_anchors_clamp_the_id_and_zero_the_pad(scheduled_bs):
+    """A row past `scheduled_bs` is token 0 at position 0, a step with no
+    scheduled row included."""
     from atom.spec_decode.dspark_proposer import _stage_anchors_kernel
 
     running_bs, vocab_max = 6, 99
@@ -2476,10 +2479,17 @@ def test_staged_anchors_clamp_the_id_and_repeat_the_last_row_into_the_pad():
     ids = torch.full((running_bs,), -7, dtype=torch.int32, device="cuda")
     anchor_positions = torch.full((running_bs,), -7, dtype=torch.int64, device="cuda")
     _stage_anchors_kernel[(running_bs,)](
-        ids, anchor_positions, next_ids, positions, rows, 4, vocab_max
+        ids,
+        anchor_positions,
+        next_ids[:scheduled_bs],
+        positions,
+        rows[:scheduled_bs],
+        scheduled_bs,
+        vocab_max,
     )
-    assert ids.tolist() == [5, 0, 99, 7, 7, 7]
-    assert anchor_positions.tolist() == [6, 15, 27, 39, 39, 39]
+    pad = [0] * (running_bs - scheduled_bs)
+    assert ids.tolist() == [5, 0, 99, 7][:scheduled_bs] + pad
+    assert anchor_positions.tolist() == [6, 15, 27, 39][:scheduled_bs] + pad
 
 
 def test_page16_table_expands_every_page_into_its_eight_sub_pages():

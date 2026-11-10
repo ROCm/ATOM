@@ -51,7 +51,9 @@ def test_v4_bf16_counts_sink_once_for_swa_and_global(small_config, length):
     step = begin_step(cache, spans)
     spec = LayerAttentionSpec(0, 1, AttentionMode.FULL, 0, 0)
     # Index row 0 for every query row: the same row its window already holds.
-    step.selected[0] = torch.zeros(1, step.width, 1, device="cuda", dtype=torch.int32)
+    step.selected[0] = torch.zeros(
+        1, step.running_tokens, 1, device="cuda", dtype=torch.int32
+    )
     q = torch.zeros(2 * length, 8, 512, dtype=torch.bfloat16, device="cuda")
     kv = torch.full((1, 2 * length, 512), 6.0, dtype=torch.bfloat16, device="cuda")
     sink = torch.zeros(8, device="cuda")

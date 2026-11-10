@@ -368,7 +368,8 @@ def test_engine_initializes_tracing_before_ready(monkeypatch):
 
     failure_callbacks = []
 
-    def runner_manager(*args, on_worker_failure):
+    def runner_manager(*args, on_worker_failure, kv_progress_event):
+        assert kv_progress_event is not None
         failure_callbacks.append(on_worker_failure)
         return SimpleNamespace(call_func=call)
 
