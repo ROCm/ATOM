@@ -113,12 +113,14 @@ class PrefixSpreadRouter:
         rank, hashes = entry
         for h, _start in hashes:
             self.pending.pop((h, rank), None)
-            # The part is on the rank now. If the entry still names a producer
-            # that is prefilling, it names the request that confirmed it, so
-            # the producer leaving cannot take a real prefix with it.
             holders = self.index.get(h)
-            if holders is not None and holders.get(rank) in self._prefilling:
-                holders[rank] = seq_id
+            if holders is not None and rank in holders:
+                # The part is the rank's latest use (owner ties go to the
+                # latest, `_rank_hits`). An entry still naming a prefilling
+                # producer now names the request that confirmed it, so the
+                # producer leaving cannot take a real prefix with it.
+                holder = holders.pop(rank)
+                holders[rank] = seq_id if holder in self._prefilling else holder
 
     def release(self, seq_id) -> dict:
         """Release a request; return extra prefill charges for its successors."""
@@ -172,9 +174,10 @@ class PrefixSpreadRouter:
         else:
             # The tier serves the prefix once some request finished prefilling
             # it, and the connector loads only what clears its load threshold.
+            in_tier = self._tier_hit(chain, hit)
             loaded = (
-                self.tier.loadable_tokens(local, hit, seq.num_prompt_tokens)
-                if self._tier_holds(chain, hit)
+                self.tier.loadable_tokens(local, in_tier, seq.num_prompt_tokens)
+                if in_tier > local
                 else 0
             )
             est_hit = local + loaded
@@ -228,22 +231,27 @@ class PrefixSpreadRouter:
 
     # -- prefix index ---------------------------------------------------------
 
-    def _tier_holds(self, chain, hit: int) -> bool:
-        """Whether the tier has the first `hit` tokens of this prompt: some
-        request that finished prefilling them put them there, on any rank. The
-        newest holder (the owner's) may still be prefilling; an older finished
-        copy on another rank is in the tier regardless."""
+    def _tier_hit(self, chain, hit: int) -> int:
+        """How much of this prompt's first `hit` tokens the tier has: the
+        longest sampled part that some request finished prefilling, on any
+        rank. The newest holder at the full length (the owner's) may still be
+        prefilling while an older, shorter copy elsewhere is already there."""
         hbs = int(chain.hash_block_size)
-        holders = self.index.get(chain.hashes[hit // hbs - 1])
-        return holders is not None and any(
-            seq_id not in self._prefilling for seq_id in holders.values()
-        )
+        stride = max(1, self.STRIDE_TOKENS // hbs)
+        for i in range(hit // hbs - 1, -1, -stride):
+            holders = self.index.get(chain.hashes[i])
+            if holders is not None and any(
+                seq_id not in self._prefilling for seq_id in holders.values()
+            ):
+                return (i + 1) * hbs
+        return 0
 
     def _rank_hits(self, chain, n: int):
         """Per rank, the longest sampled prefix of this prompt it holds.
 
         Returns ({rank: tokens}, owner, source): the owner is the rank with the
-        longest prefix (the most recent one on a tie), source the request whose
+        longest prefix (on a tie, the one that recorded or confirmed it last:
+        `_record`, `prefill_complete`), source the request whose
         prefill puts it there. A rank other than the owner counts a part only
         once its source finished prefilling it.
         """
@@ -308,12 +316,14 @@ class PrefixSpreadRouter:
                 # Confirmed: the rank holds this part. A request that computes
                 # it again reuses the rank's blocks; it neither becomes the
                 # holder nor relies on the entry, so its leaving cannot
-                # delete what the rank really holds.
+                # delete what the rank really holds. It is the rank's latest
+                # use, though, which owner ties go by.
+                holders[rank] = holders.pop(rank)
                 continue
             if had and holders[rank] in self._prefilling:
                 # A newcomer must not erase another request computing this
                 # prefix locally. It joins that producer's ordered waiters.
-                producer = holders[rank]
+                producer = holders.pop(rank)
             elif reused:
                 # A rank that holds the part keeps its holder. One that does
                 # not is loading it from the tier for this request, which then

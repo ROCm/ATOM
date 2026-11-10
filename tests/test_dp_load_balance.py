@@ -1302,3 +1302,41 @@ def test_a_moved_request_loading_from_the_tier_is_its_own_holder_on_the_target()
     assert _route(mgr, [m]) == [2]
     names = [holders[2] for holders in router.index.values() if 2 in holders]
     assert names and all(name == 3 for name in names)
+
+
+def test_a_shorter_finished_copy_in_the_tier_is_credited():
+    """The owner is still prefilling the whole prefix while another rank
+    finished a shorter part of it earlier: that shorter part is in the tier and
+    a request moved to an idle rank is credited it, not charged its whole
+    prompt."""
+    mgr = _make_spread_mgr(n_ranks=3)
+    router = mgr._prefix_router
+    short = _chain_seq(1, 8192)
+    router.place(short, 1, 3)
+    mgr._charge_seq_load_locked(short, 1)
+    mgr._mark_seq_prefill_complete(1)  # 8k of P is in the tier
+    full = _chain_seq(2, 16384)
+    router.place(full, 0, 3)
+    mgr._charge_seq_load_locked(full, 0)  # rank0 still prefilling all 16k
+    mgr._rank_tokens = [200_000, 40_000, 0]  # only rank2 is idle
+    moved = _chain_seq(3, 20480)
+    assert _route(mgr, [moved]) == [2]
+    assert _est(mgr, moved) == 8192
+
+
+def test_owner_ties_go_to_the_rank_that_used_the_prefix_last():
+    """Ranks 0 and 1 both hold P and rank 1 recorded it last; a request that
+    then reuses P on rank 0 makes rank 0 the owner on a tie."""
+    mgr = _make_spread_mgr()
+    router = mgr._prefix_router
+    for seq_id, rank in ((1, 0), (2, 1)):
+        seq = _chain_seq(seq_id, 8192)
+        router.place(seq, rank, 2)
+        mgr._charge_seq_load_locked(seq, rank)
+        mgr._mark_seq_prefill_complete(seq_id)
+    probe = _chain_seq(9, 8192).prompt_hash_chain
+    assert router._rank_hits(probe, 2)[1] == 1
+    reuse = _chain_seq(3, 8192)
+    router.place(reuse, 0, 2)
+    mgr._charge_seq_load_locked(reuse, 0)
+    assert router._rank_hits(probe, 2)[1] == 0
