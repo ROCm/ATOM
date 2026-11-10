@@ -45,14 +45,18 @@ def kv_config_has_producer(kv_config: object) -> bool:
 def produced_no_handoff(seq: object) -> bool:
     """Whether a finishing request on a P/D producer has nothing to hand off.
 
-    True when it was aborted, or when its prompt prefill never completed on
-    this scheduler (`Sequence.prefill_completed`): a request rejected as
-    unschedulable before it ran, or one that failed mid-prefill, has no
-    computed KV and no first token. A producer then publishes a cancellation
-    and keeps no send claim, as for an abort.
+    True when it was aborted or rejected as unschedulable, or when its prompt
+    prefill never completed on this scheduler (`Sequence.prefill_completed`).
+    Both reasons end a request that is leaving the waiting queue, so it holds
+    no blocks: one that never ran has no KV and no first token, and one that
+    ran, was preempted and is then rejected has had its blocks freed. A
+    producer then publishes a cancellation and keeps no send claim.
     """
-    return getattr(seq, "leave_reason", None) == "aborted" or not getattr(
-        seq, "prefill_completed", True
+    reason = getattr(seq, "leave_reason", None) or ""
+    return (
+        reason == "aborted"
+        or reason.startswith("unschedulable")
+        or not getattr(seq, "prefill_completed", True)
     )
 
 

@@ -2130,3 +2130,69 @@ def test_a_producer_cancels_a_request_whose_prefill_never_completed(
     producer.request_finished(done)
     assert done.kv_transfer_params["prefill_aborted"] is False
     assert done.kv_transfer_params["prefill_handoff"]["first_token_id"] == 7
+
+
+def test_a_preempted_producer_request_rejected_on_readmission_hands_nothing_off(
+    monkeypatch, seq_factory
+):
+    """A producer request that ran, was preempted (its blocks freed) and is
+    then rejected as unschedulable on re-admission (chunked prefill off, its
+    prompt plus output now over the batch budget) has no KV left to send. Its
+    prefill did complete, so only the reject reason tells the producer: it
+    must publish no handoff and take no send claim."""
+    import numpy as np
+    from conftest import MockConfig
+
+    from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
+    from atom.model_engine.sequence import SequenceStatus
+    from atom.sampling_params import SamplingParams
+
+    sched = Scheduler(
+        MockConfig(
+            max_num_batched_tokens=12,
+            enable_chunked_prefill=False,
+            num_kvcache_blocks=100,
+            kv_cache_block_size=4,
+        )
+    )
+    monkeypatch.setattr(mc, "get_ip", lambda: "127.0.0.1")
+    monkeypatch.setattr(mc, "get_open_port", lambda: 6400)
+    producer = sched.kv_connector = mc.MooncakeConnectorScheduler(
+        SimpleNamespace(
+            kv_transfer_config={"kv_role": "kv_producer"},
+            tensor_parallel_size=1,
+            pipeline_parallel_size=1,
+            parallel_config=SimpleNamespace(data_parallel_size=1, data_parallel_rank=0),
+            kv_cache_block_size=4,
+            decode_context_parallel_size=1,
+        )
+    )
+    seq = seq_factory(
+        list(range(10)),
+        sampling_params=SamplingParams(max_tokens=20, ignore_eos=True),
+        kv_transfer_params={"do_remote_decode": True, "transfer_id": "preempted"},
+    )
+    sched.add(seq)
+    for token in range(100, 104):
+        batch, seqs = sched.schedule()
+        sched.postprocess(
+            list(seqs.values()),
+            ScheduledBatchOutput(
+                [seq.id], [(token,)], np.array([0]), np.array([0]), None
+            ),
+            batch=batch,
+        )
+        if seq.num_tokens > 12:
+            break
+    assert seq.prefill_completed and seq.num_tokens > 12
+    assert sched.preempt(seq)
+    assert not seq.block_table
+
+    sched.schedule()
+
+    assert seq.status == SequenceStatus.FINISHED
+    assert seq.leave_reason.startswith("unschedulable")
+    assert seq.kv_transfer_params_output is None
+    assert str(seq.id) not in producer._awaiting_send
+    assert seq.id not in producer._reqs_need_save
+    assert seq.id not in sched.deferred_free_blocks

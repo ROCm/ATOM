@@ -2272,8 +2272,10 @@ class Scheduler:
             # Re-check here (not just at submit) since pool state may change.
             unschedulable = self._unschedulable_reason(seq)
             if unschedulable is not None:
-                # Leaves without running, like an abort: the same teardown
-                # (connectors see no completed prefill: `produced_no_handoff`).
+                # Leaves from the waiting queue, holding no blocks, like an
+                # abort: the same teardown, and a P/D producer hands nothing
+                # off (`produced_no_handoff`), even for a preempted request
+                # whose prefill had completed.
                 self._reject_aborted_waiting(
                     seq, reason=f"unschedulable: {unschedulable}"
                 )
