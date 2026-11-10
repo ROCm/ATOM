@@ -611,14 +611,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # leaves the fused indexer running exactly as it does with CP off.
     "ATOM_GLM52_INDEXER_CP": lambda: os.getenv("ATOM_GLM52_INDEXER_CP", "0") == "1",
     # Debug: run each mono layer next to the original one and log the difference
-    # (atom/models/minimax_m3/mono/check.py). Use with --enforce-eager.
+    # (atom/models/minimax_m3/mono/check.py; the gfx1250 V4.1 step: the launch
+    # beside the production forward, mono/gfx1250/debug.py). Use with --enforce-eager.
     "ATOM_MONO_CHECK": lambda: os.getenv("ATOM_MONO_CHECK", "0") == "1",
     # Debug: append every mono step's input tokens, positions and top-2 logits to
     # this file (rank 0; check.trace_logits). Use with --enforce-eager.
     "ATOM_MONO_TRACE": lambda: os.getenv("ATOM_MONO_TRACE"),
     # Debug: the mono layer kernels' per-phase stamps, a few steps per decode
-    # token count saved under this path prefix (mono/timeline.py). Use with
-    # --enforce-eager.
+    # token count saved under this path prefix (mono/timeline.py; the gfx1250
+    # V4.1 step: where its time goes, averaged every 64 steps, logged and
+    # appended to <prefix>_r<rank>.jsonl). Use with --enforce-eager.
     "ATOM_MONO_TIMELINE": lambda: os.getenv("ATOM_MONO_TIMELINE"),
     # Debug: the mono kernels bound every mailbox wait (10 s): a wait that gives up
     # records its region, pair and tags, and the runner raises with them at the end
@@ -1290,6 +1292,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # to 0 to fall back. Anything that would make it unsafe -- no CUDA, more TP
     # ranks than hash heads, a registration that will not fit -- falls back on
     # its own, so the switch is for taking the host path deliberately.
+    # Also governs the Qwen3.8 PLE n-gram table (~95 GiB): page-locked on the
+    # host and read over UVA by default on gfx950 / gfx942, in HBM elsewhere,
+    # for a dummy load, under the SGLang / RTP-LLM plugins and with 0, except
+    # where Qwen Mono serves the deployment (`atom/models/qwen38/mono/ple.py`),
+    # which ignores it.
     "ATOM_ENGRAM_UVA": lambda: os.getenv("ATOM_ENGRAM_UVA", "1") == "1",
     # How the UVA path page-locks a shard (`engram.host_memory`): 1 copies it
     # into page-locked memory of exactly its size (hipHostMalloc on base pages,

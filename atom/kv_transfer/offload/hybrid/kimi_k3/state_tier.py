@@ -103,7 +103,7 @@ class StateOffloadTier:
             oldest = min(self._store_submitted_at.values())
         return max(0.0, monotonic() - oldest)
 
-    def submit_store(self, op, unit_ids, producer_event=None) -> None:
+    def submit_store(self, op, unit_ids, ready_event) -> None:
         """Pack the checkpoint image in `unit_ids` for LMCache, under `op`.
 
         `op` is a `StateStoreOperationId`; the bytes are keyed by
@@ -111,14 +111,15 @@ class StateOffloadTier:
         two attempts at one prefix write the same entry but settle their own
         pins.
 
-        `producer_event` orders the gather after the checkpoint copy that
-        filled the units; see `KimiK3OffloadConnector._start_state_stores`.
-        The engine's pin keeps anything *later* from writing them.
+        `ready_event` is ordered after the copy that filled the units, and the
+        store waits on it before the packer reads them. The units are pinned by
+        the engine for the length of this transfer, so nothing writes them after
+        that copy.
         """
         with self._lock:
             self._store_submitted_at[op] = monotonic()
         self._register(
-            self._store_executor.submit(self._do_store, op, unit_ids, producer_event)
+            self._store_executor.submit(self._do_store, op, unit_ids, ready_event)
         )
 
     def submit_load(self, req_id: str, h: int, slot: int) -> None:
@@ -151,7 +152,7 @@ class StateOffloadTier:
         self._load_executor.shutdown(wait=True)
         self._store_executor.shutdown(wait=True)
 
-    def _do_store(self, op, unit_ids, producer_event=None) -> None:
+    def _do_store(self, op, unit_ids, ready_event) -> None:
         stored = False
         released = False
 
@@ -170,13 +171,13 @@ class StateOffloadTier:
                 self._source_released.add(op)
 
         try:
+            ready_event.synchronize()
             with self._staging_budget:
                 stored = bool(
                     self.codec.put(
                         int(op.prefix_hash),
                         unit_ids,
                         on_source_released=_source_released,
-                        producer_event=producer_event,
                     )
                 )
         except Exception:  # deliberately blind

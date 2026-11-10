@@ -112,6 +112,7 @@ from atom.model_ops.required_channel import (
 )
 from atom.model_ops.sampler import SAMPLER_EPS, sampler_from_config
 from atom.models.registry import mono_decode_installers, support_model_arch_dict
+from atom.mono.runtime.step_override import StepOverrideModel
 from atom.sampling_params import RequiredChannel
 from atom.spec_decode.drafter import Drafter
 from atom.spec_decode.factory import build_drafter
@@ -977,6 +978,14 @@ class ModelRunner:
                 getattr(self, "drafter", None),
                 metadata_builder=self.attn_metadata_builder,
             )
+        # A model that can run a whole decode step itself (sampling and
+        # verification included); see run_model.
+        self._step_override = (
+            self.model.step_override
+            if isinstance(self.model, StepOverrideModel)
+            else None
+        )
+        self._served = None
         self._init_forward_vars_ring()
         self._init_h2d_publication()
         self.forward_done_event = torch.cuda.Event()
@@ -3065,6 +3074,7 @@ class ModelRunner:
         input_ids: torch.Tensor,
         batch: ScheduledBatch | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        self._served = None  # set below when the model serves the whole step
         forward_context = get_forward_context()
         context = forward_context.context
         bs = context.scheduled_bs
@@ -3279,6 +3289,13 @@ class ModelRunner:
                     logits = self.model.compute_logits(hidden_states)
                     return logits, hidden_states
 
+                if self._step_override is not None:
+                    # The model ran the whole step (target, sampling, verify,
+                    # drafts): no logits; postprocess reads its outputs.
+                    self._served = self._step_override(input_ids, running_bs, batch)
+                    if self._served is not None:
+                        return None, None
+
                 graph_key = request_bucket(
                     running_bs, forward_context.attn_metadata.max_seqlen_q
                 )
@@ -3436,6 +3453,14 @@ class ModelRunner:
             # No drafts scored -> no verdict; the drafter anchors on each
             # segment's last row.
             anchors = None
+        elif self._served is not None:
+            # The step override verified on the GPU: the rejection sampler's
+            # (output_token_ids [bs, k + 1], verdict [3, bs]).
+            channel = None
+            sampled_tokens, verdict = self._served.verify_outputs(bs)
+            num_bonus_tokens, num_reject_tokens, anchors = verdict
+            next_token_locs = num_bonus_tokens
+            spec_counts = verdict[:2]
         else:
             assert logits is not None
             bonus_logits_indices = spec_decode_metadata.bonus_logits_indices
@@ -3491,8 +3516,14 @@ class ModelRunner:
 
         # Drafter input must agree across TP ranks. Ids only: the verdict is
         # deterministic on TP ranks' bit-identical inputs.
-        if get_tp_group().world_size > 1 and _needs_id_sync(
-            self.tokenID_processor.is_deferred_out, hasattr(self, "drafter")
+        # (An overridden step's ids are identical on every TP rank, and the
+        # broadcast would wait for the work it queued after them.)
+        if (
+            get_tp_group().world_size > 1
+            and self._served is None
+            and _needs_id_sync(
+                self.tokenID_processor.is_deferred_out, hasattr(self, "drafter")
+            )
         ):
             sampled_tokens = get_tp_group().broadcast(sampled_tokens, src=0)
 
@@ -3520,7 +3551,11 @@ class ModelRunner:
                 # One bit-preserving broadcast for scores, candidate IDs and ranks.
                 sampled_logprobs = get_tp_group().broadcast(sampled_logprobs, src=0)
 
-        self.forward_done_event.record()
+        # An overridden step's outputs are ready on its output stream, before
+        # the work it queued after them on this one.
+        self.forward_done_event.record(
+            None if self._served is None else self._served.output_stream
+        )
         # Capture before prepare_sampled_ids(), which advances self.prev_batch to current batch.
         prev_batch = self.tokenID_processor.prev_batch
         token_id_dict, logprobs_map = self.tokenID_processor.prepare_sampled_ids(

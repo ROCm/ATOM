@@ -162,7 +162,15 @@ class MemoryManagerMixin:
       - self.allocate_kv_cache(num_blocks) — method
       - self.capture_cudagraph() — method
       - self.get_num_blocks() — method
+
+    A model module holding weight memory outside its parameters, or handing
+    its kernels their addresses, defines ``release_weight_memory()`` and
+    ``resume_weight_memory()``, called after the parameters are discarded and
+    reallocated (before the graphs are recaptured).
     """
+
+    def _weight_memory_modules(self):
+        return (m for m in self.model.modules() if hasattr(m, "resume_weight_memory"))
 
     def clear_kv_cache(self) -> bool:
         kv = self.kv_cache
@@ -240,6 +248,8 @@ class MemoryManagerMixin:
         for name, param in self.model.named_parameters():
             self._released_weight_meta[name] = (param.shape, param.dtype)
             param.data = torch.empty(0, dtype=param.dtype, device="cpu")
+        for module in self._weight_memory_modules():
+            module.release_weight_memory()
         self._weights_discarded = True
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
@@ -271,6 +281,8 @@ class MemoryManagerMixin:
                 param.data = param.data.to(self.device, non_blocking=False)
             torch.cuda.synchronize()
             logger.info(f"{self.label}: Weights restored to {self.device}")
+        for module in self._weight_memory_modules():
+            module.resume_weight_memory()
 
     def _release_kv_cache(self) -> None:
         if not hasattr(self, "kv_cache") or self.kv_cache is None:

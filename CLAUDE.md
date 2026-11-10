@@ -79,7 +79,12 @@ Key entry points:
   Kimi-K3, both wrapped after load through
   `models.registry.mono_decode_installers`; V4.1's per-step cell decisions live in
   `deepseek_v41/mono/{index,attention,moe}_plan.py`, each called by both the
-  kernel and its CPU I3 test. Kimi-K3 runs K1 (the attention seam through
+  kernel and its CPU I3 test. On gfx1250, V4.1's whole DSpark decode step is one
+  persistent FlyDSL kernel a rank (`deepseek_v41/mono/gfx1250/`: a target launch
+  through sampling and verification, then a draft launch), which ModelRunner
+  is offered through `atom/mono/runtime/step_override.py`; it reads the
+  production MoE's experts in place, and `tests/test_deepseek_v41_gfx1250.py`
+  is its CPU test. Kimi-K3 runs K1 (the attention seam through
   the KDA recurrence) and K2 (`o_proj` + the latent MoE) on its KDA layers, on
   a plain decode or a uniform speculative verify of at most 64 rows (16-row
   token groups past 16), with or without ReplaySSM. The MLA layers keep
