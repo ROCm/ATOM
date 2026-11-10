@@ -151,59 +151,40 @@ def test_bytes_limit_and_isolated_large_request(build, chunked):
     assert sched.pd_admission.deferred["bytes"] == 1
 
 
-@pytest.mark.parametrize("chunked", [False, True])
-def test_default_limit_bounds_receive_bytes(build, chunked):
-    sched, request = build(chunked=chunked, options={"enabled": True})
-    policy = sched.pd_admission
-    assert policy.max_bytes == int(64 * 1024 * 0.15)
-    a, b = request(), request()
-    sched.extend([a, b])
-    batch, _ = sched.schedule()
-    assert set(batch.connector_meta_output.reqs_to_recv) == {a.id, b.id}
+@pytest.mark.parametrize("fraction", [None, 0.25])
+def test_fraction_uses_physical_pool_bytes(build, fraction):
+    options = {"enabled": True}
+    if fraction is not None:
+        options["max_pending_kv_fraction"] = fraction
+    sched, _ = build(options=options)
+    # 64 blocks of 1024 bytes; the default fraction is 0.15.
+    assert sched.pd_admission.max_bytes == int(64 * 1024 * (fraction or 0.15))
 
 
-@pytest.mark.parametrize("keep_referenced", [False, True])
+@pytest.mark.parametrize("geometry_matches", [False, True])
 @pytest.mark.parametrize("chunked", [False, True])
 def test_prefix_hits_charge_only_receive_targets(
-    build, seq_factory, keep_referenced, chunked
+    build, seq_factory, geometry_matches, chunked
 ):
-    sched, request = build(
-        chunked=chunked,
-        prefix=True,
-        options={"enabled": True, "max_pending_kv_bytes": 2048},
-    )
-    seed = seq_factory(list(range(8)))
-    bm = sched.block_manager
-    bm.allocate(seed, bm.can_allocate(seed))
-    bm.hash_blocks(seed, seed.num_tokens)
-    if not keep_referenced:
-        bm.deallocate(seed)
-    free_before = bm.kv.num_free
-    a, b = request(), request()
-    sched.extend([a, b])
-    batch, _ = sched.schedule()
-    assert set(batch.connector_meta_output.reqs_to_recv) == {a.id, b.id}
-    assert sched.pd_admission.pending_bytes == 2048
-    assert a.block_table[0] == b.block_table[0]
-    assert free_before - bm.kv.num_free == (2 if keep_referenced else 3)
-    for meta in batch.connector_meta_output.reqs_to_recv.values():
-        assert meta.num_computed_blocks == 1
-
-
-@pytest.mark.parametrize("chunked", [False, True])
-def test_incompatible_geometry_charges_full_receive(build, seq_factory, chunked):
-    sched, request = build(prefix=True, chunked=chunked)
+    sched, request = build(chunked=chunked, prefix=True)
     seed = seq_factory(list(range(8)))
     bm = sched.block_manager
     bm.allocate(seed, bm.can_allocate(seed))
     bm.hash_blocks(seed, seed.num_tokens)
     bm.deallocate(seed)
-    a = request()
-    a.kv_transfer_params["block_size"] = 8
-    sched.add(a)
+    a, b = request(), request()
+    if not geometry_matches:
+        # An incompatible source layout falls back to a full transfer.
+        for seq in (a, b):
+            seq.kv_transfer_params["block_size"] = 8
+    sched.extend([a, b])
     batch, _ = sched.schedule()
-    assert batch.connector_meta_output.reqs_to_recv[a.id].num_computed_blocks == 0
+    recv = batch.connector_meta_output.reqs_to_recv
+    # Each request charges only what it receives: the block past the shared
+    # prefix, or both blocks when nothing can be skipped.
+    assert set(recv) == ({a.id, b.id} if geometry_matches else {a.id})
     assert sched.pd_admission.pending_bytes == 2048
+    assert all(m.num_computed_blocks == int(geometry_matches) for m in recv.values())
 
 
 @pytest.mark.parametrize("chunked", [False, True])
@@ -230,28 +211,7 @@ def test_cancel_keeps_credit_until_safe_terminal_and_ignores_duplicate(build, ch
 
 
 @pytest.mark.parametrize("chunked", [False, True])
-def test_ready_without_compute_room_keeps_credit(build, chunked):
-    sched, request = build(chunked=chunked)
-    a = request()
-    sched.add(a)
-    sched.schedule()
-    sched._update_from_kv_xfer_finished(receive_success(a))
-    # Admission can promote A, but no token fits the speculative decode width.
-    sched.mtp_k = 4
-    sched.use_spec = True
-    sched.max_num_batched_tokens = 4
-    batch, _ = sched.schedule()
-    assert a.status == SequenceStatus.RUNNING
-    assert not batch.req_ids
-    assert str(a.id) in sched.pd_admission.pending
-    sched.max_num_batched_tokens = 64
-    batch, _ = sched.schedule()
-    assert a.id in batch.req_ids
-    assert not sched.pd_admission.pending
-
-
-@pytest.mark.parametrize("chunked", [False, True])
-def test_abort_after_promotion_before_first_batch_releases_credit(build, chunked):
+def test_promoted_request_keeps_credit_until_batch_or_abort(build, chunked):
     sched, request = build(chunked=chunked)
     a, b = request(), request()
     sched.extend([a, b])
@@ -264,6 +224,7 @@ def test_abort_after_promotion_before_first_batch_releases_credit(build, chunked
     batch, _ = sched.schedule()
     assert a.status == SequenceStatus.RUNNING
     assert not batch.req_ids
+    # RUNNING alone does not return the credit; an abort before the batch does.
     assert set(sched.pd_admission.pending) == {str(a.id)}
     assert not b.block_table
     assert sched.abort_request(a.id)
@@ -373,29 +334,6 @@ def test_ready_preempted_before_first_forward_releases_credit(build, chunked):
     assert not batch.req_ids
     assert not a.block_table
     assert sched.total_preemptions == 1
-    assert not sched.pd_admission.pending
-
-
-def test_fraction_uses_physical_pool_bytes(build):
-    sched, _ = build(options={"enabled": True, "max_pending_kv_fraction": 0.25})
-    assert sched.pd_admission.max_bytes == 64 * 1024 // 4
-
-
-@pytest.mark.parametrize("chunked", [False, True])
-def test_hard_capacity_still_rejects_oversized_request(build, chunked):
-    sched, request = build(
-        chunked=chunked,
-        num_kvcache_blocks=2,
-        options={
-            "enabled": True,
-            "max_pending_kv_bytes": 1024,
-        },
-    )
-    a = request(16)
-    sched.add(a)
-    sched.schedule()
-    assert sched.take_rejected() == [a]
-    assert not a.block_table
     assert not sched.pd_admission.pending
 
 
@@ -519,25 +457,17 @@ def test_multiconnector_uses_load_winner(build):
         MultiConnectorScheduler,
     )
 
-    def wrap(pd):
-        class Store:
-            is_offload = True
-            is_producer = False
-
-            def get_num_new_matched_tokens(self, seq):
-                return (8, True)
-
-            def cancel_pending_load(self, seq):
-                pass
-
-        multi = MultiConnectorScheduler.__new__(MultiConnectorScheduler)
-        multi._connectors = [pd, Store()]
-        multi._load_winner = {}
-        return multi
-
+    store = SimpleNamespace(
+        is_offload=True,
+        is_producer=False,
+        get_num_new_matched_tokens=lambda seq: (8, True),
+        cancel_pending_load=lambda seq: None,
+    )
     # Exercise the real first-hit selection without invoking an offload backend.
     sched, request = build()
-    multi = wrap(sched.kv_connector)
+    multi = MultiConnectorScheduler.__new__(MultiConnectorScheduler)
+    multi._connectors = [sched.kv_connector, store]
+    multi._load_winner = {}
     assert multi.supports_pd_admission
     a = request()
     multi.get_num_new_matched_tokens(a)

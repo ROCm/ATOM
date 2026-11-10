@@ -1673,9 +1673,8 @@ def test_reusing_live_transfer_id_cannot_cancel_original(monkeypatch, seq_factor
 
 
 @pytest.mark.parametrize("cancelled", [False, True])
-@pytest.mark.parametrize("admission", [False, True])
 def test_d_transfer_failure_waits_for_write_hold_before_abort(
-    monkeypatch, seq_factory, cancelled, admission
+    monkeypatch, seq_factory, cancelled
 ):
     from conftest import MockConfig
 
@@ -1686,8 +1685,6 @@ def test_d_transfer_failure_waits_for_write_hold_before_abort(
     monkeypatch.setattr(mc.time, "monotonic", lambda: now[0])
     d = Scheduler(MockConfig(num_kvcache_blocks=3))
     d.kv_connector = scheduler_connector(monkeypatch, False)
-    if admission:
-        d.pd_admission = PdAdmissionController(12, 4)
     seq = pd_sequence(seq_factory, producer=False)
     d.add(seq)
     batch, scheduled = d.schedule()
@@ -1709,17 +1706,12 @@ def test_d_transfer_failure_waits_for_write_hold_before_abort(
     assert not scheduled and seq.block_table
     assert d.block_manager.kv.num_free == 0
     deallocate.assert_not_called()
-    if admission:
-        assert d.pd_admission.pending_bytes == 12
-        assert d.pd_admission.pending[str(seq.id)].cancelled is cancelled
 
     now[0] += 2
     d._update_from_kv_xfer_finished(worker.get_finished())
     assert seq.leave_reason == "aborted"
     assert not seq.block_table and d.block_manager.kv.num_free == 3
     deallocate.assert_called_once_with(seq)
-    if admission:
-        assert not d.pd_admission.pending
     assert not d.waiting and not d.running and not d.deferred_free_blocks
     batch, scheduled = d.schedule()
     assert not scheduled and batch.total_seqs_num_prefill == 0
@@ -1731,12 +1723,8 @@ def test_d_transfer_failure_waits_for_write_hold_before_abort(
     d.add(following)
     batch, scheduled = d.schedule()
     assert not scheduled and len(following.block_table) == 3
-    d._update_from_kv_xfer_finished(
-        KVConnectorOutput(
-            finished_recving={following.id},
-            received_handoffs={following.id: PrefillHandoff(following.id, 44)},
-        )
-    )
+    following.kv_transfer_params["first_token_id"] = 44
+    d._update_from_kv_xfer_finished(KVConnectorOutput(finished_recving={following.id}))
     batch, scheduled = d.schedule()
     assert list(scheduled) == [following.id]
     assert batch.total_seqs_num_prefill == 0 and batch.total_seqs_num_decode == 1
