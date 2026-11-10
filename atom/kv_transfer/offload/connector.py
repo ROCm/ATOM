@@ -362,6 +362,16 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         callback = getattr(self._impl, "enqueue_state_stores", None)
         return bool(callback(stores)) if callback is not None else False
 
+    def enqueue_state_touches(self, hashes) -> bool:
+        """State touches for the impl; False when it carries none."""
+        callback = getattr(self._impl, "enqueue_state_touches", None)
+        return bool(callback(hashes)) if callback is not None else False
+
+    def take_state_touch_verdicts(self) -> dict:
+        """`{hash: resident}` for touches that reached quorum."""
+        callback = getattr(self._impl, "take_state_touch_verdicts", None)
+        return callback() if callback is not None else {}
+
     def take_state_reports(self):
         # Contract is a 2-tuple (indexed, failed) -- matched by the kimi_k3 impl
         # and by the sole caller `indexed, failed = take()` in
