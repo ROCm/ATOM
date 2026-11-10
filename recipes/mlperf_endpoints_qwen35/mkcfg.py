@@ -79,6 +79,14 @@ if os.environ.get("METRICS_TOKENIZER_WORKERS"):
 # the report never got written. ISL is not a reported metric (TPS / TPOT / TTFT are unaffected). Unset: base yaml.
 if os.environ.get("METRICS_ISL"):
     cfg["settings"]["metrics_isl"] = os.environ["METRICS_ISL"] == "1"
+# SUBMISSION_RULESET (e.g. mlperf-endpoints-v1.0-2026-10-C1-A): bind the run to that ruleset's published seeds
+# (submission_ref; the client pins the scheduler and sample-order RNGs from it and refuses an unregistered name).
+# Unset: the base yaml's seeds (42).
+if os.environ.get("SUBMISSION_RULESET"):
+    cfg["submission_ref"] = {
+        "model": os.environ.get("SUBMISSION_MODEL", "qwen3.6-35b-a3b"),
+        "ruleset": os.environ["SUBMISSION_RULESET"],
+    }
 cfg["endpoint_config"]["endpoints"] = ["http://localhost:8000"]
 cfg["report_dir"] = report_dir
 
