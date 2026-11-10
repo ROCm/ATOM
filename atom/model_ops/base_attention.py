@@ -220,10 +220,13 @@ def _flydsl_arch_supported() -> bool:
 
 @functools.lru_cache(maxsize=1)
 def _flydsl_explicit_plan_api() -> bool:
-    """Whether aiter has #5809's FlyDSL decode API (a required work plan).
+    """Whether aiter has #5809's FlyDSL decode API (a keyword-only work plan).
 
     An older aiter would raise on the first call; probing once lets the gate
-    decline the call before entering aiter.
+    decline the call before entering aiter. Before #5809 the plan was an
+    optional positional parameter behind max_context_partition_num. aiter
+    #7056 defaults the keyword-only plan to None for gfx950 MXFP4, which plans
+    itself; every other call still needs one and ATOM always passes it.
     """
     import inspect
 
@@ -240,7 +243,6 @@ def _flydsl_explicit_plan_api() -> bool:
             hasattr(mod, "plan_pa_decode")
             and plan is not None
             and plan.kind is inspect.Parameter.KEYWORD_ONLY
-            and plan.default is inspect.Parameter.empty
             and "max_context_length" in params
         )
     if not ok:
