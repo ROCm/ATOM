@@ -167,7 +167,7 @@ ATOM uses a multi-process design with ZMQ sockets for inter-process communicatio
 
 **Data-parallel variant** (`DPEngineCoreProc`):
 
-When `data_parallel_size > 1`, each EngineCore process is a `DPEngineCoreProc` that synchronizes with other DP ranks via `torch.distributed.all_reduce` on a Gloo process group. The `busy_loop()` override ensures all DP ranks stay in lockstep: if one rank has a prefill batch while another does not, the idle rank executes a dummy prefill (`dummy_prefill_execution()`) to keep NCCL collectives synchronized.
+When `data_parallel_size > 1`, each EngineCore process is a `DPEngineCoreProc` that synchronizes with other DP ranks via `torch.distributed.all_reduce` on a Gloo process group. The `busy_loop()` override ensures all DP ranks stay in lockstep: a rank with no request runs a step with none (`dummy_execution()`) in the group's phase, to keep NCCL collectives synchronized.
 
 ### Collective worker RPC
 

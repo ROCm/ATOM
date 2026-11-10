@@ -55,3 +55,25 @@ def test_deepseek_r1_fp4_tp4_accuracy_loads_experts_serially():
     model_name = "DeepSeek-R1-FP4 TP4"
     assert "ATOM_LOADER_NUM_THREADS=1" in _catalog_rows()[model_name]["env_vars"]
     assert "ATOM_LOADER_NUM_THREADS=1" in _workflow_block(model_name)
+
+
+def test_deepseek_v32_fp8_dp_ep_keeps_the_shared_expert_separate():
+    # FusedMoE fuses the shared expert into the MoRI all-to-all path only for
+    # MXFP4/NVFP4 routed experts and raises for FP8.
+    for model_name in (
+        "DeepSeek-V3.2-FP8 TP4 DP4 EP4",
+        "DeepSeek-V3.2-FP8 TP8 DP8 EP8",
+    ):
+        env = "ATOM_FUSE_SHARED_EXPERT=0"
+        assert env in _catalog_rows()[model_name]["env_vars"].split("\n")
+        assert env in _workflow_block(model_name)
+
+    benchmark = json.loads(
+        (REPO / ".github" / "benchmark" / "sglang_benchmark_models.json").read_text()
+    )
+    rows = {row["display"]: row for row in benchmark["models"]}
+    for display in (
+        "DeepSeek-V3.2 FP8 TP4 DP4 EP4",
+        "DeepSeek-V3.2 FP8 TP8 DP8 EP8",
+    ):
+        assert "ATOM_FUSE_SHARED_EXPERT=0" in rows[display]["env_vars"]

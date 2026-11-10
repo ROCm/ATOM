@@ -6,8 +6,10 @@
 input buffer, repeated into every residual stream, and the step's derived GDN metadata as contiguous int32 buffers.
 Per request ``b`` (``idx = spec_state_indices [batch, spec]``, ``a = num_accepted_tokens``): ``valid[b] = idx[b, 0] >= 0
 and slot_mapping[b * spec] >= 0`` (a capture's rows carry PAD_SLOT_ID: nothing written), ``prev[b] = max(a[b] - 1,
-0)``, ``slot[b] = idx[b, 0]``, ``ssm_read[b] = idx_in[b, prev[b]]``. Per row ``r``: ``out[r, s * H + c] = embed[ids[r],
-c]`` for every stream ``s`` (the rows of ``embed(ids).repeat(1, streams)``, bit for bit).
+0)``, ``slot[b] = idx[b, 0]``, ``ssm_read[b] = idx_in[b, prev[b]]``, ``rope_off[b] = positions[b * spec] -
+(context_lens[b] - spec)`` (ATOM's RoPE position of the request's first row minus its cache row: an image request's
+MRoPE offset, 0 for text and for an invalid request). Per row ``r``: ``out[r, s * H + c] = embed[ids[r], c]`` for every
+stream ``s`` (the rows of ``embed(ids).repeat(1, streams)``, bit for bit).
 
 ``fused_puts``: the target step's metadata args (``step_meta.target_puts``) and every kind's step counter in one launch.
 A put is ``dst[i] = (valid[i // group] if masked else True) ? src[i // inner * stride + i % inner] - sub : fill`` for
@@ -41,6 +43,9 @@ def _prep_kernel(
     slot,
     ssm_read,
     slots,
+    pos,
+    ctx,
+    rope_off,
     spec,
     rows,
     batch,
@@ -66,7 +71,13 @@ def _prep_kernel(
         s0 = tl.load(idx + b * idx_stride, mask=m, other=-1)
         sr = tl.load(idx_in + b * idx_in_stride + p, mask=m, other=-1)
         sm = tl.load(slots + b * spec, mask=m, other=-1)
-        tl.store(valid + b, (s0 >= 0) & (sm >= 0), mask=m)
+        ok = (s0 >= 0) & (sm >= 0)
+        # ATOM's position of the request's first row minus its cache row (context - spec)
+        p0 = tl.load(pos + b * spec, mask=m, other=0)
+        cl = tl.load(ctx + b, mask=m, other=0)
+        off = tl.where(ok, p0 - (cl.to(tl.int64) - spec), 0)
+        tl.store(rope_off + b, off.to(tl.int32), mask=m)
+        tl.store(valid + b, ok, mask=m)
         tl.store(prev + b, p.to(tl.int32), mask=m)
         tl.store(slot + b, s0.to(tl.int32), mask=m)
         tl.store(ssm_read + b, sr.to(tl.int32), mask=m)
@@ -81,6 +92,7 @@ class VerifyPrep:
         self.prev = torch.zeros(max_batch, dtype=i32, device=device)
         self.slot = torch.zeros(max_batch, dtype=i32, device=device)
         self.ssm_read = torch.zeros(max_batch, dtype=i32, device=device)
+        self.rope_off = torch.zeros(max_batch, dtype=i32, device=device)
 
     def __call__(
         self,
@@ -94,15 +106,21 @@ class VerifyPrep:
         streams: int,
         slot_mapping,
         spec: int,
+        positions,
+        context_lens,
     ):
         rows, h = ids.numel(), emb.shape[1]
+        # (MRoPE positions are [3, N]: a text row's three are equal, and the step's rows are text)
+        pos = positions[0] if positions.dim() == 2 else positions
+        assert pos.stride(-1) == 1
         assert out.stride(1) == 1 and emb.stride(1) == 1 and out.shape[1] == streams * h
         assert (
             idx.stride(1) == 1 and idx_in.stride(1) == 1 and batch <= self.valid.numel()
         )
         _prep_kernel[(rows + 1,)](
             ids, emb, emb.stride(0), out, out.stride(0), accepted, idx, idx.stride(0), idx_in, idx_in.stride(0),
-            self.valid, self.prev, self.slot, self.ssm_read, slot_mapping, spec, rows, batch,
+            self.valid, self.prev, self.slot, self.ssm_read, slot_mapping, pos, context_lens, self.rope_off,
+            spec, rows, batch,
             H=h, STREAMS=streams, BLOCK=1024, BB=max(2, triton.next_power_of_2(batch)),
         )  # fmt: skip
         return (
@@ -110,6 +128,7 @@ class VerifyPrep:
             self.prev[:batch],
             self.slot[:batch],
             self.ssm_read[:batch],
+            self.rope_off[:batch],
         )
 
 

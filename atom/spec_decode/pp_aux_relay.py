@@ -114,7 +114,7 @@ class PPAuxRelay:
 
         opens = lid == self.own_ids[0]
 
-        def write(tensor, _off):
+        def write(tensor, _tokens):
             # TBO is refused under PP, so a forward is never split into ubatches.
             if opens:
                 self._send = torch.empty(

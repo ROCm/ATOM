@@ -133,14 +133,17 @@ class TestEverythingThatMovesAByteMovesTheId:
 
 
 class TestPagedCheckpointsAreRefusedWhereSizingWouldRaise:
-    """`get_num_blocks` raises on a copying transfer under PP or RapidServe.
+    """`get_num_blocks` raises on a copying transfer under RapidServe.
     Answering `copy` there would turn "K3 keeps no state cache" into "K3 does
     not start"."""
 
-    def test_pipeline_parallelism_falls_back_to_fork(self):
+    def test_pipeline_parallelism_copies(self):
+        """The stages agree on one unit geometry, so a checkpoint is a PAGE
+        image under PP too rather than a slot competing with admissions."""
         with tp_world(TP):
             transfer = Builder.state_transfer(builder(pp=2))
-        assert transfer.forks and not transfer.copies
+        assert transfer.copies and not transfer.forks
+        assert Builder.paged_checkpoints_span_pipeline
 
     def test_rapidserve_falls_back_to_fork(self):
         with tp_world(TP):

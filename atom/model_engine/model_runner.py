@@ -2,7 +2,9 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import ctypes
+import dataclasses
 import gc
+import hashlib
 import inspect
 import logging
 import math
@@ -10,6 +12,7 @@ import os
 import time
 from collections import OrderedDict
 from contextlib import contextmanager, nullcontext
+from dataclasses import replace
 from functools import partial, wraps
 from typing import Any, ClassVar, NamedTuple
 
@@ -28,15 +31,15 @@ from aiter.dist.utils import get_distributed_init_method
 from torch.profiler import record_function
 
 from atom import structured_output
-from atom.config import Config, set_current_atom_config
+from atom.config import Config, local_device_index, set_current_atom_config
 from atom.distributed.group_agreement import group_min
 from atom.distributed.pcp_utils import (
     PcpBalGroup,
+    cut_pcp_prefill_ubatches,
     get_pcp_group,
     get_pcp_world_size,
     pcp_allgather_rerange,
     pcp_is_enabled,
-    pcp_pad_len,
     pcp_round_robin_split,
 )
 from atom.distributed.pp_comm import (
@@ -71,9 +74,7 @@ from atom.model_engine.scheduler import (
 )
 from atom.model_engine.sequence import (
     Sequence,
-    SequenceStatus,
     SequenceType,
-    new_block_table,
 )
 from atom.model_engine.state_runtime import StateRuntime
 from atom.model_engine.token_logprobs import (
@@ -109,7 +110,7 @@ from atom.model_ops.required_channel import (
     advance_states,
     constrain_logits,
 )
-from atom.model_ops.sampler import SAMPLER_EPS, Sampler
+from atom.model_ops.sampler import SAMPLER_EPS, sampler_from_config
 from atom.models.registry import mono_decode_installers, support_model_arch_dict
 from atom.sampling_params import RequiredChannel
 from atom.spec_decode.drafter import Drafter
@@ -141,12 +142,12 @@ from atom.utils.region_graph import ReqGraph, TokenGraph
 from atom.utils.selector import attn_family, get_attn_backend, has_mla_indexer
 from atom.utils.sp_wrapper import SPModelWrapper
 from atom.utils.tbo import (
-    UBatchSlice,
-    UBatchWrapper,
+    cut_decode_ubatches,
+    cut_prefill_ubatches,
     decode_bucket_splits,
-    local_tbo_precompute,
-    maybe_create_ubatch_slices,
+    prefill_tbo_vote,
 )
+from atom.utils.tbo.ubatch_wrapper import UBatchWrapper
 
 logger = logging.getLogger("atom")
 
@@ -417,7 +418,6 @@ class tokenIDProcessor:
             else:
                 processed = [(tid,) for tid in token_ids]
             ret = dict(zip(req_ids, processed))
-            ret[-1] = 0  # is_deferred_out flag
             payload = (
                 sampled_logprobs.to("cpu") if sampled_logprobs is not None else None
             )
@@ -462,7 +462,6 @@ class tokenIDProcessor:
         self.prev_batch = batch
         self.prev_token_ids = sampled_token_ids
         self.prev_channel_states = channel_states
-        token_id_dict[-1] = 1
         return token_id_dict, logprobs_map
 
     def get_token_locations(self, batch: ScheduledBatch) -> TokenLocations:
@@ -470,14 +469,6 @@ class tokenIDProcessor:
         cur_req_ids = batch.req_ids
         num_prev = len(prev_req_ids)
         num_cur = len(cur_req_ids)
-
-        # A fabricated batch carries nothing over -- and the DP-sync dummy
-        # reuses one id, so without this the next dummy matches it and reads a
-        # request that never existed out of `prev_token_ids`/`draft_token_ids`.
-        # Real ids are non-negative and never matched it either way.
-        if self.prev_batch.is_dummy_run:
-            none = np.empty(0, dtype=np.intp)
-            return TokenLocations(none, none, np.arange(num_cur, dtype=np.intp))
 
         prev_id_to_idx = dict(zip(prev_req_ids, range(num_prev)))
 
@@ -511,13 +502,8 @@ class tokenIDProcessor:
         return TokenLocations(deferred_curr, deferred_prev, new_curr)
 
     def _publish_input_ids(self, count, group):
-        if group is None:
-            self.batch_info.copy_to_gpu()
-            return self.input_ids.copy_to_gpu(count)
-        group.counts[group.indices["input_ids"]] = count
-        group.counts[group.indices["decode_src"]] = None
-        group.counts[group.indices["batch_info"]] = 3
-        group.publish(group.counts)
+        group.set_counts({"input_ids": count, "batch_info": 3})
+        group.publish()
         return self.input_ids.gpu[:count]
 
     @h2d_producer("input_ids", runner="runner")
@@ -525,11 +511,13 @@ class tokenIDProcessor:
         self,
         batch: ScheduledBatch,
         max_seqlen_q: int,
-        *,
-        publication_group=None,
+        publication_group,
     ) -> torch.Tensor:
         """Prepare the input IDs for the current batch, then take the previous
         step's speculative status.
+
+        ``publication_group`` is the runner's `token_inputs`: the ids go up in
+        it with whatever the step's other producers staged.
 
         Taking that status waits for the previous forward on the GPU, the one
         wait a decode step makes before its own. Staging, publishing and
@@ -580,10 +568,9 @@ class tokenIDProcessor:
         scheduled_tokens = batch.scheduled_tokens  # tokens per req
         total_tokens_prefill = batch.total_tokens_num_prefill
         total_tokens_decode = batch.total_tokens_num_decode
-        total_reqs_prefill = batch.total_seqs_num_prefill
 
         # TODO: remove this when we support mixed prefill and decode in one batch
-        if total_reqs_prefill > 0:
+        if batch.has_prefill:
             # Decode does not publish an empty prefill prefix: an explicit
             # zero copy is still a publication in this forward's ledger.
             self.input_ids.np[:total_tokens_prefill] = scheduled_tokens[
@@ -693,16 +680,11 @@ class tokenIDProcessor:
         src_np = self.decode_src.np[:bs]
         src_np.fill(NEW_SEQUENCE)
         src_np[deferred_curr_indices] = deferred_prev_indices
-        group = (
-            self.runner.h2d_groups["input_ids"]
-            if publication_group is None
-            else publication_group
+        group = publication_group
+        group.set_counts(
+            {"input_ids": total_tokens_decode, "decode_src": bs, "batch_info": 3}
         )
-        counts = group.counts
-        counts[group.indices["input_ids"]] = total_tokens_decode
-        counts[group.indices["decode_src"]] = bs
-        counts[group.indices["batch_info"]] = 3
-        group.publish(counts)
+        group.publish()
         # How wide the forward reads: a replayed decode graph takes a fixed
         # `running_bs * tokens_per_seq` whatever the batch scheduled, and `bs`
         # sits between two captured buckets on most steps -- a 65-request batch
@@ -875,7 +857,7 @@ class ModelRunner:
             use_spec,
             self.num_spec_tokens,
         )
-        self.sampler = Sampler()
+        self.sampler = sampler_from_config(config)
         # Each `RequiredChannel` a batch has carried, as the kernels read it.
         self._device_channels: dict[RequiredChannel, DeviceChannel] = {}
         self.arange_np = np.arange(
@@ -1076,11 +1058,7 @@ class ModelRunner:
     def _setup_device_and_distributed(self, rank: int, config: Config):
         if sp_is_enabled():
             check_aiter_sp_api()
-        # Calculate local device rank considering DP, PP and PCP.
-        # On a single node the physical GPU index equals the global distributed
-        # rank in the DPxPPxPCPxTP layout: each EngineCore (one per (dp,pp)
-        # stage) owns a contiguous tp*pcp GPU slice. `rank` is this worker's
-        # local index (0..tp*pcp-1) within its stage.
+        # `rank` is this worker's local index (0..tp*pcp-1) within its stage.
         dp_rank_local = config.parallel_config.data_parallel_rank_local or 0
         pp_rank = config.parallel_config.pipeline_parallel_rank
         pp_size = config.pipeline_parallel_size
@@ -1089,8 +1067,7 @@ class ModelRunner:
             reject_simulated_tp(config, "pipeline parallel")
         # tp_world_size: how many GPUs this stage actually occupies.
         stage_span = config.tp_world_size * config.pcp_group_size
-        engine_index = dp_rank_local * pp_size + pp_rank
-        local_device_rank = engine_index * stage_span + rank
+        local_device_rank = local_device_index(config, rank)
         num_gpus = torch.cuda.device_count()
         if local_device_rank >= num_gpus:
             raise ValueError(
@@ -1366,59 +1343,34 @@ class ModelRunner:
         if self.rank == 0:
             logger.info(*args)
 
-    def dummy_execution(self, prefill: bool = False):
-        """A one-sequence dummy step that keeps an idle rank in its DP group's
-        collectives: a decode, or with ``prefill`` -- the group's prefill step
-        (`Scheduler.dummy_prefill`) -- a request-less prefill of the smallest
-        token-graph bucket's tokens, which `ForwardMode._pad_to_token_graph`
-        raises to the bucket every rank of the group replays.
-
-        Two mechanisms lean on the fabricated id being -1: this pass flushes
-        the previous real step's tokens (`prepare_sampled_ids` reports the
-        batch before), and its own land on the key the deferred flag then
-        overwrites. What -1 must NOT do is look like a request --
-        `get_token_locations`.
+    def dummy_execution(self):
+        """A step that keeps an idle rank in its DP group's collectives. It
+        schedules nothing: `ForwardMode.decide` gives it the group's phase and
+        width, and every row it runs is padding.
         """
-        if prefill:
-            mtp_k, tokens = 0, TokenGraph.captured_sizes("prefill")[0]
-        else:
-            # The scheduler's spec width, not the drafter's. On a P/D producer
-            # the real decodes are q=1, and under DP an idle rank's dummy is
-            # unified with them: a q=mtp_k+1 dummy would hand the uniform
-            # decode collectives a different `running_tokens` than its peers'.
-            mtp_k = (
-                self.drafter.mtp_k
-                if hasattr(self, "drafter")
-                and not self.tokenID_processor.is_pd_producer
-                else 0
-            )
-            tokens = mtp_k + 1
-        seq = Sequence([0] * tokens, block_size=self.block_size, id=-1)
-        seq.status = SequenceStatus.RUNNING
-        seq.type = SequenceType.PREFILL if prefill else SequenceType.DECODE
-        seq.block_table = new_block_table([0])
+        # The scheduler's spec width, not the drafter's. On a P/D producer the
+        # real decodes are q=1, and under DP an idle rank's dummy is unified
+        # with them: a q=mtp_k+1 dummy would hand the uniform decode
+        # collectives a different `running_tokens` than its peers'.
+        mtp_k = (
+            self.drafter.mtp_k
+            if hasattr(self, "drafter") and not self.tokenID_processor.is_pd_producer
+            else 0
+        )
         return self.forward(
             ScheduledBatch(
-                seqs={seq.id: seq},
-                num_scheduled_tokens=np.array([tokens], dtype=np.int32),
-                total_tokens_num=tokens,
-                total_tokens_num_prefill=tokens if prefill else 0,
-                total_tokens_num_decode=0 if prefill else tokens,
-                total_seqs_num=1,
-                total_seqs_num_prefill=int(prefill),
-                total_seqs_num_decode=int(not prefill),
-                is_dummy_run=True,
+                seqs={},
+                num_scheduled_tokens=[],
+                total_tokens_num=0,
                 num_spec_step=mtp_k,
-                scheduled_spec_decode_tokens=(
-                    {seq.id: np.zeros(mtp_k, dtype=np.int32)} if mtp_k else None
-                ),
             )
         )
 
     def prefill_token_graphs(self) -> bool:
         """Whether a prefill step replays token graphs -- a bucket some prefill
-        record pass captured -- which is what makes an idle DP rank's dummy
-        prefill worth its decode (`Scheduler.prefill_token_graphs`)."""
+        record pass captured -- which is what makes a DP rank with no prefill of
+        its own give its decode up for an idle step in its peers' prefill
+        (`Scheduler.prefill_token_graphs`)."""
         return bool(TokenGraph.captured_sizes("prefill"))
 
     def warmup_max_tokens(self) -> int:
@@ -1467,6 +1419,8 @@ class ModelRunner:
             )
             for _ in range(num_seqs)
         ]
+        for seq in seqs:
+            seq.type = SequenceType.PREFILL
         seqs = {seq.id: seq for seq in seqs}
 
         num_scheduled_tokens = np.array([seq_len] * num_seqs, dtype=np.int32)
@@ -1622,9 +1576,6 @@ class ModelRunner:
         from atom.utils.h2d import PublicationOwner, PublicationRegistry
 
         registry = PublicationRegistry()
-        transport = envs.ATOM_H2D_BACKEND
-        if transport not in ("direct", "packed"):
-            raise ValueError("ATOM_H2D_BACKEND must be direct or packed")
         self._h2d_owners = []
         self._h2d_groups = []
         for index, variables in enumerate(self._fv_ring):
@@ -1640,38 +1591,47 @@ class ModelRunner:
                     binding = owner.bind(buffer, name, unit=buffer.publication_unit)
                     members.setdefault(buffer.publication_group, []).append(binding)
             groups = {name: owner.group(name, items) for name, items in members.items()}
-            if transport == "packed":
-                # One upload immediately before token assembly's first GPU
-                # consumer. Sampling has no earlier device consumer.
-                if all(name in groups for name in ("sampling", "early", "input_ids")):
-                    token_members = ("sampling", "early", "input_ids")
-                    if "spec_decode" in groups:
-                        token_members += ("spec_decode",)
-                    groups["token_inputs"] = owner.group(
-                        "token_inputs",
-                        [b for name in token_members for b in groups[name].members],
-                    )
-                if "prefill" in groups and "positions" in groups:
-                    groups["prefill_inputs"] = owner.group(
-                        "prefill_inputs",
-                        groups["prefill"].members + groups["positions"].members,
-                    )
-            # Some buffers also publish together at a later consumer boundary
-            # (e.g. MHA decode shares block tables with the prefill group).
-            for name, names in getattr(
-                getattr(self, "attn_metadata_builder", None), "h2d_group_members", {}
-            ).items():
-                groups[name] = owner.group(
-                    name, [variables[item]._publication for item in names]
+            # One upload immediately before token assembly's first GPU
+            # consumer. Sampling has no earlier device consumer.
+            if all(name in groups for name in ("sampling", "early", "input_ids")):
+                token_members = ("sampling", "early", "input_ids")
+                if "spec_decode" in groups:
+                    token_members += ("spec_decode",)
+                groups["token_inputs"] = owner.group(
+                    "token_inputs",
+                    [b for name in token_members for b in groups[name].members],
                 )
-            if transport == "packed":
-                for group in owner.use_packed_transport():
-                    logger.info(
-                        "H2D group %s: %s%s",
-                        group.name,
-                        group.transport,
-                        f" ({group.fallback_reason})" if group.fallback_reason else "",
-                    )
+            # One upload per phase: `prefill_metadata` / `decode_metadata`, and
+            # `ub{i}_` of each for a TBO micro-batch. A builder's declared
+            # members join the group of that name, sharing destinations other
+            # groups also publish (e.g. MHA decode's block tables).
+            composed = {}
+            if "seq_metadata" in groups and "positions" in groups:
+                composed["prefill_metadata"] = [
+                    *groups["seq_metadata"].members,
+                    *groups["positions"].members,
+                ]
+            builder = getattr(self, "attn_metadata_builder", None)
+            builder_members = {} if builder is None else builder.h2d_group_members()
+            for name, names in builder_members.items():
+                members = composed.setdefault(name, [])
+                for item in names:
+                    binding = variables[item]._publication
+                    if binding not in members:
+                        members.append(binding)
+            # The MRoPE planes go up with either phase's metadata.
+            if "mrope" in groups:
+                for name in ("prefill_metadata", "decode_metadata"):
+                    composed.setdefault(name, []).extend(groups["mrope"].members)
+            for name, members in composed.items():
+                groups[name] = owner.group(name, members)
+            for group in owner.use_packed_transport({"token_inputs", *composed}):
+                logger.info(
+                    "H2D group %s: %s%s",
+                    group.name,
+                    group.transport,
+                    f" ({group.fallback_reason})" if group.fallback_reason else "",
+                )
             # Cover constructor uploads, ring clones and transport pointer
             # tables before the first preparation, even on another stream.
             event.record()
@@ -1905,6 +1865,94 @@ class ModelRunner:
         """
         return freeze_gc_heap(worker_process_name(self.config, self.rank))
 
+    def _local_checkpoint_spec(
+        self, plan: PoolPlan, transfer, slot_bytes: int
+    ) -> PagedStateCheckpointSpec:
+        """This worker's own checkpoint geometry, before any PP agreement."""
+        # None means the backend has not narrowed its image: carry it all.
+        narrowed = self.attn_metadata_builder.checkpoint_image_bytes()
+        # The charged entry can be larger than the bytes a transfer
+        # publishes: MHA alignment padding is not a region, and a draft
+        # pool merged into the same class is ordinary KV after the
+        # checkpoint regions. The backend names the published unit.
+        page_unit_bytes = int(plan.entry_bytes[plan.paged_class])
+        published_unit = getattr(
+            self.attn_metadata_builder, "checkpoint_page_unit_bytes", None
+        )
+        if callable(published_unit):
+            published = published_unit()
+            if published is not None:
+                published = int(published)
+                if published <= 0 or published > page_unit_bytes:
+                    raise RuntimeError(
+                        f"checkpoint PAGE unit is {published} B but the "
+                        f"paged pool entry is {page_unit_bytes} B"
+                    )
+                page_unit_bytes = published
+        return PagedStateCheckpointSpec(
+            page_unit_bytes=page_unit_bytes,
+            slot_bytes=slot_bytes,
+            image_bytes=slot_bytes if narrowed is None else int(narrowed),
+            layout_id=transfer.paged_layout_id,
+        )
+
+    def _agree_pipeline_checkpoint_spec(
+        self, spec: PagedStateCheckpointSpec | None
+    ) -> PagedStateCheckpointSpec:
+        """Put every PP stage's checkpoint images on one set of unit ids.
+
+        Only the head schedules, so a store or restore op it builds names the
+        same unit ids on every stage. Each stage holds its own layers' state in
+        its own unit size, so the stages need different counts; all take the
+        largest, and a stage needing fewer leaves its tail units unwritten. An
+        op is checked against the joint layout id and the summed image bytes,
+        which change whenever any stage's geometry does. Collective over the
+        PP group, which holds one rank per stage in stage order.
+
+        A stage that holds no recurrent state passes None, and then every
+        stage refuses with the same error: one raising alone would leave the
+        others waiting here for its geometry.
+        """
+        pp = get_pp_group()
+        stages: list = [None] * pp.world_size
+        torch.distributed.all_gather_object(
+            stages,
+            (
+                None
+                if spec is None
+                else (
+                    spec.layout_id,
+                    spec.image_bytes,
+                    spec.page_unit_bytes,
+                    spec.units_per_checkpoint,
+                )
+            ),
+            group=pp.cpu_group,
+        )
+        stateless = [i for i, entry in enumerate(stages) if entry is None]
+        if stateless:
+            raise RuntimeError(
+                f"PP stages {stateless} of {len(stages)} hold no recurrent "
+                "state, so they cannot keep PAGE-backed state checkpoints; "
+                "give every stage a linear-attention layer "
+                "(VLLM_PP_LAYER_PARTITION)"
+            )
+        units = max(entry[3] for entry in stages)
+        op_bytes = sum(entry[1] for entry in stages)
+        largest_image = max(entry[1] for entry in stages)
+        digest = hashlib.sha256(repr(stages).encode()).hexdigest()[:16]
+        layout_id = f"pp{len(stages)}-joint:{digest}"
+        logger.info(
+            "PAGE-backed state checkpoints span %d PP stages: units=%d "
+            "(per stage %s), op_bytes=%d, layout=%s",
+            len(stages),
+            units,
+            [entry[3] for entry in stages],
+            op_bytes,
+            layout_id,
+        )
+        return spec.for_pipeline(layout_id, units, op_bytes, largest_image)
+
     def get_num_blocks(self) -> dict[str, object]:
         torch.set_default_device(self.device)
         config = self.config
@@ -2040,7 +2088,13 @@ class ModelRunner:
         # Keep runtime state metadata out of Config.
         transfer = self.attn_metadata_builder.state_transfer()
         uses_paged_state = transfer.copies
-        if uses_paged_state and config.pipeline_parallel_size > 1:
+        if (
+            uses_paged_state
+            and config.pipeline_parallel_size > 1
+            and not getattr(
+                self.attn_metadata_builder, "paged_checkpoints_span_pipeline", False
+            )
+        ):
             raise RuntimeError(
                 "PAGE-backed state checkpoints do not yet support pipeline "
                 "parallelism: every stage must first agree on one atomic "
@@ -2057,33 +2111,33 @@ class ModelRunner:
                 raise RuntimeError(
                     "PAGE-backed state checkpoints require a PAGE sub-pool"
                 )
+            is_pp = config.pipeline_parallel_size > 1
+            if is_pp and not torch.distributed.is_initialized():
+                raise RuntimeError(
+                    "PAGE-backed state checkpoints under PP need the "
+                    "distributed groups initialized first"
+                )
             slot_bytes = int(plan.entry_bytes[STATE_SLOT_CLASS])
-            # None means the backend has not narrowed its image: carry it all.
-            narrowed = self.attn_metadata_builder.checkpoint_image_bytes()
-            # The charged entry can be larger than the bytes a transfer
-            # publishes: MHA alignment padding is not a region, and a draft
-            # pool merged into the same class is ordinary KV after the
-            # checkpoint regions. The backend names the published unit.
-            page_unit_bytes = int(plan.entry_bytes[plan.paged_class])
-            published_unit = getattr(
-                self.attn_metadata_builder, "checkpoint_page_unit_bytes", None
+            # A PP stage without a linear-attention layer has no image.
+            local_spec = (
+                self._local_checkpoint_spec(plan, transfer, slot_bytes)
+                if slot_bytes
+                else None
             )
-            if callable(published_unit):
-                published = published_unit()
-                if published is not None:
-                    published = int(published)
-                    if published <= 0 or published > page_unit_bytes:
-                        raise RuntimeError(
-                            f"checkpoint PAGE unit is {published} B but the "
-                            f"paged pool entry is {page_unit_bytes} B"
-                        )
-                    page_unit_bytes = published
-            checkpoint_spec = PagedStateCheckpointSpec(
-                page_unit_bytes=page_unit_bytes,
-                slot_bytes=slot_bytes,
-                image_bytes=slot_bytes if narrowed is None else int(narrowed),
-                layout_id=transfer.paged_layout_id,
-            )
+            if is_pp:
+                # Every stage joins, a stateless one with None: raising before
+                # the collective would leave its peers waiting in it.
+                checkpoint_spec = self._agree_pipeline_checkpoint_spec(local_spec)
+                transfer = dataclasses.replace(
+                    transfer, paged_layout_id=checkpoint_spec.layout_id
+                )
+            elif local_spec is None:
+                raise RuntimeError(
+                    "PAGE-backed state checkpoints need recurrent state, but "
+                    "this model holds none"
+                )
+            else:
+                checkpoint_spec = local_spec
             logger.info(
                 "PAGE-backed state checkpoints enabled: unit_bytes=%d, "
                 "slot_bytes=%d, image_bytes=%d (%.1f%% of a slot), "
@@ -2396,81 +2450,65 @@ class ModelRunner:
             torch.distributed.barrier()
         return True
 
-    def _maybe_create_tbo_slices(
-        self,
-        batch,
-        is_prefill,
-        scheduled_bs,
-        scheduled_tokens,
-        num_scheduled_tokens,
-        tbo_collective_active: bool,
-    ):
-        """Create TBO ubatch slices when the collective DP decision is True.
-
-        With the packed-reduce path the eligibility (local + cross-DP AND)
-        is decided in ``ForwardMode.decide``; here we just realise the split.
-        """
-        if not tbo_collective_active:
-            return None
-
-        tbo_num_reqs = batch.total_seqs_num_prefill if is_prefill else scheduled_bs
-        # tbo_collective_active is the OR-reduced cross-DP decision: this rank
-        # is committed to splitting even if it's below ATOM_TBO_PREFILL_MIN_TOKENS
-        # (a peer cleared the bar). force=True bypasses the local min-token gate
-        # so we don't desync from peers and hang.
-        ubatch_slices = maybe_create_ubatch_slices(
-            num_reqs=tbo_num_reqs,
-            scheduled_tokens=scheduled_tokens,
-            is_prefill=is_prefill,
-            num_scheduled_tokens=num_scheduled_tokens if is_prefill else None,
-            force=True,
-        )
-        if ubatch_slices is not None:
-            logger.debug(
-                f"[TBO] splitting {'prefill' if is_prefill else 'decode'} batch: "
-                f"num_reqs={tbo_num_reqs}, ubatches={len(ubatch_slices)}"
-            )
-        return ubatch_slices
-
     def _local_tbo_eligibility(
         self, batch: ScheduledBatch
     ) -> tuple[bool, bool, int, int]:
-        """This rank's TBO answer, and the PCP flags that ride with it.
+        """This rank's TBO answer.
 
         `(meets_min_tokens, can_split, ub0_tokens, ub1_tokens)`. The first two
         are reduced across DP inside the step's one packed all_gather -- OR and
         AND respectively -- so this is the local half of that question, not a
-        decision. Sets the PCP+TBO routing flags as a side effect because they
-        come out of the same sizing.
+        decision.
         """
-        is_prefill = batch.total_tokens_num_prefill > 0
-        if not self.config.enable_tbo:
-            self._pcp_tbo_balanced_active = False
-            self._pcp_bal_groups = None
+        # A decode does not vote: whether the group splits is
+        # `ForwardMode.decide`'s, from the group's `running_bs`.
+        if not (self.config.enable_tbo and batch.has_prefill):
             return (False, False, 0, 0)
-
-        local_tbo = local_tbo_precompute(
-            self.config, batch, is_prefill, batch.num_scheduled_tokens
-        )
-
         # PCP+TBO prefill: split requests into two GROUPS at a request boundary
         # (never split a sequence's tokens), so each ubatch = "non-TBO PCP on a
-        # request subset". Requires num_reqs >= 2 (request-boundary split needs
-        # two non-empty groups); bs=1 falls back to non-TBO.
+        # request subset" (`cut_pcp_prefill_ubatches`). Requires num_reqs >= 2
+        # (request-boundary split needs two non-empty groups); bs=1 falls back
+        # to non-TBO. PCP is always dp=1, so the single-rank path returns this
+        # verbatim as `tbo_collective_active`, and each micro-batch's token
+        # count is its own slice's (`UBatchWrapper._ub_tokens_across_dp`).
         pcp_size = self.config.prefill_context_parallel_size
-        # Read by build_ubatch / run_model / prepare_prefill to route the
-        # per-group path; reset every step so a stale value cannot route one.
-        self._pcp_tbo_balanced_active = False
-        self._pcp_bal_groups = None
-        if is_prefill and pcp_size > 1 and not batch.is_dummy_run:
-            # PCP is always dp=1, so the single-rank path returns this verbatim
-            # as `tbo_collective_active`; ub0/ub1 are only read under dp > 1.
-            local_tokens = batch.total_tokens_num_prefill // pcp_size
-            eligible = batch.total_seqs_num_prefill >= 2 and local_tokens >= 2
-            ub0 = local_tokens // 2
-            local_tbo = (eligible, eligible, ub0, local_tokens - ub0)
-            self._pcp_tbo_balanced_active = eligible
-        return local_tbo
+        if pcp_size > 1 and not batch.is_dummy_run:
+            eligible = (
+                batch.total_seqs_num_prefill >= 2
+                and batch.total_tokens_num_prefill // pcp_size >= 2
+            )
+            return (eligible, eligible, 0, 0)
+        return prefill_tbo_vote(batch.total_tokens_num_prefill)
+
+    def _cut_ubatches(
+        self, forward_mode: ForwardMode, batch: ScheduledBatch
+    ) -> ForwardMode:
+        """``forward_mode`` with the step's TBO micro-batches, cut once on the
+        shape it settled: a decode by request, as its graphs are recorded; a
+        PCP prefill at a request boundary; any other prefill by token."""
+        if not forward_mode.tbo_collective_active:
+            return forward_mode
+        pcp_groups = None
+        if not forward_mode.is_prefill:
+            scheduled_bs = forward_mode.scheduled_bs
+            ubatch_slices = cut_decode_ubatches(
+                forward_mode.running_bs,
+                forward_mode.running_tokens,
+                np.asarray(batch.num_scheduled_tokens[:scheduled_bs]),
+            )
+        elif self.config.prefill_context_parallel_size > 1 and not batch.is_dummy_run:
+            ubatch_slices, pcp_groups = cut_pcp_prefill_ubatches(
+                batch.num_scheduled_tokens,
+                batch.total_seqs_num_prefill,
+                self.config.prefill_context_parallel_size,
+            )
+        else:
+            ubatch_slices = cut_prefill_ubatches(
+                batch.total_seqs_num_prefill,
+                batch.num_scheduled_tokens,
+                forward_mode.running_tokens,
+            )
+        return replace(forward_mode, ubatch_slices=ubatch_slices, pcp_groups=pcp_groups)
 
     def _dspark_apply_q_bucket(self, batch: ScheduledBatch) -> int | None:
         """Shrink this decode step's verify length to one CUDA-graph bucket q,
@@ -2620,13 +2658,14 @@ class ModelRunner:
 
         A P/D producer keeps the drafter only to write its context KV; the
         scheduler never pads drafts for it, so its decodes (the step that
-        surfaces a deferred T0) are q=1 and have nothing to verify.
+        surfaces a deferred T0) are q=1 and have nothing to verify. Nor has a
+        step with no request (an idle DP rank's).
         """
         return (
             not is_prefill
             and hasattr(self, "drafter")
             and not self.tokenID_processor.is_pd_producer
-            and not batch.is_dummy_run
+            and batch.total_seqs_num_decode > 0
         )
 
     def prepare_inputs(
@@ -2635,21 +2674,15 @@ class ModelRunner:
         input_ids: torch.Tensor,
         forward_mode: ForwardMode,
         *,
-        spec_decode_indices: tuple[np.ndarray, int] | None = None,
+        spec_decode_indices: tuple[np.ndarray, int] | None,
     ):
         # Always supplied, settled in `prepare_model` (which is where the reason
         # lives). The q-bucket shrink ran there too, so `batch` is already
         # reduced here.
-        is_prefill = batch.total_tokens_num_prefill > 0
-        scheduled_bs = batch.total_seqs_num
+        is_prefill = forward_mode.is_prefill
         scheduled_tokens = batch.total_tokens_num
-        num_scheduled_tokens = batch.num_scheduled_tokens
         sync = forward_mode.sync
-        tbo_collective_active = forward_mode.tbo_collective_active
         running_tokens_are_unified = forward_mode.running_tokens_are_unified
-
-        if not tbo_collective_active:
-            self._pcp_tbo_balanced_active = False
 
         # The step's two units, read from where they were settled: `running_bs`
         # sizes everything per-sequence, `running_tokens` everything per-row.
@@ -2657,18 +2690,17 @@ class ModelRunner:
         running_tokens = forward_mode.running_tokens
         spec_decode_metadata = None
         if self._verifies_drafts(batch, is_prefill):
-            _, lens, cu = self.attn_metadata_builder.decode_spans(batch)
-            # Inside the staging window: without the token group it publishes
-            # the indices itself. Packed indices already share the token upload.
             spec_decode_metadata = self.drafter.calc_spec_decode_metadata(
-                lens, cu[1:], input_ids, prepared_indices=spec_decode_indices
+                input_ids, spec_decode_indices
             )
         attn_metadata, positions = self.attn_metadata_builder.build(
             batch=batch,
             running_bs=running_bs,
             running_tokens=running_tokens,
             max_seqlen_q=forward_mode.max_seqlen_q,
-            ubatch_split_bs=forward_mode.ubatch_split_bs,
+            is_prefill=is_prefill,
+            ubatch_slices=forward_mode.ubatch_slices,
+            pcp_groups=forward_mode.pcp_groups,
         )
         self.attn_metadata_builder.prepare_model_inputs(input_ids, attn_metadata)
         context = Context(
@@ -2684,44 +2716,19 @@ class ModelRunner:
             scheduled_tokens_gpu=self.forward_vars["batch_info"].gpu[1:2],
         )
 
-        pcp_size = self.config.prefill_context_parallel_size
-        _pcp_tbo_balanced = (
-            is_prefill
-            and pcp_size > 1
-            and tbo_collective_active
-            and not batch.is_dummy_run
-            and getattr(self, "_pcp_tbo_balanced_active", False)
-        )
-        if _pcp_tbo_balanced:
-            # Request-boundary split for PCP+TBO prefill (see
-            # _build_pcp_balanced_slices). forward_vars stay GLOBAL here.
-            ubatch_slices, self._pcp_bal_groups = self._build_pcp_balanced_slices(
-                batch, num_scheduled_tokens, pcp_size
-            )
-        else:
-            ubatch_slices = self._maybe_create_tbo_slices(
-                batch,
-                is_prefill,
-                scheduled_bs if not is_prefill else 0,
-                scheduled_tokens,
-                num_scheduled_tokens,
-                tbo_collective_active,
-            )
-
         set_forward_context(
             attn_metadata=attn_metadata,
             atom_config=self.config,
             context=context,
             running_tokens_per_dp_rank=self.running_tokens_per_dp_rank,
             spec_decode_metadata=spec_decode_metadata,
-            ubatch_slices=ubatch_slices,
-            ub_max_tokens_across_dp=sync.ub_max_tokens_across_dp,
+            ubatch_slices=forward_mode.ubatch_slices,
             ub_tokens_across_dp=sync.ub_tokens_across_dp,
         )
 
     @h2d_producer("sampling")
     def prepare_sample(
-        self, batch: ScheduledBatch, *, publication_group=None
+        self, batch: ScheduledBatch, publication_group
     ) -> tuple[
         torch.Tensor, int | torch.Tensor | None, float | torch.Tensor | None, bool, bool
     ]:
@@ -2771,7 +2778,7 @@ class ModelRunner:
         batch.logprob_rows = None
         if getattr(batch, "any_logprobs", False):
             lengths, width = None, 1
-            if self._verifies_drafts(batch, batch.total_tokens_num_prefill > 0):
+            if self._verifies_drafts(batch, batch.has_prefill):
                 _, lengths, _ = self.attn_metadata_builder.decode_spans(batch)
                 width = self.drafter.mtp_k + 1
             requested, model_rows, sample_rows = host_logprob_rows(
@@ -2798,19 +2805,16 @@ class ModelRunner:
             ] = batch.required_channel_states
             channel_count = bs
 
-        group = (
-            self.h2d_groups["sampling"]
-            if publication_group is None
-            else publication_group
+        # Published with the token inputs (`prepare_input_ids`).
+        publication_group.set_counts(
+            {
+                "temperatures": bs,
+                "top_ks": top_k_count,
+                "top_ps": top_p_count,
+                "required_channel_states": channel_count,
+                "logprob_request_indices": logprob_count,
+            }
         )
-        counts = group.counts
-        counts[group.indices["temperatures"]] = bs
-        counts[group.indices["top_ks"]] = top_k_count
-        counts[group.indices["top_ps"]] = top_p_count
-        counts[group.indices["required_channel_states"]] = channel_count
-        counts[group.indices["logprob_request_indices"]] = logprob_count
-        if publication_group is None:
-            group.publish(counts)
         temperatures = temp_buffer.gpu[:bs]
 
         return temperatures, top_ks, top_ps, all_greedy, needs_independent_noise
@@ -2838,46 +2842,40 @@ class ModelRunner:
             max_seqlen_q=(batch.num_spec_step + 1 if shrunk_q is None else shrunk_q),
             running_tokens_per_dp_rank=self.running_tokens_per_dp_rank,
             graph_shapes=self._producer_graph_shapes(),
+            tbo_decode=self.config.enable_tbo_decode,
             tbo_decode_graphs=self.tbo_decode_graphs,
         )
+        forward_mode = self._cut_ubatches(forward_mode, batch)
         # Stash the DP-wide prefill OR for the EPLB prefill gate; reused free by
         # on_forward_pass_end when the DP group == the migration (EP) group.
         self._eplb_any_rank_has_prefill = forward_mode.sync.any_rank_has_prefill
-        total_tokens_num = batch.total_tokens_num
-        assert total_tokens_num > 0
-
-        token_group = self.h2d_groups.get("token_inputs")
+        token_group = self.h2d_groups["token_inputs"]
         spec_decode_indices = None
         temperatures, top_ks, top_ps, all_greedy, needs_independent_noise = (
-            self.prepare_sample(batch, publication_group=token_group)
+            self.prepare_sample(batch, token_group)
         )
-        if token_group is None:
-            self.attn_metadata_builder.publish_cu_seqlens_q(batch, forward_mode)
-            input_ids = self.tokenID_processor.prepare_input_ids(
-                batch, forward_mode.max_seqlen_q
+        query_counts = self.attn_metadata_builder.prepare_query_metadata(
+            self.attn_metadata_builder.query_lengths(
+                batch, forward_mode.is_prefill, forward_mode.running_tokens
+            ),
+            forward_mode.running_bs,
+            forward_mode.running_tokens,
+            forward_mode.decode_ubatch_slices,
+        )
+        token_group.set_counts(query_counts)
+        spec_group = self.h2d_groups.get("spec_decode")
+        if spec_group is not None and self._verifies_drafts(
+            batch, forward_mode.is_prefill
+        ):
+            _, lens, cu = self.attn_metadata_builder.decode_spans(batch)
+            spec_decode_indices = self.drafter.prepare_spec_decode_indices(
+                lens, cu[1:], token_group
             )
-        else:
-            cu_count = self.attn_metadata_builder.prepare_cu_seqlens_q(
-                batch, forward_mode
-            )
-            token_group.counts[token_group.indices["cu_seqlens_q"]] = cu_count
-            spec_group = self.h2d_groups.get("spec_decode")
-            if spec_group is not None:
-                if self._verifies_drafts(batch, batch.total_tokens_num_prefill > 0):
-                    _, lens, cu = self.attn_metadata_builder.decode_spans(batch)
-                    spec_decode_indices = self.drafter.prepare_spec_decode_indices(
-                        lens, cu[1:], token_group
-                    )
-                else:
-                    # A preceding decode may have filled these counts. Forwards
-                    # that verify nothing must not publish its stale indices.
-                    for binding in spec_group.members:
-                        token_group.counts[token_group.indices[binding.name]] = None
-            # No GPU consumer runs between these host producers and this
-            # upload. Token assembly publishes before launching its kernel.
-            input_ids = self.tokenID_processor.prepare_input_ids(
-                batch, forward_mode.max_seqlen_q, publication_group=token_group
-            )
+        # No GPU consumer runs between these host producers and this
+        # upload. Token assembly publishes before launching its kernel.
+        input_ids = self.tokenID_processor.prepare_input_ids(
+            batch, forward_mode.max_seqlen_q, token_group
+        )
         self.prepare_inputs(
             batch,
             input_ids,
@@ -2922,57 +2920,6 @@ class ModelRunner:
             f" sqsk={batch.detailed_sqsk}"
             f" sk={batch.detailed_sk}"
         )
-
-    def _build_pcp_balanced_slices(
-        self,
-        batch: ScheduledBatch,
-        num_scheduled_tokens: np.ndarray,
-        pcp_size: int,
-    ) -> "tuple[list[UBatchSlice], list[PcpBalGroup]]":
-        """Build request-boundary-split ubatch slices for PCP+TBO prefill.
-
-        Split REQUESTS into two groups at a request boundary near the token
-        midpoint. Each group is an independent "non-TBO PCP mini-batch": padded
-        to a pcp multiple and round-robin striped as a whole, so every sequence
-        stays intact in one group (root-fixes token-split R1/R2). forward_vars
-        stay GLOBAL here; build_ubatch_prefill_metadata slices the FULL
-        (un-reindexed) metadata per group and calls _apply_pcp_reindex on it.
-
-        Returns (ubatch_slices, groups): token_slice is in the LOCAL concat
-        space [g0_local | g1_local] that run_model produces (see
-        _apply_pcp_balanced_stripe); groups are the PcpBalGroup descriptors
-        consumed by run_model (per-group stripe) and
-        build_ubatch_prefill_metadata (slice + reindex).
-        """
-        num_prefill_reqs = batch.total_seqs_num_prefill
-        per_req = np.asarray(num_scheduled_tokens[:num_prefill_reqs], dtype=np.int64)
-        total_tok = int(per_req.sum())
-        cum = np.cumsum(per_req)  # cum[j] = sum of reqs [0..j]
-        target = total_tok // 2
-        # request boundary whose cumulative token count is closest to target
-        split_idx = int(np.searchsorted(cum, target, side="left")) + 1
-        split_idx = max(1, min(split_idx, num_prefill_reqs - 1))
-        # global token count of group0 (reqs [0:split_idx])
-        b0 = int(cum[split_idx - 1])
-        h0 = pcp_pad_len(b0, pcp_size)
-        h1 = pcp_pad_len(total_tok - b0, pcp_size)
-        l0 = h0 // pcp_size
-        l1 = h1 // pcp_size
-        ubatch_slices = [
-            UBatchSlice(
-                request_slice=slice(0, split_idx),
-                token_slice=slice(0, l0),
-            ),
-            UBatchSlice(
-                request_slice=slice(split_idx, num_prefill_reqs),
-                token_slice=slice(l0, l0 + l1),
-            ),
-        ]
-        groups = [
-            PcpBalGroup(0, split_idx, 0, b0, h0),
-            PcpBalGroup(split_idx, num_prefill_reqs, b0, total_tok, h1),
-        ]
-        return ubatch_slices, groups
 
     def _apply_pcp_balanced_stripe(
         self,
@@ -3107,8 +3054,9 @@ class ModelRunner:
         )
         assert ids.shape[0] == running and positions.shape[-1] == running
         if running > scheduled:
+            # The builders publish `positions` (and the MRoPE plane) out to
+            # `running_tokens` themselves.
             ids[scheduled:].zero_()
-            positions[..., scheduled:].zero_()
         return ids, positions
 
     @_profile_runner_stage
@@ -3133,7 +3081,6 @@ class ModelRunner:
             "through prepare_model. Add ForwardMode.decide() at the new "
             "entry point instead of re-deriving the 4-OR dispatch here."
         )
-
         # Single canonical shape check; contract owned by ForwardMode, which
         # short-circuits only on prefill. The padded step is the one it is for.
         forward_mode.assert_shape_contract(input_ids, forward_context.attn_metadata)
@@ -3156,7 +3103,8 @@ class ModelRunner:
         label = build_run_label(
             is_prefill=is_prefill,
             use_cudagraph=forward_mode.use_cudagraph,
-            is_dummy=context.is_dummy_run,
+            # A DP-sync step: one with no request.
+            is_dummy=bs == 0,
             tbo_on=forward_context.ubatch_slices is not None,
             scheduled_bs=bs,
             running_bs=context.running_bs,
@@ -3171,15 +3119,8 @@ class ModelRunner:
         # _apply_pcp_balanced_stripe). _pcp_tbo_balanced also gates the per-group
         # output restore further below.
         _pcp_size = self.config.prefill_context_parallel_size
-        _pcp_bal_groups = getattr(self, "_pcp_bal_groups", None)
-        _pcp_tbo_balanced = (
-            _pcp_size > 1
-            and isinstance(self.model, UBatchWrapper)
-            and forward_context.ubatch_slices is not None
-            and is_prefill
-            and not forward_context.context.is_dummy_run
-            and _pcp_bal_groups is not None
-        )
+        _pcp_bal_groups = forward_mode.pcp_groups
+        _pcp_tbo_balanced = _pcp_bal_groups is not None
         if _pcp_tbo_balanced:
             input_ids, positions = self._apply_pcp_balanced_stripe(
                 input_ids, positions, _pcp_bal_groups, _pcp_size, forward_context
@@ -3316,9 +3257,9 @@ class ModelRunner:
                         model_output = self._restore_pcp_balanced_output(
                             model_output, _pcp_bal_groups, _pcp_size
                         )
-                    # PP carries the full run between stages. Only the last
-                    # stage returns scheduled rows to sampling/draft consumers.
-                    hidden_states = model_output[: context.scheduled_tokens]
+                    # The LM head and a drafter run the running tokens;
+                    # `postprocess` cuts to the scheduled ones.
+                    hidden_states = model_output[: forward_mode.running_tokens]
                     logits = self.model.compute_logits(hidden_states)
         else:
             # decode[bs=128 tok=128 d=128] / decode[... p=2 d=126 spec=3] /
@@ -3335,17 +3276,7 @@ class ModelRunner:
                     model_output = self.model(_ids, _pos)
                     # model_output is always a plain Tensor; drafter aux capture
                     # (if any) already wrote its own buffers inside the forward.
-                    # Spec keeps the padded layout (postprocess/draft re-gather to
-                    # bs via next_token_locs); non-spec cuts to the scheduled rows
-                    # so pad rows never leak into sampled_token_ids ->
-                    # prev_token_ids -> next-step shape mismatch.
-                    hidden_states = model_output[
-                        : (
-                            running_tokens
-                            if hasattr(self, "drafter")
-                            else scheduled_tokens
-                        )
-                    ]
+                    hidden_states = model_output[:running_tokens]
                     logits = self.model.compute_logits(hidden_states)
                     return logits, hidden_states
 
@@ -3353,7 +3284,7 @@ class ModelRunner:
                     running_bs, forward_context.attn_metadata.max_seqlen_q
                 )
                 logits = self.req_graph.replay(key=graph_key)
-                hidden_states = self.forward_vars["outputs"][:scheduled_tokens]
+                hidden_states = self.forward_vars["outputs"][:running_tokens]
                 # Drafter aux buffers (if any) refresh on replay: their in-place
                 # copy ops were captured into the graph.
                 if logits is not None:
@@ -3471,9 +3402,10 @@ class ModelRunner:
                 )
             structured_prefixes = structured.apply(logits, batch, spec_decode_metadata)
         if spec_decode_metadata is None:
-            # The LM head emitted one row per sequence the step FORWARDED,
-            # which prefill pads to `running_bs` for the draft pass that
-            # follows it. Cut to the scheduled batch here and nowhere else:
+            # The LM head emitted one row per row the step FORWARDED, which a
+            # decode keeps at `running_bs` for the draft pass that follows it
+            # (a prefill emits the scheduled requests' last tokens only). Cut to
+            # the scheduled batch here and nowhere else:
             # this is the boundary where a padded forward becomes a
             # per-request result, and everything below counts requests -- the
             # sampler's per-row parameters and the logprob gather both. Cut
@@ -3599,11 +3531,17 @@ class ModelRunner:
             sampled_logprobs,
             channel_states=channel_states,
         )
-        # Extract req_ids and token_ids from dict (key -1 is the is_deferred_out flag)
-        req_ids_out = [k for k in token_id_dict if k != -1]
-        token_ids_out = [token_id_dict[k] for k in req_ids_out]
+        req_ids_out = list(token_id_dict)
+        token_ids_out = list(token_id_dict.values())
 
         draft_token_ids: np.ndarray | None = None
+        next_token_ids = None
+        if hasattr(self, "drafter"):
+            next_token_ids = torch.gather(
+                sampled_tokens.view(bs, batch.num_spec_step + 1),
+                1,
+                next_token_locs.view(-1, 1),
+            ).view(bs)
         if self.tokenID_processor.is_deferred_out:
             if hasattr(self, "drafter"):
                 prev_rejected_num = self.tokenID_processor.prev_rejected_num
@@ -3611,14 +3549,11 @@ class ModelRunner:
                 self.tokenID_processor.spec_status_queue.send(
                     spec_counts, ready=self.forward_done_event
                 )
-                next_token_ids = torch.gather(
-                    sampled_tokens.view(bs, -1), 1, next_token_locs.view(-1, 1)
-                ).view(bs)
                 self.tokenID_processor.prev_token_ids = next_token_ids
                 draft_token_ids = self.propose_draft_token_ids(
                     batch,
                     self.tokenID_processor.input_ids.gpu[
-                        1 : batch.total_tokens_num + 1
+                        1 : hidden_states.shape[0] + 1
                     ],
                     hidden_states,
                     next_token_ids,
@@ -3648,13 +3583,10 @@ class ModelRunner:
             if hasattr(self, "drafter"):
                 # Mid-prompt sequences get their anchor corrected inside
                 # propose_draft_token_ids, from `batch.next_token_ids`.
-                next_token_ids = torch.gather(
-                    sampled_tokens.view(bs, -1), 1, next_token_locs.view(-1, 1)
-                ).view(bs)
                 draft_token_ids = self.propose_draft_token_ids(
                     batch,
                     self.tokenID_processor.input_ids.gpu[
-                        1 : batch.total_tokens_num + 1
+                        1 : hidden_states.shape[0] + 1
                     ],
                     hidden_states,
                     next_token_ids,
@@ -3792,7 +3724,7 @@ class ModelRunner:
                 self.propose_draft_token_ids(
                     batch,
                     self.tokenID_processor.input_ids.gpu[
-                        1 : batch.total_tokens_num + 1
+                        1 : hidden_states.shape[0] + 1
                     ],
                     hidden_states,
                     torch.zeros(
@@ -4304,11 +4236,13 @@ class ModelRunner:
         def stage_and_build(*args, **kwargs):
             bs = kwargs.get("bs", args[0] if args else None)
             q_len = kwargs.get("max_q_len", full_q_len)
-            if not self.attn_metadata_builder.capture_owns_cu_seqlens_q:
-                cu = self.forward_vars["cu_seqlens_q"]
-                cu.np[: bs + 1] = np.arange(0, (bs + 1) * q_len, q_len, dtype=np.int32)
-                cu.copy_to_gpu(bs + 1)
             tokens = bs * q_len
+            self.attn_metadata_builder.publish_query_metadata(
+                np.full(bs, q_len, dtype=np.int32),
+                bs,
+                tokens,
+                kwargs.get("decode_ubatch_slices"),
+            )
             self.forward_vars["positions"].np[:tokens] = (
                 np.arange(tokens, dtype=np.int64) % q_len
             )
@@ -4343,12 +4277,20 @@ class ModelRunner:
                     # its handful of Python statements just fold into the next
                     # iteration's window.
                     self._capture_trace_tag = f"bs_{bs}_q_{max_q_len}"
-                    if supports_dynamic_q_len:
-                        attn_metadata, context = build_capture(
-                            bs=bs, max_q_len=max_q_len
+                    # A bucket that splits is recorded split at the bucket
+                    # (`ForwardMode.decode_ubatch_slices`).
+                    ubatch_slices = None
+                    if self.tbo_decode_graphs and decode_bucket_splits(bs):
+                        ubatch_slices = cut_decode_ubatches(
+                            bs, running_tokens, np.full(bs, max_q_len)
                         )
-                    else:
-                        attn_metadata, context = build_capture(bs=bs)
+                    capture_kwargs = {
+                        "bs": bs,
+                        "decode_ubatch_slices": ubatch_slices,
+                    }
+                    if supports_dynamic_q_len:
+                        capture_kwargs["max_q_len"] = max_q_len
+                    attn_metadata, context = build_capture(**capture_kwargs)
                     if self.use_mrope:
                         mrope_positions = self._mrope_positions_view(running_tokens)
                         mrope_positions.copy_(
@@ -4356,23 +4298,6 @@ class ModelRunner:
                         )
                         context.positions = mrope_positions
                     self.running_tokens_per_dp_rank.fill(running_tokens)
-                    # A bucket that splits is recorded split at the bucket
-                    # (`ForwardMode.ubatch_split_bs`). Every rank records the
-                    # same bucket, so each micro-batch's per-rank rows are its
-                    # own, repeated.
-                    ubatch_slices = ub_tokens_across_dp = ub_max_tokens = None
-                    if self.tbo_decode_graphs and decode_bucket_splits(bs):
-                        ubatch_slices = maybe_create_ubatch_slices(
-                            num_reqs=bs, scheduled_tokens=running_tokens
-                        )
-                        ub_max_tokens = tuple(
-                            s.token_slice.stop - s.token_slice.start
-                            for s in ubatch_slices
-                        )
-                        dp = len(self.running_tokens_per_dp_rank)
-                        ub_tokens_across_dp = tuple(
-                            (rows,) * dp for rows in ub_max_tokens
-                        )
                     set_forward_context(
                         attn_metadata=attn_metadata,
                         atom_config=self.config,
@@ -4380,8 +4305,6 @@ class ModelRunner:
                         running_tokens_per_dp_rank=self.running_tokens_per_dp_rank,
                         ubatch_slices=ubatch_slices,
                         in_hipgraph=True,
-                        ub_max_tokens_across_dp=ub_max_tokens,
-                        ub_tokens_across_dp=ub_tokens_across_dp,
                     )
 
                     # Warmup
