@@ -91,24 +91,61 @@ def refuse_kda_ride_without_prerequisites(vllm_config) -> None:
 
 
 def _attention_layer_bytes(group) -> list[int]:
-    """Bytes per block each attention layer publishes, in PAGE order.
+    """Bytes per block each attention layer publishes, in vLLM's order.
 
-    The order and grouping `build_kv_cache_tensors` publishes: one layer per
-    owner, sorted by `_layer_sort_key`, with a DSA indexer's cache folded into
-    the layer that owns it (`index_cache_owner`). A layer may publish several
-    planes (its cache, an index cache), so this sums them per layer; how many
-    planes that is, the worker reads off the regions it publishes.
+    The order vLLM allocates the group in, which is the order it aliases mamba
+    layer ``j`` onto attention layer ``j``, and the order `kda_ride_page_order`
+    publishes the aliased layers in. A DSA indexer's cache is folded into the
+    layer that owns it (`index_cache_owner`), as `build_kv_cache_tensors`
+    publishes it: a layer may publish several planes, so this sums them per
+    layer, and the worker reads off the regions how many planes that is.
     """
-    from .kv_cache_layout import _layer_sort_key, index_cache_owner
+    from .kv_cache_layout import index_cache_owner
 
     spec = group.kv_cache_spec
     members = getattr(spec, "kv_cache_specs", None)
+    names = list(members) if isinstance(members, dict) and members else []
+    names += [name for name in group.layer_names if name not in names]
     per_layer: dict[str, int] = {}
-    for name in group.layer_names:
-        member = members[name] if isinstance(members, dict) and members else spec
+    for name in names:
+        member = members[name] if name in (members or {}) else spec
         owner = index_cache_owner(name) or name
         per_layer[owner] = per_layer.get(owner, 0) + int(member.page_size_bytes)
-    return [per_layer[name] for name in sorted(per_layer, key=_layer_sort_key)]
+    return list(per_layer.values())
+
+
+def kda_ride_page_order(tensors, tensors_by_group):
+    """The attention layers in PAGE order for the KDA ride.
+
+    The layers the mamba layers alias come first, in mamba-layer order, then
+    the rest in the order given. ATOM publishes PAGE planes by layer name
+    (`build_kv_cache_tensors`) while vLLM aliases mamba layer ``j`` onto the
+    ``j``-th attention layer it allocates, and the two orders differ: on
+    Kimi-K3 with DSpark, five of the 29 attention layers sort ahead of the
+    first one a mamba layer aliases. The image covers a leading run of planes,
+    so the aliased layers are moved to the front, matched on addresses, and
+    renumbered so the region names follow the new order.
+    """
+    import dataclasses
+
+    at = {int(tensor.k_cache.data_ptr()): i for i, tensor in enumerate(tensors)}
+    aliased: list[int] = []
+    for j in range(max(len(group) for group in tensors_by_group)):
+        hits = {
+            at.get(int(group[j].data_ptr()))
+            for group in tensors_by_group
+            if j < len(group)
+        }
+        if len(hits) != 1 or None in hits or next(iter(hits)) in aliased:
+            raise ValueError(
+                f"ATOM offload connector: mamba layer {j} of the KDA groups does "
+                "not start where exactly one attention layer's cache starts "
+                f"(matched {sorted(map(str, hits))}); its state is not in the "
+                "PAGE pool a transfer moves"
+            )
+        aliased.append(hits.pop())
+    order = aliased + [i for i in range(len(tensors)) if i not in set(aliased)]
+    return [dataclasses.replace(tensors[i], layer_num=n) for n, i in enumerate(order)]
 
 
 def _published_layer(region) -> int:
@@ -543,6 +580,7 @@ __all__ = [
     "KdaRideGeometry",
     "KdaRidePlanner",
     "kda_ride_geometry",
+    "kda_ride_page_order",
     "publish_kda_ride_state",
     "refuse_kda_ride_without_prerequisites",
 ]

@@ -56,6 +56,7 @@ from atom.kv_transfer.offload.config import select_offload_layout
 from atom.plugin.vllm.kv_transfer.kda_ride import (
     KdaRidePlanner,
     kda_ride_geometry,
+    kda_ride_page_order,
     publish_kda_ride_state,
     refuse_kda_ride_without_prerequisites,
 )
@@ -907,6 +908,12 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             tensors = build_kv_cache_tensors(attention_caches, self._attention_layers())
             if not tensors:
                 raise ValueError("ATOM offload connector: vLLM registered no KV caches")
+            if self._state_rides_mp:
+                # The image covers a leading run of PAGE planes: put the layers
+                # the KDA state aliases there (`kda_ride_page_order`).
+                tensors = kda_ride_page_order(
+                    tensors, self._kda_state_tensors(per_group, list(groups))
+                )
 
             # Every segment's per-block stride is derived from num_blocks, so it
             # has to be the count of blocks vLLM's block tables name, which is
@@ -939,7 +946,9 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             if self._state_rides_mp and self._is_deepseek_v41:
                 self._publish_v41_state_checkpoints(transfer_tensors, replication)
             elif self._state_rides_mp:
-                self._publish_kda_ride_state(per_group, list(groups), transfer_tensors)
+                self._publish_kda_ride_state(
+                    self._kda_state_tensors(per_group, list(groups)), transfer_tensors
+                )
             logger.info(
                 "ATOM LMCache offload: publishing PAGE layout (%s), "
                 "tp_replication_factor=%d",
@@ -992,18 +1001,16 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 dtype,
             )
 
-    def _publish_kda_ride_state(self, per_group, groups, transfer_tensors) -> None:
-        """Declare the KDA state's images on the PAGE layout (`kda_ride`).
+    def _kda_state_tensors(self, per_group, groups) -> list:
+        """The mamba groups' registered layers, in group order and within a
+        group vLLM's own layer order (`gather_group_tensors`)."""
+        group_ids = [group_id for group_id, _ in self._mamba_groups]
+        return gather_group_tensors(per_group, groups, group_ids)
 
-        Group order, and within a group vLLM's own layer order, as the
-        in-process leg gathers them (`gather_group_tensors`); the image itself
-        is whole PAGE units, so the order only names what is checked.
-        """
-        geometry = self._kda_ride_geometry()
+    def _publish_kda_ride_state(self, tensors_by_group, transfer_tensors) -> None:
+        """Declare the KDA state's images on the PAGE layout (`kda_ride`)."""
         publish_kda_ride_state(
-            transfer_tensors,
-            gather_group_tensors(per_group, groups, list(geometry.group_ids)),
-            geometry,
+            transfer_tensors, tensors_by_group, self._kda_ride_geometry()
         )
 
     def _publish_v41_state_checkpoints(self, transfer_tensors, replication: int):

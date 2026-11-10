@@ -15,6 +15,7 @@ from atom.plugin.vllm.kv_transfer.connector import AtomLMCacheOffloadConnector
 from atom.plugin.vllm.kv_transfer.kda_ride import (
     KdaRidePlanner,
     kda_ride_geometry,
+    kda_ride_page_order,
     publish_kda_ride_state,
     refuse_kda_ride_without_prerequisites,
 )
@@ -119,10 +120,13 @@ def test_k3s_image_is_three_units_over_the_leading_23_layers():
 _N, _PAGE, _STATE = 5, 64, 48  # blocks, page bytes, state bytes per block
 
 
-def _pool(*, alias=True, index=0):
+def _pool(*, alias=True, index=0, extra_first=False):
     """vLLM's allocation in miniature: one buffer, every group layer-outer
-    from byte 0, so mamba layer j shares MLA plane j's bytes; index caches
-    after the MLA planes, as vLLM lays out MLA with a DSA indexer."""
+    from byte 0, so mamba layer j shares attention layer j's bytes; index
+    caches after the MLA planes, as vLLM lays out MLA with a DSA indexer.
+    *extra_first* publishes the one layer no mamba layer aliases ahead of the
+    others, as K3's layer names sort with DSpark; the ride's page order
+    (`kda_ride_page_order`) puts the aliased layers back in front."""
     from atom.config import KVCacheTensor
     from atom.plugin.vllm.kv_transfer.mp_page_layout import build_mp_transfer_tensors
 
@@ -133,7 +137,6 @@ def _pool(*, alias=True, index=0):
         at = 4 * _N * _PAGE + j * _N * index
         idx = buffer[at:][: _N * index].view(_N, index) if index else None
         tensors.append(KVCacheTensor(layer_num=j, k_cache=k, index_cache=idx))
-    transfer = build_mp_transfer_tensors(tensors, num_blocks=_N)
     state_buffer = buffer if alias else torch.zeros_like(buffer)
     kda = [
         [
@@ -147,23 +150,33 @@ def _pool(*, alias=True, index=0):
         ]
         for _ in range(2)
     ]
+    if extra_first:
+        tensors = [tensors[3], *tensors[:3]]
+    if alias:
+        tensors = kda_ride_page_order(tensors, kda)
+    transfer = build_mp_transfer_tensors(tensors, num_blocks=_N)
     config, groups = _kv_cache_config(
         attention=4, mamba=(3, 3), page=_PAGE, block=16, state=_STATE, index=index
     )
     return transfer, kda, kda_ride_geometry(config, 0, groups)
 
 
-@pytest.mark.parametrize("index", [0, 16], ids=["mla", "mla+dsa_index"])
-def test_the_state_rides_as_the_native_layout_registers_it(index):
+@pytest.mark.parametrize(
+    "index, extra_first",
+    [(0, False), (16, False), (0, True)],
+    ids=["mla", "mla+dsa_index", "unaliased_layer_sorts_first"],
+)
+def test_the_state_rides_as_the_native_layout_registers_it(index, extra_first):
     """Image unit ``j`` of the layout the worker registers holds mamba group
     ``j``'s state in the block that unit names; a DSA index plane between the
-    MLA planes is carried along, not mistaken for the next layer."""
+    MLA planes is carried along, and a layer no mamba layer aliases is moved
+    out of the image's planes however it sorts."""
     pytest.importorskip("vllm")
     from atom.kv_transfer.offload.mp.native_state_layout import (
         build_native_state_mp_layout,
     )
 
-    transfer, kda, geometry = _pool(index=index)
+    transfer, kda, geometry = _pool(index=index, extra_first=extra_first)
     per_layer = 2 if index else 1
     publish_kda_ride_state(transfer, kda, geometry)
     assert transfer.paged_state_region_count == 3 * per_layer
