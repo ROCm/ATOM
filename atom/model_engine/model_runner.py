@@ -839,6 +839,17 @@ class ModelRunner:
         self.attn_backend = get_attn_backend(self.attn_family)
         self._setup_device_and_distributed(rank, config)
 
+        # aiter kernel providers: opt-in, one configure() per worker process,
+        # after device/distributed state is up and before the model is built /
+        # loaded / warmed / captured. aiter snapshots config+discovery at the
+        # first dispatch, so a later hook would silently serve native; every
+        # spawned worker is its own interpreter and must configure here.
+        # Default off: configure_aiter_providers() returns without calling
+        # aiter.plugin.configure(), so the non-fused path is unchanged.
+        from atom.aiter_provider import configure_aiter_providers
+
+        configure_aiter_providers(self.config)
+
         self.capture_sizes = [0]  # for eager fallback
         # The same ladder as an ASCENDING int32 array, which is what
         # `ForwardMode.decide` searches. Separate from the list because the list

@@ -1,140 +1,318 @@
 # SPDX-License-Identifier: MIT
-"""CPU checks of the fused SP QKV runtime against AITER's shipped profile and
-its call-id and fail-stop contracts."""
+"""CPU checks for the provider-backed MiniMax-M3 SP QKV prologue.
 
+No AITER/triton/GPU is needed: the provider interface, the neutral op and the
+attention tail are faked.  Pins the required behaviour:
+* configure() is called exactly when --aiter-provider-enable is set;
+* the ``aiter.plugin.explain`` gate selects provider vs #3084's non-fused path;
+* the flat 15-argument + keyword payload matches the neutral contract;
+* a provider decline keeps the non-fused path (no fused call, no exception);
+* no removed ``aiter.gemm_fusion`` / ``aiter.ops.gemm_fusion`` import remains.
+"""
+
+import sys
+import types
+from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
 import torch
 
-gf = pytest.importorskip("aiter.gemm_fusion")
-
-from aiter.ops.gemm_fusion.sp_qkv import specs
-
-from atom.model_ops.gemm_fusion import runtime as gfr
-from atom.model_ops.gemm_fusion.minimax_m3 import _spec
-
-PROFILE = "minimax_m3_sp4_gfx950_v1"
-CTX = gf.MatchCtx(arch="gfx950", cu=256, world=4, m=0)
+import atom.aiter_provider as provider
+import atom.model_ops.gemm_fusion.site as site_mod
 
 
-def _runtime(profile=None):
-    return gfr.GemmFusionRuntime(gf, profile, CTX, None, 4, 128)
+def _fwd_ctx():
+    return SimpleNamespace(
+        context=SimpleNamespace(is_dummy_run=False),
+        attn_metadata=SimpleNamespace(slot_mapping=torch.arange(6, dtype=torch.int64)),
+    )
 
 
-def _module(mode):
-    """MiniMax-M3 attention at -tp 1 -sp 4."""
-    impl = SimpleNamespace(
+def _state():
+    return {
+        "k_cache": torch.zeros((2, 1, 8, 128, 16), dtype=torch.float8_e4m3fn),
+        "v_cache": torch.zeros((2, 1, 8, 128, 16), dtype=torch.float8_e4m3fn),
+        "k_scale": torch.zeros((2, 1, 128)),
+        "v_scale": torch.zeros((2, 1, 128)),
+        "slot_mapping": torch.arange(6, dtype=torch.int64),
+    }
+
+
+def _impl(mode="dense"):
+    return SimpleNamespace(
         head_dim=128,
         num_heads=16,
         num_kv_heads=1,
-        rotary_emb=SimpleNamespace(rotary_dim=64),
-        kv_cache_dtype="fp8",
-    )
-    module = SimpleNamespace(
-        head_dim=128,
-        num_heads=64,
-        num_kv_heads=4,
-        qkv_proj=SimpleNamespace(
-            output_size=9216 if mode == "dense" else 9856, input_size=6144
+        num_idx_heads=4,
+        index_head_dim=128,
+        rotary_emb=SimpleNamespace(
+            rotary_dim=64,
+            is_neox_style=True,
+            cos_cache=torch.zeros(8, 32, dtype=torch.bfloat16),
+            sin_cache=torch.zeros(8, 32, dtype=torch.bfloat16),
         ),
-        q_norm=SimpleNamespace(variance_epsilon=1e-6),
-        attn=SimpleNamespace(impl=impl),
+        q_norm=SimpleNamespace(weight=torch.zeros(128), variance_epsilon=1e-6),
+        k_norm=SimpleNamespace(weight=torch.zeros(128)),
+        index_q_norm=SimpleNamespace(weight=torch.zeros(128)),
+        index_k_norm=SimpleNamespace(weight=torch.zeros(128)),
+        index_cache=torch.zeros((2, 128, 128), dtype=torch.float8_e4m3fn),
+        gemm_fusion_prologue_state=lambda _fwd: _state(),
+        forward_after_prologue=lambda *a, **k: torch.zeros((6, 2048)),
     )
-    if mode != "dense":
-        module.idx_head_dim, module.num_idx_heads = 128, 4
-    return module
 
 
-@pytest.mark.parametrize("mode", specs.MODES)
-def test_sites_match_the_profile_and_every_bucket_is_prepared(mode):
-    """A drifted spec matches no row and leaves the layer silently native; a
-    bucket outside the prepared set would never fuse."""
-    spec = _spec(gf, _module(mode), mode, 4, 128 if mode == "dense" else 16)
-    assert spec.signature() == specs.sp_qkv_spec(mode).signature()
+class _Linear:
+    def __init__(self):
+        self.weight = torch.zeros((9216, 6144), dtype=torch.uint8)
+        self.weight.is_shuffled = True
+        self.weight_scale = torch.zeros(9216)
+        self.input_size = 6144
+        self.output_size = 9216
+        self.is_output_padded = True
 
-    profile = gf.load_profile(PROFILE)
-    rt = _runtime(profile)
-    prepared = gfr._bucket_ms(profile, spec, CTX, max_m=2048)
-    assert prepared[0] == 1 and prepared[-1] == 2048
-    buckets = {m: rt.bucket(spec, m) for m in range(1, 2049)}
-    assert {b for b in buckets.values() if b is not None} <= set(prepared)
-    # R16 pad-M: below a large bucket's floor the call stays native.
-    assert [buckets[m] for m in (3, 256, 300, 385, 386, 513)] == [
-        4,
-        256,
-        None,
-        None,
-        512,
-        768,
-    ]
+    def __call__(self, x, x_scale=None):
+        return torch.zeros((x.shape[0], self.output_size), dtype=torch.bfloat16)
 
 
-def test_large_plan_tags_are_distinct_in_one_forward():
-    """A large plan tags its handshakes with only the low bits of the call
-    id; two layers sharing them in one forward read each other's rows."""
-    rt = _runtime()
-    rt.bucket = lambda spec, m: m
-    plan = SimpleNamespace(vid="sp_qkv.large.v1", n_stages=1, src="r18")
-    rt.sites = [
-        SimpleNamespace(
-            name=f"model.layers.{i}.self_attn.qkv", spec=None, plans={512: plan}
-        )
-        for i in range(62)
-    ]
-    ids = rt._resolve_call_ids(4 * 512)
-    mask = (1 << specs.large_tag_bits("r18")) - 1
-    tags = {i & mask for i in ids.values()}
-    assert len(ids) == len(tags) == 62 and 0 not in tags
-    assert all(0 < i < 1 << 31 for i in ids.values())
-    # Every rank derives the same ids, whatever order it found the layers in.
-    rt.sites.reverse()
-    assert rt._resolve_call_ids(4 * 512) == ids
+def _site(mode="dense", provider_enabled=True):
+    attn = SimpleNamespace(
+        impl=_impl(mode),
+        sp_head_exchange=None,
+        layer_name="model.layers.0.self_attn",
+    )
+    config = SimpleNamespace(
+        sequence_parallel_size=4,
+        max_num_batched_tokens=8,
+        aiter_provider_enable=("sp-qkv-provider",) if provider_enabled else (),
+    )
+    return site_mod.QkvSite("layer0.qkv", attn, _Linear(), mode, config, out_width=2048)
 
 
-def test_a_plan_any_rank_cannot_bind_is_dropped_on_every_rank(monkeypatch):
-    prepared = []
+def _x():
+    return torch.zeros((2, 6144), dtype=torch.float8_e4m3fn)
 
-    def plan():
-        return SimpleNamespace(
-            n_stages=1, prepare=lambda x, **_: prepared.append(x.shape[0])
-        )
 
-    shared = {512: plan(), 768: plan()}
-    lin = SimpleNamespace(weight=torch.empty(0), input_size=8, weight_scale=None)
-    rt = _runtime()
-    rt.sites = [
-        SimpleNamespace(name=f"s{i}", linear=lin, plans=dict(shared)) for i in range(2)
-    ]
-    rt.res = SimpleNamespace(reset=lambda: None, step_tensor=lambda: "step")
-    # A peer failed to bind the 768 bucket.
-    peer = [0, 1, 0, 1]
+def _positions():
+    return torch.arange(6, dtype=torch.int64)
+
+
+def _install_attention_tail(monkeypatch):
+    monkeypatch.setattr(site_mod, "get_forward_context", _fwd_ctx)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: None)
+    module = types.ModuleType("atom.model_ops.sp_attention")
+    module.ulysses_attention = lambda attn, q, k, v, pos, q_scale, qkv: (
+        torch.zeros((6, 2048)),
+        torch.arange(6),
+    )
+    module.gather_heads = lambda out, rows, ca, scale: "OUT"
+    monkeypatch.setitem(sys.modules, "atom.model_ops.sp_attention", module)
+
+
+def _install_gate(monkeypatch, route="provider"):
+    calls = []
+
+    def explain(op, *args, **kwargs):
+        assert op == "sp_qkv_fused"
+        selected = route(args[1].shape[0]) if callable(route) else route
+        return SimpleNamespace(decision=SimpleNamespace(route=selected), declines={})
+
+    def op(*args, **kwargs):
+        calls.append((args, kwargs))
+
+    module = types.ModuleType("aiter")
+    module.plugin = SimpleNamespace(
+        API_VERSION=1,
+        configure=lambda **kwargs: None,
+        status=lambda: {"routed_ops": {"sp_qkv_fused": {"version": 1}}},
+        explain=explain,
+    )
+    module.sp_qkv_fused = op
+    monkeypatch.setitem(sys.modules, "aiter", module)
+    monkeypatch.setattr(site_mod, "get_forward_context", _fwd_ctx)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: None)
+    monkeypatch.setattr(site_mod, "_sp_group", lambda: None)
+    _install_attention_tail(monkeypatch)
+    return calls
+
+
+# ---------------------------------------------------------------- enablement
+def test_configure_not_called_when_flag_off(monkeypatch):
+    configured = []
+    module = types.ModuleType("aiter")
+    module.plugin = SimpleNamespace(
+        API_VERSION=1,
+        configure=lambda **kwargs: configured.append(kwargs),
+        status=lambda: {"routed_ops": {}},
+    )
+    monkeypatch.setitem(sys.modules, "aiter", module)
+    config = SimpleNamespace(aiter_provider_enable=())
+    assert provider.configure_aiter_providers(config) is False
+    assert configured == []
+
+
+def test_configure_called_once_with_source_when_enabled(monkeypatch):
+    configured = []
+    module = types.ModuleType("aiter")
+    module.plugin = SimpleNamespace(
+        API_VERSION=1,
+        configure=lambda **kwargs: configured.append(kwargs),
+        status=lambda: {"routed_ops": {"sp_qkv_fused": {}}, "enabled": ("p",)},
+    )
+    monkeypatch.setitem(sys.modules, "aiter", module)
+    config = SimpleNamespace(aiter_provider_enable=("sp-qkv-provider",))
+    assert provider.configure_aiter_providers(config) is True
+    assert configured and configured[0]["enable"] == ("sp-qkv-provider",)
+    assert configured[0]["source"].startswith("atom ")
+
+
+def test_provider_warmup_is_framework_owned_and_fail_open(monkeypatch):
+    warmed = []
+
+    class _Provider:
+        def warmup(self, payload, *, group=None, device=None):
+            warmed.append((payload, group, device))
+            return True
+
+    monkeypatch.setattr(provider, "_load_provider", lambda name: _Provider())
+    config = SimpleNamespace(aiter_provider_enable=("sp-qkv-provider",))
+    assert provider.warmup_aiter_providers(
+        config, {"mode": "dense"}, group="g", device=3
+    )
+    assert warmed == [({"mode": "dense"}, "g", 3)]
+
+
+# ---------------------------------------------------------------- explain gate
+def test_explain_gate_selects_provider_and_assembles_flat_payload(monkeypatch):
+    calls = _install_gate(monkeypatch, route="provider")
+    site = _site()
+    assert site.run(_x(), torch.zeros((2, 1)), _positions(), None) == "OUT"
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert len(args) == 15
+    assert args[3] is site.linear.weight and args[4] is site.linear.weight_scale
+    assert args[5].dtype == torch.float32 and args[6].dtype == torch.float32
+    assert args[7].shape == args[8].shape == (8, 32)
+    assert args[9] is not None and args[10] is not None
+    assert kwargs["mode"] == "dense"
+    assert kwargs["k"] is not None and kwargs["v"] is not None
+    assert kwargs["index_q"] is None
+    assert kwargs["eps"] == 1e-6
+    assert kwargs["group"] is None and kwargs["stream"] is None
+
+
+def test_explain_gate_is_cached_per_local_m(monkeypatch):
+    calls = _install_gate(monkeypatch, route="provider")
+    site = _site()
+    for _ in range(2):
+        site.run(_x(), torch.zeros((2, 1)), _positions(), None)
+    assert len(calls) == 2  # provider op runs per call
+    assert site._routes == {2: True}  # explain asked once for m=2
+
+
+def test_indexer_payload_carries_index_tensors_only(monkeypatch):
+    calls = _install_gate(monkeypatch, route="provider")
+    site = _site(mode="indexer")
+    site.run(_x(), torch.zeros((2, 1)), _positions(), None)
+    _, kwargs = calls[0]
+    assert kwargs["mode"] == "indexer"
+    assert kwargs["k"] is None and kwargs["v"] is None
+    assert kwargs["index_q"] is not None
+    assert kwargs["index_q_norm_w"] is not None
+    assert kwargs["index_k_norm_w"] is not None
+    assert kwargs["index_cache"] is not None
+
+
+def test_provider_decline_keeps_3084_non_fused_path(monkeypatch):
+    calls = _install_gate(monkeypatch, route="native")
+    site = _site()
+    assert site.run(_x(), torch.zeros((2, 1)), _positions(), None) == "OUT"
+    assert calls == []
+    assert site._routes == {2: False}
+
+
+def test_no_provider_enabled_never_touches_the_interface(monkeypatch):
+    _install_gate(monkeypatch, route="native")
+    site = _site(provider_enabled=False)
+    assert site.run(_x(), torch.zeros((2, 1)), _positions(), None) == "OUT"
+
+
+def test_provider_flag_on_without_interface_falls_back(monkeypatch):
+    _install_attention_tail(monkeypatch)
+    monkeypatch.delitem(sys.modules, "aiter", raising=False)
     monkeypatch.setattr(
-        gfr, "group_max_each", lambda codes, group: list(map(max, codes, peer))
+        site_mod, "_sp_group", lambda: (_ for _ in ()).throw(RuntimeError)
     )
-
-    rt.prepare(kv_cache_data={})
-    assert prepared == [512, 768]
-    assert [s.plans for s in rt.sites] == [{512: shared[512]}] * 2
-    assert rt.ready and rt.step == "step"
-    with pytest.raises(RuntimeError, match="once"):
-        rt.prepare(kv_cache_data={})
+    site = _site(provider_enabled=True)
+    assert site.run(_x(), torch.zeros((2, 1)), _positions(), None) == "OUT"
 
 
-def test_a_failed_launch_stops_serving_and_skips_the_collective_close():
-    errs = iter([None, 0, 0x21])
-    res = SimpleNamespace(rank=2, enqueued=[], released=False)
-    res.readback_enqueue = res.enqueued.append
-    res.readback_consume = lambda step: next(errs)
-    res.release = lambda: setattr(res, "released", True)
-    rt = _runtime()
-    rt.res, rt.ready = res, True
+def test_warmup_payload_has_every_contract_key(monkeypatch):
+    monkeypatch.setattr(site_mod, "_sp_group", lambda: None)
+    payload = _site().warmup_payload()
+    expected = {
+        "q",
+        "x",
+        "x_scale",
+        "w",
+        "w_scale",
+        "q_norm_w",
+        "k_norm_w",
+        "cos_cache",
+        "sin_cache",
+        "positions",
+        "slot_mapping",
+        "k_cache",
+        "v_cache",
+        "k_scale",
+        "v_scale",
+        "mode",
+        "k",
+        "v",
+        "index_q",
+        "index_q_norm_w",
+        "index_k_norm_w",
+        "index_cache",
+        "eps",
+        "group",
+        "stream",
+    }
+    assert set(payload) == expected
+    assert payload["mode"] == "dense"
 
-    rt.before_step()
-    rt.before_step()  # copy still in flight: no new readback
-    rt.before_step()
-    with pytest.raises(RuntimeError, match="rank 2.*ERR 0x21"):
-        rt.before_step()
-    assert res.enqueued == [0, 1]
-    rt.close()
-    assert not res.released
+
+def test_large_band_asks_explain_then_keeps_the_fallback(monkeypatch):
+    calls = _install_gate(
+        monkeypatch, route=lambda m: "provider" if m <= 256 else "native"
+    )
+    site = _site()
+    x = torch.zeros((512, 6144), dtype=torch.float8_e4m3fn)
+    x_scale = torch.zeros((512, 1))
+    assert site.run(x, x_scale, _positions(), None) == "OUT"
+    assert calls == []  # no provider call for the large cell
+    assert site._routes == {512: False}
+
+
+def test_initialize_is_none_without_the_provider_flag():
+    from atom.model_ops.gemm_fusion import initialize_gemm_fusion
+
+    config = SimpleNamespace(aiter_provider_enable=())
+    assert initialize_gemm_fusion(None, config) is None
+
+
+# ---------------------------------------------------------------- import proof
+def test_no_removed_aiter_gemm_fusion_import_remains():
+    root = Path(site_mod.__file__).resolve().parents[2]
+    patterns = (
+        "import aiter.gemm_fusion",
+        "from aiter.gemm_fusion",
+        "import aiter.ops.gemm_fusion",
+        "from aiter.ops.gemm_fusion",
+        "aiter.ops.gemm_fusion.",
+        "aiter.gemm_fusion.",
+    )
+    offenders = []
+    for path in root.rglob("*.py"):
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        if any(pattern in text for pattern in patterns):
+            offenders.append(str(path.relative_to(root)))
+    assert offenders == []

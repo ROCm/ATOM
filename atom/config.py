@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import torch
 from transformers import AutoConfig, GenerationConfig, PretrainedConfig
 
+from atom.aiter_provider import normalize_provider_names
 from atom.model_engine.capabilities import pcp_group_size_of
 from atom.model_engine.prefill_delayer import PREFILL_ADMIT_POLICIES
 from atom.model_loader.weight_utils import (
@@ -2179,9 +2180,11 @@ class Config:
     # Post-routing routed-MoE implementation. This is deliberately separate
     # from all2all backend/mode: Mega owns dispatch, both GEMMs, and combine.
     moe_backend: str = "standard"
-    # AITER gemm_fusion profile that fuses the attention QKV GEMM with the
-    # Ulysses SP exchange; None keeps the unfused path.
-    gemm_fusion_profile: str | None = None
+    # Out-of-tree aiter kernel Providers to enable, in preference order
+    # (aiter.plugin.configure(enable=...)). Empty = OFF and ATOM never calls
+    # configure(); the normalized tuple is pickled into every spawned worker.
+    # This is also the enable switch for the MiniMax-M3 SP QKV provider path.
+    aiter_provider_enable: tuple[str, ...] = ()
     runner_qualname: str = "atom.model_engine.model_runner.ModelRunner"
     # EPLB master switch + sub-config
     eplb_enable: bool = False
@@ -2407,27 +2410,6 @@ class Config:
             )
         sp_head_shards(getattr(hf_text, "num_key_value_heads", None) or heads, sp)
 
-    def _init_gemm_fusion(self) -> None:
-        self.gemm_fusion_profile = self.gemm_fusion_profile.strip()
-        if not self.gemm_fusion_profile:
-            raise ValueError("--gemm-fusion-profile must name an AITER profile")
-        if self.pipeline_parallel_size != 1:
-            raise ValueError(
-                "--gemm-fusion-profile is not supported with pipeline parallelism."
-            )
-        if self.sequence_parallel_size < 2:
-            raise ValueError(
-                "--gemm-fusion-profile fuses the Ulysses SP QKV exchange; it "
-                "requires --sequence-parallel-size > 1."
-            )
-        import importlib.util
-
-        if importlib.util.find_spec("aiter.gemm_fusion") is None:
-            raise ValueError(
-                "--gemm-fusion-profile requires an AITER build with "
-                "aiter.gemm_fusion."
-            )
-
     def _init_moe_backend(self) -> None:
         self.moe_backend = self.moe_backend.strip().lower()
         if self.moe_backend not in ("standard", "mega"):
@@ -2450,6 +2432,14 @@ class Config:
             )
 
     def __post_init__(self):
+        # AITER provider enable list: programmatic tuple/CLI string, with the
+        # ATOM_AITER_PROVIDER_ENABLE deployment override read ONCE here; the
+        # normalized tuple is what every spawned worker receives.
+        raw_providers = (
+            self.aiter_provider_enable
+            or os.getenv("ATOM_AITER_PROVIDER_ENABLE", "").strip()
+        )
+        self.aiter_provider_enable = normalize_provider_names(raw_providers)
         if self.sequence_parallel_size < 1:
             raise ValueError("sequence_parallel_size must be at least 1")
         self.moe_all2all_backend = (
@@ -2629,8 +2619,6 @@ class Config:
                 import ast
 
                 self.kv_transfer_config = ast.literal_eval(self.kv_transfer_config)
-        if self.gemm_fusion_profile is not None:
-            self._init_gemm_fusion()
         if self.sequence_parallel_size > 1:
             self._init_sequence_parallel()
         # transformers 5+ exposes rope_parameters; <5 often only rope_scaling + rope_theta.
@@ -3087,9 +3075,13 @@ class Config:
         if self.sequence_parallel_size > 1:
             # SP and PCP use the same rank dimension but different head shapes.
             factors.append(("sp", self.sequence_parallel_size))
-            if self.gemm_fusion_profile is not None:
-                # The fused QKV op replaces the traced attention prologue.
-                factors.append(("gemm_fusion", self.gemm_fusion_profile))
+        # AITER provider enabling changes which kernel runs under an existing
+        # signature and switches the MiniMax-M3 SP QKV prologue from the
+        # non-fused path to the routed op. Append only when on, so default OFF
+        # hashes (and every existing compile-cache artifact) are unchanged.
+        provider_enable = tuple(getattr(self, "aiter_provider_enable", ()) or ())
+        if provider_enable:
+            factors.append(("aiter_providers", provider_enable))
         # MiniMax-M3 indexer-only CP changes the FUSED QKV OUTPUT WIDTH: index_q
         # is this rank's one head under TP and all `sparse_num_index_heads` of
         # them under CP (minimax_m3/model.py, linear.py), so the traced graph and the
