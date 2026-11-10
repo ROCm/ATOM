@@ -539,12 +539,8 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         built = super().stage_decode(
             batch, running_bs, running_tokens, max_seqlen_q, group
         )
-        self._stage_draft_ctx_slots(
-            batch,
-            np.full(batch.total_seqs_num_decode, max_seqlen_q, dtype=np.int32),
-            running_tokens,
-            group,
-        )
+        _, lengths, _ = self.decode_spans(batch)
+        self._stage_draft_ctx_slots(batch, lengths, running_tokens, group)
         return built
 
     def _stage_draft_ctx_slots(

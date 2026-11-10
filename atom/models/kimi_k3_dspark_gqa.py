@@ -292,8 +292,10 @@ def _draft_rope_kwargs(config) -> dict:
 def _check_rope_covers(max_model_len: int, rope_rows: int) -> None:
     """Refuse a `max_model_len` past the draft's rope cache.
 
-    The context write ropes its positions unclamped, and rows past the cache
-    read out of bounds rather than fail.
+    Both passes clamp their positions to the cache's last row. Only rows past
+    `max_model_len` reach the clamp: verify rows up to `mtp_k` past the
+    request's last token, and block rows up to T past its anchor. The block
+    rewrites those rows before it reads them, or the request has finished.
     """
     if max_model_len > rope_rows:
         raise ValueError(
@@ -498,6 +500,14 @@ class KimiK3DSparkGQA(DSparkDraftModel):
 
         return AuxCaptureSpec(layer_ids, hidden_size, extract)
 
+    def write_context_kv(self, aux_concat, positions, slot_mapping=None) -> None:
+        # Verify rows reach `mtp_k` past the request's last token, so past the
+        # rope cache near `max_model_len` (`_check_rope_covers`). Out of place:
+        # `positions` is the target's.
+        super().write_context_kv(
+            aux_concat, positions.clamp(max=self._rope_max_row), slot_mapping
+        )
+
     # -- DSparkDraftModel contract ----------------------------------------
 
     def block_backbone(self, input_ids, positions, num_draft: int):
@@ -512,8 +522,7 @@ class KimiK3DSparkGQA(DSparkDraftModel):
         hidden = self.embed_tokens(draft_ids.view(-1))
         # Block positions run T past `max_model_len`, so they pass the cache in
         # the last T of a max-length context, whose drafts cannot be verified
-        # anyway. Context positions stay below it, which `_check_rope_covers`
-        # holds inside the cache.
+        # anyway (`_check_rope_covers`).
         positions = positions.clamp(max=self._rope_max_row)
         residual = None
         for layer in self.layers:

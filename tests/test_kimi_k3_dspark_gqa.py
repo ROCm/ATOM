@@ -186,8 +186,7 @@ def _draft_rope_kwargs_fn(module_file):
 
 
 def test_gqa_draft_refuses_a_max_model_len_past_the_rope_cache():
-    """The context write ropes unclamped positions, all below `max_model_len`.
-    A length equal to the cache rows -- the shipped pair's default -- fits;
+    """A length equal to the cache rows -- the shipped pair's default -- fits;
     one more row is refused at startup."""
     check = _lift_fn("kimi_k3_dspark_gqa.py", "_check_rope_covers", {})
     rows = 65536 * 16
@@ -195,6 +194,27 @@ def test_gqa_draft_refuses_a_max_model_len_past_the_rope_cache():
     check(4096, rows)
     with pytest.raises(ValueError, match="lower --max-model-len"):
         check(rows + 1, rows)
+
+
+def test_gqa_context_write_clamps_verify_rows_to_the_rope_cache(monkeypatch):
+    """Verify rows reach `mtp_k` past the last token, past the rope cache at
+    the default `max_model_len`; they are roped at its last row, and the
+    target's positions are left as they were."""
+    import torch
+
+    mod = _gpu_stack_import("atom.models.kimi_k3_dspark_gqa")
+    seen = {}
+    monkeypatch.setattr(
+        mod.DSparkDraftModel,
+        "write_context_kv",
+        lambda self, aux, positions, slots=None: seen.update(positions=positions),
+    )
+    draft = object.__new__(mod.KimiK3DSparkGQA)
+    draft._rope_max_row = 99
+    positions = torch.tensor([97, 98, 99, 100, 101])
+    draft.write_context_kv(torch.zeros(5, 4), positions, None)
+    assert seen["positions"].tolist() == [97, 98, 99, 99, 99]
+    assert positions.tolist() == [97, 98, 99, 100, 101]
 
 
 def test_gqa_draft_does_not_capture_the_k3_dspark_checkpoint():
@@ -678,52 +698,16 @@ def test_gqa_draft_arms_the_embedding_tap_without_a_successor():
 # --------------------------------------------------------------------------- #
 # draft context slots (kimi_mla_gdn_attn builder -> dspark_proposer -> draft)
 #
-# The slot math is `token_layout/slots.py`'s, on the host, and runs on CPU.
-# The builder's publication is the REAL method on a stub; its module imports
+# The builder's staging is the REAL method on a stub; its module imports
 # aiter/triton, so those tests skip on the CPU-only CI job. The proposer's
 # hand-off is in `test_dspark.py`, the base draft's fan-out in
 # `test_dspark_draft.py`.
 # --------------------------------------------------------------------------- #
 
 
-def _host_slots(tables, seqlens, positions, block_size):
-    """The host builder (`token_layout/slots.py`) for the same tokens."""
-    import numpy as np
-
-    from atom.model_ops.attentions.token_layout.slots import slot_mapping
-
-    return slot_mapping(
-        np.asarray(positions, dtype=np.int64),
-        np.asarray(seqlens),
-        np.ascontiguousarray(tables, dtype=np.int32),
-        block_size,
-    ).tolist()
-
-
 # A prefill chunk crossing an entry boundary, then two decode tokens.
 _TABLES = [[7, 9] + [0] * 14, [4] + [0] * 15]
 _SEQLENS = [3, 2]
-
-
-@pytest.mark.parametrize("dcp", [1, 8])
-def test_draft_slots_store_every_token_at_entry_granularity(dcp):
-    """Every token gets a slot, addressed in `block_size * dcp`-token entries.
-
-    At DCP>1 they differ from the target's `block_size` addressing -- which
-    would alias `dcp` requests' entries onto one range.
-    """
-    vblock = 128 * dcp
-    positions = [vblock - 2, vblock - 1, vblock, 5, 6]
-    got = _host_slots(_TABLES, _SEQLENS, positions, vblock)
-    assert got == [
-        7 * vblock + vblock - 2,
-        7 * vblock + vblock - 1,
-        9 * vblock,
-        4 * vblock + 5,
-        4 * vblock + 6,
-    ]
-    if dcp > 1:
-        assert got != _host_slots(_TABLES, _SEQLENS, positions, 128)
 
 
 def _builder_stub(entry_tokens, tables, positions, rows=64):
@@ -787,15 +771,22 @@ def _stage(stub, seqlens, rows, tables, dummy=False):
 
 @pytest.mark.parametrize("dcp", [1, 8])
 def test_the_builder_stages_the_draft_slots(dcp):
-    """The target's builder stages, at entry granularity and with no DCP
-    filter, the host slot of every scheduled token, and counts them into the
-    phase's group."""
+    """The target's builder stages, with no DCP filter, the slot of every
+    scheduled token in `block_size * dcp`-token entries, and counts them into
+    the phase's group. At DCP>1 the target's `block_size` addressing would
+    alias `dcp` requests' entries onto one range."""
     vblock = 128 * dcp
     positions = [vblock - 2, vblock - 1, vblock, 5, 6]
     stub = _builder_stub(vblock, _TABLES, positions)
     got, count = _stage(stub, _SEQLENS, len(positions), _TABLES)
     assert count == 5
-    assert got[:5].tolist() == _host_slots(_TABLES, _SEQLENS, positions, vblock)
+    assert got[:5].tolist() == [
+        7 * vblock + vblock - 2,
+        7 * vblock + vblock - 1,
+        9 * vblock,
+        4 * vblock + 5,
+        4 * vblock + 6,
+    ]
 
 
 def test_the_builder_drops_the_padded_decode_rows():
@@ -837,6 +828,42 @@ def test_a_request_less_prefill_drops_every_padded_row(monkeypatch):
     buf = stub.model_runner.forward_vars["draft_ctx_slots"]
     assert group.counts[id(buf)] == 8
     assert buf.np[:8].tolist() == [-1] * 8
+
+
+def test_a_ragged_decode_stages_each_request_at_its_own_length(monkeypatch):
+    """`stage_decode` lays the slots out from `decode_spans`, the lengths the
+    target's positions use, not a uniform `max_seqlen_q` per request."""
+    import numpy as np
+
+    kimi = _gpu_stack_import("atom.model_ops.attentions.kimi_mla_gdn_attn")
+    monkeypatch.setattr(
+        kimi.GDNStateMixin, "stage_decode", lambda self, *a: ("md", "pos")
+    )
+    positions = [3, 4, 5, 8]
+    stub = _builder_stub(1024, _TABLES, positions)
+    builder = object.__new__(kimi.KimiAiterMLAGDNMetadataBuilder)
+    builder.__dict__.update(vars(stub))
+    builder.model_runner.forward_vars["cu_seqlens_q"] = types.SimpleNamespace(
+        np=np.array([0, 3, 4], dtype=np.int32)
+    )
+    batch = types.SimpleNamespace(
+        is_dummy_run=False,
+        block_tables=_TABLES,
+        total_seqs_num_decode=2,
+        num_scheduled_tokens=np.array([3, 1], dtype=np.int32),
+    )
+    group = _Group()
+    assert builder.stage_decode(batch, 2, 6, 3, group) == ("md", "pos")
+    buf = stub.model_runner.forward_vars["draft_ctx_slots"]
+    assert group.counts[id(buf)] == 6
+    assert buf.np[:6].tolist() == [
+        7 * 1024 + 3,
+        7 * 1024 + 4,
+        7 * 1024 + 5,
+        4 * 1024 + 8,
+        -1,
+        -1,
+    ]
 
 
 def test_the_builder_skips_dummy_runs_and_drafts_without_a_pool():
