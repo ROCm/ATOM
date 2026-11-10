@@ -2830,9 +2830,6 @@ def test_non_mla_block_drafts_skip_the_csr_and_the_mla_plan(
         _draft_is_dcp_sharded=False,
         _paged_pad_ctx_len=1 + T,
         _blk_cu_seqlens_q=torch.zeros(running_bs + 1, **i32),
-        _blk_kv_indptr=torch.zeros(running_bs + 1, **i32),
-        _blk_kv_indices=torch.zeros(0, **i32),
-        _blk_last_page_lens=torch.ones(running_bs, **i32),
         _block_page_idx=proposer.DSparkProposer._block_page_idx,
         model=types.SimpleNamespace(
             block_attention_is_mla=draft_cls.block_attention_is_mla,
@@ -2854,8 +2851,8 @@ def test_non_mla_block_drafts_skip_the_csr_and_the_mla_plan(
     ]
     assert seen["ctx"] == [vblock + 1, 2 * vblock, 1 + T]
     assert md.causal is False
-    assert md.kv_indices is stub._blk_kv_indices
-    assert md.kv_indptr.shape[0] == running_bs + 1
+    # No CSR on this path: the fields stay as the caller left them.
+    assert md.kv_indices is None and md.kv_indptr is None
 
 
 @pytest.mark.parametrize(
@@ -2866,14 +2863,10 @@ def test_non_mla_block_drafts_skip_the_csr_and_the_mla_plan(
         ("atom.models.minimax_m3.dspark", "MiniMaxM3DSpark", False),
     ],
 )
-def test_kv_indices_buffer_is_allocated_only_for_mla_block_plans(
-    module, cls_name, is_mla
-):
-    """Only the MLA block plan fills `_blk_kv_indices` (max_bs x max_model_len).
-
-    A non-MLA draft returns from `_build_paged_block_metadata` before the CSR
-    build, so it gets an empty placeholder instead of the full buffer.
-    """
+def test_csr_buffers_are_allocated_only_for_mla_block_plans(module, cls_name, is_mla):
+    """Only the MLA block plan builds a CSR (`_blk_kv_indices` is max_bs x
+    max_model_len). A non-MLA draft returns from `_build_paged_block_metadata`
+    before the CSR build, so it gets none of the CSR buffers."""
     torch = pytest.importorskip("torch")
     proposer = importlib.import_module("atom.spec_decode.dspark_proposer")
     draft_cls = getattr(importlib.import_module(module), cls_name)
@@ -2891,7 +2884,14 @@ def test_kv_indices_buffer_is_allocated_only_for_mla_block_plans(
     )
     p._init_draft_block_buffers()
 
+    csr = (
+        "_blk_kv_indices",
+        "_blk_kv_indptr",
+        "_blk_last_page_lens",
+        "_blk_saved_page0",
+    )
     if is_mla:
         assert p._blk_kv_indices.numel() == 8 * (4096 + 7)
+        assert all(hasattr(p, name) for name in csr)
     else:
-        assert p._blk_kv_indices.numel() == 0
+        assert not any(hasattr(p, name) for name in csr)

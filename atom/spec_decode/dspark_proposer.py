@@ -226,26 +226,21 @@ class DSparkProposer(Drafter):
         self._blk_cu_seqlens_q = torch.arange(0, (max_bs + 1) * t, step=t, **i32)
         # Constant 1..T ramp used to expand anchors into block positions.
         self._blk_offsets = torch.arange(1, t + 1, **i64)
-        self._blk_last_page_lens = torch.ones(max_bs, **i32)
-        self._blk_kv_indptr = torch.zeros(max_bs + 1, **i32)
-        # Holds the pad tail's own first page ids while it borrows block 0 --
-        # see `_build_paged_block_metadata`.
-        self._blk_saved_page0 = torch.zeros(max_bs, **i32)
-        # kv_indptr[-1] = sum(ctx_lens) = sum(anchor + 1 + T). An anchor can sit
-        # at max_model_len - 1, so each request contributes up to
-        # max_model_len + T entries -- pad by max_bs * T so the unchecked
-        # kv_indices_generate_triton write can never run past the buffer.
-        # Only an MLA block plan fills it: a non-MLA draft returns from
-        # `_build_paged_block_metadata` before the CSR build, so it gets an
-        # empty placeholder rather than max_bs * max_model_len ints.
-        self._blk_kv_indices = torch.zeros(
-            (
-                max_bs * (self.config.max_model_len + t)
-                if self.model.block_attention_is_mla
-                else 0
-            ),
-            **i32,
-        )
+        if self.model.block_attention_is_mla:
+            # The MLA block plan's CSR. A draft that attends its block another
+            # way builds what it reads in `prepare_paged_block`.
+            self._blk_last_page_lens = torch.ones(max_bs, **i32)
+            self._blk_kv_indptr = torch.zeros(max_bs + 1, **i32)
+            # Holds the pad tail's own first page ids while it borrows block 0
+            # -- see `_build_paged_block_metadata`.
+            self._blk_saved_page0 = torch.zeros(max_bs, **i32)
+            # kv_indptr[-1] = sum(ctx_lens) = sum(anchor + 1 + T). An anchor can
+            # sit at max_model_len - 1, so each request contributes up to
+            # max_model_len + T entries -- pad by max_bs * T so the unchecked
+            # kv_indices_generate_triton write can never run past the buffer.
+            self._blk_kv_indices = torch.zeros(
+                max_bs * (self.config.max_model_len + t), **i32
+            )
 
         self._blk_dtype_q = None
 
@@ -997,11 +992,7 @@ class DSparkProposer(Drafter):
         attn_metadata.max_seqlen_k = max_seqlen_k
         if not self.model.block_attention_is_mla:
             # A non-MLA block read builds what it reads itself, so no CSR or
-            # MLA plan is built. The CSR fields still point at the draft's
-            # buffers so no reader sees the target step's.
-            attn_metadata.kv_indptr = self._blk_kv_indptr[: running_bs + 1]
-            attn_metadata.kv_indices = self._blk_kv_indices
-            attn_metadata.kv_last_page_lens = self._blk_last_page_lens[:running_bs]
+            # MLA plan is built.
             self.model.prepare_paged_block(
                 attn_metadata,
                 block_tables,
