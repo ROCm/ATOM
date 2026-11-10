@@ -202,14 +202,22 @@ def moe_common_defs(k4ctx):
         gpu.barrier()
 
     def fp8_tile_load(r_w, row, cols, kc):
-        """A lane's 32 B of an MXFP8 weight (row-major fp8 [rows, ``cols``]), row
-        ``row`` at 128-k chunk ``kc``: k 16 g .. + 16 and 64 + 16 g .. + 16 (g =
-        lane // 16), the f8f6f4 MFMA's operand layout (the B operand's, ``lds_b8``)."""
-        dw = row * (cols // 4) + kc * 32 + g4 * 4
+        """A lane's 32 B of an MXFP8 weight in aiter's (16, 16) preshuffle
+        ([N / 16][K / 32][2][16][16] bytes: a 16-row x 32-k tile is 512 B, its two
+        16-k halves apart), row ``row`` at 128-k chunk ``kc``: k 16 g .. + 16 and
+        64 + 16 g .. + 16 (g = lane // 16), the f8f6f4 MFMA's operand layout (the B
+        operand's, ``lds_b8``). Each 16 B piece of the 64 lanes is 1 KB contiguous."""
+        dw = (
+            (row // 16) * (cols // 32 * 128)
+            + kc * 512
+            + (g4 // 2) * 128
+            + (g4 % 2) * 64
+            + (row % 16) * 4
+        )
         halves = [
             fx.Vector(
                 bo.buffer_load(
-                    r_w, dw + 16 * h, vec_width=4, dtype=T.i32, cache_modifier=CM_NT
+                    r_w, dw + 256 * h, vec_width=4, dtype=T.i32, cache_modifier=CM_NT
                 )
             )
             for h in range(2)

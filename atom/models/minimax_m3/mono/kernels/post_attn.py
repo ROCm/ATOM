@@ -197,8 +197,9 @@ def build_post_attn_kernel(
     path's ``skip_index_topk`` layer) it attends over the sparse table the last
     selecting layer of the step left in scratch. ``shared_mxfp8``: the shared
     expert is not one of the MXFP4 experts (``w13`` / ``w2`` hold the routed 128)
-    but an MXFP8 MLP of its own (``w13s`` / ``s13s`` / ``w2s`` / ``s2s``: row-major
-    fp8 weights and their per-1x32 E8M0 scales), run by the narrow MoE (S <= 4)."""
+    but an MXFP8 MLP of its own (``w13s`` / ``s13s`` / ``w2s`` / ``s2s``: (16, 16)-
+    preshuffled fp8 weights and their row-major per-1x32 E8M0 scales), run by the narrow MoE (S <= 4).
+    """
     assert 1 <= tokens <= MAX_TOKENS
     if shared_mxfp8 and wide_moe(tokens):
         raise MonoUnsupported(f"an MXFP8 shared expert at {tokens} tokens (S <= 4)")

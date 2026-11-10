@@ -76,12 +76,12 @@ def _mxfp8(
         f"{name}: weight {w.dtype} {tuple(w.shape)}",
     )
     _need(
-        not weight_is_stored_preshuffled(
+        weight_is_stored_preshuffled(
             linear.quant_type,
             linear.params_dtype,
             native_group_rows=getattr(linear, "native_a8_group_rows", None),
         ),
-        f"{name}: preshuffled",
+        f"{name}: not preshuffled",
     )
     _need(not getattr(linear, "is_output_padded", False), f"{name}: output padded")
     _need(
