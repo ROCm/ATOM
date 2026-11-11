@@ -23,6 +23,7 @@ from atom.model_ops.attentions.deepseek_v41.metadata import (
 )
 from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
 from atom.utils import CpuGpuBuffer
+from atom.utils.forward_context import RoundService
 from tests.attentions.deepseek_v41.helpers import metadata_buffers, stage_query_layout
 
 
@@ -157,7 +158,12 @@ def test_engram_rows_are_staged_for_the_width_not_for_the_tokens(engram):
         else None
     )
     metadata = SimpleNamespace(
-        step=step, cache=cache, dummy=True, token_mask=None, ubatches=None
+        step=step,
+        cache=cache,
+        dummy=True,
+        token_mask=None,
+        ubatches=None,
+        served_by_round=RoundService.NONE,
     )
     builder.prepare_model_inputs(
         torch.zeros(step.scheduled_tokens, dtype=torch.int32), metadata

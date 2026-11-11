@@ -1436,6 +1436,29 @@ def test_without_a_hip_runtime_there_is_no_allocator(monkeypatch):
         hm._hip_runtime.cache_clear()
 
 
+def test_a_device_address_of_page_locked_memory(monkeypatch):
+    """`device_address` asks the runtime that page-locks (`_hip_runtime`): a byte of a range at its offset from the
+    range's device base. Without one it raises, or (`identity_without_hip`: the PLE table's copies,
+    ``qwen38.mono.ple``) gives the host address back; a refused range raises."""
+    from atom.model_ops.engram import host_memory as hm
+
+    monkeypatch.setattr(hm, "_host_get_device_pointer", lambda: None)
+    with pytest.raises(RuntimeError, match="no HIP runtime"):
+        hm.device_address(0x1000)
+    assert hm.device_address(0x1040, identity_without_hip=True) == 0x1040
+
+    # hipHostGetDevicePointer: the range at base is mapped at 0x9000
+    def get(out, base, flags):
+        out._obj.value = 0x9000 if base == 0x1000 else 0
+        return 0
+
+    monkeypatch.setattr(hm, "_host_get_device_pointer", lambda: get)
+    assert hm.device_address(0x1040, 0x1000) == 0x9040
+    assert hm.device_address(0x1000, identity_without_hip=True) == 0x9000
+    with pytest.raises(RuntimeError, match="hipHostGetDevicePointer"):
+        hm.device_address(0x2000)
+
+
 def _shared_file_table(tmp_path, rows=512, width=64):
     """A table over a shared read-only mapping of a file, as the checkpoint
     reader maps the Engram tables (`weights.shared_tensor`)."""

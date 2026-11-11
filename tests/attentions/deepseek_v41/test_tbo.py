@@ -1113,7 +1113,7 @@ def test_tbo_children_do_not_replay_late_layer_tails(monkeypatch, ubatch_idx):
     assert replayable(child, width) is False
 
 
-@pytest.mark.parametrize("backend,expected", [("none", 0), ("v4", 0), ("v41", -1)])
+@pytest.mark.parametrize("backend,expected", [("none", 0), ("v4", -1), ("v41", -1)])
 def test_tbo_communication_priority_is_backend_owned(monkeypatch, backend, expected):
     from atom.model_ops.attentions.deepseek_v4_attn import (
         DeepseekV4AttentionMetadataBuilder,
