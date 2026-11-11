@@ -325,16 +325,11 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         """Also hold back a hand-off's restore while every restore slot is taken.
 
         A hit off the chunk grid is admitted with no load: it prefills to the
-        next chunk boundary and reserves its load there, past `lookup_pending`.
-        Not parked now, it keeps prefilling, and the hand-off is weighed again
-        next step from where the prefill has reached.
+        next chunk boundary and reserves its load there, after `lookup_pending`
+        let it through. Not parked now, it keeps prefilling, and the hand-off
+        is weighed again next step from where the prefill has reached.
         """
-        if (
-            str(seq.id) in self._handoff_loads
-            and not self._page_only
-            and seq.has_per_req_cache
-            and self._restore_slots_full()
-        ):
+        if str(seq.id) in self._handoff_loads and self._restore_slots_full():
             return False
         return super().should_park_partial_prefill_for_load(seq)
 

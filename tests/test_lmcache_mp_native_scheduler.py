@@ -839,7 +839,7 @@ def test_engine_gates_a_prefetched_answer_while_every_restore_slot_is_taken(
     assert scheduled == ({seqs[2].id: seqs[2]} if runs else {})
 
 
-def test_unaligned_hbm_handoffs_wait_for_a_free_restore_slot(monkeypatch):
+def test_unaligned_hbm_handoffs_do_not_reserve_past_the_restore_slots(monkeypatch):
     """A hand-off reserves its load after admission, so `lookup_pending` never
     weighed it: three of them must not dispatch past the two restore slots."""
     scheduler, _, _ = make_scheduler(monkeypatch)
