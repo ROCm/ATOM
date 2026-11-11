@@ -378,8 +378,13 @@ def test_a_lean_rebuild_that_still_spills_refuses_its_width(caplog):
 
 
 def test_a_spill_with_nothing_leaner_refuses_without_a_rebuild(caplog):
-    """``lean`` None (a K2 or indexer spill: no K1 build to restage) refuses
-    the width on the first build, not after compiling the same one again."""
+    """``lean`` None refuses the width on the first build, not after compiling
+    the same one again.
+
+    What has nothing leaner is each runner's own answer: Kimi-K3 restages a K1
+    GEMV and has no second form for anything else, while V4.1 rebuilds a
+    spilling K2 without its indexer and only a K1 spill ends here
+    (``deepseek_v41.mono.builds.lean_width``)."""
     spill = _CompiledLauncher(b"\x18", b"post_s56")
     builds = []
 
@@ -395,6 +400,22 @@ def test_a_spill_with_nothing_leaner_refuses_without_a_rebuild(caplog):
     assert builds == [56]
     assert "rebuilt lean" not in caplog.text
     assert "post_s56 needs 24 B of scratch" in caplog.text
+
+
+def test_a_width_that_does_not_spill_is_never_rebuilt_lean():
+    """``lean`` is asked about a spill and nothing else: a width whose kernels
+    are all scratch-free keeps its first build, lean seam or no."""
+    asked = []
+
+    widths = WidthBuilds(
+        lambda key: "fat",
+        lambda k: [(NO_SCRATCH, _NoArgs)],
+        None,
+        "test",
+        lean=lambda built, spilled: asked.append(spilled) or "lean",
+    )
+    assert widths.prepare(48) and widths[48] == "fat"
+    assert asked == []
 
 
 def test_a_build_that_refuses_is_logged_by_its_reason(caplog):
