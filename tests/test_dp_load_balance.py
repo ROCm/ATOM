@@ -1910,7 +1910,9 @@ def test_prefix_spread_reset_evicts_history_in_a_repeatable_order():
     router.CAP = keep * 128
     router.reset()
     held = [
-        router._rank_hits(_chain_seq(0, 128, first_block=5_000 + i).prompt_hash_chain, 2)[1]
+        router._rank_hits(
+            _chain_seq(0, 128, first_block=5_000 + i).prompt_hash_chain, 2
+        )[1]
         is not None
         for i in range(n)
     ]
@@ -2078,3 +2080,23 @@ def test_prefix_spread_merge_waits_for_another_ranks_provisional_claim():
     router.release(1)
     router.release(3)
     assert not router.pending and not router._produced and not router._in_flight
+
+
+def test_prefix_spread_forked_prefix_is_not_merged_into_either_branch():
+    router = _make_spread_mgr()._prefix_router
+    trunk, left, right = (
+        _chain_seq(1, 4096),
+        _chain_seq(2, 8192),
+        _chain_seq(3, 8192, first_block=0),
+    )
+    # `right` shares the trunk but then runs on different blocks.
+    right.prompt_hash_chain.hashes[32:] = type(right.prompt_hash_chain.hashes)(
+        "Q", range(70_000, 70_032)
+    )
+    for seq in (trunk, left, right):
+        router.charge(seq.id, router.place(seq, 0, 2).credit)
+        router.prefill_complete(seq.id)
+    assert len(router.index) == 3  # the trunk and one edge per branch
+    for seq in (left, right):
+        assert router._rank_hits(seq.prompt_hash_chain, 2) == ({0: 8192}, 0)
+    assert router._rank_hits(trunk.prompt_hash_chain, 2) == ({0: 4096}, 0)
