@@ -14,7 +14,8 @@ A probe string is ``;``-separated terms:
 ``loop[=r+r]`` the all-reduce pushes of ``attn`` / ``ffn`` (default both) land in this rank's
                own buffer (slot = the wave's source rank) instead of the peers': no xGMI,
                the pushes' writes and the polls stay
-``nb=k+k``     these weight / cache reads (``KINDS``) go through zero-sized buffers: the
+``nb=k+k``     these weight / cache reads (``KINDS``; ``moeu`` / ``moed``: a routed expert's
+               up-gate / down, ``shu`` / ``shd`` the shared one's) go through zero-sized buffers: the
                loads issue, no byte comes from HBM
 ``pin``        the router's (routing key, sigmoid) pairs come from a table (``tl`` points at
                it: the real step's ``scores`` copy-0 image, [layer][token][expert][4] words
@@ -40,7 +41,9 @@ GROUPS = {
     "ar2": ("ffn", "ffn_ag"),  # down -> all-reduce -> layer end
 }
 STAGES = ("start", "k1", "sel", "split", "merge", "o", "router")
-KINDS = ("moe", "sh", "qkv", "o", "gate", "kv", "idx")
+KINDS = ("moeu", "moed", "shu", "shd", "qkv", "o", "gate", "kv", "idx")
+# a probe may name a group: ``moe`` = both routed halves, ``sh`` = both shared halves
+KIND_GROUPS = {"moe": ("moeu", "moed"), "sh": ("shu", "shd")}
 
 
 @dataclass(frozen=True)
@@ -68,9 +71,9 @@ def parse(text: str) -> Probe:
         elif key == "loop":
             loop.update(val.split("+") if val else ("attn", "ffn"))
         elif key == "nb":
-            kinds = val.split("+")
-            assert all(k in KINDS for k in kinds), val
-            nb.update(kinds)
+            for k in val.split("+"):
+                assert k in KINDS or k in KIND_GROUPS, val
+                nb.update(KIND_GROUPS.get(k, (k,)))
         elif key == "pin":
             pin = True
         else:

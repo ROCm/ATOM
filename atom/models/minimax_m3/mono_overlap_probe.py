@@ -209,9 +209,9 @@ def run_probe(runner, input_ids, positions, n, spec) -> None:
     kinds = sorted({lw.index_topk for lw in sparse})
     launchers = {}
     for name, probe in variants.items():
-        parse(probe)  # a malformed probe fails here, on every rank
         if probe == "@begin":
             continue
+        parse(probe)  # a malformed probe fails here, on every rank
         launchers[name] = {
             k: runner._build_k4(n, index_topk=k, **({"probe": probe} if probe else {}))
             for k in kinds
@@ -237,7 +237,7 @@ def run_probe(runner, input_ids, positions, n, spec) -> None:
     # ---- 4. graphs
     graphs = {}
     for name, probe in variants.items():
-        tl = _ptr(pin) if parse(probe).pin else 0
+        tl = _ptr(pin) if probe != "@begin" and parse(probe).pin else 0
 
         def body(name=name, tl=tl):
             runner.mailboxes.begin_step()
