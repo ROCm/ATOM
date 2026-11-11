@@ -409,11 +409,13 @@ def moe_wide_defs(k4ctx):
             )
         lds_barrier()
         acquire()
-        for base_w, n_row, lds_w, lds_row in (
-            (mb("xn8p"), XN8_WORDS, 0, XN8_ROW),
-            (mb("xscp"), XSC_WORDS, XSC_LDS, XSC_ROW),
-        ):
-            rows_to_lds_async(tid, base_w, tokens, n_row, xs + lds_w, lds_row)
+        # Put scales and values in one async flight, as K1 does for its MXFP8
+        # rows. Waiting between them serializes two copies from the same
+        # producer even though neither is consumed before the barrier below.
+        rows_to_lds_async(
+            tid, mb("xscp"), tokens, XSC_WORDS, xs + XSC_LDS, XSC_ROW, wait=False
+        )
+        rows_to_lds_async(tid, mb("xn8p"), tokens, XN8_WORDS, xs, XN8_ROW)
         lds_barrier()
         wide_ug_run(ug_state)
         stamp(8)

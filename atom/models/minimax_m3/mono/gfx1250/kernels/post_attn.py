@@ -530,6 +530,7 @@ def build_post_attn_kernel(
 
         if const_expr(not WIDE):
             ffn_next_pre = None
+            ffn_next = None
         k4ctx.update(locals())
         k4ctx.update(moe_common_defs(k4ctx))
         k4ctx.update(ffn_reduce_defs(k4ctx))

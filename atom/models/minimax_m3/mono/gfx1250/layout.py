@@ -30,20 +30,34 @@ from atom.models.minimax_m3.mono.layout import (  # noqa: F401
     SPLIT_KEYS,
     UG_PER_SLOT,
     UG_ROWS,
-    WIDE_FROM,
     XN8_ROW,
     XSC_ROW,
     H,
     diag_region_names,
     mailbox_regions,
     shared_after_routing,
-    stage_bases,
     sym_layout,
     ug_ctas_per_token,
     ug_tasks_of,
-    wide_moe,
 )
+from atom.models.minimax_m3.mono.layout import stage_bases as _stage_bases
 from atom.mono.device.gfx1250 import WAVE, WAVES
+
+WIDE_FROM = 4
+
+
+def wide_moe(tokens: int) -> bool:
+    """Use expert-grouped MoE from S=4, which fits gfx1250's 320 KB LDS."""
+    return tokens >= WIDE_FROM
+
+
+def stage_bases(tokens: int) -> dict[str, int]:
+    """Delay S=12 merge consumers until their CTAs finish split work."""
+    bases = _stage_bases(tokens)
+    if tokens == 12:
+        bases["merge"] = (N_SPLIT - 1) * tokens
+    return bases
+
 
 PV_HALVES = 2  # the split's PV: a wave's 16 dims over one half of the keys
 ACC_WORDS = WAVES * WAVE * 8  # every wave's 16x16 f32 accumulator
