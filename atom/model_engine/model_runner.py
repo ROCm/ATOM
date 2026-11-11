@@ -127,8 +127,8 @@ from atom.model_ops.required_channel import (
 )
 from atom.model_ops.sampler import SAMPLER_EPS, sampler_from_config
 from atom.models.registry import mono_decode_installers, support_model_arch_dict
-from atom.mono.runtime.step_override import StepOverrideModel
 from atom.models.utils import extract_layer_index
+from atom.mono.runtime.step_override import StepOverrideModel
 from atom.sampling_params import RequiredChannel
 from atom.spec_decode.drafter import Drafter
 from atom.spec_decode.factory import build_drafter
@@ -3953,15 +3953,15 @@ class ModelRunner:
                 # One bit-preserving broadcast for scores, candidate IDs and ranks.
                 sampled_logprobs = get_tp_group().broadcast(sampled_logprobs, src=0)
 
+        # Gathered before the event, so the token copy that waits on it carries
+        # the rows too. R3 refuses PP and P/D, the only undeferred configs, and
+        # the mono models that override the step.
+        gpu_routes = self._gather_routed_experts_step(batch)
         # An overridden step's outputs are ready on its output stream, before
         # the work it queued after them on this one.
-
         self.forward_done_event.record(
             None if self._served is None else self._served.output_stream
         )
-        # Gathered before the event, so the token copy that waits on it carries
-        # the rows too. R3 refuses PP and P/D, the only undeferred configs.
-        gpu_routes = self._gather_routed_experts_step(batch)
         # Capture before prepare_sampled_ids(), which advances self.prev_batch to current batch.
         prev_batch = self.tokenID_processor.prev_batch
         token_id_dict, logprobs_map, routed_experts = (

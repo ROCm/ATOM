@@ -62,7 +62,7 @@ def _runner(seen):
         return torch.zeros(logits.shape[0], dtype=torch.int)
 
     runner.sampler = _sampler
-    runner.forward_done_event = types.SimpleNamespace(record=lambda: None)
+    runner.forward_done_event = types.SimpleNamespace(record=lambda *_: None)
     runner.tokenID_processor = types.SimpleNamespace(
         is_deferred_out=False,
         prev_batch=None,
@@ -331,6 +331,7 @@ def test_route_capture_off_runs_none_of_its_step_hooks(monkeypatch, deferred):
     monkeypatch.setattr(mod, "current_slot_mapping", _forbidden)
     monkeypatch.setattr(mod, "sp_is_enabled", lambda: False)
     runner = _runner({})
+    runner._served = None
     runner.routed_experts_capturer = None
     runner.tokenID_processor.is_deferred_out = deferred
     runner.tokenID_processor.prev_batch = _batch(2) if deferred else None
