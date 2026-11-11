@@ -578,31 +578,22 @@ def _sparse_attn_v4_split_combine_kernel(
 
 
 # Split-KV for few-token CSA steps (decode): aim for two programs per CU, and
-# never cut a token's keys finer than the minimum below. `ATOM_V4_ATTN_SPLIT_KV=0`
+# never cut a token's keys finer than `_SPLIT_MIN_KEYS`
+# (`ATOM_V4_ATTN_SPLIT_MIN_KEYS` overrides it). `ATOM_V4_ATTN_SPLIT_KV=0`
 # disables it.
 #
-# `_split_tuning`'s first branch (V4.1-Flash TP4: 16 heads, ~640 keys a token):
-# a decode step's keys are scattered rows of a pool tens of GB large, so the
-# split kernel waits on TLB misses rather than on bandwidth (~2x slower than
-# over a 1.5 GB pool) and more, smaller splits keep more of them in flight: 32
-# keys a split and a 16-key tile cut the split+combine time 1.4-1.9x at 1-32
-# tokens. The split count is taken from a short list so a prefill of any
-# length compiles at most these variants (NUM_SPLITS is a constexpr).
+# Tuned on V4.1-Flash TP4 (16 heads, ~640 keys a token): a decode step's keys
+# are scattered rows of a pool tens of GB large, so the split kernel waits on
+# TLB misses rather than on bandwidth (~2x slower than over a 1.5 GB pool) and
+# more, smaller splits keep more of them in flight: 32 keys a split and a
+# 16-key tile cut the split+combine time 1.4-1.9x at 1-32 tokens. The split
+# count is taken from a short list so a prefill of any length compiles at most
+# these variants (NUM_SPLITS is a constexpr).
+_SPLIT_COUNTS = (20, 10, 5, 3, 2)
+_SPLIT_MIN_KEYS = int(os.environ.get("ATOM_V4_ATTN_SPLIT_MIN_KEYS", "32"))
+_SPLIT_BLOCK_K = 16
 # Columns of D a combine program owns.
 _COMBINE_BLOCK_DC = 64
-
-
-@functools.lru_cache(maxsize=1)
-def _split_tuning() -> tuple[tuple[int, ...] | None, int, int, int]:
-    """(split counts to pick from, or None for powers of two up to 16; the
-    fewest keys a split may hold; the split kernel's key tile; its waves-per-EU
-    hint). `ATOM_V4_ATTN_SPLIT_MIN_KEYS` overrides the minimum."""
-    if get_gfx().startswith("gfx94"):
-        counts, min_keys, block_k, waves = (20, 10, 5, 3, 2), 32, 16, 0
-    else:
-        counts, min_keys, block_k, waves = None, 64, _BLOCK_K, _WAVES_PER_EU
-    min_keys = int(os.environ.get("ATOM_V4_ATTN_SPLIT_MIN_KEYS", min_keys))
-    return counts, min_keys, block_k, waves
 
 
 @functools.lru_cache(maxsize=8)
@@ -618,14 +609,8 @@ def _csa_num_splits(tokens: int, head_blocks: int, avg_keys: float, device) -> i
     if programs >= target // 2:
         return 1
     want = -(-target // programs)
-    counts, min_keys, _, _ = _split_tuning()
-    cap = max(1, int(avg_keys // min_keys))
-    if counts is not None:
-        return next((s for s in counts if s <= min(want, cap)), 1)
-    splits = 1
-    while splits * 2 <= min(want, cap, 16):
-        splits *= 2
-    return splits
+    cap = max(1, int(avg_keys // _SPLIT_MIN_KEYS))
+    return next((s for s in _SPLIT_COUNTS if s <= min(want, cap)), 1)
 
 
 def _sparse_attn_v4_paged_2src_triton(
@@ -701,7 +686,6 @@ def _sparse_attn_v4_paged_2src_triton(
         else 1
     )
     if num_splits > 1:
-        _, _, split_block_k, split_waves = _split_tuning()
         head_blocks = triton.cdiv(H, block_h)
         part_acc = torch.empty(
             (T * num_splits * H, block_d), device=q.device, dtype=torch.float32
@@ -731,10 +715,9 @@ def _sparse_attn_v4_paged_2src_triton(
             NUM_SPLITS=num_splits,
             BLOCK_H=block_h,
             BLOCK_D=block_d,
-            BLOCK_K=split_block_k,
+            BLOCK_K=_SPLIT_BLOCK_K,
             num_warps=num_warps,
             num_stages=num_stages,
-            waves_per_eu=split_waves,
         )
         _sparse_attn_v4_split_combine_kernel[
             (T, head_blocks, triton.cdiv(block_d, _COMBINE_BLOCK_DC))

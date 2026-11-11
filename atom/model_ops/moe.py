@@ -3298,15 +3298,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight.data[expert_id] = w2_q
                 layer.w2_weight_scale.data[expert_id] = w2_s.squeeze(-1)
 
-        # With a SwiGLU clamp: aiter's per-token FP8 MoE here (the asm
-        # one-stage kernels) drops `swiglu_limit`, so these layers run the
-        # clamped Triton experts, which read the weights row-major. Those
-        # implement clamped SiLU(gate) * up with dynamic per-token activation
-        # scales only; any other activation (e.g. MiniMax-M3's swigluoai) or a
-        # static input scale keeps the aiter path.
+        # With a SwiGLU clamp: aiter's per-token FP8 MoE runs its asm
+        # one-stage kernels past 16 tokens (or when the intermediate size is
+        # not a multiple of 128), and those drop `swiglu_limit`, so these
+        # layers run the clamped Triton experts, which read the weights
+        # row-major. Those implement clamped SiLU(gate) * up with dynamic
+        # per-token activation scales only; any other activation (e.g.
+        # MiniMax-M3's swigluoai) or a static input scale keeps the aiter path.
         self.ptpc_clamp_triton = (
-            get_gfx().startswith("gfx94")
-            and getattr(layer, "swiglu_limit", 0.0) > 0
+            getattr(layer, "swiglu_limit", 0.0) > 0
             and getattr(layer, "activation", ActivationType.Silu) == ActivationType.Silu
             and getattr(layer, "w13_input_scale", None) is None
             and getattr(layer, "w2_input_scale", None) is None

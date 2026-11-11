@@ -165,11 +165,12 @@ def native_group32_runs_bf16() -> bool:
 
     Without microscaling MFMA there is no group32 FP8 GEMM. There the
     32x32 / 1x32 FP8 weights are dequantized once at load and the GEMM runs
-    in BF16 (hipBLASLt via tgemm).
+    in BF16 (hipBLASLt via tgemm). Asks the live GPU: `get_gfx()` follows
+    GPU_ARCHS and reports the last arch of a multi-arch list.
     """
-    from aiter.jit.utils.chip_info import get_gfx
+    from aiter.jit.utils.chip_info import get_gfx_runtime
 
-    return get_gfx().startswith("gfx94")
+    return get_gfx_runtime().startswith("gfx94")
 
 
 def _e8m0_to_float(code: torch.Tensor) -> torch.Tensor:
