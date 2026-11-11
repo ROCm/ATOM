@@ -1803,3 +1803,74 @@ def test_independent_credit_does_not_survive_request_id_reuse_or_reset():
     assert router._independent_credit[2] == 0
     router.reset()
     assert not router._independent_credit
+
+
+def _count_router_calls(router, *names):
+    """Wrap router methods; returns {name: [kwargs-of-each-call]}."""
+    calls = {name: [] for name in names}
+    for name in names:
+        real = getattr(router, name)
+
+        def wrapper(*args, _real=real, _log=calls[name], **kwargs):
+            _log.append(kwargs)
+            return _real(*args, **kwargs)
+
+        setattr(router, name, wrapper)
+    return calls
+
+
+def _warm_prefix_on_rank0(mgr, length=8192):
+    """A finished prefix on rank 0, then both ranks idle."""
+    (owner,) = _route(mgr, [_chain_seq(1, length)])
+    assert owner == 0
+    mgr._mark_seq_prefill_complete(1)
+    mgr._rank_tokens = [0, 0]
+    mgr._rank_reqs = [0, 0]
+
+
+@pytest.mark.parametrize("shape", ["cold", "owner", "moved"])
+@pytest.mark.parametrize("loads", [True, False])
+def test_prefix_spread_placement_walks_the_hash_chain_once_read_only(shape, loads):
+    from atom.kv_transfer.offload.tier import OffloadTierProfile
+
+    mgr = _make_spread_mgr(tier=OffloadTierProfile(loads, 1024, 512))
+    router = mgr._prefix_router
+    _warm_prefix_on_rank0(mgr)
+    if shape == "moved":
+        mgr._rank_tokens = [200_000, 0]
+    seq = _chain_seq(2, 8192 + 640, first_block=0 if shape != "cold" else 50_000)
+    calls = _count_router_calls(router, "_path")
+    before = _count(mgr, f"prefix_{shape}_total")
+    _route(mgr, [seq])
+    reads = [k for k in calls["_path"] if not k.get("create")]
+    creates = [k for k in calls["_path"] if k.get("create")]
+    # Lookups share one read-only walk; the only other walk creates/splits edges.
+    assert (len(reads), len(creates)) == (1, 1)
+    assert _count(mgr, f"prefix_{shape}_total") == before + 1
+
+
+def test_prefix_spread_explicit_placement_walks_the_hash_chain_once_read_only():
+    from atom.kv_transfer.offload.tier import OffloadTierProfile
+
+    router = _make_spread_mgr(tier=OffloadTierProfile(True, 1024, 512))._prefix_router
+    router.place(_chain_seq(1, 8192), 0, 2)
+    router.prefill_complete(1)
+    calls = _count_router_calls(router, "_path")
+    router.place(_chain_seq(2, 8192 + 640), 1, 2)
+    assert [bool(k.get("create")) for k in calls["_path"]] == [False, True]
+
+
+def test_prefix_spread_does_not_ask_the_tier_when_it_cannot_load():
+    from atom.kv_transfer.offload.tier import OffloadTierProfile
+
+    for loads, asked in ((False, 0), (True, 2)):
+        mgr = _make_spread_mgr(tier=OffloadTierProfile(loads, 1024, 512))
+        router = mgr._prefix_router
+        _warm_prefix_on_rank0(mgr)
+        mgr._rank_tokens = [200_000, 0]  # owner backlogged: the request moves
+        calls = _count_router_calls(router, "_tier_hit")
+        seq = _chain_seq(2, 8192 + 640)
+        assert _route(mgr, [seq]) == [1]
+        assert len(calls["_tier_hit"]) == asked
+        # No tier: the moved request keeps only what rank 1 holds (nothing).
+        assert _est(mgr, seq) == (8192 if loads else 0)

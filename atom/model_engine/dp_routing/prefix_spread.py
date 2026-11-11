@@ -192,7 +192,9 @@ class PrefixSpreadRouter:
           this is what lets the request reuse it from HBM.
         """
         chain = getattr(seq, "prompt_hash_chain", None)
-        hits, owner = self._rank_hits(chain, len(rank_tokens))
+        # One read-only walk serves every lookup below; only `_record` walks again.
+        path = self._path(chain)
+        hits, owner = self._rank_hits(chain, len(rank_tokens), path)
         if owner is None:
             rank = lightest()
             self._record(chain, rank, seq.id, 0)
@@ -207,9 +209,13 @@ class PrefixSpreadRouter:
             if target is not None:
                 rank = target
 
-        est_hit, loaded = self._credit(seq, rank, hits, owner)
+        est_hit, loaded = self._credit(seq, rank, hits, owner, path)
         self._record(
-            chain, rank, seq.id, est_hit, self._independent_hit(seq, rank, est_hit)
+            chain,
+            rank,
+            seq.id,
+            est_hit,
+            self._independent_hit(seq, rank, est_hit, path),
         )
         if rank == owner:
             return Route(rank, PREFIX_OWNER, est_hit)
@@ -220,22 +226,27 @@ class PrefixSpreadRouter:
         chain = getattr(seq, "prompt_hash_chain", None)
         if chain is None or not 0 <= rank < n_ranks:
             return Route(rank, "explicit_total")
-        hits, owner = self._rank_hits(chain, n_ranks)
-        credit, loaded = self._credit(seq, rank, hits, owner)
+        path = self._path(chain)
+        hits, owner = self._rank_hits(chain, n_ranks, path)
+        credit, loaded = self._credit(seq, rank, hits, owner, path)
         self._record(
-            chain, rank, seq.id, credit, self._independent_hit(seq, rank, credit)
+            chain,
+            rank,
+            seq.id,
+            credit,
+            self._independent_hit(seq, rank, credit, path),
         )
         return Route(rank, "explicit_total", credit, loaded)
 
-    def _credit(self, seq, rank, hits, owner):
+    def _credit(self, seq, rank, hits, owner, path):
         local = hits.get(rank, 0)
-        if rank == owner:
+        if rank == owner or not self.tier.loads:
             return local, 0
-        in_tier = self._tier_hit(seq.prompt_hash_chain)
+        in_tier = self._tier_hit(seq.prompt_hash_chain, path)
         loaded = self.tier.loadable_tokens(local, in_tier, seq.num_prompt_tokens)
         return local + loaded, loaded
 
-    def _independent_hit(self, seq, rank, credit):
+    def _independent_hit(self, seq, rank, credit, path):
         """Credit available without waiting for a same-rank producer.
 
         Keep the placement-time confirmed local prefix and load policy: an
@@ -243,7 +254,7 @@ class PrefixSpreadRouter:
         aborts. Unfinished tier copies and sub-threshold loads supply no floor.
         """
         local = 0
-        for edge, hit in reversed(self._path(seq.prompt_hash_chain)):
+        for edge, hit in reversed(path):
             holders = self.index[edge]
             if (
                 rank in holders
@@ -252,8 +263,10 @@ class PrefixSpreadRouter:
             ):
                 local = hit
                 break
+        if not self.tier.loads:
+            return min(credit, local)
         loaded = self.tier.loadable_tokens(
-            local, self._tier_hit(seq.prompt_hash_chain), seq.num_prompt_tokens
+            local, self._tier_hit(seq.prompt_hash_chain, path), seq.num_prompt_tokens
         )
         return min(credit, local + loaded)
 
@@ -360,16 +373,16 @@ class PrefixSpreadRouter:
             self._produced.setdefault(producer, set()).add(prefix)
         return prefix
 
-    def _tier_hit(self, chain) -> int:
+    def _tier_hit(self, chain, path=None) -> int:
         """Longest matching prefix with a finished holder on any rank."""
-        for edge, hit in reversed(self._path(chain)):
+        for edge, hit in reversed(self._path(chain) if path is None else path):
             if any(
                 seq_id not in self._in_flight for seq_id in self.index[edge].values()
             ):
                 return hit
         return 0
 
-    def _rank_hits(self, chain, n: int):
+    def _rank_hits(self, chain, n: int, path=None):
         """Longest prefix per rank; equal-length owners use last-recorded order.
 
         Other ranks' unfinished producers do not supply a local hit. Seed and
@@ -377,7 +390,7 @@ class PrefixSpreadRouter:
         """
         hits = {}
         owner = None
-        for edge, hit in reversed(self._path(chain)):
+        for edge, hit in reversed(self._path(chain) if path is None else path):
             holders = self.index[edge]
             for rank, seq_id in reversed(holders.items()):
                 if not 0 <= rank < n or rank in hits:
