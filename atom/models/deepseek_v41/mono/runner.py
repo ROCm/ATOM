@@ -16,6 +16,7 @@ kernels the original modules still run the compressor and Engram.
 
 import logging
 import struct
+from dataclasses import replace
 
 import torch
 from aiter.dist.parallel_state import (
@@ -34,7 +35,11 @@ from atom.model_ops.v4_kernels.paged_decode import LOG2E
 from atom.models.deepseek_v41.config import AttentionMode
 from atom.models.deepseek_v41.dspark import DeepseekV41DSpark
 from atom.models.deepseek_v41.mono import index_plan as ip
-from atom.models.deepseek_v41.mono.builds import RowsBuild
+from atom.models.deepseek_v41.mono.builds import (
+    RowsBuild,
+    lean_width,
+    unfused_post_key,
+)
 from atom.models.deepseek_v41.mono.check import (
     check_front,
     check_moe,
@@ -56,7 +61,11 @@ from atom.models.deepseek_v41.mono.kernels.index_query import (
 from atom.models.deepseek_v41.mono.kernels.moe_shape import EXPERTS, TOPK
 from atom.models.deepseek_v41.mono.kernels.peer_layout import peer_bytes, plain_layout
 from atom.models.deepseek_v41.mono.kernels.token_par import own_rows
-from atom.models.deepseek_v41.mono.step_meta import KMETA, write_step_meta
+from atom.models.deepseek_v41.mono.step_meta import (
+    KMETA,
+    write_selection_rows,
+    write_step_meta,
+)
 from atom.models.deepseek_v41.mono.weights import bind_model
 from atom.mono.device import queue
 from atom.mono.plan.execution import BLOCKS
@@ -168,7 +177,11 @@ class V41MonoDecodeRunner:
         self._full = {name: getattr(self, name) for name, _ in _ROW_BUFFERS}
         self.mailboxes = StepMailboxes(self.peers, self.scratch, debug=self.debug)
         self.widths = WidthBuilds(
-            self._rows_build, self._row_kernels, group, "V4.1 mono"
+            self._rows_build,
+            self._row_kernels,
+            group,
+            "V4.1 mono",
+            lean=self._lean_width,
         )
 
     def _place_index_outputs(self, plain: dict) -> None:
@@ -383,11 +396,17 @@ class V41MonoDecodeRunner:
             kv_fp8=self.kv_fp8,
         )
 
-    def _rows_build(self, s: int) -> RowsBuild:
-        """The s-row step's kernels."""
-        keys = self._layer_keys(s)
-        launchers = {key: k1.build_attn_pre(key) for key in set(keys)}
+    def _rows_build(self, s: int, *, unfused: bool = False) -> RowsBuild:
+        """The s-row step's kernels, fused or (``unfused``) with K2's indexer
+        out and token parallel off (``builds.unfused_post_key``): the runner
+        then scores between K1 and K2 (``_score``, ``_publish_selection``)."""
         post_key = self._post_key(s)
+        keys = self._layer_keys(s)
+        if unfused:
+            post_key = unfused_post_key(post_key)
+            keys = [replace(key, tok_par=post_key.tok_par) for key in keys]
+        launchers = {key: k1.build_attn_pre(key) for key in set(keys)}
+        rest = {"post_key": post_key, "unfused": unfused}
         if self.split_k2:
             key_a, key_b = post_key.halves()
             return RowsBuild(
@@ -395,10 +414,20 @@ class V41MonoDecodeRunner:
                 launchers,
                 attn_post=k2a.build_attn_post(key_a),
                 moe=k2b.build_moe(key_b),
-                post_key=post_key,
+                **rest,
             )
         return RowsBuild(
-            keys, launchers, layer_post=k2.build_layer_post(post_key), post_key=post_key
+            keys, launchers, layer_post=k2.build_layer_post(post_key), **rest
+        )
+
+    def _lean_width(self, built: RowsBuild, spilled: list) -> RowsBuild | None:
+        """``WidthBuilds``' lean seam: a width whose K2 needs scratch rebuilt
+        unfused, which has no index stage to spill on. Anything else has
+        nothing leaner and the width is refused as before."""
+        return lean_width(
+            built,
+            spilled,
+            lambda: self._rows_build(built.post_key.tokens, unfused=True),
         )
 
     @staticmethod
@@ -531,11 +560,14 @@ class V41MonoDecodeRunner:
             cache.geometry.window(0, cache.num_pages),
             self.ring_rel,
             self.key_meta,
-            self.walk_plans,
+            # an unfused width's scorer is ATOM's own, which plans its own work
+            {} if self.build.unfused else self.walk_plans,
             # a token-parallel step's indexer scores this rank's rows alone
             self._own_rows(rows),
         )
         state = SinglePassHCState.from_embeddings(hidden, model.config.hc_mult)
+        # an unfused width: the selection owners this step has published
+        published = set()
         for spec, block, weights, key in zip(
             model.topology, model.layers, self.layers, self.build.keys
         ):
@@ -562,7 +594,12 @@ class V41MonoDecodeRunner:
                 )
             if block.attn.indexer is not None:
                 block.attn._compress_batch(self.normed, cache, step, rope)
-                if self.check:
+                if self.build.unfused:
+                    # this width's K2 has no index stage: ATOM's own indexer
+                    # makes the selection and K2 reads it
+                    self._score(block, cache, step, rope)
+                    self._publish_selection(spec, cache, step, published)
+                elif self.check:
                     # the original scorer, the reference the selection is held to
                     block.attn.indexer.score_quantized(
                         self.index_query(), self.iw, cache, step
@@ -585,7 +622,9 @@ class V41MonoDecodeRunner:
                     rows_per_block=ip.BLOCK_ROWS,
                 )
             if self.check:
-                if block.attn.indexer is not None:
+                # an unfused width makes no selection of its own to hold to the
+                # original scorer: the one K2 read is already that scorer's
+                if block.attn.indexer is not None and not self.build.unfused:
                     check_selection(self, spec, step)
                 # the original index build, for the reference attention alone
                 keys = decode_keys(cache, spec, step)
@@ -615,6 +654,47 @@ class V41MonoDecodeRunner:
         for k, buf in enumerate(self.aux.buffers):
             buf[:rows].copy_(every[:, k + 1])
         return every[:, 0].contiguous().unsqueeze(0)
+
+    def _score(self, block, cache, step, rope) -> None:
+        """An unfused width's indexer, run between K1 and K2: this layer's
+        top-k (and a candidate producer's blocks) into ``step``, on K1's
+        outputs, as the AITER provider drives these same kernels."""
+        indexer = block.attn.indexer
+        if self.index_fp4:
+            # K1's FP4 query is laid out for K2's scorer, not this one: the
+            # original projection off K1's normed row and q latent instead
+            query, weights = indexer.project(
+                self.normed, self.qr, self.qr_scale, cache, step, rope
+            )
+            indexer.score(query, weights, cache, step)
+        else:
+            # K1's per-(row, head) FP8 query and its scale-folded head weights,
+            # as check mode scores them
+            indexer.score_quantized(self.iq, self.iw, cache, step)
+
+    def _publish_selection(self, spec, cache, step, published: set) -> None:
+        """An unfused width's selection where K2 reads it: owner
+        ``spec.layer_id``'s pool rows in ``irow`` and, on a candidate producer,
+        its blocks in ``icand`` -- what a fused build's K2 writes itself
+        (``index_score._final``). Once an owner a step: every layer that shares
+        a selection shares its KV owner, so its rows."""
+        owner = spec.layer_id
+        if owner in published:
+            return
+        published.add(owner)
+        geometry = cache.geometry
+        write_selection_rows(
+            self.irow[owner],
+            step.selected[owner][0],
+            step.batch_ids,
+            step.block_tables,
+            geometry.rows_per_page(spec.ratio),
+            geometry.page_bytes // geometry.row_bytes,
+            geometry.main_offset(spec.kv_owner),
+        )
+        if spec.produces_candidates:
+            # the REINDEX layers read them through ``candidate_block_table``
+            self.icand.copy_(step.candidates[owner])
 
     def _front(self, layer_id, key, weights, state, cache, step, rope):
         """K1 -> (the residual after the owed post, the seam's (pre, post, comb));
