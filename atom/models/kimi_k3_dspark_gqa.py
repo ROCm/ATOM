@@ -42,7 +42,7 @@ from aiter.rotary_embedding import get_rope
 from aiter.tuned_gemm import tgemm
 from torch import nn
 
-from atom.model_ops.kimi_k3.dspark_block_attn import DSparkGQABlockAttention
+from atom.model_ops.attentions.dspark_block_attn import DSparkGQABlockAttention
 from atom.model_ops.layernorm import DualRMSNorm, RMSNorm
 from atom.model_ops.linear import (
     QKVParallelLinear,

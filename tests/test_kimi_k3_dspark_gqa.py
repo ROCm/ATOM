@@ -829,7 +829,7 @@ def test_the_builder_skips_dummy_runs_and_drafts_without_a_pool():
 
 
 # --------------------------------------------------------------------------- #
-# the block read (model_ops/kimi_k3/dspark_block_attn.py)
+# the block read (model_ops/attentions/dspark_block_attn.py)
 #
 # `unified_attention` asserts causal; the read gets a non-causal block out of it
 # by folding each request's T rows into its head axis and decoding ONE row per
@@ -840,7 +840,7 @@ def test_the_builder_skips_dummy_runs_and_drafts_without_a_pool():
 
 def _fold_mod():
     pytest.importorskip("torch")
-    return gpu_stack_import("atom.model_ops.kimi_k3.dspark_block_attn")
+    return gpu_stack_import("atom.model_ops.attentions.dspark_block_attn")
 
 
 @pytest.mark.parametrize("bs,T,hkv,g", [(1, 7, 2, 4), (3, 7, 2, 4), (2, 4, 1, 8)])

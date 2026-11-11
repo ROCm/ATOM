@@ -1,15 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Page-table read for the Kimi-K3 DSpark GQA draft block.
+"""Page-table read of a DSpark block over a FLASH-layout `MhaKvPool`.
 
-The block pass writes its own T rows into the draft pool first
-(`KimiK3DSparkGQAAttention._write_kv`), so request ``b``'s pool rows are
-keys ``[0, kv_lens[b])``, ``kv_lens = context_lens = anchor + 1 + T``, and every
-block row attends all of them. Key ``t`` sits at slot
+The caller writes the block's own T rows into the pool before the read, so
+request ``b``'s pool rows are keys ``[0, kv_lens[b])`` and every block row
+attends all of them. Key ``t`` sits at slot
 ``block_tables[b, t // E] * E + t % E``, where ``E`` is the pool's entry span
-(``block_size * dcp_size`` for this draft, which is not in the dcp group). The
-read takes exactly that, so the proposer builds no ``kv_indptr``/``kv_indices``
-stream for it.
+(`MhaKvPool.fa_views`). The read takes exactly that, so the caller builds no
+``kv_indptr``/``kv_indices`` stream for it.
 
 `DSparkGQABlockAttention` is aiter's ``unified_attention`` -- the kernel
 `PagedAttentionImpl.paged_attention_unified` already decodes through -- on the
@@ -56,7 +54,7 @@ def gluon_takes_pool_dtype_q(
     if supported is None or params_t is None:
         logger.warning(
             "aiter unified_attention has no _gfx950_gluon_supported/_UAParams; "
-            "the DSpark GQA draft read keeps q in bf16 over an fp8 pool"
+            "the DSpark block read keeps q in bf16 over an fp8 pool"
         )
         return False
     fields = dict.fromkeys(params_t._fields)
