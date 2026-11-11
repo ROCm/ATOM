@@ -16966,6 +16966,36 @@ models:
             common:
               <<: *m31_n967_half_env
               ATOMESH_M31_D_MAX_SEQS: "28"
+        # C96 with both collapsed (TTFT p90 68 s): 15 requests in prefill at once vs 5.5 eager, GPU
+        # prefix hits 67% vs 75%, recompute 12.4% vs 6.0%. C80 with each switch alone, and C72 without.
+        - &m31_moriio_1p2d_n967_c80_case
+          <<: *m31_moriio_1p2d_n967_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-n967-c80-dcap20-cpu15
+          concurrency: [80]
+          env:
+            common: &m31_n967_c80_env
+              <<: *m31_n967_env
+              ATOMESH_M31_D_MAX_SEQS: "20"
+              ATOMESH_M31_P_CPU_OFFLOAD_BYTES: "1499000000000"
+        - <<: *m31_moriio_1p2d_n967_c80_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-n967-c80-dcap20-cpu15-lazy
+          env:
+            common:
+              <<: *m31_n967_c80_env
+              ATOMESH_M31_P_LAZY_OFFLOAD: "true"
+        - <<: *m31_moriio_1p2d_n967_c80_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-n967-c80-dcap20-cpu15-lpt4k
+          env:
+            common:
+              <<: *m31_n967_c80_env
+              ATOMESH_M31_P_EXTRA_ARGS: --long-prefill-token-threshold 4096
+        - <<: *m31_moriio_1p2d_n967_c80_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-n967-c72-dcap18-cpu15
+          concurrency: [72]
+          env:
+            common:
+              <<: *m31_n967_c80_env
+              ATOMESH_M31_D_MAX_SEQS: "18"
         # The local 1P1D layout (P GPUs 0-3, D GPUs 4-7 of one node) with xgmi swapped for RDMA.
         - &m31_moriio_1p1d_sn_case
           <<: *m31_moriio_1p2d_case
