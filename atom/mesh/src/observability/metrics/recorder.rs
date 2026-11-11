@@ -470,9 +470,21 @@ impl MeshMetrics {
         .record(ratio);
     }
 
-    /// Record the cost of the selected candidate, in the policy's own unit.
-    pub fn record_route_cost(pool: &'static str, policy: &'static str, cost: f64) {
-        histogram!(names::ROUTE_COST, "pool" => pool, "policy" => policy).record(cost);
+    /// Record the router-tracked active requests on the selected worker, read
+    /// before the request is added.
+    pub fn record_route_selected_worker_active_requests(
+        pool: &'static str,
+        policy: &'static str,
+        branch: &'static str,
+        active_requests: usize,
+    ) {
+        histogram!(
+            names::ROUTE_SELECTED_WORKER_ACTIVE_REQUESTS,
+            "pool" => pool,
+            "policy" => policy,
+            "branch" => branch
+        )
+        .record(active_requests as f64);
     }
 
     /// Record a session affinity lookup: hit, new, rebind or expired.

@@ -196,10 +196,7 @@ impl LoadBalancingPolicy for DpStickyPolicy {
         let (selected, outcome) = self.select_worker_impl(workers, info);
         let decision = match selected {
             None => RouteDecision::branch(NO_HEALTHY_WORKERS),
-            Some(index) if outcome == NO_SESSION => RouteDecision {
-                cost: Some(workers[index].load() as f64),
-                ..RouteDecision::branch(NO_SESSION)
-            },
+            Some(_) if outcome == NO_SESSION => RouteDecision::branch(NO_SESSION),
             Some(_) => RouteDecision {
                 affinity: Some(outcome),
                 ..RouteDecision::branch(outcome)

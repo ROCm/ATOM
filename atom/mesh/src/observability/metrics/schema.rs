@@ -270,7 +270,8 @@ pub mod names {
 
     pub const ROUTE_BRANCH_TOTAL: &str = "mesh_route_branch_total";
     pub const ROUTE_PREFIX_MATCH_RATIO: &str = "mesh_route_prefix_match_ratio";
-    pub const ROUTE_COST: &str = "mesh_route_cost";
+    pub const ROUTE_SELECTED_WORKER_ACTIVE_REQUESTS: &str =
+        "mesh_route_selected_worker_active_requests";
     pub const SESSION_AFFINITY_TOTAL: &str = "mesh_session_affinity_total";
     pub const PREFILL_OVERLAP_BLOCKS: &str = "mesh_prefill_overlap_blocks";
     pub const SELECTED_DP_RANK_TOTAL: &str = "mesh_selected_dp_rank_total";
@@ -490,9 +491,9 @@ pub const METRIC_INVENTORY: &[MetricSpec] = &[
         status: MetricStatus::Active,
     },
     MetricSpec {
-        name: names::ROUTE_COST,
+        name: names::ROUTE_SELECTED_WORKER_ACTIVE_REQUESTS,
         kind: MetricKind::Histogram,
-        help: "Cost of the selected candidate in the policy's own unit by pool, policy",
+        help: "Router-tracked active requests on the selected worker, read at selection before the request is added, by pool, policy, branch",
         status: MetricStatus::Active,
     },
     MetricSpec {
@@ -636,10 +637,9 @@ pub(crate) const ROUTE_HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[
         &[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 1.0],
     ),
     (
-        names::ROUTE_COST,
+        names::ROUTE_SELECTED_WORKER_ACTIVE_REQUESTS,
         &[
-            0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 4096.0,
-            16384.0, 65536.0, 262144.0, 1048576.0,
+            0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0,
         ],
     ),
     (

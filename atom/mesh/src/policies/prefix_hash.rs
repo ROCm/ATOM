@@ -238,20 +238,11 @@ impl LoadBalancingPolicy for PrefixHashPolicy {
         // Kept for existing scrapers until they move to mesh_route_branch_total.
         #[allow(deprecated)]
         MeshMetrics::record_worker_prefix_hash_policy_branch(branch.as_str());
-        let cost = match branch {
-            Branch::LoadBalanceWalk | Branch::FallbackLeastLoad => {
-                result.map(|idx| workers[idx].load() as f64)
-            }
-            _ => None,
-        };
         decision::report(
             self,
             workers,
             result,
-            RouteDecision {
-                cost,
-                ..RouteDecision::branch(branch.as_str())
-            },
+            RouteDecision::branch(branch.as_str()),
         );
         result
     }

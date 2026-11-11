@@ -19,8 +19,6 @@ pub(crate) struct RouteDecision {
     pub branch: &'static str,
     /// Prefix match ratio of the best candidate, for policies that estimate one.
     pub match_ratio: Option<f64>,
-    /// Cost of the selected candidate, in the policy's own unit.
-    pub cost: Option<f64>,
     /// Session affinity result: hit, new, rebind or expired.
     pub affinity: Option<&'static str>,
 }
@@ -34,7 +32,8 @@ impl RouteDecision {
     }
 }
 
-/// Record one selection; `selected` indexes `workers`.
+/// Record one selection; `selected` indexes `workers`. Call it before the
+/// router adds the request to the selected worker's load.
 pub(crate) fn report<P: LoadBalancingPolicy + ?Sized>(
     policy: &P,
     workers: &[Arc<dyn Worker>],
@@ -47,20 +46,23 @@ pub(crate) fn report<P: LoadBalancingPolicy + ?Sized>(
         policy.name(),
         decision.branch
     );
-    let Some(worker) = selected
-        .and_then(|index| workers.get(index))
-        .or(workers.first())
-    else {
+    let selected = selected.and_then(|index| workers.get(index));
+    let Some(worker) = selected.or(workers.first()) else {
         return;
     };
     let pool = worker.worker_type().as_metric_label();
     let name = policy.name();
     MeshMetrics::record_route_branch(pool, name, decision.branch);
+    if let Some(selected) = selected {
+        MeshMetrics::record_route_selected_worker_active_requests(
+            pool,
+            name,
+            decision.branch,
+            selected.load(),
+        );
+    }
     if let Some(ratio) = decision.match_ratio {
         MeshMetrics::record_route_prefix_match_ratio(pool, name, ratio);
-    }
-    if let Some(cost) = decision.cost {
-        MeshMetrics::record_route_cost(pool, name, cost);
     }
     if let Some(result) = decision.affinity {
         MeshMetrics::record_session_affinity(pool, result);
@@ -122,15 +124,28 @@ mod tests {
 
         let rendered = handle.render();
         for name in POLICIES {
-            let label = format!("policy=\"{name}\"");
-            let selections: f64 = rendered
-                .lines()
-                .filter(|line| {
-                    line.starts_with("mesh_route_branch_total{") && line.contains(&label)
-                })
-                .map(|line| line.rsplit_once(' ').unwrap().1.parse::<f64>().unwrap())
-                .sum();
-            assert_eq!(selections, 1.0, "{name}\n{rendered}");
+            let policy = format!("policy=\"{name}\"");
+            for metric in [
+                "mesh_route_branch_total{",
+                "mesh_route_selected_worker_active_requests_count{",
+            ] {
+                assert_eq!(
+                    total(&rendered, metric, &[&policy]),
+                    1.0,
+                    "{name} {metric}\n{rendered}"
+                );
+            }
         }
+    }
+
+    /// Sum of the samples of `metric` whose labels include every one of `labels`.
+    fn total(rendered: &str, metric: &str, labels: &[&str]) -> f64 {
+        rendered
+            .lines()
+            .filter(|line| {
+                line.starts_with(metric) && labels.iter().all(|label| line.contains(label))
+            })
+            .map(|line| line.rsplit_once(' ').unwrap().1.parse::<f64>().unwrap())
+            .sum()
     }
 }

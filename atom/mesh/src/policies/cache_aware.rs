@@ -349,11 +349,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 max_load,
                 min_load,
             );
-            let decision = RouteDecision {
-                cost: selected.map(|idx| workers[idx].load() as f64),
-                ..RouteDecision::branch("imbalanced")
-            };
-            decision::report(self, workers, selected, decision);
+            decision::report(self, workers, selected, RouteDecision::branch("imbalanced"));
             return selected;
         }
 
@@ -413,10 +409,6 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 // Increment processed counter
                 workers[idx].increment_processed();
 
-                let decision = RouteDecision {
-                    cost: (!affinity).then(|| workers[idx].load() as f64),
-                    ..decision
-                };
                 decision::report(self, workers, Some(idx), decision);
                 return Some(idx);
             }
@@ -671,7 +663,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn branches_match_ratio_and_cost_are_recorded() {
+    async fn branches_match_ratio_and_active_requests_are_recorded() {
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         let _recorder = metrics::set_default_local_recorder(&recorder);
@@ -707,17 +699,18 @@ mod tests {
 
         let rendered = handle.render();
         for branch in ["relocate", "affinity", "imbalanced"] {
-            let line = format!(
-                r#"mesh_route_branch_total{{pool="regular",policy="cache_aware",branch="{branch}"}} 1"#
-            );
-            assert!(rendered.contains(&line), "missing {line} in\n{rendered}");
+            for metric in [
+                "mesh_route_branch_total",
+                "mesh_route_selected_worker_active_requests_count",
+            ] {
+                let line = format!(
+                    r#"{metric}{{pool="regular",policy="cache_aware",branch="{branch}"}} 1"#
+                );
+                assert!(rendered.contains(&line), "missing {line} in\n{rendered}");
+            }
         }
-        for line in [
-            r#"mesh_route_prefix_match_ratio_count{pool="regular",policy="cache_aware"} 2"#,
-            r#"mesh_route_cost_count{pool="regular",policy="cache_aware"} 2"#,
-        ] {
-            assert!(rendered.contains(line), "missing {line} in\n{rendered}");
-        }
+        let line = r#"mesh_route_prefix_match_ratio_count{pool="regular",policy="cache_aware"} 2"#;
+        assert!(rendered.contains(line), "missing {line} in\n{rendered}");
     }
 
     #[tokio::test]
