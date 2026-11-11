@@ -16,8 +16,11 @@ ATOM supports these DSpark drafts:
 | **Kimi-K3** | [Inferact/Kimi-K3-DSpark](https://huggingface.co/Inferact/Kimi-K3-DSpark) (MLA) | `--draft-model` | extra rows in the target's MLA pool | sharded with the target |
 | **Kimi-K3** | [RadixArk/Kimi-K3-DSpark](https://huggingface.co/RadixArk/Kimi-K3-DSpark) (SpecForge DFlash, GQA) | `--draft-model` | its own pool, `--kv_cache_dtype` | not sharded: every rank holds the whole context |
 
-Everything downstream of loading — the parallel block draft, confidence-scheduled
-ragged verify, and `--dspark-config` knobs — is shared between them.
+Everything downstream of loading — the parallel block draft, the verify paths,
+and `--dspark-config` knobs — is shared between them. The confidence-scheduled
+ragged verify needs a draft that returns confidence: the V4 draft does, the two
+Kimi-K3 drafts do not (neither loads its checkpoint's `confidence_head`), so
+with them `confidence_schedule` / `ragged` pick no per-request verify length.
 
 ## Preparing environment
 
@@ -76,8 +79,8 @@ Notes for Kimi-K3:
   target's own full-attention layers cache, so the draft's 5 layers bind into
   the target's KV pool as extra rows and inherit `--kv_cache_dtype`.
 - `--draft-model` accepts a local path or an HF repo id (downloaded on startup).
-- The confidence-scheduled ragged verify (`--dspark-config`) also applies here;
-  omit it to run the plain batch-uniform verify.
+- The draft returns no confidence, so the confidence-scheduled ragged verify
+  does not apply: omit `--dspark-config` to run the plain batch-uniform verify.
 
 ### Kimi-K3 with the RadixArk DSpark GQA draft (TP8 + DCP8 + FP8 KV Cache)
 

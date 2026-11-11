@@ -3,8 +3,9 @@
 """Kimi-K3 DSpark GQA draft: the SpecForge/SGLang DSpark speculator.
 
 `RadixArk/Kimi-K3-DSpark` (a SpecForge DFlash checkpoint): the same
-block-parallel draft, Markov head and confidence head as `kimi_k3_dspark.py`,
-on 5 Qwen3-style GQA layers instead of MLA. `embed_tokens` and `lm_head` are
+block-parallel draft and Markov head as `kimi_k3_dspark.py`, on 5 Qwen3-style
+GQA layers instead of MLA. As there, the checkpoint's confidence head is not
+loaded, so the draft returns no confidence. `embed_tokens` and `lm_head` are
 shared from the target. The fusion width is ``len(target_layer_ids)`` (5), not
 the config's ``num_target_layers`` (the target's depth).
 
