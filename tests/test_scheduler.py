@@ -1209,6 +1209,33 @@ class TestSchedule:
         batch, _ = sched.schedule()
         assert list(batch.req_ids) == [resume.id]
 
+    def test_preempt_goes_in_front_of_in_flight_loads_with_no_resume_behind_them(self):
+        """With no settled resume behind them, in-flight loads (which admission
+        skips) are not ahead of the victim: it stays inside the first entries the
+        head-prefill probe reads, however many loads are in flight."""
+        sched = self._offload_sched(12)
+        loads = [self._in_flight_load(sched, 300 + 20 * i) for i in range(5)]
+        victim = Sequence(list(range(17)), 16, SamplingParams(max_tokens=2))
+        victim.status = SequenceStatus.RUNNING
+        sched.waiting.extend(loads)
+
+        assert sched.preempt(victim)
+        assert list(sched.waiting) == [victim, *loads]
+        assert sched._can_admit_head_prefill()
+
+    def test_preempt_goes_behind_the_last_resume_of_the_leading_run(self):
+        sched = self._offload_sched(12)
+        first = self._in_flight_load(sched, 300)
+        resume = self._settled_resume(sched, 100)
+        second = self._in_flight_load(sched, 400)
+        fresh = Sequence(list(range(500, 508)), 16)
+        victim = Sequence(list(range(17)), 16, SamplingParams(max_tokens=2))
+        victim.status = SequenceStatus.RUNNING
+        sched.waiting.extend([first, resume, second, fresh])
+
+        assert sched.preempt(victim)
+        assert list(sched.waiting) == [first, resume, victim, second, fresh]
+
     def test_an_idle_tick_leaves_the_waiting_queue_alone(self):
         """Without a finished or failed id nothing is scanned, however long the
         queue: a settled resume is promoted once, when its load ends, and

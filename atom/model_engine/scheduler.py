@@ -4155,17 +4155,18 @@ class Scheduler:
         # Behind the settled offload resumes at the head, which hold blocks and
         # are promoted once, when their load ends. A preempted head that cannot
         # allocate stops admission, so in front of them it would starve the
-        # resume holding the blocks it needs. In-flight loads at the head are
-        # skipped by admission and do not count as ahead.
+        # resume holding the blocks it needs. In-flight loads inside that run
+        # are skipped by admission; they stay in front only when a resume sits
+        # behind them, so the preempted request never lands behind more
+        # in-flight loads than it must (`_can_admit_head_prefill` reads only the
+        # first few queue entries).
         pos = 0
         if getattr(getattr(self, "kv_connector", None), "is_offload", False):
-            for queued in self.waiting:
-                if (
-                    queued.status != SequenceStatus.WAITING_FOR_REMOTE_KVS
-                    and not self._is_offload_prefill_resume(queued)
-                ):
+            for i, queued in enumerate(self.waiting):
+                if self._is_offload_prefill_resume(queued):
+                    pos = i + 1
+                elif queued.status != SequenceStatus.WAITING_FOR_REMOTE_KVS:
                     break
-                pos += 1
         self.waiting.insert(pos, seq)
         return True
 
