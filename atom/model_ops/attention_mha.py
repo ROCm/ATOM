@@ -1645,20 +1645,15 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
 
     def _mxfp4_select_kwargs(self, sparse_metadata, decode: bool) -> dict:
         """What the selection needs to know about the MXFP4 caches: a block table
-        of one page-128 page a block for the MXFP4 KV, the MXFP4 scorer (and, on
-        decode, the step's work map and scores) for the MXFP4 index."""
+        of one page-128 page a block for the MXFP4 KV, the MXFP4 scorer and its
+        buffers (the step's `IndexScoreBuffers`) for the MXFP4 index."""
         kw = {}
         if self.kv_cache_dtype == "fp4":
             kw.update(pages_per_block=1, block_page_stride=1)
         if self.index_cache_dtype == "fp4":
             kw["index_mxfp4"] = True
-            if decode and sparse_metadata.index_work_map is not None:
-                kw["index_work_map"] = sparse_metadata.index_work_map
-                # the bound the map was built at, which the scorer checks exactly
-                kw["index_work_map_max_block"] = (
-                    sparse_metadata.index_work_map_max_block
-                )
-                kw["index_score_workspace"] = sparse_metadata.index_score_workspace
+            if decode:
+                kw["index_scorer"] = sparse_metadata.index_scorer
         return kw
 
     @mark_trace(prefix="sparse_attention_prefill", torch_compile=False)

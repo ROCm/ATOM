@@ -546,25 +546,20 @@ class TestSelectorDispatch:
 
 
 class TestSelectWithAiter:
-    """aiter flattens the score with a `view`: a layout it cannot view is declined."""
+    """aiter flattens the score with a `view`: every scorer writes a contiguous one
+    (the MXFP4 scorers into the index workspace), so none is declined on layout."""
 
-    @pytest.mark.parametrize("transposed", [False, True])
-    def test_only_a_contiguous_score_is_served(self, monkeypatch, transposed):
+    def test_a_contiguous_score_is_served(self, monkeypatch):
         calls = []
         monkeypatch.setattr(m, "topk_per_row_small_k", lambda *a: calls.append(a))
         monkeypatch.setattr(m, "topk_per_row_small_k_supported", lambda *a: True)
         monkeypatch.setattr(m, "_AITER_SERVES", {})
         heads, total_q, blocks = 2, 8, 2048
-        if transposed:
-            # what the MXFP4 scorer returns once S * H >= its TRANSPOSE_MIN_F
-            score = torch.empty(blocks, total_q, heads).permute(2, 1, 0)
-            assert score.stride() == (1, heads, total_q * heads)
-        else:
-            score = torch.empty(heads, total_q, blocks)
+        score = torch.empty(heads, total_q, blocks)
         topk_idx = torch.empty(heads, total_q, TOPK, dtype=torch.int32)
         bounds = torch.full((heads * total_q,), blocks, dtype=torch.int32)
-        served = m._select_with_aiter(score, topk_idx, bounds, TOPK, 1, 1)
-        assert served != transposed and len(calls) == int(not transposed)
+        assert m._select_with_aiter(score, topk_idx, bounds, TOPK, 1, 1)
+        assert len(calls) == 1
 
 
 @gpu

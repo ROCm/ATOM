@@ -11,7 +11,7 @@ and split-K decode with a separate merge step.
 """
 
 import functools
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import aiter
 import torch
@@ -80,6 +80,26 @@ class MiniMaxM3SparseDecodeMetadata:
     max_query_len: int = 1
 
 
+@dataclass(frozen=True)
+class IndexScoreBuffers:
+    """The MXFP4 index scorer's persistent state, one immutable record so that none of
+    its parts can be present without the others.
+
+    ``scores`` is the `LogitsWorkspace` every layer's scorer writes its fp32 block
+    scores into (the same plane the other indexers use), viewed contiguous
+    ``[heads, rows, width]`` -- the layout aiter's selector needs. Never filled: the
+    selectors read a row only up to its valid blocks, which the scorer writes every
+    step. ``work_map`` is the decode scorer's dispatch map and ``max_block`` the block
+    count it was built at, which the scorer checks for an exact match and which must
+    not move between graph replays: the builder holds the capacity buffer, the step's
+    metadata the map built into it. A prefill step's record has neither.
+    """
+
+    scores: LogitsWorkspace
+    work_map: torch.Tensor | None = None
+    max_block: int = 0
+
+
 @dataclass
 class MiniMaxM3SparseMetadata:
     seq_lens: torch.Tensor
@@ -98,24 +118,10 @@ class MiniMaxM3SparseMetadata:
     `deepseek_v4_attn.csa_n_committed_per_token` hoists out for the sibling
     indexer. `index_topk` consumes it and never derives its own.
     """
-    index_work_map: torch.Tensor | None = None
-    """The MXFP4 decode index scorer's work map (aiter's FlyDSL scorer), built once a step at
-    `ceil(max_model_len / 128)` blocks, which must not move between graph replays.
-    None on prefill, on an empty batch and wherever the index cache is not MXFP4; the
-    scorer then builds its own map, correctly but per layer.
-    """
-    index_work_map_max_block: int = 0
-    """The block count `index_work_map` was built at (0 with no map); the scorer
-    must be given the same one, so it travels with the map and is not derived again.
-    """
-    index_score_workspace: LogitsWorkspace | None = None
-    """Persistent fp32 storage the MXFP4 decode scorer writes its block scores into,
-    viewed ``[heads, rows, index_work_map_max_block]`` contiguous (the aiter selector
-    reads only that layout): the same `LogitsWorkspace` the other indexers score
-    into. Never filled: every selector reads only the first
-    ``n_valid_column_per_row`` columns of a row, which the scorer writes each step.
-    None where there is no work map; the scorer then allocates (and fills) its own.
-    """
+    index_scorer: IndexScoreBuffers | None = None
+    """What the MXFP4 index scorer of this step needs, as one record: None wherever the
+    index cache is not MXFP4, and on an empty batch (the scorer then refuses rather
+    than quietly allocating its own)."""
 
 
 def make_sparse_prefill_metadata(
@@ -172,16 +178,12 @@ def make_sparse_decode_metadata(
     num_idx_heads: int,
     max_query_len: int = 1,
     n_valid_column_per_row_out: torch.Tensor | None = None,
-    index_work_map_out: torch.Tensor | None = None,
-    index_work_map_max_block: int = 0,
-    index_score_workspace: LogitsWorkspace | None = None,
+    index_scorer: IndexScoreBuffers | None = None,
 ) -> MiniMaxM3SparseMetadata:
-    """``index_score_workspace`` is the scorer's score storage (capacity at least
-    ``heads * rows * index_work_map_max_block``), carried through to the selection.
-    ``index_work_map_out`` is the persistent storage of an MXFP4 index cache's
-    scorer's work map (the builder allocates it only then): given, the step's map is
-    built into it here, once, at ``index_work_map_max_block`` blocks (the model
-    length's); an empty batch builds none.
+    """``index_scorer`` is the builder's MXFP4 index scorer record (None for any other
+    index cache): the step's work map is built into its capacity buffer here, once, at
+    its ``max_block`` (the model length's), and the metadata carries the record with
+    that map; an empty batch builds none.
     ``seq_lens`` and ``block_table`` must be the requests whose rows the scorer,
     selector and attention run (pad requests of a padded step: length 0): the map's
     encoding and grid and the head offsets of ``n_valid_column_per_row`` all follow
@@ -191,16 +193,19 @@ def make_sparse_decode_metadata(
         seq_lens=seq_lens, block_table=block_table, max_query_len=max_query_len
     )
     batch = seq_lens.shape[0]
-    index_work_map = None
-    if index_work_map_out is not None and batch > 0:
+    step_scorer = None
+    if index_scorer is not None and batch > 0:
         from aiter.ops.flydsl import minimax_m3_index_score_work_map
 
-        index_work_map = minimax_m3_index_score_work_map(
-            seq_lens,
-            index_work_map_max_block,
-            max_query_len,
-            num_idx_heads,
-            out=index_work_map_out,
+        step_scorer = replace(
+            index_scorer,
+            work_map=minimax_m3_index_score_work_map(
+                seq_lens,
+                index_scorer.max_block,
+                max_query_len,
+                num_idx_heads,
+                out=index_scorer.work_map,
+            ),
         )
     return MiniMaxM3SparseMetadata(
         seq_lens=seq_lens,
@@ -220,13 +225,7 @@ def make_sparse_decode_metadata(
             decode_max_q=max_query_len,
             out=n_valid_column_per_row_out,
         ),
-        index_work_map=index_work_map,
-        index_work_map_max_block=(
-            index_work_map_max_block if index_work_map is not None else 0
-        ),
-        index_score_workspace=(
-            index_score_workspace if index_work_map is not None else None
-        ),
+        index_scorer=step_scorer,
     )
 
 

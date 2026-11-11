@@ -9,6 +9,8 @@ exact context with the tail block last). The oracle is the op's definition on th
 dequantized cache, not another kernel.
 """
 
+import contextlib
+
 import pytest
 import torch
 
@@ -81,18 +83,52 @@ def reference(cache, table, seq, q, S):
     return score, picks, ctx
 
 
-def work_map_buf(max_block, S, max_batch=32):
-    """The persistent dispatch-map buffer, capacity for `max_batch` requests."""
+def _record(running, S, bound, heads=HEADS, prefill_rows=0):
+    """The builder's scorer record: the capacity buffer of the dispatch map for
+    `running` requests, and the score workspace every layer shares, at the map's
+    width and tall enough for `running * S` decode rows or `prefill_rows` -- never
+    filled, here with values no selector may read (NaN, +-inf, a huge finite)."""
     from aiter.ops.flydsl import minimax_m3_index_score_work_map_capacity
 
-    rows = minimax_m3_index_score_work_map_capacity(max_batch, max_block, S, HEADS)
-    return torch.empty((rows, 2), dtype=torch.int32, device="cuda")
+    from atom.model_ops.minimax_m3.sparse_attn import IndexScoreBuffers
+    from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace
+
+    rows = minimax_m3_index_score_work_map_capacity(running, bound, S, heads)
+    n = heads * max(running * S, prefill_rows) * bound
+    scores = LogitsWorkspace(n, "cuda")
+    junk = torch.tensor(
+        [float("nan"), float("inf"), -float("inf"), 3e38], device="cuda"
+    )
+    flat = scores.logits(1, n)
+    flat.copy_(junk[torch.randint(0, 4, flat.shape, device="cuda")])
+    return IndexScoreBuffers(
+        scores, torch.empty((rows, 2), dtype=torch.int32, device="cuda"), bound
+    )
 
 
-def work_map(seq, max_block, S, out=None):
-    from aiter.ops.flydsl import minimax_m3_index_score_work_map
+@contextlib.contextmanager
+def _aiter_allocates_its_scores():
+    """Run the scorers as before the workspace: given no `out`, aiter allocates the
+    scores and fills them with -inf itself (transposed at S * H >= 16, which the
+    selector no longer takes: the values are made contiguous, the same scores)."""
+    from aiter.ops import flydsl
 
-    return minimax_m3_index_score_work_map(seq, max_block, S, HEADS, out=out)
+    names = (
+        "minimax_m3_index_score_fp4_flydsl",
+        "minimax_m3_index_score_prefill_fp4_flydsl",
+    )
+    real = {n: getattr(flydsl, n) for n in names}
+    for n in names:
+        setattr(
+            flydsl,
+            n,
+            lambda *a, _f=real[n], **k: _f(*a, **{**k, "out": None}).contiguous(),
+        )
+    try:
+        yield
+    finally:
+        for n in names:
+            setattr(flydsl, n, real[n])
 
 
 # `ppb` 16-pages a block: 1 for the MXFP4 KV, 8 for the page-16 SHUFFLE KV that
@@ -106,12 +142,12 @@ def test_decode_selection_and_block_table(batch, S, ppb, fp8_q):
 
     cache, table, seq, q = make_case(batch, S, seed=batch * 10 + S, fp8_q=fp8_q)
     max_block = table.shape[1]
-    wmap = work_map(seq, max_block, S, work_map_buf(max_block, S))
+    record, nvalid = _buffers(batch, S, max_block)
+    md = _metadata(table, seq, S, record, nvalid)
     topk_idx, sbt, sctx = minimax_m3_index_topk_decode(
         q, cache, table, seq, int(seq.max()), TOPK, 0, 1, HEADS, SM_SCALE,
         emit_sparse_block_table=True, max_query_len=S, block_page_stride=ppb,
-        index_mxfp4=True, pages_per_block=ppb,
-        index_work_map=wmap, index_work_map_max_block=max_block,
+        index_mxfp4=True, pages_per_block=ppb, index_scorer=md.index_scorer,
     )  # fmt: skip
     _, picks, ctx = reference(cache, table, seq, q, S)
     assert sbt.shape == (batch * S, TOPK * ppb) and sctx.shape == (batch * S,)
@@ -190,7 +226,7 @@ def _assert_live_rows_match(got, want, live, heads):
     assert torch.equal(got[2][: live * heads], want[2])
 
 
-def _metadata(table, seq, S, buffers, nvalid, heads=HEADS):
+def _metadata(table, seq, S, record, nvalid, heads=HEADS):
     """What the builder refills each step, outside any graph."""
     from atom.model_ops.minimax_m3.sparse_attn import make_sparse_decode_metadata
 
@@ -203,32 +239,30 @@ def _metadata(table, seq, S, buffers, nvalid, heads=HEADS):
         num_idx_heads=heads,
         max_query_len=S,
         n_valid_column_per_row_out=nvalid,
-        index_work_map_out=buffers,
-        index_work_map_max_block=bound,
+        index_scorer=record,
     )
 
 
-def _select(q, cache, table, seq, S, md, heads=HEADS):
-    """The decode selection as the attention layer calls it."""
+def _select(q, cache, table, seq, S, md, heads=HEADS, allocated=False):
+    """The decode selection as the attention layer calls it; `allocated` runs it
+    with aiter allocating (and -inf filling) its own scores, as before the workspace."""
     from atom.model_ops.minimax_m3.index_topk import minimax_m3_index_topk_decode
 
     bound = table.shape[1]
-    return minimax_m3_index_topk_decode(
-        q, cache, table, seq, bound * 128, TOPK, 0, 1, heads, SM_SCALE,
-        emit_sparse_block_table=True, max_query_len=S, block_page_stride=1,
-        index_mxfp4=True, pages_per_block=1,
-        n_valid_column_per_row=md.n_valid_column_per_row,
-        index_work_map=md.index_work_map, index_work_map_max_block=bound,
-    )  # fmt: skip
+    with _aiter_allocates_its_scores() if allocated else contextlib.nullcontext():
+        return minimax_m3_index_topk_decode(
+            q, cache, table, seq, bound * 128, TOPK, 0, 1, heads, SM_SCALE,
+            emit_sparse_block_table=True, max_query_len=S, block_page_stride=1,
+            index_mxfp4=True, pages_per_block=1,
+            n_valid_column_per_row=md.n_valid_column_per_row,
+            index_scorer=md.index_scorer,
+        )  # fmt: skip
 
 
 def _buffers(running, S, bound, heads=HEADS):
-    from aiter.ops.flydsl import minimax_m3_index_score_work_map_capacity
-
-    rows = minimax_m3_index_score_work_map_capacity(running, bound, S, heads)
-    buffers = torch.empty((rows, 2), dtype=torch.int32, device="cuda")
+    """The record (see `_record`) and the buffer of live columns per row."""
     nvalid = torch.empty(heads * running * S, dtype=torch.int32, device="cuda")
-    return buffers, nvalid
+    return _record(running, S, bound, heads), nvalid
 
 
 @pytest.mark.parametrize(
@@ -300,91 +334,60 @@ def test_a_graph_replays_a_padded_step_like_the_scheduled_batch(S, heads, fill):
     _assert_pad_rows_are_empty(got, scheduled * S, heads)
 
 
-def _scores(running, S, bound, heads=HEADS):
-    """The builder's persistent score workspace: at the map's width, and never
-    filled -- here with values no selector may read (NaN, +-inf, a huge finite)."""
-    from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace
-
-    n = heads * running * S * bound
-    workspace = LogitsWorkspace(n, "cuda")
-    junk = torch.tensor(
-        [float("nan"), float("inf"), -float("inf"), 3e38], device="cuda"
-    )
-    flat = workspace.logits(1, n)
-    flat.copy_(junk[torch.randint(0, 4, flat.shape, device="cuda")])
-    return workspace
-
-
-def _select_persistent(q, cache, table, seq, S, md, scores, heads=HEADS):
-    from atom.model_ops.minimax_m3.index_topk import minimax_m3_index_topk_decode
-
-    bound = table.shape[1]
-    return minimax_m3_index_topk_decode(
-        q, cache, table, seq, bound * 128, TOPK, 0, 1, heads, SM_SCALE,
-        emit_sparse_block_table=True, max_query_len=S, block_page_stride=1,
-        index_mxfp4=True, pages_per_block=1,
-        n_valid_column_per_row=md.n_valid_column_per_row,
-        index_work_map=md.index_work_map, index_work_map_max_block=bound,
-        index_score_workspace=scores,
-    )  # fmt: skip
-
-
-# S * heads >= 16 is where aiter's scorer lays the scores out transposed, and with
-# 2048+ blocks a row is wide enough for the aiter selector, which only the
-# contiguous layout of a persistent buffer can use there
+# S * heads >= 16 is where aiter's scorer lays the scores out transposed when it
+# allocates them itself, and with 2048+ blocks a row is wide enough for the aiter
+# selector, which only a contiguous layout can use there
 @pytest.mark.parametrize(
     "S,heads,blocks",
     [(1, 1, 70), (8, 1, 70), (4, 4, 70), (8, 2, 70), (1, 2, 2100), (8, 2, 2100)],
 )
-def test_a_persistent_unfilled_score_buffer_selects_like_the_allocated_one(
+def test_the_unfilled_shared_workspace_selects_like_aiters_own_filled_scores(
     S, heads, blocks
 ):
-    """The scorer given `out=` (contiguous, filled with junk, reused by a second step
-    with other lengths) leaves the selection, the block table and the contexts of
-    every row bit for bit what the allocated, -inf-filled scores give: ragged lengths,
-    pad rows past the scheduled ones, e8m0-bounded random pages."""
+    """The scorer writing into the shared workspace (contiguous, filled with junk, reused
+    by a second step with other lengths) leaves the selection, the block table and
+    the contexts of every row bit for bit what aiter's own allocated, -inf-filled
+    scores give: ragged lengths, pad rows past the scheduled ones, e8m0-bounded
+    random pages."""
     running, scheduled = 8, 5
-    scores = None
+    record = nvalid = None
     for step, seed in enumerate((90, 91)):
         cache, table, seq, q = make_case(
             scheduled, S, seed=seed + S, max_len=128 * blocks, heads=heads
         )
-        if step:  # the second step is shorter than the one that wrote the buffer
+        if step:  # the second step is shorter than the one that wrote the workspace
             seq = (seq // 3).clamp(min=S + 1).to(torch.int32)
         pt, ps, pq = _pad(table, seq, q, S, running, 0x7FFFFFFF)
         bound = table.shape[1]
-        buffers, nvalid = _buffers(running, S, bound, heads)
-        md = _metadata(pt, ps, S, buffers, nvalid, heads)
-        want = _select(pq, cache, pt, ps, S, md, heads)
-        if scores is None:
-            scores = _scores(running, S, bound, heads)
-        got = _select_persistent(pq, cache, pt, ps, S, md, scores, heads)
+        record, nvalid = (
+            _buffers(running, S, bound, heads) if record is None else (record, nvalid)
+        )
+        md = _metadata(pt, ps, S, record, nvalid, heads)
+        got = _select(pq, cache, pt, ps, S, md, heads)
+        want = _select(pq, cache, pt, ps, S, md, heads, allocated=True)
         for g, w in zip(got, want):
             assert torch.equal(g, w), f"step {step}"
         _assert_pad_rows_are_empty(got, scheduled * S, heads)
 
 
 @pytest.mark.parametrize("S,heads", [(8, 1), (4, 4)])
-def test_a_graph_replays_into_its_score_workspace_like_the_allocated_scores(S, heads):
+def test_a_graph_replays_into_the_shared_workspace_like_aiters_own_scores(S, heads):
     """The workspace's pointer is baked into the graph: captured once with 8 requests,
     replayed after the builder's refill with 3 scheduled and 5 pad rows, the selection
-    is what the allocated scores give for that batch, and the workspace is the same
+    is what aiter's own scores give for that batch, and the workspace is the same
     storage before and after."""
     running, scheduled = 8, 3
     cache, table, seq, q = make_case(running, S, seed=95 + S, heads=heads)
     bound = table.shape[1]
-    buffers, nvalid = _buffers(running, S, bound, heads)
-    workspace = _scores(running, S, bound, heads)
-    ptr = workspace.logits(1, 1).data_ptr()
+    record, nvalid = _buffers(running, S, bound, heads)
+    ptr = record.scores.logits(1, 1).data_ptr()
     static = [x.clone() for x in (table, seq, q)]
 
     def refill():
-        return _metadata(static[0], static[1], S, buffers, nvalid, heads)
+        return _metadata(static[0], static[1], S, record, nvalid, heads)
 
     def run(md):
-        return _select_persistent(
-            static[2], cache, static[0], static[1], S, md, workspace, heads
-        )
+        return _select(static[2], cache, static[0], static[1], S, md, heads)
 
     md = refill()
     run(md)  # JIT outside the capture
@@ -400,9 +403,9 @@ def test_a_graph_replays_into_its_score_workspace_like_the_allocated_scores(S, h
     refill()
     graph.replay()
     torch.cuda.synchronize()
-    assert workspace.logits(1, 1).data_ptr() == ptr
-    bufs = _buffers(scheduled, S, bound, heads)
-    md = _metadata(table[:scheduled], seq[:scheduled], S, *bufs, heads)
-    want = _select(q[: scheduled * S], cache, table[:scheduled], seq[:scheduled], S, md, heads)  # fmt: skip
+    assert record.scores.logits(1, 1).data_ptr() == ptr
+    rec, nv = _buffers(scheduled, S, bound, heads)
+    md = _metadata(table[:scheduled], seq[:scheduled], S, rec, nv, heads)
+    want = _select(q[: scheduled * S], cache, table[:scheduled], seq[:scheduled], S, md, heads, allocated=True)  # fmt: skip
     _assert_live_rows_match(got, want, scheduled * S, heads)
     _assert_pad_rows_are_empty(got, scheduled * S, heads)

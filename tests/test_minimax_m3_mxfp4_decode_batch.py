@@ -32,8 +32,7 @@ def mod():
 def builder(mod, mxfp4=True, tbo_decode=True, forward_vars=None):
     b = object.__new__(mod.AiterAttentionMetadataBuilder)
     b._index_work_map_blocks = BOUND if mxfp4 else 0
-    b._index_work_maps = {}
-    b._index_score_workspaces = {}
+    b._index_scorers = {}
     b._num_idx_heads = HEADS
     b.max_bs = MAX_BS
     b.device = "cpu"
@@ -45,7 +44,10 @@ def builder(mod, mxfp4=True, tbo_decode=True, forward_vars=None):
     b.model_runner = types.SimpleNamespace(
         forward_vars={} if forward_vars is None else forward_vars,
         config=types.SimpleNamespace(
-            max_model_len=BOUND * 128, enable_tbo=True, enable_tbo_decode=tbo_decode
+            max_model_len=BOUND * 128,
+            index_cache_dtype="fp4" if mxfp4 else "fp8",
+            enable_tbo=True,
+            enable_tbo_decode=tbo_decode,
         ),
     )
     return b
@@ -63,7 +65,7 @@ class _Buf:
 @pytest.mark.parametrize(
     "mxfp4,tbo_decode", [(False, True), (True, False), (True, True)]
 )
-def test_the_ubatch_buffers_are_for_a_decode_tbo_at_one_token_a_request(
+def test_the_scorer_buffers_are_one_workspace_and_a_map_per_decode_ubatch(
     mod, monkeypatch, mxfp4, tbo_decode, max_bs
 ):
     capacity_args = []
@@ -81,15 +83,19 @@ def test_the_ubatch_buffers_are_for_a_decode_tbo_at_one_token_a_request(
     b = builder(mod, mxfp4=mxfp4, tbo_decode=tbo_decode)
     b.max_bs = max_bs
     max_qlen = 8  # a speculative config: the TBO sparse decode still runs one token
-    if mxfp4:
-        b._index_work_maps[""] = b._alloc_index_work_map(max_bs, max_qlen)
-        b._index_score_workspaces[""] = b._alloc_index_score_workspace(
-            max_bs * max_qlen
-        )
-        assert b._index_score_workspaces[""].capacity == (
-            HEADS * max_bs * max_qlen * BOUND
-        )
-        capacity_args.clear()
+    b._allocate_index_scorer(max_qlen)
+    if not mxfp4:
+        assert b._index_scorers == {} and b._index_work_map_blocks == 0
+        assert b._index_scorer_kwargs() == {}
+        return
+    main = b._index_scorers[""]
+    # one workspace for every layer, as wide as the map and as tall as a decode step
+    assert isinstance(main.scores, LogitsWorkspace)
+    assert main.scores.capacity == HEADS * max_bs * max_qlen * BOUND
+    assert main.scores.nbytes == 4 * main.scores.capacity
+    assert (main.max_block, main.work_map.shape) == (BOUND, (100, 2))
+    assert capacity_args == [(max_bs, BOUND, max_qlen, HEADS)]
+    capacity_args.clear()
     # each ubatch's requests, from the split every backend's ubatch metadata follows
     import numpy as np
 
@@ -106,26 +112,22 @@ def test_the_ubatch_buffers_are_for_a_decode_tbo_at_one_token_a_request(
     b._allocate_ubatch_buffers(max_qlen)
     # `enable_tbo` alone is the prefill split, which never scores a decode
     names = ["ub0_", "ub1_"]
-    maps = b._index_work_maps
-    if not (mxfp4 and tbo_decode):
-        assert not [n for n in names if n in maps] and not capacity_args
+    if not tbo_decode:
+        assert set(b._index_scorers) == {""} and not capacity_args
         return
-    scores = b._index_score_workspaces
-    for i in (0, 1):
-        assert maps[names[i]].shape == (100, 2)
-        assert maps[names[i]].dtype == torch.int32
-        # the scores of that ubatch's requests, one token each, at the map's width
-        assert scores[names[i]].capacity == HEADS * rows[i] * BOUND
-        assert scores[names[i]].nbytes == 4 * scores[names[i]].capacity
-        assert isinstance(scores[names[i]], LogitsWorkspace)
     assert capacity_args == [(rows[0], BOUND, 1, HEADS), (rows[1], BOUND, 1, HEADS)]
-    # each ubatch has its own map
-    assert maps[names[1]].data_ptr() != maps[names[0]].data_ptr()
-    ptr = [scores[n].logits(1, 1).data_ptr() for n in names]
-    assert ptr[0] != ptr[1]
+    ub = [b._index_scorers[n] for n in names]
+    for u in ub:
+        assert (u.max_block, u.work_map.shape) == (BOUND, (100, 2))
+        # the workspace is the step's: both ubatches run on one compute stream and a
+        # layer scores and selects inside one call
+        assert u.scores is main.scores
+    # each ubatch has its own map: both ubatches' metadata are alive at once
+    ptrs = {u.work_map.data_ptr() for u in ub} | {main.work_map.data_ptr()}
+    assert len(ptrs) == 3
 
 
-def test_the_ubatch_metadata_is_built_with_its_own_buffers(mod, monkeypatch):
+def test_the_ubatch_metadata_is_built_with_its_own_map(mod, monkeypatch):
     rows = 4
     var = {
         f"ub{i}_sparse_attention_n_valid_column_per_row": torch.zeros(1) for i in (0, 1)
@@ -140,8 +142,11 @@ def test_the_ubatch_metadata_is_built_with_its_own_buffers(mod, monkeypatch):
         lambda self, *a: None,
     )
     b = builder(mod, forward_vars=var)
-    b._index_work_maps = {"ub0_": object(), "ub1_": object()}
-    b._index_score_workspaces = {"ub0_": object(), "ub1_": object()}
+    shared = object()
+    b._index_scorers = {
+        f"ub{i}_": types.SimpleNamespace(scores=shared, work_map=object())
+        for i in (0, 1)
+    }
     ub = types.SimpleNamespace(running_bs=rows)
     attn = types.SimpleNamespace(
         block_tables=torch.zeros(rows, 4),
@@ -152,10 +157,8 @@ def test_the_ubatch_metadata_is_built_with_its_own_buffers(mod, monkeypatch):
     for i in (0, 1):
         b.finish_ubatch(i, ub, attn, 1)
     for i, kw in enumerate(seen):
-        assert kw["index_work_map_out"] is b._index_work_maps[f"ub{i}_"]
-        assert kw["index_work_map_max_block"] == BOUND
-        assert kw["index_score_workspace"] is b._index_score_workspaces[f"ub{i}_"]
-    assert seen[0]["index_work_map_out"] is not seen[1]["index_work_map_out"]
+        assert kw["index_scorer"] is b._index_scorers[f"ub{i}_"]
+    assert seen[0]["index_scorer"].work_map is not seen[1]["index_scorer"].work_map
     # another index cache allocated none: nothing to pass
     assert builder(mod)._index_scorer_kwargs("ub0_") == {}
 
@@ -225,7 +228,7 @@ def test_the_sparse_decode_runs_only_the_rows_the_metadata_covers(
         ),
         max_seq_len=100,
         n_valid_column_per_row=None,
-        index_work_map=None,
+        index_scorer=None,
     )
     ctx = types.SimpleNamespace(
         attn_metadata=types.SimpleNamespace(sparse_attention_metadata=md)
@@ -281,7 +284,7 @@ def test_the_row_rule_and_its_refusal_are_the_mxfp4_indexs(
     )
     b = builder(mod, mxfp4=mxfp4)
     if mxfp4:
-        b._index_work_maps[""] = b._index_score_workspaces[""] = object()
+        b._index_scorers[""] = object()
     b.refresh_flydsl_plan = lambda *_a, **_k: None
     b._get_sparse_attention_block_tables = lambda bt, sl, bs: bt
     b._n_valid_column_per_row_buffer = lambda: None
@@ -302,30 +305,79 @@ def test_the_row_rule_and_its_refusal_are_the_mxfp4_indexs(
     assert seen[0]["seq_lens"].shape[0] == want
 
 
-def test_the_scorer_is_given_the_bound_its_map_was_built_at():
-    """The map's bound travels on the metadata; the impl does not derive it again
-    (a length source of its own that drifted would fail every decode's exact check)."""
+def test_the_scorer_gets_the_step_records_of_the_metadata_not_the_impls_own():
+    """The map, its bound and the workspace travel as one record on the metadata; the
+    impl derives none of them (a length source of its own that drifted would fail
+    every decode's exact check)."""
     pytest.importorskip("aiter")
     from atom.model_ops import attention_mha
-    from atom.model_ops.minimax_m3.sparse_attn import MiniMaxM3SparseMetadata
+    from atom.model_ops.minimax_m3.sparse_attn import (
+        IndexScoreBuffers,
+        MiniMaxM3SparseMetadata,
+    )
 
     impl = object.__new__(attention_mha.SparseMHAPagedAttentionImpl)
     impl.kv_cache_dtype, impl.index_cache_dtype = "bf16", "fp4"
     impl.max_model_len = 10**9  # not the bound
-    wmap, scores = object(), object()
+    record = IndexScoreBuffers(
+        scores=LogitsWorkspace(4, "cpu"), work_map=torch.zeros(1, 2), max_block=37
+    )
     md = MiniMaxM3SparseMetadata(
         seq_lens=None,
         max_seq_len=0,
         slot_mapping=None,
         num_prefills=0,
-        index_work_map=wmap,
-        index_work_map_max_block=37,
-        index_score_workspace=scores,
+        index_scorer=record,
     )
     kw = impl._mxfp4_select_kwargs(md, decode=True)
-    assert kw["index_work_map"] is wmap and kw["index_work_map_max_block"] == 37
-    assert kw["index_score_workspace"] is scores
-    assert "index_work_map" not in impl._mxfp4_select_kwargs(md, decode=False)
+    assert kw == {"index_mxfp4": True, "index_scorer": record}
+    # another index cache selects without one
+    impl.index_cache_dtype = "fp8"
+    assert impl._mxfp4_select_kwargs(md, decode=True) == {}
+
+
+def test_the_decode_metadata_builds_the_map_into_the_records_buffer(monkeypatch):
+    """`make_sparse_decode_metadata` builds the step's map into the record's capacity
+    buffer at the record's bound and carries the record with that map; an empty batch
+    builds none."""
+    pytest.importorskip("aiter")
+    from aiter.ops import flydsl
+
+    from atom.model_ops.minimax_m3 import sparse_attn
+
+    built = []
+
+    def work_map(seq_lens, max_block, q, heads, out=None):
+        built.append((max_block, q, heads, out))
+        return out[:3]
+
+    monkeypatch.setattr(
+        flydsl, "minimax_m3_index_score_work_map", work_map, raising=False
+    )
+    monkeypatch.setattr(
+        sparse_attn, "build_n_valid_column_per_row", lambda *a, **k: None
+    )
+    record = sparse_attn.IndexScoreBuffers(
+        scores=LogitsWorkspace(4, "cpu"), work_map=torch.zeros(8, 2), max_block=37
+    )
+
+    def decode(seq_lens):
+        return sparse_attn.make_sparse_decode_metadata(
+            seq_lens=seq_lens,
+            block_table=None,
+            slot_mapping=None,
+            max_seq_len=5,
+            num_idx_heads=2,
+            max_query_len=4,
+            index_scorer=record,
+        )
+
+    md = decode(torch.ones(2, dtype=torch.int32))
+    assert built == [(37, 4, 2, record.work_map)]
+    assert md.index_scorer.scores is record.scores and md.index_scorer.max_block == 37
+    assert md.index_scorer.work_map.shape == (3, 2)  # the step's map, not the capacity
+    assert decode(torch.ones(0, dtype=torch.int32)).index_scorer is None
+    assert len(built) == 1
 
 
 @pytest.mark.parametrize("planned", [True, False])
@@ -373,11 +425,9 @@ def test_the_caller_can_own_the_output(monkeypatch, planned):
         m.sparse_pa_mxfp4(*args, out=torch.empty(q.shape, dtype=torch.float32))
 
 
-def test_the_scorer_writes_a_contiguous_view_of_the_persistent_scores(monkeypatch):
-    """`index_score_workspace` is a `LogitsWorkspace`: the scorer is handed a contiguous
-    [heads, rows, width] view of its head (the layout the aiter selector needs), the
-    selection reads that same tensor, and a workspace too small for the step is refused
-    rather than overrun."""
+def _scorer_call(monkeypatch):
+    """`minimax_m3_index_topk_decode` with the aiter scorer and the selection doubled:
+    returns (call(record), what the scorer was handed, what the selection read)."""
     pytest.importorskip("aiter")
     from aiter.ops import flydsl
 
@@ -402,19 +452,48 @@ def test_the_scorer_writes_a_contiguous_view_of_the_persistent_scores(monkeypatc
     idx_q = torch.zeros(rows, heads, 128)
     table = torch.zeros(rows, width, dtype=torch.int32)
     seq = torch.ones(rows, dtype=torch.int32)
+    cache = torch.zeros(1)
 
-    def call(storage):
+    def call(record):
         index_topk.minimax_m3_index_topk_decode(
-            idx_q, torch.zeros(1), table, seq, width * 128, 2, 1, 1, heads, 1.0,
-            max_query_len=1, index_mxfp4=True,
-            index_work_map=object(), index_work_map_max_block=width,
-            index_score_workspace=storage,
+            idx_q, cache, table, seq, width * 128, 2, 1, 1, heads, 1.0,
+            max_query_len=1, index_mxfp4=True, index_scorer=record,
         )  # fmt: skip
 
+    return call, seen, (heads, rows, width)
+
+
+def test_the_scorer_writes_a_contiguous_view_of_the_shared_workspace(monkeypatch):
+    """The scorer is handed a contiguous [heads, rows, width] view of the workspace's
+    head (the layout the aiter selector needs), the selection reads that same tensor,
+    and a workspace too small for the step is refused rather than overrun."""
+    from atom.model_ops.minimax_m3.sparse_attn import IndexScoreBuffers
+
+    call, seen, (heads, rows, width) = _scorer_call(monkeypatch)
+    wmap = torch.zeros(2, 2)
     storage = LogitsWorkspace(heads * rows * width + 5, "cpu")  # sized for more
-    call(storage)
+    call(IndexScoreBuffers(storage, wmap, width))
     out = seen["out"]
     assert out.shape == (heads, rows, width) and out.is_contiguous()
     assert out.data_ptr() == storage.logits(1, 1).data_ptr() and seen["sel"] is out
     with pytest.raises(ValueError, match="exceeds its workspace"):
-        call(LogitsWorkspace(heads * rows * width - 1, "cpu"))
+        call(
+            IndexScoreBuffers(
+                LogitsWorkspace(heads * rows * width - 1, "cpu"), wmap, width
+            )
+        )
+
+
+def test_the_mxfp4_decode_refuses_a_step_without_its_scorer_record(monkeypatch):
+    """No quiet per-call allocation any more: without the record (or its map) the
+    decode scorer refuses, and so does a context wider than the map's bound."""
+    from atom.model_ops.minimax_m3.sparse_attn import IndexScoreBuffers
+
+    call, _, (heads, rows, width) = _scorer_call(monkeypatch)
+    ws = LogitsWorkspace(heads * rows * width, "cpu")
+    with pytest.raises(ValueError, match="needs the step's index_scorer"):
+        call(None)
+    with pytest.raises(ValueError, match="needs the step's index_scorer"):
+        call(IndexScoreBuffers(ws))  # a record with no map
+    with pytest.raises(ValueError, match="wider than the 3 blocks"):
+        call(IndexScoreBuffers(ws, torch.zeros(2, 2), width // 2))

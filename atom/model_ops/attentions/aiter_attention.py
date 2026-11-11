@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+from dataclasses import replace
 from typing import ClassVar, NamedTuple
 
 import aiter
@@ -15,6 +16,7 @@ from atom.distributed.ulysses_sp import local_num_kv_heads
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mha import PagedAttentionImpl, use_pa_decode_bf16_asm
 from atom.model_ops.minimax_m3.sparse_attn import (
+    IndexScoreBuffers,
     make_sparse_decode_metadata,
     make_sparse_prefill_metadata,
 )
@@ -291,30 +293,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 num_head_k * self.max_bs * max_qlen,
                 **i32_kwargs,
             )
-        # The MXFP4 index scorer's work map buffer, by ubatch prefix ("" the whole step).
-        self._index_work_maps = {}
-        self._index_score_workspaces = {}  # its LogitsWorkspace, by the same prefix
-        self._index_work_map_blocks = 0
-        if (
-            self._has_sparse_attention
-            and self.model_runner.config.index_cache_dtype == "fp4"
-        ):
-            from atom.model_ops.minimax_m3.sparse_attn import SPARSE_BLOCK_SIZE
-
-            # The MXFP4 decode scorer's persistent dispatch map (aiter's FlyDSL scorer): its row
-            # count is the grid, so the bound is the model length, and the buffer is
-            # CAPACITY -- the exact grid is not monotonic in the batch. Sized at the
-            # widest step; a plain decode step (S=1) builds into the same buffer. The
-            # scores are allocated per call, like the Triton scorers'.
-            self._index_work_map_blocks = cdiv(
-                self.model_runner.config.max_model_len, SPARSE_BLOCK_SIZE
-            )
-            self._index_work_maps[""] = self._alloc_index_work_map(
-                self.max_bs, max_qlen
-            )
-            self._index_score_workspaces[""] = self._alloc_index_score_workspace(
-                self.max_bs * max_qlen
-            )
+        self._allocate_index_scorer(max_qlen)
         self._pa_decode_bf16_asm_enabled = (
             use_pa_decode_bf16_asm() and model_runner.block_size == 256
         )
@@ -353,35 +332,53 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         if model_runner.config.enable_tbo:
             self._allocate_ubatch_buffers(max_qlen)
 
+    def _allocate_index_scorer(self, max_qlen: int) -> None:
+        """The MXFP4 index scorer's buffers, by ubatch prefix ("" the whole step): the
+        work map, the block bound it is built at, and the score workspace. Nothing for
+        any other index cache."""
+        self._index_scorers: dict[str, IndexScoreBuffers] = {}
+        self._index_work_map_blocks = 0
+        config = self.model_runner.config
+        if not (self._has_sparse_attention and config.index_cache_dtype == "fp4"):
+            return
+        from atom.model_ops.minimax_m3.sparse_attn import SPARSE_BLOCK_SIZE
+
+        # The scorer's grid is its work map's row count, so the bound is the model
+        # length, and the map buffer is CAPACITY -- the exact grid is not monotonic in
+        # the batch. Sized at the widest step; a plain decode step (S=1) builds into the
+        # same buffer. The scores go into one `LogitsWorkspace` every layer shares (the
+        # scorer and selector of a layer run back to back on one stream, in one call),
+        # as wide as the map and tall enough for a decode step's rows. Allocated in the
+        # constructor, so the memory profile counts it.
+        self._index_work_map_blocks = cdiv(config.max_model_len, SPARSE_BLOCK_SIZE)
+        rows = self.max_bs * max_qlen
+        self._index_scorers[""] = IndexScoreBuffers(
+            scores=LogitsWorkspace(
+                self._num_idx_heads * rows * self._index_work_map_blocks, self.device
+            ),
+            work_map=self._alloc_index_work_map(self.max_bs, max_qlen),
+            max_block=self._index_work_map_blocks,
+        )
+
     def _allocate_ubatch_buffers(self, max_seqlen_q: int) -> None:
         super()._allocate_ubatch_buffers(max_seqlen_q)
         if self._index_work_map_blocks and self.model_runner.config.enable_tbo_decode:
             # The MXFP4 scorer's work map, per ubatch for the same reason as the
-            # sparse metadata buffers; only a decode TBO runs it (`enable_tbo` alone
-            # is the prefill split). A ubatch is one token a request (the sparse TBO
-            # decode raises above that), so q == 1 here whatever `max_seqlen_q` is.
-            # A decode split cuts a batch of `running_bs` requests at
-            # `running_bs // 2` (`cut_decode_ubatches`).
+            # sparse metadata buffers: both ubatches' metadata are alive at once. Only a
+            # decode TBO runs it (`enable_tbo` alone is the prefill split). A ubatch is
+            # one token a request (the sparse TBO decode raises above that), so q == 1
+            # here whatever `max_seqlen_q` is. A decode split cuts a batch of
+            # `running_bs` requests at `running_bs // 2` (`cut_decode_ubatches`).
+            # The score workspace is shared with the whole step's: both ubatches run on
+            # one compute stream (`make_tbo_contexts`) and a layer's scorer writes it
+            # and its selector reads it inside one `index_topk` call, which has no
+            # yield point in it, so the ubatches' uses never overlap.
             first = self.max_bs // 2
             for ub_idx, rows in enumerate((first, self.max_bs - first)):
-                # Each ubatch's own map: its capacity is not additive.
-                self._index_work_maps[f"ub{ub_idx}_"] = self._alloc_index_work_map(
-                    rows, 1
+                self._index_scorers[f"ub{ub_idx}_"] = replace(
+                    self._index_scorers[""],
+                    work_map=self._alloc_index_work_map(rows, 1),
                 )
-                # and its own scores, for the same reason
-                self._index_score_workspaces[f"ub{ub_idx}_"] = (
-                    self._alloc_index_score_workspace(rows)
-                )
-
-    def _alloc_index_score_workspace(self, max_rows: int) -> LogitsWorkspace:
-        """Score storage for up to ``max_rows`` query rows at the work map's width, the
-        indexers' `LogitsWorkspace` at an explicit capacity. Allocated once, here in
-        the builder's constructor, so the memory profile counts it and a captured graph
-        bakes a stable pointer; never filled (see
-        `MiniMaxM3SparseMetadata.index_score_workspace`)."""
-        return LogitsWorkspace(
-            self._num_idx_heads * max_rows * self._index_work_map_blocks, self.device
-        )
 
     def _alloc_index_work_map(self, max_batch: int, max_query_len: int):
         """Work map buffer for up to ``max_batch`` requests of up to ``max_query_len``
@@ -720,19 +717,12 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         ]
 
     def _index_scorer_kwargs(self, prefix: str = "") -> dict:
-        """The MXFP4 decode scorer's work map and score buffers, for
-        `make_sparse_decode_metadata`; nothing for any other index cache. `prefix`
-        selects the ubatch's buffers (`ub<i>_`): both ubatches' metadata are alive at once
-        on one stream, so a shared map would be overwritten by the second before the
-        first one's layers ran."""
-        work_map = self._index_work_maps.get(prefix)
-        if work_map is None:
-            return {}
-        return {
-            "index_work_map_out": work_map,
-            "index_work_map_max_block": self._index_work_map_blocks,
-            "index_score_workspace": self._index_score_workspaces[prefix],
-        }
+        """The MXFP4 index scorer's buffers, for the sparse metadata builders; nothing
+        for any other index cache. `prefix` selects the ubatch's work map (`ub<i>_`):
+        both ubatches' metadata are alive at once on one stream, so a shared map
+        would be overwritten by the second before the first one's layers ran."""
+        scorer = self._index_scorers.get(prefix)
+        return {} if scorer is None else {"index_scorer": scorer}
 
     def _get_sparse_attention_block_tables(
         self,
@@ -963,6 +953,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 max_query_len=1,
                 num_idx_heads=self._num_idx_heads,
                 n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(),
+                **self._index_scorer_kwargs(),
             )
         # Same short-circuit as the metadata launch above. A dummy step would
         # refresh the live work_info from synthetic lengths, but every real

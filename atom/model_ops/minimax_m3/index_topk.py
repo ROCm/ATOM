@@ -768,12 +768,11 @@ def _select_with_aiter(
     """Run the selection through aiter, or return False if it cannot serve.
 
     Declines rather than raises: k past the wave width, or a survivor buffer
-    past the LDS budget, are shapes the Triton selector still handles. `topk_idx` is contiguous, so its
-    flattening is a view; `score` is too unless the scorer allocated it transposed
-    (MXFP4, several index heads, no persistent ``index_score_workspace``), which only the
-    stride-aware Triton selector reads.
+    past the LDS budget, are shapes the Triton selector still handles. `topk_idx`
+    and `score` are contiguous (every scorer writes one, the MXFP4 ones into the
+    index workspace), so their flattenings are views.
     """
-    if topk_per_row_small_k is None or not score.is_contiguous():
+    if topk_per_row_small_k is None:
         return False
     heads, total_q, max_block = score.shape
     rows = heads * total_q
@@ -1386,9 +1385,7 @@ def minimax_m3_index_topk_decode(
     n_valid_column_per_row: torch.Tensor | None = None,
     index_mxfp4: bool = False,
     pages_per_block: int = PAGES_PER_SPARSE_BLOCK,
-    index_work_map=None,
-    index_work_map_max_block: int = 0,
-    index_score_workspace=None,
+    index_scorer=None,
 ):
     """Decode index block-score + top-k, both split-K (cudagraph-safe).
 
@@ -1396,19 +1393,15 @@ def minimax_m3_index_topk_decode(
 
     The MXFP4 scorer (aiter's ``minimax_m3_index_score_fp4_flydsl``) reads the index
     cache as the two views of ``mxfp4_pages.page_views`` and the query as e4m3, as
-    the fused writer emits it (cast as stored, no per-tensor scale). It takes the
-    step's ``index_work_map`` -- built once a step in the metadata, outside any graph
-    (`make_sparse_decode_metadata`) -- and the ``index_work_map_max_block`` it was
-    built against, which must not move between graph replays (the work map's row
-    count is the scorer's grid); omitted, it builds its own map. Given no
-    ``index_score_workspace`` it allocates the fp32 scores per call, filled with its -inf
-    sentinel (``alloc_score``), as ``[heads, rows, max_block]`` -- or the transposed,
-    non-contiguous layout of it when ``S * heads >= 16``, which the Triton selector
-    reads and the aiter one declines. ``index_score_workspace`` is a persistent
-    `LogitsWorkspace` (the builder's, so a captured graph's pointer is stable) the scorer
-    writes a contiguous ``[heads, rows, max_block]`` view of instead: no per-layer allocation,
-    no fill (both selectors read a row only up to its valid blocks, which the scorer
-    writes every step), and the aiter selector stays eligible at any ``S * heads``.
+    the fused writer emits it (cast as stored, no per-tensor scale). ``index_scorer``
+    (an `IndexScoreBuffers`, required) holds what it runs on: the step's work map --
+    built once a step in the metadata, outside any graph (`make_sparse_decode_metadata`)
+    -- and the ``max_block`` that map was built at, which must not move between graph
+    replays (the map's row count is the scorer's grid), and the `LogitsWorkspace` it
+    writes its fp32 scores into as a contiguous ``[heads, rows, max_block]`` view:
+    no per-layer allocation, no fill (both selectors read a row only up to its valid
+    blocks, which the scorer writes every step), and the aiter selector eligible at
+    any ``S * heads``.
 
     Returns topk_idx [num_kv_heads, total_q, topk] (0-indexed block ids, -1 pad).
     For spec-decode (``max_query_len = num_spec+1``) each of the ``max_query_len``
@@ -1468,13 +1461,22 @@ def minimax_m3_index_topk_decode(
 
         from atom.model_ops.minimax_m3.mxfp4_pages import page_views
 
-        score_max_block = max(max_block, index_work_map_max_block)
+        if index_scorer is None or index_scorer.work_map is None:
+            raise ValueError(
+                "the MXFP4 index decode needs the step's index_scorer "
+                "(a work map and the score workspace)"
+            )
+        score_max_block = index_scorer.max_block
+        if max_block > score_max_block:
+            raise ValueError(
+                f"a context of {max_seq_len} tokens is wider than the {score_max_block} "
+                "blocks the index scorer's work map was built at"
+            )
         _require_packable(score_max_block)
-        score_out = None
-        if index_score_workspace is not None:  # fails if the step outgrows it
-            score_out = index_score_workspace.logits(
-                num_idx_heads * total_q, score_max_block
-            ).view(num_idx_heads, total_q, score_max_block)
+        # fails if the step outgrows the workspace
+        score_out = index_scorer.scores.logits(
+            num_idx_heads * total_q, score_max_block
+        ).view(num_idx_heads, total_q, score_max_block)
         k_data, k_scale = page_views(index_kv_cache)
         score = minimax_m3_index_score_fp4_flydsl(
             idx_q,
@@ -1486,7 +1488,7 @@ def minimax_m3_index_topk_decode(
             num_idx_heads,
             sm_scale,
             score_max_block,
-            work_map=index_work_map,
+            work_map=index_scorer.work_map,
             out=score_out,
         )
     else:
