@@ -23,6 +23,7 @@ triton = pytest.importorskip("triton")
 from aiter import dtypes as _aiter_dtypes
 
 from atom.model_ops.dcp_ops import (
+    _a2a_row_pitch,
     _dcp_a2a_unpack_combine_kernel,
     _dcp_a2a_unpack_combine_quant_kernel,
     _lse_pack_slots,
@@ -35,9 +36,11 @@ FP8 = _aiter_dtypes.fp8
 
 
 def _make_recv(n, b, h, d, dtype, pack, empty_rows=(), seed=0):
-    """[N, B, H, D+pack] as the all-to-all delivers it."""
+    """[N, B, H, pitch] as the all-to-all delivers it; the row padding is NaN,
+    so a combine that reads it poisons its output."""
     g = torch.Generator(device="cpu").manual_seed(seed)
-    recv = torch.empty((n, b, h, d + pack), dtype=dtype, device="cuda")
+    pitch = _a2a_row_pitch(d, pack, dtype)
+    recv = torch.full((n, b, h, pitch), float("nan"), dtype=dtype, device="cuda")
     body = torch.randn((n, b, h, d), generator=g).to(dtype).cuda()
     lse = torch.randn((n, b, h), generator=g).cuda().float() * 2.0
     for row in empty_rows:  # a rank owning no KV for this row
@@ -289,7 +292,8 @@ def test_non_power_of_two_group():
     assert triton.next_power_of_2(n) > n, "meaningless for a power-of-two group"
     pack = _lse_pack_slots(torch.bfloat16)
 
-    big = torch.empty((n + 1, b, h, d + pack), dtype=torch.bfloat16, device="cuda")
+    pitch = _a2a_row_pitch(d, pack, torch.bfloat16)
+    big = torch.empty((n + 1, b, h, pitch), dtype=torch.bfloat16, device="cuda")
     big[:n] = _make_recv(n, b, h, d, torch.bfloat16, pack)
     big[n] = 1e4  # where the padding lane points
     recv = big[:n]
