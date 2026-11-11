@@ -179,13 +179,14 @@ def test_late_draft_uploads_are_staged_by_prepare_model():
     assert not _attribute_calls(compute_draft_kv, "anchors_to_gpu")
 
 
-def test_kv_block_count_is_the_minimum_over_tp_and_pcp_groups():
-    """Every TP and PCP-group worker builds its pool at rank 0's count, so the
-    count must be the minimum over each group's CPU group, folded back into
-    the plan. Ulysses SP runs over the PCP group with PCP=1, so that group is
-    gated on the group's size, not on PCP alone."""
+def test_kv_budget_inputs_agree_over_tp_and_pcp_groups_before_any_raise():
+    """Every TP and PCP-group worker builds its pool at rank 0's count, so all
+    of them must size it from the minimum free memory and budget over each
+    group's CPU group. The agreement must precede every check that can raise
+    on one rank alone, or the other ranks wait in it. Ulysses SP runs over the
+    PCP group with PCP=1, so that group is gated on the group's size."""
     method = _method("get_num_blocks")
-    block = next(
+    agreement = next(
         node
         for node in ast.walk(method)
         if isinstance(node, ast.If)
@@ -193,17 +194,39 @@ def test_kv_block_count_is_the_minimum_over_tp_and_pcp_groups():
     )
     pcp_gate = next(
         node
-        for node in ast.walk(block)
+        for node in ast.walk(agreement)
         if isinstance(node, ast.If)
         and ast.unparse(node.body[0]) == "groups.append(get_pcp_group())"
     )
     assert ast.unparse(pcp_gate.test) == "config.pcp_group_size > 1"
-    assigns = {ast.unparse(n) for n in ast.walk(block) if isinstance(n, ast.Assign)}
+    assigns = {ast.unparse(n) for n in ast.walk(agreement) if isinstance(n, ast.Assign)}
     assert {
-        "reduced = group_min(reduced, group.cpu_group)",
-        "num_kvcache_blocks = reduced",
-        "plan = plan.with_paged_entries(num_kvcache_blocks)",
+        "free = group_min(free, group.cpu_group)",
+        "available_for_kv_budget = group_min(available_for_kv_budget, group.cpu_group)",
     } <= assigns
+    # Both rank-local raises read `free_for_kv`: the connector check directly,
+    # the pool budget through `available_for_kv`.
+    free_for_kv = next(
+        node
+        for node in ast.walk(method)
+        if isinstance(node, ast.Assign)
+        and ast.unparse(node) == "free_for_kv = free - connector_bytes"
+    )
+    assert agreement.end_lineno < free_for_kv.lineno
+
+    def targets(node):
+        nodes = node.targets if isinstance(node, ast.Assign) else [node.target]
+        return {n.id for t in nodes for n in ast.walk(t) if isinstance(n, ast.Name)}
+
+    # Nothing in between may overwrite the agreed values with this rank's own.
+    reassigned = [
+        ast.unparse(node)
+        for node in ast.walk(method)
+        if isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign))
+        and agreement.end_lineno < node.lineno < free_for_kv.lineno
+        and targets(node) & {"free", "available_for_kv_budget"}
+    ]
+    assert not reassigned
 
 
 def test_kv_budget_refuses_free_memory_below_the_connector_reserve():

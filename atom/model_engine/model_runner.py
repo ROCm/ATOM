@@ -2068,6 +2068,22 @@ class ModelRunner:
                 "Reserving %.2fGB for KV connector buffers", connector_bytes / (1 << 30)
             )
             available_for_kv_budget -= connector_bytes
+        # Every TP / PCP worker of this engine builds its pool at the count
+        # rank 0 reports (`call_func` returns rank 0's answer), so all of them
+        # size it from the group's smallest free memory and budget. Agree
+        # before any check below can raise: a rank raising alone would leave
+        # its peers waiting here. Ulysses SP runs over the PCP group too, so it
+        # spans more than one rank with PCP=1.
+        if torch.distributed.is_initialized():
+            groups = [get_tp_group()]
+            if config.pcp_group_size > 1:
+                groups.append(get_pcp_group())
+            for group in groups:
+                if group.world_size > 1:
+                    free = group_min(free, group.cpu_group)
+                    available_for_kv_budget = group_min(
+                        available_for_kv_budget, group.cpu_group
+                    )
         # This prevents OOM when other processes share the GPU. Free HBM must
         # cover the connector buffers too.
         free_for_kv = free - connector_bytes
@@ -2158,22 +2174,6 @@ class ModelRunner:
             torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN)
             num_kvcache_blocks = int(t.item())
             plan = plan.with_paged_entries(num_kvcache_blocks)
-
-        # Every TP / PCP worker of this engine builds its pool at the count
-        # rank 0 reports (`call_func` returns rank 0's answer), so no worker
-        # may report more than the smallest of them can hold. Ulysses SP runs
-        # over the PCP group too, so it spans more than one rank with PCP=1.
-        if torch.distributed.is_initialized():
-            groups = [get_tp_group()]
-            if config.pcp_group_size > 1:
-                groups.append(get_pcp_group())
-            reduced = num_kvcache_blocks
-            for group in groups:
-                if group.world_size > 1:
-                    reduced = group_min(reduced, group.cpu_group)
-            if reduced != num_kvcache_blocks:
-                num_kvcache_blocks = reduced
-                plan = plan.with_paged_entries(num_kvcache_blocks)
 
         block_bytes = plan.entry_bytes[plan.paged_class]
         # The whole plan travels to the engine process; BlockManager, the
