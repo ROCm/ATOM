@@ -88,6 +88,16 @@ def _unverified_steps(cache):
     requests at position 0, which `begin_step` refuses to verify. It keeps the
     verify write grid `tentative` selects; only its step is not a
     verification, as before #3136.
+
+    A non-verifying step of multi-token requests is a prefill step
+    (`BatchStep.decode`), so such a dummy runs the prefill FFN, not
+    `decode_ffn` -- also as before #3136, and intended: dummy batches only
+    feed eager forwards whose output is discarded (vLLM's warmup before each
+    capture size, dummy runs before the serving pool is bound).
+    `v41_stage_step` refuses to stage inside a stream capture, and the batches
+    captures do record (`_v41_capture_batch`, `_v41_profile_capture_batch`)
+    are not dummies: they start a full window in and stay verifying, so the
+    graphs record `decode_ffn`.
     """
     begin_step = cache.begin_step
 
