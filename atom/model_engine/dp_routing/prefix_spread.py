@@ -135,7 +135,8 @@ class PrefixSpreadRouter:
         if entry is None:
             return
         rank, chain, ordinal = entry
-        for edge, _end in self._path(chain):
+        path = self._path(chain)
+        for edge, _end in path:
             producer = self.pending.get((edge, rank))
             if producer is None:
                 continue  # already-confirmed reuse did not rely on this edge
@@ -157,10 +158,10 @@ class PrefixSpreadRouter:
                 holders.pop(rank)
                 holders[rank] = None
                 self._refresh_evictable(edge)
-                parent = edge.parent
+        # Deepest first: a merge drops only the edge it is called on.
+        for edge, _end in reversed(path):
+            if edge in self.index:
                 self._merge_into_child(edge)
-                if parent is not None:
-                    self._merge_into_child(parent)
         self._trim_history()
 
     def release(self, seq_id) -> dict:
@@ -551,6 +552,8 @@ class PrefixSpreadRouter:
         # Shed from the tail of the oldest leaf, at most an eighth of it per
         # visit: its head still names the owner rank, and rotating through the
         # leaves spreads the cut over many histories instead of emptying one.
+        # This is only approximately LRU: a recently used leaf can lose a tail
+        # share before an older leaf is gone.
         while self.indexed_tokens > self.CAP and self._evictable:
             edge = next(iter(self._evictable))
             excess = -(-(self.indexed_tokens - self.CAP) // edge.hbs)
