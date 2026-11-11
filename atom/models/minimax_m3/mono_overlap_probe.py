@@ -209,7 +209,7 @@ def run_probe(runner, input_ids, positions, n, spec) -> None:
     kinds = sorted({lw.index_topk for lw in sparse})
     launchers = {}
     for name, probe in variants.items():
-        if probe == "@begin":
+        if probe in ("@begin", "@beginN"):
             continue
         parse(probe)  # a malformed probe fails here, on every rank
         launchers[name] = {
@@ -237,12 +237,21 @@ def run_probe(runner, input_ids, positions, n, spec) -> None:
     # ---- 4. graphs
     graphs = {}
     for name, probe in variants.items():
-        tl = _ptr(pin) if probe != "@begin" and parse(probe).pin else 0
+        tl = _ptr(pin) if not probe.startswith("@") and parse(probe).pin else 0
+        # a fenced variant (spec "fenced", or "@beginN"): begin_step in front of every layer.
+        # A variant that keeps waits but not the FFN all-reduce (exit=, skip=ar2) has no
+        # barrier between layers, so a rank that drifts ahead can overwrite a peer's unread pairs: a deadlock
+        fenced = name in spec.get("fenced", []) or probe == "@beginN"
 
-        def body(name=name, tl=tl):
+        def body(name=name, tl=tl, fenced=fenced):
             runner.mailboxes.begin_step()
+            if fenced and name not in launchers:  # "@beginN": one more per layer
+                for _ in range(len(sparse) - 1):
+                    runner.mailboxes.begin_step()
             if name in launchers:
                 for i, lw in enumerate(sparse):
+                    if fenced and i:
+                        runner.mailboxes.begin_step()
                     a = dict(layer_args[i])
                     a["tl"] = tl
                     _run_compiled(
@@ -304,7 +313,7 @@ def run_probe(runner, input_ids, positions, n, spec) -> None:
     }
     res_json = {
         "n": n, "rank": rank, "layers": L, "rounds": rounds, "reps": reps,
-        "variants": variants, "times_ms": times, "round_stamps": stamps,
+        "variants": variants, "fenced": spec.get("fenced", []), "times_ms": times, "round_stamps": stamps,
         "experts": experts, "sizes": sizes,
         "probe_hash": {v: hashlib.sha256(p.encode()).hexdigest()[:8] for v, p in variants.items()},
     }  # fmt: skip
