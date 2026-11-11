@@ -314,8 +314,13 @@ changing worker metric names.
 | Router | `mesh_router_*` | Requests by model/endpoint, latency, errors |
 | Inference | `mesh_router_ttft/tpot/tokens_*` | TTFT, TPOT, token counts (gRPC) |
 | Worker | `mesh_worker_*` | Pool size, connections, health, selection |
+| Routing | `mesh_route_*`, `mesh_session_affinity_total`, `mesh_selected_dp_rank_total` | Policy decisions, session affinity, cache estimate against the engine report |
 | Circuit breaker | `mesh_worker_cb_*` | State, transitions, outcomes |
 | Retry | `mesh_worker_retries_*` | Attempts, exhaustion, backoff |
+
+[Routing metrics](docs/metrics.md) covers each routing metric's labels, the
+policies and branches that record it, how to read the values, and example
+queries.
 
 ### Logging
 
