@@ -252,6 +252,8 @@ def test_fp8_query_heads_a_program_is_bit_exact(monkeypatch, fp8_heads):
     query = torch.randn(tokens, heads, dim, device=device, dtype=torch.bfloat16) * 3
     fp8, e8m0 = (t.dtype for t in quantize_fp8(normed))
 
+    monkeypatch.setattr(rope_window, "_FP8_HEADS_MIN_PROGRAMS_PER_CU", 0)
+
     def run(n):
         monkeypatch.setattr(rope_window, "_FP8_HEADS", n)
         rows = torch.empty(tokens, dim + dim // 32, device=device, dtype=torch.uint8)
@@ -338,7 +340,7 @@ def test_fused_seam_head_block_matches_a_program_a_head(monkeypatch, heads, sink
     def run(flag):
         monkeypatch.setattr(rope_window, "_HEAD_BLOCK", flag)
         monkeypatch.setattr(rope_window, "_FP8_HEADS", 8 if flag else 1)
-        monkeypatch.setattr(rope_window, "_FP8_HEADS_MIN_QUERY_ROWS", 0)
+        monkeypatch.setattr(rope_window, "_FP8_HEADS_MIN_PROGRAMS_PER_CU", 0)
         spy = _GridSpy(rope_window._rope_window_kernel)
         monkeypatch.setattr(rope_window, "_rope_window_kernel", spy)
         out = {"query": query.clone()}
@@ -387,15 +389,20 @@ def test_fused_seam_head_block_matches_a_program_a_head(monkeypatch, heads, sink
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
-@pytest.mark.parametrize("tokens, fp8_heads", [(1, 1), (63, 1), (64, 8)])
-def test_fp8_query_groups_heads_from_the_query_row_threshold(
-    monkeypatch, tokens, fp8_heads
+@pytest.mark.parametrize(
+    "cus, tokens, fp8_heads",
+    [(256, 1, 1), (256, 63, 1), (256, 64, 8), (80, 19, 1), (80, 20, 8)],
+)
+def test_fp8_query_groups_heads_once_the_grid_fills_the_cus(
+    monkeypatch, cus, tokens, fp8_heads
 ):
-    """64 heads quantize 8 a program from 64 tokens (4096 query rows) on;
-    fewer keep a program a head, which is faster there."""
+    """64 heads quantize 8 a program from 2 grouped query programs a CU on
+    (64 tokens on 256 CUs, 20 on 80); fewer keep a program a head, which is
+    faster there."""
     from atom.model_ops.blockscale import quantize_fp8
     from atom.model_ops.deepseek_v41 import rope_window
 
+    monkeypatch.setattr(rope_window, "_cu_count", lambda device: cus)
     device, heads, dim, rope_dim = "cuda", 64, 512, 64
     rope = RotaryEmbedding(rope_dim, 1024, base=10000).to(device)
     positions = torch.zeros(tokens, device=device, dtype=torch.int32)

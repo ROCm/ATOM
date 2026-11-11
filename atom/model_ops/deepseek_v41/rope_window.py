@@ -15,6 +15,8 @@ The row this writes is `packed_rows`': `head_dim` FP8 values then
 `head_dim // 32` E8M0 scales. Where it lands is the cache's, not this file's.
 """
 
+import functools
+
 import torch
 import triton
 import triton.language as tl
@@ -30,18 +32,20 @@ from atom.model_ops.v4_kernels.pool_index import window_row
 # reference.
 _HEAD_BLOCK = True
 
-# The MXFP8 query's heads quantized by one program rather than one each.
-# These defaults (heads, warps and crossover) are tuned on gfx1250 (MI455X)
-# and shared across architectures. gfx950 timing is pending: revisit after
-# comparing 1 vs 8 heads at 4096 query rows and representative decode shapes.
-# On MI455X 8 heads on 2 warps took 1344 tokens 31.8 -> 16.2 us
-# (16384: 422 -> 205 us) and c1024 serving +4.1%, with the same bytes out. 1
-# only for the tests' per-head reference.
+# The MXFP8 query's heads quantized by one program rather than one each. On
+# MI455X 8 heads on 2 warps took 1344 tokens 31.8 -> 16.2 us (16384: 422 ->
+# 205 us) and c1024 serving +4.1%, with the same bytes out. 1 only for the
+# tests' per-head reference.
 _FP8_HEADS = 8
-# Below this many query rows (tokens x heads) the grouped grid is too small
-# and a program a head is faster (1 token: 1.6 vs 2.4 us); 64 heads cross at
-# ~64 tokens, 16 heads at ~256.
-_FP8_HEADS_MIN_QUERY_ROWS = 4096
+# Grouping pays once the grouped grid fills the device: with fewer query
+# programs than this a CU, a program a head is faster. MI455X (256 CUs), 64
+# heads: 1 token 1.6 vs 2.4 us, crossing at ~64 tokens; 16 heads at ~256.
+_FP8_HEADS_MIN_PROGRAMS_PER_CU = 2
+
+
+@functools.lru_cache
+def _cu_count(device):
+    return torch.cuda.get_device_properties(device).multi_processor_count
 
 
 @triton.jit
@@ -339,12 +343,14 @@ def rope_quant_window(
         and rope_dim >= 2
         and (rope_dim & (rope_dim - 1)) == 0
     )
-    fp8_heads = _FP8_HEADS if tokens * heads >= _FP8_HEADS_MIN_QUERY_ROWS else 1
+    fp8_heads = _FP8_HEADS
     if not (
         query_fp8 is not None
         and fp8_heads > 1
         and (fp8_heads & (fp8_heads - 1)) == 0
         and heads % fp8_heads == 0
+        and tokens * heads // fp8_heads
+        >= _FP8_HEADS_MIN_PROGRAMS_PER_CU * _cu_count(query.device)
     ):
         fp8_heads = 1
     query_programs = 1 if head_block else heads // fp8_heads
