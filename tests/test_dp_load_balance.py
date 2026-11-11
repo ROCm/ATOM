@@ -2052,3 +2052,29 @@ def test_prefix_spread_trim_never_cuts_an_interval_still_being_prefilled():
         router.release(seq.id)
     router.reset()
     assert not router.index and router.indexed_tokens == 0
+
+
+def test_prefix_spread_merge_waits_for_another_ranks_provisional_claim():
+    """Rank 1 is still computing two intervals (one producer) while rank 0
+    confirms the same two. Their holders then read alike -- rank 0 confirmed,
+    rank 1 naming the same producer -- but rank 1's claims are provisional and
+    keyed by interval, so the intervals must stay apart until rank 1 finishes
+    or gives up."""
+    router = _make_spread_mgr()._prefix_router
+    first, producer, follower = (
+        _chain_seq(1, 64 * 128),
+        _chain_seq(2, 96 * 128),
+        _chain_seq(3, 96 * 128),
+    )
+    for seq, rank in ((first, 0), (producer, 1), (follower, 0)):
+        router.charge(seq.id, router.place(seq, rank, 2).credit)
+    assert len(router.index) == 2
+    router.prefill_complete(3)  # rank 0 confirms both intervals
+    assert len(router.index) == 2
+    assert router._rank_hits(follower.prompt_hash_chain, 2) == ({0: 96 * 128}, 0)
+    # Rank 1 gives up: its claims go, rank 0's confirmed history stays intact.
+    router.release(2)
+    assert router._rank_hits(follower.prompt_hash_chain, 2) == ({0: 96 * 128}, 0)
+    router.release(1)
+    router.release(3)
+    assert not router.pending and not router._produced and not router._in_flight
