@@ -37,7 +37,7 @@ OTHER = {
     "sm_scale": 0.09, "eps": 1e-5, "route_scale": 2.0, "shared_weight": 0.5,
     "swiglu_limit": 8.0, "debug": True, "xn_flag": 1,
     "shared_mxfp8": True, "mid_flag": 1, "kv_nvfp4": True, "index_nvfp4": True,
-    "sh_first": 2,
+    "sh_first": 2, "attn_mxfp8": True,
 }  # fmt: skip
 
 
@@ -49,6 +49,7 @@ def _compile(key: K4Build) -> None:
         timeline=key.timeline, fuse_k1=key.fuse_k1, heads=heads, debug=key.debug,
         index_topk=key.index_topk, xn_flag=key.xn_flag, shared_mxfp8=key.shared_mxfp8, mid_flag=key.mid_flag,
         kv_nvfp4=key.kv_nvfp4, index_nvfp4=key.index_nvfp4, sh_first=key.sh_first,
+        attn_mxfp8=key.attn_mxfp8,
     )  # fmt: skip
     with compile_only():
         launch(*K4_ABI.zeros())
@@ -116,4 +117,17 @@ def test_every_dense_field_is_listed():
 def test_one_dense_field_changed_is_a_new_binary(cache, name):
     _compile_dense(DENSE_BASE)
     _compile_dense(dataclasses.replace(DENSE_BASE, **{name: DENSE_OTHER[name]}))
+    assert len(_entries(cache)) == 2
+
+
+def test_k1_attn_mxfp8_is_a_new_binary(cache):
+    from atom.models.minimax_m3.mono.kernels.pre_attn import (
+        K1_ABI,
+        build_pre_attn_kernel,
+    )
+
+    for flag in (False, True):
+        launch = build_pre_attn_kernel(1e-6, 0.088, 1, 1, 4, attn_mxfp8=flag)
+        with compile_only():
+            launch(*K1_ABI.zeros())
     assert len(_entries(cache)) == 2

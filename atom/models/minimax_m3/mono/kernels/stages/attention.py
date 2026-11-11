@@ -23,6 +23,7 @@ from atom.models.minimax_m3.mono.layout import (
     O_ROW,
     O_ROWS,
     OSC_ROW,
+    SCRATCH,
     SPLIT_KEYS,
     H,
 )
@@ -37,12 +38,14 @@ from atom.mono.device.mx import (
 from atom.mono.device.ops import (
     CM_DEV,
     CM_NT,
+    batched_rounds,
     bf2_f32,
     bf16_round,
     butterfly,
     fp8_pack4,
     hw_exp2,
     hw_rcp,
+    ld_dev,
     mfma_fp8,
     row_sum,
     rows_to_lds,
@@ -600,9 +603,38 @@ def o_defs(k4ctx):
                 if const_expr(not attn_mxfp8):
                     x_scales = [got[k][0].bitcast(fx.Float32) for k in range(tokens)]
                 acquire()
-                rows_to_lds(tid, mb("attnq"), tokens, O_K // 4, xs, O_ROW)
                 if const_expr(attn_mxfp8):
-                    rows_to_lds(tid, mb("attnq_sc"), tokens, O_K // 32, osc, OSC_ROW)
+                    # the rows and their codes in one batched loop (a second would add a
+                    # round trip): loads v < n_a are the rows'
+                    n_a, n_c = tokens * (O_K // 4) // 4, tokens * (O_K // 32) // 4
+                    to_codes = (SCRATCH["attnq_sc"] - SCRATCH["attnq"]) // 4
+
+                    def put_row_or_codes(v, w):
+                        if v < n_a:
+                            fx.ptr_store(
+                                w, xs + (v * 4 // (O_K // 4) * O_ROW + v * 4 % (O_K // 4))
+                            )
+                        else:
+                            u = v - n_a
+                            fx.ptr_store(
+                                w,
+                                osc + (u * 4 // (O_K // 32) * OSC_ROW + u * 4 % (O_K // 32)),
+                            )
+
+                    batched_rounds(
+                        tid,
+                        n_a + n_c,
+                        lambda v: fx.Vector(
+                            ld_dev(
+                                mb("attnq"),
+                                (v < n_a).select(v * 4, to_codes + (v - n_a) * 4),
+                                4,
+                            )
+                        ),
+                        put_row_or_codes,
+                    )
+                else:
+                    rows_to_lds(tid, mb("attnq"), tokens, O_K // 4, xs, O_ROW)
             gpu.barrier()
             # B column l % 16 is token l % 16 (token 0 past the last): C column k
             # is token k's rows, the weight stream is the same for any token count

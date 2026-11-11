@@ -62,6 +62,7 @@ from atom.mono.device.mx import FP8_MAX, clamp_fp8, code_ceil, mfma_scaled, rcp_
 from atom.mono.device.ops import (
     CM_DEV,
     CM_NT,
+    batched_rounds,
     bf16_pair,
     bf16_round,
     butterfly,
@@ -71,6 +72,7 @@ from atom.mono.device.ops import (
     kernel_symbol,
     lane_gather,
     launcher,
+    ld_dev,
     mfma_fp8,
     rows_to_lds,
     rsrc,
@@ -493,9 +495,37 @@ def emit_pre_attn(
             fx.memory_fence(
                 syncscope=rocdl.SyncScope.Workgroup, ordering=fx.AtomicOrdering.Acquire
             )
-            rows_to_lds(tid, x8_mb, tokens, HIDDEN // 4, x8, HIDDEN // 4)
             if const_expr(attn_mxfp8):
-                rows_to_lds(tid, xsc_mb, tokens, HIDDEN // 32, xsc, XSC_ROW)
+                # the rows and their codes in one batched loop (a second one would add a
+                # round trip of the 16 B loads to the chain): loads v < n_x are x8's
+                n_x, n_s = tokens * (HIDDEN // 4) // 4, tokens * K_SCALE_BYTES // 4
+
+                def put_row_or_codes(v, w):
+                    if v < n_x:
+                        fx.ptr_store(w, x8 + v * 4)
+                    else:
+                        u = v - n_x
+                        fx.ptr_store(
+                            w,
+                            xsc + (u * 4 // K_SCALE_BYTES * XSC_ROW + u * 4 % K_SCALE_BYTES),
+                        )
+
+                batched_rounds(
+                    tid,
+                    n_x + n_s,
+                    lambda v: fx.Vector(
+                        ld_dev(
+                            x8_mb,
+                            (v < n_x).select(
+                                v * 4, (SCRATCH_XSC - SCRATCH_X8) // 4 + (v - n_x) * 4
+                            ),
+                            4,
+                        )
+                    ),
+                    put_row_or_codes,
+                )
+            else:
+                rows_to_lds(tid, x8_mb, tokens, HIDDEN // 4, x8, HIDDEN // 4)
             gpu.barrier()
             stamp(2)
         # 12 chunks per wave: two 16x16x32 FP8 MFMAs each (k halves of 8 bytes).

@@ -5,6 +5,9 @@
 The configuration is checked once; a step is then routed to mono only when it is
 a decode of 1..MAX_TOKENS tokens (a cudagraph's pad rows counted; a speculative
 verify's q tokens of a request count as q).
+The attention linears may be the checkpoint's native MXFP8 1x32 (no online quantization) or the ptpc-FP8
+requantization: ``weights.SparseMoeLayer`` decides per model, the runner builds the matching K1 / K4
+(``attn_mxfp8``), and a model mixing the two is refused there.
 Every per-step input is TP-uniform: the kernels all-reduce in-kernel, so ranks
 that disagreed would wait on each other forever (a per-rank flag such as
 ``is_dummy_run`` must never gate this).
