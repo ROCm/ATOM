@@ -600,6 +600,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MoE sort in a second (atom/model_ops/minimax_m3/router/router_swiglu.py),
     # instead of the one-launch router and a separate SwiGLU. 0 disables it.
     "ATOM_M3_ROUTER_SWIGLU": lambda: os.getenv("ATOM_M3_ROUTER_SWIGLU", "1") == "1",
+    # MiniMax-M3.1, with ATOM_M3_ROUTER_SWIGLU: fold the routed scaling into the
+    # routing weights and let GEMM2 accumulate onto the shared expert's output,
+    # dropping the combine launch. Not bitwise: the shared output is rounded
+    # into each bf16 atomic add instead of added once. 0 combines with one add.
+    "ATOM_M3_FOLD_SHARED_INTO_MOE": lambda: (
+        os.getenv("ATOM_M3_FOLD_SHARED_INTO_MOE", "1") == "1"
+    ),
     # Fused decode for measured model/deployment/step geometries. Unsupported
     # configurations and forwards keep the production path. 0 disables it.
     "ATOM_MONO_ENABLE": lambda: os.getenv("ATOM_MONO_ENABLE", "1") == "1",
