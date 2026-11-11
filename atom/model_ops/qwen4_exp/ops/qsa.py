@@ -18,6 +18,7 @@ from aiter.ops.qsa import (  # noqa: F401
     qsa_cache_row_layout,
     qsa_expand_block_indices,
     qsa_paged_mqa_logits,
+    qsa_select_paged_groups,
     qsa_select_paged_tokens,
     qsa_sparse_paged_gqa,
     qsa_store_quantized_rows,

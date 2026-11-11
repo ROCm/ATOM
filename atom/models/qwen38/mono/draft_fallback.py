@@ -24,6 +24,7 @@ from atom.models.qwen38.mono.draft_experts import NativeExperts
 from atom.models.qwen38.mono.kernels import qsa_index
 from atom.models.qwen38.mono.kernels.qsa_epilogue import qsa_norm_rope_cache
 from atom.models.qwen38.mono.step_meta import draft_attention_fused
+from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
@@ -154,6 +155,7 @@ def attention(module, positions, mixed):
         max_seq_len=qsa.max_seq_len,
         allow_flydsl=False,
         compressed_k_scale=module.compressed_key_scale,
+        stacked_decode=envs.ATOM_QSA_STACKED_DECODE_SCORER,
     )
     attn_out = qsa_sparse_paged_gqa(
         query,

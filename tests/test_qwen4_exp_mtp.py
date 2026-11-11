@@ -21,7 +21,6 @@ from atom.model_ops.qwen4_exp.ops.qsa import (
     qsa_paged_mqa_logits,
     qsa_select_paged_groups,
     qsa_select_paged_tokens,
-    qsa_sparse_paged_gqa,
 )
 from atom.spec_decode.draft_graph import StagedInput
 

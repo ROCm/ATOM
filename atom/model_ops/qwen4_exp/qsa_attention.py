@@ -527,6 +527,7 @@ class Qwen4ExpAttention(nn.Module):
                 max_seq_len=qsa.max_seq_len,
                 allow_flydsl=allow_flydsl,
                 compressed_k_scale=self.compressed_key_scale,
+                stacked_decode=envs.ATOM_QSA_STACKED_DECODE_SCORER,
             )
         local = slice(rows.start, min(rows.start + rows.chunk, rows.num_tokens))
         groups, width = qsa_select_paged_groups(
@@ -541,6 +542,7 @@ class Qwen4ExpAttention(nn.Module):
             max_seq_len=qsa.max_seq_len,
             allow_flydsl=allow_flydsl,
             compressed_k_scale=self.compressed_key_scale,
+            stacked_decode=envs.ATOM_QSA_STACKED_DECODE_SCORER,
         )
         if groups.shape[0] < rows.chunk:
             groups = nn.functional.pad(groups, (0, 0, 0, rows.chunk - groups.shape[0]))
