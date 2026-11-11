@@ -5104,12 +5104,15 @@ class Scheduler:
                 self._has_req_id(self.finished_recving_kv_req_ids, seq.id)
                 or self._has_req_id(self.failed_recving_kv_req_ids, seq.id)
             ):
-                if resolve:
-                    self._resolve_offload_load(seq)
-                ready.append(seq)
-            elif (
-                seq.status == SequenceStatus.WAITING
-                and self._is_offload_prefill_resume(seq)
+                if not resolve:
+                    ready.append(seq)
+                    continue
+                self._resolve_offload_load(seq)
+            # With an offload tier only a resume that keeps its blocks goes
+            # ahead: a failed load that kept none is an ordinary waiter and
+            # must not sit in front of the resumes that hold the pool.
+            if seq.status == SequenceStatus.WAITING and (
+                self._is_offload_prefill_resume(seq)
             ):
                 ready.append(seq)
             else:
