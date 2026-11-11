@@ -157,9 +157,6 @@ def test_a_filtered_batch_reaches_one_law_for_every_draw(
         rejection_sampler=SimpleNamespace(forward=mock.Mock(side_effect=_Reached)),
         drafter=drafter,
     )
-    runner._constrain_required_channel = MethodType(
-        runner_module.ModelRunner._constrain_required_channel, runner
-    )
     runner.sampler.sample_verification_tokens = mock.Mock(
         return_value=torch.zeros(bs, dtype=torch.int32)
     )
@@ -171,6 +168,7 @@ def test_a_filtered_batch_reaches_one_law_for_every_draw(
                 return_logprobs=[False] * bs,
                 any_logprobs=False,
                 required_channel=None,
+                num_spec_step=2 if verified else 0,
             ),
             torch.zeros(4, 8),
             temperatures,

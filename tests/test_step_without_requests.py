@@ -55,7 +55,6 @@ def test_postprocess_samples_nothing_without_a_request(monkeypatch):
     runner = object.__new__(mod.ModelRunner)
     runner.device = torch.device("cpu")
     runner.sampler = lambda logits, *args, **kwargs: logits.argmax(-1)
-    runner._constrain_required_channel = lambda batch, logits: None
     runner.forward_done_event = types.SimpleNamespace(record=lambda: None)
     sampled = {}
     runner.tokenID_processor = types.SimpleNamespace(

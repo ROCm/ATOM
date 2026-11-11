@@ -3587,7 +3587,6 @@ class ModelRunner:
             # every rank): the step's requests' output ids and verdict, as
             # the rejection sampler gives them. The next ids are gathered
             # below from the broadcast ids, as on the logits path.
-            channel = None
             sampled_tokens, verdict = logits
             sampled_tokens, verdict = sampled_tokens[:bs], verdict[:, :bs]
             num_bonus_tokens, num_reject_tokens, anchors = verdict
@@ -3596,7 +3595,6 @@ class ModelRunner:
         elif self._served is not None:
             # The step override verified on the GPU: the rejection sampler's
             # (output_token_ids [bs, k + 1], verdict [3, bs]).
-            channel = None
             sampled_tokens, verdict = self._served.verify_outputs(bs)
             num_bonus_tokens, num_reject_tokens, anchors = verdict
             next_token_locs = num_bonus_tokens
@@ -3729,7 +3727,7 @@ class ModelRunner:
             or getattr(delivered, "structured_requests", None)
         ):
             for req_id, ids in tuple(token_id_dict.items()):
-                if req_id != -1 and -2 in ids:
+                if -2 in ids:
                     if output_errors is None:
                         output_errors = {}
                     output_errors[req_id] = (

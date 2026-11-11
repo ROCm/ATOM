@@ -144,7 +144,7 @@ def test_failure_uses_output_copy_without_poisoning_gpu_carry(deferred, spec):
         batch, tokens, None, constraint_failed=torch.tensor([True, False])
     )
     if deferred:
-        assert output == {-1: 1}
+        assert output == {}
         assert p.prev_token_ids is tokens
         output, _ = p.prepare_sampled_ids(
             SimpleNamespace(req_ids=[99], return_logprobs=[False]), tokens[:1], None
