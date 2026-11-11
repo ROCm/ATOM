@@ -1492,14 +1492,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         Side effects: sets module `kv_cache`, `max_model_len`, and (V3.2)
         the indexer's k_cache slot.
         """
+        from atom.config import KVCacheTensor
+
         if MLA_ROWS not in self._module_kinds(module):
             return None
-
-        return self._bind_mla_kv_cache_tensor(module)
-
-    def _bind_mla_kv_cache_tensor(self, module):
-        """Bind and publish MLA KV plus FP8/FP4 index planes for any MLA builder."""
-        from atom.config import KVCacheTensor
 
         runner = self.model_runner
         # The row the sizing walk gave this module. Its `layer_num` would
@@ -1511,7 +1507,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         module.max_model_len = runner.config.max_model_len
         index_cache = None
         index_scale = None
-        if runner.has_mla_indexer and getattr(module, "indexer", None) is not None:
+        if runner.has_mla_indexer and module.indexer is not None:
             # The compact map is keyed by GLOBAL model layer ids, which the
             # pool row above is not -- on a non-first PP stage row 0 may be
             # global layer 39.

@@ -455,8 +455,33 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             )
 
         if hasattr(module, "base_attention") and getattr(module, "use_mla", False):
-            cache_tensor = self._bind_mla_kv_cache_tensor(module)
-            if cache_tensor.index_cache is not None:
+            # This module's MLA row. K3's linear-attention layers are bound
+            # above and take none, and a shared draft's layers simply continue
+            # the numbering, which is what the pool was sized for.
+            row = self.pool_rows[MLA_ROWS][module]
+            kv_cache = self.kv_pool.layer("kv", row).view(-1, 1, self.kv_pool.entry_dim)
+            module.max_model_len = runner.config.max_model_len
+            index_cache = None
+            if runner.has_mla_indexer and getattr(module, "indexer", None) is not None:
+                # The module's own global layer number, not the bind
+                # ordinal: the map is keyed globally, and on a non-first PP
+                # stage local 0 may be global 39.
+                if module.layer_num not in runner.index_cache_layer_map:
+                    raise RuntimeError(
+                        "Sparse MLA indexer layer is missing from the compact "
+                        f"index cache layout: layer_num={module.layer_num}"
+                    )
+                index_cache = self.kv_pool.layer(
+                    "index", runner.index_cache_layer_map[module.layer_num]
+                )
+                # Flat row view: `indexer_k_quant_and_cache` addresses a
+                # slot as a single row id, and the pooled writer computes that
+                # id from the block table itself.
+                module.indexer.k_cache.kv_cache[0] = index_cache.view(
+                    index_cache.shape[0] * index_cache.shape[1],
+                    1,
+                    runner.aligned_index_dim,
+                )
                 # kpool: this layer's slice of the per-request tail buffer,
                 # bound here for the same reason the index cache is -- the
                 # indexer has no other route to a runner-owned tensor.
@@ -465,7 +490,15 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
                     module.indexer.kpool_tail_cache = tail[
                         runner.index_cache_layer_map[module.layer_num]
                     ]
-            return cache_tensor
+            module.kv_cache = kv_cache
+            return KVCacheTensor(
+                layer_num=module.layer_num,
+                k_cache=kv_cache,
+                v_cache=None,
+                k_scale=None,
+                v_scale=None,
+                index_cache=index_cache,
+            )
 
         return None
 
