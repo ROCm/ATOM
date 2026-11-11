@@ -644,7 +644,8 @@ def build_post_attn_kernel(
         # a wave takes chunks q and q + 4 of an expert (``wide_down``)
         assert 4 < DN_KC <= 8
         DN_WITERS = 2 * U_MAX  # (expert, chunk) units a wave runs, at most
-        DN_DEPTH = 12  # units whose weights are in flight
+        DN_DEPTH = 20  # units whose weights are in flight
+        DN_ROWS_AHEAD = 4  # of them, those whose B rows are read already
         ROUTE_ITERS = (tokens + WAVES - 1) // WAVES  # tokens a wave routes
 
         k4ctx.update(locals())

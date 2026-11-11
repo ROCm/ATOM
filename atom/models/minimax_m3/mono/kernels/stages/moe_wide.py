@@ -66,6 +66,7 @@ def moe_wide_defs(k4ctx):
     """The functions of the expert-grouped MoE (S > 4)."""
     BASE = k4ctx["BASE"]
     DN_DEPTH = k4ctx["DN_DEPTH"]
+    DN_ROWS_AHEAD = k4ctx["DN_ROWS_AHEAD"]
     DN_KC = k4ctx["DN_KC"]
     DN_WITERS = k4ctx["DN_WITERS"]
     G = k4ctx["G"]
@@ -457,22 +458,26 @@ def moe_wide_defs(k4ctx):
         there), route-weighted per column -> ffn_finish."""
         nu = uniform(fx.ptr_load(uexp + (U_MAX + 1)))
         rg_d = td * 2 + wave // 4
-        # wave q of the row group takes chunks q and q + 4 of every expert, unit i
-        # being expert i // 2 for all 4: which wave adds a chunk, and in what
-        # order, follows from the expert alone, not its rank in the step's union,
-        # so another row's experts cannot regroup this row's sums
-        q = wave % 4
+        # wave q of the row group takes chunks q and q + 4 of every expert (units
+        # 2 e, 2 e + 1; only chunk q where q + 4 is past the last: unit e): which wave
+        # adds a chunk, and in what order, follows from the expert alone, not its
+        # rank in the step's union, so another row's experts cannot regroup this
+        # row's sums
+        q = uniform(wave % 4)
 
         def unit_load(i):
             """(weights, scale, unit) of this wave's i-th (expert, 128-k chunk)
             unit, zero-sized reads past the last."""
-            dkc = q + 4 * (i % 2)
-            ok = (dkc < DN_KC) & (
-                fx.Int32(i // 2) < nu if SH8 else fx.Int32(i // 2) <= nu
-            )
+            # waves with one chunk an expert (q >= DN_KC - 4) take one expert a unit,
+            # not every other unit empty: all their units' weights are real loads
+            # in flight, their sums unchanged (the same units in the same order)
+            one = q >= DN_KC - 4
+            e_i = one.select(fx.Int32(i), fx.Int32(i // 2))
+            dkc = one.select(q, q + 4 * (i % 2))
+            ok = e_i < nu if SH8 else e_i <= nu
             # clamped into the table: a unit past the last reads a real or zero
             # row, never past urow (a garbage row is garbage B, and 0 * NaN)
-            du = fx.Int32(min(i // 2, U_MAX - 1))
+            du = fx.min(e_i, U_MAX - 1)
             dkc = fx.min(dkc, DN_KC - 1)
             de = fx.min(uniform(fx.ptr_load(uexp + du)), SHARED_EXPERT)
             dwv = fp4_tile_load(
@@ -524,6 +529,7 @@ def moe_wide_defs(k4ctx):
         # in; unit i + DN_DEPTH's before unit i's MFMA
         acc = [fx.Float32(0.0) for _ in range(4)]
         inflight = [unit_load(i) for i in range(min(DN_DEPTH, DN_WITERS))]
+        ahead = []  # the next units, their rows read (the rest of the pipeline is raw)
         # every up / gate task pair's flag, then the MXFP8 mid rows and their
         # scales, the pool's layout (plain words, 16 B a load)
         n_ug = (nu + 1) * UG_PAIRS
@@ -548,10 +554,13 @@ def moe_wide_defs(k4ctx):
         stamp(10)
         for i in range_constexpr(DN_WITERS):
             if const_expr(i == 0):  # the tables are in: the early units' rows
-                inflight = [with_rows(u) for u in inflight]
-            dwv, dsc, drow, dkc, dw, ok = inflight.pop(0)
+                ahead = [with_rows(u) for u in inflight[:DN_ROWS_AHEAD]]
+                inflight = inflight[DN_ROWS_AHEAD:]
+            dwv, dsc, drow, dkc, dw, ok = ahead.pop(0)
             if const_expr(i + DN_DEPTH < DN_WITERS):
-                inflight.append(with_rows(unit_load(i + DN_DEPTH)))
+                inflight.append(unit_load(i + DN_DEPTH))
+            if const_expr(len(inflight) > 0):
+                ahead.append(with_rows(inflight.pop(0)))
             dcu = mfma_scaled(
                 a=dwv,
                 sa=dsc,
