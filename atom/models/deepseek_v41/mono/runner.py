@@ -38,6 +38,7 @@ from atom.models.deepseek_v41.mono import index_plan as ip
 from atom.models.deepseek_v41.mono.builds import (
     RowsBuild,
     lean_width,
+    refuse,
     unfused_post_key,
 )
 from atom.models.deepseek_v41.mono.check import (
@@ -202,8 +203,17 @@ class V41MonoDecodeRunner:
         self.icand = region("icand", self.max_rows, ip.TOPK_BLOCKS)
 
     def prepare(self, rows: int) -> bool:
-        """Whether every rank holds the ``rows``-row kernels (``WidthBuilds``)."""
-        return 0 < rows <= self.max_rows and self.widths.prepare(rows)
+        """Whether every rank holds the ``rows``-row kernels (``WidthBuilds``).
+
+        ``ATOM_DSV41_MONO_STRICT`` turns a refused width into an error instead:
+        its steps would otherwise run the original model's path without saying
+        so, which an A/B measures as if it were mono."""
+        if not 0 < rows <= self.max_rows:
+            return False
+        if self.widths.prepare(rows):
+            return True
+        refuse(rows)
+        return False
 
     def _bind(self, model, drafter) -> None:
         self.model = model
