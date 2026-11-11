@@ -629,8 +629,17 @@ def build_post_attn_kernel(
         W_MIDSC = (MID_ROWS + 1) * MID_ROW
         # up / gate tasks go in pairs, a CTA runs both: an MXFP8 block is 32 rows
         UG_PAIRS = UG_PER_SLOT // 2
-        UGW_ITERS = 2 * (
-            ((U_MAX - (1 if shared_mxfp8 else 0)) * UG_PAIRS + G - 1) // G
+        # the MXFP8 shared expert's pairs weigh two routed pairs each and sit on UG_PAIRS
+        # CTAs that take two routed pairs fewer (``stage_moe_wide``)
+        UGW_ITERS = (
+            2
+            * (
+                (U_MAX - 1) * UG_PAIRS
+                + (2 * UG_PAIRS if shared_mxfp8 else UG_PAIRS)
+                + G
+                - 1
+            )
+            // G
         )  # up / gate tasks a CTA runs
         # a wave takes chunks q and q + 4 of an expert (``wide_down``)
         assert 4 < DN_KC <= 8

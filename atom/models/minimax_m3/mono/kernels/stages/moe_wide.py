@@ -369,9 +369,27 @@ def moe_wide_defs(k4ctx):
         # the MXFP8 shared expert is not a task of the grouped loop (its tiles are fp8)
         n_pairs = (n_routed + (0 if SH8 else 1)) * UG_PAIRS
 
+        # the MXFP8 shared expert's pairs (UG_PAIRS, each two routed pairs' bytes) run
+        # on the last UG_PAIRS CTAs after their routed pairs: those carry two pairs
+        # fewer, so every CTA ends within a pair of the others. Rounds (a round is
+        # one pair a CTA): the first ``full`` are every CTA's (pair round * G +
+        # bid); the last one or two are the other G - UG_PAIRS CTAs' (the routed
+        # pairs left, in order). Not SH8: pair round * G + bid throughout
+        SH_HOST0 = G - UG_PAIRS
+        if const_expr(SH8):
+            rounds = (n_pairs + 2 * UG_PAIRS + (G - 1)) // G
+            full = fx.max(rounds - 2, 0)
+
         def task(it):
-            """Iteration it's task: pair bid + (it / 2) G's half it % 2."""
-            pr = fx.Int32(bid + it // 2 * G)
+            """Iteration it's task: its pair's half it % 2."""
+            if const_expr(SH8):
+                rd = it // 2
+                tail = full * G + (fx.Int32(rd) - full) * SH_HOST0 + bid
+                pr = (fx.Int32(rd) < full).select(
+                    fx.Int32(rd * G) + bid, (bid < SH_HOST0).select(tail, n_pairs)
+                )
+            else:
+                pr = fx.Int32(bid + it // 2 * G)
             return fx.min(pr, n_pairs - 1) * 2 + it % 2, pr < n_pairs
 
         t0, h0 = task(0)
@@ -416,11 +434,10 @@ def moe_wide_defs(k4ctx):
                 cur = nxt
         if const_expr(SH8):
             # the shared expert's pair j (task pair n_routed * UG_PAIRS + j of the
-            # step's numbering) on CTA (that) % G: both halves' tiles in flight
+            # step's numbering) on CTA SH_HOST0 + j: both halves' tiles in flight
             # before the first GEMV, the pair's flag after the second
-            # (bid + 8 G keeps the dividend positive: 8 G > the step's pairs)
-            jsh = (bid + 8 * G - n_routed * UG_PAIRS) % G
-            has_s = jsh < UG_PAIRS
+            jsh = fx.Int32(bid) - SH_HOST0
+            has_s = jsh >= 0
             jsh = fx.min(jsh, UG_PAIRS - 1)
             sh_cur = wsh_load(2 * jsh, has_s)
             sh_nxt = wsh_load(2 * jsh + 1, has_s)
