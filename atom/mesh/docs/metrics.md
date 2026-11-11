@@ -25,23 +25,37 @@ Two endpoints render the same registry:
 
 ```bash
 curl -s http://<router-host>:<router-port>/metrics \
-  | grep -E '^mesh_(route|session_affinity|selected_dp_rank)'
+  | grep -E '^mesh_(route|session|selected_dp_rank)'
 ```
 
 Values accumulate from router start. Use `rate()` or `increase()` in
 Prometheus, or subtract a scrape taken before a benchmark from one taken after
-it. Agentic PD CI saves the router port's `/metrics` after each aiperf run as
-`metrics/router-metrics.prom` in the run artifact. A series appears once it has
-a sample, so a policy or branch that never ran has no line.
-`--route-log-sample-rate` logs individual decisions with the same fields
-(see [Logging](../README.md#logging)).
+it. A series appears once it has a sample, so a policy or branch that never ran
+has no line.
+
+Agentic PD CI runs every concurrency level against one router and saves three
+files per level under `metrics/` in the run artifact:
+
+- `router-metrics-before.prom`: the router port's `/metrics` just before aiperf
+  starts;
+- `router-metrics.prom`: the same just after aiperf exits, which still includes
+  the earlier levels;
+- `router-metrics-delta.prom`: the level's own increase of every counter and
+  histogram series, buckets, sums and counts included, computed by
+  [`router_metrics_delta.py`](../../../.github/scripts/atomesh/observability/router_metrics_delta.py).
+
+Both snapshots start with a `# scraped_at` line, and the window covers the whole
+aiperf run, warmup included. A counter that went down means the router
+restarted during the level; the delta then counts from the restart, and its
+header says `counter reset: yes`.
 
 ## Metric reference
 
 Counters carry the `_total` suffix; histograms expose `_bucket`, `_sum` and
 `_count`. `pool` is the worker pool the selection was made in: `regular`
-without PD disaggregation, otherwise `prefill` or `decode`. `policy` is one of `random`,
-`round_robin`, `power_of_two`, `cache_aware`, `prefix_hash` and `dp_sticky`.
+without PD disaggregation, otherwise `prefill` or `decode`. `policy` is one of
+`random`, `round_robin`, `power_of_two`, `cache_aware`, `prefix_hash` and
+`dp_sticky`.
 Decisions and dispatches are counted per attempt: a PD request adds one per
 pool, and a retry adds another.
 
@@ -51,10 +65,11 @@ them.
 
 | Metric | Type / unit | Labels | Recorded when | Since |
 | --- | --- | --- | --- | --- |
-| `mesh_route_branch_total` | Counter, decisions | `pool`, `policy`, `branch` (see [Branches](#branches)) | Every policy selection with at least one candidate; from [#3213], also a pool without candidates. | [#3141] |
+| `mesh_route_branch_total` | Counter, decisions | `pool`, `policy`, `branch` (see [Branches](#branches)) | Every selection, including one in a pool without candidates. | [#3141] |
 | `mesh_route_prefix_match_ratio` | Histogram, ratio 0 to 1 | `pool`, `policy` | `cache_aware` branches `affinity`, `relocate`, `stale_tenant`. | [#3141] |
 | `mesh_route_selected_worker_active_requests` | Histogram, active requests | `pool`, `policy`, `branch` | Every selection that picks a worker, before the router adds the request (see [below](#selected-workers-active-requests)). | [#3141] |
 | `mesh_session_affinity_total` | Counter, requests | `pool`, `result`: `hit`, `new`, `rebind`, `expired` | `dp_sticky` selected a worker for a request with a session ID. | [#3141] |
+| `mesh_session_worker_change_total` | Counter, requests | `pool`, `reason`: `rebind`, `expired`, `rank_mapping` | A `dp_sticky` session request is dispatched to a different worker (URL and DP rank) than the session's previous request (see [below](#worker-changes)). | [#3141] |
 | `mesh_selected_dp_rank_total` | Counter, dispatches | `pool`, `worker` (base URL), `dp_rank` (rank or `none`) | HTTP routers dispatch a request, after DP rank mapping. | [#3142] |
 | `mesh_route_cache_tokens_total` | Counter, tokens | `pool` (`regular` or `prefill`), `kind`: `prompt`, `cached` | HTTP routers; the response reported cached tokens. Any policy. | [#3142] |
 | `mesh_route_cache_estimate_tokens_total` | Counter, tokens | `pool`, `kind`: `prompt`, `estimated`, `actual` | The same, when the policy also estimated a hit; today only `cache_aware`. | [#3142] |
@@ -74,9 +89,9 @@ Histogram buckets:
 
 `no_healthy_workers` exists for every policy: no candidate is healthy, so no
 worker is selected. The policy counts it when none of its candidates is
-healthy. From [#3213], the router also counts it once, under the pool's policy,
-when the health filter leaves no candidate or the pool has no worker, since
-the policy then never runs. Every branch that selects a worker also records the
+healthy. The router counts it once, under the pool's policy, when the health
+filter leaves no candidate or the pool has no worker, since the policy then
+never runs. Every branch that selects a worker also records the
 [selected worker's active requests](#selected-workers-active-requests);
 "Samples" lists what else the decision adds beyond `mesh_route_branch_total`.
 Defaults are the CLI defaults.
@@ -142,9 +157,22 @@ With N turns per session and stable workers, the hit rate approaches
 (N - 1) / N. `rebind` points at worker churn; a router restart makes every
 session `new` again. Each pool that runs `dp_sticky` records its own result.
 
+### Worker changes
+
+`mesh_session_worker_change_total` counts the session requests that run on a
+different worker than the previous request of the same session. The worker is
+the one the request is dispatched to, after DP rank mapping, so ranks behind
+one URL are different workers. `rebind` and `expired` name the affinity result
+that moved the session; an expired session reassigned to its old worker counts
+nothing. `rank_mapping` means the pin held, but
+`--atom-pd-rank-mapping-policy idx2idx` mapped the prefill request to a
+different DP rank than the previous one. A session that moves leaves its KV
+cache on the old worker. The HTTP routers and the external-processing PD
+executor record it; gRPC routers do not.
+
 ### Router estimate and engine-reported cached tokens
 
-`kind="cached"` is the engine's own count, read from the response usage
+Recorded from [#3142]. `kind="cached"` is the engine's own count, read from the response usage
 (`usage.prompt_tokens_details.cached_tokens`,
 `usage.input_tokens_details.cached_tokens` or `usage.cache_read_input_tokens`).
 It is recorded on the pool that ran the prompt, `prefill` or `regular`, never
@@ -169,10 +197,10 @@ the engines' own metrics, available through `/engine_metrics` (for ATOM, see
 
 ### DP ranks
 
-`mesh_selected_dp_rank_total` counts dispatches after the router maps the
-selection to a DP rank. `worker` is the base URL, which ranks behind one
-endpoint share; `dp_rank` is `none` for workers without ranks. Uneven counts
-across ranks of one endpoint show rank skew.
+Recorded from [#3142]. `mesh_selected_dp_rank_total` counts dispatches after
+the router maps the selection to a DP rank. `worker` is the base URL, which
+ranks behind one endpoint share; `dp_rank` is `none` for workers without ranks.
+Uneven counts across ranks of one endpoint show rank skew.
 
 ## Example queries
 
@@ -191,7 +219,15 @@ sum by (pool) (rate(mesh_session_affinity_total{result="hit"}[5m]))
   / sum by (pool) (rate(mesh_session_affinity_total[5m]))
 ```
 
-Engine-reported cache hit rate, and the router's estimate bias:
+Session worker changes per session request:
+
+```promql
+sum by (pool, reason) (rate(mesh_session_worker_change_total[5m]))
+  / ignoring (reason) group_left
+    sum by (pool) (rate(mesh_session_affinity_total[5m]))
+```
+
+Engine-reported cache hit rate, and the router's estimate bias, from [#3142]:
 
 ```promql
 sum by (pool) (rate(mesh_route_cache_tokens_total{kind="cached"}[5m]))
@@ -216,9 +252,7 @@ differences, for example hit rate = increase of `hit` / increase of all results.
 
 An excerpt of `/metrics` from a local run: 2 prefill and 2 decode mock
 workers, `--prefill-policy cache_aware --decode-policy dp_sticky`, 3 sessions
-of 4 chat turns with a growing prompt. The mock workers report 100 prompt
-tokens, 60 of them cached, for every request, so the error values only
-illustrate the format.
+of 4 chat turns with a growing prompt.
 
 ```text
 mesh_route_branch_total{pool="prefill",policy="cache_aware",branch="relocate"} 3
@@ -235,15 +269,6 @@ mesh_route_prefix_match_ratio_count{pool="prefill",policy="cache_aware"} 12
 mesh_route_selected_worker_active_requests_sum{pool="prefill",policy="cache_aware",branch="affinity"} 0
 mesh_route_selected_worker_active_requests_count{pool="prefill",policy="cache_aware",branch="affinity"} 9
 mesh_route_selected_worker_active_requests_count{pool="prefill",policy="cache_aware",branch="relocate"} 3
-mesh_route_cache_tokens_total{pool="prefill",kind="prompt"} 1200
-mesh_route_cache_tokens_total{pool="prefill",kind="cached"} 720
-mesh_route_cache_estimate_tokens_total{pool="prefill",kind="prompt"} 1100
-mesh_route_cache_estimate_tokens_total{pool="prefill",kind="estimated"} 710
-mesh_route_cache_estimate_tokens_total{pool="prefill",kind="actual"} 660
-mesh_route_cache_estimate_error_ratio_sum{pool="prefill"} 0.5
-mesh_route_cache_estimate_error_ratio_count{pool="prefill"} 11
-mesh_selected_dp_rank_total{pool="prefill",worker="http://127.0.0.1:20787",dp_rank="none"} 8
-mesh_selected_dp_rank_total{pool="prefill",worker="http://127.0.0.1:20786",dp_rank="none"} 4
 ```
 
 Reading it:
@@ -255,11 +280,8 @@ Reading it:
   each branch's `_count` matches its decision count. All values are 0 because
   requests ran one at a time.
 - The `dp_sticky` hit rate is 9 / 12 = 75%: each session's first turn is `new`.
-- The engines reported 720 / 1200 = 60% of prompt tokens cached. 11 decisions
-  carried an estimate: the 9 `affinity` decisions and the 2 relocations that
-  happened to pick the best-match worker. The router estimated 710 tokens
-  where the engines reported 660, a bias of +50 / 1100 = +4.5%.
+  No session changed workers, so `mesh_session_worker_change_total` has no
+  line.
 
 [#3141]: https://github.com/ROCm/ATOM/pull/3141
 [#3142]: https://github.com/ROCm/ATOM/pull/3142
-[#3213]: https://github.com/ROCm/ATOM/pull/3213
