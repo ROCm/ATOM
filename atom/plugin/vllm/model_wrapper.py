@@ -360,6 +360,45 @@ def _patch_required_act_dtype_post_load_hooks(
     return patched
 
 
+def _maybe_register_v41_state_checkpoints(vllm_config) -> None:
+    """Register V4.1's state-checkpoint layers when prefix caching runs with
+    `--mamba-cache-mode align` (`v41_state_checkpoints_requested`).
+
+    Off otherwise: the layers make the pool hybrid, which changes how vLLM
+    sizes and splits it. Prefix caching and LMCache offload need them on.
+    """
+    from atom.plugin.vllm.deepseek_v41_state_checkpoint import (
+        register_deepseek_v41_state_checkpoint_layers,
+        v41_state_checkpoints_requested,
+    )
+
+    if not v41_state_checkpoints_requested(vllm_config):
+        return
+    from atom.plugin.vllm.scheduler import v41_scheduler_patches_missing
+
+    missing = v41_scheduler_patches_missing()
+    if missing:
+        raise ValueError(
+            "DeepSeek-V4.1 state checkpoints (prefix caching) need "
+            f"ATOM's patch on vLLM's Scheduler.{', Scheduler.'.join(missing)}, "
+            "which this vLLM does not carry; unpatched, local hits are not capped "
+            "to a checkpoint and prefill chunks do not end on one"
+        )
+    scheduler_config = getattr(vllm_config, "scheduler_config", None)
+    if getattr(vllm_config, "speculative_config", None) is not None and getattr(
+        scheduler_config, "async_scheduling", False
+    ):
+        # Checkpoint keeps are placed from the CPU's computed count, which
+        # async speculative scheduling advances optimistically (as if every
+        # draft were accepted), so they would land on unwritten boundaries.
+        raise ValueError(
+            "DeepSeek-V4.1 prefix caching with speculative decoding needs "
+            "--no-async-scheduling"
+        )
+
+    register_deepseek_v41_state_checkpoint_layers(vllm_config)
+
+
 class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
     # forced_model_arch: str | None = None
 
@@ -371,6 +410,12 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         from atom.config import get_current_atom_config, use_custom_atom_config
 
         _set_framework_backbone("vllm")
+        # Before anything below can normalise `hf_config` for the model.
+        from atom.plugin.vllm.kv_transfer.offload_config import (
+            remember_page_geometry,
+        )
+
+        remember_page_geometry(vllm_config)
 
         self.cache_config = vllm_config.cache_config
         self.device_config = vllm_config.device_config
@@ -690,10 +735,13 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         if self._is_deepseek_v4:
             from atom.plugin.vllm.deepseek_v4_bridge import (
                 ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME,
+                bind_deepseek_v4_proxy_cache_views,
+                check_deepseek_v4_model_runner,
                 deepseek_v4_draft_proxy_layer_name,
                 register_deepseek_v4_proxy_layer,
             )
 
+            check_deepseek_v4_model_runner(vllm_config, is_mtp=self._is_deepseek_v4_mtp)
             self._deepseek_v4_proxy_layer_name = (
                 deepseek_v4_draft_proxy_layer_name(self.atom_config.hf_config)
                 if self._is_deepseek_v4_mtp
@@ -702,7 +750,7 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             # The MTP draft's layers live in the target's slot, as natively:
             # its proxy only carries the drafter's metadata and reuses the
             # target proxy's KV, so vLLM gives it no pages of its own.
-            register_deepseek_v4_proxy_layer(
+            proxy = register_deepseek_v4_proxy_layer(
                 vllm_config,
                 self._deepseek_v4_proxy_layer_name,
                 kv_sharing_target_layer_name=(
@@ -710,6 +758,14 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
                     if self._is_deepseek_v4_mtp
                     else None
                 ),
+            )
+            # The metadata builder reaches the model only through the proxy,
+            # and has to bind before the first forward under Model Runner V2.
+            proxy._atom_v4_bind = functools.partial(
+                bind_deepseek_v4_proxy_cache_views,
+                self.model,
+                vllm_config,
+                self._deepseek_v4_proxy_layer_name,
             )
             if not self._is_deepseek_v4_mtp:
                 from atom.plugin.vllm.deepseek_v4_state_checkpoint import (
@@ -749,6 +805,10 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             # capture and the first forward.
             enforce_deepseek_v41_constraints(vllm_config)
             register_deepseek_v41_proxy_layer(vllm_config)
+            # After the proxy, before the builder: the checkpoint layers are
+            # what make the pool hybrid, and both the group split and the
+            # builder's sizing read them.
+            _maybe_register_v41_state_checkpoints(vllm_config)
             self._deepseek_v41_builder = make_deepseek_v41_metadata_builder(
                 self.atom_config,
                 vllm_config,
@@ -769,6 +829,9 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             if proxy is not None:
                 proxy._atom_v41_model = self.model
                 proxy._atom_v41_builder = self._deepseek_v41_builder
+                # The KV-transfer connector's handle on this wrapper at
+                # `register_kv_caches`, before any forward has run.
+                proxy.atom_v41_owner = self
 
     # Attributes whose writes on the outer model must propagate to the
     # inner model so vLLM's weight-sharing reaches the forward path.

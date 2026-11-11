@@ -14,6 +14,7 @@ from itertools import pairwise
 
 import torch
 
+from atom.distributed.group_agreement import group_agree
 from atom.models.deepseek_v4.mono.binding import input_identity
 from atom.models.deepseek_v4.mono.cache import V4CacheAdapter
 from atom.models.deepseek_v4.mono.contract import (
@@ -24,7 +25,7 @@ from atom.models.deepseek_v4.mono.contract import (
 from atom.models.deepseek_v4.mono.engine import V4MonoEngine
 from atom.models.deepseek_v4.mono.profile import ORDINARY_PROFILE
 from atom.models.deepseek_v4.mono.runner import V4MonoDecodeRunner
-from atom.mono.runtime.consensus import MonoUnsupported, bind_agreed, tp_agree
+from atom.mono.runtime.consensus import MonoUnsupported, bind_agreed
 
 logger = logging.getLogger("atom")
 
@@ -236,13 +237,13 @@ class V4MonoSession:
         """
         # Every TP rank calls this, including an empty local batch. A local
         # early return would strand peers in the reader/producer consensus.
-        if tp_agree(empty, self.group):
+        if group_agree(empty, self.group):
             return
-        if not tp_agree(not empty, self.group):
+        if not group_agree(not empty, self.group):
             self.disabled = True
             self._draft_context = self._draft_frontier = None
             raise MonoUnsupported("state maintenance presence differs across TP ranks")
-        if tp_agree(not self._has_draft_resources(), self.group):
+        if group_agree(not self._has_draft_resources(), self.group):
             # Pre-KV startup/native-only maintenance has no joint readers.
             write()
             return
@@ -311,7 +312,9 @@ class V4MonoSession:
         draft_runner = getattr(self, "draft_runner", None)
         # Registration can fail on just one rank. All ranks must choose the
         # same retirement branch, including eager-only draft owners/readers.
-        if not tp_agree(not self._has_draft_resources(), getattr(self, "group", None)):
+        if not group_agree(
+            not self._has_draft_resources(), getattr(self, "group", None)
+        ):
 
             def retire_draft_graphs():
                 if self.disabled or completion is None:
@@ -1280,7 +1283,7 @@ class V4MonoSession:
                     from atom.mono.runtime.aux_taps import bind_aux_taps
                     from atom.spec_decode.dspark_proposer import DSparkProposer
 
-                    spec = drafter._aux_capture_spec(self.model)
+                    spec = drafter._aux_capture_spec()
                     if (
                         spec is None
                         or spec.capture != "output"
@@ -1522,6 +1525,10 @@ class V4MonoSession:
                 validate_device_values=False,
                 supported=True,
             )
+            # Forward consumes the eager/lane selection. A continuing C3 tail
+            # still uses the C4 capture key, but updates only the C3 buffers;
+            # reselect before the engine decides whether to replay FULL C4.
+            self.select_graph_execution(graph_key, self.adapter.graph_layout())
             self._remember_continuation(graph_key, batch_contract)
             width = graph_key[0] * graph_key[1]
             self.fast_publications_by_width[width] = (
@@ -1585,7 +1592,7 @@ class V4MonoSession:
         except Exception as error:  # noqa: BLE001
             self.refusal = str(error)
             supported = False
-        if not tp_agree(supported, self.group):
+        if not group_agree(supported, self.group):
             reason = self.refusal or (
                 "tp_peer_refused" if supported else "unsupported_contract"
             )
@@ -1889,8 +1896,8 @@ class V4MonoSession:
             for source, bucket in candidates:
                 key = (bucket.width, bucket.tokens_per_seq, bucket.ordinal)
                 present = key in original_graphs
-                all_present = tp_agree(present, self.group)
-                all_absent = tp_agree(not present, self.group)
+                all_present = group_agree(present, self.group)
+                all_absent = group_agree(not present, self.group)
                 if not (all_present or all_absent):
                     raise MonoUnsupported("TP ranks disagree on prepared lane graphs")
                 if all_present:

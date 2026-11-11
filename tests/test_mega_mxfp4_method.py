@@ -17,18 +17,25 @@ def test_mega_method_is_mxfp4_specialization():
     assert issubclass(moe_mod.MegaMxfp4MoEMethod, moe_mod.Mxfp4MoEMethod)
 
 
+@pytest.mark.parametrize("sp", [False, True])
 @pytest.mark.parametrize("backend_name", ["standard", "mega"])
-def test_mxfp4_method_selection(monkeypatch, backend_name):
+def test_mxfp4_method_selection(monkeypatch, backend_name, sp):
     standard_method = object()
     mega_method = object()
     config = SimpleNamespace(moe_backend=backend_name)
     monkeypatch.setattr(moe_mod, "get_current_atom_config", lambda: config)
+    monkeypatch.setattr(moe_mod, "sp_is_enabled", lambda: sp)
     monkeypatch.setattr(moe_mod, "Mxfp4MoEMethod", lambda *_args: standard_method)
     monkeypatch.setattr(moe_mod, "MegaMxfp4MoEMethod", lambda *_args: mega_method)
 
     selected = moe_mod._make_mxfp4_moe_method(object(), object())
 
-    assert selected is (mega_method if backend_name == "mega" else standard_method)
+    # Under SP, `mega` is SP MegaMoE over the standard method's weights.
+    use_mega = backend_name == "mega" and not sp
+    assert selected is (mega_method if use_mega else standard_method)
+    if sp:
+        # Nor does it hold the layer to the EP backend's requirements.
+        moe_mod.FusedMoE._validate_moe_backend(SimpleNamespace(quant_method=selected))
 
 
 @pytest.mark.parametrize("fp8_activations", [False, True])

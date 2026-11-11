@@ -23,7 +23,7 @@ import pytest
 
 BACKENDS = Path(__file__).resolve().parents[1] / "atom/model_ops/attentions"
 
-# What `EagleProposer.propose` adds when it takes the fused branch.
+# What `EagleProposer._propose` adds when it takes the fused branch.
 FUSED_KWARGS = {"update_context_lens", "positions_out"}
 
 

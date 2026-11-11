@@ -13,6 +13,30 @@ from torch import nn
 from atom.model_ops.v4_kernels.inverse_rope import inverse_rope_inplace
 
 
+def rope_frequencies(
+    dim, *, base, original_length=0, factor=1.0, beta_fast=32, beta_slow=1
+):
+    """Each rotated pair's frequency, FP32 [dim // 2]; YaRN when ``original_length`` > 0."""
+    # Keep frequency construction in FP32, including on a BF16 model context.
+    frequencies = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+    if original_length > 0:
+
+        def corrected_dim(rotations):
+            return (
+                dim
+                * math.log(original_length / (rotations * 2 * math.pi))
+                / (2 * math.log(base))
+            )
+
+        low = max(math.floor(corrected_dim(beta_fast)), 0)
+        high = min(math.ceil(corrected_dim(beta_slow)), dim - 1)
+        ramp = (
+            (torch.arange(dim // 2, dtype=torch.float32) - low) / max(high - low, 1e-3)
+        ).clamp(0, 1)
+        frequencies = frequencies / factor * ramp + frequencies * (1 - ramp)
+    return frequencies
+
+
 class RotaryEmbedding(nn.Module):
     def __init__(
         self,
@@ -26,26 +50,14 @@ class RotaryEmbedding(nn.Module):
         beta_slow=1,
     ):
         super().__init__()
-        # Keep frequency construction in FP32, including on a BF16 model context.
-        frequencies = 1.0 / (
-            base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim)
+        frequencies = rope_frequencies(
+            dim,
+            base=base,
+            original_length=original_length,
+            factor=factor,
+            beta_fast=beta_fast,
+            beta_slow=beta_slow,
         )
-        if original_length > 0:
-
-            def corrected_dim(rotations):
-                return (
-                    dim
-                    * math.log(original_length / (rotations * 2 * math.pi))
-                    / (2 * math.log(base))
-                )
-
-            low = max(math.floor(corrected_dim(beta_fast)), 0)
-            high = min(math.ceil(corrected_dim(beta_slow)), dim - 1)
-            ramp = (
-                (torch.arange(dim // 2, dtype=torch.float32) - low)
-                / max(high - low, 1e-3)
-            ).clamp(0, 1)
-            frequencies = frequencies / factor * ramp + frequencies * (1 - ramp)
         angles = torch.outer(torch.arange(max_position), frequencies)
         frequencies = torch.polar(torch.ones_like(angles), angles)
         # The cached AITER API expects contiguous real caches. BF16, as every

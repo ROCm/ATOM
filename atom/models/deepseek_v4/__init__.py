@@ -73,14 +73,15 @@ from atom.model_loader.weight_utils import local_model_dir
 # its dynamic-shape internals from Dynamo / fake-tensor mode.
 from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
 from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
+    FP4_GFX950_OPUS,
     FP4_GFX1250_NATURAL,
-    fp4_indexer_layout_for_arch,
 )
 from atom.model_ops.communication_op import (
     tensor_model_parallel_all_reduce,
 )
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.indexer import (
+    MFMA,
     NATURAL,
     PRESHUFFLE,
     IndexCache,
@@ -1453,18 +1454,24 @@ class Indexer(nn.Module):
         self._indexer_fp4 = fp4_indexer_enabled(
             get_current_atom_config().index_cache_dtype
         )
-        self.quant_mode = "fp4" if self._indexer_fp4 else "per_row_fp8"
-        # `quant_mode` says how values are quantized; `indexer_layout` says how
-        # those values are physically stored and therefore which scorer ABI
-        # consumes them. Both gfx950 and gfx1250 use quant_mode="fp4", but their
-        # preshuffled/natural layouts are intentionally incompatible.
+        # The writer's `quant_mode` must match the scorer's `indexer_layout`:
+        # AITER's generic "fp4" writes natural rows, regardless of preshuffle.
         self.indexer_layout = (
-            fp4_indexer_layout_for_arch(get_gfx_runtime())
-            if self._indexer_fp4
-            else "fp8"
+            get_current_atom_config().index_cache_layout if self._indexer_fp4 else "fp8"
         )
         self._layout = (
-            NATURAL if self.indexer_layout == FP4_GFX1250_NATURAL else PRESHUFFLE
+            NATURAL
+            if self.indexer_layout == FP4_GFX1250_NATURAL
+            else MFMA if self.indexer_layout == FP4_GFX950_OPUS else PRESHUFFLE
+        )
+        self.quant_mode = (
+            "fp4_gfx950_opus"
+            if self._layout == MFMA
+            else (
+                "fp4_gfx950_flydsl"
+                if self._indexer_fp4 and self._layout == PRESHUFFLE
+                else "fp4" if self._indexer_fp4 else "fp8_per_row"
+            )
         )
         self.compressor = Compressor(
             args,
@@ -1521,7 +1528,8 @@ class Indexer(nn.Module):
             sentinels (kernel-native: prefill `top_k_per_row_prefill` and
             decode `top_k_per_row_decode` both write -1 in the tail).
             Consumer (`csa_translate_pack`) skips negative entries via its
-            `topk >= 0` write mask.
+            `topk >= 0` write mask. Rank-major under a striped row split
+            (`indexer_score_topk`).
         """
         q_quant, weights, q_scale = self.forward_pre(
             x_full, qr_full, positions, qr_full_scale
@@ -1633,6 +1641,10 @@ class Indexer(nn.Module):
         past its visibility -- the layout `csa_translate_pack` consumes. No
         host-side short-circuit for an empty context: a row whose bound is 0
         gets all -1 from the top-k itself, so nothing is baked into a graph.
+        Under the TP row split the selection carries up to tp-1 tail rows past
+        `T` (`IndexRows.out_rows`), dropped here; a striped split's rows stay
+        rank-major, the `[:T]` view over all of its slots, which
+        `csa_translate_pack` reads through the split.
         """
         return score_topk(
             q_quant if q_scale is None else (q_quant, q_scale),
@@ -1641,7 +1653,7 @@ class Indexer(nn.Module):
             get_forward_context().attn_metadata.index_rows,
             topk=topk,
             weight_scale=self._weights_scale,
-        )
+        )[: weights.shape[0]]
 
     @property
     def index_cache(self) -> IndexCache:
@@ -1654,6 +1666,8 @@ class Indexer(nn.Module):
             return IndexCache(
                 self.kv_cache, self.kv_scale, self.kv_cache.size(1), NATURAL
             )
+        if self._layout == MFMA:
+            return IndexCache(self.kv_cache, self.kv_scale, self.kv_cache.size(2), MFMA)
         # The row-group readers' packed-dword scale contract (N_PHYS == 1)
         # holds at 64 rows a block only: fail loudly on any other.
         assert self.kv_cache.size(3) == 64, (
@@ -2666,6 +2680,8 @@ class DeepseekV4Attention(nn.Module):
             output of `Indexer.forward_batched`. The leading `valid_k[t]`
             cells are always >= 0; trailing cells are -1 sentinels never
             read by csa_translate_pack (filtered by `k_offs < valid_k`).
+            Rank-major under a striped row split, read through
+            `attn_md.index_rows.split`.
           positions: [total_tokens] int — global token positions; forwarded
             to csa_translate_pack so the kernel can compute per-token
             `valid_k` inline.
@@ -2693,6 +2709,8 @@ class DeepseekV4Attention(nn.Module):
             # — kernel loads from the per-token buffer.
             skip_buf = attn_md.skip_prefix_len_csa
             window_size = 0
+        index_rows = getattr(attn_md, "index_rows", None)
+        stripe = index_rows.split if index_rows is not None else None
 
         csa_translate_pack(
             topk_local_raw,
@@ -2705,6 +2723,7 @@ class DeepseekV4Attention(nn.Module):
             envelope_rows=attn_md.envelope_rows,
             csa_block_capacity=csa_block_capacity,
             window_size=window_size,
+            stripe=stripe,
             prefix=f"{self.layer_name}.csa_translate_pack",
         )
 

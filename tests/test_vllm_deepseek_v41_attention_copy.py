@@ -39,7 +39,7 @@ PLUGIN = ROOT / "atom/plugin/vllm/v41_core_overrides.py"
 
 # sha256 of core's `Attention.forward` and `_attend`, comments and blank
 # lines stripped.
-CORE_PREPARE_DIGEST = "6e6ba60ac60f4825"
+CORE_PREPARE_DIGEST = "50a174931df035a4"
 CORE_FORWARD_DIGEST = "efcc7dbf2f688954"
 
 
@@ -109,6 +109,72 @@ def test_plugin_forward_passes_fused_quant_into_capture_break(
         attn_out, rope, queries.positions if bounded_queries else positions
     )
     assert output is attention._project_out.return_value
+
+
+def test_plugin_forward_carries_mx_scale_across_the_break_as_bytes(
+    plugin_attention,
+):
+    """vLLM's weak-ref op refuses float8_e8m0fnu (ScalarType 44), so the MX
+    scale must reach the break as uint8 over the same storage."""
+    calls = []
+
+    class Attention:
+        heads = 2
+        head_dim = 16
+
+        def _atom_v41_attend_block(self, *args, **kwargs):
+            calls.append((args, kwargs))
+
+    attention = Attention()
+    attention._project_out = Mock(return_value=object())
+    hidden = torch.empty(1, 2, 32, dtype=torch.bfloat16)
+    hidden_fp8 = torch.empty_like(hidden, dtype=torch.float8_e4m3fn)
+    scale = torch.empty(1, 2, 1, dtype=torch.float8_e8m0fnu)
+    cache = SimpleNamespace(rope_positions=Mock(return_value=object()))
+
+    plugin_attention._forward(
+        attention, hidden, scale, cache, object(), object(), None, hidden_fp8=hidden_fp8
+    )
+
+    ((args, kwargs),) = calls
+    crossed = args[2]  # self is bound, so args starts at attn_out
+    assert crossed.dtype == torch.uint8
+    assert crossed.data_ptr() == scale.data_ptr() and crossed.shape == scale.shape
+    assert args[7] is hidden_fp8
+    assert kwargs == {"hidden_scale_dtype": torch.float8_e8m0fnu}
+
+
+def test_plugin_attend_block_restores_the_mx_scale(plugin_attention):
+    class ReachedSelection(Exception):
+        pass
+
+    hidden = torch.empty(1, 2, 32, dtype=torch.bfloat16)
+    hidden_fp8 = torch.empty_like(hidden, dtype=torch.float8_e4m3fn)
+    scale = torch.empty(1, 2, 1, dtype=torch.float8_e8m0fnu)
+    attention = SimpleNamespace(
+        _fork_compress=Mock(return_value=True),
+        project_qkv=Mock(return_value=(object(), object())),
+        qk_norm=Mock(return_value=(object(), object(), object())),
+        _fork_select=Mock(side_effect=ReachedSelection),
+    )
+    cache = SimpleNamespace(current_step=object())
+    with pytest.raises(ReachedSelection):
+        plugin_attention._attend_block(
+            attention,
+            None,
+            hidden,
+            scale.view(torch.uint8),
+            cache,
+            object(),
+            object(),
+            None,
+            hidden_fp8,
+            hidden_scale_dtype=torch.float8_e8m0fnu,
+        )
+    (qkv_input, restored), _ = attention.project_qkv.call_args
+    assert qkv_input is hidden_fp8
+    assert restored.dtype == torch.float8_e8m0fnu
+    assert restored.data_ptr() == scale.data_ptr()
 
 
 @pytest.mark.parametrize("fused_quant", [False, True])
@@ -227,7 +293,7 @@ def test_core_prepare_has_not_moved_under_its_copy():
     reader makes that class of change silent instead, so it is pinned.
     """
     body = _core_prepare()
-    assert len(body.split(NEWLINE)) > 80, "the _prepare marker matched too little"
+    assert len(body.split(NEWLINE)) > 60, "the _prepare marker matched too little"
     digest = hashlib.sha256(body.encode()).hexdigest()[:16]
     assert digest == CORE_PREPARE_DIGEST, (
         "`DeepseekV41MetadataBuilder._prepare` has changed. The vLLM plugin "
@@ -261,11 +327,14 @@ def test_the_copy_still_covers_both_dispatch_arms():
             ("forward_hidden",),
             "e5d8ebd181754862",
         ),
+        # Core's `start` / `join` skip the lookup on a step the model's decode
+        # round serves (`EngramStep.served_by_round`); not ported: the plugin's
+        # runner has no decode round, so its steps are never served by one.
         (
             "atom/model_ops/engram/device/staging.py",
             "EngramStaging",
             ("start", "consume", "join"),
-            "7d1dcc8553e48b9d",
+            "74eade6acaa9b896",
         ),
     ],
 )

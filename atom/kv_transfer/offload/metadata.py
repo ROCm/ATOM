@@ -21,6 +21,7 @@ from atom.kv_transfer.disaggregation.types import (
     LoadOperationId,
     ReqId,
     SaveOperationId,
+    StateTouchId,
 )
 
 
@@ -176,6 +177,9 @@ class LMCacheReqMeta:
     # reclaim it.
     dispatched_at: float | None = None
     dispatch_clock: str | None = None
+    # A save covering KV this step's forward computes: the worker submits it
+    # behind that forward (`after_forward`) instead of before it.
+    after_forward: bool = False
 
 
 class LMCacheOffloadMetadata(ConnectorMetadata):
@@ -197,6 +201,7 @@ class LMCacheOffloadMetadata(ConnectorMetadata):
         "lookup_requests_in_step",
         "state_loads",
         "state_stores",
+        "state_touches",
     )
 
     def __init__(self) -> None:
@@ -215,6 +220,9 @@ class LMCacheOffloadMetadata(ConnectorMetadata):
         # generation) is what the source-release and index reports carry back to
         # settle the pin and index the hash.
         self.state_stores: list[tuple] = []
+        # StateTouchId per voted state image, refreshed and reported by each
+        # worker.
+        self.state_touches: list[StateTouchId] = []
 
     def add_request(self, meta: LMCacheReqMeta) -> None:
         self.requests.append(meta)

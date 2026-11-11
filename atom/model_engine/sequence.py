@@ -10,7 +10,7 @@ from typing import Any, NamedTuple
 
 import numpy as np
 
-from atom.sampling_params import SamplingParams
+from atom.sampling_params import UNCONSTRAINED, SamplingParams
 
 
 def new_token_ids(token_ids=()) -> array.array:
@@ -292,10 +292,6 @@ class Sequence:
         # every defaulting Sequence would be a mutable default in all but name.
         if sampling_params is None:
             sampling_params = SamplingParams()
-        if num_draft_tokens and sampling_params.logprobs:
-            raise ValueError(
-                "Token logprobs are not supported with speculative decoding"
-            )
         self.block_size = block_size
         self.id = id or next(Sequence.counter)
         self.external_request_id = request_id
@@ -418,6 +414,11 @@ class Sequence:
         # `1 + accepted` puts it, and there the grid is unreachable — see
         # `BlockManager.checkpointers_at`, which measures spacing from here.
         self.last_checkpoint_pos = 0
+        # The furthest prompt position whose checkpoint was decided when its
+        # chunk was scheduled (`BlockManager.checkpoint_when_scheduled`) rather
+        # than when it retired. Retire files nothing at or before it: with
+        # forwards in flight the slot has moved on by then.
+        self.scheduled_checkpoint_pos = 0
         self.prefix_cache_hit_tokens = 0
         # True iff this seq is mid-prefill (chunked prefill produced KV for
         # some prompt tokens but not all). Maintained by the scheduler:
@@ -471,11 +472,26 @@ class Sequence:
         # would never fire for the prefill blocks; this flag does.
         self.prefix_hashes_published = False
         self.return_logprobs = bool(getattr(sampling_params, "logprobs", False))
+        # The channel `tool_choice="required"` must open, and how far the
+        # committed output has got towards it (see `RequiredChannel`). Advanced
+        # by the scheduler over each token it commits, so on a deferred step it
+        # trails the GPU's copy by one forward; the runner reads this one only
+        # for rows whose last tokens the host already has.
+        self.required_channel = sampling_params.required_channel
+        self.required_channel_state = (
+            UNCONSTRAINED if self.required_channel is None else 0
+        )
         # One entry per completion token, so the same reason `token_ids` is an
         # array applies: a list would box a PyFloat per token and hand the
         # collector a slot to walk for each one. `json.dumps` is the only
         # consumer that needs a list, and it converts at its own boundary.
         self.logprobs: array.array = array.array("d")
+        self.top_logprobs = sampling_params.top_logprobs
+        self.structured_cursor = 0
+        self.structured_started = False
+        self.json_schema = sampling_params.json_schema
+        self.structured_reasoning_end = sampling_params.structured_reasoning_end
+        self.structured_tool_format = sampling_params.structured_tool_format
         # stream callback
         self.stream_callback = stream_callback
         # The completion half of `token_ids`, kept in step with it by every

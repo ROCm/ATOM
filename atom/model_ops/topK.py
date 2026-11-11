@@ -4,10 +4,12 @@
 from functools import lru_cache
 
 import torch
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from atom.config import get_current_atom_config
 from atom.model_ops.fused_moe.expert_layout import SharedExpertMode
+from atom.model_ops.triton_topk_softmax import triton_topk_softmax
 from atom.model_ops.utils import _has_module
 from atom.quant_spec import fuses_mxfp8_shared_into_mxfp4
 from atom.utils import envs
@@ -201,6 +203,52 @@ def reassign_gathered_shared_ids(layer, topk_ids: torch.Tensor) -> None:
     topk_ids[:, top_k:] = total_topk_ids[:rows, top_k:]
 
 
+# Rows per CU up to which `triton_topk_softmax` is faster than AITER's
+# `topk_softmax`, measured per architecture; others run AITER.
+TRITON_TOPK_SOFTMAX_MAX_ROWS_PER_CU = {"gfx950": 20}
+
+
+@lru_cache
+def triton_topk_softmax_rows(
+    num_experts: int,
+    topk: int,
+    renormalize: bool,
+    num_fused_shared_experts: int = 0,
+    fused_shared_experts_scoring_func: str | None = None,
+) -> int | None:
+    """The most rows a `rocm_aiter_topk_softmax` launch of this routing runs
+    `triton_topk_softmax` for; None: always AITER. The shapes are those of
+    AITER's fused `topkGatingSoftmax` from top-4 up (at top-1 / top-2 Triton is
+    slower near the cutoff) and from 32 experts, the fewest measured for speed.
+    Under RapidServe's CU masks it counts the smallest stream's CUs.
+    `get_cu_num()` ignores an `HSA_CU_MASK` set outside ATOM; set `CU_NUM`
+    then."""
+    scoring_func = fused_shared_experts_scoring_func
+    num_shared = 0 if scoring_func is None else num_fused_shared_experts
+    if not (
+        scoring_func in (None, "sigmoid")
+        and 32 <= num_experts <= 512
+        and num_experts & (num_experts - 1) == 0
+        and 4 <= topk <= 32
+        and num_shared in (0, 1, 2, 4, 8)
+    ):
+        return None
+    per_cu = TRITON_TOPK_SOFTMAX_MAX_ROWS_PER_CU.get(get_gfx_runtime())
+    if per_cu is None:
+        return None
+    cus = get_cu_num()
+    config = get_current_atom_config()
+    if config.enable_rapidserve and config.disagg_constrained:
+        # model_runner imports this module. To move to atom/config.py:
+        # https://github.com/ROCm/ATOM/issues/2863
+        from atom.model_engine.model_runner import RapidServeModelRunner
+
+        # A prefill stream gets fraction f of the CUs, its decode stream the rest.
+        fractions = RapidServeModelRunner._CU_POOL_FRACTIONS
+        cus = round(cus * min(min(f, 1 - f) for f in fractions))
+    return per_cu * cus
+
+
 def rocm_aiter_topk_softmax_impl(
     gating_output: torch.Tensor,
     topk: int,
@@ -216,7 +264,6 @@ def rocm_aiter_topk_softmax_impl(
     device = gating_output.device
     if num_fused_shared_experts > 0:
         total_topk_weights, total_topk_ids = topk_meta_rows(token)
-        # The kernel scores the shared columns too when given a scoring func.
         topk_weights = total_topk_weights
         topk_ids = total_topk_ids[:, :topk]
     else:
@@ -225,21 +272,44 @@ def rocm_aiter_topk_softmax_impl(
     token_expert_indicies = torch.empty(
         gating_output.shape[0], topk, dtype=torch.int32, device=gating_output.device
     )
+    num_scored_shared = (
+        0 if fused_shared_experts_scoring_func is None else num_fused_shared_experts
+    )
+    # Auto-gate: runs Triton for small batches on supported HW.
+    # Must call triton_topk_softmax_rows with the original scoring_func
+    # (before None→"" conversion) so that None matches properly.
+    triton_max_rows = triton_topk_softmax_rows(
+        gating_output.shape[1] - num_scored_shared,
+        topk,
+        renormalize,
+        num_scored_shared,
+        fused_shared_experts_scoring_func,
+    )
     if fused_shared_experts_scoring_func is None:
         fused_shared_experts_scoring_func = ""
         fused_shared_experts_for_kernel = 0
     else:
         fused_shared_experts_for_kernel = num_fused_shared_experts
-    topk_softmax(
-        topk_weights,
-        topk_ids,
-        token_expert_indicies,
-        gating_output,
-        renormalize,
-        fused_shared_experts_for_kernel,
-        fused_shared_experts_scoring_func,
-        num_valid_rows,
-    )
+    if triton_max_rows is not None and token <= triton_max_rows:
+        triton_topk_softmax(
+            topk_weights,
+            topk_ids,
+            gating_output,
+            fused_shared_experts_for_kernel,
+            num_valid_rows,
+            renormalize=renormalize,
+        )
+    else:
+        topk_softmax(
+            topk_weights,
+            topk_ids,
+            token_expert_indicies,
+            gating_output,
+            renormalize,
+            fused_shared_experts_for_kernel,
+            fused_shared_experts_scoring_func,
+            num_valid_rows,
+        )
     if num_fused_shared_experts > 0:
         return total_topk_weights, total_topk_ids
     return topk_weights, topk_ids

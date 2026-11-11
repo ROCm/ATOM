@@ -60,6 +60,7 @@ class MockConfig:
             "enable_prefix_caching": False,
             "enable_log_stats": True,
             "throughput_log_interval": 10.0,
+            "throughput_log_interval_steps": 0,
             "cache_hit_rate_window": 1000,
             "enable_chunked_prefill": True,
             "enable_dynamic_chunking": False,
@@ -74,6 +75,7 @@ class MockConfig:
             "eos_token_id": 2,
             "stop_token_ids": [],
             "scheduler_delay_factor": 0.0,
+            "prefill_admit_policy": "interval",
             "speculative_config": None,
             # Scheduler.__init__ reads config.hf_config.architectures for V4
             # SWA-warmup detection; a non-V4 stub keeps that path inert.
@@ -293,6 +295,14 @@ def req_graph_recordings(monkeypatch):
     return recordings
 
 
+@pytest.fixture
+def offload_clock(monkeypatch):
+    """`state_offload`'s monotonic clock, advanced by hand."""
+    now = [1000.0]
+    monkeypatch.setattr("atom.model_engine.state_offload.monotonic", lambda: now[0])
+    return now
+
+
 @pytest.fixture(autouse=True)
 def mono_runs_on_gfx950(monkeypatch):
     """Mono's deployment checks see gfx950, the only arch its kernels are built
@@ -302,3 +312,19 @@ def mono_runs_on_gfx950(monkeypatch):
     from atom.mono.runtime import deployment
 
     monkeypatch.setattr(deployment, "_gfx", lambda: "gfx950")
+
+
+@pytest.fixture
+def mxfp4_default_backends(monkeypatch):
+    """Pin the MXFP4 linear backend to the default preshuffled ASM path.
+
+    `mxfp4_k_pad_align` and the load-time K check read the backend live
+    (`ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM`, the gfx1250 32x4 switch), so a
+    test of either must not depend on what the shell exported. Imported here
+    lazily: `atom.model_ops.linear` needs AITER.
+    """
+    from atom.model_ops import linear as linear_mod
+
+    monkeypatch.setattr(linear_mod, "use_fp4_non_shuffle_triton_gemm", lambda: False)
+    monkeypatch.setattr(linear_mod, "use_triton_gemm", lambda: False)
+    monkeypatch.setattr(linear_mod, "_mxfp4_n32k4_backend", lambda: False)

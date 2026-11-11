@@ -128,9 +128,7 @@ Tips:
   long-sequence / high-concurrency workloads (not yet supported). Give all GPUs to
   PCP instead, e.g. `-tp 1 -pcp 8`.
 - Under PCP, TBO uses a **request-boundary split** (each micro-batch is a whole
-  subset of requests) — the non-default TBO split mode — instead of the
-  token-midpoint split used without PCP. `ATOM_TBO_PREFILL_TOKEN_SPLIT`
-  therefore has no effect when PCP is enabled.
+  subset of requests) instead of the token-midpoint split used without PCP.
 - `--torch-profiler-dir ./log` can be added to collect traces for performance
   analysis.
 
@@ -171,7 +169,7 @@ Compare `-tp 4 -pcp 2` against the `-tp 8` baseline and watch **Mean TTFT** and
 output throughput; the gap widens as `--random-input-len` grows.
 
 > PCP was introduced in [ROCm/ATOM#1220](https://github.com/ROCm/ATOM/pull/1220),
-> which reported, on 8×MI308 for `-tp 4 -pcp 2` vs `-tp 8`, a **35–43%** Mean-TTFT
+> which reported, on 8×MI300X/MI300A/MI325X (gfx942) for `-tp 4 -pcp 2` vs `-tp 8`, a **35–43%** Mean-TTFT
 > reduction and up to **~49%** higher throughput on long prefill. Actual gains
 > depend on model, sequence length, and hardware.
 
@@ -179,10 +177,10 @@ output throughput; the gap widens as `--random-input-len` grows.
 
 TBO's benefit is **hardware-dependent**:
 
-- **MI308**: current testing shows PCP + TBO gives **almost no gain** over PCP
+- **MI300X/MI300A/MI325X** (gfx942): current testing shows PCP + TBO gives **almost no gain** over PCP
   alone — the overlap does not meaningfully hide the MoE communication on this
   hardware. Prefer plain PCP (`-tp 4 -pcp 2`) here.
-- **MI355**: PCP + TBO **does** deliver a speedup. Enable it with
+- **MI355X/MI350X** (gfx950): PCP + TBO **does** deliver a speedup. Enable it with
   `ATOM_PCP_MOE_MERGE=1 -tp 1 -pcp 8 --enable-tbo`.
 
 Because TBO requires `-tp 1`, compare TBO configs against the matching `-tp 1`
@@ -198,6 +196,7 @@ PCP baseline (not the `-tp 4 -pcp 2` numbers above).
 | PCP + TBO decode (`--enable-tbo all`) | Not supported (raises at startup); use `--enable-tbo` prefill-only |
 | `ATOM_PCP_MOE_MERGE=0` + `--enable-tbo` | TBO auto-disabled (warning logged) |
 | PCP + TBO with `tp > 1` | **Not supported.** May hang under long-sequence / high-concurrency workloads. TBO requires `-tp 1` (all GPUs in PCP, e.g. `-tp 1 -pcp 8`) |
+| PCP + Ulysses SP (`-sp`) | `-sp N` runs on the PCP rank dimension, so it does not combine with `-pcp` (refused at startup). Its MoE is TP-sharded across the SP ranks, and `ATOM_PCP_MOE_MERGE` is ignored. See `docs/distributed_guide.md` |
 
 PCP + TBO **prefill** is supported only with `ATOM_PCP_MOE_MERGE=1` **and
 `-tp 1`**. Decode is unchanged by PCP in all configurations.

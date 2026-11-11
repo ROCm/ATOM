@@ -314,6 +314,13 @@ class MultiConnector(KVConnectorBase):
             if callable(callback):
                 callback(req_ids)
 
+    def after_forward(self) -> None:
+        """Forward the post-forward hook (lmcache_mp same-step saves)."""
+        for connector in self._connectors:
+            callback = getattr(connector, "after_forward", None)
+            if callable(callback):
+                callback()
+
     def get_finished(self) -> KVConnectorOutput:
         recv: set = set()
         failed: set = set()
@@ -395,6 +402,11 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         methods = (getattr(c, name, None) for c in self._connectors)
         return [m for m in methods if callable(m)]
 
+    def drop_cached_kv(self) -> bool:
+        """Every sub-connector is asked, so each drops what it can."""
+        results = [bool(drop()) for drop in self._sub_methods("drop_cached_kv")]
+        return all(results)
+
     def can_detach_lookup(self, seq: Any, num_hbm_tokens: int) -> bool:
         """True only if every sub-connector with a tier lookup can detach it."""
         checks = self._sub_methods("can_detach_lookup")
@@ -419,6 +431,23 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             prefetch = getattr(connector, "prefetch_lookups", None)
             if callable(prefetch):
                 prefetch(seqs)
+
+    def offer_lookups(self, seqs: Any) -> None:
+        """Let each sub start lookups for arrived requests (input IO thread)."""
+        seqs = list(seqs)
+        for connector in self._connectors:
+            offer = getattr(connector, "offer_lookups", None)
+            if callable(offer):
+                offer(seqs)
+
+    def note_scheduled_tokens(
+        self, scheduled_seqs: Any, num_scheduled_tokens: Any
+    ) -> None:
+        """Tell each sub how far this step's forward computes each sequence."""
+        for connector in self._connectors:
+            note = getattr(connector, "note_scheduled_tokens", None)
+            if callable(note):
+                note(scheduled_seqs, num_scheduled_tokens)
 
     def __init__(self, config: Any) -> None:
         self._connectors = _build_subconnectors(config, role="scheduler")
@@ -654,6 +683,21 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         if c is None:
             return False
         return bool(c.enqueue_state_stores(stores))
+
+    def enqueue_state_touches(self, hashes) -> bool:
+        """State touches to the sub hosting the tier (`_state_tier_sub`);
+        False if none does."""
+        c = self._state_tier_sub()
+        if c is None:
+            return False
+        return bool(c.enqueue_state_touches(hashes))
+
+    def take_state_touch_verdicts(self) -> dict:
+        """`{hash: resident}` from the tier sub; empty if none."""
+        c = self._state_tier_sub()
+        if c is None:
+            return {}
+        return c.take_state_touch_verdicts()
 
     def take_state_reports(self):
         """`(indexed, failed)` from the tier sub, else two empty sets.
