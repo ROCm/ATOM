@@ -252,11 +252,36 @@ class V41AiterDecodeRunner:
             line = []
             for op, kwargs in ((ATTN_PRE, pre), (LAYER_POST, post)):
                 ok, why = aiter_gate.explain(self.ops, op, kwargs)
+                if not ok and self._step_order_only(op, kwargs):
+                    ok = True
+                    why = (
+                        f"{aiter_gate.provider_name()} in step order "
+                        "(dry query: NO_WORKLOAD)"
+                    )
                 all_ok &= ok
                 verdict = "served by" if ok else "not served:"
                 line.append(f"{_SHORT[op]} {verdict} {why}")
             routes.append("; ".join(line))
         return all_ok, _runs(routes)
+
+    def _step_order_only(self, op: str, kwargs: dict) -> bool:
+        """Whether the provider's only objection to this call is that no step is
+        open here (``NO_WORKLOAD``: "could serve, but is not ready for this
+        call").
+
+        ``_preflight`` asks every layer's two calls without running any, so the
+        provider's step cursor -- a call is served only once the step's served
+        ``attn_pre(layer_index=0)`` opened it -- declines everything but layer
+        0's ``attn_pre``. Outside a graph capture (``prepare`` refuses a width
+        first seen under one) that cursor is the provider's only ``NO_WORKLOAD``
+        rule, so a dry ``NO_WORKLOAD`` says the call is covered and would be
+        served in step order, while ``NO_SCHEMA`` / ``OUT_OF_CONTRACT`` -- what
+        this preflight exists to catch -- stay declines. Nothing is relaxed:
+        every call's recorded route is still checked after it ran (``routed``),
+        so a call that really goes native is an error under strict.
+        """
+
+        return aiter_gate.provider_reason(self.ops, op, kwargs) == "NO_WORKLOAD"
 
     def _ensure_ring_starts(self, cache) -> None:
         """Each layer's ring start in pool rows (fixed once the cache is
