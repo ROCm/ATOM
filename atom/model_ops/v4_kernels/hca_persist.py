@@ -191,15 +191,14 @@ def hca_persist_decode(
             "hca_persist: no workspace on this device and the stream is "
             "capturing; call prepare() before CUDA-graph capture"
         )
-    destination = out
-    if out is None or not out.is_contiguous():
+    if out is None:
         out = torch.empty(
             (n, HEADS, _DIM), dtype=torch.bfloat16, device=q_packed_in.device
         )
+    elif not out.is_contiguous():
+        raise ValueError("HCA output must be contiguous")
     if n == 0:
-        return (
-            out if destination is None or destination is out else destination.copy_(out)
-        )
+        return out
     mla_decode_fwd_v4_nm_ps(
         q_packed_in.contiguous(),
         q_rope_in.contiguous(),
@@ -221,4 +220,4 @@ def hca_persist_decode(
         idx,
         n,
     )
-    return out if destination is None or destination is out else destination.copy_(out)
+    return out

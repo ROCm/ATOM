@@ -185,7 +185,6 @@ class DeepseekV4AttentionVllm(DeepseekV4AttentionBase):
         x: torch.Tensor | None = None,
         qr: torch.Tensor | None = None,
         qr_scale: torch.Tensor | None = None,
-        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # NARROW entry (see class docstring). The pieces upstream produced every
         # per-token tensor at the padded bucket width, but the sparse-attention
@@ -237,24 +236,10 @@ class DeepseekV4AttentionVllm(DeepseekV4AttentionBase):
                         _clip(x),
                         _clip(qr),
                         _clip(qr_scale),
-                        out=None if out is None else out[:num_real],
                     )
-                    if out is not None:
-                        # Keep the caller's storage and zero only the
-                        # padded rows within the supplied slice.
-                        out[num_real:].zero_()
-                        return out.reshape(num_in, -1)
                     return torch.nn.functional.pad(o, (0, 0, 0, num_in - num_real))
         return super()._sparse_attention(
-            qkn,
-            positions,
-            idx_q_quant,
-            idx_weights,
-            idx_q_scale,
-            x,
-            qr,
-            qr_scale,
-            out=out,
+            qkn, positions, idx_q_quant, idx_weights, idx_q_scale, x, qr, qr_scale
         )
 
 

@@ -141,23 +141,18 @@ def _run(inp, *, n=None, t_pad=None, out=None):
     )
 
 
-@pytest.mark.parametrize("strided", [False, True])
-def test_persistent_caller_owned_output(mode, strided):
+def test_persistent_caller_owned_output(mode):
     inp = _inputs([8] * 15, seed=41)
     mode(True, min_rows=1)
     expected = _run(inp)
-    parent = torch.full(
-        (17, H, 1024 if strided else 512), -99.0, dtype=torch.bfloat16, device=DEV
-    )
-    out = parent[1:-1, :, ::2] if strided else parent[1:-1]
+    parent = torch.full((17, H, 512), -99.0, dtype=torch.bfloat16, device=DEV)
+    out = parent[1:-1]
     before = hca_persist.stats["persist"]
     actual = _run(inp, out=out)
     assert hca_persist.stats["persist"] == before + 1
     assert actual is out
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     assert torch.all(parent[[0, -1]] == -99)
-    if strided:
-        assert torch.all(parent[:, :, 1::2] == -99)
 
 
 def _both(mode, inp, **kw):

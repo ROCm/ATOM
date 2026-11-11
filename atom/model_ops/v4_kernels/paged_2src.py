@@ -75,8 +75,6 @@ except ImportError:
 from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 from aiter.ops.triton.attention.pa_prefill_sparse import pa_prefill_sparse
 
-from atom.model_ops.v4_kernels.output_buffer import call_with_output
-
 # Local head count the aiter asm fp8 prefill kernel ships for; anything else
 # raises there rather than dispatching, so we filter on it up front.
 _PREFILL_ASM_HEADS = 128
@@ -637,8 +635,8 @@ def sparse_attn_v4_paged_2src(
       kv_indptr_extend:  [T+1] int32 — true prefix sum.
       attn_sink:         [H] — per-head softmax-denom bias.
       softmax_scale:     float.
-      out:               optional output buffer. Can alias q when the caller no
-        longer needs q after attention (bf16 path only).
+      out:               optional contiguous output buffer, including a token-row
+        slice. Can alias q when it is no longer needed (bf16 path only).
       unified_kv_rope:   [total_pages, rd] bf16 RoPE prefix pool — presence
         selects the native fp8 2buff path.
       q_packed / q_rope: fp8 2buff Q ([T, H, 512] fp8 / [T, H, 64] bf16).
@@ -648,13 +646,11 @@ def sparse_attn_v4_paged_2src(
     Returns:
       out: [T, H, D] bf16.
     """
+    if out is not None and not out.is_contiguous():
+        raise ValueError("prefill output must be contiguous")
     if unified_kv_rope is not None:
         # Native fp8 prefill (op4): 2buff fp8 prefix pool + op-quantized fp8 Q
         # and extend K fed directly. No dequant of the prefix, no torch quant.
-        #
-        # Current AITER writes directly into the caller's output slice. Older
-        # versions allocate their own output, which the compatibility helper
-        # copies into the same caller-provided slice.
         from aiter.ops.pa_sparse_prefill_opus import pa_sparse_prefill_fp8_opus
 
         # aiter's asm kernel is signature-compatible with the OPUS one, so the
@@ -682,42 +678,26 @@ def sparse_attn_v4_paged_2src(
             and q_packed.shape[1] == _PREFILL_ASM_HEADS
         ):
             try:
-                return call_with_output(mla_sparse_prefill_fp8_asm, args, out)
+                return mla_sparse_prefill_fp8_asm(*args, out=out)
             except RuntimeError:
                 # The ASM path has stricter runtime dtype/shape constraints;
                 # OPUS covers configurations it cannot serve.
                 pass
 
-        return call_with_output(pa_sparse_prefill_fp8_opus, args, out)
+        return pa_sparse_prefill_fp8_opus(*args, out=out)
     # Backend selection: prefer OPUS when available; fall back to Triton on
     # import failure, env override, or runtime error (e.g. unsupported GPU).
     # OPUS covers both archs: gfx950 from source, gfx1250 from a prebuilt code
     # object (bf16 only — fp16 raises and falls through).
-    if not envs.ATOM_FORCE_ATTN_TRITON and _HAS_OPUS:
+    # OPUS uses Q's strides for output stores. A different Q layout uses
+    # Triton, which writes the caller's buffer without an output temporary.
+    if (
+        not envs.ATOM_FORCE_ATTN_TRITON
+        and _HAS_OPUS
+        and (out is None or out.stride() == q.stride())
+    ):
         try:
-            return call_with_output(
-                pa_sparse_prefill_opus,
-                (
-                    q,
-                    unified_kv,
-                    kv_indices_prefix,
-                    kv_indptr_prefix,
-                    kv,
-                    kv_indices_extend,
-                    kv_indptr_extend,
-                    attn_sink,
-                    softmax_scale,
-                ),
-                out,
-                output_strides=q.stride(),
-                supports_output=True,
-            )
-        except RuntimeError:
-            pass
-    if get_gfx() == "gfx1250":
-        return call_with_output(
-            pa_prefill_sparse,
-            (
+            return pa_sparse_prefill_opus(
                 q,
                 unified_kv,
                 kv_indices_prefix,
@@ -727,8 +707,22 @@ def sparse_attn_v4_paged_2src(
                 kv_indptr_extend,
                 attn_sink,
                 softmax_scale,
-            ),
-            out,
+                out=out,
+            )
+        except RuntimeError:
+            pass
+    if get_gfx() == "gfx1250":
+        return pa_prefill_sparse(
+            q,
+            unified_kv,
+            kv_indices_prefix,
+            kv_indptr_prefix,
+            kv,
+            kv_indices_extend,
+            kv_indptr_extend,
+            attn_sink,
+            softmax_scale,
+            out=out,
         )
     # Native Triton kernels use independent Q and output strides.
     return _sparse_attn_v4_paged_2src_triton(

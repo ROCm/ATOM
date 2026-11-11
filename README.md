@@ -118,6 +118,11 @@ pip install amd-aiter
 git clone https://github.com/ROCm/ATOM.git && pip install ./ATOM
 ```
 
+DeepSeek V4 requires **AITER 0.1.28 or newer** for the sparse prefill/decode
+`out=` APIs. Install its dependencies with `pip install './ATOM[v4]'` (or
+`pip install -e '.[v4]'` from an existing checkout). Older AITER output APIs
+are not supported; ATOM passes the destination directly to the kernels.
+
 ## 💡 Usage
 
 ### Basic Example

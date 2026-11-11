@@ -2413,11 +2413,9 @@ class DeepseekV4Attention(nn.Module):
         """The TOKEN-shaped tail: indexer top-k, CSA pack, the paged attention, and
         prefill's SWA write.
 
-        ``out`` optionally supplies a ``[num_tokens, n_local_heads, head_dim]``
-        destination. Supported backends write into it directly; legacy APIs
-        and reference fallbacks copy their result into the same buffer.
-        The flattened return may be a copy if the destination's strides do
-        not allow the head and feature dimensions to be viewed as one.
+        ``out`` optionally supplies a contiguous token-row slice of shape
+        ``[num_tokens, n_local_heads, head_dim]``. Prefill and decode can write
+        disjoint slices of one allocation without concatenating their results.
 
         Every launch here is sized by the token count -- `csa_translate_pack`'s grid
         is `(T, ...)`, the paged kernels take `N = qo_indptr.numel()-1`, the FP8

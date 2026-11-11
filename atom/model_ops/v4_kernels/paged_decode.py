@@ -60,7 +60,6 @@ from aiter.ops.triton.utils.device_info import get_num_sms
 
 from atom.model_ops.sparse_attn_v4 import _sparse_attn_ragged_torch
 from atom.model_ops.v4_kernels import hca_persist
-from atom.model_ops.v4_kernels.output_buffer import call_with_output
 from atom.model_ops.v4_kernels.paged_decode_gluon import (
     _paged_decode_fused_gluon_kernel,
 )
@@ -975,10 +974,8 @@ def _sparse_attn_v4_paged_decode_prefill_asm(
             f"least N+1={n + 1} entries, got {empty_kv_indptr.numel()}"
         )
 
-    return call_with_output(
-        mla_sparse_prefill_fp8_asm,
-        (),
-        out,
+    return mla_sparse_prefill_fp8_asm(
+        out=out,
         q_nope=q_packed_in,
         q_rope=q_rope_in,
         unified_kv_nope=unified_kv,
@@ -1155,7 +1152,7 @@ def _sparse_attn_v4_paged_decode_asm(
 
     output = (
         out
-        if out is not None and H == H_real and out.is_contiguous()
+        if out is not None and H == H_real
         else torch.empty(
             (N, H, V4_DIM_NOPE + V4_DIM_ROPE), dtype=torch.bfloat16, device=device
         )
@@ -1231,11 +1228,12 @@ def sparse_attn_v4_paged_decode(
     in-kernel using 1xGROUP_SIZE (default 64) block scales (legacy 1buff,
     unreachable from the model).
 
-    ``out`` optionally supplies the destination with matching rows, heads,
-    dtype and device. Backends requiring a contiguous or padded-head output
-    copy back into the supplied slice when they cannot write to it directly.
+    ``out`` optionally supplies a contiguous destination with matching rows,
+    heads, dtype and device. FP8 ASM copies back only when it must pad heads.
     """
     if out is not None:
+        if not out.is_contiguous():
+            raise ValueError("decode output must be contiguous")
         source = q_packed_in if unified_kv_rope is not None else q
         dim = V4_DIM_QK if unified_kv_rope is not None else source.shape[-1]
         dtype = torch.bfloat16 if unified_kv_rope is not None else source.dtype
@@ -1306,12 +1304,14 @@ def sparse_attn_v4_paged_decode(
         )
     gfx = get_gfx()
     if gfx == "gfx1250" or gfx.startswith("gfx94"):
-        # BF16 AITER decode accepts independent output strides.
-        return call_with_output(
-            pa_decode_sparse,
-            (q, unified_kv, kv_indices, kv_indptr, attn_sink, softmax_scale),
-            out,
-            supports_strided_output=True,
+        return pa_decode_sparse(
+            q,
+            unified_kv,
+            kv_indices,
+            kv_indptr,
+            attn_sink,
+            softmax_scale,
+            out=out,
             has_invalid=False,
             kv_scales=kv_scales,
         )

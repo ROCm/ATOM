@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""Prefill dispatch preserves output slices across AITER API versions."""
+"""Sparse prefill writes directly to caller-owned token-row slices."""
 
 import importlib
 
@@ -12,79 +12,25 @@ pytest.importorskip("triton")
 from atom.model_ops.v4_kernels import paged_2src
 
 
-def test_bf16_opus_row_strided_destination(monkeypatch):
-    q = torch.arange(24.0).reshape(3, 2, 4)
-    parent = torch.full((8, 2, 4), -99.0)
-    out = parent[1:7:2]
-
-    def opus_query_strides(*args, out=None):
-        # Model the verified single-split OPUS store contract: Q supplies
-        # both the query and output strides, regardless of out.stride().
-        destination = torch.empty_like(q) if out is None else out
-        destination.as_strided(q.shape, q.stride()).copy_(q + 1)
-        return destination
-
-    monkeypatch.setattr(paged_2src, "_HAS_OPUS", True)
-    monkeypatch.setattr(paged_2src.envs, "ATOM_FORCE_ATTN_TRITON", False)
-    monkeypatch.setattr(paged_2src, "pa_sparse_prefill_opus", opus_query_strides)
-    indices = torch.empty(0, dtype=torch.int32)
-    indptr = torch.zeros(4, dtype=torch.int32)
-    result = paged_2src.sparse_attn_v4_paged_2src(
-        q, q[0], indices, indptr, q[0], indices, indptr, torch.zeros(2), 0.5, out=out
-    )
-    assert result is out
-    assert torch.all(parent[[0, 2, 4, 6, 7]] == -99)
-    torch.testing.assert_close(out, q + 1)
-
-
-def test_native_triton_receives_original_strided_output(monkeypatch):
-    q = torch.arange(24.0).reshape(3, 2, 4)
-    parent = torch.full((8, 2, 4), -99.0)
-    out = parent[1:7:2]
-    seen = []
-
-    def native(*args, out=None):
-        seen.append(out)
-        return out.copy_(q + 1)
-
-    monkeypatch.setattr(paged_2src.envs, "ATOM_FORCE_ATTN_TRITON", True)
-    monkeypatch.setattr(paged_2src, "get_gfx", lambda: "gfx950")
-    monkeypatch.setattr(paged_2src, "_sparse_attn_v4_paged_2src_triton", native)
-    indices = torch.empty(0, dtype=torch.int32)
-    indptr = torch.zeros(4, dtype=torch.int32)
-    result = paged_2src.sparse_attn_v4_paged_2src(
-        q, q[0], indices, indptr, q[0], indices, indptr, torch.zeros(2), 0.5, out=out
-    )
-    assert result is out and len(seen) == 1 and seen[0] is out
-    torch.testing.assert_close(out, q + 1)
-    assert torch.all(parent[[0, 2, 4, 6, 7]] == -99)
-
-
 @pytest.mark.parametrize("backend", ["opus", "asm", "asm_fallback"])
-@pytest.mark.parametrize("legacy", [False, True])
 @pytest.mark.parametrize("supplied_output", [False, True])
-def test_fp8_prefill_accepts_legacy_output_api(
-    monkeypatch, backend, legacy, supplied_output
-):
-    calls = []
+def test_fp8_prefill_passes_output_to_opaque_api(monkeypatch, backend, supplied_output):
     expected = torch.full((2, 128, 4), 3.0)
+    parent = torch.full((4, 128, 4), -9.0)
+    out = parent[1:3] if supplied_output else None
+    calls = []
 
-    def old_kernel(*args):
-        calls.append("legacy")
-        return expected.clone()
-
-    def new_kernel(*args, out=None):
-        calls.append("current")
-        if out is None:
-            return expected.clone()
-        out.copy_(expected)
-        return out
+    # An opaque wrapper must receive out= without advertising its signature
+    # or private implementation. This also tests the ordinary out=None path.
+    def kernel(*args, **kwargs):
+        assert kwargs["out"] is out
+        calls.append(out)
+        return expected.clone() if out is None else out.copy_(expected)
 
     def unavailable_asm(*args, **kwargs):
-        calls.append("fallback")
+        assert kwargs["out"] is out
         raise RuntimeError("unsupported ASM shape")
 
-    kernel = old_kernel if legacy else new_kernel
     opus = importlib.import_module("aiter.ops.pa_sparse_prefill_opus")
     monkeypatch.setattr(opus, "pa_sparse_prefill_fp8_opus", kernel)
     monkeypatch.setattr(paged_2src, "_HAS_PREFILL_ASM", backend != "opus")
@@ -95,8 +41,6 @@ def test_fp8_prefill_accepts_legacy_output_api(
         "mla_sparse_prefill_fp8_asm",
         unavailable_asm if backend == "asm_fallback" else kernel,
     )
-    parent = torch.full((4, 128, 4), -9.0)
-    out = parent[1:3] if supplied_output else None
     q = torch.zeros_like(expected)
     k = torch.zeros(2, 4)
     indices = torch.zeros(0, dtype=torch.int32)
@@ -119,53 +63,10 @@ def test_fp8_prefill_accepts_legacy_output_api(
         k_rope=k,
     )
     torch.testing.assert_close(result, expected)
-    if supplied_output:
+    assert len(calls) == 1 and calls[0] is out
+    if out is not None:
         assert result is out
-        assert torch.all(parent[[0, 3]] == -9)
-    assert calls == (["fallback"] if backend == "asm_fallback" else []) + [
-        "legacy" if legacy else "current"
-    ]
-
-
-@pytest.mark.parametrize("legacy", [False, True])
-@pytest.mark.parametrize("supplied_output", [False, True])
-@pytest.mark.parametrize("strided", [False, True])
-def test_bf16_triton_prefill_preserves_output_api(
-    monkeypatch, legacy, supplied_output, strided
-):
-    calls = []
-    q = torch.zeros(2, 16, 4, dtype=torch.bfloat16)
-    parent = torch.full((4, 16, 8 if strided else 4), -9.0, dtype=q.dtype)
-    view = parent[1:3, :, ::2] if strided else parent[1:3]
-    out = view if supplied_output else None
-
-    def old_kernel(*args):
-        calls.append(None)
-        return torch.ones_like(q)
-
-    def new_kernel(*args, out=None):
-        assert out is None or out.is_contiguous()
-        calls.append(out)
-        return torch.ones_like(q) if out is None else out.fill_(1)
-
-    monkeypatch.setattr(paged_2src, "_HAS_OPUS", False)
-    monkeypatch.setattr(paged_2src, "get_gfx", lambda: "gfx1250")
-    monkeypatch.setattr(
-        paged_2src, "pa_prefill_sparse", old_kernel if legacy else new_kernel
-    )
-    indices = torch.empty(0, dtype=torch.int32)
-    indptr = torch.zeros(3, dtype=torch.int32)
-    result = paged_2src.sparse_attn_v4_paged_2src(
-        q, q[0], indices, indptr, q[0], indices, indptr, torch.zeros(16), 0.5, out=out
-    )
-    torch.testing.assert_close(result, torch.ones_like(q))
-    assert len(calls) == 1
-    assert calls[0] is (None if legacy or strided else out)
-    if supplied_output:
-        assert result is out
-        assert torch.all(parent[[0, 3]] == -9)
-        if strided:
-            assert torch.all(parent[:, :, 1::2] == -9)
+    assert torch.all(parent[[0, 3]] == -9)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires ROCm GPU")
@@ -212,8 +113,7 @@ def test_bf16_triton_prefill_reuses_output_on_device(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires ROCm GPU")
 @pytest.mark.parametrize("heads", [8, 128])
-@pytest.mark.parametrize("layout", ["contiguous", "rows", "features", "transposed"])
-def test_fp8_prefill_reuses_output_on_device(heads, layout):
+def test_fp8_prefill_reuses_output_on_device(heads):
     from atom.model_ops.v4_kernels.v4_quant import quantize_bf16_to_v4_2buff
 
     torch.manual_seed(41)
@@ -238,7 +138,7 @@ def test_fp8_prefill_reuses_output_on_device(heads, layout):
         "k_rope": er,
     }
     expected = paged_2src.sparse_attn_v4_paged_2src(*args, **kwargs)
-    parent, out = _output_slice(n, heads, dim, q.dtype, layout)
+    parent, out = _output_slice(n, heads, dim, q.dtype)
     out.zero_()
     untouched = parent == -99
     result = paged_2src.sparse_attn_v4_paged_2src(*args, **kwargs, out=out)
@@ -247,26 +147,14 @@ def test_fp8_prefill_reuses_output_on_device(heads, layout):
     assert torch.all(parent[untouched] == -99)
 
 
-def _output_slice(n, heads, dim, dtype, layout):
-    if layout == "rows":
-        parent = torch.full((2 * n + 2, heads, dim), -99.0, device="cuda", dtype=dtype)
-        out = parent[1 : 2 * n : 2]
-    elif layout == "features":
-        parent = torch.full((n + 2, heads, 2 * dim), -99.0, device="cuda", dtype=dtype)
-        out = parent[1:-1, :, ::2]
-    elif layout == "transposed":
-        parent = torch.full((n + 2, dim, heads), -99.0, device="cuda", dtype=dtype)
-        out = parent[1:-1].transpose(1, 2)
-    else:
-        parent = torch.full((n + 2, heads, dim), -99.0, device="cuda", dtype=dtype)
-        out = parent[1:-1]
-    return parent, out
+def _output_slice(n, heads, dim, dtype):
+    parent = torch.full((n + 2, heads, dim), -99.0, device="cuda", dtype=dtype)
+    return parent, parent[1:-1]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires ROCm GPU")
-@pytest.mark.parametrize("query_rows_strided", [False, True])
-@pytest.mark.parametrize("layout", ["contiguous", "rows", "features", "transposed"])
-def test_bf16_opus_prefill_output_layout(monkeypatch, query_rows_strided, layout):
+@pytest.mark.parametrize("alias_query", [False, True])
+def test_bf16_opus_prefill_output_on_device(monkeypatch, alias_query):
     if not paged_2src._HAS_OPUS:
         pytest.skip("requires BF16 OPUS")
     monkeypatch.setattr(paged_2src.envs, "ATOM_FORCE_ATTN_TRITON", False)
@@ -285,8 +173,7 @@ def test_bf16_opus_prefill_output_layout(monkeypatch, query_rows_strided, layout
     monkeypatch.setattr(paged_2src, "pa_prefill_sparse", no_fallback)
     torch.manual_seed(41)
     n, heads, dim = 3, 16, 512
-    query = torch.randn(2 * n, heads, dim, device="cuda", dtype=torch.bfloat16)
-    q = query[::2] if query_rows_strided else query[:n]
+    q = torch.randn(n, heads, dim, device="cuda", dtype=torch.bfloat16)
     kv = torch.randn(15, dim, device="cuda", dtype=q.dtype)
     extend = torch.randn(n, dim, device="cuda", dtype=q.dtype)
     indices = torch.arange(15, device="cuda", dtype=torch.int32)
@@ -296,20 +183,20 @@ def test_bf16_opus_prefill_output_layout(monkeypatch, query_rows_strided, layout
     sink = torch.randn(heads, device="cuda", dtype=torch.float32)
     args = (kv, indices, indptr, extend, ext_indices, ext_indptr, sink, dim**-0.5)
     expected = paged_2src.sparse_attn_v4_paged_2src(q.contiguous(), *args)
-    parent, out = _output_slice(n, heads, dim, q.dtype, layout)
+    parent, out = _output_slice(n, heads, dim, q.dtype)
     out.zero_()
     untouched = parent == -99
+    if alias_query:
+        out.copy_(q)
+        q = out
     result = paged_2src.sparse_attn_v4_paged_2src(q, *args, out=out)
-    assert result is out and len(calls) == 2
-    assert calls[1].stride() == q.stride()
-    assert (calls[1] is out) == (out.stride() == q.stride())
+    assert result is out and len(calls) == 2 and calls[1] is out
     torch.testing.assert_close(result, expected, rtol=0, atol=0)
     assert torch.all(parent[untouched] == -99)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires ROCm GPU")
-@pytest.mark.parametrize("layout", ["contiguous", "rows", "features", "transposed"])
-def test_native_triton_prefill_preserves_output_on_device(monkeypatch, layout):
+def test_native_triton_prefill_preserves_output_on_device(monkeypatch):
     if paged_2src.get_gfx() == "gfx1250":
         pytest.skip("gfx1250 dispatches to the AITER fallback")
     monkeypatch.setattr(paged_2src.envs, "ATOM_FORCE_ATTN_TRITON", True)
@@ -335,7 +222,7 @@ def test_native_triton_prefill_preserves_output_on_device(monkeypatch, layout):
     sink = torch.randn(heads, device="cuda", dtype=torch.float32)
     args = (q, kv, indices, indptr, extend, ext_indices, ext_indptr, sink, dim**-0.5)
     expected = paged_2src.sparse_attn_v4_paged_2src(*args)
-    parent, out = _output_slice(n, heads, dim, q.dtype, layout)
+    parent, out = _output_slice(n, heads, dim, q.dtype)
     out.zero_()
     untouched = parent == -99
     result = paged_2src.sparse_attn_v4_paged_2src(*args, out=out)
