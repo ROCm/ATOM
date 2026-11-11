@@ -4152,8 +4152,7 @@ class Scheduler:
         # surrendered blocks (the mutator half of `should_defer_free`'s escape).
         self._connector_release_stalled_save(seq)
         self.block_manager.deallocate(seq)
-        # Unbound: tests call `Scheduler.preempt` on hand-built owners.
-        pos = Scheduler._behind_settled_resumes(self)
+        pos = self._behind_settled_resumes()
         self.waiting.insert(pos, seq)
         return True
 
@@ -5120,7 +5119,7 @@ class Scheduler:
         (`_can_admit_head_prefill` reads only the first few queue entries).
         """
         pos = 0
-        if getattr(getattr(self, "kv_connector", None), "is_offload", False):
+        if self._connector_flag("is_offload"):
             for i, queued in enumerate(self.waiting):
                 if self._is_offload_prefill_resume(queued):
                     pos = i + 1
