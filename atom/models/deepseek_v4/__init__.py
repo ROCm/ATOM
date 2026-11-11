@@ -65,6 +65,7 @@ from atom.distributed.pcp_utils import (
     pcp_pad_len,
     pcp_round_robin_split,
 )
+from atom.distributed.ulysses_sp import sp_is_enabled
 from atom.model_loader.loader import WeightsMapper
 from atom.model_loader.weight_utils import local_model_dir
 
@@ -2997,10 +2998,19 @@ class MoE(nn.Module):
         # env threshold is positive AND we got an alt_stream from the model.
         # Per-call row gating happens inside the custom op dispatcher: a call
         # with more rows than its step's bound (set below) stays single-stream.
+        # MegaMoEV2's fused small-/large-input kernels keep every CTA resident
+        # and wait on the peer ranks; a shared-expert kernel on alt_stream
+        # holding CUs on one rank next to them deadlocks the group (EP4
+        # V4.1-Flash hung in decode-graph warm-up and serving), so they run
+        # single-stream. SP MegaMoE (under sequence parallel) is not MegaMoEV2.
+        mega_v2 = (
+            get_current_atom_config().moe_backend == "mega" and not sp_is_enabled()
+        )
         self._use_dual_stream = (
             self.shared_experts is not None
             and self.alt_stream is not None
             and envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0
+            and not mega_v2
         )
         # V4 family with an expert-parallel token exchange: the routed MoE
         # waits on it for a large part of each layer, which the side-stream
