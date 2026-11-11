@@ -91,6 +91,8 @@ class AttentionBackend(ABC):
         target_block_size: int,
         layers: int,
         kv_dtype,
+        blocks_per_entry: int = 1,
+        flash_layout: bool = False,
     ):
         """A pool of `layers` rows at this config's geometry.
 
@@ -99,6 +101,12 @@ class AttentionBackend(ABC):
         told rather than read: `layers` only the walk knows, and the block only
         the target builder, whose it is and not this backend's for the reason
         in `DraftKvBuilder.kv_pool`.
+
+        `blocks_per_entry` and `flash_layout` are what a draft's
+        `DraftKvPoolSpec.pool_kwargs` adds: an entry spanning that many
+        `target_block_size` blocks, stored in the FLASH order. The defaults are
+        the generic pool, one block per entry in the SHUFFLE order, which is
+        all a draft without a `kv_pool_spec` is built with.
         """
         raise NotImplementedError
 
