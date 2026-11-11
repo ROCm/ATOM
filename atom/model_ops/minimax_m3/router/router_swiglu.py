@@ -40,7 +40,7 @@ from atom.model_ops.swiglu_oai import swiglu_mxfp8_block, swiglu_oai_mxfp8_tile
 MIN_ROWS = 1
 MAX_ROWS = 128
 # router GEMV tile: rows, experts, K step, split partials
-_GEMV_M, _GEMV_N, _GEMV_K, _SPLIT = 16, 32, 256, 6
+_GEMV_M, _GEMV_N, _GEMV_K, _SPLIT = 16, 32, 256, 12
 _NUM_WARPS = 4
 # rows one gate program covers
 _GATE_ROWS = 4
