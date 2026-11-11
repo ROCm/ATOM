@@ -664,7 +664,6 @@ jobs:
           docker_args=(
             run -i --name "${container}"
             --network host --ipc host
-            --privileged
             --device=/dev/kfd
             --device=/dev/dri
             --device=/dev/infiniband

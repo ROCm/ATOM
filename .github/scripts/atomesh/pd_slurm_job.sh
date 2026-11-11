@@ -951,9 +951,9 @@ for execution_phase in "${EXECUTION_PHASES[@]}"; do
       fi
       set +e
       docker run --name "${container}" \
-        --network host --ipc host --privileged \
+        --network host --ipc host \
         --device /dev/kfd --device /dev/dri --device /dev/infiniband \
-        --group-add video --cap-add IPC_LOCK --cap-add NET_ADMIN \
+        --group-add video --cap-add IPC_LOCK --cap-add NET_ADMIN --cap-add SYS_NICE \
         --ulimit memlock=-1 --ulimit stack=67108864 --ulimit nofile=65536:524288 \
         --shm-size 128G \
         --env-file "'"${ENV_FILE}"'" \
