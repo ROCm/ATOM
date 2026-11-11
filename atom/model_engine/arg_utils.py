@@ -113,6 +113,20 @@ def _is_offload_connector(cfg: object) -> bool:
     return KVConnectorFactory.is_offload_backend(canonical)
 
 
+def refuse_server_routed_experts(parser: argparse.ArgumentParser, args) -> None:
+    """Exit with a usage error when a server is started with R3 on.
+
+    Routes reach callers only through ``generate()``; no server endpoint
+    returns them, so the capture's cost would buy nothing.
+    """
+    if args.enable_return_routed_experts:
+        parser.error(
+            "--enable-return-routed-experts is offline-only: routes are "
+            "returned by LLMEngine.generate(), and no server endpoint returns "
+            "them"
+        )
+
+
 @dataclass
 class EngineArgs:
     """Arguments for configuring the LLM Engine."""
@@ -319,10 +333,11 @@ class EngineArgs:
             action="store_true",
             help="Return per-request MoE expert ids on generate() as "
             "routed_experts int16 [seq_len-1, num_layers, top_k]. "
-            "Requires DCP=PCP=PP=1, no plugin mode, and no KV transfer, "
+            "Requires DCP=PCP=PP=SP=1, no plugin mode, and no KV transfer, "
             "offload, or RapidServe; after weight load, a MoE model whose "
             "attention supplies per-token KV slots (not DeepSeek-V4 / V4.1). "
-            "Mono decode turns off for models that route in-kernel.",
+            "Mono decode turns off for models that route in-kernel. "
+            "Offline only: the OpenAI and atomesh servers refuse it.",
         )
         parser.add_argument(
             "--port",

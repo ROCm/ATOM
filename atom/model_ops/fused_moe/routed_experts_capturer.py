@@ -37,36 +37,21 @@ class RoutedExpertsPatch(NamedTuple):
     Segment ``j`` is request ``req_ids[j]``'s rows for token positions
     ``[starts[j], starts[j] + offsets[j+1] - offsets[j])``. Segments apply in
     order, so a prefix-hit segment precedes the same request's step segment.
+    ``rows`` is the device gather until the token copy moves it to the host;
+    the scheduler receives it as a numpy array.
     """
 
     req_ids: np.ndarray
     starts: np.ndarray
     offsets: np.ndarray
-    rows: np.ndarray
-
-
-class PendingRoutes(NamedTuple):
-    """A stored step whose rows may still be copying to the host."""
-
-    req_ids: np.ndarray
-    starts: np.ndarray
-    offsets: np.ndarray
-    rows_cpu: torch.Tensor
-    done: torch.cuda.Event | None
-
-    def patch(self) -> RoutedExpertsPatch:
-        """The step's ``RoutedExpertsPatch``, waiting on its D2H if still queued."""
-        if self.done is not None:
-            self.done.synchronize()
-        return RoutedExpertsPatch(
-            self.req_ids, self.starts, self.offsets, self.rows_cpu.numpy()
-        )
+    rows: np.ndarray | torch.Tensor
 
 
 def merge_routed_patches(patches: list[RoutedExpertsPatch]) -> RoutedExpertsPatch:
-    """One patch holding ``patches``' segments in order, oldest step first."""
+    """One host patch holding ``patches``' segments in order, oldest step first."""
     if len(patches) == 1:
-        return patches[0]
+        p = patches[0]
+        return p._replace(rows=np.asarray(p.rows))
     offsets = [patches[0].offsets]
     for p in patches[1:]:
         offsets.append(p.offsets[1:] + offsets[-1][-1])
@@ -74,7 +59,7 @@ def merge_routed_patches(patches: list[RoutedExpertsPatch]) -> RoutedExpertsPatc
         np.concatenate([p.req_ids for p in patches]),
         np.concatenate([p.starts for p in patches]),
         np.concatenate(offsets),
-        np.concatenate([p.rows for p in patches]),
+        np.concatenate([np.asarray(p.rows) for p in patches]),
     )
 
 
@@ -171,8 +156,8 @@ class RoutedExpertsCapturer:
     The extra row is a sacrificial pad target: slots index the buffer directly,
     so a graph dummy slot (``PAD_SLOT_ID``, -1) wraps to it. ``bind`` hands
     each target FusedMoE its layer's view; each step's rows are gathered in
-    batch token order by ``store_step``, which returns them as
-    ``PendingRoutes`` for the caller to keep.
+    batch token order by ``gather_step``, which leaves them on the device for
+    the step's token copy to carry to the host.
     """
 
     def __init__(
@@ -214,7 +199,7 @@ class RoutedExpertsCapturer:
             )
         setattr(layer, ROUTES_VIEW_ATTR, self.buffer[:, layer_idx])
 
-    def store_step(
+    def gather_step(
         self,
         slot_mapping: torch.Tensor | None,
         req_ids: AbcSequence[int],
@@ -222,9 +207,8 @@ class RoutedExpertsCapturer:
         lens: AbcSequence[int],
         *,
         prefix: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None = None,
-        stream: torch.cuda.Stream | None = None,
-    ) -> PendingRoutes | None:
-        """Gather this step's rows in batch token order and queue their D2H.
+    ) -> RoutedExpertsPatch | None:
+        """This step's rows in batch token order, still on the device.
 
         Request ``i`` forwarded ``lens[i]`` tokens from position ``starts[i]``.
         ``prefix`` is ``(req_ids, starts, lens, slots)`` for cached prefixes no
@@ -233,7 +217,7 @@ class RoutedExpertsCapturer:
 
         The gather runs on the current stream: ``slot_mapping`` is the reused
         staging buffer, and the next forward rewrites it in order after this
-        stream only. With ``stream`` the D2H is non-blocking on it.
+        stream only.
         """
         slots = slot_mapping if slot_mapping is not None else current_slot_mapping()
         lens = np.asarray(lens, dtype=np.int64)
@@ -262,16 +246,7 @@ class RoutedExpertsCapturer:
         rows = self.buffer[rows_at].to(dtype=torch.int16)
         offsets = np.zeros(len(lens) + 1, dtype=np.int64)
         np.cumsum(lens, out=offsets[1:])
-        if stream is not None and self.buffer.is_cuda:
-            stream.wait_stream(torch.cuda.current_stream(self.buffer.device))
-            rows.record_stream(stream)
-            with torch.cuda.stream(stream):
-                rows_cpu = rows.to("cpu", non_blocking=True)
-                done = torch.cuda.Event()
-                done.record(stream)
-        else:
-            rows_cpu, done = rows.cpu(), None
-        return PendingRoutes(req_ids, starts, offsets, rows_cpu, done)
+        return RoutedExpertsPatch(req_ids, starts, offsets, rows)
 
 
 def maybe_capture_routed_experts(layer: Any, topk_ids: torch.Tensor) -> None:

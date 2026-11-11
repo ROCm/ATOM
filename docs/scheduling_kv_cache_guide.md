@@ -263,9 +263,12 @@ With `enable_return_routed_experts`, each request accumulates its MoE routes
   request that has left `running` are dropped: a finished request's extra row
   is past its routes, and a preempted request rewinds `routed_forwarded_end`
   and asks for them again. Rejected speculative rows are trimmed each step.
-- **Finish.** The routes are trimmed to `num_tokens - 1` rows and frozen. A
-  finish other than abort with fewer rows raises; an abort can land while its
-  last step's rows are in flight, so it may return fewer.
+- **Finish.** The routes are trimmed to `num_tokens - 1` rows and frozen.
+  After each output `postprocess` records `routed_owed_from`, the first
+  position a scheduled forward still owes routes for: the just-scheduled
+  batch's, plus any held middle chunks'. A request finishing early (abort,
+  structured-output or logprob error) may return fewer rows when the missing
+  ones are owed; fewer rows with nothing owed before `num_tokens - 1` raises.
 
 ## Block manager
 

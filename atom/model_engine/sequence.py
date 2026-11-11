@@ -501,6 +501,10 @@ class Sequence:
         # Positions some scheduled forward already returns routes for; a
         # prefix-cache hit past it must have its rows read from the cache.
         self.routed_forwarded_end: int = 0
+        # First position whose routes a scheduled forward still owes (its patch
+        # not yet received), or None. A request finishing early can be that
+        # short; one finishing with nothing owed must hold every row.
+        self.routed_owed_from: int | None = None
         # stream callback
         self.stream_callback = stream_callback
         # The completion half of `token_ids`, kept in step with it by every
@@ -621,8 +625,10 @@ class Sequence:
         """int16 [rows, layers, top_k], or None if no patch ever arrived.
 
         A view of the live rows, read-only once ``finish_routed_experts`` has
-        run. A finished request has ``num_tokens - 1`` rows, except an aborted
-        one: its last step's patch may never arrive, so it can have fewer.
+        run. A finished request has ``num_tokens - 1`` rows, except one that
+        finished (aborted, a structured-output or logprob error) while a
+        scheduled forward still owed it routes: it holds the rows up to
+        ``routed_owed_from``, as that forward's patch never reaches it.
         """
         buf = self._routed_expert_buf
         # Zero rows is still [0, layers, top_k]; only a request no patch ever

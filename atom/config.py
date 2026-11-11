@@ -2016,7 +2016,11 @@ def indexer_cp_unsupported_reason(
 
 
 def check_return_routed_experts(config: "Config") -> None:
-    """Refuse topologies that cannot assemble a full [seq_len-1] route tensor."""
+    """Refuse topologies that cannot assemble a full [seq_len-1] route tensor.
+
+    Plugin mode, DCP / PCP, PP, Ulysses SP, KV transfer and RapidServe each
+    leave rank 0's capture without the whole step's routes or without a buffer.
+    """
     if not config.enable_return_routed_experts:
         return
     plugin = config.plugin_config
@@ -2037,6 +2041,12 @@ def check_return_routed_experts(config: "Config") -> None:
     if config.pipeline_parallel_size != 1:
         raise ValueError(
             "enable_return_routed_experts requires pipeline_parallel_size == 1"
+        )
+    if config.sequence_parallel_size != 1:
+        raise ValueError(
+            "enable_return_routed_experts requires sequence_parallel_size == 1: "
+            "each SP rank routes only its own token range, so rank 0 cannot "
+            "capture the whole step"
         )
     if config.kv_transfer_config:
         raise ValueError(

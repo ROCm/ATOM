@@ -63,7 +63,7 @@ def test_postprocess_samples_nothing_without_a_request(monkeypatch):
         prev_batch=None,
         zero_spec_counts=torch.zeros(8, dtype=torch.int32),
         prepare_sampled_ids=lambda b, ids, *a, **k: (
-            sampled.update(ids=ids) or ({}, {})
+            sampled.update(ids=ids) or ({}, {}, None)
         ),
     )
     batch = types.SimpleNamespace(

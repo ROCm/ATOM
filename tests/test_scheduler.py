@@ -3838,31 +3838,124 @@ class TestRoutedExpertPatches:
         scheduler._return_routed_experts = True
         seq = seq_factory([1, 2, 3, 4])
         scheduler.add(seq)
-        scheduler.schedule()
-        rows = np.arange(4, dtype=np.int16).reshape(2, 1, 2)
+        prefill, _ = scheduler.schedule()
+        rows = np.arange(8, dtype=np.int16).reshape(4, 1, 2)
         scheduler.postprocess(
             list(scheduler.running),
             self._output(seq.id, [10], self._patch((seq.id, 0, rows))),
+            batch=prefill,
         )
+        decode, _ = scheduler.schedule()
         in_flight = list(scheduler.running)
         seq.status = SequenceStatus.ABORTED
-        assert scheduler.postprocess(in_flight, self._routes_only(None)) == [seq]
+        assert scheduler.postprocess(
+            in_flight, self._routes_only(None), batch=decode
+        ) == [seq]
         frozen = seq.routed_experts
 
         late = np.full((1, 1, 2), 9, dtype=np.int16)
         scheduler.postprocess(
-            in_flight, self._routes_only(self._patch((seq.id, 2, late)))
+            in_flight, self._routes_only(self._patch((seq.id, 4, late)))
         )
         assert np.shares_memory(seq.routed_experts, frozen)
         np.testing.assert_array_equal(seq.routed_experts, rows)
 
     def test_short_routes_at_a_normal_finish_raise(self, scheduler, seq_factory):
-        """Only an abort may finish with fewer than ``num_tokens - 1`` rows."""
+        """With nothing owed, fewer than ``num_tokens - 1`` rows are rows lost."""
         scheduler._return_routed_experts = True
         seq = seq_factory([1, 2, 3, 4])
         seq.apply_routed_expert_patch(0, np.zeros((2, 1, 2), dtype=np.int16))
         with pytest.raises(RuntimeError, match="2 of 4 rows"):
             scheduler._mark_finished(seq, "eos", 5)
+
+    @pytest.mark.parametrize("reason", ["eos", "aborted", "structured_output_error"])
+    def test_short_routes_are_allowed_only_where_a_forward_owes_them(
+        self, scheduler, seq_factory, reason
+    ):
+        """The exemption is the owed range, whatever the finish reason: rows
+        owed by an in-flight forward may be missing, rows before it may not."""
+        scheduler._return_routed_experts = True
+        seq = seq_factory([1, 2, 3, 4])
+        seq.apply_routed_expert_patch(0, np.zeros((2, 1, 2), dtype=np.int16))
+        # The in-flight forward starts at the final token's position: rows
+        # 2..3 belonged to a step that already reported.
+        seq.routed_owed_from = 4
+        with pytest.raises(RuntimeError, match="2 of 4 rows"):
+            scheduler._mark_finished(seq, reason, 5)
+
+        seq = seq_factory([1, 2, 3, 4])
+        seq.apply_routed_expert_patch(0, np.zeros((2, 1, 2), dtype=np.int16))
+        seq.routed_owed_from = 2
+        scheduler._mark_finished(seq, reason, 5)
+        assert seq.routed_expert_rows == 2
+
+    def test_structured_error_while_prefill_routes_are_in_flight(
+        self, scheduler, seq_factory
+    ):
+        """Deferred output: a grammar that fails on prefill step N is reported
+        with step N-1's output, before step N's routes arrive. The request
+        finishes with what arrived instead of stopping the engine."""
+        scheduler._return_routed_experts = True
+        seq = seq_factory([1, 2, 3, 4])
+        scheduler.add(seq)
+        batch, _ = scheduler.schedule()
+        out = ScheduledBatchOutput(
+            req_ids=[],
+            token_ids=[],
+            num_rejected=None,
+            num_bonus=None,
+            draft_token_ids=None,
+            structured_errors={seq.id: "grammar compile failed"},
+        )
+        finished = scheduler.postprocess(list(scheduler.running), out, batch=batch)
+        assert finished == [seq]
+        assert seq.leave_reason == "structured_output_error"
+        assert seq.routed_expert_rows == 0
+
+    def test_owed_routes_follow_the_runner_output_rule(self, scheduler, seq_factory):
+        """An output carries every step before ``batch`` except when ``batch``
+        is an output-less middle chunk, which holds them for the next output."""
+        seq = seq_factory(list(range(10)))
+        seq.type = SequenceType.PREFILL
+        scheduler.running.append(seq)
+
+        def chunk(cached, n, final):
+            return ScheduledBatch(
+                seqs={seq.id: seq},
+                num_scheduled_tokens=[n],
+                total_tokens_num=n,
+                total_seqs_num=1,
+                total_seqs_num_prefill=1,
+                num_cached_tokens=[cached],
+                is_final_chunk=[final],
+            )
+
+        first = chunk(0, 4, False)
+        assert not first.produces_output()
+        scheduler._record_routes_owed(first)
+        assert seq.routed_owed_from == 0
+        # A second middle chunk: chunk 0's routes are still held.
+        scheduler._record_routes_owed(chunk(4, 3, False))
+        assert seq.routed_owed_from == 0
+        # The final chunk's output carries both held chunks; only it is owed.
+        scheduler._record_routes_owed(chunk(7, 3, True))
+        assert seq.routed_owed_from == 7
+        # A DP dummy step's output carries the rest.
+        scheduler._record_routes_owed(None)
+        assert seq.routed_owed_from is None
+
+    def test_preempt_clears_owed_routes(self, scheduler, seq_factory):
+        scheduler._return_routed_experts = True
+        sp = SamplingParams(ignore_eos=True, max_tokens=100)
+        seq = seq_factory([1, 2, 3, 4], sampling_params=sp)
+        scheduler.add(seq)
+        batch, _ = scheduler.schedule()
+        scheduler.postprocess(
+            list(scheduler.running), self._routes_only(None), batch=batch
+        )
+        assert seq.routed_owed_from == 0
+        assert scheduler.preempt(seq)
+        assert seq.routed_owed_from is None
 
     def test_patch_for_a_request_no_longer_running_is_dropped(self, caplog):
         """Rows are matched by request id, never by position; a request that

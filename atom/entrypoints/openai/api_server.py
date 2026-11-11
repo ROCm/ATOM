@@ -48,7 +48,7 @@ from atom.kv_transfer.disaggregation.mooncake.endpoint import (
     DEFAULT_HANDSHAKE_PORT,
     producer_endpoint,
 )
-from atom.model_engine.arg_utils import EngineArgs
+from atom.model_engine.arg_utils import EngineArgs, refuse_server_routed_experts
 from atom.model_engine.llm_engine import load_tokenizer
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.segment_tokenizer import PrefixEncoding
@@ -3768,6 +3768,7 @@ def main():
     args = parser.parse_args()
     if args.api_server_count < 1:
         parser.error("--api-server-count must be at least 1")
+    refuse_server_routed_experts(parser, args)
 
     _setup_frontend(args)
 

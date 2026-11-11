@@ -15,7 +15,6 @@ from atom.model_engine.sequence import Sequence, SequenceStatus
 from atom.model_ops.fused_moe import routed_experts_capturer as cap_mod
 from atom.model_ops.fused_moe.routed_experts_capturer import (
     UNCAPTURED,
-    PendingRoutes,
     RoutedExpertsCapturer,
     RoutedExpertsPatch,
     capture_bytes_per_kv_block,
@@ -40,7 +39,9 @@ def _segments(patch: RoutedExpertsPatch) -> list[tuple[int, int, np.ndarray]]:
 
 
 def _store_take(capturer, slots, req_ids, starts, lens, **kw):
-    return capturer.store_step(slots, req_ids, starts, lens, **kw).patch()
+    """The step's patch as the scheduler receives it: rows on the host."""
+    patch = capturer.gather_step(slots, req_ids, starts, lens, **kw)
+    return patch._replace(rows=patch.rows.cpu().numpy())
 
 
 @contextmanager
@@ -76,6 +77,7 @@ def _r3_config(**overrides):
         "decode_context_parallel_size": 1,
         "prefill_context_parallel_size": 1,
         "pipeline_parallel_size": 1,
+        "sequence_parallel_size": 1,
         "kv_transfer_config": {},
         "enable_rapidserve": False,
         "plugin_config": None,
@@ -89,6 +91,7 @@ def _r3_config(**overrides):
         ({"decode_context_parallel_size": 2}, "decode_context_parallel_size"),
         ({"prefill_context_parallel_size": 2}, "prefill_context_parallel_size"),
         ({"pipeline_parallel_size": 2}, "pipeline_parallel_size"),
+        ({"sequence_parallel_size": 2}, "sequence_parallel_size"),
         ({"kv_transfer_config": {"kv_connector": "moriio"}}, "KV transfer"),
         ({"enable_rapidserve": True}, "never initializes"),
         ({"plugin_config": SimpleNamespace(is_plugin_mode=True)}, "plugin mode"),
@@ -97,6 +100,20 @@ def _r3_config(**overrides):
 def test_unsupported_topologies_fail_closed(overrides, match):
     with pytest.raises(ValueError, match=match):
         check_return_routed_experts(_r3_config(**overrides))
+
+
+def test_servers_refuse_the_flag():
+    """No server endpoint returns routes, so a server must not pay for them."""
+    from atom.model_engine.arg_utils import EngineArgs, refuse_server_routed_experts
+    from atom.utils.arg_parser import FlexibleArgumentParser
+
+    parser = FlexibleArgumentParser()
+    EngineArgs.add_cli_args(parser)
+    refuse_server_routed_experts(parser, parser.parse_args([]))
+    with pytest.raises(SystemExit):
+        refuse_server_routed_experts(
+            parser, parser.parse_args(["--enable-return-routed-experts"])
+        )
 
 
 def test_supported_topologies_pass():
@@ -143,6 +160,35 @@ def test_only_tp_rank0_binds_the_capture_buffer(rank, monkeypatch):
     else:
         assert capturer is None
         assert not any(hasattr(m, cap_mod.ROUTES_VIEW_ATTR) for m in moes)
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_kv_cross_check_expects_only_the_rows_a_rank_allocates(rank, monkeypatch):
+    """Every rank is charged the capture rows but only rank 0 allocates them,
+    so the other ranks' cross-check must not expect them."""
+    mr = _import_runner()
+    moes = [SimpleNamespace(prefix="model.layers.0.mlp.experts", top_k=2)]
+    monkeypatch.setattr(mr, "fused_moe_modules", lambda model: moes)
+    runner = mr.ModelRunner.__new__(mr.ModelRunner)
+    runner.model = object()
+    runner._routed_experts_geo = (3, 2)
+    runner._routed_experts_capturer = None
+    runner.rank = rank
+    runner.block_size = 4
+    runner.device = "cpu"
+    kv_bytes = 1 << 20
+    blocks = 2
+    capture = blocks * capture_bytes_per_kv_block(4, 3, 2)
+    runner.pool_plan = SimpleNamespace(total_reserved_bytes=kv_bytes + capture)
+
+    runner._bind_routed_experts_layers(num_kvcache_blocks=blocks)
+    capturer = runner._routed_experts_capturer
+    # What the allocation adds on top of the KV pools (the pad row is charged
+    # outside the plan).
+    allocated = (
+        0 if capturer is None else capturer.buffer.nbytes - capture_row_bytes(3, 2)
+    )
+    assert runner._expected_kv_bytes(blocks) == kv_bytes + allocated
 
 
 def test_flag_off_leaves_field_absent():
@@ -380,7 +426,7 @@ def test_prefix_slots_match_gpu_formula():
         assert prefix_slots(table, lo, hi, 16).tolist() == full[lo:hi]
 
 
-def test_store_step_drops_graph_pad_tail():
+def test_gather_step_drops_graph_pad_tail():
     """Graph-padded slot_mapping: only the step's real tokens are returned."""
     device = _device()
     capturer = RoutedExpertsCapturer(num_slots=8, num_layers=1, top_k=2, device=device)
@@ -420,7 +466,7 @@ def test_short_slot_mapping_raises_at_store():
     with pytest.raises(
         RuntimeError, match="forwarded 3 tokens but its slot_mapping has 1"
     ):
-        capturer.store_step(slots, [1, 2], [0, 0], [2, 1])
+        capturer.gather_step(slots, [1, 2], [0, 0], [2, 1])
 
 
 @pytest.mark.parametrize("slot_count", [2, 4])
@@ -469,46 +515,42 @@ def test_capture_drops_fused_shared_columns_past_layer_top_k():
     assert patch.rows[0, 0].tolist() == [4, 7, UNCAPTURED]
 
 
-def test_empty_step_stores_nothing():
+def test_empty_step_gathers_nothing():
     capturer = RoutedExpertsCapturer(num_slots=8, num_layers=1, top_k=2, device="cpu")
-    assert capturer.store_step(torch.tensor([], dtype=torch.long), [], [], []) is None
+    assert capturer.gather_step(torch.tensor([], dtype=torch.long), [], [], []) is None
     # Outside a forward there are no slots to read: refused, not an empty step.
     with pytest.raises(RuntimeError, match="no single per-token slot_mapping"):
-        capturer.store_step(None, [1], [0], [1])
+        capturer.gather_step(None, [1], [0], [1])
 
 
-def test_stored_steps_are_independent():
-    """A later store neither replaces nor reorders an earlier one."""
+def test_gathered_steps_are_independent():
+    """A later gather neither replaces nor reorders an earlier one."""
     capturer = RoutedExpertsCapturer(num_slots=8, num_layers=1, top_k=1, device="cpu")
     _capture(capturer, 0, torch.tensor([[4]], dtype=torch.int32), torch.tensor([1]))
-    a = capturer.store_step(torch.tensor([1]), [1], [0], [1])
+    a = capturer.gather_step(torch.tensor([1]), [1], [0], [1])
     _capture(capturer, 0, torch.tensor([[6]], dtype=torch.int32), torch.tensor([2]))
-    b = capturer.store_step(torch.tensor([2]), [2], [0], [1])
-    assert b.patch().req_ids.tolist() == [2]
-    assert a.patch().req_ids.tolist() == [1]
-    assert a.patch().rows[:, 0, 0].tolist() == [4]
-    assert b.patch().rows[:, 0, 0].tolist() == [6]
+    b = capturer.gather_step(torch.tensor([2]), [2], [0], [1])
+    assert b.req_ids.tolist() == [2]
+    assert a.req_ids.tolist() == [1]
+    assert a.rows[:, 0, 0].tolist() == [4]
+    assert b.rows[:, 0, 0].tolist() == [6]
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for copy stream")
-def test_async_store_snapshots_slots_before_staging_reuse():
-    """The next forward rewrites slot_mapping in place on the compute stream;
-    a stalled copy stream must still return this step's rows."""
-    device = torch.device("cuda")
+def test_gather_snapshots_slots_before_staging_reuse():
+    """The next forward rewrites slot_mapping in place on the compute stream,
+    behind the gather: the gathered rows are this step's."""
+    device = _device()
     capturer = RoutedExpertsCapturer(num_slots=8, num_layers=1, top_k=2, device=device)
     slots = torch.tensor([1], device=device)
     _capture(
         capturer, 0, torch.tensor([[7, 8]], dtype=torch.int32, device=device), slots
     )
-    stream = torch.cuda.Stream()
-    with torch.cuda.stream(stream):
-        torch.cuda._sleep(2_000_000_000)
-    pending = capturer.store_step(slots, [1], [0], [1], stream=stream)
+    patch = capturer.gather_step(slots, [1], [0], [1])
     slots.fill_(2)
     _capture(
         capturer, 0, torch.tensor([[3, 4]], dtype=torch.int32, device=device), slots
     )
-    np.testing.assert_array_equal(pending.patch().rows[:, 0, :], [[7, 8]])
+    np.testing.assert_array_equal(patch.rows.cpu()[:, 0, :], [[7, 8]])
 
 
 def _prefix_batch(block_tables):
@@ -784,15 +826,15 @@ def test_late_patch_after_finish_is_dropped():
     assert (seq.routed_experts != 99).all()
 
 
-def _pending(req_id: int, start: int, n: int, fill: int) -> PendingRoutes:
+def _host_patch(req_id: int, start: int, n: int, fill: int) -> RoutedExpertsPatch:
     rows = torch.full((n, 1, 2), fill, dtype=torch.int16)
-    return PendingRoutes(
-        np.array([req_id]), np.array([start]), np.array([0, n]), rows, None
+    return RoutedExpertsPatch(
+        np.array([req_id]), np.array([start]), np.array([0, n]), rows
     )
 
 
 def test_merge_routed_patches_keeps_segment_order_and_offsets():
-    a = _pending(1, 0, 2, 5).patch()
+    a = _host_patch(1, 0, 2, 5)
     b = RoutedExpertsPatch(
         np.array([1, 2]),
         np.array([2, 0]),
@@ -804,57 +846,10 @@ def test_merge_routed_patches_keeps_segment_order_and_offsets():
     np.testing.assert_array_equal(merged.starts, [0, 2, 0])
     np.testing.assert_array_equal(merged.offsets, [0, 2, 5, 6])
     np.testing.assert_array_equal(merged.rows[2:], b.rows)
-    assert merge_routed_patches([a]) is a
-
-
-def _runner_with_held(*held: PendingRoutes):
-    ModelRunner = _import_runner().ModelRunner
-    runner = ModelRunner.__new__(ModelRunner)
-    runner._held_routes = list(held)
-    return runner, ModelRunner
-
-
-def test_middle_chunk_routes_reach_the_next_output_in_order():
-    """Chunks 0..2 of one prompt: the middle chunk's routes ride the next output,
-    which carries the previous batch's routes (chunk 0, older than the held
-    chunk 1)."""
-    from atom.model_engine.scheduler import Scheduler
-
-    runner, cls = _runner_with_held(_pending(7, 4, 4, 1))
-    output = SimpleNamespace(routed_experts=None)
-    cls._attach_routed_experts(runner, _pending(7, 0, 4, 0), output)
-    assert runner._held_routes == []
-
-    seq = Sequence(list(range(12)), 4)
-    Scheduler._apply_routed_experts_patch({7: seq}, output.routed_experts)
-    assert seq.routed_expert_rows == 8
-    np.testing.assert_array_equal(seq.routed_experts[:, 0, 0], np.repeat([0, 1], 4))
-
-
-def test_held_routes_attach_without_a_batch_of_their_own():
-    runner, cls = _runner_with_held(_pending(3, 0, 2, 9), _pending(3, 2, 2, 8))
-    output = SimpleNamespace(routed_experts=None)
-    cls._attach_routed_experts(runner, None, output)
-    np.testing.assert_array_equal(output.routed_experts.starts, [0, 2])
-    np.testing.assert_array_equal(output.routed_experts.rows[:, 0, 0], [9, 9, 8, 8])
-
-
-def test_dummy_output_leaves_held_routes_for_the_next_real_output():
-    """An idle DP rank's dummy output can be discarded; the held rows must survive it."""
-    runner, cls = _runner_with_held(_pending(8, 0, 2, 4))
-    dummy_out = SimpleNamespace(routed_experts=None)
-    cls._attach_routed_experts(runner, None, dummy_out, take_held=False)
-    assert dummy_out.routed_experts is None
-    real_out = SimpleNamespace(routed_experts=None)
-    cls._attach_routed_experts(runner, None, real_out)
-    np.testing.assert_array_equal(real_out.routed_experts.starts, [0])
-
-
-def test_no_routes_leaves_output_untouched():
-    runner, cls = _runner_with_held()
-    output = SimpleNamespace(routed_experts=None)
-    cls._attach_routed_experts(runner, None, output)
-    assert output.routed_experts is None
+    assert isinstance(merged.rows, np.ndarray)
+    alone = merge_routed_patches([a])
+    assert isinstance(alone.rows, np.ndarray)
+    np.testing.assert_array_equal(alone.rows, a.rows.numpy())
 
 
 def test_incremental_decode_payload_smaller_than_full_history():
