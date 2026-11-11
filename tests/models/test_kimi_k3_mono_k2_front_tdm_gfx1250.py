@@ -33,6 +33,14 @@ def test_replicated_front_is_one_launch_of_one_cta_per_task_pair(rows):
     assert tdm_lds_bytes(rows, 2) <= 320 * 1024
 
 
+@pytest.mark.parametrize("rows", (1, 40, 48))
+def test_fp8_shared_front_takes_the_block_scales(rows):
+    kernel = front.build_replicated_front(_plan(rows), fp8_shared=True)
+    assert kernel.name.endswith(f"_s{rows}_f8")
+    names = kernel.abi.names
+    assert names.index("shared_scale") == names.index("shared_weight") + 1
+
+
 def test_replicated_front_feeds_only_the_grouped_moe_finish():
     with pytest.raises(ValueError, match="grouped-MoE"):
         build_packed_finish(_plan(16), replicated_front=True)

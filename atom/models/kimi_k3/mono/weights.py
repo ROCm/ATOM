@@ -291,6 +291,8 @@ class ExternalMoeLayer(RoutedMoeLayer):
     # The model's whole routed up-projection when it is plain BF16 (read in
     # place); None when only the dequantized rank band ``w_up`` exists.
     w_up_full: torch.Tensor | None = None
+    # E8M0 block scales of an online per_1x128 FP8 ``w_sgu``, or None (BF16).
+    w_sgu_scale: torch.Tensor | None = None
 
 
 def _seam(site, name: str) -> AttnRes:
@@ -551,8 +553,11 @@ def bind_external_moe(
     dims: Dims,
     rank: int,
     architecture: Architecture,
+    fp8_shared_gate_up: bool = False,
 ) -> ExternalMoeLayer:
-    """Bind native K2 local stages while leaving o_proj on its quantized path."""
+    """Bind native K2 local stages while leaving o_proj on its quantized path.
+    ``fp8_shared_gate_up``: the front reads an online per_1x128 FP8 shared
+    gate/up as it is; otherwise it must stay BF16."""
 
     routed = bind_routed_moe(
         layer,
@@ -571,14 +576,18 @@ def bind_external_moe(
         and tuple(up.shape) == (HIDDEN, LATENT)
         and up.is_contiguous()
     )
+    gate_up = f"{name} shared gate_up_proj"
+    gate_up_shape = (2 * dims.sh_inter, HIDDEN)
+    w_sgu, w_sgu_scale = (
+        _block_fp8(shared.gate_up_proj, gate_up, gate_up_shape)
+        if fp8_shared_gate_up and _param(shared.gate_up_proj, gate_up).dtype != BF16
+        else (_plain_bf16(shared.gate_up_proj, gate_up, gate_up_shape), None)
+    )
     return ExternalMoeLayer(
         **routed.__dict__,
         w_up_full=up.data if whole_up else None,
-        w_sgu=_plain_bf16(
-            shared.gate_up_proj,
-            f"{name} shared gate_up_proj",
-            (2 * dims.sh_inter, HIDDEN),
-        ),
+        w_sgu=w_sgu,
+        w_sgu_scale=w_sgu_scale,
         w_sd=_plain_bf16(
             shared.down_proj,
             f"{name} shared down_proj",

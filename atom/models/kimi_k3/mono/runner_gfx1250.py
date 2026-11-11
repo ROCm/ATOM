@@ -213,6 +213,7 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                 self.dims,
                 self.rank,
                 GFX1250,
+                fp8_shared_gate_up=True,
             )
             for plan in self.plans
             if plan.kda is not None
@@ -276,7 +277,8 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                 reset = routed.write_idx >= 0
                 nblocks = routed.blocks + reset
                 whole_up = routed.w_up_full is not None
-                k2_key = (nblocks, reset, routed.gu_interleave, whole_up)
+                fp8_shared = routed.w_sgu_scale is not None
+                k2_key = (nblocks, reset, routed.gu_interleave, whole_up, fp8_shared)
                 k2_local = k2_cache.get(k2_key)
                 if k2_local is None:
                     k2_local = self._build_routed_k2(
@@ -285,6 +287,7 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                         reset,
                         routed.gu_interleave,
                         whole_up,
+                        fp8_shared,
                     )
                     k2_cache[k2_key] = k2_local
                 k2_by_layer[layer.layer_id] = k2_local
@@ -298,10 +301,15 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
         reset: bool,
         gu_interleave: bool,
         whole_up: bool = False,
+        fp8_shared: bool = False,
     ) -> Gfx1250RoutedK2Build:
         plan = self._plan(rows, nblocks)
         # AITER's grouped TDM MoE reads GUGU gate/up planes only.
         grouped = gu_interleave
+        if fp8_shared and not grouped:
+            raise MonoUnsupported(
+                "only the replicated front reads an FP8 shared gate/up"
+            )
         # Both partials then take one all-reduce and every rank applies the
         # whole up-projection.
         replicated = grouped and whole_up
@@ -312,7 +320,7 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
         )
         width = TOPK + 1 if herd else TOPK
         front = (
-            build_replicated_front(plan)
+            build_replicated_front(plan, fp8_shared=fp8_shared)
             if grouped
             else build_role_lds_front(plan, include_attention=False, reset=reset)
         )
@@ -468,6 +476,7 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                 weight.w_gate.data_ptr(),
                 weight.w_ld.data_ptr(),
                 weight.w_sgu.data_ptr(),
+                0 if weight.w_sgu_scale is None else weight.w_sgu_scale.data_ptr(),
                 buffers["router_logits"].data_ptr(),
                 buffers["latent_fp4"].data_ptr(),
                 buffers["latent_scales"].data_ptr(),

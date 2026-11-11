@@ -15,7 +15,7 @@ from dataclasses import dataclass
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl.expr import gpu, range_constexpr
+from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import Int64
 
 from atom.models.kimi_k3.mono.config import EXPERTS, HIDDEN, LATENT, SUPPORTED_TP
@@ -53,6 +53,7 @@ REPLICATED_FRONT_ABI = KernelAbi(
         "router_weight",
         "latent_weight",
         "shared_weight",
+        "shared_scale",
         "router_logits",
         "latent_fp4",
         "latent_scales",
@@ -71,7 +72,22 @@ class K2ReplicatedFrontKernel:
     launch_count: int = 1
 
 
-def build_replicated_front(plan: Gfx1250KimiBuildPlan) -> K2ReplicatedFrontKernel:
+def _stage_accumulators(accumulators, red, tiles, wave, lane):
+    for tile in range_constexpr(tiles):
+        for task in range_constexpr(2):
+            gemv_gfx1250.store_accumulator(
+                accumulators[task][tile],
+                red + (2 * tile + task) * ACCUMULATOR_WORDS,
+                wave,
+                lane,
+            )
+
+
+def build_replicated_front(
+    plan: Gfx1250KimiBuildPlan, fp8_shared: bool = False
+) -> K2ReplicatedFrontKernel:
+    """``fp8_shared``: the shared gate/up is ATOM's online per_1x128 FP8 with
+    its E8M0 block scales in ``shared_scale``."""
     if plan.architecture is not GFX1250:
         raise ValueError("replicated K2 front requires gfx1250")
     if plan.threads != THREADS or plan.waves != WAVES:
@@ -81,6 +97,10 @@ def build_replicated_front(plan: Gfx1250KimiBuildPlan) -> K2ReplicatedFrontKerne
     rows = plan.tokens
     tiles = (rows + ROWS - 1) // ROWS
     staged = sum(tdm_lds_words(rows, 2))
+    # The FP8 shared slabs reuse the LDS planned for the BF16 ones, and the
+    # shared CTAs start a cluster, so no cluster mixes the two pipelines.
+    assert sum(tdm_lds_words(rows, 2, True, gemv_tdm.FP8_DEPTH)) <= staged
+    assert SHARED_PAIR0 % gemv_tdm.CLUSTER_LAUNCH["cluster"][0] == 0
 
     @fx.struct
     class Lds:
@@ -91,7 +111,7 @@ def build_replicated_front(plan: Gfx1250KimiBuildPlan) -> K2ReplicatedFrontKerne
         # columns, as 16 BF16 pairs.
         group: fx.Array[fx.Int32, rows * 16, 16]
 
-    name = f"k3_k2_gfx1250_replicated_front_s{rows}"
+    name = f"k3_k2_gfx1250_replicated_front_s{rows}{'_f8' if fp8_shared else ''}"
 
     sources = SOURCES
 
@@ -101,6 +121,7 @@ def build_replicated_front(plan: Gfx1250KimiBuildPlan) -> K2ReplicatedFrontKerne
         router_weight: Int64,
         latent_weight: Int64,
         shared_weight: Int64,
+        shared_scale: Int64,
         router_logits: Int64,
         latent_fp4: Int64,
         latent_scales: Int64,
@@ -132,26 +153,66 @@ def build_replicated_front(plan: Gfx1250KimiBuildPlan) -> K2ReplicatedFrontKerne
                 row0 + ROWS, shared_column0 + SHARED_COLUMNS
             )
             first = (router | latent).select(row0, shared_column0)
-            accumulators = gemv_tdm.project(
-                lds.gemv.ptr,
-                x,
-                HIDDEN,
-                rows,
-                weight,
-                weight_rows,
-                HIDDEN,
-                [first, second],
-                lane,
-                wave,
-            )
-            for tile in range_constexpr(tiles):
-                for task in range_constexpr(2):
-                    gemv_gfx1250.store_accumulator(
-                        accumulators[task][tile],
-                        lds.red.ptr + (2 * tile + task) * ACCUMULATOR_WORDS,
+            if const_expr(fp8_shared):
+                if pair >= SHARED_PAIR0:
+                    _stage_accumulators(
+                        gemv_tdm.project(
+                            lds.gemv.ptr,
+                            x,
+                            HIDDEN,
+                            rows,
+                            shared_weight,
+                            SHARED_ROWS,
+                            HIDDEN,
+                            [first, second],
+                            lane,
+                            wave,
+                            w_scale=shared_scale,
+                            depth=gemv_tdm.FP8_DEPTH,
+                        ),
+                        lds.red.ptr,
+                        tiles,
                         wave,
                         lane,
                     )
+                else:
+                    _stage_accumulators(
+                        gemv_tdm.project(
+                            lds.gemv.ptr,
+                            x,
+                            HIDDEN,
+                            rows,
+                            weight,
+                            weight_rows,
+                            HIDDEN,
+                            [first, second],
+                            lane,
+                            wave,
+                        ),
+                        lds.red.ptr,
+                        tiles,
+                        wave,
+                        lane,
+                    )
+            else:
+                _stage_accumulators(
+                    gemv_tdm.project(
+                        lds.gemv.ptr,
+                        x,
+                        HIDDEN,
+                        rows,
+                        weight,
+                        weight_rows,
+                        HIDDEN,
+                        [first, second],
+                        lane,
+                        wave,
+                    ),
+                    lds.red.ptr,
+                    tiles,
+                    wave,
+                    lane,
+                )
             gpu.barrier()
             # A round reduces one tile: threads [0, 128) the first task, the
             # rest the second.
@@ -232,6 +293,7 @@ def build_replicated_front(plan: Gfx1250KimiBuildPlan) -> K2ReplicatedFrontKerne
         router_weight: Int64,
         latent_weight: Int64,
         shared_weight: Int64,
+        shared_scale: Int64,
         router_logits: Int64,
         latent_fp4: Int64,
         latent_scales: Int64,
@@ -244,6 +306,7 @@ def build_replicated_front(plan: Gfx1250KimiBuildPlan) -> K2ReplicatedFrontKerne
             router_weight,
             latent_weight,
             shared_weight,
+            shared_scale,
             router_logits,
             latent_fp4,
             latent_scales,
