@@ -839,6 +839,37 @@ def test_engine_gates_a_prefetched_answer_while_every_restore_slot_is_taken(
     assert scheduled == ({seqs[2].id: seqs[2]} if runs else {})
 
 
+def test_unaligned_hbm_handoffs_wait_for_a_free_restore_slot(monkeypatch):
+    """A hand-off reserves its load after admission, so `lookup_pending` never
+    weighed it: three of them must not dispatch past the two restore slots."""
+    scheduler, _, _ = make_scheduler(monkeypatch)
+    seqs = [sequence(1 + i, computed=0, token_offset=100 * i) for i in range(3)]
+    for seq in seqs:
+        assert scheduler.get_num_new_matched_tokens(seq) == (16, True)
+        seq.num_cached_tokens = 4
+        scheduler.update_state_after_alloc(seq)
+        assert scheduler.should_park_for_load_after_alloc(seq) is False
+    assert scheduler._handoff_loads == {"1", "2", "3"}
+
+    for seq in seqs:
+        seq.num_cached_tokens = 8
+    assert [scheduler.should_park_partial_prefill_for_load(s) for s in seqs] == [
+        True,
+        True,
+        False,
+    ]
+    first, second = scheduler.build_connector_meta().requests
+    assert (first.req_id, second.req_id) == (1, 2)
+    assert scheduler._handoff_loads == {"3"}
+    assert scheduler.should_park_partial_prefill_for_load(seqs[2]) is False
+
+    assert scheduler.load_finished(first.load_operation)
+    assert scheduler.should_park_partial_prefill_for_load(seqs[2]) is True
+    [third] = scheduler.build_connector_meta().requests
+    assert third.req_id == 3 and third.load_spec.hbm_cached_tokens == 8
+    assert len(scheduler._native_loads) == 2
+
+
 @pytest.mark.parametrize("succeeded", [True, False])
 def test_engine_aborted_load_keeps_page_units_and_slot_until_terminal(
     monkeypatch, succeeded
