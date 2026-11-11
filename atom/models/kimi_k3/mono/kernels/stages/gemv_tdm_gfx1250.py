@@ -61,6 +61,8 @@ WAVE_COLUMNS = SLAB // WAVES
 WAVE_STEPS = WAVE_COLUMNS // K_PER_MMA
 assert WAVES * GFX1250.wave_size == TDM_FP8_SCALE_WORDS
 _DESCRIPTOR_TYPE = 2 << 30
+# gfx12 CPol TH_NT: each weight slab is read once per launch.
+_WEIGHT_CACHE_POLICY = 1
 _CLUSTER_MASK = (1 << TDM_CLUSTER) - 1 if TDM_CLUSTER > 1 else 0
 CLUSTER_LAUNCH = {
     "value_attrs": {"rocdl.cluster_dims": f"{TDM_CLUSTER},1,1"},
@@ -80,6 +82,7 @@ def load_rows(
     rows_per_wave: int,
     mask: int = 0,
     padded: bool = True,
+    cache_policy: int = 0,
 ):
     """Issue this wave's TDM copy of ``rows_per_wave`` of a [rows, SLAB] BF16
     tile starting at ``address`` into ``lds``; rows past ``rows`` are skipped.
@@ -133,7 +136,7 @@ def load_rows(
         zero4,
         zero4,
         zero8,
-        cache_policy=ir.IntegerAttr.get(ir.IntegerType.get_signless(32), 0),
+        cache_policy=ir.IntegerAttr.get(ir.IntegerType.get_signless(32), cache_policy),
     )
 
 
@@ -271,6 +274,7 @@ def project(
                     WAVES,
                     1,
                     padded=False,
+                    cache_policy=_WEIGHT_CACHE_POLICY,
                 )
             else:
                 load_rows(
@@ -281,6 +285,7 @@ def project(
                     destination,
                     fx.Int32(w_rows) - task_rows[task],
                     ROWS // WAVES,
+                    cache_policy=_WEIGHT_CACHE_POLICY,
                 )
             issued.append(slab)
 
