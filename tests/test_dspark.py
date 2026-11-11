@@ -2901,6 +2901,8 @@ def test_non_mla_block_drafts_skip_the_csr_and_the_mla_plan(
     It hands `prepare_paged_block` every token of the block at entry
     granularity, drops the pad row and the position past the table, and
     returns before the CSR generator, which a non-MLA read never consumes.
+    The context lengths arrive uncapped: `prepare_paged_block` caps them to
+    the allocation.
     The CSR fields still point at the draft's own buffers.
     """
     import torch
@@ -2954,7 +2956,7 @@ def test_non_mla_block_drafts_skip_the_csr_and_the_mla_plan(
         [9 * vblock + vblock - 1, -1],
         [-1, -1],
     ]
-    assert seen["ctx"] == [vblock + 1, 2 * vblock, 1 + T]
+    assert seen["ctx"] == [vblock + 1, 2 * vblock + 1, 1 + T]
     assert md.causal is False
     # No CSR on this path: the fields stay as the caller left them.
     assert md.kv_indices is None and md.kv_indptr is None

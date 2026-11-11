@@ -1023,14 +1023,9 @@ class DSparkProposer(Drafter):
             slots.masked_fill_(~in_table, -1)
             ctx_lens.copy_(global_lens)
 
-        # The CSR generator skips entries past the block table's width, so
-        # `kv_indptr` must not promise more than the table holds.
-        ctx_lens.clamp_(max=block_tables.shape[1] * entry_tokens)
-
         if running_bs > scheduled_bs:
             # See the docstring for why this tail reads a page rather than
-            # nothing. `_blk_last_page_lens` needs no tail of its own: it is
-            # all ones already, which is what one page holding one token means.
+            # nothing.
             slots[scheduled_bs:].fill_(-1)
             ctx_lens[scheduled_bs:].fill_(self._paged_pad_ctx_len)
 
@@ -1053,6 +1048,17 @@ class DSparkProposer(Drafter):
                 scheduled_bs,
             )
             return
+        # `kv_indptr` is a cumsum of these, and it must not promise more
+        # indices than the generator writes: `kv_indices_generate_kernel` masks
+        # its store with `block_cols < n_cols` (block_convert.py), so entries
+        # past the block table's width are simply skipped and the decode would
+        # read whatever the previous step left in `_blk_kv_indices`. The bound
+        # is the same in either branch's units -- one entry holds `block_size`
+        # of THIS rank's tokens under DCP too, since a rank packs its
+        # round-robin share of a virtual block densely into one page. A pad
+        # row's `_paged_pad_ctx_len` is at most one entry, so it is already
+        # within the bound.
+        ctx_lens.clamp_(max=block_tables.shape[1] * block_size)
         kv_indptr = self._blk_kv_indptr[: running_bs + 1]
         # kv_indptr[0] stays 0 (zero-init, never written). cumsum promotes
         # integers to int64, so land it through copy_ rather than out=.
@@ -1098,6 +1104,8 @@ class DSparkProposer(Drafter):
                 block_tables[scheduled_bs:, 0].copy_(saved_page0)
         attn_metadata.kv_indptr = kv_indptr
         attn_metadata.kv_indices = self._blk_kv_indices
+        # The pad tail needs no `_blk_last_page_lens` of its own: they are all
+        # ones already, which is what one page holding one token means.
         attn_metadata.kv_last_page_lens = self._blk_last_page_lens[:running_bs]
         # Build persistent (ps=1) MLA-decode metadata
         from atom.model_ops.attentions.aiter_mla import get_mla_metadata_v1
