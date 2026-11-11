@@ -52,8 +52,11 @@ from atom.model_ops.minimax_m3.router import (
 )
 from atom.model_ops.minimax_m3.router.router_swiglu import (
     gate_sort,
+    router_gateup_partials,
+    router_gateup_supported,
     router_partials_swiglu,
     router_swiglu_supported,
+    set_presort_output,
 )
 from atom.model_ops.minimax_m3.sparse_attn import (
     SPARSE_BLOCK_SIZE,
@@ -521,6 +524,76 @@ class MiniMaxM3MoE(nn.Module):
         shared = mlp.down_proj(x, x_scale=x_scale)
         return torch.add(shared, routed, alpha=scale)
 
+    def moe_with_shared_x(
+        self,
+        hidden_states: torch.Tensor,
+        shared_x: torch.Tensor,
+        shared_x_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        """``moe_with_shared`` from the shared expert's MXFP8 input rows: where
+        ``router_gateup_partials`` serves them, the shared gate_up GEMM runs
+        as split-K partials inside the router GEMV's launch and the gate +
+        sort launch finishes it with the SwiGLU; otherwise the gate_up linear
+        runs first, as in ``moe_with_shared``."""
+        mlp = self.shared_experts
+        lin = mlp.gate_up_proj
+        bias = self.e_score_correction_bias
+        scale = self.routed_scaling_factor
+        if (
+            envs.ATOM_M3_ROUTER_SWIGLU
+            and envs.ATOM_M3_ROUTER_GATEUP
+            and getattr(lin, "native_a8_group_rows", None) == 1
+            and getattr(lin, "bias", None) is None
+            and router_gateup_supported(
+                hidden_states,
+                self.gate.weight,
+                bias,
+                shared_x,
+                shared_x_scale,
+                lin.weight,
+                lin.weight_scale,
+            )
+            and router_gateup_partials(
+                hidden_states,
+                self.gate.weight,
+                shared_x,
+                shared_x_scale,
+                lin.weight,
+                lin.weight_scale,
+            )
+        ):
+            m = hidden_states.shape[0]
+            fold = envs.ATOM_M3_FOLD_SHARED_INTO_MOE
+            topk_w, topk_ids, presort, (x, x_scale) = gate_sort(
+                m,
+                bias,
+                routed_scaling_factor=scale,
+                n_local=pass_scheduled_tokens_gpu(m),
+                zero_moe_buf=not fold,
+                swiglu=(
+                    lin.weight.shape[0] // 2,
+                    mlp.swiglu_alpha,
+                    mlp.swiglu_beta,
+                    mlp.swiglu_limit,
+                ),
+            )
+            shared = mlp.down_proj(x, x_scale=x_scale)
+            fold = (
+                fold
+                and shared.shape == hidden_states.shape
+                and shared.dtype == hidden_states.dtype
+                and shared.is_contiguous()
+            )
+            if fold:
+                set_presort_output(presort, shared)
+            # without an output in the presort, fused_moe zeroes its own
+            routed = self._presorted_experts(hidden_states, topk_w, topk_ids, presort)
+            if fold and routed.data_ptr() == shared.data_ptr():
+                return routed  # GEMM2 accumulated onto the shared output
+            return torch.add(shared, routed)
+        gate_up = lin(shared_x, x_scale=shared_x_scale)
+        return self.moe_with_shared(hidden_states, gate_up)
+
     def shared_takes_mxfp8_input(self) -> bool:
         """Whether the separate shared expert's gate_up reads MXFP8, so the
         norm ahead of the MoE can also hand it E4M3 + E8M0 rows."""
@@ -545,12 +618,13 @@ class MiniMaxM3MoE(nn.Module):
             and mlp is not None
             and _linear_consumes_mxfp8(mlp.down_proj)
         ):
-            # the shared gate_up first: its SwiGLU can then share a launch with
-            # the router GEMV inside the MoE op
+            # the shared gate_up joins the router's launch inside the MoE op
+            # (MXFP8 rows), or runs first and its SwiGLU joins it
             if shared_x is not None:
-                gate_up = mlp.gate_up_proj(shared_x, x_scale=shared_x_scale)
-            else:
-                gate_up = mlp.gate_up_proj(hidden_states)
+                return torch.ops.aiter.minimax_m3_moe_with_shared_x(
+                    hidden_states, shared_x, shared_x_scale, self.routed_layer_name
+                ).view(orig_shape)
+            gate_up = mlp.gate_up_proj(hidden_states)
             return torch.ops.aiter.minimax_m3_moe_with_shared(
                 hidden_states, gate_up, self.routed_layer_name
             ).view(orig_shape)
@@ -615,6 +689,36 @@ def _minimax_m3_moe_with_shared_fake(
     hidden_states: torch.Tensor, gate_up: torch.Tensor, layer_name: str
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
+
+
+def _minimax_m3_moe_with_shared_x(
+    hidden_states: torch.Tensor,
+    shared_x: torch.Tensor,
+    shared_x_scale: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    moe = get_current_atom_config().compilation_config.static_forward_context[
+        layer_name
+    ]
+    return moe.moe_with_shared_x(hidden_states, shared_x, shared_x_scale)
+
+
+def _minimax_m3_moe_with_shared_x_fake(
+    hidden_states: torch.Tensor,
+    shared_x: torch.Tensor,
+    shared_x_scale: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
+
+
+direct_register_custom_op(
+    op_name="minimax_m3_moe_with_shared_x",
+    op_func=_minimax_m3_moe_with_shared_x,
+    mutates_args=[],
+    fake_impl=_minimax_m3_moe_with_shared_x_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
 
 
 # Writes only its output (the experts path runs with inplace=False; the
