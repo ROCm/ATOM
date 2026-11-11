@@ -169,11 +169,6 @@ The flat accuracy catalogs — `models_accuracy.json`, `oot_models_accuracy.json
   eval budget. If omitted, the eval budget is 30 minutes. The native ATOM step
   also launches the server, so its timeout is the larger of this value and 60
   minutes; the atomesh step times out at this value alone.
-- **KV block agreement**: set optional `kv_block_ranks` on a
-  `models_accuracy.json` entry to the number of workers in its engine (TP × PCP,
-  or SP). The native ATOM job then requires that many `Memory budget` lines in
-  the server log, all with one `num_kvcache_blocks`. Leave it unset with DP
-  attention: each DP rank is a separate engine with its own count.
 - **Known drift (tolerated for now)**: `extraArgs` vs `extra_args` and
   `accuracy_threshold` vs `accuracy_test_threshold` are both accepted; the schema
   documents the current reality. Normalizing these (and their consumers) is a

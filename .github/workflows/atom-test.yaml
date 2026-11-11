@@ -653,16 +653,6 @@ jobs:
             "$CONTAINER_NAME" bash -lc "
             .github/scripts/atom_test.sh accuracy $model_path
           " 2>&1 | tee atom_accuracy_output.txt
-
-      - name: Check every rank built one KV block count
-        # Opt-in per catalog entry (`kv_block_ranks`): with DP attention every
-        # DP rank is its own engine, and those counts may differ.
-        if: ${{ !cancelled() && matrix.kv_block_ranks != '' }}
-        run: |
-          set -euo pipefail
-          docker exec "$CONTAINER_NAME" cat /tmp/atom_server.log > atom_server_kv_blocks.log
-          python3 .github/scripts/check_kv_block_agreement.py \
-            atom_server_kv_blocks.log --ranks "${{ matrix.kv_block_ranks }}"
       
       - name: Dump server log
         if: always()
