@@ -156,15 +156,50 @@ def swiglu_oai_mxfp8_tile(
     mask = cols < n_inter
     gate = tl.load(gate_up_ptr + row * stride_gm + cols, mask=mask, other=0.0)
     up = tl.load(gate_up_ptr + row * stride_gm + n_inter + cols, mask=mask, other=0.0)
-    gate = gate.to(tl.float32)
-    up = up.to(tl.float32)
+    swiglu_mxfp8_store(
+        gate.to(tl.float32),
+        up.to(tl.float32),
+        q_ptr,
+        scale_ptr,
+        n_inter,
+        alpha,
+        beta,
+        limit,
+        has_limit,
+        block_i,
+        row,
+        tile,
+        gate_up_ptr.dtype.element_ty,
+    )
+
+
+@triton.jit
+def swiglu_mxfp8_store(
+    gate,
+    up,
+    q_ptr,
+    scale_ptr,
+    n_inter: tl.constexpr,
+    alpha,
+    beta,
+    limit,
+    has_limit: tl.constexpr,
+    block_i: tl.constexpr,
+    row,
+    tile,
+    act_dtype: tl.constexpr,
+):
+    """SwiGLU-OAI of one row's ``block_i`` gate / up values (fp32, holding
+    ``act_dtype`` values) and its E4M3 + E8M0 group32 store at ``tile``."""
+    cols = tile * block_i + tl.arange(0, block_i)
+    mask = cols < n_inter
     if has_limit:
         gate = tl.minimum(gate, limit)
         up = tl.minimum(tl.maximum(up, -limit), limit)
     out = gate * tl.sigmoid(alpha * gate) * (up + beta)
     # Round to the activation dtype first: the separate path stores this row
     # in it and quantizes what it reads back, and the bytes must agree.
-    out = out.to(gate_up_ptr.dtype.element_ty).to(tl.float32)
+    out = out.to(act_dtype).to(tl.float32)
     q, code, _ = fp8_groups(tl.reshape(out, (block_i // 32, 32)))
     tl.store(
         q_ptr + row * n_inter + tl.reshape(cols, (block_i // 32, 32)),

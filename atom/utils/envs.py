@@ -600,6 +600,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MoE sort in a second (atom/model_ops/minimax_m3/router/router_swiglu.py),
     # instead of the one-launch router and a separate SwiGLU. 0 disables it.
     "ATOM_M3_ROUTER_SWIGLU": lambda: os.getenv("ATOM_M3_ROUTER_SWIGLU", "1") == "1",
+    # MiniMax-M3.1, with ATOM_M3_ROUTER_SWIGLU and MXFP8 rows from the fused
+    # AR + RMSNorm: run the shared expert's gate_up GEMM as split-K partials in
+    # the router GEMV's launch (tl.dot_scaled) and finish it with the SwiGLU in
+    # the gate + sort launch. 0 runs the gate_up linear first.
+    "ATOM_M3_ROUTER_GATEUP": lambda: os.getenv("ATOM_M3_ROUTER_GATEUP", "1") == "1",
     # MiniMax-M3.1, with ATOM_M3_ROUTER_SWIGLU: fold the routed scaling into the
     # routing weights and let GEMM2 accumulate onto the shared expert's output,
     # dropping the combine launch. Not bitwise: the shared output is rounded
