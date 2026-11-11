@@ -189,3 +189,87 @@ def test_the_index_k_row_store_is_vllms_writer_byte_for_byte(scale):
     assert int((want != 0).sum()) > 1000  # not a vacuous comparison
     bad = (got != want.view(blocks, -1)).nonzero()
     assert bad.numel() == 0, f"{bad.shape[0]} bytes differ, first {bad[:6].tolist()}"
+
+
+def _kv_store_launcher(n_tokens: int):
+    """K1's K / V head tasks' stores: a token a half wave, lane l holding elements
+    4 l .. 4 l + 3 of the K row and of the V row."""
+    import flydsl.compiler as flyc
+    import flydsl.expr as fx
+    from aiter.ops.flydsl.kernels import buffer_ops as bo
+    from flydsl.expr.typing import Int32, Int64, T
+
+    from atom.models.minimax_m3.mono.kernels.common import (
+        ld_bf16x4,
+        nvfp4_k_store,
+        nvfp4_v_store,
+    )
+    from atom.mono.device.ops import rsrc
+
+    blocks = (n_tokens + 1) // 2
+
+    @flyc.kernel(name="mono_nvfp4_kv_store_test", known_block_size=[64, 1, 1])
+    def kernel(
+        krows: Int64, vrows: Int64, slots: Int64, cache: Int64, gs: Int64, n: Int32
+    ):
+        tid = fx.thread_idx.x
+        tk = fx.block_idx.x * 2 + tid // 32
+        l32 = tid % 32
+        if tk < n:
+            slot = fx.Int32(
+                bo.buffer_load(rsrc(slots), 2 * tk, vec_width=1, dtype=T.i32)
+            )
+            kv = ld_bf16x4(rsrc(krows), tk * HEAD_DIM + l32 * 4)
+            vv = ld_bf16x4(rsrc(vrows), tk * HEAD_DIM + l32 * 4)
+            kg = fx.Float32(bo.buffer_load(rsrc(gs), 0, vec_width=1, dtype=T.f32))
+            vg = fx.Float32(bo.buffer_load(rsrc(gs), 1, vec_width=1, dtype=T.f32))
+            if slot >= 0:
+                nvfp4_k_store(rsrc(cache), slot, kv, l32, kg)
+                nvfp4_v_store(rsrc(cache), cache, slot, vv, l32, vg)
+
+    @flyc.jit
+    def launch(
+        krows: Int64,
+        vrows: Int64,
+        slots: Int64,
+        cache: Int64,
+        gs: Int64,
+        n: Int32,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+    ):
+        kernel(krows, vrows, slots, cache, gs, n).launch(
+            grid=(blocks,), block=(64,), stream=stream
+        )
+
+    return launch
+
+
+@pytest.mark.parametrize("k_scale, v_scale", [(1.0, 1.0), (0.37, 2.5), (8.0, 0.05)])
+def test_the_kv_row_stores_are_vllms_writer_byte_for_byte(k_scale, v_scale):
+    _, ref = _reference_modules()
+    t, blocks = 90, 3
+    g = torch.Generator(device="cuda").manual_seed(4)
+    k = torch.randn(t, 1, HEAD_DIM, device="cuda", generator=g).to(torch.bfloat16)
+    v = (torch.randn(t, 1, HEAD_DIM, device="cuda", generator=g) * 3).to(torch.bfloat16)
+    k[3, 0, :32] = 0
+    v[5, 0, 16:32] = 1e-7
+    # consecutive slots (a verify's rows share octets) and scattered ones
+    slots = torch.cat(
+        [
+            torch.arange(130, 130 + 40, device="cuda"),
+            torch.randperm(128, device="cuda", generator=g)[: t - 41],
+            torch.tensor([-1], device="cuda"),
+        ]
+    ).to(torch.int64)
+    assert slots.numel() == t
+    want = torch.zeros(blocks, 2, 128, 72, device="cuda", dtype=torch.uint8)
+    ref.insert_nvfp4_kv(k, v, want, slots, k_scale, v_scale)
+    got = torch.zeros(blocks, 2 * 9216, device="cuda", dtype=torch.uint8)
+    gs = torch.tensor([k_scale, v_scale], device="cuda", dtype=torch.float32)
+    _kv_store_launcher(t)(
+        k.data_ptr(), v.data_ptr(), slots.data_ptr(), got.data_ptr(), gs.data_ptr(), t
+    )
+    torch.cuda.synchronize()
+    assert int((want != 0).sum()) > 1000
+    bad = (got != want.view(blocks, -1)).nonzero()
+    assert bad.numel() == 0, f"{bad.shape[0]} bytes differ, first {bad[:6].tolist()}"
