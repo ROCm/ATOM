@@ -39,11 +39,26 @@ class DraftKvPoolSpec:
         """What `make_kv_pool` takes beyond the geometry."""
         return {"blocks_per_entry": dcp, "flash_layout": True}
 
-    def block_size(self, model_runner) -> int:
-        """The block the pool is built at. The target's builder may page at a
-        kernel page instead (MLA's ATOM_MLA_PAGE_SIZE), which a block id does
-        not count in."""
-        return model_runner.block_size
+    def block_size(self, config) -> int:
+        """The block the pool is built at, the scheduler's. The target's
+        builder may page at a kernel page instead (MLA's ATOM_MLA_PAGE_SIZE),
+        which a block id does not count in."""
+        return config.kv_cache_block_size
+
+    def entry_tokens(self, config) -> int:
+        """The tokens one entry spans: the pool is built at it, and the draft's
+        reader is built for it."""
+        dcp = config.decode_context_parallel_size
+        return self.block_size(config) * self.pool_kwargs(dcp)["blocks_per_entry"]
+
+
+def draft_kv_dtype(config) -> torch.dtype:
+    """The dtype a draft's own pool stores K and V in, the configured KV
+    cache dtype: the pool is built in it, and the draft's reader is built for
+    it."""
+    from aiter import dtypes
+
+    return dtypes.d_dtypes[config.kv_cache_dtype]
 
 
 def draft_kv_builder(model_runner, draft_hf, model):
@@ -69,8 +84,6 @@ def draft_kv_builder(model_runner, draft_hf, model):
             "scale planes and nothing loads a scale into it"
         )
 
-    from aiter import dtypes
-
     from atom.utils.selector import attn_family, get_attn_backend
 
     backend = get_attn_backend(attn_family(draft_hf))
@@ -87,13 +100,13 @@ def draft_kv_builder(model_runner, draft_hf, model):
     else:
         dcp = model_runner.config.decode_context_parallel_size
         spec_kwargs = spec.pool_kwargs(dcp)
-        block_size = spec.block_size(model_runner)
+        block_size = spec.block_size(model_runner.config)
         kv_scale = spec.kv_scale
     make_pool = partial(
         backend.make_kv_pool,
         draft_hf,
         world_size=model_runner.world_size,
-        kv_dtype=dtypes.d_dtypes[model_runner.config.kv_cache_dtype],
+        kv_dtype=draft_kv_dtype(model_runner.config),
         **spec_kwargs,
     )
     # A way to build it, not the pool: how many rows it has is the walk's to
@@ -265,6 +278,11 @@ class DraftKvBuilder(PoolRowsMixin):
             k_cache, v_cache = pool.fa_views(idx)
         else:
             k_cache, v_cache = pool.kv_views(idx)
+        # A layer's reader may be built for one entry width and dtype; a view
+        # of any other would be read at the wrong stride, with no error.
+        check_cache = getattr(module, "check_cache", None)
+        if check_cache is not None:
+            check_cache(k_cache, v_cache)
         if self._kv_scale is not None:
             if self._kv_scale_tensor is None:
                 self._kv_scale_tensor = torch.full(

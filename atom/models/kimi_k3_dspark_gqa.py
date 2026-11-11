@@ -60,11 +60,15 @@ from atom.models.dspark_draft import (
     linear_out,
 )
 from atom.models.qwen3 import Qwen3MLP
-from atom.spec_decode.draft_kv import DraftKvPoolSpec
+from atom.spec_decode.draft_kv import DraftKvPoolSpec, draft_kv_dtype
 from atom.spec_decode.drafter import AuxCaptureSpec
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
+
+
+def _head_dim(config) -> int:
+    return getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
 
 
 class KimiK3DSparkGQAAttention(nn.Module):
@@ -80,7 +84,6 @@ class KimiK3DSparkGQAAttention(nn.Module):
         self,
         config,
         layer_num: int,
-        block_attn,
         quant_config=None,
         prefix: str = "",
     ):
@@ -88,11 +91,7 @@ class KimiK3DSparkGQAAttention(nn.Module):
         self.hidden_size = config.hidden_size
         self.total_num_heads = config.num_attention_heads
         self.total_num_kv_heads = config.num_key_value_heads
-        self.head_dim = getattr(
-            config, "head_dim", config.hidden_size // config.num_attention_heads
-        )
-
-        self.block_attn = block_attn
+        self.head_dim = _head_dim(config)
 
         # Plain TP: the draft is outside the target's DCP group, so `o_proj`'s
         # input shard is exactly the head slice the read produces.
@@ -109,7 +108,6 @@ class KimiK3DSparkGQAAttention(nn.Module):
         self.num_kv_heads = self.qkv_proj.num_kv_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim**-0.5
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             self.hidden_size,
@@ -137,6 +135,13 @@ class KimiK3DSparkGQAAttention(nn.Module):
         )
 
         self.kv = KVCacheBinding(layer_num)
+        self.block_attn = None
+
+    def use_block_read(self, block_attn) -> None:
+        """Read the block through `block_attn`, and bind only a pool it was
+        built for."""
+        self.block_attn = block_attn
+        self.kv.check_cache = block_attn.check_cache
 
     def _qkv(self, hidden_states: torch.Tensor):
         qkv = linear_out(self.qkv_proj(hidden_states))
@@ -207,7 +212,6 @@ class KimiK3DSparkGQAAttention(nn.Module):
             v_cache,
             attn_metadata.block_tables,
             attn_metadata.context_lens[:bs],
-            self.scaling,
             self.kv.k_scale,
             self.kv.v_scale,
         )
@@ -240,7 +244,6 @@ class KimiK3DSparkGQADecoderLayer(DSparkGQADecoderLayer):
         self,
         config,
         layer_num: int,
-        block_attn,
         quant_config=None,
         prefix: str = "",
     ):
@@ -248,7 +251,6 @@ class KimiK3DSparkGQADecoderLayer(DSparkGQADecoderLayer):
         self.self_attn = KimiK3DSparkGQAAttention(
             config,
             layer_num,
-            block_attn,
             quant_config,
             prefix=f"{prefix}.self_attn",
         )
@@ -333,18 +335,11 @@ class KimiK3DSparkGQA(DSparkDraftModel):
         )
         self.hidden_norm = RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
 
-        # One block read for every layer, built before any capture.
-        block_attn = DSparkGQABlockAttention(
-            torch.get_default_device(),
-            max_bs=int(atom_config.max_num_seqs),
-            max_model_len=int(atom_config.max_model_len),
-        )
         self.layers = nn.ModuleList(
             [
                 KimiK3DSparkGQADecoderLayer(
                     config,
                     layer_offset + i,
-                    block_attn,
                     quant_config,
                     prefix=f"layers.{i}",
                 )
@@ -371,6 +366,26 @@ class KimiK3DSparkGQA(DSparkDraftModel):
         self._alloc_cap = AllocationCap(
             int(atom_config.max_num_seqs), torch.get_default_device()
         )
+
+        # One block read for every layer, built before any capture, for the
+        # pool `draft_kv_builder` builds from the same two calls, and the
+        # per-rank heads the layers project. The block is `mtp_k` rows wide,
+        # which is `num_speculative_tokens`.
+        attn = self.layers[0].self_attn
+        block_attn = DSparkGQABlockAttention(
+            torch.get_default_device(),
+            max_bs=int(atom_config.max_num_seqs),
+            max_model_len=int(atom_config.max_model_len),
+            num_heads=attn.num_heads,
+            num_kv_heads=attn.num_kv_heads,
+            block_rows=int(atom_config.speculative_config.num_speculative_tokens),
+            head_size=attn.head_dim,
+            block_size=int(self.kv_pool_spec.entry_tokens(atom_config)),
+            kv_dtype=draft_kv_dtype(atom_config),
+            softmax_scale=attn.head_dim**-0.5,
+        )
+        for layer in self.layers:
+            layer.self_attn.use_block_read(block_attn)
 
     def prepare_paged_block(
         self,

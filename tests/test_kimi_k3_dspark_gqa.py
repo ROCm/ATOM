@@ -315,6 +315,7 @@ def _stub_runner(tp=8, dcp=1, kv_cache_dtype="fp8"):
         world_size=tp,
         block_size=128,
         config=types.SimpleNamespace(
+            kv_cache_block_size=128,
             kv_cache_dtype=kv_cache_dtype,
             tensor_parallel_size=tp,
             decode_context_parallel_size=dcp,
@@ -969,13 +970,23 @@ def test_unified_block_read_matches_the_bidirectional_reference(kv_dtype, far_en
         k_pool, v_pool = k_pool.to(dtypes.fp8), v_pool.to(dtypes.fp8)
     scale = d**-0.5
 
-    read = dba.DSparkGQABlockAttention(dev, max_bs=8, max_model_len=W * E)
+    read = dba.DSparkGQABlockAttention(
+        dev,
+        max_bs=8,
+        max_model_len=W * E,
+        num_heads=hq,
+        num_kv_heads=hkv,
+        block_rows=T,
+        head_size=d,
+        block_size=E,
+        kv_dtype=k_pool.dtype,
+        softmax_scale=scale,
+    )
     one = torch.ones(1, dtype=torch.float32, device=dev)
     # Where the read casts q to an fp8 pool's dtype (gfx950), the reference
     # takes the same q. Taken BEFORE the call, which clamps q in place.
-    cast = kv_dtype == "fp8" and read.casts_q(k_pool, v_pool)
-    q_ref = q.to(k_pool.dtype).to(q.dtype) if cast else q.clone()
-    o = read(q, k_pool, v_pool, block_tables, kv_lens, scale, one, one)
+    q_ref = q.to(k_pool.dtype).to(q.dtype) if read.casts_q else q.clone()
+    o = read(q, k_pool, v_pool, block_tables, kv_lens, one, one)
 
     args = (q_ref, k_pool, v_pool, block_tables, kv_lens, scale, hkv)
     ref = _reference_block_attn(*args)
@@ -1001,8 +1012,11 @@ def test_gqa_draft_is_refused_on_a_non_k3_target():
 
 
 def test_fp8_q_cast_asks_aiters_gluon_gate_with_the_reads_arguments(monkeypatch):
-    """The cast follows aiter's own gate, asked about this read: q in the
-    pool's dtype, the pool's head and page sizes, no softcap, all-decode."""
+    """The cast follows aiter's own gate, asked once when the read is built,
+    with every field the deployment fixes: q in the pool's dtype, the folded
+    query's heads (8 heads x 7 rows over 2 KV heads), the pool's head and
+    entry sizes, the read's scale and key bound, the device's CUs, no softcap,
+    all-decode. Only the fields no deployment fixes are left unset."""
     torch = pytest.importorskip("torch")
     dba = _fold_mod()
     ua = dba.ua
@@ -1013,22 +1027,73 @@ def test_fp8_q_cast_asks_aiters_gluon_gate_with_the_reads_arguments(monkeypatch)
         return params.head_size == 64
 
     monkeypatch.setattr(ua, "_gfx950_gluon_supported", gate)
-    read = dba.DSparkGQABlockAttention("cpu", max_bs=2, max_model_len=1024)
+    monkeypatch.setattr(dba, "get_num_sms", lambda: 256)
     fp8 = torch.float8_e4m3fn
-    k = torch.empty(2, 1024, 2, 64, dtype=fp8)
-    assert read.casts_q(k, k) and read.casts_q(k, k)
-    assert len(seen) == 1, "the answer is cached per pool shape and dtype"
-    p = seen[0]
+
+    def build(head_size, kv_dtype):
+        return dba.DSparkGQABlockAttention(
+            "cpu",
+            max_bs=2,
+            max_model_len=4096,
+            num_heads=8,
+            num_kv_heads=2,
+            block_rows=7,
+            head_size=head_size,
+            block_size=1024,
+            kv_dtype=kv_dtype,
+            softmax_scale=0.125,
+        )
+
+    assert build(64, fp8).casts_q
+    (p,) = seen
     assert (p.head_size, p.head_size_v, p.block_size) == (64, 64, 1024)
     assert p.q_dtype == p.kv_cache_dtype == fp8
-    assert p.softcap == 0 and p.max_seqlen_q == 1 and p.all_decode
+    assert (p.num_query_heads, p.num_kv_heads, p.num_queries_per_kv) == (56, 2, 28)
+    assert (p.softmax_scale, p.max_seqlen_k, p.num_sms) == (0.125, 4096, 256)
+    assert p.softcap == 0 and p.causal and p.sliding_window == 0
+    assert p.max_seqlen_q == 1 and p.all_decode
     assert not (p.shuffled_kv_cache or p.use_alibi_slopes or p.use_qq_bias)
+    unset = {f for f in ua._UAParams._fields if getattr(p, f) is None}
+    optional = set(ua._UAParams._field_defaults)
+    assert unset - optional == set(dba._UNFIXED_FIELDS)
 
-    k96 = torch.empty(2, 1024, 2, 96, dtype=fp8)
-    assert not read.casts_q(k96, k96)
+    assert not build(96, fp8).casts_q
+    # A bf16 pool takes q as it is, without asking.
+    assert not build(64, torch.bfloat16).casts_q
+    assert len(seen) == 2
 
     monkeypatch.delattr(ua, "_gfx950_gluon_supported")
-    assert not dba.gluon_takes_pool_dtype_q(64, 64, 1024, fp8)
+    assert not build(64, fp8).casts_q
+
+
+def test_the_block_read_refuses_a_pool_it_was_not_built_for():
+    """The read was built for one entry width, KV head count, head size and
+    dtype, and takes them off the cache it is bound to; a bind of any other
+    pool raises."""
+    torch = pytest.importorskip("torch")
+    dba = _fold_mod()
+    read = dba.DSparkGQABlockAttention(
+        "cpu",
+        max_bs=2,
+        max_model_len=4096,
+        num_heads=8,
+        num_kv_heads=2,
+        block_rows=7,
+        head_size=64,
+        block_size=256,
+        kv_dtype=torch.bfloat16,
+        softmax_scale=0.125,
+    )
+    good = torch.empty(2, 256, 2, 64, dtype=torch.bfloat16)
+    read.check_cache(good, good)
+    for bad in (
+        torch.empty(2, 128, 2, 64, dtype=torch.bfloat16),
+        torch.empty(2, 256, 4, 64, dtype=torch.bfloat16),
+        torch.empty(2, 256, 2, 96, dtype=torch.bfloat16),
+        torch.empty(2, 256, 2, 64, dtype=torch.float8_e4m3fn),
+    ):
+        with pytest.raises(ValueError, match="DSpark block read was built for"):
+            read.check_cache(good, bad)
 
 
 def test_fp8_q_cast_saturates_instead_of_producing_nan():
@@ -1043,17 +1108,28 @@ def test_fp8_q_cast_saturates_instead_of_producing_nan():
     dba = _fold_mod()
     dev = torch.device("cuda")
     bs, T, hkv, g, d, E = 2, 7, 2, 4, 64, 1024
-    read = dba.DSparkGQABlockAttention(dev, max_bs=4, max_model_len=E)
+    read = dba.DSparkGQABlockAttention(
+        dev,
+        max_bs=4,
+        max_model_len=E,
+        num_heads=hkv * g,
+        num_kv_heads=hkv,
+        block_rows=T,
+        head_size=d,
+        block_size=E,
+        kv_dtype=dtypes.fp8,
+        softmax_scale=d**-0.5,
+    )
     k_pool = torch.randn(3, E, hkv, d, device=dev).to(dtypes.fp8)
     v_pool = torch.randn_like(k_pool, dtype=torch.float32).to(dtypes.fp8)
-    if not read.casts_q(k_pool, v_pool):
+    if not read.casts_q:
         pytest.skip("q is only cast to fp8 where aiter's Gluon path serves the read")
     q = torch.randn(bs * T, hkv * g, d, device=dev, dtype=torch.bfloat16)
     q[0, 0, 0] = 1e4  # far past fp8_e4m3's 448
     block_tables = torch.tensor([[1], [2]], dtype=torch.int32, device=dev)
     kv_lens = torch.tensor([100, 200], dtype=torch.int32, device=dev)
     one = torch.ones(1, dtype=torch.float32, device=dev)
-    o = read(q, k_pool, v_pool, block_tables, kv_lens, d**-0.5, one, one)
+    o = read(q, k_pool, v_pool, block_tables, kv_lens, one, one)
     assert torch.isfinite(o).all()
 
 

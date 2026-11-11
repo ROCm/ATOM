@@ -357,6 +357,56 @@ def test_a_flash_pool_binds_entry_wide_flash_views_and_the_declared_scale(
     assert module.k_scale.numel() == 1 and float(module.k_scale) == 1.0
 
 
+@pytest.mark.parametrize("dcp", [1, 8])
+def test_a_declared_entry_is_the_span_of_the_pool_the_spec_builds(dcp):
+    """`entry_tokens` is what a draft builds its reader for; it has to be the
+    width of the pool built from the same spec's block and kwargs."""
+    spec = DraftKvPoolSpec()
+    config = SimpleNamespace(kv_cache_block_size=128, decode_context_parallel_size=dcp)
+    pool = MhaKvPool(
+        layers=1,
+        block_size=spec.block_size(config),
+        num_kv_heads=2,
+        head_dim=64,
+        kv_dtype=torch.bfloat16,
+        **spec.pool_kwargs(dcp),
+    )
+    assert spec.entry_tokens(config) == pool.entry_tokens == 128 * dcp
+
+
+def test_a_layer_refuses_a_cache_its_reader_was_not_built_for():
+    """A layer's `check_cache` sees the views before they are bound, and its
+    error stops the bind: the layer keeps no cache it would misread."""
+    pool = MhaKvPool(
+        layers=1,
+        block_size=128,
+        num_kv_heads=2,
+        head_dim=64,
+        kv_dtype=torch.bfloat16,
+        blocks_per_entry=2,
+        flash_layout=True,
+    )
+    pool.allocate(2, "cpu")
+    runner = _runner(draft_layers=1)
+    runner.config = SimpleNamespace(max_model_len=4096, kv_cache_dtype="bf16")
+    builder = DraftKvBuilder(runner, lambda **_: pool, kv_scale=1.0)
+    builder._kv_pool = pool
+    module = next(m for m in runner.drafter.model if isinstance(m, _PagedAttention))
+    module.layer_num = 0
+    seen = []
+
+    def check_cache(k_cache, v_cache):
+        seen.append((k_cache.shape, v_cache.shape))
+        if k_cache.shape[1] != 128:
+            raise ValueError("entry width")
+
+    module.check_cache = check_cache
+    with pytest.raises(ValueError, match="entry width"):
+        builder.build_kv_cache_tensor(module)
+    assert seen == [((2, 256, 2, 64), (2, 256, 2, 64))]
+    assert not hasattr(module, "k_cache")
+
+
 @pytest.mark.parametrize("declared", [True, False])
 def test_a_declared_pool_on_a_backend_that_cannot_own_one_is_refused(
     monkeypatch, declared
