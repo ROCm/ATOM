@@ -12,6 +12,7 @@ import pytest
 pytest.importorskip("aiter")
 pytest.importorskip("flydsl")
 
+from atom.models.deepseek_v41.mono.builds import unfused_post_key
 from atom.models.deepseek_v41.mono.kernels import attn_post as k2a
 from atom.models.deepseek_v41.mono.kernels import attn_pre as k1
 from atom.models.deepseek_v41.mono.kernels import layer_post as k2
@@ -85,4 +86,17 @@ def test_one_field_changed_is_a_new_binary(cache, build, name):
     _, _, base, other = BUILDS[build]
     _compile(build, base)
     _compile(build, dataclasses.replace(base, **{name: other[name]}))
+    assert len(_entries(cache)) == 2
+
+
+def test_the_unfused_k2_is_its_own_binary(cache):
+    """The width a K2 spill is rebuilt as (``builds.unfused_post_key``) differs
+    in two fields at once, so the lean rebuild is never served the fused
+    binary it was built to replace."""
+    fused = k2.LayerPostBuild(
+        tokens=48, index_bound_max=1 << 20, index_fp4=True, index_mfma=True,
+        tp=4, tok_par=True, kv_fp8=True,
+    )  # fmt: skip
+    _compile("k2", fused)
+    _compile("k2", unfused_post_key(fused))
     assert len(_entries(cache)) == 2

@@ -16,6 +16,7 @@ pytest.importorskip("aiter")
 pytest.importorskip("flydsl")
 
 from atom.models.deepseek_v41.mono import contract
+from atom.models.deepseek_v41.mono.builds import unfused_keys
 from atom.models.deepseek_v41.mono.kernels import attn_pre as k1
 from atom.models.deepseek_v41.mono.kernels import layer_post as k2
 from atom.mono.plan.check import ContractError, check
@@ -68,6 +69,36 @@ def test_fp4_index_layout_contract(monkeypatch, index_mfma, tok_par):
     )
     record = trace(k2.build_layer_post(key), k2.ABI)
     check(record, contract.k2_regions(key))
+
+
+# the 48-row TP4 verify whose fused K2 needs scratch, and the unfused pair the
+# lean rebuild serves it as (``builds.unfused_keys``)
+SPILLING_K1 = k1.AttnPreBuild(
+    tokens=48, fold=True, feeds_index=True, index_fp4=True, tp=4,
+    tok_par=True, kv_fp8=True,
+)  # fmt: skip
+SPILLING_K2 = k2.LayerPostBuild(
+    tokens=48, index_bound_max=1 << 20, index_fp4=True, index_mfma=True, tp=4,
+    tok_par=True, kv_fp8=True,
+)  # fmt: skip
+UNFUSED_K1, UNFUSED_K2 = unfused_keys([SPILLING_K1], SPILLING_K2)
+
+
+def test_the_unfused_width_holds(monkeypatch):
+    """The pair a K2 spill is rebuilt as: K2 with its index stage out, so it
+    reads the selection ``runner._publish_selection`` wrote instead of making
+    one, and K1 without token parallel. Both still hold their hand-off
+    contract, index regions and all gone with the stage."""
+    monkeypatch.setenv("ARCH", "gfx950")
+    monkeypatch.setenv("FLYDSL_RUNTIME_ENABLE_CACHE", "0")
+    assert UNFUSED_K2.index_bound_max == 0 and UNFUSED_K2.tok_par is False
+    check(
+        trace(k1.build_attn_pre(UNFUSED_K1[0]), k1.ABI),
+        contract.k1_regions(UNFUSED_K1[0]),
+    )
+    check(
+        trace(k2.build_layer_post(UNFUSED_K2), k2.ABI), contract.k2_regions(UNFUSED_K2)
+    )
 
 
 def _changed(decls, name, **change):
