@@ -555,7 +555,7 @@ def test_decode_bookkeeping_does_not_wait_for_an_unrelated_router_lock():
 
 def _make_spread_mgr(n_ranks=2, tier=None):
     from atom.kv_transfer.disaggregation.factory import OffloadTierProfile
-    from atom.model_engine.prefix_spread import PrefixSpreadRouter
+    from atom.model_engine.dp_routing.prefix_spread import PrefixSpreadRouter
 
     if tier is None:
         tier = OffloadTierProfile(loads=True, min_load_tokens=8192)

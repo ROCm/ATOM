@@ -17,7 +17,7 @@ from collections import OrderedDict
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
-from atom.model_engine.dp_route import (
+from atom.model_engine.dp_routing.route import (
     PREFIX_COLD,
     PREFIX_DECISIONS,
     PREFIX_MOVED,
