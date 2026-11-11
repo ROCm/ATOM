@@ -201,7 +201,7 @@ class PrefixSpreadRouter:
         chain = getattr(seq, "prompt_hash_chain", None)
         # One read-only walk serves every lookup below; only `_record` walks again.
         path = self._path(chain)
-        hits, owner = self._rank_hits(chain, len(rank_tokens), path)
+        hits, owner = self._rank_hits(len(rank_tokens), path)
         if owner is None:
             rank = lightest()
             self._record(chain, rank, seq.id, 0)
@@ -234,7 +234,7 @@ class PrefixSpreadRouter:
         if chain is None or not 0 <= rank < n_ranks:
             return Route(rank, "explicit_total")
         path = self._path(chain)
-        hits, owner = self._rank_hits(chain, n_ranks, path)
+        hits, owner = self._rank_hits(n_ranks, path)
         credit, loaded = self._credit(seq, rank, hits, owner, path)
         self._record(
             chain,
@@ -249,7 +249,7 @@ class PrefixSpreadRouter:
         local = hits.get(rank, 0)
         if rank == owner or not self.tier.loads:
             return local, 0
-        in_tier = self._tier_hit(seq.prompt_hash_chain, path)
+        in_tier = self._tier_hit(path)
         loaded = self.tier.loadable_tokens(local, in_tier, seq.num_prompt_tokens)
         return local + loaded, loaded
 
@@ -273,7 +273,7 @@ class PrefixSpreadRouter:
         if not self.tier.loads:
             return min(credit, local)
         loaded = self.tier.loadable_tokens(
-            local, self._tier_hit(seq.prompt_hash_chain, path), seq.num_prompt_tokens
+            local, self._tier_hit(path), seq.num_prompt_tokens
         )
         return min(credit, local + loaded)
 
@@ -405,16 +405,16 @@ class PrefixSpreadRouter:
         siblings[child.hashes[0]] = child
         del self.index[edge]
 
-    def _tier_hit(self, chain, path=None) -> int:
+    def _tier_hit(self, path) -> int:
         """Longest matching prefix with a finished holder on any rank."""
-        for edge, hit in reversed(self._path(chain) if path is None else path):
+        for edge, hit in reversed(path):
             if any(
                 seq_id not in self._in_flight for seq_id in self.index[edge].values()
             ):
                 return hit
         return 0
 
-    def _rank_hits(self, chain, n: int, path=None):
+    def _rank_hits(self, n: int, path):
         """Longest prefix per rank; equal-length owners use last-recorded order.
 
         Other ranks' unfinished producers do not supply a local hit. Seed and
@@ -422,7 +422,7 @@ class PrefixSpreadRouter:
         """
         hits = {}
         owner = None
-        for edge, hit in reversed(self._path(chain) if path is None else path):
+        for edge, hit in reversed(path):
             holders = self.index[edge]
             for rank, seq_id in reversed(holders.items()):
                 if not 0 <= rank < n or rank in hits:
@@ -549,18 +549,20 @@ class PrefixSpreadRouter:
             return
         # The budget covers unique edges, not replicated rank holders. Pinned
         # active edges may exceed it; releasing them makes them evictable.
-        # Shed from the tail of the oldest leaf, at most an eighth of it per
-        # visit: its head still names the owner rank, and rotating through the
-        # leaves spreads the cut over many histories instead of emptying one.
-        # This is only approximately LRU: a recently used leaf can lose a tail
-        # share before an older leaf is gone.
+        # A small overage shortens the oldest leaf from its tail (its head still
+        # names the owner rank) and the leaf then queues behind the others, so
+        # repeated small overages spread over many histories. An overage beyond
+        # an eighth of the leaf (at least one block) drops it whole, as before:
+        # each pass of this loop then removes a whole leaf, so one placement
+        # never takes more passes than whole-leaf eviction did. Either way it is
+        # only approximately LRU: a recently used leaf can lose a tail share
+        # while an older one is still held.
         while self.indexed_tokens > self.CAP and self._evictable:
             edge = next(iter(self._evictable))
             excess = -(-(self.indexed_tokens - self.CAP) // edge.hbs)
-            cut = min(excess, max(1, len(edge.hashes) // 8))
-            if cut < len(edge.hashes):
-                del edge.hashes[-cut:]
-                self.indexed_tokens -= cut * edge.hbs
+            if excess < len(edge.hashes) and excess <= max(1, len(edge.hashes) // 8):
+                del edge.hashes[-excess:]
+                self.indexed_tokens -= excess * edge.hbs
                 self._refresh_evictable(edge)  # next victim: another history
             else:
                 self._drop_edge(edge)
