@@ -54,7 +54,7 @@ class _SharedExpertFold(nn.Module):
     """Fold the shared expert into the routed experts' FP8 buffers.
 
     There the routed experts are online-quantized to per-channel FP8 and run by
-    the clamped Triton MoE, and the shared expert -- the same shape per rank
+    the clamped FlyDSL MoE, and the shared expert -- the same shape per rank
     (inter / TP) and the same clamped SwiGLU -- is four launches of its own
     (gate_up GEMM, act, down GEMM, add). Folded in as expert `E` with weight 1
     on every row, it costs the MoE one more expert's weights instead. Its
@@ -73,9 +73,7 @@ class _SharedExpertFold(nn.Module):
     def process_weights_after_loading(self):
         moe = self._moe()
         experts, shared = moe.experts, moe.shared_experts
-        if shared is None or not getattr(
-            experts.quant_method, "ptpc_clamp_triton", False
-        ):
+        if shared is None or not getattr(experts.quant_method, "ptpc_clamp", False):
             return
         w13, w2 = shared.gate_up_proj.weight.data, shared.w2.weight.data
         num_experts, n1, hidden = experts.w13_weight.shape
@@ -139,7 +137,7 @@ class MoE(V4MoE):
         args.moe_fp8_activations = True
         super().__init__(layer_id, args, prefix=prefix, alt_stream=alt_stream)
         # Registered after `shared_experts`; it folds only where the routed
-        # experts run the clamped FP8 Triton MoE (see `_SharedExpertFold`).
+        # experts run the clamped FP8 MoE (see `_SharedExpertFold`).
         if (
             getattr(self, "shared_experts", None) is not None
             and envs.ATOM_DSV41_FOLD_SHARED_EXPERT

@@ -12,7 +12,7 @@ import torch
 from aiter import ActivationType, QuantType, dtypes, get_hip_quant, topk_gating
 from aiter.dist.parallel_state import get_dp_group, get_pcp_group, get_tp_group
 from aiter.fused_moe import fused_moe
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.flydsl.moe_common import GateMode
 from aiter.ops.shuffle import (
@@ -3301,30 +3301,20 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         # With a SwiGLU clamp: aiter's per-token FP8 MoE runs its asm
         # one-stage kernels past 16 tokens (or when the intermediate size is
         # not a multiple of 128), and those drop `swiglu_limit`, so these
-        # layers run the clamped Triton experts, which read the weights
-        # row-major. Those implement clamped SiLU(gate) * up with dynamic
-        # per-token activation scales only; any other activation (e.g.
-        # MiniMax-M3's swigluoai) or a static input scale keeps the aiter path.
-        self.ptpc_clamp_triton = (
-            getattr(layer, "swiglu_limit", 0.0) > 0
+        # layers run AITER's FlyDSL MoE, its gfx942 backend, which applies it
+        # (`fused_moe_ptpc_clamp`). That takes clamped SiLU(gate) * up with
+        # dynamic per-token activation scales only; any other activation (e.g.
+        # MiniMax-M3's swigluoai) or a static input scale keeps the asm path.
+        self.ptpc_clamp = (
+            get_gfx_runtime().startswith("gfx94")
+            and getattr(layer, "swiglu_limit", 0.0) > 0
             and getattr(layer, "activation", ActivationType.Silu) == ActivationType.Silu
             and getattr(layer, "w13_input_scale", None) is None
             and getattr(layer, "w2_input_scale", None) is None
-            and envs.ATOM_FP8_MOE_CLAMP_TRITON
             and self.fused_experts is None
             and getattr(layer, "expert_mask", None) is None
         )
-        # The same clamped experts on AITER's FlyDSL MoE (opt-in: it needs
-        # an AITER with the SiLU clamp and 64-bit expert offsets), which reads
-        # the (16, 16)-preshuffled weights.
-        from atom.model_ops.fused_moe_ptpc_clamp import flydsl_moe_available
-
-        self.ptpc_flydsl = (
-            self.ptpc_clamp_triton
-            and envs.ATOM_FP8_MOE_FLYDSL
-            and flydsl_moe_available()
-        )
-        if self.ptpc_clamp_triton:
+        if self.ptpc_clamp:
             num_experts = layer.w13_weight.shape[0]
             layer.w13_weight_scale = atom_parameter(
                 layer.w13_weight_scale.data.reshape(num_experts, -1)
@@ -3334,9 +3324,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w2_weight_scale = atom_parameter(
                 layer.w2_weight_scale.data.reshape(num_experts, -1).float().contiguous()
             )
-            if self.ptpc_flydsl:
-                shuffle_weights(layer.w13_weight, layer.w2_weight)
-            return
         shuffle_weights(layer.w13_weight, layer.w2_weight)
 
     def _process_tensor_quant(self, layer: nn.Module) -> None:
@@ -3432,7 +3419,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             "gate_mode": gate_mode,
             "swiglu_limit": getattr(layer, "swiglu_limit", 0.0),
         }
-        if getattr(self, "ptpc_clamp_triton", False):
+        if getattr(self, "ptpc_clamp", False):
             from atom.model_ops.fused_moe_ptpc_clamp import fused_moe_ptpc_clamp
 
             assert (
@@ -3440,22 +3427,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 and not apply_router_weight_on_input
                 and expert_map is None
                 and activation == ActivationType.Silu
-            ), "clamped Triton MoE: SiLU, unquantized input, no expert map"
-            if getattr(self, "ptpc_flydsl", False):
-                from atom.model_ops.fused_moe_ptpc_clamp import flydsl_moe_ptpc_clamp
-
-                return flydsl_moe_ptpc_clamp(
-                    x,
-                    layer.w13_weight,
-                    layer.w13_weight_scale,
-                    layer.w2_weight,
-                    layer.w2_weight_scale,
-                    topk_weights,
-                    topk_ids,
-                    layer.swiglu_limit,
-                    shared_slot=getattr(layer, "ptpc_shared_slot", None),
-                    num_valid_rows=scheduled_tokens_gpu,
-                )
+            ), "clamped FP8 MoE: SiLU, unquantized input, no expert map"
             return fused_moe_ptpc_clamp(
                 x,
                 layer.w13_weight,
