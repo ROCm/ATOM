@@ -373,10 +373,13 @@ def test_gqa_draft_pool_inherits_the_targets_fp8_and_declares_no_scale_planes():
     the pool must declare none. Getting that wrong is not a crash: both read
     the plane's first element and apply it to every token.
 
-    The platform's fp8 -- `d_dtypes["fp8"]`, as the target's pool is.
+    The platform's fp8 -- `d_dtypes["fp8"]`, as the target's pool is. The one
+    scale is what `kv_pool_spec` declares, 1.0, handed to the builder to bind.
     """
     seen = _make_kv_pool_kwargs(_stub_runner())
     from aiter import dtypes
+
+    assert seen["builder"]._kv_scale == 1.0
 
     assert seen["kv_dtype"] is dtypes.d_dtypes["fp8"], (
         f"draft pool must take the target's fp8 ({dtypes.d_dtypes['fp8']}), "
@@ -416,8 +419,8 @@ def test_gqa_draft_pool_entry_is_dcp_blocks(dcp):
 @pytest.mark.parametrize("model", ["eagle3", "minimax"])
 def test_a_draft_without_a_pool_spec_gets_the_generic_pool(model):
     """Eagle3 declares no `kv_pool_spec` and MiniMax-M3.1 DSpark inherits
-    None: neither adds a pool kwarg, and both keep the target builder's
-    block."""
+    None: neither adds a pool kwarg, both keep the target builder's block, and
+    neither is handed a scale, so both bind the pool's own scale planes."""
     if model == "eagle3":
         draft = types.SimpleNamespace()
     else:
@@ -427,6 +430,7 @@ def test_a_draft_without_a_pool_spec_gets_the_generic_pool(model):
     builder = seen.pop("builder")
     assert set(seen) == {"layers", "target_block_size", "world_size", "kv_dtype"}
     assert builder._block_size is None
+    assert builder._kv_scale is None
 
 
 # --------------------------------------------------------------------------

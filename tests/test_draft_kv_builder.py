@@ -23,7 +23,12 @@ import torch
 from torch import nn
 
 from atom.model_ops.attentions.mha_kv_pool import MhaKvPool
-from atom.spec_decode.draft_kv import DRAFT_KV_ROWS, DraftKvBuilder
+from atom.spec_decode.draft_kv import (
+    DRAFT_KV_ROWS,
+    DraftKvBuilder,
+    DraftKvPoolSpec,
+    draft_kv_builder,
+)
 
 
 class _PagedAttention(nn.Module):
@@ -264,9 +269,10 @@ def test_the_count_tracks_the_model_it_walked(draft_layers):
 
 
 def test_gqa_draft_layers_share_one_bound_unit_scale_tensor():
-    """The DSpark GQA draft's pool binds every layer the same one-element 1.0 tensor, at
-    bind time: both its write and its read take the scale as a device pointer,
-    and nothing may be built for it inside a captured forward."""
+    """The DSpark GQA draft's pool binds every layer the same one-element tensor
+    at the scale its spec declares, at bind time: both its write and its read
+    take the scale as a device pointer, and nothing may be built for it inside
+    a captured forward."""
     pool = MhaKvPool(
         layers=2,
         block_size=128,
@@ -278,7 +284,9 @@ def test_gqa_draft_layers_share_one_bound_unit_scale_tensor():
     pool.allocate(2, "cpu")
     runner = _runner(draft_layers=2)
     runner.config = SimpleNamespace(max_model_len=4096, kv_cache_dtype="fp8")
-    builder = DraftKvBuilder(runner, lambda **_: pool)
+    builder = DraftKvBuilder(
+        runner, lambda **_: pool, kv_scale=DraftKvPoolSpec().kv_scale
+    )
     builder._kv_pool = pool
 
     layers = [m for m in runner.drafter.model if isinstance(m, _PagedAttention)]
@@ -291,12 +299,12 @@ def test_gqa_draft_layers_share_one_bound_unit_scale_tensor():
     assert all(m.k_scale is scale and m.v_scale is scale for m in layers)
 
 
-def _bind_first_layer(pool, kv_cache_dtype):
+def _bind_first_layer(pool, kv_cache_dtype, kv_scale=None):
     """Bind one paged layer through the builder; return the module."""
     pool.allocate(2, "cpu")
     runner = _runner(draft_layers=1)
     runner.config = SimpleNamespace(max_model_len=4096, kv_cache_dtype=kv_cache_dtype)
-    builder = DraftKvBuilder(runner, lambda **_: pool)
+    builder = DraftKvBuilder(runner, lambda **_: pool, kv_scale=kv_scale)
     builder._kv_pool = pool
     module = next(m for m in runner.drafter.model if isinstance(m, _PagedAttention))
     module.layer_num = 0
@@ -326,11 +334,12 @@ def test_a_default_pool_binds_shuffle_views_and_its_own_scale_planes():
 
 
 @pytest.mark.parametrize("blocks_per_entry", [1, 8])
-def test_a_flash_pool_binds_entry_wide_flash_views_and_a_unit_scale(
+def test_a_flash_pool_binds_entry_wide_flash_views_and_the_declared_scale(
     blocks_per_entry,
 ):
     """The FLASH order is the pool's own declaration, not inferred from the
-    entry width: at one block an entry it still binds `fa_views`."""
+    entry width: at one block an entry it still binds `fa_views`. The scale is
+    the spec's, which the builder is handed, not one the layout implies."""
     pool = MhaKvPool(
         layers=1,
         block_size=128,
@@ -340,7 +349,7 @@ def test_a_flash_pool_binds_entry_wide_flash_views_and_a_unit_scale(
         blocks_per_entry=blocks_per_entry,
         flash_layout=True,
     )
-    module = _bind_first_layer(pool, "fp8")
+    module = _bind_first_layer(pool, "fp8", kv_scale=DraftKvPoolSpec().kv_scale)
 
     assert module.k_cache.shape == (2, 128 * blocks_per_entry, 2, 64)
     assert module.k_cache.shape[1] == pool.entry_tokens
@@ -356,7 +365,6 @@ def test_a_declared_pool_on_a_backend_that_cannot_own_one_is_refused(
     refused here, not dropped: the target would still stage its slots and
     fail later without a builder. A draft that declares none gets None."""
     pytest.importorskip("aiter")
-    from atom.spec_decode.draft_kv import DraftKvPoolSpec, draft_kv_builder
     from atom.utils import selector
 
     class _Backend:
@@ -373,3 +381,15 @@ def test_a_declared_pool_on_a_backend_that_cannot_own_one_is_refused(
             draft_kv_builder(runner, None, _Draft())
     else:
         assert draft_kv_builder(runner, None, _Draft()) is None
+
+
+def test_a_declared_scale_other_than_unit_is_refused():
+    """The pool has no scale planes and nothing loads a scale into it, so a
+    spec declaring any other scale is refused when its builder is asked for,
+    before a backend is resolved, rather than bound as if it were 1.0."""
+
+    class _Draft:
+        kv_pool_spec = DraftKvPoolSpec(kv_scale=0.5)
+
+    with pytest.raises(ValueError, match="declares a KV scale of 0.5"):
+        draft_kv_builder(SimpleNamespace(), None, _Draft())

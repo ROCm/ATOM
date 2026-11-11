@@ -21,13 +21,19 @@ class DraftKvPoolSpec:
     `kv_pool_spec`; None there is the generic SHUFFLE pool in the target's DCP
     group.
 
-    Declaring one is the whole fact: the draft sits outside the DCP group, so
-    every rank stores every position a target block id covers. An entry is
-    then `block_size * dcp` tokens, which only the FLASH order reads, and the
-    block is the scheduler's, the unit the target's block tables count in. The
+    Declaring one says the draft sits outside the DCP group, so every rank
+    stores every position a target block id covers. An entry is then
+    `block_size * dcp` tokens, which only the FLASH order reads, and the block
+    is the scheduler's, the unit the target's block tables count in. The
     proposer's addressing and the pool's geometry both key on the declaration,
     so they cannot disagree.
+
+    `kv_scale` is the one per-tensor scale K and V are stored at, which
+    `DraftKvBuilder` places at bind. Only 1.0 is accepted: the pool has no
+    scale planes and nothing loads a scale into it.
     """
+
+    kv_scale: float = 1.0
 
     def pool_kwargs(self, dcp: int) -> dict:
         """What `make_kv_pool` takes beyond the geometry."""
@@ -55,12 +61,19 @@ def draft_kv_builder(model_runner, draft_hf, model):
     `model` is the built draft; its `kv_pool_spec` (None, or undeclared as on
     Eagle3, is the generic pool) adds to the pool's kwargs.
     """
+    spec = getattr(model, "kv_pool_spec", None)
+    if spec is not None and spec.kv_scale != 1.0:
+        raise ValueError(
+            f"{type(model).__name__} declares a KV scale of {spec.kv_scale}; a "
+            "draft's own pool is stored at a unit scale only, since it has no "
+            "scale planes and nothing loads a scale into it"
+        )
+
     from aiter import dtypes
 
     from atom.utils.selector import attn_family, get_attn_backend
 
     backend = get_attn_backend(attn_family(draft_hf))
-    spec = getattr(model, "kv_pool_spec", None)
     if not backend.DRAFT_OWNS_KV_POOL:
         if spec is not None:
             raise ValueError(
@@ -70,11 +83,12 @@ def draft_kv_builder(model_runner, draft_hf, model):
         return None
 
     if spec is None:
-        spec_kwargs, block_size = {}, None
+        spec_kwargs, block_size, kv_scale = {}, None, None
     else:
         dcp = model_runner.config.decode_context_parallel_size
         spec_kwargs = spec.pool_kwargs(dcp)
         block_size = spec.block_size(model_runner)
+        kv_scale = spec.kv_scale
     make_pool = partial(
         backend.make_kv_pool,
         draft_hf,
@@ -85,7 +99,9 @@ def draft_kv_builder(model_runner, draft_hf, model):
     # A way to build it, not the pool: how many rows it has is the walk's to
     # say, and this runs from the proposer's `__init__` -- `build_drafter`
     # still running, `runner.drafter` not yet set, nothing to walk.
-    return DraftKvBuilder(model_runner, make_pool, block_size=block_size)
+    return DraftKvBuilder(
+        model_runner, make_pool, block_size=block_size, kv_scale=kv_scale
+    )
 
 
 class DraftKvBuilder(PoolRowsMixin):
@@ -104,17 +120,27 @@ class DraftKvBuilder(PoolRowsMixin):
 
     `block_size` is the block the pool is built at; None takes the target
     builder's, which does not exist yet when this is constructed.
+
+    `kv_scale` is the per-tensor scale the draft's `kv_pool_spec` declares;
+    None, for a draft that declares no spec, binds the pool's own fp8 scale
+    planes instead.
     """
 
-    def __init__(self, model_runner, make_pool, block_size: int | None = None):
+    def __init__(
+        self,
+        model_runner,
+        make_pool,
+        block_size: int | None = None,
+        kv_scale: float | None = None,
+    ):
         self.model_runner = model_runner
         self._make_pool = make_pool
         self._block_size = block_size
-        # A per-tensor-scale pool's one scale, shared by every layer: a
-        # one-element fp32 tensor because both `reshape_and_cache_flash` and
-        # `unified_attention` take it as a device pointer. Built at the first
-        # bind, never in a forward.
-        self._unit_scale = None
+        self._kv_scale = kv_scale
+        # The declared scale, shared by every layer: a one-element fp32 tensor
+        # because both `reshape_and_cache_flash` and `unified_attention` take
+        # it as a device pointer. Built at the first bind, never in a forward.
+        self._kv_scale_tensor = None
         self._kv_pool = None
         self.num_blocks = 0  # set in allocate_kv_cache_tensors
 
@@ -237,17 +263,16 @@ class DraftKvBuilder(PoolRowsMixin):
         idx = self.pool_rows[DRAFT_KV_ROWS][module]
         if pool.flash_layout:
             k_cache, v_cache = pool.fa_views(idx)
-            # A FLASH pool reads one per-tensor scale; with no KV scales in
-            # the checkpoint it is 1.0.
-            if self._unit_scale is None:
-                self._unit_scale = torch.ones(
-                    1, dtype=torch.float32, device=k_cache.device
-                )
-            module.k_scale = module.v_scale = self._unit_scale
         else:
             k_cache, v_cache = pool.kv_views(idx)
-            if runner.config.kv_cache_dtype == "fp8":
-                module.k_scale, module.v_scale = pool.scale_views(idx)
+        if self._kv_scale is not None:
+            if self._kv_scale_tensor is None:
+                self._kv_scale_tensor = torch.full(
+                    (1,), self._kv_scale, dtype=torch.float32, device=k_cache.device
+                )
+            module.k_scale = module.v_scale = self._kv_scale_tensor
+        elif runner.config.kv_cache_dtype == "fp8":
+            module.k_scale, module.v_scale = pool.scale_views(idx)
         module.max_model_len = runner.config.max_model_len
         module.k_cache = k_cache
         module.v_cache = v_cache

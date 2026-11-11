@@ -29,8 +29,8 @@ and block table addressing it is in that unit.
 
 An fp8 pool takes one per-tensor scale: `reshape_and_cache_flash` and
 `unified_attention` both load a single scalar per launch. The checkpoint ships
-no KV scales, so every layer binds one shared 1.0, and the pool declares no
-per-token scale planes.
+no KV scales, so `kv_pool_spec` declares the unit scale, every layer binds one
+shared 1.0, and the pool declares no per-token scale planes.
 """
 
 import logging
@@ -175,7 +175,7 @@ class KimiK3DSparkGQAAttention(nn.Module):
         on the block pass, the context rows on `write_context_kv`.
         """
         if k_cache.dtype.itemsize == 1:
-            # The pool's scale is 1.0 (`DraftKvBuilder`), and a plain cast turns
+            # The pool's scale is 1.0 (`kv_pool_spec`), and a plain cast turns
             # an out-of-range value into NaN, which a context row -- written
             # once -- would carry for the request's life. Saturate, as the read
             # does for q.
