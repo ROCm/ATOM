@@ -27,11 +27,7 @@ from atom.utils.block_convert import (
     kv_indices_generate_triton,
 )
 from atom.utils.block_tables import block_table_state
-from atom.utils.forward_context import (
-    AttentionMetaData,
-    Context,
-    get_forward_context,
-)
+from atom.utils.forward_context import AttentionMetaData, Context, get_forward_context
 from atom.utils.tbo import UBatchSlice
 
 from .backends import (

@@ -19,7 +19,6 @@ def _hash(**overrides):
         "dcp_config": None,
         "enable_dp_attention": False,
         "index_cache_dtype": None,
-        "kv_cache_dtype": "fp8",
         "index_cache_layout": None,
         "hf_config": SimpleNamespace(),
         "max_model_len": 4096,
@@ -27,6 +26,7 @@ def _hash(**overrides):
         "max_num_batched_tokens": 16384,
         "attn_prefill_chunk_size": 16384,
         "kv_cache_block_size": 16,
+        "kv_cache_dtype": "fp8",
         "gpu_memory_utilization": 0.9,
         "speculative_config": None,
     }
