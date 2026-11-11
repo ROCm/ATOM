@@ -1430,9 +1430,9 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             fused_index_cache_dtype = "mxfp4"
 
         if self.kv_cache_dtype == "fp4":
-            from atom.model_ops.minimax_m3.mxfp4_pages import PAGE_TOKENS
+            from atom.model_ops.minimax_m3.geometry import SPARSE_BLOCK_SIZE
 
-            fused_kv_block_size = PAGE_TOKENS
+            fused_kv_block_size = SPARSE_BLOCK_SIZE
             kv_cache_dtype = "mxfp4"
         else:
             # SHUFFLE page size (== ASM_PAGE_SIZE == 16)

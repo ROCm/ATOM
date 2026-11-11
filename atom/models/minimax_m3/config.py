@@ -83,8 +83,12 @@ def validate_runtime_config(config):
         if why is not None:
             raise ValueError(f"--kv-cache-dtype fp4: {why}")
     block_size = config.kv_cache_block_size
-    if block_size != 128:
-        raise ValueError(f"MXFP4 pages are 128 tokens; --block-size is {block_size}")
+    from atom.model_ops.minimax_m3.geometry import SPARSE_BLOCK_SIZE
+
+    if block_size != SPARSE_BLOCK_SIZE:
+        raise ValueError(
+            f"MXFP4 pages are {SPARSE_BLOCK_SIZE} tokens; --block-size is {block_size}"
+        )
     # The live GPU, not `get_gfx()`, which follows GPU_ARCHS (a build setting).
     from aiter.jit.utils.chip_info import get_gfx_runtime
 

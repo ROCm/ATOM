@@ -19,13 +19,13 @@ from dataclasses import dataclass
 import torch
 
 from atom.model_ops.attentions.pool_layout.entry_arena import EntryField
+from atom.model_ops.minimax_m3.geometry import SPARSE_BLOCK_SIZE
 
-PAGE_TOKENS = 128
 HEAD_DIM = 128
 DATA_BYTES = HEAD_DIM // 2
 SCALE_BYTES = HEAD_DIM // 32
-DATA_PAGE_BYTES = PAGE_TOKENS * DATA_BYTES
-PAGE_BYTES = PAGE_TOKENS * (DATA_BYTES + SCALE_BYTES)
+DATA_PAGE_BYTES = SPARSE_BLOCK_SIZE * DATA_BYTES
+PAGE_BYTES = SPARSE_BLOCK_SIZE * (DATA_BYTES + SCALE_BYTES)
 
 
 def page_views(pages: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -46,10 +46,10 @@ def page_views(pages: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     lead, lead_strides = tuple(pages.shape[:-1]), tuple(pages.stride()[:-1])
     off = pages.storage_offset()
     data = pages.as_strided(
-        (*lead, PAGE_TOKENS, DATA_BYTES), (*lead_strides, DATA_BYTES, 1), off
+        (*lead, SPARSE_BLOCK_SIZE, DATA_BYTES), (*lead_strides, DATA_BYTES, 1), off
     )
     scale = pages.as_strided(
-        (*lead, PAGE_TOKENS, SCALE_BYTES),
+        (*lead, SPARSE_BLOCK_SIZE, SCALE_BYTES),
         (*lead_strides, SCALE_BYTES, 1),
         off + DATA_PAGE_BYTES,
     )
@@ -65,9 +65,13 @@ class Mxfp4KvLayout:
     tag: str = "fp4"
 
     def check(self, block_size: int, head_dim: int, blocks_per_entry: int) -> None:
-        if block_size != PAGE_TOKENS or head_dim != HEAD_DIM or blocks_per_entry != 1:
+        if (
+            block_size != SPARSE_BLOCK_SIZE
+            or head_dim != HEAD_DIM
+            or blocks_per_entry != 1
+        ):
             raise ValueError(
-                f"an MXFP4 KV page is {PAGE_TOKENS} tokens of head_dim {HEAD_DIM}, "
+                f"an MXFP4 page is {SPARSE_BLOCK_SIZE} tokens of head_dim {HEAD_DIM}, "
                 f"one block an entry; got block_size {block_size}, head_dim "
                 f"{head_dim}, {blocks_per_entry} blocks an entry"
             )

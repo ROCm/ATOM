@@ -33,6 +33,8 @@ import triton
 import triton.language as tl
 from aiter.jit.utils.chip_info import get_gfx
 
+from atom.model_ops.minimax_m3.geometry import SPARSE_BLOCK_SIZE
+
 try:
     # aiter's chunk-narrowing per-row selector: same forced-block pins and tie
     # direction as the Triton one below, same selection on every shape tried.
@@ -55,8 +57,6 @@ except ImportError:  # pragma: no cover - aiter is optional at import time
     topk_per_row_small_k = None
     topk_per_row_small_k_supported = None
 
-# One sparse block == one KV page.
-SPARSE_BLOCK_SIZE = 128
 # Query rows one prefill score program owns.
 #
 # Before the block axis was split, this and the grid were the same knob, so it

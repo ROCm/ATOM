@@ -562,13 +562,13 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         rows = self.row_counts().get(INDEX_ROWS, 0)
         index_dtype = config.index_cache_dtype
         if index_dtype == "fp4":
-            from atom.model_ops.minimax_m3.mxfp4_pages import HEAD_DIM, PAGE_BYTES
+            from atom.model_ops.minimax_m3.mxfp4_pages import (
+                PAGE_BYTES,
+                Mxfp4KvLayout,
+            )
 
-            if dim != HEAD_DIM or entry_tokens != self.block_size:
-                raise ValueError(
-                    "the MXFP4 index cache is 128-wide keys, one block an entry; "
-                    f"got dim {dim}, {entry_tokens} tokens an entry"
-                )
+            # the one geometry check of an MXFP4 page, as the K / V layout makes it
+            Mxfp4KvLayout().check(self.block_size, dim, entry_tokens // self.block_size)
             return _IndexCacheSpec(rows, (PAGE_BYTES,), torch.uint8, (-1, PAGE_BYTES))
         if index_dtype not in ("bf16", "fp8"):
             raise ValueError(

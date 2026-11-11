@@ -22,11 +22,9 @@ import triton
 import triton.language as tl
 from aiter.ops.attention import pa_fwd_asm_supports_arch
 
+from atom.model_ops.minimax_m3.geometry import SPARSE_BLOCK_SIZE
 from atom.model_ops.minimax_m3.index_topk import build_n_valid_column_per_row
 from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace
-
-# One sparse block == one KV page.
-SPARSE_BLOCK_SIZE = 128
 
 # Page-16 SHUFFLE layout for the AITER paged-attention path. The KV
 # cache is allocated with physical page size 16 (the ASM kernel page), and each

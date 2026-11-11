@@ -51,7 +51,7 @@ def test_bf16_is_two_bytes_a_key(monkeypatch):
 
 @pytest.mark.parametrize(
     "index, tokens, match",
-    [("fp6", 128, "index_cache_dtype"), ("fp4", 256, "128-wide keys")],
+    [("fp6", 128, "index_cache_dtype"), ("fp4", 256, "one block an entry")],
 )
 def test_an_index_cache_the_page_cannot_hold_is_refused(
     monkeypatch, index, tokens, match

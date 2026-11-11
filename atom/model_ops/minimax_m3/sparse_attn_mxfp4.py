@@ -31,7 +31,8 @@ from atom.model_ops.base_attention import (
     _flydsl_plan_scratch,
     _flydsl_prepare_explicit_plan,
 )
-from atom.model_ops.minimax_m3.mxfp4_pages import HEAD_DIM, PAGE_TOKENS, page_views
+from atom.model_ops.minimax_m3.geometry import SPARSE_BLOCK_SIZE
+from atom.model_ops.minimax_m3.mxfp4_pages import HEAD_DIM, page_views
 
 
 @torch.no_grad()
@@ -95,7 +96,7 @@ def sparse_pa_mxfp4(
             f"{tuple(out.shape)} {out.dtype}"
         )
     out_rows = out.view(n, group, HEAD_DIM)
-    bound = sparse_bt.shape[1] * PAGE_TOKENS
+    bound = sparse_bt.shape[1] * SPARSE_BLOCK_SIZE
     if not planned:
         pa_decode(
             out_rows,
