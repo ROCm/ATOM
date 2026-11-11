@@ -17,6 +17,7 @@ from aiter import dtypes
 
 from atom.model_ops.attentions import aiter_attention as mod
 from atom.model_ops.minimax_m3.mxfp4_pages import PAGE_BYTES
+from atom.model_ops.minimax_m3.nvfp4_pages import INDEX_PAGE_BYTES
 
 
 def builder(monkeypatch, index):
@@ -37,6 +38,13 @@ def test_fp4_is_one_uint8_page_even_when_fp8_is_uint8(monkeypatch):
     assert spec == (3, (PAGE_BYTES,), torch.uint8, (-1, PAGE_BYTES))
     (f,) = builder(monkeypatch, "fp4")._index_cache_fields(128)
     assert (f.shape, f.dtype, f.layers) == ((PAGE_BYTES,), torch.uint8, 3)
+
+
+def test_nvfp4_is_one_9216_byte_uint8_page(monkeypatch):
+    spec = builder(monkeypatch, "nvfp4")._index_cache_spec(128)
+    assert spec == (3, (INDEX_PAGE_BYTES,), torch.uint8, (-1, INDEX_PAGE_BYTES))
+    with pytest.raises(ValueError, match="NVFP4 index cache is 128-wide"):
+        builder(monkeypatch, "nvfp4")._index_cache_spec(256)
 
 
 def test_fp8_stays_byte_priced(monkeypatch):

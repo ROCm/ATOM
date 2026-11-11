@@ -1955,6 +1955,8 @@ def _check_fp4_kv(kv_cache_dtype: str, *, is_m3: bool, is_v41: bool) -> None:
         raise ValueError(
             "--kv-cache-dtype fp4 is supported by MiniMax-M3 and DeepSeek-V4.1 only"
         )
+    if kv_cache_dtype == "nvfp4" and not is_m3:
+        raise ValueError("--kv-cache-dtype nvfp4 is supported by MiniMax-M3 only")
 
 
 def kv_pages_leave_pool(config) -> bool:
@@ -1987,12 +1989,12 @@ def resolve_draft_kv_dtype(spec, target_dtype: str, *, own_pool: bool) -> str:
                 "target's KV pool and cannot have its own dtype"
             )
         return target_dtype
-    if asked == "fp4":
+    if asked in ("fp4", "nvfp4"):
         raise ValueError(
-            "--spec-decode-kv-cache-dtype fp4: the draft has no FP4 KV layout "
+            f"--spec-decode-kv-cache-dtype {asked}: the draft has no FP4 KV layout "
             "(use bf16 or fp8; the target's, or bf16 under an fp4 target, when omitted)"
         )
-    return asked or ("bf16" if target_dtype == "fp4" else target_dtype)
+    return asked or ("bf16" if target_dtype in ("fp4", "nvfp4") else target_dtype)
 
 
 def indexer_cp_unsupported_reason(
@@ -2937,7 +2939,7 @@ class Config:
                 self.decode_context_parallel_size,
                 self.enable_tbo or self.enable_tbo_decode,
                 is_plugin_mode(),
-                "fp4" in (self.index_cache_dtype, self.kv_cache_dtype),
+                bool({"fp4", "nvfp4"} & {self.index_cache_dtype, self.kv_cache_dtype}),
             )
             if indexer_cp_off is not None:
                 logger.warning(
@@ -2988,6 +2990,8 @@ class Config:
                     if is_m3 and self.kv_cache_dtype == "fp4"
                     else self.kv_cache_dtype
                 )
+        if self.index_cache_dtype == "nvfp4" and not is_m3:
+            raise ValueError("--index-cache-dtype nvfp4 is supported by MiniMax-M3 only")
         if self.speculative_config is not None:
             from atom.spec_decode.draft_kv import draft_owns_kv_pool
 
@@ -3019,7 +3023,7 @@ class Config:
                 "target"
                 + (
                     ""
-                    if self.kv_cache_dtype != "fp4"
+                    if self.kv_cache_dtype not in ("fp4", "nvfp4")
                     else " (an fp4 target has no draft layout: use a bf16 or fp8 "
                     "target)"
                 )

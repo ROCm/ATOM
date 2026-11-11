@@ -321,10 +321,13 @@ class EngineArgs:
         )
         parser.add_argument(
             "--kv_cache_dtype",
-            choices=["bf16", "fp8", "fp4"],
+            choices=["bf16", "fp8", "fp4", "nvfp4"],
             type=str,
             default="bf16",
-            help="KV cache type. Default is 'bf16'. 'fp4' is MiniMax-M3.1's MXFP4 "
+            help="KV cache type. Default is 'bf16'. 'nvfp4' is MiniMax-M3.1's NVFP4 "
+            "K/V (e2m1 + e4m3 per 16, single-buffer pages, fp32 per-layer global "
+            "scale; needs --index-cache-dtype nvfp4; same requirements as 'fp4'). "
+            "'fp4' is MiniMax-M3.1's MXFP4 "
             "K/V (e2m1 + e8m0 per 32; every layer an indexed sparse one; gfx950, "
             "--block-size 128, bf16; no KV offload or "
             "--kv-transfer-config), or DeepSeek-V4.1's own FP4 KV; other models "
@@ -333,10 +336,10 @@ class EngineArgs:
         parser.add_argument(
             "--index-cache-dtype",
             "--index_cache_dtype",
-            choices=["bf16", "fp8", "fp4"],
+            choices=["bf16", "fp8", "fp4", "nvfp4"],
             type=str,
             default=None,
-            help="Index cache type. Native single-node DeepSeek-V4 defaults to "
+            help="Index cache type ('nvfp4': MiniMax-M3 only, e2m1 + e4m3 per 16). Native single-node DeepSeek-V4 defaults to "
             "'fp4' except on gfx942, which defaults to 'fp8'; other models "
             "default to --kv_cache_dtype (MiniMax-M3's fp4 KV needs 'fp4' here). 'fp4' "
             "is MXFP4 (e2m1 + e8m0 per 32, gfx950, --block-size 128) on "

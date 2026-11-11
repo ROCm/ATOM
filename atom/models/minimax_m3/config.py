@@ -5,6 +5,12 @@ the way DeepSeek-V4.1's are (``models/deepseek_v41/config.py``). GPU-free: it
 imports neither the model nor AITER until the architecture check needs it."""
 
 
+# The FP4 cache dtypes: "fp4" is MXFP4 (e2m1 + e8m0 per 32), "nvfp4" is NVFP4
+# (e2m1 + e4m3 per 16, single-buffer K/V pages). Both are one page layout for every
+# attention layer, 128-token pages, gfx950, bf16, no offload: one set of refusals.
+_FP4_DTYPES = ("fp4", "nvfp4")
+
+
 def _mxfp4_kv_refusal(config) -> str | None:
     """Why ``--kv-cache-dtype fp4`` cannot run this MiniMax-M3 here, or None.
 
@@ -26,7 +32,7 @@ def _mxfp4_kv_refusal(config) -> str | None:
         # that was never told this byte format, and its namespace keys no FP4.
         return "it does not run with KV offload or --kv-transfer-config"
     spec = config.speculative_config
-    if spec is not None and spec.kv_cache_dtype == "fp4":
+    if spec is not None and spec.kv_cache_dtype in _FP4_DTYPES:
         # `resolve_draft_kv_dtype` leaves "fp4" only on a draft in the target's
         # pool (EAGLE3, MTP): one with no MXFP4 attention impl to write its rows.
         # A DSpark draft with its own pool is fp8 / bf16 and passes.
@@ -58,35 +64,38 @@ def _mxfp4_kv_refusal(config) -> str | None:
 
 
 def validate_runtime_config(config):
-    """Refuse MiniMax-M3's MXFP4 caches where they cannot run, at startup rather
-    than in the first forward (``--kv-cache-dtype fp4`` and
-    ``--index-cache-dtype fp4``)."""
+    """Refuse MiniMax-M3's FP4 caches where they cannot run, at startup rather
+    than in the first forward (``--kv-cache-dtype fp4|nvfp4`` and
+    ``--index-cache-dtype fp4|nvfp4``)."""
     from atom.config import is_plugin_mode
 
-    kv_fp4 = config.kv_cache_dtype == "fp4"
-    if not (kv_fp4 or config.index_cache_dtype == "fp4"):
+    kv, index = config.kv_cache_dtype, config.index_cache_dtype
+    if kv not in _FP4_DTYPES and index not in _FP4_DTYPES:
         return
     if is_plugin_mode():
         raise ValueError(
-            "MXFP4 KV / index caches do not run under the vLLM/SGLang bridges"
+            "FP4 (MXFP4 / NVFP4) KV / index caches do not run under the "
+            "vLLM/SGLang bridges"
         )
-    if kv_fp4 and config.index_cache_dtype != "fp4":
-        # `sparse_pa_mxfp4` walks every row of q; only the MXFP4 index scorer is
-        # sized to those rows, the other index caches' selectors can leave some unwritten.
+    if kv in _FP4_DTYPES and index != kv:
+        # `sparse_pa_{mxfp4,nvfp4}` walk every row of q; only the matching FP4 index
+        # scorer is sized to those rows, the other index caches' selectors can leave
+        # some unwritten. An FP4 index under a different FP4 KV is no pairing either.
         raise ValueError(
-            "--kv-cache-dtype fp4 needs --index-cache-dtype fp4, "
-            f"got {config.index_cache_dtype}"
+            f"--kv-cache-dtype {kv} needs --index-cache-dtype {kv}, got {index}"
         )
-    if kv_fp4:
+    if index == "nvfp4" and kv not in ("nvfp4", "bf16", "fp8"):
+        raise ValueError(f"--index-cache-dtype nvfp4 does not pair with KV {kv}")
+    if kv in _FP4_DTYPES:
         why = _mxfp4_kv_refusal(config)
         if why is not None:
-            raise ValueError(f"--kv-cache-dtype fp4: {why}")
+            raise ValueError(f"--kv-cache-dtype {kv}: {why}")
     block_size = config.kv_cache_block_size
     if block_size != 128:
-        raise ValueError(f"MXFP4 pages are 128 tokens; --block-size is {block_size}")
+        raise ValueError(f"FP4 pages are 128 tokens; --block-size is {block_size}")
     # The live GPU, not `get_gfx()`, which follows GPU_ARCHS (a build setting).
     from aiter.jit.utils.chip_info import get_gfx_runtime
 
     arch = get_gfx_runtime()
     if arch != "gfx950":
-        raise ValueError(f"MXFP4 KV / index caches need gfx950, got {arch}")
+        raise ValueError(f"FP4 KV / index caches need gfx950, got {arch}")
