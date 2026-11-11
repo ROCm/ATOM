@@ -316,13 +316,13 @@ def router_defs(k4ctx):
                 pv = fx.Vector(
                     bo.buffer_load(
                         rsrc(tl),
-                        ((layer * MAX_TOKENS + k) * N_ROUTED + e_r) * 2,
-                        vec_width=2,
+                        ((layer * MAX_TOKENS + k) * N_ROUTED + e_r) * 4,
+                        vec_width=4,
                         dtype=T.i32,
                     )
                 )
                 rk = (pv[0] != 0).select(fx.Int32(pv[0]), rk)
-                sc_bits = (pv[1] != 0).select(fx.Int32(pv[1]), sc.bitcast(fx.Int32))
+                sc_bits = (pv[2] != 0).select(fx.Int32(pv[2]), sc.bitcast(fx.Int32))
                 if lane < SCORE_COPIES:
                     mb_put_words(scores_copy(lane, k), e_r * 2, [rk, sc_bits])
             else:

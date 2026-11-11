@@ -17,7 +17,9 @@ A probe string is ``;``-separated terms:
 ``nb=k+k``     these weight / cache reads (``KINDS``) go through zero-sized buffers: the
                loads issue, no byte comes from HBM
 ``pin``        the router's (routing key, sigmoid) pairs come from a table (``tl`` points at
-               it: [layer][token][expert][2] words) so every variant routes as the real step did
+               it: the real step's ``scores`` copy-0 image, [layer][token][expert][4] words
+               = (key, tag, sigmoid, tag)), and a consumer that skips the ``scores`` wait
+               reads the table: every variant routes as the real step did
 """
 
 from dataclasses import dataclass
@@ -29,7 +31,11 @@ GROUPS = {
     "sp": ("sp_o", "sp_m", "sp_l"),  # split -> merge
     "mg": ("attnq_s",),  # merge -> o_proj
     "ar1": ("attn", "a", "a_ag"),  # o_proj -> all-reduce -> router
-    "rt": ("scores", "xn8", "xsc", "xndone"),  # router -> up / gate
+    "scr": (
+        "scores",
+    ),  # router -> every CTA's routing (with ``pin``: read from the table)
+    "xn": ("xn8", "xsc", "xndone"),  # router -> up / gate: the normalized input
+    "rt": ("scores", "xn8", "xsc", "xndone"),  # both
     "mid": ("mid", "ugdone"),  # up / gate -> down
     "ar2": ("ffn", "ffn_ag"),  # down -> all-reduce -> layer end
 }

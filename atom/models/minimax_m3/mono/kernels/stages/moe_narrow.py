@@ -71,7 +71,7 @@ def moe_narrow_defs(k4ctx):
     route = k4ctx["route"]
     route_top4 = k4ctx["route_top4"]
     rwt = k4ctx["rwt"]
-    scores_copy = k4ctx["scores_copy"]
+    scores_read = k4ctx["scores_read"]
     sh_compute = k4ctx["sh_compute"]
     sh_load = k4ctx["sh_load"]
     stamp = k4ctx["stamp"]
@@ -180,7 +180,7 @@ def moe_narrow_defs(k4ctx):
                 if wave == k:
                     got = mb_poll(
                         [
-                            (scores_copy(mine, k), (lane + 64 * h) * 2, 2)
+                            (scores_read(mine, k), (lane + 64 * h) * 2, 2)
                             for h in range(2)
                         ]
                     )

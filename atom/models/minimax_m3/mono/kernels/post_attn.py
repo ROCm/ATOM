@@ -119,7 +119,8 @@ from atom.mono.device.ops import CM_DEV, kernel_symbol, launcher, load_ptr64, rs
 from atom.mono.device.ops import block_max as block_max_of
 from atom.mono.device.stamps import stamp as stamp_point
 from atom.mono.device.stamps import stamp_begin, stamp_flush
-from atom.mono.device.sync import Mailbox, preg, shift, sreg
+from atom.mono.device.sync import Addr, Mailbox, preg, shift, sreg
+from atom.mono.plan.trace import Space
 from atom.mono.plan.build_key import key_tuple, symbol_params
 from atom.mono.plan.probe import parse as parse_probe
 from atom.mono.plan.execution import BLOCKS, THREADS, WAVES, first_task
@@ -401,6 +402,20 @@ def build_post_attn_kernel(
             return shift(
                 mr("scores"), (fx.Int64(c) * MAX_TOKENS + fx.Int64(k)) * (N_ROUTED * 16)
             )
+
+        def scores_read(c, k=0):
+            """Where a consumer reads copy c of token k's router outputs: the mailbox,
+            or (a probe skipping the ``scores`` wait) the pinned table's image of the
+            real step's pairs, so the route is the real one without the wait."""
+            if const_expr(P.pin and "scores" in P.skip):
+                return Addr(
+                    "scores",
+                    Space.SCRATCH,
+                    tl
+                    + fx.Int64(layer) * (MAX_TOKENS * N_ROUTED * 16)
+                    + fx.Int64(k) * (N_ROUTED * 16),
+                )
+            return scores_copy(c, k)
 
         def route_key(v, e):
             """Signed-orderable i32 of score ``v`` with its low 7 bits replaced by

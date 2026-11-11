@@ -115,7 +115,7 @@ def moe_wide_defs(k4ctx):
     rwt = k4ctx["rwt"]
     s13 = k4ctx["s13"]
     s2 = k4ctx["s2"]
-    scores_copy = k4ctx["scores_copy"]
+    scores_read = k4ctx["scores_read"]
     stamp = k4ctx["stamp"]
     start = k4ctx["start"]
     swiglu_limit = k4ctx["swiglu_limit"]
@@ -329,7 +329,7 @@ def moe_wide_defs(k4ctx):
         wave_toks = [fx.min(wave + WAVES * j, tokens - 1) for j in range(ROUTE_ITERS)]
         sg = mb_poll(
             [
-                (scores_copy(mine, k), (lane + 64 * h) * 2, 2)
+                (scores_read(mine, k), (lane + 64 * h) * 2, 2)
                 for k in wave_toks
                 for h in range(2)
             ]

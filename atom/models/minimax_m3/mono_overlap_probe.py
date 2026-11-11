@@ -95,9 +95,7 @@ def run_probe(runner, input_ids, positions, n, spec) -> None:
     rank = runner.rank
     out = spec["out"]
     os.makedirs(out, exist_ok=True)
-    log = lambda *a: print(
-        f"[overlap_probe r{rank} S{n}]", *a, flush=True
-    )
+    log = lambda *a: print(f"[overlap_probe r{rank} S{n}]", *a, flush=True)
     fwd = get_forward_context()
     rows = token_rows(fwd, n)
     sparse_md = _sparse_metadata(fwd)
@@ -117,7 +115,7 @@ def run_probe(runner, input_ids, positions, n, spec) -> None:
     )
     ar_in, res_in = [], []
     pin = torch.zeros(
-        MAX_LAYER_ID, MAX_TOKENS, N_ROUTED, 2, dtype=torch.int32, device=dev
+        MAX_LAYER_ID, MAX_TOKENS, N_ROUTED, 4, dtype=torch.int32, device=dev
     )
     sc_off = SCRATCH["scores"]
     for i, lw in enumerate(sparse):
@@ -131,8 +129,7 @@ def run_probe(runner, input_ids, positions, n, spec) -> None:
             .view(torch.int32)
             .view(MAX_TOKENS, N_ROUTED, 4)
         )
-        pin[lw.layer_id, :, :, 0] = words[:, :, 0]
-        pin[lw.layer_id, :, :, 1] = words[:, :, 2]
+        pin[lw.layer_id] = words
     pin_cpu = pin.cpu()
     experts = []  # per layer: the distinct routed experts of the step's tokens
     for lw in sparse:
@@ -170,18 +167,35 @@ def run_probe(runner, input_ids, positions, n, spec) -> None:
         keep += [k16, v16, ks16, vs16, k1_args]
         layer_args.append(
             {
-                "h_in": _ptr(runner.h), "q": _ptr(runner.q), "block_table": _ptr(block_table),
-                "seq_lens": _ptr(seq_lens), "k_cache": _ptr(k16), "v_cache": _ptr(v16),
-                "k_scale": _ptr(ks16), "v_scale": _ptr(vs16), "w_o": _ptr(lw.w_o),
-                "s_o": _ptr(lw.s_o), "g_post": _ptr(lw.g_post), "w_gate": _ptr(lw.gate),
-                "bias": _ptr(lw.bias), "w13": _ptr(lw.w13), "s13": _ptr(lw.s13),
-                "w2": _ptr(lw.w2), "s2": _ptr(lw.s2), "h_mid": _ptr(out_h),
-                "ar_out": _ptr(out_ar), "scratch": _ptr(runner.scratch4),
-                **runner.peers.kernel_args(), "layer": lw.layer_id,
+                "h_in": _ptr(runner.h),
+                "q": _ptr(runner.q),
+                "block_table": _ptr(block_table),
+                "seq_lens": _ptr(seq_lens),
+                "k_cache": _ptr(k16),
+                "v_cache": _ptr(v16),
+                "k_scale": _ptr(ks16),
+                "v_scale": _ptr(vs16),
+                "w_o": _ptr(lw.w_o),
+                "s_o": _ptr(lw.s_o),
+                "g_post": _ptr(lw.g_post),
+                "w_gate": _ptr(lw.gate),
+                "bias": _ptr(lw.bias),
+                "w13": _ptr(lw.w13),
+                "s13": _ptr(lw.s13),
+                "w2": _ptr(lw.w2),
+                "s2": _ptr(lw.s2),
+                "h_mid": _ptr(out_h),
+                "ar_out": _ptr(out_ar),
+                "scratch": _ptr(runner.scratch4),
+                **runner.peers.kernel_args(),
+                "layer": lw.layer_id,
                 "bt_width": block_table.shape[1],
-                "q_len": sparse_md.decode.max_query_len, "tl": 0,
-                "k1_args": _ptr(k1_args), "positions": _ptr(positions),
-                "slot_mapping": _ptr(sparse_md.slot_mapping), "res": _ptr(res_in[i]),
+                "q_len": sparse_md.decode.max_query_len,
+                "tl": 0,
+                "k1_args": _ptr(k1_args),
+                "positions": _ptr(positions),
+                "slot_mapping": _ptr(sparse_md.slot_mapping),
+                "res": _ptr(res_in[i]),
                 "batch_ids": _ptr(fwd.attn_metadata.batch_id_per_q_token),
                 "w13s": _ptr(lw.w13s) if lw.shared_mxfp8 else 0,
                 "s13s": _ptr(lw.s13s) if lw.shared_mxfp8 else 0,

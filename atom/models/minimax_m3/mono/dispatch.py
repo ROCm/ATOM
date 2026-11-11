@@ -170,7 +170,7 @@ class MonoDecode:
         else:
             out = self._mono.runner.forward(input_ids, positions)
         if _OVERLAP_PROBE:  # a timing run of the overlap probes (``overlap_probe``)
-            from atom.models.minimax_m3.mono.overlap_probe import maybe_probe
+            from atom.models.minimax_m3.mono_overlap_probe import maybe_probe
 
             maybe_probe(self._mono.runner, input_ids, positions)
         if envs.ATOM_MONO_TRACE:
