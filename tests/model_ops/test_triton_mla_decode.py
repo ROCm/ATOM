@@ -116,6 +116,29 @@ def test_triton_mla_decode_matches_reference(block_size, shuffled, q_len, quant)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+@pytest.mark.parametrize("block_size,shuffled", [(16, False), (64, True)])
+def test_triton_mla_decode_ignores_query_less_padded_sequences(block_size, shuffled):
+    """In a step where a DP peer prefills, a decoding rank's q holds only its
+    own rows while the per-sequence metadata is padded to the group's batch
+    with query-less sequences; the real sequences must still be attended."""
+    layer, q, cache, metadata, kv = _inputs(block_size, 1, "fp8_qkv", shuffled)
+    expected = _reference(layer, q, kv, metadata)
+    pad = 5
+    num_seqs = metadata.context_lens.numel()
+    padded = AttentionMetaData(
+        cu_seqlens_q=torch.nn.functional.pad(
+            metadata.cu_seqlens_q, (0, pad), value=num_seqs
+        ),
+        context_lens=torch.nn.functional.pad(metadata.context_lens, (0, pad)),
+        max_seqlen_q=1,
+        max_seqlen_k=metadata.max_seqlen_k,
+        block_tables=torch.nn.functional.pad(metadata.block_tables, (0, 0, 0, pad)),
+    )
+    actual = layer._forward_decode(q, cache, padded)
+    torch.testing.assert_close(actual.float(), expected, atol=0.04, rtol=0.02)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 def test_triton_mla_decode_graph_replays_updated_metadata():
     layer, q, cache, metadata, kv = _inputs(16, 4, "fp8_qkv")
     # The base metadata builder leaves the maximum length unknown at capture.
