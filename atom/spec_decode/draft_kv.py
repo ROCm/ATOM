@@ -1,6 +1,8 @@
 import logging
 from functools import partial
 
+import torch
+
 from atom.config import KVCacheTensor
 from atom.model_ops.attentions.pool_layout.pool_rows import PoolRowsMixin
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import SubPoolSpec, page_pool
@@ -189,9 +191,13 @@ class DraftKvBuilder(PoolRowsMixin):
 
     def get_kv_transfer_tensors(self):
         from atom.kv_transfer.disaggregation.page_region import page_region
-        from atom.kv_transfer.disaggregation.types import KVTransferTensors
+        from atom.kv_transfer.disaggregation.types import (
+            KVTransferTensors,
+            PageUnitSpec,
+        )
 
         pool = self.kv_pool
+        cache_fields = {f.name for f in pool.cache_fields}
         # Every field is per head, head-major in each page. A layer reading and
         # writing its cache through smaller SHUFFLE pages than the pool's
         # (M3.1's DSpark draft: page-16) keeps a block as that many runs.
@@ -209,6 +215,17 @@ class DraftKvBuilder(PoolRowsMixin):
                     head_major_runs=(
                         pool.block_size // page_tokens[row],
                         pool.num_kv_heads,
+                    ),
+                    # As the MHA backend describes its own KV and scale units.
+                    unit_spec=PageUnitSpec(
+                        namespace="draft",
+                        field=field,
+                        row=row,
+                        head_dim=pool.head_dim,
+                        dtype=str(
+                            pool.kv_dtype if field in cache_fields else torch.float32
+                        ),
+                        layout="mha_shuffle" if field in cache_fields else "head_token",
                     ),
                 )
                 for field, row, t in pool.field_regions()
