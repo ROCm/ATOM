@@ -980,6 +980,9 @@ models:
             common: &glm52_agg_mono_env
               PYTHONNOUSERSITE: "1"
               ATOM_MONO_ENABLE: "1"
+            # InferenceX runs this recipe without GPU timing; the CI turns it on for agentic reports.
+            decode: &glm52_agg_decode_env
+              ATOM_ENABLE_METRICS_DEVICE_TIMER: "0"
           benchmark: *agentic_1m_aiperf
           run_eval: false
 
@@ -1015,6 +1018,7 @@ models:
             common: &glm52_agg_env
               PYTHONNOUSERSITE: "1"
               ATOM_MONO_ENABLE: "0"
+            decode: *glm52_agg_decode_env
 
         - <<: *glm52_agg_tp4_prod
           name: glm-52-mxfp4-agg-tp4-mtp-agentic-1m-c8
@@ -1065,6 +1069,7 @@ models:
           env:
             common: *glm52_agg_env
             decode: &glm52_agg_lmcache_env
+              <<: *glm52_agg_decode_env
               # DCP sparse prefill builds the group's query heads locally.
               ATOM_DCP_PREFILL_QREP: "1"
               PYTHONHASHSEED: "0"

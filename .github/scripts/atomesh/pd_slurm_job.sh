@@ -384,25 +384,31 @@ EOF
     # FlyDSL otherwise tries to create caches under /app/aiter-test, which is
     # read-only for the Slurm uid required by Spur's Docker template.
     -e FLYDSL_RUNTIME_CACHE_DIR="/tmp/atomesh-cache-${JOB_ID}-${rank}/flydsl"
-    -e NCCL_NET_PLUGIN=none
-    -e NCCL_IB_HCA=ionic_0,ionic_1,ionic_2,ionic_3,ionic_4,ionic_5,ionic_6,ionic_7
-    # MoRI ignores NCCL_IB_*; give it the same ionic HCAs and RoCE GID index.
-    -e MORI_RDMA_DEVICES=ionic_0,ionic_1,ionic_2,ionic_3,ionic_4,ionic_5,ionic_6,ionic_7
-    -e MORI_IB_GID_INDEX="${NCCL_IB_GID_INDEX}"
-    -e NCCL_CROSS_NIC=0
-    -e NCCL_PXN_DISABLE=0
-    -e NCCL_NET_DISABLE_INTRA=1
-    -e NCCL_IB_TC=104
-    -e NCCL_IB_FIFO_TC=192
-    -e NCCL_IB_QPS_PER_CONNECTION=1
-    -e NCCL_IB_TIMEOUT=22
-    -e NCCL_IB_RETRY_CNT=12
     -e NCCL_DEBUG=WARN
     -v "${REPO_ROOT}":/workspace/ATOM:ro
     -v "${RUN_DIR}":/run_logs/slurm_job-"${JOB_ID}"
     -v /mnt:/mnt
     -v /data:/data
   )
+  # RDMA tuning for P/D KV transfer; an aggregated cell is one server on one node
+  # and keeps the image defaults, as InferenceX's single-node recipes run.
+  if [[ "${TOPOLOGY,,}" != agg* ]]; then
+    docker_args+=(
+      -e NCCL_NET_PLUGIN=none
+      -e NCCL_IB_HCA=ionic_0,ionic_1,ionic_2,ionic_3,ionic_4,ionic_5,ionic_6,ionic_7
+      # MoRI ignores NCCL_IB_*; give it the same ionic HCAs and RoCE GID index.
+      -e MORI_RDMA_DEVICES=ionic_0,ionic_1,ionic_2,ionic_3,ionic_4,ionic_5,ionic_6,ionic_7
+      -e MORI_IB_GID_INDEX="${NCCL_IB_GID_INDEX}"
+      -e NCCL_CROSS_NIC=0
+      -e NCCL_PXN_DISABLE=0
+      -e NCCL_NET_DISABLE_INTRA=1
+      -e NCCL_IB_TC=104
+      -e NCCL_IB_FIFO_TC=192
+      -e NCCL_IB_QPS_PER_CONNECTION=1
+      -e NCCL_IB_TIMEOUT=22
+      -e NCCL_IB_RETRY_CNT=12
+    )
+  fi
   if [[ -d /shared_nfs ]]; then
     docker_args+=(-v /shared_nfs:/shared_nfs)
   fi
