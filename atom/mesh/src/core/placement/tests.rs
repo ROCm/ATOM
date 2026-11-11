@@ -2167,3 +2167,80 @@ mod h_integration {
         }
     }
 }
+
+mod i_no_candidate_metrics {
+    use std::sync::Arc;
+
+    use super::super::planner::DefaultPlanner;
+    use super::super::test_support::*;
+    use super::super::traits::{PdPlanner, PolicySource, WorkerSource};
+    use super::super::types::PlacementError;
+    use crate::core::Worker;
+
+    fn unhealthy(worker: Arc<dyn Worker>) -> Arc<dyn Worker> {
+        worker.set_healthy(false);
+        worker
+    }
+
+    #[tokio::test]
+    async fn a_pool_without_candidates_counts_once_as_no_healthy_workers() {
+        let cases = [
+            (
+                "regular",
+                MockWorkerSource::new()
+                    .add_worker(unhealthy(make_regular_http("http://r1:8000", "m")))
+                    .add_worker(unhealthy(make_regular_http("http://r2:8000", "m"))),
+                PlacementError::NoAvailableWorkers,
+            ),
+            (
+                "prefill",
+                MockWorkerSource::new()
+                    .add_worker(unhealthy(make_prefill_http("http://p:8000", "m", None)))
+                    .add_worker(make_decode_http("http://d:8000", "m")),
+                PlacementError::NoAvailableWorkers,
+            ),
+            (
+                "decode",
+                MockWorkerSource::new()
+                    .add_worker(make_prefill_http("http://p:8000", "m", None))
+                    .add_worker(unhealthy(make_decode_http("http://d:8000", "m"))),
+                PlacementError::NoAvailableWorkers,
+            ),
+            (
+                "prefill",
+                MockWorkerSource::new().add_worker(make_decode_http("http://d:8000", "m")),
+                PlacementError::NoPrefillWorkers,
+            ),
+            (
+                "decode",
+                MockWorkerSource::new().add_worker(make_prefill_http("http://p:8000", "m", None)),
+                PlacementError::NoDecodeWorkers,
+            ),
+        ];
+
+        for (pool, workers, expected) in cases {
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let handle = recorder.handle();
+            let _recorder = metrics::set_default_local_recorder(&recorder);
+            let planner = DefaultPlanner::new(
+                Arc::new(workers) as Arc<dyn WorkerSource>,
+                Arc::new(MockPolicySource::new()) as Arc<dyn PolicySource>,
+            );
+
+            let err = planner
+                .plan(&make_descriptor(Some("m"), None, None, None))
+                .await
+                .unwrap_err();
+            assert_eq!(err, expected, "{pool}");
+            let rendered = handle.render();
+            let branches: Vec<_> = rendered
+                .lines()
+                .filter(|line| line.starts_with("mesh_route_branch_total{"))
+                .collect();
+            let line = format!(
+                r#"mesh_route_branch_total{{pool="{pool}",policy="round_robin",branch="no_healthy_workers"}} 1"#
+            );
+            assert_eq!(branches, [line.as_str()], "{expected:?}");
+        }
+    }
+}
