@@ -186,15 +186,6 @@ def dequantize_native_group32_weight(
     return (weight.float() * scale).to(torch.bfloat16)
 
 
-def dequantize_group32_activation(
-    x: torch.Tensor, x_scale: torch.Tensor
-) -> torch.Tensor:
-    """FP8 activations with row-major 1x32 E8M0 scales -> BF16, same shape."""
-    from atom.model_ops.blockscale import dequantize_fp8
-
-    return dequantize_fp8(x, x_scale)
-
-
 def _is_mxfp4(quant_type, quant_dtype) -> bool:
     # By value: plugin-mode QuantType members do not compare equal under `==`.
     return (
@@ -1662,10 +1653,7 @@ class LinearBase(nn.Module):
             self.native_a8_group_rows is not None
             and self.weight.dtype == torch.bfloat16
         ):
-            # BF16 fallback of a native group32 linear; an upstream fused
-            # quant may still hand over FP8 activations with 1x32 E8M0 scales.
-            if x_scale is not None:
-                x = dequantize_group32_activation(x, x_scale)
+            # BF16 fallback of a native group32 linear.
             y = tgemm.mm(x, self.weight, self.bias, otype=otype)
         elif self.native_a8_group_rows is not None:
             from atom.model_ops.blockscale import native_quant_linear
