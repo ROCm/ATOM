@@ -463,9 +463,7 @@ class _AtomCausalLMBaseForSglang(nn.Module):
                     "DSpark aux buffers are shorter than this rank's PCP shard: "
                     f"need {n_local} rows, layers {layer_ids}."
                 )
-            return [
-                pcp_allgather_rerange(buf[:n_local], pcp_ws)[:n] for buf in buffers
-            ]
+            return [pcp_allgather_rerange(buf[:n_local], pcp_ws)[:n] for buf in buffers]
         if any(buf.shape[0] < n for buf in buffers):
             raise RuntimeError(
                 "DSpark aux buffers are shorter than the target hidden state: "
@@ -714,9 +712,7 @@ class _AtomCausalLMBaseForSglang(nn.Module):
                             forward_batch,
                             aux_hidden_states=aux_hidden_states,
                             hidden_states_before_norm=(
-                                None
-                                if aux_hidden_states is not None
-                                else hidden_states
+                                None if aux_hidden_states is not None else hidden_states
                             ),
                         )
                     return self.logits_processor(
