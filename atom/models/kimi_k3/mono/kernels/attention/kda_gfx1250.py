@@ -499,22 +499,8 @@ def kda_recur_head(c, k, request, head):
     live = k["slot0"] >= 0
     column = lane * 4
     row0 = wave * ROWS
-    source = rsrc(
-        args["rstate"] + fx.Int64(fx.max(k["slot0"], 0)) * fx.Int64(args["rs_seq"]) * 4
-    )
-    loaded = [
-        fx.Vector(
-            bo.buffer_load(
-                source,
-                (head * GATE_K + row0 + row) * GATE_K + column,
-                vec_width=4,
-                dtype=T.f32,
-            )
-        )
-        for row in range(ROWS)
-    ]
     state = [
-        live.select(loaded[row][element], fx.Float32(0.0))
+        live.select(k["state"][row][element], fx.Float32(0.0))
         for row in range(ROWS)
         for element in range(4)
     ]
@@ -597,6 +583,29 @@ def kda_recur_head(c, k, request, head):
     gpu.barrier()
 
 
+def _head_state_loads(c, slot, head):
+    """This wave's sixteen state rows of ``head`` at ``slot``, four columns a
+    lane: issued before the head waits on its projection, their latency hides
+    under it."""
+    column = c["lane"] * 4
+    row0 = c["wave"] * ROWS
+    source = rsrc(
+        c["args"]["rstate"]
+        + fx.Int64(fx.max(slot, 0)) * fx.Int64(c["args"]["rs_seq"]) * 4
+    )
+    return [
+        fx.Vector(
+            bo.buffer_load(
+                source,
+                (head * GATE_K + row0 + row) * GATE_K + column,
+                vec_width=4,
+                dtype=T.f32,
+            )
+        )
+        for row in range(ROWS)
+    ]
+
+
 @traced
 def kda_head(c, request, head):
     """One plain-decode request/head without cross-CTA QK/ONRM handoffs."""
@@ -616,6 +625,7 @@ def kda_head(c, request, head):
             ld_i32(args["st_idx"], request * args["st_stride"] + tid),
             c["slots"] + tid,
         )
+    head_state = _head_state_loads(c, slot0, head)
 
     projected = _scratch_region(c, "proj")
     threads = c["matrix_threads"]
@@ -752,6 +762,7 @@ def kda_head(c, request, head):
     gpu.barrier()
 
     metadata["slot0"] = slot0
+    metadata["state"] = head_state
     c["head_onrm"] = c["head_onrm_lds"]
     kda_recur_head(c, metadata, request, head)
     kda_head_norm(c, request, head)
