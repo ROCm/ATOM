@@ -45,6 +45,21 @@ def test_supported_widths_and_query_lengths(replicated, cache):
     assert kernel.unfit(replace(key, tokens=256, max_ctx=factor * (1 << 22)))
 
 
+def test_short_projection_requires_supported_shapes_and_replicated_cache():
+    key = kernel.IxBuild(
+        _shape(), 96, 8, 163840, replicated=True, qlen=6, short_gemm=True
+    )
+    for q_lora in (1024, 1536, 2048):
+        assert not kernel.unfit(replace(key, shape=_shape(q_lora)))
+    for changes in (
+        {"world": 1},
+        {"replicated": False},
+        {"max_ctx": 262145},
+        {"shape": _shape(1280)},
+    ):
+        assert kernel.unfit(replace(key, **changes))
+
+
 @pytest.mark.parametrize(
     "q_lora,cache,replicated",
     [

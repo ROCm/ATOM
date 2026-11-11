@@ -4,6 +4,7 @@
 the mono launch on the steps a runner serves with it, and a layer's refusal
 read from the Indexer alone (its k projected outside, its q unscaled bf16)."""
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -156,10 +157,11 @@ def test_a_layer_is_refused_on_its_own_flags_and_no_model_attribute():
     )
 
 
-@pytest.mark.parametrize("model_kind", ["glm", "k3"])
+@pytest.mark.parametrize("model_kind,q_lora", [("glm", 2048), ("k3", 1536)])
+@pytest.mark.parametrize("dcp", [1, 8])
 @pytest.mark.parametrize("preshuffle_available", [False, True])
 def test_install_prepares_shared_weight_before_warmup(
-    monkeypatch, model_kind, preshuffle_available
+    monkeypatch, model_kind, q_lora, dcp, preshuffle_available
 ):
     from aiter.ops.flydsl import gemm_kernels
 
@@ -168,13 +170,14 @@ def test_install_prepares_shared_weight_before_warmup(
     installer = dispatch if model_kind == "glm" else k3_dispatch
     monkeypatch.setattr(installer, "config_refusal", lambda cfg: None)
     monkeypatch.setattr(bind, "pcp_is_enabled", lambda: False)
-    monkeypatch.setattr(bind, "get_tensor_model_parallel_world_size", lambda: 4)
+    monkeypatch.setattr(bind, "get_tensor_model_parallel_world_size", lambda: 8)
     monkeypatch.setattr(bind, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(bind, "get_dcp_rank", lambda: 0)
     if not preshuffle_available:
         monkeypatch.setattr(gemm_kernels, "flydsl_hgemm", lambda a, b: None)
-    indexer = _module()
+    indexer = _module(q_lora_rank=q_lora)
     weight = torch.nn.Parameter(
-        torch.randn_like(indexer.wq_b.weight), requires_grad=False
+        torch.randn(_SHAPE.qrows, q_lora, dtype=torch.bfloat16), requires_grad=False
     )
     indexer.wq_b.weight = weight
     original, address = weight.clone(), weight.data_ptr()
@@ -187,18 +190,52 @@ def test_install_prepares_shared_weight_before_warmup(
     else:
         model.model = inner
 
-    wrapped = installer.install_mono_decode(model, _cfg(), None)
+    cfg = _cfg(dcp)
+    cfg.tensor_parallel_size = 8
+    cfg.dcp_config = SimpleNamespace(interleave_size=1)
+    wrapped = installer.install_mono_decode(model, cfg, None)
     assert getattr(weight, "is_shuffled", False) == preshuffle_available
     assert indexer.wq_b.weight is weight and weight.data_ptr() == address
     assert not hasattr(indexer, "_mono_indexer_wq_packed")
     if preshuffle_available:
         restored = (
-            weight.view(256, _SHAPE.q_lora // 32, 4, 16, 8)
+            weight.view(256, q_lora // 32, 4, 16, 8)
             .permute(0, 3, 1, 2, 4)
             .reshape_as(weight)
         )
         assert torch.equal(restored, original)
         assert wrapped is not model
+        shuffled = weight.clone()
+        bind.prepare_weights({0: indexer})
+        assert indexer.wq_b.weight is weight and weight.data_ptr() == address
+        assert torch.equal(weight, shuffled)
     else:
         assert torch.equal(weight, original)
         assert "forward" not in indexer.__dict__
+
+
+def test_weight_updates_refuse_before_changing_storage(monkeypatch):
+    monkeypatch.setattr(bind, "_takes_weight_updates", lambda cfg: True)
+    assert "weight updates" in bind._static_refusal(None, 8, 0, {0: object()})
+
+
+@pytest.mark.parametrize("q_lora", [0, 1281, 1312])
+def test_unaligned_q_projection_refuses_before_shuffle(q_lora):
+    module = _module(q_lora_rank=q_lora)
+    module.wq_b.weight = torch.empty(_SHAPE.qrows, q_lora)
+    assert "K divisible by 128" in bind._operand_refusal(
+        module, replace(_SHAPE, q_lora=q_lora)
+    )
+
+
+def test_binding_never_shuffles_after_model_warmup(monkeypatch):
+    module = _module()
+    module.wq_b.weight.zero_()
+    monkeypatch.setattr(bind, "indexer_modules", lambda inner: {0: module})
+    monkeypatch.setattr(bind, "get_current_atom_config", _cfg)
+    monkeypatch.setattr(bind, "_refusal", lambda *args: "")
+    original, address = module.wq_b.weight.clone(), module.wq_b.weight.data_ptr()
+    assert bind.bind_indexers(None, 8, 0) is None
+    assert module.wq_b.weight.data_ptr() == address
+    assert not getattr(module.wq_b.weight, "is_shuffled", False)
+    assert torch.equal(module.wq_b.weight, original)
