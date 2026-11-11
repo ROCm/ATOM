@@ -32,14 +32,15 @@ from atom.model_ops.v4_kernels.pool_index import window_row
 # reference.
 _HEAD_BLOCK = True
 
-# The MXFP8 query's heads quantized by one program rather than one each. On
-# MI455X 8 heads on 2 warps took 1344 tokens 31.8 -> 16.2 us (16384: 422 ->
-# 205 us) and c1024 serving +4.1%, with the same bytes out. 1 only for the
-# tests' per-head reference.
+# The MXFP8 query's heads quantized by one program rather than one each, with
+# the same bytes out. 8 heads on 2 warps, 64 heads at 1344 / 16384 tokens:
+# MI455X 31.8 -> 16.2 / 422 -> 205 us (c1024 serving +4.1%), MI355X 22.4 ->
+# 21.6 / 322 -> 287 us. 1 only for the tests' per-head reference.
 _FP8_HEADS = 8
-# Grouping pays once the grouped grid fills the device: with fewer query
-# programs than this a CU, a program a head is faster. MI455X (256 CUs), 64
-# heads: 1 token 1.6 vs 2.4 us, crossing at ~64 tokens; 16 heads at ~256.
+# A program a head below this many grouped query programs a CU: measured on
+# MI455X and MI355X (256 CUs each), not derived. 64/32/16 heads cross over at
+# about this on MI455X and between 1x and 1.5x it on MI355X (at 1x up to 3%,
+# 0.1 us, slower); 8 heads below it on both. Other CU counts are unmeasured.
 _FP8_HEADS_MIN_PROGRAMS_PER_CU = 2
 
 
