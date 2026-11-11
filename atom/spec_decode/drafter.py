@@ -63,11 +63,11 @@ def pcp_aux_rows(n: int) -> int | None:
     target's output instead (EAGLE3) holds whatever the target returns. Keyed on
     the batch-global `target_pcp_split`, never on hook-side bookkeeping, which a
     cudagraph replay skips."""
-    pcp_ws = get_pcp_world_size()
     ctx = getattr(get_forward_context(), "context", None)
-    if pcp_ws > 1 and n > 0 and getattr(ctx, "target_pcp_split", False):
-        return pcp_pad_len(n, pcp_ws) // pcp_ws
-    return None
+    if n <= 0 or not getattr(ctx, "target_pcp_split", False):
+        return None
+    pcp_ws = get_pcp_world_size()
+    return pcp_pad_len(n, pcp_ws) // pcp_ws
 
 
 def aux_blocks(drafter: "Drafter") -> list[torch.Tensor]:
