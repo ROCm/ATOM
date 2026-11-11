@@ -238,14 +238,14 @@ def test_fused_seam_writes_the_fp8_pools_query_and_rows():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
 @pytest.mark.parametrize("fp8_heads", [2, 4, 16, 64])
-def test_fp8_query_heads_a_program_is_bit_exact(fp8_heads):
+def test_fp8_query_heads_a_program_is_bit_exact(monkeypatch, fp8_heads):
     """Any power-of-two group of MXFP8 query heads a program gives a program a
     head's query and KV bytes; the KV keeps the slot after the query ones."""
     from atom.model_ops.blockscale import quantize_fp8
-    from atom.model_ops.deepseek_v41.rope_window import rope_quant_window
+    from atom.model_ops.deepseek_v41 import rope_window
 
     torch.manual_seed(729)
-    device, tokens, heads, dim, rope_dim = "cuda", 13, 64, 512, 64
+    device, tokens, heads, dim, rope_dim = "cuda", 64, 64, 512, 64
     rope = RotaryEmbedding(rope_dim, 1024, base=10000).to(device)
     positions = torch.randint(0, 1024, (tokens,), device=device, dtype=torch.int32)
     normed = torch.randn(tokens, dim, device=device, dtype=torch.bfloat16)
@@ -253,10 +253,11 @@ def test_fp8_query_heads_a_program_is_bit_exact(fp8_heads):
     fp8, e8m0 = (t.dtype for t in quantize_fp8(normed))
 
     def run(n):
+        monkeypatch.setattr(rope_window, "_FP8_HEADS", n)
         rows = torch.empty(tokens, dim + dim // 32, device=device, dtype=torch.uint8)
         qv = torch.empty(tokens, heads, dim, device=device, dtype=fp8)
         qs = torch.empty(tokens, heads, dim // 32, device=device, dtype=e8m0)
-        rope_quant_window(
+        rope_window.rope_quant_window(
             query.clone(),
             normed,
             rope.cos_cache,
@@ -266,7 +267,6 @@ def test_fp8_query_heads_a_program_is_bit_exact(fp8_heads):
             values=rows[:, :dim].view(fp8),
             scales=rows[:, dim:].view(e8m0),
             query_fp8=(qv, qs),
-            fp8_heads=n,
         )
         return rows, qv.view(torch.uint8), qs.view(torch.uint8)
 

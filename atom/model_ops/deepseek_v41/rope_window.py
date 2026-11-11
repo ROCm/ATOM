@@ -30,8 +30,11 @@ from atom.model_ops.v4_kernels.pool_index import window_row
 # reference.
 _HEAD_BLOCK = True
 
-# The MXFP8 query's heads quantized by one program rather than one each, for
-# the same reason; on MI455X 8 heads on 2 warps took 1344 tokens 31.8 -> 16.2 us
+# The MXFP8 query's heads quantized by one program rather than one each.
+# These defaults (heads, warps and crossover) are tuned on gfx1250 (MI455X)
+# and shared across architectures. gfx950 timing is pending: revisit after
+# comparing 1 vs 8 heads at 4096 query rows and representative decode shapes.
+# On MI455X 8 heads on 2 warps took 1344 tokens 31.8 -> 16.2 us
 # (16384: 422 -> 205 us) and c1024 serving +4.1%, with the same bytes out. 1
 # only for the tests' per-head reference.
 _FP8_HEADS = 8
@@ -306,7 +309,6 @@ def rope_quant_window(
     scales=None,
     ring=None,
     query_fp8=None,
-    fp8_heads=None,
 ):
     """Rotate `query` in place and run the KV row to whichever sinks are given.
 
@@ -319,9 +321,7 @@ def rope_quant_window(
 
     One address serves both ring layouts: `window_row` returns a byte offset
     for a byte pool (FP8 values then codes, `V41PoolGeometry.window_bytes`)
-    and a row index for a `[rows, head_dim]` BF16 one. `fp8_heads`: MXFP8
-    query heads a program; when None, `_FP8_HEADS` from
-    `_FP8_HEADS_MIN_QUERY_ROWS` query rows on and 1 below.
+    and a row index for a `[rows, head_dim]` BF16 one.
     """
     tokens, heads, dim = query.shape
     kv_half = ring is not None or qat is not None or values is not None
@@ -339,8 +339,7 @@ def rope_quant_window(
         and rope_dim >= 2
         and (rope_dim & (rope_dim - 1)) == 0
     )
-    if fp8_heads is None:
-        fp8_heads = _FP8_HEADS if tokens * heads >= _FP8_HEADS_MIN_QUERY_ROWS else 1
+    fp8_heads = _FP8_HEADS if tokens * heads >= _FP8_HEADS_MIN_QUERY_ROWS else 1
     if not (
         query_fp8 is not None
         and fp8_heads > 1
