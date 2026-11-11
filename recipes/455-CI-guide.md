@@ -2,6 +2,8 @@
 
 455（gfx1250）CI 的执行手册：测哪些模型、用哪个镜像、怎么跑、记录哪些数字、怎么汇总。各模型的 server / bench 命令放在同目录的 [`455-CI-recipe.md`](455-CI-recipe.md)，本文件只规定流程和口径。
 
+**目的**：暴露热点模型在 ATOM main + aiter main 上的支持度和覆盖度，也就是能不能跑起来、性能是多少。所以只用 main，依赖也跟着 main 走。跑挂本身就是结果，要如实记录。
+
 每次测试按顺序做五件事：
 
 1. 按 §1 确定场景和模型：周末跑 MLPerf Endpoint，周中跑 8K/1K。
@@ -35,7 +37,7 @@
 
 - **base 镜像固定**为 `rocm/fw-bringup-mlperf:gfx1250-atom-20261110-dsv41`。要换 base 先和负责人确认，并在汇总里写明：换 base 前后的数字不能直接比。
 - **只重装 ATOM 和 aiter，且只用 `ROCm/ATOM` 和 `ROCm/aiter` 的 `main`。** 不 checkout 私有分支或 PR，不 cherry-pick，不打 patch。镜像里 `/app/endpoints-recipe-*/patches` 这类补丁也不用。
-- **其他组件保持 base 原样**（torch、triton、mori 等）。例外是 ATOM / aiter main 自己锁定版本的依赖，会随安装一起更新。例如 aiter main 锁定 `flydsl==0.5.0`，会替换镜像原来的 FlyDSL。这类变化记进汇总的"依赖变化"，不要手动换回。
+- **其他组件保持 base 原样**（torch、triton、mori 等），只有 ATOM / aiter main 自己锁定版本的依赖跟着 main 走。例如 aiter main 锁定 `flydsl==0.5.0`，安装时会替换镜像原来的 FlyDSL。这正是本 CI 要暴露的状态：不要手动换回，把变化记进汇总的"依赖变化"。
 - **构建失败**（clone、安装或 import 不通过）时，本次所有模型都记 N/A，error 写构建的核心报错。不要改用私有分支凑合。
 
 ### 2.2 命名和同名检查
@@ -151,7 +153,6 @@ recipe 建议每个模型一节，方便按模型名找到命令：
 ````markdown
 ## Kimi-K3 (2.8T)            ← 和 §1 表格里的模型名一致
 - 场景：MLPerf Endpoint；GPU：8（2 node, 2 tray x 1P4G）
-- interactivity 口径：e2e_avg_interactivity    ← 只有 MLPerf Endpoint 需要
 
 ### server
 ```bash
@@ -230,17 +231,16 @@ CI 只负责记录。要查根因就另开任务，从 ATOM 的 `/debug-guide` �
 | 指标 | 计算 |
 |---|---|
 | 每卡吞吐 (tok/s/GPU) | `tps ÷ GPU 数`。`tps` 即 `system_tps`：client 数出的输出 token ÷ 测量窗口 |
-| interactivity (tok/s/user) | agentic benchmark 用 `e2e_avg_interactivity`；single-turn 用 `1e9 / tpot.percentiles["90.0"]`（TPOT 单位是 ns，即 1000 / TPOT p90 [ms]） |
+| E2E average interactivity (tok/s/user) | `e2e_avg_interactivity`。不能用整机 tok/s ÷ 并发代替 |
 
-- Kimi-K3 和 DeepSeek-V4.1-Flash 是 agentic，用 `e2e_avg_interactivity`。这也是 MLPerf Endpoints 官网 agentic 图的横轴，和我们已有的 MI455 图口径一致。
-- DeepSeek R1 和 Qwen-35B-A3B 按各自的 benchmark 类型选口径，写进 recipe 后不再改，否则历史数据不可比。
+- 四个模型都用这两个口径，和 MLPerf Endpoints 官网 agentic 图、我们已有的 MI455 图一致。
 - `n_samples_failed` 不为 0 时照常记数字，在 `note` 列写明失败数。
 
-**8K/1K**：读 ATOM `benchmark_serving` 的结果 JSON。bench 命令要带 `--save-result`；默认的 `--percentile-metrics` 已经包含 itl。
+**8K/1K**：读 ATOM `benchmark_serving` 的结果 JSON，口径和 ATOM benchmark dashboard 一致。bench 命令要带 `--save-result`；默认的 `--percentile-metrics` 已经包含 itl。
 
 | 指标 | 计算 |
 |---|---|
-| 每卡吞吐 (tok/s/GPU) | `total_token_throughput ÷ GPU 数`（输入加输出 token），和 ATOM benchmark dashboard 的 `tput_per_gpu`、InferenceX 口径一致 |
+| 每卡吞吐 (tok/s/GPU) | `total_token_throughput ÷ GPU 数`（输入加输出 token），即 dashboard 的 `tput_per_gpu` |
 | ITL P50 (ms) | `median_itl_ms` |
 
 - `completed` 应该等于发出的请求数。`errors` 里有非空项时，把个数写进 `note`。
@@ -258,7 +258,8 @@ CI 只负责记录。要查根因就另开任务，从 ATOM 的 `/debug-guide` �
 | `gpus` | 每卡吞吐的分母 |
 | `concurrency` | `4` 或 `64` |
 | `status` | `ok` 或 `fail` |
-| `tok_s_per_gpu` | 每卡吞吐，保留两位小数 |
+| `system_tok_s` | 整机吞吐：endpoint 为 `tps`，8k1k 为 `total_token_throughput` |
+| `tok_s_per_gpu` | `system_tok_s ÷ gpus`，保留两位小数 |
 | `interactivity` | tok/s/user，只有 endpoint 填 |
 | `itl_p50_ms` | 只有 8k1k 填 |
 | `image`、`base_image` | 测试镜像 tag、base 镜像 tag |
@@ -345,17 +346,24 @@ recipes/
 
 ### 5.2 对比图
 
-每个模型一张 PNG，存为 `charts/<slug>.png`。数据全部取自 `history.csv`，每次连同本次结果一起重画，不手工改图。
+画法沿用 [LLM-Booster#246 的 MLPerf Endpoints 性能图](https://github.com/wuhuikx/LLM-Booster/issues/246#issuecomment-6678717093)，但**只画 455-CI 自己测的历史数据**，不画 NVIDIA、MI355、PD 模拟或任何其他来源的数据。
 
-- **形式**：2×2 小多图（small multiples）。两列是并发 4 和 64；两行是每卡吞吐和第二个指标（endpoint 为 interactivity，8k1k 为 ITL P50）。每一格用自己的 y 轴，从 0 开始，不用双 y 轴。
-- **x 轴**：同场景最近 20 次测试的日期（`MM-DD`）。
-- **历史**：灰色 `#8A8F98` 折线加小圆点。失败的那次在 x 轴上画灰色 `×`，折线在那里断开。
-- **本次**：深红 `#9B1C1C` 菱形，比历史点大，旁边直接标数值和"vs 上次"的百分比。本次失败时，在格子里写 `this run: N/A`。
-- **历史最佳**：灰色细虚线，不含本次。ITL 取最小值。
-- **标题**以模型名开头，例如 `Kimi-K3 · MLPerf Endpoint: this run vs history`。图注两行：一行写 GPU 数和镜像 tag，一行写指标口径。
-- 图里的文字用英文，和现有的 MLPerf Endpoint 图一致，也省掉中文字体的麻烦。单张 PNG 不超过 300 KB。
+每个模型一张图，存为 `charts/<slug>.png`。数据全部取自 `history.csv`，每次连同本次结果一起重画，不手工改图。
 
-为什么用这种图：要回答的是"这次比以前好还是差"，也就是随时间的变化，所以用折线，把本次高亮、历史压成灰色背景。两个指标、两个并发的量级差得很远，所以拆成小多图，而不是挤在一张图里或用双 y 轴。吞吐对 interactivity 的帕累托图适合跟竞品比，但每次只有两个点，日期又只能靠颜色区分，看回退不直观，所以 CI 不用它。
+| | MLPerf Endpoint | 8K/1K |
+|---|---|---|
+| y 轴 | 每卡吞吐（输出 tok/s ÷ GPU 数） | 每卡吞吐（输入加输出 tok/s ÷ GPU 数） |
+| x 轴 | E2E average interactivity (tok/s/user) | ITL P50 (ms)，越往左越好 |
+| 标题 | `<模型> · MLPerf Endpoint: Throughput per GPU vs. E2E Average Interactivity` | `<模型> · 8K/1K: Throughput per GPU vs. ITL P50` |
+
+- **曲线**：每次 CI 一条，点是并发 4 和 64，每个点都标 cN。MLPerf Endpoint 照 #246 画阶梯线，先向右再向下，最大并发那一端不加向左的短线（`stub: False`）。8K/1K 的横轴是延迟，两点之间直接连线。
+- **画几条**：最近 4 次有数据的运行，对应色阶的 4 级。更早的留在 `history.csv` 里。
+- **颜色**：红色菱形，越新越深，从旧到新依次是 `#F5998A`、`#E8452C`、`#C42B4B`、`#9B1C1C`。不足 4 条时取最深的几级。
+- **线型**：最新的一条（通常就是本次）画实线，水平 4 px、竖直 2.4 px；其余画虚线，水平 3 px、竖直 1.8 px。
+- **图例**只写名字和 GPU 数，例如 `AMD MI455 (ATOM main) · 11-15 · 8 GPUs`。副标题列出日期，例如 `455-CI · MI455 (gfx1250) · 10-25 → 11-01 → 11-08 → 11-15`，不再写模型名。
+- **本次跑挂**时图上没有本次的曲线，在图内右上角的 note 写 `11-15 run failed (N/A), see summary.`。
+- **脚注两行**：第一行写数据来源 `AMD MI455: 455-CI runs on ATOM main + aiter main, self-measured, not verified by MLCommons.`；第二行写坐标说明，加上 `cN = concurrency`。
+- 不加放大框、箭头和汇总表。输出 2 倍分辨率的 PNG，2640 px 宽，字体用 #246 里 `fetch_fonts.py` 下载的 Instrument Sans。
 
 ### 5.3 提交到 455-CI
 
@@ -382,5 +390,4 @@ git push origin 455-CI
 ## 6. 待补充
 
 - `455-CI-recipe.md`：各模型的 server 和 bench 命令，按 §3.1 的结构写。
-- DeepSeek R1 和 Qwen-35B-A3B 的 interactivity 口径（agentic 还是 single-turn）。
-- 对比图的渲染脚本：按 §5.2 从 `history.csv` 出图。放进 `455-CI/` 后，在 §5.2 写明用法。
+- 对比图的渲染脚本：复用 #246 的 `endpoint_chart.py`，加一个从 `history.csv` 生成曲线配置的 CI 版，并支持 8K/1K 的 ITL 横轴。放进 `455-CI/` 后，在 §5.2 写明用法。
