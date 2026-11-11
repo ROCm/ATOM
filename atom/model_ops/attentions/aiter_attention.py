@@ -725,6 +725,14 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         scorer = self._index_scorers.get(prefix)
         return {} if scorer is None else {"index_scorer": scorer}
 
+    def _full_batch_scorer_kwargs(self, splits: bool) -> dict:
+        """The scorer record of the step's whole-batch sparse metadata: none when the
+        step splits. A split decode (cut before the builder runs, `_cut_ubatches`) runs
+        only its micro-batches' metadata, each with its own map (`finish_ubatch`), so
+        the whole batch's map would be a launch nobody reads; a layer that did read it
+        would raise, as every decode without a record does."""
+        return {} if splits else self._index_scorer_kwargs()
+
     def _get_sparse_attention_block_tables(
         self,
         block_tables: torch.Tensor,
@@ -1161,7 +1169,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 max_query_len=int(max_seqlen_q),
                 num_idx_heads=self._num_idx_heads,
                 n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(),
-                **self._index_scorer_kwargs(),
+                **self._full_batch_scorer_kwargs(attn_metadata.ubatches is not None),
             )
 
     def finish_ubatch(
@@ -1248,7 +1256,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 max_query_len=max_q_len,
                 num_idx_heads=self._num_idx_heads,
                 n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(),
-                **self._index_scorer_kwargs(),
+                **self._full_batch_scorer_kwargs(bool(decode_ubatch_slices)),
             )
 
         positions = var["positions"].copy_to_gpu(scheduled_tokens)

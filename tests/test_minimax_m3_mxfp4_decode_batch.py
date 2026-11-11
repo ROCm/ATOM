@@ -297,6 +297,7 @@ def test_the_row_rule_and_its_refusal_are_the_mxfp4_indexs(
         slot_mapping=torch.zeros(running_bs),
         kv_indices=None,
         kv_indptr=None,
+        ubatches=None,
     )
     batch = types.SimpleNamespace(total_seqs_num_decode=scheduled)
     if want is ValueError:
@@ -305,6 +306,43 @@ def test_the_row_rule_and_its_refusal_are_the_mxfp4_indexs(
         return
     b.finish_decode(batch, attn, running_bs, rows, q)
     assert seen[0]["seq_lens"].shape[0] == want
+
+
+@pytest.mark.parametrize("splits", [False, True])
+def test_a_split_decode_builds_no_whole_batch_scorer_state(mod, monkeypatch, splits):
+    """A decode that splits runs on its micro-batches' metadata (each with its own map,
+    `finish_ubatch`), so the whole batch's is built without the scorer record -- no work
+    map launched for nobody -- and an unsplit step keeps it. The rest of the metadata is
+    the same either way."""
+    seen = []
+    monkeypatch.setattr(
+        mod, "make_sparse_decode_metadata", lambda **kw: seen.append(kw)
+    )
+    monkeypatch.setattr(mod, "kv_indices_generate_triton", lambda *a: None)
+    monkeypatch.setattr(
+        mod.AiterAttentionMetadataBuilder.__mro__[1],
+        "finish_decode",
+        lambda self, *a: None,
+    )
+    b = builder(mod)
+    record = b._index_scorers[""] = object()
+    b.refresh_flydsl_plan = lambda *_a, **_k: None
+    b._get_sparse_attention_block_tables = lambda bt, sl, bs: bt
+    b._n_valid_column_per_row_buffer = lambda: None
+    attn = types.SimpleNamespace(
+        max_seqlen_k=8,
+        block_tables=torch.zeros(8, 4),
+        context_lens=torch.zeros(8),
+        slot_mapping=torch.zeros(8),
+        kv_indices=None,
+        kv_indptr=None,
+        ubatches=[object(), object()] if splits else None,  # `stage_ubatch_decode`'s
+    )
+    b.finish_decode(types.SimpleNamespace(total_seqs_num_decode=8), attn, 8, 8, 1)
+    kw = seen[0]
+    assert kw.get("index_scorer") is (None if splits else record)
+    assert ("index_scorer" in kw) is (not splits)
+    assert kw["seq_lens"].shape[0] == 8 and kw["num_idx_heads"] == HEADS
 
 
 def test_the_scorer_record_is_immutable_and_builds_without_aiter():
