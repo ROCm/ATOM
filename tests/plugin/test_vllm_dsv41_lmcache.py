@@ -136,10 +136,10 @@ def test_a_finished_requests_save_still_finds_its_request():
     c = AtomLMCacheOffloadConnector.__new__(AtomLMCacheOffloadConnector)
     c._requests = {}
     request = SimpleNamespace(request_id="r0")
-    assert c._v41_request_of(SimpleNamespace(id="r0", _request=request)) is request
+    assert c._request_of(SimpleNamespace(id="r0", _request=request)) is request
     c._requests = {"r1": request}
-    assert c._v41_request_of(SimpleNamespace(id="r1")) is request
-    assert c._v41_request_of(SimpleNamespace(id="r2")) is None
+    assert c._request_of(SimpleNamespace(id="r1")) is request
+    assert c._request_of(SimpleNamespace(id="r2")) is None
 
 
 def test_an_unridable_finished_save_retires_and_frees_its_lease():
@@ -199,9 +199,9 @@ def _v41_scheduler(cached):
     """
     from atom.kv_transfer.offload.chunked_scheduler import ChunkedOffloadSchedulerBase
     from atom.kv_transfer.offload.mp.token_shipping import TokenShipper
-    from atom.plugin.vllm.kv_transfer.v41_mp_scheduler import V41StateMPScheduler
+    from atom.plugin.vllm.kv_transfer.ride_mp_scheduler import StateRideMPScheduler
 
-    s = V41StateMPScheduler.__new__(V41StateMPScheduler)
+    s = StateRideMPScheduler.__new__(StateRideMPScheduler)
     ChunkedOffloadSchedulerBase.__init__(
         s,
         SimpleNamespace(
