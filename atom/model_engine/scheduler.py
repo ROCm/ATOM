@@ -5121,10 +5121,11 @@ class Scheduler:
         pos = 0
         if self._connector_flag("is_offload"):
             for i, queued in enumerate(self.waiting):
-                if self._is_offload_prefill_resume(queued):
-                    pos = i + 1
-                elif queued.status != SequenceStatus.WAITING_FOR_REMOTE_KVS:
+                if queued.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
+                    continue  # in flight, even if an earlier load left its flags
+                if not self._is_offload_prefill_resume(queued):
                     break
+                pos = i + 1
         return pos
 
     def _park_ready_offload_partial_prefills(self) -> None:

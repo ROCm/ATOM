@@ -1236,6 +1236,25 @@ class TestSchedule:
         assert sched.preempt(victim)
         assert list(sched.waiting) == [first, resume, victim, second, fresh]
 
+    def test_a_reload_in_flight_is_not_a_settled_resume_for_placement(self):
+        """A request parked again for a second load keeps the flags and blocks of
+        its first one; only its status says it is in flight. It must not count as
+        a settled resume when placing a victim."""
+        sched = self._offload_sched(12)
+        reloads = []
+        for i in range(4):
+            seq = self._in_flight_load(sched, 300 + 20 * i)
+            seq.offload_loaded = True  # left by the earlier load
+            assert sched._is_offload_prefill_resume(seq)
+            reloads.append(seq)
+        victim = Sequence(list(range(17)), 16, SamplingParams(max_tokens=2))
+        victim.status = SequenceStatus.RUNNING
+        sched.waiting.extend(reloads)
+
+        assert sched.preempt(victim)
+        assert list(sched.waiting) == [victim, *reloads]
+        assert sched._can_admit_head_prefill()
+
     def test_parked_partial_prefills_queue_behind_a_settled_resume(self):
         """Four partial prefills parked for their loads must not push a settled
         resume out of the window `_can_admit_head_prefill` reads: event-free ticks
