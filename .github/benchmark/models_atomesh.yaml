@@ -2102,6 +2102,91 @@ models:
       apply_chat_template: true
       fewshot_as_multiturn: true
 
+  # MiniMax-M3.1-Flash Quark MXFP4, the recipe in recipes/MiniMax-M3.md:
+  # PTPC FP8 attention, the fused shared expert, DSpark with 7 drafts, FP8 KV
+  # and index cache, thinking on. Manual accuracy only. The Store owners and
+  # NICs are the pit2-p03 (TW MI355X) ones from the GLM mooncake_store cells.
+  MiniMax-M3.1-Flash:
+    backend: atom
+    model_path: "${ATOMESH_MODEL_ROOT}/amd/MiniMax-M3.1-Flash-Quark-MXFP4"
+    precision: MXFP4
+    env:
+      common:
+        AITER_QUICK_REDUCE_QUANTIZATION: INT4
+        ATOM_FORCE_ATTN_TRITON: "1"
+        ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4: "1"
+        MC_ENABLE_DEST_DEVICE_AFFINITY: "1"
+      prefill: {}
+      decode: {}
+    server:
+      common_args:
+        trust_remote_code: true
+        kv_cache_dtype: fp8
+        block_size: 128
+        enable_prefix_caching: false
+        gpu_memory_utilization: 0.9
+        max_model_len: 131072
+        max_num_seqs: 128
+        max_num_batched_tokens: 32768
+        online_quant_config: '{"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "vision_tower", "multi_modal_projector", "patch_merge_mlp", "*block_sparse_moe"]}'
+        method: dspark
+        draft_model: "${ATOMESH_MODEL_ROOT}/amd/MiniMax-M3.1-Flash-Quark-MXFP4/dspark"
+        num_speculative_tokens: 7
+        extra_args: '--index-cache-dtype fp8 --default-chat-template-kwargs {"thinking_mode":"enabled"}'
+    suites:
+      accuracy:
+        - name: minimax-m31-flash-1p1d-tp4-mcstore-gsm8k
+          topology: 1p1d
+          display_topology: 1P1D-TP4-DSPARK7-MCSTORE
+          pd_worker_layout: single_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [4096]
+          osl: 1024
+          concurrency: [16]
+          runner:
+            time_limit: "16:00:00"
+          prefill:
+            workers: 1
+            tp: 4
+          decode:
+            workers: 1
+            tp: 4
+          env:
+            common:
+              MC_DISABLE_HIP: "1"
+            prefill:
+              HIP_VISIBLE_DEVICES: "0,1,2,3"
+              OFFLOAD_PROFILE: "1"
+              OFFLOAD_MIN_LOAD_TOKENS: "0"
+              MOONCAKE_STORE: "1"
+              MOONCAKE_STORE_OWNERS: "0:768:rdma4,rdma5;1:768:rdma6,rdma7"
+              MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS: "${ATOMESH_MODEL_ROOT}"
+              PREFILL_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
+            decode:
+              HIP_VISIBLE_DEVICES: "4,5,6,7"
+              DECODE_KV_TRANSFER_CONFIG: >-
+                {"kv_role":"kv_consumer","kv_connector":"mooncake","proxy_ip":"${ROLE_IP}","handshake_port":6301,"ib_enable_alternate_hca":true,"ib_hca_count":8}
+          benchmark:
+            kind: random
+            wait_server_timeout: 5400
+            wait_router_timeout: 600
+          run_eval: true
+          eval_only: true
+          accuracy:
+            task: gsm8k
+            fewshot: 5
+            eval_concurrency: [16]
+            model_type: local-chat-completions
+            endpoint: chat/completions
+            batch_size: 65
+            max_gen_toks: 16384
+            apply_chat_template: true
+            fewshot_as_multiturn: true
+            # Recipe flexible-extract is 0.948 on one 4-GPU box. This is P/D
+            # plus the Store, so the bar leaves room for that and for run noise.
+            threshold: 0.90
+
   DeepSeek-V4-Pro-0813:
     backend: atom
     model_path: "${ATOMESH_MODEL_ROOT}/deepseek-ai/DeepSeek-V4-Pro-0813/"
