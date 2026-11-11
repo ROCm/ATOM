@@ -3787,9 +3787,7 @@ class ModelRunner:
                 self.tokenID_processor.prev_token_ids = next_token_ids
                 draft_token_ids = self.propose_draft_token_ids(
                     batch,
-                    self.tokenID_processor.input_ids.gpu[
-                        1 : hidden_states.shape[0] + 1
-                    ],
+                    self._draft_input_ids(batch, hidden_states),
                     hidden_states,
                     next_token_ids,
                     num_reject_tokens,
@@ -3820,9 +3818,7 @@ class ModelRunner:
                 # propose_draft_token_ids, from `batch.next_token_ids`.
                 draft_token_ids = self.propose_draft_token_ids(
                     batch,
-                    self.tokenID_processor.input_ids.gpu[
-                        1 : hidden_states.shape[0] + 1
-                    ],
+                    self._draft_input_ids(batch, hidden_states),
                     hidden_states,
                     next_token_ids,
                     num_reject_tokens,
@@ -3961,9 +3957,7 @@ class ModelRunner:
             if will_align_draft:
                 self.propose_draft_token_ids(
                     batch,
-                    self.tokenID_processor.input_ids.gpu[
-                        1 : hidden_states.shape[0] + 1
-                    ],
+                    self._draft_input_ids(batch, hidden_states),
                     hidden_states,
                     torch.zeros(
                         batch.total_seqs_num, dtype=torch.int32, device=self.device
@@ -4071,6 +4065,17 @@ class ModelRunner:
         return KVConnectorOutput(
             finished_sending=done_sending, finished_recving=done_recving
         )
+
+    def _draft_input_ids(self, batch: ScheduledBatch, hidden_states) -> torch.Tensor:
+        """The target ids the drafter reads, one per row the forward ran: its
+        `hidden_states`' rows (a PCP rank's own shard on a pure middle chunk),
+        else the step's `running_tokens` -- a step the model served whole
+        (`step_override`) returns no hidden states and drafts by itself."""
+        if hidden_states is None:
+            rows = get_forward_context().context.forward_mode.running_tokens
+        else:
+            rows = hidden_states.shape[0]
+        return self.tokenID_processor.input_ids.gpu[1 : rows + 1]
 
     def propose_draft_token_ids(
         self,
