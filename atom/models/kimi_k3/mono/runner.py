@@ -154,6 +154,8 @@ class K3MonoDecodeRunner:
 
     max_rows = MAX_ROWS
     bind_k2 = True
+    # Whether K1 reads an online per_1x128 FP8 in_proj (else in_proj stays BF16).
+    fp8_in_proj = False
 
     def __init__(self, model, drafter=None, metadata_builder=None) -> None:
         group = get_tp_group().cpu_group
@@ -194,7 +196,13 @@ class K3MonoDecodeRunner:
         self.dims = Dims(self.tp)
         self.debug = envs.ATOM_MONO_DEBUG
         self.inner = inner_model(model)
-        self.plans = bind_model(self.inner, self.dims, self.rank, bind_k2=self.bind_k2)
+        self.plans = bind_model(
+            self.inner,
+            self.dims,
+            self.rank,
+            bind_k2=self.bind_k2,
+            fp8_in_proj=self.fp8_in_proj,
+        )
         self.num_blocks = num_blocks(len(self.inner.layers))
         # a DSpark drafter taps hidden states; a plain-decode deployment has none
         self.aux = (

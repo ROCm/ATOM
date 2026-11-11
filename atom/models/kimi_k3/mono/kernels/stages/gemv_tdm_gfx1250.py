@@ -22,6 +22,7 @@ read touches over distinct banks.
 import math
 
 import flydsl.expr as fx
+from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import rocdl as rocdl_dialect
 from flydsl._mlir.dialects import vector
@@ -38,19 +39,24 @@ from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import (
     ROWS,
     TDM_CLUSTER,
     TDM_DEPTH,
+    TDM_FP8_DEPTH,
+    TDM_FP8_SCALE_WORDS,
     TDM_ROW_STRIDE,
     TDM_SLAB,
     tdm_lds_words,
+    tdm_task_words,
 )
-from atom.mono.device.ops import mma_bf16
+from atom.mono.device.ops import mma_bf16, rsrc
 from atom.mono.plan.architecture import GFX1250
 
 SLAB = TDM_SLAB
 ROW_STRIDE = TDM_ROW_STRIDE
 DEPTH = TDM_DEPTH
+FP8_DEPTH = TDM_FP8_DEPTH
 WAVES = 8
 WAVE_COLUMNS = SLAB // WAVES
 WAVE_STEPS = WAVE_COLUMNS // K_PER_MMA
+assert WAVES * GFX1250.wave_size == TDM_FP8_SCALE_WORDS
 _DESCRIPTOR_TYPE = 2 << 30
 _CLUSTER_MASK = (1 << TDM_CLUSTER) - 1 if TDM_CLUSTER > 1 else 0
 CLUSTER_LAUNCH = {
@@ -63,15 +69,25 @@ def _i32(value: int):
     return fx.Int32(value - (1 << 32) if value >= 1 << 31 else value)
 
 
-def load_rows(address, row_stride: int, lds, rows, rows_per_wave: int, mask: int = 0):
+def load_rows(
+    address,
+    row_stride: int,
+    lds,
+    rows,
+    rows_per_wave: int,
+    mask: int = 0,
+    padded: bool = True,
+):
     """Issue this wave's TDM copy of ``rows_per_wave`` of a [rows, SLAB] BF16
     tile starting at ``address`` into ``lds``; rows past ``rows`` are skipped.
-    ``mask`` is the cluster multicast mask of identical loads to merge."""
+    ``mask`` is the cluster multicast mask of identical loads to merge.
+    ``padded``: LDS rows ``ROW_STRIDE`` apart, else packed ``SLAB`` apart."""
 
     wave = fx.Int32(rocdl.wave_id())
     row0 = wave * rows_per_wave
     source = address + fx.Int64(row0) * fx.Int64(row_stride * 2)
-    destination = fx.Int32(fx.ptrtoint(lds)) + row0 * (ROW_STRIDE * 2)
+    pitch = ROW_STRIDE if padded else SLAB
+    destination = fx.Int32(fx.ptrtoint(lds)) + row0 * (pitch * 2)
     live = fx.max(fx.min(fx.Int32(rows) - row0, rows_per_wave), 0)
     group0 = vector.from_elements(
         T.vec(4, T.i32),
@@ -87,7 +103,9 @@ def load_rows(address, row_stride: int, lds, rows, rows_per_wave: int, mask: int
     )
     pad_interval = int(math.log2(SLAB * 2 // 4)) - 1
     pad_amount = LDS_PAD * 2 // 4 - 1
-    config = (1 << 16) | (1 << 20) | (pad_interval << 22) | (pad_amount << 25) | mask
+    config = (1 << 16) | mask
+    if padded:
+        config |= (1 << 20) | (pad_interval << 22) | (pad_amount << 25)
     group1 = vector.from_elements(
         T.vec(8, T.i32),
         [
@@ -142,23 +160,94 @@ def _operand(lds, row, wave, lane):
     return steps
 
 
-def project(lds, x, x_stride: int, rows: int, w, w_rows: int, k: int, task_rows,
-            lane, wave):
+def _fp8_operand(lds, wave, lane, exponent):
+    """``_operand`` of a 16-row FP8 slab in AITER's gfx1250 preshuffle
+    (``[K/32][2][16 rows][16 B]``), each value times the E8M0 ``exponent``'s
+    power of two, so the BF16 operands are exact."""
+
+    row = lane % ROWS
+    lane_group = lane // ROWS
+    steps = []
+    for step in range_constexpr(WAVE_STEPS):
+        chunk = wave * WAVE_STEPS + step
+        elements = []
+        for half in range_constexpr(2):
+            byte = ((chunk * 2 + half) * ROWS + row) * 16 + lane_group * PACK_ELEMENTS
+            raw = fx.Vector(
+                fx.ptr_load(
+                    lds + byte // 4,
+                    result_type=fx.Vector.make_type(2, fx.Int32),
+                )
+            )
+            converted = fx.Vector(
+                rocdl.cvt_scale_pk8_bf16_fp8(
+                    T.vec(PACK_ELEMENTS, T.bf16),
+                    as_ir_value(raw),
+                    as_ir_value(exponent),
+                    0,
+                )
+            )
+            elements.extend(converted[i] for i in range_constexpr(PACK_ELEMENTS))
+        steps.append(fx.Vector.from_elements(elements, fx.BFloat16))
+    return steps
+
+
+def project(
+    lds,
+    x,
+    x_stride: int,
+    rows: int,
+    w,
+    w_rows: int,
+    k: int,
+    task_rows,
+    lane,
+    wave,
+    w_scale=None,
+    depth: int = DEPTH,
+):
     """``x[rows, k] @ w[task_rows[i]:+16, k]^T`` for each task, as v8 f32 WMMA
     accumulators ``[task][16-token tile]``. ``w`` has ``w_rows`` rows of ``k``
-    BF16; rows past it are not read and their outputs are meaningless."""
+    BF16; rows past it are not read and their outputs are meaningless.
+
+    With ``w_scale``, ``w`` is FP8 in AITER's gfx1250 preshuffle with its rows
+    padded to 128 and ``w_scale`` its ``[rows / 128, k / 128]`` E8M0 block
+    scales: the per_1x128 layout ATOM's online quant leaves."""
 
     if k % SLAB:
         raise ValueError(f"TDM GEMV needs K divisible by {SLAB}, got {k}")
     slabs = k // SLAB
+    fp8 = w_scale is not None
+    if fp8 and slabs > GFX1250.wave_size:
+        raise ValueError(f"FP8 TDM GEMV holds one slab's scales a lane, K={k}")
     tasks = len(task_rows)
     tiles = (rows + ROWS - 1) // ROWS
-    x_words, _ = tdm_lds_words(rows, tasks)
+    x_words, _ = tdm_lds_words(rows, tasks, fp8)
     token_words = rows * ROW_STRIDE // 2
-    task_words = ROWS * ROW_STRIDE // 2
-    stages = DEPTH + 1
+    task_words = tdm_task_words(fp8)
+    stages = depth + 1
     rows_per_wave = (rows + WAVES - 1) // WAVES
     issued = []
+    # FP8: wave t copies task t's scale words, one a slab (its four K blocks'
+    # E8M0 bytes), to LDS past the weight slabs; the waves past the tasks and
+    # the lanes past the slabs fill unread words. Read back from LDS a slab at
+    # a time, the exponents stay out of SGPRs, which K1 has none to spare.
+    scales = lds + x_words + stages * tasks * task_words
+    if fp8:
+        row = task_rows[0]
+        for task in range(1, tasks):
+            row = (wave == task).select(task_rows[task], row)
+        word = bo.buffer_load(
+            rsrc(w_scale),
+            row // 128 * (k // 512) + fx.min(lane, slabs - 1),
+            vec_width=1,
+            dtype=T.i32,
+        )
+        fx.ptr_store(fx.Int32(word), scales + wave * GFX1250.wave_size + lane)
+
+    def slab_exponent(task, slab):
+        word = fx.ptr_load(scales + task * GFX1250.wave_size + slab)
+        return (word >> (wave // (128 // WAVE_COLUMNS) * 8)) & 0xFF
 
     def issue_tokens(slab):
         load_rows(
@@ -173,13 +262,30 @@ def project(lds, x, x_stride: int, rows: int, w, w_rows: int, k: int, task_rows,
 
     def issue_weights(slab):
         for task in range(tasks):
-            load_rows(
-                w + fx.Int64(task_rows[task]) * fx.Int64(k * 2) + fx.Int64(slab * SLAB * 2),
-                k,
-                lds + x_words + ((slab % stages) * tasks + task) * task_words,
-                fx.Int32(w_rows) - task_rows[task],
-                ROWS // WAVES,
-            )
+            destination = lds + x_words + ((slab % stages) * tasks + task) * task_words
+            if fp8:
+                # The task's slab is one contiguous 16 x 512 B block: copied as
+                # WAVES packed 512-element rows.
+                load_rows(
+                    w
+                    + fx.Int64(task_rows[task]) * fx.Int64(k)
+                    + fx.Int64(slab * SLAB * ROWS),
+                    SLAB,
+                    destination,
+                    WAVES,
+                    1,
+                    padded=False,
+                )
+            else:
+                load_rows(
+                    w
+                    + fx.Int64(task_rows[task]) * fx.Int64(k * 2)
+                    + fx.Int64(slab * SLAB * 2),
+                    k,
+                    destination,
+                    fx.Int32(w_rows) - task_rows[task],
+                    ROWS // WAVES,
+                )
             issued.append(slab)
 
     accumulators = [
@@ -187,7 +293,7 @@ def project(lds, x, x_stride: int, rows: int, w, w_rows: int, k: int, task_rows,
         for _ in range(tasks)
     ]
     issue_tokens(0)
-    for slab in range(min(DEPTH, slabs)):
+    for slab in range(min(depth, slabs)):
         issue_weights(slab)
     for slab in range(slabs):
         if slab:
@@ -200,17 +306,26 @@ def project(lds, x, x_stride: int, rows: int, w, w_rows: int, k: int, task_rows,
                 issue_tokens(slab + 1)
         elif slabs > 1:
             issue_tokens(1)
-        if slab + DEPTH < slabs:
-            issue_weights(slab + DEPTH)
+        if slab + depth < slabs:
+            issue_weights(slab + depth)
         last = max(index for index, tag in enumerate(issued) if tag == slab)
         rocdl.s_wait_tensorcnt(len(issued) - 1 - last)
         gpu.barrier()
         weights = [
-            _operand(
-                lds + x_words + ((slab % stages) * tasks + task) * task_words,
-                lane % ROWS,
-                wave,
-                lane,
+            (
+                _fp8_operand(
+                    lds + x_words + ((slab % stages) * tasks + task) * task_words,
+                    wave,
+                    lane,
+                    slab_exponent(task, slab),
+                )
+                if fp8
+                else _operand(
+                    lds + x_words + ((slab % stages) * tasks + task) * task_words,
+                    lane % ROWS,
+                    wave,
+                    lane,
+                )
             )
             for task in range(tasks)
         ]

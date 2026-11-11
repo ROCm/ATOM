@@ -169,6 +169,7 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
 
     max_rows = GFX1250_MAX_TOKENS
     bind_k2 = False
+    fp8_in_proj = True
 
     def __init__(self, model, drafter=None, metadata_builder=None) -> None:
         group = get_tp_group().cpu_group
@@ -260,6 +261,7 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                     write_idx=-1,
                     quant_core=_fuse_ptpc_core(self.inner.layers[layer.layer_id], rows),
                     external_seam=True,
+                    fp8_projection=weight.w_in_scale is not None,
                 )
                 cache_key = spec
                 local = k1_cache.get(cache_key)
@@ -637,6 +639,7 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             ares_qk=weight.seam.qk,
             in_nw=weight.seam.out_nw,
             w_in=weight.w_in,
+            w_in_scale=weight.w_in_scale,
             w_fb=weight.w_fb,
             conv_w=weight.conv_w,
             conv_st=state,

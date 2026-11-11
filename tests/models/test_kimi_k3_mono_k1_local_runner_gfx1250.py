@@ -63,6 +63,7 @@ def _runtime():
         ares_qk=bf16(1),
         in_nw=bf16(1),
         w_in=bf16(1),
+        w_in_scale=None,
         w_fb=bf16(1),
         conv_w=f32(1),
         conv_st=bf16(1),
@@ -193,3 +194,38 @@ def test_quantized_core_outputs_are_typed_and_packed_into_the_abi():
     assert (
         observed[0][builder.K1_ABI_NAMES.index("core_q")] == runtime.core_q.data_ptr()
     )
+
+
+def test_fp8_in_projection_takes_its_block_scales_through_the_abi():
+    plan = _plan()
+    spec = replace(_spec(), fp8_projection=True)
+    declaration = builder.declare_local(plan, qlen=1)
+    observed = []
+    kernel = SimpleNamespace(
+        complete=True,
+        launcher=lambda *args, **_kwargs: observed.append(args),
+        launch_count=1,
+    )
+    result = SimpleNamespace(
+        runnable=True,
+        kernel=kernel,
+        declaration=declaration,
+        launch_count=1,
+    )
+    runner = Gfx1250K1LocalRunner(plan, spec, result)
+    w_in = torch.zeros((128, 7168), dtype=torch.float8_e4m3fn)
+    scale = torch.zeros((1, 56), dtype=torch.uint8)
+    runtime = replace(_runtime(), w_in=w_in, w_in_scale=scale)
+
+    runner(runtime)
+
+    assert observed[0][builder.K1_ABI_NAMES.index("w_in")] == w_in.data_ptr()
+    assert observed[0][builder.K1_ABI_NAMES.index("w_in_scale")] == scale.data_ptr()
+    with pytest.raises(ValueError, match="E8M0"):
+        runner(replace(runtime, w_in_scale=torch.zeros((2, 56), dtype=torch.uint8)))
+    with pytest.raises(ValueError, match="w_in must be bfloat16"):
+        Gfx1250K1LocalRunner(plan, _spec(), result)(runtime)
+    with pytest.raises(ValueError, match="takes no w_in_scale"):
+        Gfx1250K1LocalRunner(plan, _spec(), result)(
+            replace(_runtime(), w_in_scale=scale)
+        )

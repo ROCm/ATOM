@@ -29,7 +29,10 @@ from atom.models.kimi_k3.mono.kernels.execution_plan import (
     KimiLdsPlan,
     LdsRegion,
 )
-from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import tdm_lds_bytes
+from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import (
+    TDM_FP8_DEPTH,
+    tdm_lds_bytes,
+)
 from atom.models.kimi_k3.mono.kernels.token_tiling import TokenTile
 from atom.mono.plan.architecture import GFX1250
 from atom.mono.plan.layout import pair_layout
@@ -56,6 +59,7 @@ K1_ABI_NAMES = (
     "ares_qk",
     "in_nw",
     "w_in",
+    "w_in_scale",
     "w_fb",
     "conv_w",
     "conv_st",
@@ -356,10 +360,20 @@ class K1LocalBuildSpec:
     # Stream the in-projection's tokens and weights through the TDM
     # (``gemv_tdm_gfx1250``) instead of register-loaded weight slabs.
     tdm_projection: bool = True
+    # The in-projection is ATOM's online per_1x128 FP8 (preshuffled, E8M0
+    # block scales in ``w_in_scale``) rather than BF16.
+    fp8_projection: bool = False
 
     def validate(self, plan: Gfx1250KimiBuildPlan) -> None:
         if not 1 <= self.qlen <= 16 or plan.tokens % self.qlen:
             raise ValueError("local K1 qlen must be in [1, 16] and divide tokens")
+        if self.fp8_projection and not self.tdm_projection:
+            raise ValueError("local K1 reads an FP8 in-projection through the TDM only")
+        # The FP8 slabs reuse the LDS planned for the BF16 ones.
+        if self.fp8_projection and tdm_lds_bytes(
+            plan.tokens, PROJECTION_TASKS_PER_CTA, True, TDM_FP8_DEPTH
+        ) > tdm_lds_bytes(plan.tokens, PROJECTION_TASKS_PER_CTA):
+            raise ValueError("local K1's FP8 TDM slabs outgrow the BF16 ones")
         if type(self.delta) is not bool:
             raise TypeError("local K1 delta must be bool")
         if self.external_seam and (self.delta or self.write_idx >= 0):

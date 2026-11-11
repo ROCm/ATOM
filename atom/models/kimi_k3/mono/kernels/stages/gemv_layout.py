@@ -41,22 +41,37 @@ LDS_PAD = 8
 TDM_SLAB = 512
 TDM_ROW_STRIDE = TDM_SLAB + LDS_PAD
 TDM_DEPTH = 3
+# An FP8 weight slab is half a BF16 one, so more of them fit in flight.
+TDM_FP8_DEPTH = 5
+# FP8's E8M0 scale words: one for each thread of the 256-thread CTA.
+TDM_FP8_SCALE_WORDS = 256
 # Every CTA of a TDM GEMV reads the same token slabs: launched in clusters of
 # this many CTAs, their identical slab loads merge (multicast) in GL1.
 TDM_CLUSTER = 4
 
 
-def tdm_lds_words(rows: int, tasks: int) -> tuple[int, int]:
+def tdm_task_words(fp8: bool = False) -> int:
+    """i32 LDS words of one weight task's slab: padded BF16 rows, or the FP8
+    preshuffled slab as one unpadded block."""
+
+    return ROWS * TDM_SLAB // 4 if fp8 else ROWS * TDM_ROW_STRIDE // 2
+
+
+def tdm_lds_words(
+    rows: int, tasks: int, fp8: bool = False, depth: int = TDM_DEPTH
+) -> tuple[int, int]:
     """``(token, weight)`` i32 LDS words of the TDM GEMV for one CTA."""
 
     return (
         2 * rows * TDM_ROW_STRIDE // 2,
-        (TDM_DEPTH + 1) * tasks * ROWS * TDM_ROW_STRIDE // 2,
+        (depth + 1) * tasks * tdm_task_words(fp8) + (TDM_FP8_SCALE_WORDS if fp8 else 0),
     )
 
 
-def tdm_lds_bytes(rows: int, tasks: int) -> int:
-    return 4 * sum(tdm_lds_words(rows, tasks))
+def tdm_lds_bytes(
+    rows: int, tasks: int, fp8: bool = False, depth: int = TDM_DEPTH
+) -> int:
+    return 4 * sum(tdm_lds_words(rows, tasks, fp8, depth))
 
 
 @dataclass(frozen=True)

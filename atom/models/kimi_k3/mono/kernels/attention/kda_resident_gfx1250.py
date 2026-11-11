@@ -83,6 +83,7 @@ class ResidentBuildKey:
     gemv_unit: int
     external_seam: bool
     tdm_projection: bool
+    fp8_projection: bool
 
 
 @dataclass(frozen=True)
@@ -203,6 +204,7 @@ def build_resident_k1(
             spec.gemv_unit,
             spec.external_seam,
             spec.tdm_projection,
+            spec.fp8_projection,
         ),
         SOURCES,
     )
@@ -210,6 +212,7 @@ def build_resident_k1(
         f"k3_k1_gfx1250_resident_s{s}_l{qlen}_nb{declaration.nblocks}"
         f"_u{spec.gemv_unit}_q{int(spec.quant_core)}"
         f"{'_xs' if spec.external_seam else ''}{'_t' if spec.tdm_projection else ''}"
+        f"{'_f8' if spec.fp8_projection else ''}"
     )
 
     @traced
@@ -389,6 +392,7 @@ def build_resident_k1(
         ares_qk: Int64,
         in_nw: Int64,
         w_in: Int64,
+        w_in_scale: Int64,
         w_fb: Int64,
         conv_w: Int64,
         conv_st: Int64,
@@ -622,6 +626,11 @@ def build_resident_k1(
                     ],
                     lane,
                     wave,
+                    **(
+                        {"w_scale": w_in_scale, "depth": gemv_tdm.FP8_DEPTH}
+                        if spec.fp8_projection
+                        else {}
+                    ),
                 )
                 gpu.barrier()
             else:
@@ -890,6 +899,7 @@ def build_resident_k1(
         ares_qk: Int64,
         in_nw: Int64,
         w_in: Int64,
+        w_in_scale: Int64,
         w_fb: Int64,
         conv_w: Int64,
         conv_st: Int64,
@@ -921,6 +931,7 @@ def build_resident_k1(
                 ares_qk,
                 in_nw,
                 w_in,
+                w_in_scale,
                 w_fb,
                 conv_w,
                 conv_st,

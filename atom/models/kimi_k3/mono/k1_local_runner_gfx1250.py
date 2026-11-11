@@ -35,6 +35,7 @@ class K1LocalRuntime:
     ares_qk: torch.Tensor
     in_nw: torch.Tensor
     w_in: torch.Tensor
+    w_in_scale: torch.Tensor | None
     w_fb: torch.Tensor
     conv_w: torch.Tensor
     conv_st: torch.Tensor
@@ -136,7 +137,6 @@ class Gfx1250K1LocalRunner:
             "ares_nw",
             "ares_qk",
             "in_nw",
-            "w_in",
             "w_fb",
             "conv_st",
             "core_out",
@@ -145,6 +145,24 @@ class Gfx1250K1LocalRunner:
                 continue
             if getattr(runtime, name).dtype != torch.bfloat16:
                 raise ValueError(f"local K1 {name} must be bfloat16")
+        if self.spec.fp8_projection:
+            w_in, scale = runtime.w_in, runtime.w_in_scale
+            if w_in.dtype != torch.float8_e4m3fn or w_in.shape[1] != HIDDEN:
+                raise ValueError("local K1 FP8 w_in must be float8_e4m3fn [N, 7168]")
+            if (
+                scale is None
+                or scale.element_size() != 1
+                or w_in.shape[0] % 128
+                or tuple(scale.shape) != (w_in.shape[0] // 128, HIDDEN // 128)
+            ):
+                raise ValueError(
+                    "local K1 w_in_scale must be the E8M0 [N / 128, 56] block scales"
+                )
+        else:
+            if runtime.w_in.dtype != torch.bfloat16:
+                raise ValueError("local K1 w_in must be bfloat16")
+            if runtime.w_in_scale is not None:
+                raise ValueError("a BF16 local K1 in-projection takes no w_in_scale")
         if self.spec.quant_core:
             if runtime.core_q is None or tuple(runtime.core_q.shape) != (
                 rows,

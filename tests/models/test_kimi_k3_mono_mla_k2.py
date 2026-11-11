@@ -67,7 +67,9 @@ def stub_binds(monkeypatch):
     from atom.models.kimi_k3.mono import weights
 
     monkeypatch.setattr(
-        weights, "bind_kda", lambda layer, lid, dims: SimpleNamespace(layer_id=lid)
+        weights,
+        "bind_kda",
+        lambda layer, lid, dims, fp8_in_proj=False: SimpleNamespace(layer_id=lid),
     )
     monkeypatch.setattr(
         weights,

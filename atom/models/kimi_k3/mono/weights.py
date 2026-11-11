@@ -116,6 +116,38 @@ def _plain_bf16(module, name: str, shape: tuple[int, ...]) -> torch.Tensor:
     return w.data
 
 
+def _block_fp8(module, name: str, shape: tuple[int, int]):
+    """ATOM's online per_1x128 FP8 linear as gfx1250's TDM GEMV reads it, in
+    place: ``(weight, scale)``, the weight in AITER's 16x16 preshuffle with its
+    rows zero-padded to 128, the scale its ``[rows / 128, cols / 128]`` E8M0
+    block scales."""
+    rows, cols = shape
+    padded = -(-rows // 128) * 128
+    w = _param(module, name)
+    scale = getattr(module, "weight_scale", None)
+    _need(w.dtype == torch.float8_e4m3fn, f"{name} is {w.dtype}, expected FP8")
+    _need(
+        scale is not None and scale.dtype == torch.float8_e8m0fnu,
+        f"{name}: the kernels read E8M0 block scales "
+        "(ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE=1)",
+    )
+    _need(
+        getattr(w, "is_shuffled", False),
+        f"{name}: the kernels read the preshuffled weight "
+        "(ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=1)",
+    )
+    _need(
+        tuple(w.shape) == (padded, cols),
+        f"{name} is {tuple(w.shape)}, expected {(padded, cols)}",
+    )
+    _need(
+        tuple(scale.shape) == (padded // 128, cols // 128),
+        f"{name} scale is {tuple(scale.shape)}, expected a 128x128 block scale",
+    )
+    _need(w.is_contiguous() and scale.is_contiguous(), f"{name} not contiguous")
+    return w.data, scale.data
+
+
 def _vec(param, n: int, name: str, dtype: torch.dtype = BF16) -> torch.Tensor:
     t = getattr(param, "data", param)
     _need(t.numel() == n, f"{name} has {t.numel()} elements, expected {n}")
@@ -195,6 +227,7 @@ class KdaLayer:
     write_idx: int  # the block this layer writes, or -1
     seam: AttnRes
     w_in: torch.Tensor
+    w_in_scale: torch.Tensor | None  # E8M0 block scales of an FP8 ``w_in``
     w_fb: torch.Tensor
     conv_w: torch.Tensor
     a_log: torch.Tensor
@@ -275,8 +308,9 @@ def _seam(site, name: str) -> AttnRes:
     )
 
 
-def bind_kda(layer, layer_id: int, dims: Dims) -> KdaLayer:
-    """One KDA layer's K1 tensors."""
+def bind_kda(layer, layer_id: int, dims: Dims, fp8_in_proj: bool = False) -> KdaLayer:
+    """One KDA layer's K1 tensors. ``fp8_in_proj``: the K1 reads an online
+    per_1x128 FP8 in_proj as it is; otherwise in_proj must stay BF16."""
     attn = layer.self_attn
     name = f"layer {layer_id}"
     _need(layer.is_linear_attn, f"{name}: not a KDA layer")
@@ -292,13 +326,20 @@ def bind_kda(layer, layer_id: int, dims: Dims) -> KdaLayer:
     lower = attn._kda_gate_lower_bound
     _need(lower is not None, f"{name}: no KDA gate lower bound")
     blocks, write_idx = layer_block(layer_id)
+    in_proj = f"{name} in_proj"
+    w_in, w_in_scale = (
+        _block_fp8(attn.in_proj, in_proj, (dims.fused, HIDDEN))
+        if fp8_in_proj and _param(attn.in_proj, in_proj).dtype != BF16
+        else (_plain_bf16(attn.in_proj, in_proj, (dims.fused, HIDDEN)), None)
+    )
     return KdaLayer(
         layer_id=layer_id,
         blocks=blocks,
         write_idx=write_idx,
         seam=_seam(layer.self_attention_attn_res, f"{name} attn seam"),
         # [q | k | v | g | beta | f_a]; the kernels' offsets follow this order
-        w_in=_plain_bf16(attn.in_proj, f"{name} in_proj", (dims.fused, HIDDEN)),
+        w_in=w_in,
+        w_in_scale=w_in_scale,
         w_fb=_plain_bf16(attn.f_b_proj, f"{name} f_b_proj", (dims.proj, HEAD_DIM)),
         conv_w=_as_f32(attn.conv_weight, dims.qkv * 4, f"{name} conv_weight").view(
             dims.qkv, 4
@@ -612,7 +653,7 @@ class LayerPlan:
 
 
 def bind_model(
-    model, dims: Dims, rank: int, *, bind_k2: bool = True
+    model, dims: Dims, rank: int, *, bind_k2: bool = True, fp8_in_proj: bool = False
 ) -> list[LayerPlan]:
     """Every decoder layer, in order.
 
@@ -658,7 +699,7 @@ def bind_model(
         plans.append(
             LayerPlan(
                 layer_id,
-                bind_kda(layer, layer_id, dims),
+                bind_kda(layer, layer_id, dims, fp8_in_proj),
                 bind_moe(layer, layer_id, dims, rank) if bind_k2 else None,
             )
         )
