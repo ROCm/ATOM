@@ -219,6 +219,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # and reads as 0. Keep it >= max_num_seqs; a smaller cap truncates every
     # rank's running batch. CoreManager warns when that happens.
     "ATOM_DP_DISPATCH_DEPTH": lambda: _nonnegative_int_env("ATOM_DP_DISPATCH_DEPTH", 0),
+    # `--dp-load-balance prefix_spread`: a rank with less queued prefill than
+    # this is about to idle and may take requests from a prefix's rank with
+    # over twice this queued. Must be positive; the default is two 16k prefill
+    # chunks.
+    "ATOM_DP_PREFIX_IDLE_TOKENS": lambda: _optional_int_env(
+        "ATOM_DP_PREFIX_IDLE_TOKENS", min_value=1
+    )
+    or 32768,
     # Place a new agent session on the lightest DP rank, then keep every later
     # request on that immutable cache owner. Existing sessions never spill;
     # child correlation ids are independently load-placed rather than
@@ -1436,6 +1444,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # rejected as not implemented). A kv_connector_extra_config
     # "lmcache.mp.mp_transfer_mode" takes precedence.
     "LMCACHE_MP_TRANSFER_MODE": lambda: os.getenv("LMCACHE_MP_TRANSFER_MODE", "auto"),
+    # LMCache's own chunk size, as the connector configures LMCache with it.
+    # Read on the ATOM side only by `prefix_spread`, which predicts loads with
+    # it and checks it against an LMCache MP server's chunk at registration.
+    "LMCACHE_CHUNK_SIZE": lambda: _int_env("LMCACHE_CHUNK_SIZE", 256),
 }
 
 
