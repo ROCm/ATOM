@@ -1535,21 +1535,14 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
     def _rope_cache_nvfp4(
         self, qkv, k, v, position, cos_sin_cache, kv_pages, slot_mapping
     ):
-        """``rope_cache`` for ``--kv-cache-dtype nvfp4``: aiter's fused norm + RoPE writes
-        the bf16 K, V and index-K rows into the process's scratch (it has no NVFP4
-        writer), `nvfp4_write` quantizes them into the K/V and index pages, and the
-        main q (bf16) and the index q (e4m3, cast as stored) come out as usual. A
-        layer that reuses another's top-k has no index branch."""
+        """``rope_cache`` for ``--kv-cache-dtype nvfp4``: aiter's fused norm + RoPE writes K,
+        V and the index key as NVFP4 straight into the K/V pages and the index pages (the
+        fp32 global K / V scales are read by the kernel), the main q (bf16) and the index
+        q (e4m3, cast as stored) come out as usual. A layer that reuses another's top-k has
+        no index branch."""
         from atom.model_ops.minimax_m3.nvfp4_pages import PAGE_TOKENS
-        from atom.model_ops.minimax_m3.nvfp4_write import (
-            nvfp4_insert_index,
-            nvfp4_insert_kv,
-        )
 
         num_tokens = qkv.shape[0]
-        scratch = self.nvfp4_scratch
-        k_rows, v_rows, index_rows = scratch.rows(num_tokens)
-        scratch_slots = scratch.slots[:num_tokens]
         q_out = torch.empty(
             (num_tokens, self.num_heads * self.head_dim),
             dtype=qkv.dtype,
@@ -1575,29 +1568,21 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             self.index_q_norm.weight,
             self.index_k_norm.weight,
             self.num_idx_heads,
-            scratch_slots,
-            scratch.k,
-            scratch.v,
-            None if self.skip_index_topk else scratch.index,
+            slot_mapping,
+            kv_pages,
+            kv_pages,
+            None if self.skip_index_topk else self.index_cache,
             PAGE_TOKENS,
             q_out,
             index_q,
-            None if self.skip_index_topk else scratch_slots,
-            kv_cache_dtype="auto",
-            index_cache_dtype="auto",
+            None if self.skip_index_topk else slot_mapping,
+            kv_cache_dtype="nvfp4",
+            index_cache_dtype="auto" if self.skip_index_topk else "nvfp4",
+            k_scale=self.nvfp4_k_scale,
+            v_scale=self.nvfp4_v_scale,
             asm_layout=False,
             skip_index_branch=self.skip_index_topk,
         )
-        nvfp4_insert_kv(
-            k_rows,
-            v_rows,
-            kv_pages,
-            slot_mapping,
-            self.nvfp4_k_scale,
-            self.nvfp4_v_scale,
-        )
-        if not self.skip_index_topk:
-            nvfp4_insert_index(index_rows, self.index_cache, slot_mapping)
         q = q_out.view(-1, self.num_heads, self.head_dim)
         self._stash_index_q(index_q, num_tokens, torch.float8_e4m3fn, qkv.device)
         return q, k, v, kv_pages, kv_pages, None, None

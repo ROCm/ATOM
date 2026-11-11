@@ -1,8 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Write side of MiniMax-M3's NVFP4 caches (``--kv-cache-dtype nvfp4`` /
-``--index-cache-dtype nvfp4``): quantize rows of K, V and the index key into the
-pages of ``nvfp4_pages``.
+"""Triton oracle of the NVFP4 page write (tests only): quantize rows of K, V and the index
+key into the pages of ``nvfp4_pages`` from bf16 rows.
+
+Production writes the pages inside aiter's fused ``fused_qknorm_idxrqknorm``
+(``kv_cache_dtype`` / ``index_cache_dtype`` ``"nvfp4"``); this file is what its bytes are
+checked against (``test_minimax_m3_nvfp4_fused_write``), and it writes the pages the
+read-path tests need. Before that op had an NVFP4 mode it was the production writer, after
+aiter's norm/RoPE wrote bf16 rows into a scratch.
 
 Quantization is the vLLM/aiter NVFP4 one, in fp32 throughout, per 16-element group
 of a 128-wide row::
@@ -16,10 +21,7 @@ The e2m1 rounding is written as seven comparisons instead of the hardware conver
 that it is exact against the torch reference (``minimax_m3_nvfp4_ref.quantize_nvfp4``)
 and independent of the arch; tests pin it byte for byte.
 
-A token is one (slot, head) row per side. The norm / RoPE of the main q/k/index
-q/k is aiter's ``fused_qknorm_idxrqknorm``, which cannot write NVFP4; it writes bf16 K,
-V and index-K rows into a scratch (:class:`Nvfp4Scratch`, one token one slot), and the two
-kernels below quantize them into the pages. Tokens with a negative slot are skipped.
+A token is one (slot, head) row per side. Tokens with a negative slot are skipped.
 Two tokens of one 8-token V octet share a 32-bit word of the page (a byte holds
 two tokens' nibbles), so V data is written with atomic and/or on the word: the
 write needs no ordering between tokens.
@@ -237,39 +239,3 @@ def nvfp4_insert_index(
     _nvfp4_index_insert_kernel[(keys.shape[0],)](
         keys, keys.stride(0), slot_mapping, index_pages, index_pages.stride(0)
     )
-
-
-class Nvfp4Scratch:
-    """bf16 rows aiter's fused norm/RoPE writes for the quantizer: K, V ``[N, Hkv, 128]``,
-    index-K ``[N, 128]``, and the identity slot map (token i -> slot i) that makes them a
-    one-page-per-128-tokens cache. One per process, sized for the widest step; the
-    kernels run in stream order, so one layer's rows are consumed before the next's
-    are written."""
-
-    def __init__(self, tokens: int, num_kv_heads: int, device):
-        self.tokens = -(-tokens // PAGE_TOKENS) * PAGE_TOKENS
-        pages = self.tokens // PAGE_TOKENS
-        # the fused op's page-128 cache: [pages, 128, Hkv, 128] per K / V
-        self.k = torch.empty(
-            (pages, PAGE_TOKENS, num_kv_heads, HEAD_DIM),
-            dtype=torch.bfloat16,
-            device=device,
-        )
-        self.v = torch.empty_like(self.k)
-        self.index = torch.empty(
-            (self.tokens, HEAD_DIM), dtype=torch.bfloat16, device=device
-        )
-        self.slots = torch.arange(self.tokens, dtype=torch.int64, device=device)
-
-    def rows(self, tokens: int):
-        """(K, V, index-K) row views of the first ``tokens`` tokens."""
-        if tokens > self.tokens:
-            raise ValueError(
-                f"NVFP4 write scratch holds {self.tokens} tokens, step has {tokens}"
-            )
-        heads = self.k.shape[2]
-        return (
-            self.k.view(-1, heads, HEAD_DIM)[:tokens],
-            self.v.view(-1, heads, HEAD_DIM)[:tokens],
-            self.index[:tokens],
-        )

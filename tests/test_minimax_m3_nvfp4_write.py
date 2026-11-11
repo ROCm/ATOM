@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""NVFP4 page writer (``nvfp4_write``) against a torch reference, byte for byte.
+"""NVFP4 page writer (the writer oracle) against a torch reference, byte for byte.
 
 The reference below quantizes with the documented math (fp32 scale = e4m3(amax/6/gs),
 nearest e2m1 grid value, ties to the even code) and places bytes by the page offsets
@@ -155,7 +155,7 @@ def scatter_slots(npages, tokens, seed, page=None, first=0):
 @pytest.mark.parametrize("heads", [1, 2, 4])
 @pytest.mark.parametrize("gs", [1.0, 0.37])
 def test_kv_pages_equal_the_reference_byte_for_byte(heads, gs):
-    from atom.model_ops.minimax_m3.nvfp4_write import nvfp4_insert_kv
+    from nvfp4_write_oracle import nvfp4_insert_kv
 
     dev = DEV
     tokens, npages = 40, 5
@@ -183,7 +183,7 @@ def test_kv_pages_equal_the_reference_byte_for_byte(heads, gs):
 
 
 def test_index_pages_equal_the_reference_byte_for_byte():
-    from atom.model_ops.minimax_m3.nvfp4_write import nvfp4_insert_index
+    from nvfp4_write_oracle import nvfp4_insert_index
 
     dev = DEV
     tokens, npages = 40, 4
@@ -204,7 +204,7 @@ def test_index_pages_equal_the_reference_byte_for_byte():
 
 
 def test_a_page_stride_wider_than_a_page_leaves_the_gap_alone():
-    from atom.model_ops.minimax_m3.nvfp4_write import nvfp4_insert_kv
+    from nvfp4_write_oracle import nvfp4_insert_kv
 
     dev, heads, npages = DEV, 1, 3
     pb = kv_page_bytes(heads)
