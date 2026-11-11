@@ -19,6 +19,12 @@ MTPR also selects the p2p wire format, so the choice must use group-agreed
 metadata, never a rank's local request count. Set ATOM_MEGA_DECODE_FAST_PATH=0
 to retain the configured capacity for all forwards.
 
+AITER builds whose ``MegaMoEV2.forward`` takes ``max_tokens`` also get the
+DP-group max rows of each step (``_max_tokens_hint``), from which AITER picks
+the staged, small-input or large-input route on the layouts its fused kernels
+support. Those builds give the large-input route one protocol slot per MoE
+layer. Older builds keep the staged route.
+
 Weight prep uses aiter's own shuffles (``aiter.ops.shuffle``):
   w1/w1_scale: ``shuffle_weight_a16w4(., 16, gate_up=True)`` /
                ``shuffle_scale_a16w4(., E, gate_up=True)``  (g1u1 interleave)
@@ -36,6 +42,8 @@ not baked into the kernel).
 
 from __future__ import annotations
 
+import functools
+import inspect
 import logging
 import os
 
@@ -57,6 +65,9 @@ if _MEGA_DECODE_MTPR not in _MEGA_DECODE_MTPRS:
         f"got {_MEGA_DECODE_MTPR}"
     )
 _MEGA_CAPACITY_LOGGED: set[tuple[bool, int, int]] = set()
+# Large-input protocol slot of each MoE module (MTP layers take the margin).
+_MEGA_LAYER_SLOTS: dict[int, int] = {}
+_MEGA_LAYER_SLOT_MARGIN = 8
 
 
 def _os_env(k):
@@ -77,6 +88,46 @@ def _select_decode_mtpr(mtpr: int, context, *, tbo_active: bool) -> int:
     if 0 < context.running_tokens <= _MEGA_DECODE_MTPR:
         return _MEGA_DECODE_MTPR
     return mtpr
+
+
+@functools.cache
+def _takes_max_tokens(mega_cls) -> bool:
+    """Whether this AITER MegaMoEV2 picks its route from a max_tokens hint."""
+    return "max_tokens" in inspect.signature(mega_cls.forward).parameters
+
+
+def _mega_layer_slots() -> int:
+    """Large-input protocol slots of a shared operator: one per MoE layer."""
+    from atom.config import get_current_atom_config
+
+    layers = getattr(get_current_atom_config().hf_config, "num_hidden_layers", 0)
+    return int(layers or 0) + _MEGA_LAYER_SLOT_MARGIN
+
+
+def _max_tokens_hint(mega, context) -> int | None:
+    """This step's max rows over the DP group, identical on every EP rank.
+
+    None (the staged route) when no such count is known: plugin bridges, TBO
+    ubatches and missing metadata. A graph capture only takes the small-input
+    route; the large-input route is never captured.
+    """
+    if context is None or is_plugin_mode():
+        return None
+    from atom.utils.tbo.ubatching import tbo_active
+
+    if tbo_active():  # a ubatch's counts need not be the group's
+        return None
+    if context.running_tokens_are_unified:
+        rows = int(context.running_tokens)  # padded, as a captured graph's bucket
+    elif context.running_tokens_across_dp:
+        rows = max(int(r) for r in context.running_tokens_across_dp)
+    else:
+        return None
+    if rows <= 0:
+        return None
+    if torch.cuda.is_current_stream_capturing() and rows > mega.small_m_mtpr:
+        return None
+    return rows
 
 
 def build_mega_weights(layer) -> None:
@@ -168,6 +219,13 @@ def get_or_build_mega_moe(
 
         # MegaMoEV2 auto-selects fixed-slot vs compact and its GEMM tiles from
         # (tokens, mtpr); no gemm2_tile / enable_fused / tune-table args anymore.
+        # The per-layer slots cost memory only on a capacity that builds the
+        # large-input route.
+        extra = (
+            {"large_m_state_slots": _mega_layer_slots()}
+            if _takes_max_tokens(MegaMoEV2)
+            else {}
+        )
         with torch.inference_mode(False), torch.no_grad():
             m = MegaMoEV2(
                 rank=rank,
@@ -183,6 +241,7 @@ def get_or_build_mega_moe(
                 w2_scale=w2_scale,
                 max_tok_per_rank=mtpr,
                 swiglu_limit=swiglu_limit,
+                **extra,
             )
         _MEGA_CACHE[key] = m
         if rank == 0:
@@ -311,13 +370,23 @@ def run_mega_moe(
                     selected_mtpr,
                 )
 
+    hint = {}
+    if _takes_max_tokens(type(mega)):
+        from atom.utils.forward_context import get_forward_context
+
+        hint["max_tokens"] = _max_tokens_hint(mega, get_forward_context().context)
+        if mega.large_m_available:
+            # The weights are bound above; select this layer's protocol slot.
+            slot = _MEGA_LAYER_SLOTS.setdefault(id(layer), len(_MEGA_LAYER_SLOTS))
+            mega.select_layer_state(slot)
+
     wts = topk_weights.to(torch.float32).contiguous()
     ids = topk_ids.to(torch.int32).contiguous()
     with torch.inference_mode(False), torch.no_grad():
         # swiglu_limit is NOT a forward arg -- it is baked into the instance at
         # construction (see the cache key above). Routing sends a pad row's
         # slots to -1, which combine must skip rather than sum stale data from.
-        out = mega.forward(x.contiguous(), wts, ids, mask_invalid_slots=True)
+        out = mega.forward(x.contiguous(), wts, ids, mask_invalid_slots=True, **hint)
     return out
 
 
