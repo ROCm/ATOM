@@ -154,6 +154,60 @@ def _patch_triton_cluster_dims_for_rocm() -> None:
 _patch_triton_cluster_dims_for_rocm()
 
 
+class _DeferredOperatorStr:
+    """``OperatorIssue.operator_str``'s text, built only when it is printed."""
+
+    __slots__ = ("_args", "_format", "_kwargs", "_target")
+
+    def __init__(self, format_fn, target, args, kwargs):
+        self._format = format_fn
+        self._target = target
+        self._args = args
+        self._kwargs = kwargs
+
+    def __str__(self) -> str:
+        return self._format(self._target, self._args, self._kwargs)
+
+
+def _defer_inductor_operator_str() -> None:
+    """Format Inductor's implicit-fallback log line only if it is emitted.
+
+    Before torch 2.13, ``GraphLowering.call_function`` calls
+    ``OperatorIssue.operator_str(target, args, kwargs)`` eagerly as the
+    argument of a ``log.info`` that is normally filtered out. That string is the
+    full ``str()`` of every argument's Inductor IR, and ``ExternKernel.__str__``
+    prints its inputs recursively, so for an op that falls back late in a long
+    chain of custom ops the text is huge and building it can keep a cold
+    compile busy, with no log output and an idle GPU, for a long time.
+    torch 2.13 wraps the call in ``LazyString`` (pytorch/pytorch#185951).
+
+    This does the same on older torch: ``operator_str`` returns an object that
+    formats the original text in ``__str__``. Every pre-2.13 caller only
+    stringifies it (the ``%s`` of that log call and the f-strings of the
+    ``OperatorIssue`` subclasses' messages), so emitted logs and exception
+    messages are unchanged. Idempotent; a no-op from torch 2.13 on, where
+    ``LazyString`` needs ``operator_str`` to return a real ``str``.
+    """
+    if is_torch_equal_or_newer("2.13.0.dev"):
+        return
+    try:
+        from torch._inductor.exc import OperatorIssue
+    except ImportError:
+        return
+    if getattr(OperatorIssue, "_atom_operator_str_deferred", False):
+        return
+    format_now = OperatorIssue.operator_str
+
+    def operator_str(target, args, kwargs):
+        return _DeferredOperatorStr(format_now, target, args, kwargs)
+
+    OperatorIssue.operator_str = staticmethod(operator_str)
+    OperatorIssue._atom_operator_str_deferred = True
+
+
+_defer_inductor_operator_str()
+
+
 class CompilerInterface:
     """
     The interface for a compiler that can be used by vLLM.

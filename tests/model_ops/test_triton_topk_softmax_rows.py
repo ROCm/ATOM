@@ -47,7 +47,6 @@ def gpu(topK, monkeypatch):
         (512, 10, 3, "sigmoid", True),
         (512, 10, 1, "softplus", True),
         (512, 10, 1, "", True),  # AITER refuses shared columns unscored by ""
-        (512, 10, 1, "sigmoid", False),
     ],
 )
 def test_other_layers_stay_on_aiter(

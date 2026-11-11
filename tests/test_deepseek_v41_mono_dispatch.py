@@ -225,7 +225,7 @@ def _context(monkeypatch, *, prefill=False, ubatch=None, **step_fields):
             "decode": True,
             "tentative": True,
             "requests": [object()],
-            "width": 6,
+            "running_tokens": 6,
             **step_fields,
         }
     )
@@ -245,13 +245,13 @@ def test_verify_step_is_routed(monkeypatch):
 
 def test_plain_decode_step_is_routed(monkeypatch):
     # no drafter: a token a request, not a tentative verify
-    _context(monkeypatch, tentative=False, requests=[object()] * 3, width=3)
+    _context(monkeypatch, tentative=False, requests=[object()] * 3, running_tokens=3)
     assert dispatch.step_supported(torch.zeros(3, dtype=torch.int64), None)
 
 
 def test_ragged_verify_step_is_routed(monkeypatch):
     # requests verifying 2, 4 and 1 + 5 tokens: 12 rows, split unevenly
-    _context(monkeypatch, requests=[object()] * 3, width=12)
+    _context(monkeypatch, requests=[object()] * 3, running_tokens=12)
     assert dispatch.step_supported(torch.zeros(12, dtype=torch.int64), None)
 
 
@@ -263,7 +263,7 @@ def test_ragged_verify_step_is_routed(monkeypatch):
         (6, {"prefill": True}),
         (6, {"ubatch": object()}),
         (6, {"decode": False}),
-        (6, {"width": 12}),
+        (6, {"running_tokens": 12}),
     ],
 )
 def test_other_steps_keep_the_original_model(monkeypatch, tokens, kwargs):
@@ -278,7 +278,7 @@ def test_the_target_is_routed_by_its_rows_alone(monkeypatch, tokens, routed):
     # a padded graph width: neither the scheduled request count nor how the rows
     # split into requests is read
     monkeypatch.setattr(dispatch, "MAX_ROWS", 12)
-    _context(monkeypatch, width=tokens, requests=[object()])
+    _context(monkeypatch, running_tokens=tokens, requests=[object()])
     ids = torch.zeros(tokens, dtype=torch.int64)
     assert dispatch.step_supported(ids, None) is routed
 

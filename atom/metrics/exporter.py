@@ -193,8 +193,10 @@ class _AtomMetricsCollector:
             (
                 "atom:dp_route_load_balanced",
                 (
-                    "Number of sessionless requests routed by the configured load "
-                    "balancer."
+                    "Number of sessionless requests placed by round_robin, "
+                    "least_requests or least_tokens (not by the offline "
+                    "backpressure pool). 0 under prefix_spread, whose placements "
+                    "are atom:dp_prefix_route."
                 ),
                 dp_router.get("load_balanced_total", 0),
             ),
@@ -202,6 +204,28 @@ class _AtomMetricsCollector:
             metric = CounterMetricFamily(name, documentation)
             metric.add_metric([], float(value))
             yield metric
+
+        decisions = dp_router.get("prefix_route")
+        if decisions is not None:
+            # Present only under `--dp-load-balance prefix_spread`.
+            routed = CounterMetricFamily(
+                "atom:dp_prefix_route",
+                "Prefix-spread placement decisions (not completed loads): owner "
+                "(kept on the rank holding the prefix), moved (placed on another "
+                "rank; where the tier holds the prefix and admission finds KV "
+                "for it, that rank restores it there) or cold (no known prefix).",
+                labels=["decision"],
+            )
+            for label, value in decisions.items():
+                routed.add_metric([label], float(value))
+            yield routed
+            moved_tokens = CounterMetricFamily(
+                "atom:dp_prefix_moved_tokens",
+                "Prefix tokens credited to moved prefix-spread requests at "
+                "placement (an estimate, not completed restores).",
+            )
+            moved_tokens.add_metric([], float(dp_router["prefix_moved_tokens"]))
+            yield moved_tokens
 
         metric = CounterMetricFamily(
             "atom:dp_requests_routed",
