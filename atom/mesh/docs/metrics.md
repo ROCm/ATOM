@@ -39,8 +39,8 @@ a sample, so a policy or branch that never ran has no line.
 ## Metric reference
 
 Counters carry the `_total` suffix; histograms expose `_bucket`, `_sum` and
-`_count`. `pool` is the pool of the selected worker: `regular` without PD
-disaggregation, otherwise `prefill` or `decode`. `policy` is one of `random`,
+`_count`. `pool` is the worker pool the selection was made in: `regular`
+without PD disaggregation, otherwise `prefill` or `decode`. `policy` is one of `random`,
 `round_robin`, `power_of_two`, `cache_aware`, `prefix_hash` and `dp_sticky`.
 Decisions and dispatches are counted per attempt: a PD request adds one per
 pool, and a retry adds another.
@@ -51,9 +51,9 @@ them.
 
 | Metric | Type / unit | Labels | Recorded when | Since |
 | --- | --- | --- | --- | --- |
-| `mesh_route_branch_total` | Counter, decisions | `pool`, `policy`, `branch` (see [Branches](#branches)) | Every policy selection with at least one candidate. | [#3141] |
+| `mesh_route_branch_total` | Counter, decisions | `pool`, `policy`, `branch` (see [Branches](#branches)) | Every policy selection with at least one candidate; from [#3213], also a pool without candidates. | [#3141] |
 | `mesh_route_prefix_match_ratio` | Histogram, ratio 0 to 1 | `pool`, `policy` | `cache_aware` branches `affinity`, `relocate`, `stale_tenant`. | [#3141] |
-| `mesh_route_cost` | Histogram, the policy's unit; today active requests | `pool`, `policy` | `cache_aware` `imbalanced`, `relocate`; `prefix_hash` `load_balance_walk`, `fallback_least_load`; `dp_sticky` `no_session`. | [#3141] |
+| `mesh_route_selected_worker_active_requests` | Histogram, active requests | `pool`, `policy`, `branch` | Every selection that picks a worker, before the router adds the request (see [below](#selected-workers-active-requests)). | [#3141] |
 | `mesh_session_affinity_total` | Counter, requests | `pool`, `result`: `hit`, `new`, `rebind`, `expired` | `dp_sticky` selected a worker for a request with a session ID. | [#3141] |
 | `mesh_selected_dp_rank_total` | Counter, dispatches | `pool`, `worker` (base URL), `dp_rank` (rank or `none`) | HTTP routers dispatch a request, after DP rank mapping. | [#3142] |
 | `mesh_route_cache_tokens_total` | Counter, tokens | `pool` (`regular` or `prefill`), `kind`: `prompt`, `cached` | HTTP routers; the response reported cached tokens. Any policy. | [#3142] |
@@ -65,16 +65,21 @@ them.
 Histogram buckets:
 
 - prefix match ratio: 0, 0.1, 0.2, ..., 0.9, 0.95, 1;
-- cost: 0, 1, 2, 4, ..., 1024, then 4096, 16384, 65536, 262144, 1048576;
+- selected worker's active requests: 0, 1, 2, 4, ..., 4096;
 - estimate error ratio: -1, -0.5, -0.25, -0.1, -0.05, -0.01, 0, 0.01, 0.05,
   0.1, 0.25, 0.5, 1;
 - overlap blocks: 0, 1, 2, 4, ..., 16384.
 
 ## Branches
 
-`no_healthy_workers` exists for every policy: there are candidates but none is
-healthy, so no worker is selected. "Samples" lists what the decision adds
-beyond `mesh_route_branch_total`. Defaults are the CLI defaults.
+`no_healthy_workers` exists for every policy: no candidate is healthy, so no
+worker is selected. The policy counts it when none of its candidates is
+healthy. From [#3213], the router also counts it once, under the pool's policy,
+when the health filter leaves no candidate or the pool has no worker, since
+the policy then never runs. Every branch that selects a worker also records the
+[selected worker's active requests](#selected-workers-active-requests);
+"Samples" lists what else the decision adds beyond `mesh_route_branch_total`.
+Defaults are the CLI defaults.
 
 | Policy | Branch | Selected worker | Samples |
 | --- | --- | --- | --- |
@@ -84,16 +89,16 @@ beyond `mesh_route_branch_total`. Defaults are the CLI defaults.
 | | `token_load` | The lower of two random workers by the token load the load monitor last reported. | |
 | | `request_load` | The same by active requests, when either worker has no token load. | |
 | `cache_aware` | `affinity` | Match ratio above `--cache-threshold` (0.3): the worker holding the longest match. | ratio |
-| | `relocate` | Match ratio at or below the threshold: the least-loaded worker, ties broken at random. | ratio, cost |
-| | `imbalanced` | The max minus min load exceeds `--balance-abs-threshold` (64) and the max exceeds `--balance-rel-threshold` (1.5) times the min: the least-loaded worker, without a tree lookup. | cost |
+| | `relocate` | Match ratio at or below the threshold: the least-loaded worker, ties broken at random. | ratio |
+| | `imbalanced` | The max minus min load exceeds `--balance-abs-threshold` (64) and the max exceeds `--balance-rel-threshold` (1.5) times the min: the least-loaded worker, without a tree lookup. | |
 | | `stale_tenant` | Affinity, but that worker is gone or unhealthy: it leaves the tree and the first healthy worker is used. | ratio |
 | | `no_tree` | No tree for the model and pool: a random healthy worker. | |
 | `prefix_hash` | `ring_hit` | The hash ring owner of the first `--prefix-token-count` (256) tokens, when its load is at most `--prefix-hash-load-factor` (1.25) times the average load including this request. | |
-| | `load_balance_walk` | The owner is over that bound: the least-loaded worker within it, or the owner if none is. | cost |
-| | `fallback_least_load` | No ring, or the owner is not healthy: the least-loaded worker. | cost |
+| | `load_balance_walk` | The owner is over that bound: the least-loaded worker within it, or the owner if none is. | |
+| | `fallback_least_load` | No ring, or the owner is not healthy: the least-loaded worker. | |
 | | `no_tokens` | The request has no tokens: no worker. | |
 | `dp_sticky` | `hit`, `new`, `rebind`, `expired` | See [session affinity](#session-affinity). | result |
-| | `no_session` | No `x-session-id` header: the least-loaded worker. | cost |
+| | `no_session` | No `x-session-id` header: the least-loaded worker. | |
 
 ## Reading the values
 
@@ -109,15 +114,17 @@ the histogram count can be lower than the `cache_aware` decision count. Mass
 above the threshold corresponds to `affinity`; mass near 0 comes from first
 turns and unrelated prompts.
 
-### Route cost
+### Selected worker's active requests
 
-Every sample today is the selected worker's active request count as tracked by
-the router (`Worker::load()`), read before this request is added. Only
-branches that pick by load record it. The unit belongs to the policy and the
-buckets reach 2^20 for policies that will record tokens or blocks, so compare
-cost within one policy only. Many `imbalanced` decisions mean load balancing is
-overriding cache affinity; high cost on `relocate` means cache misses land on
-busy workers.
+`mesh_route_selected_worker_active_requests` samples the requests this router
+has in flight on the selected worker (`Worker::load()`). It is read when the
+policy returns, before the router adds the request, so a worker with nothing
+else in flight reads 0. Other routers and the engine's own queue are not
+included. Every selection that picks a worker records one sample under its
+branch, so the `_count` of a branch equals its `mesh_route_branch_total`;
+`no_healthy_workers` and `no_tokens` select no worker and record none. Compare
+values within a branch: high values on `relocate` mean cache misses land on busy
+workers, and on `affinity` that cache hits queue behind other requests.
 
 ### Session affinity
 
@@ -225,8 +232,9 @@ mesh_route_prefix_match_ratio_bucket{pool="prefill",policy="cache_aware",le="0.8
 mesh_route_prefix_match_ratio_bucket{pool="prefill",policy="cache_aware",le="+Inf"} 12
 mesh_route_prefix_match_ratio_sum{pool="prefill",policy="cache_aware"} 7.276585578918457
 mesh_route_prefix_match_ratio_count{pool="prefill",policy="cache_aware"} 12
-mesh_route_cost_sum{pool="prefill",policy="cache_aware"} 0
-mesh_route_cost_count{pool="prefill",policy="cache_aware"} 3
+mesh_route_selected_worker_active_requests_sum{pool="prefill",policy="cache_aware",branch="affinity"} 0
+mesh_route_selected_worker_active_requests_count{pool="prefill",policy="cache_aware",branch="affinity"} 9
+mesh_route_selected_worker_active_requests_count{pool="prefill",policy="cache_aware",branch="relocate"} 3
 mesh_route_cache_tokens_total{pool="prefill",kind="prompt"} 1200
 mesh_route_cache_tokens_total{pool="prefill",kind="cached"} 720
 mesh_route_cache_estimate_tokens_total{pool="prefill",kind="prompt"} 1100
@@ -234,8 +242,8 @@ mesh_route_cache_estimate_tokens_total{pool="prefill",kind="estimated"} 710
 mesh_route_cache_estimate_tokens_total{pool="prefill",kind="actual"} 660
 mesh_route_cache_estimate_error_ratio_sum{pool="prefill"} 0.5
 mesh_route_cache_estimate_error_ratio_count{pool="prefill"} 11
-mesh_selected_dp_rank_total{pool="prefill",worker="http://127.0.0.1:21418",dp_rank="none"} 8
-mesh_selected_dp_rank_total{pool="prefill",worker="http://127.0.0.1:21419",dp_rank="none"} 4
+mesh_selected_dp_rank_total{pool="prefill",worker="http://127.0.0.1:20787",dp_rank="none"} 8
+mesh_selected_dp_rank_total{pool="prefill",worker="http://127.0.0.1:20786",dp_rank="none"} 4
 ```
 
 Reading it:
@@ -243,8 +251,9 @@ Reading it:
 - `cache_aware` sent 9 of 12 prefill decisions to the worker holding the
   prefix. The 3 relocations are the first turns, with ratios at or below 0.2;
   the later turns fall between 0.7 and 0.9.
-- `mesh_route_cost` has only the 3 `relocate` samples, all 0 because requests
-  ran one at a time.
+- `mesh_route_selected_worker_active_requests` has one sample per decision, so
+  each branch's `_count` matches its decision count. All values are 0 because
+  requests ran one at a time.
 - The `dp_sticky` hit rate is 9 / 12 = 75%: each session's first turn is `new`.
 - The engines reported 720 / 1200 = 60% of prompt tokens cached. 11 decisions
   carried an estimate: the 9 `affinity` decisions and the 2 relocations that
@@ -253,3 +262,4 @@ Reading it:
 
 [#3141]: https://github.com/ROCm/ATOM/pull/3141
 [#3142]: https://github.com/ROCm/ATOM/pull/3142
+[#3213]: https://github.com/ROCm/ATOM/pull/3213
