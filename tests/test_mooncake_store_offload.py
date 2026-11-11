@@ -3180,9 +3180,10 @@ def test_v41_registration_uses_pages_without_request_slots(
     config = _registering_config()
     config.hf_config.model_type = "deepseek_v41"
     config.enable_encoder_swa_bounded_replay = True
-    pages = object()
+    pages = [object()]
     transfer = SimpleNamespace(
         block_regions=pages,
+        block_tensor_views=[SimpleNamespace(device=torch.device("cpu"))],
         num_blocks=8,
         state_backend=SimpleNamespace(
             state_transfer=lambda: SimpleNamespace(replays=True)
@@ -3201,7 +3202,6 @@ def test_v41_registration_uses_pages_without_request_slots(
         return codec
 
     monkeypatch.setattr(dsv4_codec, "DSV4PageSlotCodec", page_codec)
-    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     worker = MooncakeStoreOffloadConnector(config)
     try:
         worker.register_kv_caches({}, transfer_tensors=transfer, num_blocks=8)
@@ -3841,14 +3841,19 @@ def test_pure_page_codec_rejects_missing_or_invalid_count(blocks):
 def test_pure_page_codec_rejects_missing_fused_staging(monkeypatch):
     from atom.kv_transfer.offload import page_codec
 
-    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(
         page_codec,
         "DSV4PageSlotCodec",
         lambda **kw: SimpleNamespace(has_fused_chunk_major_staging=False),
     )
     with pytest.raises(RuntimeError, match="fused chunk-major PAGE"):
-        page_codec.pure_page_codec(SimpleNamespace(block_regions=[object()]), 8)
+        page_codec.pure_page_codec(
+            SimpleNamespace(
+                block_regions=[object()],
+                block_tensor_views=[SimpleNamespace(device=torch.device("cpu"))],
+            ),
+            8,
+        )
 
 
 def test_plain_v4_is_refused_before_weights_load():
@@ -3921,7 +3926,7 @@ def test_m3_store_codec_includes_all_page_planes(model_type, monkeypatch):
     )
     assert codec.bytes_per_block == sum(t.shape[1] for t in fields.values())
     for bad in (None, KVTransferTensors()):
-        with pytest.raises(ValueError, match="complete PAGE"):
+        with pytest.raises(ValueError, match="non-empty block_regions"):
             build_mooncake_codec(config, {}, bad, 4, permit_per_request_state=False)
 
 

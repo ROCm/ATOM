@@ -18,6 +18,7 @@ from typing import Any
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload.dense.kv_byte_codec import DenseKVByteCodec
 from atom.kv_transfer.offload.hybrid.m3 import codec as m3_codec
+from atom.kv_transfer.offload.page_codec import pure_page_codec
 
 # Bumped when the dense codec's per-chunk byte layout changes.
 DENSE_CODEC_ID = "dense-opaque-block-v1"
@@ -67,7 +68,7 @@ def _build_m3(
     num_blocks: int | None,
     _permit_per_request_state: bool,
 ) -> Any:
-    return m3_codec.build_m3_page_codec(transfer_tensors, num_blocks)
+    return pure_page_codec(transfer_tensors, num_blocks)
 
 
 def _build_replay_pages(
@@ -78,7 +79,6 @@ def _build_replay_pages(
 ) -> Any:
     """V4.1 PAGE bytes. The replay contract is what rebuilds request state."""
     from atom.kv_transfer.offload.capabilities import replays_state
-    from atom.kv_transfer.offload.page_codec import pure_page_codec
 
     if not replays_state(transfer_tensors):
         raise ValueError("Mooncake Store V4.1 requires the PAGE replay contract")
