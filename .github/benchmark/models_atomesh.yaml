@@ -16872,6 +16872,26 @@ models:
               <<: *m31_s65822_env
               ATOMESH_M31_D_MAX_SEQS: "24"
               ATOMESH_M31_P_CPU_OFFLOAD_BYTES: "1349000000000"
+        # Lazy offload at the same node share: blocks reach host only when evicted from GPU, so the
+        # host pool no longer also holds blocks that never left GPU.
+        - <<: *m31_moriio_1p2d_s65822_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-s65822-c112-dcap20-cpu15-lazy
+          concurrency: [112]
+          env:
+            common:
+              <<: *m31_s65822_env
+              ATOMESH_M31_D_MAX_SEQS: "20"
+              ATOMESH_M31_P_CPU_OFFLOAD_BYTES: "1499000000000"
+              ATOMESH_M31_P_LAZY_OFFLOAD: "true"
+        - <<: *m31_moriio_1p2d_s65822_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-s65822-c104-dcap18-cpu15-lazy
+          concurrency: [104]
+          env:
+            common:
+              <<: *m31_s65822_env
+              ATOMESH_M31_D_MAX_SEQS: "18"
+              ATOMESH_M31_P_CPU_OFFLOAD_BYTES: "1499000000000"
+              ATOMESH_M31_P_LAZY_OFFLOAD: "true"
         # The local 1P1D layout (P GPUs 0-3, D GPUs 4-7 of one node) with xgmi swapped for RDMA.
         - &m31_moriio_1p1d_sn_case
           <<: *m31_moriio_1p2d_case

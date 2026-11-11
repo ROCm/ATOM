@@ -111,7 +111,7 @@ start_vllm_server() {
     # its handshake/notify bases sit 1000 apart, clear of the decode bases (+100 per D).
     gpus="${HIP_VISIBLE_DEVICES}" idx=$((server_port - PREFILL_PORT))
     xfer="$(m31_moriio kv_producer "${server_port}" $((M31_HANDSHAKE_PORT + 1000 * idx)) $((M31_NOTIFY_PORT + 1000 * idx)))"
-    xfer="{\"kv_connector\":\"MultiConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"connectors\":[${xfer},{\"kv_connector\":\"SimpleCPUOffloadConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"cpu_bytes_to_use\":${ATOMESH_M31_P_CPU_OFFLOAD_BYTES},\"lazy_offload\":false}}]}}"
+    xfer="{\"kv_connector\":\"MultiConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"connectors\":[${xfer},{\"kv_connector\":\"SimpleCPUOffloadConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"cpu_bytes_to_use\":${ATOMESH_M31_P_CPU_OFFLOAD_BYTES},\"lazy_offload\":${ATOMESH_M31_P_LAZY_OFFLOAD:-false}}}]}}"
     role_args=(--tensor-parallel-size "${PREFILL_TP_SIZE}" --max-num-seqs $((2 * m31_conc)) --port "${server_port}" --gpu-memory-utilization 0.85
       --max-num-batched-tokens 32768)
     [[ "${ATOMESH_M31_P_DBO:-1}" == 1 ]] &&
