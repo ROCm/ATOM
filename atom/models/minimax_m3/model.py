@@ -50,6 +50,10 @@ from atom.model_ops.minimax_m3.router import (
     m31_route,
     register_presorted_moe,
 )
+from atom.model_ops.minimax_m3.router.router_swiglu import (
+    m31_route_swiglu,
+    router_swiglu_supported,
+)
 from atom.model_ops.minimax_m3.sparse_attn import (
     SPARSE_BLOCK_SIZE,
 )
@@ -436,29 +440,67 @@ class MiniMaxM3MoE(nn.Module):
                 n_local=pass_scheduled_tokens_gpu(hidden_states.shape[0]),
             )
             if routed is not None:
-                topk_weights, topk_ids, presort = routed
-                topk_weights, topk_ids = experts.quant_method.place_experts(
-                    experts, topk_weights, topk_ids
-                )
-                # Consumed by the fused_moe right below. Padding rows carry no
-                # routes, so the call runs without a token count (a presort is
-                # only taken without one).
-                register_presorted_moe(presort)
-                return experts.quant_method.apply(
-                    layer=experts,
-                    x=hidden_states,
-                    topk_weights=topk_weights,
-                    topk_ids=topk_ids,
-                    global_num_experts=experts.global_num_experts,
-                    expert_map=experts.expert_map,
-                    activation=experts.activation,
-                    apply_router_weight_on_input=experts.apply_router_weight_on_input,
-                    prefix=f"{experts.prefix}.fused_moe",
-                    x_scale=None,
-                    scheduled_tokens_gpu=None,
-                )
+                return self._presorted_experts(hidden_states, *routed)
         router_logits = self.gate(hidden_states)
         return experts.forward_impl(hidden_states, router_logits)
+
+    def _presorted_experts(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        presort: dict,
+    ) -> torch.Tensor:
+        """The routed experts on a fused router's routes and sort."""
+        experts = self.experts
+        topk_weights, topk_ids = experts.quant_method.place_experts(
+            experts, topk_weights, topk_ids
+        )
+        # Consumed by the fused_moe right below. Padding rows carry no
+        # routes, so the call runs without a token count (a presort is
+        # only taken without one).
+        register_presorted_moe(presort)
+        return experts.quant_method.apply(
+            layer=experts,
+            x=hidden_states,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            global_num_experts=experts.global_num_experts,
+            expert_map=experts.expert_map,
+            activation=experts.activation,
+            apply_router_weight_on_input=experts.apply_router_weight_on_input,
+            prefix=f"{experts.prefix}.fused_moe",
+            x_scale=None,
+            scheduled_tokens_gpu=None,
+        )
+
+    def routed_moe_shared_swiglu(
+        self, hidden_states: torch.Tensor, gate_up: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """``routed_moe(hidden_states)`` and the shared expert's
+        ``swiglu_oai_split_mxfp8(gate_up)``. For 1..128 rows the router GEMV
+        shares its launch with the SwiGLU and the gate and sort run in one
+        more (``m31_route_swiglu``); otherwise the two run apart."""
+        mlp = self.shared_experts
+        swiglu = (mlp.swiglu_alpha, mlp.swiglu_beta, mlp.swiglu_limit)
+        bias = self.e_score_correction_bias
+        if envs.ATOM_M3_ROUTER_SWIGLU and router_swiglu_supported(
+            hidden_states, self.gate.weight, bias, gate_up
+        ):
+            routed = m31_route_swiglu(
+                hidden_states,
+                self.gate.weight,
+                bias,
+                gate_up,
+                *swiglu,
+                routed_scaling_factor=1.0,
+                n_local=pass_scheduled_tokens_gpu(hidden_states.shape[0]),
+            )
+            if routed is not None:
+                *routes, (x, x_scale) = routed
+                return self._presorted_experts(hidden_states, *routes), x, x_scale
+        x, x_scale = swiglu_oai_split_mxfp8(gate_up, *swiglu)
+        return self.routed_moe(hidden_states), x, x_scale
 
     def shared_takes_mxfp8_input(self) -> bool:
         """Whether the separate shared expert's gate_up reads MXFP8, so the
@@ -478,6 +520,27 @@ class MiniMaxM3MoE(nn.Module):
         (``shared_takes_mxfp8_input``); without them it reads ``hidden_states``."""
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, orig_shape[-1])
+        mlp = self.shared_experts
+        if (
+            self.fused_router_op
+            and mlp is not None
+            and _linear_consumes_mxfp8(mlp.down_proj)
+        ):
+            # the shared gate_up first: its SwiGLU can then share a launch with
+            # the router GEMV inside the routed op
+            if shared_x is not None:
+                gate_up = mlp.gate_up_proj(shared_x, x_scale=shared_x_scale)
+            else:
+                gate_up = mlp.gate_up_proj(hidden_states)
+            routed_output, x, x_scale = (
+                torch.ops.aiter.minimax_m3_routed_moe_shared_swiglu(
+                    hidden_states, gate_up, self.routed_layer_name
+                )
+            )
+            shared_output = mlp.down_proj(x, x_scale=x_scale)
+            if self.routed_scaling_factor != 1.0:
+                routed_output = routed_output * self.routed_scaling_factor
+            return (routed_output + shared_output).view(orig_shape)
         if self.fused_router_op:
             routed_output = torch.ops.aiter.minimax_m3_routed_moe(
                 hidden_states, self.routed_layer_name
@@ -522,6 +585,39 @@ direct_register_custom_op(
     op_func=_minimax_m3_routed_moe,
     mutates_args=["hidden_states"],
     fake_impl=_minimax_m3_routed_moe_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
+def _minimax_m3_routed_moe_shared_swiglu(
+    hidden_states: torch.Tensor, gate_up: torch.Tensor, layer_name: str
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    moe = get_current_atom_config().compilation_config.static_forward_context[
+        layer_name
+    ]
+    return moe.routed_moe_shared_swiglu(hidden_states, gate_up)
+
+
+def _minimax_m3_routed_moe_shared_swiglu_fake(
+    hidden_states: torch.Tensor, gate_up: torch.Tensor, layer_name: str
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    rows, n_inter = gate_up.shape[0], gate_up.shape[1] // 2
+    return (
+        torch.empty_like(hidden_states),
+        torch.empty(rows, n_inter, dtype=dtypes.fp8, device=gate_up.device),
+        torch.empty(
+            rows, n_inter // 32, dtype=torch.float8_e8m0fnu, device=gate_up.device
+        ),
+    )
+
+
+# Writes only its outputs (the experts path runs with inplace=False); declaring
+# no mutation also keeps Inductor from functionalizing a multi-output op.
+direct_register_custom_op(
+    op_name="minimax_m3_routed_moe_shared_swiglu",
+    op_func=_minimax_m3_routed_moe_shared_swiglu,
+    mutates_args=[],
+    fake_impl=_minimax_m3_routed_moe_shared_swiglu_fake,
     tags=(torch.Tag.needs_fixed_stride_order,),
 )
 

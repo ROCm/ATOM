@@ -594,6 +594,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # GEMV, sigmoid top-4 gate and the MoE sort as one kernel that hands its sort
     # to aiter's fused_moe (atom/model_ops/minimax_m3/router). 0 disables it.
     "ATOM_M3_FUSED_ROUTER": lambda: os.getenv("ATOM_M3_FUSED_ROUTER", "1") == "1",
+    # MiniMax-M3.1 on gfx950, with ATOM_M3_FUSED_ROUTER and an MXFP8 shared
+    # expert: for steps of 1..128 rows, run the router GEMV's split-K partials
+    # with the shared expert's SwiGLU + MXFP8 quant in one launch and the gate +
+    # MoE sort in a second (atom/model_ops/minimax_m3/router/router_swiglu.py),
+    # instead of the one-launch router and a separate SwiGLU. 0 disables it.
+    "ATOM_M3_ROUTER_SWIGLU": lambda: os.getenv("ATOM_M3_ROUTER_SWIGLU", "1") == "1",
     # Fused decode for measured model/deployment/step geometries. Unsupported
     # configurations and forwards keep the production path. 0 disables it.
     "ATOM_MONO_ENABLE": lambda: os.getenv("ATOM_MONO_ENABLE", "1") == "1",

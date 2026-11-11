@@ -119,8 +119,39 @@ def _swiglu_oai_mxfp8_kernel(
     has_limit: tl.constexpr,
     block_i: tl.constexpr,
 ):
-    row = tl.program_id(0)
-    tile = tl.program_id(1)
+    swiglu_oai_mxfp8_tile(
+        gate_up_ptr,
+        q_ptr,
+        scale_ptr,
+        n_inter,
+        stride_gm,
+        alpha,
+        beta,
+        limit,
+        has_limit,
+        block_i,
+        tl.program_id(0),
+        tl.program_id(1),
+    )
+
+
+@triton.jit
+def swiglu_oai_mxfp8_tile(
+    gate_up_ptr,
+    q_ptr,
+    scale_ptr,
+    n_inter: tl.constexpr,
+    stride_gm,
+    alpha,
+    beta,
+    limit,
+    has_limit: tl.constexpr,
+    block_i: tl.constexpr,
+    row,
+    tile,
+):
+    """Columns ``[tile * block_i, (tile + 1) * block_i)`` of row ``row`` of
+    ``_swiglu_oai_mxfp8_kernel``; other kernels run it in their own grid."""
     cols = tile * block_i + tl.arange(0, block_i)
     mask = cols < n_inter
     gate = tl.load(gate_up_ptr + row * stride_gm + cols, mask=mask, other=0.0)
@@ -146,6 +177,11 @@ def _swiglu_oai_mxfp8_kernel(
         code.to(tl.uint8),
         mask=groups < n_inter // 32,
     )
+
+
+def swiglu_mxfp8_block(n_inter: int) -> int:
+    """Columns one program of ``_swiglu_oai_mxfp8_kernel`` covers."""
+    return 512 if n_inter >= 2048 else 256
 
 
 def swiglu_oai_split_mxfp8(
@@ -179,7 +215,7 @@ def swiglu_oai_split_mxfp8(
         (m, n_inter // 32), dtype=torch.float8_e8m0fnu, device=gate_up.device
     )
     if m:
-        block_i = 512 if n_inter >= 2048 else 256
+        block_i = swiglu_mxfp8_block(n_inter)
         _swiglu_oai_mxfp8_kernel[(m, triton.cdiv(n_inter, block_i))](
             x2,
             q,
