@@ -4295,6 +4295,12 @@ class FusedMoE(torch.nn.Module):
         # For per_1x128 source we also need the old scales for dequantization.
         old_w13_data = self.w13_weight.data
         old_w2_data = self.w2_weight.data
+        if getattr(self.quant_method, "need_normalize_e4m3fn_to_e4m3fnuz", False):
+            # Still the checkpoint's OCP E4M3 bytes: the source method would
+            # have fixed them up in its process_weights_after_loading, which
+            # never runs once it is replaced.
+            old_w13_data = old_w13_data.view(torch.float8_e4m3fn)
+            old_w2_data = old_w2_data.view(torch.float8_e4m3fn)
         old_w13_scale = self.w13_weight_scale.data if need_dequant else None
         old_w2_scale = self.w2_weight_scale.data if need_dequant else None
         old_w13_scale_2 = self.w13_weight_scale_2.data if source_is_nvfp4 else None

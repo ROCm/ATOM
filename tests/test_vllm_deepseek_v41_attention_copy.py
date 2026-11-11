@@ -40,7 +40,7 @@ PLUGIN = ROOT / "atom/plugin/vllm/v41_core_overrides.py"
 # sha256 of core's `Attention.forward` and `_attend`, comments and blank
 # lines stripped.
 CORE_PREPARE_DIGEST = "50a174931df035a4"
-CORE_FORWARD_DIGEST = "efcc7dbf2f688954"
+CORE_FORWARD_DIGEST = "3d0142b552a27aed"
 
 
 @pytest.fixture
@@ -218,6 +218,31 @@ def test_plugin_quantized_qkv_preserves_bf16_auxiliary_readers(
     attention._fork_select.assert_called_once_with(
         hidden, qr, qr_scale, cache, live_step, rope, compressed=True
     )
+
+
+def test_plugin_bounded_replay_takes_a_bf16_query_alone(plugin_attention):
+    """As core's forward does: a BF16 Q comes without a scale to take."""
+
+    class ReachedProjection(Exception):
+        pass
+
+    qr, taken = object(), object()
+    queries = SimpleNamespace(take=Mock(return_value=(taken,)))
+    attention = SimpleNamespace(
+        _fork_compress=Mock(return_value=False),
+        project_qkv=Mock(return_value=(object(), object())),
+        qk_norm=Mock(return_value=(qr, None, object())),
+        _fork_select=Mock(),
+        wq_b=Mock(side_effect=ReachedProjection),
+    )
+    hidden = torch.empty(1, 2, 32, dtype=torch.bfloat16)
+    cache = SimpleNamespace(current_step=object())
+    with pytest.raises(ReachedProjection):
+        plugin_attention._attend_block(
+            attention, None, hidden, None, cache, object(), object(), queries
+        )
+    queries.take.assert_called_once_with(qr)
+    attention.wq_b.assert_called_once_with(taken, x_scale=None)
 
 
 def _core_forward() -> str:

@@ -1305,6 +1305,12 @@ class LinearBase(nn.Module):
                 weight, online_quant_type, online_quant_dtype
             )
         else:
+            if self.need_normalize_e4m3fn_to_e4m3fnuz and (
+                weight.dtype == torch.float8_e4m3fnuz
+            ):
+                # Still the checkpoint's OCP E4M3 bytes: the E4M3FNUZ fixup in
+                # process_weights_after_loading runs after this.
+                weight = weight.view(torch.float8_e4m3fn)
             weight = dequant_weight_online(
                 weight,
                 weight_scale,
@@ -1338,10 +1344,10 @@ class LinearBase(nn.Module):
         self.layer_quant_config = online_layer_quant_config
         self._stream_online_quant = False
         self.quant_func = get_hip_quant(online_quant_type)
-        self.need_normalize_e4m3fn_to_e4m3fnuz = (
-            online_quant_dtype == torch.float8_e4m3fnuz
-            and online_quant_type == QuantType.per_Token
-        )
+        # The weight now holds values encoded in the target dtype, not OCP
+        # checkpoint bytes, so the E4M3FNUZ fixup must not run on it: it would
+        # double every scale.
+        self.need_normalize_e4m3fn_to_e4m3fnuz = False
         if source_is_nvfp4:
             self.weight_scale_2 = None
             self.input_scale_2 = None
