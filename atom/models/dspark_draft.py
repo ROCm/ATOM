@@ -464,8 +464,6 @@ class DSparkDraftModel(nn.Module):
     # A pool of the draft's own, outside the target's DCP group. None is the
     # generic pool, inside the group.
     kv_pool_spec: ClassVar[DraftKvPoolSpec | None] = None
-    # A draft that loads its own embedding (K3 DSpark on PP stage > 0) keeps it.
-    own_embed_tokens: bool = False
 
     #: Does this flavor's block sampler hand ``draft_sampling`` to
     #: ``DSparkMarkovHead.sample_block``, so it draws from, and publishes, a
@@ -650,6 +648,8 @@ class DSparkDraftModel(nn.Module):
                 f"vocab {target_vocab}. The draft shares the target's embedding "
                 "and LM head, so the two must agree."
             )
-        if not self.own_embed_tokens:
+        # A draft that loaded its own embedding (K3 DSpark on PP stage > 0)
+        # keeps it.
+        if self.embed_tokens is None:
             self.embed_tokens = target_base.model.embed_tokens
         self.lm_head = target_base.lm_head

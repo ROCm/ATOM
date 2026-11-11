@@ -160,8 +160,7 @@ def test_default_share_with_target_keeps_a_drafts_own_embedding():
     """A draft that loaded its own embedding (K3 DSpark past PP stage 0)
     keeps it and still scores with the target's head."""
     draft = _stub_draft(163840)
-    own = object()
-    draft.own_embed_tokens, draft.embed_tokens = True, own
+    own = draft.embed_tokens = _target_base(163840).model.embed_tokens
     target = _target_base(163840)
     draft.share_with_target(target, set())
     assert draft.embed_tokens is own
@@ -174,7 +173,7 @@ def test_default_share_with_target_reads_the_vocab_off_the_head_under_pp():
     from atom.models.utils import PPMissingLayer
 
     draft = _stub_draft(163840)
-    draft.own_embed_tokens = True
+    draft.embed_tokens = _target_base(163840).model.embed_tokens
     target = _target_base(163840)
     target.model.embed_tokens = PPMissingLayer()
     draft.share_with_target(target, set())

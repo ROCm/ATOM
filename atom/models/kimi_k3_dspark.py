@@ -588,8 +588,7 @@ class KimiK3DSpark(DSparkDraftModel):
         # Bound by share_with_target(); both are skipped at load.
         # Exception: under PP the drafter lives on the last stage, whose target
         # embedding is a PPMissingLayer, so load the checkpoint's own copy.
-        self.own_embed_tokens = not get_pp_group().is_first_rank
-        if self.own_embed_tokens:
+        if not get_pp_group().is_first_rank:
             self.skip_weight_prefixes = tuple(
                 p for p in self.skip_weight_prefixes if p != "embed_tokens."
             )
