@@ -39,7 +39,8 @@ from atom.kv_transfer.offload._offload_common import validated_kv_role
 from atom.kv_transfer.offload.chunked_scheduler import (
     DENSE_PAGE_STORE_CHANNEL,
 )
-from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata, LMCacheReqMeta
+from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata
+from atom.kv_transfer.offload.mp import deployment
 from atom.kv_transfer.offload.mp.deployment import (
     TransferSpec,
     _make_worker_adapter,
@@ -49,11 +50,13 @@ from atom.kv_transfer.offload.mp.deployment import (
     _validate_mp_config,
     require_native_state_server,
 )
+from atom.kv_transfer.offload.mp.metadata import MPReqMeta
 from atom.kv_transfer.offload.mp.native_state_layout import (
     build_native_state_mp_layout,
     stores_state_images,
 )
 from atom.kv_transfer.offload.mp.page_views import _build_cache_views
+from atom.kv_transfer.offload.mp.token_shipping import WorkerTokens, token_list
 from atom.kv_transfer.offload.mp.transfer import (
     _chunk_ranges,
     _enforce_transfer_deadline,
@@ -113,6 +116,11 @@ class LMCacheMPConnector(KVConnectorBase):
     def __init__(self, config: Any, *, transfers_off_step: bool = False) -> None:
         _validate_mp_config(config)
         self._config = config
+        # Each request's token prefix, rebuilt from incremental shipments
+        # (`token_shipping.py`). Here, in the worker every frontend reaches (the
+        # shell, the native-state worker, the vLLM plugin's adapter), not in a
+        # shell only some of them go through.
+        self._tokens = WorkerTokens()
         # Submit and poll on the transfer thread, whatever
         # OFFLOAD_MP_TRANSFER_THREAD says: for a frontend whose forward thread
         # cannot afford either (the vLLM plugin).
@@ -156,7 +164,7 @@ class LMCacheMPConnector(KVConnectorBase):
         self._fences: _ProducerFences | None = None
         # Same-step saves of the current step, held until their forward is
         # enqueued (`after_forward`) -- and, inline, until it has finished.
-        self._after_forward_saves: list[LMCacheReqMeta] = []
+        self._after_forward_saves: list[MPReqMeta] = []
         self._after_forward_ran = False
         self._late_flush_logged = False
         # Polling transfer thread only. Submissions it has queued, by request:
@@ -238,6 +246,7 @@ class LMCacheMPConnector(KVConnectorBase):
                 adapter.lmcache_tokens_per_chunk,
                 minimum=1,
             )
+            deployment.require_chunk_matches_server(adapter, self._config)
             if chunk_size % self.block_size:
                 raise ValueError(
                     f"LMCache MP chunk size {chunk_size} must be divisible by "
@@ -306,6 +315,7 @@ class LMCacheMPConnector(KVConnectorBase):
         try:
             self._refuse_unfenceable_adapter(adapter)
             require_native_state_server(adapter, self._config)
+            deployment.require_chunk_matches_server(adapter, self._config)
             chunk_size = int(adapter.lmcache_tokens_per_chunk)
             layout = build_native_state_mp_layout(
                 transfer_tensors,
@@ -378,6 +388,7 @@ class LMCacheMPConnector(KVConnectorBase):
     def start_load_kv(self, metadata: Any) -> None:
         if not isinstance(metadata, LMCacheOffloadMetadata):
             return
+        self._tokens.resolve(metadata)
         if self._adapter is None or self.chunk_size is None:
             raise RuntimeError("lmcache_mp KV caches are not registered")
 
@@ -490,7 +501,7 @@ class LMCacheMPConnector(KVConnectorBase):
     def _dispatch(
         self,
         submit: Any,
-        req: LMCacheReqMeta,
+        req: MPReqMeta,
         event: Any,
         ready: Callable[[], bool] | None = None,
     ) -> None:
@@ -506,7 +517,7 @@ class LMCacheMPConnector(KVConnectorBase):
             self._queued_requests[owner] = self._queued_requests.get(owner, 0) + 1
         transfer.submit(self._submit_queued, submit, req, event, ready=ready)
 
-    def _submit_queued(self, submit: Any, req: LMCacheReqMeta, event: Any) -> None:
+    def _submit_queued(self, submit: Any, req: MPReqMeta, event: Any) -> None:
         """One queued submission, on a polling transfer thread."""
         try:
             submit(req, event)
@@ -537,7 +548,7 @@ class LMCacheMPConnector(KVConnectorBase):
                 transfer.take_returned(_RETURNED_FUTURES_BATCH)
         transfer.raise_error()
 
-    def _block_slice(self, req: LMCacheReqMeta, start: int, end: int) -> list[int]:
+    def _block_slice(self, req: MPReqMeta, start: int, end: int) -> list[int]:
         if start < 0 or end < start:
             raise ValueError(f"invalid LMCache MP token range [{start}, {end})")
         if start % self.block_size or end % self.block_size:
@@ -557,7 +568,7 @@ class LMCacheMPConnector(KVConnectorBase):
         return block_ids
 
     def _transfer_block_ids(
-        self, req: LMCacheReqMeta, start: int, end: int, *, loading: bool
+        self, req: MPReqMeta, start: int, end: int, *, loading: bool
     ) -> list[list[int]]:
         """The block-id list per engine group that one transfer names."""
         if self._native_layout is not None:
@@ -571,7 +582,7 @@ class LMCacheMPConnector(KVConnectorBase):
 
     def _native_block_ids(
         self,
-        req: LMCacheReqMeta,
+        req: MPReqMeta,
         start: int,
         end: int,
         *,
@@ -616,7 +627,7 @@ class LMCacheMPConnector(KVConnectorBase):
             raise ValueError("checkpoint PAGE units must not overlap KV PAGE blocks")
         return self._native_layout.transfer_block_ids(pages, unit_ids, count)
 
-    def _submit_load(self, req: LMCacheReqMeta, event: Any) -> None:
+    def _submit_load(self, req: MPReqMeta, event: Any) -> None:
         assert req.load_spec is not None
         completion = req.load_operation or req.req_id
         request_id = _mp_session_id(self._config, req.req_id)
@@ -644,7 +655,7 @@ class LMCacheMPConnector(KVConnectorBase):
                     f"({self.chunk_size})"
                 )
             op = TransferSpec(
-                token_ids=list(req.token_ids),
+                token_ids=token_list(req.token_ids),
                 block_ids=self._transfer_block_ids(req, start, end, loading=True),
                 start=start,
                 end=end,
@@ -687,7 +698,7 @@ class LMCacheMPConnector(KVConnectorBase):
                 future=transfer,
             )
 
-    def _submit_save(self, req: LMCacheReqMeta, event: Any) -> None:
+    def _submit_save(self, req: MPReqMeta, event: Any) -> None:
         assert req.save_spec is not None
         completion = req.save_operation or req.req_id
         request_id = _mp_session_id(self._config, req.req_id)
@@ -730,7 +741,7 @@ class LMCacheMPConnector(KVConnectorBase):
             return
         try:
             op = TransferSpec(
-                token_ids=list(req.token_ids),
+                token_ids=token_list(req.token_ids),
                 block_ids=self._transfer_block_ids(req, start, end, loading=False),
                 start=start,
                 end=end,

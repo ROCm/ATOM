@@ -82,6 +82,7 @@ from atom.kv_transfer.offload.hybrid.dsv4.policy import (
     select_pending_sidecar_boundary,
     sidecar_boundary_tokens,
 )
+from atom.kv_transfer.offload.load_math import tier_load_tokens
 from atom.kv_transfer.offload.metadata import (
     LMCacheOffloadMetadata,
     LMCacheReqMeta,
@@ -2247,7 +2248,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         if hbm % chunk != 0:
             return False, "unaligned_hbm_prefill", hbm, lmc, need, chunk
         min_load = int(getattr(self, "_min_load_tokens", 8192))
-        if need < min_load:
+        if not tier_load_tokens(hbm, lmc, chunk, min_load):
             return False, "too_small", hbm, lmc, need, chunk
         return True, "aligned_large_hit", hbm, lmc, need, chunk
 

@@ -20,6 +20,9 @@ from atom.kv_transfer.disaggregation.base import (
     KVConnectorBase,
     KVConnectorSchedulerBase,
 )
+from atom.kv_transfer.offload import register_backends
+from atom.kv_transfer.offload.tier import OffloadTierProfile
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -97,6 +100,12 @@ class KVConnectorFactory:
     # per-request state behind a hybrid's pages. Absent means no: a model
     # whose state rides that image refuses it.
     _reads_page_images: ClassVar[dict[str, bool]] = {}
+    # Whether a backend's tier is one store every DP rank reads (an LMCache MP
+    # server, Mooncake Store), not one per rank. Absent means per rank.
+    _shared_tier: ClassVar[dict[str, bool]] = {}
+    # A backend's transfer granularity, read off its connector config alone:
+    # "module:function" taking the leaf's `kv_transfer_config`. Absent means 1.
+    _chunk_tokens: ClassVar[dict[str, str]] = {}
 
     @classmethod
     def register(
@@ -113,6 +122,8 @@ class KVConnectorFactory:
         requires_pd_staging: bool = True,
         offload: bool = False,
         reads_page_images: bool = False,
+        shared_tier: bool = False,
+        chunk_tokens: str | None = None,
     ) -> None:
         """Register a KV connector backend.
 
@@ -126,6 +137,11 @@ class KVConnectorFactory:
                 one (`is_offload_backend`).
             reads_page_images: The backend carries PAGE checkpoint images
                 (`reads_page_images`).
+            shared_tier: The offload tier is shared by all DP ranks
+                (`offload_tier`).
+            chunk_tokens: ``"module:function"`` returning the tier's transfer
+                granularity in tokens from the leaf's ``kv_transfer_config``
+                (`offload_tier`).
         """
         cls._registry[name] = {
             "worker_module": worker_module,
@@ -151,6 +167,9 @@ class KVConnectorFactory:
         cls._copies_whole_block_regions[name] = bool(copies_whole_block_regions)
         cls._offload[name] = bool(offload)
         cls._reads_page_images[name] = bool(reads_page_images)
+        cls._shared_tier[name] = bool(shared_tier)
+        if chunk_tokens:
+            cls._chunk_tokens[name] = chunk_tokens
 
     @classmethod
     def canonical_name(cls, value: object, *, path: str = "kv_transfer_config") -> str:
@@ -184,6 +203,55 @@ class KVConnectorFactory:
         checkpoint images."""
 
         return cls._reads_page_images.get(name, False)
+
+    @classmethod
+    def offload_tier(cls, config: Any) -> OffloadTierProfile:
+        """The configured offload tier's `OffloadTierProfile`, from the
+        registry and `config` alone (nothing is built)."""
+        kv_cfg = getattr(config, "kv_transfer_config", None) or {}
+        if not isinstance(kv_cfg, dict):
+            return OffloadTierProfile()
+        tier = shared = False
+        chunk_tokens = 1
+        for name, sub in cls.leaf_connectors(config) or ():
+            role = (getattr(sub, "kv_transfer_config", None) or {}).get(
+                "kv_role", "offload"
+            )
+            if cls.is_offload_backend(name) and role in ("offload", "kv_both"):
+                if name == "mooncake_store":
+                    from atom.kv_transfer.offload.config import connector_extras
+                    from atom.kv_transfer.offload.mooncake_store.config import (
+                        parse_mooncake_store_config,
+                    )
+
+                    # A worker can read only its NIC's pool. Backend-wide
+                    # prefix credit is valid only when all NIC aliases address
+                    # the same master/metadata pair. Other routing policies do
+                    # not ask for this profile and retain per-NIC pools.
+                    extras = connector_extras(sub.kv_transfer_config)
+                    if "mooncake_store.pools" in extras:
+                        store = parse_mooncake_store_config(sub.kv_transfer_config)
+                        if len(store.store_masters()) > 1:
+                            raise ValueError(
+                                "--dp-load-balance prefix_spread requires one shared "
+                                "Mooncake Store pool; mooncake_store.pools addresses "
+                                "distinct master/metadata pairs"
+                            )
+                tier = True
+                shared |= cls._shared_tier.get(name, False)
+                hook = cls._chunk_tokens.get(name)
+                if hook:
+                    module, _, attr = hook.partition(":")
+                    chunk_tokens = getattr(importlib.import_module(module), attr)(
+                        sub.kv_transfer_config
+                    )
+        if not tier:
+            return OffloadTierProfile()
+        return OffloadTierProfile(
+            loads=shared,
+            min_load_tokens=int(envs.OFFLOAD_MIN_LOAD_TOKENS),
+            load_chunk_tokens=chunk_tokens,
+        )
 
     @classmethod
     def connector_name(cls, kv_transfer_config: dict[str, Any] | None) -> str | None:
@@ -272,10 +340,11 @@ class KVConnectorFactory:
         * `multi` is whatever it wraps. Each entry of `connectors` is a full
           transfer config, and `MultiConnector.register_kv_caches` forwards the
           same tensors to every sub, so one region reader settles it.
-        * `lmcache_offload` picks a codec from the MODEL, not the config, and
-          only the dense one ignores the regions -- hybrid, m3 and kimi_k3
-          source their PAGE bytes from them. That is not knowable at
-          registration, so the layout is asked here.
+        * An offload backend registered with `reads_block_regions=False`
+          (`lmcache_offload`, `mooncake_store`) picks its codec from the MODEL,
+          not the config: only the dense codec ignores the regions, the PAGE
+          layouts (hybrid, m3, kimi_k3, V4.1) source their bytes from them.
+          That is not knowable at registration, so the layout is asked here.
         """
 
         leaves = cls.leaf_connectors(config)
@@ -310,7 +379,9 @@ class KVConnectorFactory:
     def _leaf_reads_block_regions(cls, connector: str, config: Any) -> bool:
         if cls._reads_block_regions.get(connector, True):
             return True
-        if connector == "lmcache_offload":
+        if cls._offload.get(connector, False):
+            # An offload tier reads the map only on a PAGE layout; the dense
+            # codec builds from the `KVCacheTensor`s.
             from atom.kv_transfer.offload.config import select_offload_layout
 
             return select_offload_layout(config) != "dense"
@@ -409,10 +480,6 @@ KVConnectorFactory.register(
 )
 
 
-# ATOM standalone CPU/NVMe KV offload backend (registers "lmcache_offload").
-# Import is lightweight (offload/__init__ only records module paths as strings;
-# the connector module is imported lazily by create_connector when selected).
-try:
-    import atom.kv_transfer.offload  # noqa: F401,E402
-except Exception as _e:  # pragma: no cover - offload optional (needs lmcache)
-    logger.debug("lmcache_offload backend not registered: %s", _e)
+# Registration is explicit after the factory exists; importing an offload
+# value type does not recursively import this factory.
+register_backends(KVConnectorFactory)
