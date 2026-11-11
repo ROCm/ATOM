@@ -438,16 +438,27 @@ impl PDRouter {
         } else {
             prefill
         };
-        for (worker, kind, policy) in [
-            (&prefill, metrics_labels::WORKER_PREFILL, prefill_policy),
-            (&decode, metrics_labels::WORKER_DECODE, decode_policy),
+        for (worker, kind, policy_name, policy) in [
+            (
+                &prefill,
+                metrics_labels::WORKER_PREFILL,
+                prefill_policy,
+                self.policy_registry.get_prefill_policy(),
+            ),
+            (
+                &decode,
+                metrics_labels::WORKER_DECODE,
+                decode_policy,
+                self.policy_registry.get_decode_policy(),
+            ),
         ] {
             MeshMetrics::record_worker_selection(
                 kind,
                 metrics_labels::CONNECTION_HTTP,
                 worker.model_id(),
-                policy,
+                policy_name,
             );
+            policy.on_dispatch(kind, headers, worker);
         }
         Ok(Arc::new(ReservedPair {
             load: parking_lot::Mutex::new(Some([
@@ -2566,6 +2577,74 @@ mod tests {
         assert_eq!((prefill_rank_5.load(), decode_rank_5.load()), (1, 1));
         drop(execution);
         assert_eq!((prefill_rank_5.load(), decode_rank_5.load()), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn test_session_worker_change_follows_the_mapped_prefill_rank() {
+        use crate::policies::{DpStickyPolicy, LoadBalancingPolicy, SelectWorkerInfo};
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let mut router = create_test_pd_router();
+        router.backend = BackendType::Atom;
+        router.atom_pd_rank_mapping_policy = AtomPdRankMappingPolicy::Idx2Idx;
+        let prefill_policy: Arc<dyn LoadBalancingPolicy> = Arc::new(DpStickyPolicy::new());
+        router
+            .policy_registry
+            .set_prefill_policy(prefill_policy.clone());
+        let prefill: Vec<_> = [2, 5]
+            .into_iter()
+            .map(|rank| {
+                let worker = create_test_dp_worker(
+                    "http://prefill",
+                    rank,
+                    8,
+                    WorkerType::Prefill {
+                        bootstrap_port: None,
+                    },
+                    true,
+                );
+                router.worker_registry.register(worker.clone());
+                worker
+            })
+            .collect();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", HeaderValue::from_static("session-1"));
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+
+        // The session stays pinned to prefill rank 2; idx2idx runs it on the decode rank.
+        for decode_rank in [5, 5, 2] {
+            assert_eq!(prefill_policy.select_worker(&prefill, &info).await, Some(0));
+            let decode =
+                create_test_dp_worker("http://decode", decode_rank, 8, WorkerType::Decode, true);
+            let pair = router
+                .reserve_pair(
+                    PlacementPlan::Pair {
+                        prefill: prefill[0].clone(),
+                        decode,
+                        prefill_policy: "dp_sticky",
+                        decode_policy: "round_robin",
+                    },
+                    Some(&headers),
+                )
+                .unwrap();
+            assert_eq!(pair.prefill.dp_rank(), Some(decode_rank));
+        }
+
+        let changes: Vec<_> = handle
+            .render()
+            .lines()
+            .filter(|line| line.starts_with("mesh_session_worker_change_total{"))
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(
+            changes,
+            [r#"mesh_session_worker_change_total{pool="prefill",reason="rank_mapping"} 1"#]
+        );
     }
 
     #[test]

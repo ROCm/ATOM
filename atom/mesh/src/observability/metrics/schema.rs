@@ -203,6 +203,7 @@ pub mod labels {
     pub const AFFINITY_NEW: &str = "new";
     pub const AFFINITY_REBIND: &str = "rebind";
     pub const AFFINITY_EXPIRED: &str = "expired";
+    pub const WORKER_CHANGE_RANK_MAPPING: &str = "rank_mapping";
     pub const MEDIUM_GPU: &str = "gpu";
     pub const MEDIUM_CPU: &str = "cpu";
     pub const MEDIUM_DISK: &str = "disk";
@@ -273,6 +274,7 @@ pub mod names {
     pub const ROUTE_SELECTED_WORKER_ACTIVE_REQUESTS: &str =
         "mesh_route_selected_worker_active_requests";
     pub const SESSION_AFFINITY_TOTAL: &str = "mesh_session_affinity_total";
+    pub const SESSION_WORKER_CHANGE_TOTAL: &str = "mesh_session_worker_change_total";
     pub const PREFILL_OVERLAP_BLOCKS: &str = "mesh_prefill_overlap_blocks";
     pub const SELECTED_DP_RANK_TOTAL: &str = "mesh_selected_dp_rank_total";
     pub const ROUTE_CACHE_TOKENS_TOTAL: &str = "mesh_route_cache_tokens_total";
@@ -500,6 +502,12 @@ pub const METRIC_INVENTORY: &[MetricSpec] = &[
         name: names::SESSION_AFFINITY_TOTAL,
         kind: MetricKind::Counter,
         help: "Session affinity lookups by pool, result (hit/new/rebind/expired)",
+        status: MetricStatus::Active,
+    },
+    MetricSpec {
+        name: names::SESSION_WORKER_CHANGE_TOTAL,
+        kind: MetricKind::Counter,
+        help: "Session requests dispatched to a different worker (URL and DP rank) than the previous request, by pool, reason (rebind/expired/rank_mapping)",
         status: MetricStatus::Active,
     },
     MetricSpec {

@@ -21,8 +21,12 @@ use super::{
 };
 use crate::{
     core::Worker,
-    observability::metrics::metrics_labels::{
-        AFFINITY_EXPIRED, AFFINITY_HIT, AFFINITY_NEW, AFFINITY_REBIND,
+    observability::metrics::{
+        metrics_labels::{
+            AFFINITY_EXPIRED, AFFINITY_HIT, AFFINITY_NEW, AFFINITY_REBIND,
+            WORKER_CHANGE_RANK_MAPPING,
+        },
+        MeshMetrics,
     },
     routers::comm::header_utils::extract_sticky_routing_key,
 };
@@ -34,6 +38,10 @@ const NO_SESSION: &str = "no_session";
 struct StickyAssignment {
     worker: WorkerIdentity,
     last_access: Instant,
+    /// Where the session's last request was dispatched, after DP rank mapping.
+    dispatched: Option<WorkerIdentity>,
+    /// Why the session was last reassigned, until that request is dispatched.
+    reassigned: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -148,20 +156,20 @@ impl DpStickyPolicy {
             .assign_lock
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let outcome = match self.assignments.get_mut(session_id) {
-            None => AFFINITY_NEW,
+        let (outcome, dispatched) = match self.assignments.get_mut(session_id) {
+            None => (AFFINITY_NEW, None),
             Some(mut assignment) => {
                 let is_expired = now.saturating_duration_since(assignment.last_access)
                     > SESSION_REASSIGNMENT_IDLE_TIMEOUT;
                 if is_expired {
-                    AFFINITY_EXPIRED
+                    (AFFINITY_EXPIRED, assignment.dispatched.clone())
                 } else if let Some(index) =
                     Self::healthy_worker_for_identity(workers, &assignment.worker)
                 {
                     assignment.last_access = now;
                     return (Some(index), AFFINITY_HIT);
                 } else {
-                    AFFINITY_REBIND
+                    (AFFINITY_REBIND, assignment.dispatched.clone())
                 }
             }
         };
@@ -174,6 +182,8 @@ impl DpStickyPolicy {
             StickyAssignment {
                 worker: Self::worker_identity(&workers[selected_index]),
                 last_access: now,
+                dispatched,
+                reassigned: (outcome != AFFINITY_NEW).then_some(outcome),
             },
         );
         (Some(selected_index), outcome)
@@ -204,6 +214,34 @@ impl LoadBalancingPolicy for DpStickyPolicy {
         };
         decision::report(self, workers, selected, decision);
         selected
+    }
+
+    fn on_dispatch(
+        &self,
+        pool: &'static str,
+        headers: Option<&http::HeaderMap>,
+        worker: &Arc<dyn Worker>,
+    ) {
+        let Some(session_id) = extract_sticky_routing_key(headers) else {
+            return;
+        };
+        let Some(mut assignment) = self.assignments.get_mut(session_id) else {
+            return;
+        };
+        let identity = Self::worker_identity(worker);
+        // Without a reassignment, only rank mapping can move a pinned session.
+        let reason = assignment
+            .reassigned
+            .take()
+            .unwrap_or(WORKER_CHANGE_RANK_MAPPING);
+        if assignment
+            .dispatched
+            .as_ref()
+            .is_some_and(|previous| *previous != identity)
+        {
+            MeshMetrics::record_session_worker_change(pool, reason);
+        }
+        assignment.dispatched = Some(identity);
     }
 
     fn name(&self) -> &'static str {
@@ -389,6 +427,101 @@ mod tests {
                 r#"mesh_route_branch_total{pool="regular",policy="dp_sticky",branch="no_session"} 1"#
             ),
             "{rendered}"
+        );
+    }
+
+    /// Selects a worker for `session` and dispatches the request to it.
+    async fn route(
+        policy: &DpStickyPolicy,
+        workers: &[Arc<dyn Worker>],
+        pool: &'static str,
+        session: &str,
+    ) -> usize {
+        let headers = headers(session);
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+        let selected = policy.select_worker(workers, &info).await.unwrap();
+        policy.on_dispatch(pool, Some(&headers), &workers[selected]);
+        selected
+    }
+
+    fn expire(policy: &DpStickyPolicy, session: &str) {
+        policy.assignments.get_mut(session).unwrap().last_access =
+            Instant::now() - SESSION_REASSIGNMENT_IDLE_TIMEOUT - Duration::from_secs(1);
+    }
+
+    fn worker_changes(rendered: &str) -> Vec<&str> {
+        let mut changes: Vec<_> = rendered
+            .lines()
+            .filter(|line| line.starts_with("mesh_session_worker_change_total{"))
+            .collect();
+        changes.sort_unstable();
+        changes
+    }
+
+    #[tokio::test]
+    async fn worker_changes_count_only_a_different_dispatched_worker() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let policy = DpStickyPolicy::new();
+        let workers = workers();
+
+        // New, then hit: no change.
+        assert_eq!(route(&policy, &workers, "regular", "session-1").await, 0);
+        assert_eq!(route(&policy, &workers, "regular", "session-1").await, 0);
+        // Worker 0 is unavailable: rebind to worker 1.
+        workers[0].set_healthy(false);
+        assert_eq!(route(&policy, &workers, "regular", "session-1").await, 1);
+        workers[0].set_healthy(true);
+        // Expired: reassigned to worker 0, a different worker.
+        expire(&policy, "session-1");
+        assert_eq!(route(&policy, &workers, "regular", "session-1").await, 0);
+        // Expired again: reassigned to worker 0, the same worker.
+        expire(&policy, "session-1");
+        assert_eq!(route(&policy, &workers, "regular", "session-1").await, 0);
+
+        // Ranks behind one URL are different workers.
+        let ranks = dp_workers();
+        assert_eq!(route(&policy, &ranks, "decode", "session-2").await, 0);
+        ranks[0].set_healthy(false);
+        assert_eq!(route(&policy, &ranks, "decode", "session-2").await, 1);
+        assert_eq!(ranks[0].base_url(), ranks[1].base_url());
+
+        assert_eq!(
+            worker_changes(&handle.render()),
+            [
+                r#"mesh_session_worker_change_total{pool="decode",reason="rebind"} 1"#,
+                r#"mesh_session_worker_change_total{pool="regular",reason="expired"} 1"#,
+                r#"mesh_session_worker_change_total{pool="regular",reason="rebind"} 1"#,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_changes_follow_the_dispatched_rank() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let policy = DpStickyPolicy::new();
+        let ranks = dp_workers();
+        let headers = headers("session-1");
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+
+        // The pin stays on rank 0 while rank mapping dispatches to rank 1, 1, then 0.
+        for dispatched in [1, 1, 0] {
+            assert_eq!(policy.select_worker(&ranks, &info).await, Some(0));
+            policy.on_dispatch("prefill", Some(&headers), &ranks[dispatched]);
+        }
+
+        assert_eq!(
+            worker_changes(&handle.render()),
+            [r#"mesh_session_worker_change_total{pool="prefill",reason="rank_mapping"} 1"#]
         );
     }
 

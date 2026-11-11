@@ -58,6 +58,17 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         // Default: no-op for stateless policies
     }
 
+    /// Called with the worker a request is dispatched to in `pool`. DP rank
+    /// mapping runs after selection, so it can differ from the selected worker.
+    fn on_dispatch(
+        &self,
+        _pool: &'static str,
+        _headers: Option<&http::HeaderMap>,
+        _worker: &Arc<dyn Worker>,
+    ) {
+        // Default: no-op for policies that do not track sessions
+    }
+
     /// Get policy name for metrics and debugging
     fn name(&self) -> &'static str;
 

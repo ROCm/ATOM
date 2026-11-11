@@ -497,6 +497,17 @@ impl MeshMetrics {
         .increment(1);
     }
 
+    /// Record a session request dispatched to a different worker than the
+    /// previous one: rebind, expired or rank_mapping.
+    pub fn record_session_worker_change(pool: &'static str, reason: &'static str) {
+        counter!(
+            names::SESSION_WORKER_CHANGE_TOTAL,
+            "pool" => pool,
+            "reason" => reason
+        )
+        .increment(1);
+    }
+
     /// Record the estimated KV overlap of the selected candidate on one medium.
     pub fn record_prefill_overlap_blocks(
         pool: &'static str,

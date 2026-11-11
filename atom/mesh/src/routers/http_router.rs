@@ -95,6 +95,11 @@ impl Router {
             metadata.model.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
             policy_name,
         );
+        policy.on_dispatch(
+            metrics_labels::WORKER_REGULAR,
+            Some(&request.headers),
+            &worker,
+        );
         let load = WorkerLoadGuard::new(worker.clone(), Some(&request.headers));
         let headers = match header_utils::inference_request_headers(
             &request.headers,
