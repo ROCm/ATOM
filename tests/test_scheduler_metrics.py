@@ -1,5 +1,6 @@
 """Request lifecycle and snapshot tests for scheduler observability."""
 
+import array
 import gc
 import weakref
 from collections import deque
@@ -17,7 +18,7 @@ from atom.kv_transfer.disaggregation.types import KVConnectorOutput
 from atom.metrics.scheduler import SchedulerMetrics
 from atom.model_engine.engine_utility import EngineUtilityHandler
 from atom.model_engine.scheduler import DecodeScheduler, PrefillScheduler, Scheduler
-from atom.model_engine.sequence import Sequence, SequenceStatus
+from atom.model_engine.sequence import Sequence, SequenceStatus, new_block_table
 
 
 @pytest.fixture
@@ -313,14 +314,20 @@ def test_pool_partition_and_waiting_queue_exclusion():
     pool.free(used.block_id)
 
 
-def test_deferred_free_counts_shared_blocks_once():
+@pytest.mark.parametrize("table", [list, new_block_table])
+def test_deferred_free_counts_shared_blocks_once(table):
     scheduler = Scheduler(MockConfig())
     handler = EngineUtilityHandler(None, Queue(), scheduler=scheduler)
     assert handler.collect_metrics()["kv_blocks_deferred_free"] == 0
     # Two finished P/D sources sharing a prefix block, both awaiting their send.
+    # `list` is the plain-sequence stand-in; `new_block_table` is the array('i')
+    # a real block table is, which is what the snapshot reads without copying.
+    tables = table([3, 4]), table([3, 5, 6])
+    if table is new_block_table:
+        assert all(isinstance(block_table, array.array) for block_table in tables)
     scheduler.deferred_free_blocks = {
-        1: SimpleNamespace(block_table=[3, 4]),
-        2: SimpleNamespace(block_table=[3, 5, 6]),
+        1: SimpleNamespace(block_table=tables[0]),
+        2: SimpleNamespace(block_table=tables[1]),
     }
     snapshot = handler.collect_metrics()
     assert snapshot["requests_deferred_free"] == 2
