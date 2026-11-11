@@ -650,10 +650,14 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             # MiniMax-M3 sparse attention. The KV cache uses the SAME allocation
             # and binding as standard MHA — we only additionally bind the separate
             # indexer-key cache here, then fall through to the standard branch for
-            # all K/V + scale binding (it sets module.k_cache/v_cache/k_scale/
-            # v_scale and returns the KVCacheTensor). The standard binding is
+            # all K/V (+ scale, where the layout has scale planes) binding (it sets
+            # module.k_cache/v_cache, module.k_scale/v_scale when there are scale
+            # planes, and returns the KVCacheTensor). The standard binding is
             # page-128 SHUFFLE; SparseMHAPagedAttentionImpl.rope_cache re-views it
-            # to page-16 SHUFFLE (zero-copy) at attention time. index_cache is a
+            # to page-16 SHUFFLE (zero-copy) at attention time. Under
+            # `--kv-cache-dtype fp4` it binds scale-less MXFP4 pages (one 8704 B
+            # [data | e8m0 scales] field a page and kv head) that `rope_cache` and
+            # `sparse_pa_mxfp4` use as they are. index_cache is a
             # genuinely separate field (not derivable from the K/V ones), so
             # each sparse layer has its own row in that second space. The pool
             # was built at this backend's block, so its slice already is.
