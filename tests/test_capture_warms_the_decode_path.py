@@ -17,10 +17,9 @@ exactly that.
 
 These tests read the source because the property is an ORDER inside a function
 that needs a GPU, a loaded model and a bound KV pool to run. That the pass is
-decode-shaped is not re-derived here: `dummy_execution(prefill=False)` builds
-`total_tokens_num_prefill=0`, which
-`test_spec_deferred_status_queue.py::test_a_dp_dummy_runs_at_the_schedulers_query_width`
-pins by executing it.
+decode-shaped is not re-derived here: `dummy_execution` schedules nothing, so
+`Scheduler.has_prefill` stays False and `ForwardMode.decide` hands the batch
+the group's phase -- decode, with every rank inside `capture_cudagraph`.
 """
 
 import ast
@@ -30,17 +29,16 @@ RUNNER = (
     pathlib.Path(__file__).resolve().parents[1] / "atom/model_engine/model_runner.py"
 )
 
-# Substrings rather than exact names: a recording renamed or a new graph kind
-# added should still be covered, since the invariant is about the phase, not
-# about today's spelling of it.
+# Substrings rather than exact names: a recording renamed, or a new graph kind
+# added, should still be covered -- the invariant is about the phase, not about
+# today's spelling of it.
 RECORDS = ("record", "_build_capture")
 
 
 def _capture_cudagraph() -> ast.FunctionDef:
-    tree = ast.parse(RUNNER.read_text())
     fns = [
         n
-        for n in ast.walk(tree)
+        for n in ast.walk(ast.parse(RUNNER.read_text()))
         if isinstance(n, ast.FunctionDef) and n.name == "capture_cudagraph"
     ]
     assert len(fns) == 1, f"expected one capture_cudagraph, found {len(fns)}"
@@ -59,30 +57,32 @@ def test_capture_runs_a_decode_pass():
     assert any(name == "dummy_execution" for _, name in _calls(_capture_cudagraph()))
 
 
-def test_the_decode_pass_asks_for_decode_not_prefill():
-    """`prefill=False` by keyword. The default already is False, but a bare
-    `dummy_execution()` here would read as "some dummy pass" and survive a
-    later change of default -- the shape is the entire point of the call."""
-    fn = _capture_cudagraph()
+def test_the_decode_pass_takes_the_groups_phase_rather_than_forcing_one():
+    """`dummy_execution()` with no arguments.
+
+    It used to take `prefill=`; the phase now comes from `ForwardMode.decide`,
+    which is what makes every rank in the group agree. An argument reappearing
+    here would be a rank deciding its own phase inside a capture, which is the
+    shape that hung 8/8 once already.
+    """
     calls = [
         n
-        for n in ast.walk(fn)
+        for n in ast.walk(_capture_cudagraph())
         if isinstance(n, ast.Call)
         and isinstance(n.func, ast.Attribute)
         and n.func.attr == "dummy_execution"
     ]
     assert calls, "no decode pass to check"
     for call in calls:
-        kwargs = {k.arg: k.value for k in call.keywords}
-        assert "prefill" in kwargs, "pass prefill= explicitly"
-        assert isinstance(kwargs["prefill"], ast.Constant)
-        assert kwargs["prefill"].value is False
-        assert not call.args, "prefill positionally reads as a bare flag"
+        assert not call.args and not call.keywords, (
+            "dummy_execution() takes the group's phase; passing one here "
+            "forces this rank's"
+        )
 
 
 def test_the_decode_pass_precedes_every_recording():
     """The ordering is the whole fix: a pass after the capture loop warms
-    nothing that the loop has not already recorded cold."""
+    nothing the loop has not already recorded cold."""
     calls = _calls(_capture_cudagraph())
     warms = [ln for ln, name in calls if name == "dummy_execution"]
     records = [ln for ln, name in calls if any(r in name for r in RECORDS)]

@@ -4047,9 +4047,12 @@ class ModelRunner:
         # call that reaches it -- and the first such call is a recording made
         # below. warmup_model() cannot cover this: it runs before
         # allocate_kv_cache(), so a decode shape has no pool to attend, which
-        # is why its dummy batch is prefill-only. By capture the pool is bound,
-        # so the DP-alignment dummy's own shape is available and the cost is
-        # one decode forward.
+        # is why its dummy batch is prefill-only.
+        #
+        # `dummy_execution` schedules nothing, so its batch has no phase of its
+        # own and `ForwardMode.decide` hands it the group's -- which here, with
+        # every rank inside capture_cudagraph and none of them prefilling, is
+        # decode. The pool is bound by now, so the cost is one decode forward.
         #
         # Lazy init under capture is not slow, it is fatal and misreported. A
         # host-device readback (.item(), .cpu(), synchronize()) raises AND
@@ -4058,7 +4061,7 @@ class ModelRunner:
         # its cause; a group's first collective hangs with no timeout, which is
         # the warmup_exchange above. Out-of-tree AITER kernel providers
         # (ROCm/aiter#7240) reach their first select()/run() exactly here.
-        self.dummy_execution(prefill=False)
+        self.dummy_execution()
 
         tr_hybrid = self._tr_hybrid_active()
         if tr_hybrid:
