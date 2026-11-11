@@ -135,7 +135,7 @@ def _run(tokens, seed=0, ctx=300, real=None):
     pairs = scratch[SCRATCH_QKV : SCRATCH_QKV + tokens * ROWS * 8].view(torch.int32)
     got = pairs.view(-1, 2)[:, 0].view(torch.float32).view(tokens, ROWS).clone()
     x8 = scratch[SCRATCH_X8 : SCRATCH_X8 + tokens * HIDDEN].view(tokens, HIDDEN).clone()
-    xsc = scratch[SCRATCH_XSC : SCRATCH_XSC + tokens * NB * 4].view(torch.int32).view(tokens, NB).clone()
+    xsc = scratch[SCRATCH_XSC : SCRATCH_XSC + tokens * NB].view(tokens, NB).clone()  # 4 codes a word
     return dict(res=res, w=w, code=code, w_deq=w_deq, got=got, x8=x8, xsc=xsc, q=q, code_cpu=code_cpu)
 
 
@@ -157,7 +157,7 @@ def test_k1_mxfp8_gemv_is_exact(tokens):
     assert torch.equal(got, want), (got - want).abs().max().item()
     if tokens > 2:  # the hand-off rows the norm tasks publish
         assert torch.equal(o["x8"].view(dtypes.fp8).float(), xq.float())
-        assert torch.equal(o["xsc"].cpu(), xs.view(torch.uint8).cpu().int())
+        assert torch.equal(o["xsc"].cpu(), xs.view(torch.uint8).cpu())
 
 
 def test_the_oracle_tells_a_wrong_scale_mapping():

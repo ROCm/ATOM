@@ -56,7 +56,7 @@ from atom.models.minimax_m3.mono.kernels.index_score import (
     index_scale_log2e,
     step_rows,
 )
-from atom.models.minimax_m3.mono.layout import XSC_ROW
+from atom.models.minimax_m3.mono.layout import XSCB_ROW
 from atom.models.minimax_m3.mono.sources import SOURCES
 from atom.mono.device.mx import FP8_MAX, clamp_fp8, code_ceil, mfma_scaled, rcp_pow2
 from atom.mono.device.ops import (
@@ -123,11 +123,18 @@ SCRATCH_X8S = SCRATCH_X8 + MAX_TOKENS * HIDDEN // 4 * 8  # and their scales
 # fused layer kernel only: a head task's / the residual's done flags
 SCRATCH_HDONE = SCRATCH_X8S + MAX_TOKENS * 8
 SCRATCH_RDONE = SCRATCH_HDONE + MAX_TOKENS * N_HEAD_TASKS * 8
-# ``attn_mxfp8``, S > 2: the norm tasks' per-1x32 E8M0 codes, a word each (plain, behind x8s's flags)
+# ``attn_mxfp8``, S > 2: the norm tasks' per-1x32 E8M0 codes, 4 to a word (plain, behind x8s's flags)
 SCRATCH_XSC = SCRATCH_RDONE + MAX_TOKENS * 8
-SCRATCH_BYTES = SCRATCH_XSC + MAX_TOKENS * (HIDDEN // 32) * 4
+SCRATCH_BYTES = SCRATCH_XSC + MAX_TOKENS * (HIDDEN // 128) * 4
 K_SCALE_BYTES = HIDDEN // 32  # an MXFP8 weight row's scale bytes
 CHUNKS_PER_MFMA = 2  # 64-k chunks per 16x16x128 scaled MFMA
+# rounds of 16 B loads of the rows + codes copy that go out together (the production copy's
+# 4: with the codes the S = 16 copy is 14 rounds, a fourth round trip; K1 has the registers)
+MXFP8_COPY_BATCH = 8
+
+
+def _or(a, b):
+    return a | b
 
 
 def ld_raw8(r, lt):
@@ -205,8 +212,8 @@ def emit_pre_attn(
     ``index_nvfp4``: index K goes to NVFP4 index pages.
     ``attn_mxfp8``: the projection is a native MXFP8 1x32 one (``s_qkv``: row-major E8M0
     ``[rows, HIDDEN / 32]``): the norm's bf16 output is quantized per 32 elements (E8M0
-    ceil-pow2 code, the native linear's ``quantize_fp8``), the codes a word each in LDS
-    ``xsc`` (row pitch ``XSC_ROW``; S > 2 handed over through ``xsc_mb``), and the GEMV
+    ceil-pow2 code, the native linear's ``quantize_fp8``), the codes 4 to a word in LDS
+    ``xsc`` (row pitch ``XSCB_ROW``; S > 2 handed over through ``xsc_mb``), and the GEMV
     is one scaled 16x16x128 MFMA per 128 k, no per-token / per-row scale after it."""
     assert not (dense and kv_nvfp4)
     assert not (dense and attn_mxfp8)
@@ -324,11 +331,13 @@ def emit_pre_attn(
                     if (i == 0) | (lane < 32):
                         fx.ptr_store(w01[0].bitcast(fx.Float32), xo)
                         fx.ptr_store(w01[1].bitcast(fx.Float32), xo + 1)
-                        if lane % 4 == 0:
-                            fx.ptr_store(
-                                code.bitcast(fx.Float32),
-                                xsc + (j * XSC_ROW + lts[i] // 4),
-                            )
+                    # 4 quads' codes (lanes 16 m + 4 k) in one word, byte k
+                    word = butterfly(code << (8 * ((lane // 4) % 4)), (4, 8), _or)
+                    if (lane % 16 == 0) & ((i == 0) | (lane < 32)):
+                        fx.ptr_store(
+                            word.bitcast(fx.Float32),
+                            xsc + (j * XSCB_ROW + lts[i] // 16),
+                        )
             gpu.barrier()
             stamp(2)
             return [None] * len(toks)
@@ -400,11 +409,11 @@ def emit_pre_attn(
                     )
             if const_expr(attn_mxfp8):
                 # the codes as plain words; the flag's value carries no scale
-                if tid < HIDDEN // 32:
+                if tid < HIDDEN // 128:
                     bo.buffer_store(
                         fx.Int32(fx.ptr_load(xsc + tid).bitcast(fx.Int32)),
                         rsrc(xsc_mb),
-                        tk * (HIDDEN // 32) + tid,
+                        tk * (HIDDEN // 128) + tid,
                         cache_modifier=CM_DEV,
                     )
                 publish(mb_put, x8s_mb, tk, fx.Float32(1.0), tid == 0)
@@ -498,7 +507,7 @@ def emit_pre_attn(
             if const_expr(attn_mxfp8):
                 # the rows and their codes in one batched loop (a second one would add a
                 # round trip of the 16 B loads to the chain): loads v < n_x are x8's
-                n_x, n_s = tokens * (HIDDEN // 4) // 4, tokens * K_SCALE_BYTES // 4
+                n_x, n_s = tokens * (HIDDEN // 4) // 4, tokens * (HIDDEN // 128) // 4
 
                 def put_row_or_codes(v, w):
                     if v < n_x:
@@ -507,7 +516,7 @@ def emit_pre_attn(
                         u = v - n_x
                         fx.ptr_store(
                             w,
-                            xsc + (u * 4 // K_SCALE_BYTES * XSC_ROW + u * 4 % K_SCALE_BYTES),
+                            xsc + (u * 4 // (HIDDEN // 128) * XSCB_ROW + u * 4 % (HIDDEN // 128)),
                         )
 
                 batched_rounds(
@@ -523,6 +532,7 @@ def emit_pre_attn(
                         )
                     ),
                     put_row_or_codes,
+                    batch=MXFP8_COPY_BATCH,
                 )
             else:
                 rows_to_lds(tid, x8_mb, tokens, HIDDEN // 4, x8, HIDDEN // 4)
@@ -539,9 +549,8 @@ def emit_pre_attn(
             # the token's, both read as the low byte of a word
             g4 = lane // 16
             sbs = [
-                fx.ptr_load(
-                    xsc + (col_tok * XSC_ROW + (6 * wave + i) * 4 + g4)
-                ).bitcast(fx.Int32)
+                fx.ptr_load(xsc + (col_tok * XSCB_ROW + 6 * wave + i)).bitcast(fx.Int32)
+                >> (g4 * 8)
                 for i in range(CHUNKS_PER_WAVE // CHUNKS_PER_MFMA)
             ]
             for p in range_constexpr(CHUNKS_PER_WAVE // CHUNKS_PER_MFMA):
@@ -999,7 +1008,7 @@ def build_pre_attn_kernel(
         tls: fx.Array[fx.Int64, TL_POINTS if timeline else 1, 16]
         qs: fx.Array[fx.Float32, HEAD_DIM // 2 * tokens * heads.count, 16]
         # the norm's per-1x32 E8M0 codes, a word each
-        xsc: fx.Array[fx.Int32, tokens * XSC_ROW, 16]
+        xsc: fx.Array[fx.Int32, tokens * XSCB_ROW, 16]
 
     Smem = SmemMx if attn_mxfp8 else SmemPtpc
 

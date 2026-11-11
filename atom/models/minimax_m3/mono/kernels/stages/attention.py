@@ -451,6 +451,8 @@ def merge_defs(k4ctx):
             )
             code = code_ceil(fx.max(am, fx.Float32(1e-10)) * fx.Float32(1.0 / FP8_MAX))
             inv = rcp_pow2(code)
+            # the 4 blocks of a head (threads 8 k of its 32) in one word, byte k
+            code = butterfly(code << (8 * ((tid // 8) % 4)), (8, 16), lambda a, b: a | b)
             return (
                 fp8_pack4(
                     clamp_fp8(a0 * inv),
@@ -485,12 +487,13 @@ def merge_defs(k4ctx):
                     cache_modifier=CM_DEV,
                 )
                 if const_expr(attn_mxfp8):
-                    # the codes as plain words too; the flag carries no scale
-                    if tid % 8 == 0:
+                    # the codes as plain words too (a head's four in one); the flag carries
+                    # no scale
+                    if tid % 32 == 0:
                         bo.buffer_store(
                             x_scale,
                             rsrc(mb("attnq_sc")),
-                            k * (O_K // 32) + tid // 8,
+                            k * (O_K // 128) + tid // 32,
                             cache_modifier=CM_DEV,
                         )
                     publish(mb_put, mr("attnq_s"), k, fx.Float32(1.0), tid == 0)
@@ -590,8 +593,8 @@ def o_defs(k4ctx):
                 # the merge folded in: the partitions -> this CTA's fp8 input
                 word, x_scale = merge_token(0)
                 if const_expr(attn_mxfp8):
-                    if tid % 8 == 0:
-                        fx.ptr_store(x_scale.bitcast(fx.Float32), osc + tid // 8)
+                    if tid % 32 == 0:
+                        fx.ptr_store(x_scale.bitcast(fx.Float32), osc + tid // 32)
                 else:
                     x_scales = [x_scale]
                 fx.ptr_store(word, xs + tid)
@@ -606,7 +609,7 @@ def o_defs(k4ctx):
                 if const_expr(attn_mxfp8):
                     # the rows and their codes in one batched loop (a second would add a
                     # round trip): loads v < n_a are the rows'
-                    n_a, n_c = tokens * (O_K // 4) // 4, tokens * (O_K // 32) // 4
+                    n_a, n_c = tokens * (O_K // 4) // 4, tokens * (O_K // 128) // 4
                     to_codes = (SCRATCH["attnq_sc"] - SCRATCH["attnq"]) // 4
 
                     def put_row_or_codes(v, w):
@@ -618,7 +621,7 @@ def o_defs(k4ctx):
                             u = v - n_a
                             fx.ptr_store(
                                 w,
-                                osc + (u * 4 // (O_K // 32) * OSC_ROW + u * 4 % (O_K // 32)),
+                                osc + (u * 4 // (O_K // 128) * OSC_ROW + u * 4 % (O_K // 128)),
                             )
 
                     batched_rounds(
@@ -632,6 +635,7 @@ def o_defs(k4ctx):
                             )
                         ),
                         put_row_or_codes,
+                        batch=8,  # S = 16: 5 rounds in one trip, not 4 + 1
                     )
                 else:
                     rows_to_lds(tid, mb("attnq"), tokens, O_K // 4, xs, O_ROW)
@@ -646,8 +650,9 @@ def o_defs(k4ctx):
                 sas = [ws_dw[p] >> (g4 * 8) for p in range(O_CPW // 2)]
                 sbs = [
                     fx.ptr_load(
-                        osc + (col_tok * OSC_ROW + ((wave % 4) * (O_CPW // 2) + p) * 4 + g4)
+                        osc + (col_tok * OSC_ROW + (wave % 4) * (O_CPW // 2) + p)
                     ).bitcast(fx.Int32)
+                    >> (g4 * 8)
                     for p in range(O_CPW // 2)
                 ]
             else:

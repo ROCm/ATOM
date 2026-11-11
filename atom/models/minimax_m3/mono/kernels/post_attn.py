@@ -107,6 +107,7 @@ from atom.models.minimax_m3.mono.layout import (
     UG_PER_SLOT,
     XN8_ROW,
     XSC_ROW,
+    XSCB_ROW,
     H,
     mailbox_regions,
     pool_words,
@@ -307,8 +308,8 @@ def build_post_attn_kernel(
     ih_count, ih_own = heads.count, heads.own
     # fuse_k1 with every index head: K1's index q of every head (qs) after its x8
     # rows in the pool (K1 is done with the pool before K4's stages use it)
-    # (attn_mxfp8: K1's E8M0 codes sit between, ``XSC_ROW`` words a token)
-    QS_CP = tokens * (HIDDEN // 4 + (XSC_ROW if attn_mxfp8 else 0))
+    # (attn_mxfp8: K1's E8M0 codes sit between, ``XSCB_ROW`` words a token)
+    QS_CP = tokens * (HIDDEN // 4 + (XSCB_ROW if attn_mxfp8 else 0))
     assert not attn_mxfp8 or QS_CP <= POOL, "K1's x8 rows + codes outgrow the pool"
     assert not attn_mxfp8 or tokens * (O_ROW + OSC_ROW) <= POOL, "o_proj rows + codes"
     assert not (fuse_k1 and heads.count > 1) or (
