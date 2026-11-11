@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from atom.kv_transfer.offload import config as offcfg
+from atom.kv_transfer.offload.capabilities import replays_state
 from atom.kv_transfer.offload.dense.kv_byte_codec import DenseKVByteCodec
 from atom.kv_transfer.offload.hybrid.m3 import codec as m3_codec
 from atom.kv_transfer.offload.page_codec import pure_page_codec
@@ -78,8 +79,6 @@ def _build_replay_pages(
     _permit_per_request_state: bool,
 ) -> Any:
     """V4.1 PAGE bytes. The replay contract is what rebuilds request state."""
-    from atom.kv_transfer.offload.capabilities import replays_state
-
     if not replays_state(transfer_tensors):
         raise ValueError("Mooncake Store V4.1 requires the PAGE replay contract")
     return pure_page_codec(transfer_tensors, num_blocks)
