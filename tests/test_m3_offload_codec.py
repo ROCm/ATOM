@@ -3,6 +3,7 @@
 
 """M3 PAGE geometry and shared startup validation, without a GPU runtime."""
 
+import subprocess
 import sys
 from types import SimpleNamespace
 
@@ -100,3 +101,23 @@ def test_connectors_reject_unavailable_page_staging(transfer, monkeypatch, backe
         connector._config = config
         with pytest.raises(RuntimeError, match="Triton.*PAGE staging"):
             connector.register_kv_caches({}, transfer, 4)
+
+
+def test_store_layout_table_does_not_import_the_lmcache_m3_connector():
+    """The codec id is a leaf module; loading it must not build the LMCache worker."""
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; import atom.kv_transfer.offload.mooncake_store.layouts; "
+                "assert 'atom.kv_transfer.offload.hybrid.m3.connector' "
+                "not in sys.modules; "
+                "from atom.kv_transfer.offload.hybrid.m3 import M3OffloadConnector; "
+                "assert M3OffloadConnector.__name__ == 'M3OffloadConnector'; "
+                "assert 'atom.kv_transfer.offload.hybrid.m3.connector' in sys.modules"
+            ),
+        ],
+        check=True,
+        timeout=30,
+    )

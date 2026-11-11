@@ -15,10 +15,10 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+import atom.kv_transfer.offload.hybrid.m3.codec as m3_codec
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload.capabilities import replays_state
 from atom.kv_transfer.offload.dense.kv_byte_codec import DenseKVByteCodec
-from atom.kv_transfer.offload.hybrid.m3 import codec as m3_codec
 from atom.kv_transfer.offload.page_codec import pure_page_codec
 
 # Bumped when the dense codec's per-chunk byte layout changes.
