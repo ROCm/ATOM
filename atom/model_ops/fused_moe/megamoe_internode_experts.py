@@ -140,7 +140,7 @@ def _get_instance(
             )
         from aiter.ops.flydsl.kernels.mega_moe_internode import MegaMoEInternode
 
-        with ExitStack() as cleanup, torch.inference_mode(False), torch.no_grad():
+        with torch.inference_mode(False), torch.no_grad():
             op = MegaMoEInternode(
                 rank=rank,
                 world_size=world,
@@ -159,16 +159,8 @@ def _get_instance(
                 situ_beta=situ_beta,
                 situ_linear_beta=situ_linear_beta,
             )
-            cleanup.callback(op.close)
-            dev = op.device
-            inst = {
-                "op": op,
-                "x": torch.zeros(mtpr, model_dim, dtype=torch.bfloat16, device=dev),
-                "ids": torch.full((mtpr, topk), -1, dtype=torch.int32, device=dev),
-                "wts": torch.zeros(mtpr, topk, dtype=torch.float32, device=dev),
-            }
+            inst = {"op": op}
             _INSTANCES[key] = inst
-            cleanup.pop_all()  # The cache now owns the operator's teardown.
         _write_tune_audit(op, rank, mtpr)
         if rank == 0:
             logger.info(
@@ -220,16 +212,13 @@ def _write_tune_audit(op, rank, mtpr) -> None:
 def _run_chunk(inst, layer, x, ids, wts, start, n):
     """Run rows [start, start+n) of this rank (n may be 0) through one op call."""
     op = inst["op"]
-    bx, bids, bw = inst["x"], inst["ids"], inst["wts"]
-    if n > 0:
-        bx[:n].copy_(x[start : start + n])
-        cid = ids[start : start + n]
-        # ATOM's pad rows are already -1; the op skips invalid slots.
-        bids[:n].copy_(cid)
-        bw[:n].copy_(torch.where(cid >= 0, wts[start : start + n], 0.0))
+    # Record quantization packs these inputs directly into operator-owned storage.
+    # Invalid expert IDs are skipped by the operator regardless of their weights.
+    # Slicing also handles an empty local chunk without forwarding stale buffer rows.
+    end = start + n
     op.bind_weights(layer._mi_w1, layer._mi_w1_scale, layer._mi_w2, layer._mi_w2_scale)
     with torch.inference_mode(False), torch.no_grad():
-        return op.forward(bx[:n], bw[:n], bids[:n])
+        return op.forward(x[start:end].contiguous(), wts[start:end], ids[start:end])
 
 
 def _group_rows(local_rows: int) -> tuple[int, bool]:
@@ -299,8 +288,8 @@ class MegaInternodeFusedExperts:
         x = hidden_states
         rows = int(x.shape[0])
         topk = int(topk_ids.shape[1])
-        ids = topk_ids.to(torch.int32)
-        wts = topk_weights.to(torch.float32)
+        ids = topk_ids.to(torch.int32).contiguous()
+        wts = topk_weights.to(torch.float32).contiguous()
         build = {
             "model_dim": self._model_dim,
             "inter_dim": self._inter_dim,

@@ -180,9 +180,9 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         assert (
             not apply_router_weight_on_input
         ), "mori does not support apply_router_weight_on_input=True now."
-        assert a1.shape[0] <= self.max_tokens_per_rank, (
-            f"MORI dispatch input has {a1.shape[0]} rows, handle capacity is {self.max_tokens_per_rank}"
-        )
+        assert (
+            a1.shape[0] <= self.max_tokens_per_rank
+        ), f"MORI dispatch input has {a1.shape[0]} rows, handle capacity is {self.max_tokens_per_rank}"
         a1, scale = self._in_wire(a1, x_scale)
         block_num, warp_per_block = self._launch_geometry(a1.shape[0])
 
@@ -253,9 +253,9 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             not apply_router_weight_on_input
         ), "mori does not support apply_router_weight_on_input=True now."
 
-        assert a1.shape[0] <= self.max_tokens_per_rank, (
-            f"MORI dispatch input has {a1.shape[0]} rows, handle capacity is {self.max_tokens_per_rank}"
-        )
+        assert (
+            a1.shape[0] <= self.max_tokens_per_rank
+        ), f"MORI dispatch input has {a1.shape[0]} rows, handle capacity is {self.max_tokens_per_rank}"
         a1, scale = self._in_wire(a1, x_scale)
         if self._use_split_send_recv:
             return self._prepare_async_ll(a1, topk_weights, topk_ids, scale)

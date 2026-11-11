@@ -516,6 +516,14 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
 
     def warmup_per_req_cache(self):
         self.copies.warmup()
+        from .warmup import warmup_prefill_addressing
+
+        warmup_prefill_addressing(
+            self.cache,
+            self.model_runner.model.topology,
+            self.max_num_batched_tokens,
+            self.model_runner.forward_vars["block_tables"].gpu.stride(0),
+        )
 
     def release_kv_pools(self):
         # Release PAGE/STATE views only. Runner-owned forward buffers and

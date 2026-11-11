@@ -127,12 +127,27 @@ def test_audit_io_failure_preserves_cached_operator(
     first["op"].close.assert_called_once_with()
 
 
-def test_failed_buffer_allocation_closes_uncached_operator(internode, monkeypatch):
+def test_instance_has_no_duplicate_input_buffers(internode, monkeypatch):
     monkeypatch.setattr(torch, "full", Mock(side_effect=RuntimeError("allocation")))
-    with pytest.raises(RuntimeError, match="allocation"):
-        _instance(internode)
-    assert not internode.module._INSTANCES
-    internode.built[0].close.assert_called_once_with()
+    monkeypatch.setattr(torch, "zeros", Mock(side_effect=RuntimeError("allocation")))
+    assert set(_instance(internode)) == {"op"}
+
+
+@pytest.mark.parametrize("start,rows", [(0, 2), (2, 1), (4, 0)])
+def test_chunk_forwards_actual_views_and_invalid_routes(internode, start, rows):
+    instance = _instance(internode, capacity=4)
+    x = torch.arange(3 * 64, dtype=torch.float32).reshape(3, 64).to(torch.bfloat16)
+    weights = torch.ones(3, 2)
+    ids = torch.tensor([[0, -1], [-1, 2], [3, 4]], dtype=torch.int32)
+    result = internode.module._run_chunk(
+        instance, _weights(), x, ids, weights, start, rows
+    )
+    actual_x, actual_weights, actual_ids = instance["op"].calls[-1]
+    assert result.shape == (rows, 64)
+    assert torch.equal(actual_x, x[start : start + rows])
+    assert torch.equal(actual_weights, weights[start : start + rows])
+    assert torch.equal(actual_ids, ids[start : start + rows])
+    instance["op"].bind_weights.assert_called_once()
 
 
 def test_teardown_attempts_every_capacity_in_reverse_order(internode):

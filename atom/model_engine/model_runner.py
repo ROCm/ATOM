@@ -1492,6 +1492,15 @@ class ModelRunner:
             is_dummy_run=True,
         )
         self.forward(dummy_batch)
+        from atom.model_ops.gemm_warmup import (
+            warmup_a16_gemms,
+            warmup_native_fp8_gemms,
+            warmup_v41_bmms,
+        )
+
+        warmup_native_fp8_gemms(self.model, warmup_max_tokens)
+        warmup_a16_gemms(self.model, warmup_max_tokens)
+        warmup_v41_bmms(self.model, warmup_max_tokens)
         self.tokenID_processor.clean()
         torch.cuda.empty_cache()
         logger.info(
