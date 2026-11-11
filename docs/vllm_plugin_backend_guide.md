@@ -194,7 +194,15 @@ Currently, the plugin backend supports the following model architectures:
 Kimi-K3 uses vLLM's hybrid/Mamba cache contract for KDA recurrent state and
 ATOM's MLA backend for full-attention layers. See the
 [Kimi-K3 vLLM recipe](../recipes/atom_vllm/Kimi-K3.md) for its TP8, FLA,
-prefix-caching, and text-only requirements.
+prefix-caching, and text-only requirements. `AtomLMCacheOffloadConnector`
+offloads K3 in-process (`atom.offload.backend: inproc`, the KDA state on a leg
+of its own) or through the LMCache MP server (`mp`). Over MP the KDA state rides
+the PAGE object as DeepSeek-V4.1's checkpoints do: vLLM aliases each mamba
+group's layers onto the leading MLA planes, so the state at a boundary is one
+PAGE unit per mamba group, carried as a native-state image. That needs
+`--enable-prefix-caching`, `--mamba-cache-mode align`,
+`kv_load_failure_policy: recompute`, and an LMCache chunk that is a multiple of
+the mamba block (1536 tokens on K3).
 
 GLM-5.3-Flash reuses Kimi-K3's KDA state contract and runs its DSA indexer in
 pooled (kpool) form: the index cache declares `tokens_per_state = index_kpool`,
