@@ -32,10 +32,11 @@ class AuxTaps:
     never matches it.
 
     ``extract`` is the drafter's own ``(layer_output, layer) -> tap`` function,
-    the one its hooks run (``AuxCaptureSpec.extract``); ``None`` where the
-    drafter armed none. A model that has no layer return to hand it computes
-    the tap in its kernels instead, and binds with the one extract those
-    kernels reproduce (``bind_aux_taps``).
+    the one its hooks run (``AuxCaptureSpec.extract``), required whenever a
+    layer is tapped. Only a runner without a drafter has none: its empty
+    ``AuxTaps((), ())`` taps no layer, so nothing reads it. A model that has
+    no layer return to hand it computes the tap in its kernels instead, and
+    binds with the one extract those kernels reproduce (``bind_aux_taps``).
     """
 
     layer_ids: tuple[int, ...]
@@ -84,7 +85,13 @@ def bind_aux_taps(
         if buf.dtype != torch.bfloat16:
             raise MonoUnsupported(f"aux buffer {buf.dtype}")
     extract = drafter.aux_extract
-    if kernel_extract is not None and extract not in (None, kernel_extract):
+    # Buffers tap at least one layer here, so the empty drafterless taps are
+    # the only ones without an extract.
+    if extract is None:
+        raise MonoUnsupported(
+            f"the drafter taps target layers {layer_ids} with no aux extract"
+        )
+    if kernel_extract is not None and extract is not kernel_extract:
         raise MonoUnsupported(
             f"the drafter's aux extract {getattr(extract, '__qualname__', extract)}"
             " is not the one this model's mono kernels compute"

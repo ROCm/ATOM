@@ -113,14 +113,11 @@ def test_first_served_step_writes_the_taps(monkeypatch):
     ):  # (Triton stubbed with AITER where it is not installed)
         hook = load("atom.models.deepseek_v41.mono.hi_runner")
     # (the draft module needs AITER and FlyDSL: only the extract it names)
+    draft = types.SimpleNamespace(_target_layer_input=lambda inputs, block: None)
     monkeypatch.setitem(
         sys.modules,
         "atom.models.deepseek_v41.dspark",
-        types.SimpleNamespace(
-            DeepseekV41DSpark=types.SimpleNamespace(
-                _target_layer_input=lambda inputs, block: None
-            )
-        ),
+        types.SimpleNamespace(DeepseekV41DSpark=draft),
     )
     m = object.__new__(hook.HiLayers)
     m.aux, m.D = None, types.SimpleNamespace(TAPS=len(AUX))
@@ -128,7 +125,7 @@ def test_first_served_step_writes_the_taps(monkeypatch):
     m.r_a = {i: torch.zeros(1, 4, 8, dtype=torch.bfloat16) for i in AUX}
     bufs = [torch.zeros(4, 8, dtype=torch.bfloat16) for _ in AUX]
     cfg = types.SimpleNamespace(dspark_target_layer_ids=list(AUX))
-    m.cx_drafter = types.SimpleNamespace(_aux_buffers=bufs, aux_extract=None,
+    m.cx_drafter = types.SimpleNamespace(_aux_buffers=bufs, aux_extract=draft._target_layer_input,
                                          speculative_config=types.SimpleNamespace(draft_model_hf_config=cfg))  # fmt: skip
     taps = m._taps()
     assert [b for _, b in taps] == bufs and [r for r, _ in taps] == [

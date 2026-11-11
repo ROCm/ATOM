@@ -570,17 +570,11 @@ class K3MonoDecodeRunner:
         two cannot drift apart. ``out`` is ``(prefix, add, add2)``; the layer's
         own return carries the block bank in a fourth slot, and mono keeps that
         in ``blocks`` -- a fixed-size slot stack, not the forward's grown
-        ``cat``, so only the slots banked so far hold this step's data. A
-        drafter with no extract gets the layer's own ``aux_hidden_state``,
-        which ignores that slot.
+        ``cat``, so only the slots banked so far hold this step's data.
         """
         if layer_id not in self.aux.layer_ids:
             return
-        layer = self.inner.layers[layer_id]
-        if self.aux.extract is None:
-            tap = layer.aux_hidden_state((*out, None))
-        else:
-            tap = self.aux.extract((*out, blocks), layer)
+        tap = self.aux.extract((*out, blocks), self.inner.layers[layer_id])
         self.aux.write(layer_id, tap)
 
     def _fallback(self, plan, positions, prefix, blocks, add, add2):

@@ -23,6 +23,7 @@ pytest.importorskip("flydsl", reason="importing the K3 mono runner needs FlyDSL"
 pytest.importorskip("aiter", reason="the K3 mono runner imports aiter.dist")
 
 from atom.models.kimi_k3.mono.runner import K3MonoDecodeRunner
+from atom.spec_decode.dspark_proposer import DSparkProposer
 
 HIDDEN, ROWS = 8, 4
 
@@ -43,10 +44,13 @@ class _Layer:
 
 
 def _runner(tapped, *, mono):
-    """A runner stubbed down to `_layer` and the tap it owes."""
+    """A runner stubbed down to `_layer` and the tap it owes, bound with the
+    K3 drafter's extract."""
     runner = object.__new__(K3MonoDecodeRunner)
     runner.aux = AuxTaps(
-        tuple(tapped), tuple(torch.zeros(ROWS, HIDDEN) for _ in tapped)
+        tuple(tapped),
+        tuple(torch.zeros(ROWS, HIDDEN) for _ in tapped),
+        DSparkProposer._extract_layer_hidden,
     )
     runner.inner = SimpleNamespace(layers={i: _Layer() for i in range(4)})
     out = (torch.full((ROWS, HIDDEN), 2.0), torch.full((ROWS, HIDDEN), 3.0), None)
