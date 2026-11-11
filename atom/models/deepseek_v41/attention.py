@@ -586,7 +586,8 @@ class Attention(nn.Module):
                 queries,
                 rope=rope,
                 out=x_fp8,
-                out_scale=x_scale,
+                # The eager recorder weak-refs bytes; vLLM may reject E8M0.
+                out_scale=x_scale.view(torch.uint8),
             )
             return self._project_quantized_out(
                 x_fp8, x_scale, query.shape[:-2], query.dtype
@@ -618,6 +619,8 @@ class Attention(nn.Module):
         result is written over ``query`` in place wherever the kernel takes
         ``out=``. Fused attention writes both graph-owned FP8 output buffers
         and returns None so replay needs no result copy."""
+        if out_scale is not None:
+            out_scale = out_scale.view(torch.float8_e8m0fnu)
         if not step.requests:  # a dummy prefill on a token graph
             if out is not None:
                 out.view(torch.uint8).zero_()

@@ -8,7 +8,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-pytest.importorskip("aiter")
+if os.environ.get("ATOM_REQUIRE_FUSED_ATTENTION_TESTS") == "1":
+    __import__("aiter")
+else:
+    pytest.importorskip("aiter")
 
 from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
 from atom.model_ops.attentions.deepseek_v41.fp8_attention import (
