@@ -73,6 +73,18 @@ def unfused_post_key(key):
     return replace(key, index_bound_max=0, tok_par=False)
 
 
+def unfused_keys(keys: list, post_key):
+    """A width's (K1 build keys, K2 build key), unfused.
+
+    K1 loses token parallel with K2: a token-parallel K1 writes only its own
+    rank's rows (``token_par.own_rows``), which is whose selection that rank's
+    K2 indexer would have made. Nothing else about K1 changes -- it still
+    projects the indexer query, which the host-side scorer's FP8 form reads.
+    """
+    key = unfused_post_key(post_key)
+    return [replace(k, tok_par=key.tok_par) for k in keys], key
+
+
 def lean_width(built: RowsBuild, spilled: list, rebuild):
     """``built`` rebuilt unfused when one of its K2 launchers needs scratch,
     else None (``WidthBuilds``: nothing leaner, so the width is refused).
