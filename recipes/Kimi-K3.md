@@ -75,6 +75,11 @@ context parallelism are all served:
   one and mono refuses the whole model -- the server answers correctly on the
   production path and says so once, e.g. `mono decode off: layer 1 shared
   gate_up_proj is torch.float8_e4m3fn`.
+- **gfx1250 (MI455X) reads the online `per_block_fp8` weights.** With E8M0
+  block scales on preshuffled weights (`ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE=1`,
+  `ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=1`), K1 reads `self_attn.in_proj` and
+  K2 the shared experts as the GEMMs hold them, and `o_proj` stays a model op,
+  so only `*self_attn.f_b_proj*` must stay out of the online quant there.
 
 With a drafter:
 
