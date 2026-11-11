@@ -318,30 +318,22 @@ def router_swiglu_supported(
     )
 
 
-def m31_route_swiglu(
+def router_partials_swiglu(
     x: torch.Tensor,
     gate_weight: torch.Tensor,
-    bias: torch.Tensor,
     gate_up: torch.Tensor,
     alpha: float,
     beta: float,
     limit: float | None,
-    routed_scaling_factor: float = 1.0,
-    n_local: torch.Tensor | None = None,
-):
-    """``(topk_weights [M, 4] fp32, topk_ids [M, 4] int32, presort, (q, scale))``
-    for ``router_swiglu_supported`` operands, or None while the workspace is
-    missing (a first call under graph capture).
-
-    ``presort`` is ``router.m31_route``'s registration (both sort layouts, the
-    zeroed MoE output); ``(q, scale)`` is ``swiglu_oai_split_mxfp8(gate_up,
-    alpha, beta, limit)``. ``n_local`` (int32 device scalar): rows from it on
-    are padding -- no routes, zero weights.
-    """
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Launch 1: the router GEMV's split-K partials into the device workspace,
+    for the next ``gate_sort`` on this stream, and ``swiglu_oai_split_mxfp8(
+    gate_up, alpha, beta, limit)``, returned as ``(values, scales)``. None while
+    the workspace is missing (a first call under graph capture)."""
     ws = _workspace(x.device)
     if ws is None:
         return None
-    part, counter = ws
+    part, _ = ws
     m = x.shape[0]
     dev = x.device
     n_inter = gate_up.shape[1] // 2
@@ -375,7 +367,28 @@ def m31_route_swiglu(
         SW_BLOCK=sw_block,
         num_warps=_NUM_WARPS,
     )
+    return q, q_scale
 
+
+def gate_sort(
+    m: int,
+    bias: torch.Tensor,
+    routed_scaling_factor: float = 1.0,
+    n_local: torch.Tensor | None = None,
+    moe_buf: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, dict]:
+    """Launch 2, after ``router_partials_swiglu`` of the same ``m`` rows on this
+    stream: ``(topk_weights [m, 4] fp32, topk_ids [m, 4] int32, presort)``.
+
+    ``presort`` is ``router.m31_route``'s registration (both sort layouts and
+    the MoE output GEMM2 accumulates into). Weights are multiplied by
+    ``routed_scaling_factor``. ``n_local`` (int32 device scalar): rows from it on
+    are padding -- no routes, zero weights. ``moe_buf``: a caller's [m, 6144]
+    bf16 output, already holding what GEMM2 should add to (e.g. the shared
+    expert's output); without it the launch zeroes a fresh one.
+    """
+    dev = bias.device
+    part, counter = _workspaces[dev]
     topk_w = torch.empty(m, TOPK, dtype=torch.float32, device=dev)
     topk_ids = torch.empty(m, TOPK, dtype=torch.int32, device=dev)
     # aiter's BM=16 sort capacity, a whole number of blocks (as router.py)
@@ -387,10 +400,13 @@ def m31_route_swiglu(
     m_indices = torch.empty(max_sorted, dtype=torch.int32, device=dev)
     reverse_sorted = torch.empty(m * TOPK, dtype=torch.int32, device=dev)
     sorted_ids_ms = torch.empty(max_sorted, dtype=torch.int32, device=dev)
-    moe_buf = torch.empty(m, HIDDEN, dtype=torch.bfloat16, device=dev)
-    rows_pow2 = triton.next_power_of_2(m)
+    num_zero = 0
+    if moe_buf is None:
+        moe_buf = torch.empty(m, HIDDEN, dtype=torch.bfloat16, device=dev)
+        num_zero = triton.cdiv(moe_buf.numel(), _BUF_BLOCK)
+    m_tiles = triton.cdiv(m, _GEMV_M)
     num_gate = triton.cdiv(m, _GATE_ROWS)
-    _gate_sort_kernel[(num_gate + triton.cdiv(moe_buf.numel(), _BUF_BLOCK),)](
+    _gate_sort_kernel[(num_gate + num_zero,)](
         part,
         bias,
         n_local if n_local is not None else num_valid,
@@ -413,7 +429,7 @@ def m31_route_swiglu(
         TOPK=TOPK,
         SORT_M=BLOCK_M,
         SPLIT=_SPLIT,
-        ROWS_POW2=rows_pow2,
+        ROWS_POW2=triton.next_power_of_2(m),
         GATE_ROWS=_GATE_ROWS,
         HAS_NLOCAL=n_local is not None,
         BUF_BLOCK=_BUF_BLOCK,
@@ -427,6 +443,8 @@ def m31_route_swiglu(
         "m_indices": m_indices,
         "reverse_sorted": reverse_sorted,
         "sorted_token_ids_moe_sorting": sorted_ids_ms,
+        # GEMM2's destination, ready for it to accumulate into (aiter's word
+        # for that is "zeroed")
         "moe_buf": moe_buf,
         "moe_buf_zeroed": True,
         "moe_buf_ptr": moe_buf.data_ptr(),
@@ -437,4 +455,25 @@ def m31_route_swiglu(
         "num_experts": NUM_EXPERTS,
         "topk": TOPK,
     }
-    return topk_w, topk_ids, presort, (q, q_scale)
+    return topk_w, topk_ids, presort
+
+
+def m31_route_swiglu(
+    x: torch.Tensor,
+    gate_weight: torch.Tensor,
+    bias: torch.Tensor,
+    gate_up: torch.Tensor,
+    alpha: float,
+    beta: float,
+    limit: float | None,
+    routed_scaling_factor: float = 1.0,
+    n_local: torch.Tensor | None = None,
+):
+    """``router_partials_swiglu`` then ``gate_sort`` with a zeroed MoE output:
+    ``(topk_weights, topk_ids, presort, (q, scale))``, or None while the
+    workspace is missing (a first call under graph capture)."""
+    swiglu = router_partials_swiglu(x, gate_weight, gate_up, alpha, beta, limit)
+    if swiglu is None:
+        return None
+    routes = gate_sort(x.shape[0], bias, routed_scaling_factor, n_local)
+    return (*routes, swiglu)
