@@ -51,6 +51,9 @@ on:
 jobs:
   benchmark:
     name: SGLang ${{ matrix.model.display }} ${{ matrix.params.input_length }}/${{ matrix.params.output_length }} c=${{ matrix.params.concurrency }}
+    # Defense-in-depth: current callers are schedule/workflow_dispatch only.
+    # Keep forked PRs off these self-hosted runners if a PR caller is added later.
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(inputs.benchmark_matrix_json) }}

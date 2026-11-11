@@ -13,8 +13,11 @@
 > prewarm / status` are gone (the profile is the provider's). The sections below still describe
 > the previous in-tree revision and are to be rewritten.
 The Qwen QSA indexer scores compressed key groups with ATOM's own
-`qsa_paged_mqa_logits` (`atom/model_ops/qwen4_exp/ops/qsa.py`, unchanged: the
-frozen golden reference, sha256 `c2e46e50…` LF / `aaa78f43…` CRLF). With
+`qsa_paged_mqa_logits` (`atom/model_ops/qwen4_exp/ops/qsa.py`; the scorer is
+the frozen golden reference of 8a07708, whole file sha256 `c2e46e50…` LF /
+`aaa78f43…` CRLF through 10b99a08; main's #2847 split only the selection loop,
+so the test now pins qsa.py outside the selection entries, sha256
+`4f48345d…`). With
 `--qsa-index-scorer-profile` the same calls go to aiter's in-tree **neutral op**
 `aiter.ops.qsa.qsa_paged_mqa_logits` (op contract `qsa_paged_mqa_logits` v1;
 its 12 leading parameters are ATOM's scorer's). aiter owns the dispatch: its
@@ -32,10 +35,12 @@ route, no capability pinning and no fallback** of its own. This uses neither
 | `--qsa-index-scorer-profile NAME\|PATH.json` | `Config.qsa_index_scorer.profile` | `ATOM_QSA_INDEX_SCORER_PROFILE` (read once by `EngineArgs`, only when the flag is absent) | `""` (OFF) |
 | `--qsa-index-scorer-capture PATH` | `Config.qsa_index_scorer.capture` | — | `""` (no observer) |
 
-* **OFF** (default): `Qwen4ExpAttention.qsa_select is None`; neither
+* **OFF** (default): `Qwen4ExpAttention.qsa_select` and `.qsa_select_groups`
+  are None; neither
   `atom.model_ops.qwen4_exp.qsa_index_scorer` nor `aiter.ops.qsa`'s lifecycle
   API is touched (also not by `ModelRunner`); `_select_tokens` calls the stock
-  `qsa_select_paged_tokens`; `Config.compute_hash()` is unchanged
+  `qsa_select_paged_tokens` (whole batch) or `qsa_select_paged_groups`
+  (row-sharded, #2847); `Config.compute_hash()` is unchanged
   (`QSAIndexScorerConfig.hash_factors()` is empty while OFF).
 * **ON**: `compute_hash()` includes `("qsa_index_scorer", profile)`. The
   profile reaches aiter only through `aiter.ops.qsa.configure(profile=...,
@@ -87,18 +92,28 @@ status: <aiter.ops.qsa.status() as key=value>`; prewarm:
 
 ```
 Qwen4ExpAttention._select_tokens
-  self.qsa_select(...) == qsa_select_paged_tokens_with_scorer(..., scorer=aiter.ops.qsa.qsa_paged_mqa_logits)
+  rows is None:  self.qsa_select(...) == qsa_select_paged_tokens_with_scorer(..., scorer=op)
+                   -> qsa_select_paged_groups_with_scorer(...), then expand
+  rows given:    self.qsa_select_groups(local rows) == qsa_select_paged_groups_with_scorer(..., scorer=op)
+                   -> gather, then expand (#2847's row-sharded indexer selection)
     (stock loop: max_seq_len pow2 max_columns bucket, row chunks under the
-     128 MiB logits workspace, per-chunk row_starts, top-k, expand)
-    aiter.ops.qsa.qsa_paged_mqa_logits(q[rows], cache, table, t2r[rows], pos[rows], ctx, 4,
+     128 MiB logits workspace, per-chunk row_starts, top-k)
+    op = aiter.ops.qsa.qsa_paged_mqa_logits(q[rows], cache, table, t2r[rows], pos[rows], ctx, 4,
           max_columns=..., row_starts=..., allow_flydsl=is_prefill, compressed_k_scale=...)
       -> aiter: fused | native-triton | native-torch   (aiter's per-class decision cache)
 ```
 
-* `qsa_select_paged_tokens_with_scorer` (`qsa_index_scorer/select.py`) is the
-  stock loop with the scorer injected; a CPU test AST-compares it to `qsa.py`
-  (kept as a drift-tested copy so `qsa.py`, the golden reference, stays
-  byte-identical).
+* `qsa_select_paged_groups_with_scorer` / `qsa_select_paged_tokens_with_scorer`
+  (`qsa_index_scorer/select.py`) are the stock `qsa_select_paged_groups` /
+  `qsa_select_paged_tokens` with the scorer injected; CPU tests AST-compare
+  both to `qsa.py` (kept as drift-tested copies so `qsa.py` is not modified).
+* Composability with other scorers in the stock loop (e.g. ROCm/ATOM #3107's
+  gfx1250 `qsa_index_scores` branch): the routed op replaces the stock
+  `qsa_paged_mqa_logits` call only when a provider is enabled; with the switch
+  OFF the stock loop, including any such branch, runs unchanged. When such a
+  branch lands in `qsa_select_paged_groups`, the AST test fails until the copy
+  is re-synced (the branch is then carried as-is, with only the
+  `qsa_paged_mqa_logits` call replaced).
 * The scorer is the op object itself: no ATOM wrapper, no per-call Python of
   ATOM's on the default ON path. Anything the op raises propagates.
 * Traced regions: `Qwen4ExpForConditionalGeneration` is not

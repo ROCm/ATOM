@@ -15,9 +15,10 @@ the observer is requested; otherwise nothing here, and nothing of
 * :mod:`.enablement` -- per-process ``configure`` / startup line,
   :func:`~.enablement.index_scorer` (the scorer the call site injects),
   provider warm-up after KV allocation, and the opt-in ``explain`` observer.
-* :mod:`.select` -- ``qsa_select_paged_tokens_with_scorer``: the stock
-  ``qsa_select_paged_tokens`` loop with the scorer injected (AST drift-tested
-  against the frozen ``qsa.py``).
+* :mod:`.select` -- ``qsa_select_paged_groups_with_scorer`` /
+  ``qsa_select_paged_tokens_with_scorer``: the stock row-sharded and
+  whole-batch selection entries with the scorer injected (AST drift-tested
+  against ``qsa.py``).
 * :mod:`.capture` -- the call-class capture JSON and its ``merge`` CLI
   (coverage matrix / the provider's ``gen_profile --plan-file``).
 

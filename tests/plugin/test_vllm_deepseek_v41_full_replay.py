@@ -87,7 +87,7 @@ def _builder(
     for name in ("positions", "batch_id_per_q_token"):
         buffers[name].publication_group = "v41_step"
     buffers["cu_seqlens_q"].publication_group = "early"
-    buffers["block_tables"].publication_group = "prefill"
+    buffers["block_tables"].publication_group = "seq_metadata"
     assert all(buffer.cpu.is_pinned() for buffer in buffers.values())
     builder.model_runner = SimpleNamespace(
         forward_vars=buffers, v41_graphs_enabled=True
@@ -688,7 +688,7 @@ def test_profile_to_serving_full_graph_rebinds_real_engram_and_cache(
                 prepared = returned.atom_v41_prepared
                 step = prepared.metadata.step
                 assert returned.atom_v41_snapshot.full_graph and step.decode
-                assert step.scheduled == count < step.width == total
+                assert step.scheduled_tokens == count < step.running_tokens == total
                 assert [span.slot for span in step.requests] == list(slots)
                 assert step.tentative == bool(speculative_tokens)
                 assert staging.step.cursor.data_ptr() == cache.cursor.data_ptr()

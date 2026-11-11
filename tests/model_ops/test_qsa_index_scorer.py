@@ -43,11 +43,21 @@ RUNNER_PY = ROOT / "atom" / "model_engine" / "model_runner.py"
 ENGINE_CORE_PY = ROOT / "atom" / "model_engine" / "engine_core.py"
 HOOK_PY = ROOT / "atom" / "aiter_fused_ops.py"
 ATTN = "atom.model_ops.qwen4_exp.qsa_attention"
-# The frozen golden scorer source aiter's contract is written against
-# (ATOM 8a07708's qsa.py, unchanged through 10b99a08): CRLF / LF sha256.
-FROZEN_QSA_SHA256 = "aaa78f43255cf950bfbdf5d618246f9a7a671f0262cff2398b2ca4ea703810ee"
-FROZEN_QSA_SHA256_LF = (
-    "c2e46e50cd9b8bdbdc4b6a09b29cafc5c971dfff4246799a3c8dc32f8b4d14b9"
+# The frozen golden scorer source aiter's contract is written against: ATOM
+# 8a07708's qsa.py (whole file, unchanged through 10b99a08: sha256 c2e46e50...
+# LF / aaa78f43... CRLF). Main's #2847 split the selection loop into
+# `_selection_widths` / `qsa_select_paged_groups` / `qsa_select_paged_tokens`
+# (whole file at 920a200a: f8f04ab3... LF / 683a9528... CRLF) and left the
+# rest -- the scorer, its kernels and helpers -- unchanged. This pins that
+# rest: qsa.py's lines outside the selection entries (which the AST tests
+# below compare instead), LF, blank lines dropped.
+SELECTION_ENTRIES = (
+    "_selection_widths",
+    "qsa_select_paged_groups",
+    "qsa_select_paged_tokens",
+)
+FROZEN_QSA_SCORER_SHA256 = (
+    "4f48345db70873741e487d68aaff441997fa90e77438c7af2bf53b126d9d5b7f"
 )
 P = "qsa-index-scorer-provider"
 
@@ -211,10 +221,26 @@ def _func(path: Path, name: str) -> ast.FunctionDef:
     raise AssertionError(f"{name} not found in {path}")
 
 
+def _scorer_section_sha256(path: Path) -> str:
+    src = path.read_bytes().decode("utf-8").replace("\r\n", "\n")
+    selection = set()
+    for node in ast.parse(src).body:
+        if isinstance(node, ast.FunctionDef) and node.name in SELECTION_ENTRIES:
+            first = min([d.lineno for d in node.decorator_list] + [node.lineno])
+            selection.update(range(first, node.end_lineno + 1))
+    kept = [
+        line
+        for i, line in enumerate(src.split("\n"), 1)
+        if i not in selection and line.strip()
+    ]
+    return hashlib.sha256("\n".join(kept).encode()).hexdigest()
+
+
 def test_qsa_py_is_the_frozen_scorer():
-    lf = QSA_PY.read_bytes().replace(b"\r\n", b"\n")
-    assert hashlib.sha256(lf).hexdigest() == FROZEN_QSA_SHA256_LF
-    assert hashlib.sha256(lf.replace(b"\n", b"\r\n")).hexdigest() == FROZEN_QSA_SHA256
+    """Everything in qsa.py but the selection entries is 8a07708's."""
+    assert _scorer_section_sha256(QSA_PY) == FROZEN_QSA_SCORER_SHA256
+    for name in SELECTION_ENTRIES:
+        _func(QSA_PY, name)
 
 
 def test_observer_binding_is_atom_scorer_signature():
@@ -244,10 +270,25 @@ def _body(fn):
     return body
 
 
-def test_select_copy_is_stock_select_with_scorer_injected():
-    stock = _func(QSA_PY, "qsa_select_paged_tokens")
-    mine = _func(SELECT_PY, "qsa_select_paged_tokens_with_scorer")
-    want = [ast.dump(_RenameScorer().visit(s)) for s in _body(stock)]
+class _InjectScorerIntoGroups(ast.NodeTransformer):
+    """``qsa_select_paged_groups(...)`` -> ``..._with_scorer(..., scorer=scorer)``."""
+
+    def visit_Call(self, node):
+        self.generic_visit(node)
+        if getattr(node.func, "id", None) == "qsa_select_paged_groups":
+            node.func = ast.Name(
+                id="qsa_select_paged_groups_with_scorer", ctx=ast.Load()
+            )
+            node.keywords.append(
+                ast.keyword(arg="scorer", value=ast.Name(id="scorer", ctx=ast.Load()))
+            )
+        return node
+
+
+def _assert_copy(stock_name, transform):
+    stock = _func(QSA_PY, stock_name)
+    mine = _func(SELECT_PY, f"{stock_name}_with_scorer")
+    want = [ast.dump(transform.visit(s)) for s in _body(stock)]
     assert [ast.dump(s) for s in _body(mine)] == want, "re-sync select.py with qsa.py"
     assert [a.arg for a in mine.args.args] == [a.arg for a in stock.args.args]
     assert [ast.dump(d) for d in mine.args.defaults] == [
@@ -256,12 +297,30 @@ def test_select_copy_is_stock_select_with_scorer_injected():
     assert [a.arg for a in mine.args.kwonlyargs] == ["scorer"]
 
 
+def test_groups_copy_is_stock_groups_with_scorer_injected():
+    """The score + top-k loop (#2847's `qsa_select_paged_groups`)."""
+    _assert_copy("qsa_select_paged_groups", _RenameScorer())
+
+
+def test_select_copy_is_stock_select_with_scorer_injected():
+    """The whole-batch entry: the stock wrapper over the groups copy."""
+    _assert_copy("qsa_select_paged_tokens", _InjectScorerIntoGroups())
+
+
 def test_no_atom_fallback_in_the_scoring_path():
-    """select.py never names ATOM's scorer; the package has no route,
-    decide/launch or retry machinery left."""
+    """select.py never names ATOM's scorer or its stock selection entries;
+    the package has no route, decide/launch or retry machinery left."""
     src = SELECT_PY.read_text(encoding="utf-8")
     names = {n.id for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Name)}
+    names |= {
+        a.name
+        for n in ast.walk(ast.parse(src))
+        if isinstance(n, ast.ImportFrom)
+        for a in n.names
+    }
     assert "qsa_paged_mqa_logits" not in names
+    assert "qsa_select_paged_groups" not in names
+    assert "qsa_select_paged_tokens" not in names
     files = {p.name for p in PKG.glob("*.py")}
     assert files == {"__init__.py", "enablement.py", "select.py", "capture.py"}
     for p in PKG.glob("*.py"):
@@ -302,6 +361,11 @@ def test_attention_imports_the_package_only_when_active():
     assert (
         "qsa_select_paged_tokens if self.qsa_select is None else self.qsa_select" in src
     )
+    groups_switch = (
+        "qsa_select_paged_groups if self.qsa_select_groups is None "
+        "else self.qsa_select_groups"
+    )
+    assert groups_switch in " ".join(src.split())
 
 
 # ---------------------------------------------------------------------------
@@ -480,7 +544,8 @@ def stub_load():
 def select_mod(stub_load, monkeypatch):
     S = stub_load("atom.model_ops.qwen4_exp.qsa_index_scorer.select")
     monkeypatch.setattr(S, "top_k_per_row_prefill", lambda *a, **k: None)
-    monkeypatch.setattr(S, "qsa_expand_block_indices", lambda *a, **k: None)
+    # The stock expansion fills and returns `out` (7th positional).
+    monkeypatch.setattr(S, "qsa_expand_block_indices", lambda *a, **k: a[6])
     return S
 
 
@@ -517,6 +582,29 @@ def test_select_scores_through_the_routed_op_with_all_12_args(
         assert c["stacked_decode"] is None
 
 
+def test_row_sharded_groups_score_through_the_routed_op(select_mod, fake_aiter):
+    """#2847's row-sharded entry (`qsa_select_paged_groups`) on the op too."""
+    _api, calls = fake_aiter()
+    (q, cache, table, t2r, pos, ctx), _ = call_args(rows=6)
+    groups, width = select_mod.qsa_select_paged_groups_with_scorer(
+        q,
+        cache,
+        table,
+        t2r,
+        pos,
+        ctx,
+        64,
+        4,
+        logits_workspace_bytes=4 * 64 * 4,  # 4 rows per chunk -> 2 chunks
+        max_seq_len=200,
+        scorer=E.index_scorer(cfg()),
+    )
+    assert groups.shape == (6, 16) and groups.dtype == torch.int32
+    assert width == 16 * 4 + 3
+    assert [c["rows"] for c in calls["op"]] == [4, 2]
+    assert all(c["max_columns"] == 64 for c in calls["op"])
+
+
 def test_op_errors_propagate_without_an_atom_fallback(
     stub_load, select_mod, fake_aiter, monkeypatch
 ):
@@ -535,7 +623,7 @@ def test_op_errors_propagate_without_an_atom_fallback(
     assert len(calls["op"]) == 1
 
 
-def _fake_layer(M, monkeypatch, qsa_select):
+def _fake_layer(M, monkeypatch, qsa_select, qsa_select_groups=None):
     for name in ("qsa_store_rows", "qsa_store_quantized_rows"):
         monkeypatch.setattr(M, name, lambda *a, **k: None)
     monkeypatch.setattr(
@@ -556,6 +644,7 @@ def _fake_layer(M, monkeypatch, qsa_select):
         compressed_key_cache="ccache",
         compressed_key_scale=None,
         qsa_select=qsa_select,
+        qsa_select_groups=qsa_select_groups,
     )
 
 
@@ -605,6 +694,53 @@ def test_call_site_flag_on_injects_the_routed_op(stub_load, fake_aiter, monkeypa
     assert scorer is api.qsa_paged_mqa_logits
     assert a[:2] == ("index_q", "ccache") and k["compressed_k_scale"] is None
     assert k["allow_flydsl"] is False and k["max_seq_len"] == 128
+
+
+@pytest.mark.parametrize("on", [False, True])
+def test_row_sharded_call_site_switches_with_the_flag(
+    stub_load, fake_aiter, monkeypatch, on
+):
+    """#2847's row-sharded selection (`rows` given) takes the stock
+    `qsa_select_paged_groups` when off and the routed op when on; the
+    whole-batch entry is never called on that path."""
+    M = stub_load(ATTN)
+    api, _ = fake_aiter()
+    seen, expanded = [], []
+
+    def groups(*a, **k):
+        seen.append((a, k))
+        return torch.zeros(a[0].shape[0], 16, dtype=torch.int32), 67
+
+    for name in ("qsa_select_paged_tokens", "qsa_select_paged_groups"):
+        monkeypatch.setattr(
+            M, name, lambda *a, _n=name, **k: pytest.fail(f"{_n} called")
+        )
+    if not on:
+        monkeypatch.setattr(M, "qsa_select_paged_groups", groups)
+    monkeypatch.setattr(
+        M, "qsa_expand_block_indices", lambda *a, **k: expanded.append((a, k))
+    )
+    layer = _fake_layer(
+        M,
+        monkeypatch,
+        qsa_select=None,
+        qsa_select_groups=(
+            functools.partial(groups, scorer=E.index_scorer(cfg())) if on else None
+        ),
+    )
+    layer.indexer.project_qk = lambda h, p: (torch.zeros(6, 4, 128), "raw_key")
+    meta = _qsa_meta()
+    meta.token_to_req = torch.zeros(6, dtype=torch.int32)
+    meta.logical_positions = torch.arange(6)
+    rows = SimpleNamespace(start=4, chunk=4, num_tokens=6, gather=lambda g: g)
+    M.Qwen4ExpAttention._select_tokens(
+        layer, torch.zeros(6), torch.zeros(6), meta, rows
+    )
+    ((a, k),) = seen
+    assert a[0].shape[0] == 2 and a[1] == "ccache"  # this rank's rows 4..5
+    assert (k.get("scorer") is api.qsa_paged_mqa_logits) is on
+    ((ea, ek),) = expanded
+    assert ea[0].shape == (4, 16) and ek["output_width"] == 67
 
 
 def test_layer_exposes_its_caches_for_prewarm_only_when_on(stub_load):
