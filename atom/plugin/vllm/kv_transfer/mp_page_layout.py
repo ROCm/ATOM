@@ -141,10 +141,11 @@ def build_mp_transfer_tensors(
             # These bytes live in ``kv_cache_data`` like paged KV but are
             # indexed in the recurrent group's own block space, so ``base +
             # block_id * unit_bytes`` on the attention block table addresses
-            # someone else's state. The plugin refuses a recurrent group on
-            # the MP backend long before here; reaching it means that refusal
-            # has a hole, and continuing would publish a layout whose every
-            # later check passes.
+            # someone else's state. The plugin never passes a recurrent
+            # group here: only the attention group's layers are published as
+            # PAGE, and a mamba group's state rides them as image units
+            # (`kda_ride`). Reaching it means that split has a hole, and
+            # continuing would publish a layout whose every later check passes.
             raise ValueError(
                 f"ATOM LMCache MP: layer {layer_num} is per-request recurrent "
                 "state, not paged KV; no block-addressed transport may move it"

@@ -644,8 +644,9 @@ class PageUnitCheckpointStore:
         READY and nowhere else: `begin_store` is too early (the scatter has not
         ridden a batch, so the units hold no image yet) and `_evict`/`unindex`
         are too late (they fire when the pool wants those units *now*). READY is
-        when the bytes first exist and when the record is least wanted -- it has
-        just entered the LRU at the cold end.
+        when the copy that writes the bytes has been issued -- not run, so the
+        store fences on it -- and when the record is least wanted: it has just
+        entered the LRU at the cold end.
 
         Nomination, not reservation: a queued candidate is unpinned, so
         `_next_victim` may still spend it. The pool never waits on the CPU tier.

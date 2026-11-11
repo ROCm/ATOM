@@ -15,8 +15,14 @@ from types import SimpleNamespace
 
 import pytest
 
+from atom.kv_transfer.offload.mp import scheduler as mp_scheduler
 from atom.kv_transfer.offload.mp import transfer_thread
 from atom.kv_transfer.offload.mp import worker as mp_worker
+from atom.kv_transfer.offload.mp.token_shipping import (
+    TokenShipper,
+    WorkerTokens,
+    token_list,
+)
 
 
 class FakeCudaEvent:
@@ -95,3 +101,23 @@ def settle(worker) -> None:
         assert (
             transfer.wait_round(transfer.request_round(), 5.0) or transfer._poll_failed
         ), "no transfer-thread round finished"
+
+
+def bare_mp_scheduler():
+    """An `LMCacheMPConnectorScheduler` built without `__init__`, with the
+    token shipper its transfers use; tests set the rest."""
+    sched = mp_scheduler.LMCacheMPConnectorScheduler.__new__(
+        mp_scheduler.LMCacheMPConnectorScheduler
+    )
+    sched._token_shipper = TokenShipper()
+    return sched
+
+
+def shipped_tokens(req):
+    """The token ids (a list) a worker hands the transfer for `req`: a
+    request's first shipment carries its whole prefix (`WorkerTokens`)."""
+    import copy
+
+    meta = SimpleNamespace(requests=[copy.copy(req)])
+    WorkerTokens().resolve(meta)
+    return token_list(meta.requests[0].token_ids)
