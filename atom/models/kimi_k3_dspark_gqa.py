@@ -294,6 +294,9 @@ class KimiK3DSparkGQA(DSparkDraftModel):
 
     block_attention_is_mla = False
     kv_pool_spec = DraftKvPoolSpec()
+    # The base `_sample_block` hands the binding to the head's `sample_block`,
+    # so `DSparkProposer` may arm lossless speculative sampling here.
+    supports_lossless_draft = True
 
     packed_modules_mapping: ClassVar[dict[str, tuple]] = {
         "q_proj": ("qkv_proj", "q"),

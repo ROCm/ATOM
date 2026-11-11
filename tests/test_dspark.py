@@ -3087,6 +3087,49 @@ def test_non_mla_block_drafts_skip_the_csr_and_the_mla_plan(
     assert md.kv_indices is None and md.kv_indptr is None
 
 
+def test_lossless_sampling_arms_on_the_built_gqa_draft(monkeypatch):
+    """`DSparkLossless.arm` accepts the built `KimiK3DSparkGQA` under DCP 8:
+    the flavor declares a sampled block, its block is as wide as the verify,
+    and the fused sampled op runs its Markov tables."""
+    if not torch.cuda.is_available():
+        pytest.skip("needs a GPU: the fused op's weight check wants CUDA tables")
+    proposer = importlib.import_module("atom.spec_decode.dspark_proposer")
+    dspark_lossless = importlib.import_module("atom.spec_decode.dspark_lossless")
+    monkeypatch.setenv("ATOM_SPEC_LOSSLESS_SAMPLING", "1")
+    monkeypatch.delenv("ATOM_ENABLE_RELAXED_MTP", raising=False)
+    # A unit test has no PCP group; PCP 1 is the deployment under test.
+    monkeypatch.setattr(dspark_lossless, "get_pcp_world_size", lambda: 1)
+    draft, _ = _non_mla_draft(
+        monkeypatch,
+        "atom.models.kimi_k3_dspark_gqa",
+        "KimiK3DSparkGQA",
+        dcp=8,
+        max_model_len=256,
+        block_size=128,
+    )
+    # The served Markov tables: bf16, on the GPU.
+    draft.markov_head.to("cuda", torch.bfloat16)
+    p = proposer.DSparkProposer.__new__(proposer.DSparkProposer)
+    p.config = types.SimpleNamespace(
+        max_num_seqs=8,
+        pipeline_parallel_size=1,
+        kv_transfer_config={},
+        enable_rapidserve=False,
+        disagg_is_decode=False,
+    )
+    p.speculative_config = types.SimpleNamespace(synthetic_acceptance_rates=None)
+    p.device = torch.device("cuda")
+    p.runner = types.SimpleNamespace(rank=0)
+    p.metadata_buffers = {}
+    p.mtp_k = 7
+    p.model = draft
+
+    assert draft.supports_lossless_draft
+    assert p.draft_tokens_per_seq == p.mtp_k
+    assert dspark_lossless.lossless_unsupported_reason(p) is None
+    assert dspark_lossless.DSparkLossless.arm(p) is not None
+
+
 @pytest.mark.parametrize(
     "module,cls_name,is_mla",
     [

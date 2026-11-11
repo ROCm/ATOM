@@ -515,7 +515,7 @@ class KimiK3DSpark(DSparkDraftModel):
     ``packed_modules_mapping``.
     """
 
-    # `_sample_block` below hands the binding to the head's `sample_block`,
+    # The base `_sample_block` hands the binding to the head's `sample_block`,
     # so `DSparkProposer` may arm lossless speculative sampling here.
     supports_lossless_draft = True
 
