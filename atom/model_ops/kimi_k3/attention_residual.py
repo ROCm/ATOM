@@ -264,8 +264,7 @@ def _apply_attn_res_impl(
     if quant and not out_norm:
         raise ValueError("quant_dtype requires out_norm_weight")
     fp8_max = float(torch.finfo(quant_dtype).max) if quant else 1.0
-    # The kernel indexes [T, B] by stride: only H must be unit-stride.
-    br = block_residual if block_residual.stride(-1) == 1 else block_residual.contiguous()
+    br = block_residual.contiguous()
     ps = prefix_sum.contiguous()
     sw = score_weight.contiguous()
     y = torch.empty(
