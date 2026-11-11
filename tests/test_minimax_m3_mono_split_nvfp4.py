@@ -27,6 +27,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 from atom.models.minimax_m3.mono.config import HEAD_DIM
+from atom.models.minimax_m3.mono.kernels.common import KV_V_SCALE_AT, nvfp4_k_scale_at
 from atom.models.minimax_m3.mono.kernels.split_nvfp4 import build_split_nvfp4_kernel
 from atom.models.minimax_m3.mono.layout import N_SPLIT, O_K, SPLIT_KEYS, H
 
@@ -111,8 +112,18 @@ def _reference(ref, pages, page_of, sel, q, n_keys, k_gs, v_gs):
         (3, 2, 50, 1.0, 1.0),
     ],
 )
-def test_split_partitions_match_the_exact_reference(n_logical, n_sel, tail, k_gs, v_gs):
+@pytest.mark.parametrize("poison", [False, True])
+def test_split_partitions_match_the_exact_reference(
+    n_logical, n_sel, tail, k_gs, v_gs, poison
+):
     ref, pages, page_of, sel, q, _ctx, _ = _case(1, n_logical, n_sel, tail, k_gs, v_gs)
+    if poison:  # the tail block's keys past the context: NaN scales (stale bytes)
+        last = pages[int(page_of[sel[-1]])]
+        for t in range(tail, 128):
+            for j in range(8):
+                last[8192 + nvfp4_k_scale_at(t, j)] = 0xFF
+            for j in range(8):
+                last[KV_V_SCALE_AT + j * 128 + t] = 0xFF
     tbl, n_keys, _n_part = _tables(page_of, sel, tail, 1)
     gs = torch.tensor([k_gs, v_gs], device="cuda", dtype=torch.float32)
     sp_o = torch.zeros(N_SPLIT, O_K, device="cuda", dtype=torch.bfloat16)

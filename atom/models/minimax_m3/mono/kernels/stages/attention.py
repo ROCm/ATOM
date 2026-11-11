@@ -14,6 +14,7 @@ from flydsl.expr.typing import T
 from atom.models.minimax_m3.mono.config import HEAD_DIM, HIDDEN, MAX_TOKENS, PAGE16
 from atom.models.minimax_m3.mono.kernels.common import ld_bf16x4, per_token_fp8_scale
 from atom.models.minimax_m3.mono.kernels.pre_attn import N_HEAD_TASKS as K1_HEAD_TASKS
+from atom.models.minimax_m3.mono.kernels.split_nvfp4 import split_nvfp4_task
 from atom.models.minimax_m3.mono.kernels.stages.shared import NEG, PAGE_BYTES
 from atom.models.minimax_m3.mono.layout import (
     N_O,
@@ -307,7 +308,55 @@ def split_defs(k4ctx):
                 mb_put(mr("sp_l"), ts * H + tid, lt)
             gpu.barrier()
 
-    return {"stage_split": stage_split}
+    def stage_split_nvfp4():
+        """``stage_split`` over single-buffer NVFP4 K/V pages (``k_cache`` the pool,
+        ``k_scale`` / ``v_scale`` the layer's f32 global scales): the task of
+        ``split_nvfp4_task``, the same page lists, flags and hand-offs."""
+        kg = fx.Float32(bo.buffer_load(rsrc(k_scale), 0, vec_width=1, dtype=T.f32))
+        vg = fx.Float32(bo.buffer_load(rsrc(v_scale), 0, vec_width=1, dtype=T.f32))
+        for ts in range(start("split"), N_SPLIT * tokens, G):
+            ts = fx.Int32(ts)
+            tok = ts // N_SPLIT
+            t = ts % N_SPLIT
+            task_blocks(tok, t)
+            stamp(17)
+            if const_expr(fuse_k1):
+                if wave == 0:
+                    kv = lane - H
+                    k1_poll(
+                        [
+                            (
+                                hdone_mb,
+                                (lane < H).select(
+                                    tok * K1_HEAD_TASKS + lane,
+                                    fx.min(kv // 2, tokens - 1) * K1_HEAD_TASKS
+                                    + H
+                                    + kv % 2,
+                                ),
+                                1,
+                            )
+                        ]
+                    )
+                gpu.barrier()
+                acquire()
+            n_ctx = uniform(fx.ptr_load(blk + 16))
+
+            # (the task runs them before the loop moves on: ``ts`` is this task's)
+            def put_o(e0, ov):
+                mb_put_bf(mr("sp_o"), ts * O_K + e0, ov)  # noqa: B023
+
+            def put_m(head, m):
+                mb_put(mr("sp_m"), ts * H + head, m)  # noqa: B023
+
+            def put_l(head, lt):
+                mb_put(mr("sp_l"), ts * H + head, lt)  # noqa: B023
+
+            split_nvfp4_task(
+                tid, lane, wave, tok, t, blk, q, k_cache, kg, vg, sm_scale, hst, opart,
+                n_ctx, put_o, put_m, put_l, CM_K1, stamp,
+            )  # fmt: skip
+
+    return {"stage_split": stage_split, "stage_split_nvfp4": stage_split_nvfp4}
 
 
 @traced

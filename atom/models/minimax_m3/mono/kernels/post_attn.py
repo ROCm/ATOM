@@ -164,6 +164,8 @@ class K4Build:
     xn_flag: int = 0
     shared_mxfp8: bool = False
     mid_flag: int = 0
+    kv_nvfp4: bool = False
+    index_nvfp4: bool = False
 
 
 def build_post_attn_kernel(
@@ -184,6 +186,8 @@ def build_post_attn_kernel(
     xn_flag: int = 0,
     shared_mxfp8: bool = False,
     mid_flag: int = 0,
+    kv_nvfp4: bool = False,
+    index_nvfp4: bool = False,
 ):
     """``@flyc.jit`` launcher of K4 for one rank of an ``npes``-way TP group and a
     decode step of ``tokens`` (<= MAX_TOKENS) rows, ``q_len`` consecutive rows a
@@ -198,8 +202,13 @@ def build_post_attn_kernel(
     expert is not one of the MXFP4 experts (``w13`` / ``w2`` hold the routed 128)
     but an MXFP8 MLP of its own (``w13s`` / ``s13s`` / ``w2s`` / ``s2s``: (16, 16)-
     preshuffled fp8 weights and their row-major per-1x32 E8M0 scales), run by the narrow MoE as its shared window, by the wide one as task pairs after
-    the grouped loop.
+    the grouped loop. ``kv_nvfp4`` / ``index_nvfp4``: the K/V pool / the index cache
+    hold single-buffer NVFP4 pages: K4's split reads them (``split_nvfp4``; ``k_cache``
+    and ``v_cache`` are both the pool, ``k_scale`` / ``v_scale`` the layer's f32 global
+    scales), and with ``fuse_k1`` K1 writes and scores them. The index cache is read
+    only by K1's scores, so ``index_nvfp4`` needs ``fuse_k1`` here.
     """
+    assert not index_nvfp4 or fuse_k1, "the index cache is read by K1's scores"
     assert 1 <= tokens <= MAX_TOKENS
     key = K4Build(
         npes=npes, tokens=tokens, init_blocks=init_blocks, local_blocks=local_blocks,
@@ -207,7 +216,8 @@ def build_post_attn_kernel(
         index_topk=index_topk, fuse_k1=fuse_k1, sm_scale=sm_scale, eps=eps,
         route_scale=route_scale, shared_weight=shared_weight,
         swiglu_limit=swiglu_limit, debug=debug, xn_flag=xn_flag,
-        shared_mxfp8=shared_mxfp8, mid_flag=mid_flag,
+        shared_mxfp8=shared_mxfp8, mid_flag=mid_flag, kv_nvfp4=kv_nvfp4,
+        index_nvfp4=index_nvfp4,
     )  # fmt: skip
     build_key = key_tuple(key, SOURCES)  # the launcher references it: keyed
     # a debug build's wait records name a region by its ``region_id``
@@ -451,6 +461,8 @@ def build_post_attn_kernel(
                 diag,
                 REGION_IDS,
                 index_topk,
+                kv_nvfp4=kv_nvfp4,
+                index_nvfp4=index_nvfp4,
             )  # fmt: skip
             gpu.barrier()
             k1_mbox = Mailbox(layer, diag, REGION_IDS)
@@ -486,7 +498,7 @@ def build_post_attn_kernel(
 
         k4ctx.update(locals())
         k4ctx.update(split_defs(k4ctx))
-        stage_split = k4ctx["stage_split"]
+        stage_split = k4ctx["stage_split_nvfp4" if kv_nvfp4 else "stage_split"]
 
         if const_expr(index_topk):
             enter_stage("select_long")
