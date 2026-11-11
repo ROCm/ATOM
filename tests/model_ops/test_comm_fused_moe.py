@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ast
 import importlib
+import sys
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -688,6 +689,7 @@ def test_dsv4_single_stream_dispatches_by_token_support(atom_modules, supported)
         before_stage2_for_rows=None,
         before_shared_add=None,
         stage2_stream=None,
+        shared_ready=None,
     )
 
 
@@ -699,8 +701,13 @@ def test_dsv41_override_matches_stage2_callback_contract():
         for node in ast.walk(tree)
         if getattr(node, "name", None) == "routed_expert_forward"
     )
-    callbacks = ["before_stage2_for_rows", "before_shared_add", "stage2_stream"]
-    assert [argument.arg for argument in method.args.args[-3:]] == callbacks
+    callbacks = [
+        "before_stage2_for_rows",
+        "before_shared_add",
+        "stage2_stream",
+        "shared_ready",
+    ]
+    assert [argument.arg for argument in method.args.args[-4:]] == callbacks
     call = next(
         node
         for node in ast.walk(method)
@@ -733,6 +740,7 @@ def test_dsv4_comm_fused_dual_stream_requires_shared_join(
     moe.shared_experts = MagicMock()
     moe.shared_experts.forward.return_value = shared
     moe.routed_expert_forward = MagicMock(side_effect=run_fused)
+    moe.experts = SimpleNamespace(combine_accepts_shared=lambda rows: False)
     moe.combine_outputs = MagicMock()
     if join_shared:
         result = atom_modules.deepseek_v4.MoE.dual_stream_moe_forward(
@@ -748,58 +756,134 @@ def test_dsv4_comm_fused_dual_stream_requires_shared_join(
     assert alt_stream.wait_stream.call_args_list[0].args == (routed_stream,)
 
 
-@pytest.mark.parametrize("consumed", [False, True])
-def test_dsv4_shared_in_combine_adds_the_shared_output_once(
-    monkeypatch, atom_modules, consumed
+def test_dsv4_dual_stream_hands_the_shared_output_to_the_combine(
+    monkeypatch, atom_modules
 ):
-    """The routed combine either adds the shared output (and marks it
-    consumed) or leaves it to the caller: the sum has it exactly once."""
+    """Where the routed combine adds the shared output, the dual-stream path
+    hands it down through `routed_expert_forward` with the event recorded on
+    the side stream, and neither joins the streams nor adds it again."""
     moe = _new_v4_moe(atom_modules)
     hidden_states = torch.randn(4, 8)
     routed = torch.randn_like(hidden_states)
-    shared = torch.randn_like(hidden_states)
+    shared = MagicMock(name="shared")
     routed_stream, alt_stream = _mock_streams(monkeypatch, atom_modules)
-    monkeypatch.setattr(
-        atom_modules.deepseek_v4.torch.cuda, "Event", lambda: MagicMock(name="ready")
-    )
-    monkeypatch.setattr(torch.Tensor, "record_stream", lambda _self, _stream: None)
-    experts = _new_fused_moe(atom_modules)
-    experts.combine_accepts_shared = lambda rows: True
-    seen = []
-
-    def fused_experts(_x, _router_logits, _shared_partial):
-        pending = experts.pending_shared_add()
-        seen.append(pending)
-        if not consumed:
-            return routed, False
-        pending.consumed = True
-        return routed + pending.tensor, False
-
-    experts.forward_maybe_comm_fused = fused_experts
-    moe.experts = experts
+    ready = MagicMock(name="shared_ready")
+    monkeypatch.setattr(atom_modules.deepseek_v4.torch.cuda, "Event", lambda: ready)
     moe.alt_stream = alt_stream
-    moe.gate = MagicMock(return_value=torch.zeros(4, 2))
+    moe.experts = SimpleNamespace(combine_accepts_shared=lambda rows: rows == 4)
     moe.shared_experts = MagicMock()
     moe.shared_experts.forward.return_value = shared
-    moe.combine_outputs = lambda out, extra, prefix: (
-        out if extra is None else out + extra
-    )
+    moe.routed_expert_forward = MagicMock(return_value=(routed, False))
+    combined = torch.randn_like(hidden_states)
+    moe.combine_outputs = MagicMock(return_value=combined)
 
     result = atom_modules.deepseek_v4.MoE.dual_stream_moe_forward(moe, hidden_states)
 
-    torch.testing.assert_close(result, routed + shared, rtol=0, atol=0)
-    assert seen[0].tensor is shared and seen[0].consumed is consumed
-    assert experts.pending_shared_add() is None
-    if consumed:
-        routed_stream.wait_stream.assert_not_called()
-    else:
-        routed_stream.wait_stream.assert_called_once_with(alt_stream)
+    assert result is combined
+    moe.routed_expert_forward.assert_called_once_with(
+        hidden_states, shared_partial=shared, shared_ready=ready
+    )
+    ready.record.assert_called_once_with(alt_stream)
+    shared.record_stream.assert_called_once_with(routed_stream)
+    moe.combine_outputs.assert_called_once_with(
+        routed, None, prefix="model.layers.3.mlp.combine_outputs"
+    )
+    routed_stream.wait_stream.assert_not_called()
 
 
-def test_fused_moe_combine_accepts_shared_only_off_the_comm_fused_path(atom_modules):
+def _fused_moe_for_shared_add(atom_modules, *, accepts):
     layer = _new_fused_moe(atom_modules)
-    assert not layer.combine_accepts_shared(4)  # no modular kernel at all
-    layer.quant_method = SimpleNamespace(fused_experts=object())
-    assert not layer.combine_accepts_shared(4)  # not the mori v2 kernel
-    layer._comm_fused_moe = SimpleNamespace(supports=lambda rows: rows <= 8)
-    assert not layer.combine_accepts_shared(4)  # comm-fused takes this step
+    layer._comm_fused_moe = None
+    layer.balance_router_logits = None
+    layer.combine_accepts_shared = lambda rows: accepts
+    layer.forward_impl = MagicMock(name="forward_impl")
+    return layer
+
+
+def test_fused_moe_hands_the_shared_output_to_the_routed_combine(
+    monkeypatch, atom_modules
+):
+    layer = _fused_moe_for_shared_add(atom_modules, accepts=True)
+    ordinary_forward = MagicMock()
+    monkeypatch.setattr(type(layer), "forward", ordinary_forward)
+    hidden_states = torch.randn(4, 8)
+    router_logits = torch.randn(4, 16)
+    shared = torch.randn_like(hidden_states)
+    ready = MagicMock(name="shared_ready")
+
+    output, is_complete = layer.forward_maybe_comm_fused(
+        hidden_states, router_logits, shared, shared_ready=ready
+    )
+
+    assert output is layer.forward_impl.return_value and is_complete is False
+    layer.forward_impl.assert_called_once_with(
+        hidden_states, router_logits, shared_add=shared, shared_ready=ready
+    )
+    ordinary_forward.assert_not_called()
+
+    # Without the event the shared output stays the caller's to add.
+    output, is_complete = layer.forward_maybe_comm_fused(
+        hidden_states, router_logits, shared
+    )
+    assert output is ordinary_forward.return_value and is_complete is False
+    layer.forward_impl.assert_called_once()
+
+
+def test_fused_moe_refuses_a_shared_output_its_combine_cannot_add(atom_modules):
+    layer = _fused_moe_for_shared_add(atom_modules, accepts=False)
+    hidden_states = torch.randn(4, 8)
+    with pytest.raises(RuntimeError, match="combine_accepts_shared"):
+        layer.forward_maybe_comm_fused(
+            hidden_states,
+            torch.randn(4, 16),
+            torch.randn_like(hidden_states),
+            shared_ready=MagicMock(),
+        )
+    layer.forward_impl.assert_not_called()
+
+
+def test_fused_moe_combine_accepts_shared(monkeypatch, atom_modules):
+    class MoriV2ModularKernel:
+        pass
+
+    monkeypatch.setitem(
+        sys.modules,
+        "atom.model_ops.fused_moe.mori_v2_prepare_finalize",
+        SimpleNamespace(MoriV2ModularKernel=MoriV2ModularKernel),
+    )
+    layer = _new_fused_moe(atom_modules)
+    layer._comm_fused_moe = None
+    layer.sp_mega_moe = None
+    layer.reduce_results = False
+    layer.moe_parallel_config = SimpleNamespace(pcp_merge=False, dp_logical_ratio=1)
+    method = object.__new__(atom_modules.moe.Mxfp4MoEMethod)
+    method.fused_experts = MoriV2ModularKernel()
+    layer.quant_method = method
+    assert layer.combine_accepts_shared(4)
+
+    method.fused_experts = object()  # not the mori v2 kernel
+    assert not layer.combine_accepts_shared(4)
+    method.fused_experts = MoriV2ModularKernel()
+    layer.quant_method = SimpleNamespace(fused_experts=method.fused_experts)
+    assert not layer.combine_accepts_shared(4)  # not the MXFP4 method
+    layer.quant_method = method
+
+    refusals = [
+        ("_comm_fused_moe", SimpleNamespace(supports=lambda rows: rows <= 8)),
+        ("sp_mega_moe", SimpleNamespace(runs=lambda rows: True)),
+        ("reduce_results", True),
+        (
+            "moe_parallel_config",
+            SimpleNamespace(pcp_merge=True, dp_logical_ratio=1),
+        ),
+        (
+            "moe_parallel_config",
+            SimpleNamespace(pcp_merge=False, dp_logical_ratio=2),
+        ),
+    ]
+    for name, value in refusals:
+        kept = getattr(layer, name)
+        setattr(layer, name, value)
+        assert not layer.combine_accepts_shared(4), name
+        setattr(layer, name, kept)
+    assert layer.combine_accepts_shared(4)

@@ -19,10 +19,9 @@ topk_ids carry only routed expert ids and mori routes them cleanly.
 """
 
 import contextlib
-import inspect
 import logging
 import os
-from functools import cache, lru_cache
+from functools import lru_cache
 from types import SimpleNamespace
 from typing import Any
 
@@ -640,15 +639,6 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         )
 
 
-@cache
-def _mega_takes_shared_add(mega_cls) -> bool:
-    try:
-        params = inspect.signature(mega_cls.forward).parameters
-    except (TypeError, ValueError):
-        return False
-    return "shared_add" in params and "shared_ready" in params
-
-
 class MoriV2ModularKernel(mk.FusedMoEModularKernel):
     """Modular kernel for the v2 path.
 
@@ -697,8 +687,14 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
         w2: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        shared_add: torch.Tensor | None = None,
+        shared_ready: torch.cuda.Event | None = None,
         **kwargs,
     ) -> torch.Tensor:
+        """``shared_add``, the shared expert's output handed down by
+        ``FusedMoE.forward_maybe_comm_fused``, is added to the result by
+        MegaMoE's combine; ``shared_ready``, recorded on the stream that
+        produced it, is waited on right before the combine."""
         # Bound in init_prepare_finalize; there is no path without it.
         mega = self.prepare_finalize.mega
         assert mega is not None, "MegaMoE was not bound"
@@ -762,7 +758,7 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
                 and getattr(_ctx, "running_tokens_are_unified", True)
             ):
                 m_eff = _ctx.running_tokens * get_dp_group().world_size
-            return triton_mega_moe(
+            out = triton_mega_moe(
                 mega,
                 hidden_states,
                 topk_weights,
@@ -781,6 +777,13 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
                 recv_token_bound=bound,
                 m_eff=m_eff,
             )
+            if shared_add is None:
+                return out
+            # triton_mega_moe drives MegaMoE's internals, not its forward, so the
+            # shared output is added after its combine.
+            if shared_ready is not None:
+                torch.cuda.current_stream().wait_event(shared_ready)
+            return out + shared_add
 
         assert not kwargs.get(
             "apply_router_weight_on_input", False
@@ -788,11 +791,7 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
         self._assert_recipe_matches(mega, kwargs)
 
         ids = topk_ids.to(torch.int32).contiguous()
-        pending = (kwargs.get("moe_extra_args") or {}).get("shared_add")
-        shared_kw = {}
-        if pending is not None and _mega_takes_shared_add(type(mega)):
-            shared_kw = {"shared_add": pending.tensor, "shared_ready": pending.ready}
-        out = mega(
+        return mega(
             hidden_states.contiguous(),
             topk_weights.to(torch.float32).contiguous(),
             ids,
@@ -808,11 +807,9 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
                 self.prepare_finalize.num_dispatchers() * mega.max_tokens_per_rank,
             ),
             combine_wire=self.prepare_finalize.combine_wire_for_step(),
-            **shared_kw,
+            shared_add=shared_add,
+            shared_ready=shared_ready,
         )
-        if shared_kw:
-            pending.consumed = True
-        return out
 
     @staticmethod
     def _assert_recipe_matches(mega, kwargs: dict) -> None:
