@@ -393,12 +393,11 @@ def test_fused_seam_head_block_matches_a_program_a_head(monkeypatch, heads, sink
     "cus, tokens, fp8_heads",
     [(256, 1, 1), (256, 63, 1), (256, 64, 8), (80, 19, 1), (80, 20, 8)],
 )
-def test_fp8_query_groups_heads_once_the_grid_fills_the_cus(
+def test_fp8_query_groups_heads_from_two_programs_a_cu(
     monkeypatch, cus, tokens, fp8_heads
 ):
     """64 heads quantize 8 a program from 2 grouped query programs a CU on
-    (64 tokens on 256 CUs, 20 on 80); fewer keep a program a head, which is
-    faster there."""
+    (64 tokens on 256 CUs, 20 on 80) and keep a program a head below."""
     from atom.model_ops.blockscale import quantize_fp8
     from atom.model_ops.deepseek_v41 import rope_window
 
