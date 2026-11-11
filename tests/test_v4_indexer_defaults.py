@@ -12,7 +12,7 @@ import torch
 from transformers import PretrainedConfig
 
 import atom.config as config_module
-from atom.config import CompilationConfig, Config
+from atom.config import CompilationConfig, Config, SpeculativeConfig
 
 _V4_KERNELS_INIT = (
     Path(__file__).resolve().parents[1] / "atom/model_ops/v4_kernels/__init__.py"
@@ -117,14 +117,53 @@ def _make_config(
 
     probe = _GfxProbe(gfx)
     _install_chip_info_stub(monkeypatch, probe)
+    # a V4 asking for fp8 KV is probed for its arch (the fp8 -> bf16 fallback), which
+    # the tests of the indexer default's own probing leave out of their counts
+    kv = "bf16" if architectures is None or "Llama" not in architectures[0] else "fp8"
     config = Config(
         model="test-model",
         torch_profiler_dir=None,
         compilation_config=CompilationConfig(level=0, use_cudagraph=False),
-        **{"kv_cache_dtype": "fp8", **overrides},
+        **{"kv_cache_dtype": kv, **overrides},
     )
     config.quant_config = None
     return config, probe
+
+
+@pytest.mark.parametrize(
+    "gfx, kv", [("gfx950", "fp8"), ("gfx1250", "fp8"), ("gfx942", "bf16")]
+)
+def test_v4_fp8_kv_is_settled_by_config_with_the_arch_aiter_serves_it_on(
+    monkeypatch, gfx, kv
+):
+    """aiter's V4 fp8 (2buff) KV runs on gfx950 / gfx1250 only; elsewhere `Config`
+    makes the KV bf16 itself, so a speculative draft resolved after it (it shares the
+    target's pool) is not left asking for fp8 against a bf16 pool."""
+    monkeypatch.setattr(SpeculativeConfig, "_resolve_synthetic_acceptance", lambda s: 0)
+    spec = SpeculativeConfig(
+        method="dspark",
+        model="draft",
+        num_speculative_tokens=3,
+        draft_model_hf_config=PretrainedConfig(architectures=["DeepseekV4DSparkModel"]),
+    )
+    config, _ = _make_config(
+        monkeypatch, gfx=gfx, kv_cache_dtype="fp8", speculative_config=spec
+    )
+
+    assert config.kv_cache_dtype == kv
+    assert spec.kv_cache_dtype == kv
+
+
+def test_v4_fp8_fallback_is_not_applied_under_a_plugin(monkeypatch):
+    config, probe = _make_config(
+        monkeypatch,
+        gfx="gfx942",
+        kv_cache_dtype="fp8",
+        plugin_config=SimpleNamespace(is_vllm=False, vllm_config=None),
+    )
+
+    assert config.kv_cache_dtype == "fp8"
+    assert probe.calls == 0
 
 
 @pytest.mark.parametrize("gfx", ["gfx950", "gfx1250", "future_gfx"])
@@ -246,7 +285,7 @@ def test_non_fp4_indexer_predicate_does_not_query_arch(monkeypatch):
 
 
 def test_v4_keeps_its_fp4_indexer_and_refuses_a_fp4_kv(monkeypatch):
-    config, _ = _make_config(monkeypatch, index_cache_dtype="fp4")
+    config, _ = _make_config(monkeypatch, kv_cache_dtype="fp8", index_cache_dtype="fp4")
     assert (config.kv_cache_dtype, config.index_cache_dtype) == ("fp8", "fp4")
 
     with pytest.raises(ValueError, match="MiniMax-M3 and DeepSeek-V4.1 only"):
