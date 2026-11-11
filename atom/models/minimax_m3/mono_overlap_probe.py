@@ -41,6 +41,19 @@ _STATE = {"last_n": None, "run": 0, "done": set(), "spec": None}
 MAX_LAYER_ID = 64
 
 
+def split_variant(text):
+    """(probe string, build kwargs): ``bp.<name>=<int>`` terms of a variant are build
+    parameters (an optimization under test), the rest is the probe."""
+    kw, rest = {}, []
+    for t in filter(None, (t.strip() for t in text.split(";"))):
+        if t.startswith("bp."):
+            k, _, v = t[3:].partition("=")
+            kw[k] = int(v)
+        else:
+            rest.append(t)
+    return ";".join(rest), kw
+
+
 def _spec():
     if _STATE["spec"] is None:
         path = os.environ.get("ATOM_MONO_OVERLAP_PROBE", "")
@@ -211,9 +224,12 @@ def run_probe(runner, input_ids, positions, n, spec) -> None:
     for name, probe in variants.items():
         if probe in ("@begin", "@beginN"):
             continue
+        probe, bkw = split_variant(probe)
         parse(probe)  # a malformed probe fails here, on every rank
         launchers[name] = {
-            k: runner._build_k4(n, index_topk=k, **({"probe": probe} if probe else {}))
+            k: runner._build_k4(
+                n, index_topk=k, **bkw, **({"probe": probe} if probe else {})
+            )
             for k in kinds
         }
     items = [
@@ -237,6 +253,7 @@ def run_probe(runner, input_ids, positions, n, spec) -> None:
     # ---- 4. graphs
     graphs = {}
     for name, probe in variants.items():
+        probe = split_variant(probe)[0]
         tl = _ptr(pin) if not probe.startswith("@") and parse(probe).pin else 0
         # a fenced variant (spec "fenced", or "@beginN"): begin_step in front of every layer.
         # A variant that keeps waits but not the FFN all-reduce (exit=, skip=ar2) has no
@@ -266,6 +283,38 @@ def run_probe(runner, input_ids, positions, n, spec) -> None:
             g.replay()
             torch.cuda.synchronize()
     log("graphs captured and replayed once")
+
+    # ---- 4b. bit identity: every layer of every variant vs the "base" variant, same inputs
+    if spec.get("check"):
+        stream = torch.cuda.current_stream()
+
+        def run_layer(name, i):
+            runner.mailboxes.begin_step()
+            a = dict(layer_args[i])
+            a["tl"] = 0
+            _run_compiled(
+                launchers[name][sparse[i].index_topk], *K4_ABI.pack(a), stream
+            )
+            torch.cuda.synchronize()
+            return (
+                out_h[:n].clone().view(torch.int16),
+                out_ar[:n].clone().view(torch.int16),
+            )
+
+        for name in launchers:
+            if name == "base":
+                continue
+            bad = []
+            for i in range(len(sparse)):
+                with _Guard(f"check {name} layer {i}"):
+                    ref = run_layer("base", i)
+                    got = run_layer(name, i)
+                if not all(torch.equal(x, y) for x, y in zip(ref, got)):
+                    bad.append(i)
+            log(
+                f"bit check {name}: {len(sparse) - len(bad)}/{len(sparse)} layers identical"
+                + (f", DIFFER at {bad}" if bad else "")
+            )
 
     # ---- 5. interleaved timing
     rounds, reps, warm = (

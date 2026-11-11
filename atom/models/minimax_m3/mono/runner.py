@@ -279,6 +279,7 @@ class MonoDecodeRunner:
             shared_mxfp8=self.shared_mxfp8,
             kv_nvfp4=self.nvfp4,
             index_nvfp4=self.nvfp4,
+            sh_first=envs.ATOM_MONO_SH_FIRST,
         )
         # a dense layer's kernels around its original attention
         if self.dense_mono:

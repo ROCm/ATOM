@@ -630,6 +630,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MiniMax-M3 mono: log (rank 0) how many decode steps took mono and how many the
     # original path, by token count, every this many counted decode steps; 0 off.
     "ATOM_MONO_STATS_EVERY": lambda: int(os.getenv("ATOM_MONO_STATS_EVERY", "0")),
+    # Mono wide MoE with the MXFP8 shared expert: 0 off; k > 0 the shared pairs run first on
+    # their hosts, their tiles loaded before the router's scores arrive, hosts carry k routed pairs fewer.
+    "ATOM_MONO_SH_FIRST": lambda: int(os.getenv("ATOM_MONO_SH_FIRST", "0")),
     # DeepSeek-V4.1: how many of an attention layer's branches leave the main
     # stream. 0 none; 1 the compressor, on the MoE's `alt_stream`, waited at
     # the scorer that first reads it; 2 the indexer as well, on one of its own.
