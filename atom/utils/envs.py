@@ -611,14 +611,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # leaves the fused indexer running exactly as it does with CP off.
     "ATOM_GLM52_INDEXER_CP": lambda: os.getenv("ATOM_GLM52_INDEXER_CP", "0") == "1",
     # Debug: run each mono layer next to the original one and log the difference
-    # (atom/models/minimax_m3/mono/check.py). Use with --enforce-eager.
+    # (atom/models/minimax_m3/mono/check.py; the gfx1250 V4.1 step: the launch
+    # beside the production forward, mono/gfx1250/debug.py). Use with --enforce-eager.
     "ATOM_MONO_CHECK": lambda: os.getenv("ATOM_MONO_CHECK", "0") == "1",
     # Debug: append every mono step's input tokens, positions and top-2 logits to
     # this file (rank 0; check.trace_logits). Use with --enforce-eager.
     "ATOM_MONO_TRACE": lambda: os.getenv("ATOM_MONO_TRACE"),
     # Debug: the mono layer kernels' per-phase stamps, a few steps per decode
-    # token count saved under this path prefix (mono/timeline.py). Use with
-    # --enforce-eager.
+    # token count saved under this path prefix (mono/timeline.py; the gfx1250
+    # V4.1 step: where its time goes, averaged every 64 steps, logged and
+    # appended to <prefix>_r<rank>.jsonl). Use with --enforce-eager.
     "ATOM_MONO_TIMELINE": lambda: os.getenv("ATOM_MONO_TIMELINE"),
     # Debug: the mono kernels bound every mailbox wait (10 s): a wait that gives up
     # records its region, pair and tags, and the runner raises with them at the end
@@ -632,6 +634,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # periods and the noise floor under them are in the environment doc, and
     # end-to-end throughput is too coarse to see an effect that size.
     "ATOM_DSV41_SIDE_STREAMS": lambda: int(os.getenv("ATOM_DSV41_SIDE_STREAMS", "0")),
+    # DeepSeek-V4.1 mono decode's high-interactivity (hi) monokernels (the
+    # `mono/hi` package, imported only with this on): on the decode steps it
+    # serves, every decoder layer, the verify head, the DSpark draft and the
+    # round's glue run the hi programs (atom/models/deepseek_v41/mono/hi_*.py).
+    # "auto" (default): on for the deployment they serve (MI355X, TP4, BF16 KV,
+    # DSpark, ...: `mono/hi_gate.py`), any other keeps ATOM's mono path; "1":
+    # on, or an error naming why not; "0": off.
+    "ATOM_DSV41_MONO_HI": lambda: os.getenv("ATOM_DSV41_MONO_HI", "auto"),
     # Token-bucket TR graphs for prefill (`atom/utils/region_graph.py`): the
     # comma-separated token counts to record. A prefill longer than the largest
     # runs eagerly; empty records none. The default tops out at 3072 because
@@ -697,7 +707,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # DSpark block sampling: replace the Markov head's
     #   bias = W1[x] @ W2.float().t() ; argmax(base_logits + bias)
-    # with one fused Triton kernel (atom/model_ops/dspark_markov_sample.py).
+    # with one fused Triton kernel (atom/model_ops/dspark_markov_argmax.py).
     # The unfused spelling casts the whole [V, r] W2 table to fp32 INSIDE the
     # T-iteration loop (~252MB of traffic per iteration for a table that never
     # changes) and materializes two [B, V] fp32 tensors per iteration (42MB
@@ -720,9 +730,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # regression is suspected -- the fastest way to rule this kernel in or out,
     # since the two paths are not bit-identical by construction. Read once when
     # the Markov head is built, so it must be set before the server starts.
+    # Once ATOM_SPEC_LOSSLESS_SAMPLING arms, Kimi-K3 honours this only on steps
+    # that replay the greedy block (no row draws q).
     "ATOM_DSPARK_FUSED_MARKOV_SAMPLE": lambda: (
         os.getenv("ATOM_DSPARK_FUSED_MARKOV_SAMPLE", "1") == "1"
     ),
+    # Lossless speculative sampling: the DSpark draft samples its block from q
+    # and the verify accepts by the probability ratio (u * q < p). Off by
+    # default; needs an aiter with ROCm/aiter#6954 under TP; where it arms,
+    # ATOM_ENABLE_RELAXED_MTP is refused. See docs/model_ops_guide.md.
+    "ATOM_SPEC_LOSSLESS_SAMPLING": lambda: _flag_env("ATOM_SPEC_LOSSLESS_SAMPLING"),
     # Replicate the vocab embedding on every TP rank (full table per rank, purely
     # local lookup) instead of TP-sharding it — eliminates the post-embedding
     # all-reduce. Applies to BOTH the main/target model and the speculative draft

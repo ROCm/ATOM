@@ -97,9 +97,12 @@ DSpark, and at DEP4 (EP + DP attention). On gfx1250 its FP8 linears, the grouped
 
 What differs from gfx950:
 
-- **Mono fused decode is gfx950-only** (wave64, `permlane32`). On gfx1250 the
-  deployment check refuses it and logs `V4.1 mono decode off: arch gfx1250`, so
-  `ATOM_MONO_ENABLE` needs no setting. DSpark still runs: its draft passes and
+- **The per-layer mono kernels are gfx950-only** (wave64, `permlane32`). On
+  gfx1250 the deployment check refuses them and logs `V4.1 mono decode off:
+  arch gfx1250`. gfx1250 has its own fused decode instead, the
+  [single-launch step](#gfx1250-single-launch-decode-step), switched like the
+  gfx950 mono decode (`ATOM_MONO_ENABLE`, on by default); with
+  `ATOM_MONO_ENABLE=0`, or a deployment it refuses, DSpark's draft passes and
   verify steps take the original, unfused path.
 - **The router GEMV** (bf16 MFMA) is gfx950-only; gfx1250 uses the regular gate.
 - **FP4 index interface (hardware validation pending).** With
@@ -208,6 +211,53 @@ concurrency 2) the check mode holds as at TP4, and GSM8K 3-shot on the first
 49.2%. At TP8 the kernels compile and fit, but the server does not start on
 the original path: the shared expert's down projection has K = 288 there, and
 AITER's gfx950 FP8 blockscale GEMM needs K to be a multiple of its K tile.
+
+## gfx1250 single-launch decode step
+
+On gfx1250, mono decode (`ATOM_MONO_ENABLE`, on by default) runs each DSpark
+decode step as one
+persistent FlyDSL kernel per TP rank, issued as two launches: the target
+launch covers the 40 target layers, the LM head, sampling and the block
+verification; the draft launch covers the draft context KV, the three draft
+stages, the draft head and the Markov drafts. Inside the kernel:
+
+- the compressor, Engram, the indexer (2-level selection, REINDEX) and the MoE;
+- temperature / top-p sampling with the probabilistic draft and block verify.
+
+It replaces the target forward, the sampler, the rejection sampler and the
+DSpark proposer of a served step
+(`atom/models/deepseek_v41/mono/gfx1250/`).
+
+- **Deployment.** TP4, DSpark with 5 speculative tokens, BF16 KV cache, FP8
+  index cache, up to 8 requests (6 verify rows each), no DSpark confidence
+  schedule or ragged verify. Anything else is refused at load
+  (`V4.1 single-launch step off: <why>`).
+- **Memory.** The kernel reads the routed experts in place, as the
+  production MoE keeps them (no second copy). Its own buffers a rank: ~77 MB
+  scratch, ~28 MB peer receive and the shared experts' FP8 planes (~0.4 GB).
+- **Steps it does not serve** take the production path; it says why once per
+  kind in the log (`not served (...)`). These are:
+  - prefill;
+  - steps with structured output, logprobs or top-k;
+  - a block table or index bound past the kernel's (`tables.BCOLS`, `ILW`).
+- **Build.** Every width (6..48 rows) is built at startup, ~2.5 min cold.
+  The builds go to the FlyDSL disk cache; clear it after editing a kernel.
+- **Debug switches** (the mono ones, `atom/utils/envs.py`):
+  - `ATOM_MONO_TIMELINE=<prefix>`: per-step time split, averaged over 64
+    steps, logged and appended to `<prefix>_r<rank>.jsonl`;
+  - `ATOM_MONO_CHECK` (eager): the launch beside the production forward,
+    its head, selection, taps and drafts compared.
+
+Measured on MI455X (TP4, `--level 0`, same machine, original path as the
+reference):
+
+| | single launch | original |
+|---|---|---|
+| GSM8K (T = 1, 512 questions) | 453 | 455 |
+| GSM8K draft acceptance | 0.365 | 0.365 |
+| step time, 8 requests (short prompts) | 7.18 ms | 7.97 ms |
+| step time, 1 request | 5.44 ms | 6.75 ms |
+| TPOT, 8 requests, ~26.6k-token agentic prompts (2 runs) | 2.01 / 2.06 ms | 2.30 / 2.15 ms |
 
 ## Equal-score index selection
 
