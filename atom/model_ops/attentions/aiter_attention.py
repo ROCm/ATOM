@@ -348,10 +348,11 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         # the batch. Sized at the widest step; a plain decode step (S=1) builds into the
         # same buffer. The scores go into one `LogitsWorkspace` every layer shares (the
         # scorer and selector of a layer run back to back on one stream, in one call),
-        # as wide as the map and tall enough for a decode step's rows. Allocated in the
-        # constructor, so the memory profile counts it.
+        # as wide as the map and tall enough for the larger of a decode step's rows and
+        # a prefill chunk's. Allocated in the constructor, so the memory profile counts
+        # it.
         self._index_work_map_blocks = cdiv(config.max_model_len, SPARSE_BLOCK_SIZE)
-        rows = self.max_bs * max_qlen
+        rows = max(self.max_bs * max_qlen, config.max_num_batched_tokens)
         self._index_scorers[""] = IndexScoreBuffers(
             scores=LogitsWorkspace(
                 self._num_idx_heads * rows * self._index_work_map_blocks, self.device
@@ -997,6 +998,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 num_prefills=bs,
                 num_prefill_tokens=batch.scheduled_tokens,
                 num_idx_heads=self._num_idx_heads,
+                **self._index_scorer_kwargs(),
             )
 
     def _refuse_ragged_on_rectangular_layers(

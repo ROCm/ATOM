@@ -1154,13 +1154,16 @@ def minimax_m3_index_topk(
     n_valid_column_per_row: torch.Tensor | None = None,
     index_mxfp4: bool = False,
     pages_per_block: int = PAGES_PER_SPARSE_BLOCK,
+    index_scorer=None,
 ):
     """Index block-score + top-k selection. block_size_q == 1 (per-token).
 
     With ``index_mxfp4`` (``--index-cache-dtype fp4``) ``index_kv_cache`` is the
     uint8 ``[num_blocks, 8704]`` MXFP4 page cache and the scores come from aiter's
-    FlyDSL prefill scorer (``minimax_m3_index_score_prefill_fp4_flydsl``); the
-    selection after it is this module's.
+    FlyDSL prefill scorer (``minimax_m3_index_score_prefill_fp4_flydsl``), which
+    writes into ``index_scorer.scores`` (an `IndexScoreBuffers`, required: one
+    workspace for every layer and no per-call allocation or -inf fill, since the
+    selection after it, this module's, reads a row only up to its valid blocks).
     ``pages_per_block`` / ``block_page_stride`` describe the emitted block table:
     8 / 8 for the page-16 SHUFFLE cache, 1 / 1 for page-128 caches (MXFP4 KV).
 
@@ -1199,6 +1202,8 @@ def minimax_m3_index_topk(
     if index_mxfp4:
         from atom.model_ops.minimax_m3.mxfp4_pages import page_views
 
+        if index_scorer is None:
+            raise ValueError("the MXFP4 index prefill needs the builder's index_scorer")
         k_data, k_scale = page_views(index_kv_cache)
         from aiter.ops.flydsl import minimax_m3_index_score_prefill_fp4_flydsl
 
@@ -1213,6 +1218,9 @@ def minimax_m3_index_topk(
             max_query_len,
             max_seq_len,
             sm_scale,
+            out=index_scorer.scores.logits(num_idx_heads * total_q, max_block).view(
+                num_idx_heads, total_q, max_block
+            ),
         )
     else:
         score = _triton_prefill_score(

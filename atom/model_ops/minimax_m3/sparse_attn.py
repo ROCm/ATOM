@@ -136,7 +136,11 @@ def make_sparse_prefill_metadata(
     num_prefill_tokens: int,
     num_idx_heads: int,
     n_valid_column_per_row_out: torch.Tensor | None = None,
+    index_scorer: IndexScoreBuffers | None = None,
 ) -> MiniMaxM3SparseMetadata:
+    """``index_scorer`` is the builder's MXFP4 index scorer record (None for any other
+    index cache); a prefill step uses only its score workspace, so the map is dropped.
+    """
     query_lens = cu_seqlens_q[1 : num_prefills + 1] - cu_seqlens_q[:num_prefills]
     prefix_lens = seq_lens - query_lens
     qo_indptr = torch.arange(num_prefill_tokens, dtype=torch.int32, device="cuda")
@@ -165,6 +169,11 @@ def make_sparse_prefill_metadata(
             num_idx_heads=num_idx_heads,
             decode_max_q=0,
             out=n_valid_column_per_row_out,
+        ),
+        index_scorer=(
+            None
+            if index_scorer is None
+            else replace(index_scorer, work_map=None, max_block=0)
         ),
     )
 

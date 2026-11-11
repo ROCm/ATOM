@@ -1643,7 +1643,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 "sparse_layer_ordinal": self.sparse_layer_ordinal,
             }
 
-    def _mxfp4_select_kwargs(self, sparse_metadata, decode: bool) -> dict:
+    def _mxfp4_select_kwargs(self, sparse_metadata) -> dict:
         """What the selection needs to know about the MXFP4 caches: a block table
         of one page-128 page a block for the MXFP4 KV, the MXFP4 scorer and its
         buffers (the step's `IndexScoreBuffers`) for the MXFP4 index."""
@@ -1652,8 +1652,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             kw.update(pages_per_block=1, block_page_stride=1)
         if self.index_cache_dtype == "fp4":
             kw["index_mxfp4"] = True
-            if decode:
-                kw["index_scorer"] = sparse_metadata.index_scorer
+            kw["index_scorer"] = sparse_metadata.index_scorer
         return kw
 
     @mark_trace(prefix="sparse_attention_prefill", torch_compile=False)
@@ -1709,7 +1708,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 self.scale,
                 emit_sparse_block_table=True,
                 n_valid_column_per_row=sparse_metadata.n_valid_column_per_row,
-                **self._mxfp4_select_kwargs(sparse_metadata, decode=False),
+                **self._mxfp4_select_kwargs(sparse_metadata),
             )
             self._store_cached_topk(
                 sparse_metadata, topk_key, (topk_idx, sparse_bt, sparse_ctx)
@@ -1880,7 +1879,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                     emit_sparse_block_table=True,
                     max_query_len=max_query_len,
                     n_valid_column_per_row=sparse_metadata.n_valid_column_per_row,
-                    **self._mxfp4_select_kwargs(sparse_metadata, decode=True),
+                    **self._mxfp4_select_kwargs(sparse_metadata),
                 )
             self._store_cached_topk(
                 sparse_metadata, topk_key, (topk_idx, sparse_bt, sparse_ctx)

@@ -18,7 +18,7 @@ import torch
 
 from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace
 
-BOUND, HEADS, MAX_BS = 64, 2, 16
+BOUND, HEADS, MAX_BS, PREFILL_ROWS = 64, 2, 16, 40
 
 
 @pytest.fixture
@@ -45,6 +45,7 @@ def builder(mod, mxfp4=True, tbo_decode=True, forward_vars=None):
         forward_vars={} if forward_vars is None else forward_vars,
         config=types.SimpleNamespace(
             max_model_len=BOUND * 128,
+            max_num_batched_tokens=PREFILL_ROWS,
             index_cache_dtype="fp4" if mxfp4 else "fp8",
             enable_tbo=True,
             enable_tbo_decode=tbo_decode,
@@ -89,9 +90,10 @@ def test_the_scorer_buffers_are_one_workspace_and_a_map_per_decode_ubatch(
         assert b._index_scorer_kwargs() == {}
         return
     main = b._index_scorers[""]
-    # one workspace for every layer, as wide as the map and as tall as a decode step
+    # one workspace for every layer, as wide as the map and as tall as the larger of a
+    # decode step's rows and a prefill chunk's
     assert isinstance(main.scores, LogitsWorkspace)
-    assert main.scores.capacity == HEADS * max_bs * max_qlen * BOUND
+    assert main.scores.capacity == HEADS * max(max_bs * max_qlen, PREFILL_ROWS) * BOUND
     assert main.scores.nbytes == 4 * main.scores.capacity
     assert (main.max_block, main.work_map.shape) == (BOUND, (100, 2))
     assert capacity_args == [(max_bs, BOUND, max_qlen, HEADS)]
@@ -329,17 +331,17 @@ def test_the_scorer_gets_the_step_records_of_the_metadata_not_the_impls_own():
         num_prefills=0,
         index_scorer=record,
     )
-    kw = impl._mxfp4_select_kwargs(md, decode=True)
+    kw = impl._mxfp4_select_kwargs(md)
     assert kw == {"index_mxfp4": True, "index_scorer": record}
     # another index cache selects without one
     impl.index_cache_dtype = "fp8"
-    assert impl._mxfp4_select_kwargs(md, decode=True) == {}
+    assert impl._mxfp4_select_kwargs(md) == {}
 
 
 def test_the_decode_metadata_builds_the_map_into_the_records_buffer(monkeypatch):
     """`make_sparse_decode_metadata` builds the step's map into the record's capacity
     buffer at the record's bound and carries the record with that map; an empty batch
-    builds none."""
+    builds none. The prefill metadata keeps the workspace only."""
     pytest.importorskip("aiter")
     from aiter.ops import flydsl
 
@@ -378,6 +380,22 @@ def test_the_decode_metadata_builds_the_map_into_the_records_buffer(monkeypatch)
     assert md.index_scorer.work_map.shape == (3, 2)  # the step's map, not the capacity
     assert decode(torch.ones(0, dtype=torch.int32)).index_scorer is None
     assert len(built) == 1
+    arange = torch.arange  # the prefill metadata allocates its row index on "cuda"
+    monkeypatch.setattr(torch, "arange", lambda *a, device=None, **k: arange(*a, **k))
+    prefill = sparse_attn.make_sparse_prefill_metadata(
+        cu_seqlens_q=torch.tensor([0, 2], dtype=torch.int32),
+        seq_lens=torch.tensor([5], dtype=torch.int32),
+        block_table=None,
+        slot_mapping=None,
+        max_query_len=2,
+        max_seq_len=5,
+        num_prefills=1,
+        num_prefill_tokens=2,
+        num_idx_heads=2,
+        index_scorer=record,
+    )
+    assert prefill.index_scorer.scores is record.scores
+    assert prefill.index_scorer.work_map is None
 
 
 @pytest.mark.parametrize("planned", [True, False])
@@ -425,9 +443,10 @@ def test_the_caller_can_own_the_output(monkeypatch, planned):
         m.sparse_pa_mxfp4(*args, out=torch.empty(q.shape, dtype=torch.float32))
 
 
-def _scorer_call(monkeypatch):
-    """`minimax_m3_index_topk_decode` with the aiter scorer and the selection doubled:
-    returns (call(record), what the scorer was handed, what the selection read)."""
+def _scorer_call(monkeypatch, phase):
+    """`minimax_m3_index_topk[_decode]` with the aiter scorer and the selection
+    doubled: returns (call(record), what the scorer was handed, what the selection read).
+    """
     pytest.importorskip("aiter")
     from aiter.ops import flydsl
 
@@ -444,6 +463,9 @@ def _scorer_call(monkeypatch):
         flydsl, "minimax_m3_index_score_fp4_flydsl", scorer, raising=False
     )
     monkeypatch.setattr(
+        flydsl, "minimax_m3_index_score_prefill_fp4_flydsl", scorer, raising=False
+    )
+    monkeypatch.setattr(
         index_topk, "_launch_select", lambda score, *a, **kw: seen.update(sel=score)
     )
     monkeypatch.setattr(
@@ -455,22 +477,33 @@ def _scorer_call(monkeypatch):
     cache = torch.zeros(1)
 
     def call(record):
-        index_topk.minimax_m3_index_topk_decode(
-            idx_q, cache, table, seq, width * 128, 2, 1, 1, heads, 1.0,
-            max_query_len=1, index_mxfp4=True, index_scorer=record,
-        )  # fmt: skip
+        if phase == "decode":
+            index_topk.minimax_m3_index_topk_decode(
+                idx_q, cache, table, seq, width * 128, 2, 1, 1, heads, 1.0,
+                max_query_len=1, index_mxfp4=True, index_scorer=record,
+            )  # fmt: skip
+        else:
+            cu = torch.arange(rows + 1, dtype=torch.int32)
+            index_topk.minimax_m3_index_topk(
+                idx_q, cache, table, cu, seq, seq - 1, 1, width * 128, 2, 1, 1,
+                heads, 1.0, index_mxfp4=True, index_scorer=record,
+            )  # fmt: skip
 
     return call, seen, (heads, rows, width)
 
 
-def test_the_scorer_writes_a_contiguous_view_of_the_shared_workspace(monkeypatch):
-    """The scorer is handed a contiguous [heads, rows, width] view of the workspace's
-    head (the layout the aiter selector needs), the selection reads that same tensor,
-    and a workspace too small for the step is refused rather than overrun."""
+@pytest.mark.parametrize("phase", ["decode", "prefill"])
+def test_the_scorer_writes_a_contiguous_view_of_the_shared_workspace(
+    monkeypatch, phase
+):
+    """The scorer, decode or prefill, is handed a contiguous [heads, rows, width] view
+    of the workspace's head (the layout the aiter selector needs), the selection
+    reads that same tensor, and a workspace too small for the step is refused rather
+    than overrun."""
     from atom.model_ops.minimax_m3.sparse_attn import IndexScoreBuffers
 
-    call, seen, (heads, rows, width) = _scorer_call(monkeypatch)
-    wmap = torch.zeros(2, 2)
+    call, seen, (heads, rows, width) = _scorer_call(monkeypatch, phase)
+    wmap = torch.zeros(2, 2)  # decode only
     storage = LogitsWorkspace(heads * rows * width + 5, "cpu")  # sized for more
     call(IndexScoreBuffers(storage, wmap, width))
     out = seen["out"]
@@ -489,11 +522,17 @@ def test_the_mxfp4_decode_refuses_a_step_without_its_scorer_record(monkeypatch):
     decode scorer refuses, and so does a context wider than the map's bound."""
     from atom.model_ops.minimax_m3.sparse_attn import IndexScoreBuffers
 
-    call, _, (heads, rows, width) = _scorer_call(monkeypatch)
+    call, _, (heads, rows, width) = _scorer_call(monkeypatch, "decode")
     ws = LogitsWorkspace(heads * rows * width, "cpu")
     with pytest.raises(ValueError, match="needs the step's index_scorer"):
         call(None)
     with pytest.raises(ValueError, match="needs the step's index_scorer"):
-        call(IndexScoreBuffers(ws))  # a record with no map
+        call(IndexScoreBuffers(ws))  # a prefill record has no map
     with pytest.raises(ValueError, match="wider than the 3 blocks"):
         call(IndexScoreBuffers(ws, torch.zeros(2, 2), width // 2))
+
+
+def test_the_mxfp4_prefill_refuses_a_step_without_its_scorer_record(monkeypatch):
+    call, _, _ = _scorer_call(monkeypatch, "prefill")
+    with pytest.raises(ValueError, match="needs the builder's index_scorer"):
+        call(None)

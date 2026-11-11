@@ -173,10 +173,11 @@ def test_prefill_selection_matches_the_decode_definition():
     # a ragged prefill of S new tokens on top of seq - S cached ones, per request
     cu = torch.arange(0, (batch + 1) * S, S, device="cuda", dtype=torch.int32)
     prefix = (seq - S).to(torch.int32)
+    record = _record(batch, S, table.shape[1], prefill_rows=batch * S)
     topk_idx, _, sctx = minimax_m3_index_topk(
         q, cache, table, cu, seq, prefix, S, int(seq.max()), TOPK, 0, 1, HEADS,
         SM_SCALE, emit_sparse_block_table=True, block_page_stride=1,
-        index_mxfp4=True, pages_per_block=1,
+        index_mxfp4=True, pages_per_block=1, index_scorer=record,
     )  # fmt: skip
     score, picks, ctx = reference(cache, table, seq, q, S)
     for r in range(batch * S):
@@ -368,6 +369,78 @@ def test_the_unfilled_shared_workspace_selects_like_aiters_own_filled_scores(
         for g, w in zip(got, want):
             assert torch.equal(g, w), f"step {step}"
         _assert_pad_rows_are_empty(got, scheduled * S, heads)
+
+
+def _prefill_case(batch, heads, seed, blocks, max_query):
+    """Ragged chunked prefill: each request brings 1..max_query new tokens behind a
+    prefix of its own (some with none), and a length that is not a multiple of 128."""
+    cache, table, seq, _ = make_case(
+        batch, max_query, seed=seed, max_len=128 * blocks, heads=heads
+    )
+    g = torch.Generator(device="cuda").manual_seed(seed + 1)
+    qlen = torch.randint(1, max_query + 1, (batch,), device="cuda", generator=g)
+    seq = torch.maximum(seq - 17, qlen + 1).to(torch.int32)  # off the block boundary
+    seq[0] = 128 * blocks - 5
+    prefix = (seq - qlen).to(torch.int32)
+    cu = torch.cat([qlen.new_zeros(1), qlen.cumsum(0)]).to(torch.int32)
+    q = torch.randn(int(cu[-1]), heads, DIM, device="cuda", generator=g) * 0.7
+    return cache, table, seq, prefix, cu, q.to(torch.bfloat16), int(qlen.max())
+
+
+def _prefill_select(case, heads, record, allocated):
+    from atom.model_ops.minimax_m3.index_topk import minimax_m3_index_topk
+    from atom.model_ops.minimax_m3.sparse_attn import make_sparse_prefill_metadata
+
+    cache, table, seq, prefix, cu, q, max_q = case
+    batch = seq.shape[0]
+    md = make_sparse_prefill_metadata(
+        cu_seqlens_q=cu,
+        seq_lens=seq,
+        block_table=table,
+        slot_mapping=torch.zeros(q.shape[0], dtype=torch.int64, device="cuda"),
+        max_query_len=max_q,
+        max_seq_len=int(seq.max()),
+        num_prefills=batch,
+        num_prefill_tokens=q.shape[0],
+        num_idx_heads=heads,
+        index_scorer=record,
+    )
+    with _aiter_allocates_its_scores() if allocated else contextlib.nullcontext():
+        return minimax_m3_index_topk(
+            q, cache, table, cu, seq, prefix, max_q, int(seq.max()), TOPK, 0, 1,
+            heads, SM_SCALE, emit_sparse_block_table=True, block_page_stride=1,
+            index_mxfp4=True, pages_per_block=1,
+            n_valid_column_per_row=md.n_valid_column_per_row,
+            index_scorer=md.index_scorer,
+        )  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    "heads,batch,blocks,max_query",
+    [
+        (1, 4, 70, 40),
+        (2, 7, 70, 130),
+        (4, 3, 70, 300),
+        (1, 3, 2100, 64),
+        (2, 3, 2100, 200),
+    ],
+)
+def test_the_prefill_scorer_into_the_unfilled_workspace_selects_like_aiters_own(
+    heads, batch, blocks, max_query
+):
+    """The prefill scorer (ragged chunks, prefixes, lengths off a block boundary)
+    writing into the junk-filled workspace, reused by a second chunk of other
+    rows, selects bit for bit what aiter's own allocated -inf-filled scores give."""
+    rows = batch * max_query
+    record = _record(1, 1, blocks, heads, prefill_rows=rows)
+    for seed in (30, 31):
+        case = _prefill_case(batch, heads, seed, blocks, max_query)
+        got = _prefill_select(case, heads, record, allocated=False)
+        want = _prefill_select(case, heads, record, allocated=True)
+        for g, w in zip(got, want):
+            assert torch.equal(g, w), f"chunk {seed}"
+        # the workspace is wide enough for any chunk, so a shorter second one reuses it
+        batch, max_query = max(1, batch - 1), max(8, max_query // 2)
 
 
 @pytest.mark.parametrize("S,heads", [(8, 1), (4, 4)])
