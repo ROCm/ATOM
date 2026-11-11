@@ -20,7 +20,7 @@ Mooncake facts this wrapper is shaped by (v0.3.14):
   work, so a buffer whose key failed that way may still be read or written by
   the NIC. Sooner, a key fails only once every transfer of it has completed or
   failed, or before one was posted (see :func:`buffer_settled`).
-* The data, lookup and remove calls release the GIL; ``setup`` and ``close`` do
+* The data, lookup, remove and ``setup`` calls release the GIL; ``close`` does
   not. A blocked call spins its thread's CPU core until the transfer is done.
 """
 

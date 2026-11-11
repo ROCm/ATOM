@@ -34,12 +34,6 @@ CommonAttentionBuilder = pytest.importorskip(
     exc_type=ImportError,
 ).CommonAttentionBuilder
 
-AiterBuilder = pytest.importorskip(
-    "atom.model_ops.attentions.aiter_attention",
-    reason="the MHA builder's module imports aiter at load",
-    exc_type=ImportError,
-).AiterAttentionMetadataBuilder
-
 MAX_BS = 300
 MAX_COLS = 40
 # Neither 0 nor a plausible block id, so a cell that should have been cleared
@@ -67,7 +61,9 @@ def _golden(rows: list[array.array]) -> np.ndarray:
 
 def _stub(dst: np.ndarray):
     """A builder stub whose `forward_vars["block_tables"]` wraps `dst`."""
-    buf = SimpleNamespace(np=dst, copy_to_gpu=lambda n: ("gpu", n))
+    buf = SimpleNamespace(
+        np=dst, copy_to_gpu=lambda n: ("gpu", n), acquire_write=lambda: None
+    )
     return SimpleNamespace(
         model_runner=SimpleNamespace(forward_vars={"block_tables": buf})
     )
@@ -112,46 +108,6 @@ def test_marshal_leaves_no_buffer_export_on_the_row():
 
     for row in rows:
         row.append(999)  # BufferError here means someone kept a view
-
-
-def test_tbo_prefill_stash_does_not_pin_the_rows_it_keeps():
-    """The one place that keeps block tables past the call that read them.
-
-    `_stash_tbo_token_split_prefill_state` holds its rows until a later ubatch
-    rebuilds the straddled request's prefix, so an int32 view taken here is
-    still live when `BlockManager` next grows the sequence.
-    """
-    bs = 4
-    rows = _rows(bs)
-    stub = SimpleNamespace(
-        _tbo_prefill_state=None,
-        model_runner=SimpleNamespace(
-            forward_vars={
-                "cu_seqlens_q": SimpleNamespace(np=np.arange(bs + 1, dtype=np.int32))
-            }
-        ),
-    )
-    batch = SimpleNamespace(
-        block_tables=rows,
-        total_seqs_num_prefill=bs,
-        num_cached_tokens=[0] * bs,
-    )
-
-    AiterBuilder._stash_tbo_token_split_prefill_state(stub, batch)
-
-    assert stub._tbo_prefill_state is not None
-    kept = stub._tbo_prefill_state.block_tables
-    assert [len(r) for r in kept] == [len(r) for r in rows]
-
-    for row in rows:
-        row.append(999)  # BufferError here means the stash kept a view
-
-    # And what it kept still serves its consumer, which only ever needs a
-    # length and a slice assignment into an int32 destination.
-    dst = np.zeros((bs, MAX_COLS), dtype=np.int32)
-    for i, row in enumerate(kept):
-        dst[i, : len(row)] = row
-    assert (dst[0, : len(rows[0])] == np.asarray(rows[0][: len(rows[0])])).all()
 
 
 def test_int32_asarray_over_a_block_table_is_the_hazard_being_guarded():

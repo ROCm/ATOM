@@ -424,9 +424,8 @@ def test_forward_impl_bridges_fused_moe_state_to_runtime(comm_fused_env):
         assert runtime_args[name] is getattr(layer, attribute)
     assert runtime_args["gate_mode"] == GateMode.INTERLEAVE.value
     assert runtime_args["reuse_is_synchronized"] is False
-    # Routing sends pad rows to expert -1, and a TP layer has no expert_mask
-    # to switch the runtime's missing-route handling on by itself.
-    assert runtime_args["routes_may_be_missing"] is True
+    # Pad rows go to expert -1 as whole rows: no missing-route clear.
+    assert "routes_may_be_missing" not in runtime_args
 
 
 def test_dpa_forward_fuses_local_shared_into_owned_rs_rows(comm_fused_env):
