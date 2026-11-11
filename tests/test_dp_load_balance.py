@@ -1874,3 +1874,44 @@ def test_prefix_spread_does_not_ask_the_tier_when_it_cannot_load():
         assert len(calls["_tier_hit"]) == asked
         # No tier: the moved request keeps only what rank 1 holds (nothing).
         assert _est(mgr, seq) == (8192 if loads else 0)
+
+
+def test_prefix_spread_reset_evicts_history_in_a_repeatable_order():
+    """`reset()` drops the in-flight claims; intervals another rank still holds
+    stay as history, refreshed oldest-placed first, so the trim that follows
+    drops the earliest ones. The same input always evicts the same history,
+    whatever the addresses of the edge objects are."""
+    import random
+
+    from atom.kv_transfer.offload.tier import OffloadTierProfile
+
+    router = _make_spread_mgr(tier=OffloadTierProfile())._prefix_router
+
+    def place(seq_id, first_block, rank):
+        seq = _chain_seq(seq_id, 128, first_block=first_block)
+        router.charge(seq_id, router.place(seq, rank, 2).credit)
+        return seq
+
+    # Fragment the heap: edges created afterwards reuse freed slots, at
+    # addresses unrelated to their creation order (which is what made the old
+    # set iteration order vary).
+    scratch = list(range(400))
+    for i in scratch:
+        place(i, 1_000_000 + i, 0)
+    random.Random(7).shuffle(scratch)
+    for seq_id in scratch[:300]:
+        router.release(seq_id)  # unfinished: its provisional interval is dropped
+    n, keep = 160, 40
+    for i in range(n):  # rank 1 holds finished history ...
+        place(1_000 + i, 5_000 + i, 1)
+        router.prefill_complete(1_000 + i)
+    for i in range(n):  # ... which rank 0 then claims provisionally, in order
+        place(2_000 + i, 5_000 + i, 0)
+    router.CAP = keep * 128
+    router.reset()
+    held = [
+        router._rank_hits(_chain_seq(0, 128, first_block=5_000 + i).prompt_hash_chain, 2)[1]
+        is not None
+        for i in range(n)
+    ]
+    assert held == [False] * (n - keep) + [True] * keep

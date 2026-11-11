@@ -99,7 +99,9 @@ class PrefixSpreadRouter:
     def reset(self) -> None:
         """Forget in-flight state. The index stays: it describes the ranks'
         prefix caches, which outlive a batch."""
-        affected = {edge for edge, _rank in self.pending}
+        # A dict, not a set: edges hash by address, and the order they are
+        # refreshed below decides which history `_trim_history` evicts first.
+        affected = dict.fromkeys(edge for edge, _rank in self.pending)
         for edge, rank in self.pending:
             holders = self.index.get(edge)
             if holders is not None:
