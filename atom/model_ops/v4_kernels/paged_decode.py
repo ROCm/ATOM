@@ -59,6 +59,7 @@ from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
 from aiter.ops.triton.utils.device_info import get_num_sms
 
 from atom.model_ops.sparse_attn_v4 import _sparse_attn_ragged_torch
+from atom.model_ops.v4_decode_flydsl import flydsl_paged_decode
 from atom.model_ops.v4_kernels import hca_persist
 from atom.model_ops.v4_kernels.paged_decode_gluon import (
     _paged_decode_fused_gluon_kernel,
@@ -1211,7 +1212,8 @@ def sparse_attn_v4_paged_decode(
     Otherwise (bf16): the existing Triton / reference path. When ``kv_scales``
     is provided, ``unified_kv`` must be fp8 (e4m3fnuz) and is dequantized
     in-kernel using 1xGROUP_SIZE (default 64) block scales (legacy 1buff,
-    unreachable from the model).
+    unreachable from the model). With ``ATOM_V4_DECODE_FLYDSL=1``, a bf16 call
+    that plugin_poc's FlyDSL kernel covers (gfx950) runs that kernel instead.
     """
     if unified_kv_rope is not None:
         if (
@@ -1267,6 +1269,12 @@ def sparse_attn_v4_paged_decode(
             num_kv_splits=num_kv_splits,
             split_indptr=split_indptr,
         )
+    if envs.ATOM_V4_DECODE_FLYDSL:
+        out = flydsl_paged_decode(
+            q, unified_kv, kv_indices, kv_indptr, attn_sink, softmax_scale, kv_scales
+        )
+        if out is not None:
+            return out
     gfx = get_gfx()
     if gfx == "gfx1250" or gfx.startswith("gfx94"):
         return pa_decode_sparse(
