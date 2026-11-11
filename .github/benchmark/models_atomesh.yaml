@@ -16892,6 +16892,46 @@ models:
               ATOMESH_M31_D_MAX_SEQS: "18"
               ATOMESH_M31_P_CPU_OFFLOAD_BYTES: "1499000000000"
               ATOMESH_M31_P_LAZY_OFFLOAD: "true"
+        # The image InferenceX #4973 pins (vLLM 96710245 with PR 65822 merged), run as shipped: the
+        # overlay base and head are the image commit, so the diff is empty.
+        - &m31_moriio_1p2d_n967_case
+          <<: *m31_moriio_1p2d_s65822_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-n967-c36-dcap3
+          image: vllm/vllm-openai-rocm:nightly-96710245ece8fe57a0df3ea18cdc79cbb8ce93cf@sha256:6eeac5c66fa566c8f44f79528df9db5eaadff6cc4afb76ad583fedfd5b64e51b
+          concurrency: [36]
+          env:
+            common: &m31_n967_env
+              <<: *m31_s65822_env
+              ATOMESH_M31_VLLM_REPO: https://github.com/vllm-project/vllm.git
+              ATOMESH_M31_VLLM_SHA: 96710245ece8fe57a0df3ea18cdc79cbb8ce93cf
+              ATOMESH_M31_VLLM_BASE_SHA: 96710245ece8fe57a0df3ea18cdc79cbb8ce93cf
+              ATOMESH_M31_D_MAX_SEQS: "3"
+              ATOMESH_M31_P_CPU_OFFLOAD_BYTES: "1349000000000"
+        - <<: *m31_moriio_1p2d_n967_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-n967-c64-dcap6
+          concurrency: [64]
+          env:
+            common:
+              <<: *m31_n967_env
+              ATOMESH_M31_D_MAX_SEQS: "6"
+        - <<: *m31_moriio_1p2d_n967_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-n967-c104-dcap18-cpu15-lazy
+          concurrency: [104]
+          env:
+            common:
+              <<: *m31_n967_env
+              ATOMESH_M31_D_MAX_SEQS: "18"
+              ATOMESH_M31_P_CPU_OFFLOAD_BYTES: "1499000000000"
+              ATOMESH_M31_P_LAZY_OFFLOAD: "true"
+        - <<: *m31_moriio_1p2d_n967_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-n967-c112-dcap20-cpu15-lazy
+          concurrency: [112]
+          env:
+            common:
+              <<: *m31_n967_env
+              ATOMESH_M31_D_MAX_SEQS: "20"
+              ATOMESH_M31_P_CPU_OFFLOAD_BYTES: "1499000000000"
+              ATOMESH_M31_P_LAZY_OFFLOAD: "true"
         # The local 1P1D layout (P GPUs 0-3, D GPUs 4-7 of one node) with xgmi swapped for RDMA.
         - &m31_moriio_1p1d_sn_case
           <<: *m31_moriio_1p2d_case
