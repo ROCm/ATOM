@@ -1621,12 +1621,27 @@ def _replica_spread(gathered: bool = False) -> tuple[int, int]:
     return _MANAGER.replica_spread
 
 
+def _eplb_layer_end(model: Any) -> int | None:
+    """The first layer EPLB leaves alone where a module declares one
+    (`eplb_layer_end`), else None: every EP MoE layer is placed."""
+    for module in model.modules():
+        end = getattr(module, "eplb_layer_end", None)
+        if end is not None:
+            return int(end)
+    return None
+
+
 def collect_ep_moe_layers(model: Any) -> dict[int, Any]:
-    """Map checkpoint layer id -> EP MoE module that owns expert weights."""
+    """Map checkpoint layer id -> EP MoE module that owns expert weights, for
+    the layers before the model's `eplb_layer_end`. A layer past the placed
+    ones is never owned (`_eplb_owns_layer`): no remap, record or migration."""
+    end = _eplb_layer_end(model)
     layers: dict[int, Any] = {}
     for module in model.modules():
         layer_id = getattr(module, "layer_id", None)
         if isinstance(layer_id, bool) or not isinstance(layer_id, int):
+            continue
+        if end is not None and layer_id >= end:
             continue
         if not bool(getattr(module, "use_ep", False)):
             continue
@@ -1844,9 +1859,11 @@ class EPLBManager:
             self._p2p_batch_chunk_size = 32
 
         logger.info(
-            "EPLB runtime initialized: layers=%d num_logical=%d "
+            "EPLB runtime initialized: layers=%d (%d..%d) num_logical=%d "
             "num_physical=%d ep_size=%d ep_rank=%d",
             len(layers),
+            min(layers),
+            max(layers),
             num_logical,
             num_physical,
             ep_size,
