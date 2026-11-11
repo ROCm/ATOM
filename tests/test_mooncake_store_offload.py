@@ -3820,13 +3820,16 @@ def test_mixed_windows_report_the_same_chunks(
 
 
 def test_v41_architecture_alias_and_codec_identity():
-    from atom.kv_transfer.offload.mooncake_store.config import uses_replay_pages
+    from atom.kv_transfer.offload.mooncake_store.layouts import (
+        REPLAY_PAGE_CODEC_ID,
+        mooncake_codec_id,
+    )
 
     config = _config()
     dense = keys.store_namespace(config, CHUNK)
     config.hf_config.model_type = "deepseek_v41"
     config.enable_encoder_swa_bounded_replay = True
-    assert uses_replay_pages(config)
+    assert mooncake_codec_id(config) == REPLAY_PAGE_CODEC_ID
     assert keys.store_namespace(config, CHUNK) != dense
 
 
@@ -3870,14 +3873,17 @@ def test_plain_v4_is_refused_before_weights_load():
     "model_type", ["deepseek_v41", "deepseek_v41_text", "deepseek_v41_dspark"]
 )
 def test_every_v41_spelling_is_admitted_with_bounded_replay(model_type):
-    from atom.kv_transfer.offload.mooncake_store.config import uses_replay_pages
+    from atom.kv_transfer.offload.mooncake_store.layouts import (
+        REPLAY_PAGE_CODEC_ID,
+        mooncake_codec_id,
+    )
 
     config = _config()
     config.hf_config.model_type = model_type
     config.hf_config.compress_ratios = [4, 128]
     config.enable_encoder_swa_bounded_replay = True
     check_engine_compatibility(parse_mooncake_store_config(_extra()), config)
-    assert uses_replay_pages(config)
+    assert mooncake_codec_id(config) == REPLAY_PAGE_CODEC_ID
 
 
 def test_store_reads_the_region_map_only_on_a_page_layout():

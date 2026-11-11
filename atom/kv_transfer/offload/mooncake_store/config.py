@@ -22,9 +22,6 @@ from atom.kv_transfer.offload.mooncake_store.layouts import require_mooncake_lay
 from atom.kv_transfer.offload.mooncake_store.nic import parse_device_list
 
 KEY_PREFIX = "mooncake_store."
-# `select_offload_layout`'s name for DeepSeek-V4.1's PAGE+STATE pool. Plain
-# DeepSeek-V4 resolves to "hybrid" and is refused with every other layout.
-_REPLAY_PAGE_LAYOUT = "dsv41"
 _MIB = 1 << 20
 _PROTOCOLS = ("rdma", "tcp")
 
@@ -279,11 +276,3 @@ def _positive_seconds(name: str, value: Any) -> float:
     if not math.isfinite(seconds) or seconds <= 0:
         raise ValueError(f"{name} must be finite and > 0, got {value!r}")
     return seconds
-
-
-def uses_replay_pages(config: Any) -> bool:
-    """Whether the Store moves this model's PAGE regions (and the state is
-    rebuilt by replay) rather than the dense KV layout. Decided by the one
-    selector the worker, the scheduler and the key namespace all use; the
-    worker still checks the backend's replay contract when it registers KV."""
-    return offcfg.select_offload_layout(config) == _REPLAY_PAGE_LAYOUT

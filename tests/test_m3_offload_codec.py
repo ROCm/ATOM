@@ -53,6 +53,52 @@ def test_page_codec_preserves_region_order_and_block_count(
     ]
 
 
+def test_page_regions_round_trip_index_and_draft_bytes(transfer, monkeypatch):
+    """The packed block image keeps the NSA index and the draft KV.
+
+    The Store round trip that copies these bytes on a GPU is skipped without a
+    running Store. This follows the codec's own region list, which is the order
+    and the width the staging kernel packs.
+    """
+    monkeypatch.setattr(
+        DSV4PageSlotCodec, "has_fused_chunk_major_staging", property(lambda _: True)
+    )
+    codec = pure_page_codec(transfer)
+    planes = {
+        region.semantic_role: transfer.block_tensor_views[index][:, 0, :]
+        for index, region in enumerate(codec.page_regions)
+    }
+    for role, width, fill in (
+        ("m3.k", 32, 1),
+        ("m3.index", 16, 2),
+        ("m3.draft.k", 8, 3),
+    ):
+        planes[role].fill_(fill)
+        assert planes[role].shape[1] == width
+    packed = b"".join(
+        planes[region.semantic_role][0].numpy().tobytes()
+        for region in codec.page_regions
+    )
+    assert len(packed) == codec.bytes_per_block
+    index_at = planes["m3.k"].shape[1]
+    draft_at = index_at + planes["m3.index"].shape[1]
+    assert packed[index_at:draft_at] == bytes([2]) * planes["m3.index"].shape[1]
+    assert packed[draft_at:] == bytes([3]) * planes["m3.draft.k"].shape[1]
+    for plane in planes.values():
+        plane.zero_()
+    offset = 0
+    for region in codec.page_regions:
+        width = region.unit_bytes
+        restored = torch.tensor(
+            list(packed[offset : offset + width]), dtype=torch.uint8
+        )
+        planes[region.semantic_role][0].copy_(restored)
+        offset += width
+    assert torch.equal(planes["m3.index"][0], torch.full((16,), 2, dtype=torch.uint8))
+    assert torch.equal(planes["m3.draft.k"][0], torch.full((8,), 3, dtype=torch.uint8))
+    assert int(planes["m3.k"][0, 0]) == 1
+
+
 @pytest.mark.parametrize("missing", [None, KVTransferTensors()])
 def test_page_codec_rejects_missing_pages(missing):
     with pytest.raises(ValueError, match="non-empty block_regions"):
