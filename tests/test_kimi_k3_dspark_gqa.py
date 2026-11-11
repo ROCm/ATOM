@@ -164,6 +164,38 @@ def test_gqa_context_write_clamps_verify_rows_to_the_rope_cache(monkeypatch):
     assert positions.tolist() == [97, 98, 99, 100, 101]
 
 
+def test_gqa_checkpoint_final_norm_loads_into_final_norm():
+    """The checkpoint's top-level `norm` is the draft's `final_norm`; the
+    rename is prefix-anchored, so no other norm moves, and the skipped
+    prefixes are still skipped."""
+    from atom.model_loader.weight_names import CheckpointNameRewriter
+
+    cls = gpu_stack_import("atom.models.kimi_k3_dspark_gqa").KimiK3DSparkGQA
+    rewriter = CheckpointNameRewriter(
+        weights_mapper=cls.weights_mapper,
+        skip_weight_prefixes=cls.skip_weight_prefixes,
+        spec_decode=True,
+        num_hidden_layers=5,
+    )
+    assert rewriter.rewrite("norm.weight") == "final_norm.weight"
+    for name in (
+        "hidden_norm.weight",
+        "fc.weight",
+        "markov_head.markov_w1.weight",
+        "layers.0.input_layernorm.weight",
+        "layers.0.post_attention_layernorm.weight",
+        "layers.4.self_attn.q_norm.weight",
+        "layers.4.self_attn.k_norm.weight",
+    ):
+        assert rewriter.rewrite(name) == name
+    for name in (
+        "confidence_head.proj.weight",
+        "embed_tokens.weight",
+        "lm_head.weight",
+    ):
+        assert rewriter.rewrite(name) is None
+
+
 def test_gqa_draft_does_not_capture_the_k3_dspark_checkpoint():
     """The MLA K3-DSpark draft keeps its own route and gains no block size."""
     from atom.config import SpeculativeConfig

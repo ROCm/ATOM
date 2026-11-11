@@ -478,6 +478,19 @@ class DSparkDraftModel(nn.Module):
     #: python, so a captured graph holds whichever side it was recorded with.
     draft_sampling: "DraftSampling | None" = None
 
+    def init_block_fields(self, config) -> None:
+        """The fields every standalone draft reads off its config alike: the
+        block's mask id, the target layers it taps, and the Markov head.
+
+        Call it where the draft registers its Markov head: registration order
+        is ``named_parameters`` order, which dummy weight init walks.
+        """
+        self.noise_token_id = int(config.dspark_noise_token_id)
+        self.target_layer_ids = tuple(config.dspark_target_layer_ids)
+        self.markov_head = DSparkMarkovHead(
+            int(config.vocab_size), int(config.dspark_markov_rank)
+        )
+
     def prepare_block(self, metadata_builder, num_draft, scheduled_bs, running_bs):
         """Mask padded writes for models whose draft pass mutates private KV."""
         return
@@ -592,8 +605,32 @@ class DSparkDraftModel(nn.Module):
         slot mapping from those exact numbers; V4 takes the anchor position
         ``[B]`` and expands inside its compiled region.
         ``DSparkProposer._block_positions`` is the only place that knows which.
+
+        By default, the standalone drafts' block: ``[anchor, MASK, ...]`` of
+        width T embedded, every layer over ``rope_positions(positions)`` (the
+        ``[B*T]`` form), then ``final_norm``. Returns ``[B*T, hidden]``, flat,
+        which is what the LM head takes. A flavor whose block differs (V4,
+        V4.1) overrides this.
+
+        T positions in, T draft tokens out, the convention vLLM and SGLang use.
+        (dflash.py's standalone ``spec_generate`` demo slices
+        ``[:, -block_size+1:]`` instead; no production implementation does.)
         """
-        raise NotImplementedError
+        bs = input_ids.shape[0]
+        draft_ids = input_ids.new_full((bs, num_draft), self.noise_token_id)
+        draft_ids[:, 0] = input_ids
+        hidden = self.embed_tokens(draft_ids.view(-1))
+        positions = self.rope_positions(positions)
+        residual = None
+        for layer in self.layers:
+            hidden, residual = layer(positions, hidden, residual)
+        hidden, _ = self.final_norm(hidden, residual)
+        return hidden
+
+    def rope_positions(self, positions: torch.Tensor) -> torch.Tensor:
+        """The positions the default ``block_backbone``'s layers rope at: the
+        block's own, unless a draft's rope cache cannot reach them."""
+        return positions
 
     def head_and_sample(
         self, out, anchor_ids: torch.Tensor, num_draft: int, *, greedy: bool = False

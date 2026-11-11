@@ -42,6 +42,7 @@ from aiter.rotary_embedding import get_rope
 from aiter.tuned_gemm import tgemm
 from torch import nn
 
+from atom.model_loader.weight_names import WeightsMapper
 from atom.model_ops.attentions.dspark_block_attn import DSparkGQABlockAttention
 from atom.model_ops.layernorm import DualRMSNorm, RMSNorm
 from atom.model_ops.linear import (
@@ -53,7 +54,6 @@ from atom.models.dspark_draft import (
     AllocationCap,
     DSparkDraftModel,
     DSparkGQADecoderLayer,
-    DSparkMarkovHead,
     KVCacheBinding,
     draft_quant_config,
     draft_rope_kwargs,
@@ -302,6 +302,11 @@ class KimiK3DSparkGQA(DSparkDraftModel):
         "up_proj": ("gate_up_proj", 1),
     }
 
+    # The checkpoint's final norm is `norm`; the base `block_backbone` reads
+    # `final_norm`. Prefix-anchored: `hidden_norm` and the layers' norms keep
+    # their names.
+    weights_mapper = WeightsMapper(orig_to_new_prefix={"norm.": "final_norm."})
+
     # confidence_head predicts a per-position accept probability and is used at
     # training time (and by SGLang for adaptive block length); ATOM runs a fixed
     # block, so it is never read. embed_tokens / lm_head are the target's.
@@ -321,14 +326,12 @@ class KimiK3DSparkGQA(DSparkDraftModel):
         self.config = config
         self.vocab_size = int(config.vocab_size)
         self.hidden_size = config.hidden_size
-        self.noise_token_id = int(config.dspark_noise_token_id)
-        self.target_layer_ids = list(config.dspark_target_layer_ids)
 
         # Aux fusion: [N, hidden * len(target_layer_ids)] -> [N, hidden].
         # Replicated: the aux hidden states arrive replicated, and a
         # row-parallel split would cost an all-reduce every drafting step.
         self.fc = ReplicatedLinear(
-            self.hidden_size * len(self.target_layer_ids),
+            self.hidden_size * len(config.dspark_target_layer_ids),
             self.hidden_size,
             bias=False,
             prefix="fc",
@@ -346,7 +349,7 @@ class KimiK3DSparkGQA(DSparkDraftModel):
                 for i in range(config.num_hidden_layers)
             ]
         )
-        self.norm = RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
+        self.final_norm = RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
         # The last row of the rope cache. YaRN sizes it from
         # `original_max_position_embeddings * factor`, which equals the target's
         # default `max_model_len`, while block positions reach T past it.
@@ -354,9 +357,7 @@ class KimiK3DSparkGQA(DSparkDraftModel):
             int(self.layers[0].self_attn.rotary_emb.cos_cache.shape[0]) - 1
         )
         _check_rope_covers(int(atom_config.max_model_len), self._rope_max_row + 1)
-        self.markov_head = DSparkMarkovHead(
-            self.vocab_size, int(config.dspark_markov_rank)
-        )
+        self.init_block_fields(config)
 
         # Bound by `share_with_target`.
         self.embed_tokens = None
@@ -482,22 +483,8 @@ class KimiK3DSparkGQA(DSparkDraftModel):
 
     # -- DSparkDraftModel contract ----------------------------------------
 
-    def block_backbone(self, input_ids, positions, num_draft: int):
-        """One block: [anchor, MASK, ...] of width T in, T hidden rows out.
-
-        `positions` is [B*T] absolute block positions -- the standalone-draft
-        shape `DSparkProposer._block_positions` produces.
-        """
-        bs = input_ids.shape[0]
-        draft_ids = input_ids.new_full((bs, num_draft), self.noise_token_id)
-        draft_ids[:, 0] = input_ids
-        hidden = self.embed_tokens(draft_ids.view(-1))
+    def rope_positions(self, positions):
         # Block positions run T past `max_model_len`, so they pass the cache in
         # the last T of a max-length context, whose drafts cannot be verified
         # anyway (`_check_rope_covers`).
-        positions = positions.clamp(max=self._rope_max_row)
-        residual = None
-        for layer in self.layers:
-            hidden, residual = layer(positions, hidden, residual)
-        hidden, _ = self.norm(hidden, residual)
-        return hidden
+        return positions.clamp(max=self._rope_max_row)

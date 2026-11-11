@@ -75,7 +75,6 @@ from atom.models.dspark_draft import (
     DSparkConfidenceHead,
     DSparkDraftModel,
     DSparkGQADecoderLayer,
-    DSparkMarkovHead,
     KVCacheBinding,
     draft_quant_config,
     linear_out,
@@ -365,7 +364,11 @@ class M3DSparkDecoderLayer(DSparkGQADecoderLayer):
 
 class MiniMaxM3DSpark(DSparkDraftModel):
     """Top-level standalone DSpark draft for MiniMax-M3.1 (GQA backbone +
-    Markov head + confidence head)."""
+    Markov head + confidence head).
+
+    The block is the base ``block_backbone``, with no embedding scale: the
+    reference embeds with the target's table as is.
+    """
 
     # Per-row MHA decode; its tables are built in `prepare_paged_block`.
     block_attention_is_mla = False
@@ -400,15 +403,12 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         )
 
         self.hidden_size = config.hidden_size
-        self.noise_token_id = int(config.dspark_noise_token_id)
-        self.target_layer_ids = tuple(config.dspark_target_layer_ids)
-        self.markov_rank = int(config.dspark_markov_rank)
         self.vocab_size = int(config.vocab_size)
 
         # Replicated: the aux hidden states arrive replicated, and the
         # checkpoint keeps this projection BF16 (an ignored layer).
         self.fc = ReplicatedLinear(
-            self.hidden_size * len(self.target_layer_ids),
+            self.hidden_size * len(config.dspark_target_layer_ids),
             self.hidden_size,
             bias=False,
             quant_config=None,
@@ -428,11 +428,11 @@ class MiniMaxM3DSpark(DSparkDraftModel):
             ]
         )
         self.final_norm = GemmaRMSNorm(self.hidden_size, eps=config.rms_norm_eps)
-        self.markov_head = DSparkMarkovHead(self.vocab_size, self.markov_rank)
+        self.init_block_fields(config)
         # 0 or absent: every block row attends the whole context.
         self.sliding_window = int(getattr(config, "sliding_window", 0) or 0)
         self.confidence_head = (
-            DSparkConfidenceHead(self.hidden_size, self.markov_rank, bias=True)
+            DSparkConfidenceHead(self.hidden_size, self.markov_head.rank, bias=True)
             if getattr(config, "enable_confidence_head", False)
             else None
         )
@@ -529,27 +529,6 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         )
         attn_metadata.dspark_bt16_rows = self._bt16_rows[:rows]
         attn_metadata.dspark_ctx_rows = self._ctx_rows[:rows]
-
-    def block_backbone(
-        self,
-        input_ids: torch.Tensor,  # [B]   verified anchor token per request
-        positions: torch.Tensor,  # [B*T] block absolute positions
-        num_draft: int,
-    ) -> torch.Tensor:
-        """Embed ``[anchor, MASK, ...]``, run the layers, final norm.
-
-        Returns the post-final-norm hidden states ``[B*T, hidden]``. No
-        embedding scale: the reference embeds with the target's table as is.
-        """
-        bs = input_ids.shape[0]
-        draft_ids = input_ids.new_full((bs, num_draft), self.noise_token_id)
-        draft_ids[:, 0] = input_ids
-        hidden = self.embed_tokens(draft_ids.view(-1))
-        residual = None
-        for layer in self.layers:
-            hidden, residual = layer(positions, hidden, residual)
-        hidden, _ = self.final_norm(hidden, residual)
-        return hidden
 
     def head_and_sample(self, hidden, anchor_ids, num_draft):
         bs = anchor_ids.shape[0]

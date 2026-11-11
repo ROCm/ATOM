@@ -86,7 +86,6 @@ from atom.model_ops.linear import (
 from atom.models.deepseek_v2 import _fuse_rmsnorm_quant, yarn_get_mscale
 from atom.models.dspark_draft import (
     DSparkDraftModel,
-    DSparkMarkovHead,
     draft_rope_kwargs,
     linear_out,
 )
@@ -552,9 +551,6 @@ class KimiK3DSpark(DSparkDraftModel):
         self.hf_config = config
 
         self.hidden_size = config.hidden_size
-        self.noise_token_id = int(config.dspark_noise_token_id)
-        self.target_layer_ids = tuple(config.dspark_target_layer_ids)
-        self.markov_rank = int(config.dspark_markov_rank)
 
         # Aux fusion: [N, target_hidden * num_target_layers] -> [N, hidden].
         # Replicated, matching the reference and ATOM's other drafts: the aux
@@ -580,7 +576,7 @@ class KimiK3DSpark(DSparkDraftModel):
             ]
         )
         self.final_norm = RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
-        self.markov_head = DSparkMarkovHead(config.vocab_size, self.markov_rank)
+        self.init_block_fields(config)
         # Markov-head vocab, exposed at the top level so the proposer can clamp
         # the anchor uniformly across DSpark flavors (V4 exposes it too).
         self.vocab_size = int(config.vocab_size)
@@ -617,32 +613,3 @@ class KimiK3DSpark(DSparkDraftModel):
         projection to it.
         """
         return self.context_norm(linear_out(self.context_proj(aux_concat)))
-
-    def block_backbone(
-        self,
-        input_ids: torch.Tensor,  # [B]   verified anchor token per request
-        positions: torch.Tensor,  # [B*T] block absolute positions
-        num_draft: int,
-    ) -> torch.Tensor:
-        """The parallel half: embed the block, run the layers, norm.
-
-        Returns the post-final-norm hidden states, ``[B*T, hidden]`` -- flat,
-        because that is what the LM head takes and what the layers produced.
-        """
-        bs = input_ids.shape[0]
-        T = num_draft
-
-        # Block input ids: [anchor, MASK, MASK, ...]. T positions in, T draft
-        # tokens out -- the same convention ATOM's V4 DSpark and vLLM/sglang all
-        # use. (dflash.py's standalone `spec_generate` demo slices
-        # `[:, -block_size+1:]` instead; that is NOT what any production
-        # implementation does. Do not "fix" the sampler to match it.)
-        draft_ids = input_ids.new_full((bs, T), self.noise_token_id)
-        draft_ids[:, 0] = input_ids
-        hidden = self.embed_tokens(draft_ids.view(-1))
-
-        residual = None
-        for layer in self.layers:
-            hidden, residual = layer(positions, hidden, residual)
-        hidden, _ = self.final_norm(hidden, residual)
-        return hidden

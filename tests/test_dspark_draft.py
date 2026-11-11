@@ -4,8 +4,8 @@
 
 - `AllocationCap`, the allocation staging the paged block drafts share
   (Kimi-K3 DSpark GQA, MiniMax-M3.1 DSpark)
-- `DSparkDraftModel`'s default target sharing, block sampling and context-KV
-  fan-out, and the draft layers' slot hand-off
+- `DSparkDraftModel`'s default target sharing, block sampling, block
+  backbone and context-KV fan-out, and the draft layers' slot hand-off
 - `draft_rope_kwargs`, the drafts' shared rope arguments, and the Kimi-K3 MLA
   draft's
 
@@ -275,6 +275,160 @@ def test_the_draft_layer_writes_at_the_slots_it_is_handed(module, layer):
     slots = torch.arange(4)
     layer_cls.write_context_kv(stub, torch.zeros(4, 8), torch.arange(4), slots)
     assert seen["slots"] is slots
+
+
+# ---- the default block backbone ---------------------------------------------
+
+
+def _old_k3_mla_and_m3_block_backbone(self, input_ids, positions, num_draft):
+    """`KimiK3DSpark.block_backbone` and `MiniMaxM3DSpark.block_backbone` as
+    they were before the base took them over (the two bodies were the same)."""
+    bs = input_ids.shape[0]
+    draft_ids = input_ids.new_full((bs, num_draft), self.noise_token_id)
+    draft_ids[:, 0] = input_ids
+    hidden = self.embed_tokens(draft_ids.view(-1))
+    residual = None
+    for layer in self.layers:
+        hidden, residual = layer(positions, hidden, residual)
+    hidden, _ = self.final_norm(hidden, residual)
+    return hidden
+
+
+def _old_gqa_block_backbone(self, input_ids, positions, num_draft):
+    """`KimiK3DSparkGQA.block_backbone` as it was, its final norm under the
+    name it now loads into."""
+    bs = input_ids.shape[0]
+    draft_ids = input_ids.new_full((bs, num_draft), self.noise_token_id)
+    draft_ids[:, 0] = input_ids
+    hidden = self.embed_tokens(draft_ids.view(-1))
+    positions = positions.clamp(max=self._rope_max_row)
+    residual = None
+    for layer in self.layers:
+        hidden, residual = layer(positions, hidden, residual)
+    hidden, _ = self.final_norm(hidden, residual)
+    return hidden
+
+
+def _backbone_stub(rope_positions, ops, hidden=8, vocab=13, n_layers=3):
+    """A `DSparkDraftModel` on small random modules that log every call, in
+    order, with copies of what each was handed."""
+    import torch
+
+    from atom.models.dspark_draft import DSparkDraftModel
+
+    def snap(t):
+        return None if t is None else t.clone()
+
+    class _Embed(torch.nn.Embedding):
+        def forward(self, ids):
+            ops.append(("embed", snap(ids)))
+            return super().forward(ids)
+
+    class _Layer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = torch.nn.Linear(hidden, hidden)
+
+        def forward(self, positions, hidden_states, residual):
+            ops.append(("layer", snap(positions), snap(hidden_states), snap(residual)))
+            residual = hidden_states if residual is None else hidden_states + residual
+            rope = positions[:, None].float().cos()
+            return self.proj(residual) * rope, residual
+
+    class _Norm(torch.nn.Module):
+        def forward(self, hidden_states, residual):
+            ops.append(("final_norm", snap(hidden_states), snap(residual)))
+            x = hidden_states + residual
+            return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6), x
+
+    attrs = {} if rope_positions is None else {"rope_positions": rope_positions}
+    draft = type("StubDraft", (DSparkDraftModel,), attrs)()
+    draft.noise_token_id = vocab - 1
+    draft._rope_max_row = 29
+    draft.embed_tokens = _Embed(vocab, hidden)
+    draft.layers = torch.nn.ModuleList(_Layer() for _ in range(n_layers))
+    draft.final_norm = _Norm()
+    return draft
+
+
+def _clamp_at_the_rope_row(self, positions):
+    return positions.clamp(max=self._rope_max_row)
+
+
+def _gqa_rope_positions():
+    mod = gpu_stack_import("atom.models.kimi_k3_dspark_gqa")
+    return mod.KimiK3DSparkGQA.rope_positions
+
+
+@pytest.mark.parametrize(
+    "hook, old_body",
+    [
+        pytest.param(
+            lambda: None, _old_k3_mla_and_m3_block_backbone, id="k3_mla_and_m3"
+        ),
+        pytest.param(
+            lambda: _clamp_at_the_rope_row, _old_gqa_block_backbone, id="clamp_hook"
+        ),
+        pytest.param(_gqa_rope_positions, _old_gqa_block_backbone, id="k3_gqa"),
+    ],
+)
+def test_the_default_block_backbone_is_each_drafts_old_body(hook, old_body):
+    """Op for op and bit for bit: the same calls on the same inputs in the same
+    order, and the same output, as the per-draft body it replaces."""
+    import torch
+
+    torch.manual_seed(0)
+    ops = []
+    draft = _backbone_stub(hook(), ops)
+    bs, T = 3, 4
+    input_ids = torch.randint(0, 12, (bs,))
+    positions = torch.randint(0, 40, (bs * T,))
+    given = positions.clone()
+
+    with torch.no_grad():
+        out = draft.block_backbone(input_ids, positions, T)
+        new_ops, ops[:] = list(ops), []
+        expected = old_body(draft, input_ids, positions, T)
+
+    assert torch.equal(out, expected)
+    assert [op[0] for op in new_ops] == [op[0] for op in ops]
+    for new, old in zip(new_ops, ops):
+        for a, b in zip(new[1:], old[1:]):
+            assert (a is None and b is None) or torch.equal(a, b), new[0]
+    assert torch.equal(positions, given)
+
+
+@pytest.mark.parametrize(
+    "module, cls",
+    [
+        ("atom.models.kimi_k3_dspark", "KimiK3DSpark"),
+        ("atom.models.kimi_k3_dspark_gqa", "KimiK3DSparkGQA"),
+        ("atom.models.minimax_m3.dspark", "MiniMaxM3DSpark"),
+    ],
+)
+def test_the_standalone_drafts_run_the_default_block_backbone(module, cls):
+    from atom.models.dspark_draft import DSparkDraftModel
+
+    draft_cls = getattr(gpu_stack_import(module), cls)
+    assert draft_cls.block_backbone is DSparkDraftModel.block_backbone
+
+
+def test_init_block_fields_reads_the_shared_fields_off_the_config():
+    """The tapped layers are a tuple whatever the config holds, and the Markov
+    head spans the vocabulary at the configured rank."""
+    draft = _stub_draft()
+    config = types.SimpleNamespace(
+        dspark_noise_token_id=163824,
+        dspark_target_layer_ids=[7, 23, 51],
+        dspark_markov_rank=4,
+        vocab_size=16,
+    )
+    draft.init_block_fields(config)
+    assert draft.noise_token_id == 163824
+    assert draft.target_layer_ids == (7, 23, 51)
+    head = draft.markov_head
+    assert (head.vocab_size, head.rank) == (16, 4)
+    assert tuple(head.markov_w1.weight.shape) == (16, 4)
 
 
 # ---- the shared rope parser -------------------------------------------------
