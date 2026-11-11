@@ -1982,3 +1982,73 @@ def test_prefix_spread_provisional_edges_are_not_merged():
     mgr._release_seq(2)
     assert router._rank_hits(follower.prompt_hash_chain, 2) == ({0: 4096}, 0)
     assert len(router.index) == 1
+
+
+def _hit(router, chain, rank):
+    return router._rank_hits(chain, 2)[0].get(rank, 0)
+
+
+def test_prefix_spread_trim_cuts_the_tail_of_the_oldest_history_and_keeps_its_head():
+    router = _make_spread_mgr()._prefix_router
+    old = _chain_seq(1, 100 * 128)
+    for rank, seq_id in ((0, 1), (1, 2)):  # both ranks hold the same history
+        router.place(_chain_seq(seq_id, 100 * 128), rank, 2)
+        router.prefill_complete(seq_id)
+    router.CAP = 100 * 128
+    newcomer = _chain_seq(3, 10 * 128, first_block=5_000)
+    router.charge(3, router.place(newcomer, 0, 2).credit)  # 10 blocks over budget
+    assert router.indexed_tokens == router.CAP
+    # Only the excess is shed, from the tail; every holder keeps the same head.
+    assert _hit(router, old.prompt_hash_chain, 0) == 90 * 128
+    assert _hit(router, old.prompt_hash_chain, 1) == 90 * 128
+    assert _hit(router, newcomer.prompt_hash_chain, 0) == 10 * 128
+    router.prefill_complete(3)
+    router.CAP = 0
+    router.reset()
+    assert not router.index and router.indexed_tokens == 0
+
+
+def test_prefix_spread_trim_spreads_the_cut_over_histories():
+    router = _make_spread_mgr()._prefix_router
+    chains = [_chain_seq(i + 1, 80 * 128, first_block=i * 1_000) for i in range(16)]
+    for seq in chains:
+        router.place(seq, 0, 2)
+        router.prefill_complete(seq.id)
+    router.CAP = 16 * 80 * 128 // 2
+    router.reset()  # trims to the budget
+    kept = [_hit(router, seq.prompt_hash_chain, 0) // 128 for seq in chains]
+    assert router.indexed_tokens == router.CAP == sum(kept) * 128
+    assert min(kept) > 0  # no session lost its owner pointer
+    assert max(kept) < 80  # and each paid a share
+
+
+def test_prefix_spread_trim_never_cuts_an_interval_still_being_prefilled():
+    router = _make_spread_mgr()._prefix_router
+    history = _chain_seq(1, 50 * 128, first_block=1_000)
+    router.place(history, 0, 2)
+    router.prefill_complete(1)
+    producing = [
+        _chain_seq(2, 50 * 128, first_block=2_000),
+        _chain_seq(3, 10 * 128, first_block=3_000),
+    ]
+    router.CAP = 80 * 128
+    for seq in producing:
+        router.charge(seq.id, router.place(seq, 0, 2).credit)
+    # 110 blocks indexed against 80: only the finished history can pay.
+    assert _hit(router, history.prompt_hash_chain, 0) == 20 * 128
+    assert [_hit(router, s.prompt_hash_chain, 0) for s in producing] == [
+        50 * 128,
+        10 * 128,
+    ]
+    assert router.indexed_tokens == router.CAP
+    # Over budget with nothing finished left to shed: pinned edges stay whole.
+    router.CAP = 0
+    router.place(_chain_seq(4, 128, first_block=4_000), 1, 2)
+    assert [_hit(router, s.prompt_hash_chain, 0) for s in producing] == [
+        50 * 128,
+        10 * 128,
+    ]
+    for seq in producing:
+        router.release(seq.id)
+    router.reset()
+    assert not router.index and router.indexed_tokens == 0

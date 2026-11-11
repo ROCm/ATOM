@@ -548,9 +548,19 @@ class PrefixSpreadRouter:
             return
         # The budget covers unique edges, not replicated rank holders. Pinned
         # active edges may exceed it; releasing them makes them evictable.
+        # Shed from the tail of the oldest leaf, at most an eighth of it per
+        # visit: its head still names the owner rank, and rotating through the
+        # leaves spreads the cut over many histories instead of emptying one.
         while self.indexed_tokens > self.CAP and self._evictable:
             edge = next(iter(self._evictable))
-            self._drop_edge(edge)
+            excess = -(-(self.indexed_tokens - self.CAP) // edge.hbs)
+            cut = min(excess, max(1, len(edge.hashes) // 8))
+            if cut < len(edge.hashes):
+                del edge.hashes[-cut:]
+                self.indexed_tokens -= cut * edge.hbs
+                self._refresh_evictable(edge)  # next victim: another history
+            else:
+                self._drop_edge(edge)
 
     def _left_unprefilled(self, seq_id) -> dict:
         """Transfer an unfinished producer's intervals and credit debt once."""
