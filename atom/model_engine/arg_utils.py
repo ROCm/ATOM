@@ -320,10 +320,15 @@ class EngineArgs:
         )
         parser.add_argument(
             "--kv_cache_dtype",
-            choices=["bf16", "fp8"],
+            choices=["bf16", "fp8", "mxfp4", "mxfp4_b16", "mxfp4_fp8rope", "nvfp4"],
             type=str,
             default="bf16",
-            help="KV cache type. Default is 'bf16'.",
+            help="KV cache type. Default is 'bf16'. 'mxfp4' (E8M0 scale per 32 "
+            "values) and 'nvfp4' (E4M3 scale per 16) pack the MLA latent and "
+            "rope into E2M1 for the gfx1250 Gluon decode; 'mxfp4_b16' takes "
+            "an E8M0 scale per 16 values and 'mxfp4_fp8rope' keeps rope in "
+            "FP8. They need ATOM_MLA_KV_SHUFFLED=1, "
+            "ATOM_USE_TRITON_MLA=1 and --block-size 128.",
         )
         parser.add_argument(
             "--index-cache-dtype",

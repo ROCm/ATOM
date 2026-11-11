@@ -77,6 +77,13 @@ from atom.model_ops.indexer import (
     fp8_rows,
 )
 from atom.model_ops.indexer.schedule import any_layer_skips_index_topk
+from atom.model_ops.mla_fp4_kv import (
+    FP4_KV_BLOCK_SIZE,
+    is_fp4_kv_cache,
+    mla_kv_cache_row_width,
+    mla_kv_cache_torch_dtype,
+    mla_query_torch_dtype,
+)
 from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace
 from atom.model_ops.sparse_indexer_fp4 import (
     fp4_index_scale_rows,
@@ -495,8 +502,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             _warn_legacy_shuffle_kv()
         self.kv_shuffled = bool(envs.ATOM_MLA_KV_SHUFFLED)
         if self.kv_shuffled:
-            assert model_runner.block_size == 64, (
-                f"ATOM_MLA_KV_SHUFFLED=1 expects --block-size 64 "
+            shuffled_block_size = (
+                FP4_KV_BLOCK_SIZE
+                if is_fp4_kv_cache(model_runner.kv_cache_dtype)
+                else 64
+            )
+            assert model_runner.block_size == shuffled_block_size, (
+                f"ATOM_MLA_KV_SHUFFLED=1 expects --block-size {shuffled_block_size} "
                 f"for {model_runner.kv_cache_dtype} KV cache, "
                 f"got --block-size {model_runner.block_size}"
             )
@@ -550,8 +562,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         self._fp4_launches = Fp4LaunchStorages(
             self.device, self.max_num_batched_tokens, self.max_bs
         )
-        self.dtype_kv = dtypes.d_dtypes[config.kv_cache_dtype]
-        self.dtype_q = self.dtype_kv
+        self.dtype_kv = mla_kv_cache_torch_dtype(config.kv_cache_dtype)
+        self.dtype_q = mla_query_torch_dtype(config.kv_cache_dtype)
 
         self.dcp_world_size = get_dcp_world_size()
         self.dcp_rank = get_dcp_rank()
@@ -1506,11 +1518,16 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             if runner.has_mla_indexer
             else {}
         )
+        kv_cache_dtype = runner.config.kv_cache_dtype
         return MlaKvPool(
             layers=self._kv_pool_layers(),
             block_size=runner.block_size,
-            entry_dim=mla_kv_entry_dim(hf_config),
-            kv_dtype=dtypes.d_dtypes[runner.config.kv_cache_dtype],
+            entry_dim=mla_kv_cache_row_width(
+                mla_kv_entry_dim(hf_config),
+                hf_config.qk_rope_head_dim,
+                kv_cache_dtype,
+            ),
+            kv_dtype=mla_kv_cache_torch_dtype(kv_cache_dtype),
             **indexer,
         )
 

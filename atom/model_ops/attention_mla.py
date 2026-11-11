@@ -72,6 +72,7 @@ from atom.model_ops.dcp_ops import dcp_all_gather_prefill_query_heads
 from atom.model_ops.indexer.schedule import skips_index_topk
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import use_triton_gemm
+from atom.model_ops.mla_fp4_kv import FP4_KV_BLOCK_SIZE, is_fp4_kv_cache
 from atom.model_ops.triton_fused_mla_ctx_kv import fused_mla_ctx_norm_rope_cache
 from atom.model_ops.triton_fused_qkv_quant import (
     fused_kv_per_tensor_quant,
@@ -250,6 +251,54 @@ def check_kv_shuffled_supported(
     if unsupported:
         raise ValueError(
             "ATOM_MLA_KV_SHUFFLED does not support: " + ", ".join(unsupported)
+        )
+
+
+def check_fp4_kv_cache_supported(
+    atom_config,
+    *,
+    kv_cache_dtype: str,
+    use_triton_mla: bool,
+    kv_shuffled: bool,
+    is_sparse_mla: bool,
+    num_heads: int,
+) -> None:
+    """The packed FP4 cache is written by the shuffled Triton/Gluon writers and
+    read only by the gfx1250 Gluon decode. Every other MLA reader -- the
+    cached-context prefill gather, the ASM decode, sparse MLA, PCP's full-KV
+    write and the MTP draft pool -- still expects 576-wide BF16/FP8 rows.
+    FP8 rope is read by the decode's LDS pipeline only, which takes all 128
+    query heads of the MLA KV head in one program."""
+    from aiter.jit.utils.chip_info import get_gfx
+
+    unsupported = []
+    if get_gfx() != "gfx1250":
+        unsupported.append(f"{get_gfx()} (gfx1250 only)")
+    if kv_cache_dtype == "mxfp4_fp8rope" and num_heads != 128:
+        unsupported.append(f"{num_heads} query heads per rank (needs 128)")
+    if not kv_shuffled:
+        unsupported.append("ATOM_MLA_KV_SHUFFLED=0")
+    if not use_triton_mla:
+        unsupported.append("ATOM_USE_TRITON_MLA=0")
+    if atom_config.kv_cache_block_size != FP4_KV_BLOCK_SIZE:
+        unsupported.append(
+            f"--block-size {atom_config.kv_cache_block_size} "
+            f"(needs {FP4_KV_BLOCK_SIZE})"
+        )
+    if atom_config.enable_prefix_caching:
+        unsupported.append("prefix caching")
+    if atom_config.enable_chunked_prefill:
+        unsupported.append("chunked prefill")
+    if atom_config.speculative_config:
+        unsupported.append("speculative decoding")
+    if is_sparse_mla:
+        unsupported.append("sparse MLA")
+    if pcp_is_enabled():
+        unsupported.append("prefill context parallel")
+    if unsupported:
+        raise ValueError(
+            f"--kv_cache_dtype {kv_cache_dtype} does not support: "
+            + ", ".join(unsupported)
         )
 
 
@@ -596,6 +645,10 @@ def should_use_persistent_mode(
 
 
 class MLAAttention(nn.Module):
+    # Packed-FP4 layout name for the shuffled writers and the Gluon decode;
+    # inert unless the cache is FP4 (see __init__).
+    fp4_kv_format = "nvfp4"
+
     def __init__(
         self,
         num_heads: int,
@@ -615,7 +668,15 @@ class MLAAttention(nn.Module):
         self.head_dim = head_dim
         self.scale = float(scale)
         self.num_kv_heads = num_kv_heads
-        self.kv_cache_dtype = "fp8" if kv_cache_dtype.startswith("fp8") else "auto"
+        if is_fp4_kv_cache(kv_cache_dtype):
+            self.kv_cache_dtype = kv_cache_dtype
+        else:
+            self.kv_cache_dtype = "fp8" if kv_cache_dtype.startswith("fp8") else "auto"
+        # The shuffled writers and the Gluon decode take the packed format by
+        # name; the default is inert for BF16/FP8 caches.
+        self.fp4_kv_format = (
+            kv_cache_dtype if is_fp4_kv_cache(kv_cache_dtype) else "nvfp4"
+        )
         self.dtype = dtype
 
         self.min_query_heads = kwargs.get("min_query_heads", _MLA_MIN_HEADS)
@@ -784,6 +845,15 @@ class MLAAttention(nn.Module):
                 is_sparse_mla=self.is_sparse_mla,
                 dcp_world_size=self.dcp_world_size,
                 mla_page_size=envs.ATOM_MLA_PAGE_SIZE,
+            )
+        if is_fp4_kv_cache(self.kv_cache_dtype):
+            check_fp4_kv_cache_supported(
+                atom_config,
+                kv_cache_dtype=self.kv_cache_dtype,
+                use_triton_mla=self.use_triton_mla,
+                kv_shuffled=self.kv_shuffled,
+                is_sparse_mla=self.is_sparse_mla,
+                num_heads=self.num_heads,
             )
         if self.dcp_world_size > 1:
             from atom.model_ops.dcp_ops import CPTritonContext
@@ -2528,7 +2598,8 @@ class MLAAttention(nn.Module):
                 get_current_atom_config().kv_cache_block_size
             )
         block_size = self._shuffle_block_size_cached
-        d = self.kv_lora_rank + self.qk_rope_head_dim
+        # kv_lora_rank + qk_rope_head_dim values, or their packed FP4 bytes.
+        d = kv_cache.shape[-1]
         num_token_slots = kv_cache.shape[0]
         num_blocks = num_token_slots // block_size
         # [num_token_slots, 1, d] -> [num_blocks, block_size, d] -> [.., 1, ..]
@@ -2697,6 +2768,7 @@ class MLAAttention(nn.Module):
                 self._q_scale if q.element_size() == 1 else None,
                 self._k_scale,
                 shuffled_kv_cache=self.kv_shuffled,
+                fp4_kv_format=self.fp4_kv_format,
             )
         elif self.kv_shuffled:
             kv_buffer = self._shuffled_kv_view(kv_c_and_k_pe_cache)
@@ -2908,6 +2980,7 @@ class MLAAttention(nn.Module):
                 self._k_scale,
                 apply_scale=True,
                 shuffled_kv_cache=True,
+                fp4_kv_format=self.fp4_kv_format,
             )
         elif self.use_seg_mla:
             kv_cache_seg = self._seg_kv_cache_view(kv_cache)
@@ -3070,6 +3143,7 @@ class MLAAttention(nn.Module):
                         self._k_scale,
                         apply_scale=True,
                         shuffled_kv_cache=True,
+                        fp4_kv_format=self.fp4_kv_format,
                     )
                 elif self.use_seg_mla:
                     # Write the KV cache in the segmented layout so the
@@ -3217,6 +3291,7 @@ class MLAAttention(nn.Module):
                         apply_scale=True,
                         q_out=q_out,
                         shuffled_kv_cache=True,
+                        fp4_kv_format=self.fp4_kv_format,
                     )
                 elif self.use_seg_mla and self.dcp_world_size <= 1:
                     kv_cache_seg = self._seg_kv_cache_view(kv_cache)
