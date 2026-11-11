@@ -45,6 +45,7 @@ from aiter.dist.parallel_state import (
 )
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
+from atom.model_ops.kimi_k3 import apply_attn_res
 from atom.model_ops.layernorm import rmsnorm2d_fwd_
 from atom.models.kimi_k3.mono.config import (
     MAX_ROWS,
@@ -115,6 +116,36 @@ class WidthBuild:
             + [(f, k2.ABI) for f in self.k2_launchers.values()]
             + ix
         )
+
+
+def _bf16_attn_res(site, prefix, blocks, add, add2):
+    """``AttnRes.forward`` with no quant folded into its out_norm. Where that
+    out_norm fuses a block-scale FP8 in_proj's quant, ``forward`` returns a
+    ``(quantized, scale)`` pair on both of its branches -- the mix as well as
+    the nothing-to-mix one -- while K1 reads the bf16 normed row."""
+    if site.out_quant_dtype is None:
+        return site(prefix, blocks, add, add2)
+    if prefix is None:
+        prefix, add, add2 = add, add2, None
+    norm = site.out_norm
+    if site.enabled and blocks.shape[1] > 0:
+        if site.score_weight is None:
+            site.process_weights_after_loading()
+        return apply_attn_res(
+            prefix,
+            blocks,
+            site.score_weight,
+            site.eps,
+            add,
+            norm.weight,
+            site.out_eps,
+            add2,
+        )
+    if add is not None:
+        prefix = prefix + add
+        if add2 is not None:
+            prefix = prefix + add2
+    return rmsnorm2d_fwd_(prefix, norm.weight, norm.eps, norm.dim), prefix
 
 
 def ix_peer_offset(max_rows: int) -> int:
@@ -556,18 +587,17 @@ class K3MonoDecodeRunner:
             )
         return core, prefix
 
-    def _seam(self, plan, prefix, blocks, add, add2):
-        """The layer's attention-side AttnRes seam, on the blocks behind it."""
+    def _seam(self, plan, prefix, blocks, add, add2, bf16=False):
+        """The layer's attention-side AttnRes seam, on the blocks behind it.
+        ``bf16``: the normed row as K1 reads it, never the ``(quantized,
+        scale)`` pair a block-scale FP8 in_proj's out_norm folds in."""
         layer = self.inner.layers[plan.layer_id]
         before, write_idx = layer_block(plan.layer_id)
         site = layer.self_attention_attn_res
-        normed, prefix = site(prefix, blocks[:, :before], add, add2)
-        if isinstance(normed, tuple):
-            # With nothing to mix, the site returns its out_norm's own output,
-            # which folds a block-scale FP8 in_proj's quant; K1 reads the bf16
-            # row that out_norm computes without it.
-            norm = site.out_norm
-            normed = rmsnorm2d_fwd_(prefix, norm.weight, norm.eps, norm.dim)
+        if bf16:
+            normed, prefix = _bf16_attn_res(site, prefix, blocks[:, :before], add, add2)
+        else:
+            normed, prefix = site(prefix, blocks[:, :before], add, add2)
         return layer, normed, prefix, before, write_idx
 
     def _write_aux(self, layer_id: int, out: tuple) -> None:

@@ -497,7 +497,7 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             out = self._fallback(plan, positions, prefix, blocks, add, add2)
         else:
             layer, normed, prefix, _, write_idx = self._seam(
-                plan, prefix, blocks, add, add2
+                plan, prefix, blocks, add, add2, bf16=True
             )
             if write_idx >= 0:
                 blocks[:, write_idx].copy_(prefix)

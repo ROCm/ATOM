@@ -166,9 +166,14 @@ def test_k1_reads_the_production_seam_and_hands_its_core_to_k2(layer_id):
     core = torch.full((rows, hidden), 2.0)
     calls = {}
 
-    def self_attention_attn_res(value, visible, add_hidden, add_hidden2):
-        calls["seam"] = visible.shape[1]
-        return value + add_hidden + 10, value + add_hidden
+    class Seam:
+        out_quant_dtype = None
+
+        def __call__(self, value, visible, add_hidden, add_hidden2):
+            calls["seam"] = visible.shape[1]
+            return value + add_hidden + 10, value + add_hidden
+
+    self_attention_attn_res = Seam()
 
     def o_proj(value):
         calls["core"] = value
@@ -207,6 +212,48 @@ def test_k1_reads_the_production_seam_and_hands_its_core_to_k2(layer_id):
     if write_idx >= 0:
         torch.testing.assert_close(blocks[:, write_idx], prefix + add)
     assert all(tensor is None or tensor.shape == prefix.shape for tensor in out)
+
+
+@pytest.mark.parametrize("candidates", (0, 3))
+def test_k1_seam_is_bf16_where_out_norm_folds_fp8_quant(monkeypatch, candidates):
+    import atom.models.kimi_k3.mono.runner as base_module
+
+    rows, hidden = 2, 4
+    prefix = torch.zeros(rows, hidden)
+    add = torch.ones_like(prefix)
+    blocks = torch.zeros(rows, candidates, hidden)
+    calls = {}
+    # not callable: the quant-folding site itself must not feed K1
+    site = SimpleNamespace(
+        out_quant_dtype=dtypes.fp8,
+        enabled=True,
+        score_weight=torch.ones(hidden),
+        eps=1e-6,
+        out_eps=1e-5,
+        out_norm=SimpleNamespace(weight=torch.ones(hidden), eps=1e-5, dim=hidden),
+    )
+
+    def apply_attn_res(*args, **kwargs):
+        calls["mix"] = (len(args), kwargs)
+        return args[0] + args[4] + 7, args[0] + args[4]
+
+    def rmsnorm(value, *_args):
+        calls["norm"] = value.clone()
+        return value + 3
+
+    monkeypatch.setattr(base_module, "apply_attn_res", apply_attn_res)
+    monkeypatch.setattr(base_module, "rmsnorm2d_fwd_", rmsnorm)
+    normed, out_prefix = base_module._bf16_attn_res(site, prefix, blocks, add, None)
+
+    torch.testing.assert_close(out_prefix, prefix + add)
+    if candidates:
+        # the mix itself, normed, with no quant dtype handed down
+        assert calls["mix"] == (8, {}) and "norm" not in calls
+        torch.testing.assert_close(normed, prefix + add + 7)
+    else:
+        assert "mix" not in calls
+        torch.testing.assert_close(calls["norm"], prefix + add)
+        torch.testing.assert_close(normed, prefix + add + 3)
 
 
 def test_runner_admits_only_supported_rows_and_query_lengths():
