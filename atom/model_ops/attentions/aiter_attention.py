@@ -717,11 +717,13 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                         offset = len(kv_fields) * num_layers
                     consumer_indices.append(offset + row)
                 if field in cache_fields:
-                    dtype, layout = pool.kv_dtype, "mha_shuffle"
+                    dtype, layout, dim = pool.kv_dtype, "mha_shuffle", pool.head_dim
                 elif per_head:
-                    dtype, layout = torch.float32, "head_token"
+                    dtype, layout, dim = torch.float32, "head_token", pool.head_dim
                 else:
-                    dtype, layout = tensor.dtype, "bytes"
+                    # The indexer keys' own format: the pool stores them as uint8.
+                    index = self._index_cache_spec()
+                    dtype, layout, dim = index.dtype, "bytes", index.dim
                 pages.append(
                     page_region(
                         tensor,
@@ -731,7 +733,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                             namespace="mha",
                             field=field,
                             row=row,
-                            head_dim=pool.head_dim,
+                            head_dim=dim,
                             dtype=str(dtype),
                             layout=layout,
                         ),

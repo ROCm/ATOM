@@ -38,6 +38,7 @@ from atom.model_ops.attention_mha import (
 )
 
 BLOCK, HEAD_DIM, LAYERS = 128, 128, 8
+INDEX = (128, torch.float8_e4m3fn)  # the indexer keys' width and dtype
 SPARSE = (0, 2, 6)  # the layers with an indexer
 # Layers per stage, as VLLM_PP_LAYER_PARTITION gives them.
 PARTITIONS = [(2, 2, 2, 2), (3, 2, 2, 1)]
@@ -56,16 +57,20 @@ class _Layer:
             self.impl = object.__new__(PagedAttentionImpl)
 
 
-def _builder(layers, heads, kv_dtype=torch.float8_e4m3fn, head_dim=HEAD_DIM):
+def _builder(
+    layers, heads, kv_dtype=torch.float8_e4m3fn, head_dim=HEAD_DIM, index=INDEX
+):
     modules = [_Layer(n) for n in layers]
     indexed = [m for m in modules if m.layer_num in SPARSE]
+    index_dim, index_dtype = index
+    index_bytes = BLOCK * index_dim * index_dtype.itemsize
     pool = MhaKvPool(
         layers=len(modules),
         block_size=BLOCK,
         num_kv_heads=heads,
         head_dim=head_dim,
         kv_dtype=kv_dtype,
-        extra_fields=[EntryField("index", len(indexed), (BLOCK * 128,), torch.uint8)],
+        extra_fields=[EntryField("index", len(indexed), (index_bytes,), torch.uint8)],
     )
     pool.allocate(4, "cpu")
     geometry = KvGeometry(heads, head_dim)
@@ -76,6 +81,9 @@ def _builder(layers, heads, kv_dtype=torch.float8_e4m3fn, head_dim=HEAD_DIM):
         aiter_attention.INDEX_ROWS: {m: row for row, m in enumerate(indexed)},
     }
     builder.block_size, builder.block_ratio = BLOCK, 1
+    builder._index_cache_spec = lambda: aiter_attention._IndexCacheSpec(
+        len(indexed), index_dim, index_dtype
+    )
     builder.model_runner = SimpleNamespace(
         config=SimpleNamespace(
             hf_config=SimpleNamespace(num_hidden_layers=LAYERS),
@@ -126,12 +134,14 @@ def export(monkeypatch):
         partition=None,
         kv_dtype=torch.float8_e4m3fn,
         head_dim=HEAD_DIM,
+        index=INDEX,
         draft=False,
     ):
         sizes = partition or (LAYERS,)
         monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", ",".join(map(str, sizes)))
         start = sum(sizes[:rank])
-        builder = _builder(range(start, start + sizes[rank]), heads, kv_dtype, head_dim)
+        layers = range(start, start + sizes[rank])
+        builder = _builder(layers, heads, kv_dtype, head_dim, index)
         tt = _pp(monkeypatch, builder, rank, len(sizes)).get_kv_transfer_tensors()
         if draft and rank == len(sizes) - 1:
             tt.merge_pages(_draft(heads, kv_dtype))
@@ -431,6 +441,32 @@ def test_equal_byte_width_does_not_hide_an_incompatible_format(
     request = _request(theirs, [mem.add(4 * b, False) for _, _, b, _ in theirs], 0)
     with pytest.raises(RuntimeError, match="unit spec mismatch"):
         producer._execute_block_transfer(request, "consumer", [0], [0], "equal-bytes")
+    assert mem.writes == 0
+
+
+@pytest.mark.parametrize(
+    "producer_index",
+    [(64, torch.bfloat16), (128, torch.float8_e4m3fnuz)],
+)
+def test_equal_byte_width_does_not_hide_an_incompatible_index_format(
+    export, producer_index
+):
+    """The pool stores the indexer keys as uint8; their spec names the keys'
+    own width and dtype, so equal bytes per token still cannot pass."""
+    mem = _Memory()
+    tt = export(4, 0, (2, 2, 2, 2), index=producer_index)
+    producer = _producer(tt, mem, 4, 4)
+    theirs = _layout(export(1))
+    ours = [p for p in tt.pages if p.unit_spec.field == "index"]
+    assert ours and all(
+        p.region.unit_bytes == b
+        for p in ours
+        for *_, b, s in theirs
+        if s.field == "index"
+    )
+    request = _request(theirs, [mem.add(4 * b, False) for _, _, b, _ in theirs], 0)
+    with pytest.raises(RuntimeError, match="unit spec mismatch"):
+        producer._execute_block_transfer(request, "consumer", [0], [0], "equal-index")
     assert mem.writes == 0
 
 
