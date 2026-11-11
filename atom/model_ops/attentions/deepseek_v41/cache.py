@@ -15,9 +15,7 @@ from atom.model_ops.attentions.deepseek_v41.planes import (
 from atom.model_ops.attentions.pool_layout.entry_arena import EntryMajorArena
 from atom.model_ops.attentions.pool_layout.v41_pool_geometry import (
     INDEX_FP8_SCALE_FMT,
-    MAIN_FP4,
 )
-from atom.model_ops.blockscale import quantize_fp4, quantize_fp8
 from atom.model_ops.blockscale_kernels.quantization import FP8_DTYPE
 from atom.model_ops.deepseek_v41.candidate_table import bind_candidates
 from atom.model_ops.deepseek_v41.compressor import compress_batch
@@ -765,34 +763,30 @@ class PagedAttentionCache:
         self.pending = None
 
     def compress(self, owner, compressor, values, scores, step, rope):
-        # Quantize the rotated echo, then scatter each native plane.
-        scatter = (
-            None
-            if self.window_fp8
-            else (self.pages.view(f"main_{owner}")[0], step.block_tables)
-        )
-        latent, rotated = compress_batch(
-            self, owner, compressor, values, scores, step, rope, scatter=scatter
-        )
-        if rotated is not None:
-            self._scatter_rows(
-                tuple(
-                    plane.view(
-                        self.num_pages,
-                        self.geometry.rows_per_page(compressor.ratio),
-                        -1,
-                    )
-                    for plane in self.main_view(owner)
-                ),
-                step,
-                (
-                    quantize_fp4(rotated, **MAIN_FP4)
-                    if self.packed
-                    else quantize_fp8(rotated)
-                ),
-                compressor.ratio,
+        scale = None
+        mode = "none"
+        if self.window_fp8:
+            pages, scale = (
+                plane.view(
+                    self.num_pages, self.geometry.rows_per_page(compressor.ratio), -1
+                )
+                for plane in self.main_view(owner)
             )
-        return latent
+            mode = "planar_fp4" if self.packed else "planar_fp8"
+        else:
+            pages = self.pages.view(f"main_{owner}")[0]
+        return compress_batch(
+            self,
+            owner,
+            compressor,
+            values,
+            scores,
+            step,
+            rope,
+            scatter=(pages, step.block_tables),
+            quant_mode=mode,
+            cache_scale=scale,
+        )
 
     def write_index(self, owner, step, index, ratio):
         """One pass quantizes, preshuffles and scatters.

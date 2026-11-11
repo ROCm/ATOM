@@ -1291,6 +1291,7 @@ def bind_deepseek_v41_proxy_cache(
         # on the native path: it is sized before the memory profile and shared
         # with the throwaway profiling cache.
         workspace=builder.score_workspace,
+        prefill_window_staging=builder._prefill_window_staging,
         backing=raw,
     )
     from atom.plugin.vllm.state_slot_allocator import StateSlotAllocator
@@ -2317,20 +2318,18 @@ def _v41_checkpoint_restore(adapter, worker):
 def v41_page_planes(cache) -> list[tuple[str, torch.Tensor]]:
     """The PAGE-indexed planes of a bound V4.1 pool, in key-space order.
 
-    One main page plus that page's rows in each index plane -- the same
-    decomposition, in the same order, that ``PagedAttentionCache.unit_regions``
-    reports and that the native backend publishes to ``lmcache_mp``. The order
-    *is* the key space: an object stored under one plane order is unreadable
-    under another, so it is derived here from ``index_planes`` rather than
-    rebuilt by any caller.
+    Main page regions followed by each owner's index planes, in the same
+    order as ``PagedAttentionCache.unit_regions`` and the native backend's
+    ``lmcache_mp`` export. BF16 has one main page region; quantized caches
+    expose separate data/scale planes and any page padding. The order is the
+    stored object's key space, so derive it from the cache's region lists.
 
-    The STATE region is not here and must never be: ``page_bytes`` and the
-    index planes are views of the arena's head, while the per-request state is
-    a disjoint view of its tail. STATE is addressed by request slot, not by
-    page, so a positional mover would hand one request another's rings.
+    Per-request STATE regions are disjoint from these PAGE regions and are
+    excluded. STATE is addressed by request slot, not by page; a positional
+    mover would hand one request another's rings.
     """
     names = [name for name, _ in cache.geometry.index_planes]
-    return [("dsv41.page", cache.page_bytes)] + [
+    return [(f"dsv41.{name}", plane) for name, plane in cache.page_regions] + [
         (f"dsv41.{name}_plane.{owner}", plane)
         for owner, owned in cache.index_planes.items()
         for name, plane in zip(names, owned)

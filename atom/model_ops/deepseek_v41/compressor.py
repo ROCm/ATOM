@@ -18,21 +18,32 @@ class CompressorTail:
     scores: torch.Tensor
 
 
-def compress_batch(cache, owner, compressor, values, scores, step, rope, *, scatter):
+def compress_batch(
+    cache,
+    owner,
+    compressor,
+    values,
+    scores,
+    step,
+    rope,
+    *,
+    scatter,
+    quant_mode="none",
+    cache_scale=None,
+):
     """Every compression boundary in the batch, through V4's fused kernel.
 
-    `scatter` supplies the BF16 pages and block tables, or is None for
-    separate value/scale planes. Those planes quantize the kernel's rotated
-    BF16 echo so they retain the same rounding as the BF16 cache.
+    `scatter` supplies the value pages and block tables. For quantized caches,
+    `cache_scale` is the separate scale plane. The kernel rounds to BF16 before
+    quantizing and writes both planes directly.
 
-    Returns `(latent, rotated)`: the pre-RoPE index-key source and the
-    optional post-RoPE echo. Both are None when the plan has no rows.
+    Returns the pre-RoPE index-key source, or None when the plan has no rows.
     """
     ratio = compressor.ratio
     plan = step.plans[ratio]
     kv_state, score_state = cache.compress_state(owner)
     head_dim = values.shape[-1]
-    pages, block_tables = scatter or (None, None)
+    pages, block_tables = scatter
     # Ratio 1 has no gate, and a one-element softmax weighs 1 whatever the
     # score is, so the gate input only has to be finite.
     gate = values if scores is None else scores
@@ -50,13 +61,12 @@ def compress_batch(cache, owner, compressor, values, scores, step, rope, *, scat
     ring_in_launch = (
         capacity > 0 and 0 < step.max_q_len + ratio - 1 <= kv_state.shape[1]
     )
-    latent = rotated = None
+    latent = None
     if capacity:
         # BF16: what the index key's BF16 `wk` consumes.
         latent = torch.empty(
             capacity, head_dim, dtype=torch.bfloat16, device=values.device
         )
-        rotated = torch.empty_like(latent) if scatter is None else None
         fused_compress_attn(
             kv_in=values[0],
             score_in=gate[0],
@@ -76,14 +86,14 @@ def compress_batch(cache, owner, compressor, values, scores, step, rope, *, scat
             ratio=ratio,
             head_dim=head_dim,
             rope_head_dim=rope.rope_dim,
-            quant_mode="none",
+            quant_mode=quant_mode,
+            cache_scale=cache_scale,
             latent_out=latent,
-            rotated_out=rotated,
             write_plan=plan.write_plan_gpu if ring_in_launch else None,
             prefix=f"csa2.compress_{owner}",
         )
     if ring_in_launch:
-        return latent.unsqueeze(0), None if rotated is None else rotated.unsqueeze(0)
+        return latent.unsqueeze(0)
     # Unconditional -- a forward crossing no boundary still owes the ring its
     # projections, or the round that does cross one reads a position nobody
     # wrote.
@@ -100,8 +110,8 @@ def compress_batch(cache, owner, compressor, values, scores, step, rope, *, scat
         prefix=f"csa2.compress_state_{owner}",
     )
     if latent is None:
-        return None, None
-    return latent.unsqueeze(0), None if rotated is None else rotated.unsqueeze(0)
+        return None
+    return latent.unsqueeze(0)
 
 
 class Compressor(nn.Module):

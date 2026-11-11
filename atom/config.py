@@ -1724,6 +1724,9 @@ class DSparkConfig:
                 f"draft_kv_dtype={self.draft_kv_dtype} requires native DeepSeek-V4.1 "
                 f"DSpark with {' or '.join(t.upper() for t in target_dtypes)} target KV"
             )
+        from atom.models.deepseek_v41.draft_kv import validate_fp8_draft_support
+
+        validate_fp8_draft_support()
 
     @classmethod
     def from_dict(cls, cfg: dict | None) -> "DSparkConfig":
