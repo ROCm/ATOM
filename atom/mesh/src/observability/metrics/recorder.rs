@@ -437,6 +437,18 @@ impl MeshMetrics {
         gauge!(names::MANUAL_POLICY_CACHE_ENTRIES).set(count as f64);
     }
 
+    /// Record one session-affinity decision.
+    /// `result` is hit, new, rebind, or expired.
+    /// `scope` is regular, prefill, or decode, so the two PD tables stay separate.
+    pub fn record_session_affinity(result: &'static str, scope: &'static str) {
+        counter!(
+            names::SESSION_AFFINITY_TOTAL,
+            "result" => result,
+            "scope" => scope
+        )
+        .increment(1);
+    }
+
     /// Record prefix hash policy execution branch for routing decisions.
     pub fn record_worker_prefix_hash_policy_branch(branch: &'static str) {
         counter!(

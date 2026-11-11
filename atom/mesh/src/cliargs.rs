@@ -6,7 +6,8 @@ use crate::{
     config::{
         AtomPdRankMappingPolicy, BackendType, CircuitBreakerConfig, ConfigError, ConfigResult,
         HealthCheckConfig, MetricsConfig, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
-        TokenizerCacheConfig,
+        SessionAffinityConfig, SessionAffinityMode, SessionParentMode, TokenizerCacheConfig,
+        DEFAULT_SESSION_ID_HEADERS,
     },
     core::ConnectionMode,
     observability::metrics::PrometheusConfig,
@@ -258,6 +259,39 @@ pub struct CliArgs {
     /// Enable data parallelism aware scheduling
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     pub dp_aware: bool,
+
+    /// Headers checked in order for a session key. The first non-empty value wins.
+    /// `x-correlation-id` is not included: this router uses it as a per-request id.
+    #[arg(
+        long,
+        default_value = DEFAULT_SESSION_ID_HEADERS,
+        help_heading = "Routing Policy"
+    )]
+    pub session_id_headers: String,
+
+    /// Idle seconds before a session binding can be placed again. Default is 120 minutes.
+    #[arg(long, default_value_t = 7200, help_heading = "Routing Policy")]
+    pub session_affinity_ttl_secs: u64,
+
+    /// `hard` keeps the bound worker. `soft` is reserved for a policy that opts in
+    /// via `overrides_session_affinity`; no built-in policy does, so `soft`
+    /// currently keeps the binding as well.
+    #[arg(
+        long,
+        default_value = "hard",
+        value_parser = ["hard", "soft"],
+        help_heading = "Routing Policy"
+    )]
+    pub session_affinity_mode: String,
+
+    /// `independent` binds each session alone. `group` shares a binding across one parent's children.
+    #[arg(
+        long,
+        default_value = "independent",
+        value_parser = ["independent", "group"],
+        help_heading = "Routing Policy"
+    )]
+    pub session_parent_mode: String,
 
     // ==================== PD Disaggregation ====================
     /// Enable PD (Prefill-Decode) disaggregated mode
@@ -539,6 +573,43 @@ impl CliArgs {
         }
     }
 
+    fn session_affinity_config(&self) -> ConfigResult<SessionAffinityConfig> {
+        let mode = match self.session_affinity_mode.as_str() {
+            "hard" => SessionAffinityMode::Hard,
+            "soft" => SessionAffinityMode::Soft,
+            other => {
+                return Err(ConfigError::InvalidValue {
+                    field: "session_affinity_mode".to_string(),
+                    value: other.to_string(),
+                    reason: "expected hard or soft".to_string(),
+                });
+            }
+        };
+        let parent_mode = match self.session_parent_mode.as_str() {
+            "independent" => SessionParentMode::Independent,
+            "group" => SessionParentMode::Group,
+            other => {
+                return Err(ConfigError::InvalidValue {
+                    field: "session_parent_mode".to_string(),
+                    value: other.to_string(),
+                    reason: "expected independent or group".to_string(),
+                });
+            }
+        };
+        let session_id_headers = self
+            .session_id_headers
+            .split(',')
+            .map(|header| header.trim().to_ascii_lowercase())
+            .filter(|header| !header.is_empty())
+            .collect();
+        Ok(SessionAffinityConfig {
+            session_id_headers,
+            ttl_secs: self.session_affinity_ttl_secs,
+            mode,
+            parent_mode,
+        })
+    }
+
     fn validate_tls_args(&self) -> ConfigResult<()> {
         match (&self.tls_cert_path, &self.tls_key_path) {
             (Some(_), Some(_)) | (None, None) => Ok(()),
@@ -572,6 +643,7 @@ impl CliArgs {
         };
 
         let policy = self.parse_policy(&self.policy);
+        let session_affinity = self.session_affinity_config()?;
         let atom_pd_rank_mapping_policy = self
             .atom_pd_rank_mapping_policy
             .parse::<AtomPdRankMappingPolicy>()
@@ -613,6 +685,7 @@ impl CliArgs {
             .backend(self.backend.into())
             .atom_pd_rank_mapping_policy(atom_pd_rank_mapping_policy)
             .policy(policy)
+            .session_affinity(session_affinity)
             .connection_mode(connection_mode)
             .host(&self.host)
             .port(self.port)
@@ -834,6 +907,73 @@ mod tests {
             PolicyConfig::DpSticky
         ));
     }
+
+    #[test]
+    fn cli_session_affinity_flags_reach_router_config() {
+        let cli = Cli::try_parse_from([
+            "atomesh",
+            "launch",
+            "--session-affinity-ttl-secs",
+            "14400",
+            "--session-affinity-mode",
+            "soft",
+            "--session-parent-mode",
+            "group",
+            "--session-id-headers",
+            "x-session-affinity,x-correlation-id",
+        ])
+        .expect("session affinity flags should parse");
+        let args = match cli.command {
+            Some(Commands::Launch { args }) => args,
+            None => cli.router_args,
+        };
+        let config = args.to_router_config(Vec::new()).expect("router config");
+        assert_eq!(config.session_affinity.ttl_secs, 14400);
+        assert_eq!(config.session_affinity.mode, SessionAffinityMode::Soft);
+        assert_eq!(
+            config.session_affinity.parent_mode,
+            SessionParentMode::Group
+        );
+        assert_eq!(
+            config.session_affinity.session_id_headers,
+            vec![
+                "x-session-affinity".to_string(),
+                "x-correlation-id".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn cli_rejects_zero_session_ttl_and_empty_session_headers() {
+        let zero_ttl =
+            Cli::try_parse_from(["atomesh", "launch", "--session-affinity-ttl-secs", "0"])
+                .expect("zero ttl should parse");
+        let zero_ttl = match zero_ttl.command {
+            Some(Commands::Launch { args }) => args,
+            None => zero_ttl.router_args,
+        };
+        let ttl_error = zero_ttl
+            .to_router_config(Vec::new())
+            .expect_err("zero ttl should be rejected");
+        assert!(
+            ttl_error.to_string().contains("session_affinity_ttl_secs"),
+            "{ttl_error}"
+        );
+
+        let empty_headers = Cli::try_parse_from(["atomesh", "launch", "--session-id-headers", ","])
+            .expect("empty header list should parse");
+        let empty_headers = match empty_headers.command {
+            Some(Commands::Launch { args }) => args,
+            None => empty_headers.router_args,
+        };
+        let header_error = empty_headers
+            .to_router_config(Vec::new())
+            .expect_err("empty session headers should be rejected");
+        assert!(
+            header_error.to_string().contains("session_id_headers"),
+            "{header_error}"
+        );
+    }
 }
 
 impl Default for CliArgs {
@@ -854,6 +994,10 @@ impl Default for CliArgs {
             prefix_token_count: 256,
             prefix_hash_load_factor: 1.25,
             dp_aware: false,
+            session_id_headers: DEFAULT_SESSION_ID_HEADERS.to_string(),
+            session_affinity_ttl_secs: 7200,
+            session_affinity_mode: "hard".to_string(),
+            session_parent_mode: "independent".to_string(),
             pd_disaggregation: false,
             decode: Vec::new(),
             prefill_policy: None,

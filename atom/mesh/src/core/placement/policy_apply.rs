@@ -18,6 +18,7 @@ pub async fn apply_policy(
         tokens: descriptor.tokens,
         headers: descriptor.headers,
         hash_ring,
+        preferred_worker: None,
     };
     let idx = policy
         .select_worker(candidates, &info)

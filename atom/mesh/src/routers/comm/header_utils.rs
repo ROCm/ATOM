@@ -1,4 +1,7 @@
 use axum::{body::Body, extract::Request, http::HeaderMap};
+
+/// Parent session header. Group mode derives a shared binding from it.
+pub const PARENT_SESSION_HEADER: &str = "x-dynamo-parent-session-id";
 /// Copy request headers to a Vec of name-value string pairs
 /// Used for forwarding headers to backend workers
 pub fn copy_request_headers(req: &Request<Body>) -> Vec<(String, String)> {
@@ -63,6 +66,10 @@ pub fn should_forward_request_header(name: &str) -> bool {
         || name.eq_ignore_ascii_case("x-request-id")
         || name.eq_ignore_ascii_case("x-correlation-id")
         || name.eq_ignore_ascii_case("x-session-id")
+        || name.eq_ignore_ascii_case("x-dynamo-session-id")
+        || name.eq_ignore_ascii_case(PARENT_SESSION_HEADER)
+        || name.eq_ignore_ascii_case("x-session-affinity")
+        || name.eq_ignore_ascii_case("x-smg-routing-key")
         || name.eq_ignore_ascii_case("traceparent")
         || name.eq_ignore_ascii_case("tracestate")
         || name
@@ -70,11 +77,20 @@ pub fn should_forward_request_header(name: &str) -> bool {
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case(REQUEST_ID_PREFIX))
 }
 
-/// Return the non-empty session ID used as the data-parallel sticky routing key.
+/// Return the first non-empty header value in `names`.
 #[inline]
-pub fn extract_sticky_routing_key(headers: Option<&HeaderMap>) -> Option<&str> {
+pub fn extract_first_header<'a>(headers: Option<&'a HeaderMap>, names: &[&str]) -> Option<&'a str> {
+    let headers = headers?;
+    names
+        .iter()
+        .find_map(|name| extract_header_value(Some(headers), name))
+}
+
+/// Return one non-empty header value.
+#[inline]
+pub fn extract_header_value<'a>(headers: Option<&'a HeaderMap>, name: &str) -> Option<&'a str> {
     headers?
-        .get("x-session-id")?
+        .get(name)?
         .to_str()
         .ok()
         .filter(|value| !value.is_empty())
@@ -134,6 +150,10 @@ mod tests {
         assert!(should_forward_request_header("X-Correlation-ID"));
         assert!(should_forward_request_header("x-session-id"));
         assert!(should_forward_request_header("X-Session-ID"));
+        assert!(should_forward_request_header("x-dynamo-session-id"));
+        assert!(should_forward_request_header("X-Dynamo-Parent-Session-ID"));
+        assert!(should_forward_request_header("x-session-affinity"));
+        assert!(should_forward_request_header("X-SMG-Routing-Key"));
         assert!(should_forward_request_header("traceparent"));
         assert!(should_forward_request_header("Traceparent"));
         assert!(should_forward_request_header("tracestate"));
@@ -161,22 +181,23 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_sticky_routing_key() {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-session-id", HeaderValue::from_static("session-123"));
-        assert_eq!(
-            extract_sticky_routing_key(Some(&headers)),
-            Some("session-123")
-        );
-    }
-
-    #[test]
-    fn test_extract_sticky_routing_key_ignores_missing_or_empty_values() {
-        assert_eq!(extract_sticky_routing_key(None), None);
+    fn test_extract_first_header_skips_empty_and_uses_priority() {
+        let names = ["x-dynamo-session-id", "x-session-id", "x-session-affinity"];
+        assert_eq!(extract_first_header(None, &names), None);
 
         let mut headers = HeaderMap::new();
         headers.insert("x-session-id", HeaderValue::from_static(""));
-        assert_eq!(extract_sticky_routing_key(Some(&headers)), None);
+        assert_eq!(extract_first_header(Some(&headers), &names), None);
+
+        headers.insert("x-session-affinity", HeaderValue::from_static("affinity"));
+        headers.insert("x-correlation-id", HeaderValue::from_static("correlation"));
+        assert_eq!(
+            extract_first_header(Some(&headers), &names),
+            Some("affinity")
+        );
+
+        headers.insert("x-dynamo-session-id", HeaderValue::from_static("dynamo"));
+        assert_eq!(extract_first_header(Some(&headers), &names), Some("dynamo"));
     }
 
     // ===================== should_forward_header_no_alloc tests =====================

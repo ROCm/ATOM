@@ -1,162 +1,40 @@
 //! Data-parallel worker routing with session affinity.
 //!
-//! Requests carrying `X-Session-ID` are pinned to the first healthy worker
-//! selected for that session. A new session goes to the worker holding the
-//! fewest live sessions (load breaks ties); requests without a session ID use
-//! minimum-load balancing. A stale mapping is replaced when its worker is no
-//! longer healthy or the session has been idle for too long.
+//! The session table lives in [`super::session_affinity`]. This type is the
+//! `dp_sticky` facade: first placement still picks the healthy worker with the
+//! fewest live sessions (load breaks ties), and a request without a session
+//! key uses minimum load.
 
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
-    time::{Duration, Instant},
-};
+use std::sync::Arc;
 
 use async_trait::async_trait;
-use dashmap::DashMap;
 
-use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
-use crate::{core::Worker, routers::comm::header_utils::extract_sticky_routing_key};
-
-const SESSION_REASSIGNMENT_IDLE_TIMEOUT: Duration = Duration::from_secs(120 * 60);
-
-#[derive(Debug)]
-struct StickyAssignment {
-    worker: WorkerIdentity,
-    last_access: Instant,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct WorkerIdentity {
-    url: String,
-    dp_rank: Option<usize>,
-}
+use super::session_affinity::{SessionAffinityPolicy, SessionAffinityScope};
+use super::{LoadBalancingPolicy, SelectWorkerInfo};
+use crate::{config::SessionAffinityConfig, core::Worker};
 
 #[derive(Debug)]
 pub struct DpStickyPolicy {
-    /// Session ID -> worker identity. The DP rank distinguishes logical workers
-    /// that share a common endpoint URL.
-    assignments: DashMap<String, StickyAssignment>,
-    /// Serializes count -> choose -> insert for new sessions so a burst cannot
-    /// pin every session to the same DP rank. Established sessions use the
-    /// lock-free assignment lookup above.
-    assign_lock: Mutex<()>,
+    inner: SessionAffinityPolicy,
 }
 
 impl DpStickyPolicy {
     pub fn new() -> Self {
+        Self::with_config(
+            SessionAffinityConfig::default(),
+            SessionAffinityScope::Regular,
+        )
+    }
+
+    pub(crate) fn with_config(config: SessionAffinityConfig, scope: SessionAffinityScope) -> Self {
         Self {
-            assignments: DashMap::new(),
-            assign_lock: Mutex::new(()),
+            inner: SessionAffinityPolicy::dp_sticky_scoped(config, scope),
         }
     }
 
-    fn worker_identity(worker: &Arc<dyn Worker>) -> WorkerIdentity {
-        WorkerIdentity {
-            url: worker.url().to_string(),
-            dp_rank: worker.dp_rank(),
-        }
-    }
-
-    fn healthy_worker_for_identity(
-        workers: &[Arc<dyn Worker>],
-        identity: &WorkerIdentity,
-    ) -> Option<usize> {
-        workers
-            .iter()
-            .enumerate()
-            .find(|(_, worker)| {
-                worker.url() == identity.url
-                    && worker.dp_rank() == identity.dp_rank
-                    && worker.is_healthy()
-                    && worker.circuit_breaker().can_execute()
-            })
-            .map(|(index, _)| index)
-    }
-
-    /// Select the healthy worker with the smallest current request load.
-    fn select_low_load_worker(workers: &[Arc<dyn Worker>]) -> Option<usize> {
-        get_healthy_worker_indices(workers)
-            .into_iter()
-            .min_by_key(|&index| workers[index].load())
-    }
-
-    /// Select the healthy worker holding the fewest non-expired assignments,
-    /// tie-broken by current request load. Caller must hold `assign_lock`.
-    fn select_new_session_worker(
-        &self,
-        workers: &[Arc<dyn Worker>],
-        now: Instant,
-    ) -> Option<usize> {
-        let mut live_sessions: HashMap<WorkerIdentity, usize> = HashMap::new();
-        for entry in self.assignments.iter() {
-            if now.saturating_duration_since(entry.last_access) <= SESSION_REASSIGNMENT_IDLE_TIMEOUT
-            {
-                *live_sessions.entry(entry.worker.clone()).or_insert(0) += 1;
-            }
-        }
-
-        get_healthy_worker_indices(workers)
-            .into_iter()
-            .min_by_key(|&index| {
-                let identity = Self::worker_identity(&workers[index]);
-                (
-                    live_sessions.get(&identity).copied().unwrap_or(0),
-                    workers[index].load(),
-                )
-            })
-    }
-
-    fn select_worker_impl(
-        &self,
-        workers: &[Arc<dyn Worker>],
-        info: &SelectWorkerInfo<'_>,
-    ) -> Option<usize> {
-        let session_id = extract_sticky_routing_key(info.headers);
-        let Some(session_id) = session_id else {
-            return Self::select_low_load_worker(workers);
-        };
-        let now = Instant::now();
-
-        if let Some(mut assignment) = self.assignments.get_mut(session_id) {
-            let is_expired = now.saturating_duration_since(assignment.last_access)
-                > SESSION_REASSIGNMENT_IDLE_TIMEOUT;
-            if !is_expired {
-                if let Some(index) = Self::healthy_worker_for_identity(workers, &assignment.worker)
-                {
-                    assignment.last_access = now;
-                    return Some(index);
-                }
-            }
-        }
-
-        // New, expired, or orphaned sessions must assign atomically: another
-        // request may have pinned this session while this one waited for the lock.
-        let _assign_guard = self
-            .assign_lock
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if let Some(mut assignment) = self.assignments.get_mut(session_id) {
-            let is_expired = now.saturating_duration_since(assignment.last_access)
-                > SESSION_REASSIGNMENT_IDLE_TIMEOUT;
-            if !is_expired {
-                if let Some(index) = Self::healthy_worker_for_identity(workers, &assignment.worker)
-                {
-                    assignment.last_access = now;
-                    return Some(index);
-                }
-            }
-        }
-
-        let selected_index = self.select_new_session_worker(workers, now)?;
-        self.assignments.insert(
-            session_id.to_string(),
-            StickyAssignment {
-                worker: Self::worker_identity(&workers[selected_index]),
-                last_access: now,
-            },
-        );
-        Some(selected_index)
+    #[cfg(test)]
+    fn set_last_access(&self, key: &str, when: std::time::Instant) {
+        self.inner.set_last_access(key, when);
     }
 }
 
@@ -173,11 +51,31 @@ impl LoadBalancingPolicy for DpStickyPolicy {
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo<'_>,
     ) -> Option<usize> {
-        self.select_worker_impl(workers, info)
+        self.inner.select_worker(workers, info).await
+    }
+
+    fn on_request_complete(&self, worker_url: &str, success: bool) {
+        self.inner.on_request_complete(worker_url, success);
     }
 
     fn name(&self) -> &'static str {
         "dp_sticky"
+    }
+
+    fn needs_request_text(&self) -> bool {
+        self.inner.needs_request_text()
+    }
+
+    fn needs_tokens(&self) -> bool {
+        self.inner.needs_tokens()
+    }
+
+    fn update_loads(&self, loads: &std::collections::HashMap<String, isize>) {
+        self.inner.update_loads(loads);
+    }
+
+    fn reset(&self) {
+        self.inner.reset();
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -187,6 +85,8 @@ impl LoadBalancingPolicy for DpStickyPolicy {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use super::*;
     use crate::core::{BasicWorkerBuilder, DPAwareWorkerBuilder, WorkerType};
 
@@ -306,8 +206,12 @@ mod tests {
         assert_eq!(policy.select_worker(&workers, &info).await, Some(0));
         workers[0].increment_load();
         workers[0].increment_load();
-        policy.assignments.get_mut("session-1").unwrap().last_access =
-            Instant::now() - SESSION_REASSIGNMENT_IDLE_TIMEOUT - Duration::from_secs(1);
+        policy.set_last_access(
+            "session-1",
+            Instant::now()
+                - Duration::from_secs(SessionAffinityConfig::default().ttl_secs)
+                - Duration::from_secs(1),
+        );
 
         assert_eq!(policy.select_worker(&workers, &info).await, Some(1));
     }
