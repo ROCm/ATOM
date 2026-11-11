@@ -16,6 +16,9 @@ Also here: the sparse indexer's DCP support -- the decode candidate exchange
 (fused into one aiter op) and the sparse-prefill owned-slot filter.
 """
 
+import functools
+import logging
+
 import numpy as np
 import torch
 import triton
@@ -28,6 +31,8 @@ from atom.distributed.dcp_layout import (  # noqa: F401
 )
 from atom.distributed.dcp_utils import get_dcp_group, get_dcp_world_size
 from atom.utils.forward_context import get_published_dcp_local_context_lens
+
+logger = logging.getLogger("atom")
 
 # Token-ownership arithmetic lives in ``dcp_layout`` so P/D relayout can share
 # it without importing Triton. Re-exported here for existing attention callers.
@@ -706,6 +711,14 @@ def _dcp_a2a_unpack_combine_quant_kernel(
     )
 
 
+@functools.cache
+def _log_fused_merge():
+    """Say once a process that cp_lse_a2a takes aiter's fused merge."""
+    logger.info(
+        "DCP merge: aiter's fused all-to-all + LSE combine (cp_group.dcp_lse_merge)"
+    )
+
+
 def cp_lse_a2a(
     cp_attn_out,
     cp_attn_lse,
@@ -770,6 +783,7 @@ def cp_lse_a2a(
                 return_lse=return_lse,
             )
             if merged is not None:
+                _log_fused_merge()
                 return merged
 
     dtype = cp_attn_out.dtype
