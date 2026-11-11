@@ -242,6 +242,7 @@ CI 只负责记录。要查根因就另开任务，从 ATOM 的 `/debug-guide` �
 |---|---|
 | 每卡吞吐 (tok/s/GPU) | `total_token_throughput ÷ GPU 数`（输入加输出 token），即 dashboard 的 `tput_per_gpu` |
 | ITL P50 (ms) | `median_itl_ms` |
+| Interactive (tok/s/user)，只用于对比图 | `1000 ÷ mean_tpot_ms`，即 dashboard 上 Throughput vs Latency 图的横轴 |
 
 - `completed` 应该等于发出的请求数。`errors` 里有非空项时，把个数写进 `note`。
 
@@ -258,10 +259,10 @@ CI 只负责记录。要查根因就另开任务，从 ATOM 的 `/debug-guide` �
 | `gpus` | 每卡吞吐的分母 |
 | `concurrency` | `4` 或 `64` |
 | `status` | `ok` 或 `fail` |
-| `system_tok_s` | 整机吞吐：endpoint 为 `tps`，8k1k 为 `total_token_throughput` |
-| `tok_s_per_gpu` | `system_tok_s ÷ gpus`，保留两位小数 |
+| `tok_s_per_gpu` | 每卡吞吐，按 §4.1 计算，保留两位小数 |
 | `interactivity` | tok/s/user，只有 endpoint 填 |
 | `itl_p50_ms` | 只有 8k1k 填 |
+| `tpot_mean_ms` | 只有 8k1k 填，对比图的横轴由它换算 |
 | `image`、`base_image` | 测试镜像 tag、base 镜像 tag |
 | `atom_branch`、`atom_commit` | `main`、40 位 sha |
 | `aiter_branch`、`aiter_commit` | `main`、40 位 sha |
@@ -346,20 +347,23 @@ recipes/
 
 ### 5.2 对比图
 
-画法沿用 [LLM-Booster#246 的 MLPerf Endpoints 性能图](https://github.com/wuhuikx/LLM-Booster/issues/246#issuecomment-6678717093)，但**只画 455-CI 自己测的历史数据**，不画 NVIDIA、MI355、PD 模拟或任何其他来源的数据。
+MLPerf Endpoint 的图沿用 [LLM-Booster#246 的 MLPerf Endpoints 性能图](https://github.com/wuhuikx/LLM-Booster/issues/246#issuecomment-6678717093)，8K/1K 的图按 ATOM benchmark dashboard 的 Throughput vs Latency 图画。两种图都**只画 455-CI 自己测的历史数据**，不画 NVIDIA、MI355、PD 模拟或任何其他来源的数据。
 
 每个模型一张图，存为 `charts/<slug>.png`。数据全部取自 `history.csv`，每次连同本次结果一起重画，不手工改图。
 
 | | MLPerf Endpoint | 8K/1K |
 |---|---|---|
-| y 轴 | 每卡吞吐（输出 tok/s ÷ GPU 数） | 每卡吞吐（输入加输出 tok/s ÷ GPU 数） |
-| x 轴 | E2E average interactivity (tok/s/user) | ITL P50 (ms)，越往左越好 |
-| 标题 | `<模型> · MLPerf Endpoint: Throughput per GPU vs. E2E Average Interactivity` | `<模型> · 8K/1K: Throughput per GPU vs. ITL P50` |
+| y 轴 | 每卡吞吐（输出 tok/s ÷ GPU 数） | Total Tput per GPU（输入加输出 tok/s ÷ GPU 数） |
+| x 轴 | E2E average interactivity (tok/s/user) | Interactive (tok/s/user) = 1000 ÷ mean TPOT (ms) |
+| 连线 | 阶梯线，先向右再向下；最大并发那一端不加向左的短线（`stub: False`） | 点按 x 排序后直接连线 |
+| 标题 | `<模型> · Agentic: Throughput per GPU vs. E2E Average Interactivity` | `<模型> · 8K/1K: Total Tput per GPU vs. Interactive` |
 
-- **曲线**：每次 CI 一条，点是并发 4 和 64，每个点都标 cN。MLPerf Endpoint 照 #246 画阶梯线，先向右再向下，最大并发那一端不加向左的短线（`stub: False`）。8K/1K 的横轴是延迟，两点之间直接连线。
+下面这些两种图一样：
+
+- **曲线**：每次 CI 一条，点是并发 4 和 64，每个点都标 cN。
 - **画几条**：最近 4 次有数据的运行，对应色阶的 4 级。更早的留在 `history.csv` 里。
 - **颜色**：红色菱形，越新越深，从旧到新依次是 `#F5998A`、`#E8452C`、`#C42B4B`、`#9B1C1C`。不足 4 条时取最深的几级。
-- **线型**：最新的一条（通常就是本次）画实线，水平 4 px、竖直 2.4 px；其余画虚线，水平 3 px、竖直 1.8 px。
+- **线型**：最新的一条（通常就是本次）画实线，其余画虚线。阶梯线的实线水平 4 px、竖直 2.4 px，虚线水平 3 px、竖直 1.8 px；8K/1K 的直线实线 4 px、虚线 3 px。
 - **图例**只写名字和 GPU 数，例如 `AMD MI455 (ATOM main) · 11-15 · 8 GPUs`。副标题列出日期，例如 `455-CI · MI455 (gfx1250) · 10-25 → 11-01 → 11-08 → 11-15`，不再写模型名。
 - **本次跑挂**时图上没有本次的曲线，在图内右上角的 note 写 `11-15 run failed (N/A), see summary.`。
 - **脚注两行**：第一行写数据来源 `AMD MI455: 455-CI runs on ATOM main + aiter main, self-measured, not verified by MLCommons.`；第二行写坐标说明，加上 `cN = concurrency`。
@@ -390,4 +394,4 @@ git push origin 455-CI
 ## 6. 待补充
 
 - `455-CI-recipe.md`：各模型的 server 和 bench 命令，按 §3.1 的结构写。
-- 对比图的渲染脚本：复用 #246 的 `endpoint_chart.py`，加一个从 `history.csv` 生成曲线配置的 CI 版，并支持 8K/1K 的 ITL 横轴。放进 `455-CI/` 后，在 §5.2 写明用法。
+- 对比图的渲染脚本：复用 #246 的 `endpoint_chart.py`，加一个从 `history.csv` 生成曲线配置的 CI 版，并支持 8K/1K 的 dashboard 画法（点按 x 排序后直接连线）。放进 `455-CI/` 后，在 §5.2 写明用法。
