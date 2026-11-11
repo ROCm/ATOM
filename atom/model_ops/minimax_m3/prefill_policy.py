@@ -1,10 +1,14 @@
-"""Host launch policy for the MiniMax-M3 prefill index scorer."""
+"""Pure host policies for the MiniMax-M3 prefill indexer."""
 
 import functools
+from typing import NamedTuple
 
 # Block-axis chunks provide grid parallelism, so Q128 can retain page reuse.
 SCORE_BLOCK_SIZE_Q = 128
 SCORE_CHUNK_CTAS_PER_CU = 8
+PREFILL_TOPK_MIN_BLOCK_SIZE_K = 128
+PREFILL_TOPK_MAX_BLOCK_SIZE_K = 1024
+PREFILL_TOPK_NUM_WARPS = 1
 # Six workgroups per CU hid the score loop latency best across the MI455 sweep.
 _GFX1250_CTAS_PER_CU = 6
 # Q256 reuses each page across more rows; two workgroups per CU keep that larger
@@ -18,12 +22,62 @@ _GFX1250_Q64_BLOCKS_PER_CU = 4
 _GFX1250_MULTI_PLANE_CHUNK = 28
 
 
+class PrefillScoreConfig(NamedTuple):
+    """One scorer specialization selected entirely from launch-time bounds."""
+
+    block_size_q: int
+    chunk_blocks: int | None
+    num_warps: int | None
+    num_stages: int | None
+    store_group: int
+    prefetch_pages: bool
+    post_reduce_scale: bool
+
+
+DEFAULT_PREFILL_SCORE_CONFIG = PrefillScoreConfig(
+    block_size_q=SCORE_BLOCK_SIZE_Q,
+    chunk_blocks=None,
+    num_warps=None,
+    num_stages=None,
+    store_group=1,
+    prefetch_pages=False,
+    post_reduce_scale=False,
+)
+
+
 def _cdiv(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
 def _floor_power_of_two(value: int) -> int:
     return 1 << (max(1, value).bit_length() - 1)
+
+
+def parallel_prefill_selector_wins(
+    arch: str,
+    width: int,
+    rows: int,
+    compute_units: int,
+    emit: bool,
+    topk: int,
+    num_idx_heads: int,
+    decode_max_q: int,
+) -> bool:
+    """Whether parallel 1024-block local top-k passes repay their merge."""
+    num_tiles = _cdiv(width, PREFILL_TOPK_MAX_BLOCK_SIZE_K)
+    return (
+        arch == "gfx1250"
+        and decode_max_q == 0
+        and emit
+        and topk == 16
+        and num_idx_heads == 1
+        # The second tile has at least one block per CU.
+        and width - PREFILL_TOPK_MAX_BLOCK_SIZE_K >= compute_units
+        # Pay for the merge only when the extra tiles add two CTAs per CU.
+        and rows * (num_tiles - 1) >= 2 * compute_units
+        # Four local lists fit in sparse_bt's 128-int32 output row.
+        and width <= 4 * PREFILL_TOPK_MAX_BLOCK_SIZE_K
+    )
 
 
 def score_chunk_blocks(
@@ -44,38 +98,43 @@ def prefill_score_config(
     batch: int,
     heads: int,
     compute_units: int,
-) -> tuple[int, int | None, int | None, int | None, int, bool, bool]:
-    fallback = (SCORE_BLOCK_SIZE_Q, None, None, None, 1, False, False)
+) -> PrefillScoreConfig:
+    """Choose a scorer launch without consulting live device-side lengths.
+
+    ``None`` warp, stage, or chunk values mean that the generic launch policy
+    owns that field. Keeping that distinction in a named value makes the
+    policy/caller contract explicit and keeps CUDA Graph bounds stable.
+    """
     if arch != "gfx1250" or not is_fp8:
-        return fallback
+        return DEFAULT_PREFILL_SCORE_CONFIG
     # Unlike index heads, separate batches do not share score pages.
     if batch != 1:
-        return fallback
+        return DEFAULT_PREFILL_SCORE_CONFIG
 
     planes = heads
     q_tiles = _cdiv(max_query_len, SCORE_BLOCK_SIZE_Q)
     # The optimized paths repay their setup only with a long block row and more
     # than one Q128 tile per 16 CUs across independent heads.
     if max_block <= compute_units or q_tiles * planes <= _cdiv(compute_units, 16):
-        return fallback
+        return DEFAULT_PREFILL_SCORE_CONFIG
 
     if planes > 1:
         plane_tiles = q_tiles * planes
         if plane_tiles < _cdiv(compute_units, 2) or (
             max_block < 2 * compute_units and plane_tiles < compute_units
         ):
-            return fallback
+            return DEFAULT_PREFILL_SCORE_CONFIG
         # At both long-Q and long-context, fixed 28-page chunks over-split the grid.
         if max_block > 4 * compute_units and plane_tiles > 4 * compute_units:
-            return fallback
-        return (
-            SCORE_BLOCK_SIZE_Q,
-            _GFX1250_MULTI_PLANE_CHUNK,
-            2,
-            1,
-            1,
-            False,
-            True,
+            return DEFAULT_PREFILL_SCORE_CONFIG
+        return PrefillScoreConfig(
+            block_size_q=SCORE_BLOCK_SIZE_Q,
+            chunk_blocks=_GFX1250_MULTI_PLANE_CHUNK,
+            num_warps=2,
+            num_stages=1,
+            store_group=1,
+            prefetch_pages=False,
+            post_reduce_scale=True,
         )
 
     # A lone plane below one Q128 tile per eight CUs needs Q64 for occupancy.
@@ -87,7 +146,7 @@ def prefill_score_config(
         if max_query_len < 3 * max_block or q_tiles_64 > _cdiv(
             compute_units, _GFX1250_CTAS_PER_CU
         ):
-            return fallback
+            return DEFAULT_PREFILL_SCORE_CONFIG
         chunks = min(
             max_block,
             max(1, _cdiv(compute_units * _GFX1250_CTAS_PER_CU, q_tiles_64)),
@@ -96,23 +155,31 @@ def prefill_score_config(
         # Multiples of 16 pages are a repeatable memory-scheduling cliff on gfx1250.
         if chunk_blocks % 16 == 0:
             chunk_blocks += 1
-        return tile_q, chunk_blocks, 2, 3, 4, True, True
+        return PrefillScoreConfig(
+            block_size_q=tile_q,
+            chunk_blocks=chunk_blocks,
+            num_warps=2,
+            num_stages=3,
+            store_group=4,
+            prefetch_pages=True,
+            post_reduce_scale=True,
+        )
 
     if narrow_q:
         fallback_chunk = score_chunk_blocks(max_block, q_tiles, 1, compute_units)
         fallback_programs = q_tiles * _cdiv(max_block, fallback_chunk)
         if fallback_programs >= compute_units * (_GFX1250_CTAS_PER_CU - 1):
-            return fallback
+            return DEFAULT_PREFILL_SCORE_CONFIG
 
     if (
         not narrow_q
         and max_block < 2 * compute_units
         and q_tiles < _cdiv(compute_units, _GFX1250_CTAS_PER_CU)
     ):
-        return fallback
+        return DEFAULT_PREFILL_SCORE_CONFIG
     # A short context already exposes enough Q128 tiles at very large Q.
     if max_block < 4 * compute_units and q_tiles >= 2 * compute_units:
-        return fallback
+        return DEFAULT_PREFILL_SCORE_CONFIG
 
     tile_q = 256
     q_tiles = _cdiv(max_query_len, tile_q)
@@ -120,4 +187,12 @@ def prefill_score_config(
         max_block,
         max(1, compute_units * _GFX1250_WIDE_CTAS_PER_CU // q_tiles),
     )
-    return tile_q, _cdiv(max_block, chunks), 4, 1, 1, False, True
+    return PrefillScoreConfig(
+        block_size_q=tile_q,
+        chunk_blocks=_cdiv(max_block, chunks),
+        num_warps=4,
+        num_stages=1,
+        store_group=1,
+        prefetch_pages=False,
+        post_reduce_scale=True,
+    )

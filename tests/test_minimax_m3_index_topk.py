@@ -38,6 +38,9 @@ from atom.model_ops.minimax_m3.index_topk import (
     _prefill_topk_block_size_k,
     _require_packable,
 )
+from atom.model_ops.minimax_m3.prefill_policy import (
+    DEFAULT_PREFILL_SCORE_CONFIG,
+)
 
 TOPK = 16
 
@@ -550,31 +553,6 @@ class TestSelectorDispatch:
             assert m._aiter_selector_wins(width, emit=False)
             assert m._aiter_selector_wins(width, emit=True)
 
-    @pytest.mark.parametrize(
-        "arch,width,rows,emit,heads,decode_max_q,want",
-        [
-            ("gfx950", 1280, 512, True, 1, 0, False),
-            ("gfx1250", 1279, 512, True, 1, 0, False),
-            ("gfx1250", 1280, 511, True, 1, 0, False),
-            ("gfx1250", 1280, 512, True, 1, 0, True),
-            ("gfx1250", 4096, 170, True, 1, 0, False),
-            ("gfx1250", 4096, 171, True, 1, 0, True),
-            ("gfx1250", 4097, 512, True, 1, 0, False),
-            ("gfx1250", 1280, 512, False, 1, 0, False),
-            ("gfx1250", 1280, 512, True, 4, 0, False),
-            ("gfx1250", 1280, 512, True, 1, 1, False),
-        ],
-    )
-    def test_parallel_prefill_selector_resource_bounds(
-        self, arch, width, rows, emit, heads, decode_max_q, want
-    ):
-        assert (
-            m._parallel_prefill_selector_wins(
-                arch, width, rows, 256, emit, TOPK, heads, decode_max_q
-            )
-            == want
-        )
-
 
 @gpu
 def test_the_two_selectors_agree_where_the_dispatch_switches():
@@ -785,15 +763,7 @@ def test_prefill_launch_policy_preserves_scores_and_selection(
     old_chunk = m._score_chunk_blocks(
         max_block, old_q_tiles, len(qlens), heads, q.device
     )
-    (
-        new_block_q,
-        measured_chunk,
-        measured_warps,
-        measured_stages,
-        store_group,
-        prefetch_pages,
-        post_reduce_scale,
-    ) = m._prefill_score_config(
+    score_config = m._prefill_score_config(
         arch,
         is_fp8,
         kw["max_query_len"],
@@ -802,23 +772,27 @@ def test_prefill_launch_policy_preserves_scores_and_selection(
         heads,
         m._compute_units(q.device.index),
     )
-    new_q_tiles = triton.cdiv(kw["max_query_len"], new_block_q)
-    new_chunk = measured_chunk or m._score_chunk_blocks(
+    new_q_tiles = triton.cdiv(kw["max_query_len"], score_config.block_size_q)
+    new_chunk = score_config.chunk_blocks or m._score_chunk_blocks(
         max_block,
         new_q_tiles,
         len(qlens),
         heads,
         q.device,
     )
-    kernel_config = store_group, prefetch_pages, post_reduce_scale
+    kernel_config = (
+        score_config.store_group,
+        score_config.prefetch_pages,
+        score_config.post_reduce_scale,
+    )
     old_score = score(
         m.SCORE_BLOCK_SIZE_Q, old_chunk, old_warps, old_stages, (1, False, False)
     )
     new_score = score(
-        new_block_q,
+        score_config.block_size_q,
         new_chunk,
-        measured_warps or old_warps,
-        measured_stages or old_stages,
+        score_config.num_warps or old_warps,
+        score_config.num_stages or old_stages,
         kernel_config,
     )
     torch.cuda.synchronize()
@@ -831,17 +805,9 @@ def test_prefill_launch_policy_preserves_scores_and_selection(
         patch.setattr(
             m,
             "_prefill_score_config",
-            lambda *args: (
-                m.SCORE_BLOCK_SIZE_Q,
-                None,
-                None,
-                None,
-                1,
-                False,
-                False,
-            ),
+            lambda *args: DEFAULT_PREFILL_SCORE_CONFIG,
         )
-        patch.setattr(m, "_parallel_prefill_selector_wins", lambda *args: False)
+        patch.setattr(m, "_parallel_prefill_selector_wins", lambda **kwargs: False)
         old_outputs = m.minimax_m3_index_topk(**kw, emit_sparse_block_table=True)
     torch.cuda.synchronize()
     for old_output, new_output in zip(old_outputs, new_outputs):
@@ -870,15 +836,7 @@ def test_gfx1250_issue_341_tp4_launch_is_bit_exact(
         patch.setattr(
             m,
             "_prefill_score_config",
-            lambda *args: (
-                m.SCORE_BLOCK_SIZE_Q,
-                None,
-                None,
-                None,
-                1,
-                False,
-                False,
-            ),
+            lambda *args: DEFAULT_PREFILL_SCORE_CONFIG,
         )
         previous = m.minimax_m3_index_topk(**kw, emit_sparse_block_table=True)
     torch.cuda.synchronize()

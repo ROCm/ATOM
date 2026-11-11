@@ -33,10 +33,14 @@ import triton
 import triton.language as tl
 from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 
-from . import prefill_score_policy as _prefill_policy
+from . import prefill_policy as _prefill_policy
 
 SCORE_BLOCK_SIZE_Q = _prefill_policy.SCORE_BLOCK_SIZE_Q
 _prefill_score_config = _prefill_policy.prefill_score_config
+_parallel_prefill_selector_wins = _prefill_policy.parallel_prefill_selector_wins
+PREFILL_TOPK_MIN_BLOCK_SIZE_K = _prefill_policy.PREFILL_TOPK_MIN_BLOCK_SIZE_K
+PREFILL_TOPK_MAX_BLOCK_SIZE_K = _prefill_policy.PREFILL_TOPK_MAX_BLOCK_SIZE_K
+PREFILL_TOPK_NUM_WARPS = _prefill_policy.PREFILL_TOPK_NUM_WARPS
 
 from atom.model_ops.minimax_m3.geometry import SPARSE_BLOCK_SIZE
 from atom.model_ops.minimax_m3.mxfp4_pages import page_views
@@ -725,9 +729,6 @@ def _score_tile_keys(
 # only adds cross-lane work: 1 won all 28 cells of the sweep. Decode's selector
 # grid is 50-200 CTAs, far too few to fill the machine on their own, so it wants
 # the warps instead.
-PREFILL_TOPK_MIN_BLOCK_SIZE_K = 128
-PREFILL_TOPK_MAX_BLOCK_SIZE_K = 1024
-PREFILL_TOPK_NUM_WARPS = 1
 DECODE_TOPK_BLOCK_SIZE_K = 512
 DECODE_TOPK_NUM_WARPS = 8
 
@@ -853,25 +854,6 @@ _AITER_MIN_WIDTH_WITH_EMIT = 2048
 
 def _aiter_selector_wins(width, emit):
     return width >= (_AITER_MIN_WIDTH_WITH_EMIT if emit else _AITER_MIN_WIDTH)
-
-
-def _parallel_prefill_selector_wins(
-    arch, width, rows, compute_units, emit, topk, num_idx_heads, decode_max_q
-):
-    num_tiles = triton.cdiv(width, PREFILL_TOPK_MAX_BLOCK_SIZE_K)
-    return (
-        arch == "gfx1250"
-        and decode_max_q == 0
-        and emit
-        and topk == 16
-        and num_idx_heads == 1
-        # The second tile has at least one block per CU.
-        and width - PREFILL_TOPK_MAX_BLOCK_SIZE_K >= compute_units
-        # Pay for the merge only when the extra tiles add two CTAs per CU.
-        and rows * (num_tiles - 1) >= 2 * compute_units
-        # Four local lists fit in sparse_bt's 128-int32 output row.
-        and width <= 4 * PREFILL_TOPK_MAX_BLOCK_SIZE_K
-    )
 
 
 @triton.jit
@@ -1105,6 +1087,80 @@ def _select_with_aiter(
     return True
 
 
+def _parallel_prefill_selector_enabled(
+    score, *, emit, topk, num_idx_heads, decode_max_q
+):
+    """Apply the cheap shape gates before querying the device policy."""
+    if not (
+        decode_max_q == 0
+        and emit
+        and topk == 16
+        and num_idx_heads == 1
+        and PREFILL_TOPK_MAX_BLOCK_SIZE_K
+        < score.shape[2]
+        <= 4 * PREFILL_TOPK_MAX_BLOCK_SIZE_K
+    ):
+        return False
+
+    device_index = (
+        score.device.index
+        if score.device.index is not None
+        else torch.cuda.current_device()
+    )
+    return _parallel_prefill_selector_wins(
+        arch=get_gfx_runtime(),
+        width=score.shape[2],
+        rows=score.shape[1],
+        compute_units=_compute_units(device_index),
+        emit=emit,
+        topk=topk,
+        num_idx_heads=num_idx_heads,
+        decode_max_q=decode_max_q,
+    )
+
+
+def _launch_sparse_block_table_emit(
+    topk_idx,
+    *,
+    row_starts,
+    row_prefix,
+    batch,
+    topk,
+    block_table,
+    emit_args,
+    num_idx_heads,
+    rows_per_req,
+    decode_max_q,
+    block_page_stride,
+    pages_per_block,
+):
+    """Emit the sparse table after a selector that cannot fuse the write."""
+    sbt, sctx, bt_stride0, sbt_stride0 = emit_args
+    _emit_sparse_block_table_kernel[(rows_per_req, batch, num_idx_heads)](
+        topk_idx,
+        row_starts,
+        row_prefix,
+        topk,
+        *topk_idx.stride(),
+        block_table,
+        sbt,
+        sctx,
+        bt_stride0,
+        sbt_stride0,
+        1,  # sample_interval (block_size_q)
+        SPARSE_BLOCK_SIZE,
+        NUM_KV_HEADS=num_idx_heads,
+        DECODE_MAX_Q=decode_max_q,
+        pages_per_block=pages_per_block,
+        # A cache may pack several planes into a physical block, making its
+        # stride wider than the number of pages this logical block emits.
+        block_page_stride=block_page_stride,
+        # The 16x8 compaction has less work than one wave. More warps only add
+        # cross-wave work (prefill 8.03us -> 4.66us at one warp).
+        num_warps=1,
+    )
+
+
 def _launch_select(
     score,
     topk_idx,
@@ -1133,7 +1189,6 @@ def _launch_select(
     picks its tile from the shape, decode's are dense so both index arrays
     collapse to seq_lens and the tile and warp count have to be constants.
     """
-    sbt, sctx, bt_stride0, sbt_stride0 = emit_args
     # Bounds published and the row wide enough to pay for aiter; the selection
     # runs inside the check, which returns False on a shape aiter declines.
     # Without bounds the Triton kernel serves, holding the bound in registers --
@@ -1146,68 +1201,30 @@ def _launch_select(
         score, topk_idx, n_valid_column_per_row, topk, init_blocks, local_blocks
     ):
         if emit:
-            _emit_sparse_block_table_kernel[(rows_per_req, batch, num_idx_heads)](
+            _launch_sparse_block_table_emit(
                 topk_idx,
-                row_starts,
-                row_prefix,
-                topk,
-                *topk_idx.stride(),
-                block_table,
-                sbt,
-                sctx,
-                bt_stride0,
-                sbt_stride0,
-                1,  # sample_interval (block_size_q)
-                SPARSE_BLOCK_SIZE,
-                NUM_KV_HEADS=num_idx_heads,
-                DECODE_MAX_Q=decode_max_q,
-                pages_per_block=pages_per_block,
-                # Not PAGES_PER_SPARSE_BLOCK: a caller whose cache packs
-                # several planes into one block has a stride wider than the
-                # pages a block fills. Hard-coding the two to the same constant
-                # would emit a block table off by that difference per logical
-                # block on this path only -- the fused path below already
-                # takes the caller's value.
+                row_starts=row_starts,
+                row_prefix=row_prefix,
+                batch=batch,
+                topk=topk,
+                block_table=block_table,
+                emit_args=emit_args,
+                num_idx_heads=num_idx_heads,
+                rows_per_req=rows_per_req,
+                decode_max_q=decode_max_q,
                 block_page_stride=block_page_stride,
-                # The compaction alone is a `topk x pages_per_block` tile --
-                # 16x8 here -- so a wave is already more lanes than it has
-                # work, and the helper's cumsum stops crossing warps. The
-                # fused kernel reaches the same number from the other side
-                # (`PREFILL_TOPK_NUM_WARPS`); `DECODE_TOPK_NUM_WARPS` is 8 for
-                # the scoring this one does not do. Measured prefill device
-                # time 8.03us -> 4.66us, decode 2.63 -> 2.50, same bytes out.
-                num_warps=1,
+                pages_per_block=pages_per_block,
             )
         return
 
-    # A second 1024-wide tile with at least one block per CU repays a parallel
-    # first pass. Its partial keys reuse sparse_bt until the merge overwrites it.
-    parallel_prefill = False
-    if (
-        decode_max_q == 0
-        and emit
-        and topk == 16
-        and num_idx_heads == 1
-        and PREFILL_TOPK_MAX_BLOCK_SIZE_K
-        < score.shape[2]
-        <= 4 * PREFILL_TOPK_MAX_BLOCK_SIZE_K
+    # The partial keys reuse sparse_bt until the merge overwrites that row.
+    if _parallel_prefill_selector_enabled(
+        score,
+        emit=emit,
+        topk=topk,
+        num_idx_heads=num_idx_heads,
+        decode_max_q=decode_max_q,
     ):
-        device_index = (
-            score.device.index
-            if score.device.index is not None
-            else torch.cuda.current_device()
-        )
-        parallel_prefill = _parallel_prefill_selector_wins(
-            get_gfx_runtime(),
-            score.shape[2],
-            score.shape[1],
-            _compute_units(device_index),
-            emit,
-            topk,
-            num_idx_heads,
-            decode_max_q,
-        )
-    if parallel_prefill:
         _launch_parallel_prefill_selector(
             score,
             topk_idx,
@@ -1223,6 +1240,7 @@ def _launch_select(
         )
         return
 
+    sbt, sctx, bt_stride0, sbt_stride0 = emit_args
     _topk_index_packed_kernel[(rows_per_req, batch, num_idx_heads)](
         score,
         topk_idx,
@@ -1634,15 +1652,7 @@ def _triton_prefill_score(
     )
     arch = get_gfx_runtime()
     is_fp8 = index_kv_cache.dtype in _FP8_DTYPES
-    (
-        score_block_size_q,
-        measured_chunk,
-        measured_warps,
-        measured_stages,
-        store_group,
-        prefetch_pages,
-        post_reduce_scale,
-    ) = _prefill_score_config(
+    score_config = _prefill_score_config(
         arch,
         is_fp8,
         max_query_len,
@@ -1655,8 +1665,8 @@ def _triton_prefill_score(
             else torch.cuda.current_device()
         ),
     )
-    q_tiles = triton.cdiv(max_query_len, score_block_size_q)
-    chunk_blocks = measured_chunk or _score_chunk_blocks(
+    q_tiles = triton.cdiv(max_query_len, score_config.block_size_q)
+    chunk_blocks = score_config.chunk_blocks or _score_chunk_blocks(
         max_block, q_tiles, batch, num_idx_heads, idx_q.device
     )
     grid_score = (
@@ -1667,8 +1677,8 @@ def _triton_prefill_score(
     score_num_warps, score_num_stages = _prefill_score_launch_config(
         index_kv_cache.dtype
     )
-    score_num_warps = measured_warps or score_num_warps
-    score_num_stages = measured_stages or score_num_stages
+    score_num_warps = score_config.num_warps or score_num_warps
+    score_num_stages = score_config.num_stages or score_num_stages
     _index_block_score_kernel[grid_score](
         idx_q,
         index_kv_cache,
@@ -1691,11 +1701,11 @@ def _triton_prefill_score(
         score.stride(1),
         score.stride(2),
         block_table.stride(0),
-        BLOCK_SIZE_Q=score_block_size_q,
+        BLOCK_SIZE_Q=score_config.block_size_q,
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
-        STORE_GROUP=store_group,
-        PREFETCH_PAGES=prefetch_pages,
-        POST_REDUCE_SCALE=post_reduce_scale,
+        STORE_GROUP=score_config.store_group,
+        PREFETCH_PAGES=score_config.prefetch_pages,
+        POST_REDUCE_SCALE=score_config.post_reduce_scale,
         num_warps=score_num_warps,
         num_stages=score_num_stages,
     )
