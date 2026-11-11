@@ -42,6 +42,24 @@ def kv_config_has_producer(kv_config: object) -> bool:
     return any(kv_config_has_producer(sub) for sub in kv_config.get("connectors", []))
 
 
+def produced_no_handoff(seq: object) -> bool:
+    """Whether a finishing request on a P/D producer has nothing to hand off.
+
+    True when it was aborted or rejected as unschedulable, or when its prompt
+    prefill never completed on this scheduler (`Sequence.prefill_completed`).
+    Both reasons end a request that is leaving the waiting queue, so it holds
+    no blocks: one that never ran has no KV and no first token, and one that
+    ran, was preempted and is then rejected has had its blocks freed. A
+    producer then publishes a cancellation and keeps no send claim.
+    """
+    reason = getattr(seq, "leave_reason", None) or ""
+    return (
+        reason == "aborted"
+        or reason.startswith("unschedulable")
+        or not getattr(seq, "prefill_completed", True)
+    )
+
+
 @dataclass(frozen=True)
 class SaveOperationId:
     """Exact identity of one scheduler-issued PAGE/SLOT save generation.
@@ -102,6 +120,17 @@ class LoadOperationId:
 LoadCompletionId = ReqId | LoadOperationId
 
 
+def raw_req_id(completion: Any) -> ReqId:
+    """The request id of a completion id, bare or tagged with a generation, in
+    the type the engine compares against (`seq.id`)."""
+    return getattr(completion, "req_id", completion)
+
+
+def req_id_of(completion: Any) -> str:
+    """`raw_req_id` as a string key."""
+    return str(raw_req_id(completion))
+
+
 @dataclass(frozen=True)
 class StateStoreOperationId:
     """Exact identity of one hand-out of a state checkpoint to the CPU tier.
@@ -123,12 +152,25 @@ class StateStoreOperationId:
             raise ValueError("state store generation must be nonnegative")
 
 
+@dataclass(frozen=True)
+class StateTouchId:
+    """One LRU refresh of a voted state image. Every TP worker reports on its
+    own shard under this id, so the failure-dominant quorum says gone when any
+    shard is. `generation` keeps repeated touches of one hash distinct
+    identities.
+    """
+
+    prefix_hash: int
+    generation: int
+
+
 ConnectorCompletionId = (
     ReqId
     | SaveOperationId
     | SaveSourceGroupId
     | LoadOperationId
     | StateStoreOperationId
+    | StateTouchId
 )
 ConnectorCompletionKey = tuple[str, ConnectorCompletionId]
 
@@ -208,6 +250,23 @@ class KVTransferRegion:
 
 
 @dataclass(frozen=True)
+class PageUnitSpec:
+    """A PAGE unit's identity and byte interpretation, independent of TP.
+
+    Backends supply these fields directly, before formatting display names.
+    The per-rank head count lives in ``PageRegion.head_major_runs``; all fields
+    here must agree even when a transfer cuts heads.
+    """
+
+    namespace: str
+    field: str
+    row: int
+    head_dim: int
+    dtype: str
+    layout: str
+
+
+@dataclass(frozen=True)
 class PageRegion:
     """One PAGE region and the tensor that aliases exactly its bytes.
 
@@ -224,6 +283,7 @@ class PageRegion:
     # `(runs, heads)`: the unit is `runs` equal runs, each holding this rank's
     # `heads` KV heads one after another. None: not per head (replicated).
     head_major_runs: tuple[int, int] | None = None
+    unit_spec: PageUnitSpec | None = None
 
 
 @dataclass

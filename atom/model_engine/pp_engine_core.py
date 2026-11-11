@@ -15,7 +15,7 @@ from atom.kv_transfer.disaggregation.types import (
     KVConnectorOutput,
     connector_metadata_has_work,
 )
-from atom.model_engine.engine_core import EngineCore
+from atom.model_engine.engine_core import HELD_POLL_S, EngineCore
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.observability import tracing
 from atom.utils import envs
@@ -86,7 +86,9 @@ class PPEngineCoreProc(EngineCore):
                 shutdown = shutdown or self.pull_and_process_input_queue()
                 if shutdown:
                     break
-                if self._is_idle_rl_weights_offloaded():
+                if self._is_engine_held():
+                    self._report_held_kv_work()
+                    time.sleep(HELD_POLL_S)
                     continue
                 if self._in_flight or not self.scheduler.is_finished():
                     self._pp_head_step()
@@ -103,6 +105,57 @@ class PPEngineCoreProc(EngineCore):
             except Exception:
                 logger.exception("KV event publish during shutdown failed")
             self.scheduler.shutdown_kv_events()
+
+    def pause_generation(self, deadline: float) -> None:
+        """On the head, schedule nothing more and retire what is in flight.
+
+        Only the head schedules, so a later stage has nothing to pause; it
+        keeps forwarding what the head already sent, which is what lets the
+        head's batches complete. Raises, unpaused, if they do not by
+        *deadline*.
+        """
+        if not self.is_head:
+            return
+        self._generation_paused = True
+        try:
+            self._drain_pipeline(deadline)
+        except RuntimeError:
+            self._generation_paused = False
+            raise
+
+    def prepare_weight_sync(self, deadline: float) -> None:
+        """The head retires the batches in the pipeline before a sync's first
+        update. A later stage fenced by the sync forwards nothing, so they
+        must be done before it hears of the sync, which CoreManager tells it
+        only once the head has answered."""
+        if self.is_head:
+            self._drain_pipeline(deadline)
+
+    def prepare_kv_change(self, *, weights: bool, deadline: float) -> None:
+        """A KV change also waits for an empty pipeline: a batch in flight
+        still writes KV into blocks the change would zero or free. The later
+        stages run the change only once the head has answered, so until then
+        they forward what it sent."""
+        if self.is_head:
+            self._drain_pipeline(deadline)
+        super().prepare_kv_change(weights=weights, deadline=deadline)
+
+    def _drain_pipeline(self, deadline: float) -> None:
+        """Retire the batches in the pipeline; raise if some are left at
+        *deadline*. Schedules none, so the pipeline only empties."""
+        logged = time.monotonic()
+        while self._in_flight and time.monotonic() < deadline:
+            self._collect_pp_completions(_PP_IDLE_POLL_MS)
+            if self._in_flight and time.monotonic() - logged >= 1.0:
+                logged = time.monotonic()
+                logger.debug(
+                    f"{self.label}: {len(self._in_flight)} batch(es) still in "
+                    f"the pipeline, {max(0.0, deadline - logged):.0f}s left"
+                )
+        if self._in_flight:
+            raise RuntimeError(
+                f"{len(self._in_flight)} batch(es) still in the pipeline"
+            )
 
     def _pp_head_step(self):
         launched = 0
@@ -130,12 +183,10 @@ class PPEngineCoreProc(EngineCore):
                 break
 
             needs_output = scheduled_batch.produces_output()
-            # Middle chunks retire locally unless dynamic chunking is still
-            # shaping them. The decision rides on the batch, so the last stage
-            # acks exactly what this loop is about to wait for.
-            scheduled_batch.pp_completion_ack = (
-                not needs_output and self.scheduler.dynamic_chunking_active
-            )
+            # A middle chunk is acked too: nothing else tells the head that
+            # the last stage has run it, and a pause or a KV change must not
+            # take the pipeline for empty while a chunk still writes KV.
+            scheduled_batch.pp_completion_ack = not needs_output
             if (
                 self.kv_transfer_enabled
                 and scheduled_batch.connector_meta_output is not None
@@ -161,14 +212,13 @@ class PPEngineCoreProc(EngineCore):
         # that adopts a model calibrated from the prefills it launched.
         self._poll_dynamic_chunking_calibration()
 
-        poll_ms = 0 if launched else _PP_IDLE_POLL_MS
+        self._collect_pp_completions(0 if launched else _PP_IDLE_POLL_MS)
+
+    def _collect_pp_completions(self, poll_ms: int) -> None:
+        """Retire in-flight batches from the FIFO head as the last stage
+        completes them, waiting up to *poll_ms* for the first."""
         while self._in_flight:
             scheduled_batch, seqs, needs_output = self._in_flight[0]
-            if not needs_output and not scheduled_batch.pp_completion_ack:
-                self._in_flight.popleft()
-                self.scheduler.release_pp_inflight(scheduled_batch)
-                self._queue_or_flush_prefill_hashes(scheduled_batch, seqs)
-                continue
             completion = self.pp_transport.recv_completion(timeout_ms=poll_ms)
             if completion is None:
                 break
@@ -424,7 +474,13 @@ class PPEngineCoreProc(EngineCore):
                 shutdown = shutdown or self.pull_and_process_input_queue()
                 if shutdown:
                     break
-                if self._is_idle_rl_weights_offloaded():
+                if self._is_engine_held():
+                    # The head waits for every stage's report before a KV
+                    # change, so a fenced stage still reports; one whose
+                    # weights, and so its KV pool, are released runs nothing.
+                    if self.kv_transfer_enabled and not self._is_rl_weights_offloaded:
+                        self._poll_and_send_kv_status()
+                    time.sleep(HELD_POLL_S)
                     continue
                 batch = self.pp_transport.recv_metadata(timeout_ms=metadata_poll_ms)
                 if batch is None:

@@ -12,6 +12,7 @@ import pytest
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from atom.distributed.group_agreement import group_agree
 from atom.mono.runtime.abi import KernelAbi
 from atom.mono.runtime.compile import (
     _COMPILE_ONLY,
@@ -19,7 +20,6 @@ from atom.mono.runtime.compile import (
     kernel_resources,
     scratch_bytes,
 )
-from atom.mono.runtime.consensus import tp_agree
 
 FRAMEWORK = pathlib.Path(__file__).resolve().parents[1] / "atom" / "mono"
 
@@ -98,12 +98,12 @@ def test_compile_only_is_scoped(monkeypatch, before):
 
 
 def test_agree_alone():
-    assert tp_agree(True, None) and not tp_agree(False, None)
+    assert group_agree(True, None) and not group_agree(False, None)
 
 
 def _agree_worker(rank, world, init, refuser, out):
     dist.init_process_group("gloo", init_method=init, rank=rank, world_size=world)
-    out[rank] = tp_agree(rank != refuser, dist.group.WORLD)
+    out[rank] = group_agree(rank != refuser, dist.group.WORLD)
     dist.destroy_process_group()
 
 

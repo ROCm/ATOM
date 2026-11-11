@@ -205,7 +205,7 @@ jobs:
                   "model_path": "deepseek-ai/DeepSeek-V3.2",
                   "extra_args": "--trust-remote-code --tensor-parallel-size 4 --data-parallel-size 4 --expert-parallel-size 4 --enable-dp-attention --attention-backend aiter --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.85 --page-size 1 --disable-radix-cache",
                   "accuracy_test_threshold": 0.93,
-                  "env_vars": "SGLANG_AITER_FP8_PREFILL_ATTN=0\nSGLANG_USE_AITER=1\nATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1\nMORI_SHMEM_MODE=ISOLATION\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models",
+                  "env_vars": "SGLANG_AITER_FP8_PREFILL_ATTN=0\nSGLANG_USE_AITER=1\nATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1\nMORI_SHMEM_MODE=ISOLATION\nATOM_FUSE_SHARED_EXPERT=0\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models",
                   "runner": "linux-atom-pitt-mi350x-8",
               },
               {
@@ -214,7 +214,7 @@ jobs:
                   "model_path": "deepseek-ai/DeepSeek-V3.2",
                   "extra_args": "--trust-remote-code --tensor-parallel-size 8 --data-parallel-size 8 --expert-parallel-size 8 --enable-dp-attention --attention-backend aiter --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.85 --page-size 1 --disable-radix-cache",
                   "accuracy_test_threshold": 0.93,
-                  "env_vars": "SGLANG_AITER_FP8_PREFILL_ATTN=0\nSGLANG_USE_AITER=1\nATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1\nMORI_SHMEM_MODE=ISOLATION\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models",
+                  "env_vars": "SGLANG_AITER_FP8_PREFILL_ATTN=0\nSGLANG_USE_AITER=1\nATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1\nMORI_SHMEM_MODE=ISOLATION\nATOM_FUSE_SHARED_EXPERT=0\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models",
                   "runner": "linux-atom-pitt-mi350x-8",
               },
               {
@@ -436,7 +436,7 @@ jobs:
                   "toggle_env": "RUN_GLM52_FP8_TP4_PCP4",
                   "model_name": "GLM-5.2-FP8 TP4 PCP4",
                   "model_path": "zai-org/GLM-5.2-FP8",
-                  "extra_args": "--trust-remote-code --tp-size 4 --enable-nsa-prefill-context-parallel --attn-cp-size 4 --nsa-prefill-cp-mode round-robin-split --max-prefill-tokens 30720 --chunked-prefill-size 30720 --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.85 --disable-radix-cache --model-loader-extra-config '{\"online_quant_config\":{\"global_quant_config\":\"ptpc_fp8\",\"layer_quant_config\":{\"model.layers.*.mlp.experts\":\"per_block_fp8\"},\"exclude_layer\":[\"lm_head\",\"model.embed_tokens\",\"*.mlp.gate\"]}}'",
+                  "extra_args": "--trust-remote-code --tp-size 4 --enable-prefill-cp --attn-cp-size 4 --cp-strategy interleave --max-prefill-tokens 30720 --chunked-prefill-size 30720 --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.85 --disable-radix-cache --model-loader-extra-config '{\"online_quant_config\":{\"global_quant_config\":\"ptpc_fp8\",\"layer_quant_config\":{\"model.layers.*.mlp.experts\":\"per_block_fp8\"},\"exclude_layer\":[\"lm_head\",\"model.embed_tokens\",\"*.mlp.gate\"]}}'",
                   "lm_eval_num_fewshot": 5,
                   "lm_eval_num_concurrent": 65,
                   "accuracy_test_threshold": 0.92,

@@ -11,7 +11,11 @@ from __future__ import annotations
 
 import torch
 
-from atom.kv_transfer.disaggregation.types import KVTransferRegion, PageRegion
+from atom.kv_transfer.disaggregation.types import (
+    KVTransferRegion,
+    PageRegion,
+    PageUnitSpec,
+)
 
 
 def page_region(
@@ -21,6 +25,7 @@ def page_region(
     unit_bytes: int | None = None,
     total_bytes: int | None = None,
     head_major_runs: tuple[int, int] | None = None,
+    unit_spec: PageUnitSpec | None = None,
 ) -> PageRegion:
     """The region of ``tensor``'s PAGE blocks and a byte view aliasing them.
 
@@ -55,6 +60,7 @@ def page_region(
         ),
         view=byte_view.view(-1, 1, unit_bytes),
         head_major_runs=head_major_runs,
+        unit_spec=unit_spec,
     )
 
 

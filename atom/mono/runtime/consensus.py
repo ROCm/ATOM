@@ -8,23 +8,11 @@ on the GPU for ever. Each such decision is a local verdict agreed on over the TP
 group's CPU group before anything collective (peer handshake, launch) follows.
 """
 
-import torch
-import torch.distributed as dist
+from atom.distributed.group_agreement import group_agree
 
 
 class MonoUnsupported(Exception):
     """The loaded model or runtime configuration is outside what mono serves."""
-
-
-def tp_agree(ok: bool, group) -> bool:
-    """True when every rank of ``group`` passed ``ok`` true. Every rank must call
-    it at the same point; ``group`` is a CPU (gloo) process group, or None for a
-    single rank."""
-    if group is None:
-        return ok
-    flag = torch.tensor([int(ok)], dtype=torch.int32)
-    dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=group)
-    return bool(flag.item())
 
 
 def bind_agreed(bind, group) -> None:
@@ -33,10 +21,10 @@ def bind_agreed(bind, group) -> None:
     try:
         bind()
     except MonoUnsupported:
-        tp_agree(False, group)
+        group_agree(False, group)
         raise
     except Exception as error:
-        tp_agree(False, group)
+        group_agree(False, group)
         # Peers see only `another TP rank refused mono`, a MonoUnsupported that
         # LazyRunner catches and falls back on. A rank that failed for some
         # other reason -- an OOM dequantizing latent-MoE weights, say -- has to
@@ -44,7 +32,7 @@ def bind_agreed(bind, group) -> None:
         # catches and dies while every peer keeps serving. The original is
         # chained, and its type and message are in the refusal text.
         raise MonoUnsupported(f"{type(error).__name__}: {error}") from error
-    if not tp_agree(True, group):
+    if not group_agree(True, group):
         raise MonoUnsupported("another TP rank refused mono")
 
 

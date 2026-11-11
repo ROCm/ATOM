@@ -79,7 +79,7 @@ class DraftKvBuilder(PoolRowsMixin):
         `KeyError` is the one `pool_rows` promises.
 
         On demand is also what makes the block reachable, and it is the target
-        builder's: `propose` hands the draft the target's block tables, and the
+        builder's: `_propose` hands the draft the target's block tables, and the
         draft's kernels take the block off the cache they were bound to, so a
         block of its own would address one page with an id that counted
         another. There is nowhere in a draft to convert between the two -- it

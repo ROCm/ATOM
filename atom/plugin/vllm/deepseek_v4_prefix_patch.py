@@ -161,13 +161,18 @@ def apply_vllm_v4_profile_cache_patch() -> None:
                 # (0.29 added `kv_cache_allocation_context`), and a wrapper
                 # that names the parameters it knows turns a newly added one
                 # into a TypeError at the only call site that passes it.
-                result = original(self, kv_cache_config, *args, **kwargs)
+                #
+                # Marked before the original runs: a proxy bound inside it
+                # (V4.1 binds from `register_kv_caches`) has to see this
+                # call's mode. Marked after, V2's profiling stub was bound as
+                # a serving pool (too small) and the real init that follows
+                # read the stale profiling mark and declined to bind.
                 is_profiling = kwargs.get("is_profiling", args[0] if args else False)
                 _mark_v4_proxy_cache_mode(
                     self.compilation_config.static_forward_context,
                     is_profiling,
                 )
-                return result
+                return original(self, kv_cache_config, *args, **kwargs)
 
             wrapped_initialize_kv_cache._atom_v4_profile_cache_patched = True
             return wrapped_initialize_kv_cache

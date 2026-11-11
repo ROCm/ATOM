@@ -69,6 +69,7 @@ def _builder_bases():
 
     return _module(
         "atom.model_ops.attentions.backends",
+        PERSISTENT_WORK_BUFFERS=(),
         AttentionBackend=AttentionBackend,
         CommonAttentionBuilder=CommonAttentionBuilder,
     )
@@ -99,8 +100,7 @@ def mha_export_method():
         for node in builder.body
         if isinstance(node, ast.FunctionDef) and node.name == "get_kv_transfer_tensors"
     )
-    # The exporter's one module global: the indexer keys' row space.
-    namespace = {"INDEX_ROWS": "index"}
+    namespace = {"INDEX_ROWS": "index", "torch": torch}
     exec(  # noqa: S102 -- execute the local exporter under the CPU fixture
         compile(ast.Module(body=[method], type_ignores=[]), str(source), "exec"),
         namespace,
@@ -208,6 +208,9 @@ def mla_builder_cls():
             "atom.model_ops.attentions.sparse_mla_head_groups",
             HEADS=128,
             SparsePrefillHeadGroups=noop,
+        ),
+        "atom.model_ops.attentions.selection_pack": _module(
+            "atom.model_ops.attentions.selection_pack", pack_row_selections=noop
         ),
         "atom.model_ops.attentions.backends": _builder_bases(),
         "atom.model_ops.attentions.pool_layout.sub_pool_spec": _sub_pool_module(),

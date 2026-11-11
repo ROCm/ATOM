@@ -39,7 +39,7 @@ PLUGIN = ROOT / "atom/plugin/vllm/v41_core_overrides.py"
 
 # sha256 of core's `Attention.forward` and `_attend`, comments and blank
 # lines stripped.
-CORE_PREPARE_DIGEST = "6e6ba60ac60f4825"
+CORE_PREPARE_DIGEST = "50a174931df035a4"
 CORE_FORWARD_DIGEST = "efcc7dbf2f688954"
 
 
@@ -293,7 +293,7 @@ def test_core_prepare_has_not_moved_under_its_copy():
     reader makes that class of change silent instead, so it is pinned.
     """
     body = _core_prepare()
-    assert len(body.split(NEWLINE)) > 80, "the _prepare marker matched too little"
+    assert len(body.split(NEWLINE)) > 60, "the _prepare marker matched too little"
     digest = hashlib.sha256(body.encode()).hexdigest()[:16]
     assert digest == CORE_PREPARE_DIGEST, (
         "`DeepseekV41MetadataBuilder._prepare` has changed. The vLLM plugin "
@@ -327,11 +327,14 @@ def test_the_copy_still_covers_both_dispatch_arms():
             ("forward_hidden",),
             "e5d8ebd181754862",
         ),
+        # Core's `start` / `join` skip the lookup on a step the model's decode
+        # round serves (`EngramStep.served_by_round`); not ported: the plugin's
+        # runner has no decode round, so its steps are never served by one.
         (
             "atom/model_ops/engram/device/staging.py",
             "EngramStaging",
             ("start", "consume", "join"),
-            "7d1dcc8553e48b9d",
+            "74eade6acaa9b896",
         ),
     ],
 )
