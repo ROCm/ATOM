@@ -282,7 +282,7 @@ mod b_policy_apply {
             .await
             .unwrap();
         assert_eq!(recorder.call_count(), 1);
-        assert!(candidates.iter().any(|w| Arc::ptr_eq(w, &chosen)));
+        assert!(candidates.iter().any(|w| Arc::ptr_eq(w, &chosen.worker)));
     }
 
     #[tokio::test]
@@ -295,7 +295,7 @@ mod b_policy_apply {
             .await
             .unwrap();
         assert_eq!(recorder.call_count(), 1);
-        assert!(candidates.iter().any(|w| Arc::ptr_eq(w, &chosen)));
+        assert!(candidates.iter().any(|w| Arc::ptr_eq(w, &chosen.worker)));
     }
 
     #[tokio::test]
@@ -308,7 +308,7 @@ mod b_policy_apply {
             .await
             .unwrap();
         assert_eq!(recorder.call_count(), 1);
-        assert!(candidates.iter().any(|w| Arc::ptr_eq(w, &chosen)));
+        assert!(candidates.iter().any(|w| Arc::ptr_eq(w, &chosen.worker)));
     }
 
     #[tokio::test]
@@ -366,7 +366,7 @@ mod b_policy_apply {
         let calls = recorder.calls();
         assert_eq!(calls.len(), 1);
         assert!(calls[0].hash_ring.is_none());
-        assert!(candidates.iter().any(|w| Arc::ptr_eq(w, &chosen)));
+        assert!(candidates.iter().any(|w| Arc::ptr_eq(w, &chosen.worker)));
     }
 
     #[tokio::test]
@@ -462,7 +462,7 @@ mod b_policy_apply {
             let chosen = apply_policy(&candidates, &policy, &descriptor, None)
                 .await
                 .unwrap();
-            assert!(candidate_urls.iter().any(|u| u == chosen.url()));
+            assert!(candidate_urls.iter().any(|u| u == chosen.worker.url()));
         }
     }
 }

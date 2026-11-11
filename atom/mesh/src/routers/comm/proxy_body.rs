@@ -12,7 +12,7 @@ pub(crate) struct ProxyBody {
     status: StatusCode,
     finished: bool,
     remaining: Option<u64>,
-    _load: crate::core::WorkerLoadGuard,
+    load: crate::core::WorkerLoadGuard,
 }
 impl ProxyBody {
     pub(crate) fn response(
@@ -31,7 +31,7 @@ impl ProxyBody {
             status,
             finished: false,
             remaining,
-            _load: load,
+            load,
         };
         if remaining == Some(0) {
             body.finish(true);
@@ -76,6 +76,8 @@ impl http_body::Body for ProxyBody {
         let result = std::pin::Pin::new(&mut this.inner).poll_frame(cx);
         match &result {
             std::task::Poll::Ready(Some(Ok(frame))) => {
+                // The first byte follows the prefill.
+                this.load.release_prefill();
                 if let (Some(remaining), Some(data)) = (&mut this.remaining, frame.data_ref()) {
                     *remaining = remaining.saturating_sub(data.len() as u64);
                 }

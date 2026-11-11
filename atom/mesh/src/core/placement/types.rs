@@ -26,12 +26,16 @@ pub enum PlacementPlan {
     Single {
         worker: Arc<dyn Worker>,
         policy_name: &'static str,
+        /// Prompt tokens charged to `worker` until its prefill finishes.
+        prefill_tokens: usize,
     },
     Pair {
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
         prefill_policy: &'static str,
         decode_policy: &'static str,
+        /// Prompt tokens charged to `prefill` until its prefill finishes.
+        prefill_tokens: usize,
     },
 }
 

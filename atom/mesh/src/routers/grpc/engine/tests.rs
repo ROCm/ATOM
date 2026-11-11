@@ -825,6 +825,7 @@ mod e_engine_dispatch {
         let plan = PlacementPlan::Single {
             worker: mock_http_only_worker("http://unreachable:8000"),
             policy_name: "rr",
+            prefill_tokens: 0,
         };
         match Dispatcher::dispatch(&e, &plan, &mut basic_payload()).await {
             Ok(_) => panic!("expected ConnectionAcquireFailed"),
@@ -840,6 +841,7 @@ mod e_engine_dispatch {
             decode: mock_http_only_worker("http://d:8000"),
             prefill_policy: "rr",
             decode_policy: "rr",
+            prefill_tokens: 0,
         };
         match Dispatcher::dispatch(&e, &plan, &mut basic_payload()).await {
             Ok(_) => panic!("expected ConnectionAcquireFailed"),
@@ -854,6 +856,7 @@ mod e_engine_dispatch {
         let plan = PlacementPlan::Single {
             worker: mock_grpc_worker("http://w:8000", WorkerType::Regular),
             policy_name: "rr",
+            prefill_tokens: 0,
         };
         let _s = mock.dispatch(&plan, &mut basic_payload()).await.unwrap();
         let calls = mock.calls();
@@ -876,6 +879,7 @@ mod e_engine_dispatch {
             decode: mock_grpc_worker("http://d:8000", WorkerType::Decode),
             prefill_policy: "rr",
             decode_policy: "rr",
+            prefill_tokens: 0,
         };
         let _s = mock.dispatch(&plan, &mut basic_payload()).await.unwrap();
         let calls = mock.calls();
@@ -890,6 +894,7 @@ mod e_engine_dispatch {
         let plan = PlacementPlan::Single {
             worker: mock_grpc_worker("http://w:8000", WorkerType::Regular),
             policy_name: "rr",
+            prefill_tokens: 0,
         };
         match mock.dispatch(&plan, &mut basic_payload()).await {
             Ok(_) => panic!("expected RequestBuildFailed"),

@@ -48,8 +48,9 @@ impl DefaultPlanner {
         let chosen = apply_policy(&candidates, policy.as_ref(), req, hash_ring).await?;
 
         Ok(PlacementPlan::Single {
-            worker: chosen,
+            worker: chosen.worker,
             policy_name: policy.name(),
+            prefill_tokens: chosen.prefill_tokens,
         })
     }
 
@@ -82,7 +83,7 @@ impl DefaultPlanner {
         debug!(
             stage = "placement.pair.prefill_selected",
             model_id = req.model_id.unwrap_or(""),
-            prefill_url = prefill.url(),
+            prefill_url = prefill.worker.url(),
             policy = prefill_policy.name(),
             "prefill worker selected"
         );
@@ -90,10 +91,11 @@ impl DefaultPlanner {
             apply_policy(&decode_candidates, decode_policy.as_ref(), req, hash_ring).await?;
 
         Ok(PlacementPlan::Pair {
-            prefill,
-            decode,
+            prefill: prefill.worker,
+            decode: decode.worker,
             prefill_policy: prefill_policy.name(),
             decode_policy: decode_policy.name(),
+            prefill_tokens: prefill.prefill_tokens,
         })
     }
 }

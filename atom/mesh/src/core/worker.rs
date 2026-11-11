@@ -176,6 +176,15 @@ pub trait Worker: Send + Sync + fmt::Debug {
     /// Reset the load counter to 0 (for sync/recovery)
     fn reset_load(&self) {}
 
+    /// Prompt tokens placed on this worker whose prefill has not finished.
+    fn prefill_tokens(&self) -> usize;
+
+    /// Charge prefill tokens; pair with `release_prefill_tokens` via [`PrefillTokenGuard`].
+    fn charge_prefill_tokens(&self, tokens: usize);
+
+    /// Release tokens taken by `charge_prefill_tokens`.
+    fn release_prefill_tokens(&self, tokens: usize);
+
     /// Get the worker routing key load tracker
     fn worker_routing_key_load(&self) -> &WorkerRoutingKeyLoad;
 
@@ -487,6 +496,7 @@ pub struct WorkerMetadata {
 pub struct BasicWorker {
     pub metadata: WorkerMetadata,
     pub load_counter: Arc<AtomicUsize>,
+    pub prefill_token_counter: Arc<AtomicUsize>,
     pub worker_routing_key_load: Arc<WorkerRoutingKeyLoad>,
     pub processed_counter: Arc<AtomicUsize>,
     pub healthy: Arc<AtomicBool>,
@@ -642,6 +652,25 @@ impl Worker for BasicWorker {
     fn reset_load(&self) {
         self.load_counter.store(0, Ordering::Relaxed);
         self.update_running_requests_metrics();
+    }
+
+    fn prefill_tokens(&self) -> usize {
+        self.prefill_token_counter.load(Ordering::Relaxed)
+    }
+
+    fn charge_prefill_tokens(&self, tokens: usize) {
+        self.prefill_token_counter
+            .fetch_add(tokens, Ordering::Relaxed);
+        MeshMetrics::set_worker_prefill_tokens(self.url(), self.prefill_tokens());
+    }
+
+    fn release_prefill_tokens(&self, tokens: usize) {
+        let _ = self.prefill_token_counter.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| Some(current.saturating_sub(tokens)),
+        );
+        MeshMetrics::set_worker_prefill_tokens(self.url(), self.prefill_tokens());
     }
 
     fn worker_routing_key_load(&self) -> &WorkerRoutingKeyLoad {
@@ -858,6 +887,18 @@ impl Worker for DPAwareWorker {
         self.base_worker.reset_load();
     }
 
+    fn prefill_tokens(&self) -> usize {
+        self.base_worker.prefill_tokens()
+    }
+
+    fn charge_prefill_tokens(&self, tokens: usize) {
+        self.base_worker.charge_prefill_tokens(tokens);
+    }
+
+    fn release_prefill_tokens(&self, tokens: usize) {
+        self.base_worker.release_prefill_tokens(tokens);
+    }
+
     fn worker_routing_key_load(&self) -> &WorkerRoutingKeyLoad {
         self.base_worker.worker_routing_key_load()
     }
@@ -937,12 +978,48 @@ impl Worker for DPAwareWorker {
 /// immediately but the stream continues in the background.
 pub struct WorkerLoadGuard {
     worker: Arc<dyn Worker>,
+    prefill: Option<PrefillTokenGuard>,
 }
 
 impl WorkerLoadGuard {
     pub fn new(worker: Arc<dyn Worker>, _headers: Option<&http::HeaderMap>) -> Self {
         worker.increment_load();
-        Self { worker }
+        Self {
+            worker,
+            prefill: None,
+        }
+    }
+
+    /// Also hold `tokens` of prefill on the worker until this guard drops.
+    pub fn with_prefill_tokens(mut self, tokens: usize) -> Self {
+        if tokens > 0 {
+            self.prefill = Some(PrefillTokenGuard::new(self.worker.clone(), tokens));
+        }
+        self
+    }
+
+    /// Release the prefill charge early, e.g. once the first token is out.
+    pub fn release_prefill(&mut self) {
+        self.prefill = None;
+    }
+}
+
+/// Holds prefill tokens charged to a worker until dropped.
+pub struct PrefillTokenGuard {
+    worker: Arc<dyn Worker>,
+    tokens: usize,
+}
+
+impl PrefillTokenGuard {
+    pub fn new(worker: Arc<dyn Worker>, tokens: usize) -> Self {
+        worker.charge_prefill_tokens(tokens);
+        Self { worker, tokens }
+    }
+}
+
+impl Drop for PrefillTokenGuard {
+    fn drop(&mut self) {
+        self.worker.release_prefill_tokens(self.tokens);
     }
 }
 

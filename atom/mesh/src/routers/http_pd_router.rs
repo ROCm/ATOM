@@ -426,6 +426,7 @@ impl PDRouter {
             decode,
             prefill_policy,
             decode_policy,
+            prefill_tokens,
         } = plan
         else {
             return Err(error::internal_error(
@@ -451,7 +452,7 @@ impl PDRouter {
         }
         Ok(Arc::new(ReservedPair {
             load: parking_lot::Mutex::new(Some([
-                WorkerLoadGuard::new(prefill.clone(), headers),
+                WorkerLoadGuard::new(prefill.clone(), headers).with_prefill_tokens(prefill_tokens),
                 WorkerLoadGuard::new(decode.clone(), headers),
             ])),
             canceled: tokio::sync::watch::channel(false).0,
@@ -2278,6 +2279,7 @@ mod tests {
                         decode: decode.clone(),
                         prefill_policy: "round_robin",
                         decode_policy: "round_robin",
+                        prefill_tokens: 0,
                     },
                     None,
                 )
@@ -2418,6 +2420,7 @@ mod tests {
                     decode: decode.clone(),
                     prefill_policy: "round_robin",
                     decode_policy: "round_robin",
+                    prefill_tokens: 0,
                 },
                 None,
             )
@@ -2553,6 +2556,7 @@ mod tests {
                     decode: decode_rank_5.clone(),
                     prefill_policy: "round_robin",
                     decode_policy: "round_robin",
+                    prefill_tokens: 0,
                 },
                 None,
             )
