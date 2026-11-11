@@ -9,7 +9,7 @@ trees' kernels on the pages it wrote:
 * the K and index-K pages decode to what the FP8 build stored, within the two
   formats' quantization error;
 * the block scores K1 makes from the NVFP4 index pages (the ``q_frag`` dim order)
-  equal aiter's exact NVFP4 scorer on the pages K1 wrote, with K1's own index q, bit
+  equal aiter's NVFP4 scorer (``k_round="e4m3"``, e4m3 q) on the pages K1 wrote, with K1's own index q, bit
   for bit (blocks that hold no new token: K1 standalone does not wait for them).
 
 The reference trees are not part of this repo: ``ATOM_NVFP4_AITER_KERNELS`` (aiter's
@@ -288,7 +288,7 @@ def test_k1_nvfp4_pages_and_scores(tokens, ctx):
     rel = (got_ik - f8ik).norm(dim=-1) / f8ik.norm(dim=-1)
     assert (rel < 0.15).all(), rel
 
-    # scores: aiter's exact NVFP4 scorer on the pages K1 wrote, with K1's own index q
+    # scores: aiter's e4m3 NVFP4 scorer on the pages K1 wrote, with K1's own index q as e4m3
     kd_t = torch.as_strided(
         idx, (case.total_blocks, 128, 64), (NVFP4_PAGE_BYTES, 64, 1)
     )
@@ -296,8 +296,9 @@ def test_k1_nvfp4_pages_and_scores(tokens, ctx):
         idx, (case.total_blocks, 128, 8), (NVFP4_PAGE_BYTES, 8, 1), 128 * 64
     )
     want_s = scorer.score_flydsl_nvfp4(
-        nv["iq_out"].view(tokens, 1, HEAD_DIM), kd_t, ks_t, case.block_table,
-        case.seq, 1, 1, SM_SCALE, case.n_blk, k_round="exact",
+        nv["iq_out"].view(tokens, 1, HEAD_DIM).float().clamp(-448, 448).to(torch.float8_e4m3fn),
+        kd_t, ks_t, case.block_table,
+        case.seq, 1, 1, SM_SCALE, case.n_blk, k_round="e4m3",
     )  # fmt: skip
     scored = slice(0, case.n_blk - 1)  # the last block holds the new key (a race)
     mine, theirs = nv["iscore"][:, scored], want_s[0, :, scored]

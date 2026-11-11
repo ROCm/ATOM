@@ -2,7 +2,8 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Mono over an NVFP4 index cache (gfx950, single-buffer 9216 B pages): the block
 scores of ``build_index_score_kernel(nvfp4=True)`` against aiter's
-``score_flydsl_nvfp4`` (``k_round="exact"``) on the same pages, bit for bit, and
+``score_flydsl_nvfp4`` (``k_round="e4m3"`` with an e4m3 q, the served combination: K =
+e4m3_rn_satfinite(e2m1 x scale), q e4m3 as vLLM's quantizer makes it) on the same pages, bit for bit, and
 the top-16 selection they feed.
 
 The reference trees are not part of this repo: set ``ATOM_NVFP4_AITER_KERNELS`` (the
@@ -98,8 +99,9 @@ def test_mono_block_scores_equal_the_aiter_nvfp4_scorer_bit_for_bit(
     ks = torch.as_strided(
         pages, (total_blocks, 128, 8), (NVFP4_PAGE_BYTES, 8, 1), 128 * 64
     )
+    iq8 = iq.float().clamp(-448, 448).to(torch.float8_e4m3fn)  # vLLM's index q
     want = scorer.score_flydsl_nvfp4(
-        iq, kd, ks, block_table, seq, q_len, 1, SM_SCALE, n_blk, k_round="exact"
+        iq8, kd, ks, block_table, seq, q_len, 1, SM_SCALE, n_blk, k_round="e4m3"
     )  # [1, tokens, n_blk]
 
     launch = build_index_score_kernel(SM_SCALE, 0, 1, tokens, nvfp4=True)
