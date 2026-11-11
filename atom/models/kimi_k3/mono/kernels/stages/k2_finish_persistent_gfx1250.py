@@ -211,6 +211,8 @@ def build_packed_finish(
         raise ValueError("persistent K2 finish requires gfx1250")
     if plan.threads != THREADS or plan.waves != WAVES:
         raise ValueError("persistent K2 finish requires 256 threads/eight waves")
+    if include_shared and not include_routed and SHARED_DOWN_TASKS > 2 * plan.blocks:
+        raise ValueError("grouped-MoE finish holds two shared-down tasks a CTA")
     rows = plan.tokens
     tiles = plan.token_tiling.tile_count
     payload = FrontPayloadLayout(rows)
@@ -235,6 +237,11 @@ def build_packed_finish(
 
     # Without routed experts every token's activated row stays staged.
     staged_rows = WMMA_TOKEN_ROWS * (1 if include_routed else tiles)
+    shared_accumulator_words = (
+        WAVES * GFX1250.wave_size * gemv_gfx1250.ACCUMULATOR_ELEMENTS
+        if include_routed
+        else moe_tail_gfx1250.sdown_accumulator_words(2, rows, WAVES)
+    )
 
     @fx.struct
     class SharedDownRole:
@@ -243,11 +250,7 @@ def build_packed_finish(
             staged_rows * (SHARED_INTERMEDIATE + LDS_PAD) // 2,
             16,
         ]
-        accumulator: fx.Array[
-            fx.Float32,
-            WAVES * GFX1250.wave_size * gemv_gfx1250.ACCUMULATOR_ELEMENTS,
-            16,
-        ]
+        accumulator: fx.Array[fx.Float32, shared_accumulator_words, 16]
 
     @fx.struct
     class GateUpRole:
@@ -489,6 +492,19 @@ def build_packed_finish(
             _grid_barrier(scratch, ticket, plan.blocks)
 
         if const_expr(include_shared and not include_routed):
+            # Both tasks' weights are in flight before the rows are staged.
+            tasks = [bid, bid + plan.blocks]
+            operands = [
+                gemv_gfx1250.loads(
+                    lane,
+                    wave,
+                    WAVES,
+                    shared_down_weight,
+                    fx.min(task, SHARED_DOWN_TASKS - 1) * 16,
+                    SHARED_INTERMEDIATE,
+                )
+                for task in tasks
+            ]
             staging = {
                 "S": rows,
                 "tid": tid,
@@ -500,37 +516,21 @@ def build_packed_finish(
                 moe_tail_gfx1250.stage_hidden_rows(staging, shared_hidden)
             else:
                 moe_tail_gfx1250.stage_activated_rows(staging, shared_gate_up)
-            task = bid
-            while task < SHARED_DOWN_TASKS:
-                operands = gemv_gfx1250.loads(
-                    lane,
-                    wave,
-                    WAVES,
-                    shared_down_weight,
-                    task * 16,
-                    SHARED_INTERMEDIATE,
-                )
-                for tile in range_constexpr(tiles):
-                    tile_start = tile * WMMA_TOKEN_ROWS
-                    moe_tail_gfx1250.sdown_staged(
-                        {
-                            "S": min(WMMA_TOKEN_ROWS, rows - tile_start),
-                            "tid": tid,
-                            "threads": THREADS,
-                            "lane": lane,
-                            "wave": wave,
-                            "tail": {
-                                "gemv_accumulator": shared_down.accumulator.ptr
-                            },
-                            "shared_partial": shared_partial + tile_start * HIDDEN * 2,
-                        },
-                        task,
-                        operands,
-                        WAVES,
-                        shared_down.rows.ptr
-                        + tile_start * (SHARED_INTERMEDIATE + LDS_PAD) // 2,
-                    )
-                task = task + plan.blocks
+            moe_tail_gfx1250.sdown_tasks(
+                {
+                    "S": rows,
+                    "tid": tid,
+                    "threads": THREADS,
+                    "lane": lane,
+                    "wave": wave,
+                    "tail": {"gemv_accumulator": shared_down.accumulator.ptr},
+                    "shared_partial": shared_partial,
+                },
+                tasks,
+                operands,
+                WAVES,
+                shared_down.rows.ptr,
+            )
 
         # Shared-down and routed gate/up are independent and share a static
         # resident work queue.  Runtime union masks never change barriers.
