@@ -1256,7 +1256,7 @@ class TestSchedule:
         assert list(sched.waiting) == [resume, *partials]
         for _ in range(2):  # event-free ticks leave the order alone
             sched._prioritize_ready_remote_kv_requests()
-            assert list(sched.waiting)[0] is resume
+            assert next(iter(sched.waiting)) is resume
             assert sched._can_admit_head_prefill()
 
     def test_an_idle_tick_leaves_the_waiting_queue_alone(self):
