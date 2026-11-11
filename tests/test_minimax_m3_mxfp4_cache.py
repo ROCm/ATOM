@@ -328,11 +328,6 @@ def test_an_own_pool_draft_keeps_the_targets_dtype_unless_asked(target, asked, w
     )
 
 
-def test_an_own_pool_draft_refuses_fp4_rather_than_map_it():
-    with pytest.raises(ValueError, match="no FP4 KV layout"):
-        resolve_draft_kv_dtype(draft(asked="fp4"), "fp4", own_pool=True)
-
-
 def test_a_shared_pool_draft_has_the_targets_dtype():
     assert resolve_draft_kv_dtype(draft("eagle3"), "fp4", own_pool=False) == "fp4"
     with pytest.raises(ValueError, match="caches in the target's KV pool"):
@@ -520,8 +515,8 @@ def test_an_fp4_target_beside_offload_is_refused_for_that_not_for_its_draft(
     monkeypatch,
 ):
     """The draft (bf16 under an fp4 target) can never match it, so the draft-dtype
-    refusal would send the user to `--spec-decode-kv-cache-dtype fp4`, which is
-    refused in turn: the real reason, the fp4 KV beside offload, comes first."""
+    refusal would send the user to a flag value that does not exist: the real reason,
+    the fp4 KV beside offload, comes first."""
     with pytest.raises(ValueError, match="KV offload") as err:
         _m3(
             monkeypatch,

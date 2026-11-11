@@ -1381,7 +1381,7 @@ class SpeculativeConfig:
     # __post_init__. None => real draft/target rejection sampling.
     synthetic_acceptance_rates: list[float] | None = None
     # The draft's KV dtype (--spec-decode-kv-cache-dtype). As given: None = not
-    # asked, "bf16" / "fp8" / "fp4". `resolve_draft_kv_dtype` (from `Config`, once
+    # asked, "bf16" / "fp8". `resolve_draft_kv_dtype` (from `Config`, once
     # the target is known) replaces it with the dtype the draft will use.
     kv_cache_dtype: str | None = None
 
@@ -1965,19 +1965,10 @@ def kv_pages_leave_pool(config) -> bool:
 
 
 def resolve_draft_kv_dtype(spec, target_dtype: str, *, own_pool: bool) -> str:
-    """The KV dtype a speculative draft's pages have, from ``--spec-decode-kv-cache-dtype``
-    and the target's ``--kv-cache-dtype``.
-
-    A draft that caches into a pool of its own -- MiniMax-M3.1's standalone DSpark,
-    which `spec_decode.draft_kv.draft_kv_builder` gives one because its attention
-    family says so (``own_pool``, decided once by the caller) -- may take its
-    own dtype, bf16 or fp8. Asked nothing it keeps the target's, as every draft did
-    before it could ask, except under an FP4 target: FP4 has no draft layout (an exact
-    FP4 sliding window is not built), so that draft is bf16, and asking for FP4 is
-    refused here rather than mapped to anything else. Every other draft lives in the
-    target's pool, so it has the target's dtype and a different request is an error,
-    not a second pool.
-    """
+    """The KV dtype of a speculative draft's pages: the target's, unless the draft has
+    a pool of its own (``own_pool``) and asked for bf16 or fp8 through
+    ``--spec-decode-kv-cache-dtype``; bf16 under an fp4 target, which has no draft
+    layout. A draft in the target's pool cannot ask for another dtype."""
     asked = spec.kv_cache_dtype
     if not own_pool:
         if asked is not None and asked != target_dtype:
@@ -1987,11 +1978,6 @@ def resolve_draft_kv_dtype(spec, target_dtype: str, *, own_pool: bool) -> str:
                 "target's KV pool and cannot have its own dtype"
             )
         return target_dtype
-    if asked == "fp4":
-        raise ValueError(
-            "--spec-decode-kv-cache-dtype fp4: the draft has no FP4 KV layout "
-            "(use bf16 or fp8; the target's, or bf16 under an fp4 target, when omitted)"
-        )
     return asked or ("bf16" if target_dtype == "fp4" else target_dtype)
 
 

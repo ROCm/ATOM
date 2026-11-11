@@ -262,13 +262,26 @@ class TestEngineArgsSpeculativeValidation:
             EngineArgs.from_cli_args(parser.parse_args(argv))._get_engine_kwargs()
         assert mock_cls.call_args.kwargs["kv_cache_dtype"] == "bf16"
 
-    def test_spec_decode_kv_cache_dtype_without_a_method_is_refused(self):
+    @pytest.mark.parametrize(
+        "argv", [[], ["--method", "mtp", "--num-speculative-tokens", "0"]]
+    )
+    def test_spec_decode_kv_cache_dtype_without_speculation_is_refused(self, argv):
+        """Both ways speculation is off: no --method, or one given with no tokens."""
         parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
         args = EngineArgs.from_cli_args(
-            parser.parse_args(["--spec-decode-kv-cache-dtype", "fp8"])
+            parser.parse_args(["--spec-decode-kv-cache-dtype", "fp8", *argv])
         )
-        with pytest.raises(ValueError, match="needs --method"):
+        with pytest.raises(
+            ValueError, match="needs --method and --num-speculative-tokens > 0"
+        ):
             args._get_engine_kwargs()
+
+    def test_spec_decode_kv_cache_dtype_has_no_fp4(self, capsys):
+        """No draft pool has an FP4 layout, so the flag does not offer one."""
+        parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--spec-decode-kv-cache-dtype", "fp4"])
+        assert "invalid choice" in capsys.readouterr().err
 
 
 class TestEngineArgsIndexCacheDtype:

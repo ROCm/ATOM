@@ -476,14 +476,13 @@ class EngineArgs:
             "--spec-decode-kv-cache-dtype",
             type=str,
             default=None,
-            choices=["bf16", "fp8", "fp4"],
+            choices=["bf16", "fp8"],
             help="KV dtype of the speculative draft's pages (the draft's setting "
             "inside SpeculativeConfig.kv_cache_dtype). A draft with a KV pool of "
-            "its own -- MiniMax-M3.1's DSpark -- takes 'bf16' or 'fp8' (default "
-            "--kv_cache_dtype's, 'bf16' under an fp4 target; 'fp4' is refused, no "
-            "draft FP4 layout). A draft in the "
+            "its own (an MHA draft: MiniMax-M3.1's DSpark, an MHA EAGLE3 draft) "
+            "takes either (default --kv_cache_dtype's, 'bf16' under an fp4 target). A draft in the "
             "target's pool always has --kv_cache_dtype, and a different value "
-            "here is an error. Needs --method.",
+            "here is an error. Needs --method and --num-speculative-tokens > 0.",
         )
         parser.add_argument(
             "--spec-decode-acceptance-length",
@@ -954,7 +953,10 @@ class EngineArgs:
             kwargs.pop("spec_decode_acceptance_rate")
             kwargs.pop("spec_decode_acceptance_length")
             if kwargs.pop("spec_decode_kv_cache_dtype") is not None:
-                raise ValueError("--spec-decode-kv-cache-dtype needs --method.")
+                raise ValueError(
+                    "--spec-decode-kv-cache-dtype needs --method and "
+                    "--num-speculative-tokens > 0."
+                )
             kwargs["speculative_config"] = None
 
         # --enable-tbo [prefill|all] → enable_tbo + enable_tbo_decode
