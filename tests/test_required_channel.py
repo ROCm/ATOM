@@ -275,6 +275,86 @@ def test_openai_chat_endpoint_hands_the_channel_to_sampling(monkeypatch, tool_ch
     assert sampling_params.required_channel == expected
 
 
+def _chat_with_grammar(monkeypatch, body, text="hello"):
+    """Run a K3 chat request with ATOM_TOOL_CALL_GRAMMAR=1; return what was
+    sampled and what was prepared for the grammar."""
+    import asyncio
+
+    from atom.entrypoints.openai import api_server
+    from atom.entrypoints.openai.protocol import ChatCompletionRequest
+
+    pytest.importorskip("llguidance")
+    seen, prepared = [], []
+
+    async def generate(_prompt, sampling_params, _request_id, **_kw):
+        seen.append(sampling_params)
+        yield {
+            "text": text,
+            "finish_reason": "eos",
+            "num_tokens_input": 1,
+            "num_tokens_output": 1,
+        }
+
+    monkeypatch.setenv("ATOM_TOOL_CALL_GRAMMAR", "1")
+    monkeypatch.setattr(api_server, "model_name", "m")
+    monkeypatch.setattr(api_server, "_request_logger", None)
+    monkeypatch.setattr(api_server, "default_chat_template_kwargs", {})
+    monkeypatch.setattr(api_server, "reasoning_toggle", None)
+    monkeypatch.setattr(api_server, "custom_message_encoder", None)
+    monkeypatch.setattr(api_server, "tool_call_parser_cls", KimiK3Parser)
+    monkeypatch.setattr(api_server, "required_tool_channel", K3_CHANNEL)
+    monkeypatch.setattr(api_server, "tokenizer", K3Tokenizer())
+    monkeypatch.setattr(api_server, "apply_chat_template", lambda *a, **k: "prompt")
+    monkeypatch.setattr(api_server, "generate_async", generate)
+    monkeypatch.setattr(api_server, "synthetic_token_text", None)
+    monkeypatch.setattr(
+        api_server, "_get_engine_config", lambda: types.SimpleNamespace()
+    )
+    monkeypatch.setattr(
+        api_server,
+        "engine",
+        types.SimpleNamespace(
+            prepare_structured_request=lambda params, *_: prepared.append(params)
+        ),
+    )
+    asyncio.run(api_server.chat_completions(ChatCompletionRequest(**body), None))
+    (sampling_params,) = seen
+    return sampling_params, prepared
+
+
+@pytest.mark.parametrize("tool_choice", ["required", "auto"])
+def test_chat_tool_call_grammar_replaces_the_channel(monkeypatch, tool_choice):
+    from atom.structured_output.validation import TOOL_CALL_GRAMMAR_SCHEMA
+
+    params, prepared = _chat_with_grammar(monkeypatch, _k3_chat(tool_choice))
+    assert params.json_schema == TOOL_CALL_GRAMMAR_SCHEMA
+    assert params.required_channel is None
+    assert prepared == [params]
+
+
+def test_chat_tool_call_grammar_holds_message_declared_tools(monkeypatch):
+    body = _k3_chat({"type": "function", "function": {"name": "dyn"}})
+    dynamic = [{"type": "function", "function": {"name": "dyn", "parameters": {}}}]
+    body["messages"] = [{"role": "user", "content": "hi", "tools": dynamic}]
+    params, _ = _chat_with_grammar(monkeypatch, body)
+    import json
+
+    grammar = json.loads(params.structured_tool_format)["grammar"]
+    assert 'tool=\\"dyn\\"' in grammar
+
+
+def test_chat_with_a_response_format_takes_no_tool_call_grammar(monkeypatch):
+    from atom.entrypoints.openai import api_server
+
+    async def configure(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(api_server, "configure_request", configure)
+    body = {**_k3_chat("auto"), "response_format": {"type": "json_object"}}
+    params, prepared = _chat_with_grammar(monkeypatch, body, text="{}")
+    assert params.json_schema is None and prepared == []
+
+
 @pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize("tool_choice", ["required", "auto"])
 def test_atomesh_chat_endpoints_hand_the_channel_to_sampling(

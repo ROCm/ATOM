@@ -8,9 +8,9 @@ import torch
 pytest.importorskip("triton")
 pytest.importorskip("aiter.ops.enum", exc_type=ImportError)
 
-from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime  # noqa: E402
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 
-from atom.model_ops.qwen4_exp.ops.qsa import (  # noqa: E402
+from atom.model_ops.qwen4_exp.ops.qsa import (
     _table_width_bucket,
     qsa_sparse_paged_gqa,
 )
@@ -62,15 +62,24 @@ def test_gfx1250_qsa_matches_portable_kernel(
     scale = 256**-0.5
 
     monkeypatch.setenv("ATOM_QSA_GFX1250", "0")
-    portable = qsa_sparse_paged_gqa(q, k, v, idx, table, token_to_req, softmax_scale=scale)
+    portable = qsa_sparse_paged_gqa(
+        q, k, v, idx, table, token_to_req, softmax_scale=scale
+    )
     monkeypatch.setenv("ATOM_QSA_GFX1250", "1")
     fast = qsa_sparse_paged_gqa(q, k, v, idx, table, token_to_req, softmax_scale=scale)
 
     from atom.model_ops.qwen4_exp.ops.qsa_gfx1250 import qsa_sparse_paged_gqa_gfx1250
 
     direct = qsa_sparse_paged_gqa_gfx1250(
-        q, k, v, idx, table, token_to_req, scale,
-        _table_width_bucket(table.shape[1]), get_cu_num(),
+        q,
+        k,
+        v,
+        idx,
+        table,
+        token_to_req,
+        scale,
+        _table_width_bucket(table.shape[1]),
+        get_cu_num(),
     )
     torch.testing.assert_close(fast, direct, rtol=0, atol=0)
     torch.testing.assert_close(fast, portable, rtol=1e-2, atol=4e-3)
@@ -103,7 +112,11 @@ def test_gfx1250_qsa_fp8_matches_portable_kernel(
     k8, k_scale = _fp8_rows(k)
     v8, v_scale = _fp8_rows(v)
     scale = 256**-0.5
-    kwargs = dict(softmax_scale=scale, k_scale=k_scale, v_scale=v_scale)
+    kwargs = {
+        "softmax_scale": scale,
+        "k_scale": k_scale,
+        "v_scale": v_scale,
+    }
 
     monkeypatch.setenv("ATOM_QSA_GFX1250", "0")
     portable = qsa_sparse_paged_gqa(q, k8, v8, idx, table, token_to_req, **kwargs)
@@ -113,9 +126,17 @@ def test_gfx1250_qsa_fp8_matches_portable_kernel(
     from atom.model_ops.qwen4_exp.ops.qsa_gfx1250 import qsa_sparse_paged_gqa_gfx1250
 
     direct = qsa_sparse_paged_gqa_gfx1250(
-        q, k8, v8, idx, table, token_to_req, scale,
-        _table_width_bucket(table.shape[1]), get_cu_num(),
-        k_scale=k_scale, v_scale=v_scale,
+        q,
+        k8,
+        v8,
+        idx,
+        table,
+        token_to_req,
+        scale,
+        _table_width_bucket(table.shape[1]),
+        get_cu_num(),
+        k_scale=k_scale,
+        v_scale=v_scale,
     )
     torch.testing.assert_close(fast, direct, rtol=0, atol=0)
     torch.testing.assert_close(fast, portable, rtol=1e-2, atol=4e-3)

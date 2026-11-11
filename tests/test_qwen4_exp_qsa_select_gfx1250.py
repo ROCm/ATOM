@@ -8,9 +8,9 @@ import torch
 pytest.importorskip("triton")
 pytest.importorskip("aiter.ops.enum", exc_type=ImportError)
 
-from aiter.jit.utils.chip_info import get_gfx_runtime  # noqa: E402
+from aiter.jit.utils.chip_info import get_gfx_runtime
 
-from atom.model_ops.qwen4_exp.ops.qsa import qsa_select_paged_tokens  # noqa: E402
+from atom.model_ops.qwen4_exp.ops.qsa import qsa_select_paged_tokens
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or get_gfx_runtime() != "gfx1250",
@@ -28,17 +28,17 @@ def _case(tokens_per_request: int, seed: int = 1):
     q = torch.randn(
         requests * tokens_per_request, heads, dim, generator=g, dtype=torch.bfloat16
     )
-    cache = torch.randn(
-        pages, page, 1, dim, generator=g, dtype=torch.bfloat16
-    )
+    cache = torch.randn(pages, page, 1, dim, generator=g, dtype=torch.bfloat16)
     table = torch.arange(pages, dtype=torch.int32).view(requests, pages_per_request)
     token_to_request = torch.arange(requests, dtype=torch.int32).repeat_interleave(
         tokens_per_request
     )
-    positions = (
-        torch.full((requests,), context - tokens_per_request, dtype=torch.int64)
-        .repeat_interleave(tokens_per_request)
-        + torch.arange(requests * tokens_per_request).remainder(tokens_per_request)
+    positions = torch.full(
+        (requests,), context - tokens_per_request, dtype=torch.int64
+    ).repeat_interleave(tokens_per_request) + torch.arange(
+        requests * tokens_per_request
+    ).remainder(
+        tokens_per_request
     )
     context_lens = torch.full((requests,), context, dtype=torch.int32)
     return tuple(

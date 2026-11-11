@@ -21,6 +21,7 @@ import zmq
 import zmq.asyncio
 
 from atom.config import Config
+from atom.model_engine.capabilities import pcp_group_size_of
 from atom.model_engine.collective_rpc import (
     COLLECTIVE_RPC_CMD,
     DISCARD_WEIGHT_SYNC_CMD,
@@ -33,13 +34,16 @@ from atom.model_engine.collective_rpc import (
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import (
     FIRE_AND_FORGET_UTILITY_CMDS,
+    PAUSE_GENERATION_CMD,
     WEIGHT_UPDATE_UTILITY_CMDS,
     completes_weight_sync,
+    kv_change,
 )
 from atom.model_engine.prefix_hash import take_shipped_chains
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence
 from atom.observability import tracing
+from atom.structured_output import is_structured
 from atom.utils import (
     envs,
     get_open_zmq_inproc_path,
@@ -55,6 +59,18 @@ _WEIGHT_SYNC_OWNED_CMDS = WEIGHT_UPDATE_UTILITY_CMDS | {
     FINISH_WEIGHT_SYNC_CMD,
     DISCARD_WEIGHT_SYNC_CMD,
 }
+
+
+def _pp_head_first(cmd: str, args: dict) -> bool:
+    """Whether the PP head empties its pipeline before *cmd*: a weight update,
+    whose sync fences the later stages, a change to the KV pool, or a pause,
+    which holds them."""
+    return (
+        cmd in WEIGHT_UPDATE_UTILITY_CMDS
+        or cmd == PAUSE_GENERATION_CMD
+        or kv_change(cmd, args) is not None
+    )
+
 
 # Valid values for Config.dp_load_balance / --dp-load-balance, and the default.
 # Single source of truth for argparse (choices + default) so the CLI flag and
@@ -231,6 +247,7 @@ class CoreManager:
         )
         self.ctx = zmq.Context(io_threads=2)
         self.outputs_queue = queue.Queue[list[Sequence]]()
+        self.keep_finished_outputs = config.keep_finished_outputs or config.asyncio_mode
         # Utility replies are matched to their caller by request id, not by
         # position on a shared queue, where a late or unasked-for reply became
         # the next caller's answer.
@@ -246,9 +263,8 @@ class CoreManager:
         # Runner processes behind each engine -- EngineCore's own sizing -- so
         # an engine that never answers still fails one result per rank. Read
         # with defaults: managers are also built from bare stand-in configs.
-        self._rpc_ranks_per_engine = getattr(config, "tp_world_size", 1) * getattr(
-            config, "prefill_context_parallel_size", 1
-        )
+        tp_world_size = getattr(config, "tp_world_size", 1)
+        self._rpc_ranks_per_engine = tp_world_size * pcp_group_size_of(config)
         self._seq_id_to_callback = {}
         # Batched stream-flush hook, resolved lazily by the API server (avoids
         # an api_server <-> engine_core_mgr import cycle). Stays None on every
@@ -834,7 +850,8 @@ class CoreManager:
                                     f"{self.label}: flush_stream_batch failed: {e}",
                                     exc_info=True,
                                 )
-                        self.outputs_queue.put_nowait(seqs)
+                        if self.keep_finished_outputs:
+                            self.outputs_queue.put_nowait(seqs)
                         # These completions freed slots on their ranks — re-feed
                         # from the pending pool so a fast rank never drains to
                         # empty while peers still have work. No-op when
@@ -999,9 +1016,7 @@ class CoreManager:
             )
 
     def add_request(self, seqs: list[Sequence]):
-        structured = [
-            seq for seq in seqs if getattr(seq, "json_schema", None) is not None
-        ]
+        structured = [seq for seq in seqs if is_structured(seq)]
         if structured:
             try:
                 if self.structured_request_prepare is None:
@@ -1017,7 +1032,7 @@ class CoreManager:
     def _release_structured_requests(self, seqs):
         # The submitted/finished sequences own the cleanup information. There
         # is no cross-thread registry: workers tolerate repeated releases.
-        ids = [seq.id for seq in seqs if getattr(seq, "json_schema", None) is not None]
+        ids = [seq.id for seq in seqs if is_structured(seq)]
         if not ids:
             return
         try:
@@ -1306,7 +1321,23 @@ class CoreManager:
         ``LLMEngine.generate`` waits while the engine is alive and any request
         is unfinished. A dropped seq never finishes, so that wait never ends.
         The seqs are still in ``_bp_pending``; this only surfaces the error.
+        A pending seq with a stream callback is not reading that queue, so it
+        is taken out and ended through its callback, as abort does.
         """
+        with self._lb_lock:
+            waiting = [s for s in self._bp_pending if s.id in self._seq_id_to_callback]
+            for seq in waiting:
+                self._bp_pending.remove(seq)
+        delivered = False
+        for seq in waiting:
+            if not getattr(seq, "leave_reason", None):
+                seq.leave_reason = "aborted"
+            delivered |= self._deliver_terminal_output(seq)
+        if delivered and self._flush_stream_batch_fn is not None:
+            try:
+                self._flush_stream_batch_fn()
+            except Exception as e:  # noqa: BLE001 - the error below must still go out
+                logger.warning("%s: flush_stream_batch failed: %s", self.label, e)
         pending = len(getattr(self, "_bp_pending", ()))
         logger.error(
             "%s: backpressure send failed with nothing in flight; "
@@ -1872,12 +1903,14 @@ class CoreManager:
                 f"finishes or aborts them"
             )
 
-    def broadcast_utility_command(self, cmd: str, *, _dispatch_token=None, **kwargs):
+    def broadcast_utility_command(
+        self, cmd: str, *, _dispatch_token=None, _ranks=None, **kwargs
+    ):
         self._refuse_unowned_weight_sync_cmd(cmd, _dispatch_token)
         payload = {"cmd": cmd, **kwargs}
         # Serialize once and reuse for all ranks (optimization: avoid repeated pickle.dumps)
         serialized_payload = pickle.dumps((EngineCoreRequestType.UTILITY, payload))
-        for rank in range(len(self.control_sockets)):
+        for rank in range(len(self.control_sockets)) if _ranks is None else _ranks:
             logger.debug(
                 f"{self.label}: Broadcast utility command '{cmd}' to DP rank {rank}"
             )
@@ -2003,6 +2036,20 @@ class CoreManager:
             ctx.sync_id = uuid.uuid4().hex
         return responses
 
+    def _utility_phases(self, cmd: str, args: dict) -> list[range]:
+        """The engines *cmd* goes to, in the order it must reach them.
+
+        A command the PP head empties its pipeline for goes to the head first,
+        alone: the later stages forward what it sent until they run the command
+        themselves, and one the head refuses reaches none of them. Any other
+        command goes to every engine at once, as without PP.
+        """
+        engine_count = len(self.control_sockets)
+        if getattr(self, "pp_size", 1) > 1 and _pp_head_first(cmd, args):
+            # PP runs without DP, so engine 0 is the only head.
+            return [range(1), range(1, engine_count)]
+        return [range(engine_count)]
+
     def _broadcast_and_wait(self, cmd: str, timeout: float, **kwargs):
         """The round trip behind broadcast_utility_command_sync, unchecked.
 
@@ -2012,38 +2059,45 @@ class CoreManager:
         """
         timeout = checked_timeout(timeout)
         request_id = uuid.uuid4().hex
-        # The global engine count on a coordinator, as the broadcast reaches.
-        engine_count = len(self.control_sockets)
         deadline = time.monotonic() + timeout
         worker_deadline = time.time() + engine_budget(timeout)
         by_dp_rank: dict[int, object] = {}
+        sent: list[int] = []
         with self._rpc_router.register(request_id) as replies:
-            try:
-                self.broadcast_utility_command(
-                    cmd,
-                    _dispatch_token=self._weight_sync_dispatch_token,
-                    request_id=request_id,
-                    timeout=engine_budget(timeout),
-                    deadline=worker_deadline,
-                    **kwargs,
-                )
-            except Exception:
-                # The engines before the failed send already hold this update.
-                if cmd in WEIGHT_UPDATE_UTILITY_CMDS:
-                    self._discard_failed_weight_sync(cmd)
-                raise
-            while len(by_dp_rank) < engine_count:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
+            for ranks in self._utility_phases(cmd, kwargs):
                 try:
-                    dp_rank, body = replies.get(timeout=min(1.0, remaining))
-                except queue.Empty:
-                    continue
-                by_dp_rank.setdefault(dp_rank, body)
+                    self.broadcast_utility_command(
+                        cmd,
+                        _dispatch_token=self._weight_sync_dispatch_token,
+                        _ranks=ranks,
+                        request_id=request_id,
+                        timeout=engine_budget(timeout),
+                        deadline=worker_deadline,
+                        **kwargs,
+                    )
+                except Exception:
+                    # The engines before the failed send already hold this update.
+                    if cmd in WEIGHT_UPDATE_UTILITY_CMDS:
+                        self._discard_failed_weight_sync(cmd)
+                    raise
+                sent.extend(ranks)
+                while not by_dp_rank.keys() >= set(sent):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    try:
+                        dp_rank, body = replies.get(timeout=min(1.0, remaining))
+                    except queue.Empty:
+                        continue
+                    by_dp_rank.setdefault(dp_rank, body)
+                if not by_dp_rank.keys() >= set(sent) or any(
+                    isinstance(by_dp_rank[r], dict) and by_dp_rank[r].get("error")
+                    for r in ranks
+                ):
+                    break
 
         responses = [by_dp_rank[dp_rank] for dp_rank in sorted(by_dp_rank)]
-        missing = sorted(set(range(engine_count)) - set(by_dp_rank))
+        missing = sorted(set(sent) - set(by_dp_rank))
         if missing:
             if cmd in WEIGHT_UPDATE_UTILITY_CMDS:
                 self._discard_failed_weight_sync(cmd)

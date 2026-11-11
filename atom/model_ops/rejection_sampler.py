@@ -4,6 +4,14 @@ import triton.language as tl
 from aiter import topk_select
 from torch import nn
 
+from atom.model_ops.spec_sampling.ratio_verify import (
+    RatioVerifyInputs,
+    _ratio_sample,
+    ratio_verify_scratch,
+    warmup_ratio_verify,
+)
+from atom.model_ops.spec_sampling.sparse_q_store import store_width
+from atom.model_ops.verify_kernels import _draft_token, _finish_request
 from atom.utils import envs
 from atom.utils.forward_context import SpecDecodeMetadata
 
@@ -111,6 +119,38 @@ class RejectionSampler(nn.Module):
         # lockstep across TP ranks (SPMD), so the forced accept/reject pattern is
         # identical on every rank while still varying step to step.
         self._synthetic_step = 0
+        # The probability-ratio verify's preallocated scratch and the logits
+        # dtype it was compiled for (`arm_ratio`); None while not armed.
+        self._ratio_scratch = None
+        self._ratio_logits_dtype = None
+
+    def arm_ratio(
+        self,
+        max_bs: int,
+        num_spec_steps: int,
+        vocab_size: int,
+        logits_dtype: torch.dtype,
+        device,
+    ) -> None:
+        """Arm the probability-ratio verify for up to ``max_bs`` requests of
+        ``num_spec_steps`` drafts over ``vocab_size`` ids: allocate its scratch
+        before the KV cache is sized, so the budget and the profiling run see
+        it and no verify allocates, and compile every variant for
+        ``logits_dtype`` at the store's width (`warmup_ratio_verify`). No
+        warmup or capture forward verifies, so without this the first sampled
+        verify would compile; one on logits of another dtype is refused
+        (`forward`)."""
+        self._ratio_scratch = ratio_verify_scratch(
+            max_bs, num_spec_steps, vocab_size, device
+        )
+        warmup_ratio_verify(
+            num_spec_steps,
+            vocab_size,
+            store_width(vocab_size),
+            logits_dtype,
+            self._ratio_scratch,
+        )
+        self._ratio_logits_dtype = logits_dtype
 
     def forward(
         self,
@@ -121,11 +161,26 @@ class RejectionSampler(nn.Module):
         bonus_token_ids: torch.Tensor,
         *,
         target_token_ids: torch.Tensor | None = None,
+        # The drafter's probability-ratio inputs (`DSparkLossless.verify_inputs`);
+        # None selects exact match.
+        ratio: RatioVerifyInputs | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Ensure target_logits is contiguous. For greedy sampling, we can use
         # logits directly (argmax is the same for logits and probs), but we
         # need to ensure it's contiguous to satisfy the assertion in rejection_sample.
         target_logits = target_logits.contiguous()
+        if ratio is not None:
+            if target_logits.dtype != self._ratio_logits_dtype:
+                # The kernels were compiled for another logits dtype (or not at
+                # all); this verify would JIT them mid-serving while the TP/DP
+                # peers wait.
+                raise RuntimeError(
+                    f"ratio verify was warmed up for {self._ratio_logits_dtype} "
+                    f"logits but the LM head emits {target_logits.dtype}"
+                )
+            # The verify carves its partials out of the scratch this sampler
+            # owns (`arm_ratio`).
+            ratio = ratio._replace(scratch=self._ratio_scratch)
 
         output_token_ids = rejection_sample(
             metadata.input_ids,
@@ -133,7 +188,7 @@ class RejectionSampler(nn.Module):
             # metadata.num_draft_tokens_np,
             metadata.num_spec_steps,
             metadata.cu_num_draft_tokens,
-            None,
+            ratio,
             target_logits,
             bonus_token_ids,
             metadata.bonus_logits_indices,
@@ -149,17 +204,18 @@ class RejectionSampler(nn.Module):
 def rejection_sample(
     # the step's input ids; draft r is input_ids[target_logits_indices[r] + 1]
     input_ids: torch.Tensor,
-    # [num_tokens] -- the row of the step's logits each target_probs row is
+    # [num_tokens] -- the row of the step's logits each target_logits row is
     target_logits_indices: torch.Tensor,
     # # [batch_size]
     # num_draft_tokens: list[int],
     num_spec_steps: int,
     # [batch_size]
     cu_num_draft_tokens: torch.Tensor,
-    # [num_tokens, vocab_size]
-    draft_probs: torch.Tensor | None,
-    # [num_tokens, vocab_size]
-    target_probs: torch.Tensor,
+    # The probability-ratio inputs (`ratio_verify.RatioVerifyInputs`), or
+    # None, which keeps the exact-match acceptance below.
+    ratio: RatioVerifyInputs | None,
+    # [num_tokens, vocab_size] raw target logits
+    target_logits: torch.Tensor,
     # [batch_size, 1]
     bonus_token_ids: torch.Tensor,
     # [batch_size] -- each request's last row, the one its bonus is sampled at
@@ -172,19 +228,17 @@ def rejection_sample(
     target_token_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert input_ids.ndim == 1 and target_logits_indices.ndim == 1
-    assert draft_probs is None or draft_probs.ndim == 2
     assert cu_num_draft_tokens.ndim == 1
-    assert target_probs.ndim == 2
+    assert target_logits.ndim == 2
 
     batch_size = len(cu_num_draft_tokens)
     num_tokens = target_logits_indices.shape[0]
-    vocab_size = target_probs.shape[-1]
-    device = target_probs.device
+    vocab_size = target_logits.shape[-1]
+    device = target_logits.device
     assert input_ids.is_contiguous() and target_logits_indices.is_contiguous()
-    assert draft_probs is None or draft_probs.is_contiguous()
-    assert target_probs.is_contiguous()
+    assert target_logits.is_contiguous()
     assert bonus_token_ids.is_contiguous()
-    assert target_probs.shape == (num_tokens, vocab_size)
+    assert target_logits.shape == (num_tokens, vocab_size)
     if target_token_ids is not None:
         if target_token_ids.shape != target_logits_indices.shape:
             raise ValueError("Sampled target IDs must cover every verification row")
@@ -219,7 +273,7 @@ def rejection_sample(
         # target argmax as the correction token and stop (same output layout /
         # num_bonus_tokens semantics as the greedy path).
         cond_rates = _get_synthetic_cond_rates(synthetic_acceptance_rates, device)
-        _, target_argmax = topk_select(target_probs, 1, tie="low")
+        _, target_argmax = topk_select(target_logits, 1, tie="low")
         target_argmax = target_argmax.view(-1)
         # Rank-consistent uniforms: a dedicated device generator re-seeded from the
         # step counter draws the same Philox stream on every TP rank / GPU, so the
@@ -252,13 +306,29 @@ def rejection_sample(
             num_spec_steps,
             num_warps=1,
         )
+    elif ratio is not None:
+        # Probability-ratio path: accept with `u * q < p` against the q the
+        # draft actually drew from, instead of requiring equality with the
+        # target's own draw. Same output distribution, higher acceptance.
+        _ratio_sample(
+            output_token_ids,
+            verdict,
+            cu_num_draft_tokens,
+            input_ids,
+            target_logits_indices,
+            target_logits,
+            ratio,
+            bonus_token_ids,
+            bonus_logits_indices,
+            num_spec_steps,
+        )
     elif target_token_ids is not None or RELAXED_TOP_N <= 1:
         # Match the actual target draw for stochastic requests; greedy requests
         # take the target argmax and must match it exactly. The prefix kernel
         # needs only token IDs. `topk_select`, not `.argmax`: the tie rule
         # above is what keeps the accept/reject pattern equal across TP ranks.
         if target_token_ids is None:
-            _, target_argmax = topk_select(target_probs, 1, tie="low")
+            _, target_argmax = topk_select(target_logits, 1, tie="low")
             target_argmax = target_argmax.view(-1)
         else:
             target_argmax = target_token_ids
@@ -277,7 +347,7 @@ def rejection_sample(
     else:
         # Relaxed acceptance path: accept if draft is among top-N
         # candidates with prob >= (top1_prob - delta)
-        probs = target_probs.softmax(dim=-1, dtype=torch.float32)
+        probs = target_logits.softmax(dim=-1, dtype=torch.float32)
         # `sorted` is what puts the top-1 in slot 0 for `top1_probs` below.
         #
         # Among EQUAL probabilities the slot order is unspecified, here as it
@@ -312,50 +382,6 @@ def rejection_sample(
         )
 
     return output_token_ids, verdict
-
-
-@triton.jit
-def _draft_token(input_ids_ptr, target_logits_indices_ptr, r):
-    """Draft r: the input token after the logits row that verifies it."""
-    return tl.load(input_ids_ptr + tl.load(target_logits_indices_ptr + r) + 1)
-
-
-@triton.jit
-def _finish_request(
-    output_token_ids_ptr,
-    verdict_ptr,
-    bonus_token_ids_ptr,
-    bonus_logits_indices_ptr,
-    req_idx,
-    num_draft_tokens,
-    last_checked,
-    rejected,
-    num_spec_steps,
-):
-    """The bonus token, the -1 tail, and the request's verdict.
-
-    `last_checked` is the last draft position compared (-1 before any). The
-    anchor -- the last emitted token's row -- sits one row per accepted draft
-    into the segment that ends at the bonus row.
-    """
-    INVALID_TOKEN: tl.constexpr = -1
-    row = output_token_ids_ptr + req_idx * (num_spec_steps + 1)
-    num_accepted = last_checked
-    if rejected:
-        bonus_token_id = INVALID_TOKEN
-    else:
-        bonus_token_id = tl.load(bonus_token_ids_ptr + req_idx)
-        num_accepted += 1
-    tl.store(row + num_draft_tokens, bonus_token_id)
-    # The -1 tail is what downstream first-`-1` truncation reads under
-    # variable-length verification (the output buffer is torch.empty).
-    for pos in range(num_draft_tokens + 1, num_spec_steps + 1):
-        tl.store(row + pos, INVALID_TOKEN)
-    batch_size = tl.num_programs(0)
-    anchor = tl.load(bonus_logits_indices_ptr + req_idx) - num_draft_tokens
-    tl.store(verdict_ptr + req_idx, num_accepted)
-    tl.store(verdict_ptr + batch_size + req_idx, num_spec_steps - num_accepted)
-    tl.store(verdict_ptr + 2 * batch_size + req_idx, anchor + num_accepted)
 
 
 @triton.jit(do_not_specialize=["num_spec_steps"])

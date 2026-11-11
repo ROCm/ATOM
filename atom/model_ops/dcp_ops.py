@@ -1071,21 +1071,19 @@ def get_dcp_local_seq_lens(seq_lens, dcp_size, dcp_rank, cp_kv_cache_interleave_
 
 
 def get_dcp_local_window_lens(
-    seq_lens, max_seqlen_q, dcp_size, dcp_rank, cp_kv_cache_interleave_size=1
+    positions, dcp_size, dcp_rank, cp_kv_cache_interleave_size=1
 ):
     """Per-DCP-rank local KV length of each query token's causal window.
 
-    Draft position ``j`` attends to global positions ``[0, seq_len -
-    max_seqlen_q + j]``; that extra position belongs to a single rank, so the
-    ranks' local lengths do not all advance with j. Returns a flat
-    ``[len(seq_lens) * max_seqlen_q]`` array in (sequence, draft position)
-    order. ``max_seqlen_q == 1`` reproduces ``get_dcp_local_seq_lens``.
+    The token at global position ``p`` attends to ``[0, p]``; a draft
+    position's extra key belongs to a single rank, so the ranks' local lengths
+    do not all advance with it. One entry per token of ``positions``; a step of
+    one token a sequence reproduces ``get_dcp_local_seq_lens``.
     """
-    windows = seq_lens[:, None] - max_seqlen_q + 1 + np.arange(max_seqlen_q)
     return get_dcp_local_seq_lens(
-        # Row 0 is the committed token count, which a scheduled decode row
-        # always has at least one of; the clip is for callers that do not.
-        windows.clip(min=0).ravel(),
+        # A scheduled decode token always sees itself; the clip is for callers
+        # that do not.
+        (positions + 1).clip(min=0),
         dcp_size,
         dcp_rank,
         cp_kv_cache_interleave_size,

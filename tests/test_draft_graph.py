@@ -26,12 +26,7 @@ def _graph(**kw):
 
 
 def test_an_unwidened_empty_batch_stages_nothing():
-    """`stage` tail-repeats `src[-1]`, which a zero-row source does not have.
-
-    No caller can ask for one: `prepare_model` asserts the batch carries tokens,
-    so every drafter sees at least one row. Pinned as the boundary anyway --
-    entering at the real count must stay a no-op, not an IndexError.
-    """
+    """A zero-row source is valid when no widening is requested."""
     g = _graph()
     assert g.stage(0, {"row": torch.zeros(0, dtype=torch.int32)})["row"].shape[0] == 0
 
@@ -91,13 +86,7 @@ def test_a_pass_that_stages_nothing_is_refused():
 
 
 def test_staged_tail_repeats_a_real_row_rather_than_zero_filling():
-    """Zero-filling faults the GPU at the first padded decode step.
-
-    Measured on V4-Flash-DSpark tp8: an all-zero tail gives
-    `Memory access fault ... on address (nil)` on 8/8 ranks; repeating a real
-    row is clean on the same workload. Which input cannot take a zero was not
-    isolated, so this pins the repeat, not the reason.
-    """
+    """Padding repeats one coherent real row instead of fabricating zeros."""
     g = _graph()
     first = g._stage_one("row", 8, torch.arange(3, dtype=torch.int32) + 100)
     assert first.tolist() == [100, 101, 102, 102, 102, 102, 102, 102]
@@ -217,9 +206,7 @@ def test_a_batch_dim_1_input_stages_columns_and_tail_repeats_the_last_one():
 
 
 def test_a_batch_dim_1_producer_view_is_the_front_of_the_staged_one():
-    """`buffer(role, scheduled_bs)` is a prefix of the `running_bs` view at the
-    same stride, so staging a fill of it pads after it and copies nothing over
-    it."""
+    """A producer-owned prefix is preserved while stage pads its tail."""
     g = _mrope_graph()
     fill = g.buffer("pos", 2)
     fill.copy_(torch.tensor([[1, 2], [3, 4], [5, 6]]))
