@@ -47,6 +47,7 @@ pub(crate) fn report<P: LoadBalancingPolicy + ?Sized>(
         decision.branch
     );
     let selected = selected.and_then(|index| workers.get(index));
+    // An empty candidate list has no pool to label; the planner counts it.
     let Some(worker) = selected.or(workers.first()) else {
         return;
     };
