@@ -138,6 +138,63 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_selection_without_healthy_candidates_counts_once_in_its_pool() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let workers: Vec<Arc<dyn Worker>> = ["http://w1:8000", "http://w2:8000"]
+            .into_iter()
+            .map(|url| {
+                let worker = BasicWorkerBuilder::new(url)
+                    .worker_type(WorkerType::Prefill {
+                        bootstrap_port: None,
+                    })
+                    .build();
+                worker.set_healthy(false);
+                Arc::new(worker) as Arc<dyn Worker>
+            })
+            .collect();
+        let tokens = [1, 2, 3];
+        let info = SelectWorkerInfo {
+            request_text: Some("hello"),
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+
+        for name in POLICIES {
+            let policy = PolicyFactory::create_by_name(name).unwrap();
+            assert_eq!(policy.select_worker(&workers, &info).await, None, "{name}");
+        }
+
+        let rendered = handle.render();
+        for name in POLICIES {
+            let policy = format!("policy=\"{name}\"");
+            let failure = [
+                r#"pool="prefill""#,
+                policy.as_str(),
+                r#"branch="no_healthy_workers""#,
+            ];
+            let branches = "mesh_route_branch_total{";
+            assert_eq!(
+                total(&rendered, branches, &failure),
+                1.0,
+                "{name}\n{rendered}"
+            );
+            assert_eq!(
+                total(&rendered, branches, &[&policy]),
+                1.0,
+                "{name}\n{rendered}"
+            );
+            let samples = "mesh_route_selected_worker_active_requests_count{";
+            assert_eq!(
+                total(&rendered, samples, &[&policy]),
+                0.0,
+                "{name}\n{rendered}"
+            );
+        }
+    }
+
     /// Sum of the samples of `metric` whose labels include every one of `labels`.
     fn total(rendered: &str, metric: &str, labels: &[&str]) -> f64 {
         rendered
