@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794334699117,
+  "lastUpdate": 1794416079332,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -4864,6 +4864,40 @@ window.BENCHMARK_DATA = {
             "value": 0.8863,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/42852255267 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202611101510 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1372 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "karverma-amd",
+            "username": "karverma-amd",
+            "email": "karan.verma@amd.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "47e0c707571b0902d885ee19984401363492466f",
+          "message": "fix(engram): serialize UVA registration across DP ranks and register in 1 GiB chunks (#2932)\n\n* fix(engram): serialize UVA registration across DP ranks and register in 1 GiB chunks\n\nFour DP-attention ranks registering the shared read-only Engram mapping at\nonce hang in the KFD ioctl, and a single ~92 GiB cudaHostRegister sits\nuninterruptible. Hold a cross-process flock (ATOM_ENGRAM_REG_LOCK) around\nregistration and register each gap in ATOM_ENGRAM_REG_CHUNK_MB pieces\n(default 1024; 0 keeps one registration per gap). ATOM_ENGRAM_MLOCK=1 pins\nthe faulted-in table first so a cold reclaim cannot push registration back\nto disk.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* fix(engram): read registration knobs from envs, log lock waits, lock unregistration\n\n- ATOM_ENGRAM_REG_CHUNK_MB, ATOM_ENGRAM_REG_LOCK and ATOM_ENGRAM_MLOCK move to\n  envs.py with docs rows. The chunk size uses _nonnegative_int_env, so an\n  empty value reads as the default instead of turning chunking off.\n- A lock file that cannot be opened or locked is logged and skipped instead\n  of raising, which read as a refused registration and sent the rank to the\n  copy path.\n- A rank that has to wait for the lock logs the wait and its length.\n- Unregistration takes the same lock, before _PageRuns._lock as registration\n  does. The lock is reentrant within the process for the rollback path.\n- Tests cover the chunk split, a refusal part way through a gap, chunk size 0\n  and empty, an unopenable lock file, and the lock around unregistration.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* fix(engram): munlock with the last reference, state the lock order, log the lock path\n\n- ATOM_ENGRAM_MLOCK pins move into _PageRuns.acquire. Runs record whether\n  they are mlocked once the range holds them, and are munlocked with their\n  last reference; a refused registration unpins the pages no live run covers.\n- The release comment states the actual invariant: every path takes the\n  node-wide lock before _PageRuns._lock, including acquire's rollback.\n- The resolved lock path is logged once per process, and the docs note that\n  /dev/shm is per container unless shared.\n- Tests: munlock on release, and on a refusal part way through a range.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* fix(engram): narrow the registration lock and drop the extra knobs\n\nTake the lock only around shared cudaHostRegister and unregister, pin when RLIMIT_MEMLOCK allows, and keep the 1 GiB chunk size fixed so a refused overlap cannot leak pins.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* fix(engram): release without the lock after a timeout, latch timed-out lock paths\n\nA release whose lock file times out now unregisters anyway, and a path that timed out once fails at once for later tables instead of waiting again.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* fix(engram): time out a silent lock holder, not a slow one\n\nThe holder touches the lock file after every chunk, and a waiter gives up only after 600 s without a touch, so cold-cache ranks behind a slow holder no longer fall back to copying. Document that a timed-out path is never waited on again.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* fix(engram): heartbeat during fault-in; guard the held lock fds\n\n- _populate touches any held registration lock after each faulted-in\n  piece. acquire faults in under the lock what reclaim took back, and on\n  a cold cache that could outlast _REG_LOCK_TIMEOUT_S with no chunk\n  registered, so waiters saw no progress.\n- _held_lock_fds and every touch are under _held_lock_fds_lock: fault-in\n  workers now touch the files while the main thread adds and removes\n  them, and a descriptor leaves the list before it is closed, so a\n  closed or reused descriptor is never touched.\n- Tests: a held lock's mtime moves during _populate, once per piece; a\n  heartbeat waits for the list lock.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n---------\n\nCo-authored-by: Verma, Karan <Karan.Verma+amdeng@amd.com>\nCo-authored-by: Cursor <cursoragent@cursor.com>\nCo-authored-by: karverma-amd <karverma-amd@users.noreply.github.com>",
+          "timestamp": "2026-11-11T15:21:10Z",
+          "url": "https://github.com/ROCm/ATOM/commit/47e0c707571b0902d885ee19984401363492466f"
+        },
+        "date": 1794416078455,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.9462,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/43055935943 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202611111518 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9454 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b accuracy (GSM8K)",
+            "value": 0.8992,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/43055935943 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202611111518 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1456 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
