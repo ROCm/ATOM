@@ -1969,8 +1969,8 @@ def resolve_draft_kv_dtype(spec, target_dtype: str, *, own_pool: bool) -> str:
     and the target's ``--kv-cache-dtype``.
 
     A draft that caches into a pool of its own -- MiniMax-M3.1's standalone DSpark,
-    which `spec_decode.draft_kv.draft_kv_builder` gives one because its backend says
-    `DRAFT_OWNS_KV_POOL` (``own_pool``, decided once by the caller) -- may take its
+    which `spec_decode.draft_kv.draft_kv_builder` gives one because its attention
+    family says so (``own_pool``, decided once by the caller) -- may take its
     own dtype, bf16 or fp8. Asked nothing it keeps the target's, as every draft did
     before it could ask, except under an FP4 target: FP4 has no draft layout (an exact
     FP4 sliding window is not built), so that draft is bf16, and asking for FP4 is

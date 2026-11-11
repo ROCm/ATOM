@@ -24,6 +24,7 @@ from torch import nn
 
 from atom.model_ops.attentions.mha_kv_pool import MhaKvPool
 from atom.spec_decode.draft_kv import DRAFT_KV_ROWS, DraftKvBuilder, draft_owns_kv_pool
+from atom.utils.selector import Family
 
 
 class _PagedAttention(nn.Module):
@@ -269,11 +270,8 @@ def test_a_native_draft_owns_a_pool_when_its_backend_says_so(
 ):
     from atom.utils import selector
 
-    monkeypatch.setattr(selector, "attn_family", lambda _hf: "family")
     monkeypatch.setattr(
-        selector,
-        "get_attn_backend",
-        lambda _f: SimpleNamespace(DRAFT_OWNS_KV_POOL=owns),
+        selector, "attn_family", lambda _hf: Family.MHA if owns else Family.MLA
     )
     assert draft_owns_kv_pool(config) is want
 
@@ -289,5 +287,4 @@ def test_a_plugin_draft_owns_no_pool_and_the_selector_is_not_asked(monkeypatch):
 
     monkeypatch.setattr(prepare, "_CURRENT_FRAMEWORK", "vllm")
     monkeypatch.setattr(selector, "attn_family", refuse)
-    monkeypatch.setattr(selector, "get_attn_backend", refuse)
     assert draft_owns_kv_pool(_spec_config()) is False

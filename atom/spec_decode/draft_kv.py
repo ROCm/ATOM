@@ -18,8 +18,9 @@ def draft_owns_kv_pool(config) -> bool:
     What `draft_kv_builder` will answer for the same draft, decided from the config
     alone so `Config` and the offload deployment checks can ask it before any runner
     exists. Only DSpark has such a pool, and only the native runner builds it: under
-    a plugin the framework owns the KV cache and the selector has no backend for
-    every draft flavor (CSA2 raises), so the answer there is no without asking it.
+    a plugin the framework owns the KV cache, so the answer there is no. Read off the
+    draft's attention family (`DRAFT_POOL_FAMILIES`), not by resolving its backend,
+    which would import aiter into the API process that builds `Config`.
     """
     from atom.plugin import is_plugin_mode
 
@@ -29,9 +30,9 @@ def draft_owns_kv_pool(config) -> bool:
         return False
     if is_plugin_mode():
         return False
-    from atom.utils.selector import attn_family, get_attn_backend
+    from atom.utils.selector import DRAFT_POOL_FAMILIES, attn_family
 
-    return bool(get_attn_backend(attn_family(draft_hf)).DRAFT_OWNS_KV_POOL)
+    return attn_family(draft_hf) in DRAFT_POOL_FAMILIES
 
 
 def draft_kv_builder(model_runner, draft_hf):
@@ -40,19 +41,20 @@ def draft_kv_builder(model_runner, draft_hf):
     A draft is not an attention flavor; it is a model that has one. So the
     flavor comes from the draft's own config through the same selector the
     target uses, and that backend says whether a draft of its flavor caches
-    into a pool of its own (`DRAFT_OWNS_KV_POOL`). Where it does not, the
+    into a pool of its own (`selector.DRAFT_POOL_FAMILIES`). Where it does not, the
     runner never sees a draft builder at all.
 
     Which is why speculative decoding imports no attention anywhere: adding a
-    flavor is a flag and a `make_kv_pool` on that backend.
+    flavor is a table entry and a `make_kv_pool` on that backend.
     """
     from aiter import dtypes
 
-    from atom.utils.selector import attn_family, get_attn_backend
+    from atom.utils.selector import DRAFT_POOL_FAMILIES, attn_family, get_attn_backend
 
-    backend = get_attn_backend(attn_family(draft_hf))
-    if not backend.DRAFT_OWNS_KV_POOL:
+    family = attn_family(draft_hf)
+    if family not in DRAFT_POOL_FAMILIES:
         return None
+    backend = get_attn_backend(family)
     make_pool = partial(
         backend.make_kv_pool,
         draft_hf,

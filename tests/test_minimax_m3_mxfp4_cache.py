@@ -306,19 +306,6 @@ def test_m3_fp4_hashes_apart_from_fp8(monkeypatch):
 # ────────────────────────────────────────────── the draft's own KV dtype ──
 
 
-class _Backend:
-    """What `get_attn_backend` answers for an MHA draft (aiter is not here)."""
-
-    DRAFT_OWNS_KV_POOL = True
-
-
-@pytest.fixture(autouse=True)
-def mha_draft_backend(monkeypatch):
-    from atom.utils import selector
-
-    monkeypatch.setattr(selector, "get_attn_backend", lambda family: _Backend)
-
-
 def draft(method="dspark", **hf):
     """A speculative config as `Config` holds it once built: just what
     `resolve_draft_kv_dtype` reads."""
@@ -429,33 +416,29 @@ def _v41_dspark_spec():
     )
 
 
-def test_a_plugin_config_with_a_v41_dspark_draft_never_asks_the_selector(
+def test_a_plugin_config_with_a_v41_dspark_draft_never_asks_for_a_backend(
     monkeypatch,
 ):
-    """vLLM / SGLang have no CSA2 backend, and V4.1 DSpark is a supported plugin
-    deployment: whether the draft owns a pool is a native runner's question, so
-    `Config` must not route it through the selector (which raises for CSA2)."""
+    """V4.1 DSpark is a supported plugin deployment and vLLM / SGLang have no CSA2
+    backend: whether the draft owns a pool is a native runner's question, so `Config`
+    must not route it through a backend lookup (which raises for CSA2). It does not
+    resolve one natively either: that would import aiter into the API process."""
     from atom.plugin import prepare
     from atom.utils import selector
 
-    monkeypatch.setattr(prepare, "_CURRENT_FRAMEWORK", "vllm")
-    asked = []
-    # the autouse stub above answers every family; the real answer for CSA2 under
-    # vLLM is `get_attn_backend_cls`'s refusal
-    monkeypatch.setattr(
-        selector,
-        "get_attn_backend",
-        lambda family: asked.append(family)
-        or selector.get_attn_backend_cls(family, False, True),
-    )
-    config = _m3(
-        monkeypatch,
-        kv_cache_dtype="bf16",
-        index_cache_dtype="bf16",
-        speculative_config=_v41_dspark_spec(),
-    )
-    assert asked == []
-    assert config.speculative_config.kv_cache_dtype == "bf16"
+    def refuse(*_a):
+        raise AssertionError("a backend was resolved")
+
+    monkeypatch.setattr(selector, "get_attn_backend", refuse)
+    for framework in ("vllm", "atom"):
+        monkeypatch.setattr(prepare, "_CURRENT_FRAMEWORK", framework)
+        config = _m3(
+            monkeypatch,
+            kv_cache_dtype="bf16",
+            index_cache_dtype="bf16",
+            speculative_config=_v41_dspark_spec(),
+        )
+        assert config.speculative_config.kv_cache_dtype == "bf16"
 
 
 def test_a_draft_dtype_beside_the_targets_cannot_share_the_offload_namespace(
