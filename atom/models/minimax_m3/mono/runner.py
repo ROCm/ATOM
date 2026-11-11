@@ -270,6 +270,7 @@ class MonoDecodeRunner:
             xn_flag=envs.ATOM_MONO_XN_FLAG,
             mid_flag=envs.ATOM_MONO_MID_MODE,
             shared_mxfp8=self.shared_mxfp8,
+            sh_first=envs.ATOM_MONO_SH_FIRST,
         )
         # a dense layer's kernels around its original attention
         if self.dense_mono:

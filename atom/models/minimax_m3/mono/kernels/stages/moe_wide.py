@@ -78,6 +78,7 @@ def moe_wide_defs(k4ctx):
     UG_SHARED_UNITS = k4ctx["UG_SHARED_UNITS"]
     UG_CPW = k4ctx["UG_CPW"]
     SH8 = k4ctx["shared_mxfp8"]
+    SH_FIRST = SH8 and k4ctx["sh_first"] != 0
     UG_PAIRS = k4ctx["UG_PAIRS"]
     U_MAX = k4ctx["U_MAX"]
     W_MIDSC = k4ctx["W_MIDSC"]
@@ -220,6 +221,9 @@ def moe_wide_defs(k4ctx):
         return wts, scs
 
     def wug_y(wts, scs, half, fp8=False):
+        return wug_reduce(*wug_mma(wts, scs, half, fp8))
+
+    def wug_mma(wts, scs, half, fp8=False):
         """A task's up / gate GEMV for every token (B column l % 16 = token
         l % 16) -> swiglu: thread (row r, token k)'s mid value. ``half``: the
         task's 16-row half of its 32-row scale block (compile time)."""
@@ -244,6 +248,10 @@ def moe_wide_defs(k4ctx):
             cu_ = mfma_scaled(
                 wts[1][i], xb, cu_, scs[1][i // 2], sbs[i], a_fmt=FP4, sa_byte=sel
             )
+        return cg_, cu_
+
+    def wug_reduce(cg_, cu_):
+        """The task's two accumulators -> swiglu: thread (row r, token k)'s mid value."""
         fx.ptr_store(cg_, red + (wave * 64 + lane) * 4)
         fx.ptr_store(cu_, fpool + (W_UPP + (wave * 64 + lane) * 4))
         gpu.barrier()
@@ -320,6 +328,14 @@ def moe_wide_defs(k4ctx):
         td = start("down")  # this CTA's down task (the split tasks come first)
         has_dn = td < N_DN
         td = fx.min(td, N_DN - 1)
+        if const_expr(SH_FIRST):
+            # the shared pair needs no routing: its first half's tiles go out now,
+            # while the router's scores are still on their way, and its GEMVs are
+            # the first thing a host does once the xn is in (``sh_first``)
+            jsh = fx.Int32(bid) - (G - UG_PAIRS)
+            has_s = jsh >= 0
+            jsh = fx.min(jsh, UG_PAIRS - 1)
+            sh_cur = wsh_load(2 * jsh, has_s)
         # every token's routing: wave w routes tokens w, w + WAVES, .., their
         # scores polled in one batch
         mine = bid % SCORE_COPIES
@@ -417,6 +433,14 @@ def moe_wide_defs(k4ctx):
         ):
             rows_to_lds(tid, base_w, tokens, n_row, xs + lds_w, lds_row)
         gpu.barrier()
+        if const_expr(SH_FIRST):  # noqa: SIM102
+            if has_s:
+                # the second half's tiles follow the first's MFMAs
+                cg0, cu0 = wug_mma(sh_cur[0], sh_cur[1], 0, True)
+                sh_nxt = wsh_load(2 * jsh + 1, has_s)
+                y_lo = wug_reduce(cg0, cu0)
+                y_hi = wug_y(sh_nxt[0], sh_nxt[1], 1, True)
+                wug_publish(n_routed * UG_PAIRS + jsh, y_lo, y_hi)
         y_lo = fx.Float32(0.0)  # the pair's first half, until the second's
         for it in range_constexpr(UGW_ITERS):
             t, has_t = task(it)
@@ -434,7 +458,7 @@ def moe_wide_defs(k4ctx):
                     wug_publish(t // 2, y_lo, y)
             if const_expr(it + 1 < UGW_ITERS):
                 cur = nxt
-        if const_expr(SH8):
+        if const_expr(SH8 and not SH_FIRST):
             # the shared expert's pair j (task pair n_routed * UG_PAIRS + j of the
             # step's numbering) on CTA SH_HOST0 + j: both halves' tiles in flight
             # before the first GEMV, the pair's flag after the second
@@ -609,6 +633,8 @@ def moe_wide_defs(k4ctx):
         "build_experts": build_experts,
         "wug_load": wug_load,
         "wug_y": wug_y,
+        "wug_mma": wug_mma,
+        "wug_reduce": wug_reduce,
         "fp8_lanes4": fp8_lanes4,
         "wug_publish": wug_publish,
         "down_tables": down_tables,

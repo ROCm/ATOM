@@ -176,6 +176,9 @@ class K4Build:
     kv_nvfp4: bool = False
     index_nvfp4: bool = False
     probe: str = ""  # a timing probe (``atom.mono.plan.probe``); empty: production
+    sh_first: int = (
+        0  # wide MoE: the shared pairs first, their tiles loaded early; 0 off, else ``UG_SHARED_UNITS``
+    )
 
 
 def build_post_attn_kernel(
@@ -199,6 +202,7 @@ def build_post_attn_kernel(
     kv_nvfp4: bool = False,
     index_nvfp4: bool = False,
     probe: str = "",
+    sh_first: int = 0,
 ):
     """``@flyc.jit`` launcher of K4 for one rank of an ``npes``-way TP group and a
     decode step of ``tokens`` (<= MAX_TOKENS) rows, ``q_len`` consecutive rows a
@@ -228,7 +232,7 @@ def build_post_attn_kernel(
         route_scale=route_scale, shared_weight=shared_weight,
         swiglu_limit=swiglu_limit, debug=debug, xn_flag=xn_flag,
         shared_mxfp8=shared_mxfp8, mid_flag=mid_flag, kv_nvfp4=kv_nvfp4,
-        index_nvfp4=index_nvfp4, probe=probe,
+        index_nvfp4=index_nvfp4, probe=probe, sh_first=sh_first,
     )  # fmt: skip
     P = parse_probe(probe)
     build_key = key_tuple(key, SOURCES)  # the launcher references it: keyed
@@ -635,7 +639,7 @@ def build_post_attn_kernel(
         # layer time at S = 8 / 16 with 2 / 3 / 4 / 5 / 6: 87.2 / 83.2 / 83.2 / 82.8 / 84.5
         # and 127.3 / 123.0 / 123.0 / 122.7 / 124.5 us (the shared pair's loads and
         # sync are latency, not bytes, so it weighs more than its 2 pairs' bytes)
-        UG_SHARED_UNITS = 4
+        UG_SHARED_UNITS = sh_first or 4
         UGW_ITERS = (
             2
             * (
