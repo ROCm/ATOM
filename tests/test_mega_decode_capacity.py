@@ -16,9 +16,11 @@ import torch
 pytest.importorskip("triton", reason="MegaMoE imports its Triton row-zeroing kernel")
 
 from atom.model_ops.fused_moe import flydsl_mega_experts as mega
+from atom import config as atom_config
 from atom.plugin import prepare as plugin_prepare
 
 LARGE_CAPACITY = 16384
+SMALL_M_MTPR = 32
 
 
 def _context(rows, **overrides):
@@ -62,6 +64,7 @@ def runtime(monkeypatch):
     monkeypatch.setattr(plugin_prepare, "_CURRENT_FRAMEWORK", "atom")
     monkeypatch.setattr(mega, "_MEGA_CACHE", {})
     monkeypatch.setattr(mega, "_MEGA_CAPACITY_LOGGED", set())
+    monkeypatch.setattr(mega, "_MEGA_LAYER_SLOTS", {})
     monkeypatch.setattr(
         torch.cuda, "is_current_stream_capturing", lambda: state.capturing
     )
@@ -81,6 +84,7 @@ def runtime(monkeypatch):
             assert not state.capturing, "constructor reached during capture"
             self.rank = kwargs["rank"]
             self.capacity = kwargs["max_tok_per_rank"]
+            self.kwargs = kwargs
             state.events.append(("build", self.rank, self.capacity))
             state.instances[self.rank, self.capacity] = self
 
@@ -88,6 +92,25 @@ def runtime(monkeypatch):
             # Pad rows are routed to -1, so combine must skip those slots.
             assert mask_invalid_slots is True
             state.events.append(("forward", self.rank, self.capacity))
+            return torch.full_like(x, self.capacity)
+
+    class RoutedMegaMoEV2(FakeMegaMoEV2):
+        """An AITER build that picks its route from a max_tokens hint."""
+
+        small_m_mtpr = SMALL_M_MTPR
+
+        @property
+        def large_m_available(self):
+            return self.capacity == LARGE_CAPACITY
+
+        def select_layer_state(self, layer_slot):
+            assert self.large_m_available
+            state.events.append(("slot", self.rank, layer_slot))
+
+        def forward(self, x, weights, ids, *, mask_invalid_slots, max_tokens=None):
+            assert mask_invalid_slots is True
+            state.events.append(("forward", self.rank, self.capacity))
+            state.events.append(("hint", self.rank, max_tokens))
             return torch.full_like(x, self.capacity)
 
     def stub_module(name, **attrs):
@@ -130,7 +153,15 @@ def runtime(monkeypatch):
             swiglu_limit=0.0,
         )
 
+    def use_routed_aiter(layers=61):
+        sys.modules["aiter.ops.flydsl.kernels.mega_moe"].MegaMoEV2 = RoutedMegaMoEV2
+        config = SimpleNamespace(hf_config=SimpleNamespace(num_hidden_layers=layers))
+        monkeypatch.setattr(
+            atom_config, "get_current_atom_config", lambda: config, raising=False
+        )
+
     state.run = run
+    state.use_routed_aiter = use_routed_aiter
     return state
 
 
@@ -348,3 +379,80 @@ def test_cached_capacities_rebind_layer_weights_without_breaking_eplb_aliases(ru
     next_layer._mega_w1[0].fill_(9)
     for instance in runtime.instances.values():
         assert torch.all(instance._s1_w1[0] == 9)
+
+
+def _events(runtime, kind):
+    return [value for event, _, value in runtime.events if event == kind]
+
+
+def test_aiter_without_route_hints_keeps_the_staged_call(runtime):
+    runtime.run(_context(256))
+
+    assert all(
+        "large_m_state_slots" not in instance.kwargs
+        for instance in runtime.instances.values()
+    )
+    assert _events(runtime, "hint") == _events(runtime, "slot") == []
+
+
+@pytest.mark.parametrize(
+    ("context", "rows", "hint"),
+    [
+        (_context(64), 64, 64),
+        (_context(256), 200, 256),
+        (_context(64, running_tokens_across_dp=(256,) * 8), 64, 64),
+        (
+            _context(
+                512,
+                running_tokens_are_unified=False,
+                running_tokens_across_dp=(512, 4096),
+            ),
+            512,
+            4096,
+        ),
+        (_context(512, running_tokens_are_unified=False), 512, None),
+        (_context(0), 1, None),
+        (None, 64, None),
+    ],
+)
+def test_route_hint_is_the_dp_group_max_rows(runtime, context, rows, hint):
+    runtime.use_routed_aiter()
+    runtime.run(context, rows=rows)
+
+    assert _events(runtime, "hint") == [hint]
+
+
+def test_tbo_and_plugin_steps_take_no_route_hint(runtime, monkeypatch):
+    runtime.use_routed_aiter()
+    runtime.tbo = True
+    runtime.run(_context(64))
+    runtime.tbo = False
+    monkeypatch.setattr(plugin_prepare, "_CURRENT_FRAMEWORK", "sglang")
+    runtime.run(_context(64))
+
+    assert _events(runtime, "hint") == [None, None]
+
+
+def test_capture_hints_only_the_small_input_route(runtime):
+    runtime.use_routed_aiter()
+    runtime.run(_context(256))
+    runtime.capturing = True
+    runtime.run(_context(SMALL_M_MTPR))
+    runtime.run(_context(SMALL_M_MTPR + 1))
+
+    assert _events(runtime, "hint") == [256, SMALL_M_MTPR, None]
+
+
+def test_each_layer_selects_its_own_large_input_slot(runtime):
+    runtime.use_routed_aiter(layers=61)
+    layers = [_layer(value) for value in range(3)]
+    for layer in layers + layers:
+        runtime.run(_context(512, running_tokens_are_unified=False), layer=layer)
+    # The decode capacity has no large-input route and selects no slot.
+    runtime.run(_context(64), layer=layers[2])
+
+    assert {
+        capacity: instance.kwargs["large_m_state_slots"]
+        for (_, capacity), instance in runtime.instances.items()
+    } == {LARGE_CAPACITY: 69, 128: 69}
+    assert _events(runtime, "slot") == [0, 1, 2, 0, 1, 2]
