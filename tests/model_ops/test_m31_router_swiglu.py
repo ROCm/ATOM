@@ -213,3 +213,72 @@ def test_caller_moe_buf_and_scaling(gate, m):
     assert ps["moe_buf"] is buf and ps["moe_buf_ptr"] == buf.data_ptr()
     assert torch.equal(buf, before)
     assert torch.equal(ti1, ti2) and torch.equal(tw2, tw1 * 2)
+
+
+@pytest.fixture(scope="module")
+def shared_gate_up():
+    """An MXFP8 shared-expert gate_up weight [1536, 6144] with 1x32 scales,
+    row-major and in aiter's (16, 16) preshuffle."""
+    from aiter.ops.shuffle import shuffle_weight
+
+    from atom.model_ops.blockscale import quantize_fp8
+
+    g = torch.Generator(device="cuda").manual_seed(3)
+    w = (torch.randn(2 * INTER, K, device="cuda", generator=g) * 0.02).to(
+        torch.bfloat16
+    )
+    wq, ws = quantize_fp8(w)
+    return {"row_major": (wq, ws), "shuffled": (shuffle_weight(wq), ws)}
+
+
+@pytest.mark.parametrize("layout", ["row_major", "shuffled"])
+@pytest.mark.parametrize("m", [1, 8, 16, 17, 32, 33, 64, 100, 128])
+def test_gateup_in_router_launch_matches_linear(gate, shared_gate_up, layout, m):
+    """The gate_up GEMM as split-K partials in launch 1, finished with the
+    SwiGLU in launch 2, equals ATOM's MXFP8 linear + swiglu_oai_split_mxfp8
+    byte for byte; the routes equal launch 1 + gate_sort's."""
+    from atom.model_ops.blockscale import native_quant_linear, quantize_fp8
+    from atom.model_ops.minimax_m3.router.router_swiglu import (
+        router_gateup_partials,
+        router_gateup_supported,
+    )
+
+    w, bias = gate
+    wq, ws = shared_gate_up[layout]
+    x, _ = _inputs(m)
+    xq, xs = quantize_fp8(x)
+    assert router_gateup_supported(x, w, bias, xq, xs, wq, ws)
+    gate_up = native_quant_linear(
+        xq,
+        wq,
+        ws,
+        x_scale=xs,
+        weight_group_rows=1,
+        weight_preshuffled=layout == "shuffled",
+    )
+    rq, rs = swiglu_oai_split_mxfp8(gate_up, ALPHA, BETA, LIMIT)
+    assert router_gateup_partials(x, w, xq, xs, wq, ws)
+    tw, ti, _, (q, s) = gate_sort(
+        m, bias, 2.0, zero_moe_buf=False, swiglu=(INTER, ALPHA, BETA, LIMIT)
+    )
+    assert router_partials_swiglu(x, w, gate_up, ALPHA, BETA, LIMIT) is not None
+    tw2, ti2, _ = gate_sort(m, bias, 2.0, zero_moe_buf=False)
+    torch.cuda.synchronize()
+    assert torch.equal(q.view(torch.uint8), rq.view(torch.uint8))
+    assert torch.equal(s.view(torch.uint8), rs.view(torch.uint8))
+    assert torch.equal(ti, ti2) and torch.equal(tw, tw2)
+
+
+def test_presort_without_output(gate):
+    """zero_moe_buf=False leaves the output to set_presort_output."""
+    from atom.model_ops.minimax_m3.router.router_swiglu import set_presort_output
+
+    w, bias = gate
+    x, gu = _inputs(16)
+    assert router_partials_swiglu(x, w, gu, ALPHA, BETA, LIMIT) is not None
+    _, _, ps = gate_sort(16, bias, zero_moe_buf=False)
+    assert "moe_buf" not in ps
+    buf = torch.empty(16, K, device="cuda", dtype=torch.bfloat16)
+    set_presort_output(ps, buf)
+    assert ps["moe_buf"] is buf and ps["moe_buf_zeroed"]
+    assert ps["moe_buf_ptr"] == buf.data_ptr()
