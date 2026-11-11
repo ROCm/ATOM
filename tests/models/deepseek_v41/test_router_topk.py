@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""V4.1 decode-width routing top-k matches aiter's topk_gating bit for bit."""
+"""V4.1 routing top-k matches aiter's topk_gating bit for bit."""
 
 import pytest
 import torch
@@ -9,19 +9,21 @@ if not torch.cuda.is_available():
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
-if get_gfx_runtime() != "gfx1250":
-    pytest.skip("the kernel mirrors gfx1250's topk_gating", allow_module_level=True)
-
-from aiter import topk_gating
-
 from atom.model_ops.deepseek_v41.router_topk import (
+    _LAYOUTS,
     EXPERTS,
-    MAX_ROWS,
     route_topk,
     route_topk_supported,
 )
 
+if get_gfx_runtime() not in _LAYOUTS:
+    pytest.skip("no topk_gating layout mirrored for this arch", allow_module_level=True)
+
+from aiter import topk_gating
+
 SCALE = 1.5
+MAX_ROWS = _LAYOUTS[get_gfx_runtime()][3]
+GRAPHS_ONLY = _LAYOUTS[get_gfx_runtime()][4]
 
 
 def _reference(logits, bias, topk, valid):
@@ -41,29 +43,33 @@ def _reference(logits, bias, topk, valid):
     return weights, ids
 
 
-def _logits(rows, seed, ties):
+def _logits(rows, seed, kind):
     g = torch.Generator(device="cuda").manual_seed(seed)
     logits = torch.randn(rows, EXPERTS, generator=g, device="cuda") * 4
-    if ties:
-        # few distinct values: many exact ties within and across waves
+    if kind == "ties":
+        # few distinct values: many exact ties within and across lanes
         logits = (logits * 2).round() / 2
         logits[0, ::7] = float("nan")
+    elif kind == "nan":
+        logits[:, ::3] = float("nan")
+        logits[0, 5] = float("inf")
+        logits[0, 6] = float("-inf")
+        logits[-1] = float("nan")
     return logits.to(torch.bfloat16)
 
 
 @pytest.mark.parametrize("rows", [1, 7, 96, 576, MAX_ROWS])
-@pytest.mark.parametrize("topk", [6, 8])
-@pytest.mark.parametrize("ties", [False, True])
+@pytest.mark.parametrize("topk", [1, 6, 8])
+@pytest.mark.parametrize("kind", ["plain", "ties", "nan"])
 @pytest.mark.parametrize("with_bias", [False, True])
-def test_route_topk_is_topk_gating_bitwise(rows, topk, ties, with_bias):
-    logits = _logits(rows, 17 * rows + topk, ties)
+def test_route_topk_is_topk_gating_bitwise(rows, topk, kind, with_bias):
+    logits = _logits(rows, 17 * rows + topk, kind)
     bias = (
         torch.linspace(-1, 1, EXPERTS, device="cuda", dtype=torch.float32)
         if with_bias
         else None
     )
     valid = torch.tensor([max(1, rows - 3)], dtype=torch.int32, device="cuda")
-    assert route_topk_supported(logits, bias, topk, True)
     weights, ids = route_topk(logits, bias, topk, SCALE, valid)
     ref_weights, ref_ids = _reference(logits, bias, topk, valid)
     live = slice(0, int(valid))
@@ -75,9 +81,19 @@ def test_route_topk_is_topk_gating_bitwise(rows, topk, ties, with_bias):
     assert (weights[int(valid) :] == 0).all()
 
 
+@pytest.mark.parametrize("capturing", [False, True])
+def test_route_topk_supported_range(monkeypatch, capturing):
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
+    bias = torch.zeros(EXPERTS, device="cuda", dtype=torch.float32)
+    taken = capturing or not GRAPHS_ONLY
+    for rows, expected in ((1, taken), (MAX_ROWS, taken), (MAX_ROWS + 1, False)):
+        logits = torch.empty(rows, EXPERTS, device="cuda", dtype=torch.bfloat16)
+        assert route_topk_supported(logits, bias, 6, True) is expected
+
+
 def test_route_topk_replays_with_a_changing_row_count():
     rows, topk = 96, 6
-    logits = _logits(rows, 3, False)
+    logits = _logits(rows, 3, "plain")
     bias = torch.linspace(-1, 1, EXPERTS, device="cuda", dtype=torch.float32)
     valid = torch.tensor([rows], dtype=torch.int32, device="cuda")
     out = {}
