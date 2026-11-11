@@ -60,6 +60,7 @@ from atom.models.minimax_m3.mono.gfx1250.kernels.post_attn import (
     build_post_attn_kernel as build_post_attn_kernel_gfx1250,
 )
 from atom.models.minimax_m3.mono.gfx1250.kernels.pre_attn import K1_ARGS_G1250
+from atom.models.minimax_m3.mono.gfx1250.layout import wide_moe as gfx1250_wide_moe
 from atom.models.minimax_m3.mono.kernels.dense_post import (
     DENSE_POST_ABI,
     build_dense_post_kernel,
@@ -81,7 +82,6 @@ from atom.models.minimax_m3.mono.layout import (
     SCRATCH,
     diag_region_names,
     sym_layout,
-    wide_moe,
 )
 from atom.models.minimax_m3.mono.layout import SCRATCH_BYTES as K4_SCRATCH_BYTES
 from atom.models.minimax_m3.mono.weights import DenseLayer, SparseMoeLayer
@@ -184,7 +184,7 @@ class MonoDecodeRunner:
     def _x8_in(self, i: int, n: int) -> bool:
         """gfx1250: sparse layer i's K1 takes the MXFP8 rows layer i - 1 made (wide
         widths: a narrow kernel is VGPR-bound and normalizes its rows itself)."""
-        return self.gfx1250 and i > 0 and wide_moe(n)
+        return self.gfx1250 and i > 0 and gfx1250_wide_moe(n)
 
     def _build_layer_kernels(self, n: int) -> dict:
         kinds = {(lw.index_topk, self._x8_in(i, n)) for i, lw in enumerate(self.sparse)}

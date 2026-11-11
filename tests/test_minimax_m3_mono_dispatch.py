@@ -462,6 +462,14 @@ def test_a_prefix_mono_cannot_hand_over_from_is_refused(layers):
         runner.dense_prefix_mono(layers)
 
 
+@pytest.mark.parametrize("tokens,wide", [(1, False), (3, False), (4, True), (16, True)])
+def test_gfx1250_cross_layer_input_follows_its_wide_threshold(tokens, wide):
+    stub = runner.MonoDecodeRunner.__new__(runner.MonoDecodeRunner)
+    stub.gfx1250 = True
+    assert stub._x8_in(0, tokens) is False
+    assert stub._x8_in(1, tokens) is wide
+
+
 def _dense_runner(n):
     """A runner holding only what ``run_dense`` touches: ``ars`` and a model
     whose prefix layers add one to the hidden and stamp the residual."""
