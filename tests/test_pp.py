@@ -1231,10 +1231,9 @@ def test_hold_is_released_only_by_the_chunk_that_holds_it():
     assert seq.id not in sched._checkpoint_holds
 
 
-@pytest.mark.parametrize("acked", [False, True])
-def test_head_flushes_a_held_chunk_whether_or_not_it_is_acked(acked):
-    # Dynamic chunking acks middle chunks: that branch must flush a hold too,
-    # or the held seq never re-enters the prefill scan and stalls.
+def test_head_flushes_a_held_chunk_when_its_ack_arrives():
+    # Every middle chunk is acked: the ack must flush a hold, or the held seq
+    # never re-enters the prefill scan and stalls.
     import queue
 
     from aiter_stub import stubbed_aiter
@@ -1243,7 +1242,7 @@ def test_head_flushes_a_held_chunk_whether_or_not_it_is_acked(acked):
         from atom.model_engine.pp_engine_core import PPEngineCoreProc
 
     sched, seq, batch, seqs = _held_after_first_chunk()
-    batch.pp_completion_ack = acked
+    batch.pp_completion_ack = True
     sched.mark_pp_inflight(batch)
     core = PPEngineCoreProc.__new__(PPEngineCoreProc)
     core.scheduler = sched
@@ -1255,7 +1254,7 @@ def test_head_flushes_a_held_chunk_whether_or_not_it_is_acked(acked):
     core._poll_kv_transfer_progress = lambda: None
     core._poll_dynamic_chunking_calibration = lambda: None
     core.runner_mgr = types.SimpleNamespace(call_func=lambda *a, **k: None)
-    completions = deque([(batch.req_ids, None)] if acked else [])
+    completions = deque([(batch.req_ids, None)])
     core.pp_transport = types.SimpleNamespace(
         recv_completion=lambda **k: completions.popleft() if completions else None
     )

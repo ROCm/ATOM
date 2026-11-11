@@ -109,12 +109,18 @@ Four rules carry the module:
 | `mp/connector.py` | Capability-selected public `lmcache_mp` worker/scheduler shells. |
 | `mp/deployment.py` | LMCache MP configuration, topology, model namespace and server adapters. |
 | `mp/worker.py`, `mp/scheduler.py` | LMCache MP connector halves. The worker registers PAGE views, plus checkpoint image groups when the backend publishes them; the vLLM plugin builds it directly. |
+| `page_codec.py` | `pure_page_codec`: complete PAGE-only geometry validation and the `DSV4PageSlotCodec` shared by M3 and Mooncake Store. |
+| `capabilities.py` | `publishes_native_state`, `copies_paged_state`, and `replays_state`: lightweight state-transfer capability checks, independent of Torch and byte codecs. |
+| `tier.py` | `OffloadTierProfile`: shared tier loadability and minimum-transfer contract consumed by the connector factory and DP routing. |
+| `load_math.py` | Pure functions for how many tokens a tier moves (`loadable_hit`, `tier_load_tokens`), used by the offload scheduler and by DP routing's `OffloadTierProfile`. |
+| `mp/token_shipping.py` | Incremental token shipping: the scheduler sends each transfer only the tokens past what the workers hold; the worker shell rebuilds the prefix. |
+| `mp/metadata.py` | MP-specific shipped/resolved token types and drop-only step metadata; shared metadata keeps plain token lists. |
 | `mp/transfer_thread.py` | The transfer thread: submits off the forward thread under `OFFLOAD_MP_TRANSFER_THREAD`, and also polls for a worker built with `transfers_off_step`; `_ProducerFences`, the reused producer events. |
 | `mp/lookup.py` | Scheduler-side MP lookups and read-lock bookkeeping. |
 | `mp/transfer.py` | Transfer identity, terminal detection and the fail-stop transfer deadline. |
 | `mp/page_views.py` | Shared validation of backend-published PAGE views. |
 | `mp/native_state_{layout,scheduler,worker}.py` | The PAGE-backed native-state layout and `stores_state_images`, scheduler leases, and the worker's restore into an Active SLOT. Its registration and block-id validation are `mp/worker.py`'s (shared with the plugin), and `require_native_state_server` is `mp/deployment.py`'s. |
-| `mooncake_store/config.py` | The `mooncake_store.*` settings (per-NIC Store pools included), and the dense/DCP=1 startup refusals. |
+| `mooncake_store/config.py` | The `mooncake_store.*` settings (per-NIC Store pools included), `uses_replay_pages`, and the startup refusals (layouts other than dense and V4.1 PAGE, DCP > 1, odd chunks). |
 | `mooncake_store/keys.py` | Layout namespace, the prompt's 16-byte chunk hash chain, and Store key spelling. |
 | `mooncake_store/nic.py` | One PCI-local RDMA device per worker. |
 | `mooncake_store/client.py` | Pure zero-copy `MooncakeDistributedStore` client, result codes, per-call counters. |
@@ -126,6 +132,17 @@ The engine-side counterpart of the state tier lives outside this directory:
 `atom/model_engine/state_offload.py` holds `StateOffloadIndex`, which applies the
 store/finished/failed hash sets that `hybrid/kimi_k3/state_tier.py` reports back,
 so a later prefix hit knows which checkpoints the CPU tier can actually serve.
+
+State images and paged KV share one LocalCPU pool and one LRU, and a state hit
+is answered by the index rather than an LMCache lookup. So every voted hit is
+also sent to the workers as a touch (`LMCacheOffloadMetadata.state_touches`):
+each rank refreshes the image (`StateByteCodec.touch`) and reports on
+`k3_state_touch` whether it is still there; a gone image leaves the index. An
+admission that would load an image not confirmed within `tier_verified_for_s`
+(sized from `LMCACHE_MAX_LOCAL_CPU_SIZE`) is held a pass, at most
+`OFFLOAD_LOOKUP_DEFER_S`, for that verdict. Touches that only confirmed presence
+(the image is held by another backend only, or the touch raised) are counted in
+the connector statistic `state_touches_unrefreshed`.
 
 ## LMCache Multiprocess (`lmcache_mp`)
 
@@ -357,7 +374,8 @@ comparison, per-rank retrieve counts, one-writer storage, and promoted ranges.
 `ChunkedOffloadSchedulerBase` (save cadence, load decisions, early block
 release, exact operation completions), the `DenseOffloadConnector` worker
 plumbing (executors, per-step producer fence, completion reports),
-`BlockGPUConnector` and `DenseKVByteCodec`. What replaces LMCache is a Mooncake
+`BlockGPUConnector` and a byte codec (`DenseKVByteCodec`, or the PAGE-only
+`DSV4PageSlotCodec` for V4.1). What replaces LMCache is a Mooncake
 Store whose memory belongs to separate owner processes -- on the prefill node's
 NUMA nodes and, across two nodes, on the decode node -- reached directly by
 every prefill worker. There is no CPU L1, no LMCache engine or lookup server,
@@ -666,8 +684,8 @@ this worker config.
 
 ### Not supported in phase 1
 
-- Layouts other than dense (DSV4 PAGE+SLOT, MiniMax-M3, Kimi-K3 state tier) and
-  DCP > 1 on the offload side: refused at startup.
+- Layouts other than dense and V4.1's replay PAGEs (DSV4 PAGE+SLOT, MiniMax-M3,
+  Kimi-K3 state tier) and DCP > 1 on the offload side: refused at startup.
 - Decode-side offload, and reading the Store from decode workers: decode DRAM
   joins as Store owners only.
 - A second offload connector beside it in one `multi`.
@@ -1479,6 +1497,7 @@ LMCache version, these are what to re-check.**
 | `get_or_create(…, lambda t,s: None, lambda o,s: o)` | LMCache's trailing token-processing / output-transform callbacks | We don't use LMCache's token-shaping hooks — our codec moves raw bytes | Passed as no-op / identity callables |
 | `cfg.lookup_server_worker_ids = [0]` | default: every rank answers lookup, client takes `min()` | At TP>1 a non-rank-0 shard returning 0 would zero out a real hit; rank 0 is made authoritative | `config.py` (see [TP > 1 Notes](#tp--1-notes)) |
 | `cfg.use_gds = False` | LMCache may enable cufile GDS | cufile init hangs without NVMe-GDS hardware here | `config.py` |
+| `StateByteCodec.touch` | `LocalCPUBackend.touch_cache()` after `contains(pin=True)` | A pin needs a paired unpin, and `keys_in_request` belongs to the concurrent KV lookup | `cache_policy.update_on_hit(key, hot_cache)` under `cpu_lock`, resolved once at bind; if one is missing it warns and touches only confirm presence |
 
 ### 3. Fully delegated to LMCache (we never touch the implementation)
 

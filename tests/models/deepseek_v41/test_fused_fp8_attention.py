@@ -174,7 +174,7 @@ def make_step(
         state_slot_out=case.slot_ids,
     )
     if case.model.spec.ratio:
-        step.selected[0] = case.selection[:, : step.width]
+        step.selected[0] = case.selection[:, : step.running_tokens]
     queries = None
     if bounded:
         rows = torch.tensor(
@@ -188,7 +188,7 @@ def make_step(
             rows,
             step.positions[rows],
             replace(step, batch_ids=ids, group_indices={}),
-            torch.cat((rows, rows.new_tensor([step.width]))),
+            torch.cat((rows, rows.new_tensor([step.running_tokens]))),
         )
     return step, queries
 
@@ -226,7 +226,7 @@ def test_norm_rope_quant_window_matches_two_launches(fused_factory, stage, q_lor
     model, cache, rope = case.model, case.cache, case.rope
     step, _ = make_step(case, lengths, prefill=stage != "decode")
     latent = torch.randn(
-        1, step.width, q_lora_rank + 512, device="cuda", dtype=torch.bfloat16
+        1, step.running_tokens, q_lora_rank + 512, device="cuda", dtype=torch.bfloat16
     )
     q, kv = latent[..., :q_lora_rank], latent[..., q_lora_rank:]
     layer = model.spec.layer_id
@@ -261,7 +261,9 @@ def test_fused_forward_matches_unfused(fused_factory, heads, stage, record_prope
         position=0 if stage == "prefill" else None,
         bounded=stage == "bounded",
     )
-    hidden = torch.randn(1, step.width, 256, device="cuda", dtype=torch.bfloat16)
+    hidden = torch.randn(
+        1, step.running_tokens, 256, device="cuda", dtype=torch.bfloat16
+    )
     outputs, caches = {}, {}
     for mode in ("unfused", "fused"):
         case.model.fused_attn = mode == "fused"
@@ -284,7 +286,9 @@ def test_window_layer_fused_forward(fused_factory, stage, record_property):
         case, lengths, prefill=stage != "decode", bounded=stage == "bounded"
     )
     assert not step.selected
-    hidden = torch.randn(1, step.width, 256, device="cuda", dtype=torch.bfloat16)
+    hidden = torch.randn(
+        1, step.running_tokens, 256, device="cuda", dtype=torch.bfloat16
+    )
     reference, ring = None, None
     for mode in ("unfused", "fused"):
         case.model.fused_attn = mode == "fused"
@@ -304,7 +308,9 @@ def test_fused_forward_with_2048_prefix_rows(
 ):
     case = fused_factory(heads, topk=2048)
     step, _ = make_step(case, (3, 5) if prefill else (1, 1), prefill=prefill)
-    hidden = torch.randn(1, step.width, 256, device="cuda", dtype=torch.bfloat16)
+    hidden = torch.randn(
+        1, step.running_tokens, 256, device="cuda", dtype=torch.bfloat16
+    )
     reference, ring = None, None
     for mode in ("unfused", "fused"):
         case.model.fused_attn = mode == "fused"
@@ -372,7 +378,7 @@ def test_fused_forward_graph_replay(fused_factory, monkeypatch, kind, idle):
         live = ctx.attn_metadata.step
         live.begin_forward()
         if model.spec.ratio:
-            live.selected[0] = case.selection[:, : live.width]
+            live.selected[0] = case.selection[:, : live.running_tokens]
         return model(hidden, None, cache, live, rope)
 
     hidden = torch.randn(1, 8, 256, device="cuda", dtype=torch.bfloat16)
@@ -490,7 +496,9 @@ def test_vllm_fused_region_matches_native(fused_factory, monkeypatch, stage):
         position=0 if stage == "prefill" else None,
         bounded=stage == "bounded",
     )
-    hidden = torch.randn(1, step.width, 256, device="cuda", dtype=torch.bfloat16)
+    hidden = torch.randn(
+        1, step.running_tokens, 256, device="cuda", dtype=torch.bfloat16
+    )
     case.cache.backing.copy_(case.initial)
     expected = case.model(hidden, None, case.cache, step, case.rope, queries)
     expected_ring = case.cache.backing.clone()
