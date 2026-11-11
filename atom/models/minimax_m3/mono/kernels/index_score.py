@@ -4,7 +4,8 @@
 
 The Triton decode scorer's math, one 128-key block of index-K per task: bf16(fp8
 K) x bf16 index q on the MFMA, max over the causal keys, times fp32(sm_scale *
-log2 e). A context of <= TOPK_BLOCKS blocks keeps every block and is not scored;
+log2 e). (An NVFP4 index cache: K = e4m3_rn_satfinite(e2m1 x scale) and q e4m3,
+one fp8 16x16x128 MFMA a tile, like vLLM's NVFP4 indexer.) A context of <= TOPK_BLOCKS blocks keeps every block and is not scored;
 nor are the blocks the selector pins (the first ``init_blocks``, the last
 ``local_blocks``): their keys are forced. A scored block waits for the index keys
 K1 inserts this step only when it may hold one (``wait_new_keys``).
@@ -41,6 +42,7 @@ from atom.models.minimax_m3.mono.config import (
     IndexHeads,
 )
 from atom.models.minimax_m3.mono.sources import SOURCES
+from atom.mono.device.mx import UNIT_SCALE, mfma_scaled
 from atom.mono.device.ops import (
     butterfly,
     fp8x8_bf16_pk,
@@ -70,12 +72,31 @@ KEY_TILES = SPARSE_BLOCK // 16  # MFMA row tiles of a block
 _CURRENT_STREAM = fx.Stream(None)
 
 
-def nvfp4_dword_bf16x8(word, scale_byte):
+E4M3_MAX = 448.0
+
+
+def e4m3_dwords(vals):
+    """Eight f32 -> two dwords of E4M3 (RNE, saturating at 448: the convert itself
+    does not saturate), the quantizer of vLLM's NVFP4 indexer for K and for Q."""
+    hi, lo = fx.Float32(E4M3_MAX), fx.Float32(-E4M3_MAX)
+    out = []
+    for d in range_constexpr(2):
+        packed = as_ir_value(fx.Int32(0))
+        for h in range_constexpr(2):
+            a, b = (vals[4 * d + 2 * h + i].minimumf(hi).maximumf(lo) for i in (0, 1))
+            packed = rocdl.cvt_pk_fp8_f32(
+                T.i32, as_ir_value(a), as_ir_value(b), packed, bool(h)
+            )
+        out.append(fx.Int32(packed))
+    return out
+
+
+def nvfp4_dword_e4m3x8(word, scale_byte):
     """Eight e2m1 of ``word`` (low nibble first) times the e4m3 scale in the low
-    byte of ``scale_byte``, as eight bf16: the exact product (an e2m1 x e4m3 value
-    has <= 6 significant bits, bf16 holds it). ``v_cvt_scalef32_pk_f32_fp4`` takes
-    only the exponent of its scale, so the elements are widened at scale 1.0 and
-    multiplied by the scale decoded to f32."""
+    byte of ``scale_byte``, rounded to E4M3 (``k_round="e4m3"`` of aiter's scorer):
+    two dwords. ``v_cvt_scalef32_pk_f32_fp4`` takes only the exponent of its scale,
+    so the elements are widened at scale 1.0 and multiplied by the scale decoded to
+    f32 (exact: <= 6 significant bits)."""
     sc = fx.Vector(
         rocdl.cvt_pk_f32_fp8(
             res=fx.Vector.make_type(2, fx.Float32),
@@ -89,7 +110,17 @@ def nvfp4_dword_bf16x8(word, scale_byte):
     for sel in range_constexpr(4):
         pair = fx.Vector(rocdl.cvt_scalef32_pk_f32_fp4(T.vec(2, T.f32), w, one, sel))
         prod += [fx.Float32(pair[0]) * sc, fx.Float32(pair[1]) * sc]
-    return fx.Vector.from_elements(prod, fx.Float32).to(fx.BFloat16)
+    return e4m3_dwords(prod)
+
+
+def q_e4m3(frags):
+    """The four k-chunk fragments (bf16x8 each) of an index q -> the e4m3 B operand
+    of one 16x16x128 MFMA (8 dwords), as vLLM quantizes the index q."""
+    words = []
+    for f in frags:
+        v = fx.Vector(f).to(fx.Float32)
+        words += e4m3_dwords([fx.Float32(v[i]) for i in range(8)])
+    return fx.Vector.from_elements(words, fx.Int32)
 
 
 def _f32(x: float) -> float:
@@ -266,6 +297,9 @@ def emit_index_scores(
                 words += [w[e] for e in range(4)]
         return fx.Vector.from_elements(words, fx.Int32)
 
+    def q_operand(frags):
+        return q_e4m3(frags) if const_expr(nvfp4) else frags
+
     def split_tiles(raw, tiles):
         """``load_raw``'s words -> per tile the MFMA A operands: tile i holds keys
         16 i + lane % 16, k = 32 s + 8 (lane / 16). A 4 x 4 transpose of the 8 B
@@ -275,12 +309,16 @@ def emit_index_scores(
         if const_expr(nvfp4):
             for n in range_constexpr(len(tiles)):
                 out.append(
-                    [
-                        nvfp4_dword_bf16x8(
-                            raw[5 * n + s], raw[5 * n + 4] >> (8 * (s // 2))
-                        )
-                        for s in range(4)
-                    ]
+                    fx.Vector.from_elements(
+                        [
+                            w
+                            for s in range(4)
+                            for w in nvfp4_dword_e4m3x8(
+                                raw[5 * n + s], raw[5 * n + 4] >> (8 * (s // 2))
+                            )
+                        ],
+                        fx.Int32,
+                    )
                 )
             return out
         for n in range_constexpr(len(tiles)):
@@ -307,9 +345,13 @@ def emit_index_scores(
         v = fx.Float32(float("-inf"))
         for n, i in enumerate(tiles):
             c = fx.Vector.filled(4, 0.0, fx.Float32)
-            for s in range_constexpr(HEAD_DIM // 32):
-                a = kw[n][s] if nvfp4 else fp8x8_bf16_pk(kw[n][s])
-                c = mfma_bf16(a, qb[s], c)
+            if const_expr(nvfp4):  # K and q e4m3: one fp8 MFMA over all 128 dims
+                c = mfma_scaled(
+                    kw[n], qb, c, fx.Int32(UNIT_SCALE), fx.Int32(UNIT_SCALE)
+                )
+            else:
+                for s in range_constexpr(HEAD_DIM // 32):
+                    c = mfma_bf16(fp8x8_bf16_pk(kw[n][s]), qb[s], c)
             # lane holds keys 16 i + 4 (lane / 16) + e of column lane % 16
             key0 = b * SPARSE_BLOCK + 16 * i + 4 * g4
             for e in range_constexpr(4):
@@ -343,7 +385,9 @@ def emit_index_scores(
                     f = p * 16 + l16
                     head = fx.min(f // q_len, TP - 1)
                     col = tk - (q_len - 1) + f % q_len
-                    qb = [q_frag_head(col, s, head) for s in range(HEAD_DIM // 32)]
+                    qb = q_operand(
+                        [q_frag_head(col, s, head) for s in range(HEAD_DIM // 32)]
+                    )
                     v = tiles_max(b, qb, lane_gather(seq_lane, col), tiles, kw)
                     if (lane < 16) & (f < n_cols):
                         mb_put(
@@ -384,7 +428,7 @@ def emit_index_scores(
             if const_expr(prepare is not None):
                 prepare(tk - (q_len - 1), tk)
             col, col_seq = cols_of(tk)
-            qb = [q_frag(col, s) for s in range(HEAD_DIM // 32)]
+            qb = q_operand([q_frag(col, s) for s in range(HEAD_DIM // 32)])
             v = tiles_max(b, qb, col_seq, [wave], split_tiles(raw, [wave]))
             if lane < 16:
                 fx.ptr_store(v, red + (wave * 16 + l16))
@@ -408,7 +452,7 @@ def emit_index_scores(
             raw = load_raw(page, tiles)
             col = tk - (q_len - 1) + fx.min(l16, q_len - 1)
             col_seq = lane_gather(seq_lane, col)
-            qb = [q_frag(col, s) for s in range(HEAD_DIM // 32)]
+            qb = q_operand([q_frag(col, s) for s in range(HEAD_DIM // 32)])
             put(b, col, tiles_max(b, qb, col_seq, tiles, split_tiles(raw, tiles)))
 
         # Every wave the same task count: task u on wave
