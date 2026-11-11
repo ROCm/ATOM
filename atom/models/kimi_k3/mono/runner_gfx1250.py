@@ -21,7 +21,15 @@ from dataclasses import dataclass, replace
 import torch
 from aiter import ActivationType, QuantType, dtypes
 from aiter.dist.parallel_state import get_tp_group
-from aiter.fused_moe import fused_moe
+from aiter.fused_moe import (
+    _return_output,
+    fused_moe,
+    get_inter_dim,
+    quant_remap,
+    resolve_activation_dtype,
+)
+from aiter.ops.flydsl.grouped_moe_gfx1250 import grouped_gemm_gfx1250_a8w4
+from aiter.ops.flydsl.herd_topk import herd_finalize_candidates, herd_route_psum
 from aiter.ops.flydsl.moe_common import GateMode
 
 try:
@@ -51,6 +59,7 @@ from atom.models.kimi_k3.mono.kernels.execution_plan import (
 )
 from atom.models.kimi_k3.mono.kernels.stages.k2_finish_persistent_gfx1250 import (
     build_packed_finish,
+    herd_scratch_layout,
 )
 from atom.models.kimi_k3.mono.kernels.stages.k2_front_role_lds_gfx1250 import (
     build_role_lds_front,
@@ -129,6 +138,49 @@ def _lean_width(
     )
 
 
+class _PrecomputedHerd:
+    """The routes the lite finish finished HERD into (``precompute_herd``),
+    standing in for the ``HerdCandidates`` ``fused_moe`` hands the grouped MoE:
+    ``route_psum`` returns them when the finish laid them out for the tile the
+    MoE asks for, and otherwise finalizes the candidates as AITER would and has
+    the finish lay out for that tile from the next launch on."""
+
+    def __init__(self, scratch: torch.Tensor, candidates, values, rows: int) -> None:
+        layout = herd_scratch_layout(rows)
+
+        def view(name, dtype=torch.int32):
+            at, words = layout[name]
+            return scratch[at : at + 4 * words].view(dtype)
+
+        self.candidates, self.values = candidates, values
+        # AITER's grouped tile for these decode widths; a different one costs
+        # one fallback launch.
+        self.tile_m = 16
+        self.tile_m_cell = view("tile_m")
+        self.tile_m_cell.fill_(self.tile_m)
+        view("routed_scaling_factor", torch.float32).fill_(1.0)
+        self.routes = (
+            view("topk_weights", torch.float32).view(rows, TOPK),
+            view("topk_ids").view(rows, TOPK),
+            view("masked_m"),
+            view("topids_to_rows").view(rows, TOPK),
+            view("psum"),
+        )
+
+    def fusable(self) -> bool:
+        return True
+
+    def finalize(self) -> tuple[torch.Tensor, torch.Tensor]:
+        return herd_finalize_candidates(self.values, self.candidates, EXPERTS)
+
+    def route_psum(self, tile_m: int) -> tuple[torch.Tensor, ...]:
+        if tile_m == self.tile_m:
+            return self.routes
+        self.tile_m = tile_m
+        self.tile_m_cell.fill_(tile_m)
+        return herd_route_psum(self.values, self.candidates, EXPERTS, tile_m)
+
+
 @dataclass
 class Gfx1250RoutedK2Build:
     plan: Gfx1250KimiBuildPlan
@@ -139,6 +191,7 @@ class Gfx1250RoutedK2Build:
     grouped_experts: bool
     replicated_finalize: bool
     herd: bool = False
+    herd_routes: _PrecomputedHerd | None = None
 
 
 @dataclass(frozen=True)
@@ -333,6 +386,7 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             replicated_front=grouped,
             herd=herd,
             fp8_shared_down=fp8_down,
+            precompute_herd=herd,
         )
         finalize = (
             build_replicated_finalize(plan)
@@ -395,6 +449,16 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             grouped,
             replicated,
             herd,
+            (
+                _PrecomputedHerd(
+                    buffers["finish_scratch"],
+                    buffers["route"],
+                    buffers["tile_route"],
+                    rows,
+                )
+                if herd
+                else None
+            ),
         )
 
     def forward(
@@ -493,7 +557,9 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             )
         self._finish(weight, local, gathered, stream)
         moe = self.inner.layers[plan.layer_id].block_sparse_moe
-        if local.grouped_experts:
+        if local.herd_routes is not None:
+            self._grouped_moe(weight, local, moe)
+        elif local.grouped_experts:
             fused_moe(
                 buffers["latent_fp4"].view(torch.uint8).view(dtypes.fp4x2),
                 weight.w13.view(dtypes.fp4x2),
@@ -593,6 +659,58 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             dim=0,
             use_custom=False,
         ).view(torch.uint8)
+
+    def _grouped_moe(self, weight, local, moe):
+        """``fused_moe``'s HERD call into the grouped MoE, with the lite
+        finish's routes in place of the candidates it would finalize."""
+        buffers = local.buffers
+        hidden = buffers["latent_fp4"].view(torch.uint8).view(dtypes.fp4x2)
+        w1, w2 = weight.w13.view(dtypes.fp4x2), weight.w2.view(dtypes.fp4x2)
+        rows = hidden.size(0)
+        experts, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
+        quant_type = quant_remap.get(QuantType.per_1x32, QuantType.per_1x32)
+        out = grouped_gemm_gfx1250_a8w4(
+            hidden,
+            w1,
+            w2,
+            # Unfilled: the grouped MoE takes the routes from ``herd``.
+            torch.empty((rows, TOPK), dtype=torch.float32, device=hidden.device),
+            torch.empty((rows, TOPK), dtype=torch.int32, device=hidden.device),
+            E=experts,
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            dtype=torch.bfloat16,
+            activation=ActivationType.Situv2,
+            quant_type=quant_type,
+            q_dtype_a=resolve_activation_dtype(
+                quant_type,
+                w1.dtype,
+                activation=ActivationType.Situv2,
+                gate_mode=GateMode.INTERLEAVE,
+                M=rows,
+                hidden_dtype=hidden.dtype,
+                has_a1_scale=True,
+                gate_up_interleave=getattr(w1, "gate_up_interleave", None),
+            ),
+            q_dtype_w=w1.dtype,
+            isG1U1=inter_dim != w1.shape[1],
+            doweight_stage1=False,
+            w1_scale=moe.experts.w13_weight_scale,
+            w2_scale=moe.experts.w2_weight_scale,
+            a1_scale=buffers["latent_scales"],
+            expert_mask=None,
+            hidden_pad=0,
+            intermediate_pad=0,
+            bias1=None,
+            bias2=None,
+            situ_beta=SITU_BETA,
+            situ_linear_beta=SITU_LINEAR_BETA,
+            output=buffers["routed"],
+            herd=local.herd_routes,
+        )
+        if out is None:
+            raise RuntimeError("the grouped MoE refused the precomputed HERD routes")
+        _return_output(out, buffers["routed"])
 
     def _finish(self, weight, local, gathered, stream):
         buffers = local.buffers

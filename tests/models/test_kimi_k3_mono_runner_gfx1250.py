@@ -319,6 +319,7 @@ def test_grouped_k2_projects_locally_then_runs_grouped_moe(monkeypatch, herd):
         grouped_experts=True,
         replicated_finalize=False,
         herd=herd,
+        herd_routes=None,
     )
     x = tensor(rows, 4)
     experts = SimpleNamespace(w13_weight_scale=tensor(2), w2_weight_scale=tensor(2))
@@ -415,6 +416,7 @@ def test_replicated_finalize_all_reduces_both_partials_once(monkeypatch):
         grouped_experts=True,
         replicated_finalize=True,
         herd=False,
+        herd_routes=None,
     )
     experts = SimpleNamespace(w13_weight_scale=None, w2_weight_scale=None)
     layer = SimpleNamespace(
@@ -452,3 +454,37 @@ def test_replicated_finalize_all_reduces_both_partials_once(monkeypatch):
         buffers["final"].data_ptr(),
     )
     assert out is buffers["final"]
+
+
+def test_precomputed_herd_hands_over_routes_laid_out_for_the_tile(monkeypatch):
+    from atom.models.kimi_k3.mono.kernels.stages.k2_finish_persistent_gfx1250 import (
+        herd_scratch_layout,
+    )
+
+    rows = 20
+    layout = herd_scratch_layout(rows)
+    scratch = torch.zeros(
+        max(at + 4 * words for at, words in layout.values()), dtype=torch.uint8
+    )
+    candidates = torch.zeros((rows, 17), dtype=torch.int32)
+    values = torch.zeros((rows, 17))
+    herd = runner_module._PrecomputedHerd(scratch, candidates, values, rows)
+    tile_at = layout["tile_m"][0]
+    assert int(scratch[tile_at : tile_at + 4].view(torch.int32)) == 16
+    scale_at = layout["routed_scaling_factor"][0]
+    assert float(scratch[scale_at : scale_at + 4].view(torch.float32)) == 1.0
+
+    routes = herd.route_psum(16)
+    assert routes[1].shape == (rows, 16) and routes[2].shape == (896,)
+    assert routes[0].data_ptr() == scratch.data_ptr() + layout["topk_weights"][0]
+
+    calls = []
+    monkeypatch.setattr(
+        runner_module,
+        "herd_route_psum",
+        lambda *args: calls.append(args) or ("finalized",),
+    )
+    assert herd.route_psum(32) == ("finalized",)
+    assert calls[0][3] == 32
+    assert int(scratch[tile_at : tile_at + 4].view(torch.int32)) == 32
+    assert herd.route_psum(32) is herd.routes

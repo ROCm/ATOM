@@ -21,6 +21,7 @@ from atom.models.kimi_k3.mono.kernels.stages.moe_layout import (
     TOPK,
 )
 from atom.mono.device.ops import (
+    CM_DEV,
     butterfly,
     hw_exp2,
     hw_rcp,
@@ -236,7 +237,9 @@ def stage_route(c, token, front_payload_words=0):
                         1,
                     )
                 ]
-            )[0][0]
+            )[
+                0
+            ][0]
             logit = _f32_of(got)
             sig = hw_rcp(fx.Float32(1.0) + hw_exp2(logit * fx.Float32(-LOG2E)))
             score = sig + _load_f32(c["args"]["bias"], expert)
@@ -363,6 +366,208 @@ def stage_route(c, token, front_payload_words=0):
                     my_sigmoid * inverse,
                 )
     gpu.barrier()
+
+
+# The HERD finalize's arrival counter advances by this much a launch: the
+# routing CTAs add one each and the finalizing CTA the rest, so a power of two
+# keeps the modulo exact across the i32 wrap.
+HERD_LAUNCH_ARRIVALS = 64
+# ``herd_finalize_words``' tail: the staged kept routes and their expert slots.
+_HERD_ROUTE_SLOTS = 48 * TOPK
+# A sort key's candidate index bits, below its expert id.
+_HERD_KEY_SHIFT = 5
+
+
+def _sort_network(n: int) -> list[tuple[int, int]]:
+    """Batcher's odd-even merge sort over the next power of two, without the
+    comparators past ``n`` (those positions would hold +inf and never swap)."""
+    size = 1 << (n - 1).bit_length()
+    pairs = []
+    p = 1
+    while p < size:
+        k = p
+        while k:
+            for j in range(k % p, size - k, 2 * k):
+                for i in range(min(k, size - j - k)):
+                    if (i + j) // (2 * p) == (i + j + k) // (2 * p):
+                        pairs.append((i + j, i + j + k))
+            k //= 2
+        p *= 2
+    return [(a, b) for a, b in pairs if b < n]
+
+
+def herd_finalize_words(rows: int) -> dict[str, int]:
+    """LDS i32 words ``stage_herd_finalize`` needs for ``rows`` tokens."""
+    if rows * TOPK > _HERD_ROUTE_SLOTS:
+        raise ValueError(f"HERD finalize stages at most 48 rows, got {rows}")
+    return {
+        "popularity": EXPERTS,
+        "counts": EXPERTS,
+        "starts": EXPERTS,
+        "scan": 8,
+        "ids": rows * (TOPK + 1),
+        "values": rows * (TOPK + 1),
+        "kept_ids": _HERD_ROUTE_SLOTS,
+        "kept_weights": _HERD_ROUTE_SLOTS,
+        "slots": _HERD_ROUTE_SLOTS,
+    }
+
+
+@traced
+def stage_herd_finalize(c, rows):
+    """AITER's ``herd_route_psum`` for this launch's Top-(K+1) candidates, by
+    one CTA once every routing CTA has stored its token's.
+
+    As AITER drops it, each token loses its candidate of the lowest batch
+    popularity (then value, then expert id); the K kept are ordered by expert
+    id and weighted by their sigmoid over the kept sum taken in candidate order,
+    so ids and weights are bit-identical. ``psum`` and ``masked_m`` are the
+    ``tile_m``-aligned grouped layout, and ``topids_to_rows`` a route's row in
+    it; a route's slot within its expert is taken by an LDS atomic, as AITER's
+    is, so only the order inside an expert may differ, which no GEMM row reads
+    across."""
+
+    tid, lane, wave = c["tid"], c["lane"], c["wave"]
+    threads, waves = c["threads"], c["waves"]
+    lds = c["herd_lds"]
+    popularity, counts, starts = lds["popularity"], lds["counts"], lds["starts"]
+    ids_s, values_s = lds["ids"], lds["values"]
+    kept_ids, kept_weights, slots = lds["kept_ids"], lds["kept_weights"], lds["slots"]
+    kp1 = TOPK + 1
+    candidates = rows * kp1
+    routes = rows * TOPK
+
+    for index in range_constexpr((EXPERTS + threads - 1) // threads):
+        expert = tid + index * threads
+        if expert < EXPERTS:
+            fx.ptr_store(fx.Int32(0), popularity + expert)
+            fx.ptr_store(fx.Int32(0), counts + expert)
+    loaded = []
+    for index in range_constexpr((candidates + threads - 1) // threads):
+        at = fx.min(tid + index * threads, candidates - 1)
+        loaded.append(
+            (
+                fx.Int32(
+                    bo.buffer_load(
+                        rsrc(c["route"]),
+                        at,
+                        vec_width=1,
+                        dtype=T.i32,
+                        cache_modifier=CM_DEV,
+                    )
+                ),
+                fx.Float32(
+                    bo.buffer_load(
+                        rsrc(c["route_weights"]),
+                        at,
+                        vec_width=1,
+                        dtype=T.f32,
+                        cache_modifier=CM_DEV,
+                    )
+                ),
+            )
+        )
+    gpu.barrier()
+    for index in range_constexpr(len(loaded)):
+        at = tid + index * threads
+        if at < candidates:
+            expert, value = loaded[index]
+            fx.ptr_store(expert, ids_s + at)
+            fx.ptr_store(value, values_s + at)
+            fx.atomic_add(popularity + expert, fx.Int32(1), syncscope="workgroup")
+    gpu.barrier()
+
+    if tid < rows:
+        base = tid * kp1
+        ids = [fx.ptr_load(ids_s + base + j) for j in range_constexpr(kp1)]
+        values = [fx.ptr_load(values_s + base + j) for j in range_constexpr(kp1)]
+        pops = [fx.ptr_load(popularity + ids[j]) for j in range_constexpr(kp1)]
+        drop = fx.Int32(0)
+        drop_id, drop_value, drop_pop = ids[0], values[0], pops[0]
+        for j in range_constexpr(1, kp1):
+            take = (pops[j] < drop_pop) | (
+                (pops[j] == drop_pop)
+                & (
+                    (values[j] < drop_value)
+                    | ((values[j] == drop_value) & (ids[j] < drop_id))
+                )
+            )
+            drop = take.select(fx.Int32(j), drop)
+            drop_id = take.select(ids[j], drop_id)
+            drop_value = take.select(values[j], drop_value)
+            drop_pop = take.select(pops[j], drop_pop)
+        kept_sum = fx.Float32(0.0)
+        for j in range_constexpr(kp1):
+            kept_sum = kept_sum + (drop != fx.Int32(j)).select(
+                values[j], fx.Float32(0.0)
+            )
+        scale = c["routed_scaling_factor"] / fx.max(kept_sum, fx.Float32(1e-20))
+        # The ids are distinct, so (id, candidate) keys sort to one order; the
+        # K kept are the sorted keys with the dropped one skipped.
+        keys = [(ids[j] << _HERD_KEY_SHIFT) | fx.Int32(j) for j in range_constexpr(kp1)]
+        for a, b in _sort_network(kp1):
+            keys[a], keys[b] = fx.min(keys[a], keys[b]), fx.max(keys[a], keys[b])
+        drop_key = (drop_id << _HERD_KEY_SHIFT) | drop
+        kept = [
+            (keys[p] < drop_key).select(keys[p], keys[p + 1])
+            for p in range_constexpr(TOPK)
+        ]
+        candidate = fx.Int32((1 << _HERD_KEY_SHIFT) - 1)
+        weights = [
+            fx.ptr_load(values_s + base + (kept[p] & candidate)) * scale
+            for p in range_constexpr(TOPK)
+        ]
+        experts = [kept[p] >> _HERD_KEY_SHIFT for p in range_constexpr(TOPK)]
+        # Every slot is taken before any is stored, so the LDS atomics are in
+        # flight together.
+        taken = [
+            fx.atomic_add(counts + experts[p], fx.Int32(1), syncscope="workgroup")
+            for p in range_constexpr(TOPK)
+        ]
+        for p in range_constexpr(TOPK):
+            at = tid * TOPK + p
+            fx.ptr_store(experts[p], kept_ids + at)
+            fx.ptr_store(weights[p], kept_weights + at)
+            fx.ptr_store(taken[p], slots + at)
+    gpu.barrier()
+
+    for index in range_constexpr((routes + threads - 1) // threads):
+        at = tid + index * threads
+        if at < routes:
+            bo.buffer_store(fx.ptr_load(kept_ids + at), rsrc(c["topk_ids"]), at)
+            bo.buffer_store(fx.ptr_load(kept_weights + at), rsrc(c["topk_weights"]), at)
+    # Tile-aligned exclusive scan of the experts' route counts, a run of
+    # experts a thread.
+    per = (EXPERTS + threads - 1) // threads
+    first = tid * per
+    counted = []
+    aligned_total = fx.Int32(0)
+    tile = c["tile_m"]
+    for index in range_constexpr(per):
+        expert = first + index
+        count = (expert < EXPERTS).select(
+            fx.ptr_load(counts + fx.min(expert, EXPERTS - 1)), fx.Int32(0)
+        )
+        counted.append(count)
+        aligned_total = aligned_total + (count + tile - 1) // tile * tile
+    start, _ = _block_exclusive_scan32(aligned_total, lane, wave, lds["scan"], waves)
+    for index in range_constexpr(per):
+        expert = first + index
+        if expert < EXPERTS:
+            fx.ptr_store(start, starts + expert)
+            bo.buffer_store(counted[index], rsrc(c["masked_m"]), expert)
+            bo.buffer_store(start + counted[index], rsrc(c["psum"]), expert)
+        start = start + (counted[index] + tile - 1) // tile * tile
+    gpu.barrier()
+    for index in range_constexpr((routes + threads - 1) // threads):
+        at = tid + index * threads
+        if at < routes:
+            expert = fx.ptr_load(kept_ids + at)
+            bo.buffer_store(
+                fx.ptr_load(starts + expert) + fx.ptr_load(slots + at),
+                rsrc(c["topids_to_rows"]),
+                at,
+            )
 
 
 @traced
