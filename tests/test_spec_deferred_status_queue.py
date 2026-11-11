@@ -3,6 +3,7 @@ from unittest import mock
 
 import numpy as np
 import pytest
+import torch
 
 # On the module, not on "aiter" -- see tests/test_dspark.py for why a name-only
 # guard passes on the non-GPU runner and then aborts collection.
@@ -157,20 +158,15 @@ def _processor_for(*, kv_config: dict, family: Family) -> tokenIDProcessor:
 
 @pytest.mark.parametrize("pp_size", [1, 2])
 def test_the_scheduler_resolves_the_runners_deferral(pp_size):
-    """The scheduler has no runner: it reads the family off the config, and
-    must land where the runner does for a recurrent-state producer."""
+    """The scheduler has no runner and needs no model: deferral turns on PP
+    and the P/D role alone, so it lands where the runner does."""
     config = SimpleNamespace(
         pipeline_parallel_size=pp_size,
         kv_transfer_config={"kv_role": "kv_producer"},
-        hf_config=object(),
     )
-    with (
-        mock.patch("atom.model_engine.scheduler.get_hf_text_config"),
-        mock.patch(
-            "atom.model_engine.scheduler.attn_family", return_value=Family.KIMI_MLA
-        ),
-    ):
-        assert defers_output(config) is False
+    assert defers_output(config) is False
+    config.kv_transfer_config = {"kv_role": "kv_consumer"}
+    assert defers_output(config) is (pp_size == 1)
     config.kv_transfer_config = {}
     assert defers_output(config) is (pp_size == 1)
 
@@ -189,33 +185,46 @@ def test_a_consumer_keeps_deferred_output():
 
 
 @pytest.mark.parametrize(
-    ("family", "expected"),
+    "family",
     [
-        (Family.KIMI_MLA, False),
-        (Family.QSA_GDN, False),
-        (Family.GDN, False),
-        (Family.V4, True),
-        (Family.MLA, True),
-        (Family.MHA, True),
-        (Family.CSA2, False),
+        Family.KIMI_MLA,
+        Family.QSA_GDN,
+        Family.GDN,
+        Family.V4,
+        Family.MLA,
+        Family.MHA,
+        Family.CSA2,
     ],
 )
-def test_only_recurrent_state_producers_give_up_deferred_output(family, expected):
-    """A paged write lands at T0's own position, so the consumer repeating it
-    changes nothing -- V4 and the other paged models stay on the path they
-    used before P/D handoff existed. CSA2 (DeepSeek-V4.1) hands off a STATE
-    slot whose cursor, compressor rings and Engram history advance per token,
-    so like the recurrent families its producer emits T0 from the prefill."""
+def test_every_producer_gives_up_deferred_output(family):
+    """A producer releases a request once T0 reaches the host. Deferred, T0
+    waits for the rank's next forward that samples, which middle chunks of
+    other requests push back by seconds -- paged (V4) and recurrent (GDN,
+    CSA2) state alike."""
     processor = _processor_for(kv_config={"kv_role": "kv_producer"}, family=family)
-    assert processor.is_deferred_out is expected
+    assert processor.is_deferred_out is False
+
+
+def test_a_producer_reports_t0_from_the_forward_that_samples_it():
+    """The output prefill's own forward returns its sampled ids, keyed by its
+    own requests, not by the previous forward's."""
+    processor = _processor_for(kv_config={"kv_role": "kv_producer"}, family=Family.V4)
+    batch = SimpleNamespace(req_ids=[5, 7], return_logprobs=None)
+
+    ids, logprobs = processor.prepare_sampled_ids(
+        batch, torch.tensor([42, 43], dtype=torch.int32), sync_event=None
+    )
+
+    assert ids == {5: (42,), 7: (43,)}
+    assert logprobs is None
 
 
 @pytest.mark.parametrize(
     ("kv_role", "expected"), [("kv_producer", True), ("kv_consumer", False)]
 )
 def test_the_processor_records_the_producer_role_whatever_the_state(kv_role, expected):
-    """The runner reads it to size its DP dummy and to scope its graph lookup,
-    and a paged producer -- which keeps deferred output -- is still one."""
+    """The runner reads it to size its DP dummy, to scope its graph lookup and
+    to skip verifying drafts, whatever state the model hands off."""
     processor = _processor_for(kv_config={"kv_role": kv_role}, family=Family.V4)
     assert processor.is_pd_producer is expected
 
@@ -234,7 +243,7 @@ def _decode_batch(*, num_spec_step: int) -> ScheduledBatch:
     return batch
 
 
-def _recurrent_producer_processor() -> tokenIDProcessor:
+def _producer_processor() -> tokenIDProcessor:
     """Non-deferred, and `use_spec` still on: the runner keeps the drafter."""
     processor = _processor()
     processor.is_deferred_out = False
@@ -244,7 +253,7 @@ def _recurrent_producer_processor() -> tokenIDProcessor:
 
 
 def test_a_non_deferred_decode_stages_the_scheduled_ids_as_they_are():
-    processor = _recurrent_producer_processor()
+    processor = _producer_processor()
     group = processor.runner.h2d_groups["input_ids"]
 
     tokenIDProcessor.prepare_input_ids(
@@ -261,7 +270,7 @@ def test_the_non_deferred_branch_refuses_a_batch_carrying_drafts():
     never speculates. Staging them here would size rows by `max_seqlen_q`,
     which under DP is the group's maximum for a block drafter, not this
     batch's row width."""
-    processor = _recurrent_producer_processor()
+    processor = _producer_processor()
 
     with pytest.raises(AssertionError, match="num_spec_step=3"):
         tokenIDProcessor.prepare_input_ids(
@@ -332,8 +341,8 @@ def test_only_a_producer_with_a_drafter_may_miss_a_recording():
     ("is_pd_producer", "drafter", "is_prefill", "decodes", "expected"),
     [
         (False, True, False, 2, True),
-        # The producer's decode surfaces a deferred T0 at q=1: no drafts, so a
-        # rejection pass would select over zero target rows.
+        # A producer decodes at q=1: it never speculates, so a rejection
+        # pass would select over zero target rows.
         (True, True, False, 2, False),
         (False, True, True, 2, False),
         # An idle DP rank's step: no request, nothing drafted to score.
