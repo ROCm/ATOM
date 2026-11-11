@@ -335,18 +335,6 @@ def validate_speculative_config(config):
         )
 
 
-def _online_quant_is_routed_experts_only(online_quant_config) -> bool:
-    """No online config, or one whose only targets are the routed experts."""
-    if online_quant_config is None:
-        return True
-    if not isinstance(online_quant_config, dict):
-        return False
-    if online_quant_config.get("global_quant_config"):
-        return False
-    layers = online_quant_config.get("layer_quant_config") or {}
-    return bool(layers) and all(".ffn.experts" in pattern for pattern in layers)
-
-
 def validate_runtime_config(config):
     """Gate unimplemented execution modes before weights or pools are loaded."""
     from atom.config import CUDAGraphMode
@@ -419,13 +407,6 @@ def validate_runtime_config(config):
             and not config.enable_encoder_swa_bounded_replay,
         ),
         ("RapidServe", config.enable_rapidserve),
-        (
-            # Only the routed experts may be re-quantized at load (e.g. FP4 ->
-            # ptpc_fp8 where there is no FP4 MFMA); the native FP8 32x32
-            # linears and everything else keep their checkpoint layouts.
-            "online quantization other than of the routed experts",
-            not _online_quant_is_routed_experts_only(config.online_quant_config),
-        ),
         ("EPLB", config.eplb_enable),
         (
             # The plane the paged scorer reads: FP8, or FP4 in the row-group
