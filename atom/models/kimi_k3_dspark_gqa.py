@@ -381,6 +381,7 @@ class KimiK3DSparkGQA(DSparkDraftModel):
         ctx_lens,  # [running_bs] anchor + 1 + T, read as `context_lens`
         allocated_pages,  # [>= scheduled_bs] host, blocks each request holds
         scheduled_bs: int,
+        entry_tokens: int,  # tokens one block id spans, the slots' unit
     ) -> None:
         """Keep the block inside the blocks each request was allocated.
 
@@ -389,13 +390,8 @@ class KimiK3DSparkGQA(DSparkDraftModel):
         request's entry. Such positions are neither written (slot -1) nor read
         (the context is capped at the allocation), as MiniMax-M3.1's draft does.
         """
-        # One block id spans one pool entry; the bound FLASH page is that wide.
         alloc = self._alloc_cap.apply(
-            allocated_pages,
-            scheduled_bs,
-            block_positions,
-            slots,
-            self.layers[0].self_attn.kv.k_cache.shape[1],
+            allocated_pages, scheduled_bs, block_positions, slots, entry_tokens
         )
         torch.minimum(ctx_lens, alloc, out=ctx_lens)
 

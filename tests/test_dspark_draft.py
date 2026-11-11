@@ -106,7 +106,7 @@ def test_minimax_m31_dspark_caps_the_rows_but_not_ctx_lens(host_staging):
     MiniMaxM3DSpark = m3_dspark.MiniMaxM3DSpark
 
     draft = MiniMaxM3DSpark.__new__(MiniMaxM3DSpark)
-    draft.max_num_seqs, draft.block_size, draft._bt16 = 4, 128, None
+    draft.max_num_seqs, draft._bt16 = 4, None
     draft.sliding_window = 0
     T = 3
     pos = torch.tensor([[126, 127, 128], [5, 6, 7], [1, 2, 3]])
@@ -114,7 +114,7 @@ def test_minimax_m31_dspark_caps_the_rows_but_not_ctx_lens(host_staging):
     ctx = torch.tensor([129, 8, 1 + T], dtype=torch.int32)
     md = types.SimpleNamespace()
     block_tables = torch.tensor([[3, 0], [4, 5], [0, 0]], dtype=torch.int32)
-    draft.prepare_paged_block(md, block_tables, pos, slots, ctx, [1, 2], 2)
+    draft.prepare_paged_block(md, block_tables, pos, slots, ctx, [1, 2], 2, 128)
     assert slots.tolist() == [[10, 11, -1], [20, 21, 22], [-1, -1, -1]]
     assert ctx.tolist() == [129, 8, 1 + T]
     assert md.dspark_ctx_rows.tolist() == [128] * T + [8] * T + [1 + T] * T

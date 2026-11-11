@@ -1046,6 +1046,7 @@ class DSparkProposer(Drafter):
                 ctx_lens,
                 block_table_state(self.runner.forward_vars["block_tables"]).lengths,
                 scheduled_bs,
+                entry_tokens,
             )
             return
         # `kv_indptr` is a cumsum of these, and it must not promise more

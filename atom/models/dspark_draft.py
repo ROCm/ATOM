@@ -500,6 +500,7 @@ class DSparkDraftModel(nn.Module):
         ctx_lens: torch.Tensor,  # [running_bs] anchor + 1 + T
         allocated_pages,  # [>= scheduled_bs] host, pages each request holds
         scheduled_bs: int,
+        entry_tokens: int,  # tokens one block table id spans, the slots' unit
     ) -> None:
         """The per-step metadata only a non-MLA block attention reads, built
         outside the captured block from the proposer's paged block metadata."""

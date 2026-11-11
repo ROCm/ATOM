@@ -444,7 +444,6 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         # `prepare_paged_block`'s buffers, sized here and allocated on its
         # first call.
         self.max_num_seqs = atom_config.max_num_seqs
-        self.block_size = atom_config.kv_cache_block_size
         self._bt16 = None
 
     # ---- drafting entry points (called by the proposer) --------------------
@@ -480,6 +479,7 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         ctx_lens: torch.Tensor,  # [running_bs] anchor + 1 + T
         allocated_pages,  # [>= scheduled_bs] host, pages each request holds
         scheduled_bs: int,
+        entry_tokens: int,  # tokens one page id spans, the slots' unit
     ) -> None:
         """Per-row paged decode tables for the block.
 
@@ -504,7 +504,7 @@ class MiniMaxM3DSpark(DSparkDraftModel):
             self._alloc_block_rows(P, T, block_tables.device)
 
         alloc = self._alloc_cap.apply(
-            allocated_pages, scheduled_bs, block_positions, slots, self.block_size
+            allocated_pages, scheduled_bs, block_positions, slots, entry_tokens
         )
         # The rows' own lengths; `ctx_lens` is left as the proposer built it.
         ctx_eff = self._ctx_eff[:running_bs]

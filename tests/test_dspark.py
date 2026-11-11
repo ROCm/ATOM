@@ -2940,8 +2940,10 @@ def test_non_mla_block_drafts_skip_the_csr_and_the_mla_plan(
         _block_page_idx=proposer.DSparkProposer._block_page_idx,
         model=types.SimpleNamespace(
             block_attention_is_mla=draft_cls.block_attention_is_mla,
-            prepare_paged_block=lambda md, bt_, pos, slots, ctx, *a: seen.update(
-                slots=slots.cpu().tolist(), ctx=ctx.cpu().tolist()
+            prepare_paged_block=lambda md, bt_, pos, slots, ctx, al, sbs, et: (
+                seen.update(
+                    slots=slots.cpu().tolist(), ctx=ctx.cpu().tolist(), entry=et
+                )
             ),
         ),
     )
@@ -2957,6 +2959,7 @@ def test_non_mla_block_drafts_skip_the_csr_and_the_mla_plan(
         [-1, -1],
     ]
     assert seen["ctx"] == [vblock + 1, 2 * vblock + 1, 1 + T]
+    assert seen["entry"] == vblock
     assert md.causal is False
     # No CSR on this path: the fields stay as the caller left them.
     assert md.kv_indices is None and md.kv_indptr is None
