@@ -38,9 +38,9 @@ const NO_SESSION: &str = "no_session";
 struct StickyAssignment {
     worker: WorkerIdentity,
     last_access: Instant,
-    /// Where the session's last request was dispatched, after DP rank mapping.
+    /// Where the session's last request was sent, after DP rank mapping.
     dispatched: Option<WorkerIdentity>,
-    /// Why the session was last reassigned, until that request is dispatched.
+    /// Why the session was last reassigned, until a request is sent.
     reassigned: Option<&'static str>,
 }
 

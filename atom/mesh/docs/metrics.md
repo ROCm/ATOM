@@ -69,7 +69,7 @@ them.
 | `mesh_route_prefix_match_ratio` | Histogram, ratio 0 to 1 | `pool`, `policy` | `cache_aware` branches `affinity`, `relocate`, `stale_tenant`. | [#3141] |
 | `mesh_route_selected_worker_active_requests` | Histogram, active requests | `pool`, `policy`, `branch` | Every selection that picks a worker, before the router adds the request (see [below](#selected-workers-active-requests)). | [#3141] |
 | `mesh_session_affinity_total` | Counter, requests | `pool`, `result`: `hit`, `new`, `rebind`, `expired` | `dp_sticky` selected a worker for a request with a session ID. | [#3141] |
-| `mesh_session_worker_change_total` | Counter, requests | `pool`, `reason`: `rebind`, `expired`, `rank_mapping` | A `dp_sticky` session request is dispatched to a different worker (URL and DP rank) than the session's previous request (see [below](#worker-changes)). | [#3141] |
+| `mesh_session_worker_change_total` | Counter, requests | `pool`, `reason`: `rebind`, `expired`, `rank_mapping` | A `dp_sticky` session request is sent to a different worker (URL and DP rank) than the session's previous request (see [below](#worker-changes)). | [#3141] |
 | `mesh_selected_dp_rank_total` | Counter, dispatches | `pool`, `worker` (base URL), `dp_rank` (rank or `none`) | HTTP routers dispatch a request, after DP rank mapping. | [#3142] |
 | `mesh_route_cache_tokens_total` | Counter, tokens | `pool` (`regular` or `prefill`), `kind`: `prompt`, `cached` | HTTP routers; the response reported cached tokens. Any policy. | [#3142] |
 | `mesh_route_cache_estimate_tokens_total` | Counter, tokens | `pool`, `kind`: `prompt`, `estimated`, `actual` | The same, when the policy also estimated a hit; today only `cache_aware`. | [#3142] |
@@ -161,8 +161,11 @@ session `new` again. Each pool that runs `dp_sticky` records its own result.
 
 `mesh_session_worker_change_total` counts the session requests that run on a
 different worker than the previous request of the same session. The worker is
-the one the request is dispatched to, after DP rank mapping, so ranks behind
-one URL are different workers. `rebind` and `expired` name the affinity result
+the one the request is sent to, after DP rank mapping, so ranks behind one URL
+are different workers. It is counted when the request is sent: a reserved
+worker that receives nothing, such as the decode worker after a failed prefill
+or an unexecuted external-processing reservation, neither counts nor becomes
+the session's previous worker. `rebind` and `expired` name the affinity result
 that moved the session; an expired session reassigned to its old worker counts
 nothing. `rank_mapping` means the pin held, but
 `--atom-pd-rank-mapping-policy idx2idx` mapped the prefill request to a

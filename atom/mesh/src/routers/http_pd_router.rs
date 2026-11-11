@@ -438,27 +438,16 @@ impl PDRouter {
         } else {
             prefill
         };
-        for (worker, kind, policy_name, policy) in [
-            (
-                &prefill,
-                metrics_labels::WORKER_PREFILL,
-                prefill_policy,
-                self.policy_registry.get_prefill_policy(),
-            ),
-            (
-                &decode,
-                metrics_labels::WORKER_DECODE,
-                decode_policy,
-                self.policy_registry.get_decode_policy(),
-            ),
+        for (worker, kind, policy) in [
+            (&prefill, metrics_labels::WORKER_PREFILL, prefill_policy),
+            (&decode, metrics_labels::WORKER_DECODE, decode_policy),
         ] {
             MeshMetrics::record_worker_selection(
                 kind,
                 metrics_labels::CONNECTION_HTTP,
                 worker.model_id(),
-                policy_name,
+                policy,
             );
-            policy.on_dispatch(kind, headers, worker);
         }
         Ok(Arc::new(ReservedPair {
             load: parking_lot::Mutex::new(Some([
@@ -924,12 +913,13 @@ impl PDRouter {
         let prefill_url_for_log = prefill.url().to_string();
         let prefill_worker = prefill.clone();
         let prefill_router = self.clone();
+        let prefill_headers = headers.cloned();
         let correlation_for_log = correlation_id.unwrap_or_else(|| "unknown".to_string());
         let mut canceled = placement.canceled.subscribe();
         let work = async move {
             let _prefill_guard = prefill_guard;
             match prefill_router
-                .send_worker(prefill_post, prefill_worker)
+                .send_worker(prefill_post, prefill_worker, prefill_headers.as_ref())
                 .await
             {
                 Ok(res) => {
@@ -987,7 +977,7 @@ impl PDRouter {
             Ok(req) => req,
             Err(resp) => return resp,
         };
-        let decode_result = self.send_worker(decode_post, decode.clone()).await;
+        let decode_result = self.send_worker(decode_post, decode.clone(), headers).await;
         events::RequestReceivedEvent {}.emit();
 
         let res = match decode_result {
@@ -1110,7 +1100,9 @@ impl PDRouter {
             .clone()
             .unwrap_or_else(|| "unknown".to_string());
 
-        let prefill_result = self.send_worker(prefill_post, prefill.clone()).await;
+        let prefill_result = self
+            .send_worker(prefill_post, prefill.clone(), headers)
+            .await;
         let prefill_resp = match prefill_result {
             Ok(r) => r,
             Err(e) => {
@@ -1240,7 +1232,7 @@ impl PDRouter {
             Ok(req) => req,
             Err(resp) => return resp,
         };
-        let decode_result = self.send_worker(decode_post, decode.clone()).await;
+        let decode_result = self.send_worker(decode_post, decode.clone(), headers).await;
         events::RequestReceivedEvent {}.emit();
 
         let res = match decode_result {
@@ -1317,7 +1309,7 @@ impl PDRouter {
         let results = tokio::try_join!(
             async {
                 let response = self
-                    .send_worker(p, prefill.clone())
+                    .send_worker(p, prefill.clone(), headers)
                     .await
                     .map_err(|e| error::bad_gateway("prefill_server_error", e.to_string()))?;
                 if !response.status().is_success() {
@@ -1336,7 +1328,7 @@ impl PDRouter {
             },
             async {
                 let response = self
-                    .send_worker(d, decode.clone())
+                    .send_worker(d, decode.clone(), headers)
                     .await
                     .map_err(|e| error::bad_gateway("decode_server_error", e.to_string()))?;
                 events::RequestReceivedEvent {}.emit();
@@ -1547,7 +1539,9 @@ impl PDRouter {
         // before we await a potentially stalled error body below.
         let results = tokio::try_join!(
             async {
-                let result = self.send_worker(prefill_request, prefill.clone()).await;
+                let result = self
+                    .send_worker(prefill_request, prefill.clone(), headers)
+                    .await;
                 let result = match result {
                     Ok(res) if !res.status().is_success() => {
                         return Err(DispatchError::Prefill(res, prefill_guard));
@@ -1563,7 +1557,7 @@ impl PDRouter {
             },
             async {
                 let res = self
-                    .send_worker(decode_request, decode.clone())
+                    .send_worker(decode_request, decode.clone(), headers)
                     .await
                     .map_err(|e| {
                         error!(decode_url = %decode.url(), error = %e, "Decode request failed");
@@ -1826,11 +1820,20 @@ impl PDRouter {
         &self,
         request: reqwest::RequestBuilder,
         worker: Arc<dyn Worker>,
+        headers: Option<&HeaderMap>,
     ) -> Result<WorkerResponse, reqwest::Error> {
-        let policy = match worker.worker_type() {
-            crate::core::WorkerType::Prefill { .. } => self.policy_registry.get_prefill_policy(),
-            _ => self.policy_registry.get_decode_policy(),
+        let (pool, policy) = match worker.worker_type() {
+            crate::core::WorkerType::Prefill { .. } => (
+                metrics_labels::WORKER_PREFILL,
+                self.policy_registry.get_prefill_policy(),
+            ),
+            _ => (
+                metrics_labels::WORKER_DECODE,
+                self.policy_registry.get_decode_policy(),
+            ),
         };
+        // Only a request that is actually sent moves the session.
+        policy.on_dispatch(pool, headers, &worker);
         let mut outcome = WorkerOutcome {
             worker: Some(worker),
             policy,
@@ -2208,7 +2211,7 @@ mod tests {
                     .build(),
             );
             let response = router
-                .send_worker(router.client.get(&url), worker.clone())
+                .send_worker(router.client.get(&url), worker.clone(), None)
                 .await
                 .unwrap();
             assert_eq!(worker.circuit_breaker().total_successes(), 0);
@@ -2615,6 +2618,21 @@ mod tests {
             headers: Some(&headers),
             ..Default::default()
         };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, axum::Router::new().fallback(|| async { "{}" }))
+                .await
+                .unwrap();
+        });
+        let changes = || -> Vec<String> {
+            handle
+                .render()
+                .lines()
+                .filter(|line| line.starts_with("mesh_session_worker_change_total{"))
+                .map(str::to_owned)
+                .collect()
+        };
 
         // The session stays pinned to prefill rank 2; idx2idx runs it on the decode rank.
         for decode_rank in [5, 5, 2] {
@@ -2633,18 +2651,25 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(pair.prefill.dp_rank(), Some(decode_rank));
+            assert!(changes().is_empty(), "a reservation sends nothing");
+            router
+                .send_worker(
+                    router.client.get(&url),
+                    pair.prefill.clone(),
+                    Some(&headers),
+                )
+                .await
+                .unwrap()
+                .drain()
+                .await
+                .unwrap();
         }
 
-        let changes: Vec<_> = handle
-            .render()
-            .lines()
-            .filter(|line| line.starts_with("mesh_session_worker_change_total{"))
-            .map(str::to_owned)
-            .collect();
         assert_eq!(
-            changes,
+            changes(),
             [r#"mesh_session_worker_change_total{pool="prefill",reason="rank_mapping"} 1"#]
         );
+        server.abort();
     }
 
     #[test]

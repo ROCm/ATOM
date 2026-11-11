@@ -58,8 +58,9 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         // Default: no-op for stateless policies
     }
 
-    /// Called with the worker a request is dispatched to in `pool`. DP rank
-    /// mapping runs after selection, so it can differ from the selected worker.
+    /// Called when a request is sent to `worker` in `pool`, not when the worker
+    /// is selected or reserved. DP rank mapping runs after selection, so it can
+    /// differ from the selected worker.
     fn on_dispatch(
         &self,
         _pool: &'static str,
