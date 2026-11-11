@@ -16932,6 +16932,40 @@ models:
               ATOMESH_M31_D_MAX_SEQS: "20"
               ATOMESH_M31_P_CPU_OFFLOAD_BYTES: "1499000000000"
               ATOMESH_M31_P_LAZY_OFFLOAD: "true"
+        # Above C64 with TTFT p90 <= 5 s: a cap of half the sessions per D pair (C40-C64 at that ratio
+        # kept TTFT p90 at 0.8-2.4 s; C96 at a third took 7-17 s), lazy host KV, 4096-token prefill chunks.
+        - &m31_moriio_1p2d_n967_half_case
+          <<: *m31_moriio_1p2d_n967_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-n967-c80-dcap20-cpu15-lazy-lpt4k
+          concurrency: [80]
+          env:
+            common: &m31_n967_half_env
+              <<: *m31_n967_env
+              ATOMESH_M31_D_MAX_SEQS: "20"
+              ATOMESH_M31_P_CPU_OFFLOAD_BYTES: "1499000000000"
+              ATOMESH_M31_P_LAZY_OFFLOAD: "true"
+              ATOMESH_M31_P_EXTRA_ARGS: --long-prefill-token-threshold 4096
+        - <<: *m31_moriio_1p2d_n967_half_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-n967-c88-dcap22-cpu15-lazy-lpt4k
+          concurrency: [88]
+          env:
+            common:
+              <<: *m31_n967_half_env
+              ATOMESH_M31_D_MAX_SEQS: "22"
+        - <<: *m31_moriio_1p2d_n967_half_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-n967-c96-dcap24-cpu15-lazy-lpt4k
+          concurrency: [96]
+          env:
+            common:
+              <<: *m31_n967_half_env
+              ATOMESH_M31_D_MAX_SEQS: "24"
+        - <<: *m31_moriio_1p2d_n967_half_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-n967-c112-dcap28-cpu15-lazy-lpt4k
+          concurrency: [112]
+          env:
+            common:
+              <<: *m31_n967_half_env
+              ATOMESH_M31_D_MAX_SEQS: "28"
         # The local 1P1D layout (P GPUs 0-3, D GPUs 4-7 of one node) with xgmi swapped for RDMA.
         - &m31_moriio_1p1d_sn_case
           <<: *m31_moriio_1p2d_case
