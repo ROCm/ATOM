@@ -26,7 +26,7 @@ from atom.utils.backends import VllmBackend
 
 class Step:
     def __init__(self, rows, shift, empty=False):
-        self.width = rows
+        self.running_tokens = rows
         self.shift = shift
         self.requests = [] if empty else [object()]
         self.selected = {"stale": True}
@@ -50,8 +50,13 @@ class Rows(EngramStagedRows):
 
 
 class Attention(nn.Module):
-    def forward(self, hidden, hidden_scale, cache, step, rope, queries=None):
+    def forward(
+        self, hidden, hidden_scale, cache, step, rope, queries=None, *, hidden_fp8=None
+    ):
         assert not step.selected
+        if hidden_fp8 is not None:
+            # Exercise both optional tensors crossing the guarded boundary.
+            hidden = hidden + hidden_fp8.to(hidden.dtype) * hidden_scale.float()
         return hidden + step.shift
 
 
@@ -75,8 +80,9 @@ class Engram(nn.Module):
 
 
 class TinyBlock(RuntimeBlock):
-    def __init__(self):
+    def __init__(self, fuse_quant=False):
         nn.Module.__init__(self)
+        self.fuse_quant = fuse_quant
         self.layer_name = "v41.layers.0"
         # The block norms its own input now; this stub's is already normed.
         self.attn_norm = nn.Identity()
@@ -88,7 +94,17 @@ class TinyBlock(RuntimeBlock):
         residual = state.settle().residual
         if self.engram is not None:
             residual = self.engram_forward(residual, embeddings, image_mask)
-        return residual.mean(-2), residual, state.pre_mix, state.pre_mix, state.pre_mix
+        hidden = residual.mean(-2)
+        normed = (
+            (
+                hidden,
+                hidden.to(torch.float8_e4m3fn),
+                torch.ones_like(hidden[..., :1]).to(torch.float8_e8m0fnu),
+            )
+            if self.fuse_quant
+            else hidden
+        )
+        return normed, residual, state.pre_mix, state.pre_mix, state.pre_mix
 
     def prepare_ffn(self, output, residual, pre, post, comb):
         return output, residual, pre, post, comb
@@ -103,14 +119,15 @@ class TinyBlock(RuntimeBlock):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires ROCm compiler")
 @pytest.mark.parametrize("level, images", [(0, False), (0, True), (3, False)])
+@pytest.mark.parametrize("fuse_quant", [False, True])
 def test_runtime_guard_with_live_steps_and_aux_hooks(
-    monkeypatch, tmp_path, level, images
+    monkeypatch, tmp_path, level, images, fuse_quant
 ):
     def tiny_init(self, config, **kwargs):
         nn.Module.__init__(self)
         self.config = config
         self.embed = nn.Embedding(32, 8, device="cuda")
-        self.layers = nn.ModuleList([TinyBlock()])
+        self.layers = nn.ModuleList([TinyBlock(fuse_quant)])
         if images:
             self.layers[0].engram = Engram()
         self.topology = [SimpleNamespace(layer_id=0, ratio=0)]
@@ -182,7 +199,9 @@ def test_runtime_guard_with_live_steps_and_aux_hooks(
                 forward_context.ForwardContext(
                     attn_metadata=metadata,
                     no_compile_layers=config.compilation_config.static_forward_context,
-                    context=SimpleNamespace(is_draft=False, ubatch_token_offset=0),
+                    context=SimpleNamespace(
+                        is_draft=False, ubatch_token_offset=0, ubatch_token_order=None
+                    ),
                 ),
             )
             tokens = torch.arange(rows, device="cuda", dtype=torch.int64)
@@ -192,10 +211,13 @@ def test_runtime_guard_with_live_steps_and_aux_hooks(
                 expected_embed = inputs_embeds
             actual = model(tokens, tokens, inputs_embeds=inputs_embeds)
             engram_update = 5.0 if mask is None else (~mask).T * 5.0
+            attn_input = expected_embed + (engram_update if images else 0)
+            if fuse_quant:
+                attn_input = attn_input + attn_input.to(torch.float8_e4m3fn).to(
+                    attn_input.dtype
+                )
             expected = (
-                torch.zeros_like(expected_embed)
-                if empty
-                else (expected_embed + (engram_update if images else 0) + shift) * 2
+                torch.zeros_like(expected_embed) if empty else (attn_input + shift) * 2
             )
             if mask is not None:
                 expected = expected + mask.T * 10
@@ -214,7 +236,8 @@ def test_runtime_guard_with_live_steps_and_aux_hooks(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires ROCm mHC")
 @pytest.mark.parametrize("mode", ["pre", "post_pre"])
-def test_mhc_guard_outputs_and_input_alias(mode):
+@pytest.mark.parametrize("backend", ["triton", "hip", "hip_quant"])
+def test_mhc_guard_outputs_and_input_alias(mode, backend):
     from atom.model_ops.deepseek_v41 import mhc_pre_delayed as mhc
 
     device = "cuda"
@@ -232,6 +255,17 @@ def test_mhc_guard_outputs_and_input_alias(mode):
         "post_mult": 2.0,
         "norm_eps": 1e-6,
     }
+    if backend != "triton":
+        arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+        if arch not in ("gfx950", "gfx1250"):
+            pytest.skip("ATOM HIP Mega-MHC requires gfx950 or gfx1250")
+        if backend == "hip_quant" and not mhc.fuse_quant_supported():
+            pytest.skip("AITER Mega-MHC cannot write row-major MXFP8 scales here")
+        from aiter.ops.mega_mhc import mega_mhc_shuffle_fn
+
+        fn = mega_mhc_shuffle_fn(fn)
+        kwargs["w_preshuffle_bf16"] = True
+        kwargs["fuse_quant"] = backend == "hip_quant"
     if mode != "pre":
         kwargs.update(
             sublayer_output=torch.randn(
@@ -248,7 +282,24 @@ def test_mhc_guard_outputs_and_input_alias(mode):
         outputs = mhc.pre_delayed(*args, **kwargs)
         assert (outputs[0] is residual) == (mode == "pre")
         torch.testing.assert_close(residual, before, rtol=0, atol=0)
-        assert all(torch.isfinite(out).all() for out in outputs)
+        if backend == "hip_quant":
+            from atom.model_ops.blockscale import quantize_fp8
+
+            bf16, quant, quant_scale = outputs[1]
+            expected_quant, expected_scale = quantize_fp8(bf16)
+            # Ordinary RMSNorm groups are above both quantizers' amax floors.
+            assert bf16.float().view(-1, 32).abs().amax(-1).min() >= 1e-4
+            assert torch.equal(
+                quant.view(torch.uint8), expected_quant.view(torch.uint8)
+            )
+            assert torch.equal(
+                quant_scale.view(torch.uint8), expected_scale.view(torch.uint8)
+            )
+            plain = mhc.pre_delayed(*args, **dict(kwargs, fuse_quant=False))
+            for actual, expected in zip((outputs[0], bf16, *outputs[2:]), plain):
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        else:
+            assert all(torch.isfinite(out).all() for out in outputs)
         torch.library.opcheck(
             torch.ops.aiter.v41_mhc_pre_delayed.default,
             args,
@@ -265,7 +316,10 @@ def test_idle_prefill_runs_padding_ffn_without_attention_or_cache_writes(monkeyp
     from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
     from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
     from atom.utils.forward_context import AttnState
-    from tests.attentions.deepseek_v41.helpers import metadata_buffers
+    from tests.attentions.deepseek_v41.helpers import (
+        metadata_buffers,
+        stage_query_layout,
+    )
     from tests.attentions.deepseek_v41.test_runtime_contract import (
         _attach_uncompiled_backbone,
     )
@@ -279,23 +333,25 @@ def test_idle_prefill_runs_padding_ffn_without_attention_or_cache_writes(monkeyp
     builder.model_runner = SimpleNamespace(
         forward_vars=metadata_buffers(2, 8, 4, "cuda", geo)
     )
+    # An idle DP rank schedules nothing; its 8 rows are all padding.
     batch = SimpleNamespace(
-        is_dummy_run=True,
+        is_dummy_run=False,
         is_final_chunk=None,
         replaying={},
         state_slots_committed=[],
-        req_ids=(-1,),
-        num_scheduled_tokens=(8,),
-        context_lens=(8,),
-        total_seqs_num=1,
-        total_tokens_num=8,
+        req_ids=[],
+        num_scheduled_tokens=(),
+        context_lens=(),
+        total_seqs_num=0,
+        total_tokens_num=0,
     )
-    metadata, positions = builder.prepare_prefill(batch, 2)
+    stage_query_layout(builder, (), 2, 8)
+    metadata, positions = builder.prepare_prefill(batch, 2, 8)
     metadata.engram_embeddings = Rows()
     step = metadata.step
     assert step.requests == () and step.is_prefill and not step.decode
     assert metadata.state == AttnState.PREFILL_PREFIX
-    assert step.width == 8 and torch.all(step.batch_ids == -1)
+    assert step.running_tokens == 8 and torch.all(step.batch_ids == -1)
     builder.cache.backing.fill_(57)
     before = builder.cache.backing.clone()
 
@@ -324,7 +380,9 @@ def test_idle_prefill_runs_padding_ffn_without_attention_or_cache_writes(monkeyp
         forward_context.ForwardContext(
             attn_metadata=metadata,
             no_compile_layers={"v41.layers.0": (model.layers[0], None)},
-            context=SimpleNamespace(is_draft=False, ubatch_token_offset=0),
+            context=SimpleNamespace(
+                is_draft=False, ubatch_token_offset=0, ubatch_token_order=None
+            ),
         ),
     )
     output = model(torch.zeros(8, dtype=torch.int32, device="cuda"), positions)

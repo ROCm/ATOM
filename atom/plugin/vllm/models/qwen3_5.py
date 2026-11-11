@@ -37,6 +37,7 @@ from atom.models.qwen3_5 import (
     Qwen3_5GatedDeltaNet,
     Qwen3_5MoeConfig,
     detect_fused_expert_format,
+    gdn_in_proj_is_merged,
     get_fused_expert_mapping,
     load_fused_expert_weights,
     maybe_prefix,
@@ -58,12 +59,18 @@ class Qwen3_5GatedDeltaNetVllm(Qwen3_5GatedDeltaNet, MambaBase):
         quant_config=None,
         speculative_config=None,
         prefix: str = "",
+        reduce_results: bool = True,
     ) -> None:
+        # `reduce_results` is the decoder layer's call: False when the next
+        # norm fuses the TP all-reduce, so out_proj hands back partial sums.
+        # allreduce_norm_fusion_enabled() keeps that fusion off in plugin
+        # mode, so the layer passes True here.
         super().__init__(
             atom_config=atom_config,
             quant_config=quant_config,
             speculative_config=speculative_config,
             prefix=prefix,
+            reduce_results=reduce_results,
         )
         self.model_config = atom_config.plugin_config.vllm_config.model_config
         self.cache_config = atom_config.plugin_config.vllm_config.cache_config
@@ -153,10 +160,10 @@ class Qwen3_5ForConditionalGeneration_(vLLMQwen3_5):
         quant_config = vllm_config.quant_config
         multimodal_config = vllm_config.model_config.multimodal_config
         self.atom_config = atom_config
-        if (
-            self.atom_config.quant_config.global_quant_config.quant_dtype
-            == torch.bfloat16
-        ):
+        # The decision the ATOM layer construction makes (BF16, or per-token
+        # FP8), so the mapping names the modules that exist.
+        # The ATOM language model below is built under `language_model`.
+        if gdn_in_proj_is_merged(self.atom_config, "language_model.model.layers"):
             self.packed_modules_mapping.pop("in_proj_qkv")
             self.packed_modules_mapping.pop("in_proj_b")
             self.packed_modules_mapping.pop("in_proj_a")
@@ -237,10 +244,10 @@ class Qwen3_5MoeForConditionalGeneration_(vLLMQwen3_5Moe):
         config: Qwen3_5MoeConfig = atom_config.hf_config
         quant_config = vllm_config.quant_config
         multimodal_config = vllm_config.model_config.multimodal_config
-        if (
-            self.atom_config.quant_config.global_quant_config.quant_dtype
-            == torch.bfloat16
-        ):
+        # The decision the ATOM layer construction makes (BF16, or per-token
+        # FP8), so the mapping names the modules that exist.
+        # The ATOM language model below is built under `language_model`.
+        if gdn_in_proj_is_merged(self.atom_config, "language_model.model.layers"):
             self.packed_modules_mapping.pop("in_proj_qkv")
             self.packed_modules_mapping.pop("in_proj_b")
             self.packed_modules_mapping.pop("in_proj_a")

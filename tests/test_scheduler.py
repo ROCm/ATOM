@@ -11,6 +11,7 @@ from unittest import mock
 import numpy as np
 import pytest
 from conftest import MockConfig
+from test_state_checkpoint import ckpt_config, make_scheduler, stateful_seq
 
 from atom.kv_transfer.disaggregation.types import (
     KVConnectorOutput,
@@ -18,6 +19,7 @@ from atom.kv_transfer.disaggregation.types import (
 )
 from atom.kv_transfer.offload._offload_common import OffloadSchedulerMixin
 from atom.model_engine.engine_stats import EngineStats
+from atom.model_engine.prefill_delayer import PrefillDecision
 from atom.model_engine.scheduler import (
     ScheduledBatch,
     ScheduledBatchOutput,
@@ -392,6 +394,21 @@ class TestScheduleTicksTheWindow:
         assert sched.engine_stats.num_prompt_tokens == 4
 
 
+class TestGroupPrefillTick:
+    """An idle DP rank dummy-prefills beside a peer's prefill only when the
+    runners recorded prefill token graphs, whatever ATOM_TOKEN_GRAPH_SIZES
+    says: a backend without `supports_token_graph` records none, and its
+    dummy prefill would have no bucket to run on."""
+
+    @pytest.mark.parametrize("recorded", [False, True])
+    def test_follows_recorded_graphs_not_the_env(self, monkeypatch, recorded):
+        monkeypatch.setenv("ATOM_TOKEN_GRAPH_SIZES", "256,512")
+        sched = Scheduler(MockConfig(), prefill_token_graphs=recorded)
+        sched.set_prefill_delayer(SimpleNamespace(is_local=False))
+        decision = PrefillDecision(allow=True, prefillable_ranks=1)
+        assert sched._group_prefill_tick(decision) is recorded
+
+
 # ── add / extend / query ───────────────────────────────────────────────────
 
 
@@ -443,7 +460,7 @@ class TestSchedule:
         sched._num_parked_remote_kv = 1
         sched.kv_connector = SimpleNamespace(is_offload=False)
 
-        sched._reject_aborted_waiting(seq)
+        sched._finish_rejected_waiting(seq)
 
         assert sched.deferred_free_blocks == {seq.id: seq}
         assert sched._num_parked_remote_kv == 1
@@ -573,7 +590,7 @@ class TestSchedule:
         sched.block_manager = SimpleNamespace(
             deallocate=lambda value: events.append(("deallocate", value.id))
         )
-        sched._reject_aborted_waiting(seq)
+        sched._finish_rejected_waiting(seq)
 
         assert sched.deferred_free_blocks == {seq.id: seq}
         assert seq._awaiting_aborted_load_cleanup is True
@@ -702,6 +719,58 @@ class TestSchedule:
         # 200 - 128 = 72 for seq 2, floored to 64; the freed 8 stays unspent.
         assert list(batch.num_scheduled_tokens) == [128, 64]
         assert batch.total_tokens_num_prefill == 192
+
+    def test_prefill_completed_is_set_with_the_last_chunk(self, seq_factory):
+        """The DP router reads it to tell a prefix that exists (the last chunk
+        has completed its forward) from one that never
+        will."""
+        sched = Scheduler(
+            MockConfig(
+                max_num_batched_tokens=6,
+                num_kvcache_blocks=100,
+                kv_cache_block_size=4,
+                enable_chunked_prefill=True,
+            )
+        )
+        seq = seq_factory(list(range(10)))
+        sched.add(seq)
+        assert seq.prefill_completed is False
+
+        batch1, _ = sched.schedule()
+        assert batch1.total_tokens_num_prefill == 6
+        assert seq.prefill_completed is False  # a middle chunk
+        sched.postprocess(
+            list(sched.running),
+            ScheduledBatchOutput(
+                req_ids=[],
+                token_ids=[],
+                num_rejected=None,
+                num_bonus=None,
+                draft_token_ids=None,
+            ),
+            batch=batch1,
+        )
+        batch2, _ = sched.schedule()  # dispatch alone is not completion
+        assert seq.prefill_completed is False
+        sched.postprocess(
+            list(sched.running),
+            ScheduledBatchOutput(
+                req_ids=[],
+                token_ids=[],
+                num_rejected=None,
+                num_bonus=None,
+                draft_token_ids=None,
+            ),
+            batch=batch2,
+        )
+        assert seq.prefill_completed is True
+
+        # A preempted request keeps it: the prefix it hashed is still the
+        # prefix the rank holds, whatever its next admission does.
+        sched.running.remove(seq) if seq in sched.running else None
+        sched.running.append(seq)
+        assert sched.preempt(seq)
+        assert seq.prefill_completed is True
 
     def test_chunked_prefill_splits_prompt_across_steps(self, seq_factory):
         sched = Scheduler(
@@ -976,10 +1045,62 @@ class TestSchedule:
         sched.waiting = deque([fresh, ready, blocked])
         sched.finished_recving_kv_req_ids = ["2"]
         sched.failed_recving_kv_req_ids = []
+        sched.kv_connector = None  # P/D: resolved at admission
 
-        sched._promote_ready_remote_kv_requests()
+        sched._prioritize_ready_remote_kv_requests()
 
         assert [seq.id for seq in sched.waiting] == [2, 1, 3]
+
+    @pytest.mark.parametrize("failed", [False, True])
+    def test_settled_offload_resume_precedes_a_preempted_head(self, failed):
+        sched = Scheduler(
+            MockConfig(
+                max_num_seqs=4,
+                max_num_batched_tokens=32,
+                num_kvcache_blocks=3,
+                kv_cache_block_size=16,
+            )
+        )
+
+        class _Connector(_OffloadMixinStub):
+            _do_load = False
+
+            def get_num_new_matched_tokens(self, seq):
+                return 0, False
+
+            def build_connector_meta(self):
+                return None
+
+        sched.kv_connector = _Connector()
+        preempted = Sequence(list(range(16)), 16)
+        resume = Sequence(list(range(100, 132)), 16)
+        assert sched.block_manager.allocate(preempted)
+        assert sched.block_manager.allocate(resume)
+        preempted.num_cached_tokens = 16
+        preempted.status = SequenceStatus.RUNNING
+        preempted.append_token(77)
+        resume.status = SequenceStatus.WAITING
+        resume.num_cached_tokens = 16
+        resume.offload_loaded = not failed
+        resume.offload_load_failed = failed
+        sched._count_inflight_load(resume)
+        sched.waiting.append(resume)
+
+        # The finished id has already been consumed. A decode now needs a
+        # second block, preempts, and returns ahead of the allocated resume.
+        assert not sched.block_manager.can_append(preempted, 1, 0)
+        assert sched.preempt(preempted)
+        assert list(sched.waiting) == [preempted, resume]
+        assert sched.block_manager.can_allocate(preempted) < 0
+        assert not sched.finished_recving_kv_req_ids
+
+        batch, _ = sched.schedule()
+
+        assert list(batch.req_ids) == [resume.id]
+        assert list(batch.num_scheduled_tokens) == [16]
+        assert resume in sched.running
+        assert preempted in sched.waiting
+        assert sched._num_parked_remote_kv == 0
 
     def test_offload_parked_count_released_only_after_resume(self, seq_factory):
         sched = Scheduler(
@@ -1002,7 +1123,12 @@ class TestSchedule:
         sched._count_inflight_load(seq)
         sched.finished_recving_kv_req_ids.append(seq.id)
 
-        assert sched._resolve_waiting_remote_kv(seq, deque()) is False
+        sched._resolve_offload_load(seq)
+        # Handed back to admission as a resume at the load's end, still
+        # counted as parked until it is admitted.
+        assert seq.status == SequenceStatus.WAITING and seq.offload_loaded
+        assert sched._is_offload_prefill_resume(seq)
+        assert seq.num_cached_tokens == 4
         assert sched._num_parked_remote_kv == 1
         sched.waiting.append(seq)
 
@@ -1026,6 +1152,43 @@ class TestSchedule:
         assert failed.offload_load_failed is True
         assert failed in sched.running
         assert failed.block_table == [0]
+        assert sched._num_parked_remote_kv == 0
+
+    def test_a_retreated_joint_resumes_on_its_existing_blocks(self, seq_factory):
+        sched = Scheduler(
+            MockConfig(
+                max_num_seqs=2,
+                max_num_batched_tokens=64,
+                num_kvcache_blocks=100,
+            )
+        )
+        sched.kv_connector = SimpleNamespace(
+            is_offload=True,
+            build_connector_meta=lambda: None,
+        )
+        seq = seq_factory(list(range(32)))
+        seq.num_cached_tokens = 8
+        seq.block_table = [7, 8]
+        seq.offload_joint.boundary_tokens = 256
+        seq.offload_joint.load_hash = 99
+
+        def retreat(retreated):
+            retreated.num_cached_tokens = 16
+            retreated.offload_joint.load_hash = -1
+            retreated.offload_joint.reset_joint()
+            return True
+
+        sched.block_manager.retreat_joint_to_hbm = retreat
+        sched._park_for_remote_load(seq, deque())
+        sched.failed_recving_kv_req_ids.append(seq.id)
+        sched.waiting.append(seq)
+
+        sched.schedule()
+
+        assert seq.offload_load_failed is True
+        assert seq.block_table == [7, 8]
+        assert seq.num_cached_tokens == 16
+        assert seq in sched.running
         assert sched._num_parked_remote_kv == 0
 
     def test_a_resumed_offload_prefill_reports_the_hit_the_load_gave_it(
@@ -1062,7 +1225,10 @@ class TestSchedule:
         sched._park_for_remote_load(seq, deque())
         sched._count_inflight_load(seq)
         sched.finished_recving_kv_req_ids.append(seq.id)
-        assert sched._resolve_waiting_remote_kv(seq, deque()) is False
+        sched._resolve_offload_load(seq)
+        assert seq.status == SequenceStatus.WAITING and seq.offload_loaded
+        assert sched._is_offload_prefill_resume(seq)
+        assert seq.num_cached_tokens == 6
         sched.waiting.append(seq)
 
         sched.schedule()
@@ -1182,6 +1348,50 @@ class TestWaitingNewTokenCount:
         sched.waiting = deque([normal, oversized])
         assert sched._waiting_new_token_count() == 8
 
+    def test_an_unschedulable_reject_takes_the_abort_teardown(
+        self, seq_factory, monkeypatch
+    ):
+        """A prompt over max_model_len leaves without running: the schedule
+        hands it to the abort teardown (`_finish_rejected_waiting`) with its own
+        reason."""
+        sched = self._sched()
+        calls = []
+        real = sched._finish_rejected_waiting
+        monkeypatch.setattr(
+            sched,
+            "_finish_rejected_waiting",
+            lambda seq, reason="aborted": (calls.append(reason), real(seq, reason)),
+        )
+        oversized = seq_factory(list(range(200)))  # > max_model_len=64
+        sched.add(oversized)
+        sched._lookup_detach_declined.add(oversized.id)
+        sched.schedule()
+        assert len(calls) == 1 and calls[0].startswith("unschedulable")
+        assert oversized.leave_reason == calls[0]
+        assert oversized in sched._rejected
+        assert oversized.id not in sched._lookup_detach_declined
+
+    def test_the_abort_teardown_tells_connectors_the_prefill_never_ran(
+        self, seq_factory
+    ):
+        sched = self._sched()
+        events = []
+
+        class _Connector:
+            is_offload = True
+
+            def cancel_pending_load(self, seq):
+                events.append(("cancel", seq.id))
+
+            def request_finished(self, seq):
+                events.append(("finished", seq.id, seq.prefill_completed))
+
+        sched.kv_connector = _Connector()
+        seq = seq_factory(list(range(200)))
+        sched._finish_rejected_waiting(seq, reason="unschedulable: too long")
+        assert seq.leave_reason == "unschedulable: too long"
+        assert events == [("cancel", seq.id), ("finished", seq.id, False)]
+
     def test_saturates_at_cap(self, seq_factory):
         sched = Scheduler(
             MockConfig(
@@ -1245,6 +1455,150 @@ class TestPartialPrefillRemainingTokens:
         sched.running = deque([big])
         sched._partial_prefill_count = 1
         assert sched._partial_prefill_remaining_tokens() == 16  # capped
+
+
+_PREFIX = list(range(1, 37))  # 9 whole 4-token blocks
+
+
+def _probe_sched(**overrides):
+    config = {
+        "enable_prefix_caching": True,
+        "enable_chunked_prefill": True,
+        "kv_cache_block_size": 4,
+        "num_kvcache_blocks": 200,
+        "max_num_seqs": 8,
+        "max_num_batched_tokens": 32,
+        "max_model_len": 128,
+    }
+    config.update(overrides)
+    return Scheduler(MockConfig(**config))
+
+
+def _step(sched, batch, req_ids):
+    sched.postprocess(
+        list(sched.running),
+        ScheduledBatchOutput(
+            req_ids=list(req_ids),
+            token_ids=[(999,)] * len(req_ids),
+            num_rejected=None,
+            num_bonus=None,
+            draft_token_ids=None,
+        ),
+        batch=batch,
+    )
+
+
+def _cache_prefix(sched, seq_factory):
+    """Prefill a prompt starting with `_PREFIX`; it stays running, decoding."""
+    seed = seq_factory(
+        _PREFIX + [500, 501, 502, 503], sampling_params=SamplingParams(max_tokens=64)
+    )
+    sched.add(seed)
+    for _ in range(8):
+        if seed in sched.running and not seed.is_partial_prefill:
+            return
+        batch, _ = sched.schedule()
+        _step(sched, batch, [seed.id])
+    assert seed in sched.running and not seed.is_partial_prefill
+
+
+def _count_fits(sched, monkeypatch):
+    calls = []
+    fit = sched.block_manager.can_allocate_memoized
+    monkeypatch.setattr(
+        sched.block_manager,
+        "can_allocate_memoized",
+        lambda seq: calls.append(seq) or fit(seq),
+    )
+    return calls
+
+
+def test_probe_scans_past_long_cached_prompts(seq_factory):
+    # Two 40-token prompts, each over the 32-token budget, with 4 uncached rows.
+    sched = _probe_sched()
+    _cache_prefix(sched, seq_factory)
+    for tail in ([600, 601, 602, 603], [700, 701, 702, 703]):
+        sched.add(seq_factory(_PREFIX + tail))
+    assert sched._local_prefill_pending_work() == (True, 8)
+    batch, _ = sched.schedule()
+    assert batch.total_tokens_num_prefill == 8
+
+
+def test_probe_stops_once_the_budget_is_filled(seq_factory, monkeypatch):
+    sched = _probe_sched()
+    _cache_prefix(sched, seq_factory)
+    for i in range(3):  # 16 uncached rows each; two fill the budget
+        sched.add(seq_factory(_PREFIX + [600 + 16 * i + j for j in range(16)]))
+    fits = _count_fits(sched, monkeypatch)
+    # Scanning on would report the same; the stop saves the third fit.
+    assert sched._local_prefill_pending_work() == (True, 32)
+    assert len(fits) == 2
+    batch, _ = sched.schedule()
+    assert batch.total_tokens_num_prefill == 32
+
+
+def test_probe_stops_once_the_slots_are_used(seq_factory, monkeypatch):
+    sched = _probe_sched(max_num_seqs=2)  # the decoding seed takes one slot
+    _cache_prefix(sched, seq_factory)
+    for i in range(3):
+        sched.add(seq_factory(_PREFIX + [600 + 4 * i + j for j in range(4)]))
+    fits = _count_fits(sched, monkeypatch)
+    # Scanning on would report the same; the stop saves the other fits.
+    assert sched._local_prefill_pending_work() == (True, 4)
+    assert len(fits) == 1
+    batch, _ = sched.schedule()
+    assert batch.total_tokens_num_prefill == 4
+
+
+class _LocalDelayer:
+    """A local coalescer that releases prefill every tick."""
+
+    is_local = True
+    max_queue_ms = None
+    ttft_max_ticks = 5
+    rank_prefill_costs = ()
+
+    def protects_decode(self, running_decode_batch):
+        return False
+
+    def should_allow_prefill(self, prefillable, pending_tokens, **kwargs):
+        return PrefillDecision(allow=True, prefillable_ranks=1)
+
+
+def test_probe_stops_at_a_seq_waiting_for_an_inflight_prefix():
+    # A hybrid producer is prefilling a 200-token prompt; the consumer resends
+    # it with 8 more tokens, so admission defers it until the producer's
+    # prompt-end checkpoint. The probe must not count the consumer as fill.
+    sched = make_scheduler(
+        ckpt_config(
+            state_checkpoint_interval_tokens=-1,
+            enable_chunked_prefill=True,
+            max_num_batched_tokens=64,
+            max_num_seqs=8,
+            pool_entries={"state": 8},
+            long_prefill_token_threshold=16,
+        )
+    )
+    sched.set_prefill_delayer(_LocalDelayer())
+    producer = stateful_seq(list(range(3, 203)))
+    sched.add(producer)
+    batch, _ = sched.schedule()
+    _step(sched, batch, [])
+    assert producer.is_partial_prefill
+    consumer = stateful_seq(list(range(3, 203)) + list(range(900, 908)))
+    behind = stateful_seq(list(range(5000, 5020)))
+    sched.add(consumer)
+    sched.add(behind)
+
+    # The scan stops at the consumer: only the producer's next chunk counts,
+    # not a full budget. Admission still admits the request behind it.
+    assert sched._local_prefill_pending_work() == (True, 16)
+    assert sched._inflight_prefix_wait == {}  # the probe starts no deadline
+    batch, _ = sched.schedule()
+    assert batch.num_scheduled_tokens[0] == 16
+    assert behind in sched.running
+    assert consumer not in sched.running
+    assert consumer.id in sched._inflight_prefix_wait
 
 
 class TestOldestWaitingPrefillAge:
@@ -1698,6 +2052,33 @@ class TestPreempt:
         assert block_table_at_release  # non-empty at the moment of release
         assert seq.status == SequenceStatus.WAITING
         assert len(seq.block_table) == 0
+
+
+class TestNextDecodeCompletionSteps:
+    """Steps until a running decode reaches max_tokens, the delayer's
+    `next_completion_steps`: partial prefills excluded, drafts accepted."""
+
+    def test_none_without_decode(self, scheduler, seq_factory):
+        partial = seq_factory(list(range(8)))
+        partial.is_partial_prefill = True
+        scheduler.running = deque([partial])
+        assert scheduler._next_decode_completion_steps() is None
+
+    def test_fewest_tokens_left_in_steps(self, scheduler, seq_factory):
+        near = seq_factory(
+            list(range(8)), sampling_params=SamplingParams(max_tokens=10)
+        )
+        for t in range(3):
+            near.append_token(t)  # 7 left
+        far = seq_factory(list(range(8)), sampling_params=SamplingParams(max_tokens=50))
+        scheduler.running = deque([far, near])
+        assert scheduler._next_decode_completion_steps() == 7
+        scheduler.mtp_k = 3  # up to 4 tokens a step
+        scheduler.use_spec = True
+        assert scheduler._next_decode_completion_steps() == 2
+        # not speculating: a token a step
+        scheduler.use_spec = False
+        assert scheduler._next_decode_completion_steps() == 7
 
 
 def _spec_config(mtp_k):
@@ -3260,3 +3641,121 @@ def test_cancel_without_sampled_output_releases_state_and_pages(partial):
     assert scheduler.total_finished_requests == 1
     scheduler.kv_connector.request_finished.assert_called_once_with(seq)
     scheduler.kv_connector.send_finished.assert_called_once_with(seq.id)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_scheduled_batch_logprob_gate(enabled):
+    seqs = [Sequence([1, 2], block_size=16) for _ in range(2)]
+    for seq in seqs:
+        seq.return_logprobs = False
+        del seq.top_logprobs
+    if enabled:
+        seqs[1].return_logprobs = True
+        seqs[0].top_logprobs = 0
+        seqs[1].top_logprobs = 5
+    batch = ScheduledBatch(
+        seqs={seq.id: seq for seq in seqs},
+        num_scheduled_tokens=[2, 2],
+        total_tokens_num=4,
+        total_seqs_num=2,
+        total_seqs_num_prefill=2,
+        total_tokens_num_prefill=4,
+    )
+    assert batch.any_logprobs is enabled
+    assert batch.logprob_requested == ((1,) if enabled else ())
+    assert batch.top_logprobs == ([0, 5] if enabled else None)
+
+
+@pytest.mark.parametrize("pp", [False, True])
+@pytest.mark.parametrize("final_chunk", [False, True])
+def test_abort_after_forward_keeps_actual_prefill_completion(
+    seq_factory, pp, final_chunk
+):
+    sched = Scheduler(
+        MockConfig(
+            enable_prefix_caching=True,
+            num_kvcache_blocks=40,
+            max_num_batched_tokens=8 if final_chunk else 4,
+        )
+    )
+    sched.advance_on_schedule = pp
+    seq = seq_factory(list(range(8)), sampling_params=SamplingParams(max_tokens=16))
+    sched.add(seq)
+    batch, _ = sched.schedule()
+    assert not seq.prefill_completed  # even PP schedule-time advancement is not proof
+    seq.status = SequenceStatus.ABORTED
+    finished = sched.postprocess(
+        list(sched.running),
+        ScheduledBatchOutput(
+            req_ids=[],
+            token_ids=[],
+            num_rejected=None,
+            num_bonus=None,
+            draft_token_ids=None,
+            is_deferred_out=True,
+        ),
+        batch=batch,
+    )
+    assert seq in finished
+    assert seq.prefill_completed == final_chunk
+
+
+@pytest.mark.parametrize("resumes", [1, 2])
+@pytest.mark.parametrize("settled", ["loaded", "failed"])
+@pytest.mark.parametrize("counted", [False, True])
+def test_coalescing_ready_resume_consumes_one_slot(
+    seq_factory, resumes, settled, counted
+):
+    sched = _probe_sched(max_num_seqs=resumes + 2, max_num_batched_tokens=64)
+    sched.kv_connector = SimpleNamespace(is_offload=True)
+    decode = seq_factory([1000] * 4)
+    assert sched.block_manager.allocate(decode)
+    decode.status = SequenceStatus.RUNNING
+    decode.num_cached_tokens = 4
+    decode.append_token(1001)
+    decode.type = SequenceType.DECODE
+    sched.running.append(decode)
+    for i in range(resumes):
+        resume = seq_factory([2000 + i] * 16)
+        assert sched.block_manager.allocate(resume)
+        resume.num_cached_tokens = 8
+        resume.status = SequenceStatus.WAITING
+        setattr(
+            resume,
+            "offload_loaded" if settled == "loaded" else "offload_load_failed",
+            True,
+        )
+        if counted:
+            sched._count_inflight_load(resume)
+        sched.waiting.append(resume)
+    fresh = seq_factory([3000] * 16)
+    sched.waiting.append(fresh)
+    before = (
+        sched._num_parked_remote_kv,
+        [(q.status, list(q.block_table), q.num_cached_tokens) for q in sched.waiting],
+    )
+    assert sched._local_prefill_pending_work() == (True, resumes * 8 + 16)
+    assert (
+        sched._num_parked_remote_kv,
+        [(q.status, list(q.block_table), q.num_cached_tokens) for q in sched.waiting],
+    ) == before
+
+
+def test_coalescing_keeps_inflight_load_slot_reserved(seq_factory):
+    sched = _probe_sched(max_num_seqs=2, max_num_batched_tokens=64)
+    sched.kv_connector = SimpleNamespace(is_offload=True)
+    ready = seq_factory([2000] * 16)
+    assert sched.block_manager.allocate(ready)
+    ready.num_cached_tokens = 8
+    ready.status = SequenceStatus.WAITING
+    ready.offload_loaded = True
+    sched._count_inflight_load(ready)
+    inflight = seq_factory([2100] * 16)
+    assert sched.block_manager.allocate(inflight)
+    inflight.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+    sched._count_inflight_load(inflight)
+    fresh = seq_factory([3000] * 16)
+    sched.waiting.extend([ready, inflight, fresh])
+    assert sched._local_prefill_pending_work() == (True, 8)
+    assert sched._num_parked_remote_kv == 2
+    assert inflight.status == SequenceStatus.WAITING_FOR_REMOTE_KVS

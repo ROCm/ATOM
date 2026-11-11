@@ -248,6 +248,26 @@ def _normalize_sglang_parallel_config(
     return tp_size, 1, 1, 0, tp_rank
 
 
+def _build_sglang_parallel_config(dp_size: int, dp_rank: int):
+    """Build the ATOM ParallelConfig for one SGLang scheduler process.
+
+    SGLang runs on a single node and starts one process per DP rank, so every
+    rank is local. At construction ParallelConfig reads data_parallel_rank as
+    the first global rank of this node's slice, so build it for the slice
+    starting at 0 and then assign this process's rank, as EngineCoreManager
+    does for native ATOM.
+    """
+    from atom.config import ParallelConfig
+
+    parallel_config = ParallelConfig(
+        data_parallel_size=dp_size,
+        data_parallel_size_local=dp_size,
+    )
+    parallel_config.data_parallel_rank = dp_rank
+    parallel_config.data_parallel_rank_local = dp_rank
+    return parallel_config
+
+
 def _build_atom_speculative_config_from_vllm(vllm_spec_config: Any):
     """Translate vLLM's SpeculativeConfig into ATOM's SpeculativeConfig.
 
@@ -446,6 +466,7 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
     # page size, so it has to be resolved here -- before Config.__post_init__
     # runs the V4.1 runtime gate on it -- rather than left as vLLM's spelling.
     kv_cache_dtype = vllm_cache_config.cache_dtype
+    kv_transfer_config = _vllm_kv_transfer_config(config)
     from atom.plugin.vllm.deepseek_v41_bridge import (
         is_deepseek_v41_vllm_config,
         v41_kv_cache_dtype,
@@ -453,6 +474,13 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
 
     if is_deepseek_v41_vllm_config(config):
         kv_cache_dtype = v41_kv_cache_dtype(config)
+        # A naming boundary, not a workaround. V4.1's transport is a vLLM
+        # connector, gated by vLLM name in `enforce_deepseek_v41_constraints`
+        # and handed its own view of the config by vLLM. The model's validator
+        # resolves names through ATOM's connector registry, where every vLLM
+        # name is unknown, and `atom/models` carries no vLLM knowledge, so it
+        # is not given one.
+        kv_transfer_config = {}
 
     return Config(
         model=vllm_model_config.model,
@@ -471,8 +499,9 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
         # vLLM's KV transport, carried across so a model's own
         # `validate_runtime_config` can gate on it. Without this the gate reads
         # an empty dict in plugin mode and admits every connector silently --
-        # the check passes because it was never asked the question.
-        kv_transfer_config=_vllm_kv_transfer_config(config),
+        # the check passes because it was never asked the question. V4.1 is
+        # the exception above: its gate is the platform's.
+        kv_transfer_config=kv_transfer_config,
         port=None,
         torch_profiler_dir=None,
         compilation_config=vllm_compilation_config,
@@ -498,7 +527,6 @@ def _generate_atom_config_from_sglang_config(config: Any):
     from sglang.srt.configs.load_config import LoadConfig
     from sglang.srt.configs.model_config import ModelConfig as SglangModelConfig
     from sglang.srt.configs.modelopt_config import ModelOptConfig
-    from sglang.srt.distributed import get_tensor_model_parallel_rank
     from sglang.srt.distributed.parallel_state import (
         get_attn_context_model_parallel_rank as get_attention_cp_rank,
     )
@@ -511,12 +539,13 @@ def _generate_atom_config_from_sglang_config(config: Any):
     from sglang.srt.distributed.parallel_state import (
         get_attn_tensor_model_parallel_world_size as get_attention_tp_size,
     )
+    from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
     from sglang.srt.server_args import (
         ZMQ_TCP_PORT_DELTA,
         PortArgs,
     )
 
-    from atom.config import CompilationConfig, Config, ParallelConfig
+    from atom.config import CompilationConfig, Config
 
     # sglang's ModelRunner already parsed and stored ServerArgs globally
     # before OOT model loading, so we can retrieve it directly.
@@ -613,11 +642,8 @@ def _generate_atom_config_from_sglang_config(config: Any):
     )
 
     # sglang uses the atom parallel config
-    sgl_parallel_config = ParallelConfig(
-        data_parallel_size=atom_data_parallel_size,
-        data_parallel_size_local=atom_data_parallel_size,
-        data_parallel_rank=atom_data_parallel_rank,
-        data_parallel_rank_local=atom_data_parallel_rank,
+    sgl_parallel_config = _build_sglang_parallel_config(
+        atom_data_parallel_size, atom_data_parallel_rank
     )
 
     # use sglang torch compile policy and cuda graph policy

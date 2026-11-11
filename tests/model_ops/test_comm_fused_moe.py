@@ -12,18 +12,15 @@ from __future__ import annotations
 
 import ast
 import importlib
-import importlib.abc
-import importlib.util
-import sys
 from contextlib import contextmanager
 from dataclasses import dataclass
-from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 import torch
+from aiter_stub import ActivationType, GateMode, QuantType
 from conftest import atom_config_double
 
 
@@ -46,25 +43,6 @@ class _ShapeKey:
     add_shared: bool | None = True
     comm: str = "ar"
     gpu_model: str | None = None
-
-
-class _ActivationType(Enum):
-    Silu = 0
-    Swiglu = 1
-    Situv2 = 2
-
-
-class _QuantType(Enum):
-    No = 0
-    per_Tensor = 1
-    per_Token = 2
-    per_1x128 = 3
-    per_1x32 = 4
-
-
-class _GateMode(Enum):
-    INTERLEAVE = "interleave"
-    SEPARATED = "separated"
 
 
 class _CommFusedMoeRuntime:
@@ -96,129 +74,6 @@ class _State:
         self.shape_keys = []
         self.runner_calls = []
         self.missing_shape = False
-
-
-def _identity_decorator(*_args, **_kwargs):
-    return lambda function: function
-
-
-def _triton_jit(function=None, **_options):
-    """`triton.jit`, bare or with options (`@triton.jit(do_not_specialize=...)`)."""
-    return function if function is not None else (lambda function: function)
-
-
-def _external_module_attributes(name: str) -> dict[str, object]:
-    dtypes = SimpleNamespace(
-        bf16=torch.bfloat16,
-        fp32=torch.float32,
-        fp4x2=torch.uint8,
-        fp8=torch.float8_e4m3fnuz,
-        fp8_e8m0=torch.uint8,
-        i4x2=torch.uint8,
-        i8=torch.int8,
-        d_dtypes={},
-    )
-    return {
-        "aiter": {
-            "ActivationType": _ActivationType,
-            "QuantType": _QuantType,
-            "dtypes": dtypes,
-        },
-        "aiter.jit.utils.torch_guard": {
-            "torch_compile_guard": _identity_decorator,
-        },
-        "aiter.ops.flydsl.moe_common": {"GateMode": _GateMode},
-        "triton": {
-            "jit": _triton_jit,
-            "heuristics": _identity_decorator,
-        },
-        "triton.language": {"constexpr": object},
-    }.get(name, {})
-
-
-class _ExternalModuleLoader(importlib.abc.Loader):
-    def create_module(self, spec):
-        return None
-
-    def exec_module(self, module) -> None:
-        module.__file__ = f"<test stub for {module.__name__}>"
-        module.__path__ = []
-        module.__dict__.update(_external_module_attributes(module.__name__))
-
-        def resolve(attribute: str):
-            value = MagicMock(name=f"{module.__name__}.{attribute}")
-            setattr(module, attribute, value)
-            return value
-
-        module.__getattr__ = resolve
-
-
-class _ExternalModuleFinder(importlib.abc.MetaPathFinder):
-    def find_spec(self, fullname, path, target=None):
-        if fullname in {"aiter", "triton"} or fullname.startswith(
-            ("aiter.", "triton.")
-        ):
-            return importlib.util.spec_from_loader(
-                fullname, _ExternalModuleLoader(), is_package=True
-            )
-        return None
-
-
-@contextmanager
-def _stubbed_external_kernel_modules():
-    # Torch imports its own optional Triton integration lazily. Resolve that
-    # first so this test's deliberately small Triton stub cannot affect it.
-    importlib.import_module("torch._dynamo.config")
-
-    prefixes = ("aiter", "triton")
-    saved = {
-        name: module
-        for name, module in sys.modules.items()
-        if name in prefixes or name.startswith(("aiter.", "triton."))
-    }
-    for name in saved:
-        sys.modules.pop(name, None)
-
-    finder = _ExternalModuleFinder()
-    sys.meta_path.insert(0, finder)
-    try:
-        yield
-    finally:
-        sys.meta_path.remove(finder)
-        for name in list(sys.modules):
-            if name in prefixes or name.startswith(("aiter.", "triton.")):
-                sys.modules.pop(name, None)
-        sys.modules.update(saved)
-
-
-@pytest.fixture(scope="module")
-def atom_modules():
-    existing_atom_modules = {
-        name: module
-        for name, module in sys.modules.items()
-        if name == "atom" or name.startswith("atom.")
-    }
-    with _stubbed_external_kernel_modules():
-        try:
-            moe = importlib.import_module("atom.model_ops.moe")
-            comm = importlib.import_module("atom.model_ops.fused_moe.comm_fused_moe")
-            deepseek_v4 = importlib.import_module("atom.models.deepseek_v4")
-            host = importlib.import_module("aiter.ops.flydsl.comm_fused_moe_host")
-            runtime = importlib.import_module("aiter.ops.comm_fused_moe_runtime")
-            yield SimpleNamespace(
-                moe=moe,
-                comm=comm,
-                deepseek_v4=deepseek_v4,
-                host=host,
-                runtime=runtime,
-            )
-        finally:
-            for name in list(sys.modules):
-                if (name == "atom" or name.startswith("atom.")) and (
-                    name not in existing_atom_modules
-                ):
-                    sys.modules.pop(name, None)
-            sys.modules.update(existing_atom_modules)
 
 
 @pytest.fixture
@@ -338,7 +193,8 @@ _RUNTIME_PASSTHROUGH = {
 def _runtime_layer(modules, topk_weights, topk_ids, *, apply_router_weight=False):
     layer = _new_fused_moe(modules)
     method = SimpleNamespace(
-        select_experts_with_record=MagicMock(return_value=(topk_weights, topk_ids)),
+        select_experts=MagicMock(return_value=(topk_weights, topk_ids)),
+        place_experts=MagicMock(side_effect=lambda layer, w, ids, gathered: (w, ids)),
         quant_type=object(),
         hidden_pad=17,
         intermediate_pad=19,
@@ -356,6 +212,8 @@ def _runtime_layer(modules, topk_weights, topk_ids, *, apply_router_weight=False
         "shared_expert_scoring_func": None,
         "apply_router_weight_on_input": apply_router_weight,
         "swiglu_limit": 7.0,
+        # No prefilled shared columns to re-mark after the DPA gather.
+        "expert_layout": SimpleNamespace(mode=None),
     }
     for name, value in values.items():
         setattr(layer, name, value)
@@ -427,12 +285,12 @@ def _initialize_backend(comm_fused_env, *, dpa=False):
             {
                 "layer_quant_config": SimpleNamespace(
                     quant_dtype=torch.bfloat16,
-                    quant_type=_QuantType.per_1x32,
+                    quant_type=QuantType.per_1x32,
                 )
             },
         ),
         ({"torch_dtype": torch.float16}, {}),
-        ({}, {"activation": _ActivationType.Swiglu}),
+        ({}, {"activation": ActivationType.Swiglu}),
         ({}, {"apply_router_weight_on_input": True}),
         ({"enable_tbo": True}, {}),
         ({"prefill_context_parallel_size": 2}, {}),
@@ -501,7 +359,6 @@ def test_runner_wiring_pins_flydsl_weight_layout(comm_fused_env):
 def test_dpa_runner_uses_reduce_scatter_group(comm_fused_env):
     backend, _, state, dp_group = _initialize_backend(comm_fused_env, dpa=True)
     assert backend is not None
-    assert not backend.supports_custom_routing
     assert state.shape_keys == [
         _ShapeKey(
             "gfx950",
@@ -550,10 +407,7 @@ def test_forward_impl_bridges_fused_moe_state_to_runtime(comm_fused_env):
     )
 
     assert result is output
-    select_args = method.select_experts_with_record.call_args.kwargs
-    assert select_args["layer"] is layer
-    assert select_args["hidden_states"] is hidden_states
-    assert select_args["router_logits"] is router_logits
+    method.select_experts.assert_called_once_with(layer, hidden_states, router_logits)
     runtime_args = runtime.run.call_args.kwargs
     expected = {
         "hidden_states": hidden_states,
@@ -568,8 +422,10 @@ def test_forward_impl_bridges_fused_moe_state_to_runtime(comm_fused_env):
         assert runtime_args[name] is value
     for name, attribute in _RUNTIME_PASSTHROUGH.items():
         assert runtime_args[name] is getattr(layer, attribute)
-    assert runtime_args["gate_mode"] == _GateMode.INTERLEAVE.value
+    assert runtime_args["gate_mode"] == GateMode.INTERLEAVE.value
     assert runtime_args["reuse_is_synchronized"] is False
+    # Pad rows go to expert -1 as whole rows: no missing-route clear.
+    assert "routes_may_be_missing" not in runtime_args
 
 
 def test_dpa_forward_fuses_local_shared_into_owned_rs_rows(comm_fused_env):
@@ -577,10 +433,11 @@ def test_dpa_forward_fuses_local_shared_into_owned_rs_rows(comm_fused_env):
 
     local_hidden = torch.randn(2, 8)
     local_router = torch.randn(2, 16)
+    topk_weights = torch.randn(2, 2)
+    topk_ids = torch.zeros(2, 2, dtype=torch.int32)
     gathered_hidden = torch.randn(16, 8)
-    gathered_router = torch.randn(16, 16)
-    topk_weights = torch.randn(16, 2)
-    topk_ids = torch.zeros(16, 2, dtype=torch.int32)
+    gathered_weights = torch.randn(16, 2)
+    gathered_ids = torch.zeros(16, 2, dtype=torch.int32)
     routed = torch.randn(2, 8)
     reduce_scatter_sizes = [3, 1, 1, 2, 2, 3, 2, 2]
     local_shared = torch.randn(2, 8)
@@ -589,8 +446,7 @@ def test_dpa_forward_fuses_local_shared_into_owned_rs_rows(comm_fused_env):
 
     backend._gather_dpa_inputs = MagicMock(
         return_value=(
-            gathered_hidden,
-            gathered_router,
+            (gathered_hidden, gathered_weights, gathered_ids),
             2,
             reduce_scatter_sizes,
         )
@@ -605,12 +461,15 @@ def test_dpa_forward_fuses_local_shared_into_owned_rs_rows(comm_fused_env):
     )
 
     torch.testing.assert_close(output, routed)
-    backend._gather_dpa_inputs.assert_called_once_with(local_hidden, local_router)
-    select_args = method.select_experts_with_record.call_args.kwargs
-    assert select_args["hidden_states"] is gathered_hidden
-    assert select_args["router_logits"] is gathered_router
+    # Routed on the local rows, then the routed rows gathered.
+    method.select_experts.assert_called_once_with(layer, local_hidden, local_router)
+    backend._gather_dpa_inputs.assert_called_once_with(
+        (local_hidden, topk_weights, topk_ids)
+    )
     runtime_args = backend.runtime.run.call_args.kwargs
     assert runtime_args["hidden_states"] is gathered_hidden
+    assert runtime_args["topk_weight"] is gathered_weights
+    assert runtime_args["topk_ids"] is gathered_ids
     assert runtime_args["shared_partial"] is local_shared
     assert runtime_args["before_stage2_for_rows"] is None
     assert runtime_args["reduce_scatter_sizes"] is reduce_scatter_sizes
@@ -623,19 +482,22 @@ def test_dpa_gather_inserts_bucket_padding_inside_each_rank_shard(
     modules, _, backend = _create_dpa_backend(comm_fused_env)
 
     local_hidden = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
-    local_router = torch.tensor([[5.0], [6.0]])
+    local_weights = torch.tensor([[5.0], [6.0]])
+    local_ids = torch.tensor([[7], [8]], dtype=torch.int32)
 
     class FakeGroup:
         world_size = 8
 
         def __init__(self):
             self.locals = []
+            self.sizes = []
+            self.device_communicator = SimpleNamespace(all_gatherv=self._all_gatherv)
 
-        def all_gather(self, tensor, *, use_custom, dim):
-            assert use_custom
+        def _all_gatherv(self, tensors, *, dim, sizes):
             assert dim == 0
-            self.locals.append(tensor.clone())
-            return torch.cat([tensor] * self.world_size, dim=0)
+            self.sizes.append(sizes)
+            self.locals.extend(t.clone() for t in tensors)
+            return [torch.cat([t] * self.world_size, dim=0) for t in tensors]
 
     group = FakeGroup()
     monkeypatch.setattr(modules.comm, "get_dp_group", lambda: group)
@@ -649,19 +511,27 @@ def test_dpa_gather_inserts_bucket_padding_inside_each_rank_shard(
         bucket_for=MagicMock(return_value=32),
         supports_ragged_m=MagicMock(return_value=False),
     )
-    gathered_hidden, gathered_router, local_tokens, sizes = backend._gather_dpa_inputs(
-        local_hidden, local_router
+    (gathered_hidden, gathered_weights, gathered_ids), local_tokens, sizes = (
+        backend._gather_dpa_inputs((local_hidden, local_weights, local_ids))
     )
 
     assert local_tokens == 2
     assert sizes is None
-    assert [tensor.shape for tensor in group.locals] == [(4, 2), (4, 1)]
-    torch.testing.assert_close(group.locals[0][:2], local_hidden)
-    torch.testing.assert_close(group.locals[0][2:], torch.zeros(2, 2))
-    torch.testing.assert_close(group.locals[1][:2], local_router)
-    torch.testing.assert_close(group.locals[1][2:], torch.zeros(2, 1))
+    # One grouped collective, every shard padded to the bucket's 4 rows.
+    assert group.sizes == [[4] * 8]
+    assert [tensor.shape for tensor in group.locals] == [(4, 2), (4, 1), (4, 1)]
+    hidden_sent, weights_sent, ids_sent = group.locals
+    torch.testing.assert_close(hidden_sent[:2], local_hidden)
+    torch.testing.assert_close(hidden_sent[2:], torch.zeros(2, 2))
+    torch.testing.assert_close(weights_sent[:2], local_weights)
+    torch.testing.assert_close(weights_sent[2:], torch.zeros(2, 1))
+    # The pad rows are routed nowhere (ids travel as their float carrier).
+    ids_sent = ids_sent.view(torch.int32)
+    assert torch.equal(ids_sent[:2], local_ids)
+    assert (ids_sent[2:] == -1).all()
     assert gathered_hidden.shape == (32, 2)
-    assert gathered_router.shape == (32, 1)
+    assert gathered_weights.shape == (32, 1)
+    assert gathered_ids.dtype == torch.int32 and gathered_ids.shape == (32, 1)
     backend.runtime.bucket_for.assert_called_once_with(24)
 
 
@@ -672,11 +542,11 @@ def test_dpa_window_gathers_compact_inputs_with_one_grouped_all_gatherv(
 
     sizes = [3, 5, 1, 7, 2, 6, 4, 8]
     local_hidden = torch.randn(sizes[1], 8)
-    local_router = torch.randn(sizes[1], 16, dtype=torch.float32)
+    local_weights = torch.randn(sizes[1], 2, dtype=torch.float32)
     gathered_hidden = torch.randn(sum(sizes), 8)
-    gathered_router = torch.randn(sum(sizes), 16, dtype=torch.float32)
+    gathered_weights = torch.randn(sum(sizes), 2, dtype=torch.float32)
     communicator = SimpleNamespace(
-        all_gatherv=MagicMock(return_value=[gathered_hidden, gathered_router])
+        all_gatherv=MagicMock(return_value=[gathered_hidden, gathered_weights])
     )
     group = SimpleNamespace(
         world_size=8,
@@ -698,21 +568,23 @@ def test_dpa_window_gathers_compact_inputs_with_one_grouped_all_gatherv(
         ),
         tokens=sizes[1],
     )
-    actual_hidden, actual_router, local_tokens, actual_sizes = (
-        backend._gather_dpa_inputs(local_hidden, local_router)
+    (actual_hidden, actual_weights), local_tokens, actual_sizes = (
+        backend._gather_dpa_inputs((local_hidden, local_weights))
     )
 
-    assert actual_hidden is gathered_hidden
-    assert actual_router is gathered_router
+    assert torch.equal(actual_hidden, gathered_hidden)
+    assert torch.equal(actual_weights, gathered_weights)
     assert local_tokens == sizes[1]
     assert actual_sizes == sizes
     backend.runtime.bucket_for.assert_called_once_with(64)
     backend.runtime.supports_ragged_m.assert_called_once_with(64)
-    communicator.all_gatherv.assert_called_once_with(
-        [local_hidden, local_router],
-        dim=0,
-        sizes=sizes,
-    )
+    communicator.all_gatherv.assert_called_once()
+    (sent,), kwargs = communicator.all_gatherv.call_args
+    assert kwargs == {"dim": 0, "sizes": sizes}
+    assert [torch.equal(s, t) for s, t in zip(sent, (local_hidden, local_weights))] == [
+        True,
+        True,
+    ]
     group.all_gather.assert_not_called()
 
 
@@ -775,31 +647,6 @@ def test_fused_moe_dispatches_optional_backend(monkeypatch, atom_modules, suppor
         call_args = ordinary_forward.call_args.args
         assert call_args[0] is hidden_states
         assert call_args[1] is router_logits
-
-
-def test_dpa_hash_routing_falls_back_from_padded_comm_fused(monkeypatch, atom_modules):
-    layer = _new_fused_moe(atom_modules)
-    hidden_states = torch.randn(4, 8)
-    router_logits = torch.randn(4, 16)
-    ordinary_output = torch.randn_like(hidden_states)
-    backend = SimpleNamespace(
-        supports_custom_routing=False,
-        supports=MagicMock(return_value=True),
-        forward=MagicMock(),
-    )
-    layer._comm_fused_moe = backend
-    layer.custom_routing_function = object()
-    ordinary_forward = MagicMock(return_value=ordinary_output)
-    monkeypatch.setattr(type(layer), "forward", ordinary_forward)
-
-    output, is_complete = layer.forward_maybe_comm_fused(
-        hidden_states, router_logits, None
-    )
-
-    assert output is ordinary_output
-    assert not is_complete
-    backend.supports.assert_not_called()
-    backend.forward.assert_not_called()
 
 
 @pytest.mark.parametrize("supported", [True, False])

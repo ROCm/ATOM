@@ -19,6 +19,7 @@ from atom.kv_transfer.disaggregation.types import (
     ReqId,
     SaveOperationId,
     SaveSourceGroupId,
+    req_id_of,
 )
 
 
@@ -37,7 +38,9 @@ class PPKVAggregator:
     commits (``succeeded=True``) only if every stage succeeded, and any stage's
     failure sinks it -- but, like a load, only once every stage has reported.
 
-    Only offload-specific fields are tracked.  Mooncake P/D fields
+    Chunked Mooncake source retention uses the ``pd_source_safe`` connector
+    channel, so even cancellation waits for readers on every stage to drain.
+    The legacy Mooncake P/D fields
     (``finished_sending``, ``finished_recving``) have their own PP-aware
     side-channel and must NOT flow through this aggregator.
     """
@@ -132,7 +135,7 @@ class PPKVAggregator:
         )
 
     def _save_is_abandoned(self, operation) -> bool:
-        return str(getattr(operation, "req_id", operation)) in self._abandoned_saves
+        return req_id_of(operation) in self._abandoned_saves
 
     def forget(self, rid: ReqId) -> None:
         """Retire a request's saves after the scheduler abandons them.
@@ -153,7 +156,7 @@ class PPKVAggregator:
             self._abandoned_saves.popitem(last=False)
 
         def _owned_by(completion) -> bool:
-            return str(getattr(completion, "req_id", completion)) == sid
+            return req_id_of(completion) == sid
 
         for key in [k for k in self._saving if _owned_by(k)]:
             self._saving.pop(key, None)

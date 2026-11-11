@@ -128,7 +128,7 @@ class EngramUva:
                 # `local_heads * head_dim * 2` bytes wide. NCCL is not just
                 # slower here -- its end event, recorded during a CUDAGraph
                 # capture, is later read by the watchdog and crashes with
-                # hipErrorCapturedEvent (see moe.all_gather_with_padding).
+                # hipErrorCapturedEvent.
                 # Rank-major concatenation puts head `h` back at column
                 # `h * head_dim`, so the result needs no transpose; the trailing
                 # columns are the padding an indivisible head count leaves.

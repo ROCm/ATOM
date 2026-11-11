@@ -333,7 +333,7 @@ class TestResolveReasoningToggle:
         # an effort level, validated against the dialects' own vocabulary --
         # and is not what the resolved toggle answers.
         _TOGGLE_NAMES = {name for name, _, _ in REASONING_TOGGLES}
-        src = inspect.getsource(api_server.chat_completions)
+        src = inspect.getsource(api_server._chat_completions)
         tree = ast.parse(textwrap.dedent(src))
         hardcoded = [
             n.slice.value

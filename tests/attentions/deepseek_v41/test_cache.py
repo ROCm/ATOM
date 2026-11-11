@@ -62,10 +62,9 @@ def window_lens(geo, *, start, extend):
         plan_buffers=buffers,
         extra_write=0,
     )
-    # No host plan is a forward that closes no group.
     return {
-        ratio: np.zeros(0) if rows is None else rows[:, 3]
-        for ratio, rows in ((r, p.compress_plan_cpu) for r, p in plans.items())
+        ratio: buffers[ratio]["compress"].np[: plan.num_compress, 3]
+        for ratio, plan in plans.items()
     }
 
 
@@ -92,7 +91,9 @@ def test_checkpoint_fork_rollback_relocation_and_slot_reuse(
     # A window wide enough that one image outgrows a PAGE unit: an FP8 index
     # plane puts 32 tokens in a PAGE, and the fixture's own 4-token window
     # leaves a state entry that fits in a single one.
-    geo = replace(geometry(small_config), packed=packed, window_size=32)
+    geo = replace(
+        geometry(small_config), kv_dtype="fp4" if packed else "bf16", window_size=32
+    )
     spec = checkpoint_spec(geo)
     assert spec.units_per_checkpoint > 1
     # Enough PAGEs for the interleaved unit ids below, which is what makes the
@@ -175,7 +176,9 @@ def test_lmcache_mp_aliases_the_checkpoint_image_in_state_copies_order(
         DeepseekV41MetadataBuilder,
     )
 
-    geo = replace(geometry(small_config), packed=packed, window_size=32)
+    geo = replace(
+        geometry(small_config), kv_dtype="fp4" if packed else "bf16", window_size=32
+    )
     spec = checkpoint_spec(geo)
     assert spec.units_per_checkpoint > 1
     pages = max(40, 2 * spec.units_per_checkpoint)
@@ -232,6 +235,38 @@ def test_lmcache_mp_aliases_the_checkpoint_image_in_state_copies_order(
     assert builder.get_kv_transfer_tensors() is None
 
 
+def test_pd_transfer_publishes_the_state_slot(small_config):
+    """Mooncake P/D: PAGE units plus the whole STATE slot, slot-indexed.
+
+    The connector writes `src_slot * unit` to `dst_slot * unit`, and sends the
+    consumer's slot only when `slot_regions` is non-empty. Encoder bounded
+    replay keeps no checkpoint, so the spec may be None. `lmcache_mp` gets no
+    slot region: it moves STATE through checkpoint copies.
+    """
+    from atom.model_ops.attentions.deepseek_v41.backend import (
+        DeepseekV41MetadataBuilder,
+    )
+
+    geo = replace(geometry(small_config), window_size=32)
+    cache = PagedAttentionCache(geo, 8, 4, "cpu")
+    builder = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)
+    builder.model_runner = SimpleNamespace(
+        config=SimpleNamespace(
+            kv_transfer_config={"kv_connector": "mooncake", "kv_role": "kv_consumer"},
+            tensor_parallel_size=2,
+        ),
+        state_runtime=SimpleNamespace(checkpoint_spec=None),
+    )
+    builder.cache = cache
+    transfer = builder.get_kv_transfer_tensors()
+    assert not transfer.swa_block_regions and transfer.staging_region is None
+    (region,) = transfer.slot_regions
+    assert transfer.num_slots == 4
+    assert region.unit_bytes == geo.state_bytes and not region.reverse_indexed
+    for slot in range(4):
+        assert region.unit_addr(slot) == cache.state_bytes[slot].data_ptr()
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("ratio", [1, 2])
@@ -262,7 +297,7 @@ def test_a_rows_prefix_slice_is_exactly_as_long_as_what_gets_written(
         8,
         512,
         32,
-        packed=packed,
+        kv_dtype="fp4" if packed else "bf16",
         layer_ratios=(ratio,),
         index_topk=topk,
     )
@@ -283,7 +318,7 @@ def test_a_rows_prefix_slice_is_exactly_as_long_as_what_gets_written(
     counts = visible.clamp(max=topk)
     columns = torch.arange(topk, device="cuda")
     selection = torch.where(
-        columns < counts[:, None], columns.expand(step.width, topk), -1
+        columns < counts[:, None], columns.expand(step.running_tokens, topk), -1
     ).int()
     step.selected[0] = selection.unsqueeze(0)
     spec = LayerAttentionSpec(1, ratio, AttentionMode.REUSE, 0, 0)
@@ -321,7 +356,7 @@ def test_one_grouped_build_writes_what_the_per_layer_builds_would(ratio):
         8,
         512,
         32,
-        packed=True,
+        kv_dtype="fp4",
         layer_ratios=(ratio,),
         index_topk=8,
     )
@@ -334,7 +369,7 @@ def test_one_grouped_build_writes_what_the_per_layer_builds_would(ratio):
     assert step.decode
     selection = torch.where(
         torch.arange(8, device="cuda") < ((step.positions + 1) // ratio)[:, None],
-        torch.arange(8, device="cuda").expand(step.width, 8),
+        torch.arange(8, device="cuda").expand(step.running_tokens, 8),
         -1,
     ).int()
     step.selected[0] = selection.unsqueeze(0)
@@ -395,7 +430,7 @@ def test_a_bf16_decode_reads_each_layers_own_window_through_its_ring():
     assert step.decode
     step.selected[0] = torch.where(
         torch.arange(8, device="cuda") < ((step.positions + 1) // 2)[:, None],
-        torch.arange(8, device="cuda").expand(step.width, 8),
+        torch.arange(8, device="cuda").expand(step.running_tokens, 8),
         -1,
     ).int()[None]
     planes = set()
@@ -439,74 +474,6 @@ def test_a_bf16_decode_builds_an_ungrouped_layers_selection_from_its_own_owner()
         LayerAttentionSpec(1, 2, AttentionMode.REINDEX, 0, 1), step
     )[0]
     assert torch.equal(second, first.flip(-1))
-
-
-def test_graph_plan_sentinel_rows_do_not_write_to_live_pages():
-    """Capacity padding is skipped without compacting the scatter's input.
-
-    Two owner fields make each plane noncontiguous across PAGE boundaries;
-    flattening that view would copy it and lose every intended write.
-    """
-    from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
-    from atom.model_ops.v4_kernels import make_compress_plans
-    from atom.utils import CpuGpuBuffer
-
-    # Two owners, because one leaves a PAGE exactly `rows * dim` wide and the
-    # scatter's plane contiguous -- the shape that hides a destination folding
-    # the two axes into one.
-    geo = V41PoolGeometry(2, ((0, 2), (1, 2)), 32, 4, 512, 32, speculative_tokens=1)
-    cache = PagedAttentionCache(geo, 6, 2, "cpu")
-    running_bs, max_q_len = 2, 2
-    spans = (PagedRequest(1, 4, 0, 2, 0, (3, 5)),)
-    plans = make_compress_plans(
-        np.asarray([2], dtype=np.int32),
-        np.asarray([6], dtype=np.int32),
-        geo.compress_ratios,
-        plan_buffers={
-            2: {
-                name: CpuGpuBuffer(
-                    8, 4, dtype=torch.int32, device="cpu", pin_memory=False
-                )
-                for name in ("compress", "write")
-            }
-        },
-        running_bs=running_bs,
-        max_q_len=max_q_len,
-        extra_write=1,
-    )
-    step = begin_step(
-        cache,
-        spans,
-        running_bs=running_bs,
-        running_tokens=running_bs * max_q_len,
-        plans=plans,
-    )
-    plan = step.plans[2]
-    # The capacity, which is what the kernel's grid and every row derived from
-    # it are; `num_compress` is the count this batch happened to produce.
-    assert plan.compress_plan_gpu.shape[0] > plan.num_compress > 0
-    live = plan.compress_plan_gpu[:, 1] >= 0
-    # Positive control: with no sentinel row there is nothing to place, and the
-    # assertions below would hold for a scatter that ignores the question.
-    assert live.any() and not live.all()
-    # Derived here rather than handed to the scatter: the scatter works the
-    # same rows out of the plan itself, so these assertions check that
-    # derivation instead of echoing a value the test supplied.
-    rows = plan.compress_plan_gpu[:, 2] // 2
-    per_page = geo.rows_per_page(2)
-    pages = cache.pages.view("main_0")[0]
-    pages.fill_(0)
-    # A value no row shares, so a row that landed says which one it was.
-    value = torch.arange(1, rows.numel() + 1, dtype=pages.dtype, device=pages.device)
-    filled = value[None, :, None].expand(1, -1, pages.shape[-1])
-    cache._scatter_rows(pages, step, filled, 2)
-    table = step.block_tables[plan.compress_plan_gpu[:, 1].long()]
-    for i in live.nonzero().flatten().tolist():
-        page = table[i, rows[i] // per_page]
-        assert pages[page, rows[i] % per_page, 0] == value[i]
-    # Exactly the live rows were written: a sentinel reaching `-1` would have
-    # landed on the last page's last row, which is a live request's.
-    assert int((pages != 0).any(-1).sum()) == int(live.sum())
 
 
 def test_key_rope_positions_span_the_grid_and_carry_its_sentinels():
@@ -607,6 +574,46 @@ def test_a_deferred_probe_skips_the_slot_its_own_step_resets(small_config, devic
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_a_device_round_step_continues_the_previous_steps_requests(
+    small_config, device
+):
+    """A device-round step skips the probe and the slot resets: it must be the
+    previous step's requests, in the same order, none fresh or resuming. Any
+    other step raises before a layer reads its slots; a steady run of them
+    never does."""
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("ROCm GPU required")
+    geo = replace(geometry(small_config), window_size=32)
+    cache = PagedAttentionCache(geo, 8, 4, device)
+    cache.cursor[0] = torch.tensor([3, 19, -1, 27], device=device)
+    cache.cursor[1] = torch.tensor([5, 19, -1, 27], device=device)
+    a, b = PagedRequest(27, 3, 0, 1, 0, (0, 1)), PagedRequest(28, 5, 1, 1, 1, (2, 3))
+
+    def device_round(*requests, **kwargs):
+        cache.prepare_device_round_state(
+            begin_step(cache, requests, **kwargs), histories=False
+        )
+
+    # nothing prepared before it: no step to continue
+    with pytest.raises(RuntimeError, match="does not continue"):
+        device_round(a, b)
+    cache.prepare_state(begin_step(cache, [a, b]), histories=False)
+    # steady decode: the same requests, a step further on each time
+    for step in range(1, 4):
+        device_round(replace(a, position=3 + step), replace(b, position=5 + step))
+    # another request in the slot (recycled), one gone, the order changed
+    swapped = [replace(b, offset=0), replace(a, offset=1)]
+    for requests in ([replace(a, request_id=29), b], [a], swapped):
+        with pytest.raises(RuntimeError, match="does not continue"):
+            device_round(*requests)
+    # the same request starting over at its floor, or resuming
+    with pytest.raises(RuntimeError, match=r"fresh \[0\]"):
+        device_round(replace(a, position=0), b)
+    with pytest.raises(RuntimeError, match=r"resuming \[1\]"):
+        device_round(a, b, cached_until=np.asarray([0, 5], np.int32))
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
 @pytest.mark.parametrize("histories", [True, False])
 def test_a_forward_recomputing_below_its_state_keeps_it(
     small_config, device, histories
@@ -680,7 +687,7 @@ def test_shared_indptr_launch_matches_row_counts_and_replay(
         128,
         512,
         32,
-        packed=packed,
+        kv_dtype="fp4" if packed else "bf16",
         layer_ratios=ratios,
         index_topk=64,
     )
@@ -706,7 +713,7 @@ def test_shared_indptr_launch_matches_row_counts_and_replay(
         for r in geo.layer_ratios
     }
     step = SimpleNamespace(
-        width=width,
+        running_tokens=width,
         decode=decode,
         positions=positions,
         batch_ids=batches,
@@ -795,3 +802,34 @@ def test_candidate_blocks_are_bound_once_a_forward(small_config, monkeypatch):
     step.candidates[source] = kept
     assert cache.candidate_blocks(step, source, ratio) is not first
     assert len(builds) == 2
+
+
+@pytest.mark.parametrize("layout", ["mfma", "preshuffle", "natural"])
+def test_fp4_cache_layout_selection_and_page_geometry(monkeypatch, layout):
+    from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
+
+    # Allocation follows the declared geometry, not a later environment read.
+    monkeypatch.setenv("ATOM_V4_UNIFIED_MQA", "flydsl")
+    geo = V41PoolGeometry(
+        2,
+        ((0, 2), (1, 1)),
+        128,
+        128,
+        512,
+        128,
+        index_block_rows=8,
+        index_fp4=True,
+        index_layout=layout,
+    )
+    cache = PagedAttentionCache(geo, 3, 1, "cpu")
+    assert {units.layout for units in cache.index_units.values()} == {layout}
+    assert cache.index_units[0].values.shape == (24, 8, 64)
+    assert cache.index_units[1].values.shape == (48, 8, 64)
+    # A group may not cross PAGE boundaries: a PAGE must remain relocatable.
+    if layout == "mfma":
+        with pytest.raises(ValueError, match="4 GiB"):
+            PagedAttentionCache(geo, (1 << 19) + 1, 1, "cpu")
+        with pytest.raises(ValueError, match="complete 64-row groups"):
+            PagedAttentionCache(replace(geo, block_size=64), 3, 1, "cpu")
+    else:
+        PagedAttentionCache(replace(geo, block_size=64), 3, 1, "cpu")

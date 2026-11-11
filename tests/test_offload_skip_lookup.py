@@ -23,7 +23,7 @@ from test_lmcache_mp_async_lookup import CHUNK, _Adapter, _Client
 from atom.kv_transfer.offload.chunked_scheduler import ChunkedOffloadSchedulerBase
 from atom.kv_transfer.offload.metadata import LoadSpec
 from atom.kv_transfer.offload.mp import lookup as mp_lookup
-from atom.kv_transfer.offload.mp import scheduler as mp_scheduler
+from tests.lmcache_mp_support import bare_mp_scheduler
 
 MIN_LOAD = 32
 
@@ -34,9 +34,7 @@ def _scheduler(monkeypatch, *, chunks=8, lookup_done=False):
     client = mp_lookup._MPLookupClient(
         adapter, config=_config(), timeout=1.0, poll_interval=0.01
     )
-    sched = mp_scheduler.LMCacheMPConnectorScheduler.__new__(
-        mp_scheduler.LMCacheMPConnectorScheduler
-    )
+    sched = bare_mp_scheduler()
     sched._mp_adapter = adapter
     ChunkedOffloadSchedulerBase.__init__(
         sched, _config(), chunk_size=CHUNK, lookup_client=client
@@ -515,9 +513,9 @@ def test_admission_walks_the_prefix_once_when_the_detach_is_probed(monkeypatch):
     monkeypatch.setattr(sched_mod.envs, "OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT", True)
     walks = []
 
-    def can_allocate(seq, *, record, block_hashes):
+    def can_allocate(seq, *, record, probe):
         walks.append(record)
-        block_hashes.extend([11, 12])
+        probe.block_hashes.extend([11, 12])
         return 2
 
     s = Scheduler.__new__(Scheduler)
@@ -525,7 +523,8 @@ def test_admission_walks_the_prefix_once_when_the_detach_is_probed(monkeypatch):
     s._local_prefill_coalescing = False
     s.block_manager = SimpleNamespace(hash_block_size=4, can_allocate=can_allocate)
     probe = s._probe_hbm_prefix(SimpleNamespace())
-    assert probe == (2, [11, 12]) and walks == [False]
+    assert (probe.num_cached_blocks, probe.block_hashes) == (2, [11, 12])
+    assert walks == [False]
     assert s._can_detach_tier_lookup(SimpleNamespace(), probe)
     assert walks == [False]  # the decision itself does not walk again
 

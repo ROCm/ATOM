@@ -21,7 +21,10 @@ from atom.model_ops.deepseek_v41.dspark import (
 from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
 from atom.model_ops.deepseek_v41.rope_window import rope_quant_window
 from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
-from atom.model_ops.dspark_markov_sample import dspark_markov_argmax_tp
+from atom.model_ops.dspark_markov_argmax import (
+    dspark_markov_argmax_tp,
+    markov_weights_unsupported,
+)
 from atom.model_ops.layernorm import RMSNorm, rmsnorm2d_fwd_
 from atom.model_ops.linear import ReplicatedLinear
 from atom.model_ops.moe import FusedMoE
@@ -71,8 +74,10 @@ class DraftAttention(Attention):
         _, kv_pre = self.project_qkv(hidden)
         return self.context_keys(self.kv_norm(kv_pre), positions, rope, packed=packed)
 
-    def forward(self, hidden, hidden_scale, context_kv, step, rope):
-        q_lora, kv_pre = self.project_qkv(hidden, hidden_scale)
+    def forward(self, hidden, hidden_scale, context_kv, step, rope, *, hidden_fp8=None):
+        q_lora, kv_pre = self.project_qkv(
+            hidden if hidden_fp8 is None else hidden_fp8, hidden_scale
+        )
         qr, qr_scale, kv_normed = self.qk_norm(q_lora, kv_pre)
         query = self.wq_b(qr, x_scale=qr_scale).unflatten(
             -1, (self.heads, self.head_dim)
@@ -263,7 +268,7 @@ class DeepseekV41DSpark(DSparkDraftModel):
         if plan is not None:
             # A replayed forward ran the decoder, whose rows these come from,
             # on its tail alone: the draft's window takes the same rows.
-            if plan.tail is None:
+            if not plan.tail.requests:
                 return
             rows, step = plan.tail_rows, plan.tail
             aux_concat, positions = aux_concat[rows], positions[rows]
@@ -271,14 +276,14 @@ class DeepseekV41DSpark(DSparkDraftModel):
         # target just ran and what these buffers therefore hold. A padding row
         # belongs to a zero-length request in `cu_seqlens_q`, so it is
         # projected and then written nowhere.
-        hidden = self.project_context(aux_concat[: step.width].unsqueeze(0))
-        positions = positions[: step.width][None]
+        hidden = self.project_context(aux_concat[: step.running_tokens].unsqueeze(0))
+        positions = positions[: step.running_tokens][None]
         layers = self.context_layers
         fused = self._context_kv_fusion()
         if fused is None:
             for attention in layers:
                 keys = attention.project_context(
-                    hidden, positions, self.rope, packed=cache.packed
+                    hidden, positions, self.rope, packed=cache.window_fp8
                 )
                 cache.write_window(attention.spec.layer_id, keys, step)
             return
@@ -307,7 +312,7 @@ class DeepseekV41DSpark(DSparkDraftModel):
                 ]
             )
             keys = quantize_fp8(
-                self.rope(kv, positions.flatten()), dequantize=not cache.packed
+                self.rope(kv, positions.flatten()), dequantize=not cache.window_fp8
             )
         else:
             # Same stage-major result, one kernel: the cat is not fused but
@@ -320,12 +325,16 @@ class DeepseekV41DSpark(DSparkDraftModel):
                 self.rope.cos_cache,
                 self.rope.sin_cache,
                 eps,
-                packed=cache.packed,
+                packed=cache.window_fp8,
             )
         for i, attention in enumerate(layers):
             cache.write_window(
                 attention.spec.layer_id,
-                tuple(t[i : i + 1] for t in keys) if cache.packed else keys[i : i + 1],
+                (
+                    tuple(t[i : i + 1] for t in keys)
+                    if cache.window_fp8
+                    else keys[i : i + 1]
+                ),
                 step,
             )
 
@@ -592,8 +601,10 @@ class DeepseekV41DSpark(DSparkDraftModel):
             and head.tp_size > 1
             and head.bias is None
             and markov.fused_sample
-            and markov.markov_w1.weight.dtype in (torch.bfloat16, torch.float16)
-            and markov.markov_w2.weight.dtype is markov.markov_w1.weight.dtype
+            and markov_weights_unsupported(
+                markov.markov_w1.weight, markov.markov_w2.weight
+            )
+            is None
         )
 
     def _head_and_sample_sharded(self, normed, hc_hidden, anchor_ids):

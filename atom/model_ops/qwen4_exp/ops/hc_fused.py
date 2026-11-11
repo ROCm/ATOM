@@ -323,6 +323,81 @@ def hc_gated_mean(normed: torch.Tensor, gate: torch.Tensor, hc: int) -> torch.Te
 
 
 @triton.jit
+def _hc_gated_mean_quant_kernel(
+    normed_ptr,
+    gate_ptr,
+    out_ptr,
+    q_ptr,
+    scale_ptr,
+    M,
+    stride_row,
+    H: tl.constexpr,
+    HC: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    RB: tl.constexpr,
+    BH: tl.constexpr,
+):
+    """`_hc_gated_mean_tiled_kernel` over whole rows, also emitting the
+    per-token FP8 quant of its BF16 output (scale = amax / FP8_MAX)."""
+    rows = tl.program_id(0) * RB + tl.arange(0, RB)
+    cols = tl.arange(0, BH)
+    mask = (rows < M)[:, None] & (cols < H)[None, :]
+    base = rows[:, None].to(tl.int64) * stride_row + cols[None, :]
+    total = tl.zeros((RB, BH), dtype=tl.float32)
+    for s in tl.static_range(HC):
+        x = tl.load(normed_ptr + base + s * H, mask=mask, other=0.0).to(tl.float32)
+        g = tl.load(gate_ptr + base + s * H, mask=mask, other=0.0).to(tl.float32)
+        total += tl.sigmoid(g) * x
+    mixed = (total / HC).to(out_ptr.dtype.element_ty)
+    out_offsets = rows[:, None].to(tl.int64) * H + cols[None, :]
+    tl.store(out_ptr + out_offsets, mixed, mask=mask)
+    y = mixed.to(tl.float32)
+    scale = tl.max(tl.abs(y), axis=1) / FP8_MAX
+    inv = tl.where(scale > 0, 1.0 / scale, 0.0)
+    q = tl.clamp(y * inv[:, None], -FP8_MAX, FP8_MAX)
+    tl.store(q_ptr + out_offsets, q.to(q_ptr.dtype.element_ty), mask=mask)
+    tl.store(scale_ptr + rows, scale, mask=rows < M)
+
+
+def hc_gated_mean_quant(
+    normed: torch.Tensor, gate: torch.Tensor, hc: int, quant_dtype: torch.dtype
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """`hc_gated_mean` plus the per-token FP8 copy a per_Token GEMM consumes.
+
+    Returns (BF16 mixed [M, H], FP8 mixed [M, H], FP32 scale [M, 1]); the BF16
+    output still feeds the projections that stay unquantized. One program per
+    row: on MI355X at H=2560 that beats the tiled mean + a standalone quant up
+    to about a thousand rows (5.2 vs 7.1 us at 36) and loses at 16384 rows
+    (227 vs 198 us), so callers keep it for decode-sized batches.
+    """
+    m, width = normed.shape
+    hidden = width // hc
+    if gate.stride(0) != normed.stride(0) or normed.stride(1) != 1:
+        raise ValueError("hc_gated_mean_quant needs row-aligned contiguous inputs")
+    out = torch.empty((m, hidden), dtype=normed.dtype, device=normed.device)
+    q = torch.empty((m, hidden), dtype=quant_dtype, device=normed.device)
+    scale = torch.empty((m, 1), dtype=torch.float32, device=normed.device)
+    if m:
+        rb = 1
+        _hc_gated_mean_quant_kernel[(triton.cdiv(m, rb),)](
+            normed,
+            gate,
+            out,
+            q,
+            scale,
+            m,
+            normed.stride(0),
+            H=hidden,
+            HC=hc,
+            FP8_MAX=torch.finfo(quant_dtype).max,
+            RB=rb,
+            BH=triton.next_power_of_2(hidden),
+            num_warps=8,
+        )
+    return out, q, scale
+
+
+@triton.jit
 def _hc_combine_norm_kernel(
     h_ptr,
     block_ptr,

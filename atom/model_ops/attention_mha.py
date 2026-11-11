@@ -9,6 +9,7 @@ from aiter import fused_qk_norm_rope_cache_quant_shuffle
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.mha import _flash_attn_varlen_forward
 from aiter.ops.triton.fused_kv_cache import fused_qk_rope_reshape_and_cache
+from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon_supports_arch
 from aiter.ops.triton.unified_attention import unified_attention
 from torch import nn
 
@@ -17,6 +18,7 @@ from atom.model_ops.base_attention import (
     PA_ASM_MAX_QUERY_GROUP_SIZE,
     cp_mha_gather_cache,
     dense_decode_splits,
+    flydsl_decode_seqs,
     gluon_decode_over_limit,
     run_pa_decode,
     run_pa_fwd_asm,
@@ -41,6 +43,11 @@ class PagedAttentionImpl(nn.Module):
     """
     Attention paged implementation
     """
+
+    @staticmethod
+    def qkv_fields(num_heads, num_kv_heads, head_dim, **kwargs):
+        """(heads, head dim) of each column range of the fused qkv, in order."""
+        return [(num_heads, head_dim)] + [(num_kv_heads, head_dim)] * 2
 
     def __init__(
         self,
@@ -90,6 +97,12 @@ class PagedAttentionImpl(nn.Module):
         self.per_token_quant = True
         self.sinks = sinks
         self.sliding_window = sliding_window if sliding_window is not None else -1
+        # Fall back to Triton/Gluon for layouts unsupported by AITer PA ASM.
+        self.use_triton_attn = (
+            envs.ATOM_FORCE_ATTN_TRITON
+            or self.sliding_window != -1
+            or self.head_dim != 128
+        )
         self.rotary_emb = rotary_emb
         self.q_norm = q_norm
         self.k_norm = k_norm
@@ -189,6 +202,17 @@ class PagedAttentionImpl(nn.Module):
         if (k_scale is not None and k_scale.numel() > 1) or (
             v_scale is not None and v_scale.numel() > 1
         ):
+            if phase == "decode" and not pa_decode_gluon_supports_arch():
+                reason = (
+                    "set ATOM_PA_FLYDSL=1"
+                    if not envs.ATOM_PA_FLYDSL
+                    else "FlyDSL paged decode did not take this call"
+                )
+                raise NotImplementedError(
+                    f"layer {self.layer_num} cannot decode its per-token FP8 KV "
+                    f"cache on this GPU: {reason}, unified_attention cannot "
+                    "carry per-token KV scales, and there is no gluon fallback"
+                )
             raise NotImplementedError(
                 f"layer {self.layer_num} takes unified_attention for {phase}, "
                 "which cannot carry its per-token KV scales"
@@ -238,13 +262,7 @@ class PagedAttentionImpl(nn.Module):
         k_scale = kv_cache_data[f"layer_{self.layer_num}"].k_scale
         v_scale = kv_cache_data[f"layer_{self.layer_num}"].v_scale
 
-        # Fall back to Triton/Gluon for layouts unsupported by AITer PA ASM.
-        use_triton_attn = (
-            envs.ATOM_FORCE_ATTN_TRITON
-            or self.sliding_window != -1
-            or self.head_dim != 128
-        )
-        self.use_triton_attn = use_triton_attn
+        use_triton_attn = self.use_triton_attn
 
         if (
             self.rotary_emb is not None
@@ -434,8 +452,9 @@ class PagedAttentionImpl(nn.Module):
         the separate kernels at 16384 tokens, Qwen3.5 TP4 on MI355X), so
         above ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS run them separately:
         Gemma q/k norm in one launch, the Qwen3.5 MRoPE Triton kernel (or the
-        module's own rotary when that declines), then the per-token FP8 cache
-        write. Same SHUFFLE layout and scales the fused kernel writes.
+        module's own rotary when that declines), then the cache write: per-token
+        FP8 for an FP8 cache, unquantized otherwise. Same SHUFFLE layout and
+        scales the fused kernel writes.
         """
         from atom.model_ops.layernorm import DualRMSNorm
         from atom.model_ops.triton_mrope import try_mrope_qk_fused
@@ -463,16 +482,29 @@ class PagedAttentionImpl(nn.Module):
         q = q.view(-1, self.num_heads, self.head_dim)
         k = k.view(-1, self.num_kv_heads, self.head_dim)
         v = v.view(-1, self.num_kv_heads, self.head_dim)
-        aiter.reshape_and_cache_with_pertoken_quant(
-            k,
-            v,
-            k_cache,
-            v_cache,
-            k_scale,
-            v_scale,
-            attn_metadata.slot_mapping,
-            asm_layout=True,
-        )
+        if self.kv_cache_dtype == "fp8":
+            aiter.reshape_and_cache_with_pertoken_quant(
+                k,
+                v,
+                k_cache,
+                v_cache,
+                k_scale,
+                v_scale,
+                attn_metadata.slot_mapping,
+                asm_layout=True,
+            )
+        else:
+            aiter.reshape_and_cache(
+                k,
+                v,
+                k_cache,
+                v_cache,
+                attn_metadata.slot_mapping,
+                kv_cache_dtype="auto",
+                k_scale=None,
+                v_scale=None,
+                asm_layout=True,
+            )
         return q, k, v
 
     def _gather_prefix_and_concat_kv(
@@ -554,7 +586,7 @@ class PagedAttentionImpl(nn.Module):
             v_scales=v_scale,
             cu_seqlens_kv=cu_seqlens_k,
             # Built once per fwd by the prefill builder (same tensor for every
-            # layer); a ubatch gets its own by slicing in split_attn_metadata.
+            # layer); a ubatch's with its own metadata.
             batch_id_per_k_token=attn_metadata.batch_id_per_k_token,
             seq_starts=attn_metadata.seq_starts,
             dequant=self.kv_cache_dtype.startswith("fp8"),
@@ -574,6 +606,68 @@ class PagedAttentionImpl(nn.Module):
         x = int(k_cache.shape[-1])
         return v_cache.view(n, nh, block_size // x, head_dim, x)
 
+    def _shuffle_v_for_flydsl(self, v_cache, k_cache):
+        # FlyDSL on gfx1250 reads a 4D V as the plain layout; this cache is
+        # SHUFFLE, so pass its 5D view. gluon takes the 4D view as it always has.
+        if pa_decode_gluon_supports_arch() or v_cache.dim() != 4 or k_cache.dim() != 5:
+            return v_cache
+        return self._view_v_cache_for_pa_decode_bf16_asm(v_cache, k_cache)
+
+    def _flydsl_may_take_decode(self) -> bool:
+        """The part of `_flydsl_takes_decode` this layer's configuration
+        decides, before the call's shapes."""
+        return not (
+            envs.ATOM_USE_UNIFIED_ATTN
+            or pa_decode_gluon_supports_arch()
+            or self.sliding_window > 0
+        )
+
+    def decode_reads_ragged_queries(self, max_qlen: int) -> bool:
+        """Whether every decode kernel this layer may run at ``max_qlen`` reads
+        each sequence's query rows off `cu_seqlens_q`, so sequences of
+        different query lengths are safe. `run_pa_decode` (gluon / FlyDSL) and
+        the persistent PA kernels lay a sequence's rows ``max_qlen`` apart."""
+        runner = self._dispatch_decode(max_qlen)
+        if runner == self.paged_attention_asm:
+            return True
+        if runner == self.paged_attention_unified:
+            return not self._flydsl_may_take_decode()
+        return False
+
+    def _flydsl_takes_decode(self, q, k_cache, v_cache, attn_metadata) -> bool:
+        """Without gluon decode (gfx1250): whether FlyDSL accepts this call.
+
+        ATOM_USE_UNIFIED_ATTN keeps the call on unified_attention.
+        """
+        if not self._flydsl_may_take_decode():
+            return False
+        num_seqs = attn_metadata.context_lens.shape[0]
+        return bool(
+            flydsl_decode_seqs(
+                output=q,
+                q=q,
+                k_cache=k_cache,
+                v_cache=self._shuffle_v_for_flydsl(v_cache, k_cache),
+                block_tables=attn_metadata.block_tables,
+                context_lens=attn_metadata.context_lens,
+                max_seqlen_q=attn_metadata.max_seqlen_q,
+                max_context_partition_num=dense_decode_splits(
+                    num_seqs, k_cache.shape[1]
+                ),
+                context_partition_size=256,
+                compute_type=(
+                    torch.bfloat16
+                    if self.kv_cache_dtype == "bf16"
+                    else aiter.dtypes.fp8
+                ),
+                q_scale=None,
+                alibi_slopes=None,
+                sinks=self.sinks,
+                sliding_window=self.sliding_window,
+                ps=True,
+            )
+        )
+
     @mark_trace(prefix="paged_attention_unified", torch_compile=False)
     def paged_attention_unified(
         self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
@@ -585,6 +679,10 @@ class PagedAttentionImpl(nn.Module):
         of the reasons for it.
         """
         attn_metadata = fwd_ctx.attn_metadata
+        if self._flydsl_takes_decode(q, k_cache, v_cache, attn_metadata):
+            return self.paged_attention_triton(
+                q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx
+            )
         self._reject_per_token_scales_on_unified(k_scale, v_scale, "decode")
 
         if envs.ATOM_USE_UNIFIED_ATTN and self.kv_cache_dtype.startswith("fp8"):
@@ -622,8 +720,12 @@ class PagedAttentionImpl(nn.Module):
     def paged_attention_triton(
         self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
     ):
-        """Decode through the gluon paged kernel. Callers must have cleared
-        gluon_decode_over_limit -- _dispatch_decode is where that happens."""
+        """Decode through ``run_pa_decode``: gluon, or opted-in FlyDSL.
+
+        Callers must have cleared ``gluon_decode_over_limit`` in
+        ``_dispatch_decode`` or, on a GPU without gluon, established through
+        ``_flydsl_takes_decode`` that FlyDSL accepts the call.
+        """
 
         attn_metadata = fwd_ctx.attn_metadata
 
@@ -631,11 +733,8 @@ class PagedAttentionImpl(nn.Module):
 
         num_seqs = attn_metadata.context_lens.shape[0]
 
-        _, num_q_heads_total, head_size = q.shape
+        _, num_q_heads_total, _ = q.shape
         _, num_kv_heads, _, _, _ = k_cache.shape
-        query_group_size = attn_metadata.max_seqlen_q * (
-            num_q_heads_total // num_kv_heads
-        )
         assert num_q_heads_total % num_kv_heads == 0
 
         max_context_partition_num = dense_decode_splits(num_seqs, num_kv_heads)
@@ -645,23 +744,6 @@ class PagedAttentionImpl(nn.Module):
         if self.sliding_window > 0:
             max_context_partition_num = 1
             context_partition_size = 128
-
-        intermediate_shape = (
-            num_seqs,
-            num_kv_heads,
-            max_context_partition_num,
-            query_group_size,
-        )
-        exp_sums = torch.empty(intermediate_shape, dtype=torch.float32, device=q.device)
-        max_logits = torch.empty(
-            intermediate_shape, dtype=torch.float32, device=q.device
-        )
-        temporary_output = torch.empty(
-            *intermediate_shape,
-            head_size,
-            dtype=q.dtype,
-            device=q.device,
-        )
 
         if k_scale is not None and k_scale.numel() > 1:
             k_scale = k_scale.unsqueeze(-1)
@@ -674,7 +756,7 @@ class PagedAttentionImpl(nn.Module):
             output=o,
             q=q,
             k_cache=k_cache,
-            v_cache=v_cache,
+            v_cache=self._shuffle_v_for_flydsl(v_cache, k_cache),
             context_lens=attn_metadata.context_lens,
             block_tables=attn_metadata.block_tables,
             softmax_scale=self.scale,
@@ -685,9 +767,6 @@ class PagedAttentionImpl(nn.Module):
             q_scale=None,
             k_scale=None if self.kv_cache_dtype == "bf16" else k_scale,
             v_scale=None if self.kv_cache_dtype == "bf16" else v_scale,
-            exp_sums=exp_sums,
-            max_logits=max_logits,
-            temporary_output=temporary_output,
             alibi_slopes=None,
             sinks=self.sinks,
             sliding_window=self.sliding_window,
@@ -819,7 +898,7 @@ class PagedAttentionImpl(nn.Module):
 
             if int(attn_metadata.max_seqlen_k) > page_size:
                 final_lse = torch.empty(
-                    (batch_size * max_seqlen_q, self.num_heads),
+                    (q.shape[0], self.num_heads),
                     dtype=torch.float32,
                     device=q.device,
                 )
@@ -830,13 +909,11 @@ class PagedAttentionImpl(nn.Module):
                     attn_metadata.reduce_final_map,
                     attn_metadata.reduce_partial_map,
                     max_seqlen_q,
-                    output.view(
-                        batch_size * max_seqlen_q, self.num_heads, self.head_dim
-                    ),
+                    output.view(q.shape[0], self.num_heads, self.head_dim),
                     final_lse,
                 )
 
-            return output.view(batch_size * max_seqlen_q, self.num_heads, self.head_dim)
+            return output.view(q.shape[0], self.num_heads, self.head_dim)
 
     def _can_use_fp8_prefill_attention(
         self,
@@ -965,12 +1042,12 @@ class PagedAttentionImpl(nn.Module):
 
         # `block_tables` is always populated by TritonMHAMetadataBuilder.
         # For pure prefill (no cached tokens) it is, by default, the fake table
-        # built in prepare_prefill that maps seq i to token indices
+        # built in its `finish_prefill` that maps seq i to token indices
         # [cu_seqlens_k[i], ..., cu_seqlens_k[i+1]-1], paired with raw K/V
         # treated as kv_cache with block_size=1.
         #
-        # Under ATOM_USE_UNIFIED_ATTN, prepare_prefill instead uploads the real
-        # per-seq block_table and reads from KV cache, the new tokens
+        # Under ATOM_USE_UNIFIED_ATTN, `stage_prefill` uploads the real per-seq
+        # block_table (`_prefill_block_table_rows`) and reads from KV cache, the new tokens
         # already written into the paged flash-layout cache during rope_cache
         # are read straight from `k_cache`/`v_cache`, identical to the
         # prefix-cache-hit path.
@@ -1027,21 +1104,27 @@ class PagedAttentionImpl(nn.Module):
         return o
 
     def _dispatch_decode(self, max_qlen: int = 1):
-        """The single place that answers which decode kernel runs.
+        """Select the coarse decode runner from model shape and configuration.
 
-        The runners do not re-decide. The vLLM bridge shares the constants and
-        the predicate, not this order -- its arms differ (no unified fallback,
-        no sliding-window arm). Both
+        Cache-dependent dispatch happens later: on a GPU without gluon,
+        ``paged_attention_unified`` hands FlyDSL calls inside its supported
+        domain and keeps the rest on unified attention. The vLLM bridge shares
+        the constants and predicate, not this order -- its arms differ (no
+        unified fallback, no sliding-window arm). Both
         paged kernels stop short of unified, at different points, and drafting
         multiplies the query group into both limits. ASM is the one that must be
         checked here rather than inside its runner: past its envelope
         get_heuristic_kernel silently re-runs with mtp=1, a kernel built for
         another query length, and computes a wrong answer instead of refusing.
+
+        The no-gluon FlyDSL check needs the cache and metadata, which this
+        method does not see.
         """
         # Clamped once here so both gates see the same value; the predicate
         # clamps internally too, and a sentinel would otherwise split them.
         max_qlen = max(1, int(max_qlen))
-        over_gluon = gluon_decode_over_limit(
+        # No gluon decode (gfx1250): unified, which hands FlyDSL what it takes.
+        over_gluon = not pa_decode_gluon_supports_arch() or gluon_decode_over_limit(
             max_qlen, self.num_heads, self.num_kv_heads
         )
         over_asm = (
@@ -1145,14 +1228,29 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
       query on ``self._index_q`` for :meth:`dispatch_backend` (the parent tuple
       has no slot for it; per-layer forward is single-threaded behind the op).
     * :meth:`dispatch_backend` — selects the M3 sparse prefill/decode runners
-      (index top-k -> page-16 sparse block table -> gluon PA), with fp8 vs bf16
-      chosen by the KV cache dtype, not an env gate.
+      (index top-k -> page-16 sparse block table -> paged attention), with fp8
+      vs bf16 chosen by the KV cache dtype.
 
     All indexer state (norms, rope, top-k params, index_cache handle) lives on
     this impl instance — the model holds no sparse-attention runtime state.
     """
 
     is_indexed_sparse_attention = True
+
+    @staticmethod
+    def qkv_fields(
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        index_head_dim=0,
+        skip_index_topk=False,
+        **kwargs,
+    ):
+        fields = PagedAttentionImpl.qkv_fields(num_heads, num_kv_heads, head_dim)
+        if skip_index_topk:
+            return fields
+        # The indexer's queries (one head per kv head), then its one key head.
+        return fields + [(num_kv_heads, index_head_dim), (1, index_head_dim)]
 
     def __init__(
         self,
@@ -1176,7 +1274,6 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         index_q_norm: torch.nn.Module | None = None,
         index_k_norm: torch.nn.Module | None = None,
         index_rotary_emb: torch.nn.Module | None = None,
-        index_q_size: int = 0,
         index_head_dim: int = 0,
         topk: int = 0,
         init_blocks: int = 0,
@@ -1234,11 +1331,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         self.num_idx_heads = (
             self.indexer_cp_world if self.indexer_cp_group is not None else num_kv_heads
         )
-        self.index_q_size = (
-            self.num_idx_heads * index_head_dim
-            if self.indexer_cp_group is not None
-            else index_q_size
-        )
+        self.index_q_size = self.num_idx_heads * index_head_dim
         self.topk = topk
         self.init_blocks = init_blocks
         self.local_blocks = local_blocks
@@ -1257,35 +1350,6 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         # Rotated indexer query produced by rope_cache, consumed (and cleared) by
         # dispatch_backend within the same single-threaded layer forward.
         self._index_q: torch.Tensor | None = None
-
-    @staticmethod
-    def _to_page16_shuffle(k_cache, v_cache, k_scale, v_scale):
-        """Reinterpret the standard page-128 SHUFFLE KV/scale views as page-16
-        SHUFFLE for the MiniMax-M3 ASM/gluon kernels. Zero-copy (128 == 8*16):
-
-            K:     [N, nkv, hd//x, 128, x] -> [N*8, nkv, hd//x, 16, x]
-            V:     [N, nkv, 128//x, hd, x] -> [N*8, nkv, 16//x, hd, x]
-            scale: [N, nkv, 128]           -> [N*8, nkv, 16]   (fp8 only)
-
-        Scales are re-viewed only when present (fp8); bf16 passes them through
-        (None).
-        """
-        from atom.model_ops.minimax_m3.sparse_attn import (
-            ASM_PAGE_SIZE,
-            PAGES_PER_SPARSE_BLOCK,
-        )
-
-        n_blocks, nkv = k_cache.shape[0], k_cache.shape[1]
-        x = k_cache.shape[-1]
-        head_dim = k_cache.shape[2] * x
-        num_phys16 = n_blocks * PAGES_PER_SPARSE_BLOCK
-
-        k16 = k_cache.view(num_phys16, nkv, head_dim // x, ASM_PAGE_SIZE, x)
-        v16 = v_cache.view(num_phys16, nkv, ASM_PAGE_SIZE // x, head_dim, x)
-        if k_scale is not None and v_scale is not None:
-            k_scale = k_scale.view(num_phys16, nkv, ASM_PAGE_SIZE)
-            v_scale = v_scale.view(num_phys16, nkv, ASM_PAGE_SIZE)
-        return k16, v16, k_scale, v_scale
 
     @mark_trace(prefix="rope_cache", torch_compile=False)
     def rope_cache(self, q, k, v, qkv, position, fwd_ctx: ForwardContext):
@@ -1312,19 +1376,18 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         # other MHA model): page-128 SHUFFLE views
         #   K: [N, nkv, hd//x, 128, x]   V: [N, nkv, 128//x, hd, x]
         #   scale (fp8): [N, nkv, 128]
-        # The M3 ASM/gluon kernels index this storage as page-16 SHUFFLE: each
+        # The M3 paged kernels index this storage as page-16 SHUFFLE: each
         # logical 128-block is 8 contiguous physical 16-pages. 128 == 8*16, so the
         # page-16 view is a pure zero-copy reinterpretation of the page-128 view.
         # We re-view here (at attention time) instead of at bind time so the binder
         # has no M3-specific KV/scale code.
+        from atom.model_ops.minimax_m3.sparse_attn import to_page16_shuffle
+
         layer = kv_cache_data[f"layer_{self.layer_num}"]
-        k_cache, v_cache, k_scale, v_scale = self._to_page16_shuffle(
+        k_cache, v_cache, k_scale, v_scale = to_page16_shuffle(
             layer.k_cache, layer.v_cache, layer.k_scale, layer.v_scale
         )
 
-        # M3 sparse attention is fixed to head_dim == 128 (ASM/gluon requirement)
-        # and the AITER fused path; no Triton fallback here.
-        self.use_triton_attn = False
         self._cache_format = "SHUFFLE"
 
         sparse_metadata = getattr(attn_metadata, "sparse_attention_metadata", None)
@@ -1355,10 +1418,10 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
 
             q_size = self.num_heads * self.head_dim
             kv_size = self.num_kv_heads * self.head_dim
-            q_raw, k_raw, v_raw, _, _ = torch.split(
-                qkv,
-                [q_size, kv_size, kv_size, self.index_q_size, self.index_head_dim],
-                dim=-1,
+            # The unread index columns trail, except after a Ulysses exchange
+            # (`qkv_fields`).
+            q_raw, k_raw, v_raw = qkv[..., : q_size + 2 * kv_size].split(
+                [q_size, kv_size, kv_size], dim=-1
             )
             q_out, k_out = triton_fused_norm_rope_cache(
                 q_raw,
@@ -1448,13 +1511,18 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         contract ``fn(q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx)``.
 
         Prefill and decode both: select per-(token/request) top-k index blocks
-        (fusing the page-16 sparse block-table emit), then run the gluon split-KV
-        paged-attention over the SHUFFLE cache. fp8 vs bf16 follows the cache
-        dtype inside the runners. Consumes ``self._index_q`` from rope_cache.
+        (fusing the page-16 sparse block-table emit), then run the selected
+        paged-attention backend over the SHUFFLE cache. fp8 vs bf16 follows the
+        cache dtype inside the runners. Consumes ``self._index_q`` from rope_cache.
         """
         if fwd_ctx.context.is_prefill:
             return self._sparse_prefill
         return self._sparse_decode
+
+    def decode_reads_ragged_queries(self, max_qlen: int) -> bool:
+        """No: the sparse decode (top-k and attention) takes one
+        ``max_query_len`` for every sequence."""
+        return False
 
     def _sparse_metadata(self, fwd_ctx: ForwardContext):
         attn_metadata = fwd_ctx.attn_metadata
@@ -1607,6 +1675,8 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             prefix_lens=prefix_lens,
             sparse_bt=sparse_bt,
             sparse_ctx=sparse_ctx,
+            plan_step_owner=prefill_md if self.local_blocks >= 1 else None,
+            plan_cache_owner=prefill_md,
         )
         output = output.view(*q.shape)
         self._index_q = None

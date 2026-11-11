@@ -77,18 +77,36 @@ class ShippedChain(NamedTuple):
     hashes: array.array  # "Q"
 
 
-def ship_prompt_hash_chain(seq, hash_block_size: int) -> None:
-    """Attach `seq`'s chain for `BlockManager._adopt_shipped_chain`."""
+def ship_prompt_hash_chain(seq, hash_block_size: int, *, block_hashes=None) -> None:
+    """Attach `seq`'s chain for `BlockManager._adopt_shipped_chain`.
+
+    `block_hashes` (a `PrefixBlockHashes` the tokenizer cache built from these
+    very tokens) supplies the chain when its block size, seed and length fit;
+    otherwise the chain is hashed here. The engine checks the shipped chain
+    against the prompt either way (fingerprint and sampled links).
+    """
     if not envs.ATOM_FRONTEND_PREFIX_HASH or hash_block_size <= 0:
         return
     n = full_prompt_blocks(seq, hash_block_size)
-    chain = chained_block_hashes(seq.token_ids, hash_block_size, 0, n, seq.cache_seed)
+    if (
+        block_hashes is not None
+        and (block_hashes.block_size, block_hashes.seed)
+        == (hash_block_size, seq.cache_seed)
+        and block_hashes.num_tokens == seq.num_prompt_tokens
+        and block_hashes.num_blocks == n
+    ):
+        hashes = block_hashes.as_array()
+    else:
+        hashes = array.array(
+            "Q",
+            chained_block_hashes(seq.token_ids, hash_block_size, 0, n, seq.cache_seed),
+        )
     seq.prompt_hash_chain = ShippedChain(
         hash_block_size,
         seq.cache_seed,
         seq.num_prompt_tokens,
         prompt_fingerprint(seq),
-        array.array("Q", chain),
+        hashes,
     )
 
 

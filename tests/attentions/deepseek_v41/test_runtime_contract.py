@@ -112,7 +112,7 @@ def runtime_config(**overrides):
         {"enable_rapidserve": True},
         {"online_quant_config": {}},
         {"eplb_enable": True},
-        {"kv_cache_dtype": "fp8"},
+        {"kv_cache_dtype": "fp16"},
         {"index_cache_dtype": "bf16"},
         {"kv_cache_block_size": 3},
         # a hit's one-PAGE rebuild would not cover the window
@@ -125,12 +125,38 @@ def test_unimplemented_modes_fail_before_loading(override):
         validate_runtime_config(runtime_config(**override))
 
 
-def test_lmcache_mp_is_the_only_kv_transfer_admitted():
+def test_mp_store_and_mooncake_are_the_kv_transfers_admitted():
     validate_runtime_config(
         runtime_config(kv_transfer_config={"kv_connector": "lmcache_mp"})
     )
-    for connector in ("lmcache_offload", "mooncake", "moriio", "multi"):
-        with pytest.raises(ValueError, match="KV transfer other than lmcache_mp"):
+    validate_runtime_config(
+        runtime_config(
+            kv_transfer_config={"kv_connector": "mooncake_store"},
+            enable_encoder_swa_bounded_replay=True,
+            kv_cache_block_size=256,
+        )
+    )
+    # The Store's PAGE-only load is sound only where a hit's state is replayed.
+    with pytest.raises(ValueError, match="Mooncake Store without encoder SWA"):
+        validate_runtime_config(
+            runtime_config(kv_transfer_config={"kv_connector": "mooncake_store"})
+        )
+    for role in ("kv_producer", "kv_consumer"):
+        validate_runtime_config(
+            runtime_config(
+                kv_transfer_config={"kv_connector": "mooncake", "kv_role": role}
+            )
+        )
+    # Mooncake's implicit producer default would escape producer detection.
+    with pytest.raises(ValueError, match="without an explicit kv_role"):
+        validate_runtime_config(
+            runtime_config(kv_transfer_config={"kv_connector": "mooncake"})
+        )
+    for connector in ("lmcache_offload", "moriio", "multi"):
+        with pytest.raises(
+            ValueError,
+            match="KV transfer other than lmcache_mp, mooncake or mooncake_store",
+        ):
             validate_runtime_config(
                 runtime_config(kv_transfer_config={"kv_connector": connector})
             )
@@ -212,16 +238,12 @@ def test_plugin_mode_is_not_refused_by_the_model_validator():
     registers V4.1 at all -- so this gate guarded no reachable configuration
     while reading as though it did.
 
-    `is_vllm` survives only as a qualifier on the two capability gates whose
-    answer genuinely differs by path (non-DSpark speculation, prefix
-    caching), which is asserted elsewhere in this file.
+    The validator does not read `is_vllm` at all; the plugin's transport and
+    speculation gates are in `atom.plugin.vllm.platform` too.
     """
     validate_runtime_config(
         runtime_config(plugin_config=SimpleNamespace(is_vllm=False))
     )
-    # Through `vllm_plugin_config` for the vLLM arm: the capability gates
-    # it reaches (`enable_prefix_caching`) are fields a bare namespace does
-    # not carry, and reaching them is the point of this test.
     validate_runtime_config(vllm_plugin_config())
 
 
@@ -300,10 +322,10 @@ def test_width_invariant_is_checked_on_both_staging_paths(
     )
 
     # The width this step declared is accepted on both paths ...
-    runtime.v41_begin_forward(torch.zeros(1, step.width, 64))
+    runtime.v41_begin_forward(torch.zeros(1, step.running_tokens, 64))
     # ... and one row short is refused on both, staged or not.
     with pytest.raises(ValueError, match="width this step declared"):
-        runtime.v41_begin_forward(torch.zeros(1, step.width + 1, 64))
+        runtime.v41_begin_forward(torch.zeros(1, step.running_tokens + 1, 64))
 
 
 def test_a_forward_reads_nothing_the_forward_before_it_selected(monkeypatch):
@@ -366,7 +388,7 @@ def test_supported_cache_and_piecewise_graph_modes(cache_dtype, graph):
             index_cache_dtype="fp8",
             enforce_eager=not graph,
             compilation_config=SimpleNamespace(
-                level=0, cudagraph_mode=CUDAGraphMode.PIECEWISE
+                level=0, cudagraph_mode=CUDAGraphMode.TR_HYBRID
             ),
         )
     )
@@ -403,7 +425,7 @@ def test_native_dspark_passes_production_admission(graph, dynamic, tp_size, leve
         compilation_config=SimpleNamespace(
             level=level,
             cudagraph_mode=(
-                CUDAGraphMode.FULL if level == 3 else CUDAGraphMode.PIECEWISE
+                CUDAGraphMode.FULL if level == 3 else CUDAGraphMode.TR_HYBRID
             ),
         ),
         hf_config=SimpleNamespace(),
@@ -442,7 +464,7 @@ def test_level3_requires_full_graph_or_eager_runtime():
             runtime_config(
                 enforce_eager=False,
                 compilation_config=SimpleNamespace(
-                    level=3, cudagraph_mode=CUDAGraphMode.PIECEWISE
+                    level=3, cudagraph_mode=CUDAGraphMode.TR_HYBRID
                 ),
             )
         )
@@ -459,13 +481,13 @@ def test_shortening_the_index_block_moves_bytes_without_adding_any(rows):
     the two regions interleave changes.
     """
     geo = V41PoolGeometry(
-        40, ((2, 2), (20, 1)), 64, 128, 512, 128, packed=True, index_block_rows=rows
+        40, ((2, 2), (20, 1)), 64, 128, 512, 128, kv_dtype="fp4", index_block_rows=rows
     )
     assert geo.index_row_bytes == 132
     assert (
         geo.paged_bytes
         == V41PoolGeometry(
-            40, ((2, 2), (20, 1)), 64, 128, 512, 128, packed=True
+            40, ((2, 2), (20, 1)), 64, 128, 512, 128, kv_dtype="fp4"
         ).paged_bytes
     )
 
@@ -549,7 +571,9 @@ def test_real_config_accepts_tbo_before_dpa_rank_expansion(
     # The quantization parser resolves AITER enums. Only bypass that GPU
     # dependency; execute the real Config.__post_init__, HF config load,
     # V4.1 admission check and engine rank planner on CPU.
-    monkeypatch.setattr(config_module, "QuantizationConfig", lambda *args: None)
+    monkeypatch.setattr(
+        config_module, "QuantizationConfig", lambda *args, **kwargs: None
+    )
     cfg = Config(
         model=str(fixture),
         tensor_parallel_size=tp,
@@ -586,6 +610,35 @@ def test_tbo_admission_is_stable_across_dp_normalization(tp, dp):
         cfg.tensor_parallel_size = 1
 
 
+@pytest.mark.parametrize("requested_block", [16, 128, 256])
+def test_store_geometry_uses_v41_effective_block_size(monkeypatch, requested_block):
+    from atom import config as config_module
+    from atom.config import CompilationConfig, Config
+
+    fixture = Path(__file__).parents[2] / "models/deepseek_v41/fixtures"
+    monkeypatch.setattr(config_module, "QuantizationConfig", lambda *a, **k: None)
+    cfg = Config(
+        model=str(fixture),
+        tensor_parallel_size=1,
+        compilation_config=CompilationConfig(level=0),
+        enforce_eager=True,
+        kv_cache_dtype="bf16",
+        index_cache_dtype="fp8",
+        kv_cache_block_size=requested_block,
+        kv_transfer_config={
+            "kv_connector": "mooncake_store",
+            "kv_role": "offload",
+            "kv_connector_extra_config": {
+                "mooncake_store.master": "127.0.0.1:50051",
+                "mooncake_store.metadata": "http://127.0.0.1:8080/metadata",
+                "mooncake_store.local_hostname": "127.0.0.1",
+                "mooncake_store.chunk_tokens": 128,
+            },
+        },
+    )
+    assert cfg.kv_cache_block_size == 128
+
+
 @pytest.mark.parametrize("explicit_parallel", [False, True])
 def test_legacy_engine_dp_reaches_v41_startup(monkeypatch, explicit_parallel):
     import atom.config as config_module
@@ -596,7 +649,9 @@ def test_legacy_engine_dp_reaches_v41_startup(monkeypatch, explicit_parallel):
     monkeypatch.setattr(config_module, "get_hf_config", lambda *args, **kwargs: hf)
     monkeypatch.setattr(config_module, "get_generation_config", lambda *args: None)
     # Quantization resolves AITER enums; keep this admission test CPU-only.
-    monkeypatch.setattr(config_module, "QuantizationConfig", lambda *args: None)
+    monkeypatch.setattr(
+        config_module, "QuantizationConfig", lambda *args, **kwargs: None
+    )
     validated = []
 
     def start_core(config):
@@ -608,11 +663,12 @@ def test_legacy_engine_dp_reaches_v41_startup(monkeypatch, explicit_parallel):
         )
         assert config.parallel_config.data_parallel_master_port == 27123
         validated.append(config.parallel_config)
+        return SimpleNamespace()
 
     monkeypatch.setattr(engine_module, "CoreManager", start_core)
     monkeypatch.setattr(
         engine_module,
-        "_load_tokenizer",
+        "load_tokenizer",
         lambda *args: SimpleNamespace(bos_token_id=0, eos_token_id=1),
     )
     kwargs = {"data_parallel_size": 4, "data_parallel_master_port": 27123}

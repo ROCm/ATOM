@@ -164,7 +164,6 @@ def test_mla_dynamic_bounds_preserve_request_regions(prefill):
                     NUM_TOPK_TOKENS=128,
                     BLOCK_N=128,
                     out=workspace,
-                    seq_local=True,
                 )
                 base = (ptr[:-1] * 32 + 100) * 16
             else:

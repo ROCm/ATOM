@@ -8,6 +8,11 @@ pytest.importorskip("aiter", reason="the sampler and rejection sampler are AITER
 
 from atom.model_ops.rejection_sampler import rejection_sample
 from atom.model_ops.sampler import Sampler
+from atom.model_ops.spec_sampling.ratio_verify import (
+    RatioVerifyInputs,
+    ratio_verify_scratch,
+)
+from atom.model_ops.spec_sampling.sparse_q_store import SparseQStore
 
 ANCHOR = 7  # never a target below: a draft read from an anchor's slot is rejected
 
@@ -33,6 +38,60 @@ def bonus_rows(widths):
     """Each request's last row in `verify_stream`'s layout: anchor + drafts."""
     ends = torch.tensor(widths, device="cuda", dtype=torch.int64).add(1).cumsum(0)
     return ends - 1
+
+
+def draw(probabilities, rows):
+    """`rows` ids drawn from the two-token distribution ``probabilities``."""
+    return (torch.rand(rows, device="cuda") >= probabilities[0]).to(torch.int32)
+
+
+def two_token_ratio(q, drafts, width):
+    """The ratio verify's inputs for ``q``: one stored row per draft, both
+    ids, the drafted one at xslot, plus a dense row per request; q rows flat,
+    request b's starting at b * width; temperature 1, no filters."""
+    rows = drafts.numel()
+    batch = rows // width
+    store = SparseQStore(
+        torch.tensor([0, 1], device="cuda", dtype=torch.int32).repeat(rows, 1),
+        q.expand(rows, 2).contiguous(),
+        torch.stack((torch.full_like(drafts, 2), drafts), 1),
+    )
+    return RatioVerifyInputs(
+        store,
+        torch.arange(batch, device="cuda", dtype=torch.int32) * width,
+        0,
+        torch.ones(batch, device="cuda"),
+        None,
+        None,
+        ratio_verify_scratch(batch, width, 2, "cuda"),
+    )
+
+
+def two_token_batch(probabilities, drafts, width):
+    """`rejection_sample` arguments for equal-width requests whose every
+    verification row scores ``probabilities``, drafting ``drafts``.
+
+    The accept rule is the only thing left varying between the two arms below,
+    so both take this same batch and add their own `ratio`.
+
+    ``target_logits`` is raw LOGITS here -- `rejection_sample` builds
+    `p = softmax(logits / T)` itself, because ATOM's unfiltered verify draw
+    goes through a fused sampler that never forms probabilities to borrow.
+    """
+    rows = drafts.numel()
+    batch = rows // width
+    ids, logits_rows = verify_stream(drafts.tolist(), [width] * batch)
+    return {
+        "input_ids": ids,
+        "target_logits_indices": logits_rows,
+        "num_spec_steps": width,
+        "cu_num_draft_tokens": torch.arange(
+            width, rows + 1, width, device="cuda", dtype=torch.int32
+        ),
+        "target_logits": probabilities.log().expand(rows, -1).contiguous(),
+        "bonus_token_ids": torch.zeros(batch, device="cuda", dtype=torch.int32),
+        "bonus_logits_indices": bonus_rows([width] * batch),
+    }
 
 
 def test_verification_parameters_follow_ragged_request_rows(monkeypatch):
@@ -188,6 +247,50 @@ def test_target_prefixes_cover_every_ragged_acceptance_length(stochastic):
         assert output[i].tolist() == expected
     assert counts.tolist() == accepts
     assert rejected.tolist() == [5 - a for a in accepts]
+    # The undeferred runner's counts come from the row length.
+    emitted = (output != -1).sum(1)
+    assert torch.equal(emitted - 1, counts) and torch.equal(6 - emitted, rejected)
     # The anchor is the row the last emitted token was sampled at.
     starts = [sum(w + 1 for w in widths[:i]) for i in range(len(widths))]
     assert anchors.tolist() == [s + a for s, a in zip(starts, accepts)]
+
+
+@gpu
+@pytest.mark.parametrize("q0", (0.9, 0.7, 0.3))
+def test_ratio_acceptance_accepts_at_least_as_often_as_exact_match(q0):
+    """The PR's motivation, made testable: same drafts, same target, two rules.
+
+    Exact match accepts a draft only when the target's own draw repeats it,
+    `sum_x q(x) p(x)`; the ratio rule accepts `sum_x min(p(x), q(x))`, which is
+    never smaller for any q. Both arms get the SAME sampled drafts, so this
+    compares the accept rules alone -- it does not compare against the greedy
+    proposal that ships today, which is a different and much stronger baseline.
+    """
+    torch.manual_seed(1783)
+    n = 30000
+    p = torch.tensor([0.7, 0.3], device="cuda")
+    q = torch.tensor([q0, 1 - q0], device="cuda")
+    drafts = draw(q, n * 2)
+    batch = two_token_batch(p, drafts, 2)
+    _, (ratio_accepted, _, _) = rejection_sample(
+        **batch, ratio=two_token_ratio(q, drafts, 2)
+    )
+    # The same drafts against the target's own draw, which is what the default
+    # path verifies by equality.
+    _, (exact_accepted, _, _) = rejection_sample(
+        **batch, ratio=None, target_token_ids=draw(p, n * 2)
+    )
+    ratio_rate = torch.minimum(p, q).sum().item()
+    exact_rate = (p * q).sum().item()
+    # Width 2 and both positions independent, so the mean accepted count is
+    # `a + a**2` for a per-position acceptance of `a`.
+    measured = torch.tensor(
+        [ratio_accepted.float().mean().item(), exact_accepted.float().mean().item()]
+    )
+    torch.testing.assert_close(
+        measured,
+        torch.tensor([ratio_rate + ratio_rate**2, exact_rate + exact_rate**2]),
+        rtol=0,
+        atol=0.025,
+    )
+    assert measured[0] >= measured[1]

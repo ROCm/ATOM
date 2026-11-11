@@ -33,6 +33,9 @@ env:
 jobs:
   benchmark:
     name: c=${{ join(matrix.concurrency, ',') }}
+    # Defense-in-depth: current callers do not send PRs to this runner.
+    # Keep forked PRs off ATOMesh self-hosted runners if that changes later.
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
     runs-on: ${{ matrix.runner.slurm_submit_runner }}
     # Configs run in parallel, so this covers waiting in the Slurm queue; the
     # Slurm job's own --time (runner.time_limit) bounds the run itself.
@@ -132,8 +135,10 @@ jobs:
 
               cell = remap_model_paths(cell)
               cell["runner"]["log_root"] = "/share_nfs/ATOMESH_RUNNER/ATOMESH_LOG"
+              # TW atomesh CI submits only as amd-atom.
+              cell["runner"]["slurm_account"] = "amd-atom"
               cell["runner"]["slurm_partition"] = "amd-spur"
-              cell["runner"]["slurm_qos"] = "amd-frameworks-qos"
+              cell["runner"]["slurm_qos"] = "amd-atom-qos"
 
           if (
               cell["runner"].get("slurm_account") == "amd-atom"
@@ -205,7 +210,9 @@ jobs:
         env:
           # Build the reviewed source in a separate setup container. Use the
           # existing release profile for both benchmark and eval services.
-          ATOMESH_BUILD_MESH: ${{ matrix.benchmark.kind == 'aiperf_agentic' && 'true' || 'false' }}
+          # Mounted Python also needs the matching router protocol; accuracy
+          # cases must not silently use the image's older Mesh binary.
+          ATOMESH_BUILD_MESH: ${{ (inputs.atom_source == 'mounted' || matrix.benchmark.kind == 'aiperf_agentic') && 'true' || 'false' }}
           ATOMESH_MESH_BUILD_PROFILE: release
           ATOMESH_ATOM_SOURCE: ${{ inputs.atom_source }}
           CELL_JSON: ${{ steps.machine-paths.outputs.cell_json }}

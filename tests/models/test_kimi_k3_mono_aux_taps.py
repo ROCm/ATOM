@@ -59,7 +59,7 @@ def _runner(tapped, *, mono):
 
 
 def _drive(runner, *, layer_id, mono, prefix):
-    plan = SimpleNamespace(mono=mono, layer_id=layer_id)
+    plan = SimpleNamespace(mono=mono, ffn_only=False, layer_id=layer_id)
     return runner._layer(None, plan, None, prefix, None, None, None, None)
 
 

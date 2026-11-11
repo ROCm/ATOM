@@ -365,8 +365,10 @@ class RcclPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         apply_router_weight_on_input: bool,
         quant_config: FusedMoEQuantConfig,
         quant_type: QuantType = QuantType.No,
+        x_scale: torch.Tensor | None = None,
     ) -> mk.PrepareResultType:
         del quant_config, quant_type
+        assert x_scale is None, "the RCCL transport moves model-dtype rows only"
         # AITER's EP kernel-selection ABI reserves one trailing, masked expert
         # ID and subtracts that column from its top-k tuning key.  FusedMoE
         # advertises the sentinel by extending expert_map by exactly one slot.

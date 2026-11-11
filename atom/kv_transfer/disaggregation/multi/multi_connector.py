@@ -303,12 +303,23 @@ class MultiConnector(KVConnectorBase):
                 continue
             c.start_load_kv(m)
 
+    def publish_prefill_chunks(self, batch) -> None:
+        for connector in self._connectors:
+            connector.publish_prefill_chunks(batch)
+
     def record_kv_cache_ready(self, req_ids: list) -> None:
         """Forward a prefill-ready event hook to connector implementations."""
         for connector in self._connectors:
             callback = getattr(connector, "record_kv_cache_ready", None)
             if callable(callback):
                 callback(req_ids)
+
+    def after_forward(self) -> None:
+        """Forward the post-forward hook (lmcache_mp same-step saves)."""
+        for connector in self._connectors:
+            callback = getattr(connector, "after_forward", None)
+            if callable(callback):
+                callback()
 
     def get_finished(self) -> KVConnectorOutput:
         recv: set = set()
@@ -318,6 +329,7 @@ class MultiConnector(KVConnectorBase):
         send_now: list = []
         save_now: list = []
         completions: set = set()
+        received_handoffs = {}
         for c in self._connectors:
             o = _normalize_finished(c.get_finished())
             recv |= o.finished_recving
@@ -327,6 +339,7 @@ class MultiConnector(KVConnectorBase):
             send_now.extend(o.finished_sending)
             save_now.extend(o.finished_saving)
             completions |= o.connector_completions
+            received_handoffs.update(o.received_handoffs)
 
         return KVConnectorOutput(
             finished_sending=set(send_now),
@@ -336,6 +349,7 @@ class MultiConnector(KVConnectorBase):
             finished_loading=loaded,
             failed_loading=load_failed,
             connector_completions=completions,
+            received_handoffs=received_handoffs,
         )
 
     def get_finished_recv_blocks(self) -> list[int]:
@@ -388,6 +402,11 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         methods = (getattr(c, name, None) for c in self._connectors)
         return [m for m in methods if callable(m)]
 
+    def drop_cached_kv(self) -> bool:
+        """Every sub-connector is asked, so each drops what it can."""
+        results = [bool(drop()) for drop in self._sub_methods("drop_cached_kv")]
+        return all(results)
+
     def can_detach_lookup(self, seq: Any, num_hbm_tokens: int) -> bool:
         """True only if every sub-connector with a tier lookup can detach it."""
         checks = self._sub_methods("can_detach_lookup")
@@ -413,6 +432,23 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             if callable(prefetch):
                 prefetch(seqs)
 
+    def offer_lookups(self, seqs: Any) -> None:
+        """Let each sub start lookups for arrived requests (input IO thread)."""
+        seqs = list(seqs)
+        for connector in self._connectors:
+            offer = getattr(connector, "offer_lookups", None)
+            if callable(offer):
+                offer(seqs)
+
+    def note_scheduled_tokens(
+        self, scheduled_seqs: Any, num_scheduled_tokens: Any
+    ) -> None:
+        """Tell each sub how far this step's forward computes each sequence."""
+        for connector in self._connectors:
+            note = getattr(connector, "note_scheduled_tokens", None)
+            if callable(note):
+                note(scheduled_seqs, num_scheduled_tokens)
+
     def __init__(self, config: Any) -> None:
         self._connectors = _build_subconnectors(config, role="scheduler")
         self.is_producer = any(
@@ -421,6 +457,10 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         # Opt into the scheduler's offload suffix-prefill path if any sub is the
         # offload backend (Scheduler._is_offload_connector reads this).
         self.is_offload = any(getattr(c, "is_offload", False) for c in self._connectors)
+        self.enable_chunked_transfer = any(
+            getattr(c, "enable_chunked_transfer", False) and c.is_producer
+            for c in self._connectors
+        )
         # The sub that won `get_num_new_matched_tokens` for each in-flight
         # request, keyed by `seq.id`. The load-side decisions
         # (`should_park_for_load_after_alloc` and the two chunk/partial-prefill
@@ -644,6 +684,21 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             return False
         return bool(c.enqueue_state_stores(stores))
 
+    def enqueue_state_touches(self, hashes) -> bool:
+        """State touches to the sub hosting the tier (`_state_tier_sub`);
+        False if none does."""
+        c = self._state_tier_sub()
+        if c is None:
+            return False
+        return bool(c.enqueue_state_touches(hashes))
+
+    def take_state_touch_verdicts(self) -> dict:
+        """`{hash: resident}` from the tier sub; empty if none."""
+        c = self._state_tier_sub()
+        if c is None:
+            return {}
+        return c.take_state_touch_verdicts()
+
     def take_state_reports(self):
         """`(indexed, failed)` from the tier sub, else two empty sets.
 
@@ -783,6 +838,18 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             for c in self._connectors
             if hasattr(c, "has_pending_work")
         )
+
+    def admission_ready(self, seq: Any) -> bool:
+        return all(connector.admission_ready(seq) for connector in self._connectors)
+
+    def abort_send(self, seq: Any) -> None:
+        for connector in self._connectors:
+            connector.abort_send(seq)
+
+    def process_pd_completions(self, output: KVConnectorOutput) -> KVConnectorOutput:
+        for connector in self._connectors:
+            output = connector.process_pd_completions(output)
+        return output
 
     def process_completions(self, output: KVConnectorOutput) -> KVConnectorOutput:
         """Let the one offload sub apply its own completions and normalize output.

@@ -45,6 +45,8 @@ class RLHFModelRunner(
     DP_DEVICE_MAP_ENV = "VLLM_DEVICE_CONTROL_ENV_VAR_PLACEHOLDER"
 
     def __init__(self, rank: int, config):
+        if config.sequence_parallel_size > 1:
+            raise ValueError("RLHF rollout does not support Ulysses SP (-sp).")
         # 0 -- the default -- means "this checkpoint's vocabulary is not
         # padded", which is the right answer for almost every model and costs
         # one comparison per step.
@@ -182,9 +184,9 @@ class RLHFModelRunner(
         )
 
         # DP is handled at the EngineCore level (DPEngineCoreProc), not
-        # within ModelRunner. Override so downstream code (get_dp_padding,
-        # ForwardMode.decide/sync_dp_metadata) sees dp_size=1 and skips cross-DP
-        # collectives that would fail on the isolated process group.
+        # within ModelRunner. Override so downstream code (ForwardMode.decide /
+        # sync_dp_metadata) sees dp_size=1 and skips cross-DP collectives that
+        # would fail on the isolated process group.
         config.parallel_config.data_parallel_size = 1
 
         # aiter's init_dist_env creates a signal tensor on device=rankID

@@ -28,16 +28,18 @@ dense_mod = pytest.importorskip(
     "atom.kv_transfer.offload.dense.connector",
     reason="the dense scheduler pulls the offload stack",
 )
-
 from atom.kv_transfer.disaggregation.types import ConnectorCompletion
 from atom.kv_transfer.offload import config as offcfg
+from atom.plugin.vllm.kv_transfer.plugin_schedulers import (
+    PluginDenseScheduler,
+)
 
 BLOCK, CHUNK, WORLD = 64, 64, 4
 PROMPT = 256  # four blocks, so two chunks with room for a second save
 
 
 def _adapter(monkeypatch):
-    """The adapter wired to a real `DenseOffloadScheduler`.
+    """The adapter wired to a real `PluginDenseScheduler`.
 
     Built without `__init__` for the same reason the sibling file does it: a
     real construction needs a VllmConfig and a live LMCache engine. The
@@ -56,10 +58,17 @@ def _adapter(monkeypatch):
         tensor_parallel_size=WORLD,
     )
     adapter = object.__new__(connector_mod.AtomLMCacheOffloadConnector)
-    adapter._scheduler = dense_mod.DenseOffloadScheduler(config)
+    adapter._scheduler = PluginDenseScheduler(config)
     adapter._config = config
     adapter._seqs = SeqViewRegistry()
+    # Match the non-hybrid scheduler defaults from the real constructor.
+    adapter._requests = {}
+    adapter._attn_group_id = 0
+    adapter._kda_planner = None
+    adapter._v41_planner = None
+    adapter._state_load_failure_reports = {}
     adapter._promised_loads = {}
+    adapter._detach_after_alloc, adapter._finished_withdrawals = {}, []
     adapter._deferred_frees = set()
     adapter._deferred_free_at = {}
     adapter._next_save_reconcile_at = 0.0

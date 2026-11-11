@@ -8,12 +8,16 @@ selection trees are shared.
 
     kv  [pages, 4 (key % 4), 4 (K chunk), 2 (key // 4 % 2), 16 B]
     ks  [pages, 4 (K chunk), 8 (key)] E8M0
+
+With ``index_mfma``, keys/scales instead use OPUS 64-row groups, addressed
+from the same logical 8-row page IDs. The query and arithmetic stay the same.
+
     iq  [S, HEADS, DIM / 2] E2M1, iqs [S, 4 (K chunk), 16 (head % 16), 4
         (head // 16, padded)] E8M0, iw [S, HEADS] f32
 
 A task is a piece -- up to WALK_ROWS adjacent tokens on one page table -- and
-a run of chunks, a CTA's: a FULL layer's from the step's host plan
-(``index_plan.fill_walk_plan``, one descriptor a CTA in ``iplan``), a REINDEX
+a run of chunks, a CTA's: a FULL layer's from the step's plan
+(``step_meta._walk_plan``, one descriptor a CTA in ``iplan``), a REINDEX
 layer's (a token a piece, ``index_plan.reindex_split``) from the CTA index
 alone.
 The CTA stages the piece's query rows in LDS and its waves walk the task's
@@ -233,6 +237,23 @@ def _keys(c, page, nt):
     l, g = lane % 16, lane // 16
     # 64-bit addresses: a pool past 4 GiB is out of a buffer offset's reach
     page = fx.Int64(page)
+    if const_expr(c["index_mfma"]):
+        # A logical page names eight rows inside a 64-row OPUS group.
+        # Keep this scorer's 16x16x128 operands and query layout: only the
+        # key/scale addresses change, preserving Mono's accumulation order.
+        group = page // 8
+        row = (page % 8) * 8 + fx.Int64((l % 2) * 4)
+        base = a["plane"] + group * 4096 + fx.Int64(g * 1024) + row * 16
+        kv = [fx.Vector(global_load(base + t * 16, 4, nt)) for t in range(4)]
+        scale_base = (
+            a["pscale"] + group * 256 + fx.Int64((g % 2) * 128) + (row % 32) * 4
+        )
+        byte = fx.Int32(g // 2 * 2) + fx.Int32(row // 32)
+        kvs = fx.Int32(0)
+        for t in range_constexpr(4):
+            word = fx.Int32(global_load(scale_base + t * 4))
+            kvs = kvs | (((word >> (byte * 8)) & 255) << (t * 8))
+        return kv, kvs
     kvs = fx.Int32(
         global_load(a["pscale"] + page * PAGE_SCALES + fx.Int64(g * 8 + (l % 2) * 4))
     )
@@ -465,20 +486,20 @@ def stage_iscore4(c, lead, span, ch0, ch1, max_chunks, rows):
 
 
 @traced
-def run_scores4(c, s, bid, max_chunks):
-    """The FP4 score stage: this CTA's task, if any. A FULL layer's comes from
-    the step's host plan (``iplan``: (lead, span, ch0, ch1) a CTA, span 0 for
-    none); a REINDEX layer's from the CTA index alone
-    (``index_plan.reindex_split``): the walk stops at a token's bound, read
-    with the first keys."""
+def run_scores4(c, t0, n, bid, max_chunks):
+    """The FP4 score stage over rows t0 .. t0 + n: this CTA's task, if any. A
+    FULL layer's comes from the step's plan (``iplan``: (lead, span, ch0, ch1)
+    a CTA, span 0 for none; laid out over the same rows); a REINDEX layer's
+    from the CTA index alone (``index_plan.reindex_split``): the walk stops at
+    a token's bound, read with the first keys."""
     a = _stage_args(c)
     _read_all(a.values())
     enter_stage("k2a.iscore")
     if a["ilift"] != 0:
-        per = ip.reindex_split(s, BLOCKS, REINDEX_TASK_CHUNKS)
-        if bid < s * per:
+        per = ip.reindex_split(n, BLOCKS, REINDEX_TASK_CHUNKS)
+        if bid < n * per:
             ch0, ch1 = ip.reindex_chunks(bid % per, per)
-            stage_iscore4(c, bid // per, fx.Int32(1), ch0, ch1, max_chunks, 1)
+            stage_iscore4(c, t0 + bid // per, fx.Int32(1), ch0, ch1, max_chunks, 1)
     else:
         task = _sload4(a["iplan"] + fx.Int64(bid) * 16)
         if task[1] > 0:

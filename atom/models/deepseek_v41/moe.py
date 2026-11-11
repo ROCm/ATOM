@@ -38,7 +38,7 @@ from atom.model_ops.topK import mm_topk
 from atom.model_ops.utils import atom_parameter
 from atom.models.deepseek_v4 import DeepseekV4Args
 from atom.models.deepseek_v4 import MoE as V4MoE
-from atom.utils.forward_context import get_forward_context
+from atom.utils.forward_context import get_forward_context, pass_scheduled_tokens_gpu
 
 
 @torch_compile_guard(mutates_args=["output"], gen_fake=lambda output: None)
@@ -100,6 +100,7 @@ class MoE(V4MoE):
             out_ids=ids,
             out_weights=weights,
             image_mask=image_mask.flatten(),
+            num_valid_rows=pass_scheduled_tokens_gpu(rows),
         )
         return weights, ids
 

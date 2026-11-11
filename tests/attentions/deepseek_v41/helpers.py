@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: MIT
 from dataclasses import dataclass
 
+import numpy as np
+
 from atom.model_ops.attentions.deepseek_v41.metadata import RequestSpan
 from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
+from atom.model_ops.attentions.token_layout.batch_ids import build_query_layout
 
 
 def geometry(config, block=32):
@@ -27,6 +30,21 @@ def geometry(config, block=32):
         ),
         index_topk=config.index_topk,
     )
+
+
+def stage_query_layout(builder, lengths, running_bs, running_tokens):
+    """What the runner publishes before a builder entry
+    (`prepare_query_metadata`): `cu_seqlens_q` and the token map."""
+    var = builder.model_runner.forward_vars
+    build_query_layout(
+        np.asarray(lengths, dtype=np.int32),
+        running_bs,
+        running_tokens,
+        cu_seqlens_q=var["cu_seqlens_q"].np,
+        batch_ids=var["batch_id_per_q_token"].np,
+    )
+    var["cu_seqlens_q"].copy_to_gpu(running_bs + 1)
+    var["batch_id_per_q_token"].copy_to_gpu(running_tokens)
 
 
 def metadata_buffers(batch_size, tokens, blocks, device="cpu", geometry=None):
@@ -132,3 +150,48 @@ def publish_tables(buffer, requests, running_bs):
         .prepare([request.block_ids for request in requests], pad_to=running_bs)
         .publish(running_bs)
     )
+
+
+def decoder_publisher(cache, running_bs, capacity, blocks, device):
+    """Publish a step's decoder plan as a serving builder does
+    (`DeepseekV41MetadataBuilder._publish_decoder`) at ``running_bs``, from
+    one builder assembled around ``cache`` whose token buffers hold
+    ``capacity`` rows and whose block tables ``blocks`` PAGEs: call it with a
+    step and its requests' PAGEs."""
+    from types import SimpleNamespace
+
+    from atom.model_ops.attentions.deepseek_v41.backend import (
+        DECODER_ROWS,
+        DeepseekV41MetadataBuilder,
+    )
+
+    builder = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)
+    builder.device, builder.geometry = device, cache.geometry
+    builder.max_bs, builder.max_num_batched_tokens = running_bs, capacity
+    builder.model_runner = SimpleNamespace(
+        forward_vars=metadata_buffers(
+            running_bs, capacity, blocks, device, cache.geometry
+        )
+    )
+    builder.model_runner.forward_vars.update(
+        builder._step_buffer_copies(DECODER_ROWS, builder._step_buffer_names())
+        | builder._decoder_layout_buffers()
+    )
+
+    def publish(step, block_tables):
+        step.decoder = builder._publish_decoder(step, block_tables, cache, running_bs)
+        return step
+
+    return publish
+
+
+def publish_decoder(cache, step, block_tables, running_bs=None):
+    """``step`` with its decoder plan at ``running_bs`` (its requests by
+    default), from a builder whose buffers hold every request's window."""
+    running_bs = running_bs or max(len(block_tables), 1)
+    capacity = max(step.running_tokens, running_bs * cache.geometry.window_size)
+    blocks = max((len(row) for row in block_tables), default=1)
+    publish = decoder_publisher(
+        cache, running_bs, capacity, blocks, step.positions.device
+    )
+    return publish(step, block_tables)

@@ -14,6 +14,7 @@ that re-implemented "raise above n = 1" could not tell us whether the real one
 still does.
 """
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -117,6 +118,7 @@ class _GeneratingEngine:
         self._pending = True
         self.core_mgr = SimpleNamespace(
             reset_dp_router=lambda: None,
+            offline_backpressure_batch=lambda: nullcontext(),
             add_request=self._submitted.extend,
             get_output=self._get_output,
             is_alive=lambda: True,
@@ -165,3 +167,19 @@ def test_preprocess_still_refuses_n_greater_than_one():
         io.preprocess("hello", SamplingParams(n=2))
 
     assert io.preprocess("hello", SamplingParams(n=1)).choice_index == 0
+
+
+def test_offline_add_turns_on_the_finished_outputs_queue_before_submitting():
+    # `step` / `generate` read outputs_queue, so the offline entry point turns
+    # it on (Config.keep_finished_outputs defaults to off for online servers)
+    # before any of its sequences can finish.
+    engine, _io, _submitted = _engine()
+    seen = []
+    engine.core_mgr.keep_finished_outputs = False
+    engine.core_mgr.add_request = lambda seqs: seen.append(
+        engine.core_mgr.keep_finished_outputs
+    )
+
+    LLMEngine.add_request(engine, ["hello"], SamplingParams())
+
+    assert seen == [True]

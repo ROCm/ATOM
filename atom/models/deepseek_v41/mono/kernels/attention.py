@@ -35,6 +35,12 @@ t_i = fma(a_2i, alpha_2i, rn(a_2i+1 alpha_2i+1)), T = (t0 + t1) + (t2 + t3),
 X_w = T(2 w) + T(2 w + 1), (X0 + X2) + (X1 + X3); the sink fold,
 rn(acc alpha_kv) / max(l_final, 1e-30), bf16 -> ``att["out"]`` LDS [16][32],
 which the same task's inverse-RoPE quant reads.
+
+An FP8 pool (``kv_fp8``: MXFP8 rows, 512 E4M3 then 16 E8M0) follows the
+original FP8 path (``mla_sparse_prefill_v41``): QK on FP8, PV on BF16. score:
+q quantized to MXFP8 by the KV row's rule once a CTA (``_q_shared``), 4 chained
+16x16x128 scaled MFMAs over D on the rows as stored; pv: a row's 8 columns
+dequantized by their group's code (exact in bf16) into the same bf16 MFMAs.
 """
 
 import flydsl.expr as fx
@@ -46,16 +52,32 @@ from flydsl.expr.typing import T
 from atom.models.deepseek_v41.mono import attention_plan as aplan
 from atom.models.deepseek_v41.mono import index_plan as ip
 from atom.models.deepseek_v41.mono.config import ATTENTION_KEYS_MAX
-from atom.models.deepseek_v41.mono.kernels.dims import HEAD_DIM, HEAD_TILE
+from atom.models.deepseek_v41.mono.kernels.dims import (
+    HEAD_DIM,
+    HEAD_TILE,
+    KV_FP8_ROW_BYTES,
+)
+from atom.models.deepseek_v41.mono.kernels.mx import AMAX_FLOOR
 from atom.models.deepseek_v41.mono.step_meta import KMETA
+from atom.mono.device.mx import (
+    FP8_MAX,
+    UNIT_SCALE,
+    clamp_fp8,
+    code_ceil,
+    mfma_scaled,
+    pow2,
+    rcp_pow2,
+)
 from atom.mono.device.ops import (
     bf16_round,
     butterfly,
+    fp8_pack4,
     hw_exp2,
     lane_gather,
     ld_dev,
     ld_i32,
     mfma_bf16,
+    mxfp8_to_bf16x8,
     readlane,
     row_shr,
     rsrc,
@@ -73,6 +95,10 @@ assert SPLITS * BK == ATTENTION_KEYS_MAX
 # padding (a lane's read-back of 16 rows at one column hits distinct banks)
 SCORE_LDS_ROW = HEAD_DIM // 2 + 4  # words
 SCORE_LDS_WORDS = BK * SCORE_LDS_ROW  # a wave's
+# an FP8 pool's q operands in LDS (``_q_shared``): [K step][lane] 8 words (32 B
+# aligned for the vector access), then [K step][lane] their codes
+Q_LDS_CODES = HEAD_DIM // 128 * 64 * 8
+SCORE_Q_WORDS = Q_LDS_CODES + HEAD_DIM // 128 * 64
 COLS = 32  # the pv task's columns: one FP8 quant group
 GROUPS = HEAD_DIM // COLS  # a head's column groups
 
@@ -131,22 +157,112 @@ def tile_head(d, tile, h):
     return fx.min(head, d.heads - 1), head < d.heads
 
 
-def _row_ptr(pool, row, byte):
-    """Pool row ``row`` at ``byte``: 64-bit, a row index times the 1 KB row
-    passing 2^32 (``pool_index.row_offset``), so neither a buffer offset nor an
-    i32 product can carry it."""
-    return pool + fx.Int64(row) * ROW_BYTES + fx.Int64(byte)
+def _row_bytes(c):
+    return KV_FP8_ROW_BYTES if c["kv_fp8"] else ROW_BYTES
+
+
+def _row_ptr(pool, row, byte, row_bytes):
+    """Pool row ``row`` at ``byte``: 64-bit, a row index times the row passing
+    2^32 (``pool_index.row_offset``), so neither a buffer offset nor an i32
+    product can carry it."""
+    return pool + fx.Int64(row) * row_bytes + fx.Int64(byte)
+
+
+def _dequant8(w0, w1, code):
+    """Eight E4M3 of two dwords times their E8M0 ``code``, as bf16 pairs (exact:
+    a power of two times an E4M3 is a bf16) -- a BF16 pool's operand words."""
+    return mxfp8_to_bf16x8(w0, w1, pow2(code)).bitcast(fx.Int32)
+
+
+def _q_step(a, row, g, st):
+    """K step ``st`` of head ``row``'s q (bf16, ``row`` its word offset) as the
+    16x16x128 scaled MFMA's B operand. Lane group j holds dims 16 j .. + 16
+    of the step, then 16 from 64 past them, but its E8M0 scales block j (dims
+    32 j .. + 32): a half's block, here dims 128 st + 16 g (+ 64) and the 16
+    of lane group g ^ 1 (xor 16), takes their amax, and block g's code comes
+    from a half of this pair or of the one xor 32. Quantized by the KV row's
+    rule (amax floored at AMAX_FLOOR, the ceil code, an exact x / scale, E4M3
+    RNE): 8 words, and block g's code."""
+    words, codes = [], []
+    for half in range_constexpr(2):
+        at = row + (st * 128 + half * 64 + 16 * g) // 2
+        v = [
+            fx.Vector(
+                bo.buffer_load(rsrc(a["q"]), at + 4 * i, vec_width=4, dtype=T.i32)
+            )
+            .bitcast(fx.BFloat16)
+            .to(fx.Float32)
+            for i in range(2)
+        ]
+        v = [v[i // 8][i % 8] for i in range(16)]
+        amax = fx.Float32(0.0)
+        for i in range_constexpr(16):
+            amax = fx.max(amax, abs(v[i]))
+        amax = butterfly(amax, (16,), fx.max)
+        code = code_ceil(
+            fx.max(amax, fx.Float32(AMAX_FLOOR)) * fx.Float32(1.0 / FP8_MAX)
+        )
+        inv = rcp_pow2(code)
+        words += [
+            fp8_pack4(*[clamp_fp8(v[4 * k + i] * inv) for i in range(4)])
+            for k in range(4)
+        ]
+        codes.append(fx.Int32(code))
+    lo, hi = codes
+    mine = (g == 0).select(
+        lo,
+        (g == 1).select(xshfl(lo, 32), (g == 2).select(xshfl(hi, 32), hi)),
+    )
+    return words, mine
+
+
+@traced
+def _q_shared(c, row, g):
+    """The task's q operands (``_q_step``) for every K step, each quantized
+    once a CTA: wave w < 4 its step w into LDS ``score_q`` (``Q_LDS_CODES``),
+    then every wave reads all four. The second barrier keeps a fast wave's
+    next task from overwriting what a slow one has yet to read."""
+    lane, wave = c["lane"], c["wave"]
+    q = c["att"]["score_q"]
+    if wave < HEAD_DIM // 128:
+        words, code = _q_step(c["args"], row, g, wave)
+        fx.ptr_store(
+            fx.Vector.from_elements(words, fx.Int32), q + (wave * 64 + lane) * 8
+        )
+        fx.ptr_store(fx.Int32(code), q + (Q_LDS_CODES + wave * 64 + lane))
+    gpu.barrier()
+    out = []
+    for st in range_constexpr(HEAD_DIM // 128):
+        out.append(
+            (
+                fx.Vector(
+                    fx.ptr_load(
+                        q + (st * 64 + lane) * 8,
+                        result_type=fx.Vector.make_type(8, fx.Int32),
+                    )
+                ),
+                fx.Int32(
+                    fx.ptr_load(q + (Q_LDS_CODES + st * 64 + lane), result_type=T.i32)
+                ),
+            )
+        )
+    rocdl.s_waitcnt(lgkmcnt=0)
+    gpu.barrier()
+    return out
 
 
 def _rows_to_lds(c, pool, slot, kv):
     """A split's 16 key rows (row ``slot`` of lane k, k < 16) whole into this
     wave's LDS ``kv``: one LDS DMA a row, 16 B a lane, read back in the MFMA's
     layout (``_rows_from_lds``). A descriptor a row: the pool passes the 4 GiB
-    a buffer descriptor reaches, so no one view of it can be copied from."""
+    a buffer descriptor reaches, so no one view of it can be copied from. An
+    FP8 row's descriptor ends with it: the lanes past its 528 B read zeros."""
+    row_bytes = _row_bytes(c)
     for r in range_constexpr(BK):
         row = readlane(slot, r)
+        base = pool + fx.Int64(row) * row_bytes
         rocdl.buffer_load_to_lds(
-            rsrc(pool + fx.Int64(row) * ROW_BYTES),
+            rsrc(base, row_bytes) if const_expr(c["kv_fp8"]) else rsrc(base),
             fx.to_llvm_ptr(kv + r * SCORE_LDS_ROW),
             c["lane"] * 16,
             size_bytes=16,
@@ -154,23 +270,78 @@ def _rows_to_lds(c, pool, slot, kv):
 
 
 def _rows_from_lds(c, kv):
-    """The split's key operands back from LDS ``kv``: lane l row l % 16, bytes
-    (ch 32 + 8 (l // 16)) 2, a K chunk ch each (``_score_split``'s ``kws``)."""
+    """The split's key operands back from LDS ``kv``, lane l row l % 16: a BF16
+    row's bytes (ch 32 + 8 (l // 16)) 2, a K chunk ch each; an FP8 row's
+    scaled-MFMA A operand (``_q_step``'s layout) -- K step st's 16 bytes from
+    128 st + 16 (l // 16), then 16 from 64 past them -- and its E8M0 codes, a
+    word a step."""
     lane = c["lane"]
-    at = kv + (lane % BK) * SCORE_LDS_ROW + 4 * (lane // 16)
-    return [
-        fx.Vector(
-            fx.ptr_load(at + ch * 16, result_type=fx.Vector.make_type(4, fx.Int32))
+    g = lane // 16
+    row = kv + (lane % BK) * SCORE_LDS_ROW
+    if const_expr(not c["kv_fp8"]):
+        return [
+            fx.Vector(
+                fx.ptr_load(
+                    row + 4 * g + ch * 16, result_type=fx.Vector.make_type(4, fx.Int32)
+                )
+            )
+            for ch in range(HEAD_DIM // 32)
+        ]
+    steps = []
+    for st in range_constexpr(HEAD_DIM // 128):
+        lo, hi = (
+            fx.Vector(
+                fx.ptr_load(
+                    row + st * 32 + half * 16 + 4 * g,
+                    result_type=fx.Vector.make_type(4, fx.Int32),
+                )
+            )
+            for half in range(2)
         )
-        for ch in range(HEAD_DIM // 32)
-    ]
-
-
-def _ld_row4(pool, row, byte):
-    ptr = fx.inttoptr(
-        fx.PointerType.get(T.i32, fx.AddressSpace.Global, 16), _row_ptr(pool, row, byte)
+        steps.append(
+            fx.Vector.from_elements(
+                [lo[e] for e in range(4)] + [hi[e] for e in range(4)], fx.Int32
+            )
+        )
+    codes = fx.Vector(
+        fx.ptr_load(row + HEAD_DIM // 4, result_type=fx.Vector.make_type(4, fx.Int32))
     )
-    return fx.Vector(fx.ptr_load(ptr, result_type=fx.Vector.make_type(4, fx.Int32)))
+    return steps, codes
+
+
+def _ld_row4(c, pool, row, col):
+    """Row ``row``'s 8 columns from ``col``, as loaded (``_tile_words`` turns
+    them into bf16 pairs where they are used, so the loads stay in flight):
+    a BF16 row's 16 B, or an FP8 row's 8 B (their scale: ``_ld_codes``)."""
+    if const_expr(not c["kv_fp8"]):
+        ptr = fx.inttoptr(
+            fx.PointerType.get(T.i32, fx.AddressSpace.Global, 16),
+            _row_ptr(pool, row, col * 2, ROW_BYTES),
+        )
+        return fx.Vector(fx.ptr_load(ptr, result_type=fx.Vector.make_type(4, fx.Int32)))
+    values = fx.inttoptr(
+        fx.PointerType.get(T.i32, fx.AddressSpace.Global, 8),
+        _row_ptr(pool, row, col, KV_FP8_ROW_BYTES),
+    )
+    return fx.Vector(fx.ptr_load(values, result_type=fx.Vector.make_type(2, fx.Int32)))
+
+
+def _ld_codes(pool, row, dc):
+    """FP8 row ``row``'s E8M0 codes of column groups 4 (dc // 4) .. + 4, a byte
+    each in one word: a PV task's consecutive groups take one load a row."""
+    ptr = fx.inttoptr(
+        fx.PointerType.get(T.i32, fx.AddressSpace.Global, 4),
+        _row_ptr(pool, row, HEAD_DIM + dc // 4 * 4, KV_FP8_ROW_BYTES),
+    )
+    return fx.Int32(fx.ptr_load(ptr, result_type=T.i32))
+
+
+def _tile_words(c, tile, code=None):
+    """An ``_ld_row4`` result as 4 bf16-pair words (an FP8 one by its group's
+    E8M0 ``code``)."""
+    if const_expr(not c["kv_fp8"]):
+        return tile
+    return _dequant8(tile[0], tile[1], code)
 
 
 def _keys(a, t):
@@ -243,19 +414,27 @@ def stage_attn_score(c, task, per):
         for k in range(aplan.score_splits_a_wave(per))
     ]
     slots = [_key_row(a, t, meta, fx.min(s * BK + head, kv_len - 1)) for s in ss]
-    qws = [
-        fx.Vector(
-            bo.buffer_load(
-                rsrc(a["q"]),
-                ((t * d.heads + qh) * HEAD_DIM + ch * 32 + 8 * g) // 2,
-                vec_width=4,
-                dtype=T.i32,
+    qws = (
+        None
+        if c["kv_fp8"]
+        else [
+            fx.Vector(
+                bo.buffer_load(
+                    rsrc(a["q"]),
+                    ((t * d.heads + qh) * HEAD_DIM + ch * 32 + 8 * g) // 2,
+                    vec_width=4,
+                    dtype=T.i32,
+                )
             )
-        )
-        for ch in range(HEAD_DIM // 32)
-    ]
+            for ch in range(HEAD_DIM // 32)
+        ]
+    )
     kv = c["att"]["score_kv"] + c["wave"] * SCORE_LDS_WORDS
     _rows_to_lds(c, a["pool"], slots[0], kv)
+    if const_expr(c["kv_fp8"]):
+        # the FP8 pool's original attention reads q as MXFP8
+        # (``rope_quant_window``'s ``query_fp8``); here, under the rows' DMA
+        qws = _q_shared(c, (t * d.heads + qh) * (HEAD_DIM // 2), g)
     for k in range_constexpr(len(ss)):
         rocdl.s_waitcnt(vmcnt=0)
         kws = _rows_from_lds(c, kv)
@@ -277,12 +456,24 @@ def _score_split(c, t, tile, s, qh, live, kv_len, kws, qws):
         key = s * BK + lane % 16
         ok = key < kv_len
         sc = fx.Vector.filled(4, 0.0, fx.Float32)
-        for ch in range_constexpr(HEAD_DIM // 32):
-            kw = fx.Vector.from_elements(
-                [ok.select(kws[ch][e], fx.Int32(0)) for e in range(4)], fx.Int32
-            )
-            qw = qws[ch]
-            sc = mfma_bf16(kw.bitcast(fx.BFloat16), qw.bitcast(fx.BFloat16), sc)
+        if const_expr(c["kv_fp8"]):
+            # 4 scaled FP8 MFMAs (K = 128): a key past kv_len zero at unit
+            # scale (a zero operand does not hold back a NaN scale)
+            steps, codes = kws
+            for st in range_constexpr(HEAD_DIM // 128):
+                kw = fx.Vector.from_elements(
+                    [ok.select(steps[st][e], fx.Int32(0)) for e in range(8)], fx.Int32
+                )
+                kcode = ok.select(codes[st] >> (8 * g) & 0xFF, fx.Int32(UNIT_SCALE))
+                qw, qcode = qws[st]
+                sc = mfma_scaled(kw, qw, sc, kcode, qcode)
+        else:
+            for ch in range_constexpr(HEAD_DIM // 32):
+                kw = fx.Vector.from_elements(
+                    [ok.select(kws[ch][e], fx.Int32(0)) for e in range(4)], fx.Int32
+                )
+                qw = qws[ch]
+                sc = mfma_bf16(kw.bitcast(fx.BFloat16), qw.bitcast(fx.BFloat16), sc)
         scale = fx.Int32(a["qk_scale"]).bitcast(fx.Float32)
         sv = [
             fx.Float32(
@@ -372,11 +563,22 @@ def stage_attn_pv(c, task, groups):
     def group_tiles(i):
         dc = g0 * groups + i
         return [
-            _ld_row4(a["pool"], rows[r], (dc * COLS + 8 * (lane % 4)) * 2)
+            _ld_row4(c, a["pool"], rows[r], dc * COLS + 8 * (lane % 4))
             for r in range(8)
         ]
 
     tiles = group_tiles(0)
+    # an FP8 row's E8M0 codes of the task's groups (consecutive, from a
+    # multiple of their count): a word a row for every 4 of them
+    code_words = [
+        [_ld_codes(a["pool"], rows[r], g0 * groups + 4 * k) for k in range(-(-groups // 4))]
+        for r in range(8)
+    ] if c["kv_fp8"] else None  # fmt: skip
+
+    def group_codes(i):
+        shift = 8 * ((g0 * groups + i) % 4)
+        return [code_words[r][i // 4] >> shift & 0xFF for r in range(8)]
+
     # thread (head, column)'s sink: one load a task, not a group
     sink = fx.Float32(
         bo.buffer_load(
@@ -405,47 +607,53 @@ def stage_attn_pv(c, task, groups):
     al = [fx.ptr_load(att["alpha"] + (sp * HEAD_TILE + lane % 16)) for sp in splits]
     for i in range_constexpr(groups):
         nxt = group_tiles(i + 1) if i + 1 < groups else None
-        _pv_group(c, kv_len, act, splits, tiles, pws, al, sink, i)
+        codes = group_codes(i) if c["kv_fp8"] else None
+        _pv_group(c, kv_len, act, splits, tiles, codes, pws, al, sink, i)
         tiles = nxt
 
 
 @traced
-def _pv_group(c, kv_len, act, splits, tiles, pws, al, sink, i):
+def _pv_group(c, kv_len, act, splits, tiles, codes, pws, al, sink, i):
     """``stage_attn_pv``'s group i: each split's PV MFMAs on its key tile
-    ``tiles``, their alpha-weighted tree, the combine (with thread (head,
-    column)'s ``sink``) -> ``att["out"]`` group i."""
+    ``tiles`` (an FP8 pool's dequantized by its row's ``codes``), their
+    alpha-weighted tree, the combine (with thread (head, column)'s ``sink``)
+    -> ``att["out"]`` group i."""
     lane, wave, tid = c["lane"], c["wave"], c["tid"]
     att = c["att"]
     g = lane // 16
     head = lane % 16
     kt = att["kv"] + wave * (BK * COLS // 2)
+    # ds_read_b64_tr_b16's source for columns 16 tt ..: lane (g, head) points at
+    # key 4 g + head // 4, columns 4 (head % 4) .. + 4 of the chunk pair tt
+    tr_word = head % 4 // 2 * (BK * 4) + (4 * g + head // 4) * 4 + head % 2 * 2
     accs = []
     for r in range_constexpr(8):
         sp = splits[r]
         pb = fx.Vector.from_elements([pws[r][0], pws[r][1]], fx.Int32).bitcast(fx.Int16)
         ok = sp * BK + lane // 4 < kv_len
-        # this wave's LDS tile: [key][32 columns], this lane's quarter row
+        words = _tile_words(c, tiles[r], None if codes is None else codes[r])
+        # this wave's LDS tile: [8-column chunk][key][8 columns] (the
+        # transposing reads' layout), this lane's chunk of its key
         fx.ptr_store(
             fx.Vector.from_elements(
-                [ok.select(tiles[r][e], fx.Int32(0)) for e in range(4)], fx.Int32
+                [ok.select(words[e], fx.Int32(0)) for e in range(4)], fx.Int32
             ),
-            kt + (lane // 4 * (COLS // 2) + lane % 4 * 4),
+            kt + (lane % 4 * (BK * 4) + lane // 4 * 4),
         )
         for tt in range_constexpr(2):
-            col = tt * 16 + head
-            half = [
-                fx.Int32(fx.ptr_load(kt + ((4 * g + i4) * (COLS // 2) + col // 2)))
-                >> (col % 2 * 16)
-                & 0xFFFF
-                for i4 in range(4)
-            ]
-            av = fx.Vector.from_elements(
-                [half[0] | (half[1] << 16), half[2] | (half[3] << 16)], fx.Int32
-            )
+            # columns 16 tt + head, keys 4 g .. + 4: the MFMA's A operand
+            av = rocdl.ds_read_tr16_b64(
+                fx.Vector.make_type(4, fx.BFloat16),
+                fx.to_llvm_ptr(kt + (tr_word + tt * (2 * BK * 4))),
+            ).result
             acc = fx.Vector(
                 rocdl.mfma_f32_16x16x16bf16_1k(
                     T.vec(4, T.f32),
-                    [av.bitcast(fx.Int16), pb, fx.Vector.filled(4, 0.0, fx.Float32)],
+                    [
+                        fx.Vector(av).bitcast(fx.Int16),
+                        pb,
+                        fx.Vector.filled(4, 0.0, fx.Float32),
+                    ],
                 )
             )
             live = sp < act

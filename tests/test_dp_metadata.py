@@ -1,95 +1,99 @@
 # SPDX-License-Identifier: MIT
-"""How `DPMetadata.make` arrives at the per-rank token counts.
+"""How `DPMetadata` comes by every DP rank's running tokens.
 
-Three ways in, and the choice is a correctness question, not a performance one:
-the table sizes every DP collective in the forward, so a table that does not
+The table sizes every DP collective in the forward, so one that does not
 describe what the ranks will actually run shows up as a fixed-size collective
 posted at mismatched heights -- a hang on eight ranks, nothing here.
 
-No aiter and no DP group: the all_reduce lives behind
-`DPMetadata.num_tokens_across_dp`, which these tests replace. That is also what
-makes "did it ask the group" observable at all.
+`DPMetadata` takes the table whole; `gather_running_tokens` is the one way to a
+table for a caller that knows only its own count. No aiter and no DP group:
+the all_reduce is replaced, which is also what makes "did it ask the group"
+observable at all.
 """
 
+import sys
 import types
 
+import numpy as np
 import pytest
 import torch
 
-from atom.utils.forward_context import DPMetadata
+from atom.utils.forward_context import (
+    Context,
+    DPMetadata,
+    get_forward_context,
+    reset_forward_context,
+    set_forward_context,
+)
 
 
 def _cfg(dp_size=4, dp_rank=1):
     return types.SimpleNamespace(data_parallel_size=dp_size, data_parallel_rank=dp_rank)
 
 
-@pytest.fixture
-def no_group(monkeypatch):
-    """Make the ask itself fail, rather than count calls.
+def test_the_sizes_are_read_off_the_table_it_is_given():
+    md = DPMetadata(np.array([10, 336, 7, 1], dtype=np.int32))
 
-    A version that asks would pass against a stub that answers.
-    """
-
-    def _refuse(*a, **k):
-        raise AssertionError("asked the group for a height it was told")
-
-    monkeypatch.setattr(DPMetadata, "num_tokens_across_dp", staticmethod(_refuse))
-
-
-def test_a_unified_height_is_written_out_rather_than_reduced(no_group):
-    """Every rank runs `num_tokens`, so every rank can write the whole table."""
-    md = DPMetadata.make(_cfg(dp_size=4), 336, unified=True)
-
-    assert md.get_sizes_across_dp() == [336, 336, 336, 336]
-    assert md.max_tokens_across_dp == 336
-    assert md.cu_tokens_across_dp_cpu.tolist() == [336, 672, 1008, 1344]
-
-
-def test_a_height_not_declared_unified_is_still_discovered(monkeypatch):
-    """The default is unchanged: no table and no claim means one all_reduce.
-
-    Its answer is honoured whole -- the reduction, not this rank's own count,
-    is what the derived sizes come from.
-    """
-    asked = {}
-
-    def _reduce(num_tokens, dp_size, dp_rank):
-        asked["args"] = (num_tokens, dp_size, dp_rank)
-        return torch.tensor([10, 336, 7, 1], dtype=torch.int32)
-
-    monkeypatch.setattr(DPMetadata, "num_tokens_across_dp", staticmethod(_reduce))
-
-    md = DPMetadata.make(_cfg(dp_size=4, dp_rank=1), 336)
-
-    assert asked["args"] == (336, 4, 1)
     assert md.get_sizes_across_dp() == [10, 336, 7, 1]
     assert md.max_tokens_across_dp == 336
 
 
-def test_a_supplied_table_and_a_unified_claim_cannot_both_be_given(no_group):
-    """Handing over the table already says what every rank runs.
+def test_a_group_of_one_gathers_without_a_collective(monkeypatch):
+    """Make the ask itself fail, rather than count calls."""
 
-    Saying it again can only agree redundantly or disagree silently, and the
-    silent case is the one that costs eight ranks.
-    """
-    table = torch.tensor([336, 336, 336, 336], dtype=torch.int32)
+    def _refuse(*a, **k):
+        raise AssertionError("asked a group of one")
 
-    with pytest.raises(AssertionError):
-        DPMetadata.make(_cfg(dp_size=4), 336, table, unified=True)
+    monkeypatch.setattr(torch.distributed, "all_reduce", _refuse)
 
-    # ...and the table alone is still taken as given.
-    md = DPMetadata.make(_cfg(dp_size=4), 336, table)
-    assert md.get_sizes_across_dp() == [336, 336, 336, 336]
+    table = DPMetadata.gather_running_tokens(_cfg(dp_size=1, dp_rank=0), 336)
+
+    assert table.tolist() == [336]
 
 
-def test_a_unified_claim_is_not_checked_against_the_group(no_group):
-    """It cannot be, and the pass that makes it has to know that.
+def test_a_rank_contributes_its_own_entry_and_takes_the_reduction(monkeypatch):
+    """Its answer is honoured whole -- the reduction, not this rank's own
+    count, is the table."""
+    peers = torch.tensor([10, 0, 7, 1], dtype=torch.int32)
+    sent = {}
 
-    `make` sees one rank, and the entry it asserts is the one a repeated fill
-    satisfies by construction -- so a caller declaring uniformity off a
-    rank-local number gets a well-formed table describing a group that does not
-    exist. Pinned because the guarantee lives entirely in the callers.
-    """
-    md = DPMetadata.make(_cfg(dp_size=4, dp_rank=3), 7, unified=True)
+    def _all_reduce(table, group):
+        sent["table"] = table.clone()
+        table.add_(peers)
 
-    assert md.get_sizes_across_dp() == [7, 7, 7, 7]
+    group = types.SimpleNamespace(cpu_group="dp-cpu")
+    monkeypatch.setattr(torch.distributed, "all_reduce", _all_reduce)
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.dist.parallel_state",
+        types.SimpleNamespace(get_dp_group=lambda: group),
+    )
+
+    table = DPMetadata.gather_running_tokens(_cfg(dp_size=4, dp_rank=1), 336)
+
+    assert sent["table"].tolist() == [0, 336, 0, 0]
+    assert table.tolist() == [10, 336, 7, 1]
+
+
+@pytest.mark.parametrize("dp_size", [1, 4])
+def test_set_forward_context_mirrors_the_table_onto_the_context(dp_size):
+    """The table a forward is set with is the one its MoE all2all bounds its
+    receive buffer by, and a DP group of one builds no `DPMetadata`."""
+    config = types.SimpleNamespace(
+        parallel_config=_cfg(dp_size=dp_size, dp_rank=0),
+        compilation_config=types.SimpleNamespace(static_forward_context={}),
+    )
+    context = Context(positions=torch.zeros(3, dtype=torch.long))
+    table = np.arange(1, dp_size + 1, dtype=np.int32)
+    try:
+        set_forward_context(
+            attn_metadata=None,
+            atom_config=config,
+            context=context,
+            running_tokens_per_dp_rank=table,
+        )
+        assert context.running_tokens_across_dp == tuple(range(1, dp_size + 1))
+        dp_metadata = get_forward_context().dp_metadata
+        assert (dp_metadata is None) == (dp_size == 1)
+    finally:
+        reset_forward_context()
