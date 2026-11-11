@@ -2991,7 +2991,9 @@ class Config:
                     else self.kv_cache_dtype
                 )
         if self.index_cache_dtype == "nvfp4" and not is_m3:
-            raise ValueError("--index-cache-dtype nvfp4 is supported by MiniMax-M3 only")
+            raise ValueError(
+                "--index-cache-dtype nvfp4 is supported by MiniMax-M3 only"
+            )
         if self.speculative_config is not None:
             from atom.spec_decode.draft_kv import draft_owns_kv_pool
 

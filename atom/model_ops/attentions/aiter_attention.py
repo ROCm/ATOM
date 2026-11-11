@@ -732,6 +732,20 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             module.impl.nvfp4_v_scale = torch.ones(
                 1, dtype=torch.float32, device=k_cache.device
             )
+            # aiter's fused norm/RoPE cannot write NVFP4: it writes bf16 rows into this
+            # scratch (one per process, sized for the widest step, allocated here
+            # and not on first use so no CUDA graph capture can be the one to grow
+            # it) and `nvfp4_write` quantizes them into the pages.
+            scratch = getattr(self.model_runner, "_nvfp4_scratch", None)
+            if scratch is None:
+                from atom.model_ops.minimax_m3.nvfp4_write import Nvfp4Scratch
+
+                scratch = self.model_runner._nvfp4_scratch = Nvfp4Scratch(
+                    self.model_runner.max_num_batched_tokens,
+                    module.num_kv_heads,
+                    k_cache.device,
+                )
+            module.impl.nvfp4_scratch = scratch
 
         module.max_model_len = config.max_model_len
         module.k_cache = k_cache

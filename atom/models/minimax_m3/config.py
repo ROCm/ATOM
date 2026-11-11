@@ -4,7 +4,6 @@
 the way DeepSeek-V4.1's are (``models/deepseek_v41/config.py``). GPU-free: it
 imports neither the model nor AITER until the architecture check needs it."""
 
-
 # The FP4 cache dtypes: "fp4" is MXFP4 (e2m1 + e8m0 per 32), "nvfp4" is NVFP4
 # (e2m1 + e4m3 per 16, single-buffer K/V pages). Both are one page layout for every
 # attention layer, 128-token pages, gfx950, bf16, no offload: one set of refusals.
@@ -84,8 +83,12 @@ def validate_runtime_config(config):
         raise ValueError(
             f"--kv-cache-dtype {kv} needs --index-cache-dtype {kv}, got {index}"
         )
-    if index == "nvfp4" and kv not in ("nvfp4", "bf16", "fp8"):
-        raise ValueError(f"--index-cache-dtype nvfp4 does not pair with KV {kv}")
+    if index == "nvfp4" and kv != "nvfp4":
+        # the NVFP4 index feeds the NVFP4 sparse attention only: there is no emit of
+        # the page-16 table from it, and no run of it beside another KV is wired
+        raise ValueError(
+            f"--index-cache-dtype nvfp4 needs --kv-cache-dtype nvfp4, got {kv}"
+        )
     if kv in _FP4_DTYPES:
         why = _mxfp4_kv_refusal(config)
         if why is not None:

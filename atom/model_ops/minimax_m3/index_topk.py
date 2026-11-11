@@ -1155,8 +1155,13 @@ def minimax_m3_index_topk(
     n_valid_column_per_row: torch.Tensor | None = None,
     index_mxfp4: bool = False,
     pages_per_block: int = PAGES_PER_SPARSE_BLOCK,
+    index_nvfp4: bool = False,
 ):
     """Index block-score + top-k selection. block_size_q == 1 (per-token).
+
+    ``index_nvfp4`` (``--index-cache-dtype nvfp4``): ``index_kv_cache`` is the uint8
+    ``[num_blocks, 9216]`` NVFP4 page cache (``nvfp4_pages.index_page_views``), scored
+    by aiter's ``score_prefill_flydsl_nvfp4``; the selection after it is the same.
 
     With ``index_mxfp4`` (``--index-cache-dtype fp4``) ``index_kv_cache`` is the
     uint8 ``[num_blocks, 8704]`` MXFP4 page cache and the scores come from aiter's
@@ -1197,7 +1202,25 @@ def minimax_m3_index_topk(
     max_block = triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
     _require_packable(max_block)
 
-    if index_mxfp4:
+    if index_nvfp4:
+        from aiter.ops.flydsl import minimax_m3_index_score_prefill_nvfp4_flydsl
+
+        from atom.model_ops.minimax_m3.nvfp4_pages import index_page_views
+
+        k_data, k_scale = index_page_views(index_kv_cache)
+        score = minimax_m3_index_score_prefill_nvfp4_flydsl(
+            idx_q,
+            k_data,
+            k_scale,
+            block_table,
+            cu_seqlens_q,
+            seq_lens,
+            prefix_lens,
+            max_query_len,
+            max_seq_len,
+            sm_scale,
+        )
+    elif index_mxfp4:
         from atom.model_ops.minimax_m3.mxfp4_pages import page_views
 
         k_data, k_scale = page_views(index_kv_cache)
@@ -1389,8 +1412,13 @@ def minimax_m3_index_topk_decode(
     index_work_map=None,
     index_work_map_max_block: int = 0,
     index_score_workspace=None,
+    index_nvfp4: bool = False,
 ):
     """Decode index block-score + top-k, both split-K (cudagraph-safe).
+
+    ``index_nvfp4``: the NVFP4 index cache (``[num_blocks, 9216]`` uint8 pages), scored
+    by aiter's ``score_flydsl_nvfp4`` with the same work map and score workspace as the
+    MXFP4 scorer (it reads the query as e4m3 as stored and widens it to bf16).
 
     ``index_mxfp4`` and ``pages_per_block`` as in :func:`minimax_m3_index_topk`.
 
@@ -1463,10 +1491,21 @@ def minimax_m3_index_topk_decode(
         pages_per_block,
     )
 
-    if index_mxfp4:
-        from aiter.ops.flydsl import minimax_m3_index_score_fp4_flydsl
+    if index_mxfp4 or index_nvfp4:
+        if index_nvfp4:
+            from aiter.ops.flydsl import (
+                minimax_m3_index_score_nvfp4_flydsl as score_flydsl,
+            )
 
-        from atom.model_ops.minimax_m3.mxfp4_pages import page_views
+            from atom.model_ops.minimax_m3.nvfp4_pages import (
+                index_page_views as page_views,
+            )
+        else:
+            from aiter.ops.flydsl import (
+                minimax_m3_index_score_fp4_flydsl as score_flydsl,
+            )
+
+            from atom.model_ops.minimax_m3.mxfp4_pages import page_views
 
         score_max_block = max(max_block, index_work_map_max_block)
         _require_packable(score_max_block)
@@ -1476,7 +1515,7 @@ def minimax_m3_index_topk_decode(
                 num_idx_heads * total_q, score_max_block
             ).view(num_idx_heads, total_q, score_max_block)
         k_data, k_scale = page_views(index_kv_cache)
-        score = minimax_m3_index_score_fp4_flydsl(
+        score = score_flydsl(
             idx_q,
             k_data,
             k_scale,
