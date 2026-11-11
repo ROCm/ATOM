@@ -779,7 +779,8 @@ def cp_lse_a2a(
     owned_counts=None,
     quant_dtype=None,
 ):
-    """A2A backend: pack -> one all-to-all -> local LSE combine.
+    """A2A backend: pack -> one all-to-all -> local LSE combine, or aiter's
+    fused DCP merge when the group has one that takes the inputs.
 
     Drop-in for ``cp_lse_ag_out_rs``: same inputs, same ``[B, H_local, D]``
     output, same head ownership.
@@ -819,6 +820,22 @@ def cp_lse_a2a(
         f"got H={h_total}, N={n_ranks}"
     )
     h_local = h_total // n_ranks
+
+    # aiter's fused DCP merge (gfx1250): the all-to-all and the LSE combine in
+    # one kernel over its custom all-reduce scratch, with no pack kernel, no
+    # copy-in and no combine kernel. It returns None for inputs it does not
+    # take, and the path below runs instead.
+    if quant_dtype is None:
+        merge = getattr(cp_group, "dcp_lse_merge", None)
+        if merge is not None:
+            merged = merge(
+                cp_attn_out,
+                cp_attn_lse.to(torch.float32),
+                owned_counts=owned_counts,
+                return_lse=return_lse,
+            )
+            if merged is not None:
+                return merged
 
     dtype = cp_attn_out.dtype
     pack = _lse_pack_slots(dtype)
