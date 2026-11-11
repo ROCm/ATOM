@@ -629,13 +629,18 @@ def build_post_attn_kernel(
         W_MIDSC = (MID_ROWS + 1) * MID_ROW
         # up / gate tasks go in pairs, a CTA runs both: an MXFP8 block is 32 rows
         UG_PAIRS = UG_PER_SLOT // 2
-        # the MXFP8 shared expert's pairs weigh two routed pairs each and sit on UG_PAIRS
-        # CTAs that take two routed pairs fewer (``stage_moe_wide``)
+        # the MXFP8 shared expert's pairs sit on UG_PAIRS CTAs, one each, that take
+        # UG_SHARED_UNITS routed pairs fewer (``stage_moe_wide``); a shared pair costs
+        # its host as much as that many routed pairs: measured
+        # layer time at S = 8 / 16 with 2 / 3 / 4 / 5 / 6: 87.2 / 83.2 / 83.2 / 82.8 / 84.5
+        # and 127.3 / 123.0 / 123.0 / 122.7 / 124.5 us (the shared pair's loads and
+        # sync are latency, not bytes, so it weighs more than its 2 pairs' bytes)
+        UG_SHARED_UNITS = 4
         UGW_ITERS = (
             2
             * (
                 (U_MAX - 1) * UG_PAIRS
-                + (2 * UG_PAIRS if shared_mxfp8 else UG_PAIRS)
+                + (UG_SHARED_UNITS * UG_PAIRS if shared_mxfp8 else UG_PAIRS)
                 + G
                 - 1
             )

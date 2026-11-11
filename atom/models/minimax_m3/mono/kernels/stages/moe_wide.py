@@ -75,6 +75,7 @@ def moe_wide_defs(k4ctx):
     MID_ROW_WORDS = k4ctx["MID_ROW_WORDS"]
     ROUTE_ITERS = k4ctx["ROUTE_ITERS"]
     UGW_ITERS = k4ctx["UGW_ITERS"]
+    UG_SHARED_UNITS = k4ctx["UG_SHARED_UNITS"]
     UG_CPW = k4ctx["UG_CPW"]
     SH8 = k4ctx["shared_mxfp8"]
     UG_PAIRS = k4ctx["UG_PAIRS"]
@@ -370,16 +371,16 @@ def moe_wide_defs(k4ctx):
         # the MXFP8 shared expert is not a task of the grouped loop (its tiles are fp8)
         n_pairs = (n_routed + (0 if SH8 else 1)) * UG_PAIRS
 
-        # the MXFP8 shared expert's pairs (UG_PAIRS, each two routed pairs' bytes) run
-        # on the last UG_PAIRS CTAs after their routed pairs: those carry two pairs
+        # the MXFP8 shared expert's pairs (UG_PAIRS, each ``UG_SHARED_UNITS`` routed pairs' time) run
+        # on the last UG_PAIRS CTAs after their routed pairs: those carry that many pairs
         # fewer, so every CTA ends within a pair of the others. Rounds (a round is
         # one pair a CTA): the first ``full`` are every CTA's (pair round * G +
-        # bid); the last one or two are the other G - UG_PAIRS CTAs' (the routed
+        # bid); the last ``UG_SHARED_UNITS`` are the other G - UG_PAIRS CTAs' (the routed
         # pairs left, in order). Not SH8: pair round * G + bid throughout
         SH_HOST0 = G - UG_PAIRS
         if const_expr(SH8):
-            rounds = (n_pairs + 2 * UG_PAIRS + (G - 1)) // G
-            full = fx.max(rounds - 2, 0)
+            rounds = (n_pairs + UG_SHARED_UNITS * UG_PAIRS + (G - 1)) // G
+            full = fx.max(rounds - UG_SHARED_UNITS, 0)
 
         def task(it):
             """Iteration it's task: its pair's half it % 2."""
