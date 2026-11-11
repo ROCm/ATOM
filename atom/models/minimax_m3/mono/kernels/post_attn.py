@@ -99,7 +99,9 @@ from atom.models.minimax_m3.mono.layout import (
     AG_RS_FROM,
     MID_ROW,
     O_K,
+    O_ROW,
     O_ROWS,
+    OSC_ROW,
     SCRATCH,
     SPLIT_KEYS,
     UG_PER_SLOT,
@@ -179,6 +181,7 @@ class K4Build:
     sh_first: int = (
         0  # wide MoE: the shared pairs first, their tiles loaded early; 0 off, else ``UG_SHARED_UNITS``
     )
+    attn_mxfp8: bool = False  # qkv / o_proj are native MXFP8 1x32 (E8M0 scales), not ptpc fp8
 
 
 def build_post_attn_kernel(
@@ -203,6 +206,7 @@ def build_post_attn_kernel(
     index_nvfp4: bool = False,
     probe: str = "",
     sh_first: int = 0,
+    attn_mxfp8: bool = False,
 ):
     """``@flyc.jit`` launcher of K4 for one rank of an ``npes``-way TP group and a
     decode step of ``tokens`` (<= MAX_TOKENS) rows, ``q_len`` consecutive rows a
@@ -222,6 +226,9 @@ def build_post_attn_kernel(
     and ``v_cache`` are both the pool, ``k_scale`` / ``v_scale`` the layer's f32 global
     scales), and with ``fuse_k1`` K1 writes and scores them. The index cache is read
     only by K1's scores, so ``index_nvfp4`` needs ``fuse_k1`` here.
+    ``attn_mxfp8``: the qkv (K1, ``fuse_k1``) and o_proj weights are native MXFP8 1x32:
+    (16, 16)-preshuffled fp8, their ``s_qkv`` / ``s_o`` row-major E8M0 ``[rows, K / 32]``;
+    the activations are quantized per 32 elements (E8M0 ceil-pow2) instead of per token.
     """
     assert not index_nvfp4 or fuse_k1, "the index cache is read by K1's scores"
     assert 1 <= tokens <= MAX_TOKENS
@@ -232,7 +239,7 @@ def build_post_attn_kernel(
         route_scale=route_scale, shared_weight=shared_weight,
         swiglu_limit=swiglu_limit, debug=debug, xn_flag=xn_flag,
         shared_mxfp8=shared_mxfp8, mid_flag=mid_flag, kv_nvfp4=kv_nvfp4,
-        index_nvfp4=index_nvfp4, probe=probe, sh_first=sh_first,
+        index_nvfp4=index_nvfp4, probe=probe, sh_first=sh_first, attn_mxfp8=attn_mxfp8,
     )  # fmt: skip
     P = parse_probe(probe)
     build_key = key_tuple(key, SOURCES)  # the launcher references it: keyed
@@ -300,7 +307,10 @@ def build_post_attn_kernel(
     ih_count, ih_own = heads.count, heads.own
     # fuse_k1 with every index head: K1's index q of every head (qs) after its x8
     # rows in the pool (K1 is done with the pool before K4's stages use it)
-    QS_CP = tokens * HIDDEN // 4
+    # (attn_mxfp8: K1's E8M0 codes sit between, ``XSC_ROW`` words a token)
+    QS_CP = tokens * (HIDDEN // 4 + (XSC_ROW if attn_mxfp8 else 0))
+    assert not attn_mxfp8 or QS_CP <= POOL, "K1's x8 rows + codes outgrow the pool"
+    assert not attn_mxfp8 or tokens * (O_ROW + OSC_ROW) <= POOL, "o_proj rows + codes"
     assert not (fuse_k1 and heads.count > 1) or (
         QS_CP + HEAD_DIM // 2 * tokens * heads.count <= POOL
     )
@@ -510,6 +520,8 @@ def build_post_attn_kernel(
                 index_nvfp4=index_nvfp4,
                 skip=P.skip,
                 strip=P.nb,
+                attn_mxfp8=attn_mxfp8,
+                xsc=xs + tokens * (HIDDEN // 4) if attn_mxfp8 else None,
             )  # fmt: skip
             gpu.barrier()
             k1_mbox = Mailbox(layer, diag, REGION_IDS, P.skip)

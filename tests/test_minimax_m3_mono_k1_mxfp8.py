@@ -48,6 +48,11 @@ from atom.models.minimax_m3.mono.kernels.pre_attn import (
 )
 from atom.mono.runtime.uncached import uncached_bytes
 
+def _pow2(e):
+    """2^e exactly (``torch.pow`` is not: 2^-2 * 3 came out as 2.9999999999999996)."""
+    return torch.ldexp(torch.ones((), dtype=torch.float64), e.to(torch.int32))
+
+
 SM_SCALE = HEAD_DIM**-0.5
 ROWS = qkv_rows(1)
 NB = HIDDEN // 32
@@ -67,9 +72,7 @@ def _weights(g):
         torch.randint(0, 5, (ROWS, HIDDEN), generator=g)
     ]
     code = torch.randint(126, 129, (ROWS, NB), generator=g).to(torch.uint8)
-    deq = q.double().view(ROWS, NB, 32) * torch.pow(
-        2.0, code.double() - 127
-    ).unsqueeze(-1)
+    deq = q.double().view(ROWS, NB, 32) * _pow2(code.double() - 127).unsqueeze(-1)
     w = shuffle_weight(q.to(dtypes.fp8).cuda(), layout=(16, 16)).contiguous()
     return w, code.cuda().contiguous(), deq.view(ROWS, HIDDEN), q, code
 
@@ -139,8 +142,8 @@ def test_k1_mxfp8_gemv_is_exact(tokens):
     normed = (o["res"].float() * 0.5).to(torch.bfloat16)
     xq, xs = quantize_fp8(normed)  # the native linear's activation quantization
     xdq = (
-        xq.view(tokens, NB, 32).double()
-        * torch.pow(2.0, xs.view(torch.uint8).double() - 127).unsqueeze(-1)
+        xq.cpu().view(tokens, NB, 32).double()
+        * _pow2(xs.view(torch.uint8).double().cpu() - 127).unsqueeze(-1)
     ).view(tokens, HIDDEN)
     want = (xdq.cpu() @ o["w_deq"].T).to(torch.bfloat16).float()
     got = o["got"].cpu()
@@ -161,8 +164,8 @@ def test_the_oracle_tells_a_wrong_scale_mapping():
     normed = (o["res"].float() * 0.5).to(torch.bfloat16)
     xq, xs = quantize_fp8(normed)
     xdq = (
-        xq.view(4, NB, 32).double()
-        * torch.pow(2.0, xs.view(torch.uint8).double() - 127).unsqueeze(-1)
+        xq.cpu().view(4, NB, 32).double()
+        * _pow2(xs.view(torch.uint8).double().cpu() - 127).unsqueeze(-1)
     ).view(4, HIDDEN)
     for what, code in (
         ("block", o["code_cpu"].roll(1, 1)),
@@ -170,7 +173,7 @@ def test_the_oracle_tells_a_wrong_scale_mapping():
     ):
         deq = (
             o["q"].double().view(ROWS, NB, 32)
-            * torch.pow(2.0, code.double() - 127).unsqueeze(-1)
+            * _pow2(code.double() - 127).unsqueeze(-1)
         ).view(ROWS, HIDDEN)
         bad = (xdq.cpu() @ deq.T).to(torch.bfloat16).float()
         assert not torch.equal(o["got"].cpu(), bad), what

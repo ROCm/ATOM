@@ -116,6 +116,9 @@ SCRATCH = _layout(
         # a debug build's wait records, one a CTA; last, so the regions above
         # keep their offsets in every build
         ("diag", BLOCKS * DIAG_WORDS * 4 // PAIR_BYTES),
+        # ``attn_mxfp8``: the merged attention's per-1x32 E8M0 codes, a plain word each
+        # (behind ``attnq_s``'s flags); after ``diag`` so every region above keeps its offset
+        ("attnq_sc", MAX_TOKENS * (O_K // 32) // 2),
     ]
 )
 SCRATCH_BYTES = SCRATCH["_bytes"]
@@ -350,6 +353,8 @@ MID_ROW = INTER // 4 + 4
 MIDSC_ROW = INTER // 32 + 4
 # and the o stage's FP8 attention rows (512 words: the same 16-way conflict)
 O_ROW = O_K // 4 + 4
+# and the codes of those rows (``attn_mxfp8``), a word per 32-block
+OSC_ROW = O_K // 32 + 4
 # the dense layers' (dense_post) per-token FP8 rows: the gate / up input and the
 # down stage's mids
 DX_ROW = HIDDEN // 4 + 4

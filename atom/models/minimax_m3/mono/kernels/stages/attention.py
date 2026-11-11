@@ -22,10 +22,18 @@ from atom.models.minimax_m3.mono.layout import (
     O_K,
     O_ROW,
     O_ROWS,
+    OSC_ROW,
     SPLIT_KEYS,
     H,
 )
-from atom.mono.device.mx import FP8_MAX, UNIT_SCALE, mfma_scaled
+from atom.mono.device.mx import (
+    FP8_MAX,
+    UNIT_SCALE,
+    clamp_fp8,
+    code_ceil,
+    mfma_scaled,
+    rcp_pow2,
+)
 from atom.mono.device.ops import (
     CM_DEV,
     CM_NT,
@@ -362,8 +370,10 @@ def split_defs(k4ctx):
 
 @traced
 def merge_defs(k4ctx):
-    """The functions of the partitions' merge and per-token FP8 quantization."""
+    """The functions of the partitions' merge and per-token FP8 quantization (per 1x32
+    E8M0 under ``attn_mxfp8``)."""
     G = k4ctx["G"]
+    attn_mxfp8 = k4ctx["attn_mxfp8"]
     block_max = k4ctx["block_max"]
     lane = k4ctx["lane"]
     mb = k4ctx["mb"]
@@ -426,6 +436,27 @@ def merge_defs(k4ctx):
                 av[3] + wi * o23[1],
             ]
         a0, a1, a2, a3 = (bf16_round(x) for x in av)
+        if const_expr(attn_mxfp8):
+            # per 1x32 (the native linear's quantize_fp8): 8 threads share a block
+            am = butterfly(
+                fx.max(
+                    fx.max(fmath.absf(a0), fmath.absf(a1)),
+                    fx.max(fmath.absf(a2), fmath.absf(a3)),
+                ),
+                (1, 2, 4),
+                fx.max,
+            )
+            code = code_ceil(fx.max(am, fx.Float32(1e-10)) * fx.Float32(1.0 / FP8_MAX))
+            inv = rcp_pow2(code)
+            return (
+                fp8_pack4(
+                    clamp_fp8(a0 * inv),
+                    clamp_fp8(a1 * inv),
+                    clamp_fp8(a2 * inv),
+                    clamp_fp8(a3 * inv),
+                ),
+                code,
+            )
         amax = block_max(
             fx.max(
                 fx.max(fmath.absf(a0), fmath.absf(a1)),
@@ -450,7 +481,18 @@ def merge_defs(k4ctx):
                     k * (O_K // 4) + tid,
                     cache_modifier=CM_DEV,
                 )
-                publish(mb_put, mr("attnq_s"), k, x_scale, tid == 0)
+                if const_expr(attn_mxfp8):
+                    # the codes as plain words too; the flag carries no scale
+                    if tid % 8 == 0:
+                        bo.buffer_store(
+                            x_scale,
+                            rsrc(mb("attnq_sc")),
+                            k * (O_K // 32) + tid // 8,
+                            cache_modifier=CM_DEV,
+                        )
+                    publish(mb_put, mr("attnq_s"), k, fx.Float32(1.0), tid == 0)
+                else:
+                    publish(mb_put, mr("attnq_s"), k, x_scale, tid == 0)
 
     return {"merge_token": merge_token, "stage_merge": stage_merge}
 
@@ -459,6 +501,7 @@ def merge_defs(k4ctx):
 def o_defs(k4ctx):
     """The functions of o_proj and the attention all-reduce."""
     AG_RS = k4ctx["AG_RS"]
+    attn_mxfp8 = k4ctx["attn_mxfp8"]
     CM_K1 = k4ctx["CM_K1"]
     G = k4ctx["G"]
     SY = k4ctx["SY"]
@@ -517,25 +560,49 @@ def o_defs(k4ctx):
                     )
                 )
             # this task's row scales, before the wait
-            ws = fx.Float32(
-                bo.buffer_load(
-                    wrsrc("o", s_o), t * O_ROWS + tid % O_ROWS, vec_width=1, dtype=T.f32
+            if const_expr(attn_mxfp8):
+                # lane (row l16, block g): the E8M0 bytes of this wave's 16 blocks
+                # (4 MFMAs x 4), the row's 64 bytes at 16 (wave % 4); MFMA p takes block
+                # g of dword p (shifted to byte 0)
+                ws_dw = fx.Vector(
+                    bo.buffer_load(
+                        wrsrc("o", s_o),
+                        ((rg * 16 + l16) * (O_K // 32) + 16 * (wave % 4)) // 4,
+                        vec_width=4,
+                        dtype=T.i32,
+                    )
                 )
-            )
+                osc = xs + tokens * O_ROW  # the activation's codes, a word each
+            else:
+                ws = fx.Float32(
+                    bo.buffer_load(
+                        wrsrc("o", s_o),
+                        t * O_ROWS + tid % O_ROWS,
+                        vec_width=1,
+                        dtype=T.f32,
+                    )
+                )
 
             if const_expr(tokens == 1):
                 # the merge folded in: the partitions -> this CTA's fp8 input
                 word, x_scale = merge_token(0)
-                x_scales = [x_scale]
+                if const_expr(attn_mxfp8):
+                    if tid % 8 == 0:
+                        fx.ptr_store(x_scale.bitcast(fx.Float32), osc + tid // 8)
+                else:
+                    x_scales = [x_scale]
                 fx.ptr_store(word, xs + tid)
             else:
                 # the merge tasks' fp8 inputs: every token's scale (published
                 # after its plain words), then the words, 16 B a load
                 got = mb_poll([(mr("attnq_s"), k, 1) for k in range(tokens)])
                 stamp(3)
-                x_scales = [got[k][0].bitcast(fx.Float32) for k in range(tokens)]
+                if const_expr(not attn_mxfp8):
+                    x_scales = [got[k][0].bitcast(fx.Float32) for k in range(tokens)]
                 acquire()
                 rows_to_lds(tid, mb("attnq"), tokens, O_K // 4, xs, O_ROW)
+                if const_expr(attn_mxfp8):
+                    rows_to_lds(tid, mb("attnq_sc"), tokens, O_K // 32, osc, OSC_ROW)
             gpu.barrier()
             # B column l % 16 is token l % 16 (token 0 past the last): C column k
             # is token k's rows, the weight stream is the same for any token count
@@ -543,6 +610,16 @@ def o_defs(k4ctx):
             c = fx.Vector.filled(4, 0.0, fx.Float32)
             # chunks kc, kc + 1 in one 16x16x128 FP8 MFMA (unit scales): its lane
             # holds k 16 (l / 16) .. + 16 of each 64-k half -- the chunks' packing
+            if const_expr(attn_mxfp8):
+                sas = [ws_dw[p] >> (g4 * 8) for p in range(O_CPW // 2)]
+                sbs = [
+                    fx.ptr_load(
+                        osc + (col_tok * OSC_ROW + ((wave % 4) * (O_CPW // 2) + p) * 4 + g4)
+                    ).bitcast(fx.Int32)
+                    for p in range(O_CPW // 2)
+                ]
+            else:
+                sas = sbs = [fx.Int32(UNIT_SCALE)] * (O_CPW // 2)
             for p in range_constexpr(O_CPW // 2):
                 xb = [
                     fx.Vector(
@@ -567,8 +644,8 @@ def o_defs(k4ctx):
                         [xb[h][e] for h in range(2) for e in range(4)], fx.Int32
                     ),
                     c,
-                    fx.Int32(UNIT_SCALE),
-                    fx.Int32(UNIT_SCALE),
+                    sas[p],
+                    sbs[p],
                 )
             fx.ptr_store(c, red + (wave * 64 + lane) * 4)
             gpu.barrier()
@@ -577,7 +654,10 @@ def o_defs(k4ctx):
                 grp = (tid % O_ROWS) // 16
                 rr = tid % 16
                 tot = row_sum(red, rr, tk, [grp * 4 + w for w in range(4)])
-                fx.ptr_store(bf16_round(tot * pick(x_scales, tk) * ws), misc + tid)
+                if const_expr(attn_mxfp8):  # the scales are inside the MFMA
+                    fx.ptr_store(bf16_round(tot), misc + tid)
+                else:
+                    fx.ptr_store(bf16_round(tot * pick(x_scales, tk) * ws), misc + tid)
             gpu.barrier()
             # push bf16 partial rows, wave w -> peer w (to itself too); with AG_RS
             # to the row group's owner rank only
