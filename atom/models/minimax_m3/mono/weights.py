@@ -95,6 +95,18 @@ def _mxfp8(
     return w.data, s.data
 
 
+def _attn_gemm(
+    linear, rows: int, cols: int, name: str
+) -> tuple[torch.Tensor, torch.Tensor, bool]:
+    """An attention linear's (weight, scale, native MXFP8?): the ptpc-FP8 requantization
+    (``_ptpc_fp8``: f32 scale a row, per-token activation quant) or the checkpoint's own
+    MXFP8 1x32 (``_mxfp8``: E8M0 scale a 32-block, per-32 activation quant), both over
+    the same (16, 16)-preshuffled fp8 weight."""
+    if linear.quant_type.value == QuantType.per_1x32.value:
+        return (*_mxfp8(linear, rows, cols, name), True)
+    return (*_ptpc_fp8(linear, rows, cols, name), False)
+
+
 def _bf16_vec(t: torch.Tensor, n: int, name: str) -> torch.Tensor:
     _need(
         t.dtype == torch.bfloat16 and t.numel() == n and t.is_contiguous(),
@@ -150,6 +162,9 @@ class SparseMoeLayer:
     s13s: torch.Tensor | None = None
     w2s: torch.Tensor | None = None
     s2s: torch.Tensor | None = None
+    # qkv_proj / o_proj are the checkpoint's MXFP8 1x32 (``s_qkv`` / ``s_o``: E8M0
+    # ``[rows, K / 32]``), not the ptpc-FP8 requantization (f32 ``[rows]``)
+    attn_mxfp8: bool = False
 
     @staticmethod
     def from_layer(layer, layer_id: int, heads: IndexHeads) -> "SparseMoeLayer":
@@ -198,10 +213,13 @@ class SparseMoeLayer:
                 impl.index_cache.dtype == dtypes.fp8,
                 f"layer {layer_id}: index cache {impl.index_cache.dtype}",
             )
-        w_qkv, s_qkv = _ptpc_fp8(
+        w_qkv, s_qkv, mx_qkv = _attn_gemm(
             attn.qkv_proj, heads.rows, HIDDEN, f"layer {layer_id} qkv_proj"
         )
-        w_o, s_o = _ptpc_fp8(attn.o_proj, HIDDEN, O_K, f"layer {layer_id} o_proj")
+        w_o, s_o, mx_o = _attn_gemm(
+            attn.o_proj, HIDDEN, O_K, f"layer {layer_id} o_proj"
+        )
+        _need(mx_qkv == mx_o, f"layer {layer_id}: qkv_proj / o_proj quantized differently")
 
         moe = layer.block_sparse_moe
         experts = moe.experts
@@ -296,6 +314,7 @@ class SparseMoeLayer:
             s13s=s13s,
             w2s=w2s,
             s2s=s2s,
+            attn_mxfp8=mx_qkv,
         )
 
 

@@ -77,14 +77,20 @@ def _weights(g):
     return w, code.cuda().contiguous(), deq.view(ROWS, HIDDEN), q, code
 
 
-def _run(tokens, seed=0, ctx=300):
+def _run(tokens, seed=0, ctx=300, real=None):
+    """``real``: (res [tokens, HIDDEN] bf16, g_in, shuffled fp8 weight, E8M0 scale bytes)
+    instead of the exact-data case (the weights' oracle fields are then None)."""
     g = torch.Generator().manual_seed(seed)
     dev, bf = "cuda", torch.bfloat16
-    res = torch.stack([_residual_row(g) for _ in range(tokens)]).to(bf).to(dev)
+    if real is None:
+        res = torch.stack([_residual_row(g) for _ in range(tokens)]).to(bf).to(dev)
+        g_in = torch.zeros(HIDDEN, dtype=bf, device=dev)
+        w, code, w_deq, q, code_cpu = _weights(g)
+    else:
+        res, g_in, w, code = (t.to(dev) for t in real)
+        w_deq = q = code_cpu = None
     ar = torch.zeros(tokens, HIDDEN, dtype=bf, device=dev)
-    g_in = torch.zeros(HIDDEN, dtype=bf, device=dev)
     gam = torch.zeros(HEAD_DIM, dtype=bf, device=dev)
-    w, code, w_deq, q, code_cpu = _weights(g)
     max_pos = ctx + 8
     cos_sin = torch.zeros(max_pos, ROTARY_DIM, dtype=bf, device=dev)
     positions = torch.full((tokens,), ctx - 1, dtype=torch.int64, device=dev)

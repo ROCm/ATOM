@@ -230,6 +230,17 @@ class MonoDecodeRunner:
             raise MonoUnsupported("KV cache dtype differs between layers")
         if any(lw.shared_mxfp8 != self.shared_mxfp8 for lw in self.sparse):
             raise MonoUnsupported("shared expert fused in some layers only")
+        # the checkpoint's MXFP8 1x32 attention linears (native quantization) or the
+        # ptpc-FP8 requantization: every layer alike (the K1 / K4 builds read one kind)
+        self.attn_mxfp8 = self.sparse[0].attn_mxfp8
+        if any(lw.attn_mxfp8 != self.attn_mxfp8 for lw in self.sparse):
+            raise MonoUnsupported("attention linears quantized differently per layer")
+        if self.attn_mxfp8 and self.dense_mono:
+            raise MonoUnsupported("native MXFP8 attention with a mono dense prefix")
+        logger.info(
+            "MiniMax-M3 mono: attention linears %s",
+            "native MXFP8 1x32" if self.attn_mxfp8 else "ptpc FP8",
+        )
         if self.shared_mxfp8:
             # the unfused shared expert is added to the routed sum as it is
             shared_weight = 1.0
@@ -280,6 +291,7 @@ class MonoDecodeRunner:
             kv_nvfp4=self.nvfp4,
             index_nvfp4=self.nvfp4,
             sh_first=envs.ATOM_MONO_SH_FIRST,
+            attn_mxfp8=self.attn_mxfp8,
         )
         # a dense layer's kernels around its original attention
         if self.dense_mono:

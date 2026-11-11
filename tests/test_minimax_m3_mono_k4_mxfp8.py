@@ -49,7 +49,9 @@ PAGE16 = 16
 NB = O_K // 32
 
 
-def _case(tokens, seed=0):
+def _case(tokens, seed=0, real=None):
+    """``real``: (shuffled fp8 o_proj weight, E8M0 scale bytes, V scale) instead of the exact
+    data (V rows then N(0, 1 / 2^blk) e4m3)."""
     g = torch.Generator().manual_seed(seed)
     dev = "cuda"
     # V rows: e4m3 values with short mantissas (2^j * {1, 1.5}), two per token
@@ -61,6 +63,8 @@ def _case(tokens, seed=0):
         * 2.0 ** torch.randint(-1, 3, (tokens, 2, HEAD_DIM), generator=g)
         * 2.0 ** blk.repeat_interleave(32, dim=-1)
     ).to(dtypes.fp8)
+    if real is not None:
+        v = (torch.randn(tokens, 2, HEAD_DIM, generator=g) * 0.7).to(dtypes.fp8)
     pick = torch.randint(0, 2, (tokens, LOCAL_Q_HEADS), generator=g)  # head's key
     q = torch.where(pick == 0, 1.0, -1.0)[:, :, None].expand(-1, -1, HEAD_DIM)
     q = q.reshape(tokens, O_K).to(torch.bfloat16).to(dev)
@@ -93,14 +97,16 @@ def _case(tokens, seed=0):
         wq.double().view(HIDDEN, NB, 32) * _pow2(code.double() - 127)[..., None]
     ).view(HIDDEN, O_K)
     w = shuffle_weight(wq.to(dtypes.fp8).to(dev), layout=(16, 16)).contiguous()
+    if real is not None:
+        w, code, w_deq, wq, code = real[0].to(dev), real[1], None, None, real[1]
     return dict(
         q=q, kc=kc.to(dev), vc=vc.to(dev), ks=ks.to(dev), vs=vs.to(dev),
         bt=block_table.to(dev), seq=seq.to(dev), a=a, w=w, code=code.to(dev), w_deq=w_deq, wq=wq, code_cpu=code,
     )  # fmt: skip
 
 
-def _run(tokens):
-    c = _case(tokens)
+def _run(tokens, real=None):
+    c = _case(tokens, real=real)
     dev = torch.device("cuda")
     z = lambda *shape, dt=torch.uint8: torch.zeros(*shape, dtype=dt, device=dev)
     E = N_ROUTED
