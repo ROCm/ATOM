@@ -676,20 +676,29 @@ def build_resident_k1(
                             accumulators1[tile],
                         )
                         gpu.barrier()
+            # Every accumulator first, then one cross-wave reduction of them all.
+            slot_words = plan.kda_accumulator_lds_elements
+            for task_offset in range_constexpr(PROJECTION_ROWS_PER_CTA):
+                accumulators = (
+                    accumulators0 if const_expr(task_offset == 0) else accumulators1
+                )
+                for tile in range_constexpr(len(tile_starts)):
+                    compute["kda_gemv_store"](
+                        accumulators[tile],
+                        projection.acc.ptr
+                        + (task_offset * len(tile_starts) + tile) * slot_words,
+                        wave,
+                        lane,
+                    )
+            gpu.barrier()
             for task_offset in range_constexpr(PROJECTION_ROWS_PER_CTA):
                 task = first_task + task_offset
                 if task < PROJECTION_TASKS:
-                    accumulators = (
-                        accumulators0 if const_expr(task_offset == 0) else accumulators1
-                    )
                     for tile in range_constexpr(len(tile_starts)):
-                        compute["kda_gemv_store"](
-                            accumulators[tile],
-                            smem.red.ptr,
-                            wave,
-                            lane,
+                        slot = (
+                            projection.acc.ptr
+                            + (task_offset * len(tile_starts) + tile) * slot_words
                         )
-                        gpu.barrier()
                         work_items = tile_rows[tile] * ROWS
                         for iteration in range_constexpr(
                             (work_items + declaration.threads - 1)
@@ -700,11 +709,7 @@ def build_resident_k1(
                                 local_token = work // ROWS
                                 row = work % ROWS
                                 value = fx.Float32(
-                                    compute["kda_gemv_row_sum"](
-                                        smem.red.ptr,
-                                        row,
-                                        local_token,
-                                    )
+                                    compute["kda_gemv_row_sum"](slot, row, local_token)
                                 ).to(fx.BFloat16)
                                 value = fx.Float32(value)
                                 global_token = tile_starts[tile] + local_token
@@ -714,7 +719,7 @@ def build_resident_k1(
                                     value,
                                     generation,
                                 )
-                        gpu.barrier()
+            gpu.barrier()
             device["wait_vector_stores"]()
 
         recurrence_context = {

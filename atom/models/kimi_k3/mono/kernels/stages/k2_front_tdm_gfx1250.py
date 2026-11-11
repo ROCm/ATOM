@@ -44,6 +44,8 @@ LATENT_PAIR0 = ROUTER_TASKS // 2
 SHARED_PAIR0 = (ROUTER_TASKS + LATENT_TASKS) // 2
 PAIRS = (ROUTER_TASKS + LATENT_TASKS + SHARED_TASKS) // 2
 ACCUMULATOR_WORDS = WAVES * GFX1250.wave_size * gemv_gfx1250.ACCUMULATOR_ELEMENTS
+# The projection epilogue reduces both tasks of a tile in one round.
+assert THREADS == 2 * ROWS * 8
 
 REPLICATED_FRONT_ABI = KernelAbi(
     (
@@ -83,7 +85,8 @@ def build_replicated_front(plan: Gfx1250KimiBuildPlan) -> K2ReplicatedFrontKerne
     @fx.struct
     class Lds:
         gemv: fx.Array[fx.Int32, staged, 16]
-        red: fx.Array[fx.Float32, ACCUMULATOR_WORDS, 16]
+        # Both tasks' accumulators of every tile.
+        red: fx.Array[fx.Float32, 2 * tiles * ACCUMULATOR_WORDS, 16]
         # Per token, 32 projected latent columns or 16 shared gate then 16 up
         # columns, as 16 BF16 pairs.
         group: fx.Array[fx.Int32, rows * 16, 16]
@@ -142,47 +145,41 @@ def build_replicated_front(plan: Gfx1250KimiBuildPlan) -> K2ReplicatedFrontKerne
                 wave,
             )
             for tile in range_constexpr(tiles):
-                tile_rows = min(ROWS, rows - tile * ROWS)
                 for task in range_constexpr(2):
-                    gpu.barrier()
                     gemv_gfx1250.store_accumulator(
-                        accumulators[task][tile], lds.red.ptr, wave, lane
+                        accumulators[task][tile],
+                        lds.red.ptr + (2 * tile + task) * ACCUMULATOR_WORDS,
+                        wave,
+                        lane,
                     )
-                    gpu.barrier()
-                    if tid < ROWS * 8:
-                        local_token = tid // 8
-                        row_pair = tid % 8
-                        token = tile * ROWS + local_token
-                        low = gemv_gfx1250.row_sum(
-                            lds.red.ptr, 2 * row_pair, local_token, WAVES
+            gpu.barrier()
+            # A round reduces one tile: threads [0, 128) the first task, the
+            # rest the second.
+            task = tid // (ROWS * 8)
+            for tile in range_constexpr(tiles):
+                tile_rows = min(ROWS, rows - tile * ROWS)
+                slot = lds.red.ptr + (2 * tile + task) * ACCUMULATOR_WORDS
+                local_token = tid % (ROWS * 8) // 8
+                row_pair = tid % 8
+                token = tile * ROWS + local_token
+                low = gemv_gfx1250.row_sum(slot, 2 * row_pair, local_token, WAVES)
+                high = gemv_gfx1250.row_sum(slot, 2 * row_pair + 1, local_token, WAVES)
+                row = row0 + task * ROWS + 2 * row_pair
+                packed = (
+                    fx.Vector.from_elements([low, high], fx.Float32)
+                    .to(fx.BFloat16)
+                    .bitcast(fx.Int32)[0]
+                )
+                if local_token < tile_rows:
+                    if router:
+                        bo.buffer_store(low, rsrc(router_logits), token * EXPERTS + row)
+                        bo.buffer_store(
+                            high, rsrc(router_logits), token * EXPERTS + row + 1
                         )
-                        high = gemv_gfx1250.row_sum(
-                            lds.red.ptr, 2 * row_pair + 1, local_token, WAVES
+                    else:
+                        fx.ptr_store(
+                            packed, lds.group.ptr + token * 16 + task * 8 + row_pair
                         )
-                        row = row0 + task * ROWS + 2 * row_pair
-                        packed = (
-                            fx.Vector.from_elements([low, high], fx.Float32)
-                            .to(fx.BFloat16)
-                            .bitcast(fx.Int32)[0]
-                        )
-                        if local_token < tile_rows:
-                            if router:
-                                bo.buffer_store(
-                                    low, rsrc(router_logits), token * EXPERTS + row
-                                )
-                                bo.buffer_store(
-                                    high,
-                                    rsrc(router_logits),
-                                    token * EXPERTS + row + 1,
-                                )
-                            else:
-                                fx.ptr_store(
-                                    packed,
-                                    lds.group.ptr
-                                    + token * 16
-                                    + task * 8
-                                    + row_pair,
-                                )
             gpu.barrier()
             if pair >= SHARED_PAIR0:
                 for round_index in range_constexpr((rows * 8 + THREADS - 1) // THREADS):

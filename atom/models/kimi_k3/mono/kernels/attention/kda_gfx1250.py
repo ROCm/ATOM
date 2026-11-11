@@ -1148,7 +1148,7 @@ def emit_role_lds_types(spec):
     if expected != (
         {"red", "tls"},
         {"vals"},
-        {"xl"},
+        {"xl", "acc"},
         {
             "fa",
             "qkl",
@@ -1169,6 +1169,7 @@ def emit_role_lds_types(spec):
     @fx.struct
     class GemvLds:
         xl: fx.Array[fx.Int32, projection["xl"].elements, 16]
+        acc: fx.Array[fx.Float32, projection["acc"].elements, 16]
 
     @fx.struct
     class KdaLds:

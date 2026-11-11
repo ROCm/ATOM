@@ -31,6 +31,8 @@ WAVES = 8
 ROWS = 16
 PAIRS = HIDDEN // (2 * ROWS)
 ACCUMULATOR_WORDS = WAVES * GFX1250.wave_size * gemv_gfx1250.ACCUMULATOR_ELEMENTS
+# The epilogue reduces both tasks of a tile in one round.
+assert THREADS == 2 * ROWS * 8
 
 REPLICATED_FINALIZE_ABI = KernelAbi(("routed_normed", "shared", "up_weight", "output"))
 
@@ -58,7 +60,8 @@ def build_replicated_finalize(plan: Gfx1250KimiBuildPlan) -> K2ReplicatedFinaliz
     @fx.struct
     class Lds:
         gemv: fx.Array[fx.Int32, sum(tdm_lds_words(rows, 2)), 16]
-        red: fx.Array[fx.Float32, ACCUMULATOR_WORDS, 16]
+        # Both tasks' accumulators of every tile.
+        red: fx.Array[fx.Float32, 2 * tiles * ACCUMULATOR_WORDS, 16]
 
     name = f"k3_k2_gfx1250_replicated_finalize_s{rows}"
 
@@ -72,6 +75,21 @@ def build_replicated_finalize(plan: Gfx1250KimiBuildPlan) -> K2ReplicatedFinaliz
         lane = tid % GFX1250.wave_size
         wave = tid // GFX1250.wave_size
         lds = fx.SharedAllocator().allocate(Lds).peek()
+        # Threads [0, 128) finish a tile's first task, the rest its second; the
+        # shared rows they add are loaded before the projection.
+        task = tid // (ROWS * 8)
+        local_token = tid % (ROWS * 8) // 8
+        row_pair = tid % 8
+        locations = [
+            (fx.min(tile * ROWS + local_token, rows - 1) * HIDDEN + row0 + task * ROWS)
+            // 2
+            + row_pair
+            for tile in range_constexpr(tiles)
+        ]
+        bases = [
+            fx.Int32(bo.buffer_load(rsrc(shared), location, vec_width=1, dtype=T.i32))
+            for location in locations
+        ]
         accumulators = gemv_tdm.project(
             lds.gemv.ptr,
             routed_normed,
@@ -85,40 +103,32 @@ def build_replicated_finalize(plan: Gfx1250KimiBuildPlan) -> K2ReplicatedFinaliz
             wave,
         )
         for tile in range_constexpr(tiles):
-            for task in range_constexpr(2):
-                gpu.barrier()
+            for index in range_constexpr(2):
                 gemv_gfx1250.store_accumulator(
-                    accumulators[task][tile], lds.red.ptr, wave, lane
+                    accumulators[index][tile],
+                    lds.red.ptr + (2 * tile + index) * ACCUMULATOR_WORDS,
+                    wave,
+                    lane,
                 )
-                gpu.barrier()
-                if tid < ROWS * 8:
-                    local_token = tid // 8
-                    row_pair = tid % 8
-                    token = tile * ROWS + local_token
-                    if local_token < min(ROWS, rows - tile * ROWS):
-                        location = (token * HIDDEN + row0 + task * ROWS) // 2 + row_pair
-                        base = fx.Int32(
-                            bo.buffer_load(rsrc(shared), location, vec_width=1, dtype=T.i32)
-                        )
-                        low = bf16_round(
-                            bf_lo(base)
-                            + gemv_gfx1250.row_sum(
-                                lds.red.ptr, 2 * row_pair, local_token, WAVES
-                            )
-                        )
-                        high = bf16_round(
-                            bf_hi(base)
-                            + gemv_gfx1250.row_sum(
-                                lds.red.ptr, 2 * row_pair + 1, local_token, WAVES
-                            )
-                        )
-                        bo.buffer_store(
-                            fx.Vector.from_elements([low, high], fx.Float32)
-                            .to(fx.BFloat16)
-                            .bitcast(fx.Int32)[0],
-                            rsrc(output),
-                            location,
-                        )
+        gpu.barrier()
+        for tile in range_constexpr(tiles):
+            slot = lds.red.ptr + (2 * tile + task) * ACCUMULATOR_WORDS
+            if local_token < min(ROWS, rows - tile * ROWS):
+                low = bf16_round(
+                    bf_lo(bases[tile])
+                    + gemv_gfx1250.row_sum(slot, 2 * row_pair, local_token, WAVES)
+                )
+                high = bf16_round(
+                    bf_hi(bases[tile])
+                    + gemv_gfx1250.row_sum(slot, 2 * row_pair + 1, local_token, WAVES)
+                )
+                bo.buffer_store(
+                    fx.Vector.from_elements([low, high], fx.Float32)
+                    .to(fx.BFloat16)
+                    .bitcast(fx.Int32)[0],
+                    rsrc(output),
+                    locations[tile],
+                )
 
     @flyc.jit
     def launch(

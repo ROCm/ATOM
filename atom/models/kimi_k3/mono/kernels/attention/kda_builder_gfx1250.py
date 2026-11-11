@@ -455,9 +455,14 @@ def role_lds_plan(
         tile_rows * xrow * 2,
         tdm_lds_bytes(plan.tokens, PROJECTION_TASKS_PER_CTA),
     )
-    if smem_bytes + projection_bytes > plan.lds_bytes:
+    # Every task's and tile's accumulator, so one barrier ends the projection.
+    accumulator_bytes = (
+        PROJECTION_TASKS_PER_CTA * plan.token_tiling.tile_count * red_elements * 4
+    )
+    if smem_bytes + projection_bytes + accumulator_bytes > plan.lds_bytes:
         raise ValueError(
-            f"gfx1250 K1 projection needs {smem_bytes + projection_bytes} LDS bytes, "
+            "gfx1250 K1 projection needs "
+            f"{smem_bytes + projection_bytes + accumulator_bytes} LDS bytes, "
             f"candidate has {plan.lds_bytes}"
         )
 
@@ -467,7 +472,7 @@ def role_lds_plan(
     )
     projection = RoleLdsVariant(
         "projection",
-        _fields(("xl", projection_bytes)),
+        _fields(("xl", projection_bytes), ("acc", accumulator_bytes)),
     )
     state_width = HEAD_DIM
     recurrence = RoleLdsVariant(
@@ -501,6 +506,7 @@ def role_lds_type_spec(layout: K1RoleLdsPlan) -> K1LdsTypeSpec:
         "tls": "i64",
         "vals": "f32",
         "xl": "i32",
+        "acc": "f32",
         "fa": "f32",
         "qkl": "f32",
         "decay": "f32",
