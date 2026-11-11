@@ -409,8 +409,9 @@ class CommFusedMoeBackend:
             before_shared_add=before_shared_add,
             stage2_stream=stage2_stream,
             reduce_scatter_sizes=reduce_scatter_sizes,
-            # Routing sends the rows past `scheduled_tokens_gpu` to expert -1.
-            routes_may_be_missing=True,
+            # Rows past `scheduled_tokens_gpu` (and DPA pad rows) go to expert
+            # -1 as whole rows; each reduces into itself and is dropped, so
+            # their unwritten route scratch needs no clear.
             # The DPA input-gather phase completes only after every rank has
             # entered this invocation. It therefore also proves that every peer
             # finished reading the previous Direct partial before Stage2 reuses

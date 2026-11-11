@@ -44,7 +44,7 @@ Caller contract (`swa_write`):
                         the ring size `window_size + max_spec_steps` (e.g.
                         128 + 0 = 128 non-MTP; 128 + 1 = 129 MTP-1).
 - `write_per_batch`     int — max tokens to write per seq this fwd
-                        (= `min(max_q_len, window.ring_slots)`). Sets grid Y;
+                        (at most `window.ring_slots`). Sets grid Y;
                         read from the launch grid inside the kernel.
 
 Grid = `(bs, write_per_batch)`; each program writes one (seq, row-in-seq)
@@ -201,8 +201,8 @@ def swa_write(
             the plane relative to this view's base.
         window: this layer's compress class's `WindowParams`
             (`UnifiedPoolGeometry.window_params`).
-        write_per_batch: `min(max_q_len, window.ring_slots)` — max tokens written
-            per seq this fwd (grid y dim).
+        write_per_batch: max tokens written per seq this fwd (grid y dim), at
+            most `window.ring_slots`; a seq shorter than it writes all its rows.
         k_packed: [T, 512] or [T, 1, 512] fp8 NoPE extend K — fp8 2buff path only.
         k_rope: [T, rope_head_dim] or [T, 1, rope_head_dim] bf16 RoPE tail — fp8
             2buff path only.
@@ -529,7 +529,52 @@ def _update_compressor_states_kernel(
 
     Score write fuses ape lookup: `score + ape[position % RATIO]`.
     """
-    pid = tl.program_id(0)
+    write_compressor_state_row(
+        tl.program_id(0),
+        kv_ptr,
+        kv_row_stride,
+        score_ptr,
+        score_row_stride,
+        ape_ptr,
+        write_plan_ptr,
+        state_slot_mapping_ptr,
+        kv_state_ptr,
+        kv_state_slot_stride,
+        kv_state_pos_stride,
+        score_state_ptr,
+        score_state_slot_stride,
+        score_state_pos_stride,
+        dim,
+        STATE_SIZE,
+        RATIO,
+        BLOCK_D,
+    )
+
+
+@triton.jit
+def write_compressor_state_row(
+    pid,
+    kv_ptr,
+    kv_row_stride,
+    score_ptr,
+    score_row_stride,
+    ape_ptr,
+    write_plan_ptr,
+    state_slot_mapping_ptr,
+    kv_state_ptr,
+    kv_state_slot_stride,
+    kv_state_pos_stride,
+    score_state_ptr,
+    score_state_slot_stride,
+    score_state_pos_stride,
+    dim,
+    STATE_SIZE: tl.constexpr,
+    RATIO: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Write plan row ``pid`` into the ring (`_update_compressor_states_kernel`'s
+    one program; also run by `fused_compress_attn` when it takes the ring
+    update into its own launch)."""
     plan_base = write_plan_ptr + pid * 4
     ragged_id = tl.load(plan_base + 0)
     batch_id = tl.load(plan_base + 1)

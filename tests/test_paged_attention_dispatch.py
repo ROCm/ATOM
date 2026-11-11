@@ -22,6 +22,7 @@ import importlib.util
 import sys
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 pytest.importorskip("triton", reason="base_attention defines @triton.jit kernels")
@@ -321,6 +322,74 @@ def _route(monkeypatch, max_qlen, block_size=128, unified=False, force=False, **
         lambda: SimpleNamespace(kv_cache_block_size=block_size),
     )
     return mha.PagedAttentionImpl._dispatch_decode(_Layer(**kw), max_qlen)
+
+
+class TestRaggedQueries:
+    """Which decode kernels read each sequence's query rows off `cu_seqlens_q`
+    (ragged decode safe), measured against varlen references on gfx950:
+    `pa_fwd_asm` and unified do; `run_pa_decode` takes `max_qlen` only and the
+    persistent PA kernels lay sequences `max_qlen` rows apart."""
+
+    @staticmethod
+    def _reads_ragged(monkeypatch, max_qlen, **kw):
+        from atom.model_ops import attention_mha as mha
+
+        flags = {k: kw.pop(k) for k in ("block_size", "unified", "force") if k in kw}
+        _route(monkeypatch, max_qlen, **flags, **kw)
+        layer = _Layer(**kw)
+        layer._dispatch_decode = lambda q: mha.PagedAttentionImpl._dispatch_decode(
+            layer, q
+        )
+        layer._flydsl_may_take_decode = (
+            lambda: mha.PagedAttentionImpl._flydsl_may_take_decode(layer)
+        )
+        return mha.PagedAttentionImpl.decode_reads_ragged_queries(layer, max_qlen)
+
+    def test_asm_reads_ragged_queries(self, monkeypatch):
+        assert self._reads_ragged(monkeypatch, 1)
+
+    def test_run_pa_decode_does_not(self, monkeypatch):
+        assert not self._reads_ragged(monkeypatch, 4)
+        assert not self._reads_ragged(monkeypatch, 1, use_triton_attn=True)
+
+    def test_unified_reads_ragged_queries(self, monkeypatch):
+        assert self._reads_ragged(monkeypatch, 5)
+
+    def test_persistent_pa_does_not(self, monkeypatch):
+        assert not self._reads_ragged(monkeypatch, 1, block_size=256, unified=True)
+
+    @pytest.mark.parametrize("rectangular", [False, True])
+    def test_a_ragged_step_is_refused_only_with_a_rectangular_layer(self, rectangular):
+        from atom.model_ops import attention_mha as mha
+        from atom.model_ops.attentions import aiter_attention as aa
+
+        def impl(reads_ragged):
+            cls = type(
+                "Impl",
+                (mha.PagedAttentionImpl,),
+                {"decode_reads_ragged_queries": lambda self, q: reads_ragged},
+            )
+            return cls.__new__(cls)
+
+        sfc = {
+            "layers.0.attn": SimpleNamespace(impl=impl(True)),
+            "layers.1.attn": SimpleNamespace(impl=impl(not rectangular)),
+            "layers.1.mlp": SimpleNamespace(),
+        }
+        builder = SimpleNamespace(
+            model_runner=SimpleNamespace(
+                config=SimpleNamespace(
+                    compilation_config=SimpleNamespace(static_forward_context=sfc)
+                )
+            )
+        )
+        refuse = aa.AiterAttentionMetadataBuilder._refuse_ragged_on_rectangular_layers
+        lengths = np.array([2, 1], dtype=np.int32)
+        if rectangular:
+            with pytest.raises(ValueError, match=r"layers\.1\.attn .*one query length"):
+                refuse(builder, lengths, 2)
+        else:
+            refuse(builder, lengths, 2)
 
 
 class TestDecodeRouting:
@@ -837,7 +906,7 @@ class TestWorkPlanWiring:
         guard in the op rebuilds a compatible explicit plan, so the defect
         would come back as extra planner work instead of a crash.
 
-        AST rather than behaviour, because ``prepare_decode`` needs a model
+        AST rather than behaviour, because ``finish_decode`` needs a model
         runner to drive. It is exact about the one thing that went wrong -- the
         expression handed to ``refresh_flydsl_plan`` -- and goes red on any
         slice at the two target sites, or on a draft slice that stops naming
@@ -879,7 +948,7 @@ class TestWorkPlanWiring:
         assert creates.get(
             "build_for_cudagraph_capture"
         ), "capture must pass create=; without it no plan is ever minted"
-        assert not creates.get("prepare_decode"), (
+        assert not creates.get("finish_decode"), (
             "replay must not mint plans: that is a mid-serving kernel "
             "specialization for a batch no graph replays"
         )
@@ -887,7 +956,7 @@ class TestWorkPlanWiring:
 
         # Target passes: the whole buffer, which is already running_bs long
         # with the padded tail zeroed. A zero-length row gets no work.
-        for name in ("prepare_decode", "build_for_cudagraph_capture"):
+        for name in ("finish_decode", "build_for_cudagraph_capture"):
             assert name in args, f"{name} no longer builds a plan"
             for arg in args[name]:
                 assert isinstance(arg, ast.Attribute) and arg.attr == "context_lens", (
@@ -1222,7 +1291,7 @@ class TestExplicitPlan:
 
         Checks the argument only. That ``decode_md`` is built fresh every step
         is the builders' doing: ``make_sparse_decode_metadata`` from
-        ``AiterAttentionMetadataBuilder.prepare_decode`` (native) and
+        ``AiterAttentionMetadataBuilder.finish_decode`` (native) and
         ``MinimaxM3SparseAttentionMetadataBuilder.build`` (vLLM).
         """
         import ast
@@ -1273,23 +1342,47 @@ class TestExplicitPlan:
         ubatch[0] = 0
         assert self._call(ba, owner=step, cache_owner=step) is ub0
 
-    def test_old_aiter_api_takes_gluon(self, monkeypatch):
-        """An aiter without #5809's required work plan must not be routed."""
+    def test_explicit_plan_api_ignores_the_plan_default(self, monkeypatch):
+        """aiter defaults work_plan to None for MXFP4; ATOM always passes one."""
         from atom.model_ops import base_attention as ba
 
         mod = importlib.import_module("aiter.ops.flydsl.pa_decode")
 
-        def optional_plan(output, *a, work_plan=None, max_context_length=None):
+        def required(output, *a, work_plan, max_context_length=None):
+            raise AssertionError("not called")
+
+        def optional_none(output, *a, work_plan=None, max_context_length=None):
+            raise AssertionError("not called")
+
+        def other_default(output, *a, work_plan=..., max_context_length=None):
+            raise AssertionError("not called")
+
+        def positional_plan(output, work_plan=None, max_context_length=None):
+            raise AssertionError("not called")
+
+        def no_plan(output, *a, max_context_length=None):
             raise AssertionError("not called")
 
         def no_bound(output, *a, work_plan, sinks=None):
             raise AssertionError("not called")
 
+        cases = (
+            (required, True),
+            (optional_none, True),
+            (other_default, True),
+            (positional_plan, False),
+            (no_plan, False),
+            (no_bound, False),
+        )
         try:
-            for old in (optional_plan, no_bound):
-                monkeypatch.setattr(mod, "pa_decode", old)
+            for fake, expected in cases:
+                monkeypatch.setattr(mod, "pa_decode", fake)
                 ba._flydsl_explicit_plan_api.cache_clear()
-                assert ba._flydsl_explicit_plan_api() is False, old.__name__
+                assert ba._flydsl_explicit_plan_api() is expected, fake.__name__
+            monkeypatch.setattr(mod, "pa_decode", required)
+            monkeypatch.delattr(mod, "plan_pa_decode")
+            ba._flydsl_explicit_plan_api.cache_clear()
+            assert ba._flydsl_explicit_plan_api() is False, "no plan_pa_decode"
         finally:
             monkeypatch.undo()
             ba._flydsl_explicit_plan_api.cache_clear()
