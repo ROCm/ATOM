@@ -1087,10 +1087,10 @@ class TestSchedule:
         sched.waiting.append(resume)
 
         # The finished id has already been consumed. A decode now needs a
-        # second block, preempts, and returns ahead of the allocated resume.
+        # second block, preempts, and returns behind the allocated resume.
         assert not sched.block_manager.can_append(preempted, 1, 0)
         assert sched.preempt(preempted)
-        assert list(sched.waiting) == [preempted, resume]
+        assert list(sched.waiting) == [resume, preempted]
         assert sched.block_manager.can_allocate(preempted) < 0
         assert not sched.finished_recving_kv_req_ids
 

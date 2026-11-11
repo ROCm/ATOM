@@ -4152,7 +4152,21 @@ class Scheduler:
         # surrendered blocks (the mutator half of `should_defer_free`'s escape).
         self._connector_release_stalled_save(seq)
         self.block_manager.deallocate(seq)
-        self.waiting.appendleft(seq)
+        # Behind the settled offload resumes at the head, which hold blocks and
+        # are promoted once, when their load ends. A preempted head that cannot
+        # allocate stops admission, so in front of them it would starve the
+        # resume holding the blocks it needs. In-flight loads at the head are
+        # skipped by admission and do not count as ahead.
+        pos = 0
+        if getattr(getattr(self, "kv_connector", None), "is_offload", False):
+            for queued in self.waiting:
+                if (
+                    queued.status != SequenceStatus.WAITING_FOR_REMOTE_KVS
+                    and not self._is_offload_prefill_resume(queued)
+                ):
+                    break
+                pos += 1
+        self.waiting.insert(pos, seq)
         return True
 
     def _advance_prefill_on_schedule(
@@ -5069,19 +5083,19 @@ class Scheduler:
     def _prioritize_ready_remote_kv_requests(self) -> None:
         """Prioritize completed remote requests before sizing prefill work.
 
-        Offload completions are resolved once here, but a settled resume that
-        keeps its blocks stays ahead of fresh or preempted admissions on every
-        tick. Otherwise a preempted head can fail allocation while the resume
-        behind it holds the blocks needed to make progress. A P/D-only receive
-        is only reordered here; admission resolves it before its first decode.
+        Runs only when a load completed or failed. Offload
+        completions are resolved here, and every settled resume that keeps its
+        blocks (not only the ones that just completed) moves ahead of the
+        other waiters in one stable pass. Nothing is re-sorted on the ticks
+        after: the one way a blocker gets ahead of a resume is `preempt`, which
+        queues behind them. A P/D-only receive is only
+        reordered here; admission resolves it before its first decode.
         """
         if not self.waiting:
             return
-        resolve = self._connector_flag("is_offload")
-        if not resolve and not (
-            self.finished_recving_kv_req_ids or self.failed_recving_kv_req_ids
-        ):
+        if not (self.finished_recving_kv_req_ids or self.failed_recving_kv_req_ids):
             return
+        resolve = self._connector_flag("is_offload")
         ready: deque[Sequence] = deque()
         blocked: deque[Sequence] = deque()
         while self.waiting:
