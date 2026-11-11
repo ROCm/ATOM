@@ -1102,6 +1102,166 @@ class TestSchedule:
         assert preempted in sched.waiting
         assert sched._num_parked_remote_kv == 0
 
+    @staticmethod
+    def _offload_sched(num_blocks):
+        sched = Scheduler(
+            MockConfig(
+                max_num_seqs=4,
+                max_num_batched_tokens=32,
+                num_kvcache_blocks=num_blocks,
+                kv_cache_block_size=16,
+            )
+        )
+
+        class _Connector(_OffloadMixinStub):
+            _do_load = False
+
+            def get_num_new_matched_tokens(self, seq):
+                return 0, False
+
+            def build_connector_meta(self):
+                return None
+
+            def update_state_after_alloc(self, seq): ...
+
+        sched.kv_connector = _Connector()
+        return sched
+
+    @staticmethod
+    def _settled_resume(sched, first_token, failed=False):
+        """A two-block request whose offload load already settled: it keeps its
+        blocks and is not in flight any more."""
+        seq = Sequence(
+            list(range(first_token, first_token + 32)),
+            16,
+            SamplingParams(max_tokens=2),
+        )
+        assert sched.block_manager.allocate(seq)
+        seq.status = SequenceStatus.WAITING
+        seq.num_cached_tokens = 16
+        seq.offload_loaded = not failed
+        seq.offload_load_failed = failed
+        sched._count_inflight_load(seq)
+        return seq
+
+    @staticmethod
+    def _in_flight_load(sched, first_token, blocks=True):
+        seq = Sequence(
+            list(range(first_token, first_token + 32)),
+            16,
+            SamplingParams(max_tokens=2),
+        )
+        if blocks:
+            assert sched.block_manager.allocate(seq)
+        seq.num_cached_tokens = 16
+        seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+        sched._count_inflight_load(seq)
+        return seq
+
+    def test_preempted_head_queues_behind_settled_resumes_and_all_finish(self):
+        """Over many ticks: two settled resumes hold four of five blocks and a
+        decode preempts. The victim queues behind both, in their order, and the
+        pool drains: resumes first, then the victim. At the head instead it
+        cannot allocate, admission stops there every tick, and the resumes that
+        would free its blocks never run."""
+        sched = self._offload_sched(5)
+        first = self._settled_resume(sched, 100)
+        second = self._settled_resume(sched, 200)
+        victim = Sequence(list(range(16)), 16, SamplingParams(max_tokens=2))
+        assert sched.block_manager.allocate(victim)
+        victim.status = SequenceStatus.RUNNING
+        victim.num_cached_tokens = 16
+        victim.append_token(77)
+        sched.running.append(victim)
+        sched.waiting.extend([first, second])
+        assert not sched.block_manager.can_append(victim, 1, 0)
+        sched.running.remove(victim)
+        assert sched.preempt(victim)
+        assert list(sched.waiting) == [first, second, victim]
+
+        admitted = []
+        for _ in range(30):
+            out = sched.schedule()
+            if out is not None:
+                batch, _ = out
+                admitted.extend(r for r in batch.req_ids if r not in admitted)
+                _step(sched, batch, batch.req_ids)
+            if not sched.waiting and not sched.running:
+                break
+
+        assert admitted == [first.id, second.id, victim.id]
+        for seq in (first, second, victim):
+            assert seq.status == SequenceStatus.FINISHED
+        assert sched._num_parked_remote_kv == 0
+
+    def test_preempt_queues_behind_the_resume_past_an_in_flight_load(self):
+        """An in-flight load at the head is skipped by admission, so it does not
+        count as ahead: the victim still goes behind the resume after it."""
+        sched = self._offload_sched(5)
+        in_flight = self._in_flight_load(sched, 300, blocks=False)
+        resume = self._settled_resume(sched, 100)
+        victim = Sequence(list(range(17)), 16, SamplingParams(max_tokens=2))
+        victim.status = SequenceStatus.RUNNING
+        sched.waiting.extend([in_flight, resume])
+
+        assert sched.preempt(victim)
+        assert list(sched.waiting) == [in_flight, resume, victim]
+        batch, _ = sched.schedule()
+        assert list(batch.req_ids) == [resume.id]
+
+    def test_an_idle_tick_leaves_the_waiting_queue_alone(self):
+        """Without a finished or failed id nothing is scanned, however long the
+        queue: a settled resume is promoted once, when its load ends, and
+        `preempt` keeps it in front afterwards. Ready loads keep arrival order
+        ahead of everyone else."""
+        sched = self._offload_sched(8)
+        early = self._settled_resume(sched, 100)
+        late = self._in_flight_load(sched, 200)
+        fresh = [Sequence(list(range(i, i + 8)), 16) for i in (400, 500)]
+        sched.waiting.extend([fresh[0], early, fresh[1], late])
+
+        with mock.patch.object(
+            sched,
+            "_is_offload_prefill_resume",
+            wraps=sched._is_offload_prefill_resume,
+        ) as scan:
+            sched._prioritize_ready_remote_kv_requests()
+            assert scan.call_count == 0
+            assert list(sched.waiting) == [fresh[0], early, fresh[1], late]
+
+            sched.finished_recving_kv_req_ids.append(late.id)
+            sched._prioritize_ready_remote_kv_requests()
+            assert scan.call_count == 4
+
+        assert list(sched.waiting) == [early, late, fresh[0], fresh[1]]
+        assert late.status == SequenceStatus.WAITING and late.offload_loaded
+
+    def test_failed_load_without_blocks_does_not_jump_a_resume(self):
+        sched = self._offload_sched(8)
+        resume = self._settled_resume(sched, 100)
+        lost = self._in_flight_load(sched, 200, blocks=False)
+        fresh = Sequence(list(range(400, 408)), 16)
+        sched.waiting.extend([lost, fresh, resume])
+        sched.failed_recving_kv_req_ids.append(lost.id)
+
+        sched._prioritize_ready_remote_kv_requests()
+
+        assert lost.status == SequenceStatus.WAITING and lost.offload_load_failed
+        assert list(sched.waiting) == [resume, lost, fresh]
+
+    def test_a_failed_load_alone_opens_the_promotion(self):
+        sched = self._offload_sched(8)
+        fresh = Sequence(list(range(400, 408)), 16)
+        failed = self._in_flight_load(sched, 200)
+        sched.waiting.extend([fresh, failed])
+        sched.failed_recving_kv_req_ids.append(failed.id)
+        assert not sched.finished_recving_kv_req_ids
+
+        sched._prioritize_ready_remote_kv_requests()
+
+        assert failed.offload_load_failed
+        assert list(sched.waiting) == [failed, fresh]
+
     def test_offload_parked_count_released_only_after_resume(self, seq_factory):
         sched = Scheduler(
             MockConfig(
