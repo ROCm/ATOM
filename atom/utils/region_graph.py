@@ -183,10 +183,18 @@ class _Recorder:
         self.begin()
         delivered = self._deliver(result, args, kwargs)
         bound = inspect.signature(fn).bind(*args, **kwargs)
+        # A replay reads what ``live`` returns afresh, so the recording keeps
+        # none of it: a step it held would keep that bucket's step-sized
+        # tables alive, one set per bucket beside the shared pool.
+        taken_live = () if live is None else live().keys()
         self._steps.append(
             _EagerStep(
                 fn,
-                {k: _weak(v) for k, v in bound.arguments.items()},
+                {
+                    k: _weak(v)
+                    for k, v in bound.arguments.items()
+                    if k not in taken_live
+                },
                 live,
                 stream,
                 None if delivered is None else weak_ref_tensor(delivered),
@@ -361,7 +369,8 @@ class TokenGraph:
     `ReqGraph`'s included. Recordings never overlap -- one module's run in
     stream order, a module's output consumed before the next one replays --
     the same as two replays of one bucket, so the pool is the largest
-    recording's, not their sum.
+    recording's, not their sum. Outside it, a module holds its input buffers
+    and no bucket's step: what a region takes live is never kept.
     """
 
     _pool = None
