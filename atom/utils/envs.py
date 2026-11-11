@@ -301,6 +301,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_USE_TRITON_MXFP4_BMM", "0") == "1"
     ),
     "ATOM_USE_TRITON_MLA": lambda: os.getenv("ATOM_USE_TRITON_MLA", "0") == "1",
+    # Kimi-K3 attn-res on gfx1250: Gluon kernel that streams the candidate rows
+    # through LDS with TDM. 0 falls back to the Triton kernel.
+    "ATOM_KIMI_K3_ATTN_RES_GLUON_TDM": lambda: (
+        os.getenv("ATOM_KIMI_K3_ATTN_RES_GLUON_TDM", "1") == "1"
+    ),
     # Deprecated: use ATOM_MLA_KV_SHUFFLED. Only effective together with
     # ATOM_USE_TRITON_MLA=1.
     "ATOM_USE_TRITON_MLA_SHUFFLE_KV": lambda: (
@@ -435,6 +440,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_FLYDSL_GATHER_KV_B_PROJ": lambda: (
         os.getenv("ATOM_USE_FLYDSL_GATHER_KV_B_PROJ", "1") == "1"
     ),
+    # gfx1250 ASM FP8 MLA prefill attention (D192x128) with the same fused QKV
+    # quantization. Exclusive with ATOM_USE_FLYDSL_FP8_PREFILL_ATTN: with both
+    # set, ASM is used and a warning is logged. Unsupported configurations use
+    # BF16. Added 2026-11-03.
+    "ATOM_USE_ASM_FP8_PREFILL_ATTN": lambda: (
+        os.getenv("ATOM_USE_ASM_FP8_PREFILL_ATTN", "0") == "1"
+    ),
     # FlyDSL FP8 prefill with fused QKV quantization and direct FP8 gather output
     # where supported. Unsupported attention inputs raise. Added 2026-09-10.
     "ATOM_USE_FLYDSL_FP8_PREFILL_ATTN": lambda: (
@@ -561,6 +573,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the whole gathered q back to token-major; this removes both. Costs a
     # group-wide q GEMM + W_K bmm per prefill token. Off by default.
     "ATOM_DCP_PREFILL_QREP": lambda: os.getenv("ATOM_DCP_PREFILL_QREP", "0") == "1",
+    # DCP dense MLA cached-prefix prefill: prefetch the next MLA layer's context
+    # chunks' compressed-KV AllGathers on a high-priority side stream while this
+    # layer's attention runs (the first layer starts its own behind its
+    # new-token attention); steps with fewer than 8192 new tokens gather in place.
+    # Reorders communication only (the gathered KV is
+    # bit-identical). Off by default.
+    "ATOM_DCP_PREFILL_KV_AG_OVERLAP": lambda: (
+        os.getenv("ATOM_DCP_PREFILL_KV_AG_OVERLAP", "0") == "1"
+    ),
     # DCP sparse prefill: use the non-persistent fp8 gqa64 MLA kernel, which
     # needs no work metadata. On by default; needs an aiter with ROCm/aiter#6132.
     "ATOM_DCP_SPARSE_PREFILL_NONPS": lambda: (
@@ -805,6 +826,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ModelRunner workers) to exit before it terminates them.
     "ATOM_SHUTDOWN_TIMEOUT_S": lambda: _positive_float_env(
         "ATOM_SHUTDOWN_TIMEOUT_S", "5"
+    ),
+    # How long the nodes of a TP group that spans nodes wait for each other at
+    # startup: a remote node for the engine's endpoints, the engine for every
+    # remote rank to subscribe to its broadcast queue, a rank on the
+    # model-runner store and in its process groups' first collectives.
+    "ATOM_MULTINODE_TP_TIMEOUT_S": lambda: _positive_float_env(
+        "ATOM_MULTINODE_TP_TIMEOUT_S", "1800"
     ),
     # --- Profiling & Logging ---
     "ATOM_METRICS_UPDATE_INTERVAL_S": lambda: _positive_float_env(

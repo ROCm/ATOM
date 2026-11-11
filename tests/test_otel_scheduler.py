@@ -371,7 +371,7 @@ def test_engine_initializes_tracing_before_ready(monkeypatch):
 
     failure_callbacks = []
 
-    def runner_manager(*args, on_worker_failure, kv_progress_event):
+    def runner_manager(*args, local_proc_num, on_worker_failure, kv_progress_event):
         assert kv_progress_event is not None
         failure_callbacks.append(on_worker_failure)
         return SimpleNamespace(call_func=call)
@@ -388,6 +388,8 @@ def test_engine_initializes_tracing_before_ready(monkeypatch):
         parallel_config=SimpleNamespace(control_address="unused", data_parallel_size=1),
         tp_world_size=1,
         pcp_group_size=1,
+        is_multinode_tp=False,
+        prefill_context_parallel_size=1,
         runner_qualname="unused",
         enforce_eager=True,
         disagg_is_decode=False,

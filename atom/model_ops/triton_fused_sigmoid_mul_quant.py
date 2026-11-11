@@ -11,8 +11,11 @@ import triton
 import triton.language as tl
 from aiter import QuantType
 from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.ops.triton._triton_kernels.common.activation import _sigmoid
 from aiter.ops.triton.fusions.fused_sigmoid_mul import fused_sigmoid_mul
 from torch import Tensor
+
+from atom.model_ops.triton_e8m0_quant import fp8_e8m0_group_scale
 
 fp8_dtype = aiter.dtypes.fp8
 
@@ -135,6 +138,7 @@ def _fused_sigmoid_mul_fp8_group_quant_tiled_kernel(
     QUANT_BLOCK_SIZE: tl.constexpr,
     FP8_MAX: tl.constexpr,
     FP8_MIN: tl.constexpr,
+    E8M0_SCALE: tl.constexpr = False,
 ):
     """Prefill-shaped twin of _fused_sigmoid_mul_fp8_group_quant_kernel.
 
@@ -143,6 +147,9 @@ def _fused_sigmoid_mul_fp8_group_quant_tiled_kernel(
     hundreds of thousands. Same arithmetic in the same order, so the FP8 values
     and scales match the per-group kernel bit for bit. Rows are contiguous
     (column stride 1); BLOCK_N divides N.
+
+    E8M0_SCALE: E8M0 scales, bit-identical to
+    ``per_1x128_e8m0_quant(sigmoid_mul(...))``.
     """
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -159,13 +166,22 @@ def _fused_sigmoid_mul_fp8_group_quant_tiled_kernel(
     gate = tl.load(
         gate_ptr + rows * stride_gate_m + cols[None, :], mask=row_mask, other=0.0
     ).to(tl.float32)
-    x = tl.sigmoid(gate) * attn
-
-    x = x.reshape(BLOCK_M, NUM_QUANT_BLOCKS, QUANT_BLOCK_SIZE)
-    m = tl.maximum(tl.max(tl.abs(x), axis=-1), 1e-10)
-    scale_out = m.to(tl.float32) / FP8_MAX
-    scale_recip = 1.0 / scale_out.reshape(BLOCK_M, NUM_QUANT_BLOCKS, 1)
-    x = tl.clamp(x * scale_recip, FP8_MIN, FP8_MAX).reshape(BLOCK_M, BLOCK_N)
+    if E8M0_SCALE:
+        x = (attn * _sigmoid(gate)).to(attn_ptr.dtype.element_ty).to(tl.float32)
+        x = x.reshape(BLOCK_M, NUM_QUANT_BLOCKS, QUANT_BLOCK_SIZE)
+        scale_out, multiplier = fp8_e8m0_group_scale(
+            tl.max(tl.abs(x), axis=-1), FP8_MAX
+        )
+        x = x * multiplier.reshape(BLOCK_M, NUM_QUANT_BLOCKS, 1)
+        x = tl.clamp(x, FP8_MIN, FP8_MAX, propagate_nan=tl.PropagateNan.ALL)
+        x = x.reshape(BLOCK_M, BLOCK_N)
+    else:
+        x = tl.sigmoid(gate) * attn
+        x = x.reshape(BLOCK_M, NUM_QUANT_BLOCKS, QUANT_BLOCK_SIZE)
+        m = tl.maximum(tl.max(tl.abs(x), axis=-1), 1e-10)
+        scale_out = m.to(tl.float32) / FP8_MAX
+        scale_recip = 1.0 / scale_out.reshape(BLOCK_M, NUM_QUANT_BLOCKS, 1)
+        x = tl.clamp(x * scale_recip, FP8_MIN, FP8_MAX).reshape(BLOCK_M, BLOCK_N)
 
     tl.store(
         out_fp8_ptr + rows * stride_fp8_m + cols[None, :],
@@ -266,20 +282,25 @@ def _fused_sigmoid_mul_fp8_per_token_quant(
     return out_fp8, out_scale
 
 
-def _group_quant_outputs(attn_output: Tensor, group_size: int, transpose_scale: bool):
+def _group_quant_outputs(
+    attn_output: Tensor,
+    group_size: int,
+    transpose_scale: bool,
+    scale_dtype: torch.dtype = torch.float32,
+):
     """FP8 output and per-group scale buffers in the layout o_proj expects:
     with transpose_scale the scale memory is column-major, viewed back as
-    (M, N // group_size) after the kernel."""
+    (M, N // group_size) after the kernel. E8M0 scales are allocated as uint8."""
     M, N = attn_output.shape
     out_fp8 = torch.empty((M, N), dtype=fp8_dtype, device=attn_output.device)
     num_scale_cols = N // group_size
     if transpose_scale:
         out_scale = torch.empty(
-            (num_scale_cols, M), dtype=torch.float32, device=attn_output.device
+            (num_scale_cols, M), dtype=scale_dtype, device=attn_output.device
         )
         return out_fp8, out_scale, out_scale.stride(1), out_scale.stride(0)
     out_scale = torch.empty(
-        (M, num_scale_cols), dtype=torch.float32, device=attn_output.device
+        (M, num_scale_cols), dtype=scale_dtype, device=attn_output.device
     )
     return out_fp8, out_scale, out_scale.stride(0), out_scale.stride(1)
 
@@ -292,8 +313,10 @@ def fused_sigmoid_mul_fp8_quant_tiled(
     block_m: int = 16,
     block_n: int = 512,
     num_warps: int = 4,
+    e8m0_scale: bool = False,
 ) -> tuple[Tensor, Tensor]:
-    """fused_sigmoid_mul_fp8_quant for many rows: same outputs, tiled grid."""
+    """fused_sigmoid_mul_fp8_quant for many rows: same outputs, tiled grid
+    (``e8m0_scale``: E8M0 scales instead of FP32)."""
     if transpose_scale is None:
         from atom.utils import envs
 
@@ -302,7 +325,10 @@ def fused_sigmoid_mul_fp8_quant_tiled(
     assert N % block_n == 0 and block_n % group_size == 0, (N, block_n, group_size)
     assert attn_output.stride(1) == 1 and gate.stride(1) == 1
     out_fp8, out_scale, stride_scale_m, stride_scale_n = _group_quant_outputs(
-        attn_output, group_size, transpose_scale
+        attn_output,
+        group_size,
+        transpose_scale,
+        torch.uint8 if e8m0_scale else torch.float32,
     )
     grid = (triton.cdiv(M, block_m), N // block_n)
     _fused_sigmoid_mul_fp8_group_quant_tiled_kernel[grid](
@@ -321,10 +347,13 @@ def fused_sigmoid_mul_fp8_quant_tiled(
         QUANT_BLOCK_SIZE=group_size,
         FP8_MAX=DTYPE_MAX,
         FP8_MIN=DTYPE_MIN,
+        E8M0_SCALE=e8m0_scale,
         num_warps=num_warps,
     )
     if transpose_scale:
         out_scale = out_scale.view(M, N // group_size)
+    if e8m0_scale:
+        out_scale = out_scale.view(aiter.dtypes.fp8_e8m0)
     return out_fp8, out_scale
 
 
@@ -414,6 +443,14 @@ def fused_sigmoid_mul_fp8_quant(
     return out_fp8, out_scale
 
 
+def _tile(M: int, N: int) -> dict:
+    """The tiled kernel's tile for M rows of N columns."""
+    block_n, num_warps = (256, 4) if M < 4096 else (1024, 8)
+    while N % block_n:
+        block_n //= 2
+    return {"block_m": 8, "block_n": block_n, "num_warps": num_warps}
+
+
 def _sigmoid_mul_fp8_group_quant_fake(
     attn_output: Tensor, gate: Tensor
 ) -> tuple[Tensor, Tensor]:
@@ -443,11 +480,41 @@ def sigmoid_mul_fp8_group_quant(
     M, N = attn_output.shape
     if attn_output.stride(1) != 1 or gate.stride(1) != 1 or N % 128:
         return fused_sigmoid_mul_fp8_quant(attn_output, gate)
-    block_n, num_warps = (256, 4) if M < 4096 else (1024, 8)
-    while N % block_n:
-        block_n //= 2
+    return fused_sigmoid_mul_fp8_quant_tiled(attn_output, gate, **_tile(M, N))
+
+
+def _sigmoid_mul_fp8_e8m0_group_quant_fake(
+    attn_output: Tensor, gate: Tensor, transpose_scale: bool | None
+) -> tuple[Tensor, Tensor]:
+    M, N = attn_output.shape
+    return (
+        torch.empty((M, N), dtype=fp8_dtype, device=attn_output.device),
+        torch.empty(
+            (M, N // 128), dtype=aiter.dtypes.fp8_e8m0, device=attn_output.device
+        ),
+    )
+
+
+# Functional, like per_1x128_e8m0_quant: Inductor cannot functionalize an E8M0
+# mutation.
+@torch_compile_guard(gen_fake=_sigmoid_mul_fp8_e8m0_group_quant_fake, mutates_args=[])
+def sigmoid_mul_fp8_e8m0_group_quant(
+    attn_output: Tensor, gate: Tensor, transpose_scale: bool | None
+) -> tuple[Tensor, Tensor]:
+    """``per_1x128_e8m0_quant(sigmoid_mul(attn_output, gate))`` in one kernel.
+    Rows must be contiguous and N a multiple of 128."""
+    M, N = attn_output.shape
+    assert attn_output.stride(1) == 1 and gate.stride(1) == 1 and N % 128 == 0, (
+        attn_output.stride(),
+        gate.stride(),
+        N,
+    )
     return fused_sigmoid_mul_fp8_quant_tiled(
-        attn_output, gate, block_m=8, block_n=block_n, num_warps=num_warps
+        attn_output,
+        gate,
+        transpose_scale=transpose_scale,
+        e8m0_scale=True,
+        **_tile(M, N),
     )
 
 
@@ -488,6 +555,7 @@ def fused_sigmoid_mul_maybe_quant(
     quant: bool = False,
     quant_type_value: int = QuantType.per_Token.value,
     transpose_scale: bool | None = None,
+    e8m0_scale: bool = False,
 ) -> tuple[Tensor, Tensor | None]:
     """sigmoid(gate) * attn_output, optionally fused with FP8 quant.
 
@@ -506,7 +574,7 @@ def fused_sigmoid_mul_maybe_quant(
       ``QuantType.per_Token.value`` -> a8w8 per-token scale ``[M, 1]`` (Kimi-K3
       o_proj under ptpc_fp8); ``QuantType.per_1x128.value`` -> per-1x128 block
       scales (``transpose_scale`` controls their layout, as in
-      :func:`fused_sigmoid_mul_fp8_quant`).
+      :func:`fused_sigmoid_mul_fp8_quant`); ``e8m0_scale`` makes them E8M0.
 
     Takes the ``int`` ``QuantType.value``, not a ``QuantType``: Dynamo graph-breaks
     comparing the pybind11 type inside a traced ``forward``.
@@ -515,6 +583,8 @@ def fused_sigmoid_mul_maybe_quant(
         return sigmoid_mul(attn_output, gate), None
     if quant_type_value == QuantType.per_Token.value:
         return fused_sigmoid_mul_fp8_quant(attn_output, gate, per_token=True)
+    if quant_type_value == QuantType.per_1x128.value and e8m0_scale:
+        return sigmoid_mul_fp8_e8m0_group_quant(attn_output, gate, transpose_scale)
     if quant_type_value == QuantType.per_1x128.value:
         return fused_sigmoid_mul_fp8_quant(
             attn_output,

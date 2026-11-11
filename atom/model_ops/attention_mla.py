@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import inspect
 import logging
 from dataclasses import dataclass
 from functools import partial as functools_partial
-from typing import ClassVar, Protocol
+from typing import TYPE_CHECKING, ClassVar, Protocol
 
 import torch
 import triton
@@ -32,6 +33,7 @@ except ImportError:
     concat_and_cache_mla_seg = None
     fused_qk_rope_concat_and_cache_mla_seg = None
 from aiter.dist.parallel_state import get_dp_group, get_tensor_model_parallel_rank
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 from aiter.mla import mla_decode_fwd, mla_prefill_fwd
 from aiter.ops.triton.attention.mla import mla_decode_fwd as triton_mla_decode_fwd
 from aiter.ops.triton.fusions.fused_kv_cache import (
@@ -88,7 +90,18 @@ from atom.utils.forward_context import (
     AttentionMetaData,
     ForwardContext,
     get_forward_context,
+    pass_scheduled_tokens_gpu,
 )
+from atom.utils.region_graph import eager_region, on_scheduled_rows_into
+
+if TYPE_CHECKING:
+    from atom.model_ops.dcp_ops import DcpAllGatherHandle
+
+# DCP prefix-gather prefetch only pays for steps with at least this many new
+# tokens in a sequence: below it the step is host-launch bound, there is no long
+# kernel to hide a gather behind, and the side-stream bookkeeping only adds host
+# time (measured on MI355: +5 ms on a 1024-token tail step).
+_DCP_AG_PREFETCH_MIN_NEW_TOKENS = 8192
 
 # Cap on the KV-split budget: aiter cuts the KV walk into
 # `min(num_clusters, cap * batch_size)` parts, and a negative cap means uncapped
@@ -298,6 +311,11 @@ _MLA_DCP_KERNEL_WIDTHS = (16, 32, 64, 128)
 # width sets below, which only hold widths that have their own kernel.
 _MLA_DCP_MAX_KERNEL_HEADS = 128
 
+# gfx1250's persistent decode is aiter's PS1 kernel. It takes a multi-token
+# (q > 1) query only at these gathered widths, and aiter does not fold the
+# others onto it, so a wider verify or draft-block decode is padded up to one.
+_MLA_DCP_KERNEL_WIDTHS_PS1_MULTI_TOKEN = (16, 96)
+
 _MLA_DCP_KERNEL_WIDTHS_NON_PERSISTENT = (16, 32, 128)
 _MLA_DCP_KERNEL_WIDTHS_NON_PERSISTENT_FP8 = (16, 128)
 _MLA_DCP_SPARSE_PREFILL_WIDTHS = (16, 128)
@@ -318,6 +336,7 @@ def mla_dcp_kernel_num_heads(
     *,
     kv_cache_dtype: str,
     persistent: bool,
+    multi_token: bool = False,
 ) -> int:
     """Width to gather the query heads to for a DCP decode.
 
@@ -331,9 +350,19 @@ def mla_dcp_kernel_num_heads(
     ``kv_cache_dtype`` only selects the non-persistent set: gqa=64 is excluded
     for both dtypes there (fp8 aborts on it, bf16 silently miscomputes it), and
     fp8 lacks a gqa=32 kernel on top of that while bf16 does not.
+
+    ``multi_token``: the decode takes more than one query per sequence (a
+    speculative verify pass, or a draft block). gfx1250's persistent kernel
+    serves that only at ``_MLA_DCP_KERNEL_WIDTHS_PS1_MULTI_TOKEN``.
     """
     gathered = mla_kernel_num_heads(max(num_heads * dcp_world_size, min_kernel_heads))
-    if persistent:
+    widest = _MLA_DCP_MAX_KERNEL_HEADS
+    if persistent and multi_token and get_gfx() == "gfx1250":
+        widest = _MLA_DCP_KERNEL_WIDTHS_PS1_MULTI_TOKEN[-1]
+        for width in _MLA_DCP_KERNEL_WIDTHS_PS1_MULTI_TOKEN:
+            if width >= gathered:
+                return width
+    elif persistent:
         if gathered <= _MLA_DCP_MAX_KERNEL_HEADS:
             return gathered
     else:
@@ -350,7 +379,7 @@ def mla_dcp_kernel_num_heads(
         _dcp_kernel_width_warned = True
         logger.warning(
             f"DCP decode gathers {gathered} query heads, past the widest MLA "
-            f"kernel aiter dispatches ({_MLA_DCP_MAX_KERNEL_HEADS}); it serves "
+            f"kernel aiter dispatches ({widest}); it serves "
             "neither a kernel nor a fold that wide and will abort in "
             "mla_decode_fwd. Lower decode_context_parallel_size or raise tp."
         )
@@ -515,6 +544,58 @@ try:
 except Exception:  # noqa: BLE001 -- optional kernel; absence is the whole answer
     _FLYDSL_FP8_MHA_AVAILABLE = False
 
+# The gfx1250 counterpart: the a8w8 FMHA. Builds whose entry takes no Q/K/V
+# descales cannot serve prequantized inputs, so they count as unavailable.
+try:
+    from aiter.ops.flydsl.kernels.fmha_gfx1250.fmha_fwd_prefill_a8w8_m32x8 import (
+        flash_attn_a8w8_m32x8_supported,
+        flash_attn_varlen_a8w8_m32x8,
+    )
+
+    _FLYDSL_FP8_MHA_GFX1250_AVAILABLE = (
+        "q_descale" in inspect.signature(flash_attn_varlen_a8w8_m32x8).parameters
+    )
+except Exception:  # noqa: BLE001 -- optional kernel; absence is the whole answer
+    _FLYDSL_FP8_MHA_GFX1250_AVAILABLE = False
+
+
+def _flydsl_fp8_mha_gfx1250_supported(
+    num_heads: int, num_kv_heads: int, head_dim: int, head_dim_v: int
+) -> bool:
+    # The predicate reads only shapes and dtypes, so meta tensors stand in for Q/K/V.
+    def probe(heads: int, dim: int) -> torch.Tensor:
+        return torch.empty((1, heads, dim), dtype=torch.float8_e4m3fn, device="meta")
+
+    return flash_attn_a8w8_m32x8_supported(
+        "varlen",
+        probe(num_heads, head_dim),
+        probe(num_kv_heads, head_dim),
+        probe(num_kv_heads, head_dim_v),
+    )
+
+
+# gfx1250 ASM FP8 FMHA (D192x128, per-tensor Q/K/V descales), gated by
+# ATOM_USE_ASM_FP8_PREFILL_ATTN.
+try:
+    from aiter.jit.utils.asm_guard import is_gfx1250_asm_supported
+    from aiter.ops.mha import fmha_fwd_fp8_varlen_asm
+
+    _ASM_FP8_MHA_AVAILABLE = True
+except Exception:  # noqa: BLE001 -- optional kernel; absence is the whole answer
+    _ASM_FP8_MHA_AVAILABLE = False
+
+
+def _asm_fp8_mha_supported(
+    num_heads: int, num_kv_heads: int, head_dim: int, head_dim_v: int
+) -> bool:
+    return (
+        head_dim == 192
+        and head_dim_v == 128
+        and num_kv_heads > 0
+        and num_heads % num_kv_heads == 0
+        and is_gfx1250_asm_supported()
+    )
+
 
 # MLA Specific Arguments
 @dataclass
@@ -560,6 +641,42 @@ def _mla_output_width(impl: _MLAOutputShape, hidden_size: int) -> int:
     return hidden_size
 
 
+@eager_region()
+def _mla_prefill_core(
+    out: torch.Tensor,
+    prefill_q: torch.Tensor,
+    k_new: torch.Tensor,
+    v_new: torch.Tensor,
+    k_nope: torch.Tensor,
+    k_rope: torch.Tensor,
+    q8: torch.Tensor | None,
+    k8: torch.Tensor | None,
+    v8: torch.Tensor | None,
+    fp8_scales: tuple[torch.Tensor, ...] | None,
+    layer_name: str,
+) -> torch.Tensor:
+    """The eager break of `MLAAttention.forward_prefill_split`: the KV-cache
+    write and the attention, written into the scheduled rows of ``out``."""
+    impl = (
+        get_current_atom_config()
+        .compilation_config.static_forward_context[layer_name]
+        .impl
+    )
+    return on_scheduled_rows_into(
+        impl._prefill_attend,
+        out,
+        prefill_q,
+        k_new,
+        v_new,
+        k_nope,
+        k_rope,
+        q8,
+        k8,
+        v8,
+        fp8_scales,
+    )
+
+
 def supports_dpa_persistent_mode(
     atom_config,
     mla_modules: MLAModules,
@@ -596,6 +713,12 @@ def should_use_persistent_mode(
 
 
 class MLAAttention(nn.Module):
+    # DCP prefix-gather prefetch (ATOM_DCP_PREFILL_KV_AG_OVERLAP): the layer numbers
+    # that gather a cached prefix, and the one in-flight prefetch
+    # (attn_metadata, layer_num, {chunk: DcpAllGatherHandle}) its predecessor started.
+    _dcp_layers: ClassVar[set[int]] = set()
+    _dcp_prefetched: ClassVar[tuple | None] = None
+
     def __init__(
         self,
         num_heads: int,
@@ -609,8 +732,14 @@ class MLAAttention(nn.Module):
         **kwargs,
     ) -> None:
         super().__init__()
-        self.use_flydsl_fp8_prefill_attn = bool(envs.ATOM_USE_FLYDSL_FP8_PREFILL_ATTN)
-        self._flydsl_fp8_mha_ok: bool | None = None
+        self.use_asm_fp8_prefill_attn, self.use_flydsl_fp8_prefill_attn = (
+            self._fp8_prefill_attn_flags()
+        )
+        self._fp8_mha_ok: bool | None = None
+        self._fp8_mha_backend: str | None = None
+        # Set by a model whose prefill token graph records up to the attention
+        # core (`records_prefill_split`).
+        self.split_prefill_recording = False
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.scale = float(scale)
@@ -791,6 +920,7 @@ class MLAAttention(nn.Module):
             self.dcp_group = get_dcp_group()
             self.dcp_rank = get_dcp_rank()
             self._cp_triton_ctx = CPTritonContext()
+            MLAAttention._dcp_layers.add(layer_num)
         else:
             self.dcp_group = None
             self.dcp_rank = 0
@@ -952,6 +1082,9 @@ class MLAAttention(nn.Module):
                         self, "sparse_dcp_metadata_rebuild", False
                     ),
                 ),
+                # A speculative run decodes several queries per sequence: the
+                # target's verify pass and the draft's block pass alike.
+                multi_token=get_current_atom_config().speculative_config is not None,
             )
             self.dcp_head_pad = (
                 self.dcp_kernel_num_heads - self.num_heads * dcp_world_size
@@ -1080,39 +1213,77 @@ class MLAAttention(nn.Module):
         out = tuple(t[..., : self.qk_nope_head_dim] for t in tensors)
         return out if len(out) > 1 else out[0]
 
-    def _check_flydsl_fp8_mha(self, q: torch.Tensor) -> None:
-        """Resolve fixed device/model support before any FP8 preparation.
+    @staticmethod
+    def _fp8_prefill_attn_flags() -> tuple[bool, bool]:
+        """The (ASM, FlyDSL) FP8 prefill attention flags. They are exclusive:
+        with both set, ASM is used and the FlyDSL flag is ignored."""
+        asm = bool(envs.ATOM_USE_ASM_FP8_PREFILL_ATTN)
+        flydsl = bool(envs.ATOM_USE_FLYDSL_FP8_PREFILL_ATTN)
+        if asm and flydsl:
+            if not getattr(MLAAttention, "_fp8_prefill_both_flags_logged", False):
+                MLAAttention._fp8_prefill_both_flags_logged = True
+                logger.warning(
+                    "ATOM_USE_ASM_FP8_PREFILL_ATTN=1 and "
+                    "ATOM_USE_FLYDSL_FP8_PREFILL_ATTN=1 are both set; set only one. "
+                    "Using ASM FP8 prefill attention and ignoring "
+                    "ATOM_USE_FLYDSL_FP8_PREFILL_ATTN."
+                )
+            flydsl = False
+        return asm, flydsl
 
+    def _check_fp8_prefill_mha(self, q: torch.Tensor) -> None:
+        """Resolve the selected FP8 kernel's support before any FP8 preparation.
+
+        ATOM_USE_ASM_FP8_PREFILL_ATTN selects the ASM kernel (gfx1250
+        D192x128), ATOM_USE_FLYDSL_FP8_PREFILL_ATTN the FlyDSL one (gfx1250
+        a8w8, or gfx950); a layer the selected kernel cannot serve uses BF16.
         Like `_flydsl_gather_ok`, this is cached per layer: projected Q's
         device, dtype and head layout do not change with sequence lengths.
         Choosing BF16 here also prevents cached gather from overwriting BF16
         workspaces with FP8, so the fallback retains the original Q/K/V.
         """
-        if self._flydsl_fp8_mha_ok is not None:
+        if self._fp8_mha_ok is not None:
             return
-        if not self.use_flydsl_fp8_prefill_attn:
-            self._flydsl_fp8_mha_ok = False
+        if not (self.use_asm_fp8_prefill_attn or self.use_flydsl_fp8_prefill_attn):
+            self._fp8_mha_ok = False
             return
         head_dim = self.qk_nope_head_dim if self.rope_is_zero_pad else q.shape[-1]
-        self._flydsl_fp8_mha_ok = (
-            _FLYDSL_FP8_MHA_AVAILABLE
+        if self.use_asm_fp8_prefill_attn:
+            kernel, backend = "ASM", "asm"
+            supported = (
+                _asm_fp8_mha_supported
+                if _ASM_FP8_MHA_AVAILABLE and get_gfx_runtime() == "gfx1250"
+                else None
+            )
+        elif _FLYDSL_FP8_MHA_GFX1250_AVAILABLE and get_gfx_runtime() == "gfx1250":
+            kernel, backend = "FlyDSL", "flydsl_gfx1250"
+            supported = _flydsl_fp8_mha_gfx1250_supported
+        else:
+            kernel, backend = "FlyDSL", "flydsl_gfx950"
+            supported = (
+                functools_partial(flydsl_flash_attn_fp8_supported, q.device)
+                if _FLYDSL_FP8_MHA_AVAILABLE
+                else None
+            )
+        self._fp8_mha_ok = (
+            supported is not None
             and q.dtype == torch.bfloat16
             # Cached FP8 gather currently retains the synthetic RoPE padding.
             # Until that tuple is trimmed too, NoPE models use the BF16 path.
             and not self.rope_is_zero_pad
-            and flydsl_flash_attn_fp8_supported(
-                q.device, q.shape[-2], self.num_heads, head_dim, self.v_head_dim
-            )
+            and supported(q.shape[-2], self.num_heads, head_dim, self.v_head_dim)
         )
-        if not self._flydsl_fp8_mha_ok and not getattr(
+        self._fp8_mha_backend = backend if self._fp8_mha_ok else None
+        if not self._fp8_mha_ok and not getattr(
             MLAAttention, "_fp8_prefill_fallback_logged", False
         ):
             MLAAttention._fp8_prefill_fallback_logged = True
             logger.warning(
-                "ATOM_USE_FLYDSL_FP8_PREFILL_ATTN=1 requested, but FlyDSL FP8 "
-                "prefill attention is unavailable or unsupported for device=%s, "
-                "dtype=%s, heads=%d, qk_dim=%d, v_dim=%d. "
-                "Falling back to BF16 attention.",
+                "ATOM_USE_%s_FP8_PREFILL_ATTN=1 requested, but %s FP8 prefill "
+                "attention is unavailable or unsupported for device=%s, dtype=%s, "
+                "heads=%d, qk_dim=%d, v_dim=%d. Falling back to BF16 attention.",
+                kernel.upper(),
+                kernel,
                 q.device,
                 q.dtype,
                 q.shape[-2],
@@ -1122,7 +1293,7 @@ class MLAAttention(nn.Module):
 
     def _prepare_prefill_k(self, k_nope, k_rope):
         """Keep K split for FP8 quantization; materialize it for BF16 attention."""
-        if self._flydsl_fp8_mha_ok:
+        if self._fp8_mha_ok:
             return k_nope, None if self.rope_is_zero_pad else k_rope
         return (
             torch.cat((k_nope, k_rope.expand((*k_nope.shape[:-1], -1))), dim=-1),
@@ -1149,10 +1320,10 @@ class MLAAttention(nn.Module):
         ) = None,
         k_rope: torch.Tensor | None = None,
     ):
-        """Dispatch MLA prefill to FP8 FlyDSL or AITER varlen attention.
+        """Dispatch MLA prefill to the FP8 backend or AITER varlen attention.
 
-        FlyDSL uses bottom-right causal masking and returns natural-log FP32
-        LSE in [heads, total_q] layout. Unsupported device/model configurations
+        Every FP8 backend uses bottom-right causal masking and returns
+        natural-log FP32 LSE in [heads, total_q] layout. Unsupported device/model configurations
         select BF16 before quantization. Per-call validation and kernel
         execution failures still propagate; there is no retry after launch.
 
@@ -1162,10 +1333,10 @@ class MLAAttention(nn.Module):
         ``k_rope`` supplies the separate RoPE columns when K has not been
         concatenated yet; the fused QKV quantizer joins them directly in FP8.
         """
-        if self._flydsl_fp8_mha_ok:
-            # The direct AITER FP8 API has no dropout argument.
+        if self._fp8_mha_ok:
+            # The direct AITER FP8 APIs have no dropout argument.
             if dropout_p != 0.0:
-                raise ValueError("FlyDSL FP8 prefill attention requires dropout_p=0")
+                raise ValueError("FP8 prefill attention requires dropout_p=0")
             if q_fp8 is None and kv_fp8 is None:
                 q8, k8, v8, qs, ks, vs, _, _ = fused_qkv_per_tensor_quant(
                     q, k, v, k_rope=k_rope
@@ -1182,6 +1353,42 @@ class MLAAttention(nn.Module):
                 k8, v8, k_descale, v_descale = kv_fp8
             # Empty per-sequence cached chunks require the FMHA kernel's
             # masked-row handling: zero output and -inf LSE for the merge.
+            if self._fp8_mha_backend == "asm":
+                out, lse = fmha_fwd_fp8_varlen_asm(
+                    q8,
+                    k8,
+                    v8,
+                    q_descale,
+                    k_descale,
+                    v_descale,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    softmax_scale=self.scale,
+                    is_causal=causal,
+                    return_lse=return_lse,
+                )
+                if not return_lse:
+                    return out
+                # The kernel writes LSE as [total_q, heads, 1].
+                return out, lse.squeeze(-1).transpose(0, 1).contiguous()
+            if self._fp8_mha_backend == "flydsl_gfx1250":
+                return flash_attn_varlen_a8w8_m32x8(
+                    q8,
+                    k8,
+                    v8,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    softmax_scale=self.scale,
+                    causal=causal,
+                    return_lse=return_lse,
+                    q_descale=q_descale,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                )
             return flydsl_flash_attn_fp8_func(
                 q8,
                 k8,
@@ -1202,7 +1409,7 @@ class MLAAttention(nn.Module):
             )
 
         if kv_fp8 is not None:
-            raise ValueError("FP8 K/V require a supported FlyDSL FP8 prefill backend")
+            raise ValueError("FP8 K/V require a supported FP8 prefill backend")
         return flash_attn_varlen_func(
             q=q,
             k=k,
@@ -1655,7 +1862,7 @@ class MLAAttention(nn.Module):
         """Legacy single-pass path: gather the full cached+new context into
         k_full / v_full and run one flash_attn. OOMs on long contexts (peak
         ≈ total_kv × heads × (qk_dim + v_dim) × dtype)."""
-        self._check_flydsl_fp8_mha(prefill_q)
+        self._check_fp8_prefill_mha(prefill_q)
         k_full = torch.empty(
             (
                 attn_metadata.total_kv,
@@ -1849,6 +2056,7 @@ class MLAAttention(nn.Module):
         kv_cache: torch.Tensor,
         attn_metadata: AttentionMetaData,
         chunk_meta,
+        ctx_gathers: "dict[int, DcpAllGatherHandle] | None" = None,
     ) -> torch.Tensor:
         """Chunked prefill for the has_cached branch.
 
@@ -1867,11 +2075,38 @@ class MLAAttention(nn.Module):
         new_lse). The cached prefix is the "prefix" side (smaller token
         positions), new tokens are the "suffix".
         """
-        from atom.model_ops.attentions.triton_merge_attn_states import merge_attn_states
+        gather_ready = self._dcp_prefetch_ready(attn_metadata, chunk_meta)
+        # Step 1's inputs: new-token K/V via kv_b_proj on the latent.
+        prefill_q, k_new, v_new, quant_k_rope = self._new_token_kv(
+            prefill_q, kv_c_normed_new, k_rope_new
+        )
+        # Quantize Q once and reuse it across the new tokens and cached chunks.
+        q_fp8, new_kv_fp8, kv_out_scales = self._quantize_new_tokens(
+            prefill_q, k_new, v_new, quant_k_rope
+        )
+        output = self._chunked_prefill_attention(
+            prefill_q,
+            k_new,
+            v_new,
+            q_fp8,
+            new_kv_fp8,
+            kv_out_scales,
+            kv_cache,
+            attn_metadata,
+            chunk_meta,
+            gather_ready=gather_ready,
+            ctx_gathers=ctx_gathers,
+        )
+        return self.o_proj(output.flatten(start_dim=-2))
 
-        self._check_flydsl_fp8_mha(prefill_q)
-
-        # Step 1: new-tokens self-attn via kv_b_proj on the latent.
+    def _new_token_kv(
+        self,
+        prefill_q: torch.Tensor,
+        kv_c_normed_new: torch.Tensor,
+        k_rope_new: torch.Tensor,
+    ):
+        """``(prefill_q, k_new, v_new, quant_k_rope)`` for the new tokens."""
+        self._check_fp8_prefill_mha(prefill_q)
         if k_rope_new.dim() == 2:
             k_rope_new = k_rope_new.unsqueeze(1)
         kv_nope_new = self.kv_b_proj(kv_c_normed_new).view(
@@ -1882,17 +2117,44 @@ class MLAAttention(nn.Module):
         )
         k_new, quant_k_rope = self._prepare_prefill_k(k_nope_new, k_rope_new)
         prefill_q, k_new = self._drop_rope_pad(prefill_q, k_new)
-        # Quantize Q once and reuse it across the new tokens and cached chunks.
-        q_fp8 = None
-        new_kv_fp8 = None
-        kv_out_scales = None
-        if self._flydsl_fp8_mha_ok:
-            q8, k8, v8, qs, ks, vs, gather_ks, gather_vs = fused_qkv_per_tensor_quant(
-                prefill_q, k_new, v_new, k_rope=quant_k_rope
-            )
-            q_fp8 = (q8, qs)
-            new_kv_fp8 = (k8, v8, ks, vs)
-            kv_out_scales = (gather_ks, gather_vs)
+        return prefill_q, k_new, v_new, quant_k_rope
+
+    def _quantize_new_tokens(
+        self,
+        prefill_q: torch.Tensor,
+        k_new: torch.Tensor,
+        v_new: torch.Tensor,
+        quant_k_rope: torch.Tensor | None,
+        num_rows: torch.Tensor | None = None,
+    ):
+        """``(q_fp8, new_kv_fp8, kv_out_scales)``, or Nones on the BF16 path."""
+        if not self._fp8_mha_ok:
+            return None, None, None
+        q8, k8, v8, qs, ks, vs, gather_ks, gather_vs = fused_qkv_per_tensor_quant(
+            prefill_q, k_new, v_new, k_rope=quant_k_rope, num_rows=num_rows
+        )
+        return (q8, qs), (k8, v8, ks, vs), (gather_ks, gather_vs)
+
+    def _chunked_prefill_attention(
+        self,
+        prefill_q: torch.Tensor,
+        k_new: torch.Tensor,
+        v_new: torch.Tensor,
+        q_fp8,
+        new_kv_fp8,
+        kv_out_scales,
+        kv_cache: torch.Tensor,
+        attn_metadata: AttentionMetaData,
+        chunk_meta,
+        gather_ready=None,
+        ctx_gathers: "dict[int, DcpAllGatherHandle] | None" = None,
+    ) -> torch.Tensor:
+        """Steps 1-3 of `_forward_prefill_cached_chunked`. ``gather_ready``
+        (`_dcp_prefetch_ready`) is where the DCP prefix gathers may start, and
+        ``ctx_gathers`` the ones a predecessor already prefetched
+        (`_dcp_take_prefetched`); with neither, the gathers run in place."""
+        from atom.model_ops.attentions.triton_merge_attn_states import merge_attn_states
+
         new_out, new_lse = self._flash_attn_prefill(
             prefill_q,
             k_new,
@@ -1908,6 +2170,14 @@ class MLAAttention(nn.Module):
             q_fp8=q_fp8,
             kv_fp8=new_kv_fp8,
         )
+        # Launched behind the new-token attention, so their host launch cost is
+        # paid while that kernel runs. This layer's own gathers only if no
+        # predecessor prefetched them (the first one); then the next layer's.
+        if ctx_gathers is None:
+            ctx_gathers = self._dcp_start_context_gathers(
+                kv_cache, chunk_meta, gather_ready
+            )
+        self._dcp_prefetch_next(attn_metadata, chunk_meta, gather_ready)
 
         # Step 2: chunked cached-prefix attention.
         chunked_out: torch.Tensor | None = None
@@ -1924,6 +2194,7 @@ class MLAAttention(nn.Module):
                 chunk_meta,
                 q_fp8=q_fp8,
                 kv_out_scales=kv_out_scales,
+                ctx_gathers=ctx_gathers,
             )
         else:
             k_workspace = chunk_meta.k_workspace
@@ -1995,17 +2266,99 @@ class MLAAttention(nn.Module):
         # back to the new-only output (should not happen since has_cached
         # implies ≥1 seq has cached_len > 0).
         if chunked_out is None:
-            output = new_out
-        else:
-            output = torch.empty_like(new_out)
-            merge_attn_states(
-                output=output,
-                prefix_output=chunked_out,
-                prefix_lse=chunked_lse,
-                suffix_output=new_out,
-                suffix_lse=new_lse,
+            return new_out
+        output = torch.empty_like(new_out)
+        merge_attn_states(
+            output=output,
+            prefix_output=chunked_out,
+            prefix_lse=chunked_lse,
+            suffix_output=new_out,
+            suffix_lse=new_lse,
+        )
+        return output
+
+    def _dcp_prefetch_ready(self, attn_metadata, chunk_meta):
+        """The point from which this step's prefix gathers may start, or None.
+
+        The gathers read only the cache as of the previous step, so they may
+        start as soon as everything queued so far is done, not after the
+        new-token work. None (they run in place) unless overlap is on, the
+        step has a DCP cached prefix, and its sequences have at least
+        ``_DCP_AG_PREFETCH_MIN_NEW_TOKENS`` new tokens (``max_seqlen_q`` is the
+        same on every rank).
+        """
+        from atom.model_ops.dcp_ops import dcp_all_gather_ready
+
+        if (
+            getattr(chunk_meta, "is_dcp", False)
+            and attn_metadata.max_seqlen_q >= _DCP_AG_PREFETCH_MIN_NEW_TOKENS
+        ):
+            return dcp_all_gather_ready(self.dcp_group)
+        return None
+
+    def _dcp_start_context_gathers(
+        self, kv_cache: torch.Tensor, chunk_meta, ready
+    ) -> "dict[int, DcpAllGatherHandle]":
+        """Start every context chunk's KV gather on the side stream, or none.
+
+        The gather reads only the already-cached prefix and the step's
+        metadata, never this layer's q or new-token KV, so it may run under any
+        earlier layer's compute. The new tokens' cache write lands in other
+        slots than the real prefix; the padding rows a chunk's last partial
+        block carries may race it, but the reorg drops them. {} (the gathers
+        then run in place) when ``ready`` is None, i.e. overlap is off; chunks
+        with no local tokens are skipped on every rank.
+        """
+        from atom.model_ops.dcp_ops import (
+            DcpAllGatherHandle,
+            dcp_gather_compressed_kv,
+        )
+
+        if ready is None:
+            return {}
+        return {
+            c: DcpAllGatherHandle(
+                self.dcp_group,
+                functools_partial(
+                    dcp_gather_compressed_kv, kv_cache, chunk_meta.local_slot_ids[c]
+                ),
+                0,
+                ready,
             )
-        return self.o_proj(output.flatten(start_dim=-2))
+            for c in range(chunk_meta.num_chunks)
+            if chunk_meta.seq_tot[c] != 0
+        }
+
+    def _dcp_prefetch_next(self, attn_metadata, chunk_meta, ready) -> None:
+        """Start the next DCP MLA layer's prefix gathers (cross-layer prefetch).
+
+        They read only that layer's already-cached prefix, so they run beside
+        this layer's attention instead of in front of the next layer's.
+        Nothing after the last layer.
+        """
+        nxt = min(
+            (n for n in MLAAttention._dcp_layers if n > self.layer_num), default=None
+        )
+        if ready is None or nxt is None:
+            return
+        entry = get_forward_context().kv_cache_data.get(f"layer_{nxt}")
+        if entry is None:
+            return
+        MLAAttention._dcp_prefetched = (
+            attn_metadata,
+            nxt,
+            self._dcp_start_context_gathers(entry.k_cache, chunk_meta, ready),
+        )
+
+    def _dcp_take_prefetched(
+        self, attn_metadata
+    ) -> "dict[int, DcpAllGatherHandle] | None":
+        """This layer's prefetched gathers, or None (nobody prefetched, or they
+        belong to another step or layer)."""
+        pre, MLAAttention._dcp_prefetched = MLAAttention._dcp_prefetched, None
+        if pre is not None and pre[0] is attn_metadata and pre[1] == self.layer_num:
+            return pre[2]
+        return None
 
     def _dcp_compute_prefill_context(
         self,
@@ -2015,6 +2368,7 @@ class MLAAttention(nn.Module):
         chunk_meta,
         q_fp8: tuple[torch.Tensor, torch.Tensor] | None = None,
         kv_out_scales: tuple[torch.Tensor, torch.Tensor] | None = None,
+        ctx_gathers: "dict[int, DcpAllGatherHandle] | None" = None,
     ):
         """DCP chunked cached-prefix context attention.
 
@@ -2030,6 +2384,10 @@ class MLAAttention(nn.Module):
         the fp8 dequant, the reorg copies, the ``kv_b_proj`` decompress and the
         k_pe concat all ride along with it instead of costing a kernel (and, for
         the reorg, a per-layer Python walk over every (seq, rank) segment) each.
+
+        ``ctx_gathers`` holds the chunks whose gather the layer already started
+        (see ``_dcp_start_context_gathers``); any other chunk's gather runs in
+        place, as before.
         """
         from atom.model_ops.attentions.triton_merge_attn_states import merge_attn_states
         from atom.model_ops.dcp_ops import dcp_all_gather, dcp_gather_compressed_kv
@@ -2041,16 +2399,22 @@ class MLAAttention(nn.Module):
                 # No local tokens on any rank here. Rank-invariant (the padded
                 # local length is), so every rank skips the collective together.
                 continue
-            # 1. gather this rank's local compressed KV for the chunk (keeps the
-            #    cache dtype, so fp8 stays fp8 here).
-            local_kv = dcp_gather_compressed_kv(kv_cache, chunk_meta.local_slot_ids[c])
-            # 2. AllGather across DCP ranks -> [seq_tot * dcp_world_size, d]. It is
-            #    a copy-only collective, so an fp8 payload is safe (no fp8
-            #    arithmetic, unlike an all-reduce) and keeps the wire at half the
-            #    bf16 traffic. fp8 has no entry in the custom collective's dtype
-            #    enum, so dcp_all_gather pairs the bytes into fp16 rather than
-            #    give the gather up to pynccl.
-            ag_kv = dcp_all_gather(self.dcp_group, local_kv, 0)
+            # 1+2. gather this rank's local compressed KV for the chunk (keeps the
+            #    cache dtype, so fp8 stays fp8 here) and AllGather it across DCP
+            #    ranks -> [seq_tot * dcp_world_size, d]. It is a copy-only
+            #    collective, so an fp8 payload is safe (no fp8 arithmetic, unlike
+            #    an all-reduce) and keeps the wire at half the bf16 traffic. fp8
+            #    has no entry in the custom collective's dtype enum, so
+            #    dcp_all_gather pairs the bytes into fp16 rather than give the
+            #    gather up to pynccl. Already in flight if overlap started it.
+            gather = ctx_gathers.pop(c, None) if ctx_gathers else None
+            if gather is not None:
+                ag_kv = gather.wait()
+            else:
+                local_kv = dcp_gather_compressed_kv(
+                    kv_cache, chunk_meta.local_slot_ids[c]
+                )
+                ag_kv = dcp_all_gather(self.dcp_group, local_kv, 0)
 
             sum_seq_len = chunk_meta.total_tokens[c]
             if sum_seq_len == 0:
@@ -2147,7 +2511,7 @@ class MLAAttention(nn.Module):
         attn_metadata: AttentionMetaData,
     ) -> torch.Tensor:
         assert attn_metadata is not None
-        self._check_flydsl_fp8_mha(q)
+        self._check_fp8_prefill_mha(q)
 
         if k_rope.dim() == 2:
             k_rope = k_rope.unsqueeze(1)
@@ -3017,6 +3381,209 @@ class MLAAttention(nn.Module):
         _, k_pe = self.rotary_emb(positions, torch.empty_like(k_pe), k_pe)
         self._pcp_write_full_kv(kv_cache, kv_c, k_pe, slot_mapping)
 
+    def _prefill_q(
+        self,
+        q: torch.Tensor,
+        q_scale: torch.Tensor | None,
+        k_rope: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        """A dense prefill's query, with RoPE applied (``k_rope`` in place)."""
+        # QREP: q_proj emits the whole DCP-group head set, but dense prefill
+        # needs only this rank's heads: its MHA path never gathers q, so there
+        # is no AllGather Q for QREP to remove here.
+        proj = self._local_q_proj() if self.qrep_enabled else self.q_proj
+        prefill_q = proj(q, x_scale=q_scale).view(-1, self.num_heads, self.qk_head_dim)
+        prefill_q_pe = prefill_q[..., self.qk_nope_head_dim :]
+        self.rotary_emb(positions, prefill_q_pe, k_rope)
+        return prefill_q
+
+    def _write_prefill_kv(
+        self,
+        kv_cache: torch.Tensor,
+        k_nope: torch.Tensor,
+        k_rope: torch.Tensor,
+        attn_metadata: AttentionMetaData,
+    ) -> None:
+        """A dense prefill's new tokens written to the paged KV cache."""
+        if kv_cache.numel() == 0:
+            return
+        if self.kv_shuffled:
+            shuffled_cache = self._shuffled_kv_view(kv_cache)
+            triton_cat_and_cache_mla(
+                k_nope.view(-1, self.num_kv_heads, self.kv_lora_rank),
+                k_rope.view(-1, self.num_kv_heads, self.qk_rope_head_dim),
+                shuffled_cache,
+                attn_metadata.slot_mapping.flatten(),
+                self._k_scale,
+                apply_scale=True,
+                shuffled_kv_cache=True,
+            )
+        elif self.use_seg_mla:
+            # Write the KV cache in the segmented layout so the decode-phase
+            # mla_decode_fwd (which reads seg layout) sees a consistent cache
+            # for tokens written during prefill. kv_cache is flattened to
+            # [num_blocks, page_size*(kv_lora_rank + qk_rope_head_dim)] so the
+            # kernel derives page_size from stride(0).
+            kv_cache_seg = self._seg_kv_cache_view(kv_cache)
+            concat_and_cache_mla_seg(
+                k_nope,
+                k_rope.squeeze(1),
+                kv_cache_seg,
+                attn_metadata.slot_mapping.flatten(),
+                kv_cache_dtype=self.kv_cache_dtype,
+                scale=self._k_scale,
+            )
+        else:
+            concat_and_cache_mla(
+                k_nope,
+                k_rope.squeeze(1),
+                kv_cache,
+                attn_metadata.slot_mapping.flatten(),
+                kv_cache_dtype=self.kv_cache_dtype,
+                scale=self._k_scale,
+            )
+
+    # ---- Dense prefill split for token graphs: the head (Q projection, the
+    # new tokens' kv_b_proj and FP8 quantization) is sized by the rows alone,
+    # so a token graph records it; only the KV write and the attention break.
+
+    def records_prefill_split(self) -> bool:
+        """Whether this forward runs `forward_prefill_split`: a prefill
+        token-graph recording, or the capture's warmup forward before it."""
+        if not self.split_prefill_recording:
+            return False
+        fwd_ctx = get_forward_context()
+        context = getattr(fwd_ctx, "context", None)
+        if context is None or not context.is_prefill:
+            return False
+        recording = getattr(fwd_ctx, "tr_graph", None) == "record"
+        # The warmup forward: the capture's synthetic dummy prefill, which
+        # runs under `in_hipgraph` but is not recorded.
+        warmup = fwd_ctx.in_hipgraph and context.is_dummy_run
+        return (recording or warmup) and self._prefill_split_supported()
+
+    def _prefill_split_supported(self) -> bool:
+        """Dense, no ``o_proj`` inside, no PCP, and the plain ``kv_b_proj``
+        the eager prefill uses: under ``ATOM_USE_TRITON_GEMM`` a prefill without
+        a cached prefix takes the fused GEMM + split + cat instead, which the
+        recorded head would not."""
+        return (
+            not self.is_sparse_mla
+            and isinstance(self.o_proj, nn.Identity)
+            and not (pcp_is_enabled() and get_pcp_world_size() > 1)
+            and not use_triton_gemm()
+        )
+
+    def forward_prefill_split(
+        self,
+        q: torch.Tensor,
+        q_scale: torch.Tensor | None,
+        k_nope: torch.Tensor,
+        k_rope: torch.Tensor,
+        positions: torch.Tensor,
+        layer_name: str,
+    ) -> torch.Tensor:
+        """A dense prefill as a token graph records it: the head lands in the
+        graph, the KV write and the attention break (`_mla_prefill_core`)."""
+        prefill_q = self._prefill_q(q, q_scale, k_rope, positions)
+        prefill_q, k_new, v_new, quant_k_rope = self._new_token_kv(
+            prefill_q, k_nope, k_rope
+        )
+        # A bucket's pad rows are stale, not zeros: the FP8 descales must see
+        # the live row count, which every replay reads in place.
+        num_rows = pass_scheduled_tokens_gpu(prefill_q.shape[0])
+        assert (
+            num_rows is not None or not self._fp8_mha_ok
+        ), "a recorded FP8 prefill needs the step's row count"
+        q_fp8, new_kv_fp8, kv_out_scales = self._quantize_new_tokens(
+            prefill_q, k_new, v_new, quant_k_rope, num_rows=num_rows
+        )
+        q8 = k8 = v8 = fp8_scales = None
+        if q_fp8 is not None:
+            (q8, q_descale), (k8, v8, k_descale, v_descale) = q_fp8, new_kv_fp8
+            fp8_scales = (q_descale, k_descale, v_descale, *kv_out_scales)
+        # Zeroed in the graph: the core writes the scheduled rows in place.
+        out = prefill_q.new_zeros((prefill_q.shape[0], self.num_heads, self.v_head_dim))
+        out = _mla_prefill_core(
+            out,
+            prefill_q,
+            k_new,
+            v_new,
+            k_nope,
+            k_rope,
+            q8,
+            k8,
+            v8,
+            fp8_scales,
+            layer_name,
+        )
+        return out.flatten(start_dim=-2)
+
+    def _prefill_attend(
+        self,
+        out: torch.Tensor,
+        prefill_q: torch.Tensor,
+        k_new: torch.Tensor,
+        v_new: torch.Tensor,
+        k_nope: torch.Tensor,
+        k_rope: torch.Tensor,
+        q8: torch.Tensor | None,
+        k8: torch.Tensor | None,
+        v8: torch.Tensor | None,
+        fp8_scales: tuple[torch.Tensor, ...] | None,
+    ) -> None:
+        """The KV write and `forward_impl`'s attention on the live step, into
+        ``out``; the recording's dummy step leaves it alone."""
+        fwd_ctx = get_forward_context()
+        if fwd_ctx.context.is_dummy_run:
+            return
+        attn_metadata = fwd_ctx.attn_metadata
+        ctx_gathers = self._dcp_take_prefetched(attn_metadata)
+        kv_cache = fwd_ctx.kv_cache_data[f"layer_{self.layer_num}"].k_cache
+        self._write_prefill_kv(kv_cache, k_nope, k_rope, attn_metadata)
+        q_fp8 = new_kv_fp8 = kv_out_scales = None
+        if fp8_scales is not None:
+            q_descale, k_descale, v_descale, gather_k, gather_v = fp8_scales
+            q_fp8 = (q8, q_descale)
+            new_kv_fp8 = (k8, v8, k_descale, v_descale)
+            kv_out_scales = (gather_k, gather_v)
+        chunk_meta = getattr(attn_metadata, "mla_chunk_meta", None)
+        if attn_metadata.has_cached and chunk_meta is not None:
+            output = self._chunked_prefill_attention(
+                prefill_q,
+                k_new,
+                v_new,
+                q_fp8,
+                new_kv_fp8,
+                kv_out_scales,
+                kv_cache,
+                attn_metadata,
+                chunk_meta,
+                gather_ready=self._dcp_prefetch_ready(attn_metadata, chunk_meta),
+                ctx_gathers=ctx_gathers,
+            )
+        elif attn_metadata.has_cached:
+            output = self._forward_prefill_cached_single_pass(
+                prefill_q, kv_cache, attn_metadata
+            )
+        else:
+            output = self._flash_attn_prefill(
+                prefill_q,
+                k_new,
+                v_new,
+                cu_seqlens_q=attn_metadata.cu_seqlens_q,
+                cu_seqlens_k=attn_metadata.cu_seqlens_k,
+                max_seqlen_q=attn_metadata.max_seqlen_q,
+                max_seqlen_k=attn_metadata.max_seqlen_k,
+                min_seqlen_q=attn_metadata.min_seqlen_q,
+                dropout_p=attn_metadata.dropout_p,
+                causal=True,
+                q_fp8=q_fp8,
+                kv_fp8=new_kv_fp8,
+            )
+        out.view(output.shape).copy_(output)
+
     def forward_impl(
         self,
         q: torch.Tensor,
@@ -3043,53 +3610,9 @@ class MLAAttention(nn.Module):
         kv_cache = kv_cache_data[f"layer_{self.layer_num}"].k_cache
 
         if context.is_prefill and not use_prefill_mla:
-            # QREP: q_proj emits the whole DCP-group head set, but dense prefill
-            # needs only this rank's heads: its MHA path never gathers q, so there
-            # is no AllGather Q for QREP to remove here.
-            proj = self._local_q_proj() if self.qrep_enabled else self.q_proj
-            prefill_q = proj(q, x_scale=q_scale).view(
-                -1, self.num_heads, self.qk_head_dim
-            )
-            prefill_q_pe = prefill_q[..., self.qk_nope_head_dim :]
-            self.rotary_emb(positions, prefill_q_pe, k_rope)
-
-            if kv_cache.numel() > 0:
-                if self.kv_shuffled:
-                    shuffled_cache = self._shuffled_kv_view(kv_cache)
-                    triton_cat_and_cache_mla(
-                        k_nope.view(-1, self.num_kv_heads, self.kv_lora_rank),
-                        k_rope.view(-1, self.num_kv_heads, self.qk_rope_head_dim),
-                        shuffled_cache,
-                        attn_metadata.slot_mapping.flatten(),
-                        self._k_scale,
-                        apply_scale=True,
-                        shuffled_kv_cache=True,
-                    )
-                elif self.use_seg_mla:
-                    # Write the KV cache in the segmented layout so the
-                    # decode-phase mla_decode_fwd (which reads seg layout) sees a
-                    # consistent cache for tokens written during prefill.
-                    # kv_cache is flattened to
-                    # [num_blocks, page_size*(kv_lora_rank + qk_rope_head_dim)] so
-                    # the kernel derives page_size from stride(0).
-                    kv_cache_seg = self._seg_kv_cache_view(kv_cache)
-                    concat_and_cache_mla_seg(
-                        k_nope,
-                        k_rope.squeeze(1),
-                        kv_cache_seg,
-                        attn_metadata.slot_mapping.flatten(),
-                        kv_cache_dtype=self.kv_cache_dtype,
-                        scale=self._k_scale,
-                    )
-                else:
-                    concat_and_cache_mla(
-                        k_nope,
-                        k_rope.squeeze(1),
-                        kv_cache,
-                        attn_metadata.slot_mapping.flatten(),
-                        kv_cache_dtype=self.kv_cache_dtype,
-                        scale=self._k_scale,
-                    )
+            ctx_gathers = self._dcp_take_prefetched(attn_metadata)
+            prefill_q = self._prefill_q(q, q_scale, k_rope, positions)
+            self._write_prefill_kv(kv_cache, k_nope, k_rope, attn_metadata)
 
             if attn_metadata.has_cached:
                 # Shuffled KV takes either path too: the builder gives the chunked
@@ -3098,7 +3621,13 @@ class MLAAttention(nn.Module):
                 chunk_meta = getattr(attn_metadata, "mla_chunk_meta", None)
                 if chunk_meta is not None:
                     output = self._forward_prefill_cached_chunked(
-                        prefill_q, k_nope, k_rope, kv_cache, attn_metadata, chunk_meta
+                        prefill_q,
+                        k_nope,
+                        k_rope,
+                        kv_cache,
+                        attn_metadata,
+                        chunk_meta,
+                        ctx_gathers,
                     )
                 else:
                     output = self._forward_prefill_cached_single_pass(

@@ -1582,6 +1582,27 @@ class LinearBase(nn.Module):
             envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
         )
 
+    def quantize_input(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """The activation quant ``forward`` applies when given no ``x_scale``.
+        Not for unquantized, per_1x32 or native-A8 Linears."""
+        quant_func = self.quant_func
+        if self.quant_type.value == QuantType.per_1x128.value:
+            # preshuffle GEMM expects column-major x_scale;
+            # non-preshuffle GEMM expects row-major x_scale
+            quant_func = functools_partial(
+                (
+                    per_1x128_e8m0_quant
+                    if self.blockscale_e8m0_scale
+                    else self.quant_func
+                ),
+                transpose_scale=envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE,
+            )
+        return quant_func(
+            x,
+            quant_dtype=self.params_dtype,
+            scale=getattr(self, "input_scale", None),
+        )
+
     @mark_trace
     def forward(
         self,
@@ -1623,25 +1644,8 @@ class LinearBase(nn.Module):
             else:
                 y = tgemm.mm(x, self.weight, self.bias, otype=otype, out=out)
         else:
-            if x_scale is None:
-                quant_func = self.quant_func
-                if self.quant_type.value == QuantType.per_1x128.value:
-                    # preshuffle GEMM expects column-major x_scale;
-                    # non-preshuffle GEMM expects row-major x_scale
-                    quant_func = functools_partial(
-                        (
-                            per_1x128_e8m0_quant
-                            if self.blockscale_e8m0_scale
-                            else self.quant_func
-                        ),
-                        transpose_scale=envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE,
-                    )
-                if self.quant_type.value != QuantType.per_1x32.value:
-                    x, x_scale = quant_func(
-                        x,
-                        quant_dtype=self.params_dtype,
-                        scale=getattr(self, "input_scale", None),
-                    )
+            if x_scale is None and self.quant_type.value != QuantType.per_1x32.value:
+                x, x_scale = self.quantize_input(x)
             if self.quant_type.value == QuantType.per_Tensor.value:
                 if use_triton_gemm() and gemm_a8w8_triton is not None:
                     y = gemm_a8w8_per_tensor_impl(

@@ -1091,6 +1091,14 @@ class ParallelConfig:
 
     data_parallel_master_ip: str = "127.0.0.1"
 
+    tensor_parallel_size_local: int | None = None
+    """TP ranks (model-runner workers) this node runs. None means all of them,
+    the single-node case. Set it below tensor_parallel_size to spread one TP
+    group over several nodes; see atom/model_engine/tp_multinode.py."""
+    tensor_parallel_rank: int = 0
+    """First TP rank this node runs. The node that runs rank 0 also runs the
+    engine and the API server; the others run only their workers."""
+
     @property
     def is_multinode_dp(self) -> bool:
         """Whether this node owns only part of the global DP group.
@@ -2262,6 +2270,61 @@ class Config:
         return pcp_group_size_of(self)
 
     @property
+    def tp_size_local(self) -> int:
+        """TP worker processes on this node: fewer than `tp_world_size` when
+        one TP group spans several nodes."""
+        local = self.parallel_config.tensor_parallel_size_local
+        return self.tp_world_size if local is None else local
+
+    @property
+    def tp_rank_start(self) -> int:
+        """First TP rank on this node; it runs `tp_size_local` ranks from here."""
+        return self.parallel_config.tensor_parallel_rank
+
+    @property
+    def is_multinode_tp(self) -> bool:
+        return self.tp_size_local < self.tp_world_size or self.tp_rank_start > 0
+
+    def _check_multinode_tp(self) -> None:
+        pc = self.parallel_config
+        if pc.tensor_parallel_size_local is None and pc.tensor_parallel_rank == 0:
+            return
+        local, start, tp = self.tp_size_local, self.tp_rank_start, self.tp_world_size
+        if local < 1 or tp % local or start % local or not 0 <= start < tp:
+            raise ValueError(
+                f"--tensor-parallel-size-local {local} and --tensor-parallel-rank "
+                f"{start} must cut -tp {tp} into whole, equal per-node slices"
+            )
+        if not self.is_multinode_tp:
+            return
+        unsupported = [
+            name
+            for name, used in (
+                ("data parallelism", pc.data_parallel_size > 1),
+                ("--enable-dp-attention", self.enable_dp_attention),
+                ("pipeline parallelism", self.pipeline_parallel_size > 1),
+                ("prefill context parallelism", self.prefill_context_parallel_size > 1),
+                ("--fake-eplb", self.fake_eplb),
+                ("RapidServe", self.enable_rapidserve),
+            )
+            if used
+        ]
+        if unsupported:
+            raise ValueError(
+                "tensor parallelism across nodes does not support "
+                + ", ".join(unsupported)
+            )
+        if pc.data_parallel_base_port == 0 or pc.data_parallel_master_ip in (
+            "127.0.0.1",
+            "localhost",
+        ):
+            raise ValueError(
+                "tensor parallelism across nodes needs --data-parallel-master-ip "
+                "set to the address of the node that runs TP rank 0, and the "
+                "same nonzero --data-parallel-base-port on every node"
+            )
+
+    @property
     def capture_sizes(self) -> list[int]:
         """The declared CUDAGraph capture ladder, in batch sizes.
 
@@ -2523,6 +2586,7 @@ class Config:
             )
 
         assert 1 <= self.tensor_parallel_size <= 8
+        self._check_multinode_tp()
         if self.decode_context_parallel_size > 1:
             assert self.tensor_parallel_size % self.decode_context_parallel_size == 0, (
                 f"tp_size ({self.tensor_parallel_size}) must be divisible by "
@@ -2530,17 +2594,21 @@ class Config:
             )
             # Spec-decode + DCP arch gating. Any speculative method (mtp /
             # eagle3 / dspark) runs a q>1 verify pass, and DCP decode with q>1
-            # uses the round-robin CP (cprr) MLA kernel, which is persistent-only
-            # and ships only on gfx950; on gfx942 the non-persistent fallback
-            # ignores the cprr masking and silently produces WRONG output.
+            # needs a persistent MLA kernel that applies the causal mask on the
+            # GLOBAL positions of the round-robin KV shard: gfx950's cprr kernel,
+            # or gfx1250's PS1 one, which takes g_kv_indptr. On gfx942 the
+            # non-persistent fallback ignores the cprr masking and silently
+            # produces WRONG output.
             if self.speculative_config is not None:
                 from aiter.jit.utils.chip_info import get_gfx
 
-                gfx = get_gfx()
-                assert gfx == "gfx950", (
-                    f"Speculative decode + DCP is only supported on gfx950 (needs "
-                    f"the persistent cprr MLA kernel); got {gfx}. Disable DCP or "
-                    f"speculative decode on this GPU."
+                from atom.distributed.dcp_utils import dcp_persistent_supported
+
+                assert dcp_persistent_supported(), (
+                    f"Speculative decode + DCP needs the persistent round-robin CP "
+                    f"MLA decode (gfx950, or gfx1250 with "
+                    f"AITER_MLA_DECODE_PS1_FLYDSL=1); got {get_gfx()}. Disable DCP "
+                    f"or speculative decode on this GPU."
                 )
         # DCP KV-cache interleave granularity S. S=1 (default) = token-level
         # round-robin (unchanged). S>1 = block-level interleave; must divide the
@@ -3365,7 +3433,8 @@ def local_device_index(config: Config, rank: int) -> int:
         pc.data_parallel_rank_local or 0
     ) * config.pipeline_parallel_size + pc.pipeline_parallel_rank
     stage_span = config.tp_world_size * config.pcp_group_size
-    return engine_index * stage_span + rank
+    # A TP group that spans nodes has its ranks from tp_rank_start on here.
+    return engine_index * stage_span + rank - config.tp_rank_start
 
 
 _current_atom_config: Config | None = None

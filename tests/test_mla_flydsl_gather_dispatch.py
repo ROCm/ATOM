@@ -25,6 +25,13 @@ pytest.importorskip("aiter", reason="attention_mla imports the AITER runtime")
 from atom.model_ops import attention_mla as mla
 
 
+@pytest.fixture(autouse=True)
+def _gfx950_fp8_mha(monkeypatch):
+    """Pin the FP8 MHA backend to gfx950 unless a test selects gfx1250."""
+    monkeypatch.setattr(mla, "_FLYDSL_FP8_MHA_GFX1250_AVAILABLE", False)
+    monkeypatch.setattr(mla, "_ASM_FP8_MHA_AVAILABLE", False)
+
+
 def _impl(**over):
     """The slice of MLAAttention that `_kv_b_proj_gather` touches."""
     fields = {
@@ -126,8 +133,10 @@ def test_fp8_gather_checks_output_capability_once(monkeypatch, supported):
 
 def _prefill_impl(**over):
     impl = _impl(
+        use_asm_fp8_prefill_attn=False,
         use_flydsl_fp8_prefill_attn=True,
-        _flydsl_fp8_mha_ok=None,
+        _fp8_mha_ok=None,
+        _fp8_mha_backend=None,
         num_heads=12,
         qk_nope_head_dim=128,
         qk_rope_head_dim=64,
@@ -136,13 +145,20 @@ def _prefill_impl(**over):
         dtype=torch.bfloat16,
         scale=192**-0.5,
         layer_num=0,
+        dcp_group=SimpleNamespace(reuse_from=None),
         o_proj=lambda x: x,
     )
     for name in (
-        "_check_flydsl_fp8_mha",
+        "_check_fp8_prefill_mha",
+        "_dcp_start_context_gathers",
+        "_dcp_prefetch_ready",
+        "_dcp_prefetch_next",
         "_prepare_prefill_k",
         "_drop_rope_pad",
         "_flash_attn_prefill",
+        "_new_token_kv",
+        "_quantize_new_tokens",
+        "_chunked_prefill_attention",
     ):
         setattr(impl, name, MethodType(getattr(mla.MLAAttention, name), impl))
     impl.__dict__.update(over)
@@ -166,16 +182,229 @@ def test_fp8_mha_check_cached_and_warning_once(
     )
     impl = _prefill_impl(use_flydsl_fp8_prefill_attn=enabled)
     for tokens in (1, 70, 1024):
-        impl._check_flydsl_fp8_mha(torch.empty(tokens, 12, 192, dtype=torch.bfloat16))
-    assert impl._flydsl_fp8_mha_ok is (enabled and available and supported)
+        impl._check_fp8_prefill_mha(torch.empty(tokens, 12, 192, dtype=torch.bfloat16))
+    assert impl._fp8_mha_ok is (enabled and available and supported)
     assert predicate.call_count == int(enabled and available)
     # A second layer must not repeat the warning for the same model/process.
-    _prefill_impl(use_flydsl_fp8_prefill_attn=enabled)._check_flydsl_fp8_mha(
+    _prefill_impl(use_flydsl_fp8_prefill_attn=enabled)._check_fp8_prefill_mha(
         torch.empty(1, 12, 192, dtype=torch.bfloat16)
     )
     assert caplog.text.count("Falling back to BF16 attention") == int(
         enabled and not (available and supported)
     )
+
+
+@pytest.mark.parametrize("supported", [False, True])
+def test_gfx1250_fp8_mha_check_asks_the_a8w8_predicate(monkeypatch, supported):
+    """gfx1250 asks the a8w8 kernel, once, with Q/K/V shapes and no device memory."""
+    monkeypatch.setattr(mla, "_FLYDSL_FP8_MHA_GFX1250_AVAILABLE", True)
+    monkeypatch.setattr(mla, "get_gfx_runtime", lambda: "gfx1250")
+    monkeypatch.setattr(
+        mla.MLAAttention, "_fp8_prefill_fallback_logged", False, raising=False
+    )
+    monkeypatch.setattr(
+        mla,
+        "flydsl_flash_attn_fp8_supported",
+        Mock(side_effect=AssertionError("gfx950 predicate on gfx1250")),
+        raising=False,
+    )
+    predicate = Mock(return_value=supported)
+    monkeypatch.setattr(
+        mla, "flash_attn_a8w8_m32x8_supported", predicate, raising=False
+    )
+    impl = _prefill_impl()
+    for tokens in (1, 70, 1024):
+        impl._check_fp8_prefill_mha(torch.empty(tokens, 12, 192, dtype=torch.bfloat16))
+    assert impl._fp8_mha_ok is supported
+    assert impl._fp8_mha_backend == ("flydsl_gfx1250" if supported else None)
+    assert predicate.call_count == 1
+    mode, q, k, v = predicate.call_args.args
+    assert mode == "varlen"
+    assert [t.shape for t in (q, k, v)] == [(1, 12, 192), (1, 12, 192), (1, 12, 128)]
+    assert all(t.dtype == torch.float8_e4m3fn and t.is_meta for t in (q, k, v))
+
+
+def test_gfx1250_fp8_prefill_launches_a8w8_with_descales(monkeypatch):
+    """The quantized Q/K/V and their descales reach the a8w8 kernel unchanged."""
+    q8, k8, v8 = (
+        torch.empty(8, 12, d, dtype=torch.float8_e4m3fn) for d in (192, 192, 128)
+    )
+    qs, ks, vs = torch.full((1,), 0.5), torch.full((1,), 0.25), torch.full((1,), 2.0)
+    monkeypatch.setattr(
+        mla,
+        "fused_qkv_per_tensor_quant",
+        lambda *a, **k: (q8, k8, v8, qs, ks, vs, None, None),
+    )
+    monkeypatch.setattr(
+        mla,
+        "flydsl_flash_attn_fp8_func",
+        Mock(side_effect=AssertionError("gfx950 kernel on gfx1250")),
+        raising=False,
+    )
+    result = (torch.empty(8, 12, 128, dtype=torch.bfloat16), torch.empty(12, 8))
+    launch = Mock(return_value=result)
+    monkeypatch.setattr(mla, "flash_attn_varlen_a8w8_m32x8", launch, raising=False)
+    impl = _prefill_impl(_fp8_mha_ok=True, _fp8_mha_backend="flydsl_gfx1250")
+    cu = torch.tensor([0, 8], dtype=torch.int32)
+    q = torch.randn(8, 12, 192, dtype=torch.bfloat16)
+    out = impl._flash_attn_prefill(
+        q,
+        torch.randn(8, 12, 192, dtype=torch.bfloat16),
+        torch.randn(8, 12, 128, dtype=torch.bfloat16),
+        cu_seqlens_q=cu,
+        cu_seqlens_k=cu,
+        max_seqlen_q=8,
+        max_seqlen_k=8,
+        min_seqlen_q=8,
+        dropout_p=0.0,
+        causal=True,
+        return_lse=True,
+    )
+    assert out is result
+    launch.assert_called_once_with(
+        q8,
+        k8,
+        v8,
+        cu,
+        cu,
+        8,
+        8,
+        softmax_scale=impl.scale,
+        causal=True,
+        return_lse=True,
+        q_descale=qs,
+        k_descale=ks,
+        v_descale=vs,
+    )
+
+
+def _asm_gfx1250(monkeypatch, device_ok=True):
+    """A gfx1250 whose AITER ships the ASM FP8 FMHA; `device_ok` answers its B0 gate."""
+    monkeypatch.setattr(mla, "_ASM_FP8_MHA_AVAILABLE", True)
+    monkeypatch.setattr(mla, "_FLYDSL_FP8_MHA_GFX1250_AVAILABLE", True)
+    monkeypatch.setattr(mla, "get_gfx_runtime", lambda: "gfx1250")
+    monkeypatch.setattr(
+        mla.MLAAttention, "_fp8_prefill_fallback_logged", False, raising=False
+    )
+    gate = Mock(return_value=device_ok)
+    monkeypatch.setattr(mla, "is_gfx1250_asm_supported", gate, raising=False)
+    return gate
+
+
+@pytest.mark.parametrize("asm", ["0", "1"])
+@pytest.mark.parametrize("flydsl", ["0", "1"])
+def test_fp8_prefill_attn_flags_are_exclusive(monkeypatch, caplog, asm, flydsl):
+    """Both set means ASM, and every layer reads the flags: warn once, not per layer."""
+    monkeypatch.setenv("ATOM_USE_ASM_FP8_PREFILL_ATTN", asm)
+    monkeypatch.setenv("ATOM_USE_FLYDSL_FP8_PREFILL_ATTN", flydsl)
+    monkeypatch.setattr(
+        mla.MLAAttention, "_fp8_prefill_both_flags_logged", False, raising=False
+    )
+    both = asm == flydsl == "1"
+    for _ in range(3):
+        flags = mla.MLAAttention._fp8_prefill_attn_flags()
+        assert flags == (asm == "1", flydsl == "1" and not both)
+    assert caplog.text.count("set only one") == int(both)
+
+
+def test_asm_fp8_mha_serves_k3_on_gfx1250(monkeypatch):
+    """K3's D192x128 heads go to ASM, asked once, without consulting FlyDSL."""
+    gate = _asm_gfx1250(monkeypatch)
+    for name in ("flash_attn_a8w8_m32x8_supported", "flydsl_flash_attn_fp8_supported"):
+        monkeypatch.setattr(
+            mla, name, Mock(side_effect=AssertionError(name)), raising=False
+        )
+    impl = _prefill_impl(
+        use_asm_fp8_prefill_attn=True, use_flydsl_fp8_prefill_attn=False
+    )
+    for tokens in (1, 70, 1024):
+        impl._check_fp8_prefill_mha(torch.empty(tokens, 12, 192, dtype=torch.bfloat16))
+    assert impl._fp8_mha_ok is True
+    assert impl._fp8_mha_backend == "asm"
+    assert gate.call_count == 1
+
+
+@pytest.mark.parametrize("reason", ["gfx950", "a0", "head_dim"])
+def test_asm_fp8_mha_declined_uses_bf16(monkeypatch, caplog, reason):
+    """Where ASM does not apply, the layer runs BF16 attention, not FlyDSL, and
+    the fallback is logged."""
+    gate = _asm_gfx1250(monkeypatch, device_ok=reason != "a0")
+    if reason == "gfx950":
+        monkeypatch.setattr(mla, "get_gfx_runtime", lambda: "gfx950")
+        monkeypatch.setattr(mla, "_FLYDSL_FP8_MHA_AVAILABLE", True)
+    for name in ("flash_attn_a8w8_m32x8_supported", "flydsl_flash_attn_fp8_supported"):
+        monkeypatch.setattr(
+            mla, name, Mock(side_effect=AssertionError(name)), raising=False
+        )
+    impl = _prefill_impl(
+        use_asm_fp8_prefill_attn=True, use_flydsl_fp8_prefill_attn=False
+    )
+    head_dim = 128 if reason == "head_dim" else 192
+    impl._check_fp8_prefill_mha(torch.empty(4, 12, head_dim, dtype=torch.bfloat16))
+    assert impl._fp8_mha_ok is False
+    assert impl._fp8_mha_backend is None
+    assert gate.call_count == int(reason == "a0")
+    assert caplog.text.count("ATOM_USE_ASM_FP8_PREFILL_ATTN=1 requested") == 1
+
+
+@pytest.mark.parametrize("return_lse", [False, True])
+def test_asm_fp8_prefill_launch_and_lse_layout(monkeypatch, return_lse):
+    """The ASM kernel gets the quantized Q/K/V and descales; its [total_q, heads, 1]
+    LSE reaches the merges as [heads, total_q]."""
+    q8, k8, v8 = (
+        torch.empty(8, 12, d, dtype=torch.float8_e4m3fn) for d in (192, 192, 128)
+    )
+    qs, ks, vs = torch.full((1,), 0.5), torch.full((1,), 0.25), torch.full((1,), 2.0)
+    monkeypatch.setattr(
+        mla,
+        "fused_qkv_per_tensor_quant",
+        lambda *a, **k: (q8, k8, v8, qs, ks, vs, None, None),
+    )
+    for name in ("flydsl_flash_attn_fp8_func", "flash_attn_varlen_a8w8_m32x8"):
+        monkeypatch.setattr(
+            mla, name, Mock(side_effect=AssertionError(name)), raising=False
+        )
+    out = torch.empty(8, 12, 128, dtype=torch.bfloat16)
+    lse = torch.arange(8 * 12, dtype=torch.float32).view(8, 12, 1)
+    launch = Mock(return_value=(out, lse))
+    monkeypatch.setattr(mla, "fmha_fwd_fp8_varlen_asm", launch, raising=False)
+    impl = _prefill_impl(_fp8_mha_ok=True, _fp8_mha_backend="asm")
+    cu = torch.tensor([0, 8], dtype=torch.int32)
+    result = impl._flash_attn_prefill(
+        torch.randn(8, 12, 192, dtype=torch.bfloat16),
+        torch.randn(8, 12, 192, dtype=torch.bfloat16),
+        torch.randn(8, 12, 128, dtype=torch.bfloat16),
+        cu_seqlens_q=cu,
+        cu_seqlens_k=cu,
+        max_seqlen_q=8,
+        max_seqlen_k=8,
+        min_seqlen_q=8,
+        dropout_p=0.0,
+        causal=True,
+        return_lse=return_lse,
+    )
+    launch.assert_called_once_with(
+        q8,
+        k8,
+        v8,
+        qs,
+        ks,
+        vs,
+        cu,
+        cu,
+        8,
+        8,
+        softmax_scale=impl.scale,
+        is_causal=True,
+        return_lse=return_lse,
+    )
+    if not return_lse:
+        assert result is out
+        return
+    result_out, result_lse = result
+    assert result_out is out
+    assert result_lse.shape == (12, 8) and result_lse.is_contiguous()
+    torch.testing.assert_close(result_lse, lse.squeeze(-1).t(), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(
@@ -193,6 +422,8 @@ def test_unsupported_fp8_prefill_keeps_bf16_inputs(monkeypatch, path):
         "fused_kv_per_tensor_quant",
         "quant_fp8_per_tensor",
         "flydsl_flash_attn_fp8_func",
+        "flash_attn_varlen_a8w8_m32x8",
+        "fmha_fwd_fp8_varlen_asm",
     ):
         monkeypatch.setattr(
             mla,

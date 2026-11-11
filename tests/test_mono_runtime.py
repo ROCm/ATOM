@@ -363,6 +363,31 @@ def test_a_spilled_kernel_is_rebuilt_lean_and_its_width_served(caplog):
     assert "pre_s56 need scratch, rebuilt lean" in caplog.text
 
 
+def test_an_explicit_residency_hazard_uses_the_same_lean_ladder(caplog):
+    spill = _CompiledLauncher(b"\x00", b"pre_s16")
+    safe = _CompiledLauncher(b"\x00", b"pre_s16_lean")
+    lean_calls = []
+
+    def lean(built, spilled):
+        lean_calls.append((built, spilled))
+        return "lean"
+
+    widths = WidthBuilds(
+        lambda _key: "fat",
+        lambda built: [(spill if built == "fat" else safe, _NoArgs)],
+        None,
+        "test",
+        lean=lean,
+        hazards=lambda launcher: (
+            ("2 sgpr spill",) if launcher is spill else ()
+        ),
+    )
+    with caplog.at_level("INFO", logger="atom"):
+        assert widths.prepare(16)
+    assert lean_calls == [("fat", [spill])]
+    assert "have resident resource hazards, rebuilt lean" in caplog.text
+
+
 def test_a_lean_rebuild_that_still_spills_refuses_its_width(caplog):
     spill = _CompiledLauncher(b"\x18", b"pre_s56")
     widths = WidthBuilds(

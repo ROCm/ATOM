@@ -47,7 +47,9 @@ from atom.model_engine.collective_rpc import (
 from atom.utils import (
     envs,
     get_mp_context,
+    get_open_port,
     get_open_zmq_ipc_path,
+    get_tcp_uri,
     init_exit_handler,
     make_zmq_socket,
     resolve_obj_by_qualname,
@@ -172,6 +174,10 @@ class AsyncIOProc:
         self.rpc_queue: queue.Queue | None = None
 
         self.rpc_broadcast_mq = MessageQueue.create_from_handle(input_shm_handle, rank)
+        if self.rpc_broadcast_mq._is_remote_reader:
+            from atom.model_engine.tp_multinode import await_release
+
+            await_release(self.rpc_broadcast_mq)
         import atexit
 
         atexit.register(self._cleanup_shared_memory)
@@ -463,6 +469,7 @@ class AsyncIOProcManager:
         proc_num: int,
         runner: str,
         *args,
+        local_proc_num: int | None = None,
         on_worker_failure=None,
         kv_progress_event: threading.Event | None = None,
     ):
@@ -470,6 +477,11 @@ class AsyncIOProcManager:
         self.on_worker_failure = on_worker_failure
         self.kv_progress_event = kv_progress_event
         self.proc_num = proc_num
+        # Ranks from local_proc_num on run on other nodes (tp_multinode.py) and
+        # reach this node over TCP.
+        self.local_proc_num = proc_num if local_proc_num is None else local_proc_num
+        n_remote = proc_num - self.local_proc_num
+        host = args[0].parallel_config.data_parallel_master_ip if n_remote else None
 
         io_addrs = [get_open_zmq_ipc_path(), get_open_zmq_ipc_path()]
         self.procs: list[multiprocessing.Process] = []
@@ -478,7 +490,10 @@ class AsyncIOProcManager:
         self.label = f"AsyncIOProcManager({self.runner_label})"
 
         self.rpc_broadcast_mq = MessageQueue(
-            proc_num, proc_num, max_chunk_bytes=16 * 1024 * 1024
+            proc_num,
+            self.local_proc_num,
+            max_chunk_bytes=16 * 1024 * 1024,
+            connect_ip=host,
         )
         self._block_table_encoder = BlockTableDeltaEncoder()
         scheduler_output_handle = self.rpc_broadcast_mq.export_handle()
@@ -487,12 +502,14 @@ class AsyncIOProcManager:
         import atexit
 
         atexit.register(self._cleanup_shared_memory)
-        self.all_ranks_barrier = ctx.Barrier(proc_num)
+        # A multiprocessing barrier cannot reach another node; barrier RPCs are
+        # refused instead (see _collective_rpc).
+        self.all_ranks_barrier = None if n_remote else ctx.Barrier(proc_num)
         init_exit_handler(self)
 
         # KV output aggregation infrastructure
         self.kv_output_aggregator: KVOutputAggregator | None = None
-        self.kv_output_addrs = [get_open_zmq_ipc_path() for _ in range(proc_num)]
+        self.kv_output_addrs = [self._reply_addr(i, host) for i in range(proc_num)]
         self.kv_outputs_queues: list[queue.Queue] = [
             queue.Queue() for _ in range(proc_num)
         ]
@@ -500,7 +517,7 @@ class AsyncIOProcManager:
         self.kv_output_threads: list[threading.Thread] = []
 
         # Generic collective-RPC reply channels, one per rank
-        self.rpc_output_addrs = [get_open_zmq_ipc_path() for _ in range(proc_num)]
+        self.rpc_output_addrs = [self._reply_addr(i, host) for i in range(proc_num)]
         self.rpc_outputs_queues: list[queue.Queue] = [
             queue.Queue() for _ in range(proc_num)
         ]
@@ -510,7 +527,7 @@ class AsyncIOProcManager:
         # rank -> exit code, written by the monitor before it tears down.
         self._dead_ranks: dict[int, int | None] = {}
 
-        for i in range(proc_num):
+        for i in range(self.local_proc_num):
             label = f"ModelRunner{i}/{proc_num}"
             # Only rank 0 gets the primary output address
             addrs = [None, io_addrs[1]] if i == 0 else [None, None]
@@ -570,6 +587,32 @@ class AsyncIOProcManager:
             self.rpc_output_threads.append(t)
 
         self.monitor_procs()
+        if n_remote:
+            from atom.model_engine.tp_multinode import (
+                publish_bootstrap,
+                release_remote_readers,
+            )
+
+            publish_bootstrap(
+                args[0],
+                {
+                    "proc_num": proc_num,
+                    "handle": scheduler_output_handle,
+                    "runner": runner,
+                    "args": args,
+                    "kv_output_addrs": self.kv_output_addrs,
+                    "rpc_output_addrs": self.rpc_output_addrs,
+                },
+            )
+            release_remote_readers(
+                self.rpc_broadcast_mq, n_remote, lambda: self.still_running
+            )
+
+    def _reply_addr(self, rank: int, host: str | None) -> str:
+        """Where `rank` sends its replies: IPC from this node, TCP from another."""
+        if rank < self.local_proc_num:
+            return get_open_zmq_ipc_path()
+        return get_tcp_uri(host, get_open_port())
 
     def exit(self):
         if not self.still_running:
@@ -753,6 +796,18 @@ class AsyncIOProcManager:
             error = (
                 f"the deadline for {func_name!r} had passed before it was sent, "
                 f"so no TP rank ran it"
+            )
+            return [
+                RpcResult(payload.request_id, rank, error=error)
+                for rank in range(self.proc_num)
+            ]
+
+        if payload.barrier and getattr(self, "local_proc_num", self.proc_num) < (
+            self.proc_num
+        ):
+            error = (
+                f"cannot run barrier RPC {func_name!r}: the TP ranks on other "
+                f"nodes share no barrier with this one"
             )
             return [
                 RpcResult(payload.request_id, rank, error=error)
