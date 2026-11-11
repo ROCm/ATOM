@@ -150,31 +150,34 @@ def select_defs(k4ctx):
         kt = fx.ptr_load(keys + (2 * (n_blk - 1) + 1))
         return (key, b, rank, live), page, kt
 
-    def place(entry, kt, n_blk, seq_len):
-        """A ranked block's slot, as the Triton selector emits them: full
+    def place(entries, kt, n_blk, seq_len):
+        """Ranked blocks' slots, as the Triton selector emits them: full
         blocks by rank, the tail block (the one holding the current token)
-        last. ``entry``: this thread's (key, block, rank, live) -> ((selected,
-        slot), sparse context length). One barrier: whether the tail is
-        selected is known only once every thread's entry is."""
-        key, bb, rank, live = entry
+        last. ``entries``: this thread's (key, block, rank, live) each ->
+        ((selected, slot) each, sparse context length). One barrier: whether
+        the tail is selected is known only once every thread's entry is."""
         n_sel = fx.min(n_blk, TOPK_BLOCKS)
         tail = n_blk - 1
-        sel = live & (rank < n_sel)
-        is_tail = sel & (bb == tail)
-        if is_tail:
-            fx.ptr_store(fx.Int32(1), blk + 17)
+        sels = [live & (rank < n_sel) for _, _, rank, live in entries]
+        tails = [sel & (bb == tail) for sel, (_, bb, _, _) in zip(sels, entries)]
+        for is_tail in tails:
+            if is_tail:
+                fx.ptr_store(fx.Int32(1), blk + 17)
         lds_barrier()
         tail_sel = fx.ptr_load(blk + 17) != 0
         n_full = n_sel - tail_sel.select(fx.Int32(1), fx.Int32(0))
-        tail_first = (kt > key) | ((kt == key) & (tail > bb))
-        slot = is_tail.select(
-            n_full, rank - tail_first.select(fx.Int32(1), fx.Int32(0))
-        )
+        slots = []
+        for (key, bb, rank, _), sel, is_tail in zip(entries, sels, tails):
+            tail_first = (kt > key) | ((kt == key) & (tail > bb))
+            slot = is_tail.select(
+                n_full, rank - tail_first.select(fx.Int32(1), fx.Int32(0))
+            )
+            slots.append((sel, slot))
         n_ctx = tail_sel.select(
             n_full * SPARSE_BLOCK + seq_len - tail * SPARSE_BLOCK,
             fx.min(n_sel * SPARSE_BLOCK, seq_len),
         )
-        return (sel, slot), n_ctx
+        return slots, n_ctx
 
     def write_slot(sel, slot, page, n_ctx, part, table):
         """A selected block's pages into blk (when its slot is split task
@@ -220,7 +223,7 @@ def select_defs(k4ctx):
         if tid < 2 * PAGES_PER_BLOCK + 2:
             fx.ptr_store(fx.Int32(0), blk + tid)
         entry, page, kt = rank_blocks(iscore, n_blk, r_bt, pick(scored, k))
-        (sel, slot), n_ctx = place(entry, kt, n_blk, seq_len)
+        ((sel, slot),), n_ctx = place([entry], kt, n_blk, seq_len)
         write_slot(sel, slot, page, n_ctx, t, table)
 
     def reuse_selection(k, t):
@@ -241,15 +244,62 @@ def select_defs(k4ctx):
         lds_barrier()
 
     def select_long(k, part):
-        """Split task (k, part) of a long request's token, before the
-        split stage. Its share of the blocks (a thread keys CAND_BATCH) -> each
-        wave's TOPK_BLOCKS best -> the CTA's, to a candidate mailbox; then the
-        N_SPLIT shares' candidates (the context's TOPK_BLOCKS best are among
-        them) are ranked and placed -> blk as ``select_blocks`` leaves it, and
-        (part 0) the sparse table. The share: an eighth of the blocks, to this
-        rank's sel_long; with every index head (indexer context parallelism)
-        head part // 2's scores of half part % 2 of this rank's blocks, to the
-        head's rank's sel_cp -- the shares its own head's candidates come in."""
+        """Split task (k, part) of a long request's token, before the split
+        stage -> blk as ``select_blocks`` leaves it, and (part 0) the sparse
+        table. Up to THREADS * CAND_BATCH blocks of one index head the task
+        ranks them all (``select_whole``), else the token's split tasks
+        exchange their shares' best (``select_shares``)."""
+        if const_expr(ih_count > 1):
+            select_shares(k, part)
+        else:
+            if pick(n_blks, k) <= THREADS * CAND_BATCH:
+                select_whole(k, part)
+            else:
+                select_shares(k, part)
+
+    def select_whole(k, part):
+        """``select_long`` ranking every block in the task, CAND_BATCH a
+        thread: no wait on the token's other split tasks (a 64k..128k context:
+        their candidate round trip held its split back)."""
+        n_blk = pick(n_blks, k)
+        iscore = shift(mr("iscore"), fx.Int64(k) * (MAX_INDEX_BLOCKS * 8))
+        r_bt = rsrc(bt_row(k))
+        if tid == 0:
+            fx.ptr_store(fx.Int32(0), blk + 17)
+        blocks = [tid + THREADS * i for i in range(CAND_BATCH)]
+        live = [b < n_blk for b in blocks]
+        pages = [
+            fx.Int32(
+                bo.buffer_load(r_bt, fx.min(b, n_blk - 1), vec_width=1, dtype=T.i32)
+            )
+            for b in blocks
+        ]
+        # a pinned block's slot polls a scored block's (``rank_blocks``)
+        slots = [
+            fx.min(fx.max(b, init_blocks), n_blk - 1 - local_blocks) for b in blocks
+        ]
+        words = [w[0] for w in mb_poll([(iscore, sl, 1) for sl in slots])]
+        hs = [index_key(b, w, n_blk) for b, w in zip(blocks, words)]
+        cnts = rank_in_cta(list(zip(hs, blocks, live)), n_blk)
+        stamp(19)
+        kt = fx.ptr_load(keys + (2 * (n_blk - 1) + 1))
+        placed, n_ctx = place(
+            list(zip(hs, blocks, cnts, live)), kt, n_blk, pick(seq_lens_k, k)
+        )
+        table = table_of(k)
+        for (sel, slot), page in zip(placed, pages):
+            write_slot(sel, slot, page, n_ctx, part, table)
+        lds_barrier()
+
+    def select_shares(k, part):
+        """``select_long`` over the token's split tasks: its share of the
+        blocks (a thread keys CAND_BATCH) -> each wave's TOPK_BLOCKS best -> the
+        CTA's, to a candidate mailbox; then the N_SPLIT shares' candidates (the
+        context's TOPK_BLOCKS best are among them) are ranked and placed. The
+        share: an eighth of the blocks, to this rank's sel_long; with every
+        index head (indexer context parallelism) head part // 2's scores of
+        half part % 2 of this rank's blocks, to the head's rank's sel_cp -- the
+        shares its own head's candidates come in."""
         n_blk = pick(n_blks, k)
         iscore = shift(mr("iscore"), fx.Int64(k) * (MAX_INDEX_BLOCKS * 8))
         first = k * (N_SPLIT * TOPK_BLOCKS)  # token k's candidates (pair pairs)
@@ -315,7 +365,9 @@ def select_defs(k4ctx):
         stamp(19)
         # the tail block is a local one: its key is forced
         kt = index_key(n_blk - 1, fx.Int32(0), n_blk)
-        (sel, slot), n_ctx = place((ch, cl, cnt, held), kt, n_blk, pick(seq_lens_k, k))
+        ((sel, slot),), n_ctx = place(
+            [(ch, cl, cnt, held)], kt, n_blk, pick(seq_lens_k, k)
+        )
         write_slot(sel, slot, page, n_ctx, part, table)
         lds_barrier()
 
