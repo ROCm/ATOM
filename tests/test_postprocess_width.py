@@ -380,16 +380,24 @@ def test_a_producer_skips_propose_on_either_output_path(
     """A producer outside PP defers its output, so the deferred branch must
     skip propose too (a DSpark draft below its TP floor cannot run the block
     pass); it still keeps the step's bookkeeping."""
+    forward_mode = types.SimpleNamespace(running_tokens=2)
     monkeypatch.setattr(
         mod,
         "get_forward_context",
-        lambda: types.SimpleNamespace(spec_decode_metadata=None),
+        lambda: types.SimpleNamespace(
+            spec_decode_metadata=None,
+            context=types.SimpleNamespace(forward_mode=forward_mode),
+        ),
     )
     monkeypatch.setattr(
         mod, "get_tp_group", lambda: types.SimpleNamespace(world_size=1)
     )
     monkeypatch.setattr(mod, "get_pcp_world_size", lambda: 1)
+    monkeypatch.setattr(mod, "pcp_is_enabled", lambda: False)
+    monkeypatch.setattr(mod, "sp_is_enabled", lambda: False)
     runner = _runner({})
+    runner._served = None
+    runner.forward_done_event = types.SimpleNamespace(record=lambda stream=None: None)
     runner.drafter = types.SimpleNamespace(draft_kv_duplicates_propose=False)
     proposed, sent = [], []
     drafts = np.array([[5], [6]], dtype=np.int32)

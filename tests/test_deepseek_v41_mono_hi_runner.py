@@ -285,6 +285,7 @@ def test_postprocess_takes_the_heads_verdict_and_the_broadcast_ids(
     runner = _runner(runner_module, _Model())
     runner.tokenID_processor = SimpleNamespace(
         is_deferred_out=True,
+        is_pd_producer=False,
         prev_batch=None,
         prev_rejected_num=None,
         prev_bonus_num=None,
