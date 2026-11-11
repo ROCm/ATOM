@@ -1830,7 +1830,9 @@ def _warm_prefix_on_rank0(mgr, length=8192):
 
 @pytest.mark.parametrize("shape", ["cold", "owner", "moved"])
 @pytest.mark.parametrize("loads", [True, False])
-def test_prefix_spread_placement_walks_the_hash_chain_one_read_and_one_create(shape, loads):
+def test_prefix_spread_placement_walks_the_hash_chain_one_read_and_one_create(
+    shape, loads
+):
     from atom.kv_transfer.offload.tier import OffloadTierProfile
 
     mgr = _make_spread_mgr(tier=OffloadTierProfile(loads, 1024, 512))
