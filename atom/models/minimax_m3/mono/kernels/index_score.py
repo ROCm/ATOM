@@ -146,7 +146,7 @@ def emit_index_scores(
     slot, lane, wave, red, mb_put, iscore, q_frag, tokens, q_len, init_blocks,
     local_blocks, scale, index_cache, block_table, seq_lens, bt_width,
     wait_new_keys=None, prepare=None, heads=ONE_INDEX_HEAD, q_frag_head=None,
-    prepare_heads=None, nvfp4=False,
+    prepare_heads=None, nvfp4=False, strip=(),
 ):  # fmt: skip
     """This CTA's (``slot``) share of the step's score tasks: up to BLOCKS tasks,
     task u runs on CTA u, else on wave (u // BLOCKS) % WAVES of CTA u % BLOCKS
@@ -178,7 +178,7 @@ def emit_index_scores(
     assert local_blocks >= 1, "the block of the current token must be pinned"
     l16 = lane % 16
     g4 = lane // 16
-    r_ic = rsrc(index_cache)
+    r_ic = rsrc(index_cache, 0 if "idx" in strip else None)
     rows = step_rows(seq_lens, tokens, q_len, heads)
     seq = rows.seq
     # every request's scored blocks in one list, a task per wave across the grid;

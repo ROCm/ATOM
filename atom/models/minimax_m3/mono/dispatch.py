@@ -11,6 +11,7 @@ that disagreed would wait on each other forever (a per-rank flag such as
 """
 
 import logging
+import os
 
 import torch
 
@@ -32,6 +33,7 @@ from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
+_OVERLAP_PROBE = bool(os.environ.get("ATOM_MONO_OVERLAP_PROBE"))
 
 
 def _uses_dspark(atom_config) -> bool:
@@ -167,6 +169,10 @@ class MonoDecode:
             out = forward_probed(self._mono.runner, input_ids, positions, sums)
         else:
             out = self._mono.runner.forward(input_ids, positions)
+        if _OVERLAP_PROBE:  # a timing run of the overlap probes (``overlap_probe``)
+            from atom.models.minimax_m3.mono.overlap_probe import maybe_probe
+
+            maybe_probe(self._mono.runner, input_ids, positions)
         if envs.ATOM_MONO_TRACE:
             trace_logits(
                 self._lm, self._mono.runner.rank, input_ids, positions, out,
