@@ -28,7 +28,7 @@ def _runtime():
     if _RUNTIME is None:
         try:
             from ops.sparse_mla import runtime
-        except Exception:  # noqa: BLE001 - absent or broken package: keep Triton
+        except Exception:  # absent or broken package: keep Triton
             logger.warning(
                 "ATOM_V4_DECODE_FLYDSL=1 but plugin_poc's ops.sparse_mla is not "
                 "importable; V4 BF16 decode keeps the Triton path",
