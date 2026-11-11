@@ -66,33 +66,6 @@ def test_allocation_cap_masks_writes_past_each_rows_allocation(host_staging, uni
     assert slots.tolist() == [[30, 31, -1]]
 
 
-def test_allocation_cap_leaves_the_minimum_to_each_caller(host_staging):
-    """MiniMax-M3.1 shape: page-128 units, rows capped into their own buffer
-    while `ctx_lens` stays as the proposer built it. Kimi-K3 DSpark GQA shape: one
-    pool entry (block size x DCP) per block id, `ctx_lens` capped in place."""
-    import torch
-
-    from atom.models.dspark_draft import AllocationCap
-
-    T = 3
-    pos = torch.tensor([[126, 127, 128], [5, 6, 7], [1, 2, 3]])
-    ctx = torch.tensor([129, 8, 1 + T], dtype=torch.int32)
-
-    cap = AllocationCap(4, "cpu")
-    ctx_eff = torch.zeros(4, dtype=torch.int32)
-    alloc = cap.apply([1, 2], 2, pos, pos.clone(), 128)
-    torch.minimum(ctx, alloc, out=ctx_eff[:3])
-    assert ctx.tolist() == [129, 8, 1 + T]
-    assert ctx_eff[:3].tolist() == [128, 8, 1 + T]
-
-    entry = 128 * 8
-    pos = torch.tensor([[entry - 2, entry - 1, entry], [5, 6, 7], [1, 2, 3]])
-    ctx = torch.tensor([entry + 1, 8, 1 + T], dtype=torch.int32)
-    alloc = cap.apply([1, 2], 2, pos, pos.clone(), entry)
-    torch.minimum(ctx, alloc, out=ctx)
-    assert ctx.tolist() == [entry, 8, 1 + T]
-
-
 def test_minimax_m31_dspark_caps_the_rows_but_not_ctx_lens(host_staging):
     """MiniMax-M3.1's block rows read at most the allocation; the proposer's
     `ctx_lens` (`attn_metadata.context_lens`) is left as it built it."""

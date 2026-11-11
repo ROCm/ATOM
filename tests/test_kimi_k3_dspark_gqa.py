@@ -107,20 +107,38 @@ def test_gqa_draft_config_normalize_is_idempotent():
     assert hf.model_type == model_type
 
 
-def test_gqa_draft_rope_is_the_drafts_own():
-    """The rope the draft attention builds comes from the draft's config:
-    theta 10000 / YaRN x16 from 65536, neox-style -- not the target's theta
-    50000 / x32. A wrong rope loads clean and only moves acceptance."""
+def test_gqa_draft_rope_is_the_drafts_own(monkeypatch):
+    """The rope `KimiK3DSparkGQAAttention` builds comes from the draft's config:
+    theta 10000 / YaRN x16 from 65536, neox-style, over the whole head --
+    not the target's theta 50000 / x32. A wrong rope loads clean and only
+    moves acceptance."""
     from atom.config import SpeculativeConfig
-    from atom.models.dspark_draft import draft_rope_kwargs
 
-    def kwargs_fn(cfg):
-        # What `KimiK3DSparkGQAAttention` passes.
-        return draft_rope_kwargs(cfg, is_neox_style=True)
+    mod = gpu_stack_import("atom.models.kimi_k3_dspark_gqa")
+    group = types.SimpleNamespace(rank_in_group=0, world_size=1)
+    monkeypatch.setattr(
+        gpu_stack_import("atom.model_ops.linear"), "get_tp_group", lambda: group
+    )
+    monkeypatch.setattr(
+        gpu_stack_import("atom.model_ops.layernorm"),
+        "get_tensor_model_parallel_world_size",
+        lambda: 1,
+    )
+    calls = []
+    monkeypatch.setattr(mod, "get_rope", lambda *a, **k: calls.append((a, k)))
 
-    hf = _radixark_cfg()
+    def rope_of(cfg):
+        calls.clear()
+        mod.KimiK3DSparkGQAAttention(cfg, 0, block_attn=None)
+        ((args, kw),) = calls
+        return args, kw
+
+    # The checkpoint's rope at a toy width: the rope reads none of these.
+    toy = {"hidden_size": 128, "num_attention_heads": 4, "num_key_value_heads": 2}
+    hf = _radixark_cfg(**toy)
     SpeculativeConfig.hf_config_override(hf, model_path=None)
-    kw = kwargs_fn(hf)
+    args, kw = rope_of(hf)
+    assert args == (64,) and kw["rotary_dim"] == 64
     assert kw["base"] == 10000.0
     assert kw["is_neox_style"] is True
     assert kw["rope_scaling"]["rope_type"] == "yarn"
@@ -128,8 +146,8 @@ def test_gqa_draft_rope_is_the_drafts_own():
     assert kw["rope_scaling"]["original_max_position_embeddings"] == 65536
 
     # No scaling in the config: a plain rope, not YaRN.
-    plain = _radixark_cfg(rope_parameters={"rope_theta": 10000.0})
-    assert kwargs_fn(plain)["rope_scaling"] is None
+    plain = _radixark_cfg(**toy, rope_parameters={"rope_theta": 10000.0})
+    assert rope_of(plain)[1]["rope_scaling"] is None
 
 
 def test_gqa_draft_refuses_a_max_model_len_past_the_rope_cache():
@@ -1175,10 +1193,6 @@ def test_block_writes_and_reads_stay_inside_the_allocated_blocks():
     m = gpu_stack_import("atom.models.kimi_k3_dspark_gqa")
     draft = m.KimiK3DSparkGQA.__new__(m.KimiK3DSparkGQA)
     vblock, T = 1024, 3
-    # The bound FLASH page is one entry wide.
-    k_cache = torch.empty(1, vblock, 1, 1, device="cuda")
-    kv = types.SimpleNamespace(k_cache=k_cache)
-    draft.layers = [types.SimpleNamespace(self_attn=types.SimpleNamespace(kv=kv))]
     draft._alloc_cap = gpu_stack_import("atom.models.dspark_draft").AllocationCap(
         4, "cuda"
     )
@@ -1189,6 +1203,6 @@ def test_block_writes_and_reads_stay_inside_the_allocated_blocks():
     )
     slots = torch.tensor([[10, 11, 12], [20, 21, 22], [-1, -1, -1]], device="cuda")
     ctx = torch.tensor([vblock + 1, 8, 1 + T], dtype=torch.int32, device="cuda")
-    draft.prepare_paged_block(None, None, pos, slots, ctx, [1, 2], 2)
+    draft.prepare_paged_block(None, None, pos, slots, ctx, [1, 2], 2, vblock)
     assert slots.tolist() == [[10, 11, -1], [20, 21, 22], [-1, -1, -1]]
     assert ctx.tolist() == [vblock, 8, 1 + T]
