@@ -157,6 +157,10 @@ class PrefixSpreadRouter:
                 holders.pop(rank)
                 holders[rank] = None
                 self._refresh_evictable(edge)
+                parent = edge.parent
+                self._merge_into_child(edge)
+                if parent is not None:
+                    self._merge_into_child(parent)
         self._trim_history()
 
     def release(self, seq_id) -> dict:
@@ -374,6 +378,31 @@ class PrefixSpreadRouter:
             self.pending[(prefix, rank)] = producer
             self._produced.setdefault(producer, set()).add(prefix)
         return prefix
+
+    def _merge_into_child(self, edge):
+        """Undo a `_split` once nothing tells the two halves apart: `edge` has one
+        child and both are held by the same ranks in the same recency order with
+        no provisional producer. Every lookup answers alike on either side of the
+        seam, so the child takes over `edge`'s hashes and place in the tree.
+        Without this a session whose prompt grows each turn adds one edge per turn
+        and every walk of its chain gets longer.
+        """
+        if len(edge.children) != 1:
+            return
+        (child,) = edge.children.values()
+        holders = self.index[edge]
+        if list(holders.items()) != list(self.index[child].items()) or any(
+            (e, rank) in self.pending for e in (edge, child) for rank in holders
+        ):
+            return
+        siblings = (
+            self._roots[edge.domain] if edge.parent is None else edge.parent.children
+        )
+        child.hashes = edge.hashes + child.hashes
+        child.start = edge.start
+        child.parent = edge.parent
+        siblings[child.hashes[0]] = child
+        del self.index[edge]
 
     def _tier_hit(self, chain, path=None) -> int:
         """Longest matching prefix with a finished holder on any rank."""

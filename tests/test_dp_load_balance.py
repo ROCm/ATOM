@@ -1915,3 +1915,70 @@ def test_prefix_spread_reset_evicts_history_in_a_repeatable_order():
         for i in range(n)
     ]
     assert held == [False] * (n - keep) + [True] * keep
+
+
+def _finish_turn(mgr, seq):
+    mgr._mark_seq_prefill_complete(seq.id)
+    mgr._release_seq(seq.id)
+
+
+def test_prefix_spread_session_growing_each_turn_keeps_a_constant_edge_count():
+    import array
+
+    mgr = _make_spread_mgr()
+    router = mgr._prefix_router
+    for turn in range(1, 61):
+        seq = _chain_seq(turn, (8 + turn) * 128 + 5)
+        assert _route(mgr, [seq]) == [0]
+        assert _est(mgr, seq) == (8 + turn - 1) * 128 * (turn > 1)
+        _finish_turn(mgr, seq)
+        assert len(router.index) == 1
+    assert router.indexed_tokens == 68 * 128
+    # Every earlier turn's prompt is still answered exactly across the seam.
+    for turn in (1, 17, 59, 60):
+        probe = _chain_seq(999, (8 + turn) * 128).prompt_hash_chain
+        assert router._rank_hits(probe, 2) == ({0: (8 + turn) * 128}, 0)
+    # A request that diverges inside the merged interval keeps its shared part
+    # (hashes are chained: everything after the divergence differs too).
+    from atom.model_engine.prefix_hash import ShippedChain
+
+    hashes = array.array("Q", [*range(20), *range(987_654_321, 987_654_331)])
+    diverging = ShippedChain(128, 0, 30 * 128 + 5, 0, hashes)
+    assert router._rank_hits(diverging, 2)[0] == {0: 20 * 128}
+
+
+def test_prefix_spread_edges_with_different_holders_stay_apart():
+    mgr = _make_spread_mgr()
+    router = mgr._prefix_router
+    follower = _chain_seq(2, 8192)
+    _route(mgr, [_chain_seq(1, 4096)])
+    mgr._mark_seq_prefill_complete(1)
+    _route(mgr, [follower])
+    mgr._mark_seq_prefill_complete(2)
+    assert len(router.index) == 1  # the same rank holds both halves
+    # Rank 1 holds only the first half: the halves differ, whatever completes.
+    router.place(_chain_seq(3, 4096), 1, 2)
+    router.prefill_complete(3)
+    assert len(router.index) == 2
+    router.place(_chain_seq(4, 8192 + 128), 0, 2)
+    router.prefill_complete(4)
+    assert len(router.index) == 2  # the new tail joined rank 0's half, not rank 1's
+    assert router._rank_hits(follower.prompt_hash_chain, 2) == ({0: 8192, 1: 4096}, 0)
+    assert router._rank_hits(_chain_seq(9, 4096).prompt_hash_chain, 2)[0] == {
+        0: 4096,
+        1: 4096,
+    }
+
+
+def test_prefix_spread_provisional_edges_are_not_merged():
+    mgr = _make_spread_mgr()
+    router = mgr._prefix_router
+    first, follower = _chain_seq(1, 4096), _chain_seq(2, 8192)
+    _route(mgr, [first])
+    _route(mgr, [follower])
+    mgr._mark_seq_prefill_complete(1)
+    assert len(router.index) == 2  # the follower's tail is still provisional
+    # The follower aborts before finishing: only what completed stays.
+    mgr._release_seq(2)
+    assert router._rank_hits(follower.prompt_hash_chain, 2) == ({0: 4096}, 0)
+    assert len(router.index) == 1
