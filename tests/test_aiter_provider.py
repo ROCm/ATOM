@@ -10,6 +10,7 @@ import logging
 import sys
 import types
 from types import SimpleNamespace
+from typing import ClassVar
 
 import atom.aiter_provider as rail
 
@@ -18,7 +19,7 @@ SPARSE_MLA = "flydsl-sparse-mla-provider"
 
 
 class _SpQkv:
-    op_versions = {"sp_qkv_fused": {1}}
+    op_versions: ClassVar[dict[str, set[int]]] = {"sp_qkv_fused": {1}}
 
     def __init__(self):
         self.warmed = []
@@ -36,7 +37,9 @@ class _SpQkv:
 class _SparseMla:
     """The real provider's shape: warmup() takes no ``group``, no prepare()."""
 
-    op_versions = {"mla_sparse_prefill_v41": frozenset({1})}
+    op_versions: ClassVar[dict[str, frozenset[int]]] = {
+        "mla_sparse_prefill_v41": frozenset({1})
+    }
 
     def __init__(self):
         self.warmed = []
