@@ -329,7 +329,7 @@ def emit_pre_attn(
                             )
             gpu.barrier()
             stamp(2)
-            return None
+            return [None] * len(toks)
         for j in range_constexpr(len(toks)):
             amax = fx.Float32(0.0)
             for e in range_constexpr(8):
@@ -379,7 +379,7 @@ def emit_pre_attn(
         if (bid >= NT0) & (bid < NT0 + tokens):
             tk = bid - NT0
             raw_g, raw_ar = load_norm_inputs([tk])
-            x_scale = norm_quant([tk], raw_g, raw_ar, lambda j: True)
+            x_scale = norm_quant([tk], raw_g, raw_ar, lambda j: True)[0]
             if const_expr(signal is not None):
                 publish_done(signal[1], tk)  # the residual
             # the x8 row as plain words, then its scale: the scale's pair is the flag
@@ -407,7 +407,7 @@ def emit_pre_attn(
                     )
                 publish(mb_put, x8s_mb, tk, fx.Float32(1.0), tid == 0)
             else:
-                publish(mb_put, x8s_mb, tk, x_scale[0], tid == 0)
+                publish(mb_put, x8s_mb, tk, x_scale, tid == 0)
 
     # ============================================ GEMV tasks (one per CTA)
     enter_stage("k1.gemv")
@@ -565,13 +565,16 @@ def emit_pre_attn(
                     red + ((w * 64 + 16 * (r // 4) + tk) * 4 + r % 4)
                 )
             if const_expr(attn_mxfp8):  # the scales are inside the MFMA
-                out_r = bf16_round(tot_r)
+                mb_put(qkv_mb, tk * rows + rg * ROWS_PER_TASK + r, bf16_round(tot_r))
             else:
                 x_scale = x_scales[0]
                 for k in range_constexpr(1, tokens):
                     x_scale = (tk == k).select(x_scales[k], x_scale)
-                out_r = bf16_round(tot_r * x_scale * ws)
-            mb_put(qkv_mb, tk * rows + rg * ROWS_PER_TASK + r, out_r)
+                mb_put(
+                    qkv_mb,
+                    tk * rows + rg * ROWS_PER_TASK + r,
+                    bf16_round(tot_r * x_scale * ws),
+                )
 
         stamp(3)
 
@@ -951,15 +954,24 @@ def build_pre_attn_kernel(
     index_scale = index_scale_log2e(sm_scale)
 
     @fx.struct
-    class Smem:
+    class SmemPtpc:
         # FP8 activations, natural k order, one row per token
         x8: fx.Array[fx.Int32, tokens * HIDDEN // 4, 16]
         red: fx.Array[fx.Float32, WAVES * 64 * 4, 16]
         tls: fx.Array[fx.Int64, TL_POINTS if timeline else 1, 16]  # timeline stamps
         # every token's index q for the scorers, bf16 pairs
         qs: fx.Array[fx.Float32, HEAD_DIM // 2 * tokens * heads.count, 16]
-        # attn_mxfp8: the norm's per-1x32 E8M0 codes, a word each
-        xsc: fx.Array[fx.Int32, tokens * XSC_ROW if attn_mxfp8 else 1, 16]
+
+    @fx.struct
+    class SmemMx:
+        x8: fx.Array[fx.Int32, tokens * HIDDEN // 4, 16]
+        red: fx.Array[fx.Float32, WAVES * 64 * 4, 16]
+        tls: fx.Array[fx.Int64, TL_POINTS if timeline else 1, 16]
+        qs: fx.Array[fx.Float32, HEAD_DIM // 2 * tokens * heads.count, 16]
+        # the norm's per-1x32 E8M0 codes, a word each
+        xsc: fx.Array[fx.Int32, tokens * XSC_ROW, 16]
+
+    Smem = SmemMx if attn_mxfp8 else SmemPtpc
 
     kernel_name = kernel_symbol("minimax_m3_pre_attn", **symbol_params(key))
 
@@ -1007,7 +1019,7 @@ def build_pre_attn_kernel(
         red = lds.red.ptr
         tls = lds.tls.ptr
         qs = lds.qs.ptr
-        xsc = lds.xsc.ptr
+        xsc = lds.xsc.ptr if attn_mxfp8 else None
 
         def stamp(k):
             """``timeline``: this CTA passing point k (``atom.mono.device.stamps``)."""
