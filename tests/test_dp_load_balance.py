@@ -1830,7 +1830,7 @@ def _warm_prefix_on_rank0(mgr, length=8192):
 
 @pytest.mark.parametrize("shape", ["cold", "owner", "moved"])
 @pytest.mark.parametrize("loads", [True, False])
-def test_prefix_spread_placement_walks_the_hash_chain_once_read_only(shape, loads):
+def test_prefix_spread_placement_walks_the_hash_chain_one_read_and_one_create(shape, loads):
     from atom.kv_transfer.offload.tier import OffloadTierProfile
 
     mgr = _make_spread_mgr(tier=OffloadTierProfile(loads, 1024, 512))
@@ -1844,12 +1844,13 @@ def test_prefix_spread_placement_walks_the_hash_chain_once_read_only(shape, load
     _route(mgr, [seq])
     reads = [k for k in calls["_path"] if not k.get("create")]
     creates = [k for k in calls["_path"] if k.get("create")]
-    # Lookups share one read-only walk; the only other walk creates/splits edges.
+    # Lookups share one read-only walk; the only other walk creates/splits edges
+    # (two walks in all, down from four or five).
     assert (len(reads), len(creates)) == (1, 1)
     assert _count(mgr, f"prefix_{shape}_total") == before + 1
 
 
-def test_prefix_spread_explicit_placement_walks_the_hash_chain_once_read_only():
+def test_prefix_spread_explicit_placement_walks_the_hash_chain_one_read_and_one_create():
     from atom.kv_transfer.offload.tier import OffloadTierProfile
 
     router = _make_spread_mgr(tier=OffloadTierProfile(True, 1024, 512))._prefix_router
@@ -1947,6 +1948,59 @@ def test_prefix_spread_session_growing_each_turn_keeps_a_constant_edge_count():
     hashes = array.array("Q", [*range(20), *range(987_654_321, 987_654_331)])
     diverging = ShippedChain(128, 0, 30 * 128 + 5, 0, hashes)
     assert router._rank_hits(diverging, 2)[0] == {0: 20 * 128}
+
+
+def _assert_edges_tile_their_chains(router):
+    """Every edge starts where its parent ends (roots start at 0)."""
+    for edge in router.index:
+        assert edge.start == (0 if edge.parent is None else edge.parent.end)
+        for child in edge.children.values():
+            assert child.parent is edge
+
+
+def test_prefix_spread_merged_edges_keep_their_place_in_the_tree():
+    mgr = _make_spread_mgr()
+    router = mgr._prefix_router
+    for turn in range(1, 6):
+        seq = _chain_seq(turn, (8 + turn) * 128 + 5)
+        _route(mgr, [seq])
+        _finish_turn(mgr, seq)
+        _assert_edges_tile_their_chains(router)
+    (edge,) = router.index
+    assert (edge.start, edge.end) == (0, 13)
+    assert edge.parent is None and not edge.children
+
+
+def test_prefix_spread_session_with_a_shorter_retry_each_turn_stays_one_edge():
+    """Each turn also resends the previous prompt minus its last 32 blocks, which
+    splits the session's interval; the next completion must merge it back."""
+    mgr = _make_spread_mgr()
+    router = mgr._prefix_router
+    seq_id = 0
+    for turn in range(1, 41):
+        blocks = 64 + 32 * turn
+        for tokens in (blocks * 128, (blocks - 32) * 128):
+            seq_id += 1
+            seq = _chain_seq(seq_id, tokens)
+            _route(mgr, [seq])
+            _finish_turn(mgr, seq)
+        _assert_edges_tile_their_chains(router)
+        assert len(router.index) <= 2, turn
+    assert len(router.index) <= 2
+
+
+def test_prefix_spread_edges_with_different_recency_order_stay_apart():
+    """Both ranks hold both halves, but rank 0 used the first half last and rank 1
+    the second: lookups that break ties by recency answer differently on either
+    side of the seam, so the halves must not merge."""
+    router = _make_spread_mgr()._prefix_router
+    whole, half = _chain_seq(1, 8192), _chain_seq(2, 4096)
+    for seq, rank in ((whole, 0), (_chain_seq(3, 8192), 1), (half, 0)):
+        router.place(seq, rank, 2)
+        router.prefill_complete(seq.id)
+    assert len(router.index) == 2
+    orders = {tuple(h) for h in router.index.values()}
+    assert orders == {(1, 0), (0, 1)}  # same ranks, different order
 
 
 def test_prefix_spread_edges_with_different_holders_stay_apart():
