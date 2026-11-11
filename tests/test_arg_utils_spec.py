@@ -57,6 +57,25 @@ def test_request_context_metrics_cli_reaches_engine_kwargs(enabled):
 
 @pytest.mark.parametrize(
     "argv,want",
+    [
+        ([], ("bf16", None)),
+        (["--kv-cache-dtype", "fp4"], ("fp4", None)),
+        (["--kv_cache_dtype", "fp4"], ("fp4", None)),
+        (["--index-cache-dtype", "fp4"], ("bf16", "fp4")),
+        (
+            ["--kv-cache-dtype", "fp4", "--index-cache-dtype", "fp4"],
+            ("fp4", "fp4"),
+        ),
+    ],
+)
+def test_fp4_cache_dtypes_reach_engine_kwargs(argv, want):
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    kwargs = EngineArgs.from_cli_args(parser.parse_args(argv))._get_engine_kwargs()
+    assert (kwargs["kv_cache_dtype"], kwargs["index_cache_dtype"]) == want
+
+
+@pytest.mark.parametrize(
+    "argv,want",
     [([], "interval"), (["--prefill-admit-policy", "adaptive"], "adaptive")],
 )
 def test_prefill_admit_policy_cli_reaches_engine_kwargs(argv, want):
@@ -228,10 +247,28 @@ class TestEngineArgsSpeculativeValidation:
             method="mtp",
             model=args.model,
             num_speculative_tokens=3,
+            kv_cache_dtype=None,
             synthetic_acceptance_rate=None,
             synthetic_acceptance_length=None,
         )
         assert kwargs["speculative_config"] is fake_spec_config
+
+    def test_spec_decode_kv_cache_dtype_reaches_speculative_config(self):
+        """--spec-decode-kv-cache-dtype is SpeculativeConfig.kv_cache_dtype; the
+        native CLI has no --spec-decode-config JSON to carry it."""
+        parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+        argv = ["--method", "mtp", "--spec-decode-kv-cache-dtype", "bf16"]
+        with patch("atom.model_engine.arg_utils.SpeculativeConfig") as mock_cls:
+            EngineArgs.from_cli_args(parser.parse_args(argv))._get_engine_kwargs()
+        assert mock_cls.call_args.kwargs["kv_cache_dtype"] == "bf16"
+
+    def test_spec_decode_kv_cache_dtype_without_a_method_is_refused(self):
+        parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+        args = EngineArgs.from_cli_args(
+            parser.parse_args(["--spec-decode-kv-cache-dtype", "fp8"])
+        )
+        with pytest.raises(ValueError, match="needs --method"):
+            args._get_engine_kwargs()
 
 
 class TestEngineArgsIndexCacheDtype:

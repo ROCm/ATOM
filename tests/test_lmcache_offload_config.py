@@ -142,6 +142,13 @@ def test_page_namespace_changes_for_meaningful_geometry(mutate):
     assert offcfg.build_page_namespace(config, cfg, 4) != original
 
 
+def test_page_namespace_tells_mxfp4_kv_pages_from_fp8_ones():
+    plain = offcfg.build_page_namespace(_config(), _lmcache_config(), 4)
+    config = _config()
+    config.kv_cache_dtype = "fp4"
+    assert offcfg.build_page_namespace(config, _lmcache_config(), 4) != plain
+
+
 def test_page_namespace_changes_when_code_layout_version_changes():
     current = offcfg.build_page_namespace(_config(), _lmcache_config(), 4)
     future = offcfg.build_page_namespace(

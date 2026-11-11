@@ -12,6 +12,28 @@ logger = logging.getLogger("atom")
 DRAFT_KV_ROWS = "draft_kv"
 
 
+def draft_owns_kv_pool(config) -> bool:
+    """Whether `config`'s speculative draft caches into a KV pool of its own.
+
+    What `draft_kv_builder` will answer for the same draft, decided from the config
+    alone so `Config` and the offload deployment checks can ask it before any runner
+    exists. Only DSpark has such a pool, and only the native runner builds it: under
+    a plugin the framework owns the KV cache and the selector has no backend for
+    every draft flavor (CSA2 raises), so the answer there is no without asking it.
+    """
+    from atom.plugin import is_plugin_mode
+
+    spec = getattr(config, "speculative_config", None)  # test stubs omit it
+    draft_hf = getattr(spec, "draft_model_hf_config", None)
+    if getattr(spec, "method", None) != "dspark" or draft_hf is None:
+        return False
+    if is_plugin_mode():
+        return False
+    from atom.utils.selector import attn_family, get_attn_backend
+
+    return bool(get_attn_backend(attn_family(draft_hf)).DRAFT_OWNS_KV_POOL)
+
+
 def draft_kv_builder(model_runner, draft_hf):
     """The KV builder a draft needs of its own, or None if it needs none.
 
@@ -35,7 +57,8 @@ def draft_kv_builder(model_runner, draft_hf):
         backend.make_kv_pool,
         draft_hf,
         world_size=model_runner.world_size,
-        kv_dtype=dtypes.d_dtypes[model_runner.config.kv_cache_dtype],
+        # settled once, by `Config`
+        kv_dtype=dtypes.d_dtypes[model_runner.config.speculative_config.kv_cache_dtype],
     )
     # A way to build it, not the pool: how many rows it has is the walk's to
     # say, and this runs from the proposer's `__init__` -- `build_drafter`
@@ -175,7 +198,7 @@ class DraftKvBuilder(PoolRowsMixin):
         idx = self.pool_rows[DRAFT_KV_ROWS][module]
         k_cache, v_cache = self.kv_pool.kv_views(idx)
         module.max_model_len = runner.config.max_model_len
-        if runner.config.kv_cache_dtype == "fp8":
+        if self.kv_pool.scale_fields:  # the layout's, as the target binder asks
             module.k_scale, module.v_scale = self.kv_pool.scale_views(idx)
         module.k_cache = k_cache
         module.v_cache = v_cache

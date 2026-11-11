@@ -23,7 +23,7 @@ import torch
 from torch import nn
 
 from atom.model_ops.attentions.mha_kv_pool import MhaKvPool
-from atom.spec_decode.draft_kv import DRAFT_KV_ROWS, DraftKvBuilder
+from atom.spec_decode.draft_kv import DRAFT_KV_ROWS, DraftKvBuilder, draft_owns_kv_pool
 
 
 class _PagedAttention(nn.Module):
@@ -217,3 +217,77 @@ def test_the_count_tracks_the_model_it_walked(draft_layers):
     assert builder.kv_pool is not None
 
     assert asked == [(draft_layers, TARGET_BLOCK)]
+
+
+class _FakePool:
+    def __init__(self, scale_fields):
+        self.scale_fields = scale_fields
+
+    def kv_views(self, idx):
+        return torch.zeros(1), torch.zeros(1)
+
+    def scale_views(self, idx):
+        return torch.ones(1), torch.ones(1)
+
+
+@pytest.mark.parametrize("scale_fields", [[object()], []])
+def test_scales_are_bound_when_the_pools_layout_has_them(scale_fields):
+    """The layout decides, as the target binder asks it: not a dtype string."""
+    runner = _runner(draft_layers=1)
+    runner.config = SimpleNamespace(max_model_len=64)
+    builder = DraftKvBuilder(runner, None)
+    builder._kv_pool = _FakePool(scale_fields)
+    module = next(iter(builder.pool_rows[DRAFT_KV_ROWS]))
+    module.layer_num = 0
+
+    tensor = builder.build_kv_cache_tensor(module)
+
+    assert (tensor.k_scale is not None) is bool(scale_fields)
+
+
+def _spec_config(method="dspark", draft_hf="draft-hf"):
+    return SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            method=method, draft_model_hf_config=draft_hf
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "config, owns, want",
+    [
+        (_spec_config(), True, True),
+        (_spec_config(), False, False),  # the draft's backend shares the target's pool
+        (_spec_config("mtp"), True, False),  # only DSpark asks for a pool of its own
+        (_spec_config("eagle3"), True, False),
+        (_spec_config(draft_hf=None), True, False),
+        (SimpleNamespace(speculative_config=None), True, False),
+    ],
+)
+def test_a_native_draft_owns_a_pool_when_its_backend_says_so(
+    monkeypatch, config, owns, want
+):
+    from atom.utils import selector
+
+    monkeypatch.setattr(selector, "attn_family", lambda _hf: "family")
+    monkeypatch.setattr(
+        selector,
+        "get_attn_backend",
+        lambda _f: SimpleNamespace(DRAFT_OWNS_KV_POOL=owns),
+    )
+    assert draft_owns_kv_pool(config) is want
+
+
+def test_a_plugin_draft_owns_no_pool_and_the_selector_is_not_asked(monkeypatch):
+    """The native runner builds a draft's pool; under vLLM / SGLang the selector has
+    no backend for every draft flavor (CSA2 raises), so it is not consulted."""
+    from atom.plugin import prepare
+    from atom.utils import selector
+
+    def refuse(*_a):
+        raise AssertionError("the selector was asked")
+
+    monkeypatch.setattr(prepare, "_CURRENT_FRAMEWORK", "vllm")
+    monkeypatch.setattr(selector, "attn_family", refuse)
+    monkeypatch.setattr(selector, "get_attn_backend", refuse)
+    assert draft_owns_kv_pool(_spec_config()) is False

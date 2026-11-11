@@ -18,13 +18,18 @@ from atom.model_ops.minimax_m3.sparse_attn import (
     make_sparse_decode_metadata,
     make_sparse_prefill_metadata,
 )
+from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace
 from atom.utils import CpuGpuBuffer, envs
 from atom.utils.block_convert import (
     block_table_convert_triton,
     kv_indices_generate_triton,
 )
 from atom.utils.block_tables import block_table_state
-from atom.utils.forward_context import AttentionMetaData, Context, get_forward_context
+from atom.utils.forward_context import (
+    AttentionMetaData,
+    Context,
+    get_forward_context,
+)
 from atom.utils.tbo import UBatchSlice
 
 from .backends import (
@@ -52,16 +57,13 @@ def cdiv(a, b):
 
 
 class _IndexCacheSpec(NamedTuple):
-    """MiniMax-M3's indexer key cache: one `dim`-wide key per token, on `rows`
-    of this stage's layers. The pool is told its bytes and nothing else."""
+    """MiniMax-M3's indexer key cache on `rows` of this stage's layers: what one
+    entry's field holds, and the view the impl reads it through."""
 
     rows: int
-    dim: int
-    dtype: torch.dtype
-
-    def __str__(self) -> str:
-        """How a row space names itself in a log line."""
-        return f"kv[{self.num_kv_heads}x{self.head_dim}]"
+    field_shape: tuple[int, ...]  # bytes of one entry's row (uint8)
+    view_dtype: torch.dtype
+    view_shape: tuple[int, ...]
 
 
 # The indexer keys' row space: a second numbering over the same modules, not a
@@ -80,19 +82,6 @@ def _is_indexed_sparse_attention(module) -> bool:
     NOT the wrapper's own ``is_indexed_sparse_attention`` class attribute."""
     impl = getattr(module, "impl", None)
     return bool(getattr(impl, "is_indexed_sparse_attention", False))
-
-
-def _resolve_index_cache_dtype(config) -> torch.dtype:
-    from aiter import dtypes
-
-    index_cache_dtype = getattr(config, "index_cache_dtype", None)
-    if index_cache_dtype is None:
-        index_cache_dtype = getattr(config, "kv_cache_dtype", "bf16")
-    if index_cache_dtype in ("bf16", "fp8"):
-        return dtypes.d_dtypes[index_cache_dtype]
-    raise ValueError(
-        f"index_cache_dtype must be 'bf16' or 'fp8', got {index_cache_dtype!r}"
-    )
 
 
 @triton.jit
@@ -249,10 +238,10 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                     model_runner.block_size,
                 )
         super().__init__(model_runner)
-        # Keyed by `(num_kv_heads, head_dim)` and filled by
+        # Keyed by `KvGeometry` and filled by
         # `allocate_kv_cache_tensors`, which runs long after construction --
         # on the P/D decode side too, over the imported pool.
-        self.kv_pools: dict[tuple[int, int], MhaKvPool] = {}
+        self.kv_pools: dict[KvGeometry, MhaKvPool] = {}
         config = model_runner.config
         hf_config = config.hf_config
         # `self.num_attention_heads` set by CommonAttentionBuilder.__init__.
@@ -306,6 +295,30 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 num_head_k * self.max_bs * max_qlen,
                 **i32_kwargs,
             )
+        # The MXFP4 index scorer's work map buffer, by ubatch prefix ("" the whole step).
+        self._index_work_maps = {}
+        self._index_score_workspaces = {}  # its LogitsWorkspace, by the same prefix
+        self._index_work_map_blocks = 0
+        if (
+            self._has_sparse_attention
+            and self.model_runner.config.index_cache_dtype in ("fp4", "nvfp4")
+        ):
+            from atom.model_ops.minimax_m3.sparse_attn import SPARSE_BLOCK_SIZE
+
+            # The MXFP4 decode scorer's persistent dispatch map (aiter's FlyDSL scorer): its row
+            # count is the grid, so the bound is the model length, and the buffer is
+            # CAPACITY -- the exact grid is not monotonic in the batch. Sized at the
+            # widest step; a plain decode step (S=1) builds into the same buffer. The
+            # scores are allocated per call, like the Triton scorers'.
+            self._index_work_map_blocks = cdiv(
+                self.model_runner.config.max_model_len, SPARSE_BLOCK_SIZE
+            )
+            self._index_work_maps[""] = self._alloc_index_work_map(
+                self.max_bs, max_qlen
+            )
+            self._index_score_workspaces[""] = self._alloc_index_score_workspace(
+                self.max_bs * max_qlen
+            )
         self._pa_decode_bf16_asm_enabled = (
             use_pa_decode_bf16_asm() and model_runner.block_size == 256
         )
@@ -343,6 +356,51 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         self.model_runner.forward_vars.update(pa_persistent_metadata)
         if model_runner.config.enable_tbo:
             self._allocate_ubatch_buffers(max_qlen)
+
+    def _allocate_ubatch_buffers(self, max_seqlen_q: int) -> None:
+        super()._allocate_ubatch_buffers(max_seqlen_q)
+        if self._index_work_map_blocks and self.model_runner.config.enable_tbo_decode:
+            # The MXFP4 scorer's work map, per ubatch for the same reason as the
+            # sparse metadata buffers; only a decode TBO runs it (`enable_tbo` alone
+            # is the prefill split). A ubatch is one token a request (the sparse TBO
+            # decode raises above that), so q == 1 here whatever `max_seqlen_q` is.
+            # A decode split cuts a batch of `running_bs` requests at
+            # `running_bs // 2` (`cut_decode_ubatches`).
+            first = self.max_bs // 2
+            for ub_idx, rows in enumerate((first, self.max_bs - first)):
+                # Each ubatch's own map: its capacity is not additive.
+                self._index_work_maps[f"ub{ub_idx}_"] = self._alloc_index_work_map(
+                    rows, 1
+                )
+                # and its own scores, for the same reason
+                self._index_score_workspaces[f"ub{ub_idx}_"] = (
+                    self._alloc_index_score_workspace(rows)
+                )
+
+    def _alloc_index_score_workspace(self, max_rows: int) -> LogitsWorkspace:
+        """Score storage for up to ``max_rows`` query rows at the work map's width, the
+        indexers' `LogitsWorkspace` at an explicit capacity. Allocated once, here in
+        the builder's constructor, so the memory profile counts it and a captured graph
+        bakes a stable pointer; never filled (see
+        `MiniMaxM3SparseMetadata.index_score_workspace`)."""
+        return LogitsWorkspace(
+            self._num_idx_heads * max_rows * self._index_work_map_blocks, self.device
+        )
+
+    def _alloc_index_work_map(self, max_batch: int, max_query_len: int):
+        """Work map buffer for up to ``max_batch`` requests of up to ``max_query_len``
+        tokens, allocated once: a captured graph bakes its pointer."""
+        rows = 0
+        if max_batch > 0:
+            from aiter.ops.flydsl import minimax_m3_index_score_work_map_capacity
+
+            rows = minimax_m3_index_score_work_map_capacity(
+                max_batch,
+                self._index_work_map_blocks,
+                max_query_len,
+                self._num_idx_heads,
+            )
+        return torch.empty((rows, 2), dtype=torch.int32, device=self.device)
 
     def h2d_group_members(self) -> dict[str, tuple[str, ...]]:
         # Ready together before the CSR kernel, sharing prefill destinations
@@ -427,7 +485,22 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             and hasattr(module, "use_mla")
             and not module.use_mla
         ):
-            kinds.append(KvGeometry(module.num_kv_heads, module.head_dim))
+            layout = None
+            if (
+                _is_indexed_sparse_attention(module)
+                and self.model_runner.config.kv_cache_dtype == "fp4"
+            ):
+                from atom.model_ops.minimax_m3.mxfp4_pages import Mxfp4KvLayout
+
+                layout = Mxfp4KvLayout()
+            elif (
+                _is_indexed_sparse_attention(module)
+                and self.model_runner.config.kv_cache_dtype == "nvfp4"
+            ):
+                from atom.model_ops.minimax_m3.nvfp4_pages import Nvfp4KvLayout
+
+                layout = Nvfp4KvLayout()
+            kinds.append(KvGeometry(module.num_kv_heads, module.head_dim, layout))
         return tuple(kinds)
 
     def _declare_kv_pools(self) -> dict[KvGeometry, MhaKvPool]:
@@ -466,13 +539,20 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 blocks_per_entry=self.block_ratio,
                 num_kv_heads=geometry.num_kv_heads,
                 head_dim=geometry.head_dim,
-                kv_dtype=dtypes.d_dtypes[runner.config.kv_cache_dtype],
+                # An MXFP4 layout declares its own bytes (uint8 pages); the dtype
+                # is read only by the dtype-wide cache, which `fp4` is not.
+                kv_dtype=(
+                    torch.uint8
+                    if geometry.layout is not None
+                    else dtypes.d_dtypes[runner.config.kv_cache_dtype]
+                ),
                 extra_fields=extra_fields,
+                layout=geometry.layout,
             )
             extra_fields = ()
         return pools
 
-    def _index_cache_spec(self) -> _IndexCacheSpec | None:
+    def _index_cache_spec(self, entry_tokens: int) -> _IndexCacheSpec | None:
         """MiniMax-M3's indexer key cache, or None where there is none.
 
         Keyed off `_has_sparse_attention` -- the same answer the block size and
@@ -482,19 +562,52 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         """
         if not self._has_sparse_attention:
             return None
-        runner = self.model_runner
-        hf_config = runner.config.hf_config
-        text_config = getattr(hf_config, "text_config", hf_config)
-        sparse_cfg = text_config.sparse_attention_config
+        from aiter import dtypes
+
+        config = self.model_runner.config
+        text_config = getattr(config.hf_config, "text_config", config.hf_config)
+        dim = text_config.sparse_attention_config["sparse_index_dim"]
+        # The walk, like every other count here. The config's
+        # `sparse_attention_freq` says how many layers the *model* has an
+        # indexer on; the rows are how many this stage holds, and on PP > 1
+        # those differ -- the pool would be charged for the model's and
+        # addressed by the stage's.
+        rows = self.row_counts().get(INDEX_ROWS, 0)
+        index_dtype = config.index_cache_dtype
+        if index_dtype == "fp4":
+            from atom.model_ops.minimax_m3.mxfp4_pages import HEAD_DIM, PAGE_BYTES
+
+            if dim != HEAD_DIM or entry_tokens != self.block_size:
+                raise ValueError(
+                    "the MXFP4 index cache is 128-wide keys, one block an entry; "
+                    f"got dim {dim}, {entry_tokens} tokens an entry"
+                )
+            return _IndexCacheSpec(rows, (PAGE_BYTES,), torch.uint8, (-1, PAGE_BYTES))
+        if index_dtype == "nvfp4":
+            from atom.model_ops.minimax_m3.nvfp4_pages import (
+                HEAD_DIM,
+                INDEX_PAGE_BYTES,
+            )
+
+            if dim != HEAD_DIM or entry_tokens != self.block_size:
+                raise ValueError(
+                    "the NVFP4 index cache is 128-wide keys, one block an entry; "
+                    f"got dim {dim}, {entry_tokens} tokens an entry"
+                )
+            return _IndexCacheSpec(
+                rows, (INDEX_PAGE_BYTES,), torch.uint8, (-1, INDEX_PAGE_BYTES)
+            )
+        if index_dtype not in ("bf16", "fp8"):
+            raise ValueError(
+                "index_cache_dtype must be 'bf16', 'fp8', 'fp4' or 'nvfp4', got "
+                f"{index_dtype!r}"
+            )
+        dtype = dtypes.d_dtypes[index_dtype]
         return _IndexCacheSpec(
-            # The walk, like every other count here. The config's
-            # `sparse_attention_freq` says how many layers the *model* has an
-            # indexer on; the rows are how many this stage holds, and on PP > 1
-            # those differ -- the pool would be charged for the model's and
-            # addressed by the stage's.
-            rows=self.row_counts().get(INDEX_ROWS, 0),
-            dim=sparse_cfg["sparse_index_dim"],
-            dtype=_resolve_index_cache_dtype(runner.config),
+            rows,
+            (entry_tokens * dim * dtype.itemsize,),
+            dtype,
+            (-1, self.block_size, dim),
         )
 
     def _index_cache_fields(self, entry_tokens: int) -> tuple[EntryField, ...]:
@@ -505,17 +618,10 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         gives them back through `field_view` in the shape `build_kv_cache_
         tensor` asks for.
         """
-        spec = self._index_cache_spec()
+        spec = self._index_cache_spec(entry_tokens)
         if spec is None:
             return ()
-        return (
-            EntryField(
-                "index",
-                spec.rows,
-                (entry_tokens * spec.dim * spec.dtype.itemsize,),
-                torch.uint8,
-            ),
-        )
+        return (EntryField("index", spec.rows, spec.field_shape, torch.uint8),)
 
     def release_kv_pools(self) -> None:
         for pool in self.kv_pools.values():
@@ -585,12 +691,10 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             # was built at this backend's block, so its slice already is.
             runner = self.model_runner
             pool = next(p for p in self.kv_pools.values() if p.extra_fields)
-            spec = self._index_cache_spec()
+            spec = self._index_cache_spec(self.block_size * self.block_ratio)
+            row = self.pool_rows[INDEX_ROWS][module]
             module.impl.index_cache = pool.field_view(
-                "index",
-                self.pool_rows[INDEX_ROWS][module],
-                spec.dtype,
-                (-1, self.block_size, spec.dim),
+                "index", row, spec.view_dtype, spec.view_shape
             )
             module.impl.max_model_len = runner.config.max_model_len
             module.impl.index_topk_cache_state = getattr(
@@ -612,8 +716,36 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         row = self.pool_rows[geometry][module]
 
         k_cache, v_cache = pool.kv_views(row)
-        if config.kv_cache_dtype == "fp8":
+        # A layout with scale planes hands them over; an MXFP4 pool has none, its
+        # pages carry their own (the sparse impl takes the (data, scale) views of
+        # them, mxfp4_pages.page_views).
+        if pool.scale_fields:
             module.k_scale, module.v_scale = pool.scale_views(row)
+
+        if config.kv_cache_dtype == "nvfp4" and _is_indexed_sparse_attention(module):
+            # The layer's fp32 global K / V scale, one element each, outside the
+            # page. 1.0: the M3.1 checkpoint carries no k_scale / v_scale and vLLM's
+            # default is the same; the kernels take whatever value is here.
+            module.impl.nvfp4_k_scale = torch.ones(
+                1, dtype=torch.float32, device=k_cache.device
+            )
+            module.impl.nvfp4_v_scale = torch.ones(
+                1, dtype=torch.float32, device=k_cache.device
+            )
+            # aiter's fused norm/RoPE cannot write NVFP4: it writes bf16 rows into this
+            # scratch (one per process, sized for the widest step, allocated here
+            # and not on first use so no CUDA graph capture can be the one to grow
+            # it) and `nvfp4_write` quantizes them into the pages.
+            scratch = getattr(self.model_runner, "_nvfp4_scratch", None)
+            if scratch is None:
+                from atom.model_ops.minimax_m3.nvfp4_write import Nvfp4Scratch
+
+                scratch = self.model_runner._nvfp4_scratch = Nvfp4Scratch(
+                    self.model_runner.max_num_batched_tokens,
+                    module.num_kv_heads,
+                    k_cache.device,
+                )
+            module.impl.nvfp4_scratch = scratch
 
         module.max_model_len = config.max_model_len
         module.k_cache = k_cache
@@ -637,6 +769,21 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         return self.model_runner.forward_vars[
             f"{prefix}sparse_attention_n_valid_column_per_row"
         ]
+
+    def _index_scorer_kwargs(self, prefix: str = "") -> dict:
+        """The MXFP4 decode scorer's work map and score buffers, for
+        `make_sparse_decode_metadata`; nothing for any other index cache. `prefix`
+        selects the ubatch's buffers (`ub<i>_`): both ubatches' metadata are alive at once
+        on one stream, so a shared map would be overwritten by the second before the
+        first one's layers ran."""
+        work_map = self._index_work_maps.get(prefix)
+        if work_map is None:
+            return {}
+        return {
+            "index_work_map_out": work_map,
+            "index_work_map_max_block": self._index_work_map_blocks,
+            "index_score_workspace": self._index_score_workspaces[prefix],
+        }
 
     def _get_sparse_attention_block_tables(
         self,
@@ -1046,19 +1193,33 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             # Plain decode (q==1) and eagle3 spec-verify (q==num_spec+1) both run
             # the DECODE sparse path; the decode kernels handle q>1 per-token
             # causal internally via max_query_len.
+            # The MXFP4 scorer takes its batch off the rows of idx_q, which a DP step
+            # can make more (a prefill bucket's pad) or fewer than `running_bs * q`;
+            # `_sparse_decode` slices q / idx_q to the rows of this batch. The other
+            # index caches keep the padded batch.
+            index_bs = running_bs
+            if self._index_work_map_blocks:  # the MXFP4 index cache
+                index_bs = min(running_bs, running_tokens // max_seqlen_q)
+                if index_bs < batch.total_seqs_num_decode:
+                    raise ValueError(
+                        f"MXFP4 index decode: {running_tokens} rows of {max_seqlen_q} "
+                        f"query tokens do not cover the {batch.total_seqs_num_decode} "
+                        "scheduled requests"
+                    )
             sparse_block_tables = self._get_sparse_attention_block_tables(
-                attn_metadata.block_tables[:running_bs],
-                attn_metadata.context_lens[:running_bs],
-                running_bs,
+                attn_metadata.block_tables[:index_bs],
+                attn_metadata.context_lens[:index_bs],
+                index_bs,
             )
             attn_metadata.sparse_attention_metadata = make_sparse_decode_metadata(
-                seq_lens=attn_metadata.context_lens[:running_bs],
+                seq_lens=attn_metadata.context_lens[:index_bs],
                 block_table=sparse_block_tables,
                 slot_mapping=attn_metadata.slot_mapping,
                 max_seq_len=int(max_seqlen_k),
                 max_query_len=int(max_seqlen_q),
                 num_idx_heads=self._num_idx_heads,
                 n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(),
+                **self._index_scorer_kwargs(),
             )
 
     def finish_ubatch(
@@ -1095,6 +1256,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(
                     f"ub{ubatch_idx}_"
                 ),
+                **self._index_scorer_kwargs(f"ub{ubatch_idx}_"),
             )
 
     def build_for_cudagraph_capture(
@@ -1144,6 +1306,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 max_query_len=max_q_len,
                 num_idx_heads=self._num_idx_heads,
                 n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(),
+                **self._index_scorer_kwargs(),
             )
 
         positions = var["positions"].copy_to_gpu(scheduled_tokens)

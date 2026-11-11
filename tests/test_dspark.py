@@ -2555,3 +2555,50 @@ def test_minimax_m31_dspark_refuses_tp_below_its_kv_heads(monkeypatch, tp):
     config = types.SimpleNamespace(num_attention_heads=64, num_key_value_heads=4)
     with pytest.raises(ValueError, match="needs TP >= 4"):
         m3_dspark.M3DSparkAttention(None, config, None, layer_num=0)
+
+
+def test_standalone_draft_is_built_with_its_own_kv_dtype_target_untouched(monkeypatch):
+    """The draft model reads its KV dtype off the config it is constructed
+    with, so the shallow copy carries the draft's (fp8 under a target fp4) and
+    the target's config keeps its own."""
+    from atom.config import CompilationConfig
+    from atom.spec_decode import draft_kv
+    from atom.spec_decode.dspark_proposer import DSparkProposer
+
+    seen = {}
+    monkeypatch.setattr(draft_kv, "draft_kv_builder", lambda runner, hf: None)
+
+    p = DSparkProposer.__new__(DSparkProposer)
+    spec = types.SimpleNamespace(
+        draft_model_hf_config=types.SimpleNamespace(),
+        kv_cache_dtype="fp8",  # as `Config` resolved it, under an fp4 target
+        use_dspark_with_draft=lambda: True,
+    )
+    p.speculative_config = spec
+    p.runner = types.SimpleNamespace()
+    p.config = types.SimpleNamespace(
+        kv_cache_dtype="fp4",
+        hf_config=types.SimpleNamespace(num_hidden_layers=3),
+        compilation_config=CompilationConfig(),
+    )
+
+    def model_class(cfg, layer_offset):
+        seen["dtype"] = cfg.kv_cache_dtype
+        return object()
+
+    p._build_draft_model(model_class)
+
+    assert seen == {"dtype": "fp8"}
+    assert p.config.kv_cache_dtype == "fp4"
+
+
+def test_dtype_q_follows_the_drafts_dtype_not_the_targets():
+    from atom.spec_decode.dspark_proposer import DSparkProposer
+
+    p = DSparkProposer.__new__(DSparkProposer)
+    p.config = types.SimpleNamespace(kv_cache_dtype="fp4")
+    p.dtype = torch.bfloat16
+    p.speculative_config = types.SimpleNamespace(kv_cache_dtype="bf16")
+    p._bound_draft_k_cache = lambda fc: None
+
+    assert p._resolve_dtype_q(None) == (torch.bfloat16, False)

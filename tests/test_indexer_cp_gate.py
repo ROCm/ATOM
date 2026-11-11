@@ -23,7 +23,7 @@ which is why it must keep answering False.
 import pytest
 import torch
 
-from atom.config import indexer_cp_unsupported_reason
+from atom.config import DCPConfig, indexer_cp_unsupported_reason
 
 M3 = ["MiniMaxM3SparseForCausalLM"]
 
@@ -59,6 +59,12 @@ def test_topology_gate_truth_table(arches, tp, kv_heads, block, dcp, tbo, expect
         assert reason is not None and expected in reason
 
 
+def test_topology_gate_refuses_mxfp4_caches():
+    assert indexer_cp_unsupported_reason(M3, 4, 4, 128, 1, False) is None
+    reason = indexer_cp_unsupported_reason(M3, 4, 4, 128, 1, False, mxfp4_caches=True)
+    assert reason is not None and "MXFP4" in reason
+
+
 def test_topology_gate_does_not_reject_speculative_decode():
     """Spec decode is the configuration this feature is FOR, not a blocker.
 
@@ -87,6 +93,27 @@ def test_topology_gate_reasons_are_human_readable():
     )
 
 
+@pytest.mark.parametrize("kv_dtype", ["fp4", "bf16"])  # the MXFP4 index, with / without
+def test_mxfp4_caches_fall_back_from_the_cp_scorer(monkeypatch, caplog, kv_dtype):
+    """Any MXFP4 cache (the index alone, or with the KV) clears the CP flag, and does
+    so after `--kv-cache-dtype fp4` is normalised, not before."""
+    from tests.test_minimax_m3_mxfp4_cache import _m3, sparse_hf
+
+    with caplog.at_level("WARNING", logger="atom"):
+        config = _m3(
+            monkeypatch,
+            kv_cache_dtype=kv_dtype,
+            index_cache_dtype="fp4",
+            tensor_parallel_size=4,
+            hf={**sparse_hf(), "num_key_value_heads": 4},
+            dcp_config=DCPConfig(indexer_dcp_only=True),
+        )
+
+    assert config.kv_cache_dtype == kv_dtype
+    assert config.dcp_config.indexer_dcp_only is False
+    assert "MXFP4 caches are not wired to the CP scorer" in caplog.text
+
+
 # ───────────────────────────────────────────────────── compilation key ──
 
 
@@ -113,12 +140,12 @@ def _hash_with(indexer_dcp_only: bool) -> str:
         dcp_config=SimpleNamespace(indexer_dcp_only=indexer_dcp_only),
         enable_dp_attention=False,
         index_cache_dtype="fp8",
+        kv_cache_dtype="fp8",
         index_cache_layout=None,
         hf_config=SimpleNamespace(),
         max_model_len=4096,
         max_num_seqs=256,
         max_num_batched_tokens=16384,
-        kv_cache_dtype="fp8",
         speculative_config=None,
     )
     return Config.compute_hash(stub)
