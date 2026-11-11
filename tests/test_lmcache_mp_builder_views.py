@@ -256,6 +256,10 @@ def test_minimax_m3_builder_publishes_gqa_and_index_views_without_tp_collapse(
         block_size=128,
         block_ratio=1,
         _pp_num_global_layers=lambda: None,
+        # The indexer keys' own format: 128 FP8 values a token.
+        _index_cache_spec=lambda: SimpleNamespace(
+            rows=1, dim=128, dtype=torch.float8_e4m3fnuz
+        ),
     )
 
     transfer = mha_export_method(builder)
@@ -266,6 +270,8 @@ def test_minimax_m3_builder_publishes_gqa_and_index_views_without_tp_collapse(
     # Every KV unit is one head-major run of the rank's one head; the indexer
     # keys are the same on every rank.
     assert [page.head_major_runs for page in transfer.pages] == [(1, 1)] * 8 + [None]
+    index = transfer.pages[-1].unit_spec
+    assert (index.head_dim, index.dtype) == (128, str(torch.float8_e4m3fnuz))
     assert all(
         region.semantic_role.startswith("mha.gqa4.")
         for region in transfer.block_regions
