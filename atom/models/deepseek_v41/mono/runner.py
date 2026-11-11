@@ -16,7 +16,6 @@ kernels the original modules still run the compressor and Engram.
 
 import logging
 import struct
-from dataclasses import replace
 
 import torch
 from aiter.dist.parallel_state import (
@@ -39,7 +38,7 @@ from atom.models.deepseek_v41.mono.builds import (
     RowsBuild,
     lean_width,
     refuse,
-    unfused_post_key,
+    unfused_keys,
 )
 from atom.models.deepseek_v41.mono.check import (
     check_front,
@@ -413,8 +412,7 @@ class V41MonoDecodeRunner:
         post_key = self._post_key(s)
         keys = self._layer_keys(s)
         if unfused:
-            post_key = unfused_post_key(post_key)
-            keys = [replace(key, tok_par=post_key.tok_par) for key in keys]
+            keys, post_key = unfused_keys(keys, post_key)
         launchers = {key: k1.build_attn_pre(key) for key in set(keys)}
         rest = {"post_key": post_key, "unfused": unfused}
         if self.split_k2:
