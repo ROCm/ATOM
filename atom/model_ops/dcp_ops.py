@@ -454,10 +454,11 @@ def zero_nonfinite_rows(out: torch.Tensor, lse: torch.Tensor) -> torch.Tensor:
     return out
 
 
-# Below this many (token, destination) programs the coarsened pack loses to one
-# program per (token, head): on MI355X it is ~3% slower at 16 programs (GLM-5.2
-# C1), already faster at 32-40, and 1.6x faster at 576 (Kimi-K3 decode).
-_A2A_PACK_MIN_COARSE_PROGRAMS = 32
+# Below this many (token, destination) programs the coarsened pack does not beat
+# one program per (token, head): on MI355X it is ~3% slower at 16 programs
+# (GLM-5.2 C1), within noise at 24-32, faster from 40 and 1.6x faster at 576
+# (Kimi-K3 decode).
+_A2A_PACK_MIN_COARSE_PROGRAMS = 40
 
 
 @triton.jit
@@ -809,7 +810,7 @@ def _dcp_a2a_unpack_combine_quant_kernel(
 def _a2a_pack(send, cp_attn_out, cp_attn_lse, owned_counts, has_owned_counts):
     """Fill ``send`` [N, B, H_LOCAL, pitch]: one program per (token, destination),
     or per (token, head) when that grid is too narrow to pay for itself."""
-    n_ranks, b, h_local, pitch = send.shape
+    n_ranks, b, h_local, _ = send.shape
     h_total, head_dim = cp_attn_out.shape[1:]
     pack = _lse_pack_slots(send.dtype)
     if b * n_ranks < _A2A_PACK_MIN_COARSE_PROGRAMS:
@@ -844,7 +845,7 @@ def _a2a_pack(send, cp_attn_out, cp_attn_lse, owned_counts, has_owned_counts):
             send.stride(1),
             H_LOCAL=h_local,
             H_BLOCK=triton.next_power_of_2(h_local),
-            SEND_PITCH=pitch,
+            SEND_PITCH=send.stride(2),
             HEAD_DIM=head_dim,
             LSE_PACK=pack,
             HAS_OWNED_COUNTS=has_owned_counts,
@@ -915,9 +916,10 @@ def cp_lse_a2a(
         # device pointer so no placeholder tensor or allocation is introduced.
         owned_counts = cp_attn_lse
 
-    # The row is padded to a 16B boundary so both ends can move a full b128 per
-    # lane; the combine kernels read the pitch back out of recv.stride(2), so
-    # the wire layout is described in exactly one place.
+    # The row is padded to a 16B boundary so the coarse pack, which gets the
+    # pitch as a constexpr, can store a full b128 per lane. The combine kernels
+    # take the pitch as a runtime stride (recv.stride(2)) and never read the
+    # padding, so the wire layout is described in exactly one place.
     pitch = _a2a_row_pitch(head_dim, pack, dtype)
     send = torch.empty((n_ranks, b, h_local, pitch), dtype=dtype, device=dev)
     _a2a_pack(send, cp_attn_out, cp_attn_lse, owned_counts, has_owned_counts)
