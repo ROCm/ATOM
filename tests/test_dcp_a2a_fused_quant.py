@@ -92,6 +92,7 @@ def _run_fused(recv, b, h, d, n, pack):
         n,
         HEAD_DIM=d,
         H_LOCAL=h,
+        H_ROUNDED=triton.next_power_of_2(h),
         LSE_PACK=pack,
         N_ROUNDED=triton.next_power_of_2(n),
         FP8_MAX=float(torch.finfo(FP8).max),
@@ -122,7 +123,10 @@ def _torch_combine_fp32(recv, b, h, d, n, pack):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("b,h,d,n", [(51, 4, 256, 4), (8, 4, 256, 4), (1, 2, 128, 2)])
+@pytest.mark.parametrize(
+    "b,h,d,n",
+    [(51, 4, 256, 4), (8, 4, 256, 4), (1, 2, 128, 2), (8, 12, 128, 8)],
+)
 def test_fused_matches_fp32_combine_then_quant(dtype, b, h, d, n):
     pack = _lse_pack_slots(dtype)
     recv = _make_recv(n, b, h, d, dtype, pack)
@@ -240,6 +244,37 @@ def test_lse_and_fused_quant_is_rejected_at_any_group_size():
             cp_lse_a2a(o, lse, group, return_lse=True, quant_dtype=FP8)
 
 
+def test_non_power_of_two_head_count():
+    """H_LOCAL = H / DCP size need not be a power of two, and tl.arange needs one.
+
+    K3 runs H=96 over DCP 8, so H_LOCAL=12. The head axis used to index with a
+    bare ``tl.arange(0, H_LOCAL)``, which does not COMPILE at 12 -- nothing in
+    cp_lse_a2a or _dcp_fused_quant_dtype() constrains H_LOCAL to a power of two,
+    so the fused path would have died at trace time on the production shape.
+
+    Rounding up adds lanes whose heads do not exist. They are folded onto lane 0
+    and masked, so they must not reach the output and -- because the scale is a
+    per-TOKEN max over every head -- must not move the scale either. Both are
+    checked against the unfused pair at the same shape.
+    """
+    b, h, d, n = 8, 12, 128, 8
+    assert triton.next_power_of_2(h) > h, "meaningless for a power-of-two H_LOCAL"
+    pack = _lse_pack_slots(torch.bfloat16)
+
+    recv = _make_recv(n, b, h, d, torch.bfloat16, pack, seed=7)
+    ref = _run_unfused(recv, b, h, d, n, pack, torch.bfloat16)
+    got_q, got_s = _run_fused(recv, b, h, d, n, pack)
+
+    got = (got_q.float().reshape(b, -1) * got_s).reshape(b, h, d)
+    torch.testing.assert_close(got, ref.float(), rtol=0.1, atol=0.1)
+    # A padded lane reading a neighbouring row shows up here first: the scale is
+    # the row max, so one stray value inflates it for the whole token.
+    ref_s = ref.float().reshape(b, -1).abs().amax(dim=1, keepdim=True) / float(
+        torch.finfo(FP8).max
+    )
+    torch.testing.assert_close(got_s, ref_s, rtol=0.02, atol=0.0)
+
+
 def test_non_power_of_two_group():
     """A group size N_ROUNDED has to round up, with a poison slab where it lands.
 
@@ -275,6 +310,7 @@ def test_non_power_of_two_group():
         n,
         HEAD_DIM=d,
         H_LOCAL=h,
+        H_ROUNDED=triton.next_power_of_2(h),
         LSE_PACK=pack,
         N_ROUNDED=triton.next_power_of_2(n),
         FP8_MAX=float(torch.finfo(FP8).max),

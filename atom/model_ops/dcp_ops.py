@@ -367,6 +367,22 @@ def _lse_pack_slots(dtype: torch.dtype) -> int:
     raise NotImplementedError(f"a2a merge buffer dtype {dtype} not supported")
 
 
+def _a2a_row_pitch(head_dim: int, pack: int, dtype: torch.dtype) -> int:
+    """Row pitch of the A2A staging buffer, padded up to a 16B boundary.
+
+    A record is HEAD_DIM outputs plus LSE_PACK slots, which at K3's shape is 130
+    bf16 elements = 260B. Unpadded, every row after the first sits 4B off a 16B
+    boundary, so the widest store the pack kernel can emit for it is 2B/lane.
+    Padding the row to 136 (272B) makes every row 16B-aligned and lets a lane
+    move a full b128 instead, at the cost of 4.6% more bytes on the wire.
+
+    The padding slots are never read: the combine kernels address HEAD_DIM and
+    the LSE slots explicitly, and pick the pitch up from recv.stride(-2).
+    """
+    per_16b = 16 // dtype.itemsize
+    return triton.cdiv(head_dim + pack, per_16b) * per_16b
+
+
 @triton.jit
 def _zero_nonfinite_rows_kernel(
     out_ptr,
@@ -443,47 +459,76 @@ def _dcp_a2a_pack_kernel(
     out_ptr,  # [B, H, D]      this rank's partial attention output
     lse_ptr,  # [B, H]         fp32
     owned_counts_ptr,  # [B]   true rank-local sparse counts, or unused
-    send_ptr,  # [N, B, H_LOCAL, D + LSE_PACK]
+    send_ptr,  # [N, B, H_LOCAL, SEND_PITCH]
     out_stride_b,
     out_stride_h,
     lse_stride_b,
     lse_stride_h,
     send_stride_n,
     send_stride_b,
-    send_stride_h,
     H_LOCAL: tl.constexpr,
+    H_BLOCK: tl.constexpr,
+    SEND_PITCH: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     LSE_PACK: tl.constexpr,
     HAS_OWNED_COUNTS: tl.constexpr,
 ):
     """Scatter (output, lse) into the per-destination send buffer.
 
-    One program per (token, GLOBAL head). Head ``h`` belongs to destination rank
-    ``h // H_LOCAL`` -- the same contiguous split the ReduceScatter path uses, so
-    a rank ends up owning exactly the heads it owned before.
+    One program per (token, DESTINATION RANK), handling that destination's whole
+    H_LOCAL-head slice. Head ``h`` belongs to destination ``h // H_LOCAL`` -- the
+    same contiguous split the ReduceScatter path uses, so a rank ends up owning
+    exactly the heads it owned before.
+
+    Two things about this shape are load-bearing, both measured on gfx1250:
+
+      * One program per (token, GLOBAL head) spreads K3's decode step over 6912
+        workgroups that move 256B each. An empty kernel at that grid already
+        costs 2.71us, against 4.69us for the real one -- the launch is 58% of it.
+        Folding one destination's H_LOCAL heads into a single program cuts the
+        grid 12x to 576, where the empty-kernel floor is 1.79us.
+      * H_LOCAL need not be a power of two (K3: 96/8 = 12) and ``tl.arange``
+        requires one, hence H_BLOCK + mask. The masked lanes are pure waste --
+        25% at H_LOCAL=12 -- and that is already priced into the number above.
+
+    SEND_PITCH is a constexpr rather than a stride argument on purpose: Triton's
+    ``tt.divisibility`` hint tests the integer VALUE of a runtime stride against
+    16, which for a 2-byte dtype can only ever express ">=32B aligned". Passing
+    the pitch as a constexpr lets the axis analysis derive gcd(136, ...) = 8
+    elements = 16B instead, which is exactly one b128 per lane.
     """
     b = tl.program_id(axis=0).to(tl.int64)
-    h = tl.program_id(axis=1).to(tl.int64)
+    dst = tl.program_id(axis=1).to(tl.int64)
 
-    dst = h // H_LOCAL
-    h_local = h % H_LOCAL
+    hb = tl.arange(0, H_BLOCK)
+    h_valid = hb < H_LOCAL
+    h = dst * H_LOCAL + hb.to(tl.int64)
 
     d = tl.arange(0, HEAD_DIM)
-    src = tl.load(out_ptr + b * out_stride_b + h * out_stride_h + d)
+    src = tl.load(
+        out_ptr + b * out_stride_b + h[:, None] * out_stride_h + d[None, :],
+        mask=h_valid[:, None],
+        other=0.0,
+    )
 
     dst_base = (
-        send_ptr + dst * send_stride_n + b * send_stride_b + h_local * send_stride_h
+        send_ptr
+        + dst * send_stride_n
+        + b * send_stride_b
+        + hb.to(tl.int64) * SEND_PITCH
     )
-    tl.store(dst_base + d, src)
+    tl.store(dst_base[:, None] + d[None, :], src, mask=h_valid[:, None])
 
-    lse = tl.load(lse_ptr + b * lse_stride_b + h * lse_stride_h)
+    lse = tl.load(
+        lse_ptr + b * lse_stride_b + h * lse_stride_h, mask=h_valid, other=0.0
+    )
     if HAS_OWNED_COUNTS:
         # Empty sparse-DCP rows carry one dummy KV slot so persistent metadata
         # remains valid. Neutralize that slot while packing the existing A2A
         # payload; this adds no kernel launch to the decode path.
         lse = tl.where(tl.load(owned_counts_ptr + b) == 0, float("-inf"), lse)
     if LSE_PACK == 1:
-        tl.store(dst_base + HEAD_DIM, lse)
+        tl.store(dst_base + HEAD_DIM, lse, mask=h_valid)
     else:
         # Split the fp32 into two raw 16-bit halves. Nothing does arithmetic on
         # these slots -- the collective copies bits and the combine kernel puts
@@ -491,8 +536,8 @@ def _dcp_a2a_pack_kernel(
         bits = lse.to(tl.uint32, bitcast=True)
         hi = (bits >> 16).to(tl.uint16).to(dst_base.dtype.element_ty, bitcast=True)
         lo = (bits & 0xFFFF).to(tl.uint16).to(dst_base.dtype.element_ty, bitcast=True)
-        tl.store(dst_base + HEAD_DIM, hi)
-        tl.store(dst_base + HEAD_DIM + 1, lo)
+        tl.store(dst_base + HEAD_DIM, hi, mask=h_valid)
+        tl.store(dst_base + HEAD_DIM + 1, lo, mask=h_valid)
 
 
 @triton.jit
@@ -601,6 +646,7 @@ def _dcp_a2a_unpack_combine_quant_kernel(
     N_RANKS,
     HEAD_DIM: tl.constexpr,
     H_LOCAL: tl.constexpr,
+    H_ROUNDED: tl.constexpr,
     LSE_PACK: tl.constexpr,
     N_ROUNDED: tl.constexpr,
     FP8_MAX: tl.constexpr,
@@ -624,9 +670,15 @@ def _dcp_a2a_unpack_combine_quant_kernel(
     b = tl.program_id(axis=0).to(tl.int64)
 
     n = tl.arange(0, N_ROUNDED)
-    h = tl.arange(0, H_LOCAL)
+    h = tl.arange(0, H_ROUNDED)
     d = tl.arange(0, HEAD_DIM)
     valid = n < N_RANKS
+    # H_LOCAL = H / DCP size, which is not a power of two in general (K3: 96/8
+    # = 12) while tl.arange requires one -- same rounding the n axis already
+    # does. Folded onto lane 0 and masked at every access for the same reason.
+    h_valid = h < H_LOCAL
+    h_safe = tl.where(h_valid, h, 0)
+    live = valid[:, None] & h_valid[None, :]
     # The padding lanes are masked at every load, which is the documented Triton
     # contract. They are also folded onto lane 0 here so no pointer is ever
     # FORMED outside `recv` -- belt and braces, asked for in review, and free:
@@ -638,22 +690,22 @@ def _dcp_a2a_unpack_combine_quant_kernel(
         recv_ptr
         + n_safe[:, None].to(tl.int64) * recv_stride_n
         + b * recv_stride_b
-        + h[None, :].to(tl.int64) * recv_stride_h
+        + h_safe[None, :].to(tl.int64) * recv_stride_h
     )
 
     if LSE_PACK == 1:
-        lse = tl.load(hbase + HEAD_DIM, mask=valid[:, None], other=float("-inf"))
+        lse = tl.load(hbase + HEAD_DIM, mask=live, other=float("-inf"))
         lse = lse.to(tl.float32)
     else:
-        hi = tl.load(hbase + HEAD_DIM, mask=valid[:, None], other=0).to(
+        hi = tl.load(hbase + HEAD_DIM, mask=live, other=0).to(
             tl.uint16, bitcast=True
         )
-        lo = tl.load(hbase + HEAD_DIM + 1, mask=valid[:, None], other=0).to(
+        lo = tl.load(hbase + HEAD_DIM + 1, mask=live, other=0).to(
             tl.uint16, bitcast=True
         )
         bits = (hi.to(tl.uint32) << 16) | lo.to(tl.uint32)
         lse = bits.to(tl.float32, bitcast=True)
-        lse = tl.where(valid[:, None], lse, float("-inf"))
+        lse = tl.where(live, lse, float("-inf"))
 
     # Same non-finite handling as the unfused kernel: a rank that owns no KV for
     # this row reports lse=-inf and o=NaN, and NaN*0 is still NaN, so the NaN has
@@ -667,13 +719,13 @@ def _dcp_a2a_unpack_combine_quant_kernel(
 
     factor = tl.exp(lse - global_lse[None, :])
     factor_is_nan = factor != factor  # noqa: PLR0124
-    factor = tl.where(factor_is_nan | (~valid[:, None]), 0.0, factor)
+    factor = tl.where(factor_is_nan | (~live), 0.0, factor)
 
     # [N, H, D]. Mask the padding lanes: N_ROUNDED rounds up to a power of two,
     # so for a non-power-of-two group the high lanes address memory past `recv`.
     # Their factor is already 0, so this changes no result -- it stops the read.
     vals = tl.load(
-        hbase[:, :, None] + d[None, None, :], mask=valid[:, None, None], other=0.0
+        hbase[:, :, None] + d[None, None, :], mask=live[:, :, None], other=0.0
     ).to(tl.float32)
     vals = tl.where(factor[:, :, None] == 0.0, 0.0, vals)
     acc = tl.sum(vals * factor[:, :, None], axis=0)  # [H, D]
@@ -701,8 +753,9 @@ def _dcp_a2a_unpack_combine_quant_kernel(
 
     q = tl.minimum(tl.maximum(acc * inv, -FP8_MAX), FP8_MAX)
     tl.store(
-        out_ptr + b * out_stride_b + h[:, None] * out_stride_h + d[None, :],
+        out_ptr + b * out_stride_b + h_safe[:, None] * out_stride_h + d[None, :],
         q.to(out_ptr.dtype.element_ty),
+        mask=h_valid[:, None],
     )
 
 
@@ -770,8 +823,12 @@ def cp_lse_a2a(
         # device pointer so no placeholder tensor or allocation is introduced.
         owned_counts = cp_attn_lse
 
-    send = torch.empty((n_ranks, b, h_local, head_dim + pack), dtype=dtype, device=dev)
-    _dcp_a2a_pack_kernel[(b, h_total)](
+    # The row is padded to a 16B boundary so both ends can move a full b128 per
+    # lane; the combine kernels read the pitch back out of recv.stride(2), so
+    # the wire layout is described in exactly one place.
+    pitch = _a2a_row_pitch(head_dim, pack, dtype)
+    send = torch.empty((n_ranks, b, h_local, pitch), dtype=dtype, device=dev)
+    _dcp_a2a_pack_kernel[(b, n_ranks)](
         cp_attn_out,
         cp_attn_lse,
         owned_counts,
@@ -782,8 +839,9 @@ def cp_lse_a2a(
         cp_attn_lse.stride(1),
         send.stride(0),
         send.stride(1),
-        send.stride(2),
         H_LOCAL=h_local,
+        H_BLOCK=triton.next_power_of_2(h_local),
+        SEND_PITCH=pitch,
         HEAD_DIM=head_dim,
         LSE_PACK=pack,
         HAS_OWNED_COUNTS=has_owned_counts,
@@ -810,6 +868,7 @@ def cp_lse_a2a(
             n_ranks,
             HEAD_DIM=head_dim,
             H_LOCAL=h_local,
+            H_ROUNDED=triton.next_power_of_2(h_local),
             LSE_PACK=pack,
             N_ROUNDED=triton.next_power_of_2(n_ranks),
             FP8_MAX=float(torch.finfo(quant_dtype).max),

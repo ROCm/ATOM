@@ -78,6 +78,7 @@ try:
         mla_dcp_sparse_prefill_num_heads,
     )
     from atom.model_ops.dcp_ops import (
+        _a2a_row_pitch,
         _dcp_a2a_pack_kernel,
         _dcp_a2a_unpack_combine_kernel,
         _lse_pack_slots,
@@ -655,14 +656,20 @@ def _a2a_roundtrip(o_per_rank, lse_per_rank, n_ranks, owned_counts_per_rank=None
     dtype = o_per_rank[0].dtype
     pack = _lse_pack_slots(dtype)
 
+    pitch = _a2a_row_pitch(d, pack, dtype)
+
     sends = []
     for r in range(n_ranks):
-        send = torch.empty((n_ranks, b, h_local, d + pack), dtype=dtype, device=DEV)
+        # Poison the whole staging buffer: the padding slots a 16B-aligned pitch
+        # introduces must never reach a result, and NaN says so loudly.
+        send = torch.full(
+            (n_ranks, b, h_local, pitch), float("nan"), dtype=dtype, device=DEV
+        )
         o_r = o_per_rank[r].contiguous()
         l_r = lse_per_rank[r].contiguous().to(torch.float32)
         has_owned_counts = owned_counts_per_rank is not None
         counts_r = owned_counts_per_rank[r].contiguous() if has_owned_counts else l_r
-        _dcp_a2a_pack_kernel[(b, h_total)](
+        _dcp_a2a_pack_kernel[(b, n_ranks)](
             o_r,
             l_r,
             counts_r,
@@ -673,8 +680,9 @@ def _a2a_roundtrip(o_per_rank, lse_per_rank, n_ranks, owned_counts_per_rank=None
             l_r.stride(1),
             send.stride(0),
             send.stride(1),
-            send.stride(2),
             H_LOCAL=h_local,
+            H_BLOCK=triton.next_power_of_2(h_local),
+            SEND_PITCH=pitch,
             HEAD_DIM=d,
             LSE_PACK=pack,
             HAS_OWNED_COUNTS=has_owned_counts,
@@ -733,6 +741,35 @@ def test_a2a_reproduces_the_ag_rs_merge(n_ranks, dtype):
 
     tol = 1e-5 if dtype == torch.float32 else 3e-2
     torch.testing.assert_close(got.float(), ref.float(), rtol=tol, atol=tol)
+
+
+@needs_gpu
+def test_a2a_handles_a_non_power_of_two_head_split():
+    """K3's shape: H=96 over DCP 8, so each destination owns 12 heads.
+
+    The pack kernel handles one destination's whole H_LOCAL slice per program,
+    and tl.arange needs a power of two, so 12 heads are processed as 16 lanes
+    with the top 4 masked. Those lanes must neither write outside the
+    destination's slice nor drop a real head.
+
+    _a2a_roundtrip fills the staging buffer with NaN before packing, so a head
+    the pack kernel skipped -- or a padding slot the combine kernel read --
+    arrives as NaN rather than as a small numeric drift.
+    """
+    b, h, d, n_ranks = 3, 96, 128, 8
+    assert (h // n_ranks) & (h // n_ranks - 1), "meaningless if H_LOCAL is 2**k"
+    g = torch.Generator(device=DEV).manual_seed(96)
+    o = [
+        torch.randn(b, h, d, generator=g, device=DEV).to(torch.bfloat16)
+        for _ in range(n_ranks)
+    ]
+    lse = [torch.randn(b, h, generator=g, device=DEV) for _ in range(n_ranks)]
+
+    got = _a2a_roundtrip(o, lse, n_ranks)
+    ref = _merge_partials(torch.stack(o), torch.stack(lse))
+
+    assert torch.isfinite(got).all(), "a NaN from the staging buffer reached the output"
+    torch.testing.assert_close(got.float(), ref.float(), rtol=3e-2, atol=3e-2)
 
 
 @needs_gpu
