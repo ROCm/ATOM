@@ -441,6 +441,11 @@ def moe_ug(c):
             ug_shared_fin(c, b)
     STRIPE = MP.striped(NCH)
     nit = MP.unit_iters(STRIPE, U, CR, b, w, u1, wu)
+    if fx.const_expr(not STRIPE):
+        if b < CR:
+            ug_routed_ksplit(c, u0, u1)
+    if fx.const_expr(not STRIPE):   # the routed units ran above (ug_routed_ksplit); the dedicated CTAs keep this loop
+        nit = I32(0)
     for it in range(ded.select(I32(SH8_UPC), fx.max(nit, I32(0)))):
         ui = I32(0)
         g = I32(0)
@@ -475,6 +480,53 @@ def moe_ug(c):
             cd = {k: c[k] for k in c if k != "shcnt"}   # a plain dict (LazyC entries evaluated here)
             cd.update(dn8_bi=b - CR, dn8_nct=NDC)
             moe_dn_shared(cd)
+
+
+@ASTRewriter.transform
+def ug_routed_ksplit(c, u0, u1):
+    """A narrow routed CTA's units [u0, u1): KS = 4 / 2 / 1 waves a unit (units <= 2 / <= 4 / more), wave w
+    does unit u0 + 8 / KS * round + w / KS over K steps (w % KS) * 40 / KS .. +40 / KS; the KS partials are summed in
+    wave order through LDS (O_RED8) and the unit's first wave runs the epilogue."""
+    w, l, sm = c["w"], c["l"], c["sm"]
+    tl = l % 16
+    units = fx.max(u1 - u0, I32(0))
+    ks_ = (units <= 2).select(I32(4), (units <= 4).select(I32(2), I32(1)))
+    per = I32(8) // ks_
+    slot = w // ks_
+    part = w % ks_
+    nst = I32(40) // ks_
+    # (K steps a part: multiples of the ring's KB = 4; 4 parts -> 12 / 12 / 8 / 8, 2 parts -> 20 / 20)
+    k4 = ks_ == 4
+    nstp = k4.select((part < 2).select(I32(12), I32(8)), nst)
+    ks0p = k4.select((part < 2).select(part * 12, I32(24) + (part - 2) * 8), part * nst)
+    for it in range((units + per - 1) // per):
+        uu = u0 + it * per + slot
+        live = uu < u1
+        uc = fx.min(uu, u1 - 1)
+        ui = uc // NUG
+        g = uc % NUG
+        e = hx.lload(sm + O_UNI + ui * 4, I32)
+        n = fx.min(hx.lload(sm + O_CNT + e * 4, I32), I32(MAXTOK))
+        pk = hx.lload(sm + O_LST + (e * MAXTOK + (tl < n).select(tl, I32(0))) * 4, I32)
+        ex = i64(pslot(e, sm))
+        acc = ug_body(c, pk, c["w13"] + ex * W13_E + i64(g) * (4 * W13_TS), c["s13"] + ex * S13_E + i64(g) * (2 * W13_KC),
+                      ks0p, nstp)
+        if ks_ > 1:
+            gpu.barrier()   # the previous round's sums have read the partials
+            for tile in range_constexpr(4):
+                ow = sm + O_RED8 + ((w * 4 + tile) * 32 + l) * 32
+                hx.lstore(ow, fx.Vector.from_elements([acc[tile][i] for i in range(4)], F32), align=16)
+                hx.lstore(ow + 16, fx.Vector.from_elements([acc[tile][i] for i in range(4, 8)], F32), align=16)
+            gpu.barrier()
+            tot = [fx.Vector.filled(8, 0.0, F32) for _ in range(4)]
+            for q in range(ks_):
+                for tile in range_constexpr(4):
+                    orr = sm + O_RED8 + (((slot * ks_ + q) * 4 + tile) * 32 + l) * 32
+                    lo_ = hx.lload(orr, F32, 4, align=16)
+                    hi_ = hx.lload(orr + 16, F32, 4, align=16)
+                    tot[tile] = fx.Vector.from_elements([tot[tile][i] + lo_[i] for i in range(4)] + [tot[tile][i + 4] + hi_[i] for i in range(4)], F32)
+            acc = tot
+        ug_epilogue(c, ui, g, (live & (part == 0)).select(n, I32(0)), acc)
 
 
 @ASTRewriter.transform
@@ -622,7 +674,7 @@ def ug_shared_fin(c, su):
 
 
 @ASTRewriter.transform
-def ug_body(c, pk, wb, sb):
+def ug_body(c, pk, wb, sb, ks0=None, nst=None):
     """One UG work unit (32 MID cols: 4 tiles x 40 K steps) of the expert, its first tile's weights / scales at wb / sb,
     for the tokens of pick list pk (lane tl's pick); returns the 4 tiles' accumulators."""
     l = c["l"]
@@ -631,12 +683,19 @@ def ug_body(c, pk, wb, sb):
     xrow = c["x8"] + i64(row) * H
     srow = c["xs"] + i64(row) * (H // 32)
     KB = DUG // 4
+    nsteps = I32(40)
+    if fx.const_expr(ks0 is not None):   # K steps ks0 .. ks0 + nst - 1 only: every base shifted by ks0
+        wb = wb + i64(ks0) * 1024
+        sb = sb + i64(ks0) * 128
+        xrow = xrow + i64(ks0 * 128)
+        srow = srow + i64(ks0 * 4)
+        nsteps = nst
     ra, rb = ug_ring_init(wb, sb, lo, xrow, srow, l, KB)
     # rolled over the 40 K steps in blocks of KB, fixed ring slots (slot kk*4+tile / kk refilled with K step
     # ks + KB right after K step ks used it): ~1/10 of the unrolled code, and no ring shifting through
     # loop-carried registers (that made the compiler wait for every load at the loop top)
     acc = [fx.Vector.filled(8, 0.0, F32) for _ in range(4)]
-    for j in range(40 // KB - 1):
+    for j in range(nsteps // KB - 1):
         for kk in range_constexpr(KB):
             ks = j * KB + kk
             bq = rb[kk]

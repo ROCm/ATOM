@@ -549,10 +549,10 @@ def test_units_once(nch, U):
 
 def test_schedules():
     assert [MP.striped(n) for n in (1, 2, 3)] == [False, False, True]
-    assert [MP.sh_early(n) for n in (1, 2, 3)] == [False, False, MP.SH_EARLY]
-    assert MP.dedicated_ctas(3, NUG) == 0  # wide: the shared UG runs early in the front
-    assert MP.dedicated_ctas(1, NUG) == NUG  # narrow: one shared unit a dedicated CTA
-    assert MP.dedicated_ctas(2, NUG) == 2 * NUG
+    assert [MP.sh_early(n) for n in (1, 2, 3)] == [MP.SH_EARLY] * 3
+    # every width: the shared UG runs early in the front, no dedicated CTAs, the shared down after the handoff
+    assert [MP.dedicated_ctas(n, NUG) for n in (1, 2, 3)] == [0, 0, 0]
+    assert [MP.sh8_dnov(n) for n in (1, 2, 3)] == [False, False, False]
 
 
 # --- layout -------------------------------------------------------------------------------------------------------

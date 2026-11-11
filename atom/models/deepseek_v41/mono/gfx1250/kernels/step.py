@@ -369,7 +369,14 @@ def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sourc
                 handoff(lc + i64(LY.ATTN_D), t, True)
                 stage_E(c)
                 pf_rows(c["wob"] + i64(b // 4) * (80 * NWOA) + i64((b % 4) * 512), NWOA, 80, 512, t)
-                handoff(lc + i64(LY.ATTN_E), t, True)
+                # E -> F: wo_b CTA (cg, kq = b % 4) reads y8 cols 512 kq .. 512 kq + 511 only, written by the 64 wo_a CTAs
+                # 64 kq .. 64 kq + 63: each wo_a CTA counts into its quarter, each wo_b CTA waits for its quarter
+                hx.wait_storecnt0()
+                gpu.barrier()
+                if t == 0:
+                    hx.atomic_add(lc + i64(LY.WOA_QUARTERS) + i64(b // 64) * 4, 1)
+                    hx.wait_count(lc + i64(LY.WOA_QUARTERS) + i64(b % 4) * 4, 64, 8)
+                gpu.barrier()
                 stage_F_cluster(c)
                 gpu.barrier()
                 par = Ly % 2
@@ -448,6 +455,10 @@ def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sourc
                         MS.moe_combine(dict(t=hx.opaque_v(fx.thread_idx.x), b=b, out=fptr(fp, "mout"), topk=RTOPK), TRx, sm)
                         tp_allreduce(cwith(c, tpout=fptr(fp, "tp2out"), ytgt=fptr(fp, "y2")), par * 2 + 1, 2 * Ly + 2)
                         gpub(lc + i64(LY.TP2_GROUPS), b, t)
+                        # the next layer's stage-A weights (this CTA's wqkv tile: 16 rows x its K half) -> L2 while TP2
+                        # and the attention front run: the stage starts on warm lines after the layer's last handoff
+                        if (b < 224) & (Ly + 1 < seg_hi):
+                            pf_rows(ltab(fp, Ly + 1, "wqkv")() + i64((b // 2) * 16) * D.HID + i64((b % 2) * 2560), D.HID, 16, 2560, t)
                 handoff(lc + i64(LY.LAYER_END), t, True)
                 if fx.const_expr((kind & 1) != 0):   # the target body: the draft context taps (read before the next front rewrites aRout)
                     if (ltab(fp, Ly, "lflags")() & fx.Int64(16)) != fx.Int64(0):
