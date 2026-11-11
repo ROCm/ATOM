@@ -12,13 +12,19 @@ logger = logging.getLogger("atom")
 DRAFT_KV_ROWS = "draft_kv"
 
 
+# The methods whose proposer calls `draft_kv_builder`; the others (MTP, ngram) run
+# the target's own layers or have no draft model.
+DRAFT_POOL_METHODS = ("eagle3", "dspark")
+
+
 def draft_owns_kv_pool(config) -> bool:
     """Whether `config`'s speculative draft caches into a KV pool of its own.
 
     What `draft_kv_builder` will answer for the same draft, decided from the config
     alone so `Config` and the offload deployment checks can ask it before any runner
-    exists. Only DSpark has such a pool, and only the native runner builds it: under
-    a plugin the framework owns the KV cache, so the answer there is no. Read off the
+    exists. EAGLE3 and DSpark (`DRAFT_POOL_METHODS`) build one where the draft's family
+    owns it, and only the native runner builds it: under a plugin the framework owns
+    the KV cache, so the answer there is no. Read off the
     draft's attention family (`DRAFT_POOL_FAMILIES`), not by resolving its backend,
     which would import aiter into the API process that builds `Config`.
     """
@@ -26,7 +32,7 @@ def draft_owns_kv_pool(config) -> bool:
 
     spec = getattr(config, "speculative_config", None)  # test stubs omit it
     draft_hf = getattr(spec, "draft_model_hf_config", None)
-    if getattr(spec, "method", None) != "dspark" or draft_hf is None:
+    if getattr(spec, "method", None) not in DRAFT_POOL_METHODS or draft_hf is None:
         return False
     if is_plugin_mode():
         return False

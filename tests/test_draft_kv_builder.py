@@ -259,8 +259,13 @@ def _spec_config(method="dspark", draft_hf="draft-hf"):
     [
         (_spec_config(), True, True),
         (_spec_config(), False, False),  # the draft's backend shares the target's pool
-        (_spec_config("mtp"), True, False),  # only DSpark asks for a pool of its own
-        (_spec_config("eagle3"), True, False),
+        (_spec_config("eagle3"), True, True),  # a draft model of its own, MHA: a pool
+        (
+            _spec_config("eagle3"),
+            False,
+            False,
+        ),  # ... an MLA one binds into the target's
+        (_spec_config("mtp"), True, False),  # MTP runs the target's layers
         (_spec_config(draft_hf=None), True, False),
         (SimpleNamespace(speculative_config=None), True, False),
     ],

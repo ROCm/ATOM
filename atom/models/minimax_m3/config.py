@@ -28,8 +28,9 @@ def _mxfp4_kv_refusal(config) -> str | None:
     spec = config.speculative_config
     if spec is not None and spec.kv_cache_dtype == "fp4":
         # `resolve_draft_kv_dtype` leaves "fp4" only on a draft in the target's
-        # pool (EAGLE3, MTP): one with no MXFP4 attention impl to write its rows.
-        # A DSpark draft with its own pool is fp8 / bf16 and passes.
+        # pool (MTP; an MHA EAGLE3 or DSpark draft has its own pool): one with no
+        # MXFP4 attention impl to write its rows. A draft with its own pool is
+        # fp8 / bf16 and passes.
         return "the speculative draft would have FP4 KV, which it has no layout for"
 
     text = getattr(config.hf_config, "text_config", None) or config.hf_config

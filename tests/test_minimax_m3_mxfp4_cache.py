@@ -403,6 +403,57 @@ def test_an_own_pool_draft_without_a_flag_keeps_the_targets_dtype(monkeypatch, t
         assert config.speculative_config.kv_cache_dtype == target
 
 
+def _eagle3_spec(**kw):
+    """An EAGLE3 draft that is an MHA model (llama): `draft_kv_builder` gives it a
+    pool of its own, as it does a DSpark one."""
+    hf = PretrainedConfig(architectures=["LlamaForCausalLM"], model_type="llama")
+    return SpeculativeConfig(
+        method="eagle3",
+        model="draft",
+        num_speculative_tokens=3,
+        draft_model_hf_config=hf,
+        **kw,
+    )
+
+
+@pytest.mark.parametrize("asked", [None, "bf16", "fp8"])
+def test_an_mha_eagle3_draft_has_a_pool_of_its_own_and_takes_its_own_dtype(
+    monkeypatch, asked
+):
+    config = _m3(
+        monkeypatch,
+        kv_cache_dtype="fp8",
+        index_cache_dtype="fp8",
+        speculative_config=_eagle3_spec(kv_cache_dtype=asked),
+    )
+    assert config.speculative_config.kv_cache_dtype == (asked or "fp8")
+
+
+def test_an_fp4_target_with_an_mha_eagle3_draft_runs_the_draft_as_bf16(monkeypatch):
+    """The draft has its own (SHUFFLE) pool, so it is not "a draft that would have
+    FP4 KV, which it has no layout for"."""
+    config = _m3(
+        monkeypatch,
+        kv_cache_dtype="fp4",
+        index_cache_dtype="fp4",
+        hf=sparse_hf(),
+        speculative_config=_eagle3_spec(),
+    )
+    assert config.speculative_config.kv_cache_dtype == "bf16"
+
+
+def test_an_mtp_draft_still_shares_the_targets_pool(monkeypatch):
+    spec = _eagle3_spec(kv_cache_dtype="bf16")
+    spec.method = "mtp"
+    with pytest.raises(ValueError, match="caches in the target's KV pool"):
+        _m3(
+            monkeypatch,
+            kv_cache_dtype="fp8",
+            index_cache_dtype="fp8",
+            speculative_config=spec,
+        )
+
+
 def _v41_dspark_spec():
     """A V4.1 DSpark draft: CSA2, which only native ATOM has a backend for."""
     hf = PretrainedConfig(
