@@ -55,6 +55,7 @@ FINISH_PACKED_FRONT_ABI = KernelAbi(
         "router_bias",
         "shared_gate_up",
         "shared_down_weight",
+        "shared_down_scale",
         "w13",
         "w13s",
         "w2",
@@ -194,6 +195,7 @@ def build_packed_finish(
     replicated_front: bool = False,
     herd: bool = False,
     local_union: bool | None = None,
+    fp8_shared_down: bool = False,
 ) -> K2FinishKernel:
     """Without ``include_routed`` the routed experts are left to AITER's grouped
     MoE: ``route`` and ``tile_route`` then receive contiguous [rows, 16] expert
@@ -202,7 +204,11 @@ def build_packed_finish(
     is the rank's [rows, EXPERTS] f32 router logits, the latent planes are
     already in place and ``shared_hidden`` holds the activated shared rows.
     With ``herd`` the routes are [rows, 17] Top-(K+1) candidates and their raw
-    sigmoid scores, for AITER's HERD drop."""
+    sigmoid scores, for AITER's HERD drop. With ``fp8_shared_down`` the
+    grouped-MoE finish reads ATOM's online per_1x128 FP8 shared down, its E8M0
+    block scales in ``shared_down_scale``."""
+    if fp8_shared_down and (include_routed or not include_shared):
+        raise ValueError("only the grouped-MoE finish reads an FP8 shared down")
     if replicated_front and include_routed:
         raise ValueError("a replicated front feeds only the grouped-MoE finish")
     if herd and include_routed:
@@ -285,6 +291,7 @@ def build_packed_finish(
         f"_gu{int(gu_interleave)}_sh{int(include_shared)}"
         f"_pq_u{int(local_union)}_r{int(include_routed)}"
         f"{'_rf' if replicated_front else ''}{'_herd' if herd else ''}"
+        f"{'_f8' if fp8_shared_down else ''}"
     )
 
     sources = SOURCES
@@ -295,6 +302,7 @@ def build_packed_finish(
         router_bias: Int64,
         shared_gate_up: Int64,
         shared_down_weight: Int64,
+        shared_down_scale: Int64,
         w13: Int64,
         w13s: Int64,
         w2: Int64,
@@ -495,13 +503,25 @@ def build_packed_finish(
             # Both tasks' weights are in flight before the rows are staged.
             tasks = [bid, bid + plan.blocks]
             operands = [
-                gemv_gfx1250.loads(
-                    lane,
-                    wave,
-                    WAVES,
-                    shared_down_weight,
-                    fx.min(task, SHARED_DOWN_TASKS - 1) * 16,
-                    SHARED_INTERMEDIATE,
+                (
+                    gemv_gfx1250.fp8_loads(
+                        lane,
+                        wave,
+                        WAVES,
+                        shared_down_weight,
+                        shared_down_scale,
+                        fx.min(task, SHARED_DOWN_TASKS - 1) * 16,
+                        SHARED_INTERMEDIATE,
+                    )
+                    if fp8_shared_down
+                    else gemv_gfx1250.loads(
+                        lane,
+                        wave,
+                        WAVES,
+                        shared_down_weight,
+                        fx.min(task, SHARED_DOWN_TASKS - 1) * 16,
+                        SHARED_INTERMEDIATE,
+                    )
                 )
                 for task in tasks
             ]
@@ -813,6 +833,7 @@ def build_packed_finish(
         router_bias: Int64,
         shared_gate_up: Int64,
         shared_down_weight: Int64,
+        shared_down_scale: Int64,
         w13: Int64,
         w13s: Int64,
         w2: Int64,
@@ -839,6 +860,7 @@ def build_packed_finish(
             router_bias,
             shared_gate_up,
             shared_down_weight,
+            shared_down_scale,
             w13,
             w13s,
             w2,

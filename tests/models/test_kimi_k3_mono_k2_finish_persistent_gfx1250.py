@@ -54,3 +54,14 @@ def test_persistent_finish_abi_is_packed_and_rank_local():
         for name in names
         for forbidden in ("peer", "ipc", "xgmi", "collective")
     )
+
+
+def test_fp8_shared_down_is_the_grouped_moe_finish_only():
+    candidate = build_packed_finish(
+        _plan(40), include_routed=False, replicated_front=True, fp8_shared_down=True
+    )
+    assert candidate.name.endswith("_rf_f8")
+    names = candidate.abi.names
+    assert names.index("shared_down_scale") == names.index("shared_down_weight") + 1
+    with pytest.raises(ValueError, match="FP8 shared down"):
+        build_packed_finish(_plan(40), fp8_shared_down=True)

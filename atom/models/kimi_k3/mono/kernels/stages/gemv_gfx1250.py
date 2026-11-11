@@ -13,8 +13,8 @@ f32 result maps lane ``l`` element ``e`` to output
 
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl.expr import range_constexpr
-from flydsl.expr.typing import T
+from flydsl.expr import range_constexpr, rocdl
+from flydsl.expr.typing import T, as_ir_value
 
 from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import (
     GFX1250_GEMV,
@@ -91,6 +91,60 @@ def loads(lane, wave, waves, w, row0, k, nt=True, ldk=None, k0=0):
                 for mma_step in range(GFX1250_GEMV.mma_steps_per_chunk)
             ]
         )
+    return out
+
+
+def fp8x8_to_bf16(words, exponent):
+    """Eight FP8 values (two dwords) times the E8M0 ``exponent``'s power of
+    two, as BF16: exact, since the scale only moves the exponent."""
+
+    return fx.Vector(
+        rocdl.cvt_scale_pk8_bf16_fp8(
+            T.vec(PACK_ELEMENTS, T.bf16), as_ir_value(words), as_ir_value(exponent), 0
+        )
+    )
+
+
+def fp8_loads(lane, wave, waves, w, scale, row0, k, nt=True):
+    """``loads`` of ATOM's online per_1x128 FP8 weight: AITER's gfx1250
+    preshuffle (``[rows / 16][k / 32][2][16 rows][16 B]``) with its
+    ``[rows / 128, k / 128]`` E8M0 block scales. A wave's chunk is one scale
+    block, and ``row0``'s 16 rows share it. The BF16 fragments equal ``loads``'
+    of the dequantized weight."""
+
+    assert K_PER_CHUNK == 128
+    per, n = chunks(k, waves)
+    weights, scales = rsrc(w), rsrc(scale)
+    row = lane % ROWS
+    lane_group = lane // ROWS
+    out = []
+    for index in range(per):
+        chunk = fx.min(wave + waves * index, n - 1)
+        block = row0 // 128 * (k // K_PER_CHUNK) + chunk
+        word = bo.buffer_load(scales, block >> 2, vec_width=1, dtype=T.i32)
+        exponent = (fx.Int32(word) >> ((block & 3) * 8)) & 0xFF
+        steps = []
+        for mma_step in range(GFX1250_GEMV.mma_steps_per_chunk):
+            k32 = chunk * GFX1250_GEMV.mma_steps_per_chunk + mma_step
+            elements = []
+            for half in range_constexpr(2):
+                byte = (
+                    row0 * k
+                    + (k32 * 2 + half) * ROWS * 16
+                    + row * 16
+                    + lane_group * PACK_ELEMENTS
+                )
+                raw = bo.buffer_load(
+                    weights,
+                    byte // 4,
+                    vec_width=2,
+                    dtype=T.i32,
+                    cache_modifier=CM_NT if nt else 0,
+                )
+                converted = fp8x8_to_bf16(raw, exponent)
+                elements.extend(converted[i] for i in range_constexpr(PACK_ELEMENTS))
+            steps.append(fx.Vector.from_elements(elements, fx.BFloat16))
+        out.append(steps)
     return out
 
 

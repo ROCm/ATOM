@@ -30,7 +30,10 @@ from flydsl.expr import gpu, range_constexpr, rocdl
 from flydsl.expr.rocdl import cluster
 from flydsl.expr.typing import T, as_ir_value
 
-from atom.models.kimi_k3.mono.kernels.stages.gemv_gfx1250 import ACCUMULATOR_ELEMENTS
+from atom.models.kimi_k3.mono.kernels.stages.gemv_gfx1250 import (
+    ACCUMULATOR_ELEMENTS,
+    fp8x8_to_bf16,
+)
 from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import (
     GFX1250_GEMV,
     K_PER_MMA,
@@ -179,14 +182,7 @@ def _fp8_operand(lds, wave, lane, exponent):
                     result_type=fx.Vector.make_type(2, fx.Int32),
                 )
             )
-            converted = fx.Vector(
-                rocdl.cvt_scale_pk8_bf16_fp8(
-                    T.vec(PACK_ELEMENTS, T.bf16),
-                    as_ir_value(raw),
-                    as_ir_value(exponent),
-                    0,
-                )
-            )
+            converted = fp8x8_to_bf16(raw, exponent)
             elements.extend(converted[i] for i in range_constexpr(PACK_ELEMENTS))
         steps.append(fx.Vector.from_elements(elements, fx.BFloat16))
     return steps

@@ -286,6 +286,7 @@ def test_grouped_k2_projects_locally_then_runs_grouped_moe(monkeypatch, herd):
         w_ld=tensor(4, 4),
         w_sgu=tensor(4, 4),
         w_sgu_scale=None,
+        w_sd_scale=None,
         bias=tensor(4),
         w_sd=tensor(4, 4),
         w13=tensor(8, dtype=torch.uint8),
@@ -384,6 +385,7 @@ def test_replicated_finalize_all_reduces_both_partials_once(monkeypatch):
         },
         ln_eps=1e-6,
         w_sgu_scale=None,
+        w_sd_scale=None,
     )
     reduce = torch.zeros(rows * (latent + hidden), dtype=torch.bfloat16)
     buffers = {
