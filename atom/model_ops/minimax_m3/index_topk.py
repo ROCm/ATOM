@@ -57,6 +57,9 @@ except ImportError:  # pragma: no cover - aiter is optional at import time
 
 # One sparse block == one KV page.
 SPARSE_BLOCK_SIZE = 128
+# NVFP4 index scoring: K is e4m3_rn(e2m1 * scale), as vLLM reads it, on aiter's fp8 MFMA arm (Q is
+# e4m3); "exact" would keep the unrounded product on the bf16 arm.
+INDEX_NVFP4_K_ROUND = "e4m3"
 # Query rows one prefill score program owns.
 #
 # Before the block axis was split, this and the grid were the same knob, so it
@@ -1219,6 +1222,7 @@ def minimax_m3_index_topk(
             max_query_len,
             max_seq_len,
             sm_scale,
+            k_round=INDEX_NVFP4_K_ROUND,
         )
     elif index_mxfp4:
         from atom.model_ops.minimax_m3.mxfp4_pages import page_views
@@ -1527,6 +1531,7 @@ def minimax_m3_index_topk_decode(
             score_max_block,
             work_map=index_work_map,
             out=score_out,
+            **({"k_round": INDEX_NVFP4_K_ROUND} if index_nvfp4 else {}),
         )
     else:
         score = _triton_decode_score(

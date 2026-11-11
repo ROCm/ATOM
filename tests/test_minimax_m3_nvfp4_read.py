@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: MIT
-"""NVFP4 read path end to end, without the model: pages written by ``nvfp4_write``,
+"""NVFP4 read path end to end, without the model: pages written by the writer oracle,
 scored and selected by ``minimax_m3_index_topk{,_decode}(index_nvfp4=True)``, attended
 by ``sparse_attn_nvfp4``. Oracles are plain torch on the *dequantized pages* (a
 token-major reader written here from the page offsets of ``nvfp4_pages``, independent of
 both the writer and the kernels):
 
-* the selection: block score = max over the block's tokens of K . q (K = e2m1 * e4m3
-  scale, exact; q as stored e4m3), tail block pinned, 15 more by score;
+* the selection: block score = max over the block's tokens of K . q (K = e4m3_rn(e2m1 *
+  e4m3 scale), the scorer's ``k_round="e4m3"``; q as stored e4m3), tail block pinned, 15
+  more by score;
 * the attention: softmax over the keys of the blocks the selector *picked*, fp64.
 
 Needs gfx950 and aiter's FlyDSL (kernels are aiter's), like the MXFP4 tests.
@@ -23,15 +24,16 @@ pytestmark = pytest.mark.skipif(
     reason="needs gfx950 and aiter's FlyDSL",
 )
 
-from atom.model_ops.minimax_m3.nvfp4_pages import (  # noqa: E402
+from nvfp4_write_oracle import (
+    nvfp4_insert_index,
+    nvfp4_insert_kv,
+)
+
+from atom.model_ops.minimax_m3.nvfp4_pages import (
     INDEX_PAGE_BYTES,
     head_regions,
     index_page_views,
     kv_page_bytes,
-)
-from atom.model_ops.minimax_m3.nvfp4_write import (  # noqa: E402
-    nvfp4_insert_index,
-    nvfp4_insert_kv,
 )
 
 TOPK, DIM = 16, 128
@@ -43,12 +45,14 @@ def _fp4_values(codes):
     return torch.where(codes >= 8, -mag, mag)
 
 
-def deq_index(pages):
-    """fp32 [pages, 128, 128] of index pages."""
+def deq_index(pages, e4m3=False):
+    """fp32 [pages, 128, 128] of index pages; with ``e4m3`` each K rounded to e4m3 (RNE,
+    saturating at 448) as the scorer reads it."""
     data, scale = index_page_views(pages)
     codes = torch.stack((data & 15, data >> 4), -1).flatten(-2).long()
     s = scale.view(torch.float8_e4m3fn).float()
-    return (_fp4_values(codes).unflatten(-1, (8, 16)) * s[..., None]).flatten(-2)
+    k = (_fp4_values(codes).unflatten(-1, (8, 16)) * s[..., None]).flatten(-2)
+    return k.clamp(-448, 448).to(torch.float8_e4m3fn).float() if e4m3 else k
 
 
 def deq_kv(pages, heads, gs_k, gs_v):
@@ -128,7 +132,7 @@ class Case:
         nvfp4_insert_index(ik, self.idx, slots)
         self.ks, self.vs = ks, vs
         self.K, self.V = deq_kv(self.kv, heads, gs[0], gs[1])
-        self.IK = deq_index(self.idx)
+        self.IK = deq_index(self.idx, e4m3=True)
         self.gen = g
 
     def queries(self, rows):

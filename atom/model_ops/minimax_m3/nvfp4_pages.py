@@ -21,7 +21,7 @@ KV page, one per block, all kv heads of K then all of V (``2 * Hkv * 9216`` B)::
 
 K scales and V data / scales are in the order the sparse-PA kernel's MFMA lanes
 want them; the byte offsets are the functions below (they are the single source
-for the writer, ``nvfp4_write``, and for tests). aiter's
+for the aiter writer's tests and the test oracle). aiter's
 ``minimax_m3_sparse_pa_nvfp4_{decode,prefill}`` read this page.
 """
 
