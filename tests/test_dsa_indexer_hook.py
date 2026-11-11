@@ -154,3 +154,51 @@ def test_a_layer_is_refused_on_its_own_flags_and_no_model_attribute():
         bind._layer_refusal(_indexer(**rope, use_qk_rope_cache_fusion=True), _SHAPE)
         == ""
     )
+
+
+@pytest.mark.parametrize("model_kind", ["glm", "k3"])
+@pytest.mark.parametrize("preshuffle_available", [False, True])
+def test_install_prepares_shared_weight_before_warmup(
+    monkeypatch, model_kind, preshuffle_available
+):
+    from aiter.ops.flydsl import gemm_kernels
+
+    from atom.models.kimi_k3.mono import dispatch as k3_dispatch
+
+    installer = dispatch if model_kind == "glm" else k3_dispatch
+    monkeypatch.setattr(installer, "config_refusal", lambda cfg: None)
+    monkeypatch.setattr(bind, "pcp_is_enabled", lambda: False)
+    monkeypatch.setattr(bind, "get_tensor_model_parallel_world_size", lambda: 4)
+    monkeypatch.setattr(bind, "get_tensor_model_parallel_rank", lambda: 0)
+    if not preshuffle_available:
+        monkeypatch.setattr(gemm_kernels, "flydsl_hgemm", lambda a, b: None)
+    indexer = _module()
+    weight = torch.nn.Parameter(
+        torch.randn_like(indexer.wq_b.weight), requires_grad=False
+    )
+    indexer.wq_b.weight = weight
+    original, address = weight.clone(), weight.data_ptr()
+    inner = SimpleNamespace(
+        layers=[SimpleNamespace(self_attn=SimpleNamespace(indexer=indexer))]
+    )
+    model = torch.nn.Module()
+    if model_kind == "k3":
+        model.language_model = SimpleNamespace(model=inner)
+    else:
+        model.model = inner
+
+    wrapped = installer.install_mono_decode(model, _cfg(), None)
+    assert getattr(weight, "is_shuffled", False) == preshuffle_available
+    assert indexer.wq_b.weight is weight and weight.data_ptr() == address
+    assert not hasattr(indexer, "_mono_indexer_wq_packed")
+    if preshuffle_available:
+        restored = (
+            weight.view(256, _SHAPE.q_lora // 32, 4, 16, 8)
+            .permute(0, 3, 1, 2, 4)
+            .reshape_as(weight)
+        )
+        assert torch.equal(restored, original)
+        assert wrapped is not model
+    else:
+        assert torch.equal(weight, original)
+        assert "forward" not in indexer.__dict__

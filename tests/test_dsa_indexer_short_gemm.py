@@ -11,8 +11,8 @@ import torch
 
 pytest.importorskip("flydsl")
 
+from atom.model_ops.utils import shuffle_weights
 from atom.mono.dsa_indexer import bind
-from atom.mono.dsa_indexer.bind import pack_short_q
 from atom.mono.dsa_indexer.kernel import IxBuild, unfit
 from atom.mono.dsa_indexer.plan import IndexerShape
 
@@ -23,17 +23,20 @@ def key(rows=96, context=163840):
 
 
 @pytest.mark.parametrize("rank", [1024, 1536, 2048])
-def test_packed_q_preserves_every_checkpoint_bit(rank):
+def test_shared_q_matches_aiter_shuffle_and_preserves_storage(rank):
     weight = (
         (torch.arange(4096 * rank, dtype=torch.int32) % 251)
         .to(torch.bfloat16)
         .view(4096, rank)
     )
     original = weight.clone()
-    packed = pack_short_q(weight)
-    restored = packed.permute(0, 2, 4, 1, 3, 5).contiguous().view_as(weight)
+    weight = torch.nn.Parameter(weight, requires_grad=False)
+    address = weight.data_ptr()
+    shuffle_weights(weight)
+    packed = weight.view(32, 8, rank // 32, 4, 16, 8)
+    restored = packed.permute(0, 1, 4, 2, 3, 5).contiguous().view_as(weight)
     assert torch.equal(restored.view(torch.int16), original.view(torch.int16))
-    assert torch.equal(weight, original)
+    assert weight.data_ptr() == address and weight.is_shuffled
     assert packed.is_contiguous() and packed.dtype == torch.bfloat16
     for head, step, wave, lane, element in (
         (0, 0, 0, 0, 0),
@@ -41,8 +44,8 @@ def test_packed_q_preserves_every_checkpoint_bit(rank):
         (31, rank // 32 - 1, 7, 63, 7),
     ):
         assert (
-            packed[head, step, wave, lane // 16, lane % 16, element]
-            == weight[
+            packed[head, wave, step, lane // 16, lane % 16, element]
+            == original[
                 head * 128 + wave * 16 + lane % 16, step * 32 + lane // 16 * 8 + element
             ]
         )
@@ -63,7 +66,7 @@ def test_short_gemm_requires_a_supported_projection_shape(rank):
 
 @pytest.mark.parametrize("cache", ["fp8", "fp4"])
 @pytest.mark.parametrize("dcp", [1, 8])
-def test_k3_1_pro_binding_packs_nope_q_only_for_replicated_short_path(
+def test_k3_1_pro_binding_shares_one_shuffled_weight_in_both_dcp_modes(
     monkeypatch, cache, dcp
 ):
     shape = replace(
@@ -75,7 +78,11 @@ def test_k3_1_pro_binding_packs_nope_q_only_for_replicated_short_path(
         cache_layout="mfma" if cache == "fp4" else "preshuffle",
     )
     module = SimpleNamespace(
-        wq_b=SimpleNamespace(weight=torch.zeros(4096, 1536, dtype=torch.bfloat16))
+        wq_b=SimpleNamespace(
+            weight=torch.nn.Parameter(
+                torch.randn(4096, 1536, dtype=torch.bfloat16), requires_grad=False
+            )
+        )
     )
     cfg = SimpleNamespace(
         decode_context_parallel_size=dcp,
@@ -87,11 +94,37 @@ def test_k3_1_pro_binding_packs_nope_q_only_for_replicated_short_path(
     monkeypatch.setattr(bind, "_refusal", lambda *args: "")
     monkeypatch.setattr(bind, "shape_of", lambda *args: shape)
     monkeypatch.setattr(bind.kix, "dual_score_device", lambda device: True)
+    address = module.wq_b.weight.data_ptr()
+    assert bind.bind_indexers(None, 8, 0) is None
+    bind.prepare_weights({3: module})
     binding = bind.bind_indexers(None, 8, 0)
+    shuffled = module.wq_b.weight.clone()
+    bind.prepare_weights({3: module})
+    bind.bind_indexers(None, 8, 0)
     assert binding.short_gemm == (dcp == 1)
-    assert hasattr(module, "_mono_indexer_wq_packed") == (dcp == 1)
+    assert not hasattr(module, "_mono_indexer_wq_packed")
+    assert module.wq_b.weight.is_shuffled
+    assert module.wq_b.weight.data_ptr() == address
+    assert torch.equal(shuffled, module.wq_b.weight)
     for rows in (6, 48, 96, 144, 192, 240, 252):
         assert not unfit(binding.key(rows, 6))
+
+
+def test_weight_updates_refuse_before_changing_storage(monkeypatch):
+    monkeypatch.setattr(bind, "_takes_weight_updates", lambda cfg: True)
+    assert "weight updates" in bind._static_refusal(None, 8, 0, {0: object()})
+
+
+@pytest.mark.parametrize("rank", [0, 1281, 1312])
+def test_unaligned_q_projection_refuses_before_shuffle(rank):
+    shape = replace(key().shape, q_lora=rank)
+    module = SimpleNamespace(
+        external_k_weights=True,
+        quantized_q=False,
+        rope_dim=0,
+        wq_b=SimpleNamespace(weight=torch.empty(4096, shape.q_lora)),
+    )
+    assert "K divisible by 128" in bind._operand_refusal(module, shape)
 
 
 @lru_cache(None)

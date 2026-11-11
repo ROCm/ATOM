@@ -13,6 +13,15 @@ Keep the checkpoint quantization configuration and do not add online weight
 quantization. Mono uses the checkpoint's BF16 `wq_b`; a quantized `wq_b` or
 quantized Q latent remains unsupported by Mono.
 
+Admitted GLM/K3 indexers prepare `wq_b` once before model warmup using AITER's
+standard BF16 `(16,16)` shuffle. Native prefill/fallback GEMM and both Mono
+Q paths share that same Parameter and storage address. There is no persistent
+row-major or private head-packed copy and no per-step repack. This requires
+the companion AITER BF16 `flydsl_hgemm(..., bpreshuffle=True)` extension and
+shuffled tuning rows; older AITER leaves the indexer unmodified on native.
+Online weight-update runners are refused before shuffling. This does not
+change checkpoint values, cache dtype/layout or unrelated model GEMMs.
+
 The native prefill/fallback path uses the same resolved layout. It requires
 AITER's `mqa_logits_mxfp4_config` / `mqa_logits_mxfp4` API from PR 6952 and
 the HIP `scale_layout="opus"` mode of `indexer_qk_rope_quant_and_cache` from
@@ -76,10 +85,11 @@ long or mixed batches keep the original collaborative projection/scoring path.
 
 - At 96 or more query rows, each CTA projects complete heads for a 16/32-row
   tile and quantizes from LDS, eliminating the cross-CTA Q/quantization rendezvous.
-- A one-time BF16 weight permutation preserves every checkpoint bit and the
-  original native weight. It adds 8 MiB per indexer for Q LoRA 1024,
-  12 MiB for K3.1 Pro's Q LoRA 1536, or 16 MiB for GLM's Q LoRA 2048.
-  This is not weight quantization.
+- A one-time, bit-preserving BF16 permutation supplies both native and Mono.
+  Removing the former short-path copy saves 8 MiB per indexer for Q LoRA
+  1024, 12 MiB for K3.1 Pro's Q LoRA 1536, or 16 MiB for GLM's Q LoRA 2048,
+  per GPU. Initialization still needs temporary shuffle storage. DCP8 had no
+  private short-path copy, so it does not receive this memory saving.
 - Short MQA work is balanced across the resident CTAs; FP8 uses a wider
   gfx950 MFMA with unit internal scales and unchanged external Q/K scales.
 - The planner handles regular short batches directly; padding, contexts below
@@ -90,6 +100,31 @@ The OPUS FP4 cache ABI above is unchanged. There is still one main Mono
 kernel plus the required reset, not a native fallback or four-kernel hybrid.
 The performance reports cover GLM-5.3-MXFP4 and K3.1 Pro; they are not a
 performance guarantee for every admitted shape or model.
+Historical tables below predate shared weights. The accepted native GEMM
+tradeoff and separate shared-weight validation are recorded below.
+
+### Shared-Weight Validation
+
+On gfx950 / FlyDSL 0.5.0, 630 focused ATOM tests passed. Forty TP8 indexer
+graph cases cover GLM/K3, FP8/FP4, qlen1/6, 8K DCP1 and 160K DCP1/DCP8;
+old/shared Mono Q and sorted TopK hashes match. Eight rank-local checks and
+80 same-graph context transitions passed. Repeated weight preparation adds
+zero persistent bytes, with one weight-sized temporary shuffle allocation.
+
+Checkpoint BF16 GEMM timings use the shipped tuning rows, without an external
+configuration overlay. Units are microseconds; positive delta is slower.
+
+| Model | M | N | K | Raw native | Shared shuffled | Delta |
+|---|---:|---:|---:|---:|---:|---:|
+| K3.1 Pro | 2048 | 4096 | 1536 | 24.946 | 27.818 | +2.872 |
+| GLM-5.3 | 2048 | 4096 | 2048 | 31.686 | 35.421 | +3.735 |
+| K3.1 Pro | 16384 | 4096 | 1536 | 150.826 | 157.434 | +6.609 |
+| GLM-5.3 | 16384 | 4096 | 2048 | 198.917 | 197.080 | -1.837 |
+
+This native GEMM cost is an accepted memory tradeoff, not a universal
+no-regression claim. Nine of the 40 current Mono cases remain slower than
+current native. These are indexer graph checks, not whole-model graphs;
+whole-model accuracy and live LMCache reload were not rerun for shared weights.
 
 ## Validation Status
 

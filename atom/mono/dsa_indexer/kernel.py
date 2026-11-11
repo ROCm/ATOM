@@ -236,7 +236,6 @@ ABI = KernelAbi(
         "qr",
         "qr_ld",
         "w_qb",
-        "w_qb_packed",
         "kp",
         "wp",
         "kw_ld",
@@ -608,6 +607,32 @@ def iquant_values(c, task, lane, x0, x1):
 
 
 # ---------------------------------------------------------------- kernel
+def shuffled_q_loads(lane, wave, weight, group, k):
+    """AITER BF16 (16, 16) shuffle, in the shared GEMV's K-chunk order."""
+    per, n = gemv.chunks(k)
+    descriptor = rsrc(weight)
+    return [
+        [
+            fx.Vector(
+                bo.buffer_load(
+                    descriptor,
+                    (
+                        (group * (k // 32) + fx.min(wave + WAVES * i, n - 1) * 4 + q)
+                        * 64
+                        + lane
+                    )
+                    * 4,
+                    vec_width=4,
+                    dtype=T.i32,
+                    cache_modifier=gemv.CM_NT,
+                )
+            )
+            for q in range(4)
+        ]
+        for i in range(per)
+    ]
+
+
 @traced
 def stage_q_head(c, qr, qr_ld, w_qb):
     """A CTA projects complete heads, then quantizes them without a global rendezvous."""
@@ -644,14 +669,10 @@ def stage_q_head(c, qr, qr_ld, w_qb):
                             packed,
                             (
                                 (
-                                    (
-                                        head * (sh.q_lora // 32)
-                                        + k0 // 32
-                                        + ch * 4
-                                        + step
-                                    )
-                                    * 8
-                                    + wave
+                                    (head * 8 + wave) * (sh.q_lora // 32)
+                                    + k0 // 32
+                                    + ch * 4
+                                    + step
                                 )
                                 * 64
                                 + lane
@@ -800,7 +821,6 @@ def build(key: IxBuild):
         qr: Int64,
         qr_ld: Int32,
         w_qb: Int64,
-        w_qb_packed: Int64,
         kp: Int64,
         wp: Int64,
         kw_ld: Int32,
@@ -977,11 +997,11 @@ def build(key: IxBuild):
                 if isel.short_verify_step(c):
                     if bid < s:
                         stage_k(c, bid)
-                    stage_q_head(c, qr, qr_ld, w_qb_packed)
+                    stage_q_head(c, qr, qr_ld, w_qb)
                     stamp(on, tls, tid, 1)
                 else:
-                    ops = gemv.loads(
-                        c["lane"], c["wave"], w_qb, qgroup * gemv.ROWS, sh.q_lora
+                    ops = shuffled_q_loads(
+                        c["lane"], c["wave"], w_qb, qgroup, sh.q_lora
                     )
                     if bid < s:
                         stage_k(c, bid)
@@ -990,9 +1010,7 @@ def build(key: IxBuild):
                     stamp(on, tls, tid, 1)
                     stage_iquant(c, bid, s)
             else:
-                ops = gemv.loads(
-                    c["lane"], c["wave"], w_qb, qgroup * gemv.ROWS, sh.q_lora
-                )
+                ops = shuffled_q_loads(c["lane"], c["wave"], w_qb, qgroup, sh.q_lora)
                 if bid < s:
                     stage_k(c, bid)
                 project(qbase, s // 2 if split_q else s, ops)
@@ -1086,7 +1104,6 @@ def build(key: IxBuild):
         qr: Int64,
         qr_ld: Int32,
         w_qb: Int64,
-        w_qb_packed: Int64,
         kp: Int64,
         wp: Int64,
         kw_ld: Int32,
@@ -1121,7 +1138,6 @@ def build(key: IxBuild):
             qr,
             qr_ld,
             w_qb,
-            w_qb_packed,
             kp,
             wp,
             kw_ld,

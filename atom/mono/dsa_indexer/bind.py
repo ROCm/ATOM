@@ -14,6 +14,7 @@ request, each row its own causal window); every other step -- prefill, a dummy
 run -- calls the indexer's own forward on every rank alike.
 """
 
+import inspect
 import logging
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -28,11 +29,13 @@ from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 from atom.config import get_current_atom_config
 from atom.distributed.dcp_utils import get_dcp_rank
 from atom.distributed.pcp_utils import pcp_is_enabled
+from atom.model_ops.utils import shuffle_weights
 from atom.mono.dsa_indexer import kernel as kix
 from atom.mono.dsa_indexer.plan import (
     IndexerShape,
     unsupported,
 )
+from atom.mono.runtime.deployment import _takes_weight_updates
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.forward_context import (
     get_forward_context,
@@ -140,6 +143,8 @@ def routing_refusal(cfg, indexers: dict) -> str:
 def _static_refusal(cfg, tp: int, rank: int, indexers: dict) -> str:
     if not indexers:
         return "no DSA layers"
+    if _takes_weight_updates(cfg):
+        return "rollout weight updates do not preserve the BF16 indexer shuffle"
     shapes = {shape_of(m, cfg.kv_cache_block_size) for m in indexers.values()}
     if len(shapes) > 1:
         return f"the DSA layers differ: {sorted(s.tag for s in shapes)}"
@@ -160,6 +165,12 @@ def _static_refusal(cfg, tp: int, rank: int, indexers: dict) -> str:
         why = _operand_refusal(m, shape)
         if why:
             return f"layer {layer_id}: {why}"
+    try:
+        from aiter.ops.flydsl.gemm_kernels import flydsl_hgemm
+    except ImportError:
+        return "AITER BF16 preshuffle GEMM unavailable"
+    if "bpreshuffle" not in inspect.signature(flydsl_hgemm).parameters:
+        return "AITER BF16 preshuffle GEMM unavailable; upgrade AITER"
     return ""
 
 
@@ -179,6 +190,8 @@ def _operand_refusal(m, shape: IndexerShape) -> str:
     w = m.wq_b.weight
     if tuple(w.shape) != (shape.qrows, shape.q_lora) or not w.is_contiguous():
         return f"wq_b {tuple(w.shape)}"
+    if shape.q_lora <= 0 or shape.q_lora % kix.gemv.KCH:
+        return "shuffled Q GEMV requires wq_b K divisible by 128"
     return ""
 
 
@@ -211,6 +224,13 @@ def indexer_modules(inner) -> dict:
     }
 
 
+def prepare_weights(indexers: dict) -> None:
+    """Prepare shared AITER BF16 storage before any native graph is captured."""
+    for module in indexers.values():
+        if not getattr(module.wq_b.weight, "is_shuffled", False):
+            shuffle_weights(module.wq_b.weight)
+
+
 def bind_indexers(inner, tp: int, rank: int) -> IndexerBinding | None:
     """The DSA layers' indexers, or None (with the reason logged) when the
     kernel cannot serve them."""
@@ -219,6 +239,9 @@ def bind_indexers(inner, tp: int, rank: int) -> IndexerBinding | None:
     why = _refusal(cfg, tp, rank, indexers)
     if why:
         logger.info("mono DSA indexer off: %s", why)
+        return None
+    if any(not getattr(m.wq_b.weight, "is_shuffled", False) for m in indexers.values()):
+        logger.info("mono DSA indexer off: weights not prepared before model warmup")
         return None
     # without DCP every rank stores every key, the TP ranks split the scoring
     replicated = cfg.decode_context_parallel_size == 1
@@ -241,10 +264,6 @@ def bind_indexers(inner, tp: int, rank: int) -> IndexerBinding | None:
         and shape.q_lora in (1024, 1536, 2048)
         and kix.dual_score_device(device)
     )
-    if short_gemm:
-        for module in indexers.values():
-            weight = module.wq_b.weight.detach()
-            module._mono_indexer_wq_packed = pack_short_q(weight)
     return IndexerBinding(
         indexers,
         shape,
@@ -253,15 +272,6 @@ def bind_indexers(inner, tp: int, rank: int) -> IndexerBinding | None:
         replicated,
         dual_score=dual,
         short_gemm=short_gemm,
-    )
-
-
-def pack_short_q(weight: torch.Tensor) -> torch.Tensor:
-    """Reorder BF16 operands once; preserve checkpoint values and the native weight."""
-    return (
-        weight.view(-1, 8, 16, weight.shape[1] // 32, 4, 8)
-        .permute(0, 3, 1, 4, 2, 5)
-        .contiguous()
     )
 
 
@@ -443,7 +453,6 @@ def launch_args(
                 "cs_ld": cos.stride(0), "maxpos": cos.size(0)}  # fmt: skip
     return kix.ABI.pack({
         "qr": p(qr), "qr_ld": qr.stride(0), "w_qb": p(module.wq_b.weight),
-        "w_qb_packed": p(module._mono_indexer_wq_packed) if hasattr(module, "_mono_indexer_wq_packed") else 0,
         "kp": p(k), "wp": p(weights), "kw_ld": k.stride(0),
         "kn_w": p(module.k_norm.weight), "kn_b": p(module.k_norm.bias),
         "slots": p(md.slot_mapping), **rope, "cache": p(module.k_cache.kv_cache[0]),

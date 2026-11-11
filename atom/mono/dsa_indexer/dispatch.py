@@ -123,6 +123,7 @@ def install_mono_decode(
         from atom.mono.dsa_indexer.bind import (
             IndexerHook,
             indexer_modules,
+            prepare_weights,
             routing_refusal,
         )
     except ImportError as error:
@@ -136,6 +137,7 @@ def install_mono_decode(
         logger.info("DSA indexer mono off: %s", why)
         return model
     logger.info("DSA indexer mono armed (TP%d)", atom_config.tensor_parallel_size)
+    prepare_weights(modules)
     # routed now, before the layer stack is first traced (its warmup): the
     # runner attaches to it once built
     return IndexerMonoModel(model, IndexerHook(modules), metadata_builder)

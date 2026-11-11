@@ -33,7 +33,7 @@ from atom.model_ops.indexer.rows import fp4_rows, fp8_rows
 from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace
 from atom.models.deepseek_v2 import Indexer, get_rope, is_neox_rope_style
 from atom.mono.dsa_indexer import kernel as kix
-from atom.mono.dsa_indexer.bind import IndexerHook, shape_of
+from atom.mono.dsa_indexer.bind import IndexerHook, prepare_weights, shape_of
 from atom.mono.dsa_indexer.runner import IndexerRunner
 from atom.mono.runtime.compile import launcher_resources
 from atom.utils.forward_context import AttentionMetaData, Context, set_forward_context
@@ -192,6 +192,7 @@ def run_case(args, cfg, weights, device, rank, world, batch, context):
     )
     set_forward_context(metadata, cfg, step, np.array([rows], dtype=np.int32))
     hook = IndexerHook({0: module})
+    prepare_weights({0: module})
     runner = IndexerRunner.alone(
         SimpleNamespace(
             layers=[SimpleNamespace(self_attn=SimpleNamespace(indexer=module))]
