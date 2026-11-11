@@ -627,6 +627,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_MONO_DEBUG": lambda: os.getenv("ATOM_MONO_DEBUG", "0") == "1",
     "ATOM_MONO_XN_FLAG": lambda: int(os.getenv("ATOM_MONO_XN_FLAG", "0")),
     "ATOM_MONO_MID_MODE": lambda: int(os.getenv("ATOM_MONO_MID_MODE", "0")),
+    # MiniMax-M3 mono: log (rank 0) how many decode steps took mono and how many the
+    # original path, by token count, every this many counted decode steps; 0 off.
+    "ATOM_MONO_STATS_EVERY": lambda: int(os.getenv("ATOM_MONO_STATS_EVERY", "0")),
     # DeepSeek-V4.1: how many of an attention layer's branches leave the main
     # stream. 0 none; 1 the compressor, on the MoE's `alt_stream`, waited at
     # the scorer that first reads it; 2 the indexer as well, on one of its own.

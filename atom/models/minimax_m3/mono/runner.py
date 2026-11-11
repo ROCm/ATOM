@@ -52,6 +52,7 @@ from atom.models.minimax_m3.mono.config import (
     TP,
     IndexHeads,
 )
+from atom.models.minimax_m3.mono.kernels.common import KV_PAGE_BYTES
 from atom.models.minimax_m3.mono.kernels.dense_post import (
     DENSE_POST_ABI,
     build_dense_post_kernel,
@@ -221,6 +222,12 @@ class MonoDecodeRunner:
         eps = config.rms_norm_eps
         route_scale = float(layers[N_DENSE].block_sparse_moe.routed_scaling_factor)
         self.shared_mxfp8 = self.sparse[0].shared_mxfp8
+        # NVFP4 K/V + index pages (single-buffer): every layer alike, both caches together
+        self.nvfp4 = impl.kv_cache_dtype == "nvfp4"
+        if any(
+            lw.attn_impl.kv_cache_dtype != impl.kv_cache_dtype for lw in self.sparse
+        ):
+            raise MonoUnsupported("KV cache dtype differs between layers")
         if any(lw.shared_mxfp8 != self.shared_mxfp8 for lw in self.sparse):
             raise MonoUnsupported("shared expert fused in some layers only")
         if self.shared_mxfp8:
@@ -270,6 +277,8 @@ class MonoDecodeRunner:
             xn_flag=envs.ATOM_MONO_XN_FLAG,
             mid_flag=envs.ATOM_MONO_MID_MODE,
             shared_mxfp8=self.shared_mxfp8,
+            kv_nvfp4=self.nvfp4,
+            index_nvfp4=self.nvfp4,
         )
         # a dense layer's kernels around its original attention
         if self.dense_mono:
@@ -486,9 +495,19 @@ class MonoDecodeRunner:
         block_table, seq_lens = rows
         stream = torch.cuda.current_stream()
         kv = fwd.kv_cache_data[f"layer_{lw.layer_id}"]
-        k16, v16, ks16, vs16 = to_page16_shuffle(
-            kv.k_cache, kv.v_cache, kv.k_scale, kv.v_scale
-        )
+        if self.nvfp4:
+            # the pool's page view is both K and V; the kernels step pages by KV_PAGE_BYTES
+            pages = kv.k_cache
+            if pages.stride() != (KV_PAGE_BYTES, 1) or pages.dtype != torch.uint8:
+                raise MonoUnsupported(
+                    f"NVFP4 KV pages {pages.dtype} {tuple(pages.shape)} {pages.stride()}"
+                )
+            k16 = v16 = pages
+            ks16, vs16 = lw.attn_impl.nvfp4_k_scale, lw.attn_impl.nvfp4_v_scale
+        else:
+            k16, v16, ks16, vs16 = to_page16_shuffle(
+                kv.k_cache, kv.v_cache, kv.k_scale, kv.v_scale
+            )
         args = {
             "h_in": _ptr(self.h), "q": _ptr(self.q), "block_table": _ptr(block_table),
             "seq_lens": _ptr(seq_lens), "k_cache": _ptr(k16), "v_cache": _ptr(v16),

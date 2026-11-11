@@ -943,6 +943,10 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
             inputs_embeds = self.embed_input_ids(input_ids)
         return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
+    def mono_note_replay(self, n: int) -> None:
+        """The model runner replayed an n-row decode graph (``MonoDecode.note_replay``)."""
+        self._mono.note_replay(n)
+
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.lm_head(hidden_states)
 
@@ -1003,6 +1007,9 @@ class MiniMaxM3SparseForConditionalGenerationTextOnly(nn.Module):
 
     def bind_mono_drafter(self, drafter) -> None:
         self.language_model.bind_mono_drafter(drafter)
+
+    def mono_note_replay(self, n: int) -> None:
+        self.language_model.mono_note_replay(n)
 
     def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
         return self.language_model.get_eagle3_aux_hidden_state_layers()

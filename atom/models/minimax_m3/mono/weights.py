@@ -27,6 +27,7 @@ from atom.models.minimax_m3.mono.config import (
     TOPK_BLOCKS,
     IndexHeads,
 )
+from atom.models.minimax_m3.mono.kernels.common import NVFP4_PAGE_BYTES
 from atom.mono.runtime.consensus import MonoUnsupported
 
 
@@ -171,13 +172,32 @@ class SparseMoeLayer:
         )
         impl = attn.attn.impl
         _need(
-            impl.kv_cache_dtype == "fp8" and impl.index_cache is not None,
+            impl.kv_cache_dtype in ("fp8", "nvfp4") and impl.index_cache is not None,
             f"layer {layer_id}: caches",
         )
-        _need(
-            impl.index_cache.dtype == dtypes.fp8,
-            f"layer {layer_id}: index cache {impl.index_cache.dtype}",
-        )
+        if impl.kv_cache_dtype == "nvfp4":
+            # single-buffer pages: the kernels address page b at b * page bytes, so a
+            # layer's pool view must be dense; the f32 global K / V scales are tensors
+            _need(
+                impl.index_cache_dtype == "nvfp4"
+                and impl.index_cache.dtype == torch.uint8
+                and impl.index_cache.dim() == 2
+                and impl.index_cache.shape[1] == NVFP4_PAGE_BYTES
+                and impl.index_cache.stride() == (NVFP4_PAGE_BYTES, 1),
+                f"layer {layer_id}: index cache {impl.index_cache.dtype} "
+                f"{tuple(impl.index_cache.shape)} {impl.index_cache.stride()}",
+            )
+            for name in ("nvfp4_k_scale", "nvfp4_v_scale"):
+                t = getattr(impl, name, None)
+                _need(
+                    t is not None and t.dtype == torch.float32 and t.numel() == 1,
+                    f"layer {layer_id}: {name}",
+                )
+        else:
+            _need(
+                impl.index_cache.dtype == dtypes.fp8,
+                f"layer {layer_id}: index cache {impl.index_cache.dtype}",
+            )
         w_qkv, s_qkv = _ptpc_fp8(
             attn.qkv_proj, heads.rows, HIDDEN, f"layer {layer_id} qkv_proj"
         )
