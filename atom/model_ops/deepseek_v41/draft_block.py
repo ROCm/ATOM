@@ -16,10 +16,10 @@ class DraftStep:
     positions: torch.Tensor
     indices: torch.Tensor
     decode: bool = False
-    # `indices` as two-source CSR (`draft_csr_indices`): (context rows, ptr, draft rows,
-    # ptr). Built once per draft step and shared by every stage; None keeps the
-    # concatenating path.
-    csr_indices: tuple | None = None
+    # `indices` as the two sources (`draft_src_indices`): (context rows, ptr,
+    # draft rows, ptr). Built once per draft step and shared by every stage;
+    # None keeps the concatenating path.
+    src_indices: tuple | None = None
     csr: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None
 
 

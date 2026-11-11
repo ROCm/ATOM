@@ -16,7 +16,7 @@ if not torch.cuda.is_available():
     pytest.skip("runs a Triton attention kernel", allow_module_level=True)
 
 from atom.model_ops.deepseek_v41.draft_block import draft_step
-from atom.model_ops.deepseek_v41.dspark import draft_attention, draft_csr_indices
+from atom.model_ops.deepseek_v41.dspark import draft_attention, draft_src_indices
 
 
 @pytest.mark.parametrize("two_source", [False, True])
@@ -32,7 +32,7 @@ def test_draft_attention_against_dense_sink_oracle(two_source):
     step = draft_step(context_positions, anchors, 5, 4)
     if two_source:
         # The window and the block as the two sources of the sparse MLA kernel.
-        step = replace(step, csr_indices=draft_csr_indices(step.indices, 8))
+        step = replace(step, src_indices=draft_src_indices(step.indices, 8))
     all_keys = torch.cat((context, keys), dim=1).float()
     scores = torch.einsum("bthd,bsd->bhts", query.float(), all_keys) * 512**-0.5
     mask = (context_positions <= anchors[:, None]) & (
@@ -50,8 +50,23 @@ def test_draft_attention_against_dense_sink_oracle(two_source):
     assert error < 0.004
 
 
+def test_two_source_draft_attention_with_no_rows():
+    # No rows: the builder launches nothing and the kernel reads no indptr.
+    device = "cuda"
+    query = torch.randn(0, 5, 8, 512, dtype=torch.bfloat16, device=device)
+    context = torch.randn(0, 8, 512, dtype=torch.bfloat16, device=device)
+    keys = torch.randn(0, 5, 512, dtype=torch.bfloat16, device=device)
+    sink = torch.randn(8, device=device)
+    context_positions = torch.arange(8, device=device).expand(0, -1)
+    anchors = torch.zeros(0, dtype=torch.long, device=device)
+    step = draft_step(context_positions, anchors, 5, 4)
+    step = replace(step, src_indices=draft_src_indices(step.indices, 8))
+    actual = draft_attention(query, context, keys, sink, step, 512**-0.5)
+    assert actual.shape == (0, 5, 8, 512)
+
+
 @pytest.mark.parametrize("batch,width,ring", [(1, 1, 4), (2, 5, 8), (3, 4, 16)])
-def test_draft_csr_indices_drops_the_unused_entries_in_order(batch, width, ring):
+def test_draft_src_indices_drops_the_unused_entries_in_order(batch, width, ring):
     torch.manual_seed(batch * 100 + width)
     device = "cuda"
     history = torch.randint(0, ring, (batch, width, ring), device=device)
@@ -59,7 +74,7 @@ def test_draft_csr_indices_drops_the_unused_entries_in_order(batch, width, ring)
     block = ring + torch.arange(width, device=device).expand(batch, width, -1)
     block = torch.where(torch.rand(batch, width, width, device=device) < 0.2, -1, block)
     indices = torch.cat((history, block), dim=-1).int().contiguous()
-    context, context_ptr, draft, draft_ptr = draft_csr_indices(indices, ring)
+    context, context_ptr, draft, draft_ptr = draft_src_indices(indices, ring)
     context_rows, draft_rows = [0], [0]
     for b in range(batch):
         for t in range(width):
