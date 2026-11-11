@@ -68,7 +68,7 @@ def _fake_proposer(num_attention_heads, *, fused, returns_slots=False):
         prepare_mtp_decode=prepare_mtp_decode,
     )
     proposer = types.SimpleNamespace(
-        _share_mtp_indices=False,
+        share_mtp_indices=False,
         device=torch.device("cpu"),
         runner=types.SimpleNamespace(attn_metadata_builder=builder),
         # The real rewrite drops the metadata to one row per sequence and
@@ -221,14 +221,14 @@ def _warmup_all_sizes(warmup_draft_graphs, capture_sizes=(4, 2, 1)):
 def test_accumulated_warmup_runs_kv_indptr_backwards():
     # The hazard, shown on the base loop: sizes warm smallest first, and each
     # one's in-place bump lands on the rows every earlier size already bumped.
-    _, seen = _warmup_all_sizes(Drafter.warmup_draft_graphs)
+    _, seen = _warmup_all_sizes(Drafter._warmup_draft_graphs)
     kv_indptr, _ = seen[4]
     assert kv_indptr.tolist() == [0, 3, 4, 3, 4]
     assert (kv_indptr.diff() < 0).any()
 
 
 def test_every_size_warms_from_the_capture_state():
-    var, seen = _warmup_all_sizes(EagleProposer.warmup_draft_graphs)
+    var, seen = _warmup_all_sizes(EagleProposer._warmup_draft_graphs)
     for bs, (kv_indptr, context_lens) in seen.items():
         # One drafted token per sequence on top of an untouched capture.
         assert kv_indptr.tolist() == list(range(bs + 1))

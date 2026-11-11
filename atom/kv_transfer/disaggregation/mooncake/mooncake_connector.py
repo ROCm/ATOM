@@ -91,6 +91,7 @@ from atom.kv_transfer.disaggregation.types import (
     PageUnitSpec,
     ReqId,
     TransferId,
+    produced_no_handoff,
 )
 from atom.model_engine.sequence import Sequence, SequenceStatus
 from atom.models.utils import get_pp_indices
@@ -680,7 +681,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
     def request_finished(self, seq: Sequence) -> None:
         params = getattr(seq, "kv_transfer_params", None) or {}
         if self.is_producer and params.get("chunked_transfer"):
-            aborted = getattr(seq, "leave_reason", None) == "aborted"
+            aborted = produced_no_handoff(seq)
             self._chunked_waiting.pop(seq.id, None)
             self._chunked_ready.discard(seq.id)
             params["prefill_aborted"] = aborted
@@ -704,7 +705,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
                 )
             seq.kv_transfer_params_output = None
             return
-        if self.is_producer and getattr(seq, "leave_reason", None) == "aborted":
+        if self.is_producer and produced_no_handoff(seq):
             # No send claim protects an abort's blocks from reuse. Never
             # advertise their addresses or dispatch a queued producer save.
             self._reqs_need_save.pop(seq.id, None)
