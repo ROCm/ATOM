@@ -1147,6 +1147,43 @@ def test_an_aborted_move_does_not_replace_a_local_prefill_producer():
     assert router._rank_hits(local.prompt_hash_chain, 2)[0][1] == 8192
 
 
+def test_a_follower_branching_inside_a_producers_range_takes_over_the_shared_prefix():
+    """B reuses the first four blocks A is still prefilling, then diverges, so
+    A's interval is split inside its range. When A leaves unprefilled the shared
+    prefix passes to B with the credit B loses; once B leaves too, no hit is
+    left on that rank."""
+    import array
+
+    from atom.model_engine.prefix_hash import ShippedChain
+
+    def chain(seq_id, shared_blocks, tail_blocks, tail_base):
+        seq = _FakeSeq(seq_id, num_prompt_tokens=(shared_blocks + tail_blocks) * 128)
+        hashes = list(range(shared_blocks)) + [
+            tail_base + k for k in range(tail_blocks)
+        ]
+        seq.prompt_hash_chain = ShippedChain(
+            128, 0, seq.num_prompt_tokens, 0, array.array("Q", hashes)
+        )
+        return seq
+
+    mgr = _make_spread_mgr()
+    (owner,) = _route(mgr, [chain(1, 10, 0, 0)])
+    follower = chain(2, 4, 6, 5000)
+    assert _route(mgr, [follower]) == [owner]
+    assert _est(mgr, follower) == 512  # the four blocks A is still prefilling
+    mgr._release_seq(1)  # A leaves before its prefill completed
+    # B owns what A would have produced, and the credit it lost is its debt now.
+    assert mgr._seq_load[2][2] == follower.num_prompt_tokens
+    assert mgr._rank_tokens[owner] == follower.num_prompt_tokens
+    router = mgr._prefix_router
+    assert router.pending
+    mgr._release_seq(2)  # B leaves too
+    assert not router.pending and mgr._rank_tokens[owner] == 0
+    probe = chain(3, 10, 0, 0)
+    _route(mgr, [probe])
+    assert _est(mgr, probe) == 0  # nothing was ever prefilled: cold again
+
+
 def test_successive_producer_aborts_transfer_debt_without_leaking_it():
     mgr = _make_spread_mgr()
     (owner,) = _route(mgr, [_chain_seq(1, 100_000)])

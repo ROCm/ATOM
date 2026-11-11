@@ -7,6 +7,7 @@ import array
 import pickle
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -15,6 +16,7 @@ from atom.kv_transfer.offload.mp.metadata import MPOffloadMetadata, MPReqMeta
 from atom.kv_transfer.offload.mp.token_shipping import (
     ShippedTokens,
     TokenPrefix,
+    TokenShipper,
     WorkerTokens,
 )
 
@@ -40,6 +42,37 @@ def test_mp_metadata_roundtrip_and_drops_only_work():
     assert not copies._held
     assert not hasattr(LMCacheOffloadMetadata(), "token_drops")
     assert not LMCacheOffloadMetadata().has_work()
+
+
+def test_a_worker_that_missed_a_shipment_refuses_instead_of_resolving_wrong_tokens():
+    """The scheduler ships only the tokens past what the workers hold. A worker
+    that missed one shipment holds a prefix shorter than the next one assumes:
+    chunk keys built from it would name other tokens' KV, so it must refuse."""
+    seq = SimpleNamespace(id=7, token_ids=array.array("i", range(300)))
+    shipper = TokenShipper()
+
+    def step(end):
+        metadata = MPOffloadMetadata()
+        metadata.add_request(MPReqMeta(7, shipper.ship(seq, end), []))
+        return pickle.dumps(metadata)
+
+    first, second, third = step(100), step(200), step(300)
+    current, behind = WorkerTokens(), WorkerTokens()
+    for wire, end in ((first, 100), (second, 200), (third, 300)):
+        resolved = pickle.loads(wire)
+        current.resolve(resolved)
+        assert resolved.requests[0].token_ids.tolist() == list(range(end))
+    behind.resolve(pickle.loads(first))  # never receives `second`
+    with pytest.raises(RuntimeError, match="holds 100 tokens, the scheduler shipped"):
+        behind.resolve(pickle.loads(third))
+
+    # A shipment that does not reach the transfer's end is refused as well.
+    short = MPOffloadMetadata()
+    short.add_request(
+        MPReqMeta(8, ShippedTokens(0, 300, array.array("i", range(100))), [])
+    )
+    with pytest.raises(RuntimeError, match="holds 100 tokens, the transfer needs 300"):
+        WorkerTokens().resolve(short)
 
 
 def test_mp_missing_generation_is_rejected_before_any_token_reader():
