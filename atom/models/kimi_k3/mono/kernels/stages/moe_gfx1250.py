@@ -25,9 +25,11 @@ from atom.mono.device.ops import (
     hw_exp2,
     hw_rcp,
     lane_gather,
+    readlane,
     rsrc,
     traced,
     uniform,
+    xshfl,
 )
 from atom.mono.plan.architecture import GFX1250
 
@@ -75,6 +77,114 @@ def _block_exclusive_scan32(value, lane, wave, scratch, waves):
         wave_offset = wave_offset + (other_wave < wave).select(count, fx.Int32(0))
         total = total + count
     return inclusive - value + wave_offset, total
+
+
+WAVE = GFX1250.wave_size
+# A survivor's aux is its expert id times SLOTS plus its LDS slot.
+SLOTS = 2 * WAVE
+# ``stage_route``'s ``red``: three words a survivor slot.
+ROUTE_RED_WORDS = 3 * SLOTS
+
+
+def _before(key, aux, other_key, other_aux):
+    return (key > other_key) | ((key == other_key) & (aux < other_aux))
+
+
+def _bitonic_descending(keys, auxes, lane):
+    """Bitonic sort of ``len(keys)`` (key, aux) pairs a lane, element
+    ``r * WAVE + lane`` in register ``r``: element ``i`` ends as the i-th by
+    descending key, then ascending aux."""
+    keys, auxes = list(keys), list(auxes)
+    count = len(keys) * WAVE
+    size = 2
+    while size <= count:
+        stride = size // 2
+        while stride:
+            if stride >= WAVE:
+                step = stride // WAVE
+                for low in (r for r in range(len(keys)) if not r // step % 2):
+                    high = low + step
+                    swap = _before(keys[high], auxes[high], keys[low], auxes[low])
+                    if low * WAVE // size % 2:
+                        swap = _before(keys[low], auxes[low], keys[high], auxes[high])
+                    keys[low], keys[high] = (
+                        swap.select(keys[high], keys[low]),
+                        swap.select(keys[low], keys[high]),
+                    )
+                    auxes[low], auxes[high] = (
+                        swap.select(auxes[high], auxes[low]),
+                        swap.select(auxes[low], auxes[high]),
+                    )
+            else:
+                for r in range(len(keys)):
+                    other_key = fx.Uint32(xshfl(fx.Int32(keys[r]), stride, GFX1250))
+                    other_aux = xshfl(auxes[r], stride, GFX1250)
+                    mine_first = _before(keys[r], auxes[r], other_key, other_aux)
+                    # 0 where this lane keeps the pair's earlier element.
+                    later_here = ((lane // stride) ^ ((lane + r * WAVE) // size)) & 1
+                    keep = mine_first.select(fx.Int32(0), fx.Int32(1)) == later_here
+                    keys[r] = keep.select(keys[r], other_key)
+                    auxes[r] = keep.select(auxes[r], other_aux)
+            stride //= 2
+        size *= 2
+    return keys, auxes
+
+
+@traced
+def _ranked_survivors(scores, sigmoid, bound, kept, survivors, red, lane, registers):
+    """(expert, sigmoid) of rank ``lane`` among the ``survivors`` scores at or
+    above ``bound``, ``kept`` of them this lane's: compacted into LDS slots,
+    then one bitonic sort of ``registers`` slots a lane."""
+    slot = kept
+    for step in range_constexpr(5):
+        shift = 1 << step
+        below = lane_gather(slot, fx.max(lane - shift, 0))
+        slot = slot + (lane >= shift).select(below, fx.Int32(0))
+    slot = slot - kept
+    for index in range_constexpr(len(scores)):
+        if scores[index] >= bound:
+            expert = lane + WAVE * index
+            fx.ptr_store(scores[index].bitcast(fx.Float32), red + slot * 3)
+            fx.ptr_store(fx.Int32(expert).bitcast(fx.Float32), red + slot * 3 + 1)
+            fx.ptr_store(sigmoid[index], red + slot * 3 + 2)
+            slot = slot + 1
+    keys, auxes = [], []
+    for r in range_constexpr(registers):
+        entry = lane + r * WAVE
+        live = entry < survivors
+        keys.append(
+            live.select(
+                fx.Uint32(fx.ptr_load(red + entry * 3).bitcast(fx.Int32)), fx.Uint32(0)
+            )
+        )
+        # The padding sorts after every expert.
+        auxes.append(
+            live.select(
+                fx.ptr_load(red + entry * 3 + 1).bitcast(fx.Int32), fx.Int32(EXPERTS)
+            )
+            * SLOTS
+            + entry
+        )
+    keys, auxes = _bitonic_descending(keys, auxes, lane)
+    return auxes[0] // SLOTS, fx.ptr_load(red + (auxes[0] % SLOTS) * 3 + 2)
+
+
+def _umax_tree(values):
+    while len(values) > 1:
+        paired = [
+            (values[i] > values[i + 1]).select(values[i], values[i + 1])
+            for i in range(0, len(values) - 1, 2)
+        ]
+        values = paired + values[len(paired) * 2 :]
+    return values[0]
+
+
+def _count_tree(predicates):
+    counts = [p.select(fx.Int32(1), fx.Int32(0)) for p in predicates]
+    while len(counts) > 1:
+        paired = [counts[i] + counts[i + 1] for i in range(0, len(counts) - 1, 2)]
+        counts = paired + counts[len(paired) * 2 :]
+    return counts[0]
 
 
 def _f32_of(word):
@@ -138,91 +248,121 @@ def stage_route(c, token, front_payload_words=0):
                 (sig == sig).select(sig, fx.Float32(0.0))  # noqa: PLR0124 - NaN guard.
             )
 
-        def count_at_least(threshold):
-            # Per-lane VALU counts and one wave sum: a ballot per score
-            # serializes on its VALU -> SALU mask hand-off.
-            count = fx.Int32(0)
+        # Exact prefilter: at least ``width`` scores reach the width-th largest
+        # lane maximum, so the top ``width`` are among those scores -- about 22
+        # of the 896, more than a wave about once in a hundred tokens. One
+        # bitonic sort of them ranks the top ``width`` by key and id; a tie
+        # wider than two waves takes the radix select.
+        bound = _bitonic_descending([_umax_tree(scores)], [fx.Int32(0)], lane)[0][0]
+        bound = fx.Uint32(readlane(fx.Int32(bound), width - 1))
+        kept = _count_tree([score >= bound for score in scores])
+        survivors = butterfly(kept, (16, 8, 4, 2, 1), architecture=GFX1250)
+        rank = fx.Int32(0)
+        my_expert = fx.Int32(0)
+        my_sigmoid = fx.Float32(0.0)
+        if survivors <= SLOTS:
+            if survivors <= WAVE:
+                one = _ranked_survivors(
+                    scores, sigmoid, bound, kept, survivors, red, lane, 1
+                )
+                my_expert = one[0]
+                my_sigmoid = one[1]
+            else:
+                two = _ranked_survivors(
+                    scores, sigmoid, bound, kept, survivors, red, lane, 2
+                )
+                my_expert = two[0]
+                my_sigmoid = two[1]
+            rank = lane
+        else:
+
+            def count_at_least(threshold):
+                # Per-lane VALU counts and one wave sum: a ballot per score
+                # serializes on its VALU -> SALU mask hand-off.
+                count = fx.Int32(0)
+                for index in range_constexpr(per_lane):
+                    count = count + (scores[index] >= threshold).select(
+                        fx.Int32(1), fx.Int32(0)
+                    )
+                return butterfly(count, (16, 8, 4, 2, 1), architecture=GFX1250)
+
+            # A dynamic loop: unrolled, the 32 steps are ~23 KB of straight-line
+            # code that runs from a cold instruction cache after other kernels.
+            threshold = fx.Uint32(0)
+            for step in range(32):
+                candidate = threshold | (fx.Uint32(1 << 31) >> fx.Uint32(step))
+                threshold = (count_at_least(candidate) >= width).select(
+                    candidate, threshold
+                )
+
+            greater = fx.Int32(0)
+            equal = fx.Int32(0)
             for index in range_constexpr(per_lane):
-                count = count + (scores[index] >= threshold).select(
+                greater = greater + (scores[index] > threshold).select(
                     fx.Int32(1), fx.Int32(0)
                 )
-            return butterfly(count, (16, 8, 4, 2, 1), architecture=GFX1250)
-
-        # A dynamic loop: unrolled, the 32 steps are ~23 KB of straight-line
-        # code that runs from a cold instruction cache after other kernels.
-        threshold = fx.Uint32(0)
-        for step in range(32):
-            candidate = threshold | (fx.Uint32(1 << 31) >> fx.Uint32(step))
-            threshold = (count_at_least(candidate) >= width).select(candidate, threshold)
-
-        greater = fx.Int32(0)
-        equal = fx.Int32(0)
-        for index in range_constexpr(per_lane):
-            greater = greater + (scores[index] > threshold).select(
-                fx.Int32(1), fx.Int32(0)
-            )
-            equal = equal + (scores[index] == threshold).select(
-                fx.Int32(1), fx.Int32(0)
-            )
-        needed = fx.Int32(width) - butterfly(
-            greater, (16, 8, 4, 2, 1), architecture=GFX1250
-        )
-        if butterfly(equal, (16, 8, 4, 2, 1), architecture=GFX1250) == needed:
-            # Every key at the threshold is kept, so a lane-major slot order
-            # suffices: the ranking below orders them by key and id.
-            kept = greater + equal
-            slot = kept
-            for step in range_constexpr(5):
-                shift = 1 << step
-                below = lane_gather(slot, fx.max(lane - shift, 0))
-                slot = slot + (lane >= shift).select(below, fx.Int32(0))
-            slot = slot - kept
-            for index in range_constexpr(per_lane):
-                if scores[index] >= threshold:
-                    expert = lane + GFX1250.wave_size * index
-                    fx.ptr_store(scores[index].bitcast(fx.Float32), red + slot * 3)
-                    fx.ptr_store(
-                        fx.Int32(expert).bitcast(fx.Float32), red + slot * 3 + 1
-                    )
-                    fx.ptr_store(sigmoid[index], red + slot * 3 + 2)
-                    slot = slot + 1
-        else:
-            equal_before = fx.Int32(0)
-            selected_before = fx.Int32(0)
-            for index in range_constexpr(per_lane):
-                equal_ballot = _ballot32(scores[index] == threshold)
-                equal_rank = equal_before + _lanes_below32(equal_ballot, lane)
-                selected = (scores[index] > threshold) | (
-                    (scores[index] == threshold) & (equal_rank < needed)
+                equal = equal + (scores[index] == threshold).select(
+                    fx.Int32(1), fx.Int32(0)
                 )
-                selected_ballot = _ballot32(selected)
-                position = selected_before + _lanes_below32(selected_ballot, lane)
-                if selected:
-                    expert = lane + GFX1250.wave_size * index
-                    fx.ptr_store(
-                        scores[index].bitcast(fx.Float32),
-                        red + position * 3,
-                    )
-                    fx.ptr_store(
-                        fx.Int32(expert).bitcast(fx.Float32),
-                        red + position * 3 + 1,
-                    )
-                    fx.ptr_store(sigmoid[index], red + position * 3 + 2)
-                equal_before = equal_before + _popcount32(equal_ballot)
-                selected_before = selected_before + _popcount32(selected_ballot)
-
-        item = fx.min(lane, width - 1)
-        my_key = fx.Uint32(fx.ptr_load(red + item * 3).bitcast(fx.Int32))
-        my_expert = fx.ptr_load(red + item * 3 + 1).bitcast(fx.Int32)
-        my_sigmoid = fx.ptr_load(red + item * 3 + 2)
-        rank = fx.Int32(0)
-        for other in range_constexpr(width):
-            other_key = fx.Uint32(fx.ptr_load(red + other * 3).bitcast(fx.Int32))
-            other_expert = fx.ptr_load(red + other * 3 + 1).bitcast(fx.Int32)
-            before = (other_key > my_key) | (
-                (other_key == my_key) & (other_expert < my_expert)
+            needed = fx.Int32(width) - butterfly(
+                greater, (16, 8, 4, 2, 1), architecture=GFX1250
             )
-            rank = rank + before.select(fx.Int32(1), fx.Int32(0))
+            if butterfly(equal, (16, 8, 4, 2, 1), architecture=GFX1250) == needed:
+                # Every key at the threshold is kept, so a lane-major slot order
+                # suffices: the ranking below orders them by key and id.
+                kept = greater + equal
+                slot = kept
+                for step in range_constexpr(5):
+                    shift = 1 << step
+                    below = lane_gather(slot, fx.max(lane - shift, 0))
+                    slot = slot + (lane >= shift).select(below, fx.Int32(0))
+                slot = slot - kept
+                for index in range_constexpr(per_lane):
+                    if scores[index] >= threshold:
+                        expert = lane + GFX1250.wave_size * index
+                        fx.ptr_store(scores[index].bitcast(fx.Float32), red + slot * 3)
+                        fx.ptr_store(
+                            fx.Int32(expert).bitcast(fx.Float32), red + slot * 3 + 1
+                        )
+                        fx.ptr_store(sigmoid[index], red + slot * 3 + 2)
+                        slot = slot + 1
+            else:
+                equal_before = fx.Int32(0)
+                selected_before = fx.Int32(0)
+                for index in range_constexpr(per_lane):
+                    equal_ballot = _ballot32(scores[index] == threshold)
+                    equal_rank = equal_before + _lanes_below32(equal_ballot, lane)
+                    selected = (scores[index] > threshold) | (
+                        (scores[index] == threshold) & (equal_rank < needed)
+                    )
+                    selected_ballot = _ballot32(selected)
+                    position = selected_before + _lanes_below32(selected_ballot, lane)
+                    if selected:
+                        expert = lane + GFX1250.wave_size * index
+                        fx.ptr_store(
+                            scores[index].bitcast(fx.Float32),
+                            red + position * 3,
+                        )
+                        fx.ptr_store(
+                            fx.Int32(expert).bitcast(fx.Float32),
+                            red + position * 3 + 1,
+                        )
+                        fx.ptr_store(sigmoid[index], red + position * 3 + 2)
+                    equal_before = equal_before + _popcount32(equal_ballot)
+                    selected_before = selected_before + _popcount32(selected_ballot)
+
+            item = fx.min(lane, width - 1)
+            my_key = fx.Uint32(fx.ptr_load(red + item * 3).bitcast(fx.Int32))
+            my_expert = fx.ptr_load(red + item * 3 + 1).bitcast(fx.Int32)
+            my_sigmoid = fx.ptr_load(red + item * 3 + 2)
+            rank = fx.Int32(0)
+            for other in range_constexpr(width):
+                other_key = fx.Uint32(fx.ptr_load(red + other * 3).bitcast(fx.Int32))
+                other_expert = fx.ptr_load(red + other * 3 + 1).bitcast(fx.Int32)
+                before = (other_key > my_key) | (
+                    (other_key == my_key) & (other_expert < my_expert)
+                )
+                rank = rank + before.select(fx.Int32(1), fx.Int32(0))
         if lane < TOPK:
             fx.ptr_store(my_sigmoid, red + 64 + rank)
         total = fx.Float32(0.0)

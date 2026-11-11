@@ -221,7 +221,7 @@ def build_packed_finish(
 
     @fx.struct
     class RouteRole:
-        red: fx.Array[fx.Float32, 128, 16]
+        red: fx.Array[fx.Float32, moe_gfx1250.ROUTE_RED_WORDS, 16]
 
     @fx.struct
     class PrepRole:
