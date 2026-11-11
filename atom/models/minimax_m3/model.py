@@ -51,7 +51,8 @@ from atom.model_ops.minimax_m3.router import (
     register_presorted_moe,
 )
 from atom.model_ops.minimax_m3.router.router_swiglu import (
-    m31_route_swiglu,
+    gate_sort,
+    router_partials_swiglu,
     router_swiglu_supported,
 )
 from atom.model_ops.minimax_m3.sparse_attn import (
@@ -474,33 +475,51 @@ class MiniMaxM3MoE(nn.Module):
             scheduled_tokens_gpu=None,
         )
 
-    def routed_moe_shared_swiglu(
+    def moe_with_shared(
         self, hidden_states: torch.Tensor, gate_up: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """``routed_moe(hidden_states)`` and the shared expert's
-        ``swiglu_oai_split_mxfp8(gate_up)``. For 1..128 rows the router GEMV
-        shares its launch with the SwiGLU and the gate and sort run in one
-        more (``m31_route_swiglu``); otherwise the two run apart."""
+    ) -> torch.Tensor:
+        """The whole MoE output, ``routed_scaling_factor * routed + shared``,
+        from the shared expert's gate_up. Where ``m31_route_swiglu``'s launches
+        serve the step, the routed weights carry the scaling; with
+        ``ATOM_M3_FOLD_SHARED_INTO_MOE`` GEMM2 accumulates onto the shared
+        expert's output and no combine launch follows, otherwise one add
+        combines them (also when the selected MoE pipeline takes no caller
+        output). The choice is made here, at run time, so the traced graph is
+        the same either way."""
         mlp = self.shared_experts
         swiglu = (mlp.swiglu_alpha, mlp.swiglu_beta, mlp.swiglu_limit)
         bias = self.e_score_correction_bias
+        scale = self.routed_scaling_factor
         if envs.ATOM_M3_ROUTER_SWIGLU and router_swiglu_supported(
             hidden_states, self.gate.weight, bias, gate_up
         ):
-            routed = m31_route_swiglu(
-                hidden_states,
-                self.gate.weight,
-                bias,
-                gate_up,
-                *swiglu,
-                routed_scaling_factor=1.0,
-                n_local=pass_scheduled_tokens_gpu(hidden_states.shape[0]),
+            act = router_partials_swiglu(
+                hidden_states, self.gate.weight, gate_up, *swiglu
             )
-            if routed is not None:
-                *routes, (x, x_scale) = routed
-                return self._presorted_experts(hidden_states, *routes), x, x_scale
+            if act is not None:
+                shared = mlp.down_proj(act[0], x_scale=act[1])
+                fold = (
+                    envs.ATOM_M3_FOLD_SHARED_INTO_MOE
+                    and shared.shape == hidden_states.shape
+                    and shared.dtype == hidden_states.dtype
+                    and shared.is_contiguous()
+                )
+                routes = gate_sort(
+                    hidden_states.shape[0],
+                    bias,
+                    routed_scaling_factor=scale,
+                    n_local=pass_scheduled_tokens_gpu(hidden_states.shape[0]),
+                    moe_buf=shared if fold else None,
+                )
+                routed = self._presorted_experts(hidden_states, *routes)
+                if fold and routed.data_ptr() == shared.data_ptr():
+                    return routed  # GEMM2 accumulated onto the shared output
+                # a pipeline that took no caller output left `shared` untouched
+                return torch.add(shared, routed)
         x, x_scale = swiglu_oai_split_mxfp8(gate_up, *swiglu)
-        return self.routed_moe(hidden_states), x, x_scale
+        routed = self.routed_moe(hidden_states)
+        shared = mlp.down_proj(x, x_scale=x_scale)
+        return torch.add(shared, routed, alpha=scale)
 
     def shared_takes_mxfp8_input(self) -> bool:
         """Whether the separate shared expert's gate_up reads MXFP8, so the
@@ -527,20 +546,14 @@ class MiniMaxM3MoE(nn.Module):
             and _linear_consumes_mxfp8(mlp.down_proj)
         ):
             # the shared gate_up first: its SwiGLU can then share a launch with
-            # the router GEMV inside the routed op
+            # the router GEMV inside the MoE op
             if shared_x is not None:
                 gate_up = mlp.gate_up_proj(shared_x, x_scale=shared_x_scale)
             else:
                 gate_up = mlp.gate_up_proj(hidden_states)
-            routed_output, x, x_scale = (
-                torch.ops.aiter.minimax_m3_routed_moe_shared_swiglu(
-                    hidden_states, gate_up, self.routed_layer_name
-                )
-            )
-            shared_output = mlp.down_proj(x, x_scale=x_scale)
-            if self.routed_scaling_factor != 1.0:
-                routed_output = routed_output * self.routed_scaling_factor
-            return (routed_output + shared_output).view(orig_shape)
+            return torch.ops.aiter.minimax_m3_moe_with_shared(
+                hidden_states, gate_up, self.routed_layer_name
+            ).view(orig_shape)
         if self.fused_router_op:
             routed_output = torch.ops.aiter.minimax_m3_routed_moe(
                 hidden_states, self.routed_layer_name
@@ -589,35 +602,28 @@ direct_register_custom_op(
 )
 
 
-def _minimax_m3_routed_moe_shared_swiglu(
+def _minimax_m3_moe_with_shared(
     hidden_states: torch.Tensor, gate_up: torch.Tensor, layer_name: str
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     moe = get_current_atom_config().compilation_config.static_forward_context[
         layer_name
     ]
-    return moe.routed_moe_shared_swiglu(hidden_states, gate_up)
+    return moe.moe_with_shared(hidden_states, gate_up)
 
 
-def _minimax_m3_routed_moe_shared_swiglu_fake(
+def _minimax_m3_moe_with_shared_fake(
     hidden_states: torch.Tensor, gate_up: torch.Tensor, layer_name: str
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    rows, n_inter = gate_up.shape[0], gate_up.shape[1] // 2
-    return (
-        torch.empty_like(hidden_states),
-        torch.empty(rows, n_inter, dtype=dtypes.fp8, device=gate_up.device),
-        torch.empty(
-            rows, n_inter // 32, dtype=torch.float8_e8m0fnu, device=gate_up.device
-        ),
-    )
+) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
 
 
-# Writes only its outputs (the experts path runs with inplace=False); declaring
-# no mutation also keeps Inductor from functionalizing a multi-output op.
+# Writes only its output (the experts path runs with inplace=False; the
+# shared expert output GEMM2 accumulates onto is the op's own).
 direct_register_custom_op(
-    op_name="minimax_m3_routed_moe_shared_swiglu",
-    op_func=_minimax_m3_routed_moe_shared_swiglu,
+    op_name="minimax_m3_moe_with_shared",
+    op_func=_minimax_m3_moe_with_shared,
     mutates_args=[],
-    fake_impl=_minimax_m3_routed_moe_shared_swiglu_fake,
+    fake_impl=_minimax_m3_moe_with_shared_fake,
     tags=(torch.Tag.needs_fixed_stride_order,),
 )
 

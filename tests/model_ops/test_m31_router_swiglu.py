@@ -22,7 +22,9 @@ if torch.cuda.get_device_properties(0).gcnArchName.split(":")[0] != "gfx950":
 pytest.importorskip("aiter")
 
 from atom.model_ops.minimax_m3.router.router_swiglu import (
+    gate_sort,
     m31_route_swiglu,
+    router_partials_swiglu,
     router_swiglu_supported,
 )
 from atom.model_ops.swiglu_oai import swiglu_oai_split_mxfp8
@@ -193,3 +195,21 @@ def test_graph_replay(gate):
     assert bool((out[2]["moe_buf"] == 0).all())
     rq, _ = swiglu_oai_split_mxfp8(gu, ALPHA, BETA, LIMIT)
     assert torch.equal(out[3][0].view(torch.uint8), rq.view(torch.uint8))
+
+
+@pytest.mark.parametrize("m", [8, 32])
+def test_caller_moe_buf_and_scaling(gate, m):
+    """A caller's MoE output is handed on untouched (GEMM2 adds onto it) and
+    the routed scaling multiplies the weights exactly."""
+    w, bias = gate
+    x, gu = _inputs(m)
+    assert router_partials_swiglu(x, w, gu, ALPHA, BETA, LIMIT) is not None
+    buf = torch.randn(m, K, device="cuda").to(torch.bfloat16)
+    before = buf.clone()
+    tw2, ti2, ps = gate_sort(m, bias, routed_scaling_factor=2.0, moe_buf=buf)
+    # the partials stay in the workspace until the next launch 1
+    tw1, ti1, _ = gate_sort(m, bias, routed_scaling_factor=1.0)
+    torch.cuda.synchronize()
+    assert ps["moe_buf"] is buf and ps["moe_buf_ptr"] == buf.data_ptr()
+    assert torch.equal(buf, before)
+    assert torch.equal(ti1, ti2) and torch.equal(tw2, tw1 * 2)
