@@ -5,8 +5,13 @@ launch: each token's window ring row (K1 writes its KV row there) and its window
 metadata (K2a's attention, ``attention._keys``): a target verify step's
 (``write_step_meta``; as a torch chain these were ~19 elementwise kernels a
 step), with the FP4 score stage's FULL-layer task plan a ratio, and a DSpark
-draft block's (``write_draft_step_meta``, with its rows' positions)."""
+draft block's (``write_draft_step_meta``, with its rows' positions).
 
+``write_selection_rows`` is the odd one out: it is written between K1 and K2
+rather than once a step, and only for an unfused width (``builds``), whose K2
+reads a selection it does not make."""
+
+import torch
 import triton
 import triton.language as tl
 
@@ -250,3 +255,40 @@ def write_draft_step_meta(
         WORDS=KMETA,
         BLOCK=triton.next_power_of_2(n),
     )
+
+
+def write_selection_rows(
+    out, selected, batch_ids, block_tables, rows_per_page, page_rows, main_off
+) -> None:
+    """An unfused width's selection as K2's attention reads it (``out`` [S, K]
+    int32: the pool rows of a selection's columns, valid ones packed first).
+
+    ``selected`` [S, K] int32: the scorer's compressed-key columns, -1 where
+    there is none (a REINDEX layer's already lifted back to the row it stands
+    for, which is what ``step.selected`` holds either way). A column's pool row
+    is its request's PAGE (``block_tables[batch, col // rows_per_page]``) times
+    ``page_rows``, plus the KV owner's ``main_off`` and ``col % rows_per_page``
+    -- ``index_score._selected_rows``' arithmetic, which a fused K2 does in
+    the launch, and ``indices._indices``' addressing. A pad row (batch id -1)
+    selects nothing.
+
+    The attention takes the valid count off the bound, not off this
+    (``index_plan.selected`` of ``sbound``), so the valid entries have to be
+    packed first in their order: the top-k's own rank, which ``cumsum`` gives.
+    """
+    k = selected.shape[1]
+    s = out.shape[0]
+    assert out.shape == (s, k), (out.shape, selected.shape)
+    sel = selected[:s].to(torch.int64)
+    live = batch_ids[:s] >= 0
+    valid = (sel >= 0) & live.unsqueeze(1)
+    cols = sel.clamp_min(0)
+    batch = batch_ids[:s].to(torch.int64).clamp_min(0).unsqueeze(1)
+    pages = block_tables[batch, cols // rows_per_page].to(torch.int64)
+    rows = pages * page_rows + main_off + cols % rows_per_page
+    # a valid entry's slot is how many valid entries precede it; the rest go to
+    # a scratch column the copy below drops
+    dest = torch.where(valid, valid.to(torch.int64).cumsum(1) - 1, k)
+    packed = torch.zeros(s, k + 1, dtype=torch.int64, device=sel.device)
+    packed.scatter_(1, dest, torch.where(valid, rows, 0))
+    out.copy_(packed[:, :k])
