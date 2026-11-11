@@ -676,6 +676,9 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
     `StateOffloadFace` and the shell's `has_state_tier`)."""
 
     _supports_early_block_release = False
+    # Whether the default `max_pending_saves` scales with the pipeline depth.
+    # Only this layout has been run with the scaled default under PP.
+    _pending_saves_scale_with_pp = True
 
     def __init__(self, config) -> None:
         super().__init__(config)
@@ -692,10 +695,11 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
         # (`should_defer_free`), so the queue depth is also how much of the pool
         # a slow backend can hold. Same knob and default the DSV4 layout bounds
         # its worker queue with, read from the other end.
+        pp_size = int(getattr(config, "pipeline_parallel_size", 1) or 1)
         self._max_pending_saves = max_pending_saves(
             getattr(config, "kv_transfer_config", None) or {},
             envs.OFFLOAD_COPY_WORKERS,
-            pp_size=int(getattr(config, "pipeline_parallel_size", 1) or 1),
+            pp_size=pp_size if self._pending_saves_scale_with_pp else 1,
         )
         self._save_inflight_since: dict[object, float] = {}
         self._save_stalled = False
