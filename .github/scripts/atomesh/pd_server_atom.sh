@@ -1481,6 +1481,8 @@ if [[ "${NODE_RANK}" -eq 0 && "${SINGLE_NODE_PD}" == "1" ]]; then
 elif [[ "${NODE_RANK}" -eq 0 && "${PREFILL_SINGLE_NODE_PD}" == "1" ]]; then
   prefill_pids=()
   for idx in $(seq 0 $((xP - 1))); do
+    # Same free-port race as the decode_single_node workers below.
+    ((idx > 0)) && sleep "${ATOMESH_DECODE_START_STAGGER_S:-0}"
     gpu_start=$((idx * PREFILL_TP_SIZE))
     gpu_end=$((gpu_start + PREFILL_TP_SIZE - 1))
     export HIP_VISIBLE_DEVICES="$(seq -s, "${gpu_start}" "${gpu_end}")"

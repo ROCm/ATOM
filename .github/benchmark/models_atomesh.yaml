@@ -16846,6 +16846,32 @@ models:
               <<: *m31_s65822_env
               ATOMESH_M31_D_MAX_SEQS: "24"
               ATOMESH_M31_P_CPU_OFFLOAD_BYTES: "1499000000000"
+        # 16 GPUs at C128: prefill on a whole node, so its host KV share is the node's at
+        # dram-utilization 0.9 (8 of 8 GPUs), as one TP8 P or as two TP4 P that split it.
+        - <<: *m31_moriio_1p2d_s65822_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-s65822-c128-dcap24-ptp8-cpu27
+          concurrency: [128]
+          prefill:
+            workers: 1
+            tp: 8
+          env:
+            common:
+              <<: *m31_s65822_env
+              ATOMESH_M31_D_MAX_SEQS: "24"
+              ATOMESH_M31_P_CPU_OFFLOAD_BYTES: "2699000000000"
+        - <<: *m31_moriio_1p2d_s65822_case
+          name: m31-flash-vllm-moriio-rdma-2p2d-s65822-c128-dcap24
+          topology: 2p2d
+          pd_worker_layout: prefill_single_node
+          concurrency: [128]
+          prefill:
+            workers: 2
+            tp: 4
+          env:
+            common:
+              <<: *m31_s65822_env
+              ATOMESH_M31_D_MAX_SEQS: "24"
+              ATOMESH_M31_P_CPU_OFFLOAD_BYTES: "1349000000000"
         # The local 1P1D layout (P GPUs 0-3, D GPUs 4-7 of one node) with xgmi swapped for RDMA.
         - &m31_moriio_1p1d_sn_case
           <<: *m31_moriio_1p2d_case

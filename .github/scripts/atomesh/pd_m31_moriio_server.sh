@@ -1,5 +1,5 @@
 # shellcheck shell=bash
-# MiniMax-M3.1-Flash vLLM 1P1D/1P2D over MoRIIOConnector (WRITE, or READ with
+# MiniMax-M3.1-Flash vLLM 1P1D/1P2D/2P2D over MoRIIOConnector (WRITE, or READ with
 # ATOMESH_M31_MORIIO_READ_MODE=true) RDMA, cross-node or within one node (single_node), sourced by
 # pd_server_vllm.sh when ATOMESH_M31_MORIIO=1. Server env/argv follow the local
 # test_scripts/pd/launch_pd_main.sh CONC --offload; only PYTHONPATH, hosts, MoRIIO ports, the rdma
@@ -29,7 +29,7 @@ read -r -a m31_extra_env <<< "${ATOMESH_M31_EXTRA_ENV:-}"
 M31_ENV+=("${m31_extra_env[@]}")
 M31_VLLM_ARGS=(
   vllm serve "${MODEL_PATH}"
-  --served-model-name "${SERVED_MODEL_NAME}" --host 0.0.0.0 --tensor-parallel-size 4
+  --served-model-name "${SERVED_MODEL_NAME}" --host 0.0.0.0
   --trust-remote-code --language-model-only --disable-uvicorn-access-log
   --moe-backend aiter --block-size 128 --disable-hybrid-kv-cache-manager --enable-prefix-caching
   --kv-cache-dtype nvfp4 --attention-config '{"indexer_kv_dtype":"nvfp4","indexer_decode_cp":true}'
@@ -107,10 +107,12 @@ start_vllm_server() {
   local -a cache_env=() role_env=() role_args=() pin=() p_extra_args=()
   build_server_cache_env "${role}" "${server_port}" cache_env
   if [[ "${role}" == prefill ]]; then
-    gpus=0,1,2,3
-    xfer="$(m31_moriio kv_producer "${server_port}" "${M31_HANDSHAKE_PORT}" "${M31_NOTIFY_PORT}")"
+    # prefill_single_node: worker idx serves PREFILL_PORT+idx on the GPUs pd_server_atom.sh exported;
+    # its handshake/notify bases sit 1000 apart, clear of the decode bases (+100 per D).
+    gpus="${HIP_VISIBLE_DEVICES}" idx=$((server_port - PREFILL_PORT))
+    xfer="$(m31_moriio kv_producer "${server_port}" $((M31_HANDSHAKE_PORT + 1000 * idx)) $((M31_NOTIFY_PORT + 1000 * idx)))"
     xfer="{\"kv_connector\":\"MultiConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"connectors\":[${xfer},{\"kv_connector\":\"SimpleCPUOffloadConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"cpu_bytes_to_use\":${ATOMESH_M31_P_CPU_OFFLOAD_BYTES},\"lazy_offload\":false}}]}}"
-    role_args=(--max-num-seqs $((2 * m31_conc)) --port "${server_port}" --gpu-memory-utilization 0.85
+    role_args=(--tensor-parallel-size "${PREFILL_TP_SIZE}" --max-num-seqs $((2 * m31_conc)) --port "${server_port}" --gpu-memory-utilization 0.85
       --max-num-batched-tokens 32768)
     [[ "${ATOMESH_M31_P_DBO:-1}" == 1 ]] &&
       role_args+=(--enable-dbo --dbo-prefill-token-threshold 16384 --dbo-decode-token-threshold 32768)
@@ -128,16 +130,18 @@ start_vllm_server() {
     # Every concurrency can land on one D under consistent_hash: FULL graphs for 1..max-num-seqs requests x 8
     # tokens. ATOMESH_M31_D_MAX_SEQS caps each D's decode batch (default CONC: no cap).
     local d_seqs="${ATOMESH_M31_D_MAX_SEQS:-${m31_conc}}"
-    role_args=(--max-num-seqs "${d_seqs}" --port "${server_port}" --gpu-memory-utilization 0.85
+    role_args=(--tensor-parallel-size "${DECODE_TP_SIZE}" --max-num-seqs "${d_seqs}" --port "${server_port}" --gpu-memory-utilization 0.85
       --max-num-batched-tokens 8192
       --compilation-config "{\"cudagraph_capture_sizes\":[$(seq -s, 8 8 $((8 * d_seqs)))],\"max_cudagraph_capture_size\":$((8 * d_seqs))}"
       --kv-transfer-config "${xfer}")
   fi
-  # GPUs 0-3 sit on NUMA node 0, GPUs 4-7 on node 1.
-  read -r -a pin <<< "taskset -c $(< "/sys/devices/system/node/node$(( ${gpus%%,*} / 4 ))/cpulist")"
-  if ! "${pin[@]}" true 2>/dev/null; then
-    echo "[m31] WARNING: cannot pin ${role} to the NUMA node of GPU ${gpus%%,*}; running unpinned" >&2
-    pin=()
+  # GPUs 0-3 sit on NUMA node 0, GPUs 4-7 on node 1; a server spanning both (TP8) runs unpinned.
+  if (( ${gpus%%,*} / 4 == ${gpus##*,} / 4 )); then
+    read -r -a pin <<< "taskset -c $(< "/sys/devices/system/node/node$(( ${gpus%%,*} / 4 ))/cpulist")"
+    if ! "${pin[@]}" true 2>/dev/null; then
+      echo "[m31] WARNING: cannot pin ${role} to the NUMA node of GPU ${gpus%%,*}; running unpinned" >&2
+      pin=()
+    fi
   fi
   local -a cmd=(env "${cache_env[@]}" "${M31_ENV[@]}" "${role_env[@]}" HIP_VISIBLE_DEVICES="${gpus}" "${pin[@]}"
     "${M31_VLLM_ARGS[@]}" "${role_args[@]}")
@@ -149,7 +153,9 @@ start_vllm_server() {
 
 m31_scrape() {  # OUT_DIR TAG: /metrics of every server
   local i
-  curl -sf "http://${prefill_ips[0]}:${prefill_ports[0]}/metrics" > "$1/$2_metrics_prefill.prom" || echo "WARNING: prefill /metrics scrape failed" >&2
+  for i in "${!prefill_ips[@]}"; do  # P0 keeps the single-P file name
+    curl -sf "http://${prefill_ips[i]}:${prefill_ports[i]}/metrics" > "$1/$2_metrics_prefill${i/#0/}.prom" || echo "WARNING: prefill${i} /metrics scrape failed" >&2
+  done
   for i in "${!decode_ips[@]}"; do
     curl -sf "http://${decode_ips[i]}:${decode_ports[i]}/metrics" > "$1/$2_metrics_decode${i}.prom" || echo "WARNING: decode${i} /metrics scrape failed" >&2
   done
@@ -160,7 +166,8 @@ run_aiperf_agentic_benchmark() {
   local venv="/tmp/atomesh-agentx-venv-${ATOMESH_M31_AGENTX_VERSION}"
   local out="${RUN_DIR}/benchmark_results/m31-pd-c${m31_conc}" rc aiperf_json i
   local safe_model="${MODEL_NAME//\//-}"
-  local -a metrics=("http://${prefill_ips[0]}:${prefill_ports[0]}/metrics")
+  local -a metrics=()
+  for i in "${!prefill_ips[@]}"; do metrics+=("http://${prefill_ips[i]}:${prefill_ports[i]}/metrics"); done
   for i in "${!decode_ips[@]}"; do metrics+=("http://${decode_ips[i]}:${decode_ports[i]}/metrics"); done
   if ! python3 -m venv "${venv}"; then
     rm -rf "${venv}"
