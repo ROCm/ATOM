@@ -361,11 +361,10 @@ def _payload_tensors(payload):
 @pytest.mark.parametrize("speculative", [False, True])
 @pytest.mark.parametrize("schema", [False, True])
 @pytest.mark.parametrize("enabled", [False, True])
-def test_static_constraint_preserves_raw_logprobs(
+def test_channel_constraint_preserves_raw_logprobs(
     monkeypatch, speculative, schema, enabled
 ):
     from atom.model_engine.token_logprobs import LogprobRows, host_logprob_rows
-    from atom.sampling_params import TokenConstraint
 
     md = (
         types.SimpleNamespace(
@@ -387,7 +386,17 @@ def test_static_constraint_preserves_raw_logprobs(
     )
     batch = _batch(2, [enabled, False])
     batch.top_logprobs = [3, 0]
-    batch.token_constraints = [(i, 1, TokenConstraint.force(0)) for i in range(2)]
+    batch.required_channel = object()
+
+    def force_channel(_runner, _batch, bonus, _metadata, target):
+        for logits in (bonus, target):
+            if logits is not None:
+                logits[:, 1:] = -float("inf")
+        return (None, None)
+
+    monkeypatch.setattr(
+        "atom.model_engine.token_constraints.apply_required_channel", force_channel
+    )
     if enabled:
         batch.logprob_rows = LogprobRows(
             *(
@@ -451,7 +460,7 @@ def test_static_constraint_preserves_raw_logprobs(
     )
     runner.postprocess(batch, raw.clone(), torch.ones(2), None, None, True, None)
     assert torch.all(seen["ids"] == 0)
-    assert not seen["failed"].any()
+    assert seen["failed"] is None or not seen["failed"].any()
     if not enabled:
         assert seen["payload"] is None
         return

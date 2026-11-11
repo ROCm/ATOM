@@ -499,53 +499,25 @@ def forward(self, logits, temperatures) -> sampled_tokens:
 
 ### Shared token constraints
 
-`TokenConstraints` in `atom/model_engine/token_constraints.py` is the sampling
-boundary for Kimi-K3 required channels, llguidance JSON Schema masks, and static
-token-ID rules. `SamplingParams.token_constraints` accepts a tuple of
-`TokenConstraint.allow(ids)`, `.deny(ids)`, or `.force(id)` rules. These are hard
-constraints: rules intersect; they do not add a probability bias. An optional
-`until=N` on allow/deny rules applies the rule until N output tokens have been
-generated. The unconstrained batch returns before allocating a constraint step
-or launching masking kernels.
+`TokenConstraints` in `atom/model_engine/token_constraints.py` is the shared
+pre-sampling boundary for K3 required channels and JSON Schema. Each backend
+computes its allowed tokens: K3 keeps its GPU state machine, while llguidance
+keeps its packed vocabulary masks. Both use the shared token-column masking
+primitive rather than separate logits-write implementations. Internal
+`TokenConstraint.allow(ids)`, `.deny(ids)` and `.force(id)` describe token sets;
+this refactor adds no request parameter or minimum-output-length feature.
 
-Chat and Completions accept `min_tokens` (default 0, no greater than
-`max_tokens`). Admission translates it into a deny rule for the deployment's
-EOS and stop-token IDs until that minimum is reached. Custom stop strings are
-ignored before the minimum; the output and context limits still apply. Native
-callers can also supply token-ID rules through `SamplingParams`; those lists
-are not new Chat/Responses request fields. Explicit token-ID lists are rejected
-on RapidServe before enqueue because its prefill handoff cannot carry a
-per-request constraint error; this does not disable the built-in `min_tokens`
-rule. For example:
+Masks intersect: a K3 forced token cannot restore a token forbidden by Schema.
+An empty intersection produces a request error through the existing output-copy
+pipeline; its error marker never becomes a next-forward token. Accepted tokens
+advance grammar and channel state after verification and broadcasts. Grammar
+input copies still overlap target forward, and channel state uses the existing
+GPU carry when deferred output means the host is one step behind.
 
-```python
-from atom.sampling_params import SamplingParams, TokenConstraint
-
-params = SamplingParams(
-    max_tokens=128,
-    min_tokens=32,
-    token_constraints=(TokenConstraint.deny([42, 43]),),
-)
-```
-
-Small deny lists upload only rule metadata and IDs; their kernel writes just
-the denied logits. Allow lists mask their complement. JSON Schema retains its
-packed vocabulary masks, and K3 retains its fused GPU state machine. All three
-run before sampling, including speculative verification and bonus rows. Each
-row's actual input-token position determines whether a timed rule is active,
-so rejected drafts and deferred host output do not advance the minimum early.
-Synthetic acceptance and relaxed MTP cannot guarantee hard rules and are
-rejected when a static rule or `min_tokens` is requested.
-
-If the intersection has no valid continuation, sampling uses a safe internal
-ID and returns a request error via the existing output-copy pipeline. The
-error marker never becomes a next-forward token. The D2H-ready event covers
-this output-only encoding as well as sampling. Grammar input copies still
-overlap target forward; this adds no host read of current GPU token IDs.
-
-Enabled constraints incur metadata preparation, H2D and masking. Combinations that can remove every candidate also run an
-empty-row check; a sparse deny on otherwise unmasked model logits skips it. This is distinct from the default path, which runs none of these
-kernels. A force operation cannot restore a token forbidden by a Schema mask.
+No constraints means no constraint-step allocation or new mask kernel. Schema
+plus channel additionally checks for an empty intersection. This is a mechanism
+refactor, not a claim that all masking is fused into one GPU launch or that
+constraint generation has no overhead.
 
 ### Required channel (`required_channel.py`)
 

@@ -3,17 +3,60 @@
 
 """Packed allowed-token sets, independent of the rule that produced them."""
 
+from dataclasses import dataclass
+from typing import Literal
+
 import torch
 
-from atom.sampling_params import TokenConstraint
 
-__all__ = [
-    "AllowedTokenMask",
-    "TokenConstraint",
-    "TokenRuleBuffer",
-    "apply_bitmask_reference",
-    "apply_token_rules_reference",
-]
+@dataclass(frozen=True)
+class TokenConstraint:
+    """A hard token-ID rule, not a probability preference.
+
+    Small static ID lists can compile once to an allowed-token bitmask. Dynamic
+    grammars fill that representation directly; GPU channel state machines apply
+    the same allow/deny semantics without transferring lists to the host.
+    """
+
+    mode: Literal["allow", "deny"]
+    token_ids: tuple[int, ...]
+
+    @classmethod
+    def allow(cls, token_ids):
+        return cls("allow", tuple(token_ids))
+
+    @classmethod
+    def deny(cls, token_ids):
+        return cls("deny", tuple(token_ids))
+
+    @classmethod
+    def force(cls, token_id):
+        return cls.allow((token_id,))
+
+    def to_bitmask(self, vocab_size):
+        """Compile on the CPU outside the per-token sampling hot path."""
+        if self.mode not in ("allow", "deny") or vocab_size <= 0:
+            raise ValueError("Invalid token constraint mode or vocabulary size")
+        if any(
+            type(token) is not int or not 0 <= token < vocab_size
+            for token in self.token_ids
+        ):
+            raise ValueError("Constraint token ID is outside the vocabulary")
+        if (self.mode == "allow" and not self.token_ids) or (
+            self.mode == "deny" and len(set(self.token_ids)) == vocab_size
+        ):
+            raise ValueError("Token constraint must leave at least one allowed token")
+        mask = torch.full(
+            (1, (vocab_size + 31) // 32),
+            -1 if self.mode == "deny" else 0,
+            dtype=torch.int32,
+        )
+        for token in self.token_ids:
+            value = int(mask[0, token // 32])
+            bit = 1 << (token % 32)
+            value = (value | bit if self.mode == "allow" else value & ~bit) & 0xFFFFFFFF
+            mask[0, token // 32] = value if value < 2**31 else value - 2**32
+        return mask
 
 
 class AllowedTokenMask:
@@ -85,84 +128,3 @@ def apply_bitmask_reference(logits, masks, rows):
     for i, row in enumerate(rows):
         allowed = ((masks[i, tokens // 32] >> (tokens % 32)) & 1).bool()
         logits[row].masked_fill_(~allowed, float("-inf"))
-
-
-class TokenRuleBuffer:
-    """Small reusable rule metadata; deny rules never upload a vocabulary mask."""
-
-    def __init__(self):
-        self.capacity = 0
-        self.copy_done = None
-        self.use_done = None
-
-    def prepare(self, rules, vocab_size, device):
-        data = []
-        ids = []
-        for row, prompt_len, rule in rules:
-            if any(token >= vocab_size for token in rule.token_ids):
-                raise ValueError("Constraint token ID is outside the vocabulary")
-            data.extend(
-                (
-                    row,
-                    -1 if rule.until is None else prompt_len + rule.until - 1,
-                    int(rule.mode == "allow"),
-                    len(ids),
-                    len(rule.token_ids),
-                )
-            )
-            ids.extend(rule.token_ids)
-        data.extend(ids)
-        if self.copy_done is not None and not self.copy_done.query():
-            self.copy_done.synchronize()
-        if len(data) > self.capacity:
-            if self.use_done is not None:
-                self.use_done.synchronize()
-            self.capacity = max(len(data), 2 * self.capacity)
-            self.host = torch.empty(self.capacity, dtype=torch.int64, pin_memory=True)
-            self.device = torch.empty_like(self.host, device=device)
-            self.copy_done = torch.cuda.Event()
-            self.use_done = torch.cuda.Event()
-        self.host.numpy()[: len(data)] = data
-        stream = torch.cuda.current_stream(device)
-        stream.wait_event(self.use_done)
-        self.device[: len(data)].copy_(self.host[: len(data)], non_blocking=True)
-        self.copy_done.record(stream)
-        return self.device, len(rules)
-
-    def apply(self, rules, logits, target, positions, cu_seqlens, metadata):
-        if logits.device.type != "cuda":
-            apply_token_rules_reference(
-                rules, logits, target, positions, cu_seqlens, metadata
-            )
-            return
-        from atom.model_ops.triton_token_constraints import apply_token_rules
-
-        packed, count = self.prepare(rules, logits.shape[-1], logits.device)
-        apply_token_rules(
-            logits, target, packed, count, positions, cu_seqlens, metadata
-        )
-        self.use_done.record(torch.cuda.current_stream(logits.device))
-
-
-def apply_token_rules_reference(rules, logits, target, positions, cu_seqlens, metadata):
-    """CPU oracle: every speculative row has its own generated-token position."""
-    for row, prompt_len, rule in rules:
-        cutoff = None if rule.until is None else prompt_len + rule.until - 1
-        if metadata is None:
-            rows = [(logits, row, int(cu_seqlens[row + 1]) - 1)]
-        else:
-            start = int(metadata.cu_num_draft_tokens[row - 1]) if row else 0
-            end = int(metadata.cu_num_draft_tokens[row])
-            rows = [
-                (target, j, int(metadata.target_logits_indices[j]))
-                for j in range(start, end)
-            ]
-            rows.append((logits, row, int(metadata.bonus_logits_indices[row])))
-        for tensor, index, pos in rows:
-            if cutoff is None or int(positions[pos]) < cutoff:
-                if rule.mode == "deny":
-                    tensor[index, list(rule.token_ids)] = -float("inf")
-                else:
-                    keep = torch.zeros(tensor.shape[-1], dtype=torch.bool)
-                    keep[list(rule.token_ids)] = True
-                    tensor[index].masked_fill_(~keep, -float("inf"))

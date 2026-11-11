@@ -16,7 +16,6 @@ from atom.model_ops.required_channel import (
     advance_states,
     constrain_logits,
 )
-from atom.model_ops.token_constraints import TokenRuleBuffer
 
 
 def prepare_token_constraints(runner, batch, metadata):
@@ -65,8 +64,7 @@ class TokenConstraints:
     @classmethod
     def apply(cls, runner, batch, logits, metadata):
         requests = getattr(batch, "structured_requests", None)
-        rules = getattr(batch, "token_constraints", None)
-        if not requests and batch.required_channel is None and not rules:
+        if not requests and batch.required_channel is None:
             return None
         step = cls()
         step.grammar = getattr(runner, "structured_output", None) if requests else None
@@ -90,28 +88,7 @@ class TokenConstraints:
         step.invalid = None
         step.target_invalid = None
         step.metadata = metadata
-        if rules:
-            buffer = getattr(runner, "token_rule_buffer", None)
-            if buffer is None:
-                runner.token_rule_buffer = buffer = TokenRuleBuffer()
-            buffer.apply(
-                rules,
-                step.logits,
-                step.target,
-                runner.forward_vars["positions"].gpu,
-                runner.forward_vars["cu_seqlens_q"].gpu,
-                metadata,
-            )
-        # A sparse deny on the unmasked model row leaves other finite logits,
-        # just like the standalone channel's EOS deny path. Only intersections,
-        # allow lists, or a vocabulary-sized deny can remove every candidate.
-        check_empty = rules and (
-            requests
-            or step.channel is not None
-            or any(rule.mode == "allow" for _, _, rule in rules)
-            or sum(len(rule.token_ids) for _, _, rule in rules) >= logits.shape[-1]
-        )
-        if check_empty or (requests and step.channel is not None):
+        if requests and step.channel is not None:
             # Conflicting hard rules must fail, never silently relax a rule or
             # let an all-infinite row produce NaNs. The safe ID stays GPU-only;
             # failure travels with the existing asynchronous output copy.

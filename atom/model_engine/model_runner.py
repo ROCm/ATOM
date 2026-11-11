@@ -3542,13 +3542,7 @@ class ModelRunner:
         structured_requests = getattr(batch, "structured_requests", None)
         if need_logprobs and (
             structured_requests
-            or (
-                spec_decode_metadata is None
-                and (
-                    batch.required_channel is not None
-                    or getattr(batch, "token_constraints", None)
-                )
-            )
+            or (spec_decode_metadata is None and (batch.required_channel is not None))
         ):
             logprob_snapshot = capture_token_logits(
                 logits, batch, spec_decode_metadata, rows=logprob_rows
@@ -3722,10 +3716,7 @@ class ModelRunner:
         # Read only the output already delivered by the existing D2H pipeline.
         # Keep safe sampled IDs for GPU carry; never feed the error sentinel back.
         delivered = prev_batch if self.tokenID_processor.is_deferred_out else batch
-        if delivered is not None and (
-            getattr(delivered, "token_constraints", None)
-            or getattr(delivered, "structured_requests", None)
-        ):
+        if delivered is not None and (getattr(delivered, "structured_requests", None)):
             for req_id, ids in tuple(token_id_dict.items()):
                 if -2 in ids:
                     if output_errors is None:

@@ -16,7 +16,7 @@ from atom.model_engine.prefix_hash import hash_block_size_for, ship_prompt_hash_
 from atom.model_engine.segment_tokenizer import PrefixEncoding, SegmentTokenizer
 from atom.model_engine.sequence import Sequence
 from atom.multimodal.registry import get_mrope_input_positions
-from atom.sampling_params import RequiredChannel, SamplingParams, TokenConstraint
+from atom.sampling_params import RequiredChannel, SamplingParams
 from atom.structured_output import is_structured
 from atom.structured_output.validation import (
     WorkerGrammarPreflight,
@@ -843,20 +843,6 @@ class InputOutputProcessor:
             kv_transfer=kv_transfer_params,
             multimodal=multimodal_data is not None,
         )
-        if sampling_params.token_constraints and getattr(
-            self.config, "enable_rapidserve", False
-        ):
-            # RapidServe's PrefillDone transports an ID, not a per-request error.
-            # Do not let conflicting user rules terminate its prefill worker.
-            raise ValueError("Explicit token-ID rules are not supported by RapidServe")
-        if sampling_params.min_tokens or sampling_params.token_constraints:
-            spec = getattr(self.config, "speculative_config", None)
-            if envs.ATOM_ENABLE_RELAXED_MTP or getattr(
-                spec, "synthetic_acceptance_rates", None
-            ):
-                raise ValueError(
-                    "Token constraints require exact speculative verification"
-                )
         if is_structured(sampling_params):
             if self.structured_admission is None:
                 raise ValueError("Structured output requires engine admission")
@@ -902,30 +888,6 @@ class InputOutputProcessor:
                 stop_tokens = self.tokenizer.encode(stop_str, add_special_tokens=False)
                 if stop_tokens:
                     stop_token_sequences.append(stop_tokens)
-
-        if sampling_params.min_tokens:
-            sampling_params = replace(
-                sampling_params,
-                token_constraints=tuple(sampling_params.token_constraints)
-                + (
-                    TokenConstraint.deny(
-                        self.config.end_token_ids, until=sampling_params.min_tokens
-                    ),
-                ),
-            )
-        if sampling_params.token_constraints:
-            vocab_size = len(self.tokenizer)
-            text_config = getattr(self.config.hf_config, "text_config", None)
-            model_vocab_size = getattr(
-                text_config or self.config.hf_config, "vocab_size", None
-            )
-            if model_vocab_size is not None:
-                # Added tokenizer tokens may not have a row in the output head.
-                # Reject them before enqueue, not in the worker's batch step.
-                vocab_size = min(vocab_size, model_vocab_size)
-            for rule in sampling_params.token_constraints:
-                if any(token >= vocab_size for token in rule.token_ids):
-                    raise ValueError("Constraint token ID is outside the vocabulary")
 
         if sampling_params.required_channel is not None:
             sampling_params = replace(

@@ -3,7 +3,6 @@
 
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
-from typing import Literal
 
 UNCONSTRAINED = -1
 """The channel state of a sequence whose request requires no channel."""
@@ -130,69 +129,6 @@ class RequiredChannel:
         return replace(self, end_ids=tuple(sorted(end_ids)))
 
 
-@dataclass(frozen=True)
-class TokenConstraint:
-    """A hard token-ID rule, not a probability preference.
-
-    Small static ID lists can compile once to an allowed-token bitmask. Dynamic
-    grammars fill that representation directly; GPU channel state machines apply
-    the same allow/deny semantics without transferring lists to the host.
-    """
-
-    mode: Literal["allow", "deny"]
-    token_ids: tuple[int, ...]
-    until: int | None = None  # generated tokens; None means the whole request
-
-    def validate(self):
-        if self.mode not in ("allow", "deny"):
-            raise ValueError("Token constraint must be allow or deny")
-        if any(type(i) is not int or i < 0 for i in self.token_ids):
-            raise ValueError("Token IDs must be nonnegative integers")
-        if self.until is not None and (type(self.until) is not int or self.until < 0):
-            raise ValueError("until must be a nonnegative generated-token count")
-        if self.mode == "allow" and not self.token_ids:
-            raise ValueError("An allow rule cannot be empty")
-
-    @classmethod
-    def allow(cls, token_ids, *, until=None):
-        return cls("allow", tuple(token_ids), until)
-
-    @classmethod
-    def deny(cls, token_ids, *, until=None):
-        return cls("deny", tuple(token_ids), until)
-
-    @classmethod
-    def force(cls, token_id):
-        return cls.allow((token_id,))
-
-    def to_bitmask(self, vocab_size):
-        """Compile on the CPU outside the per-token sampling hot path."""
-        if self.mode not in ("allow", "deny") or vocab_size <= 0:
-            raise ValueError("Invalid token constraint mode or vocabulary size")
-        if any(
-            type(token) is not int or not 0 <= token < vocab_size
-            for token in self.token_ids
-        ):
-            raise ValueError("Constraint token ID is outside the vocabulary")
-        if (self.mode == "allow" and not self.token_ids) or (
-            self.mode == "deny" and len(set(self.token_ids)) == vocab_size
-        ):
-            raise ValueError("Token constraint must leave at least one allowed token")
-        import torch
-
-        mask = torch.full(
-            (1, (vocab_size + 31) // 32),
-            -1 if self.mode == "deny" else 0,
-            dtype=torch.int32,
-        )
-        for token in self.token_ids:
-            value = int(mask[0, token // 32])
-            bit = 1 << (token % 32)
-            value = (value | bit if self.mode == "allow" else value & ~bit) & 0xFFFFFFFF
-            mask[0, token // 32] = value if value < 2**31 else value - 2**32
-        return mask
-
-
 @dataclass
 class SamplingParams:
     temperature: float = 1.0
@@ -218,26 +154,12 @@ class SamplingParams:
     structured_reasoning_end: str = ""
     # Frontend default may shrink after tokenization; explicit client caps may not.
     max_tokens_is_default: bool = False
-    min_tokens: int = 0
-    token_constraints: tuple[TokenConstraint, ...] = ()
 
     def __post_init__(self):
         if type(self.top_logprobs) is not int or not 0 <= self.top_logprobs <= 20:
             raise ValueError("top_logprobs must be an integer between 0 and 20")
         if self.top_logprobs and not self.logprobs:
             raise ValueError("top_logprobs requires logprobs")
-        if type(self.min_tokens) is not int or (
-            self.min_tokens < 0
-            or (self.min_tokens > 0 and self.min_tokens > self.max_tokens)
-        ):
-            raise ValueError("min_tokens must be an integer in [0, max_tokens]")
-        for rule in self.token_constraints:
-            if isinstance(rule, TokenConstraint):
-                rule.validate()
-        if any(
-            not isinstance(rule, TokenConstraint) for rule in self.token_constraints
-        ):
-            raise ValueError("token_constraints must contain TokenConstraint rules")
         # 0 also means disabled, as in vLLM/SGLang; MLPerf Endpoints workloads send it
         if self.top_k == 0:
             self.top_k = -1
