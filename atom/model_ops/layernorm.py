@@ -1080,6 +1080,156 @@ def fused_allreduce_gemma_rms_norm_quant(
 
 
 # ---------------------------------------------------------------------------
+# AR + Gemma RMSNorm + MXFP8 (E4M3, E8M0 scale per 32) in one launch
+# ---------------------------------------------------------------------------
+def _custom_ar_mxfp8(comm, hidden_states: torch.Tensor) -> bool:
+    """Whether the TP group's custom all-reduce runs the fused MXFP8 epilogue
+    on ``hidden_states``: an aiter with the per-group ``mx_scale`` mode, the
+    custom all-reduce's own limits, and an input the unquantized
+    ``fused_allreduce_rmsnorm`` would reduce with its 1-stage kernel (same
+    size rule and overrides). Only there is the fused epilogue's RMSNorm the
+    unquantized one bit for bit: past it the unquantized path switches to
+    ``fusedAllReduceRMSNorm2Stage`` / the split kernel, which sum the squares
+    in another order (1 ulp apart on a few elements), so larger inputs keep
+    AR + RMSNorm and the separate quant and the fused path stays an exact A/B."""
+    ca = getattr(comm, "ca_comm", None)
+    if ca is None or "mx_scale" not in _signature_params(
+        ca.custom_fused_ar_rms_per_group_quant
+    ):
+        return False
+    k = hidden_states.shape[-1]
+    total_bytes = hidden_states.numel() * hidden_states.element_size()
+    # The 1-stage choice of the unquantized fused_allreduce_rmsnorm.
+    limit = getattr(comm, "_ar_1stage_max_bytes", -1)
+    override = getattr(comm, "_ar_1stage_override", None)
+    one_stage = (
+        override
+        if override is not None
+        else total_bytes <= (limit if limit >= 0 else 128 * 7168 * 2 // comm.world_size)
+    )
+    return (
+        one_stage
+        and k % 32 == 0
+        and k <= 16384
+        and k // 8 <= 1024
+        and comm.world_size != 6
+        and not ca.disabled
+        and ca.should_fuse_ar_rms(hidden_states, k, k)
+    )
+
+
+@functools.cache
+def _signature_params_cached(fn) -> frozenset:
+    return frozenset(inspect.signature(fn).parameters)
+
+
+def _signature_params(bound_method) -> frozenset:
+    return _signature_params_cached(getattr(bound_method, "__func__", bound_method))
+
+
+def _fused_ar_gemma_rms_norm_mxfp8_fake(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    emit_bf16: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    from atom.model_ops.blockscale_kernels.quantization import FP8_DTYPE
+
+    lead, k = hidden_states.shape[:-1], hidden_states.shape[-1]
+    out = torch.empty(hidden_states.shape, dtype=FP8_DTYPE, device=hidden_states.device)
+    scale = torch.empty(
+        (*lead, k // 32), dtype=torch.float8_e8m0fnu, device=hidden_states.device
+    )
+    res_out = torch.empty_like(residual)
+    normed = (
+        torch.empty_like(residual)
+        if emit_bf16
+        else torch.empty(0, dtype=residual.dtype, device=residual.device)
+    )
+    return out, scale, res_out, normed
+
+
+@torch_compile_guard(gen_fake=_fused_ar_gemma_rms_norm_mxfp8_fake, mutates_args=[])
+def _fused_ar_gemma_rms_norm_mxfp8(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    emit_bf16: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    from aiter.dist.parallel_state import get_tp_group
+
+    from atom.model_ops.blockscale import quantize_fp8
+
+    comm = get_tp_group().device_communicator
+    if comm is not None and _custom_ar_mxfp8(comm, hidden_states):
+        result = comm.ca_comm.custom_fused_ar_rms_per_group_quant(
+            hidden_states,
+            residual,
+            weight,
+            eps,
+            32,
+            True,  # the 1-stage kernel, as the unquantized path takes here
+            emit_bf16=emit_bf16,
+            gemma_norm=True,
+            mx_scale=True,
+        )
+        if result is not None:
+            if emit_bf16:
+                out, res_out, scale, normed = result
+            else:
+                (out, res_out, scale), normed = result, None
+            if normed is None:
+                normed = torch.empty(0, dtype=residual.dtype, device=residual.device)
+            return out, scale, res_out, normed
+    # The separate path the fused one is byte-equal to.
+    normed, res_out = tensor_model_parallel_fused_allreduce_rmsnorm(
+        hidden_states, residual, weight, eps, gemma_norm=True
+    )
+    out, scale = quantize_fp8(normed)
+    if not emit_bf16:
+        normed = torch.empty(0, dtype=residual.dtype, device=residual.device)
+    return out, scale, res_out, normed
+
+
+def fused_allreduce_gemma_rms_norm_mxfp8(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    norm: GemmaRMSNorm,
+    emit_bf16: bool = False,
+) -> (
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+):
+    """MiniMax-M3 helper for AR + Gemma RMSNorm + MXFP8 quant.
+
+    Returns ``(values, scales, residual)`` -- E4M3 values and E8M0 group32
+    scales, the pair a native group32 A8 linear takes as ``(x, x_scale)`` --
+    plus the bf16 normed activation when ``emit_bf16`` (for consumers of the
+    same norm that read bf16, e.g. the MoE router and routed experts). The
+    bytes equal ``quantize_fp8`` of ``fused_allreduce_gemma_rms_norm``'s output.
+    Without TP or without aiter's fused MXFP8 epilogue it runs those two.
+    """
+    if get_tensor_model_parallel_world_size() > 1:
+        out, scale, res_out, normed = _fused_ar_gemma_rms_norm_mxfp8(
+            hidden_states.contiguous(),
+            residual,
+            norm.weight,
+            norm.variance_epsilon,
+            emit_bf16,
+        )
+    else:
+        from atom.model_ops.blockscale import quantize_fp8
+
+        normed, res_out = norm(hidden_states, residual)
+        out, scale = quantize_fp8(normed)
+    if emit_bf16:
+        return out, scale, res_out, normed
+    return out, scale, res_out
+
+
+# ---------------------------------------------------------------------------
 # Fused Q/K RMSNorm Triton kernel
 # ---------------------------------------------------------------------------
 import triton
