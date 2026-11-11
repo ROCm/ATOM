@@ -160,7 +160,7 @@ def _window_rows(
     if window:
         torch.sub(positions, window - 1, out=start16)
         start16.clamp_(min=0).div_(ASM_PAGE_SIZE, rounding_mode="floor")
-        # Pad rows repeat the last real anchor but read one page.
+        # Pad rows read one page.
         start16[real_rows:].zero_()
     else:
         start16.zero_()
