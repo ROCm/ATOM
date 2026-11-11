@@ -48,11 +48,15 @@ logger = logging.getLogger("atom")
 _DEEPSEEK_MTP_ARCHES: set[str] = {
     "DeepSeekMTPModel",
     "DeepseekV32MTPModel",
+    # GLM-5.3-Flash's draft subclasses ATOM's DeepSeekMTP and keeps its
+    # forward contract (spec_step_idx in, (sample, recycle) hidden out).
+    "Glm5NextMTPModel",
 }
 _MTP_MASK_INPUT_ARCH: set[str] = {
     "DeepSeekMTPModel",
     "DeepseekV32MTPModel",
     "Glm4MoeMTPModel",
+    "Glm5NextMTPModel",
 }
 _MTP_DRAFT_MODEL_ARCHES: set[str] = {
     "DeepSeekMTPModel",
@@ -61,6 +65,7 @@ _MTP_DRAFT_MODEL_ARCHES: set[str] = {
     "DeepseekV4MTPModel",
     "Qwen3NextMTP",
     "Glm4MoeMTPModel",
+    "Glm5NextMTPModel",
 }
 _EAGLE3_DRAFT_ARCH_TO_ATOM_ARCH: dict[str, str] = {
     # vLLM/HF draft arch name: ATOM server-mode draft class
@@ -170,6 +175,7 @@ _ATOM_MODEL_CLASSES: dict[str, str] = {
     "DeepseekV32MTPModel": "atom.models.deepseek_mtp:DeepSeekMTP",
     "DeepSeekV4MTPModel": "atom.plugin.vllm.models.deepseek_v4_mtp:DeepseekV4MTP",
     "Glm4MoeMTPModel": "atom.models.glm4_moe_mtp:Glm4MoeMTP",
+    "Glm5NextMTPModel": "atom.plugin.vllm.models.glm5_next:Glm5NextMTPVllm",
     "Qwen3NextForCausalLM": "atom.plugin.vllm.models.qwen3_next:Qwen3NextForCausalLM",
     "Qwen3NextMTP": "atom.models.qwen3_next_mtp:Qwen3NextMTP",
     "Qwen3_5MoeForConditionalGeneration": "atom.plugin.vllm.models.qwen3_5:Qwen3_5MoeForConditionalGeneration_",
@@ -177,6 +183,9 @@ _ATOM_MODEL_CLASSES: dict[str, str] = {
     "KimiK25ForConditionalGeneration": "atom.plugin.vllm.models.kimi_k25:KimiK25ForConditionalGeneration_",
     "KimiK3ForConditionalGeneration": (
         "atom.plugin.vllm.models.kimi_k3:KimiK3ForConditionalGeneration_"
+    ),
+    "Glm5NextForConditionalGeneration": (
+        "atom.plugin.vllm.models.glm5_next:Glm5NextForConditionalGeneration_"
     ),
     "MiniMaxM2ForCausalLM": "atom.models.minimax_m2:MiniMaxM2ForCausalLM",
     "DeepseekV4ForCausalLM": "atom.plugin.vllm.models.deepseek_v4:DeepseekV4ForCausalLM",
@@ -360,6 +369,45 @@ def _patch_required_act_dtype_post_load_hooks(
     return patched
 
 
+def _maybe_register_v41_state_checkpoints(vllm_config) -> None:
+    """Register V4.1's state-checkpoint layers when prefix caching runs with
+    `--mamba-cache-mode align` (`v41_state_checkpoints_requested`).
+
+    Off otherwise: the layers make the pool hybrid, which changes how vLLM
+    sizes and splits it. Prefix caching and LMCache offload need them on.
+    """
+    from atom.plugin.vllm.deepseek_v41_state_checkpoint import (
+        register_deepseek_v41_state_checkpoint_layers,
+        v41_state_checkpoints_requested,
+    )
+
+    if not v41_state_checkpoints_requested(vllm_config):
+        return
+    from atom.plugin.vllm.scheduler import v41_scheduler_patches_missing
+
+    missing = v41_scheduler_patches_missing()
+    if missing:
+        raise ValueError(
+            "DeepSeek-V4.1 state checkpoints (prefix caching) need "
+            f"ATOM's patch on vLLM's Scheduler.{', Scheduler.'.join(missing)}, "
+            "which this vLLM does not carry; unpatched, local hits are not capped "
+            "to a checkpoint and prefill chunks do not end on one"
+        )
+    scheduler_config = getattr(vllm_config, "scheduler_config", None)
+    if getattr(vllm_config, "speculative_config", None) is not None and getattr(
+        scheduler_config, "async_scheduling", False
+    ):
+        # Checkpoint keeps are placed from the CPU's computed count, which
+        # async speculative scheduling advances optimistically (as if every
+        # draft were accepted), so they would land on unwritten boundaries.
+        raise ValueError(
+            "DeepSeek-V4.1 prefix caching with speculative decoding needs "
+            "--no-async-scheduling"
+        )
+
+    register_deepseek_v41_state_checkpoint_layers(vllm_config)
+
+
 class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
     # forced_model_arch: str | None = None
 
@@ -371,6 +419,12 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         from atom.config import get_current_atom_config, use_custom_atom_config
 
         _set_framework_backbone("vllm")
+        # Before anything below can normalise `hf_config` for the model.
+        from atom.plugin.vllm.kv_transfer.offload_config import (
+            remember_page_geometry,
+        )
+
+        remember_page_geometry(vllm_config)
 
         self.cache_config = vllm_config.cache_config
         self.device_config = vllm_config.device_config
@@ -760,6 +814,10 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             # capture and the first forward.
             enforce_deepseek_v41_constraints(vllm_config)
             register_deepseek_v41_proxy_layer(vllm_config)
+            # After the proxy, before the builder: the checkpoint layers are
+            # what make the pool hybrid, and both the group split and the
+            # builder's sizing read them.
+            _maybe_register_v41_state_checkpoints(vllm_config)
             self._deepseek_v41_builder = make_deepseek_v41_metadata_builder(
                 self.atom_config,
                 vllm_config,
@@ -780,6 +838,9 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             if proxy is not None:
                 proxy._atom_v41_model = self.model
                 proxy._atom_v41_builder = self._deepseek_v41_builder
+                # The KV-transfer connector's handle on this wrapper at
+                # `register_kv_caches`, before any forward has run.
+                proxy.atom_v41_owner = self
 
     # Attributes whose writes on the outer model must propagate to the
     # inner model so vLLM's weight-sharing reaches the forward path.
