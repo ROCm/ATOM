@@ -24,8 +24,6 @@ pub(crate) fn prometheus_handle() -> Option<&'static PrometheusHandle> {
 }
 
 pub fn start_prometheus(config: PrometheusConfig) {
-    init_metrics();
-
     let duration_matcher = Matcher::Suffix(String::from("duration_seconds"));
     let duration_bucket: Vec<f64> = config
         .duration_buckets
@@ -59,6 +57,8 @@ pub fn start_prometheus(config: PrometheusConfig) {
     let _ = PROMETHEUS_HANDLE.set(recorder.handle());
     tokio::spawn(exporter);
     metrics::set_global_recorder(recorder).expect("failed to install Prometheus metrics recorder");
+    // Descriptions go to the global recorder, so HELP lines need it installed first.
+    init_metrics();
 }
 
 #[cfg(test)]
