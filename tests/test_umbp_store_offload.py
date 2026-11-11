@@ -637,6 +637,119 @@ def test_saving_chunks_the_server_already_holds_succeeds(server, make_worker):
     assert len(server.at()) == 2
 
 
+def _counting_source_safe(worker, gpu):
+    """Count every source-safe report of ``worker``, by chunk index."""
+    reported = []
+    report = worker._source_group_safe
+
+    def counting(identity):
+        [(start, _end)] = identity.ranges
+        reported.append(start // CHUNK)
+        report(identity)
+
+    worker._source_group_safe = counting
+    gpu.source_safe = counting
+    return reported
+
+
+def _puts(server):
+    return [call[1] for c in server.clients for call in c.calls if call[0] == "put"]
+
+
+def test_a_save_of_chunks_all_held_reads_and_puts_nothing(server, make_worker):
+    worker, gpu = make_worker(save_slots=8)
+    worker._do_save_req(_save_req(17, 40))
+    worker.get_finished()
+    puts_before, packs_before = len(_puts(server)), len(gpu.calls)
+    reported = _counting_source_safe(worker, gpu)
+    again = _save_req(18, 40, generation=1)
+    worker._do_save_req(again)
+    assert len(_puts(server)) == puts_before
+    assert len(gpu.calls) == packs_before
+    assert sorted(reported) == list(range(5))
+    operation = again.save_operation
+    assert worker.get_finished().connector_completions == {
+        _store(operation),
+        _quiescent(operation),
+        *(_safe(operation, index) for index in range(5)),
+    }
+    assert worker._save_counts == {"put_chunks": 5, "held_chunks": 5}
+
+
+def test_a_save_puts_only_the_chunks_the_server_lacks(server, make_worker):
+    worker, gpu = make_worker(save_slots=8)
+    request = _save_req(19, 48)
+    hashes = request.chunk_hashes
+    for index in (1, 3, 4):
+        server.at()[_key(hashes, index)] = b"held" * (CHUNK_BYTES // 4)
+    reported = _counting_source_safe(worker, gpu)
+    worker._do_save_req(request)
+    # Packed and put tail first, only the chunks missing, in runs.
+    assert gpu.calls == [("from", [40]), ("from", [16]), ("from", [0])]
+    assert _puts(server)[-3:] == [
+        [_key(hashes, 5)],
+        [_key(hashes, 2)],
+        [_key(hashes, 0)],
+    ]
+    for index in (0, 2, 5):
+        expected = gpu.pattern(2 * index) + gpu.pattern(2 * index + 1)
+        assert server.at()[_key(hashes, index)] == expected
+    for index in (1, 3, 4):
+        assert server.at()[_key(hashes, index)] == b"held" * (CHUNK_BYTES // 4)
+    assert sorted(reported) == list(range(6))
+    operation = request.save_operation
+    assert worker.get_finished().connector_completions == {
+        _store(operation),
+        _quiescent(operation),
+        *(_safe(operation, index) for index in range(6)),
+    }
+    assert worker._save_counts == {"put_chunks": 3, "held_chunks": 3}
+    assert worker._pool.quarantined("save") == 0
+
+
+def test_a_failed_lookup_puts_the_whole_save(server, make_worker, caplog):
+    worker, _ = make_worker(save_slots=8)
+    worker._do_save_req(_save_req(20, 40))
+    worker.get_finished()
+    server.raise_on = "exists"
+    again = _save_req(21, 40, generation=1)
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        worker._do_save_req(again)
+    server.raise_on = None
+    assert "lookup failed" in caplog.text
+    assert [len(keys) for keys in _puts(server)[-3:]] == [2, 2, 1]
+    assert _store(again.save_operation) in worker.get_finished().connector_completions
+    assert worker._save_counts == {"put_chunks": 10, "held_chunks": 0}
+
+
+def test_a_failed_put_after_held_chunks_reports_each_chunk_once(server, make_worker):
+    worker, gpu = make_worker(save_slots=8)
+    request = _save_req(22, 48)
+    hashes = request.chunk_hashes
+    for index in (4, 5):
+        server.at()[_key(hashes, index)] = b"held" * (CHUNK_BYTES // 4)
+    server.fail_puts.add(_key(hashes, 3))
+    reported = _counting_source_safe(worker, gpu)
+    worker._do_save_req(request)
+    # Chunks 4-5 held, 2-3 read and put (3 refused), 0-1 never read: each
+    # source-safe once, so every PP stage reports the same set.
+    assert sorted(reported) == list(range(6))
+    operation = request.save_operation
+    assert worker.get_finished().connector_completions == {
+        _store(operation, False),
+        _quiescent(operation),
+        *(_safe(operation, index) for index in range(6)),
+    }
+    assert worker._save_counts == {"put_chunks": 2, "held_chunks": 2}
+    assert worker._pool.quarantined("save") == 0
+
+
+def test_held_runs_split_a_window_highest_first():
+    runs = worker_mod._held_runs(range(4, 9), [True, False, False, True, True])
+    assert runs == [(range(7, 9), True), (range(5, 7), False), (range(4, 5), True)]
+    assert worker_mod._held_runs(range(2, 3), [False]) == [(range(2, 3), False)]
+
+
 def test_a_put_answered_false_fails_its_save_and_frees_its_slots(server, make_worker):
     worker, _ = make_worker(save_slots=8)
     request = _save_req(16, 40)

@@ -27,6 +27,9 @@ Completion protocol, per worker and operation:
   retry at once and every PP stage reports the same per-chunk set. An
   exception from the GPU copy claims neither: it propagates, and ``_guard``
   reports the failure without the quiescent claim.
+* A chunk the server already holds when a save reaches its window is neither
+  read nor put: it is source-safe at once and counts as stored, so a save
+  whose every chunk was held ends in a success like any other.
 * A load ends in exactly one of done or failed, all-or-nothing.
 * A slot returns to the pool once its call returned, whatever it answered:
   the server copied before answering. A slot whose call raised is quarantined
@@ -46,7 +49,7 @@ import threading
 import time
 import uuid
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from typing import Any
 
 import torch
@@ -130,6 +133,23 @@ def _head_first_windows(start: int, end: int, size: int) -> list[range]:
     return [range(low, min(end, low + size)) for low in range(start, end, size)]
 
 
+def _held_runs(window: range, held: list[bool]) -> list[tuple[range, bool]]:
+    """``window`` in maximal runs of chunks alike in ``held``, the highest first.
+
+    ``held[i]`` is chunk ``window[i]``'s.
+    """
+    runs: list[tuple[range, bool]] = []
+    high = window.stop
+    while high > window.start:
+        state = held[high - 1 - window.start]
+        low = high - 1
+        while low > window.start and held[low - 1 - window.start] == state:
+            low -= 1
+        runs.append((range(low, high), state))
+        high = low
+    return runs
+
+
 class UMBPStoreOffloadConnector(DenseOffloadConnector):
     """Dense or M3 PAGE offload worker backed by a UMBP standalone server."""
 
@@ -154,6 +174,8 @@ class UMBPStoreOffloadConnector(DenseOffloadConnector):
         self._next_stats_log_at = 0.0
         self._next_warning_at: dict[str, float] = {}
         self._suppressed_warnings: Counter = Counter()
+        # Chunks this worker's saves put, and found on the server already.
+        self._save_counts: Counter = Counter()
         # Why this worker loads nothing from the server any more, once it does
         # not: its own put (`_distrust_store`) or this process's mark of the
         # server (:mod:`.taint`).
@@ -467,6 +489,44 @@ class UMBPStoreOffloadConnector(DenseOffloadConnector):
             window.stop,
         )
 
+    def _save_segments(
+        self,
+        client: UMBPStoreClient,
+        req: LMCacheReqMeta,
+        windows: list[range],
+    ) -> Iterator[tuple[range, bool, list[str], float]]:
+        """``windows`` in runs of chunks the server holds or not, highest first.
+
+        Per run: its chunks, whether the server holds them, their keys and the
+        milliseconds the lookup took (charged to a window's first run). One
+        lookup per window, made when the save reaches it. Another request's
+        save often stored a prefix already -- the scheduler's lookup counts
+        only the prefix every rank holds, so a save starts below what this
+        rank has -- and putting it again would pack and send bytes the server
+        then drops. A lookup that fails holds nothing, so the window is put as
+        it would be without one: UMBP answers a failed RPC as every key absent
+        anyway.
+        """
+        for window in windows:
+            keys = self._window_keys(req, window)
+            t0 = time.perf_counter()
+            try:
+                held = client.exists(keys)
+            except Exception as exc:  # noqa: BLE001  # the window is put whole
+                self._warn_rate_limited(
+                    "save:exists_failed",
+                    "UMBP offload: a save's lookup failed (%r), req=%s; its "
+                    "chunks are put without one",
+                    exc,
+                    req.req_id,
+                )
+                held = [False] * len(window)
+            lookup_ms = (time.perf_counter() - t0) * 1000
+            for run, run_held in _held_runs(window, held):
+                offset = run.start - window.start
+                yield run, run_held, keys[offset : offset + len(run)], lookup_ms
+                lookup_ms = 0.0
+
     def _do_save_req(self, req: LMCacheReqMeta, *, producer_event=None) -> None:
         ss = req.save_spec
         assert ss is not None
@@ -482,15 +542,25 @@ class UMBPStoreOffloadConnector(DenseOffloadConnector):
         windows = _tail_first_windows(
             start, end, pool.window("save", self.save_workers)
         )
-        # The lowest chunk handed to the GPU so far; [start, read_from) is unread.
+        # The lowest chunk handed to the GPU or found held so far; [start,
+        # read_from) is unread.
         read_from = end
         failure = detail = None
         windows_run = stored_bytes = in_place_windows = 0
-        pack_ms = put_ms = 0.0
+        put_chunks = held_chunks = 0
+        pack_ms = put_ms = exists_ms = 0.0
         t_store0 = time.perf_counter()
-        for window in windows:
+        for segment, held, keys, lookup_ms in self._save_segments(client, req, windows):
+            exists_ms += lookup_ms
+            if held:
+                # Already on the server: neither read nor put, and source-safe
+                # at once, highest first like the rest.
+                self._chunks_source_safe(req.save_operation, reversed(segment))
+                read_from = segment.start
+                held_chunks += len(segment)
+                continue
             try:
-                slots = pool.acquire("save", len(window))
+                slots = pool.acquire("save", len(segment))
             except SlotPoolExhausted as exc:
                 failure, detail = "pool_exhausted", str(exc)
                 break
@@ -510,7 +580,7 @@ class UMBPStoreOffloadConnector(DenseOffloadConnector):
                 if run is not None:
                     self._copy_in_place(
                         run,
-                        window,
+                        segment,
                         req.block_ids,
                         pack=True,
                         producer_event=producer_event,
@@ -519,8 +589,8 @@ class UMBPStoreOffloadConnector(DenseOffloadConnector):
                     with gpu_connector.track_save_source(req.save_operation):
                         gpu_connector.batched_from_gpu(
                             slots,
-                            [index * chunk for index in window],
-                            [(index + 1) * chunk for index in window],
+                            [index * chunk for index in segment],
+                            [(index + 1) * chunk for index in segment],
                             block_ids=req.block_ids,
                             producer_event=producer_event,
                         )
@@ -529,13 +599,12 @@ class UMBPStoreOffloadConnector(DenseOffloadConnector):
                 raise
             pack_ms += (time.perf_counter() - t_pack0) * 1000
             # Both paths return after their final stream sync: no GPU work of
-            # this window still reads the source or writes the slots.
-            read_from = window.start
+            # this segment still reads the source or writes the slots.
+            read_from = segment.start
             if run is not None:
                 in_place_windows += 1
                 # Highest first, as the block GPU connector reports them.
-                self._chunks_source_safe(req.save_operation, reversed(window))
-            keys = self._window_keys(req, window)
+                self._chunks_source_safe(req.save_operation, reversed(segment))
             t_put0 = time.perf_counter()
             try:
                 stored = client.put(
@@ -554,6 +623,7 @@ class UMBPStoreOffloadConnector(DenseOffloadConnector):
                 failure, detail = "put_raised", repr(exc)
                 break
             put_ms += (time.perf_counter() - t_put0) * 1000
+            put_chunks += len(slots)
             # The server copied before it answered: the slots are idle.
             pool.release(slots)
             not_stored = stored.count(False)
@@ -565,6 +635,9 @@ class UMBPStoreOffloadConnector(DenseOffloadConnector):
                 )
                 break
             stored_bytes += self._chunk_bytes * len(slots)
+        with self._stats_lock:
+            self._save_counts["put_chunks"] += put_chunks
+            self._save_counts["held_chunks"] += held_chunks
         store_ms = (time.perf_counter() - t_store0) * 1000
         if failure is not None:
             self._warn_rate_limited(
@@ -578,17 +651,21 @@ class UMBPStoreOffloadConnector(DenseOffloadConnector):
         if self._profile_enabled():
             logger.info(
                 "[OFFLOAD-SAVE-PROF] rank=%s req=%s toks=%d skip=%d chunks=%d "
-                "windows=%d in_place_windows=%d total_bytes=%d producer_fenced=%d "
-                "pack_ms=%.2f put_ms=%.2f store_ms=%.2f total_ms=%.2f status=%s",
+                "held_chunks=%d put_chunks=%d windows=%d in_place_windows=%d "
+                "total_bytes=%d producer_fenced=%d exists_ms=%.2f pack_ms=%.2f "
+                "put_ms=%.2f store_ms=%.2f total_ms=%.2f status=%s",
                 self._rank,
                 req.req_id,
                 end * chunk,
                 start * chunk,
                 end - start,
+                held_chunks,
+                put_chunks,
                 windows_run,
                 in_place_windows,
                 stored_bytes,
                 int(producer_event is not None and windows_run > 0),
+                exists_ms,
                 pack_ms,
                 put_ms,
                 store_ms,
@@ -935,6 +1012,7 @@ class UMBPStoreOffloadConnector(DenseOffloadConnector):
             if now < self._next_stats_log_at:
                 return
             self._next_stats_log_at = now + _STATS_LOG_INTERVAL_S
+            save_counts = Counter(self._save_counts)
         stats = client.stats()
         counts = stats["counts"]
         failures = ",".join(
@@ -942,12 +1020,18 @@ class UMBPStoreOffloadConnector(DenseOffloadConnector):
         )
         logger.info(
             "[OFFLOAD-STORE-STATS] rank=%s puts=%d put_keys=%d put_bytes=%d "
+            "save_exists=%d save_put_chunks=%d save_held_chunks=%d "
+            "save_held_bytes=%d "
             "gets=%d get_keys=%d get_bytes=%d failures=%s "
             "quarantined_slots=save:%d,load:%d",
             self._rank,
             counts.get("put_calls", 0),
             counts.get("put_keys", 0),
             counts.get("put_bytes", 0),
+            counts.get("exists_calls", 0),
+            save_counts["put_chunks"],
+            save_counts["held_chunks"],
+            save_counts["held_chunks"] * self._chunk_bytes,
             counts.get("get_calls", 0),
             counts.get("get_keys", 0),
             counts.get("get_bytes", 0),
