@@ -31,6 +31,7 @@ def _context(monkeypatch, module, service):
 
 def _proposer(module, writes):
     p = module.DSparkProposer.__new__(module.DSparkProposer)
+    p.runner = SimpleNamespace()  # no `draft_kv_builder`: every row is written
     p.model = SimpleNamespace(
         write_context_kv=lambda hidden, positions: writes.append(hidden.shape),
         vocab_size=100,
