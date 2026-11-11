@@ -10,13 +10,16 @@ With weight 0 a chunk of k tokens from position 0 costs k * k / 2.
 """
 
 import math
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
+import torch
 from conftest import MockConfig
 
 from atom.model_engine import block_manager as bm_module
-from atom.model_engine.prefill_delayer import PrefillDecision
+from atom.model_engine.prefill_delayer import PrefillDecision, PrefillDelayer
 from atom.model_engine.scheduler import Scheduler
 
 
@@ -289,3 +292,132 @@ def test_costs_ride_the_delayer_reduce_on_a_stateless_gloo_group():
     plain = PrefillDelayer(dp_size=1, cpu_group=group, max_num_batched_tokens=64)
     plain.should_allow_prefill(prefillable=True, pending_tokens=8, prefill_cost=3.5e9)
     assert plain.rank_prefill_costs == []
+
+
+# 32 lockstep steps of a DeepSeek-V4-Pro DP 8 probe at slack 7 (jgong5/ATOM#2695):
+# in step k, rank r prefills a row of 1 + (3k + r) % 16 tokens, then one of these.
+_SLACK7_ROW2 = """
+2586 4844 6901 6081 6807 7005 1252 7890
+9719 6925 521 5203 5342 4727 7172 211
+7410 5540 2474 1023 2443 4245 5002 7918
+186 15090 2523 2183 1772 7981 1487 7000
+7095 4559 3270 3487 7541 3361 2838 4857
+338 3282 12685 1752 5201 7035 4033 5832
+5168 4298 7610 4071 3309 50 5941 6277
+7421 7244 4469 15108 1267 6085 2796 5323
+7462 5977 3587 1469 2820 2043 3442 7267
+6541 3030 7956 3173 14194 6721 1807 6783
+90 3961 5784 2881 293 84 7613 3946
+2783 7273 3569 2651 4945 16020 7588 6809
+1423 1229 3118 2562 3391 7352 3312 2159
+4424 4859 6614 7480 7328 8032 11755 4713
+4127 7544 36 4200 6081 7144 426 4108
+6739 7428 675 6150 5133 330 1810 14101
+374 191 5444 3146 8058 8106 7204 1888
+9782 3982 1510 677 1560 7260 4191 4640
+6278 2370 5499 3243 2810 7403 6229 5747
+7892 14037 660 3763 8162 4094 1900 7538
+2873 1337 2007 3950 3207 6866 3547 5510
+277 1346 11027 2778 7909 547 7973 7961
+5900 4564 4010 3294 50 7776 2301 2396
+4623 3646 351 12097 7189 7457 126 325
+1450 5256 757 3646 3324 1347 1272 194
+2107 1890 6539 757 15805 4290 2746 3258
+2690 7911 2090 1433 6896 566 2309 2273
+4600 7033 7138 4420 178 16301 680 5256
+1772 277 8002 3546 5835 4900 4592 1437
+7394 5552 7697 5362 2361 8164 15485 5585
+7860 7064 7235 7700 4921 1909 2309 6330
+6886 2675 1024 1511 5188 6005 907 12729
+"""
+
+
+class _LockstepRank:
+    """Rank `r` of a DP group whose CPU all_reduce(SUM) waits for every rank."""
+
+    def __init__(self, r, bufs, barrier):
+        self.r, self.bufs, self.barrier = r, bufs, barrier
+
+    def rank(self):
+        return self.r
+
+    def all_reduce(self, buf):
+        self.bufs[self.r] = buf.clone()
+        self.barrier.wait()
+        buf.copy_(sum(self.bufs))
+        self.barrier.wait()
+
+
+def _v4_pro_dp8(monkeypatch, slack, **config):
+    """A maker of DeepSeek-V4-Pro DP 8 rank schedulers: the default balancing
+    weight and floor, a 16384-token budget and a 256-token chunk grid. A
+    delayer's reduce goes to its group's all_reduce."""
+    monkeypatch.setenv("ATOM_DP_PREFILL_BALANCE_TOKEN_WEIGHT", "360000")
+    monkeypatch.setenv("ATOM_DP_PREFILL_BALANCE_SLACK", str(slack))
+    monkeypatch.setenv("ATOM_DP_PREFILL_BALANCE_MIN_TOKENS", "4096")
+    monkeypatch.setattr(
+        torch.distributed, "all_reduce", lambda buf, op, group: group.all_reduce(buf)
+    )
+    config = {
+        "max_num_seqs": 8,
+        "num_kvcache_blocks": 256,
+        "kv_cache_block_size": 256,
+        "max_model_len": 65536,
+        "max_num_batched_tokens": 16384,
+        "enable_dp_attention": True,
+        "parallel_config": SimpleNamespace(data_parallel_size=8),
+        **config,
+    }
+    return lambda: Scheduler(MockConfig(**config))
+
+
+def test_the_costliest_rank_runs_whole_when_its_cost_is_fractional(
+    monkeypatch, seq_factory
+):
+    """At slack 7 the target is the costliest rank's own cost. Eight schedulers
+    run each step's first tick through real delayers, one thread a rank: no row
+    is cut, the costliest rank's last row included, whose cost ends in .5 in
+    15 of the 32 steps."""
+    make = _v4_pro_dp8(monkeypatch, 7)
+    cut = {}
+    for k, line in enumerate(_SLACK7_ROW2.strip().splitlines()):
+        rows = [[1 + (3 * k + r) % 16, int(n)] for r, n in enumerate(line.split())]
+        bufs, barrier = [None] * 8, threading.Barrier(8, timeout=60)
+        scheds = [make() for _ in rows]
+        for r, sched in enumerate(scheds):
+            group = _LockstepRank(r, bufs, barrier)
+            sched.set_prefill_delayer(
+                PrefillDelayer(8, group, 16384, exchange_prefill_costs=True)
+            )
+            for n in rows[r]:
+                sched.add(seq_factory(list(range(100, 100 + n)), block_size=256))
+        with ThreadPoolExecutor(8) as pool:
+            batches = list(pool.map(lambda s: s.schedule()[0], scheds))
+        ran = [[int(t) for t in b.num_scheduled_tokens] for b in batches]
+        if ran != rows:
+            cut[k] = {r: (rows[r], ran[r]) for r in range(8) if ran[r] != rows[r]}
+    assert not cut
+
+
+@pytest.mark.parametrize("start, left", [(32768, 4313), (32768, 10821), (0, 5001)])
+def test_a_rank_prefilling_alone_takes_its_odd_final_chunk_whole(
+    monkeypatch, seq_factory, start, left
+):
+    """A rank prefilling alone sets the target to its own cost, which ends in
+    .5 for an odd chunk (jgong5/ATOM#2829). The `left` tokens after `start`
+    cached ones run in one forward, not cut to the grid with the rest a forward
+    later."""
+    sched = _v4_pro_dp8(monkeypatch, 0.1, enable_prefix_caching=True)()
+    group = _LockstepRank(0, [None], threading.Barrier(1))
+    sched.set_prefill_delayer(
+        PrefillDelayer(1, group, 16384, exchange_prefill_costs=True)
+    )
+    prefix = list(range(100, 100 + start))
+    if start:
+        bm, cached = sched.block_manager, seq_factory(prefix, block_size=256)
+        bm.allocate(cached, 0)
+        bm.hash_blocks(cached, start)
+        bm.deallocate(cached)
+    sched.add(seq_factory(prefix + list(range(50000, 50000 + left)), block_size=256))
+    batch, _ = sched.schedule()
+    assert [int(t) for t in batch.num_scheduled_tokens] == [left]
