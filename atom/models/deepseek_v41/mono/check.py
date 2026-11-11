@@ -330,7 +330,7 @@ def check_moe(runner, block):
     # sums, added in part order and rounded to bf16 as ``route`` does
     x = runner.ffn_normed.reshape(-1, runner.ffn_normed.shape[-1])
     # K2b's regions where either launch shape puts them (``layer_post.moe_base``)
-    layout = k2.scratch_layout(runner._post_key(x.shape[0]))
+    layout = k2.scratch_layout(runner.build.post_key)
     off, nbytes = layout["logit"]
     pairs = runner.scratch[off : off + nbytes].view(torch.float32).view(-1, 2)
     parts = pairs[:, 0].view(x.shape[0], -1, k2b.ROUTER_PARTS)

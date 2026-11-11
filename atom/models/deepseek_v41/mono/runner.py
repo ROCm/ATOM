@@ -16,7 +16,6 @@ kernels the original modules still run the compressor and Engram.
 
 import logging
 import struct
-from dataclasses import dataclass
 
 import torch
 from aiter.dist.parallel_state import (
@@ -35,6 +34,7 @@ from atom.model_ops.v4_kernels.paged_decode import LOG2E
 from atom.models.deepseek_v41.config import AttentionMode
 from atom.models.deepseek_v41.dspark import DeepseekV41DSpark
 from atom.models.deepseek_v41.mono import index_plan as ip
+from atom.models.deepseek_v41.mono.builds import RowsBuild
 from atom.models.deepseek_v41.mono.check import (
     check_front,
     check_moe,
@@ -104,18 +104,6 @@ def _rows(x, dim, s):
     if isinstance(x, dict):
         return {k: _rows(v, dim, s) for k, v in x.items()}
     return x.narrow(dim, 0, s)
-
-
-@dataclass(frozen=True)
-class RowsBuild:
-    """The kernels of an S-row step: K1's build a layer and their launchers,
-    and K2 (or, with ``check``, K2a and K2b apart)."""
-
-    keys: list
-    launchers: dict
-    layer_post: object = None
-    attn_post: object = None
-    moe: object = None
 
 
 # the layers whose attention norm has other readers (the compressor, the indexer)
@@ -351,9 +339,10 @@ class V41MonoDecodeRunner:
         )
 
     def _own_rows(self, s: int) -> tuple[int, int]:
-        """(first row, rows) of an s-row step this rank's indexer selects
-        (``index_score._own_rows``)."""
-        return own_rows(s, self.tp, self.rank) if self._tok_par(s) else (0, s)
+        """(first row, rows) of this step's rows this rank's indexer selects
+        (``index_score._own_rows``), off the build in hand rather than off
+        ``s``: a width's shape is the build's answer, not the row count's."""
+        return own_rows(s, self.tp, self.rank) if self.build.tok_par else (0, s)
 
     def _layer_keys(self, s: int) -> list:
         """K1's build of every layer for an s-row step."""
@@ -406,8 +395,11 @@ class V41MonoDecodeRunner:
                 launchers,
                 attn_post=k2a.build_attn_post(key_a),
                 moe=k2b.build_moe(key_b),
+                post_key=post_key,
             )
-        return RowsBuild(keys, launchers, layer_post=k2.build_layer_post(post_key))
+        return RowsBuild(
+            keys, launchers, layer_post=k2.build_layer_post(post_key), post_key=post_key
+        )
 
     @staticmethod
     def _row_kernels(build: RowsBuild) -> list:
@@ -603,7 +595,7 @@ class V41MonoDecodeRunner:
             pre, post, comb = self.gates_ffn
             state = SinglePassHCState(self.res_ffn, pre, self.ffn_out, post, comb)
         hidden = state.collapse()
-        if self._tok_par(rows):
+        if self.build.tok_par:
             hidden = self._gather_rows(hidden, rows)
         model.end_forward(hidden, None)
         self._raise_on_given_up_waits(rows)
@@ -755,7 +747,7 @@ class V41MonoDecodeRunner:
     def _moe(self, layer_id, weights) -> None:
         """K2b: router, routed and shared experts and their all-reduce ->
         ``ffn_out``."""
-        key_a, _ = self._post_key(self.ffn_normed.shape[1]).halves()
+        key_a, _ = self.build.post_key.halves()
         args = k2b.ABI.pack({
             "x": self.ffn_normed.data_ptr(), **self._moe_args(weights),
             **self._peer_args(), "layer": MOE_TAG0 + layer_id,
@@ -790,7 +782,7 @@ class V41MonoDecodeRunner:
             return
         regions = {
             *k1.scratch_layout(rows),
-            *k2.scratch_layout(self._post_key(rows)),
+            *k2.scratch_layout(self.build.post_key),
         }
         diag = self.scratch[self.diag_off : self.diag_off + DIAG_BYTES]
         waits = given_up_waits(diag, kernel_debug.region_names(regions))
