@@ -27,5 +27,8 @@ class QwenOffloadScheduler(KimiK3OffloadScheduler):
     """Scheduler side of :class:`QwenOffloadConnector`.
 
     Inherits ``StateOffloadFace`` through K3, so ``isinstance`` routing still
-    sends state stores and loads here.
+    sends state stores and loads here. Keeps the unscaled default
+    ``max_pending_saves`` under PP, where its state tier is off.
     """
+
+    _pending_saves_scale_with_pp = False
