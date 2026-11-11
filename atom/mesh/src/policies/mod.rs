@@ -9,6 +9,8 @@ use async_trait::async_trait;
 
 use crate::core::{HashRing, Worker};
 
+mod agentic;
+mod block_index;
 mod cache_aware;
 mod dp_sticky;
 mod factory;
@@ -19,6 +21,7 @@ mod registry;
 mod round_robin;
 pub mod tree;
 pub(crate) mod utils;
+pub use agentic::{AgenticConfig, AgenticPolicy};
 pub use cache_aware::CacheAwarePolicy;
 pub use dp_sticky::DpStickyPolicy;
 pub use factory::PolicyFactory;
@@ -145,6 +148,23 @@ pub struct SelectWorkerInfo<'a> {
     /// Pre-computed hash ring for O(log n) consistent hashing
     /// Built and cached by WorkerRegistry, passed through to avoid per-request rebuilds
     pub hash_ring: Option<Arc<HashRing>>,
+    /// Where a policy may report the prefill tokens its choice must compute.
+    pub prefill_estimate: Option<&'a PrefillEstimate>,
+}
+
+/// Prefill tokens a policy expects the selected worker to compute
+/// (the prompt minus its estimated cache hit). The first report wins.
+#[derive(Debug, Default)]
+pub struct PrefillEstimate(std::sync::OnceLock<usize>);
+
+impl PrefillEstimate {
+    pub fn set(&self, tokens: usize) {
+        let _ = self.0.set(tokens);
+    }
+
+    pub fn get(&self) -> Option<usize> {
+        self.0.get().copied()
+    }
 }
 
 #[cfg(test)]

@@ -257,12 +257,33 @@ Supported tool parsers: `json`, `python`, `xml`.
 | `cache_aware` | Prefix-tree matching for cache reuse, with configurable balance thresholds |
 | `power_of_two` | Chooses the lighter of two randomly sampled workers |
 | `prefix_hash` | Consistent prefix hashing |
+| `agentic` | Lowest prefill cost per worker (`url@rank`): queued prefill, uncached prompt tokens, in-flight requests and prefix hits |
 
 In PD mode, use `--prefill-policy` and `--decode-policy` for per-mode overrides.
 
 `prefix_hash` hashes the leading request tokens. When the router cannot make
 them (Messages/Responses, no registered tokenizer or chat template, input over
 `--prepare-max-tokenize-bytes`), it hashes the leading request text instead.
+
+`agentic` is meant for `--prefill-policy` on multi-turn agent traffic. Each
+candidate gets
+
+```text
+cost = alpha * (inflight_prefill_tokens + uncached_tokens)
+     + beta  * inflight_requests
+     - gamma * hit_blocks
+```
+
+and the lowest cost wins, ties at random. `inflight_prefill_tokens` is
+`mesh_worker_prefill_tokens` for that worker; `uncached_tokens` is the prompt
+minus the leading blocks the worker is estimated to hold. The estimate comes
+from a router-side index of earlier placements, cut into `--agentic-block-size`
+token blocks (default 16, the ATOM `--block-size` default; keep the two equal).
+A request without tokens is matched on its text, 4 bytes per token. Defaults:
+`--agentic-alpha 1`, `--agentic-beta 512` (ATOM's `ATOM_DP_LB_REQ_EQUIV`),
+`--agentic-gamma 0`, and `--agentic-max-indexed-blocks 2097152` (block, worker)
+entries, evicted least recently placed first. The index cannot see engine
+evictions, so it can overestimate hits on a worker whose cache has turned over.
 
 ## Reliability
 

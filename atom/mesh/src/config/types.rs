@@ -316,6 +316,39 @@ pub enum PolicyConfig {
         #[serde(default = "default_load_factor")]
         load_factor: f64,
     },
+
+    /// Lowest of alpha * (inflight prefill + uncached tokens) + beta * inflight
+    /// requests - gamma * hit blocks; see `policies::agentic`.
+    #[serde(rename = "agentic")]
+    Agentic {
+        /// Tokens per hit-index block; match the engine's KV block size.
+        #[serde(default = "default_agentic_block_size")]
+        block_size: usize,
+        #[serde(default = "default_agentic_alpha")]
+        alpha: f64,
+        #[serde(default = "default_agentic_beta")]
+        beta: f64,
+        #[serde(default)]
+        gamma: f64,
+        #[serde(default = "default_agentic_max_indexed_blocks")]
+        max_indexed_blocks: usize,
+    },
+}
+
+fn default_agentic_block_size() -> usize {
+    16
+}
+
+fn default_agentic_alpha() -> f64 {
+    1.0
+}
+
+fn default_agentic_beta() -> f64 {
+    512.0
+}
+
+fn default_agentic_max_indexed_blocks() -> usize {
+    1 << 21
 }
 
 fn default_prefix_token_count() -> usize {
@@ -335,6 +368,7 @@ impl PolicyConfig {
             PolicyConfig::CacheAware { .. } => "cache_aware",
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
             PolicyConfig::PrefixHash { .. } => "prefix_hash",
+            PolicyConfig::Agentic { .. } => "agentic",
         }
     }
 }

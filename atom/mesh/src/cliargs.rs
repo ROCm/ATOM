@@ -222,7 +222,7 @@ pub struct CliArgs {
     #[arg(
         long,
         default_value = "cache_aware",
-        value_parser = ["random", "round_robin", "dp_sticky", "cache_aware", "power_of_two", "prefix_hash"],
+        value_parser = ["random", "round_robin", "dp_sticky", "cache_aware", "power_of_two", "prefix_hash", "agentic"],
         help_heading = "Routing Policy"
     )]
     pub policy: String,
@@ -255,6 +255,26 @@ pub struct CliArgs {
     #[arg(long, default_value_t = 1.25, help_heading = "Routing Policy")]
     pub prefix_hash_load_factor: f64,
 
+    /// agentic: tokens per hit-index block; match the engine's KV block size
+    #[arg(long, default_value_t = 16, help_heading = "Routing Policy")]
+    pub agentic_block_size: usize,
+
+    /// agentic: cost weight of queued plus this request's uncached prefill tokens
+    #[arg(long, default_value_t = 1.0, help_heading = "Routing Policy")]
+    pub agentic_alpha: f64,
+
+    /// agentic: cost weight of in-flight requests, in tokens per request
+    #[arg(long, default_value_t = 512.0, help_heading = "Routing Policy")]
+    pub agentic_beta: f64,
+
+    /// agentic: extra cost credit per hit block, beyond the prefill it saves
+    #[arg(long, default_value_t = 0.0, help_heading = "Routing Policy")]
+    pub agentic_gamma: f64,
+
+    /// agentic: most (block, worker) entries the hit index keeps
+    #[arg(long, default_value_t = 2_097_152, help_heading = "Routing Policy")]
+    pub agentic_max_indexed_blocks: usize,
+
     /// Enable data parallelism aware scheduling
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     pub dp_aware: bool,
@@ -271,7 +291,7 @@ pub struct CliArgs {
     /// Specific policy for prefill nodes in PD mode
     #[arg(
         long,
-        value_parser = ["random", "round_robin", "dp_sticky", "cache_aware", "power_of_two", "prefix_hash"],
+        value_parser = ["random", "round_robin", "dp_sticky", "cache_aware", "power_of_two", "prefix_hash", "agentic"],
         help_heading = "PD Disaggregation"
     )]
     pub prefill_policy: Option<String>,
@@ -279,7 +299,7 @@ pub struct CliArgs {
     /// Specific policy for decode nodes in PD mode
     #[arg(
         long,
-        value_parser = ["random", "round_robin", "dp_sticky", "cache_aware", "power_of_two", "prefix_hash"],
+        value_parser = ["random", "round_robin", "dp_sticky", "cache_aware", "power_of_two", "prefix_hash", "agentic"],
         help_heading = "PD Disaggregation"
     )]
     pub decode_policy: Option<String>,
@@ -534,6 +554,13 @@ impl CliArgs {
             "prefix_hash" => PolicyConfig::PrefixHash {
                 prefix_token_count: self.prefix_token_count,
                 load_factor: self.prefix_hash_load_factor,
+            },
+            "agentic" => PolicyConfig::Agentic {
+                block_size: self.agentic_block_size,
+                alpha: self.agentic_alpha,
+                beta: self.agentic_beta,
+                gamma: self.agentic_gamma,
+                max_indexed_blocks: self.agentic_max_indexed_blocks,
             },
             _ => PolicyConfig::RoundRobin,
         }
@@ -806,6 +833,40 @@ mod tests {
     }
 
     #[test]
+    fn cli_configures_agentic_prefill_policy() {
+        let cli = Cli::try_parse_from([
+            "atomesh",
+            "launch",
+            "--pd-disaggregation",
+            "--prefill-policy",
+            "agentic",
+            "--agentic-block-size",
+            "64",
+            "--agentic-beta",
+            "256",
+            "--agentic-gamma",
+            "8",
+        ])
+        .unwrap();
+        let args = match cli.command {
+            Some(Commands::Launch { args }) => args,
+            None => cli.router_args,
+        };
+        let PolicyConfig::Agentic {
+            block_size,
+            alpha,
+            beta,
+            gamma,
+            max_indexed_blocks,
+        } = args.parse_policy(args.prefill_policy.as_deref().unwrap())
+        else {
+            panic!("agentic must parse to PolicyConfig::Agentic");
+        };
+        assert_eq!((block_size, max_indexed_blocks), (64, 2_097_152));
+        assert_eq!((alpha, beta, gamma), (1.0, 256.0, 8.0));
+    }
+
+    #[test]
     fn cli_accepts_dp_sticky_for_pd_specific_policies() {
         let cli = Cli::try_parse_from([
             "atomesh",
@@ -853,6 +914,11 @@ impl Default for CliArgs {
             max_tree_size: 67_108_864,
             prefix_token_count: 256,
             prefix_hash_load_factor: 1.25,
+            agentic_block_size: 16,
+            agentic_alpha: 1.0,
+            agentic_beta: 512.0,
+            agentic_gamma: 0.0,
+            agentic_max_indexed_blocks: 2_097_152,
             dp_aware: false,
             pd_disaggregation: false,
             decode: Vec::new(),

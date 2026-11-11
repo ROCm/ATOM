@@ -3,8 +3,9 @@
 use std::sync::Arc;
 
 use super::{
-    CacheAwareConfig, CacheAwarePolicy, DpStickyPolicy, LoadBalancingPolicy, PowerOfTwoPolicy,
-    PrefixHashConfig, PrefixHashPolicy, RandomPolicy, RoundRobinPolicy,
+    AgenticConfig, AgenticPolicy, CacheAwareConfig, CacheAwarePolicy, DpStickyPolicy,
+    LoadBalancingPolicy, PowerOfTwoPolicy, PrefixHashConfig, PrefixHashPolicy, RandomPolicy,
+    RoundRobinPolicy,
 };
 use crate::config::PolicyConfig;
 
@@ -45,6 +46,19 @@ impl PolicyFactory {
                 };
                 Arc::new(PrefixHashPolicy::new(config))
             }
+            PolicyConfig::Agentic {
+                block_size,
+                alpha,
+                beta,
+                gamma,
+                max_indexed_blocks,
+            } => Arc::new(AgenticPolicy::new(AgenticConfig {
+                block_size: *block_size,
+                alpha: *alpha,
+                beta: *beta,
+                gamma: *gamma,
+                max_indexed_blocks: *max_indexed_blocks,
+            })),
         }
     }
 
@@ -57,6 +71,7 @@ impl PolicyFactory {
             "power_of_two" | "poweroftwo" => Some(Arc::new(PowerOfTwoPolicy::new())),
             "cache_aware" | "cacheaware" => Some(Arc::new(CacheAwarePolicy::new())),
             "prefix_hash" | "prefixhash" => Some(Arc::new(PrefixHashPolicy::with_defaults())),
+            "agentic" => Some(Arc::new(AgenticPolicy::default())),
             _ => None,
         }
     }

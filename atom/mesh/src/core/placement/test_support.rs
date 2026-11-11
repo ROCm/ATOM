@@ -471,6 +471,7 @@ mod fixture_smoke_tests {
             tokens: Some(&[1, 2, 3]),
             headers: Some(&hm),
             hash_ring: None,
+            prefill_estimate: None,
         };
         let _ = policy.select_worker(&workers, &info).await;
         let calls = policy.calls();

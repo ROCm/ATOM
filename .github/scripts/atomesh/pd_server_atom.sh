@@ -2135,6 +2135,12 @@ start_router() {
   esac
 
   local router_policy="${ROUTER_POLICY}"
+  local prefill_agentic=false
+  if [[ "${router_policy}" == "agentic" ]]; then
+    # agentic places prefill only; decode keeps the policy chosen below.
+    prefill_agentic=true
+    router_policy=random
+  fi
   local -a router_rank_mapping_args=()
   if [[ "${ATOM_PD_RANK_MAPPING_POLICY}" != "none" ]] \
     && has_cli_flag "${PREFILL_EXTRA_SERVER_ARGS}" "--enable-dp-attention" \
@@ -2170,6 +2176,20 @@ start_router() {
       --eviction-interval 300
     )
     router_rank_mapping_args=(--atom-pd-rank-mapping-policy "${ATOM_PD_RANK_MAPPING_POLICY}")
+  fi
+  if [[ "${prefill_agentic}" == true ]]; then
+    # Tokens come from the router's tokenizer; the hit index uses the engine's block size.
+    local block_size=16
+    if [[ " ${PREFILL_EXTRA_SERVER_ARGS} " =~ \ --block-size[=\ ]([0-9]+)\  ]]; then
+      block_size="${BASH_REMATCH[1]}"
+    fi
+    router_prefill_policy_args=(
+      --prefill-policy agentic
+      --agentic-block-size "${block_size}"
+      --model-path "${MODEL_PATH}"
+      --tokenizer-cache-enable-l1
+      --tokenizer-cache-l1-max-memory 1073741824
+    )
   fi
   local -a router_cmd=(
     "${mesh_binary}" launch

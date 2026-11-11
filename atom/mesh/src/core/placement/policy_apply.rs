@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use super::types::{PlacementError, RequestDescriptor};
 use crate::core::{HashRing, Worker};
-use crate::policies::{LoadBalancingPolicy, SelectWorkerInfo};
+use crate::policies::{LoadBalancingPolicy, PrefillEstimate, SelectWorkerInfo};
 
 /// A worker chosen by a policy and the prompt tokens it must prefill.
 #[derive(Debug)]
@@ -20,11 +20,13 @@ pub async fn apply_policy(
     if candidates.is_empty() {
         return Err(PlacementError::NoAvailableWorkers);
     }
+    let estimate = PrefillEstimate::default();
     let info = SelectWorkerInfo {
         request_text: descriptor.text,
         tokens: descriptor.tokens,
         headers: descriptor.headers,
         hash_ring,
+        prefill_estimate: Some(&estimate),
     };
     let idx = policy
         .select_worker(candidates, &info)
@@ -32,6 +34,8 @@ pub async fn apply_policy(
         .ok_or(PlacementError::PolicyReturnedNone)?;
     Ok(Selection {
         worker: candidates[idx].clone(),
-        prefill_tokens: descriptor.tokens.map_or(0, <[u32]>::len),
+        prefill_tokens: estimate
+            .get()
+            .unwrap_or_else(|| descriptor.tokens.map_or(0, <[u32]>::len)),
     })
 }

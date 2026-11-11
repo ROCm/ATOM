@@ -156,6 +156,35 @@ impl ConfigValidator {
                     });
                 }
             }
+            PolicyConfig::Agentic {
+                block_size,
+                alpha,
+                beta,
+                gamma,
+                max_indexed_blocks,
+            } => {
+                for (field, value) in [
+                    ("block_size", block_size),
+                    ("max_indexed_blocks", max_indexed_blocks),
+                ] {
+                    if *value == 0 {
+                        return Err(ConfigError::InvalidValue {
+                            field: format!("agentic_{field}"),
+                            value: value.to_string(),
+                            reason: "Must be > 0".to_string(),
+                        });
+                    }
+                }
+                for (field, value) in [("alpha", alpha), ("beta", beta), ("gamma", gamma)] {
+                    if !value.is_finite() || *value < 0.0 {
+                        return Err(ConfigError::InvalidValue {
+                            field: format!("agentic_{field}"),
+                            value: value.to_string(),
+                            reason: "Must be a finite value >= 0".to_string(),
+                        });
+                    }
+                }
+            }
         }
         Ok(())
     }
