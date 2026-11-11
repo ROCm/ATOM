@@ -27,10 +27,38 @@ logger = logging.getLogger("atom.aiter_provider")
 # fail-open warning: aiter and ATOM move independently.
 _SUPPORTED_PLUGIN_API = 1
 
-# Routed ops mode ATOM expects to find when it enables providers. A missing one
-# is only a warning (the installed aiter may be older than the ATOM branch);
-# such an "enabled" run would silently serve native for that op otherwise.
-_EXPECTED_ROUTED_OPS = ("sp_qkv_fused",)
+# The routed ops ATOM calls for each provider it knows, so configure() resolves
+# and checks exactly the ops of the providers it enables. A missing one is only
+# a warning (the installed aiter may be older than the ATOM branch); such an
+# "enabled" run would silently serve native for that op otherwise.
+_PROVIDER_ROUTED_OPS = {
+    "sp-qkv-provider": ("sp_qkv_fused",),
+    "flydsl-sparse-mla-provider": ("mla_sparse_prefill_v41",),
+}
+
+
+def _expected_routed_ops(enable) -> tuple[str, ...]:
+    ops: list[str] = []
+    for name in enable:
+        for op in _PROVIDER_ROUTED_OPS.get(name, ()):
+            if op not in ops:
+                ops.append(op)
+    return tuple(ops)
+
+
+def _serves_op(provider, op: str) -> bool:
+    """False only when the provider declares its ops and ``op`` is not one.
+
+    ``warmup``/``prepare`` take one op's call as their payload; handing it to a
+    provider of another op would bind it against the wrong contract.
+    """
+    ops = getattr(provider, "op_versions", None)
+    if ops is None:
+        return True
+    try:
+        return op in ops
+    except TypeError:
+        return True
 
 
 def atom_version() -> str:
@@ -135,7 +163,8 @@ def configure_aiter_providers(config) -> bool:
     # when `aiter.<op>` is resolved, so status()["routed_ops"] is empty until
     # then. Resolve the ops ATOM expects before reading status, so the preflight
     # log/asserts see the truth and the first explain() cannot KeyError.
-    for name in _EXPECTED_ROUTED_OPS:
+    expected = _expected_routed_ops(enable)
+    for name in expected:
         try:
             getattr(aiter, name)
         except Exception:  # noqa: BLE001 - absent/optional export; status() decides
@@ -153,7 +182,7 @@ def configure_aiter_providers(config) -> bool:
         return False
 
     routed = getattr(status, "get", lambda *_: None)("routed_ops") or {}
-    missing = [op for op in _EXPECTED_ROUTED_OPS if op not in routed]
+    missing = [op for op in expected if op not in routed]
     if missing:
         logger.warning(
             "aiter is missing routed ops %s; those ops stay native on this build",
@@ -211,13 +240,16 @@ def _load_provider(name: str):
     return provider
 
 
-def warmup_aiter_providers(config, payload, *, group=None, device=None) -> bool:
+def warmup_aiter_providers(
+    config, payload, *, op="sp_qkv_fused", group=None, device=None
+) -> bool:
     """Run the enabled providers' framework-owned ``warmup()`` before capture.
 
     The aiter plugin interface deliberately has no lifecycle hook; a provider
-    declines every routed call until the framework warms it.  Fail-open: a
-    missing/broken provider (or a CPU process) leaves the non-fused path in
-    place, and returns False.
+    declines every routed call until the framework warms it.  ``payload`` is
+    one call of ``op``; only the enabled providers that serve ``op`` are asked.
+    Fail-open: a missing/broken provider (or a CPU process) leaves the
+    non-fused path in place, and returns False.
     """
     enabled = _enabled_providers(config)
     if not enabled:
@@ -225,6 +257,8 @@ def warmup_aiter_providers(config, payload, *, group=None, device=None) -> bool:
     warmed = False
     for name in enabled:
         provider = _load_provider(name)
+        if provider is not None and not _serves_op(provider, op):
+            continue
         warm = getattr(provider, "warmup", None)
         if not callable(warm):
             logger.warning(
@@ -241,13 +275,17 @@ def warmup_aiter_providers(config, payload, *, group=None, device=None) -> bool:
     return warmed
 
 
-def prepare_aiter_providers(config, payload, *, group=None, device=None) -> bool:
+def prepare_aiter_providers(
+    config, payload, *, op="sp_qkv_fused", group=None, device=None
+) -> bool:
     """Pre-bind the enabled providers for a capture M class (prepare-only API).
 
     The interface has no capture hook; a compatible provider exposes
     ``prepare(payload, *, group=None, device=None) -> bool`` (no launch,
-    cache-hit safe). Fail-open: a missing API or False leaves ATOM's capture
-    path non-fused for that cell. Returns True when a provider prepared.
+    cache-hit safe). ``payload`` is one call of ``op``; only the enabled
+    providers that serve ``op`` are asked. Fail-open: a missing API or False
+    leaves ATOM's capture path non-fused for that cell. Returns True when a
+    provider prepared.
     """
     enabled = _enabled_providers(config)
     if not enabled:
@@ -256,6 +294,8 @@ def prepare_aiter_providers(config, payload, *, group=None, device=None) -> bool
     prepared = False
     for name in enabled:
         provider = _load_provider(name)
+        if provider is not None and not _serves_op(provider, op):
+            continue
         prepare = getattr(provider, "prepare", None)
         if not callable(prepare):
             logger.warning(

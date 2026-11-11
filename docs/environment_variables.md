@@ -157,6 +157,20 @@ non-fused path (`qkv_proj` + `ulysses_attention` + head gather) wherever the
 provider declines (for example the Phase-2 large/16K band). No provider enabled
 means no fused path and no AITER provider imports.
 
+For DeepSeek-V4.1 with `--kv-cache-dtype fp8`, enabling
+`flydsl-sparse-mla-provider` (FlyDSL sparse MLA for gfx950) lets the provider
+serve AITER's routed `mla_sparse_prefill_v41`, which `sparse_attn_v41_paged_2src`
+calls for both prefill and decode; ATOM's call is unchanged. It needs an AITER
+that routes the op (ROCm/aiter#7783) and the provider installed. A call the
+provider declines — another GPU, a head count per rank other than 1–16 or 32, a
+shape outside its coverage — runs AITER's OPUS kernel. FlyDSL compiles each
+kernel variant on its first call and caches it under `~/.flydsl/cache`. Under a
+whole-forward CUDA graph the provider serves only shapes that already ran
+outside capture; a cold shape captures OPUS for that graph's lifetime without
+an error, so check `aiter.plugin.decision_counts()`. The BF16 and packed V4.1
+caches call ATOM's own V4 kernels, which have no AITER contract, so this
+provider does not reach them.
+
 ## Kernel / backend selection
 
 | Variable | Type | Default | Description |
