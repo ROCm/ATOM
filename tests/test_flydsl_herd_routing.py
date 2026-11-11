@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: MIT
 
+import inspect
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -12,15 +14,17 @@ try:
 except ImportError as exc:
     skip_if_dependency_missing(exc, "requires full atom import env")
 
-# scoring, grouped top-k (groups, selected groups), top_k, the layer's routed
-# scale and the scale HERD must apply: the one the layer's own routing folds in.
-PROFILES = {
-    "deepseek_v4": ("sqrtsoftplus", False, None, None, 6, 1.5, 1.5),
-    # The softmax top-k never applies the routed scale.
-    "gpt_oss": ("softmax", False, None, None, 4, 2.0, 1.0),
-    "kimi_k3": ("sigmoid", True, 1, 1, 16, 2.5, 2.5),
-    # Applied outside the MoE when the shared experts are not fused.
-    "minimax_m3": ("sigmoid", False, None, None, 4, 2.0, 1.0),
+# scoring, grouped top-k (groups, selected groups), top_k and the layer's
+# routed scale, which both routings fold in and HERD therefore applies.
+HERD_PROFILES = {
+    "deepseek_v4": ("sqrtsoftplus", False, None, None, 6, 1.5),
+    "kimi_k3": ("sigmoid", True, 1, 1, 16, 2.5),
+}
+# Routings HERD declines.
+OTHER_PROFILES = {
+    "gpt_oss": ("softmax", False, None, None, 4, 1.0),
+    "minimax_m3": ("sigmoid", False, None, None, 4, 2.0),
+    "sqrtsoftplus_grouped": ("sqrtsoftplus", True, 1, 1, 6, 1.5),
 }
 
 
@@ -59,14 +63,15 @@ def decode_step(monkeypatch):
     )
 
 
-@pytest.mark.parametrize("profile", list(PROFILES))
+@pytest.mark.parametrize("profile", list(HERD_PROFILES))
 def test_herd_candidates_take_the_layers_own_routing(monkeypatch, decode_step, profile):
-    scoring_func, grouped, groups, topk_group, top_k, scale, _ = PROFILES[profile]
-    layer = _layer(scoring_func, grouped, groups, topk_group, top_k, scale)
+    layer = _layer(*HERD_PROFILES[profile])
+    signature = inspect.signature(moe_mod.FusedMoE.select_experts)
     calls = []
 
     def fake_select_experts(**kwargs):
-        calls.append(kwargs)
+        # A keyword FusedMoE.select_experts no longer takes fails here.
+        calls.append(signature.bind(**kwargs).arguments)
         return "weights", "ids"
 
     monkeypatch.setattr(
@@ -79,19 +84,16 @@ def test_herd_candidates_take_the_layers_own_routing(monkeypatch, decode_step, p
     )
     kwargs = calls.pop()
     # One extra candidate, raw scores: fused_moe drops, renormalises and scales.
-    assert kwargs["top_k"] == top_k + 1
+    assert kwargs["top_k"] == layer.top_k + 1
     assert kwargs["renormalize"] is False
     assert kwargs.get("routed_scaling_factor", 1.0) == 1.0
     assert kwargs.get("custom_routing_function") is None
     assert kwargs.get("num_fused_shared_experts", 0) == 0
-    # Pure TP routes pad rows like real ones, as _select_logical does, so the
-    # candidates carry no -1 rows for the count fused_moe is not given.
-    assert kwargs["mask_pad_rows"] is False
-    assert kwargs["scoring_func"] == scoring_func
+    assert kwargs["scoring_func"] == layer.scoring_func
     assert kwargs["e_score_correction_bias"] == "bias"
-    assert kwargs["use_grouped_topk"] is grouped
-    assert kwargs["num_expert_group"] == groups
-    assert kwargs["topk_group"] == topk_group
+    assert kwargs["use_grouped_topk"] is layer.use_grouped_topk
+    assert kwargs["num_expert_group"] == layer.num_expert_group
+    assert kwargs["topk_group"] == layer.topk_group
 
 
 @pytest.mark.parametrize("groups,topk_group", [(8, 4), (8, 1), (1, 1)])
@@ -103,11 +105,54 @@ def test_herd_takes_grouped_topk_with_one_group_only(decode_step, groups, topk_g
     )
 
 
-@pytest.mark.parametrize("profile", list(PROFILES))
-def test_herd_applies_the_routed_scale_the_layer_folds_in(monkeypatch, profile):
-    scoring_func, grouped, groups, topk_group, top_k, scale, herd_scale = PROFILES[
-        profile
-    ]
+@pytest.mark.parametrize(
+    "profile,herd",
+    [(p, True) for p in HERD_PROFILES] + [(p, False) for p in OTHER_PROFILES],
+)
+def test_herd_serves_deepseek_v4_and_kimi_k3_only(decode_step, profile, herd):
+    layer = _layer(*{**HERD_PROFILES, **OTHER_PROFILES}[profile])
+
+    assert _herd_method()._flydsl_herd_step(layer, torch.empty(64, 8)) is herd
+
+
+@pytest.mark.parametrize(
+    "dp_size,dp_attention,dp_logical_ratio,pcp_merge,own_rows",
+    [
+        (1, False, 1, False, True),
+        # DP without DP attention runs each rank's own rows.
+        (2, False, 1, False, True),
+        (2, True, 1, False, False),
+        (1, True, 2, False, False),
+        (1, False, 1, True, False),
+    ],
+)
+def test_herd_declines_gathered_rows(
+    monkeypatch, dp_size, dp_attention, dp_logical_ratio, pcp_merge, own_rows
+):
+    monkeypatch.setattr(
+        moe_mod,
+        "get_current_atom_config",
+        lambda: SimpleNamespace(enable_dp_attention=dp_attention),
+    )
+    parallel_config = SimpleNamespace(
+        dp_size=dp_size, dp_logical_ratio=dp_logical_ratio, pcp_merge=pcp_merge
+    )
+
+    assert moe_mod._herd_sees_own_rows(parallel_config) is own_rows
+
+
+def test_herd_stays_off_without_aiters_herd_route(monkeypatch):
+    moe_mod._aiter_serves_flydsl_herd.cache_clear()
+    # A None entry makes the import raise ImportError.
+    monkeypatch.setitem(sys.modules, "aiter.ops.flydsl.herd_topk", None)
+    try:
+        assert moe_mod._aiter_serves_flydsl_herd() is False
+    finally:
+        moe_mod._aiter_serves_flydsl_herd.cache_clear()
+
+
+@pytest.mark.parametrize("profile", list(HERD_PROFILES))
+def test_herd_applies_the_scale_and_the_pass_row_count(monkeypatch, profile):
     calls = []
 
     def fake_fused_moe(*args, **kwargs):
@@ -124,12 +169,7 @@ def test_herd_applies_the_routed_scale_the_layer_folds_in(monkeypatch, profile):
     method.use_triton_decode = False
     method.use_triton_ep = False
     layer = _layer(
-        scoring_func,
-        grouped,
-        groups,
-        topk_group,
-        top_k,
-        scale,
+        *HERD_PROFILES[profile],
         w13_weight="w1",
         w2_weight="w2",
         w13_weight_scale="w1_scale",
@@ -145,13 +185,16 @@ def test_herd_applies_the_routed_scale_the_layer_folds_in(monkeypatch, profile):
         layer=layer,
         x="x",
         topk_weights="topk_weights",
-        topk_ids=torch.empty(4, top_k + 1, dtype=torch.int32),
+        topk_ids=torch.empty(4, layer.top_k + 1, dtype=torch.int32),
         global_num_experts=128,
         expert_map=None,
         activation="silu",
         apply_router_weight_on_input=False,
+        scheduled_tokens_gpu="count",
     )
 
     kwargs = calls.pop()
-    assert kwargs["herd_topk"] == top_k
-    assert kwargs["herd_routed_scaling_factor"] == herd_scale
+    assert kwargs["herd_topk"] == layer.top_k
+    assert kwargs["herd_routed_scaling_factor"] == layer.routed_scaling_factor
+    # The drop leaves the pad rows out by the count the candidates were cut at.
+    assert kwargs["num_local_tokens"] == "count"

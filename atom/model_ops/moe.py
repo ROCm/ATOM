@@ -6,7 +6,7 @@ from abc import abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
-from functools import lru_cache
+from functools import cache, lru_cache
 
 import torch
 from aiter import ActivationType, QuantType, dtypes, get_hip_quant, topk_gating
@@ -20,7 +20,6 @@ from aiter.ops.shuffle import (
     moe_shuffle_scale,
     moe_shuffle_weight,
 )
-from aiter.ops.topk import _FLYDSL_HERD_MAX_M, _FLYDSL_HERD_MIN_M, _FLYDSL_USE_HERD
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -119,6 +118,12 @@ from atom.utils.tbo.ubatching import (
     tbo_switch_to_compute_sync,
     tbo_yield_and_switch_from_compute_to_comm,
 )
+
+try:
+    from aiter.ops.topk import _FLYDSL_HERD_MAX_M, _FLYDSL_HERD_MIN_M, _FLYDSL_USE_HERD
+except ImportError:  # aiter older than v0.1.26
+    _FLYDSL_USE_HERD = False
+    _FLYDSL_HERD_MIN_M = _FLYDSL_HERD_MAX_M = 0
 
 logger = logging.getLogger("atom")
 
@@ -1455,6 +1460,48 @@ class Nvfp4MoEMethod(FusedMoEMethodBase):
         )
 
 
+@cache
+def _aiter_serves_flydsl_herd() -> bool:
+    """Whether aiter's fused_moe(herd_topk) serves DeepSeek-V4 and Kimi-K3:
+    aiter v0.1.29 (ROCm/aiter#7494) or later. Older ones abort the process on
+    Kimi-K3's Top-17 candidates with an FP32 correction bias."""
+    try:
+        from aiter.ops.flydsl.herd_topk import herd_route_psum  # noqa: F401
+    except ImportError:
+        logger.warning(
+            "AITER_FLYDSL_USE_HERD=1 needs aiter v0.1.29 (ROCm/aiter#7494) or "
+            "later; HERD stays off"
+        )
+        return False
+    return True
+
+
+def _herd_sees_own_rows(parallel_config: FusedMoEParallelConfig) -> bool:
+    """Whether the experts run only their pass's rows, whose trailing pad rows
+    aiter's HERD drop leaves out by the count fused_moe gets. A DP-attention or
+    PCP gather, and simulated DP's repeat, interleave every rank's -1 pad rows,
+    pass no count, and can exceed the 1024 rows fused_moe(herd_topk) takes."""
+    return not (
+        parallel_config.pcp_merge
+        or parallel_config.dp_logical_ratio > 1
+        or (
+            parallel_config.dp_size > 1
+            and get_current_atom_config().enable_dp_attention
+        )
+    )
+
+
+def _herd_routing(layer: torch.nn.Module) -> bool:
+    """DeepSeek-V4's sqrtsoftplus top-k or Kimi-K3's sigmoid grouped top-k over
+    one group: the routings HERD serves, both folding the routed scale in."""
+    if layer.use_grouped_topk:
+        return layer.scoring_func == "sigmoid" and (
+            layer.num_expert_group,
+            layer.topk_group,
+        ) == (1, 1)
+    return layer.scoring_func == "sqrtsoftplus"
+
+
 class Mxfp4MoEMethod(FusedMoEMethodBase):
     def __init__(self, quant_config: LayerQuantConfig, moe: FusedMoEConfig):
         super().__init__(moe)
@@ -1522,6 +1569,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             and self.is_guinterleave
             and not ep_moe
             and not getattr(get_current_atom_config(), "eplb_enable", False)
+            and _herd_sees_own_rows(self.moe.moe_parallel_config)
+            and _aiter_serves_flydsl_herd()
         )
 
         # Triton MoE under EP exists only for gfx95x and gfx125x -- those are the
@@ -2095,6 +2144,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         shared column widened in where the legacy layout fuses one."""
         if self._flydsl_herd_step(layer, router_logits):
             # Raw Top-(K+1) scores; fused_moe(herd_topk=K) drops and scales.
+            # Pad rows route to -1, and the drop keeps them out of its
+            # popularity only by the count apply() passes as num_local_tokens.
             return FusedMoE.select_experts(
                 hidden_states=x,
                 router_logits=router_logits,
@@ -2105,9 +2156,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 renormalize=False,
                 scoring_func=layer.scoring_func,
                 e_score_correction_bias=layer.e_score_correction_bias,
-                # Pad rows as _select_logical routes them: aiter's HERD drop
-                # skips -1 rows only with the count pure TP no longer passes.
-                mask_pad_rows=layer.use_ep,
             )
         layout = layer.expert_layout
         return _select_logical(
@@ -2322,12 +2370,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
         if herd_topk:
             moe_extra_args["herd_topk"] = herd_topk
-            # The scale select_experts folds in: grouped top-k and sqrtsoftplus.
-            moe_extra_args["herd_routed_scaling_factor"] = (
-                layer.routed_scaling_factor
-                if layer.use_grouped_topk or layer.scoring_func == "sqrtsoftplus"
-                else 1.0
-            )
+            # Both _herd_routing routings fold the routed scale in.
+            moe_extra_args["herd_routed_scaling_factor"] = layer.routed_scaling_factor
         _ep_triton_now = False
         if self.use_triton_ep and self.using_modular_kernel:
             # Phase split, transport version. FusedMoEModularKernel.forward runs
@@ -2533,7 +2577,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
     ) -> bool:
         """Whether this step routes Top-(K+1) candidates for fused_moe(herd_topk):
         decode steps in aiter's HERD window that reach the FlyDSL experts, on
-        routing the drop can stand in for (it renormalises the kept K)."""
+        a `_herd_routing` routing (the drop renormalises the kept K)."""
         tokens = router_logits.shape[0]
         if (
             not self.use_flydsl_herd
@@ -2544,10 +2588,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             or layer.custom_routing_function is not None
             or layer.apply_router_weight_on_input
             or layer.num_fused_shared_experts > 0
-            or (
-                layer.use_grouped_topk
-                and (layer.num_expert_group, layer.topk_group) != (1, 1)
-            )
+            or not _herd_routing(layer)
         ):
             return False
         comm_fused = getattr(layer, "_comm_fused_moe", None)
