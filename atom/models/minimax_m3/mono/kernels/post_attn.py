@@ -182,7 +182,9 @@ class K4Build:
     sh_first: int = (
         0  # wide MoE: the shared pairs first, their tiles loaded early; 0 off, else ``UG_SHARED_UNITS``
     )
-    attn_mxfp8: bool = False  # qkv / o_proj are native MXFP8 1x32 (E8M0 scales), not ptpc fp8
+    attn_mxfp8: bool = (
+        False  # qkv / o_proj are native MXFP8 1x32 (E8M0 scales), not ptpc fp8
+    )
 
 
 def build_post_attn_kernel(

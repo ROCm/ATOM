@@ -452,7 +452,9 @@ def merge_defs(k4ctx):
             code = code_ceil(fx.max(am, fx.Float32(1e-10)) * fx.Float32(1.0 / FP8_MAX))
             inv = rcp_pow2(code)
             # the 4 blocks of a head (threads 8 k of its 32) in one word, byte k
-            code = butterfly(code << (8 * ((tid // 8) % 4)), (8, 16), lambda a, b: a | b)
+            code = butterfly(
+                code << (8 * ((tid // 8) % 4)), (8, 16), lambda a, b: a | b
+            )
             return (
                 fp8_pack4(
                     clamp_fp8(a0 * inv),
@@ -548,6 +550,40 @@ def o_defs(k4ctx):
     def stage_o():
         r_wo = wrsrc("o", w_o)
         O_CPW = O_K // 64 // 4  # 64-k chunks per wave: 4 waves per 16-row group
+        if const_expr(attn_mxfp8):
+            osc = xs + tokens * O_ROW  # the activation's codes, 4 to a word
+            # the rows and their codes in one batched loop (a second would add a round
+            # trip): loads v < n_a are the rows'
+            n_a, n_c = tokens * (O_K // 4) // 4, tokens * (O_K // 128) // 4
+            to_codes = (SCRATCH["attnq_sc"] - SCRATCH["attnq"]) // 4
+
+            def put_row_or_codes(v, w):
+                if v < n_a:
+                    fx.ptr_store(
+                        w, xs + (v * 4 // (O_K // 4) * O_ROW + v * 4 % (O_K // 4))
+                    )
+                else:
+                    u = v - n_a
+                    fx.ptr_store(
+                        w,
+                        osc + (u * 4 // (O_K // 128) * OSC_ROW + u * 4 % (O_K // 128)),
+                    )
+
+            def copy_rows_and_codes():
+                batched_rounds(
+                    tid,
+                    n_a + n_c,
+                    lambda v: fx.Vector(
+                        ld_dev(
+                            mb("attnq"),
+                            (v < n_a).select(v * 4, to_codes + (v - n_a) * 4),
+                            4,
+                        )
+                    ),
+                    put_row_or_codes,
+                    batch=8,  # S = 16: 5 rounds in one trip, not 4 + 1
+                )
+
         for t in range(start("o"), N_O, G):
             t = fx.Int32(t)
             rg = t * 2 + wave // 4
@@ -578,7 +614,6 @@ def o_defs(k4ctx):
                         dtype=T.i32,
                     )
                 )
-                osc = xs + tokens * O_ROW  # the activation's codes, a word each
             else:
                 ws = fx.Float32(
                     bo.buffer_load(
@@ -607,36 +642,7 @@ def o_defs(k4ctx):
                     x_scales = [got[k][0].bitcast(fx.Float32) for k in range(tokens)]
                 acquire()
                 if const_expr(attn_mxfp8):
-                    # the rows and their codes in one batched loop (a second would add a
-                    # round trip): loads v < n_a are the rows'
-                    n_a, n_c = tokens * (O_K // 4) // 4, tokens * (O_K // 128) // 4
-                    to_codes = (SCRATCH["attnq_sc"] - SCRATCH["attnq"]) // 4
-
-                    def put_row_or_codes(v, w):
-                        if v < n_a:
-                            fx.ptr_store(
-                                w, xs + (v * 4 // (O_K // 4) * O_ROW + v * 4 % (O_K // 4))
-                            )
-                        else:
-                            u = v - n_a
-                            fx.ptr_store(
-                                w,
-                                osc + (u * 4 // (O_K // 128) * OSC_ROW + u * 4 % (O_K // 128)),
-                            )
-
-                    batched_rounds(
-                        tid,
-                        n_a + n_c,
-                        lambda v: fx.Vector(
-                            ld_dev(
-                                mb("attnq"),
-                                (v < n_a).select(v * 4, to_codes + (v - n_a) * 4),
-                                4,
-                            )
-                        ),
-                        put_row_or_codes,
-                        batch=8,  # S = 16: 5 rounds in one trip, not 4 + 1
-                    )
+                    copy_rows_and_codes()
                 else:
                     rows_to_lds(tid, mb("attnq"), tokens, O_K // 4, xs, O_ROW)
             gpu.barrier()

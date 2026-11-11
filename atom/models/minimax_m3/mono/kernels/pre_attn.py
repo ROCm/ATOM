@@ -305,7 +305,9 @@ def emit_pre_attn(
                 [accs[j][i][e] * rstd * (gs[i][e] + 1.0) for e in range(8)]
                 for i in range(2)
             ]
-            if const_expr(plain_norm or attn_mxfp8):  # the norm's bf16 output is the linear's input
+            if const_expr(
+                plain_norm or attn_mxfp8
+            ):  # the norm's bf16 output is the linear's input
                 nj = [[bf16_round(x) for x in row] for row in nj]
             normed.append(nj)
         if const_expr(attn_mxfp8):
@@ -471,12 +473,8 @@ def emit_pre_attn(
             r_ws = rsrc(s_qkv, 0 if "qkv" in strip else None)
             w_row = ((rg * ROWS_PER_TASK + lane % 16) * K_SCALE_BYTES + 24 * wave) // 4
             ws_dw = [
-                fx.Vector(
-                    bo.buffer_load(r_ws, w_row, vec_width=4, dtype=T.i32)
-                ),
-                fx.Vector(
-                    bo.buffer_load(r_ws, w_row + 4, vec_width=2, dtype=T.i32)
-                ),
+                fx.Vector(bo.buffer_load(r_ws, w_row, vec_width=4, dtype=T.i32)),
+                fx.Vector(bo.buffer_load(r_ws, w_row + 4, vec_width=2, dtype=T.i32)),
             ]
             ws_dw = [ws_dw[0][e] for e in range(4)] + [ws_dw[1][e] for e in range(2)]
         else:
@@ -516,7 +514,11 @@ def emit_pre_attn(
                         u = v - n_x
                         fx.ptr_store(
                             w,
-                            xsc + (u * 4 // (HIDDEN // 128) * XSCB_ROW + u * 4 % (HIDDEN // 128)),
+                            xsc
+                            + (
+                                u * 4 // (HIDDEN // 128) * XSCB_ROW
+                                + u * 4 % (HIDDEN // 128)
+                            ),
                         )
 
                 batched_rounds(

@@ -48,6 +48,7 @@ from atom.models.minimax_m3.mono.kernels.pre_attn import (
 )
 from atom.mono.runtime.uncached import uncached_bytes
 
+
 def _pow2(e):
     """2^e exactly (``torch.pow`` is not: 2^-2 * 3 came out as 2.9999999999999996)."""
     return torch.ldexp(torch.ones((), dtype=torch.float64), e.to(torch.int32))
@@ -112,31 +113,45 @@ def _run(tokens, seed=0, ctx=300, real=None):
     q_out = torch.zeros(MAX_TOKENS, LOCAL_Q_HEADS * HEAD_DIM, dtype=bf, device=dev)
     iq_out = torch.zeros(MAX_TOKENS, HEAD_DIM, dtype=bf, device=dev)
     h_out = torch.zeros(MAX_TOKENS, HIDDEN, dtype=bf, device=dev)
-    iscore = torch.zeros(2 * MAX_INDEX_BLOCKS * MAX_TOKENS, dtype=torch.int32, device=dev)
+    iscore = torch.zeros(
+        2 * MAX_INDEX_BLOCKS * MAX_TOKENS, dtype=torch.int32, device=dev
+    )
     scratch = uncached_bytes(SCRATCH_BYTES, torch.device(dev))
     scratch.zero_()
     launch = build_pre_attn_kernel(1e-6, SM_SCALE, 0, 1, tokens, attn_mxfp8=True)
     args = K1_ABI.pack(
-        dict(
-            ar=ar.data_ptr(), res=res.data_ptr(), h_out=h_out.data_ptr(),
-            g_in=g_in.data_ptr(), w_qkv=w.data_ptr(), s_qkv=code.data_ptr(),
-            g_q=gam.data_ptr(), g_k=gam.data_ptr(), g_iq=gam.data_ptr(),
-            g_ik=gam.data_ptr(), cos_sin=cos_sin.data_ptr(),
-            positions=positions.data_ptr(), slot_mapping=slots.data_ptr(),
-            k_cache=kc.data_ptr(), v_cache=vc.data_ptr(), k_scale=ks.data_ptr(),
-            v_scale=vs.data_ptr(), index_cache=idx.data_ptr(), q_out=q_out.data_ptr(),
-            iq_out=iq_out.data_ptr(), block_table=block_table.data_ptr(),
-            seq_lens=seq.data_ptr(), bt_width=n_blk, q_len=1, iscore=iscore.data_ptr(),
-            scratch=scratch.data_ptr(), layer=3, tl=0,
-        )
+        {
+            "ar": ar.data_ptr(), "res": res.data_ptr(), "h_out": h_out.data_ptr(),
+            "g_in": g_in.data_ptr(), "w_qkv": w.data_ptr(), "s_qkv": code.data_ptr(),
+            "g_q": gam.data_ptr(), "g_k": gam.data_ptr(), "g_iq": gam.data_ptr(),
+            "g_ik": gam.data_ptr(), "cos_sin": cos_sin.data_ptr(),
+            "positions": positions.data_ptr(), "slot_mapping": slots.data_ptr(),
+            "k_cache": kc.data_ptr(), "v_cache": vc.data_ptr(), "k_scale": ks.data_ptr(),
+            "v_scale": vs.data_ptr(), "index_cache": idx.data_ptr(), "q_out": q_out.data_ptr(),
+            "iq_out": iq_out.data_ptr(), "block_table": block_table.data_ptr(),
+            "seq_lens": seq.data_ptr(), "bt_width": n_blk, "q_len": 1, "iscore": iscore.data_ptr(),
+            "scratch": scratch.data_ptr(), "layer": 3, "tl": 0,
+        }
     )  # fmt: skip
     launch(*args)
     torch.cuda.synchronize()
     pairs = scratch[SCRATCH_QKV : SCRATCH_QKV + tokens * ROWS * 8].view(torch.int32)
     got = pairs.view(-1, 2)[:, 0].view(torch.float32).view(tokens, ROWS).clone()
     x8 = scratch[SCRATCH_X8 : SCRATCH_X8 + tokens * HIDDEN].view(tokens, HIDDEN).clone()
-    xsc = scratch[SCRATCH_XSC : SCRATCH_XSC + tokens * NB].view(tokens, NB).clone()  # 4 codes a word
-    return dict(res=res, w=w, code=code, w_deq=w_deq, got=got, x8=x8, xsc=xsc, q=q, code_cpu=code_cpu)
+    xsc = (
+        scratch[SCRATCH_XSC : SCRATCH_XSC + tokens * NB].view(tokens, NB).clone()
+    )  # 4 codes a word
+    return {
+        "res": res,
+        "w": w,
+        "code": code,
+        "w_deq": w_deq,
+        "got": got,
+        "x8": x8,
+        "xsc": xsc,
+        "q": q,
+        "code_cpu": code_cpu,
+    }
 
 
 @pytest.mark.parametrize("tokens", [1, 2, 3, 4, 8, 16])

@@ -219,7 +219,9 @@ class SparseMoeLayer:
         w_o, s_o, mx_o = _attn_gemm(
             attn.o_proj, HIDDEN, O_K, f"layer {layer_id} o_proj"
         )
-        _need(mx_qkv == mx_o, f"layer {layer_id}: qkv_proj / o_proj quantized differently")
+        _need(
+            mx_qkv == mx_o, f"layer {layer_id}: qkv_proj / o_proj quantized differently"
+        )
 
         moe = layer.block_sparse_moe
         experts = moe.experts

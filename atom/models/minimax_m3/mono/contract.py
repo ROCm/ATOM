@@ -120,8 +120,11 @@ if __name__ == "__main__":
             print(f"S={s} index heads={ih} nvfp4 K/V + index: contract holds")
             for nv in (False, True):
                 check_build(
-                    s, ih, shared_mxfp8=True, attn_mxfp8=True, kv_nvfp4=nv, index_nvfp4=nv
+                    s,
+                    ih,
+                    shared_mxfp8=True,
+                    attn_mxfp8=True,
+                    kv_nvfp4=nv,
+                    index_nvfp4=nv,
                 )
-                print(
-                    f"S={s} index heads={ih} attn_mxfp8 nvfp4={nv}: contract holds"
-                )
+                print(f"S={s} index heads={ih} attn_mxfp8 nvfp4={nv}: contract holds")

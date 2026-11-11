@@ -40,6 +40,7 @@ from atom.models.minimax_m3.mono.kernels.post_attn import K4_ABI, build_post_att
 from atom.models.minimax_m3.mono.layout import AG_RS_FROM, SCRATCH, sym_layout
 from atom.mono.runtime.uncached import uncached_bytes
 
+
 def _pow2(e):
     """2^e exactly (``torch.pow`` is not: 2^-2 * 3 came out as 2.9999999999999996)."""
     return torch.ldexp(torch.ones((), dtype=torch.float64), e.to(torch.int32))
@@ -84,7 +85,9 @@ def _case(tokens, seed=0, real=None):
     # the merged attention output the oracle expects, [tokens, O_K] bf16
     a = torch.stack(
         [
-            torch.cat([v[k, pick[k, h]].to(torch.bfloat16) for h in range(LOCAL_Q_HEADS)])
+            torch.cat(
+                [v[k, pick[k, h]].to(torch.bfloat16) for h in range(LOCAL_Q_HEADS)]
+            )
             for k in range(tokens)
         ]
     )
@@ -98,11 +101,11 @@ def _case(tokens, seed=0, real=None):
     ).view(HIDDEN, O_K)
     w = shuffle_weight(wq.to(dtypes.fp8).to(dev), layout=(16, 16)).contiguous()
     if real is not None:
-        w, code, w_deq, wq, code = real[0].to(dev), real[1], None, None, real[1]
-    return dict(
-        q=q, kc=kc.to(dev), vc=vc.to(dev), ks=ks.to(dev), vs=vs.to(dev),
-        bt=block_table.to(dev), seq=seq.to(dev), a=a, w=w, code=code.to(dev), w_deq=w_deq, wq=wq, code_cpu=code,
-    )  # fmt: skip
+        w, code, w_deq, wq = real[0].to(dev), real[1], None, None
+    return {
+        "q": q, "kc": kc.to(dev), "vc": vc.to(dev), "ks": ks.to(dev), "vs": vs.to(dev),
+        "bt": block_table.to(dev), "seq": seq.to(dev), "a": a, "w": w, "code": code.to(dev), "w_deq": w_deq, "wq": wq, "code_cpu": code,
+    }  # fmt: skip
 
 
 def _run(tokens, real=None):
@@ -131,16 +134,16 @@ def _run(tokens, real=None):
     )  # fmt: skip
     p = lambda t: t.data_ptr()
     args = K4_ABI.pack(
-        dict(
-            h_in=p(h_in), q=p(c["q"]), block_table=p(c["bt"]), seq_lens=p(c["seq"]),
-            k_cache=p(c["kc"]), v_cache=p(c["vc"]), k_scale=p(c["ks"]),
-            v_scale=p(c["vs"]), w_o=p(c["w"]), s_o=p(c["code"]), g_post=p(g_post),
-            w_gate=p(gate), bias=p(bias), w13=p(w13), s13=p(s13), w2=p(w2), s2=p(s2),
-            h_mid=p(h_mid), ar_out=p(ar_out), scratch=scratch.data_ptr(),
-            sym=sym.data_ptr(), peers=p(peers), rank=0, layer=3, bt_width=1, q_len=1,
-            tl=0, k1_args=p(k1), positions=p(ids), slot_mapping=p(ids), res=p(h_in),
-            batch_ids=p(ids), w13s=p(w13s), s13s=p(s13s), w2s=p(w2s), s2s=p(s2s),
-        )
+        {
+            "h_in": p(h_in), "q": p(c["q"]), "block_table": p(c["bt"]), "seq_lens": p(c["seq"]),
+            "k_cache": p(c["kc"]), "v_cache": p(c["vc"]), "k_scale": p(c["ks"]),
+            "v_scale": p(c["vs"]), "w_o": p(c["w"]), "s_o": p(c["code"]), "g_post": p(g_post),
+            "w_gate": p(gate), "bias": p(bias), "w13": p(w13), "s13": p(s13), "w2": p(w2), "s2": p(s2),
+            "h_mid": p(h_mid), "ar_out": p(ar_out), "scratch": scratch.data_ptr(),
+            "sym": sym.data_ptr(), "peers": p(peers), "rank": 0, "layer": 3, "bt_width": 1, "q_len": 1,
+            "tl": 0, "k1_args": p(k1), "positions": p(ids), "slot_mapping": p(ids), "res": p(h_in),
+            "batch_ids": p(ids), "w13s": p(w13s), "s13s": p(s13s), "w2s": p(w2s), "s2s": p(s2s),
+        }
     )  # fmt: skip
     launch(*args)
     torch.cuda.synchronize()
@@ -183,7 +186,8 @@ def test_the_oracle_tells_a_wrong_scale_mapping():
             xq.cpu().view(tokens, NB, 32).double() * _pow2(acode - 127)[..., None]
         ).view(tokens, O_K)
         w = (
-            c["wq"].double().view(HIDDEN, NB, 32) * _pow2(wcode.double() - 127)[..., None]
+            c["wq"].double().view(HIDDEN, NB, 32)
+            * _pow2(wcode.double() - 127)[..., None]
         ).view(HIDDEN, O_K)
         return (xdq @ w.T).to(torch.bfloat16).float()
 
