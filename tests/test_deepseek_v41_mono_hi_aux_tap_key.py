@@ -6,12 +6,14 @@ program of their own (``window_layer_blocks(full_r_a=True)``: R_A whole) at the 
 (``hi_compose``); the hi layer needs FlyDSL (its test skips without it)."""
 
 import inspect
+import sys
 import types
 
 import pytest
 from aiter_stub import atom_without_aiter
 
 from atom.models.deepseek_v41.mono import hi_compose
+from atom.mono.runtime.consensus import MonoUnsupported
 
 AUX = (37, 38, 39)
 WIDTHS = (1, 2, 6, 8, 12, 16, 24)
@@ -98,10 +100,11 @@ def test_hi_layer_takes_full_r_a():
     assert m._key(36, 6)[-1] is False and m._key(37, 1)[-1] is False
 
 
-def test_first_served_step_writes_the_taps():
+def test_first_served_step_writes_the_taps(monkeypatch):
     """The end-step's taps on the first served step: ATOM's aux buffers are bound before the end-step launch takes
     its tap list (``_taps``), not later by ``CTX`` (``_ctx_taps``), which reads them right after it. Bound only by
-    ``CTX``, the first served step (and a graph captured on it) wrote no taps and ``CTX`` read stale ones.
+    ``CTX``, the first served step (and a graph captured on it) wrote no taps and ``CTX`` read stale ones. The bind
+    takes the extract the hi kernels compute (``DeepseekV41DSpark._target_layer_input``) and refuses any other.
     """
     import torch
 
@@ -109,6 +112,16 @@ def test_first_served_step_writes_the_taps():
         atom_without_aiter() as load
     ):  # (Triton stubbed with AITER where it is not installed)
         hook = load("atom.models.deepseek_v41.mono.hi_runner")
+    # (the draft module needs AITER and FlyDSL: only the extract it names)
+    monkeypatch.setitem(
+        sys.modules,
+        "atom.models.deepseek_v41.dspark",
+        types.SimpleNamespace(
+            DeepseekV41DSpark=types.SimpleNamespace(
+                _target_layer_input=lambda inputs, block: None
+            )
+        ),
+    )
     m = object.__new__(hook.HiLayers)
     m.aux, m.D = None, types.SimpleNamespace(TAPS=len(AUX))
     m.h_in0 = torch.zeros(1, 4, 8, dtype=torch.bfloat16)
@@ -121,3 +134,6 @@ def test_first_served_step_writes_the_taps():
     assert [b for _, b in taps] == bufs and [r for r, _ in taps] == [
         m.r_a[i] for i in AUX
     ]
+    m.aux, m.cx_drafter.aux_extract = None, lambda inputs, block: None
+    with pytest.raises(MonoUnsupported, match="aux extract"):
+        m._taps()
