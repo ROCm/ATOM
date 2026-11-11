@@ -454,9 +454,7 @@ def test_mp_keys_carry_the_prompts_salt(monkeypatch, cache_seed, salt):
     client = mp_lookup._MPLookupClient(
         adapter, config=_config(), timeout=10.0, poll_interval=0.01
     )
-    sched = mp_scheduler.LMCacheMPConnectorScheduler.__new__(
-        mp_scheduler.LMCacheMPConnectorScheduler
-    )
+    sched = _bare_mp_scheduler()
     ChunkedOffloadSchedulerBase.__init__(
         sched, _config(), chunk_size=8, lookup_client=client
     )
