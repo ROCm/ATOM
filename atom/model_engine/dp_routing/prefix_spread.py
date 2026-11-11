@@ -552,7 +552,8 @@ class PrefixSpreadRouter:
         # A small overage shortens the oldest leaf from its tail (its head still
         # names the owner rank) and the leaf then queues behind the others, so
         # repeated small overages spread over many histories. An overage beyond
-        # an eighth of the leaf (at least one block) drops it whole, as before:
+        # an eighth of the leaf (at least one block), or one that covers the whole
+        # leaf, drops it whole, as before:
         # each pass of this loop then removes a whole leaf, so one placement
         # never takes more passes than whole-leaf eviction did. Either way it is
         # only approximately LRU: a recently used leaf can lose a tail share

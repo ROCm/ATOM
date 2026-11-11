@@ -1028,8 +1028,8 @@ def test_idle_ratio_load_wins_over_a_partial_prefix():
 
 def test_partial_holder_still_prefilling_is_not_an_hbm_hit():
     mgr = _dp4_idle_ratio_mgr(partial_completed=False)
-    hits, owner = _rank_hits(mgr._prefix_router, 
-        _chain_seq(3, 110_000).prompt_hash_chain, 4
+    hits, owner = _rank_hits(
+        mgr._prefix_router, _chain_seq(3, 110_000).prompt_hash_chain, 4
     )
     assert owner == 0 and 2 not in hits
     (rank,) = _route(mgr, [_chain_seq(3, 110_000)])
@@ -1092,13 +1092,17 @@ def test_an_aborted_move_leaves_no_hit_on_its_destination():
 
     moved(2)
     mgr._release_seq(2)  # aborted before its load
-    hits, _ = _rank_hits(mgr._prefix_router, _chain_seq(9, 100_000).prompt_hash_chain, 2)
+    hits, _ = _rank_hits(
+        mgr._prefix_router, _chain_seq(9, 100_000).prompt_hash_chain, 2
+    )
     assert other not in hits
 
     moved(3)
     mgr._mark_seq_prefill_complete(3)
     mgr._release_seq(3)
-    hits, _ = _rank_hits(mgr._prefix_router, _chain_seq(9, 100_000).prompt_hash_chain, 2)
+    hits, _ = _rank_hits(
+        mgr._prefix_router, _chain_seq(9, 100_000).prompt_hash_chain, 2
+    )
     assert hits.get(other) == 99_968
 
 
@@ -1244,8 +1248,8 @@ def test_an_abort_racing_the_first_stream_keeps_the_prefix():
     mgr._mark_seq_prefill_complete(1)  # the STREAM, on the output thread
     mgr._release_seq(1)  # the terminal output
     assert not mgr._prefix_router.prefilling(1)
-    hits, src_owner = _rank_hits(mgr._prefix_router, 
-        _chain_seq(9, 100_000).prompt_hash_chain, 2
+    hits, src_owner = _rank_hits(
+        mgr._prefix_router, _chain_seq(9, 100_000).prompt_hash_chain, 2
     )
     assert src_owner == owner and hits[owner] == 99_968
     assert mgr._rank_reqs == [0, 0] and mgr._rank_tokens == [0, 0]
@@ -1445,8 +1449,8 @@ def test_a_terminal_output_completes_the_prefill_only_after_forward():
 
     (owner,) = _route(mgr, [_chain_seq(2, 100_000)])
     mgr._release_terminal_seq(SimpleNamespace(id=2, prefill_completed=True))
-    hits, src_owner = _rank_hits(mgr._prefix_router, 
-        _chain_seq(9, 100_000).prompt_hash_chain, 2
+    hits, src_owner = _rank_hits(
+        mgr._prefix_router, _chain_seq(9, 100_000).prompt_hash_chain, 2
     )
     assert src_owner == owner and hits[owner] == 99_968
     assert mgr._rank_reqs == [0, 0] and mgr._rank_tokens == [0, 0]
@@ -1921,8 +1925,8 @@ def test_prefix_spread_reset_evicts_history_in_a_repeatable_order():
     router.CAP = keep * 128
     router.reset()
     held = [
-        _rank_hits(router, 
-            _chain_seq(0, 128, first_block=5_000 + i).prompt_hash_chain, 2
+        _rank_hits(
+            router, _chain_seq(0, 128, first_block=5_000 + i).prompt_hash_chain, 2
         )[1]
         is not None
         for i in range(n)
