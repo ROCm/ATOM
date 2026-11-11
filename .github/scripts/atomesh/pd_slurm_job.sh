@@ -185,7 +185,32 @@ pre_cleanup_local() {
   if [[ "${kept_active}" -eq 1 ]]; then
     echo "WARNING: $(hostname) still runs containers of other jobs; GPUs may be shared with them" >&2
   fi
+  if [[ "${ATOMESH_REMOVE_STOPPED_CONTAINERS:-0}" == "1" ]]; then
+    remove_stopped_containers
+  fi
   set -e
+}
+
+# Removes every exited or dead container on this host, whichever job or user
+# left it. "created" is skipped: a co-scheduled job may be starting that one.
+remove_stopped_containers() {
+  echo "=== pre-cleanup: remove stopped containers on $(hostname) ==="
+  local id name status
+  local stopped=()
+  while IFS=$'\t' read -r id name status; do
+    [[ -n "${id}" ]] || continue
+    echo "  remove ${id} ${name} (${status})"
+    stopped+=("${id}")
+  done < <(docker ps -a --filter status=exited --filter status=dead \
+    --format '{{.ID}}\t{{.Names}}\t{{.Status}}' 2>/dev/null)
+
+  if [[ "${#stopped[@]}" -eq 0 ]]; then
+    echo "no stopped containers"
+  elif command -v timeout >/dev/null 2>&1; then
+    timeout 120 docker rm -f "${stopped[@]}" >/dev/null 2>&1 || true
+  else
+    docker rm -f "${stopped[@]}" >/dev/null 2>&1 || true
+  fi
 }
 
 # Prints "<gpu> <used MB>" for the first GPU above ATOMESH_GPU_BUSY_MB.
@@ -762,6 +787,10 @@ pre_cleanup_nodes() {
         rocm-smi --showmemuse 2>/dev/null || true
       fi
     ' || true
+    if [[ "${ATOMESH_REMOVE_STOPPED_CONTAINERS:-0}" == "1" ]]; then
+      srun --nodes=1 --ntasks=1 --nodelist="${node}" bash -lc \
+        "$(declare -f remove_stopped_containers); remove_stopped_containers" || true
+    fi
   done
   echo "=== pre-cleanup done ==="
 }
