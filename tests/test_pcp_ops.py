@@ -547,7 +547,6 @@ def test_aux_gathers_exactly_when_the_target_forward_split(monkeypatch):
     drafter = SimpleNamespace(
         _captures_aux=True, _aux_buffers=buffers, _relayed_aux=None
     )
-    drafter._aux_blocks = lambda: dr.Drafter._aux_blocks(drafter)
     hidden = torch.zeros(n, 2)
 
     aux = dr.Drafter.aux_for(drafter, hidden)
@@ -584,7 +583,7 @@ def test_dspark_proposer_hands_the_model_its_own_stripe(monkeypatch):
     model = SimpleNamespace(
         write_context_kv=lambda aux, pos, **kw: calls.append((aux, pos, kw))
     )
-    ctx = SimpleNamespace(context=SimpleNamespace(scheduled_bs=2))
+    ctx = SimpleNamespace(attn_metadata=None, context=SimpleNamespace(scheduled_bs=2))
     monkeypatch.setattr(dp, "get_forward_context", lambda: ctx)
     full = [b[:n] for b in bufs]
     drafter = SimpleNamespace(
@@ -594,9 +593,6 @@ def test_dspark_proposer_hands_the_model_its_own_stripe(monkeypatch):
         _relayed_aux=None,
         aux_for=lambda h: full,
     )
-    dr = _import_or_skip_dep("atom.spec_decode.drafter")
-    drafter._aux_blocks = lambda: dr.Drafter._aux_blocks(drafter)
-
     monkeypatch.setattr(dp, "pcp_aux_rows", lambda rows: n_local)
     drafter.aux_for = lambda h: pytest.fail("gathered the aux states")
     dp.DSparkProposer.compute_draft_kv(drafter, positions, torch.zeros(n, 7), None)

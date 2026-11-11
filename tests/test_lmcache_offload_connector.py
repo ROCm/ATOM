@@ -86,7 +86,10 @@ from atom.kv_transfer.offload.hybrid.kimi_k3.state_object import (
     StateByteCodec,
     TouchResult,
 )
-from atom.kv_transfer.offload.hybrid.kimi_k3.state_tier import _JointPark
+from atom.kv_transfer.offload.hybrid.kimi_k3.state_tier import (
+    StateOffloadTier,
+    _JointPark,
+)
 from atom.kv_transfer.offload.hybrid.qwen.connector import QwenOffloadScheduler
 from atom.kv_transfer.offload.metadata import (
     ATOMRawBytesLMCacheMetadata,
@@ -7624,6 +7627,8 @@ class TestConnectorTouches:
 
 # ── kimi_k3: loads must not queue behind a backlog of stores ───────────────
 
+_COPY_DONE = SimpleNamespace(synchronize=lambda: None)
+
 
 class TestStateLoadsAndStoresRunInSeparateLanes:
     """A load is on the TTFT critical path and a store is not, but one serial
@@ -7660,7 +7665,7 @@ class TestStateLoadsAndStoresRunInSeparateLanes:
         tier = self._tier(codec)
         try:
             for gen in range(4):
-                tier.submit_store(StateStoreOperationId(gen, gen + 1), (0,))
+                tier.submit_store(StateStoreOperationId(gen, gen + 1), (0,), _COPY_DONE)
             tier.submit_load("r1", 77, 0)
             assert codec.loaded.wait(
                 timeout=5
@@ -7682,7 +7687,7 @@ class TestStateLoadsAndStoresRunInSeparateLanes:
         tier = self._tier(codec, staging_lanes=1)
         try:
             for gen in range(3):
-                tier.submit_store(StateStoreOperationId(gen, gen + 1), (0,))
+                tier.submit_store(StateStoreOperationId(gen, gen + 1), (0,), _COPY_DONE)
             tier.submit_load("r1", 77, 0)
             assert not codec.loaded.wait(timeout=0.2), "held by the in-flight store"
             codec.gate.set()
@@ -7696,7 +7701,7 @@ class TestStateLoadsAndStoresRunInSeparateLanes:
         tier = self._tier(codec)
         try:
             assert tier.oldest_store_age_s() == 0.0
-            tier.submit_store(StateStoreOperationId(1, 1), (0,))
+            tier.submit_store(StateStoreOperationId(1, 1), (0,), _COPY_DONE)
             assert tier.oldest_store_age_s() >= 0.0
             assert len(tier._store_submitted_at) == 1
         finally:
@@ -7733,7 +7738,7 @@ class TestStateLoadsAndStoresRunInSeparateLanes:
         tier = self._tier(codec)
         op = StateStoreOperationId(1, 1)
         try:
-            tier.submit_store(op, (0,))
+            tier.submit_store(op, (0,), _COPY_DONE)
             assert codec.released.wait(timeout=5), "the D2H callback never fired"
             # Early: units handed back while the CPU put is still running.
             assert tier.take_source_releases() == {op}
@@ -7761,7 +7766,7 @@ class TestStateLoadsAndStoresRunInSeparateLanes:
         tier = self._tier(_RefuseCodec())
         op = StateStoreOperationId(2, 1)
         try:
-            tier.submit_store(op, (0,))
+            tier.submit_store(op, (0,), _COPY_DONE)
             tier.drain()
             assert tier.take_source_releases() == {op}
             assert tier.take_store_reports() == (set(), {op})
@@ -7783,9 +7788,111 @@ class TestStateLoadsAndStoresRunInSeparateLanes:
         tier = self._tier(_ThrowCodec())
         op = StateStoreOperationId(3, 1)
         try:
-            tier.submit_store(op, (0,))
+            tier.submit_store(op, (0,), _COPY_DONE)
             tier.drain()
             assert tier.take_source_releases() == {op}
             assert tier.take_store_reports() == (set(), {op})
         finally:
             tier.shutdown()
+
+
+class TestAStateStoreWaitsForTheCopyThatFillsItsUnits:
+    """A checkpoint is READY once the batch carrying its slot->PAGE copy is
+    issued, not once the copy has run, and its store rides a later step's
+    metadata. The gather runs on the packer's own stream, so without a fence it
+    could read the PAGE units before the copy lands and file their previous
+    occupant's bytes under a valid prefix hash. The connector records one event
+    on the current stream per step and the tier waits on it before `put`."""
+
+    class _Event:
+        def __init__(self, log, fail=False):
+            self.log, self.fail, self.stream = log, fail, None
+
+        def record(self, stream):
+            self.stream = stream
+            self.log.append("record")
+
+        def synchronize(self):
+            self.log.append("synchronize")
+            if self.fail:
+                raise RuntimeError("HIP error: an illegal memory access")
+
+    class _Codec:
+        def __init__(self, log):
+            self.log = log
+
+        def put(self, h, unit_ids, on_source_released):
+            self.log.append("put")
+            on_source_released()
+            return True
+
+    def test_the_tier_waits_on_the_fence_before_it_gathers(self):
+        log = []
+        tier = StateOffloadTier(self._Codec(log))
+        op = StateStoreOperationId(1, 1)
+        try:
+            tier.submit_store(op, (0,), self._Event(log))
+            tier.drain()
+            assert log == ["synchronize", "put"]
+            assert tier.take_store_reports() == ({op}, set())
+        finally:
+            tier.shutdown()
+
+    def test_a_fence_that_raises_fails_the_store_and_releases_its_units(self):
+        log = []
+        tier = StateOffloadTier(self._Codec(log))
+        op = StateStoreOperationId(2, 1)
+        try:
+            tier.submit_store(op, (0,), self._Event(log, fail=True))
+            tier.drain()
+            assert "put" not in log
+            assert tier.take_source_releases() == {op}
+            assert tier.take_store_reports() == (set(), {op})
+        finally:
+            tier.shutdown()
+
+    def _worker(self, log):
+        submitted = []
+
+        class _Tier:
+            def submit_store(self, *args):
+                log.append("submit")
+                submitted.append(args)
+
+        worker = _k3_worker()
+        worker._state_tier = _Tier()
+        worker._store_failed_no_tier = set()
+        return worker, submitted
+
+    def test_one_fence_on_the_current_stream_rides_every_store(self, monkeypatch):
+        log, events, stream = [], [], object()
+
+        def _event():
+            events.append(self._Event(log))
+            return events[-1]
+
+        monkeypatch.setattr(torch.cuda, "Event", _event)
+        monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
+        worker, submitted = self._worker(log)
+        a, b = StateStoreOperationId(1, 1), StateStoreOperationId(2, 1)
+        worker._start_state_stores(
+            SimpleNamespace(state_stores=[(a, [3, 4]), (b, [5])])
+        )
+        assert len(events) == 1 and events[0].stream is stream
+        assert log == ["record", "submit", "submit"]
+        assert submitted == [(a, (3, 4), events[0]), (b, (5,), events[0])]
+        assert worker._store_failed_no_tier == set()
+
+    def test_no_fence_fails_the_step_stores_instead_of_gathering(self, monkeypatch):
+        class _BrokenEvent:
+            @staticmethod
+            def record(_stream):
+                raise RuntimeError("sticky HIP error")
+
+        monkeypatch.setattr(torch.cuda, "Event", _BrokenEvent)
+        monkeypatch.setattr(torch.cuda, "current_stream", object)
+        worker, submitted = self._worker([])
+        a, b = StateStoreOperationId(1, 1), StateStoreOperationId(2, 1)
+        worker._start_state_stores(SimpleNamespace(state_stores=[(a, [3]), (b, [5])]))
+        assert submitted == []
+        assert worker._store_failed_no_tier == {a, b}
