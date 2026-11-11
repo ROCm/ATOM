@@ -4152,21 +4152,8 @@ class Scheduler:
         # surrendered blocks (the mutator half of `should_defer_free`'s escape).
         self._connector_release_stalled_save(seq)
         self.block_manager.deallocate(seq)
-        # Behind the settled offload resumes at the head, which hold blocks and
-        # are promoted once, when their load ends. A preempted head that cannot
-        # allocate stops admission, so in front of them it would starve the
-        # resume holding the blocks it needs. In-flight loads inside that run
-        # are skipped by admission; they stay in front only when a resume sits
-        # behind them, so the preempted request never lands behind more
-        # in-flight loads than it must (`_can_admit_head_prefill` reads only the
-        # first few queue entries).
-        pos = 0
-        if getattr(getattr(self, "kv_connector", None), "is_offload", False):
-            for i, queued in enumerate(self.waiting):
-                if self._is_offload_prefill_resume(queued):
-                    pos = i + 1
-                elif queued.status != SequenceStatus.WAITING_FOR_REMOTE_KVS:
-                    break
+        # Unbound: tests call `Scheduler.preempt` on hand-built owners.
+        pos = Scheduler._behind_settled_resumes(self)
         self.waiting.insert(pos, seq)
         return True
 
@@ -5121,6 +5108,26 @@ class Scheduler:
         self.waiting.extend(ready)
         self.waiting.extend(blocked)
 
+    def _behind_settled_resumes(self) -> int:
+        """Queue index behind the last settled offload resume of the leading run.
+
+        Settled resumes at the head hold blocks and are promoted once, when
+        their load ends. A preempted head that cannot allocate stops admission,
+        so in front of them it would starve the resume holding the blocks it
+        needs. In-flight loads inside that run are skipped by admission; they
+        stay in front only when a resume sits behind them, so a request put
+        back at the head never lands behind more in-flight loads than it must
+        (`_can_admit_head_prefill` reads only the first few queue entries).
+        """
+        pos = 0
+        if getattr(getattr(self, "kv_connector", None), "is_offload", False):
+            for i, queued in enumerate(self.waiting):
+                if self._is_offload_prefill_resume(queued):
+                    pos = i + 1
+                elif queued.status != SequenceStatus.WAITING_FOR_REMOTE_KVS:
+                    break
+        return pos
+
     def _park_ready_offload_partial_prefills(self) -> None:
         if (
             not self.running
@@ -5146,7 +5153,11 @@ class Scheduler:
 
         self.running = keep_running
         if parked:
-            self.waiting.extendleft(reversed(parked))
+            # Not in front of a settled resume: event-free ticks never re-rank,
+            # so four parked loads there would hide it from admission probes.
+            pos = self._behind_settled_resumes()
+            for offset, seq in enumerate(parked):
+                self.waiting.insert(pos + offset, seq)
 
     def _update_from_kv_xfer_finished(self, kv_connector_output: KVConnectorOutput):
         """Reconcile scheduler state with completed KV transfers.

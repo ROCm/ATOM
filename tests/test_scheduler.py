@@ -1236,6 +1236,29 @@ class TestSchedule:
         assert sched.preempt(victim)
         assert list(sched.waiting) == [first, resume, victim, second, fresh]
 
+    def test_parked_partial_prefills_queue_behind_a_settled_resume(self):
+        """Four partial prefills parked for their loads must not push a settled
+        resume out of the window `_can_admit_head_prefill` reads: event-free ticks
+        never re-rank, so the probe has to see it on every later tick too."""
+        sched = self._offload_sched(12)
+        sched.kv_connector.should_park_partial_prefill_for_load = lambda seq: True
+        resume = self._settled_resume(sched, 100)
+        sched.waiting.append(resume)
+        partials = []
+        for i in range(4):
+            seq = Sequence(list(range(300 + 20 * i, 316 + 20 * i)), 16)
+            seq.status = SequenceStatus.RUNNING
+            partials.append(seq)
+        sched.running.extend(partials)
+
+        sched._park_ready_offload_partial_prefills()
+
+        assert list(sched.waiting) == [resume, *partials]
+        for _ in range(2):  # event-free ticks leave the order alone
+            sched._prioritize_ready_remote_kv_requests()
+            assert list(sched.waiting)[0] is resume
+            assert sched._can_admit_head_prefill()
+
     def test_an_idle_tick_leaves_the_waiting_queue_alone(self):
         """Without a finished or failed id nothing is scanned, however long the
         queue: a settled resume is promoted once, when its load ends, and
