@@ -16,6 +16,10 @@ up to ``MAX_REQUESTS`` requests runs on ``draft_runner``, after a prefill as
 after a decode. Every per-step input read is TP-uniform: the kernels wait on
 every peer rank, so ranks that disagreed would wait on each other for ever (a
 per-rank flag such as ``is_dummy_run`` must never gate this).
+
+``ATOM_DSV41_MONO_BACKEND=aiter`` (``aiter_gate``) keeps this routing and runs
+the target's layers on AITER's routed decode-layer ops (``aiter_runner``)
+instead of ATOM's K1 / K2; the default ("atom") is unchanged.
 """
 
 import logging
@@ -23,7 +27,7 @@ import logging
 import torch
 from torch import nn
 
-from atom.models.deepseek_v41.mono import hi_gate
+from atom.models.deepseek_v41.mono import aiter_gate, hi_gate
 from atom.models.deepseek_v41.mono.config import (
     MAX_MOE_ROWS,
     MAX_REQUESTS,
@@ -79,15 +83,18 @@ class MonoDecodeModel(nn.Module):
         max_model_len: int,
         index_fp4: bool,
         dp_ranks: int,
+        create=None,
     ) -> None:
         super().__init__()
         self.model = model
         self._drafter = drafter
         # DP attention's ranks, 0 without it (``step_supported``)
         self._dp_ranks = dp_ranks
-        # created on its first eligible step (``LazyRunner``)
+        # created on its first eligible step (``LazyRunner``): ATOM's in-tree
+        # K1 / K2 unless ``create`` names another runner (``aiter_runner``)
         self._mono = LazyRunner(
-            lambda: V41MonoDecodeRunner(model, drafter, max_model_len, index_fp4),
+            create
+            or (lambda: V41MonoDecodeRunner(model, drafter, max_model_len, index_fp4)),
             "V4.1 mono decode",
         )
 
@@ -151,6 +158,55 @@ class MonoDraftModel(nn.Module):
             return getattr(self.model, name)
 
 
+def _install_aiter(model, atom_config, drafter, dp_ranks):
+    """``ATOM_DSV41_MONO_BACKEND=aiter``: the target's layers on AITER's routed
+    decode-layer ops (``aiter_runner``), the provider enabled through
+    ``aiter.plugin.configure()``; the DSpark draft on ATOM's mono as before.
+    An explicit backend outranks the hi monokernels' "auto" (hi "1" with it is
+    a conflict). None when it does not serve and strict mode is off: the
+    caller goes on as without it."""
+    if hi_gate.mode() == "1":
+        raise RuntimeError(
+            "ATOM_DSV41_MONO_HI=1 and ATOM_DSV41_MONO_BACKEND=aiter both claim "
+            "the V4.1 decoder layers: pick one"
+        )
+    try:
+        ops = aiter_gate.load_ops()
+        unavailable = None
+    except aiter_gate.Unavailable as error:
+        ops, unavailable = None, str(error)
+    why = unavailable or aiter_gate.refusal(atom_config, dp_ranks, ops)
+    if why is not None:
+        if aiter_gate.strict():
+            raise RuntimeError(f"ATOM_DSV41_MONO_BACKEND=aiter, but: {why}")
+        hi_gate.log_once(
+            logging.WARNING,
+            "V4.1 mono aiter backend off (ATOM_DSV41_MONO_AITER_STRICT=0): %s",
+            why,
+        )
+        return None
+    enabled = aiter_gate.configure(ops)
+    hi_gate.log_once(
+        logging.INFO,
+        "V4.1 mono decode: layers on AITER's deepseek_v41_decode ops, providers "
+        "enabled %s (strict %s); hi monokernels off",
+        list(enabled),
+        aiter_gate.strict(),
+    )
+    from atom.models.deepseek_v41.mono.aiter_runner import create_runner
+
+    if drafter is not None and hasattr(drafter.model, "block_backbone"):
+        drafter.model = MonoDraftModel(drafter.model, dp_ranks)
+    return MonoDecodeModel(
+        model,
+        drafter,
+        atom_config.max_model_len,
+        atom_config.index_cache_dtype == "fp4",
+        dp_ranks,
+        create=lambda: create_runner(model, drafter),
+    )
+
+
 def install_mono_decode(
     model: nn.Module, atom_config, drafter, *, metadata_builder=None
 ) -> nn.Module:
@@ -165,15 +221,24 @@ def install_mono_decode(
         )
 
         return install_single_step(model, atom_config, drafter)
+    use_aiter = aiter_gate.selected()
     why = config_refusal(atom_config)
     if why is not None:
         if hi_gate.mode() == "1":
             raise RuntimeError(
                 f"ATOM_DSV41_MONO_HI=1, but V4.1 mono decode is off: {why}"
             )
+        if use_aiter and aiter_gate.strict():
+            raise RuntimeError(
+                f"ATOM_DSV41_MONO_BACKEND=aiter, but V4.1 mono decode is off: {why}"
+            )
         logger.info("V4.1 mono decode off: %s", why)
         return model
     dp_ranks = dp_attention_ranks(atom_config)
+    if use_aiter:
+        installed = _install_aiter(model, atom_config, drafter, dp_ranks)
+        if installed is not None:
+            return installed
     # The decoder layers on the high-interactivity monokernels where they serve
     # this deployment (``hi_gate``: ATOM_DSV41_MONO_HI, "auto" by default); any
     # other takes ATOM's mono decode below, unchanged.
