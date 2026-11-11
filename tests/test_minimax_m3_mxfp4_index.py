@@ -90,7 +90,7 @@ def _record(running, S, bound, heads=HEADS, prefill_rows=0):
     filled, here with values no selector may read (NaN, +-inf, a huge finite)."""
     from aiter.ops.flydsl import minimax_m3_index_score_work_map_capacity
 
-    from atom.model_ops.minimax_m3.sparse_attn import IndexScoreBuffers
+    from atom.model_ops.minimax_m3.index_buffers import IndexScoreBuffers
     from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace
 
     rows = minimax_m3_index_score_work_map_capacity(running, bound, S, heads)

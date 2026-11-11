@@ -307,16 +307,32 @@ def test_the_row_rule_and_its_refusal_are_the_mxfp4_indexs(
     assert seen[0]["seq_lens"].shape[0] == want
 
 
+def test_the_scorer_record_is_immutable_and_builds_without_aiter():
+    """`IndexScoreBuffers` lives in a module that imports no aiter, so the non-GPU
+    suite can build it; a step's record is the builder's with its map replaced."""
+    from dataclasses import FrozenInstanceError, replace
+
+    from atom.model_ops.minimax_m3.index_buffers import IndexScoreBuffers
+
+    scores, wmap = LogitsWorkspace(4, "cpu"), torch.zeros(8, 2)
+    builder_record = IndexScoreBuffers(scores, wmap, 37)
+    step = replace(builder_record, work_map=wmap[:3])
+    assert (
+        step.scores is scores and step.max_block == 37 and step.work_map.shape == (3, 2)
+    )
+    assert builder_record.work_map is wmap
+    with pytest.raises(FrozenInstanceError):
+        builder_record.max_block = 1
+
+
 def test_the_scorer_gets_the_step_records_of_the_metadata_not_the_impls_own():
     """The map, its bound and the workspace travel as one record on the metadata; the
     impl derives none of them (a length source of its own that drifted would fail
     every decode's exact check)."""
     pytest.importorskip("aiter")
     from atom.model_ops import attention_mha
-    from atom.model_ops.minimax_m3.sparse_attn import (
-        IndexScoreBuffers,
-        MiniMaxM3SparseMetadata,
-    )
+    from atom.model_ops.minimax_m3.index_buffers import IndexScoreBuffers
+    from atom.model_ops.minimax_m3.sparse_attn import MiniMaxM3SparseMetadata
 
     impl = object.__new__(attention_mha.SparseMHAPagedAttentionImpl)
     impl.kv_cache_dtype, impl.index_cache_dtype = "bf16", "fp4"
@@ -346,6 +362,7 @@ def test_the_decode_metadata_builds_the_map_into_the_records_buffer(monkeypatch)
     from aiter.ops import flydsl
 
     from atom.model_ops.minimax_m3 import sparse_attn
+    from atom.model_ops.minimax_m3.index_buffers import IndexScoreBuffers
 
     built = []
 
@@ -359,7 +376,7 @@ def test_the_decode_metadata_builds_the_map_into_the_records_buffer(monkeypatch)
     monkeypatch.setattr(
         sparse_attn, "build_n_valid_column_per_row", lambda *a, **k: None
     )
-    record = sparse_attn.IndexScoreBuffers(
+    record = IndexScoreBuffers(
         scores=LogitsWorkspace(4, "cpu"), work_map=torch.zeros(8, 2), max_block=37
     )
 
@@ -500,7 +517,7 @@ def test_the_scorer_writes_a_contiguous_view_of_the_shared_workspace(
     of the workspace's head (the layout the aiter selector needs), the selection
     reads that same tensor, and a workspace too small for the step is refused rather
     than overrun."""
-    from atom.model_ops.minimax_m3.sparse_attn import IndexScoreBuffers
+    from atom.model_ops.minimax_m3.index_buffers import IndexScoreBuffers
 
     call, seen, (heads, rows, width) = _scorer_call(monkeypatch, phase)
     wmap = torch.zeros(2, 2)  # decode only
@@ -520,7 +537,7 @@ def test_the_scorer_writes_a_contiguous_view_of_the_shared_workspace(
 def test_the_mxfp4_decode_refuses_a_step_without_its_scorer_record(monkeypatch):
     """No quiet per-call allocation any more: without the record (or its map) the
     decode scorer refuses, and so does a context wider than the map's bound."""
-    from atom.model_ops.minimax_m3.sparse_attn import IndexScoreBuffers
+    from atom.model_ops.minimax_m3.index_buffers import IndexScoreBuffers
 
     call, _, (heads, rows, width) = _scorer_call(monkeypatch, "decode")
     ws = LogitsWorkspace(heads * rows * width, "cpu")

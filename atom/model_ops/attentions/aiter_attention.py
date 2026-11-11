@@ -15,8 +15,8 @@ from atom.config import _is_minimax_m3_config
 from atom.distributed.ulysses_sp import local_num_kv_heads
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mha import PagedAttentionImpl, use_pa_decode_bf16_asm
+from atom.model_ops.minimax_m3.index_buffers import IndexScoreBuffers
 from atom.model_ops.minimax_m3.sparse_attn import (
-    IndexScoreBuffers,
     make_sparse_decode_metadata,
     make_sparse_prefill_metadata,
 )

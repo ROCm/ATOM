@@ -23,8 +23,8 @@ import triton.language as tl
 from aiter.ops.attention import pa_fwd_asm_supports_arch
 
 from atom.model_ops.minimax_m3.geometry import SPARSE_BLOCK_SIZE
+from atom.model_ops.minimax_m3.index_buffers import IndexScoreBuffers
 from atom.model_ops.minimax_m3.index_topk import build_n_valid_column_per_row
-from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace
 
 # Page-16 SHUFFLE layout for the AITER paged-attention path. The KV
 # cache is allocated with physical page size 16 (the ASM kernel page), and each
@@ -76,26 +76,6 @@ class MiniMaxM3SparseDecodeMetadata:
     block_table: torch.Tensor
     # Query tokens per request: 1 == plain decode, num_spec+1 == eagle3 verify.
     max_query_len: int = 1
-
-
-@dataclass(frozen=True)
-class IndexScoreBuffers:
-    """The MXFP4 index scorer's persistent state, one immutable record so that none of
-    its parts can be present without the others.
-
-    ``scores`` is the `LogitsWorkspace` every layer's scorer writes its fp32 block
-    scores into (the same plane the other indexers use), viewed contiguous
-    ``[heads, rows, width]`` -- the layout aiter's selector needs. Never filled: the
-    selectors read a row only up to its valid blocks, which the scorer writes every
-    step. ``work_map`` is the decode scorer's dispatch map and ``max_block`` the block
-    count it was built at, which the scorer checks for an exact match and which must
-    not move between graph replays: the builder holds the capacity buffer, the step's
-    metadata the map built into it. A prefill step's record has neither.
-    """
-
-    scores: LogitsWorkspace
-    work_map: torch.Tensor | None = None
-    max_block: int = 0
 
 
 @dataclass
