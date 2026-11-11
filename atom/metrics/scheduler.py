@@ -99,7 +99,7 @@ class SchedulerMetrics:
             multiprocess_mode="livesum",
         ).labels(**labels)
         self.pd_admission_deferred = Counter(
-            "atom:pd_admission_deferred_total",
+            "atom:pd_admission_deferred",
             "PD requests deferred by a credit limit, counted once per request and limit.",
             [*labels, "reason"],
             registry=registry,
@@ -112,7 +112,7 @@ class SchedulerMetrics:
             registry=registry,
         ).labels(**labels)
         self.pd_admission_oversized = Counter(
-            "atom:pd_admission_oversized_total",
+            "atom:pd_admission_oversized",
             "Isolated PD requests allowed above the soft receive-byte limit.",
             labels,
             registry=registry,

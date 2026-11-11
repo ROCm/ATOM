@@ -101,9 +101,9 @@ Observed in each scheduler; exported per DP rank. All carry
 | `atom:pd_kv_transfer_seconds` | Histogram, s | Decode-side PD KV load wait until all workers report completion; includes dispatch, handshake and notification. Successful loads only. |
 | `atom:pd_admission_pending_requests` | Gauge, requests | Decode-side PD requests holding admission credits, by `state` (`receiving`, `ready`, `cancel_draining`). |
 | `atom:pd_admission_pending_kv_bytes` | Gauge, bytes | Physical receive-target bytes those requests hold, per D rank. |
-| `atom:pd_admission_deferred_total` | Counter, requests | Requests deferred by an admission limit, once per request and `reason` (`bytes`). |
+| `atom:pd_admission_deferred` | Counter, requests | Requests deferred by an admission limit, once per request and `reason` (`bytes`). |
 | `atom:pd_admission_credit_wait_seconds` | Histogram, s | First deferral to admission; 0 when admitted at once. |
-| `atom:pd_admission_oversized_total` | Counter, requests | Isolated requests admitted above the byte budget. |
+| `atom:pd_admission_oversized` | Counter, requests | Isolated requests admitted above the byte budget. |
 | `atom:pd_admission_ready_wait_seconds` | Histogram, s | Receive completion to first scheduled local forward. |
 | `atom:decode_batch_size` | Histogram, requests | Real decode request rows per forward (`ScheduledBatch.total_seqs_num_decode`). Excludes dummy work and graph padding. |
 | `atom:prefill_request_tokens` | Histogram, tokens | `num_prompt_tokens - batch.num_cached_tokens` at first local prefill dispatch, floored at 0. Once per request. |
@@ -200,8 +200,8 @@ Summed across DP ranks by `LLMEngine.get_metrics_statistics()`.
 | `atom:requests_partial_prefill` | Gauge, requests | Requests currently in chunked prefill. |
 | `atom:kv_cache_blocks_used` / `_free` / `_total` / `_indexed` | Gauge, blocks | Aggregate KV block pool. `indexed` = blocks reachable by prefix hash; it spans both in-use and free blocks and is **not** an occupancy figure. |
 | `atom:kv_cache_usage_ratio` | Gauge, ratio | Fraction of KV blocks currently allocated. |
-| `atom:requests_deferred_free` | Gauge, requests | Finished or aborted requests whose KV blocks are held until every transfer reading or writing them completes. |
-| `atom:kv_cache_blocks_deferred_free` | Gauge, blocks | Physical KV blocks those requests hold, shared prefix blocks counted once. On P/D prefill this is the source KV decode has not pulled yet. |
+| `atom:requests_deferred_free` | Gauge, requests | Finished or aborted requests kept allocated as a whole until every connector releases them. Early-release offload leases are omitted: those blocks return once every rank has read them, before the store finishes. |
+| `atom:kv_cache_blocks_deferred_free` | Gauge, blocks | Physical KV blocks those requests hold, shared prefix blocks counted once. On P/D prefill this is the source KV decode has not pulled yet. A whole-request offload save is included; an early-release lease is not. |
 | `atom:requests_finished` | Counter, requests | Requests completed by the scheduler. |
 | `atom:prompt_tokens` / `atom:generation_tokens` | Counter, tokens | Tokens in completed requests. |
 | `atom:preemptions` | Counter | Scheduler preemptions. |

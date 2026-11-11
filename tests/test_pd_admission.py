@@ -95,6 +95,22 @@ def build(monkeypatch, mooncake_module, seq_factory):
     return make
 
 
+def admission_total(metrics, name, **extra):
+    """Value of one admission counter on this scheduler's own metrics object.
+
+    A counter stored already labelled (no further labels) reports samples with
+    empty labels; one that still takes a label reports the full set.
+    """
+    want = {**metrics._labels, **extra}
+    for family in getattr(metrics, name).collect():
+        for sample in family.samples:
+            if not sample.name.endswith("_total"):
+                continue
+            if sample.labels == want or sample.labels == extra:
+                return sample.value
+    return 0.0
+
+
 def receive_success(seq, *, as_str=False):
     """A terminal worker report; chunked handoff follows the real wire contract."""
     return KVConnectorOutput(
@@ -171,12 +187,16 @@ def test_bytes_limit_and_isolated_large_request(build, chunked):
     assert a.block_table and not b.block_table
     sched.schedule()
     assert not b.block_table
+    # B waited two passes; it is one deferred request, not two attempts.
+    assert admission_total(sched.metrics, "pd_admission_deferred", reason="bytes") == 1
     sched._update_from_kv_xfer_finished(receive_success(a))
     sched.schedule()
     sched.schedule()
     # Alone, B is admitted past the 3072-byte limit.
     assert b.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
     assert sched.pd_admission.pending_bytes == 4096
+    assert admission_total(sched.metrics, "pd_admission_oversized") == 1
+    assert admission_total(sched.metrics, "pd_admission_deferred", reason="bytes") == 1
 
 
 @pytest.mark.parametrize("fraction", [None, 0.25])
@@ -623,3 +643,18 @@ def test_admission_metrics_follow_credit_lifecycle(monkeypatch):
     # SEQ entered at once; OTHER waited from its first deferral at t=100.
     assert sample("credit_wait_seconds_count") == 2
     assert sample("credit_wait_seconds_sum") == 5
+    policy.release(other)
+    # Nothing pending, so one request may pass the byte budget.
+    huge = SizedSeq(id=3, block_table=[4, 5, 6])
+    assert try_admit(policy, huge)
+    assert sample("oversized_total") == 1
+    assert sample("pending_requests", state="receiving") == 1
+    policy.cancel(huge)
+    assert sample("pending_requests", state="cancel_draining") == 1
+    assert sample("pending_requests", state="receiving") == 0
+
+
+def test_scheduler_hands_its_metrics_to_admission(build):
+    sched, _ = build()
+    assert sched.pd_admission is not None
+    assert sched.pd_admission.metrics is sched.metrics

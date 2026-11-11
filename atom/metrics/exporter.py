@@ -124,12 +124,12 @@ class _AtomMetricsCollector:
             ),
             (
                 "atom:requests_deferred_free",
-                "Finished or aborted requests whose KV blocks are held until every transfer reading or writing them completes.",
+                "Finished or aborted requests kept allocated as a whole until every connector releases them. Omits early-release offload leases.",
                 snapshot.get("requests_deferred_free", 0),
             ),
             (
                 "atom:kv_cache_blocks_deferred_free",
-                "Physical KV blocks held by those requests; on P/D prefill, the source KV decode has not pulled yet.",
+                "Physical KV blocks those requests hold, shared prefixes counted once. On P/D prefill, source KV decode has not pulled yet. Omits early-release leases.",
                 snapshot.get("kv_blocks_deferred_free", 0),
             ),
         )
