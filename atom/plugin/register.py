@@ -164,9 +164,7 @@ def _register_custom_attention_to_sglang() -> None:
                 create_dsv4_backend as create_native_dsv4_backend,
             )
 
-            logger.info(
-                "Use native SGLang DSV4 attention for the DSpark draft"
-            )
+            logger.info("Use native SGLang DSV4 attention for the DSpark draft")
             return create_native_dsv4_backend(runner)
         if any("DeepseekV4" in str(arch) for arch in arches):
             logger.info(
@@ -189,9 +187,7 @@ def _register_custom_attention_to_sglang() -> None:
                 create_dsv4_backend as create_native_dsv4_backend,
             )
 
-            logger.info(
-                "Use native SGLang DSV4 attention for the DSpark draft"
-            )
+            logger.info("Use native SGLang DSV4 attention for the DSpark draft")
             return create_native_dsv4_backend(runner)
         logger.info(
             "Create ATOMDeepseekV4BackendForSgl through SGLang dsv4 backend choice"
