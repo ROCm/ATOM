@@ -5896,6 +5896,15 @@ def _k3_scheduler() -> KimiK3OffloadScheduler:
     return s
 
 
+def test_only_k3_scales_the_default_pending_saves_with_pp(monkeypatch):
+    monkeypatch.delenv("OFFLOAD_MAX_PENDING_SAVES", raising=False)
+    monkeypatch.setenv("OFFLOAD_COPY_WORKERS", "1")
+    monkeypatch.setattr(DenseOffloadScheduler, "__init__", lambda self, config: None)
+    config = SimpleNamespace(kv_transfer_config={}, pipeline_parallel_size=8)
+    assert KimiK3OffloadScheduler(config)._max_pending_saves == 16
+    assert QwenOffloadScheduler(config)._max_pending_saves == 2
+
+
 def _k3_seq(*, hbm: int, joint: int = 0, kv: int = 0, claimed: int = 0):
     return SimpleNamespace(
         id=1,
