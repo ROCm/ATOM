@@ -2,6 +2,7 @@
 """OPUS gfx950 cache ABI: full permutations, not just equal tensor sizes."""
 
 from dataclasses import replace
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
@@ -137,7 +138,10 @@ def test_dcp_prefill_preserves_opus_rows_and_all_four_exponents(monkeypatch):
 
 
 @pytest.mark.parametrize("rope,dcp", [(0, 1), (64, 1), (0, 8), (64, 8)])
-def test_native_forward_reaches_aiter_opus_writer(monkeypatch, rope, dcp):
+@pytest.mark.parametrize("short_slots", [False, True])
+def test_native_forward_reaches_aiter_hip_opus_writer(
+    monkeypatch, rope, dcp, short_slots
+):
     if not torch.cuda.is_available() or not torch.version.hip:
         pytest.skip("requires gfx950")
     from atom.model_ops import attention_mla
@@ -154,6 +158,8 @@ def test_native_forward_reaches_aiter_opus_writer(monkeypatch, rope, dcp):
     cache = torch.full((1, 4, 64, 16), 0xA5, device="cuda", dtype=torch.uint8)
     scales = torch.full((1, 2, 32, 4), 0xA5, device="cuda", dtype=torch.uint8)
     slots = torch.tensor([-1, 1, -1, 3, -1, 5], device="cuda", dtype=torch.int64)
+    if short_slots:
+        slots = slots[:-2]
     norm = torch.ones(128, device="cuda", dtype=torch.float32)
     pos = torch.arange(rows, device="cuda", dtype=torch.int64)
     cos = torch.ones((rows, 32), device="cuda", dtype=torch.bfloat16)
@@ -184,7 +190,8 @@ def test_native_forward_reaches_aiter_opus_writer(monkeypatch, rope, dcp):
         emitted.append((args[1], args[3], kwargs["q_scale_out"]))
 
     monkeypatch.setattr(attention_mla, "_indexer_qk_rope_quant_and_cache", observe)
-    mod.sparse_attn_indexer(
+    forward = partial(
+        mod.sparse_attn_indexer,
         k,
         "indexer.k_cache",
         cache,
@@ -212,9 +219,45 @@ def test_native_forward_reaches_aiter_opus_writer(monkeypatch, rope, dcp):
         False,
         kv_cache_scale=scales,
     )
+    forward()
     assert len(emitted) == 1
-    q_out, weights_out, q_scales = emitted[0]
-    assert (q_out == 0x66).all() and (q_scales == 125).all()
-    torch.testing.assert_close(weights_out, weights, rtol=0, atol=0)
-    assert (cache[0, :, [0, 2, 4], :] == 0xA5).all()
-    assert (cache[0, :, [1, 3, 5], :] == 0x66).all()
+
+    def check(q_byte):
+        q_out, weights_out, q_scales = emitted[-1]
+        assert (q_out == q_byte).all() and (q_scales == 125).all()
+        torch.testing.assert_close(weights_out, weights, rtol=0, atol=0)
+        owned = slots[slots >= 0]
+        untouched = torch.ones(64, device="cuda", dtype=torch.bool)
+        untouched[owned] = False
+        assert (cache[0, :, untouched, :] == 0xA5).all()
+        assert (cache[0, :, owned, :] == 0x66).all()
+        expected_scales = torch.full((64, 4), 0xA5, device="cuda", dtype=torch.uint8)
+        expected_scales[owned] = 125
+        natural_scales = (
+            scales.reshape(1, 2, 32, 2, 2).permute(0, 4, 2, 3, 1).reshape(64, 4)
+        )
+        assert torch.equal(natural_scales, expected_scales)
+
+    check(0x66)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        forward()
+    q.neg_()
+    weights.neg_()
+    slots.copy_(torch.where(slots >= 0, slots + 2, slots))
+    cache.fill_(0xA5)
+    scales.fill_(0xA5)
+    torch.cuda.synchronize()
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CUDA]
+    ) as prof:
+        graph.replay()
+        torch.cuda.synchronize()
+    kernels = [
+        event.name
+        for event in prof.events()
+        if event.device_type == torch.autograd.DeviceType.CUDA
+    ]
+    assert len(kernels) == 1, kernels
+    assert "indexer_qk_rope_quant_and_cache_kernel" in kernels[0], kernels
+    check(0xEE)

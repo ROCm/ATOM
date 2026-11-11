@@ -15,9 +15,14 @@ quantized Q latent remains unsupported by Mono.
 
 The native prefill/fallback path uses the same resolved layout. It requires
 AITER's `mqa_logits_mxfp4_config` / `mqa_logits_mxfp4` API from PR 6952 and
-the `scale_layout="opus"` mode of `indexer_qk_rope_quant_and_cache`.
-The DSA writer extension is a separate AITER change; PR 7128's V4 query and
-compressor writers alone do not provide this entry point.
+the HIP `scale_layout="opus"` mode of `indexer_qk_rope_quant_and_cache` from
+[AITER PR 7798](https://github.com/ROCm/aiter/pull/7798). This replaces the
+Triton companion PR 7730 without changing the ATOM call or OPUS cache ABI.
+Use the matching AITER Python sources and rebuilt `module_cache` extension;
+an older cached binary is not compatible with the extended HIP signature.
+PR 7128's V4 query and compressor writers alone do not provide this entry
+point. Mono still performs its own fused cache write; this dependency selects
+the native prefill/fallback writer, not a different Mono kernel.
 `Config` resolves the layout once and passes it to every TP/DCP worker and
 the offload namespace. Never change it on a live cache or reuse a legacy
 FlyDSL FP4 cache. The default remains `preshuffle`. FP8 also receives

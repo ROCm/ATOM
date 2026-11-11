@@ -41,13 +41,13 @@ def require_opus_api() -> None:
         raise RuntimeError(
             "The mfma index layout requires the mqa_logits_mxfp4 API from AITER"
         )
-    if (
-        "scale_layout"
-        not in inspect.signature(indexer_qk_rope_quant_and_cache).parameters
+    if not {"scale_layout", "rope_dim"}.issubset(
+        inspect.signature(indexer_qk_rope_quant_and_cache).parameters
     ):
         raise RuntimeError(
-            "The mfma index layout requires AITER's OPUS indexer cache writer "
-            "with scale_layout support; upgrade AITER before enabling it"
+            "The mfma index layout requires AITER's HIP OPUS indexer cache "
+            "writer with scale_layout and rope_dim support (ROCm/aiter#7798); "
+            "upgrade AITER and rebuild module_cache before enabling it"
         )
 
 
