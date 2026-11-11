@@ -60,8 +60,15 @@ def _mxfp4_kv_refusal(config) -> str | None:
 
 def validate_runtime_config(config):
     """Refuse MiniMax-M3's MXFP4 caches where they cannot run, at startup rather
-    than in the first forward (``--kv-cache-dtype fp4`` and
-    ``--index-cache-dtype fp4``)."""
+    than in the first forward. The rules, stated here and in the configuration guide
+    and nowhere else; nothing falls back to FP8:
+
+    - both caches: native ATOM (not the vLLM/SGLang bridges), ``--block-size 128``,
+      gfx950;
+    - ``--kv-cache-dtype fp4`` also: ``--index-cache-dtype fp4`` (not defaulted),
+      every attention layer an indexed sparse one (M3.1), a bf16 model, no KV offload
+      or ``--kv-transfer-config``, and no speculative draft left with FP4 KV.
+    """
     from atom.config import is_plugin_mode
 
     kv_fp4 = config.kv_cache_dtype == "fp4"

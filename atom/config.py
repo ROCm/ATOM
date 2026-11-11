@@ -1947,10 +1947,8 @@ def qrep_for_step(
 
 def _check_fp4_kv(kv_cache_dtype: str, *, is_m3: bool, is_v41: bool) -> None:
     """``--kv-cache-dtype fp4`` is MiniMax-M3's to ask for and DeepSeek-V4.1's own;
-    refused elsewhere. Asking is not being served: ``minimax_m3.config.
-    validate_runtime_config`` then takes only the all-indexed-sparse MiniMax-M3.1 and
-    refuses M3's original dense-attention checkpoints. The index ``fp4`` is left as
-    it is: its layout is per model."""
+    refused elsewhere. What M3 then serves is ``minimax_m3.config.
+    validate_runtime_config``'s."""
     if kv_cache_dtype == "fp4" and not (is_m3 or is_v41):
         raise ValueError(
             "--kv-cache-dtype fp4 is supported by MiniMax-M3 and DeepSeek-V4.1 only"
