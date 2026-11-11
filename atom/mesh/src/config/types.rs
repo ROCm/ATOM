@@ -116,7 +116,7 @@ pub const DEFAULT_PREPARE_QUEUE_TIMEOUT_MS: u64 = 250;
 /// Default `--prepare-timeout-ms`.
 pub const DEFAULT_PREPARE_TIMEOUT_MS: u64 = 5000;
 /// Default `--prepare-max-tokenize-bytes`.
-pub const DEFAULT_MAX_TOKENIZE_BYTES: usize = 1024 * 1024;
+pub const DEFAULT_MAX_TOKENIZE_BYTES: usize = 4 * 1024 * 1024;
 /// Waiting jobs per preparation thread when `--prepare-queue-capacity` is unset.
 pub const PREPARE_QUEUE_SLOTS_PER_WORKER: usize = 10;
 
@@ -585,7 +585,7 @@ mod tests {
         assert_eq!(pool.queue_timeout, Duration::from_millis(250));
         assert_eq!(pool.prepare_timeout, Duration::from_secs(5));
         assert_eq!(config.prepare_pool.queue_capacity, None);
-        assert_eq!(config.resolved_max_tokenize_bytes(), 1024 * 1024);
+        assert_eq!(config.resolved_max_tokenize_bytes(), 4 * 1024 * 1024);
         let mut legacy = serde_json::to_value(&config).unwrap();
         legacy.as_object_mut().unwrap().remove("prepare_pool");
         let restored: RouterConfig = serde_json::from_value(legacy).unwrap();
@@ -627,7 +627,7 @@ mod tests {
         config.ext_proc.max_tokenize_bytes = Some(4096);
         // Merely compiling ext-proc must not change the ordinary HTTP limits.
         assert_eq!(config.resolved_prepare_workers(), workers);
-        assert_eq!(config.resolved_max_tokenize_bytes(), 1024 * 1024);
+        assert_eq!(config.resolved_max_tokenize_bytes(), 4 * 1024 * 1024);
         config.ext_proc.enabled = true;
         assert_eq!(config.resolved_prepare_workers(), 3);
         assert_eq!(config.resolved_prepare_pool().unwrap().queue_capacity, 30);

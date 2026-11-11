@@ -433,7 +433,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tokenization_rejects_oversized_text_and_rendered_chat_prompt() {
+    async fn oversized_text_and_rendered_chat_prompt_route_on_text() {
         let mut config = crate::config::RouterConfig::default();
         config.policy = crate::config::PolicyConfig::PrefixHash {
             prefix_token_count: 4,
@@ -462,13 +462,12 @@ mod tests {
             request
                 .replace_body(body.as_bytes().to_vec(), 1024)
                 .unwrap();
-            let error = parser
+            let (_, input) = parser
                 .parse(request, parser.pool.prepare_deadline())
                 .await
-                .err()
                 .unwrap();
-            assert_eq!(error.status, 413);
-            assert_eq!(error.code, "tokenizer_input_too_large");
+            assert_eq!(input.tokens, None, "{path}");
+            assert!(!input.metadata.text.is_empty(), "{path}");
         }
     }
 

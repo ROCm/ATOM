@@ -260,10 +260,9 @@ Supported tool parsers: `json`, `python`, `xml`.
 
 In PD mode, use `--prefill-policy` and `--decode-policy` for per-mode overrides.
 
-`prefix_hash` routes on exact request tokens. Messages and Responses have no
-registered token-routing template, so under `prefix_hash` they return
-`501 token_routing_unsupported`. Use a policy that does not need tokens, such as
-`cache_aware` or `round_robin`, for models served through these APIs.
+`prefix_hash` hashes the leading request tokens. When the router cannot make
+them (Messages/Responses, no registered tokenizer or chat template, input over
+`--prepare-max-tokenize-bytes`), it hashes the leading request text instead.
 
 ## Reliability
 
@@ -280,7 +279,10 @@ registered token-routing template, so under `prefix_hash` they return
   `--prepare-queue-timeout-ms` deadline (default: 250 ms); canceled waiters release
   their slot immediately. All request parsing runs on this pool. Each request's
   preparation shares one `--prepare-timeout-ms` deadline (default: 5000 ms), and
-  tokenization input is limited by `--prepare-max-tokenize-bytes` (default: 1 MiB).
+  tokenization input is limited by `--prepare-max-tokenize-bytes` (default: 4 MiB).
+  A request the router cannot tokenize (Messages/Responses, no registered
+  tokenizer or chat template, input over that limit) is routed on its text, not
+  rejected; `mesh_prepare_token_fallback_total{reason}` counts these requests.
   When ext-proc is enabled, the legacy `--ext-proc-parser-concurrency` and
   `--ext-proc-max-tokenize-bytes` options apply only if the corresponding
   `--prepare-*` option is unset; neither has a default of its own. On shutdown,

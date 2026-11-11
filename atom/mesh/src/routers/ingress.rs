@@ -629,11 +629,6 @@ impl IngressRouting {
         }
     }
 
-    #[cfg(feature = "ext-proc")]
-    pub(crate) fn needs_tokens(&self, model: Option<&str>) -> bool {
-        self.requirements(model).1
-    }
-
     /// Validate the request against this topology and prepare what its policy needs.
     pub(crate) fn prepare(
         &self,
@@ -658,7 +653,7 @@ impl IngressRouting {
         Ok(self.requirements(metadata.model.as_deref()))
     }
 
-    /// Routing text, and tokens when `needs_tokens`, for an admitted request.
+    /// Routing text, and tokens when `needs_tokens` and they can be made here.
     fn prepare_text_and_tokens(
         &self,
         parsed: &ParsedInference,
@@ -667,7 +662,7 @@ impl IngressRouting {
     ) -> Result<RoutingPreparation, IngressError> {
         let metadata = parsed.metadata();
         let tokens = if needs_tokens {
-            Some(self.tokens(parsed, &metadata, ctx)?)
+            self.tokens(parsed, &metadata, ctx)?
         } else {
             None
         };
@@ -762,47 +757,45 @@ impl IngressRouting {
         Ok(())
     }
 
+    /// Exact routing tokens, or `None` when they cannot be made here; the
+    /// policy then routes on the request text and the backend validates the request.
     fn tokens(
         &self,
         parsed: &ParsedInference,
         metadata: &InferenceMetadata,
         ctx: &JobContext,
-    ) -> Result<Vec<u32>, IngressError> {
+    ) -> Result<Option<Vec<u32>>, IngressError> {
         ctx.check()?;
         if let Some(ids) = parsed.input_tokens().map_err(IngressError::invalid)? {
-            return Ok(ids);
+            return Ok(Some(ids));
         }
         if matches!(
             parsed,
             ParsedInference::Messages(_) | ParsedInference::Responses(_)
         ) {
-            return Err(IngressError::new(http::StatusCode::NOT_IMPLEMENTED, "token_routing_unsupported", "this API has no registered token-routing template; use a policy that does not require exact tokens"));
+            return Ok(token_fallback("unsupported_api"));
         }
-        let entry = metadata
-            .model
-            .as_deref()
-            .and_then(|m| {
-                self.tokenizer_registry
-                    .get_by_name(m)
-                    .or_else(|| self.tokenizer_registry.get_by_id(m))
-            })
-            .ok_or_else(|| {
-                IngressError::new(
-                    http::StatusCode::SERVICE_UNAVAILABLE,
-                    "tokenizer_unavailable",
-                    "token routing requires input_ids or a model with a registered tokenizer",
-                )
-            })?;
+        let Some(entry) = metadata.model.as_deref().and_then(|m| {
+            self.tokenizer_registry
+                .get_by_name(m)
+                .or_else(|| self.tokenizer_registry.get_by_id(m))
+        }) else {
+            return Ok(token_fallback("no_tokenizer"));
+        };
         let limit = self.max_tokenize_bytes;
         if metadata.text.len() > limit {
-            return Err(IngressError::tokenizer_input_too_large());
+            return Ok(token_fallback("too_large"));
         }
         ctx.check()?;
         let template_started = Instant::now();
         let prompt = if let Some(chat) = parsed.chat() {
-            super::prepare::chat_template::process_chat_messages(chat, &*entry.tokenizer)
-                .map_err(IngressError::invalid)?
-                .text
+            match super::prepare::chat_template::process_chat_messages(chat, &*entry.tokenizer) {
+                Ok(processed) => processed.text,
+                Err(error) => {
+                    tracing::debug!(%error, "chat template failed; routing on text");
+                    return Ok(token_fallback("template"));
+                }
+            }
         } else {
             metadata.text.clone()
         };
@@ -810,19 +803,27 @@ impl IngressRouting {
             .record(template_started.elapsed().as_secs_f64());
         ctx.check()?;
         if prompt.len() > limit {
-            return Err(IngressError::tokenizer_input_too_large());
+            return Ok(token_fallback("too_large"));
         }
         let encoder = super::prepare::thread_tokenizer::encoder(&entry);
         let encode_started = Instant::now();
-        let tokens = encoder
-            .encode(&prompt, false)
-            .map_err(|e| IngressError::invalid(e.to_string()))?
-            .token_ids()
-            .to_vec();
+        let encoded = encoder.encode(&prompt, false);
         metrics::histogram!("mesh_prepare_stage_seconds", "stage" => "encode")
             .record(encode_started.elapsed().as_secs_f64());
-        Ok(tokens)
+        match encoded {
+            Ok(encoding) => Ok(Some(encoding.token_ids().to_vec())),
+            Err(error) => {
+                tracing::debug!(%error, "encode failed; routing on text");
+                Ok(token_fallback("encode"))
+            }
+        }
     }
+}
+
+/// Count a request that is routed without exact tokens.
+fn token_fallback(reason: &'static str) -> Option<Vec<u32>> {
+    metrics::counter!("mesh_prepare_token_fallback_total", "reason" => reason).increment(1);
+    None
 }
 
 #[cfg(test)]

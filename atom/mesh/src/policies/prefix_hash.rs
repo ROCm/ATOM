@@ -34,6 +34,11 @@ use std::sync::Arc;
 use super::{LoadBalancingPolicy, SelectWorkerInfo};
 use crate::{core::Worker, observability::metrics::MeshMetrics};
 
+/// Text bytes taken per configured prefix token when hashing text instead.
+const TEXT_BYTES_PER_TOKEN: usize = 4;
+/// Keeps text-prefix keys apart from token-prefix keys on the ring.
+const TEXT_PREFIX_SEED: u64 = 0x7465_7874;
+
 /// Configuration for the PrefixHash load balancing policy
 #[derive(Debug, Clone)]
 pub struct PrefixHashConfig {
@@ -110,6 +115,15 @@ impl PrefixHashPolicy {
 
         let bytes: &[u8] = bytemuck::cast_slice(prefix);
         xxhash_rust::xxh3::xxh3_64(bytes)
+    }
+
+    /// Hash of the text prefix, for requests the ingress could not tokenize.
+    fn compute_text_prefix_hash(&self, text: &str) -> u64 {
+        let bytes = text.as_bytes();
+        let end = bytes
+            .len()
+            .min(self.config.prefix_token_count * TEXT_BYTES_PER_TOKEN);
+        xxhash_rust::xxh3::xxh3_64_with_seed(&bytes[..end], TEXT_PREFIX_SEED)
     }
 
     /// Check if a worker's load is acceptable
@@ -207,14 +221,15 @@ impl PrefixHashPolicy {
             return (None, Branch::NoHealthyWorkers);
         }
 
-        // Get tokens from SelectWorkerInfo
-        let tokens = match info.tokens {
-            Some(t) if !t.is_empty() => t,
-            _ => return (None, Branch::NoTokens),
+        let prefix_hash = match info.tokens {
+            Some(tokens) if !tokens.is_empty() => self.compute_prefix_hash(tokens),
+            // No tokens: keep prefix locality on the text and still place the request.
+            _ => {
+                let text_hash = self.compute_text_prefix_hash(info.request_text.unwrap_or(""));
+                let (selected, _) = self.find_worker_with_load_balance(workers, info, text_hash);
+                return (selected, Branch::NoTokens);
+            }
         };
-
-        // Compute prefix hash
-        let prefix_hash = self.compute_prefix_hash(tokens);
 
         // Find worker using ring with load balancing
         self.find_worker_with_load_balance(workers, info, prefix_hash)
@@ -345,33 +360,50 @@ mod tests {
     }
 
     #[test]
-    fn test_no_tokens_returns_none() {
+    fn test_no_tokens_still_places_the_request() {
         let policy = PrefixHashPolicy::with_defaults();
         let workers = create_workers(&["http://w1:8000"]);
         let ring = Arc::new(HashRing::new(&workers));
 
-        // Empty tokens
-        let tokens: Vec<u32> = vec![];
-        let info = SelectWorkerInfo {
-            tokens: Some(&tokens),
-            hash_ring: Some(ring.clone()),
+        for tokens in [Some(&[][..]), None] {
+            let info = SelectWorkerInfo {
+                tokens,
+                hash_ring: Some(ring.clone()),
+                ..Default::default()
+            };
+            assert_eq!(
+                policy.select_worker_impl(&workers, &info),
+                (Some(0), Branch::NoTokens)
+            );
+        }
+    }
+
+    #[test]
+    fn test_text_prefix_keeps_locality_without_tokens() {
+        let policy = PrefixHashPolicy::new(PrefixHashConfig {
+            prefix_token_count: 4,
             ..Default::default()
+        });
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        let ring = Arc::new(HashRing::new(&workers));
+        let select = |text: &'static str| {
+            let info = SelectWorkerInfo {
+                request_text: Some(text),
+                hash_ring: Some(ring.clone()),
+                ..Default::default()
+            };
+            policy.select_worker_impl(&workers, &info)
         };
 
-        let (result, branch) = policy.select_worker_impl(&workers, &info);
-        assert_eq!(result, None);
+        // Only the first 16 bytes key the ring.
+        let (first, branch) = select("shared system prompt, turn one");
         assert_eq!(branch, Branch::NoTokens);
+        assert_eq!(select("shared system prompt, turn two").0, first);
 
-        // No tokens field
-        let info_no_tokens = SelectWorkerInfo {
-            tokens: None,
-            hash_ring: Some(ring),
-            ..Default::default()
-        };
-
-        let (result2, branch2) = policy.select_worker_impl(&workers, &info_no_tokens);
-        assert_eq!(result2, None);
-        assert_eq!(branch2, Branch::NoTokens);
+        let spread: std::collections::HashSet<_> = (0..64)
+            .map(|i| select(format!("{i:016}").leak()).0)
+            .collect();
+        assert!(spread.len() > 1, "text prefixes should spread: {spread:?}");
     }
 
     #[test]

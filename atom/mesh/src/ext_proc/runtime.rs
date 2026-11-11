@@ -239,17 +239,12 @@ impl HealthService {
         if app.prepare_pool.is_failed() {
             return 2;
         }
-        let routing = crate::routers::ingress::IngressRouting::new(app);
+        // A worker without a tokenizer still serves: routing falls back to text.
         let eligible: Vec<_> = app
             .worker_registry
             .get_all()
             .into_iter()
-            .filter(|w| {
-                w.is_available()
-                    && matches!(w.connection_mode(), ConnectionMode::Http)
-                    && (!routing.needs_tokens(Some(w.model_id()))
-                        || app.tokenizer_registry.get(w.model_id()).is_some())
-            })
+            .filter(|w| w.is_available() && matches!(w.connection_mode(), ConnectionMode::Http))
             .collect();
         let available = !draining.load(Ordering::Acquire)
             && if app.router_config.mode.is_pd_mode() {

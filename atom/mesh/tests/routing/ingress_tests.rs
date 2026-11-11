@@ -61,7 +61,7 @@ fn response_state_never_fails_over_to_a_different_owner() {
 }
 
 #[tokio::test]
-async fn capabilities_and_exact_token_routing_are_explicit() {
+async fn capabilities_are_explicit_and_untokenizable_apis_route_on_text() {
     let worker = BasicWorkerBuilder::new("http://127.0.0.1:1")
         .labels(std::collections::HashMap::from([(
             "mesh.apis".into(),
@@ -111,7 +111,9 @@ async fn capabilities_and_exact_token_routing_are_explicit() {
             .wait()
             .await
             .unwrap();
-        assert_eq!(result.unwrap_err().code, "token_routing_unsupported");
+        let (metadata, tokens) = result.unwrap();
+        assert_eq!(tokens, None);
+        assert!(metadata.text.contains("hi"), "{path}");
     }
 }
 fn json_headers() -> HeaderMap {
@@ -498,8 +500,8 @@ async fn native_handoff_keeps_router_contract_and_releases_raw_input() {
         connection_mode: ConnectionMode::Grpc { port: None },
         ..Default::default()
     };
-    // HTTP preparation would fail without a tokenizer. The trait default must
-    // preserve the native router's handling after the universal JSON parse.
+    // The trait default must preserve the native router's handling after the
+    // universal JSON parse.
     let context = Arc::new(
         AppContext::from_config(config, 5, pool.handle())
             .await
@@ -1040,6 +1042,52 @@ async fn token_routing_is_prepared_in_the_parse_job_or_needs_the_pool_again() {
     let (_, (metadata, tokens)) = request.prepare_routing(&closed, &routing).await.unwrap();
     assert_eq!(metadata.text, "hello world");
     assert!(tokens.is_some_and(|tokens| !tokens.is_empty()));
+}
+
+#[tokio::test]
+async fn token_routing_falls_back_to_text_instead_of_rejecting() {
+    let pool = PreparePoolRuntime::new(default_pool()).unwrap();
+    let mut config = crate::config::RouterConfig {
+        policy: crate::config::PolicyConfig::PrefixHash {
+            prefix_token_count: 4,
+            load_factor: 1.25,
+        },
+        ..Default::default()
+    };
+    config.prepare_pool.max_tokenize_bytes = Some(11);
+    let app = AppContext::from_config(config, 5, pool.handle())
+        .await
+        .unwrap();
+    async fn prepare(app: &AppContext, body: &[u8]) -> RoutingPreparation {
+        let parsed = ParsedInference::parse("/generate", body).unwrap();
+        let routing = IngressRouting::new(app);
+        app.prepare_pool
+            .submit(app.prepare_pool.prepare_deadline(), move |ctx| {
+                routing.prepare(&parsed, ctx)
+            })
+            .await
+            .unwrap()
+            .wait()
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    // No registered tokenizer: route on text.
+    let (metadata, tokens) = prepare(&app, br#"{"model":"m","text":"hello world"}"#).await;
+    assert_eq!((metadata.text.as_str(), tokens), ("hello world", None));
+
+    let tokenizer: Arc<dyn crate::tokenizer::traits::Tokenizer> =
+        Arc::new(crate::tokenizer::MockTokenizer::new());
+    app.tokenizer_registry
+        .load("mock-id", "m", "mock", || async { Ok(tokenizer) })
+        .await
+        .unwrap();
+    let (_, tokens) = prepare(&app, br#"{"model":"m","text":"hello world"}"#).await;
+    assert!(tokens.is_some_and(|tokens| !tokens.is_empty()));
+    // Over the byte limit: route on text.
+    let (metadata, tokens) = prepare(&app, br#"{"model":"m","text":"hello world!"}"#).await;
+    assert_eq!((metadata.text.as_str(), tokens), ("hello world!", None));
 }
 
 #[test]
