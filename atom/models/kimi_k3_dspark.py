@@ -49,7 +49,8 @@ Checkpoint layout (Inferact/Kimi-K3-DSpark, 68 tensors, single-file BF16):
   layers.{i}.mlp.down_proj.weight               [7168, 14336]
   markov_head.markov_w{1,2}.weight              [163840, 256]
   confidence_head.proj.{weight,bias}            SKIPPED (training-only)
-  embed_tokens.weight                           SKIPPED (target's is shared)
+  embed_tokens.weight                           SKIPPED (target's is shared;
+                                                loaded on PP stages > 0)
 
 Inferact/Kimi-K3.1-DSpark (67 tensors) is the same tree with 96 heads (q_b_proj
 [18432, 1536], kv_b_proj [24576, 512], o_proj [7168, 12288]), Markov rank 512
@@ -60,6 +61,7 @@ from typing import TYPE_CHECKING, ClassVar
 
 import torch
 from aiter import QuantType, dtypes
+from aiter.dist.parallel_state import get_pp_group
 from aiter.rotary_embedding import get_rope
 from torch import nn
 
@@ -70,6 +72,7 @@ from atom.model_ops.attention_mla import (
     qrep_tp_override,
 )
 from atom.model_ops.base_attention import Attention
+from atom.model_ops.embed_head import VocabParallelEmbedding
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import (
     ColumnParallelLinear,
@@ -528,6 +531,10 @@ class KimiK3DSpark(DSparkDraftModel):
     ``packed_modules_mapping``.
     """
 
+    # `_sample_block` below hands the binding to the head's `sample_block`,
+    # so `DSparkProposer` may arm lossless speculative sampling here.
+    supports_lossless_draft = True
+
     packed_modules_mapping: ClassVar[dict[str, tuple[str, int]]] = {
         "q_a_proj": ("fused_qkv_a_proj", 0),
         "kv_a_proj_with_mqa": ("fused_qkv_a_proj", 1),
@@ -544,11 +551,14 @@ class KimiK3DSpark(DSparkDraftModel):
     #   embed_tokens: a 2.35GB copy of the target's table. The target's is
     #     shared instead (share_with_target), so loading it would just burn
     #     memory and risk drifting from the target's.
-    skip_weight_prefixes: ClassVar[list[str]] = [
+    #
+    # Under PP, __init__ drops embed_tokens from this list on non-first stages.
+    # A tuple, not a ClassVar: the per-stage override rebinds, never mutates.
+    skip_weight_prefixes: tuple[str, ...] = (
         "confidence_head.",
         "embed_tokens.",
         "lm_head.",
-    ]
+    )
 
     def __init__(self, atom_config: "Config", layer_offset: int = 0) -> None:
         super().__init__()
@@ -591,7 +601,18 @@ class KimiK3DSpark(DSparkDraftModel):
         self.vocab_size = int(config.vocab_size)
 
         # Bound by share_with_target(); both are skipped at load.
-        self.embed_tokens = None
+        # Exception: under PP the drafter lives on the last stage, whose target
+        # embedding is a PPMissingLayer, so load the checkpoint's own copy.
+        self.own_embed_tokens = not get_pp_group().is_first_rank
+        if self.own_embed_tokens:
+            self.skip_weight_prefixes = tuple(
+                p for p in self.skip_weight_prefixes if p != "embed_tokens."
+            )
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size, config.hidden_size, prefix="embed_tokens"
+            )
+        else:
+            self.embed_tokens = None
         self.lm_head = None
         # vLLM 0.28 probes this attribute before enabling adaptive verification.
         # This checkpoint deliberately skips the training-only head.
@@ -607,14 +628,16 @@ class KimiK3DSpark(DSparkDraftModel):
         The vocabularies must agree or the shared LM head would silently score
         the wrong rows.
         """
-        target_vocab = target_base.model.embed_tokens.num_embeddings
+        # Not embed_tokens.num_embeddings: under PP it may be a PPMissingLayer.
+        target_vocab = target_base.model.vocab_size
         if target_vocab != self.hf_config.vocab_size:
             raise ValueError(
                 f"DSpark draft vocab {self.hf_config.vocab_size} != target vocab "
                 f"{target_vocab}. The draft shares the target's embedding and LM "
                 "head, so the two must agree."
             )
-        self.embed_tokens = target_base.model.embed_tokens
+        if not self.own_embed_tokens:
+            self.embed_tokens = target_base.model.embed_tokens
         self.lm_head = target_base.lm_head
 
     # ---- drafting entry points (called by the proposer) --------------------
@@ -698,6 +721,8 @@ class KimiK3DSpark(DSparkDraftModel):
         hidden: torch.Tensor,  # [B*T, hidden] post-final-norm
         anchor_ids: torch.Tensor,  # [B]
         num_draft: int,
+        *,
+        greedy: bool = False,
     ):
         """The sequential half: LM head, then Markov sampling over the block.
 
@@ -705,27 +730,26 @@ class KimiK3DSpark(DSparkDraftModel):
         flat over ``B*T`` and so cannot say which of the two axes it holds.
         """
         base_logits = self.lm_head(hidden).view(anchor_ids.shape[0], num_draft, -1)
-        return self._sample_block(base_logits, anchor_ids), None
+        return self._sample_block(base_logits, anchor_ids, greedy), None
 
     def _sample_block(
         self,
         base_logits: torch.Tensor,  # [B, T, V]
         anchor_ids: torch.Tensor,  # [B]
+        greedy: bool,
     ) -> torch.Tensor:
-        """Markov-biased left-to-right sampling over the already-computed block.
+        """Markov-biased left-to-right sampling over the already-computed block:
+        the head's ``sample_block`` with this model's ``draft_sampling``, or
+        with none when ``greedy``.
 
-            logits_k <- U_k + B(x_{k-1}, .);  x_k <- argmax(logits_k)
+            logits_k <- U_k + B(x_{k-1}, .)
+            x_k      <- argmax(logits_k)       (``greedy``, or ``draft_sampling`` None)
+            x_k      <- drawn from the top of softmax(logits_k / T), its q
+                        published for the accept rule   (lossless)
 
         Only this loop is sequential, and it is T tiny rank-256 matmuls rather
         than T backbone passes -- which is the entire point of DSpark.
         """
-        bs, T, _ = base_logits.shape
-        out_ids = anchor_ids.new_empty(bs, T + 1)
-        out_ids[:, 0] = anchor_ids
-        for k in range(T):
-            # Greedy: temperature/sampling is applied by the target's verify.
-            # The column is the op's destination, so no id is written twice.
-            self.markov_head.sample_next(
-                out_ids[:, k], base_logits[:, k], out_ids[:, k + 1]
-            )
-        return out_ids[:, 1:]
+        return self.markov_head.sample_block(
+            base_logits, anchor_ids, None if greedy else self.draft_sampling
+        )
