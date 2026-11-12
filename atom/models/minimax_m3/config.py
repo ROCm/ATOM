@@ -20,16 +20,31 @@ def _mxfp4_kv_refusal(config) -> str | None:
     """
     import torch
 
-    from atom.config import kv_pages_leave_pool
+    from atom.config import (
+        kv_pages_leave_pool,
+        kv_pages_leave_pool_by_lmcache_offload_only,
+    )
 
     if config.torch_dtype != torch.bfloat16:
         # aiter's MXFP4 pa_decode only writes bf16; the attention output takes the
         # model dtype, so an fp16 checkpoint would fail in its first forward.
         return f"it needs a bfloat16 model, got {config.torch_dtype}"
-    if kv_pages_leave_pool(config):
-        # Offloaded pages (ATOM_KV_OFFLOAD, a P/D connector) are moved by a layout
-        # that was never told this byte format, and its namespace keys no FP4.
-        return "it does not run with KV offload or --kv-transfer-config"
+    if kv_pages_leave_pool(config) and not (
+        config.kv_cache_dtype == "nvfp4"
+        and kv_pages_leave_pool_by_lmcache_offload_only(config)
+    ):
+        # P/D connectors, lmcache_mp and Mooncake Store move pages by layouts that
+        # were never told this byte format. The in-process LMCache offload moves
+        # M3's pages as the pool's opaque byte regions: an NVFP4 page is one
+        # self-contained field (data and e4m3 scales; the per-layer fp32 global
+        # scale is a constant 1.0 outside the page), and the NVFP4 index another,
+        # so it carries them as they are. MXFP4 ("fp4") is not opened up: its
+        # index layout under offload is unverified.
+        return (
+            "it runs with KV offload only as --kv-cache-dtype nvfp4 through the "
+            "in-process lmcache_offload connector (no P/D --kv-transfer-config, "
+            "lmcache_mp or mooncake_store)"
+        )
     spec = config.speculative_config
     if spec is not None and spec.kv_cache_dtype in _FP4_DTYPES:
         # `resolve_draft_kv_dtype` leaves "fp4" only on a draft in the target's

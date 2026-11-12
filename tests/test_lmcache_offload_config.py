@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from atom.kv_transfer.offload import config as offcfg
 
@@ -587,3 +588,15 @@ def test_v41_keeps_the_namespace_hybrid_gave_it(monkeypatch):
     )
     monkeypatch.setattr(offcfg, "select_offload_layout", lambda _config: "hybrid")
     assert v41 == namespace("deepseek_v41", sliding_window=128, candidate_block_size=8)
+
+
+def test_lmcache_metadata_books_nvfp4_pages_as_bytes(monkeypatch):
+    """aiter's dtype table has no "nvfp4"; MiniMax-M3's NVFP4 pages are uint8."""
+    _install_metadata_modules(monkeypatch)
+    config = _config()
+    config.kv_cache_dtype = "nvfp4"
+    config.index_cache_dtype = "nvfp4"
+    metadata = offcfg.build_lmcache_metadata(config, _lmcache_config(), 4, 0)
+    assert metadata.kv_dtype == torch.uint8
+    fp8 = offcfg.build_lmcache_metadata(_config(), _lmcache_config(), 4, 0)
+    assert metadata.model_name != fp8.model_name

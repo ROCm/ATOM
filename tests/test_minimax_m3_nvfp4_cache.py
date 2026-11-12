@@ -189,3 +189,29 @@ def test_the_draft_of_an_nvfp4_target_is_bf16_unless_asked_and_never_fp4():
         resolve_draft_kv_dtype(
             types.SimpleNamespace(kv_cache_dtype="nvfp4"), "nvfp4", own_pool=True
         )
+
+
+LMCACHE_OFFLOAD = {"kv_connector": "lmcache_offload", "kv_role": "offload"}
+
+
+def test_nvfp4_runs_with_the_in_process_lmcache_offload(monkeypatch):
+    # the connector moves the pool's page regions as opaque bytes: the NVFP4 K/V
+    # field and the NVFP4 index field each carry their own scales
+    check(monkeypatch, kv_transfer_config=LMCACHE_OFFLOAD, **NV)
+
+
+@pytest.mark.parametrize(
+    "connector", ["lmcache_mp", "mooncake_store", "moriio", "mooncake", "multi"]
+)
+def test_nvfp4_refuses_every_other_kv_transfer_connector(monkeypatch, connector):
+    with pytest.raises(ValueError, match="KV offload only as --kv-cache-dtype nvfp4"):
+        check(
+            monkeypatch,
+            kv_transfer_config={"kv_connector": connector, "kv_role": "offload"},
+            **NV,
+        )
+
+
+def test_mxfp4_kv_still_refuses_the_lmcache_offload(monkeypatch):
+    with pytest.raises(ValueError, match="KV offload"):
+        check(monkeypatch, kv_transfer_config=LMCACHE_OFFLOAD)

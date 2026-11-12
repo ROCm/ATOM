@@ -731,7 +731,14 @@ def build_lmcache_metadata(config, cfg, world_size: int, worker_id: int):
     worker_id = _strict_integer("LMCache worker id", worker_id)
     if worker_id >= world_size:
         raise ValueError("LMCache worker id must be within the world")
-    kv_dtype = dtypes.d_dtypes[config.kv_cache_dtype]
+    # Bookkeeping for LMCache (the raw-byte codec moves opaque bytes). aiter's
+    # table has no "nvfp4": MiniMax-M3's NVFP4 pages are uint8 fields, and their
+    # dtype name is in the namespace (`build_page_namespace`).
+    kv_dtype = (
+        torch.uint8
+        if config.kv_cache_dtype == "nvfp4"
+        else dtypes.d_dtypes[config.kv_cache_dtype]
+    )
     model_name = build_page_namespace(config, cfg, world_size)
 
     # MLA (DeepSeek R1/V3, Kimi) stores a single replicated per-layer latent

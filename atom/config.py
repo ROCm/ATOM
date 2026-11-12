@@ -1966,6 +1966,21 @@ def kv_pages_leave_pool(config) -> bool:
     return bool(config.kv_transfer_config)
 
 
+def kv_pages_leave_pool_by_lmcache_offload_only(config) -> bool:
+    """Whether the in-process LMCache offload (``lmcache_offload``) is the one
+    connector that moves KV pages out of the pool: no P/D peer, no ``lmcache_mp``,
+    no Mooncake Store, no ``multi``.
+
+    That connector copies a block as the opaque byte regions the pools publish
+    (``page_region`` views of every pool field, the draft's own pool included),
+    and its namespace hashes the target, index and draft KV dtypes
+    (``build_page_namespace`` over ``kv_cache_dtype``, ``index_cache_dtype`` and
+    ``speculative_config``). A page format it was never told about therefore
+    survives the round trip as long as the pools describe every byte of it."""
+    cfg = config.kv_transfer_config or {}
+    return cfg.get("kv_connector") == "lmcache_offload"
+
+
 def resolve_draft_kv_dtype(spec, target_dtype: str, *, own_pool: bool) -> str:
     """The KV dtype a speculative draft's pages have, from ``--spec-decode-kv-cache-dtype``
     and the target's ``--kv-cache-dtype``.
@@ -3012,11 +3027,19 @@ class Config:
             self.speculative_config is not None
             and self.speculative_config.kv_cache_dtype != self.kv_cache_dtype
             and kv_pages_leave_pool(self)
+            and not (
+                is_m3
+                and self.kv_cache_dtype == "nvfp4"
+                and kv_pages_leave_pool_by_lmcache_offload_only(self)
+            )
         ):
-            # The offload namespace keys the target's KV dtype alone, so a
-            # draft page of another dtype would share a key with the target's.
-            # After the model's own refusal above: an fp4 target is refused there
-            # for the offload itself, and no draft dtype can match it.
+            # Other connectors key the target's KV dtype alone, so a draft page
+            # of another dtype would share a key with the target's. The
+            # in-process LMCache offload is the exception for MiniMax-M3's NVFP4
+            # target (the only FP4 target the model's refusal above lets through
+            # it): the draft's own pool is separate byte regions of the same
+            # block, and the namespace hashes `speculative_config`, which carries
+            # the draft dtype.
             raise ValueError(
                 f"draft KV dtype {self.speculative_config.kv_cache_dtype} differs "
                 f"from the target's {self.kv_cache_dtype}: not supported with KV "

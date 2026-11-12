@@ -500,6 +500,33 @@ def test_an_fp4_target_beside_offload_is_refused_for_that_not_for_its_draft(
     assert "spec-decode-kv-cache-dtype" not in str(err.value)
 
 
+def test_an_nvfp4_target_with_an_fp8_dspark_draft_runs_with_the_lmcache_offload(
+    monkeypatch,
+):
+    """The in-process LMCache offload carries the draft's own pool as separate byte
+    regions of the block and hashes `speculative_config` (the draft dtype with it)
+    into its namespace, so an NVFP4 target and an fp8 draft pass; any other
+    connector still refuses the pair."""
+    config = _m3(
+        monkeypatch,
+        kv_cache_dtype="nvfp4",
+        index_cache_dtype="nvfp4",
+        hf=sparse_hf(),
+        kv_transfer_config=OFFLOAD,
+        speculative_config=_dspark_spec(kv_cache_dtype="fp8"),
+    )
+    assert config.speculative_config.kv_cache_dtype == "fp8"
+    with pytest.raises(ValueError, match="KV offload only as"):
+        _m3(
+            monkeypatch,
+            kv_cache_dtype="nvfp4",
+            index_cache_dtype="nvfp4",
+            hf=sparse_hf(),
+            kv_transfer_config={"kv_connector": "lmcache_mp", "kv_role": "offload"},
+            speculative_config=_dspark_spec(kv_cache_dtype="fp8"),
+        )
+
+
 def test_a_dspark_draft_with_a_pool_of_its_own_takes_its_dtype_on_any_model(
     monkeypatch,
 ):
