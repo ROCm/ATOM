@@ -160,6 +160,26 @@ fn bench_atom_chunk_keys_100k_tokens() {
     let tokens: Vec<u32> = (0..100_000u32)
         .map(|i| i.wrapping_mul(2_654_435_761) % 151_936)
         .collect();
+    let time = |run: &dyn Fn()| {
+        let mut samples: Vec<Duration> = (0..1000)
+            .map(|_| {
+                let start = std::time::Instant::now();
+                run();
+                start.elapsed()
+            })
+            .collect();
+        samples.sort();
+        (samples[500], samples[990])
+    };
+    let bytes: Vec<u8> = tokens
+        .iter()
+        .flat_map(|token| token.to_le_bytes())
+        .collect();
+    let (p50, p99) = time(&|| {
+        let bytes = std::hint::black_box(&bytes);
+        std::hint::black_box(blake2b_simd::Params::new().hash_length(16).hash(bytes));
+    });
+    println!("blake2b of the same 400 KB in one call: p50 {p50:?}, p99 {p99:?}");
     for (chunk_tokens, probe) in [
         (256, RankProbe::First),
         (256, RankProbe::All),
@@ -171,16 +191,10 @@ fn bench_atom_chunk_keys_100k_tokens() {
             world: 8,
             probe,
         };
-        let mut samples: Vec<Duration> = (0..1000)
-            .map(|_| {
-                let start = std::time::Instant::now();
-                std::hint::black_box(rule.keys(std::hint::black_box(&tokens)));
-                start.elapsed()
-            })
-            .collect();
-        samples.sort();
+        let (p50, p99) = time(&|| {
+            std::hint::black_box(rule.keys(std::hint::black_box(&tokens)));
+        });
         let keys = rule.keys(&tokens).len();
-        let (p50, p99) = (samples[500], samples[990]);
         println!("AtomChunk keys, 100k tokens, chunk {chunk_tokens}: {keys} keys, p50 {p50:?}, p99 {p99:?}");
     }
 }
