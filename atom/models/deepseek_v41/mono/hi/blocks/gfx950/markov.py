@@ -44,7 +44,11 @@ from ...device.gfx950 import buffer_ops as bo
 from ...device.gfx950 import mailbox as mb
 from ...device.gfx950.ops import (
     bf2_f32,
+    bf16_pair,
     bf16_round,
+    bf_hi,
+    bf_lo,
+    fresh,
     ld_i32,
     mfma_bf16,
     rsrc,
@@ -73,6 +77,9 @@ class _MPlan(ah._Plan):
     batch: int = 1  # requests: blocks of ``rows / batch`` positions, side by side
     blocks: int = (
         1  # 128-id blocks a task (``MarkovHead(blocks=)``: a rank's vocab past one block a CU)
+    )
+    base16: bool = (
+        False  # B requests: the base logits (bf16 values) as bf16 pairs, half the f32 words (``plan``)
     )
 
     @property
@@ -125,11 +132,15 @@ class _MPlan(ah._Plan):
         return self.a_base + self.rows * VT if self.single else 0
 
     @property
+    def base_words(self) -> int:  # the base logits' words (``base16``: two ids a word)
+        return self.rows * self.vt // (2 if self.base16 else 1)
+
+    @property
     def a_w1(self) -> int:  # W1[x_{j-1}] [rw] (B requests: one a request)
         return (
             self.a_w2 + VT * self.w2pitch
             if self.single
-            else self.a_base + self.rows * self.vt
+            else self.a_base + self.base_words
         )
 
     @property
@@ -211,25 +222,20 @@ class MarkovHead(Block):
     def plan(self, sc: Scenario) -> _MPlan:
         p = _MPlan(self.name, sc.rows, self.x.width, self.n, sc.tp, self.x.name, "bf16", self.layout, self.prefetch,
                    False, "", self.lead, False, rank_r=self.rank_r, batch=sc.batch)  # fmt: skip
+        blocks = self.blocks or (
+            1 if p.tasks <= MI355X.cus or self.logits is not None else 2
+        )
+        if blocks > 1:  # (the B-request path: W2 rows over x)
+            p = replace(p, blocks=blocks)
         if (
             sc.batch > 1 or p.lds_words * 4 > MI355X.lds_bytes
         ):  # x in K slices where it does not fit whole
-            if self.kparts > 1:
-                if p.steps % self.kparts:
-                    raise ValueError(
-                        f"MarkovHead {self.name}: kparts {self.kparts} does not divide {p.steps} K steps"
-                    )
-                p = replace(p, kparts=self.kparts)
-            # (two blocks: slices of a fifth of K or less, so x's landing batches fit beside the blocks' streams:
-            # V4.1 TP2 at 15 / 20 rows spilled 37 / 4 VGPRs at 2 slices, none at 5)
-            for kp in (
-                q
-                for q in (range(5, 11) if p.blocks > 1 else range(2, 9))
-                if p.steps % q == 0 and q > p.kparts
-            ):
-                if p.lds_words * 4 <= MI355X.lds_bytes:
-                    break
-                p = replace(p, kparts=kp)
+            fit = self._slices(p)
+            if fit.lds_words * 4 > MI355X.lds_bytes and p.blocks > 1:
+                # the base logits as bf16 pairs where their f32 words do not fit (the values are bf16 already: the
+                # same bits; V4.1 TP2 at 6 requests of 5: two blocks' W2 rows + 30 rows' logits are 169 KB in f32)
+                fit = self._slices(replace(p, base16=True))
+            p = fit
         if p.lds_words * 4 > MI355X.lds_bytes:
             raise ValueError(
                 f"MarkovHead {self.name}: {sc.rows} rows do not fit the LDS"
@@ -242,6 +248,27 @@ class MarkovHead(Block):
             raise ValueError(
                 f"MarkovHead {self.name}: at most 16 positions (the MFMA's N)"
             )
+        return p
+
+    def _slices(self, p: _MPlan) -> _MPlan:
+        """``p`` with x in K slices (B requests, or x not fitting whole): ``kparts`` at least, then more until the
+        LDS fits (or none fits)."""
+        if self.kparts > 1:
+            if p.steps % self.kparts:
+                raise ValueError(
+                    f"MarkovHead {self.name}: kparts {self.kparts} does not divide {p.steps} K steps"
+                )
+            p = replace(p, kparts=self.kparts)
+        # (two blocks: slices of a fifth of K or less, so x's landing batches fit beside the blocks' streams:
+        # V4.1 TP2 at 15 / 20 rows spilled 37 / 4 VGPRs at 2 slices, none at 5)
+        for kp in (
+            q
+            for q in (range(5, 11) if p.blocks > 1 else range(2, 9))
+            if p.steps % q == 0 and q > p.kparts
+        ):
+            if p.lds_words * 4 <= MI355X.lds_bytes:
+                break
+            p = replace(p, kparts=kp)
         return p
 
     def stages(self, sc: Scenario) -> list[Stage]:
@@ -304,6 +331,8 @@ def _mk(k, t, p: _MPlan, lg: str = ""):
             xp = _position(k, p, t, j, xp, first)
     else:  # B requests: the dot over every row, then the requests' positions side by side
         _stream_b(k, p, lane, issue, q)
+        if const_expr(p.blocks > 1):
+            _dots_rest(k, p, t, lane, r_w, n_pre)
         _w2_tile(k, p, t, first)
         gpu.barrier()
         _anchors(
@@ -311,6 +340,22 @@ def _mk(k, t, p: _MPlan, lg: str = ""):
         )  # x_{-1} of every request into LDS (where each position leaves its x_j)
         gpu.barrier()
         _position_loop(k, p, t, first)
+
+
+@traced
+def _dots_rest(k, p: _MPlan, t, lane, r_w, n_pre):
+    """``blocks`` > 1: the dot of the task's next blocks (a runtime loop: one block's units and accumulators live), x's
+    first K slice back in the LDS first where it lands in slices; each block's logits beside the last's.
+    """
+    for blk in range(1, p.blocks):
+        gpu.barrier()
+        if const_expr(p.kparts > 1):
+            ah._land_x(k, p, 0)
+            gpu.barrier()
+        tb, wave = t * p.blocks + blk, fresh(k.wave)
+        rg = tb * WAVES + wave
+        issue = partial(ah._issue, p, r_w, tb, wave, rg, fresh(lane), rg < p.n_rg)
+        _stream_b(k, p, lane, issue, [issue(i) for i in range(n_pre)], blk)
 
 
 def _stream(k, p: _MPlan, lane, issue, q):
@@ -374,12 +419,30 @@ def _stream_b(k, p: _MPlan, lane, issue, q, blk: int = 0):
 def _base_put_ch(k, p: _MPlan, lane, ch, vals, blk: int = 0):
     row = lane % 16 + ah.RG * ch
     if row < p.rows:
-        at = p.a_base + row * p.vt + k.wave * ah.RG + (lane // 16) * 4
-        at = (
-            at + blk * VT if not isinstance(blk, int) or blk else at
-        )  # (blk: a runtime value past block 0)
-        for e in range_constexpr(4):
-            fx.ptr_store(vals[e], k.ldsf + (at + e))
+        if const_expr(
+            p.base16
+        ):  # (the 4 ids' values two a word: bf16 already, the pairs exact)
+            at = p.a_base + row * (p.vt // 2) + k.wave * (ah.RG // 2) + (lane // 16) * 2
+            at = at + blk * (VT // 2) if not isinstance(blk, int) or blk else at
+            for e in range_constexpr(2):
+                fx.ptr_store(bf16_pair(vals[2 * e], vals[2 * e + 1]), k.ldsf + (at + e))
+        else:
+            at = p.a_base + row * p.vt + k.wave * ah.RG + (lane // 16) * 4
+            at = (
+                at + blk * VT if not isinstance(blk, int) or blk else at
+            )  # (blk: a runtime value past block 0)
+            for e in range_constexpr(4):
+                fx.ptr_store(vals[e], k.ldsf + (at + e))
+
+
+def _base_at(k, p: _MPlan, row, v, blk):
+    """``blocks`` > 1: the base logit of row ``row``'s id ``v`` of block ``blk`` (a runtime value): its f32 word, or
+    (``base16``) its half of the pair word."""
+    if const_expr(p.base16):
+        at = p.a_base + row * (p.vt // 2) + blk * (VT // 2)
+        w = fx.ptr_load(k.ldsf + (at + v // 2)).bitcast(fx.Int32)
+        return (v % 2 == 1).select(bf_hi(w), bf_lo(w))
+    return fx.ptr_load(k.ldsf + (p.a_base + row * p.vt + blk * VT + v))
 
 
 def _w2_tile(k, p: _MPlan, t, first):
@@ -516,6 +579,49 @@ def _bias_loop(k, p: _MPlan, j, first, w2a, part, seg, v, lid, ok):
     for b in range(p.batch):
         if const_expr(p.blocks == 1):
             _bias_one(k, p, j, b, first, w2a, part, seg, v, lid, ok)
+        else:  # the task's blocks one at a time (a runtime loop: one block's products live), merged in the wave's slot
+            for blk in range(p.blocks):
+                _bias_blk(k, p, j, b, blk, first, w2a, part, seg, v, lid)
+
+
+def _bias_blk(k, p: _MPlan, j, b, blk, first, w2a, part, seg, v, lid):
+    """``blocks`` > 1: ``_bias_one``'s arithmetic for id ``v`` of block ``blk`` (a runtime value), the wave's best
+    merged into request ``b``'s slot (block 0 writes it)."""
+    w1a = p.a_w1 + b * p.rw + part * seg
+    w2b = w2a + blk * (VT * p.w2pitch)
+    lidb = lid + blk * VT
+    ok = (part == 0) & (lidb < p.n)
+    acc = fx.Float32(0.0)
+    for w in range_constexpr(seg):
+        a0, a1 = bf2_f32(fx.ptr_load(k.ldsf + (w1a + w)).bitcast(fx.Int32))
+        b0, b1 = bf2_f32(fx.ptr_load(k.ldsf + (w2b + w)).bitcast(fx.Int32))
+        acc = acc + a0 * b0
+        acc = acc + a1 * b1
+    acc = acc + xshfl(acc, 1)
+    acc = acc + xshfl(acc, 2)
+    val = _base_at(k, p, b * p.pos + j, v, blk) + acc
+    bits = val.bitcast(fx.Int32)
+    bits = (bits == fx.Int32(INT_MIN)).select(fx.Int32(0), bits)  # -0 as +0
+    kk = ok.select(order_key(bits), fx.Int32(0))
+    ii = ok.select(lidb + first, fx.Int32(INT_MAX))
+    for off in (1, 2, 4, 8, 16, 32):
+        kk, ii = ah._take(kk, ii, xshfl(kk, off), xshfl(ii, off))
+    _wave_best_merge(k, p, kk, ii, b, blk)
+
+
+@traced
+def _wave_best_merge(k, p: _MPlan, kk, ii, b, blk):
+    """Lane 0: the wave's best of block ``blk`` into request ``b``'s slot, taken with the slot's (an earlier block's)
+    for ``blk`` > 0 (the same lane wrote it: no barrier)."""
+    if k.lane == 0:
+        at = p.a_red + (b * WAVES + k.wave) * 2
+        ko, io = fx.Int32(fx.ptr_load(k.lds + at)), fx.Int32(
+            fx.ptr_load(k.lds + (at + 1))
+        )
+        km, im = ah._take(ko, io, kk, ii)
+        first = blk == 0
+        fx.ptr_store(first.select(kk, km), k.lds + at)
+        fx.ptr_store(first.select(ii, im), k.lds + (at + 1))
 
 
 def _bias_one(k, p: _MPlan, j, b, first, w2a, part, seg, v, lid, ok):

@@ -704,6 +704,8 @@ def _merge_cta(k, t, p):
     for q in range(per // 4):
         i = base + 4 * q
         live = True if exact else i < n_all
+        if not exact:
+            i = fx.min(i, fx.Int32(n_all - 4))
         src, e = i // p.k, i % p.k  # (quads never straddle a rank: k % 4 == 0)
         vals, gid = _poll_quad(
             peer.from_rank(k, p.xreg, src), 2 * (t * p.k + e), k.tag, live, 2

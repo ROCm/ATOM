@@ -512,7 +512,7 @@ def stage_program(
     from .recipe import CHAIN_PEER, moe_route_early
 
     blocks = stage_blocks(stage, sc.tp, sc.rows, knobs)
-    kn = schedules.knobs("window", sc.rows, over=knobs)
+    kn = schedules.knobs("window", sc.rows, over=knobs, tp=sc.tp)
     stages = moe_route_early([st for b in blocks for st in b.stages(sc)], kn)
     return blocks, Program(
         name, sc, stages, peer_first=CHAIN_PEER, sgpr_spill_ok=True, **program
@@ -536,13 +536,18 @@ def pack_stage(stage: int, w: dict, raw: dict, tp: int = 4, rank: int = 0, devic
 # 24 / 16 units
 DRAFT_PREFETCH = {10: 32, 15: 24, 20: 16}
 
+# (rows, tp) -> x's K slices at a TP other than the rule's (compile only, MI355X): TP2 at 6 requests of 5 (two 128-id
+# blocks a task, the base logits as bf16 pairs) spills 4 VGPRs to memory at 10 slices (and at 32), 16 / 20 / 40 build
+DRAFT_KPARTS_TP: dict[tuple[int, int], int] = {(30, 2): 16}
 
-def DRAFT_KPARTS(rows: int) -> int:
+
+def DRAFT_KPARTS(rows: int, tp: int = 4) -> int:
     """x's K slices at least (``MarkovHead(kparts=)``; 0: the fewest that fit) at a draft of ``rows`` positions: 10
     past 20 rows (5-6 requests of 5: the fewest that fit spill 18-20 VGPRs to memory, 10 build at prefetch 8 and 16;
     7-8 requests spill 10-18 at any K slices: the B requests' side-by-side Markov steps, not x; compile only, TP4).
+    ``DRAFT_KPARTS_TP``'s (rows, tp) entry first.
     """
-    return 10 if rows > 20 else 0
+    return DRAFT_KPARTS_TP.get((rows, tp)) or (10 if rows > 20 else 0)
 
 
 def head_blocks(
@@ -569,7 +574,7 @@ def head_blocks(
         or DRAFT_PREFETCH.get(rows)
         or (H.PREFETCH if rows <= 5 else H._prefetch(None, rows))
     )
-    kp = DRAFT_KPARTS(rows) if kparts is None else kparts
+    kp = DRAFT_KPARTS(rows, tp) if kparts is None else kparts
     return hb[:2] + [
         MarkovHead(
             "mk",
@@ -592,8 +597,8 @@ def head_program(name: str, sc: Scenario, res_out: str | None = None, **program)
 
     blocks = head_blocks(sc.tp, sc.rows, res_out)
     stages = [st for b in blocks for st in b.stages(sc)]
-    # past the entries' tp: SGPR spills into VGPR lanes allowed (TP8: 12), as the verify head's
-    program.setdefault("sgpr_spill_ok", sc.tp > KEY_TP)
+    # at a tp other than the entries': SGPR spills into VGPR lanes allowed (TP8: 12), as the verify head's
+    program.setdefault("sgpr_spill_ok", sc.tp != KEY_TP)
     return blocks, Program(name, sc, stages, host_regions=H.chain_regions(sc, _draft_knobs()), peer_first=CHAIN_PEER,
                            **program)  # fmt: skip
 

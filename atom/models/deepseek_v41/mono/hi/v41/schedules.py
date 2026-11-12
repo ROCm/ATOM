@@ -8,7 +8,8 @@ at a row count runs with where a measurement on MI355X at TP4 decided it (``rows
 the build). A knob still ``"auto"`` after that takes its value in ``AUTO``; the few rules that depend on the build
 itself (the chain's exchange, the TP degree, the merge's cache copies) are the recipe's (``recipe`` module docstring,
 "Knobs"). An index source at a context bucket from ``IDX_LONG`` on takes its kind's ``LONG`` (and ``LONG_ROWS``) on
-top. A build's own ``knobs`` dict goes over all of it (``knobs(over=)``).
+top. At TP2 ``TP_SCHEDULES[2]`` goes over the (kind, rows) entry (``knobs(tp=)``: the TP2 builds' measurements). A
+build's own ``knobs`` dict goes over all of it (``knobs(over=)``).
 
 Kinds are the model's layer kinds (``kind_of``): ``window`` (layer 0), ``window+engram`` (layer 1),
 ``ratio2_kv_source`` (2, 8), ``ratio2_kv_source+engram`` (14), ``ratio1_kv_source`` (20), ``ratio1_index_source``
@@ -354,7 +355,7 @@ LONG: dict = {KV2: {**_LINE, "IDX_SUBTILES": 2, **_PK}, KV2E: {**_LINE, "IDX_SUB
 LONG_ROWS: dict = {(KV1, 6): {"IDX_CAND_APART": 2}, (KV2, 6): {"XA_PROTO": "tagged"},
                    (IDX1, 6): {"IDX_WQB_ROWS": 32}}  # fmt: skip
 
-# the TP degree the entries were measured at (a program past it allows SGPR spills into VGPR lanes: head, draft)
+# the TP degree the entries were measured at (a program at another TP allows SGPR spills into VGPR lanes: head, draft)
 KEY_TP = 4
 
 
@@ -403,6 +404,33 @@ for _key, _knobs in list(SCHEDULES.items()):
 _put(BOTH, range(33, 49), WQB_ROWS=None)
 _put((WINDOW, ENGRAM) + split((WINDOW, ENGRAM)), BAND_ROWS, SPILL_OK=True)
 
+# TP -> (kind, rows) -> knobs over the (kind, rows) entry at a TP degree other than ``KEY_TP`` (``knobs(tp=)``; exact
+# keys: an Engram kind takes only its own)
+TP_SCHEDULES: dict[int, dict] = {2: {}}
+
+
+def _put_tp(tp: int, kinds, rows, **knobs) -> None:
+    for kind in kinds:
+        for r in rows:
+            TP_SCHEDULES[tp].setdefault((kind, r), {}).update(knobs)
+
+
+# TP2 (compile-only builds of the served set): the 1152-wide expert slices in the routed ug's 8-group parts spill 1-10
+# VGPRs to memory at 6 / 16 / 18 rows (every consumer, source and Engram kind), the draft's stages at 15 rows 7: 4-group
+# parts build them spill-free
+_put_tp(2, BOTH, (6, 16, 18), MOE_UG_G=4)
+_put_tp(2, [WINDOW], [15], MOE_UG_G=4)
+# the ratio-2 consumers at 6 rows: the sparse merge at 8 heads a task and the routed ug in 12-group tasks, layer 3
+# 85.73 -> 80.29 us chained (0.936), bitwise
+_put_tp(2, [C2], [6], MOE_UG_G=12, SPARSE_MHEADS=8)
+# the window kind and the ratio-1 index sources at 6 rows: the routed ug in 12-group tasks, layer 0 95.30 -> 92.89 us,
+# layer 24 92.69 -> 90.82 (chained), bitwise
+_put_tp(2, [WINDOW, IDX1], [6], MOE_UG_G=12)
+# the draft's stages at 6 requests (30 rows) spill 2 VGPRs with the 8-group ug parts: 12; the index sources' 8-request
+# band (48 rows) spills 2 with the merge's LDS transpose reads: without them
+_put_tp(2, [WINDOW], [30], MOE_UG_G=12)
+_put_tp(2, [IDX1], [48], SPARSE_VTR=False)
+
 # knobs a chain's launches must agree on (one reads the partials the previous one pushed, in their format): a step's,
 # by its rows (``recipe.rs_pack``), never in a (kind, rows) entry (``knobs`` refuses one)
 CHAIN_KNOBS = ("RS_PACK", "RS_PACK_ROWS")
@@ -426,13 +454,21 @@ def current() -> dict:
 
 
 def knobs(
-    kind: str, rows: int | None, over: dict | None = None, tokens: int = 0
+    kind: str,
+    rows: int | None,
+    over: dict | None = None,
+    tokens: int = 0,
+    tp: int | None = None,
 ) -> dict:
-    """Every knob of a ``kind`` layer at ``rows`` (a copy): ``DEFAULT``, the schedule's entry for (kind, rows) and,
-    an index source whose context bucket ``tokens`` (its Indexer's n_max x ratio) reaches ``IDX_LONG``, its kind's
-    ``LONG``; then ``over``; a knob still "auto" takes ``AUTO``'s value (the recipe resolves the rest: module
-    docstring)."""
+    """Every knob of a ``kind`` layer at ``rows`` (a copy): ``DEFAULT``, the schedule's entry for (kind, rows) (with
+    ``TP_SCHEDULES[tp]``'s over it) and, an index source whose context bucket ``tokens`` (its Indexer's n_max x ratio)
+    reaches ``IDX_LONG``, its kind's ``LONG``; then ``over``; a knob still "auto" takes ``AUTO``'s value (the recipe
+    resolves the rest: module docstring)."""
     entry = copy.deepcopy(_entry(SCHEDULES, kind, rows))
+    if (kind, rows) in TP_SCHEDULES.get(tp, {}):
+        from ..plan.knobs import merge_knobs
+
+        entry = merge_knobs(entry, TP_SCHEDULES[tp][(kind, rows)])
     given = dict(over or {})
     long_from = given.get("IDX_LONG", "auto")
     if isinstance(long_from, str) and long_from == "auto":
