@@ -9,8 +9,8 @@ An E8M0 code is a biased exponent; ``pow2(code)`` is the scale it stands for.
 
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl.expr import rocdl
-from flydsl.expr.typing import T
+from flydsl.expr import range_constexpr, rocdl
+from flydsl.expr.typing import T, as_ir_value
 
 from atom.mono.device.ops import CM_NT
 
@@ -79,3 +79,18 @@ def mfma_scaled(a, b, c, sa, sb, a_fmt=FP8, b_fmt=FP8, sa_byte=0, sb_byte=0):
             T.vec(4, T.f32), [a, b, c, a_fmt, b_fmt, sa_byte, sa, sb_byte, sb]
         )
     )
+
+
+def fp4x8_bf16(word, code):
+    """The eight E2M1 values of dword ``word`` (low nibble first) times the E8M0
+    scale ``code`` (its low byte) as a v8bf16 MFMA operand: exact (a product of a
+    power of two and a 2-bit-mantissa value), by four ``v_cvt_scalef32_pk_bf16_fp4``
+    (aiter's a16w4 kernels' up-conversion)."""
+    scale = as_ir_value(((code & 0xFF) << 23).bitcast(fx.Float32))
+    out = []
+    for sel in range_constexpr(4):
+        pair = rocdl.cvt_scalef32_pk_bf16_fp4(
+            T.vec(2, T.bf16), as_ir_value(word), scale, sel
+        )
+        out.append(fx.Vector(pair).bitcast(fx.Int32)[0])
+    return fx.Vector.from_elements(out, fx.Int32).bitcast(fx.BFloat16)

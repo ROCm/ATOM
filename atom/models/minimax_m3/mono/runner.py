@@ -242,8 +242,9 @@ class MonoDecodeRunner:
             "native MXFP8 1x32" if self.attn_mxfp8 else "ptpc FP8",
         )
         if self.shared_mxfp8:
-            # the unfused shared expert is added to the routed sum as it is
-            shared_weight = 1.0
+            # the unfused shared expert is added to the routed sum as it is (a check of
+            # the routed experts alone: not at all)
+            shared_weight = 0.0 if envs.ATOM_MONO_CHECK_ROUTED_ONLY else 1.0
         else:
             # the fused shared expert's routing weight is whatever the topK metadata
             # holds, read through the module: the metadata is assigned after this
@@ -292,6 +293,9 @@ class MonoDecodeRunner:
             index_nvfp4=self.nvfp4,
             sh_first=envs.ATOM_MONO_SH_FIRST,
             attn_mxfp8=self.attn_mxfp8,
+            moe_a16w4=envs.ATOM_MONO_MOE_A16W4,
+            sp_f32=envs.ATOM_MONO_SP_F32,
+            prod_round=envs.ATOM_MONO_PROD_ROUND,
         )
         # a dense layer's kernels around its original attention
         if self.dense_mono:

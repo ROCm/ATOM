@@ -25,6 +25,7 @@ from atom.model_ops.communication_op import tensor_model_parallel_all_reduce
 from atom.models.minimax_m3.mono.config import HIDDEN
 from atom.models.minimax_m3.mono.runner import N_DENSE, token_rows
 from atom.mono.runtime.compare import compare
+from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
@@ -63,6 +64,8 @@ def forward_checked(
     zeros = torch.zeros(n, HIDDEN, dtype=ars[0].dtype, device=ars[0].device)
     for i, lw in enumerate(runner.sparse):
         layer = runner.model.layers[lw.layer_id]
+        if envs.ATOM_MONO_CHECK_ROUTED_ONLY:
+            layer.block_sparse_moe.shared_experts = None
         h_in = ars[i % 2][:n].clone() if runner.rank == 0 else zeros
         res_in = res.clone()
         # mono first: it reads only the caches it inserts itself, as in a real step

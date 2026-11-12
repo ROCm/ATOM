@@ -42,6 +42,8 @@ from atom.mono.plan.execution import THREADS, WAVES
 def router_defs(k4ctx):
     """The functions of the router GEMV (and the MXFP8 operand helpers the experts
     share)."""
+    A16N = k4ctx["A16N"]
+    A16W = k4ctx["A16W"]
     AG_RS = k4ctx["AG_RS"]
     CM_K1 = k4ctx["CM_K1"]
     G = k4ctx["G"]
@@ -163,6 +165,10 @@ def router_defs(k4ctx):
             [h[j][e] for j in range(2) for e in range(4)], fx.Int32
         )
 
+    def lds_bf8(word):
+        """16 B of LDS words ``word`` .. + 4 as eight bf16: a MFMA operand."""
+        return fx.Vector(fx.ptr_load(xs + word, result_type=v4f)).bitcast(fx.BFloat16)
+
     def bf16x2(word):
         return fx.Vector.from_elements([word], fx.Int32).bitcast(fx.BFloat16)
 
@@ -263,6 +269,23 @@ def router_defs(k4ctx):
                 )
             gpu.barrier()
             stamp(25)
+            if const_expr(A16N):
+                # the slice's bf16 words for the routed experts (a16w4), tagged
+                if tid < XN_SLICE // 2:
+                    mb_put_words(
+                        mr("xnb"),
+                        k * (HIDDEN // 2) + t * (XN_SLICE // 2) + tid,
+                        [fx.ptr_load(xs + (t * (XN_SLICE // 2) + tid)).bitcast(fx.Int32)],
+                    )
+            if const_expr(A16W):
+                # wide: the slice's bf16 words as plain words (the flag below follows them)
+                if tid < XN_SLICE // 2:
+                    bo.buffer_store(
+                        fx.ptr_load(xs + (t * (XN_SLICE // 2) + tid)).bitcast(fx.Int32),
+                        rsrc(mb("xnbp")),
+                        k * (HIDDEN // 2) + t * (XN_SLICE // 2) + tid,
+                        cache_modifier=CM_DEV,
+                    )
             if tid < XN_SLICE // 4:  # 4 elements a lane, 8 lanes a 32-block
                 w0 = t * (XN_SLICE // 2) + tid * 2
                 f = [
@@ -342,6 +365,7 @@ def router_defs(k4ctx):
         "mx8_scale": mx8_scale,
         "mx8_q": mx8_q,
         "lds_b8": lds_b8,
+        "lds_bf8": lds_bf8,
         "bf16x2": bf16x2,
         "lds_i32": lds_i32,
         "stage_router": stage_router,
