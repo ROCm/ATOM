@@ -643,6 +643,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # weight 0, the original layers' shared expert dropped), on the real activations.
     "ATOM_MONO_CHECK_ROUTED_ONLY": lambda: os.getenv("ATOM_MONO_CHECK_ROUTED_ONLY", "0")
     == "1",
+    # Debug, with ATOM_MONO_CHECK (a16w4 builds): also run the original layer's MoE module alone on the xn
+    # the mono kernel published, so the MoE is compared on identical inputs (no attention difference, no routing flips).
+    "ATOM_MONO_CHECK_MOE": lambda: os.getenv("ATOM_MONO_CHECK_MOE", "0") == "1",
     "ATOM_MONO_MOE_A16W4": lambda: os.getenv("ATOM_MONO_MOE_A16W4", "1") == "1",
     "ATOM_MONO_SP_F32": lambda: os.getenv("ATOM_MONO_SP_F32", "1") == "1",
     "ATOM_MONO_PROD_ROUND": lambda: os.getenv("ATOM_MONO_PROD_ROUND", "1") == "1",
