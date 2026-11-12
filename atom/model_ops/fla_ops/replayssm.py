@@ -403,6 +403,53 @@ def _replay_dot(
     return acc
 
 
+@triton.jit
+def _owns_kg_records(flush_arrivals, slot, i_hv, HV: tl.constexpr, do_flush):
+    """Whether this program stores the step's k / g records.
+
+    k and g do not depend on the V split, so one program of the head stores
+    them. Off a flush that is the first: the step appends past every row its
+    siblings replay. A flush appends at row 0, inside those rows, so the store
+    goes to the last program of the head to count itself in, and it puts the
+    count back to 0 for the next flush. Call it after this program's own loads
+    of the records: the wait and the barrier land every warp's loads before the
+    count, and the store depends on the count, so it needs no acquire. A
+    release would order the loads as well, but it writes back L2 in every
+    program: 65 against 27 us on a flushing 64-row GDN decode.
+    """
+    owns = tl.program_id(0) == 0
+    if do_flush:
+        tl.inline_asm_elementwise(
+            "s_waitcnt vmcnt(0)", "=v,v", [i_hv], dtype=tl.int32, is_pure=False, pack=1
+        )
+        tl.debug_barrier()
+        p_count = flush_arrivals + slot * HV + i_hv
+        owns = tl.atomic_add(p_count, 1, sem="relaxed") == tl.num_programs(0) - 1
+        if owns:
+            tl.store(p_count, 0)
+    return owns
+
+
+#: Zeroed `_owns_kg_records` counts, one per checkpoint slot and head, keyed by
+#: device and size. Never freed: a captured graph keeps the address.
+_FLUSH_ARRIVALS: dict[tuple[torch.device, int], torch.Tensor] = {}
+
+
+def _flush_arrivals(ckpt: torch.Tensor) -> torch.Tensor:
+    key = (ckpt.device, ckpt.shape[0] * ckpt.shape[1])
+    arrivals = _FLUSH_ARRIVALS.get(key)
+    if arrivals is None:
+        # A zeroing recorded into a graph does not run until its replay.
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "replayssm: first call for this checkpoint pool is inside a CUDA "
+                "graph capture; run the step eagerly once before capturing it"
+            )
+        arrivals = torch.zeros(key[1], dtype=torch.int32, device=ckpt.device)
+        _FLUSH_ARRIVALS[key] = arrivals
+    return arrivals
+
+
 # --------------------------------------------------------------------------- #
 # Commit kernel -- runs once per forward, shared by every linear-attn layer    #
 # --------------------------------------------------------------------------- #
@@ -688,6 +735,7 @@ def _replayssm_fwd_kernel(
     buf_k,
     buf_u,
     buf_g,
+    flush_arrivals,
     write_pos,
     slot_idx,
     cu_seqlens,
@@ -857,6 +905,7 @@ def _replayssm_fwd_kernel(
         )
         b_ck += tl.sum(b_kwt * b_xk[:, None], 0)
         b_cq += tl.sum(b_kwt * b_xq[:, None], 0)
+        owns_kg = _owns_kg_records(flush_arrivals, slot, i_hv, HV, do_flush)
 
         if do_flush:
             tl.store(
@@ -866,7 +915,7 @@ def _replayssm_fwd_kernel(
                 ),
                 mask=mask_k[:, None] & mask_v[None, :],
             )
-        if i_v == 0:
+        if owns_kg:
             p_bkt = (
                 buf_k
                 + slot * stride_bufk_slot
@@ -902,7 +951,7 @@ def _replayssm_fwd_kernel(
             + o_v
         )
         tl.store(p_bu, b_u.to(p_bu.dtype.element_ty), mask=mask_v)
-        if i_v == 0:
+        if owns_kg:
             p_bg2 = buf_g + slot * stride_bufg_slot + base * stride_bufg_pos
             tl.store(p_bg2 + i_hv * stride_bufg_hv, b_gt.to(p_bg2.dtype.element_ty))
         return
@@ -938,6 +987,7 @@ def _replayssm_fwd_kernel(
         BH,
         IS_KDA,
     )
+    owns_kg = _owns_kg_records(flush_arrivals, slot, i_hv, HV, do_flush)
     if T1_FAST:
         # T == 1: nothing chains from token to token, so S_h is never needed as
         # a value -- only its two contractions, S_h^T k and S_h^T q, and both
@@ -1007,7 +1057,7 @@ def _replayssm_fwd_kernel(
             + o_v
         )
         tl.store(p_bu, b_u.to(p_bu.dtype.element_ty), mask=mask_v)
-        if i_v == 0:
+        if owns_kg:
             p_bk = (
                 buf_k
                 + slot * stride_bufk_slot
@@ -1093,9 +1143,7 @@ def _replayssm_fwd_kernel(
             + o_v
         )
         tl.store(p_bu, b_v.to(p_bu.dtype.element_ty), mask=mask_v)
-        # k and g do not depend on the V split; let one program own the store
-        # instead of having every V-block redundantly write the same bytes.
-        if i_v == 0:
+        if owns_kg:
             p_bk = (
                 buf_k
                 + slot * stride_bufk_slot
@@ -1523,6 +1571,7 @@ def replayssm_gated_delta_rule(
         buf_k=buf_k,
         buf_u=buf_u,
         buf_g=buf_g,
+        flush_arrivals=_flush_arrivals(ckpt),
         write_pos=write_pos,
         slot_idx=slot_idx,
         cu_seqlens=cu_seqlens,
@@ -1616,6 +1665,7 @@ def _replayssm_kda_fwd_kernel(
     buf_k,
     buf_u,
     buf_g,
+    flush_arrivals,
     write_pos,
     slot_idx,
     cu_seqlens,
@@ -1709,6 +1759,7 @@ def _replayssm_kda_fwd_kernel(
         BH,
         True,
     )
+    owns_kg = _owns_kg_records(flush_arrivals, slot, i_hv, HV, do_flush)
     # KDA keeps the state transposed as [BV, BK], so the contraction is u^T @ k~.
     b_h = b_h * b_decay[None, :]
     b_h += _replay_dot(tl.trans(b_ru), b_kw, False, DOT_MODE)
@@ -1755,7 +1806,7 @@ def _replayssm_kda_fwd_kernel(
             + o_v
         )
         tl.store(p_bu, b_v.to(p_bu.dtype.element_ty), mask=mask_v)
-        if i_v == 0:
+        if owns_kg:
             p_bk = (
                 buf_k
                 + slot * stride_bufk_slot
@@ -1861,6 +1912,7 @@ def replayssm_sigmoid_gating_delta_rule(
         buf_k=buf_k,
         buf_u=buf_u,
         buf_g=buf_g,
+        flush_arrivals=_flush_arrivals(ckpt),
         write_pos=write_pos,
         slot_idx=slot_idx,
         cu_seqlens=cu_seqlens,
