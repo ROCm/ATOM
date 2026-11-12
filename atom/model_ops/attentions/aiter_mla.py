@@ -3197,7 +3197,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 vars_used.append(("sparse_kv_indptr", running_bs + 1))
 
         max_model_len = self.model_runner.config.max_model_len
-        max_seqlen_k = context_lens.max(initial=0)
+        max_seqlen_k = int(context_lens.max(initial=0))
 
         ctx = {el: var[el].gpu[:num] for el, num in vars_used}
         counts = dict(vars_used, positions=running_tokens)

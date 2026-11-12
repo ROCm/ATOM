@@ -38,14 +38,12 @@ def test_mxfp4_method_selection(monkeypatch, backend_name, sp):
         moe_mod.FusedMoE._validate_moe_backend(SimpleNamespace(quant_method=selected))
 
 
-@pytest.mark.parametrize("fp8_activations", [False, True])
-def test_fp8_activations_interleave_without_the_env_flag(monkeypatch, fp8_activations):
-    # aiter's A8W4 kernels read interleaved gate/up rows only, so a layer that
-    # asks for MXFP8 activations must get that layout whatever the env says.
+def _mxfp4_method(monkeypatch, gfx, fp8_activations):
+    """An Mxfp4MoEMethod on `gfx` with ATOM_MOE_GU_ITLV off."""
     monkeypatch.setattr(
         moe_mod, "get_current_atom_config", lambda: SimpleNamespace(eplb_enable=False)
     )
-    monkeypatch.setattr(moe_mod, "get_gfx", lambda: "gfx950")
+    monkeypatch.setattr(moe_mod, "get_gfx", lambda: gfx)
     monkeypatch.setattr(moe_mod.envs, "is_set", lambda _name: True)
     monkeypatch.setattr(moe_mod.envs, "ATOM_USE_TRITON_MOE", False)
     monkeypatch.setattr(moe_mod.envs, "ATOM_MOE_GU_ITLV", False)
@@ -59,14 +57,30 @@ def test_fp8_activations_interleave_without_the_env_flag(monkeypatch, fp8_activa
         in_dtype=torch.bfloat16,
         hidden_dim=256,
     )
+    return moe_mod.Mxfp4MoEMethod(quant_config, moe_config)
 
-    method = moe_mod.Mxfp4MoEMethod(quant_config, moe_config)
+
+@pytest.mark.parametrize("fp8_activations", [False, True])
+def test_fp8_activations_interleave_without_the_env_flag(monkeypatch, fp8_activations):
+    # aiter's A8W4 kernels read interleaved gate/up rows only, so a layer that
+    # asks for MXFP8 activations must get that layout whatever the env says.
+    method = _mxfp4_method(monkeypatch, "gfx950", fp8_activations)
 
     assert method.fp8_activations is fp8_activations
     assert method.is_guinterleave is fp8_activations
     # Routed rows that move between ranks travel in the MXFP8 the experts take.
     wire = method.routed_rows_wire
     assert (wire is not None and wire.dtype == moe_mod.dtypes.fp8) is fp8_activations
+
+
+@pytest.mark.parametrize("fp8_activations", [False, True])
+def test_gfx1250_interleaves_without_the_env_flag(monkeypatch, fp8_activations):
+    # aiter's gfx1250 fused_moe rejects the separated gate/up layout, so every
+    # MXFP4 layer there gets interleaved rows, MXFP8 activations or not.
+    method = _mxfp4_method(monkeypatch, "gfx1250", fp8_activations)
+
+    assert method.is_gfx1250 is True
+    assert method.is_guinterleave is True
 
 
 @pytest.mark.parametrize(
