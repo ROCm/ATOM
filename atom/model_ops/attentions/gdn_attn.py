@@ -599,33 +599,47 @@ class GDNStateMixin(PoolRowsMixin):
         rather than one contiguous entry, so there is no single range to
         duplicate — and at one token the fork binds almost nothing anyway.
 
-        NOT midstep-readable, though the machinery for it is present and its
-        numerical claim holds. The chunk kernel materializes the recurrent
-        state at every 64-token boundary, `write_state_checkpoints` copies
-        those out, and `tests/test_gdn_midstep_state_gpu.py` shows a slice of
-        `h` is bit-exact against a forward stopped there. What is missing is
-        everything between: the write path declines on six conditions that
-        `commit_midstep` cannot see, its row index spans three differently
-        scoped sequence lists, and its SSM read floors to a 64 grid that
-        `midstep_positions` does not enforce (`hash_block_size` defaults to
-        16). Each of those stores a findable image holding the wrong state,
-        which is worse than storing nothing.
+        Midstep-readable under `ATOM_GDN_STATE_MIDSTEP=1`, through the same
+        write path as the PAGE transfer below. The chunk kernel materializes
+        the recurrent state at every 64-token boundary of a forward, and
+        `write_state_checkpoints` copies each reserved position out of it into
+        an ordinary pool slot that `StateSlotPool.publish_midstep` files after
+        the forward. What once kept this off is shared with the PAGE path and
+        fixed there:
+          * the scheduler and the runner agree on what is writable through
+            `midstep_target_ok`, and a reservation the forward cannot write
+            raises instead of publishing a hash over unwritten bytes;
+          * rows go through `ScheduledBatch.state_rows`, not one index over
+            three differently scoped lists;
+          * positions are snapped onto the forward's own 64-token grid, and
+            non-final chunks end on a hash block so the next grid stays on it;
+          * the conv checkpoint is the `conv_kernel - 1` window the prefill
+            conv kernel resumes from.
+        `tests/test_gdn_midstep_checkpoints.py` covers the scheduler side on
+        this fork transfer; `tests/test_gdn_midstep_state_gpu.py` shows a slice
+        of `h` is bit-exact against a forward stopped there.
 
-        None of it has ever run under a server: Kimi-K3 takes the PAGE path and
-        cannot reach this one, so every measurement in this area is of the
-        other mechanism. Declaring `False` costs a shortened prefill chunk per
-        placement — the cost every backend paid before — and is what the
-        evidence supports. Flip it back with the fixes and an end-to-end run,
-        not before.
-
-        Exact, not approximate, when it is turned back on: `h` is `k.new_empty`
-        and `_state_dtypes` returns `config.torch_dtype`, so slicing `h` rounds
-        exactly where a shortened forward would. That rests on the two dtypes
-        agreeing; kimi_linear's temporal side is `ATOM_GDN_SSM_DTYPE` and need
-        not, so it overrides unconditionally
-        (`_KimiMLAGDNCommon.state_transfer`).
+        Exact only while the SSM state is stored at the dtype `h` is computed
+        in (`k.new_empty`, the model dtype): slicing `h` then rounds exactly
+        where a shortened forward would. kimi_linear and glm5_next store it at
+        `ATOM_GDN_SSM_DTYPE` and do not reach this method
+        (`_KimiMLAGDNCommon.state_transfer`); any other model storing it at
+        another dtype stays unreadable and keeps its prefill cuts.
         """
-        return StateTransfer.fork(1, readable_midstep=False)
+        _, ssm_dtype = self._state_dtypes()
+        if (
+            not envs.ATOM_GDN_STATE_MIDSTEP
+            or ssm_dtype != self.model_runner.config.torch_dtype
+        ):
+            return StateTransfer.fork(1, readable_midstep=False)
+        from atom.model_ops.fla_ops.chunk import CHUNK_SIZE
+
+        return StateTransfer.fork(
+            1,
+            readable_midstep=True,
+            midstep_grid=CHUNK_SIZE,
+            midstep_min_offset=self._conv_state_len(),
+        )
 
     def num_state_layers(self) -> int:
         """Layers holding a recurrent state, one slot each.
