@@ -70,8 +70,8 @@ def test_perf_cells_compare_with_the_newest_earlier_success_not_the_failure_afte
     _, c64 = perf_cells(rows, "endpoint", "kimi-k3", "2026-11-14")
     assert (c64.status, c64.value, c64.second) == ("ok", 380.0, 42.0)
     assert (c64.prev, c64.prev_second, c64.prev_date) == (400.0, 40.0, "2026-10-31")
-    assert (c64.best, c64.prev_failed, c64.gpus) == (420.0, True, 8)
-    assert (round(c64.delta, 4), round(c64.delta_best, 4)) == (-0.05, -0.0952)
+    assert (c64.prev_failed, c64.gpus) == (True, 8)
+    assert round(c64.delta, 4) == -0.05
 
 
 def test_a_wednesday_session_on_a_saturday_image_is_keyed_by_its_test_date():

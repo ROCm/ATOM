@@ -11,7 +11,6 @@ from ci455_data import LABEL
 PERF_UP = 0.03  # throughput up by this much against the last success: progress
 PERF_DOWN = -0.03  # down by this much: regression
 PERF_SEVERE = -0.10  # down by this much: severe regression
-BEST_DRIFT = -0.05  # this far below the best earlier image: slow regression
 ACC_WARN = 0.04  # GSM8K down by more than this (0.01 = one point): regression
 ACC_SEVERE = 0.06
 LOG_LINES = 60  # core error log lines shown in the detailed report
@@ -130,8 +129,8 @@ def _phrase(cells, top, key, template, flag=perf_flag):
 
 def _news(results):
     """(category, slug, line) per piece of news, most important first:
-    failures, severe and plain regressions (throughput, then GSM8K), slow
-    slides below the best, progress, recoveries."""
+    failures, severe and plain regressions (throughput, then GSM8K),
+    progress, recoveries. Everything is against the previous success."""
     items = []
     for r in results:
         who, top = short_name(r.name), headline(r)
@@ -168,25 +167,6 @@ def _news(results):
                     1 if flag == "🔴" else 2,
                     r.slug,
                     f"{flag} {who}: GSM8K down {abs(r.acc.delta) * 100:.1f} points to {score(r.acc.value)}.",
-                )
-            )
-        slide = [
-            c
-            for c in r.perf
-            if c not in down
-            and c.delta_best is not None
-            and round(c.delta_best, 6) <= BEST_DRIFT
-        ]
-        if slide:
-            items.append(
-                (
-                    3,
-                    r.slug,
-                    (
-                        f"⚠️ {who}: "
-                        f"{_phrase(slide, top, lambda c: c.delta_best, '{subject} {pct} below its best')}"
-                        " (gradual decline)."
-                    ),
                 )
             )
         up = [c for c in r.perf if perf_flag(c.delta) == "🟢"]

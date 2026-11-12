@@ -31,7 +31,7 @@ python3 -m pytest -q                         # 改了脚本先跑测试
 
 `examples/` 是 **EXAMPLE（示例）**：一份编出来的数据目录，结构和 `recipes/455-CI/` 一样，数字都不是真实测试数据，报告和图上都标了 EXAMPLE。里面是最近一周的两场：
 
-- 周六 11-14，MLPerf Endpoint：[报告](examples/reports/455-CI-report-20261114.md)、[详细报告](examples/reports/455-CI-report-20261114-detail.md)。DeepSeek-V4.1-Flash 提升 6%，DeepSeek R1 每周掉 1.5% 累积成慢回退，Kimi-K3 上一场跑挂这场恢复，Qwen-35B-A3B 的 c64 跑挂。
+- 周六 11-14，MLPerf Endpoint：[报告](examples/reports/455-CI-report-20261114.md)、[详细报告](examples/reports/455-CI-report-20261114-detail.md)。DeepSeek-V4.1-Flash 提升 6%，Kimi-K3 上一场跑挂这场恢复，Qwen-35B-A3B 的 c64 跑挂。
 - 周三 11-18，8K/1K（用 11-14 的镜像）：[报告](examples/reports/455-CI-report-20261118.md)、[详细报告](examples/reports/455-CI-report-20261118-detail.md)。GLM-5.2 的 c64 回退 4%，MiniMax-M3 的 GSM8K 掉了 4.7 个点。
 
 ![MLPerf Endpoint 每卡吞吐趋势（EXAMPLE）](examples/runs/20261114/charts/perf-endpoint.png)

@@ -17,8 +17,8 @@
 
 | Model | Parallelism | Concurrency | tok/s/GPU | vs 2026-11-07 | E2E avg interactivity (tok/s/user) | vs 2026-11-07 |
 |---|---|---|---|---|---|---|
-| DeepSeek R1 | tp4 | 4 | 150 | −1.7% | 149 | −0.6% |
-| DeepSeek R1 | tp4 | 64 | 1,363 | −1.4% | 57.8 | −0.9% |
+| DeepSeek R1 | tp4 | 4 | 164 | +0.2% | 149 | −0.6% |
+| DeepSeek R1 | tp4 | 64 | 1,491 | +0.6% | 57.8 | −0.9% |
 | DeepSeek-V4.1-Flash | dp4ep4 | 4 | 250 | 🟢 +6.6% | 209 | −0.5% |
 | DeepSeek-V4.1-Flash | dp4ep4 | 64 | 2,838 | 🟢 +6.9% | 94.5 | +0.4% |
 | Kimi-K3 (2.8T) | tp8dcp8 | 4 | 56.5 | +0.7% (vs 2026-10-31) | 105 | −0.7% (vs 2026-10-31) |

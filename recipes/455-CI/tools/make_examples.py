@@ -4,10 +4,10 @@
 Made-up numbers in the real layout (perf.csv, accuracy.csv, runs/, reports/)
 to show what the reports look like. Each week has two sessions on one image:
 Saturday runs MLPerf Endpoint, Wednesday runs 8K/1K. In the newest Saturday
-session (11-14) DeepSeek-V4.1-Flash gains 6%, DeepSeek R1 has slid 1.5% a
-week below its best, Kimi-K3 recovers from a failed 11-07 and Qwen-35B-A3B
-fails at c64; in the Wednesday session after it (11-18) GLM-5.2 c64 drops 4%
-and MiniMax-M3 loses 4.7 GSM8K points. The charts and reports say EXAMPLE.
+session (11-14) DeepSeek-V4.1-Flash gains 6%, Kimi-K3 recovers from a failed
+11-07 and Qwen-35B-A3B fails at c64; in the Wednesday session after it
+(11-18) GLM-5.2 c64 drops 4% and MiniMax-M3 loses 4.7 GSM8K points. The
+charts and reports say EXAMPLE.
 """
 
 import csv
@@ -101,8 +101,6 @@ ERROR_LOG = """\
 def scale(model, conc, image):
     """Throughput multiplier of a point on an image."""
     week = IMAGES.index(image)
-    if model == "deepseek-r1":  # flat, then 1.5% down every week
-        return 1.0 if week <= 3 else 1 - 0.015 * (week - 3)
     m = 1 + 0.004 * week
     if model == "deepseek-v4.1-flash" and image == NEWEST:
         m *= 1.06

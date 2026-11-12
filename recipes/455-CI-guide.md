@@ -464,14 +464,15 @@ recipes/
 
 `make_report.py` 按下表比较本次和历史结果，生成草稿；测试 agent 读一遍再提交，可以改措辞，但不能删掉 ❌ 和 🔴 的条目，也不能改数字。
 
-| 标记 | 什么时候算 | 和谁比 | 写法 |
-|---|---|---|---|
-| ❌ | 任一并发或 GSM8K 跑挂 | — | `c64 failed (<一句话报错>)`、`all runs failed (…)` |
-| 🔴 | 吞吐低 10% 及以上，或 GSM8K 掉超过 0.06 | 该模型最近一次成功的镜像（"上次"） | `throughput down 11.0%`、`GSM8K down 7.0 points to 88.0%` |
-| ⚠️ | 吞吐低 3% 及以上，或 GSM8K 掉超过 0.04 | 上次 | `throughput down 4.2%`、`GSM8K down 4.6 points to 88.1%` |
-| ⚠️ | 吞吐比历史最佳低 5% 及以上：每次都没到 3%，累积起来的 | 之前所有镜像里的最好值 | `throughput 6.2% below its best (gradual decline)` |
-| 🟢 | 吞吐高 3% 及以上 | 上次 | `throughput up 6.9%` |
-| ✅ | 上次跑挂，这次跑通 | 上次 | `recovered from the previous failure` |
+所有比较都对该模型最近一次成功的那一场（"上一场"），不和更早的最好成绩比。
+
+| 标记 | 什么时候算 | 写法 |
+|---|---|---|
+| ❌ | 任一并发或 GSM8K 跑挂 | `c64 failed (<一句话报错>)`、`all runs failed (…)` |
+| 🔴 | 吞吐比上一场低 10% 及以上，或 GSM8K 掉超过 0.06 | `throughput down 11.0%`、`GSM8K down 7.0 points to 88.0%` |
+| ⚠️ | 吞吐比上一场低 3% 及以上，或 GSM8K 掉超过 0.04 | `throughput down 4.2%`、`GSM8K down 4.6 points to 88.1%` |
+| 🟢 | 吞吐比上一场高 3% 及以上 | `throughput up 6.9%` |
+| ✅ | 上一场跑挂，这一场跑通 | `recovered from the previous failure` |
 
 - throughput 指并发 64 的每卡吞吐，和总表一致。并发 4 按同样的门槛判断，但只在 c64 没变化、或并发 4 更严重时才写，例如 `c4 throughput down 5.0%`。
 - GSM8K 看 flexible-extract，差值按点算（0.01 = 1 point）。

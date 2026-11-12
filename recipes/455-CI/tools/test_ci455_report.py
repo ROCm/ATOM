@@ -9,7 +9,6 @@ def pc(
     value,
     prev,
     status="ok",
-    best=None,
     prev_failed=False,
     error="",
     prev_date="2026-11-07",
@@ -22,7 +21,6 @@ def pc(
         prev=prev,
         prev_second=None,
         prev_date=prev_date if prev is not None else None,
-        best=prev if best is None else best,
         prev_failed=prev_failed,
         error=error,
         gpus=4,
@@ -155,21 +153,6 @@ def test_a_gain_of_3_percent_is_progress():
     )
     (alpha,) = about(hl, "Alpha")
     assert alpha.startswith("🟢 Alpha: ") and "throughput up 4.0%" in alpha
-
-
-def test_a_slow_slide_below_the_best_is_flagged_though_each_step_is_small():
-    hl = highlights(
-        [
-            model(
-                "Alpha",
-                pc(4, 100.0, 100.0),
-                pc(64, 980.0, 990.0, best=1040.0),
-                ac(0.95, 0.95),
-            )
-        ]
-    )
-    (alpha,) = about(hl, "Alpha")
-    assert alpha.startswith("⚠️ Alpha: ") and "5.8% below its best" in alpha
 
 
 def test_an_accuracy_drop_over_004_is_flagged_and_over_006_is_severe():
@@ -367,3 +350,37 @@ def test_the_delta_matches_the_numbers_shown():
         "2026-11-07",
     )
     assert row[2:5] == ["336", "340", "+4 (+1.0%)"]  # 340 − 336, not the unrounded 3.2
+
+
+def test_only_the_previous_session_counts_not_an_older_best():
+    from ci455_data import acc_cell, perf_cells
+
+    def row(date, tput):
+        return {
+            "image_date": date,
+            "test_date": date,
+            "scenario": "endpoint",
+            "model": "alpha",
+            "gpus": "4",
+            "concurrency": "64",
+            "status": "ok",
+            "tok_s_per_gpu": tput,
+            "interactivity": "50",
+        }
+
+    # about 1% down each session: 5.8% below the 10-17 best, 1.0% below the last session
+    rows = [
+        row("2026-10-17", "1040"),
+        row("2026-10-24", "1010"),
+        row("2026-10-31", "1000"),
+        row("2026-11-07", "990"),
+        row("2026-11-14", "980"),
+    ]
+    result = ModelResult(
+        "endpoint",
+        "alpha",
+        "Alpha",
+        perf_cells(rows, "endpoint", "alpha", "2026-11-14", (64,)),
+        acc_cell([], "endpoint", "alpha", "2026-11-14"),
+    )
+    assert highlights([result]) == NONE

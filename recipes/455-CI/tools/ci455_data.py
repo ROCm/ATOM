@@ -72,7 +72,6 @@ class PerfCell:
     )  # tok/s per GPU in the newest earlier session where this point succeeded
     prev_second: float | None
     prev_date: str | None
-    best: float | None  # the highest tok/s per GPU of any earlier session
     prev_failed: bool  # the point failed in the newest earlier session that ran it
     error: str
     gpus: int | None
@@ -81,10 +80,6 @@ class PerfCell:
     @property
     def delta(self):
         return _ratio(self.value, self.prev)
-
-    @property
-    def delta_best(self):
-        return _ratio(self.value, self.best)
 
     @property
     def delta_second(self):
@@ -189,7 +184,6 @@ def perf_cells(rows, scenario, model, date, concurrencies=CONCURRENCIES):
                 prev=_number(prev["tok_s_per_gpu"]) if prev else None,
                 prev_second=_number(prev.get(second)) if prev else None,
                 prev_date=prev["test_date"] if prev else None,
-                best=max(_number(r["tok_s_per_gpu"]) for r in good) if good else None,
                 prev_failed=bool(earlier)
                 and last[(earlier[-1], conc)]["status"] != "ok",
                 error=(now or {}).get("error", "") if status == "fail" else "",
