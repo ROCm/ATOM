@@ -255,8 +255,10 @@ def test_mhc_guard_outputs_and_input_alias(mode, backend):
         "post_mult": 2.0,
         "norm_eps": 1e-6,
     }
-    if backend == "asm" and not mhc._asm_seam_supported(hc, hidden):
-        pytest.skip("AITER gfx942 ASM seam unavailable")
+    if backend == "asm" and mode == "pre":
+        pytest.skip("seams without a post never take the ASM seam")
+    if backend == "asm" and not mhc.use_asm_seam(hc, hidden):
+        pytest.skip("AITER's ASM seam does not run here")
     if backend in ("hip", "hip_quant"):
         arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
         if arch not in ("gfx950", "gfx1250"):
@@ -302,7 +304,7 @@ def test_mhc_guard_outputs_and_input_alias(mode, backend):
                 torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         else:
             assert all(torch.isfinite(out).all() for out in outputs)
-        if backend == "asm" and mode != "pre":
+        if backend == "asm":
             import aiter
 
             r, post_mix, comb = (
