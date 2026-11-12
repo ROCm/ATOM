@@ -97,11 +97,10 @@ def test_transformed_error_ids_are_ready_before_async_copy():
         tokens = torch.full((128, 6), 7, device="cuda", dtype=torch.int32)
         failed = torch.arange(128, device="cuda") % 2 == 0
         ready.record()
-        for _ in range(5):
-            # Leave work after the caller's ready event, before output encoding.
-            torch.mm(
-                torch.ones(512, 512, device="cuda"), torch.ones(512, 512, device="cuda")
-            )
+        # Leave a long stretch of device work after the caller's ready event,
+        # before output encoding: the copy stream races it unless it waits on
+        # the re-recorded event.
+        torch.cuda._sleep(1_000_000_000)
         p.prepare_sampled_ids(
             SimpleNamespace(req_ids=list(range(128))),
             tokens,
@@ -112,3 +111,65 @@ def test_transformed_error_ids_are_ready_before_async_copy():
     assert (out[::2] == -2).all()
     assert (out[1::2] == 7).all()
     assert (p.prev_token_ids == 7).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
+@pytest.mark.parametrize("speculative", [False, True])
+@pytest.mark.parametrize(
+    "preserve", [[True, False, True], [False, True, False], [True, True, False]]
+)
+def test_channel_kernel_per_request_preserve_matches_reference(speculative, preserve):
+    """A per-request preserve tensor keeps the forced token's -inf only for the
+    requests that have another hard rule; the Triton kernel must agree with the
+    CPU reference row by row, for bonus and target rows."""
+    from atom.model_ops.required_channel import (
+        DeviceChannel,
+        constrain_logits,
+        constrain_logits_reference,
+    )
+    from atom.sampling_params import RequiredChannel
+
+    channel = RequiredChannel(after=(1,), opening=(2,), opens_at=1, end_ids=(3,))
+    device_channel = DeviceChannel.of(channel, torch.device("cuda"))
+    vocab = 40
+    generator = torch.Generator().manual_seed(7)
+    last = torch.randn(3, vocab, generator=generator)
+    last[:, 2] = -float("inf")  # the forced token is ruled out in every row
+    states = torch.tensor([1, 1, 1], dtype=torch.int32)  # all at the opening
+    extra_cpu, extra_gpu = {}, {}
+    if speculative:
+        target = torch.randn(6, vocab, generator=generator)
+        target[:, 2] = -float("inf")
+        cu = torch.tensor([2, 4, 6], dtype=torch.int32)
+        ids = torch.arange(vocab, dtype=torch.int32)
+        rows = torch.arange(6, dtype=torch.int32)
+        extra_cpu = {
+            "target_logits": target.clone(),
+            "cu_num_draft_tokens": cu,
+            "input_ids": ids,
+            "target_logits_indices": rows,
+        }
+        extra_gpu = {
+            "target_logits": target.cuda(),
+            "cu_num_draft_tokens": cu.cuda(),
+            "input_ids": ids.cuda(),
+            "target_logits_indices": rows.cuda(),
+        }
+    keep = torch.tensor(preserve)
+    expected = last.clone()
+    constrain_logits_reference(
+        channel, states.clone(), expected, preserve_masks=keep, **extra_cpu
+    )
+    actual = last.cuda()
+    constrain_logits(
+        device_channel, states.cuda(), actual, preserve_masks=keep.cuda(), **extra_gpu
+    )
+    torch.testing.assert_close(actual.cpu(), expected, equal_nan=True)
+    if not speculative:
+        # Preserved rows keep the forced token forbidden, the others repair it.
+        for row, kept in enumerate(preserve):
+            assert torch.isneginf(expected[row, 2]).item() == kept
+    else:
+        torch.testing.assert_close(
+            extra_gpu["target_logits"].cpu(), extra_cpu["target_logits"], equal_nan=True
+        )

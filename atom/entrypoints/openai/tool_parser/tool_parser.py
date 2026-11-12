@@ -356,20 +356,51 @@ class ToolCallParser(ABC):
 
     @classmethod
     def channel_rule(cls):
-        """Declare the format's required tool channel, if any."""
+        """Declare the tool channel a request that must call a tool is held to.
+
+        Returns a `ChannelRule` (the format's own control strings, compiled to
+        token ids once per server by the common `ConstraintParser`), or None to
+        leave the output unconstrained. None for every format but Kimi-K3,
+        whose answer either closes the message or opens the tools channel at
+        one token -- the place a model told it MUST call a tool still sometimes
+        ends instead.
+        """
 
     @classmethod
     def required_call_channel(cls, tokenizer) -> RequiredChannel | None:
-        """Compatibility bridge to common constraint parsing."""
+        """What a request that must call a tool holds the output to, in this
+        format's token ids; None leaves it unconstrained.
+
+        Public hook, kept for formats and callers that override it: the default
+        compiles `channel_rule()` through the common `ConstraintParser`.
+        Derived once per server, where the parser is resolved
+        (`registry.required_call_channel`).
+        """
         return ConstraintParser.parse(cls.channel_rule(), tokenizer)
 
     @classmethod
     def tool_grammar_rule(cls, functions, *, required, starts_in_reasoning):
+        """Declare a Lark (llguidance) grammar for the rest of the assistant
+        message as a `ToolGrammarRule`, or None to leave the output
+        unconstrained. Arguments are those of `tool_call_grammar`."""
         return None
 
     @classmethod
     def tool_call_grammar(cls, functions, *, required, starts_in_reasoning):
-        """Compatibility bridge for format grammar declarations."""
+        """A Lark (llguidance) grammar for the rest of the assistant message
+        that holds this format's calls to ``functions``; None leaves the output
+        unconstrained.
+
+        ``functions`` are the function objects the request lets the model
+        call; ``required`` means it must call one; ``starts_in_reasoning``
+        says whether the prompt opened the reasoning channel. Applied to a chat
+        request that declares tools and no response format when
+        ATOM_TOOL_CALL_GRAMMAR=1 (`structured_output.validation.
+        configure_tool_call_grammar`). None for every format but Kimi-K3.
+
+        Public hook, kept for formats and callers that override it: the default
+        compiles `tool_grammar_rule(...)` through the common `ConstraintParser`.
+        """
         return ConstraintParser.parse(
             cls.tool_grammar_rule(
                 functions, required=required, starts_in_reasoning=starts_in_reasoning

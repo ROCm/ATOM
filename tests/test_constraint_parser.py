@@ -6,6 +6,8 @@ import subprocess
 import sys
 from typing import ClassVar
 
+import pytest
+
 from atom.constraint_parser import ConstraintParser, GrammarRule
 
 
@@ -149,9 +151,6 @@ def test_registered_provider_traverses_complete_lifecycle(monkeypatch):
         ("commit", native),
         ("release", None),
     ]
-
-
-import pytest
 
 
 @pytest.mark.parametrize("spec", [False, True])
@@ -388,3 +387,59 @@ def test_request_resource_ownership_survives_native_pickle(monkeypatch):
     assert parser.needs_constraint_release(structured)
     assert parser.needs_constraint_release(restored)
     assert restored.id == 73
+
+
+class _CharTokenizer:
+    """Each name in `whole` is one id; every other character is its own id."""
+
+    def __init__(self, whole):
+        self.whole = sorted(whole, key=len, reverse=True)
+        self.ids = {}
+
+    def _id(self, piece):
+        return self.ids.setdefault(piece, len(self.ids) + 1000)
+
+    def encode(self, text, add_special_tokens=False):
+        assert add_special_tokens is False
+        out, i = [], 0
+        while i < len(text):
+            for name in self.whole:
+                if text.startswith(name, i):
+                    out.append(self._id(name))
+                    i += len(name)
+                    break
+            else:
+                out.append(self._id(text[i]))
+                i += 1
+        return out
+
+
+K3_CONTROLS = ("<|open|>", "<|close|>", "<|sep|>", "<|end_of_msg|>")
+
+
+def test_k3_channel_rule_compiles_to_the_forced_opening():
+    from atom.entrypoints.openai import kimi_k3_tokens as k3
+    from atom.entrypoints.openai.tool_parser.kimi_k3_tool_parser import KimiK3Parser
+
+    tokenizer = _CharTokenizer(K3_CONTROLS)
+    channel = ConstraintParser.parse(KimiK3Parser.channel_rule(), tokenizer)
+    assert channel.after == tuple(tokenizer.encode(k3.RESPONSE_END))
+    assert channel.end_ids == (tokenizer.ids["<|end_of_msg|>"],)
+    start = tokenizer.encode(k3.TOOLS_START)
+    assert channel.opens_at == len(start)
+    assert channel.opening[: len(start)] == tuple(start)
+
+
+@pytest.mark.parametrize("split", K3_CONTROLS)
+def test_k3_channel_is_not_held_when_a_control_token_is_split(split, caplog):
+    import logging
+
+    from atom.entrypoints.openai.tool_parser.kimi_k3_tool_parser import KimiK3Parser
+
+    tokenizer = _CharTokenizer(set(K3_CONTROLS) - {split})
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        assert ConstraintParser.parse(KimiK3Parser.channel_rule(), tokenizer) is None
+    (record,) = caplog.records
+    message = record.getMessage()
+    assert message.startswith("Kimi-K3 tool calls:")
+    assert split in message and 'tool_choice="required"' in message

@@ -235,12 +235,34 @@ class KimiK3Parser(ToolCallParser):
 
     @classmethod
     def tool_grammar_rule(cls, functions, *, required, starts_in_reasoning):
+        """Hold every call in the tools section to its tool's schema
+        (`kimi_k3_grammar.py`)."""
         return ToolGrammarRule(
             build_tool_call_grammar, functions, required, starts_in_reasoning
         )
 
     @classmethod
     def channel_rule(cls):
+        """Open the tools channel where the response channel closes.
+
+        After `<|close|>response<|sep|>` K3 either writes
+        `<|open|>tools<|sep|>` or closes the message. Told it MUST call a tool,
+        it still closed the message on 85-100% of the Kimi-Vendor-Verifier
+        failures, writing the arguments as its answer. So the opening is
+        forced through the call's name attribute, which is where vLLM's K3
+        structural tag also commits to a call, and the message cannot end
+        before it. The tool name and arguments stay the model's. Writing
+        `<|open|>tools<|sep|>` itself, by any other way, opens it too.
+
+        The common parser compiles this rule to None, constraining nothing and
+        saying so at startup, if the tokenizer does not read a control token as
+        a single id, or does not encode the forced opening as
+        `<|open|>tools<|sep|>` followed by the call's start: forcing either
+        would hand the model a sequence it never writes, and the second would
+        also misplace where the channel counts as open. `end` is the format's
+        own end only: the engine adds every id it stops on
+        (`RequiredChannel.ending_on`), from the same config it stops by.
+        """
         return ChannelRule(
             after=k3.RESPONSE_END,
             opening=k3.TOOLS_START + KIMI_K3_CALL_PREFIX,

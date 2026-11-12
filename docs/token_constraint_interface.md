@@ -59,8 +59,11 @@ Register adapters with `register_constraint_provider`. An adapter declares:
   An out-of-tree adapter therefore also calls
   `atom.constraint_parser.register_constraint_request_owner(backend, predicate)`
   from a module that the engine/coordinator process imports; this needs no
-  execution backend import and is idempotent for the same predicate. The
-  built-in grammar predicate is in the default table and needs no registration.
+  execution backend import and is idempotent for the same predicate. ATOM has
+  no plugin hook that imports out-of-tree modules into the spawned engine and
+  worker processes, so an out-of-tree adapter needs its embedding application to
+  import (and register) it in both; an in-tree adapter adds its predicate to the
+  default table in `atom.constraint_parser`, as the built-in grammar one does.
   Ordinary requests and stateless channels do not acquire an extra cleanup RPC.
   The built-in grammar predicate retains the original Schema/tool-format
   ownership rules.

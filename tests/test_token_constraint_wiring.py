@@ -12,6 +12,7 @@ error delivery, release, and the RapidServe prefill path.
 """
 
 import contextlib
+import random
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -87,7 +88,7 @@ class FakeAdapter:
             self.on_apply(step, binding)
 
     def commit(self, step, tokens, batch, deferred, failure, binding):
-        self.calls.append(("commit", failure))
+        self.calls.append(("commit", failure, deferred))
         return self.commit_result
 
 
@@ -565,6 +566,7 @@ def _postprocess_runner(ids, deferred, prev_batch=None):
 
     def prepare_sampled_ids(batch, sampled, event, payload, **kwargs):
         seen["failed"] = kwargs["constraint_failed"]
+        seen["channel_states"] = kwargs["channel_states"]
         seen["sampled"] = sampled.clone()
         return dict(ids), None
 
@@ -746,3 +748,175 @@ def test_rapidserve_prefill_rejects_a_step_with_no_valid_continuation(monkeypatc
     runner = _rapid_runner(monkeypatch, logits)
     with pytest.raises(ValueError, match="no valid continuation"):
         runner.prefill_forward(_rapid_batch("stateless"))
+
+
+# -- failure positions over ragged drafts -------------------------------------
+
+
+def _reference_failed(drafts, invalid, target_invalid, tokens):
+    """Independent per-position oracle: draft position j of a request fails on
+    its own target row, the bonus position (j == drafts) on its bonus row, and
+    only emitted (non-negative) tokens count."""
+    out, start = [], 0
+    for i, count in enumerate(drafts):
+        bad = False
+        for j, token in enumerate(tokens[i]):
+            if token < 0:
+                continue
+            if j < count:
+                bad |= bool(target_invalid is not None and target_invalid[start + j])
+            elif j == count:
+                bad |= bool(invalid is not None and invalid[i])
+        out.append(bad)
+        start += count
+    return out
+
+
+def test_failed_matches_a_per_position_reference_for_ragged_drafts():
+    rnd = random.Random(2943)
+    checked = 0
+    for _ in range(600):
+        bs = rnd.randint(1, 5)
+        drafts = [rnd.randint(0, 3) for _ in range(bs)]
+        width = max(drafts) + 1
+        mode = rnd.choice(["target", "bonus", "both"])
+        invalid = None if mode == "target" else [rnd.random() < 0.3 for _ in range(bs)]
+        target_invalid = (
+            None
+            if mode == "bonus" or not sum(drafts)
+            else [rnd.random() < 0.3 for _ in range(sum(drafts))]
+        )
+        if invalid is None and target_invalid is None:
+            continue
+        tokens = []
+        for count in drafts:
+            accepted = rnd.randint(0, count)  # emitted positions 0..accepted
+            row = [rnd.randint(0, 50) for _ in range(accepted + 1)]
+            tokens.append(row + [-1] * (width - accepted - 1))
+        cu = torch.tensor([sum(drafts[: i + 1]) for i in range(bs)])
+        step = boundary.TokenConstraints()
+        step.logits = torch.zeros(bs, 8)
+        step.invalid = None if invalid is None else torch.tensor(invalid)
+        step.target_invalid = (
+            None if target_invalid is None else torch.tensor(target_invalid)
+        )
+        step.metadata = SimpleNamespace(cu_num_draft_tokens=cu)
+        got = step.failed(torch.tensor(tokens)).tolist()
+        assert got == _reference_failed(drafts, invalid, target_invalid, tokens), (
+            drafts,
+            invalid,
+            target_invalid,
+            tokens,
+        )
+        checked += 1
+    assert checked > 400
+
+
+def test_ragged_failures_stay_on_their_own_request():
+    # Request 0 has 2 drafts, request 1 none, request 2 one. Only request 0's
+    # second target row and request 1's bonus row are invalid.
+    step = _step([False, True, False], [False, True, False], [2, 2, 3])
+    tokens = torch.tensor([[7, 8, 9], [5, -1, -1], [6, 4, -1]])
+    assert step.failed(tokens).tolist() == [True, True, False]
+    # Request 0 stopped after its first draft, so the invalid row's token was
+    # never emitted; request 1 emitted nothing.
+    tokens = torch.tensor([[7, -1, -1], [-1, -1, -1], [6, 4, -1]])
+    assert step.failed(tokens).tolist() == [False, False, False]
+
+
+# -- commit and delivery wiring -------------------------------------------------
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+def test_postprocess_commits_with_the_failure_and_forwards_gpu_carry(deferred):
+    carry = torch.tensor([3, 4])
+
+    def fail_row_one(step, binding):
+        step.invalid = torch.tensor([False, True])
+
+    adapter = register(FakeAdapter("c", hard=[0, 1], on_apply=fail_row_one))
+    adapter.commit_result = carry
+    runner, seen = _postprocess_runner(
+        {10: (4,), 11: (-2,)}, deferred, prev_batch=_quiet_batch("c")
+    )
+    _postprocess(runner, _quiet_batch("c"))
+    (commit,) = [call for call in adapter.calls if call[0] == "commit"]
+    assert commit[1].tolist() == [False, True]
+    assert commit[2] is deferred
+    assert seen["failed"].tolist() == [False, True]
+    assert seen["channel_states"] is carry
+
+
+def test_error_tokens_mark_failed_rows_in_both_layouts():
+    failure = torch.tensor([False, True])
+    assert boundary._error_tokens(torch.tensor([5, 6]), failure).tolist() == [5, -2]
+    wide = torch.tensor([[5, 6, 7], [8, 9, 1]])
+    assert boundary._error_tokens(wide, failure).tolist() == [[5, 6, 7], [-2, -2, -2]]
+
+
+def test_adapter_errors_from_every_adapter_are_merged():
+    first = register(FakeAdapter("first"))
+    second = register(FakeAdapter("second"))
+    first.errors = lambda runner: {1: "one"}
+    second.errors = lambda runner: {2: "two"}
+    register(FakeAdapter("silent"))
+    assert boundary.constraint_errors(None) == {1: "one", 2: "two"}
+
+
+def test_no_adapter_errors_is_none():
+    register(FakeAdapter("silent"))
+    assert boundary.constraint_errors(None) is None
+
+
+def test_grammar_apply_requires_a_prepared_grammar_with_the_logits_vocabulary():
+    step = SimpleNamespace(
+        runner=SimpleNamespace(), source=torch.zeros(1, 8), batch=None, metadata=None
+    )
+    with pytest.raises(ValueError, match="must be prepared"):
+        boundary.GrammarProvider.apply(step, None)
+    step.runner.structured_output = SimpleNamespace(vocab_size=7)
+    with pytest.raises(ValueError, match="do not match the prepared"):
+        boundary.GrammarProvider.apply(step, None)
+
+
+def _core_manager(prepare=None):
+    from atom.model_engine.engine_core_mgr import CoreManager
+
+    mgr = CoreManager.__new__(CoreManager)
+    mgr.label = "test"
+    mgr.structured_request_prepare = prepare
+    mgr.broadcast_utility_command = mock.Mock()
+    mgr._seq_id_to_callback = {}
+    return mgr
+
+
+def test_failed_admission_releases_requests_owned_by_any_adapter():
+    adapter = register(FakeAdapter("owned"))
+    adapter.owns_request = lambda request: getattr(request, "owned", False)
+    boundary._PROVIDERS.clear()
+    boundary.register_constraint_provider(adapter)
+    mgr = _core_manager()
+    mgr._add_prepared_requests = mock.Mock(side_effect=RuntimeError("admission"))
+    seqs = [
+        SimpleNamespace(
+            id=1, owned=True, json_schema=None, structured_tool_format=None
+        ),
+        SimpleNamespace(
+            id=2, owned=False, json_schema=None, structured_tool_format=None
+        ),
+    ]
+    with pytest.raises(RuntimeError, match="admission"):
+        mgr.add_request(seqs)
+    mgr.broadcast_utility_command.assert_called_once_with(
+        "release_structured_requests", request_ids=[1]
+    )
+
+
+def test_unowned_requests_never_send_a_release():
+    register(FakeAdapter("silent"))
+    mgr = _core_manager()
+    mgr._add_prepared_requests = mock.Mock(side_effect=RuntimeError("admission"))
+    seq = SimpleNamespace(id=1, json_schema=None, structured_tool_format=None)
+    with pytest.raises(RuntimeError):
+        mgr.add_request([seq])
+    mgr.broadcast_utility_command.assert_not_called()
