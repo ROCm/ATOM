@@ -193,6 +193,7 @@ def _model_runner_worker(pc, layout, global_rank):
         prefill_context_parallel_size=pcp,
         pcp_group_size=pcp,
         decode_context_parallel_size=dcp,
+        is_multinode_tp=False,
         master_addr="127.0.0.1",
         port=0,
     )
