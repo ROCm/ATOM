@@ -112,8 +112,8 @@ def flydsl_refusal(cfg) -> str | None:
         from aiter.ops.flydsl.kernels.pa_decode import traits
     except ImportError:
         return "ATOM_PA_FLYDSL: this aiter has no FlyDSL paged decode"
-    if not ba._flydsl_arch_supported() or not ba._flydsl_explicit_plan_api():
-        return "ATOM_PA_FLYDSL: the original path runs gluon here (no FlyDSL decode with a work plan)"
+    if not ba._flydsl_arch_supported():
+        return "ATOM_PA_FLYDSL: the original path runs gluon here (no FlyDSL decode on this GPU)"
     shape = {"max_partitions": FLYDSL_MAX_PARTS, "workgroup_budget": FLYDSL_BUDGET}
     if ba.flydsl_plan_shape(cfg.head_dim) != shape:
         return (
