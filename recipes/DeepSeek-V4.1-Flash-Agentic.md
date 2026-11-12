@@ -23,6 +23,7 @@ point and use the same `TP` and `CONC` in the server and client shells.
 | 2 | 128, 256 | DEP2 (DP attention + expert parallel) | 10 | session affinity; c256 also captures 256 |
 | 4 | 1 | TP4 | 1000000 | `--max-num-seqs 2`, capture `[1,2]` |
 | 4 | 2, 4, 8 | TP4 | 192 | |
+| 4 | 32 | TP4 | 40 | |
 
 Best practices:
 
@@ -46,7 +47,7 @@ Best practices:
 
 ```bash
 export MODEL_PATH="/models/deepseek-ai/DeepSeek-V4.1-Flash"
-export TP=2                          # 2 for CONC 1, 2, 16, 32, 64, 128, 256; 4 for CONC 1, 2, 4, 8
+export TP=2                          # 2 for CONC 1, 2, 16, 32, 64, 128, 256; 4 for CONC 1, 2, 4, 8, 32
 export CONC=32
 export OMP_NUM_THREADS=4
 export ATOM_NUMA_BIND=0
@@ -62,7 +63,8 @@ case "$TP/$CONC" in
   2/2|4/2|4/4|4/8)
             export ATOM_PREFILL_DECODE_INTERVAL=192 ;;
   2/16)     export ATOM_PREFILL_DECODE_INTERVAL=96 ;;
-  2/32)     export ATOM_PREFILL_DECODE_INTERVAL=40 ;;
+  2/32|4/32)
+            export ATOM_PREFILL_DECODE_INTERVAL=40 ;;
   2/64|2/128|2/256)
             export ATOM_PREFILL_DECODE_INTERVAL=10
             export GPU_MAX_HW_QUEUES=5
