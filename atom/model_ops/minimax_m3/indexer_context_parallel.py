@@ -12,7 +12,9 @@ from atom.model_ops.minimax_m3.index_topk import (
     _decode_score_chunks,
     _launch_select,
     _require_packable,
+    flydsl_ops,
 )
+from atom.model_ops.minimax_m3.mxfp4_pages import page_views
 
 
 @triton.jit(do_not_specialize=["LOCAL_BLOCKS", "GLOBAL_BLOCKS", "CHUNK"])
@@ -163,6 +165,57 @@ def indexer_context_scores(
             num_stages=3,
         )
     return scores
+
+
+def indexer_context_scores_mxfp4(
+    idx_q,
+    index_cache,
+    block_table,
+    seq_lens,
+    max_seq_len,
+    max_query_len,
+    sm_scale,
+    index_scorer,
+):
+    """`indexer_context_scores` over the MXFP4 index cache, by aiter's FlyDSL scorer.
+
+    ``index_scorer`` is the step's record of this rank's shard: the work map, the
+    shard's block bound ``max_block`` it was built at, and the workspace the scores
+    go into as a contiguous ``[heads, tokens, max_block]`` view, in the same
+    round-robin order. Unlike the BF16 scorer this one writes a row only up to its
+    own blocks; `local_candidate_keys` reads none past them.
+    """
+    if index_scorer.work_map is None:
+        raise ValueError(
+            "the MXFP4 index decode needs the step's index_scorer "
+            "(a work map and the score workspace)"
+        )
+    local = index_scorer.max_block
+    if triton.cdiv(triton.cdiv(max_seq_len, 128), index_scorer.cp_world) > local:
+        raise ValueError(
+            f"a context of {max_seq_len} tokens is wider than the {local} blocks a "
+            "shard of the index scorer's work map was built at"
+        )
+    tokens, heads, _ = idx_q.shape
+    # fails if the step outgrows the workspace
+    scores = index_scorer.scores.logits(heads * tokens, local).view(
+        heads, tokens, local
+    )
+    k_data, k_scale = page_views(index_cache)
+    return flydsl_ops().minimax_m3_index_score_flydsl(
+        idx_q,
+        k_data,
+        block_table,
+        seq_lens,
+        max_query_len,
+        heads,
+        sm_scale,
+        local,
+        out=scores,
+        work_map=index_scorer.work_map,
+        k_scale=k_scale,
+        **index_scorer.shard,
+    )
 
 
 def select_global_blocks(

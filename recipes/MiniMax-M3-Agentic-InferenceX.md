@@ -70,7 +70,7 @@ Enable it from **CONC ≥ 15** by adding one line to the server's `env \` block:
   ATOM_M3_INDEXER_CP=1 \
 ```
 
-Requires `--tensor-parallel-size 4` (ATOM asserts `tp_size == sparse_num_index_heads`, 4 for M3) and `decode_context_parallel_size == 1`. Measured, same-commit A/B, 1800 s per arm:
+Requires `--tensor-parallel-size 4` (ATOM asserts `tp_size == sparse_num_index_heads`, 4 for M3) and `decode_context_parallel_size == 1`. It runs on the MXFP4 index cache too (`--index-cache-dtype fp4`, with or without `--kv-cache-dtype fp4`): each rank's decode scorer is then aiter's FlyDSL MXFP4 scorer over its shard, and `tests/test_minimax_m3_mxfp4_indexer_cp.py` pins the merged selection to the TP path's. Measured, same-commit A/B, 1800 s per arm:
 
 | CONC | interactivity p90 | ISL-normalised throughput | prefix hit, TP vs CP |
 | ---: | ---: | ---: | --- |

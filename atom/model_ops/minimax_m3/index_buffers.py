@@ -23,15 +23,39 @@ class IndexScoreBuffers:
     blocks. ``work_map`` is the decode scorer's dispatch map and ``max_block`` the
     block count it was built at: checked for an exact match, and fixed across graph
     replays. A prefill step's record has neither.
+
+    Under indexer CP (``cp_world > 1``) the decode scorer runs every index head over
+    this rank's blocks ``b % cp_world == cp_rank`` only: the map is that shard's and
+    ``max_block`` its bound, ``ceil(blocks / cp_world)``. A prefill stays TP.
     """
 
     scores: LogitsWorkspace
     work_map: torch.Tensor | None = None
     max_block: int = 0
+    cp_world: int = 1
+    cp_rank: int = 0
+
+    @property
+    def shard(self) -> dict:
+        """The CP shard as aiter's work map and scorer take it."""
+        return _shard(self.cp_world, self.cp_rank)
+
+
+def _shard(cp_world: int, cp_rank: int) -> dict:
+    # nothing unsharded, so that launch keeps the exact call it has without CP
+    if cp_world == 1:
+        return {}
+    return {"cp_world": cp_world, "cp_rank": cp_rank}
 
 
 def allocate_index_scorers(
-    config, device, *, max_bs: int, max_qlen: int, num_idx_heads: int
+    config,
+    device,
+    *,
+    max_bs: int,
+    max_qlen: int,
+    num_idx_heads: int,
+    cp: tuple[int, int] = (1, 0),
 ) -> dict[str, IndexScoreBuffers]:
     """The builder's records by ubatch prefix (``""`` the whole step, ``ub<i>_`` a decode
     micro-batch); empty unless the index cache is MXFP4, so ``"" in`` the result is the
@@ -49,29 +73,46 @@ def allocate_index_scorers(
     and selector sit in one `index_topk` call. A ubatch is one token a request, so
     q == 1 for its map; `cut_decode_ubatches` cuts ``max_bs`` requests at
     ``max_bs // 2``.
+
+    ``cp`` is this rank's indexer-CP ``(world, rank)``: the decode map and bound are
+    the shard's, over ``num_idx_heads * world`` heads, and the workspace fits that
+    too. A prefill chunk still scores ``num_idx_heads`` heads over every block.
     """
     if config.index_cache_dtype != "fp4":
         return {}
     # once, at construction: this module must stay importable without aiter
     from aiter.ops.flydsl import minimax_m3_index_score_work_map_capacity
 
+    cp_world, cp_rank = cp
     max_block = -(-config.max_model_len // SPARSE_BLOCK_SIZE)
+    decode_heads = num_idx_heads * cp_world
+    decode_block = -(-max_block // cp_world)
 
     def work_map(batch: int, query_len: int) -> torch.Tensor:
         # allocated once: a captured graph bakes its pointer
         rows = 0
         if batch > 0:
             rows = minimax_m3_index_score_work_map_capacity(
-                batch, max_block, query_len, num_idx_heads
+                batch,
+                decode_block,
+                query_len,
+                decode_heads,
+                **_shard(cp_world, cp_rank),
             )
         return torch.empty((rows, 2), dtype=torch.int32, device=device)
 
     rows = max(max_bs * max_qlen, config.max_num_batched_tokens)
+    capacity = max(
+        num_idx_heads * rows * max_block,
+        decode_heads * max_bs * max_qlen * decode_block,
+    )
     scorers = {
         "": IndexScoreBuffers(
-            scores=LogitsWorkspace(num_idx_heads * rows * max_block, device),
+            scores=LogitsWorkspace(capacity, device),
             work_map=work_map(max_bs, max_qlen),
-            max_block=max_block,
+            max_block=decode_block,
+            cp_world=cp_world,
+            cp_rank=cp_rank,
         )
     }
     if config.enable_tbo and config.enable_tbo_decode:
