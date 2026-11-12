@@ -446,12 +446,22 @@ class KimiSparseMoeBlock(nn.Module):
         # the routed-expert path (on the main stream). Only meaningful when a
         # shared branch exists and an alt_stream was threaded in. TBO already
         # provides its own overlap, so the two are mutually exclusive.
-        self._use_dual_stream = False
-        if self.shared_experts is not None and self.alt_stream is not None:
-            tbo_active = get_current_atom_config().enable_tbo
-            if envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0 and not tbo_active:
-                self._use_dual_stream = True
-        if self._use_dual_stream:
+        tbo_active = get_current_atom_config().enable_tbo
+        self._use_dual_stream = (
+            self.shared_experts is not None
+            and self.alt_stream is not None
+            and envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0
+            and not tbo_active
+        )
+        # The split op's single-stream target row-shards a large step's latent
+        # tail, so a latent block with TP takes the op with dual-stream off too.
+        self._use_dispatch_op = self._use_dual_stream or (
+            self.use_latent_moe
+            and self.shared_experts is not None
+            and self.tp_size > 1
+            and not tbo_active
+        )
+        if self._use_dispatch_op:
             # Register self so `maybe_dual_stream_split_forward` can look this module up
             # by prefix from static_forward_context (the op is Dynamo-opaque).
             cc = get_current_atom_config().compilation_config
@@ -507,7 +517,8 @@ class KimiSparseMoeBlock(nn.Module):
         """Returns ``(first, shared)``, where ``shared`` may be None.
 
         When ``shared`` is a tensor the two branches are left unsummed and
-        ``first`` is the routed branch alone: the caller's next apply_attn_res
+        ``first`` is the routed branch alone (on the row-sharded tail, the sum,
+        with ``shared`` zero): the caller's next apply_attn_res
         folds both into its prefix on-load, so deferring the add removes a whole
         [T, H] elementwise kernel and its HBM round-trip per MoE layer.
 
@@ -518,7 +529,7 @@ class KimiSparseMoeBlock(nn.Module):
         therefore treat ``first`` as the whole result and not as a routed
         partial that is still owed a shared add.
         """
-        if self._use_dual_stream:
+        if self._use_dispatch_op:
             if self._defer_shared_add:
                 # maybe_dual_stream_split_forward hands both branches back unsummed,
                 # so the deferral survives the custom-op boundary and the next
@@ -579,8 +590,45 @@ class KimiSparseMoeBlock(nn.Module):
         it has to defer exactly like the dual-stream target -- otherwise the
         deferral would silently stop above the threshold, where the [T, H] add
         it saves is largest.
+
+        Above the threshold with TP, outside graph capture and TBO, the latent
+        tail runs on this rank's rows instead (`_row_sharded_split_moe_forward`).
         """
+        from atom.utils.tbo.ubatching import tbo_active
+
+        if (
+            self.tp_size > 1
+            and hidden_states.shape[0] > envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD
+            and not torch.cuda.is_current_stream_capturing()
+            and not tbo_active()
+        ):
+            return self._row_sharded_split_moe_forward(hidden_states)
         return self._assert_split(self.split_moe_forward(hidden_states))
+
+    def _row_sharded_split_moe_forward(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Latent MoE with its tail on 1/TP of the rows.
+
+        Reduce-scatters the routed and shared partial sums by rows, runs the
+        routed norm, up-projection and routed + shared add on this rank's
+        rows, and all-gathers the sum. The second return is zeros: the op's
+        schema has no optional tensor. Rounding the sum to BF16 here, instead
+        of folding it in FP32 in the next attn_res, can move MoE routing.
+        """
+        from atom.models.qwen4_exp import _SequenceParallel
+
+        rows = _SequenceParallel(
+            hidden_states.shape[0], self.tp_size, get_tensor_model_parallel_rank()
+        )
+        router_logits = self.gate(hidden_states)
+        routed_input = self.routed_expert_down_proj(hidden_states)
+        routed_output = self.experts(routed_input, router_logits)
+        routed_output = self._apply_routed_norm_and_up_proj(rows.scatter(routed_output))
+        shared_output = rows.scatter(self.shared_experts(hidden_states))
+        output = rows.gather(routed_output + shared_output)
+        # Fresh, not cached: Inductor may write a later kernel into this output.
+        return output, torch.zeros_like(output)
 
     @staticmethod
     def _assert_split(
