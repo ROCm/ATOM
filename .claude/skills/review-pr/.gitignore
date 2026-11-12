@@ -1,0 +1,6 @@
+# Review output: run_one.sh writes one directory per PR here. These are run artifacts,
+# not source -- a card plus its evidence files, regenerated on every run. aiter's copy
+# of this skill commits none of them, and nothing in the tests reads them (verified by
+# running the full suite against a tree with this directory deleted). They were tracked
+# by accident during P0 and removed; keep them out.
+reports/
