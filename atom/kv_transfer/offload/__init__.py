@@ -3,7 +3,7 @@
 
 """ATOM KV-offload connectors.
 
-Registers three backends with the shared KV connector factory:
+Defines three backends registered by the shared KV connector factory:
 
 * ``lmcache_offload`` -- the legacy in-process LMCache engine. Enable via
   ``ATOM_KV_OFFLOAD=lmcache`` (or the equivalent
@@ -18,48 +18,60 @@ Registers three backends with the shared KV connector factory:
 * ``mooncake_store`` -- a Mooncake Store reached directly, no LMCache involved:
   start its master and owners and set ``ATOM_KV_OFFLOAD=mooncake_store`` with
   ``ATOM_KV_OFFLOAD_EXTRA_CONFIG`` naming them (``mooncake_store.master`` and
-  ``mooncake_store.metadata``, or ``mooncake_store.pools``). Dense layout only.
+  ``mooncake_store.metadata``, or ``mooncake_store.pools``). Moves the dense
+  KV layout and V4.1's PAGE regions (state is rebuilt by replay).
 """
 
-from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 
-KVConnectorFactory.register(
-    "lmcache_offload",
-    worker_module="atom.kv_transfer.offload.connector",
-    worker_class="LMCacheOffloadConnector",
-    scheduler_module="atom.kv_transfer.offload.connector",
-    scheduler_class="LMCacheOffloadConnectorScheduler",
-    aliases=("LMCacheOffloadConnector", "LMCacheConnectorV1"),
-    requires_pd_staging=False,
-    offload=True,
-    # The dense codec builds from `KVCacheTensor`s and ignores the region map;
-    # the hybrid, m3 and kimi_k3 layouts do read it, and which one applies comes
-    # from the model, so `topology_reads_block_regions` refines this by layout.
-    reads_block_regions=False,
-)
+def register_backends(factory) -> None:
+    """Register offload transports after the connector factory is initialized."""
+    factory.register(
+        "lmcache_offload",
+        worker_module="atom.kv_transfer.offload.connector",
+        worker_class="LMCacheOffloadConnector",
+        scheduler_module="atom.kv_transfer.offload.connector",
+        scheduler_class="LMCacheOffloadConnectorScheduler",
+        aliases=("LMCacheOffloadConnector", "LMCacheConnectorV1"),
+        requires_pd_staging=False,
+        offload=True,
+        # The dense codec builds from `KVCacheTensor`s and ignores the region map;
+        # the hybrid, m3 and kimi_k3 layouts do read it, and which one applies comes
+        # from the model, so `topology_reads_block_regions` refines this by layout.
+        reads_block_regions=False,
+    )
 
-KVConnectorFactory.register(
-    "lmcache_mp",
-    worker_module="atom.kv_transfer.offload.mp.connector",
-    worker_class="LMCacheMPConnector",
-    scheduler_module="atom.kv_transfer.offload.mp.connector",
-    scheduler_class="LMCacheMPConnectorScheduler",
-    aliases=("LMCacheMPConnector",),
-    requires_pd_staging=False,
-    offload=True,
-    # Groups regions by per-block shape and copies whole blocks, so a layer may
-    # publish extra planes (the FP4 indexer's e8m0 scale) as more regions.
-    copies_whole_block_regions=True,
-)
+    factory.register(
+        "lmcache_mp",
+        worker_module="atom.kv_transfer.offload.mp.connector",
+        worker_class="LMCacheMPConnector",
+        scheduler_module="atom.kv_transfer.offload.mp.connector",
+        scheduler_class="LMCacheMPConnectorScheduler",
+        aliases=("LMCacheMPConnector",),
+        requires_pd_staging=False,
+        offload=True,
+        # One LMCache server for every DP rank.
+        shared_tier=True,
+        chunk_tokens="atom.kv_transfer.offload.config:lmcache_chunk_tokens",
+        # Groups regions by per-block shape and copies whole blocks, so a layer may
+        # publish extra planes (the FP4 indexer's e8m0 scale) as more regions.
+        copies_whole_block_regions=True,
+    )
 
-KVConnectorFactory.register(
-    "mooncake_store",
-    worker_module="atom.kv_transfer.offload.mooncake_store.worker",
-    worker_class="MooncakeStoreOffloadConnector",
-    scheduler_module="atom.kv_transfer.offload.mooncake_store.scheduler",
-    scheduler_class="MooncakeStoreOffloadScheduler",
-    requires_pd_staging=False,
-    offload=True,
-    # The dense codec builds from `KVCacheTensor`s; the region map is unread.
-    reads_block_regions=False,
-)
+    factory.register(
+        "mooncake_store",
+        worker_module="atom.kv_transfer.offload.mooncake_store.worker",
+        worker_class="MooncakeStoreOffloadConnector",
+        scheduler_module="atom.kv_transfer.offload.mooncake_store.scheduler",
+        scheduler_class="MooncakeStoreOffloadScheduler",
+        requires_pd_staging=False,
+        offload=True,
+        # One Mooncake Store for every DP rank.
+        shared_tier=True,
+        chunk_tokens="atom.kv_transfer.offload.mooncake_store.config:store_chunk_tokens",
+        # Dense layout: the codec builds from `KVCacheTensor`s and never reads the
+        # region map; V4.1's PAGE layout does (`topology_reads_block_regions`
+        # refines this by layout, as for `lmcache_offload`).
+        reads_block_regions=False,
+        # Dense and PAGE codecs preserve all planes, including FP4 index scales.
+        copies_whole_block_regions=True,
+    )

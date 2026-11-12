@@ -9,6 +9,7 @@ from torch.profiler import record_function
 from atom.distributed.dcp_utils import get_dcp_rank, get_dcp_world_size
 from atom.spec_decode.draft_graph import DraftGraph, StagedInput
 from atom.spec_decode.drafter import AuxCaptureSpec, Drafter
+from atom.spec_decode.dspark_lossless import DSparkLossless
 from atom.spec_decode.dspark_verify import VerifyScheduler
 from atom.utils import envs
 from atom.utils.block_convert import kv_indices_generate_triton
@@ -49,6 +50,10 @@ class DSparkProposer(Drafter):
     driven by a confidence schedule (variable-length, Level B) verification.
     """
 
+    #: The block pass with the greedy head, declared beside ``block`` only
+    #: when lossless sampling arms without DP; see `_declare_draft_graphs`.
+    block_greedy: DraftGraph | None = None
+
     def __init__(self, atom_config, device: torch.device, runner):
         super().__init__(atom_config, device, runner)
         # Confidence-scheduled verification (Level B, variable-length verify) is
@@ -70,6 +75,12 @@ class DSparkProposer(Drafter):
         if self._with_draft:
             self._init_draft_block_buffers()
 
+    def _arm_lossless_draft(self) -> DSparkLossless | None:
+        """Allocates only; the runner binds the draft model (`bind_target`)
+        before any warmup or capture, since ``block``'s sampler branches on
+        that binding in python and whichever side is bound is recorded."""
+        return DSparkLossless.arm(self)
+
     def _declare_draft_graphs(self):
         """The block pass, in whichever flavor this drafter is.
 
@@ -90,10 +101,28 @@ class DSparkProposer(Drafter):
         ``_block_positions`` is the only place that knows.
 
         No ``mtp_k`` floor, unlike eagle's: the whole width drafts in ONE pass.
+
+        Lossless armed, ``block`` records the sampled head, and
+        ``block_greedy`` is the same pass with the greedy head, which a step
+        no row of which draws a q replays instead (`_block_pass`). A second
+        pass rather than a term in the graph key: replay is decided by
+        `DraftGraph.is_captured` on the DP-agreed batch alone, while which
+        head a step needs is a per-rank fact. So ``block_greedy`` is declared
+        only without DP, where every rank stages the same batch.
         """
-        self.block = DraftGraph(
+        self.block = self._declare_block(self._block_head)
+        if self.lossless is None or self.config.parallel_config.data_parallel_size > 1:
+            return (self.block,)
+        self.block_greedy = self._declare_block(
+            self._block_head_greedy, variant="greedy"
+        )
+        return (self.block, self.block_greedy)
+
+    def _declare_block(self, epilogue, variant: str = "") -> DraftGraph:
+        """The block pass with ``epilogue`` as its head."""
+        return DraftGraph(
             forward=self._block_backbone,
-            epilogue=self._block_head,
+            epilogue=epilogue,
             capture_epilogue=True,
             capture_supported=self.model.supports_block_graph,
             inputs={
@@ -101,8 +130,15 @@ class DSparkProposer(Drafter):
                 "anchor_positions": StagedInput(dtype=torch.int64),
             },
             warmup_inputs=self._block_warmup_inputs,
+            variant=variant,
         )
-        return (self.block,)
+
+    def _block_pass(self) -> DraftGraph:
+        """The pass this step replays: ``block_greedy`` when it is declared
+        and no row of the staged step draws a q, else ``block``."""
+        if self.block_greedy is not None and not self.lossless.staging.draws_q:
+            return self.block_greedy
+        return self.block
 
     def _block_warmup_inputs(self, running_bs, *, anchor_positions, **_):
         """A plausible warmup batch, in whichever terms the context is addressed.
@@ -155,6 +191,13 @@ class DSparkProposer(Drafter):
         """
         return self.model.head_and_sample(out, anchor_ids, self.draft_tokens_per_seq)
 
+    def _block_head_greedy(self, out, running_bs, *, anchor_ids, **_):
+        """``_block_head`` with the greedy Markov sampler, whatever the
+        model's ``draft_sampling`` binding."""
+        return self.model.head_and_sample(
+            out, anchor_ids, self.draft_tokens_per_seq, greedy=True
+        )
+
     def _block_backbone(self, running_bs, *, anchor_ids, anchor_positions):
         """The block's forward: the parallel backbone over the whole draft width.
 
@@ -168,11 +211,12 @@ class DSparkProposer(Drafter):
             self.draft_tokens_per_seq,
         )
 
-    def _stage_anchors(self, running_bs, next_token_ids, positions, rows):
-        """Each request's anchor token and position, written straight into the
-        block's fixed inputs at the padded batch, so `stage` copies nothing."""
-        ids = self.block.buffer("anchor_ids", running_bs)
-        anchor_positions = self.block.buffer("anchor_positions", running_bs)
+    def _stage_anchors(self, pass_, running_bs, next_token_ids, positions, rows):
+        """Each request's anchor token and position, written straight into
+        ``pass_``'s fixed inputs at the padded batch, so `stage` copies
+        nothing."""
+        ids = pass_.buffer("anchor_ids", running_bs)
+        anchor_positions = pass_.buffer("anchor_positions", running_bs)
         scheduled_bs = next_token_ids.shape[0]
         vocab_max = int(self.model.vocab_size) - 1
         if ids.is_cuda:
@@ -191,7 +235,7 @@ class DSparkProposer(Drafter):
             anchor_positions.zero_()
             ids[:scheduled_bs] = next_token_ids.clamp(0, vocab_max)
             anchor_positions[:scheduled_bs] = positions[rows[:scheduled_bs]]
-        return self.block.stage(
+        return pass_.stage(
             running_bs, {"anchor_ids": ids, "anchor_positions": anchor_positions}
         )
 
@@ -634,6 +678,11 @@ class DSparkProposer(Drafter):
         `next_token_ids` is unused: DSpark drafts from aux hidden states.
         """
         del next_token_ids
+        # A step the model's decode round served wrote its context rows inside
+        # the target forward (`AttentionMetaData.served_by_round`).
+        metadata = get_forward_context().attn_metadata
+        if metadata is not None and metadata.served_by_round:
+            return
         aux_hidden_states = self.aux_for(hidden_states)
         if aux_hidden_states is None:
             return
@@ -649,7 +698,7 @@ class DSparkProposer(Drafter):
         ):
             self.model.write_context_kv(main_hidden_all, positions)
 
-    def propose(
+    def _propose(
         self,
         # [num_tokens] (unused: DSpark seeds from the verified anchor, not the
         # full target token stream)
@@ -710,13 +759,14 @@ class DSparkProposer(Drafter):
         # the draft ran at a batch the target had not published to -- a Python
         # slice past the end truncates rather than raising, so the kernels got
         # a slot table shorter than their own grid and read past it.
+        pass_ = self._block_pass()
         staged = self._stage_anchors(
-            running_bs, next_token_ids, target_positions, last_token_indices
+            pass_, running_bs, next_token_ids, target_positions, last_token_indices
         )
 
         if self._with_draft:
             return self._propose_with_draft(
-                forward_context, attn_metadata, staged, scheduled_bs
+                pass_, forward_context, attn_metadata, staged, scheduled_bs
             )
 
         # The rolling target-KV window is filled by `compute_draft_kv`,
@@ -754,9 +804,9 @@ class DSparkProposer(Drafter):
             running_tokens_are_unified=True,
             scheduled_tokens_gpu=self.runner.forward_vars["batch_info"].gpu[2:3],
         )
-        label = self.block.label(scheduled_bs, running_bs)
+        label = pass_.label(scheduled_bs, running_bs)
         with record_function(f"propose_dspark[{label} T={num_draft}]"):
-            draft_token_ids, confidence = self.block.run(running_bs, **staged)
+            draft_token_ids, confidence = pass_.run(running_bs, **staged)
         draft_token_ids = draft_token_ids[:scheduled_bs, : self.mtp_k]
         if confidence is not None:
             # compute_ell takes its batch size from confidence.shape and zips the
@@ -1078,6 +1128,7 @@ class DSparkProposer(Drafter):
 
     def _propose_with_draft(
         self,
+        pass_: DraftGraph,  # `_block_pass`'s choice for this step
         forward_context,
         attn_metadata,
         staged: dict[str, torch.Tensor],  # the anchors, at `running_bs`
@@ -1123,9 +1174,9 @@ class DSparkProposer(Drafter):
         )
 
         # ---- 3. Block pass + Markov sampling ---------------------------------
-        label = self.block.label(scheduled_bs, running_bs)
+        label = pass_.label(scheduled_bs, running_bs)
         with record_function(f"propose_dspark[{label} T={T}]"):
-            draft_token_ids, confidence = self.block.run(running_bs, **staged)
+            draft_token_ids, confidence = pass_.run(running_bs, **staged)
 
         if self.verify_scheduler is not None:
             self.verify_scheduler.set_last_ell(

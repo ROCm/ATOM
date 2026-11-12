@@ -419,7 +419,7 @@ class EagleProposer(Drafter):
             "positions": positions,
         }
 
-    def warmup_draft_graphs(self, build_context, end_trace=None) -> None:
+    def _warmup_draft_graphs(self, build_context, end_trace=None) -> None:
         """Warm every size from the state the target's capture left behind.
 
         `_advance_decode_metadata` bumps `kv_indptr` and `context_lens` in
@@ -446,7 +446,7 @@ class EagleProposer(Drafter):
             return build_context(**kwargs)
 
         try:
-            super().warmup_draft_graphs(build_pristine_context, end_trace)
+            super()._warmup_draft_graphs(build_pristine_context, end_trace)
         finally:
             restore()
 
@@ -639,7 +639,7 @@ class EagleProposer(Drafter):
             attn_metadata.__dict__[k] = v
         return workinfos
 
-    def propose(
+    def _propose(
         self,
         # [num_tokens]
         target_token_ids: torch.Tensor,

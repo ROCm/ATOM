@@ -216,10 +216,11 @@ def _flydsl_arch_supported() -> bool:
 
 @functools.lru_cache(maxsize=1)
 def _flydsl_explicit_plan_api() -> bool:
-    """Whether aiter has #5809's FlyDSL decode API (a required work plan).
+    """Whether aiter has #5809's FlyDSL decode API (an explicit work plan).
 
-    An older aiter would raise on the first call; probing once lets the gate
-    decline the call before entering aiter.
+    Checks presence, not defaults: aiter defaults ``work_plan`` to None for
+    MXFP4, and ATOM always passes one. An older aiter would raise on the first
+    call; probing once lets the gate decline the call before entering aiter.
     """
     import inspect
 
@@ -227,18 +228,18 @@ def _flydsl_explicit_plan_api() -> bool:
         # By module path: aiter.ops.flydsl lazily exports a `pa_decode`
         # function, which `from aiter.ops.flydsl import pa_decode` can return.
         mod = importlib.import_module("aiter.ops.flydsl.pa_decode")
-    except ImportError:
-        ok = False
+    except ImportError as e:
+        ok, detail = False, f"import failed: {e}"
     else:
-        params = inspect.signature(mod.pa_decode).parameters
-        plan = params.get("work_plan")
+        sig = inspect.signature(mod.pa_decode)
+        plan = sig.parameters.get("work_plan")
         ok = (
             hasattr(mod, "plan_pa_decode")
             and plan is not None
             and plan.kind is inspect.Parameter.KEYWORD_ONLY
-            and plan.default is inspect.Parameter.empty
-            and "max_context_length" in params
+            and "max_context_length" in sig.parameters
         )
+        detail = f"pa_decode{sig}"
     if not ok:
         fallback = (
             "using gluon"
@@ -246,8 +247,9 @@ def _flydsl_explicit_plan_api() -> bool:
             else "this GPU has no gluon fallback"
         )
         logger.warning(
-            "FlyDSL paged decode is enabled but this aiter predates the #5809 "
-            "decode API; %s.",
+            "FlyDSL paged decode is enabled but aiter lacks the #5809 explicit-plan "
+            "decode API (%s); %s.",
+            detail,
             fallback,
         )
     return ok
