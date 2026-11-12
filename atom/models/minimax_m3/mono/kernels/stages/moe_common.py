@@ -33,16 +33,25 @@ from atom.models.minimax_m3.mono.layout import (
     SH_ROWS,
     UG_PER_SLOT,
     UG_ROWS,
+    XN4_ROW,
     XN8_ROW,
     XSC_ROW,
     mxfp8_tile_dword,
 )
-from atom.mono.device.mx import FP4, FP8, fp4_tile_load, mfma_scaled, scale_index
+from atom.mono.device.mx import (
+    FP4,
+    FP8,
+    fp4_tile_load,
+    fp4x8_bf16,
+    mfma_scaled,
+    scale_index,
+)
 from atom.mono.device.ops import (
     CM_DEV,
     CM_NT,
     bf16_pair,
     bf16_round,
+    mfma_bf16,
     row_sum,
     rsrc,
     traced,
@@ -55,6 +64,10 @@ from atom.mono.device.sync import publish
 @traced
 def moe_common_defs(k4ctx):
     """The functions of the narrow MoE's up / gate / down tasks."""
+    A16N = k4ctx["A16N"]
+    A4N = k4ctx["A4N"]
+    X4S_LDS = k4ctx["X4S_LDS"]
+    X4_LDS = k4ctx["X4_LDS"]
     CPT = k4ctx["CPT"]
     DN_KC = k4ctx["DN_KC"]
     DN_UNITS = k4ctx["DN_UNITS"]
@@ -67,6 +80,8 @@ def moe_common_defs(k4ctx):
     SH_UPW = k4ctx["SH_UPW"]
     TPT = k4ctx["TPT"]
     UG_CPW = k4ctx["UG_CPW"]
+    XB_LDS = k4ctx["XB_LDS"]
+    XB_ROW = k4ctx["XB_ROW"]
     XSC_LDS = k4ctx["XSC_LDS"]
     bid = k4ctx["bid"]
     e8m0_load = k4ctx["e8m0_load"]
@@ -74,13 +89,16 @@ def moe_common_defs(k4ctx):
     group_scale_byte = k4ctx["group_scale_byte"]
     l16 = k4ctx["l16"]
     lane = k4ctx["lane"]
+    lds_b4 = k4ctx["lds_b4"]
     lds_b8 = k4ctx["lds_b8"]
+    lds_bf8 = k4ctx["lds_bf8"]
     lds_i32 = k4ctx["lds_i32"]
     mb = k4ctx["mb"]
     mb_put = k4ctx["mb_put"]
     mb_put_bf = k4ctx["mb_put_bf"]
     mr = k4ctx["mr"]
     opart = k4ctx["opart"]
+    prod_round = k4ctx["prod_round"]
     red = k4ctx["red"]
     route = k4ctx["route"]
     rwt = k4ctx["rwt"]
@@ -174,17 +192,43 @@ def moe_common_defs(k4ctx):
         col = shared.select(fx.min(l16, tokens - 1), tk)
         cg_ = fx.Vector.filled(4, 0.0, fx.Float32)
         cu_ = fx.Vector.filled(4, 0.0, fx.Float32)
-        # every chunk's B scale up front: read at use, each MFMA waited out an LDS
-        # latency (S = 4 up / gate 3.5 us over the unscaled floor)
-        sbs = [
-            lds_i32(XSC_LDS + col * XSC_ROW + (wave * UG_CPW + i) * 4 + g4)
-            for i in range(UG_CPW)
-        ]
-        for i in range_constexpr(UG_CPW):
-            kc = wave * UG_CPW + i
-            xb = lds_b8(col * XN8_ROW + kc * 32)
-            cg_ = mfma_scaled(wts[0][i], xb, cg_, scs[0][i], sbs[i], a_fmt=FP4)
-            cu_ = mfma_scaled(wts[1][i], xb, cu_, scs[1][i], sbs[i], a_fmt=FP4)
+        if const_expr(A4N):
+            # a4w4: the token's MXFP4 xn row and codes (the router's words, after the MXFP8 rows)
+            # against the weights, one fp4 x fp4 MFMA a 128-k chunk
+            xrow = X4_LDS + (0 if CPT is not None else tk * XN4_ROW)
+            srow = X4S_LDS + (0 if CPT is not None else tk * XSC_ROW)
+            sbs = [lds_i32(srow + (wave * UG_CPW + i) * 4 + g4) for i in range(UG_CPW)]
+            for i in range_constexpr(UG_CPW):
+                kc = wave * UG_CPW + i
+                xb = lds_b4(xrow + kc * 16)
+                cg_ = mfma_scaled(
+                    wts[0][i], xb, cg_, scs[0][i], sbs[i], a_fmt=FP4, b_fmt=FP4
+                )
+                cu_ = mfma_scaled(
+                    wts[1][i], xb, cu_, scs[1][i], sbs[i], a_fmt=FP4, b_fmt=FP4
+                )
+        elif const_expr(A16N):
+            # a16w4: the token's bf16 xn row (the router's words, after the MXFP8 rows)
+            # against the weights up-converted to bf16, four K = 32 MFMAs a 128-k chunk
+            xrow = XB_LDS + (0 if CPT is not None else tk * XB_ROW)
+            for i in range_constexpr(UG_CPW):
+                kc = wave * UG_CPW + i
+                for d in range_constexpr(4):
+                    xb = lds_bf8(xrow + kc * 64 + g4 * 16 + d * 4)
+                    cg_ = mfma_bf16(fp4x8_bf16(wts[0][i][d], scs[0][i]), xb, cg_)
+                    cu_ = mfma_bf16(fp4x8_bf16(wts[1][i][d], scs[1][i]), xb, cu_)
+        else:
+            # every chunk's B scale up front: read at use, each MFMA waited out an LDS
+            # latency (S = 4 up / gate 3.5 us over the unscaled floor)
+            sbs = [
+                lds_i32(XSC_LDS + col * XSC_ROW + (wave * UG_CPW + i) * 4 + g4)
+                for i in range(UG_CPW)
+            ]
+            for i in range_constexpr(UG_CPW):
+                kc = wave * UG_CPW + i
+                xb = lds_b8(col * XN8_ROW + kc * 32)
+                cg_ = mfma_scaled(wts[0][i], xb, cg_, scs[0][i], sbs[i], a_fmt=FP4)
+                cu_ = mfma_scaled(wts[1][i], xb, cu_, scs[1][i], sbs[i], a_fmt=FP4)
         stamp(9)
         # gate partials in red, up partials in opart (free once the split is done)
         fx.ptr_store(cg_, red + (wave * 64 + lane) * 4)
@@ -306,6 +350,10 @@ def moe_common_defs(k4ctx):
             col = tid // SH_ROWS
             gsum = row_sum(red, r, col)
             usum = row_sum(red, r + 8, col)
+            if const_expr(prod_round):
+                # production's gate_up_proj output is bf16, the swiglu reads that
+                gsum = bf16_round(gsum)
+                usum = bf16_round(usum)
             y = swiglu_mul_batch([gsum], [usum], fx.Float32(-swiglu_limit))[0]
             put_mid((col * MOE_SLOTS + TOP_K) * INTER + j * SH_ROWS + r, y)
         if const_expr(MID_FLAG):
@@ -320,10 +368,18 @@ def moe_common_defs(k4ctx):
         rg_d = td * 2 + wave // 4
         units = []
         for i in range_constexpr(DN_UPW):
-            j = (wave % 4) + 4 * i
-            jj = fx.min(j, DN_UNITS - 1)
-            sl = jj // DN_KC
-            kc = jj % DN_KC
+            if const_expr(A16N or A4N):
+                # a wave of the row group takes one slot, all its chunks: the slot's sum
+                # is complete in the wave, where production rounds it (bf16(acc * w))
+                j = (wave % 4) * DN_KC + i
+                jj = j
+                sl = wave % 4
+                kc = i
+            else:
+                j = (wave % 4) + 4 * i
+                jj = fx.min(j, DN_UNITS - 1)
+                sl = jj // DN_KC
+                kc = jj % DN_KC
             e_d = fx.min(uniform(fx.ptr_load(route + (8 * k + sl))), SHARED_EXPERT)
             wv = fp4_tile_load(
                 wrsrc("moed", w2 + fx.Int64(e_d) * W2_BYTES, dn_bytes),
