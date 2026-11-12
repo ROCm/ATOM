@@ -26,8 +26,8 @@ still apply. See [the implementation and CPU verification notes](../docs/pd_chun
 Mooncake reserves D's destination KV blocks before P writes them, so a backlog
 of pending receives can hold most of D's KV pool while few requests decode.
 The opt-in `pd_admission` policy defers a new receive while the receive targets
-already pending would exceed a per-rank byte budget, and can keep part of D's
-pool free for requests that are already decoding. Set it in the consumer's
+already pending would exceed a per-rank byte budget, and can keep room free for
+the admitted requests to keep decoding. Set it in the consumer's
 top-level `--kv-transfer-config`; with `multi`, put it next to `connectors` and
 list the Mooncake consumer first:
 
@@ -43,17 +43,18 @@ rejected.
 | --- | --- |
 | `max_pending_kv_fraction` | Fraction of each D rank's paged KV pool, converted to bytes at startup. |
 | `max_pending_kv_bytes` | Bytes per D rank, instead of a fraction. |
-| `min_free_kv_fraction` | Fraction of D's paged pool that must stay free after a new receive allocates its blocks, local prefix hits included. Reusable cached blocks count as free. |
+| `num_reserved_decode_tokens` | Decode tokens kept free for each admitted request to grow by, for example `512`. A new receive is deferred if, after it takes its blocks, the free pool could not grow every receiving, ready and running request and itself by that many tokens, each capped by what it may still generate. Reusable cached blocks count as free, and a local prefix hit on a block another request holds takes nothing. |
 
 Only blocks Mooncake transfers are charged to the byte budget; local prefix
 hits are not. Whole-prompt and chunked receives share the budget. A request
 holds its credit until its first local forward; preemption, a failed receive
 and a cancelled one (once its writes drain) return it. With nothing pending,
 one request may exceed the byte budget, so long prompts are not starved. The
-free-KV reserve is growth room for running requests, so it holds while any
-request runs on D, including one past its first forward; only an idle D admits
-below it. D must have PP=1, DCP=1, PCP=1, SP=1 and a single paged KV pool. Metrics are listed under `atom:pd_admission_*`
-in the [metrics guide](../docs/metrics_guide.md#scheduler).
+decode reserve covers every admitted request, including one past its first
+forward, so it holds while any request runs on D; only an idle D admits below
+it. Falling below it defers admission only and never preempts. D must have
+PP=1, DCP=1, PCP=1, SP=1 and a single paged KV pool. Metrics are listed under
+`atom:pd_admission_*` in the [metrics guide](../docs/metrics_guide.md#scheduler).
 
 ## Prerequisites
 

@@ -110,11 +110,14 @@ def receive_success(seq, *, as_str=False):
 class SizedSeq(SimpleNamespace):
     """A request with one prompt token per block of its `block_table`."""
 
+    max_tokens = 64
+    num_completion_tokens = 0
+
     def __len__(self):
         return len(self.block_table)
 
 
-def standalone(max_bytes, *, reserve_blocks=None, free_blocks=0):
+def standalone(max_bytes, *, reserve_tokens=None, free_blocks=0):
     """A controller over a one-token-per-block pool and a full-transfer connector."""
     connector = SimpleNamespace(pd_receive_block_offset=lambda seq, n, cached: 0)
     block_manager = SimpleNamespace(
@@ -123,11 +126,11 @@ def standalone(max_bytes, *, reserve_blocks=None, free_blocks=0):
         kv=SimpleNamespace(lookup=lambda h: -1, num_free=free_blocks),
     )
     return PdAdmissionController(
-        max_bytes, 1024, connector, block_manager, reserve_blocks=reserve_blocks
+        max_bytes, 1024, connector, block_manager, reserve_tokens=reserve_tokens
     )
 
 
-def try_admit(policy, seq, *, running=False):
+def try_admit(policy, seq, *, running=()):
     # No local hit: every block of the request is new.
     probe = SimpleNamespace(
         num_cached_blocks=0, block_hashes=[], num_new_blocks=len(seq)
@@ -194,7 +197,7 @@ def test_fraction_uses_physical_pool_bytes(build, fraction):
     sched, _ = build(options=options)
     # 64 blocks of 1024 bytes; the default fraction is 0.15.
     assert sched.pd_admission.max_bytes == int(64 * 1024 * (fraction or 0.15))
-    assert sched.pd_admission.reserve_blocks is None
+    assert sched.pd_admission.reserve_tokens is None
 
 
 @pytest.mark.parametrize("chunked", [False, True])
@@ -202,15 +205,16 @@ def test_free_kv_watermark_keeps_room_for_running_requests(build, chunked):
     sched, request = build(
         chunked=chunked,
         num_kvcache_blocks=10,
-        options={"enabled": True, "min_free_kv_fraction": 0.5},
+        options={"enabled": True, "num_reserved_decode_tokens": 8},
     )
     # Setting one limit drops the default byte budget.
     assert sched.pd_admission.max_bytes is None
-    assert sched.pd_admission.reserve_blocks == 5
+    assert sched.pd_admission.reserve_tokens == 8
     a, b, c = request(), request(), request()
     sched.extend([a, b, c])
     batch, _ = sched.schedule()
-    # After B, 6 blocks stay free; C would leave 4, below the 5 reserved.
+    # Each 8-token request needs two more blocks to grow by 8 tokens. After B,
+    # 6 blocks stay free; C would leave 4, short of the 6 that A, B and C need.
     assert set(batch.connector_meta_output.reqs_to_recv) == {a.id, b.id}
     assert not c.block_table
     sched.schedule()
@@ -225,6 +229,8 @@ def test_free_kv_watermark_keeps_room_for_running_requests(build, chunked):
     assert not sched.pd_admission.pending
     sched.schedule()
     assert not c.block_table
+    # Falling below the reserve only defers admission; decode still fits.
+    assert sched.total_preemptions == 0
     for seq in (a, b):
         assert sched.abort_request(seq.id)
     sched.postprocess([], ScheduledBatchOutput([], [], None, None, None), batch=batch)
@@ -238,7 +244,7 @@ def test_free_kv_watermark_holds_while_admitted_requests_decode(build, chunked):
     sched, request = build(
         chunked=chunked,
         num_kvcache_blocks=10,
-        options={"enabled": True, "min_free_kv_fraction": 0.5},
+        options={"enabled": True, "num_reserved_decode_tokens": 12},
     )
     a = request(16)
     sched.add(a)
@@ -247,8 +253,8 @@ def test_free_kv_watermark_holds_while_admitted_requests_decode(build, chunked):
     batch, _ = sched.schedule()
     assert a.id in batch.req_ids
     assert not sched.pd_admission.pending
-    # Nothing is pending, but B would leave fewer than 5 free blocks while A
-    # decodes.
+    # Nothing is pending, but A still decodes: B would leave at most 4 free
+    # blocks, short of the 6 that A and B need to grow by 12 tokens each.
     b = request()
     sched.add(b)
     sched.schedule()
@@ -261,12 +267,60 @@ def test_free_kv_watermark_holds_while_admitted_requests_decode(build, chunked):
 
 
 def test_free_kv_watermark_admits_below_it_only_on_an_idle_decoder():
-    policy = standalone(None, reserve_blocks=8, free_blocks=10)
+    policy = standalone(None, reserve_tokens=4, free_blocks=10)
     big = SizedSeq(id=1, block_table=[1, 2, 3, 4])
-    # 10 free, 4 allocated: 6 left, below the 8 reserved.
-    assert not try_admit(policy, big, running=True)
+    decoding = SizedSeq(id=2, block_table=[9])
+    # 10 free, 4 allocated: 6 left, short of the 8 that `big` and `decoding`
+    # need to grow by 4 tokens each.
+    assert not try_admit(policy, big, running=[decoding])
     # Nothing pending or running: waiting would free nothing, so it enters.
-    assert try_admit(policy, big, running=False)
+    assert try_admit(policy, big)
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+def test_decode_reclaims_cached_blocks_before_preempting(build, seq_factory, chunked):
+    sched, request = build(
+        chunked=chunked,
+        prefix=True,
+        num_kvcache_blocks=6,
+        options={"enabled": True, "num_reserved_decode_tokens": 8},
+    )
+    bm = sched.block_manager
+    a = request()
+    sched.add(a)
+    sched.schedule()
+    sched._update_from_kv_xfer_finished(receive_success(a))
+    # The rest of the pool holds reusable cached content, none of it vacant.
+    seed = seq_factory(list(range(100, 116)))
+    bm.allocate(seed, bm.can_allocate(seed))
+    bm.hash_blocks(seed, seed.num_tokens)
+    bm.deallocate(seed)
+    assert bm.kv.num_free == bm.kv.num_reusable_free == 4
+    b = request()
+    sched.add(b)
+    batch, _ = sched.schedule()
+    # A's first decode needs a third block and reclaims a cached one instead of
+    # preempting; B still waits below A's and its own growth room.
+    assert a.id in batch.req_ids
+    assert len(a.block_table) == 3
+    assert bm.kv.num_free == bm.kv.num_reusable_free == 3
+    assert sched.total_preemptions == 0
+    assert not b.block_table
+
+
+def test_decode_reserve_counts_each_growing_request_once():
+    policy = standalone(None, reserve_tokens=4, free_blocks=100)
+    ready = SizedSeq(id=1, block_table=[1])
+    cancelled = SizedSeq(id=2, block_table=[2])
+    assert try_admit(policy, ready) and try_admit(policy, cancelled)
+    policy.cancel(cancelled)
+    nearly_done = SizedSeq(
+        id=3, block_table=[3], max_tokens=10, num_completion_tokens=9
+    )
+    candidate = SizedSeq(id=4, block_table=[4])
+    # READY is pending and already RUNNING: counted once. CANCELLED drains
+    # without decoding. NEARLY_DONE may emit one more token.
+    assert policy._growth_reserve(candidate, [ready, nearly_done]) == 4 + 1 + 4
 
 
 @pytest.mark.parametrize("chunked", [False, True])
@@ -275,7 +329,7 @@ def test_free_kv_watermark_counts_claimed_prefix_hits(build, seq_factory, chunke
         chunked=chunked,
         prefix=True,
         num_kvcache_blocks=10,
-        options={"enabled": True, "min_free_kv_fraction": 0.6},
+        options={"enabled": True, "num_reserved_decode_tokens": 12},
     )
     bm = sched.block_manager
     seed = seq_factory(list(range(16)))
@@ -290,8 +344,9 @@ def test_free_kv_watermark_counts_claimed_prefix_hits(build, seq_factory, chunke
     assert free == 8
     sched.add(b)
     sched.schedule()
-    # B receives one block, but its hit also takes two cached-but-free blocks:
-    # 8 - 3 would leave fewer than the 6 reserved.
+    # B receives one block, but its hit also takes two cached-but-free blocks
+    # (the third is A's): 8 - 3 leaves 5, short of the 6 that A and B need to
+    # grow by 12 tokens each.
     assert not b.block_table
     assert bm.kv.num_free == free
     assert sched.pd_admission.deferred == {"bytes": 0, "free_kv": 1}
@@ -317,10 +372,9 @@ def test_free_kv_watermark_skips_hits_on_blocks_another_request_holds(
         chunked=chunked,
         prefix=True,
         num_kvcache_blocks=10,
-        options={"enabled": True, "min_free_kv_fraction": 0.3},
+        options={"enabled": True, "num_reserved_decode_tokens": 4},
     )
     bm = sched.block_manager
-    assert sched.pd_admission.reserve_blocks == 3
     # A running request holds the four prompt blocks the next one hits.
     holder = seq_factory(list(range(16)))
     bm.allocate(holder, bm.can_allocate(holder))
@@ -329,7 +383,8 @@ def test_free_kv_watermark_skips_hits_on_blocks_another_request_holds(
     sched.extend([a, b])
     batch, _ = sched.schedule()
     # After A, 5 blocks are free. B's three-block hit is held by `holder`, so
-    # B takes one block and leaves 4; counting its four blocks would leave 1.
+    # B takes one block and leaves 4, above the 2 that A and B need to grow by
+    # 4 tokens each; counting its four blocks would leave 1.
     assert set(batch.connector_meta_output.reqs_to_recv) == {a.id, b.id}
     assert batch.connector_meta_output.reqs_to_recv[b.id].num_computed_blocks == 3
     assert bm.kv.num_free == 4
@@ -705,13 +760,19 @@ def test_multiconnector_uses_load_winner(build):
         {"enabled": True, "max_pending_kv_fraction": 0.1, "max_pending_kv_bytes": 10},
         {"enabled": True, "max_pending_kv_fraction": None},
         # A limit is either set or omitted; null does not disable it.
-        {"enabled": True, "max_pending_kv_fraction": None, "min_free_kv_fraction": 0.5},
+        {
+            "enabled": True,
+            "max_pending_kv_fraction": None,
+            "num_reserved_decode_tokens": 512,
+        },
         {"enabled": True, "max_pending_kv_bytes": None},
         {"enabled": True, "extra_growth_blocks_per_request": 1},
-        {"enabled": True, "min_free_kv_fraction": 0},
-        {"enabled": True, "min_free_kv_fraction": 1},
-        {"enabled": True, "min_free_kv_fraction": True},
-        {"enabled": True, "min_free_kv_fraction": float("inf")},
+        {"enabled": True, "num_reserved_decode_tokens": 0},
+        {"enabled": True, "num_reserved_decode_tokens": -1},
+        {"enabled": True, "num_reserved_decode_tokens": True},
+        {"enabled": True, "num_reserved_decode_tokens": 1.5},
+        # Replaced by num_reserved_decode_tokens.
+        {"enabled": True, "min_free_kv_fraction": 0.1},
     ],
 )
 def test_invalid_config_rejected(build, options):
@@ -758,18 +819,19 @@ def test_a_request_over_both_limits_counts_under_both(build):
         options={
             "enabled": True,
             "max_pending_kv_bytes": 1024,
-            "min_free_kv_fraction": 0.5,
+            "num_reserved_decode_tokens": 8,
         }
     )
-    assert (sched.pd_admission.max_bytes, sched.pd_admission.reserve_blocks) == (
+    assert (sched.pd_admission.max_bytes, sched.pd_admission.reserve_tokens) == (
         1024,
-        32,
+        8,
     )
-    policy = standalone(1024, reserve_blocks=32, free_blocks=32)
+    policy = standalone(1024, reserve_tokens=40, free_blocks=32)
     a = SizedSeq(id=1, block_table=[1])
     b = SizedSeq(id=2, block_table=[2])
     assert try_admit(policy, a)
-    # B would exceed the byte budget and leave 31 free blocks, below the 32 kept.
+    # B would exceed the byte budget and leave 31 free blocks, short of the 80
+    # that A and B need to grow by 40 tokens each.
     for _ in range(2):
         assert not try_admit(policy, b)
     assert policy.deferred == {"bytes": 1, "free_kv": 1}
