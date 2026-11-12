@@ -5,6 +5,10 @@ import logging
 
 from atom.model_engine.capabilities import EngineCapabilities, WorkerCapabilities
 from atom.model_engine.collective_rpc import RpcResult
+from atom.model_engine.engine_utility import (
+    PAUSE_GENERATION_CMD,
+    RESUME_GENERATION_CMD,
+)
 from atom.model_engine.llm_engine import LLMEngine
 from atom.rollout.weight_sync import load_weights_via_ipc, load_weights_via_shm
 
@@ -128,6 +132,22 @@ class AsyncLLMEngine(LLMEngine):
         logger.info(f"AsyncLLMEngine wake_up: tags={tags}")
         self.core_mgr.broadcast_utility_command_sync("resume_memory", tags=tags)
         logger.info("AsyncLLMEngine wake_up: completed")
+
+    def pause_generation(self, mode: str = "keep", timeout: float = 300.0) -> None:
+        """Schedule nothing on any engine until ``resume_generation``.
+
+        What is running waits; a weight update in between preempts it, and once
+        resumed it recomputes its context on the new weights. Only ``"keep"``.
+        """
+        self.core_mgr.broadcast_utility_command_sync(
+            PAUSE_GENERATION_CMD, timeout=timeout, mode=mode
+        )
+
+    def resume_generation(self, timeout: float = 300.0) -> None:
+        """Let every engine schedule again after ``pause_generation``."""
+        self.core_mgr.broadcast_utility_command_sync(
+            RESUME_GENERATION_CMD, timeout=timeout
+        )
 
     def get_weight_sync_status(self) -> list[dict]:
         """Fence state for each DP engine, in DP-rank order."""

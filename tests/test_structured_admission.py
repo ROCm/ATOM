@@ -618,7 +618,7 @@ def test_cancellation_cleanup_follows_terminal_sequence(fields, pending):
     seq = NS(id=19, leave_reason="aborted", **fields)
     callback = Mock()
     mgr._seq_id_to_callback = {19: callback}
-    mgr._release_seq_load = Mock()
+    mgr._release_load = Mock()
     mgr._bp_take_pending = Mock(return_value=seq if pending else None)
     mgr.broadcast_utility_command = Mock()
     mgr.abort_request(19)

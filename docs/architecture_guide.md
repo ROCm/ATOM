@@ -65,7 +65,7 @@ A request flows through the system in ten steps:
 
 2. **`InputOutputProcessor.preprocess()`** — each prompt is tokenized via the HuggingFace tokenizer. A `Sequence` object is created to track the request's state, timing, and block allocation. `arrive_time` is recorded.
 
-3. **`CoreManager.add_request()`** — the list of `Sequence` objects is serialized with `pickle` and sent over a ZMQ `ROUTER` socket. When multiple DP ranks are active, requests are routed by a configurable load-balancing strategy (`least_requests` by default; `round_robin` and `least_tokens` also available).
+3. **`CoreManager.add_request()`** — the list of `Sequence` objects is serialized with `pickle` and sent over a ZMQ `ROUTER` socket. When multiple DP ranks are active, requests are routed by a configurable load-balancing strategy (`least_requests` by default; `round_robin`, `least_tokens` and `prefix_spread` also available).
 
 4. **`EngineCore.process_input_sockets()`** — an I/O thread on the `EngineCore` process receives the serialized data on a ZMQ `DEALER` socket, deserializes it, and places the sequences into the `input_queue`.
 
@@ -370,6 +370,10 @@ Each attention backend provides its own `prepare_mtp_decode()` implementation:
 | `atom/model_engine/engine_core_mgr.py` | `CoreManager` ZMQ orchestration, process launching, load-balanced DP dispatch |
 | `atom/model_engine/model_runner.py` | `ModelRunner` per-GPU execution (model loading, CUDA graph capture, forward pass), `tokenIDProcessor` deferred output handling |
 | `atom/model_engine/model_hooks.py` | `DecodeRound`, the decode round a model's install may give DeepSeek-V4.1's metadata builder |
+| `atom/model_engine/dp_routing/prefix_spread.py` | `PrefixSpreadRouter`: the `--dp-load-balance prefix_spread` prefix index and placement rule `CoreManager` calls under its load-balancing lock |
+| `atom/model_engine/dp_routing/policies.py` | Stateless, session-affinity and prefix-spread placement policies with common request lifecycle hooks |
+| `atom/model_engine/dp_routing/route.py` | Placement rank, prefix credit, moved tokens and routing counter/label names |
+| `atom/model_engine/dp_routing/topology.py` | Effective prefix-routing topology used by the manager and MP deployment checks |
 | `atom/model_engine/scheduler.py` | `Scheduler` prefill-first scheduling, `ScheduledBatch` batch descriptor, `ScheduledBatchOutput` forward results |
 | `atom/model_engine/engine_stats.py` | `EngineStats` — MTP acceptance, prefix-cache hits, and the periodic engine-status line, each on its own cadence |
 | `atom/model_engine/sequence.py` | `Sequence` request state, `SequenceStatus` and `SequenceType` enums |
