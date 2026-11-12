@@ -27,7 +27,7 @@ from dataclasses import dataclass
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl.expr import const_expr, gpu, range_constexpr
+from flydsl.expr import gpu, range_constexpr
 from flydsl.expr.typing import Int32, Int64, T
 
 from atom.models.kimi_k3.mono.config import HIDDEN, LATENT
@@ -55,11 +55,6 @@ def allreduce_lines(rows: int) -> int:
 
 def allreduce_ctas(rows: int) -> int:
     return min(MAX_CTAS, -(-allreduce_lines(rows) // THREADS))
-
-
-def shared_line0(rows: int) -> int:
-    """The first line wholly inside the shared partials (``build_shared_push``)."""
-    return -(-rows * LATENT // LINE_ELEMENTS)
 
 
 def allreduce_peer_bytes(tp: int, rows: int) -> int:
@@ -168,20 +163,14 @@ def _reduce_lines(data, mine, tp, lines, bank, epoch, line, last, stride):
         line = line + stride
 
 
-def build_allreduce(tp: int, rows: int, routed_only: bool = False) -> K2AllReduceKernel:
-    """Lines are dealt to the grid's threads in turn, and a thread reduces in
-    place only lines it pushed itself, or lines no CTA of this launch pushes.
-
-    ``routed_only``: push only the lines below ``shared_line0`` -- the rest
-    ``build_shared_push`` pushed with this launch's epoch already -- reduce
-    those already-landed shared lines first, while the routed ones cross, then
-    the routed lines."""
+def build_allreduce(tp: int, rows: int) -> K2AllReduceKernel:
+    """Lines are dealt to the grid's threads in turn; a thread reduces in place
+    only lines it pushed itself."""
     lines = allreduce_lines(rows)
     ctas = allreduce_ctas(rows)
     stride = ctas * THREADS
     bank_words = tp * lines * LINE_WORDS
-    pushed = shared_line0(rows) if routed_only else lines
-    name = f"k3_k2_gfx1250_allreduce_tp{tp}_s{rows}{'_r' if routed_only else ''}"
+    name = f"k3_k2_gfx1250_allreduce_tp{tp}_s{rows}"
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def kernel(data: Int64, peers: Int64, epochs: Int64, rank: Int32):
@@ -194,23 +183,9 @@ def build_allreduce(tp: int, rows: int, routed_only: bool = False) -> K2AllReduc
         mine = rsrc(load_ptr64(peers, rank))
         line = bid * THREADS + tid
         _push_lines(
-            data, peers, rank, tp, lines, bank, epoch, line, fx.Int32(pushed), stride
+            data, peers, rank, tp, lines, bank, epoch, line, fx.Int32(lines), stride
         )
-        if const_expr(routed_only):
-            _reduce_lines(
-                data,
-                mine,
-                tp,
-                lines,
-                bank,
-                epoch,
-                fx.Int32(pushed) + line,
-                fx.Int32(lines),
-                stride,
-            )
-        _reduce_lines(
-            data, mine, tp, lines, bank, epoch, line, fx.Int32(pushed), stride
-        )
+        _reduce_lines(data, mine, tp, lines, bank, epoch, line, fx.Int32(lines), stride)
         gpu.barrier()
         # Every counter, not just this launch's: a launch with more CTAs reads
         # the rest, and tags must not repeat across the CTAs and widths that
@@ -218,51 +193,6 @@ def build_allreduce(tp: int, rows: int, routed_only: bool = False) -> K2AllReduc
         counter = bid + tid * ctas
         if counter < MAX_CTAS:
             bo.buffer_store(epoch, rsrc(epochs), counter)
-
-    @flyc.jit
-    def launch(
-        data: Int64,
-        peers: Int64,
-        epochs: Int64,
-        rank: Int32,
-        stream: fx.Stream = fx.Stream(None),  # noqa: B008
-    ):
-        kernel(data, peers, epochs, rank).launch(
-            grid=(ctas,), block=(THREADS,), stream=stream
-        )
-
-    ALLREDUCE_ABI.check(kernel, launch)
-    return K2AllReduceKernel(name, launch, (ctas,), (THREADS,), ctas)
-
-
-def build_shared_push(tp: int, rows: int, ctas: int = 32) -> K2AllReduceKernel:
-    """The shared partials' lines (from ``shared_line0``) to every rank, tagged
-    the epoch the next ``build_allreduce(routed_only=True)`` launch reads:
-    counter 0 plus one, as the counters only move at that launch's end. Run
-    as soon as the shared partials are written, beside the routed MoE: it
-    stores and never waits."""
-    lines = allreduce_lines(rows)
-    first = shared_line0(rows)
-    bank_words = tp * lines * LINE_WORDS
-    name = f"k3_k2_gfx1250_shared_push_tp{tp}_s{rows}"
-
-    @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
-    def kernel(data: Int64, peers: Int64, epochs: Int64, rank: Int32):
-        tid = fx.Int32(fx.thread_idx.x)
-        bid = fx.Int32(fx.block_idx.x)
-        epoch = fx.Int32(bo.buffer_load(rsrc(epochs), 0, vec_width=1, dtype=T.i32)) + 1
-        _push_lines(
-            data,
-            peers,
-            rank,
-            tp,
-            lines,
-            (epoch & 1) * bank_words,
-            epoch,
-            first + bid * THREADS + tid,
-            fx.Int32(lines),
-            ctas * THREADS,
-        )
 
     @flyc.jit
     def launch(
