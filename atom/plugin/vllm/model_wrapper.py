@@ -382,8 +382,8 @@ def _standalone_draft_atom_config(vllm_config, draft_hf_config, is_dspark_draft:
     )
     atom_config.quant_config = QuantizationConfig(
         atom_config.hf_config,
-        getattr(atom_config, "online_quant_config", None),
-        model=getattr(atom_spec_config, "model", None),
+        atom_config.online_quant_config,
+        model=atom_spec_config.model,
     )
     return atom_config
 

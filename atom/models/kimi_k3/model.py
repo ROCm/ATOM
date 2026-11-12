@@ -1290,7 +1290,7 @@ class KimiKDAAttention(nn.Module):
         hidden_states = hidden_states[:num_actual_tokens]
         if hidden_states_scale is not None:
             hidden_states_scale = hidden_states_scale[:num_actual_tokens]
-        # Single fused in-proj GEMM producing [q | k | v | g]; slice out each
+        # Single fused in-proj GEMM producing [q | k | v | g | b | f_a]; slice out each
         # part. `out_gate` is the KDA output gate consumed at o_norm below
         # (computed here so it rides the same GEMM instead of a separate one
         # after the recurrence). in_proj's weight was grown in

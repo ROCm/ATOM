@@ -744,7 +744,7 @@ def append_linear_rows(dst: nn.Module, tails) -> None:
     post-load hooks return early on an empty weight.
     """
     mods = (dst, *tails)
-    if any(getattr(m, "bias", None) is not None for m in mods):
+    if any(m.bias is not None for m in mods):
         raise NotImplementedError("Appending linear rows does not support bias.")
     quant_values = {m.quant_type.value for m in mods}
     if len(quant_values) != 1:
@@ -760,7 +760,7 @@ def append_linear_rows(dst: nn.Module, tails) -> None:
         )
     if value == QuantType.per_Token.value:
         # Before dst's weight grows: each scale is checked against its own rows.
-        scales = [getattr(m, "weight_scale", None) for m in mods]
+        scales = [m.weight_scale for m in mods]
         if not all(
             p is not None and p.data.shape[0] == m.weight.shape[0]
             for p, m in zip(scales, mods)
@@ -775,9 +775,8 @@ def append_linear_rows(dst: nn.Module, tails) -> None:
     dst.output_partition_sizes = [*dst.output_partition_sizes, *added]
     for m in tails:
         m.weight.data = m.weight.data.new_empty(0)
-        scale = getattr(m, "weight_scale", None)
-        if scale is not None:
-            scale.data = scale.data.new_empty(0)
+        if m.weight_scale is not None:
+            m.weight_scale.data = m.weight_scale.data.new_empty(0)
 
 
 class LinearBase(nn.Module):
