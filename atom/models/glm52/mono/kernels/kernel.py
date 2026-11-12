@@ -276,8 +276,12 @@ def build_glm5_monokernel(
     assert rope_dtype in ("fp32", "bf16")
     attention_weight = AttentionWeight(attention_weight)
     cache_layout = as_kv_cache_layout(kv_cache_layout)
-    attention_bf16 = attention_weight is AttentionWeight.BF16
+    # q_a/kv_a, q_b and W_o follow `attention_*`; W_UK / W_UV follow
+    # `absorb_ptpc`: production keeps them per-tensor FP8 on a BF16 checkpoint.
+    attention_bf16_rows = attention_weight is AttentionWeight.BF16_ABSORB_FP8
+    attention_bf16 = attention_bf16_rows or attention_weight is AttentionWeight.BF16
     attention_ptpc = attention_weight is AttentionWeight.FP8_PTPC
+    absorb_ptpc = attention_ptpc or attention_bf16_rows
     use_atom_kv_cache = cache_layout is KvCacheLayout.ATOM
     cache_fp8 = kv_cache_dtype == "fp8"
     # ATOM's production index plane; "bf16" is the private plane PR #1256 wrote.
@@ -286,6 +290,7 @@ def build_glm5_monokernel(
     assert not atom_experts or expert_mxfp4
     assert not native_fp4_mfma or atom_experts
     attention_k_chunks_per_unit = 1 if attention_bf16 else 2
+    absorb_k_chunks_per_unit = 1 if attention_bf16 and not absorb_ptpc else 2
     SPLIT_KEYS = sparse_keys_per_task(S, heads)
     assert topk % SPLIT_KEYS == 0 and 1 <= S <= 12
     assert 1 <= launches_per_step <= LAYER_SLOTS
@@ -371,7 +376,9 @@ def build_glm5_monokernel(
     # 16 N columns and uses 4 of them. Raising the tile trades LDS for weight
     # traffic; it is bit-identical, because the samples are independent output
     # columns and each one's K chunks accumulate in the same order either way.
-    SAMPLE_TILE = min(S, qkv_sample_tile)
+    # The row-major BF16 weight is 32 MB: S=8 reads it once, staging the tile
+    # before the prefetch (`S > qkv_sample_tile`) to stay in registers.
+    SAMPLE_TILE = S if attention_bf16_rows and S <= 8 else min(S, qkv_sample_tile)
     # Per-sample strides of the MoE FP8 activation tile and its block scales,
     # in LDS.  ``HIDDEN // 4`` (1536) and ``XQ_GROUPS`` (192) are both multiples
     # of the 32 LDS banks, so when the up/gate MFMA's B column is the SAMPLE --
@@ -445,7 +452,7 @@ def build_glm5_monokernel(
     MISC_WORDS = max(
         8 + S * XQ_S_STRIDE,
         S * MOE_SLOTS * (expert_inter // (32 if native_fp4_mfma else 128)),
-        N_SPLIT + 2 + (4 if attention_ptpc else 0),
+        N_SPLIT + 2 + (4 if absorb_ptpc else 0),
     )
     KEYS_OFF = MISC_OFF + MISC_WORDS
     DNW_OFF = KEYS_OFF + LDS_KEYS
@@ -539,6 +546,7 @@ def build_glm5_monokernel(
         cp=indexer_cp,
         dcp=dcp_size,
         kv=kv_cache_dtype,
+        aw=attention_weight.value,
         t=timeline,
     )
 
@@ -1033,10 +1041,25 @@ def build_glm5_monokernel(
             ]
             return ("bf16", wv, None, b_word + (lane // 16) * 4)
 
-        def unit_attention(w_rsrc, s_rsrc, rg, kc, NKC, K, BK, b_word, ln=None, scale_rows=SCALE_BM, coef=None):
-            if const_expr(attention_bf16):
+        def unit_bf16_rows(w_rsrc, rg, kc, K, b_word, ln=None):
+            """``unit_bf16``'s operand, read from a row-major ``[N, K]`` weight in place."""
+            ln = lane if ln is None else ln
+            first = (rg * 16 + ln % 16) * K + kc * 64 + (ln // 16) * 8
+            wv = [
+                fx.Vector(bo.buffer_load(w_rsrc, (first + sp * 32) // 2, vec_width=4, dtype=T.i32))
+                for sp in range(2)
+            ]
+            return ("bf16", wv, None, b_word + (lane // 16) * 4)
+
+        def unit_attention(
+            w_rsrc, s_rsrc, rg, kc, NKC, K, BK, b_word, ln=None, scale_rows=SCALE_BM, coef=None, absorbed=False
+        ):
+            ptpc = absorb_ptpc if absorbed else attention_ptpc
+            if const_expr(attention_bf16 and not ptpc):
+                if const_expr(attention_bf16_rows):
+                    return unit_bf16_rows(w_rsrc, rg, kc, K, b_word, ln)
                 return unit_bf16(w_rsrc, rg, kc, NKC, b_word, ln)
-            if const_expr(attention_ptpc):
+            if const_expr(ptpc):
                 if const_expr(BK == 64):
                     return unit_ptpc64(w_rsrc, rg, kc, NKC, b_word, coef=coef, ln=ln)
                 return unit_ptpc(w_rsrc, rg, kc, NKC, b_word, coef=coef, ln=ln)
@@ -1155,8 +1178,8 @@ def build_glm5_monokernel(
                 value = (index == i).select(values[i], value)
             return value
 
-        def attention_b_word(element):
-            return element // 4 if const_expr(attention_ptpc) else element // 2
+        def attention_b_word(element, absorbed=False):
+            return element // 4 if const_expr(absorb_ptpc if absorbed else attention_ptpc) else element // 2
 
         def emit_ptpc(stride, row_base, scale_rsrc, x_scales):
             def f(rl, n, v):
@@ -1645,7 +1668,7 @@ def build_glm5_monokernel(
                         res.append([v[j] for j in range(4)])
                     return res
 
-                if const_expr(S <= SAMPLE_TILE):
+                if const_expr(S <= qkv_sample_tile):
                     h_ld = load_x_rmsnorm(ld_h, HIDDEN, g_in, group_count)
                     pre = [u_qa(c) for c in range(QA_UNITS)]
                     if const_expr(attention_ptpc):
@@ -2080,16 +2103,17 @@ def build_glm5_monokernel(
                     UK_NKC,
                     NOPE_DIM,
                     64,
-                    attention_b_word(n_sel() * NOPE_DIM + c * 64),
+                    attention_b_word(n_sel() * NOPE_DIM + c * 64, absorbed=True),
                     coef=(
                         (
                             lambda: pick(
                                 [uk_scales[sample * ((NOPE_DIM + 127) // 128) + c // 2] for sample in range(S)], n_sel()
                             )
                         )
-                        if const_expr(attention_ptpc)
+                        if const_expr(absorb_ptpc)
                         else None
                     ),
+                    absorbed=True,
                 )
 
             pre = [u_uk(c) for c in range(UK_NKC)]
@@ -2098,7 +2122,7 @@ def build_glm5_monokernel(
                 lambda k: (mb("q_nope"), ((S - 1) * H + head) * NOPE_DIM + k * Q_B_TILE + Q_B_TILE - 1),
                 mark=("uk", t),
             )
-            if const_expr(attention_ptpc):
+            if const_expr(absorb_ptpc):
                 uk_scales = stage_x_pairs_ptpc(
                     "q_nope", S, NOPE_DIM, lambda k: ((k // NOPE_DIM) * H + head) * NOPE_DIM + k % NOPE_DIM, group=128
                 )
@@ -2115,13 +2139,13 @@ def build_glm5_monokernel(
                 s = k // UK_TILE
                 r0 = k % UK_TILE
                 vals = []
-                if const_expr(attention_ptpc):
+                if const_expr(absorb_ptpc):
                     ptpc_scale = ld_f32(r_suk, 0)
                 for j in range_constexpr(4):
                     r = r0 + j
                     ww = r // 16
                     value = lds_ld(red, (ww * 64 + s + 16 * ((r % 16) // 4)) * 4 + r % 4)
-                    if const_expr(attention_ptpc):
+                    if const_expr(absorb_ptpc):
                         value = bf16_round(value * ptpc_scale)
                     vals.append(value)
                 put_bf(mb("q_lat"), (s * H + head) * KV_LORA + (t % UK_PER_HEAD) * UK_TILE + r0, vals)
@@ -3062,7 +3086,7 @@ def build_glm5_monokernel(
         UV_NKC = KV_LORA // 64
         UV_R = UV_TILE // 16
         UV_WPR = WAVES // UV_R
-        UV_UNITS = UV_NKC // (attention_k_chunks_per_unit * UV_WPR)
+        UV_UNITS = UV_NKC // (absorb_k_chunks_per_unit * UV_WPR)
         for tt in range(start("uv"), S * N_UV, G):
             tt = fx.Int32(tt)
             stamp("uv", tt, 0)
@@ -3072,7 +3096,7 @@ def build_glm5_monokernel(
             head = t // (V_DIM // UV_TILE)
 
             def u_uv(c):
-                kc = ((wave % UV_WPR) * UV_UNITS + c) * attention_k_chunks_per_unit
+                kc = ((wave % UV_WPR) * UV_UNITS + c) * absorb_k_chunks_per_unit
                 return unit_attention(
                     r_wuv,
                     r_suv,
@@ -3081,9 +3105,10 @@ def build_glm5_monokernel(
                     UV_NKC,
                     KV_LORA,
                     128,
-                    attention_b_word(kc * 64),
+                    attention_b_word(kc * 64, absorbed=True),
                     scale_rows=uv_scale_rows,
-                    coef=((lambda: lds_ld(misc, N_SPLIT + 2 + kc // 2)) if const_expr(attention_ptpc) else None),
+                    coef=((lambda: lds_ld(misc, N_SPLIT + 2 + kc // 2)) if const_expr(absorb_ptpc) else None),
+                    absorbed=True,
                 )
 
             pre = [u_uv(c) for c in range(UV_UNITS)]
@@ -3139,14 +3164,14 @@ def build_glm5_monokernel(
                     o0 = o0 + lds_ld(red, (q * (KV_LORA // 2) + tid) * 2)
                     o1 = o1 + lds_ld(red, (q * (KV_LORA // 2) + tid) * 2 + 1)
                 uv0, uv1 = bf16_round(o0), bf16_round(o1)
-                if const_expr(not attention_ptpc):
+                if const_expr(not absorb_ptpc):
                     lds_st(xs, tid, bf16_pair(uv0, uv1))
-            if const_expr(attention_ptpc):
+            if const_expr(absorb_ptpc):
                 uv_max = wave_max(uv_valid.select(fx.max(fmath.absf(uv0), fmath.absf(uv1)), fx.Float32(0.0)))
                 if (lane == 0) & (wave < KV_LORA // 128):
                     lds_st(misc, N_SPLIT + 2 + wave, (uv_max == 0.0).select(fx.Float32(1.0), uv_max * (1.0 / FP8_MAX)))
             gpu.barrier()
-            if const_expr(attention_ptpc):
+            if const_expr(absorb_ptpc):
                 if uv_valid:
                     uv_scale = lds_ld(misc, N_SPLIT + 2 + tid // 64)
                     uv_rcp = 1.0 / uv_scale
@@ -3167,7 +3192,7 @@ def build_glm5_monokernel(
             owner = dcp_merge_latent(s, t)
             if owner:
                 acc = run_units(u_uv, UV_UNITS, UV_UNITS, pre)
-                if const_expr(attention_ptpc):
+                if const_expr(absorb_ptpc):
                     reduce_rows(UV_R, acc, emit_ptpc_scalar(UV_TILE, ld_f32(r_suv, 0)))
                 else:
                     reduce_rows(UV_R, acc, emit_out(UV_TILE))
