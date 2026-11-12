@@ -1405,19 +1405,11 @@ def minimax_m3_index_topk_decode(
 ):
     """Decode index block-score + top-k, both split-K (cudagraph-safe).
 
-    ``index_scorer`` and ``pages_per_block`` as in :func:`minimax_m3_index_topk`.
-
-    The MXFP4 scorer (aiter's ``minimax_m3_index_score_fp4_flydsl``) reads the index
-    cache as the two views of ``mxfp4_pages.page_views`` and the query as e4m3, as
-    the fused writer emits it (cast as stored, no per-tensor scale). ``index_scorer``
-    (an `IndexScoreBuffers`, with the step's map) holds what it runs on: that work map,
-    built once a step in the metadata, outside any graph (`make_sparse_decode_metadata`),
-    and the ``max_block`` it was built at, which must not move between graph
-    replays (the map's row count is the scorer's grid), and the `LogitsWorkspace` it
-    writes its fp32 scores into as a contiguous ``[heads, rows, max_block]`` view:
-    no per-layer allocation, no fill (both selectors read a row only up to its valid
-    blocks, which the scorer writes every step), and the aiter selector eligible at
-    any ``S * heads``.
+    ``index_scorer`` (an `IndexScoreBuffers`, here with the step's work map) and
+    ``pages_per_block`` as in :func:`minimax_m3_index_topk`. The MXFP4 scorer reads the
+    cache as ``mxfp4_pages.page_views`` and the query as e4m3, as the fused writer emits
+    it; the record's ``max_block`` must not move between graph replays (the map's row
+    count is the scorer's grid).
 
     Returns topk_idx [num_kv_heads, total_q, topk] (0-indexed block ids, -1 pad).
     For spec-decode (``max_query_len = num_spec+1``) each of the ``max_query_len``
