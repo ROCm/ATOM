@@ -1025,6 +1025,11 @@ class MiniMaxM3DecoderLayer(nn.Module):
         self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        # A no-op the residual entering this layer passes through once the
+        # input all-reduce + RMSNorm has produced it: the previous layer's
+        # output, all-reduced. A DSpark tap of that layer hooks here
+        # (MiniMaxM3Model.aux_tap_point) instead of all-reducing it again.
+        self.input_residual_tap = nn.Identity()
 
     def forward(
         self,
@@ -1081,6 +1086,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
         # in the model loop, because M3's fused all-reduce RMSNorm leaves that sum
         # TP-partial / NaN-prone under CUDAGraph.
         aux_hidden_state = residual.clone() if capture_aux else None
+        residual = self.input_residual_tap(residual)
 
         hidden_states = self.self_attn(
             positions=positions,
@@ -1183,6 +1189,9 @@ class MiniMaxM3Model(nn.Module):
             self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
+        # The last layer's counterpart of input_residual_tap: the residual the
+        # final all-reduce + RMSNorm produces.
+        self.final_residual_tap = nn.Identity()
 
         # Eagle3 aux hidden-state capture layer ids. Empty unless an Eagle3 drafter
         # registers them via MiniMaxM3SparseForCausalLM.set_aux_hidden_state_layers.
@@ -1231,18 +1240,44 @@ class MiniMaxM3Model(nn.Module):
                 {"hidden_states": hidden_states, "residual": residual}
             )
 
-        hidden_states, _ = fused_allreduce_gemma_rms_norm(
+        hidden_states, residual = fused_allreduce_gemma_rms_norm(
             hidden_states, residual, self.norm
         )
+        self.final_residual_tap(residual)
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states
+
+    def aux_tap_point(self, layer_id: int):
+        """Where a drafter reads decoder layer ``layer_id``'s output, the
+        residual stream after it (``AuxCaptureSpec.post_layer_hidden``),
+        already all-reduced: from the next layer's input all-reduce + RMSNorm,
+        or the final one's after the last layer. ``(module, extract)``, or None
+        to tap the layer itself (``aux_hidden_state``: one more all-reduce and
+        add). ``ATOM_M3_DSPARK_TAP_REDUCED=0`` always taps the layer."""
+        if not envs.ATOM_M3_DSPARK_TAP_REDUCED or layer_id < 0:
+            return None
+        nxt = layer_id + 1
+        if self.start_layer <= nxt < self.end_layer:
+            module = getattr(self.layers[nxt], "input_residual_tap", None)
+        elif nxt == self.config.num_hidden_layers and get_pp_group().is_last_rank:
+            module = self.final_residual_tap
+        else:  # the next layer runs on another pipeline stage
+            module = None
+        if module is None or not (self.start_layer <= layer_id < self.end_layer):
+            return None
+        return module, _tap_point_extract
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         num_fused_shared = getattr(self.config, "n_shared_experts", 0) or 0
         return make_minimax_m3_expert_params_mapping(
             self.config.num_local_experts + num_fused_shared
         )
+
+
+def _tap_point_extract(output: torch.Tensor, _module: nn.Module) -> torch.Tensor:
+    """A tap point's output is the post-layer hidden state itself."""
+    return output
 
 
 class MiniMaxM3SparseForCausalLM(nn.Module):

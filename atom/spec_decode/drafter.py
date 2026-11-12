@@ -47,6 +47,11 @@ class AuxCaptureSpec:
     # (layer_output, layer_module) -> [N, hidden_size], or None to skip this call.
     extract: Callable[[Any, nn.Module], torch.Tensor | None]
     capture: Literal["output", "input"] = "output"
+    # ``extract`` gives the residual stream after the layer (the reference
+    # model's hidden_states[layer_id + 1]). A target that computes that tensor
+    # anyway, all-reduced, can then hand out its own tap point for it
+    # (``aux_tap_point``) and spare the extract's reconstruction.
+    post_layer_hidden: bool = False
 
     def __post_init__(self):
         if self.capture not in ("output", "input"):
@@ -186,12 +191,23 @@ def install_aux_taps(
                 f"{spec.layer_ids}."
             )
         prev = lid
+    # The target's own tap point for a layer's post-layer hidden state, if any:
+    # (module, extract) whose forward output gives it, or None.
+    tap_point = (
+        _descend_wrappers(target_model, lambda m: getattr(m, "aux_tap_point", None))
+        if spec.post_layer_hidden and spec.capture == "output"
+        else None
+    )
     for lid in layer_ids:
-        module, extract = (
-            (_resolve_embedding(target_model), _identity_extract)
-            if lid == -1
-            else (layers[lid], spec.extract)
-        )
+        point = tap_point(lid) if tap_point is not None and lid != -1 else None
+        if point is not None:
+            module, extract = point
+        else:
+            module, extract = (
+                (_resolve_embedding(target_model), _identity_extract)
+                if lid == -1
+                else (layers[lid], spec.extract)
+            )
         hook = make_hook(lid, extract)
         if lid != -1 and spec.capture == "input":
 
