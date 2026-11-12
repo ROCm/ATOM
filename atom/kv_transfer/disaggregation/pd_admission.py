@@ -154,12 +154,13 @@ class PdAdmissionController:
                 states["receiving"] += 1
         return states
 
-    def check(self, seq, probe) -> tuple[bool, ReceivePlan | None]:
+    def check(self, seq, probe, *, running: bool) -> tuple[bool, ReceivePlan | None]:
         """Whether `seq` may allocate now, and the range a later `commit` charges.
 
         Takes no credit and publishes nothing, so a caller that does not reach
         `commit` (allocation or detach declined) just drops the result. The
-        plan is `None` when this is not a PD receive.
+        plan is `None` when this is not a PD receive. `running` is whether any
+        request is running on this D rank.
         """
         num_blocks = self._block_manager.num_pool_blocks(len(seq))
         offset = self._connector.pd_receive_block_offset(
@@ -168,20 +169,22 @@ class PdAdmissionController:
         if offset is None:
             return True, None
         plan = ReceivePlan(offset, num_blocks)
-        # With no pending receive, allow a single request past either soft
-        # limit. The normal allocator still enforces the hard capacity and
-        # lookahead checks.
-        if not self.pending:
-            return True, plan
+        # The normal allocator still enforces the hard capacity and lookahead
+        # checks past either soft limit.
         hit = []
-        receive_blocks = num_blocks - offset - self._charged_hits(probe, offset)
+        # With no pending receive, one request may pass the byte budget, so a
+        # prompt larger than it is not starved.
+        if self.pending and self.max_bytes is not None:
+            receive_blocks = num_blocks - offset - self._charged_hits(probe, offset)
+            if self.pending_bytes + receive_blocks * self.block_bytes > self.max_bytes:
+                hit.append("bytes")
+        # The reserve is growth room for requests already running, including
+        # those past their first batch and so no longer pending. Only an idle D
+        # admits below it, so a request larger than the pool minus the reserve
+        # is not starved.
         if (
-            self.max_bytes is not None
-            and self.pending_bytes + receive_blocks * self.block_bytes > self.max_bytes
-        ):
-            hit.append("bytes")
-        if (
-            self.reserve_blocks is not None
+            (self.pending or running)
+            and self.reserve_blocks is not None
             # Every block the request allocates, not only the receive targets:
             # a local prefix hit on a cached-but-free block leaves the free
             # list like a receive target does.
