@@ -587,14 +587,14 @@ def _tier_hit(router, chain):
     return router._tier_hit(router._path(chain))
 
 
-def _chain_seq(seq_id, tokens, first_block=0, session=None):
+def _chain_seq(seq_id, tokens, first_block=0, session=None, hbs=128):
     import array
 
     from atom.model_engine.prefix_hash import ShippedChain
 
     seq = _FakeSeq(seq_id, num_prompt_tokens=tokens, dp_session_id=session)
-    blocks = array.array("Q", range(first_block, first_block + tokens // 128))
-    seq.prompt_hash_chain = ShippedChain(128, 0, tokens, 0, blocks)
+    blocks = array.array("Q", range(first_block, first_block + tokens // hbs))
+    seq.prompt_hash_chain = ShippedChain(hbs, 0, tokens, 0, blocks)
     return seq
 
 
@@ -2289,6 +2289,26 @@ def test_prefix_spread_leaf_evict_counts_events_blocks_and_tokens():
     assert end["leaf_evict_tokens_total"] == 4 * 128
     assert end["tail_trim_blocks_total"] == 1 and end["reset_total"] == 3
     assert end["edges"] == 0 and end["indexed_tokens"] == 0
+    assert end["trim_blocked_total"] == 0  # nothing was pinned: never "blocked"
+
+
+def test_prefix_spread_trim_token_counters_use_the_chains_hash_block_size():
+    router = _make_spread_mgr()._prefix_router
+    for seq_id, blocks in ((1, 100), (2, 4)):
+        seq = _chain_seq(seq_id, blocks * 16, first_block=seq_id * 1_000, hbs=16)
+        router.place(seq, 0, 2)
+        router.prefill_complete(seq_id)
+    router.CAP = 98 * 16  # 6 blocks over: 6 <= 100 / 8 -> one tail trim of 6 blocks
+    router.reset()
+    got = router.index_counters()
+    assert (got["tail_trim_total"], got["tail_trim_blocks_total"]) == (1, 6)
+    assert got["tail_trim_tokens_total"] == 6 * 16
+    router.CAP = 0  # both leaves go whole: 94 and 4 blocks
+    router.reset()
+    got = router.index_counters()
+    assert (got["leaf_evict_total"], got["leaf_evict_blocks_total"]) == (2, 98)
+    assert got["leaf_evict_tokens_total"] == 98 * 16
+    assert got["trim_blocked_total"] == 0
 
 
 def test_prefix_spread_trim_blocked_counts_over_budget_with_only_pinned_edges():
