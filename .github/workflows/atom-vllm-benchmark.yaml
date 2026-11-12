@@ -32,7 +32,6 @@ on:
         options:
           - none
           - DeepSeek-V4-Flash TP4
-          - GLM-5.2-MXFP4-MTP TP4
           - MiniMax-M3-MXFP4 EAGLE3 TP4
           - Kimi-K3 DSpark DCP8 TP8
           - DeepSeek-V4.1-Flash DSpark TP4
@@ -45,7 +44,6 @@ on:
         options:
           - none
           - DeepSeek-V4-Flash TP4
-          - GLM-5.2-MXFP4-MTP TP4
           - MiniMax-M3-MXFP4 EAGLE3 TP4
           - Kimi-K3 DSpark DCP8 TP8
           - DeepSeek-V4.1-Flash DSpark TP4
@@ -58,7 +56,6 @@ on:
         options:
           - none
           - DeepSeek-V4-Flash TP4
-          - GLM-5.2-MXFP4-MTP TP4
           - MiniMax-M3-MXFP4 EAGLE3 TP4
           - Kimi-K3 DSpark DCP8 TP8
           - DeepSeek-V4.1-Flash DSpark TP4
@@ -71,7 +68,6 @@ on:
         options:
           - none
           - DeepSeek-V4-Flash TP4
-          - GLM-5.2-MXFP4-MTP TP4
           - MiniMax-M3-MXFP4 EAGLE3 TP4
           - Kimi-K3 DSpark DCP8 TP8
           - DeepSeek-V4.1-Flash DSpark TP4
@@ -84,7 +80,6 @@ on:
         options:
           - none
           - DeepSeek-V4-Flash TP4
-          - GLM-5.2-MXFP4-MTP TP4
           - MiniMax-M3-MXFP4 EAGLE3 TP4
           - Kimi-K3 DSpark DCP8 TP8
           - DeepSeek-V4.1-Flash DSpark TP4
@@ -97,7 +92,6 @@ on:
         options:
           - none
           - DeepSeek-V4-Flash TP4
-          - GLM-5.2-MXFP4-MTP TP4
           - MiniMax-M3-MXFP4 EAGLE3 TP4
           - Kimi-K3 DSpark DCP8 TP8
           - DeepSeek-V4.1-Flash DSpark TP4
@@ -110,7 +104,6 @@ on:
         options:
           - none
           - DeepSeek-V4-Flash TP4
-          - GLM-5.2-MXFP4-MTP TP4
           - MiniMax-M3-MXFP4 EAGLE3 TP4
           - Kimi-K3 DSpark DCP8 TP8
           - DeepSeek-V4.1-Flash DSpark TP4
@@ -123,7 +116,6 @@ on:
         options:
           - none
           - DeepSeek-V4-Flash TP4
-          - GLM-5.2-MXFP4-MTP TP4
           - MiniMax-M3-MXFP4 EAGLE3 TP4
           - Kimi-K3 DSpark DCP8 TP8
           - DeepSeek-V4.1-Flash DSpark TP4
@@ -671,7 +663,6 @@ jobs:
           # under the same display names.
           BENCHMARK_DISPLAYS = {
               "DeepSeek-V4-Flash TP4",
-              "GLM-5.2-MXFP4-MTP TP4",
               "MiniMax-M3-MXFP4 EAGLE3 TP4",
               "Kimi-K3 DSpark DCP8 TP8",
               "DeepSeek-V4.1-Flash DSpark TP4",
