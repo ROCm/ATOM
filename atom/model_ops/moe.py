@@ -12,7 +12,7 @@ import torch
 from aiter import ActivationType, QuantType, dtypes, get_hip_quant, topk_gating
 from aiter.dist.parallel_state import get_dp_group, get_pcp_group, get_tp_group
 from aiter.fused_moe import fused_moe
-from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.flydsl.moe_common import GateMode
 from aiter.ops.shuffle import (
@@ -859,34 +859,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
 
         layer.w13_weight = atom_parameter(self._maybe_pad_weight(layer.w13_weight.data))
         layer.w2_weight = atom_parameter(self._maybe_pad_weight(layer.w2_weight.data))
-        # gfx1250's fused_moe consumes GUGU-interleaved stage-1 weights. The
-        # Quark Qwen3.8 checkpoint stores its MTP expert in BF16, so it reaches
-        # this unquantized method instead of Mxfp4MoEMethod's existing gfx1250
-        # interleave path. The layout is decided once here and recorded on the
-        # layer: both the fused_moe and the modular (all2all) path read it, and
-        # the modular kernel cannot infer it from the weights.
-        interleave = get_gfx_runtime() == "gfx1250" and envs.ATOM_MOE_GU_ITLV
-        layer.moe_gate_mode = (
-            GateMode.INTERLEAVE if interleave else GateMode.SEPARATED
-        ).value
-        if interleave:
-            layer.w13_weight.data = moe_shuffle_weight(
-                layer.w13_weight,
-                experts_cnt=layer.w13_weight.shape[0],
-                is_guinterleave=True,
-                gate_up=True,
-            )
-            layer.w2_weight.data = moe_shuffle_weight(
-                layer.w2_weight,
-                experts_cnt=layer.w2_weight.shape[0],
-                is_guinterleave=True,
-                gate_up=False,
-            )
-            layer.w13_weight.is_shuffled = True
-            layer.w2_weight.is_shuffled = True
-        else:
-            # Reshaping weights is required for the standard aiter MoE kernel.
-            shuffle_weights(layer.w13_weight, layer.w2_weight)
+        # reshaping weights is required for aiter moe kernel.
+        shuffle_weights(layer.w13_weight, layer.w2_weight)
 
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
@@ -908,8 +882,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
         x_scale: torch.Tensor | None = None,
         scheduled_tokens_gpu: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # Weights left as loaded (no process_weights_after_loading) are separated.
-        gate_mode = getattr(layer, "moe_gate_mode", GateMode.SEPARATED.value)
         if self.fused_experts:
             return self.fused_experts(
                 hidden_states=x,
@@ -923,7 +895,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
                 global_num_experts=global_num_experts,
                 expert_map=expert_map,
                 expert_mask=layer.expert_mask,
-                moe_extra_args={"gate_mode": gate_mode},
                 x_scale=x_scale,
             )
         return fused_moe(
@@ -935,7 +906,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
             expert_mask=layer.expert_mask,
             activation=activation,
             num_local_tokens=scheduled_tokens_gpu,
-            gate_mode=gate_mode,
         )
 
 
