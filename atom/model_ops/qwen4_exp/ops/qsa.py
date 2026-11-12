@@ -33,6 +33,10 @@ from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.ops.topk import top_k_per_row_prefill
 
 from atom.model_ops.qwen4_exp.ops import qsa_flydsl_layout
+from atom.model_ops.qwen4_exp.ops.qsa_gfx1250 import (
+    qsa_gfx1250_supports,
+    qsa_sparse_paged_gqa_gfx1250,
+)
 from atom.utils import envs
 
 # Quantized cache rows. FP8 rows carry one FP32 scale (row amax / FP8 max), so
@@ -2448,26 +2452,21 @@ def qsa_sparse_paged_gqa(
         and logical_indices.stride(1) == 1
         and block_table.stride(1) == 1
         and _is_gfx1250()
+        and qsa_gfx1250_supports(q, k_cache, v_cache, k_scale, v_scale)
     ):
-        from atom.model_ops.qwen4_exp.ops.qsa_gfx1250 import (
-            qsa_gfx1250_supports,
-            qsa_sparse_paged_gqa_gfx1250,
+        return qsa_sparse_paged_gqa_gfx1250(
+            q,
+            k_cache,
+            v_cache,
+            logical_indices,
+            block_table,
+            token_to_request,
+            scale,
+            _table_width_bucket(block_table.shape[1]),
+            get_cu_num(),
+            k_scale=k_scale,
+            v_scale=v_scale,
         )
-
-        if qsa_gfx1250_supports(q, k_cache, v_cache, k_scale, v_scale):
-            return qsa_sparse_paged_gqa_gfx1250(
-                q,
-                k_cache,
-                v_cache,
-                logical_indices,
-                block_table,
-                token_to_request,
-                scale,
-                _table_width_bucket(block_table.shape[1]),
-                get_cu_num(),
-                k_scale=k_scale,
-                v_scale=v_scale,
-            )
     # Split-K reduction requires contiguous output head dimensions.
     out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
     if q.shape[0] == 0:

@@ -26,7 +26,11 @@ Same contract and split-K partial format as `_qsa_sparse_paged_gqa_kernel` in
   over unscaled probabilities, as in the portable kernel's `KV_FP8` path.
 """
 
+import torch
 import triton
+from aiter.ops.triton._triton_kernels.attention.mla import (
+    _mla_decode_fwd_reduce_kernel,
+)
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
@@ -385,8 +389,6 @@ def qsa_gfx1250_supports(q, k_cache, v_cache, k_scale=None, v_scale=None) -> boo
     and K/V sharing that layout. FP8 caches also need `[pages, page, heads]`
     FP32 scales with packed slots and heads, shared by K and V.
     """
-    import torch
-
     if q.dtype != torch.bfloat16 or v_cache.dtype != k_cache.dtype:
         return False
     if k_cache.dtype == torch.float8_e4m3fn:
@@ -457,8 +459,6 @@ def qsa_sparse_paged_gqa_gfx1250(
     k_scale=None,
     v_scale=None,
 ):
-    import torch
-
     tokens, q_heads, head_dim = q.shape
     pages, page_size, kv_heads, _ = k_cache.shape
     group_size = q_heads // kv_heads
@@ -527,10 +527,6 @@ def qsa_sparse_paged_gqa_gfx1250(
         num_warps=num_warps,
     )
     if kv_splits > 1:
-        from aiter.ops.triton._triton_kernels.attention.mla import (
-            _mla_decode_fwd_reduce_kernel,
-        )
-
         _mla_decode_fwd_reduce_kernel[(tokens, q_heads)](
             out,
             target,
