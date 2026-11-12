@@ -26,7 +26,7 @@ adapters import the existing tool/reasoning parsers and SSE helpers only inside
 the functions that use them; the execution manager and backend do not import the
 API adapters. Importing the package does not load llguidance or allocate
 mask/transfer resources. The GPU kernel remains in
-`atom/model_ops/triton_structured_output.py`.
+`atom/model_ops/triton_token_constraints.py`.
 
 ## Request formats
 

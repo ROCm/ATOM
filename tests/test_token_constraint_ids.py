@@ -11,9 +11,12 @@ from atom.model_ops.token_constraints import TokenConstraint, apply_bitmask_refe
     "constraint,allowed",
     [
         (TokenConstraint.allow([0, 31, 32, 64]), {0, 31, 32, 64}),
-        (TokenConstraint.deny([0, 31, 32, 64]), set(range(65)) - {0, 31, 32, 64}),
-        (TokenConstraint.force(31), {31}),
-        (TokenConstraint.deny([]), set(range(65))),
+        (
+            TokenConstraint.allow(sorted(set(range(65)) - {0, 31, 32, 64})),
+            set(range(65)) - {0, 31, 32, 64},
+        ),
+        (TokenConstraint.allow([31]), {31}),
+        (TokenConstraint.allow(range(65)), set(range(65))),
         (TokenConstraint.allow([31, 31]), {31}),
     ],
 )
@@ -31,10 +34,10 @@ def test_id_rules_preserve_allowed_logits(constraint, allowed):
     "constraint",
     [
         TokenConstraint.allow([]),
-        TokenConstraint.force(-1),
-        TokenConstraint.force(4),
-        TokenConstraint.force(True),
-        TokenConstraint.deny(range(4)),
+        TokenConstraint.allow([-1]),
+        TokenConstraint.allow([4]),
+        TokenConstraint.allow([True]),
+        TokenConstraint.allow([0.5]),
     ],
 )
 def test_invalid_or_empty_token_sets_fail_before_sampling(constraint):

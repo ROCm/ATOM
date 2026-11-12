@@ -4,57 +4,41 @@
 """Packed allowed-token sets, independent of the rule that produced them."""
 
 from dataclasses import dataclass
-from typing import Literal
 
 import torch
 
 
 @dataclass(frozen=True)
 class TokenConstraint:
-    """A hard token-ID rule, not a probability preference.
+    """A static allowed-token set used to compile grammar stop masks.
 
     Small static ID lists can compile once to an allowed-token bitmask. Dynamic
     grammars fill that representation directly; GPU channel state machines apply
     the same allow/deny semantics without transferring lists to the host.
     """
 
-    mode: Literal["allow", "deny"]
     token_ids: tuple[int, ...]
 
     @classmethod
     def allow(cls, token_ids):
-        return cls("allow", tuple(token_ids))
-
-    @classmethod
-    def deny(cls, token_ids):
-        return cls("deny", tuple(token_ids))
-
-    @classmethod
-    def force(cls, token_id):
-        return cls.allow((token_id,))
+        return cls(tuple(token_ids))
 
     def to_bitmask(self, vocab_size):
         """Compile on the CPU outside the per-token sampling hot path."""
-        if self.mode not in ("allow", "deny") or vocab_size <= 0:
-            raise ValueError("Invalid token constraint mode or vocabulary size")
+        if vocab_size <= 0:
+            raise ValueError("Invalid token constraint vocabulary size")
         if any(
             type(token) is not int or not 0 <= token < vocab_size
             for token in self.token_ids
         ):
             raise ValueError("Constraint token ID is outside the vocabulary")
-        if (self.mode == "allow" and not self.token_ids) or (
-            self.mode == "deny" and len(set(self.token_ids)) == vocab_size
-        ):
+        if not self.token_ids:
             raise ValueError("Token constraint must leave at least one allowed token")
-        mask = torch.full(
-            (1, (vocab_size + 31) // 32),
-            -1 if self.mode == "deny" else 0,
-            dtype=torch.int32,
-        )
+        mask = torch.zeros((1, (vocab_size + 31) // 32), dtype=torch.int32)
         for token in self.token_ids:
             value = int(mask[0, token // 32])
             bit = 1 << (token % 32)
-            value = (value | bit if self.mode == "allow" else value & ~bit) & 0xFFFFFFFF
+            value = (value | bit) & 0xFFFFFFFF
             mask[0, token // 32] = value if value < 2**31 else value - 2**32
         return mask
 

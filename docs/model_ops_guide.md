@@ -27,7 +27,7 @@ ATOM (AiTer Optimized Model) wraps AITER kernels with model-level abstractions f
 | `RotaryEmbedding` | `rotary_embedding.py` | `aiter.rope_cached_positions_2c_fwd_inplace` | Rotary position embedding |
 | `Sampler` | `sampler.py` | `aiter.mixed_sample_outer_exponential`, `aiter.ops.triton.topk.topk`, `aiter.ops.triton.softmax.softmax` | Token sampling |
 | `RejectionSampler` | `rejection_sampler.py`, `verify_kernels.py`, `spec_sampling/` (`ratio_verify.py`, `ratio_target_p.py`) | Triton `rejection_greedy_sample_kernel`, `_ratio_*`, `rejection_relaxed_sample_kernel`, `rejection_synthetic_sample_kernel` | Speculative decoding |
-| `apply_packed_bitmask` | `triton_structured_output.py` | Triton packed-bitmask kernel | JSON grammar masks on selected target logits |
+| `apply_packed_bitmask` | `triton_token_constraints.py` | Triton packed-bitmask kernel | JSON grammar masks on selected target logits |
 | `constrain_logits`, `advance_states` | `required_channel.py` | Triton `_constrain_logits_kernel`, `_advance_states_kernel` | `tool_choice="required"` channel mask (Kimi-K3) |
 
 ## AITER integration overview
@@ -504,8 +504,9 @@ pre-sampling boundary for K3 required channels and JSON Schema. Each backend
 computes its allowed tokens: K3 keeps its GPU state machine, while llguidance
 keeps its packed vocabulary masks. Both use the shared token-column masking
 primitive rather than separate logits-write implementations. Internal
-`TokenConstraint.allow(ids)`, `.deny(ids)` and `.force(id)` describe token sets;
-this refactor adds no request parameter or minimum-output-length feature.
+`TokenConstraint.allow(ids)` compiles the grammar manager's static stop mask;
+there are no unused deny/force modes. This refactor adds no request parameter
+or minimum-output-length feature.
 
 Masks intersect: a K3 forced token cannot restore a token forbidden by Schema.
 An empty intersection produces a request error through the existing output-copy
