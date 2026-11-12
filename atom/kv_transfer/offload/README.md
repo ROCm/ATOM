@@ -174,6 +174,25 @@ and NSA index-cache planes as zero-copy PAGE views and deliberately stores one
 shard per TP rank. Both use chunk-completion events to release source PAGE
 blocks before the remote store becomes terminal.
 
+GLM-5.3 and K3.1 Pro also support the OPUS FP4 indexer cache
+(`--index-cache-layout mfma`, `--index-cache-dtype fp4`, `--block-size 64`) with
+standalone `lmcache_mp`, including Mono decode (`ATOM_MONO_ENABLE=1`). Packed
+keys and e8m0 scales retain the OPUS MFMA layout and are transferred as separate
+opaque planes. Their namespace is distinct from legacy FP4. K3 additionally
+transfers its native KDA checkpoint, without TP rank collapse. PCP=PP=1 is
+required; plugins, P/D, `multi`, and `lmcache_offload` remain unsupported for
+OPUS DSA FP4. Model checkpoint weight quantization is unchanged.
+
+For GLM DSA and K3, MP also admits TP8+DCP8 with DP=1, no DP attention and no
+separate draft KV pool. Each rank stores its own local PAGE bytes; TP rank
+collapse is disabled. MP token ranges remain global, so one local PAGE covers
+`block_size * 8` tokens. Set **both** the server's `--chunk-size` and ATOM's
+`LMCACHE_CHUNK_SIZE` to a multiple of that logical block size: for page64, use
+512 (or a multiple), not 256. DCP interleave must divide the physical block size.
+K3's checkpoint boundaries must also align to the chunk size. DCP size and
+interleave are part of the cache namespace; this does not convert caches
+between DCP1 and DCP8. Other DCP topologies remain unsupported.
+
 ### Running the MP server
 
 The matching LMCache build must support the global `--null-block-id` setting

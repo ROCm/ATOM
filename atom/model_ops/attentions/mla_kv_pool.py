@@ -58,6 +58,7 @@ class MlaKvPool:
         index_dtype: torch.dtype | None = None,
         index_head_dim: int = 0,
         index_fp4: bool = False,
+        index_layout: str = "preshuffle",
     ):
         self.layers = layers
         self.block_size = block_size
@@ -68,7 +69,7 @@ class MlaKvPool:
         self.index_fields: list[EntryField] = []
         if index_layers and index_fp4:
             data_shape, scale_shape = fp4_index_block_shapes(
-                index_rows_per_block, index_head_dim
+                index_rows_per_block, index_head_dim, layout=index_layout
             )
             self.index_fields = [
                 EntryField("index", index_layers, data_shape, torch.uint8),

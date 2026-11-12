@@ -7,6 +7,8 @@ FP4 is a change of dtype, not a second cache: `indexer_qk_rope_quant_and_cache`
 writes packed E2M1 keys plus their e8m0 scales in place of the FP8 row, and
 `flydsl_pa_mqa_logits_fp4` scores them straight out of the paged cache.
 Every number here is one those kernels fix, so it drifts with them.
+The explicit OPUS layout instead uses ``dsa_fp4`` and the gfx950 MFMA layout;
+it is not a view-compatible replacement for the legacy FP4 permutation.
 """
 
 from __future__ import annotations
@@ -27,6 +29,26 @@ FP4_QUANT_BLOCK_SIZE = 32
 FP4_KV_BLOCK_SIZE = 64
 _MFMA_M = 16
 _K_TILE = 128
+
+
+def require_opus_api() -> None:
+    import inspect
+
+    from aiter import indexer_qk_rope_quant_and_cache
+    from aiter.ops.opus import pa_mqa_logits_mxfp4 as opus
+
+    if not hasattr(opus, "mqa_logits_mxfp4_config"):
+        raise RuntimeError(
+            "The mfma index layout requires the mqa_logits_mxfp4 API from AITER"
+        )
+    if not {"scale_layout", "rope_dim"}.issubset(
+        inspect.signature(indexer_qk_rope_quant_and_cache).parameters
+    ):
+        raise RuntimeError(
+            "The mfma index layout requires AITER's HIP OPUS indexer cache "
+            "writer with scale_layout and rope_dim support (ROCm/aiter#7798); "
+            "upgrade AITER and rebuild module_cache before enabling it"
+        )
 
 
 def _gfx() -> str:
@@ -79,7 +101,7 @@ def sparse_indexer_fp4_enabled(
 
 
 def assert_fp4_indexer_supported(
-    *, fused_writer: bool, prefill_context_parallel: bool
+    *, packed_writer: bool, prefill_context_parallel: bool
 ) -> None:
     """Reject the FP4 requests this build cannot serve.
 
@@ -87,15 +109,13 @@ def assert_fp4_indexer_supported(
     they raise instead of falling back: quietly ignoring `--index-cache-dtype
     fp4` would hide which of the two cost the memory the flag was asked for.
     """
-    if not fused_writer:
+    if not packed_writer:
         raise ValueError(
-            "The FP4 sparse indexer requires the fused QK/RoPE/cache kernel, "
-            "the only writer of the packed E2M1 planes. Either "
-            "ATOM_DISABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION is set, which unset "
-            "restores it, or this indexer has no fused kernel to begin with: "
-            "that needs head_dim == quant_block_size and rope_dim == "
-            "head_dim // 2, so a NoPE indexer has no FP4 route at all. Pass "
-            "--index-cache-dtype fp8."
+            "The FP4 sparse indexer requires a packed Q/K cache writer. "
+            "The preshuffle layout requires the fused QK/RoPE/cache kernel "
+            "and ATOM_DISABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION unset. "
+            "Supported NoPE indexers require --index-cache-layout mfma. "
+            "Otherwise pass --index-cache-dtype fp8."
         )
     if prefill_context_parallel:
         raise ValueError(
@@ -105,12 +125,20 @@ def assert_fp4_indexer_supported(
         )
 
 
-def fp4_q_scale_shape(tokens: int, heads: int, head_dim: int) -> tuple:
+def fp4_q_scale_shape(
+    tokens: int, heads: int, head_dim: int, *, layout: str = "preshuffle"
+) -> tuple:
     """`q_scale_out`'s shape: `[T, k_tiles, 4, 16, round_up(H // 16, 4)]`.
 
     The trailing pad is the dword a lane loads its four M-tile scale bytes with,
     so it is four even where the head count needs two.
     """
+    if layout == "mfma":
+        if head_dim != 128 or heads not in (32, 64):
+            raise ValueError("OPUS DSA FP4 requires H=32/64 and D=128")
+        return (tokens, 2, 32, heads // 16)
+    if layout != "preshuffle":
+        raise ValueError(f"Unsupported DSA FP4 layout: {layout}")
     m_tiles = heads // _MFMA_M
     return (tokens, head_dim // _K_TILE, 4, _MFMA_M, -(-m_tiles // 4) * 4)
 
@@ -138,7 +166,9 @@ def fp4_index_scale_rows(rows: torch.Tensor, block_size: int) -> torch.Tensor:
     return (rows % _MFMA_M) * lanes + rows // _MFMA_M
 
 
-def fp4_index_block_shapes(rows: int, head_dim: int) -> tuple[tuple, tuple]:
+def fp4_index_block_shapes(
+    rows: int, head_dim: int, *, layout: str = "preshuffle"
+) -> tuple[tuple, tuple]:
     """One block's packed-E2M1 and e8m0 shapes, for one indexer layer."""
     if rows != FP4_KV_BLOCK_SIZE:
         raise ValueError(
@@ -146,4 +176,10 @@ def fp4_index_block_shapes(rows: int, head_dim: int) -> tuple[tuple, tuple]:
             f"got {rows}"
         )
     k_tiles = head_dim // _K_TILE
+    if layout == "mfma":
+        if head_dim != 128:
+            raise ValueError("OPUS DSA FP4 requires head_dim=128")
+        return (4, rows, 16), (2, 32, 4)
+    if layout != "preshuffle":
+        raise ValueError(f"Unsupported DSA FP4 layout: {layout}")
     return (k_tiles, 4, rows, 16), (k_tiles, 4, rows)
