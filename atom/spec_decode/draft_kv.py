@@ -12,30 +12,66 @@ logger = logging.getLogger("atom")
 DRAFT_KV_ROWS = "draft_kv"
 
 
+# The methods whose proposer calls `draft_kv_builder`; the others (MTP, ngram) run
+# the target's own layers or have no draft model.
+DRAFT_POOL_METHODS = ("eagle3", "dspark")
+
+
+def draft_owns_kv_pool(config) -> bool:
+    """Whether `config`'s speculative draft caches into a KV pool of its own.
+
+    What `draft_kv_builder` will answer for the same draft, decided from the config
+    alone so `Config` and the offload deployment checks can ask it before any runner
+    exists. EAGLE3 and DSpark (`DRAFT_POOL_METHODS`) build one where the draft's family
+    owns it, and only the native runner builds it: under a plugin the framework owns
+    the KV cache, so the answer there is no. Read off the
+    draft's attention family (`DRAFT_POOL_FAMILIES`), not by resolving its backend,
+    which would import aiter into the API process that builds `Config`.
+    """
+    from atom.plugin import is_plugin_mode
+
+    # First: under a plugin the offload adapter hands over vLLM's own speculative
+    # config unchanged, which has no `draft_model_hf_config` to read.
+    if is_plugin_mode():
+        return False
+    spec = config.speculative_config
+    if (
+        spec is None
+        or spec.method not in DRAFT_POOL_METHODS
+        or spec.draft_model_hf_config is None
+    ):
+        return False
+    from atom.utils.selector import DRAFT_POOL_FAMILIES, attn_family
+
+    return attn_family(spec.draft_model_hf_config) in DRAFT_POOL_FAMILIES
+
+
 def draft_kv_builder(model_runner, draft_hf):
     """The KV builder a draft needs of its own, or None if it needs none.
 
     A draft is not an attention flavor; it is a model that has one. So the
     flavor comes from the draft's own config through the same selector the
     target uses, and that backend says whether a draft of its flavor caches
-    into a pool of its own (`DRAFT_OWNS_KV_POOL`). Where it does not, the
+    into a pool of its own (`selector.DRAFT_POOL_FAMILIES`). Where it does not, the
     runner never sees a draft builder at all.
 
     Which is why speculative decoding imports no attention anywhere: adding a
-    flavor is a flag and a `make_kv_pool` on that backend.
+    flavor is a table entry and a `make_kv_pool` on that backend.
     """
     from aiter import dtypes
 
-    from atom.utils.selector import attn_family, get_attn_backend
+    from atom.utils.selector import DRAFT_POOL_FAMILIES, attn_family, get_attn_backend
 
-    backend = get_attn_backend(attn_family(draft_hf))
-    if not backend.DRAFT_OWNS_KV_POOL:
+    family = attn_family(draft_hf)
+    if family not in DRAFT_POOL_FAMILIES:
         return None
+    backend = get_attn_backend(family)
     make_pool = partial(
         backend.make_kv_pool,
         draft_hf,
         world_size=model_runner.world_size,
-        kv_dtype=dtypes.d_dtypes[model_runner.config.kv_cache_dtype],
+        # settled once, by `Config`
+        kv_dtype=dtypes.d_dtypes[model_runner.config.speculative_config.draft_kv_dtype],
     )
     # A way to build it, not the pool: how many rows it has is the walk's to
     # say, and this runs from the proposer's `__init__` -- `build_drafter`
@@ -175,7 +211,7 @@ class DraftKvBuilder(PoolRowsMixin):
         idx = self.pool_rows[DRAFT_KV_ROWS][module]
         k_cache, v_cache = self.kv_pool.kv_views(idx)
         module.max_model_len = runner.config.max_model_len
-        if runner.config.kv_cache_dtype == "fp8":
+        if self.kv_pool.scale_fields:  # the layout's, as the target binder asks
             module.k_scale, module.v_scale = self.kv_pool.scale_views(idx)
         module.k_cache = k_cache
         module.v_cache = v_cache

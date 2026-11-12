@@ -531,25 +531,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # rope pool is always bf16.
         self._kv_fp8 = model_runner.kv_cache_dtype == "fp8"
         # aiter prefill (op4) / decode (op5) implement the fp8 (2buff) path only
-        # on gfx950 / gfx1250. On any other arch, transparently fall back to a
-        # bf16 KV cache instead of hard-failing. Flipping self._kv_fp8 here (before
-        # the *_dtype attrs are read) keeps the whole V4 path consistent: pool
-        # sizing (sub_pool_specs / swa_block_bytes_per_layer), quant_mode,
-        # and module.kv_fp8 (build_kv_cache_tensor) all key off self._kv_fp8 /
-        # these dtype attrs. Sync model_runner.kv_cache_dtype (and the shared
-        # config) so any generic reader / log line agrees.
-        if self._kv_fp8 and get_gfx() not in ("gfx950", "gfx1250"):
-            logger.warning(
-                "DeepSeek-V4 --kv_cache_dtype fp8 (2buff) is only supported on "
-                "gfx950 / gfx1250 (aiter op4/op5); got %r. Falling back to a "
-                "bf16 KV cache.",
-                get_gfx(),
-            )
-            self._kv_fp8 = False
-            model_runner.kv_cache_dtype = "bf16"
-            cfg = getattr(model_runner, "config", None)
-            if cfg is not None and getattr(cfg, "kv_cache_dtype", None) == "fp8":
-                cfg.kv_cache_dtype = "bf16"
+        # on gfx950 / gfx1250; elsewhere `Config` has already made the KV bf16
+        # (`Config.__post_init__`), so this reads the settled dtype.
         if self._kv_fp8:
             self._swa_dtype = dtypes.fp8
             self._classical_dtype = dtypes.fp8

@@ -292,6 +292,7 @@ method with `num_speculative_tokens=1` is supported.
 | `model` | `Optional[str]` | `None` | Draft model name or path (typically the same as the target model for MTP) |
 | `num_speculative_tokens` | `Optional[int]` | `None` | Number of speculative tokens per iteration; **must be `1`** |
 | `draft_model_hf_config` | `Optional[PretrainedConfig]` | `None` | HuggingFace config for the draft model; auto-loaded from `model` when `None` |
+| `kv_cache_dtype` | `Optional[str]` | `None` | KV dtype of the draft's pages as requested (`"bf16"` or `"fp8"`), set by `--spec-decode-kv-cache-dtype`; never rewritten. `Config` stores the dtype the draft will use in `draft_kv_dtype`. A draft with a KV pool of its own (one whose attention is MHA: MiniMax-M3.1's standalone DSpark, an MHA EAGLE3 draft) takes `"bf16"` or `"fp8"`; omitted, it has the target's dtype. A draft in the target's pool (MTP, an MLA draft) always has the target's dtype, and a different request is an error. A draft dtype that differs from the target's is refused with `--kv-transfer-config` (KV offload included), whose namespace keys the target's dtype only. |
 
 ### Table-driven MTP config
 
@@ -386,8 +387,9 @@ all flags via `add_cli_args()` and converts them into a `Config` via
 | `--moe-backend` | | `str` | `"standard"` | MoE implementation; choices: `standard`, `mega`. `mega` runs FlyDSL MegaMoE and requires `--enable-expert-parallel`; with `-sp N` it instead runs the Ulysses SP MXFP4 MoE through AITER `MegaMoeTP` on gfx950, on every step whose native MoE quantizes activations to FP4 (prefill, and decode from 256 global rows), and needs MORI built with `BUILD_CCO_SDMA=ON`. Startup fails when a layer or setting is outside what it serves. Each launch covers at most `min(ceil(max_num_batched_tokens / N), 8192)` local rows |
 | `--torch-profiler-dir` | | `str` | `None` | Directory for torch profiler traces |
 | `--enable-dp-attention` | | flag | `False` | Enable DP attention |
-| `--method` | | `str` | `None` | Speculative method; choices: `mtp` |
+| `--method` | | `str` | `None` | Speculative method; choices: `mtp`, `eagle3`, `dspark` |
 | `--num-speculative-tokens` | | `int` | `1` | Number of speculative tokens per iteration |
+| `--spec-decode-kv-cache-dtype` | | `str` | `None` | The draft's KV dtype, `SpeculativeConfig.kv_cache_dtype` (native ATOM has no `--spec-decode-config` JSON; this flag is its setting); choices: `bf16`, `fp8`. Needs `--method` and `--num-speculative-tokens` > 0. See the `SpeculativeConfig` table for what each value means per draft |
 | `--max-num-batched-tokens` | | `int` | `16384` | Maximum number of tokens to batch in the async engine |
 | `--state-checkpoint-interval-tokens` | | `int` | `8192` | Tokens between rungs of the per-request state checkpoint ladder; must be a multiple of the prefix-cache hash block size. `0` turns checkpointing off entirely; **`-1` turns off only the ladder**, leaving the prompt-end anchor and the demand rung as the placements. Prompts shorter than one interval publish no rung. A rung also quantizes prefill chunk boundaries, since a checkpoint is only valid where a forward ends exactly on one — which is most of what `-1` buys back |
 | `--state-checkpoint-demand` / `--no-state-checkpoint-demand` | | `bool` | on | Let a prefix hit that was refused for want of a checkpoint place a rung of its own. Off leaves the prompt-end anchor as the only placement. `ATOM_STATE_CHECKPOINT_DEMAND=0` overrides this without touching a launch script |

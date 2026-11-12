@@ -1380,6 +1380,14 @@ class SpeculativeConfig:
     # probability that the first i+1 draft tokens are all accepted), filled in by
     # __post_init__. None => real draft/target rejection sampling.
     synthetic_acceptance_rates: list[float] | None = None
+    # The draft's KV dtype as the user asked for it (--spec-decode-kv-cache-dtype):
+    # None = not asked, else "bf16" / "fp8". Never rewritten; the dtype the draft
+    # will use is `draft_kv_dtype`.
+    kv_cache_dtype: str | None = None
+    # Filled in by `Config.__post_init__` (`resolve_draft_kv_dtype`), once the
+    # target's dtype is settled; every reader (the draft's pool, its attention, the
+    # calibration identity, the compile hash) reads this one.
+    draft_kv_dtype: str | None = field(default=None, init=False)
 
     # model_type → mtp_model_type mapping
     _MTP_TYPE_MAP: ClassVar[dict[str, str]] = {
@@ -1939,6 +1947,23 @@ def qrep_for_step(
     test instead of living only as an inline expression.
     """
     return qrep_enabled and not use_seg_mla and (not is_prefill or prefill_qrep)
+
+
+def resolve_draft_kv_dtype(spec, target_dtype: str, *, own_pool: bool) -> str:
+    """The KV dtype of a speculative draft's pages: the target's, unless the draft has
+    a pool of its own (``own_pool``) and asked for another through
+    ``--spec-decode-kv-cache-dtype``. A draft in the target's pool cannot ask for
+    another dtype."""
+    asked = spec.kv_cache_dtype
+    if not own_pool:
+        if asked is not None and asked != target_dtype:
+            raise ValueError(
+                f"--spec-decode-kv-cache-dtype {asked} differs from "
+                f"--kv-cache-dtype {target_dtype}, but this draft caches in the "
+                "target's KV pool and cannot have its own dtype"
+            )
+        return target_dtype
+    return asked or target_dtype
 
 
 def indexer_cp_unsupported_reason(
@@ -2802,6 +2827,23 @@ class Config:
             v4_block_size = 256
             if self.kv_cache_block_size != v4_block_size:
                 self.kv_cache_block_size = v4_block_size
+            if self.kv_cache_dtype == "fp8" and self.plugin_config is None:
+                # aiter's V4 prefill / decode implement the fp8 (2buff) KV only on
+                # gfx950 / gfx1250. Elsewhere the KV is bf16, decided here -- before
+                # anything reads `kv_cache_dtype`, the draft's resolved dtype
+                # included -- and not by the builder after the fact. `get_gfx` is the
+                # builder's own probe (rocminfo; it does not initialise CUDA).
+                from aiter.jit.utils.chip_info import get_gfx
+
+                gfx = get_gfx()
+                if gfx not in ("gfx950", "gfx1250"):
+                    logger.warning(
+                        "DeepSeek-V4 --kv_cache_dtype fp8 (2buff) is only supported "
+                        "on gfx950 / gfx1250 (aiter op4/op5); got %r. Falling back to "
+                        "a bf16 KV cache.",
+                        gfx,
+                    )
+                    self.kv_cache_dtype = "bf16"
 
         # GLM-5.3-Flash's indexer caches one pooled key per `index_kpool`
         # tokens, so a KV block of B tokens needs only B // index_kpool index
@@ -2914,6 +2956,26 @@ class Config:
                 self.index_cache_dtype = "fp8"
             else:
                 self.index_cache_dtype = self.kv_cache_dtype
+        if self.speculative_config is not None:
+            from atom.spec_decode.draft_kv import draft_owns_kv_pool
+
+            spec = self.speculative_config
+            # The one place the draft's pool and dtype are settled: everything
+            # downstream (the draft builder, the proposer, the calibration identity)
+            # reads `spec.draft_kv_dtype`.
+            spec.draft_kv_dtype = resolve_draft_kv_dtype(
+                spec, self.kv_cache_dtype, own_pool=draft_owns_kv_pool(self)
+            )
+            if spec.draft_kv_dtype != self.kv_cache_dtype and self.kv_transfer_config:
+                # The offload namespace keys the target's KV dtype alone, so a
+                # draft page of another dtype would share a key with the target's.
+                raise ValueError(
+                    f"draft KV dtype {spec.draft_kv_dtype} differs from the "
+                    f"target's {self.kv_cache_dtype}: not supported with KV "
+                    "offload or --kv-transfer-config. Pass "
+                    f"--spec-decode-kv-cache-dtype {self.kv_cache_dtype} to match "
+                    "the target"
+                )
 
         if self.hf_config.model_type == "deepseek_v41_text":
             # CSA2's index plane is paged by the same scorer GLM's is, so a
@@ -3344,7 +3406,9 @@ class Config:
         # steer sampling and stay out.
         spec = self.speculative_config
         factors.append(
-            None if spec is None else (spec.method, spec.num_speculative_tokens)
+            None
+            if spec is None
+            else (spec.method, spec.num_speculative_tokens, spec.draft_kv_dtype)
         )
 
         hash_str = hashlib.md5(
