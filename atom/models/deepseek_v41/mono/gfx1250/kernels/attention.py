@@ -1016,11 +1016,9 @@ def tp_allreduce(c, region, tag):
 # (merged from v3tail.py)
 # (fx-v3) The attention tail as TileRT's mega_afm partitions it (design 6.7), c1 (one 16-row tile), TP4:
 # 
-# E3   wo_a: every CTA b = (out tile t = b // 8 of 32 rows, head hh = b % 8 of the group), both groups g: a (32 rows x one
-#      head's K = 512) product; wave w = (g, N tile, K half); its weights read into VGPRs before the wait for D's flags;
-#      the K halves summed in LDS; f32 partial records [item][8][32] + one LL flag a CTA.
-# E3F  wo_a head fold: the hh == 0 CTA of tile t sums the 8 heads' records in head order (both groups), bf16, MXFP8 of the
-#      32-col block -> y8 / ys; one LL flag a tile.
+# E4   wo_a: CTAs 192..255 = (group g, 32-row out tile) over the full K = 8 heads x 512 (the head sum in the CTA);
+#      its weights read into VGPRs before the wait for D's flags; bf16, MXFP8 of the 32-col block -> y8 / ys, one LL
+#      flag a tile.
 # F3   wo_b: CTA b < NOWN = 160 owns hidden cols 32 b .. 32 b + 31 over the full K = 2048: wave w = (N tile, K quarter),
 #      weights in VGPRs before the wait for the 32 fold flags; the quarters summed ((q0 + q1) + (q2 + q3)) -> f32 [r][32]
 #      at LDS 0 (the TP payload) and `out`.
@@ -1034,88 +1032,6 @@ def tp_allreduce(c, region, tag):
 
 NOWN, OWC = 160, 32          # the column owners (wo_b / TP / mHC post): 160 CTAs x 32 hidden cols
 GROUP_ROWS = NWOA // 2       # wo_a out rows a group (1024)
-
-
-@ASTRewriter.transform
-def stage_E3(c):
-    """c: t b w l sm o8 os woa woa_s wpart wflag wtag dflag dtag NDF TR."""
-    t, b, w, l, sm, TR = c["t"], c["b"], c["w"], c["l"], c["sm"], c["TR"]
-    tt = b // 8
-    hh = b % 8
-    g = w // 4
-    nt = (w // 2) % 2
-    kh = w % 2
-    n0 = g * GROUP_ROWS + tt * 32 + nt * 16
-    brow = c["woa"] + i64((n0 + l % 16) * KWOA + hh * 512)
-    # the weights first (2 K steps of this wave), then the wait for every D (row, key segment) flag
-    Bw = [ld_op(brow, (kh * 2 + s) * 128, l) for s in range(2)]
-    Bs = [hx.gload(c["woa_s"] + i64(((n0 + l % 16) // 32) * (KWOA // 32) + (hh * 512 + (kh * 2 + s) * 128) // 32), I32, align=4)
-          for s in range(2)]
-    hx.wait_flags(c["dflag"], c["NDF"], c["dtag"], w, l, 8)
-    gpu.barrier()
-    arow = c["o8"] + i64((l % 16) * NQ + g * KWOA + hh * 512)
-    acc = fx.Vector.filled(8, 0.0, F32)
-    for s in range_constexpr(2):
-        kb = (kh * 2 + s) * 128
-        av = ld_op(arow, kb, l)
-        sa = hx.gload(c["os"] + i64((l % 16) * (NQ // 32) + (g * KWOA + hh * 512 + kb) // 32), I32, align=4)
-        acc = hx.wmma_mx(av, sa, Bw[s], Bs[s], acc)
-    hx.lstore(sm + ((w * 32 + l) * 8) * 4, acc)
-    gpu.barrier()
-    if kh == 0:
-        pv = hx.lload(sm + (((w + 1) * 32 + l) * 8) * 4, F32, 8)
-        tot = [acc[i] + pv[i] for i in range(8)]
-        item = g * 256 + b
-        for i in range_constexpr(8):
-            r = (l // 16) * 8 + i
-            if r < TR:
-                hx.stx_dev(c["wpart"] + i64((item * 8 + r) * 32 + nt * 16 + l % 16) * 4, tot[i])
-    hx.wait_storecnt0()
-    gpu.barrier()
-    if t == 0:
-        hx.put(c["wflag"] + i64(b) * 8, I32(0), c["wtag"])
-
-
-@ASTRewriter.transform
-def stage_E3F(c):
-    """The head fold of out tile tt = b // 8 (CTAs b % 8 == 0): c: t b w l sm wpart wflag wtag y8 ys eflag etag stx TR."""
-    t, b, w, l, sm, TR = c["t"], c["b"], c["w"], c["l"], c["sm"], c["TR"]
-    if b % 8 == 0:
-        tt = b // 8
-        hx.wait_flags(c["wflag"] + i64(b) * 8, 8, c["wtag"], w, l, 8)
-        gpu.barrier()
-        # thread = (group, row, col): the 8 heads' records summed in head order, bf16
-        for it in range_constexpr((2 * TR * 32 + 255) // 256):   # (2 groups x TR rows x 32 cols > 256 threads)
-            e = t + it * 256
-            if e < 2 * TR * 32:
-                g = e // (TR * 32)
-                rr = (e // 32) % TR
-                cc = e % 32
-                pv = [hx.gload(c["wpart"] + i64(((g * 256 + tt * 8 + h) * 8 + rr) * 32 + cc) * 4, F32) for h in range(8)]
-                s = pv[0]
-                for h in range_constexpr(1, 8):
-                    s = s + pv[h]
-                hx.lstore(sm + ((g * 8 + rr) * 32 + cc) * 4, s.to(BF16).to(F32))
-        gpu.barrier()
-        if t < 2 * TR:
-            g = t // TR
-            rr = t % TR
-            vq = [hx.lload(sm + ((g * 8 + rr) * 32 + 4 * k) * 4, F32, 4) for k in range(8)]
-            vals = [vq[e // 4][e % 4] for e in range(32)]
-            amax = F32(0.0)
-            for e in range_constexpr(32):
-                amax = fx.max(amax, abs(vals[e]))
-            code = e8m0_of(amax)
-            words = q8words(vals, inv_pow2(code))
-            blk = g * (GROUP_ROWS // 32) + tt
-            c["stx"](c["ys"] + i64(rr * (NWOA // 32) + blk), code.to(fx.Int8))
-            yb = c["y8"] + i64(rr * NWOA + blk * 32)
-            c["stx"](yb, fx.Vector.from_elements(words[:4], I32))
-            c["stx"](yb + i64(16), fx.Vector.from_elements(words[4:], I32))
-        hx.wait_storecnt0()
-        gpu.barrier()
-        if t == 0:
-            hx.put(c["eflag"] + i64(tt) * 8, I32(0), c["etag"])
 
 
 @ASTRewriter.transform
@@ -1193,3 +1109,61 @@ def tp3(c, region, tag):
             if wi < NWD:
                 hx.gstore(c["tpout"] + i64(b * TPG * 3 + t * 3 + q) * 4, wq)
                 hx.stx_dev(c["ytgt"] + (i64(wi // WPR) * HID + i64(col)) * 2, wq)
+
+
+E4_CTA0 = 192   # wo_a CTAs 192..255 (D runs on 0..95)
+
+
+@ASTRewriter.transform
+def stage_E4(c):
+    """wo_a with the head sum inside the CTA: CTA eb = b - 192 < 64 = (group g = eb // 32, 32-row
+    out tile tt = eb % 32) over the group's full K = 8 heads x 512; wave w = (16-row half w // 4, K quarter w % 4 of 1024 =
+    8 K steps), its weights (128 VGPRs) read before the wait for D's flags; the quarters summed in order in LDS, bf16,
+    the tile's MXFP8 block -> y8 / ys, one LL flag (g, tt). c: t b w l sm o8 os woa woa_s dflag dtag NDF eflag etag stx TR."""
+    t, b, w, l, sm, TR = c["t"], c["b"], c["w"], c["l"], c["sm"], c["TR"]
+    eb = b - E4_CTA0   # (CTAs past D's: their weights land while D runs)
+    if (eb >= 0) & (eb < 64):
+        g = eb // 32
+        tt = eb % 32
+        nt = w // 4
+        kq = w % 4
+        n0 = g * GROUP_ROWS + tt * 32 + nt * 16
+        brow = c["woa"] + i64((n0 + l % 16) * KWOA + kq * 1024)
+        Bw = [ld_op(brow, s * 128, l) for s in range(8)]
+        Bs = [hx.gload(c["woa_s"] + i64(((n0 + l % 16) // 32) * (KWOA // 32) + (kq * 1024 + s * 128) // 32), I32, align=4)
+              for s in range(8)]
+        hx.wait_flags(c["dflag"], c["NDF"], c["dtag"], w, l, 8)
+        gpu.barrier()
+        arow = c["o8"] + i64((l % 16) * NQ + g * KWOA + kq * 1024)
+        acc = fx.Vector.filled(8, 0.0, F32)
+        for s in range_constexpr(8):
+            av = ld_op(arow, s * 128, l)
+            sa = hx.gload(c["os"] + i64((l % 16) * (NQ // 32) + (g * KWOA + kq * 1024 + s * 128) // 32), I32, align=4)
+            acc = hx.wmma_mx(av, sa, Bw[s], Bs[s], acc)
+        hx.lstore(sm + ((w * 32 + l) * 8) * 4, acc)
+        gpu.barrier()
+        if kq == 0:
+            q = [hx.lload(sm + (((nt * 4 + qq) * 32 + l) * 8) * 4, F32, 8) for qq in range(4)]
+            for i in range_constexpr(8):
+                r = (l // 16) * 8 + i
+                s_ = (q[0][i] + q[1][i]) + (q[2][i] + q[3][i])
+                if r < TR:
+                    hx.lstore(sm + 8192 + (r * 32 + nt * 16 + l % 16) * 4, s_.to(BF16).to(F32))
+        gpu.barrier()
+        if t < TR:
+            vq = [hx.lload(sm + 8192 + (t * 32 + 4 * k) * 4, F32, 4) for k in range(8)]
+            vals = [vq[e // 4][e % 4] for e in range(32)]
+            amax = F32(0.0)
+            for e in range_constexpr(32):
+                amax = fx.max(amax, abs(vals[e]))
+            code = e8m0_of(amax)
+            words = q8words(vals, inv_pow2(code))
+            blk = g * (GROUP_ROWS // 32) + tt
+            c["stx"](c["ys"] + i64(t * (NWOA // 32) + blk), code.to(fx.Int8))
+            yb = c["y8"] + i64(t * NWOA + blk * 32)
+            c["stx"](yb, fx.Vector.from_elements(words[:4], I32))
+            c["stx"](yb + i64(16), fx.Vector.from_elements(words[4:], I32))
+        hx.wait_storecnt0()
+        gpu.barrier()
+        if t == 0:
+            hx.put(c["eflag"] + i64(eb) * 8, I32(0), c["etag"])

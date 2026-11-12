@@ -95,18 +95,13 @@ def stage_score_any(c, isrx):
         return r, ch, hx.lload(osr + r * 4, I32), hx.lload(osr + (64 + r) * 4, I32), fx.max(hx.lload(osr + (128 + r) * 4, I32), I32(0))
 
     nme = fx.max((nt - b + (CTAS - 1)) // CTAS, I32(0))
-    for gb in range((nme + (RB - 1)) // RB):
-        base_i = b + gb * (RB * CTAS)
+    def pages_to_lds(base_i):   # the batch's key rows: compacted column -> real row (REINDEX), -> page -> LDS
         pcols = []
-        krows = []
         qs = []
         bds = []
         rr = []
         for k in range_constexpr(RB):
             r0_, ch0, cx0, bd0, q0 = tmap(fx.min(base_i + k * CTAS, nt - 1))
-            hx.lstore(sm + O_Q + k * (HEADS * DIM) + t * 16, hx.gload(c["iq_out"] + i64(r0_ * HEADS * DIM) + i64(t) * 16, I32, 4))
-            if t < HEADS:
-                hx.lstore(sm + O_W + k * (HEADS * 4) + t * 4, hx.gload(c["iw_out"] + i64(r0_ * HEADS + t) * 4, F32))
             for u in range_constexpr(SUB_):
                 pcols.append(ch0 * TCOLS_ + u * CHUNK + w * 16 + l % 16)
                 qs.append(q0)
@@ -120,6 +115,25 @@ def stage_score_any(c, isrx):
                  for j in range(RB * SUB_)]
         for j in range_constexpr(RB * SUB_):
             hx.lstore(sm + O_PF + (j * 256 + t) * 8, i64(pages[j]) * i64(c["irpp"]) + i64(krows[j] % c["irpp"]))
+
+    # the first batch's page chain (icand -> block table: this step's tables, not this layer's outputs) before
+    # the wait for the query (c["prewait"]: the INDEX_QUANT handoff), every CTA passes it
+    if fx.const_expr("prewait" in c):
+        if nme > 0:
+            pages_to_lds(b)
+        c["prewait"]()
+    for gb in range((nme + (RB - 1)) // RB):
+        base_i = b + gb * (RB * CTAS)
+        for k in range_constexpr(RB):
+            r0_, ch0, cx0, bd0, q0 = tmap(fx.min(base_i + k * CTAS, nt - 1))
+            hx.lstore(sm + O_Q + k * (HEADS * DIM) + t * 16, hx.gload(c["iq_out"] + i64(r0_ * HEADS * DIM) + i64(t) * 16, I32, 4))
+            if t < HEADS:
+                hx.lstore(sm + O_W + k * (HEADS * 4) + t * 4, hx.gload(c["iw_out"] + i64(r0_ * HEADS + t) * 4, F32))
+        if fx.const_expr("prewait" in c):
+            if gb > 0:
+                pages_to_lds(base_i)
+        else:
+            pages_to_lds(base_i)
         gpu.barrier()
         for k in range(fx.min(nme - gb * RB, I32(RB))):   # (this batch's tasks: a 1-round CTA runs one)
             ik = base_i + k * CTAS

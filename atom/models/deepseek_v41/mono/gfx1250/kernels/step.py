@@ -336,7 +336,7 @@ def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sourc
 #   kv, C  on A2 flags -> kv rows / q -> o-ready flags (kvflag, cflag)               [indexer / Engram-next: + KV_C]
 #   (idx)  iq / iw / compressor / iquant / scorer / selection (handoffs: indexer layers only)
 #   D      attention, on cflag / kvflag -> dflag;   D-idle CTAs: the attention mix partials + Sinkhorn of this layer
-#   E3     wo_a by (out tile, head), weights before the wait on dflag -> wflag;  E3F head fold -> eflag
+#   E4     wo_a on CTAs 192..255 (out tile, full K, head sum in the CTA), weights before the wait on dflag -> eflag
 #   F3     wo_b (160 owners x 32 cols, full K), weights before the wait on eflag;  TP3 (TP1) -> y1
 #   post   FFN mHC post in the 160 owners -> pflag (x1, R')       mix partials -> MIX_POST / L1 / Sinkhorn (idle CTAs)
 #   router 128 CTAs (gate rows before the wait on pflag) -> LL scores;  shared UG (x8 self, on pflag)
@@ -508,20 +508,31 @@ def target_layer(E, Ly):
                        bstride=fx.Int32(ltab(fp, Ly, "bstride")()), slots=ltab(fp, Ly, "slots")())
             CS.stage_crow(cc, r1b)
             CS.stage_cring(cc, r1b)
-        handoff(lc + i64(LY.INDEX_QUANT), t, True)
+        if ltab(fp, Ly, "ibat")() == fx.Int64(0):   # (no scorer: the INDEX_QUANT handoff here; else inside the scorer)
+            handoff(lc + i64(LY.INDEX_QUANT), t, True)
         if ltab(fp, Ly, "ibat")() != fx.Int64(0):
             cs_ = cwith(c, ibat=ltab(fp, Ly, "ibat")(), ibound=ltab(fp, Ly, "ibound")(), iplane=ltab(fp, Ly, "iplane")(),
                         irpp=fx.Int32(ltab(fp, Ly, "irpp")()), btab=ltab(fp, Ly, "btab")(), bstride=fx.Int32(ltab(fp, Ly, "bstride")()),
                         ilog=ltab(fp, Ly, "ilog")(), ilw=fx.Int32(ltab(fp, Ly, "ilw")()), isel=ltab(fp, Ly, "isel")(),
                         irow=ltab(fp, Ly, "irow")(), cprow=fx.Int32(ltab(fp, Ly, "cprow")()), imain=fx.Int32(ltab(fp, Ly, "imain")()),
-                        iq_out=fptr(fp, "iq_out"), iw_out=fptr(fp, "iw_out"))
+                        iq_out=fptr(fp, "iq_out"), iw_out=fptr(fp, "iw_out"),
+                        prewait=lambda: handoff(lc + i64(LY.INDEX_QUANT), hx.opaque_v(fx.thread_idx.x), True))
             lfl3 = ltab(fp, Ly, "lflags")()
             isrx = (lfl3 & fx.Int64(64)) != fx.Int64(0)
             cs_ = cwith(cs_, ibmax=ltab(fp, Ly, "ibmax")(), icand=ltab(fp, Ly, "icand")(), lvl=fptr(fp, "ilvl"),
                         iprod=(lfl3 & fx.Int64(32)) != fx.Int64(0), ts=None)
             SC.stage_score_any(cs_, isrx)
             handoff(lc + i64(LY.SCORE), t, True)
-            npass = isrx.select(fx.Int32(IDXL), cs_["iprod"].select(fx.Int32(2 * IDXL), fx.Int32(IDXL)))
+            # (the selection tree's levels past the first only when a row has more than one level-0 list: every row's
+            # input count n <= SEG -> level 0 already writes the final picks; its empty level-1 pass + handoff skipped)
+            lnr = hx.opaque_v(fx.thread_idx.x) % 32
+            bdr = hx.gload(cs_["ibound"] + i64(fx.min(lnr, fx.Int32(TR - 1))) * 4, fx.Int32)
+            nrow = fx.max(bdr, fx.Int32(0))
+            if isrx:
+                nrow = TK.rx_context(cs_, fx.min(lnr, fx.Int32(TR - 1)), bdr)
+            nmax = TK.wave_max((lnr < TR).select(nrow, fx.Int32(0)))
+            lsel = (nmax > fx.Int32(TK.SEG)).select(fx.Int32(IDXL), fx.Int32(1))
+            npass = isrx.select(lsel, cs_["iprod"].select(fx.Int32(2 * IDXL), lsel))
             for pi in range(npass):
                 pmode = isrx.select(fx.Int32(TK.MODE_RX), (pi < IDXL).select(fx.Int32(TK.MODE_SEL), fx.Int32(TK.MODE_BLK)))
                 plev = pi % IDXL
@@ -553,10 +564,9 @@ def target_layer(E, Ly):
     # ---- wo_a by head (dflag -> wflag), head fold (-> eflag), wo_b 160 x 32 (eflag), TP1 -> y1
     _stamp(stp, t, 7)
     v3e = dict(wpart=c["ypart"], wflag=wfl, wtag=wtg, NDF=DCT)
-    AS.stage_E3(cwith(c, **v3f, **v3e))
-    AS.stage_E3F(cwith(c, **v3f, **v3e))
+    AS.stage_E4(cwith(c, **v3f, **v3e))   # (wo_a with the head sum in the CTA: no fold hop)
     _stamp(stp, t, 8)
-    AS.stage_F3(cwith(c, **v3f))
+    AS.stage_F3(cwith(c, **v3f, NEF=64))
     AS.tp3(cwith(c, ytgt=fptr(fp, "y1")), par * 2, 2 * Ly + 1)
     hx.wait_storecnt0()
     gpu.barrier()
