@@ -11,8 +11,11 @@ existing serialization, stop IDs, fields and backend semantics.
 changing parser dispatch. `parse(rule, context)` returns the native compiled
 value. `bind(rule, context)` tags that value with its backend. Bindings are rebuilt
 at the engine boundary from native scheduled fields; provider classes and state
-never cross Sequence IPC. Rule declaration imports require no torch, Triton,
-AITER or llguidance. Backend imports happen when the corresponding adapter runs.
+never cross Sequence IPC. Importing `atom.constraint_parser` (rule declarations,
+`ConstraintParser`, request-owner registry) requires no torch, Triton, AITER or
+llguidance. Format modules such as the Kimi-K3 tool parser import the tool parser
+and registry stack, which does require torch. Backend imports happen when the
+corresponding adapter runs.
 
 ## Runtime adapter contract
 
@@ -47,13 +50,22 @@ Register adapters with `register_constraint_provider`. An adapter declares:
 - `release(runner, request_ids)`: release only owned request resources. Optional
   `errors(runner)` exposes backend request errors for output delivery.
 - Stateful adapters also declare a lightweight `owns_request(sequence)` predicate
-  over native request data. Runtime registration installs it in the request-owner
-  registry. Coordinator and engine processes must register the same predicate
-  with `register_constraint_request_owner` during adapter setup, without importing
-  execution backends. This makes terminal, abort and admission-failure cleanup
-  reach the worker release wrapper for every owned request. Ordinary requests
-  and stateless channels do not acquire an extra cleanup RPC. The built-in grammar
-  predicate retains the original Schema/tool-format ownership rules.
+  over native request data. `register_constraint_provider` installs it in the
+  request-owner registry of the process that registers the adapter (normally a
+  worker). The registry is process-local: `EngineCore` and `CoreManager` import
+  only `atom.constraint_parser` and never `atom.model_engine.token_constraints`,
+  so an adapter registered only in a worker is invisible to them and their
+  terminal, abort and admission-failure cleanup would not send the release RPC.
+  An out-of-tree adapter therefore also calls
+  `atom.constraint_parser.register_constraint_request_owner(backend, predicate)`
+  from a module that the engine/coordinator process imports; this needs no
+  execution backend import and is idempotent for the same predicate. The
+  built-in grammar predicate is in the default table and needs no registration.
+  Ordinary requests and stateless channels do not acquire an extra cleanup RPC.
+  The built-in grammar predicate retains the original Schema/tool-format
+  ownership rules.
+- `release` failures are isolated per adapter: `release_token_constraints`
+  releases every registered adapter, then re-raises the first error.
 
 The executor counts declared hard-mask participation per request. The channel
 FSM preserves a forbidden forced token when that same request has another hard
@@ -66,7 +78,9 @@ carry, and error sentinels are only applied to delivered output.
 For speculative decoding, request participation is expanded using inclusive
 cu_num_draft_tokens; zero/ragged segments, target rows and bonus rows follow the
 same per-request mapping as the verifier. A rejected future conflicting draft
-must not fail the current accepted output. Source and sampler row domains must
+must not fail the current accepted output; this holds for both target-row and
+bonus-row failure reports (a bonus-row failure only applies to the bonus position
+and only when that position was emitted). Source and sampler row domains must
 not be interchanged.
 
 Preparation, application, accepted commit, release, logprob capture, error output
@@ -74,6 +88,14 @@ and sampling-bypass eligibility all query this registry. Unconstrained requests
 return before bindings, steps or provider instances are allocated. A new adapter
 must not require a ModelRunner special case to disable head IDs or step override.
 ModelRunner centrally rejects those bypasses when has_constraints(batch) is true.
+
+Behavior note: a single request carrying both a forced K3 channel token and a
+JSON Schema/grammar rule now has its hard masks intersected without relaxing
+either rule. If the forced token is forbidden by the grammar, the request fails
+immediately with "no valid continuation" (the earlier code let the forced token
+override the grammar mask and reported the conflict at grammar commit). The
+OpenAI server clears `required_channel` whenever it configures a grammar, so only
+direct engine API use can reach this combination.
 
 These preparation and commit lifecycle guarantees apply to the regular sampling
 path. RapidServe disaggregated prefill applies stateless token masks before
