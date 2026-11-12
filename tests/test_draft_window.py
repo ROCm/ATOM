@@ -3,12 +3,13 @@
 
 """A DSpark draft's KV kept only as far back as its sliding window reads.
 
-The window is where two components meet without sharing code: the block
-pass's own read arithmetic (`_window_rows` in the MiniMax-M3 draft) and the
-scheduler's pool that frees what the window has passed. They have to agree to
-the row, and a disagreement does not fault: the draft reads another request's
-rows and only its acceptance falls. So the geometry is checked against the read
-arithmetic row by row, and the pool against the geometry.
+The window is where three components meet without sharing code: the block
+pass's own read arithmetic (`_window_rows` in the MiniMax-M3 draft), the
+scheduler's pool that frees what the window has passed, and the runner's
+staging that addresses the pool. Each has to agree with the others to the row,
+and a disagreement does not fault: the draft reads another request's rows and
+only its acceptance falls. So the geometry is checked against the read
+arithmetic row by row, and the pool and the staging against the geometry.
 
 Runs on CPU, without aiter.
 """
@@ -16,14 +17,23 @@ Runs on CPU, without aiter.
 from __future__ import annotations
 
 import dataclasses
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
+import torch
 from conftest import MockConfig
 
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.draft_window import (
     DRAFT_WINDOW_CLASS,
     DraftWindowGeometry,
+)
+from atom.model_ops.attentions.pool_layout.sub_pool_spec import Pool
+from atom.spec_decode.draft_kv import (
+    DraftKvBuilder,
+    draft_context_slots,
+    refuse_unsupported_draft_window,
 )
 
 # MiniMax-M3.1's DSpark draft: a 4096-key window read in pages of 16, in the
@@ -261,3 +271,254 @@ def test_a_received_prompt_publishes_its_window(seq_factory):
     for i, block_id in held.items():
         if i < 5:
             assert bm.draft_window.pool.block(block_id).hash != -1
+
+
+# ── runner staging ─────────────────────────────────────────────────────────
+
+
+def test_context_rows_below_the_window_are_dropped():
+    """A prefill chunk of 12 rows from position 8, one request holding blocks
+    3-5 (ids 7, 9, 2): the rows at 8-11 are below the window."""
+    positions = np.arange(8, 20)
+    seqlens = np.array([12])
+    tables = np.full((1, 4), -1, dtype=np.int32)
+    tables[0, :3] = [7, 9, 2]
+    rows = np.empty(12, dtype=np.int64)
+    slots = np.empty(12, dtype=np.int64)
+    n = draft_context_slots(
+        positions,
+        seqlens,
+        np.array([3]),
+        np.array([6]),
+        tables,
+        4,
+        rows_out=rows,
+        slots_out=slots,
+    )
+    assert n == 8
+    assert rows[:n].tolist() == list(range(4, 12))
+    want = [7 * 4 + p % 4 for p in (12, 13, 14, 15)]
+    want += [9 * 4 + p % 4 for p in (16, 17, 18, 19)]
+    assert slots[:n].tolist() == want
+
+
+def _staging_builder(geo=SMALL, max_bs=4, tokens=32):
+    runner = SimpleNamespace(
+        device=torch.device("cpu"),
+        config=SimpleNamespace(max_num_seqs=max_bs, max_num_batched_tokens=tokens),
+        forward_vars={},
+    )
+    builder = DraftKvBuilder(runner, make_pool=None, window=geo)
+    runner.forward_vars.update(builder.step_buffers())
+    return builder, runner.forward_vars
+
+
+def test_a_forward_stages_each_request_run_and_pads_the_rest():
+    builder, var = _staging_builder()
+    # Two decoding requests, one verify row each: runs from blocks 3 and 0.
+    batch = SimpleNamespace(
+        draft_windows=(
+            np.array([3, 0], dtype=np.int32),
+            np.array([2, 3], dtype=np.int32),
+            np.array([7, 9, 4, 5, 6], dtype=np.int32),
+        )
+    )
+    md = SimpleNamespace()
+    builder.prepare_step(
+        batch,
+        md,
+        positions=np.array([19, 10]),
+        seqlens=np.array([1, 1]),
+        running_bs=3,
+        decode=True,
+    )
+    assert var["draft_window_tables"].gpu[:3, :3].tolist() == [
+        [7, 9, 0],
+        [4, 5, 6],
+        [0, 0, 0],
+    ]
+    assert var["draft_window_first"].gpu[:3].tolist() == [3, 0, 0]
+    assert var["draft_window_extent"].np[:3].tolist() == [5, 3, 1]
+    rows, n = builder.kept_context(md, 2)
+    assert n == 2 and rows is None
+    assert md.draft_slot_mapping.tolist() == [9 * 4 + 3, 6 * 4 + 2]
+    # Padded to more rows than it kept, the forward gathers the kept ones.
+    rows, n = builder.kept_context(md, 4)
+    assert n == 2 and rows.tolist() == [0, 1]
+
+
+def test_a_forward_that_staged_nothing_writes_nothing():
+    """The kept rows live on the metadata they were staged for: a forward
+    whose metadata carries none is refused, not handed the last one's."""
+    builder, _ = _staging_builder()
+    with pytest.raises(RuntimeError, match="staged no draft window"):
+        builder.kept_context(SimpleNamespace(), 1)
+
+
+def test_a_dummy_forward_keeps_no_context_rows():
+    builder, var = _staging_builder()
+    md = SimpleNamespace()
+    builder.prepare_step(
+        SimpleNamespace(draft_windows=None),
+        md,
+        positions=np.zeros(0, dtype=np.int64),
+        seqlens=np.zeros(0, dtype=np.int64),
+        running_bs=2,
+        decode=True,
+    )
+    assert builder.kept_context(md, 2)[1] == 0
+    assert var["draft_window_extent"].np[:2].tolist() == [1, 1]
+
+
+def test_a_decode_that_would_read_below_its_run_is_refused():
+    builder, _ = _staging_builder()
+    # The verify row at 19 anchors at 19 or later and reads from key 12,
+    # block 3; a run from block 4 has nothing there.
+    batch = SimpleNamespace(
+        draft_windows=(
+            np.array([4], dtype=np.int32),
+            np.array([1], dtype=np.int32),
+            np.array([7], dtype=np.int32),
+        )
+    )
+    with pytest.raises(RuntimeError, match="reads block 3"):
+        builder.prepare_step(
+            batch,
+            SimpleNamespace(),
+            positions=np.array([19]),
+            seqlens=np.array([1]),
+            running_bs=1,
+            decode=True,
+        )
+
+
+def test_a_run_longer_than_the_table_is_refused():
+    builder, var = _staging_builder()
+    width = var["draft_window_tables"].np.shape[1]
+    batch = SimpleNamespace(
+        draft_windows=(
+            np.array([0], dtype=np.int32),
+            np.array([width + 1], dtype=np.int32),
+            np.arange(width + 1, dtype=np.int32),
+        )
+    )
+    with pytest.raises(RuntimeError, match="more than the"):
+        builder.prepare_step(
+            batch,
+            SimpleNamespace(),
+            positions=np.array([0]),
+            seqlens=np.array([1]),
+            running_bs=1,
+            decode=False,
+        )
+
+
+def test_the_windowed_pool_is_a_state_class_sized_to_the_running_windows():
+    runner = SimpleNamespace(
+        config=SimpleNamespace(max_num_seqs=8),
+        attn_metadata_builder=SimpleNamespace(block_size=4),
+    )
+    builder = DraftKvBuilder(runner, make_pool=None, window=SMALL)
+    builder._kv_pool = SimpleNamespace(entry_bytes=1000)
+    (spec,) = builder.sub_pool_specs()
+    assert spec.pool is Pool.STATE and spec.name == DRAFT_WINDOW_CLASS
+    assert spec.entries_per_req == SMALL.blocks_per_req
+    # One cached window per sequence slot by default.
+    assert spec.extra_entries == 8 * SMALL.blocks_per_req
+    assert builder.paged_pool_bytes(1000) == 0
+
+
+def _sized_builder(max_num_seqs):
+    runner = SimpleNamespace(
+        config=SimpleNamespace(max_num_seqs=max_num_seqs),
+        attn_metadata_builder=SimpleNamespace(block_size=4),
+    )
+    builder = DraftKvBuilder(runner, make_pool=None, window=SMALL)
+    builder._kv_pool = SimpleNamespace(entry_bytes=1000)
+    return builder
+
+
+@pytest.mark.parametrize(
+    "ratio, max_num_seqs, windows",
+    [("1", 8, 8), ("0.25", 8, 2), ("0.3", 8, 3), ("0.5", 1, 1), ("0", 8, 0)],
+)
+def test_the_window_cache_rounds_up_to_whole_windows(
+    monkeypatch, ratio, max_num_seqs, windows
+):
+    """A fraction of a window per slot still keeps one: rounding half to even
+    would have dropped the only cached window at 0.5 x 1 slot."""
+    monkeypatch.setenv("ATOM_DSPARK_DRAFT_KV_WINDOW_CACHE", ratio)
+    (spec,) = _sized_builder(max_num_seqs).sub_pool_specs()
+    assert spec.extra_entries == windows * SMALL.blocks_per_req
+
+
+@pytest.mark.parametrize("ratio", ["nan", "inf", "-1", "many"])
+def test_a_window_cache_that_is_not_a_finite_nonnegative_number_is_refused(
+    monkeypatch, ratio
+):
+    monkeypatch.setenv("ATOM_DSPARK_DRAFT_KV_WINDOW_CACHE", ratio)
+    with pytest.raises(ValueError, match="ATOM_DSPARK_DRAFT_KV_WINDOW_CACHE"):
+        _sized_builder(8).sub_pool_specs()
+
+
+@pytest.mark.parametrize(
+    "overrides, why",
+    [
+        ({"pipeline_parallel_size": 2}, "pipeline parallelism"),
+        ({"enable_rapidserve": True}, "RapidServe"),
+        ({"kv_transfer_config": {"kv_connector": "moriio"}}, "MoRI-IO"),
+        # Named the way the factory resolves them, not as raw strings: an
+        # omitted connector is MoRI-IO, and names fold case.
+        ({"kv_transfer_config": {"kv_role": "kv_producer"}}, "MoRI-IO"),
+        (
+            {
+                "kv_transfer_config": {
+                    "kv_connector": "MoRIIO",
+                    "kv_role": "kv_producer",
+                }
+            },
+            "MoRI-IO",
+        ),
+        (
+            {
+                "kv_transfer_config": {
+                    "kv_connector": "multi",
+                    "connectors": [{"kv_role": "kv_producer"}],
+                }
+            },
+            "MoRI-IO",
+        ),
+        (
+            {
+                "kv_transfer_config": {
+                    "kv_connector": "multi",
+                    "connectors": [
+                        {
+                            "kv_connector": "mooncake",
+                            "kv_role": "kv_producer",
+                            "enable_chunked_transfer": True,
+                        }
+                    ],
+                }
+            },
+            "chunked",
+        ),
+    ],
+)
+def test_deployments_without_a_window_path_are_refused(overrides, why):
+    config = SimpleNamespace(
+        pipeline_parallel_size=1, enable_rapidserve=False, kv_transfer_config={}
+    )
+    for key, value in overrides.items():
+        setattr(config, key, value)
+    with pytest.raises(ValueError, match=why):
+        refuse_unsupported_draft_window(config)
+
+
+def test_a_plain_mooncake_pair_is_accepted():
+    config = SimpleNamespace(
+        pipeline_parallel_size=1,
+        enable_rapidserve=False,
+        kv_transfer_config={"kv_connector": "mooncake", "kv_role": "kv_consumer"},
+    )
+    refuse_unsupported_draft_window(config)
