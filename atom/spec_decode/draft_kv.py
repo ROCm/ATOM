@@ -199,8 +199,11 @@ class DraftKvBuilder(PoolRowsMixin):
                 "draft",
                 "draft",
                 [m.layer_num for m in modules],
-                # A binding viewing its cache in smaller pages is cut per page.
-                [getattr(m, "page_tokens", pool.block_size) for m in modules],
+                # Each binding declares the page it reads its cache in.
+                [
+                    pool.block_size if m.page_tokens is None else m.page_tokens
+                    for m in modules
+                ],
             ),
             # A paged MHA/GQA draft is a per-rank shard. Appending it to an
             # otherwise replicated target must disable whole-object collapse.

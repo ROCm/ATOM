@@ -34,6 +34,7 @@ class _PagedAttention(nn.Module):
         super().__init__()
         self.base_attention = True
         self.use_mla = False
+        self.page_tokens = None
 
 
 class _Norm(nn.Module):
@@ -176,7 +177,7 @@ def test_draft_exports_zero_copy_mp_views_and_disables_tp_collapse():
     pool.allocate(2, "cpu")
     builder = DraftKvBuilder.__new__(DraftKvBuilder)
     builder._kv_pool = pool
-    layer = type("Layer", (), {"layer_num": 9})()
+    layer = type("Layer", (), {"layer_num": 9, "page_tokens": None})()
     builder._pool_rows = {DRAFT_KV_ROWS: {layer: 0}}
 
     transfer = builder.get_kv_transfer_tensors()

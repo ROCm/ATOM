@@ -1007,22 +1007,11 @@ class ModelRunner:
             logger.info("TBO enabled: model wrapped with UBatchWrapper")
         if sp_is_enabled():
             self.model = SPModelWrapper(self.model)
-        if getattr(self, "drafter", None) is not None:
-            self.drafter.arm_aux_capture(self.model)
-        self.pp_aux_relay = PPAuxRelay.build(self.config, self.model)
         drafter = getattr(self, "drafter", None)
-        if (
-            get_pp_group().world_size > 1
-            and drafter is not None
-            and drafter.captures_aux
-            and drafter.aux_capture_spec(self.config) is None
-        ):
-            # Taps on earlier stages never fire, and `PPAuxRelay` relays only a
-            # config-declared spec: a producer would write wrong context K/V.
-            raise NotImplementedError(
-                "pipeline parallel + a drafter tapping target layers without a "
-                "config-only aux_capture_spec (EAGLE3): PPAuxRelay cannot relay it"
-            )
+        if drafter is not None:
+            drafter.arm_aux_capture(self.model)
+        self.pp_aux_relay = PPAuxRelay.build(self.config, self.model)
+        self._refuse_unrelayed_pp_taps(drafter)
         installer = mono_decode_installers.get(hf_config.architectures[0])
         if installer is not None:
             self.model = resolve_obj_by_qualname(installer)(
@@ -3801,17 +3790,9 @@ class ModelRunner:
                 self.tokenID_processor.prev_token_ids = next_token_ids
                 # A producer that skips propose keeps the bookkeeping above:
                 # its next step reads `prev_token_ids` like any other's.
-                if self.drafter.context_kv_only:
-                    self._commit_target_step(batch, anchors)
-                else:
-                    draft_token_ids = self.propose_draft_token_ids(
-                        batch,
-                        self._draft_input_ids(batch, hidden_states),
-                        hidden_states,
-                        next_token_ids,
-                        num_reject_tokens,
-                        anchors,
-                    )
+                draft_token_ids = self._draft_or_commit(
+                    batch, hidden_states, next_token_ids, num_reject_tokens, anchors
+                )
 
             elif prev_batch is not None:
                 prev_rejected_num = np.zeros(prev_batch.total_seqs_num, dtype=np.int32)
@@ -3832,19 +3813,9 @@ class ModelRunner:
                 prev_rejected_num = np.zeros(batch.total_seqs_num, dtype=np.int32)
                 prev_bonus_num = np.zeros(batch.total_seqs_num, dtype=np.int32)
             if hasattr(self, "drafter"):
-                if self.drafter.context_kv_only:
-                    self._commit_target_step(batch, anchors)
-                else:
-                    # Mid-prompt sequences get their anchor corrected inside
-                    # propose_draft_token_ids, from `batch.next_token_ids`.
-                    draft_token_ids = self.propose_draft_token_ids(
-                        batch,
-                        self._draft_input_ids(batch, hidden_states),
-                        hidden_states,
-                        next_token_ids,
-                        num_reject_tokens,
-                        anchors,
-                    )
+                draft_token_ids = self._draft_or_commit(
+                    batch, hidden_states, next_token_ids, num_reject_tokens, anchors
+                )
 
         # DSpark Phase 2: carry this step's per-request ell back to the scheduler
         # as a {req_id: ell} dict (req_id-keyed avoids any output/draft batch
@@ -4097,6 +4068,39 @@ class ModelRunner:
         else:
             rows = hidden_states.shape[0]
         return self.tokenID_processor.input_ids.gpu[1 : rows + 1]
+
+    def _refuse_unrelayed_pp_taps(self, drafter) -> None:
+        """Under PP, refuse a drafter whose taps no config spec declares: taps on
+        earlier stages never fire, so a producer would write wrong context K/V."""
+        if (
+            get_pp_group().world_size > 1
+            and drafter is not None
+            and drafter.captures_aux
+            and drafter.aux_capture_spec(self.config) is None
+        ):
+            raise NotImplementedError(
+                "pipeline parallel + a drafter tapping target layers without a "
+                "config-only aux_capture_spec (EAGLE3): PPAuxRelay cannot relay it"
+            )
+
+    def _draft_or_commit(
+        self, batch, hidden_states, next_token_ids, num_reject_tokens, anchors
+    ):
+        """This step's drafts; a context-only producer only commits the target
+        step and returns None."""
+        if self.drafter.context_kv_only:
+            self._commit_target_step(batch, anchors)
+            return None
+        # Mid-prompt sequences get their anchor corrected inside
+        # propose_draft_token_ids, from `batch.next_token_ids`.
+        return self.propose_draft_token_ids(
+            batch,
+            self._draft_input_ids(batch, hidden_states),
+            hidden_states,
+            next_token_ids,
+            num_reject_tokens,
+            anchors,
+        )
 
     def _commit_target_step(self, batch: ScheduledBatch, anchors):
         """Commit the target's tentative step at each request's anchor row and

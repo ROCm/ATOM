@@ -60,7 +60,7 @@ from aiter.rotary_embedding import get_rope
 from torch import nn
 
 from atom.config import QuantizationConfig
-from atom.kv_transfer.disaggregation.types import kv_config_has_producer
+from atom.kv_transfer.disaggregation import kv_config_has_producer
 from atom.model_ops.layernorm import GemmaRMSNorm
 from atom.model_ops.linear import QKVParallelLinear, ReplicatedLinear, RowParallelLinear
 from atom.model_ops.minimax_m3.sparse_attn import (
@@ -217,9 +217,7 @@ class M3DSparkAttention(nn.Module):
             )
         # A P/D producer never runs the block pass
         # (`Drafter.context_kv_only`); it only writes context K/V.
-        producer = kv_config_has_producer(
-            getattr(atom_config, "kv_transfer_config", None)
-        )
+        producer = kv_config_has_producer(atom_config.kv_transfer_config)
         if self.total_num_kv_heads > tp_size and not producer:
             raise ValueError(
                 "The MiniMax-M3.1 DSpark draft decodes its block per row with one "
