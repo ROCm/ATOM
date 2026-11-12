@@ -13,8 +13,6 @@ from __future__ import annotations
 import logging
 import time
 
-import torch
-
 from atom.kv_transfer.disaggregation.types import (
     ConnectorCompletion,
     StateStoreOperationId,
@@ -28,6 +26,7 @@ from atom.kv_transfer.offload._offload_common import (
     max_pending_saves,
     offload_save_abandon_timeout_s,
     pp_aware_rank_and_world,
+    record_save_fence,
 )
 from atom.kv_transfer.offload.dense.connector import (
     DenseOffloadConnector,
@@ -464,8 +463,7 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
                 self._store_failed_no_tier.add(op)
             return
         try:
-            ready_event = torch.cuda.Event()
-            ready_event.record(torch.cuda.current_stream())
+            ready_event = record_save_fence()
         except Exception:
             logger.exception(
                 "kimi_k3 offload: state store fence creation failed; failing "

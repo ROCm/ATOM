@@ -51,7 +51,11 @@ from atom.kv_transfer.disaggregation.types import (
 from atom.kv_transfer.offload import _block_gpu_connector
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload._block_gpu_connector import BlockGPUConnector
-from atom.kv_transfer.offload._offload_common import OffloadSchedulerMixin
+from atom.kv_transfer.offload._offload_common import (
+    OffloadSchedulerMixin,
+    SaveLifecycle,
+    wait_save_fence,
+)
 from atom.kv_transfer.offload.dense.connector import (
     DenseOffloadConnector,
     DenseOffloadScheduler,
@@ -95,6 +99,7 @@ from atom.kv_transfer.offload.metadata import (
     ATOMRawBytesLMCacheMetadata,
     LMCacheOffloadMetadata,
     LMCacheReqMeta,
+    SaveSpec,
     SlotLoadSpec,
     SlotSaveSpec,
 )
@@ -7906,3 +7911,174 @@ class TestAStateStoreWaitsForTheCopyThatFillsItsUnits:
         worker._start_state_stores(SimpleNamespace(state_stores=[(a, [3]), (b, [5])]))
         assert submitted == []
         assert worker._store_failed_no_tier == {a, b}
+
+
+class TestBothSavePathsKeepTheAsyncSaveContract:
+    """The dense KV save and the Kimi-K3 state store keep the contract written
+    out in `_offload_common.py`: one fence per step on the current stream,
+    carried into the save thread and waited on before the source is read, and
+    per save at most one source release and exactly one terminal. The state
+    store's release and failure paths are covered in the two classes above."""
+
+    _Event = TestAStateStoreWaitsForTheCopyThatFillsItsUnits._Event
+
+    @staticmethod
+    def _worker(log):
+        worker = KimiK3OffloadConnector(
+            SimpleNamespace(
+                kv_transfer_config={"kv_role": "offload"},
+                kv_cache_block_size=4,
+                decode_context_parallel_size=1,
+                tensor_parallel_size=1,
+            )
+        )
+        worker.chunk_size = 8
+        stored = []
+
+        class _Engine:
+            gpu_connector = object()
+
+            @staticmethod
+            def store(_tokens, **kwargs):
+                log.append("store")
+                stored.append(kwargs["producer_event"])
+
+        worker._engine = _Engine()
+        terminals = []
+        record = worker._record_store_terminal
+
+        def _record_store_terminal(req, succeeded):
+            terminals.append(succeeded)
+            record(req, succeeded)
+
+        worker._record_store_terminal = _record_store_terminal
+        return worker, stored, terminals
+
+    @staticmethod
+    def _save(req_id=51):
+        return LMCacheReqMeta(
+            req_id=req_id,
+            token_ids=list(range(8)),
+            block_ids=[3],
+            save_spec=SaveSpec(skip_leading_tokens=0),
+            save_operation=SaveOperationId(req_id=req_id, generation=1),
+        )
+
+    @staticmethod
+    def _join(worker):
+        worker._save_executor.shutdown(wait=True)
+        worker._load_executor.shutdown(wait=True)
+
+    def test_each_path_fences_before_it_submits_and_waits_before_it_reads(
+        self, monkeypatch
+    ):
+        log, events, stream = [], [], object()
+
+        def _event():
+            events.append(self._Event(log))
+            return events[-1]
+
+        monkeypatch.setattr(torch.cuda, "Event", _event)
+        monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
+        worker, stored, terminals = self._worker(log)
+        submitted = []
+
+        class _Tier:
+            def submit_store(self, *args):
+                log.append("submit_store")
+                submitted.append(args)
+
+        worker._state_tier = _Tier()
+        op = StateStoreOperationId(7, 1)
+        metadata = LMCacheOffloadMetadata()
+        metadata.requests.append(self._save())
+        metadata.state_stores.append((op, [4, 5]))
+        try:
+            worker.start_load_kv(metadata)
+        finally:
+            self._join(worker)
+        state_fence, kv_fence = events
+        assert state_fence.stream is stream and kv_fence.stream is stream
+        assert submitted == [(op, (4, 5), state_fence)]
+        assert stored == [kv_fence]
+        assert log == ["record", "submit_store", "record", "synchronize", "store"]
+        assert terminals == [True]
+
+    def test_a_kv_fence_that_raises_fails_the_save_once_before_it_reads(self):
+        log = []
+        worker, stored, terminals = self._worker(log)
+        req = self._save()
+        try:
+            worker._guard(
+                "save",
+                worker._do_save_req,
+                req,
+                producer_event=self._Event(log, fail=True),
+            )
+            assert worker.get_finished().finished_saving == {req.save_operation}
+            assert worker.get_finished().finished_saving == set()
+        finally:
+            self._join(worker)
+        assert log == ["synchronize"] and stored == []
+        assert terminals == [False]
+
+    def test_a_kv_store_that_raises_reports_one_failed_terminal(self):
+        log = []
+        worker, _stored, terminals = self._worker(log)
+
+        def _store(_tokens, **_kwargs):
+            log.append("store")
+            raise RuntimeError("LocalCPU allocation failed")
+
+        worker._engine.store = _store
+        try:
+            worker._guard(
+                "save",
+                worker._do_save_req,
+                self._save(),
+                producer_event=self._Event(log),
+            )
+        finally:
+            self._join(worker)
+        assert log == ["synchronize", "store"]
+        assert terminals == [False]
+
+    def test_a_state_store_handed_no_fence_fails_before_it_reads(self):
+        with pytest.raises(ValueError):
+            wait_save_fence(None)
+        log = []
+        codec = TestAStateStoreWaitsForTheCopyThatFillsItsUnits._Codec(log)
+        tier = StateOffloadTier(codec)
+        op = StateStoreOperationId(8, 1)
+        try:
+            tier.submit_store(op, (0,), None)
+            tier.drain()
+        finally:
+            tier.shutdown()
+        assert log == []
+        assert tier.take_source_releases() == {op}
+        assert tier.take_store_reports() == (set(), {op})
+
+    @staticmethod
+    def _lifecycle(log):
+        return SaveLifecycle(
+            threading.Lock(),
+            release_source=lambda: log.append("release"),
+            report_terminal=lambda ok: log.append(("terminal", ok)),
+        )
+
+    def test_a_lifecycle_releases_once_and_reports_one_terminal(self):
+        log = []
+        lifecycle = self._lifecycle(log)
+        lifecycle.release_source()
+        lifecycle.release_source()
+        lifecycle.finish(True)
+        lifecycle.finish(False)
+        assert log == ["release", ("terminal", True)]
+
+    def test_a_terminal_with_no_earlier_release_releases_first(self):
+        log = []
+        lifecycle = self._lifecycle(log)
+        lifecycle.finish(False)
+        lifecycle.release_source()
+        assert log == ["release", ("terminal", False)]
