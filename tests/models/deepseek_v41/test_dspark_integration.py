@@ -306,12 +306,17 @@ def test_decode_positions_use_accepted_prefix_and_full_reservation():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
-def test_draft_graph_replay_reads_serving_slots_after_reorder(monkeypatch):
+@pytest.mark.parametrize("two_source", [False, True], ids=["cat", "two_source"])
+def test_draft_graph_replay_reads_serving_slots_after_reorder(monkeypatch, two_source):
+    """The captured draft block replays on the serving slots. With the
+    two-source path forced on, the source lists are rebuilt inside the graph
+    from each replay's anchors into the buffers sized at max_num_seqs."""
     from atom.model_ops.attentions.deepseek_v41.backend import (
         DeepseekV41MetadataBuilder,
     )
     from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
     from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
+    from atom.model_ops.deepseek_v41 import dspark as dspark_ops
     from atom.spec_decode.draft_graph import DraftGraph, StagedInput
 
     monkeypatch.setenv("ATOM_DRAFT_CUDAGRAPH", "1")
@@ -338,6 +343,9 @@ def test_draft_graph_replay_reads_serving_slots_after_reorder(monkeypatch):
     nn.Module.__init__(draft)
     draft.window_size = 4
     draft.draft_src_buffers = None
+    if two_source:
+        monkeypatch.setattr(dspark_ops, "two_source_draft", lambda: True)
+        draft.draft_src_buffers = dspark_ops.DraftSrcBuffers(4, 5)
     draft.draft_kv_dtype = "auto"
     layer = nn.Module()
     layer.attn = nn.Module()
@@ -345,7 +353,14 @@ def test_draft_graph_replay_reads_serving_slots_after_reorder(monkeypatch):
     draft.mtp = nn.ModuleList([layer])
     # Exercise the real cache reader and metadata contract; model arithmetic is
     # covered by the checkpoint runtime test, not replaced in that acceptance.
-    draft.draft_hidden = lambda ids, pos, kv, kv_pos, **_: (kv[0], kv_pos, ids + 1)
+    # The step's source lists ride out with the result, so a replay's can be
+    # checked against an eager build from the same anchors.
+    draft.draft_hidden = lambda ids, pos, kv, kv_pos, step, **_: (
+        kv[0],
+        kv_pos,
+        ids + 1,
+        *(() if step.src_indices is None else step.src_indices),
+    )
     graph = DraftGraph(
         forward=lambda bs, anchor_ids, anchor_positions: draft.block_backbone(
             anchor_ids, anchor_positions, 5
@@ -364,6 +379,9 @@ def test_draft_graph_replay_reads_serving_slots_after_reorder(monkeypatch):
     with torch.cuda.stream(stream):
         graph.warmup(4)
     torch.cuda.current_stream().wait_stream(stream)
+    if two_source:
+        # Allocated by the eager warmup pass, before the capture.
+        src_ptr = draft.draft_src_buffers.context.data_ptr()
     for slots, anchors in (
         ([3, 1, 0], [17, 12, 3]),
         ([2], [41]),
@@ -383,7 +401,7 @@ def test_draft_graph_replay_reads_serving_slots_after_reorder(monkeypatch):
                 "anchor_positions": torch.nn.functional.pad(pos, (0, pad)),
             },
         )
-        actual, actual_pos, actual_ids = graph.run(4, **staged)
+        actual, actual_pos, actual_ids, *actual_src = graph.run(4, **staged)
         expected = window[torch.tensor(slots, device="cuda")]
         torch.testing.assert_close(actual[: len(slots)], expected, rtol=0, atol=0)
         physical = torch.arange(builder.cache.geometry.ring_slots, device="cuda")
@@ -394,6 +412,27 @@ def test_draft_graph_replay_reads_serving_slots_after_reorder(monkeypatch):
             actual_pos[: len(slots)], expected_pos, rtol=0, atol=0
         )
         torch.testing.assert_close(actual_ids[: len(slots)], ids + 1, rtol=0, atol=0)
+        if two_source:
+            expected_src = dspark_ops.draft_src_indices(
+                staged["anchor_positions"],
+                builder.cache.geometry.ring_slots,
+                draft.window_size,
+                5,
+                dspark_ops.DraftSrcBuffers(4, 5),
+            )
+            got = dspark_ops.DraftSrcIndices(*actual_src)
+            # The lists are only meaningful up to their indptr's end; the
+            # rest of the buffer is never written.
+            assert torch.equal(got.context_ptr, expected_src.context_ptr)
+            assert torch.equal(got.block_ptr, expected_src.block_ptr)
+            for name, ptr in (("context", got.context_ptr), ("block", got.block_ptr)):
+                used = int(ptr[-1])
+                assert torch.equal(
+                    getattr(got, name)[:used], getattr(expected_src, name)[:used]
+                )
+            assert draft.draft_src_buffers.context.data_ptr() == src_ptr
+        else:
+            assert not actual_src
         assert torch.equal(builder.cache.backing, before)
     assert graph.is_captured(4)
 
