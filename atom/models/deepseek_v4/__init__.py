@@ -120,6 +120,10 @@ from atom.model_ops.v4_kernels import (
     swa_write,
     update_compressor_states,
 )
+from atom.models.deepseek_v4.shared_expert_fusion import (
+    fused_scale_kwargs,
+    shared_expert_fused_act_enabled,
+)
 from atom.utils import envs, mark_spliting_op
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.decorators import mark_trace, support_torch_compile
@@ -163,8 +167,6 @@ _V4_USE_TRITON_RMSNORM = _V4_RMSNORM_BACKEND == "triton"
 # Env-gated quant round-trips. Read once at module load — checking each
 # forward burns syscalls (V4-Pro: 64 layers × multiple sites per call).
 _V4_USE_REF_QUANT = os.environ.get("V4_USE_REF_QUANT", "0") == "1"
-# Fused-kernel switches. Default off; flip via env to A/B against the eager path.
-_V4_USE_TRITON_FUSION = os.environ.get("ATOM_V4_USE_TRITON_FUSION", "0") == "1"
 ENABLE_DS_QKNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_QKNORM_QUANT_FUSION
 
 
@@ -2765,10 +2767,14 @@ class Expert(nn.Module):
             prefix=f"{prefix}.w2",
         )
         self.swiglu_limit = swiglu_limit
-        # Switch: route clamp + silu(gate)*up [+ weights] + per-token FP8 1x128
-        # quant through a single aiter triton kernel. The fused kernel emits
-        # FP8 + scale; w2 accepts `x_scale` and skips its own quant step.
-        self.use_fused_clamp_act_mul = _V4_USE_TRITON_FUSION
+        # ATOM_V4_USE_TRITON_FUSION: clamp + silu(gate)*up [+ weights] + FP8
+        # quant in one aiter triton kernel, and w2 takes its `x_scale` instead
+        # of quantizing itself. The kernel needs this rank's intermediate
+        # width to be a multiple of 128 (V4.1-Flash's 2304: whole or at TP2,
+        # not 576 at TP4 or 288 at TP8); other widths keep the unfused path.
+        self.use_fused_clamp_act_mul = shared_expert_fused_act_enabled(
+            self.w2.input_size
+        )
 
     def forward(
         self,
@@ -2783,14 +2789,17 @@ class Expert(nn.Module):
         # feed the bf16 GEMM output directly.
         combined = self.gate_up_proj(x)  # [num_tokens, 2*inter_dim_per_tp]
         if self.use_fused_clamp_act_mul:
+            native_mx = self.w2.native_a8_group_rows is not None
             x_fp8, x_scale = fused_clamp_act_mul(
                 combined,
                 swiglu_limit=self.swiglu_limit,
                 activation="silu",
                 weights=weights,
                 dtype_quant=dtypes.fp8,
-                transpose_scale=True,
+                **fused_scale_kwargs(self.w2.native_a8_group_rows),
             )
+            if native_mx:
+                x_scale = x_scale.view(torch.float8_e8m0fnu)
             return self.w2(x_fp8, x_scale=x_scale)
         out = torch.empty(
             (combined.shape[0], combined.shape[-1] // 2),

@@ -438,10 +438,62 @@ impl MeshMetrics {
     }
 
     /// Record prefix hash policy execution branch for routing decisions.
+    #[deprecated(
+        note = "Use record_route_branch: mesh_route_branch_total{policy=\"prefix_hash\"} counts the same branches by pool."
+    )]
     pub fn record_worker_prefix_hash_policy_branch(branch: &'static str) {
         counter!(
             names::PREFIX_HASH_POLICY_BRANCH_TOTAL,
             "branch" => branch
+        )
+        .increment(1);
+    }
+
+    /// Record the branch a routing policy took for one selection.
+    pub fn record_route_branch(pool: &'static str, policy: &'static str, branch: &'static str) {
+        counter!(
+            names::ROUTE_BRANCH_TOTAL,
+            "pool" => pool,
+            "policy" => policy,
+            "branch" => branch
+        )
+        .increment(1);
+    }
+
+    /// Record the prefix match ratio a policy found for its best candidate.
+    pub fn record_route_prefix_match_ratio(pool: &'static str, policy: &'static str, ratio: f64) {
+        histogram!(
+            names::ROUTE_PREFIX_MATCH_RATIO,
+            "pool" => pool,
+            "policy" => policy
+        )
+        .record(ratio);
+    }
+
+    /// Record the router-tracked active requests on the selected worker, read
+    /// before the request is added.
+    pub fn record_route_selected_worker_active_requests(
+        pool: &'static str,
+        policy: &'static str,
+        branch: &'static str,
+        active_requests: usize,
+    ) {
+        histogram!(
+            names::ROUTE_SELECTED_WORKER_ACTIVE_REQUESTS,
+            "pool" => pool,
+            "policy" => policy,
+            "branch" => branch
+        )
+        .record(active_requests as f64);
+    }
+
+    /// Record a session request dispatched to a different worker than the
+    /// previous one: rebind, expired or rank_mapping.
+    pub fn record_session_worker_change(pool: &'static str, reason: &'static str) {
+        counter!(
+            names::SESSION_WORKER_CHANGE_TOTAL,
+            "pool" => pool,
+            "reason" => reason
         )
         .increment(1);
     }

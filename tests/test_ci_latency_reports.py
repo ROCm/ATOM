@@ -434,13 +434,15 @@ def test_staging_selects_current_cell_and_job_and_links_the_artifact(tmp_path):
     stage = load_module("stage_reports")
     results, output = tmp_path / "results", tmp_path / "staged"
     make_report(results, "cell-a", 100)
-    make_report(results, "cell-a", 101)
+    folder = make_report(results, "cell-a", 101)
+    (folder / "router-metrics.prom").write_text("mesh_route_branch_total 1\n")
     make_report(results, "cell-b", 101)
     (results / "cell-a.slurm-job-id").write_text("101\n")
     manifest = stage.stage_reports(results, "cell-a", output)
     assert len(manifest["reports"]) == 1
     html = output / manifest["reports"][0]["html"]
     assert html.read_text() == "report for cell-a/101"
+    assert (html.parent / "router-metrics.prom").is_file()
     summary = tmp_path / "summary.md"
     stage.write_summary(
         manifest, "https://github.com/org/repo/actions/runs/123/artifacts/456", summary
@@ -448,6 +450,67 @@ def test_staging_selects_current_cell_and_job_and_links_the_artifact(tmp_path):
     assert "artifacts/456" in summary.read_text() and "101" in summary.read_text()
     with pytest.raises(FileExistsError):
         stage.stage_reports(results, "cell-a", output)
+
+
+def router_snapshot(scraped_at, affinity, relocate, low_ratio, ratio_sum):
+    decisions = affinity + relocate
+    return f"""# scraped_at {scraped_at}
+# HELP mesh_route_branch_total Routing decisions
+# TYPE mesh_route_branch_total counter
+mesh_route_branch_total{{branch="affinity"}} {affinity}
+mesh_route_branch_total{{branch="relocate"}} {relocate}
+# TYPE mesh_route_prefix_match_ratio histogram
+mesh_route_prefix_match_ratio_bucket{{le="0.3"}} {low_ratio}
+mesh_route_prefix_match_ratio_bucket{{le="+Inf"}} {decisions}
+mesh_route_prefix_match_ratio_sum {ratio_sum}
+mesh_route_prefix_match_ratio_count {decisions}
+# TYPE mesh_worker_pool_size gauge
+mesh_worker_pool_size 4
+"""
+
+
+def samples(text):
+    return {
+        series: float(value)
+        for series, value in (
+            line.rsplit(" ", 1)
+            for line in text.splitlines()
+            if line and not line.startswith("#")
+        )
+    }
+
+
+def test_router_metrics_delta_separates_consecutive_runs():
+    delta = load_module("router_metrics_delta").delta
+    start = router_snapshot("t0", 0, 0, 0, 0)
+    after_c2 = router_snapshot("t1", 90, 10, 10, 75.5)
+    after_c4 = router_snapshot("t2", 100, 100, 100, 85.5)
+
+    c2, reset = delta(start, after_c2)
+    assert not reset
+    assert samples(c2)['mesh_route_branch_total{branch="affinity"}'] == 90
+    c4, reset = delta(after_c2, after_c4)
+    assert not reset and "increase from t1 to t2" in c4
+    # c4's own affinity share is 10%, not the cumulative 100 / 200.
+    assert samples(c4) == {
+        'mesh_route_branch_total{branch="affinity"}': 10,
+        'mesh_route_branch_total{branch="relocate"}': 90,
+        'mesh_route_prefix_match_ratio_bucket{le="0.3"}': 90,
+        'mesh_route_prefix_match_ratio_bucket{le="+Inf"}': 100,
+        "mesh_route_prefix_match_ratio_sum": 10,
+        "mesh_route_prefix_match_ratio_count": 100,
+    }
+
+
+def test_router_metrics_delta_counts_from_a_router_restart():
+    delta = load_module("router_metrics_delta").delta
+    restarted, reset = delta(
+        router_snapshot("t2", 100, 100, 100, 85.5),
+        router_snapshot("t3", 5, 0, 0, 4.0),
+    )
+    assert reset and "counter reset: yes" in restarted
+    assert samples(restarted)['mesh_route_branch_total{branch="affinity"}'] == 5
+    assert samples(restarted)["mesh_route_prefix_match_ratio_count"] == 5
 
 
 def test_missing_job_never_publishes_historical_reports(tmp_path):
