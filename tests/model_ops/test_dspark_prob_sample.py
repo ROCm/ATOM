@@ -477,5 +477,94 @@ def test_acceptance_gain(V=50, n=5, R=2048, T=1.0, top_p=0.95):
     )
 
 
+class _NoisySampler:
+    """Gumbel-max draw from its own CUDA generator, behind a long sleep on the
+    issuing stream: a verify that read the ids without waiting on the bonus
+    event would read them before they are written."""
+
+    def __init__(self, seed):
+        self.gen = torch.Generator(device=DEV).manual_seed(seed)
+
+    def __call__(self, logits, temperatures, **kwargs):
+        torch.cuda._sleep(50_000_000)
+        u = torch.rand(logits.shape, generator=self.gen, device=logits.device)
+        noisy = logits / temperatures[:, None] - torch.log(-torch.log(u))
+        return noisy.argmax(-1).to(torch.int32)
+
+
+@pytest.mark.parametrize("use_block,top_p", [(False, None), (True, 0.9)])
+def test_bonus_on_side_stream_matches_inline(use_block, top_p, R=64, n=3, V=96):
+    """ModelRunner._sample_bonus draws on the bonus stream and records the
+    event; prob_rejection_sample waits on it before its last kernel. Same
+    outputs as the inline draw, bit for bit."""
+    from types import SimpleNamespace
+
+    from atom.model_engine.model_runner import ModelRunner
+
+    g = torch.Generator(device=DEV).manual_seed(17)
+    T = 0.9
+    target = torch.randn(R * n, V, generator=g, device=DEV) * 2
+    bonus_logits = torch.randn(R, V, generator=g, device=DEV) * 2
+    drafts = torch.randint(0, V, (R, n), generator=g, device=DEV, dtype=torch.int32)
+    # Half the requests draft with q == p, so they accept every draft and
+    # emit the bonus token.
+    q = torch.randn(R, n, V, generator=g, device=DEV) * 2
+    q[: R // 2] = target.view(R, n, V)[: R // 2]
+    tokens_per = n + 1
+    input_ids = torch.zeros(R, tokens_per, dtype=torch.int32, device=DEV)
+    input_ids[:, 1:] = drafts
+    base = torch.arange(R, dtype=torch.int32, device=DEV) * tokens_per
+    tli = (base[:, None] + torch.arange(n, dtype=torch.int32, device=DEV)).reshape(-1)
+    bli = base + n
+    cu = torch.arange(1, R + 1, dtype=torch.int32, device=DEV) * n
+    temps = torch.full((R,), T, dtype=torch.float32, device=DEV)
+    src = torch.arange(R, dtype=torch.int32, device=DEV)
+
+    def step(overlap):
+        state = ProbDraftState.allocate(R, n, V, DEV)
+        state.q[:R, :, :V] = q
+        state.ids[:R] = drafts
+        state.temps[:R] = T
+        state.set_layout(0, V, 1)
+        state.verify_step = 3
+        runner = SimpleNamespace(
+            _bonus_stream=torch.cuda.Stream(),
+            _bonus_ready=torch.cuda.Event(),
+            sampler=_NoisySampler(seed=5),
+        )
+        ids, ready = ModelRunner._sample_bonus(
+            runner, bonus_logits, temps, None, top_p, False, True, overlap=overlap
+        )
+        assert (ready is not None) == overlap
+        out, verdict = prob_rejection_sample(
+            input_ids.view(-1),
+            tli,
+            n,
+            cu,
+            target,
+            ids,
+            bli,
+            temps,
+            top_p,
+            src,
+            state,
+            use_block=use_block,
+            bonus_ready=ready,
+        )
+        torch.cuda.synchronize()
+        return ids, out, verdict
+
+    # Inline first: it also compiles the kernels, so the side-stream step
+    # below launches its verification while the draw is still asleep.
+    ids_i, out_i, verdict_i = step(overlap=False)
+    ids_s, out_s, verdict_s = step(overlap=True)
+    assert torch.equal(ids_s, ids_i)
+    assert torch.equal(out_s, out_i) and torch.equal(verdict_s, verdict_i)
+    full = verdict_i[0] == n
+    if top_p is None:
+        assert full[: R // 2].all()
+    assert torch.equal(out_i[full, n], ids_i[full])
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v", "-s"]))
