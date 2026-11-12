@@ -1619,6 +1619,19 @@ _STACKED_DECODE_TILES = {
     _FMT_FP8: (4, 64, 4, 256),
     _FMT_FP4: (4, 64, 4, 256),
 }
+# gfx1250 BF16 keys: 64-column tiles and about 8 programs per CU split over the
+# row programs (None). Qwen3.8 MTP verify, ~98K-token context, 12 caches
+# rotated in one CUDA graph, us per call: bs1 4.73 -> 3.25, bs4 7.17 -> 5.09,
+# bs16 14.85 -> 11.66, bs64 45.82 -> 38.86.
+_STACKED_DECODE_TILES_GFX1250 = {_FMT_BF16: (4, 64, 2, None)}
+_STACKED_DECODE_PROGRAMS_PER_CU = 8
+
+
+def _stacked_decode_tiles(key_fmt: int) -> tuple[int, int, int, int | None]:
+    """(rows per program, column tile, warps, column programs or None)."""
+    if _is_gfx1250() and key_fmt in _STACKED_DECODE_TILES_GFX1250:
+        return _STACKED_DECODE_TILES_GFX1250[key_fmt]
+    return _STACKED_DECODE_TILES[key_fmt]
 
 
 # Cap on the FP32 logits buffer; scoring is chunked over query rows to respect
@@ -1730,12 +1743,25 @@ def qsa_paged_mqa_logits(
         and page_table.stride(1) == 1
     )
     heads, head_dim = q.shape[1], q.shape[2]
-    bmt, bn, warps, column_programs = _STACKED_DECODE_TILES[key_fmt]
+    bmt, bn, warps, column_programs = _stacked_decode_tiles(key_fmt)
+    row_programs = triton.cdiv(q.shape[0], bmt)
+    if column_programs is None:
+        column_programs = max(
+            1, _STACKED_DECODE_PROGRAMS_PER_CU * get_cu_num() // row_programs
+        )
     # Decode-sized batches stack each row's heads into the MFMA M dimension,
     # so a few rows per request still fill it and a request's keys are read
-    # once rather than once per row.
+    # once rather than once per row. With gfx1250 tiles an MTP verify batch
+    # (bmt rows per request) stays stacked past 256 rows.
     if (
-        q.shape[0] <= 256
+        (
+            q.shape[0] <= 256
+            or (
+                key_fmt in _STACKED_DECODE_TILES_GFX1250
+                and _is_gfx1250()
+                and q.shape[0] == bmt * page_table.shape[0]
+            )
+        )
         and envs.ATOM_QSA_STACKED_DECODE_SCORER
         and contiguous
         and heads & (heads - 1) == 0
@@ -1744,10 +1770,7 @@ def qsa_paged_mqa_logits(
         and head_dim >= 16
     ):
         _qsa_paged_mqa_logits_stacked_kernel[
-            (
-                triton.cdiv(q.shape[0], bmt),
-                min(triton.cdiv(columns, bn), column_programs),
-            )
+            (row_programs, min(triton.cdiv(columns, bn), column_programs))
         ](
             q,
             compressed_k_cache,
@@ -2067,55 +2090,19 @@ def qsa_select_paged_groups(
         row_starts = torch.empty(
             row_end - row_start, dtype=torch.int32, device=q.device
         )
-        q_chunk = q[row_slice]
-        token_to_request_chunk = token_to_request[row_slice]
-        query_positions_chunk = query_positions[row_slice]
-        use_gfx1250_scorer = (
-            not allow_flydsl
-            and compressed_k_scale is None
-            and _is_gfx1250()
-            and q_chunk.shape[0] == 4 * page_table.shape[0]
+        logits, visible_groups = qsa_paged_mqa_logits(
+            q[row_slice],
+            compressed_k_cache,
+            page_table,
+            token_to_request[row_slice],
+            query_positions[row_slice],
+            context_lens,
+            compress_ratio,
+            max_columns=columns,
+            row_starts=row_starts,
+            allow_flydsl=allow_flydsl,
+            compressed_k_scale=compressed_k_scale,
         )
-        if use_gfx1250_scorer:
-            from atom.model_ops.qwen4_exp.ops.qsa_select_gfx1250 import (
-                qsa_index_scores,
-                qsa_index_scores_supports,
-            )
-
-            use_gfx1250_scorer = qsa_index_scores_supports(
-                q_chunk, compressed_k_cache, page_table
-            )
-        if use_gfx1250_scorer:
-            visible_groups = torch.empty_like(row_starts)
-            logits = qsa_index_scores(
-                q_chunk,
-                compressed_k_cache,
-                page_table,
-                token_to_request_chunk,
-                query_positions_chunk,
-                context_lens,
-                compress_ratio,
-                columns,
-                q.shape[2] ** 0.5,
-                _table_width_bucket(page_table.shape[1]),
-                get_cu_num(),
-                visible_groups=visible_groups,
-                row_starts=row_starts,
-            )
-        else:
-            logits, visible_groups = qsa_paged_mqa_logits(
-                q_chunk,
-                compressed_k_cache,
-                page_table,
-                token_to_request_chunk,
-                query_positions_chunk,
-                context_lens,
-                compress_ratio,
-                max_columns=columns,
-                row_starts=row_starts,
-                allow_flydsl=allow_flydsl,
-                compressed_k_scale=compressed_k_scale,
-            )
         top_k_per_row_prefill(
             logits,
             row_starts,
