@@ -2920,7 +2920,12 @@ def test_dcp_sharding_is_read_from_the_pool_spec(module, cls_name, sharded):
 
 
 def _compute_draft_kv(
-    kv_pool_spec, n_tok, n_rows=None, target_slots=True, publish_ctx_slots=True
+    kv_pool_spec,
+    n_tok,
+    n_rows=None,
+    target_slots=True,
+    publish_ctx_slots=True,
+    dcp=8,
 ):
     """Drive the real `compute_draft_kv`; return what reached the model."""
     import torch
@@ -2933,6 +2938,9 @@ def _compute_draft_kv(
     slots.gpu.copy_(torch.arange(16) + 100)
     seen = {}
     stub = types.SimpleNamespace(
+        config=types.SimpleNamespace(
+            kv_cache_block_size=128, decode_context_parallel_size=dcp
+        ),
         # Two taps, so the trim is checked on each before the concat.
         aux_for=lambda h: [h, h + 1],
         runner=types.SimpleNamespace(
@@ -2964,12 +2972,22 @@ def _compute_draft_kv(
 
 
 def test_the_proposer_hands_a_pooled_draft_its_own_slots():
-    """A draft with a declared pool gets the builder's slots, one per row."""
+    """Under DCP a draft with a declared pool gets the builder's slots, one
+    per row."""
     from atom.spec_decode.draft_kv import DraftKvPoolSpec
 
     seen = _compute_draft_kv(DraftKvPoolSpec(), 5)
     assert seen["aux"].shape == (5, 8)
     assert seen["slots"].tolist() == [100, 101, 102, 103, 104]
+
+
+def test_a_pooled_draft_at_dcp1_writes_through_the_target_slots():
+    """At DCP 1 the target's slots address the draft's pool, so it is handed
+    those, and the builder publishes none of its own."""
+    from atom.spec_decode.draft_kv import DraftKvPoolSpec
+
+    seen = _compute_draft_kv(DraftKvPoolSpec(), 5, dcp=1, publish_ctx_slots=False)
+    assert seen["slots"].tolist() == [500, 501, 502, 503, 504]
 
 
 def test_a_pooled_draft_on_a_builder_without_ctx_slots_is_named():

@@ -381,6 +381,14 @@ def test_a_declared_entry_is_the_span_of_the_pool_the_spec_builds(dcp):
     assert spec.entry_tokens(config) == pool.entry_tokens == 128 * dcp
 
 
+@pytest.mark.parametrize("dcp", [1, 8])
+def test_a_pooled_draft_has_slots_of_its_own_only_under_dcp(dcp):
+    """At DCP 1 an entry is one target block, so the target's slots address
+    the draft's pool; under DCP they don't."""
+    config = SimpleNamespace(kv_cache_block_size=128, decode_context_parallel_size=dcp)
+    assert DraftKvPoolSpec().needs_own_ctx_slots(config) is (dcp > 1)
+
+
 def test_a_layer_refuses_a_cache_its_reader_was_not_built_for():
     """A layer's `check_cache` sees the views before they are bound, and its
     error stops the bind: the layer keeps no cache it would misread."""

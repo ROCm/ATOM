@@ -580,12 +580,14 @@ def test_kimi_decode_publishes_draft_slots_with_attention_metadata(monkeypatch):
         (64,), -1, dtype=torch.int32, device=runner.device
     )
     builder._init_gdn_state(runner)
-    # What `_KimiMLAGDNCommon.__init__` declares for a draft with a pool.
+    # What `_KimiMLAGDNCommon.__init__` declares for a draft with a pool under
+    # DCP, whose entry spans `dcp` target blocks.
+    entry = runner.block_size * 8
     runner.forward_vars["draft_ctx_slots"] = CpuGpuBuffer(
         64, dtype=torch.int64, device=runner.device, publication_group="draft_ctx_slots"
     )
     runner.draft_kv_builder = SimpleNamespace(
-        kv_pool=SimpleNamespace(entry_tokens=runner.block_size)
+        kv_pool=SimpleNamespace(entry_tokens=entry)
     )
     runner._init_forward_vars_ring()
     runner._init_h2d_publication()
@@ -613,8 +615,7 @@ def test_kimi_decode_publishes_draft_slots_with_attention_metadata(monkeypatch):
         var = runner.forward_vars
         positions = var["positions"].np[: count * q].tolist()
         expected = [
-            int(batch.block_tables[t // q][p // runner.block_size]) * runner.block_size
-            + p % runner.block_size
+            int(batch.block_tables[t // q][p // entry]) * entry + p % entry
             for t, p in enumerate(positions)
         ] + [-1] * ((4 - count) * q)
         saved.append((var["draft_ctx_slots"].gpu[: 4 * q].clone(), expected))

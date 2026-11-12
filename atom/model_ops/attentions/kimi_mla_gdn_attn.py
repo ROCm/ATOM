@@ -50,11 +50,16 @@ class KimiMLAGDNBackend(AttentionBackend):
 class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
     def __init__(self, model_runner):
         super().__init__(model_runner=model_runner)
-        # A draft that declares a pool of its own stores every token of the
-        # target forward at that pool's entry size, so it gets slots of its
-        # own: the target's are DCP-filtered and count `block_size` tokens.
+        self._declare_draft_ctx_slots(model_runner)
+
+    def _declare_draft_ctx_slots(self, model_runner) -> None:
+        """A draft that declares a pool of its own stores every token of the
+        target forward at that pool's entry size. Under DCP that is not what
+        the target's slots address (DCP-filtered, `block_size` tokens), so it
+        gets slots of its own; at DCP 1 it writes through the target's."""
         drafter = getattr(model_runner, "drafter", None)
-        if getattr(getattr(drafter, "model", None), "kv_pool_spec", None) is not None:
+        spec = getattr(getattr(drafter, "model", None), "kv_pool_spec", None)
+        if spec is not None and spec.needs_own_ctx_slots(model_runner.config):
             model_runner.forward_vars["draft_ctx_slots"] = CpuGpuBuffer(
                 self.max_num_batched_tokens,
                 dtype=torch.int64,

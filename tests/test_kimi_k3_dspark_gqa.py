@@ -771,12 +771,35 @@ def _stage(stub, seqlens, rows, tables, dummy=False):
     return buf.np, group.counts.get(id(buf))
 
 
-@pytest.mark.parametrize("dcp", [1, 8])
+@pytest.mark.parametrize("dcp,own", [(1, False), (8, True)])
+def test_the_builder_declares_draft_slots_only_under_dcp(dcp, own):
+    """The real `_declare_draft_ctx_slots`: a pooled draft gets a slot buffer
+    of its own under DCP, and none at DCP 1, where it writes through the
+    target's; a draft without a pool gets none either way."""
+    from atom.spec_decode.draft_kv import DraftKvPoolSpec
+
+    kimi = gpu_stack_import("atom.model_ops.attentions.kimi_mla_gdn_attn")
+    builder = types.SimpleNamespace(max_num_batched_tokens=16, device="cpu")
+    for spec, expected in ((DraftKvPoolSpec(), own), (None, False)):
+        runner = types.SimpleNamespace(
+            config=types.SimpleNamespace(
+                kv_cache_block_size=128, decode_context_parallel_size=dcp
+            ),
+            drafter=types.SimpleNamespace(
+                model=types.SimpleNamespace(kv_pool_spec=spec)
+            ),
+            forward_vars={},
+        )
+        kimi._KimiMLAGDNCommon._declare_draft_ctx_slots(builder, runner)
+        assert ("draft_ctx_slots" in runner.forward_vars) is expected
+
+
+@pytest.mark.parametrize("dcp", [2, 8])
 def test_the_builder_stages_the_draft_slots(dcp):
-    """The target's builder stages, with no DCP filter, the slot of every
-    scheduled token in `block_size * dcp`-token entries, and counts them into
-    the phase's group. At DCP>1 the target's `block_size` addressing would
-    alias `dcp` requests' entries onto one range."""
+    """Under DCP the target's builder stages, with no DCP filter, the slot of
+    every scheduled token in `block_size * dcp`-token entries, and counts them
+    into the phase's group. The target's `block_size` addressing would alias
+    `dcp` requests' entries onto one range."""
     vblock = 128 * dcp
     positions = [vblock - 2, vblock - 1, vblock, 5, 6]
     stub = _builder_stub(vblock, _TABLES, positions)

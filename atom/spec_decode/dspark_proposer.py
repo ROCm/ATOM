@@ -733,17 +733,20 @@ class DSparkProposer(Drafter):
             main_hidden_all = torch.cat(
                 [h[:num_rows] for h in aux_hidden_states], dim=-1
             )
-        if self.model.kv_pool_spec is not None:
+        spec = self.model.kv_pool_spec
+        if spec is not None and spec.needs_own_ctx_slots(self.config):
             ctx_slots = self.runner.forward_vars.get("draft_ctx_slots")
             if ctx_slots is None:
                 raise RuntimeError(
-                    f"{type(self.model).__name__} declares a kv_pool_spec, so the "
-                    "target's attention metadata builder must publish its context "
+                    f"{type(self.model).__name__} declares a kv_pool_spec the "
+                    "target's slots can't address (DCP > 1), so the target's "
+                    "attention metadata builder must publish its context "
                     "slots as forward_vars['draft_ctx_slots'] (the Kimi MLA/GDN "
                     "builders in kimi_mla_gdn_attn.py do); this target's does not."
                 )
             slot_mapping = ctx_slots.gpu[:num_rows]
         else:
+            # A pooled draft at DCP 1 too: the target's slots address its pool.
             # None on a target whose metadata addresses KV another way (V4.1);
             # its draft addresses by position too.
             slot_mapping = forward_context.attn_metadata.slot_mapping

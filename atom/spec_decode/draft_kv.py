@@ -51,6 +51,13 @@ class DraftKvPoolSpec:
         dcp = config.decode_context_parallel_size
         return self.block_size(config) * self.pool_kwargs(dcp)["blocks_per_entry"]
 
+    def needs_own_ctx_slots(self, config) -> bool:
+        """Whether the target's `slot_mapping` can't address this pool, so
+        the target's builder stages the draft's context slots of its own.
+        At DCP 1 an entry is one target block and no token is filtered, so
+        the target's slots are the draft's, element for element."""
+        return self.entry_tokens(config) != self.block_size(config)
+
 
 def draft_kv_dtype(config) -> torch.dtype:
     """The dtype a draft's own pool stores K and V in, the configured KV
