@@ -1646,7 +1646,8 @@ def _ping(path: str, timeout: float = 10) -> dict:
 
 def stop_daemon(path: str, timeout_s: float = 180) -> int | None:
     """Stop the daemon holding this GPU (SIGTERM to its main process) and wait
-    until it lets go. Returns that pid; None when no daemon holds the GPU."""
+    until its process on this GPU has exited, so its device memory is free.
+    Returns the main pid; None when no daemon holds the GPU."""
     deadline = time.monotonic() + 5
     while True:
         if not daemon_alive(path):
@@ -1668,10 +1669,13 @@ def stop_daemon(path: str, timeout_s: float = 180) -> int | None:
     with contextlib.suppress(ProcessLookupError):
         os.kill(main, signal.SIGTERM)
     deadline = time.monotonic() + timeout_s
-    while daemon_alive(path):
+    # The runner lets go of the lock early in its shutdown; its device memory
+    # is free only once the process has exited.
+    while daemon_alive(path) or _pid_running(runner):
         if time.monotonic() > deadline:
             raise RuntimeError(
-                f"the weight cache daemon (pid {main}) still holds {path}.lock {timeout_s:.0f}s after SIGTERM"
+                f"the weight cache daemon (pid {main}) has not exited on this GPU "
+                f"{timeout_s:.0f}s after SIGTERM (runner pid {runner})"
             )
         time.sleep(0.5)
     return main

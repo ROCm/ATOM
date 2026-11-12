@@ -451,7 +451,8 @@ import signal, sys, time
 import atom.model_loader.weight_cache as wc
 lock = wc._DaemonLock(sys.argv[1], rank=0, model="toy-model", idle_timeout_s=0)
 def stop(*_):
-    lock.release()
+    lock.release()  # like a runner: the lock goes early in the shutdown
+    time.sleep(2)
     sys.exit(0)
 signal.signal(signal.SIGTERM, stop)
 while True:
@@ -487,7 +488,9 @@ def test_status_and_stop_a_daemon_launch(cache_dir, tmp_path, capsys):
         )
         assert wc.main(["stop"]) == 0
         assert f"stopped daemon pid {main.pid}" in capsys.readouterr().out
-        assert not wc.daemon_alive(path) and main.wait(10) == 0
+        # Returns once the runner has exited, not when it let go of the lock.
+        assert not wc.daemon_alive(path) and not wc._pid_running(st["pid"])
+        assert main.wait(10) == 0
         assert wc.main(["status"]) == 0
         assert "no weight cache daemon running" in capsys.readouterr().out
     finally:

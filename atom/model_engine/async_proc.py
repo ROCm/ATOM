@@ -13,6 +13,7 @@ This module provides:
   from all workers.
 """
 
+import functools
 import logging
 import multiprocessing
 import pickle
@@ -225,12 +226,15 @@ class AsyncIOProc:
         """A weight cache daemon's runner gets an RPC at startup and at
         shutdown only: after a few idle seconds, poll the queue every 0.1 s
         instead of spinning a core (which also starves its socket thread of
-        the GIL)."""
+        the GIL), and wait without the queue's "no block found" message
+        every minute."""
         try:
             from aiter.dist.shm_broadcast import SpinSleepTimer
 
-            self.rpc_broadcast_mq._read_spin_timer = SpinSleepTimer()
-        except Exception as e:  # noqa: BLE001 - only costs CPU
+            mq = self.rpc_broadcast_mq
+            mq._read_spin_timer = SpinSleepTimer()
+            mq.dequeue = functools.partial(mq.dequeue, indefinite=True)
+        except Exception as e:  # noqa: BLE001 - only costs CPU and log lines
             logger.warning(f"{self.label}: idle polling stays busy: {e}")
 
     def exit(self):
