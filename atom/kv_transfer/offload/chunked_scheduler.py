@@ -489,6 +489,9 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         if held is not None:
             return held[0] is seq
         client = self._lookup_client
+        answered = getattr(client, "answered", None)
+        if callable(answered):
+            return bool(answered(sid))
         is_pending = getattr(client, "is_pending", None)
         pending_ids = getattr(client, "pending_ids", None)
         if not callable(is_pending) or not callable(pending_ids):
@@ -498,9 +501,6 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         # A client that keeps an answered lookup listed as pending until it is
         # taken (the Mooncake Store's `AsyncStoreLookup`) says so through a
         # side-effect-free `answered`; `poll` may advance other clients.
-        answered = getattr(client, "answered", None)
-        if callable(answered):
-            return bool(answered(sid))
         return not is_pending(sid)
 
     def cancel_preadmission(self, seq) -> None:
@@ -1606,6 +1606,11 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 self._active_load_operations.pop(sid, None)
                 self._cancel_load_statistics(active[1])
             self._load_lifecycles.pop(sid, None)
+        elif self._load_lifecycles.get(sid) is None:
+            # Arrival offers have not matched and acquired a load lifecycle.
+            # A terminal request still cancels queued RPCs and drops capacity;
+            # live HBM-detached requests retain the separate discard path.
+            self._release_lookup(sid)
         self._release_failed_load_attempt(sid, seq)
         self._forget_tier_hit(sid)
         self._lookup_defer_since.pop(sid, None)
