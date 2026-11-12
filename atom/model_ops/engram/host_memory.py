@@ -16,6 +16,16 @@ Gaps are registered in 1 GiB pieces, and a table every DP-attention rank
 shares registers and unregisters under a per-checkpoint file lock
 (`_register_lock_file`), one process at a time.
 
+Rows only a device kernel reads (`pin_rows(device=True)`) go into GTT host
+memory first (`_gtt_rows`): an amdgpu GEM object whose pages sit in TTM's
+pool, off the LRU, where compaction, khugepaged and NUMA balancing never move
+them. `hipHostMalloc` memory is a userptr BO on a dGPU, and moving any of its
+pages makes KFD evict every GPU queue of the process until the whole BO is
+revalidated -- for a ~98 GB table, seconds per move; on a NUMA node out of free
+huge pages, back to back, which stalls graph capture for many minutes. A table
+every rank of the node holds whole is copied once per NUMA node and handed to
+the node's other ranks as a dma-buf (`_GttServer`).
+
 Every refused or failed HIP call clears HIP's last error (`_clear_hip_error`):
 HIP also leaves it as the runtime's sticky last error, which torch raises at
 its next kernel-launch check -- in the host-path fallback the refusal was
@@ -36,6 +46,7 @@ at load, before capture, or at exit. A release that would have to synchronize
 during a capture is skipped, with a warning, rather than breaking it.
 """
 
+import array
 import contextlib
 import ctypes
 import dataclasses
@@ -46,6 +57,8 @@ import hashlib
 import logging
 import os
 import resource
+import socket
+import struct
 import sys
 import threading
 import time
@@ -60,6 +73,7 @@ logger = logging.getLogger("atom")
 
 _PAGE = 4096
 _MADV_DONTNEED = 4
+_MADV_NOHUGEPAGE = 15
 _MADV_POPULATE_READ = 22  # Linux 5.14+; elsewhere EINVAL, and nothing is lost
 _MLOCK_ONFAULT = 1
 # `hipHostRegisterReadOnly`: the GPU only reads the range. Needed for a range
@@ -118,6 +132,9 @@ def _libc():
     libc.mlock2.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
     libc.munlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
     libc.prctl.argtypes = [ctypes.c_int] + [ctypes.c_ulong] * 4
+    libc.mmap.restype = ctypes.c_void_p
+    libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t] + [ctypes.c_int] * 4
+    libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
     return libc
 
 
@@ -198,7 +215,13 @@ def device_address(
 
     Without a HIP runtime to ask it raises, or with `identity_without_hip`
     returns `host_ptr` itself (where the caller's host memory is read at its
-    host address: copies the HIP allocator page-locked, or no device at all)."""
+    host address: copies the HIP allocator page-locked, or no device at all).
+
+    Rows `pin_rows` handed out as device tensors (GTT host memory) are at
+    their device address already, and are returned as they are."""
+    with _DEVICE_SPANS_LOCK:
+        if any(lo <= host_ptr < hi for lo, hi in _DEVICE_SPANS.items()):
+            return host_ptr
     fn = _host_get_device_pointer()
     if fn is None:
         if identity_without_hip:
@@ -251,6 +274,7 @@ class _HipHostAllocator:
         ]
         self._free.argtypes = [ctypes.c_void_p]
         self._prctl = libc.prctl
+        self._madvise = libc.madvise
 
     def alloc(self, nbytes: int) -> int | None:
         was = self._prctl(_PR_GET_THP_DISABLE, 0, 0, 0, 0)
@@ -264,6 +288,10 @@ class _HipHostAllocator:
         if rc != 0 or not ptr.value:
             _clear_hip_error()
             return None
+        # hsakmt asks for huge pages on a userptr of 2 MiB or more, and
+        # khugepaged then collapses its pages, a move each: KFD evicts the
+        # process's queues for every one (see the module docstring).
+        self._madvise(ptr.value, max(nbytes, 1), _MADV_NOHUGEPAGE)
         return ptr.value
 
     def free(self, ptr: int) -> None:
@@ -551,8 +579,408 @@ def _as_bytes(t: torch.Tensor) -> torch.Tensor:
     return t.reshape(-1).view(torch.uint8)
 
 
+# ---- GTT host memory ---------------------------------------------------------
+# DRM ioctls (include/uapi/drm/drm.h, amdgpu_drm.h).
+_DRM_IOCTL_GEM_CLOSE = 0x40086409  # DRM_IOW(0x09, struct drm_gem_close)
+_DRM_IOCTL_PRIME_HANDLE_TO_FD = 0xC00C642D  # DRM_IOWR(0x2d, struct drm_prime_handle)
+_DRM_IOCTL_AMDGPU_GEM_CREATE = 0xC0206440  # DRM_IOWR(0x40, union drm_amdgpu_gem_create)
+_AMDGPU_GEM_DOMAIN_GTT = 0x2
+_HIP_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD = 1
+_PROT_READ, _PROT_WRITE, _MAP_SHARED = 1, 2, 1
+_MAP_FAILED = ctypes.c_void_p(-1).value
+# Device ranges of the GTT rows this process handed out, base -> end
+# (`device_address`).
+_DEVICE_SPANS: dict[int, int] = {}
+_DEVICE_SPANS_LOCK = threading.Lock()
+
+
+class _ExternalMemoryHandleDesc(ctypes.Structure):
+    """`hipExternalMemoryHandleDesc`, for an fd (the handle union is 16 bytes)."""
+
+    _fields_ = [
+        ("type", ctypes.c_int),
+        ("_pad", ctypes.c_int),
+        ("fd", ctypes.c_int),
+        ("_handle", ctypes.c_byte * 12),
+        ("size", ctypes.c_ulonglong),
+        ("flags", ctypes.c_uint),
+        ("reserved", ctypes.c_uint * 16),
+    ]
+
+
+class _ExternalMemoryBufferDesc(ctypes.Structure):
+    """`hipExternalMemoryBufferDesc`."""
+
+    _fields_ = [
+        ("offset", ctypes.c_ulonglong),
+        ("size", ctypes.c_ulonglong),
+        ("flags", ctypes.c_uint),
+        ("reserved", ctypes.c_uint * 16),
+    ]
+
+
+@functools.cache
+def _render_node(index: int) -> tuple[str, int] | None:
+    """`(render node, NUMA node)` of CUDA device `index`, or None."""
+    props = torch.cuda.get_device_properties(index)
+    try:
+        prefix = (
+            f"{props.pci_domain_id:04x}:{props.pci_bus_id:02x}:"
+            f"{props.pci_device_id:02x}."
+        )
+    except AttributeError:
+        return None
+    try:
+        for name in sorted(os.listdir("/sys/class/drm")):
+            if not name.startswith("renderD"):
+                continue
+            dev = os.path.realpath(f"/sys/class/drm/{name}/device")
+            if os.path.basename(dev).startswith(prefix):
+                with open(os.path.join(dev, "numa_node")) as f:
+                    return f"/dev/dri/{name}", max(int(f.read()), 0)
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _gtt_dmabuf(render_node: str, nbytes: int) -> int | None:
+    """A new GTT GEM object of `nbytes` on `render_node`, as a dma-buf fd, or
+    None. Its pages come from that GPU's NUMA node."""
+    try:
+        rfd = os.open(render_node, os.O_RDWR | os.O_CLOEXEC)
+    except OSError as exc:
+        logger.info("engram: cannot open %s (%s); no GTT host memory", render_node, exc)
+        return None
+    try:
+        create = bytearray(
+            struct.pack("<QQQQ", nbytes, _PAGE, _AMDGPU_GEM_DOMAIN_GTT, 0)
+        )
+        fcntl.ioctl(rfd, _DRM_IOCTL_AMDGPU_GEM_CREATE, create, True)
+        handle = struct.unpack_from("<I", create)[0]
+        try:
+            prime = bytearray(struct.pack("<IIi", handle, os.O_RDWR | os.O_CLOEXEC, -1))
+            fcntl.ioctl(rfd, _DRM_IOCTL_PRIME_HANDLE_TO_FD, prime, True)
+            return struct.unpack_from("<IIi", prime)[2]
+        finally:
+            # From here on the dma-buf holds the object.
+            with contextlib.suppress(OSError):
+                fcntl.ioctl(rfd, _DRM_IOCTL_GEM_CLOSE, struct.pack("<II", handle, 0))
+    except OSError as exc:
+        logger.info(
+            "engram: GTT allocation of %d bytes on %s failed (%s)",
+            nbytes,
+            render_node,
+            exc,
+        )
+        return None
+    finally:
+        os.close(rfd)
+
+
+def _fill_dmabuf(fd: int, size: int, src: torch.Tensor, pool) -> None:
+    """Copy `src` into the dma-buf `fd` (`size` bytes) through a CPU mapping,
+    dropping the copied source as `_copy` does."""
+    libc = _libc()
+    addr = libc.mmap(None, size, _PROT_READ | _PROT_WRITE, _MAP_SHARED, fd, 0)
+    if addr in (None, _MAP_FAILED):
+        raise OSError(ctypes.get_errno(), "mmap of a GTT dma-buf failed")
+    try:
+        dst = torch.frombuffer(
+            (ctypes.c_char * size).from_address(addr), dtype=torch.uint8
+        )
+        drop = _source_dropper(src)
+        try:
+            _copy_into(dst[: src.nbytes], _as_bytes(src), pool, drop)
+        finally:
+            if drop is not None:
+                drop.close()
+        del dst
+    finally:
+        libc.munmap(addr, size)
+
+
+class _GttServer:
+    """Hands a shared table's dma-buf to the other ranks of the NUMA node, over
+    the abstract socket the leader bound (`_gtt_table`), to the same user only.
+    Each rank imports it for its own GPU; the object lives while any rank holds
+    it, so the leader may exit first."""
+
+    def __init__(self, sock: socket.socket, fd: int, size: int):
+        self._sock, self._fd, self._size = sock, os.dup(fd), size
+        sock.listen(64)
+        threading.Thread(target=self._serve, name="engram-gtt", daemon=True).start()
+
+    def _serve(self) -> None:
+        while True:
+            try:
+                conn, _ = self._sock.accept()
+            except OSError:
+                return  # closed
+            with conn:
+                try:
+                    cred = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+                    if struct.unpack("3i", cred)[1] != os.getuid():
+                        continue
+                    fds = array.array("i", [self._fd])
+                    conn.sendmsg(
+                        [struct.pack("<Q", self._size)],
+                        [(socket.SOL_SOCKET, socket.SCM_RIGHTS, fds)],
+                    )
+                except OSError:
+                    continue
+
+    def close(self) -> None:
+        with contextlib.suppress(OSError):
+            self._sock.shutdown(socket.SHUT_RDWR)
+        self._sock.close()
+        os.close(self._fd)
+
+
+def _receive_dmabuf(name: str) -> tuple[int, int] | None:
+    """`(fd, size)` of the dma-buf served under `name`; None if nobody serves
+    it yet."""
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM | socket.SOCK_CLOEXEC) as s:
+        try:
+            s.connect(name)
+            msg, ancillary, _, _ = s.recvmsg(8, socket.CMSG_SPACE(4))
+        except (ConnectionRefusedError, ConnectionResetError, FileNotFoundError):
+            return None  # bound by a leader still copying, or by nobody
+    fds = [
+        array.array("i", data[:4])[0]
+        for level, kind, data in ancillary
+        if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS
+    ]
+    if len(msg) != 8 or len(fds) != 1:
+        for fd in fds:
+            os.close(fd)
+        return None
+    return fds[0], struct.unpack("<Q", msg)[0]
+
+
+def _file_offset(addr: int) -> tuple[str, int] | None:
+    """`(file, offset)` of the byte at `addr` of a regular-file mapping
+    (`/proc/self/maps`), or None."""
+    try:
+        with open("/proc/self/maps") as maps:
+            for line in maps:
+                fields = line.split(maxsplit=5)
+                lo, hi = (int(x, 16) for x in fields[0].split("-"))
+                if not lo <= addr < hi:
+                    continue
+                name = fields[5].strip() if len(fields) > 5 else ""
+                if not name.startswith("/") or name.startswith("/dev/"):
+                    return None
+                return os.path.realpath(name), int(fields[2], 16) + addr - lo
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def _share_name(src: torch.Tensor, numa: int) -> str | None:
+    """The abstract socket a NUMA node's copy of `src` is served under: one
+    per checkpoint byte range, user and node. None when `src` is not a file
+    mapping, which then has nothing to identify it by across processes."""
+    where = _file_offset(src.data_ptr())
+    if where is None:
+        return None
+    key = f"{os.getuid()}:{where[0]}:{where[1]}:{src.nbytes}:{numa}"
+    return "\0atom-engram-gtt-" + hashlib.sha256(key.encode()).hexdigest()[:24]
+
+
+def _own_gtt_copy(src, render_node, size, pool) -> int | None:
+    fd = _gtt_dmabuf(render_node, size)
+    if fd is None:
+        return None
+    try:
+        _fill_dmabuf(fd, size, src, pool)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _gtt_table(src, render_node, numa, shared, pool):
+    """`(fd, server)`: a dma-buf holding `src`'s bytes, and the `_GttServer`
+    this rank runs for it (None unless it is the node's leader), or None.
+
+    Not `shared`: a copy of this rank's own. `shared`: the first rank of the
+    NUMA node to bind the table's name copies it and serves it; the others
+    wait for it and take the dma-buf. A follower whose leader died before
+    serving binds the name itself, and one that waits longer than
+    `_REG_LOCK_TIMEOUT_S` copies its own.
+    """
+    size = -(-src.nbytes // _PAGE) * _PAGE
+    name = _share_name(src, numa) if shared else None
+    deadline = time.monotonic() + _REG_LOCK_TIMEOUT_S
+    waited = False
+    while name is not None:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM | socket.SOCK_CLOEXEC)
+        try:
+            sock.bind(name)
+        except OSError:
+            sock.close()
+            got = _receive_dmabuf(name)
+            if got is not None:
+                fd, served = got
+                if served == size:
+                    if waited:
+                        logger.info("engram: took NUMA node %d's copy", numa)
+                    return fd, None
+                os.close(fd)
+                logger.warning(
+                    "engram: NUMA node %d's copy is %d bytes, not %d; copying",
+                    numa,
+                    served,
+                    size,
+                )
+                break
+            if time.monotonic() > deadline:
+                logger.warning(
+                    "engram: no copy from NUMA node %d's ranks after %d s; copying",
+                    numa,
+                    _REG_LOCK_TIMEOUT_S,
+                )
+                break
+            if not waited:
+                logger.info("engram: waiting for NUMA node %d's copy", numa)
+                waited = True
+            time.sleep(0.25)
+            continue
+        try:
+            fd = _own_gtt_copy(src, render_node, size, pool)
+            if fd is None:
+                sock.close()  # the others then bind it, or copy their own
+                return None
+            server = _GttServer(sock, fd, size)
+        except BaseException:
+            sock.close()
+            raise
+        return fd, server
+    fd = _own_gtt_copy(src, render_node, size, pool)
+    return None if fd is None else (fd, None)
+
+
+class _GttImport:
+    """A dma-buf imported into HIP: its bytes at a device address of this
+    process's GPU. `release` gives back the import and stops serving it."""
+
+    def __init__(self, hip, fd: int, size: int, server: _GttServer | None):
+        self._hip, self._server = hip, server
+        hip.hipImportExternalMemory.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(_ExternalMemoryHandleDesc),
+        ]
+        hip.hipExternalMemoryGetMappedBuffer.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_void_p,
+            ctypes.POINTER(_ExternalMemoryBufferDesc),
+        ]
+        hip.hipDestroyExternalMemory.argtypes = [ctypes.c_void_p]
+        hip.hipFree.argtypes = [ctypes.c_void_p]
+        # HIP owns the descriptor it imported.
+        desc = _ExternalMemoryHandleDesc(
+            type=_HIP_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD, fd=os.dup(fd), size=size
+        )
+        ext = ctypes.c_void_p()
+        rc = hip.hipImportExternalMemory(ctypes.byref(ext), ctypes.byref(desc))
+        if rc != 0:
+            os.close(desc.fd)
+            _clear_hip_error()
+            raise RuntimeError(f"hipImportExternalMemory failed ({rc})")
+        ptr = ctypes.c_void_p()
+        buf = _ExternalMemoryBufferDesc(offset=0, size=size)
+        rc = hip.hipExternalMemoryGetMappedBuffer(
+            ctypes.byref(ptr), ext, ctypes.byref(buf)
+        )
+        if rc != 0 or not ptr.value:
+            hip.hipDestroyExternalMemory(ext)
+            _clear_hip_error()
+            raise RuntimeError(f"hipExternalMemoryGetMappedBuffer failed ({rc})")
+        self._ext, self.ptr, self.size = ext, ptr.value, size
+        with _DEVICE_SPANS_LOCK:
+            _DEVICE_SPANS[self.ptr] = self.ptr + size
+
+    def release(self, _ptr: int) -> None:
+        if torch.cuda.is_initialized():
+            torch.cuda.synchronize()
+        with _DEVICE_SPANS_LOCK:
+            _DEVICE_SPANS.pop(self.ptr, None)
+        if self._hip.hipFree(self.ptr) != 0:
+            _clear_hip_error()
+        if self._hip.hipDestroyExternalMemory(self._ext) != 0:
+            _clear_hip_error()
+            logger.warning("engram: releasing GTT host memory failed")
+        if self._server is not None:
+            self._server.close()
+
+
+class _DeviceBytes:
+    """`__cuda_array_interface__` over a lease's device bytes. The tensor
+    built on it holds it, and with it the lease."""
+
+    def __init__(self, lease: _Lease, nbytes: int):
+        self.lease = lease
+        self.__cuda_array_interface__ = {
+            "shape": (nbytes,),
+            "typestr": "|u1",
+            "data": (lease.ptr, False),
+            "version": 3,
+        }
+
+
+def _gtt_rows(sources, leases, *, shared: bool):
+    """`sources` copied into GTT host memory and returned as device tensors of
+    the current GPU -- one copy per NUMA node when `shared`, else this rank's
+    own -- or None when this process has no GPU, render node or HIP import."""
+    if not (torch.cuda.is_available() and torch.cuda.is_initialized()):
+        return None
+    hip = _hip_runtime()
+    if hip is None or not hasattr(hip, "hipImportExternalMemory"):
+        return None
+    device = torch.device("cuda", torch.cuda.current_device())
+    node = _render_node(device.index)
+    if node is None:
+        return None
+    render_node, numa = node
+    largest = max((s.nbytes for s in sources), default=0)
+    threads = copy_threads(largest)
+    pool = ThreadPoolExecutor(threads) if threads > 1 else None
+    try:
+        out = []
+        for src in sources:
+            table = _gtt_table(src, render_node, numa, shared, pool)
+            if table is None:
+                return None
+            fd, server = table
+            try:
+                imported = _GttImport(hip, fd, -(-src.nbytes // _PAGE) * _PAGE, server)
+            except BaseException:
+                if server is not None:
+                    server.close()
+                raise
+            finally:
+                os.close(fd)
+            lease = _Lease(imported.ptr, imported.size, imported.release)
+            leases.append(lease)
+            rows = torch.as_tensor(_DeviceBytes(lease, src.nbytes), device=device)
+            out.append(rows.view(src.dtype).view(src.shape))
+        logger.info(
+            "engram: %.1f GiB of rows in GTT host memory on NUMA node %d%s",
+            sum(s.nbytes for s in sources) / 1024**3,
+            numa,
+            ", one copy per node" if shared else "",
+        )
+        return tuple(out)
+    finally:
+        if pool is not None:
+            pool.shutdown()
+
+
 def pin_rows(
-    sources: list[torch.Tensor], shared: bool = False, copy: bool = False
+    sources: list[torch.Tensor],
+    shared: bool = False,
+    copy: bool = False,
+    device: bool = False,
 ) -> tuple[torch.Tensor, ...] | None:
     """`sources` (contiguous row ranges) as page-locked tensors of the same
     dtype and shape, owning their memory; all-or-nothing.
@@ -564,6 +992,13 @@ def pin_rows(
     `copy` copies whatever `ATOM_ENGRAM_UVA_COPY` and `shared` say, and never
     registers in place, not even without an allocator.
 
+    `device`: only a device kernel reads the rows. A copy of them then goes
+    into GTT host memory first, which the kernel never migrates (`_gtt_rows`),
+    and comes back as device tensors of the current GPU; a `shared` table is
+    copied once per NUMA node, by whichever rank of the node gets there first.
+    Where GTT memory is not available the copy is a `hipHostMalloc` one, as
+    without `device`.
+
     None, with everything taken released, on any failure -- no memory, a
     refused registration, no thread to copy on -- so the TP group can fall
     back as one.
@@ -572,12 +1007,25 @@ def pin_rows(
     if shared and _COPY_ENV not in os.environ:
         plan.append("copy")
     for how in plan:
+        if how == "copy" and device:
+            # GTT host memory first; a shared table whose in-place
+            # registration was refused is copied once per NUMA node.
+            leases: list[_Lease] = []
+            try:
+                out = _gtt_rows(sources, leases, shared=shared and not copy)
+            except Exception:  # any failure is a fallback
+                logger.warning("engram: GTT host memory failed", exc_info=True)
+                out = None
+            if out is not None:
+                return out
+            for lease in leases:
+                lease.release()
         allocator = _host_allocator() if how == "copy" else None
         if how == "copy" and allocator is None:
             if copy or "register" in plan:
                 break  # registering is not wanted, or was refused already
             how = "register"
-        leases: list[_Lease] = []
+        leases = []
         try:
             if how == "copy":
                 out = _copy(allocator, sources, leases)
