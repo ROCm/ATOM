@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-/// Engine block hash: u64 as is, i64 bit-cast, byte strings by their first 8 bytes.
+/// Engine block hash: u64 as is, i64 bit-cast, byte strings by their low 64 bits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EngineHash(pub u64);
 
