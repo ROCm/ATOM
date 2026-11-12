@@ -66,6 +66,45 @@ def test_an_nccl_group_is_named_registered_and_timed_out_once(built):
     assert utils._world.pg_group_ranks[pg] == {0: 0, 1: 1, 2: 2}
 
 
+def test_a_zero_timeout_is_the_one_given(built):
+    """``timeout or default`` read timedelta(0) as no timeout given."""
+    utils.stateless_init_torch_distributed_process_group(
+        "10.0.0.1", 29500, 1, 2, "nccl", group_name="w", timeout=timedelta(0)
+    )
+    assert built["rendezvous"][3] == timedelta(0)
+
+
+def test_a_group_whose_shutdown_raised_frees_its_name_once_forgotten():
+    """torch drops its record of a group only after the shutdown returns, so a
+    group whose shutdown raised kept its name, and none could be built under
+    it again."""
+    import torch.distributed as dist
+
+    store = dist.HashStore()
+
+    def build():
+        pg, _ = utils._new_process_group_helper(
+            1,
+            0,
+            [],
+            utils.Backend("gloo"),
+            utils.PrefixStore("forget-test", store),
+            group_name="forget-test",
+            timeout=timedelta(seconds=5),
+        )
+        return pg
+
+    pg = build()
+    with pytest.raises(ValueError, match="already been created"):
+        build()
+
+    utils.forget_process_group(pg)
+    again = build()
+
+    assert again in utils._world.pg_map and pg not in utils._world.pg_map
+    utils.forget_process_group(again)
+
+
 def test_an_nccl_group_needs_a_name_before_any_rendezvous(built):
     with pytest.raises(ValueError, match="group_name"):
         utils.stateless_init_torch_distributed_process_group(

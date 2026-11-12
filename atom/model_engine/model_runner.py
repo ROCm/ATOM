@@ -1086,13 +1086,15 @@ class ModelRunner:
             fused_shared_expert_load_fn = self.model.load_fused_expert_weights
         torch.set_default_device(None)
         load_start = time.perf_counter()
-        load_model(
+        loaded = load_model(
             self.model,
             config.model,
             config.hf_config,
             config.load_dummy,
             load_fused_expert_weights_fn=fused_shared_expert_load_fn,
         )
+        # The parameters the checkpoint wrote, by name; None if none was read.
+        self._checkpoint_param_names = None if config.load_dummy else frozenset(loaded)
         load_elapsed = time.perf_counter() - load_start
         logger.info(
             f"[{self.rank_name}] Model load done: {config.model} "

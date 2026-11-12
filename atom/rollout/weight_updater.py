@@ -2,15 +2,18 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
-import sys
-from collections import Counter
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable
 from functools import wraps
-from itertools import pairwise
 
 import torch
 
 from atom.model_engine.collective_rpc import WeightReloadRefused
+from atom.rollout.reload_policy import (
+    FP8_REQUANTISERS,
+    ReloadPolicyMixin,
+    is_expert_parallel,
+)
+from atom.rollout.weight_bucket import bucket_entries, decode_bucket
 from atom.rollout.weight_sync_record import WeightSyncRecord
 
 logger = logging.getLogger("atom")
@@ -64,98 +67,9 @@ def _one_update(method):
     return update
 
 
-def _is_count(value) -> bool:
-    """A size a sender could have written: an integer, not negative, and not
-    a bool, which Python counts as an int."""
-    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
-
-
-def decode_bucket(
-    entries: Iterable[Mapping], payload: torch.Tensor
-) -> list[tuple[str, torch.Tensor]]:
-    """Named views over *payload*, a flat uint8 buffer, one per entry of
-    ``{"name", "shape", "dtype", "offset", "nbytes"}``.
-
-    Views, not copies, except for a tensor whose offset is not a multiple of
-    its element size, which ``view`` cannot reinterpret in place. Each entry is
-    checked as sent, not coerced: ``int()`` made a shape of [2.5] into [2] and
-    let -1 through as "infer this dimension". As a set, no name may repeat and
-    no two ranges overlap: either hands one tensor's bytes to two parameters.
-    """
-    weights: list[tuple[str, torch.Tensor]] = []
-    spans: list[tuple[int, int, str]] = []
-    for entry in entries:
-        fields = entry if isinstance(entry, Mapping) else {}
-        name, shape = fields.get("name"), fields.get("shape")
-        start, nbytes = fields.get("offset"), fields.get("nbytes")
-        dtype_name = fields.get("dtype")
-        dtype = (
-            getattr(torch, dtype_name.removeprefix("torch."), None)
-            if isinstance(dtype_name, str)
-            else None
-        )
-        if not (
-            isinstance(name, str)
-            and name
-            and isinstance(shape, (list, tuple))
-            and all(_is_count(dim) for dim in shape)
-            and isinstance(dtype, torch.dtype)
-            and _is_count(start)
-            and _is_count(nbytes)
-        ):
-            raise ValueError(f"invalid weight bucket entry: {entry}")
-        end = start + nbytes
-        if nbytes == 0 or end > payload.numel():
-            raise ValueError(
-                f"weight bucket range out of bounds for {name}: offset={start} "
-                f"nbytes={nbytes} payload={payload.numel()}"
-            )
-        if torch.Size(shape).numel() * dtype.itemsize != nbytes:
-            raise ValueError(
-                f"weight bucket size mismatch for {name}: shape={list(shape)} "
-                f"dtype={dtype} nbytes={nbytes}"
-            )
-        raw = payload[start:end]
-        if start % dtype.itemsize:
-            raw = raw.clone()
-        weights.append((name, raw.view(dtype).view(shape)))
-        spans.append((start, end, name))
-    repeated = sorted(
-        n for n, seen in Counter(n for *_, n in spans).items() if seen > 1
-    )
-    if repeated:
-        raise ValueError(f"weight bucket repeats names: {repeated[:20]}")
-    spans.sort()
-    for (_, prev_end, prev_name), (start, _, name) in pairwise(spans):
-        if start < prev_end:
-            raise ValueError(
-                f"weight bucket ranges overlap: {prev_name} ends at byte "
-                f"{prev_end}, {name} starts at {start}"
-            )
-    return weights
-
-
 def _synchronize(device) -> None:
     if getattr(device, "type", None) == "cuda" and torch.cuda.is_available():
         torch.cuda.synchronize(device)
-
-
-def _has_mla_attention(model) -> bool:
-    """Whether *model* attends through MLA.
-
-    By what an MLA layer has, not by one class: each model defines its own
-    attention module around a ``kv_b_proj`` and reaches MLAAttention only as
-    the impl ``Attention(use_mla=True)`` builds. MLAAttention is looked up,
-    not imported: importing it pulls in aiter, and no instance exists unless
-    it was loaded.
-    """
-    mla = getattr(sys.modules.get("atom.model_ops.attention_mla"), "MLAAttention", None)
-    return any(
-        hasattr(module, "kv_b_proj")
-        or getattr(module, "use_mla", False) is True
-        or (mla is not None and isinstance(module, mla))
-        for module in model.modules()
-    )
 
 
 def _unwrap_once(module) -> torch.nn.Module | None:
@@ -177,7 +91,7 @@ def _unwrap_once(module) -> torch.nn.Module | None:
     return None
 
 
-class WeightUpdaterMixin:
+class WeightUpdaterMixin(ReloadPolicyMixin):
     """Mixin providing weight update capabilities for ModelRunner.
 
     Host class must provide:
@@ -694,9 +608,7 @@ class WeightUpdaterMixin:
                 f"weight. Run the rollout with an unquantized MoE, or extend this "
                 f"path with a requantizing loader for the format."
             )
-        if getattr(module, "expert_map", None) is not None or getattr(
-            module, "num_redundant_experts", 0
-        ):
+        if is_expert_parallel(module):
             raise NotImplementedError(
                 f"{self.label}: {atom_name} is expert-parallel or carries redundant "
                 f"expert replicas. Incoming ids then address a rank's local slots "
@@ -769,17 +681,16 @@ class WeightUpdaterMixin:
             # answers: a slice that was relaid out must not be shuffled again
             # -- per this function's own docstring that produces a third layout
             # rather than undoing the first -- and a half-delivered one must not
-            # be kept either. Keeping it was worse than useless: nothing later
-            # completes an entry (a sync sends every shard of an expert or the
-            # write is refused), so it would fail this function again on every
-            # sync for the life of the process, taking every other buffer's
-            # relayout down with it. The bytes are recoverable without the
-            # entry -- the next update that sends the whole expert overwrites
-            # both halves row-major, and that one relays out normally.
+            # be kept either: nothing later completes an entry (a sync sends
+            # every shard of an expert or the write is refused), so it would
+            # fail this function on every later sync, taking every other
+            # buffer's relayout down with it. The next update that sends the
+            # whole expert overwrites both halves row-major and relays it out.
             #
-            # An entry the loop never reached is the opposite case and has to
-            # survive: that buffer is row-major right now, and a later sync
-            # re-establishing its layout is the only thing that fixes it.
+            # An entry the loop never reached is left for the sync's discard:
+            # this call raised, so the sync fails, and only one that rewrites
+            # every parameter, relaying out every expert, makes the weights
+            # whole again.
             for key in settled:
                 del pending[key]
             if pending:
@@ -788,7 +699,7 @@ class WeightUpdaterMixin:
                     f"{len(pending)} fused buffer(s) "
                     f"{sorted(param_name for _, param_name in pending)}; they "
                     f"hold row-major bytes the kernel reads through the expert "
-                    f"permutation until a later sync finishes the job"
+                    f"permutation until a sync rewrites every parameter"
                 )
         logger.info(
             f"{self.label}: expert layout re-established for {experts} expert "
@@ -931,72 +842,6 @@ class WeightUpdaterMixin:
             return shape
         return (logical_n, shape[1])
 
-    # The quant types _requantize_fp8_weight rebuilds, by name, so that asking
-    # which parameters a reload can rewrite needs no aiter.
-    _REQUANTISABLE_FP8 = frozenset({"per_1x128", "per_Tensor", "per_Token"})
-
-    def _unreloadable_params(self) -> list[str]:
-        """Parameters a full-precision write cannot rewrite in place.
-
-        A floating-point parameter of two bytes or more is written as sent,
-        and an FP8 one is requantised if _requantize_fp8_weight knows its quant
-        type. Anything else -- FP4 or MXFP4 packed bytes, integer quantisation,
-        FP8 of another scheme -- is cast into garbage where the shapes agree.
-        A module that writes its weights itself (``sync_weight``) knows their
-        format, and an int64 parameter is a constant, an index or a hash: no
-        quantisation stores weights in it.
-        """
-        unreloadable = []
-        for prefix, module in self._sync_target_model().named_modules():
-            if callable(getattr(module, "sync_weight", None)):
-                continue
-            quant_type = getattr(getattr(module, "quant_type", None), "name", None)
-            for name, param in module.named_parameters(recurse=False):
-                if (
-                    name.endswith("input_scale")
-                    or param.dtype == torch.int64
-                    or (param.dtype.is_floating_point and param.element_size() >= 2)
-                ):
-                    continue
-                if (
-                    self._is_fp8_param(module, param)
-                    and quant_type in self._REQUANTISABLE_FP8
-                ):
-                    continue
-                unreloadable.append(f"{prefix}.{name}" if prefix else name)
-        return unreloadable
-
-    def _reload_refusal(self) -> str | None:
-        """Why this model's weights cannot be reloaded in place, if they cannot.
-
-        Asked before any sync writes, whatever carries it.
-        """
-        config = getattr(self, "config", None)
-        pcp = int(getattr(config, "prefill_context_parallel_size", 1) or 1)
-        if pcp > 1:
-            return (
-                f"prefill_context_parallel_size={pcp}: a worker's rank counts "
-                f"every prefill-context rank, but the updater slices a full "
-                f"tensor by it as by a TP rank, so some workers would load "
-                f"another rank's shard"
-            )
-        model = self._sync_target_model()
-        if _has_mla_attention(model):
-            return (
-                "the model attends through MLA, whose decode reads W_K and W_V "
-                "derived from kv_b_proj once, at load; a reload rewrites "
-                "kv_b_proj and leaves them as they were"
-            )
-        held = self._unreloadable_params()
-        if held:
-            return (
-                f"{len(held)} parameter(s), {held[:3]} among them, are held in "
-                f"a format a full-precision write cannot produce: FP4 or MXFP4 "
-                f"packed bytes, integer quantisation, or FP8 of a scheme the "
-                f"updater does not requantise"
-            )
-        return None
-
     def _credit_requantised(self, module: torch.nn.Module, param) -> None:
         """Count *param* and the ``weight_scale`` requantisation rewrote with
         it, which no sender sends."""
@@ -1022,7 +867,6 @@ class WeightUpdaterMixin:
         """
         weight_scale = module.weight_scale
         fp8_dtype = param.dtype
-        fp8_max = torch.finfo(fp8_dtype).max
 
         tensor_gpu = tensor.to(device=self.device, dtype=torch.float32)
 
@@ -1051,57 +895,19 @@ class WeightUpdaterMixin:
             )
             return False
 
-        from aiter import QuantType as _QT
-
         quant_type = getattr(module, "quant_type", None)
-
-        if quant_type is not None and quant_type.value == _QT.per_1x128.value:
-            # Must match the load-time online_quantize_weight layout: a true
-            # 128x128 block scale of shape (N//128, K//128). The previous code
-            # produced a 1x128-along-K scale (N, K//128) and sliced it into the
-            # (N//128, K//128) buffer, which is inconsistent with the blockscale
-            # GEMM and collapses generation after the first weight update.
-            # ``scale_dtype`` has to be decided here too. Casting an FP32 scale
-            # to E8M0 afterwards does not round it up to a power of two, and
-            # the weight would have been quantized against the unrounded scale.
-            from atom.quantization.quark.utils import (
-                quantize_weight_to_fp8_128x128_blockscale,
-            )
-
-            q_weight, scale = quantize_weight_to_fp8_128x128_blockscale(
-                tensor_gpu,
-                fp8_dtype,
-                # Online quant rebuilds its own (maybe E8M0) scale; a
-                # checkpoint's scale keeps main's FP32 requantize.
-                scale_dtype=(
-                    module.weight_scale.dtype
-                    if getattr(module.quant_config, "online_quant", False)
-                    else torch.float32
-                ),
-            )
-            # The scale writes ride on the weight's fence: `_await_readers_of`
-            # synchronizes the device, so the reader that held the weight held
-            # its scale too and both are done by the time this returns.
-            self._copy_into_param(param, q_weight)
-            weight_scale.data.copy_(scale.to(weight_scale.dtype))
-
-        elif quant_type is not None and quant_type.value == _QT.per_Tensor.value:
-            amax = tensor_gpu.abs().max()
-            scale = (amax / fp8_max).clamp(min=1e-12)
-            self._copy_into_param(param, (tensor_gpu / scale).to(fp8_dtype))
-            weight_scale.data.fill_(scale.item())
-
-        elif quant_type is not None and quant_type.value == _QT.per_Token.value:
-            row_amax = tensor_gpu.abs().amax(dim=-1, keepdim=True)
-            scale = (row_amax / fp8_max).clamp(min=1e-12)
-            self._copy_into_param(param, (tensor_gpu / scale).to(fp8_dtype))
-            weight_scale.data.copy_(scale.to(weight_scale.dtype))
-
-        else:
+        requantise = FP8_REQUANTISERS.get(getattr(quant_type, "name", None))
+        if requantise is None:
             logger.warning(
                 f"{self.label}: Unknown quant_type {quant_type} for FP8 requantize"
             )
             return False
+        q_weight, scale = requantise(module, tensor_gpu, fp8_dtype)
+        # The scale writes ride on the weight's fence: `_await_readers_of`
+        # synchronizes the device, so the reader that held the weight held its
+        # scale too and both are done by the time this returns.
+        self._copy_into_param(param, q_weight)
+        weight_scale.data.copy_(scale.to(weight_scale.dtype))
 
         self._post_process_fp8_weight(module, param)
         logger.debug(
@@ -1308,9 +1114,9 @@ class WeightUpdaterMixin:
     def _refuse_unwritten(self, counts: dict) -> None:
         """Fail an update that left a parameter it named stale.
 
-        Returning the count alone reported success over it, and where only
-        some ranks skipped, the shards stopped belonging to one model. Raised
-        once the rest of the batch is applied and finished.
+        A count alone reads as success, and where only some ranks skip a
+        weight, the shards no longer belong to one model. Raised once the rest
+        of the batch is applied and finished.
         """
         unwritten = counts["unwritten"]
         if unwritten:
@@ -1369,7 +1175,7 @@ class WeightUpdaterMixin:
                 f"shards in this sync, so none was written: {unwritten[:20]}"
             )
         if require_full:
-            missing = sync.missing(dict(self._sync_target_model().named_parameters()))
+            missing = sync.missing(self._params_a_full_sync_rewrites())
             if missing:
                 raise RuntimeError(
                     f"{self.label}: the weights are not whole after an earlier "
@@ -1377,6 +1183,46 @@ class WeightUpdaterMixin:
                     f"parameter(s) as they were ({missing[:20]}); only a sync "
                     f"that rewrites every parameter makes them whole again"
                 )
+
+    def _params_a_full_sync_rewrites(self) -> dict[str, torch.nn.Parameter]:
+        """The parameters the checkpoint wrote at load, the ones a trainer's
+        checkpoint holds: one ATOM builds or derives itself is no trainer's to
+        send. Every parameter if no checkpoint was read, as under a dummy load
+        or weights imported from another engine."""
+        model = self._sync_target_model()
+        loaded = getattr(self, "_checkpoint_param_names", None)
+        if loaded is None:
+            return dict(model.named_parameters())
+        # By object: a tied parameter is loaded under either of its names.
+        held = {
+            id(param)
+            for name, param in model.named_parameters(remove_duplicate=False)
+            if name in loaded
+        }
+        return {n: p for n, p in model.named_parameters() if id(p) in held}
+
+    def _write_batch(
+        self,
+        path: str,
+        named_tensors: Iterable[tuple[str, torch.Tensor]],
+        *,
+        complete: bool,
+        require_full: bool,
+        clear_kv_cache: bool = True,
+    ) -> int:
+        """Write one batch of a sync, completing the sync if it is the last;
+        the number of parameters written. Every path ends here."""
+        counts = self._apply_named_tensors(named_tensors)
+        if complete:
+            self._complete_sync(require_full, clear_kv_cache)
+        logger.info(
+            f"{self.label}: {path} weight update done - "
+            f"updated={counts['updated']}, skipped={counts['skipped']}, "
+            f"ignored_scales={counts['ignored_scales']}, is_last={complete}"
+        )
+        self._warn_if_nothing_matched(counts["updated"], counts["skipped"])
+        self._refuse_unwritten(counts)
+        return counts["updated"]
 
     @_one_update
     @_discard_sync_state_on_error
@@ -1409,17 +1255,13 @@ class WeightUpdaterMixin:
             RuntimeError: a tensor named a parameter but could not be written
                 to it. Raised once the rest of the batch is applied.
         """
-        self._open_sync()
-        counts = self._apply_named_tensors(named_tensors)
-        self._complete_sync(require_full, clear_kv_cache)
-        logger.info(
-            f"{self.label}: Weight update complete - "
-            f"updated={counts['updated']}, skipped={counts['skipped']}, "
-            f"ignored_scales={counts['ignored_scales']}"
+        return self._write_batch(
+            "direct",
+            named_tensors,
+            complete=True,
+            require_full=require_full,
+            clear_kv_cache=clear_kv_cache,
         )
-        self._warn_if_nothing_matched(counts["updated"], counts["skipped"])
-        self._refuse_unwritten(counts)
-        return counts["updated"]
 
     @_one_update
     @_discard_sync_state_on_error
@@ -1464,23 +1306,13 @@ class WeightUpdaterMixin:
             shm = _shm_mod.SharedMemory(name=shm_name)
 
         try:
-            self._open_sync()
-            counts = self._apply_named_tensors(
-                decode_bucket(
-                    _bucket_entries(bucket_meta),
-                    torch.frombuffer(shm.buf, dtype=torch.uint8),
-                )
+            views = decode_bucket(
+                bucket_entries(bucket_meta),
+                torch.frombuffer(shm.buf, dtype=torch.uint8),
             )
-            if is_last:
-                self._complete_sync(require_full)
-            logger.info(
-                f"{self.label}: SHM weight update bucket done - "
-                f"updated={counts['updated']}, skipped={counts['skipped']}, "
-                f"ignored_scales={counts['ignored_scales']}, is_last={is_last}"
+            return self._write_batch(
+                "SHM", views, complete=is_last, require_full=require_full
             )
-            self._warn_if_nothing_matched(counts["updated"], counts["skipped"])
-            self._refuse_unwritten(counts)
-            return counts["updated"]
         finally:
             shm.close()
 
@@ -1556,35 +1388,24 @@ class WeightUpdaterMixin:
                     f"runner_device={self.device})"
                 )
 
-        self._open_sync()
-        views = decode_bucket(_bucket_entries(bucket_meta), self._ipc_buffer)
+        views = decode_bucket(bucket_entries(bucket_meta), self._ipc_buffer)
         # Copied one at a time, so the sender can overwrite its buffer without
         # this rank ever holding a copy of the whole bucket. .to() copies when
         # the device differs; on the same device it would not.
-        counts = self._apply_named_tensors(
+        copies = (
             (name, src.clone() if src.device == self.device else src.to(self.device))
             for name, src in views
         )
-
-        # Only release the IPC buffer mapping on the last bucket
-        if is_last:
-            self._ipc_buffer = None
-            try:
-                torch.cuda.ipc_collect()
-            except (AttributeError, RuntimeError) as e:
-                # ipc_collect may not be available on all platforms
-                logger.debug("torch.cuda.ipc_collect skipped: %s", e)
-            self._complete_sync(require_full)
-        logger.info(
-            f"{self.label}: IPC weight update bucket done - "
-            f"updated={counts['updated']}, skipped={counts['skipped']}, "
-            f"ignored_scales={counts['ignored_scales']}, is_last={is_last}"
-        )
-        self._warn_if_nothing_matched(counts["updated"], counts["skipped"])
-        self._refuse_unwritten(counts)
-        return counts["updated"]
-
-
-def _bucket_entries(bucket_meta: dict) -> list[dict]:
-    """``{name: {shape, dtype, offset, nbytes}}`` as ``decode_bucket`` takes it."""
-    return [{"name": name, **meta} for name, meta in bucket_meta.items()]
+        try:
+            return self._write_batch(
+                "IPC", copies, complete=is_last, require_full=require_full
+            )
+        finally:
+            # The mapping is held for the whole sync, and released at its end.
+            if is_last:
+                self._ipc_buffer = None
+                try:
+                    torch.cuda.ipc_collect()
+                except (AttributeError, RuntimeError) as e:
+                    # ipc_collect may not be available on all platforms
+                    logger.debug("torch.cuda.ipc_collect skipped: %s", e)

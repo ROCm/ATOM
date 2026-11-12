@@ -34,6 +34,7 @@ if not torch.cuda.is_available():
 
 from aiter import QuantType, dtypes
 
+from atom.model_engine.collective_rpc import WeightReloadRefused
 from atom.model_ops import moe as moe_module
 from atom.model_ops.moe import Fp8MoEMethod, FusedMoE
 from atom.model_ops.utils import shuffle_weights
@@ -315,6 +316,13 @@ def test_a_dense_model_is_unaffected():
 # ── the combinations this path does not implement ─────────────────────────
 
 
+def _expert_bytes(moe) -> list:
+    return [
+        getattr(moe, name).detach().view(torch.uint8).cpu().tolist()
+        for name in ("w13_weight", "w2_weight")
+    ]
+
+
 def test_a_quantized_expert_buffer_is_refused_rather_than_miscopied():
     """bf16 into an FP8 buffer is a dtype cast with no new scale.
 
@@ -326,9 +334,11 @@ def test_a_quantized_expert_buffer_is_refused_rather_than_miscopied():
     """
     moe = _FusedMoEDouble(dtype=dtypes.fp8)
     runner = _Runner(_ModelDouble(moe))
+    before = _expert_bytes(moe)
 
-    with pytest.raises(NotImplementedError, match="quantized storage format"):
+    with pytest.raises(WeightReloadRefused, match="full-precision write cannot"):
         runner.update_weights(_trainer_tensors(11))
+    assert _expert_bytes(moe) == before, "refused before anything was written"
 
 
 def test_an_expert_parallel_layer_is_refused():
@@ -337,18 +347,22 @@ def test_an_expert_parallel_layer_is_refused():
         expert_map=torch.tensor([0, 1, -1, -1], dtype=torch.int32, device=DEVICE)
     )
     runner = _Runner(_ModelDouble(moe))
+    before = _expert_bytes(moe)
 
-    with pytest.raises(NotImplementedError, match="expert-parallel"):
+    with pytest.raises(WeightReloadRefused, match="expert-parallel"):
         runner.update_weights(_trainer_tensors(12))
+    assert _expert_bytes(moe) == before, "refused before anything was written"
 
 
 def test_redundant_expert_replicas_are_refused():
     moe = _FusedMoEDouble()
     moe.num_redundant_experts = 2
     runner = _Runner(_ModelDouble(moe))
+    before = _expert_bytes(moe)
 
-    with pytest.raises(NotImplementedError, match="redundant"):
+    with pytest.raises(WeightReloadRefused, match="redundant"):
         runner.update_weights(_trainer_tensors(13))
+    assert _expert_bytes(moe) == before, "refused before anything was written"
 
 
 def test_a_buffer_that_is_not_an_expert_weight_is_refused():
@@ -504,9 +518,11 @@ def test_a_fused_name_that_is_not_3d_is_refused():
 def test_a_fused_name_on_a_quantized_layer_is_refused():
     moe = _FusedMoEDouble(dtype=dtypes.fp8)
     runner = _Runner(_ModelDouble(moe))
+    before = _expert_bytes(moe)
 
-    with pytest.raises(NotImplementedError, match="quantized storage format"):
+    with pytest.raises(WeightReloadRefused, match="full-precision write cannot"):
         runner.update_weights(_fused_trainer_tensors(20))
+    assert _expert_bytes(moe) == before, "refused before anything was written"
 
 
 def test_a_dense_gate_up_proj_is_not_mistaken_for_an_expert_one():

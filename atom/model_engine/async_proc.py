@@ -761,7 +761,9 @@ class AsyncIOProcManager:
                 f"so no TP rank ran it"
             )
             return [
-                RpcResult(payload.request_id, rank, error=error)
+                RpcResult(
+                    payload.request_id, rank, error=error, refused_before_writing=True
+                )
                 for rank in range(self.proc_num)
             ]
 
@@ -776,7 +778,12 @@ class AsyncIOProcManager:
                     f"broken; restart the runner manager"
                 )
                 return [
-                    RpcResult(payload.request_id, rank, error=error)
+                    RpcResult(
+                        payload.request_id,
+                        rank,
+                        error=error,
+                        refused_before_writing=True,
+                    )
                     for rank in range(self.proc_num)
                 ]
             self.rpc_broadcast_mq.enqueue((func_name, payload))

@@ -36,7 +36,10 @@ from datetime import timedelta
 import torch
 import torch.distributed as dist
 
-from atom.rollout.weight_updater import _one_update, decode_bucket
+from atom.distributed.group_agreement import group_min_each
+from atom.model_engine.collective_rpc import WeightReloadRefused
+from atom.rollout.weight_bucket import decode_bucket
+from atom.rollout.weight_updater import _one_update
 
 logger = logging.getLogger("atom")
 
@@ -147,13 +150,6 @@ def _decode_frame(
     return decode_bucket(metadata, payload)
 
 
-def vote(group, *ballots: int) -> tuple[int, ...]:
-    """The least of each ballot across every rank of *group*, a CPU group."""
-    votes = torch.tensor(ballots, dtype=torch.int64)
-    dist.all_reduce(votes, op=dist.ReduceOp.MIN, group=group)
-    return tuple(int(v) for v in votes.tolist())
-
-
 @torch.no_grad()
 def receive_weight_stream(
     group,
@@ -188,6 +184,10 @@ def receive_weight_stream(
 
     *refusal*, if given, refuses the stream: it is received in full and
     discarded, nothing is written, and the refusal is raised at the end.
+
+    A failure raised at the end marker before this rank wrote any of the
+    stream is a ``WeightReloadRefused``, so the engine can tell that nothing
+    was written here.
     """
     total_bytes = 0
     total_buckets = 0
@@ -195,6 +195,7 @@ def receive_weight_stream(
     started = time.perf_counter()
     failure: Exception | None = refusal
     opened = False
+    applied = False
     ended = False
     # Set by the vote that is every rank's last, and by no other.
     decided = False
@@ -280,6 +281,7 @@ def receive_weight_stream(
                 continue
             try:
                 weights = _decode_frame(metadata_tensor, payload)
+                applied = True
                 counts = runner._apply_named_tensors(weights)
                 runner._refuse_unwritten(counts)
             except Exception as exc:  # noqa: BLE001 - raised at the end marker
@@ -306,15 +308,16 @@ def receive_weight_stream(
         if decide(_ENDED) == _LEFT:
             decided = True
             # Counts as written, so the engine stays fenced, as it should: the
-            # stream broke off, and what the other ranks wrote is unknown. A
-            # WeightReloadRefused is never the cause, since a model a reload
-            # cannot rewrite is refused its group by init_rdma_weight_group.
+            # stream broke off, and what the other ranks wrote is unknown even
+            # where this one wrote nothing.
             raise RDMAStreamOutOfStep(
                 f"RDMA weight stream v{version}: a rank taking it left its group"
             ) from failure
         decided = True
         if failure is not None:
-            raise failure
+            if applied or isinstance(failure, WeightReloadRefused):
+                raise failure
+            raise WeightReloadRefused(str(failure)) from failure
     except Exception as exc:
         if not decided:
             # Broken off between votes, in a broadcast a peer may still be in.
@@ -406,7 +409,7 @@ class RDMAWeightReceiverMixin:
                 f"cannot decide on the RDMA stream: the process world has "
                 f"{world.world_size} rank(s), the engine {workers} worker(s)"
             )
-        return vote(world.cpu_group, *ballots)
+        return group_min_each(ballots, world.cpu_group)
 
     def init_rdma_weight_group(
         self,
@@ -421,9 +424,9 @@ class RDMAWeightReceiverMixin:
 
         Rank 0 is the trainer; the caller assigns one ``base_rank`` per
         replica, whose workers follow it in order. Decided by every worker of
-        the engine before any joins: one that could not -- refused, its rank
-        out of range, its earlier join a different one -- or that had joined
-        where the others had not, left them in the rendezvous waiting for it.
+        the engine before any joins: one that cannot -- refused, its rank out
+        of range, its earlier join a different one -- or that has joined where
+        the others have not would leave them in the rendezvous waiting for it.
         Idempotent for the same join, as the orchestrator may retry.
         """
         from atom.utils.distributed.utils import (
@@ -524,12 +527,13 @@ class RDMAWeightReceiverMixin:
         version = int(version)
         weight_group = self._rdma_groups.get(group_name)
         # Agreed before the first header: a worker without the group, raising
-        # alone, left the others waiting for it in the stream's first vote.
+        # alone, would leave the others waiting for it in the stream's first
+        # vote.
         (outcome,) = self._vote_with_engine_peers(
             _RECEIVING if weight_group is not None else _BROKEN_OFF
         )
         if outcome != _RECEIVING:
-            raise RuntimeError(
+            raise WeightReloadRefused(
                 f"RDMA weight group {group_name!r} is not joined on every "
                 f"worker of this engine; destroy it on every rank and join it "
                 f"again"
@@ -540,8 +544,6 @@ class RDMAWeightReceiverMixin:
                 f"weight versions must rise within a group: last={last}, "
                 f"got={version}"
             )
-        if refusal is None:
-            weight_group.last_version = version
         try:
             stats = receive_weight_stream(
                 weight_group.group,
@@ -551,7 +553,7 @@ class RDMAWeightReceiverMixin:
                 require_full=require_full,
                 agree=lambda ballot: self._vote_with_engine_peers(ballot)[0],
                 leave=lambda: self.destroy_rdma_weight_group(group_name),
-                refusal=None if refusal is None else RuntimeError(refusal),
+                refusal=None if refusal is None else WeightReloadRefused(refusal),
             )
         except RDMAStreamOutOfStep as exc:
             logger.error(
@@ -562,18 +564,25 @@ class RDMAWeightReceiverMixin:
             )
             self.destroy_rdma_weight_group(group_name)
             raise
+        # Only a stream written and completed uses up its version: a retry of
+        # one that failed is the same version again.
+        weight_group.last_version = version
         logger.info(
             "%s: RDMA weight stream v%d written: %s", self.label, version, stats
         )
         return stats["updated"]
 
     def destroy_rdma_weight_group(self, group_name: str) -> bool:
+        from atom.utils.distributed.utils import forget_process_group
+
         weight_group = self._rdma_groups.pop(group_name, None)
         if weight_group is None:
             return True
         try:
             dist.destroy_process_group(weight_group.group)
         except Exception as exc:  # noqa: BLE001 - teardown must not mask the real error
+            # Or the group's name stays taken, and it cannot be joined again.
+            forget_process_group(weight_group.group)
             logger.warning(
                 "%s: tearing down RDMA weight group %s failed: %s",
                 self.label,

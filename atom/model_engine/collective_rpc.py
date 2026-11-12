@@ -25,8 +25,8 @@ FINISH_WEIGHT_SYNC_CMD = "finish_weight_sync"
 
 class WeightReloadRefused(RuntimeError):
     """A rank refused a sync before writing any of it: a reload cannot
-    rewrite this model's weights in place. Its reply says so in
-    ``RpcResult.refused_before_writing``."""
+    rewrite this model's weights in place, or the update failed before its
+    first write. Its reply says so in ``RpcResult.refused_before_writing``."""
 
 
 # The runner methods the public collective_rpc runs, and so the ones a
@@ -166,8 +166,9 @@ class RpcResult:
     tp_rank: int
     value: object = None
     error: str | None = None
-    # The call raised WeightReloadRefused: the rank refused a sync before
-    # writing any of it. Carried apart from *error*, whose text is free.
+    # Nothing of the call was written on this rank: it raised
+    # WeightReloadRefused, or was never sent. Carried apart from *error*,
+    # whose text is free.
     refused_before_writing: bool = False
 
     @property

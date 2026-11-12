@@ -33,6 +33,7 @@ from atom.model_engine.engine_utility import (
     RECEIVE_WEIGHTS_RDMA_CMD,
     WEIGHT_UPDATE_UTILITY_CMDS,
     EngineUtilityHandler,
+    ask_what_runners_take,
     kv_change,
 )
 from atom.model_engine.scheduler import (
@@ -316,7 +317,7 @@ class _Runners:
     """The TP ranks of one engine, each applying whatever it is sent, and
     reporting *unavailable* when asked what it supports.
 
-    With *unanswered* that query times out instead. Of its *ranks*, those in
+    With *unasked* the engine was not told at startup. Of its *ranks*, those in
     *refusing* refuse every update before writing, with *refusal*, as a
     runner whose model a reload cannot rewrite does; unless *marked* is
     false, when only their error's text says so.
@@ -325,14 +326,14 @@ class _Runners:
     def __init__(
         self,
         unavailable=None,
-        unanswered=False,
+        unasked=False,
         refusal=None,
         refusing=(),
         ranks=1,
         marked=True,
     ):
         self.unavailable = unavailable or {}
-        self.unanswered = unanswered
+        self.unasked = unasked
         self.refusal = refusal
         self.refusing = set(refusing)
         self.ranks = ranks
@@ -341,8 +342,7 @@ class _Runners:
 
     def utility_rpc(self, method, payload, timeout=300.0):
         if method == "get_worker_capabilities":
-            if self.unanswered:
-                raise TimeoutError("no reply from TP rank 0")
+            assert not self.unasked, "asked on a sync's path, not at startup"
             return [
                 RpcResult(
                     payload.request_id, rank, value={"unavailable": self.unavailable}
@@ -386,7 +386,16 @@ def _wired(schedulers, runners=None):
     outs = [queue.Queue() for _ in schedulers]
     runners = runners or [_Runners() for _ in schedulers]
     handlers = [
-        EngineUtilityHandler(runner, out, label=f"dp{i}", scheduler=sched)
+        EngineUtilityHandler(
+            runner,
+            out,
+            label=f"dp{i}",
+            scheduler=sched,
+            # As EngineCore asks at startup.
+            unavailable=(
+                None if runner.unasked else ask_what_runners_take(runner, f"dp{i}")
+            ),
+        )
         for i, (runner, out, sched) in enumerate(zip(runners, outs, schedulers))
     ]
 
@@ -458,15 +467,13 @@ def test_a_sync_the_runners_cannot_reload_is_refused_before_it_writes():
     assert [cmd for r in runners for cmd, _ in r.calls] == [DISCARD_WEIGHT_SYNC_CMD] * 2
 
 
-def test_a_refusal_after_an_unanswered_query_fences_no_engine():
-    """The engines could not ask, so each sent the update and its runners
+def test_a_refusal_the_engines_were_not_told_of_fences_no_engine():
+    """Not told at startup, each engine sent the update and its runners
     refused it before writing. DISCARD found every fence up and kept it, for
     good: the refusal is the model's, and so is every later one."""
     reason = "the model attends through MLA"
     schedulers = [_running(2)[0], _running(2)[0]]
-    runners = [
-        _Runners(unanswered=True, refusal=reason, refusing={0}) for _ in schedulers
-    ]
+    runners = [_Runners(unasked=True, refusal=reason, refusing={0}) for _ in schedulers]
     mgr, engines = _wired(schedulers, runners)
 
     for _ in range(2):
@@ -477,9 +484,9 @@ def test_a_refusal_after_an_unanswered_query_fences_no_engine():
         )
 
 
-def test_a_stream_refused_after_an_unanswered_query_fences_nothing():
+def test_a_stream_refused_by_runners_the_engine_did_not_ask_fences_nothing():
     reason = "the model attends through MLA"
-    runner = _Runners(unanswered=True, refusal=reason, refusing={0})
+    runner = _Runners(unasked=True, refusal=reason, refusing={0})
     mgr, (engine,) = _wired([_running(2)[0]], [runner])
 
     with pytest.raises(RuntimeError, match=reason):
@@ -492,7 +499,7 @@ def test_a_stream_refused_after_an_unanswered_query_fences_nothing():
 
 def test_an_engine_one_of_whose_ranks_wrote_stays_fenced():
     """Rank 1 wrote what rank 0 refused, so the weights are not whole."""
-    runner = _Runners(unanswered=True, refusal="rank 0 only", refusing={0}, ranks=2)
+    runner = _Runners(unasked=True, refusal="rank 0 only", refusing={0}, ranks=2)
     mgr, (engine,) = _wired([_running(2)[0]], [runner])
 
     with pytest.raises(RuntimeError, match="rank 0 only"):
@@ -504,7 +511,7 @@ def test_an_engine_one_of_whose_ranks_wrote_stays_fenced():
 def test_an_error_that_only_reads_like_a_refusal_keeps_the_fence():
     """Read off the text, any error that began with the refusal's name took
     the fence down, whatever had been written."""
-    runner = _Runners(unanswered=True, refusal="MLA", refusing={0}, marked=False)
+    runner = _Runners(unasked=True, refusal="MLA", refusing={0}, marked=False)
     mgr, (engine,) = _wired([_running(2)[0]], [runner])
 
     with pytest.raises(RuntimeError, match="MLA"):

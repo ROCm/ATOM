@@ -761,6 +761,23 @@ def test_a_dead_rank_breaks_the_barrier_so_the_survivors_answer():
     assert "died" in results[1].error
 
 
+@pytest.mark.parametrize("unsent", ["past its deadline", "broken barrier"])
+def test_a_call_that_was_never_sent_wrote_nothing(unsent):
+    """A sync's first update that waited in the engine's queue past its
+    deadline ran on no rank, yet its replies read as written, and a healthy
+    engine was marked not whole."""
+    mgr = _mgr(2)
+    if unsent == "broken barrier":
+        mgr.all_ranks_barrier = _Abortable(on_abort=lambda: None)
+        mgr.all_ranks_barrier.broken = True
+        results = mgr.collective_rpc("m", RpcPayload("u1", barrier=True), timeout=5)
+    else:
+        results = mgr.collective_rpc("m", RpcPayload("u2"), timeout=0)
+
+    assert mgr.rpc_broadcast_mq.sent == []
+    assert all(not r.ok and r.refused_before_writing for r in results)
+
+
 def test_a_slow_rank_does_not_break_the_barrier():
     """Only death does. A slow rank can still arrive, and a broken barrier
     stays broken for every later call that needs one."""

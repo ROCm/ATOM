@@ -174,7 +174,8 @@ def stateless_init_torch_distributed_process_group(
     """
     init_method = get_tcp_uri(host, port)
     backend = Backend(backend)  # it is basically string
-    timeout = timeout or _get_default_timeout(backend)
+    if timeout is None:
+        timeout = _get_default_timeout(backend)
     if backend == "nccl" and not group_name:
         raise ValueError("an NCCL group needs a group_name")
 
@@ -201,6 +202,28 @@ def stateless_init_torch_distributed_process_group(
             prefix_store, group_rank, group_size, group_name, timeout
         )
     raise ValueError(f"Unsupported backend: {backend}")
+
+
+def forget_process_group(pg: ProcessGroup) -> None:
+    """Drop torch.distributed's record of *pg*, as ``destroy_process_group``
+    does once the group's shutdown returns. After a shutdown that raised -- on
+    a broken communicator -- the record stays, and with it the group's name:
+    a group of that name cannot be built again."""
+    if pg not in _world.pg_map:
+        return
+    for record in (
+        _world.pg_map,
+        _world.pg_names,
+        _world.pg_group_ranks,
+        _world.pg_backend_config,
+        _world.pg_coalesce_state,
+    ):
+        record.pop(pg, None)
+    tag = _world.pg_to_tag.pop(pg, None)
+    for key in {tag, ""} - {None}:
+        if pg in _world.tags_to_pg.get(key, ()):
+            _world.tags_to_pg[key].remove(pg)
+    _unregister_process_group(pg.group_name)
 
 
 def stateless_destroy_torch_distributed_process_group(pg: ProcessGroup) -> None:

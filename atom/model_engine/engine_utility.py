@@ -84,7 +84,7 @@ _CAPABILITY_TIMEOUT_S = 30.0
 # How long the engine waits for its runners to finish a weight stream. They
 # bound it themselves, by their group's collective timeout, and a rank that
 # dies is noticed at once; this only keeps the deadline finite.
-_WEIGHT_STREAM_TIMEOUT_S = 24 * 3600.0
+WEIGHT_STREAM_TIMEOUT_S = 24 * 3600.0
 
 
 def _remaining_timeout(args: dict, default: float) -> float:
@@ -93,6 +93,25 @@ def _remaining_timeout(args: dict, default: float) -> float:
         deadline = checked_timeout(args["deadline"])
         return max(0.0, deadline - time.time())
     return checked_timeout(args.get("timeout", default))
+
+
+def ask_what_runners_take(runner_mgr, label: str) -> dict[str, str]:
+    """The weight syncs *runner_mgr*'s runners cannot take, by feature, with
+    why. Raises if a runner cannot answer: no sync could drive that one."""
+    payload = RpcPayload(request_id=f"get_worker_capabilities-{uuid.uuid4().hex}")
+    replies = runner_mgr.utility_rpc(
+        "get_worker_capabilities", payload, timeout=_CAPABILITY_TIMEOUT_S
+    )
+    failed = [reply for reply in replies if not reply.ok]
+    if failed:
+        raise RuntimeError(
+            f"{label}: the runners could not say which weight syncs they take: "
+            + "; ".join(f"TP rank {r.tp_rank}: {r.error}" for r in failed)
+        )
+    unavailable: dict[str, str] = {}
+    for reply in replies:
+        unavailable.update(reply.value.get("unavailable", {}))
+    return unavailable
 
 
 class _ReplyQueue:
@@ -160,7 +179,12 @@ class EngineUtilityHandler:
     }
 
     def __init__(
-        self, runner_mgr, output_queue, label: str = "Engine Core", scheduler=None
+        self,
+        runner_mgr,
+        output_queue,
+        label: str = "Engine Core",
+        scheduler=None,
+        unavailable: dict[str, str] | None = None,
     ):
         self.runner_mgr = runner_mgr
         self.output_queue = _ReplyQueue(output_queue)
@@ -177,12 +201,14 @@ class EngineUtilityHandler:
         # Request id of the complete update this engine applied, the only one
         # a FINISH may commit.
         self._awaiting_finish: str | None = None
-        # What the runners reported they cannot take, by feature, with why.
-        self._unavailable: dict[str, str] | None = None
-        # The engine's (fenced, inconsistent) when the current sync began, and
+        # What the runners cannot take, by feature, with why, as they said at
+        # startup (ask_what_runners_take); None if they were not asked, and
+        # then they refuse before writing themselves.
+        self._unavailable = unavailable
+        # Whether the engine was fenced when the current sync began, and
         # whether any update of it may have written; a sync that fails having
-        # written nothing leaves the engine as it was.
-        self._held_before_sync = (False, False)
+        # written nothing leaves the fence as it was.
+        self._fenced_before_sync = False
         self._sync_wrote = False
         # Whether the update being handled may have written on some rank.
         self._update_wrote = True
@@ -233,10 +259,7 @@ class EngineUtilityHandler:
                     if args.get("sync_id") != self._sync_id:
                         self._begin_weight_sync(args.get("sync_id"))
                     if starts_sync:
-                        self._held_before_sync = (
-                            fenced,
-                            engine._rl_weights_inconsistent,
-                        )
+                        self._fenced_before_sync = fenced
                         self._sync_wrote = False
                     self._weight_sync_in_progress = True
                     self._update_wrote = True
@@ -283,13 +306,9 @@ class EngineUtilityHandler:
                             reply["error"]
                         )
                     if failed and not self._sync_wrote:
-                        # Every rank refused before writing, as when the
-                        # runners could not be asked up front: the engine
-                        # holds what it held, so DISCARD leaves it so too.
-                        (
-                            engine._weight_sync_fenced,
-                            engine._rl_weights_inconsistent,
-                        ) = self._held_before_sync
+                        # Every rank refused before writing: the engine holds
+                        # what it held, so DISCARD leaves it so too.
+                        engine._weight_sync_fenced = self._fenced_before_sync
                         logger.error(
                             f"{self.label}: weight sync refused before it wrote; "
                             f"serving is unchanged: {reply['error']}"
@@ -353,30 +372,15 @@ class EngineUtilityHandler:
         """Why the runners cannot take the sync *cmd* would start, if they
         cannot.
 
-        Asked before its first update, so a refusal writes nothing and fences
-        nothing. The answer is the model's, so the runners are asked once; if
-        they cannot be, they decide, refusing before they write.
+        Decided before its first update, so a refusal writes nothing and
+        fences nothing.
         """
-        if cmd not in WEIGHT_UPDATE_UTILITY_CMDS or self._continues_weight_sync(
-            cmd, args
+        if (
+            cmd not in WEIGHT_UPDATE_UTILITY_CMDS
+            or self._continues_weight_sync(cmd, args)
+            or self._unavailable is None
         ):
             return None
-        if self._unavailable is None:
-            payload = RpcPayload(
-                request_id=f"get_worker_capabilities-{uuid.uuid4().hex}"
-            )
-            try:
-                replies = self.runner_mgr.utility_rpc(
-                    "get_worker_capabilities", payload, timeout=_CAPABILITY_TIMEOUT_S
-                )
-            except Exception:
-                logger.exception(f"{self.label}: could not ask the runners")
-                return None
-            if not all(reply.ok for reply in replies):
-                return None
-            self._unavailable = {}
-            for reply in replies:
-                self._unavailable.update(reply.value.get("unavailable", {}))
         if cmd == RECEIVE_WEIGHTS_RDMA_CMD:
             return self._unavailable.get("rdma_weight_receive")
         return self._unavailable.get("weight_reload")
@@ -407,23 +411,13 @@ class EngineUtilityHandler:
         return None
 
     def _refuse(self, cmd: str, args, reason: str) -> dict:
-        """Answer *cmd* with *reason* without running it.
+        """Answer *cmd* with *reason*, writing nothing of it.
 
-        A weight stream is still taken in, and discarded: its trainer is
-        already broadcasting it, and would wait in its first broadcast.
+        A weight stream is still taken in and discarded, so this lasts as
+        long as the stream does; see ``_drain_refused_stream``.
         """
         if cmd == RECEIVE_WEIGHTS_RDMA_CMD:
-            payload = RpcPayload(
-                request_id=f"{cmd}-refused-{uuid.uuid4().hex}",
-                args=(args.get("group_name"), args.get("version")),
-                kwargs={"refusal": reason},
-            )
-            try:
-                self.runner_mgr.utility_rpc(
-                    cmd, payload, timeout=_WEIGHT_STREAM_TIMEOUT_S
-                )
-            except Exception:  # the refusal is what is answered
-                logger.exception(f"{self.label}: a refused {cmd} was not drained")
+            self._drain_refused_stream(args, reason)
         reply = {"cmd": cmd, "error": f"refused: {reason}"}
         logger.error(f"{self.label}: {cmd} refused: {reason}")
         self.output_queue.request_id = (
@@ -434,6 +428,24 @@ class EngineUtilityHandler:
         finally:
             self.output_queue.request_id = None
         return reply
+
+    def _drain_refused_stream(self, args, reason: str) -> None:
+        """Take in and discard the weight stream *args* names: its trainer is
+        already broadcasting it, and would wait in its first broadcast until
+        its group timed out."""
+        payload = RpcPayload(
+            request_id=f"{RECEIVE_WEIGHTS_RDMA_CMD}-refused-{uuid.uuid4().hex}",
+            args=(args.get("group_name"), args.get("version")),
+            kwargs={"refusal": reason},
+        )
+        try:
+            self.runner_mgr.utility_rpc(
+                RECEIVE_WEIGHTS_RDMA_CMD, payload, timeout=WEIGHT_STREAM_TIMEOUT_S
+            )
+        except Exception:  # the refusal is what is answered
+            logger.exception(
+                f"{self.label}: a refused {RECEIVE_WEIGHTS_RDMA_CMD} was not drained"
+            )
 
     def _forget_cached_prefixes(self) -> None:
         """Drop the prefix-cache index; live sequences keep their blocks.
@@ -628,11 +640,13 @@ class EngineUtilityHandler:
         """
         if self._weight_sync_failure is not None:
             self._update_wrote = False
-            return {
-                "cmd": cmd,
-                "error": f"weight sync {self._sync_id!r} already failed, so "
-                f"this update cannot complete it: {self._weight_sync_failure}",
-            }
+            error = (
+                f"weight sync {self._sync_id!r} already failed, so this update "
+                f"cannot complete it: {self._weight_sync_failure}"
+            )
+            if cmd == RECEIVE_WEIGHTS_RDMA_CMD:
+                self._drain_refused_stream(args, error)
+            return {"cmd": cmd, "error": error}
         payload = RpcPayload(
             request_id=f"{cmd}-{uuid.uuid4().hex}",
             args=call_args,
@@ -807,7 +821,8 @@ class EngineUtilityHandler:
 
         Waits for the runners' own outcome, not the caller's deadline: a
         stream outlasting that is still received and decided by the runners,
-        and giving up on it reported a failure for a version they then wrote.
+        and giving up on it would report a failure for a version they then
+        write.
         """
         reply = self._update_on_every_rank(
             RECEIVE_WEIGHTS_RDMA_CMD,
@@ -815,7 +830,7 @@ class EngineUtilityHandler:
             args,
             args.get("group_name"),
             args.get("version"),
-            timeout=_WEIGHT_STREAM_TIMEOUT_S,
+            timeout=WEIGHT_STREAM_TIMEOUT_S,
         )
         self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
         return reply
