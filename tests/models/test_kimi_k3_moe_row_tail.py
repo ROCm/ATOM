@@ -13,6 +13,7 @@ from torch import nn
 
 pytest.importorskip("aiter", reason="atom.models.kimi_k3.model imports aiter")
 
+from atom.model_ops import module_dispatch_ops
 from atom.models import qwen4_exp
 from atom.models.kimi_k3 import model as kimi
 
@@ -109,10 +110,11 @@ def _block(w, rank, up_rows):
         x * logits.sum(-1, keepdim=True)
     )
     block.shared_experts = lambda x: share * torch.tanh(x @ w["shared"])
-    # RMS norm with eps, so padded (zero) rows stay zero as in the model.
-    block.routed_expert_norm = lambda x: x * torch.rsqrt(
-        x.pow(2).mean(-1, keepdim=True) + 1e-6
-    )
+    # RMS norm with eps, so padded (zero) rows stay zero as in the model; in
+    # FP32, as there, since a BF16 CPU mean rounds differently by row count.
+    block.routed_expert_norm = lambda x: (
+        x.float() * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + 1e-6)
+    ).to(x.dtype)
 
     def up_proj(x):
         up_rows.append(x.shape[0])
@@ -122,18 +124,19 @@ def _block(w, rank, up_rows):
     return block
 
 
-def _base_and_op_target(ranks, tokens):
-    """Per rank: `split_moe_forward`'s pair, the split op's single-stream
-    target's pair, and the rows each up-projection saw."""
+def _base_and_op_target(ranks, tokens, target=None):
+    """Per rank: `split_moe_forward`'s pair, `target`'s pair (by default the
+    split op's single-stream target) and the rows each up-projection saw."""
     w = _weights()
     gen = torch.Generator().manual_seed(tokens)
     x = torch.randn(tokens, HIDDEN, generator=gen).to(torch.bfloat16)
+    target = target or (lambda block, x: block.single_stream_split_moe_forward(x))
 
     def on_rank(rank):
         up_rows = []
         block = _block(w, rank, up_rows)
         base = block.split_moe_forward(x)
-        return base, block.single_stream_split_moe_forward(x), up_rows
+        return base, target(block, x), up_rows
 
     return ranks(on_rank)
 
@@ -146,6 +149,39 @@ def test_row_sharded_pair_sums_to_the_base_pair(ranks, monkeypatch, tokens):
         # The base up-projects every row; the sharded tail only this rank's.
         assert up_rows == [tokens, -(-tokens // WORLD)]
         assert summed.shape == zeros.shape == (tokens, HIDDEN)
+        assert not zeros.any()
+        expected = (routed.float() + shared.float()).to(summed.dtype)
+        torch.testing.assert_close(summed, expected)
+
+
+def test_forward_with_dual_stream_off_takes_the_row_sharded_tail(ranks, monkeypatch):
+    """A threshold of 0 turns dual-stream off; the block still goes through
+    the split op, whose single-stream target shards the tail."""
+    monkeypatch.setenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "0")
+    blocks = {}
+    config = SimpleNamespace(
+        compilation_config=SimpleNamespace(static_forward_context=blocks)
+    )
+    monkeypatch.setattr(module_dispatch_ops, "get_current_atom_config", lambda: config)
+    # The op is registered for CUDA only; call its Python body on CPU tensors.
+    monkeypatch.setattr(
+        torch.ops.aiter,
+        "maybe_dual_stream_split_forward",
+        module_dispatch_ops.maybe_dual_stream_split_forward,
+    )
+
+    def forward(block, x):
+        block.prefix = str(id(block))
+        block._use_dual_stream, block._use_dispatch_op = False, True
+        block._defer_shared_add = True
+        blocks[block.prefix] = block
+        return block.forward(x)
+
+    tokens = 13
+    for (routed, shared), (summed, zeros), up_rows in _base_and_op_target(
+        ranks, tokens, forward
+    ):
+        assert up_rows == [tokens, -(-tokens // WORLD)]
         assert not zeros.any()
         expected = (routed.float() + shared.float()).to(summed.dtype)
         torch.testing.assert_close(summed, expected)

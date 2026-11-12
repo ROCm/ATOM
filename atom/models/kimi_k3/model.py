@@ -446,12 +446,22 @@ class KimiSparseMoeBlock(nn.Module):
         # the routed-expert path (on the main stream). Only meaningful when a
         # shared branch exists and an alt_stream was threaded in. TBO already
         # provides its own overlap, so the two are mutually exclusive.
-        self._use_dual_stream = False
-        if self.shared_experts is not None and self.alt_stream is not None:
-            tbo_active = get_current_atom_config().enable_tbo
-            if envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0 and not tbo_active:
-                self._use_dual_stream = True
-        if self._use_dual_stream:
+        tbo_active = get_current_atom_config().enable_tbo
+        self._use_dual_stream = (
+            self.shared_experts is not None
+            and self.alt_stream is not None
+            and envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0
+            and not tbo_active
+        )
+        # The split op's single-stream target row-shards a large step's latent
+        # tail, so a latent block with TP takes the op with dual-stream off too.
+        self._use_dispatch_op = self._use_dual_stream or (
+            self.use_latent_moe
+            and self.shared_experts is not None
+            and self.tp_size > 1
+            and not tbo_active
+        )
+        if self._use_dispatch_op:
             # Register self so `maybe_dual_stream_split_forward` can look this module up
             # by prefix from static_forward_context (the op is Dynamo-opaque).
             cc = get_current_atom_config().compilation_config
@@ -519,7 +529,7 @@ class KimiSparseMoeBlock(nn.Module):
         therefore treat ``first`` as the whole result and not as a routed
         partial that is still owed a shared add.
         """
-        if self._use_dual_stream:
+        if self._use_dispatch_op:
             if self._defer_shared_add:
                 # maybe_dual_stream_split_forward hands both branches back unsummed,
                 # so the deferral survives the custom-op boundary and the next
