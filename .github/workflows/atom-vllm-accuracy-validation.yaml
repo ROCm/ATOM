@@ -814,7 +814,7 @@ jobs:
           RUN pip uninstall -y atom
           RUN rm -rf /app/ATOM
           COPY . /app/ATOM
-          RUN cd /app/ATOM && pip install -e .
+          RUN cd /app/ATOM && pip install 'tomli; python_version < "3.11"' && python3 .github/scripts/install_atom_with_ci_aiter.py --aiter-source /app/aiter-test
           RUN echo "=== ATOM version AFTER installation ===" && pip show atom || true
           EOF
 
