@@ -122,6 +122,11 @@ class EngineCore:
         self.input_thread.start()
 
         self.mark_trace = getattr(config, "mark_trace", False)
+        from atom.model_loader.weight_cache import DAEMON_RUNNER
+
+        # ATOM_WEIGHT_CACHE=daemon: runners stop after loading and serve their
+        # weights; this engine sets up nothing for serving.
+        self._weight_cache_daemon = config.runner_qualname == DAEMON_RUNNER
         init_exit_handler(self)
         self._init_data_parallel(config)
 
@@ -143,56 +148,13 @@ class EngineCore:
                 kv_progress_event=self._kv_progress_event,
             )
             self._post_model_load_hook()
-            block_info = self.runner_mgr.call_func("get_num_blocks", wait_out=True)
-            num_blocks = block_info["num_kvcache_blocks"]
-            # Sizing happens in the runner subprocess, so nothing it wrote to
-            # its own `config` is visible here. Carry the per-class entry table
-            # across; BlockManager (built in Scheduler below) and the
-            # sliding-window pool each look up the class they declared, so
-            # adding an architecture never touches this line.
-            config.pool_entries = block_info.get("pool_entries", {})
-            config.pool_entries_per_req = block_info.get("pool_entries_per_req", {})
-            self.state_runtime = StateRuntime.from_wire(block_info["state_runtime"])
-            ret = self.runner_mgr.call_func(
-                "allocate_kv_cache", num_blocks, wait_out=True
-            )
-            assert ret, "Failed to allocate kv cache"
-
-            config.num_kvcache_blocks = num_blocks
-            # Config has already turned the feature off wherever it cannot act,
-            # so every stage of a pipeline takes this branch or none does: the
-            # sweep's dummy forwards cross stages and must run in lockstep.
-            if config.enable_dynamic_chunking:
-                # Startup profiling only measures the chunk cost that carries no
-                # attention; the attention terms are calibrated from real
-                # prefills while serving, so no chunk is rebalanced until then.
-                profile = self.runner_mgr.call_func(
-                    "profile_dynamic_chunking", wait_out=True
-                )
-                if not profile or "linear_coeff" not in profile:
-                    config.enable_dynamic_chunking = False
-                    reason = (profile or {}).get("error", "")
-                    logger.warning(
-                        "%s: disabling dynamic chunking because startup profiling "
-                        "did not produce a chunk overhead baseline%s",
-                        self.label,
-                        f": {reason}" if reason else "",
-                    )
-                if (
-                    config.enable_dynamic_chunking
-                    and config.parallel_config.pipeline_parallel_rank != 0
-                ):
-                    # Downstream stages execute metadata from the PP head and
-                    # never make chunking decisions themselves.
-                    config.enable_dynamic_chunking = False
-            if not config.enforce_eager and not config.disagg_is_decode:
-                cap_cost, decode_sizes, pool_bytes = self.runner_mgr.call_func(
-                    "capture_cudagraph", wait_out=True
-                )
-                logger.info(
-                    f"{self.label}: cudagraph capture{decode_sizes} cost: {cap_cost:.2f} "
-                    f"seconds, pool: {pool_bytes / (1 << 30):.2f}GB"
-                )
+            if self._weight_cache_daemon:
+                # The runners loaded their weights and serve them to clients;
+                # a daemon has no KV cache, warmup or graphs of its own
+                # (atom/model_loader/weight_cache.py).
+                self.state_runtime = None
+            else:
+                self._init_kv_cache_and_graphs(config)
             good = True
         finally:
             logger.info(
@@ -205,8 +167,9 @@ class EngineCore:
         # import sets config.num_kvcache_blocks (BlockManager asserts num_blocks > 0).
         # Keep the attribute defined (None) so EngineUtilityHandler below and other
         # consumers can reference it before DecodeEngineCore creates the real one.
+        # A weight cache daemon never schedules.
         self.scheduler = None
-        if not config.disagg_is_decode:
+        if not config.disagg_is_decode and not self._weight_cache_daemon:
             self.scheduler = Scheduler(
                 config,
                 state_runtime=self.state_runtime,
@@ -247,6 +210,73 @@ class EngineCore:
 
         self._send_ready_signal()
         logger.info(f"{self.label}: EngineCore fully initialized and ready")
+
+    def _init_kv_cache_and_graphs(self, config: Config):
+        """Size and allocate the KV cache, profile dynamic chunking and capture
+        CUDA graphs, once the runners hold the model."""
+        block_info = self.runner_mgr.call_func("get_num_blocks", wait_out=True)
+        num_blocks = block_info["num_kvcache_blocks"]
+        # Sizing happens in the runner subprocess, so nothing it wrote to
+        # its own `config` is visible here. Carry the per-class entry table
+        # across; BlockManager (built in Scheduler below) and the
+        # sliding-window pool each look up the class they declared, so
+        # adding an architecture never touches this line.
+        config.pool_entries = block_info.get("pool_entries", {})
+        config.pool_entries_per_req = block_info.get("pool_entries_per_req", {})
+        self.state_runtime = StateRuntime.from_wire(block_info["state_runtime"])
+        ret = self.runner_mgr.call_func("allocate_kv_cache", num_blocks, wait_out=True)
+        assert ret, "Failed to allocate kv cache"
+
+        config.num_kvcache_blocks = num_blocks
+        # Config has already turned the feature off wherever it cannot act,
+        # so every stage of a pipeline takes this branch or none does: the
+        # sweep's dummy forwards cross stages and must run in lockstep.
+        if config.enable_dynamic_chunking:
+            # Startup profiling only measures the chunk cost that carries no
+            # attention; the attention terms are calibrated from real
+            # prefills while serving, so no chunk is rebalanced until then.
+            profile = self.runner_mgr.call_func(
+                "profile_dynamic_chunking", wait_out=True
+            )
+            if not profile or "linear_coeff" not in profile:
+                config.enable_dynamic_chunking = False
+                reason = (profile or {}).get("error", "")
+                logger.warning(
+                    "%s: disabling dynamic chunking because startup profiling "
+                    "did not produce a chunk overhead baseline%s",
+                    self.label,
+                    f": {reason}" if reason else "",
+                )
+            if (
+                config.enable_dynamic_chunking
+                and config.parallel_config.pipeline_parallel_rank != 0
+            ):
+                # Downstream stages execute metadata from the PP head and
+                # never make chunking decisions themselves.
+                config.enable_dynamic_chunking = False
+        if not config.enforce_eager and not config.disagg_is_decode:
+            cap_cost, decode_sizes, pool_bytes = self.runner_mgr.call_func(
+                "capture_cudagraph", wait_out=True
+            )
+            logger.info(
+                f"{self.label}: cudagraph capture{decode_sizes} cost: {cap_cost:.2f} "
+                f"seconds, pool: {pool_bytes / (1 << 30):.2f}GB"
+            )
+
+    def weight_cache_daemon_loop(self):
+        """A weight cache daemon's engine: the runners hold and serve the
+        weights, nothing is scheduled. Waits for shutdown, without the
+        collectives a DP engine's busy loop would run."""
+        logger.info(f"{self.label}: weight cache daemon ready; waiting for shutdown")
+        while True:
+            while not self.input_queue.empty():
+                for seq in self.input_queue.get_nowait():
+                    if seq.status == SequenceStatus.EXIT_ENGINE:
+                        return
+                    logger.warning(
+                        f"{self.label}: weight cache daemon ignores request {seq.id}"
+                    )
+            time.sleep(0.2)
 
     def _init_prefill_delayer(self, config: Config, cpu_group=None):
         if (
@@ -411,7 +441,10 @@ class EngineCore:
                 engine = DPEngineCoreProc(config, input_address, output_address)
             else:
                 engine = EngineCore(config, input_address, output_address)
-            engine.busy_loop()
+            if getattr(engine, "_weight_cache_daemon", False):
+                engine.weight_cache_daemon_loop()
+            else:
+                engine.busy_loop()
         except Exception:
             logger.exception("run_engine failed")
             raise

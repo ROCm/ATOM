@@ -3689,6 +3689,13 @@ def main():
     """Main entry point for the server."""
     global engine
 
+    if envs.ATOM_WEIGHT_CACHE != "off":
+        # ATOM_PRELOAD: remember this launch, to start a weight cache daemon
+        # with it; daemon: let its runners find this process to stop it.
+        from atom.model_loader.weight_cache import record_launch
+
+        record_launch()
+
     parser = FlexibleArgumentParser(description="ATOM OpenAI API Server")
     EngineArgs.add_cli_args(parser)
     parser.add_argument("--host", type=str, default=DEFAULT_HOST, help="Server host")
@@ -3793,6 +3800,9 @@ def main():
     _setup_reasoning_and_tools(args)
 
     engine = engine_args.create_engine(tokenizer=tokenizer)
+    if envs.ATOM_WEIGHT_CACHE == "daemon":
+        _run_weight_cache_daemon(engine)
+        return
     _setup_stream_dispatch(args)
 
     # Wire the batched stream-flush hook: per-seq stream callbacks only buffer
@@ -4037,6 +4047,32 @@ def _loop_impl() -> str:
             "uvloop not installed; falling back to the default asyncio loop."
         )
         return "auto"
+
+
+def _run_weight_cache_daemon(engine) -> None:
+    """ATOM_WEIGHT_CACHE=daemon: every runner has loaded its shard and serves
+    it to clients (atom/model_loader/weight_cache.py). There is no API to
+    serve; wait for SIGINT/SIGTERM, then shut the engine down."""
+    import signal
+    import threading
+
+    stop = threading.Event()
+
+    def _on_signal(signum, frame):
+        logger.info(
+            f"Weight cache daemon: received {signal.Signals(signum).name}, shutting down..."
+        )
+        stop.set()
+
+    signal.signal(signal.SIGINT, _on_signal)
+    signal.signal(signal.SIGTERM, _on_signal)
+    logger.info(
+        "Weight cache daemon ready: all ranks serve their weights. Stop with SIGINT/SIGTERM."
+    )
+    while not stop.wait(1.0):
+        pass
+    engine.close()
+    logger.info("Weight cache daemon stopped.")
 
 
 def _serve(args) -> None:
