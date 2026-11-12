@@ -411,14 +411,19 @@ def _owns_kg_records(flush_arrivals, slot, i_hv, HV: tl.constexpr, do_flush):
     siblings replay. A flush appends at row 0, inside those rows, so the store
     goes to the last program of the head to count itself in, and it puts the
     count back to 0 for the next flush. Call it after this program's own loads
-    of the records: the release orders them before the count, and the store
-    depends on the count, so it needs no acquire (acq_rel measured 0.8 us
-    slower on a flushing T = 32 KDA step).
+    of the records: the wait and the barrier land every warp's loads before the
+    count, and the store depends on the count, so it needs no acquire. A
+    release would order the loads as well, but it writes back L2 in every
+    program: 65 against 27 us on a flushing 64-row GDN decode.
     """
     owns = tl.program_id(0) == 0
     if do_flush:
+        tl.inline_asm_elementwise(
+            "s_waitcnt vmcnt(0)", "=v,v", [i_hv], dtype=tl.int32, is_pure=False, pack=1
+        )
+        tl.debug_barrier()
         p_count = flush_arrivals + slot * HV + i_hv
-        owns = tl.atomic_add(p_count, 1, sem="release") == tl.num_programs(0) - 1
+        owns = tl.atomic_add(p_count, 1, sem="relaxed") == tl.num_programs(0) - 1
         if owns:
             tl.store(p_count, 0)
     return owns
