@@ -233,12 +233,12 @@ class _AtomMetricsCollector:
             # ever ran and how much history it shed.
             events = CounterMetricFamily(
                 "atom:dp_prefix_index_events",
-                "Prefix-spread index maintenance events: tail_trim (an old "
-                "history shortened from its tail), leaf_evict (an old history "
-                "dropped whole), over_budget (budget checks that found the "
-                "index over budget), blocked (over budget with only still-"
-                "prefilling history left to shed), merge (a split edge "
-                "re-merged), reset.",
+                "Prefix-spread index budget events: tail_trim (an old history "
+                "shortened from its tail), leaf_evict (an old history dropped "
+                "whole), over_budget (budget checks that found the index over "
+                "budget), blocked (still over budget after eviction ran out of "
+                "evictable history: only still-prefilling edges and their "
+                "ancestors were left).",
                 labels=["event"],
             )
             for label, key in (
@@ -246,10 +246,8 @@ class _AtomMetricsCollector:
                 ("leaf_evict", "leaf_evict_total"),
                 ("over_budget", "over_budget_total"),
                 ("blocked", "trim_blocked_total"),
-                ("merge", "merge_total"),
-                ("reset", "reset_total"),
             ):
-                events.add_metric([label], float(index.get(key, 0)))
+                events.add_metric([label], float(index[key]))
             yield events
             shed = CounterMetricFamily(
                 "atom:dp_prefix_index_evicted_tokens",
@@ -258,34 +256,16 @@ class _AtomMetricsCollector:
                 "leaf).",
                 labels=["kind"],
             )
-            shed.add_metric(
-                ["tail_trim"], float(index.get("tail_trim_tokens_total", 0))
-            )
-            shed.add_metric(
-                ["leaf_evict"], float(index.get("leaf_evict_tokens_total", 0))
-            )
+            shed.add_metric(["tail_trim"], float(index["tail_trim_tokens_total"]))
+            shed.add_metric(["leaf_evict"], float(index["leaf_evict_tokens_total"]))
             yield shed
-            for name, documentation, key in (
-                (
-                    "atom:dp_prefix_index_tokens",
-                    (
-                        "Prompt tokens currently held by the prefix-spread index "
-                        "(unique edges, not per-rank holders)."
-                    ),
-                    "indexed_tokens",
-                ),
-                (
-                    "atom:dp_prefix_index_budget_tokens",
-                    (
-                        "Prefix-spread index token budget; finished history is "
-                        "shed above it."
-                    ),
-                    "budget_tokens",
-                ),
-            ):
-                gauge = GaugeMetricFamily(name, documentation)
-                gauge.add_metric([], float(index.get(key, 0)))
-                yield gauge
+            indexed = GaugeMetricFamily(
+                "atom:dp_prefix_index_tokens",
+                "Prompt tokens currently held by the prefix-spread index "
+                "(unique edges, not per-rank holders).",
+            )
+            indexed.add_metric([], float(index["indexed_tokens"]))
+            yield indexed
 
         metric = CounterMetricFamily(
             "atom:dp_requests_routed",

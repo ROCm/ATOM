@@ -358,10 +358,7 @@ def test_prefix_index_counters_are_exported_only_with_the_prefix_router():
                     "leaf_evict_tokens_total": 1024,
                     "over_budget_total": 7,
                     "trim_blocked_total": 1,
-                    "merge_total": 5,
-                    "reset_total": 4,
                     "indexed_tokens": 4096,
-                    "budget_tokens": 8192,
                 }
             },
         }
@@ -372,8 +369,6 @@ def test_prefix_index_counters_are_exported_only_with_the_prefix_router():
         ("leaf_evict", 2),
         ("over_budget", 7),
         ("blocked", 1),
-        ("merge", 5),
-        ("reset", 4),
     ):
         assert (
             samples[("atom:dp_prefix_index_events_total", (("event", event),))] == value
@@ -382,4 +377,4 @@ def test_prefix_index_counters_are_exported_only_with_the_prefix_router():
         key = ("atom:dp_prefix_index_evicted_tokens_total", (("kind", kind),))
         assert samples[key] == value
     assert samples[("atom:dp_prefix_index_tokens", ())] == 4096
-    assert samples[("atom:dp_prefix_index_budget_tokens", ())] == 8192
+    assert not [n for n, _ in samples if "budget" in n or "merge" in n]
