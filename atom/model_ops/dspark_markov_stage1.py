@@ -1,13 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Stage 1 of both DSpark Markov ops: the bias GEMV over one (V tile, row
-tile), the tile's (max, lowest id), and the launch geometry.
+"""Stage 1 of the DSpark Markov ops: the bias GEMV over one (V tile, row
+tile), the tile's (max, lowest id), and the default launch geometry.
 
-The greedy op (`dspark_markov_argmax`) and the sampled one
-(`spec_sampling.dspark_markov_sample`) run the same GEMV on the same tiles and
-differ only in what they keep of it, so the tile, its constants and its
-launch live here, once: retuning the GEMV retunes both.
+The greedy op (`dspark_markov_argmax`), the sampled one
+(`spec_sampling.dspark_markov_sample`) and the probabilistic stage-1 kernels
+(`dspark_prob_sample`, `dspark_prob_markov_chain`) run the same GEMV and
+differ only in what they keep of it, so the tile and its constants live here,
+once: retuning the GEMV retunes all of them. `markov_launch_geometry` is the
+default tiling; the fused probabilistic chain starts from it and overrides it
+only for larger batches.
 """
 
 from typing import NamedTuple
@@ -33,12 +36,19 @@ MAX_BLOCK_ROW = 64
 
 
 class MarkovGeometry(NamedTuple):
-    """How a stage-1 launch tiles ``num_rows`` x ``vocab_size``."""
+    """How a stage-1 launch tiles ``num_rows`` x ``vocab_size``: a
+    ``(v_tiles, row_tiles)`` grid whose programs each cover ``block_row``
+    rows and ``tiles_per_program`` consecutive ``block_v``-column vocab
+    tiles. The defaults are the single-tile layout every Markov stage-1
+    kernel uses; only the fused probabilistic chain overrides them."""
 
     block_row: int
     row_tiles: int
     v_tiles: int
     num_warps: int
+    block_v: int = BLOCK_V
+    tiles_per_program: int = 1
+    num_stages: int = 2
 
 
 def markov_launch_geometry(num_rows: int, vocab_size: int) -> MarkovGeometry:
@@ -84,8 +94,9 @@ def markov_logits_tile(
     packed uint64 keys (`dspark_prob_markov_chain`): the low word is the
     inverted id, and a zero key (empty row) reads id 0.
 
-    The GEMV both stage-1 kernels run (`dspark_markov_argmax`'s and
-    `dspark_markov_sample`'s); each keeps only its own tail. ``base``
+    The GEMV every Markov stage-1 kernel runs (`dspark_markov_argmax`'s,
+    `dspark_markov_sample`'s, and the probabilistic ones through
+    `_sampled_tile_argmax`); each keeps only its own tail. ``base``
     holds the tile's columns from 0, W2 is read from vocab id ``vocab_offset``
     on (a TP rank's shard of the LM head; 0 for the whole vocab). The vocab
     and row offsets are int64: `[max_bs, T, V]` logits and a whole W2 pass
