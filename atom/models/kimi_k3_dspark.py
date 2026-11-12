@@ -611,7 +611,9 @@ class KimiK3DSpark(DSparkDraftModel):
         The vocabularies must agree or the shared LM head would silently score
         the wrong rows.
         """
-        target_vocab = target_base.model.embed_tokens.num_embeddings
+        # Not embed_tokens.num_embeddings: a stage without the embedding binds
+        # a PPMissingLayer, which check_shared_embedding then refuses.
+        target_vocab = target_base.model.vocab_size
         if target_vocab != self.hf_config.vocab_size:
             raise ValueError(
                 f"DSpark draft vocab {self.hf_config.vocab_size} != target vocab "

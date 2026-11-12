@@ -278,21 +278,28 @@ def test_relay_hook_compiles_without_an_in_place_update():
     assert "update" not in names
 
 
-def test_k3_draft_shares_the_last_stages_embedding():
-    # Under PP the draft drafts from the last stage's copy of the target's
-    # embedding, never its own (Kimi-K3.1-DSpark ships none).
+def _k3_draft_sharing(embed):
     from atom.models.kimi_k3_dspark import KimiK3DSpark
 
-    embed = nn.Embedding(16, 4)
     target = types.SimpleNamespace(
-        model=types.SimpleNamespace(embed_tokens=embed), lm_head=nn.Identity()
+        model=types.SimpleNamespace(embed_tokens=embed, vocab_size=16),
+        lm_head=nn.Identity(),
     )
     draft = types.SimpleNamespace(hf_config=types.SimpleNamespace(vocab_size=16))
     KimiK3DSpark.share_with_target(draft, target, set())
+    return draft
+
+
+def test_k3_draft_shares_the_last_stages_embedding():
+    # Under PP the draft drafts from the last stage's copy of the target's
+    # embedding, never its own (Kimi-K3.1-DSpark ships none).
+    embed = nn.Embedding(16, 4)
+    draft = _k3_draft_sharing(embed)
     assert draft.embed_tokens is embed
     check_shared_embedding(draft)
 
 
-def test_a_draft_sharing_a_missing_embedding_is_refused():
+def test_a_k3_draft_on_a_stage_without_the_embedding_is_refused():
+    draft = _k3_draft_sharing(PPMissingLayer())
     with pytest.raises(TypeError, match="pp_speculative_methods"):
-        check_shared_embedding(types.SimpleNamespace(embed_tokens=PPMissingLayer()))
+        check_shared_embedding(draft)
