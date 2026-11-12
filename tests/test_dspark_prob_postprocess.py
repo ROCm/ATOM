@@ -90,7 +90,9 @@ def test_structured_verify_keeps_raw_logprobs(modules, monkeypatch, probabilisti
 
     def ratio_verify(*args, **kwargs):
         observed["ratio_verification"] = True
-        return verify(args[4], args[5])
+        # The ratio test may read the target rows of the full logits in place.
+        logits, rows = args[4], kwargs.get("logit_rows")
+        return verify(logits if rows is None else logits.index_select(0, rows), args[5])
 
     def ordinary_verify(
         metadata, target_logits, bonus, *, target_token_ids, ratio=None
