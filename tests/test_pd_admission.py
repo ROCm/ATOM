@@ -8,8 +8,8 @@ from aiter_stub import stubbed_aiter
 from conftest import MockConfig
 
 from atom.kv_transfer.disaggregation.chunked_prefill import PrefillHandoff
+from atom.kv_transfer.disaggregation.pd_admission import PdAdmissionController
 from atom.kv_transfer.disaggregation.types import KVConnectorOutput
-from atom.model_engine.pd_admission import PdAdmissionController
 from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
 from atom.model_engine.sequence import SequenceStatus
 

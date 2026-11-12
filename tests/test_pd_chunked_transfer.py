@@ -20,6 +20,7 @@ from atom.kv_transfer.disaggregation.chunked_prefill import (
     ChunkedPrefill,
     PrefillHandoff,
 )
+from atom.kv_transfer.disaggregation.pd_admission import PdAdmissionController
 from atom.kv_transfer.disaggregation.pp_kv_aggregator import PPKVAggregator
 from atom.kv_transfer.disaggregation.types import (
     ConnectorCompletion,
@@ -29,7 +30,6 @@ from atom.kv_transfer.disaggregation.types import (
     KVTransferTensors,
     PageRegion,
 )
-from atom.model_engine.pd_admission import PdAdmissionController
 
 
 @pytest.fixture(autouse=True)

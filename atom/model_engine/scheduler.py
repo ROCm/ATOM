@@ -34,6 +34,7 @@ import numpy as np
 
 from atom.config import Config
 from atom.kv_transfer.disaggregation import KVConnectorOutput, kv_config_has_producer
+from atom.kv_transfer.disaggregation.pd_admission import PdAdmissionController
 from atom.metrics.scheduler import SchedulerMetrics
 from atom.model_engine.block_manager import (
     AdmissionProbe,
@@ -49,7 +50,6 @@ from atom.model_engine.dynamic_chunking import (
 )
 from atom.model_engine.engine_stats import EngineStats
 from atom.model_engine.multimodal_runtime import prefill_media_payload
-from atom.model_engine.pd_admission import PdAdmissionController
 from atom.model_engine.prefill_delayer import PrefillDecision
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import (
