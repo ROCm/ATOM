@@ -87,13 +87,13 @@ class DeviceChannel(NamedTuple):
 
 
 def constrain_logits(*args, **kwargs):
-    from atom.model_ops.required_channel_gpu import constrain_logits as execute
+    from atom.model_ops.triton_required_channel import constrain_logits as execute
 
     return execute(*args, **kwargs)
 
 
 def advance_states(*args, **kwargs):
-    from atom.model_ops.required_channel_gpu import advance_states as execute
+    from atom.model_ops.triton_required_channel import advance_states as execute
 
     return execute(*args, **kwargs)
 
