@@ -13,7 +13,7 @@
 | 周中 | 不重建镜像，用同一个本周镜像测 8K/1K 的 4 个模型，同样先精度后性能；记录，补全本周报告，提交 |
 
 - 跑挂了就记下核心 error log，接着测下一个模型。
-- 同一个镜像测出的所有结果都归在这个镜像名下：一个镜像一份报告 `455-CI-report-<YYYYMMDD>.md`，历史数据都留在 `455-CI` 分支的 `recipes/455-CI/` 里（§4.4）。
+- 同一个镜像测出的所有结果都归在这个镜像名下：一个镜像一份报告 `455-CI-report-<YYYYMMDD>.md`（Highlights 和总表，给老板看）和一份详细报告，历史数据都留在 `455-CI` 分支的 `recipes/455-CI/` 里（§4.4）。
 
 **前置条件**：
 
@@ -169,6 +169,25 @@ docker commit \
 remote_tag_state "$NEW_IMAGE"          # push 前再查一次，必须是 absent
 docker push "$NEW_IMAGE"
 docker buildx imagetools inspect "$NEW_IMAGE" | grep -m1 Digest    # 记下 digest，写进报告
+
+# 记下本周镜像的信息，详细报告的"测试环境"从这里读。CI_DIR 是 455-CI 分支里的 recipes/455-CI
+mkdir -p "$CI_DIR/runs/$DATE"
+NEW_IMAGE="$NEW_IMAGE" BASE_IMAGE="$BASE_IMAGE" ATOM_SHA="$ATOM_SHA" AITER_SHA="$AITER_SHA" \
+DIGEST=$(docker buildx imagetools inspect "$NEW_IMAGE" | awk '/^Digest:/ {print $2; exit}') \
+ATOM_LOG=$(docker exec ci455-build-${DATE} git -C /app/ATOM log -1 --date=short --format='%cd%x09%s') \
+AITER_LOG=$(docker exec ci455-build-${DATE} git -C /app/aiter log -1 --date=short --format='%cd%x09%s') \
+DEPS="<2.3 里 diff 出的依赖变化，逗号分隔；没有就留空>" \
+python3 - "$CI_DIR/runs/$DATE/image.json" <<'EOF'
+import json, os, sys
+e = os.environ
+def repo(sha, log):
+    date, title = (e[log].split("\t", 1) + [""])[:2]
+    return {"commit": e[sha], "date": date, "title": title}
+json.dump({"image": e["NEW_IMAGE"], "digest": e["DIGEST"], "base_image": e["BASE_IMAGE"],
+           "atom": repo("ATOM_SHA", "ATOM_LOG"), "aiter": repo("AITER_SHA", "AITER_LOG"),
+           "dependency_changes": [d.strip() for d in e["DEPS"].split(",") if d.strip()]},
+          open(sys.argv[1], "w"), ensure_ascii=False, indent=1)
+EOF
 docker rm -f ci455-build-${DATE}
 ```
 
@@ -298,7 +317,7 @@ EOF
 下面任一情况都算失败：server 没起来或中途退出；GSM8K 或 bench 报错退出、卡住；结果文件缺失或不完整。
 
 1. **不盲目重试。** 纯环境问题（GPU 没释放、端口被占、下载失败）修好后可以重跑一次，并在报告里注明"重跑"。
-2. **摘核心 error log**，存到 `$RUN_DIR/$MODEL/error.log`，不超过 100 行：
+2. **摘核心 error log**，存到 `$RUN_DIR/$MODEL/error.log`，不超过 100 行。详细报告的"失败"一节会贴出它的前 60 行：
 
    ```bash
    LOG="$RUN_DIR/$MODEL/server.log"      # client 侧失败就换成对应的 lm_eval.log 或 bench.log
@@ -397,11 +416,13 @@ recipes/
     ├── perf.csv           全部历史性能
     ├── accuracy.csv       全部历史 GSM8K 精度
     ├── accuracy_baseline.csv   可选：精度图上的 baseline 参考线
-    ├── tools/             出图脚本和样图（§5.4）
-    ├── reports/
-    │   └── 455-CI-report-<YYYYMMDD>.md    一个镜像一份报告，YYYYMMDD 是镜像日期
+    ├── tools/             生成图和报告的脚本、样例（§5.5）
+    ├── reports/           一个镜像两份，YYYYMMDD 是镜像日期
+    │   ├── 455-CI-report-<YYYYMMDD>.md          报告：Highlights 和总表
+    │   └── 455-CI-report-<YYYYMMDD>-detail.md   详细报告
     └── runs/<YYYYMMDD>/   这个镜像的原始结果和图
-        ├── charts/        perf-<slug>.png、accuracy-endpoint.png、accuracy-8k1k.png
+        ├── image.json     本周镜像的信息（§2.4）
+        ├── charts/        perf-endpoint.png、perf-8k1k.png、accuracy-endpoint.png、accuracy-8k1k.png
         └── <slug>/        两个场景的模型不重名，放在同一层
             ├── server_cmd.sh  gsm8k_cmd.sh  bench_cmd.sh
             ├── gsm8k/         lm_eval 的 results_*.json
@@ -423,124 +444,99 @@ recipes/
 
 ## 5. 报告
 
-### 5.1 报告文件
+每个镜像出两份报告，放在 `reports/` 下，日期是镜像日期：
 
-每个镜像一份 `reports/455-CI-report-<YYYYMMDD>.md`，日期是镜像日期。周末测完创建，填好镜像信息和 MLPerf Endpoint 的精度、性能，8K/1K 的部分先写"待测（周中）"；周中测完补上。内容和顺序固定：
+| 文件 | 给谁看 | 内容 |
+|---|---|---|
+| `455-CI-report-<YYYYMMDD>.md` | 老板 | Highlights（几句话）和总表 |
+| `455-CI-report-<YYYYMMDD>-detail.md` | 要看细节的人 | 测试环境、全部数字、趋势图、跑挂 case 的核心 error log |
 
-````markdown
+周末测完生成一次，8K/1K 写"待测（周中）"；周中测完再生成一次，覆盖同名文件。两份报告和图都用 §5.5 的脚本从 `perf.csv`、`accuracy.csv` 生成，不手填数字。样例见 [`455-CI/tools/examples/reports/`](455-CI/tools/examples/reports/)（模拟数据）。
+
+### 5.1 Highlights
+
+大老板只看 Highlights，所以它要用几句话说清本次最重要的变化。`make_report.py` 按下表比较本次和历史结果，生成草稿；测试 agent 读一遍再提交，可以合并条目、改写措辞，但不能删掉 ❌ 和 🔴 的条目，也不能改数字。
+
+| 标记 | 什么时候算 | 和谁比 |
+|---|---|---|
+| ❌ 跑挂 | 任一并发或 GSM8K 失败 | — |
+| 🔴 严重回退 | 每卡吞吐低 10% 及以上，或 GSM8K 下降超过 0.06 | 该模型最近一次成功的镜像（"上次"） |
+| ⚠️ 回退 | 每卡吞吐低 3% 及以上，或 GSM8K 下降超过 0.04 | 上次 |
+| ⚠️ 慢回退 | 每卡吞吐比历史最佳低 5% 及以上：每次都没到 3%，累积起来的 | 之前所有镜像里的最好值 |
+| 🟢 进展 | 每卡吞吐高 3% 及以上 | 上次 |
+| ✅ 恢复 | 上次跑挂，这次跑通 | 上次 |
+| 🆕 首次 | 没有历史数据 | — |
+
+- 按上表顺序排，最后一句把其余持平的模型合成"其余 N 个模型持平"，没测的场景写"待测（周中）"。
+- 性能只看每卡吞吐，c4 和 c64 各比各的；GSM8K 看 flexible-extract，差值按个点算（0.01 = 1 个点）。
+- 门槛的来由：吞吐跑到跑之间有 1% 到 2% 的波动；GSM8K 在这套环境上 temp 0 也不完全确定，±0.02 以内通常是噪声。
+
+### 5.2 报告：Highlights 和总表
+
+格式如下（数字是编的）：
+
+```markdown
 # 455-CI 报告 · <YYYY-MM-DD>
 
-| 项目 | 内容 |
-|---|---|
-| 测试 image | `rocm/fw-bringup-mlperf:gfx1250-atom-ci455-<YYYYMMDD>`（digest `sha256:<...>`） |
-| base image | `rocm/fw-bringup-mlperf:gfx1250-atom-<YYYYMMDD>` |
-| ATOM | `main` @ [`<sha 前 9 位>`](https://github.com/ROCm/ATOM/commit/<sha>)，<commit 日期> <标题> |
-| aiter | `main` @ [`<sha 前 9 位>`](https://github.com/ROCm/aiter/commit/<sha>)，<commit 日期> <标题> |
-| 依赖变化 | 2.3 里 diff 的结果；没有就写"无" |
-| 测试日期 | MLPerf Endpoint <YYYY-MM-DD>；8K/1K <YYYY-MM-DD>（北京时间） |
+镜像 `gfx1250-atom-ci455-<YYYYMMDD>` · ATOM `main@<sha 前 9 位>` · aiter `main@<sha 前 9 位>` · base `gfx1250-atom-<YYYYMMDD>` · [详细报告](455-CI-report-<YYYYMMDD>-detail.md)
 
-## 总览
+## Highlights
 
-- MLPerf Endpoint：<n>/4 跑通；精度回退 <n> 项，性能回退 <n> 项
-- 8K/1K：待测（周中）
+- ❌ MLPerf Endpoint · Qwen-35B-A3B 跑挂（c64）：RuntimeError: HIP error: out of memory。
+- 🟢 MLPerf Endpoint · DeepSeek-V4.1-Flash 每卡吞吐提升：c4 +6.6%（235 → 250）、c64 +6.9%（2,655 → 2,838）。
+- 其余 6 个模型持平：每卡吞吐变化在 ±3% 以内，GSM8K 变化在 0.04 以内。
 
-## 精度（GSM8K，3-shot，flexible-extract）
+## 总表
 
-| 场景 | 模型 | 本次 | 上次 | Δ |
-|---|---|---|---|---|
-| MLPerf Endpoint | DeepSeek R1 | <0.xxxx> | <0.xxxx> | <±0.xxxx> |
-| MLPerf Endpoint | Kimi-K3 (2.8T) | N/A | <0.xxxx> | |
-| 8K/1K | 待测（周中） | | | |
+| 场景 | 模型 | 每卡吞吐 tok/s/GPU（c4 / c64） | vs 上次（c4 / c64） | GSM8K | vs 上次 |
+|---|---|---|---|---|---|
+| MLPerf Endpoint | DeepSeek-V4.1-Flash | 250 / 2,838 | 🟢 +6.6% / 🟢 +6.9% | 93.9% | −0.2 个点 |
+| MLPerf Endpoint | Qwen-35B-A3B | 1,005 / N/A ❌ | −0.1% / ❌ | 90.1% | −0.1 个点 |
+```
 
-![GSM8K · MLPerf Endpoint](../runs/<YYYYMMDD>/charts/accuracy-endpoint.png)
+- 一个模型一行，场景和模型各一列。每卡吞吐的口径见 §4.1：endpoint 是输出 token，8K/1K 是输入加输出 token。
+- vs 上次：吞吐写百分比，GSM8K 写个点；第一次有数据写"首次"，跑挂写 ❌。
 
-![GSM8K · 8K/1K](../runs/<YYYYMMDD>/charts/accuracy-8k1k.png)
+### 5.3 详细报告
 
-## 性能 · MLPerf Endpoint
+依次是：
 
-| 模型 | GPU | 并发 | tok/s/GPU | vs 上次 | E2E avg interactivity (tok/s/user) | vs 上次 |
-|---|---|---|---|---|---|---|
-| DeepSeek R1 | 4 | 4 | <数值> | <±x.x%> | <数值> | <±x.x%> |
-| | | 64 | <数值> | <±x.x%> | <数值> | <±x.x%> |
-| Kimi-K3 (2.8T) | 8 | 4 | N/A | | N/A | |
-| | | 64 | N/A | | N/A | |
+1. **测试环境**：测试 image 和 digest、base image、ATOM 和 aiter 的 branch 与 commit（带 commit 日期和标题）、依赖变化、两个场景的测试日期。取自 `runs/<YYYYMMDD>/image.json`（§2.4），缺的项从 CSV 里补。
+2. **性能表**（每个场景一张）：每个模型每个并发一行，列出每卡吞吐、vs 上次、vs 历史最佳（低 5% 及以上标 ⚠️，创新高标"新高"），以及第二指标（endpoint 是 E2E avg interactivity，8K/1K 是 ITL P50）和它的 vs 上次。
+3. **精度表**（每个场景一张）：flexible-extract、strict-match、上次、vs 上次。
+4. **趋势图**：每个场景两张，见 §5.4。
+5. **失败**：每个跑挂的 case 一小节，写一句话报错、`error.log` 的链接，以及核心 error log 段落（`error.log` 的前 60 行）。
 
-### DeepSeek R1
+### 5.4 趋势图
 
-![DeepSeek R1](../runs/<YYYYMMDD>/charts/perf-deepseek-r1.png)
+只跑两个并发，画成帕累托图只是一条线段或一个直角，看不出变化，所以按镜像画趋势。每个场景两张，存在 `runs/<YYYYMMDD>/charts/`：
 
-## 性能 · 8K/1K
+- **`perf-<scenario>.png`**：每卡吞吐随镜像的变化，一个模型一个并发一格，左 c4、右 c64，最近 12 个镜像。每格右上角写最新值和对比上次的百分比；跑挂的镜像在 x 轴上画灰色 `×` 并标 N/A。
+- **`accuracy-<scenario>.png`**：照 ATOM benchmark dashboard 的精度趋势图，一个模型一格，最近 12 个镜像。flexible-extract 实线，strict-match 虚线；baseline 是灰色虚线，在 `accuracy_baseline.csv` 里设了才画，数值写在格子标题行右侧；最新分数标在最后一个点右边。
+- 两张图都用 dashboard 的浅色样式和深红 `#9B1C1C`，字体 Instrument Sans，2 倍分辨率 PNG，2640 px 宽。图里文字用英文，脚注两行写数据来源和口径。
 
-| 模型 | GPU | 并发 | tok/s/GPU | vs 上次 | ITL P50 (ms) | vs 上次 |
-|---|---|---|---|---|---|---|
-| 待测（周中） | | | | | | |
+### 5.5 生成图和报告
 
-## 失败
-
-- **Kimi-K3 (2.8T)**：`<一句话核心报错>`。摘录见 [error.log](../runs/<YYYYMMDD>/kimi-k3/error.log)
-````
-
-- **上次**：同模型（性能还要同并发）在之前的镜像上最近一次成功的结果。第一次有数据的写"首次"。
-- **回退标记**：性能沿用 ATOM benchmark dashboard 的阈值，变差 5% 及以上标 ⚠️，10% 及以上标 🔴；tok/s/GPU 和 interactivity 下降、ITL P50 上升算变差。精度下降超过 0.04 标 ⚠️，超过 0.06 标 🔴：GSM8K 在这套环境上 temp 0 也不完全确定，±0.02 以内通常是噪声。
-- 失败的写 N/A，并在"失败"一节给出一句话核心报错和 error.log 链接。
-
-### 5.2 性能图
-
-MLPerf Endpoint 的图沿用 [LLM-Booster#246 的 MLPerf Endpoints 性能图](https://github.com/wuhuikx/LLM-Booster/issues/246#issuecomment-6678717093)，8K/1K 的图按 ATOM benchmark dashboard 的 Throughput vs Latency 图画。两种图都**只画 455-CI 自己测的历史数据**，不画 NVIDIA、MI355、PD 模拟或任何其他来源的数据。
-
-每个模型一张图，存为 `charts/perf-<slug>.png`：周末测完画 MLPerf Endpoint 的 4 张，周中测完画 8K/1K 的 4 张。数据全部取自 `perf.csv`，每次连同本次结果一起重画，不手工改图。
-
-| | MLPerf Endpoint | 8K/1K |
-|---|---|---|
-| y 轴 | 每卡吞吐（输出 tok/s ÷ GPU 数） | Total Tput per GPU（输入加输出 tok/s ÷ GPU 数） |
-| x 轴 | E2E average interactivity (tok/s/user) | Interactive (tok/s/user) = 1000 ÷ mean TPOT (ms) |
-| 连线 | 阶梯线，先向右再向下；最大并发那一端不加向左的短线（`stub: False`） | 点按 x 排序后直接连线 |
-| 标题 | `<模型> · Agentic: Throughput per GPU vs. E2E Average Interactivity` | `<模型> · 8K/1K: Total Tput per GPU vs. Interactive` |
-
-下面这些两种图一样：
-
-- **曲线**：每个镜像一条，点是并发 4 和 64，每个点都标 cN。
-- **画几条**：最近 4 个有数据的镜像，对应色阶的 4 级。更早的留在 `perf.csv` 里。
-- **颜色**：越新越深的红色，从旧到新依次是 `#F5998A`、`#E8452C`、`#C42B4B`、`#9B1C1C`，不足 4 条时取最深的几级。MLPerf Endpoint 的点是菱形（#246），8K/1K 的点是圆点（dashboard）。
-- **线型**：最新的一条（通常就是本次）画实线，其余画虚线。阶梯线的实线水平 4 px、竖直 2.4 px，虚线水平 3 px、竖直 1.8 px；8K/1K 的直线实线 4 px、虚线 3 px。
-- **图例**只写名字和 GPU 数，日期用镜像日期，例如 `AMD MI455 (ATOM main) · 11-14 · 8 GPUs`。MLPerf Endpoint 的图例在图下方（#246），8K/1K 的在图上方（dashboard）。副标题列出这几个镜像的日期，例如 `455-CI · MI455 (gfx1250) · 10-24 → 10-31 → 11-07 → 11-14`，不再写模型名。
-- **本次跑挂**时图上没有本次的曲线，在图内右上角的 note 写 `11-14 image: run failed (N/A), see report.`。
-- **脚注两行**：第一行写数据来源 `AMD MI455: 455-CI runs on ATOM main + aiter main, self-measured, not verified by MLCommons.`；第二行写坐标说明，加上 `cN = concurrency`。
-- 不加放大框、箭头和汇总表。输出 2 倍分辨率的 PNG，2640 px 宽，字体用 #246 里 `fetch_fonts.py` 下载的 Instrument Sans。
-
-### 5.3 精度图
-
-照 ATOM benchmark dashboard 的精度趋势图画。每个场景一张，存为 `charts/accuracy-endpoint.png` 和 `charts/accuracy-8k1k.png`，数据取自 `accuracy.csv`，每次连同本次结果一起重画。
-
-- **形式**：2×2，一格一个模型（该场景的 4 个模型），格子标题写模型名；设了 baseline 的，标题行右侧写 `baseline 0.xxxx`。
-- **x 轴**：最近 12 个镜像的日期（`MM-DD`）。
-- **y 轴**：百分比，上限 100%，下限是最低分减 0.03 后向下取整到 5%，和 dashboard 的算法一样。
-- **线**：flexible-extract 画实线加实心点，strict-match 画同色虚线加空心点，都用深红 `#9B1C1C`（性能图里最新曲线的颜色）。baseline 是灰色虚线。最新的分数标在最后一个点右边。
-- **失败**：那个镜像在 x 轴上画灰色 `×` 并标 N/A；折线和 dashboard 一样跨过它连着画。
-- **标题**：`MLPerf Endpoint models · GSM8K accuracy by image`，8K/1K 同理。图例在图上方。**脚注两行**：数据来源，以及"报告的分数是 flexible-extract，strict-match 只作参考"。
-- 字体和输出规格同性能图：Instrument Sans，2 倍分辨率 PNG，2640 px 宽。
-
-### 5.4 出图
-
-脚本在 `recipes/455-CI/tools/`，用法和样图见那里的 [`README.md`](455-CI/tools/README.md)。需要 Python 3.10 以上和 matplotlib：
+脚本在 `recipes/455-CI/tools/`，需要 Python 3.10 以上和 matplotlib，说明见那里的 [`README.md`](455-CI/tools/README.md)：
 
 ```bash
 cd recipes/455-CI/tools
-python3 fetch_fonts.py                              # 第一次用时下载 Instrument Sans；不下也能画，退回 DejaVu Sans
-python3 make_charts.py --image-date <YYYY-MM-DD>    # 本周镜像的日期；周末测完和周中测完各跑一次
+python3 fetch_fonts.py                              # 第一次用时下载 Instrument Sans；不下也能画
+python3 make_charts.py --image-date <YYYY-MM-DD>    # 本周镜像的日期，写 runs/<YYYYMMDD>/charts/
+python3 make_report.py --image-date <YYYY-MM-DD>    # 写两份报告，并打印 Highlights 草稿
 ```
 
-- 输出到 `runs/<YYYYMMDD>/charts/`：有成功数据的模型各一张 `perf-<slug>.png`，每个场景一张 `accuracy-<scenario>.png`。只画一个场景就加 `--scenario endpoint` 或 `--scenario 8k1k`。
-- `endpoint_chart.py` 和 `fetch_fonts.py` 原样取自 LLM-Booster#246，不要改。CI 自己的逻辑在 `ci455_data.py`（选数据）和 `ci455_charts.py`（画图）。
+- 周末测完和周中测完各跑一次，每次连同历史数据重新生成。
+- 生成后按 §5.1 审一遍 Highlights，再提交。
 - 改了脚本先跑测试：`python3 -m pytest -q recipes/455-CI/tools`。
 
-### 5.5 提交到 455-CI
+### 5.6 提交到 455-CI
 
 ```bash
 git clone --branch 455-CI --single-branch git@github.com:ROCm/ATOM.git atom-455-ci
 cd atom-455-ci
-# 放入 recipes/455-CI/runs/<YYYYMMDD>/，追加 perf.csv 和 accuracy.csv，按 §5.4 出图，
-# 写或更新 reports/455-CI-report-<YYYYMMDD>.md，更新 README.md 的索引
+# 放入 recipes/455-CI/runs/<YYYYMMDD>/，追加 perf.csv 和 accuracy.csv，
+# 按 §5.5 生成图和两份报告，审过 Highlights，更新 README.md 的索引
 git add recipes/455-CI
 git commit -m "[455-CI] gfx1250-atom-ci455-<YYYYMMDD>: MLPerf Endpoint results"    # 周中写 8K/1K results
 git push origin 455-CI

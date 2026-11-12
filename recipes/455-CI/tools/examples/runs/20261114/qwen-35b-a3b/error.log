@@ -1,0 +1,9 @@
+(mock) INFO  [model_runner] capturing CUDA graphs for batch sizes 1..64
+(mock) Traceback (most recent call last):
+(mock)   File "/app/ATOM/atom/model_engine/model_runner.py", line 1234, in capture_cudagraph
+(mock)     self.run_model(dummy_batch)
+(mock)   File "/app/ATOM/atom/model_engine/model_runner.py", line 987, in run_model
+(mock)     hidden = self.model(input_ids, positions)
+(mock) RuntimeError: HIP error: out of memory (mock)
+----- 最后 30 行 -----
+(mock) ERROR [engine_core] EngineCore_DP0 died, shutting down the server

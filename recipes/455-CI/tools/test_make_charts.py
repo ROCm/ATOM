@@ -26,7 +26,7 @@ def perf(image_date, conc, model="kimi-k3", status="ok"):
     }
 
 
-def test_writes_one_perf_chart_per_model_with_data_and_one_accuracy_chart_per_scenario(
+def test_writes_one_perf_trend_and_one_accuracy_chart_per_scenario_with_data(
     tmp_path,
 ):
     write_csv(
@@ -37,12 +37,8 @@ def test_writes_one_perf_chart_per_model_with_data_and_one_accuracy_chart_per_sc
             perf("2026-11-07", 64),
             perf("2026-11-14", 4),
             perf("2026-11-14", 64, status="fail"),
-            perf(
-                "2026-11-14", 4, model="deepseek-r1", status="fail"
-            ),  # no successful point: no chart
-            perf(
-                "2026-11-21", 4, model="qwen-35b-a3b"
-            ),  # after the report image: ignored
+            perf("2026-11-14", 4, model="deepseek-r1", status="fail"),
+            perf("2026-11-21", 4, model="qwen-35b-a3b"),  # after the report image
         ],
     )
     write_csv(
@@ -63,7 +59,7 @@ def test_writes_one_perf_chart_per_model_with_data_and_one_accuracy_chart_per_sc
     out = tmp_path / "runs" / "20261114" / "charts"
     assert sorted(p.name for p in out.iterdir()) == [
         "accuracy-endpoint.png",
-        "perf-kimi-k3.png",
+        "perf-endpoint.png",
     ]
 
 

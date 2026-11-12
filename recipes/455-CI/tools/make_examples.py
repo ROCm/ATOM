@@ -1,23 +1,27 @@
 #!/usr/bin/env python3
-"""Render mock-data previews of the 455-CI charts into ./examples.
+"""Build a mock 455-CI data dir in ./examples and draw its charts and report.
 
-The numbers are made up to show the layout: a weekly gain, two runs that
-failed outright (Kimi-K3 10-31, MiniMax-M3 11-07), one concurrency that
-failed on the newest image (Qwen-35B-A3B c64), a GSM8K drop on the newest
-image (MiniMax-M3) and two baselines. Every chart says MOCK DATA.
+Made-up numbers in the real layout (perf.csv, accuracy.csv, runs/, reports/)
+to preview what a report looks like. On the newest image (11-14):
+DeepSeek-V4.1-Flash gains 6%, GLM-5.2 c64 drops 4%, DeepSeek R1 has slid
+1.5% a week below its best, Kimi-K3 recovers from a failed 11-07,
+Qwen-35B-A3B fails at c64 and MiniMax-M3 loses 4.7 GSM8K points. The charts
+and the report say MOCK DATA.
 """
 
 import csv
 import datetime
+import json
 import os
 import random
 import shutil
-import tempfile
 
 from ci455_data import ACCURACY_COLUMNS, PERF_COLUMNS
 from make_charts import main as make_charts
+from make_report import main as make_report
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+OUT = os.path.join(HERE, "examples")
 IMAGES = [
     "2026-09-26",
     "2026-10-03",
@@ -28,8 +32,9 @@ IMAGES = [
     "2026-11-07",
     "2026-11-14",
 ]
-# model: (GPUs, {concurrency: (x, tok/s per GPU)} on the first image), where x
-# is the E2E interactivity (endpoint) or the mean TPOT in ms (8k1k).
+NEWEST = IMAGES[-1]
+# model: (GPUs, {concurrency: (x, tok/s per GPU)}), where x is the E2E
+# interactivity (endpoint) or the mean TPOT in ms (8k1k).
 ENDPOINT = {
     "deepseek-r1": (4, {4: (150.0, 160.0), 64: (58.0, 1450.0)}),
     "deepseek-v4.1-flash": (4, {4: (210.0, 230.0), 64: (95.0, 2600.0)}),
@@ -52,39 +57,56 @@ GSM8K = {
     "minimax-m3": 0.931,
     "qwen-3.8-flash": 0.893,
 }
-FAILED = {
-    ("kimi-k3", "2026-10-31"): (4, 64),
-    ("minimax-m3", "2026-11-07"): (4, 64),
-    ("qwen-35b-a3b", "2026-11-14"): (64,),
-}
-GSM8K_DROP = {("minimax-m3", "2026-11-14"): -0.047}
+FAILED = {("kimi-k3", "2026-11-07"): {4, 64, "gsm8k"}, ("qwen-35b-a3b", NEWEST): {64}}
 BASELINES = {"kimi-k3": 0.95, "glm-5.2": 0.94}
+ERROR = "RuntimeError: HIP error: out of memory (mock)"
+ERROR_LOG = """\
+(mock) INFO  [model_runner] capturing CUDA graphs for batch sizes 1..64
+(mock) Traceback (most recent call last):
+(mock)   File "/app/ATOM/atom/model_engine/model_runner.py", line 1234, in capture_cudagraph
+(mock)     self.run_model(dummy_batch)
+(mock)   File "/app/ATOM/atom/model_engine/model_runner.py", line 987, in run_model
+(mock)     hidden = self.model(input_ids, positions)
+(mock) RuntimeError: HIP error: out of memory (mock)
+----- 最后 30 行 -----
+(mock) ERROR [engine_core] EngineCore_DP0 died, shutting down the server
+"""
+
+
+def scale(model, conc, image):
+    """Throughput multiplier of a point on an image."""
+    week = IMAGES.index(image)
+    if model == "deepseek-r1":  # flat, then 1.5% down every week
+        return 1.0 if week <= 3 else 1 - 0.015 * (week - 3)
+    m = 1 + 0.004 * week
+    if model == "deepseek-v4.1-flash" and image == NEWEST:
+        m *= 1.06
+    if model == "glm-5.2" and conc == 64 and image == NEWEST:
+        m *= 0.96
+    return m
 
 
 def mock_rows():
     rng = random.Random(455)
     perf, acc = [], []
-    for week, image in enumerate(IMAGES):
+    for image in IMAGES:
         tag = f"rocm/fw-bringup-mlperf:gfx1250-atom-ci455-{image.replace('-', '')}"
         for scenario, table in (("endpoint", ENDPOINT), ("8k1k", EIGHT_K)):
             shift = (
                 0 if scenario == "endpoint" else 4
             )  # 8K/1K runs midweek on the same image
-            test_date = str(
-                datetime.date.fromisoformat(image) + datetime.timedelta(days=shift)
-            )
             common = {
                 "image_date": image,
-                "test_date": test_date,
                 "scenario": scenario,
                 "image": tag,
+                "test_date": str(
+                    datetime.date.fromisoformat(image) + datetime.timedelta(days=shift)
+                ),
                 "atom_branch": "main",
                 "aiter_branch": "main",
             }
             for model, (gpus, base) in table.items():
-                gain = 1 + 0.025 * week + rng.uniform(-0.01, 0.01)
-                speed = 1 + 0.012 * week + rng.uniform(-0.01, 0.01)
-                failed = FAILED.get((model, image), ())
+                failed = FAILED.get((model, image), set())
                 for conc, (x, y) in base.items():
                     row = {
                         **common,
@@ -93,41 +115,32 @@ def mock_rows():
                         "concurrency": str(conc),
                     }
                     if conc in failed:
-                        row.update(
-                            status="fail",
-                            error="RuntimeError: HIP error: out of memory (mock)",
-                        )
-                    elif scenario == "endpoint":
-                        row.update(
-                            status="ok",
-                            tok_s_per_gpu=f"{y * gain:.2f}",
-                            interactivity=f"{x * speed:.2f}",
-                        )
+                        row.update(status="fail", error=ERROR)
                     else:
-                        tpot = x / speed
-                        row.update(
-                            status="ok",
-                            tok_s_per_gpu=f"{y * gain:.2f}",
-                            tpot_mean_ms=f"{tpot:.3f}",
-                            itl_p50_ms=f"{tpot * 0.97:.3f}",
+                        tput = (
+                            y
+                            * scale(model, conc, image)
+                            * (1 + rng.uniform(-0.004, 0.004))
                         )
+                        speed = 1 + rng.uniform(-0.01, 0.01)
+                        row.update(status="ok", tok_s_per_gpu=f"{tput:.2f}")
+                        if scenario == "endpoint":
+                            row["interactivity"] = f"{x * speed:.2f}"
+                        else:
+                            row.update(
+                                tpot_mean_ms=f"{x / speed:.3f}",
+                                itl_p50_ms=f"{x / speed * 0.97:.3f}",
+                            )
                     perf.append(row)
                 row = {**common, "model": model, "num_fewshot": "3"}
-                if set(failed) == set(base):
-                    row.update(
-                        status="fail",
-                        error="RuntimeError: HIP error: out of memory (mock)",
-                    )
+                if "gsm8k" in failed:
+                    row.update(status="fail", error=ERROR)
                 else:
-                    score = (
-                        GSM8K[model]
-                        + rng.uniform(-0.006, 0.006)
-                        + GSM8K_DROP.get((model, image), 0)
-                    )
+                    s = GSM8K[model] + rng.uniform(-0.004, 0.004)
+                    if (model, image) == ("minimax-m3", NEWEST):
+                        s -= 0.047
                     row.update(
-                        status="ok",
-                        gsm8k=f"{score:.4f}",
-                        gsm8k_strict=f"{score - 0.008:.4f}",
+                        status="ok", gsm8k=f"{s:.4f}", gsm8k_strict=f"{s - 0.008:.4f}"
                     )
                 acc.append(row)
     return perf, acc
@@ -140,37 +153,46 @@ def write_csv(path, columns, rows):
         w.writerows(rows)
 
 
-# The charts kept in ./examples: an endpoint chart with a failed image left
-# out, one with a failed concurrency on the newest image, an 8K/1K chart and
-# both accuracy charts. The other models' charts look the same.
-SHOWCASE = (
-    "perf-kimi-k3.png",
-    "perf-qwen-35b-a3b.png",
-    "perf-minimax-m3.png",
-    "accuracy-endpoint.png",
-    "accuracy-8k1k.png",
-)
-
-
 def main():
+    shutil.rmtree(OUT, ignore_errors=True)
+    run = os.path.join(OUT, "runs", NEWEST.replace("-", ""))
+    os.makedirs(os.path.join(run, "qwen-35b-a3b"))
     perf, acc = mock_rows()
-    examples = os.path.join(HERE, "examples")
-    os.makedirs(examples, exist_ok=True)
-    with tempfile.TemporaryDirectory() as data:
-        write_csv(os.path.join(data, "perf.csv"), PERF_COLUMNS, perf)
-        write_csv(os.path.join(data, "accuracy.csv"), ACCURACY_COLUMNS, acc)
-        write_csv(
-            os.path.join(data, "accuracy_baseline.csv"),
-            ("model", "baseline"),
-            [{"model": m, "baseline": str(b)} for m, b in BASELINES.items()],
+    write_csv(os.path.join(OUT, "perf.csv"), PERF_COLUMNS, perf)
+    write_csv(os.path.join(OUT, "accuracy.csv"), ACCURACY_COLUMNS, acc)
+    write_csv(
+        os.path.join(OUT, "accuracy_baseline.csv"),
+        ("model", "baseline"),
+        [{"model": m, "baseline": str(b)} for m, b in BASELINES.items()],
+    )
+    with open(
+        os.path.join(run, "qwen-35b-a3b", "error.log"), "w", encoding="utf-8"
+    ) as f:
+        f.write(ERROR_LOG)
+    with open(os.path.join(run, "image.json"), "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "image": "rocm/fw-bringup-mlperf:gfx1250-atom-ci455-20261114",
+                "digest": "sha256:0000mock",
+                "base_image": "rocm/fw-bringup-mlperf:gfx1250-atom-20261113",
+                "atom": {
+                    "commit": "0" * 40,
+                    "date": "2026-11-14",
+                    "title": "(mock) ATOM main head",
+                },
+                "aiter": {
+                    "commit": "1" * 40,
+                    "date": "2026-11-14",
+                    "title": "(mock) aiter main head",
+                },
+                "dependency_changes": [],
+            },
+            f,
+            ensure_ascii=False,
+            indent=1,
         )
-        out = os.path.join(data, "charts")
-        make_charts(
-            ["--image-date", IMAGES[-1], "--data-dir", data, "--out", out, "--mock"]
-        )
-        for name in SHOWCASE:
-            shutil.copyfile(os.path.join(out, name), os.path.join(examples, name))
-            print("kept", os.path.join(examples, name))
+    make_charts(["--image-date", NEWEST, "--data-dir", OUT, "--mock"])
+    make_report(["--image-date", NEWEST, "--data-dir", OUT, "--mock"])
 
 
 if __name__ == "__main__":

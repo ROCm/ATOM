@@ -1,0 +1,3 @@
+# The repo-wide .gitignore drops *.log; 455-CI keeps each failed case's core error log
+# (runs/<YYYYMMDD>/<slug>/error.log), which the detailed report links to.
+!error.log

@@ -4,38 +4,28 @@
     python3 make_charts.py --image-date 2026-11-14 [--scenario endpoint|8k1k|all]
         [--data-dir recipes/455-CI] [--out recipes/455-CI/runs/20261114/charts] [--mock]
 
-Writes, for every model of the scenario with a successful point up to the
-image, perf-<slug>.png, and per scenario accuracy-<scenario>.png: the files
-the image's report links to. --image-date is the image's (Saturday) date, the
-same for its weekend and midweek runs. An optional accuracy_baseline.csv in
-the data dir (columns model, baseline) adds the dashboard's baseline line.
---mock marks every chart as mock data, for layout previews.
+Writes per scenario perf-<scenario>.png (tok/s per GPU by image) and
+accuracy-<scenario>.png (GSM8K by image): the charts the image's detailed
+report links to. --image-date is the image's (Saturday) date, the same for its
+weekend and midweek runs. An optional accuracy_baseline.csv in the data dir
+(columns model, baseline) adds the dashboard's baseline line. --mock marks
+every chart as mock data, for layout previews.
 """
 
 import argparse
 import os
 
-from ci455_charts import failure_note, render_8k1k, render_accuracy, render_endpoint
-from ci455_data import accuracy_history, failed_concurrencies, perf_curves, read_csv
+from ci455_charts import render_accuracy, render_perf_trends
+from ci455_data import (
+    CONCURRENCIES,
+    LABEL,
+    MODELS,
+    accuracy_history,
+    perf_trend,
+    read_csv,
+)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-
-# The test matrix of 455-CI-guide.md §1: (slug, chart name) per scenario.
-MODELS = {
-    "endpoint": [
-        ("deepseek-r1", "DeepSeek R1"),
-        ("deepseek-v4.1-flash", "DeepSeek-V4.1-Flash"),
-        ("kimi-k3", "Kimi-K3 (2.8T)"),
-        ("qwen-35b-a3b", "Qwen-35B-A3B"),
-    ],
-    "8k1k": [
-        ("deepseek-v4-pro", "DeepSeek-V4-Pro"),
-        ("glm-5.2", "GLM-5.2"),
-        ("minimax-m3", "MiniMax-M3 (428B)"),
-        ("qwen-3.8-flash", "Qwen-3.8 Flash"),
-    ],
-}
-SCENARIO_LABEL = {"endpoint": "MLPerf Endpoint", "8k1k": "8K/1K"}
 
 
 def _rows(path):
@@ -68,42 +58,34 @@ def main(argv=None):
     scenarios = ["endpoint", "8k1k"] if args.scenario == "all" else [args.scenario]
 
     for scenario in scenarios:
-        histories = []
-        for slug, name in MODELS[scenario]:
-            curves = perf_curves(perf, scenario, slug, day)
-            if curves:
-                ran = {
-                    int(r["concurrency"])
-                    for r in perf
-                    if (r["scenario"], r["model"], r["image_date"])
-                    == (scenario, slug, day)
-                }
-                note = failure_note(
-                    day, failed_concurrencies(perf, scenario, slug, day), ran
-                )
-                render = render_endpoint if scenario == "endpoint" else render_8k1k
-                os.makedirs(out, exist_ok=True)
-                render(
-                    curves,
-                    os.path.join(out, f"perf-{slug}.png"),
-                    name,
-                    note=note,
-                    mock=args.mock,
-                )
-            else:
-                print(
-                    f"skip perf-{slug}.png: no successful {scenario} point up to {day}"
-                )
-            histories.append((name, accuracy_history(acc, scenario, slug, day), slug))
-        if any(hist for _, hist, _ in histories):
+        panels = [
+            (f"{name} · c{conc}", perf_trend(perf, scenario, slug, conc, day))
+            for slug, name in MODELS[scenario]
+            for conc in CONCURRENCIES
+        ]
+        if any(trend for _, trend in panels):
+            os.makedirs(out, exist_ok=True)
+            render_perf_trends(
+                panels,
+                os.path.join(out, f"perf-{scenario}.png"),
+                LABEL[scenario],
+                args.mock,
+            )
+        else:
+            print(f"skip perf-{scenario}.png: no {scenario} results up to {day}")
+        histories = [
+            (name, accuracy_history(acc, scenario, slug, day))
+            for slug, name in MODELS[scenario]
+        ]
+        if any(hist for _, hist in histories):
             os.makedirs(out, exist_ok=True)
             render_accuracy(
-                [(name, hist) for name, hist, _ in histories],
+                histories,
                 os.path.join(out, f"accuracy-{scenario}.png"),
-                SCENARIO_LABEL[scenario],
+                LABEL[scenario],
                 baselines={
                     name: baselines[slug]
-                    for name, _, slug in histories
+                    for slug, name in MODELS[scenario]
                     if slug in baselines
                 },
                 mock=args.mock,

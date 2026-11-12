@@ -1,0 +1,16 @@
+{
+ "image": "rocm/fw-bringup-mlperf:gfx1250-atom-ci455-20261114",
+ "digest": "sha256:0000mock",
+ "base_image": "rocm/fw-bringup-mlperf:gfx1250-atom-20261113",
+ "atom": {
+  "commit": "0000000000000000000000000000000000000000",
+  "date": "2026-11-14",
+  "title": "(mock) ATOM main head"
+ },
+ "aiter": {
+  "commit": "1111111111111111111111111111111111111111",
+  "date": "2026-11-14",
+  "title": "(mock) aiter main head"
+ },
+ "dependency_changes": []
+}

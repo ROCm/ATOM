@@ -1,4 +1,4 @@
-"""Pick the rows the 455-CI charts draw from perf.csv and accuracy.csv.
+"""Pick and compare the 455-CI results in perf.csv and accuracy.csv.
 
 Rows are dicts as csv.DictReader yields them, so every value is a string. A
 rerun appends rows: for an image and concurrency (perf) or an image (accuracy)
@@ -8,10 +8,6 @@ string order is date order.
 
 import csv
 from dataclasses import dataclass
-
-# MI455 curve colours from LLM-Booster#246, oldest to newest: the newest
-# curve always takes the deepest red.
-RAMP = ("#F5998A", "#E8452C", "#C42B4B", "#9B1C1C")
 
 # Column order of the two history files (455-CI-guide.md §4.2 and §4.3).
 PERF_COLUMNS = (
@@ -53,20 +49,60 @@ ACCURACY_COLUMNS = (
     "error",
     "note",
 )
+CONCURRENCIES = (4, 64)
+# The second perf metric of a scenario: endpoint E2E interactivity, 8K/1K ITL P50.
+SECOND = {"endpoint": "interactivity", "8k1k": "itl_p50_ms"}
 
 
 @dataclass
-class Point:
-    c: int  # concurrency
-    x: float  # endpoint: E2E avg interactivity; 8k1k: 1000 / mean TPOT (ms)
-    y: float  # tok/s per GPU
+class PerfCell:
+    """One concurrency of one model on the report image, and its history."""
+
+    concurrency: int
+    status: str  # "ok", "fail", or "missing" (no row, or ok without a number)
+    value: float | None  # tok/s per GPU
+    second: float | None  # endpoint: E2E avg interactivity; 8k1k: ITL P50 (ms)
+    prev: (
+        float | None
+    )  # tok/s per GPU on the newest earlier image where this point succeeded
+    prev_second: float | None
+    prev_date: str | None
+    best: float | None  # the highest earlier tok/s per GPU
+    prev_failed: bool  # the point failed on the newest earlier image that ran it
+    error: str
+    gpus: int | None
+
+    @property
+    def delta(self):
+        return _ratio(self.value, self.prev)
+
+    @property
+    def delta_best(self):
+        return _ratio(self.value, self.best)
+
+    @property
+    def delta_second(self):
+        return _ratio(self.second, self.prev_second)
 
 
 @dataclass
-class Curve:
-    image_date: str
-    gpus: int
-    points: list  # Point, sorted by x
+class AccCell:
+    """GSM8K of one model on the report image, and the newest earlier success."""
+
+    status: str  # "ok", "fail", or "missing"
+    value: float | None  # flexible-extract
+    strict: float | None  # strict-match
+    prev: float | None
+    prev_date: str | None
+    prev_failed: bool
+    error: str
+
+    @property
+    def delta(self):
+        """Change in score (0.01 = one point), not a ratio."""
+        if self.value is None or self.prev is None:
+            return None
+        return self.value - self.prev
 
 
 @dataclass
@@ -88,6 +124,12 @@ def _number(text):
         return None
 
 
+def _ratio(now, then):
+    if now is None or not then:
+        return None
+    return now / then - 1
+
+
 def _rows_up_to(rows, scenario, model, report_date):
     return [
         r
@@ -105,44 +147,84 @@ def _last_rows(rows, key):
     return last
 
 
-def perf_curves(rows, scenario, model, report_date, max_images=4):
-    """One curve per image, for the `max_images` newest images up to
-    `report_date` that have at least one successful point."""
+def _usable(row, column="tok_s_per_gpu"):
+    return row["status"] == "ok" and _number(row.get(column)) is not None
+
+
+def perf_cells(rows, scenario, model, report_date, concurrencies=CONCURRENCIES):
+    """A PerfCell per concurrency for the report image."""
     last = _last_rows(
         _rows_up_to(rows, scenario, model, report_date),
         lambda r: (r["image_date"], int(r["concurrency"])),
     )
-    by_image = {}
-    for (image, conc), r in sorted(last.items()):
-        if r["status"] != "ok":
-            continue
-        y = _number(r["tok_s_per_gpu"])
-        if scenario == "8k1k":
-            tpot = _number(r["tpot_mean_ms"])
-            x = 1000 / tpot if tpot else None
+    second = SECOND[scenario]
+    cells = []
+    for conc in concurrencies:
+        now = last.get((report_date, conc))
+        earlier = sorted(d for d, c in last if c == conc and d < report_date)
+        good = [last[(d, conc)] for d in earlier if _usable(last[(d, conc)])]
+        prev = good[-1] if good else None
+        if now is None or (now["status"] == "ok" and not _usable(now)):
+            status = "missing"
         else:
-            x = _number(r["interactivity"])
-        if x is None or y is None:
-            continue
-        curve = by_image.setdefault(image, Curve(image, int(r["gpus"]), []))
-        curve.points.append(Point(conc, x, y))
-    curves = [by_image[d] for d in sorted(by_image)][-max_images:]
-    for curve in curves:
-        curve.points.sort(key=lambda p: p.x)
-    return curves
+            status = "ok" if now["status"] == "ok" else "fail"
+        cells.append(
+            PerfCell(
+                concurrency=conc,
+                status=status,
+                value=_number(now["tok_s_per_gpu"]) if status == "ok" else None,
+                second=_number(now.get(second)) if status == "ok" else None,
+                prev=_number(prev["tok_s_per_gpu"]) if prev else None,
+                prev_second=_number(prev.get(second)) if prev else None,
+                prev_date=prev["image_date"] if prev else None,
+                best=max(_number(r["tok_s_per_gpu"]) for r in good) if good else None,
+                prev_failed=bool(earlier)
+                and last[(earlier[-1], conc)]["status"] != "ok",
+                error=(now or {}).get("error", "") if status == "fail" else "",
+                gpus=(
+                    int(now["gpus"])
+                    if now and now.get("gpus")
+                    else (int(prev["gpus"]) if prev and prev.get("gpus") else None)
+                ),
+            )
+        )
+    return cells
 
 
-def failed_concurrencies(rows, scenario, model, report_date):
-    """Concurrencies whose last row on the report image is not ok."""
+def perf_trend(rows, scenario, model, conc, report_date, max_images=12):
+    """(image date, tok/s per GPU or None) for the `max_images` newest images
+    up to the report image on which the model ran at any concurrency."""
+    mine = _rows_up_to(rows, scenario, model, report_date)
+    last = _last_rows(mine, lambda r: (r["image_date"], int(r["concurrency"])))
+    images = sorted({r["image_date"] for r in mine})[-max_images:]
+    trend = []
+    for d in images:
+        r = last.get((d, conc))
+        trend.append((d, _number(r["tok_s_per_gpu"]) if r and _usable(r) else None))
+    return trend
+
+
+def acc_cell(rows, scenario, model, report_date):
     last = _last_rows(
-        [
-            r
-            for r in _rows_up_to(rows, scenario, model, report_date)
-            if r["image_date"] == report_date
-        ],
-        lambda r: int(r["concurrency"]),
+        _rows_up_to(rows, scenario, model, report_date), lambda r: r["image_date"]
     )
-    return sorted(c for c, r in last.items() if r["status"] != "ok")
+    now = last.get(report_date)
+    earlier = sorted(d for d in last if d < report_date)
+    good = [last[d] for d in earlier if _usable(last[d], "gsm8k")]
+    prev = good[-1] if good else None
+    if now is None or (now["status"] == "ok" and not _usable(now, "gsm8k")):
+        status = "missing"
+    else:
+        status = "ok" if now["status"] == "ok" else "fail"
+    return AccCell(
+        status=status,
+        value=_number(now["gsm8k"]) if status == "ok" else None,
+        strict=_number(now.get("gsm8k_strict")) if status == "ok" else None,
+        prev=_number(prev["gsm8k"]) if prev else None,
+        prev_date=prev["image_date"] if prev else None,
+        prev_failed=bool(earlier) and last[earlier[-1]]["status"] != "ok",
+        error=(now or {}).get("error", "") if status == "fail" else "",
+    )
 
 
 def accuracy_history(rows, scenario, model, report_date, max_images=12):
@@ -165,10 +247,19 @@ def accuracy_history(rows, scenario, model, report_date, max_images=12):
     return hist
 
 
-def curve_styles(n):
-    """(colour, line) for `n` curves, oldest first: the deepest `n` shades of
-    RAMP, and only the newest curve solid."""
-    if n > len(RAMP):
-        raise ValueError(f"at most {len(RAMP)} curves, got {n}")
-    colours = RAMP[len(RAMP) - n :]
-    return [(c, "solid" if i == n - 1 else "dashed") for i, c in enumerate(colours)]
+# The test matrix of 455-CI-guide.md §1: (slug, display name) per scenario.
+MODELS = {
+    "endpoint": [
+        ("deepseek-r1", "DeepSeek R1"),
+        ("deepseek-v4.1-flash", "DeepSeek-V4.1-Flash"),
+        ("kimi-k3", "Kimi-K3 (2.8T)"),
+        ("qwen-35b-a3b", "Qwen-35B-A3B"),
+    ],
+    "8k1k": [
+        ("deepseek-v4-pro", "DeepSeek-V4-Pro"),
+        ("glm-5.2", "GLM-5.2"),
+        ("minimax-m3", "MiniMax-M3 (428B)"),
+        ("qwen-3.8-flash", "Qwen-3.8 Flash"),
+    ],
+}
+LABEL = {"endpoint": "MLPerf Endpoint", "8k1k": "8K/1K"}
