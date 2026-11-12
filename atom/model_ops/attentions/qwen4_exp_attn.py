@@ -551,12 +551,10 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
         super().relocate_state_slots(pairs)
         destinations, sources = [], []
         # The shared pool relocates individual slots, never request groups.
-        for name in ("ple_conv_state", "ple_ngram_state"):
-            state = getattr(self.model_runner, name, None)
-            if state is not None:
-                for src, dst in pairs:
-                    destinations.append(state[dst : dst + 1])
-                    sources.append(state[src : src + 1])
+        for state in self._ple_tensors():
+            for src, dst in pairs:
+                destinations.append(state[dst : dst + 1])
+                sources.append(state[src : src + 1])
         if destinations:
             torch._foreach_copy_(destinations, sources)
 
