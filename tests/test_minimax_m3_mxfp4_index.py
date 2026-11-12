@@ -114,8 +114,9 @@ def _run(
     """One decode step as the attention layer runs it (buffers sized to it by default)."""
     from atom.model_ops.minimax_m3.index_topk import minimax_m3_index_topk_decode
 
-    buffers = buffers or _buffers(len(seq), S, table.shape[1], heads)
-    md = md or _metadata(table, seq, S, *buffers, heads)
+    if md is None:  # a graph capture passes its own: nothing may be allocated inside it
+        buffers = buffers or _buffers(len(seq), S, table.shape[1], heads)
+        md = _metadata(table, seq, S, *buffers, heads)
     with _aiter_allocates_its_scores(allocated):
         return minimax_m3_index_topk_decode(
             q, cache, table, seq, table.shape[1] * 128, TOPK, 0, 1, heads, DIM**-0.5,
