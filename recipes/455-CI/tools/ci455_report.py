@@ -221,20 +221,6 @@ def _perf_delta(c, delta):
     return f"{perf_flag(delta)} {pct(delta)}".strip()
 
 
-def _best_delta(c):
-    """Against the best earlier image: flagged only below the slow-slide line."""
-    if c.status == "fail":
-        return "N/A"
-    if c.value is None:
-        return "—"
-    if c.delta_best is None:
-        return "first"
-    d = round(c.delta_best, 6)
-    if d > 0:
-        return f"{pct(d)} (new best)"
-    return f"{'⚠️ ' if d <= BEST_DRIFT else ''}{pct(d)}"
-
-
 def _acc_value(a):
     return {"ok": score(a.value) if a.value is not None else "—", "fail": "N/A"}.get(
         a.status, "—"
@@ -259,15 +245,23 @@ def _image_short(image):
     return (image or "—").split(":")[-1]
 
 
-def summary_md(date, env, results, pending, detail_name, mock=False):
+def _labels(results):
+    return [
+        LABEL[sc]
+        for sc in ("endpoint", "8k1k")
+        if any(r.scenario == sc for r in results)
+    ]
+
+
+def summary_md(date, env, results, detail_name, mock=False):
     out = [
-        f"# 455-CI report · {date}" + (" · EXAMPLE" if mock else ""),
+        f"# 455-CI report · {date} · {' + '.join(_labels(results))}"
+        + (" · EXAMPLE" if mock else ""),
         "",
         *(EXAMPLE if mock else []),
         (
             f"Image `{_image_short(env.get('image'))}` · ATOM `main@{_sha(env, 'atom')}`"
-            f" · aiter `main@{_sha(env, 'aiter')}` · base `{_image_short(env.get('base_image'))}`"
-            f" · [Detailed report]({detail_name})"
+            f" · aiter `main@{_sha(env, 'aiter')}` · [Detailed report]({detail_name})"
         ),
         "",
         "## Highlights",
@@ -280,13 +274,10 @@ def summary_md(date, env, results, pending, detail_name, mock=False):
         "|---|---|---|---|---|---|",
     ]
     out += ["| " + " | ".join(summary_row(r, date)) + " |" for r in results]
-    out += [
-        f"| {label} models | {label} | pending (midweek) | | | |" for label in pending
-    ]
     return "\n".join(out) + "\n"
 
 
-def _env_rows(env):
+def _env_rows(env, date):
     def commit(repo, url):
         c = env.get(repo) or {}
         sha = c.get("commit") or ""
@@ -298,18 +289,13 @@ def _env_rows(env):
         )
 
     digest = f" (digest `{env['digest']}`)" if env.get("digest") else ""
-    dates = "; ".join(
-        f"{LABEL[s]} {d}" for s, d in (env.get("test_dates") or {}).items()
-    )
     return [
         "| Item | Value |",
         "|---|---|",
         f"| Test image | `{env.get('image') or '—'}`{digest} |",
-        f"| Base image | `{env.get('base_image') or '—'}` |",
         f"| ATOM | {commit('atom', 'ROCm/ATOM')} |",
         f"| aiter | {commit('aiter', 'ROCm/aiter')} |",
-        f"| Dependency changes | {', '.join(env.get('dependency_changes') or []) or 'none'} |",
-        f"| Test dates | {dates or '—'} (Beijing time) |",
+        f"| Test date | {date} |",
     ]
 
 
@@ -319,32 +305,43 @@ SECOND_HEADER = {
 }
 
 
-def detail_md(
-    date, env, results, pending, summary_name, charts_dir, runs_dir, mock=False
-):
-    """`charts_dir` and `runs_dir` are relative to the report's directory."""
+def _vs(cell, text, ref, delta):
+    """A change cell; named by date when its comparison is not the column's."""
+    if delta is not None and cell.prev_date and cell.prev_date != ref:
+        return f"{text} (vs {cell.prev_date})"
+    return text
+
+
+def detail_md(date, env, results, summary_name, charts_dir, runs_dir, mock=False):
+    """`charts_dir` and `runs_dir` are relative to the report's directory.
+    Changes are against the previous session, whose date heads the column; a
+    model whose last success is older says so in its cell."""
     out = [
-        f"# 455-CI detailed report · {date}" + (" · EXAMPLE" if mock else ""),
+        f"# 455-CI detailed report · {date} · {' + '.join(_labels(results))}"
+        + (" · EXAMPLE" if mock else ""),
         "",
         *(EXAMPLE if mock else []),
         f"[← Report]({summary_name})",
         "",
         "## Environment",
         "",
-        *_env_rows(env),
+        *_env_rows(env, date),
     ]
     for scenario in ("endpoint", "8k1k"):
-        label = LABEL[scenario]
-        out += ["", f"## {label}", ""]
-        if label in pending:
-            out.append("Pending (midweek).")
-            continue
         mine = [r for r in results if r.scenario == scenario]
+        if not mine:
+            continue
+        label = LABEL[scenario]
+        ref = max(
+            (c.prev_date for r in mine for c in r.perf if c.prev_date), default=None
+        )
+        vs = f"vs {ref}" if ref else "vs —"
         out += [
-            "### Performance",
             "",
-            f"| Model | GPUs | Concurrency | tok/s/GPU | vs previous | vs best | {SECOND_HEADER[scenario]} | vs previous |",
-            "|---|---|---|---|---|---|---|---|",
+            f"## Performance · {label}",
+            "",
+            f"| Model | GPUs | Concurrency | tok/s/GPU | {vs} | {SECOND_HEADER[scenario]} | {vs} |",
+            "|---|---|---|---|---|---|---|",
         ]
         for r in mine:
             for c in r.perf:
@@ -360,25 +357,33 @@ def detail_md(
                 )
                 out.append(
                     f"| {r.name} | {c.gpus or '—'} | {c.concurrency} | {_perf_value(c)} | "
-                    f"{_perf_delta(c, c.delta)} | {_best_delta(c)} | {sv} | {sd} |"
+                    f"{_vs(c, _perf_delta(c, c.delta), ref, c.delta)} | {sv} | "
+                    f"{_vs(c, sd, ref, c.delta_second)} |"
                 )
+        aref = max((r.acc.prev_date for r in mine if r.acc.prev_date), default=None)
+        avs = f"vs {aref}" if aref else "vs —"
         out += [
             "",
-            "### Accuracy (GSM8K, 3-shot)",
+            f"## Accuracy (GSM8K, 3-shot) · {label}",
             "",
-            "| Model | flexible-extract | strict-match | Previous | vs previous |",
+            f"| Model | flexible-extract | strict-match | {aref or '—'} | {avs} |",
             "|---|---|---|---|---|",
         ]
         for r in mine:
             a = r.acc
             strict = score(a.strict) if a.strict is not None else "—"
-            prev = f"{score(a.prev)} ({a.prev_date})" if a.prev is not None else "—"
+            prev = (
+                "—"
+                if a.prev is None
+                else score(a.prev)
+                + (f" ({a.prev_date})" if a.prev_date != aref else "")
+            )
             out.append(
-                f"| {r.name} | {_acc_value(a)} | {strict} | {prev} | {_acc_delta(a)} |"
+                f"| {r.name} | {_acc_value(a)} | {strict} | {prev} | {_vs(a, _acc_delta(a), aref, a.delta)} |"
             )
         out += [
             "",
-            "### Trends",
+            f"## Trends · {label}",
             "",
             f"![{label} throughput per GPU]({charts_dir}/perf-{scenario}.png)",
             "",

@@ -4,16 +4,16 @@
 
 **目的**：暴露热点模型在 ATOM main + aiter main 上的支持度和覆盖度，也就是能不能跑起来、精度对不对、性能是多少。所以只用 main，依赖也跟着 main 走。跑挂本身就是结果，要如实记录。
 
-**每周一轮，一轮只建一个镜像**，周末和周中的测试都用它：
+**每周两场测试，共用一个镜像**。一场只测 4 个模型，每场出一份报告：
 
-| 时间 | 做什么 |
-|---|---|
-| 周六开测前 | 按 §2 构建本周镜像：取 `gfx1250-atom-<YYYYMMDD>` 系列里最新的一个作 base，装上当时的 ATOM main 和 aiter main，推成 `rocm/fw-bringup-mlperf:gfx1250-atom-ci455-<周六日期>` |
-| 周末（周六起） | 用本周镜像按 §3 测 MLPerf Endpoint 的 4 个模型，每个模型先测 GSM8K 精度、再测性能；按 §4 记录，按 §5 写本周报告，提交到 `455-CI` 分支 |
-| 周中 | 不重建镜像，用同一个本周镜像测 8K/1K 的 4 个模型，同样先精度后性能；记录，补全本周报告，提交 |
+| 场次 | 时间 | 机器 | 测什么 | 镜像 |
+|---|---|---|---|---|
+| 周末验证 | 每周六 10:30–22:30，12 小时 | 2 个节点：e15-06、e15-07 | MLPerf Endpoint 的 4 个模型 | 开测前按 §2 构建本周镜像：取 `gfx1250-atom-<YYYYMMDD>` 系列里最新的一个作 base，装上当时的 ATOM main 和 aiter main，推成 `rocm/fw-bringup-mlperf:gfx1250-atom-ci455-<周六日期>` |
+| 周中验证 | 每周三 17:30–22:30，5 小时 | 1 个节点：e15-09 | 8K/1K 的 4 个模型 | 不构建，复用上一个周六的镜像（§2.5） |
 
-- 跑挂了就记下核心 error log，接着测下一个模型。
-- 同一个镜像测出的所有结果都归在这个镜像名下：一个镜像一份报告 `455-CI-report-<YYYYMMDD>.md`（Highlights 和总表，给老板看）和一份详细报告，历史数据都留在 `455-CI` 分支的 `recipes/455-CI/` 里（§4.4）。
+- 每场按 §3 逐个模型测，每个模型先测 GSM8K 精度、再测性能。跑挂了就记下核心 error log，接着测下一个模型。
+- 每场测完按 §4 记录，按 §5 出本场的报告：`455-CI-report-<场次日期>.md`（Highlights 和总表，给老板看）和一份详细报告，提交到 `455-CI` 分支。历史数据都留在 `recipes/455-CI/` 里（§4.4）。
+- 只有周六构建镜像。周六构建失败时，这一周的两场都记 N/A（§2.1）。
 
 **前置条件**：
 
@@ -28,16 +28,16 @@
 
 ## 1. 测试矩阵
 
-| 时间 | 场景 | 模型 | slug | 规模 | GPU 数 | 并发 | 时长 |
+| 场次 | 场景 | 模型 | slug | 规模 | GPU 数 | 并发 | 时长 |
 |---|---|---|---|---|---|---|---|
-| 周末 | MLPerf Endpoint | DeepSeek R1 | `deepseek-r1` | 1 tray x 1P4G | 4 | 64、4 | 10 min |
-| 周末 | MLPerf Endpoint | DeepSeek-V4.1-Flash | `deepseek-v4.1-flash` | 1 tray x 1P4G | 4 | 64、4 | 10 min |
-| 周末 | MLPerf Endpoint | Kimi-K3 (2.8T) | `kimi-k3` | 2 node, 2 tray x 1P4G | 8 | 64、4 | 10 min |
-| 周末 | MLPerf Endpoint | Qwen-35B-A3B | `qwen-35b-a3b` | 1 card | 1 | 64、4 | 10 min |
-| 周中 | 8K/1K | DeepSeek-V4-Pro | `deepseek-v4-pro` | 1 tray x 1P4G | 4 | 64、4 | — |
-| 周中 | 8K/1K | GLM-5.2 | `glm-5.2` | 1 tray x 1P4G | 4 | 64、4 | — |
-| 周中 | 8K/1K | MiniMax-M3 (428B) | `minimax-m3` | 1 tray x 1P4G | 4 | 64、4 | — |
-| 周中 | 8K/1K | Qwen-3.8 Flash | `qwen-3.8-flash` | 1 card | 1 | 64、4 | — |
+| 周六 | MLPerf Endpoint | DeepSeek R1 | `deepseek-r1` | 1 tray x 1P4G | 4 | 64、4 | 10 min |
+| 周六 | MLPerf Endpoint | DeepSeek-V4.1-Flash | `deepseek-v4.1-flash` | 1 tray x 1P4G | 4 | 64、4 | 10 min |
+| 周六 | MLPerf Endpoint | Kimi-K3 (2.8T) | `kimi-k3` | 2 node, 2 tray x 1P4G | 8 | 64、4 | 10 min |
+| 周六 | MLPerf Endpoint | Qwen-35B-A3B | `qwen-35b-a3b` | 1 card | 1 | 64、4 | 10 min |
+| 周三 | 8K/1K | DeepSeek-V4-Pro | `deepseek-v4-pro` | 1 tray x 1P4G | 4 | 64、4 | — |
+| 周三 | 8K/1K | GLM-5.2 | `glm-5.2` | 1 tray x 1P4G | 4 | 64、4 | — |
+| 周三 | 8K/1K | MiniMax-M3 (428B) | `minimax-m3` | 1 tray x 1P4G | 4 | 64、4 | — |
+| 周三 | 8K/1K | Qwen-3.8 Flash | `qwen-3.8-flash` | 1 card | 1 | 64、4 | — |
 
 - **GPU 数**是每卡吞吐的分母：1 tray x 1P4G 为 4 张，2 tray 为 8 张，1 card 为 1 张。
 - **slug** 用作目录名，以及 `perf.csv`、`accuracy.csv` 的 `model` 列。定下来就不要改，否则新旧数据对不上。
@@ -48,11 +48,11 @@
 
 ### 2.1 规则
 
-- **每周只建一次**：周六开测前建，周中的 8K/1K 直接用它（§2.5），不重建。
+- **每周只建一次**：周六开测前建，周三那场直接用它（§2.5），不构建。
 - **base 取 `gfx1250-atom-<YYYYMMDD>` 系列里最新的一个**：只看不带后缀的纯日期 tag，也就是大家每天出的 bring-up 镜像，例如 `gfx1250-atom-20261111`。最新的那个 pull 不下来或明显有问题时，往前取一个，并在报告里写明。base 每周都会变，周与周之间的差异也可能来自 base（ROCm、torch、triton、mori 等），所以报告里要写出 base。
 - **只重装 ATOM 和 aiter，且只用 `ROCm/ATOM` 和 `ROCm/aiter` 的 `main`。** 不 checkout 私有分支或 PR，不 cherry-pick，不打 patch。base 里自带的补丁（如 `/app/endpoints-recipe-*/patches`）也不用。
-- **其他组件保持 base 原样**（torch、triton、mori 等），只有 ATOM / aiter main 自己锁定版本的依赖跟着 main 走。例如 aiter main 锁定 `flydsl==0.5.0`，base 里的版本不同时，安装会把它换掉。这正是本 CI 要暴露的状态：不要手动换回，把变化写进报告的"依赖变化"。
-- **构建失败**（clone、安装或 import 不通过）时，本周两个场景的所有模型都记 N/A，error 写构建的核心报错。周中不另建镜像，要补建先和负责人确认。不要改用私有分支凑合。
+- **其他组件保持 base 原样**（torch、triton、mori 等），只有 ATOM / aiter main 自己锁定版本的依赖跟着 main 走。例如 aiter main 锁定 `flydsl==0.5.0`，base 里的版本不同时，安装会把它换掉。这正是本 CI 要暴露的状态：不要手动换回，把变化记进 `image.json` 的 `dependency_changes`（§2.4）。
+- **构建失败**（clone、安装或 import 不通过）时，这一周两场的所有模型都记 N/A，error 写构建的核心报错。周三不另建镜像，要补建先和负责人确认。不要改用私有分支凑合。
 
 ### 2.2 选 base、命名和同名检查
 
@@ -150,7 +150,7 @@ python3 -m pip show atom amd-aiter | grep -E '^(Name|Version|Editable project lo
 python3 -c 'import atom, aiter; print("import ok")'
 
 python3 -m pip list 2>/dev/null | grep -E "$PKGS" > /tmp/pkgs.after
-diff /tmp/pkgs.before /tmp/pkgs.after    # 依赖变化，抄进报告
+diff /tmp/pkgs.before /tmp/pkgs.after    # 依赖变化，记进 image.json（§2.4）
 rm -rf /root/.cache/atom/* /root/.cache/pip
 exit
 ```
@@ -196,15 +196,15 @@ docker rm -f ci455-build-${DATE}
 
 ### 2.5 测试机使用本周镜像
 
-周末和周中的所有测试机，包括 Kimi-K3 的两个节点，都 pull 同一个本周镜像。周中不重建、不重推，开测前先核对用的是本周镜像：
+周六的两个节点（e15-06、e15-07，Kimi-K3 两个都用）和周三的 e15-09 都 pull 同一个本周镜像。周三不构建、不推送，直接用上一个周六推的那个，开测前先核对：
 
 ```bash
-NEW_IMAGE=rocm/fw-bringup-mlperf:gfx1250-atom-ci455-<本周六日期>    # README 索引第一行的镜像
+NEW_IMAGE=rocm/fw-bringup-mlperf:gfx1250-atom-ci455-<本周六日期>    # 上一个周六推的镜像
 docker buildx imagetools inspect "$NEW_IMAGE" --format '{{json .Image.Config.Labels}}' | tr ',' '\n' | grep ci455
 docker pull "$NEW_IMAGE"
 ```
 
-能看到 `com.amd.ci455.*` 这几个 label，而且 commit 和本周报告里写的一致，才开测。周六构建失败、没有本周镜像时，8K/1K 也记 N/A，原因同周六的构建失败。
+能看到 `com.amd.ci455.*` 这几个 label，而且 commit 和周六那场报告里写的一致，才开测。周六构建失败、没有本周镜像时，周三这场也记 N/A，原因同周六的构建失败。
 
 ## 3. 跑测试
 
@@ -359,12 +359,12 @@ CI 只负责记录。要查根因就另开任务，从 ATOM 的 `/debug-guide` �
 
 ### 4.2 perf.csv
 
-每个模型的每个并发，每次测试写一行。失败也写，数字留空。只追加不修改；历史行要更正时单独提一个 commit，并在 message 里写明原因。同一个镜像上重跑同一个模型时追加新行，`note` 写"重跑"，报告和画图取这个镜像上最后一次的结果。
+每个模型的每个并发，每次测试写一行。失败也写，数字留空。只追加不修改；历史行要更正时单独提一个 commit，并在 message 里写明原因。同一场（同一天）重跑同一个模型时追加新行，`note` 写"重跑"，报告和画图取这一场最后一次的结果。
 
 | 列 | 内容 |
 |---|---|
-| `image_date` | 本周镜像的日期（周六），`YYYY-MM-DD`。同一个镜像的两个场景共用，是报告和图的单位 |
-| `test_date` | 实际测试日期（北京时间），`YYYY-MM-DD` |
+| `image_date` | 所用镜像的日期，也就是构建它的那个周六，`YYYY-MM-DD`。只用来追溯镜像 |
+| `test_date` | 场次日期（周六或周三，北京时间），`YYYY-MM-DD`。报告、对比和画图都以场次为单位 |
 | `scenario` | `endpoint` 或 `8k1k` |
 | `model` | §1 的 slug |
 | `gpus` | 每卡吞吐的分母 |
@@ -412,18 +412,18 @@ recipes/
 ├── 455-CI-guide.md        本文件
 ├── 455-CI-recipe.md       各模型的命令
 └── 455-CI/
-    ├── README.md          报告索引，一个镜像一行，最新的在最上面
+    ├── README.md          报告索引，一场一行，最新的在最上面
     ├── perf.csv           全部历史性能
     ├── accuracy.csv       全部历史 GSM8K 精度
     ├── accuracy_baseline.csv   可选：精度图上的 baseline 参考线
     ├── tools/             生成图和报告的脚本、样例（§5.5）
-    ├── reports/           一个镜像两份，YYYYMMDD 是镜像日期
+    ├── reports/           一场两份，YYYYMMDD 是场次日期
     │   ├── 455-CI-report-<YYYYMMDD>.md          报告：Highlights 和总表
     │   └── 455-CI-report-<YYYYMMDD>-detail.md   详细报告
-    └── runs/<YYYYMMDD>/   这个镜像的原始结果和图
-        ├── image.json     本周镜像的信息（§2.4）
-        ├── charts/        perf-endpoint.png、perf-8k1k.png、accuracy-endpoint.png、accuracy-8k1k.png
-        └── <slug>/        两个场景的模型不重名，放在同一层
+    └── runs/<YYYYMMDD>/   一场一个目录：本场的原始结果和图
+        ├── image.json     只在周六的目录里：本周镜像的信息（§2.4）
+        ├── charts/        perf-<scenario>.png、accuracy-<scenario>.png
+        └── <slug>/        本场每个模型一个目录
             ├── server_cmd.sh  gsm8k_cmd.sh  bench_cmd.sh
             ├── gsm8k/         lm_eval 的 results_*.json
             ├── c4/  c64/      性能结果文件
@@ -451,7 +451,7 @@ recipes/
 | `455-CI-report-<YYYYMMDD>.md` | 老板 | Highlights 和总表 |
 | `455-CI-report-<YYYYMMDD>-detail.md` | 要看细节的人 | 测试环境、全部数字、趋势图、跑挂 case 的核心 error log |
 
-周末测完生成一次，8K/1K 那一行写 `pending (midweek)`；周中测完再生成一次，覆盖同名文件。两份报告和图都用 §5.5 的脚本从 `perf.csv`、`accuracy.csv` 生成，不手填数字。样例见 [`455-CI/tools/examples/reports/`](455-CI/tools/examples/reports/)，那是 EXAMPLE（示例）：数字都是编的，不是真实测试数据。
+每场测完生成本场的两份报告，文件名用场次日期，例如周六 `455-CI-report-20261114.md`、周三 `455-CI-report-20261118.md`。两份报告和图都用 §5.5 的脚本从 `perf.csv`、`accuracy.csv` 生成，不手填数字。样例见 [`455-CI/tools/examples/reports/`](455-CI/tools/examples/reports/)，那是 EXAMPLE（示例）：数字都是编的，不是真实测试数据。
 
 ### 5.1 Highlights
 
@@ -474,49 +474,49 @@ recipes/
 
 ### 5.2 报告：Highlights 和总表
 
-格式如下（数字是编的）：
+格式如下（周六那场，数字是编的）：
 
 ```markdown
-# 455-CI report · <YYYY-MM-DD>
+# 455-CI report · <YYYY-MM-DD> · MLPerf Endpoint
 
-Image `gfx1250-atom-ci455-<YYYYMMDD>` · ATOM `main@<sha 前 9 位>` · aiter `main@<sha 前 9 位>` · base `gfx1250-atom-<YYYYMMDD>` · [Detailed report](455-CI-report-<YYYYMMDD>-detail.md)
+Image `gfx1250-atom-ci455-<YYYYMMDD>` · ATOM `main@<sha 前 9 位>` · aiter `main@<sha 前 9 位>` · [Detailed report](455-CI-report-<YYYYMMDD>-detail.md)
 
 ## Highlights
 
 - ❌ Qwen-35B-A3B: c64 failed (RuntimeError: HIP error: out of memory).
-- ⚠️ MiniMax-M3: GSM8K down 4.6 points to 88.1%.
 - 🟢 DeepSeek-V4.1-Flash: throughput up 6.9%.
+- ✅ Kimi-K3: recovered from the previous failure.
 
 ## Summary
 
 | Model | Scenario | Previous (tok/s/GPU) | Current (tok/s/GPU) | Change | GSM8K change |
 |---|---|---|---|---|---|
 | DeepSeek-V4.1-Flash | MLPerf Endpoint | 2,655 (2026-11-07) | 2,838 (2026-11-14) | 🟢 +6.9% | −0.2 pts (now 93.9%) |
+| Kimi-K3 (2.8T) | MLPerf Endpoint | 336 (2026-10-31) | 340 (2026-11-14) | +1.0% | −0.1 pts (now 96.1%) |
 | Qwen-35B-A3B | MLPerf Endpoint | 6,345 (2026-11-07) | N/A (2026-11-14) | N/A | −0.1 pts (now 90.1%) |
-| MiniMax-M3 (428B) | 8K/1K | 16,145 (2026-11-07) | 16,287 (2026-11-14) | +0.9% | ⚠️ −4.6 pts (now 88.1%) |
 ```
 
 - 一个模型一行，依次是 Model、Scenario、Previous、Current、Change、GSM8K change。表格下面不加说明文字。
-- Previous 和 Current 是并发 64 的每卡吞吐（口径见 §4.1：endpoint 是输出 token，8K/1K 是输入加输出 token），括号里是镜像日期。Previous 取该模型最近一次成功的镜像，所以不一定是上周（比如上周跑挂了）。
+- Previous 和 Current 是并发 64 的每卡吞吐（口径见 §4.1：endpoint 是输出 token，8K/1K 是输入加输出 token），括号里是场次日期。Previous 取该模型最近一次成功的那一场，所以不一定是上一场：例子里 Kimi-K3 上一场（11-07）跑挂了，就和 10-31 那场比。
 - GSM8K change 写掉了多少、现在多少，例如 `−4.6 pts (now 88.1%)`。
-- N/A 表示跑挂、没有值；— 表示没有结果；first 表示第一次有数据，没有可比的。还没测的场景写一行 `pending (midweek)`。
+- N/A 表示跑挂、没有值；— 表示没有结果；first 表示第一次有数据，没有可比的。
 
 ### 5.3 详细报告
 
 依次是以下几节，全部英文：
 
-1. **Environment**：测试 image 和 digest、base image、ATOM 和 aiter 的 branch 与 commit（带 commit 日期和标题）、依赖变化、两个场景的测试日期。取自 `runs/<YYYYMMDD>/image.json`（§2.4），缺的项从 CSV 里补。
-2. **Performance**（每个场景一张表）：每个模型每个并发一行，列出 tok/s/GPU、vs previous、vs best（低 5% 及以上标 ⚠️，创新高标 new best），以及第二指标（endpoint 是 E2E avg interactivity，8K/1K 是 ITL P50）和它的 vs previous。
-3. **Accuracy**（每个场景一张表）：flexible-extract、strict-match、Previous（带日期）、vs previous。
-4. **Trends**：每个场景两张图，见 §5.4。
+1. **Environment**：测试 image 和 digest、ATOM 和 aiter 的 branch 与 commit（带 commit 日期和标题）、测试日期。镜像信息取自构建它的那个周六目录里的 `image.json`（§2.4），缺的项从 CSV 里补。
+2. **Performance**：每个模型每个并发一行，列出 tok/s/GPU 和第二指标（endpoint 是 E2E avg interactivity，8K/1K 是 ITL P50），以及各自和上一场比的变化。变化列的表头写上一场的日期，例如 `vs 2026-11-07`；某个模型上一场跑挂了，就和它最近一次成功的那场比，并在格子里注明，例如 `+1.0% (vs 2026-10-31)`。
+3. **Accuracy**：flexible-extract、strict-match、上一场的分数（表头写日期）和变化，写法同上。
+4. **Trends**：两张趋势图，见 §5.4。
 5. **Failures**：每个跑挂的 case 一小节，写一句话报错、`error.log` 的链接，以及核心 error log 段落（`error.log` 的前 60 行，§3.4 摘出来的那份）。
 
 ### 5.4 趋势图
 
-只跑两个并发，画成帕累托图只是一条线段或一个直角，看不出变化，所以按镜像画趋势。每个场景两张，存在 `runs/<YYYYMMDD>/charts/`：
+只跑两个并发，画成帕累托图只是一条线段或一个直角，看不出变化，所以按场次画趋势。每场两张，存在 `runs/<YYYYMMDD>/charts/`：
 
-- **`perf-<scenario>.png`**：每卡吞吐随镜像的变化，一个模型一个并发一格，左 c4、右 c64，最近 12 个镜像。每格右上角写最新值和对比上次的百分比；跑挂的镜像在 x 轴上画灰色 `×` 并标 N/A。
-- **`accuracy-<scenario>.png`**：照 ATOM benchmark dashboard 的精度趋势图，一个模型一格，最近 12 个镜像。flexible-extract 实线，strict-match 虚线；baseline 是灰色虚线，在 `accuracy_baseline.csv` 里设了才画，数值写在格子标题行右侧；最新分数标在最后一个点右边。
+- **`perf-<scenario>.png`**：每卡吞吐随场次的变化，一个模型一个并发一格，左 c4、右 c64，最近 12 场。每格右上角写最新值和对比上次的百分比；跑挂的那场在 x 轴上画灰色 `×` 并标 N/A。
+- **`accuracy-<scenario>.png`**：照 ATOM benchmark dashboard 的精度趋势图，一个模型一格，最近 12 场。flexible-extract 实线，strict-match 虚线；baseline 是灰色虚线，在 `accuracy_baseline.csv` 里设了才画，数值写在格子标题行右侧；最新分数标在最后一个点右边。
 - 两张图都用 dashboard 的浅色样式和深红 `#9B1C1C`，字体 Instrument Sans，2 倍分辨率 PNG，2640 px 宽。图里文字用英文，脚注两行写数据来源和口径。
 
 ### 5.5 生成图和报告
@@ -526,11 +526,11 @@ Image `gfx1250-atom-ci455-<YYYYMMDD>` · ATOM `main@<sha 前 9 位>` · aiter `m
 ```bash
 cd recipes/455-CI/tools
 python3 fetch_fonts.py                              # 第一次用时下载 Instrument Sans；不下也能画
-python3 make_charts.py --image-date <YYYY-MM-DD>    # 本周镜像的日期，写 runs/<YYYYMMDD>/charts/
-python3 make_report.py --image-date <YYYY-MM-DD>    # 写两份报告，并打印 Highlights 草稿
+python3 make_charts.py --date <YYYY-MM-DD>          # 场次日期（周六或周三），写 runs/<YYYYMMDD>/charts/
+python3 make_report.py --date <YYYY-MM-DD>          # 写本场的两份报告，并打印 Highlights 草稿
 ```
 
-- 周末测完和周中测完各跑一次，每次连同历史数据重新生成。
+- 每场测完跑一次，连同历史数据重新生成。
 - 生成后按 §5.1 审一遍 Highlights，再提交。
 - 改了脚本先跑测试：`python3 -m pytest -q recipes/455-CI/tools`。
 
@@ -542,19 +542,19 @@ cd atom-455-ci
 # 放入 recipes/455-CI/runs/<YYYYMMDD>/，追加 perf.csv 和 accuracy.csv，
 # 按 §5.5 生成图和两份报告，审过 Highlights，更新 README.md 的索引
 git add recipes/455-CI
-git commit -m "[455-CI] gfx1250-atom-ci455-<YYYYMMDD>: MLPerf Endpoint results"    # 周中写 8K/1K results
+git commit -m "[455-CI] <YYYY-MM-DD> MLPerf Endpoint results"    # 周三写 8K/1K results
 git push origin 455-CI
 ```
 
-- 每个场景测完提交一次：周末一次，周中一次。commit message 不加 `Co-Authored-By` trailer，这是 ROCm/ATOM 维护者的要求。
+- 每场测完提交一次：周六一次，周三一次。commit message 不加 `Co-Authored-By` trailer，这是 ROCm/ATOM 维护者的要求。
 - 不 force push，不改写历史。push 被拒就先 `git pull --rebase`，再推。
 
-`recipes/455-CI/README.md` 的索引表一个镜像一行。周末测完在最上面加一行，周中测完更新同一行的 8K/1K 列：
+`recipes/455-CI/README.md` 的索引表一场一行，每场测完在最上面加一行：
 
 ```markdown
-| 报告 | 镜像 | base | ATOM / aiter | MLPerf Endpoint | 8K/1K |
-|---|---|---|---|---|---|
-| [<YYYY-MM-DD>](reports/455-CI-report-<YYYYMMDD>.md) | `gfx1250-atom-ci455-<YYYYMMDD>` | `gfx1250-atom-<YYYYMMDD>` | `<sha 前 9 位>` / `<sha 前 9 位>` | 例：3/4 跑通，Kimi-K3 失败；⚠️ 1 项 | 待测（周中） |
+| 报告 | 场景 | 镜像 | ATOM / aiter | 结果 |
+|---|---|---|---|---|
+| [<YYYY-MM-DD>](reports/455-CI-report-<YYYYMMDD>.md) | MLPerf Endpoint | `gfx1250-atom-ci455-<YYYYMMDD>` | `<sha 前 9 位>` / `<sha 前 9 位>` | 例：3/4 跑通，❌ 1 项，⚠️ 1 项 |
 ```
 
 ## 6. 待补充

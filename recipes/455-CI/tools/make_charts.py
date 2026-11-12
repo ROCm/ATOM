@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Draw the 455-CI charts of one image from perf.csv and accuracy.csv.
+"""Draw the 455-CI charts of one session from perf.csv and accuracy.csv.
 
-    python3 make_charts.py --image-date 2026-11-14 [--scenario endpoint|8k1k|all]
-        [--data-dir recipes/455-CI] [--out recipes/455-CI/runs/20261114/charts] [--mock]
+    python3 make_charts.py --date 2026-11-18 [--scenario endpoint|8k1k]
+        [--data-dir recipes/455-CI] [--out recipes/455-CI/runs/20261118/charts] [--mock]
 
-Writes per scenario perf-<scenario>.png (tok/s per GPU by image) and
-accuracy-<scenario>.png (GSM8K by image): the charts the image's detailed
-report links to. --image-date is the image's (Saturday) date, the same for its
-weekend and midweek runs. An optional accuracy_baseline.csv in the data dir
-(columns model, baseline) adds the dashboard's baseline line. --mock marks
-every chart as mock data, for layout previews.
+A session is one day's run (Saturday: MLPerf Endpoint, Wednesday: 8K/1K).
+Writes, for the scenario run that day, perf-<scenario>.png (tok/s per GPU by
+session) and accuracy-<scenario>.png (GSM8K by session): the charts the
+session's detailed report links to. An optional accuracy_baseline.csv in the
+data dir (columns model, baseline) adds the dashboard's baseline line. --mock
+marks every chart as an example.
 """
 
 import argparse
@@ -34,18 +34,20 @@ def _rows(path):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--image-date", required=True, help="image date, YYYY-MM-DD")
-    ap.add_argument("--scenario", choices=["endpoint", "8k1k", "all"], default="all")
+    ap.add_argument("--date", required=True, help="session (test) date, YYYY-MM-DD")
+    ap.add_argument(
+        "--scenario", choices=["endpoint", "8k1k"], help="default: what ran that day"
+    )
     ap.add_argument(
         "--data-dir",
         default=os.path.dirname(HERE),
         help="dir of perf.csv / accuracy.csv",
     )
     ap.add_argument("--out", help="default: <data-dir>/runs/<YYYYMMDD>/charts")
-    ap.add_argument("--mock", action="store_true", help="mark the charts as mock data")
+    ap.add_argument("--mock", action="store_true", help="mark the charts as an example")
     args = ap.parse_args(argv)
 
-    day = args.image_date
+    day = args.date
     out = args.out or os.path.join(
         args.data_dir, "runs", day.replace("-", ""), "charts"
     )
@@ -55,7 +57,16 @@ def main(argv=None):
         r["model"]: float(r["baseline"])
         for r in _rows(os.path.join(args.data_dir, "accuracy_baseline.csv"))
     }
-    scenarios = ["endpoint", "8k1k"] if args.scenario == "all" else [args.scenario]
+    if args.scenario:
+        scenarios = [args.scenario]
+    else:
+        scenarios = [
+            s
+            for s in MODELS
+            if any(r["scenario"] == s and r["test_date"] == day for r in perf + acc)
+        ]
+    if not scenarios:
+        print(f"no session on {day}: nothing to draw")
 
     for scenario in scenarios:
         panels = [

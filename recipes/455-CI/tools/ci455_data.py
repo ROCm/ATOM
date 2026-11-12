@@ -1,9 +1,13 @@
 """Pick and compare the 455-CI results in perf.csv and accuracy.csv.
 
+A session is one day's run of one scenario: Saturday runs MLPerf Endpoint on
+the image built that morning, Wednesday runs 8K/1K on the previous Saturday's
+image. Sessions are keyed by their test date (ISO, so string order is date
+order); the image_date column only records which image a session used.
+
 Rows are dicts as csv.DictReader yields them, so every value is a string. A
-rerun appends rows: for an image and concurrency (perf) or an image (accuracy)
-the last row in file order wins. Images are keyed by their ISO date, so
-string order is date order.
+rerun appends rows: for a session and concurrency (perf) or a session
+(accuracy) the last row in file order wins.
 """
 
 import csv
@@ -56,7 +60,7 @@ SECOND = {"endpoint": "interactivity", "8k1k": "itl_p50_ms"}
 
 @dataclass
 class PerfCell:
-    """One concurrency of one model on the report image, and its history."""
+    """One concurrency of one model in the session, and its history."""
 
     concurrency: int
     status: str  # "ok", "fail", or "missing" (no row, or ok without a number)
@@ -64,11 +68,11 @@ class PerfCell:
     second: float | None  # endpoint: E2E avg interactivity; 8k1k: ITL P50 (ms)
     prev: (
         float | None
-    )  # tok/s per GPU on the newest earlier image where this point succeeded
+    )  # tok/s per GPU in the newest earlier session where this point succeeded
     prev_second: float | None
     prev_date: str | None
-    best: float | None  # the highest earlier tok/s per GPU
-    prev_failed: bool  # the point failed on the newest earlier image that ran it
+    best: float | None  # the highest tok/s per GPU of any earlier session
+    prev_failed: bool  # the point failed in the newest earlier session that ran it
     error: str
     gpus: int | None
 
@@ -87,7 +91,7 @@ class PerfCell:
 
 @dataclass
 class AccCell:
-    """GSM8K of one model on the report image, and the newest earlier success."""
+    """GSM8K of one model in the session, and the newest earlier success."""
 
     status: str  # "ok", "fail", or "missing"
     value: float | None  # flexible-extract
@@ -107,7 +111,7 @@ class AccCell:
 
 @dataclass
 class AccuracyPoint:
-    image_date: str
+    date: str  # session (test) date
     flexible: float | None  # None when the run failed
     strict: float | None
 
@@ -130,13 +134,11 @@ def _ratio(now, then):
     return now / then - 1
 
 
-def _rows_up_to(rows, scenario, model, report_date):
+def _rows_up_to(rows, scenario, model, date):
     return [
         r
         for r in rows
-        if r["scenario"] == scenario
-        and r["model"] == model
-        and r["image_date"] <= report_date
+        if r["scenario"] == scenario and r["model"] == model and r["test_date"] <= date
     ]
 
 
@@ -151,17 +153,17 @@ def _usable(row, column="tok_s_per_gpu"):
     return row["status"] == "ok" and _number(row.get(column)) is not None
 
 
-def perf_cells(rows, scenario, model, report_date, concurrencies=CONCURRENCIES):
-    """A PerfCell per concurrency for the report image."""
+def perf_cells(rows, scenario, model, date, concurrencies=CONCURRENCIES):
+    """A PerfCell per concurrency for the session on `date`."""
     last = _last_rows(
-        _rows_up_to(rows, scenario, model, report_date),
-        lambda r: (r["image_date"], int(r["concurrency"])),
+        _rows_up_to(rows, scenario, model, date),
+        lambda r: (r["test_date"], int(r["concurrency"])),
     )
     second = SECOND[scenario]
     cells = []
     for conc in concurrencies:
-        now = last.get((report_date, conc))
-        earlier = sorted(d for d, c in last if c == conc and d < report_date)
+        now = last.get((date, conc))
+        earlier = sorted(d for d, c in last if c == conc and d < date)
         good = [last[(d, conc)] for d in earlier if _usable(last[(d, conc)])]
         prev = good[-1] if good else None
         if now is None or (now["status"] == "ok" and not _usable(now)):
@@ -176,7 +178,7 @@ def perf_cells(rows, scenario, model, report_date, concurrencies=CONCURRENCIES):
                 second=_number(now.get(second)) if status == "ok" else None,
                 prev=_number(prev["tok_s_per_gpu"]) if prev else None,
                 prev_second=_number(prev.get(second)) if prev else None,
-                prev_date=prev["image_date"] if prev else None,
+                prev_date=prev["test_date"] if prev else None,
                 best=max(_number(r["tok_s_per_gpu"]) for r in good) if good else None,
                 prev_failed=bool(earlier)
                 and last[(earlier[-1], conc)]["status"] != "ok",
@@ -191,25 +193,25 @@ def perf_cells(rows, scenario, model, report_date, concurrencies=CONCURRENCIES):
     return cells
 
 
-def perf_trend(rows, scenario, model, conc, report_date, max_images=12):
-    """(image date, tok/s per GPU or None) for the `max_images` newest images
-    up to the report image on which the model ran at any concurrency."""
-    mine = _rows_up_to(rows, scenario, model, report_date)
-    last = _last_rows(mine, lambda r: (r["image_date"], int(r["concurrency"])))
-    images = sorted({r["image_date"] for r in mine})[-max_images:]
+def perf_trend(rows, scenario, model, conc, date, max_sessions=12):
+    """(session date, tok/s per GPU or None) for the `max_sessions` newest
+    sessions up to `date` in which the model ran at any concurrency."""
+    mine = _rows_up_to(rows, scenario, model, date)
+    last = _last_rows(mine, lambda r: (r["test_date"], int(r["concurrency"])))
+    sessions = sorted({r["test_date"] for r in mine})[-max_sessions:]
     trend = []
-    for d in images:
+    for d in sessions:
         r = last.get((d, conc))
         trend.append((d, _number(r["tok_s_per_gpu"]) if r and _usable(r) else None))
     return trend
 
 
-def acc_cell(rows, scenario, model, report_date):
+def acc_cell(rows, scenario, model, date):
     last = _last_rows(
-        _rows_up_to(rows, scenario, model, report_date), lambda r: r["image_date"]
+        _rows_up_to(rows, scenario, model, date), lambda r: r["test_date"]
     )
-    now = last.get(report_date)
-    earlier = sorted(d for d in last if d < report_date)
+    now = last.get(date)
+    earlier = sorted(d for d in last if d < date)
     good = [last[d] for d in earlier if _usable(last[d], "gsm8k")]
     prev = good[-1] if good else None
     if now is None or (now["status"] == "ok" and not _usable(now, "gsm8k")):
@@ -221,25 +223,25 @@ def acc_cell(rows, scenario, model, report_date):
         value=_number(now["gsm8k"]) if status == "ok" else None,
         strict=_number(now.get("gsm8k_strict")) if status == "ok" else None,
         prev=_number(prev["gsm8k"]) if prev else None,
-        prev_date=prev["image_date"] if prev else None,
+        prev_date=prev["test_date"] if prev else None,
         prev_failed=bool(earlier) and last[earlier[-1]]["status"] != "ok",
         error=(now or {}).get("error", "") if status == "fail" else "",
     )
 
 
-def accuracy_history(rows, scenario, model, report_date, max_images=12):
-    """GSM8K per image, for the `max_images` newest images up to
-    `report_date`; a failed image stays in as a gap (scores None)."""
+def accuracy_history(rows, scenario, model, date, max_sessions=12):
+    """GSM8K per session, for the `max_sessions` newest sessions up to
+    `date`; a failed session stays in as a gap (scores None)."""
     last = _last_rows(
-        _rows_up_to(rows, scenario, model, report_date), lambda r: r["image_date"]
+        _rows_up_to(rows, scenario, model, date), lambda r: r["test_date"]
     )
     hist = []
-    for image in sorted(last)[-max_images:]:
-        r = last[image]
+    for day in sorted(last)[-max_sessions:]:
+        r = last[day]
         ok = r["status"] == "ok"
         hist.append(
             AccuracyPoint(
-                image,
+                day,
                 _number(r["gsm8k"]) if ok else None,
                 _number(r.get("gsm8k_strict")) if ok else None,
             )

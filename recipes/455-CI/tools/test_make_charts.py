@@ -1,4 +1,4 @@
-"""End-to-end test of make_charts.py: the files the report links to."""
+"""End-to-end tests of make_charts.py: the charts of one session."""
 
 import csv
 
@@ -13,9 +13,10 @@ def write_csv(path, columns, rows):
         w.writerows(rows)
 
 
-def perf(image_date, conc, model="kimi-k3", status="ok"):
+def perf(date, conc, model="kimi-k3", status="ok"):
     return {
-        "image_date": image_date,
+        "image_date": date,
+        "test_date": date,
         "scenario": "endpoint",
         "model": model,
         "gpus": "8",
@@ -26,9 +27,7 @@ def perf(image_date, conc, model="kimi-k3", status="ok"):
     }
 
 
-def test_writes_one_perf_trend_and_one_accuracy_chart_per_scenario_with_data(
-    tmp_path,
-):
+def test_writes_the_trend_charts_of_the_scenario_run_that_day(tmp_path):
     write_csv(
         tmp_path / "perf.csv",
         PERF_COLUMNS,
@@ -38,7 +37,7 @@ def test_writes_one_perf_trend_and_one_accuracy_chart_per_scenario_with_data(
             perf("2026-11-14", 4),
             perf("2026-11-14", 64, status="fail"),
             perf("2026-11-14", 4, model="deepseek-r1", status="fail"),
-            perf("2026-11-21", 4, model="qwen-35b-a3b"),  # after the report image
+            perf("2026-11-21", 4, model="qwen-35b-a3b"),  # a later session
         ],
     )
     write_csv(
@@ -47,6 +46,7 @@ def test_writes_one_perf_trend_and_one_accuracy_chart_per_scenario_with_data(
         [
             {
                 "image_date": "2026-11-14",
+                "test_date": "2026-11-14",
                 "scenario": "endpoint",
                 "model": "kimi-k3",
                 "status": "ok",
@@ -55,7 +55,7 @@ def test_writes_one_perf_trend_and_one_accuracy_chart_per_scenario_with_data(
             },
         ],
     )
-    main(["--image-date", "2026-11-14", "--data-dir", str(tmp_path)])
+    main(["--date", "2026-11-14", "--data-dir", str(tmp_path)])
     out = tmp_path / "runs" / "20261114" / "charts"
     assert sorted(p.name for p in out.iterdir()) == [
         "accuracy-endpoint.png",
@@ -63,17 +63,8 @@ def test_writes_one_perf_trend_and_one_accuracy_chart_per_scenario_with_data(
     ]
 
 
-def test_writes_nothing_for_a_scenario_without_data(tmp_path):
+def test_writes_nothing_for_a_day_without_a_session(tmp_path):
     write_csv(tmp_path / "perf.csv", PERF_COLUMNS, [perf("2026-11-14", 4)])
-    main(
-        [
-            "--image-date",
-            "2026-11-14",
-            "--scenario",
-            "8k1k",
-            "--data-dir",
-            str(tmp_path),
-        ]
-    )
-    out = tmp_path / "runs" / "20261114" / "charts"
+    main(["--date", "2026-11-18", "--data-dir", str(tmp_path)])
+    out = tmp_path / "runs" / "20261118" / "charts"
     assert not out.exists() or list(out.iterdir()) == []

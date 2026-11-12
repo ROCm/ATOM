@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Build a mock 455-CI data dir in ./examples and draw its charts and report.
+"""Build an example 455-CI data dir in ./examples and draw its charts and reports.
 
 Made-up numbers in the real layout (perf.csv, accuracy.csv, runs/, reports/)
-to preview what a report looks like. On the newest image (11-14):
-DeepSeek-V4.1-Flash gains 6%, GLM-5.2 c64 drops 4%, DeepSeek R1 has slid
-1.5% a week below its best, Kimi-K3 recovers from a failed 11-07,
-Qwen-35B-A3B fails at c64 and MiniMax-M3 loses 4.7 GSM8K points. The charts
-and the report say MOCK DATA.
+to show what the reports look like. Each week has two sessions on one image:
+Saturday runs MLPerf Endpoint, Wednesday runs 8K/1K. In the newest Saturday
+session (11-14) DeepSeek-V4.1-Flash gains 6%, DeepSeek R1 has slid 1.5% a
+week below its best, Kimi-K3 recovers from a failed 11-07 and Qwen-35B-A3B
+fails at c64; in the Wednesday session after it (11-18) GLM-5.2 c64 drops 4%
+and MiniMax-M3 loses 4.7 GSM8K points. The charts and reports say EXAMPLE.
 """
 
 import csv
@@ -191,8 +192,10 @@ def main():
             ensure_ascii=False,
             indent=1,
         )
-    make_charts(["--image-date", NEWEST, "--data-dir", OUT, "--mock"])
-    make_report(["--image-date", NEWEST, "--data-dir", OUT, "--mock"])
+    wednesday = str(datetime.date.fromisoformat(NEWEST) + datetime.timedelta(days=4))
+    for day in (NEWEST, wednesday):  # the two sessions on the newest image
+        make_charts(["--date", day, "--data-dir", OUT, "--mock"])
+        make_report(["--date", day, "--data-dir", OUT, "--mock"])
 
 
 if __name__ == "__main__":

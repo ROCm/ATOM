@@ -1,10 +1,19 @@
 """Tests for the 455-CI highlights and summary table (ci455_report.py)."""
 
 from ci455_data import AccCell, PerfCell
-from ci455_report import ModelResult, highlights, summary_row
+from ci455_report import ModelResult, detail_md, highlights, summary_row
 
 
-def pc(conc, value, prev, status="ok", best=None, prev_failed=False, error=""):
+def pc(
+    conc,
+    value,
+    prev,
+    status="ok",
+    best=None,
+    prev_failed=False,
+    error="",
+    prev_date="2026-11-07",
+):
     return PerfCell(
         concurrency=conc,
         status=status,
@@ -12,7 +21,7 @@ def pc(conc, value, prev, status="ok", best=None, prev_failed=False, error=""):
         second=None,
         prev=prev,
         prev_second=None,
-        prev_date="2026-11-07" if prev is not None else None,
+        prev_date=prev_date if prev is not None else None,
         best=prev if best is None else best,
         prev_failed=prev_failed,
         error=error,
@@ -20,13 +29,13 @@ def pc(conc, value, prev, status="ok", best=None, prev_failed=False, error=""):
     )
 
 
-def ac(value, prev, status="ok", prev_failed=False, error=""):
+def ac(value, prev, status="ok", prev_failed=False, error="", prev_date="2026-11-07"):
     return AccCell(
         status=status,
         value=value,
         strict=None,
         prev=prev,
-        prev_date="2026-11-07" if prev is not None else None,
+        prev_date=prev_date if prev is not None else None,
         prev_failed=prev_failed,
         error=error,
     )
@@ -254,3 +263,34 @@ def test_summary_row_of_a_first_run_has_no_change():
         "first",
         "first (now 95.0%)",
     ]
+
+
+def test_detail_tables_compare_with_the_previous_session_by_date_and_name_an_older_one():
+    a = model("Alpha", pc(4, 100.0, 100.0), pc(64, 1000.0, 1000.0), ac(0.95, 0.95))
+    b = model(
+        "Bravo",
+        pc(4, 100.0, 99.0, prev_date="2026-10-31"),
+        pc(64, 1000.0, 990.0, prev_date="2026-10-31"),
+        ac(0.95, 0.95, prev_date="2026-10-31"),
+    )
+    text = detail_md(
+        "2026-11-14", {}, [a, b], "r.md", "../runs/20261114/charts", "../runs/20261114"
+    )
+    assert "| vs 2026-11-07 |" in text and "(vs 2026-10-31)" in text
+    assert "previous" not in text.lower() and "vs best" not in text.lower()
+
+
+def test_detail_environment_lists_the_image_the_commits_and_one_test_date():
+    env = {
+        "image": "img:tag",
+        "digest": "sha256:abc",
+        "base_image": "base:tag",
+        "dependency_changes": ["x 1 -> 2"],
+        "atom": {"commit": "a" * 40},
+        "aiter": {"commit": "b" * 40},
+    }
+    text = detail_md("2026-11-18", env, [model("Alpha", **FLAT)], "r.md", "c", "r")
+    assert "| Test date | 2026-11-18 |" in text and "sha256:abc" in text
+    assert (
+        "Base image" not in text and "base:tag" not in text and "Dependency" not in text
+    )

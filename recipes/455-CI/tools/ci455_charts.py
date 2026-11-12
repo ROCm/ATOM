@@ -1,9 +1,9 @@
 """Render the 455-CI trend charts, in the ATOM benchmark dashboard's trend style.
 
-- perf-<scenario>.png: tok/s per GPU by image, one panel per model and
+- perf-<scenario>.png: tok/s per GPU by run, one panel per model and
   concurrency, c4 left and c64 right. Two points per run make a Pareto chart a
   bare segment, so the history is shown as a trend instead.
-- accuracy-<scenario>.png: GSM8K by image, one panel per model:
+- accuracy-<scenario>.png: GSM8K by run, one panel per model:
   flexible-extract solid, strict-match dashed, the baseline (when set) grey
   dashed.
 
@@ -58,8 +58,8 @@ NICE_STEPS = (
 LEFT, GAP, COL_W, TOP = 90, 80, 560, 140
 
 
-def mmdd(image_date):
-    return image_date[5:]
+def mmdd(date):
+    return date[5:]
 
 
 def _num(v):
@@ -284,7 +284,7 @@ def _latest_text(trend):
 
 
 def render_perf_trends(panels, out, scenario_label, mock=False):
-    """tok/s per GPU by image. `panels` is [(title, [(image date, value or
+    """tok/s per GPU by run. `panels` is [(title, [(image date, value or
     None)])], two per row: c4 left and c64 right for each model."""
     panel_h, row_h = 190, 270
     foot_top, H = _layout(len(panels), panel_h, row_h)
@@ -294,8 +294,8 @@ def render_perf_trends(panels, out, scenario_label, mock=False):
     _header(
         fig,
         H,
-        f"{scenario_label} · throughput per GPU by image",
-        f"455-CI · MI455 (gfx1250) · ATOM main + aiter main · images {span}",
+        f"{scenario_label} · throughput per GPU by run",
+        f"455-CI · MI455 (gfx1250) · ATOM main + aiter main · runs {span}",
         mock,
     )
     _legend(
@@ -365,20 +365,20 @@ def _percent_step(span):
 
 
 def render_accuracy(histories, out, scenario_label, baselines=None, mock=False):
-    """GSM8K by image, the dashboard's accuracy trend: one panel per model,
+    """GSM8K by run, the dashboard's accuracy trend: one panel per model,
     two per row. `histories` is [(model name, [AccuracyPoint])], `baselines`
     maps a model name to a reference score drawn as a grey dashed line."""
     baselines = baselines or {}
     panel_h, row_h = 250, 330
     foot_top, H = _layout(len(histories), panel_h, row_h)
     fig = _figure(H)
-    days = sorted({h.image_date for _, hist in histories for h in hist})
+    days = sorted({h.date for _, hist in histories for h in hist})
     span = f"{mmdd(days[0])} → {mmdd(days[-1])}" if days else "no data yet"
     _header(
         fig,
         H,
-        f"{scenario_label} models · GSM8K accuracy by image",
-        f"455-CI · MI455 (gfx1250) · lm_eval gsm8k, 3-shot · images {span}",
+        f"{scenario_label} models · GSM8K accuracy by run",
+        f"455-CI · MI455 (gfx1250) · lm_eval gsm8k, 3-shot · runs {span}",
         mock,
     )
     _legend(
@@ -413,9 +413,7 @@ def render_accuracy(histories, out, scenario_label, baselines=None, mock=False):
             values.append(base)
         ymin = max(0.0, math.floor(((min(values) if values else 0.9) - 0.03) * 20) / 20)
         ax.set_ylim(ymin, 1.0)
-        _dates(
-            ax, [h.image_date for h in hist], extra_right=0.6
-        )  # room for the newest label
+        _dates(ax, [h.date for h in hist], extra_right=0.6)  # room for the newest label
         ax.yaxis.set_major_locator(MultipleLocator(_percent_step(1.0 - ymin)))
         ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v * 100:.0f}%"))
         if base is not None:
