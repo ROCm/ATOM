@@ -137,7 +137,7 @@ Key entry points:
   per-step input check only, and Kimi-K3 ships neither it nor a `check.py`
   yet). DeepSeek-V4.1 also has the high-interactivity monokernels
   (`ATOM_DSV41_MONO_HI`, on by default where `deepseek_v41/mono/hi_gate.py`
-  says they serve: MI355X, TP2 or TP4, DSpark): one persistent FlyDSL launch a layer
+  says they serve: MI355X, TP2, TP4 or TP8, DSpark): one persistent FlyDSL launch a layer
   (the runtime in `deepseek_v41/mono/hi/`), the host hook in `hi_runner.py` /
   `hi_compose.py` / `hi_dispatch.py`, its head output
   (`HiDecodeModel.compute_head`: `round/post_verify.py`) and its decode round in

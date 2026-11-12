@@ -92,8 +92,8 @@ def test_hi_layer_takes_full_r_a():
     from atom.models.deepseek_v41.mono.hi.v41 import layer as L
 
     assert "full_r_a" in inspect.signature(L.window_layer_blocks).parameters
-    # (RESIDUAL "auto", the schedules' default; the same at both served TP sizes)
-    for tp in (2, 4):
+    # (RESIDUAL "auto", the schedules' default; the same at every served TP size)
+    for tp in (2, 4, 8):
         assert L.residual_layout(tp, rows=6) == "sharded"
         assert L.residual_layout(tp, rows=1) == "replicated"
     m = _layers(L)

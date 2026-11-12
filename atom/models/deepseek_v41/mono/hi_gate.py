@@ -2,8 +2,8 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Whether DeepSeek-V4.1's high-interactivity (hi) monokernels serve this deployment (``ATOM_DSV41_MONO_HI``).
 
-- "auto" (the default): on for exactly the deployment they are built for, gfx950 (MI355X, every CU) at TP2 or TP4
-  (``SERVED_TPS``) without DP attention, a bf16 KV cache with the FP4 index cache (either gfx950 layout,
+- "auto" (the default): on for exactly the deployment they are built for, gfx950 (MI355X, every CU) at TP2, TP4 or
+  TP8 (``SERVED_TPS``) without DP attention, a bf16 KV cache with the FP4 index cache (either gfx950 layout,
   ``INDEX_LAYOUTS``), ATOM's 128-token V4.1 pages, the DSpark draft with its 5 drafts, ATOM's Engram runtime on its
   UVA lookup with overlap staging, no KV transfer, a context up to ``MAX_CTX`` (the programs' context bucket),
   DeepSeek-V4.1-Flash's geometry and FlyDSL installed. Any other deployment keeps ATOM's own mono decode, unchanged,
@@ -32,6 +32,7 @@ MODES = ("auto", "1", "0")
 SERVED_TPS = (
     2,
     4,
+    8,
 )  # the tensor-parallel sizes the hi programs are built for (MI355X, the validated configurations)
 REQ_ROWS = 6  # a verify's rows a request: DSpark's 5 drafts + the anchor
 # the KV cache's page in tokens: ATOM's for V4.1 (``Config`` sets ``kv_cache_block_size`` to 128 for

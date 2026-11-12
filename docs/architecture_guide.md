@@ -160,7 +160,7 @@ and the model's forward all read it, so they agree on every step.
 
 DeepSeek-V4.1's high-interactivity monokernels (`atom/models/deepseek_v41/mono/hi_*.py`,
 `round/`, the FlyDSL runtime in `hi/`; `ATOM_DSV41_MONO_HI`, on by default where
-`hi_gate` says they serve: MI355X at TP2 or TP4) use all three: `hi_dispatch` wraps the model
+`hi_gate` says they serve: MI355X at TP2, TP4 or TP8) use all three: `hi_dispatch` wraps the model
 (`HiDecodeModel`, whose `compute_head` is the in-graph verify head and
 post-verify, `round/post_verify.py`), and `round.HiRound` is its decode round
 (the device round, `round/device_round.py`, consumes the device verdict).

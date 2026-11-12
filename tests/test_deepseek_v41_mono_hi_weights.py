@@ -2,7 +2,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """``hi_weights``: the hi packs from the tensors ATOM loaded equal the packs from the checkpoint, byte for byte.
 
-A synthetic layer in the checkpoint's form is packed for TP2 and TP4 rank 1 the checkpoint's way (``layer_impl.pack``:
+A synthetic layer in the checkpoint's form is packed for TP2, TP4 and TP8 rank 1 the checkpoint's way (``layer_impl.pack``:
 sliced there); the same tensors put through what ATOM's load does to them (this rank's slices, the fused
 projections, the FP8 16 x 16 preshuffle, the routed experts' gfx950 gate / up shuffle and scale shuffle: aiter's
 own functions) are packed from ATOM's form (``block_tensors`` / ``expert_packs``, ``pack(local=True)``).
@@ -124,17 +124,18 @@ def hi_order_scales(
     return {f"{name}.ug.ws": ug.contiguous(), f"{name}.down.ws": down.contiguous()}
 
 
-@pytest.mark.parametrize("tp", [2, 4])
+@pytest.mark.parametrize("tp", [2, 4, 8])
 def test_expert_packs_are_the_checkpoints(tp):
     """``expert_packs`` of ATOM's shuffled experts == ``pack_experts(.., "intra")`` of the checkpoint's (a small
     shape: 384-wide experts, a rank's 96-wide (TP4) or 192-wide (TP2) slice padded to the 128 step; down's 4 or 6
-    scale groups padded to 8 by aiter).
+    scale groups padded to 8 by aiter; at TP8 the model's 2304-wide experts, a 288-wide slice padded to 384, down's 9
+    scale groups padded to 16).
     """
     from atom.models.deepseek_v41.mono import hi_weights
     from atom.models.deepseek_v41.mono.hi.blocks.gfx950.moe_experts import pack_experts
 
     g = torch.Generator().manual_seed(7)
-    n, inter, hidden = 3, 384, 256
+    n, inter, hidden = 3, 2304 if tp == 8 else 384, 256
     full = {}
     for e in range(n):
         for name, shape in (
@@ -200,7 +201,7 @@ def test_expert_packs_are_the_checkpoints(tp):
         hi_weights.check_experts(experts, inter, tp)
 
 
-@pytest.mark.parametrize("tp", [2, 4])
+@pytest.mark.parametrize("tp", [2, 4, 8])
 def test_a_layer_packed_from_atoms_tensors_is_the_checkpoints(tp):
     """A window layer with Engram (4 routed experts: the packs do not depend on the count) packed both ways."""
     from atom.models.deepseek_v41.mono import hi_weights

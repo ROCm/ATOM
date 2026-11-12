@@ -120,9 +120,9 @@ def test_the_hook_and_its_entry_modules_import():
         importlib.import_module(f"{PKG}.{entry}")
 
 
-@pytest.mark.parametrize("tp", [2, 4])
+@pytest.mark.parametrize("tp", [2, 4, 8])
 def test_the_served_schedules_build_dual_copy_mailboxes(tp):
-    """V4.1's schedules (MI355X, TP2 and TP4) put its tagged mailboxes in dual copies (``NUMA_DUAL``, "numa2"
+    """V4.1's schedules (MI355X, TP2, TP4 and TP8) put its tagged mailboxes in dual copies (``NUMA_DUAL``, "numa2"
     regions): the served programs need the run-time half of the dual-copy scratch (``runtime.dual``).
     """
     pytest.importorskip("flydsl")

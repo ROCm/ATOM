@@ -5,9 +5,9 @@ leaves every other on ATOM's mono path, with one info line; "1" refuses loudly; 
 configuration, the environment and the device properties only: no hi module is imported.
 
 The configuration is ATOM's own ``Config`` of the served command line (serve_v41.sh's arguments, the InferenceX
-recipe at TP4, and the same at TP2), built the way ``LLMEngine`` builds it, so the gate sees every value ATOM settles
-on (its overrides included: V4.1's 128-token KV page whatever ``--block-size`` asks); each refusal case changes one of
-those fields.
+recipe at TP4, and the same at TP2 and TP8), built the way ``LLMEngine`` builds it, so the gate sees every value ATOM
+settles on (its overrides included: V4.1's 128-token KV page whatever ``--block-size`` asks); each refusal case changes
+one of those fields.
 
 What only the loaded model shows is refused at install (``hi_dispatch.install_hi``): every rank's check agreed over
 the TP group before anything is built, so one rank refusing turns the hi path off on every rank.
@@ -40,6 +40,10 @@ SERVED_ARGS = (
 SERVED_ARGS_TP2 = SERVED_ARGS.replace(
     "--tensor-parallel-size 4", "--tensor-parallel-size 2"
 )
+# ... and at TP8 (one MI355X node)
+SERVED_ARGS_TP8 = SERVED_ARGS.replace(
+    "--tensor-parallel-size 4", "--tensor-parallel-size 8"
+)
 
 
 def _atom_config(args: str = SERVED_ARGS):
@@ -68,6 +72,11 @@ def served():
 @pytest.fixture(scope="module")
 def served_tp2():
     return _atom_config(SERVED_ARGS_TP2)
+
+
+@pytest.fixture(scope="module")
+def served_tp8():
+    return _atom_config(SERVED_ARGS_TP8)
 
 
 @pytest.fixture(autouse=True)
@@ -137,22 +146,34 @@ def test_auto_serves_the_served_command_line_at_tp2(mi355x, served_tp2, caplog):
     assert not [m for m in set(sys.modules) - before if ".mono.hi" in m]
 
 
-@pytest.mark.parametrize("tp", [1, 3, 8])
+def test_auto_serves_the_served_command_line_at_tp8(mi355x, served_tp8, caplog):
+    """The same recipe at ``--tensor-parallel-size 8``: served (8 heads, 288-wide expert slices and 16,160 vocab rows a
+    rank: the package's TP8 programs), nothing of the hi path imported to decide it.
+    """
+    assert served_tp8.tensor_parallel_size == 8 and 8 in hi_gate.SERVED_TPS
+    before = set(sys.modules)
+    with caplog.at_level(logging.INFO, logger="atom"):
+        assert hi_gate.decide(served_tp8, _drafter(), _builder(), 0) is True
+    assert not caplog.records
+    assert not [m for m in set(sys.modules) - before if ".mono.hi" in m]
+
+
+@pytest.mark.parametrize("tp", [1, 3, 16])
 def test_only_the_served_tp_sizes_are_served(mi355x, served, tp):
-    """TP2 and TP4 (``SERVED_TPS``); any other size keeps ATOM's path."""
-    assert hi_gate.SERVED_TPS == (2, 4)
+    """TP2, TP4 and TP8 (``SERVED_TPS``); any other size keeps ATOM's path."""
+    assert hi_gate.SERVED_TPS == (2, 4, 8)
     cfg = _config(served, tensor_parallel_size=tp)
     assert hi_gate.refusal(cfg, _drafter(), _builder(), 0) == (
-        f"TP{tp} (the hi path serves TP2 / TP4)"
+        f"TP{tp} (the hi path serves TP2 / TP4 / TP8)"
     )
 
 
-@pytest.mark.parametrize("tp", [2, 4])
-def test_the_gate_reads_the_values_atom_settled_on(served, served_tp2, tp):
+@pytest.mark.parametrize("tp", [2, 4, 8])
+def test_the_gate_reads_the_values_atom_settled_on(served, served_tp2, served_tp8, tp):
     """Every configuration field the gate reads, as ATOM's ``Config`` holds it for the served command line: the value
-    the hook and ATOM's cache use (``--block-size 16`` becomes V4.1's 128-token page), at either served TP size.
+    the hook and ATOM's cache use (``--block-size 16`` becomes V4.1's 128-token page), at every served TP size.
     """
-    served = {2: served_tp2, 4: served}[tp]
+    served = {2: served_tp2, 4: served, 8: served_tp8}[tp]
     assert served.kv_cache_block_size == hi_gate.BLOCK_SIZE == 128
     assert (
         served.tensor_parallel_size,
@@ -181,7 +202,7 @@ def test_any_block_size_flag_takes_atoms_v41_page(mi355x, block):
 
 UNSUPPORTED = {
     "TP1": ({"tensor_parallel_size": 1}, {}, "TP1"),
-    "TP8": ({"tensor_parallel_size": 8}, {}, "TP8"),
+    "TP16": ({"tensor_parallel_size": 16}, {}, "TP16"),
     "DP attention": ({}, {"dp_ranks": 2}, "DP attention"),
     "fp8 KV": ({"kv_cache_dtype": "fp8"}, {}, "kv_cache_dtype fp8"),
     "fp8 index cache": ({"index_cache_dtype": "fp8"}, {}, "index-cache-dtype fp8"),
@@ -233,13 +254,13 @@ UNSUPPORTED = {
 }
 
 
-@pytest.mark.parametrize("tp", [2, 4])
+@pytest.mark.parametrize("tp", [2, 4, 8])
 @pytest.mark.parametrize("case", sorted(UNSUPPORTED))
 def test_auto_leaves_any_other_deployment_on_atoms_path(
-    mi355x, served, served_tp2, caplog, case, tp
+    mi355x, served, served_tp2, served_tp8, caplog, case, tp
 ):
     over, args, why = UNSUPPORTED[case]
-    base = {2: served_tp2, 4: served}[tp]
+    base = {2: served_tp2, 4: served, 8: served_tp8}[tp]
     call = {"drafter": _drafter(), "builder": _builder(), "dp_ranks": 0, **args}
     with caplog.at_level(logging.INFO, logger="atom"):
         assert not hi_gate.decide(
@@ -273,14 +294,16 @@ def test_auto_without_flydsl(mi355x, served, monkeypatch):
     assert "FlyDSL" in hi_gate.refusal(served, _drafter(), _builder(), 0)
 
 
-@pytest.mark.parametrize("tp", [2, 4])
+@pytest.mark.parametrize("tp", [2, 4, 8])
 @pytest.mark.parametrize("layout", hi_gate.INDEX_LAYOUTS)
 def test_both_gfx950_fp4_index_layouts_are_served(
-    mi355x, served, served_tp2, layout, tp
+    mi355x, served, served_tp2, served_tp8, layout, tp
 ):
     """ATOM's FP4 index plane in either gfx950 layout (``ATOM_V4_UNIFIED_MQA``: opus -> mfma, flydsl ->
-    preshuffle): the hi programs address both, at either served TP size."""
-    cfg = _config({2: served_tp2, 4: served}[tp], index_cache_layout=layout)
+    preshuffle): the hi programs address both, at every served TP size."""
+    cfg = _config(
+        {2: served_tp2, 4: served, 8: served_tp8}[tp], index_cache_layout=layout
+    )
     assert hi_gate.refusal(cfg, _drafter(), _builder(), 0) == ""
 
 
@@ -293,13 +316,14 @@ def test_off(mi355x, served, monkeypatch, caplog):
     ]
 
 
-def test_forced(mi355x, served, served_tp2, monkeypatch):
+def test_forced(mi355x, served, served_tp2, served_tp8, monkeypatch):
     monkeypatch.setenv("ATOM_DSV41_MONO_HI", "1")
     assert hi_gate.decide(served, _drafter(), _builder(), 0)
     assert hi_gate.decide(served_tp2, _drafter(), _builder(), 0)
-    with pytest.raises(RuntimeError, match="TP8"):
+    assert hi_gate.decide(served_tp8, _drafter(), _builder(), 0)
+    with pytest.raises(RuntimeError, match="TP16"):
         hi_gate.decide(
-            _config(served, tensor_parallel_size=8), _drafter(), _builder(), 0
+            _config(served, tensor_parallel_size=16), _drafter(), _builder(), 0
         )
 
 
@@ -560,6 +584,21 @@ def test_at_tp2_the_other_ranks_refusal_refuses_here(hi_dispatch_module, monkeyp
         hi_dispatch_module.install_hi(*args)
     assert str(raised.value) == "refused at install: rank 0: MonoUnsupported: shard"
     assert log == [("check", 2, 1), ("agree", None, "tp cpu group")]
+    assert args[2].model is draft
+
+
+def test_at_tp8_one_other_ranks_refusal_refuses_here(hi_dispatch_module, monkeypatch):
+    """A TP8 group (this process rank 1 of 8): the check runs at TP8, rank 6's refusal is agreed and raised here
+    before anything is built, so every rank falls back."""
+    from atom.mono.runtime.consensus import MonoUnsupported
+
+    monkeypatch.setattr(hi_dispatch_module, "_tp", lambda: ("tp cpu group", 8, 1))
+    others = (None,) * 5 + ("MonoUnsupported: shard", None)  # ranks 0, 2 .. 7
+    log, args, draft = _install_world(hi_dispatch_module, monkeypatch, others=others)
+    with pytest.raises(MonoUnsupported) as raised:
+        hi_dispatch_module.install_hi(*args)
+    assert str(raised.value) == "refused at install: rank 6: MonoUnsupported: shard"
+    assert log == [("check", 8, 1), ("agree", None, "tp cpu group")]
     assert args[2].model is draft
 
 
