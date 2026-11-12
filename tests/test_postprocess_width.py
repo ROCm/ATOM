@@ -398,7 +398,11 @@ def test_channel_constraint_preserves_raw_logprobs(
     batch.required_channel = object()
 
     def force_channel(_runner, _batch, bonus, _metadata, target, preserve_masks=False):
-        assert preserve_masks is False
+        if schema:
+            assert preserve_masks.dtype == torch.bool
+            assert preserve_masks.tolist() == [True, False]
+        else:
+            assert preserve_masks is False
         for logits in (bonus, target):
             if logits is not None:
                 logits[:, 1:] = -float("inf")
