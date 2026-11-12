@@ -167,7 +167,9 @@ def _score_paged(query, weights, cache, rows, topk, weight_scale, stable, on_ban
         if rows.packed_offsets is not None:
             scores = workspace.packed_logits()
             offsets = rows.packed_offsets[span]
-            lane_max = _band_lane_max(workspace, cache, rows, index)
+            # Whether this band's scorer writes them is `_fp4_band_logits`'s
+            # call; the top-k selects the same whatever the buffer holds.
+            lane_max = workspace.packed_lane_max()
         else:
             scores = (
                 plane[:count]
@@ -232,7 +234,7 @@ def _score_paged(query, weights, cache, rows, topk, weight_scale, stable, on_ban
                 stable=stable,
                 row_starts=offsets,
                 plane_width=rows.width,
-                **({} if lane_max is None else {"lane_max": lane_max}),
+                lane_max=lane_max,
             )
 
 
@@ -241,21 +243,8 @@ def _writes_lane_max(cache, launch):
     return (
         cache.layout in (NATURAL, MFMA)
         and launch["schedule"] is None
-        and getattr(launch["cfg"], "writes_lane_max", False)
+        and launch["cfg"].writes_lane_max
     )
-
-
-def _band_lane_max(workspace, cache, rows, band):
-    """The packed plane's lane maxima for band `band`'s scorer and top-k, or
-    None. The top-k's selection does not depend on them, so a replay whose
-    live launch writes none (`_fp4_band_logits`) still selects exactly."""
-    if not cache.fp4 or rows.fp4_bands is None:
-        return None
-    # A packed workspace without lane maxima (a stand-in) passes none.
-    lane_max = getattr(workspace, "packed_lane_max", lambda: None)()
-    if lane_max is None or not _writes_lane_max(cache, rows.fp4_bands[band]):
-        return None
-    return lane_max
 
 
 def _gather_concat(query, cache, keys):
@@ -354,7 +343,7 @@ def _fp4_band_logits(
             weight_scale=weight_scale,
             out=scores,
             out_offsets=offsets,
-            **({} if lane_max is None else {"lane_max": lane_max}),
+            lane_max=lane_max,
             **launch,
         )
         return scores

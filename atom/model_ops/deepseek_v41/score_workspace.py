@@ -87,21 +87,6 @@ class PackedRows(NamedTuple):
     bands: tuple[tuple[int, int], ...]
 
 
-def _lane_max_elems():
-    """aiter's lane-maxima sizing where this chip's OPUS scorer writes them,
-    else None. Imported on use: a non-GPU install has no `aiter.jit`, and an
-    older aiter's scorer writes no lane maxima (the scorer and top-k are then
-    called as before)."""
-    try:
-        from aiter.jit.utils.chip_info import get_gfx
-        from aiter.ops.opus.pa_mqa_logits_mxfp4 import (
-            mqa_logits_mxfp4_lane_max_elems,
-        )
-    except ImportError:
-        return None
-    return mqa_logits_mxfp4_lane_max_elems if get_gfx() == "gfx1250" else None
-
-
 class ScoreWorkspace(LogitsWorkspace):
     """The scorer's logits plane (`LogitsWorkspace`) and each ratio's tile
     table, at their largest, and the row starts of one-row sequences. The FP4 plane has no tile tables:
@@ -112,10 +97,20 @@ class ScoreWorkspace(LogitsWorkspace):
     `max_tokens` bounds a forward's query rows and `columns` a block table's
     width: the two dimensions every later request is checked against.
     `pages` bounds the PAGE pool the FP4 plane's packed rows can see.
+    `lane_max_elems`: aiter's lane-maxima sizing
+    (`mqa_logits_mxfp4_lane_max_elems`) where the FP4 scorer writes lane
+    maxima beside the packed logits, else None.
     """
 
     def __init__(
-        self, geometry, max_tokens, columns, device, pages=None, candidate_blocks=0
+        self,
+        geometry,
+        max_tokens,
+        columns,
+        device,
+        pages=None,
+        candidate_blocks=0,
+        lane_max_elems=None,
     ):
         self._max_tokens = max_tokens
         ratios = sorted({ratio for _, ratio in geometry.owners})
@@ -170,14 +165,13 @@ class ScoreWorkspace(LogitsWorkspace):
         # The packed logits' lane maxima, which gfx1250's OPUS scorer writes
         # beside them for the top-k of the same band (`packed_lane_max`).
         # Allocated here with the rest, so the memory profile counts them.
-        lane_max_elems = _lane_max_elems() if self.packed else None
         self._lane_max = (
             torch.empty(
                 lane_max_elems(self.capacity, max_tokens),
                 dtype=torch.float32,
                 device=device,
             )
-            if lane_max_elems is not None
+            if self.packed and lane_max_elems is not None
             else None
         )
         self._row_starts = torch.arange(
