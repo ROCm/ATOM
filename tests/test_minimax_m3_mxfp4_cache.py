@@ -96,6 +96,7 @@ def check(*, hf=None, arch="gfx950", plugin_mode=False, **kw):
         "kv_cache_block_size": 128,
         "torch_dtype": torch.bfloat16,
         "kv_transfer_config": {},
+        "decode_context_parallel_size": 1,
         "speculative_config": None,
         "hf_config": text,
     }
@@ -114,6 +115,11 @@ REFUSALS = [  # (config change, message): one row per refusal reason
     ({"plugin_mode": True}, "bridges"),
     ({"kv_cache_block_size": 16}, "128 tokens"),
     ({"arch": "gfx942"}, "gfx950, got gfx942"),
+    ({"decode_context_parallel_size": 2}, "decode-context-parallel-size 2"),
+    (
+        {"decode_context_parallel_size": 2, **INDEX_ONLY},
+        "decode-context-parallel-size 2",
+    ),
     ({"plugin_mode": True, **INDEX_ONLY}, "bridges"),  # the index alone is held to it
     ({"arch": "gfx942", **INDEX_ONLY}, "gfx950, got gfx942"),
     ({"index_cache_dtype": "fp8"}, "needs --index-cache-dtype fp4, got fp8"),
