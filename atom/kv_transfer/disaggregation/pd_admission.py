@@ -12,6 +12,22 @@ from atom.model_engine.capabilities import pcp_group_size_of
 
 logger = logging.getLogger("atom")
 
+_LIMITS = ("max_pending_kv_bytes", "max_pending_kv_fraction", "min_free_kv_fraction")
+
+
+def _fraction(name: str, value, upper_inclusive: bool):
+    if value is None:
+        return None
+    # NaN and infinities fail the range check too.
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not (0 < value <= 1 if upper_inclusive else 0 < value < 1)
+    ):
+        interval = "(0, 1]" if upper_inclusive else "(0, 1)"
+        raise ValueError(f"pd_admission.{name} must be in {interval}")
+    return value
+
 
 @dataclass
 class PendingReceive:
@@ -41,12 +57,7 @@ class PdAdmissionController:
             raise ValueError("pd_admission.enabled must be a boolean")
         if not options.get("enabled", False):
             return None
-        unknown = options.keys() - {
-            "enabled",
-            "max_pending_kv_bytes",
-            "max_pending_kv_fraction",
-            "min_free_kv_fraction",
-        }
+        unknown = options.keys() - {"enabled", *_LIMITS}
         if unknown:
             raise ValueError(f"Unknown pd_admission options: {sorted(unknown)}")
         if connector is None or not connector.supports_pd_admission:
@@ -63,29 +74,26 @@ class PdAdmissionController:
         if len(entry_bytes) != 1 or entry_bytes[0] <= 0:
             raise ValueError("pd_admission requires a single paged KV pool layout")
         block_bytes = entry_bytes[0]
+        limits = [name for name in _LIMITS if name in options]
+        for name in limits:
+            if options[name] is None:
+                raise ValueError(f"pd_admission.{name} cannot be null; omit it")
         byte_limit = options.get("max_pending_kv_bytes")
-        fraction = options.get(
-            "max_pending_kv_fraction", None if byte_limit is not None else 0.15
-        )
-        free_fraction = options.get("min_free_kv_fraction")
         if byte_limit is not None and (type(byte_limit) is not int or byte_limit <= 0):
             raise ValueError(
-                "pd_admission.max_pending_kv_bytes must be a positive integer or null"
+                "pd_admission.max_pending_kv_bytes must be a positive integer"
             )
-        for name, value, closed in (
-            ("max_pending_kv_fraction", fraction, True),
-            ("min_free_kv_fraction", free_fraction, False),
-        ):
-            if value is None:
-                continue
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, (int, float))
-                or not math.isfinite(value)
-                or not (0 < value <= 1 if closed else 0 < value < 1)
-            ):
-                interval = "(0, 1]" if closed else "(0, 1)"
-                raise ValueError(f"pd_admission.{name} must be in {interval}")
+        # Each limit is opt-in; the 0.15 byte budget applies only when none is set.
+        fraction = _fraction(
+            "max_pending_kv_fraction",
+            options.get("max_pending_kv_fraction", None if limits else 0.15),
+            upper_inclusive=True,
+        )
+        free_fraction = _fraction(
+            "min_free_kv_fraction",
+            options.get("min_free_kv_fraction"),
+            upper_inclusive=False,
+        )
         if fraction is not None:
             if byte_limit is not None:
                 raise ValueError("Set only one PD byte limit: bytes or fraction")
@@ -95,8 +103,6 @@ class PdAdmissionController:
             if free_fraction is None
             else math.ceil(config.num_kvcache_blocks * free_fraction)
         )
-        if byte_limit is None and reserve_blocks is None:
-            raise ValueError("pd_admission requires at least one limit")
         return cls(
             byte_limit,
             block_bytes,
@@ -162,29 +168,27 @@ class PdAdmissionController:
         if offset is None:
             return True, None
         plan = ReceivePlan(offset, num_blocks)
-        reason = None
         # With no pending receive, allow a single request past either soft
         # limit. The normal allocator still enforces the hard capacity and
         # lookahead checks.
+        if not self.pending:
+            return True, plan
+        hit = []
+        receive_blocks = num_blocks - offset - self._charged_hits(probe, offset)
         if (
             self.max_bytes is not None
-            and self.pending
-            and self.pending_bytes
-            + (num_blocks - offset - self._charged_hits(probe, offset))
-            * self.block_bytes
-            > self.max_bytes
+            and self.pending_bytes + receive_blocks * self.block_bytes > self.max_bytes
         ):
-            reason = "bytes"
-        elif (
+            hit.append("bytes")
+        if (
             self.reserve_blocks is not None
             # Every block the request allocates, not only the receive targets:
             # a local prefix hit on a cached-but-free block leaves the free
             # list like a receive target does.
             and self._block_manager.kv.num_free - num_blocks < self.reserve_blocks
-            and self.pending
         ):
-            reason = "free_kv"
-        if reason is None:
+            hit.append("free_kv")
+        if not hit:
             return True, plan
         # One deferral per admission wait and limit, however many passes it
         # takes; a repeated pass allocates nothing.
@@ -192,9 +196,10 @@ class PdAdmissionController:
         reasons = self._deferred_by.get(key)
         if reasons is None:
             reasons = self._deferred_by[key] = set()
-        if reason not in reasons:
-            reasons.add(reason)
-            self.deferred[reason] += 1
+        for reason in hit:
+            if reason not in reasons:
+                reasons.add(reason)
+                self.deferred[reason] += 1
         return False, plan
 
     def _charged_hits(self, probe, offset: int) -> int:
