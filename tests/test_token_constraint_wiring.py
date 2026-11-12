@@ -431,11 +431,7 @@ def test_forward_prepares_constraints_after_staging_and_before_the_model_runs():
         ),
         pytest.raises(_Reached),
     ):
-        (
-            mod.ModelRunner.forward.__wrapped__(runner, batch)
-            if hasattr(mod.ModelRunner.forward, "__wrapped__")
-            else mod.ModelRunner.forward(runner, batch)
-        )
+        mod.ModelRunner.forward(runner, batch)
     assert events == ["staged", "prepare", "run_model"]
     (call,) = adapter.calls
     assert call[:2] == (runner, batch) and call[2] is metadata
