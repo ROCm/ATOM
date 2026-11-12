@@ -51,6 +51,7 @@ from atom.mono.device.ops import (
     rsrc,
     st_dev,
     traced,
+    wave_max,
 )
 from atom.mono.device.sync import POLL_MAX, preg, publish
 from atom.mono.plan.arith import pick, sel
@@ -88,7 +89,7 @@ def _plane_ptr(plane, tile, byte):
     )
 
 
-def _chunk_keys(a, t, ch0, width, wave, lane):
+def _chunk_keys(a, t, ch0, width, wave, lane, task_chunks=TASK_CHUNKS):
     """This lane's keys of chunks [ch0, ch0 + width) through token t's tile
     table (wave: a tile pair a chunk): every table load, then every key load,
     none waited on. A slot past ``width`` re-reads the last chunk (cache hits);
@@ -97,7 +98,7 @@ def _chunk_keys(a, t, ch0, width, wave, lane):
     r8 = lane % 8
     blks = [
         (ch0 + fx.min(width - 1, m)) * (ip.CHUNK // TILE) + 2 * wave + lane % 16 // 8
-        for m in range(TASK_CHUNKS)
+        for m in range(task_chunks)
     ]
     tiles = [
         fx.Int32(
@@ -201,31 +202,55 @@ def _score_chunk(c, t, bound, blocks, query, blk, ks, b64):
 
 
 @traced
-def stage_iscore(c, lead, span, ch0, width, max_chunks):
+def stage_iscore(c, lead, span, ch0, width, max_chunks, task_chunks=TASK_CHUNKS):
     """Chunks [ch0, ch0 + width) of the ``span`` tokens from ``lead``, which
     read lead's tile table (``index_plan.score_tasks``): the keys loaded once,
     every (token, chunk) scored, then one drain and the chunks' flags."""
     tid, lane, wave = c["tid"], c["lane"], c["wave"]
     a = c["args"]
     # a thread a (token, chunk) flag; its bound loaded with the keys
-    row = lead + tid // TASK_CHUNKS
-    m = tid % TASK_CHUNKS
+    row = lead + tid // task_chunks
+    m = tid % task_chunks
     row_bound = ld_i32(a["ibound"], fx.min(row, c["S"] - 1))
-    keys = _chunk_keys(a, lead, ch0, width, wave, lane)
+    keys = _chunk_keys(a, lead, ch0, width, wave, lane, task_chunks)
     for r in range(span):
         tok = lead + r
         tok_bound = ld_i32(a["ibound"], tok)
         query = _token_query(a, tok, lane)
         tok_blocks = ip.blocks(tok_bound)
-        for k in range_constexpr(TASK_CHUNKS):
+        for k in range_constexpr(task_chunks):
             if ip.task_writes(tok_bound, ch0, width, k):
                 _score_chunk(c, tok, tok_bound, tok_blocks, query, *keys[k])
-    who = (tid < span * TASK_CHUNKS) & ip.task_writes(row_bound, ch0, width, m)
+    who = (tid < span * task_chunks) & ip.task_writes(row_bound, ch0, width, m)
     publish(c["put"], c["isf"], row * max_chunks + ch0 + m, 1, who)
 
 
 @traced
 def stage_ilist(c, t, j, raw, kind, level, bound_max, max_chunks):
+    """Copy a whole short row directly; otherwise rank its selection list."""
+    k = ip.KINDS[kind]
+    bound = ip.kind_bound(kind, raw)
+    if const_expr(level == 0):
+        if bound <= k:
+            for r in range_constexpr(ip.cdiv(k, THREADS)):
+                pos = c["tid"] + r * THREADS
+                ident = Int32((pos < bound).select(pos, -1))
+                if const_expr(kind == "sel"):
+                    row, pool = _selected_rows(c, t, ident)
+                    _final(c, kind, t, pos, ident, (row, (ident >= 0).select(pool, 0)))
+                else:
+                    _final(c, kind, t, pos, ident)
+            region = "irdy" if kind == "sel" else "icrdy" if c["tok_par"] else None
+            if const_expr(region is not None):
+                _publish_all(c, region, t)
+        else:
+            _stage_ilist_rank(c, t, j, raw, kind, level, bound_max, max_chunks)
+    else:
+        _stage_ilist_rank(c, t, j, raw, kind, level, bound_max, max_chunks)
+
+
+@traced
+def _stage_ilist_rank(c, t, j, raw, kind, level, bound_max, max_chunks):
     """List j of ``level`` for token t (``raw`` its column bound); see the
     module. Only the lists ``index_plan.list_count`` gives a token run."""
     tid = c["tid"]
@@ -249,7 +274,7 @@ def stage_ilist(c, t, j, raw, kind, level, bound_max, max_chunks):
             gpu.barrier()
         else:
             below = ip.list_slots(kind, level - 1, bound_max)
-            base = tid * PER_THREAD
+            base = tid * (n <= ip.SEG // 2).select(PER_THREAD // 2, PER_THREAD)
             got = c["poll"](
                 [
                     (
@@ -277,37 +302,39 @@ def stage_ilist(c, t, j, raw, kind, level, bound_max, max_chunks):
             return [got[4 * q + e][0] for e in range(4)]
 
         keys = c["sel_lds"]["keys"]
-        first_i = tid * PER_THREAD
+        selected = c["sel_lds"]["hist"]
 
         def ident_of(d, i):
             return j * ip.SEG + i if level == 0 else got[d][1]
 
-        # a selection's rows (``_selected_rows``), in flight during the passes
-        def selected_rows():
-            return [
-                _selected_rows(c, t, ident_of(d, fx.min(first_i + d, n - 1)))
-                for d in range(PER_THREAD)
-            ]
-
         def emit(pos, d, i, rows):
             if const_expr(d is None):
                 ident, bits = fx.Int32(-1), fx.Float32(NEG).bitcast(fx.Int32)
-                picked = (fx.Int32(-1), fx.Int32(0))
             else:
                 ident = ident_of(d, i)
                 bits = key_bits(fx.ptr_load(keys + i))
-                picked = rows[d] if kind == "sel" else None
             if to_final:
-                _final(c, kind, t, pos, ident, picked)
+                if const_expr(kind == "sel"):
+                    fx.ptr_store(Int32(ident), selected + pos)
+                else:
+                    _final(c, kind, t, pos, ident)
             else:
                 c["put_words"](
                     c[f"i{kind}{level}"], ((t * slots + j) * k + pos) * 2, [bits, ident]
                 )
 
-        lds_topk(
-            n, k, load, emit, c["sel_lds"], tid, PER_THREAD,
-            selected_rows if kind == "sel" else None,
-        )  # fmt: skip
+        if n <= ip.SEG // 2:
+            lds_topk(n, k, load, emit, c["sel_lds"], tid, PER_THREAD // 2)
+        else:
+            lds_topk(n, k, load, emit, c["sel_lds"], tid, PER_THREAD)
+        if const_expr(kind == "sel"):  # noqa: SIM102
+            if to_final:  # noqa: SIM102
+                if tid < k:
+                    ident = fx.ptr_load(selected + tid)
+                    row, pool_row = _selected_rows(c, t, ident)
+                    _final(
+                        c, kind, t, tid, ident, (row, (ident >= 0).select(pool_row, 0))
+                    )
         # a selection's flag for the attention; the candidate blocks' only in a
         # token-parallel launch, which waits for every rank's (``await_candidates``)
         region = "irdy" if kind == "sel" else "icrdy" if c["tok_par"] else None
@@ -321,11 +348,9 @@ def _selected_rows(c, t, ident):
     compacted column lifted back to the row it stands for) and as the
     attention reads it: its pool row, through the block table (``attention.
     _key_row``'s arithmetic; every layer sharing this selection shares its KV
-    owner, so its row). Issue the loads for every element from ``after_keys``
-    before the top-k passes, allowing pool-table reads to overlap the passes.
-    Keep candidate loads branch-free and inside the token's candidate row;
-    FULL and padding discard their values. Branching around each candidate
-    load can serialize these prefetches through the in-order load counter."""
+    owner, so its row). Called once per selected entry after compacting IDs.
+    Candidate loads stay inside the token's candidate row; FULL and padding
+    discard their values."""
     a = c["args"]
     cand = fx.Int32(
         bo.buffer_load(
@@ -419,18 +444,39 @@ def run_indexer(c, s, bid, bound_max):
     a = c["args"]
     max_chunks = ip.chunks(bound_max)
     t0, n = _own_rows(c, s)
-    bounds = [ld_i32(a["ibound"], t0 + t) for t in range(n)]
     if const_expr(c["index_fp4"]):
         run_scores4(c, t0, n, bid, max_chunks)
     else:
-        run_scores(c, t0, n, bid, bounds, max_chunks)
-    _run_tree(c, t0, n, bid, "sel", bounds, bound_max, max_chunks)
+        run_scores(c, t0, n, bid, max_chunks)
+    _run_tree(c, t0, n, bid, "sel", bound_max, max_chunks)
     if a["iprod"] != 0:
-        _run_tree(c, t0, n, bid, "blk", bounds, bound_max, max_chunks)
+        _run_tree(c, t0, n, bid, "blk", bound_max, max_chunks)
 
 
 @traced
-def run_scores(c, t0, n, bid, bounds, max_chunks):
+def run_scores(c, t0, n, bid, max_chunks):
+    """Short rows use fixed token owners; longer rows also share key loads."""
+    assert n <= 64, n
+    largest = wave_max(ld_i32(c["args"]["ibound"], t0 + fx.min(c["lane"], n - 1)))
+    short_limit = ip.TOPK_BLOCKS * ip.BLOCK_ROWS if n <= 12 else ip.SEG
+    if largest <= short_limit:
+        per = BLOCKS // n
+        width = min(
+            TASK_CHUNKS, 1 << (ip.cdiv(ip.CHUNKS_PER_SEG, per) - 1).bit_length()
+        )
+        enter_stage("k2a.iscore")
+        if bid < n * per:
+            t = t0 + bid // per
+            bound = ld_i32(c["args"]["ibound"], t)
+            for ch0 in range(bid % per * width, ip.score_chunks(bound), per * width):
+                stage_iscore(c, t, 1, ch0, width, max_chunks, width)
+    else:
+        bounds = [ld_i32(c["args"]["ibound"], t0 + t) for t in range(n)]
+        run_scores_shared(c, t0, n, bid, bounds, max_chunks)
+
+
+@traced
+def run_scores_shared(c, t0, n, bid, bounds, max_chunks):
     """The score stage's tasks (``index_plan.score_tasks``) over rows t0 ..
     t0 + n. A request's tokens share its tile table (key metadata word 2: its
     block table offset); a REINDEX layer's are each token's own candidates."""
@@ -451,13 +497,15 @@ def run_scores(c, t0, n, bid, bounds, max_chunks):
 
 
 @traced
-def _run_tree(c, t0, n, bid, kind, bounds, bound_max, max_chunks):
+def _run_tree(c, t0, n, bid, kind, bound_max, max_chunks):
+    """Each token's CTA group walks only that token's live lists."""
     k = ip.KINDS[kind]
-    for level in range_constexpr(ip.top_level(kind, bound_max) + 1):
-        counts = [ip.list_count(ip.kind_bound(kind, b), level, k) for b in bounds]
-        enter_stage(f"k2a.i{kind}{level}")
-        for task in range(first_task(bid, 0), ip.flat_total(counts), BLOCKS):
-            t, j = ip.flat_task(counts, task)
-            stage_ilist(
-                c, t0 + t, j, pick(bounds, t), kind, level, bound_max, max_chunks
-            )
+    per = BLOCKS // n
+    if bid < n * per:
+        t = t0 + bid // per
+        raw = ld_i32(c["args"]["ibound"], t)
+        bound = ip.kind_bound(kind, raw)
+        for level in range_constexpr(ip.top_level(kind, bound_max) + 1):
+            enter_stage(f"k2a.i{kind}{level}")
+            for j in range(bid % per, ip.list_count(bound, level, k), per):
+                stage_ilist(c, t, j, raw, kind, level, bound_max, max_chunks)

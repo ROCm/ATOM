@@ -83,6 +83,7 @@ def _dcp_stage_indexer_fp4_prefill(
     kv_cache: torch.Tensor,
     kv_cache_scale: torch.Tensor,
     prefill_metadata,
+    layout="preshuffle",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Stage the whole key set's FP4 index planes into pages of this rank's own.
 
@@ -99,6 +100,37 @@ def _dcp_stage_indexer_fp4_prefill(
     # Built once per forward by the metadata builder.
     page = prefill_metadata.dcp_indexer_fp4_read_page
     row = prefill_metadata.dcp_indexer_fp4_read_row
+    if layout == "mfma":
+        # Scales cannot be indexed by the data plane's row axis. Gather
+        # each logical row's four bytes explicitly, then scatter the same
+        # OPUS permutation after the DCP all-gather.
+        g = torch.arange(4, device=kv_cache.device)
+        scale_at = (
+            g[None, :] % 2 * 128
+            + row[:, None] % 32 * 4
+            + g[None, :] // 2 * 2
+            + row[:, None] // 32
+        )
+        data = kv_cache[page, :, row, :]
+        scale = kv_cache_scale.view(-1, 256)[page[:, None], scale_at]
+        group = get_dcp_group()
+        gather_index = prefill_metadata.dcp_indexer_gather_index
+        data = group.all_gather(data, dim=0).index_select(0, gather_index)
+        scale = group.all_gather(scale, dim=0).index_select(0, gather_index)
+        page = prefill_metadata.dcp_indexer_fp4_stage_page
+        row = prefill_metadata.dcp_indexer_fp4_stage_row
+        pages = prefill_metadata.dcp_indexer_fp4_stage_pages
+        staged = kv_cache.new_zeros(pages, 4, 64, 16)
+        staged_scale = kv_cache_scale.new_zeros(pages, 2, 32, 4)
+        staged[page, :, row, :] = data
+        scale_at = (
+            g[None, :] % 2 * 128
+            + row[:, None] % 32 * 4
+            + g[None, :] // 2 * 2
+            + row[:, None] // 32
+        )
+        staged_scale.view(-1, 256)[page[:, None], scale_at] = scale
+        return staged, staged_scale
     data = kv_cache[page, :, :, row, :]
     scale = kv_cache_scale[page, :, :, prefill_metadata.dcp_indexer_fp4_read_scale_row]
 
@@ -144,6 +176,7 @@ def sparse_attn_indexer(
     is_neox_style: bool,
     use_qk_rope_cache_fusion: bool,
     stable_topk: bool,
+    kv_cache_scale: torch.Tensor | None = None,
 ) -> None:
     # Room for the DCP prefill all-gather to land in place. It produces
     # `world_size * ceil(N_q / world_size)` rows, up to `world_size - 1` more
@@ -192,7 +225,53 @@ def sparse_attn_indexer(
         k = k[:n_real]
         if positions is not None:
             positions = positions[:n_real]
-    if indexer_fp4:
+    if (
+        indexer_fp4
+        and getattr(indexer_module, "_index_cache_layout", "preshuffle") == "mfma"
+    ):
+        if kv_cache_scale is None:
+            raise ValueError(
+                "OPUS DSA FP4 requires its mutated scale plane as an op argument"
+            )
+        q_quant = torch.empty(
+            (*q_input.shape[:-1], head_dim // 2),
+            device=q_input.device,
+            dtype=torch.uint8,
+        )
+        q_fp4_scale = torch.empty(
+            fp4_q_scale_shape(
+                q_input.shape[0], q_input.shape[1], head_dim, layout="mfma"
+            ),
+            device=q_input.device,
+            dtype=torch.uint8,
+        )
+        weights_mqa = torch.empty(
+            weights.shape, device=weights.device, dtype=weights.dtype
+        )
+        indexer_qk_rope_quant_and_cache(
+            q_input,
+            q_quant,
+            weights,
+            weights_mqa,
+            k,
+            kv_cache,
+            slot_mapping,
+            k_norm_weight,
+            k_norm_bias,
+            positions,
+            cos_cache,
+            sin_cache,
+            k_norm_eps,
+            FP4_QUANT_BLOCK_SIZE,
+            scale_fmt,
+            weights_scale,
+            is_neox=is_neox_style,
+            q_scale_out=q_fp4_scale,
+            kv_cache_scale=kv_cache_scale,
+            scale_layout="opus",
+            rope_dim=indexer_module.rope_dim,
+        )
+    elif indexer_fp4:
         # `weights_out` comes back unscaled in q's dtype: the FP4 mqa-logits
         # kernels apply the per-group q scale inside the MFMA and take
         # `weights_scale` as their own fp32 scalar, so either folded in here
@@ -315,6 +394,7 @@ def sparse_attn_indexer(
             q_scale=q_fp4_scale,
             kv_scale=indexer_module.k_cache.kv_cache_scale if indexer_fp4 else None,
             weights_scale=weights_scale,
+            cache_layout=getattr(indexer_module, "_index_cache_layout", "preshuffle"),
         )
         return
     rows = attn_metadata.index_rows
@@ -403,11 +483,12 @@ def _index_cache(indexer, kv_cache, attn_metadata, is_prefill) -> IndexCache:
     if not indexer._indexer_fp4:
         return IndexCache(kv_cache, None, block)
     scales = indexer.k_cache.kv_cache_scale
+    layout = getattr(indexer, "_index_cache_layout", "preshuffle")
     if is_prefill and get_dcp_world_size() > 1:
         kv_cache, scales = _dcp_stage_indexer_fp4_prefill(
-            kv_cache, scales, attn_metadata
+            kv_cache, scales, attn_metadata, layout
         )
-    return IndexCache(kv_cache, scales, block)
+    return IndexCache(kv_cache, scales, block, layout)
 
 
 # The selection buffers are declared mutated so a compiled graph orders the
@@ -418,6 +499,7 @@ direct_register_custom_op(
     op_func=sparse_attn_indexer,
     mutates_args=[
         "kv_cache",
+        "kv_cache_scale",
         "sparse_kv_indices_buffer",
         "dcp_sparse_kv_indptr_buffer",
         "dcp_owned_counts_buffer",

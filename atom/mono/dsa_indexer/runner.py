@@ -17,6 +17,7 @@ from aiter.dist.parallel_state import (
     get_tp_group,
 )
 
+from atom.config import get_current_atom_config
 from atom.mono.dsa_indexer import kernel as kix
 from atom.mono.dsa_indexer.bind import IndexerHook, bind_indexers, logits_plane
 from atom.mono.runtime.consensus import MonoUnsupported, bind_agreed
@@ -55,6 +56,12 @@ class IndexerRunner:
             raise MonoUnsupported("no logits plane for a replicated step's ILOG")
         self.ix = replace(ix, peer_offset=peer_offset)
         self.device = next(iter(ix.modules.values())).wq_b.weight.device
+        # Bound decode and qlen-6 verify independently by reachable requests.
+        # Retain all legacy decode widths.
+        max_rows = min(
+            max_rows,
+            max(kix.MAX_LEGACY_TOKENS, get_current_atom_config().max_num_seqs),
+        )
         # the widest step it serves: its buffers are sized for it
         self.rows = max(
             (r for r in range(1, max_rows + 1) if self.ix.serves(r, 1, self.ilog)),
@@ -62,6 +69,17 @@ class IndexerRunner:
         )
         if not self.rows:
             raise MonoUnsupported("no step width the kernel serves")
+        verify_limit = min(
+            kix.MAX_VERIFY_TOKENS, get_current_atom_config().max_num_seqs * 6
+        )
+        self.verify_rows = max(
+            (
+                r
+                for r in range(6, verify_limit + 1, 6)
+                if self.ix.serves(r, 6, self.ilog)
+            ),
+            default=0,
+        )
         built = max(r for r in range(1, max_rows + 1) if not kix.unfit(self.ix.key(r)))
         if self.rows < built:
             logger.info(
@@ -70,11 +88,14 @@ class IndexerRunner:
                 self.rows,
                 built,
             )
-        widest = self.ix.key(self.rows)
-        self.scratch_bytes = kix.scratch_bytes(widest)
-        self.plain_bytes = kix.plain_bytes(widest)
+        # Compact-radix buckets can need less peer storage than a smaller
+        # legacy width. Cover every reachable layout, not only the last one.
+        keys = [self.ix.key(r) for r in range(1, self.rows + 1)]
+        keys += [self.ix.key(r, 6) for r in range(6, self.verify_rows + 1, 6)]
+        self.scratch_bytes = max(kix.scratch_bytes(key) for key in keys)
+        self.plain_bytes = max(kix.plain_bytes(key) for key in keys)
         # its regions start ``peer_offset`` into the peer buffer it shares
-        self.peer_bytes = peer_offset + kix.peer_bytes(widest)
+        self.peer_bytes = peer_offset + max(kix.peer_bytes(key) for key in keys)
         # the routing: a compiled stack's is installed before its first trace
         # (``dispatch``), an eager one's at ``attach``
         self.hook = hook
@@ -82,7 +103,7 @@ class IndexerRunner:
 
     def serves(self, rows: int, qlen: int) -> bool:
         return (
-            0 < rows <= self.rows
+            0 < rows <= (self.verify_rows if qlen == 6 else self.rows)
             and not rows % qlen
             and self.ix.serves(rows, qlen, self.ilog)
         )
@@ -138,9 +159,11 @@ class IndexerRunner:
         return self.serves(rows, qlen) and self.widths.prepare((rows, qlen))
 
     def serving(self, rows: int, qlen: int):
-        """The step's forward with the indexers on its build: the mailboxes
-        cleared and the peers fenced first, on the step's stream."""
-        self.mailboxes.begin_step()
+        """Serve this build after its local reset or original peer fence,
+        on the step's stream."""
+        from atom.mono.dsa_indexer.local_step import begin
+
+        begin(self, rows, qlen)
         return self.hook.serving(self.widths[(rows, qlen)])
 
     def unhook(self) -> None:

@@ -211,7 +211,7 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         load_spec = self._load_specs.get(sid)
         if load_spec is None:
             return matched
-        if self.block_size == 1:
+        if self.virtual_block_size == 1:
             # Allocating prompt-1 one-token blocks cannot provide a destination
             # for the complete final LMCache chunk. Recompute instead.
             self._clear_pending_load(sid)
