@@ -46,8 +46,10 @@ from typing import NamedTuple
 
 import torch
 
-from atom.sampling_params import RequiredChannel
-from atom.sampling_params import UNCONSTRAINED as UNCONSTRAINED
+from atom.sampling_params import (
+    UNCONSTRAINED,  # noqa: F401 - public compatibility export
+    RequiredChannel,
+)
 
 BLOCK_V = 1024
 """Vocabulary columns a `constrain_logits` program writes at a time."""
