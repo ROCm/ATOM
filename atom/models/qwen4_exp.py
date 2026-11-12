@@ -666,9 +666,11 @@ def _pad_rows(x: torch.Tensor, missing: int) -> torch.Tensor:
 
 
 class _SequenceParallel:
-    """Token sharding of the HC residual streams across the TP ranks.
+    """Token sharding across the TP ranks, shared by every model that
+    row-shards under TP: `shard`, `scatter` and `gather` take any `[T, ...]`
+    tensor; `maybe` is this model's gate.
 
-    The four-stream residual and its hyper-connections (grouped norm, two
+    Here it shards the HC residual streams. The four-stream residual and its hyper-connections (grouped norm, two
     low-rank GEMMs, gated mean) are per-token and replicated under plain TP,
     so every rank repeats the same work on all tokens. Sharding the tokens
     splits that work TP ways; the sub-layers still see every token through an
