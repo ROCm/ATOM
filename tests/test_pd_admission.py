@@ -108,13 +108,14 @@ def receive_success(seq, *, as_str=False):
 
 
 class SizedSeq(SimpleNamespace):
-    """A request with one prompt token per block of its `block_table`."""
+    """A request of `num_tokens` tokens, by default one per block it holds."""
 
     max_tokens = 64
     num_completion_tokens = 0
+    num_tokens = None
 
     def __len__(self):
-        return len(self.block_table)
+        return len(self.block_table) if self.num_tokens is None else self.num_tokens
 
 
 def standalone(max_bytes, *, reserve_tokens=None, free_blocks=0):
@@ -201,7 +202,7 @@ def test_fraction_uses_physical_pool_bytes(build, fraction):
 
 
 @pytest.mark.parametrize("chunked", [False, True])
-def test_free_kv_watermark_keeps_room_for_running_requests(build, chunked):
+def test_decode_reserve_keeps_room_for_running_requests(build, chunked):
     sched, request = build(
         chunked=chunked,
         num_kvcache_blocks=10,
@@ -240,7 +241,7 @@ def test_free_kv_watermark_keeps_room_for_running_requests(build, chunked):
 
 
 @pytest.mark.parametrize("chunked", [False, True])
-def test_free_kv_watermark_holds_while_admitted_requests_decode(build, chunked):
+def test_decode_reserve_holds_while_admitted_requests_decode(build, chunked):
     sched, request = build(
         chunked=chunked,
         num_kvcache_blocks=10,
@@ -266,7 +267,7 @@ def test_free_kv_watermark_holds_while_admitted_requests_decode(build, chunked):
     assert b.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
 
 
-def test_free_kv_watermark_admits_below_it_only_on_an_idle_decoder():
+def test_decode_reserve_admits_below_it_only_on_an_idle_decoder():
     policy = standalone(None, reserve_tokens=4, free_blocks=10)
     big = SizedSeq(id=1, block_table=[1, 2, 3, 4])
     decoding = SizedSeq(id=2, block_table=[9])
@@ -323,8 +324,21 @@ def test_decode_reserve_counts_each_growing_request_once():
     assert policy._growth_reserve(candidate, [ready, nearly_done]) == 4 + 1 + 4
 
 
+def test_decode_reserve_starts_from_the_blocks_a_request_holds():
+    policy = standalone(None, reserve_tokens=4, free_blocks=100)
+    # A draft round already took two blocks past AHEAD's 4 tokens. LAGGING's
+    # third token starts a block its next decode has yet to take. SPENT holds
+    # more than its last token needs.
+    ahead = SizedSeq(id=1, block_table=[1, 2, 3, 4, 5, 6], num_tokens=4)
+    lagging = SizedSeq(id=2, block_table=[7, 8], num_tokens=3)
+    spent = SizedSeq(id=3, block_table=[9, 10, 11], num_tokens=1, max_tokens=1)
+    candidate = SizedSeq(id=4, block_table=[12])
+    running = [ahead, lagging, spent]
+    assert policy._growth_reserve(candidate, running) == 2 + 5 + 0 + 4
+
+
 @pytest.mark.parametrize("chunked", [False, True])
-def test_free_kv_watermark_counts_claimed_prefix_hits(build, seq_factory, chunked):
+def test_decode_reserve_counts_claimed_prefix_hits(build, seq_factory, chunked):
     sched, request = build(
         chunked=chunked,
         prefix=True,
@@ -365,7 +379,7 @@ def test_free_kv_watermark_counts_claimed_prefix_hits(build, seq_factory, chunke
 
 
 @pytest.mark.parametrize("chunked", [False, True])
-def test_free_kv_watermark_skips_hits_on_blocks_another_request_holds(
+def test_decode_reserve_skips_hits_on_blocks_another_request_holds(
     build, seq_factory, chunked
 ):
     sched, request = build(

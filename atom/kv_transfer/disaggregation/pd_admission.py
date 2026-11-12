@@ -214,16 +214,23 @@ class PdAdmissionController:
         for entry in self.pending.values():
             if not entry.cancelled:
                 growing.setdefault(entry.sequence.id, entry.sequence)
-        growing[seq.id] = seq
-        return sum(map(self._growth_blocks, growing.values()))
+        # `seq` will hold just its prompt's blocks; `check` left its draft
+        # lookahead to this reserve.
+        reserve = self._growth_blocks(
+            seq, self._block_manager.num_pool_blocks(len(seq))
+        )
+        for admitted in growing.values():
+            reserve += self._growth_blocks(admitted, len(admitted.block_table))
+        return reserve
 
-    def _growth_blocks(self, seq) -> int:
-        # No more than the request may still generate, rounded to its pages.
+    def _growth_blocks(self, seq, held: int) -> int:
+        # Past the blocks `seq` holds, which can lead its length by a draft
+        # lookahead already allocated or trail it by the block this step's
+        # decode has yet to take. No more than it may still generate.
         tokens = min(
             self.reserve_tokens, max(0, seq.max_tokens - seq.num_completion_tokens)
         )
-        num_pool_blocks = self._block_manager.num_pool_blocks
-        return num_pool_blocks(len(seq) + tokens) - num_pool_blocks(len(seq))
+        return max(0, self._block_manager.num_pool_blocks(len(seq) + tokens) - held)
 
     def _charged_hits(self, probe, offset: int) -> int:
         """Prefix hits inside the receive range that pending credits already hold.
