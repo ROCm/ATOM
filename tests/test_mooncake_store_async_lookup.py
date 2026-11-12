@@ -9,7 +9,10 @@ from atom.kv_transfer.disaggregation.multi.multi_connector import (
     MultiConnectorScheduler,
 )
 from atom.kv_transfer.offload.mooncake_store.async_lookup import AsyncStoreLookup
-from atom.kv_transfer.offload.mooncake_store.config import uses_replay_pages
+from atom.kv_transfer.offload.mooncake_store.layouts import (
+    REPLAY_PAGE_CODEC_ID,
+    mooncake_codec_id,
+)
 
 
 def test_async_query_is_bounded_and_cancellable():
@@ -50,12 +53,12 @@ def test_v41_page_path_does_not_admit_other_hybrid_models():
         ("deepseek_v4", False),
         ("qwen3_next", False),
     ]:
-        assert (
-            uses_replay_pages(
-                SimpleNamespace(hf_config=SimpleNamespace(model_type=name))
-            )
-            == allowed
-        )
+        config = SimpleNamespace(hf_config=SimpleNamespace(model_type=name))
+        if allowed:
+            assert mooncake_codec_id(config) == REPLAY_PAGE_CODEC_ID
+        else:
+            with pytest.raises(ValueError):
+                mooncake_codec_id(config)
 
 
 def test_multi_prefetch_only_on_producer_not_decode_receiver():
