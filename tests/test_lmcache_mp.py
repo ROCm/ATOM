@@ -363,6 +363,7 @@ def test_scheduler_reserves_locks_for_every_collapsed_tp_reader(
 ):
     @dataclass(frozen=True)
     class Key:
+        request_id: str = "req"
         num_kv_readers: int = 1
 
     class AtomMPParallelConfig:

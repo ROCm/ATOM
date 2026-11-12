@@ -353,17 +353,10 @@ def _make_scheduler_adapter(
             # session -> `tier_cache_salt`, for salted prompts only.
             self.cache_salts: dict[str, str] = {}
 
-        def _create_key(
-            self,
-            token_ids: list[int],
-            start: int,
-            end: int,
-            request_id: str,
-            worker_id: int | None,
-        ) -> Any:
-            key = super()._create_key(token_ids, start, end, request_id, worker_id)
+        def _create_key(self, *args: Any, **kwargs: Any) -> Any:
+            key = super()._create_key(*args, **kwargs)
             key = replace(key, num_kv_readers=num_kv_readers)
-            salt = self.cache_salts.get(request_id)
+            salt = self.cache_salts.get(key.request_id)
             return replace(key, cache_salt=salt) if salt else key
 
         def salt_session(self, request_id: str, salt: str) -> None:
