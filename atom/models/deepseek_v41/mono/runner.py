@@ -561,8 +561,6 @@ class V41MonoDecodeRunner:
             self._own_rows(rows),
         )
         state = SinglePassHCState.from_embeddings(hidden, model.config.hc_mult)
-        # an unfused width: the selection owners this step has published
-        published = set()
         for spec, block, weights, key in zip(
             model.topology, model.layers, self.layers, self.build.keys
         ):
@@ -593,7 +591,7 @@ class V41MonoDecodeRunner:
                     # this width's K2 has no index stage: ATOM's own indexer
                     # makes the selection and K2 reads it
                     self._score(block, cache, step, rope)
-                    self._publish_selection(spec, cache, step, published)
+                    self._publish_selection(spec, cache, step)
                 elif self.check:
                     # the original scorer, the reference the selection is held to
                     block.attn.indexer.score_quantized(
@@ -667,16 +665,12 @@ class V41MonoDecodeRunner:
             # as check mode scores them
             indexer.score_quantized(self.iq, self.iw, cache, step)
 
-    def _publish_selection(self, spec, cache, step, published: set) -> None:
+    def _publish_selection(self, spec, cache, step) -> None:
         """An unfused width's selection where K2 reads it: owner
         ``spec.layer_id``'s pool rows in ``irow`` and, on a candidate producer,
         its blocks in ``icand`` -- what a fused build's K2 writes itself
-        (``index_score._final``). Once an owner a step: every layer that shares
-        a selection shares its KV owner, so its rows."""
+        (``index_score._final``)."""
         owner = spec.layer_id
-        if owner in published:
-            return
-        published.add(owner)
         geometry = cache.geometry
         write_selection_rows(
             self.irow[owner],
