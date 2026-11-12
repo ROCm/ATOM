@@ -263,7 +263,9 @@ frees it. Instead, a transfer that is still not terminal after
 `lmcache.mp.transfer_deadline_s` (default 30 s) is fatal: the worker raises
 `LMCacheTransferUnprovable` and the engine stops. This is a per-transfer deadline
 from submission, including time queued at the MP server, not a model request
-timeout or a heartbeat timeout. It also catches a live server whose ZMQ handler
+timeout or a heartbeat timeout. A native-state load's restore is held to the same
+deadline, counted from when its copy is enqueued, not from submission.
+The deadline from submission also catches a live server whose ZMQ handler
 failed without replying; no LMCache transport changes are required. The scheduler
 independently watches dispatched operations with an additional 10 s margin for
 lost or never-aggregated completion reports. These checks run when the respective
