@@ -25,9 +25,9 @@ def test_mla_backend_import(monkeypatch, family, triton):
     assert backend.get_builder_cls() is not None
 
 
-def _inputs(block_size, q_len, quant, shuffled=False):
+def _inputs(block_size, q_len, quant, shuffled=False, heads=16):
     torch.manual_seed(42)
-    heads, rank, rope = 16, 512, 64
+    rank, rope = 512, 64
     lengths = [19, 67, 129]
     blocks_per_seq = (max(lengths) + block_size - 1) // block_size
     num_blocks = len(lengths) * blocks_per_seq + 3
@@ -113,6 +113,113 @@ def test_triton_mla_decode_matches_reference(block_size, shuffled, q_len, quant)
     # before PV, whereas the reference keeps the entire attention in FP32.
     atol = 0.04 if quant == "fp8_qkv" else 0.01
     torch.testing.assert_close(actual.float(), expected, atol=atol, rtol=0.02)
+
+
+def _fp4_decoded(kv, fmt):
+    """The values a packed FP4 cache row decodes to, from aiter's quantizers."""
+    from aiter.ops.triton.quant import dynamic_mxfp4_quant, dynamic_nvfp4_quant
+    from aiter.utility.fp4_utils import e8m0_to_f32, mxfp4_to_f32
+
+    rows = kv.reshape(-1, kv.shape[-1]).contiguous()
+    if fmt == "mxfp4_fp8rope":
+        rank = 512
+        latent = _fp4_decoded(rows[:, :rank].contiguous(), "mxfp4")
+        rope = rows[:, rank:].to(e4m3_dtype).float()
+        return torch.cat([latent, rope], dim=-1).view(kv.shape)
+    if fmt == "mxfp4_b16":
+        # aiter's dynamic_mxfp4_quant is fixed at 32 values per scale: quantize
+        # each 16-value block twice over, so its scale is the block's own.
+        blocks = rows.reshape(-1, 16)
+        packed, scales = dynamic_mxfp4_quant(torch.cat([blocks, blocks], -1))
+        values = mxfp4_to_f32(packed.view(torch.uint8))[:, :16]
+        scale = e8m0_to_f32(scales.view(torch.uint8)).reshape(-1, 1)
+        return (values * scale).reshape(kv.shape)
+    if fmt == "mxfp4":
+        packed, scales = dynamic_mxfp4_quant(rows)
+        scales = e8m0_to_f32(scales.view(torch.uint8)).repeat_interleave(32, dim=-1)
+    else:
+        packed, scales = dynamic_nvfp4_quant(rows)
+        scales = scales.view(e4m3_dtype).float().repeat_interleave(16, dim=-1)
+    return (mxfp4_to_f32(packed.view(torch.uint8)) * scales).view(kv.shape)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+@pytest.mark.parametrize("fmt", ["mxfp4", "mxfp4_b16", "mxfp4_fp8rope", "nvfp4"])
+@pytest.mark.parametrize(
+    "q_len",
+    [
+        1,
+        pytest.param(
+            4,
+            marks=pytest.mark.xfail(
+                reason="the Gluon shuffled decode (BF16/FP8 too) mishandles a "
+                "query whose context ends on a tile edge, as the 129-token "
+                "sequence's does with 4 queries"
+            ),
+        ),
+    ],
+)
+def test_triton_mla_decode_fp4_kv_matches_reference(fmt, q_len):
+    """An FP4 cache filled by the shuffled writer ATOM uses for prefill and read
+    back through _forward_decode attends exactly over its decoded values."""
+    from aiter.ops.triton.kv_cache import cat_and_cache_mla
+
+    from atom.model_ops.mla_fp4_kv import FP4_KV_BLOCK_SIZE, mla_kv_cache_row_width
+
+    if fmt == "mxfp4_fp8rope" and q_len > 1:
+        pytest.skip("FP8 rope is decoded one query token at a time")
+    block_size = FP4_KV_BLOCK_SIZE
+    # FP8 rope is read by the LDS pipeline, which takes 128 heads at once.
+    heads = 128 if fmt == "mxfp4_fp8rope" else 16
+    layer, q, _, metadata, _ = _inputs(
+        block_size, q_len, "fp8_qkv", shuffled=True, heads=heads
+    )
+    layer.fp4_kv_format = fmt
+    layer._k_scale = torch.tensor(1.0, device="cuda")
+    rank, rope = layer.kv_lora_rank, layer.qk_rope_head_dim
+    num_blocks = metadata.block_tables.numel() + 3
+    torch.manual_seed(7)
+    kv = torch.randn(num_blocks * block_size, 1, rank + rope, device="cuda").bfloat16()
+    row = mla_kv_cache_row_width(rank + rope, rope, fmt)
+    cache = torch.zeros(
+        num_blocks, 1, block_size, row, dtype=torch.uint8, device="cuda"
+    )
+    cat_and_cache_mla(
+        kv[..., :rank],
+        kv[..., rank:],
+        cache,
+        torch.arange(kv.shape[0], device="cuda"),
+        layer._k_scale,
+        shuffled_kv_cache=True,
+        fp4_kv_format=fmt,
+    )
+    actual = layer._forward_decode(q, cache.view(-1, 1, row), metadata)
+    decoded = _fp4_decoded(kv, fmt).view(num_blocks, block_size, rank + rope)
+    expected = _reference(layer, q, decoded, metadata)
+    torch.testing.assert_close(actual.float(), expected, atol=0.04, rtol=0.02)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+@pytest.mark.parametrize("block_size,shuffled", [(16, False), (64, True)])
+def test_triton_mla_decode_ignores_query_less_padded_sequences(block_size, shuffled):
+    """In a step where a DP peer prefills, a decoding rank's q holds only its
+    own rows while the per-sequence metadata is padded to the group's batch
+    with query-less sequences; the real sequences must still be attended."""
+    layer, q, cache, metadata, kv = _inputs(block_size, 1, "fp8_qkv", shuffled)
+    expected = _reference(layer, q, kv, metadata)
+    pad = 5
+    num_seqs = metadata.context_lens.numel()
+    padded = AttentionMetaData(
+        cu_seqlens_q=torch.nn.functional.pad(
+            metadata.cu_seqlens_q, (0, pad), value=num_seqs
+        ),
+        context_lens=torch.nn.functional.pad(metadata.context_lens, (0, pad)),
+        max_seqlen_q=1,
+        max_seqlen_k=metadata.max_seqlen_k,
+        block_tables=torch.nn.functional.pad(metadata.block_tables, (0, 0, 0, pad)),
+    )
+    actual = layer._forward_decode(q, cache, padded)
+    torch.testing.assert_close(actual.float(), expected, atol=0.04, rtol=0.02)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")

@@ -2912,6 +2912,14 @@ class Config:
                 # V4.1 runtime gate, which refuses anything else before weights
                 # load. Overriding it here would accept the flag and ignore it.
                 self.index_cache_dtype = "fp8"
+            elif self.kv_cache_dtype in (
+                "mxfp4",
+                "mxfp4_b16",
+                "mxfp4_fp8rope",
+                "nvfp4",
+            ):
+                # The packed MLA formats have no indexer counterpart.
+                self.index_cache_dtype = "fp8"
             else:
                 self.index_cache_dtype = self.kv_cache_dtype
 
