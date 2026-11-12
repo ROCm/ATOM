@@ -63,15 +63,14 @@ def test_patched_forward_plan_matches_per_layer_rebuild(monkeypatch, cache_dtype
     )
     builder = SimpleNamespace(
         dcp_sparse_prefill_nonps=False,
+        dcp_world_size=8,
         block_size=1,
         dtype_q=dtype,
         dtype_kv=dtype,
         index_topk_out=topk,
         model_runner=SimpleNamespace(forward_vars=work_buffers("sparse_prefill_")),
     )
-    AiterMLAMetadataBuilder._sparse_prefill_work_plan(
-        builder, meta, "", heads, last, whole_rows=True
-    )
+    AiterMLAMetadataBuilder._sparse_prefill_work_plan(builder, meta, "", heads, last)
 
     monkeypatch.setenv("ATOM_MLA_PAGE_SIZE", "1")
     monkeypatch.setattr(
@@ -104,7 +103,6 @@ def test_patched_forward_plan_matches_per_layer_rebuild(monkeypatch, cache_dtype
         "dcp_sparse_prefill_nonps": False,
         "owns_sparse_indexer": True,
         "sparse_prefill_head_groups": None,
-        "_sparse_prefill_kv_granularity": topk,
     }.items():
         setattr(attn, name, value)
 
@@ -170,3 +168,66 @@ def test_patched_forward_plan_matches_per_layer_rebuild(monkeypatch, cache_dtype
         else:
             assert torch.equal(out, expected)
             assert torch.equal(lse, expected_lse)
+
+
+@pytest.mark.parametrize("rows", [64, 257])
+@pytest.mark.parametrize("cache_dtype", ["bf16", "fp8"])
+def test_patch_stops_at_the_plans_last_item(cache_dtype, rows):
+    """A PCP replan's dummy query has no keys, and the planner gives such a
+    row no work item when it lands on a nearly full CU. The patch rewrites
+    the plan's items only, not one a row past its end."""
+    from types import SimpleNamespace
+
+    from aiter import dtypes, get_mla_metadata_info_v1
+
+    from atom.model_ops.attentions.aiter_mla import AiterMLAMetadataBuilder
+    from atom.model_ops.attentions.sparse_mla_head_groups import (
+        PERSISTENT_WORK_BUFFERS,
+    )
+    from atom.model_ops.sparse_mla_work_plan import patch_work_kv_ranges
+
+    dtype = dtypes.fp8 if cache_dtype == "fp8" else torch.bfloat16
+    heads, topk = 96, 2048
+    gen = torch.Generator(device="cuda").manual_seed(500 + rows)
+    sizes = get_mla_metadata_info_v1(
+        rows, 1, heads, dtype, dtype, is_sparse=True, fast_mode=True
+    )
+    work = {
+        "sparse_prefill_" + name: torch.empty(shape, dtype=dt, device="cuda")
+        for name, (shape, dt) in zip(PERSISTENT_WORK_BUFFERS, sizes)
+    }
+    # Leftovers whose row lies before the indptr.
+    work["sparse_prefill_work_info_set"].fill_(-1)
+    selected = torch.full((rows,), topk, dtype=torch.int32, device="cuda")
+    selected[-1] = 0
+
+    def indptr(counts):
+        return torch.cat([counts.new_zeros(1), counts.cumsum(0)]).int()
+
+    meta = SimpleNamespace(
+        sparse_cu_seqlens_q=torch.arange(rows + 1, dtype=torch.int32, device="cuda"),
+        sparse_kv_indptr=indptr(selected),
+    )
+    builder = SimpleNamespace(
+        dcp_sparse_prefill_nonps=False,
+        dcp_world_size=8,
+        block_size=1,
+        dtype_q=dtype,
+        dtype_kv=dtype,
+        index_topk_out=topk,
+        model_runner=SimpleNamespace(forward_vars=work),
+    )
+    last = torch.ones(rows, dtype=torch.int32, device="cuda")
+    AiterMLAMetadataBuilder._sparse_prefill_work_plan(builder, meta, "", heads, last)
+    items = int(meta.sparse_prefill_work_indptr[-1])
+    assert items == rows - 1, "the zero-key row kept its work item"
+
+    info = meta.sparse_prefill_work_info_set
+    leftovers = info[items:rows].clone()
+    owned = (selected * torch.rand(rows, generator=gen, device="cuda")).ceil().int()
+    kvptr = indptr(owned)
+    patch_work_kv_ranges(info, meta.sparse_prefill_work_indptr, kvptr, rows)
+    assert torch.equal(info[items:rows], leftovers)
+    planned = info[:items, 0].long()
+    assert torch.equal(info[:items, 4], kvptr[planned])
+    assert torch.equal(info[:items, 5], kvptr[planned + 1])

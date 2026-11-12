@@ -2426,6 +2426,7 @@ class MLAAttention(nn.Module):
                 elif sparse_dcp_persistent and self.owns_sparse_indexer:
                     patch_work_kv_ranges(
                         attn_metadata.sparse_prefill_work_info_set,
+                        attn_metadata.sparse_prefill_work_indptr,
                         paged_kv_indptr,
                         B,
                     )

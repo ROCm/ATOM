@@ -16,10 +16,10 @@ BLOCK = 256
 
 
 @triton.jit
-def _patch_work_kv_ranges(work_info, kv_indptr, rows, BLOCK: tl.constexpr):
+def _patch_work_kv_ranges(work_info, items, kv_indptr, BLOCK: tl.constexpr):
     # aiter's MlaWorkInfo is eight int32: the row at 0, KV start and end at 4, 5.
     item = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    live = item < rows
+    live = item < tl.load(items)
     info = work_info + item * 8
     row = tl.load(info, mask=live, other=0)
     # The planner counts KV from the indptr's first entry.
@@ -29,15 +29,20 @@ def _patch_work_kv_ranges(work_info, kv_indptr, rows, BLOCK: tl.constexpr):
 
 
 def patch_work_kv_ranges(
-    work_info_set: torch.Tensor, kv_indptr: torch.Tensor, rows: int
+    work_info_set: torch.Tensor,
+    work_indptr: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    rows: int,
 ) -> None:
-    """Give each of a whole-row plan's ``rows`` work items its row's range in
-    ``kv_indptr``.
+    """Give each work item of a whole-row plan over ``rows`` query rows its
+    row's range in ``kv_indptr``.
 
-    The plan must hold one unsplit work item a row, as a plan at a KV
-    granularity no row exceeds does. aiter's persistent MLA kernel takes a
-    row's keys from its work item alone, not from the indptr it is passed.
+    The plan must hold at most one unsplit work item a row, as a plan at a KV
+    granularity no row exceeds does. A row with no keys can get no item, so
+    the plan's own item count (``work_indptr[-1]``) bounds the patch. aiter's
+    persistent MLA kernel takes a row's keys from its work item alone, not
+    from the indptr it is passed.
     """
     _patch_work_kv_ranges[(triton.cdiv(rows, BLOCK),)](
-        work_info_set, kv_indptr, rows, BLOCK=BLOCK
+        work_info_set, work_indptr[-1:], kv_indptr, BLOCK=BLOCK
     )

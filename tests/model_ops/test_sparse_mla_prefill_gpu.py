@@ -22,6 +22,7 @@ def _forward_work_plan(meta, heads, dtype, topk_out):
 
     builder = SimpleNamespace(
         dcp_sparse_prefill_nonps=False,
+        dcp_world_size=8,
         block_size=1,
         dtype_q=dtype,
         dtype_kv=dtype,
@@ -35,7 +36,7 @@ def _forward_work_plan(meta, heads, dtype, topk_out):
         ),
     )
     AiterMLAMetadataBuilder._sparse_prefill_work_plan(
-        builder, meta, "", heads, meta.sparse_kv_last_page_lens, whole_rows=True
+        builder, meta, "", heads, meta.sparse_kv_last_page_lens
     )
 
 
@@ -447,7 +448,7 @@ def test_bf16_sparse_prefill_is_independent_of_batch_composition(candidate_width
             **{"sparse_prefill_" + name: value for name, value in work.items()},
         )
         _forward_work_plan(meta, 96, q.dtype, candidate_width)
-        patch_work_kv_ranges(work["work_info_set"], kvptr, rows)
+        patch_work_kv_ranges(work["work_info_set"], work["work_indptr"], kvptr, rows)
         # Each live row has one whole interval, even at the smallest batch.
         info = work["work_info_set"][: int(work["work_indptr"][-1])].cpu()
         starts = kvptr.cpu().tolist()
