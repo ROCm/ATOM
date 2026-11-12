@@ -8,6 +8,7 @@ from __future__ import annotations
 from typing import ClassVar
 
 import torch
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 from atom.models.qwen3_5.mono.config import StepInputError
 from atom.models.qwen3_5.mono.kernels.layer import build_qwen35_kernel
@@ -318,7 +319,8 @@ class Qwen35MonoKernel:
         v = self.variant
         if begin:  # standalone: this launch is a step of the variant's own mailboxes
             v.begin_step()
-        v.launch(
+        _run_compiled(
+            v.launch,
             ptr(h),
             ptr(x_out),
             ptr(sl_in),
@@ -367,6 +369,6 @@ class Qwen35MonoKernel:
             layer,
             bt_stride,
             tl,
-            stream=torch.cuda.current_stream(),
+            torch.cuda.current_stream(),
         )
         return x_out

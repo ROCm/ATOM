@@ -242,7 +242,7 @@ def test_every_bf16_gemm_the_kernel_follows_is_asked_of_aiter(weights):
         name: (n, k, rule)
         for name, n, k, rule in layout.bf16_gemms(Q35Config(weights=weights))
     }
-    want = {"router": (513, 4096, "router"), "in_proj_ba": (32, 4096, None)}
+    want = {"router": (528, 4096, "router"), "in_proj_ba": (32, 4096, None)}
     if weights == "mxfp4":
         want |= {
             "in_proj_qkvz": (5120, 4096, None),

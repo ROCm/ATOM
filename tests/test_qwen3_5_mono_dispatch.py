@@ -17,7 +17,7 @@ class _Mode:
     def __init__(self, piecewise):
         self.piecewise = piecewise
 
-    def requires_piecewise_compilation(self):
+    def uses_tr_hybrid(self):
         return self.piecewise
 
 
@@ -128,7 +128,7 @@ def test_a_flat_text_config_is_read(native):
                     level=3, cudagraph_mode=_Mode(True)
                 )
             },
-            "piecewise",
+            "TR_HYBRID",
         ),
         ({"kv_cache_dtype": "bf16"}, "kv cache bf16"),
         ({"kv_cache_block_size": 1024}, "KV block size 1024"),

@@ -338,7 +338,8 @@ class Qwen35MonoDecodeRunner:
         mx = cfg.weights == "mxfp4"
         E, inter, hidden = cfg.n_experts, cfg.local_inter, cfg.hidden
         model = torch.bfloat16
-        _need(i, "router", mlp.gate.weight, (E + 1, hidden), model)
+        # ATOM zero-pads the router + shared-gate rows (513) to 16 (output_row_alignment)
+        _need(i, "router", mlp.gate.weight, (router_rows(E), hidden), model)
         for k in ("input_layernorm", "post_attention_layernorm"):
             _need(i, k, getattr(layer, k).weight, (hidden,))
         if mx:
@@ -404,14 +405,8 @@ class Qwen35MonoDecodeRunner:
                 (E + 1, hidden // 128, inter // 128),
                 f32_,
             )
-        w_r = torch.zeros(
-            router_rows(cfg.n_experts),
-            cfg.hidden,
-            dtype=torch.bfloat16,
-            device=self.dev,
-        )
-        # 512 experts, then the shared-expert gate row (one merged linear in both formats)
-        w_r[: cfg.n_experts + 1] = mlp.gate.weight
+        # 512 experts, then the shared-expert gate row (one merged linear in both formats), zero rows
+        w_r = mlp.gate.weight
         p = {
             "g_in1": 1.0 + f32(layer.input_layernorm.weight),
             "g_post1": 1.0 + f32(layer.post_attention_layernorm.weight),

@@ -97,7 +97,8 @@ BF16_GEMM_RULES = {
     "out": {m: ("halves",) if m <= 8 or m == 12 else ("single",) for m in range(1, 17)},
     # the MXFP4 checkpoint's shared gate_up (N 512, K 4096)
     "shared_ug": _SPLITK_512x4096,
-    # the router and the shared-expert gate: one merged GEMM (N 513, K 4096; both checkpoints), torch
+    # the router and the shared-expert gate: one merged GEMM (N 513, which ATOM pads to 528; K 4096; both
+    # checkpoints), torch
     "router": {m: ("single",) for m in range(1, 17)},
 }
 
@@ -108,7 +109,7 @@ def bf16_gemms(cfg) -> list[tuple[str, int, int, str | None]]:
     rank: the router and the GDN b | a projection in both checkpoints, the MXFP4 checkpoint's BF16
     projections and shared expert."""
     gemms = [
-        ("router", cfg.n_experts + 1, cfg.hidden, "router"),
+        ("router", router_rows(cfg.n_experts), cfg.hidden, "router"),
         ("in_proj_ba", 2 * cfg.hv, cfg.hidden, None),
     ]
     if cfg.weights == "mxfp4":
