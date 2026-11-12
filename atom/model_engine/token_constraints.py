@@ -352,11 +352,11 @@ def _merge_invalid(previous, current):
 def _guard_empty_rows(logits, selected=None):
     if selected is None:
         selected = torch.ones(logits.shape[0], dtype=torch.bool, device=logits.device)
-    invalid = torch.zeros(logits.shape[0], dtype=torch.bool, device=logits.device)
     if logits.is_cuda:
         from atom.model_ops.required_channel_gpu import guard_empty_rows
 
         return guard_empty_rows(logits, selected)
+    invalid = torch.zeros(logits.shape[0], dtype=torch.bool, device=logits.device)
     rows = selected.nonzero().flatten()
     subset = logits.index_select(0, rows)
     bad = ~torch.isfinite(subset).any(dim=-1)

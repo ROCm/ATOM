@@ -306,7 +306,7 @@ def _finite_tiles(
     tiles: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    row, tile = tl.program_id(0), tl.program_id(1)
+    row, tile = tl.program_id(0).to(tl.int64), tl.program_id(1)
     if tl.load(selected + row):
         columns = tile * BLOCK + tl.arange(0, BLOCK)
         values = tl.load(

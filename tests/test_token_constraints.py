@@ -9,9 +9,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-boundary = pytest.importorskip(
-    "atom.model_engine.token_constraints", exc_type=ImportError
-)
+from atom.model_engine import token_constraints as boundary
 
 
 def test_unconstrained_step_does_not_touch_backend_or_logits():
@@ -136,3 +134,23 @@ def test_channel_backend_keeps_gpu_carry_and_draft_metadata(monkeypatch, carry):
     assert kwargs["cu_num_draft_tokens"] is metadata.cu_num_draft_tokens
     assert kwargs["target_logits_indices"] is metadata.target_logits_indices
     assert kwargs["target_logits"] is target
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("select_tail", [False, True])
+def test_gpu_guard_row_address_exceeds_int32(dtype, select_tail):
+    if not torch.cuda.is_available():
+        pytest.skip("Requires a GPU for the real intersection kernel")
+    stride = 2**30 + 17
+    storage_bytes = (2 * stride + 1) * torch.empty((), dtype=dtype).element_size()
+    free_bytes, _ = torch.cuda.mem_get_info()
+    if free_bytes < storage_bytes + 64 * 1024**2:
+        pytest.skip(f"Requires {storage_bytes} bytes of free GPU storage")
+    logits = torch.empty_strided((3, 1), (stride, 1), dtype=dtype, device="cuda")
+    logits[:, 0] = torch.tensor([3.0, -1.0, -float("inf")], dtype=dtype, device="cuda")
+    selected = torch.tensor([True, True, select_tail], device="cuda")
+    assert 2 * logits.stride(0) > 2**31 - 1
+    invalid = boundary._guard_empty_rows(logits, selected)
+    assert invalid.tolist() == [False, False, select_tail]
+    expected_tail = 0.0 if select_tail else -float("inf")
+    assert logits[:, 0].tolist() == [3.0, -1.0, expected_tail]
