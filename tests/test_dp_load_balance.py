@@ -2292,6 +2292,20 @@ def test_prefix_spread_leaf_evict_counts_events_blocks_and_tokens():
     assert end["trim_blocked_total"] == 0  # nothing was pinned: never "blocked"
 
 
+def test_prefix_spread_dropping_released_empty_edges_is_not_counted_as_eviction():
+    router = _make_spread_mgr()._prefix_router
+    for seq_id in (1, 2):
+        seq = _chain_seq(seq_id, 10 * 128, first_block=seq_id * 1_000)
+        router.charge(seq_id, router.place(seq, 0, 2).credit)
+    router.release(1)  # unfinished prefill released: its edge empties and goes
+    router.reset()  # the other one's pending claim is dropped: same
+    got = router.index_counters()
+    assert got["edges"] == 0 and got["indexed_tokens"] == 0
+    assert got["leaf_evict_total"] == got["tail_trim_total"] == 0
+    assert got["over_budget_total"] == got["trim_blocked_total"] == 0
+    assert got["leaf_evict_blocks_total"] == got["leaf_evict_tokens_total"] == 0
+
+
 def test_prefix_spread_trim_token_counters_use_the_chains_hash_block_size():
     router = _make_spread_mgr()._prefix_router
     for seq_id, blocks in ((1, 100), (2, 4)):
