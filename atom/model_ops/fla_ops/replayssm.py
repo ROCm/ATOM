@@ -49,6 +49,7 @@ __all__ = [
     "replayssm_buffer_shapes",
     "replayssm_commit",
     "replayssm_gated_delta_rule",
+    "replayssm_kda_fused_update",
     "replayssm_materialize",
     "replayssm_sigmoid_gating_delta_rule",
 ]
@@ -1583,16 +1584,22 @@ def replayssm_gated_delta_rule(
 
 
 @triton.jit
+def _kda_log_decay(x, b_A, LOWER_BOUND, USE_LOWER_BOUND):
+    """KDA's log-decay of ``x = a + dt_bias``, elementwise over any shape."""
+    if USE_LOWER_BOUND:
+        return LOWER_BOUND * tl.sigmoid(tl.exp(b_A) * x)
+    softplus_x = tl.where(x <= 20.0, tl.log(1 + tl.exp(x)), x)
+    return -tl.exp(b_A) * softplus_x
+
+
+@triton.jit
 def _kda_gate(A_log_ptr, a_ptr, dt_bias_ptr, mask_k, LOWER_BOUND, USE_LOWER_BOUND):
     """Per-K-channel log-decay, matching fused_sigmoid_gating's two branches."""
     x = tl.load(a_ptr, mask=mask_k, other=0.0).to(tl.float32) + tl.load(
         dt_bias_ptr, mask=mask_k, other=0.0
     ).to(tl.float32)
     b_A = tl.load(A_log_ptr).to(tl.float32)
-    if USE_LOWER_BOUND:
-        return LOWER_BOUND * tl.sigmoid(tl.exp(b_A) * x)
-    softplus_x = tl.where(x <= 20.0, tl.log(1 + tl.exp(x)), x)
-    return -tl.exp(b_A) * softplus_x
+    return _kda_log_decay(x, b_A, LOWER_BOUND, USE_LOWER_BOUND)
 
 
 @triton.jit(do_not_specialize=["N", "T_TOT", "T_MAX", "CAP"])
@@ -1889,3 +1896,443 @@ def replayssm_sigmoid_gating_delta_rule(
         num_stages=3,
     )
     return out
+
+
+# --------------------------------------------------------------------------- #
+# KDA decode / verify, fused from the in_proj output                           #
+# --------------------------------------------------------------------------- #
+#
+# The unfused KDA decode / verify chain is `causal_conv1d_update`, the
+# `f_b_proj` GEMM and the kernel above, each over a few dozen rows. The
+# kernel below does all three from the in_proj output's column views. One
+# program owns one head of one sequence: the head's q/k/v conv channels, its
+# checkpoint and its records. The conv state may be updated in place and a
+# flush rewrites the records the replay reads, so every read of either has to
+# land before any write. Only a barrier inside one program can order that:
+# `tl.debug_barrier` also orders the global memory accesses of the program's
+# warps.
+#
+# Whatever does not depend on the state -- the conv, the gate, the q / k
+# normalisation and exp(g) -- runs over the whole step up front, and the
+# token loop reads it back a row at a time from a scratch buffer. The loop is
+# then the state update alone, on the state held as [4, V, K // 4]: a thread
+# keeps a quarter-K strip of a few V rows, so most of a reduction over K stays
+# in the thread. The conv output and the gate projection are rounded to bf16
+# where the unfused path stores them, so the recurrence starts from the values
+# it would have read.
+
+
+@triton.jit
+def _conv_rows(p_win, p_x, s, T, stride_conv_pos, stride_x_token):
+    """Rows ``s`` of [the conv state's three-row window, the step's tokens]."""
+    in_win = (s < 3)[:, None]
+    win = tl.load(p_win[None, :] + s[:, None] * stride_conv_pos, mask=in_win)
+    tok = tl.load(
+        p_x[None, :] + (s - 3)[:, None] * stride_x_token,
+        mask=((s >= 3) & (s < T + 3))[:, None],
+        other=0.0,
+    )
+    return tl.where(in_win, win, tok)
+
+
+@triton.jit
+def _conv4_silu_rows(
+    p_win, p_x, p_w, o_t, T, stride_conv_pos, stride_x_token, stride_w_width
+):
+    """Rows ``o_t`` of the width-4 conv and silu, in `_causal_conv1d_update_kernel`'s
+    tap order and rounded to the dtype it stores. Also returns the rows from
+    the second on: the new conv state."""
+    w = tl.load(p_w[:, None] + tl.arange(0, 4)[None, :] * stride_w_width)
+    w02, w13 = tl.split(tl.reshape(w, (p_w.shape[0], 2, 2)))
+    w0, w2 = tl.split(w02)
+    w1, w3 = tl.split(w13)
+    kept = _conv_rows(p_win, p_x, o_t + 1, T, stride_conv_pos, stride_x_token)
+    rows = _conv_rows(p_win, p_x, o_t, T, stride_conv_pos, stride_x_token)
+    acc = (rows * w0[None, :]).to(tl.float32)
+    acc += kept * w1[None, :]
+    rows = _conv_rows(p_win, p_x, o_t + 2, T, stride_conv_pos, stride_x_token)
+    acc += rows * w2[None, :]
+    rows = _conv_rows(p_win, p_x, o_t + 3, T, stride_conv_pos, stride_x_token)
+    acc += rows * w3[None, :]
+    acc = acc / (1 + tl.exp(-acc))
+    return acc.to(kept.dtype), kept
+
+
+@triton.jit
+def _kda_token_row(p_row, p_b, i_t, T, o_kq, o_k, HV, K, stride_b_token):
+    """Token ``i_t``'s scratch row and beta, not read past the step."""
+    m = i_t < T
+    p_t = p_row + i_t * (HV * 4 * K)
+    q = tl.load(p_t + o_kq, mask=m)
+    k = tl.load(p_t + K + o_kq, mask=m)
+    e = tl.load(p_t + 2 * K + o_kq, mask=m)
+    v = tl.load(p_t + 3 * K + o_k, mask=m)
+    beta = tl.load(p_b + i_t * stride_b_token, mask=m)
+    return q, k, e, v, beta
+
+
+@triton.jit
+def _kda_token_update(b_h, b_o, b_u, row, i_t, o_t):
+    q, k, e, v, beta = row
+    b_h *= e[:, None, :]
+    v -= tl.sum(tl.sum(b_h * k[:, None, :], 0), 1)
+    v *= tl.sigmoid(beta.to(tl.float32))
+    b_h += v[None, :, None] * k[:, None, :]
+    at_t = (o_t == i_t)[None, :]
+    b_o = tl.where(at_t, tl.sum(tl.sum(b_h * q[:, None, :], 0), 1)[:, None], b_o)
+    b_u = tl.where(at_t, v[:, None], b_u)
+    return b_h, b_o, b_u
+
+
+@triton.jit(do_not_specialize=["T_MAX", "CAP"])
+def _replayssm_kda_fused_kernel(
+    x,
+    f_a,
+    b,
+    conv_state,
+    conv_weight,
+    f_b_weight,
+    A_log,
+    dt_bias,
+    o,
+    rows,
+    ckpt,
+    buf_k,
+    buf_u,
+    buf_g,
+    write_pos,
+    slot_idx,
+    cu_seqlens,
+    conv_idx,
+    conv_idx_in,
+    num_accepted,
+    scale,
+    LOWER_BOUND,
+    T_MAX,
+    CAP,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    F: tl.constexpr,
+    BT: tl.constexpr,
+    BH: tl.constexpr,
+    stride_x_token: tl.constexpr,
+    stride_fa_token: tl.constexpr,
+    stride_b_token: tl.constexpr,
+    stride_conv_slot: tl.constexpr,
+    stride_conv_dim: tl.constexpr,
+    stride_conv_pos: tl.constexpr,
+    stride_conv_idx: tl.constexpr,
+    stride_conv_idx_in: tl.constexpr,
+    stride_w_dim: tl.constexpr,
+    stride_w_width: tl.constexpr,
+    stride_ckpt_slot: tl.constexpr,
+    stride_bufk_slot: tl.constexpr,
+    stride_bufk_pos: tl.constexpr,
+    stride_bufk_hv: tl.constexpr,
+    stride_bufu_slot: tl.constexpr,
+    stride_bufu_pos: tl.constexpr,
+    stride_bufu_hv: tl.constexpr,
+    stride_bufg_slot: tl.constexpr,
+    stride_bufg_pos: tl.constexpr,
+    stride_bufg_hv: tl.constexpr,
+    HAS_NUM_ACCEPTED: tl.constexpr,
+    USE_LOWER_BOUND: tl.constexpr,
+    DOT_MODE: tl.constexpr,
+):
+    KQ: tl.constexpr = K // 4
+    i_nh = tl.program_id(0)
+    i_n, i_hv = i_nh // HV, i_nh % HV
+
+    bos = tl.load(cu_seqlens + i_n).to(tl.int64)
+    T = tl.load(cu_seqlens + i_n + 1).to(tl.int64) - bos
+    if T == 0:
+        return
+    slot = tl.load(slot_idx + i_n).to(tl.int64)
+    coord_in = tl.load(conv_idx_in + i_n * stride_conv_idx_in).to(tl.int64)
+    if (slot < 0) | (coord_in < 0):
+        return
+    coord_out = tl.load(conv_idx + i_n * stride_conv_idx).to(tl.int64)
+    if HAS_NUM_ACCEPTED:
+        n_acc = tl.load(num_accepted + i_n).to(tl.int64)
+    else:
+        n_acc = 1
+
+    o_k = tl.arange(0, K)
+    o_f = tl.arange(0, F)
+    o_t = tl.arange(0, BT)
+    m_t = (o_t < T)[:, None]
+    # Element (i, v, j) of the [4, V, K // 4] state is S[v, i * K // 4 + j].
+    o_kq = tl.arange(0, 4)[:, None] * KQ + tl.arange(0, KQ)[None, :]
+
+    # ---- 1. everything read from a buffer this program also writes --------
+    ch = i_hv * K + o_k
+    p_win = conv_state + coord_in * stride_conv_slot + (n_acc - 1) * stride_conv_pos
+    p_win += ch * stride_conv_dim
+    p_x = x + bos * stride_x_token + ch
+    p_w = conv_weight + ch * stride_w_dim
+    D_W: tl.constexpr = HV * K * stride_w_dim
+    D_WIN: tl.constexpr = HV * K * stride_conv_dim
+    b_q, b_sq = _conv4_silu_rows(
+        p_win, p_x, p_w, o_t, T, stride_conv_pos, stride_x_token, stride_w_width
+    )
+    b_k, b_sk = _conv4_silu_rows(
+        p_win + D_WIN,
+        p_x + HV * K,
+        p_w + D_W,
+        o_t,
+        T,
+        stride_conv_pos,
+        stride_x_token,
+        stride_w_width,
+    )
+    b_v, b_sv = _conv4_silu_rows(
+        p_win + 2 * D_WIN,
+        p_x + 2 * HV * K,
+        p_w + 2 * D_W,
+        o_t,
+        T,
+        stride_conv_pos,
+        stride_x_token,
+        stride_w_width,
+    )
+
+    h = tl.maximum(tl.load(write_pos + slot).to(tl.int32), 0)
+    do_flush = h + 2 * T_MAX > CAP
+    base = tl.where(do_flush, 0, h).to(tl.int64)
+
+    p_ckpt = ckpt + slot * stride_ckpt_slot + i_hv * K * K
+    p_ckpt += o_k[None, :, None] * K + o_kq[:, None, :]
+    b_kw, b_ru, b_decay = _replay_tiles(
+        buf_k,
+        buf_u,
+        buf_g,
+        slot,
+        h,
+        stride_bufk_slot,
+        stride_bufk_pos,
+        stride_bufk_hv,
+        stride_bufu_slot,
+        stride_bufu_pos,
+        stride_bufu_hv,
+        stride_bufg_slot,
+        stride_bufg_pos,
+        stride_bufg_hv,
+        i_hv,
+        o_k,
+        o_k,
+        o_k < K,
+        o_k < K,
+        K,
+        K,
+        K,
+        BH,
+        True,
+    )
+    b_r = _replay_dot(tl.trans(b_ru), b_kw, False, DOT_MODE)
+    b_h = tl.load(p_ckpt) * tl.reshape(b_decay, (4, 1, KQ))
+    b_h += tl.permute(tl.reshape(b_r, (K, 4, KQ)), (1, 0, 2))
+
+    # ---- 2. f_b_proj, the gate and the normalised q / k of every row --------
+    b_fa = tl.load(
+        f_a + (bos + o_t[:, None]) * stride_fa_token + o_f[None, :],
+        mask=m_t,
+        other=0.0,
+    )
+    b_wt = tl.load(f_b_weight + ch[None, :] * F + o_f[:, None])
+    b_a = tl.dot(b_fa, b_wt).to(f_a.dtype.element_ty).to(tl.float32)
+    b_g = _kda_log_decay(
+        b_a + tl.load(dt_bias + ch).to(tl.float32)[None, :],
+        tl.load(A_log + i_hv).to(tl.float32),
+        LOWER_BOUND,
+        USE_LOWER_BOUND,
+    )
+    b_qn = b_q.to(tl.float32)
+    b_qn = b_qn * tl.rsqrt(tl.sum(b_qn * b_qn, 1) + 1e-6)[:, None] * scale
+    b_kn = b_k.to(tl.float32)
+    b_kn = b_kn * tl.rsqrt(tl.sum(b_kn * b_kn, 1) + 1e-6)[:, None]
+
+    tl.debug_barrier()
+
+    # ---- 3. the writes that do not depend on the state ----------------------
+    p_state = conv_state + coord_out * stride_conv_slot
+    p_state += o_t[:, None] * stride_conv_pos + ch[None, :] * stride_conv_dim
+    m_state = (o_t < T + 2)[:, None]
+    tl.store(p_state, b_sq, mask=m_state)
+    tl.store(p_state + D_WIN, b_sk, mask=m_state)
+    tl.store(p_state + 2 * D_WIN, b_sv, mask=m_state)
+    if do_flush:
+        tl.store(p_ckpt, b_h)
+    o_rec = (base + o_t[:, None]) * stride_bufk_pos + o_k[None, :]
+    p_bk = buf_k + slot * stride_bufk_slot + i_hv * stride_bufk_hv + o_rec
+    tl.store(p_bk, b_kn.to(p_bk.dtype.element_ty), mask=m_t)
+    o_rec = (base + o_t[:, None]) * stride_bufg_pos + o_k[None, :]
+    tl.store(
+        buf_g + slot * stride_bufg_slot + i_hv * stride_bufg_hv + o_rec, b_g, mask=m_t
+    )
+    # A token's row: [q / |q| * scale, k / |k|, exp(g), v].
+    p_row = rows + ((bos + o_t[:, None]) * HV + i_hv) * (4 * K) + o_k[None, :]
+    tl.store(p_row, b_qn, mask=m_t)
+    tl.store(p_row + K, b_kn, mask=m_t)
+    tl.store(p_row + 2 * K, exp(b_g), mask=m_t)
+    tl.store(p_row + 3 * K, b_v.to(tl.float32), mask=m_t)
+
+    tl.debug_barrier()
+
+    # ---- 4. the state through the step's tokens ----------------------------
+    # Two tokens a trip, each one's row loaded while the other's is applied.
+    # The outputs and u records stay in registers until the loop ends.
+    p_row = rows + (bos * HV + i_hv) * (4 * K)
+    p_b = b + bos * stride_b_token + i_hv
+    b_o = tl.zeros([K, BT], tl.float32)
+    b_u = tl.zeros([K, BT], tl.float32)
+    r_even = _kda_token_row(p_row, p_b, 0, T, o_kq, o_k, HV, K, stride_b_token)
+    for i_t in range(0, T, 2):
+        r_odd = _kda_token_row(p_row, p_b, i_t + 1, T, o_kq, o_k, HV, K, stride_b_token)
+        b_h, b_o, b_u = _kda_token_update(b_h, b_o, b_u, r_even, i_t, o_t)
+        r_even = _kda_token_row(
+            p_row, p_b, i_t + 2, T, o_kq, o_k, HV, K, stride_b_token
+        )
+        if i_t + 1 < T:
+            b_h, b_o, b_u = _kda_token_update(b_h, b_o, b_u, r_odd, i_t + 1, o_t)
+    m_t = (o_t < T)[None, :]
+    p_o = o + ((bos + o_t[None, :]) * HV + i_hv) * K + o_k[:, None]
+    tl.store(p_o, b_o.to(o.dtype.element_ty), mask=m_t)
+    p_bu = buf_u + slot * stride_bufu_slot + i_hv * stride_bufu_hv + o_k[:, None]
+    p_bu += (base + o_t[None, :]) * stride_bufu_pos
+    tl.store(p_bu, b_u.to(buf_u.dtype.element_ty), mask=m_t)
+
+
+def replayssm_kda_fused_update(
+    mixed_qkv: torch.Tensor,
+    f_a: torch.Tensor,
+    b: torch.Tensor,
+    conv_state: torch.Tensor,
+    conv_weight: torch.Tensor,
+    f_b_weight: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    ckpt: torch.Tensor,
+    buf_k: torch.Tensor,
+    buf_u: torch.Tensor,
+    buf_g: torch.Tensor,
+    write_pos: torch.Tensor,
+    slot_idx: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    max_query_len: int,
+    conv_state_indices: torch.Tensor,
+    conv_state_indices_in: torch.Tensor | None = None,
+    num_accepted_tokens: torch.Tensor | None = None,
+    o: torch.Tensor | None = None,
+    scale: float | None = None,
+    lower_bound: float | None = None,
+    fork_slots: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Kimi-K3's KDA decode / verify step from the in_proj output, in one kernel.
+
+    Computes what :func:`causal_conv1d_update` (silu, varlen), ``f_b_proj``
+    (a bias-free bf16 linear) and :func:`replayssm_sigmoid_gating_delta_rule`
+    (q/k l2-normalised) compute in sequence, with the same buffer updates.
+
+    ``mixed_qkv`` ``[T, 3*HV*K]``, ``f_a`` ``[T, F]`` and ``b`` ``[T, HV]``
+    (or ``[1, T, HV]``) may be column views of one wider tensor; each token's
+    row only has to be dense. ``conv_state`` is ``causal_conv1d_update``'s
+    logical ``[slot, 3*HV*K, state_len]`` view with a width-4 ``conv_weight``,
+    and ``f_b_weight`` is ``f_b_proj``'s ``[HV*K, F]`` weight. The conv index
+    tensors may be columns of a slot table.
+
+    ``num_accepted_tokens`` gives the verify window's conv rollback; without
+    it every sequence resumes after one accepted token, which is a plain
+    decode step. A sequence whose conv read slot is PAD or whose ReplaySSM
+    slot is negative is skipped whole. Returns the ``[T, HV, K]`` output,
+    written into ``o`` when given.
+    """
+    T_tot = mixed_qkv.shape[0]
+    _, HV, V, K = ckpt.shape
+    F = f_a.shape[-1]
+    N = cu_seqlens.numel() - 1
+    cap = buf_k.shape[2]
+    assert K == V, "KDA heads are square"
+    assert mixed_qkv.shape[-1] == 3 * HV * K and f_b_weight.shape == (HV * K, F)
+    assert conv_weight.shape[-1] == 4, "the fused conv is width 4"
+    assert mixed_qkv.dtype == conv_state.dtype == f_b_weight.dtype == torch.bfloat16
+    assert conv_state.shape[-1] >= 2 + max_query_len, "conv state misses the window"
+    assert flush_threshold_ok(cap, max_query_len), "cache_len < 2 * max_query_len"
+    assert mixed_qkv.stride(-1) == 1 and f_a.stride(-1) == 1 and b.stride(-1) == 1
+    assert f_b_weight.is_contiguous() and ckpt.stride(-1) == 1
+    assert ckpt.stride(-2) == K and ckpt.stride(1) == V * K
+    assert all(
+        t is None or t.is_contiguous()
+        for t in (slot_idx, cu_seqlens, num_accepted_tokens)
+    )
+    seed_forked_slots(ckpt, fork_slots)
+
+    if scale is None:
+        scale = K**-0.5
+    if conv_state_indices_in is None:
+        conv_state_indices_in = conv_state_indices
+    if o is None:
+        o = mixed_qkv.new_empty(T_tot, HV, V)
+    assert o.is_contiguous()
+    # A step's rows plus the two conv-state columns kept ahead of them;
+    # `tl.dot` wants 16 on CDNA.
+    BT = max(16, triton.next_power_of_2(max_query_len + 2))
+    BH = max(16, triton.next_power_of_2(cap - max_query_len))
+    # What the token loop reads per token and head, worked out up front.
+    rows = mixed_qkv.new_empty(T_tot, HV, 4, K, dtype=torch.float32)
+
+    _replayssm_kda_fused_kernel[(N * HV,)](
+        x=mixed_qkv,
+        f_a=f_a,
+        b=b,
+        conv_state=conv_state,
+        conv_weight=conv_weight,
+        f_b_weight=f_b_weight,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        o=o,
+        rows=rows,
+        ckpt=ckpt,
+        buf_k=buf_k,
+        buf_u=buf_u,
+        buf_g=buf_g,
+        write_pos=write_pos,
+        slot_idx=slot_idx,
+        cu_seqlens=cu_seqlens,
+        conv_idx=conv_state_indices,
+        conv_idx_in=conv_state_indices_in,
+        num_accepted=num_accepted_tokens,
+        scale=scale,
+        LOWER_BOUND=0.0 if lower_bound is None else lower_bound,
+        T_MAX=max_query_len,
+        CAP=cap,
+        HV=HV,
+        K=K,
+        F=F,
+        BT=BT,
+        BH=BH,
+        stride_x_token=mixed_qkv.stride(0),
+        stride_fa_token=f_a.stride(0),
+        stride_b_token=b.stride(-2),
+        stride_conv_slot=conv_state.stride(0),
+        stride_conv_dim=conv_state.stride(1),
+        stride_conv_pos=conv_state.stride(2),
+        stride_conv_idx=conv_state_indices.stride(0),
+        stride_conv_idx_in=conv_state_indices_in.stride(0),
+        stride_w_dim=conv_weight.stride(0),
+        stride_w_width=conv_weight.stride(1),
+        stride_ckpt_slot=ckpt.stride(0),
+        stride_bufk_slot=buf_k.stride(0),
+        stride_bufk_pos=buf_k.stride(2),
+        stride_bufk_hv=buf_k.stride(1),
+        stride_bufu_slot=buf_u.stride(0),
+        stride_bufu_pos=buf_u.stride(2),
+        stride_bufu_hv=buf_u.stride(1),
+        stride_bufg_slot=buf_g.stride(0),
+        stride_bufg_pos=buf_g.stride(2),
+        stride_bufg_hv=buf_g.stride(1),
+        HAS_NUM_ACCEPTED=num_accepted_tokens is not None,
+        USE_LOWER_BOUND=lower_bound is not None,
+        DOT_MODE=_replay_dot_mode(buf_u.dtype),
+        num_warps=4,
+    )
+    return o
