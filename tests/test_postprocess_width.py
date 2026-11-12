@@ -6,8 +6,8 @@ The LM head emits one row per sequence the step FORWARDED. On a prefill that is
 per-request parameters are `scheduled_bs` wide, because they describe requests.
 Every step between the two has to happen on the same side of the cut.
 
-Skipped where `model_engine.model_runner` cannot import (it needs aiter at
-module load); nothing here touches a GPU.
+The runner module is imported against AITER/Triton stand-ins on a CPU job, so
+the wiring runs there too; nothing here touches a GPU.
 """
 
 import types
@@ -15,17 +15,18 @@ import types
 import numpy as np
 import pytest
 import torch
+from aiter_stub import atom_without_aiter
 
-# Not `importorskip("aiter")`: the non-GPU runner has `aiter` as a namespace
-# package, so that import succeeds and `model_runner` still fails on a symbol.
-# Naming the module we actually need catches both, and `exc_type` is what makes
-# a non-ModuleNotFoundError ImportError a skip rather than a collection error --
-# one of which takes the whole suite down with it. See tests/import_guard.py.
-mod = pytest.importorskip(
-    "atom.model_engine.model_runner",
-    reason="model_runner imports aiter at module load",
-    exc_type=ImportError,
-)
+mod = None  # bound by `_runner_module` for the whole file
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _runner_module():
+    """The real runner module; AITER and Triton are stood in for on a CPU job."""
+    global mod
+    with atom_without_aiter() as load:
+        mod = load("atom.model_engine.model_runner")
+        yield mod
 
 
 @pytest.fixture(autouse=True)

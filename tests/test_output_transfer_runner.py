@@ -8,12 +8,27 @@ from unittest import mock
 import numpy as np
 import pytest
 import torch
+from aiter_stub import atom_without_aiter
 
-runner_module = pytest.importorskip(
-    "atom.model_engine.model_runner",
-    reason="runner integration requires AITER",
-    exc_type=ImportError,
-)
+runner_module = None  # bound by `_runner_module` for the whole file
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _runner_module():
+    """The real runner module; AITER and Triton are stood in for on a CPU job."""
+    global runner_module
+    with atom_without_aiter() as load:
+        runner_module = load("atom.model_engine.model_runner")
+        yield runner_module
+
+
+@pytest.fixture(autouse=True)
+def isolated_topology(monkeypatch):
+    # No sequence/context parallelism here; under the CPU stand-ins the real
+    # group queries would return mocks.
+    monkeypatch.setattr(runner_module, "sp_is_enabled", lambda: False)
+    monkeypatch.setattr(runner_module, "pcp_is_enabled", lambda: False)
+    monkeypatch.setattr(runner_module, "get_pcp_world_size", lambda: 1)
 
 
 def sampling_group(buffers):
@@ -85,6 +100,7 @@ def test_postprocess_submits_prefill_or_final_broadcast_counts(
         ),
         drafter=SimpleNamespace(lossless=None),
         forward_done_event=mock.Mock(),
+        _served=None,
     )
     with pytest.raises(StatusSubmitted):
         runner_module.ModelRunner.postprocess(
@@ -156,6 +172,7 @@ def test_a_filtered_batch_reaches_one_law_for_every_draw(
         sampler=mock.Mock(side_effect=None if verified else _Reached),
         rejection_sampler=SimpleNamespace(forward=mock.Mock(side_effect=_Reached)),
         drafter=drafter,
+        _served=None,
     )
     runner.sampler.sample_verification_tokens = mock.Mock(
         return_value=torch.zeros(bs, dtype=torch.int32)
