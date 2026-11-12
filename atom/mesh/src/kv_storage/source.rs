@@ -3,7 +3,7 @@
 use std::{fmt, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
+use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::kv_index::PrefixRequest;
 
@@ -86,6 +86,33 @@ pub enum ReaderRule {
     #[default]
     Discovered,
     Workers(Vec<String>),
+}
+
+impl<'de> Deserialize<'de> for ReaderRule {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Keyword(String),
+            Workers(Vec<String>),
+        }
+        match Raw::deserialize(deserializer)? {
+            Raw::Keyword(keyword) if keyword == "discovered" => Ok(ReaderRule::Discovered),
+            Raw::Keyword(keyword) => Err(D::Error::custom(format!(
+                "readers must be \"discovered\" or a list of worker URLs, got {keyword:?}"
+            ))),
+            Raw::Workers(workers) => Ok(ReaderRule::Workers(workers)),
+        }
+    }
+}
+
+impl Serialize for ReaderRule {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            ReaderRule::Discovered => serializer.serialize_str("discovered"),
+            ReaderRule::Workers(workers) => workers.serialize(serializer),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

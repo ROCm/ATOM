@@ -1,9 +1,13 @@
-use std::time::Duration;
+use std::{collections::BTreeMap, time::Duration};
 
 use serde::{Deserialize, Serialize};
 
 use super::{ConfigError, ConfigResult};
-use crate::core::{prepare_pool::PoolConfig, runtime::default_prepare_workers, ConnectionMode};
+use crate::{
+    core::{prepare_pool::PoolConfig, runtime::default_prepare_workers, ConnectionMode},
+    kv_events::{source::TierMap, OffloadLoad, WireProfile},
+    kv_storage::{KeyRule, RankProbe, ReaderRule},
+};
 
 /// Backend runtime type for inference workers.
 /// Determines PD-disaggregation protocol (SGLang dual-dispatch+bootstrap vs vLLM Mooncake kv_transfer_params).
@@ -109,6 +113,8 @@ pub struct RouterConfig {
     pub tool_call_parser: Option<String>,
     #[serde(default)]
     pub tokenizer_cache: TokenizerCacheConfig,
+    #[serde(default)]
+    pub kv_events: KvEventsConfig,
 }
 
 /// Default `--prepare-queue-timeout-ms`.
@@ -213,6 +219,167 @@ impl Default for TokenizerCacheConfig {
             l0_max_entries: default_l0_max_entries(),
             enable_l1: default_enable_l1(),
             l1_max_memory: default_l1_max_memory(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KvEventsMode {
+    /// Discover sources when a policy needs KV events; finding none is not an error.
+    #[default]
+    Auto,
+    /// As `auto`, and a worker whose discovery fails is reported as `down`.
+    On,
+    Off,
+}
+
+impl std::str::FromStr for KvEventsMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "on" => Ok(Self::On),
+            "off" => Ok(Self::Off),
+            other => Err(format!("expected auto, on or off, got {other:?}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KvDiscoveryMethod {
+    Static,
+    Engine,
+    ServerInfo,
+}
+
+/// Event endpoints of one worker, listed by DP rank.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StaticKvEventSource {
+    pub endpoints: Vec<String>,
+    #[serde(default)]
+    pub replay_endpoints: Vec<String>,
+    #[serde(default)]
+    pub topic: String,
+    pub model: Option<String>,
+    #[serde(default)]
+    pub profile: WireProfile,
+    #[serde(default)]
+    pub tier_map: TierMap,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct KvStorageBreakerConfig {
+    pub failures: u32,
+    pub open_secs: u64,
+}
+
+impl Default for KvStorageBreakerConfig {
+    fn default() -> Self {
+        Self {
+            failures: 5,
+            open_secs: 10,
+        }
+    }
+}
+
+/// Defaults for shared-storage lookups.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct KvStorageConfig {
+    /// Mooncake master admin port (its `metrics_port`).
+    pub mooncake_admin_port: u16,
+    /// UMBP master of ATOM's `umbp_store`. ATOM does not know it, so no UMBP source is
+    /// generated without it.
+    pub umbp_master: Option<String>,
+    /// Mooncake only; UMBP always probes every rank.
+    pub probe: RankProbe,
+    pub deadline_ms: u64,
+    pub breaker: KvStorageBreakerConfig,
+    /// In-flight lookups per source; requests beyond it skip the source.
+    pub max_inflight: u32,
+}
+
+impl Default for KvStorageConfig {
+    fn default() -> Self {
+        Self {
+            mooncake_admin_port: 9003,
+            umbp_master: None,
+            probe: RankProbe::First,
+            deadline_ms: 3,
+            breaker: KvStorageBreakerConfig::default(),
+            max_inflight: 64,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageBackendConfig {
+    MooncakeAdmin(Vec<String>),
+    UmbpMaster(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageGateConfig {
+    pub min_tokens: u32,
+}
+
+/// A storage source discovery cannot find. With the id of a generated source, only the
+/// given fields override it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageSourceConfig {
+    pub model: Option<String>,
+    pub backend: Option<StorageBackendConfig>,
+    pub key_rule: Option<KeyRule>,
+    #[serde(default)]
+    pub readers: ReaderRule,
+    /// Defaults to the readers' `min_load_tokens`.
+    pub gate: Option<StorageGateConfig>,
+    pub deadline_ms: Option<u64>,
+    pub probe: Option<RankProbe>,
+}
+
+/// KV event ingestion and shared-storage lookups.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct KvEventsConfig {
+    pub enabled: KvEventsMode,
+    /// Tried in order; the first non-empty result wins.
+    pub discovery: Vec<KvDiscoveryMethod>,
+    /// Keyed by worker base URL.
+    pub static_sources: BTreeMap<String, StaticKvEventSource>,
+    pub storage: KvStorageConfig,
+    pub storage_sources: BTreeMap<String, StorageSourceConfig>,
+    /// For `atom` sources whose discovery result carries no `offload`.
+    pub offload_load: Option<OffloadLoad>,
+    pub replay_timeout_ms: u64,
+    pub stale_after_secs: u64,
+    pub max_index_blocks: u64,
+    /// Strict decoding, for conformance tests only.
+    pub strict: bool,
+}
+
+impl Default for KvEventsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: KvEventsMode::Auto,
+            discovery: vec![
+                KvDiscoveryMethod::Static,
+                KvDiscoveryMethod::Engine,
+                KvDiscoveryMethod::ServerInfo,
+            ],
+            static_sources: BTreeMap::new(),
+            storage: KvStorageConfig::default(),
+            storage_sources: BTreeMap::new(),
+            offload_load: None,
+            replay_timeout_ms: 5000,
+            stale_after_secs: 30,
+            max_index_blocks: 4_000_000,
+            strict: false,
         }
     }
 }
@@ -468,6 +635,7 @@ impl Default for RouterConfig {
             reasoning_parser: None,
             tool_call_parser: None,
             tokenizer_cache: TokenizerCacheConfig::default(),
+            kv_events: KvEventsConfig::default(),
         }
     }
 }
@@ -574,6 +742,67 @@ impl RouterConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kv_events::model::TierTarget;
+
+    #[test]
+    fn kv_events_config_parses_documented_example_and_defaults_when_absent() {
+        let config: KvEventsConfig = serde_json::from_str(
+            r#"{"enabled": "auto", "discovery": ["static", "engine", "server_info"],
+                "static_sources": {"http://10.0.0.7:8000": {
+                    "endpoints": ["tcp://10.0.0.7:5557", "tcp://10.0.0.7:5558"],
+                    "replay_endpoints": ["tcp://10.0.0.7:5657", "tcp://10.0.0.7:5658"],
+                    "topic": "", "model": "zai-org/GLM-5.2", "profile": "vllm",
+                    "tier_map": {"CPU": "drop"}}},
+                "storage": {"mooncake_admin_port": 9003, "umbp_master": "10.0.0.20:50051",
+                    "probe": "first", "deadline_ms": 3,
+                    "breaker": {"failures": 5, "open_secs": 10}, "max_inflight": 64},
+                "storage_sources": {"umbp-a": {"model": "zai-org/GLM-5.2",
+                    "backend": {"umbp_master": "10.0.0.21:50051"},
+                    "key_rule": {"sglang_page": {"page_size": 64, "layout": "mha_split_heads"}},
+                    "readers": ["http://10.0.1.*:30000"], "gate": {"min_tokens": 4096}}},
+                "offload_load": {"chunk_tokens": 256, "min_load_tokens": 8192},
+                "replay_timeout_ms": 5000, "stale_after_secs": 30,
+                "max_index_blocks": 4000000, "strict": false}"#,
+        )
+        .unwrap();
+        let source = &config.static_sources["http://10.0.0.7:8000"];
+        assert_eq!(source.tier_map["CPU"], TierTarget::Drop);
+        assert_eq!(source.profile, WireProfile::Vllm);
+        let umbp = &config.storage_sources["umbp-a"];
+        assert_eq!(
+            umbp.backend,
+            Some(StorageBackendConfig::UmbpMaster("10.0.0.21:50051".into()))
+        );
+        assert_eq!(
+            umbp.readers,
+            ReaderRule::Workers(vec!["http://10.0.1.*:30000".into()])
+        );
+        assert!(matches!(
+            umbp.key_rule,
+            Some(KeyRule::SglangPage { page_size: 64, .. })
+        ));
+        assert_eq!(
+            config.storage.umbp_master.as_deref(),
+            Some("10.0.0.20:50051")
+        );
+
+        let overrides: KvEventsConfig = serde_json::from_str(
+            r#"{"enabled": "off", "storage_sources": {"atom-mooncake-5f0e3c9a":
+                {"readers": "discovered", "deadline_ms": 5, "probe": "all"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(overrides.enabled, KvEventsMode::Off);
+        assert_eq!(overrides.discovery, KvEventsConfig::default().discovery);
+        let generated = &overrides.storage_sources["atom-mooncake-5f0e3c9a"];
+        assert_eq!(generated.readers, ReaderRule::Discovered);
+        assert_eq!(generated.probe, Some(RankProbe::All));
+        assert!(serde_json::from_str::<StorageSourceConfig>(r#"{"readers": "all"}"#).is_err());
+
+        let mut legacy = serde_json::to_value(RouterConfig::default()).unwrap();
+        legacy.as_object_mut().unwrap().remove("kv_events");
+        let restored: RouterConfig = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.kv_events, KvEventsConfig::default());
+    }
 
     #[test]
     fn prepare_pool_defaults_overrides_and_legacy_config_deserialization() {

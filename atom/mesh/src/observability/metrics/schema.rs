@@ -284,6 +284,21 @@ pub mod names {
     pub const DB_OPERATION_DURATION_SECONDS: &str = "mesh_db_operation_duration_seconds";
     pub const DB_CONNECTIONS_ACTIVE: &str = "mesh_db_connections_active";
     pub const DB_ITEMS_STORED: &str = "mesh_db_items_stored";
+
+    pub const KV_EVENTS_BATCHES_TOTAL: &str = "mesh_kv_events_batches_total";
+    pub const KV_EVENTS_EVENTS_TOTAL: &str = "mesh_kv_events_events_total";
+    pub const KV_EVENTS_REJECTED_TOTAL: &str = "mesh_kv_events_rejected_total";
+    pub const KV_EVENTS_GAPS_TOTAL: &str = "mesh_kv_events_gaps_total";
+    pub const KV_EVENTS_RECOVERY_SECONDS: &str = "mesh_kv_events_recovery_seconds";
+    pub const KV_EVENTS_LAG_SECONDS: &str = "mesh_kv_events_lag_seconds";
+    pub const KV_EVENTS_SOURCES: &str = "mesh_kv_events_sources";
+    pub const KV_INDEX_BLOCKS: &str = "mesh_kv_index_blocks";
+    pub const KV_INDEX_MATCH_DURATION_SECONDS: &str = "mesh_kv_index_match_duration_seconds";
+    pub const KV_STORAGE_LOOKUPS_TOTAL: &str = "mesh_kv_storage_lookups_total";
+    pub const KV_STORAGE_LOOKUP_DURATION_SECONDS: &str = "mesh_kv_storage_lookup_duration_seconds";
+    pub const KV_STORAGE_KEY_DURATION_SECONDS: &str = "mesh_kv_storage_key_duration_seconds";
+    pub const KV_STORAGE_KEYS_PER_LOOKUP: &str = "mesh_kv_storage_keys_per_lookup";
+    pub const KV_STORAGE_TAINTED_POOLS: &str = "mesh_kv_storage_tainted_pools";
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -583,6 +598,90 @@ pub const METRIC_INVENTORY: &[MetricSpec] = &[
         name: names::DB_ITEMS_STORED,
         kind: MetricKind::Counter,
         help: "Total items stored by storage_type",
+        status: MetricStatus::Planned,
+    },
+    MetricSpec {
+        name: names::KV_EVENTS_BATCHES_TOTAL,
+        kind: MetricKind::Counter,
+        help: "KV event batches by pool, result (applied/duplicate/replayed/reset/dropped)",
+        status: MetricStatus::Planned,
+    },
+    MetricSpec {
+        name: names::KV_EVENTS_EVENTS_TOTAL,
+        kind: MetricKind::Counter,
+        help: "Applied KV events by pool, type, tier",
+        status: MetricStatus::Planned,
+    },
+    MetricSpec {
+        name: names::KV_EVENTS_REJECTED_TOTAL,
+        kind: MetricKind::Counter,
+        help: "Dropped KV events and blocks by pool, reason",
+        status: MetricStatus::Planned,
+    },
+    MetricSpec {
+        name: names::KV_EVENTS_GAPS_TOTAL,
+        kind: MetricKind::Counter,
+        help: "KV event sequence gaps by pool, result (replayed/snapshot/cleared)",
+        status: MetricStatus::Planned,
+    },
+    MetricSpec {
+        name: names::KV_EVENTS_RECOVERY_SECONDS,
+        kind: MetricKind::Histogram,
+        help: "Time from detecting a KV event gap to recovering from it by pool",
+        status: MetricStatus::Planned,
+    },
+    MetricSpec {
+        name: names::KV_EVENTS_LAG_SECONDS,
+        kind: MetricKind::Histogram,
+        help: "KV event batch receive time minus batch timestamp by pool",
+        status: MetricStatus::Planned,
+    },
+    MetricSpec {
+        name: names::KV_EVENTS_SOURCES,
+        kind: MetricKind::Gauge,
+        help: "KV event sources by pool, state (exact/partial/stale/down)",
+        status: MetricStatus::Planned,
+    },
+    MetricSpec {
+        name: names::KV_INDEX_BLOCKS,
+        kind: MetricKind::Gauge,
+        help: "Indexed KV blocks by pool, tier",
+        status: MetricStatus::Planned,
+    },
+    MetricSpec {
+        name: names::KV_INDEX_MATCH_DURATION_SECONDS,
+        kind: MetricKind::Histogram,
+        help: "KV index prefix match duration by pool",
+        status: MetricStatus::Planned,
+    },
+    MetricSpec {
+        name: names::KV_STORAGE_LOOKUPS_TOTAL,
+        kind: MetricKind::Counter,
+        help: "Shared-storage lookups by source, result (hit/miss/skipped/timeout/error/breaker_open/overloaded), reason",
+        status: MetricStatus::Planned,
+    },
+    MetricSpec {
+        name: names::KV_STORAGE_LOOKUP_DURATION_SECONDS,
+        kind: MetricKind::Histogram,
+        help: "Shared-storage lookup duration by source, from the first request sent to the folded result",
+        status: MetricStatus::Planned,
+    },
+    MetricSpec {
+        name: names::KV_STORAGE_KEY_DURATION_SECONDS,
+        kind: MetricKind::Histogram,
+        help: "Time to compute shared-storage keys from tokens by source",
+        status: MetricStatus::Planned,
+    },
+    MetricSpec {
+        name: names::KV_STORAGE_KEYS_PER_LOOKUP,
+        kind: MetricKind::Histogram,
+        help: "Keys per shared-storage lookup by source",
+        status: MetricStatus::Planned,
+    },
+    MetricSpec {
+        name: names::KV_STORAGE_TAINTED_POOLS,
+        kind: MetricKind::Gauge,
+        help: "Tainted Mooncake pools treated as empty by source",
         status: MetricStatus::Planned,
     },
 ];

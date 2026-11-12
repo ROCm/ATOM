@@ -5,8 +5,8 @@ use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use crate::{
     config::{
         AtomPdRankMappingPolicy, BackendType, CircuitBreakerConfig, ConfigError, ConfigResult,
-        HealthCheckConfig, MetricsConfig, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
-        TokenizerCacheConfig,
+        HealthCheckConfig, KvEventsConfig, MetricsConfig, PolicyConfig, RetryConfig, RouterConfig,
+        RoutingMode, TokenizerCacheConfig,
     },
     core::ConnectionMode,
     observability::metrics::PrometheusConfig,
@@ -470,6 +470,15 @@ pub struct CliArgs {
     #[arg(long, value_enum, default_value_t = Backend::Sglang, alias = "runtime", help_heading = "Backend")]
     pub backend: Backend,
 
+    // ==================== KV Events ====================
+    /// KV event ingestion: auto (when a policy needs KV events), on or off. Overrides the file.
+    #[arg(long, value_parser = ["auto", "on", "off"], help_heading = "KV Events")]
+    pub kv_events: Option<String>,
+
+    /// JSON file holding the `kv_events` section: static sources, storage sources, tuning
+    #[arg(long, help_heading = "KV Events")]
+    pub kv_event_sources: Option<std::path::PathBuf>,
+
     // ==================== Control Plane Authentication ====================
     /// API key for worker connections
     #[arg(long, help_heading = "Control Plane Authentication")]
@@ -551,11 +560,35 @@ impl CliArgs {
         }
     }
 
+    fn kv_events_config(&self) -> ConfigResult<KvEventsConfig> {
+        let mut config = match &self.kv_event_sources {
+            Some(path) => {
+                let invalid = |reason: String| ConfigError::InvalidValue {
+                    field: "kv_event_sources".to_string(),
+                    value: path.display().to_string(),
+                    reason,
+                };
+                let text = std::fs::read_to_string(path).map_err(|e| invalid(e.to_string()))?;
+                serde_json::from_str(&text).map_err(|e| invalid(e.to_string()))?
+            }
+            None => KvEventsConfig::default(),
+        };
+        if let Some(mode) = &self.kv_events {
+            config.enabled = mode.parse().map_err(|reason| ConfigError::InvalidValue {
+                field: "kv_events".to_string(),
+                value: mode.clone(),
+                reason,
+            })?;
+        }
+        Ok(config)
+    }
+
     pub fn to_router_config(
         &self,
         prefill_urls: Vec<(String, Option<u16>)>,
     ) -> ConfigResult<RouterConfig> {
         self.validate_tls_args()?;
+        let kv_events = self.kv_events_config()?;
 
         // Determine routing mode based on PD disaggregation flag
         let mode = if self.pd_disaggregation {
@@ -668,6 +701,10 @@ impl CliArgs {
             .retries(!self.disable_retries)
             .circuit_breaker(!self.disable_circuit_breaker)
             .build()
+            .map(|config| RouterConfig {
+                kv_events,
+                ..config
+            })
     }
 
     pub fn to_server_config(&self, router_config: RouterConfig) -> ServerConfig {
@@ -777,6 +814,35 @@ mod tests {
             assert_eq!(config.resolved_prepare_pool().unwrap().queue_capacity, 10);
             assert_eq!(config.resolved_max_tokenize_bytes(), 8192);
         }
+    }
+
+    #[test]
+    fn cli_kv_events_options_map_to_router_config() {
+        let config = CliArgs::default().to_router_config(Vec::new()).unwrap();
+        assert_eq!(config.kv_events, KvEventsConfig::default());
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("kv_events.json");
+        std::fs::write(&path, r#"{"enabled": "on", "replay_timeout_ms": 100}"#).unwrap();
+        let path = path.to_str().unwrap();
+        let args = CliArgs::try_parse_from(["atomesh", "--kv-event-sources", path]).unwrap();
+        let config = args.to_router_config(Vec::new()).unwrap();
+        assert_eq!(config.kv_events.enabled, crate::config::KvEventsMode::On);
+        assert_eq!(config.kv_events.replay_timeout_ms, 100);
+
+        let args =
+            CliArgs::try_parse_from(["atomesh", "--kv-event-sources", path, "--kv-events", "off"])
+                .unwrap();
+        let config = args.to_router_config(Vec::new()).unwrap();
+        assert_eq!(config.kv_events.enabled, crate::config::KvEventsMode::Off);
+
+        std::fs::write(path, "{").unwrap();
+        let args = CliArgs::try_parse_from(["atomesh", "--kv-event-sources", path]).unwrap();
+        assert!(matches!(
+            args.to_router_config(Vec::new()),
+            Err(ConfigError::InvalidValue { field, .. }) if field == "kv_event_sources"
+        ));
+        assert!(CliArgs::try_parse_from(["atomesh", "--kv-events", "maybe"]).is_err());
     }
 
     #[test]
@@ -902,6 +968,8 @@ impl Default for CliArgs {
             reasoning_parser: None,
             tool_call_parser: None,
             backend: Backend::Sglang,
+            kv_events: None,
+            kv_event_sources: None,
             api_key: None,
             tls_cert_path: None,
             tls_key_path: None,
