@@ -2132,12 +2132,12 @@ mod tests {
     struct CompletionPolicy(std::sync::Mutex<Vec<bool>>);
     #[async_trait::async_trait]
     impl crate::policies::LoadBalancingPolicy for CompletionPolicy {
-        async fn select_worker(
+        async fn select_with_decision(
             &self,
             _: &[Arc<dyn Worker>],
             _: &crate::policies::SelectWorkerInfo<'_>,
-        ) -> Option<usize> {
-            Some(0)
+        ) -> (Option<usize>, crate::policies::RouteDecision) {
+            (Some(0), crate::policies::RouteDecision::branch("first"))
         }
         fn on_request_complete(&self, _: &str, success: bool) {
             self.0.lock().unwrap().push(success);

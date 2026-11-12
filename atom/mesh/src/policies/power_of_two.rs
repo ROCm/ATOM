@@ -10,8 +10,8 @@ use rand::Rng;
 use tracing::debug;
 
 use super::{
-    decision::{self, RouteDecision, NO_HEALTHY_WORKERS},
-    get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo,
+    get_healthy_worker_indices, LoadBalancingPolicy, RouteDecision, SelectWorkerInfo,
+    NO_HEALTHY_WORKERS,
 };
 use crate::core::Worker;
 
@@ -35,32 +35,22 @@ impl PowerOfTwoPolicy {
 
 #[async_trait]
 impl LoadBalancingPolicy for PowerOfTwoPolicy {
-    async fn select_worker(
+    async fn select_with_decision(
         &self,
         workers: &[Arc<dyn Worker>],
         _info: &SelectWorkerInfo<'_>,
-    ) -> Option<usize> {
+    ) -> (Option<usize>, RouteDecision) {
         let healthy_indices = get_healthy_worker_indices(workers);
 
         if healthy_indices.is_empty() {
-            decision::report(
-                self,
-                workers,
-                None,
-                RouteDecision::branch(NO_HEALTHY_WORKERS),
-            );
-            return None;
+            return (None, RouteDecision::branch(NO_HEALTHY_WORKERS));
         }
 
         if healthy_indices.len() == 1 {
-            let selected = Some(healthy_indices[0]);
-            decision::report(
-                self,
-                workers,
-                selected,
+            return (
+                Some(healthy_indices[0]),
                 RouteDecision::branch("single_worker"),
             );
-            return selected;
         }
 
         // Select two random workers - use offset to guarantee different selection in O(1)
@@ -122,27 +112,12 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
 
         // Increment processed counter
         workers[selected_idx].increment_processed();
-        decision::report(
-            self,
-            workers,
-            Some(selected_idx),
-            RouteDecision::branch(branch),
-        );
 
-        Some(selected_idx)
+        (Some(selected_idx), RouteDecision::branch(branch))
     }
 
     fn name(&self) -> &'static str {
         "power_of_two"
-    }
-
-    fn decision_branches(&self) -> &'static [&'static str] {
-        &[
-            "single_worker",
-            "token_load",
-            "request_load",
-            NO_HEALTHY_WORKERS,
-        ]
     }
 
     fn update_loads(&self, loads: &HashMap<String, isize>) {

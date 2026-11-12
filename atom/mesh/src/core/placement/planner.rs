@@ -8,7 +8,7 @@ use super::traits::{PdPlanner, PolicySource, WorkerSource};
 use super::types::{PlacementError, PlacementPlan, Protocol, RequestDescriptor};
 use crate::core::{ConnectionMode, HashRing, Worker, WorkerType};
 use crate::observability::metrics::{metrics_labels, MeshMetrics};
-use crate::policies::{decision::NO_HEALTHY_WORKERS, LoadBalancingPolicy};
+use crate::policies::{LoadBalancingPolicy, NO_HEALTHY_WORKERS};
 
 fn health_filter(pool: Vec<Arc<dyn Worker>>) -> Vec<Arc<dyn Worker>> {
     pool.into_iter().filter(|w| w.is_available()).collect()

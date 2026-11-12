@@ -6,8 +6,8 @@ use async_trait::async_trait;
 use rand::Rng;
 
 use super::{
-    decision::{self, RouteDecision, NO_HEALTHY_WORKERS},
-    get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo,
+    get_healthy_worker_indices, LoadBalancingPolicy, RouteDecision, SelectWorkerInfo,
+    NO_HEALTHY_WORKERS,
 };
 use crate::core::Worker;
 
@@ -25,42 +25,28 @@ impl RandomPolicy {
 
 #[async_trait]
 impl LoadBalancingPolicy for RandomPolicy {
-    async fn select_worker(
+    async fn select_with_decision(
         &self,
         workers: &[Arc<dyn Worker>],
         _info: &SelectWorkerInfo<'_>,
-    ) -> Option<usize> {
+    ) -> (Option<usize>, RouteDecision) {
         let healthy_indices = get_healthy_worker_indices(workers);
 
         if healthy_indices.is_empty() {
-            decision::report(
-                self,
-                workers,
-                None,
-                RouteDecision::branch(NO_HEALTHY_WORKERS),
-            );
-            return None;
+            return (None, RouteDecision::branch(NO_HEALTHY_WORKERS));
         }
 
         let mut rng = rand::rng();
         let random_idx = rng.random_range(0..healthy_indices.len());
-        let selected = healthy_indices[random_idx];
-        decision::report(
-            self,
-            workers,
-            Some(selected),
-            RouteDecision::branch("random"),
-        );
 
-        Some(selected)
+        (
+            Some(healthy_indices[random_idx]),
+            RouteDecision::branch("random"),
+        )
     }
 
     fn name(&self) -> &'static str {
         "random"
-    }
-
-    fn decision_branches(&self) -> &'static [&'static str] {
-        &["random", NO_HEALTHY_WORKERS]
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

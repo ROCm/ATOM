@@ -8,8 +8,8 @@ use std::sync::{
 use async_trait::async_trait;
 
 use super::{
-    decision::{self, RouteDecision, NO_HEALTHY_WORKERS},
-    get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo,
+    get_healthy_worker_indices, LoadBalancingPolicy, RouteDecision, SelectWorkerInfo,
+    NO_HEALTHY_WORKERS,
 };
 use crate::core::Worker;
 
@@ -31,42 +31,29 @@ impl RoundRobinPolicy {
 
 #[async_trait]
 impl LoadBalancingPolicy for RoundRobinPolicy {
-    async fn select_worker(
+    async fn select_with_decision(
         &self,
         workers: &[Arc<dyn Worker>],
         _info: &SelectWorkerInfo<'_>,
-    ) -> Option<usize> {
+    ) -> (Option<usize>, RouteDecision) {
         let healthy_indices = get_healthy_worker_indices(workers);
 
         if healthy_indices.is_empty() {
-            decision::report(
-                self,
-                workers,
-                None,
-                RouteDecision::branch(NO_HEALTHY_WORKERS),
-            );
-            return None;
+            return (None, RouteDecision::branch(NO_HEALTHY_WORKERS));
         }
 
         // Get and increment counter atomically
         let count = self.counter.fetch_add(1, Ordering::Relaxed);
-        let selected = healthy_indices[count % healthy_indices.len()];
-        decision::report(
-            self,
-            workers,
-            Some(selected),
-            RouteDecision::branch("round_robin"),
-        );
+        let selected_idx = count % healthy_indices.len();
 
-        Some(selected)
+        (
+            Some(healthy_indices[selected_idx]),
+            RouteDecision::branch("round_robin"),
+        )
     }
 
     fn name(&self) -> &'static str {
         "round_robin"
-    }
-
-    fn decision_branches(&self) -> &'static [&'static str] {
-        &["round_robin", NO_HEALTHY_WORKERS]
     }
 
     fn reset(&self) {

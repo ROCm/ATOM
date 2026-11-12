@@ -68,11 +68,8 @@ use rand::Rng;
 use tracing::debug;
 
 use super::{
-    decision::{self, RouteDecision, NO_HEALTHY_WORKERS},
-    get_healthy_worker_indices, normalize_model_key,
-    tree::Tree,
-    utils::PeriodicTask,
-    CacheAwareConfig, LoadBalancingPolicy, SelectWorkerInfo,
+    get_healthy_worker_indices, normalize_model_key, tree::Tree, utils::PeriodicTask,
+    CacheAwareConfig, LoadBalancingPolicy, RouteDecision, SelectWorkerInfo, NO_HEALTHY_WORKERS,
 };
 use crate::core::{Worker, WorkerType};
 
@@ -305,22 +302,16 @@ impl CacheAwarePolicy {
 
 #[async_trait]
 impl LoadBalancingPolicy for CacheAwarePolicy {
-    async fn select_worker(
+    async fn select_with_decision(
         &self,
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo<'_>,
-    ) -> Option<usize> {
+    ) -> (Option<usize>, RouteDecision) {
         let request_text = info.request_text;
         let healthy_indices = get_healthy_worker_indices(workers);
 
         if healthy_indices.is_empty() {
-            decision::report(
-                self,
-                workers,
-                None,
-                RouteDecision::branch(NO_HEALTHY_WORKERS),
-            );
-            return None;
+            return (None, RouteDecision::branch(NO_HEALTHY_WORKERS));
         }
 
         // The router pre-filters candidates by model and, in PD mode, by role,
@@ -349,8 +340,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 max_load,
                 min_load,
             );
-            decision::report(self, workers, selected, RouteDecision::branch("imbalanced"));
-            return selected;
+            return (selected, RouteDecision::branch("imbalanced"));
         }
 
         // Use cache-aware routing when balanced
@@ -372,8 +362,8 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             let affinity = match_rate > self.config.cache_threshold;
             let tenant_url: &str = &result.tenant;
             let decision = RouteDecision {
+                branch: if affinity { "affinity" } else { "relocate" },
                 match_ratio: Some(match_rate as f64),
-                ..RouteDecision::branch(if affinity { "affinity" } else { "relocate" })
             };
 
             // Select worker without String allocation
@@ -393,11 +383,11 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                     .iter()
                     .map(|&idx| (idx, workers[idx].load()))
                     .collect();
-                let min_load = loads.iter().map(|&(_, load)| load).min()?;
+                let min_load = loads.iter().map(|&(_, load)| load).min();
                 loads
                     .iter()
                     .copied()
-                    .filter(|&(_, load)| load == min_load)
+                    .filter(|&(_, load)| Some(load) == min_load)
                     .map(|(idx, _)| idx)
                     .choose(&mut rand::rng())
             };
@@ -409,8 +399,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 // Increment processed counter
                 workers[idx].increment_processed();
 
-                decision::report(self, workers, Some(idx), decision);
-                return Some(idx);
+                return (Some(idx), decision);
             }
 
             // Selected worker no longer exists or unhealthy, remove stale tenant from tree
@@ -420,13 +409,10 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             }
 
             // Fallback to first healthy worker
-            let fallback = healthy_indices.first().copied();
-            let decision = RouteDecision {
-                branch: "stale_tenant",
-                ..decision
-            };
-            decision::report(self, workers, fallback, decision);
-            fallback
+            (
+                healthy_indices.first().copied(),
+                RouteDecision::branch("stale_tenant"),
+            )
         } else {
             // No tree for this key: cache affinity is dead and every request is
             // placed at random, which is indistinguishable from "cache_aware is
@@ -447,9 +433,10 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             // Return a random healthy worker
             let mut rng = rand::rng();
             let random_idx = rng.random_range(0..healthy_indices.len());
-            let selected = Some(healthy_indices[random_idx]);
-            decision::report(self, workers, selected, RouteDecision::branch("no_tree"));
-            selected
+            (
+                Some(healthy_indices[random_idx]),
+                RouteDecision::branch("no_tree"),
+            )
         }
     }
 
@@ -467,17 +454,6 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
 
     fn name(&self) -> &'static str {
         "cache_aware"
-    }
-
-    fn decision_branches(&self) -> &'static [&'static str] {
-        &[
-            "affinity",
-            "relocate",
-            "imbalanced",
-            "stale_tenant",
-            "no_tree",
-            NO_HEALTHY_WORKERS,
-        ]
     }
 
     fn needs_request_text(&self) -> bool {
@@ -663,10 +639,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn branches_match_ratio_and_active_requests_are_recorded() {
-        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
-        let handle = recorder.handle();
-        let _recorder = metrics::set_default_local_recorder(&recorder);
+    async fn each_exit_reports_its_branch_and_match_ratio() {
         let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
             cache_threshold: 0.5,
             balance_abs_threshold: 5,
@@ -690,27 +663,21 @@ mod tests {
             ..Default::default()
         };
 
-        let first = policy.select_worker(&workers, &info).await.unwrap();
-        assert_eq!(policy.select_worker(&workers, &info).await, Some(first));
+        let select = || async {
+            let (selected, decision) = policy.select_with_decision(&workers, &info).await;
+            (selected.unwrap(), decision.branch, decision.match_ratio)
+        };
+
+        let (first, branch, ratio) = select().await;
+        assert_eq!((branch, ratio), ("relocate", Some(0.0)));
+        assert_eq!(select().await, (first, "affinity", Some(1.0)));
+        workers[first].set_healthy(false);
+        assert_eq!(select().await, (1 - first, "stale_tenant", None));
+        workers[first].set_healthy(true);
         for _ in 0..20 {
             workers[first].increment_load();
         }
-        assert_ne!(policy.select_worker(&workers, &info).await, Some(first));
-
-        let rendered = handle.render();
-        for branch in ["relocate", "affinity", "imbalanced"] {
-            for metric in [
-                "mesh_route_branch_total",
-                "mesh_route_selected_worker_active_requests_count",
-            ] {
-                let line = format!(
-                    r#"{metric}{{pool="regular",policy="cache_aware",branch="{branch}"}} 1"#
-                );
-                assert!(rendered.contains(&line), "missing {line} in\n{rendered}");
-            }
-        }
-        let line = r#"mesh_route_prefix_match_ratio_count{pool="regular",policy="cache_aware"} 2"#;
-        assert!(rendered.contains(line), "missing {line} in\n{rendered}");
+        assert_eq!(select().await, (1 - first, "imbalanced", None));
     }
 
     #[tokio::test]

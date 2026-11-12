@@ -487,16 +487,6 @@ impl MeshMetrics {
         .record(active_requests as f64);
     }
 
-    /// Record a session affinity lookup: hit, new, rebind or expired.
-    pub fn record_session_affinity(pool: &'static str, result: &'static str) {
-        counter!(
-            names::SESSION_AFFINITY_TOTAL,
-            "pool" => pool,
-            "result" => result
-        )
-        .increment(1);
-    }
-
     /// Record a session request dispatched to a different worker than the
     /// previous one: rebind, expired or rank_mapping.
     pub fn record_session_worker_change(pool: &'static str, reason: &'static str) {

@@ -264,7 +264,6 @@ pub mod names {
     pub const ROUTE_PREFIX_MATCH_RATIO: &str = "mesh_route_prefix_match_ratio";
     pub const ROUTE_SELECTED_WORKER_ACTIVE_REQUESTS: &str =
         "mesh_route_selected_worker_active_requests";
-    pub const SESSION_AFFINITY_TOTAL: &str = "mesh_session_affinity_total";
     pub const SESSION_WORKER_CHANGE_TOTAL: &str = "mesh_session_worker_change_total";
 
     pub const WORKER_CB_STATE: &str = "mesh_worker_cb_state";
@@ -469,7 +468,7 @@ pub const METRIC_INVENTORY: &[MetricSpec] = &[
     MetricSpec {
         name: names::ROUTE_BRANCH_TOTAL,
         kind: MetricKind::Counter,
-        help: "Routing decisions by pool, policy, branch; branches are declared by each policy",
+        help: "Routing decisions by pool, policy, branch",
         status: MetricStatus::Active,
     },
     MetricSpec {
@@ -482,12 +481,6 @@ pub const METRIC_INVENTORY: &[MetricSpec] = &[
         name: names::ROUTE_SELECTED_WORKER_ACTIVE_REQUESTS,
         kind: MetricKind::Histogram,
         help: "Router-tracked active requests on the selected worker, read at selection before the request is added, by pool, policy, branch",
-        status: MetricStatus::Active,
-    },
-    MetricSpec {
-        name: names::SESSION_AFFINITY_TOTAL,
-        kind: MetricKind::Counter,
-        help: "Session affinity lookups by pool, result (hit/new/rebind/expired)",
         status: MetricStatus::Active,
     },
     MetricSpec {

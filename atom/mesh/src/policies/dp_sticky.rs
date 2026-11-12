@@ -16,8 +16,8 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 
 use super::{
-    decision::{self, RouteDecision, NO_HEALTHY_WORKERS},
-    get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo,
+    get_healthy_worker_indices, LoadBalancingPolicy, RouteDecision, SelectWorkerInfo,
+    NO_HEALTHY_WORKERS,
 };
 use crate::{
     core::Worker,
@@ -198,22 +198,18 @@ impl Default for DpStickyPolicy {
 
 #[async_trait]
 impl LoadBalancingPolicy for DpStickyPolicy {
-    async fn select_worker(
+    async fn select_with_decision(
         &self,
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo<'_>,
-    ) -> Option<usize> {
+    ) -> (Option<usize>, RouteDecision) {
         let (selected, outcome) = self.select_worker_impl(workers, info);
-        let decision = match selected {
-            None => RouteDecision::branch(NO_HEALTHY_WORKERS),
-            Some(_) if outcome == NO_SESSION => RouteDecision::branch(NO_SESSION),
-            Some(_) => RouteDecision {
-                affinity: Some(outcome),
-                ..RouteDecision::branch(outcome)
-            },
+        let branch = if selected.is_some() {
+            outcome
+        } else {
+            NO_HEALTHY_WORKERS
         };
-        decision::report(self, workers, selected, decision);
-        selected
+        (selected, RouteDecision::branch(branch))
     }
 
     fn on_dispatch(
@@ -246,17 +242,6 @@ impl LoadBalancingPolicy for DpStickyPolicy {
 
     fn name(&self) -> &'static str {
         "dp_sticky"
-    }
-
-    fn decision_branches(&self) -> &'static [&'static str] {
-        &[
-            AFFINITY_HIT,
-            AFFINITY_NEW,
-            AFFINITY_REBIND,
-            AFFINITY_EXPIRED,
-            NO_SESSION,
-            NO_HEALTHY_WORKERS,
-        ]
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -392,42 +377,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_outcomes_are_counted_by_result() {
-        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
-        let handle = recorder.handle();
-        let _recorder = metrics::set_default_local_recorder(&recorder);
+    async fn session_outcomes_are_reported_as_branches() {
         let policy = DpStickyPolicy::new();
         let workers = workers();
         let headers = headers("session-1");
-        let info = SelectWorkerInfo {
+        let session = SelectWorkerInfo {
             headers: Some(&headers),
             ..Default::default()
         };
+        let no_session = SelectWorkerInfo::default();
 
-        let first = policy.select_worker(&workers, &info).await.unwrap();
-        policy.select_worker(&workers, &info).await.unwrap();
-        workers[first].set_healthy(false);
-        policy.select_worker(&workers, &info).await.unwrap();
-        policy.assignments.get_mut("session-1").unwrap().last_access =
-            Instant::now() - SESSION_REASSIGNMENT_IDLE_TIMEOUT - Duration::from_secs(1);
-        policy.select_worker(&workers, &info).await.unwrap();
-        policy
-            .select_worker(&workers, &SelectWorkerInfo::default())
-            .await
-            .unwrap();
+        let (first, decision) = policy.select_with_decision(&workers, &session).await;
+        let mut branches = vec![decision.branch];
+        branches.push(branch(&policy, &workers, &session).await);
+        workers[first.unwrap()].set_healthy(false);
+        branches.push(branch(&policy, &workers, &session).await);
+        expire(&policy, "session-1");
+        branches.push(branch(&policy, &workers, &session).await);
+        branches.push(branch(&policy, &workers, &no_session).await);
+        workers.iter().for_each(|worker| worker.set_healthy(false));
+        branches.push(branch(&policy, &workers, &session).await);
 
-        let rendered = handle.render();
-        for result in ["new", "hit", "rebind", "expired"] {
-            let line =
-                format!(r#"mesh_session_affinity_total{{pool="regular",result="{result}"}} 1"#);
-            assert!(rendered.contains(&line), "missing {line} in\n{rendered}");
-        }
-        assert!(
-            rendered.contains(
-                r#"mesh_route_branch_total{pool="regular",policy="dp_sticky",branch="no_session"} 1"#
-            ),
-            "{rendered}"
+        assert_eq!(
+            branches,
+            [
+                "new",
+                "hit",
+                "rebind",
+                "expired",
+                "no_session",
+                NO_HEALTHY_WORKERS
+            ]
         );
+    }
+
+    async fn branch(
+        policy: &DpStickyPolicy,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+    ) -> &'static str {
+        policy.select_with_decision(workers, info).await.1.branch
     }
 
     /// Selects a worker for `session` and dispatches the request to it.

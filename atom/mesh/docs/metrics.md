@@ -62,9 +62,8 @@ adds another.
 | Metric | Type / unit | Labels | Recorded when |
 | --- | --- | --- | --- |
 | `mesh_route_branch_total` | Counter, decisions | `pool`, `policy`, `branch` (see [Branches](#branches)) | Every selection, including one in a pool without candidates. |
-| `mesh_route_prefix_match_ratio` | Histogram, ratio 0 to 1 | `pool`, `policy` | `cache_aware` branches `affinity`, `relocate`, `stale_tenant`. |
+| `mesh_route_prefix_match_ratio` | Histogram, ratio 0 to 1 | `pool`, `policy` | `cache_aware` branches `affinity` and `relocate`. |
 | `mesh_route_selected_worker_active_requests` | Histogram, active requests | `pool`, `policy`, `branch` | Every selection that picks a worker, before the router adds the request (see [below](#selected-workers-active-requests)). |
-| `mesh_session_affinity_total` | Counter, requests | `pool`, `result`: `hit`, `new`, `rebind`, `expired` | `dp_sticky` selected a worker for a request with a session ID. |
 | `mesh_session_worker_change_total` | Counter, requests | `pool`, `reason`: `rebind`, `expired`, `rank_mapping` | A `dp_sticky` session request is sent to a different worker (URL and DP rank) than the session's previous request (see [below](#worker-changes)). |
 | `mesh_prefix_hash_policy_branch_total` | Counter, decisions | `branch` | `prefix_hash`, the same branches without `pool`. Deprecated by [#3141] for `mesh_route_branch_total{policy="prefix_hash"}`. |
 
@@ -76,7 +75,7 @@ Histogram buckets:
 ## Branches
 
 `no_healthy_workers` exists for every policy: no candidate is healthy, so no
-worker is selected. The policy counts it when none of its candidates is
+worker is selected. A policy returns it when none of its candidates is
 healthy. The router counts it once, under the pool's policy, when the health
 filter leaves no candidate or the pool has no worker, since the policy then
 never runs. Every branch that selects a worker also records the
@@ -94,13 +93,13 @@ Defaults are the CLI defaults.
 | `cache_aware` | `affinity` | Match ratio above `--cache-threshold` (0.3): the worker holding the longest match. | ratio |
 | | `relocate` | Match ratio at or below the threshold: the least-loaded worker, ties broken at random. | ratio |
 | | `imbalanced` | The max minus min load exceeds `--balance-abs-threshold` (64) and the max exceeds `--balance-rel-threshold` (1.5) times the min: the least-loaded worker, without a tree lookup. | |
-| | `stale_tenant` | Affinity, but that worker is gone or unhealthy: it leaves the tree and the first healthy worker is used. | ratio |
+| | `stale_tenant` | Affinity, but that worker is gone or unhealthy: it leaves the tree and the first healthy worker is used. | |
 | | `no_tree` | No tree for the model and pool: a random healthy worker. | |
 | `prefix_hash` | `ring_hit` | The hash ring owner of the first `--prefix-token-count` (256) tokens, when its load is at most `--prefix-hash-load-factor` (1.25) times the average load including this request. | |
 | | `load_balance_walk` | The owner is over that bound: the least-loaded worker within it, or the owner if none is. | |
 | | `fallback_least_load` | No ring, or the owner is not healthy: the least-loaded worker. | |
 | | `no_tokens` | The request has no tokens: no worker. | |
-| `dp_sticky` | `hit`, `new`, `rebind`, `expired` | See [session affinity](#session-affinity). | result |
+| `dp_sticky` | `hit`, `new`, `rebind`, `expired` | See [session affinity](#session-affinity). | |
 | | `no_session` | No `x-session-id` header: the least-loaded worker. | |
 
 ## Reading the values
@@ -112,10 +111,11 @@ and pool, and records matched characters over input characters for the best
 match. It counts characters of the prompt text, not tokens or KV blocks. The
 router prunes the tree on its own schedule (`--eviction-interval`,
 `--max-tree-size`) and does not see engine eviction, so the ratio estimates
-reuse rather than measuring it. `imbalanced` and `no_tree` skip the lookup, so
-the histogram count can be lower than the `cache_aware` decision count. Mass
-above the threshold corresponds to `affinity`; mass near 0 comes from first
-turns and unrelated prompts.
+reuse rather than measuring it. `imbalanced` and `no_tree` skip the lookup, and
+the match of a `stale_tenant` is on a worker that is gone, so none of them
+records a ratio and the histogram count can be lower than the `cache_aware`
+decision count. Mass above the threshold corresponds to `affinity`; mass near 0
+comes from first turns and unrelated prompts.
 
 ### Selected worker's active requests
 
@@ -143,7 +143,7 @@ to a worker (URL and DP rank) in router memory:
 
 With N turns per session and stable workers, the hit rate approaches
 (N - 1) / N. `rebind` points at worker churn; a router restart makes every
-session `new` again. Each pool that runs `dp_sticky` records its own result.
+session `new` again. Each pool that runs `dp_sticky` records its own branches.
 
 ### Worker changes
 
@@ -171,11 +171,12 @@ sum by (pool, policy, branch) (rate(mesh_route_branch_total[5m]))
     sum by (pool, policy) (rate(mesh_route_branch_total[5m]))
 ```
 
-Session affinity hit rate:
+Session affinity hit rate, over the `dp_sticky` decisions of requests with a
+session ID:
 
 ```promql
-sum by (pool) (rate(mesh_session_affinity_total{result="hit"}[5m]))
-  / sum by (pool) (rate(mesh_session_affinity_total[5m]))
+sum by (pool) (rate(mesh_route_branch_total{policy="dp_sticky",branch="hit"}[5m]))
+  / sum by (pool) (rate(mesh_route_branch_total{policy="dp_sticky",branch=~"hit|new|rebind|expired"}[5m]))
 ```
 
 Session worker changes per session request:
@@ -183,7 +184,7 @@ Session worker changes per session request:
 ```promql
 sum by (pool, reason) (rate(mesh_session_worker_change_total[5m]))
   / ignoring (reason) group_left
-    sum by (pool) (rate(mesh_session_affinity_total[5m]))
+    sum by (pool) (rate(mesh_route_branch_total{policy="dp_sticky",branch=~"hit|new|rebind|expired"}[5m]))
 ```
 
 Median prefix match ratio:
@@ -207,8 +208,6 @@ mesh_route_branch_total{pool="prefill",policy="cache_aware",branch="relocate"} 3
 mesh_route_branch_total{pool="prefill",policy="cache_aware",branch="affinity"} 9
 mesh_route_branch_total{pool="decode",policy="dp_sticky",branch="new"} 3
 mesh_route_branch_total{pool="decode",policy="dp_sticky",branch="hit"} 9
-mesh_session_affinity_total{pool="decode",result="hit"} 9
-mesh_session_affinity_total{pool="decode",result="new"} 3
 mesh_route_prefix_match_ratio_bucket{pool="prefill",policy="cache_aware",le="0.2"} 3
 mesh_route_prefix_match_ratio_bucket{pool="prefill",policy="cache_aware",le="0.8"} 9
 mesh_route_prefix_match_ratio_bucket{pool="prefill",policy="cache_aware",le="+Inf"} 12

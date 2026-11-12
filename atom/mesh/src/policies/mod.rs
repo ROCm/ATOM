@@ -10,7 +10,6 @@ use async_trait::async_trait;
 use crate::core::{HashRing, Worker};
 
 mod cache_aware;
-pub(crate) mod decision;
 mod dp_sticky;
 mod factory;
 mod power_of_two;
@@ -30,6 +29,26 @@ pub use registry::PolicyRegistry;
 pub use round_robin::RoundRobinPolicy;
 pub use tree::PrefixMatchResult;
 
+/// Branch for selections that found no healthy candidate.
+pub const NO_HEALTHY_WORKERS: &str = "no_healthy_workers";
+
+/// What a policy decided for one selection.
+#[derive(Debug, Clone, Copy)]
+pub struct RouteDecision {
+    pub branch: &'static str,
+    /// Prefix match ratio of the best candidate, for policies that estimate one.
+    pub match_ratio: Option<f64>,
+}
+
+impl RouteDecision {
+    pub fn branch(branch: &'static str) -> Self {
+        Self {
+            branch,
+            match_ratio: None,
+        }
+    }
+}
+
 /// Core trait for load balancing policies
 ///
 /// This trait provides a unified interface for implementing routing algorithms
@@ -40,15 +59,26 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     ///
     /// This is used for regular routing mode where requests go to a single worker.
     /// Now uses Arc<dyn Worker> for better performance and to avoid unnecessary cloning.
+    /// Returns the branch that chose the worker along with its index; the
+    /// placement layer records one decision per call.
     ///
     /// # Arguments
     /// * `workers` - Available workers to select from
     /// * `info` - Additional information for routing decisions
+    async fn select_with_decision(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+    ) -> (Option<usize>, RouteDecision);
+
+    /// [`Self::select_with_decision`] without the decision.
     async fn select_worker(
         &self,
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo<'_>,
-    ) -> Option<usize>;
+    ) -> Option<usize> {
+        self.select_with_decision(workers, info).await.0
+    }
 
     /// Update policy state after request completion
     ///
@@ -72,12 +102,6 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
 
     /// Get policy name for metrics and debugging
     fn name(&self) -> &'static str;
-
-    /// Branches this policy passes to `decision::report`, declared up front so
-    /// `mesh_route_branch_total` stays bounded.
-    fn decision_branches(&self) -> &'static [&'static str] {
-        &[]
-    }
 
     /// Check if this policy needs request text for routing decisions
     fn needs_request_text(&self) -> bool {
