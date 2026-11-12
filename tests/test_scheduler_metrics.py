@@ -369,6 +369,7 @@ def test_pd_consumer_counts_its_own_prefix_once_after_transfer(
     scheduler.kv_connector = SimpleNamespace(
         is_producer=False,
         is_offload=False,
+        pending_load_partial_token_cap=0,
         build_connector_meta=lambda: None,
     )
     bm = scheduler.block_manager
@@ -425,6 +426,7 @@ def test_failed_pd_transfer_does_not_record_successful_cache_admission():
     scheduler.kv_connector = SimpleNamespace(
         is_producer=False,
         is_offload=False,
+        pending_load_partial_token_cap=0,
         build_connector_meta=lambda: None,
         get_num_new_matched_tokens=lambda seq: (0, False),
         update_state_after_alloc=lambda seq: None,
