@@ -13,7 +13,6 @@ This module provides:
   from all workers.
 """
 
-import functools
 import logging
 import multiprocessing
 import pickle
@@ -218,24 +217,7 @@ class AsyncIOProc:
         runner_class = resolve_obj_by_qualname(runner_qualname)
         self.runners: list[object] = []
         self.runners = [runner_class(rank, *args, **kwargs)]
-        if any(getattr(r, "weights_only", False) for r in self.runners):
-            self._sleep_when_idle()
         self.busy_loop()
-
-    def _sleep_when_idle(self):
-        """A weight cache daemon's runner gets an RPC at startup and at
-        shutdown only: after a few idle seconds, poll the queue every 0.1 s
-        instead of spinning a core (which also starves its socket thread of
-        the GIL), and wait without the queue's "no block found" message
-        every minute."""
-        try:
-            from aiter.dist.shm_broadcast import SpinSleepTimer
-
-            mq = self.rpc_broadcast_mq
-            mq._read_spin_timer = SpinSleepTimer()
-            mq.dequeue = functools.partial(mq.dequeue, indefinite=True)
-        except Exception as e:  # noqa: BLE001 - only costs CPU and log lines
-            logger.warning(f"{self.label}: idle polling stays busy: {e}")
 
     def exit(self):
         if not getattr(self, "still_running", True):

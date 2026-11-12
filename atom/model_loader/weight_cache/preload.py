@@ -80,12 +80,13 @@ def _remove(*paths: str) -> None:
 
 
 def record_launch() -> None:
-    """Called first thing by the API server (weight cache on). Its start time
-    tells the runners which sources may have changed under them. A daemon
+    """Called first thing by the API server (weight cache on). The time it
+    runs tells the runners which sources may have changed under them. A daemon
     tells its runners its main process (stopping that stops the daemon). An
     ATOM_PRELOAD server saves its command line and environment, to start a
     daemon with them."""
-    os.environ[_LAUNCH_T0_ENV] = str(psutil.Process().create_time())
+    # The engine's runners start, and import their code, after this moment.
+    os.environ[_LAUNCH_T0_ENV] = repr(time.time())
     if envs.ATOM_WEIGHT_CACHE == "daemon":
         os.environ[_DAEMON_PID_ENV] = str(os.getpid())
         return

@@ -42,6 +42,7 @@ from atom.model_loader.weight_cache.transport import (
     _recv,
     _send,
     daemon_alive,
+    daemon_state,
     socket_path,
 )
 from atom.model_loader.weight_cache.values import _TAG, _Miss, logger
@@ -180,6 +181,32 @@ def _probe(path: str, label: str, runner, started: dict | None):
     return sock, payload, reasons, True
 
 
+def _stop_and_reclaim(path: str, device: torch.device) -> None:
+    """Stop this GPU's daemon, then wait until its memory is free: the driver
+    releases an exited process's device memory asynchronously, so a load
+    that starts at once can still find the GPU full."""
+    held = (daemon_state(path) or {}).get("bytes") or 0
+    on_gpu = device.type == "cuda"
+    free0 = torch.cuda.mem_get_info(device)[0] if on_gpu else 0
+    stop_daemon(path)
+    if not on_gpu:
+        return
+    deadline = time.monotonic() + 120
+    last, steady_since = free0, time.monotonic()
+    while time.monotonic() < deadline:
+        free = torch.cuda.mem_get_info(device)[0]
+        if held and free >= free0 + 0.9 * held:
+            return
+        if free != last:
+            last, steady_since = free, time.monotonic()
+        elif not held and time.monotonic() - steady_since > 2:
+            return  # size unknown (it was loading): settled
+        time.sleep(0.2)
+    logger.warning(
+        f"{_TAG} the stopped daemon's memory is still not free on {device} after 120s"
+    )
+
+
 def _forward_context(runner) -> dict | None:
     cc = getattr(runner.config, "compilation_config", None)
     return getattr(cc, "static_forward_context", None)
@@ -190,7 +217,7 @@ def _give_up(label, path, reasons, started, group, runner, layers) -> bool:
     load from disk (its memory is free again), or fail if it won't stop."""
     err = None
     try:
-        stop_daemon(path)
+        _stop_and_reclaim(path, runner.device)
     except Exception as e:  # noqa: BLE001 - every rank must reach the agreement
         err = f"could not stop the daemon this launch started: {e}"
     if not group_agree(err is None, group):
@@ -308,7 +335,7 @@ def try_load_from_cache(runner, model_class) -> bool:
                 )
             err = None
             try:
-                stop_daemon(path)
+                _stop_and_reclaim(path, runner.device)
             except Exception as e:  # noqa: BLE001 - every rank must reach the agreement
                 err = f"could not stop the daemon: {e}"
             if not group_agree(err is None, group):

@@ -14,13 +14,22 @@ import sys
 import textwrap
 import threading
 import time
+from types import SimpleNamespace
 
+import psutil
 import pytest
 import torch
 from torch import nn
 
 import atom.model_loader.weight_cache.__main__ as cli
-from atom.model_loader.weight_cache import export, key, preload, transport, values
+from atom.model_loader.weight_cache import (
+    client,
+    export,
+    key,
+    preload,
+    transport,
+    values,
+)
 from atom.model_loader.weight_cache import recorder as ir
 
 # --------------------------------------------------------------------------
@@ -468,8 +477,19 @@ def test_record_launch_saves_the_environment_from_exec(cache_dir, monkeypatch):
 
 def test_record_launch_in_a_daemon_names_its_main_process(cache_dir, monkeypatch):
     monkeypatch.setenv("ATOM_WEIGHT_CACHE", "daemon")
+    before = time.time()
     preload.record_launch()
     assert os.environ[transport._DAEMON_PID_ENV] == str(os.getpid())
+    # The launch time is taken now, not from the process start (psutil's can
+    # be a second early, so a file edited just before the launch would count
+    # as edited after it).
+    assert before <= float(os.environ[key._LAUNCH_T0_ENV]) <= time.time()
+
+
+def test_process_start_is_to_the_tick():
+    start = key._process_start()
+    assert start <= time.time()
+    assert abs(start - psutil.Process().create_time()) < 1.5
 
 
 def test_spawned_daemon_is_detached_and_started_once(cache_dir, tmp_path, monkeypatch):
@@ -658,3 +678,140 @@ def test_start_early_only_without_any_daemon(cache_dir, monkeypatch):
     lock.release()
     preload.start_early()
     assert calls == [1] and preload._started_by_launch()["pid"] == 4242
+
+
+# --------------------------------------------------------------------------
+# The client's decisions (one rank; the daemon-facing calls replaced)
+# --------------------------------------------------------------------------
+
+
+class _Model(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.w = nn.Parameter(torch.zeros(2), requires_grad=False)
+        # Like attention/MoE layers: registered globally by name.
+        config.compilation_config.static_forward_context["layers.0"] = self
+
+
+def _runner():
+    ctx = {"other": 1}
+    config = SimpleNamespace(
+        compilation_config=SimpleNamespace(static_forward_context=ctx)
+    )
+    return SimpleNamespace(rank=0, device=torch.device("cpu"), config=config)
+
+
+class _Conn:
+    def recv(self, n):
+        return b""
+
+    def close(self):
+        pass
+
+
+@pytest.fixture
+def loop(monkeypatch):
+    """try_load_from_cache with the daemon replaced: ``probes`` lists what
+    each probe finds, (daemon there, why it cannot be used)."""
+    calls = SimpleNamespace(probes=[], spawned=0, stopped=0, attr_diffs=[])
+    payload = {
+        "summary": {"pid": 7, "daemon_pid": 7},
+        "structure": {},
+        "export": {"plan": {}, "storages": {}},
+        "reads": {},
+    }
+
+    def probe(path, label, runner, started):
+        present, reasons = calls.probes.pop(0)
+        if not present:
+            return None, None, [], False
+        return (None if reasons else _Conn()), payload, reasons, True
+
+    def spawn():
+        calls.spawned += 1
+        return {"pid": 1, "log": "daemon.log"}
+
+    def stop(path):
+        calls.stopped += 1
+
+    for name, fn in {
+        "_probe": probe,
+        "_spawn_daemon": spawn,
+        "stop_daemon": stop,
+        "socket_path": lambda device: "/nonexistent/gpu.sock",
+        "_started_by_launch": lambda: None,
+        "_in_use_by_others": lambda path: None,
+        "exported_structure": lambda built, export: {},
+        "diff_reads": lambda reads, kinds, **kw: list(calls.attr_diffs),
+        "apply_export": lambda model, export, device: 0,
+        "_leftover_meta": lambda model: [],
+        "_run_prepare_finalize": lambda model: 0,
+    }.items():
+        monkeypatch.setattr(client, name, fn)
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda *a, **k: None)
+    monkeypatch.delenv("ATOM_PRELOAD", raising=False)
+    monkeypatch.delenv("ATOM_WEIGHT_CACHE", raising=False)
+    return calls
+
+
+def test_client_mode_without_a_daemon_loads_from_disk(loop):
+    loop.probes = [(False, [])]
+    assert client.try_load_from_cache(_runner(), _Model) is False
+
+
+def test_client_mode_refuses_a_daemon_it_cannot_use(loop):
+    loop.probes = [(True, ["env X: daemon=1 client=2"])]
+    with pytest.raises(RuntimeError, match="env X"):
+        client.try_load_from_cache(_runner(), _Model)
+    assert loop.stopped == loop.spawned == 0
+
+
+def test_preload_starts_a_daemon_and_maps_it(loop, monkeypatch):
+    monkeypatch.setenv("ATOM_PRELOAD", "1")
+    loop.probes = [(False, []), (True, [])]
+    runner = _runner()
+    assert client.try_load_from_cache(runner, _Model) is True
+    assert loop.spawned == 1 and isinstance(runner.model, _Model)
+
+
+def test_preload_restarts_a_daemon_it_cannot_use_once(loop, monkeypatch):
+    monkeypatch.setenv("ATOM_PRELOAD", "1")
+    loop.probes = [(True, ["atom/model_loader/loader.py:load_model"]), (True, [])]
+    assert client.try_load_from_cache(_runner(), _Model) is True
+    assert loop.stopped == 1 and loop.spawned == 1
+
+
+def test_preload_loads_from_disk_when_its_own_daemon_does_not_fit(loop, monkeypatch):
+    monkeypatch.setenv("ATOM_PRELOAD", "1")
+    monkeypatch.setattr(
+        client, "_started_by_launch", lambda: {"pid": 1, "log": "d.log"}
+    )
+    loop.probes = [(True, [])]
+    loop.attr_diffs = ["layers.0.interleave: daemon=True client=False"]
+    runner = _runner()
+    assert client.try_load_from_cache(runner, _Model) is False  # a disk load follows
+    assert loop.stopped == 1 and loop.spawned == 0
+    # The meta-built model is unregistered, so the disk load can build it again.
+    assert runner.config.compilation_config.static_forward_context == {"other": 1}
+
+
+def test_preload_loads_from_disk_when_no_daemon_can_start(loop, monkeypatch):
+    monkeypatch.setenv("ATOM_PRELOAD", "1")
+
+    def no_spawn():
+        raise values._Miss("this engine was not started by the API server")
+
+    monkeypatch.setattr(client, "_spawn_daemon", no_spawn)
+    loop.probes = [(False, [])]
+    assert client.try_load_from_cache(_runner(), _Model) is False
+
+
+def test_preload_leaves_a_daemon_other_servers_use(loop, monkeypatch):
+    monkeypatch.setenv("ATOM_PRELOAD", "1")
+    monkeypatch.setattr(
+        client, "_in_use_by_others", lambda path: "1 other running server(s) use it"
+    )
+    loop.probes = [(True, ["atom/model_loader/loader.py:load_model"])]
+    with pytest.raises(RuntimeError, match="other running server"):
+        client.try_load_from_cache(_runner(), _Model)
+    assert loop.stopped == loop.spawned == 0

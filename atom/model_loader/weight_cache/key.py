@@ -16,8 +16,8 @@ import struct
 import subprocess
 import sys
 import threading
+import time
 
-import psutil
 import torch
 from torch import nn
 
@@ -165,10 +165,22 @@ _LAUNCH_T0_ENV = "ATOM_WEIGHT_CACHE_LAUNCH_T0"
 
 
 def _launch_start() -> float:
-    """When this launch started: its API server's start, else this process's."""
+    """A time before this process imported its code: when its API server
+    started (preload.record_launch), else when this process started."""
     with contextlib.suppress(TypeError, ValueError):
         return float(os.environ.get(_LAUNCH_T0_ENV))
-    return psutil.Process().create_time()
+    return _process_start()
+
+
+def _process_start() -> float:
+    """This process's start in wall-clock time, to the clock tick. (psutil's
+    create_time adds the boot time, truncated to the second, so it can be up
+    to a second early: a file edited just before the launch would count as
+    edited after it.)"""
+    with open("/proc/self/stat", "rb") as f:
+        ticks = int(f.read().rsplit(b")", 1)[1].split()[19])
+    since_boot = ticks / os.sysconf("SC_CLK_TCK")
+    return time.time() - (time.clock_gettime(time.CLOCK_BOOTTIME) - since_boot)
 
 
 def _package_roots() -> dict[str, str]:

@@ -2522,15 +2522,13 @@ class Config:
                 "atom.model_engine.model_runner.RapidServeModelRunner"
             )
 
-        # Weight cache (atom/model_loader/weight_cache/): a daemon is this
-        # launch with runners that stop after loading and serve their weights;
-        # a client maps them. Clients share the daemon's memory, so runners
-        # that write weights in place (EPLB, RLHF weight updates, RapidServe's
-        # own weight sharing) cannot take part.
+        # Weight cache (atom/model_loader/weight_cache/): a daemon loads the
+        # weights once per GPU and serves them; a client maps them. Clients
+        # share the daemon's memory, so runners that write weights in place
+        # (EPLB, RLHF weight updates, RapidServe's own weight sharing) cannot
+        # take part.
         cache_mode = envs.ATOM_WEIGHT_CACHE
         if cache_mode in ("daemon", "client"):
-            from atom.model_loader.weight_cache import DAEMON_RUNNER
-
             if self.runner_qualname != "atom.model_engine.model_runner.ModelRunner":
                 raise ValueError(
                     f"ATOM_WEIGHT_CACHE={cache_mode} needs the default model "
@@ -2546,14 +2544,12 @@ class Config:
                     f"ATOM_WEIGHT_CACHE={cache_mode} does not support pipeline "
                     "parallelism yet"
                 )
-            if self.parallel_config.data_parallel_size > 1:
-                # The daemon and the server would both hold the DP master port.
+            if self.parallel_config.data_parallel_size > 1 or self.enable_dp_attention:
+                # The daemon starts one process per GPU of a single engine.
                 raise ValueError(
                     f"ATOM_WEIGHT_CACHE={cache_mode} does not support data "
-                    "parallelism yet"
+                    "parallelism (or DP attention) yet"
                 )
-            if cache_mode == "daemon":
-                self.runner_qualname = DAEMON_RUNNER
         elif cache_mode != "off":
             raise ValueError(
                 f"ATOM_WEIGHT_CACHE must be off, client or daemon, not {cache_mode!r}"

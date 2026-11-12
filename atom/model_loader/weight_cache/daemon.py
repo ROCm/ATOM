@@ -1,13 +1,22 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""The daemon's model runner (``ATOM_WEIGHT_CACHE=daemon``)."""
+"""The daemon (``ATOM_WEIGHT_CACHE=daemon``): one process per GPU that builds
+and loads its shard as a serving runner would, then serves it.
+
+No engine, scheduler or HTTP server: the daemon shares no port, store or
+communicator with the servers that use it, and serving features need no
+daemon mode."""
 
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import gc
+import multiprocessing
 import os
+import queue
 import signal
+import threading
 import time
 
 import torch
@@ -41,10 +50,118 @@ from atom.model_loader.weight_cache.values import _TAG, _entries, logger
 from atom.utils import envs
 
 
+def run_daemon(engine_args) -> None:
+    """Called by the API server in place of starting an engine: start one
+    process per GPU of the launch, report when all serve, and stop them on
+    SIGINT/SIGTERM (``python -m atom.model_loader.weight_cache stop``, the
+    idle timeout) or when one of them fails."""
+    from torch.distributed import TCPStore
+
+    config = _engine_config(engine_args)
+    # The runners' rendezvous, as the engine's CoreManager hosts it.
+    pc = config.parallel_config
+    store = TCPStore(
+        pc.data_parallel_master_ip, 0, is_master=True, wait_for_workers=False
+    )
+    pc.data_parallel_base_port = store.port
+    pc._managed_distributed_store = True
+
+    n = config.tp_world_size * config.pcp_group_size
+    ctx = multiprocessing.get_context("spawn")
+    ready = ctx.Queue()
+    procs = [
+        ctx.Process(
+            target=_serve_rank, args=(rank, config, ready), name=f"WeightCache{rank}"
+        )
+        for rank in range(n)
+    ]
+    stop = threading.Event()
+
+    def on_signal(signum, frame):
+        stop.set()  # no logging here: a signal can land inside a log write
+
+    signal.signal(signal.SIGINT, on_signal)
+    signal.signal(signal.SIGTERM, on_signal)
+    t0 = time.monotonic()
+    for p in procs:
+        p.start()
+    serving: set[int] = set()
+    failed = []
+    while not stop.is_set():
+        with contextlib.suppress(queue.Empty):
+            serving.add(ready.get(timeout=1.0))
+            if len(serving) == n:
+                logger.info(
+                    f"{_TAG} daemon ready: {n} rank(s) serve their weights "
+                    f"({time.monotonic() - t0:.0f}s)"
+                )
+        failed = [p.name for p in procs if p.exitcode is not None]
+        if failed:
+            logger.error(
+                f"{_TAG} daemon process(es) {failed} exited; stopping the daemon"
+            )
+            break
+    for p in procs:
+        if p.is_alive():
+            p.terminate()  # each stops serving and exits
+    deadline = time.monotonic() + 60
+    for p in procs:
+        p.join(max(0.0, deadline - time.monotonic()))
+        if p.is_alive():
+            p.kill()
+            p.join(5)
+    del store
+    logger.info(f"{_TAG} daemon stopped")
+    if failed:
+        raise SystemExit(1)
+
+
+def _engine_config(engine_args):
+    """The Config a server's runners get: LLMEngine's preparation before it
+    starts its engine."""
+    from atom.config import Config
+    from atom.model_engine.llm_engine import load_tokenizer
+
+    fields = {f.name for f in dataclasses.fields(Config)}
+    kwargs = engine_args._get_engine_kwargs()
+    config = Config(
+        engine_args.model, **{k: v for k, v in kwargs.items() if k in fields}
+    )
+    tokenizer = load_tokenizer(config.model, config.trust_remote_code)
+    config.bos_token_id = tokenizer.bos_token_id
+    config.eos_token_id = tokenizer.eos_token_id
+    stop_token_ids = set(config.stop_token_ids)
+    stop_token_ids.discard(config.eos_token_id)
+    config.stop_token_ids = list(stop_token_ids)
+    return config
+
+
+def _serve_rank(rank: int, config, ready) -> None:
+    """One GPU's daemon process: the setup an engine's worker does, then the
+    runner, which loads and serves; then wait to be stopped."""
+    from atom.config import local_device_index
+    from atom.utils import enable_orphan_reaping, set_process_title, worker_process_name
+    from atom.utils.gc_utils import tune_gc
+    from atom.utils.numa_utils import numa_bind_to_node
+
+    enable_orphan_reaping()  # dies with the daemon's main process
+    set_process_title(f"WeightCache_{worker_process_name(config, rank)}")
+    tune_gc()
+    with contextlib.suppress(Exception):  # locality only, as in the engine's workers
+        numa_bind_to_node(local_device_index(config, rank), f"weight cache rank {rank}")
+    runner = WeightCacheDaemonRunner(rank, config)
+    stop = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    signal.signal(signal.SIGINT, lambda *_: stop.set())
+    ready.put(rank)
+    while not stop.wait(1.0):
+        pass
+    runner.exit()
+
+
 class WeightCacheDaemonRunner(ModelRunner):
-    """Loads its shard like a serving runner and serves it to clients over
-    the socket; sets up nothing for serving requests (weights_only), so its
-    EngineCore skips the KV cache, warmup and graphs and reports ready."""
+    """Loads its shard like a serving runner, then serves it to clients over
+    the socket; sets up nothing for serving requests (weights_only)."""
 
     weights_only = True
 
@@ -149,11 +266,11 @@ class WeightCacheDaemonRunner(ModelRunner):
             self.exit()  # main process unknown: at least stop serving
 
     def exit(self):
-        """Stop serving: called by the engine's shutdown (or on SIGTERM).
-        Clients that mapped the weights keep them until they exit."""
-        if not getattr(self, "still_running", False):
+        """Stop serving. Clients that mapped the weights keep them until they
+        exit."""
+        if getattr(self, "_wc_stopped", False):
             return
-        self.still_running = False
+        self._wc_stopped = True
         server = getattr(self, "_wc_server", None)
         if server is not None:
             server.close()

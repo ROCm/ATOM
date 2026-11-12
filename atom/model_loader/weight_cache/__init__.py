@@ -2,9 +2,10 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Keep a model's processed weights on the GPU across server restarts.
 
-A *daemon* is an ATOM launch with ``ATOM_WEIGHT_CACHE=daemon``: its runners
-load and post-process their shard as usual, then stop (daemon.py). Each rank
-exports what loading produced as CUDA IPC handles on a Unix socket named
+A *daemon* is started like a server, with ``ATOM_WEIGHT_CACHE=daemon``: in
+place of an engine it starts one process per GPU that builds, loads and
+post-processes its shard as a serving runner would, then stops (daemon.py).
+Each exports what loading produced as CUDA IPC handles on a Unix socket named
 after its GPU (transport.py). A *client* (``ATOM_WEIGHT_CACHE=client``) builds
 its model on the meta device and maps those tensors instead of reading the
 checkpoint (client.py).
@@ -30,5 +31,3 @@ starts, reuses or (once) restarts the daemon with the server's own launch
 loads from disk. ``python -m atom.model_loader.weight_cache status|stop`` shows
 or stops this user's daemons.
 """
-
-DAEMON_RUNNER = "atom.model_loader.weight_cache.daemon.WeightCacheDaemonRunner"

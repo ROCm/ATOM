@@ -3775,6 +3775,13 @@ def main():
     args = parser.parse_args()
     if args.api_server_count < 1:
         parser.error("--api-server-count must be at least 1")
+    if envs.ATOM_WEIGHT_CACHE == "daemon":
+        # A weight cache daemon serves weights, not requests: no front end,
+        # engine or HTTP server.
+        from atom.model_loader.weight_cache.daemon import run_daemon
+
+        run_daemon(EngineArgs.from_cli_args(args))
+        return
     if envs.ATOM_PRELOAD and envs.ATOM_WEIGHT_CACHE == "client":
         # Start the weight cache daemon now, so it loads while this starts up.
         from atom.model_loader.weight_cache.preload import start_early
@@ -3805,9 +3812,6 @@ def main():
     _setup_reasoning_and_tools(args)
 
     engine = engine_args.create_engine(tokenizer=tokenizer)
-    if envs.ATOM_WEIGHT_CACHE == "daemon":
-        _run_weight_cache_daemon(engine)
-        return
     _setup_stream_dispatch(args)
 
     # Wire the batched stream-flush hook: per-seq stream callbacks only buffer
@@ -4052,31 +4056,6 @@ def _loop_impl() -> str:
             "uvloop not installed; falling back to the default asyncio loop."
         )
         return "auto"
-
-
-def _run_weight_cache_daemon(engine) -> None:
-    """ATOM_WEIGHT_CACHE=daemon: the runners serve their weights, not
-    requests; wait for SIGINT/SIGTERM, then shut the engine down."""
-    import signal
-    import threading
-
-    stop = threading.Event()
-
-    def _on_signal(signum, frame):
-        logger.info(
-            f"Weight cache daemon: received {signal.Signals(signum).name}, shutting down..."
-        )
-        stop.set()
-
-    signal.signal(signal.SIGINT, _on_signal)
-    signal.signal(signal.SIGTERM, _on_signal)
-    logger.info(
-        "Weight cache daemon ready: all ranks serve their weights. Stop with SIGINT/SIGTERM."
-    )
-    while not stop.wait(1.0):
-        pass
-    engine.close()
-    logger.info("Weight cache daemon stopped.")
 
 
 def _serve(args) -> None:
