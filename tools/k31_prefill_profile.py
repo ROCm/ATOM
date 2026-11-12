@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Profile 16384-token Kimi-K3.1 prefill chunks at TP8 + DCP8 (recipe F8).
+"""Profile 16384-token Kimi-K3.1 Pro prefill chunks at TP8 + DCP8.
 
 Warms up on one random prompt, then profiles a different one with prefix
 caching off and one output token, so rank 0's trace holds one ``prefill[``
@@ -21,8 +21,8 @@ from atom import SamplingParams
 from atom.model_engine.arg_utils import EngineArgs
 from atom.utils.arg_parser import FlexibleArgumentParser
 
-# Recipe F8's environment; a value already exported wins.
-F8_ENV = {
+# The Kimi-K3.1 Pro TP8 + DCP8 serving environment; an exported value wins.
+DEFAULT_ENV = {
     "AITER_LOG_LEVEL": "WARNING",
     "AITER_SITUV2_A4W4": "1",
     "AITER_FLYDSL_USE_HERD": "1",
@@ -39,9 +39,9 @@ F8_ENV = {
     "ATOM_MLA_ABSORB_BF16": "1",
 }
 
-# Recipe F8's server flags, except prefix caching (off) and the LMCache CPU
-# tier (not started: pass --kv-transfer-config to add it).
-F8_ARGS = {
+# The Kimi-K3.1 Pro TP8 + DCP8 serving flags, except prefix caching (off) and
+# the LMCache CPU tier (not started: pass --kv-transfer-config to add it).
+DEFAULT_ARGS = {
     "model": "/shared/data/amd_int/models/Kimi-K3.1-Pro",
     "trust_remote_code": True,
     "tensor_parallel_size": 8,
@@ -71,13 +71,13 @@ F8_ARGS = {
 parser = FlexibleArgumentParser(
     formatter_class=argparse.RawDescriptionHelpFormatter,
     description=__doc__,
-    epilog="Defaults (recipe F8):\n"
-    + "\n".join(f"  --{k.replace('_', '-')} {v}" for k, v in F8_ARGS.items())
-    + "\nEnvironment defaults (recipe F8; an exported value wins):\n"
-    + "\n".join(f"  {k}={v}" for k, v in F8_ENV.items()),
+    epilog="Defaults (Kimi-K3.1 Pro TP8 + DCP8 serving flags):\n"
+    + "\n".join(f"  --{k.replace('_', '-')} {v}" for k, v in DEFAULT_ARGS.items())
+    + "\nEnvironment defaults (an exported value wins):\n"
+    + "\n".join(f"  {k}={v}" for k, v in DEFAULT_ENV.items()),
 )
 EngineArgs.add_cli_args(parser)
-parser.set_defaults(**F8_ARGS)
+parser.set_defaults(**DEFAULT_ARGS)
 parser.add_argument(
     "--prompt-len",
     type=int,
@@ -88,7 +88,7 @@ parser.add_argument(
 
 def main():
     args = parser.parse_args()
-    for key, value in F8_ENV.items():
+    for key, value in DEFAULT_ENV.items():
         os.environ.setdefault(key, value)
 
     llm = EngineArgs.from_cli_args(args).create_engine()
