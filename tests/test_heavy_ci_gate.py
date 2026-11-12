@@ -168,6 +168,8 @@ def test_current_approval_runs_without_label(tmp_path):
 
     assert result["should_run"] == "true"
     assert result["reason"] == "current-approval"
+    assert result["decidable"] == "true"
+    assert result["smoke_requested"] == "true"
     assert result["review_decision"] == "APPROVED"
 
 
@@ -192,6 +194,7 @@ def test_review_query_failure_fails_closed(tmp_path):
 
     assert result["should_run"] == "false"
     assert result["reason"] == "review-query-failed"
+    assert result["decidable"] == "false"
 
 
 def _current_pr(**updates):
@@ -288,6 +291,8 @@ def test_ignored_paths_remain_gated(tmp_path):
     )
     assert result["should_run"] == "false"
     assert result["reason"] == "ignored-paths-only"
+    assert result["decidable"] == "true"
+    assert result["smoke_requested"] == "false"
 
 
 def _previous_run(**updates):
@@ -445,6 +450,7 @@ def test_pr_check_takeover_is_reported_even_when_approval_is_not_sufficient(tmp_
     )
     assert result["should_run"] == "false"
     assert result["pr_check_takeover"] == "true"
+    assert result["smoke_requested"] == "true"
 
 
 def test_replaced_run_does_not_hide_heavy_ci_started_by_earlier_run(tmp_path):
@@ -642,6 +648,10 @@ def test_workflow_wiring_preserves_existing_checks_and_separates_noop_reviews():
         assert "github.event.review.state != 'approved'" in concurrency["group"]
         assert "format('-review-{0}', github.run_id)" in concurrency["group"]
         assert config["jobs"]["ci-gate"]["permissions"]["actions"] == "read"
+        assert (
+            config["jobs"]["ci-gate"]["outputs"]["decidable"]
+            == "${{ steps.gate.outputs.decidable }}"
+        )
         gate_env = next(
             step["env"]
             for step in config["jobs"]["ci-gate"]["steps"]
@@ -653,22 +663,21 @@ def test_workflow_wiring_preserves_existing_checks_and_separates_noop_reviews():
             assert "CI_GATE_PR_CHECK_JOB" not in gate_env
         if filename == "atom-test.yaml":
             assert gate_env["CI_GATE_PR_CHECK_JOB"] == "Offline inference smoke test"
+            assert (
+                config["jobs"]["ci-gate"]["outputs"]["smoke_requested"]
+                == "${{ steps.gate.outputs.smoke_requested }}"
+            )
             smoke = config["jobs"]["offline-smoke-test"]
             assert smoke["needs"] == ["ci-gate"]
             assert smoke["if"] == "${{ !cancelled() }}"
-            requested = (
-                "needs.ci-gate.outputs.should_run == 'true' || "
-                "needs.ci-gate.outputs.pr_check_takeover == 'true' || "
-                "(github.event_name != 'pull_request_review' && "
-                "needs.ci-gate.outputs.reason != 'ignored-paths-only' && "
-                "needs.ci-gate.outputs.reason != 'draft-pull-request' && "
-                "needs.ci-gate.outputs.reason != 'pull-request-closed')"
+            assert (
+                smoke["env"]["SMOKE_REQUESTED"]
+                == "${{ needs.ci-gate.outputs.smoke_requested }}"
             )
-            assert smoke["env"]["SMOKE_REQUESTED"] == "${{ " + requested + " }}"
-            assert requested in smoke["runs-on"]
+            assert "needs.ci-gate.outputs.smoke_requested == 'true'" in smoke["runs-on"]
             assert "'ubuntu-latest'" in smoke["runs-on"]
             assert "'linux-atom-mi35x-1'" in smoke["runs-on"]
-            assert requested in smoke["name"]
+            assert "needs.ci-gate.outputs.smoke_requested == 'true'" in smoke["name"]
             assert all(
                 "env.SMOKE_REQUESTED == 'true'" in step["if"] for step in smoke["steps"]
             )
@@ -680,14 +689,78 @@ def test_workflow_wiring_preserves_existing_checks_and_separates_noop_reviews():
             assert "'Offline inference smoke test'" in smoke["name"]
             assert config["jobs"]["atom-test"]["name"] == "Accuracy"
             assert {"push", "schedule", "workflow_dispatch"} <= events.keys()
+        else:
+            assert "smoke_requested" not in config["jobs"]["ci-gate"]["outputs"]
 
 
-def test_evaluate_test_gate_action_rejects_undecidable_scope():
+def _run_evaluate_gate(tmp_path, **overrides):
     action = yaml.safe_load(
         (REPO_ROOT / ".github/actions/evaluate-test-gate/action.yml").read_text()
     )
     script = action["runs"]["steps"][0]["run"]
-    assert "*-query-failed" in script
-    assert "missing-event-payload" in script
-    assert "missing-pr-context" in script
-    assert "scope was undecidable" in script
+    env = os.environ.copy()
+    env.update(
+        {
+            "GATE_NAME": "Example Gate",
+            "SUITE_NAME": "Example tests",
+            "SHOULD_RUN": "true",
+            "DECIDABLE": "true",
+            "REASON": "current-approval",
+            "CI_GATE_RESULT": "success",
+            "REQUIRED_RESULTS": "check-signal=success\naccuracy=success",
+            "OPTIONAL_RESULTS": "",
+            "GITHUB_STEP_SUMMARY": str(tmp_path / "summary.md"),
+            **overrides,
+        }
+    )
+    return subprocess.run(
+        ["bash", "-c", script],
+        check=False,
+        capture_output=True,
+        encoding="utf-8",
+        env=env,
+    )
+
+
+def test_evaluate_test_gate_rejects_undecidable_scope(tmp_path):
+    result = _run_evaluate_gate(
+        tmp_path,
+        DECIDABLE="false",
+        REASON="review-query-failed",
+        REQUIRED_RESULTS="check-signal=skipped",
+    )
+
+    assert result.returncode != 0
+    assert "scope was undecidable: review-query-failed" in result.stdout
+
+
+def test_evaluate_test_gate_allows_optional_skipped_when_required_passes(tmp_path):
+    result = _run_evaluate_gate(
+        tmp_path,
+        OPTIONAL_RESULTS="offline-smoke-test=skipped",
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_evaluate_test_gate_rejects_required_skipped(tmp_path):
+    result = _run_evaluate_gate(
+        tmp_path,
+        OPTIONAL_RESULTS="offline-smoke-test=skipped",
+        REQUIRED_RESULTS="check-signal=success\naccuracy=skipped",
+    )
+
+    assert result.returncode != 0
+    assert "accuracy=skipped" in result.stderr
+
+
+def test_evaluate_test_gate_allows_not_required_doc_only(tmp_path):
+    result = _run_evaluate_gate(
+        tmp_path,
+        SHOULD_RUN="false",
+        REASON="ignored-paths-only",
+        OPTIONAL_RESULTS="offline-smoke-test=skipped",
+        REQUIRED_RESULTS="check-signal=skipped\naccuracy=skipped",
+    )
+
+    assert result.returncode == 0, result.stderr

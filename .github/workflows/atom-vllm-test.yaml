@@ -33,6 +33,7 @@ jobs:
     outputs:
       should_run: ${{ steps.gate.outputs.should_run }}
       reason: ${{ steps.gate.outputs.reason }}
+      decidable: ${{ steps.gate.outputs.decidable }}
     steps:
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
@@ -315,6 +316,7 @@ jobs:
           gate-name: ATOM vLLM Test Gate
           suite-name: ATOM vLLM tests
           should-run: ${{ needs.ci-gate.outputs.should_run }}
+          decidable: ${{ needs.ci-gate.outputs.decidable }}
           reason: ${{ needs.ci-gate.outputs.reason }}
           ci-gate-result: ${{ needs.ci-gate.result }}
           required-results: |

@@ -53,6 +53,8 @@ jobs:
     outputs:
       should_run: ${{ steps.gate.outputs.should_run }}
       reason: ${{ steps.gate.outputs.reason }}
+      decidable: ${{ steps.gate.outputs.decidable }}
+      smoke_requested: ${{ steps.gate.outputs.smoke_requested }}
       pr_check_takeover: ${{ steps.gate.outputs.pr_check_takeover }}
     steps:
       - name: Checkout ATOM repo
@@ -179,8 +181,8 @@ jobs:
     # a crash, not wrong text, so there is no golden file to keep per model --
     # and one small model exercises that code path as well as thirteen do.
     # Do not publish a same-named skipped check over a previous smoke failure.
-    name: ${{ (needs.ci-gate.outputs.should_run == 'true' || needs.ci-gate.outputs.pr_check_takeover == 'true' || (github.event_name != 'pull_request_review' && needs.ci-gate.outputs.reason != 'ignored-paths-only' && needs.ci-gate.outputs.reason != 'draft-pull-request' && needs.ci-gate.outputs.reason != 'pull-request-closed')) && 'Offline inference smoke test' || 'Offline smoke not requested' }}
-    runs-on: ${{ (needs.ci-gate.outputs.should_run == 'true' || needs.ci-gate.outputs.pr_check_takeover == 'true' || (github.event_name != 'pull_request_review' && needs.ci-gate.outputs.reason != 'ignored-paths-only' && needs.ci-gate.outputs.reason != 'draft-pull-request' && needs.ci-gate.outputs.reason != 'pull-request-closed')) && 'linux-atom-mi35x-1' || 'ubuntu-latest' }}
+    name: ${{ needs.ci-gate.outputs.smoke_requested == 'true' && 'Offline inference smoke test' || 'Offline smoke not requested' }}
+    runs-on: ${{ needs.ci-gate.outputs.smoke_requested == 'true' && 'linux-atom-mi35x-1' || 'ubuntu-latest' }}
     timeout-minutes: 45
     env:
       CONTAINER_NAME: atom_smoke_test
@@ -190,7 +192,7 @@ jobs:
       # the offline entrypoint completes, so it keeps the small model and its
       # settings regardless of what the accuracy matrix tracks.
       SMOKE_EXTRA_ARGS: --kv_cache_dtype fp8 --gpu-memory-utilization 0.3
-      SMOKE_REQUESTED: ${{ needs.ci-gate.outputs.should_run == 'true' || needs.ci-gate.outputs.pr_check_takeover == 'true' || (github.event_name != 'pull_request_review' && needs.ci-gate.outputs.reason != 'ignored-paths-only' && needs.ci-gate.outputs.reason != 'draft-pull-request' && needs.ci-gate.outputs.reason != 'pull-request-closed') }}
+      SMOKE_REQUESTED: ${{ needs.ci-gate.outputs.smoke_requested }}
     steps:
       - name: Kill stale containers
         if: env.SMOKE_REQUESTED == 'true'
@@ -797,6 +799,7 @@ jobs:
           gate-name: ATOM Test Gate
           suite-name: ATOM accuracy tests
           should-run: ${{ needs.ci-gate.outputs.should_run }}
+          decidable: ${{ needs.ci-gate.outputs.decidable }}
           reason: ${{ needs.ci-gate.outputs.reason }}
           ci-gate-result: ${{ needs.ci-gate.result }}
           optional-results: |
