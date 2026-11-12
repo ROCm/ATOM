@@ -920,3 +920,33 @@ def test_unowned_requests_never_send_a_release():
     with pytest.raises(RuntimeError):
         mgr.add_request([seq])
     mgr.broadcast_utility_command.assert_not_called()
+
+
+@pytest.mark.parametrize("layout", ["1d", "2d"])
+def test_immediate_output_masks_failed_rows_in_both_layouts(layout):
+    processor = object.__new__(mod.tokenIDProcessor)
+    processor.is_deferred_out = False
+    batch = SimpleNamespace(req_ids=[10, 11], return_logprobs=[False, False])
+    failed = torch.tensor([False, True])
+    if layout == "1d":
+        tokens = torch.tensor([7, 8])
+    else:
+        tokens = torch.tensor([[7, 8, 9], [5, 6, -1]])
+    ids, _ = processor.prepare_sampled_ids(
+        batch, tokens, None, constraint_failed=failed
+    )
+    assert -2 not in ids[10]
+    assert ids[11][0] == -2
+    # The caller's tensor, which feeds GPU carry, is never rewritten.
+    assert tokens.tolist() == ([7, 8] if layout == "1d" else [[7, 8, 9], [5, 6, -1]])
+
+
+def test_has_constraints_tolerates_a_missing_batch():
+    adapter = register(FakeAdapter("strict"))
+
+    def enabled(batch):
+        return "strict" in batch.active  # a third-party adapter may not guard None
+
+    adapter.enabled = enabled
+    assert boundary.has_constraints(None) is False
+    assert boundary.has_constraints(active("strict")) is True
