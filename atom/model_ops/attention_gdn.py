@@ -465,12 +465,21 @@ class GatedDeltaNet(nn.Module):
         wrote_core_attn_out = False
         if gdn_metadata.num_prefills > 0:
             ckpt = gdn_metadata.ssm_checkpoints
+            # An interior checkpoint is sliced out of `h`, so `h` is kept at
+            # the pool's dtype: the slice is then the state a forward ending
+            # there would store. FlyDSL snapshots are bf16 only.
+            interior_dtype = (
+                ssm_state.dtype
+                if ckpt is not None and ckpt.get("interior", True)
+                else None
+            )
             flydsl_metadata = getattr(gdn_metadata, "flydsl_prefill_metadata", None)
             use_flydsl_prefill = False
             if (
                 flydsl_policy is not None
                 and flydsl_policy.prefill
                 and not use_replayssm
+                and interior_dtype in (None, torch.bfloat16)
             ):
                 from atom.model_ops.fla_ops.gdn_flydsl import (
                     prefill,
@@ -542,6 +551,7 @@ class GatedDeltaNet(nn.Module):
                     keep_intermediate_states=(
                         ckpt is not None or gdn_metadata.keep_intermediate_states
                     ),
+                    intermediate_state_dtype=interior_dtype,
                 )
             # Init cache
             ssm_state.index_copy_(

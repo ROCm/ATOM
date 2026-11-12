@@ -43,6 +43,7 @@ def chunk_gated_delta_rule_fwd(
     cu_seqlens: torch.LongTensor | None = None,
     o: torch.Tensor | None = None,
     keep_intermediate_states: bool = False,
+    intermediate_state_dtype: torch.dtype | None = None,
 ):
     B, T = q.shape[0], q.shape[1]
     Hv = g.shape[2]
@@ -95,6 +96,7 @@ def chunk_gated_delta_rule_fwd(
         initial_state=initial_state,
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
+        h_dtype=intermediate_state_dtype,
     )
     o = chunk_fwd_o(
         q=q,
@@ -166,6 +168,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         use_qk_l2norm_in_kernel: bool = False,
         o: torch.Tensor | None = None,
         keep_intermediate_states: bool = False,
+        intermediate_state_dtype: torch.dtype | None = None,
     ):
         if use_qk_l2norm_in_kernel:
             q = l2norm_fwd(q)
@@ -186,6 +189,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             cu_seqlens=cu_seqlens,
             o=o,
             keep_intermediate_states=keep_intermediate_states,
+            intermediate_state_dtype=intermediate_state_dtype,
         )
         ctx.scale = scale
         ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
@@ -218,6 +222,7 @@ def chunk_gated_delta_rule(
     use_qk_l2norm_in_kernel: bool = False,
     o: torch.Tensor | None = None,
     keep_intermediate_states: bool = False,
+    intermediate_state_dtype: torch.dtype | None = None,
 ):
     r"""
     Args:
@@ -251,6 +256,11 @@ def chunk_gated_delta_rule(
             `pop_last_intermediate_states` to collect. Default: `False`, which
             drops them as soon as the forward returns — they are ~33 MB at
             T=8192, H=8, K=V=128, so a caller that never pops must not ask.
+        intermediate_state_dtype (Optional[torch.dtype]):
+            Dtype the per-chunk states are stored at. Default: `None`, the
+            input dtype. A caller checkpointing into a wider state pool passes
+            the pool's dtype, so a boundary is stored exactly as a forward
+            ending there would store its final state.
 
     Returns:
         o (torch.Tensor):
@@ -366,6 +376,7 @@ def chunk_gated_delta_rule(
         use_qk_l2norm_in_kernel,
         o,
         keep_intermediate_states,
+        intermediate_state_dtype,
     )
     if head_first:
         o = rearrange(o, "b t h ... -> b h t ...")
@@ -379,8 +390,9 @@ def pop_last_intermediate_states():
     cache can take a checkpoint at any chunk-aligned interior position without
     splitting the prefill into two forward passes.
 
-    ``h`` is stored in the input dtype; see ``GDNStateMixin.state_transfer``
-    for why that makes a checkpoint exact for every model on this path.
+    ``h`` is stored at ``intermediate_state_dtype`` (the input dtype unless the
+    caller asked otherwise); see ``GDNStateMixin.state_transfer`` for why that
+    makes a checkpoint exact.
 
     Consumes the reference so a later caller cannot read a stale tensor, and
     returns None when the last forward was not asked to keep its states.

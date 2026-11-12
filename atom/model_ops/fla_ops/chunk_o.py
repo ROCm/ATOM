@@ -123,8 +123,7 @@ def chunk_fwd_kernel_o(
         )
 
         # [BT, BK] @ [BK, BV] -> [BT, BV]
-        if HEAD_MAJOR_VK:
-            b_h = b_h.to(b_q.dtype)
+        b_h = b_h.to(b_q.dtype)
         b_o += tl.dot(b_q, b_h)
         # [BT, BK] @ [BK, BT] -> [BT, BT]
         b_A += tl.dot(b_q, b_k)

@@ -363,6 +363,7 @@ def chunk_gated_delta_rule_fwd_h(
     chunk_size: int = 64,  # SY: remove this argument and force chunk size 64?
     save_new_value: bool = True,
     cu_seqlens: torch.LongTensor | None = None,
+    h_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # This kernel is slightly different from fla to support Q/K with different head numbers.
     # In fla, Q/K always have the same head number, so Hg is always equal to H.
@@ -386,7 +387,10 @@ def chunk_gated_delta_rule_fwd_h(
         )
     assert K <= 256, "current kernel does not support head dimension larger than 256."
 
-    h = k.new_empty(B, NT, H, K, V)
+    # The recurrence runs in fp32 registers and each boundary is stored at
+    # `h_dtype`, so a wider `h` holds the state exactly; `chunk_fwd_o` casts
+    # it back to the input dtype before its dot.
+    h = k.new_empty(B, NT, H, K, V, dtype=h_dtype or k.dtype)
     final_state = (
         k.new_empty(N, H, K, V, dtype=torch.float32) if output_final_state else None
     )

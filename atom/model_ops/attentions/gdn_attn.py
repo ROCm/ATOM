@@ -619,18 +619,14 @@ class GDNStateMixin(PoolRowsMixin):
         this fork transfer; `tests/test_gdn_midstep_state_gpu.py` shows a slice
         of `h` is bit-exact against a forward stopped there.
 
-        Exact only while the SSM state is stored at the dtype `h` is computed
-        in (`k.new_empty`, the model dtype): slicing `h` then rounds exactly
-        where a shortened forward would. kimi_linear and glm5_next store it at
-        `ATOM_GDN_SSM_DTYPE` and do not reach this method
-        (`_KimiMLAGDNCommon.state_transfer`); any other model storing it at
-        another dtype stays unreadable and keeps its prefill cuts.
+        Exact at any state dtype. The recurrence runs in fp32 and a forward
+        with an interior target keeps `h` at the pool's dtype
+        (`GatedDeltaNet` passes `intermediate_state_dtype`), so a slice of `h`
+        is the value a forward ending there would store. Qwen4Exp keeps its
+        state in fp32 (`mamba_ssm_dtype`); a bf16 `h` would round it. FlyDSL
+        prefill, whose snapshots are bf16 only, steps aside for such a forward.
         """
-        _, ssm_dtype = self._state_dtypes()
-        if (
-            not envs.ATOM_GDN_STATE_MIDSTEP
-            or ssm_dtype != self.model_runner.config.torch_dtype
-        ):
+        if not envs.ATOM_GDN_STATE_MIDSTEP:
             return StateTransfer.fork(1, readable_midstep=False)
         from atom.model_ops.fla_ops.chunk import CHUNK_SIZE
 
@@ -1286,6 +1282,8 @@ class GDNStateMixin(PoolRowsMixin):
             "offs": mk(offs),
             "is_end": mk(is_end),
             "runtime": mk(runtime),
+            # Host-side, so the layer can pick `h`'s dtype without a sync.
+            "interior": not all(is_end),
         }
 
     def prepare_state_indices(self, batch: ScheduledBatch, with_spec: bool = False):

@@ -114,18 +114,12 @@ class TestTheLayoutId:
         assert _layout(monkeypatch) != _layout(monkeypatch, layers=44)
 
 
-def _fork_transfer(monkeypatch, *, midstep, ssm_dtype=torch.bfloat16):
+def _fork_transfer(monkeypatch, *, midstep):
     _builder_cls()
     from atom.model_ops.attentions.gdn_attn import GDNStateMixin
 
     monkeypatch.setenv("ATOM_GDN_STATE_MIDSTEP", "1" if midstep else "0")
-    builder = SimpleNamespace(
-        model_runner=SimpleNamespace(
-            config=SimpleNamespace(torch_dtype=torch.bfloat16)
-        ),
-        _state_dtypes=lambda: (torch.bfloat16, ssm_dtype),
-        _conv_state_len=lambda: 3,
-    )
+    builder = SimpleNamespace(_conv_state_len=lambda: 3)
     return GDNStateMixin.state_transfer(builder)
 
 
@@ -141,10 +135,6 @@ class TestForkMidstep:
         assert transfer.forks and transfer.readable_midstep
         assert transfer.midstep_grid == CHUNK_SIZE
         assert transfer.midstep_min_offset == 3
-
-    def test_a_state_stored_at_another_dtype_stays_unreadable(self, monkeypatch):
-        transfer = _fork_transfer(monkeypatch, midstep=True, ssm_dtype=torch.float32)
-        assert not transfer.readable_midstep
 
 
 def _pool(*, kv_dtype, layers=15, block_size=16):

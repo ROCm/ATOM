@@ -99,6 +99,36 @@ def test_every_interior_boundary_matches_a_shortened_forward():
         ), f"boundary at token {j * CHUNK} differs from a forward ending there"
 
 
+def test_a_wider_h_holds_the_same_states_and_leaves_the_output_alone():
+    """fp32 `h` is the fp32 state; the output is bit-identical to bf16 `h`.
+
+    `chunk_fwd_o` casts `h` to the input dtype before its dot, so widening the
+    snapshot for a checkpoint cannot move the forward's own output.
+    """
+    inp = _inputs()
+    cu = torch.tensor([0, inp["q"].shape[1]], dtype=torch.int32, device=DEV)
+    outs, hs = [], []
+    for h_dtype in (None, torch.float32):
+        o, _ = chunk_gated_delta_rule(
+            **inp,
+            initial_state=None,
+            output_final_state=True,
+            cu_seqlens=cu,
+            head_first=False,
+            use_qk_l2norm_in_kernel=True,
+            keep_intermediate_states=True,
+            intermediate_state_dtype=h_dtype,
+        )
+        outs.append(o)
+        hs.append(pop_last_intermediate_states())
+    assert hs[1].dtype == torch.float32
+    assert torch.equal(outs[0], outs[1])
+    assert torch.equal(hs[1].to(DTYPE), hs[0])
+    for j in range(1, NUM_CHUNKS):
+        cut = _forward(inp, upto=j * CHUNK)
+        assert torch.equal(hs[1][:, j], cut.reshape(hs[1][:, j].shape))
+
+
 def test_popping_consumes_the_reference():
     """A second pop must come back empty.
 
@@ -153,7 +183,7 @@ def _cu(lens):
     return torch.tensor(out, dtype=torch.int32, device=DEV)
 
 
-def _run(inp, cu, init, keep=False):
+def _run(inp, cu, init, keep=False, h_dtype=None):
     _, final = chunk_gated_delta_rule(
         q=inp["q"],
         k=inp["k"],
@@ -166,17 +196,22 @@ def _run(inp, cu, init, keep=False):
         head_first=False,
         use_qk_l2norm_in_kernel=True,
         keep_intermediate_states=keep,
+        intermediate_state_dtype=h_dtype,
     )
     return final
 
 
-def test_varlen_resumed_rows_match_a_forward_stopped_there():
+@pytest.mark.parametrize("pool_dtype", [torch.bfloat16, torch.float32])
+def test_varlen_resumed_rows_match_a_forward_stopped_there(pool_dtype):
     """Three resumed prefills of uneven length, every readable position.
 
     Each row starts from its own initial state, as a request resuming from a
     checkpoint does, so a position is an offset from the row's start -- the
     frame `_checkpoint_targets` hands the kernel. The reference for each target
     is that row alone, from the same state, stopped there.
+
+    Run at both pool dtypes, with `h` kept at the pool's dtype as the layer
+    does: Qwen4Exp's state is fp32, and a bf16 `h` would round it.
     """
     from atom.model_ops.fla_ops.index import prepare_chunk_offsets
     from atom.model_ops.fla_ops.state_checkpoint import write_state_checkpoints
@@ -184,8 +219,8 @@ def test_varlen_resumed_rows_match_a_forward_stopped_there():
     lens = [200, 77, 333]
     inp = _varlen(lens, seed=1)
     cu = _cu(lens)
-    init = torch.randn(len(lens), H, K, V, dtype=DTYPE, device=DEV) * 0.1
-    final = _run(inp, cu, init.clone(), keep=True)
+    init = torch.randn(len(lens), H, K, V, dtype=pool_dtype, device=DEV) * 0.1
+    final = _run(inp, cu, init.clone(), keep=True, h_dtype=pool_dtype)
     h = pop_last_intermediate_states()
     assert h is not None
 
@@ -196,9 +231,9 @@ def test_varlen_resumed_rows_match_a_forward_stopped_there():
         targets += [(r, off, 0) for off in range(CHUNK, n, CHUNK)]
         targets.append((r, n, 1))
     pool = torch.zeros(
-        len(lens) + len(targets), *final.shape[1:], dtype=DTYPE, device=DEV
+        len(lens) + len(targets), *final.shape[1:], dtype=pool_dtype, device=DEV
     )
-    pool[: len(lens)] = final.to(DTYPE)
+    pool[: len(lens)] = final.to(pool_dtype)
     D = 8
     x = torch.randn(sum(lens), D, dtype=DTYPE, device=DEV)
     conv = torch.zeros(pool.shape[0], D, 6, dtype=DTYPE, device=DEV)
@@ -229,7 +264,7 @@ def test_varlen_resumed_rows_match_a_forward_stopped_there():
         alone = {key: t[:, sl] for key, t in inp.items()}
         ref = _run(alone, _cu([off]), init[r : r + 1].clone())
         assert torch.equal(
-            pool[slot], ref[0].to(DTYPE)
+            pool[slot], ref[0].to(pool_dtype)
         ), f"row {r} at offset {off} differs from a forward stopped there"
 
 
