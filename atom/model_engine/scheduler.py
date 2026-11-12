@@ -5879,7 +5879,7 @@ class Scheduler:
         # owner must run to release its blocks/slot, including on later ticks
         # after its completion event has already been consumed.
         head_blocked = False
-        if any(completed(seq) and seq.id in early for seq in queue):
+        if early and any(completed(seq) and seq.id in early for seq in queue):
             head = next((seq for seq in queue if not completed(seq)), None)
             slots_full = (
                 len(self.running) + self._num_parked_remote_kv >= self.max_num_seqs

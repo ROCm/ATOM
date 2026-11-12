@@ -467,3 +467,70 @@ def test_a_reuse_report_before_the_first_output_reassigns_the_prefix():
     router.prefill_complete(2)
     router.select(_seq(3, PREFIX), [0, 0], [0, 0])
     assert router.charge(3) > 0
+
+
+def test_reuse_correction_cancel_does_not_credit_a_sibling_past_missing_trunk():
+    router = ShareCacheRouter(min_load_tokens=16, req_equiv=16)
+    trunk = list(range(512))
+    left = trunk + [700] * 512
+    right = trunk + [800] * 512
+    for sid, tokens in ((1, left), (2, right)):
+        route, _ = _route(router, _seq(sid, tokens), [0, 10**9], [0, 0])
+        assert route.rank == 0
+        router.prefill_complete(sid)
+    route, _ = _route(router, _seq(3, left), [0, 10**9], [0, 0])
+    assert route.rank == 0 and router.charge(3) == 1024
+    assert router.note_reuse(3, 0)
+    router.release(3)
+    path = router._path(_seq(4, right).prompt_hash_chain)
+    # The sibling's deeper history can remain, but its missing common interval
+    # cannot be fabricated by the deepest-claim lookup.
+    hits, owner = router._rank_hits(2, path, all_pending=True)
+    assert hits == {0: HBS} and owner == 0
+    assert any(0 in router.index[edge] and end > HBS for edge, end in path)
+    route, _ = _route(router, _seq(4, right), [0, 10**9], [0, 0])
+    assert router.charge(4) == HBS
+
+
+def test_missing_trunk_clamp_preserves_other_rank_and_active_producer():
+    router = ShareCacheRouter(min_load_tokens=16, req_equiv=16)
+    trunk = list(range(512))
+    left = trunk + [700] * 512
+    right = trunk + [800] * 512
+    for sid, tokens, backlog in (
+        (1, left, [0, 10**9]),
+        (2, right, [0, 10**9]),
+        (3, right, [10**9, 0]),
+    ):
+        _route(router, _seq(sid, tokens), backlog, [0, 0])
+        router.prefill_complete(sid)
+    _route(router, _seq(4, left), [0, 10**9], [0, 0])
+    assert router.note_reuse(4, 0)
+    path = router._path(_seq(5, right).prompt_hash_chain)
+    hits, _ = router._rank_hits(2, path, all_pending=True)
+    assert hits[1] == 1024  # rank0's admission says nothing about rank1 HBM
+    assert 4 in router.pending.values()  # recomputing producer still owns trunk
+    router.release(4)
+    hits, _ = router._rank_hits(2, router._path(_seq(5, right).prompt_hash_chain))
+    assert hits[0] == HBS and hits[1] == 1024
+
+
+def test_sibling_successor_debt_uses_contiguous_confirmed_prefix():
+    router = ShareCacheRouter(min_load_tokens=16, req_equiv=16)
+    trunk = list(range(512))
+    left = trunk + [700] * 512
+    right = trunk + [800] * 512
+    for sid, tokens in ((1, left), (2, right)):
+        _route(router, _seq(sid, tokens), [0, 10**9], [0, 0])
+        router.prefill_complete(sid)
+    _route(router, _seq(3, left), [0, 10**9], [0, 0])
+    assert router.note_reuse(3, 0)
+    _route(router, _seq(4, right), [0, 10**9], [0, 0])
+    assert router.charge(4) == 1024  # depends on the active trunk producer
+    assert router._independent_credit[4] == HBS
+    charges = router.release(3)
+    assert charges == {4: 1024 - HBS}
+    assert router._in_flight[4] == HBS
+    router.prefill_complete(4)
+    path = router._path(_seq(5, right).prompt_hash_chain)
+    assert router._rank_hits(2, path)[0][0] == 1024

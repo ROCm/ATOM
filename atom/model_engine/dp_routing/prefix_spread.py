@@ -406,16 +406,10 @@ class PrefixSpreadRouter:
         unrelated completed tier copy does not disappear when that producer
         aborts. Unfinished tier copies and sub-threshold loads supply no floor.
         """
-        local = 0
-        for edge, hit in reversed(path):
-            holders = self.index[edge]
-            if (
-                rank in holders
-                and (edge, rank) not in self.pending
-                and holders[rank] not in self._in_flight
-            ):
-                local = hit
-                break
+        confirmed_path = self._continuous_local_path(
+            path, (rank,), include_pending=False
+        )
+        local = confirmed_path[-1][1] if confirmed_path else 0
         if not self.tier.loads:
             return min(credit, local)
         loaded = self.tier.loadable_tokens(
@@ -567,20 +561,50 @@ class PrefixSpreadRouter:
                 return hit
         return 0
 
+    def _continuous_local_path(self, path, ranks, *, include_pending: bool):
+        """Local claims must cover every interval, including shared ancestors.
+
+        Placement may depend on an active producer; independent cancellation
+        credit requires every interval to be confirmed without that producer.
+        Descendants stay recorded so a later repair can make them reachable.
+        """
+        continuous = frozenset(ranks)
+        local_path = []
+        for edge, hit in path:
+            holders = self.index[edge]
+            continuous = {
+                rank
+                for rank, seq_id in holders.items()
+                if rank in continuous
+                and (
+                    ((edge, rank) not in self.pending or seq_id in self._in_flight)
+                    if include_pending
+                    else (edge, rank) not in self.pending
+                    and seq_id not in self._in_flight
+                )
+            }
+            if not continuous:
+                break
+            local_path.append((edge, hit, continuous))
+        return local_path
+
     def _rank_hits(self, n: int, path, *, all_pending: bool = False):
         """Longest prefix per rank; equal-length owners use last-recorded order.
 
         Other ranks' unfinished producers do not supply a local hit. Seed and
         block-size domains are separate even if a supplied hash collides.
+        A deeper local claim cannot skip a missing ancestor interval; reuse
+        correction on one branch may invalidate its shared trunk while another
+        branch still retains a confirmed descendant. Keep those descendant
+        claims for future repairs, but credit only the continuous prefix.
         """
         hits = {}
         owner = None
-        for edge, hit in reversed(path):
+        local_path = self._continuous_local_path(path, range(n), include_pending=True)
+        for edge, hit, continuous in reversed(local_path):
             holders = self.index[edge]
             for rank, seq_id in reversed(holders.items()):
-                if not 0 <= rank < n or rank in hits:
-                    continue
-                if (edge, rank) in self.pending and seq_id not in self._in_flight:
+                if rank not in continuous or rank in hits:
                     continue
                 if owner is None:
                     owner = rank
