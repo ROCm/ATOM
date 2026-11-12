@@ -21,7 +21,7 @@ one is not readable through the other, and no size check can see the mismatch;
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 import torch
 
@@ -318,16 +318,57 @@ class MhaKvPool:
 
         The granularity a transfer registers, and it cannot be coarser while
         the pool is layer-major: an entry's bytes are `entries` apart, so no
-        contiguous range is one entry.
-
-        Named for the reader, not for the wire: the mooncake connector pairs
-        the two ends by list position and drops the role. What a name buys is
-        that `set_block_count`'s refusal says which region is wrong -- `k` of
-        layer 12, not region 37 -- and the folded order (all of K, then all of
-        V) makes that worth having.
+        contiguous range is one entry. The role is a label for the reader:
+        `set_block_count`'s refusal says `k` of layer 12, not region 37.
         """
         return [
             (f"{name}.layer_{layer}", view[layer])
             for name, view in self._views.items()
             for layer in range(len(view))
         ]
+
+    def transfer_pages(
+        self,
+        namespace: str,
+        role_prefix: str,
+        layers: Sequence[int],
+        page_tokens: Sequence[int] | None = None,
+        extra: Mapping[str, tuple[Sequence[int], int, torch.dtype]] | None = None,
+    ) -> list:
+        """`region_tensors` as PAGE regions, each with its head runs and spec.
+
+        `layers[row]` is a KV row's `layer_num` and `page_tokens[row]` the page
+        its writer views it in; `extra[field]` is `(layer per row, dim, dtype)`.
+        """
+        from atom.kv_transfer.disaggregation.page_region import page_region
+        from atom.kv_transfer.disaggregation.types import PageUnitSpec
+
+        cache = {f.name for f in self.cache_fields}
+        per_head = cache | {f.name for f in self.scale_fields}
+        pages = []
+        for name, view in self._views.items():
+            for row in range(len(view)):
+                runs = None
+                if name in per_head:
+                    page = self.block_size if page_tokens is None else page_tokens[row]
+                    if self.entry_tokens % page:
+                        raise ValueError(f"{page}-token pages do not tile {name}")
+                    runs = (self.entry_tokens // page, self.num_kv_heads)
+                    layer = layers[row]
+                    dim, dtype = (
+                        (self.head_dim, self.kv_dtype)
+                        if name in cache
+                        else (1, torch.float32)
+                    )
+                else:
+                    rows, dim, dtype = (extra or {})[name]
+                    layer = rows[row]
+                pages.append(
+                    page_region(
+                        view[row],
+                        semantic_role=f"{role_prefix}.{name}.layer_{row}",
+                        head_major_runs=runs,
+                        unit_spec=PageUnitSpec(namespace, name, layer, dim, str(dtype)),
+                    )
+                )
+        return pages
