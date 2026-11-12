@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""Self-consistency of the probabilistic verification's input variants.
+"""Self-consistency of the probabilistic verification's variants.
 
 `prob_rejection_sample` can read the target rows of the full logits in place
 (`in_place=True`) instead of a compacted copy of them; on the same inputs it
@@ -23,7 +23,8 @@ else:
 
 import atom.model_ops.dspark_prob_sample as dps
 
-V = 20000
+# Three vocab chunks of the split verification, the last one partial.
+V = 2 * dps._CHUNK + 3616
 R, N = 4, 3
 PER_ROW_TOP_P = (0.95, 0.5, 1.0, 0.8)
 
@@ -148,3 +149,30 @@ def test_in_place_refuses_a_strided_source():
             state,
             in_place=True,
         )
+
+
+@pytest.mark.parametrize("seed,top_p,use_block,greedy,no_q", CASES)
+def test_vocab_chunks_match_a_single_chunk(
+    monkeypatch, seed, top_p, use_block, greedy, no_q
+):
+    c = _case(seed, greedy, no_q)
+    split = _verify(c, top_p, use_block)
+    assert triton_cdiv(V, dps._CHUNK) > 2
+    monkeypatch.setattr(dps, "_CHUNK", 4 * dps._CHUNK)  # one chunk per row
+    _assert_same(split, _verify(c, top_p, use_block))
+
+
+@pytest.mark.parametrize("seed,top_p,use_block,greedy,no_q", CASES[1:3] + CASES[4:])
+def test_per_row_top_p_fallback_matches_split_search(
+    monkeypatch, seed, top_p, use_block, greedy, no_q
+):
+    c = _case(seed, greedy, no_q)
+    split = _verify(c, top_p, use_block)
+    # A tiny compaction buffer: every top-p row overflows its final interval
+    # and takes the per-row search instead.
+    monkeypatch.setattr(dps, "_TOPP_RB", 16)
+    _assert_same(split, _verify(c, top_p, use_block))
+
+
+def triton_cdiv(a, b):
+    return -(-a // b)
