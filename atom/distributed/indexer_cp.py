@@ -96,35 +96,51 @@ def get_indexer_cp_world_size() -> int:
 _ALLGATHER_MAX_PAYLOAD_BYTES = 512 * 1024
 
 
+def _mailbox_runtime():
+    """The private aiter pieces used only while opening a mailbox."""
+    from aiter.dist.device_communicators.custom_all_reduce import (
+        IPCBufferPool,
+        _loaded_hip_runtime,
+        _should_use_vmm,
+    )
+
+    return IPCBufferPool, _loaded_hip_runtime, _should_use_vmm
+
+
 class CandidateMailbox:
     """Where ``select_exchanged_candidates`` sends each head's candidates: a
     mailbox of 2 banks x ``world`` senders x ``max_rows`` rows x ``MAX_TOPK``
     keys on every rank, mapped by every peer (hipIpc), and this rank's call
-    counters. ``timeouts`` counts the waits that gave up (the merge then read
-    stale keys); nothing resets it.
+    counters.
 
     Cached memory, as aiter's gluon all-reduce inboxes: polling uncached memory
     made the one-launch exchange 2 us slower at 32 x 4 rows on MI455X.
+
+    Setup failures are agreed before any rank can return a usable mailbox.
+    Failures before ``open_peer_buffers`` keep every rank out of the handle
+    exchange; failures that return or raise from it are agreed afterward. A
+    process that dies inside the exchange before publishing its handle can
+    still leave peers in the TCPStore read until the store itself times out.
     """
 
     MAX_TOPK = 64
-    MAX_POLLS = 20_000_000  # some seconds: a peer may still be compiling
 
     def __init__(self, cpu_group, world: int, max_rows: int, device):
-        from aiter.dist.device_communicators.custom_all_reduce import (
-            IPCBufferPool,
-            _loaded_hip_runtime,
-            _should_use_vmm,
-        )
-
         self.max_rows = max_rows
         nbytes = 2 * world * max_rows * self.MAX_TOPK * 8
-        # Every step is agreed before the next, so a rank that fails here
-        # never leaves the others waiting in the handle exchange.
         failure, self._pool = None, None
         try:
+            IPCBufferPool, _loaded_hip_runtime, _should_use_vmm = _mailbox_runtime()
             if _should_use_vmm(True):
                 raise RuntimeError("hipIpc of cached memory needs ROCm 7.14 or later")
+            # All device allocations precede the first agreement. A rank-local
+            # OOM therefore makes every rank skip the peer-handle exchange and
+            # take the collective fallback.
+            self.peers = torch.empty(world, dtype=torch.int64, device=device)
+            self.send_calls = torch.zeros(
+                world * max_rows, dtype=torch.int32, device=device
+            )
+            self.recv_calls = torch.zeros(max_rows, dtype=torch.int32, device=device)
             self._pool = IPCBufferPool(device, cpu_group)
             mailbox = self._pool.create("indexer_cp_mailbox", nbytes, raw_cached=True)
             err = _loaded_hip_runtime().hipMemset(
@@ -138,6 +154,8 @@ class CandidateMailbox:
         if group_agree(failure is None, cpu_group):
             try:
                 peers = self._pool.open_peer_buffers("indexer_cp_mailbox")
+                self.peers.copy_(torch.tensor(peers, dtype=torch.int64, device="cpu"))
+                torch.cuda.synchronize(device)
             except Exception as error:  # noqa: BLE001
                 failure = error
             if group_agree(failure is None, cpu_group):
@@ -151,12 +169,6 @@ class CandidateMailbox:
                 self._pool.close_peer_buffers()
                 self._pool.close()
             raise RuntimeError(f"candidate mailbox: {failure}") from failure
-        self.peers = torch.tensor(peers, dtype=torch.int64, device=device)
-        self.send_calls = torch.zeros(
-            world * max_rows, dtype=torch.int32, device=device
-        )
-        self.recv_calls = torch.zeros(max_rows, dtype=torch.int32, device=device)
-        self.timeouts = torch.zeros(1, dtype=torch.int32, device=device)
 
     def fits(self, tokens: int, topk: int) -> bool:
         return tokens <= self.max_rows and topk <= self.MAX_TOPK
@@ -171,25 +183,23 @@ def candidate_mailbox() -> CandidateMailbox | None:
     return _mailbox
 
 
-def _open_candidate_mailbox(device) -> None:
+def _open_candidate_mailbox(device, max_rows: int) -> None:
     global _mailbox
     from aiter.jit.utils.chip_info import get_gfx_runtime
 
     if _mailbox is not None or get_gfx_runtime() != "gfx1250":
         return
-    config = get_current_atom_config()
-    spec = config.speculative_config
-    query_len = 1 + ((spec.num_speculative_tokens or 0) if spec is not None else 0)
     group = get_indexer_cp_group()
     try:
         _mailbox = CandidateMailbox(
             group.cpu_group,
             group.world_size,
-            config.max_num_seqs * query_len,
+            max_rows,
             device,
         )
-    except RuntimeError as error:  # raised on every rank alike
-        logger.warning("indexer CP keeps the all-gather exchange: %s", error)
+    except RuntimeError as error:
+        # CandidateMailbox agrees recoverable setup failures before raising.
+        logger.warning("indexer CP keeps the collective candidate exchange: %s", error)
 
 
 def exchange_candidates(keys: torch.Tensor) -> torch.Tensor:
@@ -289,7 +299,7 @@ def _exchange_via_all_gather(keys: torch.Tensor, group) -> torch.Tensor:
     ]
 
 
-def warmup_exchange(device) -> None:
+def warmup_exchange(device, max_mailbox_rows: int) -> None:
     """Run one eager all-to-all so capture never sees NCCL's lazy setup.
 
     NCCL establishes peer connections on a group's first collective. Doing that
@@ -316,7 +326,8 @@ def warmup_exchange(device) -> None:
     payload -- the warmup cannot pass for a transport production then skips.
 
     It then opens the one-launch exchange's mailbox, a collective that capture
-    must not see either.
+    must not see either. ``max_mailbox_rows`` comes from the runner's resolved
+    ``mtp_k + 1`` rather than the possibly unset speculative config field.
     """
     if not indexer_cp_enabled():
         return
@@ -328,4 +339,4 @@ def warmup_exchange(device) -> None:
     if _can_all_gather(probe, group):
         _exchange_via_all_gather(probe, group)
     torch.cuda.synchronize()
-    _open_candidate_mailbox(device)
+    _open_candidate_mailbox(device, max_mailbox_rows)

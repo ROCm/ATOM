@@ -21,13 +21,12 @@ from atom.model_ops.minimax_m3.index_topk import (
 # instead, and each request's live blocks are split over its programs.
 CP_SCORE_PROGRAMS = 1024
 CP_SCORE_MIN_SPAN = 2  # blocks a program scores at least
-CP_SCORE_PAD_TILE = 64  # -inf slots a store writes past the live blocks
 
 
 @functools.cache
 def _transposed_score() -> bool:
-    # As the gfx1250 TP decode scorer (ROCm/ATOM#2982): Q as WMMA's M operand,
-    # the converted K as its N operand, K loads streaming. Same bits.
+    # On gfx1250, use Q as WMMA's M operand and converted K as N. Same bits.
+    # The architecture-specific K load policy is documented at the load.
     return get_gfx_runtime() == "gfx1250"
 
 
@@ -58,7 +57,6 @@ def _context_score(
     RANK: tl.constexpr,
     WORLD: tl.constexpr,
     MIN_SPAN: tl.constexpr,
-    PAD_TILE: tl.constexpr,
     N: tl.constexpr,
     SCALE: tl.constexpr,
     TRANSPOSED: tl.constexpr,
@@ -95,6 +93,10 @@ def _context_score(
             page = tl.load(Table + request * TABLE_STRIDE + block).to(tl.int64)
             k_page = Cache + page * 128 * 128
             if TRANSPOSED:
+                # On CDNA5 `.cv` is a system-scoped volatile/last-use load, not
+                # a streaming (`.cs`) policy. It is safe here because earlier
+                # kernels finished producing K and no writer races this launch;
+                # `.cs` has not been substituted without a separate benchmark.
                 k = tl.load(
                     k_page + pos[None, :] * 128 + d[:, None], cache_modifier=".cv"
                 )
@@ -107,17 +109,6 @@ def _context_score(
                 in_ctx = block * 128 + pos[:, None] < cutoff[None, :]
                 score = tl.max(tl.where(in_ctx, dot, float("-inf")), 0)
             tl.store(s_row + local, score, mask=live)
-    # Every output slot is overwritten, including empty shards and replay padding.
-    pad_span = (LOCAL_BLOCKS - live_end + programs - 1) // programs
-    lo = live_end + program * pad_span
-    hi = tl.minimum(lo + pad_span, LOCAL_BLOCKS)
-    for t in range(lo, hi, PAD_TILE):
-        off = t + tl.arange(0, PAD_TILE)
-        tl.store(
-            s_row[:, None] + off[None, :],
-            tl.full((N, PAD_TILE), float("-inf"), tl.float32),
-            mask=live[:, None] & (off[None, :] < hi),
-        )
 
 
 def indexer_context_scores(
@@ -135,6 +126,8 @@ def indexer_context_scores(
 
     Index cache remains replicated. Caller supplies valid live lengths no greater
     than max_seq_len and in-bounds physical pages; no host reads of live metadata.
+    Only each row's live shard prefix is initialized; selection masks the tail
+    from ``seq_lens`` rather than reading replay leftovers.
     """
     if (
         world_size < 1
@@ -208,7 +201,6 @@ def indexer_context_scores(
             RANK=rank,
             WORLD=world_size,
             MIN_SPAN=CP_SCORE_MIN_SPAN,
-            PAD_TILE=CP_SCORE_PAD_TILE,
             N=max(16, triton.next_power_of_2(heads * max_query_len)),
             SCALE=sm_scale * 1.4426950409,
             TRANSPOSED=_transposed_score(),

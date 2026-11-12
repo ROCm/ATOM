@@ -41,6 +41,28 @@ def _scores(q, cache, table, lengths, max_len, rank):
     )
 
 
+def _keys(scores, lengths, max_len, rank):
+    return ex.local_candidate_keys(
+        scores,
+        lengths,
+        TOPK,
+        rank,
+        WORLD,
+        QLEN,
+        triton.cdiv(max_len, 128),
+        0,
+        1,
+    )
+
+
+def _assert_live_scores_equal(actual, expected, lengths, rank):
+    for request, length in enumerate(lengths.tolist()):
+        blocks = triton.cdiv(length, 128)
+        live = max(0, (blocks - rank + WORLD - 1) // WORLD)
+        rows = slice(request * QLEN, (request + 1) * QLEN)
+        assert torch.equal(actual[:, rows, :live], expected[:, rows, :live])
+
+
 @needs_gpu
 @pytest.mark.parametrize("batch,context", [(1, 1000), (3, 9000), (16, 40000)])
 @pytest.mark.parametrize("rank", [0, 3])
@@ -49,16 +71,11 @@ def test_wide_launch_matches_real_length(batch, context, rank):
     real_len = int(lengths.max())
     narrow = _scores(q, cache, table, lengths, real_len, rank)
     wide = _scores(q, cache, table, lengths, WIDE, rank)
-    live = narrow.shape[2]
-    assert torch.equal(wide[..., :live], narrow)
-    assert torch.all(wide[..., live:] == float("-inf"))
-    keys = [
-        ex.local_candidate_keys(
-            s, lengths, TOPK, rank, WORLD, QLEN, triton.cdiv(n, 128), 0, 1
-        )
-        for s, n in ((narrow, real_len), (wide, WIDE))
-    ]
-    assert torch.equal(*keys)
+    _assert_live_scores_equal(wide, narrow, lengths, rank)
+    assert torch.equal(
+        _keys(wide, lengths, WIDE, rank),
+        _keys(narrow, lengths, real_len, rank),
+    )
 
 
 @needs_gpu
@@ -67,24 +84,33 @@ def test_scores_do_not_depend_on_the_split(monkeypatch, programs):
     q, cache, table, lengths = _inputs(8, 30000, seed=11)
     expected = _scores(q, cache, table, lengths, WIDE, 1)
     monkeypatch.setattr(cp, "_context_score_programs", lambda *args: programs)
-    assert torch.equal(_scores(q, cache, table, lengths, WIDE, 1), expected)
+    actual = _scores(q, cache, table, lengths, WIDE, 1)
+    _assert_live_scores_equal(actual, expected, lengths, 1)
 
 
 @needs_gpu
 def test_graph_replay_matches_eager():
+    rank = 0
     q, cache, table, lengths = _inputs(4, 20000, seed=5)
-    _scores(q, cache, table, lengths, WIDE, 2)  # compile outside the capture
+    _scores(q, cache, table, lengths, WIDE, rank)  # compile outside the capture
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=stream):
-            replayed = _scores(q, cache, table, lengths, WIDE, 2)
-        for length in (QLEN, 5000, 20000):  # every slot is rewritten
+            replayed = _scores(q, cache, table, lengths, WIDE, rank)
+        # Shrinking is the discriminating order: stale scores from the longer
+        # replay remain in the masked tail and must not affect the live prefix.
+        for length in (20000, 5000, QLEN):
             q.copy_(torch.randn_like(q))
             lengths.fill_(length)
             graph.replay()
-            assert torch.equal(replayed, _scores(q, cache, table, lengths, WIDE, 2))
+            eager = _scores(q, cache, table, lengths, WIDE, rank)
+            _assert_live_scores_equal(replayed, eager, lengths, rank)
+            assert torch.equal(
+                _keys(replayed, lengths, WIDE, rank),
+                _keys(eager, lengths, WIDE, rank),
+            )
     torch.cuda.current_stream().wait_stream(stream)
 
 
@@ -104,4 +130,5 @@ def test_orientations_agree(monkeypatch, transposed):
     q, cache, table, lengths = _inputs(6, 25000, seed=23)
     expected = _scores(q, cache, table, lengths, WIDE, 2)
     monkeypatch.setattr(cp, "_transposed_score", lambda: transposed)
-    assert torch.equal(_scores(q, cache, table, lengths, WIDE, 2), expected)
+    actual = _scores(q, cache, table, lengths, WIDE, 2)
+    _assert_live_scores_equal(actual, expected, lengths, 2)

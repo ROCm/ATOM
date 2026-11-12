@@ -25,6 +25,9 @@ pytestmark = pytest.mark.skipif(not _gfx1250_x4(), reason="requires 4 gfx1250 GP
 
 WORLD, QLEN, TOPK, MAX_LEN = 4, 4, 16, 1 << 20
 CASES = [(1, 1000, 0, 1), (16, 60000, 1, 4), (64, 100000, 1, 4)]
+# The first four calls cross both boundaries: 2**30 wraps the stored counter,
+# and 2**30 == 1 (mod 32767) crosses the 15-bit tag boundary too.
+COUNTER_START = (1 << 30) - 3
 
 
 def _case(rank, mailbox, batch, context, init, keep):
@@ -77,13 +80,14 @@ def _case(rank, mailbox, batch, context, init, keep):
     with torch.cuda.stream(stream):
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=stream):
-            for i in (0, 1, 0):
-                replayed = one_launch(i)
+            order = (0, 1, 0)
+            replayed = [one_launch(i) for i in order]
         for _ in range(3):
             graph.replay()
             torch.cuda.synchronize()
-            results.append(
-                all(torch.equal(a, b) for a, b in zip(replayed, expected[0]))
+            results.extend(
+                all(torch.equal(a, b) for a, b in zip(got, expected[i]))
+                for got, i in zip(replayed, order)
             )
     torch.cuda.current_stream().wait_stream(stream)
     dist.barrier()
@@ -101,10 +105,12 @@ def _worker(rank, port, out):
     )
     cpu = dist.new_group(backend="gloo")
     mailbox = CandidateMailbox(cpu, WORLD, 256, torch.device("cuda", rank))
+    mailbox.send_calls.fill_(COUNTER_START)
+    mailbox.recv_calls.fill_(COUNTER_START)
     results = []
     for case in CASES:
         results += _case(rank, mailbox, *case)
-    out[rank] = (results, int(mailbox.timeouts.item()))
+    out[rank] = results
     dist.barrier()
     dist.destroy_process_group()
 
@@ -118,6 +124,5 @@ def test_one_launch_matches_gather_then_merge():
     out = mp.Manager().dict()
     mp.spawn(_worker, args=(port, out), nprocs=WORLD, join=True)
     for rank in range(WORLD):
-        results, timeouts = out[rank]
+        results = out[rank]
         assert all(results), f"rank {rank}: {results}"
-        assert timeouts == 0, f"rank {rank}: {timeouts} waits gave up"
