@@ -11,12 +11,14 @@ PREFILL_TOPK_MAX_BLOCK_SIZE_K = 1024
 PREFILL_TOPK_NUM_WARPS = 1
 # Six workgroups per CU hid the score loop latency best across the MI455 sweep.
 _GFX1250_CTAS_PER_CU = 6
+# The four-block store specialization needs more independent CTAs as its block
+# loop grows. Two CTA waves per rounded context-block wave, clamped to the
+# measured resident range, scales that latency from the workload and CU count.
+_GFX1250_GROUPED_MIN_CTAS_PER_CU = 4
+_GFX1250_GROUPED_MAX_CTAS_PER_CU = 12
 # Q256 reuses each page across more rows; two workgroups per CU keep that larger
 # tile resident without turning context length into a shape table.
 _GFX1250_WIDE_CTAS_PER_CU = 2
-# Q64 reads every K page twice as often as Q128. Keep it to contexts where the
-# extra query tiles still fit the measured four-block-store working envelope.
-_GFX1250_Q64_BLOCKS_PER_CU = 4
 # Multi-plane rows already supply occupancy. A short page chunk with two waves
 # improves the long-query cases without the register cost of grouped stores.
 _GFX1250_MULTI_PLANE_CHUNK = 28
@@ -107,6 +109,56 @@ def prefill_score_config(
     """
     if arch != "gfx1250" or not is_fp8:
         return DEFAULT_PREFILL_SCORE_CONFIG
+
+    planes = batch * heads
+    grouped_q_tiles = _cdiv(max_query_len, 64)
+    grouped_plane_tiles = grouped_q_tiles * planes
+    block_waves = max(1, (max_block + compute_units // 2) // compute_units)
+    grouped_ctas_per_cu = min(
+        _GFX1250_GROUPED_MAX_CTAS_PER_CU,
+        max(_GFX1250_GROUPED_MIN_CTAS_PER_CU, 2 * block_waves),
+    )
+    grouped_chunks = min(
+        max_block,
+        max(
+            1,
+            _cdiv(
+                compute_units * grouped_ctas_per_cu,
+                max(1, grouped_plane_tiles),
+            ),
+        ),
+    )
+    grouped_chunk_blocks = _cdiv(max_block, grouped_chunks)
+    q128_tiles = _cdiv(max_query_len, SCORE_BLOCK_SIZE_Q)
+    grouped_store_too_deep = (
+        planes == 1
+        and q128_tiles >= _cdiv(compute_units, 8)
+        and grouped_chunk_blocks > _cdiv(compute_units, _GFX1250_CTAS_PER_CU)
+    )
+    if (
+        max_block > compute_units
+        # Too little work cannot amortize the Q64 specialization.
+        and grouped_plane_tiles > _cdiv(compute_units, 16)
+        # More than two tile waves per CU makes rereading K at Q64 dominate.
+        and grouped_plane_tiles <= 2 * compute_units
+        # Bound each plane as well as their aggregate: extra heads/requests add
+        # independent query work but cannot justify an arbitrarily narrow tile.
+        and grouped_q_tiles <= _cdiv(compute_units, 2)
+        # With one already-wide Q plane, a deep Q64 chunk rereads too much K.
+        # Multi-plane launches have more independent query work and are governed
+        # by the aggregate tile bound above instead.
+        and not grouped_store_too_deep
+    ):
+        return PrefillScoreConfig(
+            block_size_q=64,
+            chunk_blocks=grouped_chunk_blocks,
+            num_warps=2,
+            num_stages=3,
+            store_group=4,
+            prefetch_pages=True,
+            post_reduce_scale=True,
+        )
+
     # Unlike index heads, separate batches do not share score pages.
     if batch != 1:
         return DEFAULT_PREFILL_SCORE_CONFIG
@@ -137,34 +189,7 @@ def prefill_score_config(
             post_reduce_scale=True,
         )
 
-    # A lone plane below one Q128 tile per eight CUs needs Q64 for occupancy.
     narrow_q = q_tiles < _cdiv(compute_units, 8)
-    # Otherwise doubling the page reads costs more than the extra Q64 grid earns.
-    if narrow_q and max_block <= compute_units * _GFX1250_Q64_BLOCKS_PER_CU:
-        tile_q = 64
-        q_tiles_64 = _cdiv(max_query_len, tile_q)
-        if max_query_len < 3 * max_block or q_tiles_64 > _cdiv(
-            compute_units, _GFX1250_CTAS_PER_CU
-        ):
-            return DEFAULT_PREFILL_SCORE_CONFIG
-        chunks = min(
-            max_block,
-            max(1, _cdiv(compute_units * _GFX1250_CTAS_PER_CU, q_tiles_64)),
-        )
-        chunk_blocks = _cdiv(max_block, chunks)
-        # Multiples of 16 pages are a repeatable memory-scheduling cliff on gfx1250.
-        if chunk_blocks % 16 == 0:
-            chunk_blocks += 1
-        return PrefillScoreConfig(
-            block_size_q=tile_q,
-            chunk_blocks=chunk_blocks,
-            num_warps=2,
-            num_stages=3,
-            store_group=4,
-            prefetch_pages=True,
-            post_reduce_scale=True,
-        )
-
     if narrow_q:
         fallback_chunk = score_chunk_blocks(max_block, q_tiles, 1, compute_units)
         fallback_programs = q_tiles * _cdiv(max_block, fallback_chunk)
