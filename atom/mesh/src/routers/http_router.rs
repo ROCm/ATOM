@@ -142,6 +142,11 @@ impl Router {
                 .body(request.body.clone()),
             Err(err) => return err.response(metadata.route),
         };
+        policy.on_dispatch(
+            metrics_labels::WORKER_REGULAR,
+            Some(&request.headers),
+            &worker,
+        );
         events::RequestSentEvent { url: worker.url() }.emit();
         let upstream = builder.send().await;
         events::RequestReceivedEvent {}.emit();

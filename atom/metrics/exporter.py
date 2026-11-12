@@ -227,6 +227,46 @@ class _AtomMetricsCollector:
             moved_tokens.add_metric([], float(dp_router["prefix_moved_tokens"]))
             yield moved_tokens
 
+        index = dp_router.get("prefix_index")
+        if index is not None:
+            # Prefix-index budget path (`prefix_spread`): shows whether eviction
+            # ever ran and how much history it shed.
+            events = CounterMetricFamily(
+                "atom:dp_prefix_index_events",
+                "Prefix-spread index budget events: tail_trim (an old history "
+                "shortened from its tail), leaf_evict (an old history dropped "
+                "whole), over_budget (budget checks that found the index over "
+                "budget), blocked (still over budget after eviction ran out of "
+                "evictable history: only still-prefilling edges and their "
+                "ancestors were left).",
+                labels=["event"],
+            )
+            for label, key in (
+                ("tail_trim", "tail_trim_total"),
+                ("leaf_evict", "leaf_evict_total"),
+                ("over_budget", "over_budget_total"),
+                ("blocked", "trim_blocked_total"),
+            ):
+                events.add_metric([label], float(index[key]))
+            yield events
+            shed = CounterMetricFamily(
+                "atom:dp_prefix_index_evicted_tokens",
+                "Prompt tokens of prefix history shed by the index budget, by "
+                "kind: tail_trim (cut from a leaf's tail) or leaf_evict (a whole "
+                "leaf).",
+                labels=["kind"],
+            )
+            shed.add_metric(["tail_trim"], float(index["tail_trim_tokens_total"]))
+            shed.add_metric(["leaf_evict"], float(index["leaf_evict_tokens_total"]))
+            yield shed
+            indexed = GaugeMetricFamily(
+                "atom:dp_prefix_index_tokens",
+                "Prompt tokens currently held by the prefix-spread index "
+                "(unique edges, not per-rank holders).",
+            )
+            indexed.add_metric([], float(index["indexed_tokens"]))
+            yield indexed
+
         metric = CounterMetricFamily(
             "atom:dp_requests_routed",
             "Cumulative requests routed to each data-parallel rank.",
