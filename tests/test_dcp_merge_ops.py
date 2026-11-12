@@ -1022,6 +1022,7 @@ def test_pcp_reindex_builds_work_plan_only_when_read(monkeypatch, nonps, plans):
         device="cpu",
         index_topk=2048,
         dcp_sparse_prefill_nonps=nonps,
+        dcp_world_size=1,
         padded_num_attention_heads=64,
         block_size=1,
         dtype_q=None,
