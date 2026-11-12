@@ -202,7 +202,7 @@ def test_fraction_uses_physical_pool_bytes(build, fraction):
 
 
 @pytest.mark.parametrize("chunked", [False, True])
-def test_free_kv_watermark_keeps_room_for_running_requests(build, chunked):
+def test_decode_reserve_keeps_room_for_running_requests(build, chunked):
     sched, request = build(
         chunked=chunked,
         num_kvcache_blocks=10,
@@ -241,7 +241,7 @@ def test_free_kv_watermark_keeps_room_for_running_requests(build, chunked):
 
 
 @pytest.mark.parametrize("chunked", [False, True])
-def test_free_kv_watermark_holds_while_admitted_requests_decode(build, chunked):
+def test_decode_reserve_holds_while_admitted_requests_decode(build, chunked):
     sched, request = build(
         chunked=chunked,
         num_kvcache_blocks=10,
@@ -267,7 +267,7 @@ def test_free_kv_watermark_holds_while_admitted_requests_decode(build, chunked):
     assert b.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
 
 
-def test_free_kv_watermark_admits_below_it_only_on_an_idle_decoder():
+def test_decode_reserve_admits_below_it_only_on_an_idle_decoder():
     policy = standalone(None, reserve_tokens=4, free_blocks=10)
     big = SizedSeq(id=1, block_table=[1, 2, 3, 4])
     decoding = SizedSeq(id=2, block_table=[9])
@@ -338,7 +338,7 @@ def test_decode_reserve_starts_from_the_blocks_a_request_holds():
 
 
 @pytest.mark.parametrize("chunked", [False, True])
-def test_free_kv_watermark_counts_claimed_prefix_hits(build, seq_factory, chunked):
+def test_decode_reserve_counts_claimed_prefix_hits(build, seq_factory, chunked):
     sched, request = build(
         chunked=chunked,
         prefix=True,
@@ -379,7 +379,7 @@ def test_free_kv_watermark_counts_claimed_prefix_hits(build, seq_factory, chunke
 
 
 @pytest.mark.parametrize("chunked", [False, True])
-def test_free_kv_watermark_skips_hits_on_blocks_another_request_holds(
+def test_decode_reserve_skips_hits_on_blocks_another_request_holds(
     build, seq_factory, chunked
 ):
     sched, request = build(
