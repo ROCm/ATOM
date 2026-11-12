@@ -48,9 +48,9 @@ def draft_kv_builder(model_runner, draft_hf):
 
     A draft is not an attention flavor; it is a model that has one. So the
     flavor comes from the draft's own config through the same selector the
-    target uses, and the family table (`selector.DRAFT_POOL_FAMILIES`) says
-    whether a draft of its flavor caches into a pool of its own. Where it does
-    not, the runner never sees a draft builder at all.
+    target uses, and that backend says whether a draft of its flavor caches
+    into a pool of its own (`selector.DRAFT_POOL_FAMILIES`). Where it does not, the
+    runner never sees a draft builder at all.
 
     Which is why speculative decoding imports no attention anywhere: adding a
     flavor is a table entry and a `make_kv_pool` on that backend.

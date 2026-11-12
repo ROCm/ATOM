@@ -17,10 +17,11 @@ an attention builder and whose package promises to import no attention at all.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, NamedTuple
+from typing import NamedTuple, Protocol
 
-if TYPE_CHECKING:
-    from atom.model_ops.attentions.mha_kv_pool import KvLayout
+
+class _Tagged(Protocol):
+    tag: str  # what a KV layout (`mha_kv_pool.KvLayout`) names its row space by
 
 
 class KvGeometry(NamedTuple):
@@ -38,7 +39,7 @@ class KvGeometry(NamedTuple):
     # None for the dtype-wide cache; a layout for layers whose pages read another
     # way (MiniMax-M3's sparse layers under --kv-cache-dtype fp4) -- a separate
     # pool beside any dense layers' one. Hashable, with a `tag` naming it.
-    layout: KvLayout | None = None
+    layout: _Tagged | None = None
 
     def __str__(self) -> str:
         """What this row space is called, wherever one is named -- the startup
