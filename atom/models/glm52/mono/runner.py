@@ -24,6 +24,7 @@ from aiter.dist.parallel_state import (
     get_tp_group,
 )
 
+from atom.distributed.group_agreement import group_max, group_min
 from atom.model_ops.attention_mla import (
     triton_convert_req_index_to_global_index,
     triton_gather_kv_indices_sparse,
@@ -45,7 +46,11 @@ from atom.models.glm52.mono.kernels.geometry_config import (
     KvCacheLayout,
     glm5_kernel_samples,
 )
-from atom.models.glm52.mono.weights import bf16_vector, layer_weights
+from atom.models.glm52.mono.weights import (
+    attention_format,
+    bf16_vector,
+    layer_weights,
+)
 from atom.mono.runtime.compile import kernel_names
 from atom.mono.runtime.consensus import MonoUnsupported, tp_uniform_local_validation
 from atom.mono.weights.layer import LayerWeights
@@ -92,6 +97,7 @@ class _GlmLayerOp:
         prepared_weights,
         runtime,
         launches_per_step: int,
+        attention_weight: AttentionWeight,
     ) -> None:
         from atom.models.glm52.mono.kernels.op import Glm5MonoKernel
 
@@ -106,7 +112,7 @@ class _GlmLayerOp:
             topk=topk,
             launches_per_step=launches_per_step,
             with_indexer=False,
-            attention_weight=AttentionWeight.FP8_PTPC,
+            attention_weight=attention_weight,
             kv_cache_layout=KvCacheLayout.ATOM,
             kv_cache_dtype=kv_cache_dtype,
             prepared_weights=prepared_weights,
@@ -371,6 +377,9 @@ class Glm52MonoRunner:
         self._fused_launches: dict[int, int] = {}
         self._refused: set[int] = set()
         self._announced: set[int] = set()
+        # The attention storage production loaded (`weights.attention_format`),
+        # settled by the first build and agreed over TP.
+        self._attention: AttentionWeight | None = None
         # The `cur_pos` argument `Glm5MonoKernel.forward` demands: contiguous
         # int32 with exactly one element. Under `KvCacheLayout.ATOM` -- the
         # only layout ATOM builds -- the kernel does not read a position from
@@ -492,6 +501,11 @@ class Glm52MonoRunner:
             )
             if native is None:
                 raise MonoUnsupported("layer backend")
+            attention = (
+                attention_format(layers[0])
+                if self._attention is None
+                else self._attention
+            )
             for layer in layers:
                 if layer.layer_idx not in self._weights:
                     # Always the base (with_indexer=False) mapping: every
@@ -501,12 +515,14 @@ class Glm52MonoRunner:
                     # validated pass below -- see `_GlmFusedLayerOp`'s
                     # docstring and the "falls back, does not refuse `rows`"
                     # contract that pass must honor.
-                    weights = layer_weights(layer, rank, npes, with_indexer=False)
+                    weights = layer_weights(
+                        layer, rank, npes, attention=attention, with_indexer=False
+                    )
                     mapped.append(
                         (
                             layer.layer_idx,
                             weights,
-                            prepare_glm5_weights(weights, AttentionWeight.FP8_PTPC),
+                            prepare_glm5_weights(weights, attention),
                         )
                     )
         # `Exception`, not (MonoUnsupported, ValueError): every one of these four
@@ -530,6 +546,25 @@ class Glm52MonoRunner:
             self._refused.add(rows)
             logger.warning("GLM-5.2 MonoKernel fallback before launch: %s", error)
             return False
+        if self._attention is None:
+            code = list(AttentionWeight).index(attention)
+            group = get_tp_group().cpu_group
+            if group_max(code, group) != group_min(code, group):
+                self._refused.add(rows)
+                logger.warning(
+                    "GLM-5.2 MonoKernel fallback before launch: TP ranks loaded "
+                    "different attention formats"
+                )
+                return False
+            self._attention = attention
+            # The kernel fuses its indexer only beside PTPC projections.
+            if attention is not AttentionWeight.FP8_PTPC and self._fused_indexer_on:
+                logger.info(
+                    "GLM-5.2 fused indexer off: %s attention runs the external "
+                    "indexer",
+                    attention.value,
+                )
+                self._fused_indexer_on = False
         for layer_idx, weights, prepared in mapped:
             self._weights[layer_idx] = weights
             self._prepared[layer_idx] = prepared
@@ -554,7 +589,13 @@ class Glm52MonoRunner:
                         fused_mapped.append(
                             (
                                 layer.layer_idx,
-                                layer_weights(layer, rank, npes, with_indexer=True),
+                                layer_weights(
+                                    layer,
+                                    rank,
+                                    npes,
+                                    attention=self._attention,
+                                    with_indexer=True,
+                                ),
                             )
                         )
             except Exception as error:  # noqa: BLE001 - collective below
@@ -684,6 +725,7 @@ class Glm52MonoRunner:
                         self._prepared[layer.layer_idx],
                         runtime,
                         launches_per_step=base_launches,
+                        attention_weight=self._attention,
                     )
                     if runtime is None:
                         runtime = owned.op
@@ -940,4 +982,5 @@ class Glm52MonoRunner:
         self._fused_launches.clear()
         self._refused.clear()
         self._announced.clear()
+        self._attention = None
         self._cur_pos = None

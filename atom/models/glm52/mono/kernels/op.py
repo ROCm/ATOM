@@ -59,7 +59,9 @@ def prepare_glm5_weights(W: LayerWeights, attention_weight: AttentionWeight | st
     expert_mxfp4 = t["w_ug"].dtype is torch.uint8
     moe_mode = MoeMode.A16W4 if expert_mxfp4 else MoeMode.W8A8
     profile = replace(W.config, attention_weight=AttentionWeight(attention_weight))
-    if profile.attention_weight is AttentionWeight.FP8_PTPC:
+    # production's own projections, read in place
+    in_place = profile.attention_weight in (AttentionWeight.FP8_PTPC, AttentionWeight.BF16_ABSORB_FP8)
+    if in_place:
         attention = {
             "w_qkv_a": t["w_qkv_a"],
             "w_q_b": t["w_q_b"],
@@ -83,8 +85,8 @@ def prepare_glm5_weights(W: LayerWeights, attention_weight: AttentionWeight | st
         packed["w_r"] = pack_bf16(t["w_r"])
         packed.update(dict(zip(("w_ug", "s_ug", "w_dn", "s_dn"), prepare_mxfp4_expert_storage(W, canonical=False))))
         return packed
-    if profile.attention_weight is AttentionWeight.FP8_PTPC:
-        raise ValueError("PTPC attention currently requires ATOM expert storage")
+    if in_place:
+        raise ValueError(f"{profile.attention_weight.value} attention currently requires ATOM expert storage")
     packed = pack_layer_weights(
         t,
         moe_mode,
@@ -385,9 +387,9 @@ class Glm5MonoKernel:
             native_fp4_mfma=native_fp4_mfma,
             rope_dtype=rope_dtype,
             uv_scale_rows=(
-                128
-                if self.attention_weight in (AttentionWeight.BF16, AttentionWeight.FP8_PTPC)
-                else W.t["w_uv"].shape[0] // W.t["s_uv"].shape[0]
+                W.t["w_uv"].shape[0] // W.t["s_uv"].shape[0]
+                if self.attention_weight is AttentionWeight.FP8_BLOCK128
+                else 128
             ),
             indexer_cp=indexer_cp,
         )
