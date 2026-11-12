@@ -78,9 +78,7 @@ try:
         mla_dcp_sparse_prefill_num_heads,
     )
     from atom.model_ops.dcp_ops import (
-        _A2A_PACK_MIN_COARSE_PROGRAMS,
-        _a2a_pack,
-        _a2a_row_pitch,
+        _dcp_a2a_pack_kernel,
         _dcp_a2a_unpack_combine_kernel,
         _lse_pack_slots,
         correct_attn_out,
@@ -657,20 +655,35 @@ def _a2a_roundtrip(o_per_rank, lse_per_rank, n_ranks, owned_counts_per_rank=None
     dtype = o_per_rank[0].dtype
     pack = _lse_pack_slots(dtype)
 
-    pitch = _a2a_row_pitch(d, pack, dtype)
-
     sends = []
     for r in range(n_ranks):
-        # Poison the whole staging buffer: the padding slots a 16B-aligned pitch
-        # introduces must never reach a result, and NaN says so loudly.
+        # Poison the staging buffer: a record the pack kernel skipped must
+        # reach the result as NaN, not as a small numeric drift.
         send = torch.full(
-            (n_ranks, b, h_local, pitch), float("nan"), dtype=dtype, device=DEV
+            (n_ranks, b, h_local, d + pack), float("nan"), dtype=dtype, device=DEV
         )
         o_r = o_per_rank[r].contiguous()
         l_r = lse_per_rank[r].contiguous().to(torch.float32)
         has_owned_counts = owned_counts_per_rank is not None
         counts_r = owned_counts_per_rank[r].contiguous() if has_owned_counts else l_r
-        _a2a_pack(send, o_r, l_r, counts_r, has_owned_counts)
+        _dcp_a2a_pack_kernel[(b, n_ranks)](
+            o_r,
+            l_r,
+            counts_r,
+            send,
+            o_r.stride(0),
+            o_r.stride(1),
+            l_r.stride(0),
+            l_r.stride(1),
+            send.stride(0),
+            send.stride(1),
+            send.stride(2),
+            H_LOCAL=h_local,
+            H_BLOCK=triton.next_power_of_2(h_local),
+            HEAD_DIM=d,
+            LSE_PACK=pack,
+            HAS_OWNED_COUNTS=has_owned_counts,
+        )
         sends.append(send)
 
     outs = []
@@ -699,17 +712,10 @@ def _a2a_roundtrip(o_per_rank, lse_per_rank, n_ranks, owned_counts_per_rank=None
     return torch.cat(outs, dim=1)
 
 
-def _a2a_batch(n_ranks, wide):
-    """A token count just below (narrow: one pack program per head) or just
-    above (wide: one per destination) the pack kernel's dispatch threshold."""
-    return max(1, _A2A_PACK_MIN_COARSE_PROGRAMS // n_ranks + (1 if wide else -1))
-
-
 @needs_gpu
-@pytest.mark.parametrize("wide", [False, True])
 @pytest.mark.parametrize("n_ranks", [2, 8])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_a2a_reproduces_the_ag_rs_merge(n_ranks, dtype, wide):
+def test_a2a_reproduces_the_ag_rs_merge(n_ranks, dtype):
     """The two backends must agree: same weighted sum, same head ownership.
 
     They arrive there differently -- ag_rs pre-multiplies each rank's partial and
@@ -720,7 +726,7 @@ def test_a2a_reproduces_the_ag_rs_merge(n_ranks, dtype, wide):
     is the only one where the fp32 LSE has to survive being split across two
     16-bit slots of the transfer buffer.
     """
-    b, h, d = _a2a_batch(n_ranks, wide), 8, 32
+    b, h, d = 3, 8, 32
     g = torch.Generator(device=DEV).manual_seed(n_ranks)
     o = [
         torch.randn(b, h, d, generator=g, device=DEV).to(dtype) for _ in range(n_ranks)
@@ -735,22 +741,18 @@ def test_a2a_reproduces_the_ag_rs_merge(n_ranks, dtype, wide):
 
 
 @needs_gpu
-@pytest.mark.parametrize("wide", [False, True])
-def test_a2a_handles_a_non_power_of_two_head_split(wide):
+def test_a2a_handles_a_non_power_of_two_head_split():
     """K3's shape: H=96 over DCP 8, so each destination owns 12 heads.
 
-    A wide step packs one destination's whole H_LOCAL slice per program, and
-    tl.arange needs a power of two, so 12 heads are processed as 16 lanes with
-    the top 4 masked. Those lanes must neither write outside the destination's
-    slice nor drop a real head. A narrow step packs one head per program into
-    the same padded records; both paths are covered.
+    The pack kernel handles one destination's whole H_LOCAL slice per program,
+    and tl.arange needs a power of two, so 12 heads are processed as 16 lanes
+    with the top 4 masked. Those lanes must neither write outside the
+    destination's slice nor drop a real head.
 
     _a2a_roundtrip fills the staging buffer with NaN before packing, so a head
-    the pack kernel skipped -- or a padding slot the combine kernel read --
-    arrives as NaN rather than as a small numeric drift.
+    the pack kernel skipped arrives as NaN rather than as a small numeric drift.
     """
-    h, d, n_ranks = 96, 128, 8
-    b = _a2a_batch(n_ranks, wide)
+    b, h, d, n_ranks = 3, 96, 128, 8
     assert (h // n_ranks) & (h // n_ranks - 1), "meaningless if H_LOCAL is 2**k"
     g = torch.Generator(device=DEV).manual_seed(96)
     o = [
@@ -767,8 +769,7 @@ def test_a2a_handles_a_non_power_of_two_head_split(wide):
 
 
 @needs_gpu
-@pytest.mark.parametrize("wide", [False, True])
-def test_a2a_lse_survives_the_16_bit_split(wide):
+def test_a2a_lse_survives_the_16_bit_split():
     """A bf16 buffer stores the fp32 LSE as two raw 16-bit halves.
 
     Nothing does arithmetic on those slots -- the collective copies bits -- so the
@@ -778,8 +779,7 @@ def test_a2a_lse_survives_the_16_bit_split(wide):
     Checked by giving each rank a distinct LSE and one-hot outputs, so the merged
     result is a pure function of the weights.
     """
-    h, d, n_ranks = 4, 32, 4
-    b = _a2a_batch(n_ranks, wide)
+    b, h, d, n_ranks = 2, 4, 32, 4
     g = torch.Generator(device=DEV).manual_seed(11)
     lse = [torch.randn(b, h, generator=g, device=DEV) * 5.0 for _ in range(n_ranks)]
     # Rank r contributes the constant r, so out == sum_r weight_r * r exactly.
@@ -799,27 +799,24 @@ def test_a2a_lse_survives_the_16_bit_split(wide):
 
 
 @needs_gpu
-@pytest.mark.parametrize("wide", [False, True])
-def test_a2a_scrubs_the_empty_rank(wide):
+def test_a2a_scrubs_the_empty_rank():
     """A dummy-backed empty rank has finite LSE and a meaningless output.
 
     The existing pack kernel must use the true count to send LSE=-inf, after
     which the combine kernel forces its contribution to a hard zero. This is
     the launch-free sparse-DCP zero-row path used by decode and prefill.
     """
-    h, d, n_ranks = 4, 32, 2
-    b = _a2a_batch(n_ranks, wide)
+    b, h, d, n_ranks = 2, 4, 32, 2
     g = torch.Generator(device=DEV).manual_seed(5)
     o = [
         torch.randn(b, h, d, generator=g, device=DEV).bfloat16() for _ in range(n_ranks)
     ]
     lse = [torch.randn(b, h, generator=g, device=DEV) for _ in range(n_ranks)]
     o[0][0] = float("nan")
-    # Rank 0 owns no KV for token 0 only.
     owned_counts = [
-        torch.ones(b, dtype=torch.int32, device=DEV) for _ in range(n_ranks)
+        torch.tensor([0, 1], dtype=torch.int32, device=DEV),
+        torch.tensor([1, 1], dtype=torch.int32, device=DEV),
     ]
-    owned_counts[0][0] = 0
 
     got = _a2a_roundtrip(o, lse, n_ranks, owned_counts)
     assert torch.isfinite(got).all(), "empty-rank NaN reached the a2a output"

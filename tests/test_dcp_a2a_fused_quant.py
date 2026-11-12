@@ -23,7 +23,6 @@ triton = pytest.importorskip("triton")
 from aiter import dtypes as _aiter_dtypes
 
 from atom.model_ops.dcp_ops import (
-    _a2a_row_pitch,
     _dcp_a2a_unpack_combine_kernel,
     _dcp_a2a_unpack_combine_quant_kernel,
     _lse_pack_slots,
@@ -36,11 +35,9 @@ FP8 = _aiter_dtypes.fp8
 
 
 def _make_recv(n, b, h, d, dtype, pack, empty_rows=(), seed=0):
-    """[N, B, H, pitch] as the all-to-all delivers it; the row padding is NaN,
-    so a combine that reads it poisons its output."""
+    """[N, B, H, D+pack] as the all-to-all delivers it."""
     g = torch.Generator(device="cpu").manual_seed(seed)
-    pitch = _a2a_row_pitch(d, pack, dtype)
-    recv = torch.full((n, b, h, pitch), float("nan"), dtype=dtype, device="cuda")
+    recv = torch.empty((n, b, h, d + pack), dtype=dtype, device="cuda")
     body = torch.randn((n, b, h, d), generator=g).to(dtype).cuda()
     lse = torch.randn((n, b, h), generator=g).cuda().float() * 2.0
     for row in empty_rows:  # a rank owning no KV for this row
@@ -247,37 +244,6 @@ def test_lse_and_fused_quant_is_rejected_at_any_group_size():
             cp_lse_a2a(o, lse, group, return_lse=True, quant_dtype=FP8)
 
 
-def test_non_power_of_two_head_count():
-    """H_LOCAL = H / DCP size need not be a power of two, and tl.arange needs one.
-
-    K3 runs H=96 over DCP 8, so H_LOCAL=12. The head axis used to index with a
-    bare ``tl.arange(0, H_LOCAL)``, which does not COMPILE at 12 -- nothing in
-    cp_lse_a2a or _dcp_fused_quant_dtype() constrains H_LOCAL to a power of two,
-    so the fused path would have died at trace time on the production shape.
-
-    Rounding up adds lanes whose heads do not exist. They are folded onto lane 0
-    and masked, so they must not reach the output and -- because the scale is a
-    per-TOKEN max over every head -- must not move the scale either. Both are
-    checked against the unfused pair at the same shape.
-    """
-    b, h, d, n = 8, 12, 128, 8
-    assert triton.next_power_of_2(h) > h, "meaningless for a power-of-two H_LOCAL"
-    pack = _lse_pack_slots(torch.bfloat16)
-
-    recv = _make_recv(n, b, h, d, torch.bfloat16, pack, seed=7)
-    ref = _run_unfused(recv, b, h, d, n, pack, torch.bfloat16)
-    got_q, got_s = _run_fused(recv, b, h, d, n, pack)
-
-    got = (got_q.float().reshape(b, -1) * got_s).reshape(b, h, d)
-    torch.testing.assert_close(got, ref.float(), rtol=0.1, atol=0.1)
-    # A padded lane reading a neighbouring row shows up here first: the scale is
-    # the row max, so one stray value inflates it for the whole token.
-    ref_s = ref.float().reshape(b, -1).abs().amax(dim=1, keepdim=True) / float(
-        torch.finfo(FP8).max
-    )
-    torch.testing.assert_close(got_s, ref_s, rtol=0.02, atol=0.0)
-
-
 def test_non_power_of_two_group():
     """A group size N_ROUNDED has to round up, with a poison slab where it lands.
 
@@ -292,8 +258,7 @@ def test_non_power_of_two_group():
     assert triton.next_power_of_2(n) > n, "meaningless for a power-of-two group"
     pack = _lse_pack_slots(torch.bfloat16)
 
-    pitch = _a2a_row_pitch(d, pack, torch.bfloat16)
-    big = torch.empty((n + 1, b, h, pitch), dtype=torch.bfloat16, device="cuda")
+    big = torch.empty((n + 1, b, h, d + pack), dtype=torch.bfloat16, device="cuda")
     big[:n] = _make_recv(n, b, h, d, torch.bfloat16, pack)
     big[n] = 1e4  # where the padding lane points
     recv = big[:n]
