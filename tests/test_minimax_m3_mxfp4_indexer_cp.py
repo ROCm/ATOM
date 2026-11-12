@@ -4,13 +4,15 @@
 Each CP rank scores every index head over its 1/P of the blocks with aiter's MXFP4
 decode scorer (`indexer_context_scores_mxfp4`), keeps its shard's top-k, and the
 rank owning head h merges every shard's head-h candidates. The CPU tests pin the
-wiring: the shard's map, bound and workspace, what the scorer is handed, and which
-scorer the CP decode runs with what page geometry its merge emits. The gfx950 test
-runs the four ranks in one process, the exchange done by indexing, and pins the
-selection itself: the merged top-k, sparse block table and context equal the native
-TP selector's for the same head, bit for bit.
+wiring: the shard's map, bound and workspace, what the scorer is handed, which
+scorer the CP decode runs with what page geometry its merge emits, and that the
+installed aiter's signatures take those calls. The gfx950 test runs the four ranks
+in one process, the exchange done by indexing, and pins the selection itself: the
+merged top-k, sparse block table and context equal the native TP selector's for the
+same head, bit for bit.
 """
 
+import inspect
 import types
 
 import pytest
@@ -264,6 +266,72 @@ def test_the_builder_sizes_the_scorer_for_this_ranks_shard(monkeypatch, enabled)
     monkeypatch.setattr(indexer_cp, "get_indexer_cp_rank", lambda: 2)
     shard = aiter_attention.AiterAttentionMetadataBuilder._index_cp_shard()
     assert shard == ((WORLD, 2) if enabled else (1, 0))
+
+
+def test_the_installed_aiter_takes_the_shards_calls(monkeypatch):
+    """Each FlyDSL call a shard's decode makes binds to the installed aiter's
+    signature, so an aiter that does not take one fails here, with no GPU, rather
+    than at the first MXFP4 CP decode. The scorer's `k_scale` needs aiter#7060, the
+    PR that added the MXFP4 scorer itself; its `cp_world` / `cp_rank` are older."""
+    flydsl = pytest.importorskip("aiter.ops.flydsl")
+    from atom.model_ops.minimax_m3 import indexer_context_parallel as icp
+    from atom.model_ops.minimax_m3 import sparse_attn
+    from atom.model_ops.minimax_m3.index_buffers import allocate_index_scorers
+
+    bound = {}
+
+    def binding(name, result):
+        signature = inspect.signature(getattr(flydsl, name))
+
+        def call(*args, **kwargs):
+            bound[name] = signature.bind(*args, **kwargs).arguments
+            return result(kwargs)
+
+        return call
+
+    capacity = "minimax_m3_index_score_work_map_capacity"
+    monkeypatch.setattr(flydsl, capacity, binding(capacity, lambda kw: 4))
+    ops = types.SimpleNamespace(
+        minimax_m3_index_score_work_map=binding(
+            "minimax_m3_index_score_work_map", lambda kw: kw["out"][:3]
+        ),
+        minimax_m3_index_score_flydsl=binding(
+            "minimax_m3_index_score_flydsl", lambda kw: kw["out"]
+        ),
+    )
+    monkeypatch.setattr(sparse_attn, "flydsl_ops", lambda: ops)
+    monkeypatch.setattr(
+        sparse_attn, "build_n_valid_column_per_row", lambda *a, **k: None
+    )
+    monkeypatch.setattr(icp, "flydsl_ops", lambda: ops)
+    monkeypatch.setattr(icp, "page_views", lambda cache: ("data", "scale"))
+
+    seq = torch.ones(2, dtype=torch.int32)
+    record = allocate_index_scorers(
+        _config(), "cpu", max_bs=2, max_qlen=1, num_idx_heads=1, cp=(WORLD, 1)
+    )[""]
+    step = sparse_attn.make_sparse_decode_metadata(
+        seq_lens=seq,
+        block_table=None,
+        slot_mapping=None,
+        max_seq_len=128,
+        num_idx_heads=1,
+        index_scorer=record,
+    ).index_scorer
+    table = torch.zeros(2, BOUND, dtype=torch.int32)
+    q = torch.zeros(2, WORLD, DIM)
+    icp.indexer_context_scores_mxfp4(q, "cache", table, seq, 128, 1, SM_SCALE, step)
+    assert bound.keys() == {
+        capacity,
+        "minimax_m3_index_score_work_map",
+        "minimax_m3_index_score_flydsl",
+    }
+    scorer = bound["minimax_m3_index_score_flydsl"]
+    assert (scorer["k_scale"], scorer["cp_world"], scorer["cp_rank"]) == (
+        "scale",
+        WORLD,
+        1,
+    )
 
 
 # ─────────────────────────────────────────────────────────── selection ──
