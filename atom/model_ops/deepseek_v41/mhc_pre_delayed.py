@@ -6,10 +6,10 @@ pre-mix carried from the PREVIOUS sublayer while the one computed here is
 carried to the next. HIP Mega-MHC and the Triton implementation cover that seam --
 the owed post, the gate projection, Sinkhorn, the collapse with the carried
 pre-mix and the sublayer's input RMSNorm. HIP uses one compute kernel on gfx950
-and gfx1250. On gfx942, seams with a post run AITER's ASM seam
-(mhc_fused_post_pre_delayed, then rms_norm) wherever AITER supports it
-(mhc_fused_post_pre_delayed_asm_supported: H=5120); seams without a post stay on
-Triton. ATOM_DSV41_MHC_BACKEND=triton forces Triton everywhere.
+and gfx1250. On gfx942, seams with a post pass the FP32 weight to mega_mhc,
+which runs AITER's ASM seam and RMSNorm wherever
+mhc_fused_post_pre_delayed_asm_supported holds (H=5120); seams without a post
+stay on Triton. ATOM_DSV41_MHC_BACKEND=triton forces Triton everywhere.
 
 The norm is the sublayer's own. Attention can request HIP's fused MXFP8
 output alongside BF16 for its other readers; FFN keeps the BF16 interface.
@@ -25,11 +25,7 @@ from functools import cache
 import torch
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.jit.utils.torch_guard import torch_compile_guard
-from aiter.ops.mhc import (
-    mhc_fused_post_pre_delayed,
-    mhc_fused_post_pre_delayed_asm_supported,
-)
-from aiter.ops.rmsnorm import rms_norm
+from aiter.ops.mhc import mhc_fused_post_pre_delayed_asm_supported
 from aiter.ops.triton.fusions.mhc_fused_post_pre_delayed_rmsnorm import (
     mhc_fused_post_pre_delayed_rmsnorm,
 )
@@ -67,8 +63,9 @@ def _row_major_scale_options():
 
 
 def use_asm_seam(hc_mult, hidden) -> bool:
-    """Whether a seam with a post runs AITER's gfx942 ASM seam: wherever AITER
-    supports it, unless ATOM_DSV41_MHC_BACKEND=triton."""
+    """Whether a seam with a post passes the FP32 weight to mega_mhc for AITER's
+    gfx942 ASM seam: wherever AITER supports it, unless
+    ATOM_DSV41_MHC_BACKEND=triton."""
     return envs.ATOM_DSV41_MHC_BACKEND != "triton" and (
         mhc_fused_post_pre_delayed_asm_supported(hidden, hc_mult)
     )
@@ -237,44 +234,30 @@ def v41_mhc_pre_delayed(
         options["out_dtype"] = "mxfp8" if fuse_quant else "bf16"
         if fuse_quant:
             options.update(_row_major_scale_options())
-    if not w_preshuffle_bf16 and with_post and use_asm_seam(hc_mult, hidden):
-        new_residual, post, comb, layer_input, pre = mhc_fused_post_pre_delayed(
-            residual.view(rows, hc_mult, hidden),
-            hc_fn,
-            hc_scale,
-            hc_base,
-            rms_eps,
-            hc_eps,
-            hc_eps,
-            post_mult,
-            sinkhorn_iters,
-            pre_mix.reshape(rows, hc_mult),
-            sublayer_output.reshape(rows, hidden),
-            post_mix.reshape(rows, hc_mult),
-            combination.reshape(rows, hc_mult, hc_mult),
-        )
-        normed = rms_norm(layer_input, norm_weight, norm_eps)
-    else:
-        new_residual, post, comb, normed, pre = kernel(
-            residual.view(rows, hc_mult, hidden),
-            hc_fn,
-            hc_scale,
-            hc_base,
-            rms_eps,
-            hc_eps,
-            hc_eps,
-            post_mult,
-            sinkhorn_iters,
-            pre_mix.reshape(rows, hc_mult),
-            sublayer_out=sublayer_output.reshape(rows, hidden) if with_post else None,
-            post_layer_mix=post_mix.reshape(rows, hc_mult) if with_post else None,
-            comb_res_mix=(
-                combination.reshape(rows, hc_mult, hc_mult) if with_post else None
-            ),
-            norm_weight=norm_weight,
-            norm_eps=norm_eps,
-            **options,
-        )
+    elif with_post and use_asm_seam(hc_mult, hidden):
+        # FP32 fn: mega_mhc runs AITER's ASM seam, then RMSNorm.
+        kernel = _hip_ops()[0]
+        options["out_dtype"] = "bf16"
+    new_residual, post, comb, normed, pre = kernel(
+        residual.view(rows, hc_mult, hidden),
+        hc_fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_eps,
+        hc_eps,
+        post_mult,
+        sinkhorn_iters,
+        pre_mix.reshape(rows, hc_mult),
+        sublayer_out=sublayer_output.reshape(rows, hidden) if with_post else None,
+        post_layer_mix=post_mix.reshape(rows, hc_mult) if with_post else None,
+        comb_res_mix=(
+            combination.reshape(rows, hc_mult, hc_mult) if with_post else None
+        ),
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
+        **options,
+    )
     if fuse_quant:
         normed, quant, scale = normed
     outputs = [
