@@ -182,15 +182,16 @@ class PdAdmissionController:
         # those past their first batch and so no longer pending. Only an idle D
         # admits below it, so a request larger than the pool minus the reserve
         # is not starved.
-        if (
-            (self.pending or running)
-            and self.reserve_blocks is not None
-            # Every block the request allocates, not only the receive targets:
-            # a local prefix hit on a cached-but-free block leaves the free
-            # list like a receive target does.
-            and self._block_manager.kv.num_free - num_blocks < self.reserve_blocks
-        ):
-            hit.append("free_kv")
+        if (self.pending or running) and self.reserve_blocks is not None:
+            # What this request takes off the free list now: the allocator's
+            # demand, where a hit on a cached-but-free block counts and one on
+            # a block another request holds does not. The draft lookahead in it
+            # is decode growth, which a PD receive allocates at its first decode.
+            demand = probe.num_new_blocks - self._block_manager.draft_lookahead_blocks(
+                len(seq)
+            )
+            if self._block_manager.kv.num_free - demand < self.reserve_blocks:
+                hit.append("free_kv")
         if not hit:
             return True, plan
         # One deferral per admission wait and limit, however many passes it
