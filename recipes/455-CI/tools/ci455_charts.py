@@ -32,7 +32,7 @@ FAIL_GREY = "#8A8F98"
 RED = "#9B1C1C"  # the MI455 deep red of the LLM-Booster#246 charts
 
 SOURCE = "Source: AMD MI455 455-CI runs on ATOM main + aiter main, self-measured"
-MOCK_NOTE = "MOCK DATA: layout preview, not measurements."
+MOCK_NOTE = "EXAMPLE: mock data, not real measurements."
 NICE_STEPS = (
     1,
     2,
@@ -100,7 +100,7 @@ def _header(fig, H, title, subtitle, mock):
     fig.text(
         24 / W,
         1 - 52 / H,
-        f"MOCK DATA · {subtitle}" if mock else subtitle,
+        f"EXAMPLE (mock data) · {subtitle}" if mock else subtitle,
         ha="left",
         va="top",
         fontsize=13 * PX,

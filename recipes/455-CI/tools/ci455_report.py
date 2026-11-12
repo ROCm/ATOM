@@ -1,7 +1,8 @@
 """Build the 455-CI report of one image: highlights and a summary table for
 the boss, and a detailed report with every number and each failure's core
-error log (455-CI-guide.md §5.1)."""
+error log (455-CI-guide.md §5)."""
 
+import re
 from dataclasses import dataclass
 
 from ci455_data import LABEL
@@ -14,6 +15,10 @@ BEST_DRIFT = -0.05  # this far below the best earlier image: slow regression
 ACC_WARN = 0.04  # GSM8K down by more than this (0.01 = one point): regression
 ACC_SEVERE = 0.06
 LOG_LINES = 60  # core error log lines shown in the detailed report
+EXAMPLE = [
+    "> ⚠️ **EXAMPLE（示例）**：这是演示报告格式的例子，所有数字都是编的，不是真实测试数据。",
+    "",
+]
 
 
 @dataclass
@@ -31,7 +36,8 @@ def pct(x):
 
 
 def pts(x):
-    return f"{x * 100:+.1f} 个点".replace("-", "−")
+    v = round(x * 100, 1)
+    return "0.0 个点" if v == 0 else f"{v:+.1f} 个点".replace("-", "−")
 
 
 def num(v):
@@ -66,8 +72,14 @@ def acc_flag(delta):
     return ""
 
 
-def _where(r):
-    return f"{LABEL[r.scenario]} · {r.name}"
+def short_name(name):
+    """ "Kimi-K3 (2.8T)" -> "Kimi-K3": highlights keep to the point."""
+    return re.sub(r"\s*\(.*\)\s*$", "", name)
+
+
+def headline(r):
+    """The cell the summary table shows: the highest concurrency (c64)."""
+    return max(r.perf, key=lambda c: c.concurrency)
 
 
 def _failed_parts(r):
@@ -77,23 +89,34 @@ def _failed_parts(r):
     return parts
 
 
-def _short(error, limit=90):
+def _short(error, limit=60):
     line = (error or "").strip().splitlines()[0] if (error or "").strip() else ""
     return line if len(line) <= limit else line[: limit - 1] + "…"
 
 
-def _changes(cells, key):
-    return "、".join(
-        f"c{c.concurrency} {pct(key(c))}（{num(c.prev)} → {num(c.value)}）"
-        for c in cells
-    )
+RANK = {"": 0, "🟢": 0, "⚠️": 1, "🔴": 2}
+
+
+def _phrase(cells, top, key, verb, flag=perf_flag):
+    """ "吞吐<verb> x%" for the headline concurrency (c64). The low concurrency
+    is mentioned only when c64 has nothing to say, or when it is worse."""
+    main = [c for c in cells if c is top]
+    low = [c for c in cells if c is not top]
+    if main and low and RANK[flag(key(low[0]))] <= RANK[flag(key(main[0]))]:
+        low = []
+    parts = [f"吞吐{verb} {abs(key(c)) * 100:.1f}%" for c in main]
+    parts += [
+        f"{'低并发' if main else '低并发吞吐'}{verb} {abs(key(c)) * 100:.1f}%"
+        for c in low
+    ]
+    return "，".join(parts)
 
 
 def highlights(results, pending=()):
-    """The few lines the boss reads, most important first: failures, severe
-    and plain regressions (throughput, then GSM8K), slow slides below the
-    best, progress, recoveries, first results, one line for everything flat,
-    then scenarios not run yet."""
+    """One short line per model with news, "<flag> <model>：<what happened>",
+    most important first: failures, severe and plain regressions (throughput,
+    then GSM8K), slow slides below the best, progress, recoveries, first
+    results; then one line for everything flat and the scenarios not run."""
     failed, severe, warn, drift, gain, recovered, new, quiet = (
         [],
         [],
@@ -105,7 +128,7 @@ def highlights(results, pending=()):
         0,
     )
     for r in results:
-        where = _where(r)
+        who, top = short_name(r.name), headline(r)
         parts = _failed_parts(r)
         if parts:
             everything = all(c.status != "ok" for c in r.perf) and r.acc.status != "ok"
@@ -113,24 +136,21 @@ def highlights(results, pending=()):
                 [r.acc.error] if r.acc.error else []
             )
             err = _short(errors[0]) if errors else ""
-            failed.append(
-                f"❌ {where} 跑挂（{'全部' if everything else '、'.join(parts)}）"
-                + (f"：{err}" if err else "")
-                + "。"
-            )
+            what = "全部跑挂" if everything else f"{'、'.join(parts)} 跑挂"
+            failed.append(f"❌ {who}：{what}" + (f"（{err}）" if err else "") + "。")
             continue
         said = False
         down = [c for c in r.perf if perf_flag(c.delta) in ("⚠️", "🔴")]
         if down:
             icon = "🔴" if any(perf_flag(c.delta) == "🔴" for c in down) else "⚠️"
             (severe if icon == "🔴" else warn).append(
-                f"{icon} {where} 每卡吞吐回退：{_changes(down, lambda c: c.delta)}。"
+                f"{icon} {who}：{_phrase(down, top, lambda c: c.delta, '回退')}。"
             )
             said = True
         flag = acc_flag(r.acc.delta)
         if flag:
             (severe if flag == "🔴" else warn).append(
-                f"{flag} {where} GSM8K 回退：{score(r.acc.prev)} → {score(r.acc.value)}（{pts(r.acc.delta)}）。"
+                f"{flag} {who}：GSM8K 掉了 {abs(r.acc.delta) * 100:.1f} 个点，现在 {score(r.acc.value)}。"
             )
             said = True
         slide = [
@@ -142,33 +162,26 @@ def highlights(results, pending=()):
         ]
         if slide:
             drift.append(
-                "⚠️ {} 每卡吞吐比历史最佳低：{}。".format(
-                    where,
-                    "、".join(
-                        f"c{c.concurrency} {pct(c.delta_best)}（最佳 {num(c.best)}，本次 {num(c.value)}）"
-                        for c in slide
-                    ),
-                )
+                f"⚠️ {who}：{_phrase(slide, top, lambda c: c.delta_best, '比历史最佳低')}（累计小幅下降）。"
             )
             said = True
         up = [c for c in r.perf if perf_flag(c.delta) == "🟢"]
         if up:
-            gain.append(f"🟢 {where} 每卡吞吐提升：{_changes(up, lambda c: c.delta)}。")
+            gain.append(f"🟢 {who}：{_phrase(up, top, lambda c: c.delta, '提升')}。")
             said = True
         if any(c.prev_failed for c in r.perf) or r.acc.prev_failed:
-            recovered.append(f"✅ {where} 上次跑挂，这次恢复。")
+            recovered.append(f"✅ {who}：上次跑挂，这次恢复。")
             said = True
         if all(c.prev is None for c in r.perf) and r.acc.prev is None:
-            new.append(where)
+            new.append(who)
             said = True
         quiet += not said
     lines = failed + severe + warn + drift + gain + recovered
     if new:
         lines.append(f"🆕 首次有数据：{'、'.join(new)}。")
     if quiet:
-        lead = "全部" if quiet == len(results) else "其余"
         lines.append(
-            f"{lead} {quiet} 个模型持平：每卡吞吐变化在 ±3% 以内，GSM8K 变化在 0.04 以内。"
+            f"{'全部' if quiet == len(results) else '其余'} {quiet} 个模型持平。"
         )
     lines += [f"{label} 待测（周中）。" for label in pending]
     return lines
@@ -177,15 +190,42 @@ def highlights(results, pending=()):
 # ------------------------------------------------------------------ tables
 
 
+def summary_row(r):
+    """模型、场景、上次性能、本次性能、变化、精度变化. 性能 is the c64 tok/s
+    per GPU; N/A means the run failed."""
+    c, a = headline(r), r.acc
+    prev = num(c.prev) if c.prev is not None else "—"
+    if c.status == "fail":
+        now, change = "N/A", "N/A"
+    elif c.value is None:
+        now, change = "—", "—"
+    else:
+        now = num(c.value)
+        change = (
+            "首次"
+            if c.delta is None
+            else f"{perf_flag(c.delta)} {pct(c.delta)}".strip()
+        )
+    if a.status == "fail":
+        acc = "N/A"
+    elif a.value is None:
+        acc = "—"
+    elif a.delta is None:
+        acc = f"首次（当前 {score(a.value)}）"
+    else:
+        acc = f"{acc_flag(a.delta)} {pts(a.delta)}（当前 {score(a.value)}）".strip()
+    return [r.name, LABEL[r.scenario], prev, now, change, acc]
+
+
 def _perf_value(c):
-    return {"ok": num(c.value) if c.value is not None else "—", "fail": "N/A ❌"}.get(
+    return {"ok": num(c.value) if c.value is not None else "—", "fail": "N/A"}.get(
         c.status, "—"
     )
 
 
 def _perf_delta(c, delta):
     if c.status == "fail":
-        return "❌"
+        return "N/A"
     if c.value is None:
         return "—"
     if delta is None:
@@ -196,7 +236,7 @@ def _perf_delta(c, delta):
 def _best_delta(c):
     """Against the best earlier image: flagged only below the slow-slide line."""
     if c.status == "fail":
-        return "❌"
+        return "N/A"
     if c.value is None:
         return "—"
     if c.delta_best is None:
@@ -208,14 +248,14 @@ def _best_delta(c):
 
 
 def _acc_value(a):
-    return {"ok": score(a.value) if a.value is not None else "—", "fail": "N/A ❌"}.get(
+    return {"ok": score(a.value) if a.value is not None else "—", "fail": "N/A"}.get(
         a.status, "—"
     )
 
 
 def _acc_delta(a):
     if a.status == "fail":
-        return "❌"
+        return "N/A"
     if a.value is None:
         return "—"
     if a.delta is None:
@@ -232,22 +272,21 @@ def _image_short(image):
 
 
 LEGEND = (
-    "N/A ❌ = 跑挂；首次 = 没有历史数据；— = 没有结果。vs 上次 = 和该模型最近一次成功的镜像比。"
+    "性能 = 并发 64 的每卡吞吐（tok/s/GPU），并发 4 和其他指标见详细报告。N/A = 跑挂，没有值；"
+    "— = 没有结果；首次 = 第一次有数据。变化和精度变化都和该模型最近一次成功的镜像比，"
     "⚠️/🔴/🟢 的阈值见 455-CI-guide.md §5.1。"
 )
 
 
-MOCK = ["> **模拟数据**：数字都是编的，只用来看报告的格式。", ""]
-
-
 def summary_md(date, env, results, pending, detail_name, mock=False):
     out = [
-        f"# 455-CI 报告 · {date}",
+        f"# 455-CI 报告 · {date}" + (" · 示例 EXAMPLE" if mock else ""),
         "",
-        *(MOCK if mock else []),
+        *(EXAMPLE if mock else []),
         (
-            f"镜像 `{_image_short(env.get('image'))}` · ATOM `main@{_sha(env, 'atom')}` · aiter `main@{_sha(env, 'aiter')}`"
-            f" · base `{_image_short(env.get('base_image'))}` · [详细报告]({detail_name})"
+            f"镜像 `{_image_short(env.get('image'))}` · ATOM `main@{_sha(env, 'atom')}`"
+            f" · aiter `main@{_sha(env, 'aiter')}` · base `{_image_short(env.get('base_image'))}`"
+            f" · [详细报告]({detail_name})"
         ),
         "",
         "## Highlights",
@@ -256,21 +295,11 @@ def summary_md(date, env, results, pending, detail_name, mock=False):
         "",
         "## 总表",
         "",
-        "| 场景 | 模型 | 每卡吞吐 tok/s/GPU（c4 / c64） | vs 上次（c4 / c64） | GSM8K | vs 上次 |",
+        "| 模型 | 场景 | 上次性能 tok/s/GPU | 本次性能 tok/s/GPU | 变化 | 精度变化（GSM8K） |",
         "|---|---|---|---|---|---|",
     ]
-    for r in results:
-        out.append(
-            "| {} | {} | {} | {} | {} | {} |".format(
-                LABEL[r.scenario],
-                r.name,
-                " / ".join(_perf_value(c) for c in r.perf),
-                " / ".join(_perf_delta(c, c.delta) for c in r.perf),
-                _acc_value(r.acc),
-                _acc_delta(r.acc),
-            )
-        )
-    out += [f"| {label} | 待测（周中） | | | | |" for label in pending]
+    out += ["| " + " | ".join(summary_row(r)) + " |" for r in results]
+    out += [f"| 待测（周中） | {label} | | | | |" for label in pending]
     out += ["", LEGEND, ""]
     return "\n".join(out)
 
@@ -303,8 +332,8 @@ def _env_rows(env):
 
 
 SECOND_HEADER = {
-    "endpoint": ("E2E avg interactivity tok/s/user", "vs 上次"),
-    "8k1k": ("ITL P50 ms（越低越好）", "vs 上次"),
+    "endpoint": "E2E avg interactivity tok/s/user",
+    "8k1k": "ITL P50 ms（越低越好）",
 }
 
 
@@ -313,9 +342,9 @@ def detail_md(
 ):
     """`charts_dir` and `runs_dir` are relative to the report's directory."""
     out = [
-        f"# 455-CI 详细报告 · {date}",
+        f"# 455-CI 详细报告 · {date}" + (" · 示例 EXAMPLE" if mock else ""),
         "",
-        *(MOCK if mock else []),
+        *(EXAMPLE if mock else []),
         f"[← 报告]({summary_name})",
         "",
         "## 测试环境",
@@ -329,11 +358,10 @@ def detail_md(
             out.append("待测（周中）。")
             continue
         mine = [r for r in results if r.scenario == scenario]
-        second, second_vs = SECOND_HEADER[scenario]
         out += [
             "### 性能",
             "",
-            f"| 模型 | GPU | 并发 | 每卡吞吐 tok/s/GPU | vs 上次 | vs 历史最佳 | {second} | {second_vs} |",
+            f"| 模型 | GPU | 并发 | 每卡吞吐 tok/s/GPU | vs 上次 | vs 历史最佳 | {SECOND_HEADER[scenario]} | vs 上次 |",
             "|---|---|---|---|---|---|---|---|",
         ]
         for r in mine:
@@ -341,7 +369,7 @@ def detail_md(
                 sv = (
                     num(c.second)
                     if c.second is not None
-                    else ("N/A ❌" if c.status == "fail" else "—")
+                    else ("N/A" if c.status == "fail" else "—")
                 )
                 sd = (
                     pct(c.delta_second)
@@ -383,9 +411,9 @@ def detail_md(
             [r.acc.error] if r.acc.error else []
         )
         out += [
-            f"### {_where(r)}：{'、'.join(_failed_parts(r))}",
+            f"### {r.name}（{LABEL[r.scenario]}）：{'、'.join(_failed_parts(r))}",
             "",
-            f"- 报错：`{_short(errors[0]) if errors else '—'}`",
+            f"- 报错：`{_short(errors[0], 120) if errors else '—'}`",
             f"- 完整摘录：[error.log]({runs_dir}/{r.slug}/error.log)",
             "",
         ]

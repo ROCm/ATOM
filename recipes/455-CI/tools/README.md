@@ -28,11 +28,11 @@ python3 -m pytest -q                                # 改了脚本先跑测试
 
 ## 样例
 
-`examples/` 是一份模拟数据目录，结构和 `recipes/455-CI/` 一样，**数字都是编的**。模拟的是 11-14 这个镜像：DeepSeek-V4.1-Flash 提升 6%、GLM-5.2 c64 回退 4%、DeepSeek R1 每周掉 1.5% 累积成慢回退、Kimi-K3 上次跑挂这次恢复、Qwen-35B-A3B c64 跑挂、MiniMax-M3 的 GSM8K 掉了 4.7 个点。
+`examples/` 是 **EXAMPLE（示例）**：一份模拟数据目录，结构和 `recipes/455-CI/` 一样，数字都是编的，不是真实测试数据，报告和图上都标了 EXAMPLE。模拟的是 11-14 这个镜像：DeepSeek-V4.1-Flash 提升 6%、GLM-5.2 c64 回退 4%、DeepSeek R1 每周掉 1.5% 累积成慢回退、Kimi-K3 上次跑挂这次恢复、Qwen-35B-A3B c64 跑挂、MiniMax-M3 的 GSM8K 掉了 4.7 个点。
 
 - 报告：[`examples/reports/455-CI-report-20261114.md`](examples/reports/455-CI-report-20261114.md)
 - 详细报告：[`examples/reports/455-CI-report-20261114-detail.md`](examples/reports/455-CI-report-20261114-detail.md)
 
-![MLPerf Endpoint 每卡吞吐趋势（模拟数据）](examples/runs/20261114/charts/perf-endpoint.png)
+![MLPerf Endpoint 每卡吞吐趋势（EXAMPLE）](examples/runs/20261114/charts/perf-endpoint.png)
 
-![8K/1K GSM8K 趋势（模拟数据）](examples/runs/20261114/charts/accuracy-8k1k.png)
+![8K/1K GSM8K 趋势（EXAMPLE）](examples/runs/20261114/charts/accuracy-8k1k.png)
