@@ -352,10 +352,8 @@ def _payload_tensors(payload):
 def test_a_producer_skips_propose_only_when_nothing_rides_on_it(
     producer, duplicates_propose
 ):
-    """A producer's drafts are dropped. DSpark writes its context K/V apart
-    from propose, so a producer leaves propose out, PP or not, and on every DP
-    rank alike; EAGLE's first draft step writes the final chunk's K/V, so it
-    still runs."""
+    """DSpark writes its context K/V apart from propose, so a producer skips it
+    on every DP rank; EAGLE's first draft step writes it, so it still runs."""
     runner = object.__new__(mod.ModelRunner)
     runner.drafter = types.SimpleNamespace(
         draft_kv_duplicates_propose=duplicates_propose

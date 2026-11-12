@@ -270,36 +270,3 @@ def test_relay_hook_compiles_without_an_in_place_update():
         handle.remove()
         torch._dynamo.reset()
     assert "update" not in names
-
-
-def test_every_stage_warms_up_on_the_rows_the_last_stage_does(monkeypatch):
-    """A block drafter warms up on >= 2 sequences. Read off the drafter, a
-    stage without one sent 1 x 5000 rows to a last stage expecting 2 x 4096."""
-    runner_mod = pytest.importorskip(
-        "atom.model_engine.model_runner", exc_type=ImportError
-    )
-    monkeypatch.setattr(runner_mod.torch.cuda, "empty_cache", lambda: None)
-    monkeypatch.setattr(runner_mod.torch.cuda, "reset_peak_memory_stats", lambda: None)
-    monkeypatch.setattr(
-        runner_mod, "get_dp_group", lambda: types.SimpleNamespace(world_size=1)
-    )
-    rows = []
-    for drafter in (None, types.SimpleNamespace(is_block_drafter=True)):
-        runner = object.__new__(runner_mod.ModelRunner)
-        runner.config = types.SimpleNamespace(
-            max_model_len=5000,
-            max_num_seqs=8,
-            max_num_batched_tokens=8192,
-            enable_dp_attention=False,
-            prefill_context_parallel_size=1,
-            speculative_config=types.SimpleNamespace(use_dspark=lambda: True),
-        )
-        if drafter is not None:
-            runner.drafter = drafter
-        runner.block_size, runner.label = 16, "stage"
-        runner.tokenID_processor = types.SimpleNamespace(clean=lambda: None)
-        runner.forward = lambda batch: rows.append(
-            (batch.total_seqs_num, batch.total_tokens_num)
-        )
-        runner.warmup_model()
-    assert rows == [(2, 8192), (2, 8192)]

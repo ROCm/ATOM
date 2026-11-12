@@ -1017,9 +1017,8 @@ class ModelRunner:
             and drafter.captures_aux
             and drafter.aux_capture_spec(self.config) is None
         ):
-            # Its taps on earlier stages' layers never fire, and `PPAuxRelay`
-            # relays only a config-declared spec (DSpark's): the draft would
-            # read zeros and, on a P/D producer, write wrong context K/V.
+            # Taps on earlier stages never fire, and `PPAuxRelay` relays only a
+            # config-declared spec: a producer would write wrong context K/V.
             raise NotImplementedError(
                 "pipeline parallel + a drafter tapping target layers without a "
                 "config-only aux_capture_spec (EAGLE3): PPAuxRelay cannot relay it"
@@ -1462,9 +1461,8 @@ class ModelRunner:
         # torch.compile's mark_dynamic can't make a size-1 batch dim dynamic, so
         # a DSpark block drafter (rows == num_seqs) must first-compile at B >= 2
         # (EAGLE gets that free -- its first draft step is a many-row prefill).
-        # Other cases only need the usual >= 1 floor. Read off the config, not
-        # the drafter: under PP only the last stage builds one, and every stage
-        # must warm up on the same rows.
+        # Other cases only need the usual >= 1 floor. From the config: under PP
+        # only the last stage has a drafter, and every stage runs the same rows.
         spec_config = self.config.speculative_config
         min_seqs = 2 if spec_config and spec_config.use_dspark() else 1
         num_seqs = max(num_seqs, min_seqs)
@@ -4028,10 +4026,9 @@ class ModelRunner:
 
         Only under DP attention -- `_publish_draft_shape` returns early at
         `data_parallel_size <= 1`, where an output-less batch legitimately
-        drafts nothing. PP is excluded, and asked about directly:
-        `is_deferred_out` is also off on a P/D producer, a rank that keeps its
-        drafter loaded and still owes its peers the collectives propose()
-        carries.
+        drafts nothing. PP is excluded, and asked about directly. A producer
+        that keeps propose (EAGLE) still owes its peers its collectives; one
+        that skips it skips it on every rank.
         """
         return (
             hasattr(self, "drafter")
@@ -4041,14 +4038,8 @@ class ModelRunner:
         )
 
     def _producer_skips_propose(self) -> bool:
-        """Does this P/D producer leave propose() out entirely?
-
-        A producer's drafts are dropped (the scheduler gives it `mtp_k` 0). A
-        drafter whose context K/V `compute_draft_kv` writes apart from propose
-        (DSpark) has nothing left to do there, on every rank and every step
-        alike, so its DP peers skip it too. EAGLE leaves a final chunk's
-        context K/V to propose's first step, so it still runs.
-        """
+        """A producer's drafts are dropped (`mtp_k` 0); it skips propose when its
+        drafter writes context K/V apart from it (DSpark, not EAGLE)."""
         return (
             self.tokenID_processor.is_pd_producer
             and not self.drafter.draft_kv_duplicates_propose

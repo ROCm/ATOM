@@ -35,9 +35,8 @@ page-16 table ``prepare_paged_block`` builds outside the graph; the block's own 
 are written into the cache first, except at positions past the request's
 allocated pages. No host sync and fixed shapes, so the block pass is CUDA-graph
 captured like the other drafts. The per-row decode takes one KV head per rank,
-so the draft needs TP >= its KV head count (4) to draft; a P/D producer
-never proposes and only writes context K/V, so it may hold several (all four
-on a TP1 PP stage).
+so the draft needs TP >= its KV head count (4) to draft; a P/D producer only
+writes context K/V, so it may hold several (all four on a TP1 PP stage).
 
 Checkpoint layout (``<draft>/dspark``, MXFP8 [1, 32] linears, BF16 rest):
   language_model.model.dspark.fc.weight                       [6144, 5 * 6144]
@@ -532,10 +531,8 @@ class MiniMaxM3DSpark(DSparkDraftModel):
                 f"{target_vocab}. The draft shares the target's embedding and LM "
                 "head, so the two must agree."
             )
-        # On a later PP stage the embedding is a placeholder. That stage never
-        # drafts: MiniMax-M3 declares no `pp_speculative_methods`, so under PP
-        # it speculates only as a P/D producer (`Config._check_pp_support`),
-        # which skips propose. None says so plainly.
+        # A later PP stage holds a placeholder; it only runs as a P/D
+        # producer, which never drafts.
         embed = target_base.model.embed_tokens
         self.embed_tokens = None if isinstance(embed, PPMissingLayer) else embed
         self.lm_head = target_base.lm_head
