@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 """Kimi-K3 latent MoE on simulated TP8 ranks: above the dual-stream threshold
-the routed norm, up-projection and routed + shared add run on each rank's
-rows, and the block's pair still sums to the replicated `split_moe_forward`."""
+and the row floor the routed norm, up-projection and routed + shared add run
+on each rank's rows, and the block's pair still sums to the replicated
+`split_moe_forward`."""
 
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -107,6 +108,12 @@ def stub_block_parts(monkeypatch):
     monkeypatch.setattr(kimi, "get_current_atom_config", lambda: config)
     monkeypatch.setattr(module_dispatch_ops, "get_current_atom_config", lambda: config)
     return config
+
+
+@pytest.fixture(autouse=True)
+def no_row_floor(monkeypatch):
+    """Every row count may take the tail; `test_row_floor` sets its own floor."""
+    monkeypatch.setenv("ATOM_KIMI_K3_MOE_ROW_SHARD_MIN_TOKENS", "0")
 
 
 def _weights():
@@ -232,6 +239,27 @@ def test_forward_with_tbo_enabled_keeps_the_base_pair(
     ):
         assert up_rows == [tokens, tokens]
         assert torch.equal(routed_out, routed) and torch.equal(shared_out, shared)
+
+
+@pytest.mark.parametrize(
+    "floor,sharded",
+    [(None, False), ("14", False), ("13", True)],
+    ids=["default-floor", "below-floor", "at-floor"],
+)
+def test_row_floor(ranks, monkeypatch, split_op_on_cpu, floor, sharded):
+    """At threshold 0 an eager step below the row floor keeps the base pair."""
+    monkeypatch.setenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "0")
+    if floor is None:
+        monkeypatch.delenv("ATOM_KIMI_K3_MOE_ROW_SHARD_MIN_TOKENS")
+    else:
+        monkeypatch.setenv("ATOM_KIMI_K3_MOE_ROW_SHARD_MIN_TOKENS", floor)
+    tokens = 13
+    for (routed, shared), (first, second), up_rows in _base_and_op_target(
+        ranks, tokens, lambda block, x: block.forward(x)
+    ):
+        assert up_rows == [tokens, -(-tokens // WORLD) if sharded else tokens]
+        if not sharded:
+            assert torch.equal(first, routed) and torch.equal(second, shared)
 
 
 @pytest.mark.parametrize(

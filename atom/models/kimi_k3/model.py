@@ -591,14 +591,16 @@ class KimiSparseMoeBlock(nn.Module):
         deferral would silently stop above the threshold, where the [T, H] add
         it saves is largest.
 
-        Above the threshold with TP, outside graph capture and TBO, the latent
-        tail runs on this rank's rows instead (`_row_sharded_split_moe_forward`).
+        Above the threshold and from `ATOM_KIMI_K3_MOE_ROW_SHARD_MIN_TOKENS`
+        rows with TP, outside graph capture and TBO, the latent tail runs on
+        this rank's rows instead (`_row_sharded_split_moe_forward`).
         """
         from atom.utils.tbo.ubatching import tbo_active
 
         if (
             self.tp_size > 1
             and hidden_states.shape[0] > envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD
+            and hidden_states.shape[0] >= envs.ATOM_KIMI_K3_MOE_ROW_SHARD_MIN_TOKENS
             and not torch.cuda.is_current_stream_capturing()
             and not tbo_active()
         ):
