@@ -21,6 +21,7 @@ the methods listed in each op's docstring.
 Currently registered:
   - torch.ops.aiter.maybe_dual_stream_forward  — V2/V3.2/V4 MoE (summed)
   - torch.ops.aiter.maybe_dual_stream_split_forward — K3 MoE (routed/shared unsummed)
+  - torch.ops.aiter.kimi_k3_post_attention_forward — K3 MoE layer after its attention
   - torch.ops.aiter.indexer_score_topk         — V4 sparse indexer
 """
 
@@ -145,6 +146,55 @@ direct_register_custom_op(
     op_func=maybe_dual_stream_split_forward,
     mutates_args=(),
     fake_impl=_maybe_dual_stream_split_forward_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
+# ---------------------------------------------------------------------------
+# K3 MoE layer after its attention: o_proj's reduce, mlp_attn_res and the MoE
+# ---------------------------------------------------------------------------
+#
+# Caller contract (the decoder layer looked up by `layer_name`):
+#   - `post_attention_forward(attn_partial, prefix_sum, block_residual)
+#      -> (prefix_sum, routed, shared)`, three `[T, H]` tensors
+#
+# One op, so that whether a step reduces o_proj's partial sum by all-reduce or
+# runs the attention residual on this rank's rows (reduce-scatter, then an
+# all-gather of the MoE input) is decided at run time by T: no traced tensor
+# changes shape between the two. On the row-sharded path the residual comes
+# back whole as `prefix_sum`, and `routed` / `shared` are zeros.
+
+
+def kimi_k3_post_attention_forward(
+    attn_partial: torch.Tensor,
+    prefix_sum: torch.Tensor | None,
+    block_residual: torch.Tensor | None,
+    layer_name: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    self = get_current_atom_config().compilation_config.static_forward_context[
+        layer_name
+    ]
+    return self.post_attention_forward(attn_partial, prefix_sum, block_residual)
+
+
+def _kimi_k3_post_attention_forward_fake(
+    attn_partial: torch.Tensor,
+    prefix_sum: torch.Tensor | None,
+    block_residual: torch.Tensor | None,
+    layer_name: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return (
+        torch.empty_like(attn_partial),
+        torch.empty_like(attn_partial),
+        torch.empty_like(attn_partial),
+    )
+
+
+direct_register_custom_op(
+    op_name="kimi_k3_post_attention_forward",
+    op_func=kimi_k3_post_attention_forward,
+    mutates_args=(),
+    fake_impl=_kimi_k3_post_attention_forward_fake,
     tags=(torch.Tag.needs_fixed_stride_order,),
 )
 
