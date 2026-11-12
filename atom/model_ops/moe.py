@@ -20,6 +20,7 @@ from aiter.ops.shuffle import (
     moe_shuffle_scale,
     moe_shuffle_weight,
 )
+from aiter.ops.topk import _FLYDSL_HERD_MAX_M, _FLYDSL_HERD_MIN_M, _FLYDSL_USE_HERD
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -118,12 +119,6 @@ from atom.utils.tbo.ubatching import (
     tbo_switch_to_compute_sync,
     tbo_yield_and_switch_from_compute_to_comm,
 )
-
-try:
-    from aiter.ops.topk import _FLYDSL_HERD_MAX_M, _FLYDSL_HERD_MIN_M, _FLYDSL_USE_HERD
-except ImportError:  # aiter older than v0.1.26
-    _FLYDSL_USE_HERD = False
-    _FLYDSL_HERD_MIN_M = _FLYDSL_HERD_MAX_M = 0
 
 logger = logging.getLogger("atom")
 
@@ -1465,15 +1460,16 @@ def _aiter_serves_flydsl_herd() -> bool:
     """Whether aiter's fused_moe(herd_topk) serves DeepSeek-V4 and Kimi-K3:
     aiter v0.1.29 (ROCm/aiter#7494) or later. Older ones abort the process on
     Kimi-K3's Top-17 candidates with an FP32 correction bias."""
-    try:
-        from aiter.ops.flydsl.herd_topk import herd_route_psum  # noqa: F401
-    except ImportError:
-        logger.warning(
-            "AITER_FLYDSL_USE_HERD=1 needs aiter v0.1.29 (ROCm/aiter#7494) or "
-            "later; HERD stays off"
-        )
-        return False
-    return True
+    # In aiter since the HERD constants above (v0.1.26, ROCm/aiter#5693).
+    from aiter.ops.flydsl import herd_topk
+
+    if hasattr(herd_topk, "herd_route_psum"):
+        return True
+    logger.warning(
+        "AITER_FLYDSL_USE_HERD=1 needs aiter v0.1.29 (ROCm/aiter#7494) or "
+        "later; HERD stays off"
+    )
+    return False
 
 
 def _herd_sees_own_rows(parallel_config: FusedMoEParallelConfig) -> bool:
@@ -2343,12 +2339,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 )
             return _moe_result
 
-        # Top-(K+1) HERD candidates; a fused shared column also widens by one.
+        # The step select_experts routed Top-(K+1) HERD candidates for: the same
+        # decision over the same rows (it reads their count; HERD never runs on
+        # gathered rows), not a guess from the ids' width.
         herd_topk = (
             layer.top_k
-            if self.use_flydsl_herd
-            and layer.num_fused_shared_experts == 0
-            and topk_ids.shape[1] == layer.top_k + 1
+            if self.use_flydsl_herd and self._flydsl_herd_step(layer, x)
             else 0
         )
         a1_scale = getattr(layer, "w13_input_scale", None)

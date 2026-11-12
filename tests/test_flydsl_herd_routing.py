@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 
 import inspect
-import sys
 from types import SimpleNamespace
 
 import pytest
@@ -142,17 +141,22 @@ def test_herd_declines_gathered_rows(
 
 
 def test_herd_stays_off_without_aiters_herd_route(monkeypatch):
+    from aiter.ops.flydsl import herd_topk
+
     moe_mod._aiter_serves_flydsl_herd.cache_clear()
-    # A None entry makes the import raise ImportError.
-    monkeypatch.setitem(sys.modules, "aiter.ops.flydsl.herd_topk", None)
+    # An aiter older than v0.1.29 has the module but not herd_route_psum.
+    monkeypatch.delattr(herd_topk, "herd_route_psum", raising=False)
     try:
         assert moe_mod._aiter_serves_flydsl_herd() is False
     finally:
         moe_mod._aiter_serves_flydsl_herd.cache_clear()
 
 
+@pytest.mark.parametrize("herd", [True, False])
 @pytest.mark.parametrize("profile", list(HERD_PROFILES))
-def test_herd_applies_the_scale_and_the_pass_row_count(monkeypatch, profile):
+def test_herd_applies_the_scale_and_the_pass_row_count(
+    monkeypatch, decode_step, profile, herd
+):
     calls = []
 
     def fake_fused_moe(*args, **kwargs):
@@ -181,11 +185,13 @@ def test_herd_applies_the_scale_and_the_pass_row_count(monkeypatch, profile):
         swiglu_limit=0.0,
     )
 
+    # 8 rows sit below aiter's HERD window: a plain step.
+    rows = 64 if herd else 8
     method.apply(
         layer=layer,
-        x="x",
+        x=torch.empty(rows, 8),
         topk_weights="topk_weights",
-        topk_ids=torch.empty(4, layer.top_k + 1, dtype=torch.int32),
+        topk_ids=torch.empty(rows, layer.top_k + 1, dtype=torch.int32),
         global_num_experts=128,
         expert_map=None,
         activation="silu",
@@ -194,7 +200,11 @@ def test_herd_applies_the_scale_and_the_pass_row_count(monkeypatch, profile):
     )
 
     kwargs = calls.pop()
-    assert kwargs["herd_topk"] == layer.top_k
-    assert kwargs["herd_routed_scaling_factor"] == layer.routed_scaling_factor
     # The drop leaves the pad rows out by the count the candidates were cut at.
     assert kwargs["num_local_tokens"] == "count"
+    if not herd:
+        # K+1 ids per row on a plain step: apply reads no HERD from the width.
+        assert "herd_topk" not in kwargs
+        return
+    assert kwargs["herd_topk"] == layer.top_k
+    assert kwargs["herd_routed_scaling_factor"] == layer.routed_scaling_factor
