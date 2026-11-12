@@ -38,7 +38,7 @@ class _Launcher:
 
 
 def test_width_build_enumerates_each_local_launcher_once_and_compile_only():
-    launchers = [_Launcher() for _ in range(5)]
+    launchers = [_Launcher() for _ in range(6)]
     k1 = SimpleNamespace(
         entrypoint=SimpleNamespace(
             launcher=launchers[0],
@@ -54,6 +54,7 @@ def test_width_build_enumerates_each_local_launcher_once_and_compile_only():
     build = Gfx1250WidthBuild(
         k1={1: k1, 2: k1},
         k2={1: k2, 2: k2},
+        oproj=SimpleNamespace(launcher=launchers[5], abi=KernelAbi(("core",))),
     )
 
     kernels = build.kernels()
@@ -90,12 +91,14 @@ def test_width_build_replaces_only_spilled_k1_with_lean_gemv():
         spec=spec,
         plan=plan,
     )
-    built = Gfx1250WidthBuild({1: old, 2: other}, {})
+    oproj = object()
+    built = Gfx1250WidthBuild({1: old, 2: other}, {}, oproj)
 
     lean = _lean_width(built, [spilled])
     assert lean is not None
     assert lean.k1 == {1: rebuilt, 2: other}
     assert lean.k2 == {}
+    assert lean.oproj is oproj
     assert len(observed) == 1 and observed[0].gemv_unit == 1
     assert _lean_width(built, [object()]) is None
 
@@ -200,7 +203,9 @@ def test_k1_reads_the_production_seam_and_hands_its_core_to_k2(layer_id):
     runner._write_aux = lambda *_args: None
     plan = SimpleNamespace(layer_id=layer_id, mono=True, kda=object())
 
-    out = runner._layer(None, plan, None, prefix, blocks, add, None, None)
+    out = runner._layer(
+        SimpleNamespace(oproj=None), plan, None, prefix, blocks, add, None, None
+    )
 
     before, write_idx = layer_block(layer_id)
     normed, delta = calls["k1"]
@@ -214,6 +219,79 @@ def test_k1_reads_the_production_seam_and_hands_its_core_to_k2(layer_id):
     if write_idx >= 0:
         torch.testing.assert_close(blocks[:, write_idx], prefix + add)
     assert all(tensor is None or tensor.shape == prefix.shape for tensor in out)
+
+
+def test_k1_core_goes_through_the_kernel_o_proj_all_reduce_when_built():
+    rows, hidden = 2, 4
+    prefix = torch.zeros(rows, hidden)
+    blocks = torch.zeros(rows, 1, hidden)
+    core = torch.full((rows, hidden), 2.0)
+    kernel = object()
+    calls = {}
+
+    class Seam:
+        out_quant_dtype = None
+        enabled = False
+
+        def __call__(self, value, visible, add_hidden, add_hidden2):
+            return value + add_hidden, value + add_hidden
+
+    def production_o_proj(_value):
+        raise AssertionError("o_proj ran on AITER's GEMM")
+
+    layer = SimpleNamespace(
+        self_attention_attn_res=Seam(),
+        self_attn=SimpleNamespace(o_proj=production_o_proj),
+    )
+    runner = object.__new__(K3Gfx1250MonoDecodeRunner)
+    runner.inner = SimpleNamespace(layers={5: layer})
+    runner.routed = {5: object()}
+    runner._k1 = lambda *_args: core
+    runner._oproj = lambda built, layer_id, value: (
+        calls.update(oproj=(built, layer_id, value)) or value + 3
+    )
+    runner._routed_k2 = lambda _build, _plan, attn, value, _blocks: (
+        calls.update(attn=attn) or value,
+        attn,
+    )
+    runner._write_aux = lambda *_args: None
+    plan = SimpleNamespace(layer_id=5, mono=True, kda=object())
+
+    runner._layer(
+        SimpleNamespace(oproj=kernel), plan, None, prefix, blocks, prefix, None, None
+    )
+
+    assert calls["oproj"][0] is kernel and calls["oproj"][1] == 5
+    assert calls["oproj"][2] is core
+    torch.testing.assert_close(calls["attn"], core + 3)
+
+
+def test_kernel_o_proj_all_reduce_launch_reads_the_layer_weights():
+    runner = object.__new__(K3Gfx1250MonoDecodeRunner)
+    weight, scale = torch.zeros(4), torch.zeros(2)
+    runner.oproj_weights = {9: (weight, scale)}
+    runner.oproj_peers = torch.zeros(8, dtype=torch.int64)
+    runner.k2_peers = SimpleNamespace(epochs=torch.zeros(4, dtype=torch.int32))
+    runner.rank = 3
+    core = torch.zeros(5, 6, dtype=torch.bfloat16)
+    calls = []
+
+    def launch(*args, stream):
+        calls.append(args)
+
+    out = runner._oproj(SimpleNamespace(launcher=launch), 9, core)
+
+    assert out.shape == (5, runner_module.HIDDEN) and out.dtype == core.dtype
+    (args,) = calls
+    assert args == (
+        core.data_ptr(),
+        weight.data_ptr(),
+        scale.data_ptr(),
+        out.data_ptr(),
+        runner.oproj_peers.data_ptr(),
+        runner.k2_peers.epochs.data_ptr(),
+        3,
+    )
 
 
 @pytest.mark.parametrize("candidates", (0, 3))
@@ -328,7 +406,7 @@ def test_dispatch_selects_gfx1250_runner(monkeypatch):
 @pytest.mark.parametrize("herd", (False, True))
 def test_grouped_k2_projects_locally_then_runs_grouped_moe(monkeypatch, herd):
     rows, layer_id = 2, 3
-    tensor = lambda *shape, dtype=torch.float32: torch.zeros(shape, dtype=dtype)  # noqa: E731
+    tensor = lambda *shape, dtype=torch.float32: torch.zeros(shape, dtype=dtype)
     weight = SimpleNamespace(
         write_idx=-1,
         blocks=2,
@@ -348,10 +426,23 @@ def test_grouped_k2_projects_locally_then_runs_grouped_moe(monkeypatch, herd):
         ln_eps=1e-6,
     )
     names = (
-        "router_logits", "latent_fp4", "latent_scales", "shared_gate_up",
-        "shared_hidden", "route", "tile_route", "flags", "experts", "kof",
-        "union_sizes", "intermediate_fp4", "intermediate_scales", "routed",
-        "shared", "finish_scratch", "final",
+        "router_logits",
+        "latent_fp4",
+        "latent_scales",
+        "shared_gate_up",
+        "shared_hidden",
+        "route",
+        "tile_route",
+        "flags",
+        "experts",
+        "kof",
+        "union_sizes",
+        "intermediate_fp4",
+        "intermediate_scales",
+        "routed",
+        "shared",
+        "finish_scratch",
+        "final",
     )
     buffers = {name: tensor(rows, 4, dtype=torch.uint8) for name in names}
     calls = {}
@@ -434,8 +525,18 @@ def test_replicated_finalize_all_reduces_both_partials_once(monkeypatch, kernel_
         **{
             name: torch.zeros(8, dtype=torch.uint8)
             for name in (
-                "w_gate", "w_ld", "w_sgu", "bias", "w_sd", "w13", "w13s", "w2",
-                "w2s", "ln_w", "w_up", "w_up_full",
+                "w_gate",
+                "w_ld",
+                "w_sgu",
+                "bias",
+                "w_sd",
+                "w13",
+                "w13s",
+                "w2",
+                "w2s",
+                "ln_w",
+                "w_up",
+                "w_up_full",
             )
         },
         ln_eps=1e-6,
@@ -446,10 +547,21 @@ def test_replicated_finalize_all_reduces_both_partials_once(monkeypatch, kernel_
     buffers = {
         name: torch.zeros(rows, 4, dtype=torch.uint8)
         for name in (
-            "router_logits", "latent_fp4", "latent_scales", "shared_gate_up",
-            "shared_hidden", "route", "tile_route", "flags", "experts", "kof",
-            "union_sizes", "intermediate_fp4", "intermediate_scales",
-            "finish_scratch", "final",
+            "router_logits",
+            "latent_fp4",
+            "latent_scales",
+            "shared_gate_up",
+            "shared_hidden",
+            "route",
+            "tile_route",
+            "flags",
+            "experts",
+            "kof",
+            "union_sizes",
+            "intermediate_fp4",
+            "intermediate_scales",
+            "finish_scratch",
+            "final",
         )
     }
     buffers["reduce"] = reduce
@@ -489,9 +601,7 @@ def test_replicated_finalize_all_reduces_both_partials_once(monkeypatch, kernel_
     runner.routed = {layer_id: weight}
     runner.inner = SimpleNamespace(layers={layer_id: layer})
     group = SimpleNamespace(
-        all_reduce=lambda value, ca_fp8_quant=False: calls["all_reduce"].append(
-            value
-        ),
+        all_reduce=lambda value, ca_fp8_quant=False: calls["all_reduce"].append(value),
     )
     monkeypatch.setattr(runner_module, "get_tp_group", lambda: group)
     monkeypatch.setattr(runner_module.torch.cuda, "current_stream", lambda: None)

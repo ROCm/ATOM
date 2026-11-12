@@ -64,6 +64,9 @@ from atom.models.kimi_k3.mono.kernels.stages.k2_allreduce_gfx1250 import (
     allreduce_peer_bytes,
     build_allreduce,
 )
+from atom.models.kimi_k3.mono.kernels.stages.k2_finalize_tdm_gfx1250 import (
+    build_replicated_finalize,
+)
 from atom.models.kimi_k3.mono.kernels.stages.k2_finish_persistent_gfx1250 import (
     build_packed_finish,
     herd_scratch_layout,
@@ -71,14 +74,15 @@ from atom.models.kimi_k3.mono.kernels.stages.k2_finish_persistent_gfx1250 import
 from atom.models.kimi_k3.mono.kernels.stages.k2_front_role_lds_gfx1250 import (
     build_role_lds_front,
 )
-from atom.models.kimi_k3.mono.kernels.stages.k2_finalize_tdm_gfx1250 import (
-    build_replicated_finalize,
-)
 from atom.models.kimi_k3.mono.kernels.stages.k2_front_tdm_gfx1250 import (
     build_replicated_front,
 )
 from atom.models.kimi_k3.mono.kernels.stages.k2_local_kernels_gfx1250 import (
     build_finalize_local,
+)
+from atom.models.kimi_k3.mono.kernels.stages.k2_oproj_ar_gfx1250 import (
+    build_oproj_allreduce,
+    oproj_peer_bytes,
 )
 from atom.models.kimi_k3.mono.kernels.token_tiling import GFX1250_MAX_TOKENS
 from atom.models.kimi_k3.mono.plan import _width, kda_metadata, width_key
@@ -88,7 +92,7 @@ from atom.models.kimi_k3.mono.runner import (
     state_slots,
 )
 from atom.models.kimi_k3.mono.symm_peers import SymmPeers, map_symm_peers
-from atom.models.kimi_k3.mono.weights import bind_external_moe
+from atom.models.kimi_k3.mono.weights import bind_external_moe, bind_fp8_o_proj
 from atom.mono.plan.architecture import GFX1250
 from atom.mono.runtime.abi import KernelAbi
 from atom.mono.runtime.compile import launcher_resources
@@ -148,6 +152,7 @@ def _lean_width(
     return Gfx1250WidthBuild(
         {layer: replacements.get(layer, runner) for layer, runner in built.k1.items()},
         built.k2,
+        built.oproj,
     )
 
 
@@ -214,6 +219,8 @@ class Gfx1250RoutedK2Build:
 class Gfx1250WidthBuild:
     k1: dict[int, Gfx1250K1LocalRunner]
     k2: dict[int, Gfx1250RoutedK2Build]
+    # o_proj and its all-reduce in one kernel, every KDA layer's
+    oproj: object | None = None
 
     def kernels(self) -> list[tuple[object, KernelAbi]]:
         """All local launchers, for compile-time scratch validation."""
@@ -228,6 +235,8 @@ class Gfx1250WidthBuild:
             )
             if k2.allreduce is not None:
                 pairs.append((k2.allreduce.launcher, k2.allreduce.abi))
+        if self.oproj is not None:
+            pairs.append((self.oproj.launcher, self.oproj.abi))
 
         unique = {}
         for launcher, abi in pairs:
@@ -242,19 +251,25 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
     bind_k2 = False
     fp8_in_proj = True
     k2_peers: SymmPeers | None = None
+    # the o_proj all-reduce's banks, past the K2 all-reduce's in ``k2_peers``
+    oproj_peers: torch.Tensor | None = None
+    oproj_weights: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None
 
     def __init__(self, model, drafter=None, metadata_builder=None) -> None:
         group = get_tp_group().cpu_group
         bind_agreed(lambda: self._bind(model, drafter, metadata_builder), group)
         # Every rank bound: the rendezvous is a collective they all reach.
         if envs.ATOM_KIMI_MONO_KERNEL_AR:
+            reduce_bytes = allreduce_peer_bytes(self.tp, self.max_rows)
             self.k2_peers = map_symm_peers(
-                allreduce_peer_bytes(self.tp, self.max_rows),
+                reduce_bytes + oproj_peer_bytes(self.tp, self.max_rows),
                 ALLREDUCE_COUNTERS,
                 group,
                 self.tp,
                 self.device,
             )
+            if self.k2_peers is not None and self.oproj_weights:
+                self.oproj_peers = self.k2_peers.peers + reduce_bytes
         self.widths = WidthBuilds(
             self._build_width,
             Gfx1250WidthBuild.kernels,
@@ -265,10 +280,12 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
         )
         self._served_widths: set[tuple[int, int]] = set()
         logger.info(
-            "Kimi-K3 gfx1250 packed mono runner bound (TP%d, %d CUs, K2 all-reduce %s)",
+            "Kimi-K3 gfx1250 packed mono runner bound (TP%d, %d CUs, K2 all-reduce %s, "
+            "o_proj all-reduce %s)",
             self.tp,
             self.blocks,
             "in kernel" if self.k2_peers is not None else "by aiter",
+            "in kernel" if self.oproj_peers is not None else "by aiter",
         )
 
     def _bind(self, model, drafter=None, metadata_builder=None) -> None:
@@ -300,6 +317,16 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             for plan in self.plans
             if plan.kda is not None
         }
+        try:
+            self.oproj_weights = {
+                layer_id: bind_fp8_o_proj(
+                    self.inner.layers[layer_id], layer_id, self.dims
+                )
+                for layer_id in self.routed
+            }
+        except MonoUnsupported:
+            # o_proj stays on AITER's GEMM and all-reduce
+            self.oproj_weights = None
 
     def _allocate(self) -> None:
         self.ones = torch.ones(self.max_rows, dtype=torch.int32, device=self.device)
@@ -350,7 +377,9 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                 local = k1_cache.get(cache_key)
                 if local is None:
                     local = (
-                        self._plan(rows, 1).make_k1_local_runner(spec).prepare(self.device)
+                        self._plan(rows, 1)
+                        .make_k1_local_runner(spec)
+                        .prepare(self.device)
                     )
                     k1_cache[cache_key] = local
                 k1_by_layer[layer.layer_id] = local
@@ -377,7 +406,12 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                     k2_cache[k2_key] = k2_local
                 k2_by_layer[layer.layer_id] = k2_local
 
-        return Gfx1250WidthBuild(k1_by_layer, k2_by_layer)
+        oproj = (
+            build_oproj_allreduce(self._plan(rows, 1), self.tp, self.dims.proj)
+            if self.oproj_peers is not None
+            else None
+        )
+        return Gfx1250WidthBuild(k1_by_layer, k2_by_layer, oproj)
 
     def _build_routed_k2(
         self,
@@ -400,7 +434,9 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
         # The production MoE's HERD window: Top-(K+1) candidates, one dropped
         # by batch popularity inside the grouped MoE.
         herd = (
-            grouped and _FLYDSL_USE_HERD and _FLYDSL_HERD_MIN_M <= rows <= _FLYDSL_HERD_MAX_M
+            grouped
+            and _FLYDSL_USE_HERD
+            and _FLYDSL_HERD_MIN_M <= rows <= _FLYDSL_HERD_MAX_M
         )
         width = TOPK + 1 if herd else TOPK
         front = (
@@ -432,9 +468,7 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             "shared_gate_up": empty((rows, 2 * self.dims.sh_inter), torch.bfloat16),
             "route": empty((rows, width if grouped else 2 * TOPK), torch.int32),
             "tile_route": (
-                empty((rows, width))
-                if grouped
-                else empty((tiles, 16, 32), torch.int32)
+                empty((rows, width)) if grouped else empty((tiles, 16, 32), torch.int32)
             ),
             "flags": empty((tiles, EXPERTS), torch.int32),
             "experts": empty((tiles, 256), torch.int32),
@@ -536,7 +570,9 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             if write_idx >= 0:
                 blocks[:, write_idx].copy_(prefix)
             core = self._k1(build, plan, normed, None, blocks, metadata)
-            if isinstance(core, tuple):
+            if build.oproj is not None:
+                attn_out = self._oproj(build.oproj, plan.layer_id, core)
+            elif isinstance(core, tuple):
                 core, core_scale = core
                 attn_out = layer.self_attn.o_proj(core, x_scale=core_scale)
             else:
@@ -559,6 +595,22 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             )
         self._write_aux(plan.layer_id, out)
         return out
+
+    def _oproj(self, kernel, layer_id, core):
+        """o_proj of the BF16 core rows and its all-reduce, in one kernel."""
+        weight, scale = self.oproj_weights[layer_id]
+        attn_out = core.new_empty(core.size(0), HIDDEN)
+        kernel.launcher(
+            core.data_ptr(),
+            weight.data_ptr(),
+            scale.data_ptr(),
+            attn_out.data_ptr(),
+            self.oproj_peers.data_ptr(),
+            self.k2_peers.epochs.data_ptr(),
+            self.rank,
+            stream=torch.cuda.current_stream(),
+        )
+        return attn_out
 
     def _routed_k2(self, build, plan, attn_out, prefix, blocks):
         weight = self.routed[plan.layer_id]
@@ -702,11 +754,15 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
         # RCCL's small float32 all-gather is much faster than its byte path on
         # gfx1250. All-gather only copies elements, so this view preserves every
         # heterogeneous payload bit exactly.
-        return get_tp_group().all_gather(
-            buffers["payload"].view(torch.float32),
-            dim=0,
-            use_custom=False,
-        ).view(torch.uint8)
+        return (
+            get_tp_group()
+            .all_gather(
+                buffers["payload"].view(torch.float32),
+                dim=0,
+                use_custom=False,
+            )
+            .view(torch.uint8)
+        )
 
     def _grouped_moe(self, weight, local, moe):
         """``fused_moe``'s HERD call into the grouped MoE, with the lite

@@ -602,6 +602,14 @@ def bind_external_moe(
     )
 
 
+def bind_fp8_o_proj(layer, layer_id: int, dims: Dims):
+    """A KDA layer's o_proj as gfx1250's in-kernel o_proj reads it:
+    ``(weight, scale)``, ``_block_fp8``'s per_1x128 FP8 layout."""
+    return _block_fp8(
+        layer.self_attn.o_proj, f"layer {layer_id} o_proj", (HIDDEN, dims.proj)
+    )
+
+
 def bind_moe(layer, layer_id: int, dims: Dims, rank: int) -> MoeLayer:
     """One layer's K2 tensors: o_proj and the latent MoE."""
     name = f"layer {layer_id}"
