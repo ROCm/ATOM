@@ -5,6 +5,29 @@ from dataclasses import dataclass
 import logging
 
 
+def _grammar_owns_request(request):
+    from atom.structured_output import is_structured
+    return is_structured(request)
+
+
+_REQUEST_OWNERS = {"grammar": _grammar_owns_request}
+
+
+def register_constraint_request_owner(backend, owns_request):
+    """Register a lightweight native-request resource predicate in each process."""
+    if not callable(owns_request):
+        raise TypeError("Constraint request ownership must be callable")
+    existing = _REQUEST_OWNERS.get(backend)
+    if existing is not None and existing is not owns_request:
+        raise ValueError(f"Duplicate constraint request owner: {backend}")
+    _REQUEST_OWNERS[backend] = owns_request
+
+
+def needs_constraint_release(request):
+    """Whether any adapter owns worker resources for this native request."""
+    return any(owns_request(request) for owns_request in _REQUEST_OWNERS.values())
+
+
 @dataclass(frozen=True)
 class ChannelRule:
     after: str

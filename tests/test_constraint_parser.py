@@ -270,3 +270,24 @@ def test_provider_failure_reports_preserve_previous_failures(monkeypatch, inplac
     assert step.invalid.tolist() == [True, True]
     assert step.target_invalid.tolist() == [True, True]
     assert step.failed(torch.tensor([[3, -1], [4, -1]])).tolist() == [True, True]
+
+
+def test_request_resource_ownership_survives_native_pickle(monkeypatch):
+    import pickle
+    from atom import constraint_parser as parser
+    from atom.model_engine.sequence import Sequence
+    from atom.sampling_params import SamplingParams
+
+    monkeypatch.setattr(parser, "_REQUEST_OWNERS", dict(parser._REQUEST_OWNERS))
+    parser.register_constraint_request_owner(
+        "third-resource", lambda seq: getattr(seq, "third_resource", False)
+    )
+    ordinary = Sequence([1, 2], 16, SamplingParams(), id=71)
+    structured = Sequence([1, 2], 16, SamplingParams(json_schema="{}"), id=72)
+    third = Sequence([1, 2], 16, SamplingParams(), id=73)
+    third.third_resource = True
+    restored = pickle.loads(pickle.dumps(third))
+    assert not parser.needs_constraint_release(ordinary)
+    assert parser.needs_constraint_release(structured)
+    assert parser.needs_constraint_release(restored)
+    assert restored.id == 73

@@ -46,6 +46,14 @@ Register adapters with `register_constraint_provider`. An adapter declares:
   one adapter to return a native carry tensor; all other adapters return None.
 - `release(runner, request_ids)`: release only owned request resources. Optional
   `errors(runner)` exposes backend request errors for output delivery.
+- Stateful adapters also declare a lightweight `owns_request(sequence)` predicate
+  over native request data. Runtime registration installs it in the request-owner
+  registry. Coordinator and engine processes must register the same predicate
+  with `register_constraint_request_owner` during adapter setup, without importing
+  execution backends. This makes terminal, abort and admission-failure cleanup
+  reach the worker release wrapper for every owned request. Ordinary requests
+  and stateless channels do not acquire an extra cleanup RPC. The built-in grammar
+  predicate retains the original Schema/tool-format ownership rules.
 
 The executor counts declared hard-mask participation per request. The channel
 FSM preserves a forbidden forced token when that same request has another hard

@@ -58,6 +58,7 @@ from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence
 from atom.observability import tracing
 from atom.structured_output import is_structured
+from atom.constraint_parser import needs_constraint_release
 from atom.utils import (
     envs,
     get_open_zmq_inproc_path,
@@ -1061,22 +1062,20 @@ class CoreManager:
 
     def add_request(self, seqs: list[Sequence]):
         structured = [seq for seq in seqs if is_structured(seq)]
-        if structured:
-            try:
+        try:
+            if structured:
                 if self.structured_request_prepare is None:
                     raise ValueError("Structured output requires engine admission")
                 self.structured_request_prepare(structured)
-                self._add_prepared_requests(seqs)
-            except BaseException:
-                self._release_structured_requests(structured)
-                raise
-        else:
             self._add_prepared_requests(seqs)
+        except BaseException:
+            self._release_structured_requests(seqs)
+            raise
 
     def _release_structured_requests(self, seqs):
         # The submitted/finished sequences own the cleanup information. There
         # is no cross-thread registry: workers tolerate repeated releases.
-        ids = [seq.id for seq in seqs if is_structured(seq)]
+        ids = [seq.id for seq in seqs if needs_constraint_release(seq)]
         if not ids:
             return
         try:

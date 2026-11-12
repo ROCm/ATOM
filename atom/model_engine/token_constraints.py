@@ -11,7 +11,7 @@ token copies. Neither backend is converted to a Python list of vocabulary IDs.
 
 import torch
 
-from atom.constraint_parser import ConstraintBinding
+from atom.constraint_parser import ConstraintBinding, register_constraint_request_owner
 
 from atom.model_ops.required_channel import (
     DeviceChannel,
@@ -35,6 +35,9 @@ def register_constraint_provider(provider):
         raise TypeError("Constraint adapters must declare hard_requests(binding, batch)")
     if not hasattr(provider, "mask_stage") or not hasattr(provider, "commit_order"):
         raise TypeError("Constraint adapters must declare mask_stage and commit_order")
+    owns_request = getattr(provider, "owns_request", None)
+    if owns_request is not None:
+        register_constraint_request_owner(provider.backend, owns_request)
     _PROVIDERS.append(provider)
     _PROVIDERS.sort(key=lambda adapter: adapter.mask_stage)
 
