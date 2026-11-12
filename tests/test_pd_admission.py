@@ -189,6 +189,32 @@ def test_prefix_hits_charge_only_receive_targets(
 
 
 @pytest.mark.parametrize("chunked", [False, True])
+def test_overlapping_receive_targets_charge_their_physical_union(
+    build, seq_factory, chunked
+):
+    sched, request = build(
+        chunked=chunked,
+        prefix=True,
+        options={"enabled": True, "max_pending_kv_bytes": 3072},
+    )
+    seed = seq_factory(list(range(8)))
+    bm = sched.block_manager
+    bm.allocate(seed, bm.can_allocate(seed))
+    bm.hash_blocks(seed, seed.num_tokens)
+    bm.deallocate(seed)
+    a, b = request(), request()
+    for seq in (a, b):
+        # No usable page geometry: a full transfer, hit block included.
+        seq.kv_transfer_params["block_size"] = 8
+    sched.extend([a, b])
+    batch, _ = sched.schedule()
+    # A holds {p, x}; B adds only y, so {p, x, y} fills the three-block W.
+    assert set(batch.connector_meta_output.reqs_to_recv) == {a.id, b.id}
+    assert a.block_table[0] == b.block_table[0]
+    assert sched.pd_admission.pending_bytes == 3072
+
+
+@pytest.mark.parametrize("chunked", [False, True])
 def test_cancel_keeps_credit_until_safe_terminal_and_ignores_duplicate(build, chunked):
     sched, request = build(chunked=chunked)
     a, b = request(), request()
