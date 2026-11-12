@@ -495,6 +495,18 @@ publishes; downstream stages bind nothing. Prefill/decode disaggregation runs
 separate engine processes, and only decode publishes; if other engines share
 the host, give each its own endpoints.
 
+Discovery: `GET /kv_event_sources`, also under `kv_event_sources` in
+`/server_info`, maps each DP rank the server runs to its publisher as vLLM
+reports it there (`enable_kv_cache_events`, `publisher`, the rank's `endpoint`
+and `replay_endpoint`, `topic`, `hwm`, and vLLM's `buffer_steps` and
+`max_queue_size`, which are ATOM's replay ring `replay_buffer_steps` and send
+queue `buffer_steps`), plus the stream's
+`encoding` and `schema_version`, an `incarnation` that changes whenever the
+engines restart, the `block_size` and `hash_algo` of the block hashes, and an
+`offload` report under a Mooncake Store or LMCache offload connector. It is
+`{}` with events off or the `null` publisher. Endpoints are reported as
+configured, so a consumer replaces a wildcard host with the server's address.
+
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | **ATOM_KV_EVENTS_ENABLE** | bool | 0 (false) | Set to `1` to publish KV cache events. |

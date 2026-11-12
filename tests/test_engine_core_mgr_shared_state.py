@@ -192,6 +192,14 @@ class OutputThreadStateTest(unittest.TestCase):
         for mgr in self.managers:
             self.assertIsNone(mgr._flush_stream_batch_fn)
 
+    def test_every_spawn_has_its_own_incarnation(self):
+        """`/kv_event_sources` reports it so a consumer can tell restarted
+        publishers from a gap in their stream; two spawns may never share one."""
+        first, second = (mgr.incarnation for mgr in self.managers)
+        self.assertRegex(first, r"\A[0-9a-f]{32}\Z")
+        self.assertRegex(second, r"\A[0-9a-f]{32}\Z")
+        self.assertNotEqual(first, second)
+
     def test_load_accounting_is_sized_for_the_engine_count(self):
         mgr = _bare_manager(CoreManager, local_engine_count=4)
         self.addCleanup(mgr.ctx.term)

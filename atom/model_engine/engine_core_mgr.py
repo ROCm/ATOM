@@ -259,6 +259,9 @@ class CoreManager:
         self.global_engine_count = (
             local_engine_count if global_engine_count is None else global_engine_count
         )
+        # One per spawn of the engines, which own the KV event publishers:
+        # `/kv_event_sources` reports it so a consumer can tell a restart.
+        self.incarnation = uuid.uuid4().hex
         self.ctx = zmq.Context(io_threads=2)
         self.outputs_queue = queue.Queue[list[Sequence]]()
         self.keep_finished_outputs = config.keep_finished_outputs or config.asyncio_mode
