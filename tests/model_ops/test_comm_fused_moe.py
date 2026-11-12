@@ -887,3 +887,120 @@ def test_fused_moe_combine_accepts_shared(monkeypatch, atom_modules):
         assert not layer.combine_accepts_shared(4), name
         setattr(layer, name, kept)
     assert layer.combine_accepts_shared(4)
+
+
+def _recording_fused_moe(monkeypatch, atom_modules, *, dp_world):
+    """A FusedMoE whose real forward_impl / forward_impl_graph / _run_experts
+    run; only the quant method (which records what reaches ``apply``) and the
+    process groups are stand-ins."""
+    moe = atom_modules.moe
+    layer = _new_fused_moe(atom_modules)
+    routed = torch.randn(4, 8)
+    method = SimpleNamespace(
+        routed_rows_wire=None,
+        select_experts=MagicMock(
+            return_value=(torch.rand(4, 2), torch.zeros(4, 2, dtype=torch.int32))
+        ),
+        place_experts=MagicMock(side_effect=lambda layer, w, ids, gathered: (w, ids)),
+        apply=MagicMock(return_value=routed),
+    )
+    values = {
+        "quant_method": method,
+        "_comm_fused_moe": None,
+        "sp_mega_moe": None,
+        "balance_router_logits": None,
+        "reduce_results": False,
+        # EP all2all: forward_impl_graph does no DP gather/scatter of its own.
+        "moe_parallel_config": SimpleNamespace(
+            dp_size=dp_world,
+            pcp_merge=False,
+            dp_logical_ratio=1,
+            use_all2all_kernels=True,
+        ),
+        "global_num_experts": 16,
+        "expert_map": None,
+        "activation": None,
+        "apply_router_weight_on_input": False,
+        "prefix": "experts",
+    }
+    for name, value in values.items():
+        setattr(layer, name, value)
+    layer.combine_accepts_shared = lambda rows: True
+    context = SimpleNamespace(
+        is_dummy_run=False, pcp_split=False, scheduled_tokens_gpu=None
+    )
+    monkeypatch.setattr(
+        moe, "get_forward_context", lambda: SimpleNamespace(context=context)
+    )
+    monkeypatch.setattr(moe, "pass_scheduled_tokens_gpu", lambda rows: None)
+    monkeypatch.setattr(
+        moe, "get_dp_group", lambda: SimpleNamespace(world_size=dp_world)
+    )
+    graph = MagicMock(wraps=layer.forward_impl_graph)
+    monkeypatch.setattr(layer, "forward_impl_graph", graph)
+    return layer, method, routed, graph
+
+
+@pytest.mark.parametrize("dp_world", [1, 2], ids=["forward_impl", "graph"])
+def test_shared_output_reaches_the_quant_method_through_forward_impl(
+    monkeypatch, atom_modules, dp_world
+):
+    """Every hop from forward_maybe_comm_fused to quant_method.apply carries
+    the shared output and its event: forward_impl -> _run_experts on one DP
+    rank, forward_impl -> forward_impl_graph -> _run_experts on several."""
+    layer, method, routed, graph = _recording_fused_moe(
+        monkeypatch, atom_modules, dp_world=dp_world
+    )
+    hidden_states = torch.randn(4, 8)
+    router_logits = torch.randn(4, 16)
+    shared = torch.randn_like(hidden_states)
+    ready = MagicMock(name="shared_ready")
+
+    output, is_complete = layer.forward_maybe_comm_fused(
+        hidden_states, router_logits, shared, shared_ready=ready
+    )
+
+    assert output is routed and is_complete is False
+    assert graph.call_count == (1 if dp_world > 1 else 0)
+    method.apply.assert_called_once()
+    applied = method.apply.call_args.kwargs
+    assert applied["shared_add"] is shared
+    assert applied["shared_ready"] is ready
+    assert applied["x"] is hidden_states
+
+
+def test_routed_forward_without_a_shared_output_passes_none_down(
+    monkeypatch, atom_modules
+):
+    """The ordinary forward_impl call does not hand the quant method a shared
+    output, so the methods that do not take one are called as before."""
+    layer, method, _, _ = _recording_fused_moe(monkeypatch, atom_modules, dp_world=1)
+
+    layer.forward_impl(torch.randn(4, 8), torch.randn(4, 16))
+
+    applied = method.apply.call_args.kwargs
+    assert "shared_add" not in applied and "shared_ready" not in applied
+
+
+@pytest.mark.parametrize(
+    ("use_triton", "fused_experts"),
+    [(False, None), (True, object())],
+    ids=["no-modular-kernel", "triton-experts"],
+)
+def test_mxfp4_apply_refuses_a_shared_output_without_a_combine(
+    atom_modules, use_triton, fused_experts
+):
+    method = object.__new__(atom_modules.moe.Mxfp4MoEMethod)
+    method.use_triton = use_triton
+    method.use_triton_decode = False
+    method.fused_experts = fused_experts
+    hidden_states = torch.randn(4, 8)
+    with pytest.raises(RuntimeError, match="without a combine"):
+        method.apply(
+            layer=SimpleNamespace(),
+            x=hidden_states,
+            topk_weights=torch.rand(4, 2),
+            topk_ids=torch.zeros(4, 2, dtype=torch.int32),
+            shared_add=torch.randn_like(hidden_states),
+            shared_ready=MagicMock(),
+        )
