@@ -341,3 +341,39 @@ def test_snapshot_copy_does_not_hold_publication_lock(monkeypatch, operation):
     if operation == "read":
         assert result == ({"revision": 1}, 0, exporter.read()[2])
     assert exporter.read()[1] == 1
+
+
+def test_prefix_index_counters_are_exported_only_with_the_prefix_router():
+    exporter = AtomMetricsExporter()
+    exporter.update({"enabled": True, "dp_router": {}})
+    assert not [n for n, _ in _samples(exporter.render()) if "dp_prefix_index" in n]
+    exporter.update(
+        {
+            "enabled": True,
+            "dp_router": {
+                "prefix_index": {
+                    "tail_trim_total": 3,
+                    "tail_trim_tokens_total": 384,
+                    "leaf_evict_total": 2,
+                    "leaf_evict_tokens_total": 1024,
+                    "over_budget_total": 7,
+                    "trim_blocked_total": 1,
+                    "indexed_tokens": 4096,
+                }
+            },
+        }
+    )
+    samples = _samples(exporter.render())
+    for event, value in (
+        ("tail_trim", 3),
+        ("leaf_evict", 2),
+        ("over_budget", 7),
+        ("blocked", 1),
+    ):
+        assert (
+            samples[("atom:dp_prefix_index_events_total", (("event", event),))] == value
+        )
+    for kind, value in (("tail_trim", 384), ("leaf_evict", 1024)):
+        key = ("atom:dp_prefix_index_evicted_tokens_total", (("kind", kind),))
+        assert samples[key] == value
+    assert samples[("atom:dp_prefix_index_tokens", ())] == 4096
