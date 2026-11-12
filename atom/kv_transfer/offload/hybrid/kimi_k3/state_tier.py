@@ -16,6 +16,8 @@ from concurrent.futures import ThreadPoolExecutor
 from time import monotonic
 from typing import Any
 
+from atom.kv_transfer.offload._offload_common import SaveLifecycle, wait_save_fence
+
 logger = logging.getLogger(__name__)
 
 #: A load waiting longer than this for its lane is worth a line: it is time
@@ -153,31 +155,24 @@ class StateOffloadTier:
         self._store_executor.shutdown(wait=True)
 
     def _do_store(self, op, unit_ids, ready_event) -> None:
+        # `release_source` fires from `codec.put` once `pack`'s gather+D2H
+        # drain, before `batched_put`: the GPU has stopped reading the units, so
+        # they go back now instead of staying out of the pool across the CPU
+        # put. Emitted once -- a second emission would double-unpin engine-side.
+        lifecycle = SaveLifecycle(
+            self._lock,
+            release_source=lambda: self._source_released.add(op),
+            report_terminal=lambda ok: self._settle_store_locked(op, ok),
+        )
         stored = False
-        released = False
-
-        def _source_released() -> None:
-            # Fires from `codec.put` once `pack`'s gather+D2H drain, before
-            # `batched_put`: the GPU has stopped reading the units, so hand them
-            # back now instead of holding a whole image out of the pool across
-            # the CPU put. Under `self._lock` (the engine thread drains the set);
-            # the flag makes the end-of-store backstop a no-op so the release is
-            # emitted once -- a second emission would double-unpin engine-side.
-            nonlocal released
-            with self._lock:
-                if released:
-                    return
-                released = True
-                self._source_released.add(op)
-
         try:
-            ready_event.synchronize()
+            wait_save_fence(ready_event)
             with self._staging_budget:
                 stored = bool(
                     self.codec.put(
                         int(op.prefix_hash),
                         unit_ids,
-                        on_source_released=_source_released,
+                        on_source_released=lifecycle.release_source,
                     )
                 )
         except Exception:  # deliberately blind
@@ -191,27 +186,24 @@ class StateOffloadTier:
                 op.generation,
                 exc_info=True,
             )
-        with self._lock:
-            # Backstop, not the primary path: on success the callback already
-            # published the release, so this must NOT re-add it (that second
-            # emission is the double-unpin). It fires only on paths the callback
-            # never reached -- a refused allocation never read the units, and a
-            # throwing `pack` drained the device first
-            # (`StagedTransfer._drain_device`) -- where withholding it would hold
-            # an image out of the pool until the stale reclaimer noticed.
-            self._store_submitted_at.pop(op, None)
-            if not released:
-                released = True
-                self._source_released.add(op)
-            # Report, never apply: `StateOffloadIndex` lives in the engine
-            # process; the engine applies these via KVConnectorOutput.
-            if stored:
-                self._indexed.add(op)
-            else:
-                # The failure channel lets the aggregator take quorum on
-                # `indexed | index_failed` rather than await a second report
-                # that will never come from this rank.
-                self._index_failed.add(op)
+        # The release here is a backstop for the paths the callback never
+        # reached -- a refused allocation never read the units, and a throwing
+        # `pack` drained the device first (`StagedTransfer._drain_device`) --
+        # where withholding it would hold an image out of the pool until the
+        # stale reclaimer noticed.
+        lifecycle.finish(stored)
+
+    def _settle_store_locked(self, op, stored: bool) -> None:
+        self._store_submitted_at.pop(op, None)
+        # Report, never apply: `StateOffloadIndex` lives in the engine process;
+        # the engine applies these via KVConnectorOutput.
+        if stored:
+            self._indexed.add(op)
+        else:
+            # The failure channel lets the aggregator take quorum on
+            # `indexed | index_failed` rather than await a second report that
+            # will never come from this rank.
+            self._index_failed.add(op)
 
     def take_store_reports(self) -> tuple[set, set]:
         """`(operations stored, operations failed)` since the last call.
