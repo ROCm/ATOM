@@ -246,6 +246,7 @@ def _packed_workspace(capacity):
     workspace = SimpleNamespace(
         packed=True, capacity=capacity, block_rows=PAGE,
         packed_logits=lambda: logits, packed_maxima=lambda: maxima,
+        packed_lane_max=lambda: None,
     )  # fmt: skip
     workspace.pack = lambda *rows: ScoreWorkspace.pack(workspace, *rows)
     return workspace
