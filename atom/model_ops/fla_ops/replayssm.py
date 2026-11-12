@@ -1902,10 +1902,9 @@ def replayssm_sigmoid_gating_delta_rule(
 # KDA decode / verify, fused from the in_proj output                           #
 # --------------------------------------------------------------------------- #
 #
-# On a decode or verify step Kimi-K3 runs `causal_conv1d_update`, the
-# `f_b_proj` GEMM and the kernel above back to back, each over a few dozen
-# rows. The kernel below does all three from the in_proj output's column
-# views. One program owns one head of one sequence: the head's q/k/v conv
+# The unfused KDA decode / verify chain is `causal_conv1d_update`, the
+# `f_b_proj` GEMM and the kernel above, each over a few dozen rows. The
+# kernel below does all three from the in_proj output's column views. One program owns one head of one sequence: the head's q/k/v conv
 # channels, its checkpoint and its records. The conv state may be updated in
 # place and a flush rewrites the records the replay reads, so every read of
 # either has to land before any write. Only a barrier inside one program can
@@ -2021,6 +2020,8 @@ def _replayssm_kda_fused_kernel(
     stride_conv_slot: tl.constexpr,
     stride_conv_dim: tl.constexpr,
     stride_conv_pos: tl.constexpr,
+    stride_conv_idx: tl.constexpr,
+    stride_conv_idx_in: tl.constexpr,
     stride_w_dim: tl.constexpr,
     stride_w_width: tl.constexpr,
     stride_ckpt_slot: tl.constexpr,
@@ -2046,10 +2047,10 @@ def _replayssm_kda_fused_kernel(
     if T == 0:
         return
     slot = tl.load(slot_idx + i_n).to(tl.int64)
-    coord_in = tl.load(conv_idx_in + i_n).to(tl.int64)
+    coord_in = tl.load(conv_idx_in + i_n * stride_conv_idx_in).to(tl.int64)
     if (slot < 0) | (coord_in < 0):
         return
-    coord_out = tl.load(conv_idx + i_n).to(tl.int64)
+    coord_out = tl.load(conv_idx + i_n * stride_conv_idx).to(tl.int64)
     if HAS_NUM_ACCEPTED:
         n_acc = tl.load(num_accepted + i_n).to(tl.int64)
     else:
@@ -2235,7 +2236,8 @@ def replayssm_kda_fused_update(
     (or ``[1, T, HV]``) may be column views of one wider tensor; each token's
     row only has to be dense. ``conv_state`` is ``causal_conv1d_update``'s
     logical ``[slot, 3*HV*K, state_len]`` view with a width-4 ``conv_weight``,
-    and ``f_b_weight`` is ``f_b_proj``'s ``[HV*K, F]`` weight.
+    and ``f_b_weight`` is ``f_b_proj``'s ``[HV*K, F]`` weight. The conv index
+    tensors may be columns of a slot table.
 
     ``num_accepted_tokens`` gives the verify window's conv rollback; without
     it every sequence resumes after one accepted token, which is a plain
@@ -2257,6 +2259,10 @@ def replayssm_kda_fused_update(
     assert mixed_qkv.stride(-1) == 1 and f_a.stride(-1) == 1 and b.stride(-1) == 1
     assert f_b_weight.is_contiguous() and ckpt.stride(-1) == 1
     assert ckpt.stride(-2) == K and ckpt.stride(1) == V * K
+    assert all(
+        t is None or t.is_contiguous()
+        for t in (slot_idx, cu_seqlens, num_accepted_tokens)
+    )
     seed_forked_slots(ckpt, fork_slots)
 
     if scale is None:
@@ -2309,6 +2315,8 @@ def replayssm_kda_fused_update(
         stride_conv_slot=conv_state.stride(0),
         stride_conv_dim=conv_state.stride(1),
         stride_conv_pos=conv_state.stride(2),
+        stride_conv_idx=conv_state_indices.stride(0),
+        stride_conv_idx_in=conv_state_indices_in.stride(0),
         stride_w_dim=conv_weight.stride(0),
         stride_w_width=conv_weight.stride(1),
         stride_ckpt_slot=ckpt.stride(0),

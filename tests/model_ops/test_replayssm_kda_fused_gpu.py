@@ -87,11 +87,20 @@ def step_args(lens, accepted, fork):
     def i32(x):
         return torch.tensor(x, device=DEV, dtype=torch.int32)
 
+    def conv_column(x):
+        """A verify step's conv indices: column 0 of its [n, T_MAX] slot table."""
+        if accepted is None:
+            return i32(x)
+        table = torch.arange(n * T_MAX, device=DEV, dtype=torch.int32) % CONV_SLOTS
+        table = table.view(n, T_MAX)
+        table[:, 0] = i32(x)
+        return table[:, 0]
+
     return {
         "cu": i32([0] + lens).cumsum(0).to(torch.int32),
         "slot_idx": i32(SLOT_IDX[:n]),
-        "conv_idx": i32(CONV_IDX[:n]),
-        "conv_in": i32(conv_in),
+        "conv_idx": conv_column(CONV_IDX[:n]),
+        "conv_in": conv_column(conv_in),
         "accepted": None if accepted is None else i32(accepted),
         "fork_slots": fork_slots,
     }
@@ -123,7 +132,7 @@ def views(fused):
 
 
 def run_unfused(inp, a):
-    """Kimi-K3's decode / verify branch as it stands: three ops and a copy."""
+    """The unfused decode / verify chain: three ops and a copy."""
     s = {name: t.clone() for name, t in inp["state"].items()}
     conv = s.pop("conv")
     mixed, f_a, beta = views(inp["fused"])
