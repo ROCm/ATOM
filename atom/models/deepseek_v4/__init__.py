@@ -613,7 +613,14 @@ def _wo_a_is_bf16_on_disk(model_path):
     return False
 
 
-def make_v4_quant_config(hf_config, model_path=None, online_quant_config=None):
+def make_v4_quant_config(
+    hf_config,
+    model_path=None,
+    online_quant_config=None,
+    *,
+    shared_expert_spec=None,
+    online_routed_experts=False,
+):
     """Build a QuantizationConfig that knows V4's per-layer quant scheme.
 
     Two V4 SKUs supported:
@@ -645,6 +652,11 @@ def make_v4_quant_config(hf_config, model_path=None, online_quant_config=None):
     preserved on BOTH the source lookup AND the online lookup — returning
     the same spec on the online path triggers the FusedMoE/Linear
     ``source == online_target`` early-return so those layers stay untouched.
+
+    ``shared_expert_spec`` pins the shared experts, on the source lookup and on
+    an online one that does not name them (by a layer pattern or a global
+    spec). With ``online_routed_experts`` an online layer pattern reaches the
+    routed experts, which otherwise keep their checkpoint spec on both lookups.
     """
 
     base = QuantizationConfig(hf_config, online_quant_config=online_quant_config)
@@ -680,6 +692,10 @@ def make_v4_quant_config(hf_config, model_path=None, online_quant_config=None):
         )
 
     orig_lookup = base.get_layer_quant_config
+    raw_online = base.online_quant_config_raw
+    online_global = isinstance(raw_online, dict) and bool(
+        raw_online.get("global_quant_config")
+    )
 
     def overridden(layer_name, use_online_quant=False, *, check_children=False):
         # Routed experts → SKU-detected (FP4 for V4-Pro, FP8-block for V4-Flash).
@@ -694,7 +710,23 @@ def make_v4_quant_config(hf_config, model_path=None, online_quant_config=None):
         # dequant→requant round-trip for these layers (which would either
         # crash on the moe assert or further damage already-quantized weights).
         if ".ffn.experts" in layer_name:
+            if (
+                online_routed_experts
+                and use_online_quant
+                and base.online_pattern_spec(layer_name) is not None
+            ):
+                return orig_lookup(
+                    layer_name, use_online_quant=True, check_children=check_children
+                )
             return routed_spec
+        if shared_expert_spec is not None and ".shared_experts" in layer_name:
+            if use_online_quant and (
+                online_global or base.online_pattern_spec(layer_name) is not None
+            ):
+                return orig_lookup(
+                    layer_name, use_online_quant=True, check_children=check_children
+                )
+            return shared_expert_spec
         # BF16 / fp32 raw paths
         if (
             ".compressor.wkv" in layer_name

@@ -40,7 +40,7 @@ from atom.utils import envs
 from .attention import Attention
 from .config import build_attention_topology
 from .layers import native_quant_config
-from .model import Block, DeepseekV41ForCausalLM, install_v41_quant_lookup
+from .model import Block, DeepseekV41ForCausalLM
 
 logger = logging.getLogger("atom")
 
@@ -170,12 +170,12 @@ class DeepseekV41DSpark(DSparkDraftModel):
         draft = copy(args)
         draft.n_routed_experts = args.dspark_n_routed_experts
         draft.num_experts_per_tok = args.dspark_num_experts_per_tok
-        # The backbone's lookup rules too: the shared-expert pin and an online
-        # pattern for the routed experts reach the draft's stages alike.
-        self.moe_quant_config = install_v41_quant_lookup(
-            make_v4_quant_config(
-                draft, online_quant_config=getattr(config, "online_quant_config", None)
-            )
+        # The backbone's rules (see DeepseekV41ForCausalLM) for the draft's stages.
+        self.moe_quant_config = make_v4_quant_config(
+            draft,
+            online_quant_config=getattr(config, "online_quant_config", None),
+            shared_expert_spec=native_quant_config().global_spec,
+            online_routed_experts=True,
         )
         topology = build_attention_topology(args)[args.num_hidden_layers :]
         # The backbone's, handed down: the two models never run at once, so a

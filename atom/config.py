@@ -464,15 +464,26 @@ class QuantizationConfig:
             return LayerQuantConfig(quant_dtype=self.torch_dtype)
 
         # 2. Pattern match
+        spec = self._pattern_spec(layer_name, layer_pattern_specs)
+        if spec is not None:
+            return spec
+
+        # 3. Global default
+        return global_spec
+
+    def online_pattern_spec(self, layer_name: str) -> LayerQuantConfig | None:
+        """The spec of the online layer pattern that matches *layer_name*, if any."""
+        return self._pattern_spec(layer_name, self.online_layer_pattern_specs)
+
+    @staticmethod
+    def _pattern_spec(layer_name, layer_pattern_specs):
         for pattern, spec in layer_pattern_specs:
             if "*" not in pattern:
                 if layer_name in pattern:
                     return spec
             elif fnmatch.fnmatch(layer_name, pattern):
                 return spec
-
-        # 3. Global default
-        return global_spec
+        return None
 
     # -- convenience properties (delegate to global_spec) ---------------------
 
