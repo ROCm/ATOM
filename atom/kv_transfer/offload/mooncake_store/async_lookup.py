@@ -23,8 +23,6 @@ logger = logging.getLogger("atom")
 # arrival-time lookups. The renewal is advisory (see `renew`); a Store RPC that
 # is slow must not stall the scheduler and, through the DP lockstep, its peers.
 RENEW_TIMEOUT_S = 1.0
-# The compatibility `lookup()` fallback also runs on the scheduler thread.
-FALLBACK_LOOKUP_TIMEOUT_S = 2.0
 
 
 class DaemonExecutor:
@@ -190,16 +188,16 @@ class AsyncStoreLookup:
         return getattr(self.backend, name)
 
     def lookup(self, seq, lookup_id=None):
-        # Compatibility fallback after the scheduler's defer window. Normal
-        # prefetch consumes with take_answer and never waits here.
+        # Admission still reaches this after its defer window. A pending Store
+        # query is a non-answer, not a reason to block the scheduler or a miss.
         sid = lookup_id or str(seq.id)
         self.submit(seq, sid)
         with self.lock:
             f = self.pending.get(sid)
-        if f is None:
+        if f is None or not f.done():
             return None
         try:
-            result = f.result(timeout=FALLBACK_LOOKUP_TIMEOUT_S)
+            result = f.result()
         except Exception:  # noqa: BLE001
             result = None
         with self.lock:
