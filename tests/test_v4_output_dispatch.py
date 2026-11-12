@@ -77,25 +77,6 @@ def test_opaque_kernel_receives_output(kind, supplied_output, compiled):
 
 
 @pytest.mark.parametrize("kind", ["2src", "decode"])
-@pytest.mark.parametrize("old_api", [False, True])
-def test_kernel_typeerror_propagates_without_retry(kind, old_api):
-    calls = []
-
-    def kernel(*args, **kwargs):
-        calls.append(kwargs)
-        if old_api:
-            raise TypeError("unexpected keyword argument 'out'")
-        raise TypeError("invalid packed tensor dtype")
-
-    run = _dispatch(kind, kernel)
-    q = torch.zeros(3, 2, 4)
-    out = torch.empty_like(q)
-    with pytest.raises(TypeError, match="out" if old_api else "packed tensor"):
-        run(*_args(kind, q), out=out)
-    assert len(calls) == 1 and calls[0]["out"] is out
-
-
-@pytest.mark.parametrize("kind", ["2src", "decode"])
 def test_strided_destination_is_rejected_before_launch(kind):
     def kernel(*args, **kwargs):
         pytest.fail("invalid output reached the kernel")

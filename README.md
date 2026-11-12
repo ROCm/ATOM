@@ -114,14 +114,12 @@ docker run -it --network=host \
 #### 2. Install AITER and ATOM inside the container
 
 ```bash
-pip install amd-aiter
+pip install 'amd-aiter>=0.1.28'
 git clone https://github.com/ROCm/ATOM.git && pip install ./ATOM
 ```
 
-DeepSeek V4 requires **AITER 0.1.28 or newer** for the sparse prefill/decode
-`out=` APIs. Install its dependencies with `pip install './ATOM[v4]'` (or
-`pip install -e '.[v4]'` from an existing checkout). Older AITER output APIs
-are not supported; ATOM passes the destination directly to the kernels.
+ATOM requires **AITER 0.1.28 or newer**, including the sparse prefill/decode
+`out=` APIs. This minimum is part of the base installation dependencies.
 
 ## 💡 Usage
 

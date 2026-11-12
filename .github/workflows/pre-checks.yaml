@@ -95,9 +95,23 @@ jobs:
       - name: Install dependencies
         run: |
           pip3 install torch --index-url https://download.pytorch.org/whl/cpu
+          # Install CPU test dependencies from the package metadata, excluding
+          # AITER's GPU runtime. Normal ATOM installs keep its required floor.
+          python3 - <<'PY'
+          import subprocess
+          import sys
+          import tomllib
+          from pathlib import Path
+
+          project = tomllib.loads(Path("pyproject.toml").read_text())["project"]
+          deps = [d for d in project["dependencies"] if not d.startswith("amd-aiter")]
+          for extra in ("tracing", "structured-output"):
+              deps.extend(project["optional-dependencies"][extra])
+          subprocess.check_call([sys.executable, "-m", "pip", "install", *deps])
+          PY
           # Isolate CPU test installation from unrelated repository tags (e.g.
           # lmcache-*). Release and GPU benchmark versions are resolved separately.
-          SETUPTOOLS_SCM_PRETEND_VERSION_FOR_ATOM=0.0.0+cpu.ci pip3 install -e '.[tracing,structured-output]'
+          SETUPTOOLS_SCM_PRETEND_VERSION_FOR_ATOM=0.0.0+cpu.ci pip3 install --no-deps -e .
           # requests is imported by tests/ only. datasets>=5.1 stopped pulling it
           # in, and one failed import at collection aborts the whole run.
           pip3 install pytest msgpack quart requests
