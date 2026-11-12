@@ -851,16 +851,14 @@ class EngineCore:
             self._ingested_seqs += len(recv_reqs)
         if credit_updates:
             self.scheduler.correct_prefix_estimates(credit_updates)
+            report = (self._ingested_seqs, prefill_backlog(self.scheduler))
             self.output_queue.put_nowait(
                 (
                     "PREFILL_BACKLOG",
-                    (
-                        self._ingested_seqs,
-                        prefill_backlog(self.scheduler),
-                        credit_updates,
-                    ),
+                    (*report, credit_updates),
                 )
             )
+            self._last_backlog_report = report
         return False
 
     # How often the backlog is recomputed. Walking `waiting` costs about 0.25 us

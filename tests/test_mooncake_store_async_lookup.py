@@ -185,6 +185,57 @@ def test_close_does_not_wait_for_a_hung_query():
     assert time.monotonic() - started < 2.0
 
 
+def test_batch_renewal_skips_a_stalled_backend_without_per_request_wait(monkeypatch):
+    from atom.kv_transfer.offload.mooncake_store import async_lookup
+
+    entered, release = Event(), Event()
+
+    class Backend:
+        def lookup(self, seq, lookup_id=None):
+            entered.set()
+            release.wait(10)
+            return 1
+
+        def renew(self, seq, start, end):
+            return 7
+
+    monkeypatch.setattr(async_lookup, "RENEW_TIMEOUT_S", 0.05)
+    lookup = AsyncStoreLookup(Backend())
+    try:
+        lookup.submit(SimpleNamespace(id=1), "1")
+        assert entered.wait(2)
+        started = time.monotonic()
+        for i in range(32):
+            assert lookup.renew(SimpleNamespace(id=i), 0, 256) == 0
+        assert time.monotonic() - started < 0.8
+    finally:
+        release.set()
+        lookup.close()
+
+
+def test_batch_renewal_skips_an_earlier_stalled_renewal(monkeypatch):
+    from atom.kv_transfer.offload.mooncake_store import async_lookup
+
+    release = Event()
+
+    class Backend:
+        def renew(self, seq, start, end):
+            release.wait(10)
+            return 7
+
+    monkeypatch.setattr(async_lookup, "RENEW_TIMEOUT_S", 0.05)
+    lookup = AsyncStoreLookup(Backend())
+    try:
+        assert lookup.renew(SimpleNamespace(id=1), 0, 256) == 0
+        started = time.monotonic()
+        for i in range(32):
+            assert lookup.renew(SimpleNamespace(id=i), 0, 256) == 0
+        assert time.monotonic() - started < 0.8
+    finally:
+        release.set()
+        lookup.close()
+
+
 def test_a_hung_store_call_does_not_keep_the_process_alive():
     """The workers are daemon threads: a process that closed its lookup while an
     RPC hangs still exits."""

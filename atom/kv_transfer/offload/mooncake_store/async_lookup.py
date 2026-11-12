@@ -5,8 +5,8 @@
 Only completed Store answers are cached, scoped to one request lifecycle.
 The worker rechecks/renews before loading; a stale answer never authorizes
 reuse of missing bytes. One lookup executor serializes the arrival-time queries;
-a lease renewal has an executor of its own and waits only for the query being
-served (`backend_lock`), never for the queue behind it.
+a lease renewal has an executor of its own and skips an occupied backend,
+never waiting for arrival-time queries or earlier stalled renewals.
 """
 
 import logging
@@ -22,8 +22,8 @@ from atom.kv_transfer.offload.lookup_client import LookupClient, as_lookup_clien
 
 logger = logging.getLogger("atom")
 
-# How long the scheduler thread waits for a lease renewal queued behind
-# arrival-time lookups. The renewal is advisory (see `renew`); a Store RPC that
+# How long the scheduler thread waits for its own advisory renewal RPC.
+# Occupied backends are skipped immediately (see `renew`); a Store RPC that
 # is slow must not stall the scheduler and, through the DP lockstep, its peers.
 RENEW_TIMEOUT_S = 1.0
 
@@ -230,18 +230,26 @@ class AsyncStoreLookup(LookupClient):
             return hits
 
     def _renew(self, seq, start, end):
-        with self.backend_lock:
+        # Advisory renewal must not wait behind a stalled lookup or renewal.
+        # Otherwise every request in a dispatch batch pays its own timeout.
+        if not self.backend_lock.acquire(blocking=False):
+            return 0
+        try:
             return self.backend.renew(seq, start, end)
+        finally:
+            self.backend_lock.release()
 
     def renew(self, seq, start, end):
         """Renew the read leases of tokens ``[start, end)``; 0 if it is not done in time.
 
-        Runs on the renewal executor, behind at most the query being served, and
-        the scheduler thread waits at most `RENEW_TIMEOUT_S` for it.
+        Runs on the renewal executor and skips an occupied backend immediately.
+        The scheduler thread waits at most `RENEW_TIMEOUT_S` for its own RPC.
         The load goes ahead whatever the answer (its all-or-nothing get fails on
         a chunk the Store lost and the request is prefilled), so a renewal that
         is late costs a lease, never correctness.
         """
+        if self.backend_lock.locked():
+            return 0
         future = self.renew_executor.submit(self._renew, seq, start, end)
         if future is None:  # earlier renewals are still stuck behind a slow RPC
             return 0
