@@ -8,7 +8,11 @@ verdict
   reading a compacted copy of them;
 - over several vocab chunks as over a single chunk (cross-chunk combine);
 - splitting an overflowing top-p interval over the whole row as finishing it
-  from the chunked levels, including an interval of tied tokens.
+  from the chunked levels, including an interval of tied tokens;
+
+and, against an independent sort-based reference (`_nucleus_probs`), the
+top-p nucleus and the draft token's p(x) of every top-p row, tied rows
+included.
 
 Needs a GPU, or TRITON_INTERPRET=1 (then runs on the CPU).
 """
@@ -190,3 +194,67 @@ def test_tied_cutoff_interval_is_kept_whole(monkeypatch, use_block):
     default = _verify(c, top_p, use_block)
     monkeypatch.setattr(dps, "_TOPP_RB", 16)
     _assert_same(default, _verify(c, top_p, use_block))
+
+
+def _row_stats(monkeypatch, c, top_p, use_block):
+    """`_verify`, also returning the per-row statistics [N, 8] handed to
+    the decide kernel (amax, m, tau, zk, p(x) | q fields)."""
+    seen = {}
+    kernel = dps._prob_decide_kernel
+    rs_arg = kernel.arg_names.index("rs_ptr")
+
+    class Capture:
+        def __getitem__(self, grid):
+            launch = kernel[grid]
+
+            def run(*args, **kwargs):
+                seen["rs"] = args[rs_arg].clone()
+                return launch(*args, **kwargs)
+
+            return run
+
+    monkeypatch.setattr(dps, "_prob_decide_kernel", Capture())
+    out = _verify(c, top_p, use_block)
+    return out, seen["rs"].cpu()
+
+
+@pytest.mark.parametrize(
+    "seed,top_p,grid,rb",
+    [
+        (11, 0.9, None, None),
+        (12, torch.tensor(PER_ROW_TOP_P), None, None),
+        # Logits on a coarse grid: the cutoff falls on a run of tied tokens.
+        (13, torch.tensor(PER_ROW_TOP_P), 2.0, None),
+        (14, 0.8, 2.0, None),
+        # Every interval overflows: the whole-row splits find the cutoff.
+        (15, torch.tensor(PER_ROW_TOP_P), None, 16),
+        (16, torch.tensor(PER_ROW_TOP_P), 2.0, 16),
+    ],
+)
+def test_top_p_nucleus_matches_sorted_reference(monkeypatch, seed, top_p, grid, rb):
+    c = _case(seed)
+    if grid is not None:
+        c["full"] = torch.round(c["full"] * grid) / grid
+    if rb is not None:
+        monkeypatch.setattr(dps, "_TOPP_RB", rb)
+    _, rs = _row_stats(monkeypatch, c, top_p, use_block=False)
+    target = c["full"].index_select(0, c["rows"]).cpu().float()
+    temps = c["temps"].cpu()
+    drafts = c["input_ids"].cpu()[c["rows"].cpu().long() + 1].long()
+    tps = top_p if torch.is_tensor(top_p) else torch.full((R,), top_p)
+    checked = 0
+    for i in range(R):
+        if float(tps[i]) >= 1.0:
+            continue
+        for k in range(N):
+            r = i * N + k
+            ref = dps._nucleus_probs(
+                target[r : r + 1], temps[i : i + 1, None], float(tps[i])
+            )[0]
+            y = target[r] * (1.0 / temps[i])
+            nucleus = y >= rs[r, 2]
+            assert torch.equal(nucleus, ref > 0), (r, int(nucleus.sum()))
+            x = int(drafts[r])
+            assert float(rs[r, 4]) == pytest.approx(float(ref[x]), rel=1e-4, abs=1e-12)
+            checked += 1
+    assert checked > 0
