@@ -129,8 +129,8 @@ def standalone(max_bytes, *, reserve_blocks=None, free_blocks=0):
     )
 
 
-def try_admit(policy, seq):
-    admitted, plan = policy.check(seq, NO_HIT)
+def try_admit(policy, seq, *, running=False):
+    admitted, plan = policy.check(seq, NO_HIT, running=running)
     if admitted:
         policy.commit(seq, plan)
     return admitted
@@ -219,10 +219,52 @@ def test_free_kv_watermark_keeps_room_for_running_requests(build, chunked):
     batch, _ = sched.schedule()
     assert {a.id, b.id} <= set(batch.req_ids)
     assert not c.block_table  # A and B held credits during this pass.
+    # Past their first batch A and B hold no credit, but they still decode.
+    assert not sched.pd_admission.pending
     sched.schedule()
-    # Alone, C may enter below the watermark; the allocator still has room.
+    assert not c.block_table
+    for seq in (a, b):
+        assert sched.abort_request(seq.id)
+    sched.postprocess([], ScheduledBatchOutput([], [], None, None, None), batch=batch)
+    sched.schedule()
     assert c.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
     assert set(sched.pd_admission.pending) == {str(c.id)}
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+def test_free_kv_watermark_holds_while_admitted_requests_decode(build, chunked):
+    sched, request = build(
+        chunked=chunked,
+        num_kvcache_blocks=10,
+        options={"enabled": True, "min_free_kv_fraction": 0.5},
+    )
+    a = request(16)
+    sched.add(a)
+    sched.schedule()
+    sched._update_from_kv_xfer_finished(receive_success(a))
+    batch, _ = sched.schedule()
+    assert a.id in batch.req_ids
+    assert not sched.pd_admission.pending
+    # Nothing is pending, but B would leave fewer than 5 free blocks while A
+    # decodes.
+    b = request()
+    sched.add(b)
+    sched.schedule()
+    assert not b.block_table
+    assert sched.pd_admission.deferred == {"bytes": 0, "free_kv": 1}
+    assert sched.abort_request(a.id)
+    sched.postprocess([], ScheduledBatchOutput([], [], None, None, None), batch=batch)
+    sched.schedule()
+    assert b.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+
+
+def test_free_kv_watermark_admits_below_it_only_on_an_idle_decoder():
+    policy = standalone(None, reserve_blocks=8, free_blocks=10)
+    big = SizedSeq(id=1, block_table=[1, 2, 3, 4])
+    # 10 free, 4 allocated: 6 left, below the 8 reserved.
+    assert not try_admit(policy, big, running=True)
+    # Nothing pending or running: waiting would free nothing, so it enters.
+    assert try_admit(policy, big, running=False)
 
 
 @pytest.mark.parametrize("chunked", [False, True])
@@ -252,9 +294,15 @@ def test_free_kv_watermark_counts_claimed_prefix_hits(build, seq_factory, chunke
     assert bm.kv.num_free == free
     assert sched.pd_admission.deferred == {"bytes": 0, "free_kv": 1}
     sched._update_from_kv_xfer_finished(receive_success(a))
-    sched.schedule()
     batch, _ = sched.schedule()
-    # Alone, B enters with the same three-block hit.
+    assert a.id in batch.req_ids
+    # A decodes past its first batch; B still waits for room.
+    sched.schedule()
+    assert not b.block_table
+    assert sched.abort_request(a.id)
+    sched.postprocess([], ScheduledBatchOutput([], [], None, None, None), batch=batch)
+    batch, _ = sched.schedule()
+    # With A gone, B enters with the same three-block hit.
     assert batch.connector_meta_output.reqs_to_recv[b.id].num_computed_blocks == 3
     assert set(sched.pd_admission.pending) == {str(b.id)}
 
