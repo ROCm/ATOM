@@ -610,11 +610,22 @@ def test_physical_targets_are_deduplicated_and_release_is_idempotent():
     assert policy.pending_bytes == 0
 
 
+def test_rejected_deferred_request_leaves_no_marker():
+    policy = standalone(1024)
+    a = SizedSeq(id=1, block_table=[1])
+    b = SizedSeq(id=2, block_table=[2])
+    assert try_admit(policy, a)
+    assert not try_admit(policy, b)
+    # B is rejected from waiting without ever being admitted.
+    policy.cancel(b)
+    assert not policy._deferred
+
+
 def test_admission_metrics_follow_credit_lifecycle(monkeypatch):
     from prometheus_client import CollectorRegistry
 
-    from atom.metrics.scheduler import SchedulerMetrics
     from atom.kv_transfer.disaggregation import pd_admission
+    from atom.metrics.scheduler import SchedulerMetrics
 
     clock = [100.0]
     monkeypatch.setattr(pd_admission.time, "perf_counter", lambda: clock[0])
