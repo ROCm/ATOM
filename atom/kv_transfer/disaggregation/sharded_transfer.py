@@ -290,3 +290,59 @@ def build_dcp_shard_plan(
         run_length=np.full(local_token.size, interleave_size, dtype=np.int64),
         valid=valid,
     )
+
+
+def kv_heads_of_rank(rank: int, tp: int, total_heads: int) -> tuple[int, int]:
+    """`(first, count)` of the KV heads TP rank `rank` holds, as
+    `QKVParallelLinear` shards them (one replicated head per rank past the count)."""
+    if not 0 <= rank < tp or total_heads <= 0:
+        raise ValueError(f"no KV heads for rank {rank} of TP {tp} ({total_heads})")
+    if total_heads % tp == 0:
+        count = total_heads // tp
+        return rank * count, count
+    if tp % total_heads == 0:
+        return rank // (tp // total_heads), 1
+    raise ValueError(f"{total_heads} KV heads do not shard over TP {tp}")
+
+
+def consumer_head_slices(
+    src_bytes: int,
+    dst_bytes: int,
+    src_runs: tuple[int, int] | None,
+    dst_runs: tuple[int, int] | None,
+    rank: int,
+    tp: int,
+    label: str,
+) -> np.ndarray:
+    """`[src offset, dst offset, bytes]` rows moving consumer `rank`'s heads of
+    a TP1 unit; runs None on both ends is a unit not per head, moved whole."""
+    if src_runs is None or dst_runs is None:
+        if src_runs != dst_runs or src_bytes != dst_bytes:
+            raise ValueError(
+                f"{label}: {src_runs} runs of {src_bytes} B here, "
+                f"{dst_runs} of {dst_bytes} B on consumer rank {rank}/{tp}"
+            )
+        return np.array([[0, 0, src_bytes]], dtype=np.int64)
+    (runs, heads), (dst_run_count, dst_heads) = src_runs, dst_runs
+    first, count = kv_heads_of_rank(rank, tp, heads)
+    width = src_bytes // (runs * heads) if runs > 0 else 0
+    if (
+        width <= 0
+        or (runs, count) != (dst_run_count, dst_heads)
+        or src_bytes != runs * heads * width
+        or dst_bytes != runs * count * width
+    ):
+        raise ValueError(
+            f"{label}: {runs}x{heads} heads in {src_bytes} B here do not cut "
+            f"into {dst_run_count}x{dst_heads} in {dst_bytes} B on consumer "
+            f"rank {rank}/{tp}"
+        )
+    run = np.arange(runs, dtype=np.int64)
+    return np.stack(
+        [
+            run * heads * width + first * width,
+            run * count * width,
+            np.full(runs, count * width, dtype=np.int64),
+        ],
+        axis=1,
+    )

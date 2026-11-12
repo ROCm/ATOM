@@ -125,10 +125,22 @@ def test_unimplemented_modes_fail_before_loading(override):
         validate_runtime_config(runtime_config(**override))
 
 
-def test_lmcache_mp_and_mooncake_are_the_kv_transfers_admitted():
+def test_mp_store_and_mooncake_are_the_kv_transfers_admitted():
     validate_runtime_config(
         runtime_config(kv_transfer_config={"kv_connector": "lmcache_mp"})
     )
+    validate_runtime_config(
+        runtime_config(
+            kv_transfer_config={"kv_connector": "mooncake_store"},
+            enable_encoder_swa_bounded_replay=True,
+            kv_cache_block_size=256,
+        )
+    )
+    # The Store's PAGE-only load is sound only where a hit's state is replayed.
+    with pytest.raises(ValueError, match="Mooncake Store without encoder SWA"):
+        validate_runtime_config(
+            runtime_config(kv_transfer_config={"kv_connector": "mooncake_store"})
+        )
     for role in ("kv_producer", "kv_consumer"):
         validate_runtime_config(
             runtime_config(
@@ -142,7 +154,8 @@ def test_lmcache_mp_and_mooncake_are_the_kv_transfers_admitted():
         )
     for connector in ("lmcache_offload", "moriio", "multi"):
         with pytest.raises(
-            ValueError, match="KV transfer other than lmcache_mp or mooncake"
+            ValueError,
+            match="KV transfer other than lmcache_mp, mooncake or mooncake_store",
         ):
             validate_runtime_config(
                 runtime_config(kv_transfer_config={"kv_connector": connector})
@@ -595,6 +608,35 @@ def test_tbo_admission_is_stable_across_dp_normalization(tp, dp):
                 validate_tbo_parallelism(cfg)
         cfg.parallel_config.data_parallel_size = tp * dp
         cfg.tensor_parallel_size = 1
+
+
+@pytest.mark.parametrize("requested_block", [16, 128, 256])
+def test_store_geometry_uses_v41_effective_block_size(monkeypatch, requested_block):
+    from atom import config as config_module
+    from atom.config import CompilationConfig, Config
+
+    fixture = Path(__file__).parents[2] / "models/deepseek_v41/fixtures"
+    monkeypatch.setattr(config_module, "QuantizationConfig", lambda *a, **k: None)
+    cfg = Config(
+        model=str(fixture),
+        tensor_parallel_size=1,
+        compilation_config=CompilationConfig(level=0),
+        enforce_eager=True,
+        kv_cache_dtype="bf16",
+        index_cache_dtype="fp8",
+        kv_cache_block_size=requested_block,
+        kv_transfer_config={
+            "kv_connector": "mooncake_store",
+            "kv_role": "offload",
+            "kv_connector_extra_config": {
+                "mooncake_store.master": "127.0.0.1:50051",
+                "mooncake_store.metadata": "http://127.0.0.1:8080/metadata",
+                "mooncake_store.local_hostname": "127.0.0.1",
+                "mooncake_store.chunk_tokens": 128,
+            },
+        },
+    )
+    assert cfg.kv_cache_block_size == 128
 
 
 @pytest.mark.parametrize("explicit_parallel", [False, True])
