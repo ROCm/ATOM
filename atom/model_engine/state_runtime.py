@@ -116,6 +116,7 @@ class StateTransfer:
         readable_midstep: bool = False,
         midstep_grid: int = 0,
         midstep_min_offset: int = 0,
+        decode_keep: str = KEEP_SETTLED,
     ) -> "StateTransfer":
         return cls(
             FORK,
@@ -123,6 +124,7 @@ class StateTransfer:
             readable_midstep=readable_midstep,
             midstep_grid=midstep_grid,
             midstep_min_offset=midstep_min_offset,
+            decode_keep=decode_keep,
         )
 
     @classmethod

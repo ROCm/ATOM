@@ -15,6 +15,8 @@ still returns a plausible state, and no CPU test can see it, so these pin it:
 * one stacked fold over every layer is the per-layer fold, bit for bit;
 * the states real heads produce -- exactly low-rank, zero, tiny -- store and
   fold to finite values;
+* a fork's write slot takes all three planes of its source, and a prefix
+  checkpoint inside a prefill is the chunk state it names;
 * every kernel gives the same bytes run after run.
 """
 
@@ -33,7 +35,9 @@ from atom.model_ops.fla_ops.leapquant import (
     leapquant_fold,
     leapquant_gated_delta_rule,
     leapquant_load_state,
+    leapquant_seed_forked_slots,
     leapquant_store_state,
+    leapquant_write_checkpoints,
 )
 from atom.model_ops.fla_ops.replayssm import replayssm_commit
 
@@ -319,6 +323,63 @@ def test_degenerate_states_store_and_fold_finite():
         # int8 residual.
         tol = 2e-2 if name == "generic" else 1e-4
         assert rel(warm[i], want[i]) < tol, name
+
+
+def test_a_fork_takes_every_plane_of_its_source():
+    """The int8 residual is no state without its scales and compensators: a
+    fork's write slot takes all three from its source, in every layer, and no
+    other slot moves."""
+    layers, n = 2, 4
+    pools = slot_buffers(layers)[:3]
+    z, sc, comp = pools
+    src = scattered_slots(n)
+    dst = src - 1
+    for layer in range(layers):
+        S, _ = make_states(n, 256, seed=30 + layer)
+        leapquant_store_state(S, z[layer], sc[layer], comp[layer], src)
+    before = [p.clone() for p in pools]
+
+    leapquant_seed_forked_slots(*pools, torch.stack([dst, src]).long())
+
+    rest = torch.ones(POOL, device=DEV, dtype=torch.bool)
+    rest[dst.long()] = False
+    for got, was in zip(pools, before):
+        assert torch.equal(got[:, dst.long()], was[:, src.long()])
+        assert torch.equal(got[:, rest], was[:, rest])
+    for layer in range(layers):
+        assert torch.equal(
+            leapquant_load_state(z[layer], sc[layer], comp[layer], dst),
+            leapquant_load_state(z[layer], sc[layer], comp[layer], src),
+        )
+
+
+def test_a_prefill_checkpoint_is_the_chunk_state_it_names():
+    """The chunk kernel's intermediates are batch-concatenated, so an interior
+    target is a chunk boundary counted from its row's first chunk; a target
+    at the end of its row is that row's final state, which they do not hold.
+    Each slot ends up as a prefill that finished there would leave it, byte
+    for byte, and no other slot is written."""
+    chunk = 64
+    # Rows of 3 and 2 chunks (192 and 100 tokens).
+    chunk_offsets = torch.tensor([0, 3, 5], device=DEV, dtype=torch.int32)
+    h = make_states(5, 256, seed=40)[0].bfloat16()[None]
+    final = make_states(2, 256, seed=41)[0]
+    rows = torch.tensor([0, 1, 1], device=DEV, dtype=torch.int32)
+    offs = torch.tensor([128, 64, 100], device=DEV, dtype=torch.int32)
+    is_end = torch.tensor([0, 0, 1], device=DEV, dtype=torch.int32)
+    slots = scattered_slots(3)
+    want = torch.stack([h[0, 0 + 2].float(), h[0, 3 + 1].float(), final[1]])
+
+    pools = slot_buffers()[:3]
+    leapquant_write_checkpoints(
+        h, final, *pools, rows, slots, offs, is_end, chunk_offsets, chunk
+    )
+
+    prefilled = slot_buffers()[:3]
+    leapquant_store_state(want, *prefilled, slots)
+    for got, ref in zip(pools, prefilled):
+        assert torch.equal(got, ref)
+    assert rel(leapquant_load_state(*pools, slots), ref_quantize(want)) < 1e-3
 
 
 def test_every_kernel_returns_the_same_bytes_every_run():

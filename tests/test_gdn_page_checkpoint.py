@@ -67,7 +67,7 @@ def _config(model_type, *, pp=1, rapidserve=False, wrapped=False):
     )
 
 
-def _transfer(monkeypatch, **kwargs):
+def _builder(monkeypatch, **kwargs):
     params = {
         "layers": 45,
         "shape_k": (3, 1536),
@@ -78,23 +78,35 @@ def _transfer(monkeypatch, **kwargs):
         "num_spec": 0,
         "replayssm": False,
         "midstep": False,
+        "leapquant": False,
     }
     params.update(kwargs)
     builder_cls = _builder_cls()
+    from atom.model_ops.fla_ops.leapquant import leapquant_buffer_shapes
+
     monkeypatch.setattr(
         "atom.model_ops.attentions.gdn_attn.get_tp_group",
         lambda: SimpleNamespace(world_size=params["tp"]),
     )
     monkeypatch.setenv("ATOM_GDN_STATE_MIDSTEP", "1" if params["midstep"] else "0")
+    # The pool's dtypes: LeapQuant stores the ssm plane as its int8 residual.
+    dtype_pool_v = torch.int8 if params["leapquant"] else params["dtype_v"]
     builder = SimpleNamespace(
         num_spec=params["num_spec"],
-        replayssm=params["replayssm"],
-        _conv_state_len=lambda: params["shape_k"][0],
+        leapquant=params["leapquant"],
+        leapquant_rank=4,
+        replayssm=params["replayssm"] or params["leapquant"],
         _uses_paged_checkpoints=lambda: True,
         num_state_layers=lambda: params["layers"],
         _state_shape_for_runner=lambda: (params["shape_k"], params["shape_v"]),
         _state_dtypes=lambda: (params["dtype_k"], params["dtype_v"]),
-        _pool_state_dtypes=lambda: (params["dtype_k"], params["dtype_v"]),
+        _pool_state_dtypes=lambda: (params["dtype_k"], dtype_pool_v),
+        _leapquant_buffer_shapes=lambda: (
+            leapquant_buffer_shapes(*params["shape_v"], 4)
+            if params["leapquant"]
+            else None
+        ),
+        _conv_state_len=lambda: params["shape_k"][0],
     )
     for name in (
         "_decode_keep",
@@ -102,7 +114,11 @@ def _transfer(monkeypatch, **kwargs):
         "_checkpoint_plane_shapes",
     ):
         setattr(builder, name, getattr(builder_cls, name).__get__(builder))
-    return builder_cls.state_transfer(builder)
+    return builder
+
+
+def _transfer(monkeypatch, **kwargs):
+    return _builder_cls().state_transfer(_builder(monkeypatch, **kwargs))
 
 
 def _layout(monkeypatch, **kwargs):
@@ -203,13 +219,45 @@ class TestTheLayoutId:
         assert _layout(monkeypatch) != _layout(monkeypatch, dtype_v=torch.float32)
         assert _layout(monkeypatch) != _layout(monkeypatch, layers=44)
 
+    def test_leapquant_names_its_planes_and_its_int8_state(self, monkeypatch):
+        layout = _layout(monkeypatch, leapquant=True)
+        assert layout != _layout(monkeypatch)
+        assert f":ssm={(8, 128, 128)},{torch.int8}" in layout
+        assert (
+            ":order=conv-all-layers,ssm-all-layers,scale-all-layers,"
+            "comp-all-layers:leapquant=r4"
+        ) in layout
+
+
+class TestAReplaySlotKeepsNothingItCannotGive:
+    """Between two decode steps a ReplaySSM slot is its checkpoint plus the
+    records since. A PAGE copy builds the step's image from that
+    (`KEEP_SNAPSHOT`); LeapQuant's scale and compensator planes have no such
+    builder, and a fork hands over the slot itself, so both keep nothing at a
+    decode boundary. A prefill leaves no records."""
+
+    @pytest.mark.parametrize("midstep", [False, True])
+    def test_leapquant_keeps_none_at_a_decode_boundary(self, monkeypatch, midstep):
+        transfer = _transfer(monkeypatch, leapquant=True, midstep=midstep)
+        assert transfer.readable_midstep is midstep
+        assert transfer.decode_keep == "none"
+
+    def test_a_fork_keeps_none_under_replay(self, monkeypatch):
+        _builder_cls()
+        from atom.model_ops.attentions.gdn_attn import GDNStateMixin
+
+        fork = GDNStateMixin.state_transfer
+        assert fork(_builder(monkeypatch)).decode_keep == "settled"
+        assert fork(_builder(monkeypatch, replayssm=True)).decode_keep == "none"
+        assert fork(_builder(monkeypatch, leapquant=True)).decode_keep == "none"
+
 
 def _fork_transfer(monkeypatch, *, midstep):
     _builder_cls()
     from atom.model_ops.attentions.gdn_attn import GDNStateMixin
 
     monkeypatch.setenv("ATOM_GDN_STATE_MIDSTEP", "1" if midstep else "0")
-    builder = SimpleNamespace(_conv_state_len=lambda: 3)
+    builder = SimpleNamespace(_conv_state_len=lambda: 3, replayssm=False)
     return GDNStateMixin.state_transfer(builder)
 
 

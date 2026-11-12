@@ -36,6 +36,11 @@ compensators decay with the checkpoint, so a window's state is
 exactly as in ReplaySSM.  A flush materialises ``S_h`` once in fp32, refits
 the compensators (warm-started from the previous window's), recomputes the
 smoothing and re-quantises.
+
+A prefix-cache checkpoint only ever sits at a prompt position, where the
+prefill has just quantised the whole state into the slot and left no
+records: an image carries ``Z``, the scales and the compensators, and a fork
+seeds all three.
 """
 
 from __future__ import annotations
@@ -55,7 +60,9 @@ __all__ = [
     "leapquant_fold",
     "leapquant_gated_delta_rule",
     "leapquant_load_state",
+    "leapquant_seed_forked_slots",
     "leapquant_store_state",
+    "leapquant_write_checkpoints",
 ]
 
 #: Power-iteration steps per compensator.  A prefill has nothing to start
@@ -880,6 +887,64 @@ def leapquant_load_state(
         num_warps=8,
     )
     return out
+
+
+def leapquant_seed_forked_slots(
+    z: torch.Tensor,
+    sc: torch.Tensor,
+    comp: torch.Tensor,
+    fork_slots: torch.Tensor | None,
+) -> None:
+    """Copy a state fork's source boundary state onto its write slot.
+
+    `seed_forked_slots` for the int8 pool, which is no state without its
+    scales and compensators.  Every layer at once: the pools are layer-major,
+    ``[L, slots, ...]``.  ``fork_slots`` is the builder's int64 ``[2, F]``
+    (write, source) pairs; the caller parks the write slots' cursors, since
+    a source holds no records.
+    """
+    if fork_slots is None:
+        return
+    dst, src = fork_slots[0], fork_slots[1]
+    for pool in (z, sc, comp):
+        pool[:, dst] = pool[:, src]
+
+
+def leapquant_write_checkpoints(
+    h: torch.Tensor,
+    final_state: torch.Tensor,
+    z: torch.Tensor,
+    sc: torch.Tensor,
+    comp: torch.Tensor,
+    rows: torch.Tensor,
+    slots: torch.Tensor,
+    offs: torch.Tensor,
+    is_end: torch.Tensor,
+    chunk_offsets: torch.Tensor,
+    chunk_size: int,
+) -> None:
+    """The SSM half of `write_state_checkpoints`, for the int8 pool.
+
+    Same targets: an interior one is the chunk boundary
+    ``h[chunk_offsets[row] + off // chunk_size]``, one at the end of its row's
+    tokens is that row's ``final_state`` (``[N, HV, K, V]``), which ``h`` does
+    not hold.  Each is quantised into its slot as a prefill's final state is;
+    a checkpoint is stored from its slot and restored into a prefill, so no
+    cursor is involved.
+    """
+    if rows.numel() == 0:
+        return
+    HV, K, V = z.shape[-3:]
+    rows = rows.long()
+    h = h.reshape(-1, HV, K, V)
+    src = chunk_offsets.long()[rows] + offs.long() // chunk_size
+    inner = h.index_select(0, src.clamp(max=h.shape[0] - 1)).float()
+    state = torch.where(
+        is_end.bool()[:, None, None, None],
+        final_state.index_select(0, rows).float(),
+        inner,
+    )
+    leapquant_store_state(state, z, sc, comp, slots)
 
 
 def leapquant_gated_delta_rule(

@@ -17,6 +17,7 @@ from atom.model_ops.fla_ops.leapquant import (
     leapquant_gated_delta_rule,
     leapquant_load_state,
     leapquant_store_state,
+    leapquant_write_checkpoints,
 )
 from atom.model_ops.fla_ops.replayssm import replayssm_gated_delta_rule
 from atom.model_ops.mamba_ops.causal_conv1d import (
@@ -621,7 +622,8 @@ class GatedDeltaNet(nn.Module):
                 # One launch for both halves. `conv_state` is
                 # [slot, conv_dim, state_len] by here (see the transpose
                 # above) and shares `slots` with the SSM half, so the two
-                # always describe the same token position.
+                # always describe the same token position. The int8 pool
+                # cannot take a copy, so LeapQuant quantises its half.
                 write_state_checkpoints(
                     h if h_snap is None else h_snap,
                     ssm_state,
@@ -637,7 +639,22 @@ class GatedDeltaNet(nn.Module):
                     CHUNK_SIZE,
                     gdn_metadata.ssm_conv_state_len,
                     h_rows=None if h_snap is None else ckpt["h_rows"],
+                    copy_ssm=not use_leapquant,
                 )
+                if use_leapquant:
+                    leapquant_write_checkpoints(
+                        h,
+                        last_recurrent_state,
+                        ssm_state,
+                        layer_cache.leapquant_scale,
+                        layer_cache.leapquant_comp,
+                        ckpt["rows"],
+                        ckpt["slots"],
+                        ckpt["offs"],
+                        ckpt["is_end"],
+                        gdn_metadata.ssm_chunk_offsets,
+                        CHUNK_SIZE,
+                    )
         elif gdn_metadata.num_decodes > 0 and use_leapquant:
             nd = gdn_metadata.num_decodes
             core_attn_out_non_spec = leapquant_gated_delta_rule(

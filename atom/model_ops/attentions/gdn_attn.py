@@ -25,7 +25,11 @@ from atom.model_engine.state_runtime import (
 from atom.model_ops.attention_gdn import GatedDeltaNet
 from atom.model_ops.fla_ops.chunk import CHUNK_SIZE
 from atom.model_ops.fla_ops.index import prepare_chunk_offsets
-from atom.model_ops.fla_ops.leapquant import leapquant_buffer_shapes, leapquant_fold
+from atom.model_ops.fla_ops.leapquant import (
+    leapquant_buffer_shapes,
+    leapquant_fold,
+    leapquant_seed_forked_slots,
+)
 from atom.model_ops.fla_ops.replayssm import (
     replayssm_buffer_shapes,
     replayssm_commit,
@@ -312,14 +316,6 @@ class GDNStateMixin(PoolRowsMixin):
                     "ATOM_ENABLE_LEAPQUANT decodes one token per step; it does "
                     "not support speculative decoding yet."
                 )
-            # A prefix-cache checkpoint image holds the pool's planes, and the
-            # int8 residual is not a state without its scales, compensators
-            # and window records.
-            if model_runner.config.enable_prefix_caching:
-                raise NotImplementedError(
-                    "ATOM_ENABLE_LEAPQUANT does not support prefix caching "
-                    "yet; run with --no-enable_prefix_caching."
-                )
             if replayssm_override is False:
                 raise ValueError(
                     "ATOM_ENABLE_LEAPQUANT=1 is built on ReplaySSM and cannot "
@@ -514,10 +510,12 @@ class GDNStateMixin(PoolRowsMixin):
             )
             # `h` holds the state narrowed to the activation dtype. A pool at
             # another dtype (Qwen4Exp's fp32) takes its interior targets from
-            # snapshots the chunk kernel stores unnarrowed.
+            # snapshots the chunk kernel stores unnarrowed; LeapQuant's int8
+            # pool quantises them from `h` (`leapquant_write_checkpoints`).
             if (
                 any(ckpt["interior_host"])
                 and self._state_dtypes()[1] != self.model_runner.config.torch_dtype
+                and not self.leapquant
             ):
                 lens = batch.num_scheduled_tokens
                 ckpt["snap_idx"], ckpt["h_rows"], ckpt["num_snaps"] = (
@@ -769,15 +767,24 @@ class GDNStateMixin(PoolRowsMixin):
         unnarrowed into a snapshot (`interior_state_snapshots`), so the
         checkpoint is the value a forward ending there would store. FlyDSL
         prefill, which takes no snapshots, steps aside for such a forward.
+
+        Under ReplaySSM a slot between decode steps is its checkpoint plus the
+        records since the last flush, and a fork seeds the checkpoint alone:
+        a decode boundary keeps nothing (`KEEP_NONE`), or the generating
+        sequence would itself continue from the state at the last flush.
         """
+        decode_keep = KEEP_NONE if self.replayssm else KEEP_SETTLED
         if not envs.ATOM_GDN_STATE_MIDSTEP:
-            return StateTransfer.fork(1, readable_midstep=False)
+            return StateTransfer.fork(
+                1, readable_midstep=False, decode_keep=decode_keep
+            )
 
         return StateTransfer.fork(
             1,
             readable_midstep=True,
             midstep_grid=CHUNK_SIZE,
             midstep_min_offset=self._conv_state_len(),
+            decode_keep=decode_keep,
         )
 
     def _decode_keep(self) -> str:
@@ -1015,19 +1022,32 @@ class GDNStateMixin(PoolRowsMixin):
         ]
 
     def _checkpoint_plane_shapes(self) -> list[tuple[int, int]]:
-        """`(per_layer_bytes, num_layers)` per plane, conv first then ssm.
+        """`(per_layer_bytes, num_layers)` per plane, conv first then ssm, then
+        LeapQuant's scales and compensators, without which its int8 ssm plane
+        is no state.
 
         Pure geometry from the state shapes, so it answers before the tensors
         exist -- which `checkpoint_image_bytes` needs, being called during
         sizing.
+
+        No ReplaySSM records: a checkpoint is kept at a prompt position, where
+        the prefill has parked the cursor and the checkpoint plane is the whole
+        state, or at a decode boundary from the step's materialized image
+        (`_decode_keep`). LeapQuant's extra planes have no such builder, so it
+        keeps none at a decode boundary.
         """
         shape_k, shape_v = self._state_shape_for_runner()
         dt_k, dt_v = self._pool_state_dtypes()
         n = self.num_state_layers()
-        return [
+        shapes = [
             (math.prod(shape_k) * dt_k.itemsize, n),
             (math.prod(shape_v) * dt_v.itemsize, n),
         ]
+        side = self._leapquant_buffer_shapes()
+        if side is not None:
+            s_scale, s_comp = side
+            shapes += [(math.prod(s_scale) * 4, n), (math.prod(s_comp) * 2, n)]
+        return shapes
 
     def _checkpoint_plane_tensors(self) -> list[torch.Tensor]:
         """Allocated source planes in the order `_checkpoint_plane_shapes` names.
@@ -1036,10 +1056,11 @@ class GDNStateMixin(PoolRowsMixin):
         runs before these tensors exist. Hybrid backends may extend both lists
         with state that shares the same slot lifetime.
         """
-        return [
-            self.model_runner.mamba_k_cache,
-            self.model_runner.mamba_v_cache,
-        ]
+        runner = self.model_runner
+        planes = [runner.mamba_k_cache, runner.mamba_v_cache]
+        if self._leapquant_buffer_shapes() is not None:
+            planes += [runner.leapquant_scale, runner.leapquant_comp]
+        return planes
 
     def _checkpoint_num_slots(self) -> int:
         """The slot axis of the state tensors, or 1 before they exist.
@@ -1359,10 +1380,14 @@ class GDNStateMixin(PoolRowsMixin):
                 f"state_entry_views: slot {slot} out of range [0, {num_slots})"
             )
         views = []
-        for cache in (
-            self.model_runner.mamba_k_cache,
-            self.model_runner.mamba_v_cache,
-        ):
+        runner = self.model_runner
+        caches = [runner.mamba_k_cache, runner.mamba_v_cache]
+        # LeapQuant's int8 state means nothing without its scales and
+        # compensators; like a PAGE image, no ReplaySSM records
+        # (`_checkpoint_plane_shapes`).
+        if self._leapquant_buffer_shapes() is not None:
+            caches += [runner.leapquant_scale, runner.leapquant_comp]
+        for cache in caches:
             for layer in range(cache.shape[0]):
                 views.append(cache[layer, slot : slot + 1])
         return views
@@ -1852,18 +1877,27 @@ class GDNStateMixin(PoolRowsMixin):
             write_pos.index_fill_(0, live, -1)
             return
 
+        runner = self.model_runner
         if self._fork_slots:
-            # Forks come from prefix-cache checkpoints, which LeapQuant refuses;
-            # seeding one would also have to copy its scales and compensators.
-            assert not self.leapquant, "LeapQuant cannot seed a state fork"
             # A fork's write slot starts from the source checkpoint alone (the
             # kernel wrapper seeds it), so park its cursor like a prefill's:
-            # otherwise it folds the slot's previous tenant's records.
+            # otherwise it folds the slot's previous tenant's records. The
+            # source holds no records: under ReplaySSM a fork keeps nothing at
+            # a decode boundary (`GDNStateMixin.state_transfer`).
             # Pinned: a pageable H2D syncs the stream.
             fork = torch.tensor(list(zip(*self._fork_slots)), pin_memory=True)
             fork = fork.to(write_pos.device, non_blocking=True)
             write_pos.index_fill_(0, fork[0], -1)
             md.replayssm_fork_slots = fork
+            if self.leapquant:
+                # The LeapQuant kernels take no fork slots: seed the int8
+                # state, its scales and its compensators here, every layer.
+                leapquant_seed_forked_slots(
+                    runner.mamba_v_cache,
+                    runner.leapquant_scale,
+                    runner.leapquant_comp,
+                    fork,
+                )
 
         # Decode: apply the PREVIOUS step's accepted counts.  For non-spec
         # decode `num_accepted_tokens` stays at its initialised value of 1,
@@ -1879,7 +1913,6 @@ class GDNStateMixin(PoolRowsMixin):
             # This step's flushes, for every layer in one launch: the cursor
             # decides them and is shared by all layers. Runs outside the
             # captured graph, so the layer kernels only ever decode.
-            runner = self.model_runner
             leapquant_fold(
                 runner.mamba_v_cache,
                 runner.leapquant_scale,
@@ -2112,16 +2145,20 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
             return super().state_transfer()
 
         shape_k, shape_v = self._state_shape_for_runner()
-        dtype_k, dtype_v = self._state_dtypes()
+        dtype_k, dtype_v = self._pool_state_dtypes()
         # Same fields Kimi spells inline in ``state_transfer``. ``order`` is
         # the one fact the shapes cannot say. ``spec`` changes the conv
         # window. ``tp`` is in the id because the heads are sharded.
+        order = "conv-all-layers,ssm-all-layers"
+        if self.leapquant:
+            order += ",scale-all-layers,comp-all-layers"
+            order += f":leapquant=r{self.leapquant_rank}"
         layout_id = (
             "gdn-paged-state-v1"
             f":layers={self.num_state_layers()}"
             f":conv={tuple(shape_k)},{dtype_k}"
             f":ssm={tuple(shape_v)},{dtype_v}"
-            ":order=conv-all-layers,ssm-all-layers"
+            f":order={order}"
             f":tp={get_tp_group().world_size}"
             f":spec={self.num_spec}"
             ":carry=all"

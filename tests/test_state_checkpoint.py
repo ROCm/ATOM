@@ -2482,6 +2482,60 @@ class TestDecodePointPublishing:
         self._generate_to(bm, seq, 3 * BLOCK)
         assert seq.num_hashed_tokens == 3 * BLOCK
 
+    def test_a_records_backend_keeps_nothing_past_the_prompt(self):
+        """ReplaySSM and LeapQuant: between two decode steps a slot is the state
+        at its last flush plus records no checkpoint carries, so a rung kept
+        there would resume tokens behind: a fork keeps nothing at a decode
+        boundary (`decode_keep`).
+        """
+        bm = make_block_manager(
+            ckpt_config(),
+            state_runtime=StateRuntime(
+                transfer=StateTransfer.fork(1, decode_keep=KEEP_NONE)
+            ),
+        )
+        seq = self._prompt_of_10(bm)
+        group = seq.state_slot
+
+        self._generate_to(bm, seq, 4 * BLOCK)
+        assert seq.state_slot == group
+        assert not bm.state.hash_to_slot
+        assert seq.num_hashed_tokens == 4 * BLOCK
+
+    @pytest.mark.parametrize("decode_keep", [KEEP_SETTLED, KEEP_NONE])
+    def test_a_records_backend_stores_no_image_past_the_prompt(self, decode_keep):
+        transfer = StateTransfer.copy(
+            PAGED_COPY_SPEC.layout_id, decode_keep=decode_keep
+        )
+        bm = make_block_manager(
+            paged_copy_config(),
+            state_runtime=StateRuntime(
+                transfer=transfer, checkpoint_spec=PAGED_COPY_SPEC
+            ),
+        )
+        seq = stateful_seq(list(range(10)))
+        run_prompt(bm, seq)
+        assert bm.take_state_maintenance_ops().checkpoint_stores == ()
+
+        self._generate_to(bm, seq, 3 * BLOCK)
+        stores = bm.take_state_maintenance_ops().checkpoint_stores
+        assert len(stores) == (1 if decode_keep == KEEP_SETTLED else 0)
+
+    def test_a_records_backend_still_keeps_its_prompt_rungs(self):
+        """A prefill leaves no records, so its rungs are whole states."""
+        kept = []
+        for decode_keep in (KEEP_SETTLED, KEEP_NONE):
+            bm = make_block_manager(
+                ckpt_config(),
+                state_runtime=StateRuntime(
+                    transfer=StateTransfer.fork(1, decode_keep=decode_keep)
+                ),
+            )
+            assert run_prompt_on_the_ladder(bm, stateful_seq(list(range(10))))
+            kept.append(len(bm.state.hash_to_slot))
+        assert kept[0] > 0
+        assert kept[1] == kept[0]
+
     def test_followup_turn_resumes_from_a_generated_rung(self):
         """The payoff: turn 2 reuses KV *and* the state that goes with it."""
         bm = make_block_manager(

@@ -21,6 +21,7 @@ def test_wire_round_trip_keeps_the_complete_capability():
     transfers = (
         StateTransfer.none(),
         StateTransfer.fork(7),
+        StateTransfer.fork(1, decode_keep=KEEP_NONE),
         StateTransfer.copy("layout-v2"),
         StateTransfer.copy("layout-v2", decode_keep=KEEP_NONE),
         StateTransfer.copy("layout-v2", decode_keep=KEEP_SNAPSHOT),
@@ -30,6 +31,12 @@ def test_wire_round_trip_keeps_the_complete_capability():
         wire = pickle.loads(pickle.dumps(transfer.to_wire()))
         assert StateTransfer.from_wire(wire) == transfer
     assert transfers[-1].to_wire()["paged_layout_id"] == "layout-v2"
+    assert transfers[2].to_wire()["decode_keep"] == KEEP_NONE
+
+
+def test_a_fork_cannot_build_a_decode_snapshot():
+    with pytest.raises(ValueError, match="only a copy transfer"):
+        StateTransfer.fork(1, decode_keep=KEEP_SNAPSHOT)
 
 
 def test_invalid_kind_token_and_layout_combinations_are_rejected():

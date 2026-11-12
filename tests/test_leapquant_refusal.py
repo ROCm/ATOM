@@ -1,14 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""ATOM_ENABLE_LEAPQUANT refuses, at startup, every setup it would get wrong.
+"""What ATOM_ENABLE_LEAPQUANT accepts and refuses at startup.
 
-Each of these would otherwise start and serve a wrong state rather than fail:
-KDA's per-channel gates are not what the GDN kernels decay by, a verify
-window is more than the one token the decode kernel takes, a prefix-cache
-image copies the int8 residual without its scales, compensators and window
-records, and the int8 state is a ReplaySSM checkpoint, so ReplaySSM cannot
-be off.
+Refused, because each would otherwise start and serve a wrong state: KDA's
+per-channel gates are not what the GDN kernels decay by, a verify window is
+more than the one token the decode kernel takes, and the int8 state is a
+ReplaySSM checkpoint, so ReplaySSM cannot be off. Prefix caching starts,
+with generation keeping no checkpoints.
 """
 
 from types import SimpleNamespace
@@ -31,8 +30,24 @@ def _builder(*, kda=False, num_spec=0, prefix_caching=False):
             enable_prefix_caching=prefix_caching,
         ),
         num_spec_tokens=num_spec,
+        forward_vars={},
     )
-    return SimpleNamespace(model_runner=runner, _is_kda=lambda: kda)
+    return SimpleNamespace(
+        model_runner=runner,
+        _is_kda=lambda: kda,
+        max_bs=4,
+        device="cpu",
+        _state_index_buffers=GDNStateMixin._state_index_buffers,
+    )
+
+
+def _leapquant_env(monkeypatch, replayssm=None):
+    monkeypatch.setenv("ATOM_ENABLE_LEAPQUANT", "1")
+    monkeypatch.delenv("ATOM_LEAPQUANT_WINDOW", raising=False)
+    if replayssm is None:
+        monkeypatch.delenv("ATOM_ENABLE_REPLAYSSM", raising=False)
+    else:
+        monkeypatch.setenv("ATOM_ENABLE_REPLAYSSM", replayssm)
 
 
 @pytest.mark.parametrize(
@@ -40,16 +55,21 @@ def _builder(*, kda=False, num_spec=0, prefix_caching=False):
     [
         ({"kda": True}, None, NotImplementedError, "KDA"),
         ({"num_spec": 1}, None, NotImplementedError, "speculative decoding"),
-        ({"prefix_caching": True}, None, NotImplementedError, "prefix caching"),
         ({}, "0", ValueError, "ATOM_ENABLE_REPLAYSSM=0"),
     ],
 )
 def test_leapquant_refuses_at_startup(monkeypatch, setup, replayssm, error, match):
-    monkeypatch.setenv("ATOM_ENABLE_LEAPQUANT", "1")
-    if replayssm is None:
-        monkeypatch.delenv("ATOM_ENABLE_REPLAYSSM", raising=False)
-    else:
-        monkeypatch.setenv("ATOM_ENABLE_REPLAYSSM", replayssm)
+    _leapquant_env(monkeypatch, replayssm)
     builder = _builder(**setup)
     with pytest.raises(error, match=match):
         GDNStateMixin._init_gdn_state(builder, builder.model_runner)
+
+
+@pytest.mark.parametrize("prefix_caching", [False, True])
+def test_leapquant_starts_with_or_without_prefix_caching(monkeypatch, prefix_caching):
+    _leapquant_env(monkeypatch)
+    builder = _builder(prefix_caching=prefix_caching)
+    GDNStateMixin._init_gdn_state(builder, builder.model_runner)
+    assert builder.leapquant and builder.replayssm
+    # p + 1 records: a fold once the cursor reaches p.
+    assert builder.replayssm_cache_len == 17
