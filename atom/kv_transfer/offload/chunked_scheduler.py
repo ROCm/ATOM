@@ -22,7 +22,7 @@ from atom.kv_transfer.offload._offload_common import (
     validated_kv_role,
 )
 from atom.kv_transfer.offload.config import min_load_tokens
-from atom.kv_transfer.offload.load_math import tier_load_tokens
+from atom.kv_transfer.offload.load_math import chunk_floor, tier_load_tokens
 from atom.kv_transfer.offload.metadata import (
     LMCacheOffloadMetadata,
     LMCacheReqMeta,
@@ -291,7 +291,12 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         """
         if not self._do_load or self._lookup_client is None:
             return False
-        uncached = int(seq.num_tokens) - max(0, int(num_hbm_tokens))
+        hbm = max(0, int(num_hbm_tokens))
+        # Store admission can reload an unaligned HBM tail. Its load budget
+        # therefore starts at the preceding chunk, as the actual load does.
+        if self.lowers_hbm_hit_to_chunk:
+            hbm = chunk_floor(hbm, self.chunk_size)
+        uncached = int(seq.num_tokens) - hbm
         return uncached < int(self._min_load_tokens)
 
     def can_detach_lookup(self, seq, num_hbm_tokens: int) -> bool:

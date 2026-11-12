@@ -536,3 +536,25 @@ def test_the_detach_is_on_by_default_and_0_turns_it_off(monkeypatch):
     assert envs.OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT is True
     monkeypatch.setenv("OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT", "0")
     assert envs.OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT is False
+
+
+@pytest.mark.parametrize(
+    "floor,prompt,hbm,disabled,ruled_out",
+    [
+        (True, 800, 384, False, False),
+        (False, 800, 384, False, True),
+        (True, 700, 384, False, True),
+        (True, 800, 512, False, True),
+        (True, 800, 384, True, False),
+    ],
+)
+def test_detach_respects_the_connectors_hbm_load_boundary(
+    floor, prompt, hbm, disabled, ruled_out
+):
+    sched = ChunkedOffloadSchedulerBase.__new__(ChunkedOffloadSchedulerBase)
+    sched._do_load = not disabled
+    sched._lookup_client = object()
+    sched._min_load_tokens = 512
+    sched.chunk_size = 256
+    sched.lowers_hbm_hit_to_chunk = floor
+    assert sched._load_ruled_out(_seq(prompt), hbm) is ruled_out
