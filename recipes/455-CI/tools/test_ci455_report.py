@@ -1,7 +1,7 @@
-"""Tests for the 455-CI highlights and summary table (ci455_report.py)."""
+"""Tests for the 455-CI report: highlights, summary table, details (ci455_report.py)."""
 
 from ci455_data import AccCell, PerfCell
-from ci455_report import ModelResult, detail_md, highlights, missing_owners, summary_row
+from ci455_report import ModelResult, highlights, missing_owners, report_md, summary_row
 
 
 def pc(
@@ -207,8 +207,8 @@ def test_detail_tables_compare_with_the_previous_session_by_date_and_name_an_old
         pc(64, 1000.0, 990.0, prev_date="2026-10-31"),
         ac(0.95, 0.95, prev_date="2026-10-31"),
     )
-    text = detail_md(
-        "2026-11-14", {}, [a, b], "r.md", "../runs/20261114/charts", "../runs/20261114"
+    text = report_md(
+        "2026-11-14", {}, [a, b], "../runs/20261114/charts", "../runs/20261114"
     )
     assert "| vs 2026-11-07 |" in text and "(vs 2026-10-31)" in text
     assert "previous" not in text.lower() and "vs best" not in text.lower()
@@ -223,7 +223,7 @@ def test_detail_environment_lists_the_image_the_commits_and_one_test_date():
         "atom": {"commit": "a" * 40},
         "aiter": {"commit": "b" * 40},
     }
-    text = detail_md("2026-11-18", env, [model("Alpha", **FLAT)], "r.md", "c", "r")
+    text = report_md("2026-11-18", env, [model("Alpha", **FLAT)], "c", "r")
     assert "| Test date | 2026-11-18 |" in text and "sha256:abc" in text
     assert (
         "Base image" not in text and "base:tag" not in text and "Dependency" not in text
@@ -231,9 +231,28 @@ def test_detail_environment_lists_the_image_the_commits_and_one_test_date():
 
 
 def test_detail_performance_rows_show_the_parallelism_not_the_gpu_count():
-    text = detail_md("2026-11-14", {}, [model("Alpha", **FLAT)], "r.md", "c", "r")
+    text = report_md("2026-11-14", {}, [model("Alpha", **FLAT)], "c", "r")
     assert "| Parallelism |" in text and "| GPUs |" not in text
     assert "| Alpha | tp4 | 4 |" in text and "| Alpha | tp4 | 64 |" in text
+
+
+def test_one_report_holds_the_summary_and_then_the_details():
+    text = report_md(
+        "2026-11-14", {}, [model("Alpha", **FLAT), model("Bravo", **FAILING)], "c", "r"
+    )
+    order = [
+        "\n## Summary\n",
+        "\n### Highlights\n",
+        "\n| Model | Scenario |",
+        "\n## Details\n",
+        "\n### Environment\n",
+        "\n### Performance · MLPerf Endpoint\n",
+        "\n### Failures\n",
+        "\n#### Bravo (MLPerf Endpoint): c64\n",
+    ]
+    at = [text.index(heading) for heading in order]
+    assert at == sorted(at)
+    assert "-detail.md" not in text and "Detailed report" not in text
 
 
 FAILING = {

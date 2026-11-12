@@ -1,6 +1,7 @@
-"""Build the 455-CI report of one image, in English: highlights and a summary
-table for the boss, and a detailed report with every number and each failure's
-core error log (455-CI-guide.md §5)."""
+"""Build the 455-CI report of one session, in English and in one file: a short
+summary for the boss (highlights and a table), then the details (environment,
+every number, trend charts and each failure's core error log)
+(455-CI-guide.md §5)."""
 
 import re
 from dataclasses import dataclass
@@ -13,7 +14,7 @@ PERF_DOWN = -0.03  # down by this much: regression
 PERF_SEVERE = -0.10  # down by this much: severe regression
 ACC_WARN = 0.04  # GSM8K down by more than this (0.01 = one point): regression
 ACC_SEVERE = 0.06
-LOG_LINES = 60  # core error log lines shown in the detailed report
+LOG_LINES = 60  # core error log lines shown in the details
 NONE = "No failures or major changes."
 EXAMPLE = [
     (
@@ -296,29 +297,23 @@ def _labels(results):
     ]
 
 
-def summary_md(date, env, results, detail_name, mock=False, owners=None):
+def _summary(date, results, owners):
+    """The short summary, for the boss: the highlights, then each model's c64
+    throughput against the previous session and its GSM8K change."""
     ref = previous_column(results)
-    out = [
-        f"# 455-CI report · {date} · {' + '.join(_labels(results))}"
-        + (" · EXAMPLE" if mock else ""),
+    return [
+        "## Summary",
         "",
-        *(EXAMPLE if mock else []),
-        (
-            f"Image `{_image_short(env.get('image'))}` · ATOM `main@{_sha(env, 'atom')}`"
-            f" · aiter `main@{_sha(env, 'aiter')}` · [Detailed report]({detail_name})"
-        ),
-        "",
-        "## Highlights",
+        "### Highlights",
         "",
         *[f"- {h}" for h in highlights(results, owners)],
         "",
-        "## Summary",
+        "### Results",
         "",
         f"| Model | Scenario | {ref or '—'} (tok/s/GPU) | {date} (tok/s/GPU) | Delta | GSM8K delta |",
         "|---|---|---|---|---|---|",
+        *["| " + " | ".join(summary_row(r, date, ref)) + " |" for r in results],
     ]
-    out += ["| " + " | ".join(summary_row(r, date, ref)) + " |" for r in results]
-    return "\n".join(out) + "\n"
 
 
 def _env_rows(env, date):
@@ -356,21 +351,11 @@ def _vs(cell, text, ref, delta):
     return text
 
 
-def detail_md(date, env, results, summary_name, charts_dir, runs_dir, mock=False):
-    """`charts_dir` and `runs_dir` are relative to the report's directory.
+def _details(date, env, results, charts_dir, runs_dir):
+    """The detailed summary: environment, every number, trends and failures.
     Changes are against the previous session, whose date heads the column; a
     model whose last success is older says so in its cell."""
-    out = [
-        f"# 455-CI detailed report · {date} · {' + '.join(_labels(results))}"
-        + (" · EXAMPLE" if mock else ""),
-        "",
-        *(EXAMPLE if mock else []),
-        f"[← Report]({summary_name})",
-        "",
-        "## Environment",
-        "",
-        *_env_rows(env, date),
-    ]
+    out = ["## Details", "", "### Environment", "", *_env_rows(env, date)]
     for scenario in ("endpoint", "8k1k"):
         mine = [r for r in results if r.scenario == scenario]
         if not mine:
@@ -382,7 +367,7 @@ def detail_md(date, env, results, summary_name, charts_dir, runs_dir, mock=False
         vs = f"vs {ref}" if ref else "vs —"
         out += [
             "",
-            f"## Performance · {label}",
+            f"### Performance · {label}",
             "",
             f"| Model | Parallelism | Concurrency | tok/s/GPU | {vs} | {SECOND_HEADER[scenario]} | {vs} |",
             "|---|---|---|---|---|---|---|",
@@ -408,7 +393,7 @@ def detail_md(date, env, results, summary_name, charts_dir, runs_dir, mock=False
         avs = f"vs {aref}" if aref else "vs —"
         out += [
             "",
-            f"## Accuracy (GSM8K, 3-shot) · {label}",
+            f"### Accuracy (GSM8K, 3-shot) · {label}",
             "",
             f"| Model | flexible-extract | strict-match | {aref or '—'} | {avs} |",
             "|---|---|---|---|---|",
@@ -427,13 +412,13 @@ def detail_md(date, env, results, summary_name, charts_dir, runs_dir, mock=False
             )
         out += [
             "",
-            f"## Trends · {label}",
+            f"### Trends · {label}",
             "",
             f"![{label} throughput per GPU]({charts_dir}/perf-{scenario}.png)",
             "",
             f"![{label} GSM8K]({charts_dir}/accuracy-{scenario}.png)",
         ]
-    out += ["", "## Failures", ""]
+    out += ["", "### Failures", ""]
     broken = [r for r in results if _failed_parts(r)]
     if not broken:
         out.append("No failures.")
@@ -442,7 +427,7 @@ def detail_md(date, env, results, summary_name, charts_dir, runs_dir, mock=False
             [r.acc.error] if r.acc.error else []
         )
         out += [
-            f"### {r.name} ({LABEL[r.scenario]}): {', '.join(_failed_parts(r))}",
+            f"#### {r.name} ({LABEL[r.scenario]}): {', '.join(_failed_parts(r))}",
             "",
             f"- Error: `{_short(errors[0], 120) if errors else '—'}`",
             f"- Full excerpt: [error.log]({runs_dir}/{r.slug}/error.log)",
@@ -466,4 +451,25 @@ def detail_md(date, env, results, summary_name, charts_dir, runs_dir, mock=False
             ]
         else:
             out += ["No error.log found; add one as in the guide's §3.4.", ""]
+    return out
+
+
+def report_md(date, env, results, charts_dir, runs_dir, mock=False, owners=None):
+    """One session's report: the short summary (highlights and the table),
+    then the details. `charts_dir` and `runs_dir` are relative to the report's
+    directory."""
+    out = [
+        f"# 455-CI report · {date} · {' + '.join(_labels(results))}"
+        + (" · EXAMPLE" if mock else ""),
+        "",
+        *(EXAMPLE if mock else []),
+        (
+            f"Image `{_image_short(env.get('image'))}` · ATOM `main@{_sha(env, 'atom')}`"
+            f" · aiter `main@{_sha(env, 'aiter')}`"
+        ),
+        "",
+        *_summary(date, results, owners),
+        "",
+        *_details(date, env, results, charts_dir, runs_dir),
+    ]
     return "\n".join(out).rstrip("\n") + "\n"

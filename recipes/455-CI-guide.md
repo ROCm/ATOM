@@ -12,7 +12,8 @@
 | 周中验证 | 每周三 17:30–22:30，5 小时 | 1 个节点：e15-09 | 8K/1K 的 4 个模型 | 不构建，复用上一个周六的镜像（§2.5） |
 
 - 每场按 §3 逐个模型测，每个模型先测 GSM8K 精度、再测性能。跑挂了就记下核心 error log，接着测下一个模型。
-- 每场测完按 §4 记录，按 §5 出本场的报告：`455-CI-report-<场次日期>.md`（Highlights 和总表，给老板看）和一份详细报告，提交到 `455-CI` 分支。历史数据都留在 `recipes/455-CI/` 里（§4.4）。
+- **每测完一个模型，就把它的精度和性能数据推到 `455-CI` 分支**（§3.5），不攒到最后。数据按 §4 记录，历史数据都留在 `recipes/455-CI/` 里。
+- 全部测完后按 §5 出本场的报告 `455-CI-report-<场次日期>.md`：一个 md 文件，前面是简短 summary（Highlights 和总表，给老板看），后面是详细 summary。推到 `455-CI` 后，最后给出这个 md 文件的路径（§5.6）。
 - 只有周六构建镜像。周六构建失败时，这一周的两场都记 N/A（§2.1）。
 
 **前置条件**：
@@ -24,7 +25,12 @@
   ```
 
 - 测试机能访问 GitHub 和 PyPI。
-- 对 `ROCm/ATOM` 的 `455-CI` 分支有 push 权限。
+- 对 `ROCm/ATOM` 的 `455-CI` 分支有 push 权限。开测前在每个测试节点上 clone 这个分支，镜像信息（§2.4）、每个模型的数据（§3.5）和报告（§5.6）都提交到这里：
+
+  ```bash
+  git clone --branch 455-CI --single-branch git@github.com:ROCm/ATOM.git atom-455-ci
+  CI_DIR=$PWD/atom-455-ci/recipes/455-CI
+  ```
 
 ## 1. 测试矩阵
 
@@ -170,7 +176,7 @@ remote_tag_state "$NEW_IMAGE"          # push 前再查一次，必须是 absent
 docker push "$NEW_IMAGE"
 docker buildx imagetools inspect "$NEW_IMAGE" | grep -m1 Digest    # 记下 digest，写进报告
 
-# 记下本周镜像的信息，详细报告的"测试环境"从这里读。CI_DIR 是 455-CI 分支里的 recipes/455-CI
+# 记下本周镜像的信息，报告的 Environment 从这里读。CI_DIR 见前置条件
 mkdir -p "$CI_DIR/runs/$DATE"
 NEW_IMAGE="$NEW_IMAGE" BASE_IMAGE="$BASE_IMAGE" ATOM_SHA="$ATOM_SHA" AITER_SHA="$AITER_SHA" \
 DIGEST=$(docker buildx imagetools inspect "$NEW_IMAGE" | awk '/^Digest:/ {print $2; exit}') \
@@ -193,6 +199,7 @@ docker rm -f ci455-build-${DATE}
 
 - 第三条 LABEL 覆盖从 base 继承来的同名 label。base 的这些 label 记的是私有分支，不覆盖会误导后来的人。其他继承来的 label（如 `dsv41.atom`）描述的是 base，不是本镜像，以 `com.amd.ci455.*` 为准。
 - push 只上传新增的那一层，base 的层远端已经有了。
+- `image.json` 不用单独提交，随第一个模型的数据一起推到 `455-CI`（§3.5）。
 
 ### 2.5 测试机使用本周镜像
 
@@ -241,7 +248,7 @@ recipe 建议每个模型一节，方便按模型名找到命令：
 
 ### 3.2 每个模型的流程
 
-`RUN_DIR` 是测试机上本次的结果目录（挂进容器），跑完按 §4.4 的结构拷进 455-CI 分支。`MODEL_PATH`、`PORT` 取自 recipe。
+`MODEL` 是 §1 的 slug。`RUN_DIR` 是测试机上本次的结果目录（挂进容器），每测完一个模型就按 §3.5 拷进 455-CI 分支并推送。`MODEL_PATH`、`PORT` 取自 recipe。
 
 ```bash
 export AITER_LOG_LEVEL=WARNING                      # 压住 aiter 的刷屏日志
@@ -272,6 +279,8 @@ done
 # 4) 停 server：ATOM 不理 SIGTERM，要 kill -9 主进程和 EngineCore 进程
 kill -9 $(pgrep -f "[o]penai_server"); sleep 2; pkill -9 -f "ATOM[:][:]"
 test "$(ls /sys/class/kfd/kfd/proc | wc -l)" = 0
+
+# 5) 按 §3.5 把这个模型的数据推到 455-CI，再测下一个模型
 ```
 
 - 精度和两个并发的性能用同一个 server，中间不重启。
@@ -318,7 +327,7 @@ EOF
 下面任一情况都算失败：server 没起来或中途退出；GSM8K 或 bench 报错退出、卡住；结果文件缺失或不完整。
 
 1. **不盲目重试。** 纯环境问题（GPU 没释放、端口被占、下载失败）修好后可以重跑一次，并在报告里注明"重跑"。
-2. **摘核心 error log**，存到 `$RUN_DIR/$MODEL/error.log`，不超过 100 行。详细报告的"失败"一节会贴出它的前 60 行：
+2. **摘核心 error log**，存到 `$RUN_DIR/$MODEL/error.log`，不超过 100 行。报告详细 summary 的 Failures 一节会贴出它的前 60 行：
 
    ```bash
    LOG="$RUN_DIR/$MODEL/server.log"      # client 侧失败就换成对应的 lm_eval.log 或 bench.log
@@ -328,9 +337,34 @@ EOF
    ```
 
 3. **一句话报错**：取最后那行异常（例如 `RuntimeError: ...`），截到 150 个字符以内，写进 `accuracy.csv` 或 `perf.csv` 的 `error` 列和报告。
-4. server 挂了的话，这个模型还没测的项（精度或性能）都记 N/A，原因相同。按 3.2 第 4 步把 GPU 清干净，接着测下一个模型。
+4. server 挂了的话，这个模型还没测的项（精度或性能）都记 N/A，原因相同。按 3.2 第 4 步把 GPU 清干净，按 §3.5 上传（跑挂的结果也要上传），再测下一个模型。
 
 CI 只负责记录。要查根因就另开任务，从 ATOM 的 `/debug-guide` 开始。
+
+### 3.5 每测完一个模型就上传
+
+一个模型测完（包括跑挂）后，马上把它的精度和性能数据推到 `455-CI`，再测下一个模型。这样中途出问题也不会丢掉已经测完的数据，大家随时能在分支上看到进度。
+
+1. 按 §4.4 挑出要提交的结果文件，从 `$RUN_DIR/$MODEL` 拷到 `$CI_DIR/runs/<YYYYMMDD>/$MODEL/`。跑挂的话要包括 `error.log`。
+2. 往 `$CI_DIR/perf.csv` 追加这个模型的 c4、c64 两行，往 `accuracy.csv` 追加一行（§4.2、§4.3）。跑挂的也写，数字留空。
+3. 提交并推送：
+
+   ```bash
+   D=<YYYYMMDD>                            # 场次日期
+   cd "$CI_DIR"
+   git add perf.csv accuracy.csv "runs/$D"
+   git commit -q -m "[455-CI] $D $MODEL"
+   for i in 1 2 3; do                      # 另一个节点可能刚推过：先 rebase 到远端最新，再推
+     git pull -q --rebase --autostash origin 455-CI && git push -q origin 455-CI && break
+     sleep 10
+   done
+   git status -sb | head -1                # 出现 [ahead N] 就是还没推上去
+   ```
+
+- 周六第一个模型的这次提交会把 `runs/<YYYYMMDD>/image.json`（§2.4）一起带上去。
+- 两个节点同时追加 CSV 不会冲突：`recipes/455-CI/.gitattributes` 给 `perf.csv`、`accuracy.csv` 设了 `merge=union`，rebase 时两边新加的行都保留。其他结果文件按模型分目录，互不影响。
+- 推不上去（例如网络问题）时本地 commit 还在，可以先接着测，下一个模型上传时会一起推。不要 force push。
+- commit message 不加 `Co-Authored-By` trailer，这是 ROCm/ATOM 维护者的要求。§5.6 的提交也一样。
 
 ## 4. 记录
 
@@ -369,7 +403,7 @@ CI 只负责记录。要查根因就另开任务，从 ATOM 的 `/debug-guide` �
 | `scenario` | `endpoint` 或 `8k1k` |
 | `model` | §1 的 slug |
 | `gpus` | 每卡吞吐的分母 |
-| `parallel` | 并行策略，照 recipe 里该模型"并行"那一行写，小写、不加空格，例如 `tp8dcp8`、`tp4`。详细报告里显示的是这一列 |
+| `parallel` | 并行策略，照 recipe 里该模型"并行"那一行写，小写、不加空格，例如 `tp8dcp8`、`tp4`。报告的详细 summary 里显示的是这一列 |
 | `concurrency` | `4` 或 `64` |
 | `status` | `ok` 或 `fail` |
 | `tok_s_per_gpu` | 每卡吞吐，按 §4.1 计算，保留两位小数 |
@@ -407,7 +441,7 @@ CI 只负责记录。要查根因就另开任务，从 ATOM 的 `/debug-guide` �
 
 ### 4.4 455-CI 分支的目录结构
 
-`recipes/455-CI/` 在第一次提交结果时创建。
+`perf.csv`、`accuracy.csv` 已经建好，只有表头；`README.md` 在第一次提交报告时创建。
 
 ```text
 recipes/
@@ -419,10 +453,10 @@ recipes/
     ├── accuracy.csv       全部历史 GSM8K 精度
     ├── accuracy_baseline.csv   可选：精度图上的 baseline 参考线
     ├── owners.csv         每个模型的 owner，Highlights 里 @ 他们（§5.1）
+    ├── .gitattributes     两个 CSV 设了 merge=union，两个节点同时上传不冲突（§3.5）
     ├── tools/             生成图和报告的脚本、样例（§5.5）
-    ├── reports/           一场两份，YYYYMMDD 是场次日期
-    │   ├── 455-CI-report-<YYYYMMDD>.md          报告：Highlights 和总表
-    │   └── 455-CI-report-<YYYYMMDD>-detail.md   详细报告
+    ├── reports/           一场一份，YYYYMMDD 是场次日期
+    │   └── 455-CI-report-<YYYYMMDD>.md   简短 summary（Highlights 和总表）+ 详细 summary
     └── runs/<YYYYMMDD>/   一场一个目录：本场的原始结果和图
         ├── image.json     只在周六的目录里：本周镜像的信息（§2.4）
         ├── charts/        perf-<scenario>.png、accuracy-<scenario>.png
@@ -447,14 +481,14 @@ recipes/
 
 ## 5. 报告
 
-每个镜像出两份报告，放在 `reports/` 下，日期是镜像日期。**报告用英文写**，Highlights、表格和详细报告都是：
+全部模型测完、数据都按 §3.5 推上去之后，生成本场的报告。**一场一个 md 文件**：`reports/455-CI-report-<YYYYMMDD>.md`，日期是场次日期，例如周六 `455-CI-report-20261114.md`、周三 `455-CI-report-20261118.md`。**报告用英文写**，分两部分：
 
-| 文件 | 给谁看 | 内容 |
+| 部分 | 给谁看 | 内容 |
 |---|---|---|
-| `455-CI-report-<YYYYMMDD>.md` | 老板 | Highlights 和总表 |
-| `455-CI-report-<YYYYMMDD>-detail.md` | 要看细节的人 | 测试环境、全部数字、趋势图、跑挂 case 的核心 error log |
+| 简短 summary（`## Summary`） | 老板 | Highlights 和总表（§5.1、§5.2） |
+| 详细 summary（`## Details`） | 要看细节的人 | 测试环境、全部数字、趋势图、跑挂 case 的核心 error log（§5.3、§5.4） |
 
-每场测完生成本场的两份报告，文件名用场次日期，例如周六 `455-CI-report-20261114.md`、周三 `455-CI-report-20261118.md`。两份报告和图都用 §5.5 的脚本从 `perf.csv`、`accuracy.csv` 生成，不手填数字。样例见 [`455-CI/tools/examples/reports/`](455-CI/tools/examples/reports/)，那是 EXAMPLE（示例）：数字都是编的，不是真实测试数据。
+报告和图都用 §5.5 的脚本从 `perf.csv`、`accuracy.csv` 生成，不手填数字。样例见 [`455-CI/tools/examples/reports/`](455-CI/tools/examples/reports/)，那是 EXAMPLE（示例）：数字都是编的，不是真实测试数据。
 
 ### 5.1 Highlights
 
@@ -478,28 +512,34 @@ recipes/
 - GSM8K 看 flexible-extract，差值按点算（0.01 = 1 point）。
 - 门槛的来由：吞吐跑到跑之间有 1% 到 2% 的波动；GSM8K 在这套环境上 temp 0 也不完全确定，±0.02 以内通常是噪声。
 
-### 5.2 报告：Highlights 和总表
+### 5.2 简短 summary：Highlights 和总表
 
-格式如下（周六那场，数字是编的，owner 是占位名）：
+报告开头的格式如下（周六那场，数字是编的，owner 是占位名）：
 
 ```markdown
 # 455-CI report · <YYYY-MM-DD> · MLPerf Endpoint
 
-Image `gfx1250-atom-ci455-<YYYYMMDD>` · ATOM `main@<sha 前 9 位>` · aiter `main@<sha 前 9 位>` · [Detailed report](455-CI-report-<YYYYMMDD>-detail.md)
+Image `gfx1250-atom-ci455-<YYYYMMDD>` · ATOM `main@<sha 前 9 位>` · aiter `main@<sha 前 9 位>`
 
-## Highlights
+## Summary
+
+### Highlights
 
 - ❌ Qwen-35B-A3B: c64 failed (RuntimeError: HIP error: out of memory). @qwen35b_owner
 - 🟢 DeepSeek-V4.1-Flash: throughput up 6.9%. @v41_flash_owner
 - ✅ Kimi-K3: recovered from the previous failure. @k3_owner
 
-## Summary
+### Results
 
 | Model | Scenario | 2026-11-07 (tok/s/GPU) | 2026-11-14 (tok/s/GPU) | Delta | GSM8K delta |
 |---|---|---|---|---|---|
 | DeepSeek-V4.1-Flash | MLPerf Endpoint | 2,655 | 2,838 | 🟢 +6.9% | −0.2 pts (now 93.9%) |
 | Kimi-K3 (2.8T) | MLPerf Endpoint | 336 (2026-10-31) | 340 | +1.0% | −0.1 pts (now 96.1%) (vs 2026-10-31) |
 | Qwen-35B-A3B | MLPerf Endpoint | 6,345 | N/A | N/A | −0.1 pts (now 90.1%) |
+
+## Details
+
+……（详细 summary，§5.3）
 ```
 
 - 一个模型一行，依次是 Model、Scenario、上一场、本场、Delta、GSM8K delta。表格下面不加说明文字。
@@ -507,9 +547,9 @@ Image `gfx1250-atom-ci455-<YYYYMMDD>` · ATOM `main@<sha 前 9 位>` · aiter `m
 - Delta 只写百分比，例如 `+6.9%`。GSM8K delta 写掉了多少、现在多少，例如 `−4.6 pts (now 88.1%)`。
 - N/A 表示跑挂、没有值；— 表示没有结果；first 表示第一次有数据，没有可比的。
 
-### 5.3 详细报告
+### 5.3 详细 summary
 
-依次是以下几节，全部英文：
+紧接在简短 summary 后面，`## Details` 下依次是以下几节，全部英文：
 
 1. **Environment**：测试 image 和 digest、ATOM 和 aiter 的 branch 与 commit（带 commit 日期和标题）、测试日期。镜像信息取自构建它的那个周六目录里的 `image.json`（§2.4），缺的项从 CSV 里补。
 2. **Performance**：每个模型每个并发一行，列出并行策略（例如 `tp8dcp8`，不写 GPU 数）、tok/s/GPU 和第二指标（endpoint 是 E2E avg interactivity，8K/1K 是 ITL P50），以及各自和上一场比的变化。变化列的表头写上一场的日期，例如 `vs 2026-11-07`；某个模型上一场跑挂了，就和它最近一次成功的那场比，并在格子里注明，例如 `+1.0% (vs 2026-10-31)`。
@@ -533,35 +573,41 @@ Image `gfx1250-atom-ci455-<YYYYMMDD>` · ATOM `main@<sha 前 9 位>` · aiter `m
 cd recipes/455-CI/tools
 python3 fetch_fonts.py                              # 第一次用时下载 Instrument Sans；不下也能画
 python3 make_charts.py --date <YYYY-MM-DD>          # 场次日期（周六或周三），写 runs/<YYYYMMDD>/charts/
-python3 make_report.py --date <YYYY-MM-DD>          # 写本场的两份报告，并打印 Highlights 草稿
+python3 make_report.py --date <YYYY-MM-DD>          # 写本场的报告（一个 md），打印 Highlights 草稿，最后一行是报告路径
 ```
 
 - 每场测完跑一次，连同历史数据重新生成。
 - 生成后按 §5.1 审一遍 Highlights，再提交。
 - 改了脚本先跑测试：`python3 -m pytest -q recipes/455-CI/tools`。
 
-### 5.6 提交到 455-CI
+### 5.6 提交报告，给出路径
+
+各模型的数据已经在 §3.5 推上去了，这里只提交本场的图、报告和 README 索引：
 
 ```bash
-git clone --branch 455-CI --single-branch git@github.com:ROCm/ATOM.git atom-455-ci
-cd atom-455-ci
-# 放入 recipes/455-CI/runs/<YYYYMMDD>/，追加 perf.csv 和 accuracy.csv，
-# 按 §5.5 生成图和两份报告，审过 Highlights，更新 README.md 的索引
-git add recipes/455-CI
-git commit -m "[455-CI] <YYYY-MM-DD> MLPerf Endpoint results"    # 周三写 8K/1K results
-git push origin 455-CI
+cd "$CI_DIR"
+git pull -q --rebase --autostash origin 455-CI    # 先拉下另一个节点推的数据，报告才完整
+# 按 §5.5 生成图和报告，审过 Highlights，在 README.md 的索引最上面加一行（见下）
+git add README.md reports runs/<YYYYMMDD>/charts
+git commit -q -m "[455-CI] <YYYY-MM-DD> MLPerf Endpoint report"    # 周三写 8K/1K report
+git pull -q --rebase --autostash origin 455-CI && git push -q origin 455-CI
+git status -sb | head -1                # 不能有 [ahead N]
 ```
 
-- 每场测完提交一次：周六一次，周三一次。commit message 不加 `Co-Authored-By` trailer，这是 ROCm/ATOM 维护者的要求。
-- 不 force push，不改写历史。push 被拒就先 `git pull --rebase`，再推。
+- 不 force push，不改写历史；commit message 不加 `Co-Authored-By` trailer。
 
-`recipes/455-CI/README.md` 的索引表一场一行，每场测完在最上面加一行：
+`recipes/455-CI/README.md` 的索引表一场一行，最新的在最上面：
 
 ```markdown
 | 报告 | 场景 | 镜像 | ATOM / aiter | 结果 |
 |---|---|---|---|---|
 | [<YYYY-MM-DD>](reports/455-CI-report-<YYYYMMDD>.md) | MLPerf Endpoint | `gfx1250-atom-ci455-<YYYYMMDD>` | `<sha 前 9 位>` / `<sha 前 9 位>` | 例：3/4 跑通，❌ 1 项，⚠️ 1 项 |
 ```
+
+**最后给出报告 md 文件的路径。** push 成功后，在本场的收尾消息里写出报告的仓库路径和 GitHub 链接。`make_report.py` 输出的最后一行就是它的本地路径。例如：
+
+- `recipes/455-CI/reports/455-CI-report-20261114.md`
+- https://github.com/ROCm/ATOM/blob/455-CI/recipes/455-CI/reports/455-CI-report-20261114.md
 
 ## 6. 待补充
 

@@ -72,7 +72,7 @@ def image_json(run, digest):
     )
 
 
-def test_a_saturday_report_has_highlights_a_dated_table_and_the_core_error_log(
+def test_a_saturday_report_is_one_file_with_the_summary_then_the_details(
     tmp_path,
 ):
     write_csv(
@@ -107,24 +107,23 @@ def test_a_saturday_report_has_highlights_a_dated_table_and_the_core_error_log(
 
     main(["--date", "2026-11-14", "--data-dir", str(tmp_path)])
 
-    summary = (tmp_path / "reports" / "455-CI-report-20261114.md").read_text()
-    detail = (tmp_path / "reports" / "455-CI-report-20261114-detail.md").read_text()
+    reports = tmp_path / "reports"
+    assert [p.name for p in reports.iterdir()] == ["455-CI-report-20261114.md"]
+    report = (reports / "455-CI-report-20261114.md").read_text()
+    summary, details = report.split("\n## Details\n")
     assert summary.startswith("# 455-CI report · 2026-11-14 · MLPerf Endpoint")
-    assert (
-        "## Highlights" in summary
-        and "❌" in summary
-        and "455-CI-report-20261114-detail.md" in summary
-    )
+    assert "## Summary" in summary and "### Highlights" in summary and "❌" in summary
     assert "| Kimi-K3 (2.8T) | MLPerf Endpoint | 1,000 | N/A | N/A |" in summary
-    assert "base" not in summary.split("## Highlights")[0].lower()
-    assert "| Test date | 2026-11-14 |" in detail and "sha256:abc" in detail
-    assert "Base image" not in detail and "Dependency" not in detail
+    assert "base" not in summary.split("### Highlights")[0].lower()
+    assert "| Test date | 2026-11-14 |" in details and "sha256:abc" in details
+    assert "Base image" not in details and "Dependency" not in details
     assert (
-        "Traceback" in detail and "../runs/20261114/charts/perf-endpoint.png" in detail
+        "Traceback" in details
+        and "../runs/20261114/charts/perf-endpoint.png" in details
     )
-    assert "| Kimi-K3 (2.8T) | tp8dcp8 | 4 |" in detail
+    assert "| Kimi-K3 (2.8T) | tp8dcp8 | 4 |" in details
     assert "@k3_owner" in summary and "please" not in summary
-    assert not re.search(CJK, summary + detail)
+    assert not re.search(CJK, report)
 
 
 def test_a_wednesday_report_covers_its_own_session_on_the_saturday_image(tmp_path):
@@ -144,25 +143,32 @@ def test_a_wednesday_report_covers_its_own_session_on_the_saturday_image(tmp_pat
 
     main(["--date", "2026-11-18", "--data-dir", str(tmp_path)])
 
-    summary = (tmp_path / "reports" / "455-CI-report-20261118.md").read_text()
-    detail = (tmp_path / "reports" / "455-CI-report-20261118-detail.md").read_text()
-    assert summary.startswith("# 455-CI report · 2026-11-18 · 8K/1K")
-    assert "| GLM-5.2 | 8K/1K | 12,000 | 12,300 | +2.5% |" in summary
-    assert "MLPerf Endpoint" not in summary
+    reports = tmp_path / "reports"
+    assert [p.name for p in reports.iterdir()] == ["455-CI-report-20261118.md"]
+    report = (reports / "455-CI-report-20261118.md").read_text()
+    assert report.startswith("# 455-CI report · 2026-11-18 · 8K/1K")
+    assert "| GLM-5.2 | 8K/1K | 12,000 | 12,300 | +2.5% |" in report
+    assert "MLPerf Endpoint" not in report
     assert (
         "| Model | Scenario | 2026-11-11 (tok/s/GPU) | 2026-11-18 (tok/s/GPU) | Delta | GSM8K delta |"
-        in summary
+        in report
     )
-    assert "sha256:saturday" in detail and "| Test date | 2026-11-18 |" in detail
-    assert "../runs/20261118/charts/perf-8k1k.png" in detail
+    assert "sha256:saturday" in report and "| Test date | 2026-11-18 |" in report
+    assert "../runs/20261118/charts/perf-8k1k.png" in report
 
 
 def test_a_mock_report_says_example_at_the_top(tmp_path):
     write_csv(tmp_path / "perf.csv", PERF_COLUMNS, [perf("2026-11-14", 4, "100")])
     main(["--date", "2026-11-14", "--data-dir", str(tmp_path), "--mock"])
-    for name in ("455-CI-report-20261114.md", "455-CI-report-20261114-detail.md"):
-        head = (tmp_path / "reports" / name).read_text().splitlines()[:4]
-        assert any("EXAMPLE" in line for line in head)
+    report = tmp_path / "reports" / "455-CI-report-20261114.md"
+    assert any("EXAMPLE" in line for line in report.read_text().splitlines()[:4])
+
+
+def test_the_console_ends_with_the_report_path(tmp_path, capsys):
+    write_csv(tmp_path / "perf.csv", PERF_COLUMNS, [perf("2026-11-14", 64, "1000")])
+    main(["--date", "2026-11-14", "--data-dir", str(tmp_path)])
+    last = capsys.readouterr().out.rstrip().splitlines()[-1]
+    assert last == f"Report: {tmp_path / 'reports' / '455-CI-report-20261114.md'}"
 
 
 def test_news_about_a_model_without_an_owner_is_flagged_on_the_console(

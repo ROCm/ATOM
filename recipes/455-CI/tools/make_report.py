@@ -4,14 +4,14 @@
     python3 make_report.py --date 2026-11-18 [--scenario endpoint|8k1k] [--data-dir recipes/455-CI] [--mock]
 
 A session is one day's run (Saturday: MLPerf Endpoint on the image built that
-day; Wednesday: 8K/1K on the previous Saturday's image). Writes
-reports/455-CI-report-<YYYYMMDD>.md (highlights and the summary table) and
-reports/455-CI-report-<YYYYMMDD>-detail.md (environment, every number, the
-trend charts of make_charts.py and each failure's core error log from
-runs/<YYYYMMDD>/<slug>/error.log), and prints the highlights, tagging each model's owner from owners.csv
-(columns model, owner) and warning about news without an owner. The image comes
-from runs/<image date>/image.json, written when the image was built
-(455-CI-guide.md §2.4), else from the CSV rows.
+day; Wednesday: 8K/1K on the previous Saturday's image). Writes one file,
+reports/455-CI-report-<YYYYMMDD>.md: the short summary (highlights, tagging
+each model's owner from owners.csv, and the summary table), then the details
+(environment, every number, the trend charts of make_charts.py and each
+failure's core error log from runs/<YYYYMMDD>/<slug>/error.log). Prints the
+highlights, a warning for news without an owner, and last the report's path.
+The image comes from runs/<image date>/image.json, written when the image was
+built (455-CI-guide.md §2.4), else from the CSV rows.
 """
 
 import argparse
@@ -19,7 +19,7 @@ import json
 import os
 
 from ci455_data import MODELS, acc_cell, perf_cells, read_csv
-from ci455_report import ModelResult, detail_md, highlights, missing_owners, summary_md
+from ci455_report import ModelResult, highlights, missing_owners, report_md
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -96,29 +96,27 @@ def main(argv=None):
     }
 
     out = os.path.join(args.data_dir, "reports")
-    summary, detail = f"455-CI-report-{tag}.md", f"455-CI-report-{tag}-detail.md"
+    path = os.path.abspath(os.path.join(out, f"455-CI-report-{tag}.md"))
     os.makedirs(out, exist_ok=True)
-    with open(os.path.join(out, summary), "w", encoding="utf-8") as f:
-        f.write(summary_md(day, env, results, detail, args.mock, owners))
-    with open(os.path.join(out, detail), "w", encoding="utf-8") as f:
+    with open(path, "w", encoding="utf-8") as f:
         f.write(
-            detail_md(
+            report_md(
                 day,
                 env,
                 results,
-                summary,
                 os.path.relpath(os.path.join(run_dir, "charts"), out),
                 os.path.relpath(run_dir, out),
                 args.mock,
+                owners,
             )
         )
-    print(f"wrote {os.path.join(out, summary)}\nwrote {os.path.join(out, detail)}\n")
     for line in highlights(results, owners):
         print("-", line)
     for name in missing_owners(results, owners):
         print(
             f"WARNING: {name} is in the highlights but has no owner in owners.csv, so nobody is tagged."
         )
+    print(f"\nReport: {path}")
 
 
 if __name__ == "__main__":
