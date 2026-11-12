@@ -4,13 +4,16 @@
 
 **目的**：暴露热点模型在 ATOM main + aiter main 上的支持度和覆盖度，也就是能不能跑起来、性能是多少。所以只用 main，依赖也跟着 main 走。跑挂本身就是结果，要如实记录。
 
-每次测试按顺序做五件事：
+**每周一轮，一轮只建一个镜像**，周末和周中的测试都用它：
 
-1. 按 §1 确定场景和模型：周末跑 MLPerf Endpoint，周中跑 8K/1K。
-2. 按 §2 在固定的 base 镜像里重装 ATOM main 和 aiter main，推成 `rocm/fw-bringup-mlperf:gfx1250-atom-<YYYYMMDD>`。
-3. 按 §3 用 recipe 里的命令逐个模型跑。跑挂了就记下核心 error log，接着跑下一个。
-4. 按 §4 记录指标，追加到 `455-CI/history.csv`。
-5. 按 §5 写本次汇总、画对比图，提交到 `455-CI` 分支。
+| 时间 | 做什么 |
+|---|---|
+| 周六开测前 | 按 §2 构建本周镜像：DSV4.1 MLPerf base 镜像 + 当时的 ATOM main 和 aiter main，推成 `rocm/fw-bringup-mlperf:gfx1250-atom-<周六日期>` |
+| 周末（周六起） | 用本周镜像按 §3 跑 MLPerf Endpoint 的 4 个模型；按 §4 记录，按 §5 建本周汇总、画图，提交到 `455-CI` 分支 |
+| 周中 | 不重建镜像，用同一个本周镜像跑 8K/1K 的 4 个模型；记录，补全本周汇总，提交 |
+
+- 跑挂了就记下核心 error log，接着跑下一个模型。
+- 同一个镜像测出的所有结果都归在这个镜像名下（§4.3），存进 `455-CI` 分支。对比图上一个镜像就是一条曲线。
 
 **前置条件**：docker 已登录，且对 `rocm/fw-bringup-mlperf` 有 push 权限；测试机能访问 GitHub 和 PyPI；对 `ROCm/ATOM` 的 `455-CI` 分支有 push 权限。
 
@@ -31,18 +34,19 @@
 - **slug** 用作目录名和 `history.csv` 的 `model` 列。定下来就不要改，否则新旧数据对不上。
 - 8K/1K 的输入输出长度、请求数等参数以 recipe 为准。
 
-## 2. 准备测试镜像
+## 2. 准备本周镜像（每周六一次）
 
 ### 2.1 规则
 
-- **base 镜像固定**为 `rocm/fw-bringup-mlperf:gfx1250-atom-20261110-dsv41`。要换 base 先和负责人确认，并在汇总里写明：换 base 前后的数字不能直接比。
+- **每周只建一次**：周六开测前建，周中的 8K/1K 直接用它（§2.5），不重建。
+- **base 镜像固定**为 DSV4.1 MLPerf 镜像 `rocm/fw-bringup-mlperf:gfx1250-atom-20261110-dsv41`。要换 base 先和负责人确认，并在汇总里写明：换 base 前后的数字不能直接比。
 - **只重装 ATOM 和 aiter，且只用 `ROCm/ATOM` 和 `ROCm/aiter` 的 `main`。** 不 checkout 私有分支或 PR，不 cherry-pick，不打 patch。镜像里 `/app/endpoints-recipe-*/patches` 这类补丁也不用。
 - **其他组件保持 base 原样**（torch、triton、mori 等），只有 ATOM / aiter main 自己锁定版本的依赖跟着 main 走。例如 aiter main 锁定 `flydsl==0.5.0`，安装时会替换镜像原来的 FlyDSL。这正是本 CI 要暴露的状态：不要手动换回，把变化记进汇总的"依赖变化"。
-- **构建失败**（clone、安装或 import 不通过）时，本次所有模型都记 N/A，error 写构建的核心报错。不要改用私有分支凑合。
+- **构建失败**（clone、安装或 import 不通过）时，本周两个场景的所有模型都记 N/A，error 写构建的核心报错。周中不另建镜像，要补建先和负责人确认。不要改用私有分支凑合。
 
 ### 2.2 命名和同名检查
 
-新镜像命名为 `rocm/fw-bringup-mlperf:gfx1250-atom-<YYYYMMDD>`，日期取构建当天（北京时间）。开始构建前查一次远端有没有同名镜像，push 前再查一次：
+新镜像命名为 `rocm/fw-bringup-mlperf:gfx1250-atom-<YYYYMMDD>`，日期取周六构建当天（北京时间）。开始构建前查一次远端有没有同名镜像，push 前再查一次：
 
 ```bash
 BASE_IMAGE=rocm/fw-bringup-mlperf:gfx1250-atom-20261110-dsv41
@@ -138,7 +142,18 @@ docker rm -f ci455-build-${DATE}
 
 - 第三条 LABEL 覆盖从 base 继承来的同名 label。base 的这些 label 记的是私有分支，不覆盖会误导后来的人。
 - push 只上传新增的那一层，base 的层远端已经有了。
-- Kimi-K3 的两个节点都要 `docker pull` 同一个 `$NEW_IMAGE`。
+
+### 2.5 测试机使用本周镜像
+
+周末和周中的所有测试机，包括 Kimi-K3 的两个节点，都 pull 同一个本周镜像。周中不重建、不重推，开测前先核对用的是本周镜像：
+
+```bash
+NEW_IMAGE=rocm/fw-bringup-mlperf:gfx1250-atom-<本周六日期>    # README 索引第一行的镜像
+docker buildx imagetools inspect "$NEW_IMAGE" --format '{{json .Image.Config.Labels}}' | tr ',' '\n' | grep ci455
+docker pull "$NEW_IMAGE"
+```
+
+能看到 `com.amd.ci455.*` 这几个 label，而且 commit 和本周汇总里写的一致，才开测。周六构建失败、没有本周镜像时，8K/1K 也记 N/A，原因同周六的构建失败。
 
 ## 3. 跑测试
 
@@ -248,12 +263,12 @@ CI 只负责记录。要查根因就另开任务，从 ATOM 的 `/debug-guide` �
 
 ### 4.2 history.csv
 
-每个模型的每个并发，每次测试写一行。失败也写，数字留空。只追加不修改；历史行要更正时单独提一个 commit，并在 message 里写明原因。
+每个模型的每个并发，每次测试写一行。失败也写，数字留空。只追加不修改；历史行要更正时单独提一个 commit，并在 message 里写明原因。同一个镜像上重跑同一个模型时追加新行，`note` 写"重跑"，汇总和画图取这个镜像上最后一次的结果。
 
 | 列 | 内容 |
 |---|---|
-| `run_id` | `<YYYYMMDD>-<scenario>`，同一天重跑加 `-r2` |
-| `date` | 测试开始日期（北京时间），`YYYY-MM-DD` |
+| `image_date` | 本周镜像的日期（周六），`YYYY-MM-DD`。同一个镜像的两个场景共用，是汇总和对比图的单位 |
+| `test_date` | 实际测试日期（北京时间），`YYYY-MM-DD` |
 | `scenario` | `endpoint` 或 `8k1k` |
 | `model` | §1 的 slug |
 | `gpus` | 每卡吞吐的分母 |
@@ -280,12 +295,12 @@ recipes/
 ├── 455-CI-guide.md        本文件
 ├── 455-CI-recipe.md       各模型的 server / bench 命令
 └── 455-CI/
-    ├── README.md          历次测试的索引，最新的在最上面
+    ├── README.md          各镜像的索引，最新的在最上面
     ├── history.csv        全部历史数据，对比图从这里画
-    └── runs/<run_id>/
-        ├── summary.md     本次汇总
+    └── runs/<YYYYMMDD>/   一个镜像一个目录，YYYYMMDD 是镜像日期
+        ├── summary.md     这个镜像的汇总：周末写 MLPerf Endpoint，周中补 8K/1K
         ├── charts/<slug>.png
-        └── <slug>/
+        └── <slug>/        两个场景的模型不重名，放在同一层
             ├── server_cmd.sh  bench_cmd.sh
             ├── c4/  c64/      结果文件
             └── error.log      只在失败时有
@@ -306,28 +321,34 @@ recipes/
 
 ### 5.1 summary.md
 
-每次测试写一份 `runs/<run_id>/summary.md`，内容和顺序固定：
+每个镜像一份 `runs/<YYYYMMDD>/summary.md`，内容和顺序固定。周末测完创建，填镜像信息和 MLPerf Endpoint 一节，8K/1K 一节先写"待测（周中）"；周中测完补上 8K/1K。
 
 ````markdown
-# 455-CI · <YYYY-MM-DD> · MLPerf Endpoint
+# 455-CI · gfx1250-atom-<YYYYMMDD>
 
 | 项目 | 内容 |
 |---|---|
-| 测试日期 | <YYYY-MM-DD>（北京时间） |
 | 测试 image | `rocm/fw-bringup-mlperf:gfx1250-atom-<YYYYMMDD>`（digest `sha256:<...>`） |
 | base image | `rocm/fw-bringup-mlperf:gfx1250-atom-20261110-dsv41` |
 | ATOM | `main` @ [`<sha 前 9 位>`](https://github.com/ROCm/ATOM/commit/<sha>)，<commit 日期> <标题> |
 | aiter | `main` @ [`<sha 前 9 位>`](https://github.com/ROCm/aiter/commit/<sha>)，<commit 日期> <标题> |
 | 依赖变化 | 2.3 里 diff 的结果，例如 flydsl 版本变化；没有就写"无" |
+| 测试日期 | MLPerf Endpoint <YYYY-MM-DD>；8K/1K <YYYY-MM-DD>（北京时间） |
 
-## 结果
+## MLPerf Endpoint
 
-| 模型 | GPU | 并发 | tok/s/GPU | vs 上次 | Interactivity (tok/s/user) | vs 上次 |
+| 模型 | GPU | 并发 | tok/s/GPU | vs 上次 | E2E avg interactivity (tok/s/user) | vs 上次 |
 |---|---|---|---|---|---|---|
 | DeepSeek R1 | 4 | 4 | <数值> | <±x.x%> | <数值> | <±x.x%> |
 | | | 64 | <数值> | <±x.x%> | <数值> | <±x.x%> |
 | Kimi-K3 (2.8T) | 8 | 4 | N/A | | N/A | |
 | | | 64 | N/A | | N/A | |
+
+## 8K/1K
+
+| 模型 | GPU | 并发 | tok/s/GPU | vs 上次 | ITL P50 (ms) | vs 上次 |
+|---|---|---|---|---|---|---|
+| 待测（周中） | | | | | | |
 
 ## 失败
 
@@ -340,8 +361,7 @@ recipes/
 ![DeepSeek R1](charts/deepseek-r1.png)
 ````
 
-- 8K/1K 的表把 Interactivity 两列换成 ITL P50 (ms)。
-- **vs 上次**：和同模型、同并发最近一次成功的结果比，写成 `+2.1%` 或 `−6.3%` 这样。第一次有数据的写"首次"。
+- **vs 上次**：和同模型、同并发在之前的镜像上最近一次成功的结果比，写成 `+2.1%` 或 `−6.3%` 这样。第一次有数据的写"首次"。
 - **回退标记**沿用 ATOM benchmark dashboard 的阈值：变差 5% 及以上标 ⚠️，10% 及以上标 🔴。tok/s/GPU 和 interactivity 下降算变差，ITL P50 上升算变差。
 - 失败的写 N/A，并在"失败"一节给出一句话核心报错和 error.log 链接。
 
@@ -349,7 +369,7 @@ recipes/
 
 MLPerf Endpoint 的图沿用 [LLM-Booster#246 的 MLPerf Endpoints 性能图](https://github.com/wuhuikx/LLM-Booster/issues/246#issuecomment-6678717093)，8K/1K 的图按 ATOM benchmark dashboard 的 Throughput vs Latency 图画。两种图都**只画 455-CI 自己测的历史数据**，不画 NVIDIA、MI355、PD 模拟或任何其他来源的数据。
 
-每个模型一张图，存为 `charts/<slug>.png`。数据全部取自 `history.csv`，每次连同本次结果一起重画，不手工改图。
+每个模型一张图，存为 `charts/<slug>.png`：周末测完画 MLPerf Endpoint 的 4 张，周中测完画 8K/1K 的 4 张。数据全部取自 `history.csv`，每次连同本次结果一起重画，不手工改图。
 
 | | MLPerf Endpoint | 8K/1K |
 |---|---|---|
@@ -360,12 +380,12 @@ MLPerf Endpoint 的图沿用 [LLM-Booster#246 的 MLPerf Endpoints 性能图](ht
 
 下面这些两种图一样：
 
-- **曲线**：每次 CI 一条，点是并发 4 和 64，每个点都标 cN。
-- **画几条**：最近 4 次有数据的运行，对应色阶的 4 级。更早的留在 `history.csv` 里。
+- **曲线**：每个镜像一条，点是并发 4 和 64，每个点都标 cN。
+- **画几条**：最近 4 个有数据的镜像，对应色阶的 4 级。更早的留在 `history.csv` 里。
 - **颜色**：红色菱形，越新越深，从旧到新依次是 `#F5998A`、`#E8452C`、`#C42B4B`、`#9B1C1C`。不足 4 条时取最深的几级。
 - **线型**：最新的一条（通常就是本次）画实线，其余画虚线。阶梯线的实线水平 4 px、竖直 2.4 px，虚线水平 3 px、竖直 1.8 px；8K/1K 的直线实线 4 px、虚线 3 px。
-- **图例**只写名字和 GPU 数，例如 `AMD MI455 (ATOM main) · 11-15 · 8 GPUs`。副标题列出日期，例如 `455-CI · MI455 (gfx1250) · 10-25 → 11-01 → 11-08 → 11-15`，不再写模型名。
-- **本次跑挂**时图上没有本次的曲线，在图内右上角的 note 写 `11-15 run failed (N/A), see summary.`。
+- **图例**只写名字和 GPU 数，日期用镜像日期，例如 `AMD MI455 (ATOM main) · 11-14 · 8 GPUs`。副标题列出这几个镜像的日期，例如 `455-CI · MI455 (gfx1250) · 10-24 → 10-31 → 11-07 → 11-14`，不再写模型名。
+- **本次跑挂**时图上没有本次的曲线，在图内右上角的 note 写 `11-14 image: run failed (N/A), see summary.`。
 - **脚注两行**：第一行写数据来源 `AMD MI455: 455-CI runs on ATOM main + aiter main, self-measured, not verified by MLCommons.`；第二行写坐标说明，加上 `cN = concurrency`。
 - 不加放大框、箭头和汇总表。输出 2 倍分辨率的 PNG，2640 px 宽，字体用 #246 里 `fetch_fonts.py` 下载的 Instrument Sans。
 
@@ -374,21 +394,21 @@ MLPerf Endpoint 的图沿用 [LLM-Booster#246 的 MLPerf Endpoints 性能图](ht
 ```bash
 git clone --branch 455-CI --single-branch git@github.com:ROCm/ATOM.git atom-455-ci
 cd atom-455-ci
-# 放入 recipes/455-CI/runs/<run_id>/，追加 history.csv，在 README.md 的索引表最上面加一行
+# 放入 recipes/455-CI/runs/<YYYYMMDD>/，追加 history.csv，更新 README.md 的索引表
 git add recipes/455-CI
-git commit -m "[455-CI] <run_id> results"
+git commit -m "[455-CI] gfx1250-atom-<YYYYMMDD>: MLPerf Endpoint results"    # 周中写 8K/1K results
 git push origin 455-CI
 ```
 
-- 一次测试一个 commit。commit message 不加 `Co-Authored-By` trailer，这是 ROCm/ATOM 维护者的要求。
+- 每个场景测完提交一次：周末一次，周中一次。commit message 不加 `Co-Authored-By` trailer，这是 ROCm/ATOM 维护者的要求。
 - 不 force push，不改写历史。push 被拒就先 `git pull --rebase`，再推。
 
-`recipes/455-CI/README.md` 的索引表格式：
+`recipes/455-CI/README.md` 的索引表一个镜像一行。周末测完在最上面加一行，周中测完更新同一行的 8K/1K 列：
 
 ```markdown
-| 日期 | 场景 | 测试 image | 结果 | 汇总 |
+| 镜像 | ATOM / aiter | MLPerf Endpoint | 8K/1K | 汇总 |
 |---|---|---|---|---|
-| <YYYY-MM-DD> | MLPerf Endpoint | `gfx1250-atom-<YYYYMMDD>` | 例：3/4 通过，Kimi-K3 失败；⚠️ 1 项 | [summary](runs/<run_id>/summary.md) |
+| `gfx1250-atom-<YYYYMMDD>` | `<sha 前 9 位>` / `<sha 前 9 位>` | 例：3/4 通过，Kimi-K3 失败；⚠️ 1 项 | 待测（周中） | [summary](runs/<YYYYMMDD>/summary.md) |
 ```
 
 ## 6. 待补充
