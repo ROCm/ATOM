@@ -408,25 +408,31 @@ class UmbpBlockPool(KVBlockPool):
             self.pool_id, [_key(h) for h in hashes]
         )
         index = self._hash_to_block_id
-        gone: list[int] = []
+        # What UMBP destroyed to make room comes first, and on its own: a
+        # fetch that stops early (a copy or a lower tier failed) has emptied
+        # destinations it then did not fill, so they are not among `slots`.
+        for key in evicted:
+            block_id = index.get(_hash(key))
+            if block_id is None or block_id in self._used:
+                raise RuntimeError(
+                    f"UMBP pool {self.pool_id}: local view diverged "
+                    f"(UMBP evicted a block this view does not hold free)"
+                )
+            self._forget(block_id)
         for i, block_id in enumerate(slots):
             h = hashes[i]
             current = index.get(h)
             if current == block_id:
                 continue
-            if current is not None or block_id in self._used:
+            if current is not None or block_id in self._used or self._indexed(block_id):
                 raise RuntimeError(
                     f"UMBP pool {self.pool_id}: local view diverged on fetch"
                 )
-            evicted_hash = self._forget(block_id)
-            if evicted_hash != -1:
-                gone.append(evicted_hash)
             block = self.blocks[block_id]
             block.hash = h
             block.token_ids = tokens_of(i)
             index[h] = block_id
             self._cached_free += 1
-        self._check_evicted(gone, evicted)
         elapsed = time.perf_counter() - started
         self.blocks_fetched += copied
         self.bytes_fetched += copied_bytes
