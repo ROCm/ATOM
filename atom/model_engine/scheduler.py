@@ -5070,13 +5070,13 @@ class Scheduler:
     def _prioritize_ready_remote_kv_requests(self) -> None:
         """Prioritize completed remote requests before sizing prefill work.
 
-        Runs only when a load completed or failed. Offload
-        completions are resolved here, and every settled resume that keeps its
-        blocks (not only the ones that just completed) moves ahead of the
-        other waiters in one stable pass. Nothing is re-sorted on the ticks
-        after: the one way a blocker gets ahead of a resume is `preempt`, which
-        queues behind them. A P/D-only receive is only
-        reordered here; admission resolves it before its first decode.
+        Runs only when a load completed or failed. Offload completions are
+        resolved here, and every settled resume that keeps its blocks (not only
+        the ones that just completed) moves ahead of the other waiters in one
+        stable pass. Nothing is re-sorted on the ticks after: the one way a
+        blocker gets ahead of a resume is `preempt`, which queues behind them.
+        A P/D-only receive is only reordered here; admission resolves it before
+        its first decode.
         """
         if not self.waiting:
             return
