@@ -14,6 +14,14 @@ def _jobs(filename):
     return yaml.safe_load((WORKFLOWS / filename).read_text())["jobs"]
 
 
+def test_empty_accuracy_model_list_skips_the_job_only_on_pull_requests():
+    job = _jobs("atomesh-accuracy-validation.yaml")["atomesh-test"]
+    assert (
+        "(github.event_name != 'pull_request' || "
+        "needs.load-test-models.outputs.models_json != '[]')"
+    ) in job["if"]
+
+
 def test_mocker_benchmark_stays_off_pull_requests():
     jobs = _jobs("atomesh-mocker-benchmark.yaml")
     benchmark = jobs["run_atomesh_mocker_benchmark"]
