@@ -742,11 +742,15 @@ def test_a_scheduled_batch_carries_every_structured_request(
 
 @pytest.mark.parametrize("fields", STRUCTURED)
 def test_a_finished_structured_request_releases_its_grammar(seq_factory, fields):
-    from atom.model_engine.engine_core import EngineCore
+    from aiter_stub import atom_without_aiter
+
     from atom.sampling_params import SamplingParams
 
     seq = seq_factory([1, 2, 3, 4], sampling_params=SamplingParams(**fields))
     calls = []
     core = NS(runner_mgr=NS(call_func=lambda *args: calls.append(args)))
-    EngineCore._release_request_resources(core, [seq])
+    with atom_without_aiter() as load:
+        load("atom.model_engine.engine_core").EngineCore._release_request_resources(
+            core, [seq]
+        )
     assert ("release_structured_requests", [seq.id]) in calls
