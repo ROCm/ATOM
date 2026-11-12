@@ -137,6 +137,27 @@ def test_channel_backend_keeps_gpu_carry_and_draft_metadata(monkeypatch, carry):
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("vocab", [2, 4097])
+@pytest.mark.parametrize("token_stride", [1, 2])
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_intersection_guard_respects_token_stride(dtype, vocab, token_stride, device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("Requires a GPU for the real intersection kernel")
+    storage = torch.full((6, vocab * token_stride), 7.0, dtype=dtype, device=device)
+    logits = storage[::2, ::token_stride]
+    logits.fill_(-float("inf"))
+    storage[2].fill_(-float("inf"))
+    logits[1, -1] = 7.0
+    before = storage.clone()
+    invalid = boundary._guard_empty_rows(
+        logits, torch.tensor([True, True, False], device=device)
+    )
+    assert invalid.tolist() == [True, False, False]
+    before[0, 0] = 0.0
+    torch.testing.assert_close(storage, before)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("select_tail", [False, True])
 def test_gpu_guard_row_address_exceeds_int32(dtype, select_tail):
     if not torch.cuda.is_available():

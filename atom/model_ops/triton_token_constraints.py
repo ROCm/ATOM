@@ -63,6 +63,7 @@ def apply_packed_bitmask(logits, masks, rows):
 def _finite_tiles(
     logits,
     stride,
+    token_stride,
     selected,
     partial,
     vocab: tl.constexpr,
@@ -71,9 +72,11 @@ def _finite_tiles(
 ):
     row, tile = tl.program_id(0).to(tl.int64), tl.program_id(1)
     if tl.load(selected + row):
-        columns = tile * BLOCK + tl.arange(0, BLOCK)
+        columns = tile.to(tl.int64) * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
         values = tl.load(
-            logits + row * stride + columns, columns < vocab, other=float("-inf")
+            logits + row * stride + columns * token_stride,
+            columns < vocab,
+            other=float("-inf"),
         )
         finite = (values > float("-inf")) & (values < float("inf"))
         tl.store(partial + row * tiles + tile, tl.sum(finite.to(tl.int32), 0) > 0)
@@ -92,6 +95,7 @@ def guard_empty_rows(logits, selected):
     _finite_tiles[(logits.shape[0], tiles)](
         logits,
         logits.stride(0),
+        logits.stride(1),
         selected,
         partial,
         vocab=logits.shape[1],

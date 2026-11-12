@@ -6,11 +6,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from atom.model_engine.token_constraints import TokenConstraints
+
 
 def test_rejected_future_draft_does_not_fail_current_output():
-    TokenConstraints = pytest.importorskip(
-        "atom.model_engine.token_constraints", exc_type=ImportError
-    ).TokenConstraints
     step = TokenConstraints()
     step.logits = torch.zeros(1, 4)
     step.invalid = torch.tensor([True])
@@ -56,7 +55,6 @@ def test_failure_uses_output_copy_without_poisoning_gpu_carry(deferred, spec):
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 def test_channel_cannot_restore_schema_forbidden_token(device):
-    pytest.importorskip("triton")
     from atom.model_ops.required_channel import (
         DeviceChannel,
         constrain_logits,
