@@ -4,7 +4,8 @@
 # fmt: off
 """The mHC front of the decode layer (FFN front and attention front, one copy of the code: front_any).
 
-96 CTAs = 6 groups x 16 positions, one 16-CTA hw cluster a group; CTA (g, p) owns tokens 8g..8g+7 and hidden cols
+96 CTAs = 6 groups x 16 positions up to 48 rows (12 groups, 192 CTAs at 96: front_ctas), one 16-CTA hw cluster a
+group; CTA (g, p) owns tokens 8g..8g+7 and hidden cols
 [320p, 320p+320):
   A  R'_j = bf16(post_j*y + sum_h comb[h][j]*R_h), x1 = bf16(sum_j pre_j*R'_j), square sums      (mhc_fused_post_pre_delayed)
      (an attention front before an Engram layer: + gate . value, _engram_gate)
@@ -35,7 +36,8 @@ from atom.models.deepseek_v41.mono.gfx1250.kernels import dims as D
 from atom.models.deepseek_v41.mono.gfx1250.kernels.attention import q8words, bf, cluster_sync, e8m0_of, inv_pow2, pack4, rsq, to_e4m3
 from atom.models.deepseek_v41.mono.gfx1250.kernels.moe import sched_barrier
 
-T, H, NG, TG, CL, NE, TOPK = D.T_MAX, D.HID, 6, 8, D.CL, D.EXPERTS, D.TOPK
+T, H, TG, CL, NE, TOPK = D.T_MAX, D.HID, 8, D.CL, D.EXPERTS, D.TOPK
+NG = T // TG   # token groups at the widest step (12): the scratch's capacity
 
 
 def router(c):
@@ -48,7 +50,13 @@ def router(c):
 
 COLS = H // CL          # 320
 CP = COLS + 8           # padded LDS row (bf16)
-FRONT_CTAS = NG * CL    # 96
+FRONT_CTAS = D.NARROW_T // TG * CL    # 96: the CTAs of a front up to 48 rows
+
+
+def front_ctas(TR):
+    """The front's CTAs for TR rows: 96 up to 48 rows (6 groups, as every narrow build), else a group of 8 tokens a
+    16-CTA cluster."""
+    return max(FRONT_CTAS, -(-TR // TG) * CL)
 F32, I32, I64, BF16 = fx.Float32, fx.Int32, fx.Int64, fx.BFloat16
 # LDS layout (bytes)
 O_RP = 0                                  # R' bf16 [16][4][CP] (rows 8..15 zero: the WMMA M padding)

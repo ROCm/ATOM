@@ -7,7 +7,7 @@
 Rows r = req * 6 + k (k = 0..4: the rows that verify draft x_k of the
 request, k = 5: the bonus row), 5 CTAs a row, 4 ranks (vocab shards of VR columns), as sample_common.
 
-sp [48][8] (16 + 16 B a row): invT f32, topp f32, seed i32, greedy i32 | invTd f32 (draft 1/T), hasq i32 (q of this request's
+sp [T][8] (16 + 16 B a row): invT f32, topp f32, seed i32, greedy i32 | invTd f32 (draft 1/T), hasq i32 (q of this request's
 drafts kept by the kernel's prob drafter last step), qsrc i32 (its row in that step's qlog), seed_acc i32.
 qlog [8][5][VR] f32: this rank's pre-temperature draft logits of the previous step (markov_prob writes them).
 dids [8][5] i32 drafts being verified. prow [48][8] (32 B a row) scratch. Outputs: outtok [8][6],
@@ -110,13 +110,14 @@ def _lw(sm, src, q, kind=F32):
 
 @ASTRewriter.transform
 def sample_once_p(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, recv, rank, tag0, sp, qlog, dids, prow, outtok,
-                  verdict, anc, qids=None, ctxp=None):
+                  verdict, anc, qids=None, ctxp=None, rows=48, cpr=CPR, nreq=8):
+    """rows: the target rows sampled (48 up to 8 requests, else 96), cpr CTAs a row, nreq requests verified."""
     t = hx.opaque_v(t)
     b = hx.opaque_s(b)
-    row = b // CPR
-    c = b % CPR
-    act = b < ROWS * CPR
-    row = fx.min(row, I32(ROWS - 1))
+    row = b // cpr
+    c = b % cpr
+    act = b < rows * cpr
+    row = fx.min(row, I32(rows - 1))
     req = row // (ND + 1)
     k = row % (ND + 1)
     spb = sp + i64(row) * (SPW * 4)
@@ -137,7 +138,7 @@ def sample_once_p(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, recv, rank,
         for p_ in range_constexpr(ND):
             useq = useq & (hx.gload(dids + i64(req * ND + p_) * 4, I32) == hx.gload(qids + i64(qsrc * ND + p_) * 4, I32))
     xk = hx.gload(dids + i64(req * ND + fx.min(k, I32(ND - 1))) * 4, I32)
-    CH = (V + CPR - 1) // CPR
+    CH = (V + cpr - 1) // cpr
     PT = (CH + 255) // 256
     c0 = c * CH
     base = lg + i64(row) * (V * 4)
@@ -197,25 +198,25 @@ def sample_once_p(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, recv, rank,
                                                      hx.lload(sm + 2048 + (t + d2) * 12 + 8, F32)))
         gpu.barrier()
     if act & (t < 2):
-        hx.gstore(rec0 + i64(row * CPR + c) * 8 + i64(t) * 4, hx.lload(sm + t * 4, F32))
-    if act & (t < 3):   # q statistics after the (m, s) records: [ROWS*CPR][4] f32
-        hx.gstore(rec0 + i64(ROWS * CPR * 8) + i64(row * CPR + c) * 16 + i64(t) * 4, hx.lload(sm + 2048 + t * 4, F32))
+        hx.gstore(rec0 + i64(row * cpr + c) * 8 + i64(t) * 4, hx.lload(sm + t * 4, F32))
+    if act & (t < 3):   # q statistics after the (m, s) records: [rows*cpr][4] f32
+        hx.gstore(rec0 + i64(rows * cpr * 8) + i64(row * cpr + c) * 16 + i64(t) * 4, hx.lload(sm + 2048 + t * 4, F32))
     handoff(cnt, t, NCT)
     # P1: rank-row (m, s) and (mq, sq, dx) -> exchange -> global; histogram of z in [M - R, M)
     mr = F32(-1e30)
-    for q in range_constexpr(CPR):
-        mr = fx.max(mr, hx.gload(rec0 + i64(row * CPR + q) * 8, F32))
+    for q in range_constexpr(cpr):
+        mr = fx.max(mr, hx.gload(rec0 + i64(row * cpr + q) * 8, F32))
     sr = F32(0.0)
-    for q in range_constexpr(CPR):
-        sr = sr + hx.gload(rec0 + i64(row * CPR + q) * 8 + i64(4), F32) * expf(hx.gload(rec0 + i64(row * CPR + q) * 8, F32) - mr)
-    qb = rec0 + i64(ROWS * CPR * 8) + i64(row * CPR) * 16
+    for q in range_constexpr(cpr):
+        sr = sr + hx.gload(rec0 + i64(row * cpr + q) * 8 + i64(4), F32) * expf(hx.gload(rec0 + i64(row * cpr + q) * 8, F32) - mr)
+    qb = rec0 + i64(rows * cpr * 8) + i64(row * cpr) * 16
     mqr = F32(-1e30)
     dxr = F32(NEG)
-    for q in range_constexpr(CPR):
+    for q in range_constexpr(cpr):
         mqr = fx.max(mqr, hx.gload(qb + i64(q * 16), F32))
         dxr = fx.max(dxr, hx.gload(qb + i64(q * 16 + 8), F32))
     sqr = F32(0.0)
-    for q in range_constexpr(CPR):
+    for q in range_constexpr(cpr):
         sqr = sqr + hx.gload(qb + i64(q * 16 + 4), F32) * expf(hx.gload(qb + i64(q * 16), F32) - mqr)
     xchg6(recv, rank, 0, row, c, t, sm, [mr.bitcast(I32), sr.bitcast(I32), mqr.bitcast(I32), sqr.bitcast(I32),
                                           dxr.bitcast(I32), I32(0)], tag0, mid=_ctxmid(ctxp, 0))
@@ -244,16 +245,16 @@ def sample_once_p(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, recv, rank,
             hx.latomic_add_f32(sm + bi * 4, expf(z - M))
     gpu.barrier()
     if act:
-        hx.gstore(rec1 + (i64(row * CPR + c) * NB + i64(t)) * 4, hx.lload(sm + t * 4, F32))
+        hx.gstore(rec1 + (i64(row * cpr + c) * NB + i64(t)) * 4, hx.lload(sm + t * 4, F32))
     handoff(cnt + i64(4), t, NCT)
     # P2: crossing bin b1; sub-histogram inside it
     target = topp * Z
     hs = F32(0.0)
-    for q in range_constexpr(CPR):
-        hs = hs + hx.gload(rec1 + (i64(row * CPR + q) * NB + i64(t)) * 4, F32)
+    for q in range_constexpr(cpr):
+        hs = hs + hx.gload(rec1 + (i64(row * cpr + q) * NB + i64(t)) * 4, F32)
     hx.lstore(sm + t * 4, hs)
     gpu.barrier()
-    xchg_hist(recv, rank, 1, row, c, t, sm, tag0 + 1, mid=_ctxmid(ctxp, 1))
+    xchg_hist(recv, rank, 1, row, c, t, sm, tag0 + 1, mid=_ctxmid(ctxp, 1), cpr=cpr)
     suffix_scan(sm, t)
     b1, rem1 = crossing(sm, t, target)
     hx.lstore(sm + t * 4, F32(0.0))
@@ -268,15 +269,15 @@ def sample_once_p(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, recv, rank,
                 hx.latomic_add_f32(sm + bi * 4, expf(z - M))
     gpu.barrier()
     if act:
-        hx.gstore(rec2 + (i64(row * CPR + c) * NB + i64(t)) * 4, hx.lload(sm + t * 4, F32))
+        hx.gstore(rec2 + (i64(row * cpr + c) * NB + i64(t)) * 4, hx.lload(sm + t * 4, F32))
     handoff(cnt + i64(8), t, NCT)
     # P3: threshold, Gumbel-max over the kept set; + the nucleus mass and z(x_k)
     hs = F32(0.0)
-    for q in range_constexpr(CPR):
-        hs = hs + hx.gload(rec2 + (i64(row * CPR + q) * NB + i64(t)) * 4, F32)
+    for q in range_constexpr(cpr):
+        hs = hs + hx.gload(rec2 + (i64(row * cpr + q) * NB + i64(t)) * 4, F32)
     hx.lstore(sm + t * 4, hs)
     gpu.barrier()
-    xchg_hist(recv, rank, 2, row, c, t, sm, tag0 + 2, mid=_ctxmid(ctxp, 2))
+    xchg_hist(recv, rank, 2, row, c, t, sm, tag0 + 2, mid=_ctxmid(ctxp, 2), cpr=cpr)
     suffix_scan(sm, t)
     b2, rem2 = crossing(sm, t, rem1)
     th = (b1 < 0).select(F32(NEG), lo2 + F32(fx.max(b2, I32(0))) * F32(R / (NB * NB)))
@@ -303,24 +304,24 @@ def sample_once_p(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, recv, rank,
     hx.latomic_max_u32(sm + 4096 + 128 + (t % 32) * 4, skey(zx) ^ I32(-2147483648))
     gpu.barrier()
     if act & (t == 0):
-        hx.gstore(rec3 + i64(row * CPR + c) * 8, hx.lload(sm + 2048, fx.Int64))
-        hx.gstore(rec3 + i64(ROWS * CPR * 8) + i64(row * CPR + c) * 4, th)
+        hx.gstore(rec3 + i64(row * cpr + c) * 8, hx.lload(sm + 2048, fx.Int64))
+        hx.gstore(rec3 + i64(rows * cpr * 8) + i64(row * cpr + c) * 4, th)
         znc = F32(0.0)
         zxs = I32(-2147483648)
         for q in range_constexpr(32):
             znc = znc + hx.lload(sm + 4096 + q * 4, F32)
             zxs = fx.max(zxs, hx.lload(sm + 4096 + 128 + q * 4, I32) ^ I32(-2147483648))   # unsigned slot -> its skey
-        hx.gstore(rec3 + i64(ROWS * CPR * 12) + i64(row * CPR + c) * 8, znc)
-        hx.gstore(rec3 + i64(ROWS * CPR * 12) + i64(row * CPR + c) * 8 + i64(4), ((zxs < 0).select(zxs ^ I32(0x7FFFFFFF), zxs)).bitcast(F32))
+        hx.gstore(rec3 + i64(rows * cpr * 12) + i64(row * cpr + c) * 8, znc)
+        hx.gstore(rec3 + i64(rows * cpr * 12) + i64(row * cpr + c) * 8 + i64(4), ((zxs < 0).select(zxs ^ I32(0x7FFFFFFF), zxs)).bitcast(F32))
     handoff(cnt + i64(12), t, NCT)
     # P4: rank-row winner, nucleus mass, z(x_k) -> exchange -> global (every CTA of a row, every rank)
     wb = I64MIN()
     znr = F32(0.0)
     zxr = F32(NEG)
-    for q in range_constexpr(CPR):
-        wb = fx.max(wb, hx.gload(rec3 + i64(row * CPR + q) * 8, fx.Int64))
-        znr = znr + hx.gload(rec3 + i64(ROWS * CPR * 12) + i64(row * CPR + q) * 8, F32)
-        zxr = fx.max(zxr, hx.gload(rec3 + i64(ROWS * CPR * 12) + i64(row * CPR + q) * 8 + i64(4), F32))
+    for q in range_constexpr(cpr):
+        wb = fx.max(wb, hx.gload(rec3 + i64(row * cpr + q) * 8, fx.Int64))
+        znr = znr + hx.gload(rec3 + i64(rows * cpr * 12) + i64(row * cpr + q) * 8, F32)
+        zxr = fx.max(zxr, hx.gload(rec3 + i64(rows * cpr * 12) + i64(row * cpr + q) * 8 + i64(4), F32))
     xchg6(recv, rank, 3, row, c, t, sm, [I32(wb & fx.Int64(0xFFFFFFFF)), I32(wb >> 32), znr.bitcast(I32), zxr.bitcast(I32),
                                           I32(0), I32(0)], tag0 + 3, mid=_ctxmid(ctxp, 3))
     gb = I64MIN()
@@ -339,7 +340,7 @@ def sample_once_p(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, recv, rank,
     # a batch without T > 0 requests (sparam identical on every rank: a uniform branch) skips P5 and its two handoffs and
     # exchange; D then needs only the ids (P4's handoff)
     anyprob = I32(0) > I32(1)
-    for r_ in range_constexpr(NREQ):
+    for r_ in range_constexpr(nreq):
         anyprob = anyprob | (hx.gload(sp + i64(r_ * (ND + 1)) * (SPW * 4) + i64(12), I32) == I32(0))
     if anyprob:
         # P5: rm_k and the residual candidates of row k (T > 0 rows k < 5)
@@ -379,7 +380,7 @@ def sample_once_p(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, recv, rank,
         latomic_max64(sm + 2048, br)
         latomic_max64(sm + 2056, bp)
         gpu.barrier()
-        r5 = rec1 + i64(row * CPR + c) * 32
+        r5 = rec1 + i64(row * cpr + c) * 32
         if act & (t == 0):
             rmc = F32(0.0)
             for q in range_constexpr(32):
@@ -391,8 +392,8 @@ def sample_once_p(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, recv, rank,
         rmr = F32(0.0)
         brr = I64MIN()
         bpr = I64MIN()
-        for q in range_constexpr(CPR):
-            rq = rec1 + i64(row * CPR + q) * 32
+        for q in range_constexpr(cpr):
+            rq = rec1 + i64(row * cpr + q) * 32
             rmr = rmr + hx.gload(rq, F32)
             brr = fx.max(brr, hx.gload(rq + i64(8), fx.Int64))
             bpr = fx.max(bpr, hx.gload(rq + i64(16), fx.Int64))
@@ -411,7 +412,7 @@ def sample_once_p(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, recv, rank,
             hx.gstore(prow + i64(row) * 32 + i64(12), tok)
         handoff(cnt + i64(24), t, NCT)
     # D: per request on CTA 0 (every rank identically)
-    if (b == 0) & (t < NREQ):
+    if (b == 0) & (t < nreq):
         rr = t
         r0 = rr * (ND + 1)
         sb = sp + i64(r0) * (SPW * 4)

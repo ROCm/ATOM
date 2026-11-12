@@ -6,11 +6,20 @@ expert's units go. Called by the kernel on traced Int32 / trace-time Python ints
 
 WIDE_NCH = 3  # >= 3 shared token chunks (> 32 rows): the wide schedule
 SH_EARLY = True  # wide: the shared expert's UG runs in the FFN front's idle CTAs (moe.ug_shared_early)
+EARLY_NCH_MAX = 3  # the front's idle CTAs (160 past its 96) hold 3 chunks' units x 2 CTAs; wider steps (front 160-192
+# CTAs, 4-6 chunks) run the shared UG on dedicated CTAs
 
 
 def sh_early(nch):
-    """The shared expert's UG in the front's idle CTAs (wide batches)."""
-    return SH_EARLY and nch >= WIDE_NCH
+    """The shared expert's UG in the front's idle CTAs (wide batches up to 48 rows)."""
+    return SH_EARLY and WIDE_NCH <= nch <= EARLY_NCH_MAX
+
+
+def dynamic_units(nch):
+    """Past 48 rows (4..6 shared chunks): the routed UG units are taken from a counter a wave at a time, the dedicated
+    CTAs joining once their shared units are done -- the static split left the dedicated CTAs (~1 MB of shared weights
+    each against ~4 MB a routed CTA) idle and the waves 3 or 4 units apart."""
+    return nch > EARLY_NCH_MAX
 
 
 def sh8_upc(nch):

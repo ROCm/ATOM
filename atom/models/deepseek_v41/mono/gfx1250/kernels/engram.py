@@ -40,10 +40,11 @@ def i64(x):
 @ASTRewriter.transform
 def stage_engq(c):
     """Group gi = b * 256 + t of T x EG: 32 bf16 -> amax -> e8m0 code -> 8 MXFP8 words (the kernel's q8words / e8m0_of,
-    as every other activation quantization here). Rows >= TR: zeros (code of 0)."""
+    as every other activation quantization here). Rows >= TR: zeros (code of 0), up to the build's row tiles (48 rows at
+    least: the narrow builds' extent)."""
     t, b = c["t"], c["b"]
     gi = b * 256 + t
-    if gi < T * EG:
+    if gi < max(D.NARROW_T, c["MT"] * 16) * EG:
         row = gi // EG
         g = gi % EG
         live = row < c["TR"]
@@ -62,9 +63,8 @@ def stage_engq(c):
 
 
 ED = 4                 # K128 steps of B operands in flight
-KCH = 3072             # K bytes of A staged in LDS at a time (2 chunks)
-SPC = KCH // 128       # K128 steps a chunk
-RS = KCH + 16          # padded LDS row of the A chunk (bank spread)
+KCH_N = 3072           # K bytes of A staged in LDS at a time up to 3 row tiles (2 chunks)
+KCH_W = 1536           # past 3 row tiles (4 chunks: 96 rows of A in LDS)
 
 
 @ASTRewriter.transform
@@ -75,6 +75,9 @@ def stage_engkv(c):
     the chunks and their K128 steps (code size: this sits in the layer loop). LDS [0, MT*16*RS + MT*16*KCH/32) is free
     here (between attention stages; the layer-resident residual streams sit at RKOFF)."""
     t, b, w, l, MT, sm = c["t"], c["b"], c["w"], c["l"], c["MT"], c["sm"]
+    KCH = KCH_N if MT <= 3 else KCH_W
+    SPC = KCH // 128       # K128 steps a chunk
+    RS = KCH + 16          # padded LDS row of the A chunk (bank spread)
     RA = MT * 16
     oa = sm
     osc = sm + RA * RS

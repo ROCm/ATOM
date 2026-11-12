@@ -15,7 +15,7 @@ import time
 
 import torch
 
-from atom.models.deepseek_v41.mono.gfx1250.config import NL, ROWS_PER_REQ
+from atom.models.deepseek_v41.mono.gfx1250.config import MAX_REQUESTS, NL, ROWS_PER_REQ
 from atom.mono.runtime.consensus import MonoUnsupported
 from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
@@ -220,12 +220,17 @@ class RunnerDebug:
             )
         out = (
             self.scratch["outtok"]
-            .view(torch.int32)[: 8 * ROWS_PER_REQ]
-            .view(8, ROWS_PER_REQ)[:req]
+            .view(torch.int32)[: MAX_REQUESTS * ROWS_PER_REQ]
+            .view(MAX_REQUESTS, ROWS_PER_REQ)[:req]
             .cpu()
         )
         acc = self.scratch["verdict"].view(torch.int32)[:req].cpu()
-        mids = self.scratch["mids"].view(torch.int32)[: 8 * 5].view(8, 5)[:req].cpu()
+        mids = (
+            self.scratch["mids"]
+            .view(torch.int32)[: MAX_REQUESTS * 5]
+            .view(MAX_REQUESTS, 5)[:req]
+            .cpu()
+        )
         self._prev_drafts = {
             sl: (int(out[q, int(acc[q])]), mids[q].tolist())
             for q, sl in enumerate(slots)

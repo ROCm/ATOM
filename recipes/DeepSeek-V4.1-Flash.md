@@ -214,6 +214,10 @@ AITER's gfx950 FP8 blockscale GEMM needs K to be a multiple of its K tile.
 
 ## gfx1250 single-launch decode step
 
+For the TP4 C16 FP8-KV / FP4-index agentic deployment, see the
+[C16 recipe, image and environment requirements](../docs/deepseek_v41_gfx1250_c16.md).
+It records the matched E13 configuration and the ongoing standard comparison.
+
 On gfx1250, mono decode (`ATOM_MONO_ENABLE`, on by default) runs each DSpark
 decode step as one
 persistent FlyDSL kernel per TP rank, issued as two launches: the target
