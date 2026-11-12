@@ -26,6 +26,18 @@ dispatch and negotiation layers must import on a machine with no GPU build.
 
 from dataclasses import dataclass, field
 
+
+def pcp_group_size_of(config) -> int:
+    """Ranks in AITER's PCP process group, which Ulysses SP runs over too.
+
+    Read with defaults: also called on bare stand-in configs.
+    """
+    return max(
+        int(getattr(config, "prefill_context_parallel_size", 1) or 1),
+        int(getattr(config, "sequence_parallel_size", 1) or 1),
+    )
+
+
 # Bump when the collective-RPC wire contract changes incompatibly. A consumer
 # that pins a version can refuse to negotiate rather than fail mid-collective.
 COLLECTIVE_RPC_PROTOCOL_VERSION = 1

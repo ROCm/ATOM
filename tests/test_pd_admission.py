@@ -8,9 +8,12 @@ from aiter_stub import stubbed_aiter
 from conftest import MockConfig
 
 from atom.kv_transfer.disaggregation.chunked_prefill import PrefillHandoff
+from atom.kv_transfer.disaggregation.pd_admission import (
+    PdAdmissionController,
+    ReceivePlan,
+)
 from atom.kv_transfer.disaggregation.types import KVConnectorOutput
-from atom.model_engine.pd_admission import PdAdmissionController
-from atom.model_engine.scheduler import Scheduler
+from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
 from atom.model_engine.sequence import SequenceStatus
 
 
@@ -35,7 +38,7 @@ def build(monkeypatch, mooncake_module, seq_factory):
     ):
         config = MockConfig(
             num_kvcache_blocks=64,
-            pd_admission_block_bytes=1024,
+            pool_entry_bytes={"kv": 1024},
             tensor_parallel_size=4,
             pipeline_parallel_size=1,
             parallel_config=SimpleNamespace(
@@ -104,6 +107,40 @@ def receive_success(seq, *, as_str=False):
     )
 
 
+class SizedSeq(SimpleNamespace):
+    """A request with one prompt token per block of its `block_table`."""
+
+    max_tokens = 64
+    num_completion_tokens = 0
+
+    def __len__(self):
+        return len(self.block_table)
+
+
+def standalone(max_bytes, *, reserve_tokens=None, free_blocks=0):
+    """A controller over a one-token-per-block pool and a full-transfer connector."""
+    connector = SimpleNamespace(pd_receive_block_offset=lambda seq, n, cached: 0)
+    block_manager = SimpleNamespace(
+        num_pool_blocks=lambda tokens: tokens,
+        draft_lookahead_blocks=lambda tokens: 0,
+        kv=SimpleNamespace(lookup=lambda h: -1, num_free=free_blocks),
+    )
+    return PdAdmissionController(
+        max_bytes, 1024, connector, block_manager, reserve_tokens=reserve_tokens
+    )
+
+
+def try_admit(policy, seq, *, running=()):
+    # No local hit: every block of the request is new.
+    probe = SimpleNamespace(
+        num_cached_blocks=0, block_hashes=[], num_new_blocks=len(seq)
+    )
+    admitted, plan = policy.check(seq, probe, running=running)
+    if admitted:
+        policy.commit(seq, plan)
+    return admitted
+
+
 @pytest.mark.parametrize("chunked", [False, True])
 def test_ready_credit_held_until_first_batch(build, chunked):
     sched, request = build(chunked=chunked)
@@ -118,7 +155,7 @@ def test_ready_credit_held_until_first_batch(build, chunked):
 
     sched._update_from_kv_xfer_finished(receive_success(a, as_str=True))
     assert len(sched.pd_admission.pending) == 1
-    assert sched.pd_admission.pending[str(a.id)].ready_at is not None
+    assert sched.pd_admission.pending[str(a.id)].ready
     batch, _ = sched.schedule()
     assert a.id in batch.req_ids
     assert not b.block_table  # A held its credit during this admission pass.
@@ -140,27 +177,27 @@ def test_bytes_limit_and_isolated_large_request(build, chunked):
     sched.schedule()
     assert a.block_table and not b.block_table
     sched.schedule()
+    assert not b.block_table
     # B waited two passes; it is one deferred request, not two attempts.
-    assert sched.pd_admission.deferred["bytes"] == 1
+    assert sched.pd_admission.deferred == {"bytes": 1, "free_kv": 0}
     sched._update_from_kv_xfer_finished(receive_success(a))
     sched.schedule()
     sched.schedule()
+    # Alone, B is admitted past the 3072-byte limit.
     assert b.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
     assert sched.pd_admission.pending_bytes == 4096
-    assert sched.pd_admission.oversized_admissions == 1
-    assert sched.pd_admission.deferred["bytes"] == 1
+    assert sched.pd_admission.deferred == {"bytes": 1, "free_kv": 0}
 
 
-@pytest.mark.parametrize("chunked", [False, True])
-def test_default_limit_bounds_receive_bytes(build, chunked):
-    sched, request = build(chunked=chunked, options={"enabled": True})
-    policy = sched.pd_admission
-    assert policy.max_bytes == int(64 * 1024 * 0.15)
-    assert policy.reserve_blocks is None
-    a, b = request(), request()
-    sched.extend([a, b])
-    batch, _ = sched.schedule()
-    assert set(batch.connector_meta_output.reqs_to_recv) == {a.id, b.id}
+@pytest.mark.parametrize("fraction", [None, 0.25])
+def test_fraction_uses_physical_pool_bytes(build, fraction):
+    options = {"enabled": True}
+    if fraction is not None:
+        options["max_pending_kv_fraction"] = fraction
+    sched, _ = build(options=options)
+    # 64 blocks of 1024 bytes; the default fraction is 0.15.
+    assert sched.pd_admission.max_bytes == int(64 * 1024 * (fraction or 0.15))
+    assert sched.pd_admission.reserve_tokens is None
 
 
 @pytest.mark.parametrize("chunked", [False, True])
@@ -168,17 +205,16 @@ def test_free_kv_watermark_keeps_room_for_running_requests(build, chunked):
     sched, request = build(
         chunked=chunked,
         num_kvcache_blocks=10,
-        options={
-            "enabled": True,
-            "max_pending_kv_fraction": None,
-            "min_free_kv_fraction": 0.5,
-        },
+        options={"enabled": True, "num_reserved_decode_tokens": 8},
     )
-    assert sched.pd_admission.reserve_blocks == 5
+    # Setting one limit drops the default byte budget.
+    assert sched.pd_admission.max_bytes is None
+    assert sched.pd_admission.reserve_tokens == 8
     a, b, c = request(), request(), request()
     sched.extend([a, b, c])
     batch, _ = sched.schedule()
-    # After B, 6 blocks stay free; C would leave 4, below the 5 reserved.
+    # Each 8-token request needs two more blocks to grow by 8 tokens. After B,
+    # 6 blocks stay free; C would leave 4, short of the 6 that A, B and C need.
     assert set(batch.connector_meta_output.reqs_to_recv) == {a.id, b.id}
     assert not c.block_table
     sched.schedule()
@@ -189,54 +225,234 @@ def test_free_kv_watermark_keeps_room_for_running_requests(build, chunked):
     batch, _ = sched.schedule()
     assert {a.id, b.id} <= set(batch.req_ids)
     assert not c.block_table  # A and B held credits during this pass.
+    # Past their first batch A and B hold no credit, but they still decode.
+    assert not sched.pd_admission.pending
     sched.schedule()
-    # Alone, C may enter below the watermark; the allocator still has room.
+    assert not c.block_table
+    # Falling below the reserve only defers admission; decode still fits.
+    assert sched.total_preemptions == 0
+    for seq in (a, b):
+        assert sched.abort_request(seq.id)
+    sched.postprocess([], ScheduledBatchOutput([], [], None, None, None), batch=batch)
+    sched.schedule()
     assert c.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
     assert set(sched.pd_admission.pending) == {str(c.id)}
 
 
-@pytest.mark.parametrize("keep_referenced", [False, True])
 @pytest.mark.parametrize("chunked", [False, True])
-def test_prefix_hits_charge_only_receive_targets(
-    build, seq_factory, keep_referenced, chunked
+def test_free_kv_watermark_holds_while_admitted_requests_decode(build, chunked):
+    sched, request = build(
+        chunked=chunked,
+        num_kvcache_blocks=10,
+        options={"enabled": True, "num_reserved_decode_tokens": 12},
+    )
+    a = request(16)
+    sched.add(a)
+    sched.schedule()
+    sched._update_from_kv_xfer_finished(receive_success(a))
+    batch, _ = sched.schedule()
+    assert a.id in batch.req_ids
+    assert not sched.pd_admission.pending
+    # Nothing is pending, but A still decodes: B would leave at most 4 free
+    # blocks, short of the 6 that A and B need to grow by 12 tokens each.
+    b = request()
+    sched.add(b)
+    sched.schedule()
+    assert not b.block_table
+    assert sched.pd_admission.deferred == {"bytes": 0, "free_kv": 1}
+    assert sched.abort_request(a.id)
+    sched.postprocess([], ScheduledBatchOutput([], [], None, None, None), batch=batch)
+    sched.schedule()
+    assert b.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+
+
+def test_free_kv_watermark_admits_below_it_only_on_an_idle_decoder():
+    policy = standalone(None, reserve_tokens=4, free_blocks=10)
+    big = SizedSeq(id=1, block_table=[1, 2, 3, 4])
+    decoding = SizedSeq(id=2, block_table=[9])
+    # 10 free, 4 allocated: 6 left, short of the 8 that `big` and `decoding`
+    # need to grow by 4 tokens each.
+    assert not try_admit(policy, big, running=[decoding])
+    # Nothing pending or running: waiting would free nothing, so it enters.
+    assert try_admit(policy, big)
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+def test_decode_reclaims_cached_blocks_before_preempting(build, seq_factory, chunked):
+    sched, request = build(
+        chunked=chunked,
+        prefix=True,
+        num_kvcache_blocks=6,
+        options={"enabled": True, "num_reserved_decode_tokens": 8},
+    )
+    bm = sched.block_manager
+    a = request()
+    sched.add(a)
+    sched.schedule()
+    sched._update_from_kv_xfer_finished(receive_success(a))
+    # The rest of the pool holds reusable cached content, none of it vacant.
+    seed = seq_factory(list(range(100, 116)))
+    bm.allocate(seed, bm.can_allocate(seed))
+    bm.hash_blocks(seed, seed.num_tokens)
+    bm.deallocate(seed)
+    assert bm.kv.num_free == bm.kv.num_reusable_free == 4
+    b = request()
+    sched.add(b)
+    batch, _ = sched.schedule()
+    # A's first decode needs a third block and reclaims a cached one instead of
+    # preempting; B still waits below A's and its own growth room.
+    assert a.id in batch.req_ids
+    assert len(a.block_table) == 3
+    assert bm.kv.num_free == bm.kv.num_reusable_free == 3
+    assert sched.total_preemptions == 0
+    assert not b.block_table
+
+
+def test_decode_reserve_counts_each_growing_request_once():
+    policy = standalone(None, reserve_tokens=4, free_blocks=100)
+    ready = SizedSeq(id=1, block_table=[1])
+    cancelled = SizedSeq(id=2, block_table=[2])
+    assert try_admit(policy, ready) and try_admit(policy, cancelled)
+    policy.cancel(cancelled)
+    nearly_done = SizedSeq(
+        id=3, block_table=[3], max_tokens=10, num_completion_tokens=9
+    )
+    candidate = SizedSeq(id=4, block_table=[4])
+    # READY is pending and already RUNNING: counted once. CANCELLED drains
+    # without decoding. NEARLY_DONE may emit one more token.
+    assert policy._growth_reserve(candidate, [ready, nearly_done]) == 4 + 1 + 4
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+def test_free_kv_watermark_counts_claimed_prefix_hits(build, seq_factory, chunked):
+    sched, request = build(
+        chunked=chunked,
+        prefix=True,
+        num_kvcache_blocks=10,
+        options={"enabled": True, "num_reserved_decode_tokens": 12},
+    )
+    bm = sched.block_manager
+    seed = seq_factory(list(range(16)))
+    bm.allocate(seed, bm.can_allocate(seed))
+    bm.hash_blocks(seed, seed.num_tokens)
+    bm.deallocate(seed)
+    a, b = request(), request(16)
+    sched.add(a)
+    sched.schedule()
+    assert set(sched.pd_admission.pending) == {str(a.id)}
+    free = bm.kv.num_free
+    assert free == 8
+    sched.add(b)
+    sched.schedule()
+    # B receives one block, but its hit also takes two cached-but-free blocks
+    # (the third is A's): 8 - 3 leaves 5, short of the 6 that A and B need to
+    # grow by 12 tokens each.
+    assert not b.block_table
+    assert bm.kv.num_free == free
+    assert sched.pd_admission.deferred == {"bytes": 0, "free_kv": 1}
+    sched._update_from_kv_xfer_finished(receive_success(a))
+    batch, _ = sched.schedule()
+    assert a.id in batch.req_ids
+    # A decodes past its first batch; B still waits for room.
+    sched.schedule()
+    assert not b.block_table
+    assert sched.abort_request(a.id)
+    sched.postprocess([], ScheduledBatchOutput([], [], None, None, None), batch=batch)
+    batch, _ = sched.schedule()
+    # With A gone, B enters with the same three-block hit.
+    assert batch.connector_meta_output.reqs_to_recv[b.id].num_computed_blocks == 3
+    assert set(sched.pd_admission.pending) == {str(b.id)}
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+def test_free_kv_watermark_skips_hits_on_blocks_another_request_holds(
+    build, seq_factory, chunked
 ):
     sched, request = build(
         chunked=chunked,
         prefix=True,
-        options={"enabled": True, "max_pending_kv_bytes": 2048},
+        num_kvcache_blocks=10,
+        options={"enabled": True, "num_reserved_decode_tokens": 4},
     )
-    seed = seq_factory(list(range(8)))
     bm = sched.block_manager
-    bm.allocate(seed, bm.can_allocate(seed))
-    bm.hash_blocks(seed, seed.num_tokens)
-    if not keep_referenced:
-        bm.deallocate(seed)
-    free_before = bm.kv.num_free
-    a, b = request(), request()
+    # A running request holds the four prompt blocks the next one hits.
+    holder = seq_factory(list(range(16)))
+    bm.allocate(holder, bm.can_allocate(holder))
+    bm.hash_blocks(holder, holder.num_tokens)
+    a, b = request(4), request(16)
     sched.extend([a, b])
     batch, _ = sched.schedule()
+    # After A, 5 blocks are free. B's three-block hit is held by `holder`, so
+    # B takes one block and leaves 4, above the 2 that A and B need to grow by
+    # 4 tokens each; counting its four blocks would leave 1.
     assert set(batch.connector_meta_output.reqs_to_recv) == {a.id, b.id}
-    assert sched.pd_admission.pending_bytes == 2048
-    assert a.block_table[0] == b.block_table[0]
-    assert free_before - bm.kv.num_free == (2 if keep_referenced else 3)
-    for meta in batch.connector_meta_output.reqs_to_recv.values():
-        assert meta.num_computed_blocks == 1
+    assert batch.connector_meta_output.reqs_to_recv[b.id].num_computed_blocks == 3
+    assert bm.kv.num_free == 4
 
 
+def test_probe_reports_free_pool_demand_without_prefix_caching(build, seq_factory):
+    sched, _ = build()
+    seq = seq_factory(list(range(8)))
+    new_blocks: list[int] = []
+    assert (
+        sched.block_manager.can_allocate(seq, record=False, new_block_count=new_blocks)
+        == 0
+    )
+    # Eight tokens at block size 4, no prefix cache: both blocks come off the
+    # free list. Draft lookahead is zero in this fixture.
+    assert new_blocks == [2]
+
+
+@pytest.mark.parametrize("geometry_matches", [False, True])
 @pytest.mark.parametrize("chunked", [False, True])
-def test_incompatible_geometry_charges_full_receive(build, seq_factory, chunked):
-    sched, request = build(prefix=True, chunked=chunked)
+def test_prefix_hits_charge_only_receive_targets(
+    build, seq_factory, geometry_matches, chunked
+):
+    sched, request = build(chunked=chunked, prefix=True)
     seed = seq_factory(list(range(8)))
     bm = sched.block_manager
     bm.allocate(seed, bm.can_allocate(seed))
     bm.hash_blocks(seed, seed.num_tokens)
     bm.deallocate(seed)
-    a = request()
-    a.kv_transfer_params["block_size"] = 8
-    sched.add(a)
+    a, b = request(), request()
+    if not geometry_matches:
+        # An incompatible source layout falls back to a full transfer.
+        for seq in (a, b):
+            seq.kv_transfer_params["block_size"] = 8
+    sched.extend([a, b])
     batch, _ = sched.schedule()
-    assert batch.connector_meta_output.reqs_to_recv[a.id].num_computed_blocks == 0
+    recv = batch.connector_meta_output.reqs_to_recv
+    # Each request charges only what it receives: the block past the shared
+    # prefix, or both blocks when nothing can be skipped.
+    assert set(recv) == ({a.id, b.id} if geometry_matches else {a.id})
     assert sched.pd_admission.pending_bytes == 2048
+    assert all(m.num_computed_blocks == int(geometry_matches) for m in recv.values())
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+def test_overlapping_receive_targets_charge_their_physical_union(
+    build, seq_factory, chunked
+):
+    sched, request = build(
+        chunked=chunked,
+        prefix=True,
+        options={"enabled": True, "max_pending_kv_bytes": 3072},
+    )
+    seed = seq_factory(list(range(8)))
+    bm = sched.block_manager
+    bm.allocate(seed, bm.can_allocate(seed))
+    bm.hash_blocks(seed, seed.num_tokens)
+    bm.deallocate(seed)
+    a, b = request(), request()
+    for seq in (a, b):
+        # No usable page geometry: a full transfer, hit block included.
+        seq.kv_transfer_params["block_size"] = 8
+    sched.extend([a, b])
+    batch, _ = sched.schedule()
+    # A holds {p, x}; B adds only y, so {p, x, y} fills the three-block W.
+    assert set(batch.connector_meta_output.reqs_to_recv) == {a.id, b.id}
+    assert a.block_table[0] == b.block_table[0]
+    assert sched.pd_admission.pending_bytes == 3072
 
 
 @pytest.mark.parametrize("chunked", [False, True])
@@ -263,24 +479,40 @@ def test_cancel_keeps_credit_until_safe_terminal_and_ignores_duplicate(build, ch
 
 
 @pytest.mark.parametrize("chunked", [False, True])
-def test_ready_without_compute_room_keeps_credit(build, chunked):
+def test_promoted_request_keeps_credit_until_batch_or_abort(build, chunked):
     sched, request = build(chunked=chunked)
-    a = request()
-    sched.add(a)
+    a, b = request(), request()
+    sched.extend([a, b])
     sched.schedule()
     sched._update_from_kv_xfer_finished(receive_success(a))
-    # Admission can promote A, but no token fits the speculative decode width.
+    # A is promoted to RUNNING, but its decode row does not fit this pass.
+    # This scheduler sizes a local-spec decode row as `mtp_k + 1` only when
+    # `spec_decode_local` is set; `use_spec` alone leaves the row at one token.
     sched.mtp_k = 4
+    sched.use_spec = True
     sched.spec_decode_local = True
     sched.max_num_batched_tokens = 4
     batch, _ = sched.schedule()
     assert a.status == SequenceStatus.RUNNING
     assert not batch.req_ids
-    assert str(a.id) in sched.pd_admission.pending
+    # RUNNING alone does not return the credit; an abort before the batch does.
+    assert set(sched.pd_admission.pending) == {str(a.id)}
+    assert not b.block_table
+    assert sched.abort_request(a.id)
+    finished = sched.postprocess(
+        [], ScheduledBatchOutput([], [], None, None, None), batch=batch
+    )
+    assert finished == [a]
+    assert not a.block_table
+    assert not sched.pd_admission.pending
+    # B no longer waits behind A's credit.
+    sched.mtp_k = 0
+    sched.use_spec = False
+    sched.spec_decode_local = False
     sched.max_num_batched_tokens = 64
     batch, _ = sched.schedule()
-    assert a.id in batch.req_ids
-    assert not sched.pd_admission.pending
+    assert set(batch.connector_meta_output.reqs_to_recv) == {b.id}
+    assert set(sched.pd_admission.pending) == {str(b.id)}
 
 
 @pytest.mark.parametrize("chunked", [False, True])
@@ -354,7 +586,7 @@ def test_multi_pd_ready_resume_releases_only_on_batch(build, monkeypatch, chunke
     assert set(batch.connector_meta_output.metas[0].reqs_to_recv) == {a.id}
     assert not b.block_table
     sched._update_from_kv_xfer_finished(receive_success(a))
-    assert sched.pd_admission.pending[str(a.id)].ready_at is not None
+    assert sched.pd_admission.pending[str(a.id)].ready
     batch, _ = sched.schedule()
     assert a.id in batch.req_ids  # The existing Multi suffix-resume path runs.
     assert a.block_table
@@ -368,35 +600,12 @@ def test_ready_preempted_before_first_forward_releases_credit(build, chunked):
     sched.add(a)
     sched.schedule()
     sched._update_from_kv_xfer_finished(receive_success(a))
-    # The inherited decode capacity check needs another block for T0. There is
-    # no G reservation in this change, so it may safely preempt the ready row.
+    # The inherited decode capacity check needs another block for T0. No
+    # decode-slot reservation exists, so the ready row may be preempted.
     batch, _ = sched.schedule()
     assert not batch.req_ids
     assert not a.block_table
     assert sched.total_preemptions == 1
-    assert not sched.pd_admission.pending
-
-
-def test_fraction_uses_physical_pool_bytes(build):
-    sched, _ = build(options={"enabled": True, "max_pending_kv_fraction": 0.25})
-    assert sched.pd_admission.max_bytes == 64 * 1024 // 4
-
-
-@pytest.mark.parametrize("chunked", [False, True])
-def test_hard_capacity_still_rejects_oversized_request(build, chunked):
-    sched, request = build(
-        chunked=chunked,
-        num_kvcache_blocks=2,
-        options={
-            "enabled": True,
-            "max_pending_kv_bytes": 1024,
-        },
-    )
-    a = request(16)
-    sched.add(a)
-    sched.schedule()
-    assert sched.take_rejected() == [a]
-    assert not a.block_table
     assert not sched.pd_admission.pending
 
 
@@ -425,7 +634,7 @@ def test_chunked_charge_matches_dispatched_targets_without_source_ids(
 
     # The consumer flag is intentionally off: the router's per-request mode
     # controls the transfer, including on a D service receiving both modes.
-    sched, request = build(prefix=True, pd_admission_block_bytes=4)
+    sched, request = build(prefix=True, pool_entry_bytes={"kv": 4})
     seed = seq_factory(list(range(8)))
     bm = sched.block_manager
     bm.allocate(seed, bm.can_allocate(seed))
@@ -494,7 +703,7 @@ def test_chunked_pp4_tp4_credits_wait_for_terminal_handoff(build, monkeypatch, o
             )
             if not last:
                 assert sched.pd_admission.pending_bytes == 3072
-                assert sched.pd_admission.pending[str(a.id)].ready_at is None
+                assert not sched.pd_admission.pending[str(a.id)].ready
                 assert "first_token_id" not in a.kv_transfer_params
                 _, scheduled = sched.schedule()
                 assert not scheduled and not b.block_table
@@ -502,7 +711,7 @@ def test_chunked_pp4_tp4_credits_wait_for_terminal_handoff(build, monkeypatch, o
     if outcome == "success":
         assert a.kv_transfer_params["first_token_id"] == 42
         assert a.kv_transfer_params["draft_token_ids"] == [43]
-        assert sched.pd_admission.pending[str(a.id)].ready_at is not None
+        assert sched.pd_admission.pending[str(a.id)].ready
         assert sched.pd_admission.pending_bytes == 3072
         _, scheduled = sched.schedule()
         assert list(scheduled) == [a.id]
@@ -520,25 +729,20 @@ def test_multiconnector_uses_load_winner(build):
         MultiConnectorScheduler,
     )
 
-    def wrap(pd):
-        class Store:
-            is_offload = True
-            is_producer = False
-
-            def get_num_new_matched_tokens(self, seq):
-                return (8, True)
-
-            def cancel_pending_load(self, seq):
-                pass
-
-        multi = MultiConnectorScheduler.__new__(MultiConnectorScheduler)
-        multi._connectors = [pd, Store()]
-        multi._load_winner = {}
-        return multi
-
+    store = SimpleNamespace(
+        is_offload=True,
+        is_producer=False,
+        # The `KVConnectorSchedulerBase` defaults every offload scheduler has.
+        supports_pd_admission=False,
+        pd_receive_block_offset=lambda *args: None,
+        get_num_new_matched_tokens=lambda seq: (8, True),
+        cancel_pending_load=lambda seq: None,
+    )
     # Exercise the real first-hit selection without invoking an offload backend.
     sched, request = build()
-    multi = wrap(sched.kv_connector)
+    multi = MultiConnectorScheduler.__new__(MultiConnectorScheduler)
+    multi._connectors = [sched.kv_connector, store]
+    multi._load_winner = {}
     assert multi.supports_pd_admission
     a = request()
     multi.get_num_new_matched_tokens(a)
@@ -562,11 +766,20 @@ def test_multiconnector_uses_load_winner(build):
         {"enabled": True, "max_pending_kv_fraction": 1.1},
         {"enabled": True, "max_pending_kv_fraction": 0.1, "max_pending_kv_bytes": 10},
         {"enabled": True, "max_pending_kv_fraction": None},
+        # A limit is either set or omitted; null does not disable it.
+        {
+            "enabled": True,
+            "max_pending_kv_fraction": None,
+            "num_reserved_decode_tokens": 512,
+        },
+        {"enabled": True, "max_pending_kv_bytes": None},
         {"enabled": True, "extra_growth_blocks_per_request": 1},
-        {"enabled": True, "min_free_kv_fraction": 0},
-        {"enabled": True, "min_free_kv_fraction": 1},
-        {"enabled": True, "min_free_kv_fraction": True},
-        {"enabled": True, "min_free_kv_fraction": float("inf")},
+        {"enabled": True, "num_reserved_decode_tokens": 0},
+        {"enabled": True, "num_reserved_decode_tokens": -1},
+        {"enabled": True, "num_reserved_decode_tokens": True},
+        {"enabled": True, "num_reserved_decode_tokens": 1.5},
+        # Replaced by num_reserved_decode_tokens.
+        {"enabled": True, "min_free_kv_fraction": 0.1},
     ],
 )
 def test_invalid_config_rejected(build, options):
@@ -577,9 +790,13 @@ def test_invalid_config_rejected(build, options):
 @pytest.mark.parametrize(
     "override",
     [
-        {"pd_admission_block_bytes": 0},
+        {"pool_entry_bytes": {}},
+        {"pool_entry_bytes": {"kv": 1024, "state": 64}},
         {"pipeline_parallel_size": 2},
         {"decode_context_parallel_size": 2},
+        {"prefill_context_parallel_size": 2},
+        # Ulysses SP runs over the PCP group even with PCP=1.
+        {"sequence_parallel_size": 2},
     ],
 )
 def test_unsupported_layout_rejected(build, override):
@@ -588,10 +805,11 @@ def test_unsupported_layout_rejected(build, override):
 
 
 def test_physical_targets_are_deduplicated_and_release_is_idempotent():
-    policy = PdAdmissionController(4096, 1024)
-    a, b = SimpleNamespace(id=1), SimpleNamespace(id=2)
-    policy.admit(a, [1, 2])
-    policy.admit(b, [2, 3])
+    policy = PdAdmissionController(4096, 1024, connector=None, block_manager=None)
+    a = SimpleNamespace(id=1, block_table=[1, 2])
+    b = SimpleNamespace(id=2, block_table=[2, 3])
+    policy.commit(a, ReceivePlan(0, 2))
+    policy.commit(b, ReceivePlan(0, 2))
     assert policy.pending_bytes == 3072
     policy.release(a)
     policy.release(a)
@@ -603,57 +821,97 @@ def test_physical_targets_are_deduplicated_and_release_is_idempotent():
     assert policy.pending_bytes == 0
 
 
-def test_admission_metrics_follow_credit_lifecycle(monkeypatch):
-    from prometheus_client import CollectorRegistry
+def test_a_request_over_both_limits_counts_under_both(build):
+    sched, _ = build(
+        options={
+            "enabled": True,
+            "max_pending_kv_bytes": 1024,
+            "num_reserved_decode_tokens": 8,
+        }
+    )
+    assert (sched.pd_admission.max_bytes, sched.pd_admission.reserve_tokens) == (
+        1024,
+        8,
+    )
+    policy = standalone(1024, reserve_tokens=40, free_blocks=32)
+    a = SizedSeq(id=1, block_table=[1])
+    b = SizedSeq(id=2, block_table=[2])
+    assert try_admit(policy, a)
+    # B would exceed the byte budget and leave 31 free blocks, short of the 80
+    # that A and B need to grow by 40 tokens each.
+    for _ in range(2):
+        assert not try_admit(policy, b)
+    assert policy.deferred == {"bytes": 1, "free_kv": 1}
 
-    from atom.metrics.scheduler import SchedulerMetrics
-    from atom.model_engine import pd_admission
 
-    clock = [100.0]
-    monkeypatch.setattr(pd_admission.time, "perf_counter", lambda: clock[0])
-    registry = CollectorRegistry()
-    metrics = SchedulerMetrics(registry=registry)
-    policy = PdAdmissionController(2048, 1024, metrics)
-    seq, other = SimpleNamespace(id=1), SimpleNamespace(id=2)
-    labels = {"dp_rank": "0", "engine_role": "default"}
-    policy.admit(seq, [1, 2])
-    assert (
-        registry.get_sample_value(
-            "atom:pd_admission_pending_requests", {**labels, "state": "receiving"}
+def test_rejected_deferred_request_leaves_no_marker():
+    policy = standalone(1024)
+    a = SizedSeq(id=1, block_table=[1])
+    b = SizedSeq(id=2, block_table=[2])
+    assert try_admit(policy, a)
+    assert not try_admit(policy, b)
+    # B is rejected from waiting without ever being admitted.
+    policy.cancel(b)
+    assert not policy._deferred_by
+
+
+def test_admission_state_is_exported_from_the_metrics_snapshot(build):
+    from queue import Queue
+
+    from atom.metrics.exporter import _AtomMetricsCollector
+    from atom.model_engine.engine_utility import EngineUtilityHandler
+    from atom.model_engine.llm_engine import LLMEngine
+
+    sched, request = build()
+    handler = EngineUtilityHandler(None, Queue(), scheduler=sched)
+    exporter = SimpleNamespace(stream_silence=lambda: 0.0, other_processes_gc=list)
+
+    def exported():
+        """The admission series a scrape serves, through the engine's DP aggregation."""
+        engine = SimpleNamespace(
+            core_mgr=SimpleNamespace(
+                latest_metrics={0: handler.collect_metrics()},
+                get_dp_router_statistics=dict,
+            )
         )
-        == 1
-    )
-    assert not policy.can_admit(other, 1, 64)
-    clock[0] += 2
-    assert not policy.can_admit(other, 1, 64)
-    assert (
-        registry.get_sample_value(
-            "atom:pd_admission_deferred_total", {**labels, "reason": "bytes"}
-        )
-        == 1
-    )
-    policy.received(seq.id)
-    assert (
-        registry.get_sample_value(
-            "atom:pd_admission_pending_requests", {**labels, "state": "ready"}
-        )
-        == 1
-    )
-    clock[0] += 3
-    policy.scheduled([seq])
-    assert registry.get_sample_value("atom:pd_admission_pending_kv_bytes", labels) == 0
-    assert (
-        registry.get_sample_value("atom:pd_admission_ready_wait_seconds_count", labels)
-        == 1
-    )
-    assert policy.can_admit(other, 1, 64)
-    policy.admit(other, [3])
-    # SEQ entered at once; OTHER waited from its first deferral at t=100.
-    assert (
-        registry.get_sample_value("atom:pd_admission_credit_wait_seconds_count", labels)
-        == 2
-    )
-    assert (
-        registry.get_sample_value("atom:pd_admission_credit_wait_seconds_sum", labels)
-        == 5
-    )
+        snapshot = LLMEngine.get_metrics_statistics(engine)
+        return {
+            (sample.name, tuple(sorted(sample.labels.items()))): sample.value
+            for family in _AtomMetricsCollector(exporter)._collect((snapshot, 0, 0.0))
+            for sample in family.samples
+            if sample.name.startswith("atom:pd_admission_")
+        }
+
+    # A plain `Scheduler` reports no role, which aggregation exports as "default".
+    labels = (("dp_rank", "0"), ("engine_role", "default"))
+    pending_bytes = ("atom:pd_admission_pending_kv_bytes", labels)
+    deferred = "atom:pd_admission_deferred_total"
+    # Cumulative: B deferred once by bytes, never by the free-KV reserve.
+    counters = {
+        (deferred, (*labels, ("reason", "bytes"))): 1,
+        (deferred, (*labels, ("reason", "free_kv"))): 0,
+    }
+
+    def pending(**counts):
+        states = {"receiving": 0, "ready": 0, "cancel_draining": 0} | counts
+        return {
+            ("atom:pd_admission_pending_requests", (*labels, ("state", s))): n
+            for s, n in states.items()
+        }
+
+    a, b = request(), request()
+    sched.extend([a, b])
+    sched.schedule()
+    sched.schedule()
+    assert exported() == pending(receiving=1) | {pending_bytes: 2048, **counters}
+    sched._update_from_kv_xfer_finished(receive_success(a, as_str=True))
+    assert exported() == pending(ready=1) | {pending_bytes: 2048, **counters}
+    # A's first forward returns its credit; B is admitted on the next pass.
+    sched.schedule()
+    assert exported() == pending() | {pending_bytes: 0, **counters}
+    sched.schedule()
+    assert sched.abort_request(b.id)
+    # A cancelled receive keeps its credit while its writes drain.
+    assert exported() == pending(cancel_draining=1) | {pending_bytes: 2048, **counters}
+    sched._update_from_kv_xfer_finished(KVConnectorOutput(failed_recving={str(b.id)}))
+    assert exported() == pending() | {pending_bytes: 0, **counters}

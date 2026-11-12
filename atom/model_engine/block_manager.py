@@ -1156,6 +1156,7 @@ class BlockManager:
         record: bool = True,
         *,
         block_hashes: list[int] | None = None,
+        new_block_count: list[int] | None = None,
     ) -> int:
         """Return number of cache-hit blocks (>=0) if seq fits, else -1.
 
@@ -1179,7 +1180,9 @@ class BlockManager:
         Caller (scheduler) passes the returned hit count to `allocate()`,
         avoiding a second hash pass.
         """
-        return self._evaluate(seq, self._admission_walk, record, block_hashes)
+        return self._evaluate(
+            seq, self._admission_walk, record, block_hashes, new_block_count
+        )
 
     def _evaluate(
         self,
@@ -1187,9 +1190,20 @@ class BlockManager:
         walk_of: Callable[[Sequence], _PrefixWalk],
         record: bool,
         block_hashes: list[int] | None,
+        new_block_count: list[int] | None = None,
     ) -> int:
         """`can_allocate` over the walk `walk_of(seq)` returns; everything but
-        the walk is asked afresh on every call."""
+        the walk is asked afresh on every call.
+
+        `new_block_count`, when given, receives the free-pool demand of a fit
+        (one int), including draft lookahead. Admission reads it before
+        `allocate` commits the probe.
+        """
+
+        def _note_new(n: int) -> None:
+            if new_block_count is not None:
+                new_block_count[:] = [n]
+
         # Active Slots are preallocated; PAGE checkpoints share the KV pool.
         #
         # The full per-request width, because that is what `allocate` will take:
@@ -1209,10 +1223,12 @@ class BlockManager:
         ):
             return -1
         if not self.enable_prefix_caching:
-            if not self._has_page_units(
-                self.num_pool_blocks(len(seq)) + self.draft_lookahead_blocks(len(seq))
-            ):
+            demand = self.num_pool_blocks(len(seq)) + self.draft_lookahead_blocks(
+                len(seq)
+            )
+            if not self._has_page_units(demand):
                 return -1
+            _note_new(demand)
             return 0
         # Step 1: compressed prefix (CSA/HCA/indexer share the block hash and
         # read the WHOLE history, so this stays a full front-to-back chained
@@ -1293,6 +1309,7 @@ class BlockManager:
         # at its first line otherwise. Qwen GDN does under
         # `ATOM_GDN_STATE_MIDSTEP=1`, and then every admission pays it.
         self._extend_hash_chain(seq, block_hashes)
+        _note_new(num_new_blocks)
         return num_cached_blocks
 
     def _walk_prefix(self, seq: Sequence) -> _PrefixWalk:
@@ -1412,7 +1429,7 @@ class BlockManager:
         by a publish of that hash), and token count and seed are unchanged.
         """
         walk_of = self._memoised_walk if self.walk_memo else self._walk_prefix
-        return self._evaluate(seq, walk_of, False, None)
+        return self._evaluate(seq, walk_of, False, None, None)
 
     def _memoised_walk(self, seq: Sequence) -> _PrefixWalk:
         memo = self._cached_walks.get(seq)

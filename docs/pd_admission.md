@@ -16,7 +16,7 @@ Enable it only on the decode service, in the top-level `--kv-transfer-config`:
   "pd_admission": {
     "enabled": true,
     "max_pending_kv_fraction": 0.15,
-    "min_free_kv_fraction": 0.1
+    "num_reserved_decode_tokens": 512
   }
 }
 ```
@@ -34,25 +34,26 @@ above works for either mode without requiring a separate chunk flag on D.
 | Option | Default when enabled | Meaning |
 | --- | --- | --- |
 | `enabled` | `false` | Opt in; absent/false preserves the existing scheduler. |
-| `max_pending_kv_fraction` | `0.15` | Fraction of each D rank's physical paged KV pool, converted to bytes at startup. `null` disables this dimension. |
-| `max_pending_kv_bytes` | unset | Explicit bytes **per D rank**, instead of a fraction. Do not specify both byte options. |
-| `min_free_kv_fraction` | `null` | Fraction of D's paged pool that must stay free after a new receive reserves its targets: the headroom kept for the running batch's decode growth. Free includes cached blocks a prefix hit could still reuse. `null` disables this dimension. |
+| `max_pending_kv_fraction` | `0.15` when no limit is set | Fraction of each D rank's physical paged KV pool, converted to bytes at startup. Omit it to turn this limit off. `null` is rejected. |
+| `max_pending_kv_bytes` | unset | Explicit bytes **per D rank**, instead of a fraction. Do not specify both byte options. Omit it to turn this limit off. `null` is rejected. |
+| `num_reserved_decode_tokens` | unset | Decode tokens kept free for each admitted request to grow by. A new receive is deferred when, after it takes its blocks, the free pool could not grow every receiving, ready and running request and itself by that many tokens, each capped by what it may still generate. Reusable cached blocks count as free. A local prefix hit on a block another request already holds takes nothing. Omit it to turn this limit off. `null` is rejected. |
 
-At least one limit must be enabled. Values are experiment starting points, not
-performance recommendations.
+With no limit set, the byte budget defaults to `max_pending_kv_fraction: 0.15`.
+Values are experiment starting points, not performance recommendations.
 
 There is no limit on the number of pending requests. A fixed count caps intake
 at about the count divided by the receive latency however much of D is free,
 and in whole-prompt mode every request D defers keeps its source KV on P. The
-byte limit bounds what non-running receives hold; the free-KV watermark keeps
-room for requests that are already decoding.
+byte limit bounds what non-running receives hold; the decode-token reserve
+keeps room for every admitted request to keep generating.
 
 The policy supports a single paged KV pool, including target,
 index and draft regions sharing the same page IDs. D must have PP=1, DCP=1,
-PCP=1 and identical page sizes across TP ranks. Separate state/windowed-draft
-pools are rejected when this policy is enabled. P can use PP;
-PP4→TP4 still counts as one logical receive, not sixteen requests. Startup
-reconciles the TP capacity once and reports the actual page and budget bytes.
+PCP=1 and SP=1. Identical page sizes across TP ranks follow from agreeing
+`free` and the KV budget before the pools are planned. Separate
+state/windowed-draft pools are rejected when this policy is enabled. P can use
+PP; PP4→TP4 still counts as one logical receive, not sixteen requests. The
+byte budget is the agreed page size times the pool.
 Existing transfer topology constraints still apply, including D TP being a
 multiple of P TP for chunked transfers.
 
@@ -85,27 +86,25 @@ the existing safe failure report. Requests that have not reserved on D hold no
 credits.
 
 New requests retain FIFO order. A request that exceeds the soft byte limit or
-the free-KV watermark may enter alone once no pending credit remains, so a
-long request does not wait forever because of either soft limit. Existing
-physical capacity, lookahead and `max_num_seqs` checks remain in force. The
-watermark is a fraction of the pool, not a per-request decode growth estimate,
-and adds no extra lookahead blocks.
+the decode reserve may enter alone when D is idle and nothing is pending, so a
+long request does not wait forever because of either soft limit. The decode
+reserve holds while any request is receiving, ready or running, so only an idle
+D admits below it. Falling below it defers admission and never preempts.
+Existing physical capacity, lookahead and `max_num_seqs` checks remain in force.
 
 Metrics use `dp_rank` and `engine_role` labels:
 
 - `atom:pd_admission_pending_requests{state="receiving|ready|cancel_draining"}`
 - `atom:pd_admission_pending_kv_bytes`
-- `atom:pd_admission_deferred_total{reason="bytes|free_kv"}` (requests, each counted once per limit that deferred it)
-- `atom:pd_admission_credit_wait_seconds` (from a request's first deferral to its admission; 0 when admitted at once)
-- `atom:pd_admission_oversized_total`
-- `atom:pd_admission_ready_wait_seconds`
+- `atom:pd_admission_deferred{reason="bytes|free_kv"}` (requests, each counted once per limit that deferred it)
 
 P's retained source KV is exported by every scheduler as
 `atom:kv_cache_blocks_deferred_free` (physical blocks) and
 `atom:requests_deferred_free`: on P/D prefill, finished requests whose KV decode
-has not pulled yet, plus any pending offload save.
+has not pulled yet. A whole-request offload save is included; an early-release
+lease is not.
 
-Compare baseline (`enabled: false`) → bytes only → bytes plus watermark, with
+Compare baseline (`enabled: false`) → bytes only → bytes plus decode reserve, with
 unchanged model/cache configuration and chunk/landing flags. Include completed
 request throughput, end-to-end latency, preemptions and P's deferred-free
 blocks. A lower pending count alone is not evidence of a throughput

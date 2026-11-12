@@ -20,6 +20,7 @@ from atom.kv_transfer.disaggregation.chunked_prefill import (
     ChunkedPrefill,
     PrefillHandoff,
 )
+from atom.kv_transfer.disaggregation.pd_admission import PdAdmissionController
 from atom.kv_transfer.disaggregation.pp_kv_aggregator import PPKVAggregator
 from atom.kv_transfer.disaggregation.types import (
     ConnectorCompletion,
@@ -29,7 +30,6 @@ from atom.kv_transfer.disaggregation.types import (
     KVTransferTensors,
     PageRegion,
 )
-from atom.model_engine.pd_admission import PdAdmissionController
 
 
 @pytest.fixture(autouse=True)
@@ -1481,7 +1481,7 @@ def test_opposite_admission_order_progresses_without_recompute(
     p.kv_connector = scheduler_connector(monkeypatch, True)
     d.kv_connector = scheduler_connector(monkeypatch, False)
     if byte_limit:
-        d.pd_admission = PdAdmissionController(12, 4)
+        d.pd_admission = PdAdmissionController(12, 4, d.kv_connector, d.block_manager)
     pa, pb = [pd_sequence(seq_factory, name) for name in ("xfer-a", "xfer-b")]
     da, db = [pd_sequence(seq_factory, name, False) for name in ("xfer-a", "xfer-b")]
     p.extend([pa, pb])
@@ -1533,7 +1533,7 @@ def test_opposite_admission_order_progresses_without_recompute(
             assert d.pd_admission.pending_bytes == 12
             if ds is db:
                 assert not da.block_table
-                assert d.pd_admission.deferred["bytes"] == 1
+                assert d.pd_admission.deferred == {"bytes": 1, "free_kv": 0}
         dw.start_load_kv(batch.connector_meta_output)
         # Reserving D's pages alone cannot admit P: the write request still
         # waits in D's queue until prior GPU writes to those pages finish.
@@ -1559,7 +1559,7 @@ def test_opposite_admission_order_progresses_without_recompute(
                     # Bytes are credited for the full destination, not each
                     # completed chunk. P's final sampling still lies ahead.
                     assert d.pd_admission.pending_bytes == 12
-                    assert d.pd_admission.pending[str(ds.id)].ready_at is None
+                    assert not d.pd_admission.pending[str(ds.id)].ready
                 p.postprocess(
                     list(seqs.values()),
                     ScheduledBatchOutput([ps.id], [(42,)], None, None, None),
@@ -1575,7 +1575,7 @@ def test_opposite_admission_order_progresses_without_recompute(
         d._update_from_kv_xfer_finished(dw.get_finished())
         if byte_limit:
             assert d.pd_admission.pending_bytes == 12
-            assert d.pd_admission.pending[str(ds.id)].ready_at is not None
+            assert d.pd_admission.pending[str(ds.id)].ready
         batch, seqs = d.schedule()
         if byte_limit:
             assert not d.pd_admission.pending
@@ -1779,7 +1779,7 @@ def test_d_transfer_failure_waits_for_write_hold_before_abort(
     d = Scheduler(MockConfig(num_kvcache_blocks=3))
     d.kv_connector = scheduler_connector(monkeypatch, False)
     if admission:
-        d.pd_admission = PdAdmissionController(12, 4)
+        d.pd_admission = PdAdmissionController(12, 4, d.kv_connector, d.block_manager)
     seq = pd_sequence(seq_factory, producer=False)
     d.add(seq)
     batch, scheduled = d.schedule()
@@ -2127,7 +2127,7 @@ def test_ready_but_capacity_blocked_timeout_preserves_decode_write_safety(
     )
     d.kv_connector = scheduler_connector(monkeypatch, False)
     if admission:
-        d.pd_admission = PdAdmissionController(12, 4)
+        d.pd_admission = PdAdmissionController(12, 4, d.kv_connector, d.block_manager)
     occupied = seq_factory(list(range(10)))
     assert p.block_manager.allocate(occupied)
     ps = [pd_sequence(seq_factory, f"wait-{i}") for i in range(3)]

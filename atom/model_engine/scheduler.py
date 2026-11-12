@@ -28,12 +28,14 @@ import threading
 import time
 from collections import Counter, deque
 from collections.abc import Iterable
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import numpy as np
 
 from atom.config import Config
 from atom.kv_transfer.disaggregation import KVConnectorOutput, kv_config_has_producer
+from atom.kv_transfer.disaggregation.pd_admission import PdAdmissionController
 from atom.metrics.scheduler import SchedulerMetrics
 from atom.model_engine.block_manager import BlockManager, draft_kv_lookahead
 from atom.model_engine.dynamic_chunking import (
@@ -45,7 +47,6 @@ from atom.model_engine.dynamic_chunking import (
 )
 from atom.model_engine.engine_stats import EngineStats
 from atom.model_engine.multimodal_runtime import prefill_media_payload
-from atom.model_engine.pd_admission import PdAdmissionController
 from atom.model_engine.prefill_delayer import PrefillDecision
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import (
@@ -821,7 +822,7 @@ class Scheduler:
 
         self.kv_connector = get_kvconnector("scheduler", config)
         self.pd_admission = PdAdmissionController.from_config(
-            config, self.kv_connector, self.metrics
+            config, self.kv_connector, self.block_manager
         )
         bind_block_manager = getattr(self.kv_connector, "bind_block_manager", None)
         if callable(bind_block_manager):
@@ -1686,7 +1687,7 @@ class Scheduler:
 
         self.deferred_free_blocks.pop(seq.id, None)
         self.block_manager.deallocate(seq)
-        if getattr(self, "pd_admission", None) is not None:
+        if self.pd_admission is not None:
             self.pd_admission.release(seq)
         # After the free, not before: the connector may only forget the state
         # keyed on these blocks once nothing can read them again.
@@ -1973,7 +1974,7 @@ class Scheduler:
         quiet, which is indistinguishable from an idle engine.
         """
         result = self._schedule()
-        if getattr(self, "pd_admission", None) is not None and result is not None:
+        if self.pd_admission is not None and result is not None:
             batch, seqs = result
             if not batch.is_dummy_run:
                 self.pd_admission.scheduled(seqs.values())
@@ -2341,7 +2342,7 @@ class Scheduler:
                 and self._tier_hit(seq) != probed_tier_kv
             ):
                 hbm_probe = self._probe_hbm_prefix(seq)
-            num_cached_blocks, block_hashes = hbm_probe
+            num_cached_blocks, block_hashes, probe_new_blocks = hbm_probe
             if num_cached_blocks < 0:
                 self.waiting.appendleft(seq)
                 break
@@ -2401,15 +2402,20 @@ class Scheduler:
             ):
                 self.waiting.appendleft(seq)
                 break
-            pd_offset = None
-            if getattr(self, "pd_admission", None) is not None and needs_remote_load:
-                num_blocks = self.block_manager.num_pool_blocks(len(seq))
-                pd_offset = self.kv_connector.pd_receive_block_offset(
-                    seq, num_blocks, num_cached_blocks
+            # Before `record_allocation`, which commits the probe's joint
+            # boundary: a request deferred here must leave nothing committed.
+            pd_plan = None
+            if self.pd_admission is not None and needs_remote_load:
+                admitted, pd_plan = self.pd_admission.check(
+                    seq,
+                    SimpleNamespace(
+                        num_cached_blocks=num_cached_blocks,
+                        block_hashes=block_hashes,
+                        num_new_blocks=probe_new_blocks,
+                    ),
+                    running=self.running,
                 )
-                if pd_offset is not None and not self.pd_admission.can_admit(
-                    seq, num_blocks - pd_offset, self.block_manager.kv.num_free
-                ):
+                if not admitted:
                     self.waiting.appendleft(seq)
                     break
 
@@ -2451,18 +2457,8 @@ class Scheduler:
                 seq.prefix_cache_hit_tokens = seq.num_cached_tokens
 
             self._lookup_detach_declined.discard(seq.id)
-            if pd_offset is not None:
-                actual_offset = self.kv_connector.pd_receive_block_offset(
-                    seq,
-                    len(seq.block_table),
-                    seq.num_cached_tokens // self.block_manager.hash_block_size,
-                )
-                if actual_offset != pd_offset or len(seq.block_table) != num_blocks:
-                    # No address has been published yet. A layout whose probe
-                    # differs from allocation must not silently exceed credits.
-                    self.block_manager.deallocate(seq)
-                    raise RuntimeError("PD receive footprint changed during allocation")
-                self.pd_admission.admit(seq, seq.block_table[actual_offset:])
+            if pd_plan is not None:
+                self.pd_admission.commit(seq, pd_plan)
             self._notify_connector_after_prefill_alloc(seq)
 
             # A replay that loads its KV first parks for that load whatever the
@@ -2968,7 +2964,7 @@ class Scheduler:
         return True
 
     def _reject_aborted_waiting(self, seq: Sequence) -> None:
-        if getattr(self, "pd_admission", None) is not None:
+        if self.pd_admission is not None:
             self.pd_admission.cancel(seq)
         self._inflight_prefix_wait.pop(seq.id, None)
         self._lookup_detach_declined.discard(seq.id)
@@ -3050,7 +3046,7 @@ class Scheduler:
         if hasattr(seq, "_awaiting_aborted_load_cleanup"):
             delattr(seq, "_awaiting_aborted_load_cleanup")
         self._uncount_inflight_load(seq)
-        if getattr(self, "pd_admission", None) is not None:
+        if self.pd_admission is not None:
             self.pd_admission.release(seq)
         # The one path that never went through `postprocess`, so it finishes
         # the request here rather than before the park.
@@ -3150,21 +3146,28 @@ class Scheduler:
             or (seq.kv_transfer_params or {}).get("do_remote_prefill")
         )
 
-    def _probe_hbm_prefix(self, seq: Sequence) -> tuple[int, list[int]]:
+    def _probe_hbm_prefix(self, seq: Sequence) -> tuple[int, list[int], int]:
         """`can_allocate(record=False)`: the HBM hit in blocks (-1 if the
-        request does not fit) and the hash chain it walked.
+        request does not fit), the hash chain it walked, and the free-pool
+        demand of a fit (0 when the request does not fit).
 
         Done once per admission attempt; the result is shared by the detach
         decision and the admission itself, which run in the same pass with no
         pool change in between.
         """
         block_hashes: list[int] = []
+        new_blocks: list[int] = []
         num_cached_blocks = self.block_manager.can_allocate(
             seq,
             record=False,
             block_hashes=block_hashes,
+            new_block_count=new_blocks,
         )
-        return num_cached_blocks, block_hashes
+        return (
+            num_cached_blocks,
+            block_hashes,
+            new_blocks[0] if new_blocks else 0,
+        )
 
     @staticmethod
     def _tier_hit(seq: Sequence) -> tuple[int, int]:
@@ -3177,7 +3180,7 @@ class Scheduler:
         )
 
     def _can_detach_tier_lookup(
-        self, seq: Sequence, hbm_probe: tuple[int, list[int]]
+        self, seq: Sequence, hbm_probe: tuple[int, list[int], int]
     ) -> bool:
         """Whether admission may proceed without waiting for `seq`'s lookup.
 
@@ -3951,7 +3954,7 @@ class Scheduler:
         self._connector_release_stalled_save(seq)
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
-        if getattr(self, "pd_admission", None) is not None:
+        if self.pd_admission is not None:
             # A ready request preempted before its first batch has discarded
             # its received KV; its subsequent replay is no longer a PD load.
             self.pd_admission.release(seq)
@@ -4581,6 +4584,10 @@ class Scheduler:
                     self.block_manager.deallocate(seq)
             else:
                 self.block_manager.deallocate(seq)
+            if self.pd_admission is not None:
+                # A request aborted after promotion but before its first batch
+                # never reaches `scheduled`, which would otherwise return this.
+                self.pd_admission.release(seq)
             self.running.remove(seq)
 
         self.engine_stats.update_throughput(
@@ -4849,7 +4856,7 @@ class Scheduler:
             logger.debug("Finished recving KV transfer for request %s", req_id)
             if self._finish_aborted_load_cleanup(req_id):
                 continue
-            if getattr(self, "pd_admission", None) is not None:
+            if self.pd_admission is not None:
                 self.pd_admission.received(req_id)
             if metrics := getattr(self, "metrics", None):
                 metrics.finish_kv_wait(req_id, succeeded=True)
@@ -5070,6 +5077,8 @@ class PrefillScheduler:
     # in-flight prefill is not counted on both. See `_METRICS_ROLE` on
     # `Scheduler`.
     _METRICS_ROLE = "prefill"
+    # P/D admission is decode-side Mooncake policy; this prefill side has none.
+    pd_admission = None
 
     def __init__(self, config: Config, disagg_cu_shm_name: str = ""):
         self.max_num_seqs = config.max_num_seqs

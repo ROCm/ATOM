@@ -28,6 +28,7 @@ from aiter.dist.utils import get_distributed_init_method
 from torch.profiler import record_function
 
 from atom.config import Config, set_current_atom_config
+from atom.distributed.group_agreement import agree_kv_budget
 from atom.distributed.pcp_utils import (
     PcpBalGroup,
     get_pcp_world_size,
@@ -1885,12 +1886,23 @@ class ModelRunner:
                 "Reserving %.2fGB for KV connector buffers", connector_bytes / (1 << 30)
             )
             available_for_kv_budget -= connector_bytes
-        # This prevents OOM when other processes share the GPU. Free HBM must
-        # cover the connector buffers too.
+        # Every worker builds its pool at rank 0's count, so take the group
+        # minimum before any rank raises alone and leaves the others waiting.
+        # The PCP group is included whenever it spans more than one rank, which
+        # covers Ulysses SP (PCP=1) as well as PCP>1.
+        groups = (
+            (get_tp_group(), get_pcp_group())
+            if torch.distributed.is_initialized()
+            else ()
+        )
+        free, available_for_kv_budget = agree_kv_budget(
+            free, available_for_kv_budget, groups
+        )
+        # Free HBM has to cover the buffers the connector allocates after the
+        # KV cache is sized, or the cache is planned into memory that is not
+        # there. `free` is agreed above, so every rank raises here or none does.
         free_for_kv = free - connector_bytes
         if connector_bytes and free_for_kv <= 0:
-            # Otherwise the KV cache gets nothing and the connector allocates
-            # from memory that is not there.
             raise RuntimeError(
                 f"Only {free / (1 << 30):.2f}GB is free on the GPU, less than "
                 f"the {connector_bytes / (1 << 30):.2f}GB the KV connector "
@@ -1976,47 +1988,7 @@ class ModelRunner:
             num_kvcache_blocks = int(t.item())
             plan = plan.with_paged_entries(num_kvcache_blocks)
 
-        # Every TP / PCP worker of this engine builds its pool at the count
-        # rank 0 reports (`call_func` returns rank 0's answer), so no worker
-        # may report more than the smallest of them can hold.
-        if torch.distributed.is_initialized():
-            groups = [get_tp_group()]
-            if config.prefill_context_parallel_size > 1:
-                groups.append(get_pcp_group())
-            reduced = num_kvcache_blocks
-            for group in groups:
-                if group.world_size > 1:
-                    t = torch.tensor([reduced], dtype=torch.int64, device="cpu")
-                    torch.distributed.all_reduce(
-                        t, op=torch.distributed.ReduceOp.MIN, group=group.cpu_group
-                    )
-                    reduced = int(t.item())
-            if reduced != num_kvcache_blocks:
-                num_kvcache_blocks = reduced
-                plan = plan.with_paged_entries(num_kvcache_blocks)
-
         block_bytes = plan.entry_bytes[plan.paged_class]
-        pd_block_bytes = block_bytes if len(plan.entry_bytes) == 1 else 0
-        pd_admission = (config.kv_transfer_config or {}).get("pd_admission", {})
-        if isinstance(pd_admission, dict) and pd_admission.get("enabled"):
-            # W is budgeted in one D rank's page bytes, so every TP rank must
-            # use the same physical page layout.
-            if torch.distributed.is_initialized():
-                layout = torch.tensor(
-                    [pd_block_bytes, -pd_block_bytes], dtype=torch.int64, device="cpu"
-                )
-                torch.distributed.all_reduce(
-                    layout,
-                    op=torch.distributed.ReduceOp.MIN,
-                    group=get_tp_group().cpu_group,
-                )
-                smallest, neg_largest = layout.tolist()
-                if smallest != -neg_largest:
-                    raise ValueError(
-                        "pd_admission requires identical D TP page layouts"
-                    )
-            if pd_block_bytes <= 0:
-                raise ValueError("pd_admission requires a single paged KV pool layout")
         # The whole plan travels to the engine process; BlockManager, the
         # sliding-window pool and the attention builder each index it by the
         # class name they declared. Nothing here needs to know those names.
@@ -2158,7 +2130,7 @@ class ModelRunner:
         draft = getattr(self, "draft_kv_builder", None)
         return {
             "num_kvcache_blocks": num_kvcache_blocks,
-            "pd_admission_block_bytes": pd_block_bytes,
+            "pool_entry_bytes": dict(plan.entry_bytes),
             "pool_entries": dict(plan.entries),
             "pool_entries_per_req": dict(plan.entries_per_req),
             "state_runtime": state_runtime.to_wire(),
