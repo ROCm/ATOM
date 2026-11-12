@@ -180,14 +180,15 @@ def _inputs(tokens):
 def _base_forward(layer, x, bank, add, add2):
     """`KimiDecoderLayer.forward` as it was before the op: the attention
     reduces o_proj and the layer runs mlp_attn_res and the FFN itself."""
-    layer.self_attn.o_proj.reduce_results = True
+    o_proj = layer.self_attn.o_proj
+    reduce_results, o_proj.reduce_results = o_proj.reduce_results, True
     try:
         h, prefix = layer.self_attention_attn_res(x, bank, add, add2)
         bank, prefix = layer.self_attention_attn_res.maybe_close_block(prefix, bank)
         h, prefix = layer.mlp_attn_res(prefix, bank, layer.self_attn(h))
         h, shared = layer._ffn(h)
     finally:
-        layer.self_attn.o_proj.reduce_results = False
+        o_proj.reduce_results = reduce_results
     return prefix, h, shared, bank
 
 
