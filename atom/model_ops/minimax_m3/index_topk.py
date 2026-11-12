@@ -32,23 +32,45 @@ import torch
 import triton
 import triton.language as tl
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl import (
-    minimax_m3_index_score_fp4_flydsl,
-    minimax_m3_index_score_prefill_fp4_flydsl,
-)
-
-# aiter's chunk-narrowing per-row selector: same forced-block pins and tie
-# direction as the Triton one below, same selection on every shape tried. It
-# narrows in one pass where Triton folds tl.topk over ceil(max_block / BLOCK_SIZE_K)
-# tiles, so it pulls ahead as the row widens -- 7us against 36us at a 1M context.
-# `_aiter_selector_wins` says where.
-from aiter.ops.flydsl.topk.topk_per_row_small_k import (
-    topk_per_row_small_k,
-    topk_per_row_small_k_supported,
-)
 
 from atom.model_ops.minimax_m3.geometry import SPARSE_BLOCK_SIZE
 from atom.model_ops.minimax_m3.mxfp4_pages import page_views
+
+
+@functools.cache
+def flydsl_ops():
+    """aiter's FlyDSL module, for the MXFP4 index scorers and their work map.
+
+    Imported where an MXFP4 index step first reaches for it, once, not at module load:
+    `aiter.ops.flydsl` imports `flydsl` itself, and every bf16 / fp8 deployment (and
+    every MHA model, which imports this module through the shared backend) would then
+    need it. A deployment that does run the MXFP4 index and lacks FlyDSL fails here.
+    """
+    from aiter.ops import flydsl
+
+    return flydsl
+
+
+@functools.cache
+def _small_k_selector():
+    """aiter's chunk-narrowing per-row selector and its support predicate.
+
+    Same forced-block pins and tie direction as the Triton one below, same selection
+    on every shape tried. It narrows in one pass where Triton folds tl.topk over
+    ceil(max_block / BLOCK_SIZE_K) tiles, so it pulls ahead as the row widens -- 7us
+    against 36us at a 1M context. `_aiter_selector_wins` says where.
+
+    Imported where a row first takes it, once, for the reason `flydsl_ops` is. No probe
+    and no fallback: a row wide enough to take it on an aiter without it fails here
+    rather than quietly running the Triton selector.
+    """
+    from aiter.ops.flydsl.topk.topk_per_row_small_k import (
+        topk_per_row_small_k,
+        topk_per_row_small_k_supported,
+    )
+
+    return topk_per_row_small_k, topk_per_row_small_k_supported
+
 
 # Query rows one prefill score program owns.
 #
@@ -772,6 +794,7 @@ def _select_with_aiter(
     # The bounds length is in the key, not assumed equal to `rows`: a caller
     # whose decode tokens are not `max_query_len` per request hands a shorter
     # one, and that has to keep declining rather than hit a cached yes.
+    topk_per_row_small_k, topk_per_row_small_k_supported = _small_k_selector()
     key = (rows, max_block, topk, n_valid_column_per_row.shape[0], score.device)
     served = _AITER_SERVES.get(key)
     if served is None:
@@ -1192,7 +1215,7 @@ def minimax_m3_index_topk(
 
     if index_scorer is not None:
         k_data, k_scale = page_views(index_kv_cache)
-        score = minimax_m3_index_score_prefill_fp4_flydsl(
+        score = flydsl_ops().minimax_m3_index_score_prefill_fp4_flydsl(
             idx_q,
             k_data,
             k_scale,
@@ -1466,7 +1489,7 @@ def minimax_m3_index_topk_decode(
             num_idx_heads * total_q, score_max_block
         ).view(num_idx_heads, total_q, score_max_block)
         k_data, k_scale = page_views(index_kv_cache)
-        score = minimax_m3_index_score_fp4_flydsl(
+        score = flydsl_ops().minimax_m3_index_score_fp4_flydsl(
             idx_q,
             k_data,
             k_scale,

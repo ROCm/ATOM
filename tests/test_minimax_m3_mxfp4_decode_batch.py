@@ -446,7 +446,11 @@ def test_the_decode_metadata_builds_the_map_into_the_records_buffer(monkeypatch)
         built.append((max_block, q, heads, out))
         return out[:3]
 
-    monkeypatch.setattr(sparse_attn, "minimax_m3_index_score_work_map", work_map)
+    monkeypatch.setattr(
+        sparse_attn,
+        "flydsl_ops",
+        lambda: types.SimpleNamespace(minimax_m3_index_score_work_map=work_map),
+    )
     monkeypatch.setattr(
         sparse_attn, "build_n_valid_column_per_row", lambda *a, **k: None
     )
@@ -540,8 +544,11 @@ def _scorer_call(monkeypatch, phase):
         seen["out"] = out
         return out
 
-    monkeypatch.setattr(index_topk, "minimax_m3_index_score_fp4_flydsl", scorer)
-    monkeypatch.setattr(index_topk, "minimax_m3_index_score_prefill_fp4_flydsl", scorer)
+    scorers = types.SimpleNamespace(
+        minimax_m3_index_score_fp4_flydsl=scorer,
+        minimax_m3_index_score_prefill_fp4_flydsl=scorer,
+    )
+    monkeypatch.setattr(index_topk, "flydsl_ops", lambda: scorers)
     monkeypatch.setattr(
         index_topk, "_launch_select", lambda score, *a, **kw: seen.update(sel=score)
     )

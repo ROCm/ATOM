@@ -551,8 +551,11 @@ class TestSelectWithAiter:
 
     def test_a_contiguous_score_is_served(self, monkeypatch):
         calls = []
-        monkeypatch.setattr(m, "topk_per_row_small_k", lambda *a: calls.append(a))
-        monkeypatch.setattr(m, "topk_per_row_small_k_supported", lambda *a: True)
+        monkeypatch.setattr(
+            m,
+            "_small_k_selector",
+            lambda: (lambda *a: calls.append(a), lambda *a: True),
+        )
         monkeypatch.setattr(m, "_AITER_SERVES", {})
         heads, total_q, blocks = 2, 8, 2048
         score = torch.empty(heads, total_q, blocks)
@@ -637,9 +640,11 @@ def test_pad_rows_of_a_padded_step_emit_nothing_and_live_rows_are_unchanged(
     )
 
     served = []
-    real = m.topk_per_row_small_k
+    real, supported = m._small_k_selector()
     monkeypatch.setattr(
-        m, "topk_per_row_small_k", lambda *a: (served.append(1), real(*a))[1]
+        m,
+        "_small_k_selector",
+        lambda: (lambda *a: (served.append(1), real(*a))[1], supported),
     )
     monkeypatch.setattr(m, "_AITER_SERVES", {})
 

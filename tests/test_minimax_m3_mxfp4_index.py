@@ -111,16 +111,17 @@ def _aiter_allocates_its_scores():
     """Run the scorers as before the workspace: given no `out`, aiter allocates the
     scores and fills them with -inf itself (transposed at S * H >= 16, which the
     selector no longer takes: the values are made contiguous, the same scores)."""
-    from atom.model_ops.minimax_m3 import index_topk  # binds the scorers
+    from atom.model_ops.minimax_m3 import index_topk
 
+    ops = index_topk.flydsl_ops()
     names = (
         "minimax_m3_index_score_fp4_flydsl",
         "minimax_m3_index_score_prefill_fp4_flydsl",
     )
-    real = {n: getattr(index_topk, n) for n in names}
+    real = {n: getattr(ops, n) for n in names}
     for n in names:
         setattr(
-            index_topk,
+            ops,
             n,
             lambda *a, _f=real[n], **k: _f(*a, **{**k, "out": None}).contiguous(),
         )
@@ -128,7 +129,7 @@ def _aiter_allocates_its_scores():
         yield
     finally:
         for n in names:
-            setattr(index_topk, n, real[n])
+            setattr(ops, n, real[n])
 
 
 # `ppb` 16-pages a block: 1 for the MXFP4 KV, 8 for the page-16 SHUFFLE KV that

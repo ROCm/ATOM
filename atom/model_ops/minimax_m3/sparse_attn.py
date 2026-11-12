@@ -21,11 +21,13 @@ import torch
 import triton
 import triton.language as tl
 from aiter.ops.attention import pa_fwd_asm_supports_arch
-from aiter.ops.flydsl import minimax_m3_index_score_work_map
 
 from atom.model_ops.minimax_m3.geometry import SPARSE_BLOCK_SIZE
 from atom.model_ops.minimax_m3.index_buffers import IndexScoreBuffers
-from atom.model_ops.minimax_m3.index_topk import build_n_valid_column_per_row
+from atom.model_ops.minimax_m3.index_topk import (
+    build_n_valid_column_per_row,
+    flydsl_ops,
+)
 
 # Page-16 SHUFFLE layout for the AITER paged-attention path. The KV
 # cache is allocated with physical page size 16 (the ASM kernel page), and each
@@ -185,7 +187,7 @@ def make_sparse_decode_metadata(
     if index_scorer is not None and batch > 0:
         step_scorer = replace(
             index_scorer,
-            work_map=minimax_m3_index_score_work_map(
+            work_map=flydsl_ops().minimax_m3_index_score_work_map(
                 seq_lens,
                 index_scorer.max_block,
                 max_query_len,

@@ -30,14 +30,16 @@ def draft_owns_kv_pool(config) -> bool:
     """
     from atom.plugin import is_plugin_mode
 
+    # First: under a plugin the offload adapter hands over vLLM's own speculative
+    # config unchanged, which has no `draft_model_hf_config` to read.
+    if is_plugin_mode():
+        return False
     spec = config.speculative_config
     if (
         spec is None
         or spec.method not in DRAFT_POOL_METHODS
         or spec.draft_model_hf_config is None
     ):
-        return False
-    if is_plugin_mode():
         return False
     from atom.utils.selector import DRAFT_POOL_FAMILIES, attn_family
 

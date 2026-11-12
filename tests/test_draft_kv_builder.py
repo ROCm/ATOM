@@ -295,6 +295,16 @@ def test_a_plugin_draft_owns_no_pool_and_the_selector_is_not_asked(monkeypatch):
     assert draft_owns_kv_pool(_spec_config()) is False
 
 
+def test_a_plugin_config_without_native_draft_fields_answers_no(monkeypatch):
+    """The vLLM offload adapter passes vLLM's SpeculativeConfig through unchanged: it
+    has `method` but no `draft_model_hf_config`, and the answer must not read it."""
+    from atom.plugin import prepare
+
+    monkeypatch.setattr(prepare, "_CURRENT_FRAMEWORK", "vllm")
+    vllm_spec = SimpleNamespace(method="eagle3", draft_model_config=object())
+    assert draft_owns_kv_pool(SimpleNamespace(speculative_config=vllm_spec)) is False
+
+
 @pytest.mark.parametrize(
     "target, asked, pool_dtype",
     [
