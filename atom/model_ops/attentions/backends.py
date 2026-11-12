@@ -225,8 +225,8 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         """Undo what the capture wrote into the cache, before any request runs.
 
         `blank_cache_write_targets` keeps the paged writes off the cache, but a
-        backend whose capture has to run on real per-request state (a slot it
-        cannot point at nothing) leaves that state behind, and the next request
+        backend whose capture has to run on real per-request state (there is no
+        null slot to point it at) leaves that state behind, and the next request
         given the slot inherits it. Such a backend overrides this; the default
         has nothing to undo.
         """

@@ -182,17 +182,22 @@ class TestInitialFill:
 
     def test_refill_live_undoes_a_write(self):
         """A CUDA graph capture's warmup runs on real slots before any request
-        owns them, and may leave NaN there; the slots go out as if fresh."""
-        arena = build()
+        owns them, and may leave NaN there; the live slots go out as if fresh.
+        The entries below the live tail belong to whatever shares the buffer
+        and keep what they hold."""
+        arena = EntryMajorArena(V4_LIKE, 5, device="cpu", live_entries=2)
+        dead = arena.entries - arena.live_entries
         for field in V4_LIKE:
             arena.view(field.name).fill_(float("nan"))
         arena.refill_live()
         for field in V4_LIKE:
             view = arena.view(field.name)
+            assert torch.isnan(view[:, :dead]).all()
+            live = view[:, dead:]
             if field.fill == 0.0:
-                assert torch.equal(view, torch.zeros_like(view))
+                assert torch.equal(live, torch.zeros_like(live))
             else:
-                assert torch.isneginf(view).all()
+                assert torch.isneginf(live).all()
 
 
 def test_carving_more_than_the_buffer_holds_is_refused():
