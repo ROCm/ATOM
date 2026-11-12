@@ -2,7 +2,6 @@
 
 import logging
 import os
-from contextlib import contextmanager
 from importlib import import_module
 
 from atom.config import Config
@@ -271,32 +270,6 @@ def _patch_sglang_dsv4_draft_backends() -> None:
     DraftBackendFactory._create_dsv4_decode_backend = _create_atom_dsv4_decode_backend
     DraftBackendFactory._create_dsv4_prefill_backend = _create_atom_dsv4_prefill_backend
     DraftBackendFactory._atom_dsv4_draft_backend_patched = True
-
-
-_SGLANG_DISABLE_DRAFT_EXTEND_CG_ENV = "SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH"
-
-
-@contextmanager
-def _sglang_draft_extend_capture_disabled(active: bool):
-    """Keep SGLang from capturing its own draft-extend CUDA graph while active.
-
-    SGLang reads SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH from the environment
-    when it decides to capture, so setting it around graph initialization
-    leaves the draft-extend runner to the plugin. The previous value, or its
-    absence, is restored on exit.
-    """
-    if not active:
-        yield
-        return
-    previous = os.environ.get(_SGLANG_DISABLE_DRAFT_EXTEND_CG_ENV)
-    os.environ[_SGLANG_DISABLE_DRAFT_EXTEND_CG_ENV] = "1"
-    try:
-        yield
-    finally:
-        if previous is None:
-            os.environ.pop(_SGLANG_DISABLE_DRAFT_EXTEND_CG_ENV, None)
-        else:
-            os.environ[_SGLANG_DISABLE_DRAFT_EXTEND_CG_ENV] = previous
 
 
 def _patch_sglang_dsv4_spec_cuda_graph() -> None:
@@ -994,15 +967,8 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
             if hide_draft_extend_backend:
                 original_draft_extend_backend = self.draft_extend_attn_backend
                 self.draft_extend_attn_backend = None
-            # The Flash drafter's draft-extend graph is plugin-built below, as it
-            # was before SGLang 0.5.22 admitted QwenSparseAttnBackend to its own
-            # HIP capture. Left to SGLang, that capture reaches the plugin's
-            # rebuild with a runner already set, which the plugin then drops,
-            # and every decode step's draft extend runs eager.
-            defer_draft_extend_capture = _is_qwen4_exp_nextn_runner(draft_runner)
             try:
-                with _sglang_draft_extend_capture_disabled(defer_draft_extend_capture):
-                    ret = original_init_cuda_graphs(self)
+                ret = original_init_cuda_graphs(self)
             finally:
                 if hide_draft_extend_backend:
                     self.draft_extend_attn_backend = original_draft_extend_backend
@@ -1015,10 +981,11 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                     getattr(self, "draft_runner", None)
                 ):
                     self.cuda_graph_runner = None
-                # The Flash drafter also takes this plugin-built draft-extend
-                # runner (its [3, N] mRoPE input is staged on replay by
-                # stage_draft_graph_mrope); SGLang's own capture is deferred for
-                # it above.
+                # The Flash drafter also uses a draft-extend graph (its [3, N]
+                # mRoPE input is staged on replay by stage_draft_graph_mrope).
+                # Keep a runner SGLang already captured (0.5.22+ admits
+                # QwenSparseAttnBackend to its HIP capture); build one only
+                # when SGLang did not.
                 supports_plugin_graph = _is_dsv4_or_glm52_nextn_runner(
                     getattr(self, "draft_runner", None)
                 ) or _is_qwen4_exp_nextn_runner(getattr(self, "draft_runner", None))
@@ -1065,8 +1032,6 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                     self.cuda_graph_runner_for_draft_extend = (
                         EAGLEDraftExtendCudaGraphRunner(self)
                     )
-                elif supports_plugin_graph:
-                    self.cuda_graph_runner_for_draft_extend = None
             except Exception as exc:
                 logger.warning(
                     "Failed to enable draft-extend cuda graph in ATOM plugin: %s",
