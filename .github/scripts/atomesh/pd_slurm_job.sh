@@ -188,28 +188,62 @@ pre_cleanup_local() {
   set -e
 }
 
-# Succeeds only when the scheduler answers and lists no job on this host but
-# this one. Finished jobs whose leftovers linger in COMPLETING do not count.
-node_runs_only_this_job() {
-  local host listing job state
-  host="$(hostname -s)"
+slurm_cmd() {
+  local -a cmd=("$1")
+  shift
+  if [[ -n "${SPUR_CONTROLLER_ADDR:-}" ]]; then
+    cmd+=(--controller "${SPUR_CONTROLLER_ADDR}")
+  fi
+  timeout "${ATOMESH_SPUR_QUERY_TIMEOUT:-20}" "${cmd[@]}" "$@"
+}
+
+# Prints "<job> <uid> <user> <state>" for each job the scheduler still runs on
+# this host besides this one, and fails when the scheduler does not answer.
+# Finished jobs whose leftovers linger in COMPLETING are not listed.
+other_jobs_on_node() {
+  local listing job uid user state
   command -v squeue >/dev/null 2>&1 || return 1
-  listing="$(timeout 10 squeue -h -w "${host}" -o '%i %T' 2>/dev/null)" || return 1
-  while read -r job state; do
+  listing="$(slurm_cmd squeue -h -w "$(hostname -s)" -o '%i %U %u %T' 2>/dev/null)" || return 1
+  while read -r job uid user state; do
     [[ -n "${job}" && "${job}" != "${JOB_ID}" ]] || continue
     case "${state}" in
       COMPLETING|COMPLETED|CANCELLED|FAILED|TIMEOUT|NODE_FAIL|PREEMPTED|OUT_OF_MEMORY) ;;
-      *)
-        echo "  job ${job} (${state:-unknown}) also runs on ${host}"
-        return 1
-        ;;
+      *) echo "${job} ${uid} ${user} ${state:-unknown}" ;;
     esac
   done <<< "${listing}"
 }
 
+# Takes this host's GPUs for this job: other users' jobs on the host are
+# cancelled and every GPU holder killed. When the scheduler does not answer,
+# the holders are killed anyway. Another job of this CI user on the host
+# (a sibling cell) is left alone, and so are the GPUs.
+free_gpus_for_this_job() {
+  local host others job uid user state
+  local -a cancel=()
+  host="$(hostname -s)"
+  compgen -G '/sys/class/kfd/kfd/proc/[0-9]*' >/dev/null || return 0
+  if ! others="$(other_jobs_on_node)"; then
+    echo "the scheduler did not answer for ${host}; killing its GPU holders anyway"
+    kill_gpu_holders
+    return 0
+  fi
+  while read -r job uid user state; do
+    [[ -n "${job}" ]] || continue
+    if [[ "${uid}" == "$(id -u)" ]]; then
+      echo "keep GPU holders: ${host} also runs this user's job ${job} (${state})"
+      return 0
+    fi
+    cancel+=("${job}")
+    echo "cancel ${user}'s job ${job} (${state}) on ${host}"
+  done <<< "${others}"
+  if [[ "${#cancel[@]}" -gt 0 ]] && ! slurm_cmd scancel "${cancel[@]}"; then
+    echo "WARNING: scancel ${cancel[*]} failed; killing the GPU holders anyway" >&2
+  fi
+  kill_gpu_holders
+}
+
 # Kills every process that has the GPUs open on this host, whoever owns it:
-# the container a process runs in, or else the process itself. Callers must
-# first make sure the node belongs to this job alone.
+# the container a process runs in, or else the process itself.
 kill_gpu_holders() {
   echo "=== pre-cleanup: kill GPU holders on $(hostname) ==="
   local proc pid cid name owner
@@ -218,14 +252,14 @@ kill_gpu_holders() {
   for proc in /sys/class/kfd/kfd/proc/[0-9]*; do
     [[ -d "${proc}" ]] || continue
     pid="${proc##*/}"
-    owner="$(ps -o user:32=,args= -p "${pid}" 2>/dev/null | tr -s ' ' | cut -c1-160)"
+    owner="$(ps -o user:32=,args= -p "${pid}" 2>/dev/null | tr -s ' ' | cut -c1-160)" || true
     [[ -n "${owner}" ]] || continue
     found=1
-    cid="$(grep -oE '[0-9a-f]{64}' "/proc/${pid}/cgroup" 2>/dev/null | head -1)"
+    cid="$(grep -oE '[0-9a-f]{64}' "/proc/${pid}/cgroup" 2>/dev/null | head -1)" || true
     if [[ -n "${cid}" && -n "${killed_containers[${cid}]:-}" ]]; then
       continue
     fi
-    name="$(docker inspect -f '{{.Name}}' "${cid:-none}" 2>/dev/null)"
+    name="$(docker inspect -f '{{.Name}}' "${cid:-none}" 2>/dev/null)" || true
     if [[ -n "${name}" ]] && timeout 20 docker kill "${cid}" >/dev/null 2>&1; then
       echo "  killed container ${name#/} (pid ${pid}: ${owner})"
       killed_containers["${cid}"]=1
@@ -264,20 +298,15 @@ busiest_gpu_over_limit() {
 # ones, release VRAM only after a while (over 90 s after a DeepSeek-V4 TP8
 # job), so poll for ATOMESH_GPU_IDLE_WAIT_SECONDS first. A busy host is
 # recorded in RUN_DIR/gpu-busy/ for pd_submit.sh to resubmit without it.
-# With ATOMESH_KILL_GPU_HOLDERS=1, any process with the GPUs open on a host
-# that runs no other job is killed first, however little VRAM it holds.
+# With ATOMESH_KILL_GPU_HOLDERS=1, free_gpus_for_this_job runs first, however
+# little VRAM the holders use.
 assert_gpus_idle() {
   local max_used_mb="${ATOMESH_GPU_BUSY_MB:-8192}"
   local wait_s="${ATOMESH_GPU_IDLE_WAIT_SECONDS:-300}"
   local deadline=$((SECONDS + wait_s))
   local busy
-  if [[ "${ATOMESH_KILL_GPU_HOLDERS:-0}" == "1" ]] \
-    && compgen -G '/sys/class/kfd/kfd/proc/[0-9]*' >/dev/null; then
-    if node_runs_only_this_job; then
-      kill_gpu_holders
-    else
-      echo "keep GPU holders: the scheduler does not show $(hostname) as this job's alone"
-    fi
+  if [[ "${ATOMESH_KILL_GPU_HOLDERS:-0}" == "1" ]]; then
+    free_gpus_for_this_job
   fi
   if ! command -v amd-smi >/dev/null 2>&1; then
     command -v rocm-smi >/dev/null 2>&1 && { rocm-smi --showmemuse 2>/dev/null | head -40 || true; }
