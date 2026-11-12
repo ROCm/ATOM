@@ -17,6 +17,7 @@ impl ConfigValidator {
         config.ext_proc.validate(config)?;
         Self::validate_mode(&config.mode)?;
         Self::validate_policy(&config.policy)?;
+        config.session_affinity.validate()?;
         Self::validate_server_settings(config)?;
 
         if let Some(metrics) = &config.metrics {

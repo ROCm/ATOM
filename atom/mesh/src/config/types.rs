@@ -52,6 +52,100 @@ impl std::str::FromStr for AtomPdRankMappingPolicy {
     }
 }
 
+/// Idle time before a session binding is eligible for a new placement.
+pub const DEFAULT_SESSION_AFFINITY_TTL_SECS: u64 = 120 * 60;
+
+/// Comma-separated session headers. The first non-empty value wins.
+/// `x-correlation-id` is not a session key: this router treats it as a per-request id.
+pub const DEFAULT_SESSION_ID_HEADERS: &str =
+    "x-dynamo-session-id,x-session-id,x-smg-routing-key,x-session-affinity";
+
+fn default_session_id_headers() -> Vec<String> {
+    DEFAULT_SESSION_ID_HEADERS
+        .split(',')
+        .map(str::to_string)
+        .collect()
+}
+
+fn default_session_affinity_ttl_secs() -> u64 {
+    DEFAULT_SESSION_AFFINITY_TTL_SECS
+}
+
+/// `hard` keeps the bound worker. `soft` keeps it too, unless the inner policy
+/// opts in and chooses another worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionAffinityMode {
+    #[default]
+    Hard,
+    Soft,
+}
+
+/// `independent` gives each session its own binding. `group` binds requests
+/// that carry a parent session id under one shared key; the parent session
+/// itself keeps its own binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionParentMode {
+    #[default]
+    Independent,
+    Group,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionAffinityConfig {
+    #[serde(default = "default_session_id_headers")]
+    pub session_id_headers: Vec<String>,
+    #[serde(default = "default_session_affinity_ttl_secs")]
+    pub ttl_secs: u64,
+    #[serde(default)]
+    pub mode: SessionAffinityMode,
+    #[serde(default)]
+    pub parent_mode: SessionParentMode,
+}
+
+impl Default for SessionAffinityConfig {
+    fn default() -> Self {
+        Self {
+            session_id_headers: default_session_id_headers(),
+            ttl_secs: default_session_affinity_ttl_secs(),
+            mode: SessionAffinityMode::Hard,
+            parent_mode: SessionParentMode::Independent,
+        }
+    }
+}
+
+impl SessionAffinityConfig {
+    /// Reject settings that would silently disable affinity or expire every request.
+    pub fn validate(&self) -> ConfigResult<()> {
+        if self.ttl_secs == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "session_affinity_ttl_secs".to_string(),
+                value: "0".to_string(),
+                reason: "idle ttl must be at least 1 second".to_string(),
+            });
+        }
+        if !self
+            .session_id_headers
+            .iter()
+            .any(|header| !header.trim().is_empty())
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "session_id_headers".to_string(),
+                value: self.session_id_headers.join(","),
+                reason: "at least one session header is required; an empty list disables affinity"
+                    .to_string(),
+            });
+        }
+        if self.mode == SessionAffinityMode::Soft {
+            tracing::warn!(
+                "session-affinity mode is soft, but no built-in policy overrides an existing binding; soft currently behaves as hard"
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Main router configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouterConfig {
@@ -71,6 +165,9 @@ pub struct RouterConfig {
     pub atom_pd_rank_mapping_policy: AtomPdRankMappingPolicy,
 
     pub policy: PolicyConfig,
+    /// Session table layered on every policy. Prefill and decode each get a table.
+    #[serde(default)]
+    pub session_affinity: SessionAffinityConfig,
     pub host: String,
     pub port: u16,
     pub max_payload_size: usize,
@@ -285,7 +382,8 @@ pub enum PolicyConfig {
     RoundRobin,
 
     /// Session-affinity policy for data-parallel workers.
-    /// Requests with the same `X-Session-ID` are routed to the same healthy worker.
+    /// The first placement uses the fewest live sessions. The session key comes
+    /// from [`SessionAffinityConfig`], not only `X-Session-ID`.
     #[serde(rename = "dp_sticky")]
     DpSticky,
 
@@ -438,6 +536,7 @@ impl Default for RouterConfig {
             },
             backend: BackendType::Sglang,
             policy: PolicyConfig::Random,
+            session_affinity: SessionAffinityConfig::default(),
             host: "0.0.0.0".to_string(),
             port: 3001,
             max_payload_size: 536_870_912,     // 512MB

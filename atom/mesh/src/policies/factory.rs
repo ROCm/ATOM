@@ -3,17 +3,47 @@
 use std::sync::Arc;
 
 use super::{
+    session_affinity::{SessionAffinityPolicy, SessionAffinityScope},
     CacheAwareConfig, CacheAwarePolicy, DpStickyPolicy, LoadBalancingPolicy, PowerOfTwoPolicy,
     PrefixHashConfig, PrefixHashPolicy, RandomPolicy, RoundRobinPolicy,
 };
-use crate::config::PolicyConfig;
+use crate::config::{PolicyConfig, SessionAffinityConfig};
 
 /// Factory for creating policy instances
 pub struct PolicyFactory;
 
 impl PolicyFactory {
-    /// Create a policy from configuration
+    /// Create a policy from configuration, using the default session-affinity settings.
     pub fn create_from_config(config: &PolicyConfig) -> Arc<dyn LoadBalancingPolicy> {
+        Self::create(config, &SessionAffinityConfig::default())
+    }
+
+    /// Create a policy and wrap it with a session table.
+    ///
+    /// Each call gets its own table, so prefill and decode do not share bindings.
+    pub fn create(
+        config: &PolicyConfig,
+        affinity: &SessionAffinityConfig,
+    ) -> Arc<dyn LoadBalancingPolicy> {
+        Self::create_in(config, affinity, SessionAffinityScope::Regular)
+    }
+
+    pub(crate) fn create_in(
+        config: &PolicyConfig,
+        affinity: &SessionAffinityConfig,
+        scope: SessionAffinityScope,
+    ) -> Arc<dyn LoadBalancingPolicy> {
+        if matches!(config, PolicyConfig::DpSticky) {
+            return Arc::new(DpStickyPolicy::with_config(affinity.clone(), scope));
+        }
+        Arc::new(SessionAffinityPolicy::around_scoped(
+            affinity.clone(),
+            Self::create_bare(config),
+            scope,
+        ))
+    }
+
+    fn create_bare(config: &PolicyConfig) -> Arc<dyn LoadBalancingPolicy> {
         match config {
             PolicyConfig::Random => Arc::new(RandomPolicy::new()),
             PolicyConfig::RoundRobin => Arc::new(RoundRobinPolicy::new()),
@@ -50,15 +80,32 @@ impl PolicyFactory {
 
     /// Create a policy by name (for dynamic loading)
     pub fn create_by_name(name: &str) -> Option<Arc<dyn LoadBalancingPolicy>> {
-        match name.to_lowercase().as_str() {
-            "random" => Some(Arc::new(RandomPolicy::new())),
-            "round_robin" | "roundrobin" => Some(Arc::new(RoundRobinPolicy::new())),
-            "dp_sticky" | "dpsticky" => Some(Arc::new(DpStickyPolicy::new())),
-            "power_of_two" | "poweroftwo" => Some(Arc::new(PowerOfTwoPolicy::new())),
-            "cache_aware" | "cacheaware" => Some(Arc::new(CacheAwarePolicy::new())),
-            "prefix_hash" | "prefixhash" => Some(Arc::new(PrefixHashPolicy::with_defaults())),
-            _ => None,
-        }
+        Self::create_by_name_with(name, &SessionAffinityConfig::default())
+    }
+
+    pub fn create_by_name_with(
+        name: &str,
+        affinity: &SessionAffinityConfig,
+    ) -> Option<Arc<dyn LoadBalancingPolicy>> {
+        let bare: Arc<dyn LoadBalancingPolicy> = match name.to_lowercase().as_str() {
+            "random" => Arc::new(RandomPolicy::new()),
+            "round_robin" | "roundrobin" => Arc::new(RoundRobinPolicy::new()),
+            "dp_sticky" | "dpsticky" => {
+                return Some(Arc::new(DpStickyPolicy::with_config(
+                    affinity.clone(),
+                    SessionAffinityScope::Regular,
+                )));
+            }
+            "power_of_two" | "poweroftwo" => Arc::new(PowerOfTwoPolicy::new()),
+            "cache_aware" | "cacheaware" => Arc::new(CacheAwarePolicy::new()),
+            "prefix_hash" | "prefixhash" => Arc::new(PrefixHashPolicy::with_defaults()),
+            _ => return None,
+        };
+        Some(Arc::new(SessionAffinityPolicy::around_scoped(
+            affinity.clone(),
+            bare,
+            SessionAffinityScope::Regular,
+        )))
     }
 }
 
@@ -209,5 +256,36 @@ mod tests {
                 expected_name
             );
         }
+    }
+
+    #[test]
+    fn prefill_and_decode_tables_keep_their_scope() {
+        let affinity = SessionAffinityConfig::default();
+        let prefill = PolicyFactory::create_in(
+            &PolicyConfig::Random,
+            &affinity,
+            SessionAffinityScope::Prefill,
+        );
+        let decode = PolicyFactory::create_in(
+            &PolicyConfig::Random,
+            &affinity,
+            SessionAffinityScope::Decode,
+        );
+        assert_eq!(
+            prefill
+                .as_any()
+                .downcast_ref::<SessionAffinityPolicy>()
+                .unwrap()
+                .scope_label(),
+            "prefill"
+        );
+        assert_eq!(
+            decode
+                .as_any()
+                .downcast_ref::<SessionAffinityPolicy>()
+                .unwrap()
+                .scope_label(),
+            "decode"
+        );
     }
 }

@@ -9,8 +9,14 @@ use tracing::{debug, info, warn};
 /// When the first worker of a new model is added, it determines the policy for that model.
 /// All subsequent workers of the same model use the established policy.
 /// When the last worker of a model is removed, the policy mapping is cleaned up.
-use super::{CacheAwarePolicy, LoadBalancingPolicy, PolicyFactory};
-use crate::{config::types::PolicyConfig, core::Worker};
+use super::{
+    session_affinity::{as_cache_aware, SessionAffinityScope},
+    LoadBalancingPolicy, PolicyFactory,
+};
+use crate::{
+    config::{PolicyConfig, SessionAffinityConfig},
+    core::Worker,
+};
 
 /// Registry for managing model-to-policy mappings
 #[derive(Clone)]
@@ -24,6 +30,9 @@ pub struct PolicyRegistry {
     /// Default policy instance (cached, immutable after creation)
     default_policy: Arc<dyn LoadBalancingPolicy>,
 
+    /// Applied to every policy this registry creates, including worker hints.
+    session_affinity: SessionAffinityConfig,
+
     /// Prefill policy for PD mode (set once at startup, lock-free reads via OnceLock)
     prefill_policy: Arc<OnceLock<Arc<dyn LoadBalancingPolicy>>>,
 
@@ -32,11 +41,25 @@ pub struct PolicyRegistry {
 }
 
 impl PolicyRegistry {
-    /// Create a new PolicyRegistry with a default policy
+    /// Create a new PolicyRegistry with a default policy and default session affinity.
     pub fn new(default_policy_config: PolicyConfig) -> Self {
-        let default_policy = Self::create_policy_from_config(&default_policy_config);
+        Self::with_session_affinity(default_policy_config, SessionAffinityConfig::default())
+    }
+
+    /// Create a registry whose policies share these session-affinity settings.
+    /// Each policy still gets its own session table.
+    pub fn with_session_affinity(
+        default_policy_config: PolicyConfig,
+        session_affinity: SessionAffinityConfig,
+    ) -> Self {
+        let default_policy = PolicyFactory::create_in(
+            &default_policy_config,
+            &session_affinity,
+            SessionAffinityScope::Regular,
+        );
 
         Self {
+            session_affinity,
             model_policies: Arc::new(DashMap::new()),
             model_worker_counts: Arc::new(DashMap::new()),
             default_policy,
@@ -159,15 +182,29 @@ impl PolicyRegistry {
 
     /// Create a policy from a type string (delegates to PolicyFactory)
     fn create_policy_from_type(&self, policy_type: &str) -> Arc<dyn LoadBalancingPolicy> {
-        PolicyFactory::create_by_name(policy_type).unwrap_or_else(|| {
-            warn!("Unknown policy type '{}', using default", policy_type);
-            Arc::clone(&self.default_policy)
-        })
+        PolicyFactory::create_by_name_with(policy_type, &self.session_affinity).unwrap_or_else(
+            || {
+                warn!("Unknown policy type '{}', using default", policy_type);
+                Arc::clone(&self.default_policy)
+            },
+        )
     }
 
-    /// Create a policy from a PolicyConfig (delegates to PolicyFactory)
-    fn create_policy_from_config(config: &PolicyConfig) -> Arc<dyn LoadBalancingPolicy> {
-        PolicyFactory::create_from_config(config)
+    /// Create a policy from a PolicyConfig using this registry's session settings.
+    fn create_policy(
+        &self,
+        config: &PolicyConfig,
+        scope: SessionAffinityScope,
+    ) -> Arc<dyn LoadBalancingPolicy> {
+        PolicyFactory::create_in(config, &self.session_affinity, scope)
+    }
+
+    pub fn create_prefill_policy(&self, config: &PolicyConfig) -> Arc<dyn LoadBalancingPolicy> {
+        self.create_policy(config, SessionAffinityScope::Prefill)
+    }
+
+    pub fn create_decode_policy(&self, config: &PolicyConfig) -> Arc<dyn LoadBalancingPolicy> {
+        self.create_policy(config, SessionAffinityScope::Decode)
     }
 
     /// Get current model->policy mappings (for debugging/monitoring)
@@ -268,7 +305,7 @@ impl PolicyRegistry {
         // Get the policy for this model
         if let Some(policy) = self.get_policy(model_id) {
             if policy.name() == "cache_aware" {
-                if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
+                if let Some(cache_aware) = as_cache_aware(policy.as_ref()) {
                     debug!(
                         "Initializing cache-aware policy with {} workers for model {}",
                         workers.len(),
@@ -286,7 +323,7 @@ impl PolicyRegistry {
         // Get the policy for this model
         if let Some(policy) = self.get_policy(model_id) {
             if policy.name() == "cache_aware" {
-                if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
+                if let Some(cache_aware) = as_cache_aware(policy.as_ref()) {
                     cache_aware.remove_worker_by_url(worker_url);
                     debug!(
                         "Removed worker {} from cache-aware policy for model {}",
@@ -303,7 +340,7 @@ impl PolicyRegistry {
             .flatten()
         {
             if policy.name() == "cache_aware" {
-                if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
+                if let Some(cache_aware) = as_cache_aware(policy.as_ref()) {
                     cache_aware.remove_worker_by_url(worker_url);
                 }
             }
@@ -331,9 +368,7 @@ impl PolicyRegistry {
         // Initialize prefill policy if it's cache-aware (lock-free via OnceLock::get)
         if let Some(prefill_policy) = self.prefill_policy.get() {
             if prefill_policy.name() == "cache_aware" {
-                if let Some(cache_aware) =
-                    prefill_policy.as_any().downcast_ref::<CacheAwarePolicy>()
-                {
+                if let Some(cache_aware) = as_cache_aware(prefill_policy.as_ref()) {
                     if !prefill_workers.is_empty() {
                         // info-level: a silently skipped seed leaves cache_aware
                         // treeless, which is invisible until throughput tanks.
@@ -350,8 +385,7 @@ impl PolicyRegistry {
         // Initialize decode policy if it's cache-aware (lock-free via OnceLock::get)
         if let Some(decode_policy) = self.decode_policy.get() {
             if decode_policy.name() == "cache_aware" {
-                if let Some(cache_aware) = decode_policy.as_any().downcast_ref::<CacheAwarePolicy>()
-                {
+                if let Some(cache_aware) = as_cache_aware(decode_policy.as_ref()) {
                     if !decode_workers.is_empty() {
                         debug!(
                             "Initializing decode cache-aware policy with {} workers",
