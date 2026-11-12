@@ -13,3 +13,6 @@ class StepOverrideModel:
 
     def step_override(self, input_ids, running_bs: int, batch):
         raise NotImplementedError
+
+    def decline_step(self, batch):
+        """Drop previous served state when the executor requires normal logits."""
