@@ -117,14 +117,16 @@ class SizedSeq(SimpleNamespace):
 NO_HIT = SimpleNamespace(num_cached_blocks=0, block_hashes=[])
 
 
-def standalone(max_bytes):
+def standalone(max_bytes, *, reserve_blocks=None, free_blocks=0):
     """A controller over a one-token-per-block pool and a full-transfer connector."""
     connector = SimpleNamespace(pd_receive_block_offset=lambda seq, n, cached: 0)
     block_manager = SimpleNamespace(
         num_pool_blocks=lambda tokens: tokens,
-        kv=SimpleNamespace(lookup=lambda h: -1),
+        kv=SimpleNamespace(lookup=lambda h: -1, num_free=free_blocks),
     )
-    return PdAdmissionController(max_bytes, 1024, connector, block_manager)
+    return PdAdmissionController(
+        max_bytes, 1024, connector, block_manager, reserve_blocks=reserve_blocks
+    )
 
 
 def try_admit(policy, seq):
@@ -198,12 +200,10 @@ def test_free_kv_watermark_keeps_room_for_running_requests(build, chunked):
     sched, request = build(
         chunked=chunked,
         num_kvcache_blocks=10,
-        options={
-            "enabled": True,
-            "max_pending_kv_fraction": None,
-            "min_free_kv_fraction": 0.5,
-        },
+        options={"enabled": True, "min_free_kv_fraction": 0.5},
     )
+    # Setting one limit drops the default byte budget.
+    assert sched.pd_admission.max_bytes is None
     assert sched.pd_admission.reserve_blocks == 5
     a, b, c = request(), request(), request()
     sched.extend([a, b, c])
@@ -231,11 +231,7 @@ def test_free_kv_watermark_counts_claimed_prefix_hits(build, seq_factory, chunke
         chunked=chunked,
         prefix=True,
         num_kvcache_blocks=10,
-        options={
-            "enabled": True,
-            "max_pending_kv_fraction": None,
-            "min_free_kv_fraction": 0.6,
-        },
+        options={"enabled": True, "min_free_kv_fraction": 0.6},
     )
     bm = sched.block_manager
     seed = seq_factory(list(range(16)))
@@ -622,6 +618,9 @@ def test_multiconnector_uses_load_winner(build):
         {"enabled": True, "max_pending_kv_fraction": 1.1},
         {"enabled": True, "max_pending_kv_fraction": 0.1, "max_pending_kv_bytes": 10},
         {"enabled": True, "max_pending_kv_fraction": None},
+        # A limit is either set or omitted; null does not disable it.
+        {"enabled": True, "max_pending_kv_fraction": None, "min_free_kv_fraction": 0.5},
+        {"enabled": True, "max_pending_kv_bytes": None},
         {"enabled": True, "extra_growth_blocks_per_request": 1},
         {"enabled": True, "min_free_kv_fraction": 0},
         {"enabled": True, "min_free_kv_fraction": 1},
@@ -666,6 +665,28 @@ def test_physical_targets_are_deduplicated_and_release_is_idempotent():
     assert policy.pending_bytes == 2048
     policy.release(b)
     assert policy.pending_bytes == 0
+
+
+def test_a_request_over_both_limits_counts_under_both(build):
+    sched, _ = build(
+        options={
+            "enabled": True,
+            "max_pending_kv_bytes": 1024,
+            "min_free_kv_fraction": 0.5,
+        }
+    )
+    assert (sched.pd_admission.max_bytes, sched.pd_admission.reserve_blocks) == (
+        1024,
+        32,
+    )
+    policy = standalone(1024, reserve_blocks=32, free_blocks=32)
+    a = SizedSeq(id=1, block_table=[1])
+    b = SizedSeq(id=2, block_table=[2])
+    assert try_admit(policy, a)
+    # B would exceed the byte budget and leave 31 free blocks, below the 32 kept.
+    for _ in range(2):
+        assert not try_admit(policy, b)
+    assert policy.deferred == {"bytes": 1, "free_kv": 1}
 
 
 def test_rejected_deferred_request_leaves_no_marker():
