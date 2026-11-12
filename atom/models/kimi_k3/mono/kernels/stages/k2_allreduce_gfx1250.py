@@ -54,8 +54,15 @@ def allreduce_lines(rows: int) -> int:
     return rows * REDUCE_WIDTH // LINE_ELEMENTS
 
 
+def allreduce_threads(rows: int) -> int:
+    """A CTA's threads: twice as many once ``MAX_CTAS`` CTAs would leave some
+    thread a second line, whose loads would wait out the first line's remote
+    stores."""
+    return THREADS if allreduce_lines(rows) <= MAX_CTAS * THREADS else 2 * THREADS
+
+
 def allreduce_ctas(rows: int) -> int:
-    return min(MAX_CTAS, -(-allreduce_lines(rows) // THREADS))
+    return min(MAX_CTAS, -(-allreduce_lines(rows) // allreduce_threads(rows)))
 
 
 def allreduce_peer_bytes(tp: int, rows: int) -> int:
@@ -177,12 +184,13 @@ def build_allreduce(tp: int, rows: int) -> K2AllReduceKernel:
     """Lines are dealt to the grid's threads in turn; a thread reduces in place
     only lines it pushed itself."""
     lines = allreduce_lines(rows)
+    threads = allreduce_threads(rows)
     ctas = allreduce_ctas(rows)
-    stride = ctas * THREADS
+    stride = ctas * threads
     bank_words = tp * lines * LINE_WORDS
     name = f"k3_k2_gfx1250_allreduce_tp{tp}_s{rows}"
 
-    @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
+    @flyc.kernel(name=name, known_block_size=[threads, 1, 1])
     def kernel(data: Int64, peers: Int64, epochs: Int64, rank: Int32):
         tid = fx.Int32(fx.thread_idx.x)
         bid = fx.Int32(fx.block_idx.x)
@@ -192,7 +200,7 @@ def build_allreduce(tp: int, rows: int) -> K2AllReduceKernel:
         bank = (epoch & 1) * bank_words
         bases = [load_ptr64(peers, p) for p in range(tp)]
         mine = rsrc(load_ptr64(peers, rank))
-        line = bid * THREADS + tid
+        line = bid * threads + tid
         _push_lines(rsrc(data), bases, rank, lines, bank, epoch, line, stride)
         _reduce_lines(data, mine, tp, lines, bank, epoch, line, fx.Int32(lines), stride)
         gpu.barrier()
@@ -212,8 +220,8 @@ def build_allreduce(tp: int, rows: int) -> K2AllReduceKernel:
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         kernel(data, peers, epochs, rank).launch(
-            grid=(ctas,), block=(THREADS,), stream=stream
+            grid=(ctas,), block=(threads,), stream=stream
         )
 
     ALLREDUCE_ABI.check(kernel, launch)
-    return K2AllReduceKernel(name, launch, (ctas,), (THREADS,), ctas)
+    return K2AllReduceKernel(name, launch, (ctas,), (threads,), ctas)

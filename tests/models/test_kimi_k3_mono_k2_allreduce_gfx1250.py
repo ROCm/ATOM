@@ -14,7 +14,10 @@ def test_lines_cover_the_routed_and_shared_partials(rows):
     assert lines * ar.LINE_ELEMENTS == rows * (LATENT + HIDDEN)
     ctas = ar.allreduce_ctas(rows)
     assert 1 <= ctas <= ar.MAX_CTAS
-    assert ctas * ar.THREADS >= min(lines, ar.MAX_CTAS * ar.THREADS)
+    # one line a thread, so no thread loads after its own remote stores
+    assert ctas * ar.allreduce_threads(rows) >= lines
+    # every epoch counter is in some thread's reach
+    assert ctas * ar.allreduce_threads(rows) >= ar.MAX_CTAS
 
 
 def test_peer_banks_hold_two_epochs_of_every_source():
