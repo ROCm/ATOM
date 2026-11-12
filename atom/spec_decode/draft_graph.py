@@ -214,6 +214,12 @@ class DraftGraph:
             f"the batch at axis {d}"
         )
         scheduled_bs = src.shape[d]
+        assert scheduled_bs <= running_bs and (scheduled_bs > 0 or running_bs == 0), (
+            f"draft input '{role}' of {self.name} arrived with {scheduled_bs} "
+            f"rows for a running batch of {running_bs}; a pass widens one or "
+            f"more real rows by repeating the last, so it needs "
+            f"0 < rows <= running_bs (or both zero)"
+        )
         dst = out.narrow(d, 0, scheduled_bs)
         assert src.shape == dst.shape, (
             f"draft input '{role}' of {self.name} arrived as {tuple(src.shape)}, "

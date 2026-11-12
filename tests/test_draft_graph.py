@@ -31,6 +31,14 @@ def test_an_unwidened_empty_batch_stages_nothing():
     assert g.stage(0, {"row": torch.zeros(0, dtype=torch.int32)})["row"].shape[0] == 0
 
 
+@pytest.mark.parametrize(("rows", "running_bs"), [(0, 4), (5, 4)])
+def test_a_batch_that_cannot_be_widened_names_the_input_and_pass(rows, running_bs):
+    """No last row to repeat, or more rows than the batch: refused by name."""
+    g = _graph()
+    with pytest.raises(AssertionError, match=rf"'row' of {g.name}.*{rows} rows"):
+        g.stage(running_bs, {"row": torch.zeros(rows, dtype=torch.int32)})
+
+
 def test_owning_a_recording_says_nothing_about_a_batch_it_is_not_at(
     req_graph_recordings,
 ):
