@@ -185,32 +185,57 @@ pre_cleanup_local() {
   if [[ "${kept_active}" -eq 1 ]]; then
     echo "WARNING: $(hostname) still runs containers of other jobs; GPUs may be shared with them" >&2
   fi
-  if [[ "${ATOMESH_REMOVE_STOPPED_CONTAINERS:-0}" == "1" ]]; then
-    remove_stopped_containers
-  fi
   set -e
 }
 
-# Removes every exited or dead container on this host, whichever job or user
-# left it. "created" is skipped: a co-scheduled job may be starting that one.
-remove_stopped_containers() {
-  echo "=== pre-cleanup: remove stopped containers on $(hostname) ==="
-  local id name status
-  local stopped=()
-  while IFS=$'\t' read -r id name status; do
-    [[ -n "${id}" ]] || continue
-    echo "  remove ${id} ${name} (${status})"
-    stopped+=("${id}")
-  done < <(docker ps -a --filter status=exited --filter status=dead \
-    --format '{{.ID}}\t{{.Names}}\t{{.Status}}' 2>/dev/null)
+# Succeeds only when the scheduler answers and lists no job on this host but
+# this one. Finished jobs whose leftovers linger in COMPLETING do not count.
+node_runs_only_this_job() {
+  local host listing job state
+  host="$(hostname -s)"
+  command -v squeue >/dev/null 2>&1 || return 1
+  listing="$(timeout 10 squeue -h -w "${host}" -o '%i %T' 2>/dev/null)" || return 1
+  while read -r job state; do
+    [[ -n "${job}" && "${job}" != "${JOB_ID}" ]] || continue
+    case "${state}" in
+      COMPLETING|COMPLETED|CANCELLED|FAILED|TIMEOUT|NODE_FAIL|PREEMPTED|OUT_OF_MEMORY) ;;
+      *)
+        echo "  job ${job} (${state:-unknown}) also runs on ${host}"
+        return 1
+        ;;
+    esac
+  done <<< "${listing}"
+}
 
-  if [[ "${#stopped[@]}" -eq 0 ]]; then
-    echo "no stopped containers"
-  elif command -v timeout >/dev/null 2>&1; then
-    timeout 120 docker rm -f "${stopped[@]}" >/dev/null 2>&1 || true
-  else
-    docker rm -f "${stopped[@]}" >/dev/null 2>&1 || true
-  fi
+# Kills every process that has the GPUs open on this host, whoever owns it:
+# the container a process runs in, or else the process itself. Callers must
+# first make sure the node belongs to this job alone.
+kill_gpu_holders() {
+  echo "=== pre-cleanup: kill GPU holders on $(hostname) ==="
+  local proc pid cid name owner
+  local -A killed_containers=()
+  local found=0
+  for proc in /sys/class/kfd/kfd/proc/[0-9]*; do
+    [[ -d "${proc}" ]] || continue
+    pid="${proc##*/}"
+    owner="$(ps -o user:32=,args= -p "${pid}" 2>/dev/null | tr -s ' ' | cut -c1-160)"
+    [[ -n "${owner}" ]] || continue
+    found=1
+    cid="$(grep -oE '[0-9a-f]{64}' "/proc/${pid}/cgroup" 2>/dev/null | head -1)"
+    if [[ -n "${cid}" && -n "${killed_containers[${cid}]:-}" ]]; then
+      continue
+    fi
+    name="$(docker inspect -f '{{.Name}}' "${cid:-none}" 2>/dev/null)"
+    if [[ -n "${name}" ]] && timeout 20 docker kill "${cid}" >/dev/null 2>&1; then
+      echo "  killed container ${name#/} (pid ${pid}: ${owner})"
+      killed_containers["${cid}"]=1
+    elif kill -9 "${pid}" 2>/dev/null || sudo -n kill -9 "${pid}" 2>/dev/null; then
+      echo "  killed pid ${pid}: ${owner}"
+    else
+      echo "  WARNING: not permitted to kill pid ${pid}: ${owner}" >&2
+    fi
+  done
+  [[ "${found}" -eq 1 ]] || echo "no process holds the GPUs"
 }
 
 # Prints "<gpu> <used MB>" for the first GPU above ATOMESH_GPU_BUSY_MB.
@@ -239,16 +264,28 @@ busiest_gpu_over_limit() {
 # ones, release VRAM only after a while (over 90 s after a DeepSeek-V4 TP8
 # job), so poll for ATOMESH_GPU_IDLE_WAIT_SECONDS first. A busy host is
 # recorded in RUN_DIR/gpu-busy/ for pd_submit.sh to resubmit without it.
+# With ATOMESH_KILL_GPU_HOLDERS=1, a busy host that runs no other job gets
+# its GPU holders killed once before the wait.
 assert_gpus_idle() {
   local max_used_mb="${ATOMESH_GPU_BUSY_MB:-8192}"
   local wait_s="${ATOMESH_GPU_IDLE_WAIT_SECONDS:-300}"
   local deadline=$((SECONDS + wait_s))
   local busy
+  local kill_checked=0
   if ! command -v amd-smi >/dev/null 2>&1; then
     command -v rocm-smi >/dev/null 2>&1 && { rocm-smi --showmemuse 2>/dev/null | head -40 || true; }
     return 0
   fi
   while busy="$(busiest_gpu_over_limit)"; do
+    if [[ "${kill_checked}" -eq 0 && "${ATOMESH_KILL_GPU_HOLDERS:-0}" == "1" ]]; then
+      kill_checked=1
+      echo "$(hostname) GPU ${busy%% *} uses ${busy##* } MB VRAM before start"
+      if node_runs_only_this_job; then
+        kill_gpu_holders
+      else
+        echo "  keep GPU holders: the scheduler does not show $(hostname) as this job's alone"
+      fi
+    fi
     if (( SECONDS >= deadline )); then
       echo "ERROR: $(hostname) GPU ${busy%% *} already uses ${busy##* } MB VRAM (limit ${max_used_mb} MB). Spur co-scheduled another job on this node; refusing to start." >&2
       amd-smi monitor -v 2>/dev/null | head -20 >&2 || true
@@ -765,7 +802,9 @@ pre_cleanup_nodes() {
   echo "=== pre-cleanup: stop all running containers ==="
   for node in "${SELECTED_NODES[@]}"; do
     echo "[pre-cleanup] node=${node}"
-    srun --nodes=1 --ntasks=1 --nodelist="${node}" bash -lc '
+    # Slurm allocated the node exclusively, so anything left on the GPUs
+    # after the containers stop is not another job's.
+    srun --nodes=1 --ntasks=1 --nodelist="${node}" bash -lc "$(declare -f kill_gpu_holders)"'
       set +e
       echo "host=$(hostname)"
 
@@ -781,16 +820,15 @@ pre_cleanup_nodes() {
       else
         echo "no running containers"
       fi
+      if [[ "${ATOMESH_KILL_GPU_HOLDERS:-0}" == "1" ]]; then
+        kill_gpu_holders
+      fi
 
       sleep 2
       if command -v rocm-smi >/dev/null 2>&1; then
         rocm-smi --showmemuse 2>/dev/null || true
       fi
     ' || true
-    if [[ "${ATOMESH_REMOVE_STOPPED_CONTAINERS:-0}" == "1" ]]; then
-      srun --nodes=1 --ntasks=1 --nodelist="${node}" bash -lc \
-        "$(declare -f remove_stopped_containers); remove_stopped_containers" || true
-    fi
   done
   echo "=== pre-cleanup done ==="
 }
