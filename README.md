@@ -114,12 +114,18 @@ docker run -it --network=host \
 #### 2. Install AITER and ATOM inside the container
 
 ```bash
-pip install 'amd-aiter>=0.1.28'
+# Install the AITER release wheel matching your ROCm and Python versions first.
+# Get its URL from https://github.com/ROCm/aiter/releases (v0.1.28.post1 or newer).
+pip install '<matching AITER release wheel URL>'
 git clone https://github.com/ROCm/ATOM.git && pip install ./ATOM
 ```
 
 ATOM requires **AITER 0.1.28 or newer**, including the sparse prefill/decode
 `out=` APIs. This minimum is part of the base installation dependencies.
+Release wheels are published on [GitHub Releases](https://github.com/ROCm/aiter/releases);
+the default PyPI index may not carry a compatible version. CI uses a separately
+installed nightly wheel and checks its source commit against `v0.1.28`, since
+nightly package versions do not necessarily reflect the release tag.
 
 ## 💡 Usage
 

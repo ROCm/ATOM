@@ -121,6 +121,8 @@ jobs:
         timeout-minutes: 30
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # v0.1.28: sparse prefill/decode kernels accept caller-owned out=.
+          AITER_MINIMUM_COMMIT: f1965cd26021c43436ae2bd614846a5977c2636e
         run: bash .github/scripts/download_aiter_wheel.sh
 
       - name: Upload aiter wheel
@@ -521,7 +523,7 @@ jobs:
             echo '=== Installing ATOM ==='
             cd /workspace
             git config --global --add safe.directory /workspace
-            pip install -e .
+            python3 .github/scripts/install_atom_with_ci_aiter.py
 
             echo '=== Installed package versions ==='
             pip show amd-aiter | grep -E '^(Name|Version):'
