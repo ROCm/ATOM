@@ -220,6 +220,7 @@ recipe 建议每个模型一节，方便按模型名找到命令：
 ````markdown
 ## Kimi-K3 (2.8T)            ← 和 §1 表格里的模型名一致
 - 场景：MLPerf Endpoint；GPU：8（2 node, 2 tray x 1P4G）
+- 并行：TP8 + DCP8（`perf.csv` 里记作 `tp8dcp8`）
 - MODEL_PATH：<模型路径>；PORT：<端口>
 
 ### server
@@ -368,6 +369,7 @@ CI 只负责记录。要查根因就另开任务，从 ATOM 的 `/debug-guide` �
 | `scenario` | `endpoint` 或 `8k1k` |
 | `model` | §1 的 slug |
 | `gpus` | 每卡吞吐的分母 |
+| `parallel` | 并行策略，照 recipe 里该模型"并行"那一行写，小写、不加空格，例如 `tp8dcp8`、`tp4`。详细报告里显示的是这一列 |
 | `concurrency` | `4` 或 `64` |
 | `status` | `ok` 或 `fail` |
 | `tok_s_per_gpu` | 每卡吞吐，按 §4.1 计算，保留两位小数 |
@@ -506,7 +508,7 @@ Image `gfx1250-atom-ci455-<YYYYMMDD>` · ATOM `main@<sha 前 9 位>` · aiter `m
 依次是以下几节，全部英文：
 
 1. **Environment**：测试 image 和 digest、ATOM 和 aiter 的 branch 与 commit（带 commit 日期和标题）、测试日期。镜像信息取自构建它的那个周六目录里的 `image.json`（§2.4），缺的项从 CSV 里补。
-2. **Performance**：每个模型每个并发一行，列出 tok/s/GPU 和第二指标（endpoint 是 E2E avg interactivity，8K/1K 是 ITL P50），以及各自和上一场比的变化。变化列的表头写上一场的日期，例如 `vs 2026-11-07`；某个模型上一场跑挂了，就和它最近一次成功的那场比，并在格子里注明，例如 `+1.0% (vs 2026-10-31)`。
+2. **Performance**：每个模型每个并发一行，列出并行策略（例如 `tp8dcp8`，不写 GPU 数）、tok/s/GPU 和第二指标（endpoint 是 E2E avg interactivity，8K/1K 是 ITL P50），以及各自和上一场比的变化。变化列的表头写上一场的日期，例如 `vs 2026-11-07`；某个模型上一场跑挂了，就和它最近一次成功的那场比，并在格子里注明，例如 `+1.0% (vs 2026-10-31)`。
 3. **Accuracy**：flexible-extract、strict-match、上一场的分数（表头写日期）和变化，写法同上。
 4. **Trends**：两张趋势图，见 §5.4。
 5. **Failures**：每个跑挂的 case 一小节，写一句话报错、`error.log` 的链接，以及核心 error log 段落（`error.log` 的前 60 行，§3.4 摘出来的那份）。

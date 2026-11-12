@@ -48,6 +48,18 @@ EIGHT_K = {
     "minimax-m3": (4, {4: (9.0, 3100.0), 64: (24.0, 15800.0)}),
     "qwen-3.8-flash": (1, {4: (6.0, 4800.0), 64: (16.0, 26000.0)}),
 }
+# Parallelism as recorded from the recipe (Kimi-K3, GLM-5.2 and MiniMax-M3
+# as in 455-CI-recipe.md; the others made up).
+PARALLEL = {
+    "deepseek-r1": "tp4",
+    "deepseek-v4.1-flash": "dp4ep4",
+    "kimi-k3": "tp8dcp8",
+    "qwen-35b-a3b": "tp1",
+    "deepseek-v4-pro": "dp4ep4",
+    "glm-5.2": "tp4",
+    "minimax-m3": "tp4",
+    "qwen-3.8-flash": "tp1",
+}
 GSM8K = {
     "deepseek-r1": 0.952,
     "deepseek-v4.1-flash": 0.941,
@@ -113,6 +125,7 @@ def mock_rows():
                         **common,
                         "model": model,
                         "gpus": str(gpus),
+                        "parallel": PARALLEL[model],
                         "concurrency": str(conc),
                     }
                     if conc in failed:

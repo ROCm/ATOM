@@ -19,6 +19,7 @@ def perf_row(
     gpus="8",
     error="",
     image_date=None,
+    parallel="",
 ):
     return {
         "image_date": image_date or date,
@@ -26,6 +27,7 @@ def perf_row(
         "scenario": scenario,
         "model": model,
         "gpus": gpus,
+        "parallel": parallel,
         "concurrency": str(conc),
         "status": status,
         "tok_s_per_gpu": tput,
@@ -235,3 +237,14 @@ def test_accuracy_history_keeps_the_twelve_newest_sessions_and_the_last_rerun():
     hist = accuracy_history(rows, "endpoint", "kimi-k3", "2026-08-14")
     assert [h.date for h in hist] == days[2:]
     assert hist[-1].flexible == 0.93
+
+
+def test_a_cell_carries_its_session_parallelism_or_else_the_last_one_recorded():
+    rows = [
+        perf_row("2026-11-07", 4, parallel="tp8dcp8"),
+        perf_row("2026-11-07", 64, parallel="tp8dcp8"),
+        perf_row("2026-11-14", 4, parallel="tp8dcp8ep8"),
+        perf_row("2026-11-14", 64, status="fail", tput="", parallel=""),
+    ]
+    c4, c64 = perf_cells(rows, "endpoint", "kimi-k3", "2026-11-14")
+    assert (c4.parallel, c64.parallel) == ("tp8dcp8ep8", "tp8dcp8")

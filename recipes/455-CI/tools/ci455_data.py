@@ -20,6 +20,7 @@ PERF_COLUMNS = (
     "scenario",
     "model",
     "gpus",
+    "parallel",
     "concurrency",
     "status",
     "tok_s_per_gpu",
@@ -75,6 +76,7 @@ class PerfCell:
     prev_failed: bool  # the point failed in the newest earlier session that ran it
     error: str
     gpus: int | None
+    parallel: str = ""  # e.g. tp8dcp8, from the recipe's server command
 
     @property
     def delta(self):
@@ -170,6 +172,14 @@ def perf_cells(rows, scenario, model, date, concurrencies=CONCURRENCIES):
             status = "missing"
         else:
             status = "ok" if now["status"] == "ok" else "fail"
+        recorded = [
+            last[(d, conc)].get("parallel")
+            for d in earlier
+            if last[(d, conc)].get("parallel")
+        ]
+        parallel = ((now or {}).get("parallel") or "") or (
+            recorded[-1] if recorded else ""
+        )
         cells.append(
             PerfCell(
                 concurrency=conc,
@@ -188,6 +198,7 @@ def perf_cells(rows, scenario, model, date, concurrencies=CONCURRENCIES):
                     if now and now.get("gpus")
                     else (int(prev["gpus"]) if prev and prev.get("gpus") else None)
                 ),
+                parallel=parallel,
             )
         )
     return cells

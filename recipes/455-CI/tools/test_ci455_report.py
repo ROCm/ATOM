@@ -26,6 +26,7 @@ def pc(
         prev_failed=prev_failed,
         error=error,
         gpus=4,
+        parallel="tp4",
     )
 
 
@@ -294,3 +295,9 @@ def test_detail_environment_lists_the_image_the_commits_and_one_test_date():
     assert (
         "Base image" not in text and "base:tag" not in text and "Dependency" not in text
     )
+
+
+def test_detail_performance_rows_show_the_parallelism_not_the_gpu_count():
+    text = detail_md("2026-11-14", {}, [model("Alpha", **FLAT)], "r.md", "c", "r")
+    assert "| Parallelism |" in text and "| GPUs |" not in text
+    assert "| Alpha | tp4 | 4 |" in text and "| Alpha | tp4 | 64 |" in text

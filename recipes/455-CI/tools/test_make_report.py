@@ -34,6 +34,7 @@ def perf(
         "scenario": scenario,
         "model": model,
         "gpus": "8",
+        "parallel": "tp8dcp8",
         "concurrency": str(conc),
         "status": status,
         "tok_s_per_gpu": tput,
@@ -122,6 +123,7 @@ def test_a_saturday_report_has_highlights_a_dated_table_and_the_core_error_log(
     assert (
         "Traceback" in detail and "../runs/20261114/charts/perf-endpoint.png" in detail
     )
+    assert "| Kimi-K3 (2.8T) | tp8dcp8 | 4 |" in detail
     assert not re.search(CJK, summary + detail)
 
 

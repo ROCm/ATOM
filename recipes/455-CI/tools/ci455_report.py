@@ -340,7 +340,7 @@ def detail_md(date, env, results, summary_name, charts_dir, runs_dir, mock=False
             "",
             f"## Performance · {label}",
             "",
-            f"| Model | GPUs | Concurrency | tok/s/GPU | {vs} | {SECOND_HEADER[scenario]} | {vs} |",
+            f"| Model | Parallelism | Concurrency | tok/s/GPU | {vs} | {SECOND_HEADER[scenario]} | {vs} |",
             "|---|---|---|---|---|---|---|",
         ]
         for r in mine:
@@ -356,7 +356,7 @@ def detail_md(date, env, results, summary_name, charts_dir, runs_dir, mock=False
                     else ("first" if c.second is not None else "—")
                 )
                 out.append(
-                    f"| {r.name} | {c.gpus or '—'} | {c.concurrency} | {_perf_value(c)} | "
+                    f"| {r.name} | {c.parallel or '—'} | {c.concurrency} | {_perf_value(c)} | "
                     f"{_vs(c, _perf_delta(c, c.delta), ref, c.delta)} | {sv} | "
                     f"{_vs(c, sd, ref, c.delta_second)} |"
                 )
