@@ -2,7 +2,7 @@
 
 各模型在 455-CI 镜像（`rocm/fw-bringup-mlperf:gfx1250-atom-ci455-<YYYYMMDD>`，ATOM main + aiter main）上的 server、GSM8K 和 bench 命令。流程、指标口径和记录方式见 [`455-CI-guide.md`](455-CI-guide.md)；这里只写命令。
 
-目前收录 Kimi-K3 (2.8T)、GLM-5.2、MiniMax-M3 (428B) 三个模型，其余 5 个见 [`455-CI-guide.md`](455-CI-guide.md) §1。
+目前收录 Kimi-K3 (2.8T)、GLM-5.2、MiniMax-M3 (428B)、DeepSeek R1、DeepSeek-V4.1-Flash、DeepSeek-V4-Pro 六个模型，其余 2 个见 [`455-CI-guide.md`](455-CI-guide.md) §1。
 
 ## 通用约定
 
@@ -290,3 +290,270 @@ python3 -m atom.benchmarks.benchmark_serving \
 - GSM8K：chat、5-shot，strict 0.9469 / flexible 0.9568；
 - 8K/1K 每卡吞吐：c64 11,237 tok/s/GPU，c4 3,331 tok/s/GPU；
 - 随机数据下 EAGLE3 接受率：c64 68.8%，c4 62.8%。
+
+---
+
+## DeepSeek R1
+
+- 场景：MLPerf Endpoint；GPU：4（1 tray x 1P4G）
+- 并行：注意力 DP4（DP attention），MoE EP4；FP8 KV cache，block 64；不开 prefix cache 和 chunked prefill；`q_b_proj` 在线量化成 MXFP4
+- MODEL_PATH：`/models/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4/`（结尾的 `/` 是模型名的一部分，lm_eval 和 bench 要写成一样）；PORT：`8000`
+
+**当前 main 上跑不起来，预期记 N/A**：server 能起来，GSM8K 开始后 rank 0 在一次约 10K token 的 prefill 上退出：`RuntimeError: Triton Error [HIP]: Code: 200, Message: device kernel image is invalid`，位置是 o_proj 的 aiter Triton `gemm_a8w8`（`atom/model_ops/linear.py:615`）刚 JIT 出来的一个新 M 档位变体在加载时失败。同一 recipe 在 `gfx1250-atom-20261111` 原样镜像上能跑完；两边 o_proj 的代码、配置和同档位编出的二进制都相同，根因还没定位，只出现过一次。
+
+命令取自 `gfx1250-atom-2026111x` 镜像里的 `/app/scripts/dsr1/serve_dsr1fp4_a8w8_dp4ep4_realEPLB.sh`，参数原样。不用同目录的 `serve_dsr1fp4_a8w8_dp4ep4.sh`：它默认 `FAKE_EPLB=1`，加 `--fake-eplb --hf-overrides '{"num_hash_layers": 0}'`，假路由输出乱码，GSM8K 没法测。c4 和 c64 用同一个 server。
+
+### server
+
+```bash
+env ATOM_MLA_ABSORB_BF16_FUSE_QOUT=1 ATOM_MLA_KV_SHUFFLED=1 ATOM_MEGA_MASK_PAD_ROWS=1 MEGA_COMBINE_WIRE=bf16 \
+  AITER_DISABLE_KERNARG_PRELOAD=1 HSA_ENABLE_SDMA=1 HSA_USE_SVM=1 HSA_XNACK=1 ATOM_DP_LM_HEAD_MODE=allgather \
+  ATOM_USE_UNIFIED_ATTN=1 ATOM_USE_TRITON_MLA=0 ATOM_MLA_PAGE_SIZE=1 AITER_MLA_DECODE_PS1_FLYDSL=1 \
+  AITER_ROPE_TRITON_BACKEND=1 ATOM_ENABLE_DS_QKNORM_FUSION=0 ATOM_LOADER_NUM_THREADS=4 \
+  ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION=0 ATOM_ENABLE_DS_QKNORM_QUANT_FUSION=0 ATOM_USE_TRITON_GEMM=1 \
+  ATOM_USE_TRITON_MLA_SHUFFLE_KV=0 ENABLE_CK=0 AITER_USE_GROUPED_GEMM=1 AITER_FORCE_A8W4=0 \
+  AITER_USE_OPUS_MOE_SORTING=1 ATOM_MOE_GU_ITLV=1 ATOM_MORI_V2=1 ATOM_MORI_V2_FUSED=1 ATOM_MEGA_STAGE1_FUSED=0 \
+  MEGA_DISPATCH=mori MORI_GPU_ARCHS=gfx1250 FLYDSL_GPU_ARCH=gfx1250 AITER_FLYDSL_GATHER_REDUCE_WAVE_MIN_TOKENS=-1 \
+  ATOM_GC_THRESHOLD=20000,50,50 MEGA_DISPATCH_WIRE=fp4 \
+python3 -m atom.entrypoints.openai_server -tp 4 --model /models/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4/ \
+  --kv_cache_dtype fp8 --block-size 64 --no-enable_prefix_caching --no-enable-chunked-prefill \
+  --enable-expert-parallel --enable-dp-attention \
+  --online_quant_config '{"layer_quant_config":{"*.self_attn.q_b_proj":"mxfp4"}}' \
+  --max-num-seqs 2048 --gpu-memory-utilization 0.975 \
+  --cudagraph-capture-sizes '[1,2,4,8,16,32,48,64,128,256,512,1024,1536,2048]'
+```
+
+### gsm8k
+
+和指南 §3.3 不同的地方：
+- 加 `max_gen_toks=2048`，和镜像里的 `/app/scripts/dsr1/eval_dsr1fp4.sh` 一致；
+- 镜像 ENV 里有 `HF_HUB_OFFLINE=1`，lm_eval 拉不到 `openai/gsm8k`，要加 `HF_HUB_OFFLINE=0`。
+
+```bash
+HF_HUB_OFFLINE=0 lm_eval --model local-completions \
+  --model_args "model=/models/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4/,base_url=http://127.0.0.1:8000/v1/completions,num_concurrent=65,max_retries=3,max_gen_toks=2048,tokenized_requests=False,trust_remote_code=True" \
+  --tasks gsm8k --num_fewshot 3 --output_path "$ACC_DIR" > "$ACC_DIR/lm_eval.log" 2>&1
+```
+
+### bench
+
+client 用镜像里的 `/app/mlcommons-endpoints`（`mlcommons/endpoints` @ `d3c57f2`，自带 venv）。数据集是 MLPerf DeepSeek-R1 的 eval parquet（4388 条）。镜像里那份 `examples/07_DeepSeekR1_Example/data/deepseek_r1_eval.parquet` 只是 git-lfs 指针，要另外下载并校验：
+
+```bash
+EP=/app/mlcommons-endpoints
+DSR1=<数据目录>/deepseek_r1_eval.parquet
+curl -fsSL -o $DSR1 https://media.githubusercontent.com/media/mlcommons/endpoints/d3c57f2/examples/07_DeepSeekR1_Example/data/deepseek_r1_eval.parquet
+echo "36facfae18f42587b7e4863e16a0e96446470761017d207791e609537d0f6f02  $DSR1" | sha256sum -c -
+```
+
+固定并发，流式，发 10 分钟请求。命令取自镜像 `/app/endpoints-recipe/06_bench_concurrency.sh`，另加 10 分钟上限。warmup 发 `CONC` 条、输出上限 2048，不计入结果。
+
+```bash
+export LEGACY_MLPERF_DEEPSEEK_R1_DATASET=$DSR1
+rm -rf $EP/dataset_cache/legacy_mlperf_deepseek_r1    # 缓存不跟数据集路径走，每次清
+cd $EP
+run_r1() {  # run_r1 <样本数> <输出上限> <report_dir>
+  $EP/venv/bin/inference-endpoint benchmark online --endpoints http://127.0.0.1:8000 \
+    --model /models/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4/ --tokenizer /models/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4/ \
+    --api-type openai_completions --dataset legacy_mlperf_deepseek_r1 --mode perf \
+    --load-pattern concurrency --concurrency $CONC --num-samples $1 --streaming on \
+    --max-output-tokens $2 --runtime.max-issue-duration-ms 600000 --timeout 14400 --report-dir $3
+}
+run_r1 $CONC 2048 $RESULT_DIR/warmup > $RESULT_DIR/warmup.log 2>&1
+run_r1 4388 20000 $RESULT_DIR/report > $RESULT_DIR/bench.log 2>&1
+```
+
+结果在 `$RESULT_DIR/report/performance/result_summary.json`。R1 的回答很长，c4 十分钟只能完成二十来条，发请求停止后还要等在途请求跑完，c64 一个点约 15 分钟。
+
+### 参考值
+
+2026-11-12，`gfx1250-atom-20261111` 原样镜像（ATOM / aiter 在私有分支 `jiaolyu/duty1111-main-rebase`），上面的命令：
+- GSM8K：3-shot，flexible / strict 都是 0.9522；
+- c4：66.90 tok/s/GPU（`tps` 267.59 ÷ 4），E2E avg interactivity 71.20 tok/s/user，20 条；
+- c64：679.99 tok/s/GPU（2719.95 ÷ 4），E2E avg interactivity 53.76 tok/s/user，353 条。
+
+---
+
+## DeepSeek-V4.1-Flash
+
+- 场景：MLPerf Endpoint；GPU：4（1 tray x 1P4G）
+- MODEL_PATH：`/models/DeepSeek-V4.1-Flash`（`deepseek-ai/DeepSeek-V4.1-Flash` @ `dba1be0a40aa45a94ad051997016db3960a90277`）；PORT：`8000`
+- c4 和 c64 用两个不同的 server，和镜像里 `/app/endpoints-recipe-dsv41/run_ep.py` 的分法一致：c4 用 TP4（它 c8 的配置），c64 用 DEP4（EP4 + DP attention，`--max-num-seqs 64`）。GSM8K 在两个 server 上各测一次，accuracy.csv 记两行，`note` 写 TP4 / DEP4。
+- 宿主机要设 `echo Y > /sys/module/amdgpu/parameters/no_system_mem_limit`（DEP4 的 `ATOM_ENGRAM_UVA=1` 依赖它，机器重启后复位）。
+
+**当前 main 上 c64 跑不起来，预期记 N/A**：DEP4 用 FP4 KV cache，main 的 argparse 直接退出：`invalid choice: 'fp4' (choose from 'bf16', 'fp8')`。FP4 KV 在 [ROCm/ATOM#2989](https://github.com/ROCm/ATOM/pull/2989)，gfx1250 上的 A8W4 attention 还要 [ROCm/aiter#7407](https://github.com/ROCm/aiter/pull/7407)，两个都没合。另外 DEP4 用的下面这些环境变量在 main 上没有代码读，等于没开：`ATOM_DSPARK_PROB_DRAFT`、`ATOM_DSPARK_BLOCK_VERIFY`（ROCm/ATOM#2724）、`ATOM_DSPARK_PROB_FUSED_CHAIN`（#2877）、`ATOM_DP_LOGITS_PEER_EXCHANGE`（#2882）、`AITER_MOE_LOC`（ROCm/aiter#7332 + ROCm/ATOM#3144），以及 `AITER_S1F_*`、`AITER_TDM_COMPACT_ROUTE_*`、`ATOM_PREFILL_ADMIT*`、`ATOM_ENGRAM_MLOCK`、`ATOM_HYI_*`、`ATOM_STEP_TIMER`（只在镜像的私有分支里）。c4（TP4）在 main 上能跑。
+
+### server，c4（TP4）
+
+命令取自镜像 `/app/endpoints-recipe-dsv41/serve_tp4.sh`，`TP4_CFG=c8`：
+
+```bash
+cd /app/ATOM
+export HIP_VISIBLE_DEVICES=0,1,2,3
+export ATOM_DSPARK_PROB_DRAFT=1 ATOM_DSPARK_BLOCK_VERIFY=1
+export AITER_CUSTOM_AR_MIN_SIZE=131072 AITER_CUSTOM_AR_MAX_SIZE=8388608 ATOM_GC_THRESHOLD=20000,50,50 HSA_XNACK=1
+export HSA_ENABLE_SCRATCH_ASYNC_RECLAIM=1
+export ATOM_MONO_ENABLE=1
+python3 -u -m atom.entrypoints.openai_server --model /models/DeepSeek-V4.1-Flash --trust-remote-code \
+  --host 0.0.0.0 --server-port 8000 -tp 4 \
+  --kv_cache_dtype bf16 --index-cache-dtype fp8 \
+  --max-num-seqs 64 --max-num-batched-tokens 16384 --attn-prefill-chunk-size 16384 --block-size 16 \
+  --level 0 --method dspark --num-speculative-tokens 5 \
+  --cudagraph-capture-sizes "[1,2,3,4,5,6,7,8,12,16,24,32,40,48,56,64]" \
+  --disable-uvicorn-access-log
+```
+
+### server，c64（DEP4）
+
+命令取自镜像 `/app/endpoints-recipe-dsv41/serve_dep4.sh`，`MAXSEQ=64`。三个 `AITER_CONFIG_*` 是调参表，只影响性能，指向 aiter 里的 CSV 和镜像 recipe 目录 `$R/configs` 下的 4 个 CSV；换成 aiter main 后某个文件不存在或 shape 重复时，把那一项删掉。2026-11-12 的 aiter main（`65714259c`）上这些文件都在。
+
+```bash
+cd /app/ATOM
+R=/app/endpoints-recipe-dsv41
+export HIP_VISIBLE_DEVICES=0,1,2,3 OMP_NUM_THREADS=4 ATOM_DISABLE_MMAP=true AITER_LOG_LEVEL=WARNING
+export AITER_REUSE_IDENTICAL_COMM_GROUPS=1 HF_HUB_OFFLINE=1 PYTHONFAULTHANDLER=1 HSA_DISABLE_COREDUMP_ON_EXCEPTION=1
+export MORI_AMD_SMI_PATH=/opt/rocm/lib/libamd_smi.so.27 MORI_GPU_ARCHS=gfx1250 FLYDSL_GPU_ARCH=gfx1250
+export HIP_FORCE_DEV_KERNARG=1 HSA_ENABLE_SCRATCH_ASYNC_RECLAIM=0 HSA_ENABLE_SDMA=1 HSA_USE_SVM=1 HSA_XNACK=1
+export ATOM_GC_THRESHOLD=20000,50,50 AITER_CUSTOM_AR_MIN_SIZE=131072 AITER_CUSTOM_AR_MAX_SIZE=8388608
+export MORI_SHMEM_HEAP_SIZE=17179869184
+export ATOM_DSPARK_PROB_DRAFT=1 ATOM_DSPARK_BLOCK_VERIFY=1
+export ATOM_DP_SESSION_AFFINITY=1
+export ATOM_ENGRAM_UVA=1 ATOM_ENGRAM_UVA_COPY=0
+export ATOM_PREFILL_DECODE_INTERVAL=24
+export ATOM_MORI_V2=1 MEGA_DISPATCH_WIRE=fp4
+export ATOM_DP_LM_HEAD_MODE=allgather
+export ATOM_STEP_TIMER=1 ATOM_STEP_TIMER_EVERY=500
+export MAX_JOBS=16
+export ATOM_DSV41_ROPE_HEAD_BLOCK=1
+export ATOM_DECODER_GRAPH_SIZES=1,2,3,4,8,16
+export ATOM_TOKEN_GRAPH_SIZES=256,512,1024,2048,3072,4096,5120,6144
+export AITER_CONFIG_GEMM_BF16="/app/aiter/aiter/configs/bf16_tuned_gemm.csv:/app/aiter/aiter/configs/model_configs/dsr1_bf16_tuned_gemm.csv:/app/aiter/aiter/configs/model_configs/dsv3_bf16_tuned_gemm.csv:/app/aiter/aiter/configs/model_configs/dsv41_bf16_tuned_gemm.csv:/app/aiter/aiter/configs/model_configs/dsv4_bf16_tuned_gemm.csv:/app/aiter/aiter/configs/model_configs/flux2_bf16_tuned_gemm.csv:/app/aiter/aiter/configs/model_configs/glm47_bf16_tuned_gemm.csv:/app/aiter/aiter/configs/model_configs/glm53_bf16_tuned_gemm.csv:/app/aiter/aiter/configs/model_configs/glm53_flash_bf16_tuned_gemm.csv:/app/aiter/aiter/configs/model_configs/glm5_bf16_tuned_gemm.csv:/app/aiter/aiter/configs/model_configs/gptoss_bf16_tuned_gemm.csv:/app/aiter/aiter/configs/model_configs/inkling_bf16_tuned_gemm.csv:/app/aiter/aiter/configs/model_configs/kimi_bf16_tuned_gemm.csv:/app/aiter/aiter/configs/model_configs/kimik2_bf16_tuned_gemm.csv:/app/aiter/aiter/configs/model_configs/kimik3_bf16_tuned_gemm.csv:/app/aiter/aiter/configs/model_configs/llama405B_bf16_tuned_gemm.csv:/app/aiter/aiter/configs/model_configs/llama70B_bf16_tuned_gemm.csv:/app/aiter/aiter/configs/model_configs/minimax_m3_eagle_bf16_tuned_gemm.csv:/app/aiter/aiter/configs/model_configs/minimax_m3_mxfp4_bf16_tuned_gemm.csv:/app/aiter/aiter/configs/model_configs/muse_glimmer_bf16_tuned_gemm.csv:/app/aiter/aiter/configs/model_configs/q3vl_bf16_tuned_gemm.csv:/app/aiter/aiter/configs/model_configs/qwen32B_bf16_tuned_gemm.csv:/app/aiter/aiter/configs/model_configs/qwen38_flash_next_bf16_tuned_gemm.csv:/app/aiter/aiter/configs/model_configs/qwen3_5_397b_bf16_tuned_gemm.csv:/app/aiter/aiter/configs/model_configs/qwen3_8_27b_bf16_tuned_gemm.csv:/app/aiter/aiter/configs/model_configs/qwen3_8_2p4t_a95b_bf16_tuned_gemm.csv:/app/aiter/aiter/configs/model_configs/qwen3_8b_bf16_tuned_gemm.csv:/app/aiter/aiter/configs/model_configs/wan22_bf16_tuned_gemm.csv:$R/configs/dsv41_bf16_all_tuned.csv"
+export AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE="/app/aiter/aiter/configs/a8w8_blockscale_mxscale_bpreshuffle_tuned_gemm.csv:$R/configs/dsv41_a8w8_blockscale_mxscale_bpreshuffle_tuned_gemm.minus_recipe9.csv:/app/aiter/aiter/configs/model_configs/dsv4_a8w8_blockscale_mxscale_bpreshuffle_tuned_gemm.csv:/app/aiter/aiter/configs/model_configs/minimax_m3_a8w8_blockscale_mxscale_bpreshuffle_tuned_gemm.csv:/app/aiter/aiter/configs/model_configs/kimik3_a8w8_blockscale_mxscale_bpreshuffle_tuned_gemm.csv:$R/configs/dsv41_dep4_dense_mx32_tuned.csv"
+export AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE="/app/aiter/aiter/configs/batched_gemm_a8w8_blockscale_mxscale_bpreshuffle_tuned.csv:/app/aiter/aiter/configs/model_configs/dsv4_batched_gemm_a8w8_blockscale_mxscale_bpreshuffle_tuned.csv:$R/configs/dsv41_dep4_bmm_mx32_tuned.csv"
+export AITER_MEGA_S1F=1 AITER_S1F_BLOCK_RUNS=4,2,8,8 AITER_S1F_MAX_RECV=4096 AITER_S1F_ANY_TILE=1
+export AITER_TDM_COMPACT_ROUTE_UPTO=1024 AITER_TDM_COMPACT_ROUTE_SPEC=384,16
+export ATOM_PREFILL_ADMIT=adaptive ATOM_PREFILL_ADMIT_VERSION=2
+export ATOM_ENGRAM_MLOCK=1 ATOM_HYI_TPL_EXECUTOR=1 ATOM_HYI_DROP_FINISHED_SEQS=1 ATOM_HYI_ENC_MEMO=1
+export ATOM_DSPARK_PROB_FUSED_CHAIN=1
+export ATOM_DP_LOGITS_PEER_EXCHANGE=1
+export AITER_MOE_LOC=1
+python3 -u -m atom.entrypoints.openai_server --model /models/DeepSeek-V4.1-Flash --trust-remote-code \
+  --host 0.0.0.0 --server-port 8000 -tp 4 \
+  --kv_cache_dtype fp4 --index-cache-dtype fp4 --gpu-memory-utilization 0.9 \
+  --max-num-batched-tokens 16384 --attn-prefill-chunk-size 16384 --block-size 16 \
+  --level 0 --max-num-seqs 64 --cudagraph-capture-sizes "[1,2,3,4,5,6,7,8,12,16,24,32,40,48,56,64]" \
+  --enable-expert-parallel --enable-dp-attention --all2all-backend high-throughput \
+  --method dspark --num-speculative-tokens 5 \
+  --disable-uvicorn-access-log --api-server-count 4
+```
+
+### gsm8k
+
+按指南 §3.3，`MODEL_PATH=/models/DeepSeek-V4.1-Flash`，`PORT=8000`；前面加 `HF_HUB_OFFLINE=0`（镜像 ENV 里是 1）。
+
+### bench
+
+client 用镜像里的 `/app/mlcommons-endpoints`（`mlcommons/endpoints` @ `d3c57f2`，自带 venv），agentic 数据集和 Kimi-K3 一节相同（sha256 `1beb24c8…`）。client 配置照镜像 `run_ep.py` / `mkcfg.py` 生成：以 `examples/10_Agentic_Inference/dsv4_agentic_benchmark.yaml` 为底，只保留 performance 数据集，613 条轨迹，第一个 user 跑完就停，发 10 分钟请求。
+
+```bash
+EP=/app/mlcommons-endpoints
+DATASET=<数据目录>/mlperf_agentic_inference_dataset.jsonl
+$EP/venv/bin/python - $EP/examples/10_Agentic_Inference/dsv4_agentic_benchmark.yaml $DATASET /models/DeepSeek-V4.1-Flash $CONC $RESULT_DIR/report > $RESULT_DIR/client.yaml << 'PY'
+import sys, yaml
+base, dataset, model, c, report = sys.argv[1:]
+cfg = yaml.safe_load(open(base))
+cfg["model_params"].update(name=model, tokenizer_name=model)
+perf = next(d for d in cfg["datasets"] if d.get("type") == "performance")
+perf["path"] = dataset
+perf["accuracy_config"] = {"eval_method": "agentic_inference_inline", "num_repeats": 1}
+perf["agentic_inference"].update(num_trajectories_to_issue=613, enable_salt=True, inject_tool_delay=True,
+                                 stop_issuing_on_first_user_complete=True)
+cfg["datasets"] = [perf]
+cfg["settings"]["load_pattern"]["target_concurrency"] = int(c)
+cfg["settings"].setdefault("runtime", {})["max_issue_duration_ms"] = 600000
+cfg["settings"].setdefault("timeouts", {})["run_timeout_s"] = 14400
+cfg["endpoint_config"]["endpoints"] = ["http://127.0.0.1:8000"]
+cfg["report_dir"] = report
+print(yaml.safe_dump(cfg, sort_keys=False))
+PY
+# warmup（run_ep.py 的做法）：发一条带工具调用的 chat 请求，再清 prefix cache
+curl -sf -m 900 http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{"model": "/models/DeepSeek-V4.1-Flash", "max_tokens": 2048, "temperature": 1.0, "top_p": 0.95, "top_k": 0, "chat_template_kwargs": {"thinking": true, "reasoning_effort": "max"}, "tools": [{"type": "function", "function": {"name": "get_order", "description": "Look up an order", "parameters": {"type": "object", "properties": {"order_id": {"type": "string"}}, "required": ["order_id"]}}}], "messages": [{"role": "user", "content": "Where is my order 43E33A3CAA? Use the tool."}]}' > $RESULT_DIR/smoke.json
+for i in $(seq 12); do      # 刚结束的 smoke 请求还在清理时返回 409，和 run_ep.py 一样每 5 秒重试
+  code=$(curl -s -o $RESULT_DIR/prefix_cache_reset.json -w '%{http_code}' -X POST http://127.0.0.1:8000/reset_prefix_cache -H 'Content-Type: application/json' -d '{}')
+  [ "$code" = 409 ] || break; sleep 5
+done
+cd $EP && HF_HUB_OFFLINE=1 $EP/venv/bin/inference-endpoint benchmark from-config --config $RESULT_DIR/client.yaml --mode perf > $RESULT_DIR/bench.log 2>&1
+```
+
+结果在 `$RESULT_DIR/report/performance/result_summary.json`，inline 精度在 `$RESULT_DIR/report/scores.json`。
+
+- main 上没有 `/reset_prefix_cache`（返回 404，在 [ROCm/ATOM#2763](https://github.com/ROCm/ATOM/pull/2763)），这一步等于跳过。
+
+### 参考值
+
+2026-11-12，同一台机器：
+
+| | GSM8K flexible / strict | tok/s/GPU | E2E avg interactivity | inline 精度 |
+|---|---|---|---|---|
+| c4 TP4，main（ATOM `f7b8962fd`、aiter `65714259c`） | 0.9196 / 0.9196 | 274.51（1098.06 ÷ 4） | 502.76 | 0.5061 |
+| c4 TP4，`gfx1250-atom-20261111` 原样 | 0.9219 / 0.9212 | 283.92（1135.67 ÷ 4） | 531.07 | 0.5106 |
+| c64 DEP4，`gfx1250-atom-20261111` 原样 | 0.9196 / 0.9196 | 3,098.08（12,392.34 ÷ 4） | 317.68 | 0.5477 |
+
+每个点只跑了一次。inline 精度是 client 自带的 agentic 打分，`run_ep.py` 的门槛是 0.5236；c4 十分钟只评到约 700 个 turn。
+
+---
+
+## DeepSeek-V4-Pro
+
+- 场景：8K/1K；GPU：4（1 tray x 1P4G）
+- 并行：注意力 DP4（DP attention），MoE EP4（MegaMoE）；FP8 KV cache，FP4 index cache；不开 prefix cache
+- MODEL_PATH：`/models/DeepSeek-V4-Pro`；PORT：`8000`。2026-11-12 测的是 `DeepSeek-V4-Pro-0813` 这份 checkpoint（config 比另一份 `DeepSeek-V4-Pro` 多 `dspark_*` 字段，attention 权重的类型和 shape 相同）
+
+**当前 main 上跑不起来，预期记 N/A；`gfx1250-atom-20261111` 原样镜像同样跑不起来**：加载权重后录 CUDA graph 时，4 个 rank 都在 `layers.1.attn` 的 `wqkv_a` 上报 `IndexError: tuple index out of range`，位置是 aiter 的 FlyDSL gfx1250 mxfp8 GEMM（`aiter/ops/flydsl/mxfp8_bpreshuffle_gemm_gfx1250.py:411` → `kernels/tensor_shim.py:336`）。[ROCm/aiter#7178](https://github.com/ROCm/aiter/pull/7178)（已合入 main）给 `launch_gemm_a8w8` 加了带默认值的参数 `arg_scale_out`，dense mxfp8 的调用方没跟着改，少传参数，同一个 kernel 第二次走缓存时越界。镜像里带的是这个 PR 的预合入版，所以也崩。脚本默认的 `FAKE_EPLB=1` 和 `FAKE_EPLB=0` 结果一样。
+
+命令取自镜像 `/app/scripts/dsv4/serve_dsv4_ep4.sh`（默认 `FUSED=1 STAGE1=1 TRITON_MOE=0`），去掉 `FAKE_EPLB=1` 加的 `--fake-eplb --hf-overrides '{"num_hash_layers": 0}'`：假路由输出乱码，GSM8K 没法测。c4 和 c64 用同一个 server。
+
+### server
+
+```bash
+env ATOM_MEGA_COMBINE_WIRE=fp4 PYTHONPATH=/app/aiter HSA_ENABLE_SDMA=1 HSA_USE_SVM=1 HSA_XNACK=1 \
+  AITER_DISABLE_KERNARG_PRELOAD=0 ATOM_USE_TRITON_MOE=0 ATOM_USE_TRITON_MOE_DECODE=0 ATOM_USE_TRITON_MOE_A4W4=0 \
+  ATOM_USE_UNIFIED_ATTN=1 ATOM_FORCE_ATTN_TRITON=0 ATOM_USE_V4_PREFILL_ASM_FOR_DECODE=1 ATOM_LOADER_USE_THREADPOOL=1 \
+  AITER_ROPE_TRITON_BACKEND=1 ATOM_ENABLE_DS_QKNORM_FUSION=0 ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION=0 \
+  ATOM_ENABLE_DS_QKNORM_QUANT_FUSION=0 ATOM_USE_TRITON_GEMM=1 ATOM_LOADER_NUM_THREADS=4 ENABLE_CK=0 \
+  AITER_USE_OPUS_MOE_SORTING=1 AITER_FORCE_A8W4=0 AITER_USE_GROUPED_GEMM=1 ATOM_USE_AITER_TRITON_ATTN=1 \
+  AITER_TRITON_USE_HERD=1 ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE=1 ATOM_DSV4_USE_GFX1250_MXFP8_ASM_GEMM=1 \
+  AITER_CUSTOM_AR_MIN_SIZE=131072 ATOM_MOE_GU_ITLV=1 ATOM_MORI_V2=1 MEGA_DISPATCH=mori ATOM_WO_A_USE_FLYDSL=1 \
+  MORI_GPU_ARCHS=gfx1250 FLYDSL_GPU_ARCH=gfx1250 ATOM_MEGA_STAGE2_FUSED=1 ATOM_MEGA_STAGE1_FUSED=1 \
+  AITER_FLYDSL_GATHER_REDUCE_WAVE_MIN_TOKENS=-1 ATOM_GC_THRESHOLD=20000,50,50 AITER_CUSTOM_AR_MAX_SIZE=8388608 \
+  ATOM_DP_LM_HEAD_MODE=allgather MEGA_DISPATCH_WIRE=fp4 \
+python3 -m atom.entrypoints.openai_server -tp 4 --model /models/DeepSeek-V4-Pro \
+  --kv_cache_dtype fp8 --index-cache-dtype fp4 --no-enable_prefix_caching \
+  --enable-expert-parallel --enable-dp-attention --disable_uvicorn_access_log
+```
+
+### gsm8k
+
+和指南 §3.3 不同的地方：加 `max_gen_toks=2048`（镜像里的 `/app/scripts/dsv4/eval_dsv4.sh`），前面加 `HF_HUB_OFFLINE=0`。
+
+```bash
+HF_HUB_OFFLINE=0 lm_eval --model local-completions \
+  --model_args "model=/models/DeepSeek-V4-Pro,base_url=http://127.0.0.1:8000/v1/completions,num_concurrent=65,max_retries=3,max_gen_toks=2048,tokenized_requests=False,trust_remote_code=True" \
+  --tasks gsm8k --num_fewshot 3 --output_path "$ACC_DIR" > "$ACC_DIR/lm_eval.log" 2>&1
+```
+
+### bench
+
+```bash
+python3 -m atom.benchmarks.benchmark_serving \
+  --model=/models/DeepSeek-V4-Pro --backend=vllm --base-url=http://127.0.0.1:8000 \
+  --dataset-name=random --random-input-len=8192 --random-output-len=1024 --random-range-ratio=0.8 \
+  --max-concurrency=$CONC --num-prompts=$((CONC * 10)) --num-warmups=$((CONC * 2)) \
+  --request-rate=inf --ignore-eos --trust-remote-code \
+  --save-result --result-dir=$RESULT_DIR --result-filename=raw.json \
+  --percentile-metrics="ttft,tpot,itl,e2el"
+```
+
+### 参考值
+
+还没有：2026-11-12 在 main 和 `gfx1250-atom-20261111` 上都没起来（见上）。
