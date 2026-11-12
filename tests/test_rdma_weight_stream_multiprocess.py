@@ -147,6 +147,7 @@ def _rank_main(rank, world_size, ports, backend, scenarios, results):
 
     with stubbed_aiter():
         import atom.rollout.rdma_weight_receiver as receiver
+    from atom.distributed.group_agreement import group_min
     from atom.utils.distributed.utils import (
         stateless_init_torch_distributed_process_group,
     )
@@ -205,7 +206,7 @@ def _rank_main(rank, world_size, ports, backend, scenarios, results):
                     device=device,
                     version=version,
                     require_full=True,
-                    agree=lambda ballot: receiver.vote(votes, ballot)[0],
+                    agree=lambda ballot: group_min(ballot, votes),
                     leave=lambda: None,
                 )
                 state, detail = "written", runner.weights()

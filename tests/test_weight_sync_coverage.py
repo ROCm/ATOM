@@ -35,9 +35,15 @@ class _Runner(WeightUpdaterMixin):
     world_size = 1
 
     def __init__(self, model, config=None):
+        from atom.utils.selector import attn_family
+
         self._init_weight_updater()
         self.model = model
         self.config = config
+        # As ModelRunner declares it, from the config.
+        self.attn_family = attn_family(
+            getattr(config, "hf_text_config", None) or SimpleNamespace()
+        )
         self.kv_cleared = 0
 
     def clear_kv_cache(self):
@@ -225,6 +231,40 @@ def test_a_partial_sync_cannot_make_the_weights_whole_again(path):
     with pytest.raises(RuntimeError, match=r"not whole.*'attn\.qkv_proj\.weight'"):
         _sync(runner, path, [_dense_checkpoint(names=["o_proj"])], require_full=True)
     assert runner._sync is None
+
+
+@pytest.mark.parametrize("path", PATHS)
+def test_a_parameter_no_checkpoint_holds_is_not_owed_by_a_full_sync(path):
+    """ATOM derives it at init, so no trainer sends it, and after one failed
+    sync every recovery reported it left as it was: the engine stayed fenced."""
+    model = _dense_model()
+    model.attn.derived = _param(2)
+    runner = _Runner(model)
+    runner._checkpoint_param_names = frozenset(
+        {"attn.qkv_proj.weight", "attn.o_proj.weight"}
+    )
+
+    _sync(runner, path, [_dense_checkpoint()], require_full=True)
+
+    assert runner._sync is None
+    with pytest.raises(RuntimeError, match=r"not whole.*'attn\.qkv_proj\.weight'"):
+        _sync(runner, path, [_dense_checkpoint(names=["o_proj"])], require_full=True)
+
+
+def test_a_tied_parameter_is_owed_under_the_name_it_was_loaded_by():
+    model = _dense_model()
+    model.head = nn.Module()
+    model.head.weight = model.attn.o_proj.weight
+    runner = _Runner(model)
+    runner._checkpoint_param_names = frozenset({"attn.qkv_proj.weight", "head.weight"})
+
+    with pytest.raises(RuntimeError, match=r"not whole.*'attn\.o_proj\.weight'"):
+        _sync(
+            runner,
+            "direct",
+            [_dense_checkpoint(names=["q_proj", "k_proj", "v_proj"])],
+            require_full=True,
+        )
 
 
 @pytest.mark.parametrize("path", PATHS)
@@ -486,6 +526,10 @@ def test_the_writes_land_before_the_sync_completes(monkeypatch):
 # ── a model whose weights a reload cannot rewrite is refused up front ──────
 
 
+# A latent rank is what makes a config MLA.
+_MLA_CONFIG = SimpleNamespace(hf_text_config=SimpleNamespace(kv_lora_rank=512))
+
+
 def _mla_model():
     attn = nn.Module()
     attn.kv_b_proj = nn.Linear(HIDDEN, HIDDEN, bias=False)
@@ -504,14 +548,32 @@ def _int8_model():
     return model
 
 
+def _expert_parallel_moe():
+    """Refused at its first expert tensor, after the dense ones ahead of it
+    were written."""
+    model = _dense_model()
+    model.experts = nn.Module()
+    model.experts.expert_map = torch.tensor([0, -1], dtype=torch.int32)
+    return model
+
+
+def _redundant_expert_moe():
+    model = _dense_model()
+    model.experts = nn.Module()
+    model.experts.num_redundant_experts = 2
+    return model
+
+
 _unreloadable = pytest.mark.parametrize(
     ("model", "config", "reason"),
     [
-        (_mla_model, None, "MLA"),
+        (_mla_model, _MLA_CONFIG, "MLA"),
         (_dense_model, SimpleNamespace(prefill_context_parallel_size=2), "prefill"),
         (_int8_model, None, "format a full-precision write cannot produce"),
+        (_expert_parallel_moe, None, "expert-parallel"),
+        (_redundant_expert_moe, None, "redundant expert"),
     ],
-    ids=["mla", "pcp", "int8"],
+    ids=["mla", "pcp", "int8", "ep", "redundant-experts"],
 )
 
 
@@ -539,6 +601,12 @@ def test_a_model_a_reload_cannot_rewrite_reports_why(model, config, reason):
     report = _ReportingRunner(model(), config).get_worker_capabilities()
     assert "weight_reload" not in report["features"]
     assert reason in report["unavailable"]["weight_reload"]
+
+
+def test_mla_is_what_the_config_declares_not_what_a_module_looks_like():
+    """Inferred from module attributes, an MLA layer whose projection is
+    named otherwise passed for MHA."""
+    assert "MLA" in _Runner(_dense_model(), _MLA_CONFIG)._reload_refusal()
 
 
 def test_a_model_a_reload_can_rewrite_reports_it():
@@ -608,13 +676,22 @@ class _Engine:
 
 
 def _engine_with(runner, runners=None):
+    """An engine over *runner*, which at startup asks a runner that can say
+    what weight syncs it takes, as EngineCore does."""
     import queue
 
-    from atom.model_engine.engine_utility import EngineUtilityHandler
+    from atom.model_engine.engine_utility import (
+        EngineUtilityHandler,
+        ask_what_runners_take,
+    )
 
     out = queue.Queue()
     runners = runners or _InProcessRunners(runner)
-    handler, engine = EngineUtilityHandler(runners, out), _Engine()
+    unavailable = None
+    if callable(getattr(runner, "get_worker_capabilities", None)):
+        unavailable = ask_what_runners_take(runners, "test")
+    handler = EngineUtilityHandler(runners, out, unavailable=unavailable)
+    engine = _Engine()
 
     def send(cmd, **args):
         engine._has_pending_utility = True
@@ -647,18 +724,49 @@ def test_the_engine_refuses_a_model_a_reload_cannot_rewrite_without_a_fence(
     assert runner._sync is None
 
 
-@pytest.mark.parametrize("query", ["timeout", "error"])
+@pytest.mark.parametrize("how", ["timeout", "error"])
+def test_runners_that_cannot_say_what_they_take_stop_the_engine_starting(how):
+    """Asked on the way into every sync instead, a slow or failing answer cost
+    each sync up to 30 s at its start, and then went unheeded without a word."""
+    from atom.model_engine.engine_utility import ask_what_runners_take
+
+    runner = _ReportingRunner(_dense_model())
+    with pytest.raises((RuntimeError, TimeoutError), match="rank 1"):
+        ask_what_runners_take(_UnansweredQuery(runner, how), "test")
+
+
+def test_a_sync_asks_the_runners_nothing():
+    """What they take was settled at startup."""
+    asked = []
+
+    class _Recording(_InProcessRunners):
+        def utility_rpc(self, method, payload, timeout=300.0):
+            asked.append(method)
+            return super().utility_rpc(method, payload, timeout)
+
+    runner = _ReportingRunner(_dense_model())
+    _, send = _engine_with(runner, _Recording(runner))
+    asked.clear()
+
+    reply = send(
+        "update_weights",
+        sync_id="s1",
+        request_id="a",
+        named_tensors=list(_dense_checkpoint().items()),
+    )
+
+    assert "error" not in reply and "get_worker_capabilities" not in asked
+
+
 @_unreloadable
-def test_a_refusal_the_engine_could_not_foresee_fences_nothing(
-    query, model, config, reason
-):
-    """The engine could not ask, so it put its fence up and sent the update,
-    which the runner refused before writing. DISCARD then found the fence up
-    and kept it, and every later sync was refused the same way."""
+def test_a_refusal_the_engine_was_not_told_of_fences_nothing(model, config, reason):
+    """Not asked, the engine put its fence up and sent the update, which the
+    runner refused before writing. DISCARD then found the fence up and kept
+    it, and every later sync was refused the same way."""
     from atom.model_engine.collective_rpc import DISCARD_WEIGHT_SYNC_CMD
 
     runner = _Runner(model(), config)
-    engine, send = _engine_with(runner, _UnansweredQuery(runner, query))
+    engine, send = _engine_with(runner)
     weights = [("anything.weight", torch.ones(2))]
 
     for request_id in ("a", "b"):
@@ -673,10 +781,10 @@ def test_a_refusal_the_engine_could_not_foresee_fences_nothing(
     assert runner._sync is None
 
 
-def test_an_unforeseen_refusal_leaves_a_fence_that_was_up():
+def test_a_refusal_the_engine_was_not_told_of_leaves_a_fence_that_was_up():
     """The engine was fenced for an earlier failed sync, and stays so."""
-    runner = _Runner(_mla_model())
-    engine, send = _engine_with(runner, _UnansweredQuery(runner, "timeout"))
+    runner = _Runner(_mla_model(), _MLA_CONFIG)
+    engine, send = _engine_with(runner)
     engine._weight_sync_fenced = engine._rl_weights_inconsistent = True
 
     reply = send(
@@ -694,7 +802,7 @@ def test_a_sync_after_one_refused_before_writing_finds_the_weights_whole(monkeyp
     """Only a sync abandoned between buckets, having written, leaves them not
     whole; one refused before writing is over, not abandoned."""
     runner = _Runner(_dense_model())
-    engine, send = _engine_with(runner, _UnansweredQuery(runner, "timeout"))
+    engine, send = _engine_with(runner)
     monkeypatch.setattr(runner, "_reload_refusal", lambda: "stand-in refusal")
     reply = send(
         "update_weights",

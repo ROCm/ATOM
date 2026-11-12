@@ -671,7 +671,7 @@ def test_a_weight_stream_waits_for_its_runners_not_its_callers_deadline():
     )
     ((method, _, timeout),) = mgr.calls
     assert method == "receive_weights_rdma"
-    assert timeout == engine_utility._WEIGHT_STREAM_TIMEOUT_S
+    assert timeout == engine_utility.WEIGHT_STREAM_TIMEOUT_S
 
 
 class _RefusingEngine(_Engine):
@@ -693,6 +693,34 @@ def test_a_refused_weight_stream_is_still_drained_and_changes_nothing():
     assert (method, payload.args) == ("receive_weights_rdma", ("g", 7))
     assert payload.kwargs == {"refusal": "1 batch(es) still in the pipeline"}
     assert not engine._weight_sync_fenced and not engine._rl_weights_inconsistent
+
+
+class _UnclearableMgr(_RunnerMgr):
+    """A runner manager whose ranks cannot clear what a sync left."""
+
+    def utility_rpc(self, method, payload, timeout=300.0):
+        if method != "discard_failed_weight_sync":
+            return super().utility_rpc(method, payload, timeout)
+        self.calls.append((method, payload, timeout))
+        return [RpcResult(payload.request_id, 0, error="rank 0 is stuck")]
+
+
+def test_a_weight_stream_its_sync_cannot_take_is_still_drained():
+    """A stream whose sync began by failing to clear an abandoned one was
+    answered at once, leaving its trainer in the first broadcast until the
+    group timed out."""
+    mgr, out = _UnclearableMgr(replies=_TWO_RANKS_OK), queue.Queue()
+    h = EngineUtilityHandler(mgr, out, label="test")
+    engine = _Engine()
+    _process_one(h, out, engine, "update_weights_ipc", _bucket("a1", False))
+    stream = {"sync_id": "s2", "request_id": "r1", "group_name": "g", "version": 7}
+
+    (reply,) = _process_one(h, out, engine, "receive_weights_rdma", stream)
+
+    assert "not cleared" in reply["error"]
+    method, payload, _ = mgr.calls[-1]
+    assert (method, payload.args) == ("receive_weights_rdma", ("g", 7))
+    assert "not cleared" in payload.kwargs["refusal"]
 
 
 def test_after_a_failed_sync_only_a_full_one_can_lift_the_fence():

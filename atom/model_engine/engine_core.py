@@ -21,7 +21,10 @@ from atom.model_engine.dynamic_chunking import (
     ChunkSizePredictor,
 )
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
-from atom.model_engine.engine_utility import EngineUtilityHandler
+from atom.model_engine.engine_utility import (
+    EngineUtilityHandler,
+    ask_what_runners_take,
+)
 from atom.model_engine.prefill_backlog import prefill_backlog
 from atom.model_engine.prefix_hash import attach_shipped_chains
 from atom.model_engine.scheduler import DecodeScheduler, PrefillScheduler, Scheduler
@@ -39,6 +42,7 @@ from atom.utils import (
     envs,
     init_exit_handler,
     make_zmq_socket,
+    resolve_obj_by_qualname,
     set_process_title,
 )
 from atom.utils.distributed.utils import (
@@ -221,6 +225,11 @@ class EngineCore:
                     f"{self.label}: cudagraph capture{decode_sizes} cost: {cap_cost:.2f} "
                     f"seconds, pool: {pool_bytes / (1 << 30):.2f}GB"
                 )
+            unavailable = None
+            runner_class = resolve_obj_by_qualname(config.runner_qualname)
+            if callable(getattr(runner_class, "get_worker_capabilities", None)):
+                # Fixed once the model is loaded, so asked once.
+                unavailable = ask_what_runners_take(self.runner_mgr, self.label)
             good = True
         finally:
             logger.info(
@@ -266,6 +275,7 @@ class EngineCore:
             self.output_queue,
             label=self.label,
             scheduler=self.scheduler,
+            unavailable=unavailable,
         )
 
         # KV cache allocated, graphs captured, BlockPool built: everything this
