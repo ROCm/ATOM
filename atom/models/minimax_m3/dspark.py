@@ -185,6 +185,8 @@ class KVCacheBinding(nn.Module):
 
     base_attention = None
     use_mla = False
+    # The page `M3DSparkAttention._bound_cache` reads and writes it in.
+    page_tokens = ASM_PAGE_SIZE
 
     def __init__(self, layer_num: int) -> None:
         super().__init__()
