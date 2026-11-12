@@ -908,8 +908,11 @@ def prepare_dcp_mailbox(cp_group, heads, dim, max_tokens) -> bool:
         from aiter.ops.flydsl.dcp_mailbox import CombineWorkspace, dcp_lse_combine
 
         usable = "row_counts" in inspect.signature(dcp_lse_combine).parameters
-    except ImportError:
+        if not usable:
+            logger.warning("DCP mailbox: aiter's dcp_lse_combine has no row_counts")
+    except Exception as error:  # noqa: BLE001 - any failure must reach the vote
         usable = False
+        logger.warning("DCP mailbox: aiter mailbox combine unavailable: %r", error)
     # agree first: a rank that skipped the mapping would leave its peers
     # waiting in it
     ok = torch.tensor([int(usable)], dtype=torch.int32, device="cpu")
@@ -917,6 +920,8 @@ def prepare_dcp_mailbox(cp_group, heads, dim, max_tokens) -> bool:
         ok, op=torch.distributed.ReduceOp.MIN, group=cp_group.cpu_group
     )
     if not ok.item():
+        if usable:
+            logger.warning("DCP mailbox: another rank cannot run it; using a2a")
         return False
     device = torch.device("cuda", torch.cuda.current_device())
     try:
@@ -955,12 +960,14 @@ def _dcp_mailbox_merge(cp_attn_out, cp_attn_lse, cp_group, owned_counts, quant_d
         return None
     from aiter.ops.flydsl.dcp_mailbox import dcp_lse_combine
 
+    # The combine takes exactly one int32 count per row, where the a2a path
+    # accepts any buffer at least `tokens` long.
     out = dcp_lse_combine(
         ws,
         cp_attn_out,
         cp_attn_lse.to(torch.float32).contiguous(),
         base_e=True,
-        row_counts=owned_counts,
+        row_counts=None if owned_counts is None else owned_counts[:tokens],
     )
     # No quantizing combine here: hand back the bf16 rows unquantized, which
     # the caller then quantizes as it would without the fused path.

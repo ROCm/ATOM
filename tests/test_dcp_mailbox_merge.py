@@ -27,6 +27,17 @@ needs_dcp_ops = pytest.mark.skipif(
 )
 
 
+def _min_vote(record):
+    """A stub for the CPU vote's all_reduce: the vote must take the minimum,
+    so one rank that cannot run the mailbox keeps the whole group on a2a."""
+
+    def all_reduce(t, op, group):
+        assert op == torch.distributed.ReduceOp.MIN
+        record(t)
+
+    return all_reduce
+
+
 def test_mailbox_is_a_comm_backend():
     assert DCPConfig(comm_backend="mailbox").comm_backend == "mailbox"
 
@@ -125,9 +136,11 @@ def test_empty_rows_are_masked_by_the_combine(monkeypatch, capturing):
     )
     out = torch.zeros(2, 16, 128, dtype=torch.bfloat16)
     lse = torch.ones(2, 16)
-    owned = torch.tensor([3, 0], dtype=torch.int32)
+    # a2a accepts a buffer longer than the step; the combine wants one per row
+    owned = torch.tensor([3, 0, 7, 7], dtype=torch.int32)
     dcp_ops.dcp_lse_merge(out, lse, group, backend="mailbox", owned_counts=owned)
-    assert seen["row_counts"] is owned
+    assert seen["row_counts"].tolist() == [3, 0]
+    assert seen["row_counts"].data_ptr() == owned.data_ptr()
     assert torch.equal(seen["lse"], lse)
 
 
@@ -149,7 +162,27 @@ def test_an_aiter_without_row_counts_keeps_all_to_all(monkeypatch):
     )
     votes = []
     monkeypatch.setattr(
-        torch.distributed, "all_reduce", lambda t, op, group: votes.append(t.item())
+        torch.distributed, "all_reduce", _min_vote(lambda t: votes.append(t.item()))
+    )
+    monkeypatch.setattr(dcp_ops, "_MAILBOX_WORKSPACES", {})
+    group = SimpleNamespace(world_size=4, rank_in_group=0, cpu_group="gloo")
+    assert not dcp_ops.prepare_dcp_mailbox(group, 16, 256, 64)
+    assert votes == [0]
+
+
+@needs_dcp_ops
+def test_a_broken_aiter_import_still_votes(monkeypatch):
+    """Any failure loading the combine, not only ImportError, has to reach the
+    vote: a rank that raised out of it would leave its peers waiting in gloo."""
+
+    class Broken:
+        def __getattr__(self, name):
+            raise RuntimeError("flydsl failed to initialise")
+
+    monkeypatch.setitem(sys.modules, "aiter.ops.flydsl.dcp_mailbox", Broken())
+    votes = []
+    monkeypatch.setattr(
+        torch.distributed, "all_reduce", _min_vote(lambda t: votes.append(t.item()))
     )
     monkeypatch.setattr(dcp_ops, "_MAILBOX_WORKSPACES", {})
     group = SimpleNamespace(world_size=4, rank_in_group=0, cpu_group="gloo")
@@ -178,7 +211,7 @@ def test_an_unavailable_mailbox_is_voted_once_on_the_cpu(monkeypatch):
     votes = []
     monkeypatch.setitem(sys.modules, "aiter.ops.flydsl.dcp_mailbox", None)
     monkeypatch.setattr(
-        torch.distributed, "all_reduce", lambda t, op, group: votes.append(t.device)
+        torch.distributed, "all_reduce", _min_vote(lambda t: votes.append(t.device))
     )
     monkeypatch.setattr(dcp_ops, "_MAILBOX_WORKSPACES", {})
     group = SimpleNamespace(world_size=4, rank_in_group=0, cpu_group="gloo")
