@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 """Public interface adoption and dependency boundaries."""
 
+import abc
 import subprocess
 import sys
 from typing import ClassVar
@@ -38,10 +39,24 @@ def test_registry_uses_public_parser(monkeypatch):
         return result
 
     result, tokenizer = object(), object()
-    monkeypatch.setattr(KimiK3Parser, "parse", classmethod(parse))
+    monkeypatch.setattr(ConstraintParser, "parse", classmethod(parse))
     assert required_call_channel(KimiK3Parser, tokenizer) is result
     assert KimiK3Parser.required_call_channel(tokenizer) is result
     assert calls == [tokenizer, tokenizer]
+
+
+def test_tool_parsers_do_not_inherit_constraint_parser_names():
+    # Format parsers compose the common compiler; they must not take its
+    # generic names (parse/bind/register) onto their public class surface,
+    # where a format's own `parse` would collide with them.
+    from atom.entrypoints.openai.tool_parser.tool_parser import ToolCallParser
+
+    assert not issubclass(ToolCallParser, ConstraintParser)
+    for name in ("parse", "bind", "_adapters"):
+        assert not hasattr(ToolCallParser, name)
+    # `register` stays ABC's virtual-subclass hook rather than being shadowed
+    # by ConstraintParser.register(rule_type, backend, adapter).
+    assert ToolCallParser.register.__func__ is abc.ABCMeta.register
 
 
 def test_registered_rule_parser_and_binding():

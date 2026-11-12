@@ -307,7 +307,7 @@ class RegionParse:
 NO_CALLS = RegionParse()
 
 
-class ToolCallParser(ConstraintParser, ABC):
+class ToolCallParser(ABC):
     """One on-the-wire tool-call format.
 
     Entirely class-side. A format holds no per-request state -- the engine
@@ -361,7 +361,7 @@ class ToolCallParser(ConstraintParser, ABC):
     @classmethod
     def required_call_channel(cls, tokenizer) -> RequiredChannel | None:
         """Compatibility bridge to common constraint parsing."""
-        return cls.parse(cls.channel_rule(), tokenizer)
+        return ConstraintParser.parse(cls.channel_rule(), tokenizer)
 
     @classmethod
     def tool_grammar_rule(cls, functions, *, required, starts_in_reasoning):
@@ -370,7 +370,7 @@ class ToolCallParser(ConstraintParser, ABC):
     @classmethod
     def tool_call_grammar(cls, functions, *, required, starts_in_reasoning):
         """Compatibility bridge for format grammar declarations."""
-        return cls.parse(
+        return ConstraintParser.parse(
             cls.tool_grammar_rule(
                 functions, required=required, starts_in_reasoning=starts_in_reasoning
             ),
