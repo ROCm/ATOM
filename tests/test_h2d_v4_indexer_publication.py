@@ -193,7 +193,18 @@ def test_pcp_ragged_queries_publish_indexer_once(monkeypatch, pp_size, rank):
         buf = runner.forward_vars["v4_indexer_cu_committed"]
         buf.gpu.fill_(77)
         torch.cuda._sleep(5_000_000)
-        local = builder._apply_pcp_reindex(md, positions, 3, 3, 11, 11, cu)
+        var = runner.forward_vars
+        local = builder._apply_pcp_reindex(
+            md,
+            positions,
+            3,
+            3,
+            11,
+            11,
+            cu,
+            cu_q_per_seq_gpu=var["cu_seqlens_q"].gpu[:3],
+            block_tables_gpu=var["block_tables"].gpu[:3],
+        )
         # The paged prefill indices are built for this rank's real rows.
         ((rows, built_gpu),) = paged
         assert rows == (3, len(range(rank, 11, 4)), 3)

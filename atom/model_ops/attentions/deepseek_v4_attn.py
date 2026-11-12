@@ -2954,6 +2954,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 scheduled_tokens,
                 running_tokens,
                 cu_seqlens_q_np,
+                cu_q_per_seq_gpu=var["cu_seqlens_q"].gpu[:scheduled_bs],
+                block_tables_gpu=var["block_tables"].gpu[:scheduled_bs],
             )
 
     def _apply_pcp_reindex(
@@ -2966,8 +2968,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         total_tokens: int,
         cu_seqlens_q_cpu: np.ndarray,
         *,
-        cu_q_per_seq_gpu: torch.Tensor | None = None,
-        block_tables_gpu: torch.Tensor | None = None,
+        cu_q_per_seq_gpu: torch.Tensor,
+        block_tables_gpu: torch.Tensor,
         buf_prefix_ubatch: str = "",
     ) -> torch.Tensor:
         """Reduce per-query prefill metadata to this PCP rank's round-robin shard.
@@ -2981,9 +2983,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         apply_cp_reindex. The paged-prefill inputs were staged split
         (`_stage_paged_prefill(pcp_split=True)`) over the same rows.
 
-        `cu_q_per_seq_gpu` / `block_tables_gpu` default to the whole batch's;
-        a PCP+TBO group passes its own, its `cu_q` rebased to the group, since
-        the extend indices are rows of the group's `kv`.
+        `cu_q_per_seq_gpu` / `block_tables_gpu` are required: the whole batch
+        passes its own, a PCP+TBO group passes its rows, its `cu_q` rebased to
+        the group, since the extend indices are rows of the group's `kv`.
 
         Returns the sliced `positions` (the model.forward entry slices its own
         copy identically; this keeps attn_metadata-internal users consistent).

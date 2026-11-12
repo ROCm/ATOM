@@ -64,6 +64,8 @@ def pcp_aux_rows(n: int) -> int | None:
     the batch-global `target_pcp_split`, never on hook-side bookkeeping, which a
     cudagraph replay skips."""
     ctx = getattr(get_forward_context(), "context", None)
+    # `target_pcp_split` implies PCP is enabled (ws > 1); see
+    # `ModelRunner._settle_target_pcp_split`.
     if n <= 0 or not getattr(ctx, "target_pcp_split", False):
         return None
     pcp_ws = get_pcp_world_size()
