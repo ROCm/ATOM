@@ -13,15 +13,17 @@ pytest.importorskip("aiter", reason="requires the AITER runtime")
 triton = pytest.importorskip("triton", reason="requires Triton")
 
 
-def _gfx1250_x4():
+def _mailbox_x4():
     if torch.cuda.device_count() < 4:
         return False
     from aiter.jit.utils.chip_info import get_gfx_runtime
 
-    return get_gfx_runtime() == "gfx1250"
+    return get_gfx_runtime() in ("gfx950", "gfx1250")
 
 
-pytestmark = pytest.mark.skipif(not _gfx1250_x4(), reason="requires 4 gfx1250 GPUs")
+pytestmark = pytest.mark.skipif(
+    not _mailbox_x4(), reason="requires 4 supported mailbox GPUs"
+)
 
 WORLD, QLEN, TOPK, MAX_LEN = 4, 4, 16, 1 << 20
 CASES = [(1, 1000, 0, 1), (16, 60000, 1, 4), (64, 100000, 1, 4)]
