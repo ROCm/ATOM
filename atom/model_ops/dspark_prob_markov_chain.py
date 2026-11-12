@@ -14,7 +14,6 @@ per-position inter-rank winner exchange and uses the existing implementation.
 """
 
 from functools import cache
-from typing import NamedTuple
 
 import torch
 import triton
@@ -28,39 +27,29 @@ from atom.model_ops.dspark_prob_sample import (
 )
 
 _BLOCK_K = _markov_stage1.BLOCK_K
-_BLOCK_V = _markov_stage1.BLOCK_V
-_MAX_BLOCK_ROW = _markov_stage1.MAX_BLOCK_ROW
-_MIN_BLOCK_ROW = _markov_stage1.MIN_BLOCK_ROW
-
-
-class _ChainLaunch(NamedTuple):
-    """Tiling of one stage-1 launch: each program scores ``block_row`` rows
-    against ``v_tiles`` consecutive ``block_v``-column vocab tiles and folds
-    their keys in registers before one atomic per row."""
-
-    block_row: int
-    block_v: int
-    v_tiles: int
-    num_warps: int
-    num_stages: int
-
 
 # Batches above this many rows take 16-row tiles with two 32-column vocab
 # tiles per program, which keeps many programs in flight; smaller batches
 # keep the Markov stage-1 tiling, already a single row tile there.
 _WIDE_MIN_ROWS = 16
-_WIDE_LAUNCH = _ChainLaunch(
-    block_row=16, block_v=32, v_tiles=2, num_warps=2, num_stages=1
-)
+_WIDE_BLOCK_ROW = 16
+_WIDE_BLOCK_V = 32
+_WIDE_TILES_PER_PROGRAM = 2
 
 
-def _chain_launch(num_rows: int) -> _ChainLaunch:
-    if num_rows > _WIDE_MIN_ROWS:
-        return _WIDE_LAUNCH
-    block_row = min(
-        _MAX_BLOCK_ROW, max(_MIN_BLOCK_ROW, triton.next_power_of_2(num_rows))
+def _chain_launch(num_rows: int, vocab_size: int) -> _markov_stage1.MarkovGeometry:
+    """`markov_launch_geometry`, with the wide override for larger batches."""
+    if num_rows <= _WIDE_MIN_ROWS:
+        return _markov_stage1.markov_launch_geometry(num_rows, vocab_size)
+    return _markov_stage1.MarkovGeometry(
+        block_row=_WIDE_BLOCK_ROW,
+        row_tiles=triton.cdiv(num_rows, _WIDE_BLOCK_ROW),
+        v_tiles=triton.cdiv(vocab_size, _WIDE_BLOCK_V * _WIDE_TILES_PER_PROGRAM),
+        num_warps=2,
+        block_v=_WIDE_BLOCK_V,
+        tiles_per_program=_WIDE_TILES_PER_PROGRAM,
+        num_stages=1,
     )
-    return _ChainLaunch(block_row, _BLOCK_V, 1, 8 if block_row >= 32 else 4, 2)
 
 
 @triton.jit
@@ -270,11 +259,8 @@ def prob_markov_sample_chain(
             torch.int32,
             torch.int64,
         )
-    launch = _chain_launch(b)
-    grid = (
-        triton.cdiv(v, launch.block_v * launch.v_tiles),
-        triton.cdiv(b, launch.block_row),
-    )
+    launch = _chain_launch(b, v)
+    grid = (launch.v_tiles, launch.row_tiles)
     for k in range(t):
         previous = prev_ids if k == 0 else keys[k - 1]
         _prob_markov_chain_stage1[grid](
@@ -301,7 +287,7 @@ def prob_markov_sample_chain(
             RANK=rank,
             BLOCK_ROW=launch.block_row,
             BLOCK_V=launch.block_v,
-            NUM_V_TILES=launch.v_tiles,
+            NUM_V_TILES=launch.tiles_per_program,
             BLOCK_K=_BLOCK_K,
             FROM_PACKED=k > 0,
             num_warps=launch.num_warps,

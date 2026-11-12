@@ -1038,12 +1038,12 @@ class ModelRunner:
         self._init_forward_vars_ring()
         self._init_h2d_publication()
         self.forward_done_event = torch.cuda.Event()
-        # ATOM_DSPARK_PROB_DRAFT=1: the bonus-token draw runs on this stream,
-        # overlapping probabilistic verification, which waits on the event
-        # (`_sample_bonus`).
+        # ATOM_DSPARK_PROB_DRAFT=1: `_sample_bonus` runs the bonus-token draw
+        # on this stream and records the event; it overlaps probabilistic
+        # verification, which waits on the event in `prob_rejection_sample`.
         self._bonus_stream = self._bonus_ready = None
         if envs.ATOM_DSPARK_PROB_DRAFT:
-            self._bonus_stream = torch.cuda.Stream()
+            self._bonus_stream = torch.cuda.Stream(self.device)
             self._bonus_ready = torch.cuda.Event()
         initialize_eplb_runtime(self)
         self._maybe_warmup()
