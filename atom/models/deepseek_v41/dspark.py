@@ -219,12 +219,8 @@ class DeepseekV41DSpark(DSparkDraftModel):
         self.draft_kv_dtype = config.dspark.draft_kv_dtype
         self.block_size = args.dspark_block_size
         self.window_size, self.vocab_size = args.sliding_window, args.vocab_size
-        # Serving hands over the engine config; an offline build has no batch
-        # bound and never runs `block_backbone`, the only reader.
-        max_batch = getattr(config, "max_num_seqs", None)
-        self.draft_src_buffers = (
-            None if max_batch is None else DraftSrcBuffers(max_batch, self.block_size)
-        )
+        # Sized at the engine's batch bound, as the backbone's index buffers are.
+        self.draft_src_buffers = DraftSrcBuffers(config.max_num_seqs, self.block_size)
         draft = copy(args)
         draft.n_routed_experts = args.dspark_n_routed_experts
         draft.num_experts_per_tok = args.dspark_num_experts_per_tok
