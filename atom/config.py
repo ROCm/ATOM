@@ -2159,9 +2159,10 @@ class Config:
     master_addr: str = "127.0.0.1"
     enable_dp_attention: bool = False
     # DP request-routing strategy used by CoreManager to pick an engine rank:
-    # "round_robin" | "least_requests" (default) | "least_tokens". Only has an
-    # effect when more than one DP engine rank is launched. See
-    # atom/model_engine/engine_core_mgr.py:_select_dp_rank_locked. The literal
+    # "round_robin" | "least_requests" (default) | "least_tokens" |
+    # "prefix_spread". Only has an effect when more than one DP engine rank is
+    # launched. See atom/model_engine/engine_core_mgr.py:_select_dp_rank_locked
+    # and, for "prefix_spread", atom/model_engine/dp_routing/prefix_spread.py. The literal
     # default must stay in sync with engine_core_mgr.DP_LB_DEFAULT (config.py
     # cannot import it without a cycle: engine_core_mgr imports Config).
     dp_load_balance: str = "least_requests"

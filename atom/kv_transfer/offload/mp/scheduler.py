@@ -21,7 +21,6 @@ from atom.kv_transfer.offload._offload_common import validated_kv_role
 from atom.kv_transfer.offload.chunked_scheduler import (
     ChunkedOffloadSchedulerBase,
 )
-from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata
 from atom.kv_transfer.offload.mp.deployment import (
     _extra_config,
     _make_scheduler_adapter,
@@ -30,6 +29,8 @@ from atom.kv_transfer.offload.mp.deployment import (
 )
 from atom.kv_transfer.offload.mp.lookup import _DEFAULT_READ_TTL_S, _MPLookupClient
 from atom.kv_transfer.offload.mp.lookup_driver import _LockedAdapter
+from atom.kv_transfer.offload.mp.metadata import MPOffloadMetadata, MPReqMeta
+from atom.kv_transfer.offload.mp.token_shipping import ShippedTokens, TokenShipper
 from atom.kv_transfer.offload.mp.transfer import (
     _SCHEDULER_DEADLINE_MARGIN_S,
     LMCacheTransferUnprovable,
@@ -46,6 +47,8 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
     """Scheduler-side LMCache MP connector for generic PAGE offload."""
 
     _supports_early_block_release = True
+    _request_meta_type = MPReqMeta
+    _step_meta_type = MPOffloadMetadata
     # Whether a save may cover KV the current step computes (see
     # `note_scheduled_tokens`). A subclass whose save reads more than the
     # PAGE blocks that forward writes turns it off.
@@ -55,6 +58,8 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         self, config: Any, *, checkpoint_spec: Any = None, images: bool = True
     ) -> None:
         _validate_mp_config(config)
+        # Incremental token shipping (`token_shipping.py`).
+        self._token_shipper = TokenShipper()
         kvc = getattr(config, "kv_transfer_config", {}) or {}
         validated_kv_role(kvc)
         offcfg._strict_integer(
@@ -228,7 +233,10 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         seq.offload_load_start_tokens = int(seq.num_cached_tokens)
         return operation
 
-    def build_connector_meta(self) -> LMCacheOffloadMetadata:
+    def _transfer_tokens(self, seq: Any, end: int) -> ShippedTokens:
+        return self._token_shipper.ship(seq, end)
+
+    def build_connector_meta(self) -> MPOffloadMetadata:
         try:
             metadata = super().build_connector_meta()
         finally:
@@ -257,6 +265,8 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         if stats:
             for key, value in stats.items():
                 self._perf_counters_set(f"lookup_driver_{key}", value)
+        # Last: `_end_finished_sessions` above queues this step's drops.
+        metadata.token_drops = self._token_shipper.take_drops()
         return metadata
 
     def _perf_counters_set(self, key: str, value: int) -> None:
@@ -369,7 +379,8 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         self._end_finished_sessions()
 
     def has_pending_work(self) -> bool:
-        """Also report pending session ends and unreleased discarded lookups.
+        """Also report pending session ends, queued token drops and unreleased
+        discarded lookups.
 
         A detached lookup can outlive its request. If no other request is
         running, nothing else steps the connector, so without this the lookup
@@ -381,6 +392,7 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         return (
             super().has_pending_work()
             or bool(self._pending_session_ends())
+            or self._token_shipper.has_drops()
             or bool(callable(orphans) and orphans())
         )
 
@@ -419,6 +431,8 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
             if callable(in_flight) and in_flight(sid):
                 continue
             del pending[sid]
+            # No save can follow now: the workers' copy of its tokens goes.
+            self._token_shipper.drop(seq.id, seq)
             try:
                 self._mp_adapter.end_session(_mp_session_id(self._config, seq.id))
             except Exception:

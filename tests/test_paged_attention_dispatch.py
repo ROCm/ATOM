@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
-import inspect
 import sys
 from types import SimpleNamespace
 
@@ -1343,71 +1342,6 @@ class TestExplicitPlan:
         ubatch[0] = 0
         assert self._call(ba, owner=step, cache_owner=step) is ub0
 
-    def test_old_aiter_api_takes_gluon(self, monkeypatch):
-        """An aiter without #5809's keyword-only work plan must not be routed."""
-        from atom.model_ops import base_attention as ba
-
-        mod = importlib.import_module("aiter.ops.flydsl.pa_decode")
-
-        # Before #5809: the plan rides positionally behind the partition count.
-        def positional_plan(
-            output,
-            query,
-            key_cache,
-            value_cache,
-            context_lengths,
-            block_tables,
-            softmax_scale,
-            query_length,
-            max_context_partition_num,
-            work_plan=None,
-        ):
-            raise AssertionError("not called")
-
-        def no_bound(output, *a, work_plan, sinks=None):
-            raise AssertionError("not called")
-
-        try:
-            for old in (positional_plan, no_bound):
-                monkeypatch.setattr(mod, "pa_decode", old)
-                ba._flydsl_explicit_plan_api.cache_clear()
-                assert ba._flydsl_explicit_plan_api() is False, old.__name__
-        finally:
-            monkeypatch.undo()
-            ba._flydsl_explicit_plan_api.cache_clear()
-        assert ba._flydsl_explicit_plan_api() is True
-
-    @pytest.mark.parametrize("default", [inspect.Parameter.empty, None])
-    def test_keyword_plan_api_is_routed(self, monkeypatch, default):
-        """#5809's required plan and #7056's None default (gfx950 MXFP4) both route."""
-        from atom.model_ops import base_attention as ba
-
-        mod = importlib.import_module("aiter.ops.flydsl.pa_decode")
-        plan = inspect.Parameter(
-            "work_plan", inspect.Parameter.KEYWORD_ONLY, default=default
-        )
-        bound = inspect.Parameter(
-            "max_context_length", inspect.Parameter.KEYWORD_ONLY, default=None
-        )
-
-        def pa_decode(output, *a, **kw):
-            raise AssertionError("not called")
-
-        pa_decode.__signature__ = inspect.Signature(
-            [
-                inspect.Parameter("output", inspect.Parameter.POSITIONAL_OR_KEYWORD),
-                plan,
-                bound,
-            ]
-        )
-        try:
-            monkeypatch.setattr(mod, "pa_decode", pa_decode)
-            ba._flydsl_explicit_plan_api.cache_clear()
-            assert ba._flydsl_explicit_plan_api() is True
-        finally:
-            monkeypatch.undo()
-            ba._flydsl_explicit_plan_api.cache_clear()
-
     def test_dense_site_leaves_the_bound_to_the_block_table(self):
         """max_seqlen_k differs between graph and eager and picks the kernel."""
         for kw in self._call_kwargs("model_ops/attention_mha.py", "run_pa_decode"):
@@ -2001,19 +1935,6 @@ class TestNoGluonFlyDSLRouting:
                 temporary_output=None,
             )
 
-    def test_api_probe_reads_the_submodule_not_the_package_export(self, monkeypatch):
-        """aiter.ops.flydsl lazily exports a `pa_decode` function of that name."""
-        from atom.model_ops import base_attention as ba
-
-        pkg = importlib.import_module("aiter.ops.flydsl")
-        mod = importlib.import_module("aiter.ops.flydsl.pa_decode")
-        monkeypatch.setattr(pkg, "pa_decode", mod.pa_decode, raising=False)
-        ba._flydsl_explicit_plan_api.cache_clear()
-        try:
-            assert ba._flydsl_explicit_plan_api() is True
-        finally:
-            ba._flydsl_explicit_plan_api.cache_clear()
-
     def test_dense_decode_without_gluon_takes_the_unified_arm(self, monkeypatch):
         self._no_gluon(monkeypatch)
         assert _route(monkeypatch, 1) == "paged_attention_unified"
@@ -2066,27 +1987,14 @@ class TestNoGluonFlyDSLRouting:
         layer.sliding_window = -1
         assert not layer._flydsl_takes_decode(None, None, None, None)
 
-    @pytest.mark.parametrize(
-        "arch, takes_max_batch", [("gfx950", True), ("gfx1250", False)]
-    )
-    def test_plan_cap_stays_4096_unless_gfx1250_planner_takes_it(
-        self, monkeypatch, arch, takes_max_batch
-    ):
-        """gfx942/gfx950 keep aiter's cap; an aiter before #6462 has no
-        max_batch_size to raise it with."""
-        import aiter.ops.flydsl.pa_decode as fly
+    @pytest.mark.parametrize("arch", ["gfx942", "gfx950"])
+    def test_plan_cap_stays_4096_off_gfx1250(self, monkeypatch, arch):
+        """Only gfx1250, without gluon for sparse decode, raises aiter's cap."""
         from aiter.jit.utils import chip_info
 
         from atom.model_ops import base_attention as ba
 
-        def with_cap(lengths, num_kv_heads, *, max_batch_size=None): ...
-
-        def without_cap(lengths, num_kv_heads): ...
-
         monkeypatch.setattr(chip_info, "get_gfx_runtime", lambda: arch)
-        monkeypatch.setattr(
-            fly, "plan_pa_decode", with_cap if takes_max_batch else without_cap
-        )
         ba._flydsl_plan_max_batch.cache_clear()
         try:
             assert ba._flydsl_plan_max_batch() == ba._FLYDSL_PLAN_MAX_BATCH
@@ -2095,15 +2003,11 @@ class TestNoGluonFlyDSLRouting:
 
     def test_plan_cap_follows_lds_on_gfx1250(self, monkeypatch):
         """320 KiB of LDS per block: (327680 - 512) // 16 * 16 // 4 = 81792."""
-        import aiter.ops.flydsl.pa_decode as fly
         from aiter.jit.utils import chip_info
 
         from atom.model_ops import base_attention as ba
 
-        def with_cap(lengths, num_kv_heads, *, max_batch_size=None): ...
-
         monkeypatch.setattr(chip_info, "get_gfx_runtime", lambda: "gfx1250")
-        monkeypatch.setattr(fly, "plan_pa_decode", with_cap)
         monkeypatch.setattr(ba.torch.cuda, "current_device", lambda: 0)
         monkeypatch.setattr(
             ba.torch.cuda,
