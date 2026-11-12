@@ -18,7 +18,9 @@ from aiter.ops.quant import per_1x32_f4_quant
 from aiter.utility import fp4_utils
 
 HIDDEN, INTER, TOP_K, SWIGLU_LIMIT = 6144, 768, 4, 7.0
-INV6 = torch.tensor(1.0 / 6.0, dtype=torch.float32)  # 0x3E2AAAAB, the constant aiter's HIP / FlyDSL multiply by
+INV6 = torch.tensor(
+    1.0 / 6.0, dtype=torch.float32
+)  # 0x3E2AAAAB, the constant aiter's HIP / FlyDSL multiply by
 
 
 def _code_ceil(v):
@@ -35,7 +37,10 @@ def _f32_to_e2m1(q):
     sign = qx & -(2**31)
     a = (qx & 0x7FFFFFFF).to(torch.int64)
     denorm_bias = 0x4A800000
-    denorm = (a.to(torch.int32).view(torch.float32) + torch.tensor(denorm_bias, dtype=torch.int32).view(torch.float32)).view(torch.int32) - denorm_bias
+    denorm = (
+        a.to(torch.int32).view(torch.float32)
+        + torch.tensor(denorm_bias, dtype=torch.int32).view(torch.float32)
+    ).view(torch.int32) - denorm_bias
     mant_odd = (a >> 22) & 1
     normal = ((a + 0xC11FFFFF + mant_odd) & 0xFFFFFFFF) >> 22
     e = torch.where((a < 0x40C00000) & (a >= 0x3F800000), normal, torch.full_like(a, 7))
@@ -54,7 +59,26 @@ def fp4_quant_kernel_rule(x):
 
 
 def _grid(nib):
-    t = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0])
+    t = torch.tensor(
+        [
+            0.0,
+            0.5,
+            1.0,
+            1.5,
+            2.0,
+            3.0,
+            4.0,
+            6.0,
+            -0.0,
+            -0.5,
+            -1.0,
+            -1.5,
+            -2.0,
+            -3.0,
+            -4.0,
+            -6.0,
+        ]
+    )
     return t.to(nib.device)[nib]
 
 
@@ -69,7 +93,9 @@ def dq_fp8(x):
     r = x.float().view(x.shape[0], -1, 32)
     code = _code_ceil(r.abs().amax(-1) * torch.tensor(1.0 / 448.0, dtype=torch.float32))
     sc = (code << 23).view(torch.float32)[..., None]
-    return ((r / sc).clamp(-448, 448).to(torch.float8_e4m3fn).float() * sc).view(x.shape)
+    return ((r / sc).clamp(-448, 448).to(torch.float8_e4m3fn).float() * sc).view(
+        x.shape
+    )
 
 
 def _bf16(x):
@@ -84,7 +110,8 @@ def swiglu(g, u, limit=SWIGLU_LIMIT):
 
 def ref_moe(x, w13, w2, route, rw, act="a4w4"):
     """x [T, HIDDEN] (bf16 values), w13[e] [2 INTER, HIDDEN] / w2[e] [HIDDEN, INTER] dequantized MXFP4
-    (gate rows then up rows), route [T, TOP_K], rw [T, TOP_K] -> [T, HIDDEN] f32 (f32 accumulation)."""
+    (gate rows then up rows), route [T, TOP_K], rw [T, TOP_K] -> [T, HIDDEN] f32 (f32 accumulation).
+    """
     q = {"a16w4": lambda v: v, "a8w4": dq_fp8, "a4w4": dq_fp4}[act]
     xq = q(_bf16(x))
     out = torch.zeros(x.shape[0], HIDDEN)
@@ -99,19 +126,26 @@ def ref_moe(x, w13, w2, route, rw, act="a4w4"):
 
 def test_quant_matches_aiter_bit_for_bit():
     g = torch.Generator().manual_seed(0)
-    x = torch.randn(256, 6144, generator=g) * torch.exp2(torch.randint(-6, 6, (256, 192), generator=g).float()).repeat_interleave(32, 1)
+    x = torch.randn(256, 6144, generator=g) * torch.exp2(
+        torch.randint(-6, 6, (256, 192), generator=g).float()
+    ).repeat_interleave(32, 1)
     x = x.to(torch.bfloat16).float()
     nib, code = fp4_quant_kernel_rule(x)
     q, s = per_1x32_f4_quant(x, quant_dtype=dtypes.fp4x2)
     ref_codes = s.view(torch.uint8).view(256, -1).to(torch.int32)
-    ref_nib = torch.stack([(q.view(torch.uint8) & 0xF), (q.view(torch.uint8) >> 4)], -1).view(256, -1).to(torch.int64)
+    ref_nib = (
+        torch.stack([(q.view(torch.uint8) & 0xF), (q.view(torch.uint8) >> 4)], -1)
+        .view(256, -1)
+        .to(torch.int64)
+    )
     assert torch.equal(code, ref_codes)
     assert torch.equal(nib, ref_nib)
 
 
 def test_scale_boundary_multiply_equals_divide():
     """amax = 6 * 2^k: the HIP / FlyDSL kernels multiply by f32(1/6) (1 + 3e-8), aiter's CPU ref
-    divides; the f32 product rounds back to exactly 2^k, so both give scale 2^k (no extra round-up)."""
+    divides; the f32 product rounds back to exactly 2^k, so both give scale 2^k (no extra round-up).
+    """
     for k in range(-4, 6):
         x = torch.zeros(1, 32)
         x[0, 0] = 6.0 * 2.0**k

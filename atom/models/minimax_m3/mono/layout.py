@@ -453,7 +453,9 @@ def pool_words(tokens: int, a16w4: bool = False, a4w4: bool = False) -> int:
     if a16w4:
         down = wide_down_words(tokens)
     up = tokens * (XN8_ROW + XSC_ROW + N_ROUTED) + WAVES * 64 * 4
-    if a4w4:  # only the shared expert's CTAs hold the MXFP8 rows; the routed operands are in registers
+    if (
+        a4w4
+    ):  # only the shared expert's CTAs hold the MXFP8 rows; the routed operands are in registers
         down = wide_down4_words(tokens)
     return max(WAVES * O_K, up, down)
 
@@ -471,7 +473,13 @@ def wide_down_layout(tokens: int) -> dict:
     sh8 = (rows + 1) * MIDB_ROW
     sh8sc = sh8 + (tokens + 1) * MID_ROW
     shp = sh8sc + (tokens + 1) * MIDSC_ROW
-    return {"rows": rows, "sh8": sh8, "sh8sc": sh8sc, "shp": shp, "end": shp + WAVES * 64 * 4}
+    return {
+        "rows": rows,
+        "sh8": sh8,
+        "sh8sc": sh8sc,
+        "shp": shp,
+        "end": shp + WAVES * 64 * 4,
+    }
 
 
 def wide_down_words(tokens: int) -> int:
@@ -481,13 +489,21 @@ def wide_down_words(tokens: int) -> int:
 def wide_down4_layout(tokens: int) -> dict:
     """Word offsets of the wide ``moe_a4w4`` down stage's pool: the routed experts' MXFP4 mid rows (row
     k TOP_K + slot, a zero row last) then their codes (``MIDSC_ROW`` words a row), then the shared
-    expert's MXFP8 rows, codes and the waves' shared partials as in ``wide_down_layout``."""
+    expert's MXFP8 rows, codes and the waves' shared partials as in ``wide_down_layout``.
+    """
     rows = TOP_K * tokens
     sc4 = (rows + 1) * MID4_ROW
     sh8 = sc4 + (rows + 1) * MIDSC_ROW
     sh8sc = sh8 + (tokens + 1) * MID_ROW
     shp = sh8sc + (tokens + 1) * MIDSC_ROW
-    return {"rows": rows, "sc4": sc4, "sh8": sh8, "sh8sc": sh8sc, "shp": shp, "end": shp + WAVES * 64 * 4}
+    return {
+        "rows": rows,
+        "sc4": sc4,
+        "sh8": sh8,
+        "sh8sc": sh8sc,
+        "shp": shp,
+        "end": shp + WAVES * 64 * 4,
+    }
 
 
 def wide_down4_words(tokens: int) -> int:

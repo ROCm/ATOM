@@ -19,7 +19,14 @@ from atom.models.minimax_m3.mono.config import (
 from atom.models.minimax_m3.mono.kernels.common import ld_bf16x12
 from atom.models.minimax_m3.mono.kernels.stages.shared import XN_SLICE
 from atom.models.minimax_m3.mono.layout import N_ROUTER, SCORE_COPIES, XN4_WORDS
-from atom.mono.device.mx import FP8_MAX, clamp_fp8, code_ceil, fp4_pack2, fp4_scale, pow2
+from atom.mono.device.mx import (
+    FP8_MAX,
+    clamp_fp8,
+    code_ceil,
+    fp4_pack2,
+    fp4_scale,
+    pow2,
+)
 from atom.mono.device.ops import (
     CM_DEV,
     bf2_f32,
@@ -170,10 +177,11 @@ def router_defs(k4ctx):
 
     def lds_b4(word):
         """This lane's MXFP4 B operand (a4w4) of the 128-k chunk at LDS word ``word``: k 32 g .. + 32
-        (g = lane // 16), 16 B, the fp4 A tile's K assignment (hip/fp4_mfma_probe.cpp)."""
-        return fx.Vector(
-            fx.ptr_load(xs + (word + 4 * g4), result_type=v4f)
-        ).bitcast(fx.Int32)
+        (g = lane // 16), 16 B, the fp4 A tile's K assignment (hip/fp4_mfma_probe.cpp).
+        """
+        return fx.Vector(fx.ptr_load(xs + (word + 4 * g4), result_type=v4f)).bitcast(
+            fx.Int32
+        )
 
     def lds_bf8(word):
         """16 B of LDS words ``word`` .. + 4 as eight bf16: a MFMA operand."""
@@ -239,7 +247,7 @@ def router_defs(k4ctx):
                 for qq in range(2)
                 for i, f in enumerate(bf2_f32(arow[h][qq]))
             ]
-            if const_expr(AG_RS):  # noqa: SIM102
+            if const_expr(AG_RS):
                 # h_mid = bf16(bf16(sum) + residual): task t writes slice t
                 if tid // (XN_SLICE // RE) == t:
                     hw = (k * HIDDEN + tid * RE) // 2
@@ -285,7 +293,11 @@ def router_defs(k4ctx):
                     mb_put_words(
                         mr("xnb"),
                         k * (HIDDEN // 2) + t * (XN_SLICE // 2) + tid,
-                        [fx.ptr_load(xs + (t * (XN_SLICE // 2) + tid)).bitcast(fx.Int32)],
+                        [
+                            fx.ptr_load(xs + (t * (XN_SLICE // 2) + tid)).bitcast(
+                                fx.Int32
+                            )
+                        ],
                     )
             if const_expr(A16W):
                 # wide: the slice's bf16 words as plain words (the flag below follows them)
@@ -320,7 +332,9 @@ def router_defs(k4ctx):
                     # the routed experts' MXFP4 xn (a4w4): the same 32-blocks, E8M0 RoundUp; a lane's 4
                     # elements are 2 bytes, an even lane stores its neighbour's beside its own
                     amax4 = fx.max(fx.max(f[0], -f[0]), fx.max(f[1], -f[1]))
-                    amax4 = fx.max(amax4, fx.max(fx.max(f[2], -f[2]), fx.max(f[3], -f[3])))
+                    amax4 = fx.max(
+                        amax4, fx.max(fx.max(f[2], -f[2]), fx.max(f[3], -f[3]))
+                    )
                     e4, sc4 = fp4_scale(butterfly(amax4, (1, 2, 4), fx.max))
                     w16 = fp4_pack2(fx.Int32(0), f[0], f[1], sc4, 0)
                     w16 = fp4_pack2(w16, f[2], f[3], sc4, 1) & 0xFFFF
@@ -329,9 +343,13 @@ def router_defs(k4ctx):
                     xsw4 = k * XSC_WORDS + t * (XN_SLICE // 32) + tid // 8
                     if const_expr(A4W):
                         if tid % 2 == 0:
-                            bo.buffer_store(word4, rsrc(mb("xn4p")), xw4, cache_modifier=CM_DEV)
+                            bo.buffer_store(
+                                word4, rsrc(mb("xn4p")), xw4, cache_modifier=CM_DEV
+                            )
                         if tid % 8 == 0:
-                            bo.buffer_store(e4, rsrc(mb("xs4p")), xsw4, cache_modifier=CM_DEV)
+                            bo.buffer_store(
+                                e4, rsrc(mb("xs4p")), xsw4, cache_modifier=CM_DEV
+                            )
                     else:
                         if tid % 2 == 0:
                             mb_put_words(mr("xn4"), xw4, [word4])

@@ -9,12 +9,12 @@ from atom.models.minimax_m3.mono.config import INTER, MOE_SLOTS, TOP_K
 from atom.models.minimax_m3.mono.kernels.stages.shared import XN_SLICE
 from atom.models.minimax_m3.mono.layout import (
     DN_ROWS,
+    MID4N_WORDS,
+    MIDSC4N_WORDS,
     N_DN,
     N_ROUTER,
     SCORE_COPIES,
     SH_TASKS,
-    MID4N_WORDS,
-    MIDSC4N_WORDS,
     XN4_ROW,
     XN4_WORDS,
     XN8_ROW,
@@ -237,14 +237,20 @@ def moe_narrow_defs(k4ctx):
             def stage_row(kk, row):
                 got = mb_poll(
                     [
-                        (mr("xn4"), kk * XN4_WORDS + fx.min(tid + i * THREADS, XN4_WORDS - 1), 1)
+                        (
+                            mr("xn4"),
+                            kk * XN4_WORDS + fx.min(tid + i * THREADS, XN4_WORDS - 1),
+                            1,
+                        )
                         for i in range(2)
                     ]
                     + [(mr("xs4"), kk * XSC_WORDS + fx.min(tid, XSC_WORDS - 1), 1)]
                 )
                 fx.ptr_store(got[0][0], xs + (X4_LDS + row * XN4_ROW + tid))
                 if tid + THREADS < XN4_WORDS:
-                    fx.ptr_store(got[1][0], xs + (X4_LDS + row * XN4_ROW + tid + THREADS))
+                    fx.ptr_store(
+                        got[1][0], xs + (X4_LDS + row * XN4_ROW + tid + THREADS)
+                    )
                 if tid < XSC_WORDS:
                     fx.ptr_store(got[2][0], xs + (X4S_LDS + row * XSC_ROW + tid))
 
@@ -318,7 +324,7 @@ def moe_narrow_defs(k4ctx):
                 )
             cur = ug_load(ug_task_id(0)[0])
             stamp(7)
-            if const_expr(sh_late):  # noqa: SIM102
+            if const_expr(sh_late):
                 if has_sh:  # while the first routed task's weights are in flight
                     sh_compute(sh_j, sh_w[0], sh_w[1])
             # task i + 1's weights go out before task i's GEMV (software pipeline);
@@ -405,7 +411,8 @@ def moe_narrow_defs(k4ctx):
 
         def stage_mids_quant(k):
             """Token k's mid row -> the routed slots' MXFP4 words + codes (lanes < MID4N_WORDS), the shared
-            slot's MXFP8 words + codes (the next MID8_WORDS // 2 - MID4N_WORDS lanes)."""
+            slot's MXFP8 words + codes (the next MID8_WORDS // 2 - MID4N_WORDS lanes).
+            """
             got = mb_poll(
                 [
                     (

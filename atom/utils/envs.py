@@ -649,8 +649,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_MONO_MOE_A16W4": lambda: os.getenv("ATOM_MONO_MOE_A16W4", "1") == "1",
     # The routed experts on MXFP4 activations (a4w4: xn and the swiglu mid per 1x32, E8M0 RoundUp, aiter's
     # a4w4 convention; the shared expert stays MXFP8). Wins over ATOM_MONO_MOE_A16W4; needs the unfused
-    # MXFP8 shared expert (else ignored). Default off until the model-level accuracy is accepted.
-    "ATOM_MONO_MOE_A4W4": lambda: os.getenv("ATOM_MONO_MOE_A4W4", "0") == "1",
+    # MXFP8 shared expert (else ignored). Default on (GSM8K 500 paired 469 vs 463 with it off, needle 10/10);
+    # ATOM_MONO_MOE_A4W4=0 gives the earlier a16w4 numerics.
+    "ATOM_MONO_MOE_A4W4": lambda: os.getenv("ATOM_MONO_MOE_A4W4", "1") == "1",
     # f32 split -> merge partition outputs: off by default (the bf16 partitions of the earlier mono)
     "ATOM_MONO_SP_F32": lambda: os.getenv("ATOM_MONO_SP_F32", "0") == "1",
     "ATOM_MONO_PROD_ROUND": lambda: os.getenv("ATOM_MONO_PROD_ROUND", "1") == "1",

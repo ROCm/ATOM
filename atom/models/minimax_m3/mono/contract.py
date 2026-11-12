@@ -97,8 +97,15 @@ def check_build(
         ),
         K4_ABI,
         mailbox_regions(
-            tokens, index_heads, fuse_k1, index_topk, xn_flag, mid_flag, sp_f32,
-            moe_a16w4 and shared_mxfp8 and not moe_a4w4, moe_a4w4,
+            tokens,
+            index_heads,
+            fuse_k1,
+            index_topk,
+            xn_flag,
+            mid_flag,
+            sp_f32,
+            moe_a16w4 and shared_mxfp8 and not moe_a4w4,
+            moe_a4w4,
         ),
     )
 
@@ -125,13 +132,17 @@ if __name__ == "__main__":
                         )
                 if s < WIDE_FROM and not a16:
                     check_build(s, ih, xn_flag=1, mid_flag=1, moe_a16w4=False)
-                    print(f"S={s} index heads={ih} xn_flag=1 mid_flag=1: contract holds")
+                    print(
+                        f"S={s} index heads={ih} xn_flag=1 mid_flag=1: contract holds"
+                    )
                 check_build(s, ih, shared_mxfp8=True, moe_a16w4=a16)
                 print(f"S={s} index heads={ih} shared_mxfp8 {tag}: contract holds")
                 if s >= WIDE_FROM:
                     for k in (1, 2, 4):
                         check_build(s, ih, shared_mxfp8=True, sh_first=k, moe_a16w4=a16)
-                        print(f"S={s} index heads={ih} sh_first={k} {tag}: contract holds")
+                        print(
+                            f"S={s} index heads={ih} sh_first={k} {tag}: contract holds"
+                        )
                 check_build(s, ih, kv_nvfp4=True, index_nvfp4=True, moe_a16w4=a16)
                 print(f"S={s} index heads={ih} nvfp4 K/V + index {tag}: contract holds")
                 for nv in (False, True):

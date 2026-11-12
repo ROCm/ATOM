@@ -370,15 +370,15 @@ def split_defs(k4ctx):
             # (the task runs them before the loop moves on: ``ts`` is this task's)
             def put_o(e0, ov):
                 if const_expr(sp_f32):
-                    put_sp_o_f32(ts * O_K + e0, ov)  # noqa: B023
+                    put_sp_o_f32(ts * O_K + e0, ov)
                 else:
-                    mb_put_bf(mr("sp_o"), ts * O_K + e0, ov)  # noqa: B023
+                    mb_put_bf(mr("sp_o"), ts * O_K + e0, ov)
 
             def put_m(head, m):
-                mb_put(mr("sp_m"), ts * H + head, m)  # noqa: B023
+                mb_put(mr("sp_m"), ts * H + head, m)
 
             def put_l(head, lt):
-                mb_put(mr("sp_l"), ts * H + head, lt)  # noqa: B023
+                mb_put(mr("sp_l"), ts * H + head, lt)
 
             split_nvfp4_task(
                 tid, lane, wave, tok, t, blk, q, k_cache, kg, vg, sm_scale, hst, opart,
@@ -738,7 +738,7 @@ def o_defs(k4ctx):
             # to the row group's owner rank only
             push_rows("attn", t * O_ROWS, O_ROWS, t % W if AG_RS else None)
             gpu.barrier()
-            if const_expr(AG_RS):  # noqa: SIM102
+            if const_expr(AG_RS):
                 # the owner sums every peer's partials in rank order and gathers
                 # the sums to every rank's a_ag (h_mid: the router tasks)
                 if own_task(t, "attn") & (tid < O_ROWS // 2 * tokens):
@@ -759,7 +759,7 @@ def o_defs(k4ctx):
                             ptk * HIDDEN + row,
                             [t0, t1],
                         )
-            if const_expr(not AG_RS):  # noqa: SIM102
+            if const_expr(not AG_RS):
                 # this task's rows of the all-reduce, finished here (GLM's
                 # peer_reduce): every peer's partials summed in rank order, bf16, plus
                 # the residual -> h_mid and the 'a' mailbox. A router task then reads

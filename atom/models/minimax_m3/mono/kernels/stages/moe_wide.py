@@ -60,8 +60,8 @@ from atom.mono.device.ops import (
     bf16_pair,
     bf16_round,
     butterfly,
-    ld_dev,
     lanes_below,
+    ld_dev,
     mfma_bf16,
     popcount,
     row_live,
@@ -303,7 +303,8 @@ def moe_wide_defs(k4ctx):
 
     def wug_reduce(cg_, cu_, rnd=False):
         """The task's two accumulators -> swiglu: thread (row r, token k)'s mid value.
-        ``rnd`` (the shared expert's MXFP8 GEMVs): its gate / up are bf16 in production."""
+        ``rnd`` (the shared expert's MXFP8 GEMVs): its gate / up are bf16 in production.
+        """
         fx.ptr_store(cg_, red + (wave * 64 + lane) * 4)
         fx.ptr_store(cu_, fpool + (W_UPP + (wave * 64 + lane) * 4))
         gpu.barrier()
@@ -353,7 +354,8 @@ def moe_wide_defs(k4ctx):
         a 32-row block is 4 words, rows 0..7 / 8..15 / 16..23 / 24..31, low nibble = lower row) and
         its E8M0 code (``mids4p``), then the pair's flag. Thread (r, k) holds rows r and 16 + r of
         the block: the 16 lanes of a token share the block's amax (as ``wug_publish``), an even
-        lane packs its neighbour's value beside its own, 4 even lanes' bytes make a word."""
+        lane packs its neighbour's value beside its own, 4 even lanes' bytes make a word.
+        """
         u = pr // UG_PAIRS
         blk_ = pr % UG_PAIRS
         r = tid % UG_ROWS
@@ -627,14 +629,16 @@ def moe_wide_defs(k4ctx):
             ):
                 rows_to_lds(tid, base_w, tokens, n_row, xs + lds_w, lds_row)
         gpu.barrier()
-        if const_expr(SH_FIRST):  # noqa: SIM102
+        if const_expr(SH_FIRST):
             if has_s:
                 # the second half's tiles follow the first's MFMAs
                 cg0, cu0 = wug_mma(sh_cur[0], sh_cur[1], 0, True)
                 sh_nxt = wsh_load(2 * jsh + 1, has_s)
                 y_lo = wug_reduce(cg0, cu0, rnd=True)
                 y_hi = wug_y(sh_nxt[0], sh_nxt[1], 1, True)
-                wug_publish(n_routed * UG_PAIRS + jsh, y_lo, y_hi, shared_row=A16W or A4W)
+                wug_publish(
+                    n_routed * UG_PAIRS + jsh, y_lo, y_hi, shared_row=A16W or A4W
+                )
         y_lo = fx.Float32(0.0)  # the pair's first half, until the second's
         for it in range_constexpr(UGW_ITERS):
             t, has_t = task(it)
@@ -645,7 +649,9 @@ def moe_wide_defs(k4ctx):
             if const_expr(it % 2 == 0):
                 pair_scs = cur[1]
             if has_t:
-                y = wug_y(cur[0], pair_scs, it % 2, xb=xb, xq=xq)  # a pair: row groups cg, cg + 1
+                y = wug_y(
+                    cur[0], pair_scs, it % 2, xb=xb, xq=xq
+                )  # a pair: row groups cg, cg + 1
                 if const_expr(it % 2 == 0):
                     y_lo = y
                 elif const_expr(A4W):
@@ -668,7 +674,9 @@ def moe_wide_defs(k4ctx):
             if has_s:
                 y_lo = wug_y(sh_cur[0], sh_cur[1], 0, True)
                 y_hi = wug_y(sh_nxt[0], sh_nxt[1], 1, True)
-                wug_publish(n_routed * UG_PAIRS + jsh, y_lo, y_hi, shared_row=A16W or A4W)
+                wug_publish(
+                    n_routed * UG_PAIRS + jsh, y_lo, y_hi, shared_row=A16W or A4W
+                )
         stamp(8)
         if has_dn:
             if const_expr(A4W):
@@ -814,7 +822,9 @@ def moe_wide_defs(k4ctx):
                     c=fx.Vector.filled(4, 0.0, fx.Float32),
                     a_fmt=FP8,
                 )
-                if const_expr(prod_round):  # kept apart: production rounds each of the two
+                if const_expr(
+                    prod_round
+                ):  # kept apart: production rounds each of the two
                     shacc = [
                         shacc[e] + sok.select(scu[e] * sw, fx.Float32(0.0))
                         for e in range(4)
@@ -870,7 +880,9 @@ def moe_wide_defs(k4ctx):
             zero-sized reads past its last expert."""
             du = q + 4 * (i // DN_KC)
             ok = du < nu
-            de = fx.min(uniform(fx.ptr_load(uexp + fx.min(du, U_MAX - 1))), SHARED_EXPERT)
+            de = fx.min(
+                uniform(fx.ptr_load(uexp + fx.min(du, U_MAX - 1))), SHARED_EXPERT
+            )
             dwv = fp4_tile_load(
                 wrsrc(
                     "moed",
@@ -919,7 +931,9 @@ def moe_wide_defs(k4ctx):
         acquire()
         rows_to_lds(tid, mb("mid16p"), MIDB_ROWS, INTER // 2, xs, MIDB_ROW)
         rows_to_lds(tid, mb("mid8p"), tokens, MID_ROW_WORDS, xs + DNL["sh8"], MID_ROW)
-        rows_to_lds(tid, mb("midsp"), tokens, MIDSC_ROW_WORDS, xs + DNL["sh8sc"], MIDSC_ROW)
+        rows_to_lds(
+            tid, mb("midsp"), tokens, MIDSC_ROW_WORDS, xs + DNL["sh8sc"], MIDSC_ROW
+        )
         if tid < INTER // 2:
             fx.ptr_store(fx.Int32(0), xs + (MIDB_ROWS * MIDB_ROW + tid))
         if tid < MID_ROW_WORDS:
@@ -1012,7 +1026,9 @@ def moe_wide_defs(k4ctx):
             zero-sized reads past its last expert."""
             du = q + 4 * (i // DN_KC)
             ok = du < nu
-            de = fx.min(uniform(fx.ptr_load(uexp + fx.min(du, U_MAX - 1))), SHARED_EXPERT)
+            de = fx.min(
+                uniform(fx.ptr_load(uexp + fx.min(du, U_MAX - 1))), SHARED_EXPERT
+            )
             dwv = fp4_tile_load(
                 wrsrc(
                     "moed",
@@ -1060,9 +1076,13 @@ def moe_wide_defs(k4ctx):
         gpu.barrier()
         acquire()
         rows_to_lds(tid, mb("mid4p"), MIDB_ROWS, MID4_WORDS, xs, MID4_ROW)
-        rows_to_lds(tid, mb("mids4p"), MIDB_ROWS, INTER // 32, xs + DN4["sc4"], MIDSC_ROW)
+        rows_to_lds(
+            tid, mb("mids4p"), MIDB_ROWS, INTER // 32, xs + DN4["sc4"], MIDSC_ROW
+        )
         rows_to_lds(tid, mb("mid8p"), tokens, MID_ROW_WORDS, xs + DN4["sh8"], MID_ROW)
-        rows_to_lds(tid, mb("midsp"), tokens, MIDSC_ROW_WORDS, xs + DN4["sh8sc"], MIDSC_ROW)
+        rows_to_lds(
+            tid, mb("midsp"), tokens, MIDSC_ROW_WORDS, xs + DN4["sh8sc"], MIDSC_ROW
+        )
         if tid < MID4_WORDS:
             fx.ptr_store(fx.Int32(0), xs + (MIDB_ROWS * MID4_ROW + tid))
         if tid < INTER // 32:

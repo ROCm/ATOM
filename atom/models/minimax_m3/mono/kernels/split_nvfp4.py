@@ -349,7 +349,8 @@ def build_split_nvfp4_kernel(
     [tasks][32] i32 (16 page-16 ids, n_ctx at 16), ``q`` bf16 [token][O_K], the cache,
     the f32 global scales [k, v]; writes ``sp_o`` bf16 [ts][O_K] (``sp_f32``: f32, as
     K4's ``sp_f32`` build keeps it), ``sp_m`` / ``sp_l`` f32 [ts][H]. ``timed``:
-    ``sp_l`` is followed by an i32 [tasks] of the task's ``s_memrealtime`` ticks (100 MHz), first load of its page list to its last put."""
+    ``sp_l`` is followed by an i32 [tasks] of the task's ``s_memrealtime`` ticks (100 MHz), first load of its page list to its last put.
+    """
     assert 1 <= tasks <= BLOCKS
 
     @fx.struct
@@ -359,7 +360,10 @@ def build_split_nvfp4_kernel(
         blk: fx.Array[fx.Int32, 32, 16]
 
     kernel_name = kernel_symbol(
-        "minimax_m3_split_nvfp4", s=tasks, sm=int(sm_scale * 1e6), t=int(timed),
+        "minimax_m3_split_nvfp4",
+        s=tasks,
+        sm=int(sm_scale * 1e6),
+        t=int(timed),
         **({"f32": 1} if sp_f32 else {}),
     )
 
@@ -416,7 +420,7 @@ def build_split_nvfp4_kernel(
             tid, lane, wave, ts // N_SPLIT, ts % N_SPLIT, blk, q, kv, kg, vg,
             sm_scale, lds.hst.ptr, lds.opart.ptr, n_ctx, put_o, put_m, put_l,
         )  # fmt: skip
-        if const_expr(timed):  # noqa: SIM102
+        if const_expr(timed):
             if tid == 0:
                 bo.buffer_store(fx.Int32(memrealtime() - t0), rsrc(tl), ts)
 

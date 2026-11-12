@@ -97,10 +97,8 @@ from atom.models.minimax_m3.mono.kernels.stages.shared import (
 )
 from atom.models.minimax_m3.mono.layout import (
     AG_RS_FROM,
-    MID_ROW,
     MID4N_WORDS,
-    MIDB_ROW,
-    MIDSC4N_WORDS,
+    MID_ROW,
     O_K,
     O_ROW,
     O_ROWS,
@@ -110,7 +108,6 @@ from atom.models.minimax_m3.mono.layout import (
     UG_PER_SLOT,
     WIDE_FROM,
     XN4_ROW,
-    XN4_WORDS,
     XN8_ROW,
     XSC_ROW,
     XSCB_ROW,
@@ -119,13 +116,13 @@ from atom.models.minimax_m3.mono.layout import (
     pool_words,
     stage_bases,
     sym_layout,
-    wide_down4_layout,
-    wide_down_layout,
-    xb_lds_base,
-    xb_lds_rows,
     ug_ctas_per_token,
     ug_tasks_of,
+    wide_down4_layout,
+    wide_down_layout,
     wide_moe,
+    xb_lds_base,
+    xb_lds_rows,
 )
 from atom.models.minimax_m3.mono.sources import SOURCES
 from atom.mono.device.ops import CM_DEV, kernel_symbol, launcher, load_ptr64, rsrc
@@ -133,11 +130,10 @@ from atom.mono.device.ops import block_max as block_max_of
 from atom.mono.device.stamps import stamp as stamp_point
 from atom.mono.device.stamps import stamp_begin, stamp_flush
 from atom.mono.device.sync import Addr, Mailbox, preg, shift, sreg
-from atom.mono.plan.trace import Space
 from atom.mono.plan.build_key import key_tuple, symbol_params
-from atom.mono.plan.probe import parse as parse_probe
 from atom.mono.plan.execution import BLOCKS, THREADS, WAVES, first_task
-from atom.mono.plan.trace import enter_stage
+from atom.mono.plan.probe import parse as parse_probe
+from atom.mono.plan.trace import Space, enter_stage
 from atom.mono.runtime.abi import KernelAbi
 from atom.mono.runtime.debug import region_ids
 
@@ -199,7 +195,9 @@ class K4Build:
     # previous behaviour, code object for code object
     moe_a16w4: bool = True  # routed experts: bf16 activations (F1); False: MXFP8 (a8w4)
     sp_f32: bool = True  # split -> merge partition outputs in f32 (F2); False: bf16
-    prod_round: bool = True  # shared swiglu on bf16 gate / up, production's output-sum roundings (F3, F4)
+    prod_round: bool = (
+        True  # shared swiglu on bf16 gate / up, production's output-sum roundings (F3, F4)
+    )
     # routed experts on MXFP4 activations (a4w4: xn and the swiglu mid per 1x32 E8M0 RoundUp, aiter's a4w4
     # convention), the shared expert stays MXFP8; wins over ``moe_a16w4`` (compiled out when set)
     moe_a4w4: bool = False
@@ -259,11 +257,11 @@ def build_post_attn_kernel(
     moe_a16w4 = moe_a16w4 and not moe_a4w4  # a4w4 wins, a16w4 is compiled out
     assert not (
         moe_a16w4 and shared_mxfp8 and tokens < WIDE_FROM and (xn_flag or mid_flag)
-    ), (
-        "the narrow moe_a16w4 publishes its bf16 xn as tagged pairs: xn_flag = mid_flag = 0"
-    )
+    ), "the narrow moe_a16w4 publishes its bf16 xn as tagged pairs: xn_flag = mid_flag = 0"
     assert 1 <= tokens <= MAX_TOKENS
-    assert not moe_a4w4 or shared_mxfp8, "the a4w4 experts need the unfused MXFP8 shared expert"
+    assert (
+        not moe_a4w4 or shared_mxfp8
+    ), "the a4w4 experts need the unfused MXFP8 shared expert"
     assert not (
         moe_a4w4 and tokens < WIDE_FROM and xn_flag
     ), "the narrow moe_a4w4 publishes its MXFP4 xn as tagged words: xn_flag = 0 (mid_flag 0 / 1 / 2 as for a8w4)"
@@ -284,7 +282,14 @@ def build_post_attn_kernel(
     REGION_IDS = region_ids(
         d.name
         for d in mailbox_regions(
-            tokens, heads.count, fuse_k1, index_topk, xn_flag, mid_flag, sp_f32, True,
+            tokens,
+            heads.count,
+            fuse_k1,
+            index_topk,
+            xn_flag,
+            mid_flag,
+            sp_f32,
+            True,
             moe_a4w4,
         )
     )
@@ -673,7 +678,9 @@ def build_post_attn_kernel(
         DN_UNITS = TOP_K * DN_KC  # routed (slot, 128-k chunk) units per row group
         DN_UPW = (DN_UNITS + 3) // 4  # 4 waves per row group
         SH_UPW = (DN_KC + 3) // 4  # the shared expert's chunks, once for all tokens
-        assert not (A16N or A4N) or DN_UPW == DN_KC  # a wave a slot, its chunks the units
+        assert (
+            not (A16N or A4N) or DN_UPW == DN_KC
+        )  # a wave a slot, its chunks the units
         # routed (token, slot, row group) tasks t < ROUTED_TASKS; the shared expert's
         # row groups (one GEMV with a column per token) are tasks ROUTED_TASKS + j,
         # run as task j of stage "shared" while the routing is still on its way, so
@@ -699,7 +706,9 @@ def build_post_attn_kernel(
         W_MIDSC = (MID_ROWS + 1) * MID_ROW
         # moe_a16w4: the down stage's pool (``layout.wide_down_layout``)
         DNL = wide_down_layout(tokens)
-        MIDB_ROWS = DNL["rows"]  # the routed experts' bf16 mid rows, the zero row's index
+        MIDB_ROWS = DNL[
+            "rows"
+        ]  # the routed experts' bf16 mid rows, the zero row's index
         assert not A16W or DNL["end"] <= POOL
         DN4 = wide_down4_layout(tokens)  # moe_a4w4 (wide): the down stage's pool
         assert not A4W or DN4["end"] <= POOL

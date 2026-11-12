@@ -26,25 +26,25 @@ pytestmark = pytest.mark.skipif(
 )
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import test_minimax_m3_mono_k4_mxfp8 as K4T  # noqa: E402
-import test_minimax_m3_mono_moe_a4w4 as Q4  # noqa: E402
-from aiter import dtypes  # noqa: E402
-from aiter.ops.shuffle import shuffle_scale, shuffle_weight  # noqa: E402
+import test_minimax_m3_mono_k4_mxfp8 as K4T
+import test_minimax_m3_mono_moe_a4w4 as Q4
+from aiter import dtypes
+from aiter.ops.shuffle import shuffle_scale, shuffle_weight
 
-from atom.model_ops.blockscale import quantize_fp8  # noqa: E402
-from atom.models.minimax_m3.mono.config import (  # noqa: E402
+from atom.model_ops.blockscale import quantize_fp8
+from atom.models.minimax_m3.mono.config import (
     HIDDEN,
     INTER,
     MOE_SLOTS,
     N_ROUTED,
     TOP_K,
 )
-from atom.models.minimax_m3.mono.kernels.post_attn import (  # noqa: E402
+from atom.models.minimax_m3.mono.kernels.post_attn import (
     K4_ABI,
     build_post_attn_kernel,
 )
-from atom.models.minimax_m3.mono.layout import SCRATCH, sym_layout  # noqa: E402
-from atom.mono.runtime.uncached import uncached_bytes  # noqa: E402
+from atom.models.minimax_m3.mono.layout import SCRATCH, sym_layout
+from atom.mono.runtime.uncached import uncached_bytes
 
 DEV = "cuda"
 BF = torch.bfloat16
@@ -60,7 +60,10 @@ def bf(x):
 
 
 def pow2(code):
-    return torch.ldexp(torch.ones((), dtype=torch.float64, device=code.device), code.to(torch.int32) - 127)
+    return torch.ldexp(
+        torch.ones((), dtype=torch.float64, device=code.device),
+        code.to(torch.int32) - 127,
+    )
 
 
 def dq_fp4(b, sc):
@@ -74,14 +77,19 @@ def dq_fp4(b, sc):
 
 def dq_fp8(w, sc):
     """fp8 [R, K] and E8M0 codes [R, K / 32] -> f64 [R, K]."""
-    return (w.double().view(w.shape[0], -1, 32) * pow2(sc)[..., None]).view(w.shape[0], -1)
+    return (w.double().view(w.shape[0], -1, 32) * pow2(sc)[..., None]).view(
+        w.shape[0], -1
+    )
 
 
 def mx8(x):
     """The MXFP8 quantization the native linear / mono apply to a bf16 [n, K], dequantized (f64)."""
     xq, xs = quantize_fp8(x.to(BF).contiguous())
     n, k = x.shape
-    return (xq.double().view(n, k // 32, 32) * pow2(xs.view(torch.uint8).view(n, k // 32))[..., None]).view(n, k)
+    return (
+        xq.double().view(n, k // 32, 32)
+        * pow2(xs.view(torch.uint8).view(n, k // 32))[..., None]
+    ).view(n, k)
 
 
 def swiglu(g, u):
@@ -96,10 +104,16 @@ class Experts:
 
     def __init__(self, seed):
         g = torch.Generator(device=DEV).manual_seed(1000 + seed)
-        r8 = lambda *s: torch.randint(0, 256, s, dtype=torch.uint8, device=DEV, generator=g)  # noqa: E731
-        codes = lambda *s: torch.randint(117, 121, s, dtype=torch.uint8, device=DEV, generator=g)  # noqa: E731
+        r8 = lambda *s: torch.randint(
+            0, 256, s, dtype=torch.uint8, device=DEV, generator=g
+        )
+        codes = lambda *s: torch.randint(
+            117, 121, s, dtype=torch.uint8, device=DEV, generator=g
+        )
         E = N_ROUTED
-        self.b13, self.c13 = r8(E, 2 * INTER, HIDDEN // 2), codes(E, 2 * INTER, HIDDEN // 32)
+        self.b13, self.c13 = r8(E, 2 * INTER, HIDDEN // 2), codes(
+            E, 2 * INTER, HIDDEN // 32
+        )
         self.b2, self.c2 = r8(E, HIDDEN, INTER // 2), codes(E, HIDDEN, INTER // 32)
         # the shuffles the loader applies (GGUU, not guinterleave): (16, 16) weight, 2-D scale shuffle
         self.w13 = shuffle_weight(self.b13, layout=(16, 16)).contiguous()
@@ -107,8 +121,10 @@ class Experts:
         self.s13 = shuffle_scale(self.c13.view(-1, HIDDEN // 32)).contiguous()
         self.s2 = shuffle_scale(self.c2.view(-1, INTER // 32)).contiguous()
         # the MXFP8 shared expert: fp8 [rows, K] (16, 16)-preshuffled, row-major E8M0 codes
-        f8 = lambda *s: (torch.randn(*s, device=DEV, generator=g) * 0.02).to(dtypes.fp8)  # noqa: E731
-        sc = lambda *s: torch.randint(125, 128, s, dtype=torch.uint8, device=DEV, generator=g)  # noqa: E731
+        f8 = lambda *s: (torch.randn(*s, device=DEV, generator=g) * 0.02).to(dtypes.fp8)
+        sc = lambda *s: torch.randint(
+            125, 128, s, dtype=torch.uint8, device=DEV, generator=g
+        )
         self.f13, self.k13 = f8(2 * INTER, HIDDEN), sc(2 * INTER, HIDDEN // 32)
         self.f2, self.k2 = f8(HIDDEN, INTER), sc(HIDDEN, INTER // 32)
         self.w13s = shuffle_weight(self.f13, layout=(16, 16)).contiguous()
@@ -125,9 +141,18 @@ class Experts:
         rg, kc = 1, 3
         for lane in (0, 5, 16, 63):
             dw = rg * (2 * HIDDEN) + kc * 256 + lane * 4
-            got = self.w13.view(-1)[e * (2 * INTER * HIDDEN // 2) + dw * 4 : e * (2 * INTER * HIDDEN // 2) + dw * 4 + 16]
+            got = self.w13.view(-1)[
+                e * (2 * INTER * HIDDEN // 2)
+                + dw * 4 : e * (2 * INTER * HIDDEN // 2)
+                + dw * 4
+                + 16
+            ]
             g4 = lane // 16
-            want = self.b13[e, 16 + lane % 16, (kc * 128 + g4 * 32) // 2 : (kc * 128 + g4 * 32) // 2 + 16]
+            want = self.b13[
+                e,
+                16 + lane % 16,
+                (kc * 128 + g4 * 32) // 2 : (kc * 128 + g4 * 32) // 2 + 16,
+            ]
             assert torch.equal(got, want), ("weight layout", lane)
         for r, c in ((0, 0), (17, 5), (1000, 100), (1535, 191)):
             si = scale_index(e * 2 * INTER + r, c, HIDDEN // 32)
@@ -161,7 +186,9 @@ def norm(h_in, g_post, eps=1e-6):
     return bf((v * rstd) * (g_post.float() + 1.0))
 
 
-def moe_oracle(h_in, gate, bias, g_post, experts, shared, routing, *, act, prod_round, S):
+def moe_oracle(
+    h_in, gate, bias, g_post, experts, shared, routing, *, act, prod_round, S
+):
     """The MoE's ``ar_out`` [S, HIDDEN] f32 (bf16 values). ``act``: the routed experts' activation, a4w4 / a16w4 / a8w4."""
     del gate, bias, shared
     ids, w = routing
@@ -177,7 +204,9 @@ def moe_oracle(h_in, gate, bias, g_post, experts, shared, routing, *, act, prod_
         t, s = (ids == e).nonzero(as_tuple=True)
         o = (xr[t] @ experts.dq13(e).T).float()
         mid[t, s] = bf(swiglu(o[:, :INTER], o[:, INTER:]))
-    midq = q(mid.view(-1, INTER)).view(S, TOP_K, INTER) if act != "a16w4" else mid.double()
+    midq = (
+        q(mid.view(-1, INTER)).view(S, TOP_K, INTER) if act != "a16w4" else mid.double()
+    )
     acc = torch.zeros(S, TOP_K, HIDDEN, device=DEV)
     for e in ids.unique().tolist():
         t, s = (ids == e).nonzero(as_tuple=True)
@@ -224,22 +253,31 @@ def run_case(S, act="a4w4", prod_round=True, seed=0, **build_kw):
     gate = (torch.randn(N_ROUTED, HIDDEN, device=DEV, generator=g) * 0.02).to(BF)
     bias = torch.randn(N_ROUTED, device=DEV, generator=g) * 0.5
     # zero attention: zero o_proj weights, E8M0 code 127 (exact 1.0)
-    real = (torch.zeros(HIDDEN, K4T.O_K, dtype=torch.uint8), torch.full((HIDDEN, K4T.NB), 127, dtype=torch.uint8))
+    real = (
+        torch.zeros(HIDDEN, K4T.O_K, dtype=torch.uint8),
+        torch.full((HIDDEN, K4T.NB), 127, dtype=torch.uint8),
+    )
     c = K4T._case(S, real=real)
-    z = lambda *shape, dt=torch.uint8: torch.zeros(*shape, dtype=dt, device=DEV)  # noqa: E731
+    z = lambda *shape, dt=torch.uint8: torch.zeros(*shape, dtype=dt, device=DEV)
     h_mid, ar_out = z(S, HIDDEN, dt=BF), z(S, HIDDEN, dt=BF)
     scratch = uncached_bytes(SCRATCH["_bytes"], torch.device(DEV))
     sym = uncached_bytes(sym_layout(1)["_bytes"], torch.device(DEV))
     peers = torch.tensor([sym.data_ptr()], dtype=torch.int64, device=DEV)
     k1 = torch.zeros(12, dtype=torch.int64, device=DEV)
     ids_t = torch.arange(S, dtype=torch.int32, device=DEV)
-    flags = {"moe_a16w4": act == "a16w4", "moe_a4w4": act == "a4w4", "prod_round": prod_round, "sp_f32": False, **build_kw}
+    flags = {
+        "moe_a16w4": act == "a16w4",
+        "moe_a4w4": act == "a4w4",
+        "prod_round": prod_round,
+        "sp_f32": False,
+        **build_kw,
+    }
     ps = inspect.signature(build_post_attn_kernel).parameters
     launch = build_post_attn_kernel(
         1, 0.088, 1e-6, ROUTE_SCALE, SHARED_WEIGHT, SWIGLU_LIMIT, 1, 1, S, shared_mxfp8=True, attn_mxfp8=True,
         **{k: v for k, v in flags.items() if k in ps},
     )  # fmt: skip
-    p = lambda t: t.data_ptr()  # noqa: E731
+    p = lambda t: t.data_ptr()
     args = K4_ABI.pack(
         {
             "h_in": p(h_in), "q": p(c["q"]), "block_table": p(c["bt"]), "seq_lens": p(c["seq"]),
@@ -255,18 +293,31 @@ def run_case(S, act="a4w4", prod_round=True, seed=0, **build_kw):
     launch(*args)
     torch.cuda.synchronize()
     off = SCRATCH["sel"]
-    words = scratch[off : off + 2 * MOE_SLOTS * S * 8].view(torch.int32)[0::2]  # (value, tag) pairs
+    words = scratch[off : off + 2 * MOE_SLOTS * S * 8].view(torch.int32)[
+        0::2
+    ]  # (value, tag) pairs
     sel = words.view(S, 2, MOE_SLOTS)  # token k: ids at pairs 0..4, weights at 5..9
     ids = sel[:, 0, :TOP_K].long()
     w = sel[:, 1, :TOP_K].contiguous().view(torch.float32)
     assert (ids >= 0).all() and (ids < N_ROUTED).all(), ids
     got = ar_out.float()
     oracles = {
-        a: moe_oracle(h_in, gate, bias, g_post, ex, None, (ids, w), act=a, prod_round=prod_round, S=S)
+        a: moe_oracle(
+            h_in,
+            gate,
+            bias,
+            g_post,
+            ex,
+            None,
+            (ids, w),
+            act=a,
+            prod_round=prod_round,
+            S=S,
+        )
         for a in ("a4w4", "a16w4", "a8w4")
     }
     want = oracles[act]
-    rel = lambda a, b: ((a - b).norm(dim=-1) / b.norm(dim=-1))  # noqa: E731
+    rel = lambda a, b: ((a - b).norm(dim=-1) / b.norm(dim=-1))
     same_set, wdiff = _route_check(h_in, gate, bias, g_post, ids, w)
     details = {
         "rel": rel(got, want).cpu(),
@@ -283,7 +334,7 @@ def run_case(S, act="a4w4", prod_round=True, seed=0, **build_kw):
 @pytest.mark.parametrize("act", ["a4w4", "a16w4", "a8w4"])
 @pytest.mark.parametrize("tokens", [1, 2, 3, 4, 5, 8, 12, 16])
 def test_moe_matches_the_oracle(tokens, act):
-    got, want, d = run_case(tokens, act)
+    got, _want, d = run_case(tokens, act)
     assert torch.isfinite(got).all() and got.abs().max() > 0
     # a4w4 has more rounding flips (a fp4 grid step is 4-8 % of a value): rel L2 vs its own oracle
     med = 2e-3 if act == "a4w4" else 1e-3
@@ -297,7 +348,9 @@ if __name__ == "__main__":
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--mid-flag", type=int, default=0)
     a = ap.parse_args()
-    print("S act | rel L2 vs own oracle median / max | identical | router match | max rel vs oracle a4w4 a16w4 a8w4 | mean rel vs a16w4")
+    print(
+        "S act | rel L2 vs own oracle median / max | identical | router match | max rel vs oracle a4w4 a16w4 a8w4 | mean rel vs a16w4"
+    )
     for s in [int(x) for x in a.S.split(",")]:
         for act in a.acts.split(","):
             got, want, d = run_case(s, act, seed=a.seed, mid_flag=a.mid_flag)

@@ -184,7 +184,9 @@ def test_f32_partition_outputs_merge_closer_to_the_exact_reference():
     w = torch.exp(m - m.max(0).values) * l
     exact = (w[..., None] * o).sum(0) / w.sum(0)[:, None]
     err = {f: ((outs[f] - exact).norm() / exact.norm()).item() for f in outs}
-    print(f"merged rel L2 vs the float64 reference: bf16 partitions {err[False]:.3e}, f32 {err[True]:.3e}")
+    print(
+        f"merged rel L2 vs the float64 reference: bf16 partitions {err[False]:.3e}, f32 {err[True]:.3e}"
+    )
     assert err[True] < err[False]
     assert err[True] < 3e-3
 

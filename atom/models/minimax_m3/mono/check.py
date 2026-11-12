@@ -79,7 +79,9 @@ def forward_checked(
             # the bf16 xn the kernel's router published (a16w4 builds): the original MoE module on
             # exactly that input, all-reduced, against the kernel's reduced output
             xn = mono_xn(runner, n)
-            moe_ar = tensor_model_parallel_all_reduce(layer.block_sparse_moe(xn)).view(n, HIDDEN)
+            moe_ar = tensor_model_parallel_all_reduce(layer.block_sparse_moe(xn)).view(
+                n, HIDDEN
+            )
             # the floor: the same module on the same rows one token at a time (another batch, so another
             # tile / split-K configuration of its kernels: only the accumulation order differs)
             one_ar = tensor_model_parallel_all_reduce(
@@ -129,10 +131,15 @@ def _mono_xn4(sc: torch.Tensor, n: int) -> torch.Tensor:
         codes = sc[c : c + n * HIDDEN // 32 * 8].view(torch.int32)[0::2]
     b = words.contiguous().view(torch.uint8).view(n, HIDDEN // 2)
     lut = torch.tensor(
-        [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6], device=sc.device
+        [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
+        device=sc.device,
     )
-    v = torch.stack([lut[(b & 15).long()], lut[(b >> 4).long()]], -1).view(n, HIDDEN // 32, 32)
-    scale = torch.ldexp(torch.ones_like(codes, dtype=torch.float32), codes.view(n, -1) - 127)
+    v = torch.stack([lut[(b & 15).long()], lut[(b >> 4).long()]], -1).view(
+        n, HIDDEN // 32, 32
+    )
+    scale = torch.ldexp(
+        torch.ones_like(codes, dtype=torch.float32), codes.view(n, -1) - 127
+    )
     return (v * scale[..., None]).view(n, HIDDEN).to(torch.bfloat16)
 
 
