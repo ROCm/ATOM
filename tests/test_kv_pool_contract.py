@@ -166,7 +166,12 @@ def test_neither_has_a_default(path, cls, fn, arg):
 
 # ── Who builds a draft a pool of its own ───────────────────────────────────
 #
-# Which backends build a draft a pool of its own: `selector.DRAFT_POOL_FAMILIES`.
+# Two members that have to agree: the families `DRAFT_POOL_FAMILIES` says own a
+# draft pool, and the backends that define the factory `draft_kv_builder` calls
+# for them. A family listed without a factory is the loud half (the base factory
+# raises); a factory no family reaches is the silent one -- a backend that builds
+# pools but is not in the table leaves its drafts sharing the target's rows, a real
+# layout for MLA and a wrong one here.
 
 POOL_FACTORY = "make_kv_pool"
 # The declaration, which defines the factory in order to refuse it.
@@ -186,6 +191,34 @@ def _classes_defining_the_factory() -> list[tuple[str, ast.ClassDef]]:
     ]
 
 
+def _backend_class_name(family) -> str:
+    from atom.utils.selector import get_attn_backend_cls
+
+    return get_attn_backend_cls(family, False, False).rsplit(".", 1)[-1]
+
+
+def test_the_factory_is_declared_on_the_backend_base():
+    """So a backend outside the table inherits a factory that refuses, not none."""
+    declarations = _classes_defining_the_factory()
+
+    assert FACTORY_DECLARATION in [cls.name for _, cls in declarations]
+
+
+def test_a_backend_that_can_build_a_draft_pool_is_in_the_table():
+    """The silent direction: out of the table, `draft_kv_builder` returns None and
+    the draft binds into the target's rows -- no error, no log."""
+    from atom.utils.selector import DRAFT_POOL_FAMILIES, Family
+
+    builders = {
+        cls.name
+        for _, cls in _classes_defining_the_factory()
+        if cls.name != FACTORY_DECLARATION
+    }
+    listed = {_backend_class_name(f) for f in DRAFT_POOL_FAMILIES}
+    # `get_attn_backend_cls` is asked per family with no plugin and no unified attn
+    assert builders == listed, (builders, listed, list(Family))
+
+
 def test_a_geometry_row_space_names_itself_readably():
     """`KvGeometry` is the one row space that is not a plain string, so it is
     the one that needs a `__str__`: the default repr put
@@ -194,6 +227,12 @@ def test_a_geometry_row_space_names_itself_readably():
     its error messages. Pinned by value because a shape is what a reader
     recognizes."""
     from atom.model_ops.attentions.pool_layout.pool_rows import KvGeometry
+    from atom.model_ops.minimax_m3.mxfp4_pages import Mxfp4KvLayout
 
     assert str(KvGeometry(2, 256)) == "h2d256"
     assert f"mha.{KvGeometry(8, 128)}.k.layer_0" == "mha.h8d128.k.layer_0"
+    # MiniMax-M3's MXFP4 sparse-layer pool is named by its format too
+    assert (
+        f"mha.{KvGeometry(8, 128, Mxfp4KvLayout())}.k.layer_0"
+        == "mha.h8d128fp4.k.layer_0"
+    )
