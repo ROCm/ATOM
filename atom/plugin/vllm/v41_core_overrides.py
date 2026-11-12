@@ -17,7 +17,7 @@ address on every replay.
 """
 
 import logging
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from functools import wraps
 
 import numpy as np
@@ -78,13 +78,47 @@ def _v41_publication_epoch(owner, *, resume=False):
         owner.finish()
 
 
+@contextmanager
+def _unverified_steps(cache):
+    """Begin `cache`'s steps as non-verifying while inside.
+
+    Native `_prepare_step` verifies every tentative step with requests (#3136
+    dropped its `not batch.is_dummy_run`: native capture batches are not
+    dummies). A plugin dummy batch is fabricated on private scratch with its
+    requests at position 0, which `begin_step` refuses to verify. It keeps the
+    verify write grid `tentative` selects; only its step is not a
+    verification, as before #3136.
+
+    A non-verifying step of multi-token requests is a prefill step
+    (`BatchStep.decode`), so such a dummy runs the prefill FFN, not
+    `decode_ffn` -- also as before #3136, and intended: dummy batches only
+    feed eager forwards whose output is discarded (vLLM's warmup before each
+    capture size, dummy runs before the serving pool is bound).
+    `v41_stage_step` refuses to stage inside a stream capture, and the batches
+    captures do record (`_v41_capture_batch`, `_v41_profile_capture_batch`)
+    are not dummies: they start a full window in and stay verifying, so the
+    graphs record `decode_ffn`.
+    """
+    begin_step = cache.begin_step
+
+    def begin_unverified(*args, **kwargs):
+        kwargs["tentative"] = False
+        return begin_step(*args, **kwargs)
+
+    cache.begin_step = begin_unverified
+    try:
+        yield
+    finally:
+        del cache.begin_step
+
+
 def _publish_v41_metadata(prepare):
     @wraps(prepare)
     def publish(self, *args, **kwargs):
         runner = self.model_runner
         if not hasattr(runner, "h2d_owner"):
             owner, groups = _v41_publication_owner(runner.forward_vars, self.device)
-            for name, names in self.h2d_group_members.items():
+            for name, names in self.h2d_group_members().items():
                 groups[name] = owner.group(
                     name, [runner.forward_vars[item]._publication for item in names]
                 )
@@ -184,7 +218,6 @@ class VllmDeepseekV41MetadataBuilder(DeepseekV41MetadataBuilder):
         tentative=False,
         is_prefill=False,
         start_positions=None,
-        query_prefix_ready=False,
         engram_live=True,
         cache_override=None,
     ):
@@ -193,19 +226,6 @@ class VllmDeepseekV41MetadataBuilder(DeepseekV41MetadataBuilder):
         ``cache_override`` selects private profiling capture storage without
         changing the serving binding or forcing a verify batch into prefill.
         """
-        # Once graphs bind the serving pool, an idle DP rank must publish
-        # padding into that pool's metadata. A fresh scratch cache would refill
-        # different indptr addresses while replay still reads the captured ones.
-        if self._idle(batch) and cache_override is None:
-            return self._prepare_idle(
-                batch,
-                running_bs,
-                running_tokens,
-                max_q_len=max_q_len,
-                tentative=tentative,
-                is_prefill=is_prefill,
-                query_prefix_ready=query_prefix_ready,
-            )
         spans, rows, offset, next_page = [], [], 0, 0
         slots = batch.state_slots_committed
         if not batch.is_dummy_run and len(slots) != batch.total_seqs_num:
@@ -214,8 +234,6 @@ class VllmDeepseekV41MetadataBuilder(DeepseekV41MetadataBuilder):
             zip(batch.req_ids, batch.num_scheduled_tokens, batch.context_lens)
         ):
             length, end = int(length), int(end)
-            if length == 0:
-                continue
             if batch.is_dummy_run:
                 # Warmup uses private scratch. A dummy rank may never mutate
                 # a live slot or PAGE, even when its fabricated block ID is 0.
@@ -235,15 +253,14 @@ class VllmDeepseekV41MetadataBuilder(DeepseekV41MetadataBuilder):
             offset += length
         if offset != batch.total_tokens_num or running_tokens < offset:
             raise ValueError("CSA2 batch token spans disagree with the runner")
-        # Each span's batch index: zero-token scheduler rows have none.
-        scheduled = np.flatnonzero(batch.num_scheduled_tokens)
         resumes, floors, cached_until, histories = (
             (None,) * 4
             if batch.is_dummy_run or not batch.replaying
-            else self._replay_layout(batch.replaying, scheduled, spans)
+            else self._replay_layout(batch.replaying, spans)
         )
         cache = cache_override
         if cache is None:
+            # Fabricated requests get private scratch.
             cache = (
                 self._capture_dummy_cache(
                     max(next_page, 1), max(len(spans), 1), running_tokens
@@ -253,27 +270,28 @@ class VllmDeepseekV41MetadataBuilder(DeepseekV41MetadataBuilder):
             )
         if cache is None:
             raise RuntimeError("CSA2 cache must be allocated before serving")
-        compacted = len(spans) != len(batch.req_ids)
-        return self._prepare_step(
-            batch,
-            spans,
-            rows,
-            cache,
-            running_bs,
-            running_tokens,
-            max_q_len=max_q_len,
-            tentative=tentative,
-            is_prefill=is_prefill,
-            query_prefix_ready=query_prefix_ready and not compacted,
-            query_prefix_republish_reason=(
-                "compact zero-token scheduler rows for CSA2 after input assembly"
-                if query_prefix_ready and compacted
-                else None
-            ),
-            engram_live=engram_live,
-            scheduled=scheduled,
-            replay_layout=(resumes, floors, cached_until, histories),
+        # No runner token inputs carry the query metadata here.
+        self.publish_query_metadata(
+            np.asarray(batch.num_scheduled_tokens, np.int32), running_bs, running_tokens
         )
+        with (
+            _unverified_steps(cache)
+            if tentative and batch.is_dummy_run
+            else nullcontext()
+        ):
+            return self._prepare_step(
+                batch,
+                spans,
+                rows,
+                cache,
+                running_bs,
+                running_tokens,
+                max_q_len=max_q_len,
+                tentative=tentative,
+                is_prefill=is_prefill,
+                engram_live=engram_live,
+                replay_layout=(resumes, floors, cached_until, histories),
+            )
 
 
 # ---------------------------------------------------------------------------

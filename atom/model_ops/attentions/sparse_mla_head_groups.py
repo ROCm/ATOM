@@ -16,7 +16,8 @@ GROUP_HEADS = HEADS // GROUPS
 KV_LORA_RANK = 512
 Q_DIM = KV_LORA_RANK + 64
 REGION = 2048
-MLA_WORK_NAMES = (
+# A persistent attention kernel's work plan, one set a forward.
+PERSISTENT_WORK_BUFFERS = (
     "work_meta_data",
     "work_indptr",
     "work_info_set",
@@ -89,7 +90,7 @@ class SparsePrefillHeadGroups:
         )
         self.work = {
             name: torch.empty(shape, dtype=dtype, device=device)
-            for name, (shape, dtype) in zip(MLA_WORK_NAMES, sizes)
+            for name, (shape, dtype) in zip(PERSISTENT_WORK_BUFFERS, sizes)
         }
 
     @staticmethod

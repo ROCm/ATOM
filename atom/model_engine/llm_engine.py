@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import importlib.util
 import itertools
 import logging
 import time
@@ -73,30 +72,6 @@ class LLMEngine:
         # Config validated SP before the legacy DP kwargs above landed.
         if config.sequence_parallel_size > 1 and self.data_parallel_size != 1:
             raise ValueError("Ulysses SP currently requires data_parallel_size=1")
-        # TBO's two concurrent ubatches are supported by the mori EP
-        # dispatch/combine path. The EP collective fallback instead issues
-        # full DP all-gather/reduce-scatter operations from both ubatch streams;
-        # those streams can enter the collectives in opposite order and hang.
-        # Keep the fallback usable by serializing it until it has dedicated
-        # per-ubatch communicators, analogous to the PCP/TP guard below.
-        mori_ep_enabled = (
-            getattr(config, "moe_all2all_backend", "auto") in {"auto", "mori"}
-            and not envs.ATOM_DISABLE_MORI_EP
-            and importlib.util.find_spec("mori") is not None
-        )
-        if (
-            config.enable_dp_attention
-            and config.enable_expert_parallel
-            and config.enable_tbo
-            and not mori_ep_enabled
-        ):
-            logger.warning(
-                "Disabling TBO for the DP-attention + EP collective fallback: "
-                "concurrent all-gather/reduce-scatter ubatches can deadlock. "
-                "Use mori EP or run the fallback without --enable-tbo."
-            )
-            config.enable_tbo = False
-            config.enable_tbo_decode = False
         # PCP and DP-attention together are unverified. The refusal's original
         # cause, a DP all-gather of the hash-routing input ids sized for the
         # un-split token count, is gone: the MoE now routes before its DP
@@ -114,71 +89,6 @@ class LLMEngine:
                 "now, disable one of them (use -tp N -pcp M without "
                 "DP-attention, or -dp N --enable-dp-attention without -pcp)."
             )
-        # PCP + TBO prefill: supported via coordinated splitting.
-        # PCP + TBO decode: not yet supported (pcp_all_reduce semantics under
-        # per-request ubatch split are unverified).
-        if config.prefill_context_parallel_size > 1 and config.enable_tbo:
-            # TBO overlaps compute with the attn<->MoE PCP collectives, which
-            # only exist in MoE merge mode (ATOM_PCP_MOE_MERGE=1). With
-            # ATOM_PCP_MOE_MERGE=0, MoE runs on each rank's 1/W token shard
-            # with NO extra comm between attn and MoE, so TBO has nothing
-            # to overlap and only adds ubatch-splitting overhead. Force it off.
-            if not envs.ATOM_PCP_MOE_MERGE:
-                logger.warning(
-                    "Disabling TBO because ATOM_PCP_MOE_MERGE=0: in this "
-                    "situation it runs MoE on each rank's 1/W token shard with "
-                    "no extra attn<->MoE communication, so TBO has nothing to "
-                    "overlap and only adds overhead."
-                )
-                config.enable_tbo = False
-                config.enable_tbo_decode = False
-            elif config.tensor_parallel_size > 1:
-                # Cross-communicator (PCP x TP) RCCL deadlock:
-                # under TBO the PCP collectives (comm_stream) run concurrently
-                # and UNORDERED with the TP-group all_reduces (compute_stream,
-                # from attention wo_b / MoE RowParallelLinear). On the TPxPCP
-                # rank grid with large collectives this forms a cross-rank
-                # circular wait -> hang (reproduced MI355 TP4PCP2/TP2PCP4 merge
-                # +TBO, 64k/c32). Serialized (non-TBO single stream) is fine, and
-                # TP=1 has no TP communicator so it cannot form the cycle. Only
-                # TP=1 + PCP keeps TBO; TP>1 falls back to non-TBO.
-                logger.warning(
-                    "Disabling TBO: prefill_context_parallel_size > 1 (-pcp) "
-                    "with tensor_parallel_size > 1 (-tp) hangs under TBO due to "
-                    "a PCP<->TP cross-communicator RCCL deadlock (concurrent "
-                    "unordered collectives on comm/compute streams; see "
-                    "PCP_TBO.md 14.4). TBO with PCP is only supported at -tp 1 "
-                    "(e.g. -tp 1 -pcp 8)."
-                )
-                config.enable_tbo = False
-                config.enable_tbo_decode = False
-            elif config.enable_tbo_decode:
-                raise ValueError(
-                    "prefill_context_parallel_size > 1 (-pcp) combined with "
-                    "--enable-tbo all (decode TBO) is not supported yet. "
-                    "Use --enable-tbo (prefill only) with -pcp."
-                )
-            # Under PCP, TBO prefill uses a request-boundary split (the
-            # non-default TBO split mode; never token-midpoint split), so
-            # ATOM_TBO_PREFILL_TOKEN_SPLIT is ignored.
-            if config.enable_tbo and envs.ATOM_TBO_PREFILL_TOKEN_SPLIT:
-                logger.warning(
-                    "ATOM_TBO_PREFILL_TOKEN_SPLIT is ignored under PCP: TBO "
-                    "prefill uses request-boundary balanced grouping."
-                )
-            # TBO stripes positions per request group, the draft prefill split
-            # the batch as one sequence: their shards disagree. Keyed on config,
-            # so runs that would never reach TBO are refused too.
-            if config.enable_tbo and config.speculative_config is not None:
-                raise ValueError(
-                    "prefill_context_parallel_size > 1 (-pcp) with speculative "
-                    "decoding is not supported under TBO: TBO's PCP prefill "
-                    "splits per request group, which the draft model's global "
-                    "round-robin query split does not match. Drop --enable-tbo, "
-                    "or run without a draft model. Note -tp > 1 already "
-                    "disables TBO under PCP (see above), so this only affects "
-                    "-tp 1 (e.g. -tp 1 -pcp 8)."
-                )
         self.io_processor = InputOutputProcessor(
             config, self.tokenizer, config.kv_cache_block_size
         )

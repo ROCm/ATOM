@@ -49,6 +49,7 @@ def make_mgr(n_ranks=4, depth=3, fail_ranks=None):
     mgr._rank_routed_total = [0] * n_ranks
     mgr._dp_route_counters = {"explicit_total": 0, "load_balanced_total": 0}
     mgr._seq_load = {}
+    mgr._prefix_router = None
     mgr._lb_lock = Lock()
     mgr._input_send_lock = Lock()
     mgr._bp_depth = depth
@@ -102,7 +103,7 @@ def test_refill_feeds_fast_rank_more():
     def finish_one_on_rank(rank):
         # pick a charged seq currently on `rank`
         sid = next(s for s, (r, _, _) in mgr._seq_load.items() if r == rank)
-        mgr._release_seq_load(sid)
+        mgr._release_seq(sid)
         if mgr._bp_depth > 0 and mgr._bp_pending:
             mgr._bp_dispatch_or_refill(raise_on_error=False)
         return sid
@@ -165,7 +166,7 @@ def test_drains_everything():
     guard = 0
     while mgr._seq_load:
         sid = next(iter(mgr._seq_load))
-        mgr._release_seq_load(sid)
+        mgr._release_seq(sid)
         if mgr._bp_pending:
             mgr._bp_dispatch_or_refill(raise_on_error=False)
         guard += 1
@@ -228,7 +229,7 @@ def test_refill_send_failure_requeues_and_fails_a_stalled_run():
     assert sum(mgr._rank_reqs) == 2
     mgr.fail_ranks.update({0, 1})
     for sid in list(mgr._seq_load):
-        mgr._release_seq_load(sid)
+        mgr._release_seq(sid)
     mgr._bp_dispatch_or_refill(raise_on_error=False)
     assert mgr._rank_reqs == [0, 0]
     sent, pending = _accounted(mgr)
@@ -261,7 +262,7 @@ def test_abort_pending_seq_is_not_dispatched():
     while mgr._seq_load or mgr._bp_pending:
         if mgr._seq_load:
             sid = next(iter(mgr._seq_load))
-            mgr._release_seq_load(sid)
+            mgr._release_seq(sid)
         if mgr._bp_pending:
             mgr._bp_dispatch_or_refill(raise_on_error=False)
         guard += 1
@@ -294,7 +295,7 @@ def test_concurrent_add_and_refill_dispatches_once():
                         return
                     time.sleep(0.001)
                     continue
-                mgr._release_seq_load(sid)
+                mgr._release_seq(sid)
                 mgr._bp_dispatch_or_refill(raise_on_error=False)
             raise AssertionError("timed out draining concurrent backpressure")
         except Exception as exc:  # noqa: BLE001 - surfaced to the test thread
@@ -329,7 +330,7 @@ def test_a_stalled_run_ends_pending_seqs_that_wait_on_a_callback():
     mgr.add_request(seqs)
     mgr.fail_ranks.update({0, 1})
     for sid in list(mgr._seq_load):
-        mgr._release_seq_load(sid)
+        mgr._release_seq(sid)
     mgr._bp_dispatch_or_refill(raise_on_error=False)
     assert delivered == {seqs[-1].id: "aborted"}
     assert all(seq.id != seqs[-1].id for seq in mgr._bp_pending)
