@@ -687,6 +687,7 @@ class Scheduler:
     # A preempted sequence recomputes its prompt here, which a KV change relies
     # on to keep what was running (see `preempt_running`).
     can_recompute_prompts = True
+    pd_admission: PdAdmissionController | None = None
 
     def __init__(
         self,
@@ -1786,7 +1787,7 @@ class Scheduler:
 
         self.deferred_free_blocks.pop(seq.id, None)
         self.block_manager.deallocate(seq)
-        if getattr(self, "pd_admission", None) is not None:
+        if self.pd_admission is not None:
             self.pd_admission.release(seq)
         # After the free, not before: the connector may only forget the state
         # keyed on these blocks once nothing can read them again.
@@ -2073,7 +2074,7 @@ class Scheduler:
         quiet, which is indistinguishable from an idle engine.
         """
         result = self._schedule()
-        if getattr(self, "pd_admission", None) is not None and result is not None:
+        if self.pd_admission is not None and result is not None:
             batch, seqs = result
             if not batch.is_dummy_run:
                 self.pd_admission.scheduled(seqs.values())
@@ -2521,7 +2522,7 @@ class Scheduler:
             # Before `record_allocation`, which commits the probe's joint
             # boundary: a request deferred here must leave nothing committed.
             pd_offset = None
-            if getattr(self, "pd_admission", None) is not None and needs_remote_load:
+            if self.pd_admission is not None and needs_remote_load:
                 num_blocks = self.block_manager.num_pool_blocks(len(seq))
                 pd_offset = self.kv_connector.pd_receive_block_offset(
                     seq, num_blocks, num_cached_blocks
@@ -3168,7 +3169,7 @@ class Scheduler:
 
         A preempted request may already have run before this rejection.
         """
-        if getattr(self, "pd_admission", None) is not None:
+        if self.pd_admission is not None:
             self.pd_admission.cancel(seq)
         self._inflight_prefix_wait.pop(seq.id, None)
         self._lookup_detach_declined.discard(seq.id)
@@ -3250,7 +3251,7 @@ class Scheduler:
         if hasattr(seq, "_awaiting_aborted_load_cleanup"):
             delattr(seq, "_awaiting_aborted_load_cleanup")
         self._uncount_inflight_load(seq)
-        if getattr(self, "pd_admission", None) is not None:
+        if self.pd_admission is not None:
             self.pd_admission.release(seq)
         # This rejection does not go through forward postprocess, so finish
         # the connector lifecycle here, including requests that ran before
@@ -4188,7 +4189,7 @@ class Scheduler:
         self.block_manager.deallocate(seq)
         pos = self._behind_settled_resumes()
         self.waiting.insert(pos, seq)
-        if getattr(self, "pd_admission", None) is not None:
+        if self.pd_admission is not None:
             # A ready request preempted before its first batch has discarded
             # its received KV; its subsequent replay is no longer a PD load.
             self.pd_admission.release(seq)
@@ -4912,7 +4913,7 @@ class Scheduler:
                     self.block_manager.deallocate(seq)
             else:
                 self.block_manager.deallocate(seq)
-            if getattr(self, "pd_admission", None) is not None:
+            if self.pd_admission is not None:
                 # A request aborted after promotion but before its first batch
                 # never reaches `scheduled`, which would otherwise return this.
                 self.pd_admission.release(seq)
@@ -5227,7 +5228,7 @@ class Scheduler:
             logger.debug("Finished recving KV transfer for request %s", req_id)
             if self._finish_aborted_load_cleanup(req_id):
                 continue
-            if getattr(self, "pd_admission", None) is not None:
+            if self.pd_admission is not None:
                 self.pd_admission.received(req_id)
             if metrics := getattr(self, "metrics", None):
                 metrics.finish_kv_wait(req_id, succeeded=True)

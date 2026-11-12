@@ -559,7 +559,7 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         # arm another load into the same destination table.
         return (
             bool(self._connectors)
-            and getattr(self._connectors[0], "supports_pd_admission", False)
+            and self._connectors[0].supports_pd_admission
             and all(getattr(c, "is_offload", False) for c in self._connectors[1:])
         )
 
@@ -567,8 +567,7 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         winner = self._load_winner.get(seq.id)
         if winner is None:
             return None
-        estimate = getattr(winner, "pd_receive_block_offset", None)
-        return estimate(seq, num_blocks, num_cached_blocks) if estimate else None
+        return winner.pd_receive_block_offset(seq, num_blocks, num_cached_blocks)
 
     def cancel_pending_load(self, seq: Any) -> None:
         """Forward a load cancellation to every sub that arms loads.

@@ -514,8 +514,9 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
     def supports_pd_admission(self) -> bool:
         return not self.is_producer
 
-    def _receive_prefix(self, seq, num_cached_blocks: int) -> tuple[int, int]:
-        geometry = self._remote_page_geometry(seq.kv_transfer_params or {})
+    def _receive_prefix(
+        self, seq, num_cached_blocks: int, geometry: tuple[int, int] | None
+    ) -> tuple[int, int]:
         if geometry is None or seq.has_per_req_cache:
             return 0, 1
         return num_cached_blocks, self.dcp_size // geometry[1]
@@ -528,7 +529,9 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             # Lifting this also needs `Scheduler` to re-measure the receive
             # after `allocate` instead of charging the pre-allocation probe.
             raise ValueError("PD admission supports paged KV receives only")
-        cached, factor = self._receive_prefix(seq, num_cached_blocks)
+        cached, factor = self._receive_prefix(
+            seq, num_cached_blocks, self._remote_page_geometry(params)
+        )
         # Chunked P has not allocated its source table when D reserves the
         # full prompt destination. Match worker dispatch: a missing source
         # table does not invalidate a compatible local prefix in this mode.
@@ -679,10 +682,10 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             # PD incremental: skip leading blocks already in the decode node's
             # prefix cache. Per-request state (including the SWA ring slot) is
             # not covered by a block-only delta, so it takes a full transfer.
-            num_computed_blocks, src_block_skip_factor = self._receive_prefix(
-                seq, seq.num_cached_tokens // self.hash_block_size
-            )
             remote_geometry = self._remote_page_geometry(params)
+            num_computed_blocks, src_block_skip_factor = self._receive_prefix(
+                seq, seq.num_cached_tokens // self.hash_block_size, remote_geometry
+            )
             if remote_geometry is None:
                 logger.warning(
                     "PD incremental transfer disabled for req %s: producer "

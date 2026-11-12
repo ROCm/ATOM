@@ -1441,7 +1441,6 @@ def test_opposite_admission_order_progresses_without_recompute(
             assert d.pd_admission.pending_bytes == 12
             if ds is db:
                 assert not da.block_table
-                assert d.pd_admission.deferred["bytes"] == 1
         dw.start_load_kv(batch.connector_meta_output)
         # Reserving D's pages alone cannot admit P: the write request still
         # waits in D's queue until prior GPU writes to those pages finish.
@@ -1467,7 +1466,7 @@ def test_opposite_admission_order_progresses_without_recompute(
                     # Bytes are credited for the full destination, not each
                     # completed chunk. P's final sampling still lies ahead.
                     assert d.pd_admission.pending_bytes == 12
-                    assert d.pd_admission.pending[str(ds.id)].ready_at is None
+                    assert not d.pd_admission.pending[str(ds.id)].ready
                 p.postprocess(
                     list(seqs.values()),
                     ScheduledBatchOutput([ps.id], [(42,)], None, None, None),
@@ -1483,7 +1482,7 @@ def test_opposite_admission_order_progresses_without_recompute(
         d._update_from_kv_xfer_finished(dw.get_finished())
         if byte_limit:
             assert d.pd_admission.pending_bytes == 12
-            assert d.pd_admission.pending[str(ds.id)].ready_at is not None
+            assert d.pd_admission.pending[str(ds.id)].ready
         batch, seqs = d.schedule()
         if byte_limit:
             assert not d.pd_admission.pending

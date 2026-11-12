@@ -35,7 +35,7 @@ def build(monkeypatch, mooncake_module, seq_factory):
     ):
         config = MockConfig(
             num_kvcache_blocks=64,
-            pd_admission_block_bytes=1024,
+            pool_entry_bytes={"kv": 1024},
             tensor_parallel_size=4,
             pipeline_parallel_size=1,
             parallel_config=SimpleNamespace(
@@ -118,7 +118,7 @@ def test_ready_credit_held_until_first_batch(build, chunked):
 
     sched._update_from_kv_xfer_finished(receive_success(a, as_str=True))
     assert len(sched.pd_admission.pending) == 1
-    assert sched.pd_admission.pending[str(a.id)].ready_at is not None
+    assert sched.pd_admission.pending[str(a.id)].ready
     batch, _ = sched.schedule()
     assert a.id in batch.req_ids
     assert not b.block_table  # A held its credit during this admission pass.
@@ -140,15 +140,13 @@ def test_bytes_limit_and_isolated_large_request(build, chunked):
     sched.schedule()
     assert a.block_table and not b.block_table
     sched.schedule()
-    # B waited two passes; it is one deferred request, not two attempts.
-    assert sched.pd_admission.deferred["bytes"] == 1
+    assert not b.block_table
     sched._update_from_kv_xfer_finished(receive_success(a))
     sched.schedule()
     sched.schedule()
+    # Alone, B is admitted past the 3072-byte limit.
     assert b.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
     assert sched.pd_admission.pending_bytes == 4096
-    assert sched.pd_admission.oversized_admissions == 1
-    assert sched.pd_admission.deferred["bytes"] == 1
 
 
 @pytest.mark.parametrize("fraction", [None, 0.25])
@@ -314,7 +312,7 @@ def test_multi_pd_ready_resume_releases_only_on_batch(build, monkeypatch, chunke
     assert set(batch.connector_meta_output.metas[0].reqs_to_recv) == {a.id}
     assert not b.block_table
     sched._update_from_kv_xfer_finished(receive_success(a))
-    assert sched.pd_admission.pending[str(a.id)].ready_at is not None
+    assert sched.pd_admission.pending[str(a.id)].ready
     batch, _ = sched.schedule()
     assert a.id in batch.req_ids  # The existing Multi suffix-resume path runs.
     assert a.block_table
@@ -362,7 +360,7 @@ def test_chunked_charge_matches_dispatched_targets_without_source_ids(
 
     # The consumer flag is intentionally off: the router's per-request mode
     # controls the transfer, including on a D service receiving both modes.
-    sched, request = build(prefix=True, pd_admission_block_bytes=4)
+    sched, request = build(prefix=True, pool_entry_bytes={"kv": 4})
     seed = seq_factory(list(range(8)))
     bm = sched.block_manager
     bm.allocate(seed, bm.can_allocate(seed))
@@ -431,7 +429,7 @@ def test_chunked_pp4_tp4_credits_wait_for_terminal_handoff(build, monkeypatch, o
             )
             if not last:
                 assert sched.pd_admission.pending_bytes == 3072
-                assert sched.pd_admission.pending[str(a.id)].ready_at is None
+                assert not sched.pd_admission.pending[str(a.id)].ready
                 assert "first_token_id" not in a.kv_transfer_params
                 _, scheduled = sched.schedule()
                 assert not scheduled and not b.block_table
@@ -439,7 +437,7 @@ def test_chunked_pp4_tp4_credits_wait_for_terminal_handoff(build, monkeypatch, o
     if outcome == "success":
         assert a.kv_transfer_params["first_token_id"] == 42
         assert a.kv_transfer_params["draft_token_ids"] == [43]
-        assert sched.pd_admission.pending[str(a.id)].ready_at is not None
+        assert sched.pd_admission.pending[str(a.id)].ready
         assert sched.pd_admission.pending_bytes == 3072
         _, scheduled = sched.schedule()
         assert list(scheduled) == [a.id]
@@ -460,6 +458,9 @@ def test_multiconnector_uses_load_winner(build):
     store = SimpleNamespace(
         is_offload=True,
         is_producer=False,
+        # The `KVConnectorSchedulerBase` defaults every offload scheduler has.
+        supports_pd_admission=False,
+        pd_receive_block_offset=lambda *args: None,
         get_num_new_matched_tokens=lambda seq: (8, True),
         cancel_pending_load=lambda seq: None,
     )
@@ -502,7 +503,8 @@ def test_invalid_config_rejected(build, options):
 @pytest.mark.parametrize(
     "override",
     [
-        {"pd_admission_block_bytes": 0},
+        {"pool_entry_bytes": {}},
+        {"pool_entry_bytes": {"kv": 1024, "state": 64}},
         {"pipeline_parallel_size": 2},
         {"decode_context_parallel_size": 2},
         {"prefill_context_parallel_size": 2},
