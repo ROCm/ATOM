@@ -47,6 +47,7 @@ def _batch(seqs, mask=None):
         logprob_requested=requested,
         logprob_rows=rows,
         required_channel=None,
+        num_spec_step=0,
     )
 
 
@@ -315,6 +316,7 @@ def test_prefill_really_does_run_wider_than_it_scheduled():
     """The premise, from the decider itself -- not a number invented here."""
     mode = mod.ForwardMode.decide(
         batch=types.SimpleNamespace(
+            has_prefill=True,
             total_tokens_num_prefill=9,
             total_tokens_num=9,
             total_seqs_num=3,

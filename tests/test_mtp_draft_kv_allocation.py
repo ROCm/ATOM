@@ -2,7 +2,7 @@
 """Every KV position an MTP step writes is allocated before its forward.
 
 A forward writes the target's tokens and then the draft round's. With
-`k = num_speculative_tokens`, `EagleProposer.propose` runs `k - 1` draft
+`k = num_speculative_tokens`, `EagleProposer._propose` runs `k - 1` draft
 mid-steps after step 0, each bumping `context_lens` and writing one token at
 `context_lens - 1`; the builders' slot for it is
 `block_tables[row, pos // B] * B + pos % B`. So a forward whose target context
@@ -35,13 +35,13 @@ from atom.model_engine.sequence import Sequence
 from atom.sampling_params import SamplingParams
 
 
-def spec(k):
-    return SimpleNamespace(num_speculative_tokens=k, use_dspark=lambda: False)
+def spec(k, dspark=False):
+    return SimpleNamespace(num_speculative_tokens=k, use_dspark=lambda: dspark)
 
 
-def make_scheduler(k, block, **overrides):
+def make_scheduler(k, block, dspark=False, **overrides):
     cfg = {
-        "speculative_config": spec(k),
+        "speculative_config": spec(k, dspark),
         "kv_cache_block_size": block,
         "num_kvcache_blocks": 256,
         "max_model_len": 8192,
@@ -62,13 +62,15 @@ def output(seq, tokens, rejected, k):
     )
 
 
-def run(prompt_len, k, block, accepts):
+def run(prompt_len, k, block, accepts, dspark=False):
     """Prefill then one decode per entry of `accepts` (tokens emitted, 1..k+1).
 
     Returns, per forward, the KV positions the runner writes and the number of
-    blocks in the row's table when it does.
+    blocks in the row's table when it does. A serial drafter writes
+    `[C, C + k - 1)`; DSpark's block pass writes `anchor + 1 .. anchor + k`
+    with `anchor = C - 1`, i.e. `[C, C + k)`.
     """
-    sched = make_scheduler(k, block)
+    sched = make_scheduler(k, block, dspark)
     seq = Sequence(
         list(range(10, 10 + prompt_len)),
         block,
@@ -88,7 +90,7 @@ def run(prompt_len, k, block, accepts):
         else:
             end = ctx - r_prev
             target = range(end - k - 1, end)
-        draft = range(end, end + k - 1)
+        draft = range(end, end + k) if dspark else range(end, end + k - 1)
         steps.append(
             SimpleNamespace(
                 prefill=bool(batch.total_seqs_num_prefill),
@@ -132,6 +134,15 @@ def test_lookahead_is_the_draft_mid_steps(k, lookahead):
     assert draft_kv_lookahead(k) == lookahead
 
 
+@pytest.mark.parametrize("k", [1, 4, 7])
+def test_a_block_drafter_reaches_one_position_further(k):
+    """DSpark writes `anchor + 1 .. anchor + k` with `anchor <= C - 1`, i.e.
+    through `C + k - 1`: `k` positions past `len(seq)`, not the serial `k - 1`.
+    The missing one lands in physical block 0 on a fully accepted step."""
+    assert draft_kv_lookahead(k, block_drafter=True) == k
+    assert draft_kv_lookahead(k, block_drafter=True) == draft_kv_lookahead(k) + 1
+
+
 # ── The real scheduler path ─────────────────────────────────────────────────
 
 PATTERNS = {
@@ -160,6 +171,23 @@ def test_every_write_of_every_forward_is_allocated(block, k, pattern):
     if k > 1:
         # The draft round really did cross into a block past the target's.
         assert crossings > 0
+
+
+@pytest.mark.parametrize("block", [16, 64, 128])
+@pytest.mark.parametrize("k", [1, 4, 7])
+@pytest.mark.parametrize("pattern", sorted(PATTERNS))
+def test_every_dspark_block_write_is_allocated(block, k, pattern):
+    """Same sweep for DSpark, whose block reaches one position further than a
+    serial round. With the serial `k - 1` lookahead, a fully accepted step
+    whose last block position starts a new block wrote physical block 0."""
+    for prompt_len in range(1, 2 * block + 1):
+        for i, step in enumerate(
+            run(prompt_len, k, block, PATTERNS[pattern](k), dspark=True)
+        ):
+            assert not unallocated(step, block), (
+                f"prompt {prompt_len}, forward {i}: {step} writes "
+                f"{unallocated(step, block)} past {step.blocks} blocks"
+            )
 
 
 @pytest.mark.parametrize("k", [2, 3, 5])

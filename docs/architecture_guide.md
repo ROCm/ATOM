@@ -65,7 +65,7 @@ A request flows through the system in ten steps:
 
 2. **`InputOutputProcessor.preprocess()`** — each prompt is tokenized via the HuggingFace tokenizer. A `Sequence` object is created to track the request's state, timing, and block allocation. `arrive_time` is recorded.
 
-3. **`CoreManager.add_request()`** — the list of `Sequence` objects is serialized with `pickle` and sent over a ZMQ `ROUTER` socket. When multiple DP ranks are active, requests are routed by a configurable load-balancing strategy (`least_requests` by default; `round_robin` and `least_tokens` also available).
+3. **`CoreManager.add_request()`** — the list of `Sequence` objects is serialized with `pickle` and sent over a ZMQ `ROUTER` socket. When multiple DP ranks are active, requests are routed by a configurable load-balancing strategy (`least_requests` by default; `round_robin`, `least_tokens` and `prefix_spread` also available).
 
 4. **`EngineCore.process_input_sockets()`** — an I/O thread on the `EngineCore` process receives the serialized data on a ZMQ `DEALER` socket, deserializes it, and places the sequences into the `input_queue`.
 
@@ -111,6 +111,59 @@ ATOM uses a module-level global `ForwardContext` to pass metadata through CUDA g
 | `set_kv_cache_data(kv_cache_data)` | Register KV cache tensors at initialization |
 
 This pattern enables stateless dispatch: attention backends and model operators call `get_forward_context()` to access metadata without requiring it as a function parameter, which is critical for CUDA graph compatibility.
+
+## Model hooks (head output, deferred status, decode round)
+
+Two switches of `ModelRunner` let a model take over part of a step; neither
+is specific to one model, and a model that uses neither runs exactly as before.
+
+- **The in-graph head output.** A model may give its own head output,
+  `compute_head(hidden_states)`, resolved once at install (`ModelRunner.compute_head`):
+  the forward's logits, or a speculative verify's output token ids
+  `[requests, num_spec_steps + 1]` and verdict `[3, requests]` (accepted,
+  rejected, anchor row: the rejection sampler's layout), computed inside its
+  forward; None leaves the head to the logits. `ModelRunner._head_output` takes
+  it after an eager forward and records it at the tail of a decode graph's
+  capture, as `logits_in_graph` records the logits at TP 1, so a replay returns
+  it. `ModelRunner._step_head` keeps a verify's ids and verdict only where they
+  stand for the step (`_head_ids_serve`: nothing reads the logits but each
+  row's pick -- no logprobs, structured output or required channel, exact or
+  forced acceptance -- every request verifies the full draft span, and the rows
+  are all greedy or all sampled from temperature and top-p alone), else it
+  computes the logits; `postprocess` then branches once, on whether the head
+  output carries ids. As on every other step, the output ids are broadcast over
+  TP and each request's next id (the next forward's ids, the drafter's anchor)
+  is gathered from the broadcast ids. ATOM's own greedy argmax and rejection
+  verdict could move into the graph the same way.
+- **The deferrable status wait.** An attention builder may say a step consumes
+  the previous verify's verdict on the device rather than its host-side status
+  (`AttentionMetadataBuilder.consumes_device_verdict`, asked once a step in
+  `prepare_model`): `tokenIDProcessor.prepare_input_ids` then builds the step
+  from zero rejected / bonus counts and the runner takes the status
+  (`take_deferred_spec_status`) right after the target's launch, where
+  `postprocess` needs it.
+
+DeepSeek-V4.1's metadata builder also takes a model's decode round
+(`atom/model_engine/model_hooks.py`, `DecodeRound`, handed over by the model's
+install: `DeepseekV41MetadataBuilder.use_decode_round`) and asks it at its own
+points of a step: `consumes_device_verdict` (its answer to the runner),
+`service` before the layout, `laid_out` after it and `committed` before the
+speculative commit (at the anchors the runner commits). `DecodeRound.service`
+is the step's one routing decision, `AttentionMetaData.served_by_round`
+(`RoundService`): `NONE`, or `FORWARD` (the model's own forward runs every
+layer, looks its Engram rows up itself and writes the DSpark draft's context
+KV), `LEAN` (laid out without the compress plans and step planners nothing it
+runs reads) and `DEVICE` (positions advanced on the device from the previous
+verdict). The builder decides it once before the step's layout; the builder,
+its cache, Engram staging (`EngramStep.served_by_round`), the DSpark proposer
+and the model's forward all read it, so they agree on every step.
+
+DeepSeek-V4.1's high-interactivity monokernels (`atom/models/deepseek_v41/mono/hi_*.py`,
+`round/`, the FlyDSL runtime in `hi/`; `ATOM_DSV41_MONO_HI`, on by default where
+`hi_gate` says they serve) use all three: `hi_dispatch` wraps the model
+(`HiDecodeModel`, whose `compute_head` is the in-graph verify head and
+post-verify, `round/post_verify.py`), and `round.HiRound` is its decode round
+(the device round, `round/device_round.py`, consumes the device verdict).
 
 ## Multi-process architecture
 
@@ -167,7 +220,7 @@ ATOM uses a multi-process design with ZMQ sockets for inter-process communicatio
 
 **Data-parallel variant** (`DPEngineCoreProc`):
 
-When `data_parallel_size > 1`, each EngineCore process is a `DPEngineCoreProc` that synchronizes with other DP ranks via `torch.distributed.all_reduce` on a Gloo process group. The `busy_loop()` override ensures all DP ranks stay in lockstep: if one rank has a prefill batch while another does not, the idle rank executes a dummy prefill (`dummy_prefill_execution()`) to keep NCCL collectives synchronized.
+When `data_parallel_size > 1`, each EngineCore process is a `DPEngineCoreProc` that synchronizes with other DP ranks via `torch.distributed.all_reduce` on a Gloo process group. The `busy_loop()` override ensures all DP ranks stay in lockstep: a rank with no request runs a step with none (`dummy_execution()`) in the group's phase, to keep NCCL collectives synchronized.
 
 ### Collective worker RPC
 
@@ -287,7 +340,7 @@ The `embed_tokens` layer is always shared when shapes match and pipeline paralle
 
 ### Propose loop: metadata is the backend's, not the proposer's
 
-The `propose()` method iterates `mtp_k` draft steps. Every step calls
+`EagleProposer._propose()` (the flavor body `Drafter.propose` calls) iterates `mtp_k` draft steps. Every step calls
 `runner.attn_metadata_builder.prepare_mtp_decode()` and merges the dict it
 returns into `attn_metadata`, so *which* fields a step updates — `kv_indptr`
 and `kv_indices` for MLA, `block_tables` and `context_lens` for MHA — is the
@@ -298,7 +351,7 @@ rejected speculative tokens are taken back out.
 One thing does branch, on a builder capability rather than a model family:
 `fuse_mtp_decode_position_update`. Where a builder sets it, the per-step
 position bump and the `context_lens` increment ride into its kernel through
-`update_context_lens` / `positions_out`; where it does not, `propose()` does
+`update_context_lens` / `positions_out`; where it does not, `_propose()` does
 both itself before the call.
 
 ### `prepare_mtp_decode()`
@@ -316,6 +369,11 @@ Each attention backend provides its own `prepare_mtp_decode()` implementation:
 | `atom/model_engine/engine_core.py` | `EngineCore` main execution loop, `DPEngineCoreProc` data-parallel variant, `EngineCoreRequestType` message protocol |
 | `atom/model_engine/engine_core_mgr.py` | `CoreManager` ZMQ orchestration, process launching, load-balanced DP dispatch |
 | `atom/model_engine/model_runner.py` | `ModelRunner` per-GPU execution (model loading, CUDA graph capture, forward pass), `tokenIDProcessor` deferred output handling |
+| `atom/model_engine/model_hooks.py` | `DecodeRound`, the decode round a model's install may give DeepSeek-V4.1's metadata builder |
+| `atom/model_engine/dp_routing/prefix_spread.py` | `PrefixSpreadRouter`: the `--dp-load-balance prefix_spread` prefix index and placement rule `CoreManager` calls under its load-balancing lock |
+| `atom/model_engine/dp_routing/policies.py` | Stateless, session-affinity and prefix-spread placement policies with common request lifecycle hooks |
+| `atom/model_engine/dp_routing/route.py` | Placement rank, prefix credit, moved tokens and routing counter/label names |
+| `atom/model_engine/dp_routing/topology.py` | Effective prefix-routing topology used by the manager and MP deployment checks |
 | `atom/model_engine/scheduler.py` | `Scheduler` prefill-first scheduling, `ScheduledBatch` batch descriptor, `ScheduledBatchOutput` forward results |
 | `atom/model_engine/engine_stats.py` | `EngineStats` — MTP acceptance, prefix-cache hits, and the periodic engine-status line, each on its own cadence |
 | `atom/model_engine/sequence.py` | `Sequence` request state, `SequenceStatus` and `SequenceType` enums |
