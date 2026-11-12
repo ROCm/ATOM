@@ -8,8 +8,8 @@ at a row count runs with where a measurement on MI355X at TP4 decided it (``rows
 the build). A knob still ``"auto"`` after that takes its value in ``AUTO``; the few rules that depend on the build
 itself (the chain's exchange, the TP degree, the merge's cache copies) are the recipe's (``recipe`` module docstring,
 "Knobs"). An index source at a context bucket from ``IDX_LONG`` on takes its kind's ``LONG`` (and ``LONG_ROWS``) on
-top. At TP2 ``TP_SCHEDULES[2]`` goes over the (kind, rows) entry (``knobs(tp=)``: the TP2 builds' measurements). A
-build's own ``knobs`` dict goes over all of it (``knobs(over=)``).
+top. At TP2 or TP8 ``TP_SCHEDULES[tp]`` goes over the (kind, rows) entry (``knobs(tp=)``: that TP's builds'
+measurements). A build's own ``knobs`` dict goes over all of it (``knobs(over=)``).
 
 Kinds are the model's layer kinds (``kind_of``): ``window`` (layer 0), ``window+engram`` (layer 1),
 ``ratio2_kv_source`` (2, 8), ``ratio2_kv_source+engram`` (14), ``ratio1_kv_source`` (20), ``ratio1_index_source``
@@ -406,7 +406,7 @@ _put((WINDOW, ENGRAM) + split((WINDOW, ENGRAM)), BAND_ROWS, SPILL_OK=True)
 
 # TP -> (kind, rows) -> knobs over the (kind, rows) entry at a TP degree other than ``KEY_TP`` (``knobs(tp=)``; exact
 # keys: an Engram kind takes only its own)
-TP_SCHEDULES: dict[int, dict] = {2: {}}
+TP_SCHEDULES: dict[int, dict] = {2: {}, 8: {}}
 
 
 def _put_tp(tp: int, kinds, rows, **knobs) -> None:
@@ -430,6 +430,21 @@ _put_tp(2, [WINDOW, IDX1], [6], MOE_UG_G=12)
 # band (48 rows) spills 2 with the merge's LDS transpose reads: without them
 _put_tp(2, [WINDOW], [30], MOE_UG_G=12)
 _put_tp(2, [IDX1], [48], SPARSE_VTR=False)
+# TP8 (compile-only builds of the served set): the window kinds spill 2-15 SGPRs into VGPR lanes at every width (none
+# to memory; as the batched widths at TP4), and at 18 rows the 288-wide expert slices in the routed ug's 8-group parts
+# spill a VGPR to memory on every consumer and source: 4-group parts there (183-191 VGPRs)
+_put_tp(8, (WINDOW, ENGRAM) + split((WINDOW, ENGRAM)), ROWS, SPILL_OK=True)
+_put_tp(8, ONE, [18], MOE_UG_G=4)
+# ... and the ratio-2 KV + index sources at 18 rows spill a VGPR with 4 Compressor tiles: 2 (193 VGPRs; as at TP4's
+# 24 rows)
+_put_tp(8, KV_INDEX2, [18], COMP_TILES=2)
+# the ratio-2 consumers at 6 rows: the routed MoE in 4-group ug / 16-group down tasks (the 288-wide slices' 8-group
+# parts left the ug at 12.4-13.1 us for half TP4's bytes), layer 3 54.04 -> 52.93 us chained (0.9789), bitwise
+_put_tp(8, [C2], [6], MOE_UG_G=4, MOE_DOWN_G=16)
+# ... and so do the window kind and the ratio-1 KV source (layer 0 59.13 -> 57.99 us, 0.981; layer 20 65.96 -> 64.65,
+# 0.980) and, the ug alone, the ratio-1 index sources (layer 24 62.54 -> 60.21, 0.963), chained, bitwise
+_put_tp(8, [WINDOW, KV1], [6], MOE_UG_G=4, MOE_DOWN_G=16)
+_put_tp(8, [IDX1], [6], MOE_UG_G=4)
 
 # knobs a chain's launches must agree on (one reads the partials the previous one pushed, in their format): a step's,
 # by its rows (``recipe.rs_pack``), never in a (kind, rows) entry (``knobs`` refuses one)
