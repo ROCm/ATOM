@@ -1038,6 +1038,13 @@ class ModelRunner:
         self._init_forward_vars_ring()
         self._init_h2d_publication()
         self.forward_done_event = torch.cuda.Event()
+        # ATOM_DSPARK_PROB_DRAFT=1: the bonus-token draw runs on this stream,
+        # overlapping probabilistic verification, which waits on the event
+        # (`_sample_bonus`).
+        self._bonus_stream = self._bonus_ready = None
+        if envs.ATOM_DSPARK_PROB_DRAFT:
+            self._bonus_stream = torch.cuda.Stream()
+            self._bonus_ready = torch.cuda.Event()
         initialize_eplb_runtime(self)
         self._maybe_warmup()
 
@@ -3675,83 +3682,26 @@ class ModelRunner:
                 )
                 if target_token_ids.numel() and get_tp_group().world_size > 1:
                     target_token_ids = get_tp_group().broadcast(target_token_ids, src=0)
-            bonus_ready = None
-            if prob_src is not None and bonus_logits.is_cuda:
-                # The bonus draw does not depend on verification, and
-                # verification reads it only in its last kernel: issue it on a
-                # side stream so it overlaps the verification passes. Host
-                # call order (and so the generator's offsets) is unchanged.
-                # Off-device (CPU tests) the draw stays inline below.
-                main_stream = torch.cuda.current_stream()
-                side = self.__dict__.get("_bonus_sample_stream")
-                if side is None:
-                    side = self._bonus_sample_stream = torch.cuda.Stream()
-                side.wait_stream(main_stream)
-                with torch.cuda.stream(side):
-                    bonus_token_ids = self.sampler(
-                        logits=bonus_logits,
-                        temperatures=temperatures,
-                        top_ks=top_ks,
-                        top_ps=top_ps,
-                        all_greedy=all_greedy,
-                        needs_independent_noise=needs_independent_noise
-                        or not all_greedy,
-                    )
-                    bonus_ready = torch.cuda.Event()
-                    bonus_ready.record(side)
-                bonus_logits.record_stream(side)
-                temperatures.record_stream(side)
-                bonus_token_ids.record_stream(main_stream)
-            else:
-                bonus_token_ids = self.sampler(
-                    logits=bonus_logits,
-                    temperatures=temperatures,
-                    top_ks=top_ks,
-                    top_ps=top_ps,
-                    all_greedy=all_greedy,
-                    needs_independent_noise=needs_independent_noise or not all_greedy,
-                )
+            bonus_token_ids, bonus_ready = self._sample_bonus(
+                bonus_logits,
+                temperatures,
+                top_ks,
+                top_ps,
+                all_greedy,
+                needs_independent_noise or not all_greedy,
+                overlap=prob_src is not None,
+            )
             if prob_src is not None:
-                from atom.model_ops.dspark_prob_sample import (
-                    BLOCK_VERIFY,
-                    PROB_DEBUG,
-                    debug_acceptance,
-                    prob_rejection_sample,
-                )
-
-                sampled_tokens, verdict = prob_rejection_sample(
-                    spec_decode_metadata.input_ids,
-                    spec_decode_metadata.target_logits_indices,
-                    spec_decode_metadata.num_spec_steps,
-                    spec_decode_metadata.cu_num_draft_tokens,
+                sampled_tokens, verdict = self._prob_verify(
+                    spec_decode_metadata,
                     target_logits,
                     bonus_token_ids,
-                    spec_decode_metadata.bonus_logits_indices,
+                    bonus_ready,
                     temperatures,
                     top_ps,
                     prob_src,
                     prob_state,
-                    use_block=BLOCK_VERIFY,
-                    tp_group=get_tp_group(),
-                    use_custom=envs.ATOM_USE_CUSTOM_ALL_GATHER,
-                    bonus_ready=bonus_ready,
                 )
-                if PROB_DEBUG and prob_state.verify_step % PROB_DEBUG == 0:
-                    debug_acceptance(
-                        target_logits,
-                        spec_decode_metadata.cu_num_draft_tokens,
-                        spec_decode_metadata.input_ids,
-                        spec_decode_metadata.target_logits_indices,
-                        temperatures,
-                        top_ps,
-                        prob_src,
-                        prob_state,
-                    )
-                # Every rank computes the same verdict from identical inputs;
-                # align it with rank 0 anyway (sampled_tokens is broadcast
-                # below), as the synthetic path's num_bonus_tokens must be.
-                if get_tp_group().world_size > 1:
-                    verdict = get_tp_group().broadcast(verdict, src=0)
             else:
                 sampled_tokens, verdict = self.rejection_sampler.forward(
                     spec_decode_metadata,
@@ -4128,6 +4078,103 @@ class ModelRunner:
         else:
             rows = hidden_states.shape[0]
         return self.tokenID_processor.input_ids.gpu[1 : rows + 1]
+
+    def _sample_bonus(
+        self,
+        bonus_logits,
+        temperatures,
+        top_ks,
+        top_ps,
+        all_greedy,
+        needs_independent_noise,
+        overlap,
+    ):
+        """The verify step's bonus-token draw: (ids, event or None).
+
+        With ``overlap`` (probabilistic verification) the draw runs on the
+        bonus stream: it does not depend on verification, which first reads
+        it in its last kernel, after waiting on the returned event. Host call
+        order, and so the generator's offsets, is unchanged."""
+        side = self._bonus_stream if overlap else None
+        if side is not None:
+            main_stream = torch.cuda.current_stream()
+            side.wait_stream(main_stream)
+        with torch.cuda.stream(side) if side is not None else nullcontext():
+            bonus_token_ids = self.sampler(
+                logits=bonus_logits,
+                temperatures=temperatures,
+                top_ks=top_ks,
+                top_ps=top_ps,
+                all_greedy=all_greedy,
+                needs_independent_noise=needs_independent_noise,
+            )
+        if side is None:
+            return bonus_token_ids, None
+        self._bonus_ready.record(side)
+        # Allocated on the main stream, read on the side one (and the ids
+        # the other way round).
+        bonus_logits.record_stream(side)
+        temperatures.record_stream(side)
+        bonus_token_ids.record_stream(main_stream)
+        return bonus_token_ids, self._bonus_ready
+
+    def _prob_verify(
+        self,
+        spec_decode_metadata,
+        target_logits,
+        bonus_token_ids,
+        bonus_ready,
+        temperatures,
+        top_ps,
+        prob_src,
+        prob_state,
+    ):
+        """ATOM_DSPARK_PROB_DRAFT=1: probability-ratio verification of the
+        step's drafts against the drafter's stored q (`prob_rejection_sample`),
+        with its periodic acceptance diagnostics. Returns the rejection
+        sampler's (output ids, verdict), the verdict aligned with TP rank 0."""
+        from atom.model_ops.dspark_prob_sample import (
+            BLOCK_VERIFY,
+            PROB_DEBUG,
+            debug_acceptance,
+            prob_rejection_sample,
+        )
+
+        md = spec_decode_metadata
+        sampled_tokens, verdict = prob_rejection_sample(
+            md.input_ids,
+            md.target_logits_indices,
+            md.num_spec_steps,
+            md.cu_num_draft_tokens,
+            target_logits,
+            bonus_token_ids,
+            md.bonus_logits_indices,
+            temperatures,
+            top_ps,
+            prob_src,
+            prob_state,
+            use_block=BLOCK_VERIFY,
+            tp_group=get_tp_group(),
+            use_custom=envs.ATOM_USE_CUSTOM_ALL_GATHER,
+            bonus_ready=bonus_ready,
+        )
+        if PROB_DEBUG and prob_state.verify_step % PROB_DEBUG == 0:
+            debug_acceptance(
+                target_logits,
+                md.cu_num_draft_tokens,
+                md.input_ids,
+                md.target_logits_indices,
+                temperatures,
+                top_ps,
+                prob_src,
+                prob_state,
+            )
+        # Every rank computes the same verdict from identical inputs; align
+        # it with rank 0 anyway (sampled_tokens is broadcast by the caller),
+        # as the synthetic path's num_bonus_tokens must be.
+        if get_tp_group().world_size > 1:
+            verdict = get_tp_group().broadcast(verdict, src=0)
+        return sampled_tokens, verdict
 
     def _dspark_prob_state(self, top_ks):
         """The drafter's ``ProbDraftState`` when probability-ratio verification

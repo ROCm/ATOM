@@ -63,8 +63,10 @@ from atom.model_ops.dspark_markov_argmax import (
     _dspark_markov_argmax_stage2,
     argmax_gather,
 )
+from atom.model_ops.dspark_markov_stage1 import markov_logits_tile
 from atom.model_ops.rejection_sampler import _draft_token, _finish_request
 from atom.model_ops.sampler import SAMPLER_EPS
+from atom.model_ops.tile_argmax import argmax_lowest_id
 from atom.utils import envs
 
 _BLOCK_K = _markov_stage1.BLOCK_K
@@ -90,6 +92,8 @@ GREEDY_T = float(torch.tensor(SAMPLER_EPS, dtype=torch.float32).item())
 _GREEDY_T = tl.constexpr(GREEDY_T)
 # Smallest positive value of Triton's fp32 tl.rand.
 _RAND_MIN = tl.constexpr(4.6566127342e-10)
+# `argmax_lowest_id`'s answer for a tile with no hit: past every column.
+_NO_HIT = tl.constexpr(2147483647)
 # Top-p search: coarse bisection passes over the row, then the tokens left in
 # the bracket are compacted (<= _CAND_CAP) and the search finishes on them.
 _COARSE_ITERS = 12
@@ -131,6 +135,91 @@ def _gumbel(seed, offs):
 
 
 @triton.jit
+def _draft_row_temps(temp_ptr, seed_ptr, offs_row, row_mask):
+    """(greedy, 1 / T, seed) of a row tile: the rows at the greedy clamp
+    take the plain argmax, the others Gumbel-max at their temperature."""
+    temp = tl.load(temp_ptr + offs_row, mask=row_mask, other=1.0)
+    greedy = temp <= _GREEDY_T
+    inv_t = 1.0 / tl.where(greedy, 1.0, temp)
+    return greedy, inv_t, tl.load(seed_ptr)
+
+
+@triton.jit
+def _sampled_tile_argmax(
+    base_ptr,
+    prev_ids_ptr,
+    w1_ptr,
+    w2_ptr,
+    embed_out_ptr,
+    q_out_ptr,
+    tile,
+    offs_row,
+    offs_v,
+    row_mask,
+    v_mask,
+    greedy,
+    inv_t,
+    seed,
+    num_rows,
+    vocab_global,
+    vocab_offset,
+    rank,
+    pos_k,
+    stride_base_row,
+    stride_prev,
+    stride_w1_vocab,
+    stride_embed_row,
+    stride_w2_vocab,
+    stride_q_row,
+    BLOCK_ROW: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    FROM_PACKED: tl.constexpr,
+):
+    """One (row tile, V tile) of a sampled block position: the biased logits
+    z (`markov_logits_tile`), stored to ``q_out`` (fp32, pre-temperature:
+    verification rebuilds q from exactly these), then the Gumbel-perturbed
+    scores' (max, lowest local column); a tile with no hit (all NaN) answers
+    `_NO_HIT`. Shared by `_prob_markov_stage1` and the fused chain."""
+    z = markov_logits_tile(
+        base_ptr,
+        prev_ids_ptr,
+        w1_ptr,
+        w2_ptr,
+        embed_out_ptr,
+        tile,
+        offs_row,
+        offs_v,
+        row_mask,
+        v_mask,
+        rank,
+        stride_base_row,
+        stride_prev,
+        stride_w1_vocab,
+        stride_embed_row,
+        stride_w2_vocab,
+        vocab_offset,
+        BLOCK_ROW,
+        BLOCK_V,
+        BLOCK_K,
+        STORE_EMBED=True,
+        FROM_PACKED=FROM_PACKED,
+    )
+    tl.store(
+        q_out_ptr + offs_row[:, None] * stride_q_row + offs_v[None, :],
+        z,
+        mask=row_mask[:, None] & v_mask[None, :],
+    )
+    noise_offs = (pos_k * num_rows + offs_row)[:, None] * vocab_global + (
+        vocab_offset + offs_v
+    )[None, :]
+    g = _gumbel(seed, noise_offs)
+    # Padded lanes hold z = -inf, hence score -inf, and are masked anyway.
+    score = tl.where(greedy[:, None], z, z * inv_t[:, None] + g)
+    return argmax_lowest_id(score, offs_v[None, :], v_mask[None, :], _NO_HIT)
+
+
+@triton.jit
 def _prob_markov_stage1(
     base_ptr,
     prev_ids_ptr,
@@ -164,60 +253,39 @@ def _prob_markov_stage1(
     offs_v = tile * BLOCK_V + tl.arange(0, BLOCK_V)
     row_mask = offs_row < num_rows
     v_mask = offs_v < vocab_size
-    prev = tl.load(prev_ids_ptr + offs_row * stride_prev, mask=row_mask, other=0)
-
-    acc = tl.zeros((BLOCK_ROW, BLOCK_V), dtype=tl.float32)
-    for k in range(tl.cdiv(rank, BLOCK_K)):
-        offs_k = k * BLOCK_K + tl.arange(0, BLOCK_K)
-        k_mask = offs_k < rank
-        embed = tl.load(
-            w1_ptr + prev[:, None] * stride_w1_vocab + offs_k[None, :],
-            mask=row_mask[:, None] & k_mask[None, :],
-            other=0.0,
-        )
-        if tile == 0:
-            tl.store(
-                embed_out_ptr + offs_row[:, None] * stride_embed_row + offs_k[None, :],
-                embed,
-                mask=row_mask[:, None] & k_mask[None, :],
-            )
-        w2 = tl.load(
-            w2_ptr
-            + (vocab_offset + offs_v[None, :]) * stride_w2_vocab
-            + offs_k[:, None],
-            mask=v_mask[None, :] & k_mask[:, None],
-            other=0.0,
-        )
-        acc = tl.dot(embed, w2, acc)
-
-    mask2 = row_mask[:, None] & v_mask[None, :]
-    base = tl.load(
-        base_ptr + offs_row[:, None] * stride_base_row + offs_v[None, :],
-        mask=mask2,
-        other=0.0,
+    greedy, inv_t, seed = _draft_row_temps(temp_ptr, seed_ptr, offs_row, row_mask)
+    tile_max, tile_idx = _sampled_tile_argmax(
+        base_ptr,
+        prev_ids_ptr,
+        w1_ptr,
+        w2_ptr,
+        embed_out_ptr,
+        q_out_ptr,
+        tile,
+        offs_row,
+        offs_v,
+        row_mask,
+        v_mask,
+        greedy,
+        inv_t,
+        seed,
+        num_rows,
+        vocab_global,
+        vocab_offset,
+        rank,
+        pos_k,
+        stride_base_row,
+        stride_prev,
+        stride_w1_vocab,
+        stride_embed_row,
+        stride_w2_vocab,
+        stride_q_row,
+        BLOCK_ROW,
+        BLOCK_V,
+        BLOCK_K,
+        FROM_PACKED=False,
     )
-    z = base.to(tl.float32) + acc
-    # q's logits, pre-temperature: verification rebuilds q from exactly these.
-    tl.store(
-        q_out_ptr + offs_row[:, None] * stride_q_row + offs_v[None, :], z, mask=mask2
-    )
-
-    temp = tl.load(temp_ptr + offs_row, mask=row_mask, other=1.0)
-    greedy = temp <= _GREEDY_T
-    inv_t = 1.0 / tl.where(greedy, 1.0, temp)
-    seed = tl.load(seed_ptr)
-    noise_offs = (pos_k * num_rows + offs_row)[:, None] * vocab_global + (
-        vocab_offset + offs_v
-    )[None, :]
-    g = _gumbel(seed, noise_offs)
-    score = tl.where(greedy[:, None], z, z * inv_t[:, None] + g)
-    vals = tl.where(v_mask[None, :], score, float("-inf"))
-    tile_max = tl.max(vals, axis=1)
-    cand = tl.where(
-        (vals == tile_max[:, None]) & v_mask[None, :], offs_v[None, :], vocab_size
-    )
-    tile_idx = tl.min(cand, axis=1)
-    tile_idx = tl.where(tile_idx < vocab_size, tile_idx + vocab_offset, vocab_size)
+    tile_idx = tl.where(tile_idx != _NO_HIT, tile_idx + vocab_offset, vocab_size)
     tl.store(part_val_ptr + tile * num_rows + offs_row, tile_max, mask=row_mask)
     tl.store(part_idx_ptr + tile * num_rows + offs_row, tile_idx, mask=row_mask)
 

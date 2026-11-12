@@ -14,26 +14,66 @@ per-position inter-rank winner exchange and uses the existing implementation.
 """
 
 from functools import cache
+from typing import NamedTuple
 
 import torch
 import triton
 import triton.language as tl
 
 from atom.model_ops import dspark_markov_stage1 as _markov_stage1
-from atom.model_ops.dspark_prob_sample import _GREEDY_T, _gumbel
+from atom.model_ops.dspark_prob_sample import (
+    _NO_HIT,
+    _draft_row_temps,
+    _sampled_tile_argmax,
+)
 
 _BLOCK_K = _markov_stage1.BLOCK_K
 _BLOCK_V = _markov_stage1.BLOCK_V
 _MAX_BLOCK_ROW = _markov_stage1.MAX_BLOCK_ROW
 _MIN_BLOCK_ROW = _markov_stage1.MIN_BLOCK_ROW
 
-# Batches above this take `_prob_markov_chain_stage1_wide`: 16-row tiles and
-# two 32-column vocab tiles per program. Smaller batches keep the original
-# launch, which is already a single row tile there.
+
+class _ChainLaunch(NamedTuple):
+    """Tiling of one stage-1 launch: each program scores ``block_row`` rows
+    against ``v_tiles`` consecutive ``block_v``-column vocab tiles and folds
+    their keys in registers before one atomic per row."""
+
+    block_row: int
+    block_v: int
+    v_tiles: int
+    num_warps: int
+    num_stages: int
+
+
+# Batches above this many rows take 16-row tiles with two 32-column vocab
+# tiles per program, which keeps many programs in flight; smaller batches
+# keep the Markov stage-1 tiling, already a single row tile there.
 _WIDE_MIN_ROWS = 16
-_WIDE_BLOCK_ROW = 16
-_WIDE_BLOCK_V = 32
-_WIDE_V_TILES = 2
+_WIDE_LAUNCH = _ChainLaunch(
+    block_row=16, block_v=32, v_tiles=2, num_warps=2, num_stages=1
+)
+
+
+def _chain_launch(num_rows: int) -> _ChainLaunch:
+    if num_rows > _WIDE_MIN_ROWS:
+        return _WIDE_LAUNCH
+    block_row = min(
+        _MAX_BLOCK_ROW, max(_MIN_BLOCK_ROW, triton.next_power_of_2(num_rows))
+    )
+    return _ChainLaunch(block_row, _BLOCK_V, 1, 8 if block_row >= 32 else 4, 2)
+
+
+@triton.jit
+def _pack_key(tile_max, tile_id):
+    """uint64 key whose maximum is the (max score, lowest id) pair: the
+    ordered fp32 bits are the high word and the inverted id the low word,
+    so smaller ids win exact score ties. Zero is canonicalized so -0 and +0
+    compare equal. Every valid score, -inf included, packs to a key above
+    zero, which is what an empty row keeps."""
+    tile_max = tl.where(tile_max == 0.0, 0.0, tile_max)
+    bits = tile_max.to(tl.uint32, bitcast=True)
+    ordered = tl.where((bits & 0x80000000) != 0, ~bits, bits ^ 0x80000000).to(tl.uint32)
+    return (ordered.to(tl.uint64) << 32) | (~tile_id.to(tl.uint32)).to(tl.uint64)
 
 
 @triton.jit
@@ -51,117 +91,6 @@ def _prob_markov_chain_stage1(
     vocab_size,  # columns of base_logits (this rank's shard)
     vocab_global,
     vocab_offset,  # global id of column 0
-    rank,
-    pos_k,
-    stride_base_row,
-    stride_prev,
-    stride_w1_vocab,
-    stride_embed_row,
-    stride_w2_vocab,
-    stride_q_row,
-    BLOCK_ROW: tl.constexpr,
-    BLOCK_V: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    FROM_PACKED: tl.constexpr,
-):
-    """Native bias/q/RNG arithmetic; publish a packed per-row maximum."""
-    tile = tl.program_id(0)
-    offs_row = tl.program_id(1) * BLOCK_ROW + tl.arange(0, BLOCK_ROW)
-    offs_v = tile * BLOCK_V + tl.arange(0, BLOCK_V)
-    row_mask = offs_row < num_rows
-    v_mask = offs_v < vocab_size
-    previous = tl.load(prev_ids_ptr + offs_row * stride_prev, mask=row_mask, other=0)
-    if FROM_PACKED:
-        prev = tl.where(previous == 0, 0, ~previous.to(tl.uint32)).to(tl.int64)
-    else:
-        prev = previous
-
-    acc = tl.zeros((BLOCK_ROW, BLOCK_V), dtype=tl.float32)
-    for k in range(tl.cdiv(rank, BLOCK_K)):
-        offs_k = k * BLOCK_K + tl.arange(0, BLOCK_K)
-        k_mask = offs_k < rank
-        embed = tl.load(
-            w1_ptr + prev[:, None] * stride_w1_vocab + offs_k[None, :],
-            mask=row_mask[:, None] & k_mask[None, :],
-            other=0.0,
-        )
-        if tile == 0:
-            tl.store(
-                embed_out_ptr + offs_row[:, None] * stride_embed_row + offs_k[None, :],
-                embed,
-                mask=row_mask[:, None] & k_mask[None, :],
-            )
-        w2 = tl.load(
-            w2_ptr
-            + (vocab_offset + offs_v[None, :]) * stride_w2_vocab
-            + offs_k[:, None],
-            mask=v_mask[None, :] & k_mask[:, None],
-            other=0.0,
-        )
-        acc = tl.dot(embed, w2, acc)
-
-    mask2 = row_mask[:, None] & v_mask[None, :]
-    base = tl.load(
-        base_ptr + offs_row[:, None] * stride_base_row + offs_v[None, :],
-        mask=mask2,
-        other=0.0,
-    )
-    z = base.to(tl.float32) + acc
-    # q's logits, pre-temperature: verification rebuilds q from exactly these.
-    tl.store(
-        q_out_ptr + offs_row[:, None] * stride_q_row + offs_v[None, :], z, mask=mask2
-    )
-
-    temp = tl.load(temp_ptr + offs_row, mask=row_mask, other=1.0)
-    greedy = temp <= _GREEDY_T
-    inv_t = 1.0 / tl.where(greedy, 1.0, temp)
-    seed = tl.load(seed_ptr)
-    noise_offs = (pos_k * num_rows + offs_row)[:, None] * vocab_global + (
-        vocab_offset + offs_v
-    )[None, :]
-    g = _gumbel(seed, noise_offs)
-    score = tl.where(greedy[:, None], z, z * inv_t[:, None] + g)
-    vals = tl.where(v_mask[None, :], score, float("-inf"))
-    tile_max = tl.max(vals, axis=1)
-    cand = tl.where(
-        (vals == tile_max[:, None]) & v_mask[None, :], offs_v[None, :], vocab_size
-    )
-    tile_idx = tl.min(cand, axis=1)
-    tile_idx = tl.where(tile_idx < vocab_size, tile_idx + vocab_offset, vocab_size)
-    # Ordered fp32 bits are the high word; inverse id makes smaller ids
-    # win exact score ties. Canonicalize zero so -0 and +0 compare equally.
-    # On gfx1250, native max ignores an all-NaN tile if a numeric tile
-    # exists. Such a tile has no valid argmax index and contributes no key.
-    tile_max = tl.where(tile_max == 0.0, 0.0, tile_max)
-    bits = tile_max.to(tl.uint32, bitcast=True)
-    ordered = tl.where((bits & 0x80000000) != 0, ~bits, bits ^ 0x80000000).to(tl.uint32)
-    key = (ordered.to(tl.uint64) << 32) | (~tile_idx.to(tl.uint32)).to(tl.uint64)
-    # Every valid score, including -inf, has a key greater than zero.
-    # The next launch on this stream sees the completed reduction. No CTA
-    # spins or attempts a device-wide barrier inside this kernel.
-    # The index mask also excludes a partial tile with only NaNs and padded
-    # -inf lanes. An empty row retains zero and decodes to safe id 0.
-    tl.atomic_max(
-        winner_ptr + offs_row,
-        key,
-        mask=row_mask & (tile_idx < vocab_size),
-        sem="relaxed",
-    )
-
-
-@triton.jit
-def _prob_markov_chain_stage1_wide(
-    base_ptr,
-    prev_ids_ptr,
-    w1_ptr,
-    w2_ptr,
-    embed_out_ptr,
-    q_out_ptr,
-    temp_ptr,
-    seed_ptr,
-    winner_ptr,
-    num_rows,
-    vocab_size,
     pos_k,
     stride_base_row,
     stride_prev,
@@ -176,88 +105,57 @@ def _prob_markov_chain_stage1_wide(
     BLOCK_K: tl.constexpr,
     FROM_PACKED: tl.constexpr,
 ):
-    """`_prob_markov_chain_stage1` for larger batches (full vocabulary only).
-
-    Small row tiles keep many programs in flight; each program walks
-    NUM_V_TILES consecutive vocab tiles and folds their packed keys before a
-    single atomic. Per element the bias dot (same BLOCK_K accumulation
-    order), fp32 q, Philox counter and Gumbel transform are those of
-    `_prob_markov_chain_stage1`; the key max is order independent.
-    """
-    pid_v = tl.program_id(0)
+    """Native bias/q/RNG arithmetic (`_sampled_tile_argmax`, as
+    `prob_markov_sample`); publish a packed per-row maximum. A program walks
+    NUM_V_TILES consecutive vocab tiles and folds their keys in registers
+    before a single atomic; the key maximum is order independent."""
     offs_row = tl.program_id(1) * BLOCK_ROW + tl.arange(0, BLOCK_ROW)
     row_mask = offs_row < num_rows
-    previous = tl.load(prev_ids_ptr + offs_row * stride_prev, mask=row_mask, other=0)
-    if FROM_PACKED:
-        prev = tl.where(previous == 0, 0, ~previous.to(tl.uint32)).to(tl.int64)
-    else:
-        prev = previous
-    if pid_v == 0:
-        offs_r = tl.arange(0, RANK)
-        embed = tl.load(
-            w1_ptr + prev[:, None] * stride_w1_vocab + offs_r[None, :],
-            mask=row_mask[:, None],
-            other=0.0,
-        )
-        tl.store(
-            embed_out_ptr + offs_row[:, None] * stride_embed_row + offs_r[None, :],
-            embed,
-            mask=row_mask[:, None],
-        )
-    temp = tl.load(temp_ptr + offs_row, mask=row_mask, other=1.0)
-    greedy = temp <= _GREEDY_T
-    inv_t = 1.0 / tl.where(greedy, 1.0, temp)
-    seed = tl.load(seed_ptr)
+    greedy, inv_t, seed = _draft_row_temps(temp_ptr, seed_ptr, offs_row, row_mask)
     best = tl.zeros((BLOCK_ROW,), dtype=tl.uint64)
     for j in range(NUM_V_TILES):
-        offs_v = (pid_v * NUM_V_TILES + j) * BLOCK_V + tl.arange(0, BLOCK_V)
+        tile = tl.program_id(0) * NUM_V_TILES + j
+        offs_v = tile * BLOCK_V + tl.arange(0, BLOCK_V)
         v_mask = offs_v < vocab_size
-        acc = tl.zeros((BLOCK_ROW, BLOCK_V), dtype=tl.float32)
-        for kk in tl.static_range(RANK // BLOCK_K):
-            offs_k = kk * BLOCK_K + tl.arange(0, BLOCK_K)
-            e = tl.load(
-                w1_ptr + prev[:, None] * stride_w1_vocab + offs_k[None, :],
-                mask=row_mask[:, None],
-                other=0.0,
-            )
-            w2 = tl.load(
-                w2_ptr + offs_v[None, :] * stride_w2_vocab + offs_k[:, None],
-                mask=v_mask[None, :],
-                other=0.0,
-            )
-            acc = tl.dot(e, w2, acc)
-        mask2 = row_mask[:, None] & v_mask[None, :]
-        base = tl.load(
-            base_ptr + offs_row[:, None] * stride_base_row + offs_v[None, :],
-            mask=mask2,
-            other=0.0,
+        tile_max, tile_idx = _sampled_tile_argmax(
+            base_ptr,
+            prev_ids_ptr,
+            w1_ptr,
+            w2_ptr,
+            embed_out_ptr,
+            q_out_ptr,
+            tile,
+            offs_row,
+            offs_v,
+            row_mask,
+            v_mask,
+            greedy,
+            inv_t,
+            seed,
+            num_rows,
+            vocab_global,
+            vocab_offset,
+            RANK,
+            pos_k,
+            stride_base_row,
+            stride_prev,
+            stride_w1_vocab,
+            stride_embed_row,
+            stride_w2_vocab,
+            stride_q_row,
+            BLOCK_ROW,
+            BLOCK_V,
+            BLOCK_K,
+            FROM_PACKED,
         )
-        z = base.to(tl.float32) + acc
-        tl.store(
-            q_out_ptr + offs_row[:, None] * stride_q_row + offs_v[None, :],
-            z,
-            mask=mask2,
-        )
-        noise_offs = (pos_k * num_rows + offs_row)[:, None] * vocab_size + offs_v[
-            None, :
-        ]
-        g = _gumbel(seed, noise_offs)
-        score = tl.where(greedy[:, None], z, z * inv_t[:, None] + g)
-        vals = tl.where(v_mask[None, :], score, float("-inf"))
-        tile_max = tl.max(vals, axis=1)
-        cand = tl.where(
-            (vals == tile_max[:, None]) & v_mask[None, :], offs_v[None, :], vocab_size
-        )
-        tile_idx = tl.min(cand, axis=1)
-        tile_max = tl.where(tile_max == 0.0, 0.0, tile_max)
-        bits = tile_max.to(tl.uint32, bitcast=True)
-        ordered = tl.where((bits & 0x80000000) != 0, ~bits, bits ^ 0x80000000).to(
-            tl.uint32
-        )
-        key = (ordered.to(tl.uint64) << 32) | (~tile_idx.to(tl.uint32)).to(tl.uint64)
-        # A tile without a valid index contributes no key (as in the chain).
-        key = tl.where(tile_idx < vocab_size, key, 0)
-        best = tl.maximum(best, key)
+        # On gfx1250, native max ignores an all-NaN tile if a numeric tile
+        # exists. Such a tile has no valid argmax index and contributes no
+        # key; neither do a tile past the vocabulary and its padded lanes.
+        key = _pack_key(tile_max, tile_idx + vocab_offset)
+        best = tl.maximum(best, tl.where(tile_idx != _NO_HIT, key, 0))
+    # The next launch on this stream sees the completed reduction. No CTA
+    # spins or attempts a device-wide barrier inside this kernel. An empty
+    # row retains zero and decodes to safe id 0.
     tl.atomic_max(
         winner_ptr + offs_row, best, mask=row_mask & (best != 0), sem="relaxed"
     )
@@ -372,53 +270,14 @@ def prob_markov_sample_chain(
             torch.int32,
             torch.int64,
         )
-    block_row = min(_MAX_BLOCK_ROW, max(_MIN_BLOCK_ROW, triton.next_power_of_2(b)))
-    num_tiles = triton.cdiv(v, _BLOCK_V)
-    # The wide kernel loads whole embedding rows (`tl.arange(0, RANK)`), so
-    # it needs a power-of-two rank that BLOCK_K divides.
-    wide = (
-        b > _WIDE_MIN_ROWS
-        and rank == triton.next_power_of_2(rank)
-        and rank % _BLOCK_K == 0
+    launch = _chain_launch(b)
+    grid = (
+        triton.cdiv(v, launch.block_v * launch.v_tiles),
+        triton.cdiv(b, launch.block_row),
     )
     for k in range(t):
         previous = prev_ids if k == 0 else keys[k - 1]
-        if wide:
-            _prob_markov_chain_stage1_wide[
-                (
-                    triton.cdiv(v, _WIDE_BLOCK_V * _WIDE_V_TILES),
-                    triton.cdiv(b, _WIDE_BLOCK_ROW),
-                )
-            ](
-                base_logits[:, k],
-                previous,
-                markov_w1,
-                markov_w2,
-                embed_out[:, k],
-                q_out[:, k],
-                temps,
-                seed,
-                keys[k],
-                b,
-                v,
-                k,
-                stride_base_row=base_logits.stride(0),
-                stride_prev=previous.stride(0),
-                stride_w1_vocab=markov_w1.stride(0),
-                stride_embed_row=embed_out.stride(0),
-                stride_w2_vocab=markov_w2.stride(0),
-                stride_q_row=q_out.stride(0),
-                RANK=rank,
-                BLOCK_ROW=_WIDE_BLOCK_ROW,
-                BLOCK_V=_WIDE_BLOCK_V,
-                NUM_V_TILES=_WIDE_V_TILES,
-                BLOCK_K=_BLOCK_K,
-                FROM_PACKED=k > 0,
-                num_warps=2,
-                num_stages=1,
-            )
-            continue
-        _prob_markov_chain_stage1[(num_tiles, triton.cdiv(b, block_row))](
+        _prob_markov_chain_stage1[grid](
             base_logits[:, k],
             previous,
             markov_w1,
@@ -432,7 +291,6 @@ def prob_markov_sample_chain(
             v,
             v,
             0,
-            rank,
             k,
             stride_base_row=base_logits.stride(0),
             stride_prev=previous.stride(0),
@@ -440,12 +298,14 @@ def prob_markov_sample_chain(
             stride_embed_row=embed_out.stride(0),
             stride_w2_vocab=markov_w2.stride(0),
             stride_q_row=q_out.stride(0),
-            BLOCK_ROW=block_row,
-            BLOCK_V=_BLOCK_V,
+            RANK=rank,
+            BLOCK_ROW=launch.block_row,
+            BLOCK_V=launch.block_v,
+            NUM_V_TILES=launch.v_tiles,
             BLOCK_K=_BLOCK_K,
             FROM_PACKED=k > 0,
-            num_warps=8 if block_row >= 32 else 4,
-            num_stages=2,
+            num_warps=launch.num_warps,
+            num_stages=launch.num_stages,
         )
     saved = out if saved_ids is None else saved_ids
     _finish_prob_markov_chain[(triton.cdiv(b * t, 256),)](
