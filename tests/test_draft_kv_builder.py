@@ -175,6 +175,8 @@ def test_draft_exports_zero_copy_mp_views_and_disables_tp_collapse():
     pool.allocate(2, "cpu")
     builder = DraftKvBuilder.__new__(DraftKvBuilder)
     builder._kv_pool = pool
+    layer = type("Layer", (), {"layer_num": 9})()
+    builder._pool_rows = {DRAFT_KV_ROWS: {layer: 0}}
 
     transfer = builder.get_kv_transfer_tensors()
     transfer.set_block_count(2)
@@ -184,6 +186,11 @@ def test_draft_exports_zero_copy_mp_views_and_disables_tp_collapse():
         "draft.k.layer_0",
         "draft.v.layer_0",
     ]
+    # Named by its layer under its own namespace, split by head like a target.
+    assert [(p.unit_spec.namespace, p.unit_spec.layer) for p in transfer.pages] == [
+        ("draft", 9)
+    ] * 2
+    assert {p.head_major_runs for p in transfer.pages} == {(1, 4)}
     assert [tuple(view.shape[:2]) for view in transfer.block_tensor_views] == [
         (2, 1),
         (2, 1),

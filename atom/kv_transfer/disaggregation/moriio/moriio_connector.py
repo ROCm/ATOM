@@ -44,6 +44,7 @@ from atom.kv_transfer.disaggregation.types import (
     ReqId,
     ReqMeta,
     TransferId,
+    produced_no_handoff,
 )
 from atom.kv_transfer.disaggregation.utils import (
     MAX_RDMA_CHUNK_BYTES,
@@ -2058,7 +2059,7 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
         to the decode instance.  On the consumer side this cleans up
         the transfer_id mapping.
         """
-        if self.is_producer and getattr(seq, "leave_reason", None) == "aborted":
+        if self.is_producer and produced_no_handoff(seq):
             # No send claim protects an abort's blocks from reuse. Never
             # advertise their addresses, including any previous metadata.
             seq.kv_transfer_params_output = None

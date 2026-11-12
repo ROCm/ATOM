@@ -71,6 +71,9 @@ def producer(pp_rank=0, pp_size=1, num_tokens=10):
     c._start_layer = pp_rank
     c._end_layer = pp_rank + 1
     c._block_region_consumer_indices = None
+    c._block_unit_specs = None
+    c._block_head_major_runs = ()
+    c._unit_layout = None
     c._block_region_roles = [None]
     c._per_block_bytes_list = [4]
     c._completed_prefills_lock = threading.Lock()
@@ -818,6 +821,7 @@ def test_consumer_dispatches_all_pp_stages_without_source_block_ids(
     c._num_local_layers = 3
     c._block_regions = [(100, 4), (200, 4), (300, 4)]
     c._block_region_roles = [None] * 3
+    c._unit_layout = None
     c._has_slot_regions = False
     c.kv_caches_base_addr = [100, 200, 300]
     c._send_on_socket = MagicMock()
@@ -2089,3 +2093,110 @@ def test_admission_deadline_stops_at_source_allocation(monkeypatch, seq_factory)
     assert list(seq.block_table) == blocks
     assert not seq.kv_transfer_params.get("prefill_aborted")
     assert str(seq.id) in p.kv_connector._awaiting_send
+
+
+def test_a_producer_cancels_a_request_whose_prefill_never_completed(
+    monkeypatch, seq_factory
+):
+    """A request that ends without its prefill completing (rejected as
+    unschedulable before it ran) has no KV and no first token. The chunked
+    producer publishes a cancellation, as for an abort, instead of building a
+    handoff from `output_tokens[0]`; a request whose prefill completed still
+    hands off."""
+    producer = scheduler_connector(monkeypatch, True)
+    unrun = seq_factory(
+        list(range(10)),
+        kv_transfer_params={
+            "chunked_transfer": True,
+            "do_remote_decode": True,
+            "transfer_id": "unschedulable",
+        },
+    )
+    unrun.leave_reason = "unschedulable: prompt exceeds max_model_len"
+    assert not unrun.prefill_completed and len(unrun.output_tokens) == 0
+    producer.request_finished(unrun)
+    params = unrun.kv_transfer_params
+    assert params["prefill_aborted"] is True
+    assert "prefill_handoff" not in params
+    assert producer.build_connector_meta().reqs_to_save[unrun.id].prefill_aborted
+
+    done = seq_factory(
+        list(range(10)),
+        kv_transfer_params={
+            "chunked_transfer": True,
+            "do_remote_decode": True,
+            "transfer_id": "done",
+        },
+    )
+    done.prefill_completed = True
+    done.append_token(7)
+    done.leave_reason = "length"
+    producer.request_finished(done)
+    assert done.kv_transfer_params["prefill_aborted"] is False
+    assert done.kv_transfer_params["prefill_handoff"]["first_token_id"] == 7
+
+
+def test_a_preempted_producer_request_rejected_on_readmission_hands_nothing_off(
+    monkeypatch, seq_factory
+):
+    """A producer request that ran, was preempted (its blocks freed) and is
+    then rejected as unschedulable on re-admission (chunked prefill off, its
+    prompt plus output now over the batch budget) has no KV left to send. Its
+    prefill did complete, so only the reject reason tells the producer: it
+    must publish no handoff and take no send claim."""
+    import numpy as np
+    from conftest import MockConfig
+
+    from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
+    from atom.model_engine.sequence import SequenceStatus
+    from atom.sampling_params import SamplingParams
+
+    sched = Scheduler(
+        MockConfig(
+            max_num_batched_tokens=12,
+            enable_chunked_prefill=False,
+            num_kvcache_blocks=100,
+            kv_cache_block_size=4,
+        )
+    )
+    monkeypatch.setattr(mc, "get_ip", lambda: "127.0.0.1")
+    monkeypatch.setattr(mc, "get_open_port", lambda: 6400)
+    producer = sched.kv_connector = mc.MooncakeConnectorScheduler(
+        SimpleNamespace(
+            kv_transfer_config={"kv_role": "kv_producer"},
+            tensor_parallel_size=1,
+            pipeline_parallel_size=1,
+            parallel_config=SimpleNamespace(data_parallel_size=1, data_parallel_rank=0),
+            kv_cache_block_size=4,
+            decode_context_parallel_size=1,
+        )
+    )
+    seq = seq_factory(
+        list(range(10)),
+        sampling_params=SamplingParams(max_tokens=20, ignore_eos=True),
+        kv_transfer_params={"do_remote_decode": True, "transfer_id": "preempted"},
+    )
+    sched.add(seq)
+    for token in range(100, 104):
+        batch, seqs = sched.schedule()
+        sched.postprocess(
+            list(seqs.values()),
+            ScheduledBatchOutput(
+                [seq.id], [(token,)], np.array([0]), np.array([0]), None
+            ),
+            batch=batch,
+        )
+        if seq.num_tokens > 12:
+            break
+    assert seq.prefill_completed and seq.num_tokens > 12
+    assert sched.preempt(seq)
+    assert not seq.block_table
+
+    sched.schedule()
+
+    assert seq.status == SequenceStatus.FINISHED
+    assert seq.leave_reason.startswith("unschedulable")
+    assert seq.kv_transfer_params_output is None
+    assert str(seq.id) not in producer._awaiting_send
+    assert seq.id not in producer._reqs_need_save
+    assert seq.id not in sched.deferred_free_blocks

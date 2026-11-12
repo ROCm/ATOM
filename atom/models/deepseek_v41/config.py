@@ -375,13 +375,16 @@ def validate_runtime_config(config):
             config.enable_tbo and not config.enable_dp_attention,
         ),
         (
-            # `lmcache_mp` checkpoints STATE through the backend's PAGE-backed
-            # copies; Mooncake P/D moves whole PAGE units plus the request's one
-            # STATE slot (`get_kv_transfer_tensors`). MoRI-IO and in-process
-            # offload read SLOT codecs this runtime does not publish.
-            "KV transfer other than lmcache_mp or mooncake",
+            # The Store moves PAGEs and rebuilds STATE through replay (it is
+            # refused without bounded replay, below). `lmcache_mp` moves PAGEs
+            # and either replays STATE or, without bounded replay, carries
+            # native-state images. Mooncake P/D moves whole PAGE units plus the
+            # request's one STATE slot (`get_kv_transfer_tensors`). MoRI-IO and
+            # in-process offload read SLOT codecs this runtime does not publish.
+            # A `multi` (P/D plus an offload tier) is not admitted.
+            "KV transfer other than lmcache_mp, mooncake or mooncake_store",
             KVConnectorFactory.connector_name(config.kv_transfer_config)
-            not in (None, "lmcache_mp", "mooncake"),
+            not in (None, "lmcache_mp", "mooncake", "mooncake_store"),
         ),
         (
             # Mooncake defaults a missing role to producer, but producer
@@ -393,6 +396,15 @@ def validate_runtime_config(config):
             and isinstance(config.kv_transfer_config, dict)
             and config.kv_transfer_config.get("kv_role")
             not in ("kv_producer", "kv_consumer"),
+        ),
+        (
+            # The Store moves V4.1's PAGEs and relies on replay to rebuild the
+            # state a hit does not carry; without bounded replay the backend
+            # copies state instead and the Store's PAGE-only load is unsound.
+            "Mooncake Store without encoder SWA bounded replay",
+            KVConnectorFactory.connector_name(config.kv_transfer_config)
+            == "mooncake_store"
+            and not config.enable_encoder_swa_bounded_replay,
         ),
         ("RapidServe", config.enable_rapidserve),
         ("online quantization", config.online_quant_config is not None),

@@ -265,6 +265,16 @@ class AiterMlaSparseIndexerPrefillChunkMetadataForVllm:
     token_start: int
     token_end: int
     num_reqs: int
+    # Request range this chunk covers, needed by any consumer that has to slice
+    # a batch-wide per-request tensor (the pooled indexer slices the KDA state
+    # slots) the same way `block_table` was sliced.
+    reqs_start: int = 0
+    reqs_end: int = 0
+    # Pooled-indexer gather geometry, computed here on CPU counts because the
+    # forward would otherwise need a device-to-host read of a cumulative sum --
+    # illegal under CUDA-graph capture, and frozen into every replay if dodged.
+    pool_cu_seq_lens: torch.Tensor | None = None
+    total_pools: int = 0
 
 
 @dataclass
@@ -308,6 +318,13 @@ class AiterMlaSparseIndexerMetadataForVllm:
 
     decode: AiterMlaSparseIndexerDecodeMetadataForVllm | None = None
     prefill: AiterMlaSparseIndexerPrefillMetadataForVllm | None = None
+
+    # Tokens per cached indexer row (the spec's `tokens_per_state`). 1
+    # everywhere but GLM-5.3-Flash's pooled indexer, whose op computes its own
+    # pooled write slots and does not read `slot_mapping`.
+    tokens_per_state: int = 1
+    # Cached rows per block of `block_table` (`block_size // tokens_per_state`).
+    rows_per_block: int = 0
 
 
 # TODO (zyongye) optimize this, this is now vibe coded
@@ -2194,6 +2211,20 @@ class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
         self.padded_num_heads = max(self.num_heads, _MLA_MIN_HEADS)
         self.mla_dims = get_mla_dims(self.model_config)
         self.topk_tokens = config.model_config.hf_config.index_topk
+        # GLM-5.3-Flash's pooled indexer emits a WIDER row than index_topk: the
+        # selected pools expand back to their tokens and the open tail rides
+        # along, rounded to 128. Every buffer the indexer writes and sparse MLA
+        # reads has to be sized on that physical width; the two are equal for
+        # every non-pooled model.
+        from atom.model_ops.glm5_next.geometry import (
+            effective_kpool_size,
+            topk_output_width,
+        )
+
+        self.index_kpool = effective_kpool_size(
+            int(getattr(config.model_config.hf_text_config, "index_kpool", 1) or 1)
+        )
+        self.topk_out_width = topk_output_width(self.topk_tokens, self.index_kpool)
         self.max_model_len_tensor = torch.tensor(
             [self.model_config.max_model_len], device=device, dtype=torch.int32
         )
@@ -2227,7 +2258,7 @@ class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
             layer_names,
             config,
             device,
-            max_num_batched_tokens * self.topk_tokens,
+            max_num_batched_tokens * self.topk_out_width,
         )
 
         (
@@ -2368,7 +2399,7 @@ class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
         #     rewritten by the cumsum + scalar broadcast, so its fill_(0) is
         #     redundant and dropped entirely.
         new_req_extent = int(batch_id_per_q_token.shape[0])
-        new_indices_extent = num_tokens * self.topk_tokens
+        new_indices_extent = num_tokens * self.topk_out_width
         if self._prev_req_extent > new_req_extent:
             self.batch_id_per_q_token_buffer[
                 new_req_extent : self._prev_req_extent
@@ -2400,6 +2431,7 @@ class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
             self.topk_tokens,
             num_tokens,
             common_attn_metadata.max_query_len,
+            index_kpool=self.index_kpool,
         )
         torch.cumsum(
             sparse_seqlen,
@@ -2411,7 +2443,7 @@ class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
         batch_id_per_q_token = self.batch_id_per_q_token_buffer[:num_tokens]
         qo_indptr = self.qo_indptr[: num_tokens + 1]
         paged_kv_last_page_len = self.paged_kv_last_page_len[:num_tokens]
-        paged_kv_indices = self.paged_kv_indices[: num_tokens * self.topk_tokens]
+        paged_kv_indices = self.paged_kv_indices[: num_tokens * self.topk_out_width]
         paged_kv_indptr = self.paged_kv_indptr[: num_tokens + 1]
 
         # ----- Compute persistent MLA metadata -----
@@ -2450,9 +2482,21 @@ class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
                 seq_lens_cpu = getattr(common_attn_metadata, "_seq_lens_cpu", None)
             if seq_lens_cpu is None:
                 seq_lens_cpu = seq_lens.cpu()
-            clamped_seq_lens = torch.clamp(
-                seq_lens_cpu[:num_reqs], max=self.topk_tokens
-            )
+            seq_lens_cpu = seq_lens_cpu[:num_reqs]
+            if self.index_kpool > 1:
+                # The pooled indexer selects whole pools and always appends the
+                # open tail, so a decode row's sparse length is NOT
+                # min(seq_len, topk): past topk it still moves with
+                # seq_len % index_kpool, every step. Key on the length
+                # `generate_sparse_seqlen_kernel` writes, or a cache hit replays
+                # a work split for a different paged_kv_indptr.
+                kpool = self.index_kpool
+                pools = torch.clamp(
+                    seq_lens_cpu // kpool, max=self.topk_tokens // kpool
+                )
+                clamped_seq_lens = pools * kpool + seq_lens_cpu % kpool
+            else:
+                clamped_seq_lens = torch.clamp(seq_lens_cpu, max=self.topk_tokens)
             metadata_key = (
                 num_tokens,
                 self.padded_num_heads,
@@ -2552,6 +2596,26 @@ class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
         )
 
 
+def expand_block_table_rows(
+    block_table: torch.Tensor,
+    decode_lens: torch.Tensor,
+    out: torch.Tensor,
+    num_rows: int,
+) -> None:
+    """Repeat each request's block-table row once per decode token into `out`.
+
+    `out` is sized for `max_model_len` in kernel blocks. vLLM can hand over a
+    wider table: it rounds every request up to whole manager blocks, and a
+    hybrid model's indexer group can get a manager block several times the
+    attention one (GLM-5.3-Flash's dense indexer: 8192 tokens, 128 kernel
+    blocks, at max_model_len 2048, where `out` holds 32). The extra columns
+    address no position below `max_model_len`, so they are dropped.
+    """
+    out[:num_rows] = torch.repeat_interleave(
+        block_table[:, : out.shape[1]], decode_lens, dim=0, output_size=num_rows
+    )
+
+
 class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
     reorder_batch_threshold = 1
@@ -2604,6 +2668,29 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
             self.model_config.max_model_len
         )
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+
+        # GLM-5.3-Flash's pooled cache holds one row per `tokens_per_state`
+        # tokens, and the decode scorer pages over those rows. It computes
+        # correctly only in the preshuffled layout, which needs the rows per
+        # block to be a multiple of MQA_LOGITS_PRESHUFFLE_ROWS -- the same
+        # check native ATOM makes in `kimi_mla_gdn_attn._index_rows_per_block`.
+        # `block_size` here is the KERNEL block vLLM split the manager block
+        # into, which is what `block_table` and the cache view are paged in.
+        block_size = getattr(kv_cache_spec, "block_size", None)
+        tokens_per_state = int(getattr(kv_cache_spec, "tokens_per_state", 1) or 1)
+        if block_size and tokens_per_state > 1:
+            from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
+                MQA_LOGITS_PRESHUFFLE_ROWS,
+            )
+
+            rows_per_block, rem = divmod(block_size, tokens_per_state)
+            if rem or rows_per_block % MQA_LOGITS_PRESHUFFLE_ROWS:
+                raise ValueError(
+                    f"Pooled indexer KV block size {block_size} gives "
+                    f"{block_size / tokens_per_state:g} rows per block at "
+                    f"tokens_per_state={tokens_per_state}; the decode scorer "
+                    f"needs a whole multiple of {MQA_LOGITS_PRESHUFFLE_ROWS}."
+                )
 
         # Determine if this builder is for draft model layers (MTP).
         # Draft model layers have layer indices >= num_hidden_layers.
@@ -2672,7 +2759,13 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
         )
 
     def _build_indexer_one_prefill_chunk(
-        self, reqs_start, reqs_end, query_start_loc_cpu, seq_lens_cpu, block_table
+        self,
+        reqs_start,
+        reqs_end,
+        query_start_loc_cpu,
+        seq_lens_cpu,
+        block_table,
+        tokens_per_state=1,
     ):
         prefill_query_start_loc = (
             query_start_loc_cpu[reqs_start : reqs_end + 1]
@@ -2699,6 +2792,18 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
             .to(torch.int32)
             .to(self.device)
         )
+        pool_cu_seq_lens = None
+        total_pools = 0
+        if tokens_per_state > 1:
+            # Only COMPLETE pools are cached and scored; the open tail rides
+            # along in `expand_pools_and_append_tail`.
+            pool_counts = seq_lens_cpu[reqs_start:reqs_end] // tokens_per_state
+            pool_cu_cpu = torch.cat(
+                [torch.zeros(1, dtype=torch.int32), pool_counts.cumsum(dim=0)]
+            ).to(torch.int32)
+            total_pools = int(pool_cu_cpu[-1].item())
+            pool_cu_seq_lens = pool_cu_cpu.to(self.device)
+
         return AiterMlaSparseIndexerPrefillChunkMetadataForVllm(
             cu_seqlen_ks=cu_seqlen_ks,
             cu_seqlen_ke=cu_seqlen_ke,
@@ -2709,6 +2814,10 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
             token_start=token_start,
             token_end=token_end,
             num_reqs=reqs_end - reqs_start,
+            reqs_start=reqs_start,
+            reqs_end=reqs_end,
+            pool_cu_seq_lens=pool_cu_seq_lens,
+            total_pools=total_pools,
         )
 
     def _build_indexer(
@@ -2729,6 +2838,14 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
 
         num_reqs = common_attn_metadata.num_reqs
         num_tokens = common_attn_metadata.num_actual_tokens
+        # Tokens per cached indexer row (GLM-5.3-Flash's pooled indexer) and
+        # the rows one `block_table` block then holds. The builder's spec
+        # carries the KERNEL block size vLLM split the manager block into, the
+        # granularity of both `block_table_tensor` and the cache view. Read
+        # here, before the prefill chunks are built: they size their pooled
+        # gather from it.
+        tokens_per_state = int(getattr(self.kv_cache_spec, "tokens_per_state", 1) or 1)
+        rows_per_block = self.kv_cache_spec.block_size // tokens_per_state
 
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
@@ -2759,6 +2876,7 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
                     query_start_loc_cpu,
                     seq_lens_cpu,
                     common_attn_metadata.block_table_tensor,
+                    tokens_per_state,
                 )
                 for reqs_start, reqs_end in chunk_seq_ids
             ]
@@ -2843,10 +2961,11 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
 
                 # Give each of the flattened entries the same block table row as the
                 # original request.
-                self.expanded_block_table_buffer[:actual_expanded] = (
-                    torch.repeat_interleave(
-                        block_table, decode_lens, dim=0, output_size=actual_expanded
-                    )
+                expand_block_table_rows(
+                    block_table,
+                    decode_lens,
+                    self.expanded_block_table_buffer,
+                    actual_expanded,
                 )
                 if actual_expanded < num_decode_tokens:
                     self.expanded_block_table_buffer[
@@ -2903,6 +3022,8 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
             query_start_loc=common_attn_metadata.query_start_loc,
             slot_mapping=common_attn_metadata.slot_mapping,
             head_dim=128,
+            tokens_per_state=tokens_per_state,
+            rows_per_block=rows_per_block,
             num_decodes=num_decodes,
             num_decode_tokens=num_decode_tokens,
             num_prefills=num_prefills,
