@@ -1082,33 +1082,38 @@ def fused_allreduce_gemma_rms_norm_quant(
 # ---------------------------------------------------------------------------
 # AR + Gemma RMSNorm + MXFP8 (E4M3, E8M0 scale per 32) in one launch
 # ---------------------------------------------------------------------------
+def _ar_one_stage(comm, hidden_states: torch.Tensor) -> bool:
+    """Whether the unquantized ``fused_allreduce_rmsnorm`` reduces
+    ``hidden_states`` with its 1-stage kernel (same size rule and overrides)."""
+    total_bytes = hidden_states.numel() * hidden_states.element_size()
+    limit = getattr(comm, "_ar_1stage_max_bytes", -1)
+    override = getattr(comm, "_ar_1stage_override", None)
+    if override is not None:
+        return override
+    return total_bytes <= (limit if limit >= 0 else 128 * 7168 * 2 // comm.world_size)
+
+
 def _custom_ar_mxfp8(comm, hidden_states: torch.Tensor) -> bool:
     """Whether the TP group's custom all-reduce runs the fused MXFP8 epilogue
     on ``hidden_states``: an aiter with the per-group ``mx_scale`` mode, the
     custom all-reduce's own limits, and an input the unquantized
-    ``fused_allreduce_rmsnorm`` would reduce with its 1-stage kernel (same
-    size rule and overrides). Only there is the fused epilogue's RMSNorm the
+    ``fused_allreduce_rmsnorm`` would reduce with its 1-stage kernel
+    (``_ar_one_stage``). Only there is the fused epilogue's RMSNorm the
     unquantized one bit for bit: past it the unquantized path switches to
     ``fusedAllReduceRMSNorm2Stage`` / the split kernel, which sum the squares
-    in another order (1 ulp apart on a few elements), so larger inputs keep
-    AR + RMSNorm and the separate quant and the fused path stays an exact A/B."""
+    in another order (1 ulp apart on a few elements), so by default larger
+    inputs keep AR + RMSNorm and the separate quant and the fused path stays an
+    exact A/B. ``ATOM_M3_FUSE_MXFP8_QUANT_2STAGE`` takes the fused epilogue on
+    the 2-stage kernel there too (decided here, inside the custom op: the
+    compile cache key ignores env vars)."""
     ca = getattr(comm, "ca_comm", None)
     if ca is None or "mx_scale" not in _signature_params(
         ca.custom_fused_ar_rms_per_group_quant
     ):
         return False
     k = hidden_states.shape[-1]
-    total_bytes = hidden_states.numel() * hidden_states.element_size()
-    # The 1-stage choice of the unquantized fused_allreduce_rmsnorm.
-    limit = getattr(comm, "_ar_1stage_max_bytes", -1)
-    override = getattr(comm, "_ar_1stage_override", None)
-    one_stage = (
-        override
-        if override is not None
-        else total_bytes <= (limit if limit >= 0 else 128 * 7168 * 2 // comm.world_size)
-    )
     return (
-        one_stage
+        (_ar_one_stage(comm, hidden_states) or envs.ATOM_M3_FUSE_MXFP8_QUANT_2STAGE)
         and k % 32 == 0
         and k <= 16384
         and k // 8 <= 1024
@@ -1170,7 +1175,9 @@ def _fused_ar_gemma_rms_norm_mxfp8(
             weight,
             eps,
             32,
-            True,  # the 1-stage kernel, as the unquantized path takes here
+            # the kernel the unquantized path takes for this size (2-stage only
+            # under ATOM_M3_FUSE_MXFP8_QUANT_2STAGE)
+            _ar_one_stage(comm, hidden_states),
             emit_bf16=emit_bf16,
             gemma_norm=True,
             mx_scale=True,

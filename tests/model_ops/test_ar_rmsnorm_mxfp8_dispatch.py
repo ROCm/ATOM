@@ -16,7 +16,7 @@ import torch
 
 pytest.importorskip("aiter")
 
-from atom.model_ops.layernorm import _custom_ar_mxfp8
+from atom.model_ops.layernorm import _ar_one_stage, _custom_ar_mxfp8
 
 H = 6144
 
@@ -106,3 +106,20 @@ def test_no_custom_all_reduce():
 def test_shape_and_group_limits():
     assert not _custom_ar_mxfp8(_Comm(_CA()), _rows(4, k=6144 + 16))
     assert not _custom_ar_mxfp8(_Comm(_CA(), world_size=6), _rows(4))
+
+
+@pytest.mark.parametrize("rows", [38, 160, 192, 4120])
+def test_two_stage_switch_takes_the_fused_epilogue_past_the_one_stage_range(
+    monkeypatch, rows
+):
+    # ATOM_M3_FUSE_MXFP8_QUANT_2STAGE: the fused epilogue on aiter's 2-stage kernel
+    monkeypatch.setenv("ATOM_M3_FUSE_MXFP8_QUANT_2STAGE", "1")
+    comm = _Comm(_CA())
+    assert _custom_ar_mxfp8(comm, _rows(rows))
+    assert not _ar_one_stage(comm, _rows(rows))
+
+
+def test_two_stage_switch_keeps_the_one_stage_kernel_where_it_applies(monkeypatch):
+    monkeypatch.setenv("ATOM_M3_FUSE_MXFP8_QUANT_2STAGE", "1")
+    comm = _Comm(_CA())
+    assert _custom_ar_mxfp8(comm, _rows(37)) and _ar_one_stage(comm, _rows(37))

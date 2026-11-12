@@ -590,6 +590,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_M3_FUSE_MXFP8_QUANT": lambda: (
         os.getenv("ATOM_M3_FUSE_MXFP8_QUANT", "1") == "1"
     ),
+    # MiniMax-M3, with ATOM_M3_FUSE_MXFP8_QUANT: also take the fused AR + RMSNorm
+    # + MXFP8 epilogue past the 1-stage range, on aiter's 2-stage kernel (decode
+    # batches of 38+ rows at TP4, prefill). Not bitwise: the separate path's
+    # 2-stage RMSNorm sums the squares in another order (1 ulp apart on a few
+    # elements). 0 keeps the separate quant there, an exact A/B.
+    "ATOM_M3_FUSE_MXFP8_QUANT_2STAGE": lambda: (
+        os.getenv("ATOM_M3_FUSE_MXFP8_QUANT_2STAGE", "0") == "1"
+    ),
     # MiniMax-M3.1 on gfx950: for steps of at most 16 rows, run the router
     # GEMV, sigmoid top-4 gate and the MoE sort as one kernel that hands its sort
     # to aiter's fused_moe (atom/model_ops/minimax_m3/router). 0 disables it.
