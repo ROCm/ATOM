@@ -52,8 +52,10 @@ from atom.kv_transfer.offload._offload_common import (
     OffloadWorkerMixin,
     build_offload_engine,
     pp_aware_rank_and_world,
+    record_save_fence,
     tokens_to_tensor,
     validated_kv_role,
+    wait_save_fence,
 )
 from atom.kv_transfer.offload.chunked_scheduler import (
     DENSE_PAGE_SOURCE_QUIESCENT_CHANNEL,
@@ -225,9 +227,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                     # rejects this step's saves; loads must still be submitted
                     # and report a terminal result.
                     try:
-                        candidate_event = torch.cuda.Event()
-                        candidate_event.record(torch.cuda.current_stream())
-                        save_ready_event = candidate_event
+                        save_ready_event = record_save_fence()
                         self._save_fence_failure_logged = False
                     except Exception:
                         save_fence_failed = True
@@ -405,12 +405,10 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
 
         tok_tensor = tokens_to_tensor(toks)
         t_store0 = time.perf_counter()
-        # Wait on the producing stream before this thread reads KV. An event
-        # that only records the fence (the unit-test double) has no
-        # synchronize; the same event is still handed to store() below.
-        synchronize = getattr(producer_event, "synchronize", None)
-        if synchronize is not None:
-            synchronize()
+        # Wait on the producing stream before this thread reads KV; the same
+        # event is still handed to store() below.
+        if producer_event is not None:
+            wait_save_fence(producer_event)
         self._reset_gpu_connector_transfer_stats()
         gpu_connector = self._engine.gpu_connector
         track_source = getattr(gpu_connector, "track_save_source", None)
