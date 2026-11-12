@@ -625,16 +625,7 @@ class GDNStateMixin(PoolRowsMixin):
         not, so it overrides unconditionally
         (`_KimiMLAGDNCommon.state_transfer`).
         """
-        if not envs.ATOM_GDN_STATE_MIDSTEP:
-            return StateTransfer.fork(1, readable_midstep=False)
-        from atom.model_ops.fla_ops.chunk import CHUNK_SIZE
-
-        return StateTransfer.fork(
-            1,
-            readable_midstep=True,
-            midstep_grid=CHUNK_SIZE,
-            midstep_min_offset=self._conv_state_len(),
-        )
+        return StateTransfer.fork(1, readable_midstep=False)
 
     def num_state_layers(self) -> int:
         """Layers holding a recurrent state, one slot each.
