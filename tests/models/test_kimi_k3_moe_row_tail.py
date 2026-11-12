@@ -82,6 +82,31 @@ def ranks(monkeypatch):
     return run
 
 
+class _Stub(nn.Module):
+    """Stands in for a sub-module class; the test sets `fn` after `__init__`."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__()
+
+    def forward(self, *args):
+        return self.fn(*args)
+
+
+@pytest.fixture(autouse=True)
+def stub_block_parts(monkeypatch):
+    """`KimiSparseMoeBlock.__init__` runs for real on CPU: its sub-modules are
+    stubs, the TP size is WORLD and its config registers into one context."""
+    for name in ("ReplicatedLinear", "FusedMoE", "KimiMLP", "RMSNorm"):
+        monkeypatch.setattr(kimi, name, _Stub)
+    monkeypatch.setattr(kimi, "get_tensor_model_parallel_world_size", lambda: WORLD)
+    config = SimpleNamespace(
+        enable_tbo=False,
+        compilation_config=SimpleNamespace(static_forward_context={}),
+    )
+    monkeypatch.setattr(kimi, "get_current_atom_config", lambda: config)
+    monkeypatch.setattr(module_dispatch_ops, "get_current_atom_config", lambda: config)
+
+
 def _weights():
     gen = torch.Generator().manual_seed(3)
     shapes = {
@@ -99,20 +124,32 @@ def _weights():
 def _block(w, rank, up_rows):
     """A latent block whose stub experts return this rank's share of the
     sum, as the real ones do before the all-reduce."""
-    block = kimi.KimiSparseMoeBlock.__new__(kimi.KimiSparseMoeBlock)
-    nn.Module.__init__(block)
-    block.tp_size, block.use_latent_moe = WORLD, True
-    block.fuse_routed_triton_mxfp4_quant = False
+    config = SimpleNamespace(
+        hidden_size=HIDDEN,
+        num_experts=EXPERTS,
+        num_experts_per_token=2,
+        routed_expert_hidden_size=LATENT,
+        moe_intermediate_size=HIDDEN,
+        moe_renormalize=True,
+        moe_router_activation_func="sigmoid",
+        num_shared_experts=1,
+        latent_moe_use_norm=True,
+        rms_norm_eps=1e-6,
+    )
+    # The model threads a stream into every block with shared experts.
+    block = kimi.KimiSparseMoeBlock(
+        config, prefix=f"rank{rank}.mlp", alt_stream=object()
+    )
     share = (rank + 1) / (WORLD * (WORLD + 1) / 2)
-    block.gate = lambda x: x @ w["gate"]
-    block.routed_expert_down_proj = lambda x: x @ w["down"]
-    block.experts = lambda x, logits: share * torch.tanh(
+    block.gate.fn = lambda x: x @ w["gate"]
+    block.routed_expert_down_proj.fn = lambda x: x @ w["down"]
+    block.experts.fn = lambda x, logits: share * torch.tanh(
         x * logits.sum(-1, keepdim=True)
     )
-    block.shared_experts = lambda x: share * torch.tanh(x @ w["shared"])
+    block.shared_experts.fn = lambda x: share * torch.tanh(x @ w["shared"])
     # RMS norm with eps, so padded (zero) rows stay zero as in the model; in
     # FP32, as there, since a BF16 CPU mean rounds differently by row count.
-    block.routed_expert_norm = lambda x: (
+    block.routed_expert_norm.fn = lambda x: (
         x.float() * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + 1e-6)
     ).to(x.dtype)
 
@@ -120,7 +157,7 @@ def _block(w, rank, up_rows):
         up_rows.append(x.shape[0])
         return x @ w["up"]
 
-    block.routed_expert_up_proj = up_proj
+    block.routed_expert_up_proj.fn = up_proj
     return block
 
 
@@ -158,11 +195,6 @@ def test_forward_with_dual_stream_off_takes_the_row_sharded_tail(ranks, monkeypa
     """A threshold of 0 turns dual-stream off; the block still goes through
     the split op, whose single-stream target shards the tail."""
     monkeypatch.setenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "0")
-    blocks = {}
-    config = SimpleNamespace(
-        compilation_config=SimpleNamespace(static_forward_context=blocks)
-    )
-    monkeypatch.setattr(module_dispatch_ops, "get_current_atom_config", lambda: config)
     # The op is registered for CUDA only; call its Python body on CPU tensors.
     monkeypatch.setattr(
         torch.ops.aiter,
@@ -170,16 +202,9 @@ def test_forward_with_dual_stream_off_takes_the_row_sharded_tail(ranks, monkeypa
         module_dispatch_ops.maybe_dual_stream_split_forward,
     )
 
-    def forward(block, x):
-        block.prefix = str(id(block))
-        block._use_dual_stream, block._use_dispatch_op = False, True
-        block._defer_shared_add = True
-        blocks[block.prefix] = block
-        return block.forward(x)
-
     tokens = 13
     for (routed, shared), (summed, zeros), up_rows in _base_and_op_target(
-        ranks, tokens, forward
+        ranks, tokens, lambda block, x: block.forward(x)
     ):
         assert up_rows == [tokens, -(-tokens // WORLD)]
         assert not zeros.any()
