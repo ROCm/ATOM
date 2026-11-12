@@ -352,7 +352,6 @@ class MoriIOScheduleTest(unittest.TestCase):
             dict(
                 cls.lane(schedule),
                 GITHUB_EVENT_NAME="schedule",
-                EVENT_SCHEDULE=schedule,
                 SUITE="nightly",
                 RUN_ALL_MODELS="true",
                 MODEL_NAMES="",
@@ -373,7 +372,7 @@ class MoriIOScheduleTest(unittest.TestCase):
         runner = "ATOMESH_SLURM_SUBMIT_RUNNER"
         self.assertEqual(self.lane(SPUR_MORIIO)[runner], "atomesh-cicd-mi350")
 
-    def test_the_moriio_cron_has_a_concurrency_group_of_its_own(self):
+    def test_scheduled_runs_use_the_moriio_concurrency_group(self):
         group = self.workflow["concurrency"]["group"]
         prefix = "Atomesh Benchmark-refs/heads/main-"
         self.assertEqual(
