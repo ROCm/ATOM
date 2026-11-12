@@ -100,9 +100,12 @@ _MAILBOX_ARCHES = ("gfx950", "gfx1250")
 def _mailbox_runtime():
     """The private aiter IPC API used only while opening a mailbox.
 
+    Needs ROCm/aiter main at de06bd30b (#6974) or later, the first commit with
+    every name used here (``IPCBufferPool.open_peer_buffers`` included).
     Validated with ROCm/aiter@55cde6a0c49cc04f39f6141e312938a8c48e61fb.
-    ``CandidateMailbox`` uses ``create(raw_cached=True)``; cached hipIPC needs
-    ROCm 7.14 or later, and unsupported/VMM setups take the collective fallback.
+    ``CandidateMailbox`` uses ``create(raw_cached=True)`` and requires ROCm 7.14
+    or later (aiter's gfx1250 hipIpc floor, applied on every arch); older ROCm
+    or VMM setups take the collective fallback.
     """
     from aiter.dist.device_communicators.custom_all_reduce import (
         IPCBufferPool,
