@@ -741,6 +741,33 @@ def _realtime():
     )
 
 
+def _cycles():
+    """The core-clock cycle counter's low word (``llvm.readcyclecounter``)."""
+    from flydsl._mlir.dialects import llvm
+
+    return fx.Int32(
+        fx.Int64(llvm.call_intrinsic(T.i64, "llvm.readcyclecounter", [], [], []))
+    )
+
+
+def _lds_barrier():
+    """A workgroup barrier for LDS alone: this wave's LDS traffic drained,
+    then signal and wait. ``gpu.barrier``'s workgroup fence also waits out
+    every global store first (s_wait_storecnt 0) -- an epilogue's device-scope
+    stores, a down tile's output -- which nothing past these barriers reads;
+    the one release that needs them (a gate/up flag) drains them itself. As
+    side-effecting asm it keeps the compiler's memory ops on their side."""
+    from flydsl._mlir.dialects import llvm
+
+    llvm.inline_asm(
+        None,
+        [],
+        "s_wait_dscnt 0x0\n s_barrier_signal -1\n s_barrier_wait -1",
+        "",
+        has_side_effects=True,
+    )
+
+
 @traced
 def _bounded_wait(flags, slot, tag, state, bid):
     """Until expert ``slot``'s four gate/up flags carry ``tag``; past
@@ -987,6 +1014,16 @@ def build_moe(rows: int, profile: bool = False) -> MoeKernel:
         _stage_latent(latent, scales, rows, tid, lds, LATENT_LDS_WORDS)
         # A task's flag goes out a K tile into the next, its stores drained.
         pending = fx.Int32(-1)
+        up_wait = fx.Int32(0)
+        up_epilogue = fx.Int32(0)
+
+        def clock():
+            return _cycles() if profile else fx.Int32(0)
+
+        def since(before):
+            return clock() - before
+
+        up_start = clock()
         n = fx.Int32(0)
         while n < mine:
             task = bid + n * 256
@@ -1002,42 +1039,57 @@ def build_moe(rows: int, profile: bool = False) -> MoeKernel:
             accumulators = [fx.Vector.filled(16, 0.0, fx.Float32) for _ in range(tiles)]
             for tile_k in range_constexpr(k_tiles):
                 item = n * k_tiles + tile_k
+                before = clock()
                 wait_for(item)
                 if const_expr(tile_k == k_tiles - 2):
                     rocdl.s_wait_storecnt(0)
-                gpu.barrier()
+                _lds_barrier()
+                up_wait = up_wait + since(before)
                 if const_expr(tile_k == k_tiles - 2):  # noqa: SIM102
                     if (tid == 0) & (pending >= 0):
                         publish(pending)
                 if item + ring - 1 < flat:
                     issue(item + ring - 1, (item + ring - 1) % ring)
                 stage = smem.stages.ptr + (item % ring) * (SLOT_BYTES // 4)
-                item_scale = (
-                    smem.item_scales.ptr
-                    + (item % ring) * SCALE_WORDS
-                    + fx.min(wave, UP_WAVES - 1) * STEPS * 32
-                    + lane
-                )
-                for step in range_constexpr(STEPS):
-                    k_step = tile_k * STEPS + step
-                    weight = _weight_operand(
-                        stage, fx.min(wave, UP_WAVES - 1), lane, step
+                # One branch a wave (6 and 7 hold no rows), then every K step's
+                # weights and scales loaded ahead of the first tile's WMMA chain:
+                # a tile's own branch held the loads behind each WMMA.
+                if wave < UP_WAVES:
+                    item_scale = (
+                        smem.item_scales.ptr
+                        + (item % ring) * SCALE_WORDS
+                        + wave * STEPS * 32
+                        + lane
                     )
+                    weights = [
+                        _weight_operand(stage, wave, lane, step)
+                        for step in range(STEPS)
+                    ]
+                    weight_scales = [
+                        fx.ptr_load(item_scale + step * 32) for step in range(STEPS)
+                    ]
                     for m in range_constexpr(tiles):
-                        if (m == 0 or m * 16 < count) & (wave < UP_WAVES):
-                            activation = _activation_fragment(
-                                lds["latq"], LATENT_LDS_WORDS, tokens[m], k_step, lane
-                            )
-                            activation_scale = fx.ptr_load(
-                                lds["latsc"] + tokens[m] * (LATENT_SCALES // 4) + k_step
-                            )
-                            accumulators[m] = _wmma(
-                                weight,
-                                activation,
-                                accumulators[m],
-                                fx.ptr_load(item_scale + step * 32),
-                                activation_scale,
-                            )
+                        if m == 0 or m * 16 < count:
+                            for step in range_constexpr(STEPS):
+                                k_step = tile_k * STEPS + step
+                                accumulators[m] = _wmma(
+                                    weights[step],
+                                    _activation_fragment(
+                                        lds["latq"],
+                                        LATENT_LDS_WORDS,
+                                        tokens[m],
+                                        k_step,
+                                        lane,
+                                    ),
+                                    accumulators[m],
+                                    weight_scales[step],
+                                    fx.ptr_load(
+                                        lds["latsc"]
+                                        + tokens[m] * (LATENT_SCALES // 4)
+                                        + k_step
+                                    ),
+                                )
+            before = clock()
             for m in range_constexpr(tiles):
                 if m == 0 or m * 16 < count:
                     if wave < UP_WAVES:
@@ -1045,7 +1097,7 @@ def build_moe(rows: int, profile: bool = False) -> MoeKernel:
                             accumulators[m],
                             lds["red"] + (wave * GFX1250.wave_size + lane) * 16,
                         )
-                    gpu.barrier()
+                    _lds_barrier()
                     if wave < UP_ROWS // 64:
                         _epilogue(
                             lds,
@@ -1060,19 +1112,22 @@ def build_moe(rows: int, profile: bool = False) -> MoeKernel:
                             in_row=True,
                             pairs=UP_ROWS // 64,
                         )
-                    gpu.barrier()
+                    _lds_barrier()
+            up_epilogue = up_epilogue + since(before)
             pending = slot * FLAG_WORDS + block
             n = n + 1
         rocdl.s_wait_storecnt(0)
-        gpu.barrier()
+        _lds_barrier()
         if (tid == 0) & (pending >= 0):
             publish(pending)
+        up_cycles = since(up_start)
         stamp(2)
 
         rows_lds = lds["latq"]
         current = fx.Int32(-1)
         waited = fx.Int32(0)
         switches = fx.Int32(0)
+        down_wait = fx.Int32(0)
         i = fx.Int32(0)
         while i < downs:
             slot, tile = down_tile(i)
@@ -1082,7 +1137,7 @@ def build_moe(rows: int, profile: bool = False) -> MoeKernel:
                 before = fx.Int32(_realtime()) if profile else fx.Int32(0)
                 if tid == 0:
                     _bounded_wait(flags, slot, tag, state, bid)
-                gpu.barrier()
+                _lds_barrier()
                 if const_expr(profile):
                     waited = waited + (fx.Int32(_realtime()) - before)
                     switches = switches + 1
@@ -1103,8 +1158,10 @@ def build_moe(rows: int, profile: bool = False) -> MoeKernel:
                         )
             current = slot
             item = up_items + i
+            before = clock()
             wait_for(item)
-            gpu.barrier()
+            _lds_barrier()
+            down_wait = down_wait + since(before)
             if item + ring - 1 < flat:
                 issue(item + ring - 1, (item + ring - 1) % ring)
             stage = smem.stages.ptr + (item % ring) * (SLOT_BYTES // 4)
@@ -1155,6 +1212,10 @@ def build_moe(rows: int, profile: bool = False) -> MoeKernel:
             if tid == 0:
                 st_dev(waited, state, MOE_STATE_WORDS + 256 * 5 + bid * 2)
                 st_dev(switches, state, MOE_STATE_WORDS + 256 * 5 + bid * 2 + 1)
+                st_dev(up_wait, state, MOE_STATE_WORDS + 256 * 7 + bid * 3)
+                st_dev(up_epilogue, state, MOE_STATE_WORDS + 256 * 7 + bid * 3 + 1)
+                st_dev(down_wait, state, MOE_STATE_WORDS + 256 * 7 + bid * 3 + 2)
+                st_dev(up_cycles, state, MOE_STATE_WORDS + 256 * 10 + bid)
         if tid == 0:  # noqa: SIM102
             if task_queue.take(task_queue.word(state + 4)) == 255:
                 st_dev(fx.Int32(0), state, 1)
