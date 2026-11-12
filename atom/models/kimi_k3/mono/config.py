@@ -349,10 +349,11 @@ def _served_connectors(atom_config) -> tuple[str, ...]:
     A producer, any other transport, or an offload tier beside it (`multi`)
     copies on streams of its own.
     """
-    kv = getattr(atom_config, "kv_transfer_config", None) or {}
+    from atom.kv_transfer.disaggregation.pd_producer import disaggregated_kv_role
+
     if (
-        atom_config.decode_context_parallel_size != 1
-        or kv.get("kv_role") != "kv_consumer"
+        atom_config.decode_context_parallel_size == 1
+        and disaggregated_kv_role(atom_config) == "kv_consumer"
     ):
-        return ()
-    return ("mooncake",)
+        return ("mooncake",)
+    return ()
