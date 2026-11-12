@@ -28,7 +28,8 @@ ATOM (AiTer Optimized Model) wraps AITER kernels with model-level abstractions f
 | `Sampler` | `sampler.py` | `aiter.mixed_sample_outer_exponential`, `aiter.ops.triton.topk.topk`, `aiter.ops.triton.softmax.softmax` | Token sampling |
 | `RejectionSampler` | `rejection_sampler.py`, `verify_kernels.py`, `spec_sampling/` (`ratio_verify.py`, `ratio_target_p.py`) | Triton `rejection_greedy_sample_kernel`, `_ratio_*`, `rejection_relaxed_sample_kernel`, `rejection_synthetic_sample_kernel` | Speculative decoding |
 | `apply_packed_bitmask` | `triton_token_constraints.py` | Triton packed-bitmask kernel | JSON grammar masks on selected target logits |
-| `constrain_logits`, `advance_states` | `required_channel.py` | Triton `_constrain_logits_kernel`, `_advance_states_kernel` | `tool_choice="required"` channel mask (Kimi-K3) |
+| `constrain_logits`, `advance_states` | `required_channel.py` (lazy entry), `triton_required_channel.py` (kernels) | Triton `_constrain_logits_kernel`, `_advance_states_kernel` | `tool_choice="required"` channel mask (Kimi-K3) |
+| `guard_empty_rows` | `triton_token_constraints.py` | Triton `_finite_tiles` | Detect empty hard-mask intersections across constraint adapters |
 
 ## AITER integration overview
 
