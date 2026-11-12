@@ -9,6 +9,8 @@ their fused GPU state machine, while grammars keep packed masks and overlapped
 token copies. Neither backend is converted to a Python list of vocabulary IDs.
 """
 
+import logging
+
 import torch
 
 from atom.constraint_parser import ConstraintBinding, register_constraint_request_owner
@@ -17,6 +19,8 @@ from atom.model_ops.required_channel import (
     advance_states,
     constrain_logits,
 )
+
+logger = logging.getLogger("atom")
 
 _PROVIDERS = []
 
@@ -37,7 +41,15 @@ def register_constraint_provider(provider):
         raise TypeError("Constraint adapters must declare mask_stage and commit_order")
     owns_request = getattr(provider, "owns_request", None)
     if owns_request is not None:
+        # Process-local: the engine/coordinator process must register the same
+        # predicate itself (see docs/token_constraint_interface.md).
         register_constraint_request_owner(provider.backend, owns_request)
+        logger.info(
+            "Constraint adapter %s registered its request-owner predicate in "
+            "this process only; the engine process must call "
+            "register_constraint_request_owner for release RPCs",
+            provider.backend,
+        )
     _PROVIDERS.append(provider)
     _PROVIDERS.sort(key=lambda adapter: adapter.mask_stage)
 
@@ -73,9 +85,25 @@ def prepare_token_constraints(runner, batch, metadata):
 
 
 def release_token_constraints(runner, request_ids):
-    """Release per-request backend resources through the same adapter contract."""
+    """Release per-request backend resources through the same adapter contract.
+
+    Every adapter is released even when another one fails, so one adapter's
+    error cannot leave a later adapter's request state (for example a grammar
+    matcher) allocated. The first failure is raised after all releases ran.
+    """
+    first_error = None
     for provider in _PROVIDERS:
-        provider.release(runner, request_ids)
+        try:
+            provider.release(runner, request_ids)
+        except Exception as error:
+            if first_error is None:
+                first_error = error
+            else:
+                logger.exception(
+                    "Constraint adapter %s release failed", provider.backend
+                )
+    if first_error is not None:
+        raise first_error
 
 
 def constraint_errors(runner):
@@ -226,7 +254,10 @@ class TokenConstraints:
         width = torch.arange(tokens.shape[1], device=tokens.device)[None, :]
         rows = start[:, None] + width
         draft = width < (end - start)[:, None]
-        bad = invalid[:, None].expand_as(tokens)
+        # A bonus-row failure applies only to the bonus position. Draft
+        # positions fail only through target-row failures, so a rejected
+        # draft's bonus row (never emitted) cannot fail the accepted output.
+        bad = invalid[:, None] & ~draft
         if self.target_invalid is not None and self.target_invalid.numel():
             target_bad = self.target_invalid[
                 rows.clamp(max=self.target_invalid.numel() - 1).long()
