@@ -3803,7 +3803,9 @@ class ModelRunner:
                 self.tokenID_processor.prev_token_ids = next_token_ids
                 # A producer that skips propose keeps the bookkeeping above:
                 # its next step reads `prev_token_ids` like any other's.
-                if not self._producer_skips_propose():
+                if self._producer_skips_propose():
+                    self._commit_target_step(batch, anchors)
+                else:
                     draft_token_ids = self.propose_draft_token_ids(
                         batch,
                         self._draft_input_ids(batch, hidden_states),
@@ -3831,19 +3833,20 @@ class ModelRunner:
             else:
                 prev_rejected_num = np.zeros(batch.total_seqs_num, dtype=np.int32)
                 prev_bonus_num = np.zeros(batch.total_seqs_num, dtype=np.int32)
-            # PP stages and P/D producers still run the drafter, unless
-            # `_producer_skips_propose`.
-            if hasattr(self, "drafter") and not self._producer_skips_propose():
-                # Mid-prompt sequences get their anchor corrected inside
-                # propose_draft_token_ids, from `batch.next_token_ids`.
-                draft_token_ids = self.propose_draft_token_ids(
-                    batch,
-                    self._draft_input_ids(batch, hidden_states),
-                    hidden_states,
-                    next_token_ids,
-                    num_reject_tokens,
-                    anchors,
-                )
+            if hasattr(self, "drafter"):
+                if self._producer_skips_propose():
+                    self._commit_target_step(batch, anchors)
+                else:
+                    # Mid-prompt sequences get their anchor corrected inside
+                    # propose_draft_token_ids, from `batch.next_token_ids`.
+                    draft_token_ids = self.propose_draft_token_ids(
+                        batch,
+                        self._draft_input_ids(batch, hidden_states),
+                        hidden_states,
+                        next_token_ids,
+                        num_reject_tokens,
+                        anchors,
+                    )
 
         # DSpark Phase 2: carry this step's per-request ell back to the scheduler
         # as a {req_id: ell} dict (req_id-keyed avoids any output/draft batch
@@ -4112,6 +4115,19 @@ class ModelRunner:
             rows = hidden_states.shape[0]
         return self.tokenID_processor.input_ids.gpu[1 : rows + 1]
 
+    def _commit_target_step(self, batch: ScheduledBatch, anchors):
+        """Commit the target's tentative step at each request's anchor row and
+        return those rows; a producer that skips propose still owes this."""
+        last_token_indices = (
+            self.drafter.prepare_inputs(batch.total_seqs_num)
+            if anchors is None
+            else anchors
+        )
+        self.attn_metadata_builder.commit_speculative_state(
+            get_forward_context().attn_metadata, last_token_indices
+        )
+        return last_token_indices
+
     def propose_draft_token_ids(
         self,
         batch: ScheduledBatch,
@@ -4154,14 +4170,7 @@ class ModelRunner:
 
         assert isinstance(self.drafter, Drafter)
 
-        last_token_indices = (
-            self.drafter.prepare_inputs(batch.total_seqs_num)
-            if anchors is None
-            else anchors
-        )
-        self.attn_metadata_builder.commit_speculative_state(
-            forward_context.attn_metadata, last_token_indices
-        )
+        last_token_indices = self._commit_target_step(batch, anchors)
 
         draft_token = self.drafter.propose(
             target_token_ids=input_ids,

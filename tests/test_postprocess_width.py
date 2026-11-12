@@ -377,15 +377,15 @@ def test_a_producer_skips_propose_only_when_nothing_rides_on_it(
 def test_a_producer_skips_propose_on_either_output_path(
     monkeypatch, deferred, producer
 ):
-    """A producer outside PP defers its output, so the deferred branch must
-    skip propose too (a DSpark draft below its TP floor cannot run the block
-    pass); it still keeps the step's bookkeeping."""
+    """Either output path skips propose on a producer, keeps the step's
+    bookkeeping, and still commits the target's tentative step (V4.1)."""
     forward_mode = types.SimpleNamespace(running_tokens=2)
     monkeypatch.setattr(
         mod,
         "get_forward_context",
         lambda: types.SimpleNamespace(
             spec_decode_metadata=None,
+            attn_metadata="step",
             context=types.SimpleNamespace(forward_mode=forward_mode),
         ),
     )
@@ -398,8 +398,13 @@ def test_a_producer_skips_propose_on_either_output_path(
     runner = _runner({})
     runner._served = None
     runner.forward_done_event = types.SimpleNamespace(record=lambda stream=None: None)
-    runner.drafter = types.SimpleNamespace(draft_kv_duplicates_propose=False)
-    proposed, sent = [], []
+    runner.drafter = types.SimpleNamespace(
+        draft_kv_duplicates_propose=False, prepare_inputs=torch.arange
+    )
+    proposed, sent, commits = [], [], []
+    runner.attn_metadata_builder = types.SimpleNamespace(
+        commit_speculative_state=lambda md, rows: commits.append((md, rows.tolist()))
+    )
     drafts = np.array([[5], [6]], dtype=np.int32)
     runner.propose_draft_token_ids = lambda *a: proposed.append(a) or drafts
     runner.tokenID_processor.__dict__.update(
@@ -419,6 +424,8 @@ def test_a_producer_skips_propose_on_either_output_path(
 
     assert len(proposed) == (0 if producer else 1)
     assert out.draft_token_ids is (None if producer else drafts)
+    # Propose commits for the others; it is faked here.
+    assert commits == ([("step", [0, 1])] if producer else [])
     if deferred:
         assert len(sent) == 1
         assert out.num_rejected.tolist() == [1, 2]
