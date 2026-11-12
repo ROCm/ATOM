@@ -21,10 +21,10 @@ from atom.model_ops.required_channel import (
 def prepare_token_constraints(runner, batch, metadata):
     """After deferred input assembly, before forward: overlap grammar D2H."""
     if getattr(batch, "structured_requests", None):
-        runner.structured_output.prepare(batch, metadata)
+        GrammarProvider.prepare(runner, batch, metadata)
 
 
-def apply_required_channel(runner, batch, logits, metadata=None, target=None):
+def apply_required_channel(runner, batch, logits, metadata=None, target=None, preserve_masks=False):
     """GPU-only force/deny backend, also used by disaggregated prefill."""
     channel = batch.required_channel
     if channel is None:
@@ -42,7 +42,7 @@ def apply_required_channel(runner, batch, logits, metadata=None, target=None):
         logits,
         carried_from=tp.decode_src.gpu[:bs] if carried else None,
         carried_states=tp.prev_channel_states if carried else None,
-        preserve_masks=bool(getattr(batch, "structured_requests", None)),
+        preserve_masks=preserve_masks,
         target_logits=target,
         cu_num_draft_tokens=None if metadata is None else metadata.cu_num_draft_tokens,
         input_ids=None if metadata is None else metadata.input_ids,
@@ -67,51 +67,40 @@ class TokenConstraints:
         if not requests and batch.required_channel is None:
             return None
         step = cls()
-        step.grammar = getattr(runner, "structured_output", None) if requests else None
-        if requests and step.grammar is None:
-            raise ValueError("Structured output must be prepared before enqueue")
-        if requests and logits.shape[-1] != step.grammar.vocab_size:
-            raise ValueError(
-                "Target logits do not match the prepared structured vocabulary"
-            )
-        bs = batch.total_seqs_num
-        step.prefixes = step.grammar.apply(logits, batch, metadata) if requests else {}
-        if metadata is None:
-            step.logits = logits[:bs]
-            step.target = None
-        else:
-            step.logits = torch.index_select(logits, 0, metadata.bonus_logits_indices)
-            step.target = torch.index_select(logits, 0, metadata.target_logits_indices)
-        step.channel = apply_required_channel(
-            runner, batch, step.logits, metadata, step.target
-        )
-        step.invalid = None
-        step.target_invalid = None
-        step.metadata = metadata
-        if requests and step.channel is not None:
-            # Conflicting hard rules must fail, never silently relax a rule or
-            # let an all-infinite row produce NaNs. The safe ID stays GPU-only;
-            # failure travels with the existing asynchronous output copy.
-            step.invalid = _guard_empty_rows(step.logits)
-            if step.target is not None:
-                step.target_invalid = _guard_empty_rows(step.target)
+        step.runner, step.batch, step.metadata = runner, batch, metadata
+        step.source = logits
+        step.logits = step.target = None
+        step.grammar = None
+        step.prefixes = {}
+        step.channel = None
+        step.invalid = step.target_invalid = None
+        step.providers = []
+        if requests:
+            step.providers.append(GrammarProvider())
+        if batch.required_channel is not None:
+            step.providers.append(ChannelProvider())
+        for provider in step.providers:
+            provider.apply(step)
+        step.gather()
         return step
 
     def commit(self, sampled_tokens, batch, deferred, failure):
         """Consume synchronized, accepted IDs, never unverified draft IDs."""
-        channel_states = (
-            advance_states(*self.channel, sampled_tokens)
-            if self.channel is not None and deferred
-            else None
-        )
-        if self.prefixes:
-            output = (
-                sampled_tokens
-                if failure is None
-                else _error_tokens(sampled_tokens, failure)
-            )
-            self.grammar.commit(output, batch, self.prefixes)
+        channel_states = None
+        for provider in self.providers:
+            result = provider.commit(self, sampled_tokens, batch, deferred, failure)
+            if result is not None:
+                channel_states = result
         return channel_states
+
+    def gather(self):
+        if self.logits is not None:
+            return
+        if self.metadata is None:
+            self.logits = self.source[:self.batch.total_seqs_num]
+        else:
+            self.logits = torch.index_select(self.source, 0, self.metadata.bonus_logits_indices)
+            self.target = torch.index_select(self.source, 0, self.metadata.target_logits_indices)
 
     def failed(self, sampled):
         if self.invalid is None:
@@ -134,9 +123,63 @@ class TokenConstraints:
         return (bad & (tokens >= 0)).any(dim=1)
 
 
-def _guard_empty_rows(logits):
-    invalid = ~torch.isfinite(logits).any(dim=-1)
-    logits[:, 0] = torch.where(invalid, 0.0, logits[:, 0])
+class GrammarProvider:
+    @staticmethod
+    def prepare(runner, batch, metadata):
+        runner.structured_output.prepare(batch, metadata)
+
+    def apply(self, step):
+        step.grammar = getattr(step.runner, "structured_output", None)
+        if step.grammar is None:
+            raise ValueError("Structured output must be prepared before enqueue")
+        if step.source.shape[-1] != step.grammar.vocab_size:
+            raise ValueError("Target logits do not match the prepared structured vocabulary")
+        step.prefixes = step.grammar.apply(step.source, step.batch, step.metadata)
+
+    def commit(self, step, tokens, batch, deferred, failure):
+        if step.prefixes:
+            step.grammar.commit(tokens if failure is None else _error_tokens(tokens, failure),
+                                batch, step.prefixes)
+
+
+class ChannelProvider:
+    def apply(self, step):
+        step.gather()
+        requests = getattr(step.batch, "structured_requests", None)
+        preserve = False
+        if requests:
+            preserve = torch.zeros(step.batch.total_seqs_num, dtype=torch.bool,
+                                   device=step.logits.device)
+            preserve[list(requests)] = True
+        step.channel = apply_required_channel(step.runner, step.batch, step.logits,
+                                              step.metadata, step.target, preserve)
+        if requests and step.channel is not None:
+            intersection = preserve & (step.channel[1] >= 0)
+            step.invalid = _guard_empty_rows(step.logits, intersection)
+            if step.target is not None:
+                end = step.metadata.cu_num_draft_tokens
+                counts = end - torch.cat((torch.zeros_like(end[:1]), end[:-1]))
+                owners = torch.repeat_interleave(intersection, counts.long(),
+                                                output_size=step.target.shape[0])
+                step.target_invalid = _guard_empty_rows(step.target, owners)
+
+    def commit(self, step, tokens, batch, deferred, failure):
+        if step.channel is not None and deferred:
+            return advance_states(*step.channel, tokens)
+
+
+def _guard_empty_rows(logits, selected=None):
+    if selected is None:
+        selected = torch.ones(logits.shape[0], dtype=torch.bool, device=logits.device)
+    invalid = torch.zeros(logits.shape[0], dtype=torch.bool, device=logits.device)
+    if logits.is_cuda:
+        from atom.model_ops.required_channel_gpu import guard_empty_rows
+        return guard_empty_rows(logits, selected)
+    rows = selected.nonzero().flatten()
+    subset = logits.index_select(0, rows)
+    bad = ~torch.isfinite(subset).any(dim=-1)
+    invalid[rows] = bad
+    logits[rows, 0] = torch.where(bad, 0.0, subset[:, 0])
     return invalid
 
 

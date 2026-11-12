@@ -691,9 +691,9 @@ def tool_call_grammar_format(parser_cls, tools, tool_choice, starts_in_reasoning
         # would accept but cannot match within its budget fails the request at
         # decode time, after the client has been told it succeeded.
         check_schema_safety(function.get("parameters") or {})
-    grammar = parser_cls.tool_call_grammar(
+    grammar = parser_cls.parse(parser_cls.tool_grammar_rule(
         functions, required=required, starts_in_reasoning=starts_in_reasoning
-    )
+    ), None)
     if grammar is None:
         return None
     return json.dumps({"kind": "lark", "grammar": grammar})

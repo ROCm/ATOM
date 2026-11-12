@@ -53,9 +53,10 @@ def test_masks_precede_sampling_and_commit_uses_final_ids(
     )
     logits = torch.arange(32, dtype=torch.float32).view(4, 8)
     raw = logits.clone()
-    channel_state = (object(), object())
+    channel_state = (object(), torch.tensor([0, -1]))
 
-    def channel_mask(runner, batch, bonus, metadata, target):
+    def channel_mask(runner, batch, bonus, metadata, target, preserve_masks):
+        torch.testing.assert_close(preserve_masks, torch.tensor([True, False]))
         events.append("channel")
         assert torch.isneginf(bonus[:, 7]).all()
         bonus[:, 6] = -float("inf")

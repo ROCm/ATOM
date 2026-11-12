@@ -23,7 +23,7 @@ import logging
 import re
 from typing import ClassVar
 
-from atom.sampling_params import RequiredChannel
+from atom.constraint_parser import ChannelRule, ToolGrammarRule
 
 from .. import kimi_k3_tokens as k3
 from .kimi_k3_grammar import build_tool_call_grammar
@@ -234,71 +234,19 @@ class KimiK3Parser(ToolCallParser):
         )
 
     @classmethod
-    def tool_call_grammar(
-        cls, functions: list[dict], *, required: bool, starts_in_reasoning: bool
-    ) -> str | None:
-        """Hold every call in the tools section to its tool's schema
-        (`kimi_k3_grammar.py`)."""
-        return build_tool_call_grammar(
-            functions, required=required, starts_in_reasoning=starts_in_reasoning
-        )
+    def tool_grammar_rule(cls, functions, *, required, starts_in_reasoning):
+        return ToolGrammarRule(build_tool_call_grammar, functions,
+                               required, starts_in_reasoning)
 
     @classmethod
-    def required_call_channel(cls, tokenizer) -> RequiredChannel | None:
-        """Open the tools channel where the response channel closes.
-
-        After `<|close|>response<|sep|>` K3 either writes
-        `<|open|>tools<|sep|>` or closes the message. Told it MUST call a tool,
-        it still closed the message on 85-100% of the Kimi-Vendor-Verifier
-        failures, writing the arguments as its answer. So the opening is
-        forced through the call's name attribute, which is where vLLM's K3
-        structural tag also commits to a call, and the message cannot end
-        before it. The tool name and arguments stay the model's. Writing
-        `<|open|>tools<|sep|>` itself, by any other way, opens it too.
-
-        None, constraining nothing and saying so at startup, if this tokenizer
-        does not read a control token as a single id, or does not encode the
-        forced opening as `<|open|>tools<|sep|>` followed by the call's start:
-        forcing either would hand the model a sequence it never writes, and
-        the second would also misplace where the channel counts as open.
-
-        Derived once per server, where the parser is resolved
-        (`registry.required_call_channel`).
-        """
-
-        def unheld(reason: str) -> None:
-            logger.warning(
-                'Kimi-K3 tool calls: %s, so tool_choice="required" will not '
-                "hold output to the tools channel on this server.",
-                reason,
-            )
-
-        def ids(text: str) -> tuple[int, ...]:
-            return tuple(tokenizer.encode(text, add_special_tokens=False))
-
-        controls = ("<|open|>", "<|close|>", "<|sep|>", k3.END_OF_MSG)
-        split = [c for c in controls if len(ids(c)) != 1]
-        if split:
-            unheld(f"this tokenizer splits {', '.join(split)} into several ids")
-            return None
-        # `opens_at` counts the ids that open the channel itself, at the head
-        # of the forced opening; it is only right if they are those ids.
-        start = ids(k3.TOOLS_START)
-        opening = ids(k3.TOOLS_START + KIMI_K3_CALL_PREFIX)
-        if opening[: len(start)] != start:
-            unheld(
-                f"this tokenizer does not encode {k3.TOOLS_START!r} at the "
-                "head of the forced opening as it encodes it alone"
-            )
-            return None
-
-        # The format's own end only: the engine adds every id it stops on
-        # (`RequiredChannel.ending_on`), from the same config it stops by.
-        return RequiredChannel(
-            after=ids(k3.RESPONSE_END),
-            opening=opening,
-            opens_at=len(start),
-            end_ids=ids(k3.END_OF_MSG),
+    def channel_rule(cls):
+        return ChannelRule(
+            after=k3.RESPONSE_END,
+            opening=k3.TOOLS_START + KIMI_K3_CALL_PREFIX,
+            channel_start=k3.TOOLS_START,
+            end=k3.END_OF_MSG,
+            controls=("<|open|>", "<|close|>", "<|sep|>", k3.END_OF_MSG),
+            label="Kimi-K3",
         )
 
     @classmethod

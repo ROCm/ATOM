@@ -34,6 +34,7 @@ from dataclasses import dataclass
 from typing import Any, ClassVar
 
 from atom.sampling_params import RequiredChannel
+from atom.constraint_parser import ConstraintParser
 
 # A tool name is an identifier, which is what the model was given.
 #
@@ -306,7 +307,7 @@ class RegionParse:
 NO_CALLS = RegionParse()
 
 
-class ToolCallParser(ABC):
+class ToolCallParser(ConstraintParser, ABC):
     """One on-the-wire tool-call format.
 
     Entirely class-side. A format holds no per-request state -- the engine
@@ -354,32 +355,25 @@ class ToolCallParser(ABC):
     DETECT_MARKERS: ClassVar[tuple[str, ...]] = ()
 
     @classmethod
-    def required_call_channel(cls, tokenizer) -> RequiredChannel | None:
-        """What a request that must call a tool holds the output to, in this
-        format's token ids; None leaves it unconstrained.
-
-        None for every format but Kimi-K3, whose answer either closes the
-        message or opens the tools channel at one token -- the place a model
-        told it MUST call a tool still sometimes ends instead.
-        """
+    def channel_rule(cls):
+        """Declare the format's required tool channel, if any."""
         return None
 
     @classmethod
-    def tool_call_grammar(
-        cls, functions: list[dict], *, required: bool, starts_in_reasoning: bool
-    ) -> str | None:
-        """A Lark (llguidance) grammar for the rest of the assistant message
-        that holds this format's calls to ``functions``; None leaves the output
-        unconstrained.
+    def required_call_channel(cls, tokenizer) -> RequiredChannel | None:
+        """Compatibility bridge to common constraint parsing."""
+        return cls.parse(cls.channel_rule(), tokenizer)
 
-        ``functions`` are the function objects the request lets the model
-        call; ``required`` means it must call one; ``starts_in_reasoning``
-        says whether the prompt opened the reasoning channel. Applied to a chat
-        request that declares tools and no response format when
-        ATOM_TOOL_CALL_GRAMMAR=1 (`structured_output.validation.
-        configure_tool_call_grammar`). None for every format but Kimi-K3.
-        """
+    @classmethod
+    def tool_grammar_rule(cls, functions, *, required, starts_in_reasoning):
         return None
+
+    @classmethod
+    def tool_call_grammar(cls, functions, *, required, starts_in_reasoning):
+        """Compatibility bridge for format grammar declarations."""
+        return cls.parse(cls.tool_grammar_rule(
+            functions, required=required, starts_in_reasoning=starts_in_reasoning
+        ), None)
 
     @classmethod
     def opens_region(cls, marker: str) -> bool:
