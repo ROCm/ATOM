@@ -37,6 +37,12 @@ exactly as in ReplaySSM.  A flush materialises ``S_h`` once in fp32, refits
 the compensators (warm-started from the previous window's), recomputes the
 smoothing and re-quantises.
 
+A speculative verify window (``T > 1`` tokens a sequence) cannot stay
+matrix-free: each token reads the state after the ones before it, so that
+kernel materialises ``S_h`` once and walks the window, as ReplaySSM's serial
+route does.  The record buffer is ``p + 2T - 1`` long, so a fold still lands
+every ``p`` committed tokens.
+
 A prefix-cache checkpoint only ever sits at a prompt position, where the
 prefill has just quantised the whole state into the slot and left no
 records: an image carries ``Z``, the scales and the compensators, and a fork
@@ -636,6 +642,161 @@ def _leapquant_decode_kernel(
         tl.store(p_bg + i_hv * stride_bufg_hv, b_gt.to(p_bg.dtype.element_ty))
 
 
+@triton.jit(do_not_specialize=["N", "T_MAX", "CAP"])
+def _leapquant_verify_kernel(
+    q,
+    k,
+    v,
+    g,
+    beta,
+    o,
+    z,
+    sc,
+    comp,
+    buf_k,
+    buf_u,
+    buf_g,
+    write_pos,
+    slot_idx,
+    cu_seqlens,
+    scale,
+    N,
+    T_MAX,
+    CAP,
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    BH: tl.constexpr,
+    R: tl.constexpr,
+    stride_z_slot: tl.constexpr,
+    stride_sc_slot: tl.constexpr,
+    stride_comp_slot: tl.constexpr,
+    stride_bufk_slot: tl.constexpr,
+    stride_bufk_pos: tl.constexpr,
+    stride_bufk_hv: tl.constexpr,
+    stride_bufu_slot: tl.constexpr,
+    stride_bufu_pos: tl.constexpr,
+    stride_bufu_hv: tl.constexpr,
+    stride_bufg_slot: tl.constexpr,
+    stride_bufg_pos: tl.constexpr,
+    stride_bufg_hv: tl.constexpr,
+    USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
+):
+    """A window of up to ``T_MAX`` tokens per sequence: the speculative verify.
+
+    Each token's state is the one after the tokens before it in the window,
+    so ``S_h`` is materialised once in fp32 -- the boundary decayed by
+    ``e^C`` plus the committed records -- and the window is walked token by
+    token, as ReplaySSM's serial route does.  Every token appends its record;
+    `replayssm_commit` then keeps only the accepted ones.
+    """
+    i_v, i_nh = tl.program_id(0), tl.program_id(1)
+    i_n, i_hv = i_nh // HV, i_nh % HV
+    i_h = i_hv // (HV // H)
+
+    bos = tl.load(cu_seqlens + i_n).to(tl.int64)
+    eos = tl.load(cu_seqlens + i_n + 1).to(tl.int64)
+    T = eos - bos
+    if T == 0:
+        return
+    slot = tl.load(slot_idx + i_n).to(tl.int64)
+    if slot < 0:
+        return
+    # Same predicate as the fold kernel and `replayssm_commit`: on a fold step
+    # the boundary state already absorbed every committed record.
+    h = tl.maximum(tl.load(write_pos + slot), 0)
+    base = tl.where(h + 2 * T_MAX > CAP, 0, h)
+
+    o_k = tl.arange(0, BK)
+    o_v = i_v * BV + tl.arange(0, BV)
+    mask_k = o_k < K
+    mask_v = o_v < V
+    b_h = _lq_rebuild(
+        buf_k,
+        buf_u,
+        buf_g,
+        slot,
+        base,
+        z + slot * stride_z_slot + i_hv * K * V,
+        sc + slot * stride_sc_slot + i_hv * (V + K),
+        comp + slot * stride_comp_slot + i_hv * R * (K + V),
+        stride_bufk_slot,
+        stride_bufk_pos,
+        stride_bufk_hv,
+        stride_bufu_slot,
+        stride_bufu_pos,
+        stride_bufu_hv,
+        stride_bufg_slot,
+        stride_bufg_pos,
+        stride_bufg_hv,
+        i_hv,
+        o_k,
+        o_v,
+        mask_k,
+        mask_v,
+        K,
+        V,
+        BH,
+        R,
+    )
+
+    p_q = q + (bos * H + i_h) * K + o_k
+    p_k = k + (bos * H + i_h) * K + o_k
+    p_v = v + (bos * HV + i_hv) * V + o_v
+    p_o = o + (bos * HV + i_hv) * V + o_v
+    p_beta = beta + bos * HV + i_hv
+    p_g = g + bos * HV + i_hv
+    for i_t in range(T):
+        b_q = tl.load(p_q, mask=mask_k, other=0.0).to(tl.float32)
+        b_k = tl.load(p_k, mask=mask_k, other=0.0).to(tl.float32)
+        b_v = tl.load(p_v, mask=mask_v, other=0.0).to(tl.float32)
+        if USE_QK_L2NORM_IN_KERNEL:
+            b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
+            b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
+        b_q = b_q * scale
+        b_gt = tl.load(p_g).to(tl.float32)
+        b_h *= exp(b_gt)
+        b_v -= tl.sum(b_h * b_k[:, None], 0)
+        b_v *= tl.load(p_beta).to(tl.float32)
+        b_h += b_k[:, None] * b_v[None, :]
+        tl.store(
+            p_o, tl.sum(b_h * b_q[:, None], 0).to(p_o.dtype.element_ty), mask=mask_v
+        )
+
+        pos = (base + i_t).to(tl.int64)
+        p_bu = (
+            buf_u
+            + slot * stride_bufu_slot
+            + pos * stride_bufu_pos
+            + i_hv * stride_bufu_hv
+            + o_v
+        )
+        b_ub = tl.minimum(tl.maximum(b_v, -_FP16_MAX), _FP16_MAX)
+        tl.store(p_bu, b_ub.to(p_bu.dtype.element_ty), mask=mask_v)
+        # k and g do not depend on the V split; one program owns their store.
+        if i_v == 0:
+            p_bk = (
+                buf_k
+                + slot * stride_bufk_slot
+                + pos * stride_bufk_pos
+                + i_hv * stride_bufk_hv
+                + o_k
+            )
+            tl.store(p_bk, b_k.to(p_bk.dtype.element_ty), mask=mask_k)
+            p_bg = buf_g + slot * stride_bufg_slot + pos * stride_bufg_pos
+            tl.store(p_bg + i_hv * stride_bufg_hv, b_gt.to(p_bg.dtype.element_ty))
+
+        p_q += H * K
+        p_k += H * K
+        p_v += HV * V
+        p_o += HV * V
+        p_beta += HV
+        p_g += HV
+
+
 _MAX_INT_32 = 2**31 - 1
 
 
@@ -732,6 +893,18 @@ def _record_block(cap: int) -> int:
     return max(16, triton.next_power_of_2(cap - 1))
 
 
+def _verify_launch_config(n: int, hv: int, v: int) -> tuple[int, int]:
+    """``(BV, num_warps)`` for `_leapquant_verify_kernel`.
+
+    One warp, so each token's contractions over K reduce inside it: four
+    warps at BV = 32 measured 3.4x slower at 128 sequences (gfx950, the
+    Qwen3.5-9B heads, T = 4).  Up to 1024 (sequence, head) pairs a 32-wide
+    V slice keeps more programs in flight; past that 64 wins (83 against
+    96 us a layer at 48 sequences, 142 against 165 at 128).
+    """
+    return min(triton.next_power_of_2(v), 32 if n * hv <= 1024 else 64), 1
+
+
 def leapquant_fold(
     z: torch.Tensor,
     sc: torch.Tensor,
@@ -741,6 +914,7 @@ def leapquant_fold(
     buf_g: torch.Tensor,
     write_pos: torch.Tensor,
     slot_idx: torch.Tensor,
+    max_query_len: int = 1,
     iters: int = WARM_ITERS,
     num_warps: int = 2,
     waves_per_eu: int = 2,
@@ -753,6 +927,9 @@ def leapquant_fold(
     sequence flushes in every layer at the same step and one launch covers
     them all.  A fold is a few dozen microseconds of dependent reductions, so
     batching the layers is what turns that latency into throughput.
+
+    ``max_query_len`` is the verify window, as passed to the step's layers and
+    to `replayssm_commit`: all three decide a flush by ``h + 2T > cap``.
     """
     tensors = (
         _layered(z, 4),
@@ -768,7 +945,7 @@ def leapquant_fold(
     if N == 0:
         return
     cap = tensors[3].shape[3]
-    assert flush_threshold_ok(cap, 1), f"record buffer of {cap} is too short"
+    assert flush_threshold_ok(cap, max_query_len), f"record buffer {cap} too short"
     # As many layers per launch as keep every view within 32-bit offsets.
     group = L
     for x in tensors:
@@ -782,7 +959,7 @@ def leapquant_fold(
             write_pos=write_pos,
             slot_idx=slot_idx,
             N=N,
-            T_MAX=1,
+            T_MAX=max_query_len,
             CAP=cap,
             HV=HV,
             K=K,
@@ -967,21 +1144,24 @@ def leapquant_gated_delta_rule(
     use_qk_l2norm_in_kernel: bool = False,
     fold: bool = True,
     iters: int = WARM_ITERS,
-    block_v: int = 128,
-    num_warps: int = 1,
+    o: torch.Tensor | None = None,
+    block_v: int | None = None,
+    num_warps: int | None = None,
 ) -> torch.Tensor:
     """LeapQuant decode for one GDN layer; same contract as
     :func:`replayssm_gated_delta_rule` with the checkpoint pool replaced by
     ``(z, sc, comp)``.  ``write_pos`` is advanced by `replayssm_commit`.
 
+    ``max_query_len`` is the verify window the server runs with, whatever
+    this step's rows carry: the flush predicate is ``h + 2T > cap`` for the
+    configured ``T``, the same one `replayssm_commit` and the fold use.  With
+    no speculation (``T == 1``) a token needs only two contractions of the
+    state; a verify window walks its tokens over the materialised state.
+
     ``fold=False`` when the caller already ran :func:`leapquant_fold` for this
-    step over every layer at once.
+    step over every layer at once.  ``o`` is an optional contiguous
+    ``[T_tot, HV, V]`` destination.
     """
-    if max_query_len != 1:
-        raise NotImplementedError(
-            "LeapQuant decode handles one token per sequence; speculative "
-            "verify windows are not supported yet"
-        )
     assert q.shape[0] == 1, "varlen layout expected (B == 1)"
     _check_side_layout(z, sc, comp)
     _, T_tot, H, K = q.shape
@@ -991,18 +1171,69 @@ def leapquant_gated_delta_rule(
     rank = comp.shape[2]
     if scale is None:
         scale = K**-0.5
-    assert flush_threshold_ok(cap, 1), f"record buffer of {cap} is too short"
+    assert flush_threshold_ok(cap, max_query_len), f"record buffer {cap} too short"
     assert beta.ndim != v.ndim, "LeapQuant decode expects a per-head beta"
 
     q, k, v, g, beta = (x.contiguous() for x in (q, k, v, g, beta))
-    o = q.new_empty(1, T_tot, HV, V)
+    if o is None:
+        o = q.new_empty(1, T_tot, HV, V)
+    else:
+        assert o.is_contiguous(), "o must be contiguous"
+        o = o.view(1, T_tot, HV, V)
     if N == 0:
         return o
     if fold:
         leapquant_fold(
-            z, sc, comp, buf_k, buf_u, buf_g, write_pos, slot_idx[:N], iters=iters
+            z,
+            sc,
+            comp,
+            buf_k,
+            buf_u,
+            buf_g,
+            write_pos,
+            slot_idx[:N],
+            max_query_len=max_query_len,
+            iters=iters,
         )
-    BV = min(triton.next_power_of_2(V), block_v)
+    if max_query_len > 1:
+        BV, warps = _verify_launch_config(N, HV, V)
+        BV = min(triton.next_power_of_2(V), block_v or BV)
+        _leapquant_verify_kernel[(triton.cdiv(V, BV), N * HV)](
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            o=o,
+            z=_span(z),
+            sc=_span(sc),
+            comp=_span(comp),
+            buf_k=_span(buf_k),
+            buf_u=_span(buf_u),
+            buf_g=_span(buf_g),
+            write_pos=write_pos,
+            slot_idx=slot_idx,
+            cu_seqlens=cu_seqlens,
+            scale=scale,
+            N=N,
+            T_MAX=max_query_len,
+            CAP=cap,
+            H=H,
+            HV=HV,
+            K=K,
+            V=V,
+            BK=triton.next_power_of_2(K),
+            BV=BV,
+            BH=_record_block(cap),
+            R=rank,
+            **_side_strides(z, sc, comp),
+            **_record_strides(buf_k, buf_u, buf_g),
+            USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+            num_warps=num_warps or warps,
+            num_stages=1,
+        )
+        return o
+    BV = min(triton.next_power_of_2(V), block_v or 128)
     _leapquant_decode_kernel[(triton.cdiv(V, BV), N * HV)](
         q=q,
         k=k,
@@ -1035,7 +1266,7 @@ def leapquant_gated_delta_rule(
         **_record_strides(buf_k, buf_u, buf_g),
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         IS_BETA_HEADWISE=False,
-        num_warps=num_warps,
+        num_warps=num_warps or 1,
         num_stages=1,
     )
     return o

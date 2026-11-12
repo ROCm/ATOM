@@ -311,11 +311,6 @@ class GDNStateMixin(PoolRowsMixin):
                     "ATOM_ENABLE_LEAPQUANT covers the GDN recurrence; KDA's "
                     "per-channel gates are not supported."
                 )
-            if self.use_spec_decode:
-                raise NotImplementedError(
-                    "ATOM_ENABLE_LEAPQUANT decodes one token per step; it does "
-                    "not support speculative decoding yet."
-                )
             if replayssm_override is False:
                 raise ValueError(
                     "ATOM_ENABLE_LEAPQUANT=1 is built on ReplaySSM and cannot "
@@ -329,11 +324,15 @@ class GDNStateMixin(PoolRowsMixin):
         self.replayssm_route = envs.ATOM_REPLAYSSM_ROUTE
         self.replayssm_cache_len = 0
         if self.replayssm:
-            requested_cache_len = envs.ATOM_REPLAYSSM_CACHE_LEN
             if self.leapquant:
-                # A T == 1 flush fires when the cursor reaches cache_len - 1,
-                # so a window of p tokens takes p + 1 entries.
-                requested_cache_len = envs.ATOM_LEAPQUANT_WINDOW + 1
+                # A fold fires once the cursor h has h + 2T > cache_len (T the
+                # verify window), so h reaches p first with p + 2T - 1 entries:
+                # p + 1 for plain decode.
+                requested_cache_len = (
+                    envs.ATOM_LEAPQUANT_WINDOW + 2 * self.replayssm_max_query_len - 1
+                )
+            else:
+                requested_cache_len = envs.ATOM_REPLAYSSM_CACHE_LEN
             min_cache_len = 2 * self.replayssm_max_query_len
             self.replayssm_cache_len = max(requested_cache_len, min_cache_len)
             if self.replayssm_cache_len != requested_cache_len:
@@ -364,7 +363,7 @@ class GDNStateMixin(PoolRowsMixin):
                     "%d fp16 compensator tokens per head, re-quantised every "
                     "%d tokens.",
                     self.leapquant_rank,
-                    self.replayssm_cache_len - 1,
+                    self.replayssm_cache_len - 2 * self.replayssm_max_query_len + 1,
                 )
         else:
             logger.info(
@@ -1922,6 +1921,7 @@ class GDNStateMixin(PoolRowsMixin):
                 runner.replayssm_buf_g,
                 write_pos,
                 slot_idx,
+                max_query_len=self.replayssm_max_query_len,
             )
 
     def _attach_gdn_decode_metadata(

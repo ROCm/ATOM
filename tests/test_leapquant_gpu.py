@@ -12,6 +12,8 @@ still returns a plausible state, and no CPU test can see it, so these pin it:
 * decode across windows follows a shadow that runs exact fp32 steps from the
   kernel's own boundary state, and its error against the exact trajectory
   does not grow from window to window;
+* so do speculative verify windows whose sequences each keep a random number
+  of their tokens;
 * one stacked fold over every layer is the per-layer fold, bit for bit;
 * the states real heads produce -- exactly low-rank, zero, tiny -- store and
   fold to finite values;
@@ -148,7 +150,7 @@ def rel(a, b) -> float:
     return ((a - b).norm() / b.norm()).item()
 
 
-def slot_buffers(layers: int | None = None) -> list[torch.Tensor]:
+def slot_buffers(layers: int | None = None, cap: int = CAP) -> list[torch.Tensor]:
     """A zeroed slot pool: residual, scales, compensators, then the records."""
     lead = (POOL,) if layers is None else (layers, POOL)
     sc_shape, comp_shape = leapquant_buffer_shapes(HV, K, V, RANK)
@@ -156,9 +158,9 @@ def slot_buffers(layers: int | None = None) -> list[torch.Tensor]:
         torch.zeros(*lead, HV, K, V, device=DEV, dtype=torch.int8),
         torch.zeros(*lead, *sc_shape, device=DEV),
         torch.zeros(*lead, *comp_shape, device=DEV, dtype=torch.float16),
-        torch.zeros(*lead, HV, CAP, K, device=DEV, dtype=torch.float16),
-        torch.zeros(*lead, HV, CAP, V, device=DEV, dtype=torch.float16),
-        torch.zeros(*lead, HV, CAP, device=DEV),
+        torch.zeros(*lead, HV, cap, K, device=DEV, dtype=torch.float16),
+        torch.zeros(*lead, HV, cap, V, device=DEV, dtype=torch.float16),
+        torch.zeros(*lead, HV, cap, device=DEV),
     ]
 
 
@@ -190,6 +192,30 @@ def decode(x, bufs, write_pos, slots, **kwargs):
 def commit(write_pos, slots):
     accepted = torch.ones(slots.numel(), device=DEV, dtype=torch.int32)
     replayssm_commit(write_pos, slots, accepted, 1, CAP)
+
+
+def verify(xs, lens, bufs, write_pos, slots, t_max, **kwargs):
+    """One verify step: sequence ``i`` runs the first ``lens[i]`` of the
+    ``t_max`` token steps in ``xs``.  Returns the outputs as ``[N, t_max, HV,
+    V]``, zero past each sequence's length."""
+    n = slots.numel()
+    ran = torch.arange(t_max, device=DEV)[None, :] < lens[:, None]
+    inputs = [torch.stack(parts, 1)[ran] for parts in zip(*xs)]
+    cu = torch.zeros(n + 1, device=DEV, dtype=torch.int32)
+    cu[1:] = lens.cumsum(0)
+    o = leapquant_gated_delta_rule(
+        *(t[None] for t in inputs),
+        *bufs,
+        write_pos,
+        slots,
+        cu,
+        t_max,
+        use_qk_l2norm_in_kernel=True,
+        **kwargs,
+    )[0]
+    out = torch.zeros(n, t_max, HV, V, device=DEV, dtype=o.dtype)
+    out[ran] = o
+    return out
 
 
 def test_the_quantiser_is_its_torch_mirror_and_beats_plain_int8():
@@ -229,6 +255,8 @@ def test_decode_follows_its_shadow_and_the_error_does_not_compound():
         if flush.any():
             folds += 1
             folded = leapquant_load_state(z, sc, comp, slots)
+            # The fold absorbed every committed token: one quantisation off.
+            assert rel(folded[flush], shadow[flush]) < 1e-2
             shadow = torch.where(flush[:, None, None, None], folded, shadow)
         shadow, o_shadow = torch_step(shadow, *x)
         exact, o_exact = torch_step(exact, *x)
@@ -241,6 +269,71 @@ def test_decode_follows_its_shadow_and_the_error_does_not_compound():
     # The first window starts from the prefill's cold fit, every later one
     # from a warm refit, so only the later ones are like for like.
     assert windows[-1] < 1.25 * windows[1], windows
+
+
+@pytest.mark.parametrize(
+    ("t_max", "block_v"),
+    # The launcher's V slice for this batch, and the one a large batch gets.
+    [(2, None), (4, None), (4, 64)],
+)
+def test_verify_windows_follow_their_shadow_through_partial_accepts(t_max, block_v):
+    """A speculative verify step runs up to ``t_max`` tokens a sequence and the
+    next commit keeps a random 1..len of them, so cursors land anywhere and
+    each sequence flushes on its own steps.  Every output, kept or not, is
+    read off the state after the tokens before it, so it matches a shadow
+    that runs the same tokens exactly; only the kept ones move the shadow on,
+    and a flush's boundary is the shadow's state up to one quantisation.
+    The record buffer is sized as the server sizes it."""
+    n, steps = 8, 4 * WINDOW
+    cap = WINDOW + 2 * t_max - 1
+    S0, src = make_states(n, 256, seed=20 + t_max)
+    gen = torch.Generator(device=DEV).manual_seed(t_max)
+    slots = scattered_slots(n)
+    bufs = slot_buffers(cap=cap)
+    z, sc, comp = bufs[:3]
+    write_pos = cursors()
+    leapquant_store_state(S0, z, sc, comp, slots)
+    write_pos[slots.long()] = -1
+    shadow = leapquant_load_state(z, sc, comp, slots)
+    exact = S0
+
+    accepted = torch.ones(n, device=DEV, dtype=torch.int32)
+    flushes = torch.zeros(n, device=DEV, dtype=torch.int32)
+    worst, errs = 0.0, []
+    for _ in range(steps):
+        replayssm_commit(write_pos, slots, accepted, t_max, cap)
+        flush = write_pos[slots.long()] + 2 * t_max > cap
+        lens = torch.randint(1, t_max + 1, (n,), device=DEV, generator=gen)
+        xs = [src.step() for _ in range(t_max)]
+        o = verify(xs, lens, bufs, write_pos, slots, t_max, block_v=block_v).float()
+        assert torch.isfinite(o).all()
+        flushes += flush
+        if flush.any():
+            folded = leapquant_load_state(z, sc, comp, slots)
+            assert rel(folded[flush], shadow[flush]) < 1e-2
+            shadow = torch.where(flush[:, None, None, None], folded, shadow)
+
+        accepted = (torch.rand(n, device=DEV, generator=gen) * lens).int() + 1
+        S, E, step_err = shadow, exact, []
+        for t, x in enumerate(xs):
+            S, o_shadow = torch_step(S, *x)
+            E, o_exact = torch_step(E, *x)
+            ran = lens > t
+            if ran.any():
+                worst = max(worst, rel(o[ran, t], o_shadow[ran]))
+                step_err.append(rel(o[ran, t], o_exact[ran]))
+            kept = (accepted > t)[:, None, None, None]
+            shadow = torch.where(kept, S, shadow)
+            exact = torch.where(kept, E, exact)
+        errs.append(sum(step_err) / len(step_err))
+
+    assert flushes.min() >= 3, flushes
+    assert worst < 1e-3
+    # As at T == 1, a later window is no worse than an earlier one; the first
+    # quarter holds the cold fit.
+    q = steps // 4
+    early, late = sum(errs[q : 2 * q]) / q, sum(errs[3 * q :]) / q
+    assert late < 1.25 * early, (early, late)
 
 
 def test_one_stacked_fold_is_the_per_layer_fold():
@@ -407,8 +500,14 @@ def test_every_kernel_returns_the_same_bytes_every_run():
         _, pos, xs = state
         return lambda *st: decode(xs, st, pos, slots)
 
+    window = (mid[2], src.step())
+    lens = torch.full((n,), len(window), device=DEV)
     cases = {
         "decode, mid-window": (decode_from(mid), mid[0]),
+        "verify, mid-window": (
+            lambda *st: verify(window, lens, st, mid[1], slots, len(window)),
+            mid[0],
+        ),
         "decode + fold, flush step": (decode_from(flush), flush[0]),
         "stacked fold": (
             lambda *st: leapquant_fold(*(b[None] for b in st), flush[1], slots),

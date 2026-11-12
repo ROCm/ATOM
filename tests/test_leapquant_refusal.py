@@ -4,10 +4,10 @@
 """What ATOM_ENABLE_LEAPQUANT accepts and refuses at startup.
 
 Refused, because each would otherwise start and serve a wrong state: KDA's
-per-channel gates are not what the GDN kernels decay by, a verify window is
-more than the one token the decode kernel takes, and the int8 state is a
-ReplaySSM checkpoint, so ReplaySSM cannot be off. Prefix caching starts,
-with generation keeping no checkpoints.
+per-channel gates are not what the GDN kernels decay by, and the int8 state
+is a ReplaySSM checkpoint, so ReplaySSM cannot be off. Speculative decoding
+and prefix caching start, with the record buffer sized for the verify window
+and generation keeping no checkpoints.
 """
 
 from types import SimpleNamespace
@@ -41,20 +41,22 @@ def _builder(*, kda=False, num_spec=0, prefix_caching=False):
     )
 
 
-def _leapquant_env(monkeypatch, replayssm=None):
+def _leapquant_env(monkeypatch, replayssm=None, window=None):
     monkeypatch.setenv("ATOM_ENABLE_LEAPQUANT", "1")
-    monkeypatch.delenv("ATOM_LEAPQUANT_WINDOW", raising=False)
     if replayssm is None:
         monkeypatch.delenv("ATOM_ENABLE_REPLAYSSM", raising=False)
     else:
         monkeypatch.setenv("ATOM_ENABLE_REPLAYSSM", replayssm)
+    if window is None:
+        monkeypatch.delenv("ATOM_LEAPQUANT_WINDOW", raising=False)
+    else:
+        monkeypatch.setenv("ATOM_LEAPQUANT_WINDOW", str(window))
 
 
 @pytest.mark.parametrize(
     ("setup", "replayssm", "error", "match"),
     [
         ({"kda": True}, None, NotImplementedError, "KDA"),
-        ({"num_spec": 1}, None, NotImplementedError, "speculative decoding"),
         ({}, "0", ValueError, "ATOM_ENABLE_REPLAYSSM=0"),
     ],
 )
@@ -65,11 +67,25 @@ def test_leapquant_refuses_at_startup(monkeypatch, setup, replayssm, error, matc
         GDNStateMixin._init_gdn_state(builder, builder.model_runner)
 
 
-@pytest.mark.parametrize("prefix_caching", [False, True])
-def test_leapquant_starts_with_or_without_prefix_caching(monkeypatch, prefix_caching):
-    _leapquant_env(monkeypatch)
-    builder = _builder(prefix_caching=prefix_caching)
+@pytest.mark.parametrize(
+    ("num_spec", "prefix_caching", "window", "cache_len"),
+    [
+        # p + 1 records: a fold once the cursor reaches p.
+        (0, False, 16, 17),
+        (0, True, 16, 17),
+        # A verify window of T takes p + 2T - 1, so h still folds at p.
+        (1, True, 16, 19),
+        (3, False, 16, 23),
+        # Never below the two windows the flush invariant needs.
+        (3, False, 0, 8),
+    ],
+)
+def test_leapquant_sizes_the_record_buffer_for_the_verify_window(
+    monkeypatch, num_spec, prefix_caching, window, cache_len
+):
+    _leapquant_env(monkeypatch, window=window)
+    builder = _builder(num_spec=num_spec, prefix_caching=prefix_caching)
     GDNStateMixin._init_gdn_state(builder, builder.model_runner)
     assert builder.leapquant and builder.replayssm
-    # p + 1 records: a fold once the cursor reaches p.
-    assert builder.replayssm_cache_len == 17
+    assert builder.replayssm_max_query_len == num_spec + 1
+    assert builder.replayssm_cache_len == cache_len

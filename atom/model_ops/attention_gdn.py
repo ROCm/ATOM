@@ -424,28 +424,52 @@ class GatedDeltaNet(nn.Module):
                 spec_only = (
                     gdn_metadata.num_prefills == 0 and gdn_metadata.num_decodes == 0
                 )
-                core_attn_out_spec = replayssm_gated_delta_rule(
-                    q=query_spec,
-                    k=key_spec,
-                    v=value_spec,
-                    g=g_spec,
-                    beta=beta_spec,
-                    ckpt=ssm_state,
-                    buf_k=layer_cache.replay_buf_k,
-                    buf_u=layer_cache.replay_buf_u,
-                    buf_g=layer_cache.replay_buf_g,
-                    flush_arrivals=layer_cache.replay_flush_arrivals,
-                    flush_wait=layer_cache.replay_flush_wait,
-                    write_pos=gdn_metadata.write_pos,
-                    slot_idx=gdn_metadata.slot_idx[:nsd],
-                    cu_seqlens=spec_query_start_loc[: nsd + 1],
-                    max_query_len=gdn_metadata.replayssm_max_query_len,
-                    use_qk_l2norm_in_kernel=True,
-                    is_kda=False,
-                    route=gdn_metadata.replayssm_route,
-                    o=(core_attn_out[: query_spec.shape[1]] if spec_only else None),
-                    fork_slots=gdn_metadata.replayssm_fork_slots,
-                )
+                if use_leapquant:
+                    # The builder already folded this step and seeded any
+                    # fork, for every layer at once.
+                    core_attn_out_spec = leapquant_gated_delta_rule(
+                        q=query_spec,
+                        k=key_spec,
+                        v=value_spec,
+                        g=g_spec,
+                        beta=beta_spec,
+                        z=ssm_state,
+                        sc=layer_cache.leapquant_scale,
+                        comp=layer_cache.leapquant_comp,
+                        buf_k=layer_cache.replay_buf_k,
+                        buf_u=layer_cache.replay_buf_u,
+                        buf_g=layer_cache.replay_buf_g,
+                        write_pos=gdn_metadata.write_pos,
+                        slot_idx=gdn_metadata.slot_idx[:nsd],
+                        cu_seqlens=spec_query_start_loc[: nsd + 1],
+                        max_query_len=gdn_metadata.replayssm_max_query_len,
+                        use_qk_l2norm_in_kernel=True,
+                        fold=False,
+                        o=(core_attn_out[: query_spec.shape[1]] if spec_only else None),
+                    )
+                else:
+                    core_attn_out_spec = replayssm_gated_delta_rule(
+                        q=query_spec,
+                        k=key_spec,
+                        v=value_spec,
+                        g=g_spec,
+                        beta=beta_spec,
+                        ckpt=ssm_state,
+                        buf_k=layer_cache.replay_buf_k,
+                        buf_u=layer_cache.replay_buf_u,
+                        buf_g=layer_cache.replay_buf_g,
+                        flush_arrivals=layer_cache.replay_flush_arrivals,
+                        flush_wait=layer_cache.replay_flush_wait,
+                        write_pos=gdn_metadata.write_pos,
+                        slot_idx=gdn_metadata.slot_idx[:nsd],
+                        cu_seqlens=spec_query_start_loc[: nsd + 1],
+                        max_query_len=gdn_metadata.replayssm_max_query_len,
+                        use_qk_l2norm_in_kernel=True,
+                        is_kda=False,
+                        route=gdn_metadata.replayssm_route,
+                        o=(core_attn_out[: query_spec.shape[1]] if spec_only else None),
+                        fork_slots=gdn_metadata.replayssm_fork_slots,
+                    )
                 last_recurrent_state = None
             else:
                 core_attn_out_spec, last_recurrent_state = (
