@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 """`_emit_sparse_block_table_row` (shared by every index cache) on a pad row with a
 non-empty selection. CPU: Triton's interpreter, in a child process (the flag must
-precede the triton import). The gfx950 variant is GPU-PENDING, not yet run."""
+precede the triton import). The gfx950 variant needs the GPU (run on MI355X: passes)."""
 
 from __future__ import annotations
 

@@ -97,6 +97,7 @@ def check(*, hf=None, arch="gfx950", plugin_mode=False, **kw):
         "torch_dtype": torch.bfloat16,
         "kv_transfer_config": {},
         "decode_context_parallel_size": 1,
+        "sequence_parallel_size": 1,
         "speculative_config": None,
         "hf_config": text,
     }
@@ -123,6 +124,7 @@ REFUSALS = [  # (config change, message): one row per refusal reason
     ({"plugin_mode": True, **INDEX_ONLY}, "bridges"),  # the index alone is held to it
     ({"arch": "gfx942", **INDEX_ONLY}, "gfx950, got gfx942"),
     ({"index_cache_dtype": "fp8"}, "needs --index-cache-dtype fp4, got fp8"),
+    ({"sequence_parallel_size": 2}, "sequence-parallel-size > 1"),
     ({"torch_dtype": torch.float16}, "needs a bfloat16 model"),
     ({"kv_transfer_config": {"kv_connector": "lmcache_offload"}}, "KV offload"),
     # EAGLE3 / MTP share the target's pool: an fp4 draft has no layout
@@ -145,7 +147,9 @@ def test_startup_refusals(kw, match):
 def test_what_still_passes_and_v41_keeps_its_fp4_kv():
     check()
     check(hf={}, torch_dtype=torch.float16, **INDEX_ONLY)  # index alone: no pa_decode
-    _check_fp4_kv("fp4", is_m3=False, is_v41=True)  # refusal elsewhere: test_v4_*
+    _check_fp4_kv("fp4", is_m3=False, is_v41=True)
+    with pytest.raises(ValueError, match="MiniMax-M3.1 and DeepSeek-V4.1 only"):
+        _check_fp4_kv("fp4", is_m3=False, is_v41=False)  # every other model
 
 
 @pytest.mark.parametrize(

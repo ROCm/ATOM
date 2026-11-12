@@ -19,6 +19,10 @@ def _mxfp4_kv_refusal(config) -> str | None:
     if config.kv_transfer_config:
         # Offload / P-D transfer moves pages by a layout that does not know this format.
         return "it does not run with KV offload or --kv-transfer-config"
+    if config.sequence_parallel_size > 1:
+        # Ulysses leaves a top-k reusing layer's qkv without index columns; the fused
+        # MXFP4 writer checks the row width and needs them.
+        return "it does not run with --sequence-parallel-size > 1"
     spec = config.speculative_config
     if spec is not None and spec.draft_kv_dtype == "fp4":
         # "fp4" is left only on a draft in the target's pool (MTP), which has no
@@ -57,7 +61,7 @@ def validate_runtime_config(config):
       gfx950, no decode context parallelism (the writer stores a rank's own tokens
       only and the sparse readers take global lengths: M3 has no DCP gather/merge);
     - ``--kv-cache-dtype fp4`` also: ``--index-cache-dtype fp4`` (the default when omitted, an explicit other value is refused),
-      every attention layer an indexed sparse one (M3.1), a bf16 model, no KV offload
+      every attention layer an indexed sparse one (M3.1), a bf16 model, no sequence parallelism, no KV offload
       or ``--kv-transfer-config``, and no speculative draft left with FP4 KV.
     """
     from atom.config import is_plugin_mode

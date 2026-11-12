@@ -33,6 +33,7 @@ class _PagedAttention(nn.Module):
         super().__init__()
         self.base_attention = True
         self.use_mla = False
+        self.impl = SimpleNamespace(kv_layout=None)
 
 
 class _Norm(nn.Module):

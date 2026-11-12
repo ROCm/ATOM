@@ -420,9 +420,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             and hasattr(module, "use_mla")
             and not module.use_mla
         ):
-            # the impl declares how its pages are laid out; None is SHUFFLE
-            layout = getattr(getattr(module, "impl", None), "kv_layout", None)
-            kinds.append(KvGeometry(module.num_kv_heads, module.head_dim, layout))
+            kinds.append(
+                KvGeometry(module.num_kv_heads, module.head_dim, module.impl.kv_layout)
+            )
         return tuple(kinds)
 
     def _declare_kv_pools(self) -> dict[KvGeometry, MhaKvPool]:

@@ -45,6 +45,8 @@ class PagedAttentionImpl(nn.Module):
     Attention paged implementation
     """
 
+    kv_layout = None  # the pool layout of its pages (a `KvLayout`); None = SHUFFLE
+
     @staticmethod
     def qkv_fields(num_heads, num_kv_heads, head_dim, **kwargs):
         """(heads, head dim) of each column range of the fused qkv, in order."""
@@ -1349,7 +1351,6 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         # The selection's block-table shape follows the KV layout: one page-128 page a
         # block for MXFP4 KV, the page-16 SHUFFLE defaults otherwise.
         self._select_page_kwargs = {}
-        self.kv_layout = None  # the pool layout of its pages; None = SHUFFLE
         if self.kv_cache_dtype == "fp4":
             from atom.model_ops.minimax_m3.mxfp4_pages import Mxfp4KvLayout
             from atom.model_ops.minimax_m3.sparse_attn_mxfp4 import sparse_pa_mxfp4
