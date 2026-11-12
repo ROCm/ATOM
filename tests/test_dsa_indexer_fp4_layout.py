@@ -131,7 +131,12 @@ def test_dcp_prefill_preserves_opus_rows_and_all_four_exponents(monkeypatch):
 def test_hip_writer_adapter_preserves_outputs_and_dcp_semantics(
     monkeypatch, layout, rope, dcp
 ):
-    from atom.model_ops import attention_mla
+    try:
+        from atom.model_ops import attention_mla
+    except ImportError as exc:
+        from import_guard import skip_if_dependency_missing
+
+        skip_if_dependency_missing(exc, "attention_mla imports Triton and AITER")
 
     captured = []
     monkeypatch.setattr(attention_mla, "get_dcp_world_size", lambda: dcp)

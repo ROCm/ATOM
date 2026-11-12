@@ -186,7 +186,6 @@ def mla_builder_cls():
         "atom.utils.block_tables": _module(
             "atom.utils.block_tables", block_table_state=noop
         ),
-        "atom.utils.tbo": _module("atom.utils.tbo", decode_ubatch_request_ranges=noop),
         "atom.utils.forward_context": _module(
             "atom.utils.forward_context",
             AttentionMetaData=type("AttentionMetaData", (), {}),
