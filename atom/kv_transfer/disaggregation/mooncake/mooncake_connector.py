@@ -703,7 +703,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             )
 
         # Producer side: queue block_ids for the write listener to look up
-        if params.get("do_remote_decode"):
+        if params.get("do_remote_decode") and params.get("chunked_transfer"):
             assert self.is_producer, "Only the producer side handles do_remote_decode"
             self._reqs_need_save[seq.id] = (seq, list(seq.block_table), slot_index)
             logger.debug(
@@ -753,6 +753,15 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             "do_remote_decode"
         ):
             self._awaiting_send.add(str(seq.id))
+            # A non-chunked source is published only after prefill finishes.
+            # Allocation may dispatch Store loads before the P forward; caching
+            # those addresses then would leave them in the worker after an
+            # aborted load releases the allocation.
+            self._reqs_need_save[seq.id] = (
+                seq,
+                list(seq.block_table),
+                getattr(seq, "state_slot", -1),
+            )
 
         first_token_id = seq.output_tokens[0] if seq.output_tokens else None
         drafts = getattr(seq, "spec_token_ids", None)
