@@ -124,10 +124,12 @@ class CandidateMailbox:
     """
 
     MAX_TOPK = 64
+    BANKS = 2
 
     def __init__(self, cpu_group, world: int, max_rows: int, device):
+        self.world = world
         self.max_rows = max_rows
-        nbytes = 2 * world * max_rows * self.MAX_TOPK * 8
+        nbytes = self.BANKS * world * max_rows * self.MAX_TOPK * 8
         failure, self._pool = None, None
         try:
             IPCBufferPool, _loaded_hip_runtime, _should_use_vmm = _mailbox_runtime()
@@ -149,14 +151,14 @@ class CandidateMailbox:
             if err:
                 raise RuntimeError(f"hipMemset failed: {err}")
             torch.cuda.synchronize(device)
-        except Exception as error:  # noqa: BLE001 - every rank reaches the agreement
+        except Exception as error:  # noqa: BLE001 - agree every rank-local failure
             failure = error
         if group_agree(failure is None, cpu_group):
             try:
                 peers = self._pool.open_peer_buffers("indexer_cp_mailbox")
                 self.peers.copy_(torch.tensor(peers, dtype=torch.int64, device="cpu"))
                 torch.cuda.synchronize(device)
-            except Exception as error:  # noqa: BLE001
+            except Exception as error:  # noqa: BLE001 - agree every mapping failure
                 failure = error
             if group_agree(failure is None, cpu_group):
                 failure = None
@@ -170,8 +172,12 @@ class CandidateMailbox:
                 self._pool.close()
             raise RuntimeError(f"candidate mailbox: {failure}") from failure
 
-    def fits(self, tokens: int, topk: int) -> bool:
-        return tokens <= self.max_rows and topk <= self.MAX_TOPK
+    def fits(self, heads: int, tokens: int, topk: int) -> bool:
+        return (
+            heads == self.world
+            and tokens <= self.max_rows
+            and 1 <= topk <= self.MAX_TOPK
+        )
 
 
 _mailbox: CandidateMailbox | None = None

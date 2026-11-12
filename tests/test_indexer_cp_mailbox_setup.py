@@ -47,11 +47,10 @@ def _worker(rank, port, out):
 
     from atom.distributed import indexer_cp
 
-    indexer_cp._mailbox_runtime = lambda: (
-        Pool,
-        lambda: HipRuntime(),
-        lambda _raw_cached: False,
-    )
+    def runtime():
+        return Pool, lambda: HipRuntime(), lambda _raw_cached: False
+
+    indexer_cp._mailbox_runtime = runtime
     torch.cuda.synchronize = lambda *_args, **_kwargs: None
 
     def setup_failed():
@@ -85,7 +84,21 @@ def _worker(rank, port, out):
 
         indexer_cp._mailbox_runtime = missing_runtime
     fallbacks.append(setup_failed())
-    out[rank] = (fallbacks, state["open_calls"])
+
+    dist.barrier()
+    indexer_cp._mailbox_runtime = runtime
+    mailbox = indexer_cp.CandidateMailbox(
+        dist.group.WORLD, WORLD, max_rows=8, device=torch.device("cpu")
+    )
+    boundaries = (
+        mailbox.fits(WORLD, 8, 1),
+        mailbox.fits(WORLD, 8, mailbox.MAX_TOPK),
+        not mailbox.fits(WORLD - 1, 8, 1),
+        not mailbox.fits(WORLD, 9, 1),
+        not mailbox.fits(WORLD, 8, 0),
+        not mailbox.fits(WORLD, 8, mailbox.MAX_TOPK + 1),
+    )
+    out[rank] = (fallbacks, state["open_calls"], boundaries)
     dist.barrier()
     dist.destroy_process_group()
 
@@ -96,4 +109,6 @@ def test_setup_failures_are_agreed_before_collective_fallback():
         port = sock.getsockname()[1]
     out = mp.Manager().dict()
     mp.spawn(_worker, args=(port, out), nprocs=WORLD, join=True)
-    assert [out[rank] for rank in range(WORLD)] == [([True, True], 0)] * WORLD
+    assert [out[rank] for rank in range(WORLD)] == [
+        ([True, True], 1, (True,) * 6)
+    ] * WORLD

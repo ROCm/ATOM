@@ -119,6 +119,14 @@ DECODE_SCORE_MIN_BLOCKS = 3
 # asserts that rather than leaving it to a comment.
 PAGES_PER_SPARSE_BLOCK = 8
 
+# Packed candidate keys occupy bits 0..48: 16 block-id bits, 32 ordered-score
+# bits and one real-candidate bit. Mailbox users put their tag above this.
+SCORE_KEY_BITS = 49
+_SCORE_KEY_REAL_BIT = tl.constexpr(SCORE_KEY_BITS - 1)
+assert (
+    (1 << 48) | (0xFFFFFFFF << 16) | 0xFFFF
+) < 1 << SCORE_KEY_BITS, "packed score keys overlap the mailbox tag"
+
 
 # ---------------------------------------------------------------------------
 # Fused sparse block-table emission, shared by the prefill and decode
@@ -565,7 +573,7 @@ def _pack_score_key(score, index, valid):
     # (exponent all ones, mantissa nonzero) rather than `x != x` keeps this in
     # the integer domain and leaves the infinities exactly where they belong.
     ordered = tl.where((bits & 0x7FFFFFFF) > 0x7F800000, 0, ordered)
-    key = (1 << 48) | (ordered.to(tl.int64) << 16) | index.to(tl.int64)
+    key = (1 << _SCORE_KEY_REAL_BIT) | (ordered.to(tl.int64) << 16) | index.to(tl.int64)
     return tl.where(valid, key, 0)
 
 
@@ -702,7 +710,8 @@ def _require_packable(max_block: int) -> None:
     if max_block >= 0xFFFF:
         raise ValueError(
             f"packed top-k addresses at most {0xFFFF - 1} blocks, got "
-            f"{max_block}; widen the tie-break field"
+            f"{max_block}; widening the tie-break field also requires updating "
+            "SCORE_KEY_BITS and the indexer-CP mailbox tag layout"
         )
 
 
