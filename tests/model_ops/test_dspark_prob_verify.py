@@ -2,7 +2,7 @@
 """Self-consistency of the probabilistic verification's input variants.
 
 `prob_rejection_sample` can read the target rows of the full logits in place
-(`logit_rows=`) instead of a compacted copy of them; on the same inputs it
+(`in_place=True`) instead of a compacted copy of them; on the same inputs it
 must give the same tokens and verdict either way.
 
 Needs a GPU, or TRITON_INTERPRET=1 (then runs on the CPU).
@@ -91,7 +91,7 @@ def _verify(c, top_p, use_block, in_place=False):
         c["src"],
         state,
         use_block=use_block,
-        logit_rows=c["rows"] if in_place else None,
+        in_place=in_place,
     )
     return out.cpu(), verdict.cpu()
 
@@ -118,3 +118,33 @@ def test_rows_read_in_place_match_compacted_rows(seed, top_p, use_block, greedy,
     _assert_same(
         _verify(c, top_p, use_block, in_place=True), _verify(c, top_p, use_block)
     )
+
+
+def test_in_place_refuses_a_strided_source():
+    """The kernels step rows by the vocab width, so a strided view of the
+    logits must be refused rather than silently copied back out."""
+    c = _case(1, (), ())
+    strided = torch.cat((c["full"], c["full"]), dim=1)[:, :V]
+    assert not strided.is_contiguous()
+    state = dps.ProbDraftState(
+        q=c["q"].clone(),
+        ids=c["drafts"].clone(),
+        temps=c["temps"].clone(),
+        seed=torch.zeros(1, dtype=torch.int64, device=DEV),
+    )
+    state.set_layout(0, V, 1)
+    with pytest.raises(AssertionError):
+        dps.prob_rejection_sample(
+            c["input_ids"],
+            c["rows"],
+            N,
+            c["cu"],
+            strided,
+            c["bonus"],
+            c["bonus_rows"],
+            c["temps"],
+            None,
+            c["src"],
+            state,
+            in_place=True,
+        )

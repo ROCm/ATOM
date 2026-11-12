@@ -3665,9 +3665,10 @@ class ModelRunner:
             # `logits` in place (`_prob_verify`); every other reader (the
             # channel mask, the rejection sampler and its verification draw)
             # takes them compacted.
+            in_place = prob_src is not None and batch.required_channel is None
             target_logits = (
                 None
-                if prob_src is not None and batch.required_channel is None
+                if in_place
                 else torch.index_select(logits, 0, target_logits_indices)
             )
             channel = self._constrain_required_channel(
@@ -3703,8 +3704,8 @@ class ModelRunner:
             if prob_src is not None:
                 sampled_tokens, verdict = self._prob_verify(
                     spec_decode_metadata,
-                    logits,
-                    target_logits,
+                    logits if in_place else target_logits,
+                    in_place,
                     bonus_token_ids,
                     bonus_ready,
                     temperatures,
@@ -4131,8 +4132,8 @@ class ModelRunner:
     def _prob_verify(
         self,
         spec_decode_metadata,
-        logits,
-        target_logits,
+        verify_logits,
+        in_place,
         bonus_token_ids,
         bonus_ready,
         temperatures,
@@ -4142,8 +4143,9 @@ class ModelRunner:
     ):
         """ATOM_DSPARK_PROB_DRAFT=1: probability-ratio verification of the
         step's drafts against the drafter's stored q (`prob_rejection_sample`),
-        with its periodic acceptance diagnostics. ``target_logits`` None: the
-        target rows are read from ``logits`` in place. Returns the rejection
+        with its periodic acceptance diagnostics. ``in_place``: ``verify_logits``
+        is the step's full logits, its target rows read where they are;
+        otherwise it is those rows, compacted. Returns the rejection
         sampler's (output ids, verdict), the verdict aligned with TP rank 0."""
         from atom.model_ops.dspark_prob_sample import (
             BLOCK_VERIFY,
@@ -4153,13 +4155,12 @@ class ModelRunner:
         )
 
         md = spec_decode_metadata
-        in_place = target_logits is None
         sampled_tokens, verdict = prob_rejection_sample(
             md.input_ids,
             md.target_logits_indices,
             md.num_spec_steps,
             md.cu_num_draft_tokens,
-            logits if in_place else target_logits,
+            verify_logits,
             bonus_token_ids,
             md.bonus_logits_indices,
             temperatures,
@@ -4170,11 +4171,14 @@ class ModelRunner:
             tp_group=get_tp_group(),
             use_custom=envs.ATOM_USE_CUSTOM_ALL_GATHER,
             bonus_ready=bonus_ready,
-            logit_rows=md.target_logits_indices if in_place else None,
+            in_place=in_place,
         )
         if PROB_DEBUG and prob_state.verify_step % PROB_DEBUG == 0:
-            if in_place:
-                target_logits = torch.index_select(logits, 0, md.target_logits_indices)
+            target_logits = (
+                torch.index_select(verify_logits, 0, md.target_logits_indices)
+                if in_place
+                else verify_logits
+            )
             debug_acceptance(
                 target_logits,
                 md.cu_num_draft_tokens,
