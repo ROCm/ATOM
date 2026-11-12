@@ -63,7 +63,7 @@ def validate_runtime_config(config):
 
     - both caches: native ATOM (not the vLLM/SGLang bridges), ``--block-size 128``,
       gfx950;
-    - ``--kv-cache-dtype fp4`` also: ``--index-cache-dtype fp4`` (not defaulted),
+    - ``--kv-cache-dtype fp4`` also: ``--index-cache-dtype fp4`` (the default when omitted, an explicit other value is refused),
       every attention layer an indexed sparse one (M3.1), a bf16 model, no KV offload
       or ``--kv-transfer-config``, and no speculative draft left with FP4 KV.
     """

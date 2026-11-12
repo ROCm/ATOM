@@ -200,11 +200,11 @@ def test_an_all_sparse_m3_passes_the_kv_gate(monkeypatch, text_config):
     check(monkeypatch, text_config=text_config)
 
 
-def test_an_fp4_kv_without_the_fp4_index_flag_is_refused_not_defaulted(monkeypatch):
-    """fp4 only when asked for: the index is bf16 unless given, so the fp4 KV beside
-    it is refused at startup rather than the index being picked for the user."""
-    with pytest.raises(ValueError, match="needs --index-cache-dtype fp4, got bf16"):
-        _m3(monkeypatch, kv_cache_dtype="fp4", hf=sparse_hf())
+def test_an_fp4_kv_without_an_index_flag_gets_the_fp4_index(monkeypatch):
+    """The MXFP4 KV needs the MXFP4 index, so an omitted index dtype follows the KV's
+    rather than being left at bf16 to be refused; an explicit one is held to it."""
+    cfg = _m3(monkeypatch, kv_cache_dtype="fp4", hf=sparse_hf())
+    assert cfg.index_cache_dtype == "fp4"
 
 
 def test_an_fp4_kv_with_another_index_cache_is_refused(monkeypatch):

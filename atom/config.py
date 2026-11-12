@@ -1946,12 +1946,13 @@ def qrep_for_step(
 
 
 def _check_fp4_kv(kv_cache_dtype: str, *, is_m3: bool, is_v41: bool) -> None:
-    """``--kv-cache-dtype fp4`` is MiniMax-M3's to ask for and DeepSeek-V4.1's own;
-    refused elsewhere. What M3 then serves is ``minimax_m3.config.
-    validate_runtime_config``'s."""
+    """``--kv-cache-dtype fp4`` is MiniMax-M3.1's to ask for and DeepSeek-V4.1's own;
+    refused for every other model. The guard admits the MiniMax-M3 architecture and
+    ``minimax_m3.config.validate_runtime_config`` then refuses what is not M3.1
+    (a model with dense attention layers)."""
     if kv_cache_dtype == "fp4" and not (is_m3 or is_v41):
         raise ValueError(
-            "--kv-cache-dtype fp4 is supported by MiniMax-M3 and DeepSeek-V4.1 only"
+            "--kv-cache-dtype fp4 is supported by MiniMax-M3.1 and DeepSeek-V4.1 only"
         )
 
 
@@ -2964,15 +2965,11 @@ class Config:
                 # load. Overriding it here would accept the flag and ignore it.
                 self.index_cache_dtype = "fp8"
             else:
-                # fp4 only when asked for: M3's fp4 KV needs the fp4 index (the MXFP4
-                # attention reads the selector's rows, which only that scorer sizes
-                # to match), so it is not defaulted, and `validate_runtime_config`
-                # refuses the bf16 left here.
-                self.index_cache_dtype = (
-                    "bf16"
-                    if is_m3 and self.kv_cache_dtype == "fp4"
-                    else self.kv_cache_dtype
-                )
+                # M3's fp4 KV needs the fp4 index (the MXFP4 attention reads the
+                # selector's rows, which only that scorer sizes to match), which is
+                # what following the KV dtype gives; an explicit other index dtype
+                # is refused by `validate_runtime_config`.
+                self.index_cache_dtype = self.kv_cache_dtype
         if self.speculative_config is not None:
             from atom.spec_decode.draft_kv import draft_owns_kv_pool
 
