@@ -2112,6 +2112,15 @@ class Config:
     enable_chunked_prefill: bool = True
     enable_log_stats: bool = True
     enable_request_context_metrics: bool = False
+    # --sampler-independent-noise: draw a fresh exponential noise row per
+    # stochastic row of an unfiltered temperature batch instead of broadcasting
+    # one row, so ordinary n=1 requests (not only fan-out siblings and
+    # speculative verification) are sampled independently. Off by default; the
+    # option costs a (num_tokens, vocab_size) float32 allocation per sampler
+    # call and changes the RNG stream. The top-k/top-p path already draws
+    # per-row noise, so the option is inert there by design; greedy rows never
+    # draw noise. Native ATOM engine only.
+    sampler_independent_noise: bool = False
     # Seconds between engine-status lines. Validated > 0 by EngineStats.
     throughput_log_interval: float = 10.0
     # Forwards between engine-status lines, replacing the clock above when
@@ -2150,9 +2159,10 @@ class Config:
     master_addr: str = "127.0.0.1"
     enable_dp_attention: bool = False
     # DP request-routing strategy used by CoreManager to pick an engine rank:
-    # "round_robin" | "least_requests" (default) | "least_tokens". Only has an
-    # effect when more than one DP engine rank is launched. See
-    # atom/model_engine/engine_core_mgr.py:_select_dp_rank_locked. The literal
+    # "round_robin" | "least_requests" (default) | "least_tokens" |
+    # "prefix_spread". Only has an effect when more than one DP engine rank is
+    # launched. See atom/model_engine/engine_core_mgr.py:_select_dp_rank_locked
+    # and, for "prefix_spread", atom/model_engine/dp_routing/prefix_spread.py. The literal
     # default must stay in sync with engine_core_mgr.DP_LB_DEFAULT (config.py
     # cannot import it without a cycle: engine_core_mgr imports Config).
     dp_load_balance: str = "least_requests"
@@ -3341,6 +3351,21 @@ class Config:
             str(factors).encode(), usedforsecurity=False
         ).hexdigest()[:10]
         return hash_str
+
+
+def local_device_index(config: Config, rank: int) -> int:
+    """Node-local GPU index of worker ``rank`` (0..tp*pcp-1) of its stage.
+
+    On a single node the physical GPU index equals the global distributed rank
+    in the DPxPPxPCPxTP layout: each EngineCore (one per (dp,pp) stage) owns a
+    contiguous slice of `tp_world_size * pcp_group_size` GPUs.
+    """
+    pc = config.parallel_config
+    engine_index = (
+        pc.data_parallel_rank_local or 0
+    ) * config.pipeline_parallel_size + pc.pipeline_parallel_rank
+    stage_span = config.tp_world_size * config.pcp_group_size
+    return engine_index * stage_span + rank
 
 
 _current_atom_config: Config | None = None

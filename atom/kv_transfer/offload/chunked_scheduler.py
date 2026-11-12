@@ -21,6 +21,7 @@ from atom.kv_transfer.offload._offload_common import (
     OffloadSchedulerMixin,
     validated_kv_role,
 )
+from atom.kv_transfer.offload.load_math import tier_load_tokens
 from atom.kv_transfer.offload.metadata import (
     LMCacheOffloadMetadata,
     LMCacheReqMeta,
@@ -48,6 +49,8 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
     is_offload = True
     # Only transports that publish source-safe completion groups may opt in.
     _supports_early_block_release = False
+    _request_meta_type = LMCacheReqMeta
+    _step_meta_type = LMCacheOffloadMetadata
 
     def __init__(
         self,
@@ -619,7 +622,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         if hbm % chunk != 0:
             return False, "unaligned_hbm_prefill", hbm, lmc, need, chunk
         min_load = int(getattr(self, "_min_load_tokens", 8192))
-        if need < min_load:
+        if not tier_load_tokens(hbm, lmc, chunk, min_load):
             return False, "too_small", hbm, lmc, need, chunk
         return True, "aligned_large_hit", hbm, lmc, need, chunk
 
@@ -656,9 +659,9 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         is_last_prefill: bool,
     ) -> LMCacheReqMeta | None:
         """Admit any layout-specific sources before advancing the watermark."""
-        return LMCacheReqMeta(
+        return self._request_meta_type(
             req_id=seq.id,
-            token_ids=list(seq.token_ids[:aligned]),
+            token_ids=self._transfer_tokens(seq, aligned),
             block_ids=block_ids,
             save_spec=SaveSpec(skip_leading_tokens=saved, can_save=True),
             is_last_prefill=is_last_prefill,
@@ -719,13 +722,18 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         Ships the prompt prefix the transfer covers, from which the worker
         derives the chunk keys. A transport keyed differently overrides this.
         """
-        return LMCacheReqMeta(
+        return self._request_meta_type(
             req_id=seq.id,
-            token_ids=list(seq.token_ids[:transfer_end]),
+            token_ids=self._transfer_tokens(seq, transfer_end),
             block_ids=list(seq.block_table),
             load_spec=load_spec,
             load_operation=load_operation,
         )
+
+    def _transfer_tokens(self, seq, end: int):
+        """The token ids a transfer covering ``[0, end)`` ships; a transport
+        that keeps the prefix worker-side overrides it (LMCache MP)."""
+        return list(seq.token_ids[:end])
 
     def _late_save_frontier(self, seq, saved: int, available: int) -> int:
         """Return the largest layout-valid boundary for a late-acquired source."""
@@ -787,7 +795,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
 
     def build_connector_meta(self) -> LMCacheOffloadMetadata:
         _perf_t0 = time.perf_counter()
-        meta = LMCacheOffloadMetadata()
+        meta = self._step_meta_type()
 
         # Loads
         logger.debug("[OFFLOAD-BUILD] reqs_need_recv=%d", len(self._reqs_need_recv))

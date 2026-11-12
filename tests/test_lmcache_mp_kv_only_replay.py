@@ -37,6 +37,7 @@ from atom.model_engine.page_unit_checkpoint import (
     PagedStateCheckpointSpec,
 )
 from atom.model_engine.sequence import Sequence
+from tests.lmcache_mp_support import shipped_tokens as _shipped_tokens
 
 CHUNK = 8
 REPLAY = 6
@@ -400,7 +401,7 @@ def test_a_page_only_save_stores_page_alone_with_no_checkpoint(monkeypatch):
     assert request.native_state.kv_only
     assert request.native_state.unit_ids == ()
     assert request.native_state.boundary_tokens == 32
-    assert request.token_ids == list(seq.token_ids[:32])
+    assert _shipped_tokens(request) == list(seq.token_ids[:32])
     assert request.save_spec.skip_leading_tokens == 0
     assert checkpoints.store.pool.num_free == free
     operation = request.save_operation
