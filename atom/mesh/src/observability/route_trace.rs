@@ -354,4 +354,46 @@ mod tests {
             assert!(sampled.contains(field), "missing {field} in\n{sampled}");
         }
     }
+
+    #[tokio::test]
+    async fn a_pool_without_candidates_logs_its_failure() {
+        use crate::core::placement::{planner::DefaultPlanner, test_support::*, PdPlanner};
+
+        let unhealthy = |worker: Arc<dyn Worker>| {
+            worker.set_healthy(false);
+            worker
+        };
+        let prefill = || make_prefill_http("http://p:8000", "m", Some(8998));
+        let decode = || make_decode_http("http://d:8000", "m");
+        let cases = [
+            (
+                "regular",
+                vec![unhealthy(make_regular_http("http://w:8000", "m"))],
+            ),
+            ("prefill", vec![unhealthy(prefill()), decode()]),
+            ("decode", vec![prefill(), unhealthy(decode())]),
+            ("prefill", vec![decode()]),
+            ("decode", vec![prefill()]),
+        ];
+        for (pool, workers) in cases {
+            let source = workers
+                .into_iter()
+                .fold(MockWorkerSource::new(), MockWorkerSource::add_worker);
+            let planner = DefaultPlanner::new(Arc::new(source), Arc::new(MockPolicySource::new()));
+            let sampled = logs(true, async {
+                let descriptor = make_descriptor(Some("m"), None, None, None);
+                assert!(planner.plan(&descriptor).await.is_err());
+            })
+            .await;
+
+            for field in [
+                "No worker selected",
+                &format!(r#"pool="{pool}""#),
+                r#"policy="round_robin""#,
+                r#"branch="no_healthy_workers""#,
+            ] {
+                assert!(sampled.contains(field), "missing {field} in\n{sampled}");
+            }
+        }
+    }
 }
