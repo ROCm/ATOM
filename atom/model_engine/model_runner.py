@@ -799,12 +799,6 @@ class ModelRunner:
     weights_only = False
 
     def __init__(self, rank: int, config: Config):
-        if envs.ATOM_WEIGHT_CACHE != "off":
-            # Before the model's modules are imported: the cache compares the
-            # code that runs with the files it hashes.
-            from atom.model_loader.weight_cache.key import snapshot_sources
-
-            snapshot_sources()
         self.config = config
         self.structured_output = None
         self.structured_compile_executor = None

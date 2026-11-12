@@ -831,8 +831,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PRELOAD_IDLE_TIMEOUT_S": lambda: _nonnegative_int_env(
         "ATOM_PRELOAD_IDLE_TIMEOUT_S", 3600
     ),
-    # Directory for the daemons' sockets and locks (default
-    # /dev/shm/atom_weight_cache_<uid>; daemon and clients must agree).
+    # Directory for the daemons' sockets, locks and logs (default
+    # /tmp/atom_weight_cache_<uid>; daemon and clients must agree).
     "ATOM_WEIGHT_CACHE_DIR": lambda: os.getenv("ATOM_WEIGHT_CACHE_DIR", ""),
     # How long a client waits for a daemon that is still loading.
     "ATOM_WEIGHT_CACHE_WAIT_S": lambda: _positive_float_env(

@@ -2546,6 +2546,12 @@ class Config:
                     f"ATOM_WEIGHT_CACHE={cache_mode} does not support pipeline "
                     "parallelism yet"
                 )
+            if self.parallel_config.data_parallel_size > 1:
+                # The daemon and the server would both hold the DP master port.
+                raise ValueError(
+                    f"ATOM_WEIGHT_CACHE={cache_mode} does not support data "
+                    "parallelism yet"
+                )
             if cache_mode == "daemon":
                 self.runner_qualname = DAEMON_RUNNER
         elif cache_mode != "off":

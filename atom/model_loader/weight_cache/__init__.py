@@ -13,7 +13,8 @@ What is served is found by diffing the model and the ATOM/AITER objects
 hanging off it before and after ``load_model`` (export.py). A client takes the
 cache only if all of these match the daemon's:
 
-* identity: checkpoint headers, hf_config, rank, GPU arch, library versions;
+* identity: the checkpoint's files (name, size, mtime, inode; safetensors
+  headers), hf_config, rank, GPU arch, library versions;
 * what the daemon's load read (recorder.py): env vars, config fields,
   construction-time attributes, globals and files. Serving flags that loading
   does not read, such as --max-model-len, do not count;
@@ -25,7 +26,8 @@ cache only if all of these match the daemon's:
 Once a daemon holds a launch's GPUs there is no silent fallback to disk: all
 ranks agree, and a mismatch fails with the reason. ``ATOM_PRELOAD=1`` instead
 starts, reuses or (once) restarts the daemon with the server's own launch
-(preload.py). ``python -m atom.model_loader.weight_cache status|stop`` shows
+(preload.py); if the daemon it started cannot be used either, it stops it and
+loads from disk. ``python -m atom.model_loader.weight_cache status|stop`` shows
 or stops this user's daemons.
 """
 

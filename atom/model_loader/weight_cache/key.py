@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import ast
 import contextlib
-import glob
 import hashlib
 import importlib
 import importlib.metadata
@@ -18,6 +17,7 @@ import subprocess
 import sys
 import threading
 
+import psutil
 import torch
 from torch import nn
 
@@ -39,18 +39,36 @@ class _SourceChanged(Exception):
 # ---------------------------------------------------------------------------
 
 
+_SMALL_FILE = 1 << 20
+
+
 def _checkpoint_digest(model_path: str) -> str:
-    """Hash of every shard's safetensors header (names, dtypes, shapes, offsets)."""
-    files = sorted(glob.glob(os.path.join(model_path, "*.safetensors")))
-    if not files:
-        return f"path:{os.path.realpath(model_path)}"
+    """Every file in the checkpoint directory by name, size, mtime and inode
+    (a checkpoint rewritten in place changes them), with the content of small
+    files (configs) and the safetensors headers."""
+    root = os.path.realpath(model_path)
+    if not os.path.isdir(root):
+        return f"path:{root}"
     h = hashlib.sha256()
-    for path in files:
-        with open(path, "rb") as f:
-            raw = f.read(8)
-            (n,) = struct.unpack("<Q", raw)
-            h.update(os.path.basename(path).encode())
-            h.update(raw + f.read(n))
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
+        for name in sorted(filenames):
+            path = os.path.join(dirpath, name)
+            try:
+                st = os.stat(path)
+                rel = os.path.relpath(path, root)
+                h.update(
+                    f"{rel}\0{st.st_size}\0{st.st_mtime_ns}\0{st.st_ino}\n".encode()
+                )
+                with open(path, "rb") as f:
+                    if st.st_size <= _SMALL_FILE:
+                        h.update(f.read())
+                    elif name.endswith(".safetensors"):
+                        raw = f.read(8)
+                        (n,) = struct.unpack("<Q", raw)
+                        h.update(raw + f.read(n))
+            except (OSError, struct.error) as e:
+                h.update(f"{name}\0<{type(e).__name__}>\n".encode())
     return h.hexdigest()
 
 
@@ -142,19 +160,15 @@ def _diff_key(daemon: dict, client: dict, prefix: str = "") -> list[str]:
 # ---------------------------------------------------------------------------
 
 _OWN_DIR = os.path.dirname(os.path.realpath(__file__))
-_SOURCE_STATS: dict[str, tuple[int, int]] | None = None
-_SKIP_DIRS = frozenset(
-    {
-        "__pycache__",
-        ".git",
-        "target",
-        "build",
-        "csrc",
-        "hsa",
-        "3rdparty",
-        "node_modules",
-    }
-)
+# Set by the API server for its engine's processes (preload.record_launch).
+_LAUNCH_T0_ENV = "ATOM_WEIGHT_CACHE_LAUNCH_T0"
+
+
+def _launch_start() -> float:
+    """When this launch started: its API server's start, else this process's."""
+    with contextlib.suppress(TypeError, ValueError):
+        return float(os.environ.get(_LAUNCH_T0_ENV))
+    return psutil.Process().create_time()
 
 
 def _package_roots() -> dict[str, str]:
@@ -176,25 +190,6 @@ def _code_location(filename: str, roots: dict[str, str]) -> tuple[str, str] | No
         if fn.startswith(root + os.sep):
             return pkg, os.path.relpath(fn, root)
     return None
-
-
-def snapshot_sources() -> None:
-    """Record each ATOM/AITER source file's (mtime, size) as this process
-    starts, so a file edited after its code was imported is caught later."""
-    global _SOURCE_STATS
-    if _SOURCE_STATS is not None:
-        return
-    stats = {}
-    for root in _package_roots().values():
-        for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
-            for fn in filenames:
-                if fn.endswith(".py"):
-                    path = os.path.join(dirpath, fn)
-                    with contextlib.suppress(OSError):
-                        st = os.stat(path)
-                        stats[os.path.realpath(path)] = (st.st_mtime_ns, st.st_size)
-    _SOURCE_STATS = stats
 
 
 class _CodeTracer:
@@ -274,14 +269,25 @@ def _record_jit(kernels: dict):
         JITFunction.run = orig
 
 
+def _kernel_key(jf) -> str:
+    """A Triton kernel's cache key, or a hash of its source if it has none."""
+    try:
+        return str(jf.cache_key)
+    except Exception:  # noqa: BLE001
+        src = getattr(jf, "src", None)
+        if not isinstance(src, str):
+            return "<unkeyable>"
+        return "src:" + hashlib.sha256(src.encode()).hexdigest()
+
+
 def _jit_key(module: str, qual: str) -> str:
     try:
         obj = _import_qual(module, qual)
-        while not hasattr(obj, "cache_key") and hasattr(obj, "fn"):
-            obj = obj.fn  # autotuner / heuristics wrappers
-        return str(obj.cache_key)
     except Exception as e:  # noqa: BLE001
         return f"<unresolved {type(e).__name__}>"
+    while not hasattr(obj, "cache_key") and hasattr(obj, "fn"):
+        obj = obj.fn  # autotuner / heuristics wrappers
+    return _kernel_key(obj)
 
 
 class _StripDocstrings(ast.NodeTransformer):
@@ -301,29 +307,48 @@ class _StripDocstrings(ast.NodeTransformer):
 
 
 class _SourceHasher:
-    """AST hashes (docstrings stripped) of functions in the atom/aiter packages."""
+    """AST hashes (docstrings stripped) of functions in the atom/aiter packages.
+
+    A source file changed (ctime) after this launch started may not be what
+    the process imported, so reading one raises _SourceChanged."""
 
     def __init__(self):
         self.roots = _package_roots()
+        self.t0 = _launch_start()
+        self._sources: dict[str, bytes | None] = {}
         self._trees: dict[str, ast.AST | None] = {}
 
-    def _tree(self, pkg: str, rel: str):
+    def source(self, pkg: str, rel: str) -> bytes | None:
         key = f"{pkg}/{rel}"
-        if key not in self._trees:
+        if key not in self._sources:
             path = os.path.realpath(
                 os.path.join(self.roots.get(pkg, "/nonexistent"), rel)
             )
             try:
-                st = os.stat(path)
+                changed = os.stat(path).st_ctime > self.t0
+                if not changed:
+                    with open(path, "rb") as f:
+                        self._sources[key] = f.read()
             except OSError:
-                self._trees[key] = None
-                return None
-            # Files created after start (e.g. JIT-generated) have nothing to compare with.
-            known = _SOURCE_STATS.get(path) if _SOURCE_STATS is not None else None
-            if known is not None and known != (st.st_mtime_ns, st.st_size):
-                raise _SourceChanged(key)
-            with open(path, encoding="utf-8") as f:
-                self._trees[key] = _StripDocstrings().visit(ast.parse(f.read()))
+                self._sources[key] = None
+            else:
+                if changed:
+                    raise _SourceChanged(key)
+        return self._sources[key]
+
+    def file_hash(self, pkg: str, rel: str) -> str | None:
+        src = self.source(pkg, rel)
+        return None if src is None else hashlib.sha256(src).hexdigest()
+
+    def _tree(self, pkg: str, rel: str):
+        key = f"{pkg}/{rel}"
+        if key not in self._trees:
+            src = self.source(pkg, rel)
+            self._trees[key] = (
+                None
+                if src is None
+                else _StripDocstrings().visit(ast.parse(src.decode("utf-8")))
+            )
         return self._trees[key]
 
     @staticmethod
@@ -369,38 +394,39 @@ def _outer_qualname(code) -> str:
     return ".".join(parts) if parts else "<module>"
 
 
-def code_fingerprint(codes, kernels) -> list[tuple]:
-    """What ran during load: functions and launched Triton kernels. (Module
-    constants and bound functions the code used are keyed as globals by
-    the recorder.)"""
+def code_fingerprint(codes, kernels) -> dict:
+    """What ran during load: functions (AST hashes, plus the hash of each
+    file, so a client with the same bytes skips parsing) and launched Triton
+    kernels. (Module constants and bound functions the code used are keyed
+    as globals by the recorder.)"""
     hasher = _SourceHasher()
     fns = set()
     for code in codes:
         where = _code_location(code.co_filename, hasher.roots)
         if where is not None:
             fns.add((*where, _outer_qualname(code)))
-    out = [
+    entries = [
         ("fn", pkg, rel, qual, hasher.digest(pkg, rel, qual)) for pkg, rel, qual in fns
     ]
     for jf in kernels:
         fn = getattr(jf, "fn", None)
         module, qual = getattr(fn, "__module__", "?"), getattr(fn, "__qualname__", "?")
-        try:
-            key = str(jf.cache_key)
-        except Exception as e:  # noqa: BLE001 - an unkeyable kernel never matches
-            key = f"<error {type(e).__name__} pid {os.getpid()}>"
-        out.append(("jit", module, qual, "", key))
-    return sorted(set(out))
+        entries.append(("jit", module, qual, "", _kernel_key(jf)))
+    files = {f"{pkg}/{rel}": hasher.file_hash(pkg, rel) for pkg, rel, _ in fns}
+    return {"entries": sorted(set(entries)), "files": files}
 
 
-def verify_code(fingerprint) -> list[str]:
+def verify_code(fingerprint: dict) -> list[str]:
     """Entries whose code differs in this process (raises _SourceChanged)."""
     hasher = _SourceHasher()
     changed = []
-    for kind, a, b, c, digest in fingerprint:
-        now = hasher.digest(a, b, c) if kind == "fn" else _jit_key(a, b)
-        if now != digest:
-            changed.append(f"{a}/{b}:{c}" if kind == "fn" else f"Triton kernel {a}.{b}")
+    for kind, a, b, c, digest in fingerprint["entries"]:
+        if kind == "fn":
+            same_file = hasher.file_hash(a, b) == fingerprint["files"].get(f"{a}/{b}")
+            if not same_file and hasher.digest(a, b, c) != digest:
+                changed.append(f"{a}/{b}:{c}")
+        elif _jit_key(a, b) != digest:
+            changed.append(f"Triton kernel {a}.{b}")
     return changed
 
 

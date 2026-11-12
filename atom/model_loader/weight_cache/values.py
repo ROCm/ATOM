@@ -187,8 +187,9 @@ _DIGEST_CHUNK = 1 << 24
 _DIGEST_WEIGHTS: dict[str, torch.Tensor] = {}
 
 
-def _digest(t: torch.Tensor) -> str:
-    """Exact content digest (two position-weighted sums over the raw bytes)."""
+def _digest_sums(t: torch.Tensor):
+    """(bytes, s1, s2) of a tensor's raw bytes with the sums left on its
+    device, or a fixed string for meta and empty tensors."""
     if t.is_meta:
         return "meta"
     if t.numel() == 0:
@@ -213,14 +214,41 @@ def _digest(t: torch.Tensor) -> str:
         )
         _DIGEST_WEIGHTS[key] = w
     s1 = s2 = 0
-    for i in range(0, x.numel(), _DIGEST_CHUNK):
+    for k, i in enumerate(range(0, x.numel(), _DIGEST_CHUNK)):
         c = x[i : i + _DIGEST_CHUNK]
         if c.dtype != torch.int64:
             c = c.to(torch.int64)
-        s1 += int(c.sum())
-        s2 += int((c * w[: c.numel()]).sum())
+        s1 = s1 + c.sum()
+        # Weighted by the position in the chunk and by the chunk, so data
+        # moved between chunks changes the digest too.
+        s2 = s2 + (c * w[: c.numel()]).sum() * (k + 1)
+    return n, s1, s2
+
+
+def _digests(tensors) -> list[str]:
+    """Exact content digests (two position-weighted sums over the raw bytes),
+    with one host sync per device."""
+    sums = [_digest_sums(t) for t in tensors]
+    out = [s if isinstance(s, str) else "" for s in sums]
+    by_device: dict = {}
+    for i, s in enumerate(sums):
+        if not isinstance(s, str):
+            by_device.setdefault(s[1].device, []).append(i)
     mask = (1 << 64) - 1
-    return f"{n}:{s1 & mask:x}:{s2 & mask:x}"
+    for idx in by_device.values():
+        vals = torch.stack([v for i in idx for v in sums[i][1:]]).tolist()
+        for j, i in enumerate(idx):
+            out[i] = f"{sums[i][0]}:{vals[2 * j] & mask:x}:{vals[2 * j + 1] & mask:x}"
+    return out
+
+
+def _digest(t: torch.Tensor) -> str:
+    return _digests([t])[0]
+
+
+def release_digest_buffers() -> None:
+    """Drop the digest weights (128 MiB per device); the caller empties the cache."""
+    _DIGEST_WEIGHTS.clear()
 
 
 # ---------------------------------------------------------------------------

@@ -65,13 +65,22 @@ def _status(launches: dict) -> None:
             print(f"{line}; gpu {st.get('gpu', '?')}")
 
 
-def _stop(launches: dict) -> int:
+def _stop(launches: dict, force: bool) -> int:
     rc = 0
     for main_pid, gpus in launches.items():
         servers = 0  # each server connects once per GPU
         for path, _ in gpus:
             with contextlib.suppress(Exception):
                 servers = max(servers, _ping(path, timeout=5).get("clients", 0))
+        if servers and not force:
+            # Their mappings outlive the daemon in practice, but HIP does not
+            # promise that for memory whose exporter has exited.
+            print(
+                f"daemon pid {main_pid}: {servers} running server(s) use its weights; "
+                "stop them first, or pass --force"
+            )
+            rc = 1
+            continue
         try:
             for path, _ in gpus:
                 stop_daemon(path)  # the first one stops the whole launch
@@ -94,6 +103,11 @@ def main(argv: list[str] | None = None) -> int:
         description="Show or stop this user's ATOM weight cache daemons on this machine.",
     )
     parser.add_argument("command", choices=("status", "stop"))
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="stop: also stop daemons that running servers use",
+    )
     args = parser.parse_args(argv)
     launches = _running_daemons()
     if not launches:
@@ -102,7 +116,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "status":
         _status(launches)
         return 0
-    return _stop(launches)
+    return _stop(launches, args.force)
 
 
 if __name__ == "__main__":

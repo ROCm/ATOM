@@ -16,6 +16,7 @@ import time
 
 import psutil
 
+from atom.model_loader.weight_cache.key import _LAUNCH_T0_ENV
 from atom.model_loader.weight_cache.transport import (
     _DAEMON_LOG_ENV,
     _DAEMON_PID_ENV,
@@ -24,7 +25,7 @@ from atom.model_loader.weight_cache.transport import (
     daemon_state,
     socket_dir,
 )
-from atom.model_loader.weight_cache.values import _Miss
+from atom.model_loader.weight_cache.values import _TAG, _Miss, logger
 from atom.utils import envs
 
 _LAUNCH_ENV = "ATOM_PRELOAD_LAUNCH"  # set by the API server: its saved launch
@@ -79,14 +80,23 @@ def _remove(*paths: str) -> None:
 
 
 def record_launch() -> None:
-    """Called first thing by the API server. A daemon tells its runners its
-    main process (stopping that stops the daemon). An ATOM_PRELOAD server
-    saves its command line and environment, to start a daemon with them."""
+    """Called first thing by the API server (weight cache on). Its start time
+    tells the runners which sources may have changed under them. A daemon
+    tells its runners its main process (stopping that stops the daemon). An
+    ATOM_PRELOAD server saves its command line and environment, to start a
+    daemon with them."""
+    os.environ[_LAUNCH_T0_ENV] = str(psutil.Process().create_time())
     if envs.ATOM_WEIGHT_CACHE == "daemon":
         os.environ[_DAEMON_PID_ENV] = str(os.getpid())
         return
     if not envs.ATOM_PRELOAD:
         return
+    if os.getpid() == 1:
+        logger.warning(
+            f"{_TAG} ATOM_PRELOAD: this server is its container's PID 1, so the "
+            "container (and the daemon in it) stops when the server does; run "
+            "the server under another init process to keep the daemon"
+        )
     d = socket_dir()
     for old in glob.glob(os.path.join(d, "launch_*.json")):
         with contextlib.suppress(ValueError, IndexError):
@@ -104,6 +114,39 @@ def record_launch() -> None:
         json.dump(launch, f)
     os.environ[_LAUNCH_ENV] = path
     atexit.register(_remove, path, path + ".daemon")
+
+
+def start_early() -> None:
+    """ATOM_PRELOAD, from the API server before it starts its engine: with no
+    daemon on any GPU here, start one now, so it loads while this server
+    starts up. The runners find it through the launch's marker; with a
+    daemon present they decide themselves (reuse or restart)."""
+    if not os.environ.get(_LAUNCH_ENV):
+        return
+    locks = glob.glob(os.path.join(socket_dir(), "gpu_*.sock.lock"))
+    if any(daemon_alive(lock[: -len(".lock")]) for lock in locks):
+        return
+    try:
+        info = _spawn_daemon()
+    except _Miss as e:
+        logger.warning(f"{_TAG} could not start a weight cache daemon early: {e}")
+        return
+    logger.info(
+        f"{_TAG} started weight cache daemon pid {info['pid']} (log {info['log']})"
+    )
+
+
+def _started_by_launch() -> dict | None:
+    """The daemon this launch has started already (start_early), if any."""
+    launch = os.environ.get(_LAUNCH_ENV)
+    if not launch:
+        return None
+    try:
+        with open(launch + ".daemon") as f:
+            info = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return None if "error" in info else info
 
 
 def _spawn_daemon() -> dict:
@@ -204,22 +247,28 @@ def stop_daemon(path: str, timeout_s: float = 180) -> int | None:
     return main
 
 
-def _in_use_by_others(path: str) -> str | None:
+def _in_use_by_others(path: str, wait_s: float = 5) -> str | None:
     """Why this GPU's daemon must not be replaced (None: it may be)."""
-    others, deadline = 0, time.monotonic() + 3
+    deadline = time.monotonic() + wait_s
     while True:  # this server has just closed its own connection
         try:
             others = _ping(path).get("clients", 0)
-        except OSError:
-            return None  # still loading, or gone
+        except FileNotFoundError:
+            return None  # not serving (yet): nobody can be connected
+        except ConnectionRefusedError:
+            if not daemon_alive(path):
+                return None  # it has stopped serving and exited
+            others = None  # stopping: let it finish
         except Exception as e:  # noqa: BLE001 - every rank must reach the agreement
             return f"could not ask the daemon whether servers use it: {e!r}"
-        if others == 0 or time.monotonic() > deadline:
+        if others == 0:
+            return None
+        if time.monotonic() > deadline:
             break
         time.sleep(0.1)
-    if others:
-        return (
-            f"{others} other running server(s) use the daemon's weights on this GPU; they keep "
-            "them in memory, so a new daemon would not fit. Stop them first"
-        )
-    return None
+    if others is None:
+        return "the daemon holds this GPU but does not answer"
+    return (
+        f"{others} other running server(s) use the daemon's weights on this GPU; they keep "
+        "them in memory, so a new daemon would not fit. Stop them first"
+    )

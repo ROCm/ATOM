@@ -3775,6 +3775,11 @@ def main():
     args = parser.parse_args()
     if args.api_server_count < 1:
         parser.error("--api-server-count must be at least 1")
+    if envs.ATOM_PRELOAD and envs.ATOM_WEIGHT_CACHE == "client":
+        # Start the weight cache daemon now, so it loads while this starts up.
+        from atom.model_loader.weight_cache.preload import start_early
+
+        start_early()
 
     _setup_frontend(args)
 

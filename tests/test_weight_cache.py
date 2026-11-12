@@ -66,7 +66,8 @@ def _write(path, text):
 
 @pytest.fixture
 def no_source_stats(monkeypatch):
-    monkeypatch.setattr(key, "_SOURCE_STATS", None)
+    # The launch "starts" after every file the test writes.
+    monkeypatch.setenv(key._LAUNCH_T0_ENV, str(time.time() + 3600))
 
 
 def test_function_hash_follows_its_body_only(tmp_path, no_source_stats):
@@ -97,15 +98,53 @@ def test_all_same_named_defs_are_hashed(tmp_path, no_source_stats):
 def test_source_edited_after_start_is_refused(tmp_path, monkeypatch):
     f = tmp_path / "mod.py"
     _write(f, SRC)
-    st = os.stat(f)
-    monkeypatch.setattr(
-        key, "_SOURCE_STATS", {os.path.realpath(f): (st.st_mtime_ns, st.st_size)}
-    )
+    time.sleep(0.05)
+    monkeypatch.setenv(key._LAUNCH_T0_ENV, str(time.time()))
     assert _hasher(tmp_path).digest("pkg", "mod.py", "load")
+    time.sleep(0.05)
     _write(f, SRC + "\nEXTRA = 1\n")
-    os.utime(f, ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))
+    os.utime(f, (0, 0))  # an old mtime does not hide it: ctime moved
     with pytest.raises(key._SourceChanged):
         _hasher(tmp_path).digest("pkg", "mod.py", "load")
+
+
+def test_same_file_bytes_skip_the_ast(tmp_path, no_source_stats, monkeypatch):
+    f = tmp_path / "mod.py"
+    _write(f, SRC)
+    monkeypatch.setattr(key, "_package_roots", lambda: {"pkg": str(tmp_path)})
+    h = key._SourceHasher()
+    fp = {
+        "entries": [("fn", "pkg", "mod.py", "load", h.digest("pkg", "mod.py", "load"))],
+        "files": {"pkg/mod.py": h.file_hash("pkg", "mod.py")},
+    }
+    parsed = []
+    tree = key._SourceHasher._tree
+    monkeypatch.setattr(
+        key._SourceHasher,
+        "_tree",
+        lambda self, pkg, rel: parsed.append(rel) or tree(self, pkg, rel),
+    )
+    assert key.verify_code(fp) == [] and parsed == []  # same bytes: not parsed
+    _write(f, SRC.replace("return x + 1", "return x + 2"))  # forward-only edit
+    assert key.verify_code(fp) == [] and parsed == ["mod.py"]
+    _write(f, SRC.replace("return x * SCALE", "return x * SCALE * 2"))
+    assert key.verify_code(fp) == ["pkg/mod.py:load"]
+
+
+def test_checkpoint_rewritten_in_place_changes_the_key(tmp_path):
+    def shard(body: bytes):
+        header = b'{"w": {"dtype": "F32", "shape": [2], "data_offsets": [0, 8]}}'
+        (tmp_path / "model.safetensors").write_bytes(
+            len(header).to_bytes(8, "little") + header + body
+        )
+
+    (tmp_path / "config.json").write_text("{}")
+    shard(b"\0" * 8 + b"x" * (2 << 20))
+    a = key._checkpoint_digest(str(tmp_path))
+    assert key._checkpoint_digest(str(tmp_path)) == a
+    time.sleep(0.01)
+    shard(b"\1" * 8 + b"x" * (2 << 20))  # same names, shapes and size: new weights
+    assert key._checkpoint_digest(str(tmp_path)) != a
 
 
 def test_outer_qualname():
@@ -148,6 +187,15 @@ def test_digest_sees_reorder():
     u = t.clone()
     u[[3, 7]] = u[[7, 3]]
     assert values._digest(t) == values._digest(t.clone()) != values._digest(u)
+
+
+def test_digest_sees_data_moved_between_chunks(monkeypatch):
+    monkeypatch.setattr(values, "_DIGEST_CHUNK", 8)
+    monkeypatch.setattr(values, "_DIGEST_WEIGHTS", {})
+    t = torch.arange(16, dtype=torch.int64)
+    u = t.clone()
+    u[[1, 9]] = u[[9, 1]]  # the same position in two chunks
+    assert values._digests([t, u])[0] != values._digests([u])[0]
 
 
 def test_norm_uses_compute_hash():
@@ -382,6 +430,7 @@ def cache_dir(tmp_path, monkeypatch):
         "ATOM_WEIGHT_CACHE",
         "ATOM_PRELOAD",
         preload._LAUNCH_ENV,
+        key._LAUNCH_T0_ENV,
         transport._DAEMON_PID_ENV,
         transport._DAEMON_LOG_ENV,
     ):
@@ -540,5 +589,72 @@ def test_idle_timeout_counts_connected_servers(cache_dir):
         conn.close()
         assert idle.wait(3)
         assert transport._ping(path)["clients"] == 0
+        # Stopping now: a server that arrives late is turned away.
+        late = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        late.connect(path)
+        transport._send(late, {"cmd": "get", "who": "late"})
+        assert "shutting down" in transport._recv(late)["error"]
+        late.close()
     finally:
         server.close()
+
+
+def _get(path):
+    conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    conn.connect(path)
+    transport._send(conn, {"cmd": "get", "who": "test"})
+    return conn, transport._recv(conn)
+
+
+def test_write_into_shared_weights_is_caught_after_the_writer_left(cache_dir):
+    path = os.path.join(transport.socket_dir(), "gpu_check.sock")
+    weights = torch.zeros(64, dtype=torch.uint8)
+    server = transport._Server(
+        path, {"summary": {"pid": 1, "bytes": 64}}, {1: weights}, "t"
+    )
+    try:
+        assert not [p for p in os.listdir(transport.socket_dir()) if p.endswith(".tmp")]
+        conn, payload = _get(path)
+        assert "error" not in payload
+        weights[5] = 7  # the connected server writes into the shared weights
+        conn.close()
+        _wait_for(lambda: server.poisoned, timeout=10)  # checked once it left
+        _, payload = _get(path)
+        assert "changed since export" in payload["error"]
+    finally:
+        server.close()
+
+
+def test_in_use_by_others(cache_dir):
+    path = os.path.join(transport.socket_dir(), "gpu_use.sock")
+    assert preload._in_use_by_others(path, wait_s=0.2) is None  # not serving
+    server = transport._Server(path, {"summary": {"pid": 1, "bytes": 0}}, {}, "t")
+    try:
+        conn, _ = _get(path)
+        assert "1 other running server" in preload._in_use_by_others(path, wait_s=0.2)
+        conn.close()
+        _wait_for(lambda: preload._in_use_by_others(path, wait_s=0.2) is None, 5)
+    finally:
+        server.close()
+
+
+def test_start_early_only_without_any_daemon(cache_dir, monkeypatch):
+    os.makedirs(cache_dir, mode=0o700)
+    launch = cache_dir / "launch_1_1.json"
+    launch.write_text("{}")
+    monkeypatch.setenv(preload._LAUNCH_ENV, str(launch))
+    calls = []
+
+    def spawn():
+        calls.append(1)
+        info = {"pid": 4242, "log": "x.log"}
+        (cache_dir / "launch_1_1.json.daemon").write_text(json.dumps(info))
+        return info
+
+    monkeypatch.setattr(preload, "_spawn_daemon", spawn)
+    lock = transport._DaemonLock(os.path.join(str(cache_dir), "gpu_held.sock"))
+    preload.start_early()  # a daemon holds a GPU: the runners decide
+    assert calls == [] and preload._started_by_launch() is None
+    lock.release()
+    preload.start_early()
+    assert calls == [1] and preload._started_by_launch()["pid"] == 4242

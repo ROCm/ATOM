@@ -27,7 +27,6 @@ from atom.model_loader.weight_cache.key import (
     code_fingerprint,
     compute_key,
     exported_structure,
-    snapshot_sources,
     structure,
 )
 from atom.model_loader.weight_cache.recorder import InputRecorder
@@ -50,9 +49,6 @@ class WeightCacheDaemonRunner(ModelRunner):
     weights_only = True
 
     def __init__(self, *args, **kwargs):
-        # Before the model's modules are imported: the sources it hashes and
-        # the reads it records must cover them.
-        snapshot_sources()
         self._input_recorder = InputRecorder.start()
         super().__init__(*args, **kwargs)
 
@@ -134,7 +130,7 @@ class WeightCacheDaemonRunner(ModelRunner):
         )
         logger.info(
             f"{_TAG} {label}: serving {entries} entries ({export['bytes'] / (1 << 30):.2f} GiB, "
-            f"{len(codes)} code entries) at {path} after {time.perf_counter() - t0:.1f}s"
+            f"{len(codes['entries'])} code entries) at {path} after {time.perf_counter() - t0:.1f}s"
         )
         if export["unshippable"]:
             logger.warning(
@@ -201,6 +197,9 @@ class WeightCacheDaemonRunner(ModelRunner):
                 setattr(self, name, None)
         gc.collect()
         torch.cuda.empty_cache()
+        # Pinned staging buffers from loading stay cached in host memory.
+        with contextlib.suppress(Exception):
+            torch._C._host_emptyCache()
         free, total = torch.cuda.mem_get_info(self.device)
         gib, weights = 1 << 30, export["bytes"]
         logger.info(

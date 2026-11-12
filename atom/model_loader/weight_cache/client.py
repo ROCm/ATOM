@@ -32,6 +32,7 @@ from atom.model_loader.weight_cache.preload import (
     _in_use_by_others,
     _pid_running,
     _spawn_daemon,
+    _started_by_launch,
     stop_daemon,
 )
 from atom.model_loader.weight_cache.recorder import STATIC_READS, diff_reads
@@ -179,6 +180,40 @@ def _probe(path: str, label: str, runner, started: dict | None):
     return sock, payload, reasons, True
 
 
+def _forward_context(runner) -> dict | None:
+    cc = getattr(runner.config, "compilation_config", None)
+    return getattr(cc, "static_forward_context", None)
+
+
+def _give_up(label, path, reasons, started, group, runner, layers) -> bool:
+    """The daemon this launch started cannot be used either: stop it and
+    load from disk (its memory is free again), or fail if it won't stop."""
+    err = None
+    try:
+        stop_daemon(path)
+    except Exception as e:  # noqa: BLE001 - every rank must reach the agreement
+        err = f"could not stop the daemon this launch started: {e}"
+    if not group_agree(err is None, group):
+        raise _fail(label, [err] if err else [], preload=True)
+    _drop_layers(runner, layers)
+    detail = "\n  ".join(reasons[:25]) if reasons else "another rank cannot use it"
+    logger.warning(
+        f"{_TAG} {label}: the weight cache daemon this launch started cannot be used, "
+        f"so it was stopped and this server loads from disk (daemon log {started['log']}):"
+        f"\n  {detail}"
+    )
+    return False
+
+
+def _drop_layers(runner, layers) -> None:
+    """Unregister the layers a meta-built model registered (a disk load
+    builds the model again)."""
+    ctx = _forward_context(runner)
+    if ctx is not None and layers is not None:
+        for name in set(ctx) - layers:
+            del ctx[name]
+
+
 def try_load_from_cache(runner, model_class) -> bool:
     """Build ``runner.model`` from a daemon's weights; False: load from disk.
 
@@ -186,14 +221,17 @@ def try_load_from_cache(runner, model_class) -> bool:
     launch's GPUs has one, an error when one is there but cannot be used.
     ATOM_PRELOAD manages the daemon: it starts one when there is none, and
     when the one there cannot be used, stops it and starts a new one (once).
-    Every rank of the launch takes the same decisions."""
+    If the daemon it started cannot be used either, or none can be started,
+    it loads from disk. Every rank of the launch takes the same decisions."""
     t0 = time.perf_counter()
     label = f"rank {runner.rank}"
     group = _agree_group()
     auto = envs.ATOM_PRELOAD
     path = socket_path(runner.device)
-    started = None  # the daemon this launch started
-    model, t_meta = None, 0.0
+    # The daemon this launch started (the API server may have already).
+    started = _started_by_launch() if auto else None
+    settled = False
+    model, t_meta, layers = None, 0.0, None
     while True:
         sock, payload, reasons, present = _probe(path, label, runner, started)
         status = 0 if not present else (2 if reasons else 1)
@@ -205,8 +243,19 @@ def try_load_from_cache(runner, model_class) -> bool:
                 f"{_TAG} {label}: no weight cache daemon on this launch's GPUs; loading from disk"
             )
             return False
+        if lo == 0 and hi > 0 and started is None and not settled:
+            # A daemon takes its GPUs one rank at a time: give the others a moment.
+            settled = True
+            if sock is not None:
+                sock.close()
+            deadline = time.monotonic() + 60
+            while not daemon_alive(path) and time.monotonic() < deadline:
+                time.sleep(0.5)
+            continue
         if lo == hi == 1:
             if model is None:  # built once: a model registers its layers globally
+                ctx = _forward_context(runner)
+                layers = set(ctx) if ctx is not None else None
                 t_build = time.perf_counter()
                 with params_on_meta():
                     model = model_class(runner.config)
@@ -238,22 +287,7 @@ def try_load_from_cache(runner, model_class) -> bool:
         if not auto:
             raise _fail(label, reasons, pid)
         if started is not None:
-            # The daemon this launch just started does not fit it either.
-            with contextlib.suppress(Exception):
-                stop_daemon(path)
-            raise _fail(
-                label,
-                (
-                    reasons
-                    + [
-                        f"(this launch started that daemon and has stopped it again; its log: {started['log']})"
-                    ]
-                    if reasons
-                    else []
-                ),
-                pid,
-                preload=True,
-            )
+            return _give_up(label, path, reasons, started, group, runner, layers)
         if hi > 0:
             err = _in_use_by_others(path)
             if not group_agree(err is None, group):
@@ -289,7 +323,13 @@ def try_load_from_cache(runner, model_class) -> bool:
         except _Miss as e:
             err = str(e)
         if not group_agree(err is None, group):
-            raise _fail(label, [err] if err else [], preload=True)
+            # No daemon holds these GPUs now: none was there, or it was stopped.
+            _drop_layers(runner, layers)
+            logger.warning(
+                f"{_TAG} {label}: {err or 'another rank could not start the daemon'}; "
+                "loading from disk"
+            )
+            return False
         logger.info(
             f"{_TAG} {label}: started weight cache daemon pid {started['pid']} (log {started['log']}); "
             "waiting for it to load"

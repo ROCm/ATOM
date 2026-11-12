@@ -49,6 +49,7 @@ _BULK_THRESHOLD = 25  # distinct variables read from one line: a copy of the env
 # code. Others (a progress bar reading COLUMNS) do not decide weights.
 KEY_ENV_PREFIXES = ("atom/", "aiter/", "flydsl/", "triton/", "mori/")
 _ROOTS_CACHE: list[str] | None = None
+_REALPATHS: dict[str, str] = {}
 
 
 def _roots() -> list[str]:
@@ -83,11 +84,14 @@ def _where(frame) -> tuple[str, bool]:
                 bulk = True
             frame = frame.f_back
             continue
-        path = os.path.realpath(fn)
-        for root in _roots():
-            if path.startswith(root + os.sep):
-                path = os.path.relpath(path, root)
-                break
+        path = _REALPATHS.get(fn)
+        if path is None:
+            path = os.path.realpath(fn)
+            for root in _roots():
+                if path.startswith(root + os.sep):
+                    path = os.path.relpath(path, root)
+                    break
+            _REALPATHS[fn] = path
         return f"{path}:{frame.f_lineno} {frame.f_code.co_name}", bulk
     return "?", bulk
 
@@ -129,8 +133,9 @@ def _raw_class_attr(cls: type, name: str):
 def _safe_key_fp(v: Any):
     try:
         return key_fp(v)
-    except Exception as e:  # noqa: BLE001 - unfingerprintable: never matches
-        return ("<error>", type(e).__name__, os.getpid())
+    except Exception as e:  # noqa: BLE001
+        # Never matches: the client's side raises too and compares as missing.
+        return ("<error>", type(e).__name__)
 
 
 class InputRecorder:
@@ -147,6 +152,9 @@ class InputRecorder:
         self.attrs_on = False
         self._patched: list[tuple[type, Any, bool]] = []
         self._local = threading.local()
+        # (object id, name, phase) already handled: loading reads the same
+        # attributes millions of times, and only the first read counts.
+        self._seen: set[tuple[int, str, str]] = set()
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -307,7 +315,16 @@ class InputRecorder:
             return  # builtin / extension type
         self._patched.append((cls, orig_own, own))
 
+    def _first(self, obj, name: str) -> bool:
+        key = (id(obj), name, self.phase)
+        if key in self._seen:
+            return False
+        self._seen.add(key)
+        return True
+
     def _on_attr(self, obj, hit, name: str, value) -> None:
+        if not self._first(obj, name):
+            return
         kind, path = hit
         try:
             d = object.__getattribute__(obj, "__dict__")
@@ -326,6 +343,8 @@ class InputRecorder:
             self._attr_read("class", f"{cls.__module__}:{cls.__qualname__}", name, raw)
 
     def _on_missing(self, obj, hit, name: str) -> None:
+        if not self._first(obj, f"[buffer]{name}"):
+            return
         try:
             buffers = object.__getattribute__(obj, "__dict__").get("_buffers")
         except Exception:  # noqa: BLE001
