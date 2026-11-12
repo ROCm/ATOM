@@ -912,16 +912,12 @@ impl PDRouter {
         };
         let prefill_url_for_log = prefill.url().to_string();
         let prefill_worker = prefill.clone();
-        let prefill_router = self.clone();
-        let prefill_headers = headers.cloned();
+        let prefill_policy = self.dispatch(&prefill, headers);
         let correlation_for_log = correlation_id.unwrap_or_else(|| "unknown".to_string());
         let mut canceled = placement.canceled.subscribe();
         let work = async move {
             let _prefill_guard = prefill_guard;
-            match prefill_router
-                .send_worker(prefill_post, prefill_worker, prefill_headers.as_ref())
-                .await
-            {
+            match Self::send(prefill_post, prefill_worker, prefill_policy).await {
                 Ok(res) => {
                     let status = res.status();
                     if status.is_success() {
@@ -1822,6 +1818,17 @@ impl PDRouter {
         worker: Arc<dyn Worker>,
         headers: Option<&HeaderMap>,
     ) -> Result<WorkerResponse, reqwest::Error> {
+        let policy = self.dispatch(&worker, headers);
+        Self::send(request, worker, policy).await
+    }
+
+    /// Runs the dispatch hooks on the request task, right before the request
+    /// is sent to `worker`, and returns the policy that owns it.
+    fn dispatch(
+        &self,
+        worker: &Arc<dyn Worker>,
+        headers: Option<&HeaderMap>,
+    ) -> Arc<dyn crate::policies::LoadBalancingPolicy> {
         let (pool, policy) = match worker.worker_type() {
             crate::core::WorkerType::Prefill { .. } => (
                 metrics_labels::WORKER_PREFILL,
@@ -1833,7 +1840,15 @@ impl PDRouter {
             ),
         };
         // Only a request that is actually sent moves the session.
-        policy.on_dispatch(pool, headers, &worker);
+        policy.on_dispatch(pool, headers, worker);
+        policy
+    }
+
+    async fn send(
+        request: reqwest::RequestBuilder,
+        worker: Arc<dyn Worker>,
+        policy: Arc<dyn crate::policies::LoadBalancingPolicy>,
+    ) -> Result<WorkerResponse, reqwest::Error> {
         let mut outcome = WorkerOutcome {
             worker: Some(worker),
             policy,
