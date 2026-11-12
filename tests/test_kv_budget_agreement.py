@@ -8,8 +8,6 @@ agreement twice, once for a rank with more free memory and once for the rank
 with less, and a stand-in ``group_min`` returns the smaller of the two.
 """
 
-import pytest
-
 from atom.distributed import group_agreement
 from atom.distributed.group_agreement import agree_kv_budget
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import page_pool, plan_pools
@@ -33,9 +31,11 @@ def _install_peer_min(monkeypatch, peers):
 
 
 def _block_count(free, budget, groups):
-    agreed = agree_kv_budget(free, budget, 0, groups)
+    agreed_free, agreed_budget = agree_kv_budget(free, budget, groups)
+    # The caller sizes from the budget clamped by free memory, with no connector.
+    available_for_kv = min(agreed_budget, agreed_free)
     return plan_pools(
-        [page_pool(_ENTRY_BYTES)], agreed.available_for_kv, max_num_seqs=1
+        [page_pool(_ENTRY_BYTES)], available_for_kv, max_num_seqs=1
     ).paged_entries
 
 
@@ -67,12 +67,12 @@ def test_larger_rank_builds_the_smaller_block_count(monkeypatch):
     )
 
 
-def test_connector_reserve_raises_on_the_larger_rank_too(monkeypatch):
-    """The connector check reads the agreed free memory. A rank whose own free
-    memory would cover the reserve still raises when a peer's does not."""
+def test_larger_rank_gets_the_peers_smaller_free_memory(monkeypatch):
+    """The caller checks the connector reserve against the agreed free memory.
+    A rank with more free memory must get the peer's smaller value, so its
+    check agrees with the rank that is short."""
     low_free, high_free = 1 << 30, 4 << 30
     low_budget, high_budget = 3 << 30, 5 << 30
-    connector_bytes = 2 << 30
     _install_peer_min(
         monkeypatch,
         {
@@ -84,14 +84,8 @@ def test_connector_reserve_raises_on_the_larger_rank_too(monkeypatch):
     )
     groups = (_Group(4), _Group(1))
 
-    with pytest.raises(RuntimeError, match="KV connector"):
-        agree_kv_budget(low_free, low_budget, connector_bytes, groups)
-    with pytest.raises(RuntimeError, match="KV connector"):
-        agree_kv_budget(high_free, high_budget, connector_bytes, groups)
-
-    # The same high rank, with no peer in the group, keeps its own free memory
-    # and does not raise.
-    agree_kv_budget(high_free, high_budget, connector_bytes, (_Group(1),))
+    assert agree_kv_budget(high_free, high_budget, groups) == (low_free, low_budget)
+    assert agree_kv_budget(low_free, low_budget, groups) == (low_free, low_budget)
 
 
 def test_world_size_one_keeps_this_rank_budget(monkeypatch):
@@ -101,8 +95,7 @@ def test_world_size_one_keeps_this_rank_budget(monkeypatch):
         raise AssertionError(group)
 
     monkeypatch.setattr(group_agreement, "group_min", fail_if_called)
-    agreed = agree_kv_budget(9_000, 8_000, 0, (_Group(1), _Group(1)))
-    assert agreed.available_for_kv == 8_000
+    assert agree_kv_budget(9_000, 8_000, (_Group(1), _Group(1))) == (9_000, 8_000)
 
     reduced = []
 
@@ -112,6 +105,5 @@ def test_world_size_one_keeps_this_rank_budget(monkeypatch):
 
     monkeypatch.setattr(group_agreement, "group_min", take_a_slice)
     tp, pcp = _Group(1), _Group(2)
-    agreed = agree_kv_budget(8_000, 7_000, 0, (tp, pcp))
+    assert agree_kv_budget(8_000, 7_000, (tp, pcp)) == (7_000, 6_000)
     assert reduced == [pcp.cpu_group, pcp.cpu_group]
-    assert agreed.available_for_kv == 6_000
