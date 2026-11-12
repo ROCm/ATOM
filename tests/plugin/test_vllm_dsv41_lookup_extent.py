@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 from atom.kv_transfer.offload.chunked_scheduler import ChunkedOffloadSchedulerBase
 from atom.kv_transfer.offload.metadata import LoadSpec
-from atom.plugin.vllm.kv_transfer.v41_mp_scheduler import V41StateMPScheduler
+from atom.plugin.vllm.kv_transfer.ride_mp_scheduler import StateRideMPScheduler
 from atom.plugin.vllm.paged_state_checkpoint_scheduler import StateCheckpointPlacement
 
 LENS = (2048, 2049, 2050, 2303)
@@ -16,7 +16,7 @@ def _sched(tail=None):
     if tail is None:
         s = object.__new__(ChunkedOffloadSchedulerBase)
     else:
-        s = object.__new__(V41StateMPScheduler)
+        s = object.__new__(StateRideMPScheduler)
         s._planner = SimpleNamespace(prefill_tail=tail)
     s.chunk_size = 256
     return s

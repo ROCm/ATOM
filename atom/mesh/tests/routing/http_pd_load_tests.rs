@@ -1,6 +1,9 @@
 //! PD load accounting and credential forwarding to prefill and decode workers.
 use super::*;
-use crate::core::{BasicWorkerBuilder, WorkerType};
+use crate::{
+    core::{BasicWorkerBuilder, WorkerType},
+    policies::{DpStickyPolicy, LoadBalancingPolicy, SelectWorkerInfo},
+};
 use axum::{routing::post, Router};
 use bytes::Bytes;
 use http_body_util::BodyExt;
@@ -135,7 +138,21 @@ fn dispatch_with_headers(
     streaming: bool,
     headers: Option<HeaderMap>,
 ) -> JoinHandle<Response> {
+    dispatch_with_policy(kind, p, d, streaming, headers, None)
+}
+
+fn dispatch_with_policy(
+    kind: DispatchKind,
+    p: &GatedServer,
+    d: &GatedServer,
+    streaming: bool,
+    headers: Option<HeaderMap>,
+    decode_policy: Option<Arc<dyn LoadBalancingPolicy>>,
+) -> JoinHandle<Response> {
     let mut router = tests::create_test_pd_router();
+    if let Some(policy) = decode_policy {
+        router.policy_registry.set_decode_policy(policy);
+    }
     let prefill = p.worker.clone();
     let decode = d.worker.clone();
     let mut info = AtomPrefillInfo::default();
@@ -589,6 +606,94 @@ async fn atom_prefill_failure_releases_pair_without_dispatching_decode() {
             .await
             .is_err());
     }
+}
+
+#[tokio::test]
+async fn session_worker_change_waits_until_the_new_decode_receives_a_request() {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _recorder = metrics::set_default_local_recorder(&recorder);
+    let changes = || -> Vec<String> {
+        handle
+            .render()
+            .lines()
+            .filter(|line| line.starts_with("mesh_session_worker_change_total{"))
+            .map(str::to_owned)
+            .collect()
+    };
+    let policy: Arc<dyn LoadBalancingPolicy> = Arc::new(DpStickyPolicy::new());
+    let mut a = GatedServer::start(WorkerType::Decode).await;
+    let mut b = GatedServer::start(WorkerType::Decode).await;
+    let decode = [a.worker.clone(), b.worker.clone()];
+    let mut headers = HeaderMap::new();
+    headers.insert("x-session-id", HeaderValue::from_static("session-1"));
+    let info = SelectWorkerInfo {
+        headers: Some(&headers),
+        ..Default::default()
+    };
+    let prefill = || {
+        GatedServer::start(WorkerType::Prefill {
+            bootstrap_port: None,
+        })
+    };
+    let session_request = |p: &GatedServer, d: &GatedServer| {
+        let policy = Some(policy.clone());
+        dispatch_with_policy(
+            DispatchKind::Atom,
+            p,
+            d,
+            false,
+            Some(headers.clone()),
+            policy,
+        )
+    };
+
+    assert_eq!(policy.select_worker(&decode, &info).await, Some(0));
+    let mut p = prefill().await;
+    let task = session_request(&p, &a);
+    p.wait_entered().await;
+    p.respond(prefill_response());
+    a.wait_entered().await;
+    a.respond(axum::Json(json!({"choices": []})).into_response());
+    assert_eq!(result(task).await.status(), StatusCode::OK);
+
+    // A is down, so the session rebinds to B. Neither a failed prefill nor an
+    // unexecuted reservation sends anything to B.
+    a.worker.set_healthy(false);
+    assert_eq!(policy.select_worker(&decode, &info).await, Some(1));
+    let mut p = prefill().await;
+    let task = session_request(&p, &b);
+    p.wait_entered().await;
+    p.respond(StatusCode::SERVICE_UNAVAILABLE.into_response());
+    assert!(result(task).await.status().is_server_error());
+    let router = tests::create_test_pd_router();
+    router.policy_registry.set_decode_policy(policy.clone());
+    let reservation = router.reserve_pair(
+        PlacementPlan::Pair {
+            prefill: p.worker.clone(),
+            decode: b.worker.clone(),
+            prefill_policy: "round_robin",
+            decode_policy: "dp_sticky",
+        },
+        Some(&headers),
+    );
+    drop(reservation.unwrap());
+    assert!(b.captured.try_recv().is_err());
+    assert!(changes().is_empty());
+
+    // The first request B receives is compared against A.
+    assert_eq!(policy.select_worker(&decode, &info).await, Some(1));
+    let mut p = prefill().await;
+    let task = session_request(&p, &b);
+    p.wait_entered().await;
+    p.respond(prefill_response());
+    b.wait_entered().await;
+    b.respond(axum::Json(json!({"choices": []})).into_response());
+    assert_eq!(result(task).await.status(), StatusCode::OK);
+    assert_eq!(
+        changes(),
+        [r#"mesh_session_worker_change_total{pool="decode",reason="rebind"} 1"#]
+    );
 }
 
 #[tokio::test]

@@ -2,7 +2,6 @@
 
 """Native-state MP admission and PAGE-image lifetime contracts."""
 
-from collections import deque
 from types import SimpleNamespace
 from weakref import WeakKeyDictionary
 
@@ -35,6 +34,7 @@ from atom.model_engine.page_unit_checkpoint import (
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput, Scheduler
 from atom.model_engine.sequence import Replay, Sequence, SequenceStatus, SequenceType
 from atom.model_engine.state_runtime import StateRuntime, StateTransfer
+from tests.lmcache_mp_support import shipped_tokens as _shipped_tokens
 
 
 @pytest.fixture(autouse=True)
@@ -202,7 +202,7 @@ def test_save_uses_ready_native_hash_and_never_copies_active_slot(monkeypatch):
     assert request.native_state.boundary_tokens == 16
     assert request.native_state.unit_ids == image.unit_ids
     assert request.native_state.destination_slot is None
-    assert request.token_ids == list(seq.token_ids[:16])
+    assert _shipped_tokens(request) == list(seq.token_ids[:16])
     assert request.save_spec.skip_leading_tokens == 0
     assert checkpoints.take_checkpoint_ops() == ((), ())
     checkpoints.clear_index()
@@ -238,7 +238,7 @@ def test_save_frontier_selects_existing_checkpoint_below_computed_tokens(monkeyp
     checkpoint(scheduler, checkpoints, seq, 8)
     scheduler.update_state_after_alloc(seq)
     [request] = scheduler.build_connector_meta().requests
-    assert len(request.token_ids) == 8
+    assert len(_shipped_tokens(request)) == 8
     assert request.native_state.boundary_tokens == 8
     assert scheduler._save_tracker["1"][1] == 8
 
@@ -461,7 +461,7 @@ def test_load_queries_safe_chunk_boundary_before_reserving_state(monkeypatch, pr
     assert request.native_state.destination_slot == seq.state_slot
     assert request.load_spec.lmcache_cached_tokens == expected
     assert request.load_spec.transfer_end_tokens is None
-    assert request.token_ids == list(seq.token_ids[:expected])
+    assert _shipped_tokens(request) == list(seq.token_ids[:expected])
     assert (
         scheduler.load_finished(LoadOperationId(seq.id, operation.generation + 1))
         is False
@@ -485,7 +485,7 @@ def test_aligned_hbm_hit_uses_incremental_native_restore(monkeypatch):
     [request] = scheduler.build_connector_meta().requests
     assert request.load_spec.hbm_cached_tokens == 8
     assert request.load_spec.lmcache_cached_tokens == 16
-    assert request.token_ids == list(seq.token_ids[:16])
+    assert _shipped_tokens(request) == list(seq.token_ids[:16])
     assert seq.offload_load_start_tokens == 8
     assert checkpoints.store.pool.num_free == 27
 
@@ -977,7 +977,8 @@ def _woken(engine, seq):
     engine._update_from_kv_xfer_finished(
         KVConnectorOutput(finished_loading={request.load_operation})
     )
-    assert engine._resolve_waiting_remote_kv(seq, deque()) is False
+    engine._resolve_offload_load(seq)
+    assert engine._is_offload_prefill_resume(seq)
     assert seq.status == SequenceStatus.WAITING and seq.replays_hit
     assert seq.num_cached_tokens == 32
 

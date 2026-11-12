@@ -513,6 +513,9 @@ def transfer_stub(slot_regions):
         _slot_region_consumer_indices=None,
         _slot_region_tp_segments=None,
         _slot_region_tp_replicated=None,
+        # No block regions: an empty plan.
+        _block_plan=lambda *_: SimpleNamespace(cmap=[], cuts=None),
+        _MAX_RDMA_ENTRIES_PER_BATCH=4096,
         # Matches the absence of the FP4 keys in `transfer_args`; the dtype
         # cross-check now runs before Phase 2 and would reject the pair first.
         _fp4_index_layout=False,

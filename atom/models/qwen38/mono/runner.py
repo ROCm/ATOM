@@ -244,6 +244,9 @@ class Layer:
                     "v_cache": q.v,
                     "index_raw": q.index_raw,
                     "index_cmp": q.index_cmp,
+                    "rope_positions": (
+                        0 if q.rope_positions is None else q.rope_positions
+                    ),
                 }
             )
             if q.k_scale is not None:
@@ -394,7 +397,7 @@ class TargetRunner:
         q = self._qsa_layers.get(i)
         if q is not None:
             return QSAPools(self.geo, q.k_cache, q.v_cache, q.raw_key_cache, q.compressed_key_cache,
-                            q.k_scale_cache, q.v_scale_cache)  # fmt: skip
+                            q.k_scale_cache, q.v_scale_cache, rope_positions=q.rope_position_cache)  # fmt: skip
         raise NotImplementedError(
             f"Qwen mono: layer {i} pools (GDN and QSA layers are wired)"
         )
