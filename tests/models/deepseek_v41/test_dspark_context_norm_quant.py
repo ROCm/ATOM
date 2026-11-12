@@ -51,6 +51,7 @@ class _Draft:
 
     def __init__(self, norm):
         self.mtp = [SimpleNamespace(main_proj=lambda x: x, main_norm=norm)]
+        DeepseekV41DSpark._build_main_norm_quant(self)
 
 
 def _draft(seed):

@@ -196,6 +196,22 @@ class DeepseekV41DSpark(DSparkDraftModel):
             args.qk_rope_head_dim, capacity + self.block_size, base=args.rope_theta
         )
         self.embed = self.head = None
+        # Stage 0's main_norm, as a fused RMSNorm + MXFP8 quant. Outside the
+        # module tree so the loader looks for no new weight; it holds
+        # main_norm's own weight tensor, so loads and weight syncs reach it.
+        self._build_main_norm_quant()
+
+    def _build_main_norm_quant(self):
+        main = self.mtp[0].main_norm
+        norm = RMSNorm(
+            main.dim,
+            main.eps,
+            fused_quant=True,
+            quant_config=native_quant_config(),
+        )
+        norm.weight = main.weight
+        # Bypass Module.__setattr__ so this is not a registered child.
+        self.__dict__["_main_norm_quant_cached"] = norm
 
     @property
     def model(self):
@@ -266,24 +282,8 @@ class DeepseekV41DSpark(DSparkDraftModel):
         return self._main_norm_quant()(self.mtp[0].main_proj(aux_concat))
 
     def _main_norm_quant(self):
-        """Stage 0's `main_norm` as a fused RMSNorm + MXFP8 quant.
-
-        Kept out of the module tree so the loader looks for no new weight, and
-        it holds `main_norm`'s own weight tensor, so loads and weight syncs
-        reach it.
-        """
-        norm = self.__dict__.get("_main_norm_quant_cached")
-        if norm is None:
-            main = self.mtp[0].main_norm
-            norm = RMSNorm(
-                main.dim,
-                main.eps,
-                fused_quant=True,
-                quant_config=native_quant_config(),
-            )
-            norm.weight = main.weight
-            self.__dict__["_main_norm_quant_cached"] = norm
-        return norm
+        """The fused norm built in ``__init__``."""
+        return self.__dict__["_main_norm_quant_cached"]
 
     @property
     def context_layers(self):
