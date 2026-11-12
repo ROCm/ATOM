@@ -2,11 +2,14 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """The V4.1 mono width whose fused K2 spills, served unfused instead.
 
-No GPU and no kernel build: the build keys are data, the lean choice is a pure
-function over a build record, and the selection mapping is torch on the CPU.
-What the unfused keys compile to is ``test_deepseek_v41_mono_build_key`` (a
-binary of their own) and ``test_deepseek_v41_mono_contract`` (their hand-off
-contract); that they are scratch-free is a compile probe, not a test.
+No GPU, no kernel build and no AITER, FlyDSL or Triton, so the non-GPU CI runs
+all of it: the lean choice is a pure function over a build record, the unfused
+keys are ``replace`` on a key, and the selection mapping is torch on the CPU.
+The keys are stand-ins with the real keys' fields, because the real ones live
+in FlyDSL kernel modules; those go through the same transforms where the
+kernels import, in ``test_deepseek_v41_mono_build_key`` (a binary of their
+own) and ``test_deepseek_v41_mono_contract`` (their hand-off contract). That
+they are scratch-free is a compile probe, not a test.
 """
 
 import dataclasses
@@ -14,21 +17,44 @@ import dataclasses
 import pytest
 import torch
 
-pytest.importorskip("aiter")
-
 from atom.models.deepseek_v41.mono.builds import (
     RowsBuild,
     lean_width,
     unfused_keys,
     unfused_post_key,
+    write_selection_rows,
 )
-from atom.models.deepseek_v41.mono.kernels import attn_pre as k1
-from atom.models.deepseek_v41.mono.kernels import layer_post as k2
-from atom.models.deepseek_v41.mono.step_meta import write_selection_rows
+
+
+@dataclasses.dataclass(frozen=True)
+class PostKey:
+    """``kernels.layer_post.LayerPostBuild``'s fields this file reads."""
+
+    tokens: int
+    index_bound_max: int
+    index_fp4: bool
+    index_mfma: bool
+    tp: int
+    tok_par: bool
+    kv_fp8: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class PreKey:
+    """``kernels.attn_pre.AttnPreBuild``'s fields this file reads."""
+
+    tokens: int
+    fold: bool
+    feeds_index: bool
+    index_fp4: bool
+    tp: int
+    tok_par: bool
+    kv_fp8: bool
+
 
 # the 48-row TP4 step DSpark's verify runs, on the FP4 MFMA index layout: the
 # build the compile probe measures at 256 VGPRs and 8 B of scratch a lane
-FUSED = k2.LayerPostBuild(
+FUSED = PostKey(
     tokens=48,
     index_bound_max=1 << 20,
     index_fp4=True,
@@ -40,7 +66,7 @@ FUSED = k2.LayerPostBuild(
 # that step's K1 builds: layer 0 and a folding layer, with and without the
 # indexer query, all token parallel because the width is
 K1_KEYS = [
-    k1.AttnPreBuild(
+    PreKey(
         tokens=48,
         fold=fold,
         feeds_index=feeds,

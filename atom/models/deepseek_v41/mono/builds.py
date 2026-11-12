@@ -19,12 +19,15 @@ The unfused variant is what ``WidthBuilds``' ``lean`` seam rebuilds such a
 width as: K2 without its index stage (``index_bound_max`` 0, the shape the
 DSpark draft already builds), with ATOM's own indexer run between K1 and K2
 and its selection published into the buffers K2 would otherwise have filled
-itself (``runner.V41MonoDecodeRunner._publish_selection``). The same
-configuration, on kernels byte-identical to these, is what the out-of-tree
-AITER provider drives, so this is a build choice, not a new kernel.
+itself (``runner.V41MonoDecodeRunner._publish_selection``,
+``write_selection_rows``). The same configuration, on kernels byte-identical
+to these, is what the out-of-tree AITER provider drives, so this is a build
+choice, not a new kernel.
 """
 
 from dataclasses import dataclass, replace
+
+import torch
 
 
 @dataclass(frozen=True)
@@ -95,3 +98,40 @@ def lean_width(built: RowsBuild, spilled: list, rebuild):
     if not any(f in spilled for f in k2):
         return None
     return rebuild()
+
+
+def write_selection_rows(
+    out, selected, batch_ids, block_tables, rows_per_page, page_rows, main_off
+) -> None:
+    """An unfused width's selection as K2's attention reads it (``out`` [S, K]
+    int32: the pool rows of a selection's columns, valid ones packed first).
+
+    ``selected`` [S, K] int32: the scorer's compressed-key columns, -1 where
+    there is none (a REINDEX layer's already lifted back to the row it stands
+    for, which is what ``step.selected`` holds either way). A column's pool row
+    is its request's PAGE (``block_tables[batch, col // rows_per_page]``) times
+    ``page_rows``, plus the KV owner's ``main_off`` and ``col % rows_per_page``
+    -- ``index_score._selected_rows``' arithmetic, which a fused K2 does in
+    the launch, and ``indices._indices``' addressing. A pad row (batch id -1)
+    selects nothing.
+
+    The attention takes the valid count off the bound, not off this
+    (``index_plan.selected`` of ``sbound``), so the valid entries have to be
+    packed first in their order: the top-k's own rank, which ``cumsum`` gives.
+    """
+    k = selected.shape[1]
+    s = out.shape[0]
+    assert out.shape == (s, k), (out.shape, selected.shape)
+    sel = selected[:s].to(torch.int64)
+    live = batch_ids[:s] >= 0
+    valid = (sel >= 0) & live.unsqueeze(1)
+    cols = sel.clamp_min(0)
+    batch = batch_ids[:s].to(torch.int64).clamp_min(0).unsqueeze(1)
+    pages = block_tables[batch, cols // rows_per_page].to(torch.int64)
+    rows = pages * page_rows + main_off + cols % rows_per_page
+    # a valid entry's slot is how many valid entries precede it; the rest go to
+    # a scratch column the copy below drops
+    dest = torch.where(valid, valid.to(torch.int64).cumsum(1) - 1, k)
+    packed = torch.zeros(s, k + 1, dtype=torch.int64, device=sel.device)
+    packed.scatter_(1, dest, torch.where(valid, rows, 0))
+    out.copy_(packed[:, :k])

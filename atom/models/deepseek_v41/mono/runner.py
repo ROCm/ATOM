@@ -38,6 +38,7 @@ from atom.models.deepseek_v41.mono.builds import (
     RowsBuild,
     lean_width,
     unfused_keys,
+    write_selection_rows,
 )
 from atom.models.deepseek_v41.mono.check import (
     check_front,
@@ -60,11 +61,7 @@ from atom.models.deepseek_v41.mono.kernels.index_query import (
 from atom.models.deepseek_v41.mono.kernels.moe_shape import EXPERTS, TOPK
 from atom.models.deepseek_v41.mono.kernels.peer_layout import peer_bytes, plain_layout
 from atom.models.deepseek_v41.mono.kernels.token_par import own_rows
-from atom.models.deepseek_v41.mono.step_meta import (
-    KMETA,
-    write_selection_rows,
-    write_step_meta,
-)
+from atom.models.deepseek_v41.mono.step_meta import KMETA, write_step_meta
 from atom.models.deepseek_v41.mono.weights import bind_model
 from atom.mono.device import queue
 from atom.mono.plan.execution import BLOCKS
