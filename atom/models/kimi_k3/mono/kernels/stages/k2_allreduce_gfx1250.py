@@ -27,8 +27,9 @@ from dataclasses import dataclass
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import gpu, range_constexpr
-from flydsl.expr.typing import Int32, Int64, T
+from flydsl.expr.typing import Int32, Int64, T, as_ir_value
 
 from atom.models.kimi_k3.mono.config import HIDDEN, LATENT
 from atom.mono.device.ops import bf2_f32, load_ptr64, rsrc, spin_pause, traced
@@ -111,12 +112,25 @@ def _poll_lines(mine, ats, epoch):
     return words
 
 
+def _store_line_sys(address, line):
+    """One 16 B line to a peer, as aiter's custom all-reduce writes it: a global
+    (not buffer) b128 store at system scope."""
+    llvm.InlineAsmOp(
+        None,
+        [as_ir_value(fx.Int64(address)), as_ir_value(line)],
+        "global_store_b128 $0, $1, off scope:SCOPE_SYS",
+        "v,v",
+        has_side_effects=True,
+    )
+
+
 @traced
-def _push_lines(data, peers, rank, tp, lines, bank, epoch, line, last, stride):
-    """Lines ``line``, ``line + stride``, .. below ``last`` of this rank's
-    partials, tagged ``epoch``, to every rank's bank (words from ``bank``)."""
-    local = rsrc(data)
-    while line < last:
+def _push_lines(local, bases, rank, lines, bank, epoch, line, stride):
+    """Lines ``line``, ``line + stride``, .. of this rank's partials, tagged
+    ``epoch``, to every rank's bank (words from ``bank``) at ``bases``: loaded
+    before the first store, since a load issued after a remote store waits for
+    that store's fabric round trip."""
+    while line < lines:
         words = [
             fx.Int32(
                 bo.buffer_load(
@@ -126,13 +140,9 @@ def _push_lines(data, peers, rank, tp, lines, bank, epoch, line, last, stride):
             for w in range_constexpr(PAYLOAD_WORDS)
         ]
         out = fx.Vector.from_elements(words + [epoch], fx.Int32)
-        for p in range_constexpr(tp):
-            bo.buffer_store(
-                out,
-                rsrc(load_ptr64(peers, p)),
-                bank + (rank * lines + line) * LINE_WORDS,
-                cache_modifier=SCOPE_SYS,
-            )
+        at = fx.Int64(bank + (rank * lines + line) * LINE_WORDS) * 4
+        for base in bases:
+            _store_line_sys(base + at, out)
         line = line + stride
 
 
@@ -180,11 +190,10 @@ def build_allreduce(tp: int, rows: int) -> K2AllReduceKernel:
             fx.Int32(bo.buffer_load(rsrc(epochs), bid, vec_width=1, dtype=T.i32)) + 1
         )
         bank = (epoch & 1) * bank_words
+        bases = [load_ptr64(peers, p) for p in range(tp)]
         mine = rsrc(load_ptr64(peers, rank))
         line = bid * THREADS + tid
-        _push_lines(
-            data, peers, rank, tp, lines, bank, epoch, line, fx.Int32(lines), stride
-        )
+        _push_lines(rsrc(data), bases, rank, lines, bank, epoch, line, stride)
         _reduce_lines(data, mine, tp, lines, bank, epoch, line, fx.Int32(lines), stride)
         gpu.barrier()
         # Every counter, not just this launch's: a launch with more CTAs reads
