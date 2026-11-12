@@ -147,7 +147,7 @@ async fn run_chat_stream(
 
     while let Some(item) = stream.next().await {
         let chunk = item.map_err(engine_error_to_string)?;
-        match chunk {
+        let (chunk_text, logprobs) = match chunk {
             TokenChunk::Partial {
                 token_ids,
                 logprobs,
@@ -158,99 +158,7 @@ async fn run_chat_stream(
                 completion_tokens += token_ids.len() as u32;
 
                 let (chunk_text, _stopped) = process_chunk_tokens(&mut stop_decoder, &token_ids);
-                if chunk_text.is_empty() {
-                    continue;
-                }
-
-                if is_first {
-                    let first_chunk = ChatCompletionStreamResponse::builder(request_id, model)
-                        .created(created)
-                        .add_choice_role(INDEX, "assistant")
-                        .maybe_system_fingerprint(system_fingerprint.clone())
-                        .build();
-                    format_sse_chunk_into(&mut sse_buffer, &first_chunk);
-                    send_bytes(tx, &sse_buffer, "first chunk")?;
-                    is_first = false;
-                }
-
-                let mut delta = chunk_text;
-
-                let in_reasoning = if reasoning_parser_available {
-                    let (normal_text, reasoning_chunk, in_reasoning) = process_reasoning_stream(
-                        &delta,
-                        &mut reasoning_parser,
-                        ctx.reasoning_parser_factory.as_ref(),
-                        ctx.configured_reasoning_parser.as_deref(),
-                        starts_in_reasoning,
-                        request_id,
-                        model,
-                        created,
-                        system_fingerprint.as_deref(),
-                    )
-                    .await;
-                    if let Some(c) = reasoning_chunk {
-                        format_sse_chunk_into(&mut sse_buffer, &c);
-                        send_bytes(tx, &sse_buffer, "reasoning chunk")?;
-                    }
-                    delta = normal_text;
-                    in_reasoning
-                } else {
-                    false
-                };
-
-                if !in_reasoning
-                    && tools.is_some()
-                    && (tool_parser_available || (used_json_schema && tool_choice_enabled))
-                {
-                    let tool_chunks = if is_specific_function {
-                        process_specific_function_stream(
-                            &delta,
-                            &mut has_tool_call,
-                            tool_choice,
-                            request_id,
-                            model,
-                            created,
-                            system_fingerprint.as_deref(),
-                            history_tool_calls_count,
-                        )
-                    } else {
-                        process_tool_calls_stream(
-                            &delta,
-                            &mut tool_parser,
-                            &mut has_tool_call,
-                            tools.as_ref().unwrap(),
-                            ctx.tool_parser_factory.as_ref(),
-                            ctx.configured_tool_parser.as_deref(),
-                            request_id,
-                            model,
-                            created,
-                            system_fingerprint.as_deref(),
-                            history_tool_calls_count,
-                            used_json_schema,
-                            !tool_choice_enabled,
-                        )
-                        .await
-                    };
-
-                    for c in tool_chunks {
-                        format_sse_chunk_into(&mut sse_buffer, &c);
-                        send_bytes(tx, &sse_buffer, "tool call chunk")?;
-                    }
-                    continue;
-                }
-
-                if !delta.is_empty() {
-                    let chat_logprobs = logprobs
-                        .as_ref()
-                        .map(|lp| token_logprobs_to_chat(lp, &ctx.tokenizer));
-                    let content_chunk = ChatCompletionStreamResponse::builder(request_id, model)
-                        .created(created)
-                        .add_choice_content_with_logprobs(INDEX, "assistant", delta, chat_logprobs)
-                        .maybe_system_fingerprint(system_fingerprint.clone())
-                        .build();
-                    format_sse_chunk_into(&mut sse_buffer, &content_chunk);
-                    send_bytes(tx, &sse_buffer, "content chunk")?;
-                }
+                (chunk_text, logprobs)
             }
             TokenChunk::Complete {
                 finish_reason,
@@ -259,18 +167,6 @@ async fn run_chat_stream(
                 meta,
                 ..
             } => {
-                if let SequenceDecoderOutput::Text(text) = stop_decoder.flush() {
-                    if !text.is_empty() {
-                        let chunk = ChatCompletionStreamResponse::builder(request_id, model)
-                            .created(created)
-                            .add_choice_content(INDEX, "assistant", text)
-                            .maybe_system_fingerprint(system_fingerprint.clone())
-                            .build();
-                        format_sse_chunk_into(&mut sse_buffer, &chunk);
-                        send_bytes(tx, &sse_buffer, "flushed content")?;
-                    }
-                }
-
                 prompt_tokens = usage.prompt_tokens;
                 completion_tokens = usage.completion_tokens;
                 cached_tokens = meta.cached_tokens;
@@ -282,7 +178,107 @@ async fn run_chat_stream(
                 if system_fingerprint.is_none() {
                     system_fingerprint = meta.weight_version;
                 }
+                // What the stop decoder held is the output's last text, and
+                // goes through the parsers like any other.
+                let held = match stop_decoder.flush() {
+                    SequenceDecoderOutput::Text(text) => text,
+                    _ => String::new(),
+                };
+                (held, None)
             }
+        };
+        if chunk_text.is_empty() {
+            continue;
+        }
+
+        if is_first {
+            let first_chunk = ChatCompletionStreamResponse::builder(request_id, model)
+                .created(created)
+                .add_choice_role(INDEX, "assistant")
+                .maybe_system_fingerprint(system_fingerprint.clone())
+                .build();
+            format_sse_chunk_into(&mut sse_buffer, &first_chunk);
+            send_bytes(tx, &sse_buffer, "first chunk")?;
+            is_first = false;
+        }
+
+        let mut delta = chunk_text;
+
+        let in_reasoning = if reasoning_parser_available {
+            let (normal_text, reasoning_chunk, in_reasoning) = process_reasoning_stream(
+                &delta,
+                &mut reasoning_parser,
+                ctx.reasoning_parser_factory.as_ref(),
+                ctx.configured_reasoning_parser.as_deref(),
+                starts_in_reasoning,
+                request_id,
+                model,
+                created,
+                system_fingerprint.as_deref(),
+            )
+            .await;
+            if let Some(c) = reasoning_chunk {
+                format_sse_chunk_into(&mut sse_buffer, &c);
+                send_bytes(tx, &sse_buffer, "reasoning chunk")?;
+            }
+            delta = normal_text;
+            in_reasoning
+        } else {
+            false
+        };
+
+        if !in_reasoning
+            && tools.is_some()
+            && (tool_parser_available || (used_json_schema && tool_choice_enabled))
+        {
+            let tool_chunks = if is_specific_function {
+                process_specific_function_stream(
+                    &delta,
+                    &mut has_tool_call,
+                    tool_choice,
+                    request_id,
+                    model,
+                    created,
+                    system_fingerprint.as_deref(),
+                    history_tool_calls_count,
+                )
+            } else {
+                process_tool_calls_stream(
+                    &delta,
+                    &mut tool_parser,
+                    &mut has_tool_call,
+                    tools.as_ref().unwrap(),
+                    ctx.tool_parser_factory.as_ref(),
+                    ctx.configured_tool_parser.as_deref(),
+                    request_id,
+                    model,
+                    created,
+                    system_fingerprint.as_deref(),
+                    history_tool_calls_count,
+                    used_json_schema,
+                    !tool_choice_enabled,
+                )
+                .await
+            };
+
+            for c in tool_chunks {
+                format_sse_chunk_into(&mut sse_buffer, &c);
+                send_bytes(tx, &sse_buffer, "tool call chunk")?;
+            }
+            continue;
+        }
+
+        if !delta.is_empty() {
+            let chat_logprobs = logprobs
+                .as_ref()
+                .map(|lp| token_logprobs_to_chat(lp, &ctx.tokenizer));
+            let content_chunk = ChatCompletionStreamResponse::builder(request_id, model)
+                .created(created)
+                .add_choice_content_with_logprobs(INDEX, "assistant", delta, chat_logprobs)
+                .maybe_system_fingerprint(system_fingerprint.clone())
+                .build();
+            format_sse_chunk_into(&mut sse_buffer, &content_chunk);
+            send_bytes(tx, &sse_buffer, "content chunk")?;
         }
     }
 

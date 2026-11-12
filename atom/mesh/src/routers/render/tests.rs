@@ -2228,6 +2228,68 @@ mod c4_chat_streaming_coverage {
         assert!(s.contains("[DONE]"));
     }
 
+    /// Text the stop decoder holds as a stop string's possible start comes
+    /// out at Complete, and goes through the reasoning parser: an output cut
+    /// off inside the think block streams it as reasoning, as non-streaming
+    /// returns it.
+    #[tokio::test]
+    async fn test_flushed_text_goes_through_the_reasoning_parser() {
+        use crate::protocols::common::StringOrArray;
+        use crate::routers::prepare::chat_template::ProcessedMessages;
+
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
+        let stop = StringOrArray::String("world!".to_string());
+        let stop_decoder = create_stop_decoder(&tokenizer, Some(&stop), None, true, false);
+        let mut req = ChatCompletionRequest::default();
+        req.separate_reasoning = true;
+        let ctx = ResponseContext {
+            original: ProtocolRequest::Chat(Arc::new(req)),
+            model_id: Some("m".to_string()),
+            headers: None,
+            original_text: None,
+            processed_messages: Some(ProcessedMessages {
+                text: "<|im_start|>assistant\n<think>\n".into(),
+                stop_sequences: None,
+            }),
+            tokenizer,
+            stop_decoder,
+            request_id: "rid".to_string(),
+            created: 0,
+            tool_parser_factory: None,
+            reasoning_parser_factory: Some(test_mocks::reasoning_parser_factory()),
+            configured_tool_parser: None,
+            configured_reasoning_parser: Some("qwen3".to_string()),
+        };
+        // `Hello world`: `world` is held, as `world!` may follow.
+        let stream = synthetic_single_stream(vec![
+            Ok(TokenChunk::Partial {
+                token_ids: vec![1, 5, 2],
+                logprobs: None,
+            }),
+            Ok(TokenChunk::Complete {
+                token_ids: vec![],
+                finish_reason: FinishReason::Length,
+                matched_stop: None,
+                usage: usage(1, 3),
+                logprobs: None,
+                input_logprobs: None,
+                meta: meta_plain(),
+            }),
+        ]);
+        let s = body_of(chat_streaming::process(stream, ctx, "regular")).await;
+        let (mut reasoning, mut content) = (String::new(), String::new());
+        for event in s.lines().filter_map(|l| l.strip_prefix("data: ")) {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(event) else {
+                continue;
+            };
+            let delta = &v["choices"][0]["delta"];
+            reasoning.push_str(delta["reasoning_content"].as_str().unwrap_or_default());
+            content.push_str(delta["content"].as_str().unwrap_or_default());
+        }
+        assert!(reasoning.ends_with("world"), "reasoning: {reasoning:?}");
+        assert_eq!(content, "");
+    }
+
     #[tokio::test]
     async fn test_pd_backend_label_accepted() {
         let stream = synthetic_single_stream(vec![
