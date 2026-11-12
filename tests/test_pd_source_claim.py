@@ -198,3 +198,85 @@ def test_mooncake_preadmission_cancel_cannot_release_a_dispatched_source():
     sched.build_connector_meta()
     sched.cancel_preadmission(seq)
     assert sched.should_defer_free(seq)
+
+
+def test_nonchunked_mooncake_publishes_only_a_completed_prefill():
+    sched = _mooncake()
+    seq = _seq(do_remote_decode=True)
+    seq.output_tokens = []
+    sched.update_state_after_alloc(seq)
+    assert not sched.build_connector_meta().reqs_to_save
+    # A later chunk changes both its final PAGE allocation and STATE slot.
+    seq.block_table = [8, 9, 10, 11]
+    seq.state_slot = 3
+    sched.update_state_after_alloc(seq)
+    assert not sched.build_connector_meta().reqs_to_save
+    seq.output_tokens = [42]
+    seq.leave_reason = "stop_sequence"
+    sched.request_finished(seq)
+    publication = sched.build_connector_meta().reqs_to_save[seq.id]
+    assert publication.local_block_ids == seq.block_table
+    assert publication.local_slot_index == 3
+    assert sched.should_defer_free(seq)
+    assert not sched.build_connector_meta().reqs_to_save
+
+
+def test_nonchunked_mooncake_cancel_after_dispatch_never_advertises_source():
+    sched = _mooncake()
+    seq = _seq(do_remote_decode=True)
+    seq.output_tokens = []
+    sched.update_state_after_alloc(seq)
+    # Store loading dispatches metadata before the P forward. No producer
+    # address can survive cancellation if that prefill never completed.
+    dispatched = sched.build_connector_meta()
+    seq.leave_reason = "aborted"
+    sched.request_finished(seq)
+    assert not dispatched.reqs_to_save
+    assert not sched.build_connector_meta().reqs_to_save
+    assert not sched.should_defer_free(seq)
+    assert seq.kv_transfer_params_output is None
+
+
+def test_nonchunked_decode_waits_for_successful_publication(monkeypatch):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    from atom.kv_transfer.disaggregation.mooncake.mooncake_connector import (
+        MooncakeConnector,
+    )
+
+    sched = _mooncake()
+    seq = _seq(do_remote_decode=True)
+    seq.output_tokens = []
+    sched.update_state_after_alloc(seq)
+    worker = MooncakeConnector.__new__(MooncakeConnector)
+    worker.is_producer = True
+    worker._completed_prefills = {}
+    worker._completed_prefills_lock = threading.Lock()
+    worker._completed_prefills_cv = threading.Condition(worker._completed_prefills_lock)
+    # The input contains no chunked requests; isolate its unrelated dispatcher.
+    monkeypatch.setattr(worker, "_dispatch_ready_chunked_requests", lambda: None)
+    worker.start_load_kv(sched.build_connector_meta())
+    entered_wait = threading.Event()
+    wait = worker._completed_prefills_cv.wait
+
+    def observe_wait(timeout=None):
+        entered_wait.set()
+        return wait(timeout)
+
+    monkeypatch.setattr(worker._completed_prefills_cv, "wait", observe_wait)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        reader = executor.submit(worker._wait_for_prefill_data, seq.id)
+        assert entered_wait.wait(timeout=2)
+        assert not reader.done()
+        seq.output_tokens = [42]
+        seq.leave_reason = "stop_sequence"
+        seq.block_table = [10, 11]
+        seq.state_slot = 5
+        sched.request_finished(seq)
+        worker.start_load_kv(sched.build_connector_meta())
+        assert reader.result(timeout=2) == {
+            "block_ids": [10, 11],
+            "swa_block_ids": [5],
+            "slot_index": 5,
+        }
