@@ -612,6 +612,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # name in atom.models.glm52.mono.config.indexer_cp_refusal, and a refusal
     # leaves the fused indexer running exactly as it does with CP off.
     "ATOM_GLM52_INDEXER_CP": lambda: os.getenv("ATOM_GLM52_INDEXER_CP", "0") == "1",
+    # Kimi-K3 gfx1250 mono: all-reduce K2's routed and shared partials inside a
+    # kernel over the TP group's torch.symm_mem buffers (the transport aiter's
+    # custom all-reduce maps across trays) instead of the custom all-reduce
+    # call. Used only where that transport maps every peer. Opt-in until
+    # validated end to end at TP8.
+    "ATOM_KIMI_MONO_KERNEL_AR": lambda: (
+        os.getenv("ATOM_KIMI_MONO_KERNEL_AR", "0") == "1"
+    ),
     # Debug: run each mono layer next to the original one and log the difference
     # (atom/models/minimax_m3/mono/check.py). Use with --enforce-eager.
     "ATOM_MONO_CHECK": lambda: os.getenv("ATOM_MONO_CHECK", "0") == "1",

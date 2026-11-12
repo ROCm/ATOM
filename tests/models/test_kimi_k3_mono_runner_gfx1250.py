@@ -38,7 +38,7 @@ class _Launcher:
 
 
 def test_width_build_enumerates_each_local_launcher_once_and_compile_only():
-    launchers = [_Launcher() for _ in range(4)]
+    launchers = [_Launcher() for _ in range(5)]
     k1 = SimpleNamespace(
         entrypoint=SimpleNamespace(
             launcher=launchers[0],
@@ -49,6 +49,7 @@ def test_width_build_enumerates_each_local_launcher_once_and_compile_only():
         front=SimpleNamespace(launcher=launchers[1], abi=KernelAbi(("front",))),
         finish=SimpleNamespace(launcher=launchers[2], abi=KernelAbi(("finish",))),
         finalize=SimpleNamespace(launcher=launchers[3], abi=KernelAbi(("finalize",))),
+        allreduce=SimpleNamespace(launcher=launchers[4], abi=KernelAbi(("data",))),
     )
     build = Gfx1250WidthBuild(
         k1={1: k1, 2: k1},
@@ -424,7 +425,8 @@ def test_grouped_k2_projects_locally_then_runs_grouped_moe(monkeypatch, herd):
     assert calls["finalize"][0] == buffers["routed"].data_ptr()
 
 
-def test_replicated_finalize_all_reduces_both_partials_once(monkeypatch):
+@pytest.mark.parametrize("kernel_ar", (False, True))
+def test_replicated_finalize_all_reduces_both_partials_once(monkeypatch, kernel_ar):
     rows, layer_id, latent, hidden = 2, 3, 3584, 7168
     weight = SimpleNamespace(
         write_idx=-1,
@@ -469,6 +471,7 @@ def test_replicated_finalize_all_reduces_both_partials_once(monkeypatch):
         replicated_finalize=True,
         herd=False,
         herd_routes=None,
+        allreduce=recorder("allreduce") if kernel_ar else None,
     )
     experts = SimpleNamespace(w13_weight_scale=None, w2_weight_scale=None)
     layer = SimpleNamespace(
@@ -478,7 +481,11 @@ def test_replicated_finalize_all_reduces_both_partials_once(monkeypatch):
         ),
     )
     runner = object.__new__(K3Gfx1250MonoDecodeRunner)
-    runner.rank = 0
+    runner.rank = 3
+    runner.k2_peers = SimpleNamespace(
+        peers=torch.zeros(8, dtype=torch.int64),
+        epochs=torch.zeros(256, dtype=torch.int32),
+    )
     runner.routed = {layer_id: weight}
     runner.inner = SimpleNamespace(layers={layer_id: layer})
     group = SimpleNamespace(
@@ -501,7 +508,16 @@ def test_replicated_finalize_all_reduces_both_partials_once(monkeypatch):
         torch.zeros(rows, 3, 4),
     )
 
-    assert [value is reduce for value in calls["all_reduce"]] == [True]
+    if kernel_ar:
+        assert calls["all_reduce"] == []
+        assert calls["allreduce"] == (
+            reduce.data_ptr(),
+            runner.k2_peers.peers.data_ptr(),
+            runner.k2_peers.epochs.data_ptr(),
+            3,
+        )
+    else:
+        assert [value is reduce for value in calls["all_reduce"]] == [True]
     assert calls["finalize"] == (
         buffers["routed"].data_ptr(),
         buffers["shared"].data_ptr(),

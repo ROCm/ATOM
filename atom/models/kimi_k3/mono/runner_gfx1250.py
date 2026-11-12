@@ -57,6 +57,13 @@ from atom.models.kimi_k3.mono.kernels.attention.kda_builder_gfx1250 import (
 from atom.models.kimi_k3.mono.kernels.execution_plan import (
     Gfx1250KimiBuildPlan,
 )
+from atom.models.kimi_k3.mono.kernels.stages.k2_allreduce_gfx1250 import (
+    MAX_CTAS as ALLREDUCE_COUNTERS,
+)
+from atom.models.kimi_k3.mono.kernels.stages.k2_allreduce_gfx1250 import (
+    allreduce_peer_bytes,
+    build_allreduce,
+)
 from atom.models.kimi_k3.mono.kernels.stages.k2_finish_persistent_gfx1250 import (
     build_packed_finish,
     herd_scratch_layout,
@@ -80,12 +87,14 @@ from atom.models.kimi_k3.mono.runner import (
     _bf16_attn_res,
     state_slots,
 )
+from atom.models.kimi_k3.mono.symm_peers import SymmPeers, map_symm_peers
 from atom.models.kimi_k3.mono.weights import bind_external_moe
 from atom.mono.plan.architecture import GFX1250
 from atom.mono.runtime.abi import KernelAbi
 from atom.mono.runtime.compile import launcher_resources
 from atom.mono.runtime.consensus import MonoUnsupported, bind_agreed
 from atom.mono.runtime.widths import WidthBuilds
+from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
@@ -196,6 +205,9 @@ class Gfx1250RoutedK2Build:
     replicated_finalize: bool
     herd: bool = False
     herd_routes: _PrecomputedHerd | None = None
+    # the replicated finalize's all-reduce in a kernel, where the TP group's
+    # symm_mem banks map (``K3Gfx1250MonoDecodeRunner.k2_peers``)
+    allreduce: object | None = None
 
 
 @dataclass(frozen=True)
@@ -214,6 +226,8 @@ class Gfx1250WidthBuild:
                     (k2.finalize.launcher, k2.finalize.abi),
                 )
             )
+            if k2.allreduce is not None:
+                pairs.append((k2.allreduce.launcher, k2.allreduce.abi))
 
         unique = {}
         for launcher, abi in pairs:
@@ -227,10 +241,20 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
     max_rows = GFX1250_MAX_TOKENS
     bind_k2 = False
     fp8_in_proj = True
+    k2_peers: SymmPeers | None = None
 
     def __init__(self, model, drafter=None, metadata_builder=None) -> None:
         group = get_tp_group().cpu_group
         bind_agreed(lambda: self._bind(model, drafter, metadata_builder), group)
+        # Every rank bound: the rendezvous is a collective they all reach.
+        if envs.ATOM_KIMI_MONO_KERNEL_AR:
+            self.k2_peers = map_symm_peers(
+                allreduce_peer_bytes(self.tp, self.max_rows),
+                ALLREDUCE_COUNTERS,
+                group,
+                self.tp,
+                self.device,
+            )
         self.widths = WidthBuilds(
             self._build_width,
             Gfx1250WidthBuild.kernels,
@@ -241,9 +265,10 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
         )
         self._served_widths: set[tuple[int, int]] = set()
         logger.info(
-            "Kimi-K3 gfx1250 packed mono runner bound (TP%d, %d CUs)",
+            "Kimi-K3 gfx1250 packed mono runner bound (TP%d, %d CUs, K2 all-reduce %s)",
             self.tp,
             self.blocks,
+            "in kernel" if self.k2_peers is not None else "by aiter",
         )
 
     def _bind(self, model, drafter=None, metadata_builder=None) -> None:
@@ -463,6 +488,11 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                 if herd
                 else None
             ),
+            (
+                build_allreduce(self.tp, rows)
+                if replicated and self.k2_peers is not None
+                else None
+            ),
         )
 
     def forward(
@@ -590,7 +620,19 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                 ),
             )
         if local.replicated_finalize:
-            reduced = get_tp_group().all_reduce(buffers["reduce"], ca_fp8_quant=False)
+            if local.allreduce is not None:
+                local.allreduce.launcher(
+                    buffers["reduce"].data_ptr(),
+                    self.k2_peers.peers.data_ptr(),
+                    self.k2_peers.epochs.data_ptr(),
+                    self.rank,
+                    stream=stream,
+                )
+                reduced = buffers["reduce"]
+            else:
+                reduced = get_tp_group().all_reduce(
+                    buffers["reduce"], ca_fp8_quant=False
+                )
             if reduced is None:
                 reduced = buffers["reduce"]
             rows = buffers["routed"].size(0)
