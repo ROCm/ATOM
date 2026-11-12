@@ -553,6 +553,27 @@ class TestSelectorDispatch:
             assert m._aiter_selector_wins(width, emit=False)
             assert m._aiter_selector_wins(width, emit=True)
 
+    @pytest.mark.parametrize(
+        "width,rows,want",
+        [
+            (511, 65536, False),
+            (512, 8191, False),
+            (512, 8192, True),
+            (1895, 4104, True),
+        ],
+    )
+    def test_gfx1250_uses_work_per_cu(self, width, rows, want):
+        assert (
+            m._aiter_selector_wins(
+                width,
+                emit=True,
+                arch="gfx1250",
+                rows=rows,
+                compute_units=256,
+            )
+            == want
+        )
+
 
 @gpu
 def test_the_two_selectors_agree_where_the_dispatch_switches():
@@ -668,6 +689,58 @@ def test_pad_rows_of_a_padded_step_emit_nothing_and_live_rows_are_unchanged(
         assert int(ctx[n:].abs().max()) == 0 and int(bt[n:].abs().max()) == 0
         assert int(bt[:n].max()) < 10_000 * 8 * heads
     assert torch.equal(ait_ctx, tri_ctx) and torch.equal(ait_bt, tri_bt)
+
+
+@gpu
+@pytest.mark.parametrize(
+    "q_len,prefix_len,heads",
+    [
+        (4104, 238336, 1),
+        (16384, 65536, 4),
+        (32768, 49152, 4),
+    ],
+)
+def test_gfx1250_wave32_selector_matches_prefill_fallback(
+    monkeypatch, q_len, prefix_len, heads
+):
+    if m.get_gfx_runtime() != "gfx1250":
+        pytest.skip("gfx1250 wave32 selector regression")
+    try:
+        m._small_k_selector()
+    except ImportError:
+        pytest.skip("aiter's small-k selector is not installed")
+
+    kw = _inputs([q_len], [prefix_len], heads, "cuda")
+    bounds = m.build_n_valid_column_per_row(
+        kw["cu_seqlens_q"],
+        kw["prefix_lens"],
+        batch=1,
+        total_q=q_len,
+        num_idx_heads=heads,
+        decode_max_q=0,
+    )
+    used_aiter = False
+    original_select = m._select_with_aiter
+
+    def tracked_select(*args, **kwargs):
+        nonlocal used_aiter
+        used_aiter = True
+        return original_select(*args, **kwargs)
+
+    monkeypatch.setattr(m, "_select_with_aiter", tracked_select)
+    candidate = m.minimax_m3_index_topk(
+        **kw,
+        emit_sparse_block_table=True,
+        n_valid_column_per_row=bounds,
+    )
+    assert used_aiter
+
+    fallback = m.minimax_m3_index_topk(
+        **kw,
+        emit_sparse_block_table=True,
+        n_valid_column_per_row=None,
+    )
+    assert all(torch.equal(a, b) for a, b in zip(candidate, fallback))
 
 
 @gpu

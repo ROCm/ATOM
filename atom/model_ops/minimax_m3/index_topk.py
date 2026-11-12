@@ -848,11 +848,32 @@ def _alloc_emit(
 # Width decides, not rows: at fixed width the ratio moves <0.2x across 1..512
 # rows. Emission raises the bar because it costs a second kernel there, 26us
 # against the ~4us the fusion charges for the same work.
+#
+# gfx1250's wave32 build has a different crossover: the row count reaches tens
+# of thousands in DPEP prefill, and its one-pass narrowing repays the separate
+# emit launch once rows * width supplies 16K cells per CU. The work gate keeps
+# short eager calls on the fused Triton selector instead of turning a device win
+# into two host submissions. GPU0 complete-path A/B at width 1895/3942 was
+# 128.2 -> 113.9us and 189.4 -> 167.8us; DPEP q16K was 655.2 -> 579.2us.
 _AITER_MIN_WIDTH = 1024
 _AITER_MIN_WIDTH_WITH_EMIT = 2048
+_GFX1250_AITER_MIN_WIDTH = 512
+_GFX1250_AITER_MIN_CELLS_PER_CU = 1 << 14
 
 
-def _aiter_selector_wins(width, emit):
+def _aiter_selector_wins(
+    width,
+    emit,
+    *,
+    arch=None,
+    rows=1,
+    compute_units=1,
+):
+    if arch == "gfx1250":
+        return (
+            width >= _GFX1250_AITER_MIN_WIDTH
+            and rows * width >= compute_units * _GFX1250_AITER_MIN_CELLS_PER_CU
+        )
     return width >= (_AITER_MIN_WIDTH_WITH_EMIT if emit else _AITER_MIN_WIDTH)
 
 
@@ -1194,8 +1215,17 @@ def _launch_select(
     # Without bounds the Triton kernel serves, holding the bound in registers --
     # deriving a private copy here is the per-layer rebuild that
     # `MiniMaxM3SparseMetadata.n_valid_column_per_row` exists to avoid.
+    device_index = (
+        score.device.index
+        if score.device.index is not None
+        else torch.cuda.current_device()
+    )
     take_aiter = n_valid_column_per_row is not None and _aiter_selector_wins(
-        score.shape[2], emit
+        score.shape[2],
+        emit,
+        arch=get_gfx_runtime(),
+        rows=score.shape[0] * score.shape[1],
+        compute_units=_compute_units(device_index),
     )
     if take_aiter and _select_with_aiter(
         score, topk_idx, n_valid_column_per_row, topk, init_blocks, local_blocks
