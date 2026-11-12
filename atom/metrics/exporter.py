@@ -268,14 +268,18 @@ class _AtomMetricsCollector:
             for name, documentation, key in (
                 (
                     "atom:dp_prefix_index_tokens",
-                    "Prompt tokens currently held by the prefix-spread index "
-                    "(unique edges, not per-rank holders).",
+                    (
+                        "Prompt tokens currently held by the prefix-spread index "
+                        "(unique edges, not per-rank holders)."
+                    ),
                     "indexed_tokens",
                 ),
                 (
                     "atom:dp_prefix_index_budget_tokens",
-                    "Prefix-spread index token budget; finished history is shed "
-                    "above it.",
+                    (
+                        "Prefix-spread index token budget; finished history is "
+                        "shed above it."
+                    ),
                     "budget_tokens",
                 ),
             ):
