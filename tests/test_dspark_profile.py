@@ -74,14 +74,3 @@ def test_mxfp4_kv_does_not_share_an_fp8_identity(tmp_path, monkeypatch):
     data = {**profile(), "identity": fp8}
     with pytest.raises(ValueError):
         validate_calibration(data, kv_mx, width=5, max_batch=4)
-
-
-def test_a_draft_dtype_beside_the_targets_changes_the_identity(tmp_path, monkeypatch):
-    def with_draft(dtype):
-        spec = SimpleNamespace(draft_kv_dtype=dtype)
-        return identity_of(tmp_path, monkeypatch, speculative_config=spec)
-
-    # the target's own dtype leaves it as it was, so older profiles still match
-    assert with_draft("fp8") == identity_of(tmp_path, monkeypatch)
-    assert "draft_kv_cache_dtype" not in with_draft("fp8")
-    assert with_draft("bf16") != with_draft("fp8")

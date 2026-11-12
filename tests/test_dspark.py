@@ -2661,23 +2661,20 @@ def test_minimax_m31_dspark_refuses_tp_below_its_kv_heads(monkeypatch, tp):
 
 
 def test_standalone_draft_is_built_with_its_own_kv_dtype_target_untouched(monkeypatch):
-    """The draft model reads its KV dtype off the config it is constructed
-    with, so the shallow copy carries the draft's (bf16 under a target fp4) and
-    the target's config keeps its own."""
+    """The draft model reads its KV dtype off the config it is built with: the shallow
+    copy carries the draft's (bf16 under a target fp4); the target's keeps its own."""
     from atom.config import CompilationConfig
     from atom.spec_decode import draft_kv
     from atom.spec_decode.dspark_proposer import DSparkProposer
 
     seen = {}
     monkeypatch.setattr(draft_kv, "draft_kv_builder", lambda runner, hf: None)
-
     p = DSparkProposer.__new__(DSparkProposer)
-    spec = types.SimpleNamespace(
+    p.speculative_config = types.SimpleNamespace(
         draft_model_hf_config=types.SimpleNamespace(),
         draft_kv_dtype="bf16",  # as `Config` resolved it, under an fp4 target
         use_dspark_with_draft=lambda: True,
     )
-    p.speculative_config = spec
     p.runner = types.SimpleNamespace()
     p.config = types.SimpleNamespace(
         kv_cache_dtype="fp4",
@@ -2691,8 +2688,7 @@ def test_standalone_draft_is_built_with_its_own_kv_dtype_target_untouched(monkey
 
     p._build_draft_model(model_class)
 
-    assert seen == {"dtype": "bf16"}
-    assert p.config.kv_cache_dtype == "fp4"
+    assert seen == {"dtype": "bf16"} and p.config.kv_cache_dtype == "fp4"
 
 
 def test_dtype_q_follows_the_drafts_dtype_not_the_targets():

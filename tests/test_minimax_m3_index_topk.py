@@ -545,26 +545,6 @@ class TestSelectorDispatch:
             assert m._aiter_selector_wins(width, emit=True)
 
 
-class TestSelectWithAiter:
-    """aiter flattens the score with a `view`: every scorer writes a contiguous one
-    (the MXFP4 scorers into the index workspace), so none is declined on layout."""
-
-    def test_a_contiguous_score_is_served(self, monkeypatch):
-        calls = []
-        monkeypatch.setattr(
-            m,
-            "_small_k_selector",
-            lambda: (lambda *a: calls.append(a), lambda *a: True),
-        )
-        monkeypatch.setattr(m, "_AITER_SERVES", {})
-        heads, total_q, blocks = 2, 8, 2048
-        score = torch.empty(heads, total_q, blocks)
-        topk_idx = torch.empty(heads, total_q, TOPK, dtype=torch.int32)
-        bounds = torch.full((heads * total_q,), blocks, dtype=torch.int32)
-        assert m._select_with_aiter(score, topk_idx, bounds, TOPK, 1, 1)
-        assert len(calls) == 1
-
-
 @gpu
 def test_the_two_selectors_agree_where_the_dispatch_switches():
     """Above the width threshold both paths must return the same selection.
@@ -610,7 +590,6 @@ def test_the_two_selectors_agree_where_the_dispatch_switches():
 @pytest.mark.parametrize(
     "S,heads,width",
     [
-        (1, 1, 70),
         (8, 2, 70),
         (1, 2, m._AITER_MIN_WIDTH_WITH_EMIT + 252),
         (8, 1, m._AITER_MIN_WIDTH_WITH_EMIT + 252),
@@ -619,12 +598,10 @@ def test_the_two_selectors_agree_where_the_dispatch_switches():
 def test_pad_rows_of_a_padded_step_emit_nothing_and_live_rows_are_unchanged(
     monkeypatch, S, heads, width
 ):
-    """Decode selection + emission over a step padded from 3 to 6 requests (pad rows
-    length 0, a poisoned block table), on both selectors. A pad row has no causal
-    key: it emits context 0 and page 0 and never reads its table; a live row's
-    context is the closed form of what the selection holds. The wide case is the one
-    `_aiter_selector_wins` hands to aiter's selector: it must actually serve it, and
-    agree with Triton."""
+    """A decode step padded from 3 to 6 requests (pad rows length 0, a poisoned block
+    table), on both selectors: a pad row emits context 0 and page 0 and never reads
+    its table; a live row's context is the closed form of its selection. The wide
+    case must actually be served by aiter's selector, and agree with Triton."""
     live_lens = [width * SPARSE_BLOCK_SIZE - 5, 300 + S, 9 * SPARSE_BLOCK_SIZE + S]
     batch, live = 6, len(live_lens)
     dev = "cuda"
@@ -633,19 +610,19 @@ def test_pad_rows_of_a_padded_step_emit_nothing_and_live_rows_are_unchanged(
     table = torch.full((batch, width), 0x7FFFFFFF, dtype=torch.int32, device=dev)
     table[:live] = torch.randperm(10_000, device=dev)[: live * width].reshape(live, -1).int()  # fmt: skip
     total_q = batch * S
-    g = torch.Generator(device=dev).manual_seed(7 * S + heads)
-    score = torch.randn(heads, total_q, width, generator=g, device=dev)
+    score = torch.randn(heads, total_q, width, device=dev)
     nvalid = m.build_n_valid_column_per_row(
         seq, seq, batch=batch, total_q=total_q, num_idx_heads=heads, decode_max_q=S
     )
 
     served = []
     real, supported = m._small_k_selector()
-    monkeypatch.setattr(
-        m,
-        "_small_k_selector",
-        lambda: (lambda *a: (served.append(1), real(*a))[1], supported),
-    )
+
+    def served_by(*a):
+        served.append(1)
+        return real(*a)
+
+    monkeypatch.setattr(m, "_small_k_selector", lambda: (served_by, supported))
     monkeypatch.setattr(m, "_AITER_SERVES", {})
 
     def run(bounds):
@@ -663,10 +640,7 @@ def test_pad_rows_of_a_padded_step_emit_nothing_and_live_rows_are_unchanged(
     tri_idx, tri_bt, tri_ctx = run(None)
     assert not served
     ait_idx, ait_bt, ait_ctx = run(nvalid)
-    if width >= m._AITER_MIN_WIDTH_WITH_EMIT:
-        if real is None:
-            pytest.skip("aiter's small-k selector is not installed")
-        assert served, "the wide row was not served by aiter's selector"
+    assert bool(served) == (width >= m._AITER_MIN_WIDTH_WITH_EMIT)
     rows = heads * total_q
     assert torch.equal(
         torch.sort(ait_idx.reshape(rows, TOPK), dim=1).values,

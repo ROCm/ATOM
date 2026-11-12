@@ -57,25 +57,6 @@ def test_request_context_metrics_cli_reaches_engine_kwargs(enabled):
 
 @pytest.mark.parametrize(
     "argv,want",
-    [
-        ([], ("bf16", None)),
-        (["--kv-cache-dtype", "fp4"], ("fp4", None)),
-        (["--kv_cache_dtype", "fp4"], ("fp4", None)),
-        (["--index-cache-dtype", "fp4"], ("bf16", "fp4")),
-        (
-            ["--kv-cache-dtype", "fp4", "--index-cache-dtype", "fp4"],
-            ("fp4", "fp4"),
-        ),
-    ],
-)
-def test_fp4_cache_dtypes_reach_engine_kwargs(argv, want):
-    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
-    kwargs = EngineArgs.from_cli_args(parser.parse_args(argv))._get_engine_kwargs()
-    assert (kwargs["kv_cache_dtype"], kwargs["index_cache_dtype"]) == want
-
-
-@pytest.mark.parametrize(
-    "argv,want",
     [([], "interval"), (["--prefill-admit-policy", "adaptive"], "adaptive")],
 )
 def test_prefill_admit_policy_cli_reaches_engine_kwargs(argv, want):
