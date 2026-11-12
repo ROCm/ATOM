@@ -357,9 +357,7 @@ class MultiConnector(KVConnectorBase):
     def set_forward_stream(self, stream) -> None:
         """Tell every child which stream the forward runs on."""
         for connector in self._connectors:
-            callback = getattr(connector, "set_forward_stream", None)
-            if callable(callback):
-                callback(stream)
+            connector.set_forward_stream(stream)
 
     def get_finished(self) -> KVConnectorOutput:
         recv: set = set()
@@ -476,7 +474,7 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
 
     def cancel_preadmission(self, seq: Any) -> None:
         """Take back an early admission, including each tier's held state."""
-        self._load_winner.pop(getattr(seq, "id", None), None)
+        self._load_winner.pop(seq.id, None)
         for connector in self._connectors:
             connector.cancel_preadmission(seq)
 
@@ -647,7 +645,7 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         and the abandoned request stayed recv-queued. Idempotent per sub (the
         `_load_lifecycles` guard), so fanning to all is safe.
         """
-        self._load_winner.pop(getattr(seq, "id", None), None)
+        self._load_winner.pop(seq.id, None)
         for c in self._connectors:
             fn = getattr(c, "cancel_pending_load", None)
             if callable(fn):
@@ -663,7 +661,7 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             c.update_state_after_alloc(seq)
 
     def request_finished(self, seq: Any) -> None:
-        self._load_winner.pop(getattr(seq, "id", None), None)
+        self._load_winner.pop(seq.id, None)
         for c in self._connectors:
             if hasattr(c, "request_finished"):
                 c.request_finished(seq)

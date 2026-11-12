@@ -831,8 +831,15 @@ class EngineCore:
 
     def pull_and_process_input_queue(self):
         recv_reqs = []
+        credit_updates = []
         while not self.input_queue.empty():
             seqs = self.input_queue.get_nowait()
+            if (
+                isinstance(seqs, tuple)
+                and seqs[0] == EngineCoreRequestType.DP_PREFIX_CREDIT
+            ):
+                credit_updates.extend(seqs[1])
+                continue
             for seq in seqs:
                 if seq.status == SequenceStatus.EXIT_ENGINE:
                     logger.debug(f"{self.label}: input_queue get exit engine")
@@ -842,6 +849,18 @@ class EngineCore:
             logger.debug(f"{self.label}: put {len(recv_reqs)} reqs to scheduler")
             self.scheduler.extend(recv_reqs)
             self._ingested_seqs += len(recv_reqs)
+        if credit_updates:
+            self.scheduler.correct_prefix_estimates(credit_updates)
+            self.output_queue.put_nowait(
+                (
+                    "PREFILL_BACKLOG",
+                    (
+                        self._ingested_seqs,
+                        prefill_backlog(self.scheduler),
+                        credit_updates,
+                    ),
+                )
+            )
         return False
 
     # How often the backlog is recomputed. Walking `waiting` costs about 0.25 us
@@ -944,6 +963,9 @@ class EngineCore:
                         self.input_queue.put_nowait(reqs)
                         self._kv_progress_event.set()
                         self._offer_tier_lookups(reqs)
+                    elif request_type == EngineCoreRequestType.DP_PREFIX_CREDIT:
+                        self.input_queue.put_nowait((request_type, reqs))
+                        self._kv_progress_event.set()
                     elif request_type == EngineCoreRequestType.UTILITY:
                         cmd = reqs.get("cmd") if isinstance(reqs, dict) else None
                         logger.debug(f"{self.label}: input get UTILITY command: {cmd}")
@@ -1614,14 +1636,34 @@ class DecodeEngineCore(EngineCore):
         """Override: add new sequences to waiting queue, then allocate blocks
         and send BlockAssignment to prefill for any that fit."""
         recv_reqs = []
+        credit_updates = []
         while not self.input_queue.empty():
             seqs = self.input_queue.get_nowait()
+            if (
+                isinstance(seqs, tuple)
+                and seqs[0] == EngineCoreRequestType.DP_PREFIX_CREDIT
+            ):
+                credit_updates.extend(seqs[1])
+                continue
             for seq in seqs:
                 if seq.status == SequenceStatus.EXIT_ENGINE:
                     return True
                 recv_reqs.append(seq)
         if recv_reqs:
             self.scheduler.extend(recv_reqs)
+            self._ingested_seqs += len(recv_reqs)
+        if credit_updates:
+            self.scheduler.correct_prefix_estimates(credit_updates)
+            self.output_queue.put_nowait(
+                (
+                    "PREFILL_BACKLOG",
+                    (
+                        self._ingested_seqs,
+                        prefill_backlog(self.scheduler),
+                        credit_updates,
+                    ),
+                )
+            )
         for seq in self.scheduler.allocate_waiting():
             self._send_block_assignment(seq)
         return False

@@ -10,8 +10,6 @@ from typing import ClassVar
 from atom.kv_transfer.offload.tier import OffloadTierProfile
 from atom.model_engine.dp_routing.prefix_spread import PrefixSpreadRouter
 
-SHARED_TIER_CONNECTORS = frozenset({"mooncake_store", "lmcache_mp"})
-
 
 class SharedWorkPlacement:
     """Balance actual backlog plus this request's cost and decode slot pressure."""

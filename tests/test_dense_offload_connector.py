@@ -26,6 +26,7 @@ from atom.kv_transfer.offload.dense.connector import (
     DenseOffloadConnector,
     DenseOffloadScheduler,
 )
+from atom.kv_transfer.offload.lookup_client import as_lookup_client
 from atom.kv_transfer.offload.metadata import (
     LMCacheOffloadMetadata,
     LMCacheReqMeta,
@@ -728,8 +729,8 @@ def test_unused_lookup_releases_worker_pin(monkeypatch, outcome):
             raise RuntimeError("lookup transport failed after a worker pinned")
         return 0 if outcome == "miss" else 16
 
-    scheduler._lookup_client = SimpleNamespace(
-        lookup=lookup, clear_lookup_status=lambda _sid: None
+    scheduler._lookup_client = as_lookup_client(
+        SimpleNamespace(lookup=lookup, clear_lookup_status=lambda _sid: None)
     )
     worker._engine = SimpleNamespace(lookup_unpin=pins.discard)
     seq = _load_seq(52, num_prompt_tokens=24)
@@ -757,9 +758,11 @@ def test_unused_lookup_releases_worker_pin(monkeypatch, outcome):
 
 def test_pending_load_keeps_pin_until_cancelled(monkeypatch):
     scheduler = _scheduler(monkeypatch, "kv_consumer")
-    scheduler._lookup_client = SimpleNamespace(
-        lookup=lambda *_args, **_kwargs: 16,
-        clear_lookup_status=lambda _sid: None,
+    scheduler._lookup_client = as_lookup_client(
+        SimpleNamespace(
+            lookup=lambda *_args, **_kwargs: 16,
+            clear_lookup_status=lambda _sid: None,
+        )
     )
     seq = _load_seq(53, num_prompt_tokens=24)
     assert scheduler.get_num_new_matched_tokens(seq) == (16, True)
@@ -786,8 +789,8 @@ def test_scheduler_abort_before_allocation_releases_lookup_pin(
         pins.add(lookup_id)
         return 16
 
-    connector._lookup_client = SimpleNamespace(
-        lookup=lookup, clear_lookup_status=lambda _sid: None
+    connector._lookup_client = as_lookup_client(
+        SimpleNamespace(lookup=lookup, clear_lookup_status=lambda _sid: None)
     )
     worker._engine = SimpleNamespace(lookup_unpin=pins.discard)
     scheduler.kv_connector = connector
@@ -835,9 +838,11 @@ def test_scheduler_abort_before_allocation_releases_lookup_pin(
 def test_lookup_id_reuse_does_not_consume_an_old_pin(monkeypatch):
     scheduler = _scheduler(monkeypatch, "kv_consumer")
     calls = []
-    scheduler._lookup_client = SimpleNamespace(
-        lookup=lambda _tokens, lookup_id: calls.append(lookup_id) or 16,
-        clear_lookup_status=lambda _sid: None,
+    scheduler._lookup_client = as_lookup_client(
+        SimpleNamespace(
+            lookup=lambda _tokens, lookup_id: calls.append(lookup_id) or 16,
+            clear_lookup_status=lambda _sid: None,
+        )
     )
     old = _load_seq(54, num_prompt_tokens=24)
     new = _load_seq(54, num_prompt_tokens=32)
@@ -852,9 +857,11 @@ def test_lookup_id_reuse_does_not_consume_an_old_pin(monkeypatch):
 
 def test_hbm_catches_up_after_a_pending_cpu_lookup(monkeypatch):
     scheduler = _scheduler(monkeypatch, "kv_consumer")
-    scheduler._lookup_client = SimpleNamespace(
-        lookup=lambda *_args, **_kwargs: 16,
-        clear_lookup_status=lambda _sid: None,
+    scheduler._lookup_client = as_lookup_client(
+        SimpleNamespace(
+            lookup=lambda *_args, **_kwargs: 16,
+            clear_lookup_status=lambda _sid: None,
+        )
     )
     seq = _load_seq(55, num_prompt_tokens=24)
     assert scheduler.get_num_new_matched_tokens(seq) == (16, True)
@@ -889,7 +896,7 @@ def test_native_retry_on_a_full_kv_cache_reuses_the_lookup(
 
     connector = _scheduler(monkeypatch, "kv_consumer")
     calls = []
-    connector._lookup_client = _counting_lookup(calls, 0)
+    connector._lookup_client = as_lookup_client(_counting_lookup(calls, 0))
     scheduler.kv_connector = connector
     seq = seq_factory(list(range(24)))
     scheduler.add(seq)
@@ -916,7 +923,7 @@ def test_native_admission_spends_the_memo(monkeypatch, scheduler, seq_factory):
 
     connector = _scheduler(monkeypatch, "kv_consumer")
     calls = []
-    connector._lookup_client = _counting_lookup(calls, 0)
+    connector._lookup_client = as_lookup_client(_counting_lookup(calls, 0))
     scheduler.kv_connector = connector
     seq = seq_factory(list(range(24)))
     scheduler.add(seq)
@@ -945,10 +952,12 @@ def test_prefetch_skips_a_request_that_resumes_after_its_load(monkeypatch, settl
 
     sched = _scheduler(monkeypatch)
     submitted = []
-    sched._lookup_client = SimpleNamespace(
-        submit=lambda _tokens, sid: submitted.append(sid) or True,
-        pump=lambda: None,
-        pending_ids=lambda: (),
+    sched._lookup_client = as_lookup_client(
+        SimpleNamespace(
+            submit=lambda _tokens, sid: submitted.append(sid) or True,
+            pump=lambda: None,
+            pending_ids=lambda: (),
+        )
     )
     resumed = _load_seq(70, num_prompt_tokens=16)
     setattr(resumed, settled, True)
@@ -975,10 +984,12 @@ def test_prefetch_skips_exactly_what_admission_resumes(monkeypatch, flags, block
 
     sched = _scheduler(monkeypatch)
     submitted = []
-    sched._lookup_client = SimpleNamespace(
-        submit=lambda _tokens, sid: submitted.append(sid) or True,
-        pump=lambda: None,
-        pending_ids=lambda: (),
+    sched._lookup_client = as_lookup_client(
+        SimpleNamespace(
+            submit=lambda _tokens, sid: submitted.append(sid) or True,
+            pump=lambda: None,
+            pending_ids=lambda: (),
+        )
     )
     seq = _load_seq(74, num_prompt_tokens=16)
     seq.block_table = blocks
@@ -997,10 +1008,12 @@ def test_prefetch_skips_a_finished_load_before_admission(monkeypatch):
 
     sched = _scheduler(monkeypatch)
     submitted = []
-    sched._lookup_client = SimpleNamespace(
-        submit=lambda _tokens, sid: submitted.append(sid) or True,
-        pump=lambda: None,
-        pending_ids=lambda: (),
+    sched._lookup_client = as_lookup_client(
+        SimpleNamespace(
+            submit=lambda _tokens, sid: submitted.append(sid) or True,
+            pump=lambda: None,
+            pending_ids=lambda: (),
+        )
     )
     loaded = _load_seq(72, num_prompt_tokens=16)
     loaded.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
@@ -1027,7 +1040,7 @@ def test_a_declined_load_is_not_looked_up_again_every_step(monkeypatch):
     sched = _scheduler(monkeypatch, "kv_consumer")
     sched._min_load_tokens = 8192  # every hit here is "too small" to transfer
     calls = []
-    sched._lookup_client = _counting_lookup(calls, 16)
+    sched._lookup_client = as_lookup_client(_counting_lookup(calls, 16))
     seq = _load_seq(60, num_prompt_tokens=24)
 
     for _ in range(8):
@@ -1053,7 +1066,7 @@ def test_a_moved_frontier_is_re_derived_from_the_same_hit(monkeypatch):
     sched = _scheduler(monkeypatch, "kv_consumer")
     sched._min_load_tokens = 0
     calls = []
-    sched._lookup_client = _counting_lookup(calls, 16)
+    sched._lookup_client = as_lookup_client(_counting_lookup(calls, 16))
     seq = _load_seq(61, num_prompt_tokens=24)
 
     assert sched.get_num_new_matched_tokens(seq) == (16, True)
@@ -1085,8 +1098,8 @@ def test_a_failed_lookup_backs_off_before_it_is_retried(monkeypatch):
         calls.append(lookup_id)
         return replies.pop(0)
 
-    sched._lookup_client = SimpleNamespace(
-        lookup=lookup, clear_lookup_status=lambda _sid: None
+    sched._lookup_client = as_lookup_client(
+        SimpleNamespace(lookup=lookup, clear_lookup_status=lambda _sid: None)
     )
     seq = _load_seq(62, num_prompt_tokens=24)
 
@@ -1116,7 +1129,7 @@ def test_a_stale_memo_expires_and_asks_the_tier_again(monkeypatch):
     sched._min_load_tokens = 8192  # every hit here is declined after alloc
     sched._tier_memo_steps = 2
     calls = []
-    sched._lookup_client = _counting_lookup(calls, 16)
+    sched._lookup_client = as_lookup_client(_counting_lookup(calls, 16))
     seq = _load_seq(65, num_prompt_tokens=24)
 
     for _ in range(4):
@@ -1143,7 +1156,7 @@ def test_a_multi_connector_cancel_re_arms_honestly(monkeypatch):
     sched = _scheduler(monkeypatch, "kv_consumer")
     sched._min_load_tokens = 0
     calls = []
-    sched._lookup_client = _counting_lookup(calls, 16)
+    sched._lookup_client = as_lookup_client(_counting_lookup(calls, 16))
     moriio_matched = {"yes": False}
 
     def moriio_match(_seq):
@@ -1169,7 +1182,7 @@ def test_a_multi_connector_cancel_re_arms_honestly(monkeypatch):
 def test_a_finished_request_leaves_no_memo_behind(monkeypatch):
     sched = _scheduler(monkeypatch, "kv_consumer")
     calls = []
-    sched._lookup_client = _counting_lookup(calls, 0)
+    sched._lookup_client = as_lookup_client(_counting_lookup(calls, 0))
     seq = _load_seq(63, num_prompt_tokens=24)
 
     sched.get_num_new_matched_tokens(seq)
@@ -1181,9 +1194,11 @@ def test_a_finished_request_leaves_no_memo_behind(monkeypatch):
 def test_cpu_pin_is_retained_until_retrieve_finishes(monkeypatch):
     scheduler = _scheduler(monkeypatch, "kv_consumer")
     scheduler._min_load_tokens = 0
-    scheduler._lookup_client = SimpleNamespace(
-        lookup=lambda *_args, **_kwargs: 16,
-        clear_lookup_status=lambda _sid: None,
+    scheduler._lookup_client = as_lookup_client(
+        SimpleNamespace(
+            lookup=lambda *_args, **_kwargs: 16,
+            clear_lookup_status=lambda _sid: None,
+        )
     )
     seq = _load_seq(56, num_prompt_tokens=24)
     scheduler.get_num_new_matched_tokens(seq)
@@ -1361,7 +1376,7 @@ class _StubLookupClient:
 
 def _lookup_scheduler(monkeypatch, hit, *, role="offload"):
     sched = _scheduler(monkeypatch, role)
-    sched._lookup_client = _StubLookupClient(hit)
+    sched._lookup_client = as_lookup_client(_StubLookupClient(hit))
     sched._min_load_tokens = 0  # these prompts are far below the 8192 default
     return sched
 

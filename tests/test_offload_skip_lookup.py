@@ -28,6 +28,44 @@ from tests.lmcache_mp_support import bare_mp_scheduler
 MIN_LOAD = 32
 
 
+@pytest.mark.parametrize("fail_build", [False, True])
+def test_metadata_retirement_reconciles_once_and_restores_terminal_progress(
+    monkeypatch, fail_build
+):
+    sched, client, _adapter = _scheduler(monkeypatch, lookup_done=True)
+    calls = []
+    original_pump = client.pump
+
+    def pump():
+        calls.append("pump")
+        original_pump()
+
+    client.pump = pump
+    original_build = ChunkedOffloadSchedulerBase.build_connector_meta
+
+    def retiring_build(self):
+        metadata = original_build(self)
+        # The shared metadata builder can retire several finished requests.
+        self._end_finished_sessions()
+        self._end_finished_sessions()
+        if fail_build:
+            raise RuntimeError("metadata serialization failed")
+        return metadata
+
+    monkeypatch.setattr(
+        ChunkedOffloadSchedulerBase, "build_connector_meta", retiring_build
+    )
+    if fail_build:
+        with pytest.raises(RuntimeError, match="serialization failed"):
+            sched.build_connector_meta()
+    else:
+        sched.build_connector_meta()
+    assert calls == ["pump"]
+    # Outside metadata construction the terminal path must advance lookups.
+    sched._end_finished_sessions()
+    assert calls == ["pump", "pump"]
+
+
 def _scheduler(monkeypatch, *, chunks=8, lookup_done=False):
     """An MP scheduler over the async-capable fake adapter."""
     adapter = _Adapter(_Client(chunks, lookup_done=lookup_done))

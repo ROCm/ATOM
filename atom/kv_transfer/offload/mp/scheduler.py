@@ -237,6 +237,16 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         return self._token_shipper.ship(seq, end)
 
     def build_connector_meta(self) -> MPOffloadMetadata:
+        # Shared base advances lookups before it builds metadata. Retirements
+        # inside that build must not pump the same client a second time.
+        depth = self.__dict__.get("_metadata_build_depth", 0)
+        self._metadata_build_depth = depth + 1
+        try:
+            return self._build_mp_connector_meta()
+        finally:
+            self._metadata_build_depth = depth
+
+    def _build_mp_connector_meta(self) -> MPOffloadMetadata:
         try:
             metadata = super().build_connector_meta()
         finally:
@@ -417,19 +427,18 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         # Pumped on every pass: a detached lookup must be released even while
         # its request is still transferring and the waiting queue, which
         # drives `prefetch_lookups`, is empty.
+        # Metadata has already advanced this step; terminal-only calls still
+        # need the shared reconciliation to free detached lookup locks.
+        if not self.__dict__.get("_metadata_build_depth", 0):
+            self._reconcile_lookups_each_step()
         client = self._lookup_client
-        pump = getattr(client, "pump", None)
-        if callable(pump):
-            pump()
-        # Before the sessions: an answered lookup releases its locks here first.
-        self.reconcile_detached_lookups()
         pending = self._pending_session_ends()
-        in_flight = getattr(client, "is_pending", None)
+
         for sid, seq in list(pending.items()):
             entry = self._save_tracker.get(sid)
             if (entry is not None and entry[0] is seq) or sid in self._save_inflight:
                 continue
-            if callable(in_flight) and in_flight(sid):
+            if client is not None and client.is_pending(sid):
                 continue
             del pending[sid]
             # No save can follow now: the workers' copy of its tokens goes.

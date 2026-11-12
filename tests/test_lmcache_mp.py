@@ -2417,7 +2417,9 @@ def test_the_session_end_drops_the_workers_copy(monkeypatch):
     sched = _bare_mp_scheduler()
     seq = SimpleNamespace(id=7, token_ids=array.array("i", range(64)))
     sched._token_shipper.ship(seq, 32)
-    sched._lookup_client = SimpleNamespace()
+    from atom.kv_transfer.offload.lookup_client import LookupClient
+
+    sched._lookup_client = LookupClient()
     sched._save_tracker, sched._save_inflight = {}, {}
     sched._mp_adapter = SimpleNamespace(end_session=lambda rid: None)
     sched._config = SimpleNamespace()

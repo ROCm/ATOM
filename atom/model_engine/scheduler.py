@@ -1616,6 +1616,20 @@ class Scheduler:
         if self.engine_stats.window_expired(now):
             self._record_throughput()
 
+    def correct_prefix_estimates(self, updates):
+        """Correct only unallocated waiting hints; resident KV remains authoritative."""
+        by_id = {seq.id: seq for seq in self.waiting}
+        for sid, credit in updates:
+            seq = by_id.get(sid)
+            if (
+                seq is not None
+                and seq.status == SequenceStatus.WAITING
+                and not seq.block_table
+            ):
+                seq.dp_est_cached_tokens = min(
+                    seq.dp_est_cached_tokens, max(0, int(credit))
+                )
+
     def _waiting_new_token_count(self) -> int:
         """Sum of new (uncached) tokens across the ADMITTABLE waiting queue,
         saturated at `max_num_batched_tokens`.
@@ -4296,8 +4310,7 @@ class Scheduler:
             return False
         if self._unschedulable_reason(seq) is not None:
             return False
-        admission_ready = getattr(self.kv_connector, "admission_ready", None)
-        if callable(admission_ready) and not admission_ready(seq):
+        if not self.kv_connector.admission_ready(seq):
             state.skip(seq.id, "admission_not_ready")
             return False
         # Never block the scheduler thread -- and every DP rank with it -- on a
@@ -5549,7 +5562,11 @@ class Scheduler:
         """
         if not self.waiting:
             return
-        if not (self.finished_recving_kv_req_ids or self.failed_recving_kv_req_ids):
+        if not (
+            self.finished_recving_kv_req_ids
+            or self.failed_recving_kv_req_ids
+            or self._early_load.entries
+        ):
             return
         resolve = self._connector_flag("is_offload")
         queue = list(self.waiting)

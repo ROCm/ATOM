@@ -58,7 +58,7 @@ from atom.model_engine.engine_utility import (
 from atom.model_engine.prefix_hash import take_shipped_chains
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence
-from atom.model_engine.share_cache import SHARED_TIER_CONNECTORS, ShareCacheRouter
+from atom.model_engine.share_cache import ShareCacheRouter
 from atom.observability import tracing
 from atom.structured_output import is_structured
 from atom.utils import (
@@ -392,6 +392,14 @@ class CoreManager:
         # that was lightest when it started.
         self._backlog_unsent: dict = {}
         self._backlog_unsent_tokens = [0] * n_ranks
+        self._backlog_unseen_ids = [deque() for _ in range(n_ranks)]
+        self._backlog_objects = {}
+        self._backlog_prompt_tokens = {}
+        self._backlog_sent_ordinals = {}
+        self._backlog_credit_updates = {}
+        self._backlog_credit_sent = {}
+        self._backlog_credit_debts = {}
+        self._backlog_reported_credit_tokens = [0] * n_ranks
         # --- Backpressure (lazy) DP dispatch --------------------------------
         # ATOM_DP_DISPATCH_DEPTH > 0 holds load-balanced seqs in _bp_pending and
         # releases them to the lightest rank only up to that in-flight cap. A
@@ -891,8 +899,12 @@ class CoreManager:
                         self.latest_metrics[dp_rank] = data
                     elif request_type == EngineCoreRequestType.PREFILL_BACKLOG:
                         with self._lb_lock:
-                            self._backlog_report[dp_rank] = data
+                            self._backlog_ack_credit_locked(
+                                dp_rank, data[2] if len(data) > 2 else ()
+                            )
+                            self._backlog_report[dp_rank] = data[:2]
                             self._backlog_pop_seen_locked(dp_rank)
+                            self._backlog_flush_credit_updates_locked(dp_rank)
                     elif request_type == EngineCoreRequestType.DP_REUSE:
                         with self._lb_lock:
                             self._note_dp_reuse_locked(data)
@@ -1603,31 +1615,13 @@ class CoreManager:
         # to the transport, so look at the transports it runs, not its name.
         leaves = KVConnectorFactory.leaf_connectors(config) or []
         names = [name for name, _ in leaves]
-        if not SHARED_TIER_CONNECTORS.intersection(names):
+        shared_names = KVConnectorFactory.shared_offload_connectors()
+        if not shared_names.intersection(names):
             raise ValueError(
                 "--dp-load-balance share_cache needs an offload tier every DP "
-                f"rank shares ({', '.join(sorted(SHARED_TIER_CONNECTORS))}); "
+                f"rank shares ({', '.join(sorted(shared_names))}); "
                 f"the KV connectors are {names!r}"
             )
-        for name, leaf in leaves:
-            if name != "mooncake_store" or self.global_engine_count < 2:
-                continue
-            from atom.kv_transfer.offload.mooncake_store.config import (
-                parse_mooncake_store_config,
-            )
-
-            masters = parse_mooncake_store_config(
-                leaf.kv_transfer_config
-            ).store_masters()
-            if len(masters) > 1:
-                # Each worker reads and writes its own NIC's pool, so a prefix
-                # one DP rank saved is a lookup hit another rank's load misses.
-                raise ValueError(
-                    "--dp-load-balance share_cache needs one Mooncake Store every "
-                    f"DP rank reaches; mooncake_store.pools splits it into "
-                    f"{len(masters)} pools, so a request placed on another rank "
-                    "fails its load and recomputes"
-                )
         tier = (
             KVConnectorFactory.offload_tier(config)
             if self.global_engine_count > 1
@@ -1639,6 +1633,8 @@ class CoreManager:
         """`seq` was just charged to `dp_rank` and is not sent yet."""
         entry = self._seq_load.get(seq.id)
         charge = entry[2] if entry is not None else 0
+        self._backlog_objects[seq.id] = seq
+        self._backlog_prompt_tokens[seq.id] = int(seq.num_prompt_tokens)
         self._backlog_unsent[seq.id] = (dp_rank, charge)
         self._backlog_unsent_tokens[dp_rank] += charge
 
@@ -1655,7 +1651,15 @@ class CoreManager:
     def _backlog_note_sent_locked(self, dp_rank: int, seqs) -> None:
         """Seqs just sent to `dp_rank`, in send (= ingest) order."""
         q = self._backlog_unseen[dp_rank]
-        for seq in seqs:
+        for offset, seq in enumerate(seqs):
+            active = seq.id in self._seq_load
+            if active:
+                self._backlog_sent_ordinals[seq.id] = (
+                    dp_rank,
+                    self._backlog_sent[dp_rank] + offset + 1,
+                )
+            self._backlog_unseen_ids[dp_rank].append(seq.id if active else None)
+            self._backlog_objects.pop(seq.id, None)
             if seq.id in self._backlog_unsent:
                 charge = self._backlog_drop_unsent_locked(seq.id)
             else:
@@ -1665,6 +1669,7 @@ class CoreManager:
             self._backlog_unseen_tokens[dp_rank] += charge
         self._backlog_sent[dp_rank] += len(seqs)
         self._backlog_pop_seen_locked(dp_rank)
+        self._backlog_flush_credit_updates_locked(dp_rank)
 
     def _backlog_pop_seen_locked(self, dp_rank: int) -> None:
         """Drop the sent seqs the rank's last report already counts."""
@@ -1675,7 +1680,97 @@ class CoreManager:
         q = self._backlog_unseen[dp_rank]
         while self._backlog_popped[dp_rank] < target and q:
             self._backlog_unseen_tokens[dp_rank] -= q.popleft()
+            sid = self._backlog_unseen_ids[dp_rank].popleft()
+            self._backlog_reported_credit_tokens[dp_rank] += sum(
+                extra for _, extra in self._backlog_credit_debts.get(sid, ())
+            )
             self._backlog_popped[dp_rank] += 1
+
+    def _backlog_flush_credit_updates_locked(self, rank):
+        updates = [
+            (sid, credit)
+            for sid, (target, credit) in self._backlog_credit_updates.items()
+            if target == rank
+            and sid in self._backlog_sent_ordinals
+            and self._backlog_credit_sent.get(sid) != credit
+        ]
+        if not updates:
+            return
+        try:
+            self._send_request(
+                rank, pickle.dumps((EngineCoreRequestType.DP_PREFIX_CREDIT, updates))
+            )
+        except Exception:
+            logger.exception(
+                "%s: successor credit update retained for retry on rank %d",
+                self.label,
+                rank,
+            )
+            return
+        self._backlog_credit_sent.update(updates)
+
+    def _backlog_add_successor_debt_locked(self, sid, rank, extra, charge):
+        credit = max(0, self._backlog_prompt_tokens[sid] - charge)
+        self._backlog_credit_updates[sid] = (rank, credit)
+        self._backlog_credit_debts.setdefault(sid, []).append((credit, extra))
+        obj = self._backlog_objects.get(sid)
+        if obj is not None:
+            obj.dp_est_cached_tokens = min(obj.dp_est_cached_tokens, credit)
+        if sid in self._backlog_unsent:
+            _, previous = self._backlog_unsent[sid]
+            self._backlog_unsent[sid] = (rank, previous + extra)
+            self._backlog_unsent_tokens[rank] += extra
+        elif sid in self._backlog_sent_ordinals:
+            _, ordinal = self._backlog_sent_ordinals[sid]
+            if ordinal > self._backlog_popped[rank]:
+                offset = ordinal - self._backlog_popped[rank] - 1
+                self._backlog_unseen[rank][offset] += extra
+                self._backlog_unseen_tokens[rank] += extra
+            else:
+                self._backlog_reported_credit_tokens[rank] += extra
+            self._backlog_flush_credit_updates_locked(rank)
+
+    def _backlog_ack_credit_locked(self, rank, updates):
+        for sid, credit in updates:
+            sent = self._backlog_sent_ordinals.get(sid)
+            debts = self._backlog_credit_debts.get(sid, [])
+            last_sent = self._backlog_credit_sent.get(sid)
+            if (
+                sent is None
+                or sent[0] != rank
+                or last_sent is None
+                or credit < last_sent
+                or not any(value == credit for value, _ in debts)
+            ):
+                continue
+            remaining = [(value, extra) for value, extra in debts if value < credit]
+            acknowledged = sum(extra for value, extra in debts if value >= credit)
+            sent = self._backlog_sent_ordinals.get(sid)
+            if (
+                sent is not None
+                and sent[0] == rank
+                and sent[1] <= self._backlog_popped[rank]
+            ):
+                self._backlog_reported_credit_tokens[rank] -= acknowledged
+            if remaining:
+                self._backlog_credit_debts[sid] = remaining
+            else:
+                self._backlog_credit_debts.pop(sid, None)
+            if self._backlog_credit_updates.get(sid) == (rank, credit):
+                self._backlog_credit_updates.pop(sid, None)
+                self._backlog_credit_sent.pop(sid, None)
+
+    def _backlog_forget_credit_locked(self, sid):
+        sent = self._backlog_sent_ordinals.pop(sid, None)
+        debts = self._backlog_credit_debts.pop(sid, ())
+        if sent is not None and sent[1] <= self._backlog_popped[sent[0]]:
+            self._backlog_reported_credit_tokens[sent[0]] -= sum(
+                extra for _, extra in debts
+            )
+        self._backlog_credit_updates.pop(sid, None)
+        self._backlog_credit_sent.pop(sid, None)
+        self._backlog_prompt_tokens.pop(sid, None)
+        self._backlog_objects.pop(sid, None)
 
     def _note_dp_reuse_locked(self, reports) -> None:
         """A rank's (seq id, prompt tokens reused) reports for requests placed
@@ -1701,6 +1796,7 @@ class CoreManager:
                     int(report[1])
                     + self._backlog_unseen_tokens[r]
                     + self._backlog_unsent_tokens[r]
+                    + self._backlog_reported_credit_tokens[r]
                 )
         return out
 
@@ -1861,6 +1957,7 @@ class CoreManager:
         """``_release_load`` for a caller that already holds ``_lb_lock``."""
         if self._store_router is not None:
             self._backlog_drop_unsent_locked(seq_id)
+            self._backlog_forget_credit_locked(seq_id)
         entry = self._seq_load.pop(seq_id, None)
         if entry is None:
             return
@@ -1890,6 +1987,10 @@ class CoreManager:
                 rank, req_cost, tok_cost = successor_load
                 self._rank_tokens[rank] += extra
                 self._seq_load[successor] = (rank, req_cost, tok_cost + extra)
+                if self._store_router is not None:
+                    self._backlog_add_successor_debt_locked(
+                        successor, rank, extra, tok_cost + extra
+                    )
 
     def _release_terminal_seq(self, seq) -> None:
         """Release a returned sequence using its completed-forward fact,
@@ -1912,6 +2013,9 @@ class CoreManager:
                 return
         with self._lb_lock:
             policy.prefill_complete(seq_id)
+            if self._store_router is not None:
+                self._backlog_drop_unsent_locked(seq_id)
+                self._backlog_forget_credit_locked(seq_id)
             entry = self._seq_load.get(seq_id)
             if entry is None:
                 return
@@ -1967,9 +2071,17 @@ class CoreManager:
             for r in range(len(self._backlog_unseen)):
                 self._backlog_popped[r] += len(self._backlog_unseen[r])
                 self._backlog_unseen[r].clear()
+                self._backlog_unseen_ids[r].clear()
+                self._backlog_reported_credit_tokens[r] = 0
                 self._backlog_unseen_tokens[r] = 0
                 self._backlog_unsent_tokens[r] = 0
             self._backlog_unsent.clear()
+            self._backlog_objects.clear()
+            self._backlog_prompt_tokens.clear()
+            self._backlog_sent_ordinals.clear()
+            self._backlog_credit_updates.clear()
+            self._backlog_credit_sent.clear()
+            self._backlog_credit_debts.clear()
 
     def send_utility_command(self, cmd: str, dp_rank: int | None = None):
         self._refuse_unowned_weight_sync_cmd(cmd, None)

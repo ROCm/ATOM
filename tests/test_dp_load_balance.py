@@ -10,6 +10,7 @@
 # conftest.py supplies the atom.* / zmq stubs the import chain needs.
 
 import pickle
+from collections import deque
 from threading import Event, Lock, Thread
 
 import pytest
@@ -76,6 +77,16 @@ def _make_mgr(
     mgr._backlog_unsent = {}
     mgr._backlog_unsent_tokens = [0] * n_ranks
     mgr._backlog_popped = [0] * n_ranks
+    mgr._backlog_report = [None] * n_ranks
+    mgr._backlog_sent = [0] * n_ranks
+    mgr._backlog_unseen_ids = [deque() for _ in range(n_ranks)]
+    mgr._backlog_objects = {}
+    mgr._backlog_prompt_tokens = {}
+    mgr._backlog_sent_ordinals = {}
+    mgr._backlog_credit_updates = {}
+    mgr._backlog_credit_sent = {}
+    mgr._backlog_credit_debts = {}
+    mgr._backlog_reported_credit_tokens = [0] * n_ranks
     return mgr
 
 
@@ -2352,6 +2363,7 @@ def test_share_cache_completed_hit_is_not_a_producing_source():
     completed = router.select(_chain_seq(23, 768), [0, 0], [0, 0])
     assert completed.credit > 0
     assert completed.decision == "share_cache_hit_total"
+
 
 # ── Prefix-spread index counters (trim / evict) ────────────────────
 

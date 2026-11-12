@@ -5,6 +5,9 @@
 
 from __future__ import annotations
 
+from atom.kv_transfer.offload.lookup_client import as_lookup_client
+
+
 import logging
 import time
 
@@ -89,7 +92,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             chunk_size,
             minimum=1,
         )
-        self._lookup_client = lookup_client
+        self._lookup_client = as_lookup_client(lookup_client)
 
         # Optional veto on how far a reported hit may reach, installed by a
         # hybrid connector. A model whose recurrent state must be restored
@@ -400,8 +403,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             ):
                 self._perf_bump("detached_floor_lowered")
 
-        pending_ids = getattr(client, "pending_ids", None)
-        in_flight = pending_ids() if callable(pending_ids) else ()
+        in_flight = client.pending_ids() if client is not None else ()
         for sid, seq in list(detached.items()):
             if sid not in in_flight:
                 del detached[sid]
@@ -444,7 +446,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         ordinary synchronous lookup waits for the answer.
         """
         client = self._lookup_client
-        if getattr(client, "is_pending", None) is None:
+        if client is None:
             return False
         sid = str(seq.id)
         if not client.is_pending(sid) or client.poll(sid):
@@ -489,19 +491,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         if held is not None:
             return held[0] is seq
         client = self._lookup_client
-        answered = getattr(client, "answered", None)
-        if callable(answered):
-            return bool(answered(sid))
-        is_pending = getattr(client, "is_pending", None)
-        pending_ids = getattr(client, "pending_ids", None)
-        if not callable(is_pending) or not callable(pending_ids):
-            return False
-        if sid not in pending_ids():
-            return False
-        # A client that keeps an answered lookup listed as pending until it is
-        # taken (the Mooncake Store's `AsyncStoreLookup`) says so through a
-        # side-effect-free `answered`; `poll` may advance other clients.
-        return not is_pending(sid)
+        return client is not None and bool(client.answered(sid))
 
     def cancel_preadmission(self, seq) -> None:
         """Forget an admission the scheduler takes back before any dispatch.
@@ -896,9 +886,8 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         unbounded, and its save floor stays at the HBM prefix even where the
         tier no longer holds it.
         """
-        pump = getattr(self._lookup_client, "pump", None)
-        if callable(pump):
-            pump()
+        if self._lookup_client is not None:
+            self._lookup_client.pump()
         self.reconcile_detached_lookups()
 
     def build_connector_meta(self) -> LMCacheOffloadMetadata:
@@ -920,7 +909,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                     getattr(ls, "can_load", None),
                 )
                 continue
-            # ★ Use the REAL HBM-cached count as the load floor.
+            # â˜… Use the REAL HBM-cached count as the load floor.
             # get_num_new_matched_tokens runs BEFORE the prefix-cache match in
             # block_manager.allocate, so seq.num_cached_tokens was stale (often
             # 0) when the LoadSpec was recorded. By now (post-allocate) it is the

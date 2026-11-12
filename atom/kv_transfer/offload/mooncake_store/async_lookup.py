@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+
 """Bounded arrival-time Store lookups, without blocking the scheduler thread.
 
 Only completed Store answers are cached, scoped to one request lifecycle.
@@ -16,6 +17,8 @@ from collections import OrderedDict
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FutureTimeout
 from threading import Lock, RLock
+
+from atom.kv_transfer.offload.lookup_client import LookupClient, as_lookup_client
 
 logger = logging.getLogger("atom")
 
@@ -93,9 +96,9 @@ class DaemonExecutor:
         self._queue.put(None)
 
 
-class AsyncStoreLookup:
+class AsyncStoreLookup(LookupClient):
     def __init__(self, backend, capacity=4096):
-        self.backend = backend
+        self.backend = as_lookup_client(backend)
         self.capacity = capacity
         self.lock = RLock()
         self.executor = DaemonExecutor("store-query", limit=capacity)
@@ -264,6 +267,5 @@ class AsyncStoreLookup:
         self.executor.shutdown()
         self.renew_executor.shutdown()
         # And the backend's own workers (the Store's per-pool lookups).
-        close = getattr(self.backend, "close", None)
-        if callable(close):
-            close()
+        if self.backend is not None:
+            self.backend.close()

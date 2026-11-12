@@ -5,6 +5,9 @@
 
 from __future__ import annotations
 
+from atom.kv_transfer.offload.lookup_client import LookupClient
+
+
 import functools
 import logging
 import threading
@@ -68,7 +71,7 @@ class _LookupState:
     retrieve_end: int | None = None
 
 
-class _MPLookupClient:
+class _MPLookupClient(LookupClient):
     """Synchronous lookup facade used by ATOM's existing scheduler policy."""
 
     token_database = None
