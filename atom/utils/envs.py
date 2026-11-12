@@ -650,6 +650,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # DSpark, ...: `mono/hi_gate.py`), any other keeps ATOM's mono path; "1":
     # on, or an error naming why not; "0": off.
     "ATOM_DSV41_MONO_HI": lambda: os.getenv("ATOM_DSV41_MONO_HI", "auto"),
+    # Experimental MiniMax-M3 prefill token graphs at `ATOM_TOKEN_GRAPH_SIZES`.
+    # The attention builder refuses DP/PP/PCP, EP, TBO and plugin mode, and a
+    # prefill carrying images stays eager; either way the eager path is unchanged.
+    "ATOM_MINIMAX_M3_PREFILL_TOKEN_GRAPH": lambda: _flag_env(
+        "ATOM_MINIMAX_M3_PREFILL_TOKEN_GRAPH"
+    ),
     # Token-bucket TR graphs for prefill (`atom/utils/region_graph.py`): the
     # comma-separated token counts to record. A prefill longer than the largest
     # runs eagerly; empty records none. The default tops out at 3072 because
