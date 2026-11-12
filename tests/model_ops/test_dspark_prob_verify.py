@@ -1,9 +1,14 @@
 # SPDX-License-Identifier: MIT
 """Self-consistency of the probabilistic verification's variants.
 
-`prob_rejection_sample` can read the target rows of the full logits in place
-(`in_place=True`) instead of a compacted copy of them; on the same inputs it
-must give the same tokens and verdict either way.
+On the same inputs `prob_rejection_sample` must give the same tokens and
+verdict
+
+- reading the target rows of the full logits in place (`in_place=True`) as
+  reading a compacted copy of them;
+- over several vocab chunks as over a single chunk (cross-chunk combine);
+- splitting an overflowing top-p interval over the whole row as finishing it
+  from the chunked levels, including an interval of tied tokens.
 
 Needs a GPU, or TRITON_INTERPRET=1 (then runs on the CPU).
 """
@@ -13,7 +18,7 @@ import os
 import pytest
 
 torch = pytest.importorskip("torch")
-pytest.importorskip("triton")
+triton = pytest.importorskip("triton")
 if torch.cuda.is_available():
     DEV = "cuda"
 elif os.environ.get("TRITON_INTERPRET") == "1":
@@ -157,22 +162,31 @@ def test_vocab_chunks_match_a_single_chunk(
 ):
     c = _case(seed, greedy, no_q)
     split = _verify(c, top_p, use_block)
-    assert triton_cdiv(V, dps._CHUNK) > 2
+    assert triton.cdiv(V, dps._CHUNK) > 2
     monkeypatch.setattr(dps, "_CHUNK", 4 * dps._CHUNK)  # one chunk per row
     _assert_same(split, _verify(c, top_p, use_block))
 
 
 @pytest.mark.parametrize("seed,top_p,use_block,greedy,no_q", CASES[1:3] + CASES[4:])
-def test_per_row_top_p_fallback_matches_split_search(
+def test_whole_row_top_p_splits_match_chunked_search(
     monkeypatch, seed, top_p, use_block, greedy, no_q
 ):
     c = _case(seed, greedy, no_q)
-    split = _verify(c, top_p, use_block)
-    # A tiny compaction buffer: every top-p row overflows its final interval
-    # and takes the per-row search instead.
+    chunked = _verify(c, top_p, use_block)
+    # A tiny compaction buffer: every top-p interval overflows the chunked
+    # levels and keeps splitting over the whole row until it fits.
     monkeypatch.setattr(dps, "_TOPP_RB", 16)
-    _assert_same(split, _verify(c, top_p, use_block))
+    _assert_same(chunked, _verify(c, top_p, use_block))
 
 
-def triton_cdiv(a, b):
-    return -(-a // b)
+@pytest.mark.parametrize("use_block", [False, True])
+def test_tied_cutoff_interval_is_kept_whole(monkeypatch, use_block):
+    # Logits on a coarse grid: the cutoff falls inside many exactly
+    # tied tokens, which no split separates. They are kept whole, as the
+    # bisection keeps a tie at the boundary.
+    c = _case(7)
+    c["full"] = torch.round(c["full"] * 2.0) / 2.0
+    top_p = torch.tensor(PER_ROW_TOP_P)
+    default = _verify(c, top_p, use_block)
+    monkeypatch.setattr(dps, "_TOPP_RB", 16)
+    _assert_same(default, _verify(c, top_p, use_block))
