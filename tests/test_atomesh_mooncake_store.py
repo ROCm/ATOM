@@ -855,8 +855,8 @@ stop_mooncake_store
 
     def test_the_prefill_node_stops_waiting_once_the_decode_node_failed(self):
         # The decode node's owners failed to mount and its launcher exited 1:
-        # the prefill node fails within seconds rather than at its 60 s wait,
-        # and a node that exited 0, or its own rank's file, does not stop it.
+        # the prefill node fails within seconds rather than when its wait times
+        # out, and a node that exited 0, or its own rank's file, does not stop it.
         run_dir = self.root / "run"
         run_dir.mkdir()
         (run_dir / "rank-rc-0").write_text("1\n")
