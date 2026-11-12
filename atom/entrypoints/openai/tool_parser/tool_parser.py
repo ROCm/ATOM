@@ -383,7 +383,7 @@ class ToolCallParser(ABC):
         """Declare a Lark (llguidance) grammar for the rest of the assistant
         message as a `ToolGrammarRule`, or None to leave the output
         unconstrained. Arguments are those of `tool_call_grammar`."""
-        return None
+        return
 
     @classmethod
     def tool_call_grammar(cls, functions, *, required, starts_in_reasoning):
