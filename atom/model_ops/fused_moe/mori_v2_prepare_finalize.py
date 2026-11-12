@@ -692,9 +692,12 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
         **kwargs,
     ) -> torch.Tensor:
         """``shared_add``, the shared expert's output handed down by
-        ``FusedMoE.forward_maybe_comm_fused``, is added to the result by
-        MegaMoE's combine; ``shared_ready``, recorded on the stream that
-        produced it, is waited on right before the combine."""
+        ``FusedMoE.forward_maybe_comm_fused``, is added to the routed result;
+        ``shared_ready``, recorded on the stream that produced it, comes with
+        it and is waited on before the add. MegaMoE's own forward does both
+        inside its combine. The ``triton_mega_moe`` branch drives MegaMoE's
+        internals rather than its forward, so there the wait and the add both
+        happen after the combine."""
         # Bound in init_prepare_finalize; there is no path without it.
         mega = self.prepare_finalize.mega
         assert mega is not None, "MegaMoE was not bound"
@@ -780,9 +783,9 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
             if shared_add is None:
                 return out
             # triton_mega_moe drives MegaMoE's internals, not its forward, so the
-            # shared output is added after its combine.
-            if shared_ready is not None:
-                torch.cuda.current_stream().wait_event(shared_ready)
+            # shared output is added after its combine. The caller always sends
+            # the event with the output, so the wait is unconditional.
+            torch.cuda.current_stream().wait_event(shared_ready)
             return out + shared_add
 
         assert not kwargs.get(
