@@ -1349,8 +1349,13 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         # The selection's block-table shape follows the KV layout: one page-128 page a
         # block for MXFP4 KV, the page-16 SHUFFLE defaults otherwise.
         self._select_page_kwargs = {}
+        # The pool layout of this impl's pages; the KV builder reads it, None = SHUFFLE.
+        self.kv_layout = None
         if self.kv_cache_dtype == "fp4":
+            from atom.model_ops.minimax_m3.mxfp4_pages import Mxfp4KvLayout
             from atom.model_ops.minimax_m3.sparse_attn_mxfp4 import sparse_pa_mxfp4
+
+            self.kv_layout = Mxfp4KvLayout()
 
             # here, not per call: it needs FlyDSL, which other caches / families lack
             self._sparse_pa_mxfp4 = sparse_pa_mxfp4

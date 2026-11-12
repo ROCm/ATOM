@@ -420,14 +420,8 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             and hasattr(module, "use_mla")
             and not module.use_mla
         ):
-            layout = None
-            if (
-                _is_indexed_sparse_attention(module)
-                and self.model_runner.config.kv_cache_dtype == "fp4"
-            ):
-                from atom.model_ops.minimax_m3.mxfp4_pages import Mxfp4KvLayout
-
-                layout = Mxfp4KvLayout()
+            # the impl declares how its pages are laid out; None is SHUFFLE
+            layout = getattr(getattr(module, "impl", None), "kv_layout", None)
             kinds.append(KvGeometry(module.num_kv_heads, module.head_dim, layout))
         return tuple(kinds)
 
