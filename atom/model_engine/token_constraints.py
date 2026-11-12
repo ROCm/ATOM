@@ -11,6 +11,8 @@ token copies. Neither backend is converted to a Python list of vocabulary IDs.
 
 import torch
 
+from atom.constraint_parser import ConstraintBinding
+
 from atom.model_ops.required_channel import (
     DeviceChannel,
     advance_states,
@@ -18,10 +20,59 @@ from atom.model_ops.required_channel import (
 )
 
 
+_PROVIDERS = []
+
+
+def register_constraint_provider(provider):
+    """Register an adapter in mask order, without changing the executor.
+
+    Adapters own native field interpretation and resource lifecycle. The
+    executor only binds, prepares, applies and commits accepted token output.
+    """
+    if any(existing.backend == provider.backend for existing in _PROVIDERS):
+        raise ValueError(f"Duplicate constraint backend: {provider.backend}")
+    _PROVIDERS.append(provider)
+
+
+def has_constraints(batch):
+    """Query adapters without creating bindings, instances or GPU work."""
+    return batch is not None and any(provider.enabled(batch) for provider in _PROVIDERS)
+
+
+def needs_constraint_snapshot(batch, metadata):
+    return any(provider.enabled(batch) and provider.masks_source(metadata)
+               for provider in _PROVIDERS)
+
+
+def _bindings(batch):
+    for provider in _PROVIDERS:
+        binding = provider.bind(batch)
+        if binding is not None:
+            yield provider, binding
+
+
 def prepare_token_constraints(runner, batch, metadata):
-    """After deferred input assembly, before forward: overlap grammar D2H."""
-    if getattr(batch, "structured_requests", None):
-        GrammarProvider.prepare(runner, batch, metadata)
+    """After deferred input assembly, before forward: overlap backend work."""
+    for provider, binding in _bindings(batch):
+        provider.prepare(runner, batch, metadata, binding)
+
+
+def release_token_constraints(runner, request_ids):
+    """Release per-request backend resources through the same adapter contract."""
+    for provider in _PROVIDERS:
+        provider.release(runner, request_ids)
+
+
+def constraint_errors(runner):
+    errors = None
+    for provider in _PROVIDERS:
+        collect = getattr(provider, "errors", None)
+        current = collect(runner) if collect is not None else None
+        if current is not None:
+            if errors is None:
+                errors = {}
+            errors.update(current)
+    return errors
 
 
 def apply_required_channel(runner, batch, logits, metadata=None, target=None, preserve_masks=False):
@@ -63,9 +114,9 @@ class TokenConstraints:
 
     @classmethod
     def apply(cls, runner, batch, logits, metadata):
-        requests = getattr(batch, "structured_requests", None)
-        if not requests and batch.required_channel is None:
+        if not has_constraints(batch):
             return None
+        bindings = tuple(_bindings(batch))
         step = cls()
         step.runner, step.batch, step.metadata = runner, batch, metadata
         step.source = logits
@@ -74,21 +125,17 @@ class TokenConstraints:
         step.prefixes = {}
         step.channel = None
         step.invalid = step.target_invalid = None
-        step.providers = []
-        if requests:
-            step.providers.append(GrammarProvider())
-        if batch.required_channel is not None:
-            step.providers.append(ChannelProvider())
-        for provider in step.providers:
-            provider.apply(step)
+        step.providers = bindings
+        for provider, binding in step.providers:
+            provider.apply(step, binding)
         step.gather()
         return step
 
     def commit(self, sampled_tokens, batch, deferred, failure):
         """Consume synchronized, accepted IDs, never unverified draft IDs."""
         channel_states = None
-        for provider in self.providers:
-            result = provider.commit(self, sampled_tokens, batch, deferred, failure)
+        for provider, binding in reversed(self.providers):
+            result = provider.commit(self, sampled_tokens, batch, deferred, failure, binding)
             if result is not None:
                 channel_states = result
         return channel_states
@@ -124,11 +171,38 @@ class TokenConstraints:
 
 
 class GrammarProvider:
+    backend = "grammar"
+
     @staticmethod
-    def prepare(runner, batch, metadata):
+    def enabled(batch):
+        return bool(getattr(batch, "structured_requests", None))
+
+    @staticmethod
+    def masks_source(metadata):
+        return True
+
+    @staticmethod
+    def bind(batch):
+        requests = getattr(batch, "structured_requests", None)
+        return ConstraintBinding("grammar", requests) if requests else None
+
+    @staticmethod
+    def prepare(runner, batch, metadata, binding):
         runner.structured_output.prepare(batch, metadata)
 
-    def apply(self, step):
+    @staticmethod
+    def errors(runner):
+        grammar = getattr(runner, "structured_output", None)
+        return grammar.errors if grammar is not None else None
+
+    @staticmethod
+    def release(runner, request_ids):
+        grammar = getattr(runner, "structured_output", None)
+        if grammar is not None:
+            grammar.release(request_ids)
+
+    @staticmethod
+    def apply(step, binding):
         step.grammar = getattr(step.runner, "structured_output", None)
         if step.grammar is None:
             raise ValueError("Structured output must be prepared before enqueue")
@@ -136,14 +210,42 @@ class GrammarProvider:
             raise ValueError("Target logits do not match the prepared structured vocabulary")
         step.prefixes = step.grammar.apply(step.source, step.batch, step.metadata)
 
-    def commit(self, step, tokens, batch, deferred, failure):
+    @staticmethod
+    def commit(step, tokens, batch, deferred, failure, binding):
         if step.prefixes:
             step.grammar.commit(tokens if failure is None else _error_tokens(tokens, failure),
                                 batch, step.prefixes)
 
 
 class ChannelProvider:
-    def apply(self, step):
+    backend = "channel"
+
+    @staticmethod
+    def enabled(batch):
+        return getattr(batch, "required_channel", None) is not None
+
+    @staticmethod
+    def masks_source(metadata):
+        return metadata is None
+
+    @staticmethod
+    def bind(batch):
+        channel = getattr(batch, "required_channel", None)
+        return ConstraintBinding("channel", channel) if channel is not None else None
+
+    @staticmethod
+    def prepare(runner, batch, metadata, binding):
+        # Channel state is assembled with the batch and carried on the GPU.
+        pass
+
+    @staticmethod
+    def release(runner, request_ids):
+        # Immutable device tables are server-wide; request carry belongs to
+        # tokenIDProcessor and follows its existing batch/output lifetime.
+        pass
+
+    @staticmethod
+    def apply(step, binding):
         step.gather()
         requests = getattr(step.batch, "structured_requests", None)
         preserve = False
@@ -163,7 +265,8 @@ class ChannelProvider:
                                                 output_size=step.target.shape[0])
                 step.target_invalid = _guard_empty_rows(step.target, owners)
 
-    def commit(self, step, tokens, batch, deferred, failure):
+    @staticmethod
+    def commit(step, tokens, batch, deferred, failure, binding):
         if step.channel is not None and deferred:
             return advance_states(*step.channel, tokens)
 
@@ -186,3 +289,7 @@ def _guard_empty_rows(logits, selected=None):
 def _error_tokens(tokens, failure):
     mask = failure if tokens.ndim == 1 else failure[:, None]
     return tokens.masked_fill(mask, -2)
+
+
+register_constraint_provider(GrammarProvider)
+register_constraint_provider(ChannelProvider)

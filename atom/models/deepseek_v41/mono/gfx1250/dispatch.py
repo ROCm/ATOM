@@ -16,6 +16,7 @@ from atom.models.deepseek_v41.mono.gfx1250 import refusal
 from atom.models.deepseek_v41.mono.gfx1250.config import MAX_ROWS, ROWS_PER_REQ
 from atom.models.deepseek_v41.mono.gfx1250.debug import CheckModel
 from atom.mono.runtime.route import LazyRunner
+from atom.model_engine.token_constraints import has_constraints
 from atom.mono.runtime.step_override import StepOverrideModel
 from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
@@ -111,9 +112,8 @@ class SingleStepModel(CheckModel, StepOverrideModel, nn.Module):
         if envs.ATOM_MONO_CHECK:  # the production path serves, the launch only compares
             return None
         if batch is not None and (
-            getattr(batch, "structured_requests", None)
+            has_constraints(batch)
             or batch.any_logprobs
-            or getattr(batch, "required_channel", None) is not None
         ):
             return None
         fc = get_forward_context()

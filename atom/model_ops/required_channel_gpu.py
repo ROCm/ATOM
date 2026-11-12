@@ -204,7 +204,7 @@ def constrain_logits(
     cu_num_draft_tokens: torch.Tensor | None = None,
     input_ids: torch.Tensor | None = None,
     target_logits_indices: torch.Tensor | None = None,
-    preserve_masks: bool = False,
+    preserve_masks: bool | torch.Tensor = False,
 ) -> torch.Tensor:
     """Mask the step's target rows in place; return each request's base state.
 

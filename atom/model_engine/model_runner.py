@@ -84,6 +84,10 @@ from atom.model_engine.state_runtime import StateRuntime
 from atom.model_engine.token_constraints import (
     TokenConstraints,
     prepare_token_constraints,
+    release_token_constraints,
+    has_constraints,
+    needs_constraint_snapshot,
+    constraint_errors,
 )
 from atom.model_engine.token_logprobs import (
     LogprobRows,
@@ -3462,8 +3466,7 @@ class ModelRunner:
             or batch is None
             or getattr(self, "rejection_sampler", None) is None
             or batch.any_logprobs
-            or getattr(batch, "structured_requests", None)
-            or batch.required_channel is not None
+            or has_constraints(batch)
             or RELAXED_TOP_N > 1
             or get_pcp_world_size() > 1
         ):
@@ -3494,8 +3497,7 @@ class ModelRunner:
         return True
 
     def release_structured_requests(self, request_ids):
-        if self.structured_output is not None:
-            self.structured_output.release(request_ids)
+        release_token_constraints(self, request_ids)
 
     def prepare_structured_output(
         self,
@@ -3538,12 +3540,7 @@ class ModelRunner:
         logprob_rows = None
         if need_logprobs:
             logprob_rows = batch.logprob_rows
-        structured = getattr(self, "structured_output", None)
-        structured_requests = getattr(batch, "structured_requests", None)
-        if need_logprobs and (
-            structured_requests
-            or (spec_decode_metadata is None and (batch.required_channel is not None))
-        ):
+        if need_logprobs and needs_constraint_snapshot(batch, spec_decode_metadata):
             logprob_snapshot = capture_token_logits(
                 logits, batch, spec_decode_metadata, rows=logprob_rows
             )
@@ -3712,11 +3709,11 @@ class ModelRunner:
             channel_states=channel_states,
             constraint_failed=constraint_failed,
         )
-        output_errors = dict(structured.errors) if structured is not None else None
+        output_errors = constraint_errors(self)
         # Read only the output already delivered by the existing D2H pipeline.
         # Keep safe sampled IDs for GPU carry; never feed the error sentinel back.
         delivered = prev_batch if self.tokenID_processor.is_deferred_out else batch
-        if delivered is not None and (getattr(delivered, "structured_requests", None)):
+        if has_constraints(delivered):
             for req_id, ids in tuple(token_id_dict.items()):
                 if -2 in ids:
                     if output_errors is None:

@@ -30,6 +30,17 @@ class ToolGrammarRule:
     starts_in_reasoning: bool
 
 
+@dataclass(frozen=True)
+class ConstraintBinding:
+    """A native rule value tagged for its execution adapter.
+
+    Bindings are rebuilt at the engine boundary; provider objects never cross
+    sequence IPC and do not replace native RequiredChannel/grammar objects.
+    """
+    backend: str
+    value: object
+
+
 class ConstraintParser:
     """Compile format declarations through one public interface.
 
@@ -37,44 +48,75 @@ class ConstraintParser:
     grammar rules. Each keeps its native representation and execution backend.
     """
 
+    _adapters = {}
+
     @classmethod
-    def parse(cls, rule, adapter):
+    def register(cls, rule_type, backend, adapter):
+        if rule_type in cls._adapters:
+            raise ValueError(f"Duplicate constraint rule: {rule_type.__name__}")
+        cls._adapters[rule_type] = (backend, adapter)
+
+    @classmethod
+    def parse(cls, rule, context):
         if rule is None:
             return None
-        if isinstance(rule, ToolGrammarRule):
-            return rule.builder(rule.functions, required=rule.required,
-                                starts_in_reasoning=rule.starts_in_reasoning)
-        if isinstance(rule, GrammarRule):
-            return adapter.compile_json_schema(
-                rule.schema, rule.tool_format, rule.reasoning_end
-            )
-        if not isinstance(rule, ChannelRule):
-            raise TypeError(f"Unsupported constraint rule: {type(rule).__name__}")
-        from atom.sampling_params import RequiredChannel
+        try:
+            _, adapter = cls._adapters[type(rule)]
+        except KeyError:
+            raise TypeError(f"Unsupported constraint rule: {type(rule).__name__}") from None
+        return adapter(rule, context)
 
-        def ids(text):
-            return tuple(adapter.encode(text, add_special_tokens=False))
-
-        def unheld(reason):
-            logging.getLogger("atom").warning(
-                '%s tool calls: %s, so tool_choice="required" will not '
-                "hold output to the tools channel on this server.",
-                rule.label,
-                reason,
-            )
-
-        split = [c for c in rule.controls if len(ids(c)) != 1]
-        if split:
-            unheld(f"this tokenizer splits {', '.join(split)} into several ids")
+    @classmethod
+    def bind(cls, rule, context):
+        if rule is None:
             return None
-        start, opening = ids(rule.channel_start), ids(rule.opening)
-        if opening[: len(start)] != start:
-            unheld(
-                f"this tokenizer does not encode {rule.channel_start!r} at the "
-                "head of the forced opening as it encodes it alone"
-            )
+        value = cls.parse(rule, context)
+        if value is None:
             return None
-        return RequiredChannel(
-            after=ids(rule.after), opening=opening,
-            opens_at=len(start), end_ids=ids(rule.end),
+        backend, _ = cls._adapters[type(rule)]
+        return ConstraintBinding(backend, value)
+
+
+def _parse_grammar(rule, adapter):
+    return adapter.compile_json_schema(rule.schema, rule.tool_format, rule.reasoning_end)
+
+
+def _parse_tool_grammar(rule, adapter):
+    return rule.builder(rule.functions, required=rule.required,
+                        starts_in_reasoning=rule.starts_in_reasoning)
+
+
+def _parse_channel(rule, adapter):
+    from atom.sampling_params import RequiredChannel
+
+    def ids(text):
+        return tuple(adapter.encode(text, add_special_tokens=False))
+
+    def unheld(reason):
+        logging.getLogger("atom").warning(
+            '%s tool calls: %s, so tool_choice="required" will not '
+            "hold output to the tools channel on this server.",
+            rule.label,
+            reason,
         )
+
+    split = [c for c in rule.controls if len(ids(c)) != 1]
+    if split:
+        unheld(f"this tokenizer splits {', '.join(split)} into several ids")
+        return None
+    start, opening = ids(rule.channel_start), ids(rule.opening)
+    if opening[: len(start)] != start:
+        unheld(
+            f"this tokenizer does not encode {rule.channel_start!r} at the "
+            "head of the forced opening as it encodes it alone"
+        )
+        return None
+    return RequiredChannel(
+        after=ids(rule.after), opening=opening,
+        opens_at=len(start), end_ids=ids(rule.end),
+    )
+
+
+ConstraintParser.register(ChannelRule, "channel", _parse_channel)
+ConstraintParser.register(GrammarRule, "grammar", _parse_grammar)
+ConstraintParser.register(ToolGrammarRule, "grammar-format", _parse_tool_grammar)
