@@ -290,8 +290,8 @@ _MLA_DCP_KERNEL_WIDTHS = (16, 32, 64, 128)
 # Widest gathered query aiter has any MLA decode dispatch for; past it
 # mla_decode_fwd asserts rather than falling back to anything.
 #
-# A persistent decode reaches every multiple of 16 up to that: the widths
-# without a dedicated kernel (48, 80, 96, 112) fold onto the 16-head one, which
+# A persistent decode reaches every multiple of 16 up to that: the fp8 widths
+# without a dedicated kernel (48, 80, 112) fold onto the 16-head one, which
 # reinterprets head groups as extra sequence rows and rebuilds qo_indptr and the
 # kv indptrs to match, so the round-robin mask survives it. A NON-persistent one
 # does not -- aiter's fold is guarded on persistent mode -- so it stays on the
@@ -301,11 +301,11 @@ _MLA_DCP_MAX_KERNEL_HEADS = 128
 _MLA_DCP_KERNEL_WIDTHS_NON_PERSISTENT = (16, 32, 128)
 _MLA_DCP_KERNEL_WIDTHS_NON_PERSISTENT_FP8 = (16, 128)
 _MLA_DCP_SPARSE_PREFILL_WIDTHS = (16, 128)
-# Same widths as decode's persistent table today (both dispatch on aiter's
-# persistent kernel set), but a separate tuple on purpose: aliasing the two
-# would let a decode-only change to _MLA_DCP_KERNEL_WIDTHS silently repoint
-# sparse prefill's gathered pad width too.
-_MLA_DCP_SPARSE_PREFILL_WIDTHS_PERSISTENT = (16, 32, 64, 128)
+# A separate tuple from decode's on purpose: aliasing the two would let a
+# decode-only change to _MLA_DCP_KERNEL_WIDTHS silently repoint sparse
+# prefill's gathered pad width too. 96 is aiter's native gqa96 kernel for fp8
+# and bf16, not a fold, so 12 heads x DCP8 runs unpadded.
+_MLA_DCP_SPARSE_PREFILL_WIDTHS_PERSISTENT = (16, 32, 64, 96, 128)
 
 _dcp_kernel_width_warned = False
 _dcp_sparse_prefill_width_warned = False

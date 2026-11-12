@@ -1253,7 +1253,7 @@ def test_mlaattention_init_actually_calls_qrep_enabled_for_layer():
 
 @needs_gpu
 @pytest.mark.parametrize(
-    "world,decode_heads,prefill_heads", [(2, 32, 32), (4, 48, 64), (8, 96, 128)]
+    "world,decode_heads,prefill_heads", [(2, 32, 32), (4, 48, 64), (8, 96, 96)]
 )
 @pytest.mark.parametrize("cache_dtype", ["bf16", "fp8"])
 def test_sparse_prefill_builder_allocates_for_its_consumer(
@@ -1422,19 +1422,23 @@ def test_rebuild_sparse_dcp_persistent_metadata_call_sites_use_their_own_width()
 @needs_dcp_ops
 def test_dcp_kernel_and_sparse_prefill_num_heads_can_diverge():
     """Demonstrates the gap the test above guards against is real, not just
-    hypothetical: at this head count the two width tables actually disagree.
+    hypothetical: at 12 heads x DCP4 the two width tables actually disagree.
+    At DCP8 both run aiter's native gqa96 kernel, unpadded.
     """
-    decode_width = mla_dcp_kernel_num_heads(
-        12, 8, kv_cache_dtype="bf16", persistent=True
+    widths = {
+        dcp: (
+            mla_dcp_kernel_num_heads(12, dcp, kv_cache_dtype="bf16", persistent=True),
+            mla_dcp_sparse_prefill_num_heads(12, dcp, persistent=True),
+        )
+        for dcp in (4, 8)
+    }
+    assert widths == {4: (48, 64), 8: (96, 96)}, (
+        "expected decode's and sparse prefill's width tables to disagree at "
+        f"DCP4 and agree on 96 at DCP8; got {widths} -- if DCP4 now agrees, "
+        "the case above no longer proves the two call sites must use their "
+        "own width, pick another num_heads/dcp pair that still diverges"
     )
-    prefill_width = mla_dcp_sparse_prefill_num_heads(12, 8, persistent=True)
-    assert (decode_width, prefill_width) == (96, 128), (
-        "expected decode's and sparse prefill's width tables to disagree "
-        f"here; got decode={decode_width}, prefill={prefill_width} -- if "
-        "they now agree, the case above no longer proves the two call sites "
-        "must use their own width, pick another num_heads/dcp pair that "
-        "still diverges"
-    )
+    assert mla_dcp_sparse_prefill_num_heads(12, 8, persistent=False) == 128
 
 
 # ──────────────── QREP wiring at the q_proj producers (CPU, source-level) ──
