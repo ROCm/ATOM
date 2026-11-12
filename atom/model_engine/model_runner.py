@@ -3662,9 +3662,11 @@ class ModelRunner:
 
             bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
             # The probability-ratio verification reads the target rows of
-            # `logits` in place (`_prob_verify`); every other reader (the
-            # channel mask, the rejection sampler and its verification draw)
-            # takes them compacted.
+            # `logits` in place (`_prob_verify`), except when the batch has a
+            # required channel: the channel mask writes into the compacted
+            # target rows, so the verification then reads that masked copy.
+            # Every other reader (the rejection sampler and its verification
+            # draw) takes the rows compacted.
             in_place = prob_src is not None and batch.required_channel is None
             target_logits = (
                 None
