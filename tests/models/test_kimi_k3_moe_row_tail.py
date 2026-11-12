@@ -16,6 +16,7 @@ pytest.importorskip("aiter", reason="atom.models.kimi_k3.model imports aiter")
 from atom.model_ops import module_dispatch_ops
 from atom.models import qwen4_exp
 from atom.models.kimi_k3 import model as kimi
+from atom.utils.tbo import ubatching
 
 WORLD, HIDDEN, LATENT, EXPERTS = 8, 16, 8, 4
 
@@ -105,6 +106,7 @@ def stub_block_parts(monkeypatch):
     )
     monkeypatch.setattr(kimi, "get_current_atom_config", lambda: config)
     monkeypatch.setattr(module_dispatch_ops, "get_current_atom_config", lambda: config)
+    return config
 
 
 def _weights():
@@ -191,17 +193,22 @@ def test_row_sharded_pair_sums_to_the_base_pair(ranks, monkeypatch, tokens):
         torch.testing.assert_close(summed, expected)
 
 
-def test_forward_with_dual_stream_off_takes_the_row_sharded_tail(ranks, monkeypatch):
-    """A threshold of 0 turns dual-stream off; the block still goes through
-    the split op, whose single-stream target shards the tail."""
-    monkeypatch.setenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "0")
-    # The op is registered for CUDA only; call its Python body on CPU tensors.
+@pytest.fixture
+def split_op_on_cpu(monkeypatch):
+    """The op is registered for CUDA only; call its Python body on CPU tensors."""
     monkeypatch.setattr(
         torch.ops.aiter,
         "maybe_dual_stream_split_forward",
         module_dispatch_ops.maybe_dual_stream_split_forward,
     )
 
+
+def test_forward_with_dual_stream_off_takes_the_row_sharded_tail(
+    ranks, monkeypatch, split_op_on_cpu
+):
+    """A threshold of 0 turns dual-stream off; the block still goes through
+    the split op, whose single-stream target shards the tail."""
+    monkeypatch.setenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "0")
     tokens = 13
     for (routed, shared), (summed, zeros), up_rows in _base_and_op_target(
         ranks, tokens, lambda block, x: block.forward(x)
@@ -212,15 +219,36 @@ def test_forward_with_dual_stream_off_takes_the_row_sharded_tail(ranks, monkeypa
         torch.testing.assert_close(summed, expected)
 
 
+def test_forward_with_tbo_enabled_keeps_the_base_pair(
+    ranks, monkeypatch, split_op_on_cpu, stub_block_parts
+):
+    """With TBO enabled the block stays off the split op, so a step that TBO
+    does not split keeps the base pair too."""
+    monkeypatch.setenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "0")
+    stub_block_parts.enable_tbo = True
+    tokens = 13
+    for (routed, shared), (routed_out, shared_out), up_rows in _base_and_op_target(
+        ranks, tokens, lambda block, x: block.forward(x)
+    ):
+        assert up_rows == [tokens, tokens]
+        assert torch.equal(routed_out, routed) and torch.equal(shared_out, shared)
+
+
 @pytest.mark.parametrize(
-    "threshold,capturing",
-    [("13", False), ("14", False), ("4", True)],
-    ids=["at-threshold", "below-threshold", "graph-capture"],
+    "threshold,capturing,tbo_step",
+    [
+        ("13", False, False),
+        ("14", False, False),
+        ("4", True, False),
+        ("4", False, True),
+    ],
+    ids=["at-threshold", "below-threshold", "graph-capture", "tbo-step"],
 )
-def test_base_pair_kept_bit_for_bit(ranks, monkeypatch, threshold, capturing):
+def test_base_pair_kept_bit_for_bit(ranks, monkeypatch, threshold, capturing, tbo_step):
     tokens = 13
     monkeypatch.setenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", threshold)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
+    monkeypatch.setattr(ubatching, "tbo_active", lambda: tbo_step)
     results = _base_and_op_target(ranks, tokens)
     for (routed, shared), (routed_out, shared_out), up_rows in results:
         assert up_rows == [tokens, tokens]
