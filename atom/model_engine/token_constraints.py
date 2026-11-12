@@ -143,6 +143,13 @@ class TokenConstraints:
                     step.rule_counts[indices] += 1
         for provider, binding in step.providers:
             previous, previous_target = step.invalid, step.target_invalid
+            # Providers may reuse their failure output in place. Preserve the
+            # accumulated failures before exposing those tensors to the next
+            # adapter; these are row-sized flags, never vocabulary masks.
+            if previous is not None:
+                previous = previous.clone()
+            if previous_target is not None:
+                previous_target = previous_target.clone()
             provider.apply(step, binding)
             step.invalid = _merge_invalid(previous, step.invalid)
             step.target_invalid = _merge_invalid(previous_target, step.target_invalid)

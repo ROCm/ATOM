@@ -212,3 +212,61 @@ def test_target_only_failure_tracks_accepted_prefix():
     step.metadata = SimpleNamespace(cu_num_draft_tokens=torch.tensor([2]))
     assert step.failed(torch.tensor([[7, -1, -1]])).tolist() == [False]
     assert step.failed(torch.tensor([[7, 3, -1]])).tolist() == [True]
+
+
+@pytest.mark.parametrize("inplace", [False, True])
+def test_provider_failure_reports_preserve_previous_failures(monkeypatch, inplace):
+    from types import SimpleNamespace
+    import torch
+    from atom.constraint_parser import ConstraintBinding
+    from atom.model_engine import token_constraints as boundary
+
+    class First:
+        backend = "first"
+        mask_stage = 0
+        commit_order = 0
+
+        @staticmethod
+        def enabled(batch):
+            return True
+
+        @staticmethod
+        def bind(batch):
+            return ConstraintBinding("first", None)
+
+        @staticmethod
+        def hard_requests(binding, batch):
+            return []
+
+        @staticmethod
+        def apply(step, binding):
+            step.invalid = torch.tensor([True, False])
+            step.target_invalid = torch.tensor([False, True])
+
+    class Second(First):
+        backend = "second"
+
+        @staticmethod
+        def apply(step, binding):
+            invalid = torch.tensor([False, True])
+            target_invalid = torch.tensor([True, False])
+            if inplace:
+                step.invalid.copy_(invalid)
+                step.target_invalid.copy_(target_invalid)
+            else:
+                step.invalid = invalid
+                step.target_invalid = target_invalid
+
+    monkeypatch.setattr(boundary, "_PROVIDERS", [])
+    boundary.register_constraint_provider(First)
+    boundary.register_constraint_provider(Second)
+    batch = SimpleNamespace(total_seqs_num=2)
+    metadata = SimpleNamespace(
+        bonus_logits_indices=torch.tensor([0, 2]),
+        target_logits_indices=torch.tensor([1, 3]),
+        cu_num_draft_tokens=torch.tensor([1, 2]),
+    )
+    step = boundary.TokenConstraints.apply(None, batch, torch.zeros(4, 8), metadata)
+    assert step.invalid.tolist() == [True, True]
+    assert step.target_invalid.tolist() == [True, True]
+    assert step.failed(torch.tensor([[3, -1], [4, -1]])).tolist() == [True, True]
