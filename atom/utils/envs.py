@@ -1052,7 +1052,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_DRAFT_CUDAGRAPH", "1").lower() == "1"
     ),
     # --- MoE (DeepSeek-style shared experts) ---
-    # Dual-stream MoE only when num_tokens <= threshold; 0 disables dual-stream registration.
+    # Dual-stream MoE only when num_tokens <= threshold; 0 turns dual-stream off.
+    # Kimi-K3.1's latent TP MoE row-shards above it (docs/environment_variables.md).
     "ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD": lambda: int(
         os.getenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "1024")
     ),
