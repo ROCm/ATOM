@@ -23,7 +23,8 @@ import torch
 from torch import nn
 
 from atom.model_ops.attentions.mha_kv_pool import MhaKvPool
-from atom.spec_decode.draft_kv import DRAFT_KV_ROWS, DraftKvBuilder
+from atom.spec_decode.draft_kv import DRAFT_KV_ROWS, DraftKvBuilder, draft_owns_kv_pool
+from atom.utils.selector import Family
 
 
 class _PagedAttention(nn.Module):
@@ -224,3 +225,142 @@ def test_the_count_tracks_the_model_it_walked(draft_layers):
     assert builder.kv_pool is not None
 
     assert asked == [(draft_layers, TARGET_BLOCK)]
+
+
+class _FakePool:
+    def __init__(self, scale_fields):
+        self.scale_fields = scale_fields
+
+    def kv_views(self, idx):
+        return torch.zeros(1), torch.zeros(1)
+
+    def scale_views(self, idx):
+        return torch.ones(1), torch.ones(1)
+
+
+@pytest.mark.parametrize("scale_fields", [[object()], []])
+def test_scales_are_bound_when_the_pools_layout_has_them(scale_fields):
+    """The layout decides, as the target binder asks it: not a dtype string."""
+    runner = _runner(draft_layers=1)
+    runner.config = SimpleNamespace(max_model_len=64)
+    builder = DraftKvBuilder(runner, None)
+    builder._kv_pool = _FakePool(scale_fields)
+    module = next(iter(builder.pool_rows[DRAFT_KV_ROWS]))
+    module.layer_num = 0
+
+    tensor = builder.build_kv_cache_tensor(module)
+
+    assert (tensor.k_scale is not None) is bool(scale_fields)
+
+
+def _spec_config(method="dspark", draft_hf="draft-hf"):
+    return SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            method=method, draft_model_hf_config=draft_hf
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "config, owns, want",
+    [
+        (_spec_config(), True, True),
+        (_spec_config(), False, False),  # the draft's backend shares the target's pool
+        (_spec_config("eagle3"), True, True),  # a draft model of its own, MHA: a pool
+        (
+            _spec_config("eagle3"),
+            False,
+            False,
+        ),  # ... an MLA one binds into the target's
+        (_spec_config("mtp"), True, False),  # MTP runs the target's layers
+        (_spec_config(draft_hf=None), True, False),
+        (SimpleNamespace(speculative_config=None), True, False),
+    ],
+)
+def test_a_native_draft_owns_a_pool_when_its_backend_says_so(
+    monkeypatch, config, owns, want
+):
+    from atom.utils import selector
+
+    monkeypatch.setattr(
+        selector, "attn_family", lambda _hf: Family.MHA if owns else Family.MLA
+    )
+    assert draft_owns_kv_pool(config) is want
+
+
+def test_a_plugin_draft_owns_no_pool_and_the_selector_is_not_asked(monkeypatch):
+    """The native runner builds a draft's pool; under vLLM / SGLang the selector has
+    no backend for every draft flavor (CSA2 raises), so it is not consulted."""
+    from atom.plugin import prepare
+    from atom.utils import selector
+
+    def refuse(*_a):
+        raise AssertionError("the selector was asked")
+
+    monkeypatch.setattr(prepare, "_CURRENT_FRAMEWORK", "vllm")
+    monkeypatch.setattr(selector, "attn_family", refuse)
+    assert draft_owns_kv_pool(_spec_config()) is False
+
+
+def test_a_plugin_config_without_native_draft_fields_answers_no(monkeypatch):
+    """The vLLM offload adapter passes vLLM's SpeculativeConfig through unchanged: it
+    has `method` but no `draft_model_hf_config`, and the answer must not read it."""
+    from atom.plugin import prepare
+
+    monkeypatch.setattr(prepare, "_CURRENT_FRAMEWORK", "vllm")
+    vllm_spec = SimpleNamespace(method="eagle3", draft_model_config=object())
+    assert draft_owns_kv_pool(SimpleNamespace(speculative_config=vllm_spec)) is False
+
+
+@pytest.mark.parametrize(
+    "target, asked, pool_dtype",
+    [
+        ("fp8", "bf16", "bf16"),  # the inverse overrides mismatch too
+        ("bf16", "fp8", "fp8"),
+        ("fp8", None, "fp8"),
+    ],
+)
+def test_an_eagle3_draft_attention_is_built_at_the_dtype_of_its_pool(
+    target, asked, pool_dtype
+):
+    """The draft's attention reads its cache dtype off the config it is built
+    with, and its pool is built at `speculative_config.draft_kv_dtype` (what
+    `draft_kv_builder` hands `make_kv_pool`). They are one value; the target's
+    config keeps its own."""
+    # eagle_proposer pulls aiter in through atom.distributed.pcp_utils
+    pytest.importorskip("aiter", reason="the proposer imports aiter at module load")
+    from atom.config import CompilationConfig, resolve_draft_kv_dtype
+    from atom.spec_decode.eagle_proposer import EagleProposer
+
+    spec = SimpleNamespace(
+        method="eagle3",
+        draft_model_hf_config=SimpleNamespace(),
+        kv_cache_dtype=asked,
+    )
+    spec.draft_kv_dtype = resolve_draft_kv_dtype(spec, target, own_pool=True)
+    assert spec.draft_kv_dtype == pool_dtype
+
+    p = EagleProposer.__new__(EagleProposer)
+    p.speculative_config = spec
+    p.runner = SimpleNamespace()
+    p.config = SimpleNamespace(
+        kv_cache_dtype=target,
+        hf_config=SimpleNamespace(num_hidden_layers=3),
+        compilation_config=CompilationConfig(),
+    )
+    seen = {}
+
+    def model_class(cfg, layer_offset):
+        seen["dtype"] = cfg.kv_cache_dtype
+        return object()
+
+    import atom.spec_decode.eagle_proposer as mod
+
+    orig, mod.draft_kv_builder = mod.draft_kv_builder, lambda runner, hf: None
+    try:
+        p._build_draft_model(model_class)
+    finally:
+        mod.draft_kv_builder = orig
+
+    assert seen == {"dtype": pool_dtype}
+    assert p.config.kv_cache_dtype == target

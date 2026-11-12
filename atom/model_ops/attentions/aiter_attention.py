@@ -147,10 +147,6 @@ def _mtp_prepare_decode_metadata_kernel(
 
 
 class AiterBackend(AttentionBackend):
-    # An MHA draft keeps its own K and V; there is no target tensor its rows
-    # could be.
-    DRAFT_OWNS_KV_POOL: ClassVar[bool] = True
-
     @staticmethod
     def get_name() -> str:
         return "ATOM_ATTENTION"

@@ -178,6 +178,7 @@ class EngineArgs:
     draft_model: str | None = None
     spec_decode_acceptance_rate: float | None = None
     spec_decode_acceptance_length: float | None = None
+    spec_decode_kv_cache_dtype: str | None = None
     mark_trace: bool = False
     enable_rapidserve: bool = False
     disagg_prefill_max_num_seqs: int | None = None
@@ -469,6 +470,18 @@ class EngineArgs:
             "--method eagle3; optional for --method dspark (needed for the "
             "DFlash-backbone drafts such as Kimi-K3-DSpark, omitted for "
             "V4-Pro-DSpark which ships inside the target checkpoint).",
+        )
+        parser.add_argument(
+            "--spec-decode-kv-cache-dtype",
+            type=str,
+            default=None,
+            choices=["bf16", "fp8"],
+            help="KV dtype of the speculative draft's pages "
+            "(SpeculativeConfig.kv_cache_dtype). A draft with a KV pool of its own "
+            "(an MHA draft: MiniMax-M3.1's DSpark, an MHA EAGLE3 draft) takes "
+            "either; default is --kv_cache_dtype's. A draft in the target's pool "
+            "always has --kv_cache_dtype, and a different value here is an error. "
+            "Needs --method and --num-speculative-tokens > 0.",
         )
         parser.add_argument(
             "--spec-decode-acceptance-length",
@@ -928,6 +941,7 @@ class EngineArgs:
                 method=method,
                 model=draft_model or self.model,
                 num_speculative_tokens=num_spec_tokens,
+                kv_cache_dtype=kwargs.pop("spec_decode_kv_cache_dtype"),
                 synthetic_acceptance_rate=synthetic_acceptance_rate,
                 synthetic_acceptance_length=synthetic_acceptance_length,
             )
@@ -937,6 +951,11 @@ class EngineArgs:
             kwargs.pop("draft_model")
             kwargs.pop("spec_decode_acceptance_rate")
             kwargs.pop("spec_decode_acceptance_length")
+            if kwargs.pop("spec_decode_kv_cache_dtype") is not None:
+                raise ValueError(
+                    "--spec-decode-kv-cache-dtype needs --method and "
+                    "--num-speculative-tokens > 0."
+                )
             kwargs["speculative_config"] = None
 
         # --enable-tbo [prefill|all] → enable_tbo + enable_tbo_decode
