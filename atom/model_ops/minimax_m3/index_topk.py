@@ -32,30 +32,23 @@ import torch
 import triton
 import triton.language as tl
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.flydsl import (
+    minimax_m3_index_score_fp4_flydsl,
+    minimax_m3_index_score_prefill_fp4_flydsl,
+)
+
+# aiter's chunk-narrowing per-row selector: same forced-block pins and tie
+# direction as the Triton one below, same selection on every shape tried. It
+# narrows in one pass where Triton folds tl.topk over ceil(max_block / BLOCK_SIZE_K)
+# tiles, so it pulls ahead as the row widens -- 7us against 36us at a 1M context.
+# `_aiter_selector_wins` says where.
+from aiter.ops.flydsl.topk.topk_per_row_small_k import (
+    topk_per_row_small_k,
+    topk_per_row_small_k_supported,
+)
 
 from atom.model_ops.minimax_m3.geometry import SPARSE_BLOCK_SIZE
-
-try:
-    # aiter's chunk-narrowing per-row selector: same forced-block pins and tie
-    # direction as the Triton one below, same selection on every shape tried.
-    # It narrows in one pass where Triton folds tl.topk over
-    # ceil(max_block / BLOCK_SIZE_K) tiles, so it pulls ahead as the row widens
-    # -- 7us against 36us at a 1M context. `_aiter_selector_wins` says where.
-    # A newer aiter keeps it in the `topk` package; the flat module is an older
-    # aiter's, the same functions.
-    try:
-        from aiter.ops.flydsl.topk.topk_per_row_small_k import (
-            topk_per_row_small_k,
-            topk_per_row_small_k_supported,
-        )
-    except ImportError:
-        from aiter.ops.flydsl.topk_per_row_small_k import (
-            topk_per_row_small_k,
-            topk_per_row_small_k_supported,
-        )
-except ImportError:  # pragma: no cover - aiter is optional at import time
-    topk_per_row_small_k = None
-    topk_per_row_small_k_supported = None
+from atom.model_ops.minimax_m3.mxfp4_pages import page_views
 
 # Query rows one prefill score program owns.
 #
@@ -772,8 +765,6 @@ def _select_with_aiter(
     and `score` are contiguous (every scorer writes one, the MXFP4 ones into the
     index workspace), so their flattenings are views.
     """
-    if topk_per_row_small_k is None:
-        return False
     heads, total_q, max_block = score.shape
     rows = heads * total_q
     flat_score = score.view(rows, max_block)
@@ -1152,18 +1143,18 @@ def minimax_m3_index_topk(
     emit_sparse_block_table: bool = False,
     block_page_stride: int = PAGES_PER_SPARSE_BLOCK,
     n_valid_column_per_row: torch.Tensor | None = None,
-    index_mxfp4: bool = False,
     pages_per_block: int = PAGES_PER_SPARSE_BLOCK,
     index_scorer=None,
 ):
     """Index block-score + top-k selection. block_size_q == 1 (per-token).
 
-    With ``index_mxfp4`` (``--index-cache-dtype fp4``) ``index_kv_cache`` is the
+    With an ``index_scorer`` (an `IndexScoreBuffers`: the MXFP4 index cache,
+    ``--index-cache-dtype fp4``, and only that one has it) ``index_kv_cache`` is the
     uint8 ``[num_blocks, 8704]`` MXFP4 page cache and the scores come from aiter's
     FlyDSL prefill scorer (``minimax_m3_index_score_prefill_fp4_flydsl``), which
-    writes into ``index_scorer.scores`` (an `IndexScoreBuffers`, required: one
-    workspace for every layer and no per-call allocation or -inf fill, since the
-    selection after it, this module's, reads a row only up to its valid blocks).
+    writes into ``index_scorer.scores``: one workspace for every layer and no
+    per-call allocation or -inf fill, since the selection after it, this module's,
+    reads a row only up to its valid blocks. Without one the Triton scorer runs.
     ``pages_per_block`` / ``block_page_stride`` describe the emitted block table:
     8 / 8 for the page-16 SHUFFLE cache, 1 / 1 for page-128 caches (MXFP4 KV).
 
@@ -1199,14 +1190,8 @@ def minimax_m3_index_topk(
     max_block = triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
     _require_packable(max_block)
 
-    if index_mxfp4:
-        from atom.model_ops.minimax_m3.mxfp4_pages import page_views
-
-        if index_scorer is None:
-            raise ValueError("the MXFP4 index prefill needs the builder's index_scorer")
+    if index_scorer is not None:
         k_data, k_scale = page_views(index_kv_cache)
-        from aiter.ops.flydsl import minimax_m3_index_score_prefill_fp4_flydsl
-
         score = minimax_m3_index_score_prefill_fp4_flydsl(
             idx_q,
             k_data,
@@ -1391,20 +1376,19 @@ def minimax_m3_index_topk_decode(
     max_query_len: int = 1,  # query tokens per request (num_spec+1); 1 == plain decode
     block_page_stride: int = PAGES_PER_SPARSE_BLOCK,
     n_valid_column_per_row: torch.Tensor | None = None,
-    index_mxfp4: bool = False,
     pages_per_block: int = PAGES_PER_SPARSE_BLOCK,
     index_scorer=None,
 ):
     """Decode index block-score + top-k, both split-K (cudagraph-safe).
 
-    ``index_mxfp4`` and ``pages_per_block`` as in :func:`minimax_m3_index_topk`.
+    ``index_scorer`` and ``pages_per_block`` as in :func:`minimax_m3_index_topk`.
 
     The MXFP4 scorer (aiter's ``minimax_m3_index_score_fp4_flydsl``) reads the index
     cache as the two views of ``mxfp4_pages.page_views`` and the query as e4m3, as
     the fused writer emits it (cast as stored, no per-tensor scale). ``index_scorer``
-    (an `IndexScoreBuffers`, required) holds what it runs on: the step's work map --
-    built once a step in the metadata, outside any graph (`make_sparse_decode_metadata`)
-    -- and the ``max_block`` that map was built at, which must not move between graph
+    (an `IndexScoreBuffers`, with the step's map) holds what it runs on: that work map,
+    built once a step in the metadata, outside any graph (`make_sparse_decode_metadata`),
+    and the ``max_block`` it was built at, which must not move between graph
     replays (the map's row count is the scorer's grid), and the `LogitsWorkspace` it
     writes its fp32 scores into as a contiguous ``[heads, rows, max_block]`` view:
     no per-layer allocation, no fill (both selectors read a row only up to its valid
@@ -1464,12 +1448,8 @@ def minimax_m3_index_topk_decode(
         pages_per_block,
     )
 
-    if index_mxfp4:
-        from aiter.ops.flydsl import minimax_m3_index_score_fp4_flydsl
-
-        from atom.model_ops.minimax_m3.mxfp4_pages import page_views
-
-        if index_scorer is None or index_scorer.work_map is None:
+    if index_scorer is not None:
+        if index_scorer.work_map is None:
             raise ValueError(
                 "the MXFP4 index decode needs the step's index_scorer "
                 "(a work map and the score workspace)"

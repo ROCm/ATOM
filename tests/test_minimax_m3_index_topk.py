@@ -573,8 +573,6 @@ def test_the_two_selectors_agree_where_the_dispatch_switches():
     from atom.model_ops.minimax_m3 import index_topk as m2
     from atom.model_ops.minimax_m3.sparse_attn import make_sparse_decode_metadata
 
-    if m2.topk_per_row_small_k is None:
-        pytest.skip("aiter's small-k selector is not installed")
     batch, heads, ctx = 2, 1, m2._AITER_MIN_WIDTH_WITH_EMIT * SPARSE_BLOCK_SIZE
     kw = _inputs([1] * batch, [ctx - 1] * batch, heads, "cuda")
     md = make_sparse_decode_metadata(
@@ -640,10 +638,9 @@ def test_pad_rows_of_a_padded_step_emit_nothing_and_live_rows_are_unchanged(
 
     served = []
     real = m.topk_per_row_small_k
-    if real is not None:
-        monkeypatch.setattr(
-            m, "topk_per_row_small_k", lambda *a: (served.append(1), real(*a))[1]
-        )
+    monkeypatch.setattr(
+        m, "topk_per_row_small_k", lambda *a: (served.append(1), real(*a))[1]
+    )
     monkeypatch.setattr(m, "_AITER_SERVES", {})
 
     def run(bounds):

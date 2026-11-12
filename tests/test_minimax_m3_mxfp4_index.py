@@ -111,16 +111,16 @@ def _aiter_allocates_its_scores():
     """Run the scorers as before the workspace: given no `out`, aiter allocates the
     scores and fills them with -inf itself (transposed at S * H >= 16, which the
     selector no longer takes: the values are made contiguous, the same scores)."""
-    from aiter.ops import flydsl
+    from atom.model_ops.minimax_m3 import index_topk  # binds the scorers
 
     names = (
         "minimax_m3_index_score_fp4_flydsl",
         "minimax_m3_index_score_prefill_fp4_flydsl",
     )
-    real = {n: getattr(flydsl, n) for n in names}
+    real = {n: getattr(index_topk, n) for n in names}
     for n in names:
         setattr(
-            flydsl,
+            index_topk,
             n,
             lambda *a, _f=real[n], **k: _f(*a, **{**k, "out": None}).contiguous(),
         )
@@ -128,7 +128,7 @@ def _aiter_allocates_its_scores():
         yield
     finally:
         for n in names:
-            setattr(flydsl, n, real[n])
+            setattr(index_topk, n, real[n])
 
 
 # `ppb` 16-pages a block: 1 for the MXFP4 KV, 8 for the page-16 SHUFFLE KV that
@@ -147,7 +147,7 @@ def test_decode_selection_and_block_table(batch, S, ppb, fp8_q):
     topk_idx, sbt, sctx = minimax_m3_index_topk_decode(
         q, cache, table, seq, int(seq.max()), TOPK, 0, 1, HEADS, SM_SCALE,
         emit_sparse_block_table=True, max_query_len=S, block_page_stride=ppb,
-        index_mxfp4=True, pages_per_block=ppb, index_scorer=md.index_scorer,
+        pages_per_block=ppb, index_scorer=md.index_scorer,
     )  # fmt: skip
     _, picks, ctx = reference(cache, table, seq, q, S)
     assert sbt.shape == (batch * S, TOPK * ppb) and sctx.shape == (batch * S,)
@@ -177,7 +177,7 @@ def test_prefill_selection_matches_the_decode_definition():
     topk_idx, _, sctx = minimax_m3_index_topk(
         q, cache, table, cu, seq, prefix, S, int(seq.max()), TOPK, 0, 1, HEADS,
         SM_SCALE, emit_sparse_block_table=True, block_page_stride=1,
-        index_mxfp4=True, pages_per_block=1, index_scorer=record,
+        pages_per_block=1, index_scorer=record,
     )  # fmt: skip
     score, picks, ctx = reference(cache, table, seq, q, S)
     for r in range(batch * S):
@@ -254,7 +254,7 @@ def _select(q, cache, table, seq, S, md, heads=HEADS, allocated=False):
         return minimax_m3_index_topk_decode(
             q, cache, table, seq, bound * 128, TOPK, 0, 1, heads, SM_SCALE,
             emit_sparse_block_table=True, max_query_len=S, block_page_stride=1,
-            index_mxfp4=True, pages_per_block=1,
+            pages_per_block=1,
             n_valid_column_per_row=md.n_valid_column_per_row,
             index_scorer=md.index_scorer,
         )  # fmt: skip
@@ -409,7 +409,7 @@ def _prefill_select(case, heads, record, allocated):
         return minimax_m3_index_topk(
             q, cache, table, cu, seq, prefix, max_q, int(seq.max()), TOPK, 0, 1,
             heads, SM_SCALE, emit_sparse_block_table=True, block_page_stride=1,
-            index_mxfp4=True, pages_per_block=1,
+            pages_per_block=1,
             n_valid_column_per_row=md.n_valid_column_per_row,
             index_scorer=md.index_scorer,
         )  # fmt: skip

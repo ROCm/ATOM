@@ -21,6 +21,7 @@ import torch
 import triton
 import triton.language as tl
 from aiter.ops.attention import pa_fwd_asm_supports_arch
+from aiter.ops.flydsl import minimax_m3_index_score_work_map
 
 from atom.model_ops.minimax_m3.geometry import SPARSE_BLOCK_SIZE
 from atom.model_ops.minimax_m3.index_buffers import IndexScoreBuffers
@@ -182,8 +183,6 @@ def make_sparse_decode_metadata(
     batch = seq_lens.shape[0]
     step_scorer = None
     if index_scorer is not None and batch > 0:
-        from aiter.ops.flydsl import minimax_m3_index_score_work_map
-
         step_scorer = replace(
             index_scorer,
             work_map=minimax_m3_index_score_work_map(

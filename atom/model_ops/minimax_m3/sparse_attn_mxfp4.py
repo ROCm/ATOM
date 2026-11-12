@@ -25,6 +25,8 @@ whatever the rows.
 """
 
 import torch
+from aiter.ops.flydsl.pa_decode import pa_decode
+from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
 
 from atom.model_ops.base_attention import (
     _FLYDSL_PLAN_MAX_BATCH,
@@ -63,9 +65,6 @@ def sparse_pa_mxfp4(
     layer's rows have the same lengths (the tail block is always selected), so a
     plan is refreshed once a step; None refreshes it on every call.
     """
-    from aiter.ops.flydsl.pa_decode import pa_decode
-    from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
-
     rows, num_heads, head_dim = q.shape
     if head_dim != HEAD_DIM or not q.is_contiguous():
         raise ValueError(

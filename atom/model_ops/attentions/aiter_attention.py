@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
-from dataclasses import replace
 from typing import ClassVar, NamedTuple
 
 import aiter
@@ -15,12 +14,11 @@ from atom.config import _is_minimax_m3_config
 from atom.distributed.ulysses_sp import local_num_kv_heads
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mha import PagedAttentionImpl, use_pa_decode_bf16_asm
-from atom.model_ops.minimax_m3.index_buffers import IndexScoreBuffers
+from atom.model_ops.minimax_m3.index_buffers import allocate_index_scorers
 from atom.model_ops.minimax_m3.sparse_attn import (
     make_sparse_decode_metadata,
     make_sparse_prefill_metadata,
 )
-from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace
 from atom.utils import CpuGpuBuffer, envs
 from atom.utils.block_convert import (
     block_table_convert_triton,
@@ -289,7 +287,17 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 num_head_k * self.max_bs * max_qlen,
                 **i32_kwargs,
             )
-        self._allocate_index_scorer(max_qlen)
+        self._index_scorers = (
+            allocate_index_scorers(
+                self.model_runner.config,
+                self.device,
+                max_bs=self.max_bs,
+                max_qlen=max_qlen,
+                num_idx_heads=self._num_idx_heads,
+            )
+            if self._has_sparse_attention
+            else {}
+        )
         self._pa_decode_bf16_asm_enabled = (
             use_pa_decode_bf16_asm() and model_runner.block_size == 256
         )
@@ -327,70 +335,6 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         self.model_runner.forward_vars.update(pa_persistent_metadata)
         if model_runner.config.enable_tbo:
             self._allocate_ubatch_buffers(max_qlen)
-
-    def _allocate_index_scorer(self, max_qlen: int) -> None:
-        """The MXFP4 index scorer's buffers, by ubatch prefix ("" the whole step): the
-        work map, the block bound it is built at, and the score workspace. Nothing for
-        any other index cache."""
-        self._index_scorers: dict[str, IndexScoreBuffers] = {}
-        self._index_work_map_blocks = 0
-        config = self.model_runner.config
-        if not (self._has_sparse_attention and config.index_cache_dtype == "fp4"):
-            return
-        from atom.model_ops.minimax_m3.sparse_attn import SPARSE_BLOCK_SIZE
-
-        # The scorer's grid is its work map's row count, so the bound is the model
-        # length, and the map buffer is CAPACITY -- the exact grid is not monotonic in
-        # the batch. Sized at the widest step; a plain decode step (S=1) builds into the
-        # same buffer. The scores go into one `LogitsWorkspace` every layer shares (the
-        # scorer and selector of a layer run back to back on one stream, in one call),
-        # as wide as the map and tall enough for the larger of a decode step's rows and
-        # a prefill chunk's. Allocated in the constructor, so the memory profile counts
-        # it.
-        self._index_work_map_blocks = cdiv(config.max_model_len, SPARSE_BLOCK_SIZE)
-        rows = max(self.max_bs * max_qlen, config.max_num_batched_tokens)
-        self._index_scorers[""] = IndexScoreBuffers(
-            scores=LogitsWorkspace(
-                self._num_idx_heads * rows * self._index_work_map_blocks, self.device
-            ),
-            work_map=self._alloc_index_work_map(self.max_bs, max_qlen),
-            max_block=self._index_work_map_blocks,
-        )
-
-    def _allocate_ubatch_buffers(self, max_seqlen_q: int) -> None:
-        super()._allocate_ubatch_buffers(max_seqlen_q)
-        if self._index_work_map_blocks and self.model_runner.config.enable_tbo_decode:
-            # The MXFP4 scorer's work map, per ubatch for the same reason as the
-            # sparse metadata buffers: both ubatches' metadata are alive at once. Only a
-            # decode TBO runs it (`enable_tbo` alone is the prefill split). A ubatch is
-            # one token a request (the sparse TBO decode raises above that), so q == 1
-            # here whatever `max_seqlen_q` is. A decode split cuts a batch of
-            # `running_bs` requests at `running_bs // 2` (`cut_decode_ubatches`).
-            # The score workspace is shared with the whole step's: both ubatches run on
-            # one compute stream (`make_tbo_contexts`) and a layer's scorer writes it
-            # and its selector reads it inside one `index_topk` call, which has no
-            # yield point in it, so the ubatches' uses never overlap.
-            first = self.max_bs // 2
-            for ub_idx, rows in enumerate((first, self.max_bs - first)):
-                self._index_scorers[f"ub{ub_idx}_"] = replace(
-                    self._index_scorers[""],
-                    work_map=self._alloc_index_work_map(rows, 1),
-                )
-
-    def _alloc_index_work_map(self, max_batch: int, max_query_len: int):
-        """Work map buffer for up to ``max_batch`` requests of up to ``max_query_len``
-        tokens, allocated once: a captured graph bakes its pointer."""
-        rows = 0
-        if max_batch > 0:
-            from aiter.ops.flydsl import minimax_m3_index_score_work_map_capacity
-
-            rows = minimax_m3_index_score_work_map_capacity(
-                max_batch,
-                self._index_work_map_blocks,
-                max_query_len,
-                self._num_idx_heads,
-            )
-        return torch.empty((rows, 2), dtype=torch.int32, device=self.device)
 
     def h2d_group_members(self) -> dict[str, tuple[str, ...]]:
         # Ready together before the CSR kernel, sharing prefill destinations
@@ -717,22 +661,6 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             f"{prefix}sparse_attention_n_valid_column_per_row"
         ]
 
-    def _index_scorer_kwargs(self, prefix: str = "") -> dict:
-        """The MXFP4 index scorer's buffers, for the sparse metadata builders; nothing
-        for any other index cache. `prefix` selects the ubatch's work map (`ub<i>_`):
-        both ubatches' metadata are alive at once on one stream, so a shared map
-        would be overwritten by the second before the first one's layers ran."""
-        scorer = self._index_scorers.get(prefix)
-        return {} if scorer is None else {"index_scorer": scorer}
-
-    def _full_batch_scorer_kwargs(self, splits: bool) -> dict:
-        """The scorer record of the step's whole-batch sparse metadata: none when the
-        step splits. A split decode (cut before the builder runs, `_cut_ubatches`) runs
-        only its micro-batches' metadata, each with its own map (`finish_ubatch`), so
-        the whole batch's map would be a launch nobody reads; a layer that did read it
-        would raise, as every decode without a record does."""
-        return {} if splits else self._index_scorer_kwargs()
-
     def _get_sparse_attention_block_tables(
         self,
         block_tables: torch.Tensor,
@@ -962,7 +890,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 max_query_len=1,
                 num_idx_heads=self._num_idx_heads,
                 n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(),
-                **self._index_scorer_kwargs(),
+                index_scorer=self._index_scorers.get(""),
             )
         # Same short-circuit as the metadata launch above. A dummy step would
         # refresh the live work_info from synthetic lengths, but every real
@@ -1006,7 +934,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 num_prefills=bs,
                 num_prefill_tokens=batch.scheduled_tokens,
                 num_idx_heads=self._num_idx_heads,
-                **self._index_scorer_kwargs(),
+                index_scorer=self._index_scorers.get(""),
             )
 
     def _refuse_ragged_on_rectangular_layers(
@@ -1148,7 +1076,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             # `_sparse_decode` slices q / idx_q to the rows of this batch. The other
             # index caches keep the padded batch.
             index_bs = running_bs
-            if self._index_work_map_blocks:  # the MXFP4 index cache
+            if "" in self._index_scorers:  # the MXFP4 index cache
                 index_bs = min(running_bs, running_tokens // max_seqlen_q)
                 if index_bs < batch.total_seqs_num_decode:
                     raise ValueError(
@@ -1169,7 +1097,14 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 max_query_len=int(max_seqlen_q),
                 num_idx_heads=self._num_idx_heads,
                 n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(),
-                **self._full_batch_scorer_kwargs(attn_metadata.ubatches is not None),
+                # a split decode (cut before the builder runs, `_cut_ubatches`) runs only its
+                # micro-batches' metadata, each with the map of its own (`finish_ubatch`):
+                # the whole batch's would be a launch nobody reads
+                index_scorer=(
+                    None
+                    if attn_metadata.ubatches is not None
+                    else self._index_scorers.get("")
+                ),
             )
 
     def finish_ubatch(
@@ -1206,7 +1141,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(
                     f"ub{ubatch_idx}_"
                 ),
-                **self._index_scorer_kwargs(f"ub{ubatch_idx}_"),
+                # both ubatches' metadata are alive at once on one stream: a shared map
+                # would be overwritten by the second before the first one's layers ran
+                index_scorer=self._index_scorers.get(f"ub{ubatch_idx}_"),
             )
 
     def build_for_cudagraph_capture(
@@ -1256,7 +1193,10 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 max_query_len=max_q_len,
                 num_idx_heads=self._num_idx_heads,
                 n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(),
-                **self._full_batch_scorer_kwargs(bool(decode_ubatch_slices)),
+                # a split bucket runs on its micro-batches' maps, as in `finish_decode`
+                index_scorer=(
+                    None if decode_ubatch_slices else self._index_scorers.get("")
+                ),
             )
 
         positions = var["positions"].copy_to_gpu(scheduled_tokens)

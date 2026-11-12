@@ -30,15 +30,18 @@ def draft_owns_kv_pool(config) -> bool:
     """
     from atom.plugin import is_plugin_mode
 
-    spec = getattr(config, "speculative_config", None)  # test stubs omit it
-    draft_hf = getattr(spec, "draft_model_hf_config", None)
-    if getattr(spec, "method", None) not in DRAFT_POOL_METHODS or draft_hf is None:
+    spec = config.speculative_config
+    if (
+        spec is None
+        or spec.method not in DRAFT_POOL_METHODS
+        or spec.draft_model_hf_config is None
+    ):
         return False
     if is_plugin_mode():
         return False
     from atom.utils.selector import DRAFT_POOL_FAMILIES, attn_family
 
-    return attn_family(draft_hf) in DRAFT_POOL_FAMILIES
+    return attn_family(spec.draft_model_hf_config) in DRAFT_POOL_FAMILIES
 
 
 def draft_kv_builder(model_runner, draft_hf):
