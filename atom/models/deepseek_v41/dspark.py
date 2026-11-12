@@ -3,6 +3,7 @@
 
 import logging
 from copy import copy
+from types import SimpleNamespace
 
 import torch
 from aiter.dist.parallel_state import get_tp_group
@@ -213,8 +214,9 @@ class DeepseekV41DSpark(DSparkDraftModel):
             quant_config=native_quant_config(),
         )
         norm.weight = main.weight
-        # Bypass Module.__setattr__ so this is not a registered child.
-        self.__dict__["_main_norm_quant_cached"] = norm
+        # A plain object, not a child module: assigning the RMSNorm itself
+        # would register it and make the loader look for a second weight.
+        self._main_norm_quant_holder = SimpleNamespace(norm=norm)
 
     @property
     def model(self):
@@ -286,7 +288,7 @@ class DeepseekV41DSpark(DSparkDraftModel):
 
     def _main_norm_quant(self):
         """The fused norm built in ``__init__``."""
-        return self.__dict__["_main_norm_quant_cached"]
+        return self._main_norm_quant_holder.norm
 
     @property
     def context_layers(self):
