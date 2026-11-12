@@ -605,6 +605,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the router GEMV's launch (tl.dot_scaled) and finish it with the SwiGLU in
     # the gate + sort launch. 0 runs the gate_up linear first.
     "ATOM_M3_ROUTER_GATEUP": lambda: os.getenv("ATOM_M3_ROUTER_GATEUP", "1") == "1",
+    # MiniMax-M3: a DSpark tap of decoder layer k reads the residual stream the
+    # next layer's input all-reduce + RMSNorm (the final norm after the last
+    # layer) already produces, instead of all-reducing layer k's output and
+    # adding its residual again. 0 taps layer k's output.
+    "ATOM_M3_DSPARK_TAP_REDUCED": lambda: (
+        os.getenv("ATOM_M3_DSPARK_TAP_REDUCED", "1") == "1"
+    ),
     # MiniMax-M3.1, with ATOM_M3_ROUTER_SWIGLU: fold the routed scaling into the
     # routing weights and let GEMM2 accumulate onto the shared expert's output,
     # dropping the combine launch. Not bitwise: the shared output is rounded

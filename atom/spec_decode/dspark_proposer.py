@@ -574,6 +574,7 @@ class DSparkProposer(Drafter):
             layer_ids=layer_ids,
             hidden_size=config.hf_config.hidden_size,
             extract=cls._extract_layer_hidden,
+            post_layer_hidden=True,
         )
 
     def _aux_capture_spec(self) -> AuxCaptureSpec:
