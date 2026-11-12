@@ -42,13 +42,13 @@ from atom.kv_transfer.offload.chunked_scheduler import (
 from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata
 from atom.kv_transfer.offload.mp import deployment
 from atom.kv_transfer.offload.mp.deployment import (
-    TransferSpec,
     _make_worker_adapter,
     _mp_session_id,
     _published_tp_replication_factor,
     _tp_replication_factor,
     _validate_mp_config,
     require_native_state_server,
+    transfer_spec,
 )
 from atom.kv_transfer.offload.mp.metadata import MPReqMeta
 from atom.kv_transfer.offload.mp.native_state_layout import (
@@ -654,7 +654,7 @@ class LMCacheMPConnector(KVConnectorBase):
                     f"load range [{start}, {end}) is not LMCache chunk aligned "
                     f"({self.chunk_size})"
                 )
-            op = TransferSpec(
+            op = transfer_spec(
                 token_ids=token_list(req.token_ids),
                 block_ids=self._transfer_block_ids(req, start, end, loading=True),
                 start=start,
@@ -740,7 +740,7 @@ class LMCacheMPConnector(KVConnectorBase):
                 self._immediate_saves[completion] = None
             return
         try:
-            op = TransferSpec(
+            op = transfer_spec(
                 token_ids=token_list(req.token_ids),
                 block_ids=self._transfer_block_ids(req, start, end, loading=False),
                 start=start,
