@@ -3692,7 +3692,7 @@ def main():
     if envs.ATOM_WEIGHT_CACHE != "off":
         # ATOM_PRELOAD: remember this launch, to start a weight cache daemon
         # with it; daemon: let its runners find this process to stop it.
-        from atom.model_loader.weight_cache import record_launch
+        from atom.model_loader.weight_cache.preload import record_launch
 
         record_launch()
 
@@ -4050,9 +4050,8 @@ def _loop_impl() -> str:
 
 
 def _run_weight_cache_daemon(engine) -> None:
-    """ATOM_WEIGHT_CACHE=daemon: every runner has loaded its shard and serves
-    it to clients (atom/model_loader/weight_cache.py). There is no API to
-    serve; wait for SIGINT/SIGTERM, then shut the engine down."""
+    """ATOM_WEIGHT_CACHE=daemon: the runners serve their weights, not
+    requests; wait for SIGINT/SIGTERM, then shut the engine down."""
     import signal
     import threading
 

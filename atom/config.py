@@ -2522,13 +2522,15 @@ class Config:
                 "atom.model_engine.model_runner.RapidServeModelRunner"
             )
 
-        # Weight cache (atom/model_loader/weight_cache.py): a daemon is this
+        # Weight cache (atom/model_loader/weight_cache/): a daemon is this
         # launch with runners that stop after loading and serve their weights;
         # a client maps them. Clients share the daemon's memory, so runners
         # that write weights in place (EPLB, RLHF weight updates, RapidServe's
         # own weight sharing) cannot take part.
         cache_mode = envs.ATOM_WEIGHT_CACHE
         if cache_mode in ("daemon", "client"):
+            from atom.model_loader.weight_cache import DAEMON_RUNNER
+
             if self.runner_qualname != "atom.model_engine.model_runner.ModelRunner":
                 raise ValueError(
                     f"ATOM_WEIGHT_CACHE={cache_mode} needs the default model "
@@ -2545,9 +2547,7 @@ class Config:
                     "parallelism yet"
                 )
             if cache_mode == "daemon":
-                self.runner_qualname = (
-                    "atom.model_loader.weight_cache.WeightCacheDaemonRunner"
-                )
+                self.runner_qualname = DAEMON_RUNNER
         elif cache_mode != "off":
             raise ValueError(
                 f"ATOM_WEIGHT_CACHE must be off, client or daemon, not {cache_mode!r}"

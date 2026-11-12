@@ -815,7 +815,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_USE_MODEL_SENSITIVE_RMSNORM", "0") == "1"
     ),
     # --- Shutdown ---
-    # Weight cache (atom/model_loader/weight_cache.py). "daemon": this launch
+    # Weight cache (atom/model_loader/weight_cache/). "daemon": this launch
     # loads the weights, serves them over CUDA IPC and never serves requests.
     # "client": map the weights from the daemon on the same GPUs instead of
     # loading the checkpoint; without one, load from disk; a daemon that
@@ -838,13 +838,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_WEIGHT_CACHE_WAIT_S": lambda: _positive_float_env(
         "ATOM_WEIGHT_CACHE_WAIT_S", "1800"
     ),
-    # Debug: write every runner's model state digest to
-    # <prefix>.<rank>.json after loading, to compare a disk load and a cache hit.
-    "ATOM_WEIGHT_CACHE_DIGEST": lambda: os.getenv("ATOM_WEIGHT_CACHE_DIGEST", ""),
-    # Debug: record which env vars, config fields, module attributes, globals
-    # and files each runner reads while building and loading its model, to
-    # <prefix>.<rank>.json (atom/model_loader/input_recorder.py).
-    "ATOM_WEIGHT_CACHE_READS": lambda: os.getenv("ATOM_WEIGHT_CACHE_READS", ""),
     # How long a shutting-down process waits for its children (EngineCore,
     # ModelRunner workers) to exit before it terminates them.
     "ATOM_SHUTDOWN_TIMEOUT_S": lambda: _positive_float_env(

@@ -125,7 +125,7 @@ class EngineCore:
         from atom.model_loader.weight_cache import DAEMON_RUNNER
 
         # ATOM_WEIGHT_CACHE=daemon: runners stop after loading and serve their
-        # weights; this engine sets up nothing for serving.
+        # weights; this engine sets up no KV cache, graphs or scheduler.
         self._weight_cache_daemon = config.runner_qualname == DAEMON_RUNNER
         init_exit_handler(self)
         self._init_data_parallel(config)
@@ -149,9 +149,6 @@ class EngineCore:
             )
             self._post_model_load_hook()
             if self._weight_cache_daemon:
-                # The runners loaded their weights and serve them to clients;
-                # a daemon has no KV cache, warmup or graphs of its own
-                # (atom/model_loader/weight_cache.py).
                 self.state_runtime = None
             else:
                 self._init_kv_cache_and_graphs(config)
@@ -167,7 +164,6 @@ class EngineCore:
         # import sets config.num_kvcache_blocks (BlockManager asserts num_blocks > 0).
         # Keep the attribute defined (None) so EngineUtilityHandler below and other
         # consumers can reference it before DecodeEngineCore creates the real one.
-        # A weight cache daemon never schedules.
         self.scheduler = None
         if not config.disagg_is_decode and not self._weight_cache_daemon:
             self.scheduler = Scheduler(
@@ -264,9 +260,8 @@ class EngineCore:
             )
 
     def weight_cache_daemon_loop(self):
-        """A weight cache daemon's engine: the runners hold and serve the
-        weights, nothing is scheduled. Waits for shutdown, without the
-        collectives a DP engine's busy loop would run."""
+        """Wait for shutdown, without the collectives a DP engine's busy
+        loop would run."""
         logger.info(f"{self.label}: weight cache daemon ready; waiting for shutdown")
         while True:
             while not self.input_queue.empty():

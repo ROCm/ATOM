@@ -795,23 +795,16 @@ class ModelRunner:
     # the target's launch (`prepare_model`).
     compute_head: Callable | None = None
     spec_status_deferred = False
-    # A weight cache daemon's runner loads and serves its weights only: no
-    # sampler state, KV cache, warmup or graphs (atom/model_loader/weight_cache.py).
+    # The weight cache daemon's runner returns after loading (weight_cache/daemon.py).
     weights_only = False
 
     def __init__(self, rank: int, config: Config):
         if envs.ATOM_WEIGHT_CACHE != "off":
             # Before the model's modules are imported: the cache compares the
             # code that runs with the files it hashes.
-            from atom.model_loader.weight_cache import snapshot_sources
+            from atom.model_loader.weight_cache.key import snapshot_sources
 
             snapshot_sources()
-        if envs.ATOM_WEIGHT_CACHE_READS or envs.ATOM_WEIGHT_CACHE == "daemon":
-            # What loading reads is the daemon's cache key; recording starts
-            # before the model's modules are imported.
-            from atom.model_loader.input_recorder import InputRecorder
-
-            self._input_recorder = InputRecorder.start()
         self.config = config
         self.structured_output = None
         self.structured_compile_executor = None
@@ -940,10 +933,6 @@ class ModelRunner:
         self._build_and_load_model(model_class)
         if self.weights_only:
             return
-        if envs.ATOM_WEIGHT_CACHE_DIGEST:
-            from atom.model_loader.weight_cache import dump_state_digest
-
-            dump_state_digest(self.model, self.rank_name, envs.ATOM_WEIGHT_CACHE_DIGEST)
         # After weight processing, before warmup and capture. Here rather than in
         # the loader so a runner that builds its model differently still sets it.
         from atom.model_ops.fused_moe.sp_mega_moe import initialize_sp_mega_moe
@@ -1100,23 +1089,15 @@ class ModelRunner:
         # Subclasses load or share weights their own way (Config rejects them
         # in cache mode too).
         if envs.ATOM_WEIGHT_CACHE == "client" and type(self) is ModelRunner:
-            from atom.model_loader.weight_cache import try_load_from_cache
+            from atom.model_loader.weight_cache.client import try_load_from_cache
 
             if try_load_from_cache(self, model_class):
                 return
-        recorder = getattr(self, "_input_recorder", None)
-        if recorder is not None:
-            recorder.enter_construct(config)
         self.model = model_class(config)
         fused_shared_expert_load_fn = None
         if hasattr(self.model, "load_fused_expert_weights"):
             fused_shared_expert_load_fn = self.model.load_fused_expert_weights
         torch.set_default_device(None)
-        if recorder is not None:
-            from atom.model_loader.weight_cache import _CodeTracer
-
-            tracer = _CodeTracer().__enter__()
-            recorder.enter_load(self.model)
         load_start = time.perf_counter()
         load_model(
             self.model,
@@ -1126,10 +1107,6 @@ class ModelRunner:
             load_fused_expert_weights_fn=fused_shared_expert_load_fn,
         )
         load_elapsed = time.perf_counter() - load_start
-        if recorder is not None:
-            tracer.__exit__(None, None, None)
-            recorder.finish_load(tracer.codes)
-            recorder.dump(f"{envs.ATOM_WEIGHT_CACHE_READS}.{self.rank_name}.json")
         logger.info(
             f"[{self.rank_name}] Model load done: {config.model} "
             f"(weights loaded in {load_elapsed:.2f}s)"
