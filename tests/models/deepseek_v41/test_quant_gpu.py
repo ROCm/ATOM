@@ -185,3 +185,88 @@ def test_real_weight_slice_gemm(prefix, fp4):
         x.cuda(), b.cuda(), s.cuda(), weight_group_rows=group_n, dtype=torch.float32
     ).cpu()
     torch.testing.assert_close(actual, expected, rtol=3e-5, atol=3e-5)
+
+
+def _preshuffled(weight):
+    from atom.model_ops.utils import shuffle_weights
+
+    weight = torch.nn.Parameter(weight.clone(), requires_grad=False)
+    shuffle_weights(weight)
+    return weight.data
+
+
+def _oracle(x, b, b_scale):
+    m, k = x.shape
+    a, a_scale = oracle.act_quant(x, 32, "ue8m0", torch.float8_e8m0fnu)
+    a_values = (
+        a.float().reshape(m, k // 32, 32) * a_scale.float()[:, :, None]
+    ).reshape(m, k)
+    full_scale = b_scale.float().repeat_interleave(32, 0).repeat_interleave(32, 1)
+    return F.linear(a_values, b.float() * full_scale)
+
+
+@pytest.mark.parametrize("m", [1, 6, 24, 300])
+def test_preshuffled_gemm_zero_padded_k(m):
+    """AITER's preshuffled group32 FP8 GEMM steps K in 64s; a K it cannot step
+    (the V4.1 shared expert's down projection at TP8: 288) runs on weights and
+    activations zero-padded to the next multiple (``GROUP32_K_STEP``). TP4's K
+    (576) steps and runs unpadded. The padding's products are exact zeros: the
+    padded GEMM equals the K = 320 GEMM whose last 32 weight columns are zero
+    under any activations there, bit for bit, and the fp32 oracle."""
+    from atom.model_ops.blockscale import (
+        GROUP32_K_STEP,
+        native_quant_linear,
+        pad_group32_k,
+    )
+
+    def run(x, b, b_scale):
+        k = -(-b.shape[1] // GROUP32_K_STEP) * GROUP32_K_STEP
+        b, b_scale = pad_group32_k(b, b_scale, k)
+        return native_quant_linear(
+            x.cuda(),
+            _preshuffled(b.cuda()),
+            b_scale.cuda(),
+            weight_group_rows=32,
+            weight_preshuffled=True,
+            dtype=torch.bfloat16,
+        ).cpu()
+
+    def tolerance(expected):
+        return {"rtol": 1e-2, "atol": 1e-2 * expected.abs().max().item()}
+
+    torch.manual_seed(288)
+    n = 4096
+
+    def operands(k):
+        x = torch.randn(m, k, dtype=torch.bfloat16)
+        b = (torch.randn(n, k) * 16).to(torch.float8_e4m3fn)
+        b_scale = torch.exp2(torch.randint(-7, 1, (n // 32, k // 32)).float()).to(
+            torch.float8_e8m0fnu
+        )
+        return x, b, b_scale
+
+    x, b, b_scale = operands(576)  # TP4: no padding
+    expected = _oracle(x, b, b_scale)
+    torch.testing.assert_close(
+        run(x, b, b_scale).float(), expected, **tolerance(expected)
+    )
+
+    x, b, b_scale = operands(288)  # TP8
+    with pytest.raises(
+        (RuntimeError, ValueError)
+    ):  # the symptom: no kernel steps K = 288
+        native_quant_linear(
+            x.cuda(),
+            _preshuffled(b.cuda()),
+            b_scale.cuda(),
+            weight_group_rows=32,
+            weight_preshuffled=True,
+            dtype=torch.bfloat16,
+        )
+    padded = run(x, b, b_scale)
+    expected = _oracle(x, b, b_scale)
+    torch.testing.assert_close(padded.float(), expected, **tolerance(expected))
+    # the same GEMM at K = 320 with zero weight columns under nonzero activations
+    b320, s320 = pad_group32_k(b, b_scale, 320)
+    x320 = torch.cat([x, torch.randn(m, 32, dtype=torch.bfloat16)], dim=1)
+    assert torch.equal(padded, run(x320, b320, s320))

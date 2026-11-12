@@ -250,6 +250,68 @@ def test_native_linear_preshuffled_matches_row_major(
     assert cos > 0.9999
 
 
+@pytest.mark.parametrize("k", [288, 576])
+def test_a_k_the_preshuffled_gemm_cannot_step_takes_a_zero_padded_copy(
+    linear_modules, monkeypatch, k
+):
+    """gfx950's preshuffled group32 FP8 GEMM steps K in 64s (``GROUP32_K_STEP``).
+    A K it cannot step (V4.1's shared-expert down projection at TP8: 2304 / 8 =
+    288) keeps ``weight`` as loaded and adds a preshuffled copy padded to 320
+    with zero codes under unit scales, so every padded product is an exact zero;
+    TP4's 576 adds nothing."""
+    from aiter.jit.utils import chip_info
+    from aiter.ops.shuffle import shuffle_weight
+
+    from atom.model_ops.blockscale import GROUP32_K_STEP, pad_group32_k
+
+    linear, group = linear_modules
+    group.world_size = 1
+    monkeypatch.setattr(chip_info, "get_gfx", lambda: "gfx950")
+    monkeypatch.setenv("ATOM_GROUP32_WEIGHT_PRESHUFFLE", "1")
+    torch.manual_seed(k)
+    weight = (torch.randn(64, k) * 32).to(torch.float8_e4m3fn)
+    scale = torch.exp2(torch.randint(-8, -1, (2, k // 32)).float()).to(
+        torch.float8_e8m0fnu
+    )
+    module = linear.ReplicatedLinear(k, 64, quant_config=_config())
+    module.weight_loader(module.weight, weight)
+    module.weight_loader(module.weight_scale, scale)
+    module.process_weights_after_loading()
+    assert module.weight.is_shuffled
+    assert torch.equal(
+        module.weight.view(torch.uint8),
+        shuffle_weight(weight, layout=(16, 16)).view(torch.uint8),
+    )
+    if k % GROUP32_K_STEP == 0:
+        assert not hasattr(module, "weight_kpad")
+        return
+    zeros = torch.zeros(64, 320 - k, dtype=torch.uint8)
+    padded = torch.cat([weight.view(torch.uint8), zeros], 1)
+    assert torch.equal(
+        module.weight_kpad.view(torch.uint8),
+        shuffle_weight(padded.view(torch.float8_e4m3fn), layout=(16, 16)).view(
+            torch.uint8
+        ),
+    )
+    unit = torch.full((2, 1), 127, dtype=torch.uint8)
+    assert torch.equal(
+        module.weight_scale_kpad.view(torch.uint8),
+        torch.cat([scale.view(torch.uint8), unit], 1),
+    )
+    # the activations' codes and scales padded the same way: zeros under 1.0
+    codes = (torch.randn(5, k) * 32).to(torch.float8_e4m3fn)
+    x_scale = torch.exp2(torch.randint(-8, -1, (5, k // 32)).float()).to(
+        torch.float8_e8m0fnu
+    )
+    pc, ps = pad_group32_k(codes, x_scale, 320)
+    assert torch.equal(
+        pc.view(torch.uint8), torch.cat([codes.view(torch.uint8), zeros[:5]], 1)
+    )
+    assert ps.float()[:, k // 32 :].eq(1.0).all() and torch.equal(
+        ps[:, : k // 32].view(torch.uint8), x_scale.view(torch.uint8)
+    )
+
+
 def test_merged_replicated_splits_v41_qkv_a_scale_rows(linear_modules):
     """The fused `attn.wqkv_a` must land each disk shard on its own rows.
 
