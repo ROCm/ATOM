@@ -111,6 +111,19 @@ class PdAdmissionController:
     def pending_bytes(self):
         return len(self._block_refs) * self.block_bytes
 
+    @property
+    def pending_states(self) -> dict[str, int]:
+        """Pending requests by state; a cancelled one drains whether or not ready."""
+        states = dict.fromkeys(("receiving", "ready", "cancel_draining"), 0)
+        for entry in self.pending.values():
+            if entry.cancelled:
+                states["cancel_draining"] += 1
+            elif entry.ready:
+                states["ready"] += 1
+            else:
+                states["receiving"] += 1
+        return states
+
     def check(self, seq, probe) -> tuple[bool, ReceivePlan | None]:
         """Whether `seq` may allocate now, and the range a later `commit` charges.
 
@@ -134,8 +147,12 @@ class PdAdmissionController:
         if self.pending_bytes + receive_blocks * self.block_bytes <= self.max_bytes:
             return True, plan
         reason = "bytes"
-        # One deferral per request and limit, however many passes it waits.
-        reasons = self._deferred_by.setdefault(str(seq.id), set())
+        # One deferral per request and limit, however many passes it waits;
+        # a repeated wait allocates nothing.
+        key = str(seq.id)
+        reasons = self._deferred_by.get(key)
+        if reasons is None:
+            reasons = self._deferred_by[key] = set()
         if reason not in reasons:
             reasons.add(reason)
             self.deferred[reason] += 1
@@ -176,9 +193,10 @@ class PdAdmissionController:
             entry.ready = True
 
     def cancel(self, seq):
+        key = str(seq.id)
         # A request rejected while deferred never reaches `commit`.
-        self._deferred_by.pop(str(seq.id), None)
-        entry = self.pending.get(str(seq.id))
+        self._deferred_by.pop(key, None)
+        entry = self.pending.get(key)
         if entry is not None and entry.sequence is seq:
             entry.cancelled = True
 

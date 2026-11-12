@@ -609,34 +609,53 @@ def test_admission_state_is_exported_from_the_metrics_snapshot(build):
 
     from atom.metrics.exporter import _AtomMetricsCollector
     from atom.model_engine.engine_utility import EngineUtilityHandler
+    from atom.model_engine.llm_engine import LLMEngine
 
     sched, request = build()
+    handler = EngineUtilityHandler(None, Queue(), scheduler=sched)
+    exporter = SimpleNamespace(stream_silence=lambda: 0.0, other_processes_gc=list)
+
+    def exported():
+        """The admission series a scrape serves, through the engine's DP aggregation."""
+        engine = SimpleNamespace(
+            core_mgr=SimpleNamespace(
+                latest_metrics={0: handler.collect_metrics()},
+                get_dp_router_statistics=dict,
+            )
+        )
+        snapshot = LLMEngine.get_metrics_statistics(engine)
+        return {
+            (sample.name, tuple(sorted(sample.labels.items()))): sample.value
+            for family in _AtomMetricsCollector(exporter)._collect((snapshot, 0, 0.0))
+            for sample in family.samples
+            if sample.name.startswith("atom:pd_admission_")
+        }
+
+    # A plain `Scheduler` reports no role, which aggregation exports as "default".
+    labels = (("dp_rank", "0"), ("engine_role", "default"))
+    pending_bytes = ("atom:pd_admission_pending_kv_bytes", labels)
+    deferred = ("atom:pd_admission_deferred_total", (*labels, ("reason", "bytes")))
+
+    def pending(**counts):
+        states = {"receiving": 0, "ready": 0, "cancel_draining": 0} | counts
+        return {
+            ("atom:pd_admission_pending_requests", (*labels, ("state", s))): n
+            for s, n in states.items()
+        }
+
     a, b = request(), request()
     sched.extend([a, b])
     sched.schedule()
     sched.schedule()
-    handler = EngineUtilityHandler(None, Queue(), scheduler=sched)
-    rank = handler.collect_metrics()["scheduler_metrics"]
-    assert rank["pd_admission"] == {
-        "pending": {"receiving": 1, "ready": 0, "cancel_draining": 0},
-        "pending_kv_bytes": 2048,
-        "deferred": {"bytes": 1},
-    }
-    sched.pd_admission.received(a.id)
-    pending = handler.collect_metrics()["scheduler_metrics"]["pd_admission"]["pending"]
-    assert pending == {"receiving": 0, "ready": 1, "cancel_draining": 0}
-
-    snapshot = {"scheduler_metrics": [{"dp_rank": 0, "engine_role": "decode", **rank}]}
-    exporter = SimpleNamespace(stream_silence=lambda: 0.0, other_processes_gc=list)
-    samples = {
-        (sample.name, tuple(sorted(sample.labels.items()))): sample.value
-        for family in _AtomMetricsCollector(exporter)._collect((snapshot, 0, 0.0))
-        for sample in family.samples
-    }
-    labels = (("dp_rank", "0"), ("engine_role", "decode"))
-    receiving = (*labels, ("state", "receiving"))
-    assert samples["atom:pd_admission_pending_requests", receiving] == 1
-    assert samples["atom:pd_admission_pending_kv_bytes", labels] == 2048
-    assert (
-        samples["atom:pd_admission_deferred_total", (*labels, ("reason", "bytes"))] == 1
-    )
+    assert exported() == pending(receiving=1) | {pending_bytes: 2048, deferred: 1}
+    sched._update_from_kv_xfer_finished(receive_success(a, as_str=True))
+    assert exported() == pending(ready=1) | {pending_bytes: 2048, deferred: 1}
+    # A's first forward returns its credit; B is admitted on the next pass.
+    sched.schedule()
+    assert exported() == pending() | {pending_bytes: 0, deferred: 1}
+    sched.schedule()
+    assert sched.abort_request(b.id)
+    # A cancelled receive keeps its credit while its writes drain.
+    assert exported() == pending(cancel_draining=1) | {pending_bytes: 2048, deferred: 1}
+    sched._update_from_kv_xfer_finished(KVConnectorOutput(failed_recving={str(b.id)}))
+    assert exported() == pending() | {pending_bytes: 0, deferred: 1}
