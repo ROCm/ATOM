@@ -129,7 +129,7 @@ def test_gqa_draft_rope_is_the_drafts_own(monkeypatch):
 
     def rope_of(cfg):
         calls.clear()
-        mod.KimiK3DSparkGQAAttention(cfg, 0, block_attn=None)
+        mod.KimiK3DSparkGQAAttention(cfg, 0)
         ((args, kw),) = calls
         return args, kw
 

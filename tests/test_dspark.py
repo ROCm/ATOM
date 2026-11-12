@@ -2385,7 +2385,9 @@ def _paged_proposer(
         block_size=block_size,
         world_size=_DRAFT_TP,
         config=types.SimpleNamespace(
-            kv_cache_dtype="bf16", decode_context_parallel_size=dcp
+            kv_cache_dtype="bf16",
+            decode_context_parallel_size=dcp,
+            kv_cache_block_size=block_size,
         ),
         drafter=p,
         forward_vars={
