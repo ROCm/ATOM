@@ -55,6 +55,8 @@ def test_structured_verify_keeps_raw_logprobs(modules, monkeypatch, probabilisti
     runner = object.__new__(mod.ModelRunner)
     runner.forward_done_event = NS(record=lambda *args: None)
     runner._served = None
+    # No bonus side stream off-device: the draw stays inline.
+    runner._bonus_stream = runner._bonus_ready = None
     observed = {}
     prefixes = {0: object()}
 

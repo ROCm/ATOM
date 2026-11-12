@@ -75,10 +75,14 @@ def markov_logits_tile(
     BLOCK_V: tl.constexpr,
     BLOCK_K: tl.constexpr,
     STORE_EMBED: tl.constexpr,
+    FROM_PACKED: tl.constexpr = False,
 ):
     """``base + W1[prev] @ W2^T`` on one (row tile, V tile), fp32, -inf on
     padded vocab lanes; with ``STORE_EMBED`` tile 0 also publishes
     ``W1[prev]`` to ``embed_out`` (the greedy op's confidence head reads it).
+    With ``FROM_PACKED`` the previous ids are the probabilistic chain's
+    packed uint64 keys (`dspark_prob_markov_chain`): the low word is the
+    inverted id, and a zero key (empty row) reads id 0.
 
     The GEMV both stage-1 kernels run (`dspark_markov_argmax`'s and
     `dspark_markov_sample`'s); each keeps only its own tail. ``base``
@@ -90,6 +94,8 @@ def markov_logits_tile(
     # Strided: the caller's ids are one column of its `[B, T + 1]` block, so
     # assuming unit stride here reads another position's tokens.
     prev = tl.load(prev_ids_ptr + offs_row * stride_prev, mask=row_mask, other=0)
+    if FROM_PACKED:
+        prev = tl.where(prev == 0, 0, ~prev.to(tl.uint32)).to(tl.int64)
 
     acc = tl.zeros((BLOCK_ROW, BLOCK_V), dtype=tl.float32)
     for k in range(tl.cdiv(rank, BLOCK_K)):
