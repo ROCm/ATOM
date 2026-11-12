@@ -159,10 +159,14 @@ def _emit_sparse_block_table_row(
     BLOCK_SIZE_T: tl.constexpr,
 ):
     off_t = tl.arange(0, BLOCK_SIZE_T)
+    # A pad row (seq_len 0) has causal_len = seq_len - MAX_Q + tok + 1 <= 0: it has
+    # no key. Clamp it here, where it enters, so nothing below is computed from a
+    # negative length, and give it no tail block so no selected id can be valid.
+    causal_len = tl.maximum(causal_len, 0)
     # Tail block: the 128-block holding this token's last causal key. It is the
     # only selected block that can be partial, so it has to land last -- ctx
     # counts the leading full blocks and then however much of it is real.
-    self_blk = (causal_len - 1) // block_size
+    self_blk = tl.where(causal_len > 0, (causal_len - 1) // block_size, -1)
     bt_blk = tl.where(off_t < topk, topk_idx, -1)
     # The selector already caps selection at self_blk; the upper bound is
     # defensive, and keeps an out-of-range id from indexing the block table.
@@ -208,10 +212,7 @@ def _emit_sparse_block_table_row(
     bt_ctx = tl.where(
         bt_has_tail, bt_ctx, tl.minimum(bt_n_valid * block_size, causal_len)
     )
-    # A pad row of a padded step (length 0) has no causal key: causal_len <= 0
-    # makes the count above negative, and a context below zero is outside what the
-    # decode kernels take. A live row has causal_len >= 1 and a positive count.
-    tl.store(sctx_ptr, tl.maximum(bt_ctx, 0))
+    tl.store(sctx_ptr, bt_ctx)
 
 
 # ---------------------------------------------------------------------------
