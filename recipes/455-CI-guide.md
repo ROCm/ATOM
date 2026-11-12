@@ -323,7 +323,7 @@ EOF
    LOG="$RUN_DIR/$MODEL/server.log"      # client 侧失败就换成对应的 lm_eval.log 或 bench.log
    n=$(grep -n -m1 -E "Traceback|Memory access fault|HIP error|hipError|out of memory|Segmentation fault|core dumped|AssertionError|RuntimeError|Error:" "$LOG" | cut -d: -f1)
    { [ -n "$n" ] && sed -n "$(( n > 15 ? n - 15 : 1 )),$(( n + 40 ))p" "$LOG"
-     echo "----- 最后 30 行 -----"; tail -n 30 "$LOG"; } | head -n 100 > "$RUN_DIR/$MODEL/error.log"
+     echo "----- last 30 lines -----"; tail -n 30 "$LOG"; } | head -n 100 > "$RUN_DIR/$MODEL/error.log"
    ```
 
 3. **一句话报错**：取最后那行异常（例如 `RuntimeError: ...`），截到 150 个字符以内，写进 `accuracy.csv` 或 `perf.csv` 的 `error` 列和报告。
@@ -444,32 +444,32 @@ recipes/
 
 ## 5. 报告
 
-每个镜像出两份报告，放在 `reports/` 下，日期是镜像日期：
+每个镜像出两份报告，放在 `reports/` 下，日期是镜像日期。**报告用英文写**，Highlights、表格和详细报告都是：
 
 | 文件 | 给谁看 | 内容 |
 |---|---|---|
-| `455-CI-report-<YYYYMMDD>.md` | 老板 | Highlights（几句话）和总表 |
+| `455-CI-report-<YYYYMMDD>.md` | 老板 | Highlights 和总表 |
 | `455-CI-report-<YYYYMMDD>-detail.md` | 要看细节的人 | 测试环境、全部数字、趋势图、跑挂 case 的核心 error log |
 
-周末测完生成一次，8K/1K 写"待测（周中）"；周中测完再生成一次，覆盖同名文件。两份报告和图都用 §5.5 的脚本从 `perf.csv`、`accuracy.csv` 生成，不手填数字。样例见 [`455-CI/tools/examples/reports/`](455-CI/tools/examples/reports/)，那是 EXAMPLE（示例）：数字都是编的，不是真实测试数据。
+周末测完生成一次，8K/1K 那一行写 `pending (midweek)`；周中测完再生成一次，覆盖同名文件。两份报告和图都用 §5.5 的脚本从 `perf.csv`、`accuracy.csv` 生成，不手填数字。样例见 [`455-CI/tools/examples/reports/`](455-CI/tools/examples/reports/)，那是 EXAMPLE（示例）：数字都是编的，不是真实测试数据。
 
 ### 5.1 Highlights
 
-大老板只看 Highlights，所以每个有事的模型只写一行：`<标记> <模型>：<这次发生了什么>`。不写场景，只给一个关键数字，例如"⚠️ GLM-5.2：吞吐回退 4.2%。""❌ Qwen-35B-A3B：c64 跑挂（RuntimeError: …）。"。`make_report.py` 按下表比较本次和历史结果，生成草稿；测试 agent 读一遍再提交，可以改措辞，但不能删掉 ❌ 和 🔴 的条目，也不能改数字。
+大老板只看 Highlights，所以只写本次出了大事或跑挂的模型，每个一行：`<标记> <模型>: <发生了什么>`。不写场景，只给一个关键数字，例如 `⚠️ GLM-5.2: throughput down 4.2%.`、`❌ Qwen-35B-A3B: c64 failed (RuntimeError: …).`。持平、变化不大或第一次有数据的模型都不提；一个都没有时只写 `No failures or major changes.`。
 
-| 标记 | 什么时候算 | 和谁比 |
-|---|---|---|
-| ❌ 跑挂 | 任一并发或 GSM8K 失败 | — |
-| 🔴 严重回退 | 吞吐低 10% 及以上，或 GSM8K 掉超过 0.06 | 该模型最近一次成功的镜像（"上次"） |
-| ⚠️ 回退 | 吞吐低 3% 及以上，或 GSM8K 掉超过 0.04 | 上次 |
-| ⚠️ 慢回退 | 吞吐比历史最佳低 5% 及以上：每次都没到 3%，累积起来的 | 之前所有镜像里的最好值 |
-| 🟢 进展 | 吞吐高 3% 及以上 | 上次 |
-| ✅ 恢复 | 上次跑挂，这次跑通 | 上次 |
-| 🆕 首次 | 没有历史数据 | — |
+`make_report.py` 按下表比较本次和历史结果，生成草稿；测试 agent 读一遍再提交，可以改措辞，但不能删掉 ❌ 和 🔴 的条目，也不能改数字。
 
-- "吞吐"指并发 64 的每卡吞吐，和总表一致。并发 4 按同样的门槛判断，但只在 c64 没变化、或并发 4 更严重时才写，写作"低并发吞吐回退 x%"。
-- GSM8K 看 flexible-extract，写成"GSM8K 掉了 x 个点，现在 y%"（0.01 = 1 个点）。
-- 按上表顺序排，最后一句写"其余 N 个模型持平"，没测的场景写"8K/1K 待测（周中）"。
+| 标记 | 什么时候算 | 和谁比 | 写法 |
+|---|---|---|---|
+| ❌ | 任一并发或 GSM8K 跑挂 | — | `c64 failed (<一句话报错>)`、`all runs failed (…)` |
+| 🔴 | 吞吐低 10% 及以上，或 GSM8K 掉超过 0.06 | 该模型最近一次成功的镜像（"上次"） | `throughput down 11.0%`、`GSM8K down 7.0 points to 88.0%` |
+| ⚠️ | 吞吐低 3% 及以上，或 GSM8K 掉超过 0.04 | 上次 | `throughput down 4.2%`、`GSM8K down 4.6 points to 88.1%` |
+| ⚠️ | 吞吐比历史最佳低 5% 及以上：每次都没到 3%，累积起来的 | 之前所有镜像里的最好值 | `throughput 6.2% below its best (gradual decline)` |
+| 🟢 | 吞吐高 3% 及以上 | 上次 | `throughput up 6.9%` |
+| ✅ | 上次跑挂，这次跑通 | 上次 | `recovered from the previous failure` |
+
+- throughput 指并发 64 的每卡吞吐，和总表一致。并发 4 按同样的门槛判断，但只在 c64 没变化、或并发 4 更严重时才写，例如 `c4 throughput down 5.0%`。
+- GSM8K 看 flexible-extract，差值按点算（0.01 = 1 point）。
 - 门槛的来由：吞吐跑到跑之间有 1% 到 2% 的波动；GSM8K 在这套环境上 temp 0 也不完全确定，±0.02 以内通常是噪声。
 
 ### 5.2 报告：Highlights 和总表
@@ -477,40 +477,39 @@ recipes/
 格式如下（数字是编的）：
 
 ```markdown
-# 455-CI 报告 · <YYYY-MM-DD>
+# 455-CI report · <YYYY-MM-DD>
 
-镜像 `gfx1250-atom-ci455-<YYYYMMDD>` · ATOM `main@<sha 前 9 位>` · aiter `main@<sha 前 9 位>` · base `gfx1250-atom-<YYYYMMDD>` · [详细报告](455-CI-report-<YYYYMMDD>-detail.md)
+Image `gfx1250-atom-ci455-<YYYYMMDD>` · ATOM `main@<sha 前 9 位>` · aiter `main@<sha 前 9 位>` · base `gfx1250-atom-<YYYYMMDD>` · [Detailed report](455-CI-report-<YYYYMMDD>-detail.md)
 
 ## Highlights
 
-- ❌ Qwen-35B-A3B：c64 跑挂（RuntimeError: HIP error: out of memory）。
-- ⚠️ MiniMax-M3：GSM8K 掉了 4.6 个点，现在 88.1%。
-- 🟢 DeepSeek-V4.1-Flash：吞吐提升 6.9%。
-- 其余 5 个模型持平。
+- ❌ Qwen-35B-A3B: c64 failed (RuntimeError: HIP error: out of memory).
+- ⚠️ MiniMax-M3: GSM8K down 4.6 points to 88.1%.
+- 🟢 DeepSeek-V4.1-Flash: throughput up 6.9%.
 
-## 总表
+## Summary
 
-| 模型 | 场景 | 上次性能 tok/s/GPU | 本次性能 tok/s/GPU | 变化 | 精度变化（GSM8K） |
+| Model | Scenario | Previous (tok/s/GPU) | Current (tok/s/GPU) | Change | GSM8K change |
 |---|---|---|---|---|---|
-| DeepSeek-V4.1-Flash | MLPerf Endpoint | 2,655 | 2,838 | 🟢 +6.9% | −0.2 个点（当前 93.9%） |
-| Qwen-35B-A3B | MLPerf Endpoint | 6,345 | N/A | N/A | −0.1 个点（当前 90.1%） |
-| MiniMax-M3 (428B) | 8K/1K | 16,145 | 16,287 | +0.9% | ⚠️ −4.6 个点（当前 88.1%） |
+| DeepSeek-V4.1-Flash | MLPerf Endpoint | 2,655 (2026-11-07) | 2,838 (2026-11-14) | 🟢 +6.9% | −0.2 pts (now 93.9%) |
+| Qwen-35B-A3B | MLPerf Endpoint | 6,345 (2026-11-07) | N/A (2026-11-14) | N/A | −0.1 pts (now 90.1%) |
+| MiniMax-M3 (428B) | 8K/1K | 16,145 (2026-11-07) | 16,287 (2026-11-14) | +0.9% | ⚠️ −4.6 pts (now 88.1%) |
 ```
 
-- 一个模型一行，依次是模型、场景、上次性能、本次性能、变化、精度变化。
-- 性能是并发 64 的每卡吞吐，不分并发（口径见 §4.1：endpoint 是输出 token，8K/1K 是输入加输出 token）；并发 4 和其他指标在详细报告里。
-- 精度变化写掉了多少、现在多少，例如 `−4.6 个点（当前 88.1%）`。
-- N/A 表示跑挂、没有值；— 表示没有结果；首次表示第一次有数据，没有可比的。
+- 一个模型一行，依次是 Model、Scenario、Previous、Current、Change、GSM8K change。表格下面不加说明文字。
+- Previous 和 Current 是并发 64 的每卡吞吐（口径见 §4.1：endpoint 是输出 token，8K/1K 是输入加输出 token），括号里是镜像日期。Previous 取该模型最近一次成功的镜像，所以不一定是上周（比如上周跑挂了）。
+- GSM8K change 写掉了多少、现在多少，例如 `−4.6 pts (now 88.1%)`。
+- N/A 表示跑挂、没有值；— 表示没有结果；first 表示第一次有数据，没有可比的。还没测的场景写一行 `pending (midweek)`。
 
 ### 5.3 详细报告
 
-依次是：
+依次是以下几节，全部英文：
 
-1. **测试环境**：测试 image 和 digest、base image、ATOM 和 aiter 的 branch 与 commit（带 commit 日期和标题）、依赖变化、两个场景的测试日期。取自 `runs/<YYYYMMDD>/image.json`（§2.4），缺的项从 CSV 里补。
-2. **性能表**（每个场景一张）：每个模型每个并发一行，列出每卡吞吐、vs 上次、vs 历史最佳（低 5% 及以上标 ⚠️，创新高标"新高"），以及第二指标（endpoint 是 E2E avg interactivity，8K/1K 是 ITL P50）和它的 vs 上次。
-3. **精度表**（每个场景一张）：flexible-extract、strict-match、上次、vs 上次。
-4. **趋势图**：每个场景两张，见 §5.4。
-5. **失败**：每个跑挂的 case 一小节，写一句话报错、`error.log` 的链接，以及核心 error log 段落（`error.log` 的前 60 行）。
+1. **Environment**：测试 image 和 digest、base image、ATOM 和 aiter 的 branch 与 commit（带 commit 日期和标题）、依赖变化、两个场景的测试日期。取自 `runs/<YYYYMMDD>/image.json`（§2.4），缺的项从 CSV 里补。
+2. **Performance**（每个场景一张表）：每个模型每个并发一行，列出 tok/s/GPU、vs previous、vs best（低 5% 及以上标 ⚠️，创新高标 new best），以及第二指标（endpoint 是 E2E avg interactivity，8K/1K 是 ITL P50）和它的 vs previous。
+3. **Accuracy**（每个场景一张表）：flexible-extract、strict-match、Previous（带日期）、vs previous。
+4. **Trends**：每个场景两张图，见 §5.4。
+5. **Failures**：每个跑挂的 case 一小节，写一句话报错、`error.log` 的链接，以及核心 error log 段落（`error.log` 的前 60 行，§3.4 摘出来的那份）。
 
 ### 5.4 趋势图
 

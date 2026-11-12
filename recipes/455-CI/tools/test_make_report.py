@@ -2,6 +2,7 @@
 
 import csv
 import json
+import re
 
 from ci455_data import ACCURACY_COLUMNS, PERF_COLUMNS
 from make_report import main
@@ -87,12 +88,19 @@ def test_writes_a_summary_with_highlights_and_a_detail_with_the_core_error_log(
 
     summary = (tmp_path / "reports" / "455-CI-report-20261114.md").read_text()
     detail = (tmp_path / "reports" / "455-CI-report-20261114-detail.md").read_text()
-    assert "Highlights" in summary and "❌" in summary
+    assert "## Highlights" in summary and "❌" in summary
     assert "455-CI-report-20261114-detail.md" in summary
-    assert "| 模型 | 场景 | 上次性能" in summary
+    assert "| Model | Scenario | Previous" in summary
     assert (
-        "| Kimi-K3 (2.8T) | MLPerf Endpoint | 1,000 | N/A | N/A |" in summary
-    )  # c64 failed
+        "| Kimi-K3 (2.8T) | MLPerf Endpoint | 1,000 (2026-11-07) | N/A (2026-11-14) | N/A |"
+        in summary
+    )
+    assert (
+        "| 8K/1K models | 8K/1K | pending" in summary
+    )  # no 8K/1K rows on the image yet
+    assert not re.search(
+        "[\u4e00-\u9fff]", summary + detail
+    )  # the reports are in English
     assert "Traceback" in detail and "out of memory" in detail  # the core error log
     assert "../runs/20261114/charts/perf-endpoint.png" in detail
     assert "sha256:abc" in detail

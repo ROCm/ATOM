@@ -68,7 +68,7 @@ ERROR_LOG = """\
 (mock)   File "/app/ATOM/atom/model_engine/model_runner.py", line 987, in run_model
 (mock)     hidden = self.model(input_ids, positions)
 (mock) RuntimeError: HIP error: out of memory (mock)
------ 最后 30 行 -----
+----- last 30 lines -----
 (mock) ERROR [engine_core] EngineCore_DP0 died, shutting down the server
 """
 

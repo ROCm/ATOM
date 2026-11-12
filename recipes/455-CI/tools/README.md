@@ -1,6 +1,6 @@
 # 455-CI 图和报告的生成脚本
 
-按 [`455-CI-guide.md`](../../455-CI-guide.md) §5，从 `perf.csv` 和 `accuracy.csv` 生成一个镜像的趋势图和两份报告。
+按 [`455-CI-guide.md`](../../455-CI-guide.md) §5，从 `perf.csv` 和 `accuracy.csv` 生成一个镜像的趋势图和两份报告，报告是英文的。
 
 | 文件 | 作用 |
 |---|---|

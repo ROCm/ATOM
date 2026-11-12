@@ -1,88 +1,88 @@
-# 455-CI 详细报告 · 2026-11-14 · 示例 EXAMPLE
+# 455-CI detailed report · 2026-11-14 · EXAMPLE
 
-> ⚠️ **EXAMPLE（示例）**：这是演示报告格式的例子，所有数字都是编的，不是真实测试数据。
+> ⚠️ **EXAMPLE**: this report only illustrates the format. All numbers are made up; they are not real test results.
 
-[← 报告](455-CI-report-20261114.md)
+[← Report](455-CI-report-20261114.md)
 
-## 测试环境
+## Environment
 
-| 项目 | 内容 |
+| Item | Value |
 |---|---|
-| 测试 image | `rocm/fw-bringup-mlperf:gfx1250-atom-ci455-20261114`（digest `sha256:0000mock`） |
-| base image | `rocm/fw-bringup-mlperf:gfx1250-atom-20261113` |
-| ATOM | `main` @ [`000000000`](https://github.com/ROCm/ATOM/commit/0000000000000000000000000000000000000000)，2026-11-14 (mock) ATOM main head |
-| aiter | `main` @ [`111111111`](https://github.com/ROCm/aiter/commit/1111111111111111111111111111111111111111)，2026-11-14 (mock) aiter main head |
-| 依赖变化 | 无 |
-| 测试日期 | MLPerf Endpoint 2026-11-14；8K/1K 2026-11-18（北京时间） |
+| Test image | `rocm/fw-bringup-mlperf:gfx1250-atom-ci455-20261114` (digest `sha256:0000mock`) |
+| Base image | `rocm/fw-bringup-mlperf:gfx1250-atom-20261113` |
+| ATOM | `main` @ [`000000000`](https://github.com/ROCm/ATOM/commit/0000000000000000000000000000000000000000), 2026-11-14 (mock) ATOM main head |
+| aiter | `main` @ [`111111111`](https://github.com/ROCm/aiter/commit/1111111111111111111111111111111111111111), 2026-11-14 (mock) aiter main head |
+| Dependency changes | none |
+| Test dates | MLPerf Endpoint 2026-11-14; 8K/1K 2026-11-18 (Beijing time) |
 
 ## MLPerf Endpoint
 
-### 性能
+### Performance
 
-| 模型 | GPU | 并发 | 每卡吞吐 tok/s/GPU | vs 上次 | vs 历史最佳 | E2E avg interactivity tok/s/user | vs 上次 |
+| Model | GPUs | Concurrency | tok/s/GPU | vs previous | vs best | E2E avg interactivity (tok/s/user) | vs previous |
 |---|---|---|---|---|---|---|---|
 | DeepSeek R1 | 4 | 4 | 150 | −1.7% | ⚠️ −6.6% | 149 | −0.6% |
 | DeepSeek R1 | 4 | 64 | 1,363 | −1.4% | ⚠️ −6.2% | 57.8 | −0.9% |
-| DeepSeek-V4.1-Flash | 4 | 4 | 250 | 🟢 +6.6% | +6.6%（新高） | 209 | −0.5% |
-| DeepSeek-V4.1-Flash | 4 | 64 | 2,838 | 🟢 +6.9% | +6.7%（新高） | 94.5 | +0.4% |
-| Kimi-K3 (2.8T) | 8 | 4 | 56.5 | +0.7% | +0.7%（新高） | 105 | −0.7% |
-| Kimi-K3 (2.8T) | 8 | 64 | 340 | +1.0% | +0.9%（新高） | 45.2 | −0.5% |
+| DeepSeek-V4.1-Flash | 4 | 4 | 250 | 🟢 +6.6% | +6.6% (new best) | 209 | −0.5% |
+| DeepSeek-V4.1-Flash | 4 | 64 | 2,838 | 🟢 +6.9% | +6.7% (new best) | 94.5 | +0.4% |
+| Kimi-K3 (2.8T) | 8 | 4 | 56.5 | +0.7% | +0.7% (new best) | 105 | −0.7% |
+| Kimi-K3 (2.8T) | 8 | 64 | 340 | +1.0% | +0.9% (new best) | 45.2 | −0.5% |
 | Qwen-35B-A3B | 1 | 4 | 1,005 | −0.1% | −0.1% | 262 | +0.5% |
 | Qwen-35B-A3B | 1 | 64 | N/A | N/A | N/A | N/A | — |
 
-### 精度（GSM8K，3-shot）
+### Accuracy (GSM8K, 3-shot)
 
-| 模型 | flexible-extract | strict-match | 上次 | vs 上次 |
+| Model | flexible-extract | strict-match | Previous | vs previous |
 |---|---|---|---|---|
-| DeepSeek R1 | 95.0% | 94.2% | 95.6% | −0.6 个点 |
-| DeepSeek-V4.1-Flash | 93.9% | 93.1% | 94.1% | −0.2 个点 |
-| Kimi-K3 (2.8T) | 96.1% | 95.3% | 96.2% | −0.1 个点 |
-| Qwen-35B-A3B | 90.1% | 89.3% | 90.2% | −0.1 个点 |
+| DeepSeek R1 | 95.0% | 94.2% | 95.6% (2026-11-07) | −0.6 pts |
+| DeepSeek-V4.1-Flash | 93.9% | 93.1% | 94.1% (2026-11-07) | −0.2 pts |
+| Kimi-K3 (2.8T) | 96.1% | 95.3% | 96.2% (2026-10-31) | −0.1 pts |
+| Qwen-35B-A3B | 90.1% | 89.3% | 90.2% (2026-11-07) | −0.1 pts |
 
-### 趋势
+### Trends
 
-![MLPerf Endpoint 每卡吞吐趋势](../runs/20261114/charts/perf-endpoint.png)
+![MLPerf Endpoint throughput per GPU](../runs/20261114/charts/perf-endpoint.png)
 
-![MLPerf Endpoint GSM8K 趋势](../runs/20261114/charts/accuracy-endpoint.png)
+![MLPerf Endpoint GSM8K](../runs/20261114/charts/accuracy-endpoint.png)
 
 ## 8K/1K
 
-### 性能
+### Performance
 
-| 模型 | GPU | 并发 | 每卡吞吐 tok/s/GPU | vs 上次 | vs 历史最佳 | ITL P50 ms（越低越好） | vs 上次 |
+| Model | GPUs | Concurrency | tok/s/GPU | vs previous | vs best | ITL P50 (ms, lower is better) | vs previous |
 |---|---|---|---|---|---|---|---|
-| DeepSeek-V4-Pro | 4 | 4 | 2,160 | +0.2% | +0.2%（新高） | 13.6 | +0.1% |
-| DeepSeek-V4-Pro | 4 | 64 | 10,058 | +0.6% | +0.5%（新高） | 37.1 | +1.1% |
-| GLM-5.2 | 4 | 4 | 2,682 | +1.0% | +0.9%（新高） | 10.7 | −0.8% |
+| DeepSeek-V4-Pro | 4 | 4 | 2,160 | +0.2% | +0.2% (new best) | 13.6 | +0.1% |
+| DeepSeek-V4-Pro | 4 | 64 | 10,058 | +0.6% | +0.5% (new best) | 37.1 | +1.1% |
+| GLM-5.2 | 4 | 4 | 2,682 | +1.0% | +0.9% (new best) | 10.7 | −0.8% |
 | GLM-5.2 | 4 | 64 | 12,304 | ⚠️ −4.2% | −4.2% | 29.3 | −0.2% |
-| MiniMax-M3 (428B) | 4 | 4 | 3,196 | +0.7% | +0.7%（新高） | 8.7 | −0.7% |
-| MiniMax-M3 (428B) | 4 | 64 | 16,287 | +0.9% | +0.9%（新高） | 23.2 | −0.5% |
-| Qwen-3.8 Flash | 1 | 4 | 4,948 | +0.9% | +0.7%（新高） | 5.8 | −1.0% |
-| Qwen-3.8 Flash | 1 | 64 | 26,655 | +0.4% | +0.2%（新高） | 15.5 | +0.7% |
+| MiniMax-M3 (428B) | 4 | 4 | 3,196 | +0.7% | +0.7% (new best) | 8.7 | −0.7% |
+| MiniMax-M3 (428B) | 4 | 64 | 16,287 | +0.9% | +0.9% (new best) | 23.2 | −0.5% |
+| Qwen-3.8 Flash | 1 | 4 | 4,948 | +0.9% | +0.7% (new best) | 5.8 | −1.0% |
+| Qwen-3.8 Flash | 1 | 64 | 26,655 | +0.4% | +0.2% (new best) | 15.5 | +0.7% |
 
-### 精度（GSM8K，3-shot）
+### Accuracy (GSM8K, 3-shot)
 
-| 模型 | flexible-extract | strict-match | 上次 | vs 上次 |
+| Model | flexible-extract | strict-match | Previous | vs previous |
 |---|---|---|---|---|
-| DeepSeek-V4-Pro | 95.3% | 94.5% | 95.5% | −0.2 个点 |
-| GLM-5.2 | 95.2% | 94.4% | 95.1% | +0.1 个点 |
-| MiniMax-M3 (428B) | 88.1% | 87.3% | 92.7% | ⚠️ −4.6 个点 |
-| Qwen-3.8 Flash | 89.1% | 88.3% | 89.7% | −0.6 个点 |
+| DeepSeek-V4-Pro | 95.3% | 94.5% | 95.5% (2026-11-07) | −0.2 pts |
+| GLM-5.2 | 95.2% | 94.4% | 95.1% (2026-11-07) | +0.1 pts |
+| MiniMax-M3 (428B) | 88.1% | 87.3% | 92.7% (2026-11-07) | ⚠️ −4.6 pts |
+| Qwen-3.8 Flash | 89.1% | 88.3% | 89.7% (2026-11-07) | −0.6 pts |
 
-### 趋势
+### Trends
 
-![8K/1K 每卡吞吐趋势](../runs/20261114/charts/perf-8k1k.png)
+![8K/1K throughput per GPU](../runs/20261114/charts/perf-8k1k.png)
 
-![8K/1K GSM8K 趋势](../runs/20261114/charts/accuracy-8k1k.png)
+![8K/1K GSM8K](../runs/20261114/charts/accuracy-8k1k.png)
 
-## 失败
+## Failures
 
-### Qwen-35B-A3B（MLPerf Endpoint）：c64
+### Qwen-35B-A3B (MLPerf Endpoint): c64
 
-- 报错：`RuntimeError: HIP error: out of memory (mock)`
-- 完整摘录：[error.log](../runs/20261114/qwen-35b-a3b/error.log)
+- Error: `RuntimeError: HIP error: out of memory (mock)`
+- Full excerpt: [error.log](../runs/20261114/qwen-35b-a3b/error.log)
 
-核心 error log：
+Core error log:
 
 ```text
 (mock) INFO  [model_runner] capturing CUDA graphs for batch sizes 1..64
@@ -92,6 +92,6 @@
 (mock)   File "/app/ATOM/atom/model_engine/model_runner.py", line 987, in run_model
 (mock)     hidden = self.model(input_ids, positions)
 (mock) RuntimeError: HIP error: out of memory (mock)
------ 最后 30 行 -----
+----- last 30 lines -----
 (mock) ERROR [engine_core] EngineCore_DP0 died, shutting down the server
 ```

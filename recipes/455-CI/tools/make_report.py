@@ -107,7 +107,7 @@ def main(argv=None):
             )
         )
     print(f"wrote {os.path.join(out, summary)}\nwrote {os.path.join(out, detail)}\n")
-    for line in highlights(results, pending):
+    for line in highlights(results):
         print("-", line)
 
 
