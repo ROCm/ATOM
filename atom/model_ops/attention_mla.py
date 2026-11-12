@@ -1337,7 +1337,9 @@ class MLAAttention(nn.Module):
             self._qrep_local_src = w
         return self._qrep_local_proj
 
-    def _dcp_merge(self, o, lse, ctx=None, owned_counts=None, quant_dtype=None):
+    def _dcp_merge(
+        self, o, lse, ctx=None, owned_counts=None, quant_dtype=None, head_major=False
+    ):
         """Bind this layer's DCP group and backend to ``dcp_ops.dcp_lse_merge``."""
         from atom.model_ops.dcp_ops import dcp_lse_merge
 
@@ -1349,6 +1351,7 @@ class MLAAttention(nn.Module):
             ctx=ctx,
             owned_counts=owned_counts,
             quant_dtype=quant_dtype,
+            head_major=head_major,
         )
 
     def _dcp_fused_quant_dtype(self):
@@ -1384,30 +1387,48 @@ class MLAAttention(nn.Module):
 
     @mark_trace(prefix="dcp_project_merge_out", torch_compile=False)
     def _dcp_project_merge_out(
-        self, o, lse, ctx=None, merge_in_fp32=False, owned_counts=None
+        self, o, lse, ctx=None, merge_in_fp32=False, owned_counts=None, head_major=False
     ):
         """Shared tail of both DCP paths: PBM projection, merge, o_proj.
 
         With PBM the V up-projection runs on the whole group's head set BEFORE
         the merge, so o_proj then takes an already-projected tensor. Without it
         the merge carries the latent and ``_v_up_proj_and_o_proj`` does both.
+        ``head_major`` hands the merge the projection's ``[H, B, V]`` storage
+        rather than its ``[B, H, V]`` view, when the projection stores that.
         """
         if self.pbm_enabled:
             o = self._v_up_proj(
                 o, self.W_V_dcp, self.W_V_dcp_scale, num_heads=o.shape[1]
             )
+        # Only the bf16 bmm stores [H, B, V]; the fp8 and fp4 ones store the
+        # [B, H, V] the pack reads, where head-major would add a copy.
+        head_major = (
+            head_major and self.pbm_enabled and o.transpose(0, 1).is_contiguous()
+        )
+        if head_major:
+            o = o.transpose(0, 1)
         # Only PBM hands the merge output straight to o_proj, so it is the only
         # path whose activation quant the combine can absorb. The fp32 merge is
         # a prefill-accuracy path and keeps its bf16 store.
         fused_quant = None if merge_in_fp32 else self._dcp_fused_quant_dtype()
         if merge_in_fp32:
             dtype = o.dtype
-            o = self._dcp_merge(o.float(), lse, ctx=ctx, owned_counts=owned_counts).to(
-                dtype
-            )
+            o = self._dcp_merge(
+                o.float(),
+                lse,
+                ctx=ctx,
+                owned_counts=owned_counts,
+                head_major=head_major,
+            ).to(dtype)
         else:
             o = self._dcp_merge(
-                o, lse, ctx=ctx, owned_counts=owned_counts, quant_dtype=fused_quant
+                o,
+                lse,
+                ctx=ctx,
+                owned_counts=owned_counts,
+                quant_dtype=fused_quant,
+                head_major=head_major,
             )
         if fused_quant is not None:
             o, o_scale = o
@@ -1451,6 +1472,7 @@ class MLAAttention(nn.Module):
             lse,
             merge_in_fp32=not self.dcp_prefill_merge_bf16_ok,
             owned_counts=attn_metadata.dcp_owned_counts[: q_out.shape[0]],
+            head_major=True,
         )
 
     @mark_trace(prefix="dcp_decode", torch_compile=False)
