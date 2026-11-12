@@ -217,6 +217,30 @@ def _pick_attn_res_config(tokens: int):
     return _ATTN_RES_CATCHALL
 
 
+# The zero addends the last row-sharded MoE layer handed back.
+_folded_zeros: list[torch.Tensor] = []
+
+
+def folded_zeros_like(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Two fresh zero ``x``s, which ``apply_attn_res`` adds without loading.
+
+    Fresh, not cached: Inductor may write a later kernel into a custom op's
+    output once that output is dead. Held here until an ``apply_attn_res``
+    takes them or the next call replaces them, so no other tensor can be
+    allocated at their addresses meanwhile."""
+    _folded_zeros[:] = (torch.zeros_like(x), torch.zeros_like(x))
+    return _folded_zeros[0], _folded_zeros[1]
+
+
+def _take_folded_zero(t: torch.Tensor) -> bool:
+    """Whether ``t`` is a held folded zero; a match releases it."""
+    for i, zero in enumerate(_folded_zeros):
+        if zero.data_ptr() == t.data_ptr():
+            del _folded_zeros[i]
+            return True
+    return False
+
+
 def _apply_attn_res_impl(
     prefix_sum: torch.Tensor,  # [T, H]
     block_residual: torch.Tensor,  # [T, B, H]; by stride, H unit-stride or copied
@@ -259,6 +283,8 @@ def _apply_attn_res_impl(
     do_add2 = add_hidden2 is not None
     if do_add2 and not do_add:
         raise ValueError("add_hidden2 requires add_hidden")
+    load_add = do_add and not _take_folded_zero(add_hidden)
+    load_add2 = do_add2 and not _take_folded_zero(add_hidden2)
     out_norm = out_norm_weight is not None
     quant = quant_dtype is not None
     if quant and not out_norm:
@@ -287,8 +313,10 @@ def _apply_attn_res_impl(
     # hs/hs2/pref pointers are always passed (triton needs a tensor); when not
     # adding they alias ps and are never dereferenced (DO_ADD / DO_ADD2 /
     # WRITE_PREF are False).
-    hs = add_hidden.contiguous() if do_add else ps
-    hs2 = add_hidden2.contiguous() if do_add2 else ps
+    hs = add_hidden.contiguous() if load_add else ps
+    hs2 = add_hidden2.contiguous() if load_add2 else ps
+    # Written whenever an addend was given, loaded or not: the op's outputs
+    # must not alias its inputs.
     pref = torch.empty_like(ps) if do_add else ps
 
     nw, ns, bl = (
@@ -324,8 +352,8 @@ def _apply_attn_res_impl(
         BD=triton.next_power_of_2(H),
         num_stages=ns,
         num_warps=nw,
-        DO_ADD=do_add,
-        DO_ADD2=do_add2,
+        DO_ADD=load_add,
+        DO_ADD2=load_add2,
         WRITE_PREF=do_add,
         OUT_NORM=out_norm,
         QUANT=quant,

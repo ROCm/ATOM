@@ -591,9 +591,7 @@ class K3MonoDecodeRunner:
         else:
             attn_out = layer.self_attn(positions, normed)
         after = before + (write_idx >= 0)
-        normed, prefix = layer.mlp_attn_res(prefix, blocks[:, :after], attn_out)
-        out, shared = layer._ffn(normed)
-        return prefix, out, shared
+        return layer._post_attention(attn_out, prefix, blocks[:, :after])
 
     def _k1(self, build, plan, prefix, delta, blocks, metadata, taps=None):
         """K1 -> the gated core rows (``o_proj``'s input).
