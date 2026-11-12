@@ -18,26 +18,6 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-import torch
-
-# ── 0. AITER's FP8 dtype on a machine with no GPU ──────────────────────────
-#
-# This is not a stand-in for a module: it corrects one value AITER cannot read
-# without a device. AITER picks `dtypes.fp8` off the detected arch and falls
-# back to `torch.uint8` when there is no GPU to ask, and `torch.finfo` of that
-# raises at import of `model_ops.blockscale_kernels.quantization` -- so every
-# module that reaches it (the V4.1 mono kernels among them) fails to COLLECT,
-# which reads as "no tests" rather than as an environment that cannot answer.
-# The guard is the fallback value itself, so on any machine whose AITER did
-# read an arch -- gfx950's OCP E4M3, gfx942's FNUZ -- this does nothing. CI has
-# no AITER at all and `importorskip`s those modules before reaching them.
-try:
-    import aiter
-
-    if aiter.dtypes.fp8 is torch.uint8:
-        aiter.dtypes.fp8 = torch.float8_e4m3fn
-except ImportError:
-    pass
 
 # ── 1. Resolve ATOM root and ensure it's on sys.path ──────────────────────
 
