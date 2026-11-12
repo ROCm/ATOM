@@ -71,6 +71,9 @@ def producer(pp_rank=0, pp_size=1, num_tokens=10):
     c._start_layer = pp_rank
     c._end_layer = pp_rank + 1
     c._block_region_consumer_indices = None
+    c._block_unit_specs = None
+    c._block_head_major_runs = ()
+    c._unit_layout = None
     c._block_region_roles = [None]
     c._per_block_bytes_list = [4]
     c._completed_prefills_lock = threading.Lock()
@@ -818,6 +821,7 @@ def test_consumer_dispatches_all_pp_stages_without_source_block_ids(
     c._num_local_layers = 3
     c._block_regions = [(100, 4), (200, 4), (300, 4)]
     c._block_region_roles = [None] * 3
+    c._unit_layout = None
     c._has_slot_regions = False
     c.kv_caches_base_addr = [100, 200, 300]
     c._send_on_socket = MagicMock()
