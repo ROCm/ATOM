@@ -479,6 +479,7 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             row = self.pool_rows[MLA_ROWS][module]
             kv_cache = self.kv_pool.layer("kv", row).view(-1, 1, self.kv_pool.entry_dim)
             module.max_model_len = runner.config.max_model_len
+            index_cache = None
             if runner.has_mla_indexer and getattr(module, "indexer", None) is not None:
                 # The module's own global layer number, not the bind
                 # ordinal: the map is keyed globally, and on a non-first PP
@@ -514,6 +515,7 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
                 v_cache=None,
                 k_scale=None,
                 v_scale=None,
+                index_cache=index_cache,
             )
 
         return None

@@ -445,7 +445,8 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         self.copies.staging.reserve(descriptor_slots)
 
     def get_kv_transfer_tensors(self):
-        """PAGE units and the native checkpoint contract, for `lmcache_mp`.
+        """PAGE units and the native checkpoint contract, for `lmcache_mp` and
+        `mooncake_store`.
 
         A PAGE unit is its main page plus that page's rows in each index plane
         (`PagedAttentionCache.unit_regions`; an FP4 owner has two, its values
