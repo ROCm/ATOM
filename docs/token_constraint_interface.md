@@ -75,6 +75,11 @@ return before bindings, steps or provider instances are allocated. A new adapter
 must not require a ModelRunner special case to disable head IDs or step override.
 ModelRunner centrally rejects those bypasses when has_constraints(batch) is true.
 
+These preparation and commit lifecycle guarantees apply to the regular sampling
+path. RapidServe disaggregated prefill applies stateless token masks before
+sampling; it does not run adapter preparation or commit. Stateful constraint
+adapters and JSON Schema remain unsupported across P/D handoff.
+
 Grammar release keeps its original asynchronous copy buffer leases. Channel
 immutable device tables are server resources; tokenIDProcessor owns GPU carried
 request states through its existing output/batch lifecycle. Adapter release must
