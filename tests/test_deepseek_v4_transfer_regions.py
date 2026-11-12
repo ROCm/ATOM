@@ -840,6 +840,7 @@ def _fp4_pd_pair(builder_cls, writer, kv_dtype="fp8", coalesce=False):
         ),
         _block_region_consumer_indices=None,
         _block_unit_specs=None,  # MLA: matched by position and role
+        _block_head_major_runs=(),
         _per_block_bytes_list=[r.unit_bytes for r in src.block_regions],
         _MAX_RDMA_ENTRIES_PER_BATCH=4096,
         _block_mr_ends=[[r.total_bytes] for r in src.block_regions],

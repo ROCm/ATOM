@@ -860,11 +860,9 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
 
 def _pack_unit_layout(pages) -> bytes | None:
     """Each PAGE region's spec, head runs and width, packed once for producers;
-    None where the backend names no units."""
+    None unless every region names its unit (an MLA target names none)."""
     specs = [page.unit_spec for page in pages]
     if not specs or None in specs:
-        if any(specs):
-            raise ValueError("Every PAGE region carries a unit spec, or none does")
         return None
     return msgpack.dumps(
         [
@@ -2979,6 +2977,24 @@ class MooncakeConnector(KVConnectorBase):
             )
             roles = request_data.get("consumer_region_roles")
             bpb = request_data.get("consumer_block_bpb")
+            per_head = [
+                role
+                for role, runs in zip(
+                    self._block_region_roles, self._block_head_major_runs
+                )
+                if runs is not None
+            ]
+            consumer_tp = per_head and int(
+                request_data.get("consumer_tp_size", self.tp_size)
+            )
+            if per_head and consumer_tp != self.tp_size:
+                # By position, consumer rank c would get producer rank c % P's
+                # heads (an MHA draft beside an MLA target).
+                raise RuntimeError(
+                    f"req {req_id}: {per_head[0]} and {len(per_head) - 1} more "
+                    "regions are split by KV head, which only a layout naming "
+                    f"every unit can cut from TP {self.tp_size} to {consumer_tp}"
+                )
             if any(not 0 <= c < num_consumer_regions for c in cmap) or any(
                 v is not None and len(v) != num_consumer_regions for v in (roles, bpb)
             ):

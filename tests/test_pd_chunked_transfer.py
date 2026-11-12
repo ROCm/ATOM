@@ -72,6 +72,7 @@ def producer(pp_rank=0, pp_size=1, num_tokens=10):
     c._end_layer = pp_rank + 1
     c._block_region_consumer_indices = None
     c._block_unit_specs = None
+    c._block_head_major_runs = ()
     c._unit_layout = None
     c._block_region_roles = [None]
     c._per_block_bytes_list = [4]

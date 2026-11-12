@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 import torch
 
+from atom.kv_transfer.disaggregation.page_region import page_region
 from atom.model_ops.attentions.mha_kv_pool import MhaKvPool
 from atom.model_ops.attentions.pool_layout.entry_arena import EntryField
 from atom.model_ops.attentions.pool_layout.pool_rows import KvGeometry
@@ -78,7 +79,9 @@ def _producer(pages, mem, heads, partition, rank, monkeypatch):
         _per_block_bytes_list=[p.region.unit_bytes for p in pages],
         _block_region_roles=[p.region.semantic_role for p in pages],
         _block_head_major_runs=tuple(p.head_major_runs for p in pages),
-        _block_unit_specs=tuple(p.unit_spec for p in pages),
+        _block_unit_specs=(
+            mc._pack_unit_layout(pages) and tuple(p.unit_spec for p in pages)
+        ),
         _block_region_consumer_indices=None,
         _unit_plans={},
         _slot_regions=[],
@@ -283,3 +286,39 @@ def test_the_backend_views_sparse_layers_as_the_sparse_writer_lays_heads_out():
         unit = page.view[2].view(runs, heads, -1)
         for head in range(heads):
             assert torch.all(unit[:, head] == head + 1)
+
+
+def _mla_target_with_mha_draft(heads):
+    """An MLA target names no units; its paged MHA (EAGLE3) draft does."""
+    pool = MhaKvPool(
+        layers=1,
+        block_size=BLOCK,
+        num_kv_heads=heads,
+        head_dim=HEAD_DIM,
+        kv_dtype=torch.bfloat16,
+    )
+    pool.allocate(4, "cpu")
+    mla = page_region(torch.zeros(4, 576, dtype=torch.uint8), semantic_role="mla.kv")
+    return [mla, *pool.transfer_pages("draft", "draft", [LAYERS + 1])]
+
+
+@pytest.mark.parametrize("heads", [1, 4])
+def test_an_mla_target_with_an_mha_draft_moves_by_position(heads, monkeypatch):
+    """Same TP copies every region whole, as on main; another TP is refused
+    rather than handing consumer rank c producer rank c % P's draft heads."""
+    mem = _Memory()
+    ours = _mla_target_with_mha_draft(heads)
+    assert mc._pack_unit_layout(ours) is None
+    producer = _producer(ours, mem, heads, (1,), 0, monkeypatch)
+    theirs = _mla_target_with_mha_draft(1)
+    bases = [mem.add(4 * p.region.unit_bytes, False) for p in theirs]
+    request = _request(theirs, bases, 0)
+    if heads == 4:  # a TP1 producer, a TP4 consumer
+        _refused(producer, request, mem, "split by KV head")
+        return
+    assert producer._execute_block_transfer(request, "consumer", [2], [1], "mixed")
+    for page, src_base, dst_base in zip(ours, producer.kv_caches_base_addr, bases):
+        n = page.region.unit_bytes
+        assert np.array_equal(
+            mem.at(dst_base + n, n), mem.at(src_base + 2 * n, n)
+        ), page.region.semantic_role

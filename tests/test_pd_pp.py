@@ -1810,6 +1810,7 @@ def test_dcp_block_descriptors_are_streamed_in_bounded_batches():
     connector._block_region_roles = [MLA_KV_ROLE, MLA_KV_ROLE]
     connector._block_region_consumer_indices = None
     connector._block_unit_specs = None
+    connector._block_head_major_runs = ()
     connector._unit_layout = None
     connector._consumer_region_map = lambda *_args, **_kwargs: [0, 1]
 
@@ -1878,6 +1879,7 @@ def test_dcp_index_staging_waits_for_request_ready_event():
     connector._block_region_roles = [MLA_KV_ROLE, INDEX_CACHE_ROLE]
     connector._block_region_consumer_indices = None
     connector._block_unit_specs = None
+    connector._block_head_major_runs = ()
     connector._unit_layout = None
     connector._consumer_region_map = lambda *_args, **_kwargs: [0, 1]
     connector._index_staging_chunk_pages = 256
@@ -1941,6 +1943,7 @@ def test_dcp_index_staging_rejects_missing_request_ready_event():
     connector._block_region_roles = [MLA_KV_ROLE, INDEX_CACHE_ROLE]
     connector._block_region_consumer_indices = None
     connector._block_unit_specs = None
+    connector._block_head_major_runs = ()
     connector._unit_layout = None
     connector._consumer_region_map = lambda *_args, **_kwargs: [0, 1]
     connector._index_staging_chunk_pages = 256
