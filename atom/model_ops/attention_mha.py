@@ -1236,9 +1236,6 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
     """
 
     is_indexed_sparse_attention = True
-    # `rope_cache` writes and reads the cache through page-16 SHUFFLE views
-    # (`to_page16_shuffle`), so a block holds its KV heads in 16-token runs.
-    shuffle_page_tokens = 16
 
     @staticmethod
     def qkv_fields(
