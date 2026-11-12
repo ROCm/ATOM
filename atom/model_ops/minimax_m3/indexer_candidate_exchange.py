@@ -271,12 +271,10 @@ def _merge_topk(
         )
 
 
-# Per layer in a graph on AgentX contexts (S=8, 1M bound, 2048-wide shards):
-# 6.0-10.0 us at batch 24-60 against 8.8-15.8 us for 512-wide tiles walked in
-# turn, 5.6-6.2 against 7.2-9.5 at batch 8-16 with a long row. A grid under
-# about three programs a CU is latency-bound: four warps and an unfiltered
-# narrow tile win there (3.3-3.4 against 4.1 us at batch 4-8, short rows),
-# two warps and the filter above it.
+# A row reads its shard in one tile, the narrowest of these that covers it, rather
+# than in 512-wide tiles walked in turn. A grid under about three programs a CU is
+# latency-bound: four warps and an unfiltered narrow tile are faster there, two
+# warps and the filter above it.
 _LOCAL_TOPK_WIDTHS = (512, 1024, 2048)
 _LOCAL_TOPK_FULL_GRID = 768
 
