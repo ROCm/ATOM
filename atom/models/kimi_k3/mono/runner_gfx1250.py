@@ -63,6 +63,7 @@ from atom.models.kimi_k3.mono.kernels.stages.k2_allreduce_gfx1250 import (
 from atom.models.kimi_k3.mono.kernels.stages.k2_allreduce_gfx1250 import (
     allreduce_peer_bytes,
     build_allreduce,
+    build_shared_push,
 )
 from atom.models.kimi_k3.mono.kernels.stages.k2_finish_persistent_gfx1250 import (
     build_packed_finish,
@@ -206,8 +207,10 @@ class Gfx1250RoutedK2Build:
     herd: bool = False
     herd_routes: _PrecomputedHerd | None = None
     # the replicated finalize's all-reduce in a kernel, where the TP group's
-    # symm_mem banks map (``K3Gfx1250MonoDecodeRunner.k2_peers``)
+    # symm_mem banks map (``K3Gfx1250MonoDecodeRunner.k2_peers``): the shared
+    # partials pushed beside the routed MoE, then the routed ones
     allreduce: object | None = None
+    shared_push: object | None = None
 
 
 @dataclass(frozen=True)
@@ -226,8 +229,9 @@ class Gfx1250WidthBuild:
                     (k2.finalize.launcher, k2.finalize.abi),
                 )
             )
-            if k2.allreduce is not None:
-                pairs.append((k2.allreduce.launcher, k2.allreduce.abi))
+            for kernel in (k2.allreduce, k2.shared_push):
+                if kernel is not None:
+                    pairs.append((kernel.launcher, kernel.abi))
 
         unique = {}
         for launcher, abi in pairs:
@@ -255,6 +259,7 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                 self.tp,
                 self.device,
             )
+            self.push_stream = torch.cuda.Stream(self.device)
         self.widths = WidthBuilds(
             self._build_width,
             Gfx1250WidthBuild.kernels,
@@ -488,10 +493,13 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                 if herd
                 else None
             ),
-            (
-                build_allreduce(self.tp, rows)
+            *(
+                (
+                    build_allreduce(self.tp, rows, routed_only=True),
+                    build_shared_push(self.tp, rows),
+                )
                 if replicated and self.k2_peers is not None
-                else None
+                else (None, None)
             ),
         )
 
@@ -592,6 +600,18 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                 plan, weight, local, attn_out, prefix, blocks, x
             )
         self._finish(weight, local, gathered, stream)
+        if local.shared_push is not None:
+            # The finish wrote the shared partials: push them beside the routed
+            # MoE. The push only stores, so nothing on either stream waits on
+            # a peer meanwhile.
+            self.push_stream.wait_stream(stream)
+            local.shared_push.launcher(
+                buffers["reduce"].data_ptr(),
+                self.k2_peers.peers.data_ptr(),
+                self.k2_peers.epochs.data_ptr(),
+                self.rank,
+                stream=self.push_stream,
+            )
         moe = self.inner.layers[plan.layer_id].block_sparse_moe
         if local.herd_routes is not None:
             self._grouped_moe(weight, local, moe)
@@ -621,6 +641,8 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             )
         if local.replicated_finalize:
             if local.allreduce is not None:
+                if local.shared_push is not None:
+                    stream.wait_stream(self.push_stream)
                 local.allreduce.launcher(
                     buffers["reduce"].data_ptr(),
                     self.k2_peers.peers.data_ptr(),

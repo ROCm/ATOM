@@ -50,6 +50,7 @@ def test_width_build_enumerates_each_local_launcher_once_and_compile_only():
         finish=SimpleNamespace(launcher=launchers[2], abi=KernelAbi(("finish",))),
         finalize=SimpleNamespace(launcher=launchers[3], abi=KernelAbi(("finalize",))),
         allreduce=SimpleNamespace(launcher=launchers[4], abi=KernelAbi(("data",))),
+        shared_push=None,
     )
     build = Gfx1250WidthBuild(
         k1={1: k1, 2: k1},
@@ -370,6 +371,7 @@ def test_grouped_k2_projects_locally_then_runs_grouped_moe(monkeypatch, herd):
         replicated_finalize=False,
         herd=herd,
         herd_routes=None,
+        shared_push=None,
     )
     x = tensor(rows, 4)
     experts = SimpleNamespace(w13_weight_scale=tensor(2), w2_weight_scale=tensor(2))
@@ -472,6 +474,7 @@ def test_replicated_finalize_all_reduces_both_partials_once(monkeypatch, kernel_
         herd=False,
         herd_routes=None,
         allreduce=recorder("allreduce") if kernel_ar else None,
+        shared_push=recorder("shared_push") if kernel_ar else None,
     )
     experts = SimpleNamespace(w13_weight_scale=None, w2_weight_scale=None)
     layer = SimpleNamespace(
@@ -488,13 +491,17 @@ def test_replicated_finalize_all_reduces_both_partials_once(monkeypatch, kernel_
     )
     runner.routed = {layer_id: weight}
     runner.inner = SimpleNamespace(layers={layer_id: layer})
+    runner.push_stream = SimpleNamespace(
+        wait_stream=lambda other: calls.setdefault("fork", other)
+    )
+    main = SimpleNamespace(wait_stream=lambda other: calls.setdefault("join", other))
     group = SimpleNamespace(
         all_reduce=lambda value, ca_fp8_quant=False: calls["all_reduce"].append(
             value
         ),
     )
     monkeypatch.setattr(runner_module, "get_tp_group", lambda: group)
-    monkeypatch.setattr(runner_module.torch.cuda, "current_stream", lambda: None)
+    monkeypatch.setattr(runner_module.torch.cuda, "current_stream", lambda: main)
     monkeypatch.setattr(
         runner_module, "_bf16_attn_res", lambda site, *args: site(*args[:3])
     )
@@ -509,13 +516,16 @@ def test_replicated_finalize_all_reduces_both_partials_once(monkeypatch, kernel_
     )
 
     if kernel_ar:
-        assert calls["all_reduce"] == []
-        assert calls["allreduce"] == (
+        expected = (
             reduce.data_ptr(),
             runner.k2_peers.peers.data_ptr(),
             runner.k2_peers.epochs.data_ptr(),
             3,
         )
+        assert calls["all_reduce"] == []
+        assert calls["shared_push"] == expected and calls["allreduce"] == expected
+        # the push forks off the finish and the all-reduce joins it
+        assert calls["fork"] is main and calls["join"] is runner.push_stream
     else:
         assert [value is reduce for value in calls["all_reduce"]] == [True]
     assert calls["finalize"] == (
