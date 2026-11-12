@@ -74,6 +74,7 @@ try:
         _MLA_DCP_KERNEL_WIDTHS_NON_PERSISTENT_FP8,
         _MLA_DCP_SPARSE_PREFILL_WIDTHS,
         _MLA_DCP_SPARSE_PREFILL_WIDTHS_PERSISTENT,
+        MLAAttention,
         mla_dcp_kernel_num_heads,
         mla_dcp_sparse_prefill_num_heads,
     )
@@ -89,6 +90,7 @@ try:
         reorg_kvcache,
     )
     from atom.model_ops.linear import ColumnParallelLinear
+    from atom.model_ops.utils import dynamic_per_batched_tensor_quant
     from atom.quant_spec import LayerQuantConfig, QuantType
 
     _DCP_OPS_ERR = None
@@ -791,17 +793,14 @@ def test_a2a_scrubs_the_empty_rank():
     torch.testing.assert_close(got[0].float(), o[1][0].float(), rtol=8e-3, atol=8e-3)
 
 
-def _cp_lse_a2a_on_every_rank(monkeypatch, o, lse, owned_counts, **kwargs):
-    """``cp_lse_a2a`` as each rank in turn, its all-to-alls fed by every rank's sends.
+def _on_every_rank(monkeypatch, n, run):
+    """``run(rank)`` as each rank in turn, its all-to-alls fed by every rank's sends.
 
     What a rank sends depends on its own inputs alone, so a first pass records
     each rank's sends and a second hands rank j, call by call, chunk j of every
-    rank's send -- the permutation ``all_to_all_single`` performs.
+    rank's send -- the permutation ``all_to_all_single`` performs. Returns the
+    outputs and how many all-to-alls a rank ran.
     """
-    from atom.model_ops.dcp_ops import cp_lse_a2a
-
-    n = len(o)
-    group = SimpleNamespace(world_size=n, device_group=None)
     sent = [[] for _ in range(n)]
     rank, calls = 0, iter(())
 
@@ -818,17 +817,26 @@ def _cp_lse_a2a_on_every_rank(monkeypatch, o, lse, owned_counts, **kwargs):
         outs = []
         for rank in range(n):
             calls = iter(range(len(sent[rank])))
-            x = (
-                o[rank].transpose(0, 1).contiguous()
-                if kwargs.get("head_major")
-                else o[rank]
-            )
-            outs.append(
-                cp_lse_a2a(
-                    x, lse[rank], group, owned_counts=owned_counts[rank], **kwargs
-                )
-            )
-    return outs
+            outs.append(run(rank))
+    return outs, len(sent[0])
+
+
+def _cp_lse_a2a_on_every_rank(monkeypatch, o, lse, owned_counts, **kwargs):
+    from atom.model_ops.dcp_ops import cp_lse_a2a
+
+    group = SimpleNamespace(world_size=len(o), device_group=None)
+
+    def run(rank):
+        x = (
+            o[rank].transpose(0, 1).contiguous()
+            if kwargs.get("head_major")
+            else o[rank]
+        )
+        return cp_lse_a2a(
+            x, lse[rank], group, owned_counts=owned_counts[rank], **kwargs
+        )
+
+    return _on_every_rank(monkeypatch, len(o), run)[0]
 
 
 @needs_gpu
@@ -864,6 +872,59 @@ def test_head_major_a2a_matches_the_packed_one_bitwise(monkeypatch, dtype, quant
     for want, got in zip(packed, head_major, strict=True):
         for x, y in zip(want, got, strict=True):
             assert torch.equal(x.view(torch.uint8), y.view(torch.uint8))
+
+
+@needs_gpu
+@pytest.mark.parametrize("merge_in_fp32", [False, True])
+@pytest.mark.parametrize("fp8_absorb", [False, True])
+def test_project_merge_out_head_major_matches_the_packed_one(
+    monkeypatch, fp8_absorb, merge_in_fp32
+):
+    """The DCP tail returns the same bits with ``head_major`` as without. Only
+    the bf16 projection stores ``[H, B, V]``, so only it skips the pack and
+    sends the LSE in a second all-to-all."""
+    b, h, latent, v_dim, n_ranks = 8, 16, 128, 32, 4
+    g = torch.Generator(device=DEV).manual_seed(9)
+    layer = MLAAttention.__new__(MLAAttention)
+    torch.nn.Module.__init__(layer)
+    layer.pbm_enabled, layer.dcp_comm_backend = True, "a2a"
+    layer.dcp_group = SimpleNamespace(world_size=n_ranks, device_group=None)
+    layer.num_heads, layer.kv_lora_rank, layer.v_head_dim = h // n_ranks, latent, v_dim
+    layer.o_proj = lambda x: x
+    w_v = torch.randn(h, v_dim, latent, generator=g, device=DEV).bfloat16()
+    layer.W_V_dcp, layer.W_V_dcp_scale = (
+        dynamic_per_batched_tensor_quant(w_v, dtype=dtypes.fp8)
+        if fp8_absorb
+        else (w_v, None)
+    )
+    o = [
+        torch.randn(b, h, latent, generator=g, device=DEV).bfloat16()
+        for _ in range(n_ranks)
+    ]
+    lse = [torch.randn(b, h, generator=g, device=DEV) for _ in range(n_ranks)]
+    owned_counts = [
+        torch.ones(b, dtype=torch.int32, device=DEV) for _ in range(n_ranks)
+    ]
+    owned_counts[0][1] = 0
+
+    def tail(head_major):
+        return _on_every_rank(
+            monkeypatch,
+            n_ranks,
+            lambda r: layer._dcp_project_merge_out(
+                o[r],
+                lse[r],
+                merge_in_fp32=merge_in_fp32,
+                owned_counts=owned_counts[r],
+                head_major=head_major,
+            ),
+        )
+
+    packed, packed_a2as = tail(False)
+    head_major, head_major_a2as = tail(True)
+    assert (packed_a2as, head_major_a2as) == (1, 1 if fp8_absorb else 2)
+    for want, got in zip(packed, head_major, strict=True):
+        assert torch.equal(want, got)
 
 
 @needs_dcp_ops

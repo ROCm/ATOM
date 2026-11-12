@@ -1405,14 +1405,18 @@ class MLAAttention(nn.Module):
         With PBM the V up-projection runs on the whole group's head set BEFORE
         the merge, so o_proj then takes an already-projected tensor. Without it
         the merge carries the latent and ``_v_up_proj_and_o_proj`` does both.
-        ``head_major`` hands the merge the projection's ``[H, B, V]`` output
-        rather than its ``[B, H, V]`` view; it needs PBM.
+        ``head_major`` hands the merge the projection's ``[H, B, V]`` storage
+        rather than its ``[B, H, V]`` view, when the projection stores that.
         """
-        head_major = head_major and self.pbm_enabled
         if self.pbm_enabled:
             o = self._v_up_proj(
                 o, self.W_V_dcp, self.W_V_dcp_scale, num_heads=o.shape[1]
             )
+        # Only the bf16 bmm stores [H, B, V]; the fp8 and fp4 ones store the
+        # [B, H, V] the pack reads, where head-major would add a copy.
+        head_major = (
+            head_major and self.pbm_enabled and o.transpose(0, 1).is_contiguous()
+        )
         if head_major:
             o = o.transpose(0, 1)
         # Only PBM hands the merge output straight to o_proj, so it is the only
