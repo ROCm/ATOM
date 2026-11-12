@@ -61,8 +61,9 @@ def _small_k_selector():
     against 36us at a 1M context. `_aiter_selector_wins` says where.
 
     Imported where a row first takes it, once, for the reason `flydsl_ops` is. No probe
-    and no fallback: a row wide enough to take it on an aiter without it fails here
-    rather than quietly running the Triton selector.
+    and no fallback: a row wide enough to take it on an aiter without it (the minimum is
+    ROCm/aiter#7014, in docs/configuration_guide.md) fails here rather than quietly
+    running the Triton selector.
     """
     from aiter.ops.flydsl.topk.topk_per_row_small_k import (
         topk_per_row_small_k,
