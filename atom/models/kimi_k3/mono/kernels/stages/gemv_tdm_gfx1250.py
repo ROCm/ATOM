@@ -49,7 +49,7 @@ from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import (
     tdm_lds_words,
     tdm_task_words,
 )
-from atom.mono.device.ops import mma_bf16, rsrc
+from atom.mono.device.ops import mma_bf16, rsrc, traced
 from atom.mono.plan.architecture import GFX1250
 
 SLAB = TDM_SLAB
@@ -83,14 +83,17 @@ def load_rows(
     mask: int = 0,
     padded: bool = True,
     cache_policy: int = 0,
+    whole: bool = False,
 ):
     """Issue this wave's TDM copy of ``rows_per_wave`` of a [rows, SLAB] BF16
     tile starting at ``address`` into ``lds``; rows past ``rows`` are skipped.
     ``mask`` is the cluster multicast mask of identical loads to merge.
-    ``padded``: LDS rows ``ROW_STRIDE`` apart, else packed ``SLAB`` apart."""
+    ``padded``: LDS rows ``ROW_STRIDE`` apart, else packed ``SLAB`` apart.
+    ``whole``: the first ``rows_per_wave`` rows in one copy, by the caller's
+    one wave."""
 
     wave = fx.Int32(rocdl.wave_id())
-    row0 = wave * rows_per_wave
+    row0 = fx.Int32(0) if whole else wave * rows_per_wave
     source = address + fx.Int64(row0) * fx.Int64(row_stride * 2)
     pitch = ROW_STRIDE if padded else SLAB
     destination = fx.Int32(fx.ptrtoint(lds)) + row0 * (pitch * 2)
@@ -138,6 +141,14 @@ def load_rows(
         zero8,
         cache_policy=ir.IntegerAttr.get(ir.IntegerType.get_signless(32), cache_policy),
     )
+
+
+@traced
+def _on_wave(wave, issuer, emit):
+    """``emit()`` on wave ``issuer`` only: the others skip the instruction, so
+    their tensor counters never see it."""
+    if wave == issuer:
+        emit()
 
 
 def _operand(lds, row, wave, lane):
@@ -204,6 +215,9 @@ def project(
     wave,
     w_scale=None,
     depth: int = DEPTH,
+    prologue=None,
+    x_cache_policy: int = 0,
+    wide: bool = True,
 ):
     """``x[rows, k] @ w[task_rows[i]:+16, k]^T`` for each task, as v8 f32 WMMA
     accumulators ``[task][16-token tile]``. ``w`` has ``w_rows`` rows of ``k``
@@ -211,7 +225,16 @@ def project(
 
     With ``w_scale``, ``w`` is FP8 in AITER's gfx1250 preshuffle with its rows
     padded to 128 and ``w_scale`` its ``[rows / 128, k / 128]`` E8M0 block
-    scales: the per_1x128 layout ATOM's online quant leaves."""
+    scales: the per_1x128 layout ATOM's online quant leaves.
+
+    ``prologue``: emitted once the first ``depth`` weight slabs are in flight
+    and before ``x`` is first read, so ``x`` may be produced there by other
+    CTAs; ``x_cache_policy`` is then the scope ``x`` is read at.
+
+    ``wide``: each slab's tokens and each task's weight slab move in one TDM
+    copy, by a wave of its own in turn, not as every wave's few rows: a wave
+    keeps at most three tensor copies in flight, so small copies cap the bytes
+    a CU has in flight."""
 
     if k % SLAB:
         raise ValueError(f"TDM GEMV needs K divisible by {SLAB}, got {k}")
@@ -248,54 +271,84 @@ def project(
         word = fx.ptr_load(scales + task * GFX1250.wave_size + slab)
         return (word >> (wave // (128 // WAVE_COLUMNS) * 8)) & 0xFF
 
+    owned = {w: [] for w in range(WAVES)}
+    turn = [0]
+
+    def next_issuer(slab):
+        issuer = turn[0] % WAVES
+        turn[0] += 1
+        owned[issuer].append(slab)
+        return issuer
+
     def issue_tokens(slab):
-        load_rows(
-            x + fx.Int64(slab * SLAB * 2),
-            x_stride,
-            lds + (slab % 2) * token_words,
-            rows,
-            rows_per_wave,
-            _CLUSTER_MASK,
-        )
+        def emit(whole=False):
+            load_rows(
+                x + fx.Int64(slab * SLAB * 2),
+                x_stride,
+                lds + (slab % 2) * token_words,
+                rows,
+                rows if whole else rows_per_wave,
+                _CLUSTER_MASK,
+                cache_policy=x_cache_policy,
+                whole=whole,
+            )
+
+        if wide:
+            _on_wave(wave, next_issuer(slab), lambda: emit(True))
+        else:
+            emit()
         issued.append(slab)
 
     def issue_weights(slab):
         for task in range(tasks):
             destination = lds + x_words + ((slab % stages) * tasks + task) * task_words
-            if fp8:
-                # The task's slab is one contiguous 16 x 512 B block: copied as
-                # WAVES packed 512-element rows.
-                load_rows(
-                    w
-                    + fx.Int64(task_rows[task]) * fx.Int64(k)
-                    + fx.Int64(slab * SLAB * ROWS),
-                    SLAB,
-                    destination,
-                    WAVES,
-                    1,
-                    padded=False,
-                    cache_policy=_WEIGHT_CACHE_POLICY,
-                )
+
+            def emit(task=task, destination=destination, whole=False):
+                if fp8:
+                    # The task's slab is one contiguous 16 x 512 B block:
+                    # copied as WAVES packed 512-element rows.
+                    load_rows(
+                        w
+                        + fx.Int64(task_rows[task]) * fx.Int64(k)
+                        + fx.Int64(slab * SLAB * ROWS),
+                        SLAB,
+                        destination,
+                        WAVES,
+                        WAVES if whole else 1,
+                        padded=False,
+                        cache_policy=_WEIGHT_CACHE_POLICY,
+                        whole=whole,
+                    )
+                else:
+                    load_rows(
+                        w
+                        + fx.Int64(task_rows[task]) * fx.Int64(k * 2)
+                        + fx.Int64(slab * SLAB * 2),
+                        k,
+                        destination,
+                        fx.Int32(w_rows) - task_rows[task],
+                        ROWS if whole else ROWS // WAVES,
+                        cache_policy=_WEIGHT_CACHE_POLICY,
+                        whole=whole,
+                    )
+
+            if wide:
+                _on_wave(wave, next_issuer(slab), lambda emit=emit: emit(whole=True))
             else:
-                load_rows(
-                    w
-                    + fx.Int64(task_rows[task]) * fx.Int64(k * 2)
-                    + fx.Int64(slab * SLAB * 2),
-                    k,
-                    destination,
-                    fx.Int32(w_rows) - task_rows[task],
-                    ROWS // WAVES,
-                    cache_policy=_WEIGHT_CACHE_POLICY,
-                )
+                emit()
             issued.append(slab)
 
     accumulators = [
         [fx.Vector.filled(ACCUMULATOR_ELEMENTS, 0.0, fx.Float32) for _ in range(tiles)]
         for _ in range(tasks)
     ]
-    issue_tokens(0)
+    if prologue is None:
+        issue_tokens(0)
     for slab in range(min(depth, slabs)):
         issue_weights(slab)
+    if prologue is not None:
+        prologue()
+        issue_tokens(0)
     for slab in range(slabs):
         if slab:
             # The buffers slab - 1 read are the ones refilled below.
@@ -309,8 +362,15 @@ def project(
             issue_tokens(1)
         if slab + depth < slabs:
             issue_weights(slab + depth)
-        last = max(index for index, tag in enumerate(issued) if tag == slab)
-        rocdl.s_wait_tensorcnt(len(issued) - 1 - last)
+        if wide:
+            for issuer, tags in owned.items():
+                if slab in tags:
+                    last = max(index for index, tag in enumerate(tags) if tag == slab)
+                    later = len(tags) - 1 - last
+                    _on_wave(wave, issuer, lambda n=later: rocdl.s_wait_tensorcnt(n))
+        else:
+            last = max(index for index, tag in enumerate(issued) if tag == slab)
+            rocdl.s_wait_tensorcnt(len(issued) - 1 - last)
         gpu.barrier()
         weights = [
             (
