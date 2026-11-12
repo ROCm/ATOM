@@ -2,16 +2,25 @@
 //! looked up by token at routing time instead of being indexed from events, and projected
 //! onto the workers that can load from them (readers).
 
+pub mod keys;
+pub mod mock;
 pub mod source;
+#[cfg(test)]
+mod tests;
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::Serialize;
 
-pub use self::source::{
-    FailReason, Gate, GateReason, KeyRule, KeyState, RankProbe, ReaderRule, SourceId,
-    StorageBackend, StorageBackendSpec, StorageHitSource, StorageLookup, StorageSourceSpec,
+pub use self::{
+    keys::AtomChunk,
+    mock::{MockPool, MockStore},
+    source::{
+        merge_pools, FailReason, Gate, GateReason, KeyRule, KeyState, PoolAnswer, RankProbe,
+        ReaderRule, SourceId, StorageBackend, StorageBackendSpec, StorageHitSource, StorageLookup,
+        StorageSourceSpec,
+    },
 };
 use crate::{
     core::Worker,

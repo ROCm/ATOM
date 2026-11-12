@@ -19,6 +19,18 @@ pub enum KeyState {
     Unknown,
 }
 
+impl KeyState {
+    /// Pools merge to the highest level, the ranks of a chunk to the lowest.
+    pub(crate) fn level(self) -> u8 {
+        match self {
+            KeyState::Absent => 0,
+            KeyState::Unknown => 1,
+            KeyState::SsdOnly => 2,
+            KeyState::Memory => 3,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailReason {
     Timeout,
@@ -127,6 +139,57 @@ pub struct Gate {
 pub trait StorageBackend: Send + Sync + fmt::Debug {
     /// One state per key, in key order.
     async fn query(&self, keys: &[String]) -> Result<Vec<KeyState>, FailReason>;
+
+    /// Pools last seen holding the writer's taint marker.
+    fn tainted_pools(&self) -> u32 {
+        0
+    }
+}
+
+/// One pool's answer, and whether the pool holds the writer's taint marker.
+#[derive(Debug, Clone)]
+pub struct PoolAnswer {
+    pub states: Vec<KeyState>,
+    pub tainted: bool,
+}
+
+/// Merges the pools' answers as `StorageBackend` describes. A tainted pool counts as
+/// empty; the backend fails only when every pool did.
+pub fn merge_pools(
+    keys: usize,
+    answers: &[Result<PoolAnswer, FailReason>],
+) -> Result<Vec<KeyState>, FailReason> {
+    let failed = answers
+        .iter()
+        .find_map(|answer| answer.as_ref().err().copied());
+    if answers.iter().all(Result::is_err) {
+        return Err(failed.unwrap_or(FailReason::Transport));
+    }
+    let pools: Vec<&[KeyState]> = answers
+        .iter()
+        .filter_map(|answer| answer.as_ref().ok())
+        .filter(|pool| !pool.tainted)
+        .map(|pool| pool.states.as_slice())
+        .collect();
+    let floor = if failed.is_some() {
+        KeyState::Unknown
+    } else {
+        KeyState::Absent
+    };
+    Ok((0..keys)
+        .map(|key| {
+            pools
+                .iter()
+                .map(|states| states.get(key).copied().unwrap_or(KeyState::Unknown))
+                .fold(floor, |merged, state| {
+                    if state.level() > merged.level() {
+                        state
+                    } else {
+                        merged
+                    }
+                })
+        })
+        .collect())
 }
 
 #[derive(Debug, Clone)]
