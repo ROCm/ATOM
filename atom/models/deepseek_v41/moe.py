@@ -32,6 +32,8 @@ shared expert into the same buffers after loading
 import weakref
 
 import torch
+import triton
+import triton.language as tl
 from aiter import QuantType, dtypes, get_hip_quant
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.shuffle import shuffle_weight
@@ -48,6 +50,37 @@ from atom.models.deepseek_v4 import DeepseekV4Args
 from atom.models.deepseek_v4 import MoE as V4MoE
 from atom.utils import envs
 from atom.utils.forward_context import get_forward_context, pass_scheduled_tokens_gpu
+
+
+@triton.jit
+def _append_shared_kernel(
+    IDS, WTS, IDS_OUT, WTS_OUT, stride_i, stride_w,
+    TOPK: tl.constexpr, SHARED: tl.constexpr,
+):  # fmt: skip
+    # The row's routed top-k, then the folded shared expert at weight 1.
+    row = tl.program_id(0).to(tl.int64)
+    KP: tl.constexpr = triton.next_power_of_2(TOPK + 1)
+    k = tl.arange(0, KP)
+    routed = k < TOPK
+    ids = tl.load(IDS + row * stride_i + k, mask=routed, other=SHARED)
+    wts = tl.load(WTS + row * stride_w + k, mask=routed, other=1.0)
+    tl.store(IDS_OUT + row * (TOPK + 1) + k, ids, mask=k <= TOPK)
+    tl.store(WTS_OUT + row * (TOPK + 1) + k, wts, mask=k <= TOPK)
+
+
+def _with_shared_slot(weights, ids, shared):
+    """[M, topk] int32 ids / fp32 weights -> contiguous [M, topk + 1], the last
+    slot expert `shared` at weight 1. Rows past the pass's scheduled count are
+    skipped by the MoE (num_local_tokens)."""
+    rows, topk = ids.shape
+    out_ids = torch.empty(rows, topk + 1, dtype=torch.int32, device=ids.device)
+    out_wts = torch.empty(rows, topk + 1, dtype=torch.float32, device=ids.device)
+    if rows:
+        _append_shared_kernel[(rows,)](
+            ids, weights, out_ids, out_wts, ids.stride(0), weights.stride(0),
+            TOPK=topk, SHARED=shared, num_warps=1,
+        )  # fmt: skip
+    return out_wts, out_ids
 
 
 class _SharedExpertFold(nn.Module):
@@ -107,7 +140,13 @@ class _SharedExpertFold(nn.Module):
         experts.w2_weight_scale = atom_parameter(
             torch.cat([experts.w2_weight_scale.data, s2.reshape(1, -1).float()])
         )
-        experts.ptpc_shared_slot = num_experts
+        # Every row also runs it, as one more top-k slot after the routed ones.
+        route = experts.custom_routing_function
+
+        def route_with_shared(**kwargs):
+            return _with_shared_slot(*route(**kwargs), num_experts)
+
+        experts.custom_routing_function = route_with_shared
         moe.shared_experts = None
         # Nothing is left to overlap with the routed experts on `alt_stream`.
         moe._use_dual_stream = False

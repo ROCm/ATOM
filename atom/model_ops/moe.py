@@ -3298,13 +3298,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight.data[expert_id] = w2_q
                 layer.w2_weight_scale.data[expert_id] = w2_s.squeeze(-1)
 
-        # With a SwiGLU clamp: aiter's per-token FP8 MoE runs its asm
-        # one-stage kernels past 16 tokens (or when the intermediate size is
-        # not a multiple of 128), and those drop `swiglu_limit`, so these
-        # layers run AITER's FlyDSL MoE, its gfx942 backend, which applies it
-        # (`fused_moe_ptpc_clamp`). That takes clamped SiLU(gate) * up with
-        # dynamic per-token activation scales only; any other activation (e.g.
-        # MiniMax-M3's swigluoai) or a static input scale keeps the asm path.
+        # With a SwiGLU clamp: aiter's per-token FP8 one-stage kernels drop
+        # `swiglu_limit`, so aiter's fused_moe runs these layers on its FlyDSL
+        # MoE backend, which applies it (tuned rows, else its clamped-SiLU
+        # default). That takes clamped SiLU(gate) * up with dynamic per-token
+        # activation scales and per-channel fp32 weight scales only; any other
+        # activation (e.g. MiniMax-M3's swigluoai) or a static input scale
+        # keeps the asm path. A model may fold its shared expert in here.
         self.ptpc_clamp = (
             get_gfx_runtime().startswith("gfx94")
             and getattr(layer, "swiglu_limit", 0.0) > 0
@@ -3419,27 +3419,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             "gate_mode": gate_mode,
             "swiglu_limit": getattr(layer, "swiglu_limit", 0.0),
         }
-        if getattr(self, "ptpc_clamp", False):
-            from atom.model_ops.fused_moe_ptpc_clamp import fused_moe_ptpc_clamp
-
-            assert (
-                x_scale is None
-                and not apply_router_weight_on_input
-                and expert_map is None
-                and activation == ActivationType.Silu
-            ), "clamped FP8 MoE: SiLU, unquantized input, no expert map"
-            return fused_moe_ptpc_clamp(
-                x,
-                layer.w13_weight,
-                layer.w13_weight_scale,
-                layer.w2_weight,
-                layer.w2_weight_scale,
-                topk_weights,
-                topk_ids,
-                layer.swiglu_limit,
-                shared_slot=getattr(layer, "ptpc_shared_slot", None),
-                num_valid_rows=scheduled_tokens_gpu,
-            )
         if self.quant_type == QuantType.per_Tensor or self.fused_experts is None:
             return torch.ops.aiter.rocm_aiter_fused_moe(
                 x,
