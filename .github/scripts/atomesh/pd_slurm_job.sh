@@ -220,7 +220,10 @@ other_jobs_on_node() {
 free_gpus_for_this_job() {
   local host others job uid user state
   host="$(hostname -s)"
-  compgen -G '/sys/class/kfd/kfd/proc/[0-9]*' >/dev/null || return 0
+  if ! compgen -G '/sys/class/kfd/kfd/proc/[0-9]*' >/dev/null; then
+    echo "no process holds the GPUs on ${host}"
+    return 0
+  fi
   if ! others="$(other_jobs_on_node)"; then
     echo "the scheduler did not answer for ${host}; killing its GPU holders anyway"
     others=""
