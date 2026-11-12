@@ -45,6 +45,16 @@ def _mtp_weights_quantized(model: str) -> bool:
     return not mtp or any("_scale" in n.rsplit(".", 1)[-1] for n in mtp)
 
 
+def _moe_needs_quantized_weights() -> bool:
+    """Whether this GPU has no unquantized (BF16) fused MoE kernel.
+
+    aiter's gfx1250 MoE kernels are MXFP4 only (grouped a4w4/a8w4 and mega
+    MoE). A BF16 expert falls back to the CK 2-stage kernel, which does not
+    build for gfx1250, so a BF16 MTP head is quantized online to MXFP4 there.
+    """
+    return get_gfx_runtime() == "gfx1250"
+
+
 class _UnquantizedMTPQuantizationConfig(_Qwen4ExpQuantizationConfig):
     """Resolves every MTP layer as excluded from quantization."""
 
@@ -84,10 +94,7 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         self.mtp_start_layer_idx = config.num_hidden_layers
         self.hc_count = config.hc_count
         self.hidden_size = config.hidden_size
-        # The validated gfx1250 stack serves the checkpoint through the
-        # online-MXFP4 MTP path. Other architectures follow the checkpoint's
-        # own MTP quantization metadata.
-        quantized_mtp = get_gfx_runtime() == "gfx1250" or _mtp_weights_quantized(
+        quantized_mtp = _moe_needs_quantized_weights() or _mtp_weights_quantized(
             atom_config.model
         )
         quant_cls = (
