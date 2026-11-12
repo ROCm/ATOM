@@ -81,6 +81,28 @@ def mfma_scaled(a, b, c, sa, sb, a_fmt=FP8, b_fmt=FP8, sa_byte=0, sb_byte=0):
     )
 
 
+FP4_INV_MAX = 1.0 / 6.0  # f32(1/6) = 0x3E2AAAAB: the constant aiter's HIP / FlyDSL RoundUp multiply by
+
+
+def fp4_scale(amax):
+    """(E8M0 code, forward scale 2^(code - 127)) of an MXFP4 32-block of absolute maximum ``amax``:
+    aiter's RoundUp, ceil_pow2(amax * f32(1/6)) (``mxfp4_gemm_common._e8m0_roundup``, csrc
+    mx_quant_utils.h ``fp_f32_to_e8m0_scale<RoundUp, FP4_E2M1>``); see ``code_ceil`` for the clamp."""
+    e = code_ceil(amax * fx.Float32(FP4_INV_MAX))
+    return e, pow2(e)
+
+
+def fp4_pack2(old, a, b, scale, sel):
+    """``old`` with byte ``sel`` (0..3, compile time) := the e2m1 nibbles of ``a`` (low) and ``b``
+    (high) divided by ``scale`` (a power of two, the forward scale), RNE, saturating at 6
+    (``v_cvt_scalef32_pk_fp4_f32``; bit-exact with aiter's quantization, hip/fp4_mfma_probe.cpp)."""
+    return fx.Int32(
+        rocdl.cvt_scalef32_pk_fp4_f32(
+            T.i32, as_ir_value(old), as_ir_value(a), as_ir_value(b), as_ir_value(scale), sel
+        )
+    )
+
+
 def fp4x8_bf16(word, code):
     """The eight E2M1 values of dword ``word`` (low nibble first) times the E8M0
     scale ``code`` (its low byte) as a v8bf16 MFMA operand: exact (a product of a

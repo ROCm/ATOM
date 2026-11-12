@@ -13,15 +13,20 @@ from atom.models.minimax_m3.mono.layout import (
     N_ROUTER,
     SCORE_COPIES,
     SH_TASKS,
+    MID4N_WORDS,
+    MIDSC4N_WORDS,
+    XN4_ROW,
+    XN4_WORDS,
     XN8_ROW,
     XSC_ROW,
     shared_after_routing,
 )
-from atom.mono.device.mx import FP4, fp4x8_bf16, mfma_scaled
+from atom.mono.device.mx import FP4, fp4_pack2, fp4_scale, fp4x8_bf16, mfma_scaled
 from atom.mono.device.ops import (
     bf2_f32,
     bf16_pair,
     bf16_round,
+    butterfly,
     fp8_pack4,
     mfma_bf16,
     row_sum,
@@ -36,6 +41,11 @@ from atom.mono.plan.trace import enter_stage
 def moe_narrow_defs(k4ctx):
     """The functions of the per-(token, slot) MoE (S <= 4)."""
     A16N = k4ctx["A16N"]
+    A4N = k4ctx["A4N"]
+    MID4_LDS = k4ctx["MID4_LDS"]
+    MIDSC4_LDS = k4ctx["MIDSC4_LDS"]
+    X4S_LDS = k4ctx["X4S_LDS"]
+    X4_LDS = k4ctx["X4_LDS"]
     BASE = k4ctx["BASE"]
     CPT = k4ctx["CPT"]
     ROUTED_TASKS = k4ctx["ROUTED_TASKS"]
@@ -62,6 +72,7 @@ def moe_narrow_defs(k4ctx):
     g4 = k4ctx["g4"]
     l16 = k4ctx["l16"]
     lane = k4ctx["lane"]
+    lds_b4 = k4ctx["lds_b4"]
     lds_b8 = k4ctx["lds_b8"]
     lds_bf8 = k4ctx["lds_bf8"]
     lds_i32 = k4ctx["lds_i32"]
@@ -203,6 +214,46 @@ def moe_narrow_defs(k4ctx):
             else:
                 stage_row(tok, 0)
 
+        def fetch_xn4(tok=None):
+            """a4w4: token tok's (default: every token's) MXFP4 xn words and codes -> xs (after the
+            MXFP8 rows). Wave 0 first polls the last word of each router task's slice (as
+            ``fetch_xn``), then every thread takes words tid and tid + THREADS (the second only
+            below XN4_WORDS) and its code word."""
+            gate_tok = fx.min(lane // N_ROUTER, tokens - 1) if tok is None else tok
+            if wave == 0:
+                mb_poll(
+                    [
+                        (
+                            mr("xn4"),
+                            gate_tok * XN4_WORDS
+                            + (lane % N_ROUTER + 1) * (XN_SLICE // 8)
+                            - 1,
+                            1,
+                        )
+                    ]
+                )
+            gpu.barrier()
+
+            def stage_row(kk, row):
+                got = mb_poll(
+                    [
+                        (mr("xn4"), kk * XN4_WORDS + fx.min(tid + i * THREADS, XN4_WORDS - 1), 1)
+                        for i in range(2)
+                    ]
+                    + [(mr("xs4"), kk * XSC_WORDS + fx.min(tid, XSC_WORDS - 1), 1)]
+                )
+                fx.ptr_store(got[0][0], xs + (X4_LDS + row * XN4_ROW + tid))
+                if tid + THREADS < XN4_WORDS:
+                    fx.ptr_store(got[1][0], xs + (X4_LDS + row * XN4_ROW + tid + THREADS))
+                if tid < XSC_WORDS:
+                    fx.ptr_store(got[2][0], xs + (X4S_LDS + row * XSC_ROW + tid))
+
+            if const_expr(tok is None):
+                for k in range_constexpr(tokens):
+                    stage_row(k, k)
+            else:
+                stage_row(tok, 0)
+
         sh_late = shared_after_routing(tokens)
         if const_expr(sh_late):
             sh_j = fx.min(start("shared"), SH_TASKS - 1)
@@ -218,7 +269,12 @@ def moe_narrow_defs(k4ctx):
         if ug_task_id(0)[1] | has_dn:
             # xn lands before the logits: stage it while waiting (a shared-expert
             # CTA has it already); a CTA's routed tasks are one token's
-            if const_expr(A16N):
+            if const_expr(A4N):
+                # the routed tasks read the MXFP4 xn; only the shared expert's CTAs
+                # hold MXFP8 rows (above)
+                if ug_task_id(0)[1]:
+                    fetch_xn4(bid // CPT if CPT is not None else None)
+            elif const_expr(A16N):
                 # the routed tasks read the bf16 xn; only the shared expert's CTAs
                 # hold MXFP8 rows (above)
                 if ug_task_id(0)[1]:
@@ -363,7 +419,7 @@ def moe_narrow_defs(k4ctx):
         # each poll) cost S = 1 / 4 1.75 / 6 us, though the arithmetic is tiny
         # (a16w4: the shared expert's slot only: the routed down GEMVs read the bf16 mids)
         for k in range_constexpr(tokens):
-            if const_expr(A16N):
+            if const_expr(A16N or A4N):
                 quant_lane = (tid >= TOP_K * INTER // 8) & (tid < MID8_WORDS // 2)
             else:
                 quant_lane = tid < MID8_WORDS // 2
@@ -383,6 +439,25 @@ def moe_narrow_defs(k4ctx):
                 )
                 if tid % 4 == 0:
                     fx.ptr_store(sc, xs + (MIDSC_LDS + k * MIDSC_WORDS + tid // 4))
+            if const_expr(A4N):
+                # a4w4: the routed slots' mids as MXFP4 (8 elements a lane, 4 lanes a 32-block)
+                if tid < MID4N_WORDS:
+                    w4 = fx.Vector(
+                        fx.ptr_load(xs + (k * MID16_WORDS + tid * 4), result_type=v4f)
+                    ).bitcast(fx.Int32)
+                    f4 = [v for j in range(4) for v in bf2_f32(w4[j])]
+                    amax4 = fx.max(f4[0], -f4[0])
+                    for v in f4[1:]:
+                        amax4 = fx.max(amax4, fx.max(v, -v))
+                    e4, sc4 = fp4_scale(butterfly(amax4, (1, 2), fx.max))
+                    word4 = fx.Int32(0)
+                    for h in range_constexpr(4):
+                        word4 = fp4_pack2(word4, f4[2 * h], f4[2 * h + 1], sc4, h)
+                    fx.ptr_store(word4, xs + (MID4_LDS + k * MID4N_WORDS + tid))
+                    if tid % 4 == 0:
+                        fx.ptr_store(
+                            e4, xs + (MIDSC4_LDS + k * MIDSC4N_WORDS + tid // 4)
+                        )
         gpu.barrier()
         # the shared expert once, B column l % 16 = token l % 16's mid -> opart
         # (free once the split is done); each token's reduce adds its column
@@ -415,7 +490,33 @@ def moe_narrow_defs(k4ctx):
             if const_expr(k + 2 < tokens):
                 dn_units[k + 2] = down_load(k + 2, t, has_dn)
             acc = [fx.Float32(0.0) for _ in range(4)]
-            if const_expr(A16N):
+            if const_expr(A4N):
+                # the wave's slot: 6 chunks, one fp4 x fp4 MFMA each, in one accumulator, then
+                # (prod_round) production's bf16(acc * topk weight)
+                cslot = fx.Vector.filled(4, 0.0, fx.Float32)
+                for wv, sc, sl, kc, wgt in dn_units.pop(k):
+                    cslot = mfma_scaled(
+                        a=wv,
+                        sa=sc,
+                        b=lds_b4(
+                            MID4_LDS + k * MID4N_WORDS + sl * (INTER // 8) + kc * 16
+                        ),
+                        sb=lds_i32(
+                            MIDSC4_LDS
+                            + k * MIDSC4N_WORDS
+                            + sl * (INTER // 32)
+                            + kc * 4
+                            + g4
+                        ),
+                        c=cslot,
+                        a_fmt=FP4,
+                        b_fmt=FP4,
+                    )
+                if const_expr(prod_round):
+                    acc = [bf16_round(cslot[j4] * wgt) for j4 in range(4)]
+                else:
+                    acc = [cslot[j4] * wgt for j4 in range(4)]
+            elif const_expr(A16N):
                 # the wave's slot: 6 chunks x 4 K = 32 MFMAs in one accumulator, then
                 # (prod_round) production's bf16(acc * topk weight) (gemm2's epilogue)
                 cslot = fx.Vector.filled(4, 0.0, fx.Float32)

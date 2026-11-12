@@ -40,6 +40,7 @@ def build_layer(
     attn_mxfp8: bool = False,
     sp_f32: bool = True,
     moe_a16w4: bool = True,
+    moe_a4w4: bool = False,
 ):
     """The layer kernel for ``tokens`` and ``index_heads`` (1 or TP), K1 fused in
     or not (``fuse_k1``), selecting or reusing a selection (``index_topk``), its
@@ -51,7 +52,7 @@ def build_layer(
         TP, 0.088, 1e-6, 1.0, 1.0, 7.0, 1, 1, tokens, fuse_k1=fuse_k1, heads=heads,
         index_topk=index_topk, xn_flag=xn_flag, shared_mxfp8=shared_mxfp8, mid_flag=mid_flag,
         kv_nvfp4=kv_nvfp4, index_nvfp4=index_nvfp4, sh_first=sh_first,
-        attn_mxfp8=attn_mxfp8, sp_f32=sp_f32, moe_a16w4=moe_a16w4,
+        attn_mxfp8=attn_mxfp8, sp_f32=sp_f32, moe_a16w4=moe_a16w4, moe_a4w4=moe_a4w4,
     )  # fmt: skip
 
 
@@ -74,6 +75,7 @@ def check_build(
     attn_mxfp8: bool = False,
     sp_f32: bool = True,
     moe_a16w4: bool = True,
+    moe_a4w4: bool = False,
 ) -> None:
     """Trace ``build_layer`` and check its hand-offs; raises ``ContractError``."""
     check_traced(
@@ -91,11 +93,12 @@ def check_build(
             attn_mxfp8,
             sp_f32,
             moe_a16w4,
+            moe_a4w4,
         ),
         K4_ABI,
         mailbox_regions(
             tokens, index_heads, fuse_k1, index_topk, xn_flag, mid_flag, sp_f32,
-            moe_a16w4 and shared_mxfp8,
+            moe_a16w4 and shared_mxfp8 and not moe_a4w4, moe_a4w4,
         ),
     )
 
@@ -144,3 +147,12 @@ if __name__ == "__main__":
                     print(
                         f"S={s} index heads={ih} attn_mxfp8 nvfp4={nv} {tag}: contract holds"
                     )
+            # a4w4 routed experts (needs the unfused MXFP8 shared expert)
+            for spf in (True, False):
+                check_build(s, ih, shared_mxfp8=True, moe_a4w4=True, sp_f32=spf)
+                print(f"S={s} index heads={ih} a4w4 sp_f32={spf}: contract holds")
+            check_build(
+                s, ih, shared_mxfp8=True, attn_mxfp8=True, kv_nvfp4=True,
+                index_nvfp4=True, moe_a4w4=True, sp_f32=False,
+            )  # fmt: skip
+            print(f"S={s} index heads={ih} a4w4 attn_mxfp8 nvfp4: contract holds")

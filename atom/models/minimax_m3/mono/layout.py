@@ -127,6 +127,16 @@ SCRATCH = _layout(
         # (row k TOP_K + slot) as plain words, behind the xn / up-gate flags
         ("xnbp", HIDDEN // 2 * MAX_TOKENS // 2),
         ("mid16p", TOP_K * INTER // 2 * MAX_TOKENS // 2),
+        # ``moe_a4w4``: the routed experts' MXFP4 xn (packed e2m1, 8 to a word, low nibble = lower k) and its
+        # per-32 E8M0 codes (a word each): narrow tagged (``xn4`` / ``xs4``), wide plain words behind the
+        # xn flag (``xn4p`` / ``xs4p``); wide: the routed mid rows (row k TOP_K + slot) and their codes
+        # as plain words behind the up-gate flag (``mid4p`` / ``mids4p``)
+        ("xn4", HIDDEN // 8 * MAX_TOKENS),
+        ("xs4", HIDDEN // 32 * MAX_TOKENS),
+        ("xn4p", HIDDEN // 8 * MAX_TOKENS // 2),
+        ("xs4p", HIDDEN // 32 * MAX_TOKENS // 2),
+        ("mid4p", TOP_K * INTER // 8 * MAX_TOKENS // 2),
+        ("mids4p", TOP_K * INTER // 32 * MAX_TOKENS // 2),
     ]
 )
 SCRATCH_BYTES = SCRATCH["_bytes"]
@@ -171,6 +181,7 @@ def mailbox_regions(
     mid_flag: int = 0,
     sp_f32: bool = True,
     moe_a16w4: bool = True,
+    moe_a4w4: bool = False,
 ) -> list[RegionDecl]:
     """The fused layer kernel's mailbox regions for a build: each one's space and
     the one stage that puts it (``atom.mono.plan.check``; the stages are the ones
@@ -215,7 +226,9 @@ def mailbox_regions(
             regions.append(RegionDecl("xndone", S, "router"))
         else:
             regions += [RegionDecl(n, S, "router") for n in ("xn8", "xsc")]
-            if moe_a16w4:  # the bf16 words the routed experts read
+            if moe_a4w4:  # the MXFP4 words and codes the routed experts read
+                regions += [RegionDecl(n, S, "router") for n in ("xn4", "xs4")]
+            elif moe_a16w4:  # the bf16 words the routed experts read
                 regions.append(RegionDecl("xnb", S, "router"))
         regions.append(
             RegionDecl("ugdone", S, "ug")
@@ -394,7 +407,32 @@ def xb_lds_base(tokens: int) -> int:
     return tokens * (XN8_ROW + XSC_ROW)
 
 
-def pool_words(tokens: int, a16w4: bool = False) -> int:
+# LDS rows of the a4w4 experts' MXFP4 xn (8 fp4 a word, +4 words a row: the bank rule of XN8_ROW) and
+# mids; the narrow down stage's MXFP4 routed mids (TOP_K slots, no padding) and their codes
+XN4_ROW = HIDDEN // 8 + 4
+XN4_WORDS = HIDDEN // 8
+MID4_ROW = INTER // 8 + 4
+MID4_WORDS = INTER // 8
+MID4N_WORDS = TOP_K * INTER // 8
+MIDSC4N_WORDS = TOP_K * INTER // 32
+
+
+def narrow_a4_words(tokens: int) -> int:
+    """LDS words the narrow ``moe_a4w4`` needs beyond the bf16 xn pool: the up / gate stage's MXFP8
+    rows + codes (shared expert) then the routed tasks' MXFP4 rows + codes; the down stage's bf16 mids,
+    the shared slot's MXFP8 mids + codes, then the routed slots' MXFP4 mids + codes."""
+    up = xb_lds_base(tokens) + xb_lds_rows(tokens) * (XN4_ROW + XSC_ROW)
+    down = tokens * (
+        MOE_SLOTS * INTER // 2
+        + MOE_SLOTS * INTER // 4
+        + MOE_SLOTS * INTER // 32
+        + MID4N_WORDS
+        + MIDSC4N_WORDS
+    )
+    return max(up, down)
+
+
+def pool_words(tokens: int, a16w4: bool = False, a4w4: bool = False) -> int:
     """LDS words of the activation pool ``x``. Narrow: every token's bf16 xn (the
     largest stage operand; ``a16w4``: also its MXFP8 rows, then the bf16 rows the
     routed tasks read). Wide: the largest of the split's PV partials, the up /
@@ -402,6 +440,8 @@ def pool_words(tokens: int, a16w4: bool = False) -> int:
     stage's MXFP8 mids + scales + a zero row (``a16w4``: the routed experts' bf16
     mid rows, the shared expert's MXFP8 ones, the shared partials)."""
     if not wide_moe(tokens):
+        if a4w4:
+            return max(HIDDEN // 2 * tokens, narrow_a4_words(tokens))
         if a16w4:
             return max(
                 HIDDEN // 2 * tokens,
@@ -412,11 +452,10 @@ def pool_words(tokens: int, a16w4: bool = False) -> int:
     down = rows * (MID_ROW + MIDSC_ROW)
     if a16w4:
         down = wide_down_words(tokens)
-    return max(
-        WAVES * O_K,
-        tokens * (XN8_ROW + XSC_ROW + N_ROUTED) + WAVES * 64 * 4,
-        down,
-    )
+    up = tokens * (XN8_ROW + XSC_ROW + N_ROUTED) + WAVES * 64 * 4
+    if a4w4:  # only the shared expert's CTAs hold the MXFP8 rows; the routed operands are in registers
+        down = wide_down4_words(tokens)
+    return max(WAVES * O_K, up, down)
 
 
 # the wide ``moe_a16w4`` down stage's pool: the routed experts' bf16 mid rows (row k TOP_K
@@ -437,6 +476,22 @@ def wide_down_layout(tokens: int) -> dict:
 
 def wide_down_words(tokens: int) -> int:
     return wide_down_layout(tokens)["end"]
+
+
+def wide_down4_layout(tokens: int) -> dict:
+    """Word offsets of the wide ``moe_a4w4`` down stage's pool: the routed experts' MXFP4 mid rows (row
+    k TOP_K + slot, a zero row last) then their codes (``MIDSC_ROW`` words a row), then the shared
+    expert's MXFP8 rows, codes and the waves' shared partials as in ``wide_down_layout``."""
+    rows = TOP_K * tokens
+    sc4 = (rows + 1) * MID4_ROW
+    sh8 = sc4 + (rows + 1) * MIDSC_ROW
+    sh8sc = sh8 + (tokens + 1) * MID_ROW
+    shp = sh8sc + (tokens + 1) * MIDSC_ROW
+    return {"rows": rows, "sc4": sc4, "sh8": sh8, "sh8sc": sh8sc, "shp": shp, "end": shp + WAVES * 64 * 4}
+
+
+def wide_down4_words(tokens: int) -> int:
+    return wide_down4_layout(tokens)["end"]
 
 
 def mxfp8_tile_dword(row, cols, kc, g):

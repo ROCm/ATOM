@@ -33,6 +33,7 @@ from atom.models.minimax_m3.mono.layout import (
     SH_ROWS,
     UG_PER_SLOT,
     UG_ROWS,
+    XN4_ROW,
     XN8_ROW,
     XSC_ROW,
     mxfp8_tile_dword,
@@ -64,6 +65,9 @@ from atom.mono.device.sync import publish
 def moe_common_defs(k4ctx):
     """The functions of the narrow MoE's up / gate / down tasks."""
     A16N = k4ctx["A16N"]
+    A4N = k4ctx["A4N"]
+    X4S_LDS = k4ctx["X4S_LDS"]
+    X4_LDS = k4ctx["X4_LDS"]
     CPT = k4ctx["CPT"]
     DN_KC = k4ctx["DN_KC"]
     DN_UNITS = k4ctx["DN_UNITS"]
@@ -85,6 +89,7 @@ def moe_common_defs(k4ctx):
     group_scale_byte = k4ctx["group_scale_byte"]
     l16 = k4ctx["l16"]
     lane = k4ctx["lane"]
+    lds_b4 = k4ctx["lds_b4"]
     lds_b8 = k4ctx["lds_b8"]
     lds_bf8 = k4ctx["lds_bf8"]
     lds_i32 = k4ctx["lds_i32"]
@@ -187,7 +192,22 @@ def moe_common_defs(k4ctx):
         col = shared.select(fx.min(l16, tokens - 1), tk)
         cg_ = fx.Vector.filled(4, 0.0, fx.Float32)
         cu_ = fx.Vector.filled(4, 0.0, fx.Float32)
-        if const_expr(A16N):
+        if const_expr(A4N):
+            # a4w4: the token's MXFP4 xn row and codes (the router's words, after the MXFP8 rows)
+            # against the weights, one fp4 x fp4 MFMA a 128-k chunk
+            xrow = X4_LDS + (0 if CPT is not None else tk * XN4_ROW)
+            srow = X4S_LDS + (0 if CPT is not None else tk * XSC_ROW)
+            sbs = [lds_i32(srow + (wave * UG_CPW + i) * 4 + g4) for i in range(UG_CPW)]
+            for i in range_constexpr(UG_CPW):
+                kc = wave * UG_CPW + i
+                xb = lds_b4(xrow + kc * 16)
+                cg_ = mfma_scaled(
+                    wts[0][i], xb, cg_, scs[0][i], sbs[i], a_fmt=FP4, b_fmt=FP4
+                )
+                cu_ = mfma_scaled(
+                    wts[1][i], xb, cu_, scs[1][i], sbs[i], a_fmt=FP4, b_fmt=FP4
+                )
+        elif const_expr(A16N):
             # a16w4: the token's bf16 xn row (the router's words, after the MXFP8 rows)
             # against the weights up-converted to bf16, four K = 32 MFMAs a 128-k chunk
             xrow = XB_LDS + (0 if CPT is not None else tk * XB_ROW)
@@ -348,7 +368,7 @@ def moe_common_defs(k4ctx):
         rg_d = td * 2 + wave // 4
         units = []
         for i in range_constexpr(DN_UPW):
-            if const_expr(A16N):
+            if const_expr(A16N or A4N):
                 # a wave of the row group takes one slot, all its chunks: the slot's sum
                 # is complete in the wave, where production rounds it (bf16(acc * w))
                 j = (wave % 4) * DN_KC + i
