@@ -382,6 +382,9 @@ class BlockManager:
                 enabled=enabled,
                 readable_midstep=state_runtime.transfer.readable_midstep,
             )
+            if enabled:
+                # Checkpoint images live in KV blocks; block 0 must not be one.
+                self.kv.reserve_null_block()
         # The rolling state class: per-request slots plus a content index over
         # the free ones. A checkpoint IS a free slot whose content is still
         # valid, so it holds no capacity of its own and never blocks admission.
