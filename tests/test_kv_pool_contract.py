@@ -191,6 +191,13 @@ def _classes_defining_the_factory() -> list[tuple[str, ast.ClassDef]]:
     ]
 
 
+@pytest.fixture(autouse=True)
+def _default_backends(monkeypatch):
+    # With ATOM_USE_UNIFIED_ATTN=1 the MHA family selects TritonMHABackend,
+    # which inherits the factory; these checks name the default backends.
+    monkeypatch.setenv("ATOM_USE_UNIFIED_ATTN", "0")
+
+
 def _backend_class_name(family) -> str:
     from atom.utils.selector import get_attn_backend_cls
 
@@ -226,7 +233,6 @@ def test_a_backend_that_can_build_a_draft_pool_is_in_the_table():
         if cls.name != FACTORY_DECLARATION
     }
     listed = {_backend_class_name(f) for f in DRAFT_POOL_FAMILIES}
-    # `get_attn_backend_cls` is asked per family with no plugin and no unified attn
     assert builders == listed, (builders, listed, list(Family))
 
 
