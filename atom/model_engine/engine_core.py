@@ -813,10 +813,7 @@ class EngineCore:
         connector = getattr(self.scheduler, "kv_connector", None)
         if connector is None or not (
             getattr(connector, "is_offload", False)
-            or (
-                getattr(connector, "is_producer", False)
-                and getattr(connector, "enable_chunked_transfer", False)
-            )
+            or getattr(connector, "is_producer", False)
         ):
             return
         # `dispatch_new=False` on the shutdown drain: publishing new state

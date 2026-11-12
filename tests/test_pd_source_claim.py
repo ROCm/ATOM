@@ -274,7 +274,16 @@ def test_nonchunked_decode_waits_for_successful_publication(monkeypatch):
         seq.block_table = [10, 11]
         seq.state_slot = 5
         sched.request_finished(seq)
-        worker.start_load_kv(sched.build_connector_meta())
+        # Last request publication must reach D through the real idle engine.
+        with stubbed_aiter():
+            from atom.model_engine.engine_core import EngineCore
+        core = EngineCore.__new__(EngineCore)
+        core.kv_transfer_enabled = True
+        core.scheduler = SimpleNamespace(kv_connector=sched)
+        core.runner_mgr = SimpleNamespace(
+            call_func=lambda name, meta: worker.start_load_kv(meta)
+        )
+        core._dispatch_idle_offload_work()
         assert reader.result(timeout=2) == {
             "block_ids": [10, 11],
             "swa_block_ids": [5],
