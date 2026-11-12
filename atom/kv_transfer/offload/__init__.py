@@ -84,6 +84,7 @@ def register_backends(factory) -> None:
         # One Mooncake Store for every DP rank.
         shared_tier=True,
         chunk_tokens="atom.kv_transfer.offload.mooncake_store.config:store_chunk_tokens",
+        lowers_hbm_hit_to_chunk=True,
         # Same predicate as lmcache_offload: dense ignores the region map, and
         # M3 and V4.1 PAGE layouts read it. Other layouts are refused at
         # startup; see `check_engine_compatibility`.

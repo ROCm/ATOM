@@ -562,10 +562,11 @@ def test_concurrent_store_dispatch_accounts_in_socket_send_order():
     from collections import deque
     from concurrent.futures import ThreadPoolExecutor
     from threading import Event
-    from types import SimpleNamespace
 
     mgr = _make_mgr(1)
-    mgr._store_router = SimpleNamespace(charge=lambda _sid, _credit: 0)
+    from atom.model_engine.share_cache import ShareCacheRouter
+
+    mgr._store_router = ShareCacheRouter(0, 100)
     mgr._backlog_report = [None]
     mgr._backlog_sent = [0]
     mgr._backlog_unseen = [deque()]
@@ -1463,9 +1464,10 @@ def test_partial_store_hit_does_not_hide_recomputed_prefill(monkeypatch):
     mgr._rank_tokens = [100_000, 0, 0]
     moved = _chain_seq(3, 12288)
     assert _route(mgr, [moved]) == [1]
-    assert _est(mgr, moved) == 4096
-    assert mgr._seq_load[moved.id][2] == 8192
-    assert _count(mgr, "prefix_moved_tokens") == 0
+    # Store reloads the HBM tail from the previous chunk boundary.
+    assert _est(mgr, moved) == 8192
+    assert mgr._seq_load[moved.id][2] == 4096
+    assert _count(mgr, "prefix_moved_tokens") == 8192
 
 
 def test_reset_keeps_the_prefix_index_across_batches():
@@ -2276,6 +2278,80 @@ def test_prefix_spread_forked_prefix_is_not_merged_into_either_branch():
         assert _rank_hits(router, seq.prompt_hash_chain, 2) == ({0: 8192}, 0)
     assert _rank_hits(router, trunk.prompt_hash_chain, 2) == ({0: 4096}, 0)
 
+
+def test_share_cache_explicit_rank_records_completed_prefix():
+    from atom.model_engine.dp_routing.policies import ShareCachePolicy
+    from atom.model_engine.share_cache import ShareCacheRouter
+
+    router = ShareCacheRouter(0, 100)
+    policy = ShareCachePolicy(router, lambda: [0, 0], lambda: [0, 0], lambda: 0)
+    first = _chain_seq(1, 768)
+    route = policy.select(first, 0)
+    policy.charge(first, route.credit)
+    policy.prefill_complete(first.id)
+    route = policy.select(_chain_seq(2, 768), 0)
+    assert route.rank == 0 and route.credit == 768
+    assert route.decision == "explicit_total"
+
+
+def test_store_floor_profile_matches_admission_without_double_credit():
+    from types import SimpleNamespace
+
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+    from atom.kv_transfer.offload.tier import OffloadTierProfile
+
+    config = SimpleNamespace(
+        kv_transfer_config={
+            "kv_connector": "mooncake_store",
+            "kv_role": "offload",
+            "kv_connector_extra_config": {"mooncake_store.chunk_tokens": 256},
+        }
+    )
+    tier = KVConnectorFactory.offload_tier(config)
+    assert tier.lowers_hbm_hit_to_chunk
+    tier = OffloadTierProfile(True, 512, 256, tier.lowers_hbm_hit_to_chunk)
+    loaded = tier.loadable_tokens(384, 768, 1024)
+    assert loaded == 512
+    assert tier.credited_tokens(384, loaded) == 768
+    # Other connectors still hand off at the next chunk boundary.
+    ceil_tier = OffloadTierProfile(True, 512, 256)
+    assert ceil_tier.loadable_tokens(384, 768, 1024) == 0
+    assert ceil_tier.credited_tokens(384, 0) == 384
+
+
+def test_late_reuse_miss_splits_a_merged_placement_credit_boundary():
+    from atom.kv_transfer.offload.tier import OffloadTierProfile
+    from atom.model_engine.dp_routing.prefix_spread import PrefixSpreadRouter
+
+    router = PrefixSpreadRouter(1000, OffloadTierProfile(True, 0, 1), 64)
+    a, b, c = (_chain_seq(11, 1280), _chain_seq(12, 1408), _chain_seq(13, 1408))
+    for item in (a,):
+        route = router.place(item, 0, 2)
+        router.charge(item.id, route.credit)
+        router.prefill_complete(item.id)
+    route = router.place(b, 0, 2)
+    assert route.credit == 1280
+    router.charge(b.id, route.credit)
+    route = router.place(c, 0, 2)
+    router.charge(c.id, route.credit)
+    router.prefill_complete(c.id)
+    assert router.note_reuse(b.id, 128)
+    assert _tier_hit(router, b.prompt_hash_chain) <= 256
+
+
+def test_share_cache_completed_hit_is_not_a_producing_source():
+    from atom.model_engine.share_cache import ShareCacheRouter
+
+    router = ShareCacheRouter(128, 100)
+    first = _chain_seq(21, 768)
+    route = router.select(first, [0, 0], [0, 0])
+    router.charge(first.id, route.credit)
+    producing = router.select(_chain_seq(22, 768), [0, 0], [0, 0])
+    assert producing.decision == "share_cache_source_rank_total"
+    router.prefill_complete(first.id)
+    completed = router.select(_chain_seq(23, 768), [0, 0], [0, 0])
+    assert completed.credit > 0
+    assert completed.decision == "share_cache_hit_total"
 
 # ── Prefix-spread index counters (trim / evict) ────────────────────
 

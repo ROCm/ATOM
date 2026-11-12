@@ -419,8 +419,7 @@ def validate_runtime_config(config):
             # state a hit does not carry; without bounded replay the backend
             # copies state instead and the Store's PAGE-only load is unsound.
             "Mooncake Store without encoder SWA bounded replay",
-            KVConnectorFactory.connector_name(config.kv_transfer_config)
-            == "mooncake_store"
+            "mooncake_store" in (names or ())
             and not config.enable_encoder_swa_bounded_replay,
         ),
         ("RapidServe", config.enable_rapidserve),
