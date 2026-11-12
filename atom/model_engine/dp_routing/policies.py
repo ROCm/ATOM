@@ -140,7 +140,10 @@ class ShareCachePolicy(LoadPolicy):
 
     def select(self, seq: Any, explicit_rank: int | None) -> Route:
         if explicit_rank is not None:
-            return super().select(seq, explicit_rank)
+            placed = self.router.place(seq, explicit_rank, len(self.rank_reqs()))
+            return Route(
+                explicit_rank, "explicit_total", placed.credit, placed.moved_tokens
+            )
         placed = self.router.select(seq, self.backlog(), self.rank_reqs())
         return placed
 
