@@ -17,11 +17,15 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from torch import nn
+# The ATOMesh config job runs these tests on a runner without torch.
+try:
+    from torch import nn
 
-from atom.models.kimi_k3.mono import dispatch as k3_mono
-from atom.mono.runtime import route
-from atom.mono.runtime.consensus import MonoUnsupported
+    from atom.models.kimi_k3.mono import dispatch as k3_mono
+    from atom.mono.runtime import route
+    from atom.mono.runtime.consensus import MonoUnsupported
+except ModuleNotFoundError:
+    nn = None
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / ".github/scripts/atomesh"
@@ -671,6 +675,7 @@ class SubmitOnlineQuantTest(unittest.TestCase):
         self.assertEqual(result.stdout.splitlines()[-1], "exit 1")
 
 
+@unittest.skipIf(nn is None, "needs torch")
 class C1LogLinesAreK3MonoLogsTest(unittest.TestCase):
     """Every expect_log and reject_log line of the C1 decode is one K3 mono
     logs: a reworded log in ATOM must fail here, not leave a reject_log that
