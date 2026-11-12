@@ -63,10 +63,13 @@ def _select(case):
 
 
 def test_gfx1250_scorer_matches_portable_selection(monkeypatch):
+    import atom.model_ops.qwen4_exp.ops.qsa_select_gfx1250 as gfx_select
+
     case = _case(tokens_per_request=4)
-    monkeypatch.setenv("ATOM_QSA_GFX1250_SCORER", "0")
+    supports = gfx_select.qsa_index_scores_supports
+    monkeypatch.setattr(gfx_select, "qsa_index_scores_supports", lambda *_: False)
     expected = _select(case)
-    monkeypatch.setenv("ATOM_QSA_GFX1250_SCORER", "1")
+    monkeypatch.setattr(gfx_select, "qsa_index_scores_supports", supports)
     actual = _select(case)
     assert torch.equal(actual, expected)
 
@@ -75,7 +78,6 @@ def test_gfx1250_scorer_falls_back_for_draft_rows(monkeypatch):
     import atom.model_ops.qwen4_exp.ops.qsa_select_gfx1250 as gfx_select
 
     case = _case(tokens_per_request=1)
-    monkeypatch.setenv("ATOM_QSA_GFX1250_SCORER", "1")
 
     def unexpected(*args, **kwargs):
         raise AssertionError("gfx1250 scorer must not run for one row per request")
@@ -92,7 +94,6 @@ def test_gfx1250_scorer_falls_back_for_strided_page_table(monkeypatch):
     table = case[2]
     case[2] = table.T.contiguous().T
     assert case[2].stride(1) != 1
-    monkeypatch.setenv("ATOM_QSA_GFX1250_SCORER", "1")
 
     def unexpected(*args, **kwargs):
         raise AssertionError("gfx1250 scorer requires contiguous page-table rows")

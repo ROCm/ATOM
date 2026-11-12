@@ -2071,8 +2071,7 @@ def qsa_select_paged_groups(
         token_to_request_chunk = token_to_request[row_slice]
         query_positions_chunk = query_positions[row_slice]
         use_gfx1250_scorer = (
-            envs.ATOM_QSA_GFX1250_SCORER
-            and not allow_flydsl
+            not allow_flydsl
             and compressed_k_scale is None
             and _is_gfx1250()
             and q_chunk.shape[0] == 4 * page_table.shape[0]
@@ -2461,7 +2460,6 @@ def qsa_sparse_paged_gqa(
         and logical_indices.shape[1] > 0
         and logical_indices.stride(1) == 1
         and block_table.stride(1) == 1
-        and envs.ATOM_QSA_GFX1250
         and _is_gfx1250()
     ):
         from atom.model_ops.qwen4_exp.ops.qsa_gfx1250 import (

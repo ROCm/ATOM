@@ -7,6 +7,7 @@ import json
 import os
 
 import torch
+from aiter.jit.utils.chip_info import get_gfx
 from torch import nn
 
 from atom.config import Config
@@ -83,13 +84,15 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         self.mtp_start_layer_idx = config.num_hidden_layers
         self.hc_count = config.hc_count
         self.hidden_size = config.hidden_size
-        # Compatibility probe for gfx1250: the PR's validated MI355X stack can
-        # serve the checkpoint's BF16 MTP expert directly, while the available
-        # gfx1250 runtime uses the established online-MXFP4 MTP path.
-        force_quant_mtp = os.getenv("ATOM_QWEN38_FORCE_QUANT_MTP", "0") == "1"
+        # The validated gfx1250 stack serves the checkpoint through the
+        # online-MXFP4 MTP path. Other architectures follow the checkpoint's
+        # own MTP quantization metadata.
+        quantized_mtp = get_gfx() == "gfx1250" or _mtp_weights_quantized(
+            atom_config.model
+        )
         quant_cls = (
             _Qwen4ExpQuantizationConfig
-            if force_quant_mtp or _mtp_weights_quantized(atom_config.model)
+            if quantized_mtp
             else _UnquantizedMTPQuantizationConfig
         )
         quant_config = quant_cls(atom_config.quant_config)

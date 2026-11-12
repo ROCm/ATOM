@@ -756,16 +756,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_GDN_DECODE_LOSSY_FAST": lambda: (
         os.getenv("ATOM_ENABLE_GDN_DECODE_LOSSY_FAST", "0").lower() == "1"
     ),
-    # Qwen3.8 QSA sparse paged GQA on gfx1250 (MI450/MI455): gather the
-    # selected K/V rows with TDM into an LDS ring instead of the portable
-    # Triton kernel's VGPR loads. Default on; "0" restores the portable kernel.
-    "ATOM_QSA_GFX1250": lambda: os.getenv("ATOM_QSA_GFX1250", "1") == "1",
-    # Decode/verify QSA index scorer: reuse each compressed-K tile across the
-    # four MTP rows of one request with a 16-row WMMA. Default on after
-    # correctness, GSM8K and AgentX validation; "0" restores the portable scorer.
-    "ATOM_QSA_GFX1250_SCORER": lambda: (
-        os.getenv("ATOM_QSA_GFX1250_SCORER", "1") == "1"
-    ),
     # --- ReplaySSM (linear-attention state) ---
     # Cache the SSM *inputs* (k, u, g) instead of one full recurrent state per
     # speculative token.  The state pool stops scaling with the MTP window --
