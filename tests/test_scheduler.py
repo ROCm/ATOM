@@ -1053,37 +1053,13 @@ class TestSchedule:
 
     @pytest.mark.parametrize("failed", [False, True])
     def test_settled_offload_resume_precedes_a_preempted_head(self, failed):
-        sched = Scheduler(
-            MockConfig(
-                max_num_seqs=4,
-                max_num_batched_tokens=32,
-                num_kvcache_blocks=3,
-                kv_cache_block_size=16,
-            )
-        )
-
-        class _Connector(_OffloadMixinStub):
-            _do_load = False
-
-            def get_num_new_matched_tokens(self, seq):
-                return 0, False
-
-            def build_connector_meta(self):
-                return None
-
-        sched.kv_connector = _Connector()
+        sched = self._offload_sched(3)
         preempted = Sequence(list(range(16)), 16)
-        resume = Sequence(list(range(100, 132)), 16)
         assert sched.block_manager.allocate(preempted)
-        assert sched.block_manager.allocate(resume)
+        resume = self._settled_resume(sched, 100, failed=failed)
         preempted.num_cached_tokens = 16
         preempted.status = SequenceStatus.RUNNING
         preempted.append_token(77)
-        resume.status = SequenceStatus.WAITING
-        resume.num_cached_tokens = 16
-        resume.offload_loaded = not failed
-        resume.offload_load_failed = failed
-        sched._count_inflight_load(resume)
         sched.waiting.append(resume)
 
         # The finished id has already been consumed. A decode now needs a
@@ -1281,8 +1257,8 @@ class TestSchedule:
     def test_an_idle_tick_leaves_the_waiting_queue_alone(self):
         """Without a finished or failed id nothing is scanned, however long the
         queue: a settled resume is promoted once, when its load ends, and
-        `preempt` keeps it in front afterwards. Ready loads keep arrival order
-        ahead of everyone else."""
+        `preempt` and parking, which both queue behind it, keep it in front
+        afterwards. Ready loads keep arrival order ahead of everyone else."""
         sched = self._offload_sched(8)
         early = self._settled_resume(sched, 100)
         late = self._in_flight_load(sched, 200)
