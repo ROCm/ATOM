@@ -20,6 +20,7 @@ import triton.language as tl
 from atom.model_ops.minimax_m3.index_topk import (
     DECODE_TOPK_NUM_WARPS,
     PAGES_PER_SPARSE_BLOCK,
+    SCORE_KEY_BITS,
     _alloc_emit,
     _emit_sparse_block_table_row,
     _pack_score_key,
@@ -28,6 +29,22 @@ from atom.model_ops.minimax_m3.index_topk import (
 
 # Live blocks one _local_topk tile selects from; longer rows stream more tiles.
 LOCAL_TOPK_TILE = 512
+
+
+def _topk_block_t(topk: int) -> int:
+    """Power-of-two selection width required by tl.topk and fused emission."""
+    return triton.next_power_of_2(topk)
+
+
+def _topk_tiles(topk: int, local_blocks: int) -> tuple[int, int]:
+    """The score tile and selection widths shared by both local-top-k paths."""
+    block_t = _topk_block_t(topk)
+    block_k = max(
+        16,
+        block_t,
+        min(triton.next_power_of_2(local_blocks), LOCAL_TOPK_TILE),
+    )
+    return block_k, block_t
 
 
 @triton.jit
@@ -131,15 +148,15 @@ def _local_topk(
         row,
         head,
         tokens,
-        QUERY_LEN,
-        LOCAL_BLOCKS,
-        GLOBAL_BLOCKS,
-        RANK,
-        WORLD,
-        INIT_BLOCKS,
-        LOCAL_KEEP,
-        BLOCK_SIZE_K,
-        BLOCK_SIZE_T,
+        QUERY_LEN=QUERY_LEN,
+        LOCAL_BLOCKS=LOCAL_BLOCKS,
+        GLOBAL_BLOCKS=GLOBAL_BLOCKS,
+        RANK=RANK,
+        WORLD=WORLD,
+        INIT_BLOCKS=INIT_BLOCKS,
+        LOCAL_KEEP=LOCAL_KEEP,
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
+        BLOCK_SIZE_T=BLOCK_SIZE_T,
     )
     off_t = tl.arange(0, BLOCK_SIZE_T)
     tl.store(
@@ -263,16 +280,16 @@ def _merge_topk(
         Table,
         SparseBt,
         SparseCtx,
-        TABLE_STRIDE,
-        SBT_STRIDE,
-        QUERY_LEN,
-        TOPK,
-        INIT_BLOCKS,
-        LOCAL_KEEP,
-        NUM_KV_HEADS,
-        PAGES_PER_BLOCK,
-        BLOCK_SIZE_T,
-        EMIT,
+        TABLE_STRIDE=TABLE_STRIDE,
+        SBT_STRIDE=SBT_STRIDE,
+        QUERY_LEN=QUERY_LEN,
+        TOPK=TOPK,
+        INIT_BLOCKS=INIT_BLOCKS,
+        LOCAL_KEEP=LOCAL_KEEP,
+        NUM_KV_HEADS=NUM_KV_HEADS,
+        PAGES_PER_BLOCK=PAGES_PER_BLOCK,
+        BLOCK_SIZE_T=BLOCK_SIZE_T,
+        EMIT=EMIT,
     )
 
 
@@ -320,11 +337,7 @@ def local_candidate_keys(
         # shipped config and costs it exactly nothing; it is here so the
         # function is correct for the topk its own guard admits (<= 512), rather
         # than only for the one value production happens to pass.
-        width = max(
-            16,
-            triton.next_power_of_2(topk),
-            min(triton.next_power_of_2(local), LOCAL_TOPK_TILE),
-        )
+        block_k, block_t = _topk_tiles(topk, local)
         _local_topk[(tokens, heads)](
             scores,
             keys,
@@ -337,8 +350,8 @@ def local_candidate_keys(
             TOPK=topk,
             INIT_BLOCKS=init_blocks,
             LOCAL_KEEP=local_blocks,
-            BLOCK_SIZE_K=width,
-            BLOCK_SIZE_T=triton.next_power_of_2(topk),
+            BLOCK_SIZE_K=block_k,
+            BLOCK_SIZE_T=block_t,
             num_warps=DECODE_TOPK_NUM_WARPS,
         )
     return keys
@@ -390,6 +403,7 @@ def merge_candidate_keys(
     indices = torch.empty((1, tokens, topk), dtype=torch.int32, device=keys.device)
     output, _ = _alloc_emit(tokens, 1, topk, block_table, True, keys.device)
     if tokens:
+        block_t = _topk_block_t(topk)
         _merge_topk[(tokens,)](
             keys,
             indices,
@@ -414,16 +428,27 @@ def merge_candidate_keys(
             # emit's zero-fill spans BLOCK_SIZE_T*pages_per_block unmasked, and
             # the sparse_bt row is only topk*pages_per_block wide. A padded
             # BLOCK_SIZE_T writes past the row into the next allocation.
-            BLOCK_SIZE_T=triton.next_power_of_2(topk),
+            BLOCK_SIZE_T=block_t,
             EMIT=True,
             num_warps=DECODE_TOPK_NUM_WARPS,
         )
     return indices, *output
 
 
-# A key uses bits 0..48 (_pack_score_key), so a mailbox word carries the tag of
-# its call in bits 49..63. The tag is never 0, the word of an empty mailbox.
-_TAG_SHIFT = tl.constexpr(49)
+# A mailbox word carries its tag above the packed score key. The tag is never
+# zero, which is the value of an empty mailbox word.
+_TAG_SHIFT = tl.constexpr(SCORE_KEY_BITS)
+_TAG_MASK = tl.constexpr((1 << (64 - SCORE_KEY_BITS)) - 1)
+# Divisible by both banks, so bank alternation survives the counter wrap.
+_CALL_PERIOD = tl.constexpr(1 << 30)
+
+
+@triton.jit
+def _next_call(counter, BANKS: tl.constexpr):
+    """Return the next counter value and its mailbox bank/tag."""
+    tl.static_assert(_CALL_PERIOD % BANKS == 0)
+    call = tl.load(counter) % _CALL_PERIOD + 1
+    return call, call % BANKS, (call % _TAG_MASK + 1).to(tl.int64)
 
 
 @triton.jit(do_not_specialize=["GLOBAL_BLOCKS"])
@@ -442,6 +467,7 @@ def _select_exchange_merge(
     GLOBAL_BLOCKS,
     RANK: tl.constexpr,
     WORLD: tl.constexpr,
+    BANKS: tl.constexpr,
     TOPK: tl.constexpr,
     INIT_BLOCKS: tl.constexpr,
     LOCAL_KEEP: tl.constexpr,
@@ -468,7 +494,7 @@ def _select_exchange_merge(
     row = pid % tokens
     head = (RANK + 1 + pid // tokens) % WORLD
     counter = SendCalls + head * MAX_ROWS + row
-    call = tl.load(counter) % (1 << 30) + 1
+    call, bank, tag = _next_call(counter, BANKS)
     peer = tl.load(Peers + head).to(tl.pointer_type(tl.int64))
     winners = _shard_winners(
         Scores,
@@ -476,21 +502,20 @@ def _select_exchange_merge(
         row,
         head,
         tokens,
-        QUERY_LEN,
-        LOCAL_BLOCKS,
-        GLOBAL_BLOCKS,
-        RANK,
-        WORLD,
-        INIT_BLOCKS,
-        LOCAL_KEEP,
-        BLOCK_SIZE_K,
-        BLOCK_SIZE_T,
+        QUERY_LEN=QUERY_LEN,
+        LOCAL_BLOCKS=LOCAL_BLOCKS,
+        GLOBAL_BLOCKS=GLOBAL_BLOCKS,
+        RANK=RANK,
+        WORLD=WORLD,
+        INIT_BLOCKS=INIT_BLOCKS,
+        LOCAL_KEEP=LOCAL_KEEP,
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
+        BLOCK_SIZE_T=BLOCK_SIZE_T,
     )
     tl.debug_barrier()  # every wave has read the old call
     tl.store(counter, call)
     off_t = tl.arange(0, BLOCK_SIZE_T)
-    slot = ((call % 2) * WORLD + RANK) * MAX_ROWS + row
-    tag = (call % 32767 + 1).to(tl.int64)
+    slot = (bank * WORLD + RANK) * MAX_ROWS + row
     tl.store(
         peer + slot * SLOT_KEYS + off_t,
         winners | (tag << _TAG_SHIFT),
@@ -499,11 +524,12 @@ def _select_exchange_merge(
     )
     if head == RANK:
         counter = RecvCalls + row
-        call = tl.load(counter) % (1 << 30) + 1
-        tag = (call % 32767 + 1).to(tl.int64)
+        call, bank, tag = _next_call(counter, BANKS)
         off = tl.arange(0, CANDIDATES)
-        bank = (call % 2) * WORLD * MAX_ROWS
-        src = peer + ((bank + (off // TOPK) * MAX_ROWS + row) * SLOT_KEYS + off % TOPK)
+        bank_offset = bank * WORLD * MAX_ROWS
+        src = peer + (
+            (bank_offset + (off // TOPK) * MAX_ROWS + row) * SLOT_KEYS + off % TOPK
+        )
         # The pad lanes of a power-of-two CANDIDATES read as an empty slot that arrived.
         real = off < WORLD * TOPK
         empty = tag << _TAG_SHIFT
@@ -514,7 +540,9 @@ def _select_exchange_merge(
             seen = tl.load(
                 src, mask=real, other=empty, cache_modifier=".cv", volatile=True
             )
-            late = tl.sum((((seen >> _TAG_SHIFT) & 0x7FFF) != tag).to(tl.int32), axis=0)
+            late = tl.sum(
+                (((seen >> _TAG_SHIFT) & _TAG_MASK) != tag).to(tl.int32), axis=0
+            )
         tl.debug_barrier()
         tl.store(counter, call)
         # The poll checked one copy of each key; the waves holding the others
@@ -528,16 +556,16 @@ def _select_exchange_merge(
             Table,
             SparseBt,
             SparseCtx,
-            TABLE_STRIDE,
-            SBT_STRIDE,
-            QUERY_LEN,
-            TOPK,
-            INIT_BLOCKS,
-            LOCAL_KEEP,
-            1,
-            PAGES_PER_BLOCK,
-            BLOCK_SIZE_T,
-            True,
+            TABLE_STRIDE=TABLE_STRIDE,
+            SBT_STRIDE=SBT_STRIDE,
+            QUERY_LEN=QUERY_LEN,
+            TOPK=TOPK,
+            INIT_BLOCKS=INIT_BLOCKS,
+            LOCAL_KEEP=LOCAL_KEEP,
+            NUM_KV_HEADS=1,
+            PAGES_PER_BLOCK=PAGES_PER_BLOCK,
+            BLOCK_SIZE_T=BLOCK_SIZE_T,
+            EMIT=True,
         )
 
 
@@ -558,10 +586,12 @@ def select_exchanged_candidates(
     ``fits`` this call). Returns what ``merge_candidate_keys`` returns, bit for bit.
 
     Every rank of the group must make the same calls in the same order, as for
-    any collective.
+    any collective. Inputs are the scorer output and CP metadata already
+    validated by the caller; rank/world and forced-block counts come from the
+    same CP configuration used by the collective fallback.
     """
     heads, tokens, local = scores.shape
-    if heads != world_size or not mailbox.fits(tokens, topk):
+    if world_size != mailbox.world or not mailbox.fits(heads, tokens, topk):
         raise ValueError(
             "the mailbox exchange needs one head a rank and room for the call"
         )
@@ -574,11 +604,7 @@ def select_exchanged_candidates(
     indices = torch.empty((1, tokens, topk), dtype=torch.int32, device=scores.device)
     output, _ = _alloc_emit(tokens, 1, topk, block_table, True, scores.device)
     if tokens:
-        width = max(
-            16,
-            triton.next_power_of_2(topk),
-            min(triton.next_power_of_2(local), LOCAL_TOPK_TILE),
-        )
+        block_k, block_t = _topk_tiles(topk, local)
         _select_exchange_merge[(tokens * heads,)](
             scores,
             seq_lens,
@@ -594,11 +620,12 @@ def select_exchanged_candidates(
             GLOBAL_BLOCKS=global_blocks,
             RANK=rank,
             WORLD=world_size,
+            BANKS=mailbox.BANKS,
             TOPK=topk,
             INIT_BLOCKS=init_blocks,
             LOCAL_KEEP=local_blocks,
-            BLOCK_SIZE_K=width,
-            BLOCK_SIZE_T=triton.next_power_of_2(topk),
+            BLOCK_SIZE_K=block_k,
+            BLOCK_SIZE_T=block_t,
             CANDIDATES=triton.next_power_of_2(world_size * topk),
             MAX_ROWS=mailbox.max_rows,
             SLOT_KEYS=mailbox.MAX_TOPK,

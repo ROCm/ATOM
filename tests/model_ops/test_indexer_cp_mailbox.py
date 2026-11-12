@@ -72,7 +72,9 @@ def _case(rank, mailbox, batch, context, init, keep):
     # No barrier between calls: a rank runs up to one call ahead of a peer.
     for i in (0, 1, 1, 0, 0, 1, 0, 1):
         got = one_launch(i)
-        results.append(all(torch.equal(a, b) for a, b in zip(got, expected[i])))
+        results.append(
+            all(torch.equal(a, b) for a, b in zip(got, expected[i], strict=True))
+        )
     torch.cuda.synchronize()
     dist.barrier()
     stream = torch.cuda.Stream()
@@ -86,8 +88,8 @@ def _case(rank, mailbox, batch, context, init, keep):
             graph.replay()
             torch.cuda.synchronize()
             results.extend(
-                all(torch.equal(a, b) for a, b in zip(got, expected[i]))
-                for got, i in zip(replayed, order)
+                all(torch.equal(a, b) for a, b in zip(got, expected[i], strict=True))
+                for got, i in zip(replayed, order, strict=True)
             )
     torch.cuda.current_stream().wait_stream(stream)
     dist.barrier()

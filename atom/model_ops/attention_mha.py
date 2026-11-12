@@ -1712,7 +1712,9 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         )
         # The shape decides the path, so every rank takes the same one.
         mailbox = candidate_mailbox()
-        if mailbox is not None and mailbox.fits(scores.shape[1], self.topk):
+        if mailbox is not None and mailbox.fits(
+            scores.shape[0], scores.shape[1], self.topk
+        ):
             return select_exchanged_candidates(
                 scores,
                 seq_lens,
