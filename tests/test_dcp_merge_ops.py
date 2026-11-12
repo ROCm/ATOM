@@ -897,6 +897,7 @@ def test_project_merge_out_head_major_matches_the_packed_one(
         if fp8_absorb
         else (w_v, None)
     )
+    layer.W_V_scale = layer.W_V_dcp_scale  # what _v_up_proj reads for a None scale
     o = [
         torch.randn(b, h, latent, generator=g, device=DEV).bfloat16()
         for _ in range(n_ranks)
