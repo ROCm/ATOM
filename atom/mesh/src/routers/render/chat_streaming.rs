@@ -282,7 +282,13 @@ async fn run_chat_stream(
         }
     }
 
-    if let Some(parser) = tool_parser.as_ref().filter(|_| tool_choice_enabled) {
+    // `tool_choice: "none"`: the parser read the calls, none go out.
+    let unstreamed_parser = if tool_choice_enabled {
+        tool_parser.as_ref()
+    } else {
+        None
+    };
+    if let Some(parser) = unstreamed_parser {
         let guard = parser.lock().await;
         if let Some(unstreamed) = guard.get_unstreamed_tool_args() {
             for item in unstreamed {
@@ -341,8 +347,7 @@ async fn run_chat_stream(
                 })
                 .maybe_system_fingerprint(system_fingerprint.clone())
                 .build();
-            let s = serde_json::to_value(&usage_chunk)
-                .map(|chunk| super::with_cached_tokens(chunk, cached_tokens).to_string())
+            let s = serde_json::to_string(&super::with_cached_tokens(usage_chunk, cached_tokens))
                 .map_err(|e| format!("Failed to serialize usage chunk: {}", e))?;
             tx.send(Ok(Bytes::from(format!("data: {}\n\n", s))))
                 .map_err(|_| "send usage".to_string())?;
@@ -541,35 +546,37 @@ async fn process_tool_calls_stream(
                         .build(),
                 );
             }
-            for item in calls.into_iter().filter(|_| !suppress_calls) {
-                *has_tool_call = true;
-                let id = item.name.as_ref().map(|n| {
-                    generate_tool_call_id(model, n, item.tool_index, history_tool_calls_count)
-                });
-                let delta = ToolCallDelta {
-                    index: item.tool_index as u32,
-                    id,
-                    tool_type: if item.name.is_some() {
-                        Some("function".to_string())
-                    } else {
-                        None
-                    },
-                    function: Some(FunctionCallDelta {
-                        name: item.name,
-                        arguments: if item.parameters.is_empty() {
-                            None
+            if !suppress_calls {
+                for item in calls {
+                    *has_tool_call = true;
+                    let id = item.name.as_ref().map(|n| {
+                        generate_tool_call_id(model, n, item.tool_index, history_tool_calls_count)
+                    });
+                    let delta = ToolCallDelta {
+                        index: item.tool_index as u32,
+                        id,
+                        tool_type: if item.name.is_some() {
+                            Some("function".to_string())
                         } else {
-                            Some(item.parameters)
+                            None
                         },
-                    }),
-                };
-                chunks.push(
-                    ChatCompletionStreamResponse::builder(request_id, model)
-                        .created(created)
-                        .add_choice_tool_call_delta(0, delta)
-                        .maybe_system_fingerprint(system_fingerprint.map(|s| s.to_string()))
-                        .build(),
-                );
+                        function: Some(FunctionCallDelta {
+                            name: item.name,
+                            arguments: if item.parameters.is_empty() {
+                                None
+                            } else {
+                                Some(item.parameters)
+                            },
+                        }),
+                    };
+                    chunks.push(
+                        ChatCompletionStreamResponse::builder(request_id, model)
+                            .created(created)
+                            .add_choice_tool_call_delta(0, delta)
+                            .maybe_system_fingerprint(system_fingerprint.map(|s| s.to_string()))
+                            .build(),
+                    );
+                }
             }
         }
         Err(e) => error!("Tool call parsing error: {}", e),

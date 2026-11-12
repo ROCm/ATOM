@@ -41,10 +41,7 @@ use crate::{
 
 pub async fn process(stream: TokenHandle, ctx: ResponseContext) -> Response {
     match aggregate(stream, ctx).await {
-        Ok((resp, cached)) => match serde_json::to_value(resp) {
-            Ok(value) => axum::Json(super::with_cached_tokens(value, cached)).into_response(),
-            Err(e) => error::internal_error("serialize_failed", e.to_string()),
-        },
+        Ok((resp, cached)) => axum::Json(super::with_cached_tokens(resp, cached)).into_response(),
         Err(resp) => resp,
     }
 }
@@ -261,7 +258,7 @@ async fn process_choice(
             _ => false,
         };
 
-        if used_json_schema && !tool_choice_none {
+        if used_json_schema {
             (tool_calls, processed_text) = parse_json_schema_response(
                 &processed_text,
                 &chat_request.tool_choice,
