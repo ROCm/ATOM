@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import logging
 import math
-import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -20,8 +19,6 @@ class PendingReceive:
     blocks: frozenset[int]
     ready: bool = False
     cancelled: bool = False
-    # Only for `pd_admission_ready_wait`.
-    ready_at: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -36,7 +33,7 @@ class PdAdmissionController:
     """Credits never free KV or decide whether a remote writer is safe."""
 
     @classmethod
-    def from_config(cls, config, connector, block_manager, metrics):
+    def from_config(cls, config, connector, block_manager):
         options = (config.kv_transfer_config or {}).get("pd_admission", {})
         if not isinstance(options, dict):
             raise TypeError("pd_admission must be an object")
@@ -88,21 +85,21 @@ class PdAdmissionController:
             byte_limit = max(1, int(config.num_kvcache_blocks * block_bytes * fraction))
         if byte_limit is None:
             raise ValueError("pd_admission requires a receive-byte limit")
-        return cls(byte_limit, block_bytes, connector, block_manager, metrics)
+        return cls(byte_limit, block_bytes, connector, block_manager)
 
-    def __init__(self, max_bytes, block_bytes, connector, block_manager, metrics=None):
+    def __init__(self, max_bytes, block_bytes, connector, block_manager):
         self.max_bytes = max_bytes
         self.block_bytes = block_bytes
         # The receive range is the connector's prefix-skip rule over the
         # allocator's destination table; neither is the scheduler's to know.
         self._connector = connector
         self._block_manager = block_manager
-        self.metrics = metrics
         self.pending: dict[str, PendingReceive] = {}
         self._block_refs: dict[int, int] = {}
-        # Per request id: when it was first deferred, and by which limits.
-        self._deferred: dict[str, tuple[float, set[str]]] = {}
-        self._publish()
+        # Requests deferred, once per request and limit, for the metrics
+        # snapshot. `_deferred_by` holds the limits each waiting request hit.
+        self.deferred = {"bytes": 0}
+        self._deferred_by: dict[str, set[str]] = {}
         logger.info(
             "PD admission enabled: pending_kv_bytes=%d per D rank, "
             "block_bytes=%d; credits held until first forward",
@@ -138,15 +135,10 @@ class PdAdmissionController:
             return True, plan
         reason = "bytes"
         # One deferral per request and limit, however many passes it waits.
-        _, reasons = self._deferred.setdefault(
-            str(seq.id), (time.perf_counter(), set())
-        )
+        reasons = self._deferred_by.setdefault(str(seq.id), set())
         if reason not in reasons:
             reasons.add(reason)
-            if self.metrics is not None:
-                self.metrics.pd_admission_deferred.labels(
-                    **self.metrics._labels, reason=reason
-                ).inc()
+            self.deferred[reason] += 1
         return False, plan
 
     def _charged_hits(self, probe, offset: int) -> int:
@@ -172,33 +164,23 @@ class PdAdmissionController:
         key = str(seq.id)
         if key in self.pending:
             raise RuntimeError(f"Duplicate PD admission for sequence {key}")
-        deferred = self._deferred.pop(key, None)
-        if self.metrics is not None:
-            self.metrics.pd_admission_credit_wait.observe(
-                0.0 if deferred is None else time.perf_counter() - deferred[0]
-            )
+        self._deferred_by.pop(key, None)
         blocks = frozenset(seq.block_table[plan.offset : plan.num_blocks])
-        if len(blocks) * self.block_bytes > self.max_bytes and self.metrics is not None:
-            self.metrics.pd_admission_oversized.inc()
         self.pending[key] = PendingReceive(seq, blocks)
         for block in blocks:
             self._block_refs[block] = self._block_refs.get(block, 0) + 1
-        self._publish()
 
     def received(self, req_id):
         entry = self.pending.get(str(req_id))
-        if entry is not None and not entry.ready:
+        if entry is not None:
             entry.ready = True
-            entry.ready_at = time.perf_counter()
-            self._publish()
 
     def cancel(self, seq):
         # A request rejected while deferred never reaches `commit`.
-        self._deferred.pop(str(seq.id), None)
+        self._deferred_by.pop(str(seq.id), None)
         entry = self.pending.get(str(seq.id))
         if entry is not None and entry.sequence is seq:
             entry.cancelled = True
-            self._publish()
 
     def scheduled(self, sequences):
         # Runs on every batch, and most batches decode with nothing pending.
@@ -210,17 +192,13 @@ class PdAdmissionController:
                 continue
             if not entry.ready or entry.cancelled:
                 raise RuntimeError(f"Scheduled unfinished PD receive {seq.id}")
-            if self.metrics is not None:
-                self.metrics.pd_admission_ready_wait.observe(
-                    time.perf_counter() - entry.ready_at
-                )
             self.release(seq)
             if not self.pending:
                 return
 
     def release(self, seq):
         key = str(seq.id)
-        self._deferred.pop(key, None)
+        self._deferred_by.pop(key, None)
         entry = self.pending.get(key)
         if entry is None or entry.sequence is not seq:
             return
@@ -231,21 +209,3 @@ class PdAdmissionController:
                 self._block_refs[block] = refs
             else:
                 del self._block_refs[block]
-        self._publish()
-
-    def _publish(self):
-        if self.metrics is None:
-            return
-        counts = {"receiving": 0, "ready": 0, "cancel_draining": 0}
-        for entry in self.pending.values():
-            state = (
-                "cancel_draining"
-                if entry.cancelled
-                else ("ready" if entry.ready else "receiving")
-            )
-            counts[state] += 1
-        for state, count in counts.items():
-            self.metrics.pd_admission_pending.labels(
-                **self.metrics._labels, state=state
-            ).set(count)
-        self.metrics.pd_admission_bytes.set(self.pending_bytes)

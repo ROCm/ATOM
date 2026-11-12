@@ -95,22 +95,6 @@ def build(monkeypatch, mooncake_module, seq_factory):
     return make
 
 
-def admission_total(metrics, name, **extra):
-    """Value of one admission counter on this scheduler's own metrics object.
-
-    A counter stored already labelled (no further labels) reports samples with
-    empty labels; one that still takes a label reports the full set.
-    """
-    want = {**metrics._labels, **extra}
-    for family in getattr(metrics, name).collect():
-        for sample in family.samples:
-            if not sample.name.endswith("_total"):
-                continue
-            if sample.labels == want or sample.labels == extra:
-                return sample.value
-    return 0.0
-
-
 def receive_success(seq, *, as_str=False):
     """A terminal worker report; chunked handoff follows the real wire contract."""
     return KVConnectorOutput(
@@ -133,14 +117,14 @@ class SizedSeq(SimpleNamespace):
 NO_HIT = SimpleNamespace(num_cached_blocks=0, block_hashes=[])
 
 
-def standalone(max_bytes, metrics=None):
+def standalone(max_bytes):
     """A controller over a one-token-per-block pool and a full-transfer connector."""
     connector = SimpleNamespace(pd_receive_block_offset=lambda seq, n, cached: 0)
     block_manager = SimpleNamespace(
         num_pool_blocks=lambda tokens: tokens,
         kv=SimpleNamespace(lookup=lambda h: -1),
     )
-    return PdAdmissionController(max_bytes, 1024, connector, block_manager, metrics)
+    return PdAdmissionController(max_bytes, 1024, connector, block_manager)
 
 
 def try_admit(policy, seq):
@@ -188,15 +172,14 @@ def test_bytes_limit_and_isolated_large_request(build, chunked):
     sched.schedule()
     assert not b.block_table
     # B waited two passes; it is one deferred request, not two attempts.
-    assert admission_total(sched.metrics, "pd_admission_deferred", reason="bytes") == 1
+    assert sched.pd_admission.deferred == {"bytes": 1}
     sched._update_from_kv_xfer_finished(receive_success(a))
     sched.schedule()
     sched.schedule()
     # Alone, B is admitted past the 3072-byte limit.
     assert b.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
     assert sched.pd_admission.pending_bytes == 4096
-    assert admission_total(sched.metrics, "pd_admission_oversized") == 1
-    assert admission_total(sched.metrics, "pd_admission_deferred", reason="bytes") == 1
+    assert sched.pd_admission.deferred == {"bytes": 1}
 
 
 @pytest.mark.parametrize("fraction", [None, 0.25])
@@ -618,54 +601,42 @@ def test_rejected_deferred_request_leaves_no_marker():
     assert not try_admit(policy, b)
     # B is rejected from waiting without ever being admitted.
     policy.cancel(b)
-    assert not policy._deferred
+    assert not policy._deferred_by
 
 
-def test_admission_metrics_follow_credit_lifecycle(monkeypatch):
-    from prometheus_client import CollectorRegistry
+def test_admission_state_is_exported_from_the_metrics_snapshot(build):
+    from queue import Queue
 
-    from atom.kv_transfer.disaggregation import pd_admission
-    from atom.metrics.scheduler import SchedulerMetrics
+    from atom.metrics.exporter import _AtomMetricsCollector
+    from atom.model_engine.engine_utility import EngineUtilityHandler
 
-    clock = [100.0]
-    monkeypatch.setattr(pd_admission.time, "perf_counter", lambda: clock[0])
-    registry = CollectorRegistry()
-    policy = standalone(2048, SchedulerMetrics(registry=registry))
-    seq = SizedSeq(id=1, block_table=[1, 2])
-    other = SizedSeq(id=2, block_table=[3])
-    labels = {"dp_rank": "0", "engine_role": "default"}
+    sched, request = build()
+    a, b = request(), request()
+    sched.extend([a, b])
+    sched.schedule()
+    sched.schedule()
+    handler = EngineUtilityHandler(None, Queue(), scheduler=sched)
+    rank = handler.collect_metrics()["scheduler_metrics"]
+    assert rank["pd_admission"] == {
+        "pending": {"receiving": 1, "ready": 0, "cancel_draining": 0},
+        "pending_kv_bytes": 2048,
+        "deferred": {"bytes": 1},
+    }
+    sched.pd_admission.received(a.id)
+    pending = handler.collect_metrics()["scheduler_metrics"]["pd_admission"]["pending"]
+    assert pending == {"receiving": 0, "ready": 1, "cancel_draining": 0}
 
-    def sample(name, **extra):
-        return registry.get_sample_value(f"atom:pd_admission_{name}", labels | extra)
-
-    assert try_admit(policy, seq)
-    assert sample("pending_requests", state="receiving") == 1
-    assert not try_admit(policy, other)
-    clock[0] += 2
-    assert not try_admit(policy, other)
-    assert sample("deferred_total", reason="bytes") == 1
-    policy.received(seq.id)
-    assert sample("pending_requests", state="ready") == 1
-    clock[0] += 3
-    policy.scheduled([seq])
-    assert sample("pending_kv_bytes") == 0
-    assert sample("ready_wait_seconds_count") == 1
-    assert try_admit(policy, other)
-    # SEQ entered at once; OTHER waited from its first deferral at t=100.
-    assert sample("credit_wait_seconds_count") == 2
-    assert sample("credit_wait_seconds_sum") == 5
-    policy.release(other)
-    # Nothing pending, so one request may pass the byte budget.
-    huge = SizedSeq(id=3, block_table=[4, 5, 6])
-    assert try_admit(policy, huge)
-    assert sample("oversized_total") == 1
-    assert sample("pending_requests", state="receiving") == 1
-    policy.cancel(huge)
-    assert sample("pending_requests", state="cancel_draining") == 1
-    assert sample("pending_requests", state="receiving") == 0
-
-
-def test_scheduler_hands_its_metrics_to_admission(build):
-    sched, _ = build()
-    assert sched.pd_admission is not None
-    assert sched.pd_admission.metrics is sched.metrics
+    snapshot = {"scheduler_metrics": [{"dp_rank": 0, "engine_role": "decode", **rank}]}
+    exporter = SimpleNamespace(stream_silence=lambda: 0.0, other_processes_gc=list)
+    samples = {
+        (sample.name, tuple(sorted(sample.labels.items()))): sample.value
+        for family in _AtomMetricsCollector(exporter)._collect((snapshot, 0, 0.0))
+        for sample in family.samples
+    }
+    labels = (("dp_rank", "0"), ("engine_role", "decode"))
+    receiving = (*labels, ("state", "receiving"))
+    assert samples["atom:pd_admission_pending_requests", receiving] == 1
+    assert samples["atom:pd_admission_pending_kv_bytes", labels] == 2048
+    assert (
+        samples["atom:pd_admission_deferred_total", (*labels, ("reason", "bytes"))] == 1
+    )

@@ -895,7 +895,7 @@ class Scheduler:
 
         self.kv_connector = get_kvconnector("scheduler", config)
         self.pd_admission = PdAdmissionController.from_config(
-            config, self.kv_connector, self.block_manager, self.metrics
+            config, self.kv_connector, self.block_manager
         )
         bind_block_manager = getattr(self.kv_connector, "bind_block_manager", None)
         if callable(bind_block_manager):

@@ -992,5 +992,22 @@ class EngineUtilityHandler:
                     "waiting": max(0, waiting - external),
                     "waiting_kv": external,
                 }
+                admission = getattr(self.scheduler, "pd_admission", None)
+                if admission is not None:
+                    pending = dict.fromkeys(
+                        ("receiving", "ready", "cancel_draining"), 0
+                    )
+                    for entry in admission.pending.values():
+                        if entry.cancelled:
+                            pending["cancel_draining"] += 1
+                        elif entry.ready:
+                            pending["ready"] += 1
+                        else:
+                            pending["receiving"] += 1
+                    result["scheduler_metrics"]["pd_admission"] = {
+                        "pending": pending,
+                        "pending_kv_bytes": admission.pending_bytes,
+                        "deferred": dict(admission.deferred),
+                    }
 
         return result
