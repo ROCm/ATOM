@@ -37,6 +37,7 @@ from atom.model_ops.qwen4_exp.ops.qsa_gfx1250 import (
     qsa_gfx1250_supports,
     qsa_sparse_paged_gqa_gfx1250,
 )
+from atom.model_ops.qwen4_exp.ops.qsa_split_k import reduce_split_k, split_k_buffers
 from atom.utils import envs
 
 # Quantized cache rows. FP8 rows carry one FP32 scale (row amax / FP8 max), so
@@ -2494,15 +2495,7 @@ def qsa_sparse_paged_gqa(
     if logical_indices.shape[1] == 0:
         # Empty selections produce zero attention output; skip split reduction.
         return out.zero_()
-    target = out
-    partial_max = partial_sum = out
-    widths = None
-    if kv_splits > 1:
-        shape = (q.shape[0], q.shape[1], kv_splits)
-        partial_max = torch.empty(shape, device=q.device, dtype=torch.float32)
-        partial_sum = torch.empty_like(partial_max)
-        target = torch.empty((*shape, q.shape[2]), device=q.device, dtype=torch.float32)
-        widths = torch.empty(q.shape[0], dtype=torch.int32, device=q.device)
+    target, partial_max, partial_sum, widths = split_k_buffers(out, kv_splits)
     grid_y = k_cache.shape[2] * num_head_groups
     _qsa_sparse_paged_gqa_kernel[(q.shape[0], grid_y, kv_splits)](
         q,
@@ -2556,30 +2549,5 @@ def qsa_sparse_paged_gqa(
         num_stages=num_stages,
         waves_per_eu=waves_per_eu,
     )
-    if kv_splits > 1:
-        from aiter.ops.triton._triton_kernels.attention.mla import (
-            _mla_decode_fwd_reduce_kernel,
-        )
-
-        _mla_decode_fwd_reduce_kernel[(q.shape[0], q.shape[1])](
-            out,
-            target,
-            partial_max,
-            partial_sum,
-            widths,
-            None,
-            q.shape[0],
-            q.shape[1],
-            out.stride(0),
-            out.stride(1),
-            1,
-            1,
-            q.shape[0],
-            TILE_SIZE=block_n,
-            KV_LORA_RANK=q.shape[2],
-            query_start_len_ptr=None,
-            BLOCK_Q=1,
-            NUM_SEGMENTS_PER_SEQ=kv_splits,
-            ALL_DECODE=True,
-        )
+    reduce_split_k(out, target, partial_max, partial_sum, widths, kv_splits, block_n)
     return out

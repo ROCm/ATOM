@@ -28,11 +28,10 @@ Same contract and split-K partial format as `_qsa_sparse_paged_gqa_kernel` in
 
 import torch
 import triton
-from aiter.ops.triton._triton_kernels.attention.mla import (
-    _mla_decode_fwd_reduce_kernel,
-)
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
+
+from atom.model_ops.qwen4_exp.ops.qsa_split_k import reduce_split_k, split_k_buffers
 
 
 @gluon.jit
@@ -478,15 +477,7 @@ def qsa_sparse_paged_gqa_gfx1250(
     rows_per_page = k_cache.stride(0) // head_dim
     num_cache_rows = (pages - 1) * rows_per_page + page_size * kv_heads
     out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
-    target = out
-    partial_max = partial_sum = out
-    widths = None
-    if kv_splits > 1:
-        shape = (tokens, q_heads, kv_splits)
-        partial_max = torch.empty(shape, device=q.device, dtype=torch.float32)
-        partial_sum = torch.empty_like(partial_max)
-        target = torch.empty((*shape, head_dim), device=q.device, dtype=torch.float32)
-        widths = torch.empty(tokens, dtype=torch.int32, device=q.device)
+    target, partial_max, partial_sum, widths = split_k_buffers(out, kv_splits)
 
     _qsa_sparse_paged_gqa_gfx1250_kernel[(tokens, kv_heads, kv_splits)](
         q,
@@ -526,26 +517,5 @@ def qsa_sparse_paged_gqa_gfx1250(
         KV_FP8=kv_fp8,
         num_warps=num_warps,
     )
-    if kv_splits > 1:
-        _mla_decode_fwd_reduce_kernel[(tokens, q_heads)](
-            out,
-            target,
-            partial_max,
-            partial_sum,
-            widths,
-            None,
-            tokens,
-            q_heads,
-            out.stride(0),
-            out.stride(1),
-            1,
-            1,
-            tokens,
-            TILE_SIZE=block_k,
-            KV_LORA_RANK=head_dim,
-            query_start_len_ptr=None,
-            BLOCK_Q=1,
-            NUM_SEGMENTS_PER_SEQ=kv_splits,
-            ALL_DECODE=True,
-        )
+    reduce_split_k(out, target, partial_max, partial_sum, widths, kv_splits, block_k)
     return out
