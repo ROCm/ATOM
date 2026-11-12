@@ -147,6 +147,7 @@ impl Router {
             Some(&request.headers),
             &worker,
         );
+        crate::observability::route_trace::record_dispatch(metrics_labels::WORKER_REGULAR, &worker);
         events::RequestSentEvent { url: worker.url() }.emit();
         let upstream = builder.send().await;
         events::RequestReceivedEvent {}.emit();

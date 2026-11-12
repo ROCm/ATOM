@@ -1,0 +1,264 @@
+//! Sampled `Selected worker` log of the routing decisions behind each dispatch.
+//!
+//! While `--route-log-sample-rate` is above 0, inference requests pass through
+//! [`scope`], and a sampled request gets a trace. Policies select and routers
+//! dispatch on the request task, so both reach the trace through a task-local
+//! instead of the placement API.
+
+use std::{cell::RefCell, sync::Arc};
+
+use axum::{
+    extract::{Request, State},
+    http::HeaderMap,
+    middleware::Next,
+    response::Response,
+};
+use rand::Rng;
+use tracing::info;
+
+use crate::{core::Worker, observability::metrics::MeshMetrics};
+
+/// Request header that logs the routing decisions of one request while the
+/// sample rate is above 0.
+pub const ROUTE_TRACE_HEADER: &str = "x-mesh-route-trace";
+
+tokio::task_local! {
+    static TRACE: RouteTrace;
+}
+
+/// Latest policy selection per pool; retries replace it.
+#[derive(Default)]
+struct RouteTrace {
+    selections: RefCell<Vec<Selection>>,
+}
+
+struct Selection {
+    pool: &'static str,
+    policy: &'static str,
+    url: String,
+    /// Router-tracked active requests on the worker when the policy selected it.
+    active_requests: usize,
+    branch: &'static str,
+    match_ratio: Option<f64>,
+}
+
+/// Clients can send the header, so it only applies once the operator enables sampling.
+fn should_log(headers: &HeaderMap, rate: f64) -> bool {
+    rate > 0.0 && (headers.contains_key(ROUTE_TRACE_HEADER) || rand::rng().random::<f64>() < rate)
+}
+
+pub(crate) async fn scope(State(rate): State<f64>, request: Request, next: Next) -> Response {
+    if should_log(request.headers(), rate) {
+        TRACE.scope(RouteTrace::default(), next.run(request)).await
+    } else {
+        next.run(request).await
+    }
+}
+
+/// Keeps the decision of a policy selection until the router dispatches it.
+pub(crate) fn record_selection(
+    pool: &'static str,
+    policy: &'static str,
+    worker: Option<&Arc<dyn Worker>>,
+    branch: &'static str,
+    match_ratio: Option<f64>,
+) {
+    let _ = TRACE.try_with(|trace| {
+        let Some(worker) = worker else {
+            info!(target: "mesh::route", pool, policy, branch, "No worker selected");
+            return;
+        };
+        let mut selections = trace.selections.borrow_mut();
+        selections.retain(|selection| selection.pool != pool);
+        selections.push(Selection {
+            pool,
+            policy,
+            url: worker.url().to_string(),
+            active_requests: worker.load(),
+            branch,
+            match_ratio,
+        });
+    });
+}
+
+/// Records the worker a request is sent to after rank mapping.
+pub(crate) fn record_dispatch(pool: &'static str, worker: &Arc<dyn Worker>) {
+    MeshMetrics::record_selected_dp_rank(pool, worker.base_url(), worker.dp_rank());
+    let _ = TRACE.try_with(|trace| {
+        let selections = trace.selections.borrow();
+        let selection = selections.iter().find(|selection| selection.pool == pool);
+        info!(
+            target: "mesh::route",
+            pool,
+            policy = selection.map(|selection| selection.policy),
+            branch = selection.map(|selection| selection.branch),
+            worker = worker.base_url(),
+            dp_rank = worker.dp_rank(),
+            remapped_from = selection
+                .filter(|selection| selection.url != worker.url())
+                .map(|selection| selection.url.as_str()),
+            match_ratio = selection.and_then(|selection| selection.match_ratio),
+            active_requests = selection.map(|selection| selection.active_requests),
+            "Selected worker"
+        );
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    use axum::{body::Body, routing::get, Router};
+    use tower::ServiceExt;
+
+    use super::*;
+    use crate::core::{BasicWorkerBuilder, DPAwareWorkerBuilder, WorkerType};
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl Capture {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    fn prefill_rank(rank: usize) -> Arc<dyn Worker> {
+        Arc::new(
+            DPAwareWorkerBuilder::new("http://prefill:8000", rank, 2)
+                .worker_type(WorkerType::Prefill {
+                    bootstrap_port: None,
+                })
+                .build(),
+        )
+    }
+
+    async fn logs(sampled: bool, run: impl FnOnce()) -> String {
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        if sampled {
+            TRACE.scope(RouteTrace::default(), async { run() }).await;
+        } else {
+            run();
+        }
+        capture.text()
+    }
+
+    #[test]
+    fn header_forces_the_log_only_while_sampling() {
+        let mut headers = HeaderMap::new();
+        assert!(!should_log(&headers, 0.0));
+        assert!(should_log(&headers, 1.0));
+        headers.insert(ROUTE_TRACE_HEADER, "1".parse().unwrap());
+        assert!(!should_log(&headers, 0.0));
+        assert!(should_log(&headers, f64::MIN_POSITIVE));
+    }
+
+    #[tokio::test]
+    async fn only_sampled_requests_get_a_trace() {
+        let cases = [
+            (1.0, false, "true"),
+            (f64::MIN_POSITIVE, true, "true"),
+            (f64::MIN_POSITIVE, false, "false"),
+        ];
+        for (rate, header, traced) in cases {
+            let app = Router::new()
+                .route(
+                    "/",
+                    get(|| async { TRACE.try_with(|_| ()).is_ok().to_string() }),
+                )
+                .layer(axum::middleware::from_fn_with_state(rate, scope));
+            let mut request = Request::builder().uri("/");
+            if header {
+                request = request.header(ROUTE_TRACE_HEADER, "1");
+            }
+
+            let response = app
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let body = axum::body::to_bytes(response.into_body(), 64)
+                .await
+                .unwrap();
+            assert_eq!(&body[..], traced.as_bytes(), "rate {rate} header {header}");
+        }
+    }
+
+    #[test]
+    fn dispatch_counts_the_rank_after_mapping() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let regular: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://regular:8000")
+                .worker_type(WorkerType::Regular)
+                .build(),
+        );
+
+        metrics::with_local_recorder(&recorder, || {
+            record_dispatch("prefill", &prefill_rank(1));
+            record_dispatch("regular", &regular);
+        });
+
+        let rendered = handle.render();
+        for line in [
+            r#"mesh_selected_dp_rank_total{pool="prefill",worker="http://prefill:8000",dp_rank="1"} 1"#,
+            r#"mesh_selected_dp_rank_total{pool="regular",worker="http://regular:8000",dp_rank="none"} 1"#,
+        ] {
+            assert!(rendered.contains(line), "missing {line} in\n{rendered}");
+        }
+    }
+
+    #[tokio::test]
+    async fn sampled_dispatch_logs_the_decision_and_remap() {
+        let run = || {
+            let selected = prefill_rank(0);
+            record_selection(
+                "prefill",
+                "cache_aware",
+                Some(&selected),
+                "affinity",
+                Some(0.75),
+            );
+            record_dispatch("prefill", &prefill_rank(1));
+        };
+
+        let sampled = logs(true, run).await;
+        for field in [
+            "Selected worker",
+            r#"pool="prefill""#,
+            r#"policy="cache_aware""#,
+            r#"branch="affinity""#,
+            r#"worker="http://prefill:8000""#,
+            "dp_rank=1",
+            r#"remapped_from="http://prefill:8000@0""#,
+            "match_ratio=0.75",
+            "active_requests=0",
+        ] {
+            assert!(sampled.contains(field), "missing {field} in\n{sampled}");
+        }
+        assert!(logs(false, run).await.is_empty());
+    }
+}

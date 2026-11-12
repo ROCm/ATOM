@@ -1841,6 +1841,7 @@ impl PDRouter {
         };
         // Only a request that is actually sent moves the session.
         policy.on_dispatch(pool, headers, worker);
+        crate::observability::route_trace::record_dispatch(pool, worker);
         policy
     }
 

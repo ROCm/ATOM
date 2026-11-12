@@ -326,6 +326,12 @@ queries.
 
 Structured logging via `tracing`, optional file sink (`--log-dir`), and log level (`--log-level`).
 
+`--route-log-sample-rate` (0 to 1, default 0 = off) logs the routing decisions of
+that fraction of inference requests at info level under target `mesh::route`.
+While it is above 0, a request carrying the `x-mesh-route-trace` header is always
+logged. HTTP routers only: gRPC workers and Envoy external processing do not
+emit these logs.
+
 ## Security
 
 ### TLS

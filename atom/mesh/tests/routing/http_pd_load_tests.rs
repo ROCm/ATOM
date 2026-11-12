@@ -609,7 +609,7 @@ async fn atom_prefill_failure_releases_pair_without_dispatching_decode() {
 }
 
 #[tokio::test]
-async fn session_worker_change_waits_until_the_new_decode_receives_a_request() {
+async fn dispatch_hooks_wait_until_the_new_decode_receives_a_request() {
     let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
     let handle = recorder.handle();
     let _recorder = metrics::set_default_local_recorder(&recorder);
@@ -620,6 +620,14 @@ async fn session_worker_change_waits_until_the_new_decode_receives_a_request() {
             .filter(|line| line.starts_with("mesh_session_worker_change_total{"))
             .map(str::to_owned)
             .collect()
+    };
+    let decode_dispatches = || -> u64 {
+        handle
+            .render()
+            .lines()
+            .filter(|line| line.starts_with(r#"mesh_selected_dp_rank_total{pool="decode""#))
+            .map(|line| line.rsplit(' ').next().unwrap().parse::<u64>().unwrap())
+            .sum()
     };
     let policy: Arc<dyn LoadBalancingPolicy> = Arc::new(DpStickyPolicy::new());
     let mut a = GatedServer::start(WorkerType::Decode).await;
@@ -656,6 +664,7 @@ async fn session_worker_change_waits_until_the_new_decode_receives_a_request() {
     a.wait_entered().await;
     a.respond(axum::Json(json!({"choices": []})).into_response());
     assert_eq!(result(task).await.status(), StatusCode::OK);
+    assert_eq!(decode_dispatches(), 1);
 
     // A is down, so the session rebinds to B. Neither a failed prefill nor an
     // unexecuted reservation sends anything to B.
@@ -680,6 +689,7 @@ async fn session_worker_change_waits_until_the_new_decode_receives_a_request() {
     drop(reservation.unwrap());
     assert!(b.captured.try_recv().is_err());
     assert!(changes().is_empty());
+    assert_eq!(decode_dispatches(), 1);
 
     // The first request B receives is compared against A.
     assert_eq!(policy.select_worker(&decode, &info).await, Some(1));
@@ -694,6 +704,7 @@ async fn session_worker_change_waits_until_the_new_decode_receives_a_request() {
         changes(),
         [r#"mesh_session_worker_change_total{pool="decode",reason="rebind"} 1"#]
     );
+    assert_eq!(decode_dispatches(), 2);
 }
 
 #[tokio::test]

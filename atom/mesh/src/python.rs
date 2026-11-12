@@ -148,6 +148,7 @@ pub fn parse_from(py: Python<'_>, args: Vec<String>) -> PyResult<Py<PyDict>> {
     cli_args_dict.set_item("log_dir", cli_args.log_dir)?;
     cli_args_dict.set_item("log_level", cli_args.log_level)?;
     cli_args_dict.set_item("json_log", cli_args.json_log)?;
+    cli_args_dict.set_item("route_log_sample_rate", cli_args.route_log_sample_rate)?;
     cli_args_dict.set_item("prometheus_port", cli_args.prometheus_port)?;
     cli_args_dict.set_item("prometheus_host", cli_args.prometheus_host)?;
     cli_args_dict.set_item(

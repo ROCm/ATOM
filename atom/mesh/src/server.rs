@@ -343,6 +343,7 @@ pub struct ServerConfig {
     pub log_dir: Option<String>,
     pub log_level: Option<String>,
     pub json_log: bool,
+    pub route_log_sample_rate: f64,
     pub prometheus_config: Option<PrometheusConfig>,
     pub request_timeout_secs: u64,
     pub request_id_headers: Option<Vec<String>>,
@@ -711,6 +712,14 @@ async fn serve_with_prepare_pool(
         config.max_payload_size,
         request_id_headers,
     );
+    let app = if config.route_log_sample_rate > 0.0 {
+        app.layer(axum::middleware::from_fn_with_state(
+            config.route_log_sample_rate,
+            crate::observability::route_trace::scope,
+        ))
+    } else {
+        app
+    };
 
     let listener = std::net::TcpListener::bind(http_address).map_err(|error| {
         io::Error::new(
