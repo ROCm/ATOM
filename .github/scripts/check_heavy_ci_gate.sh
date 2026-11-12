@@ -127,7 +127,9 @@ emit_decision() {
   local decidable="${7:-true}"
   local smoke_requested="false"
 
-  if [ "${should_run}" = "true" ] || [ "${PR_CHECK_TAKEOVER}" = "true" ]; then
+  if [ "${decidable}" != "true" ]; then
+    smoke_requested="false"
+  elif [ "${should_run}" = "true" ] || [ "${PR_CHECK_TAKEOVER}" = "true" ]; then
     smoke_requested="true"
   elif [ "${EVENT_NAME}" != "pull_request_review" ] \
     && [ "${reason}" != "ignored-paths-only" ] \

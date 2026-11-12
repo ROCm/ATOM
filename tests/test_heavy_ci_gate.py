@@ -195,6 +195,7 @@ def test_review_query_failure_fails_closed(tmp_path):
     assert result["should_run"] == "false"
     assert result["reason"] == "review-query-failed"
     assert result["decidable"] == "false"
+    assert result["smoke_requested"] == "false"
 
 
 def _current_pr(**updates):
@@ -630,11 +631,65 @@ def test_queued_approval_revalidates_head_sha(tmp_path):
     assert result["reason"] == "stale-head-sha"
 
 
+def _result_job_names(results):
+    return {
+        line.split("=", 1)[0].strip() for line in results.splitlines() if line.strip()
+    }
+
+
 def test_workflow_wiring_preserves_existing_checks_and_separates_noop_reviews():
+    gate_expectations = {
+        "atom-test.yaml": {
+            "job": "atom-test-gate",
+            "needs": [
+                "ci-gate",
+                "check-signal",
+                "download_aiter_wheel",
+                "load-test-models",
+                "offline-smoke-test",
+                "atom-test",
+            ],
+            "required": {
+                "check-signal",
+                "download_aiter_wheel",
+                "load-test-models",
+                "atom-test",
+            },
+            "optional": {"offline-smoke-test"},
+        },
+        "atom-vllm-test.yaml": {
+            "job": "atom-vllm-test-gate",
+            "needs": [
+                "ci-gate",
+                "check-signal",
+                "download_aiter_wheel",
+                "atom-vllm-oot",
+            ],
+            "required": {"check-signal", "download_aiter_wheel", "atom-vllm-oot"},
+            "optional": set(),
+        },
+        "atom-sglang-test.yaml": {
+            "job": "atom-sglang-test-gate",
+            "needs": [
+                "ci-gate",
+                "check-signal",
+                "download_aiter_wheel",
+                "atom-sglang-accuracy",
+            ],
+            "required": {
+                "check-signal",
+                "download_aiter_wheel",
+                "atom-sglang-accuracy",
+            },
+            "optional": set(),
+        },
+    }
+
     for filename in ("atom-test.yaml", "atom-vllm-test.yaml", "atom-sglang-test.yaml"):
         config = yaml.safe_load(
             (REPO_ROOT / ".github/workflows" / filename).read_text()
         )
+        gate_expectation = gate_expectations[filename]
         events = config.get("on", config.get(True))
         assert "pull_request_review" in events
         assert "labeled" in events["pull_request"]["types"]
@@ -659,6 +714,22 @@ def test_workflow_wiring_preserves_existing_checks_and_separates_noop_reviews():
         )
         assert gate_env["CI_GATE_WORKFLOW"] == filename
         assert config["jobs"]["check-signal"]["name"] == "Check Pre Checkin Signal"
+
+        test_gate = config["jobs"][gate_expectation["job"]]
+        assert test_gate["if"] == "always()"
+        assert test_gate["needs"] == gate_expectation["needs"]
+        evaluate_step = next(
+            step
+            for step in test_gate["steps"]
+            if step.get("uses") == "./.github/actions/evaluate-test-gate"
+        )
+        evaluate_inputs = evaluate_step["with"]
+        required_jobs = _result_job_names(evaluate_inputs.get("required-results", ""))
+        optional_jobs = _result_job_names(evaluate_inputs.get("optional-results", ""))
+        assert required_jobs == gate_expectation["required"]
+        assert optional_jobs == gate_expectation["optional"]
+        assert set(test_gate["needs"]) - {"ci-gate"} == required_jobs | optional_jobs
+
         if filename != "atom-test.yaml":
             assert "CI_GATE_PR_CHECK_JOB" not in gate_env
         if filename == "atom-test.yaml":
@@ -727,11 +798,17 @@ def test_evaluate_test_gate_rejects_undecidable_scope(tmp_path):
         tmp_path,
         DECIDABLE="false",
         REASON="review-query-failed",
-        REQUIRED_RESULTS="check-signal=skipped",
     )
 
     assert result.returncode != 0
     assert "scope was undecidable: review-query-failed" in result.stdout
+
+
+def test_evaluate_test_gate_rejects_failed_ci_gate(tmp_path):
+    result = _run_evaluate_gate(tmp_path, CI_GATE_RESULT="cancelled")
+
+    assert result.returncode != 0
+    assert "scope gate did not succeed: cancelled" in result.stdout
 
 
 def test_evaluate_test_gate_allows_optional_skipped_when_required_passes(tmp_path):
@@ -764,3 +841,15 @@ def test_evaluate_test_gate_allows_not_required_doc_only(tmp_path):
     )
 
     assert result.returncode == 0, result.stderr
+
+
+def test_evaluate_test_gate_rejects_optional_failure_when_not_required(tmp_path):
+    result = _run_evaluate_gate(
+        tmp_path,
+        SHOULD_RUN="false",
+        REASON="ignored-paths-only",
+        OPTIONAL_RESULTS="offline-smoke-test=failure",
+    )
+
+    assert result.returncode != 0
+    assert "offline-smoke-test=failure" in result.stderr
