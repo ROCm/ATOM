@@ -2,6 +2,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """One tensor-parallel group across nodes (atom/model_engine/tp_multinode.py)."""
 
+import time
 from datetime import timedelta
 from types import SimpleNamespace
 
@@ -172,3 +173,134 @@ def test_a_remote_rank_replies_to_an_ipv6_host():
     reply = AsyncIOProcManager._reply_addr
     assert reply(manager, 4, "fd00::1").startswith("tcp://[fd00::1]:")
     assert reply(manager, 4, "10.0.0.1").startswith("tcp://10.0.0.1:")
+
+
+def test_config_checks_the_tp_slices(monkeypatch):
+    class Reached(Exception):
+        pass
+
+    def reached(self):
+        raise Reached
+
+    monkeypatch.setattr(Config, "_check_multinode_tp", reached)
+    with pytest.raises(Reached):
+        Config(model="unused", tensor_parallel_size=8)
+
+
+@pytest.fixture
+def engine_store():
+    from atom.utils import get_open_port
+
+    port = get_open_port()
+    store = dist.TCPStore("127.0.0.1", port, is_master=True)
+    yield SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            data_parallel_master_ip="127.0.0.1", data_parallel_base_port=port
+        )
+    )
+    del store
+
+
+def _remote_ranks(config, monkeypatch, ps1="1"):
+    monkeypatch.setenv("AITER_MLA_DECODE_PS1_FLYDSL", ps1)
+    return tp_multinode.RemoteRanks(
+        config,
+        {"proc_num": 8, "local_proc_num": 4, "args": (None,), "handle": None},
+    )
+
+
+@pytest.mark.parametrize(
+    "start, ps1, claimed, error",
+    [
+        (4, "0", False, "AITER_MLA_DECODE_PS1_FLYDSL must match"),
+        (2, "1", False, "not remote ranks"),
+        (4, "1", True, "TP rank 4 already runs on another node"),
+    ],
+)
+def test_a_worker_node_refuses_a_slice_or_env_the_engine_does_not_expect(
+    monkeypatch, engine_store, start, ps1, claimed, error
+):
+    from aiter_stub import stubbed_aiter
+
+    import atom.config
+
+    pc = engine_store.parallel_config
+    remote = _remote_ranks(engine_store, monkeypatch)
+    if claimed:  # another node holds rank 4
+        claims = tp_multinode._store("127.0.0.1", pc.data_parallel_base_port, 5)
+        claims.add(tp_multinode._engine_key(remote.engine_id, "rank/4"), 1)
+    monkeypatch.setenv("AITER_MLA_DECODE_PS1_FLYDSL", ps1)
+    monkeypatch.setattr(atom.config, "get_hf_config", lambda *a, **k: None)
+    args = EngineArgs(
+        tensor_parallel_size=8,
+        tensor_parallel_size_local=2 if start == 2 else 4,
+        tensor_parallel_rank=start,
+        data_parallel_master_ip="10.0.0.1",
+        data_parallel_base_port=pc.data_parallel_base_port,
+    )
+    # The engine's store answers on loopback; the address check needs a real one.
+    real_store = tp_multinode._store
+    monkeypatch.setattr(
+        tp_multinode, "_store", lambda ip, port, t: real_store("127.0.0.1", port, t)
+    )
+    with stubbed_aiter(), pytest.raises(ValueError, match=error):
+        tp_multinode.serve_remote_tp_ranks(args)
+
+
+class _Proc:
+    def __init__(self, name, exitcode=None):
+        self.name, self.exitcode = name, exitcode
+
+    def is_alive(self):
+        return self.exitcode is None
+
+
+def _supervise(config, remote, procs, monkeypatch):
+    stopped = []
+    monkeypatch.setattr(tp_multinode.signal, "signal", lambda *a: None)
+    monkeypatch.setattr(tp_multinode.time, "sleep", lambda s: None)
+    monkeypatch.setattr(
+        tp_multinode, "shutdown_all_processes", lambda p, **k: stopped.extend(p)
+    )
+    pc = config.parallel_config
+    ip, port = pc.data_parallel_master_ip, pc.data_parallel_base_port
+    store = tp_multinode._store(ip, port, 5)
+    status = tp_multinode._supervise(procs, store, ip, port, remote.engine_id)
+    assert stopped == procs
+    return status
+
+
+def test_a_failed_worker_is_reported_to_the_engine(monkeypatch, engine_store):
+    remote = _remote_ranks(engine_store, monkeypatch)
+    assert remote.failure() is None
+    procs = [_Proc("ModelRunner4/8"), _Proc("ModelRunner5/8", exitcode=-9)]
+    assert _supervise(engine_store, remote, procs, monkeypatch) == 1
+    assert remote.failure() == "ModelRunner5/8 exited with -9"
+
+
+def test_the_engine_stopping_stops_the_worker_node(monkeypatch, engine_store):
+    remote = _remote_ranks(engine_store, monkeypatch)
+    remote.close()
+    assert _supervise(engine_store, remote, [_Proc("ModelRunner4/8")], monkeypatch) == 0
+    assert remote.failure() is None
+
+
+def test_the_engine_stops_when_a_worker_node_reports(monkeypatch):
+    from aiter_stub import stubbed_aiter
+
+    with stubbed_aiter():
+        from atom.model_engine.async_proc import AsyncIOProcManager
+
+    manager = object.__new__(AsyncIOProcManager)
+    exited, reported = [], []
+    manager.procs, manager.label, manager.runner_label = [], "mgr", "runner"
+    manager.still_running = True
+    manager.on_worker_failure = lambda: reported.append(True)
+    manager.exit = lambda: exited.append(True)
+    manager.remote_ranks = SimpleNamespace(poll_s=0.01, failure=lambda: "lost")
+    manager.monitor_procs()
+    for _ in range(500):
+        if exited:
+            break
+        time.sleep(0.01)
+    assert exited and reported

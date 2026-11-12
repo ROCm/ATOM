@@ -44,7 +44,9 @@ One TP group over several nodes (`--tensor-parallel-size-local`, `--tensor-paral
 |----------|------|---------|-------------|
 | **ATOM_MULTINODE_TP_TIMEOUT_S** | float | 1800 | How many seconds the nodes wait for each other at startup: a node that runs only workers waits this long for the engine's endpoints, the engine waits this long for every remote rank to subscribe to its broadcast queue, and a rank waits this long on the model-runner store (for the NCCL id of a communicator created on first use). It is also the floor for the timeout of the process groups created without one, the default group and aiter's TP groups: it raises torch's defaults (30 minutes for gloo, 10 for NCCL) and never lowers them. Must be finite and positive. |
 
-Every node reads its own environment, so a variable that changes what a rank computes must have the same value on every node. In particular, on gfx1250 `AITER_MLA_DECODE_PS1_FLYDSL` decides whether DCP decode runs persistent. Nodes that disagree size the gathered heads and the work metadata differently, and the DCP all-gather and merge then disagree across the group: it hangs, returns wrong output, or aborts on half the ranks with `only support page_size == 64`. Nothing checks this at startup.
+Every node reads its own environment, so a variable that changes what a rank computes must have the same value on every node. A worker node refuses to start when one it knows of differs from the engine node's: on gfx1250 `AITER_MLA_DECODE_PS1_FLYDSL`, which decides whether DCP decode runs persistent.
+
+The nodes trust each other: the engine's store and the workers' reply channels are unauthenticated TCP on `--data-parallel-master-ip` and carry pickled objects, so that address must be on a network only the nodes can reach.
 
 ## Prefill delayer (TP/DCP and DP attention)
 

@@ -14,9 +14,11 @@ TCPStore that CoreManager serves on ``data_parallel_master_ip`` and
 """
 
 import logging
+import os
 import pickle
 import signal
 import time
+import uuid
 from datetime import timedelta
 
 from atom.utils import envs, get_mp_context, shutdown_all_processes
@@ -24,6 +26,8 @@ from atom.utils import envs, get_mp_context, shutdown_all_processes
 logger = logging.getLogger("atom")
 
 BOOTSTRAP_KEY = "atom/tp_multinode/bootstrap"
+# Env vars that change what a rank computes, so every node must set them alike.
+MATCHED_ENV = ("AITER_MLA_DECODE_PS1_FLYDSL",)
 _READY = b"READY"
 # What an XPUB socket in verbose mode receives when a subscriber joins.
 _SUBSCRIBED = b"\x01"
@@ -85,15 +89,48 @@ def raise_timeout_if_tp_spans_nodes(config) -> None:
         distributed_c10d.default_pg_nccl_timeout = max(nccl, timedelta(seconds=seconds))
 
 
-def publish_bootstrap(config, info: dict) -> None:
-    """Engine side: hand the other nodes what their workers are built from."""
-    pc = config.parallel_config
-    store = _store(
-        pc.data_parallel_master_ip,
-        pc.data_parallel_base_port,
-        envs.ATOM_MULTINODE_TP_TIMEOUT_S,
-    )
-    store.set(BOOTSTRAP_KEY, pickle.dumps(info))
+def _engine_key(engine_id: str, name: str) -> str:
+    return f"atom/tp_multinode/{engine_id}/{name}"
+
+
+class RemoteRanks:
+    """Engine side: hands the other nodes what their workers are built from,
+    and is how the engine and those nodes tell each other they stopped."""
+
+    # How often the engine looks for a worker node's report.
+    poll_s = 5
+
+    def __init__(self, config, info: dict):
+        pc = config.parallel_config
+        self.engine_id = uuid.uuid4().hex
+        self._store = _store(
+            pc.data_parallel_master_ip,
+            pc.data_parallel_base_port,
+            envs.ATOM_MULTINODE_TP_TIMEOUT_S,
+        )
+        self._store.set(_engine_key(self.engine_id, "alive"), b"1")
+        info = {
+            **info,
+            "engine_id": self.engine_id,
+            "env": {name: os.environ.get(name) for name in MATCHED_ENV},
+        }
+        self._store.set(BOOTSTRAP_KEY, pickle.dumps(info))
+
+    def failure(self) -> str | None:
+        """Why a worker node stopped its ranks, once one has."""
+        key = _engine_key(self.engine_id, "failed")
+        try:
+            return self._store.get(key).decode() if self._store.check([key]) else None
+        except Exception as e:  # noqa: BLE001 - the store dies with the server
+            logger.debug("Cannot read %s: %s", key, e)
+            return None
+
+    def close(self) -> None:
+        """Tell the worker nodes to stop their ranks."""
+        try:
+            self._store.delete_key(_engine_key(self.engine_id, "alive"))
+        except Exception as e:  # noqa: BLE001 - teardown must not raise
+            logger.debug("Cannot reach the TP ranks on other nodes: %s", e)
 
 
 def release_remote_readers(mq, n_remote: int, is_running) -> None:
@@ -144,8 +181,7 @@ def await_release(mq) -> None:
 def serve_remote_tp_ranks(engine_args) -> int:
     """Run this node's TP ranks for the engine on another node, until they end.
 
-    Returns 0 when every worker exited cleanly (the engine shut them down),
-    1 otherwise.
+    Returns 0 when the engine stopped them, 1 otherwise.
     """
     from atom.model_engine.async_proc import AsyncIOProc
 
@@ -174,11 +210,18 @@ def serve_remote_tp_ranks(engine_args) -> int:
 
     get_hf_config(engine_args.model, trust_remote_code=engine_args.trust_remote_code)
     info = pickle.loads(payload)
-    proc_num = info["proc_num"]
-    if ranks[-1] >= proc_num:
+    proc_num, engine_id = info["proc_num"], info["engine_id"]
+    if start < info["local_proc_num"] or ranks[-1] >= proc_num:
         raise ValueError(
-            f"TP ranks {start}-{ranks[-1]} do not exist: the engine runs {proc_num}"
+            f"TP ranks {start}-{ranks[-1]} are not remote ranks of the engine, "
+            f"which runs ranks 0-{info['local_proc_num'] - 1} of {proc_num} itself"
         )
+    mismatched = [k for k, v in info["env"].items() if os.environ.get(k) != v]
+    if mismatched:
+        raise ValueError(f"{', '.join(mismatched)} must match the engine node's")
+    for rank in ranks:
+        if store.add(_engine_key(engine_id, f"rank/{rank}"), 1) > 1:
+            raise ValueError(f"TP rank {rank} already runs on another node")
     config, *runner_args = info["args"]
     # The engine's copy describes its own node.
     config.parallel_config.tensor_parallel_size_local = local
@@ -207,27 +250,26 @@ def serve_remote_tp_ranks(engine_args) -> int:
         proc.start()
         procs.append(proc)
     logger.info("TP ranks %d-%d started for the engine at %s", start, ranks[-1], ip)
-    return _supervise(procs, ip, port)
+    return _supervise(procs, store, ip, port, engine_id)
 
 
-def _supervise(procs, ip: str, port: int) -> int:
-    """Wait for the workers. One that fails, a signal, or losing the engine's
-    store (it lives in the engine node's server process) stops all of them."""
+def _supervise(procs, store, ip: str, port: int, engine_id: str) -> int:
+    """Wait for the workers. The engine stopping, losing its store (it lives in
+    the engine node's server process), a worker failing or a signal stops all
+    of them; the last two are reported to the engine, which then stops too."""
     stopping = []
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda signum, frame: stopping.append(signum))
 
+    alive = _engine_key(engine_id, "alive")
     watchdog, misses = None, 0
-    status = 1
+    status, failure = 1, None
     while not stopping:
         exited = [p for p in procs if not p.is_alive()]
         failed = [p for p in exited if p.exitcode != 0]
         if failed:
-            logger.error(
-                "%s exited with %s; stopping this node's TP ranks",
-                failed[0].name,
-                failed[0].exitcode,
-            )
+            failure = f"{failed[0].name} exited with {failed[0].exitcode}"
+            logger.error("%s; stopping this node's TP ranks", failure)
             break
         if len(exited) == len(procs):
             status = 0
@@ -235,7 +277,7 @@ def _supervise(procs, ip: str, port: int) -> int:
         try:
             if watchdog is None:
                 watchdog = _store(ip, port, _WATCHDOG_TIMEOUT_S)
-            watchdog.check([BOOTSTRAP_KEY])
+            engine_running = watchdog.check([alive])
             misses = 0
         except Exception as e:  # noqa: BLE001 - any store failure counts as a miss
             watchdog, misses = None, misses + 1
@@ -243,8 +285,19 @@ def _supervise(procs, ip: str, port: int) -> int:
             if misses >= _WATCHDOG_MISSES:
                 logger.error("Lost the engine; stopping this node's TP ranks")
                 break
+        else:
+            if not engine_running:
+                logger.info("The engine stopped; stopping this node's TP ranks")
+                status = 0
+                break
         time.sleep(5)
     if stopping:
+        failure = f"signal {stopping[0]} on the node of TP ranks"
         logger.info("Signal %d: stopping this node's TP ranks", stopping[0])
+    if failure:
+        try:
+            store.set(_engine_key(engine_id, "failed"), failure)
+        except Exception as e:  # noqa: BLE001 - the engine may be gone already
+            logger.warning("Cannot report to the engine: %s", e)
     shutdown_all_processes(procs, allowed_seconds=5)
     return status

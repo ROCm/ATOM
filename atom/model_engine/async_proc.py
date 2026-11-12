@@ -450,6 +450,9 @@ class AsyncIOProcManager:
         *args: Additional arguments forwarded to the runner constructor.
     """
 
+    # The TP ranks on other nodes (tp_multinode.RemoteRanks), if any.
+    remote_ranks = None
+
     # The public collective_rpc runs only these.
     _PUBLIC_RPC_METHODS: ClassVar[frozenset[str]] = COLLECTIVE_RPC_METHODS
     # Names the engine's wire protocol owns, which even the utility handler's
@@ -586,17 +589,17 @@ class AsyncIOProcManager:
             t.start()
             self.rpc_output_threads.append(t)
 
-        self.monitor_procs()
         if n_remote:
             from atom.model_engine.tp_multinode import (
-                publish_bootstrap,
+                RemoteRanks,
                 release_remote_readers,
             )
 
-            publish_bootstrap(
+            self.remote_ranks = RemoteRanks(
                 args[0],
                 {
                     "proc_num": proc_num,
+                    "local_proc_num": self.local_proc_num,
                     "handle": scheduler_output_handle,
                     "runner": runner,
                     "args": args,
@@ -604,6 +607,8 @@ class AsyncIOProcManager:
                     "rpc_output_addrs": self.rpc_output_addrs,
                 },
             )
+        self.monitor_procs()
+        if n_remote:
             release_remote_readers(
                 self.rpc_broadcast_mq, n_remote, lambda: self.still_running
             )
@@ -626,6 +631,8 @@ class AsyncIOProcManager:
                 proc.join(timeout=max(deadline - time.monotonic(), 0))
         shutdown_all_processes(self.procs, allowed_seconds=1)
         self.procs = []
+        if self.remote_ranks is not None:
+            self.remote_ranks.close()
         self.output_thread.join(timeout=1)
         for thread in self.kv_output_threads:
             thread.join(timeout=0.5)
@@ -1043,19 +1050,35 @@ class AsyncIOProcManager:
 
         def monitor_engine_cores():
             sentinels = [proc.sentinel for proc in procs]
-            died = multiprocessing.connection.wait(sentinels)
+            remote = self.remote_ranks
+            # Ranks on other nodes report through the store, not a sentinel.
+            while not (
+                died := multiprocessing.connection.wait(
+                    sentinels, timeout=None if remote is None else remote.poll_s
+                )
+            ):
+                if not getattr(self_ref(), "still_running", False):
+                    return
+                if failure := remote.failure():
+                    break
             _self = self_ref()
             if not _self or not _self.keep_monitoring:
                 return
-            dead_proc = next(proc for proc in procs if proc.sentinel == died[0])
-            dead_proc.join(timeout=5)
-            # Before exit() empties self.procs and stops every other rank, so
-            # a collective_rpc in flight can still name the one that died.
-            _self._dead_ranks[procs.index(dead_proc)] = dead_proc.exitcode
-            logger.error(
-                f"{self.label}: [{dead_proc.name}] proc died unexpectedly "
-                f"(exitcode={dead_proc.exitcode}), shutting down.",
-            )
+            if died:
+                dead_proc = next(proc for proc in procs if proc.sentinel == died[0])
+                dead_proc.join(timeout=5)
+                # Before exit() empties self.procs and stops every other rank,
+                # so a collective_rpc in flight can still name the one that died.
+                _self._dead_ranks[procs.index(dead_proc)] = dead_proc.exitcode
+                logger.error(
+                    f"{self.label}: [{dead_proc.name}] proc died unexpectedly "
+                    f"(exitcode={dead_proc.exitcode}), shutting down.",
+                )
+            else:
+                logger.error(
+                    f"{self.label}: TP ranks on another node stopped ({failure}), "
+                    "shutting down."
+                )
             # Notify the frontend before exit() can block draining GPU work.
             # A live EngineCore process alone does not imply healthy runners.
             try:

@@ -64,7 +64,9 @@ def test_worker_death_reports_failure_before_blocking_cleanup(monkeypatch):
         lambda **kw: SimpleNamespace(start=lambda: targets.append(kw["target"])),
     )
     monkeypatch.setattr(
-        async_proc_module.multiprocessing.connection, "wait", lambda sentinels: [17]
+        async_proc_module.multiprocessing.connection,
+        "wait",
+        lambda sentinels, timeout=None: [17],
     )
     mgr.monitor_procs()
     targets[0]()
@@ -83,7 +85,9 @@ def test_expected_worker_shutdown_does_not_report_failure(monkeypatch):
         lambda **kw: SimpleNamespace(start=lambda: targets.append(kw["target"])),
     )
     monkeypatch.setattr(
-        async_proc_module.multiprocessing.connection, "wait", lambda sentinels: [17]
+        async_proc_module.multiprocessing.connection,
+        "wait",
+        lambda sentinels, timeout=None: [17],
     )
     mgr.monitor_procs()
     mgr.keep_monitoring = False
