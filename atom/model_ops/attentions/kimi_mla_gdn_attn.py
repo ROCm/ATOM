@@ -25,6 +25,7 @@ from atom.models.kimi_k3.midstep import (
     kda_midstep_enabled,
     kda_midstep_transfer,
     kda_snapshots,
+    refuse_midstep_under_pipeline,
     require_flash_kda_snapshots,
 )
 from atom.utils import CpuGpuBuffer, envs
@@ -379,7 +380,8 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         free list as everything else, and evicted by the same LRU.
 
         Midstep-readable only under `ATOM_K3_KDA_STATE_MIDSTEP=1`
-        (`atom.models.kimi_k3.midstep`): aiter's `chunk_kimi_delta_attn` then
+        (`atom.models.kimi_k3.midstep`), which startup refuses under pipeline
+        parallelism: aiter's `chunk_kimi_delta_attn` then
         also stores the state at each interior position the coordinator
         reserves (`snapshot_targets`), so a forward no longer has to end there.
         Off, the call returns only the final state, and the coordinator cuts
@@ -396,6 +398,9 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             return StateTransfer.fork(1)
         midstep = kda_midstep_enabled()
         if midstep:
+            refuse_midstep_under_pipeline(
+                self.model_runner.config.pipeline_parallel_size
+            )
             require_flash_kda_snapshots(chunk_kimi_delta_attn)
         shape_k, shape_v = self._state_shape_for_runner()
         dt_k, dt_v = self._state_dtypes()

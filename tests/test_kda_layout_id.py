@@ -207,3 +207,14 @@ class TestPagedCheckpointsAreRefusedWhereSizingWouldRaise:
                 builder(replayssm=True, pp=2, kpool=4, kpool_tail=kpool_tail)
             )
         assert transfer.decode_keep == "none"
+
+    def test_the_midstep_switch_is_refused_under_pipeline_parallelism(
+        self, monkeypatch
+    ):
+        """At startup, before the aiter signature probe."""
+        monkeypatch.setenv("ATOM_K3_KDA_STATE_MIDSTEP", "1")
+        with (
+            tp_world(TP),
+            pytest.raises(RuntimeError, match="pipeline_parallel_size=2"),
+        ):
+            Builder.state_transfer(builder(pp=2))

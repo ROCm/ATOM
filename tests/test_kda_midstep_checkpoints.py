@@ -37,6 +37,7 @@ from atom.models.kimi_k3.midstep import (
     kda_midstep_enabled,
     kda_midstep_transfer,
     kda_snapshots,
+    refuse_midstep_under_pipeline,
     require_flash_kda_snapshots,
 )
 from atom.utils import envs
@@ -143,6 +144,12 @@ def test_an_aiter_without_snapshot_arguments_is_refused_at_startup():
         require_flash_kda_snapshots(half)
     with pytest.raises(RuntimeError, match="aiter#7413"):
         require_flash_kda_snapshots(catch_all)
+
+
+def test_the_switch_is_refused_under_pipeline_parallelism():
+    refuse_midstep_under_pipeline(1)
+    with pytest.raises(RuntimeError, match=r"pipeline_parallel_size=2\)"):
+        refuse_midstep_under_pipeline(2)
 
 
 def test_the_transfer_reads_midstep_on_the_flash_kda_grid():
