@@ -2280,6 +2280,87 @@ models:
             max_gen_toks: 4096
             apply_chat_template: true
 
+  DeepSeek-V4.1-Flash:
+    backend: atom
+    model_path: "${ATOMESH_MODEL_ROOT}/deepseek-ai/DeepSeek-V4.1-Flash/"
+    precision: FP4
+    env:
+      common:
+        ATOM_DISABLE_MMAP: "true"
+        OMP_NUM_THREADS: "4"
+        AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+        MC_GID_INDEX: "1"
+        ATOM_MOONCAKE_MATCHED_RAILS: auto
+        # DSpark's draft compile can stall startup in inductor.
+        ATOM_DSPARK_DISABLE_COMPILE: "1"
+      prefill:
+        PREFILL_KV_TRANSFER_CONFIG: >-
+          {"kv_role":"kv_producer","kv_connector":"mooncake","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
+      decode:
+        # A Mooncake decode is not marked disagg_is_decode, so it would record
+        # prefill token graphs it never runs; the DP ranks hang recording them.
+        ATOM_TOKEN_GRAPH_SIZES: "0"
+        DECODE_KV_TRANSFER_CONFIG: >-
+          {"kv_role":"kv_consumer","kv_connector":"mooncake","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
+    # Validated 1P1D settings from recipes/pd_disaggregation_guide.md.
+    server:
+      common_args:
+        trust_remote_code: true
+        kv_cache_dtype: bf16
+        block_size: 16
+        enable_prefix_caching: true
+        gpu_memory_utilization: 0.7
+        max_model_len: ""
+        max_num_batched_tokens: 16384
+        method: dspark
+        num_speculative_tokens: 5
+        spec_decode_acceptance_length: 3.51
+        state_checkpoint_interval_tokens: 8192
+        extra_args: "--index-cache-dtype fp4 --attn-prefill-chunk-size 16384 --tool-call-parser dsml_v41"
+    suites:
+      weekly:
+        # 4P4D: prefill and decode are each one DPA32 + EP32 instance across
+        # four nodes (eight nodes in all). V4.1 admits only Mooncake for P/D.
+        - name: ds-v41-flash-4p4d-dpa32-ep32-dspark5-agentic-1m-c512
+          topology: 1p1d_dpa32_ep32
+          display_topology: 4P4D-DPA32-EP32-DSPARK5
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_2P1D_NODES}"
+          isl: [1048576]
+          osl: 1024
+          concurrency: [512]
+          router:
+            policy: cache_aware
+          server:
+            common_args:
+              max_num_seqs: 64
+              decode_max_num_seqs: 64
+          prefill:
+            workers: 1
+            nodes_per_worker: 4
+            tp: 8
+            cudagraph_mode: FULL
+            compilation_level: 3
+            extra_args: "--enable-dp-attention --enable-expert-parallel"
+          decode:
+            workers: 1
+            nodes_per_worker: 4
+            tp: 8
+            # Per DP rank: c512 over 32 ranks is 16 requests each.
+            cudagraph: "[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32]"
+            cudagraph_mode: FULL
+            compilation_level: 3
+            extra_args: "--enable-dp-attention --enable-expert-parallel"
+          env:
+            common:
+              MORI_SHMEM_HEAP_SIZE: 16G
+              HSA_NO_SCRATCH_RECLAIM: "1"
+              ATOM_DP_LM_HEAD_MODE: default
+          benchmark:
+            <<: *agentic_1m_aiperf
+            wait_server_timeout: 7200
+          run_eval: false
+
   # Bring-up model for the MoRI IO PD KV path. Text-only, ships a real
   # tokenizer.json so the router can register one, and its FP8 weights keep
   # quantization out of the picture -- but the KV path under test is the same

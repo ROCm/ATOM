@@ -61,7 +61,7 @@ on:
         default: false
         type: boolean
       model_names:
-        description: 'When run_all_models=false, run all cases in the selected suite for these model families. Comma-separated: DeepSeek-V4-Pro,DeepSeek-V4-Pro-0813,GLM-5.2-MXFP4,Kimi-K3-MXFP4,Kimi-K2.5-MXFP4,MiniMax-M3-MXFP4,MiniMax-M3-MXFP8'
+        description: 'When run_all_models=false, run all cases in the selected suite for these model families. Comma-separated: DeepSeek-V4-Pro,DeepSeek-V4-Pro-0813,DeepSeek-V4.1-Flash,GLM-5.2-MXFP4,Kimi-K3-MXFP4,Kimi-K2.5-MXFP4,MiniMax-M3-MXFP4,MiniMax-M3-MXFP8'
         required: false
         default: ''
         type: string
@@ -85,6 +85,9 @@ on:
 
           DeepSeek-V4-Pro-0813 (accuracy):
             ds-v4-0813-1p1d-tp8-dspark3-gsm8k-only-c16
+
+          DeepSeek-V4.1-Flash (weekly; 4P4D DPA32+EP32, 8 nodes):
+            ds-v41-flash-4p4d-dpa32-ep32-dspark5-agentic-1m-c512
 
           GLM:
             glm-52-mxfp4-1p1d-tp4,glm-52-mxfp4-1p1d-tp8,
