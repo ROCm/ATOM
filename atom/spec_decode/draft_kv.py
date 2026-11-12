@@ -20,13 +20,10 @@ DRAFT_POOL_METHODS = ("eagle3", "dspark")
 def draft_owns_kv_pool(config) -> bool:
     """Whether `config`'s speculative draft caches into a KV pool of its own.
 
-    What `draft_kv_builder` will answer for the same draft, decided from the config
-    alone so `Config` and the offload deployment checks can ask it before any runner
-    exists. EAGLE3 and DSpark (`DRAFT_POOL_METHODS`) build one where the draft's family
-    owns it, and only the native runner builds it: under a plugin the framework owns
-    the KV cache, so the answer there is no. Read off the
-    draft's attention family (`DRAFT_POOL_FAMILIES`), not by resolving its backend,
-    which would import aiter into the API process that builds `Config`.
+    What `draft_kv_builder` will answer for the same draft, from the config alone so
+    `Config` and the offload checks can ask before any runner exists: EAGLE3 / DSpark
+    on a family in `DRAFT_POOL_FAMILIES` (not by resolving its backend, which would
+    import aiter into the API process), native runner only.
     """
     from atom.plugin import is_plugin_mode
 

@@ -15,17 +15,14 @@ from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace
 
 @dataclass(frozen=True)
 class IndexScoreBuffers:
-    """The MXFP4 index scorer's persistent state, one immutable record so that none of
-    its parts can be present without the others.
+    """The MXFP4 index scorer's persistent state, one immutable record.
 
     ``scores`` is the `LogitsWorkspace` every layer's scorer writes its fp32 block
-    scores into (the same plane the other indexers use), viewed contiguous
-    ``[heads, rows, width]`` -- the layout aiter's selector needs. Never filled: the
-    selectors read a row only up to its valid blocks, which the scorer writes every
-    step. ``work_map`` is the decode scorer's dispatch map and ``max_block`` the block
-    count it was built at, which the scorer checks for an exact match and which must
-    not move between graph replays: the builder holds the capacity buffer, the step's
-    metadata the map built into it. A prefill step's record has neither.
+    scores into, viewed contiguous ``[heads, rows, width]`` (what aiter's selector
+    needs); never filled, since the selectors read a row only up to its valid
+    blocks. ``work_map`` is the decode scorer's dispatch map and ``max_block`` the
+    block count it was built at: checked for an exact match, and fixed across graph
+    replays. A prefill step's record has neither.
     """
 
     scores: LogitsWorkspace
@@ -41,21 +38,17 @@ def allocate_index_scorers(
     switch for "this model runs the MXFP4 index scorer".
 
     The scorer's grid is its work map's row count, so the block bound is the model
-    length's, and the map buffer is CAPACITY -- the exact grid is not monotonic in the
-    batch. Sized at the widest step; a plain decode step (S=1) builds into the same
-    buffer. The scores go into one `LogitsWorkspace` every layer shares (the scorer and
-    selector of a layer run back to back on one stream, in one call), as wide as the map
-    and tall enough for the larger of a decode step's rows and a prefill chunk's.
-    Allocated in the builder's constructor, so the memory profile counts it.
+    length's and the map buffer is capacity (the exact grid is not monotonic in the
+    batch). Every layer shares one `LogitsWorkspace` for the scores (a layer's scorer
+    and selector run back to back on one stream), as wide as the map and tall enough
+    for a decode step's rows or a prefill chunk's. Allocated in the builder's
+    constructor, so the memory profile counts it.
 
-    A decode TBO also gets a map per ubatch, for the same reason as the sparse metadata
-    buffers: both ubatches' metadata are alive at once. Its scores are the step's: both
-    ubatches run on one compute stream (`make_tbo_contexts`) and a layer's scorer writes
-    them and its selector reads them inside one `index_topk` call, which has no yield
-    point in it. A ubatch is one token a request (the sparse TBO decode raises above
-    that), so q == 1 for its map whatever ``max_qlen`` is; `cut_decode_ubatches` cuts a
-    batch of ``max_bs`` requests at ``max_bs // 2``. `enable_tbo` alone is the prefill
-    split, which never runs the decode scorer.
+    A decode TBO also gets a map per ubatch (both ubatches' metadata are alive at once)
+    but shares the step's scores: both run on one compute stream and a layer's scorer
+    and selector sit in one `index_topk` call. A ubatch is one token a request, so
+    q == 1 for its map; `cut_decode_ubatches` cuts ``max_bs`` requests at
+    ``max_bs // 2``.
     """
     if config.index_cache_dtype != "fp4":
         return {}

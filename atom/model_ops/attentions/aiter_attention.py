@@ -592,20 +592,13 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         from atom.config import KVCacheTensor
 
         if _is_indexed_sparse_attention(module):
-            # MiniMax-M3 sparse attention. The KV cache uses the SAME allocation
-            # and binding as standard MHA — we only additionally bind the separate
-            # indexer-key cache here, then fall through to the standard branch for
-            # all K/V (+ scale, where the layout has scale planes) binding (it sets
-            # module.k_cache/v_cache, module.k_scale/v_scale when there are scale
-            # planes, and returns the KVCacheTensor). The standard binding is
-            # page-128 SHUFFLE; SparseMHAPagedAttentionImpl.rope_cache re-views it
-            # to page-16 SHUFFLE (zero-copy) at attention time. Under
-            # `--kv-cache-dtype fp4` it binds scale-less MXFP4 pages (one 8704 B
-            # [data | e8m0 scales] field a page and kv head) that `rope_cache` and
-            # `sparse_pa_mxfp4` use as they are. index_cache is a
-            # genuinely separate field (not derivable from the K/V ones), so
-            # each sparse layer has its own row in that second space. The pool
-            # was built at this backend's block, so its slice already is.
+            # MiniMax-M3 sparse attention. K/V use the SAME allocation and binding as
+            # standard MHA (the standard branch below binds them, and the scales where
+            # the layout has scale planes): page-128 SHUFFLE, which
+            # SparseMHAPagedAttentionImpl.rope_cache re-views as page-16 at attention
+            # time; under `--kv-cache-dtype fp4`, scale-less MXFP4 pages (8704 B a page
+            # and kv head) used as they are. Only the separate indexer-key cache is
+            # bound here; each sparse layer has its own row in that second space.
             runner = self.model_runner
             pool = next(p for p in self.kv_pools.values() if p.extra_fields)
             spec = self._index_cache_spec(self.block_size * self.block_ratio)
@@ -1093,9 +1086,8 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             # the DECODE sparse path; the decode kernels handle q>1 per-token
             # causal internally via max_query_len.
             # The MXFP4 scorer takes its batch off the rows of idx_q, which a DP step
-            # can make more (a prefill bucket's pad) or fewer than `running_bs * q`;
-            # `_sparse_decode` slices q / idx_q to the rows of this batch. The other
-            # index caches keep the padded batch.
+            # can make more or fewer than `running_bs * q`; `_sparse_decode` slices q /
+            # idx_q to this batch. The other index caches keep the padded batch.
             index_bs = running_bs
             if "" in self._index_scorers:  # the MXFP4 index cache
                 index_bs = min(running_bs, running_tokens // max_seqlen_q)

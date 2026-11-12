@@ -39,13 +39,8 @@ from atom.model_ops.minimax_m3.mxfp4_pages import page_views
 
 @functools.cache
 def flydsl_ops():
-    """aiter's FlyDSL module, for the MXFP4 index scorers and their work map.
-
-    Imported where an MXFP4 index step first reaches for it, once, not at module load:
-    `aiter.ops.flydsl` imports `flydsl` itself, and every bf16 / fp8 deployment (and
-    every MHA model, which imports this module through the shared backend) would then
-    need it. A deployment that does run the MXFP4 index and lacks FlyDSL fails here.
-    """
+    """aiter's FlyDSL module (MXFP4 index scorers, work map), imported on first use:
+    every bf16 / fp8 deployment imports this module and must not need FlyDSL."""
     from aiter.ops import flydsl
 
     return flydsl
@@ -53,17 +48,10 @@ def flydsl_ops():
 
 @functools.cache
 def _small_k_selector():
-    """aiter's chunk-narrowing per-row selector and its support predicate.
-
-    Same forced-block pins and tie direction as the Triton one below, same selection
-    on every shape tried. It narrows in one pass where Triton folds tl.topk over
-    ceil(max_block / BLOCK_SIZE_K) tiles, so it pulls ahead as the row widens -- 7us
-    against 36us at a 1M context. `_aiter_selector_wins` says where.
-
-    Imported where a row first takes it, once, for the reason `flydsl_ops` is. No probe
-    and no fallback: a row wide enough to take it on an aiter without it (the minimum is
-    ROCm/aiter#7014, in docs/configuration_guide.md) fails here rather than quietly
-    running the Triton selector.
+    """aiter's per-row selector and its support predicate: the Triton selector's pins
+    and tie direction, in one pass (7us against 36us at a 1M context;
+    `_aiter_selector_wins` says where). Imported on first use, like `flydsl_ops`; no
+    fallback: an aiter without it (minimum #7014, see the configuration guide) fails here.
     """
     from aiter.ops.flydsl.topk.topk_per_row_small_k import (
         topk_per_row_small_k,
@@ -182,10 +170,8 @@ def _emit_sparse_block_table_row(
     bt_slot = tl.where(bt_is_full, bt_earlier_full, bt_n_full)  # tail -> n_full
 
     bt_logical_page = tl.load(bt_row + bt_blk, mask=bt_valid, other=0).to(tl.int32)
-    # block_page_stride > pages_per_block only for a fused-K/V cache (the vLLM
-    # plugin's 16 > 8): consecutive logical blocks then sit 16 physical pages apart
-    # because the K and V planes overlap half a block. 8 / 8 for the page-16
-    # SHUFFLE cache, 1 / 1 for a page-128 (MXFP4) one.
+    # block_page_stride > pages_per_block only for the vLLM plugin's fused-K/V cache
+    # (16 > 8: the K and V planes overlap half a block); 8 / 8 page-16 SHUFFLE, 1 / 1 MXFP4.
     bt_base_phys = bt_logical_page * block_page_stride * NUM_KV_HEADS + pid_h
     bt_dst_base = bt_slot * pages_per_block
 
@@ -1173,15 +1159,13 @@ def minimax_m3_index_topk(
 ):
     """Index block-score + top-k selection. block_size_q == 1 (per-token).
 
-    With an ``index_scorer`` (an `IndexScoreBuffers`: the MXFP4 index cache,
-    ``--index-cache-dtype fp4``, and only that one has it) ``index_kv_cache`` is the
-    uint8 ``[num_blocks, 8704]`` MXFP4 page cache and the scores come from aiter's
-    FlyDSL prefill scorer (``minimax_m3_index_score_prefill_fp4_flydsl``), which
-    writes into ``index_scorer.scores``: one workspace for every layer and no
-    per-call allocation or -inf fill, since the selection after it, this module's,
-    reads a row only up to its valid blocks. Without one the Triton scorer runs.
-    ``pages_per_block`` / ``block_page_stride`` describe the emitted block table:
-    8 / 8 for the page-16 SHUFFLE cache, 1 / 1 for page-128 caches (MXFP4 KV).
+    With an ``index_scorer`` (an `IndexScoreBuffers`, MXFP4 index cache only)
+    ``index_kv_cache`` is the uint8 ``[num_blocks, 8704]`` page cache and aiter's
+    FlyDSL prefill scorer writes the scores into ``index_scorer.scores`` (shared by
+    every layer, never filled: the selection reads a row only up to its valid
+    blocks). Without one the Triton scorer runs. ``pages_per_block`` /
+    ``block_page_stride`` describe the emitted block table: 8 / 8 page-16 SHUFFLE,
+    1 / 1 MXFP4 KV.
 
     Returns topk_idx [num_kv_heads, total_q, topk] of 0-indexed block ids
     (right-padded with -1). M3 has num_idx_heads == num_kv_heads, so the
@@ -1189,10 +1173,8 @@ def minimax_m3_index_topk(
 
     When ``emit_sparse_block_table`` is True the topk kernel ALSO fuses the
     per-query-token block-table compaction and returns ``(topk_idx, sparse_bt
-    [total_q, topk * pages_per_block], sparse_ctx [total_q])`` ready for the
-    prefill attention kernel (``pages_per_block`` is 8 for the page-16 SHUFFLE
-    cache, 1 for an MXFP4 KV) -- saving a separate build launch + topk_idx HBM
-    round-trip.
+    [total_q, topk * pages_per_block], sparse_ctx [total_q])`` for the prefill
+    attention kernel, saving a launch and a topk_idx HBM round-trip.
 
     ``block_page_stride`` is the distance in physical 16-pages between two
     consecutive logical 128-blocks in the KV cache. It defaults to
@@ -1406,11 +1388,9 @@ def minimax_m3_index_topk_decode(
 ):
     """Decode index block-score + top-k, both split-K (cudagraph-safe).
 
-    ``index_scorer`` (an `IndexScoreBuffers`, here with the step's work map) and
-    ``pages_per_block`` as in :func:`minimax_m3_index_topk`. The MXFP4 scorer reads the
-    cache as ``mxfp4_pages.page_views`` and the query as e4m3, as the fused writer emits
-    it; the record's ``max_block`` must not move between graph replays (the map's row
-    count is the scorer's grid).
+    ``index_scorer`` (here with the step's work map) and ``pages_per_block`` as in
+    :func:`minimax_m3_index_topk`. The MXFP4 scorer takes an e4m3 query; the record's
+    ``max_block`` must not move between graph replays (the map's rows are its grid).
 
     Returns topk_idx [num_kv_heads, total_q, topk] (0-indexed block ids, -1 pad).
     For spec-decode (``max_query_len = num_spec+1``) each of the ``max_query_len``
@@ -1420,9 +1400,8 @@ def minimax_m3_index_topk_decode(
 
     When ``emit_sparse_block_table`` is True the selector ALSO fuses the block-table
     compaction and returns ``(topk_idx, sparse_bt [total_q, topk * pages_per_block],
-    sparse_ctx [total_q])`` ready for the decode attention kernel (``pages_per_block``
-    is 8 for the page-16 SHUFFLE cache, 1 for an MXFP4 KV) -- saving a separate build
-    launch + topk_idx HBM round-trip.
+    sparse_ctx [total_q])`` for the decode attention kernel, saving a launch and a
+    topk_idx HBM round-trip.
 
     ``block_page_stride`` is the distance in physical 16-pages between two
     consecutive logical 128-blocks in the KV cache. It defaults to

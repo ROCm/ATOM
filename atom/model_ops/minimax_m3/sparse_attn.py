@@ -100,9 +100,8 @@ class MiniMaxM3SparseMetadata:
     indexer. `index_topk` consumes it and never derives its own.
     """
     index_scorer: IndexScoreBuffers | None = None
-    """What the MXFP4 index scorer of this step needs, as one record: None wherever the
-    index cache is not MXFP4, and on an empty batch (the scorer then refuses rather
-    than quietly allocating its own)."""
+    """The MXFP4 index scorer's record for this step; None for any other index cache
+    and on an empty batch (the scorer then refuses)."""
 
 
 def make_sparse_prefill_metadata(
@@ -172,12 +171,10 @@ def make_sparse_decode_metadata(
 ) -> MiniMaxM3SparseMetadata:
     """``index_scorer`` is the builder's MXFP4 index scorer record (None for any other
     index cache): the step's work map is built into its capacity buffer here, once, at
-    its ``max_block`` (the model length's), and the metadata carries the record with
-    that map; an empty batch builds none.
-    ``seq_lens`` and ``block_table`` must be the requests whose rows the scorer,
-    selector and attention run (pad requests of a padded step: length 0): the map's
-    encoding and grid and the head offsets of ``n_valid_column_per_row`` all follow
-    that batch.
+    its ``max_block``, and the metadata carries the record with that map; an empty batch
+    builds none. ``seq_lens`` and ``block_table`` must be the requests whose rows the
+    scorer, selector and attention run (pad requests: length 0): the map and
+    ``n_valid_column_per_row`` both follow that batch.
     """
     decode = MiniMaxM3SparseDecodeMetadata(
         seq_lens=seq_lens, block_table=block_table, max_query_len=max_query_len

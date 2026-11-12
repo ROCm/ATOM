@@ -2837,11 +2837,8 @@ class Config:
             if self.kv_cache_block_size != v4_block_size:
                 self.kv_cache_block_size = v4_block_size
             if self.kv_cache_dtype == "fp8" and self.plugin_config is None:
-                # aiter's V4 prefill / decode implement the fp8 (2buff) KV only on
-                # gfx950 / gfx1250. Elsewhere the KV is bf16, decided here -- before
-                # anything reads `kv_cache_dtype`, the draft's resolved dtype
-                # included -- and not by the builder after the fact. `get_gfx` is the
-                # builder's own probe (rocminfo; it does not initialise CUDA).
+                # aiter's V4 fp8 (2buff) KV exists only on gfx950 / gfx1250; elsewhere it
+                # is bf16, decided here before the draft's dtype is resolved from it.
                 from aiter.jit.utils.chip_info import get_gfx
 
                 gfx = get_gfx()

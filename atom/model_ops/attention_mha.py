@@ -1346,14 +1346,13 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         self.index_cache_dtype = (
             index_cache_dtype if index_cache_dtype is not None else kv_cache_dtype
         )
-        # What the selection emits for the KV layout, fixed by it: one page-128 page a
-        # block for the MXFP4 KV, the page-16 SHUFFLE defaults otherwise.
+        # The selection's block-table shape follows the KV layout: one page-128 page a
+        # block for MXFP4 KV, the page-16 SHUFFLE defaults otherwise.
         self._select_page_kwargs = {}
         if self.kv_cache_dtype == "fp4":
             from atom.model_ops.minimax_m3.sparse_attn_mxfp4 import sparse_pa_mxfp4
 
-            # here, not per call: the module needs FlyDSL, which a model with another
-            # cache (or another family, all of which import this file) may not have
+            # here, not per call: it needs FlyDSL, which other caches / families lack
             self._sparse_pa_mxfp4 = sparse_pa_mxfp4
             self._select_page_kwargs = {"pages_per_block": 1, "block_page_stride": 1}
         # Bound by AiterAttentionMetadataBuilder.build_kv_cache_tensor (Task 6):
@@ -1391,16 +1390,13 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         attn_metadata = fwd_ctx.attn_metadata
         kv_cache_data = fwd_ctx.kv_cache_data
 
-        # The KV cache is bound by the STANDARD MHA path (same allocation as every
-        # other MHA model): page-128 SHUFFLE views, unless `kv_cache_dtype` is fp4 (below)
+        # The KV cache is bound by the STANDARD MHA path: page-128 SHUFFLE views
         #   K: [N, nkv, hd//x, 128, x]   V: [N, nkv, 128//x, hd, x]
         #   scale (fp8): [N, nkv, 128]
-        # The M3 paged kernels index this storage as page-16 SHUFFLE: each
-        # logical 128-block is 8 contiguous physical 16-pages. 128 == 8*16, so the
-        # page-16 view is a pure zero-copy reinterpretation of the page-128 view.
-        # We re-view here (at attention time) instead of at bind time. Under
-        # `kv_cache_dtype` fp4 the pool's pages are [N, nkv, 8704] uint8 (data + e8m0 scales,
-        # no scale planes) and are used as they are.
+        # The M3 paged kernels index it as page-16 SHUFFLE (each 128-block is 8
+        # contiguous 16-pages, a zero-copy re-view done here, not at bind time). Under
+        # `kv_cache_dtype` fp4 the pages are [N, nkv, 8704] uint8 (data + e8m0 scales)
+        # and are used as they are.
         from atom.model_ops.minimax_m3.sparse_attn import to_page16_shuffle
 
         layer = kv_cache_data[f"layer_{self.layer_num}"]
@@ -1654,9 +1650,8 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             }
 
     def _index_scorer(self, sparse_metadata):
-        """The step's MXFP4 index scorer record, None for any other index cache. A layer
-        of the MXFP4 index whose metadata has none (a split decode's whole-batch
-        metadata, an empty batch) raises: the Triton scorer would read its uint8 pages.
+        """The step's MXFP4 index scorer record, None for any other index cache; a layer
+        of the MXFP4 index whose metadata has none raises (Triton would read uint8 pages).
         """
         if self.index_cache_dtype != "fp4":
             return None
@@ -1668,10 +1663,9 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         return sparse_metadata.index_scorer
 
     def _metadata_rows(self, q, covered: int) -> int:
-        """The rows of ``q`` this step's sparse metadata covers, which is what the
-        selector writes and so all that attention may read, in decode and prefill alike.
-        A DP step can hand ``q`` more (a prefill bucket's pad). Only the MXFP4 index
-        keeps to it; the other index caches run every row of ``q``."""
+        """The rows of ``q`` this step's sparse metadata covers: what the selector writes
+        and so all attention may read, in decode and prefill (a DP step can hand ``q``
+        more). Only the MXFP4 index keeps to it; the others run every row."""
         if self.index_cache_dtype != "fp4":
             return q.shape[0]
         assert covered <= q.shape[0], (covered, q.shape)

@@ -2,26 +2,19 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Block-sparse attention over the MXFP4 KV cache (``--kv-cache-dtype fp4``).
 
-A row is a decode query token or a prefill query token: one sparse selection of
-at most ``topk`` 128-token pages, the tail page last, with its exact context
-length -- what index_topk emits at ``pages_per_block=1``. Each row is a length-1
-"sequence" for ``pa_decode`` (MXFP4 K/V) (query e4m3 as the fused writer emitted it,
-K and V MXFP4 pages), the same fold ``sparse_pa_per_row`` makes for the fp8
-caches, with the (token, kv head) pair collapsed into the row so the kernel runs
-one kv head per call: the emitted page id is ``page * Hkv + head``, which is the
-page index of the collapsed ``[pages * Hkv, 1, 128, .]`` views taken here.
+A row is a decode or prefill query token: one sparse selection of at most ``topk``
+128-token pages, the tail page last, with its exact context length (what index_topk
+emits at ``pages_per_block=1``). Each row is a length-1 "sequence" for ``pa_decode``
+(MXFP4 K/V, e4m3 query), the fold ``sparse_pa_per_row`` makes for the fp8 caches, with
+the (token, kv head) pair collapsed into the row: the emitted page id is
+``page * Hkv + head``, the page index of the collapsed ``[pages * Hkv, 1, 128, .]``
+views taken here.
 
-Decode (a captured graph, a fixed set of row counts) runs planned: aiter's planner
-takes at most ``_FLYDSL_PLAN_MAX_BATCH`` sequences, so more rows are run in
-segments, each with a plan of its own from the shared plan cache
-(``_flydsl_prepare_explicit_plan``, the one the fp8 sparse and dense paths use,
-including its once-a-step refresh under a step owner). There is no gluon fallback
-for MXFP4 pages, hence the segments rather than a refusal past one plan.
-
-Prefill runs plan-free (``planned=False``): a chunk has a new row count nearly
-every forward, and ``plan_pa_decode`` JIT-compiles a kernel per batch size. So it
-takes one task a row (a row reads at most ``topk`` pages), and one specialization
-whatever the rows.
+Decode (a captured graph, fixed row counts) runs planned, in segments of at most
+``_FLYDSL_PLAN_MAX_BATCH`` rows (aiter's planner limit; no gluon fallback exists for
+MXFP4 pages), each with a plan from the shared cache. Prefill runs plan-free
+(``planned=False``): a chunk's row count is new almost every forward and
+``plan_pa_decode`` JIT-compiles per batch size, so it takes one task a row.
 """
 
 import torch

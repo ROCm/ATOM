@@ -8,38 +8,30 @@ imports neither the model nor AITER until the architecture check needs it."""
 def _mxfp4_kv_refusal(config) -> str | None:
     """Why ``--kv-cache-dtype fp4`` cannot run this MiniMax-M3 here, or None.
 
-    The MXFP4 KV is one page layout for every attention layer of the model, and a
-    writer and a reader that exist only for the indexed sparse layers (MiniMax-M3.1:
-    every layer). Nothing quietly falls back to FP8 for a layer or an offloaded page
-    it cannot hold, so each such case is refused here instead.
+    The MXFP4 KV has a writer and a reader only for indexed sparse layers (M3.1: every
+    layer), so nothing falls back to FP8 for a layer or page it cannot hold: refused.
     """
     import torch
 
     if config.torch_dtype != torch.bfloat16:
-        # aiter's MXFP4 pa_decode only writes bf16; the attention output takes the
-        # model dtype, so an fp16 checkpoint would fail in its first forward.
+        # aiter's MXFP4 pa_decode only writes bf16; an fp16 model fails in its first forward.
         return f"it needs a bfloat16 model, got {config.torch_dtype}"
     if config.kv_transfer_config:
-        # Offloaded pages (ATOM_KV_OFFLOAD, a P/D connector) are moved by a layout
-        # that was never told this byte format, and its namespace keys no FP4.
+        # Offload / P-D transfer moves pages by a layout that does not know this format.
         return "it does not run with KV offload or --kv-transfer-config"
     spec = config.speculative_config
     if spec is not None and spec.draft_kv_dtype == "fp4":
-        # `resolve_draft_kv_dtype` leaves "fp4" only on a draft in the target's
-        # pool (MTP; an MHA EAGLE3 or DSpark draft has its own pool): one with no
-        # MXFP4 attention impl to write its rows. A draft with its own pool is
-        # bf16 and passes.
+        # "fp4" is left only on a draft in the target's pool (MTP), which has no
+        # MXFP4 attention impl to write its rows; an own-pool draft is bf16 and passes.
         return "the speculative draft would have FP4 KV, which it has no layout for"
 
     text = getattr(config.hf_config, "text_config", None) or config.hf_config
     layers = getattr(text, "num_hidden_layers", None)
     sparse_cfg = getattr(text, "sparse_attention_config", None) or {}
     freq = sparse_cfg.get("sparse_attention_freq")
-    # Dense attention is a layer the model's own freq marks 0, and M3's original
-    # checkpoints have them. Read off that list alone -- an MLP layout says nothing
-    # about the attention -- and exactly: one entry a layer, each a literal 1,
-    # because the model treats any non-zero as indexed sparse and a value of
-    # another meaning must not pass as one.
+    # Dense attention is a layer the model's freq marks 0 (M3's original checkpoints
+    # have them). Read exactly: one literal 1 a layer, since the model treats any
+    # non-zero as indexed sparse and another meaning must not pass as one.
     if (
         not sparse_cfg.get("use_sparse_attention")
         or not isinstance(freq, (list, tuple))
@@ -78,8 +70,7 @@ def validate_runtime_config(config):
         )
     if kv_fp4 and config.index_cache_dtype != "fp4":
         # The MXFP4 KV's attention reads exactly the rows the selection wrote, which
-        # only the MXFP4 index path keeps to (`_metadata_rows`); the other index caches
-        # run every row of q, and their selectors can leave some unwritten.
+        # only the MXFP4 index path keeps to (`_metadata_rows`).
         raise ValueError(
             "--kv-cache-dtype fp4 needs --index-cache-dtype fp4, "
             f"got {config.index_cache_dtype}"
