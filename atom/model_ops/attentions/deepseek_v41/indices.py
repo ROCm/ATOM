@@ -149,7 +149,7 @@ def _indptr_scan_all(
             )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["WINDOW_ROWS"])
 def _indices(
     selected,
     pptr,
@@ -181,8 +181,9 @@ def _indices(
     PACKED: tl.constexpr,
     HISTORY: tl.constexpr,
     SPLIT_PREFILL: tl.constexpr,
-    WINDOW_ROWS: tl.constexpr,
+    WINDOW_ROWS,
 ):
+    # WINDOW_ROWS is a live batch offset, not a compile-time shape.
     # `HISTORY`: the window rows at the tail of each prefix slice. A split
     # decode has them in `_window_rows`'s list instead.
     t = tl.program_id(0)

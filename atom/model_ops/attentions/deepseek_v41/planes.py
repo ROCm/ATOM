@@ -96,12 +96,12 @@ def prefill_window(history, step, ring):
 def _reset_windows(
     ptrs, slots, NSLOTS: tl.constexpr, RING: tl.constexpr, D: tl.constexpr
 ):
-    pair = tl.program_id(1)
+    pair = tl.program_id(0)
     layer, request = pair // NSLOTS, pair % NSLOTS
     slot = tl.load(slots + request).to(tl.int64)
     data = tl.load(ptrs + layer * 2).to(tl.pointer_type(tl.uint8))
     scale = tl.load(ptrs + layer * 2 + 1).to(tl.pointer_type(tl.uint8))
-    offset = tl.program_id(0) * 1024 + tl.arange(0, 1024)
+    offset = tl.program_id(1) * 1024 + tl.arange(0, 1024)
     tl.store(data + slot * RING * D + offset, 0, offset < RING * D)
     tl.store(scale + slot * RING * (D // 32) + offset, 0, offset < RING * (D // 32))
 
@@ -111,7 +111,8 @@ def reset_windows(sources, ptrs, slots, ring, dim):
     if not slots.numel() or not sources:
         return
     if slots.is_cuda:
-        _reset_windows[(triton.cdiv(ring * dim, 1024), len(sources) * slots.numel())](
+        # The layer/slot product can exceed the y-axis limit of 65535.
+        _reset_windows[(len(sources) * slots.numel(), triton.cdiv(ring * dim, 1024))](
             ptrs, slots, slots.numel(), ring, dim
         )
     else:

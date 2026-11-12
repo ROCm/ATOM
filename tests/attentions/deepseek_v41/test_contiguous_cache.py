@@ -11,7 +11,11 @@ pytest.importorskip("triton", reason="the V4.1 cache and CSR kernels need Triton
 
 from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
 from atom.model_ops.attentions.deepseek_v41.checkpoints import StateCopies
-from atom.model_ops.attentions.deepseek_v41.planes import prefill_window
+from atom.model_ops.attentions.deepseek_v41.planes import (
+    prefill_window,
+    reset_windows,
+    split_source,
+)
 from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
 
 
@@ -99,6 +103,52 @@ def test_prefill_staging_grows_at_step_boundary_and_skips_decode(dtype):
             large.prefill_window_staging.data_ptr()
             != small.prefill_window_staging.data_ptr()
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+@pytest.mark.parametrize("dtype", ["fp4", "fp8"])
+@pytest.mark.parametrize("slack", [0, 3])
+def test_prefill_staging_permuted_slots_and_graph_replay(dtype, slack):
+    from atom.model_ops.attentions.deepseek_v41.metadata import RequestSpan
+
+    cache = PagedAttentionCache(geometry(dtype, slack), 7, 4, "cuda", max_tokens=16)
+    ring = cache.geometry.ring_slots
+    step = cache.begin_step(
+        (RequestSpan(0, 8, 0, 8, 3), RequestSpan(1, 8, 8, 8, 1)),
+        block_tables=[[0], [1]],
+        is_prefill=True,
+    )
+    history = cache.ring_view(1)
+    for i, plane in enumerate(history):
+        values = torch.arange(plane.numel(), device="cuda").view(plane.shape)
+        plane.copy_((values + 31 * i) % 251)
+    saved = [plane.clone() for plane in history]
+    source, tail = prefill_window(history, step, ring)
+
+    def check(ids):
+        for output, old, current in zip(source, saved, tail):
+            expected = torch.cat([old[slot * ring : (slot + 1) * ring] for slot in ids])
+            torch.testing.assert_close(output[: 2 * ring], expected, rtol=0, atol=0)
+            assert (current == 219).all()
+        for actual, old in zip(history, saved):
+            torch.testing.assert_close(actual, old, rtol=0, atol=0)
+        assert source[0].data_ptr() == step.prefill_window_staging.data_ptr()
+
+    for current in tail:
+        current.fill_(219)
+    check([3, 1])
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        prefill_window(history, step, ring)
+    torch.cuda.current_stream().wait_stream(stream)
+    for ids in ([1, 3], [2, 0]):
+        step.slots.copy_(torch.tensor(ids, dtype=step.slots.dtype, device="cuda"))
+        for output in source:
+            output[: 2 * ring].fill_(255)
+        graph.replay()
+        check(ids)
 
 
 @pytest.mark.parametrize("dtype", ["fp4", "fp8"])
@@ -256,53 +306,6 @@ def test_planes_are_dense_disjoint_and_cover_exact_budget(dtype, slack):
     for source in buffers:
         assert source.ndim == 1 and source.is_contiguous()
     assert cache.geometry.layout_id.startswith("source-buffer-v1:")
-
-
-@pytest.mark.parametrize("dtype", ["fp4", "fp8"])
-@pytest.mark.parametrize("ratio", [1, 2])
-@pytest.mark.parametrize("device", ["cpu", "cuda"])
-@pytest.mark.parametrize("plan_dtype", [torch.int32, torch.int64])
-def test_main_scatter_preserves_other_owner_and_all_window_planes(
-    dtype, ratio, device, plan_dtype
-):
-    if device == "cuda" and not torch.cuda.is_available():
-        pytest.skip("GPU required")
-    cache = PagedAttentionCache(geometry(dtype), 7, 4, device)
-    for buffer in cache.allocations:
-        buffer.fill_(29)
-    owner = 1 if ratio == 1 else 0
-    pages = tuple(plane.view(7, 32 // ratio, -1) for plane in cache.main_view(owner))
-    rpp = 32 // ratio
-    plan = torch.tensor(
-        [
-            [0, 0, 0, 0],
-            [0, 1, rpp * ratio, 0],
-            [-1, -1, -1, -1],
-            [0, 0, (rpp + 1) * ratio, 0],
-        ],
-        dtype=plan_dtype,
-    )
-    step = SimpleNamespace(
-        plans={ratio: SimpleNamespace(compress_plan_gpu=plan.to(device))},
-        block_tables=torch.tensor([[3, 1], [6, 2]], device=device),
-    )
-    values = tuple(
-        torch.randint(0, 256, (1, 4, p.shape[-1]), dtype=torch.uint8, device=device)
-        for p in pages
-    )
-    source = cache.main_sources[owner]
-    expected = source.clone()
-    untouched = [buf.clone() for buf in cache.allocations if buf is not source]
-    for p, val in zip(pages, values):
-        for t, page, row in ((0, 3, 0), (1, 2, 0), (3, 1, 1)):
-            at = p.storage_offset() + page * p.stride(0) + row * p.stride(1)
-            expected[at : at + p.shape[-1]] = val[0, t]
-    cache._scatter_rows(pages, step, values, ratio)
-    torch.testing.assert_close(source, expected, rtol=0, atol=0)
-    for actual, saved in zip(
-        (buf for buf in cache.allocations if buf is not source), untouched
-    ):
-        torch.testing.assert_close(actual, saved, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("dtype", ["fp4", "fp8"])
@@ -752,3 +755,34 @@ def test_reset_state_graph_uses_live_slot_ids(dtype):
             expected = torch.full_like(region, 91)
             expected[ids] = 0
             torch.testing.assert_close(region, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+@pytest.mark.parametrize("count", [1500, 1600])
+def test_reset_windows_above_grid_y_limit(count):
+    # 43 * 1600 exceeds 65535. Two tiles also exercise partial data/scale masks.
+    layers, ring, dim = 43, 3, 512
+    capacity = count + 2
+    sources = [
+        torch.full(
+            (capacity * ring * (dim + dim // 32),),
+            layer + 1,
+            dtype=torch.uint8,
+            device="cuda",
+        )
+        for layer in range(layers)
+    ]
+    ptrs = torch.tensor(
+        [p.data_ptr() for source in sources for p in split_source(source, dim)],
+        dtype=torch.int64,
+        device="cuda",
+    )
+    slots = torch.arange(count, 0, -1, device="cuda", dtype=torch.int64)
+    reset_windows(sources, ptrs, slots, ring, dim)
+    for layer, source in enumerate(sources):
+        for plane in split_source(source, dim):
+            expected = torch.full_like(plane.view(capacity, -1), layer + 1)
+            expected[1:-1] = 0
+            torch.testing.assert_close(
+                plane.view_as(expected), expected, rtol=0, atol=0
+            )

@@ -31,11 +31,7 @@ from atom.model_ops.deepseek_v41.index_write import (
 from atom.model_ops.deepseek_v41.rope_window import rope_quant_window
 from atom.model_ops.deepseek_v41.unit_table import unit_table
 from atom.model_ops.v4_kernels import make_compress_plans
-from atom.model_ops.v4_kernels.state_writes import (
-    swa_scatter_rows,
-    swa_scatter_rows_reference,
-    swa_write,
-)
+from atom.model_ops.v4_kernels.state_writes import swa_write
 from atom.utils import CpuGpuBuffer, upload_numpy
 
 from .indices import (
@@ -895,34 +891,6 @@ class PagedAttentionCache:
                 rows_per_block=self.geometry.index_block_rows,
             )
         return bound
-
-    def _scatter_rows(self, pages, step, value, ratio):
-        """Scatter plan rows with V4's dtype-agnostic, sentinel-aware writer.
-
-        PAGE fields have gaps between pages. Give the existing row scatter a
-        zero-copy view whose row stride is one element, so destination indices
-        are element offsets into this field's span. This retains the real page
-        stride without flattening/copying the field or compacting live rows on
-        the host during CUDA graph capture.
-        """
-        planes = pages if isinstance(pages, tuple) else (pages,)
-        values = value if isinstance(pages, tuple) else (value,)
-        per_page = planes[0].shape[1]
-        plan = step.plans[ratio].compress_plan_gpu
-        batch = plan[:, 1].long().contiguous()
-        rows = plan[:, 2].long() // ratio
-        page = step.block_tables[batch.clamp_min(0), (rows // per_page).clamp_min(0)]
-        page, row = page.long(), rows % per_page
-        for plane, rows_in in zip(planes, values):
-            offsets = page * plane.stride(0) + row * plane.stride(1)
-            last = (plane.shape[0] - 1) * plane.stride(0) + (
-                per_page - 1
-            ) * plane.stride(1)
-            pool = plane.as_strided((last + 1, plane.shape[-1]), (1, 1))
-            if isinstance(pages, tuple):
-                rows_in = rows_in.view(torch.uint8)
-            scatter = swa_scatter_rows if plane.is_cuda else swa_scatter_rows_reference
-            scatter(rows_in[0], offsets, batch, pool)
 
     def compress_state(self, owner):
         """This owner's `(kv_state, score_state)`, each `[slots, ring, dim]`.

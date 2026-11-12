@@ -99,3 +99,83 @@ def test_csr_resolves_to_causal_main_and_window_rows(
             assert wi[wp[t] : wp[t + 1]] == history + [
                 ring_rows + row for row in current
             ]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+@pytest.mark.parametrize("dtype", ["fp8", "fp4"])
+def test_prefill_request_counts_reuse_indices_kernel(dtype, monkeypatch):
+    import triton
+
+    geo = V41PoolGeometry(
+        2,
+        ((0, 2),),
+        32,
+        8,
+        512,
+        128,
+        kv_dtype=dtype,
+        speculative_tokens=3,
+        layer_ratios=(2,),
+        index_topk=4,
+    )
+    tensor = lambda values: torch.tensor(values, dtype=torch.int32, device="cuda")
+    tokens = 16
+    selected = tensor([[0, 1, 2, 3]] * tokens)
+    positions = torch.empty(tokens, dtype=torch.int32, device="cuda")
+    batches = torch.empty_like(positions)
+    cu = torch.empty(5, dtype=torch.int32, device="cuda")
+    pptr, eptr = tensor([0] * (tokens + 1)), tensor([0] * (tokens + 1))
+    step = SimpleNamespace(
+        running_tokens=tokens,
+        max_q_len=tokens,
+        decode=False,
+        positions=positions,
+        batch_ids=batches,
+        slots=tensor([3, 1, 2, 0]),
+        block_tables=tensor([[1, 0], [2, 0], [3, 0], [4, 0]]),
+        swa_cached_until=tensor([0] * 4),
+        swa_replay_start=tensor([0] * 4),
+    )
+    cache_misses = []
+
+    def record_miss(**event):
+        if event["fn"].name == "_indices":
+            cache_misses.append(event["key"])
+
+    monkeypatch.setattr(triton.knobs.runtime, "jit_cache_hook", record_miss)
+    # Fixed token bucket and tensor alignment; only the live request count changes.
+    for iteration, requests in enumerate((1, 2, 3, 4, 1)):
+        lengths = [
+            tokens // requests + (b < tokens % requests) for b in range(requests)
+        ]
+        offsets = [0]
+        pos, batch_ids = [], []
+        for batch, length in enumerate(lengths):
+            offsets.append(offsets[-1] + length)
+            pos.extend(range(10 + 32 * batch, 10 + 32 * batch + length))
+            batch_ids.extend([batch] * length)
+        positions.copy_(tensor(pos))
+        batches.copy_(tensor(batch_ids))
+        cu[: requests + 1].copy_(tensor(offsets))
+        step.cu_seqlens_q = cu[: requests + 1]
+        indptrs = fill_step_indptrs(step, geo, {2: (pptr, eptr)}, split=True)[2]
+        pi, pp, wi, wp = build_indices(
+            selected, indptrs, step, geo, geo.window(0, 6), 0, 2, split=True
+        )
+        pi, pp, wi, wp = pi[0].tolist(), pp.tolist(), wi.tolist(), wp.tolist()
+        for t, (position, batch) in enumerate(zip(pos, batch_ids)):
+            assert pi[pp[t] : pp[t + 1]] == [(batch + 1) * 16 + j for j in range(4)]
+            start = 10 + 32 * batch
+            expected = [
+                (
+                    batch * geo.ring_slots + p % geo.ring_slots
+                    if p < start
+                    else requests * geo.ring_slots + offsets[batch] + p - start
+                )
+                for p in range(position - geo.window_size + 1, position + 1)
+            ]
+            assert wi[wp[t] : wp[t + 1]] == expected
+        if iteration == 0:
+            cache_misses.clear()  # The first request count may compile once.
+        else:
+            assert not cache_misses, "request count introduced a new specialization"
