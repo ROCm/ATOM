@@ -8,10 +8,11 @@ earlier stage or the host puts) and the memory model (``check_memory``), raising
 The engine's builds at load skip both (``serving``: FlyDSL's disk cache on) and rely on this check of the same
 programs.
 
-Usage: python -m atom.models.deepseek_v41.mono.hi_contract CONFIG.json [WIDTH ...] [--fits]
+Usage: python -m atom.models.deepseek_v41.mono.hi_contract CONFIG.json [WIDTH ...] [--tp N] [--fits]
 (``CONFIG.json``: the model's ``config.json``; widths default to every served one, ``hi_compose.ROWS``: the 108
-programs and their fits, about 10 minutes on 8 CPUs). The Linear prefetch fits are derived and held to the frozen
-table (``hi.blocks.gfx950.linear_fits``); ``--fits`` prints the table instead (to regenerate it).
+programs and their fits, about 10 minutes on 8 CPUs; ``--tp``: one served TP size, ``hi_gate.SERVED_TPS``, default
+every one). The Linear prefetch fits are derived and held to the frozen table (``hi.blocks.gfx950.linear_fits``);
+``--fits`` prints the table instead (to regenerate it: every fit of the TP sizes checked).
 """
 
 from __future__ import annotations
@@ -24,9 +25,7 @@ from types import SimpleNamespace
 
 from atom.models.deepseek_v41.config import build_attention_topology
 from atom.models.deepseek_v41.mono import hi_compose
-from atom.models.deepseek_v41.mono.hi_gate import MAX_CTX
-
-TP = 4
+from atom.models.deepseek_v41.mono.hi_gate import MAX_CTX, SERVED_TPS
 
 
 def config(path: str) -> SimpleNamespace:
@@ -36,14 +35,17 @@ def config(path: str) -> SimpleNamespace:
     return SimpleNamespace(**raw.get("text_config", raw))
 
 
-def check(cfg, widths=None, tp: int = TP, fits: bool = True) -> hi_compose.HiPrograms:
-    """Every hi program of ``widths`` (default ``hi_compose.ROWS``) at ``tp`` built for gfx950 compile-only, its trace
-    checked (module docstring); -> the composition. Raises ``ContractError`` on a violation. ``fits``: the Linear
-    prefetch fits derived by their probes, not read from the frozen table (``linear_fits``), and each held to the
-    table's (``ContractError`` on a difference; a plan the table lacks: ``missing_fits``).
+def check(cfg, widths=None, tp: int = 4, fits: bool = True) -> hi_compose.HiPrograms:
+    """Every hi program of ``widths`` (default ``hi_compose.ROWS``) at ``tp`` (one of ``SERVED_TPS``) built for gfx950
+    compile-only, its trace checked (module docstring); -> the composition. Raises ``ContractError`` on a violation,
+    ``ValueError`` on a TP size the programs are not built for. ``fits``: the Linear prefetch fits derived by their
+    probes, not read from the frozen table (``linear_fits``), and each held to the table's (``ContractError`` on a
+    difference; a plan the table lacks: ``missing_fits``).
     """
     from .hi.blocks.gfx950 import linear, linear_fits
 
+    if tp not in SERVED_TPS:
+        raise ValueError(f"TP{tp}: the hi programs are built for TP {SERVED_TPS}")
     os.environ.setdefault("ARCH", "gfx950")
     os.environ.setdefault("FLYDSL_GPU_ARCH", "gfx950")
     topology = build_attention_topology(cfg)[: cfg.num_hidden_layers]
@@ -85,7 +87,7 @@ def fits_module(fits: dict) -> str:
             "without spills, with its VGPR margin), frozen: the plan's digest (``linear.plan_digest``) -> depth (None: no",
             "depth builds). Derived by the probes with FlyDSL ``FLYDSL`` for MI355X; another FlyDSL derives its own. The",
             "contract check derives them again and holds them to this table; regenerate with",
-            "``python -m atom.models.deepseek_v41.mono.hi_contract CONFIG.json --fits``.",
+            "``python -m atom.models.deepseek_v41.mono.hi_contract CONFIG.json --fits`` (every served TP size).",
             '"""',
             "",
             f"FLYDSL = {md.version('flydsl')!r}",
@@ -104,17 +106,23 @@ def main(argv: list[str]) -> int:
         return 2
     write = "--fits" in argv
     argv = [a for a in argv if a != "--fits"]
-    t0 = time.time()
-    progs = check(config(argv[0]), [int(w) for w in argv[1:]] or None)
+    tps = SERVED_TPS
+    if "--tp" in argv:
+        i = argv.index("--tp")
+        tps, argv = (int(argv[i + 1]),), argv[:i] + argv[i + 2 :]
+    cfg, widths = config(argv[0]), [int(w) for w in argv[1:]] or None
+    for tp in tps:  # (one process: the derived fits of every TP size)
+        t0 = time.time()
+        progs = check(cfg, widths, tp)
+        if not write:
+            print(f"TP{tp}: {len(progs.kernels())} hi programs built and checked in {time.time() - t0:.0f} s; "
+                  f"{len(missing_fits())} fits not in the frozen table")  # fmt: skip
     if (
         write
-    ):  # the frozen table, every fit of the composition (the derived ones it lacked included)
+    ):  # the frozen table, every fit of the compositions (the derived ones it lacked included)
         from .hi.blocks.gfx950 import linear
 
         print(fits_module(dict(linear.DERIVED)), end="")
-        return 0
-    print(f"{len(progs.kernels())} hi programs built and checked in {time.time() - t0:.0f} s; "
-          f"{len(missing_fits())} fits not in the frozen table")  # fmt: skip
     return 0
 
 
