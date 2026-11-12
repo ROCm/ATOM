@@ -2353,7 +2353,7 @@ class ModelRunner:
                 )
         offsets, total = plan_regions(sizes)
         if buf is None:
-            buf = torch.zeros(total, dtype=torch.uint8, device=self.device)
+            buf = self._kv_pool_memory().allocate(total, self.device)
         elif buf.numel() < total:
             raise ValueError(
                 f"the imported paged pool holds {buf.numel()} B but this side's "
@@ -2361,6 +2361,16 @@ class ModelRunner:
             )
         regions = [buf[o : o + n] for o, n in zip(offsets, sizes)]
         return buf, regions, builders
+
+    def _kv_pool_memory(self):
+        """Where the paged pool's bytes come from (`ATOM_KV_POOL_BACKEND`)."""
+        memory = getattr(self, "_kv_pool_memory_provider", None)
+        if memory is None:
+            from atom.model_engine.kv_block_pool import make_pool_memory
+
+            memory = make_pool_memory(self.config, self.rank)
+            self._kv_pool_memory_provider = memory
+        return memory
 
     def _back_paged_pools(self, blocks: int, buf=None):
         """Back every builder's paged pool and publish what comes back.
@@ -2480,6 +2490,14 @@ class ModelRunner:
             # counts in its own page, and the transfer protocol addresses
             # ``req.block_ids``, which are the scheduler's.
             transfer_tensors.set_block_count(num_kvcache_blocks)
+        if pool.numel():
+            # A backend that moves blocks itself has to know where a block's
+            # bytes are; the PAGE regions are that, in the scheduler's ids.
+            self._kv_pool_memory().bind_layout(
+                pool,
+                transfer_tensors.block_regions if transfer_tensors is not None else (),
+                num_kvcache_blocks,
+            )
         # The same count reaches the codecs, which likewise index by scheduler
         # block: MLA's cache is allocated in page-size-1 rows, so its own count
         # is block_ratio times larger and would make a codec treat one token as
@@ -2505,7 +2523,8 @@ class ModelRunner:
         # parallel reconciliation — so this mirrors the budget by construction
         # rather than re-deriving it.
         expected_kv_bytes = self.pool_plan.total_reserved_bytes
-        if expected_kv_bytes > 0:
+        # A pool another process allocated is not in this allocator's numbers.
+        if expected_kv_bytes > 0 and self._kv_pool_memory().counted_by_torch:
             diff_pct = abs(actual_kv_bytes - expected_kv_bytes) / expected_kv_bytes
             # 3% threshold: budget formula matches allocation exactly, but the
             # measured `post_alloc - pre_alloc` includes allocator alignment
@@ -3861,6 +3880,8 @@ class ModelRunner:
 
     def _record_kv_cache_ready(self, batch: ScheduledBatch) -> None:
         """Publish completed chunk snapshots and the legacy final-ready event."""
+        # Before the early return: decodes write the pool too.
+        self._kv_pool_memory().writes_issued()
         if batch.total_seqs_num_prefill <= 0:
             return
         connector = get_kvconnector()
