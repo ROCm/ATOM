@@ -114,14 +114,12 @@ class SizedSeq(SimpleNamespace):
         return len(self.block_table)
 
 
-NO_HIT = SimpleNamespace(num_cached_blocks=0, block_hashes=[])
-
-
 def standalone(max_bytes, *, reserve_blocks=None, free_blocks=0):
     """A controller over a one-token-per-block pool and a full-transfer connector."""
     connector = SimpleNamespace(pd_receive_block_offset=lambda seq, n, cached: 0)
     block_manager = SimpleNamespace(
         num_pool_blocks=lambda tokens: tokens,
+        draft_lookahead_blocks=lambda tokens: 0,
         kv=SimpleNamespace(lookup=lambda h: -1, num_free=free_blocks),
     )
     return PdAdmissionController(
@@ -130,7 +128,11 @@ def standalone(max_bytes, *, reserve_blocks=None, free_blocks=0):
 
 
 def try_admit(policy, seq, *, running=False):
-    admitted, plan = policy.check(seq, NO_HIT, running=running)
+    # No local hit: every block of the request is new.
+    probe = SimpleNamespace(
+        num_cached_blocks=0, block_hashes=[], num_new_blocks=len(seq)
+    )
+    admitted, plan = policy.check(seq, probe, running=running)
     if admitted:
         policy.commit(seq, plan)
     return admitted
@@ -305,6 +307,42 @@ def test_free_kv_watermark_counts_claimed_prefix_hits(build, seq_factory, chunke
     # With A gone, B enters with the same three-block hit.
     assert batch.connector_meta_output.reqs_to_recv[b.id].num_computed_blocks == 3
     assert set(sched.pd_admission.pending) == {str(b.id)}
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+def test_free_kv_watermark_skips_hits_on_blocks_another_request_holds(
+    build, seq_factory, chunked
+):
+    sched, request = build(
+        chunked=chunked,
+        prefix=True,
+        num_kvcache_blocks=10,
+        options={"enabled": True, "min_free_kv_fraction": 0.3},
+    )
+    bm = sched.block_manager
+    assert sched.pd_admission.reserve_blocks == 3
+    # A running request holds the four prompt blocks the next one hits.
+    holder = seq_factory(list(range(16)))
+    bm.allocate(holder, bm.can_allocate(holder))
+    bm.hash_blocks(holder, holder.num_tokens)
+    a, b = request(4), request(16)
+    sched.extend([a, b])
+    batch, _ = sched.schedule()
+    # After A, 5 blocks are free. B's three-block hit is held by `holder`, so
+    # B takes one block and leaves 4; counting its four blocks would leave 1.
+    assert set(batch.connector_meta_output.reqs_to_recv) == {a.id, b.id}
+    assert batch.connector_meta_output.reqs_to_recv[b.id].num_computed_blocks == 3
+    assert bm.kv.num_free == 4
+
+
+def test_probe_reports_free_pool_demand_without_prefix_caching(build, seq_factory):
+    from atom.model_engine.block_manager import AdmissionProbe
+
+    sched, _ = build()
+    probe = AdmissionProbe()
+    seq = seq_factory(list(range(8)))
+    assert sched.block_manager.can_allocate(seq, record=False, probe=probe) == 0
+    assert probe.num_new_blocks == 2
 
 
 @pytest.mark.parametrize("geometry_matches", [False, True])
