@@ -1278,6 +1278,7 @@ models:
             decode: &kimi_k3_pd_opus_decode_env
               AITER_MLA_USE_OPUS: "1"
           run_eval: true
+          eval_only: true
           eval_concurrency: [72]
 
         # The prefill saturates at CONC 88, so its PP head keeps 16 batches in
