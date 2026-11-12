@@ -99,6 +99,14 @@ def _bare_mgr(n=2):
     mgr._backlog_popped = [0] * n
     mgr._backlog_unsent = {}
     mgr._backlog_unsent_tokens = [0] * n
+    mgr._backlog_unseen_ids = [deque() for _ in range(n)]
+    mgr._backlog_objects = {}
+    mgr._backlog_prompt_tokens = {}
+    mgr._backlog_sent_ordinals = {}
+    mgr._backlog_credit_updates = {}
+    mgr._backlog_credit_sent = {}
+    mgr._backlog_credit_debts = {}
+    mgr._backlog_reported_credit_tokens = [0] * n
     return mgr
 
 
@@ -129,7 +137,10 @@ def test_a_charged_seq_not_sent_yet_counts_for_the_next_one_of_its_batch():
     mgr = _bare_mgr()
     mgr._seq_load = {"a": (0, 1, 30_000), "b": (0, 1, 30_000)}
     mgr._backlog_report = [(0, 0), (0, 0)]
-    first, second = SimpleNamespace(id="a"), SimpleNamespace(id="b")
+    first, second = (
+        SimpleNamespace(id="a", num_prompt_tokens=30000),
+        SimpleNamespace(id="b", num_prompt_tokens=30000),
+    )
     mgr._backlog_note_charged_locked(first, 0)
     assert mgr._backlog_effective_tokens_locked() == [30_000, 0]  # rank 1 is lighter
     mgr._backlog_note_charged_locked(second, 1)
@@ -144,7 +155,9 @@ def test_a_released_unsent_seq_gives_its_charge_back():
     mgr = _bare_mgr()
     mgr._seq_load = {"a": (0, 1, 30_000)}
     mgr._backlog_report = [(0, 0), (0, 0)]
-    mgr._backlog_note_charged_locked(SimpleNamespace(id="a"), 0)
+    mgr._backlog_note_charged_locked(
+        SimpleNamespace(id="a", num_prompt_tokens=30000), 0
+    )
     assert mgr._backlog_drop_unsent_locked("a") == 30_000
     assert mgr._backlog_drop_unsent_locked("a") == 0  # idempotent
     assert mgr._backlog_effective_tokens_locked() == [0, 0]
@@ -356,7 +369,9 @@ def test_share_cache_refuses_a_store_split_into_per_nic_pools():
 
     assert isinstance(build(one, 2), ShareCacheRouter)
     assert isinstance(build(two, 1), ShareCacheRouter)  # one rank: nothing to share
-    with pytest.raises(ValueError, match="splits it into 2 pools"):
+    with pytest.raises(
+        ValueError, match="Shared-prefix DP routing requires one shared"
+    ):
         build(two, 2)
 
 

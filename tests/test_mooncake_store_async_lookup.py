@@ -307,13 +307,20 @@ def test_cancelled_lookups_do_not_pile_up_behind_a_stalled_rpc():
 
 
 def test_multi_connector_fans_the_forward_stream_out_to_children():
+    from atom.kv_transfer.disaggregation.base import KVConnectorBase
     from atom.kv_transfer.disaggregation.multi.multi_connector import MultiConnector
+
+    class DefaultStreamConnector(KVConnectorBase):
+        def register_kv_caches(self, *args, **kwargs): ...
+        def start_load_kv(self, metadata): ...
+        def get_finished(self):
+            return set(), set()
 
     got = []
     m = MultiConnector.__new__(MultiConnector)
     m._connectors = [
         SimpleNamespace(set_forward_stream=got.append),
-        SimpleNamespace(),  # a child without the hook is skipped
+        DefaultStreamConnector(),
     ]
     m.set_forward_stream("stream-B")
     assert got == ["stream-B"]

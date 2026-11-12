@@ -374,7 +374,7 @@ def test_cancel_pending_load_forwards_to_offload_subs():
     loads (idempotent, and moriio has no such method)."""
     moriio = FakeSchedSub(is_producer=True)
     off = FakeSchedSub(is_offload=True, offload_methods=True)
-    seq = object()
+    seq = SimpleNamespace(id="cancel-pending")
     _sched([moriio, off]).cancel_pending_load(seq)
 
     assert off.cancelled == [seq]
@@ -411,7 +411,7 @@ def test_cancel_preadmission_clears_tier_state_and_load_winner():
 def test_update_and_finished_fan_out_to_all():
     a, b = FakeSchedSub(), FakeSchedSub()
     sched = _sched([a, b])
-    seq = object()
+    seq = SimpleNamespace(id="fan-out")
     sched.update_state_after_alloc(seq)
     sched.request_finished(seq)
     assert a.alloc_calls == [seq] and b.alloc_calls == [seq]

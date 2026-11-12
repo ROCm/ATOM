@@ -202,6 +202,31 @@ class KVConnectorFactory:
         return cls._offload.get(name, False)
 
     @classmethod
+    def shared_offload_connectors(cls) -> frozenset[str]:
+        return frozenset(
+            name
+            for name in cls._registry
+            if cls._offload.get(name, False) and cls._shared_tier.get(name, False)
+        )
+
+    @classmethod
+    def lowers_hbm_hit_to_chunk(cls, name: str) -> bool:
+        return cls._lowers_hbm_hit_to_chunk.get(name, False)
+
+    @classmethod
+    def offload_min_load_tokens(cls, config: Any) -> int | None:
+        """The configured offload tier's own default `min_load_tokens`, or None.
+
+        A ``multi`` runs at most one offload tier, so this reads that leaf, not
+        the P/D transport beside it.
+        """
+
+        for name, _ in cls.leaf_connectors(config) or ():
+            if cls.is_offload_backend(name):
+                return cls._min_load_tokens.get(name)
+        return None
+
+    @classmethod
     def offload_tier(cls, config: Any) -> OffloadTierProfile:
         """The configured offload tier's `OffloadTierProfile`, from the
         registry and `config` alone (nothing is built)."""
@@ -230,7 +255,7 @@ class KVConnectorFactory:
                         store = parse_mooncake_store_config(sub.kv_transfer_config)
                         if len(store.store_masters()) > 1:
                             raise ValueError(
-                                "--dp-load-balance prefix_spread requires one shared "
+                                "Shared-prefix DP routing requires one shared "
                                 "Mooncake Store pool; mooncake_store.pools addresses "
                                 "distinct master/metadata pairs"
                             )

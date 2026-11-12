@@ -21,6 +21,7 @@ from test_lmcache_mp_async_threads import (
     _wait_until,
 )
 
+from atom.kv_transfer.disaggregation.base import KVConnectorSchedulerBase
 from atom.kv_transfer.offload._offload_common import OffloadSchedulerMixin
 from atom.kv_transfer.offload.chunked_scheduler import ChunkedOffloadSchedulerBase
 from atom.kv_transfer.offload.mp import scheduler as mp_scheduler
@@ -32,7 +33,7 @@ from atom.model_engine.sequence import SequenceStatus
 META = object()
 
 
-class _Connector(OffloadSchedulerMixin):
+class _Connector(OffloadSchedulerMixin, KVConnectorSchedulerBase):
     """Offload connector double: every request has an answered lookup and a
     tier hit that needs a load, unless a test says otherwise."""
 
@@ -46,6 +47,7 @@ class _Connector(OffloadSchedulerMixin):
         return 0
 
     def close(self): ...
+    def send_finished(self, req_id): ...
 
     def __init__(self):
         self.ready = True

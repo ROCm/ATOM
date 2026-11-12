@@ -39,3 +39,5 @@ class EngineCoreRequestType(enum.Enum):
     # [(seq id, prompt tokens reused)] of requests `share_cache` placed on an
     # estimated prefix, sent ahead of their first output.
     DP_REUSE = b"\x0b"
+    # Absolute cached-prefix estimate corrections, sent after the seq's ADD.
+    DP_PREFIX_CREDIT = b"\x0c"

@@ -13,6 +13,9 @@ Store objects, instead of the prompt's token ids.
 
 from __future__ import annotations
 
+from atom.kv_transfer.offload.lookup_client import LookupClient
+
+
 import functools
 import logging
 import time
@@ -164,7 +167,7 @@ class _PoolLookups:
         self.tainted = False
 
 
-class _StoreLookup:
+class _StoreLookup(LookupClient):
     """The chunked scheduler's lookup client, answered by the Store's masters.
 
     A hit is the prefix every rank holds: per rank, the run of chunks present
@@ -489,7 +492,11 @@ class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
     # The Store reads whole chunks into fresh blocks, so an HBM hit that ends
     # inside a chunk can be lowered to the chunk floor (see
     # `BlockManager.lower_hit_to_chunk`).
-    lowers_hbm_hit_to_chunk = True
+    @property
+    def lowers_hbm_hit_to_chunk(self):
+        from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+        return KVConnectorFactory.lowers_hbm_hit_to_chunk("mooncake_store")
 
     # Workers publish one source-safe group per chunk once its GPU pack is
     # done (the block GPU connector), separately from the store terminal.
@@ -580,8 +587,7 @@ class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
         # answer the asynchronous lookup took earlier is as old as its query.
         self._looked_up_at[sid] = time.monotonic()
         hit = super()._fresh_tier_lookup(seq, sid)
-        query_started = getattr(self._lookup_client, "query_started", None)
-        started = query_started(sid) if callable(query_started) else None
+        started = self._lookup_client.query_started(sid)
         if started is not None and started < self._looked_up_at.get(sid, started):
             self._looked_up_at[sid] = started
         return hit
