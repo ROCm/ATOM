@@ -526,12 +526,12 @@ def _row_online_stats(row_ptr, V, inv_t, BLOCK: tl.constexpr):
 
 
 @triton.jit
-def _target_row(rows_ptr, r, MAPPED: tl.constexpr):
-    """Row of the target logits holding verify row r: r itself, or (MAPPED)
-    the logits row the step's `target_logits_indices` names, so the full
-    logits are read in place instead of through a compacted copy."""
-    if MAPPED:
-        return tl.load(rows_ptr + r).to(tl.int64)
+def _target_row(target_logits_indices_ptr, r, IN_PLACE: tl.constexpr):
+    """Row of `target_ptr` holding verify row r: r itself, or (IN_PLACE, the
+    full logits) the row the step's `target_logits_indices` names, so the
+    target rows are read in place instead of through a compacted copy."""
+    if IN_PLACE:
+        return tl.load(target_logits_indices_ptr + r).to(tl.int64)
     return r.to(tl.int64)
 
 
@@ -659,8 +659,7 @@ def _topp_threshold(
     ]
 )
 def _verify_row_stats_kernel(
-    target_ptr,  # [N, V], or the full logits (MAPPED)
-    rows_ptr,  # [N] (MAPPED): target row of each verify row
+    target_ptr,  # [N, V], or the full logits (IN_PLACE)
     input_ids_ptr,
     target_logits_indices_ptr,
     cu_num_draft_tokens_ptr,  # [bs]
@@ -684,7 +683,7 @@ def _verify_row_stats_kernel(
     QTP: tl.constexpr,
     HAS_TOPP_PTR: tl.constexpr,
     BLOCK: tl.constexpr,
-    MAPPED: tl.constexpr,
+    IN_PLACE: tl.constexpr,
     CAP: tl.constexpr,
     COARSE: tl.constexpr,
 ):
@@ -698,7 +697,7 @@ def _verify_row_stats_kernel(
         return
     r = start + k
     out = rs_ptr + r * 8
-    row = target_ptr + _target_row(rows_ptr, r, MAPPED) * V
+    row = target_ptr + _target_row(target_logits_indices_ptr, r, IN_PLACE) * V
     x = tl.load(input_ids_ptr + tl.load(target_logits_indices_ptr + r) + 1).to(tl.int32)
     x_ok = (x >= 0) & (x < V)
     xs = tl.where(x_ok, x, 0)
@@ -797,8 +796,8 @@ def _cum_log_ratio(rs_ptr, start, upto, N, QTP: tl.constexpr):
 
 @triton.jit(do_not_specialize=["q_width", "q_vs", "q_cols", "q_stride"])
 def _block_residual_mass_kernel(
-    target_ptr,  # [N, V], or the full logits (MAPPED)
-    rows_ptr,  # [N] (MAPPED): target row of each verify row
+    target_ptr,  # [N, V], or the full logits (IN_PLACE)
+    target_logits_indices_ptr,  # [N] (IN_PLACE): logits row of each verify row
     cu_num_draft_tokens_ptr,
     temps_ptr,
     src_ptr,
@@ -815,7 +814,7 @@ def _block_residual_mass_kernel(
     q_stride,
     QTP: tl.constexpr,
     BLOCK: tl.constexpr,
-    MAPPED: tl.constexpr,
+    IN_PLACE: tl.constexpr,
 ):
     """rm[row k] = sum_v max(P_k p_k(v) - q_k(v), 0) for 1 <= k < n, over
     this rank's vocab columns."""
@@ -837,7 +836,9 @@ def _block_residual_mass_kernel(
         tau = _ts(rs_ptr, r, N, QTP, 2)
         zk = _ts(rs_ptr, r, N, QTP, 3)
         mq, zq, _ = _q_comb(rs_ptr, r, N, QTP)
-        row = target_ptr + _target_row(rows_ptr, r, MAPPED) * V + q_vs
+        row = (
+            target_ptr + _target_row(target_logits_indices_ptr, r, IN_PLACE) * V + q_vs
+        )
         qrow = q_ptr + (s_row.to(tl.int64) * q_width + k) * q_stride
         if P > 0.0:
             accv = tl.zeros((BLOCK,), tl.float32)
@@ -950,8 +951,7 @@ def _prob_decide_kernel(
 def _prob_resample_kernel(
     res_ptr,  # [bs, 4] f32: best residual score, id, best p score, id
     dec_ptr,
-    target_ptr,  # [N, V], or the full logits (MAPPED)
-    rows_ptr,  # [N] (MAPPED): target row of each verify row
+    target_ptr,  # [N, V], or the full logits (IN_PLACE)
     input_ids_ptr,
     target_logits_indices_ptr,
     cu_num_draft_tokens_ptr,
@@ -970,7 +970,7 @@ def _prob_resample_kernel(
     seed_res,
     QTP: tl.constexpr,
     BLOCK: tl.constexpr,
-    MAPPED: tl.constexpr,
+    IN_PLACE: tl.constexpr,
 ):
     """This rank's vocab columns of the residual draw at the rejected row:
     norm(max(c p - q, 0)) (one-hot q: p without the draft), with p's own draw
@@ -999,7 +999,9 @@ def _prob_resample_kernel(
             tl.load(q_temps_ptr + s_row).to(tl.float32), _GREEDY_T
         )
         mq, zq, _ = _q_comb(rs_ptr, r, N, QTP)
-        row = target_ptr + _target_row(rows_ptr, r, MAPPED) * V + q_vs
+        row = (
+            target_ptr + _target_row(target_logits_indices_ptr, r, IN_PLACE) * V + q_vs
+        )
         qrow = q_ptr + (s_row.to(tl.int64) * q_width + num_acc) * q_stride
         for st in range(0, q_cols, BLOCK):
             offs = st + tl.arange(0, BLOCK)
@@ -1100,7 +1102,7 @@ def prob_rejection_sample(
     target_logits_indices: torch.Tensor,
     num_spec_steps: int,
     cu_num_draft_tokens: torch.Tensor,  # [bs] inclusive
-    target_logits: torch.Tensor,  # [N, V]
+    target_logits: torch.Tensor,  # [N, V], or the full logits (in_place)
     bonus_token_ids: torch.Tensor,  # [bs]
     bonus_logits_indices: torch.Tensor,  # [bs]
     temperatures: torch.Tensor,  # [bs] (clamped to eps)
@@ -1111,22 +1113,19 @@ def prob_rejection_sample(
     tp_group=None,  # required when state.q_tp > 1
     use_custom: bool = True,
     bonus_ready=None,  # Event: bonus_token_ids produced on another stream
-    logit_rows: torch.Tensor | None = None,
+    in_place: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """`logit_rows` [N]: `target_logits` is then the step's full logits and
-    verify row r is its row `logit_rows[r]` (the target rows, read in place
-    rather than copied out first); None: `target_logits` is those rows."""
-    mapped = logit_rows is not None
-    if mapped and not target_logits.is_contiguous():
-        # The kernels step rows by the vocab width: compact a strided source.
-        target_logits, mapped = torch.index_select(target_logits, 0, logit_rows), False
-    target_logits = target_logits.contiguous()
-    if mapped:
-        num_rows, vocab = logit_rows.shape[0], target_logits.shape[1]
-        rows = logit_rows
+    """`in_place`: `target_logits` is the step's full logits and verify row r
+    is its row `target_logits_indices[r]` (the target rows, read in place
+    rather than copied out first); otherwise `target_logits` is those rows."""
+    if in_place:
+        # The kernels step rows by the vocab width and index the row list
+        # with bare pointer arithmetic.
+        assert target_logits.is_contiguous() and target_logits_indices.is_contiguous()
+        num_rows, vocab = target_logits_indices.shape[0], target_logits.shape[1]
     else:
+        target_logits = target_logits.contiguous()
         num_rows, vocab = target_logits.shape
-        rows = target_logits  # unread when not mapped
     bs = cu_num_draft_tokens.shape[0]
     device = target_logits.device
     q_width = state.q.shape[1]
@@ -1170,7 +1169,6 @@ def prob_rejection_sample(
     if num_rows > 0 and num_spec_steps > 0:
         _verify_row_stats_kernel[(bs, num_spec_steps)](
             target_logits,
-            rows,
             input_ids,
             target_logits_indices,
             cu_num_draft_tokens,
@@ -1192,7 +1190,7 @@ def prob_rejection_sample(
             num_spec_steps,
             rank_id,
             QTP=qtp,
-            MAPPED=mapped,
+            IN_PLACE=in_place,
             HAS_TOPP_PTR=has_ptr,
             BLOCK=_VBLOCK,
             CAP=_CAND_CAP,
@@ -1204,7 +1202,7 @@ def prob_rejection_sample(
     if use_block and num_rows > 0 and num_spec_steps > 1:
         _block_residual_mass_kernel[(bs, num_spec_steps - 1)](
             target_logits,
-            rows,
+            target_logits_indices,
             cu_num_draft_tokens,
             temps,
             src,
@@ -1220,7 +1218,7 @@ def prob_rejection_sample(
             state.q_cols,
             q_stride,
             QTP=qtp,
-            MAPPED=mapped,
+            IN_PLACE=in_place,
             BLOCK=_VBLOCK,
             num_warps=_NUM_WARPS,
         )
@@ -1246,7 +1244,6 @@ def prob_rejection_sample(
         res,
         dec,
         target_logits,
-        rows,
         input_ids,
         target_logits_indices,
         cu_num_draft_tokens,
@@ -1264,7 +1261,7 @@ def prob_rejection_sample(
         q_stride,
         seed_res,
         QTP=qtp,
-        MAPPED=mapped,
+        IN_PLACE=in_place,
         BLOCK=_VBLOCK,
         num_warps=_NUM_WARPS,
     )
