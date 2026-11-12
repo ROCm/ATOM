@@ -40,6 +40,7 @@ def _copy_checkpoints_kernel(
     is_end,  # [T] 1 if the target sits AT the end of the row's tokens
     runtime_slots,  # [T] the row's runtime slot, the source when is_end
     chunk_offsets,  # [N + 1] first chunk index of each sequence in `h`
+    h_rows,  # [T] row of `h` holding each interior target, if HAS_H_ROWS
     cu_seqlens,  # [N + 1] first token of each sequence in `x`
     stride_x_t,  # row (token) stride of `x`; NOT D — see write_state_checkpoints
     stride_cd_s,  # conv_dst slot stride
@@ -54,6 +55,7 @@ def _copy_checkpoints_kernel(
     K: tl.constexpr,
     V: tl.constexpr,
     STATE_VK: tl.constexpr = False,
+    HAS_H_ROWS: tl.constexpr = False,
 ):
     i_t = tl.program_id(0)
     i_blk = tl.program_id(1)
@@ -84,7 +86,10 @@ def _copy_checkpoints_kernel(
                 ssm_dst.dtype.element_ty
             )
         else:
-            src = tl.load(chunk_offsets + row).to(tl.int64) + off // CHUNK
+            if HAS_H_ROWS:
+                src = tl.load(h_rows + i_t).to(tl.int64)
+            else:
+                src = tl.load(chunk_offsets + row).to(tl.int64) + off // CHUNK
             sv = tl.load(h + src * HKV + idx, mask=mask, other=0.0).to(
                 ssm_dst.dtype.element_ty
             )
@@ -121,6 +126,7 @@ def write_state_checkpoints(
     cu_seqlens: torch.Tensor,
     chunk_size: int,
     conv_state_len: int,
+    h_rows: torch.Tensor | None = None,
 ) -> None:
     """Write both halves of every checkpoint this step reached, in one launch.
 
@@ -149,6 +155,10 @@ def write_state_checkpoints(
     fused in-projection whose row stride is the *fused* width, not ``D``.
     Deriving either from the shape writes a correctly-shaped checkpoint out of
     the wrong bytes, which nothing downstream can detect.
+
+    ``h_rows`` names, per target, the row of ``h`` an interior target reads;
+    pass it with the ``h_snap`` of `interior_state_snapshots` as ``h``. Without
+    it the row is the chunk boundary, ``chunk_offsets[row] + off // chunk``.
     """
     n = rows.numel()
     if n == 0:
@@ -171,6 +181,7 @@ def write_state_checkpoints(
         is_end,
         runtime_slots,
         chunk_offsets,
+        h_rows,
         cu_seqlens,
         x.stride(0),
         conv_state.stride(0),
@@ -185,4 +196,34 @@ def write_state_checkpoints(
         K=ssm_state.shape[-2],
         V=ssm_state.shape[-1],
         STATE_VK=ssm_state.stride(-2) == 1,
+        HAS_H_ROWS=h_rows is not None,
     )
+
+
+def interior_state_snapshots(
+    rows: torch.Tensor,
+    offs: torch.Tensor,
+    interior: list[bool],
+    chunk_offsets: torch.Tensor,
+    num_chunks_bound: int,
+    chunk_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Where the chunk kernel stores each interior target's unnarrowed state.
+
+    Returns ``snap_idx`` (``[num_chunks_bound]``: chunk boundary of the
+    flattened batch -> snapshot row, or -1), ``h_rows`` (per target: its
+    snapshot row, -1 for an end target) and the number of snapshots.
+    ``rows``/``offs`` are the device targets `write_state_checkpoints` takes and
+    ``interior`` their host-side flags, so nothing here waits on the device.
+    """
+    dev = rows.device
+    sel = [i for i, f in enumerate(interior) if f]
+    snap_rows = [-1] * len(interior)
+    for j, i in enumerate(sel):
+        snap_rows[i] = j
+    snap_idx = torch.full((num_chunks_bound,), -1, dtype=torch.int32, device=dev)
+    if sel:
+        pick = torch.tensor(sel, dtype=torch.long, device=dev)
+        chunk = chunk_offsets[rows[pick].long()] + offs[pick] // chunk_size
+        snap_idx[chunk.long()] = torch.arange(len(sel), dtype=torch.int32, device=dev)
+    return snap_idx, torch.tensor(snap_rows, dtype=torch.int32, device=dev), len(sel)

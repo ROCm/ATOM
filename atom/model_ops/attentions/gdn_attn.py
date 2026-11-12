@@ -22,6 +22,7 @@ from atom.model_ops.fla_ops.replayssm import (
     replayssm_buffer_shapes,
     replayssm_commit,
 )
+from atom.model_ops.fla_ops.state_checkpoint import interior_state_snapshots
 from atom.model_ops.mamba_ops.causal_conv1d import (
     PAD_SLOT_ID,
     compute_causal_conv1d_metadata,
@@ -412,14 +413,32 @@ class GDNStateMixin(PoolRowsMixin):
             batch, attn_metadata, is_prefill=True, prepare_block_tables=False
         )
 
-        gdn_metadata.ssm_checkpoints = self._checkpoint_targets(batch)
+        gdn_metadata.ssm_checkpoints = ckpt = self._checkpoint_targets(batch)
         gdn_metadata.ssm_conv_state_len = self._conv_state_len()
-        if gdn_metadata.ssm_checkpoints is not None:
+        if ckpt is not None:
             # Same mapping the chunk kernel builds internally, computed once
             # per step rather than per layer.
             gdn_metadata.ssm_chunk_offsets = prepare_chunk_offsets(
                 gdn_metadata.non_spec_query_start_loc, CHUNK_SIZE
             )
+            # `h` holds the state narrowed to the activation dtype. A wider
+            # pool (Qwen4Exp's fp32) takes its interior targets from snapshots
+            # the chunk kernel stores unnarrowed.
+            if (
+                ckpt["interior"]
+                and self._state_dtypes()[1] != self.model_runner.config.torch_dtype
+            ):
+                lens = batch.num_scheduled_tokens
+                ckpt["snap_idx"], ckpt["h_rows"], ckpt["num_snaps"] = (
+                    interior_state_snapshots(
+                        ckpt["rows"],
+                        ckpt["offs"],
+                        ckpt["interior_host"],
+                        gdn_metadata.ssm_chunk_offsets,
+                        int(sum(lens)) // CHUNK_SIZE + len(lens) + 1,
+                        CHUNK_SIZE,
+                    )
+                )
 
         attn_metadata.gdn_metadata = gdn_metadata
 
@@ -619,12 +638,13 @@ class GDNStateMixin(PoolRowsMixin):
         this fork transfer; `tests/test_gdn_midstep_state_gpu.py` shows a slice
         of `h` is bit-exact against a forward stopped there.
 
-        Exact at any state dtype. The recurrence runs in fp32 and a forward
-        with an interior target keeps `h` at the pool's dtype
-        (`GatedDeltaNet` passes `intermediate_state_dtype`), so a slice of `h`
-        is the value a forward ending there would store. Qwen4Exp keeps its
-        state in fp32 (`mamba_ssm_dtype`); a bf16 `h` would round it. FlyDSL
-        prefill, whose snapshots are bf16 only, steps aside for such a forward.
+        Exact at any state dtype. The recurrence runs in fp32 and `h` narrows
+        it to the activation dtype, which is exact for a pool of that dtype.
+        A wider pool -- Qwen4Exp keeps its state in fp32 (`mamba_ssm_dtype`)
+        -- has the chunk kernel store each interior target's boundary
+        unnarrowed into a snapshot (`interior_state_snapshots`), so the
+        checkpoint is the value a forward ending there would store. FlyDSL
+        prefill, which takes no snapshots, steps aside for such a forward.
         """
         if not envs.ATOM_GDN_STATE_MIDSTEP:
             return StateTransfer.fork(1, readable_midstep=False)
@@ -1282,8 +1302,9 @@ class GDNStateMixin(PoolRowsMixin):
             "offs": mk(offs),
             "is_end": mk(is_end),
             "runtime": mk(runtime),
-            # Host-side, so the layer can pick `h`'s dtype without a sync.
+            # Host-side, so nothing downstream waits on the device for them.
             "interior": not all(is_end),
+            "interior_host": [not e for e in is_end],
         }
 
     def prepare_state_indices(self, batch: ScheduledBatch, with_spec: bool = False):

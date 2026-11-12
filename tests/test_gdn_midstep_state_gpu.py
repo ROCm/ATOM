@@ -99,16 +99,19 @@ def test_every_interior_boundary_matches_a_shortened_forward():
         ), f"boundary at token {j * CHUNK} differs from a forward ending there"
 
 
-def test_a_wider_h_holds_the_same_states_and_leaves_the_output_alone():
-    """fp32 `h` is the fp32 state; the output is bit-identical to bf16 `h`.
+def test_snapshots_hold_the_unnarrowed_state_and_leave_the_forward_alone():
+    """An fp32 pool's checkpoint is the fp32 state, not bf16 `h` widened.
 
-    `chunk_fwd_o` casts `h` to the input dtype before its dot, so widening the
-    snapshot for a checkpoint cannot move the forward's own output.
+    The snapshot at boundary `j` must equal, bit for bit, the fp32 final state
+    of a forward stopped there; asking for snapshots must not move `h` or the
+    output.
     """
     inp = _inputs()
     cu = torch.tensor([0, inp["q"].shape[1]], dtype=torch.int32, device=DEV)
+    snap_idx = torch.arange(-1, NUM_CHUNKS - 1, dtype=torch.int32, device=DEV)
+    h_snap = torch.empty(NUM_CHUNKS - 1, H, K, V, dtype=torch.float32, device=DEV)
     outs, hs = [], []
-    for h_dtype in (None, torch.float32):
+    for snapshots in (None, (snap_idx, h_snap)):
         o, _ = chunk_gated_delta_rule(
             **inp,
             initial_state=None,
@@ -117,16 +120,15 @@ def test_a_wider_h_holds_the_same_states_and_leaves_the_output_alone():
             head_first=False,
             use_qk_l2norm_in_kernel=True,
             keep_intermediate_states=True,
-            intermediate_state_dtype=h_dtype,
+            state_snapshots=snapshots,
         )
         outs.append(o)
         hs.append(pop_last_intermediate_states())
-    assert hs[1].dtype == torch.float32
     assert torch.equal(outs[0], outs[1])
-    assert torch.equal(hs[1].to(DTYPE), hs[0])
+    assert torch.equal(hs[0], hs[1])
     for j in range(1, NUM_CHUNKS):
         cut = _forward(inp, upto=j * CHUNK)
-        assert torch.equal(hs[1][:, j], cut.reshape(hs[1][:, j].shape))
+        assert torch.equal(h_snap[j - 1], cut.reshape(h_snap[j - 1].shape))
 
 
 def test_popping_consumes_the_reference():
@@ -183,7 +185,7 @@ def _cu(lens):
     return torch.tensor(out, dtype=torch.int32, device=DEV)
 
 
-def _run(inp, cu, init, keep=False, h_dtype=None):
+def _run(inp, cu, init, keep=False, snapshots=None):
     _, final = chunk_gated_delta_rule(
         q=inp["q"],
         k=inp["k"],
@@ -196,7 +198,7 @@ def _run(inp, cu, init, keep=False, h_dtype=None):
         head_first=False,
         use_qk_l2norm_in_kernel=True,
         keep_intermediate_states=keep,
-        intermediate_state_dtype=h_dtype,
+        state_snapshots=snapshots,
     )
     return final
 
@@ -210,26 +212,50 @@ def test_varlen_resumed_rows_match_a_forward_stopped_there(pool_dtype):
     frame `_checkpoint_targets` hands the kernel. The reference for each target
     is that row alone, from the same state, stopped there.
 
-    Run at both pool dtypes, with `h` kept at the pool's dtype as the layer
-    does: Qwen4Exp's state is fp32, and a bf16 `h` would round it.
+    Run at both pool dtypes, as the layer runs them: a bf16 pool reads `h`,
+    an fp32 one (Qwen4Exp) reads the chunk kernel's unnarrowed snapshots.
     """
     from atom.model_ops.fla_ops.index import prepare_chunk_offsets
-    from atom.model_ops.fla_ops.state_checkpoint import write_state_checkpoints
+    from atom.model_ops.fla_ops.state_checkpoint import (
+        interior_state_snapshots,
+        write_state_checkpoints,
+    )
 
     lens = [200, 77, 333]
     inp = _varlen(lens, seed=1)
     cu = _cu(lens)
+    chunk_offsets = prepare_chunk_offsets(cu, CHUNK)
     init = torch.randn(len(lens), H, K, V, dtype=pool_dtype, device=DEV) * 0.1
-    final = _run(inp, cu, init.clone(), keep=True, h_dtype=pool_dtype)
+
+    def ix(vals):
+        return torch.tensor(vals, dtype=torch.int32, device=DEV)
+
+    targets = []  # (row, off, is_end)
+    for r, n in enumerate(lens):
+        targets += [(r, off, 0) for off in range(CHUNK, n, CHUNK)]
+        targets.append((r, n, 1))
+    rows, offs = ix([r for r, _o, _e in targets]), ix([o for _r, o, _e in targets])
+    # As the layer does: a pool wider than `h` reads interior targets from
+    # snapshots, a pool of `h`'s dtype reads `h` itself.
+    snap = {}
+    snapshots = None
+    if pool_dtype != DTYPE:
+        snap_idx, h_rows, n_snaps = interior_state_snapshots(
+            rows,
+            offs,
+            [not e for _r, _o, e in targets],
+            chunk_offsets,
+            sum(lens) // CHUNK + len(lens) + 1,
+            CHUNK,
+        )
+        h_snap = torch.empty(n_snaps, H, K, V, dtype=pool_dtype, device=DEV)
+        snapshots, snap = (snap_idx, h_snap), {"h_rows": h_rows}
+    final = _run(inp, cu, init.clone(), keep=True, snapshots=snapshots)
     h = pop_last_intermediate_states()
     assert h is not None
 
     # Runtime slots 0..2 hold each row's final state, as the scatter after the
     # chunk kernel leaves them; checkpoint slots follow.
-    targets = []  # (row, off, is_end)
-    for r, n in enumerate(lens):
-        targets += [(r, off, 0) for off in range(CHUNK, n, CHUNK)]
-        targets.append((r, n, 1))
     pool = torch.zeros(
         len(lens) + len(targets), *final.shape[1:], dtype=pool_dtype, device=DEV
     )
@@ -238,24 +264,22 @@ def test_varlen_resumed_rows_match_a_forward_stopped_there(pool_dtype):
     x = torch.randn(sum(lens), D, dtype=DTYPE, device=DEV)
     conv = torch.zeros(pool.shape[0], D, 6, dtype=DTYPE, device=DEV)
 
-    def ix(vals):
-        return torch.tensor(vals, dtype=torch.int32, device=DEV)
-
     slots = list(range(len(lens), len(lens) + len(targets)))
     write_state_checkpoints(
-        h,
+        snapshots[1] if snapshots else h,
         pool,
         x,
         conv,
-        ix([r for r, _o, _e in targets]),
+        rows,
         ix(slots),
-        ix([o for _r, o, _e in targets]),
+        offs,
         ix([e for _r, _o, e in targets]),
-        ix([r for r, _o, _e in targets]),
-        prepare_chunk_offsets(cu, CHUNK),
+        rows,
+        chunk_offsets,
         cu,
         CHUNK,
         3,
+        **snap,
     )
 
     starts = cu.tolist()
