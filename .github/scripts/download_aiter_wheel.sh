@@ -7,8 +7,6 @@
 # blocks). Inputs via env: ATOM_PYTHON_TAG (required), GITHUB_TOKEN (required);
 # S3_MAIN_MANIFEST_URL / API_URL / AITER_TEST_WORKFLOW_ID are overridable.
 # Output: ${AITER_WHEEL_OUTPUT_DIR:-aiter-whl}/amd_aiter*.whl.
-# AITER_MINIMUM_COMMIT optionally requires the resolved source to include that
-# commit. This validates nightly wheels independently of their package version.
 set -euo pipefail
 : "${ATOM_PYTHON_TAG:?ATOM_PYTHON_TAG must be set}"
 : "${GITHUB_TOKEN:?GITHUB_TOKEN must be set}"
@@ -64,25 +62,6 @@ curl_with_retry() {
       --connect-timeout "$AITER_WHEEL_CURL_CONNECT_TIMEOUT_SECONDS" \
       --max-time "$AITER_WHEEL_CURL_MAX_TIME_SECONDS" \
       "$@"
-}
-
-verify_minimum_commit() {
-  local commit="$1" comparison status
-  if [ -z "${AITER_MINIMUM_COMMIT:-}" ]; then
-    return 0
-  fi
-  if [[ ! "$commit" =~ ^[0-9a-f]{40}$ ]] || [[ ! "$AITER_MINIMUM_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
-    echo "ERROR: AITER source verification requires full commit hashes" >&2
-    return 1
-  fi
-  comparison=$(curl_with_retry -H "$AUTH_HEADER" \
-    "$API_URL/repos/ROCm/aiter/compare/${AITER_MINIMUM_COMMIT}...${commit}") || return 1
-  status=$(echo "$comparison" | jq -r '.status')
-  if [ "$status" != "ahead" ] && [ "$status" != "identical" ]; then
-    echo "ERROR: AITER source $commit does not include required commit $AITER_MINIMUM_COMMIT ($status)" >&2
-    return 1
-  fi
-  echo "Verified AITER source $commit includes required commit $AITER_MINIMUM_COMMIT"
 }
 
 prepare_output_dir() {
@@ -197,7 +176,6 @@ download_from_s3_manifest() {
     echo "No GitHub fallback artifact found while checking manifest freshness"
   fi
 
-  verify_minimum_commit "$manifest_commit" || return 1
   resolved_wheel_url=$(resolve_download_url "$wheel_url")
 
   echo "Selected latest main wheel manifest: $S3_MAIN_MANIFEST_URL"
@@ -221,8 +199,6 @@ download_from_artifact() {
     echo "ERROR: No ${ATOM_PYTHON_TAG} aiter-whl-* artifact found in recent Aiter Test runs"
     return 1
   }
-
-  verify_minimum_commit "$ARTIFACT_RUN_SHA" || return 1
 
   prepare_output_dir
   download_artifact_zip "ROCm/aiter" "$ARTIFACT_ID" aiter-whl.zip

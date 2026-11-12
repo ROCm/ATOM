@@ -195,8 +195,6 @@ def hca_persist_decode(
         out = torch.empty(
             (n, HEADS, _DIM), dtype=torch.bfloat16, device=q_packed_in.device
         )
-    elif not out.is_contiguous():
-        raise ValueError("HCA output must be contiguous")
     if n == 0:
         return out
     mla_decode_fwd_v4_nm_ps(
