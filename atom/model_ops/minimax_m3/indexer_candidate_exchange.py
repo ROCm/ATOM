@@ -450,7 +450,6 @@ def _select_exchange_merge(
     Peers,
     SendCalls,
     RecvCalls,
-    Timeouts,
     Indices,
     Table,
     SparseBt,
@@ -472,7 +471,6 @@ def _select_exchange_merge(
     SBT_STRIDE: tl.constexpr,
     PAGES_PER_BLOCK: tl.constexpr,
     BLOCK_PAGE_STRIDE: tl.constexpr,
-    MAX_POLLS: tl.constexpr,
 ):
     """_local_topk, the exchange and _merge_topk in one launch.
 
@@ -528,15 +526,13 @@ def _select_exchange_merge(
         real = off < WORLD * TOPK
         empty = tag << _TAG_SHIFT
         late = 1
-        polls = 0
-        while (late > 0) & (polls < MAX_POLLS):
+        # Match the collective this replaces: a delayed peer may stall the
+        # group, but must never turn stale mailbox words into a wrong top-k.
+        while late > 0:
             seen = tl.load(
                 src, mask=real, other=empty, cache_modifier=".cv", volatile=True
             )
             late = tl.sum((((seen >> _TAG_SHIFT) & 0x7FFF) != tag).to(tl.int32), axis=0)
-            polls += 1
-        if late > 0:  # the merge below reads stale keys; counted, not raised
-            tl.atomic_add(Timeouts, 1)
         tl.debug_barrier()
         tl.store(counter, call)
         # The poll checked one copy of each key; the waves holding the others
@@ -612,7 +608,6 @@ def select_exchanged_candidates(
             mailbox.peers,
             mailbox.send_calls,
             mailbox.recv_calls,
-            mailbox.timeouts,
             indices,
             block_table,
             output[0],
@@ -634,7 +629,6 @@ def select_exchanged_candidates(
             SBT_STRIDE=output[0].stride(0),
             PAGES_PER_BLOCK=pages_per_block,
             BLOCK_PAGE_STRIDE=block_page_stride,
-            MAX_POLLS=mailbox.MAX_POLLS,
             num_warps=DECODE_TOPK_NUM_WARPS,
         )
     return indices, *output
