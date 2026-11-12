@@ -1592,6 +1592,8 @@ class CoreManager:
                 "queued_prefill_tokens_per_rank": list(self._rank_tokens),
                 "session_count_per_rank": sessions_per_rank,
             }
+            if self._prefix_router is not None:
+                snapshot["prefix_index"] = self._prefix_router.index_counters()
             if PREFIX_OWNER in self._dp_route_counters:
                 snapshot["prefix_route"] = {
                     label: self._dp_route_counters[name]
