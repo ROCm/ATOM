@@ -8,7 +8,10 @@ from aiter_stub import stubbed_aiter
 from conftest import MockConfig
 
 from atom.kv_transfer.disaggregation.chunked_prefill import PrefillHandoff
-from atom.kv_transfer.disaggregation.pd_admission import PdAdmissionController
+from atom.kv_transfer.disaggregation.pd_admission import (
+    PdAdmissionController,
+    ReceivePlan,
+)
 from atom.kv_transfer.disaggregation.types import KVConnectorOutput
 from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
 from atom.model_engine.sequence import SequenceStatus
@@ -518,10 +521,11 @@ def test_unsupported_layout_rejected(build, override):
 
 
 def test_physical_targets_are_deduplicated_and_release_is_idempotent():
-    policy = PdAdmissionController(4096, 1024)
-    a, b = SimpleNamespace(id=1), SimpleNamespace(id=2)
-    policy.admit(a, [1, 2])
-    policy.admit(b, [2, 3])
+    policy = PdAdmissionController(4096, 1024, connector=None, block_manager=None)
+    a = SimpleNamespace(id=1, block_table=[1, 2])
+    b = SimpleNamespace(id=2, block_table=[2, 3])
+    policy.commit(a, ReceivePlan(0, 2))
+    policy.commit(b, ReceivePlan(0, 2))
     assert policy.pending_bytes == 3072
     policy.release(a)
     policy.release(a)

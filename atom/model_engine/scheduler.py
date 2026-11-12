@@ -894,7 +894,9 @@ class Scheduler:
         from atom.utils.forward_context import get_kvconnector
 
         self.kv_connector = get_kvconnector("scheduler", config)
-        self.pd_admission = PdAdmissionController.from_config(config, self.kv_connector)
+        self.pd_admission = PdAdmissionController.from_config(
+            config, self.kv_connector, self.block_manager
+        )
         bind_block_manager = getattr(self.kv_connector, "bind_block_manager", None)
         if callable(bind_block_manager):
             bind_block_manager(self.block_manager)
@@ -2521,15 +2523,10 @@ class Scheduler:
                 break
             # Before `record_allocation`, which commits the probe's joint
             # boundary: a request deferred here must leave nothing committed.
-            pd_offset = None
+            pd_plan = None
             if self.pd_admission is not None and needs_remote_load:
-                num_blocks = self.block_manager.num_pool_blocks(len(seq))
-                pd_offset = self.kv_connector.pd_receive_block_offset(
-                    seq, num_blocks, num_cached_blocks
-                )
-                if pd_offset is not None and not self.pd_admission.can_admit(
-                    seq, num_blocks - pd_offset
-                ):
+                admitted, pd_plan = self.pd_admission.check(seq, hbm_probe)
+                if not admitted:
                     self.waiting.appendleft(seq)
                     break
 
@@ -2590,14 +2587,8 @@ class Scheduler:
                 seq.prefix_cache_hit_tokens = recorded
 
             self._lookup_detach_declined.discard(seq.id)
-            if pd_offset is not None:
-                # The credit is the footprint `can_admit` approved before
-                # `allocate`, which is exact only while `allocate` keeps the
-                # probe's hit and block count. It does for the layouts
-                # `from_config` accepts; supporting per-request state (a joint
-                # boundary, a disowned prefix) has to re-measure the receive
-                # from `seq.block_table` here.
-                self.pd_admission.admit(seq, seq.block_table[pd_offset:num_blocks])
+            if pd_plan is not None:
+                self.pd_admission.commit(seq, pd_plan)
             self._notify_connector_after_prefill_alloc(seq)
 
             # A replay that loads its KV first parks for that load whatever the

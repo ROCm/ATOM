@@ -21,11 +21,19 @@ class PendingReceive:
     cancelled: bool = False
 
 
+@dataclass(frozen=True)
+class ReceivePlan:
+    """The destination range a PD receive writes: `block_table[offset:num_blocks]`."""
+
+    offset: int
+    num_blocks: int
+
+
 class PdAdmissionController:
     """Credits never free KV or decide whether a remote writer is safe."""
 
     @classmethod
-    def from_config(cls, config, connector):
+    def from_config(cls, config, connector, block_manager):
         options = (getattr(config, "kv_transfer_config", None) or {}).get(
             "pd_admission", {}
         )
@@ -81,11 +89,15 @@ class PdAdmissionController:
             byte_limit = max(1, int(config.num_kvcache_blocks * block_bytes * fraction))
         if byte_limit is None:
             raise ValueError("pd_admission requires a receive-byte limit")
-        return cls(byte_limit, block_bytes)
+        return cls(byte_limit, block_bytes, connector, block_manager)
 
-    def __init__(self, max_bytes, block_bytes):
+    def __init__(self, max_bytes, block_bytes, connector, block_manager):
         self.max_bytes = max_bytes
         self.block_bytes = block_bytes
+        # The receive range is the connector's prefix-skip rule over the
+        # allocator's destination table; neither is the scheduler's to know.
+        self._connector = connector
+        self._block_manager = block_manager
         self.pending: dict[str, PendingReceive] = {}
         self._block_refs: dict[int, int] = {}
         logger.info(
@@ -99,20 +111,55 @@ class PdAdmissionController:
     def pending_bytes(self):
         return len(self._block_refs) * self.block_bytes
 
-    def can_admit(self, seq, receive_blocks: int) -> bool:
+    def check(self, seq, probe) -> tuple[bool, ReceivePlan | None]:
+        """Whether `seq` may allocate now, and the range a later `commit` charges.
+
+        Takes no credit and publishes nothing, so a caller that does not reach
+        `commit` (allocation or detach declined) just drops the result. The
+        plan is `None` when this is not a PD receive.
+        """
+        num_blocks = self._block_manager.num_pool_blocks(len(seq))
+        offset = self._connector.pd_receive_block_offset(
+            seq, num_blocks, probe.num_cached_blocks
+        )
+        if offset is None:
+            return True, None
+        plan = ReceivePlan(offset, num_blocks)
         # With no pending receive, allow a single request past the soft
         # limit. The normal allocator still enforces the hard capacity and
         # lookahead checks.
+        if not self.pending:
+            return True, plan
+        receive_blocks = num_blocks - offset - self._charged_hits(probe, offset)
         return (
-            not self.pending
-            or self.pending_bytes + receive_blocks * self.block_bytes <= self.max_bytes
+            self.pending_bytes + receive_blocks * self.block_bytes <= self.max_bytes,
+            plan,
         )
 
-    def admit(self, seq, block_ids):
+    def _charged_hits(self, probe, offset: int) -> int:
+        """Prefix hits inside the receive range that pending credits already hold.
+
+        Only a full transfer over a local hit (no usable page geometry) writes
+        into hit blocks; fresh and cached-but-free blocks hold no credit.
+        """
+        lookup = self._block_manager.kv.lookup
+        return sum(
+            lookup(h) in self._block_refs
+            for h in probe.block_hashes[offset : probe.num_cached_blocks]
+        )
+
+    def commit(self, seq, plan: ReceivePlan) -> None:
+        """Charge the range `check` approved, before the receive is published.
+
+        That range is exact only while `allocate` keeps the probe's hit and
+        block count. It does for the layouts `from_config` accepts; supporting
+        per-request state (a joint boundary, a disowned prefix) has to
+        re-measure the receive from `seq.block_table` here.
+        """
         key = str(seq.id)
         if key in self.pending:
             raise RuntimeError(f"Duplicate PD admission for sequence {key}")
-        blocks = frozenset(block_ids)
+        blocks = frozenset(seq.block_table[plan.offset : plan.num_blocks])
         self.pending[key] = PendingReceive(seq, blocks)
         for block in blocks:
             self._block_refs[block] = self._block_refs.get(block, 0) + 1
@@ -128,6 +175,9 @@ class PdAdmissionController:
             entry.cancelled = True
 
     def scheduled(self, sequences):
+        # Runs on every batch, and most batches decode with nothing pending.
+        if not self.pending:
+            return
         for seq in sequences:
             entry = self.pending.get(str(seq.id))
             if entry is None:
@@ -135,6 +185,8 @@ class PdAdmissionController:
             if not entry.ready or entry.cancelled:
                 raise RuntimeError(f"Scheduled unfinished PD receive {seq.id}")
             self.release(seq)
+            if not self.pending:
+                return
 
     def release(self, seq):
         key = str(seq.id)

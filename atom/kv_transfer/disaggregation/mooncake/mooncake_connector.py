@@ -526,8 +526,9 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         if self.is_producer or not params.get("do_remote_prefill"):
             return None
         if seq.has_per_req_cache:
-            # Lifting this also needs `Scheduler` to re-measure the receive
-            # after `allocate` instead of charging the pre-allocation probe.
+            # Lifting this also needs `PdAdmissionController.commit` to
+            # re-measure the receive after `allocate` instead of charging the
+            # pre-allocation probe.
             raise ValueError("PD admission supports paged KV receives only")
         cached, factor = self._receive_prefix(
             seq, num_cached_blocks, self._remote_page_geometry(params)

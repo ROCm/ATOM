@@ -1389,7 +1389,7 @@ def test_opposite_admission_order_progresses_without_recompute(
     p.kv_connector = scheduler_connector(monkeypatch, True)
     d.kv_connector = scheduler_connector(monkeypatch, False)
     if byte_limit:
-        d.pd_admission = PdAdmissionController(12, 4)
+        d.pd_admission = PdAdmissionController(12, 4, d.kv_connector, d.block_manager)
     pa, pb = [pd_sequence(seq_factory, name) for name in ("xfer-a", "xfer-b")]
     da, db = [pd_sequence(seq_factory, name, False) for name in ("xfer-a", "xfer-b")]
     p.extend([pa, pb])
@@ -2025,7 +2025,7 @@ def test_ready_but_capacity_blocked_timeout_preserves_decode_write_safety(
     )
     d.kv_connector = scheduler_connector(monkeypatch, False)
     if admission:
-        d.pd_admission = PdAdmissionController(12, 4)
+        d.pd_admission = PdAdmissionController(12, 4, d.kv_connector, d.block_manager)
     occupied = seq_factory(list(range(10)))
     assert p.block_manager.allocate(occupied)
     ps = [pd_sequence(seq_factory, f"wait-{i}") for i in range(3)]
