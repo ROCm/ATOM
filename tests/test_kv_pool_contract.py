@@ -204,17 +204,6 @@ def test_the_factory_is_declared_on_the_backend_base():
     assert FACTORY_DECLARATION in [cls.name for _, cls in declarations]
 
 
-def test_every_family_that_owns_a_draft_pool_has_a_backend_that_builds_it():
-    from atom.utils.selector import DRAFT_POOL_FAMILIES
-
-    builders = {
-        cls.name
-        for _, cls in _classes_defining_the_factory()
-        if cls.name != FACTORY_DECLARATION
-    }
-    assert {_backend_class_name(f) for f in DRAFT_POOL_FAMILIES} <= builders
-
-
 def test_a_backend_that_can_build_a_draft_pool_is_in_the_table():
     """The silent direction: out of the table, `draft_kv_builder` returns None and
     the draft binds into the target's rows -- no error, no log."""

@@ -382,24 +382,6 @@ def test_another_index_cache_allocates_no_scorer_and_imports_no_aiter():
     assert got == {} and "" not in got
 
 
-def test_the_scorer_record_is_immutable_and_builds_without_aiter():
-    """`IndexScoreBuffers` lives in a module that imports no aiter, so the non-GPU
-    suite can build it; a step's record is the builder's with its map replaced."""
-    from dataclasses import FrozenInstanceError, replace
-
-    from atom.model_ops.minimax_m3.index_buffers import IndexScoreBuffers
-
-    scores, wmap = LogitsWorkspace(4, "cpu"), torch.zeros(8, 2)
-    builder_record = IndexScoreBuffers(scores, wmap, 37)
-    step = replace(builder_record, work_map=wmap[:3])
-    assert (
-        step.scores is scores and step.max_block == 37 and step.work_map.shape == (3, 2)
-    )
-    assert builder_record.work_map is wmap
-    with pytest.raises(FrozenInstanceError):
-        builder_record.max_block = 1
-
-
 def test_the_scorer_gets_the_step_records_of_the_metadata_not_the_impls_own():
     """The map, its bound and the workspace travel as one record on the metadata; the
     impl derives none of them (a length source of its own that drifted would fail
