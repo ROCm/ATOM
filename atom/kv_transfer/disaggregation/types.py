@@ -12,7 +12,7 @@ KV output aggregator.
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -251,19 +251,61 @@ class KVTransferRegion:
 
 @dataclass(frozen=True)
 class PageUnitSpec:
-    """A PAGE unit's identity and byte interpretation, independent of TP.
+    """A PAGE unit's identity, `(namespace, field, layer)`, and its format.
 
-    Backends supply these fields directly, before formatting display names.
-    The per-rank head count lives in ``PageRegion.head_major_runs``; all fields
-    here must agree even when a transfer cuts heads.
+    The same on every TP size and PP stage; heads per rank are `head_major_runs`.
     """
 
     namespace: str
     field: str
-    row: int
-    head_dim: int
+    # The owning module's `layer_num`, so a PP stage names a unit as the
+    # unsplit model does.
+    layer: int
+    # Elements per token, per head where the unit is per head.
+    dim: int
     dtype: str
-    layout: str
+
+
+def pair_units(
+    local: Sequence[PageUnitSpec],
+    consumer: Sequence[PageUnitSpec],
+    first_layer: int = 0,
+    end_layer: int | None = None,
+) -> list[int]:
+    """The consumer region each local unit lands in, matched by identity.
+
+    Every consumer unit of layers `[first_layer, end_layer)` must be matched.
+    """
+    index: dict[tuple[str, str, int], int] = {}
+    for i, spec in enumerate(consumer):
+        key = (spec.namespace, spec.field, spec.layer)
+        if key in index:
+            raise ValueError(f"consumer publishes {key} twice")
+        index[key] = i
+    cmap = []
+    for spec in local:
+        i = index.get((spec.namespace, spec.field, spec.layer))
+        if i is None:
+            raise ValueError(f"consumer has no unit for {spec}")
+        if consumer[i] != spec:
+            raise ValueError(
+                f"unit format mismatch: ours {spec}, consumer's {consumer[i]}"
+            )
+        cmap.append(i)
+    if len(set(cmap)) != len(cmap):
+        raise ValueError("two local units share one identity")
+    owned = {
+        i
+        for i, spec in enumerate(consumer)
+        if spec.layer >= first_layer and (end_layer is None or spec.layer < end_layer)
+    }
+    missing = sorted(owned.difference(cmap))
+    if missing:
+        raise ValueError(
+            f"{len(missing)} consumer unit(s) of layers [{first_layer}, "
+            f"{end_layer}) are not held here, e.g. {consumer[missing[0]]}"
+        )
+    return cmap
 
 
 @dataclass(frozen=True)
@@ -318,10 +360,7 @@ class KVTransferTensors:
     num_slots: int = 0
     # Optional producer-local -> consumer-global mapping for non-uniform block
     # region layouts. Uniform per-layer groups leave this unset and use the
-    # connector's existing group-major inference. A negative index counts from
-    # the consumer's end: regions appended after the mapped ones (a draft's,
-    # `merge_pages`) are the consumer's last too, and only the handshake knows
-    # its total.
+    # connector's existing group-major inference.
     block_region_consumer_indices: list[int] | None = None
     # Legacy field name: full per-request SLOT regions keyed by pool group.
     # `unit_bytes` includes compressor state and SWA, not just one ring.
@@ -399,16 +438,6 @@ class KVTransferTensors:
         """
         if not other.pages:
             return
-        if other.block_region_consumer_indices is not None:
-            raise ValueError("Only the first PAGE contributor may map its regions")
-        if self.block_region_consumer_indices is not None:
-            # Appended regions are the consumer's last, so they are numbered
-            # from its end; regions appended earlier move one block further in.
-            n = len(other.pages)
-            self.block_region_consumer_indices = [
-                *(i - n if i < 0 else i for i in self.block_region_consumer_indices),
-                *range(-n, 0),
-            ]
         self.pages.extend(other.pages)
         self.tp_replication_factor = math.gcd(
             self.tp_replication_factor, other.tp_replication_factor

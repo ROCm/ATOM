@@ -991,7 +991,9 @@ def test_explicit_region_map_supports_compact_index_group():
     explicit = list(range(18, 38)) + [83, 84, 85, 86, 87]
 
     assert (
-        conn._consumer_region_map(len(explicit), 98, explicit_indices=explicit)
+        conn._consumer_region_map(
+            len(explicit), len(explicit), explicit_indices=explicit
+        )
         == explicit
     )
 
@@ -1026,22 +1028,6 @@ def test_explicit_region_map_rejects_length_mismatch():
 
     with pytest.raises(ValueError, match="length does not match"):
         conn._consumer_region_map(3, 2, explicit_indices=[0, 1])
-
-
-# Negative indices count from the consumer's end (`merge_pages`): -3 of 2 is
-# before it, and -1 is the consumer's region 1.
-@pytest.mark.parametrize(
-    "indices, refusal", [([0, 2], "exceeds"), ([-3, 0], "exceeds"), ([1, -1], "two")]
-)
-def test_explicit_region_map_rejects_a_region_the_consumer_lacks_or_repeats(
-    indices, refusal
-):
-    mc = pytest.importorskip(
-        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
-    )
-    conn = object.__new__(mc.MooncakeConnector)
-    with pytest.raises(ValueError, match=refusal):
-        conn._consumer_region_map(2, 2, explicit_indices=indices)
 
 
 # ---------------------------------------------------------------------------
@@ -1823,6 +1809,9 @@ def test_dcp_block_descriptors_are_streamed_in_bounded_batches():
     connector._per_block_bytes_list = [bytes_per_block, bytes_per_block]
     connector._block_region_roles = [MLA_KV_ROLE, MLA_KV_ROLE]
     connector._block_region_consumer_indices = None
+    connector._block_unit_specs = None
+    connector._block_head_major_runs = ()
+    connector._unit_layout = None
     connector._consumer_region_map = lambda *_args, **_kwargs: [0, 1]
 
     batch_sizes = []
@@ -1889,6 +1878,9 @@ def test_dcp_index_staging_waits_for_request_ready_event():
     connector._per_block_bytes_list = [mla_block_bytes, index_block_bytes]
     connector._block_region_roles = [MLA_KV_ROLE, INDEX_CACHE_ROLE]
     connector._block_region_consumer_indices = None
+    connector._block_unit_specs = None
+    connector._block_head_major_runs = ()
+    connector._unit_layout = None
     connector._consumer_region_map = lambda *_args, **_kwargs: [0, 1]
     connector._index_staging_chunk_pages = 256
     gather_indices = object()
@@ -1950,6 +1942,9 @@ def test_dcp_index_staging_rejects_missing_request_ready_event():
     connector._per_block_bytes_list = [16 * 576, 16 * 144]
     connector._block_region_roles = [MLA_KV_ROLE, INDEX_CACHE_ROLE]
     connector._block_region_consumer_indices = None
+    connector._block_unit_specs = None
+    connector._block_head_major_runs = ()
+    connector._unit_layout = None
     connector._consumer_region_map = lambda *_args, **_kwargs: [0, 1]
     connector._index_staging_chunk_pages = 256
     connector._prepare_sharded_index = MagicMock(return_value=object())

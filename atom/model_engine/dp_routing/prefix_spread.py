@@ -17,7 +17,7 @@ from collections import OrderedDict
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
-from atom.model_engine.dp_route import (
+from atom.model_engine.dp_routing.route import (
     PREFIX_COLD,
     PREFIX_DECISIONS,
     PREFIX_MOVED,
@@ -99,7 +99,9 @@ class PrefixSpreadRouter:
     def reset(self) -> None:
         """Forget in-flight state. The index stays: it describes the ranks'
         prefix caches, which outlive a batch."""
-        affected = {edge for edge, _rank in self.pending}
+        # A dict, not a set: edges hash by address, and the order they are
+        # refreshed below decides which history `_trim_history` evicts first.
+        affected = dict.fromkeys(edge for edge, _rank in self.pending)
         for edge, rank in self.pending:
             holders = self.index.get(edge)
             if holders is not None:
@@ -133,7 +135,8 @@ class PrefixSpreadRouter:
         if entry is None:
             return
         rank, chain, ordinal = entry
-        for edge, _end in self._path(chain):
+        path = self._path(chain)
+        for edge, _end in path:
             producer = self.pending.get((edge, rank))
             if producer is None:
                 continue  # already-confirmed reuse did not rely on this edge
@@ -155,6 +158,10 @@ class PrefixSpreadRouter:
                 holders.pop(rank)
                 holders[rank] = None
                 self._refresh_evictable(edge)
+        # Deepest first: a merge drops only the edge it is called on.
+        for edge, _end in reversed(path):
+            if edge in self.index:
+                self._merge_into_child(edge)
         self._trim_history()
 
     def release(self, seq_id) -> dict:
@@ -192,7 +199,9 @@ class PrefixSpreadRouter:
           this is what lets the request reuse it from HBM.
         """
         chain = getattr(seq, "prompt_hash_chain", None)
-        hits, owner = self._rank_hits(chain, len(rank_tokens))
+        # One read-only walk serves every lookup below; only `_record` walks again.
+        path = self._path(chain)
+        hits, owner = self._rank_hits(len(rank_tokens), path)
         if owner is None:
             rank = lightest()
             self._record(chain, rank, seq.id, 0)
@@ -207,9 +216,13 @@ class PrefixSpreadRouter:
             if target is not None:
                 rank = target
 
-        est_hit, loaded = self._credit(seq, rank, hits, owner)
+        est_hit, loaded = self._credit(seq, rank, hits, owner, path)
         self._record(
-            chain, rank, seq.id, est_hit, self._independent_hit(seq, rank, est_hit)
+            chain,
+            rank,
+            seq.id,
+            est_hit,
+            self._independent_hit(seq, rank, est_hit, path),
         )
         if rank == owner:
             return Route(rank, PREFIX_OWNER, est_hit)
@@ -220,22 +233,27 @@ class PrefixSpreadRouter:
         chain = getattr(seq, "prompt_hash_chain", None)
         if chain is None or not 0 <= rank < n_ranks:
             return Route(rank, "explicit_total")
-        hits, owner = self._rank_hits(chain, n_ranks)
-        credit, loaded = self._credit(seq, rank, hits, owner)
+        path = self._path(chain)
+        hits, owner = self._rank_hits(n_ranks, path)
+        credit, loaded = self._credit(seq, rank, hits, owner, path)
         self._record(
-            chain, rank, seq.id, credit, self._independent_hit(seq, rank, credit)
+            chain,
+            rank,
+            seq.id,
+            credit,
+            self._independent_hit(seq, rank, credit, path),
         )
         return Route(rank, "explicit_total", credit, loaded)
 
-    def _credit(self, seq, rank, hits, owner):
+    def _credit(self, seq, rank, hits, owner, path):
         local = hits.get(rank, 0)
-        if rank == owner:
+        if rank == owner or not self.tier.loads:
             return local, 0
-        in_tier = self._tier_hit(seq.prompt_hash_chain)
+        in_tier = self._tier_hit(path)
         loaded = self.tier.loadable_tokens(local, in_tier, seq.num_prompt_tokens)
         return local + loaded, loaded
 
-    def _independent_hit(self, seq, rank, credit):
+    def _independent_hit(self, seq, rank, credit, path):
         """Credit available without waiting for a same-rank producer.
 
         Keep the placement-time confirmed local prefix and load policy: an
@@ -243,7 +261,7 @@ class PrefixSpreadRouter:
         aborts. Unfinished tier copies and sub-threshold loads supply no floor.
         """
         local = 0
-        for edge, hit in reversed(self._path(seq.prompt_hash_chain)):
+        for edge, hit in reversed(path):
             holders = self.index[edge]
             if (
                 rank in holders
@@ -252,8 +270,10 @@ class PrefixSpreadRouter:
             ):
                 local = hit
                 break
+        if not self.tier.loads:
+            return min(credit, local)
         loaded = self.tier.loadable_tokens(
-            local, self._tier_hit(seq.prompt_hash_chain), seq.num_prompt_tokens
+            local, self._tier_hit(path), seq.num_prompt_tokens
         )
         return min(credit, local + loaded)
 
@@ -360,16 +380,41 @@ class PrefixSpreadRouter:
             self._produced.setdefault(producer, set()).add(prefix)
         return prefix
 
-    def _tier_hit(self, chain) -> int:
+    def _merge_into_child(self, edge):
+        """Undo a `_split` once nothing tells the two halves apart: `edge` has one
+        child and both are held by the same ranks in the same recency order with
+        no provisional producer. Every lookup answers alike on either side of the
+        seam, so the child takes over `edge`'s hashes and place in the tree.
+        Without this a session whose prompt grows each turn adds one edge per turn
+        and every walk of its chain gets longer.
+        """
+        if len(edge.children) != 1:
+            return
+        (child,) = edge.children.values()
+        holders = self.index[edge]
+        if list(holders.items()) != list(self.index[child].items()) or any(
+            (e, rank) in self.pending for e in (edge, child) for rank in holders
+        ):
+            return
+        siblings = (
+            self._roots[edge.domain] if edge.parent is None else edge.parent.children
+        )
+        child.hashes = edge.hashes + child.hashes
+        child.start = edge.start
+        child.parent = edge.parent
+        siblings[child.hashes[0]] = child
+        del self.index[edge]
+
+    def _tier_hit(self, path) -> int:
         """Longest matching prefix with a finished holder on any rank."""
-        for edge, hit in reversed(self._path(chain)):
+        for edge, hit in reversed(path):
             if any(
                 seq_id not in self._in_flight for seq_id in self.index[edge].values()
             ):
                 return hit
         return 0
 
-    def _rank_hits(self, chain, n: int):
+    def _rank_hits(self, n: int, path):
         """Longest prefix per rank; equal-length owners use last-recorded order.
 
         Other ranks' unfinished producers do not supply a local hit. Seed and
@@ -377,7 +422,7 @@ class PrefixSpreadRouter:
         """
         hits = {}
         owner = None
-        for edge, hit in reversed(self._path(chain)):
+        for edge, hit in reversed(path):
             holders = self.index[edge]
             for rank, seq_id in reversed(holders.items()):
                 if not 0 <= rank < n or rank in hits:
@@ -504,9 +549,23 @@ class PrefixSpreadRouter:
             return
         # The budget covers unique edges, not replicated rank holders. Pinned
         # active edges may exceed it; releasing them makes them evictable.
+        # A small overage shortens the oldest leaf from its tail (its head still
+        # names the owner rank) and the leaf then queues behind the others, so
+        # repeated small overages spread over many histories. An overage beyond
+        # an eighth of the leaf (at least one block), or one that covers the whole
+        # leaf, drops it whole, as before: each pass of this loop then removes a
+        # whole leaf, so one placement never takes more passes than whole-leaf
+        # eviction did. Either way it is only approximately LRU: a recently used
+        # leaf can lose a tail share while an older one is still held.
         while self.indexed_tokens > self.CAP and self._evictable:
             edge = next(iter(self._evictable))
-            self._drop_edge(edge)
+            excess = -(-(self.indexed_tokens - self.CAP) // edge.hbs)
+            if excess < len(edge.hashes) and excess <= max(1, len(edge.hashes) // 8):
+                del edge.hashes[-excess:]
+                self.indexed_tokens -= excess * edge.hbs
+                self._refresh_evictable(edge)  # next victim: another history
+            else:
+                self._drop_edge(edge)
 
     def _left_unprefilled(self, seq_id) -> dict:
         """Transfer an unfinished producer's intervals and credit debt once."""

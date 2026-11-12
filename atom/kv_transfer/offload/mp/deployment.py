@@ -16,7 +16,7 @@ from dataclasses import replace
 from typing import Any
 
 from atom.kv_transfer.offload import config as offcfg
-from atom.model_engine.dp_routing import prefix_spread_enabled
+from atom.model_engine.dp_routing.topology import prefix_spread_enabled
 from atom.utils import envs
 
 logger = logging.getLogger("atom")

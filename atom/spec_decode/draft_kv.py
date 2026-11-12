@@ -1,8 +1,6 @@
 import logging
 from functools import partial
 
-import torch
-
 from atom.config import KVCacheTensor
 from atom.model_ops.attentions.pool_layout.pool_rows import PoolRowsMixin
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import SubPoolSpec, page_pool
@@ -190,46 +188,14 @@ class DraftKvBuilder(PoolRowsMixin):
         )
 
     def get_kv_transfer_tensors(self):
-        from atom.kv_transfer.disaggregation.page_region import page_region
-        from atom.kv_transfer.disaggregation.types import (
-            KVTransferTensors,
-            PageUnitSpec,
-        )
+        from atom.kv_transfer.disaggregation.types import KVTransferTensors
 
-        pool = self.kv_pool
-        cache_fields = {f.name for f in pool.cache_fields}
-        # Every field is per head, head-major in each page. A layer reading and
-        # writing its cache through smaller SHUFFLE pages than the pool's
-        # (M3.1's DSpark draft: page-16) keeps a block as that many runs.
-        page_tokens = {
-            row: getattr(module, "shuffle_page_tokens", pool.block_size)
-            for module, row in self.pool_rows[DRAFT_KV_ROWS].items()
-        }
+        pool, rows = self.kv_pool, self.pool_rows[DRAFT_KV_ROWS]
+        modules = sorted(rows, key=rows.get)
         return KVTransferTensors(
-            # The draft's rows sit in the same block ids as the target's, so
-            # its regions need a name that says which stack they are.
-            pages=[
-                page_region(
-                    t,
-                    semantic_role=f"draft.{field}.layer_{row}",
-                    head_major_runs=(
-                        pool.block_size // page_tokens[row],
-                        pool.num_kv_heads,
-                    ),
-                    # As the MHA backend describes its own KV and scale units.
-                    unit_spec=PageUnitSpec(
-                        namespace="draft",
-                        field=field,
-                        row=row,
-                        head_dim=pool.head_dim,
-                        dtype=str(
-                            pool.kv_dtype if field in cache_fields else torch.float32
-                        ),
-                        layout="mha_shuffle" if field in cache_fields else "head_token",
-                    ),
-                )
-                for field, row, t in pool.field_regions()
-            ],
+            # Described by its pool like the target's, under a namespace of its
+            # own: its rows sit in the same block ids.
+            pages=pool.transfer_pages("draft", "draft", [m.layer_num for m in modules]),
             # A paged MHA/GQA draft is a per-rank shard. Appending it to an
             # otherwise replicated target must disable whole-object collapse.
             tp_replication_factor=1,
