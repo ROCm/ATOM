@@ -256,6 +256,7 @@ def build_post_attn_kernel(
     the activations are quantized per 32 elements (E8M0 ceil-pow2) instead of per token.
     """
     assert not index_nvfp4 or fuse_k1, "the index cache is read by K1's scores"
+    moe_a16w4 = moe_a16w4 and not moe_a4w4  # a4w4 wins, a16w4 is compiled out
     assert not (
         moe_a16w4 and shared_mxfp8 and tokens < WIDE_FROM and (xn_flag or mid_flag)
     ), (
@@ -264,9 +265,8 @@ def build_post_attn_kernel(
     assert 1 <= tokens <= MAX_TOKENS
     assert not moe_a4w4 or shared_mxfp8, "the a4w4 experts need the unfused MXFP8 shared expert"
     assert not (
-        moe_a4w4 and tokens < WIDE_FROM and (xn_flag or mid_flag)
-    ), "the narrow moe_a4w4 publishes its MXFP4 xn as tagged words: xn_flag = mid_flag = 0"
-    moe_a16w4 = moe_a16w4 and not moe_a4w4
+        moe_a4w4 and tokens < WIDE_FROM and xn_flag
+    ), "the narrow moe_a4w4 publishes its MXFP4 xn as tagged words: xn_flag = 0 (mid_flag 0 / 1 / 2 as for a8w4)"
     key = K4Build(
         npes=npes, tokens=tokens, init_blocks=init_blocks, local_blocks=local_blocks,
         index_heads=heads.count, index_own=heads.own, timeline=timeline,

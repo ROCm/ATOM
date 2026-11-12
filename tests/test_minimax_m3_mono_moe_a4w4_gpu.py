@@ -295,11 +295,12 @@ if __name__ == "__main__":
     ap.add_argument("--S", default="1,2,3,4,5,8,12,16")
     ap.add_argument("--acts", default="a4w4")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--mid-flag", type=int, default=0)
     a = ap.parse_args()
     print("S act | rel L2 vs own oracle median / max | identical | router match | max rel vs oracle a4w4 a16w4 a8w4 | mean rel vs a16w4")
     for s in [int(x) for x in a.S.split(",")]:
         for act in a.acts.split(","):
-            got, want, d = run_case(s, act, seed=a.seed)
+            got, want, d = run_case(s, act, seed=a.seed, mid_flag=a.mid_flag)
             r = d["rel"]
             rv = d["rel_vs"]
             print(
