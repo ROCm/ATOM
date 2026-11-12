@@ -157,7 +157,8 @@ def write_state_checkpoints(
     the wrong bytes, which nothing downstream can detect.
 
     ``h_rows`` names, per target, the row of ``h`` an interior target reads;
-    pass it with the ``h_snap`` of `interior_state_snapshots` as ``h``. Without
+    pass it with the ``h_snap`` of
+    `atom.model_ops.gdn_midstep_snapshots.interior_state_snapshots` as ``h``. Without
     it the row is the chunk boundary, ``chunk_offsets[row] + off // chunk``.
     """
     n = rows.numel()
@@ -198,32 +199,3 @@ def write_state_checkpoints(
         STATE_VK=ssm_state.stride(-2) == 1,
         HAS_H_ROWS=h_rows is not None,
     )
-
-
-def interior_state_snapshots(
-    rows: torch.Tensor,
-    offs: torch.Tensor,
-    interior: list[bool],
-    chunk_offsets: torch.Tensor,
-    num_chunks_bound: int,
-    chunk_size: int,
-) -> tuple[torch.Tensor, torch.Tensor, int]:
-    """Where the chunk kernel stores each interior target's unnarrowed state.
-
-    Returns ``snap_idx`` (``[num_chunks_bound]``: chunk boundary of the
-    flattened batch -> snapshot row, or -1), ``h_rows`` (per target: its
-    snapshot row, -1 for an end target) and the number of snapshots.
-    ``rows``/``offs`` are the device targets `write_state_checkpoints` takes and
-    ``interior`` their host-side flags, so nothing here waits on the device.
-    """
-    dev = rows.device
-    sel = [i for i, f in enumerate(interior) if f]
-    snap_rows = [-1] * len(interior)
-    for j, i in enumerate(sel):
-        snap_rows[i] = j
-    snap_idx = torch.full((num_chunks_bound,), -1, dtype=torch.int32, device=dev)
-    if sel:
-        pick = torch.tensor(sel, dtype=torch.long, device=dev)
-        chunk = chunk_offsets[rows[pick].long()] + offs[pick] // chunk_size
-        snap_idx[chunk.long()] = torch.arange(len(sel), dtype=torch.int32, device=dev)
-    return snap_idx, torch.tensor(snap_rows, dtype=torch.int32, device=dev), len(sel)

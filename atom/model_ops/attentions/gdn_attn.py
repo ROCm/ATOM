@@ -22,7 +22,7 @@ from atom.model_ops.fla_ops.replayssm import (
     replayssm_buffer_shapes,
     replayssm_commit,
 )
-from atom.model_ops.fla_ops.state_checkpoint import interior_state_snapshots
+from atom.model_ops.gdn_midstep_snapshots import interior_state_snapshots
 from atom.model_ops.mamba_ops.causal_conv1d import (
     PAD_SLOT_ID,
     compute_causal_conv1d_metadata,

@@ -216,10 +216,8 @@ def test_varlen_resumed_rows_match_a_forward_stopped_there(pool_dtype):
     an fp32 one (Qwen4Exp) reads the chunk kernel's unnarrowed snapshots.
     """
     from atom.model_ops.fla_ops.index import prepare_chunk_offsets
-    from atom.model_ops.fla_ops.state_checkpoint import (
-        interior_state_snapshots,
-        write_state_checkpoints,
-    )
+    from atom.model_ops.fla_ops.state_checkpoint import write_state_checkpoints
+    from atom.model_ops.gdn_midstep_snapshots import interior_state_snapshots
 
     lens = [200, 77, 333]
     inp = _varlen(lens, seed=1)
