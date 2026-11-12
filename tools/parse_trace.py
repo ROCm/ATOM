@@ -47,8 +47,7 @@ def model_name_from_trace(path: str) -> str | None:
     if "_ts_" not in base:
         return None
     prefix = base.split("_ts_", 1)[0]
-    if prefix.startswith("capture_graph_"):
-        prefix = prefix[len("capture_graph_") :]
+    prefix = prefix.removeprefix("capture_graph_")
     return prefix or None
 
 
@@ -364,23 +363,26 @@ def build_warmup_mapping(
         and start <= float(event.get("ts", 0.0)) < end
         and event.get("cat") in {"user_annotation", "cpu_op"}
     ]
-    gpu_annotations = [
-        event
-        for event in capture_events
-        if event.get("ph") == "X"
-        and start <= float(event.get("ts", 0.0)) < end
-        and event.get("cat") == "gpu_user_annotation"
-    ]
+    # The GPU runs the warmup behind the CPU, so its tail can start after the
+    # capture span opens: a kernel is the warmup's if it was launched in it.
     kernels = sorted(
         [
             event
             for event in capture_events
             if event.get("ph") == "X"
-            and start <= float(event.get("ts", 0.0)) < end
             and event.get("cat") == "kernel"
+            and (event.get("args") or {}).get("correlation") in launch_by_corr
         ],
         key=lambda event: event["ts"],
     )
+    gpu_end = max((event_end(event) for event in kernels), default=end)
+    gpu_annotations = [
+        event
+        for event in capture_events
+        if event.get("ph") == "X"
+        and start <= float(event.get("ts", 0.0)) < gpu_end
+        and event.get("cat") == "gpu_user_annotation"
+    ]
     mapping: list[dict[str, Any]] = []
     for kernel in kernels:
         args = kernel.get("args") or {}
@@ -397,7 +399,7 @@ def build_warmup_mapping(
 
 
 def print_first_warmup_mappings(mapping: list[dict[str, Any]], limit: int) -> None:
-    print("")
+    print()
     print(f"First {limit} warmup mappings:")
     print("| # | module/tag | stream | kernel |")
     print("|---:|---|---:|---|")
@@ -554,11 +556,13 @@ def consume_replay_stream_for_block(
     while pos < len(stream_events):
         replay = stream_events[pos]
         replay_kernel = str(replay.get("name", ""))
+        marker = substituted_warmup_kernel(replay_kernel)
         matched_pos = None
         for idx in range(template_pos, len(template)):
             if idx in used_template_positions:
                 continue
-            if template[idx][1]["kernel"] == replay_kernel:
+            kernel = template[idx][1]["kernel"]
+            if kernel == replay_kernel or (marker is not None and marker in kernel):
                 matched_pos = idx
                 break
         if matched_pos is None:
@@ -1146,7 +1150,7 @@ def main() -> None:
 
     print(f"Run trace: {args.run_trace}")
     print(f"Capture trace: {capture_trace}")
-    print("")
+    print()
     print("First decode:")
     print(f"  name: {decode.get('name')}")
     print(f"  ts: {decode.get('ts'):.3f}")
@@ -1161,7 +1165,7 @@ def main() -> None:
     print(f"  name: {graph.get('name')}")
     print(f"  ts: {graph.get('ts'):.3f}")
     print(f"  dur: {graph.get('dur'):.3f}")
-    print("")
+    print()
     print("Decode warmup window:")
     print(f"  start: {warmup_start:.3f}")
     print(f"  end: {warmup_end:.3f}")
@@ -1182,7 +1186,7 @@ def main() -> None:
         print_head=args.print_head,
     )
     unmatched = sum(1 for row in matched_rows if row["cpu_module"] == "<unmatched>")
-    print("")
+    print()
     print("Decode replay mapping:")
     print(f"  replay kernels: {len(replay_kernels)}")
     print(f"  unmatched kernels: {unmatched}")
