@@ -212,6 +212,10 @@ impl LoadBalancingPolicy for RecordingPolicy {
         self.inner.needs_tokens()
     }
 
+    fn needs_kv_events(&self) -> bool {
+        self.inner.needs_kv_events()
+    }
+
     fn on_request_complete(&self, worker_url: &str, success: bool) {
         self.inner.on_request_complete(worker_url, success);
     }
@@ -473,6 +477,7 @@ mod fixture_smoke_tests {
             tokens: Some(&[1, 2, 3]),
             headers: Some(&hm),
             hash_ring: None,
+            prefix: None,
         };
         let _ = policy.select_worker(&workers, &info).await;
         let calls = policy.calls();

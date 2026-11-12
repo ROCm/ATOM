@@ -278,7 +278,7 @@ mod b_policy_apply {
         let recorder = RecordingPolicy::wrap(Arc::new(RoundRobinPolicy::new()));
         let descriptor = make_descriptor(Some("m"), None, None, None);
 
-        let chosen = apply_policy(&candidates, &recorder, &descriptor, None)
+        let chosen = apply_policy(&candidates, &recorder, &descriptor, None, None)
             .await
             .unwrap();
         assert_eq!(recorder.call_count(), 1);
@@ -291,7 +291,7 @@ mod b_policy_apply {
         let recorder = RecordingPolicy::wrap(Arc::new(RandomPolicy::new()));
         let descriptor = make_descriptor(Some("m"), None, None, None);
 
-        let chosen = apply_policy(&candidates, &recorder, &descriptor, None)
+        let chosen = apply_policy(&candidates, &recorder, &descriptor, None, None)
             .await
             .unwrap();
         assert_eq!(recorder.call_count(), 1);
@@ -304,7 +304,7 @@ mod b_policy_apply {
         let recorder = RecordingPolicy::wrap(Arc::new(PowerOfTwoPolicy::new()));
         let descriptor = make_descriptor(Some("m"), None, None, None);
 
-        let chosen = apply_policy(&candidates, &recorder, &descriptor, None)
+        let chosen = apply_policy(&candidates, &recorder, &descriptor, None, None)
             .await
             .unwrap();
         assert_eq!(recorder.call_count(), 1);
@@ -317,7 +317,7 @@ mod b_policy_apply {
         let recorder = RecordingPolicy::wrap(Arc::new(CacheAwarePolicy::new()));
         let descriptor = make_descriptor(Some("m"), Some("hello world"), None, None);
 
-        let _ = apply_policy(&candidates, &recorder, &descriptor, None).await;
+        let _ = apply_policy(&candidates, &recorder, &descriptor, None, None).await;
         let calls = recorder.calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].request_text.as_deref(), Some("hello world"));
@@ -332,7 +332,7 @@ mod b_policy_apply {
         let tokens = [10u32, 20, 30];
         let descriptor = make_descriptor(Some("m"), None, Some(&tokens), None);
 
-        let _ = apply_policy(&candidates, &recorder, &descriptor, None).await;
+        let _ = apply_policy(&candidates, &recorder, &descriptor, None, None).await;
         let calls = recorder.calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].tokens.as_deref(), Some(&tokens[..]));
@@ -345,9 +345,15 @@ mod b_policy_apply {
         let recorder = RecordingPolicy::round_robin();
         let descriptor = make_descriptor(Some("m1"), None, None, None);
 
-        let _ = apply_policy(&candidates, &recorder, &descriptor, Some(ring.clone()))
-            .await
-            .unwrap();
+        let _ = apply_policy(
+            &candidates,
+            &recorder,
+            &descriptor,
+            Some(ring.clone()),
+            None,
+        )
+        .await
+        .unwrap();
         let calls = recorder.calls();
         assert_eq!(calls.len(), 1);
         let received = calls[0].hash_ring.as_ref().expect("hash_ring forwarded");
@@ -360,7 +366,7 @@ mod b_policy_apply {
         let recorder = RecordingPolicy::round_robin();
         let descriptor = make_descriptor(Some("m_no_ring"), None, None, None);
 
-        let chosen = apply_policy(&candidates, &recorder, &descriptor, None)
+        let chosen = apply_policy(&candidates, &recorder, &descriptor, None, None)
             .await
             .unwrap();
         let calls = recorder.calls();
@@ -375,7 +381,7 @@ mod b_policy_apply {
         let recorder = RecordingPolicy::round_robin();
         let descriptor = make_descriptor(Some("m"), Some("hello"), None, None);
 
-        let _ = apply_policy(&candidates, &recorder, &descriptor, None).await;
+        let _ = apply_policy(&candidates, &recorder, &descriptor, None, None).await;
         let calls = recorder.calls();
         assert_eq!(calls[0].request_text.as_deref(), Some("hello"));
     }
@@ -387,7 +393,7 @@ mod b_policy_apply {
         let tokens = [1u32, 2, 3];
         let descriptor = make_descriptor(Some("m"), None, Some(&tokens), None);
 
-        let _ = apply_policy(&candidates, &recorder, &descriptor, None).await;
+        let _ = apply_policy(&candidates, &recorder, &descriptor, None, None).await;
         let calls = recorder.calls();
         assert_eq!(calls[0].tokens.as_deref(), Some(&tokens[..]));
     }
@@ -400,7 +406,7 @@ mod b_policy_apply {
         hm.insert("x-trace", "abc".parse().unwrap());
         let descriptor = make_descriptor(Some("m"), None, None, Some(&hm));
 
-        let _ = apply_policy(&candidates, &recorder, &descriptor, None).await;
+        let _ = apply_policy(&candidates, &recorder, &descriptor, None, None).await;
         let calls = recorder.calls();
         let received = calls[0].headers.as_ref().expect("headers passed through");
         assert_eq!(received.get("x-trace"), Some(&"abc".parse().unwrap()));
@@ -411,7 +417,7 @@ mod b_policy_apply {
         let candidates = two_workers();
         let descriptor = make_descriptor(Some("m"), None, None, None);
 
-        let err = apply_policy(&candidates, &AlwaysNonePolicy, &descriptor, None)
+        let err = apply_policy(&candidates, &AlwaysNonePolicy, &descriptor, None, None)
             .await
             .unwrap_err();
         assert_eq!(err, PlacementError::PolicyReturnedNone);
@@ -423,7 +429,7 @@ mod b_policy_apply {
         let recorder = RecordingPolicy::round_robin();
         let descriptor = make_descriptor(Some("m"), None, None, None);
 
-        let err = apply_policy(&candidates, &recorder, &descriptor, None)
+        let err = apply_policy(&candidates, &recorder, &descriptor, None, None)
             .await
             .unwrap_err();
         assert_eq!(recorder.call_count(), 0);
@@ -459,7 +465,7 @@ mod b_policy_apply {
         let policy = RandomPolicy::new();
 
         for _ in 0..32 {
-            let chosen = apply_policy(&candidates, &policy, &descriptor, None)
+            let chosen = apply_policy(&candidates, &policy, &descriptor, None, None)
                 .await
                 .unwrap();
             assert!(candidate_urls.iter().any(|u| u == chosen.url()));
@@ -2218,7 +2224,7 @@ mod i_route_metrics {
 
         for name in POLICIES {
             let policy = PolicyFactory::create_by_name(name).unwrap();
-            apply_policy(&candidates, policy.as_ref(), &descriptor, None)
+            apply_policy(&candidates, policy.as_ref(), &descriptor, None, None)
                 .await
                 .unwrap();
         }
@@ -2253,7 +2259,7 @@ mod i_route_metrics {
 
         for name in POLICIES {
             let policy = PolicyFactory::create_by_name(name).unwrap();
-            let err = apply_policy(&candidates, policy.as_ref(), &descriptor, None)
+            let err = apply_policy(&candidates, policy.as_ref(), &descriptor, None, None)
                 .await
                 .unwrap_err();
             assert_eq!(err, PlacementError::PolicyReturnedNone, "{name}");

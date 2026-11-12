@@ -1,12 +1,24 @@
 use std::{
     collections::HashMap,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
+use async_trait::async_trait;
+use parking_lot::Mutex;
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
 use super::*;
-use crate::kv_events::{DropReason, EngineHash, Group, KvEvent, Namespace, StoredBlock, Tier};
+use crate::{
+    core::{
+        placement::{planner::DefaultPlanner, test_support::*, PdPlanner},
+        Worker,
+    },
+    kv_events::{
+        DropReason, EngineHash, Group, KvEvent, Namespace, PoolRole, StoredBlock, Tier, Trust,
+    },
+    policies::{LoadBalancingPolicy, RouteDecision, SelectWorkerInfo},
+};
 
 const TIERS: [Tier; 3] = [Tier::Device, Tier::Host, Tier::Disk];
 
@@ -396,4 +408,209 @@ fn bench_memory_1m_blocks() {
         stats.approx_bytes >> 20
     );
     assert!(after - before < 200 << 20);
+}
+
+fn workers(names: &[&str]) -> Vec<Arc<dyn Worker>> {
+    names
+        .iter()
+        .map(|name| make_regular_http(&format!("http://{name}:8000"), "m"))
+        .collect()
+}
+
+#[test]
+fn exact_sources_answer_alone_and_partial_ones_add_predictions() {
+    let provider = IndexProvider::new(Duration::from_secs(60), 4);
+    let workers = workers(&["a", "b", "c", "d"]);
+    let key = PartitionKey {
+        model_id: "m".into(),
+        pool: PoolRole::Regular,
+        block_size: 4,
+    };
+    let tokens: Vec<u32> = (0..16).collect();
+    for (worker, blocks, trust) in [(0, 2, Trust::Exact), (1, 1, Trust::Partial)] {
+        let url = workers[worker].url();
+        let (id, partition) = provider.holder(url, &key).unwrap();
+        provider.set_trust(url, &key, trust);
+        let event = stored(worker, &tokens, 0..blocks, 4, Tier::Device, true);
+        HolderTable::default()
+            .apply(&partition.index, id, &event)
+            .unwrap();
+    }
+    let req = PrefixRequest::new("m", &tokens, Namespace::default());
+    for worker in &workers[..3] {
+        provider.on_routed(worker.as_ref(), &req);
+    }
+    let summary = |provider: &IndexProvider| -> Vec<Option<(u32, HitSource, bool)>> {
+        let hits = provider.match_workers(&req, &workers);
+        hits.into_iter()
+            .map(|hit| hit.map(|hit| (hit.tokens[0], hit.source, hit.exact)))
+            .collect()
+    };
+    assert_eq!(
+        summary(&provider),
+        [
+            Some((8, HitSource::Events, true)),
+            Some((16, HitSource::Events, false)),
+            Some((16, HitSource::Predicted, false)),
+            None,
+        ]
+    );
+    let expired = IndexProvider::new(Duration::ZERO, 4);
+    expired.on_routed(workers[2].as_ref(), &req);
+    assert_eq!(summary(&expired)[2], None);
+    provider.remove_worker(workers[1].url());
+    assert_eq!(summary(&provider)[1], None);
+    // Routing to an exact source recorded no prediction.
+    provider.set_trust(workers[0].url(), &key, Trust::Partial);
+    assert_eq!(summary(&provider)[0], Some((8, HitSource::Events, false)));
+}
+
+#[derive(Debug, Default)]
+struct PrefixProbe {
+    kv_events: bool,
+    seen: Mutex<Vec<Option<usize>>>,
+}
+
+#[async_trait]
+impl LoadBalancingPolicy for PrefixProbe {
+    async fn select_with_decision(
+        &self,
+        _workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+    ) -> (Option<usize>, RouteDecision) {
+        let prefix = info
+            .prefix
+            .map(|prefix| prefix as *const PrefixRequest as usize);
+        self.seen.lock().push(prefix);
+        (Some(0), RouteDecision::branch("first"))
+    }
+
+    fn name(&self) -> &'static str {
+        "probe"
+    }
+
+    fn needs_kv_events(&self) -> bool {
+        self.kv_events
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+#[tokio::test]
+async fn prefill_and_decode_share_the_prefix_request() {
+    let probe = |kv_events| {
+        Arc::new(PrefixProbe {
+            kv_events,
+            ..PrefixProbe::default()
+        })
+    };
+    let (prefill, decode, regular) = (probe(true), probe(true), probe(false));
+    let pd = DefaultPlanner::new(
+        Arc::new(
+            MockWorkerSource::new()
+                .add_worker(make_prefill_http("http://p:8000", "m", None))
+                .add_worker(make_decode_http("http://d:8000", "m")),
+        ),
+        Arc::new(
+            MockPolicySource::new()
+                .with_prefill(prefill.clone())
+                .with_decode(decode.clone()),
+        ),
+    );
+    let tokens = [1, 2, 3, 4];
+    pd.plan(&make_descriptor(Some("m"), None, Some(&tokens), None))
+        .await
+        .unwrap();
+    pd.plan(&make_descriptor(Some("m"), None, None, None))
+        .await
+        .unwrap();
+    let (prefill, decode) = (prefill.seen.lock().clone(), decode.seen.lock().clone());
+    assert!(prefill[0].is_some());
+    assert_eq!(prefill, decode);
+    assert_eq!(prefill[1], None);
+    let single = DefaultPlanner::new(
+        Arc::new(MockWorkerSource::new().add_worker(make_regular_http("http://r:8000", "m"))),
+        Arc::new(MockPolicySource::new().with_regular(regular.clone())),
+    );
+    single
+        .plan(&make_descriptor(Some("m"), None, Some(&tokens), None))
+        .await
+        .unwrap();
+    assert_eq!(*regular.seen.lock(), [None]);
+}
+
+/// The query policies see: 16 partial workers, each holding (k+1)/16 of a 100k-token
+/// prefix by events and all of it by prediction, in one partition with 1M other entries.
+#[test]
+#[ignore]
+fn bench_match_workers_16_partial_workers() {
+    let provider = IndexProvider::new(Duration::from_secs(60), 16);
+    let names: Vec<String> = (0..16).map(|k| format!("w{k}")).collect();
+    let workers = workers(&names.iter().map(String::as_str).collect::<Vec<_>>());
+    let key = PartitionKey {
+        model_id: "m".into(),
+        pool: PoolRole::Regular,
+        block_size: 16,
+    };
+    let tokens: Vec<u32> = (0..100_000).map(|i| (i * 7919 % 150_000) as u32).collect();
+    let req = PrefixRequest::new("m", &tokens, Namespace::default());
+    let prefix = req.hashes(16);
+    let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+    for (k, worker) in workers.iter().enumerate() {
+        let (id, partition) = provider.holder(worker.url(), &key).unwrap();
+        let held = prefix[..prefix.len() * (k + 1) / 16].iter().copied();
+        let other = (0..62_500).map(|_| PrefixHash(rng.below(usize::MAX) as u64));
+        let ops: Vec<IndexOp> = held
+            .chain(other)
+            .map(|hash| IndexOp::Store {
+                hash,
+                tier: Tier::Device,
+            })
+            .collect();
+        partition.index.apply(id, &ops);
+        provider.on_routed(worker.as_ref(), &req);
+    }
+    let mut samples: Vec<Duration> = (0..2000)
+        .map(|_| {
+            let started = Instant::now();
+            let hits = provider.match_workers(&req, &workers);
+            assert!(hits
+                .iter()
+                .all(|hit| hit.as_ref().is_some_and(|hit| hit.tokens[0] == 100_000)));
+            started.elapsed()
+        })
+        .collect();
+    samples.sort();
+    println!(
+        "match_workers, 16 partial workers: p50 {:?}, p99 {:?}",
+        samples[1000], samples[1980]
+    );
+}
+
+/// Predictions are written inline: one index write per new block, one deadline per block.
+#[test]
+#[ignore]
+fn bench_on_routed_100k_tokens() {
+    let provider = IndexProvider::new(Duration::from_secs(60), 16);
+    let workers = workers(&["a"]);
+    let (mut new, mut again) = (Vec::new(), Vec::new());
+    for round in 0..200u32 {
+        let tokens: Vec<u32> = (0..100_000).map(|i| i ^ (round << 20)).collect();
+        let req = PrefixRequest::new("m", &tokens, Namespace::default());
+        req.hashes(16);
+        for samples in [&mut new, &mut again] {
+            let started = Instant::now();
+            provider.on_routed(workers[0].as_ref(), &req);
+            samples.push(started.elapsed());
+        }
+    }
+    for (name, mut samples) in [("a new prefix", new), ("the same prefix again", again)] {
+        samples.sort();
+        println!(
+            "on_routed, 6250 blocks, {name}: p50 {:?}, p99 {:?}",
+            samples[100], samples[198]
+        );
+    }
 }

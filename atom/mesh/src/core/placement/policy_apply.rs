@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use super::types::{PlacementError, RequestDescriptor};
 use crate::core::{HashRing, Worker};
+use crate::kv_index::PrefixRequest;
 use crate::observability::metrics::MeshMetrics;
 use crate::policies::{LoadBalancingPolicy, RouteDecision, SelectWorkerInfo};
 
@@ -10,6 +11,7 @@ pub async fn apply_policy(
     policy: &dyn LoadBalancingPolicy,
     descriptor: &RequestDescriptor<'_>,
     hash_ring: Option<Arc<HashRing>>,
+    prefix: Option<&PrefixRequest<'_>>,
 ) -> Result<Arc<dyn Worker>, PlacementError> {
     if candidates.is_empty() {
         return Err(PlacementError::NoAvailableWorkers);
@@ -19,6 +21,7 @@ pub async fn apply_policy(
         tokens: descriptor.tokens,
         headers: descriptor.headers,
         hash_ring,
+        prefix: prefix.filter(|_| policy.needs_kv_events()),
     };
     let (idx, decision) = policy.select_with_decision(candidates, &info).await;
     let selected = idx.map(|idx| candidates[idx].clone());

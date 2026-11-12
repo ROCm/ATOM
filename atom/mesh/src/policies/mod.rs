@@ -7,7 +7,10 @@ use std::{fmt::Debug, sync::Arc};
 
 use async_trait::async_trait;
 
-use crate::core::{HashRing, Worker};
+use crate::{
+    core::{HashRing, Worker},
+    kv_index::PrefixRequest,
+};
 
 mod cache_aware;
 mod dp_sticky;
@@ -112,6 +115,11 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         false
     }
 
+    /// The policy reads `SelectWorkerInfo::prefix`; it must also need tokens.
+    fn needs_kv_events(&self) -> bool {
+        false
+    }
+
     /// Update worker load information
     ///
     /// This is called periodically with current load information for load-aware policies.
@@ -188,6 +196,9 @@ pub struct SelectWorkerInfo<'a> {
     /// Pre-computed hash ring for O(log n) consistent hashing
     /// Built and cached by WorkerRegistry, passed through to avoid per-request rebuilds
     pub hash_ring: Option<Arc<HashRing>>,
+    /// Set when the policy needs KV events and the request has tokens; shared by the
+    /// prefill and decode selections.
+    pub prefix: Option<&'a PrefixRequest<'a>>,
 }
 
 #[cfg(test)]

@@ -14,7 +14,10 @@ use serde::Serialize;
 
 pub use self::{
     index::{HolderTable, PrefixIndex, MAX_HOLDERS},
-    provider::{CacheHit, HitSource, LoadPath, LowerHit, PrefixMatchProvider, PrefixRequest},
+    provider::{
+        CacheHit, HitSource, IndexProvider, LoadPath, LowerHit, Partition, PartitionKey,
+        PrefixMatchProvider, PrefixRequest,
+    },
 };
 use crate::kv_events::{PoolRole, Tier};
 

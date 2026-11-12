@@ -7,6 +7,8 @@ use super::policy_apply::apply_policy;
 use super::traits::{PdPlanner, PolicySource, WorkerSource};
 use super::types::{PlacementError, PlacementPlan, Protocol, RequestDescriptor};
 use crate::core::{ConnectionMode, HashRing, Worker, WorkerType};
+use crate::kv_events::Namespace;
+use crate::kv_index::PrefixRequest;
 use crate::observability::metrics::{metrics_labels, MeshMetrics};
 use crate::policies::{LoadBalancingPolicy, NO_HEALTHY_WORKERS};
 
@@ -44,6 +46,7 @@ impl DefaultPlanner {
     async fn plan_single(
         &self,
         req: &RequestDescriptor<'_>,
+        prefix: Option<&PrefixRequest<'_>>,
         regular_pool_raw: Vec<Arc<dyn Worker>>,
     ) -> Result<PlacementPlan, PlacementError> {
         let candidates = health_filter(regular_pool_raw);
@@ -54,7 +57,7 @@ impl DefaultPlanner {
         }
 
         let hash_ring = self.hash_ring_for(req.model_id);
-        let chosen = apply_policy(&candidates, policy.as_ref(), req, hash_ring).await?;
+        let chosen = apply_policy(&candidates, policy.as_ref(), req, hash_ring, prefix).await?;
 
         Ok(PlacementPlan::Single {
             worker: chosen,
@@ -65,6 +68,7 @@ impl DefaultPlanner {
     async fn plan_pair(
         &self,
         req: &RequestDescriptor<'_>,
+        prefix: Option<&PrefixRequest<'_>>,
         prefill_pool_raw: Vec<Arc<dyn Worker>>,
         decode_pool_raw: Vec<Arc<dyn Worker>>,
     ) -> Result<PlacementPlan, PlacementError> {
@@ -88,6 +92,7 @@ impl DefaultPlanner {
             prefill_policy.as_ref(),
             req,
             hash_ring.clone(),
+            prefix,
         )
         .await?;
         debug!(
@@ -97,8 +102,14 @@ impl DefaultPlanner {
             policy = prefill_policy.name(),
             "prefill worker selected"
         );
-        let decode =
-            apply_policy(&decode_candidates, decode_policy.as_ref(), req, hash_ring).await?;
+        let decode = apply_policy(
+            &decode_candidates,
+            decode_policy.as_ref(),
+            req,
+            hash_ring,
+            prefix,
+        )
+        .await?;
 
         Ok(PlacementPlan::Pair {
             prefill,
@@ -148,10 +159,19 @@ impl PdPlanner for DefaultPlanner {
             conn_mode.clone(),
         );
 
+        // Requests do not carry their LoRA or cache salt yet.
+        let prefix = req.tokens.map(|tokens| {
+            PrefixRequest::new(
+                req.model_id.unwrap_or_default(),
+                tokens,
+                Namespace::default(),
+            )
+        });
         if !regular_pool.is_empty() {
-            self.plan_single(req, regular_pool).await
+            self.plan_single(req, prefix.as_ref(), regular_pool).await
         } else if !prefill_pool.is_empty() && !decode_pool.is_empty() {
-            self.plan_pair(req, prefill_pool, decode_pool).await
+            self.plan_pair(req, prefix.as_ref(), prefill_pool, decode_pool)
+                .await
         } else if prefill_pool.is_empty() && !decode_pool.is_empty() {
             report_no_candidates(
                 metrics_labels::WORKER_PREFILL,
