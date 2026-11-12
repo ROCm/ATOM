@@ -569,7 +569,6 @@ class EngineCore:
         if self.kv_transfer_enabled:
             self._kv_progress_event.clear()
         result = self.scheduler.schedule()
-        self.scheduler.block_manager.kv.flush()
 
         # Surface admit-rejected seqs (those `_unschedulable_reason` flags in
         # the scheduler) through the same finished-seq path as normal seqs.
@@ -644,9 +643,6 @@ class EngineCore:
             stream_output_queue=self.stream_output_queue,
             batch=batch,
         )
-        # Blocks this pass filled and released become visible to the pool's
-        # backend (and through it to other engine ranks) here.
-        self.scheduler.block_manager.kv.flush()
 
         # Send stream outputs to main process via output_queue
         try:

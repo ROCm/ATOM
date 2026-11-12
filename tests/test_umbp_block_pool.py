@@ -50,6 +50,8 @@ class FakeL1:
     """What the UMBP L1 service does to slots, without memory."""
 
     def __init__(self):
+        # Set to n to make fetch stop after n slots, as a failed copy does.
+        self.fetch_keeps = None
         self.pools = {}
         self.holders = {}  # (group, key) -> [(pool_id, slot)]
         self.copies = []  # (src pool, src slot, dst pool, dst slot)
@@ -212,6 +214,15 @@ class FakeL1:
             pinned.add(dst)
             slots.append(dst)
             copied += 1
+        if self.fetch_keeps is not None:
+            # A copy failed part-way: the destinations after it were emptied
+            # (and their old content reported) but are left vacant.
+            for dst in slots[self.fetch_keeps :]:
+                self._unindex(pool_id, dst)
+                del pool["lru"][dst]
+                pool["state"][dst] = "V"
+            copied = min(copied, self.fetch_keeps)
+            slots = slots[: self.fetch_keeps]
         return slots, evicted, copied, copied * UNIT, 0
 
     def clear(self, pool_id):
@@ -515,6 +526,28 @@ class TestFetch:
         assert b.fetch([1, 2], lambda i: toks(i)) == 2
         assert sorted(evicted) == [50, 51]
         assert b.lookup(50) == -1 and b.lookup(1) != -1
+
+    def test_fetch_that_stops_early_still_reports_what_it_evicted(self):
+        """UMBP empties its destinations before it fills them. When the fill
+        fails part-way, the rest stay empty: their old content is gone here
+        too, though no fetched block took its place."""
+        l1 = FakeL1()
+        evicted = []
+        a = make_pool(l1, "a", 4)
+        b = make_pool(l1, "b", 4, on_evict=evicted.append)
+        cache(a, [1, 2, 3])
+        own = cache(b, [11, 12, 13, 14])
+        l1.fetch_keeps = 1
+        assert b.fetch([1, 2, 3], toks) == 1
+        assert sorted(evicted) == [11, 12, 13]
+        assert b.index_get(1) is not None
+        assert b.index_get(2) is None and b.index_get(11) is None
+        assert b.index_get(14) == own[3]
+        assert b.num_free == 4
+        # The pool goes on working, and agrees with UMBP about what is free.
+        l1.fetch_keeps = None
+        assert b.fetch([1, 2, 3], toks) == 3
+        assert evicted == [11, 12, 13]
 
     def test_fetch_takes_no_block_a_sequence_holds(self, l1):
         a = make_pool(l1, "a", 8)
