@@ -3404,7 +3404,7 @@ class ModelRunner:
                     )
                     return logits, hidden_states
 
-                if self._step_override is not None:
+                if self._step_override is not None and not has_constraints(batch):
                     # The model ran the whole step (target, sampling, verify,
                     # drafts): no logits; postprocess reads its outputs.
                     self._served = self._step_override(input_ids, running_bs, batch)

@@ -31,7 +31,12 @@ def register_constraint_provider(provider):
     """
     if any(existing.backend == provider.backend for existing in _PROVIDERS):
         raise ValueError(f"Duplicate constraint backend: {provider.backend}")
+    if not callable(getattr(provider, "hard_requests", None)):
+        raise TypeError("Constraint adapters must declare hard_requests(binding, batch)")
+    if not hasattr(provider, "mask_stage") or not hasattr(provider, "commit_order"):
+        raise TypeError("Constraint adapters must declare mask_stage and commit_order")
     _PROVIDERS.append(provider)
+    _PROVIDERS.sort(key=lambda adapter: adapter.mask_stage)
 
 
 def has_constraints(batch):
@@ -46,9 +51,12 @@ def needs_constraint_snapshot(batch, metadata):
 
 def _bindings(batch):
     for provider in _PROVIDERS:
+        if not provider.enabled(batch):
+            continue
         binding = provider.bind(batch)
-        if binding is not None:
-            yield provider, binding
+        if binding is None:
+            raise ValueError(f"Enabled constraint adapter {provider.backend} did not bind")
+        yield provider, binding
 
 
 def prepare_token_constraints(runner, batch, metadata):
@@ -126,17 +134,37 @@ class TokenConstraints:
         step.channel = None
         step.invalid = step.target_invalid = None
         step.providers = bindings
+        step.rule_counts = None
+        if len(bindings) > 1:
+            step.rule_counts = torch.zeros(batch.total_seqs_num, dtype=torch.int32, device=logits.device)
+            for provider, binding in bindings:
+                indices = provider.hard_requests(binding, batch)
+                if indices:
+                    step.rule_counts[indices] += 1
         for provider, binding in step.providers:
+            previous, previous_target = step.invalid, step.target_invalid
             provider.apply(step, binding)
+            step.invalid = _merge_invalid(previous, step.invalid)
+            step.target_invalid = _merge_invalid(previous_target, step.target_invalid)
         step.gather()
+        if len(bindings) > 1:
+            selected = step.rule_counts > 1
+            step.invalid = _merge_invalid(step.invalid, _guard_empty_rows(step.logits, selected))
+            if step.target is not None:
+                end = metadata.cu_num_draft_tokens
+                counts = end - torch.cat((torch.zeros_like(end[:1]), end[:-1]))
+                owners = torch.repeat_interleave(selected, counts.long(), output_size=step.target.shape[0])
+                step.target_invalid = _merge_invalid(step.target_invalid, _guard_empty_rows(step.target, owners))
         return step
 
     def commit(self, sampled_tokens, batch, deferred, failure):
         """Consume synchronized, accepted IDs, never unverified draft IDs."""
         channel_states = None
-        for provider, binding in reversed(self.providers):
+        for provider, binding in sorted(self.providers, key=lambda item: item[0].commit_order):
             result = provider.commit(self, sampled_tokens, batch, deferred, failure, binding)
             if result is not None:
+                if channel_states is not None:
+                    raise ValueError("Multiple constraint adapters returned GPU carry")
                 channel_states = result
         return channel_states
 
@@ -162,7 +190,7 @@ class TokenConstraints:
         rows = start[:, None] + width
         draft = width < (end - start)[:, None]
         bad = self.invalid[:, None].expand_as(tokens)
-        if self.target_invalid.numel():
+        if self.target_invalid is not None and self.target_invalid.numel():
             target_bad = self.target_invalid[
                 rows.clamp(max=self.target_invalid.numel() - 1).long()
             ]
@@ -172,6 +200,12 @@ class TokenConstraints:
 
 class GrammarProvider:
     backend = "grammar"
+    mask_stage = 0
+    commit_order = 10
+
+    @staticmethod
+    def hard_requests(binding, batch):
+        return list(binding.value)
 
     @staticmethod
     def enabled(batch):
@@ -219,6 +253,13 @@ class GrammarProvider:
 
 class ChannelProvider:
     backend = "channel"
+    mask_stage = 1
+    commit_order = 0
+
+    @staticmethod
+    def hard_requests(binding, batch):
+        # Effective states are resolved from GPU carry during apply.
+        return []
 
     @staticmethod
     def enabled(batch):
@@ -247,28 +288,22 @@ class ChannelProvider:
     @staticmethod
     def apply(step, binding):
         step.gather()
-        requests = getattr(step.batch, "structured_requests", None)
-        preserve = False
-        if requests:
-            preserve = torch.zeros(step.batch.total_seqs_num, dtype=torch.bool,
-                                   device=step.logits.device)
-            preserve[list(requests)] = True
+        preserve = False if step.rule_counts is None else step.rule_counts > 0
         step.channel = apply_required_channel(step.runner, step.batch, step.logits,
                                               step.metadata, step.target, preserve)
-        if requests and step.channel is not None:
-            intersection = preserve & (step.channel[1] >= 0)
-            step.invalid = _guard_empty_rows(step.logits, intersection)
-            if step.target is not None:
-                end = step.metadata.cu_num_draft_tokens
-                counts = end - torch.cat((torch.zeros_like(end[:1]), end[:-1]))
-                owners = torch.repeat_interleave(intersection, counts.long(),
-                                                output_size=step.target.shape[0])
-                step.target_invalid = _guard_empty_rows(step.target, owners)
+        if step.channel is not None and step.rule_counts is not None:
+            step.rule_counts += (step.channel[1] >= 0).to(step.rule_counts.dtype)
 
     @staticmethod
     def commit(step, tokens, batch, deferred, failure, binding):
         if step.channel is not None and deferred:
             return advance_states(*step.channel, tokens)
+
+
+def _merge_invalid(previous, current):
+    if current is None:
+        return previous
+    return current if previous is None else previous | current
 
 
 def _guard_empty_rows(logits, selected=None):
