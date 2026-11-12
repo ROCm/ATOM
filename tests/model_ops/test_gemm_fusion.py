@@ -14,6 +14,7 @@ import sys
 import types
 from pathlib import Path
 from types import SimpleNamespace
+from typing import ClassVar
 
 import pytest
 import torch
@@ -27,6 +28,14 @@ from atom.model_ops.gemm_fusion import GemmFusionSites
 def _reset_process_gate(monkeypatch):
     monkeypatch.setattr(site_mod, "_ENSURE_DONE", False)
     monkeypatch.setattr(site_mod, "_PLUGIN", None)
+
+
+class _SpQkvProvider:
+    op_versions: ClassVar[dict[str, set[int]]] = {"sp_qkv_fused": {1}}
+
+
+def _routed_to_sp_qkv():
+    return {"sp_qkv_fused": {"eligible": ("sp-qkv-provider",), "ineligible": {}}}
 
 
 def _fwd_ctx():
@@ -166,9 +175,14 @@ def test_configure_called_once_with_source_when_enabled(monkeypatch):
     module.plugin = SimpleNamespace(
         API_VERSION=1,
         configure=lambda **kwargs: configured.append(kwargs),
-        status=lambda: {"routed_ops": {"sp_qkv_fused": {}}, "enabled": ("p",)},
+        status=lambda: {
+            "routed_ops": _routed_to_sp_qkv(),
+            "enabled": ("sp-qkv-provider",),
+            "skipped_providers": (),
+        },
     )
     monkeypatch.setitem(sys.modules, "aiter", module)
+    monkeypatch.setattr(provider, "_load_provider", lambda name: _SpQkvProvider())
     config = SimpleNamespace(aiter_provider_enable=("sp-qkv-provider",))
     assert provider.configure_aiter_providers(config) is True
     assert configured and configured[0]["enable"] == ("sp-qkv-provider",)
@@ -194,10 +208,15 @@ def test_configure_resolves_lazy_routed_ops_before_status(monkeypatch):
         configure=lambda **kwargs: events.append("configure"),
         status=lambda: (
             events.append("status"),
-            {"routed_ops": {"sp_qkv_fused": {}} if resolved[0] else {}},
+            {
+                "routed_ops": _routed_to_sp_qkv() if resolved[0] else {},
+                "enabled": ("sp-qkv-provider",),
+                "skipped_providers": (),
+            },
         )[1],
     )
     monkeypatch.setitem(sys.modules, "aiter", module)
+    monkeypatch.setattr(provider, "_load_provider", lambda name: _SpQkvProvider())
     config = SimpleNamespace(aiter_provider_enable=("sp-qkv-provider",))
     assert provider.configure_aiter_providers(config) is True
     assert resolved[0] is True
@@ -245,7 +264,7 @@ def test_site_reasserts_enablement_once_per_process(monkeypatch):
 def test_provider_warmup_is_framework_owned_and_fail_open(monkeypatch):
     warmed = []
 
-    class _Provider:
+    class _Provider(_SpQkvProvider):
         def warmup(self, payload, *, group=None, device=None):
             warmed.append((payload, group, device))
             return True
@@ -471,7 +490,7 @@ def test_capture_gate_requires_preprepare(monkeypatch):
 def test_provider_prepare_api_is_called_and_fail_open(monkeypatch):
     calls = []
 
-    class _Prepared:
+    class _Prepared(_SpQkvProvider):
         def prepare(self, payload, *, group=None, device=None):
             calls.append((payload, group, device))
             return True
@@ -481,7 +500,7 @@ def test_provider_prepare_api_is_called_and_fail_open(monkeypatch):
     assert provider.prepare_aiter_providers(config, {"payload": 1}, group="g", device=2)
     assert calls == [({"payload": 1}, "g", 2)]
 
-    class _NoAPI:
+    class _NoAPI(_SpQkvProvider):
         pass
 
     monkeypatch.setattr(provider, "_load_provider", lambda name: _NoAPI())

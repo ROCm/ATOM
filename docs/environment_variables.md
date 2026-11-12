@@ -138,16 +138,19 @@ cannot affect a server that does not use the feature.
 ATOM can enable out-of-tree AITER kernel Providers (the `aiter.plugin` interface
 stack). Enablement is opt-in and off by default: ATOM makes one
 `aiter.plugin.configure(source="atom <version>", enable=[...])` call per worker
-process before model loading/warm-up/CUDA-graph capture, then warms the named
-providers (the interface has no lifecycle hook), and never raises when the
-interface or a provider is missing — every routed op then takes its non-fused
-path. `AITER_PLUGINS=0` is AITER's own kill switch (the only environment control;
+process before model loading/warm-up/CUDA-graph capture, then warms the
+providers that take a framework warm-up (the interface has no lifecycle hook).
+A named provider that cannot serve stops startup: an AITER without
+`aiter.plugin` or on another plugin API, a provider that cannot be loaded, or an
+op the provider declares that this AITER does not route to it. A call the
+provider declines still takes its non-fused path.
+`AITER_PLUGINS=0` is AITER's own kill switch (the only environment control;
 it can only turn routing off and records no decision), and ATOM does not manage
 that variable.
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| **ATOM_AITER_PROVIDER_ENABLE** | str | unset (off) | Comma-separated AITER Provider names, in preference order; the operator/deployment override for `--aiter-provider-enable` / `Config.aiter_provider_enable`. Empty or unset means off (ATOM does not call `configure()`). A provider that does not serve an op, an API-version mismatch or a missing routed op leaves the non-fused path in place with a warning. |
+| **ATOM_AITER_PROVIDER_ENABLE** | str | unset (off) | Comma-separated AITER Provider names, in preference order; the operator/deployment override for `--aiter-provider-enable` / `Config.aiter_provider_enable`. Empty or unset means off (ATOM does not call `configure()`). Startup fails when a named provider cannot be loaded, the AITER plugin API differs, or an op the provider declares is not routed to it; a call the provider declines runs AITER's native kernel. |
 
 For MiniMax-M3 at `-tp 1 -sp 4`, enabling the SP QKV provider moves the QKV GEMM
 plus the Ulysses exchange/norm/RoPE/cache prologue to the neutral routed
@@ -160,16 +163,21 @@ means no fused path and no AITER provider imports.
 For DeepSeek-V4.1 with `--kv-cache-dtype fp8`, enabling
 `flydsl-sparse-mla-provider` (FlyDSL sparse MLA for gfx950) lets the provider
 serve AITER's routed `mla_sparse_prefill_v41`, which `sparse_attn_v41_paged_2src`
-calls for both prefill and decode; ATOM's call is unchanged. It needs an AITER
-that routes the op (ROCm/aiter#7783) and the provider installed. A call the
-provider declines — another GPU, a head count per rank other than 1–16 or 32, a
-shape outside its coverage — runs AITER's OPUS kernel. FlyDSL compiles each
-kernel variant on its first call and caches it under `~/.flydsl/cache`. Under a
-whole-forward CUDA graph the provider serves only shapes that already ran
-outside capture; a cold shape captures OPUS for that graph's lifetime without
-an error, so check `aiter.plugin.decision_counts()`. The BF16 and packed V4.1
-caches call ATOM's own V4 kernels, which have no AITER contract, so this
-provider does not reach them.
+calls in prefill and in every decode step that mono decode (`ATOM_MONO_ENABLE`)
+does not serve; ATOM's call is unchanged. Startup fails
+without an AITER that routes the op (ROCm/aiter#7783) or without the provider
+installed. A call the provider declines — another GPU, a head count per rank
+other than 1–16 or 32, a shape outside its coverage — runs AITER's OPUS kernel.
+FlyDSL compiles each kernel variant on its first call and caches it under
+`~/.flydsl/cache`. Under a CUDA graph the provider serves only shapes that
+already ran outside capture; ATOM's capture runs every bucket once outside
+capture before recording it, so a recording gets the FlyDSL kernel wherever
+that eager run did. A call outside a graph costs more host time through the
+provider than OPUS's: under `--cudagraph-mode TR_HYBRID`, where every decode
+step runs the attention eagerly, that made the decode step about 7 % slower
+than OPUS at TP4 and concurrency 8, while FULL graphs replay it without Python.
+The BF16 and packed V4.1 caches call ATOM's own V4 kernels, which have no AITER
+contract, so this provider does not reach them.
 
 ## Kernel / backend selection
 

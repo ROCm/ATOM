@@ -454,9 +454,13 @@ class EngineArgs:
                 "Comma-separated aiter kernel Provider names to enable, in preference "
                 "order (aiter.plugin.configure(enable=...)). Unset/empty (default) is "
                 "OFF: ATOM never calls configure(), every routed op runs native, and "
-                "MiniMax-M3 SP4 keeps the non-fused QKV path. A named provider serves "
+                "MiniMax-M3 SP4 keeps the non-fused QKV path. sp-qkv-provider serves "
                 "the neutral sp_qkv_fused prologue when its explain() gate accepts the "
-                "call; AITER_PLUGINS=0 is aiter's own kill switch."
+                "call; flydsl-sparse-mla-provider serves mla_sparse_prefill_v41 "
+                "(DeepSeek-V4.1 sparse attention on the FP8 KV cache) and declines to "
+                "AITER's OPUS kernel. Startup fails when a named provider is not "
+                "installed or this aiter does not route its op to it. "
+                "AITER_PLUGINS=0 is aiter's own kill switch."
             ),
         )
         parser.add_argument(

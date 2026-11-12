@@ -4,8 +4,9 @@
 
 Enablement is the aiter provider rail (``--aiter-provider-enable``); this
 module only installs the attention sites and owns the provider warm-up, which
-the aiter interface leaves to the framework.  With no provider enabled the
-function returns None and the model keeps #3084's completely unfused path.
+the aiter interface leaves to the framework.  With no enabled provider serving
+``sp_qkv_fused`` the function returns None and the model keeps #3084's
+completely unfused path.
 """
 
 import logging
@@ -181,10 +182,12 @@ def _warmup(config, sites):
 def initialize_gemm_fusion(model, config):
     """After weight processing, before warmup and capture.
 
-    Returns the installed sites, or None when the aiter provider rail is off
-    (byte-identical to #3084 with gemm-fusion off).
+    Returns the installed sites, or None when no enabled aiter provider serves
+    ``sp_qkv_fused`` (byte-identical to #3084 with gemm-fusion off).
     """
-    if not getattr(config, "aiter_provider_enable", ()):
+    from atom.aiter_provider import serves_sp_qkv_fused
+
+    if not serves_sp_qkv_fused(config):
         return None
     from .site import install_minimax_m3
 
