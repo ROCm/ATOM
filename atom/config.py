@@ -1955,6 +1955,11 @@ def resolve_draft_kv_dtype(spec, target_dtype: str, *, own_pool: bool) -> str:
     ``--spec-decode-kv-cache-dtype``. A draft in the target's pool cannot ask for
     another dtype."""
     asked = spec.kv_cache_dtype
+    # argparse restricts the flag; a Python caller can pass anything
+    if asked not in (None, "bf16", "fp8"):
+        raise ValueError(
+            f"speculative kv_cache_dtype must be 'bf16' or 'fp8', got {asked!r}"
+        )
     if not own_pool:
         if asked is not None and asked != target_dtype:
             raise ValueError(

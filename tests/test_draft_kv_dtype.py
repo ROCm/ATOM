@@ -71,6 +71,12 @@ def test_an_own_pool_draft_keeps_the_targets_dtype_unless_asked(target, asked):
     )
 
 
+@pytest.mark.parametrize("own_pool", [True, False])
+def test_an_unsupported_draft_dtype_is_refused_whoever_asks(own_pool):
+    with pytest.raises(ValueError, match="must be 'bf16' or 'fp8'"):
+        resolve_draft_kv_dtype(_draft(asked="int4"), "bf16", own_pool=own_pool)
+
+
 def test_a_shared_pool_draft_has_the_targets_dtype():
     assert resolve_draft_kv_dtype(_draft("mtp"), "fp8", own_pool=False) == "fp8"
     assert resolve_draft_kv_dtype(_draft("mtp", "bf16"), "bf16", own_pool=False) == (
