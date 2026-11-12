@@ -280,11 +280,12 @@ if [ $DRAIN_RC != 0 ]; then
 fi
 wait "$LM_PID"
 
-# 读分数
+# 读分数：flexible-extract 是报告的分数，strict-match 也记下（精度图上画成虚线）
 python3 - "$ACC_DIR" <<'EOF'
 import json, pathlib, sys
 f = max(pathlib.Path(sys.argv[1]).rglob("results*.json"), key=lambda p: p.stat().st_mtime)
-print("gsm8k flexible-extract:", json.load(open(f))["results"]["gsm8k"]["exact_match,flexible-extract"])
+r = json.load(open(f))["results"]["gsm8k"]
+print("flexible-extract:", r["exact_match,flexible-extract"], " strict-match:", r["exact_match,strict-match"])
 EOF
 ```
 
@@ -315,7 +316,7 @@ CI 只负责记录。要查根因就另开任务，从 ATOM 的 `/debug-guide` �
 
 ### 4.1 指标口径
 
-**GSM8K 精度**：lm_eval 结果 JSON 里的 `results.gsm8k["exact_match,flexible-extract"]`，3-shot。
+**GSM8K 精度**：lm_eval 结果 JSON 里的 `results.gsm8k["exact_match,flexible-extract"]`，3-shot，这是报告的分数。`exact_match,strict-match` 也记下，精度图上和 dashboard 一样画成虚线作参考。
 
 **MLPerf Endpoint**：读 client 输出的 `report_dir/performance/result_summary.json`。
 
@@ -371,6 +372,7 @@ CI 只负责记录。要查根因就另开任务，从 ATOM 的 `/debug-guide` �
 | `model` | §1 的 slug |
 | `status` | `ok` 或 `fail` |
 | `gsm8k` | `exact_match,flexible-extract`，保留四位小数 |
+| `gsm8k_strict` | `exact_match,strict-match`，保留四位小数 |
 | `num_fewshot` | `3`；recipe 改过就写实际值 |
 | `image`、`base_image` | 测试镜像 tag、base 镜像 tag |
 | `atom_branch`、`atom_commit` | `main`、40 位 sha |
@@ -379,6 +381,8 @@ CI 只负责记录。要查根因就另开任务，从 ATOM 的 `/debug-guide` �
 | `note` | 其他说明，如重跑 |
 
 两个 CSV 都用 UTF-8、逗号分隔，含逗号的字段加双引号，表头按上表顺序。
+
+精度图上的 baseline 参考线来自可选的 `accuracy_baseline.csv`，两列：`model`（slug）和 `baseline`（分数，例如模型卡或 ATOM CI 的 baseline）。没有这个文件就不画。
 
 ### 4.4 455-CI 分支的目录结构
 
@@ -392,6 +396,8 @@ recipes/
     ├── README.md          报告索引，一个镜像一行，最新的在最上面
     ├── perf.csv           全部历史性能
     ├── accuracy.csv       全部历史 GSM8K 精度
+    ├── accuracy_baseline.csv   可选：精度图上的 baseline 参考线
+    ├── tools/             出图脚本和样图（§5.4）
     ├── reports/
     │   └── 455-CI-report-<YYYYMMDD>.md    一个镜像一份报告，YYYYMMDD 是镜像日期
     └── runs/<YYYYMMDD>/   这个镜像的原始结果和图
@@ -475,7 +481,7 @@ recipes/
 ````
 
 - **上次**：同模型（性能还要同并发）在之前的镜像上最近一次成功的结果。第一次有数据的写"首次"。
-- **回退标记**：性能沿用 ATOM benchmark dashboard 的阈值，变差 5% 及以上标 ⚠️，10% 及以上标 🔴；tok/s/GPU 和 interactivity 下降、ITL P50 上升算变差。精度下降超过 0.03 标 ⚠️，超过 0.05 标 🔴：GSM8K 在这套环境上 temp 0 也不完全确定，±0.02 以内通常是噪声。
+- **回退标记**：性能沿用 ATOM benchmark dashboard 的阈值，变差 5% 及以上标 ⚠️，10% 及以上标 🔴；tok/s/GPU 和 interactivity 下降、ITL P50 上升算变差。精度下降超过 0.04 标 ⚠️，超过 0.06 标 🔴：GSM8K 在这套环境上 temp 0 也不完全确定，±0.02 以内通常是噪声。
 - 失败的写 N/A，并在"失败"一节给出一句话核心报错和 error.log 链接。
 
 ### 5.2 性能图
@@ -495,30 +501,45 @@ MLPerf Endpoint 的图沿用 [LLM-Booster#246 的 MLPerf Endpoints 性能图](ht
 
 - **曲线**：每个镜像一条，点是并发 4 和 64，每个点都标 cN。
 - **画几条**：最近 4 个有数据的镜像，对应色阶的 4 级。更早的留在 `perf.csv` 里。
-- **颜色**：红色菱形，越新越深，从旧到新依次是 `#F5998A`、`#E8452C`、`#C42B4B`、`#9B1C1C`。不足 4 条时取最深的几级。
+- **颜色**：越新越深的红色，从旧到新依次是 `#F5998A`、`#E8452C`、`#C42B4B`、`#9B1C1C`，不足 4 条时取最深的几级。MLPerf Endpoint 的点是菱形（#246），8K/1K 的点是圆点（dashboard）。
 - **线型**：最新的一条（通常就是本次）画实线，其余画虚线。阶梯线的实线水平 4 px、竖直 2.4 px，虚线水平 3 px、竖直 1.8 px；8K/1K 的直线实线 4 px、虚线 3 px。
-- **图例**只写名字和 GPU 数，日期用镜像日期，例如 `AMD MI455 (ATOM main) · 11-14 · 8 GPUs`。副标题列出这几个镜像的日期，例如 `455-CI · MI455 (gfx1250) · 10-24 → 10-31 → 11-07 → 11-14`，不再写模型名。
+- **图例**只写名字和 GPU 数，日期用镜像日期，例如 `AMD MI455 (ATOM main) · 11-14 · 8 GPUs`。MLPerf Endpoint 的图例在图下方（#246），8K/1K 的在图上方（dashboard）。副标题列出这几个镜像的日期，例如 `455-CI · MI455 (gfx1250) · 10-24 → 10-31 → 11-07 → 11-14`，不再写模型名。
 - **本次跑挂**时图上没有本次的曲线，在图内右上角的 note 写 `11-14 image: run failed (N/A), see report.`。
 - **脚注两行**：第一行写数据来源 `AMD MI455: 455-CI runs on ATOM main + aiter main, self-measured, not verified by MLCommons.`；第二行写坐标说明，加上 `cN = concurrency`。
 - 不加放大框、箭头和汇总表。输出 2 倍分辨率的 PNG，2640 px 宽，字体用 #246 里 `fetch_fonts.py` 下载的 Instrument Sans。
 
 ### 5.3 精度图
 
-每个场景一张，存为 `charts/accuracy-endpoint.png` 和 `charts/accuracy-8k1k.png`，数据取自 `accuracy.csv`，每次连同本次结果一起重画。
+照 ATOM benchmark dashboard 的精度趋势图画。每个场景一张，存为 `charts/accuracy-endpoint.png` 和 `charts/accuracy-8k1k.png`，数据取自 `accuracy.csv`，每次连同本次结果一起重画。
 
-- **形式**：2×2 小多图，一格一个模型（该场景的 4 个模型），格子标题写模型名。每格用自己的 y 轴，跨度至少 0.10，免得把噪声放大成大起大落；上限不超过 1.0。
+- **形式**：2×2，一格一个模型（该场景的 4 个模型），格子标题写模型名；设了 baseline 的，标题行右侧写 `baseline 0.xxxx`。
 - **x 轴**：最近 12 个镜像的日期（`MM-DD`）。
-- **线和点**：深红 `#9B1C1C` 折线加圆点，和性能图里最新的曲线同色。本次的点画大一号，旁边直接标分数和"vs 上次"。
-- **失败**：那个镜像在 x 轴上画灰色 `#8A8F98` 的 `×`，折线在那里断开。
-- **标题**：`MLPerf Endpoint models · GSM8K (3-shot, flexible-extract) by image`，8K/1K 同理。**脚注两行**：数据来源同性能图，第二行写指标说明。
+- **y 轴**：百分比，上限 100%，下限是最低分减 0.03 后向下取整到 5%，和 dashboard 的算法一样。
+- **线**：flexible-extract 画实线加实心点，strict-match 画同色虚线加空心点，都用深红 `#9B1C1C`（性能图里最新曲线的颜色）。baseline 是灰色虚线。最新的分数标在最后一个点右边。
+- **失败**：那个镜像在 x 轴上画灰色 `×` 并标 N/A；折线和 dashboard 一样跨过它连着画。
+- **标题**：`MLPerf Endpoint models · GSM8K accuracy by image`，8K/1K 同理。图例在图上方。**脚注两行**：数据来源，以及"报告的分数是 flexible-extract，strict-match 只作参考"。
 - 字体和输出规格同性能图：Instrument Sans，2 倍分辨率 PNG，2640 px 宽。
 
-### 5.4 提交到 455-CI
+### 5.4 出图
+
+脚本在 `recipes/455-CI/tools/`，用法和样图见那里的 [`README.md`](455-CI/tools/README.md)。需要 Python 3.10 以上和 matplotlib：
+
+```bash
+cd recipes/455-CI/tools
+python3 fetch_fonts.py                              # 第一次用时下载 Instrument Sans；不下也能画，退回 DejaVu Sans
+python3 make_charts.py --image-date <YYYY-MM-DD>    # 本周镜像的日期；周末测完和周中测完各跑一次
+```
+
+- 输出到 `runs/<YYYYMMDD>/charts/`：有成功数据的模型各一张 `perf-<slug>.png`，每个场景一张 `accuracy-<scenario>.png`。只画一个场景就加 `--scenario endpoint` 或 `--scenario 8k1k`。
+- `endpoint_chart.py` 和 `fetch_fonts.py` 原样取自 LLM-Booster#246，不要改。CI 自己的逻辑在 `ci455_data.py`（选数据）和 `ci455_charts.py`（画图）。
+- 改了脚本先跑测试：`python3 -m pytest -q recipes/455-CI/tools`。
+
+### 5.5 提交到 455-CI
 
 ```bash
 git clone --branch 455-CI --single-branch git@github.com:ROCm/ATOM.git atom-455-ci
 cd atom-455-ci
-# 放入 recipes/455-CI/runs/<YYYYMMDD>/，追加 perf.csv 和 accuracy.csv，
+# 放入 recipes/455-CI/runs/<YYYYMMDD>/，追加 perf.csv 和 accuracy.csv，按 §5.4 出图，
 # 写或更新 reports/455-CI-report-<YYYYMMDD>.md，更新 README.md 的索引
 git add recipes/455-CI
 git commit -m "[455-CI] gfx1250-atom-ci455-<YYYYMMDD>: MLPerf Endpoint results"    # 周中写 8K/1K results
@@ -539,4 +560,3 @@ git push origin 455-CI
 ## 6. 待补充
 
 - `455-CI-recipe.md`：各模型的 server 和 bench 命令（GSM8K 有特殊参数时也写上），按 §3.1 的结构写。
-- 出图脚本：性能图复用 #246 的 `endpoint_chart.py`，加一个从 `perf.csv` 生成曲线配置的 CI 版，并支持 8K/1K 的 dashboard 画法；精度图按 §5.3 从 `accuracy.csv` 出。放进 `recipes/455-CI/tools/` 后，在 §5 写明用法。
