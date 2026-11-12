@@ -3,9 +3,11 @@
 //! While `--route-log-sample-rate` is above 0, inference requests pass through
 //! [`scope`], and a sampled request gets a trace. Policies select and routers
 //! dispatch on the request task, so both reach the trace through a task-local
-//! instead of the placement API.
+//! instead of the placement API. Work spawned off the request task, such as the
+//! detached Mooncake prefill, takes the trace and the request span along with
+//! [`carry`].
 
-use std::{cell::RefCell, sync::Arc};
+use std::{cell::RefCell, future::Future, sync::Arc};
 
 use axum::{
     extract::{Request, State},
@@ -14,7 +16,7 @@ use axum::{
     response::Response,
 };
 use rand::Rng;
-use tracing::info;
+use tracing::{info, Instrument};
 
 use crate::{core::Worker, observability::metrics::MeshMetrics};
 
@@ -32,6 +34,7 @@ struct RouteTrace {
     selections: RefCell<Vec<Selection>>,
 }
 
+#[derive(Clone)]
 struct Selection {
     pool: &'static str,
     policy: &'static str,
@@ -53,6 +56,26 @@ pub(crate) async fn scope(State(rate): State<f64>, request: Request, next: Next)
     } else {
         next.run(request).await
     }
+}
+
+/// Runs `future` in the current request span and, for a sampled request, with a
+/// copy of its decisions, wherever the future is spawned.
+pub(crate) fn carry<F: Future>(future: F) -> impl Future<Output = F::Output> {
+    let selections = TRACE
+        .try_with(|trace| trace.selections.borrow().clone())
+        .ok();
+    async move {
+        match selections {
+            Some(selections) => {
+                let trace = RouteTrace {
+                    selections: RefCell::new(selections),
+                };
+                TRACE.scope(trace, future).await
+            }
+            None => future.await,
+        }
+    }
+    .instrument(tracing::Span::current())
 }
 
 /// Keeps the decision of a policy selection until the router dispatches it.
@@ -152,7 +175,7 @@ mod tests {
         )
     }
 
-    async fn logs(sampled: bool, run: impl FnOnce()) -> String {
+    async fn logs(sampled: bool, run: impl Future<Output = ()>) -> String {
         let capture = Capture::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(capture.clone())
@@ -160,9 +183,9 @@ mod tests {
             .finish();
         let _subscriber = tracing::subscriber::set_default(subscriber);
         if sampled {
-            TRACE.scope(RouteTrace::default(), async { run() }).await;
+            TRACE.scope(RouteTrace::default(), run).await;
         } else {
-            run();
+            run.await;
         }
         capture.text()
     }
@@ -245,7 +268,7 @@ mod tests {
             record_dispatch("prefill", &prefill_rank(1));
         };
 
-        let sampled = logs(true, run).await;
+        let sampled = logs(true, async { run() }).await;
         for field in [
             "Selected worker",
             r#"pool="prefill""#,
@@ -259,12 +282,36 @@ mod tests {
         ] {
             assert!(sampled.contains(field), "missing {field} in\n{sampled}");
         }
-        assert!(logs(false, run).await.is_empty());
+        assert!(logs(false, async { run() }).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn carried_work_dispatches_in_the_request_span_and_trace() {
+        let sampled = logs(true, async {
+            let selected = prefill_rank(0);
+            record_selection("prefill", "cache_aware", Some(&selected), "affinity", None);
+            async {
+                let plain = async { record_dispatch("prefill", &prefill_rank(0)) };
+                tokio::spawn(plain).await.unwrap();
+                let carried = carry(async { record_dispatch("prefill", &prefill_rank(0)) });
+                tokio::spawn(carried).await.unwrap();
+            }
+            .instrument(tracing::info_span!("request", id = 7))
+            .await;
+        })
+        .await;
+
+        assert_eq!(sampled.matches("Selected worker").count(), 1, "{sampled}");
+        assert!(sampled.contains("request{id=7}"), "{sampled}");
+        assert!(
+            sampled.contains(r#"policy="cache_aware" branch="affinity""#),
+            "{sampled}"
+        );
     }
 
     #[tokio::test]
     async fn a_retry_replaces_the_pools_selection() {
-        let sampled = logs(true, || {
+        let sampled = logs(true, async {
             record_selection(
                 "prefill",
                 "cache_aware",
@@ -293,7 +340,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_selection_without_a_worker_logs_its_pool() {
-        let sampled = logs(true, || {
+        let sampled = logs(true, async {
             record_selection("decode", "round_robin", None, "no_healthy_workers", None);
         })
         .await;

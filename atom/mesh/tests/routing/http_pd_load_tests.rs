@@ -764,6 +764,29 @@ async fn vllm_detached_prefill_retains_load_until_it_finishes() {
 }
 
 #[tokio::test]
+async fn vllm_prefill_aborted_before_it_starts_records_no_dispatch() {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _recorder = metrics::set_default_local_recorder(&recorder);
+    let mut p = GatedServer::start(WorkerType::Prefill {
+        bootstrap_port: None,
+    })
+    .await;
+    // The decode request fails to build before the detached prefill task runs.
+    let d = GatedServer::start_with_api_key(WorkerType::Decode, Some("bad\nkey")).await;
+
+    let task = dispatch(DispatchKind::Vllm, &p, &d, false);
+    assert_eq!(result(task).await.status(), StatusCode::SERVICE_UNAVAILABLE);
+    sleep(Duration::from_millis(20)).await;
+    assert!(p.captured.try_recv().is_err());
+    let rendered = handle.render();
+    assert!(
+        !rendered.contains("mesh_selected_dp_rank_total"),
+        "{rendered}"
+    );
+}
+
+#[tokio::test]
 async fn nonstreaming_dispatch_releases_prefill_before_decode_body() {
     for kind in KINDS {
         let (mut p, mut d) = servers().await;
