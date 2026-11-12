@@ -21,6 +21,9 @@ from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload.mooncake_store.nic import parse_device_list
 
 KEY_PREFIX = "mooncake_store."
+# `select_offload_layout`'s name for DeepSeek-V4.1's PAGE+STATE pool. Plain
+# DeepSeek-V4 resolves to "hybrid" and is refused with every other layout.
+_REPLAY_PAGE_LAYOUT = "dsv41"
 _MIB = 1 << 20
 _PROTOCOLS = ("rdma", "tcp")
 
@@ -89,6 +92,13 @@ class MooncakeStoreOffloadConfig:
 _FIELDS = tuple(field.name for field in fields(MooncakeStoreOffloadConfig))
 
 
+def store_chunk_tokens(kv_transfer_config: Mapping[str, Any] | None) -> int:
+    """The transfer granularity shared by routing and the Store connector."""
+    return offcfg.connector_integer(
+        offcfg.connector_extras(kv_transfer_config), "mooncake_store.chunk_tokens", 256
+    )
+
+
 def parse_mooncake_store_config(
     kv_transfer_config: Mapping[str, Any] | None,
 ) -> MooncakeStoreOffloadConfig:
@@ -101,12 +111,7 @@ def parse_mooncake_store_config(
             type or out of range, neither a shared master nor pools, or pools
             without rdma.
     """
-    kvc = kv_transfer_config or {}
-    extra = kvc.get("kv_connector_extra_config", kvc) or {}
-    if not isinstance(extra, Mapping):
-        raise ValueError(  # noqa: TRY004  # a settings error, like every other
-            "kv_connector_extra_config must be a JSON object"
-        )
+    extra = offcfg.connector_extras(kv_transfer_config)
     values: dict[str, Any] = {}
     for key, value in extra.items():
         if not (isinstance(key, str) and key.startswith(KEY_PREFIX)):
@@ -164,8 +169,8 @@ def parse_mooncake_store_config(
         ),
         protocol=protocol,
         local_hostname=_text("mooncake_store.local_hostname", local_hostname),
-        chunk_tokens=offcfg._strict_integer(
-            "mooncake_store.chunk_tokens", values.get("chunk_tokens", 256), minimum=1
+        chunk_tokens=offcfg.connector_integer(
+            extra, "mooncake_store.chunk_tokens", 256
         ),
         load_pool_mib=offcfg._strict_integer(
             "mooncake_store.load_pool_mib", values.get("load_pool_mib", 1024), minimum=1
@@ -181,22 +186,24 @@ def parse_mooncake_store_config(
 
 
 def check_engine_compatibility(cfg: MooncakeStoreOffloadConfig, config: Any) -> None:
-    """Refuse what phase 1 does not move: non-dense layouts, DCP, odd chunks.
+    """Require dense KV or V4.1's PAGEs, no DCP, and whole chunks.
 
     The Store holds one object per (rank, chunk) of the dense codec's opaque
-    block bytes. A hybrid, M3 or Kimi-K3 layout needs PAGE regions or a state
-    tier this connector does not carry, and a DCP rank's pages cover a virtual
-    block that the chunk keys do not name.
+    block bytes, or of V4.1's PAGE regions, whose request state is rebuilt by
+    replay. That V4.1 on the Store needs bounded replay is the model's own
+    runtime gate (`deepseek_v41.config.validate_runtime_config`). Other hybrid
+    layouts need a state tier this connector does not carry. A DCP rank's
+    pages cover a virtual block that the chunk keys do not name.
 
     Raises:
-        ValueError: The model is not on the dense layout, DCP > 1, or the
-            chunk is not a whole number of KV blocks.
+        ValueError: The model is neither dense nor V4.1, DCP > 1, or the chunk
+            is not a whole number of KV blocks.
     """
     layout = offcfg.select_offload_layout(config)
-    if layout != "dense" and not uses_replay_pages(config):
+    if layout not in ("dense", _REPLAY_PAGE_LAYOUT):
         raise ValueError(
-            f"the Mooncake Store offload moves only the dense KV layout; this "
-            f"model resolves to {layout!r}"
+            "the Mooncake Store offload moves the dense KV layout and V4.1's "
+            f"replay PAGEs; this model resolves to {layout!r}"
         )
     dcp = int(getattr(config, "decode_context_parallel_size", 1) or 1)
     if dcp > 1:
@@ -280,9 +287,8 @@ def _positive_seconds(name: str, value: Any) -> float:
 
 
 def uses_replay_pages(config: Any) -> bool:
-    """V4.1 restores PAGE bytes and rebuilds per-request state by replay."""
-    return getattr(config.hf_config, "model_type", None) in (
-        "deepseek_v41",
-        "deepseek_v41_text",
-        "deepseek_v41_dspark",
-    )
+    """Whether the Store moves this model's PAGE regions (and the state is
+    rebuilt by replay) rather than the dense KV layout. Decided by the one
+    selector the worker, the scheduler and the key namespace all use; the
+    worker still checks the backend's replay contract when it registers KV."""
+    return offcfg.select_offload_layout(config) == _REPLAY_PAGE_LAYOUT

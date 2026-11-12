@@ -14,7 +14,7 @@ So the two travel together or not at all. State checkpoints copy the entry into
 PAGE units at chunk boundaries, in blocks of single-layer checkpoint groups that
 vLLM hashes like any other group; the block in checkpoint group ``j`` is unit
 ``j`` of the native checkpoint image. A transfer names those units as a
-native-state image (`v41_mp_scheduler`), so the checkpoint commits and restores
+native-state image (`ride_mp_scheduler`), so the checkpoint commits and restores
 as part of the PAGE object it continues. This module is the scheduler half: it
 decides which boundary a transfer may carry and caps hits to one. The units
 themselves are resolved by `PageRideMixin`.
@@ -352,7 +352,7 @@ class V41BoundaryPlanner(BoundaryPlanner, PageRideMixin):
 
     def has_pending_work(self) -> bool:
         """A ride pin is given back by a step's reconciliation
-        (`V41StateMPScheduler.build_connector_meta`), so one still held needs
+        (`StateRideMPScheduler.build_connector_meta`), so one still held needs
         the engine to keep stepping."""
         return self.has_ride_pins()
 

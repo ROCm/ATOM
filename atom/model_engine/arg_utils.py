@@ -417,6 +417,11 @@ class EngineArgs:
             "it will compute (prompt minus the prefix any rank already put in "
             "the tier); needs --enable_prefix_caching and "
             "ATOM_FRONTEND_PREFIX_HASH=1, excludes ATOM_DP_SESSION_AFFINITY. "
+            "'prefix_spread': keep a request on the rank holding its prompt's "
+            "prefix unless that rank has a prefill backlog and another is "
+            "about to idle (ATOM_DP_PREFIX_IDLE_TOKENS); the moved request "
+            "loads its prefix from the offload tier. Needs prefix caching; "
+            "excludes ATOM_DP_SESSION_AFFINITY. "
             "Has no effect when data_parallel_size == 1.",
         )
         parser.add_argument(

@@ -718,15 +718,26 @@ def test_config_refuses_pools_without_rdma():
 def test_engine_compatibility_refuses_what_phase_one_does_not_move():
     cfg = parse_mooncake_store_config(_extra())
     check_engine_compatibility(cfg, _config())
-    hybrid = _config()
-    hybrid.hf_config.compress_ratios = [4, 128]
-    with pytest.raises(ValueError, match="only the dense KV layout"):
-        check_engine_compatibility(cfg, hybrid)
+    state_owning = _config()
+    state_owning.hf_config.model_type = "kimi_linear"
+    with pytest.raises(ValueError, match="dense KV layout and V4.1's replay PAGEs"):
+        check_engine_compatibility(cfg, state_owning)
     with pytest.raises(ValueError, match="decode context parallelism"):
         check_engine_compatibility(cfg, _config(decode_context_parallel_size=4))
     odd = parse_mooncake_store_config(_extra(chunk_tokens=6))
     with pytest.raises(ValueError, match="multiple of the KV cache block size 4"):
         check_engine_compatibility(odd, _config())
+
+
+def test_engine_compatibility_accepts_v41_page_replay():
+    config = _config()
+    config.enable_encoder_swa_bounded_replay = True
+    config.hf_config.model_type = "deepseek_v41"
+    cfg = parse_mooncake_store_config(_extra())
+    check_engine_compatibility(cfg, config)
+    config.decode_context_parallel_size = 2
+    with pytest.raises(ValueError, match="decode context parallelism"):
+        check_engine_compatibility(cfg, config)
 
 
 @pytest.mark.parametrize("role_side", ["scheduler", "worker"])
@@ -1844,8 +1855,18 @@ def test_a_fresh_hit_is_loaded_without_asking_again(cluster, scheduler_clock):
     assert "52" not in scheduler._looked_up_at
 
 
+def _await_store_lookup(offload, seq):
+    """Establish an actual asynchronous answer before testing load/forward work."""
+    offload.offer_lookups([seq])
+    deadline = time.monotonic() + 5.0
+    while not offload.lookup_ready(seq) and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert offload.lookup_ready(seq), "the real Store lookup did not answer"
+    assert offload._lookup_client.answered(str(seq.id))
+
+
 @pytest.fixture
-def store_engine(cluster, monkeypatch):
+def store_engine(cluster, monkeypatch, request):
     """The engine's scheduler, prefix caching on, offloading to the Store.
 
     ``withheld.on`` refuses every allocation, as a full KV cache does: a
@@ -1860,6 +1881,7 @@ def store_engine(cluster, monkeypatch):
         )
     )
     offload = MooncakeStoreOffloadScheduler(_config("offload"))
+    request.addfinalizer(offload.close)
     offload._min_load_tokens = 0
     offload.bind_block_manager(engine.block_manager)
     engine.kv_connector = offload
@@ -1885,6 +1907,7 @@ def _park_after_a_wait_for_blocks(cluster, scheduler_clock, store_engine, meanwh
     seq = Sequence(list(range(41)), BLOCK, sampling_params=SamplingParams())
     engine.add(seq)
     store_engine.withheld.on = True
+    _await_store_lookup(offload, seq)
     engine.schedule()  # lookup offered, but no KV blocks
     # Finish the asynchronous answer before simulating its lease expiry.
     assert offload.get_num_new_matched_tokens(seq) == (40, True)
@@ -1962,6 +1985,7 @@ def test_a_loaded_prefix_is_published_and_the_suffix_hashes_onto_it(
     _store_chunks(cluster, _hashes(40), range(5))
     seq = Sequence(list(range(49)), BLOCK, sampling_params=SamplingParams())
     engine.add(seq)
+    _await_store_lookup(offload, seq)
     batch, _ = engine.schedule()
     [request] = [r for r in batch.connector_meta_output.requests if r.load_spec]
     worker, _ = make_worker(namespace=offload._namespace)
@@ -2857,7 +2881,9 @@ def test_the_scheduler_finds_what_the_worker_stored(cluster, make_worker):
     assert scheduler.get_num_new_matched_tokens(turn) == (40, True)
 
 
-def test_under_pp_each_stage_fences_a_save_after_the_forwards_it_reads(cluster):
+def test_under_pp_each_stage_fences_a_save_after_the_forwards_it_reads(
+    cluster, request
+):
     """The PP save frontier runs ahead of the forwards; the fence still covers it.
 
     Under PP `schedule()` advances `num_cached_tokens` as it dispatches a
@@ -2881,17 +2907,20 @@ def test_under_pp_each_stage_fences_a_save_after_the_forwards_it_reads(cluster):
         )
     )
     offload = MooncakeStoreOffloadScheduler(_config("offload", pp=4, layers=8))
+    request.addfinalizer(offload.close)
     offload.bind_block_manager(engine.block_manager)
     engine.kv_connector = offload
     seq = Sequence(list(range(64)), BLOCK, sampling_params=SamplingParams())
     engine.add(seq)
 
-    def runner(rpcs, *, store_saves=False):
+    def runner(rpcs, *, store_saves=False, acks=None):
         """A stage's workers: they run each call in order, on one stream."""
 
         def call_func(name, *args, **_kwargs):
             if name == "forward":
                 rpcs.append(("forward", args[0]))
+                if acks is not None and args[0].pp_completion_ack:
+                    acks.append((args[0].req_ids, None))
             elif name == "process_kvconnector_output":
                 rpcs.append(("fence", args[0]))  # `start_load_kv` records it
                 # Store each save at once, so that every step emits the next.
@@ -2905,7 +2934,7 @@ def test_under_pp_each_stage_fences_a_save_after_the_forwards_it_reads(cluster):
 
         return SimpleNamespace(call_func=call_func)
 
-    head_rpcs, sent = [], []
+    head_rpcs, sent, acks = [], [], deque()
     head = SimpleNamespace(
         pp_size=4,
         scheduler=engine,
@@ -2913,21 +2942,29 @@ def test_under_pp_each_stage_fences_a_save_after_the_forwards_it_reads(cluster):
         _in_flight=deque(),
         _defer_prefix_hash=False,
         _next_idle_kv_drain=0.0,
-        runner_mgr=runner(head_rpcs, store_saves=True),
-        # The socket to the downstream stages; no stage ever returns a token.
+        runner_mgr=runner(head_rpcs, store_saves=True, acks=acks),
+        # The socket to the downstream stages. Each middle chunk is acked as
+        # soon as the head has run it, as if the later stages took no time;
+        # no stage ever returns a token.
         pp_transport=SimpleNamespace(
-            send_metadata=sent.append, recv_completion=lambda **_: None
+            send_metadata=sent.append,
+            recv_completion=lambda **_: acks.popleft() if acks else None,
         ),
         _poll_kv_transfer_progress=lambda: None,
         _poll_dynamic_chunking_calibration=lambda: None,
     )
     for name, owner in (
         ("_dispatch_connector_only_batch", PPEngineCoreProc),
+        ("_collect_pp_completions", PPEngineCoreProc),
         ("_dispatch_idle_offload_work", PPEngineCoreProc),
         ("_queue_or_flush_prefill_hashes", PPEngineCoreProc),
         ("_advance_idle_kv_transfer", EngineCore),
     ):
         setattr(head, name, getattr(owner, name).__get__(head))
+    # The Store lookup is asynchronous. Establish the answered cold-miss
+    # precondition so these steps exercise forward/save fencing rather than
+    # depending on whether the lookup thread happened to run between ticks.
+    _await_store_lookup(offload, seq)
     # The prompt's four chunks go out back to back. The next step has only
     # the last chunk's save to dispatch, while that chunk still runs.
     PPEngineCoreProc._pp_head_step(head)
@@ -2953,12 +2990,13 @@ def test_under_pp_each_stage_fences_a_save_after_the_forwards_it_reads(cluster):
             recv_metadata=lambda **_: queued.popleft() if queued else None
         ),
         pull_and_process_input_queue=lambda: not queued,  # stop once drained
-        _is_idle_rl_weights_offloaded=lambda: False,
+        _is_engine_held=lambda: False,
         _poll_and_send_kv_status=lambda: None,
     )
     PPEngineCoreProc._downstream_busy_loop(stage)
 
     for rpcs in (head_rpcs, stage_rpcs):
+        assert sum(kind == "forward" for kind, _ in rpcs) == 4
         enqueued, saves = 0, []
         for kind, item in rpcs:
             if kind == "forward":
@@ -3142,6 +3180,118 @@ def one_rank(monkeypatch):
 
 def _registering_config():
     return _config(extra=_extra(save_pool_mib=1, load_pool_mib=1))
+
+
+@pytest.mark.parametrize("replays", [False, None])
+def test_v41_registration_requires_explicit_page_replay(cluster, one_rank, replays):
+    config = _registering_config()
+    config.hf_config.model_type = "deepseek_v41"
+    config.enable_encoder_swa_bounded_replay = True
+    transfer = SimpleNamespace(
+        state_backend=SimpleNamespace(
+            state_transfer=lambda: SimpleNamespace(replays=replays)
+        )
+    )
+    worker = MooncakeStoreOffloadConnector(config)
+    try:
+        with pytest.raises(ValueError, match="requires the PAGE replay contract"):
+            worker.register_kv_caches(
+                _kv_caches(), transfer_tensors=transfer, num_blocks=8
+            )
+        assert not cluster.stores
+    finally:
+        worker.close()
+
+
+def test_v41_registration_uses_pages_without_request_slots(
+    cluster, one_rank, monkeypatch
+):
+    from atom.kv_transfer.offload import page_codec as dsv4_codec
+
+    config = _registering_config()
+    config.hf_config.model_type = "deepseek_v41"
+    config.enable_encoder_swa_bounded_replay = True
+    pages = object()
+    transfer = SimpleNamespace(
+        block_regions=pages,
+        slot_regions=[object()],
+        num_slots=64,
+        num_blocks=8,
+        state_backend=SimpleNamespace(
+            state_transfer=lambda: SimpleNamespace(replays=True)
+        ),
+    )
+    selected = {}
+
+    def page_codec(**kwargs):
+        selected.update(kwargs)
+        # The fixture's fake transfer engine uses CPU bytes. Keep its normal
+        # codec while verifying which PAGE/SLOT contract registration selects.
+        codec = worker_mod.DenseKVByteCodec(_kv_caches(), num_blocks=8)
+        monkeypatch.setattr(
+            type(codec), "has_fused_chunk_major_staging", property(lambda self: True)
+        )
+        return codec
+
+    monkeypatch.setattr(dsv4_codec, "DSV4PageSlotCodec", page_codec)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    worker = MooncakeStoreOffloadConnector(config)
+    original_slots = transfer.slot_regions
+    try:
+        worker.register_kv_caches({}, transfer_tensors=transfer, num_blocks=8)
+        assert selected["page_regions"] is pages
+        assert selected["slot_regions"] == ()
+        assert selected["num_slots"] == 0
+        assert selected["num_blocks"] == 8
+        assert transfer.slot_regions is original_slots
+        assert len(transfer.slot_regions) == 1
+        assert transfer.num_slots == 64
+        assert worker._pool is not None
+    finally:
+        worker.close()
+
+
+@pytest.mark.parametrize("field", ["spec", "callback", "copies"])
+def test_replay_page_codec_refuses_native_state_contract(field):
+    from atom.kv_transfer.offload.page_codec import replay_page_codec
+
+    transfer = SimpleNamespace(
+        block_regions=[object()],
+        slot_regions=[object()],
+        state_backend=SimpleNamespace(
+            state_transfer=lambda: SimpleNamespace(
+                replays=True, copies=field == "copies"
+            )
+        ),
+        paged_state_checkpoint_spec=object() if field == "spec" else None,
+        execute_paged_state_copies=(lambda: None) if field == "callback" else None,
+    )
+    with pytest.raises(ValueError, match="cannot carry native state checkpoints"):
+        replay_page_codec(transfer, 8)
+
+
+@pytest.mark.parametrize("replays", [None, False])
+def test_replay_page_codec_refuses_unconfirmed_replay(replays):
+    from atom.kv_transfer.offload.page_codec import replay_page_codec
+
+    transfer = SimpleNamespace(
+        block_regions=[object()],
+        slot_regions=[object()],
+        state_backend=SimpleNamespace(
+            state_transfer=lambda: SimpleNamespace(replays=replays)
+        ),
+    )
+    with pytest.raises(ValueError, match="requires the state replay contract"):
+        replay_page_codec(transfer, 8)
+
+
+def test_pure_page_codec_still_refuses_live_pd_slot():
+    from atom.kv_transfer.offload.page_codec import pure_page_codec
+
+    with pytest.raises(ValueError, match="requires empty SLOT"):
+        pure_page_codec(
+            SimpleNamespace(block_regions=[object()], slot_regions=[object()]), 8
+        )
 
 
 def test_registration_builds_the_pool_and_probes_the_store(cluster, one_rank):
@@ -3773,7 +3923,7 @@ def test_the_dense_codec_id_is_unchanged_and_v41_has_its_own():
     dense = SimpleNamespace(hf_config=SimpleNamespace(model_type="llama"))
     v41 = SimpleNamespace(hf_config=SimpleNamespace(model_type="deepseek_v41"))
     assert keys.codec_id(dense) == "dense-opaque-block-v1"  # stored entries stay valid
-    assert keys.codec_id(v41) == "replay-page-block-v1"
+    assert keys.codec_id(v41) == "v41-replay-page-v1"
 
 
 def test_an_answer_taken_late_is_as_old_as_its_store_query(cluster):
@@ -3840,3 +3990,70 @@ def _synthetic_stream_operation_completion(monkeypatch):
         return stream.synchronize()
 
     monkeypatch.setattr(staging, "fence_submitted_work", complete)
+
+
+def test_v41_architecture_alias_and_codec_identity():
+    from atom.kv_transfer.offload.mooncake_store.config import uses_replay_pages
+
+    config = _config()
+    dense = keys.store_namespace(config, CHUNK)
+    config.hf_config.model_type = "deepseek_v41"
+    config.enable_encoder_swa_bounded_replay = True
+    assert uses_replay_pages(config)
+    assert keys.store_namespace(config, CHUNK) != dense
+
+
+@pytest.mark.parametrize("blocks", [None, 0, -1])
+def test_pure_page_codec_rejects_missing_or_invalid_count(blocks):
+    from atom.kv_transfer.offload.page_codec import pure_page_codec
+
+    with pytest.raises(ValueError, match="positive num_blocks"):
+        pure_page_codec(SimpleNamespace(block_regions=[object()]), blocks)
+
+
+def test_pure_page_codec_rejects_missing_fused_staging(monkeypatch):
+    from atom.kv_transfer.offload import page_codec
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        page_codec,
+        "DSV4PageSlotCodec",
+        lambda **kw: SimpleNamespace(has_fused_chunk_major_staging=False),
+    )
+    with pytest.raises(RuntimeError, match="fused chunk-major PAGE"):
+        page_codec.pure_page_codec(SimpleNamespace(block_regions=[object()]), 8)
+
+
+def test_plain_v4_is_refused_before_weights_load():
+    """Plain DeepSeek-V4 resolves to the "hybrid" layout, which the Store does
+    not move: refused at construction, not at registration. (V4.1 without
+    bounded replay is the model's own runtime gate.)"""
+    plain_v4 = _config()
+    plain_v4.hf_config.compress_ratios = [4, 128]
+    with pytest.raises(ValueError, match="resolves to 'hybrid'"):
+        check_engine_compatibility(parse_mooncake_store_config(_extra()), plain_v4)
+
+
+@pytest.mark.parametrize(
+    "model_type", ["deepseek_v41", "deepseek_v41_text", "deepseek_v41_dspark"]
+)
+def test_every_v41_spelling_is_admitted_with_bounded_replay(model_type):
+    from atom.kv_transfer.offload.mooncake_store.config import uses_replay_pages
+
+    config = _config()
+    config.hf_config.model_type = model_type
+    config.hf_config.compress_ratios = [4, 128]
+    config.enable_encoder_swa_bounded_replay = True
+    check_engine_compatibility(parse_mooncake_store_config(_extra()), config)
+    assert uses_replay_pages(config)
+
+
+def test_store_reads_the_region_map_only_on_a_page_layout():
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+    store = {"kv_connector": "mooncake_store", "kv_role": "offload"}
+    dense = _config(kv_transfer_config=store)
+    assert not KVConnectorFactory.topology_reads_block_regions(dense)
+    v41 = _config(kv_transfer_config=store)
+    v41.hf_config.model_type = "deepseek_v41"
+    assert KVConnectorFactory.topology_reads_block_regions(v41)

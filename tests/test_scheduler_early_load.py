@@ -195,7 +195,7 @@ def test_loaded_request_is_not_promoted_ahead_of_earlier_arrivals(
     assert b.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
     sched.finished_recving_kv_req_ids.append(b.id)
 
-    sched._promote_ready_remote_kv_requests()
+    sched._prioritize_ready_remote_kv_requests()
 
     assert list(sched.waiting) == [a, b]  # a parked-and-loaded old-path request
     # would have moved up; an early-loaded one keeps its place
@@ -205,11 +205,14 @@ def test_old_path_parked_request_is_still_promoted(monkeypatch, seq_factory):
     sched, _, (a, b) = _make(monkeypatch, seq_factory, n=2)
     sched.kv_connector.not_ready_ids = {a.id, b.id}
     sched.schedule()
-    # b parked by the admission pass, not by the early load.
+    # b parked by the admission pass, not by the early load; the real
+    # admission owns its block table before it can park for a tier load.
+    sched.block_manager.allocate(b)
+    assert b.block_table
     b.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
     sched.finished_recving_kv_req_ids.append(b.id)
 
-    sched._promote_ready_remote_kv_requests()
+    sched._prioritize_ready_remote_kv_requests()
 
     assert list(sched.waiting) == [b, a]
 
@@ -221,7 +224,9 @@ def test_loaded_request_prefills_only_on_a_fire(setup):
 
     batch, _ = sched.schedule()  # still HOLD
     assert batch.total_seqs_num_prefill == 0
-    assert seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+    # Completion resolves before the delayer sizes the work, but HOLD still
+    # launches no prefill and preserves the reserved resources.
+    assert seq.status == SequenceStatus.WAITING
 
     delayer.allow = True
     batch, scheduled = sched.schedule()  # FIRE: resumes as an offload prefill
@@ -656,10 +661,12 @@ def test_finished_early_loads_are_promoted_when_the_head_has_no_slot(
     sched = _sched(monkeypatch)
     head = seq_factory(list(range(16)))
     parked = _parked(sched, seq_factory, sched.max_num_seqs)
+    for seq in parked:
+        sched.block_manager.allocate(seq)
     sched.waiting.extend([head, *parked])
     sched._num_parked_remote_kv = sched.max_num_seqs
     sched.finished_recving_kv_req_ids = [seq.id for seq in parked]
-    sched._promote_ready_remote_kv_requests()
+    sched._prioritize_ready_remote_kv_requests()
     assert list(sched.waiting)[: len(parked)] == parked
     assert sched.waiting[-1] is head
 
@@ -706,3 +713,28 @@ def test_a_routed_estimate_is_reported_once_with_the_reuse_found(
     unplaced = seq_factory(list(range(64)))
     sched._note_dp_reuse(unplaced)
     assert sched.dp_reuse_reports == [(seq.id, 16)]
+
+
+def test_settled_early_owner_keeps_fifo_until_the_head_cannot_allocate(
+    monkeypatch, seq_factory
+):
+    sched, _, (head, owner) = _make(monkeypatch, seq_factory, n=2)
+    sched.kv_connector.not_ready_ids = {head.id}
+    sched.schedule()
+    assert owner.block_table and owner.id in sched._early_load.entries
+    sched.finished_recving_kv_req_ids.append(owner.id)
+    for _ in range(3):
+        sched.schedule()
+        assert owner.status == SequenceStatus.WAITING
+        assert owner.id in sched._early_load.entries
+        assert list(sched.waiting) == [head, owner]
+    assert owner.id not in sched.finished_recving_kv_req_ids
+    original = sched.block_manager.can_allocate_memoized
+    monkeypatch.setattr(
+        sched.block_manager,
+        "can_allocate_memoized",
+        lambda seq: -1 if seq is head else original(seq),
+    )
+    sched._prioritize_ready_remote_kv_requests()
+    assert list(sched.waiting) == [owner, head]
+    assert owner.block_table

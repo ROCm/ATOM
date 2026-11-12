@@ -183,6 +183,16 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         rank answers alike, and `ForwardMode.decide` agrees it across DP."""
         return False
 
+    def consumes_device_verdict(self, batch: ScheduledBatch, max_seqlen_q: int) -> bool:
+        """True when this step's metadata advances from the previous verify's
+        verdict on the device, not from its host-side status (the rejected /
+        bonus counts): the runner then builds the step as if no draft had been
+        rejected and waits for that status only after the target's launch
+        (`tokenIDProcessor.prepare_input_ids`' `defer_spec_status`). Asked
+        once a step, before its input ids, from the batch and the forwards
+        before it, alike on every TP rank."""
+        return False
+
     def close(self):
         """Release backend-owned host workers and mapped resources."""
         self.release_kv_pools()
@@ -568,7 +578,7 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         ) // self.block_size
         # Width of every `block_tables` buffer, and of anything gathered from one.
         self.block_table_cols = self.max_num_blocks_per_seq // self.block_ratio
-        # Per-rank attention head count. eagle.propose's mid-step path reads
+        # Per-rank attention head count. EagleProposer._propose's mid-step path reads
         # this to gate the `do_attn_metadata_update` branch. Subclasses that
         # need a kernel-minimum-padded count set `self.padded_num_attention_heads`
         # separately (it does NOT replace this attribute).

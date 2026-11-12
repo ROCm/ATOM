@@ -4,7 +4,7 @@
 """Store keys for KV chunks: a layout namespace, a rank, and a prefix hash.
 
 One Store object holds one PP/TP rank's bytes of one ``chunk_tokens`` chunk of
-a prompt, exactly as the dense codec packs them. Its key is
+a prompt, as packed by its dense or replay PAGE codec. Its key is
 
     ``{namespace}/w{rank}of{world}/{digest}``
 
@@ -44,16 +44,14 @@ DIGEST_BYTES = 16
 _CHAIN_PERSON = b"atom-kv-chain-v1"
 _MEDIA_SEED_PERSON = b"atom-kv-media-v1"
 _NAMESPACE_PREFIX = "atomkv1-"
-# One id per chunk byte layout, bumped when that layout changes: the dense layout
-# keeps its id (and its stored entries); V4.1 stores PAGE bytes and rebuilds
-# state by replay.
-DENSE_CODEC_ID = "dense-opaque-block-v1"
-REPLAY_PAGE_CODEC_ID = "replay-page-block-v1"
+# Bumped when the dense codec's per-chunk byte layout changes.
+CODEC_ID = "dense-opaque-block-v1"
+REPLAY_PAGE_CODEC_ID = "v41-replay-page-v1"
 
 
 def codec_id(config: Any) -> str:
-    """The byte layout `config`'s chunks are stored in."""
-    return REPLAY_PAGE_CODEC_ID if uses_replay_pages(config) else DENSE_CODEC_ID
+    """The byte layout used by this configuration, preserving main namespaces."""
+    return REPLAY_PAGE_CODEC_ID if uses_replay_pages(config) else CODEC_ID
 
 
 def pp_stage_layer_spans(config: Any) -> list[tuple[int, int]]:

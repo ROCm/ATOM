@@ -381,11 +381,14 @@ def test_triton_wrapper_only_enqueues_on_the_supplied_stream(
         5,
         10,
     )
-    assert kernel_kwargs == {
+    expected_kwargs = {
         "REVERSE": True,
         "TILE": triton_page_slot.TILE_BYTES,
         "num_warps": 8,
     }
+    if wrapper_name == "scatter_region_items":
+        expected_kwargs.update(ITEMS_PER_CHUNK=1, CHUNK_STRIDE=10)
+    assert kernel_kwargs == expected_kwargs
 
 
 @pytest.mark.parametrize("unit_bytes", [1023, 1024, 1025, 2049])
