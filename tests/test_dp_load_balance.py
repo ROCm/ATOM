@@ -565,7 +565,7 @@ def test_concurrent_store_dispatch_accounts_in_socket_send_order():
     from types import SimpleNamespace
 
     mgr = _make_mgr(1)
-    mgr._store_router = SimpleNamespace(charge=lambda _sid: 0)
+    mgr._store_router = SimpleNamespace(charge=lambda _sid, _credit: 0)
     mgr._backlog_report = [None]
     mgr._backlog_sent = [0]
     mgr._backlog_unseen = [deque()]

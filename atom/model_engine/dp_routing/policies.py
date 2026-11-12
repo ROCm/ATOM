@@ -142,10 +142,10 @@ class ShareCachePolicy(LoadPolicy):
         if explicit_rank is not None:
             return super().select(seq, explicit_rank)
         placed = self.router.select(seq, self.backlog(), self.rank_reqs())
-        return Route(placed.rank, placed.decision)
+        return placed
 
     def charge(self, seq: Any, credit: int) -> int:
-        hit = self.router.charge(seq.id)
+        hit = self.router.charge(seq.id, credit)
         seq.dp_est_cached_tokens = int(hit)
         return hit
 
@@ -156,8 +156,7 @@ class ShareCachePolicy(LoadPolicy):
         self.router.prefill_complete(seq_id)
 
     def release(self, seq_id: Any) -> dict:
-        self.router.release(seq_id)
-        return {}
+        return self.router.release(seq_id)
 
     def reset(self) -> None:
         self.router.reset()
