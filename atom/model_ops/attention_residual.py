@@ -112,7 +112,8 @@ class AttnRes(nn.Module):
         self.eps = 1e-6 if norm is None else _rms_eps(norm)
         self.out_eps = 1e-6 if out_norm is None else _rms_eps(out_norm)
         self.score_weight: torch.Tensor | None = None
-        # Set only on the site that closes out blocks (see maybe_close_block).
+        # Set on a site handed the whole bank: it mixes the slots closed before
+        # layer `layer_idx`, which `maybe_close_block` writes.
         self.block_size = block_size
         self.layer_idx = layer_idx
 
@@ -170,9 +171,7 @@ class AttnRes(nn.Module):
         if prefix_sum is None:
             prefix_sum, add_hidden, add_hidden2 = add_hidden, add_hidden2, None
         assert prefix_sum is not None
-        if self.block_size is not None and block_residual is not None:
-            # the closing site gets the whole bank; mix the slots closed so far
-            block_residual = block_residual[:, : -(-self.layer_idx // self.block_size)]
+        block_residual = self.window(block_residual)
 
         if self.enabled and block_residual is not None and block_residual.shape[1] > 0:
             score_weight = self.score_weight
@@ -202,6 +201,13 @@ class AttnRes(nn.Module):
         mixed = prefix_sum if self.out_norm is None else self.out_norm(prefix_sum)
         return mixed, prefix_sum
 
+    def window(self, block_residual: torch.Tensor | None) -> torch.Tensor | None:
+        """The bank's slots this site mixes. Sliced here, not by the caller: in
+        a compiled forward a view must not cross a graph split."""
+        if self.block_size is None or block_residual is None:
+            return block_residual
+        return block_residual[:, : -(-self.layer_idx // self.block_size)]
+
     def maybe_close_block(
         self,
         prefix_sum: torch.Tensor,
@@ -209,16 +215,15 @@ class AttnRes(nn.Module):
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Copy ``prefix_sum`` into its slot of the bank every ``block_size`` layers.
 
-        Returns ``(a view of the closed slots, prefix_sum)``. A closed-out block
+        Returns the new ``(block_residual, prefix_sum)``. A closed-out block
         leaves prefix_sum None: the running sum has been banked as a candidate
         and the next site starts a fresh one from whatever it is handed.
-        Residuals disabled means no change.
+        Residuals disabled, or a layer mid-block, means no change.
         """
         if not self.enabled or self.block_size is None:
             return block_residual, prefix_sum
+        if self.layer_idx % self.block_size != 0:
+            return block_residual, prefix_sum
         assert block_residual is not None
-        slot, mid_block = divmod(self.layer_idx, self.block_size)
-        if not mid_block:
-            block_residual[:, slot].copy_(prefix_sum)
-            prefix_sum = None
-        return block_residual[:, : slot + 1], prefix_sum
+        block_residual[:, self.layer_idx // self.block_size].copy_(prefix_sum)
+        return block_residual, None

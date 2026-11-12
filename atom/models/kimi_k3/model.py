@@ -1815,6 +1815,9 @@ class KimiDecoderLayer(nn.Module):
             getattr(self, "mlp_res_norm", None),
             out_norm=self.post_attention_layernorm,
             enabled=self.use_attn_residuals,
+            # after this layer's close: the next layer's attention site's slots
+            block_size=getattr(config, "attn_res_block_size", None),
+            layer_idx=layer_num + 1,
         )
 
     def _ffn(
@@ -1883,9 +1886,10 @@ class KimiDecoderLayer(nn.Module):
         rows = _SequenceParallel(
             attn_partial.shape[0], moe.tp_size, get_tensor_model_parallel_rank()
         )
+        window = self.mlp_attn_res.window(block_residual)
         hidden_rows, prefix_rows = self.mlp_attn_res(
             None if prefix_sum is None else rows.shard(prefix_sum),
-            None if block_residual is None else rows.shard(block_residual),
+            None if window is None else rows.shard(window),
             rows.scatter(attn_partial),
         )
         residual = moe.row_sharded_moe(rows.gather(hidden_rows), rows, prefix_rows)
@@ -1907,7 +1911,7 @@ class KimiDecoderLayer(nn.Module):
         hidden_states, prefix_sum = self.self_attention_attn_res(
             hidden_states, block_residual, pending_add, pending_add2
         )
-        closed, prefix_sum = self.self_attention_attn_res.maybe_close_block(
+        block_residual, prefix_sum = self.self_attention_attn_res.maybe_close_block(
             prefix_sum, block_residual
         )
 
@@ -1920,7 +1924,7 @@ class KimiDecoderLayer(nn.Module):
         # attn_res kernel folds both into its prefix on-load, so the [T, H]
         # elementwise add that would combine them here never runs.
         prefix_sum, hidden_states, shared = self._post_attention(
-            hidden_states, prefix_sum, closed
+            hidden_states, prefix_sum, block_residual
         )
         return prefix_sum, hidden_states, shared, block_residual
 
