@@ -12,13 +12,11 @@ token copies. Neither backend is converted to a Python list of vocabulary IDs.
 import torch
 
 from atom.constraint_parser import ConstraintBinding, register_constraint_request_owner
-
 from atom.model_ops.required_channel import (
     DeviceChannel,
     advance_states,
     constrain_logits,
 )
-
 
 _PROVIDERS = []
 
@@ -32,7 +30,9 @@ def register_constraint_provider(provider):
     if any(existing.backend == provider.backend for existing in _PROVIDERS):
         raise ValueError(f"Duplicate constraint backend: {provider.backend}")
     if not callable(getattr(provider, "hard_requests", None)):
-        raise TypeError("Constraint adapters must declare hard_requests(binding, batch)")
+        raise TypeError(
+            "Constraint adapters must declare hard_requests(binding, batch)"
+        )
     if not hasattr(provider, "mask_stage") or not hasattr(provider, "commit_order"):
         raise TypeError("Constraint adapters must declare mask_stage and commit_order")
     owns_request = getattr(provider, "owns_request", None)
@@ -48,8 +48,10 @@ def has_constraints(batch):
 
 
 def needs_constraint_snapshot(batch, metadata):
-    return any(provider.enabled(batch) and provider.masks_source(metadata)
-               for provider in _PROVIDERS)
+    return any(
+        provider.enabled(batch) and provider.masks_source(metadata)
+        for provider in _PROVIDERS
+    )
 
 
 def _bindings(batch):
@@ -58,7 +60,9 @@ def _bindings(batch):
             continue
         binding = provider.bind(batch)
         if binding is None:
-            raise ValueError(f"Enabled constraint adapter {provider.backend} did not bind")
+            raise ValueError(
+                f"Enabled constraint adapter {provider.backend} did not bind"
+            )
         yield provider, binding
 
 
@@ -86,7 +90,9 @@ def constraint_errors(runner):
     return errors
 
 
-def apply_required_channel(runner, batch, logits, metadata=None, target=None, preserve_masks=False):
+def apply_required_channel(
+    runner, batch, logits, metadata=None, target=None, preserve_masks=False
+):
     """GPU-only force/deny backend, also used by disaggregated prefill."""
     channel = batch.required_channel
     if channel is None:
@@ -139,7 +145,9 @@ class TokenConstraints:
         step.providers = bindings
         step.rule_counts = None
         if len(bindings) > 1:
-            step.rule_counts = torch.zeros(batch.total_seqs_num, dtype=torch.int32, device=logits.device)
+            step.rule_counts = torch.zeros(
+                batch.total_seqs_num, dtype=torch.int32, device=logits.device
+            )
             for provider, binding in bindings:
                 indices = provider.hard_requests(binding, batch)
                 if indices:
@@ -159,19 +167,29 @@ class TokenConstraints:
         step.gather()
         if len(bindings) > 1:
             selected = step.rule_counts > 1
-            step.invalid = _merge_invalid(step.invalid, _guard_empty_rows(step.logits, selected))
+            step.invalid = _merge_invalid(
+                step.invalid, _guard_empty_rows(step.logits, selected)
+            )
             if step.target is not None:
                 end = metadata.cu_num_draft_tokens
                 counts = end - torch.cat((torch.zeros_like(end[:1]), end[:-1]))
-                owners = torch.repeat_interleave(selected, counts.long(), output_size=step.target.shape[0])
-                step.target_invalid = _merge_invalid(step.target_invalid, _guard_empty_rows(step.target, owners))
+                owners = torch.repeat_interleave(
+                    selected, counts.long(), output_size=step.target.shape[0]
+                )
+                step.target_invalid = _merge_invalid(
+                    step.target_invalid, _guard_empty_rows(step.target, owners)
+                )
         return step
 
     def commit(self, sampled_tokens, batch, deferred, failure):
         """Consume synchronized, accepted IDs, never unverified draft IDs."""
         channel_states = None
-        for provider, binding in sorted(self.providers, key=lambda item: item[0].commit_order):
-            result = provider.commit(self, sampled_tokens, batch, deferred, failure, binding)
+        for provider, binding in sorted(
+            self.providers, key=lambda item: item[0].commit_order
+        ):
+            result = provider.commit(
+                self, sampled_tokens, batch, deferred, failure, binding
+            )
             if result is not None:
                 if channel_states is not None:
                     raise ValueError("Multiple constraint adapters returned GPU carry")
@@ -182,17 +200,23 @@ class TokenConstraints:
         if self.logits is not None:
             return
         if self.metadata is None:
-            self.logits = self.source[:self.batch.total_seqs_num]
+            self.logits = self.source[: self.batch.total_seqs_num]
         else:
-            self.logits = torch.index_select(self.source, 0, self.metadata.bonus_logits_indices)
-            self.target = torch.index_select(self.source, 0, self.metadata.target_logits_indices)
+            self.logits = torch.index_select(
+                self.source, 0, self.metadata.bonus_logits_indices
+            )
+            self.target = torch.index_select(
+                self.source, 0, self.metadata.target_logits_indices
+            )
 
     def failed(self, sampled):
         if self.invalid is None and self.target_invalid is None:
             return None
         invalid = self.invalid
         if invalid is None:
-            invalid = torch.zeros(self.logits.shape[0], dtype=torch.bool, device=self.logits.device)
+            invalid = torch.zeros(
+                self.logits.shape[0], dtype=torch.bool, device=self.logits.device
+            )
         if self.metadata is None:
             return invalid
         tokens = sampled.reshape(self.logits.shape[0], -1)
@@ -254,14 +278,19 @@ class GrammarProvider:
         if step.grammar is None:
             raise ValueError("Structured output must be prepared before enqueue")
         if step.source.shape[-1] != step.grammar.vocab_size:
-            raise ValueError("Target logits do not match the prepared structured vocabulary")
+            raise ValueError(
+                "Target logits do not match the prepared structured vocabulary"
+            )
         step.prefixes = step.grammar.apply(step.source, step.batch, step.metadata)
 
     @staticmethod
     def commit(step, tokens, batch, deferred, failure, binding):
         if step.prefixes:
-            step.grammar.commit(tokens if failure is None else _error_tokens(tokens, failure),
-                                batch, step.prefixes)
+            step.grammar.commit(
+                tokens if failure is None else _error_tokens(tokens, failure),
+                batch,
+                step.prefixes,
+            )
 
 
 class ChannelProvider:
@@ -302,8 +331,9 @@ class ChannelProvider:
     def apply(step, binding):
         step.gather()
         preserve = False if step.rule_counts is None else step.rule_counts > 0
-        step.channel = apply_required_channel(step.runner, step.batch, step.logits,
-                                              step.metadata, step.target, preserve)
+        step.channel = apply_required_channel(
+            step.runner, step.batch, step.logits, step.metadata, step.target, preserve
+        )
         if step.channel is not None and step.rule_counts is not None:
             step.rule_counts += (step.channel[1] >= 0).to(step.rule_counts.dtype)
 
@@ -325,6 +355,7 @@ def _guard_empty_rows(logits, selected=None):
     invalid = torch.zeros(logits.shape[0], dtype=torch.bool, device=logits.device)
     if logits.is_cuda:
         from atom.model_ops.required_channel_gpu import guard_empty_rows
+
         return guard_empty_rows(logits, selected)
     rows = selected.nonzero().flatten()
     subset = logits.index_select(0, rows)

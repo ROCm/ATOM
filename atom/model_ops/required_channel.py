@@ -46,7 +46,8 @@ from typing import NamedTuple
 
 import torch
 
-from atom.sampling_params import UNCONSTRAINED, RequiredChannel
+from atom.sampling_params import RequiredChannel
+from atom.sampling_params import UNCONSTRAINED as UNCONSTRAINED
 
 BLOCK_V = 1024
 """Vocabulary columns a `constrain_logits` program writes at a time."""
@@ -61,7 +62,6 @@ halves the first at bs 1 but quadruples the second at bs 64, and that is the
 step a request takes every time until its channel opens."""
 
 # The host's own sentinel, so both sides keep one definition of it.
-
 
 
 class DeviceChannel(NamedTuple):
@@ -86,11 +86,13 @@ class DeviceChannel(NamedTuple):
 
 def constrain_logits(*args, **kwargs):
     from atom.model_ops.required_channel_gpu import constrain_logits as execute
+
     return execute(*args, **kwargs)
 
 
 def advance_states(*args, **kwargs):
     from atom.model_ops.required_channel_gpu import advance_states as execute
+
     return execute(*args, **kwargs)
 
 
@@ -134,15 +136,17 @@ def constrain_logits_reference(
             if src >= 0:
                 base[i] = carried_states[src]
     for i, state in enumerate(base.tolist()):
-        preserve = bool(preserve_masks[i]) if isinstance(preserve_masks, torch.Tensor) else preserve_masks
+        preserve = (
+            bool(preserve_masks[i])
+            if isinstance(preserve_masks, torch.Tensor)
+            else preserve_masks
+        )
         if state < 0:
             continue
         if target_logits is not None:
             start = 0 if i == 0 else int(cu_num_draft_tokens[i - 1])
             for r in range(start, int(cu_num_draft_tokens[i])):
-                _constrain_row_reference(
-                    target_logits[r], state, channel, preserve
-                )
+                _constrain_row_reference(target_logits[r], state, channel, preserve)
                 draft = int(input_ids[int(target_logits_indices[r]) + 1])
                 state = channel.step(state, draft)
         _constrain_row_reference(last_logits[i], state, channel, preserve)

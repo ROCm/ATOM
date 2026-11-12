@@ -1,12 +1,16 @@
 # SPDX-License-Identifier: MIT
 """Lazy GPU backend for required channels."""
+
 import torch
 import triton
 import triton.language as tl
+
+from atom.model_ops.required_channel import BLOCK_V, VOCAB_PROGRAMS, DeviceChannel
 from atom.model_ops.triton_token_constraints import mask_token_columns
-from atom.model_ops.required_channel import DeviceChannel, BLOCK_V, VOCAB_PROGRAMS
 from atom.sampling_params import UNCONSTRAINED
+
 _UNCONSTRAINED = tl.constexpr(UNCONSTRAINED)
+
 
 @triton.jit
 def _step(
@@ -259,7 +263,9 @@ def constrain_logits(
         OPENS_AT=channel.opens_at,
         END_LEN=channel.end_len,
         BLOCK_V=BLOCK_V,
-        PRESERVE_MASKS=(False if isinstance(preserve_masks, torch.Tensor) else preserve_masks),
+        PRESERVE_MASKS=(
+            False if isinstance(preserve_masks, torch.Tensor) else preserve_masks
+        ),
     )
     return base
 
@@ -290,16 +296,22 @@ def advance_states(
     return out
 
 
-
-
 @triton.jit
-def _finite_tiles(logits, stride, selected, partial, vocab: tl.constexpr,
-                  tiles: tl.constexpr, BLOCK: tl.constexpr):
+def _finite_tiles(
+    logits,
+    stride,
+    selected,
+    partial,
+    vocab: tl.constexpr,
+    tiles: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
     row, tile = tl.program_id(0), tl.program_id(1)
     if tl.load(selected + row):
         columns = tile * BLOCK + tl.arange(0, BLOCK)
-        values = tl.load(logits + row * stride + columns, columns < vocab,
-                         other=float("-inf"))
+        values = tl.load(
+            logits + row * stride + columns, columns < vocab, other=float("-inf")
+        )
         finite = (values > float("-inf")) & (values < float("inf"))
         tl.store(partial + row * tiles + tile, tl.sum(finite.to(tl.int32), 0) > 0)
     else:
@@ -309,12 +321,19 @@ def _finite_tiles(logits, stride, selected, partial, vocab: tl.constexpr,
 def guard_empty_rows(logits, selected):
     """Inspect only intersection rows, without a vocabulary-sized temporary."""
     tiles = triton.cdiv(logits.shape[1], 4096)
-    partial = torch.empty((logits.shape[0], tiles), dtype=torch.bool, device=logits.device)
+    partial = torch.empty(
+        (logits.shape[0], tiles), dtype=torch.bool, device=logits.device
+    )
     if logits.shape[0] == 0:
         return torch.empty(0, dtype=torch.bool, device=logits.device)
     _finite_tiles[(logits.shape[0], tiles)](
-        logits, logits.stride(0), selected, partial,
-        vocab=logits.shape[1], tiles=tiles, BLOCK=4096,
+        logits,
+        logits.stride(0),
+        selected,
+        partial,
+        vocab=logits.shape[1],
+        tiles=tiles,
+        BLOCK=4096,
     )
     invalid = ~partial.any(dim=-1)
     logits[:, 0] = torch.where(invalid, 0.0, logits[:, 0])

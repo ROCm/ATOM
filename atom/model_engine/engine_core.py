@@ -12,6 +12,7 @@ import torch
 import zmq
 
 from atom.config import Config
+from atom.constraint_parser import needs_constraint_release
 from atom.kv_transfer.disaggregation import KVOutputAggregator
 from atom.kv_transfer.disaggregation.types import connector_metadata_has_work
 from atom.metrics.scheduler import SchedulerMetrics
@@ -32,7 +33,6 @@ from atom.model_engine.sequence import (
 )
 from atom.model_engine.state_runtime import StateRuntime
 from atom.observability import tracing
-from atom.constraint_parser import needs_constraint_release
 from atom.utils import (
     engine_process_name,
     envs,

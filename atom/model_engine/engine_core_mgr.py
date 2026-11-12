@@ -21,6 +21,7 @@ import zmq
 import zmq.asyncio
 
 from atom.config import Config
+from atom.constraint_parser import needs_constraint_release
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 from atom.model_engine.capabilities import pcp_group_size_of
 from atom.model_engine.collective_rpc import (
@@ -58,7 +59,6 @@ from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence
 from atom.observability import tracing
 from atom.structured_output import is_structured
-from atom.constraint_parser import needs_constraint_release
 from atom.utils import (
     envs,
     get_open_zmq_inproc_path,

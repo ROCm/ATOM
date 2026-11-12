@@ -83,11 +83,11 @@ from atom.model_engine.sequence import (
 from atom.model_engine.state_runtime import StateRuntime
 from atom.model_engine.token_constraints import (
     TokenConstraints,
-    prepare_token_constraints,
-    release_token_constraints,
+    constraint_errors,
     has_constraints,
     needs_constraint_snapshot,
-    constraint_errors,
+    prepare_token_constraints,
+    release_token_constraints,
 )
 from atom.model_engine.token_logprobs import (
     LogprobRows,

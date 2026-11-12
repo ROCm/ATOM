@@ -33,8 +33,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
-from atom.sampling_params import RequiredChannel
 from atom.constraint_parser import ConstraintParser
+from atom.sampling_params import RequiredChannel
 
 # A tool name is an identifier, which is what the model was given.
 #
@@ -357,7 +357,6 @@ class ToolCallParser(ConstraintParser, ABC):
     @classmethod
     def channel_rule(cls):
         """Declare the format's required tool channel, if any."""
-        return None
 
     @classmethod
     def required_call_channel(cls, tokenizer) -> RequiredChannel | None:
@@ -371,9 +370,12 @@ class ToolCallParser(ConstraintParser, ABC):
     @classmethod
     def tool_call_grammar(cls, functions, *, required, starts_in_reasoning):
         """Compatibility bridge for format grammar declarations."""
-        return cls.parse(cls.tool_grammar_rule(
-            functions, required=required, starts_in_reasoning=starts_in_reasoning
-        ), None)
+        return cls.parse(
+            cls.tool_grammar_rule(
+                functions, required=required, starts_in_reasoning=starts_in_reasoning
+            ),
+            None,
+        )
 
     @classmethod
     def opens_region(cls, marker: str) -> bool:

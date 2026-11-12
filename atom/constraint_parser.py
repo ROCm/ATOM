@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: MIT
 """Declarative constraint parsing without importing execution backends."""
 
-from dataclasses import dataclass
 import logging
+from dataclasses import dataclass
+from typing import ClassVar
 
 
 def _grammar_owns_request(request):
     from atom.structured_output import is_structured
+
     return is_structured(request)
 
 
@@ -60,6 +62,7 @@ class ConstraintBinding:
     Bindings are rebuilt at the engine boundary; provider objects never cross
     sequence IPC and do not replace native RequiredChannel/grammar objects.
     """
+
     backend: str
     value: object
 
@@ -71,7 +74,7 @@ class ConstraintParser:
     grammar rules. Each keeps its native representation and execution backend.
     """
 
-    _adapters = {}
+    _adapters: ClassVar[dict] = {}
 
     @classmethod
     def register(cls, rule_type, backend, adapter):
@@ -86,7 +89,9 @@ class ConstraintParser:
         try:
             _, adapter = cls._adapters[type(rule)]
         except KeyError:
-            raise TypeError(f"Unsupported constraint rule: {type(rule).__name__}") from None
+            raise TypeError(
+                f"Unsupported constraint rule: {type(rule).__name__}"
+            ) from None
         return adapter(rule, context)
 
     @classmethod
@@ -101,12 +106,17 @@ class ConstraintParser:
 
 
 def _parse_grammar(rule, adapter):
-    return adapter.compile_json_schema(rule.schema, rule.tool_format, rule.reasoning_end)
+    return adapter.compile_json_schema(
+        rule.schema, rule.tool_format, rule.reasoning_end
+    )
 
 
 def _parse_tool_grammar(rule, adapter):
-    return rule.builder(rule.functions, required=rule.required,
-                        starts_in_reasoning=rule.starts_in_reasoning)
+    return rule.builder(
+        rule.functions,
+        required=rule.required,
+        starts_in_reasoning=rule.starts_in_reasoning,
+    )
 
 
 def _parse_channel(rule, adapter):
@@ -135,8 +145,10 @@ def _parse_channel(rule, adapter):
         )
         return None
     return RequiredChannel(
-        after=ids(rule.after), opening=opening,
-        opens_at=len(start), end_ids=ids(rule.end),
+        after=ids(rule.after),
+        opening=opening,
+        opens_at=len(start),
+        end_ids=ids(rule.end),
     )
 
 

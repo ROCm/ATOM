@@ -235,8 +235,9 @@ class KimiK3Parser(ToolCallParser):
 
     @classmethod
     def tool_grammar_rule(cls, functions, *, required, starts_in_reasoning):
-        return ToolGrammarRule(build_tool_call_grammar, functions,
-                               required, starts_in_reasoning)
+        return ToolGrammarRule(
+            build_tool_call_grammar, functions, required, starts_in_reasoning
+        )
 
     @classmethod
     def channel_rule(cls):
