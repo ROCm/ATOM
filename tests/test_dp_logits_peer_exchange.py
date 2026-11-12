@@ -17,6 +17,7 @@ import datetime
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -46,6 +47,7 @@ def _validate_peer_exchange():
     from aiter.dist.device_communicators.custom_all_reduce import CustomAllreduce
 
     from atom.distributed.dp_logits_exchange import PeerLogitsExchange
+    from atom.model_ops.embed_head import ParallelLMHead
 
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ.get("LOCAL_RANK", rank))
@@ -66,6 +68,14 @@ def _validate_peer_exchange():
     )
     stream = torch.cuda.Stream()
     generator = torch.Generator(device=device).manual_seed(91973 + rank)
+    shared = torch.Generator(device=device).manual_seed(4049)
+    # The fields ParallelLMHead._vocab_shard_logits reads: a replicated
+    # [vocab, hidden] head without bias.
+    head = SimpleNamespace(
+        num_embeddings=4 * 32320,
+        bias=None,
+        weight=torch.empty((4 * 32320, 64), device=device, dtype=torch.bfloat16),
+    )
     report = {"rank": rank, "tests": []}
     cases = []
 
@@ -103,16 +113,23 @@ def _validate_peer_exchange():
         actual = copy_in(x, local_rows)
         torch.cuda.synchronize()
         assert torch.equal(expected.view(torch.int16), actual.view(torch.int16))
-        # The lm_head's entry: a GEMM writes this rank's shard into the pool.
+        # The lm_head's entry, as shipped: ``_vocab_shard_logits`` (tgemm.mm)
+        # writes this rank's vocab shard of the gathered hidden rows straight
+        # into its slot of the pool. Every rank holds the same hidden rows and
+        # head, as after the DP all-gather.
         hidden = torch.randn(
-            (4 * rows, 64), generator=generator, device=device, dtype=torch.bfloat16
+            (4 * rows, 64), generator=shared, device=device, dtype=torch.bfloat16
         )
-        head = torch.randn(
-            (64, 32320), generator=generator, device=device, dtype=torch.bfloat16
+        head.weight.normal_(generator=shared)
+        expected = reference(
+            ParallelLMHead._vocab_shard_logits(head, hidden, rank, 4), local_rows
         )
-        expected = reference(torch.mm(hidden, head), local_rows)
         actual = exchange.produce(
-            lambda dst, a=hidden, b=head: torch.mm(a, b, out=dst), rows, local_rows
+            lambda dst, h=hidden: ParallelLMHead._vocab_shard_logits(
+                head, h, rank, 4, out=dst
+            ),
+            rows,
+            local_rows,
         )
         torch.cuda.synchronize()
         assert torch.equal(expected.view(torch.int16), actual.view(torch.int16))

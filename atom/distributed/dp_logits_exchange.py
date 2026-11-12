@@ -97,9 +97,11 @@ class PeerLogitsExchange:
         if len(pointers) != 4 or not all(pointers):
             raise RuntimeError("Every peer must map the logits pool")
         self.peers = torch.tensor(pointers, dtype=torch.int64, device=self.device)
-        # This rank's own slot in the pool as a tensor, so a producer can write
-        # its logits there directly instead of staging a copy.
-        self.local = torch.as_tensor(
+        # This rank's own slot in the pool as a tensor. Private: only the
+        # ``fill`` callback that ``produce`` runs between its two barriers may
+        # write it, so a producer writes its logits there instead of staging
+        # a copy.
+        self._local = torch.as_tensor(
             DeviceBytes(self.buffer.data_ptr, 4 * max_rows * vocab_shard * width),
             device=self.device,
         ).view(dtype)
@@ -120,9 +122,16 @@ class PeerLogitsExchange:
             dist.all_reduce(self.token, group=self.barrier_group)
 
     def produce(self, fill, rows, local_rows):
-        """Exchange this rank's ``[4 * rows, vocab]`` logits, which
-        ``fill(dst)`` writes straight into its slot of the pool: this rank's
-        ``[local_rows, 4 * vocab]`` rows over the whole vocab."""
+        """Exchange logits over the four ranks' vocab shards.
+
+        ``fill(dst)`` writes this rank's ``[4 * rows, vocab_shard]`` logits
+        (every rank's rows, rank-major, over this rank's vocab shard) straight
+        into its slot of the pool; ``dst`` is valid only inside the call.
+        Returns ``[local_rows, 4 * vocab_shard]``: this rank's first
+        ``local_rows`` rows with the four ranks' vocab shards concatenated in
+        rank order."""
+        if self._local is None:
+            raise RuntimeError("The peer logits pool is closed")
         if rows > self.max_rows or not 0 <= local_rows <= rows:
             raise ValueError("Input rows exceed the peer pool capacity")
         output = torch.empty(
@@ -134,7 +143,7 @@ class PeerLogitsExchange:
         output_words = output.view(torch.int64)
         vocab_words = self.vocab // 4
         self._barrier()
-        fill(self.local[: 4 * rows * self.vocab].view(4 * rows, self.vocab))
+        fill(self._local[: 4 * rows * self.vocab].view(4 * rows, self.vocab))
         self._barrier()
         if local_rows:
             _gather[(triton.cdiv(local_rows * vocab_words, 4096), 4)](
@@ -151,6 +160,9 @@ class PeerLogitsExchange:
 
     def close(self):
         torch.cuda.synchronize()
+        # Drop the views into the pool before unmapping it.
+        self._local = None
+        self.peers = None
         for imported in self.imports:
             imported.close()
         self.imports.clear()
