@@ -365,3 +365,34 @@ def test_hashing_a_prompt_on_the_lookup_worker_never_blocks_a_token_append():
         lookup.close()
     finally:
         store_sched.store_client.MooncakeStoreClient = original
+
+
+def test_pending_store_fallback_never_blocks_the_admission_thread():
+    gate = Event()
+    entered = Event()
+
+    class Backend:
+        def lookup(self, seq, lookup_id=None):
+            entered.set()
+            assert gate.wait(5)
+            return 8192
+
+    client = AsyncStoreLookup(Backend(), capacity=4)
+    seq = SimpleNamespace(id="pending")
+    try:
+        assert client.submit(seq, "pending")
+        assert entered.wait(1)
+        start = time.monotonic()
+        for _ in range(4):
+            assert client.lookup(seq, lookup_id="pending") is None
+        assert time.monotonic() - start < 0.2
+        assert client.is_pending("pending")
+        gate.set()
+        deadline = time.monotonic() + 1
+        while not client.poll("pending") and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert client.lookup(seq, lookup_id="pending") == 8192
+        assert not client.is_pending("pending")
+    finally:
+        gate.set()
+        client.close()
