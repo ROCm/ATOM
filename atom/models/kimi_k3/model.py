@@ -881,11 +881,10 @@ class KimiFullAttention(nn.Module):
             o_type.value if self.fuse_sigmoid_mul_quant else QuantType.No.value
         )
 
-    def _gated_core(
-        self, positions: torch.Tensor, hidden_states: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """sigmoid(g_proj) * attention output, i.e. ``o_proj``'s input, and its
-        activation scale when ``o_proj`` runs fp8 (else None)."""
+    def _mla_inputs(self, positions: torch.Tensor, hidden_states):
+        """``fused_qkv_a_proj``, the q_a / kv_a RMSNorms (+ q's activation quant)
+        and the indexer: ``(hidden_states, hidden_states_scale, q, q_scale, kv,
+        k_rope)``, the MLA module's inputs and g_proj's."""
         # deepseek_v2 pattern: one _fuse_rmsnorm_quant kernel does q_a norm +
         # kv_a norm (+ q-activation quant), then q's scale is forwarded into the
         # MLA module (q_proj consumes it).
@@ -939,6 +938,16 @@ class KimiFullAttention(nn.Module):
                 positions,
                 projected_k_weights=(projected[3], projected[4]),
             )
+        return hidden_states, hidden_states_scale, q, q_scale, kv, k_rope
+
+    def _gated_core(
+        self, positions: torch.Tensor, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """sigmoid(g_proj) * attention output, i.e. ``o_proj``'s input, and its
+        activation scale when ``o_proj`` runs fp8 (else None)."""
+        hidden_states, hidden_states_scale, q, q_scale, kv, k_rope = self._mla_inputs(
+            positions, hidden_states
+        )
         attn_out = self.attn(q, kv, k_rope, positions, q_scale=q_scale)
         gate = self.g_proj(hidden_states, hidden_states_scale)
         # BF16 output gating uses the shared fused sigmoid/mul. When o_proj
@@ -964,6 +973,59 @@ class KimiFullAttention(nn.Module):
         kernel that applies ``o_proj`` itself (``mono.weights.bind_moe`` refuses
         a quantized ``o_proj``, so there is never an activation scale)."""
         attn_out, attn_scale = self._gated_core(positions, hidden_states)
+        assert attn_scale is None, "o_proj is quantized; K2 reads it as bf16"
+        return attn_out
+
+    def forward_latent(self, positions: torch.Tensor, hidden_states):
+        """K3 mono decode, ``ATOM_MONO_MLA_POST``: ``forward_pre_o`` up to the MLA
+        decode's latent output -- no v-up, g_proj or output gate, which the
+        layer's K2 launch runs. Returns ``(o [rows, heads, kv_lora_rank] bf16,
+        hidden_states, hidden_states_scale)``; the last two are g_proj's input."""
+        hidden_states, hidden_states_scale, q, q_scale, kv, k_rope = self._mla_inputs(
+            positions, hidden_states
+        )
+        o = self.attn.impl.forward_impl(
+            q, kv, k_rope, positions=positions, q_scale=q_scale, latent_out=True
+        )
+        return o, hidden_states, hidden_states_scale
+
+    def forward_prepped(
+        self,
+        positions: torch.Tensor,
+        x: torch.Tensor,
+        x_scale: torch.Tensor,
+        q: torch.Tensor | None = None,
+        q_scale: torch.Tensor | None = None,
+        kv: torch.Tensor | None = None,
+        k_rope: torch.Tensor | None = None,
+        q_out: torch.Tensor | None = None,
+        latent_out: bool = False,
+    ) -> torch.Tensor:
+        """K3 mono decode, ``ATOM_MONO_MLA_PREP``: ``forward_pre_o`` (or, with
+        ``latent_out``, ``forward_latent``'s latent) from where the preceding
+        layer's K2 launch stopped: after ``_mla_inputs`` (sub-mode 2: ``q`` /
+        ``q_scale``, q_a_layernorm's per-token FP8, ``kv``, ``k_rope``) or after
+        the rope / KV-cache write (sub-mode 3: ``q_out``). ``x`` / ``x_scale``:
+        the seam's per-token FP8 activation, g_proj's input."""
+        if q_out is not None:
+            attn_out = self.attn.impl.forward_decode_prebuilt(
+                q_out, latent_out=latent_out
+            )
+            if latent_out:
+                return attn_out
+        elif latent_out:
+            return self.attn.impl.forward_impl(
+                q, kv, k_rope, positions=positions, q_scale=q_scale, latent_out=True
+            )
+        else:
+            attn_out = self.attn(q, kv, k_rope, positions, q_scale=q_scale)
+        gate = self.g_proj(x, x_scale)
+        attn_out, attn_scale = fused_sigmoid_mul_maybe_quant(
+            attn_out,
+            gate,
+            quant=self.fuse_sigmoid_mul_quant,
+            quant_type_value=self.o_proj_quant_type_value,
+        )
         assert attn_scale is None, "o_proj is quantized; K2 reads it as bf16"
         return attn_out
 
