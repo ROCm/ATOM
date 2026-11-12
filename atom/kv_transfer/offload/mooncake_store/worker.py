@@ -5,7 +5,8 @@
 
 Everything but the transport is the dense offload's: the executors and the
 per-step producer fence (``start_load_kv``), the completion reports, the block
-GPU connector and a dense or replay PAGE codec. What changes is where a packed chunk goes:
+GPU connector and a dense, M3 PAGE, or V4.1 replay PAGE codec. A packed chunk
+moves through:
 
 * save: KV blocks --pack, copy--> a slot of the registered transfer pool
   --``batch_put_from``--> the Store owners;
@@ -49,20 +50,18 @@ from typing import Any
 import torch
 
 from atom.kv_transfer.disaggregation.types import SaveOperationId, SaveSourceGroupId
+from atom.kv_transfer.offload import atom_lmcache_staging
 from atom.kv_transfer.offload._block_gpu_connector import (
     _DEFAULT_GPU_STAGING_BYTES,
     BlockGPUConnector,
 )
 from atom.kv_transfer.offload._offload_common import pp_aware_rank_and_world
-from atom.kv_transfer.offload.capabilities import replays_state
 from atom.kv_transfer.offload.dense.connector import DenseOffloadConnector
-from atom.kv_transfer.offload.dense.kv_byte_codec import DenseKVByteCodec
 from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata, LMCacheReqMeta
 from atom.kv_transfer.offload.mooncake_store import client as store_client
 from atom.kv_transfer.offload.mooncake_store.config import (
     check_engine_compatibility,
     parse_mooncake_store_config,
-    uses_replay_pages,
 )
 from atom.kv_transfer.offload.mooncake_store.keys import (
     DIGEST_BYTES,
@@ -72,6 +71,7 @@ from atom.kv_transfer.offload.mooncake_store.keys import (
     probe_key,
     store_namespace,
 )
+from atom.kv_transfer.offload.mooncake_store.layouts import build_mooncake_codec
 from atom.kv_transfer.offload.mooncake_store.nic import requester_rdma_device
 from atom.kv_transfer.offload.mooncake_store.pool import (
     Slot,
@@ -84,7 +84,6 @@ from atom.kv_transfer.offload.mooncake_store.scheduler import (
     require_monotonic_clock_id,
 )
 from atom.kv_transfer.offload.mooncake_store.taint import TaintMarker
-from atom.kv_transfer.offload.page_codec import replay_page_codec
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -162,8 +161,8 @@ def _head_first_windows(start: int, end: int, size: int) -> list[range]:
 
 
 class MooncakeStoreOffloadConnector(DenseOffloadConnector):
-    """Offload worker (dense KV, or V4.1 PAGEs) whose tier is a Mooncake Store,
-    reached directly."""
+    """Offload worker (dense KV, M3 PAGE, or V4.1 replay PAGEs) whose tier is a
+    Mooncake Store, reached directly."""
 
     def __init__(self, config: Any) -> None:
         super().__init__(config)
@@ -209,16 +208,10 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
         kvc = getattr(config, "kv_transfer_config", {}) or {}
         cfg = parse_mooncake_store_config(kvc)
         threads = envs.OFFLOAD_COPY_WORKERS + envs.OFFLOAD_LOAD_WORKERS
-        metadata_bytes = 0
-        if uses_replay_pages(config):
-            from atom.kv_transfer.offload.metadata_lease import (
-                METADATA_GPU_RESERVE_BYTES,
-            )
-
-            metadata_bytes = METADATA_GPU_RESERVE_BYTES
-        return pool_allocation_bytes(
-            cfg.save_pool_bytes, cfg.load_pool_bytes
-        ) + threads * (_staging_buffer_bound() + metadata_bytes)
+        return (
+            pool_allocation_bytes(cfg.save_pool_bytes, cfg.load_pool_bytes)
+            + threads * _staging_buffer_bound()
+        )
 
     def close(self) -> None:
         """Join the executors, then release the GPU connector, pool and client."""
@@ -254,18 +247,15 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
         self._world = world
         # Scheduler blocks, threaded from the model runner. MLA stores its KV
         # token-major, so the codec cannot infer the count from shape[0].
-        if uses_replay_pages(self._config):
-            if not replays_state(transfer_tensors):
-                raise ValueError(
-                    "Mooncake Store V4.1 requires the PAGE replay contract"
-                )
-            self._codec = replay_page_codec(transfer_tensors, num_blocks)
-        else:
-            self._codec = DenseKVByteCodec(
-                kv_caches,
-                num_blocks=num_blocks,
-                permit_per_request_state=self._permit_per_request_state,
-            )
+        # The dense codec reads kv_caches. M3 and V4.1 read the PAGE region map.
+        # V4.1 also requires the replay contract; its state is not stored.
+        self._codec = build_mooncake_codec(
+            self._config,
+            kv_caches,
+            transfer_tensors,
+            num_blocks,
+            permit_per_request_state=self._permit_per_request_state,
+        )
         cfg = self._store_cfg
         namespace = store_namespace(self._config, self.chunk_size)
         device = self._codec.device
@@ -818,29 +808,10 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
                 )
                 break
             run = pool.contiguous_view(slots) if self._in_place else None
-            chunk_stride_bytes = None
-            if (
-                run is None
-                and self._in_place
-                and callable(
-                    getattr(
-                        self._codec, "chunk_major_strided_buffer_to_gpu_prepared", None
-                    )
-                )
-            ):
-                run = pool.strided_view(slots)
-                if run is not None:
-                    chunk_stride_bytes = pool.slot_stride
             t_unpack0 = time.perf_counter()
             try:
                 if run is not None:
-                    self._copy_in_place(
-                        run,
-                        window,
-                        req.block_ids,
-                        pack=False,
-                        chunk_stride_bytes=chunk_stride_bytes,
-                    )
+                    self._copy_in_place(run, window, req.block_ids, pack=False)
                     in_place_windows += 1
                 else:
                     gpu_connector.batched_to_gpu(
@@ -934,7 +905,6 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
         *,
         pack: bool,
         producer_event: Any = None,
-        chunk_stride_bytes: int | None = None,
     ) -> None:
         """Pack ``window``'s KV blocks into ``run``, or unpack it into them.
 
@@ -967,35 +937,8 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
             if pack
             else codec.chunk_major_device_buffer_to_gpu_prepared
         )
-        finish_ids = getattr(codec, "finish_prepared_block_id_groups", None)
-        try:
-            if chunk_stride_bytes is not None:
-                assert not pack
-                codec.chunk_major_strided_buffer_to_gpu_prepared(
-                    run,
-                    owner,
-                    0,
-                    stream=stream,
-                    items_per_chunk=per_chunk,
-                    chunk_stride_bytes=chunk_stride_bytes,
-                )
-            else:
-                copy(run, owner, 0, stream=stream)
-            record_ids = getattr(codec, "record_prepared_block_id_completion", None)
-            if callable(record_ids):
-                record_ids(owner)
-            from atom.kv_transfer.offload.atom_lmcache_staging import (
-                fence_submitted_work,
-            )
-
-            fence_submitted_work(stream)
-        except BaseException:
-            if callable(finish_ids):
-                finish_ids(owner, safe=False)
-            raise
-        else:
-            if callable(finish_ids):
-                finish_ids(owner, safe=True)
+        copy(run, owner, 0, stream=stream)
+        atom_lmcache_staging.fence_submitted_work(stream)
 
         # -- slot settlement -----------------------------------------------
 

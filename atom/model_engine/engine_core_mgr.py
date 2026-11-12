@@ -22,7 +22,7 @@ import zmq.asyncio
 
 from atom.config import Config
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
-from atom.kv_transfer.offload.config import min_load_tokens
+from atom.kv_transfer.offload.tier import OffloadTierProfile
 from atom.model_engine.capabilities import pcp_group_size_of
 from atom.model_engine.collective_rpc import (
     COLLECTIVE_RPC_CMD,
@@ -33,19 +33,20 @@ from atom.model_engine.collective_rpc import (
     checked_timeout,
     engine_budget,
 )
-from atom.model_engine.dp_policy import (
+from atom.model_engine.dp_routing.policies import (
     LoadPolicy,
     PrefixPolicy,
     SessionPolicy,
     ShareCachePolicy,
 )
-from atom.model_engine.dp_route import (
+from atom.model_engine.dp_routing.prefix_spread import PrefixSpreadRouter
+from atom.model_engine.dp_routing.route import (
     PREFIX_LABELS,
     PREFIX_MOVED_TOKENS,
     PREFIX_OWNER,
     Route,
 )
-from atom.model_engine.dp_routing import prefix_spread_enabled
+from atom.model_engine.dp_routing.topology import prefix_spread_enabled
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import (
     FIRE_AND_FORGET_UTILITY_CMDS,
@@ -55,7 +56,6 @@ from atom.model_engine.engine_utility import (
     kv_change,
 )
 from atom.model_engine.prefix_hash import take_shipped_chains
-from atom.model_engine.prefix_spread import PrefixSpreadRouter
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence
 from atom.model_engine.share_cache import SHARED_TIER_CONNECTORS, ShareCacheRouter
@@ -348,10 +348,10 @@ class CoreManager:
             "explicit_total": 0,
             "load_balanced_total": 0,
         }
-        # Prefix-spread routing (`atom/model_engine/prefix_spread.py`): keeps a
-        # request on the rank holding its prompt's prefix unless that rank has
-        # a prefill backlog and another is about to idle. Created only when
-        # this manager actually routes between eligible DP ranks.
+        # Prefix-spread routing (`atom/model_engine/dp_routing/prefix_spread.py`):
+        # keeps a request on the rank holding its prompt's prefix unless that
+        # rank has a prefill backlog and another is about to idle. Created only
+        # when this manager actually routes between eligible DP ranks.
         self._prefix_router = self._build_prefix_router(config)
         if self._prefix_router is not None:
             self._dp_route_counters.update(
@@ -1628,7 +1628,12 @@ class CoreManager:
                     f"{len(masters)} pools, so a request placed on another rank "
                     "fails its load and recomputes"
                 )
-        return ShareCacheRouter(min_load_tokens(config), self._dp_lb_req_equiv)
+        tier = (
+            KVConnectorFactory.offload_tier(config)
+            if self.global_engine_count > 1
+            else OffloadTierProfile()
+        )
+        return ShareCacheRouter(tier.min_load_tokens, self._dp_lb_req_equiv, tier=tier)
 
     def _backlog_note_charged_locked(self, seq, dp_rank: int) -> None:
         """`seq` was just charged to `dp_rank` and is not sent yet."""
@@ -1772,6 +1777,8 @@ class CoreManager:
                 "queued_prefill_tokens_per_rank": list(self._rank_tokens),
                 "session_count_per_rank": sessions_per_rank,
             }
+            if self._prefix_router is not None:
+                snapshot["prefix_index"] = self._prefix_router.index_counters()
             if PREFIX_OWNER in self._dp_route_counters:
                 snapshot["prefix_route"] = {
                     label: self._dp_route_counters[name]

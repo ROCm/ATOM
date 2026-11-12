@@ -52,6 +52,9 @@ jobs:
     if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
     name: run_atomesh_test_harness
     runs-on: ubuntu-latest
+    outputs:
+      cargo_cache_key: ${{ steps.cargo-deps.outputs.key }}
+      cargo_cache_prefix: ${{ steps.cargo-deps.outputs.prefix }}
     steps:
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
@@ -65,25 +68,48 @@ jobs:
           # would keep linking the old -lpython3.X. Key the detection on it.
           echo "PYO3_ENVIRONMENT_SIGNATURE=$(python3 -c 'import sys; print(sys.version)')" >> "$GITHUB_ENV"
 
-      - name: Cache cargo build output
-        uses: actions/cache@v4
+      # Cargo.lock is gitignored, so every run resolves the newest dependency
+      # versions. Key the cache on that resolution and the toolchain: keyed on
+      # the manifests alone, it kept restoring an old build no run saved again.
+      - name: Resolve cargo dependencies
+        id: cargo-deps
+        run: |
+          set -euo pipefail
+          cargo generate-lockfile --manifest-path atom/mesh/Cargo.toml
+          cargo generate-lockfile --manifest-path atom/mesh/mocker/Cargo.toml
+          prefix="atomesh-mocker-cargo-${RUNNER_OS}-rustc$(rustc -V | cut -d' ' -f2)-"
+          hash="$(cat atom/mesh/Cargo.toml atom/mesh/Cargo.lock \
+            atom/mesh/mocker/Cargo.toml atom/mesh/mocker/Cargo.lock | sha256sum | cut -c1-16)"
+          echo "prefix=${prefix}" >> "$GITHUB_OUTPUT"
+          echo "key=${prefix}${hash}" >> "$GITHUB_OUTPUT"
+
+      # Pull requests fall back to main's newest build for this toolchain, but
+      # only push, nightly and dispatch runs save, and from a clean build: one
+      # on top of a fallback would carry the replaced artifacts along.
+      - name: Restore cargo build output
+        id: cargo-cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             atom/mesh/mocker/target
-          key: atomesh-mocker-cargo-${{ runner.os }}-${{ hashFiles('atom/mesh/Cargo.lock', 'atom/mesh/Cargo.toml', 'atom/mesh/mocker/Cargo.toml') }}
-          restore-keys: |
-            atomesh-mocker-cargo-${{ runner.os }}-
+          key: ${{ steps.cargo-deps.outputs.key }}
+          restore-keys: ${{ github.event_name == 'pull_request' && steps.cargo-deps.outputs.prefix || '' }}
 
+      # The ci profile, not release: release's fat LTO and single codegen unit
+      # made this build the slowest step, and only the benchmark measures the
+      # binary's speed.
       - name: Test P/D router request lifecycle
         run: |
           set -euo pipefail
           cargo test \
             --manifest-path atom/mesh/Cargo.toml \
             --target-dir atom/mesh/mocker/target/mesh \
-            --release --lib routers::http_pd_router
+            --profile ci --lib routers::http_pd_router
 
+      # The mocker is its own cargo root: atom/mesh's profiles, ci included,
+      # do not apply, and its release profile is cargo's default (no fat LTO).
       - name: Run Atomesh test harness
         run: |
           set -euo pipefail
@@ -93,8 +119,21 @@ jobs:
             --release \
             test_atomesh_harness
 
+      - name: Save cargo build output
+        if: ${{ github.event_name != 'pull_request' && steps.cargo-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            atom/mesh/mocker/target
+          key: ${{ steps.cargo-deps.outputs.key }}
+
   run_atomesh_mocker_benchmark:
-    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    # Not on pull requests: their numbers are compared against no baseline and
+    # published nowhere, yet the run took most of an hour. To benchmark a PR
+    # branch, run this workflow on it by hand.
+    if: ${{ github.event_name != 'pull_request' }}
     name: run_atomesh_mocker_benchmark
     needs: [run_atomesh_test_harness]
     runs-on: ubuntu-latest
@@ -154,16 +193,17 @@ jobs:
               )
           PY
 
-      - name: Cache Rust build artifacts
-        uses: actions/cache@v4
+      # The cache run_atomesh_test_harness restored or saved; it does not hold
+      # this job's release build of atom/mesh.
+      - name: Restore cargo build output
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             atom/mesh/mocker/target
-          key: atomesh-mocker-cargo-${{ runner.os }}-${{ hashFiles('atom/mesh/Cargo.lock', 'atom/mesh/Cargo.toml', 'atom/mesh/mocker/Cargo.toml') }}
-          restore-keys: |
-            atomesh-mocker-cargo-${{ runner.os }}-
+          key: ${{ needs.run_atomesh_test_harness.outputs.cargo_cache_key }}
+          restore-keys: ${{ needs.run_atomesh_test_harness.outputs.cargo_cache_prefix }}
 
       - name: Build Atomesh
         run: |
