@@ -4,12 +4,17 @@
 //! `p_0 = c_0`, `p_i = XXH3(p_{i-1} || c_i)` over per-block content hashes, so blocks from
 //! engines with different hash algorithms land on the same key.
 
+pub mod hash;
+pub mod index;
 pub mod provider;
+#[cfg(test)]
+mod tests;
 
 use serde::Serialize;
 
-pub use self::provider::{
-    CacheHit, HitSource, LoadPath, LowerHit, PrefixMatchProvider, PrefixRequest,
+pub use self::{
+    index::{HolderTable, PrefixIndex, MAX_HOLDERS},
+    provider::{CacheHit, HitSource, LoadPath, LowerHit, PrefixMatchProvider, PrefixRequest},
 };
 use crate::kv_events::{PoolRole, Tier};
 
