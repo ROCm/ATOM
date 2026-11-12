@@ -2718,6 +2718,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             prefix,
             self.padded_num_attention_heads,
             var["sparse_kv_last_page_lens"].gpu[:n_owned],
+            whole_rows=self.dcp_world_size > 1,
         )
 
         # --- owned slot_mapping for the fused q_out kernel in MLAAttention. The

@@ -332,7 +332,9 @@ def test_indexer_to_sparse_mla_matches_attention_reference(
         torch.testing.assert_close(
             output.cpu().float(), expected_out, rtol=0.02, atol=0.02 if fp8 else 0.002
         )
-        assert (output.cpu().float() - expected_out).norm() / expected_out.norm() < 0.01
+        # FP8 reduces each row in one work item, as it does in any large batch.
+        rel_error = (output.cpu().float() - expected_out).norm() / expected_out.norm()
+        assert rel_error < (0.02 if fp8 else 0.01)
 
         if length <= topk:
             # Independent dense attention over all causally visible keys.

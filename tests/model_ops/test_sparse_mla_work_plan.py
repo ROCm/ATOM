@@ -112,8 +112,10 @@ def test_patched_forward_plan_matches_per_layer_rebuild(monkeypatch, cache_dtype
         share = torch.rand(rows, generator=gen, device="cuda")
         owned = (selected * share).ceil().clamp(min=1).int()
         kvptr = indptr(owned)
+        # Sized for the forward's candidates, so a plan still holding their
+        # ranges reads wrong keys rather than past the end.
         indices = torch.randint(
-            0, slots, (int(kvptr[-1]),), generator=gen, device="cuda"
+            0, slots, (int(meta.sparse_kv_indptr[-1]),), generator=gen, device="cuda"
         ).int()
         meta.dcp_sparse_kv_indptr = kvptr
         meta.sparse_kv_indices = indices
