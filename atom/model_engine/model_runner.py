@@ -1017,7 +1017,7 @@ class ModelRunner:
             self.model = resolve_obj_by_qualname(installer)(
                 self.model,
                 config,
-                getattr(self, "drafter", None),
+                drafter,
                 metadata_builder=self.attn_metadata_builder,
             )
         # The installed model's own head output, where it has one: its
