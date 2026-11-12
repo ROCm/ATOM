@@ -1907,7 +1907,7 @@ class KimiDecoderLayer(nn.Module):
         hidden_states, prefix_sum = self.self_attention_attn_res(
             hidden_states, block_residual, pending_add, pending_add2
         )
-        block_residual, prefix_sum = self.self_attention_attn_res.maybe_close_block(
+        closed, prefix_sum = self.self_attention_attn_res.maybe_close_block(
             prefix_sum, block_residual
         )
 
@@ -1920,7 +1920,7 @@ class KimiDecoderLayer(nn.Module):
         # attn_res kernel folds both into its prefix on-load, so the [T, H]
         # elementwise add that would combine them here never runs.
         prefix_sum, hidden_states, shared = self._post_attention(
-            hidden_states, prefix_sum, block_residual
+            hidden_states, prefix_sum, closed
         )
         return prefix_sum, hidden_states, shared, block_residual
 
@@ -2026,6 +2026,15 @@ class KimiLinearModel(nn.Module):
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
+    def block_bank(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        """A slot per attention-residual block, read only after its block closes."""
+        block_size = getattr(self.config, "attn_res_block_size", None)
+        if block_size is None:
+            return None
+        tokens, hidden = hidden_states.shape
+        blocks = -(-self.config.num_hidden_layers // block_size)
+        return hidden_states.new_empty(tokens, blocks, hidden)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -2039,13 +2048,7 @@ class KimiLinearModel(nn.Module):
                 if inputs_embeds is not None
                 else self.embed_tokens(input_ids)
             )
-            block_residual = (
-                hidden_states.new_zeros(
-                    hidden_states.shape[0], 0, hidden_states.shape[1]
-                )
-                if getattr(self.config, "attn_res_block_size", None) is not None
-                else None
-            )
+            block_residual = self.block_bank(hidden_states)
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]

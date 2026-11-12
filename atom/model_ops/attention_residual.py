@@ -170,6 +170,9 @@ class AttnRes(nn.Module):
         if prefix_sum is None:
             prefix_sum, add_hidden, add_hidden2 = add_hidden, add_hidden2, None
         assert prefix_sum is not None
+        if self.block_size is not None and block_residual is not None:
+            # the closing site gets the whole bank; mix the slots closed so far
+            block_residual = block_residual[:, : -(-self.layer_idx // self.block_size)]
 
         if self.enabled and block_residual is not None and block_residual.shape[1] > 0:
             score_weight = self.score_weight
@@ -204,17 +207,18 @@ class AttnRes(nn.Module):
         prefix_sum: torch.Tensor,
         block_residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        """Append ``prefix_sum`` as a candidate every ``block_size`` layers.
+        """Copy ``prefix_sum`` into its slot of the bank every ``block_size`` layers.
 
-        Returns the new ``(block_residual, prefix_sum)``. A closed-out block
+        Returns ``(a view of the closed slots, prefix_sum)``. A closed-out block
         leaves prefix_sum None: the running sum has been banked as a candidate
         and the next site starts a fresh one from whatever it is handed.
-        Residuals disabled, or a layer mid-block, means no change.
+        Residuals disabled means no change.
         """
         if not self.enabled or self.block_size is None:
             return block_residual, prefix_sum
-        if self.layer_idx % self.block_size != 0:
-            return block_residual, prefix_sum
         assert block_residual is not None
-        block_residual = torch.cat([block_residual, prefix_sum.unsqueeze(1)], dim=1)
-        return block_residual, None
+        slot, mid_block = divmod(self.layer_idx, self.block_size)
+        if not mid_block:
+            block_residual[:, slot].copy_(prefix_sum)
+            prefix_sum = None
+        return block_residual[:, : slot + 1], prefix_sum
