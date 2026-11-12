@@ -92,12 +92,6 @@ GREEDY_T = float(torch.tensor(SAMPLER_EPS, dtype=torch.float32).item())
 _GREEDY_T = tl.constexpr(GREEDY_T)
 # Smallest positive value of Triton's fp32 tl.rand.
 _RAND_MIN = tl.constexpr(4.6566127342e-10)
-# Top-p search: coarse bisection passes over the row, then the tokens left in
-# the bracket are compacted (<= _CAND_CAP) and the search finishes on them.
-_COARSE_ITERS = 12
-_FINE_ITERS = tl.constexpr(18)
-_CAND_CAP = 8192
-_VBLOCK = 8192
 _NUM_WARPS = 8
 # Vocab-split verification: the full-vocab scans (row statistics, block
 # residual mass, the residual draw) run one program per CHUNK columns of a row
@@ -109,19 +103,21 @@ _NUM_WARPS = 8
 _SPLIT_BLOCK = 2048
 _CHUNK = 8192
 assert _CHUNK % _SPLIT_BLOCK == 0, "_CHUNK must be a multiple of _SPLIT_BLOCK"
-# Vocab-split top-p threshold. The per-row search above makes up to ~30
-# sequential full-row passes on a flat row, and a kernel takes as long as its
-# slowest row. Split: one pass records, per chunk, the mass and count at or
-# above each of _TOPP_K evenly spaced thresholds of the same bracket [m - c, m];
-# the interval holding the cutoff is refined once more the same way if it holds
-# more than _TOPP_RB tokens; its tokens are compacted (chunk order, then column
-# order) and the bisection finishes on them in registers. The nucleus is the
-# same token set; its mass is summed in another order. A row whose final
-# interval still holds more than _TOPP_RB tokens takes the per-row search.
+# Top-p threshold: the largest tau with mass(>= tau) >= top_p z. One pass
+# records, per chunk, the mass and count at or above each of _TOPP_K evenly
+# spaced thresholds of the bracket [m - c, m] (c = ln(V / (1 - top_p)) + 1:
+# tokens below it hold at most 1 - top_p of the mass); the interval holding
+# the cutoff is split _TOPP_K ways again while it holds more than _TOPP_RB
+# tokens (once more per chunk, then over the whole row, at most
+# _TOPP_ROW_LEVELS times); its tokens are compacted (chunk order, then column
+# order) and the bisection finishes on them in registers. An interval still
+# over _TOPP_RB tokens after that is kept whole: they lie within c / K**8 of
+# one another, i.e. they tie.
 _TOPP_K = 32
 _TOPP_SB = 256
 _TOPP_RB = 4096
 _TOPP_ITERS = tl.constexpr(30)
+_TOPP_ROW_LEVELS = tl.constexpr(6)
 
 
 # ---------------------------------------------------------------------------
@@ -497,18 +493,6 @@ class ProbDraftState:
 
 
 @triton.jit
-def _row_mass_ge(row_ptr, V, inv_t, m, thr, BLOCK: tl.constexpr):
-    """sum over v with l_v*inv_t >= thr of exp(l_v*inv_t - m)."""
-    acc = tl.zeros((BLOCK,), tl.float32)
-    for start in range(0, V, BLOCK):
-        offs = start + tl.arange(0, BLOCK)
-        x = tl.load(row_ptr + offs, mask=offs < V, other=float("-inf")).to(tl.float32)
-        y = x * inv_t
-        acc += tl.where(y >= thr, tl.exp(y - m), 0.0)
-    return tl.sum(acc, axis=0)
-
-
-@triton.jit
 def _span_max_argmax(row_ptr, lo, hi, BLOCK: tl.constexpr):
     """(max, lowest argmax) of columns [lo, hi) of a row; per-lane
     accumulation, one final reduce."""
@@ -551,24 +535,31 @@ def _span_online_stats(row_ptr, lo, hi, inv_t, BLOCK: tl.constexpr):
 
 
 @triton.jit
-def _combine_stats(part_ptr, nch, STRIDE: tl.constexpr):
-    """Fold per-chunk (max, sumexp, lowest argmax) records, chunks in column
-    order: (max, sumexp at that max, lowest column holding it). The strict
-    compare keeps the earliest chunk on a tie, i.e. the lowest column, which
-    is the per-row helpers' tie rule."""
+def _combine_stats(stat_ptr, nch):
+    """Fold per-chunk (max, sumexp) records [nch, 2], chunks in column order:
+    (max, sumexp at that max, first chunk holding the max or -1 for none).
+    The strict compare keeps the earliest chunk on a tie, i.e. the lowest
+    column, which is the per-row helpers' tie rule."""
     m = tl.zeros((), tl.float32) + float("-inf")
-    best_i = tl.zeros((), tl.float32)
+    best_c = tl.zeros((), tl.int32) - 1
     for c in range(nch):
-        mc = tl.load(part_ptr + c * STRIDE)
+        mc = tl.load(stat_ptr + c * 2)
         t = mc > m
-        best_i = tl.where(t, tl.load(part_ptr + c * STRIDE + 2), best_i)
+        best_c = tl.where(t, c, best_c)
         m = tl.where(t, mc, m)
     s = tl.zeros((), tl.float32)
     for c in range(nch):
-        mc = tl.load(part_ptr + c * STRIDE)
-        sc = tl.load(part_ptr + c * STRIDE + 1)
+        mc = tl.load(stat_ptr + c * 2)
+        sc = tl.load(stat_ptr + c * 2 + 1)
         s += tl.where(mc == float("-inf"), 0.0, sc * tl.exp(mc - m))
-    return m, s, best_i.to(tl.int32)
+    return m, s, best_c
+
+
+@triton.jit
+def _combine_argmax(arg_ptr, best_c):
+    """A row's lowest argmax from its per-chunk ones [nch]: that of the first
+    chunk holding the row max (`_combine_stats`), 0 when no chunk does."""
+    return tl.where(best_c >= 0, tl.load(arg_ptr + tl.maximum(best_c, 0)), 0)
 
 
 @triton.jit
@@ -591,109 +582,7 @@ def _req_span(cu_ptr, req_idx):
     return start, end - start
 
 
-@triton.jit
-def _bisect_pass(row, V, inv_t, m, lo, mid, hi, BLOCK: tl.constexpr):
-    """mass(>= mid), #tokens in [lo, mid), #tokens in [mid, hi)."""
-    accv = tl.zeros((BLOCK,), tl.float32)
-    c_lo = tl.zeros((BLOCK,), tl.int32)
-    c_hi = tl.zeros((BLOCK,), tl.int32)
-    for start in range(0, V, BLOCK):
-        offs = start + tl.arange(0, BLOCK)
-        y = (
-            tl.load(row + offs, mask=offs < V, other=float("-inf")).to(tl.float32)
-            * inv_t
-        )
-        ge = y >= mid
-        accv += tl.where(ge, tl.exp(y - m), 0.0)
-        c_lo += ((y >= lo) & (y < mid)).to(tl.int32)
-        c_hi += (ge & (y < hi)).to(tl.int32)
-    return tl.sum(accv, axis=0), tl.sum(c_lo, axis=0), tl.sum(c_hi, axis=0)
-
-
-@triton.jit
-def _topp_threshold(
-    row,
-    cand_ptr,
-    V,
-    inv_t,
-    m,
-    z,
-    top_p,
-    BLOCK: tl.constexpr,
-    CAP: tl.constexpr,
-    MAX_COARSE: tl.constexpr,
-    FBLOCK: tl.constexpr = 2048,
-):
-    """(tau, zk): the largest tau with mass(>= tau) >= top_p z, and that mass.
-
-    Bracket [m - c, m] with c = ln(V / (1 - top_p)) + 1: tokens below it hold
-    at most (1 - top_p) of the mass, so the cutoff is inside. Bisection passes
-    over the row (each also counting the tokens on both sides of the midpoint)
-    run until the bracket holds <= CAP tokens; those are compacted to
-    ``cand_ptr`` with their exp-weights and the search finishes on them."""
-    target = top_p * z
-    c = tl.log(V * 1.0) - tl.log(tl.maximum(1.0 - top_p, 1e-30)) + 1.0
-    lo = m - c
-    hi = m
-    cnt_br = tl.zeros((), tl.int32) + V
-    it = tl.zeros((), tl.int32)
-    while (cnt_br > CAP) & (it < MAX_COARSE):
-        mid = 0.5 * (lo + hi)
-        s, c_lo, c_hi = _bisect_pass(row, V, inv_t, m, lo, mid, hi, BLOCK)
-        ge = s >= target
-        lo = tl.where(ge, mid, lo)
-        hi = tl.where(ge, hi, mid)
-        cnt_br = tl.where(ge, c_hi, c_lo)
-        it += 1
-    # compact the tokens in [lo, hi) (y, e); mass(>= hi) alongside
-    cnt = tl.zeros((), tl.int32)
-    min_v = tl.zeros((BLOCK,), tl.float32)
-    mhi_v = tl.zeros((BLOCK,), tl.float32)
-    for start in range(0, V, BLOCK):
-        offs = start + tl.arange(0, BLOCK)
-        y = (
-            tl.load(row + offs, mask=offs < V, other=float("-inf")).to(tl.float32)
-            * inv_t
-        )
-        e = tl.exp(y - m)
-        inb = (y >= lo) & (y < hi)
-        csum = tl.cumsum(inb.to(tl.int32), axis=0)
-        pos = cnt + csum - 1
-        keep = inb & (pos < CAP)
-        tl.store(cand_ptr + pos, y, mask=keep)
-        tl.store(cand_ptr + CAP + pos, e, mask=keep)
-        cnt += tl.max(csum, axis=0)
-        min_v += tl.where(inb, e, 0.0)
-        mhi_v += tl.where(y >= hi, e, 0.0)
-    mass_hi = tl.sum(mhi_v, axis=0)  # mass(>= hi)
-    zk = mass_hi + tl.sum(min_v, axis=0)  # mass(>= lo)
-    if cnt <= CAP:
-        for _ in range(_FINE_ITERS):
-            mid = 0.5 * (lo + hi)
-            accv = tl.zeros((FBLOCK,), tl.float32)
-            for cs in range(0, cnt, FBLOCK):
-                co = cs + tl.arange(0, FBLOCK)
-                cm = co < cnt
-                yc = tl.load(cand_ptr + co, mask=cm, other=float("-inf"))
-                ec = tl.load(cand_ptr + CAP + co, mask=cm, other=0.0)
-                accv += tl.where(yc >= mid, ec, 0.0)
-            s = mass_hi + tl.sum(accv, axis=0)
-            ge = s >= target
-            lo = tl.where(ge, mid, lo)
-            zk = tl.where(ge, s, zk)
-            hi = tl.where(ge, hi, mid)
-    else:
-        for _ in range(_FINE_ITERS):
-            mid = 0.5 * (lo + hi)
-            s = _row_mass_ge(row, V, inv_t, m, mid, BLOCK)
-            ge = s >= target
-            lo = tl.where(ge, mid, lo)
-            zk = tl.where(ge, s, zk)
-            hi = tl.where(ge, hi, mid)
-    return lo, zk
-
-
-# ---- vocab-split top-p threshold ------------------------------------------
+# ---- top-p threshold (see _TOPP_K) ----------------------------------------
 
 
 @triton.jit
@@ -747,13 +636,13 @@ def _sum_records(m_ptr, c_ptr, nch, K: tl.constexpr):
 
 @triton.jit(do_not_specialize=["top_p_scalar", "rank_id"])
 def _topp_level1_kernel(
-    target_ptr,  # [N, V]
+    target_ptr,  # [N, V], or the full logits (IN_PLACE)
     target_logits_indices_ptr,  # [N] (IN_PLACE): logits row of each verify row
     cu_num_draft_tokens_ptr,
     temps_ptr,
     top_p_ptr,
     top_p_scalar,
-    tpart_ptr,  # [N, NCH, 3] `_verify_stats_partial_kernel`'s target records
+    tstat_ptr,  # [N, NCH, 2] `_verify_stats_partial_kernel`'s target records
     thr1_ptr,  # [N, K] out: level-1 thresholds
     l1m_ptr,  # [N, NCH, K] out: chunk mass at or above each threshold
     l1c_ptr,  # [N, NCH, K] out: chunk count at or above each threshold
@@ -764,10 +653,10 @@ def _topp_level1_kernel(
     K: tl.constexpr,
     SB: tl.constexpr,
     CHUNK: tl.constexpr,
-    IN_PLACE: tl.constexpr = False,
+    IN_PLACE: tl.constexpr,
 ):
-    """K evenly spaced thresholds over the per-row search's bracket
-    [m - c, m]; this chunk's mass and count at or above each."""
+    """K evenly spaced thresholds over the cutoff's bracket [m - c, m]; this
+    chunk's mass and count at or above each."""
     req_idx = tl.program_id(0)
     k = tl.program_id(1)
     c = tl.program_id(2)
@@ -780,8 +669,7 @@ def _topp_level1_kernel(
         temps_ptr, top_p_ptr, top_p_scalar, req_idx, HAS_TOPP_PTR
     )
     if active & ((r % QTP) == rank_id):
-        m, _, _ = _combine_stats(tpart_ptr + r * nch * 3, nch, 3)
-        # the per-row search's bracket (`_topp_threshold`)
+        m, _, _ = _combine_stats(tstat_ptr + r * nch * 2, nch)
         cw = tl.log(V * 1.0) - tl.log(tl.maximum(1.0 - top_p, 1e-30)) + 1.0
         js = tl.arange(0, K)
         thr = (m - cw) + js.to(tl.float32) * (cw / K)
@@ -805,17 +693,17 @@ def _topp_level1_kernel(
 
 @triton.jit(do_not_specialize=["top_p_scalar", "rank_id"])
 def _topp_level2_kernel(
-    target_ptr,
+    target_ptr,  # [N, V], or the full logits (IN_PLACE)
     target_logits_indices_ptr,  # [N] (IN_PLACE): logits row of each verify row
     cu_num_draft_tokens_ptr,
     temps_ptr,
     top_p_ptr,
     top_p_scalar,
-    tpart_ptr,
+    tstat_ptr,
     thr1_ptr,
     l1m_ptr,
     l1c_ptr,
-    dec1_ptr,  # [N, 2] out: level-1 interval index, whether level 2 ran
+    dec1_ptr,  # [N, 2] int32 out: level-1 interval index, whether level 2 ran
     thr2_ptr,  # [N, K] out: level-2 thresholds
     l2m_ptr,  # [N, NCH, K] out
     l2c_ptr,  # [N, NCH, K] out
@@ -827,7 +715,7 @@ def _topp_level2_kernel(
     SB: tl.constexpr,
     CHUNK: tl.constexpr,
     RB: tl.constexpr,
-    IN_PLACE: tl.constexpr = False,
+    IN_PLACE: tl.constexpr,
 ):
     """The level-1 interval holding the cutoff (the highest threshold whose
     mass at or above still reaches top_p z); split K ways again when it holds
@@ -844,7 +732,7 @@ def _topp_level2_kernel(
         temps_ptr, top_p_ptr, top_p_scalar, req_idx, HAS_TOPP_PTR
     )
     if active & ((r % QTP) == rank_id):
-        m, z, _ = _combine_stats(tpart_ptr + r * nch * 3, nch, 3)
+        m, z, _ = _combine_stats(tstat_ptr + r * nch * 2, nch)
         target = top_p * z
         js = tl.arange(0, K)
         M, C = _sum_records(l1m_ptr + r * nch * K, l1c_ptr + r * nch * K, nch, K)
@@ -853,8 +741,8 @@ def _topp_level2_kernel(
         n1 = _pick(C, js, k1) - _pick(C, js, k1 + 1)
         need2 = n1 > RB
         if c == 0:
-            tl.store(dec1_ptr + r * 2, k1.to(tl.float32))
-            tl.store(dec1_ptr + r * 2 + 1, need2.to(tl.float32))
+            tl.store(dec1_ptr + r * 2, k1)
+            tl.store(dec1_ptr + r * 2 + 1, need2.to(tl.int32))
         if need2:
             a1 = _pick(thr, js, k1)
             w2 = (_pick(thr, js, 1) - _pick(thr, js, 0)) / K
@@ -891,11 +779,12 @@ def _final_interval(
     target,
     K: tl.constexpr,
 ):
-    """(a, b, mass at or above b, level, index, k1): the interval [a, b) holding
-    the cutoff, from level 2 where it ran; b is +inf for the top interval."""
+    """(a, b, mass at or above b, threshold spacing, level 2 ran, index, k1):
+    the interval [a, b) holding the cutoff, from level 2 where it ran; b is
+    +inf for the top interval."""
     js = tl.arange(0, K)
-    k1 = tl.load(dec1_ptr + r * 2).to(tl.int32)
-    need2 = tl.load(dec1_ptr + r * 2 + 1) > 0.5
+    k1 = tl.load(dec1_ptr + r * 2)
+    need2 = tl.load(dec1_ptr + r * 2 + 1) != 0
     M, _ = _sum_records(l1m_ptr + r * nch * K, l1c_ptr + r * nch * K, nch, K)
     thr = tl.load(thr1_ptr + r * K + js)
     top1 = k1 + 1 >= K
@@ -904,6 +793,7 @@ def _final_interval(
     a = _pick(thr, js, k1)
     b = b1
     mhi = mhi1
+    w = _pick(thr, js, 1) - _pick(thr, js, 0)
     kk = k1
     if need2:
         M2, _ = _sum_records(l2m_ptr + r * nch * K, l2c_ptr + r * nch * K, nch, K)
@@ -913,8 +803,9 @@ def _final_interval(
         a = _pick(thr2, js, k2)
         b = tl.where(top2, b1, _pick(thr2, js, k2 + 1))
         mhi = tl.where(top2, mhi1, _pick(M2, js, k2 + 1))
+        w = w / K
         kk = k2
-    return a, b, mhi, need2, kk, k1
+    return a, b, mhi, w, need2, kk, k1
 
 
 @triton.jit
@@ -933,15 +824,36 @@ def _chunk_interval_count(l1c_ptr, l2c_ptr, r, nch, ch, need2, kk, k1, K: tl.con
     return cnt
 
 
+@triton.jit
+def _compact_interval(
+    row, lo, hi, inv_t, m, a, b, ybuf, pos0, RB: tl.constexpr, BLOCK: tl.constexpr
+):
+    """Append the (y, exp(y - m)) of columns [lo, hi) with y in [a, b) to
+    ``ybuf`` ([2, RB]) from position pos0 on, in column order."""
+    pos0 = tl.zeros((), tl.int32) + pos0
+    for st in range(lo, hi, BLOCK):
+        offs = st + tl.arange(0, BLOCK)
+        y = (
+            tl.load(row + offs, mask=offs < hi, other=float("-inf")).to(tl.float32)
+            * inv_t
+        )
+        inb = (y >= a) & (y < b)
+        csum = tl.cumsum(inb.to(tl.int32), axis=0)
+        pos = pos0 + csum - 1
+        tl.store(ybuf + pos, y, mask=inb)
+        tl.store(ybuf + RB + pos, tl.exp(y - m), mask=inb)
+        pos0 += tl.sum(inb.to(tl.int32), axis=0)
+
+
 @triton.jit(do_not_specialize=["top_p_scalar", "rank_id"])
 def _topp_compact_kernel(
-    target_ptr,
+    target_ptr,  # [N, V], or the full logits (IN_PLACE)
     target_logits_indices_ptr,  # [N] (IN_PLACE): logits row of each verify row
     cu_num_draft_tokens_ptr,
     temps_ptr,
     top_p_ptr,
     top_p_scalar,
-    tpart_ptr,
+    tstat_ptr,
     thr1_ptr,
     l1m_ptr,
     l1c_ptr,
@@ -949,7 +861,8 @@ def _topp_compact_kernel(
     thr2_ptr,
     l2m_ptr,
     l2c_ptr,
-    dec2_ptr,  # [N, 4] out: a, b, count in [a, b), mass at or above b
+    fin_ptr,  # [N, 4] out: a, b, mass at or above b, threshold spacing
+    fin_n_ptr,  # [N] int32 out: tokens in [a, b)
     cand_ptr,  # [N, 2, RB] out: the interval's (y, exp(y - m)), chunk then column order
     V,
     rank_id,
@@ -959,10 +872,11 @@ def _topp_compact_kernel(
     BLOCK: tl.constexpr,
     CHUNK: tl.constexpr,
     RB: tl.constexpr,
-    IN_PLACE: tl.constexpr = False,
+    IN_PLACE: tl.constexpr,
 ):
     """Compact the final interval's tokens: each chunk writes at the sum of
-    the earlier chunks' counts, so the order is fixed."""
+    the earlier chunks' counts, so the order is fixed. An interval of more
+    than RB tokens is left to `_topp_cutoff`."""
     req_idx = tl.program_id(0)
     k = tl.program_id(1)
     c = tl.program_id(2)
@@ -975,8 +889,8 @@ def _topp_compact_kernel(
         temps_ptr, top_p_ptr, top_p_scalar, req_idx, HAS_TOPP_PTR
     )
     if active & ((r % QTP) == rank_id):
-        m, z, _ = _combine_stats(tpart_ptr + r * nch * 3, nch, 3)
-        a, b, mhi, need2, kk, k1 = _final_interval(
+        m, z, _ = _combine_stats(tstat_ptr + r * nch * 2, nch)
+        a, b, mhi, w, need2, kk, k1 = _final_interval(
             thr1_ptr,
             l1m_ptr,
             l1c_ptr,
@@ -996,44 +910,34 @@ def _topp_compact_kernel(
             off += tl.where(ch < c, cnt, 0)
             total += cnt
         if c == 0:
-            tl.store(dec2_ptr + r * 4, a)
-            tl.store(dec2_ptr + r * 4 + 1, b)
-            tl.store(dec2_ptr + r * 4 + 2, total.to(tl.float32))
-            tl.store(dec2_ptr + r * 4 + 3, mhi)
+            tl.store(fin_ptr + r * 4, a)
+            tl.store(fin_ptr + r * 4 + 1, b)
+            tl.store(fin_ptr + r * 4 + 2, mhi)
+            tl.store(fin_ptr + r * 4 + 3, w)
+            tl.store(fin_n_ptr + r, total)
         if total <= RB:
-            row = target_ptr + _target_row(target_logits_indices_ptr, r, IN_PLACE) * V
-            inv_t = 1.0 / temp
-            ybuf = cand_ptr + r.to(tl.int64) * (2 * RB)
             lo = c * CHUNK
-            hi = tl.minimum(lo + CHUNK, V)
-            pos0 = off
-            for st in range(lo, hi, BLOCK):
-                offs = st + tl.arange(0, BLOCK)
-                y = (
-                    tl.load(row + offs, mask=offs < hi, other=float("-inf")).to(
-                        tl.float32
-                    )
-                    * inv_t
-                )
-                inb = (y >= a) & (y < b)
-                csum = tl.cumsum(inb.to(tl.int32), axis=0)
-                pos = pos0 + csum - 1
-                tl.store(ybuf + pos, y, mask=inb)
-                tl.store(ybuf + RB + pos, tl.exp(y - m), mask=inb)
-                pos0 += tl.sum(inb.to(tl.int32), axis=0)
+            _compact_interval(
+                target_ptr + _target_row(target_logits_indices_ptr, r, IN_PLACE) * V,
+                lo,
+                tl.minimum(lo + CHUNK, V),
+                1.0 / temp,
+                m,
+                a,
+                b,
+                cand_ptr + r.to(tl.int64) * (2 * RB),
+                off,
+                RB,
+                BLOCK,
+            )
 
 
 @triton.jit
-def _topp_finish(dec2_ptr, cand_ptr, r, m, target, RB: tl.constexpr):
-    """(tau, zk) from the compacted interval: the bisection of `_topp_threshold`
-    on [a, b) over its tokens, held in registers; mass at or above b added."""
-    a = tl.load(dec2_ptr + r * 4)
-    b = tl.load(dec2_ptr + r * 4 + 1)
-    total = tl.load(dec2_ptr + r * 4 + 2).to(tl.int32)
-    mhi = tl.load(dec2_ptr + r * 4 + 3)
+def _topp_finish(a, b, total, mhi, ybuf, m, target, RB: tl.constexpr):
+    """(tau, zk): bisection on [a, b) over the interval's compacted tokens,
+    held in registers; mass at or above b added."""
     idx = tl.arange(0, RB)
     cm = idx < total
-    ybuf = cand_ptr + r.to(tl.int64) * (2 * RB)
     yv = tl.load(ybuf + idx, mask=cm, other=float("-inf"))
     ev = tl.load(ybuf + RB + idx, mask=cm, other=0.0)
     lo = a
@@ -1046,12 +950,66 @@ def _topp_finish(dec2_ptr, cand_ptr, r, m, target, RB: tl.constexpr):
         lo = tl.where(ge, mid, lo)
         zk = tl.where(ge, s, zk)
         hi = tl.where(ge, hi, mid)
-    return lo, zk, total
+    return lo, zk
+
+
+@triton.jit
+def _topp_cutoff(
+    row,
+    fin_ptr,
+    fin_n_ptr,
+    ybuf,
+    V,
+    inv_t,
+    m,
+    target,
+    K: tl.constexpr,
+    SB: tl.constexpr,
+    RB: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """(tau, zk) of a top-p row from `_topp_compact_kernel`'s final interval
+    [a, b). An interval of more than RB tokens is split K ways again over the
+    whole row (the level kernels' records, `_ge_records`) until it fits, then
+    compacted here; one still too large after _TOPP_ROW_LEVELS splits is kept
+    whole (its tokens tie): tau = a, zk = mass at or above a."""
+    a = tl.load(fin_ptr)
+    b = tl.load(fin_ptr + 1)
+    mhi = tl.load(fin_ptr + 2)
+    w = tl.load(fin_ptr + 3)
+    total = tl.load(fin_n_ptr)
+    mass_a = tl.zeros((), tl.float32)
+    if total > RB:
+        js = tl.arange(0, K)
+        level = tl.zeros((), tl.int32)
+        while (total > RB) & (level < _TOPP_ROW_LEVELS):
+            w = w / K
+            thr = a + js.to(tl.float32) * w
+            M, C = _ge_records(row, 0, V, inv_t, m, thr, K, SB)
+            above_b = _pick(C, js, 0) - total  # thr[0] is a
+            kk = tl.max(tl.where(M >= target, js, 0), axis=0)
+            top = kk + 1 >= K
+            a = _pick(thr, js, kk)
+            b = tl.where(top, b, _pick(thr, js, kk + 1))
+            mhi = tl.where(top, mhi, _pick(M, js, kk + 1))
+            total = _pick(C, js, kk) - tl.where(top, above_b, _pick(C, js, kk + 1))
+            mass_a = _pick(M, js, kk)
+            level += 1
+        if total <= RB:
+            _compact_interval(row, 0, V, inv_t, m, a, b, ybuf, 0, RB, BLOCK)
+            # The bisection reads back what other lanes just wrote.
+            tl.debug_barrier()
+    if total <= RB:
+        tau, zk = _topp_finish(a, b, total, mhi, ybuf, m, target, RB)
+    else:
+        tau = a
+        zk = mass_a
+    return tau, zk
 
 
 @triton.jit(do_not_specialize=["q_width", "q_vs", "q_cols", "q_stride", "rank_id"])
 def _verify_stats_partial_kernel(
-    target_ptr,  # [N, V]
+    target_ptr,  # [N, V], or the full logits (IN_PLACE)
     input_ids_ptr,
     target_logits_indices_ptr,
     cu_num_draft_tokens_ptr,  # [bs]
@@ -1060,8 +1018,9 @@ def _verify_stats_partial_kernel(
     q_ptr,  # [max_bs, W, q_stride]
     q_ids_ptr,  # [max_bs, W]
     q_temps_ptr,  # [max_bs]
-    tpart_ptr,  # [N, NCH, 3] out: target chunk max, sumexp, lowest argmax
-    qpart_ptr,  # [N, NCH, 3] out: q chunk max, sumexp, (unused)
+    tstat_ptr,  # [N, NCH, 2] out: target chunk max, sumexp
+    targ_ptr,  # [N, NCH] int32 out: target chunk lowest argmax
+    qstat_ptr,  # [N, NCH, 2] out: q chunk max, sumexp
     V,
     q_width,
     q_vs,
@@ -1071,12 +1030,12 @@ def _verify_stats_partial_kernel(
     QTP: tl.constexpr,
     BLOCK: tl.constexpr,
     CHUNK: tl.constexpr,
-    IN_PLACE: tl.constexpr = False,
+    IN_PLACE: tl.constexpr,
 ):
     """One CHUNK of a verified row's two full-vocab statistics passes -- the
     target's (on the rank owning the row) and the stored q's -- which
-    `_verify_row_stats_kernel` used to run whole per row. A chunk past a row's
-    end stores the empty record (-inf, 0, 0)."""
+    `_verify_row_stats_kernel` combines. A chunk past a row's end stores the
+    empty record (-inf, 0), argmax 0."""
     req_idx = tl.program_id(0)
     k = tl.program_id(1)
     c = tl.program_id(2)
@@ -1092,20 +1051,20 @@ def _verify_stats_partial_kernel(
     own_row = (r % QTP) == rank_id
     temp = tl.load(temps_ptr + req_idx).to(tl.float32)
     greedy = temp <= _GREEDY_T
-    tout = tpart_ptr + (r * nch + c) * 3
+    tout = tstat_ptr + (r * nch + c) * 2
     hi = tl.minimum(lo + CHUNK, V)
     if greedy:
         if own_row:
             mx, ai = _span_max_argmax(row, lo, hi, BLOCK)
             tl.store(tout, mx)
             tl.store(tout + 1, 0.0)
-            tl.store(tout + 2, ai.to(tl.float32))
+            tl.store(targ_ptr + r * nch + c, ai)
     else:
         if own_row:
             mx, s, ai = _span_online_stats(row, lo, hi, 1.0 / temp, BLOCK)
             tl.store(tout, mx)
             tl.store(tout + 1, s)
-            tl.store(tout + 2, ai.to(tl.float32))
+            tl.store(targ_ptr + r * nch + c, ai)
         s_row = tl.load(src_ptr + req_idx)
         if (s_row >= 0) & (k < q_width):
             qid = tl.load(q_ids_ptr + s_row * q_width + k)
@@ -1114,10 +1073,9 @@ def _verify_stats_partial_kernel(
                 qrow = q_ptr + (s_row.to(tl.int64) * q_width + k) * q_stride
                 hq = tl.minimum(lo + CHUNK, q_cols)
                 mq, zq, _ = _span_online_stats(qrow, lo, hq, 1.0 / tq, BLOCK)
-                qout = qpart_ptr + (r * nch + c) * 3
+                qout = qstat_ptr + (r * nch + c) * 2
                 tl.store(qout, mq)
                 tl.store(qout + 1, zq)
-                tl.store(qout + 2, 0.0)
 
 
 @triton.jit(
@@ -1133,7 +1091,7 @@ def _verify_stats_partial_kernel(
     ]
 )
 def _verify_row_stats_kernel(
-    target_ptr,  # [N, V]
+    target_ptr,  # [N, V], or the full logits (IN_PLACE)
     input_ids_ptr,
     target_logits_indices_ptr,
     cu_num_draft_tokens_ptr,  # [bs]
@@ -1144,11 +1102,12 @@ def _verify_row_stats_kernel(
     q_ptr,  # [max_bs, W, q_stride]
     q_ids_ptr,  # [max_bs, W]
     q_temps_ptr,  # [max_bs]
-    cand_ptr,  # [N, 2 * CAP] scratch
-    tpart_ptr,  # [N, nch, 3] `_verify_stats_partial_kernel`'s target records
-    qpart_ptr,  # [N, nch, 3] and its q records
-    dec2_ptr,  # [N, 4] `_topp_compact_kernel`'s final interval (SPLIT_TOPP)
-    cand2_ptr,  # [N, 2, RB] and its tokens
+    tstat_ptr,  # [N, nch, 2] `_verify_stats_partial_kernel`'s target records
+    targ_ptr,  # [N, nch] and their argmax
+    qstat_ptr,  # [N, nch, 2] and its q records
+    fin_ptr,  # [N, 4] `_topp_compact_kernel`'s final interval (top-p rows)
+    fin_n_ptr,  # [N] its token count
+    cand_ptr,  # [N, 2, RB] and its tokens
     rs_ptr,  # [N, 8] out: amax, m, tau, zk, p(x) | local q max, sumexp, x-logit
     hasq_ptr,  # [N] out
     V,
@@ -1161,20 +1120,18 @@ def _verify_row_stats_kernel(
     nch,
     QTP: tl.constexpr,
     HAS_TOPP_PTR: tl.constexpr,
-    BLOCK: tl.constexpr,
-    CAP: tl.constexpr,
-    COARSE: tl.constexpr,
-    SPLIT_TOPP: tl.constexpr,
+    K: tl.constexpr,
+    SB: tl.constexpr,
     RB: tl.constexpr,
-    IN_PLACE: tl.constexpr = False,
+    BLOCK: tl.constexpr,
+    IN_PLACE: tl.constexpr,
 ):
     """Per verified row. The target half (fields 0-4) is computed only by the
     rank that owns the row (r % QTP), the q half (5-7) by every rank over its
     own vocab columns; one all-gather then hands every rank both. The rows'
     max / sumexp / argmax come from `_verify_stats_partial_kernel`'s chunks;
-    with SPLIT_TOPP the top-p cutoff finishes on `_topp_compact_kernel`'s
-    interval, falling back to the per-row search when that interval
-    overflowed RB."""
+    a top-p cutoff finishes on `_topp_compact_kernel`'s interval
+    (`_topp_cutoff`)."""
     req_idx = tl.program_id(0)
     k = tl.program_id(1)
     start, n = _req_span(cu_num_draft_tokens_ptr, req_idx)
@@ -1188,54 +1145,38 @@ def _verify_row_stats_kernel(
     xs = tl.where(x_ok, x, 0)
     own_row = (r % QTP) == rank_id
 
-    temp = tl.load(temps_ptr + req_idx).to(tl.float32)
+    active, temp, top_p = _topp_row(
+        temps_ptr, top_p_ptr, top_p_scalar, req_idx, HAS_TOPP_PTR
+    )
     greedy = temp <= _GREEDY_T
     hasq = 0
     if greedy:
         if own_row:
-            _, _, amax = _combine_stats(tpart_ptr + r * nch * 3, nch, 3)
+            _, _, best_c = _combine_stats(tstat_ptr + r * nch * 2, nch)
+            amax = _combine_argmax(targ_ptr + r * nch, best_c)
             tl.store(out, amax.to(tl.float32))
     else:
         if own_row:
             inv_t = 1.0 / temp
-            m, z, amax = _combine_stats(tpart_ptr + r * nch * 3, nch, 3)
-            if HAS_TOPP_PTR:
-                top_p = tl.load(top_p_ptr + req_idx).to(tl.float32)
-            else:
-                top_p = top_p_scalar
+            m, z, best_c = _combine_stats(tstat_ptr + r * nch * 2, nch)
+            amax = _combine_argmax(targ_ptr + r * nch, best_c)
             tau = tl.zeros((), tl.float32) + float("-inf")
             zk = z
-            if top_p < 1.0:
-                if SPLIT_TOPP:
-                    tau, zk, total = _topp_finish(
-                        dec2_ptr, cand2_ptr, r, m, top_p * z, RB
-                    )
-                    if total > RB:
-                        tau, zk = _topp_threshold(
-                            row,
-                            cand_ptr + r.to(tl.int64) * (2 * CAP),
-                            V,
-                            inv_t,
-                            m,
-                            z,
-                            top_p,
-                            BLOCK,
-                            CAP,
-                            COARSE,
-                        )
-                else:
-                    tau, zk = _topp_threshold(
-                        row,
-                        cand_ptr + r.to(tl.int64) * (2 * CAP),
-                        V,
-                        inv_t,
-                        m,
-                        z,
-                        top_p,
-                        BLOCK,
-                        CAP,
-                        COARSE,
-                    )
+            if active:
+                tau, zk = _topp_cutoff(
+                    row,
+                    fin_ptr + r * 4,
+                    fin_n_ptr + r,
+                    cand_ptr + r.to(tl.int64) * (2 * RB),
+                    V,
+                    inv_t,
+                    m,
+                    top_p * z,
+                    K,
+                    SB,
+                    RB,
+                    BLOCK,
+                )
             lx = tl.load(row + xs).to(tl.float32) * inv_t
             px = tl.where(x_ok & (lx >= tau), tl.exp(lx - m) / zk, 0.0)
             tl.store(out, amax.to(tl.float32))
@@ -1251,7 +1192,7 @@ def _verify_row_stats_kernel(
             if (qid == x) & x_ok & (tq > _GREEDY_T):
                 inv_tq = 1.0 / tq
                 qrow = q_ptr + (s_row.to(tl.int64) * q_width + k) * q_stride
-                mq, zq, _ = _combine_stats(qpart_ptr + r * nch * 3, nch, 3)
+                mq, zq, _ = _combine_stats(qstat_ptr + r * nch * 2, nch)
                 xl = x - q_vs
                 own = (xl >= 0) & (xl < q_cols)
                 dx = tl.load(qrow + tl.where(own, xl, 0)) * inv_tq
@@ -1622,6 +1563,36 @@ def _prob_finish_kernel(
     )
 
 
+class _TopPWorkspace:
+    """The top-p search's per-step scratch, carved from one allocation: the
+    compacted final-interval tokens ``cand`` [N, 2, RB]; the two chunked
+    levels' thresholds ``thr`` [2, N, K] and per-chunk mass / count records
+    ``lm`` / ``lc`` [2, N, nch, K]; the final interval ``fin`` [N, 4] (a, b,
+    mass at or above b, threshold spacing); and the int32 fields ``fin_n``
+    [N] (its token count) and ``dec1`` [N, 2] (level-1 interval, whether
+    level 2 ran). ``nch`` 0 (no top-p): only the per-row slots, never read."""
+
+    def __init__(self, nrow: int, nch: int, device):
+        f32, i32 = torch.float32, torch.int32
+        k = _TOPP_K if nch else 0
+        layout = (
+            ("cand", (nrow, 2, _TOPP_RB if nch else 0), f32),
+            ("thr", (2, nrow, k), f32),
+            ("lm", (2, nrow, nch, k), f32),
+            ("lc", (2, nrow, nch, k), i32),
+            ("fin", (nrow, 4), f32),
+            ("fin_n", (nrow,), i32),
+            ("dec1", (nrow, 2), i32),
+        )
+        sizes = [torch.Size(shape).numel() for _, shape, _ in layout]
+        words = torch.empty(sum(sizes), dtype=i32, device=device)
+        off = 0
+        for (name, shape, dtype), n in zip(layout, sizes):
+            part = words[off : off + n]
+            setattr(self, name, (part if dtype is i32 else part.view(f32)).view(shape))
+            off += n
+
+
 def prob_rejection_sample(
     input_ids: torch.Tensor,
     target_logits_indices: torch.Tensor,
@@ -1671,8 +1642,9 @@ def prob_rejection_sample(
     rs = torch.empty((nrow, 8), **f32)
     rm = torch.empty((nrow, nch_q), **f32)
     hasq = torch.empty(nrow, dtype=torch.int32, device=device)
-    tpart = torch.empty((nrow, nch_stats, 3), **f32)
-    qpart = torch.empty((nrow, nch_stats, 3), **f32)
+    tstat = torch.empty((nrow, nch_stats, 2), **f32)
+    targ = torch.empty((nrow, nch_stats), dtype=torch.int32, device=device)
+    qstat = torch.empty((nrow, nch_stats, 2), **f32)
     dec = torch.empty((3, bs), **f32)
     res = torch.empty((bs * nch_q, 4), **f32)
     if isinstance(top_ps, torch.Tensor) and top_ps.numel() > 1:
@@ -1682,30 +1654,9 @@ def prob_rejection_sample(
             top_ps = float(top_ps.item())
         top_p_ptr, has_ptr = temperatures, False
         top_p_scalar = 1.0 if top_ps is None else float(top_ps)
-    # Top-p candidate scratch (64 KB per row); never touched without top-p.
-    if has_ptr or top_p_scalar < 1.0:
-        cand = torch.empty((nrow, 2 * _CAND_CAP), **f32)
-    else:
-        cand = rs
     temps = temperatures.to(torch.float32)
-    # The split top-p search reads the split statistics' row max and sum.
-    split_topp = has_ptr or top_p_scalar < 1.0
-    K, RB = _TOPP_K, _TOPP_RB
-    if split_topp:
-        i32 = {"dtype": torch.int32, "device": device}
-        thr1 = torch.empty((nrow, K), **f32)
-        thr2 = torch.empty((nrow, K), **f32)
-        l1m = torch.empty((nrow, nch_stats, K), **f32)
-        l1c = torch.empty((nrow, nch_stats, K), **i32)
-        l2m = torch.empty((nrow, nch_stats, K), **f32)
-        l2c = torch.empty((nrow, nch_stats, K), **i32)
-        dec1 = torch.empty((nrow, 2), **f32)
-        dec2 = torch.empty((nrow, 4), **f32)
-        cand2 = torch.empty((nrow, 2, RB), **f32)
-    else:
-        # Without top-p the split search does not run and the row-stats
-        # kernel (SPLIT_TOPP=False) never reads its outputs: no scratch.
-        dec2 = cand2 = rs
+    topp = has_ptr or top_p_scalar < 1.0
+    ws = _TopPWorkspace(nrow, nch_stats if topp else 0, device)
     gather = (
         (lambda t: tp_group.all_gather(t, dim=0, use_custom=use_custom))
         if qtp > 1
@@ -1726,8 +1677,9 @@ def prob_rejection_sample(
             state.q,
             state.ids,
             state.temps,
-            tpart,
-            qpart,
+            tstat,
+            targ,
+            qstat,
             vocab,
             q_width,
             state.q_vs,
@@ -1740,7 +1692,7 @@ def prob_rejection_sample(
             CHUNK=_CHUNK,
             num_warps=_NUM_WARPS,
         )
-    if num_rows > 0 and num_spec_steps > 0 and split_topp:
+    if num_rows > 0 and num_spec_steps > 0 and topp:
         grid = (bs, num_spec_steps, nch_stats)
         row_args = (
             target_logits,
@@ -1749,63 +1701,56 @@ def prob_rejection_sample(
             temps,
             top_p_ptr,
             top_p_scalar,
-            tpart,
+            tstat,
         )
+        level1 = (ws.thr[0], ws.lm[0], ws.lc[0])
+        level2 = (ws.thr[1], ws.lm[1], ws.lc[1])
         _topp_level1_kernel[grid](
             *row_args,
-            thr1,
-            l1m,
-            l1c,
+            *level1,
             vocab,
             rank_id,
             QTP=qtp,
-            IN_PLACE=in_place,
             HAS_TOPP_PTR=has_ptr,
-            K=K,
+            K=_TOPP_K,
             SB=_TOPP_SB,
             CHUNK=_CHUNK,
+            IN_PLACE=in_place,
             num_warps=_NUM_WARPS,
         )
         _topp_level2_kernel[grid](
             *row_args,
-            thr1,
-            l1m,
-            l1c,
-            dec1,
-            thr2,
-            l2m,
-            l2c,
+            *level1,
+            ws.dec1,
+            *level2,
             vocab,
             rank_id,
             QTP=qtp,
-            IN_PLACE=in_place,
             HAS_TOPP_PTR=has_ptr,
-            K=K,
+            K=_TOPP_K,
             SB=_TOPP_SB,
             CHUNK=_CHUNK,
-            RB=RB,
+            RB=_TOPP_RB,
+            IN_PLACE=in_place,
             num_warps=_NUM_WARPS,
         )
         _topp_compact_kernel[grid](
             *row_args,
-            thr1,
-            l1m,
-            l1c,
-            dec1,
-            thr2,
-            l2m,
-            l2c,
-            dec2,
-            cand2,
+            *level1,
+            ws.dec1,
+            *level2,
+            ws.fin,
+            ws.fin_n,
+            ws.cand,
             vocab,
             rank_id,
             QTP=qtp,
-            IN_PLACE=in_place,
             HAS_TOPP_PTR=has_ptr,
-            K=K,
+            K=_TOPP_K,
             BLOCK=_SPLIT_BLOCK,
             CHUNK=_CHUNK,
-            RB=RB,
+            RB=_TOPP_RB,
+            IN_PLACE=in_place,
             num_warps=_NUM_WARPS,
         )
     if num_rows > 0 and num_spec_steps > 0:
@@ -1821,11 +1766,12 @@ def prob_rejection_sample(
             state.q,
             state.ids,
             state.temps,
-            cand,
-            tpart,
-            qpart,
-            dec2,
-            cand2,
+            tstat,
+            targ,
+            qstat,
+            ws.fin,
+            ws.fin_n,
+            ws.cand,
             rs,
             hasq,
             vocab,
@@ -1837,13 +1783,12 @@ def prob_rejection_sample(
             rank_id,
             nch_stats,
             QTP=qtp,
-            IN_PLACE=in_place,
             HAS_TOPP_PTR=has_ptr,
-            BLOCK=_VBLOCK,
-            CAP=_CAND_CAP,
-            COARSE=_COARSE_ITERS,
-            SPLIT_TOPP=split_topp,
-            RB=RB,
+            K=_TOPP_K,
+            SB=_TOPP_SB,
+            RB=_TOPP_RB,
+            BLOCK=_SPLIT_BLOCK,
+            IN_PLACE=in_place,
             num_warps=_NUM_WARPS,
         )
     rsall = gather(rs)
