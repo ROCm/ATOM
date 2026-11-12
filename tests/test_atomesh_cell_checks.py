@@ -612,6 +612,65 @@ class SubmitLogLinesTest(unittest.TestCase):
                     self.assertEqual(result.stdout.splitlines()[-1], "exit 1")
 
 
+class SubmitOnlineQuantTest(unittest.TestCase):
+    """pd_submit.sh's per-role --online_quant_config, from the real PP8 C72
+    cell, whose prefill alone excludes the drafter's f_b_proj."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.cell = next(
+            cell
+            for cell in kimi_k3_cells("nightly")
+            if cell["name"].endswith("-c72-opus")
+        )
+        source = (SCRIPTS / "pd_submit.sh").read_text()
+        start = source.index("python3 - <<'PY'\nimport json\nimport os\nimport shlex")
+        start = source.index("\n", start) + 1
+        cls.mapping = source[start : source.index("\nPY\n", start)]
+
+    def submit(self, cell):
+        return subprocess.run(
+            [sys.executable, "-c", self.mapping],
+            env=dict(os.environ, CELL_JSON=json.dumps(cell)),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+
+    def test_a_role_s_extra_exclusions_reach_only_its_command_line(self):
+        result = self.submit(self.cell)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        exports = {}
+        for line in result.stdout.splitlines():
+            words = shlex.split(line)
+            if words[:1] == ["export"]:
+                name, _, value = words[1].partition("=")
+                exports[name] = value
+        server_args = self.cell["server_args"]
+        shared = json.loads(server_args["online_quant_config"])
+        both = [
+            *shared["exclude_layer"],
+            *server_args["online_quant_extra_exclude_layer"],
+        ]
+        prefill = json.loads(exports["PREFILL_ONLINE_QUANT_CONFIG"])
+        decode = json.loads(exports["DECODE_ONLINE_QUANT_CONFIG"])
+        self.assertEqual(prefill["exclude_layer"], [*both, "*self_attn.f_b_proj"])
+        self.assertEqual(decode["exclude_layer"], both)
+        self.assertEqual(
+            {k: v for k, v in prefill.items() if k != "exclude_layer"},
+            {k: v for k, v in shared.items() if k != "exclude_layer"},
+        )
+
+    def test_extra_exclusions_without_a_config_fail_the_cell(self):
+        cell = copy.deepcopy(self.cell)
+        cell["server_args"]["online_quant_config"] = ""
+        result = self.submit(cell)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("without an online_quant_config to extend", result.stdout)
+        self.assertEqual(result.stdout.splitlines()[-1], "exit 1")
+
+
 class C1LogLinesAreK3MonoLogsTest(unittest.TestCase):
     """Every expect_log and reject_log line of the C1 decode is one K3 mono
     logs: a reworded log in ATOM must fail here, not leave a reject_log that
