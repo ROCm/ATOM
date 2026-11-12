@@ -8,7 +8,8 @@ day; Wednesday: 8K/1K on the previous Saturday's image). Writes
 reports/455-CI-report-<YYYYMMDD>.md (highlights and the summary table) and
 reports/455-CI-report-<YYYYMMDD>-detail.md (environment, every number, the
 trend charts of make_charts.py and each failure's core error log from
-runs/<YYYYMMDD>/<slug>/error.log), and prints the highlights. The image comes
+runs/<YYYYMMDD>/<slug>/error.log), and prints the highlights, tagging each model's owner from owners.csv
+(columns model, owner) and warning about news without an owner. The image comes
 from runs/<image date>/image.json, written when the image was built
 (455-CI-guide.md §2.4), else from the CSV rows.
 """
@@ -18,7 +19,7 @@ import json
 import os
 
 from ci455_data import MODELS, acc_cell, perf_cells, read_csv
-from ci455_report import ModelResult, detail_md, highlights, summary_md
+from ci455_report import ModelResult, detail_md, highlights, missing_owners, summary_md
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -89,12 +90,16 @@ def main(argv=None):
         for slug, name in MODELS[s]
     ]
     env = environment(args.data_dir, [r for r in today if r["scenario"] in scenarios])
+    owners = {
+        r["model"]: r.get("owner", "")
+        for r in _rows(os.path.join(args.data_dir, "owners.csv"))
+    }
 
     out = os.path.join(args.data_dir, "reports")
     summary, detail = f"455-CI-report-{tag}.md", f"455-CI-report-{tag}-detail.md"
     os.makedirs(out, exist_ok=True)
     with open(os.path.join(out, summary), "w", encoding="utf-8") as f:
-        f.write(summary_md(day, env, results, detail, args.mock))
+        f.write(summary_md(day, env, results, detail, args.mock, owners))
     with open(os.path.join(out, detail), "w", encoding="utf-8") as f:
         f.write(
             detail_md(
@@ -108,8 +113,12 @@ def main(argv=None):
             )
         )
     print(f"wrote {os.path.join(out, summary)}\nwrote {os.path.join(out, detail)}\n")
-    for line in highlights(results):
+    for line in highlights(results, owners):
         print("-", line)
+    for name in missing_owners(results, owners):
+        print(
+            f"WARNING: {name} is in the highlights but has no owner in owners.csv, so nobody is tagged."
+        )
 
 
 if __name__ == "__main__":

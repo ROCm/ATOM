@@ -103,6 +103,8 @@ def test_a_saturday_report_has_highlights_a_dated_table_and_the_core_error_log(
         "Traceback (most recent call last):\nRuntimeError: HIP error: out of memory\n"
     )
 
+    (tmp_path / "owners.csv").write_text("model,owner\nkimi-k3,@k3_owner\n")
+
     main(["--date", "2026-11-14", "--data-dir", str(tmp_path)])
 
     summary = (tmp_path / "reports" / "455-CI-report-20261114.md").read_text()
@@ -124,6 +126,7 @@ def test_a_saturday_report_has_highlights_a_dated_table_and_the_core_error_log(
         "Traceback" in detail and "../runs/20261114/charts/perf-endpoint.png" in detail
     )
     assert "| Kimi-K3 (2.8T) | tp8dcp8 | 4 |" in detail
+    assert "@k3_owner please take a look." in summary
     assert not re.search(CJK, summary + detail)
 
 
@@ -159,3 +162,19 @@ def test_a_mock_report_says_example_at_the_top(tmp_path):
     for name in ("455-CI-report-20261114.md", "455-CI-report-20261114-detail.md"):
         head = (tmp_path / "reports" / name).read_text().splitlines()[:4]
         assert any("EXAMPLE" in line for line in head)
+
+
+def test_news_about_a_model_without_an_owner_is_flagged_on_the_console(
+    tmp_path, capsys
+):
+    write_csv(
+        tmp_path / "perf.csv",
+        PERF_COLUMNS,
+        [
+            perf("2026-11-07", 64, "1000"),
+            perf("2026-11-14", 64, "", status="fail", error="RuntimeError: x"),
+        ],
+    )
+    main(["--date", "2026-11-14", "--data-dir", str(tmp_path)])
+    out = capsys.readouterr().out
+    assert "no owner" in out and "Kimi-K3" in out

@@ -1,7 +1,7 @@
 """Tests for the 455-CI highlights and summary table (ci455_report.py)."""
 
 from ci455_data import AccCell, PerfCell
-from ci455_report import ModelResult, detail_md, highlights, summary_row
+from ci455_report import ModelResult, detail_md, highlights, missing_owners, summary_row
 
 
 def pc(
@@ -301,3 +301,43 @@ def test_detail_performance_rows_show_the_parallelism_not_the_gpu_count():
     text = detail_md("2026-11-14", {}, [model("Alpha", **FLAT)], "r.md", "c", "r")
     assert "| Parallelism |" in text and "| GPUs |" not in text
     assert "| Alpha | tp4 | 4 |" in text and "| Alpha | tp4 | 64 |" in text
+
+
+FAILING = {
+    "c4": pc(4, 50.0, 50.0),
+    "c64": pc(64, None, 900.0, status="fail", error="RuntimeError: x"),
+    "accuracy": ac(0.9, 0.9),
+}
+GAINING = {
+    "c4": pc(4, 100.0, 100.0),
+    "c64": pc(64, 1040.0, 1000.0),
+    "accuracy": ac(0.95, 0.95),
+}
+
+
+def test_a_problem_tags_the_owner_and_asks_them_to_look():
+    (line,) = highlights([model("Bravo", **FAILING)], owners={"bravo": "@bravo_owner"})
+    assert line.startswith("❌ Bravo: ") and line.endswith(
+        "@bravo_owner please take a look."
+    )
+
+
+def test_good_news_tags_the_owner_without_asking():
+    (line,) = highlights(
+        [model("Alpha", **GAINING)], owners={"alpha": "@alpha_owner @alpha_backup"}
+    )
+    assert line.endswith("@alpha_owner @alpha_backup") and "please" not in line
+
+
+def test_a_model_without_an_owner_gets_no_mention():
+    (line,) = highlights([model("Alpha", **GAINING)], owners={"bravo": "@bravo_owner"})
+    assert "@" not in line
+
+
+def test_missing_owners_names_the_models_with_news_and_no_owner():
+    results = [
+        model("Alpha", **GAINING),
+        model("Bravo", **FAILING),
+        model("Charlie", **FLAT),
+    ]
+    assert missing_owners(results, {"alpha": "@alpha_owner"}) == ["Bravo"]

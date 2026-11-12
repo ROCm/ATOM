@@ -123,12 +123,11 @@ def _phrase(cells, top, key, template, flag=perf_flag):
     return ", ".join(parts)
 
 
-def highlights(results):
-    """One short line per model with news, "<flag> <model>: <what happened>",
-    most important first: failures, severe and plain regressions (throughput,
-    then GSM8K), slow slides below the best, progress, recoveries. Flat models
-    and first results are not news; with no news the list says so."""
-    failed, severe, warn, drift, gain, recovered = [], [], [], [], [], []
+def _news(results):
+    """(category, slug, line, ask) per piece of news, most important first:
+    failures, severe and plain regressions (throughput, then GSM8K), slow
+    slides below the best, progress, recoveries. `ask`: the owner should look."""
+    items = []
     for r in results:
         who, top = short_name(r.name), headline(r)
         parts = _failed_parts(r)
@@ -139,18 +138,35 @@ def highlights(results):
             )
             err = _short(errors[0]) if errors else ""
             what = "all runs failed" if everything else f"{' and '.join(parts)} failed"
-            failed.append(f"❌ {who}: {what}" + (f" ({err})" if err else "") + ".")
+            items.append(
+                (
+                    0,
+                    r.slug,
+                    f"❌ {who}: {what}" + (f" ({err})" if err else "") + ".",
+                    True,
+                )
+            )
             continue
         down = [c for c in r.perf if perf_flag(c.delta) in ("⚠️", "🔴")]
         if down:
             icon = "🔴" if any(perf_flag(c.delta) == "🔴" for c in down) else "⚠️"
-            (severe if icon == "🔴" else warn).append(
-                f"{icon} {who}: {_phrase(down, top, lambda c: c.delta, '{subject} down {pct}')}."
+            items.append(
+                (
+                    1 if icon == "🔴" else 2,
+                    r.slug,
+                    f"{icon} {who}: {_phrase(down, top, lambda c: c.delta, '{subject} down {pct}')}.",
+                    True,
+                )
             )
         flag = acc_flag(r.acc.delta)
         if flag:
-            (severe if flag == "🔴" else warn).append(
-                f"{flag} {who}: GSM8K down {abs(r.acc.delta) * 100:.1f} points to {score(r.acc.value)}."
+            items.append(
+                (
+                    1 if flag == "🔴" else 2,
+                    r.slug,
+                    f"{flag} {who}: GSM8K down {abs(r.acc.delta) * 100:.1f} points to {score(r.acc.value)}.",
+                    True,
+                )
             )
         slide = [
             c
@@ -160,19 +176,60 @@ def highlights(results):
             and round(c.delta_best, 6) <= BEST_DRIFT
         ]
         if slide:
-            drift.append(
-                f"⚠️ {who}: "
-                f"{_phrase(slide, top, lambda c: c.delta_best, '{subject} {pct} below its best')}"
-                " (gradual decline)."
+            items.append(
+                (
+                    3,
+                    r.slug,
+                    (
+                        f"⚠️ {who}: "
+                        f"{_phrase(slide, top, lambda c: c.delta_best, '{subject} {pct} below its best')}"
+                        " (gradual decline)."
+                    ),
+                    True,
+                )
             )
         up = [c for c in r.perf if perf_flag(c.delta) == "🟢"]
         if up:
-            gain.append(
-                f"🟢 {who}: {_phrase(up, top, lambda c: c.delta, '{subject} up {pct}')}."
+            items.append(
+                (
+                    4,
+                    r.slug,
+                    f"🟢 {who}: {_phrase(up, top, lambda c: c.delta, '{subject} up {pct}')}.",
+                    False,
+                )
             )
         if any(c.prev_failed for c in r.perf) or r.acc.prev_failed:
-            recovered.append(f"✅ {who}: recovered from the previous failure.")
-    return failed + severe + warn + drift + gain + recovered or [NONE]
+            items.append(
+                (5, r.slug, f"✅ {who}: recovered from the previous failure.", False)
+            )
+    return sorted(
+        items, key=lambda item: item[0]
+    )  # stable: model order within a category
+
+
+def highlights(results, owners=None):
+    """One short line per piece of news, "<flag> <model>: <what happened>",
+    then the model's owner (owners.csv): asked to take a look when something
+    is wrong, just tagged for good news. Flat models and first results are
+    not news; with no news the list says so."""
+    owners = owners or {}
+    lines = []
+    for _, slug, line, ask in _news(results):
+        owner = owners.get(slug, "").strip()
+        if owner:
+            line = f"{line} {owner} please take a look." if ask else f"{line} {owner}"
+        lines.append(line)
+    return lines or [NONE]
+
+
+def missing_owners(results, owners):
+    """Models with news but no owner to tag, in report order."""
+    news = {slug for _, slug, _, _ in _news(results)}
+    return [
+        r.name
+        for r in results
+        if r.slug in news and not (owners or {}).get(r.slug, "").strip()
+    ]
 
 
 # ------------------------------------------------------------------ tables
@@ -253,7 +310,7 @@ def _labels(results):
     ]
 
 
-def summary_md(date, env, results, detail_name, mock=False):
+def summary_md(date, env, results, detail_name, mock=False, owners=None):
     out = [
         f"# 455-CI report · {date} · {' + '.join(_labels(results))}"
         + (" · EXAMPLE" if mock else ""),
@@ -266,7 +323,7 @@ def summary_md(date, env, results, detail_name, mock=False):
         "",
         "## Highlights",
         "",
-        *[f"- {h}" for h in highlights(results)],
+        *[f"- {h}" for h in highlights(results, owners)],
         "",
         "## Summary",
         "",

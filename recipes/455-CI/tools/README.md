@@ -24,6 +24,7 @@ python3 -m pytest -q                         # 改了脚本先跑测试
 ```
 
 - `--date` 是场次日期：周六那场或周三那场。每场测完跑一次，连同历史数据重新生成。那天跑的是哪个场景，脚本从数据里看出来。
+- Highlights 里 @ 的 owner 取自 `../owners.csv`（两列：`model`、`owner`）。有消息的模型没登记 owner 时，`make_report.py` 会打警告。
 - 依赖：Python 3.10 以上、matplotlib；跑测试还要 pytest。没有字体文件也能画，会退回 DejaVu Sans。
 
 ## 样例

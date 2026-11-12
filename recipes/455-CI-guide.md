@@ -418,6 +418,7 @@ recipes/
     ├── perf.csv           全部历史性能
     ├── accuracy.csv       全部历史 GSM8K 精度
     ├── accuracy_baseline.csv   可选：精度图上的 baseline 参考线
+    ├── owners.csv         每个模型的 owner，Highlights 里 @ 他们（§5.1）
     ├── tools/             生成图和报告的脚本、样例（§5.5）
     ├── reports/           一场两份，YYYYMMDD 是场次日期
     │   ├── 455-CI-report-<YYYYMMDD>.md          报告：Highlights 和总表
@@ -459,6 +460,8 @@ recipes/
 
 大老板只看 Highlights，所以只写本次出了大事或跑挂的模型，每个一行：`<标记> <模型>: <发生了什么>`。不写场景，只给一个关键数字，例如 `⚠️ GLM-5.2: throughput down 4.2%.`、`❌ Qwen-35B-A3B: c64 failed (RuntimeError: …).`。持平、变化不大或第一次有数据的模型都不提；一个都没有时只写 `No failures or major changes.`。
 
+每条后面 @ 这个模型的 owner，让负责的人看到：出问题（❌、🔴、⚠️）写成 `… @owner please take a look.`，好消息（🟢、✅）只 @ 一下。owner 名单在 `recipes/455-CI/owners.csv`（两列：`model` 是 §1 的 slug，`owner` 是要 @ 的人，多人用空格隔开），由测试负责人维护。用 GitHub 账号还是 IM 里的名字，取决于 Highlights 贴到哪里：仓库里的 md 文件写 @ 不会触发 GitHub 通知，真正提醒到人的是把 Highlights 贴进 issue 或群聊那一下。有消息的模型没登记 owner 时，`make_report.py` 会打警告，提交前补上。
+
 `make_report.py` 按下表比较本次和历史结果，生成草稿；测试 agent 读一遍再提交，可以改措辞，但不能删掉 ❌ 和 🔴 的条目，也不能改数字。
 
 | 标记 | 什么时候算 | 和谁比 | 写法 |
@@ -485,9 +488,9 @@ Image `gfx1250-atom-ci455-<YYYYMMDD>` · ATOM `main@<sha 前 9 位>` · aiter `m
 
 ## Highlights
 
-- ❌ Qwen-35B-A3B: c64 failed (RuntimeError: HIP error: out of memory).
-- 🟢 DeepSeek-V4.1-Flash: throughput up 6.9%.
-- ✅ Kimi-K3: recovered from the previous failure.
+- ❌ Qwen-35B-A3B: c64 failed (RuntimeError: HIP error: out of memory). @qwen35b_owner please take a look.
+- 🟢 DeepSeek-V4.1-Flash: throughput up 6.9%. @v41_flash_owner
+- ✅ Kimi-K3: recovered from the previous failure. @k3_owner
 
 ## Summary
 
