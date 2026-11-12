@@ -12,7 +12,7 @@ KV output aggregator.
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -40,6 +40,24 @@ def kv_config_has_producer(kv_config: object) -> bool:
     if kv_config.get("kv_role") == "kv_producer":
         return True
     return any(kv_config_has_producer(sub) for sub in kv_config.get("connectors", []))
+
+
+def produced_no_handoff(seq: object) -> bool:
+    """Whether a finishing request on a P/D producer has nothing to hand off.
+
+    True when it was aborted or rejected as unschedulable, or when its prompt
+    prefill never completed on this scheduler (`Sequence.prefill_completed`).
+    Both reasons end a request that is leaving the waiting queue, so it holds
+    no blocks: one that never ran has no KV and no first token, and one that
+    ran, was preempted and is then rejected has had its blocks freed. A
+    producer then publishes a cancellation and keeps no send claim.
+    """
+    reason = getattr(seq, "leave_reason", None) or ""
+    return (
+        reason == "aborted"
+        or reason.startswith("unschedulable")
+        or not getattr(seq, "prefill_completed", True)
+    )
 
 
 @dataclass(frozen=True)
@@ -232,6 +250,65 @@ class KVTransferRegion:
 
 
 @dataclass(frozen=True)
+class PageUnitSpec:
+    """A PAGE unit's identity, `(namespace, field, layer)`, and its format.
+
+    The same on every TP size and PP stage; heads per rank are `head_major_runs`.
+    """
+
+    namespace: str
+    field: str
+    # The owning module's `layer_num`, so a PP stage names a unit as the
+    # unsplit model does.
+    layer: int
+    # Elements per token, per head where the unit is per head.
+    dim: int
+    dtype: str
+
+
+def pair_units(
+    local: Sequence[PageUnitSpec],
+    consumer: Sequence[PageUnitSpec],
+    first_layer: int = 0,
+    end_layer: int | None = None,
+) -> list[int]:
+    """The consumer region each local unit lands in, matched by identity.
+
+    Every consumer unit of layers `[first_layer, end_layer)` must be matched.
+    """
+    index: dict[tuple[str, str, int], int] = {}
+    for i, spec in enumerate(consumer):
+        key = (spec.namespace, spec.field, spec.layer)
+        if key in index:
+            raise ValueError(f"consumer publishes {key} twice")
+        index[key] = i
+    cmap = []
+    for spec in local:
+        i = index.get((spec.namespace, spec.field, spec.layer))
+        if i is None:
+            raise ValueError(f"consumer has no unit for {spec}")
+        if consumer[i] != spec:
+            raise ValueError(
+                f"unit format mismatch: ours {spec}, consumer's {consumer[i]}"
+            )
+        cmap.append(i)
+    if len(set(cmap)) != len(cmap):
+        raise ValueError("two local units share one identity")
+    owned = {
+        i
+        for i, spec in enumerate(consumer)
+        if spec.layer >= first_layer and (end_layer is None or spec.layer < end_layer)
+    }
+    missing = sorted(owned.difference(cmap))
+    if missing:
+        raise ValueError(
+            f"{len(missing)} consumer unit(s) of layers [{first_layer}, "
+            f"{end_layer}) are not held here, e.g. {consumer[missing[0]]}"
+        )
+    return cmap
+
+
+@dataclass(frozen=True)
 class PageRegion:
     """One PAGE region and the tensor that aliases exactly its bytes.
 
@@ -245,6 +322,10 @@ class PageRegion:
 
     region: KVTransferRegion
     view: Any = None
+    # `(runs, heads)`: the unit is `runs` equal runs, each holding this rank's
+    # `heads` KV heads one after another. None: not per head (replicated).
+    head_major_runs: tuple[int, int] | None = None
+    unit_spec: PageUnitSpec | None = None
 
 
 @dataclass

@@ -718,15 +718,26 @@ def test_config_refuses_pools_without_rdma():
 def test_engine_compatibility_refuses_what_phase_one_does_not_move():
     cfg = parse_mooncake_store_config(_extra())
     check_engine_compatibility(cfg, _config())
-    hybrid = _config()
-    hybrid.hf_config.compress_ratios = [4, 128]
-    with pytest.raises(ValueError, match="only the dense KV layout"):
-        check_engine_compatibility(cfg, hybrid)
+    state_owning = _config()
+    state_owning.hf_config.model_type = "kimi_linear"
+    with pytest.raises(ValueError, match="dense KV layout and V4.1's replay PAGEs"):
+        check_engine_compatibility(cfg, state_owning)
     with pytest.raises(ValueError, match="decode context parallelism"):
         check_engine_compatibility(cfg, _config(decode_context_parallel_size=4))
     odd = parse_mooncake_store_config(_extra(chunk_tokens=6))
     with pytest.raises(ValueError, match="multiple of the KV cache block size 4"):
         check_engine_compatibility(odd, _config())
+
+
+def test_engine_compatibility_accepts_v41_page_replay():
+    config = _config()
+    config.enable_encoder_swa_bounded_replay = True
+    config.hf_config.model_type = "deepseek_v41"
+    cfg = parse_mooncake_store_config(_extra())
+    check_engine_compatibility(cfg, config)
+    config.decode_context_parallel_size = 2
+    with pytest.raises(ValueError, match="decode context parallelism"):
+        check_engine_compatibility(cfg, config)
 
 
 @pytest.mark.parametrize("role_side", ["scheduler", "worker"])
@@ -3140,6 +3151,69 @@ def _registering_config():
     return _config(extra=_extra(save_pool_mib=1, load_pool_mib=1))
 
 
+@pytest.mark.parametrize("replays", [False, None])
+def test_v41_registration_requires_explicit_page_replay(cluster, one_rank, replays):
+    config = _registering_config()
+    config.hf_config.model_type = "deepseek_v41"
+    config.enable_encoder_swa_bounded_replay = True
+    transfer = SimpleNamespace(
+        state_backend=SimpleNamespace(
+            state_transfer=lambda: SimpleNamespace(replays=replays)
+        )
+    )
+    worker = MooncakeStoreOffloadConnector(config)
+    try:
+        with pytest.raises(ValueError, match="requires the PAGE replay contract"):
+            worker.register_kv_caches(
+                _kv_caches(), transfer_tensors=transfer, num_blocks=8
+            )
+        assert not cluster.stores
+    finally:
+        worker.close()
+
+
+def test_v41_registration_uses_pages_without_request_slots(
+    cluster, one_rank, monkeypatch
+):
+    from atom.kv_transfer.offload import page_codec as dsv4_codec
+
+    config = _registering_config()
+    config.hf_config.model_type = "deepseek_v41"
+    config.enable_encoder_swa_bounded_replay = True
+    pages = object()
+    transfer = SimpleNamespace(
+        block_regions=pages,
+        num_blocks=8,
+        state_backend=SimpleNamespace(
+            state_transfer=lambda: SimpleNamespace(replays=True)
+        ),
+    )
+    selected = {}
+
+    def page_codec(**kwargs):
+        selected.update(kwargs)
+        # The fixture's fake transfer engine uses CPU bytes. Keep its normal
+        # codec while verifying which PAGE/SLOT contract registration selects.
+        codec = worker_mod.DenseKVByteCodec(_kv_caches(), num_blocks=8)
+        monkeypatch.setattr(
+            type(codec), "has_fused_chunk_major_staging", property(lambda self: True)
+        )
+        return codec
+
+    monkeypatch.setattr(dsv4_codec, "DSV4PageSlotCodec", page_codec)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    worker = MooncakeStoreOffloadConnector(config)
+    try:
+        worker.register_kv_caches({}, transfer_tensors=transfer, num_blocks=8)
+        assert selected["page_regions"] is pages
+        assert selected["slot_regions"] == ()
+        assert selected["num_slots"] == 0
+        assert selected["num_blocks"] == 8
+        assert worker._pool is not None
+    finally:
+        worker.close()
+
+
 def test_registration_builds_the_pool_and_probes_the_store(cluster, one_rank):
     worker = MooncakeStoreOffloadConnector(_registering_config())
     try:
@@ -3743,3 +3817,70 @@ def test_mixed_windows_report_the_same_chunks(
     for index in range(4):
         expected = _page_pattern(2 * index) + _page_pattern(2 * index + 1)
         assert objects[_key(request.chunk_hashes, index)] == expected
+
+
+def test_v41_architecture_alias_and_codec_identity():
+    from atom.kv_transfer.offload.mooncake_store.config import uses_replay_pages
+
+    config = _config()
+    dense = keys.store_namespace(config, CHUNK)
+    config.hf_config.model_type = "deepseek_v41"
+    config.enable_encoder_swa_bounded_replay = True
+    assert uses_replay_pages(config)
+    assert keys.store_namespace(config, CHUNK) != dense
+
+
+@pytest.mark.parametrize("blocks", [None, 0, -1])
+def test_pure_page_codec_rejects_missing_or_invalid_count(blocks):
+    from atom.kv_transfer.offload.page_codec import pure_page_codec
+
+    with pytest.raises(ValueError, match="positive num_blocks"):
+        pure_page_codec(SimpleNamespace(block_regions=[object()]), blocks)
+
+
+def test_pure_page_codec_rejects_missing_fused_staging(monkeypatch):
+    from atom.kv_transfer.offload import page_codec
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        page_codec,
+        "DSV4PageSlotCodec",
+        lambda **kw: SimpleNamespace(has_fused_chunk_major_staging=False),
+    )
+    with pytest.raises(RuntimeError, match="fused chunk-major PAGE"):
+        page_codec.pure_page_codec(SimpleNamespace(block_regions=[object()]), 8)
+
+
+def test_plain_v4_is_refused_before_weights_load():
+    """Plain DeepSeek-V4 resolves to the "hybrid" layout, which the Store does
+    not move: refused at construction, not at registration. (V4.1 without
+    bounded replay is the model's own runtime gate.)"""
+    plain_v4 = _config()
+    plain_v4.hf_config.compress_ratios = [4, 128]
+    with pytest.raises(ValueError, match="resolves to 'hybrid'"):
+        check_engine_compatibility(parse_mooncake_store_config(_extra()), plain_v4)
+
+
+@pytest.mark.parametrize(
+    "model_type", ["deepseek_v41", "deepseek_v41_text", "deepseek_v41_dspark"]
+)
+def test_every_v41_spelling_is_admitted_with_bounded_replay(model_type):
+    from atom.kv_transfer.offload.mooncake_store.config import uses_replay_pages
+
+    config = _config()
+    config.hf_config.model_type = model_type
+    config.hf_config.compress_ratios = [4, 128]
+    config.enable_encoder_swa_bounded_replay = True
+    check_engine_compatibility(parse_mooncake_store_config(_extra()), config)
+    assert uses_replay_pages(config)
+
+
+def test_store_reads_the_region_map_only_on_a_page_layout():
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+    store = {"kv_connector": "mooncake_store", "kv_role": "offload"}
+    dense = _config(kv_transfer_config=store)
+    assert not KVConnectorFactory.topology_reads_block_regions(dense)
+    v41 = _config(kv_transfer_config=store)
+    v41.hf_config.model_type = "deepseek_v41"
+    assert KVConnectorFactory.topology_reads_block_regions(v41)
