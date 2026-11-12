@@ -84,18 +84,21 @@ def load_rows(
     padded: bool = True,
     cache_policy: int = 0,
     whole: bool = False,
+    width: int = SLAB,
 ):
-    """Issue this wave's TDM copy of ``rows_per_wave`` of a [rows, SLAB] BF16
+    """Issue this wave's TDM copy of ``rows_per_wave`` of a [rows, width] BF16
     tile starting at ``address`` into ``lds``; rows past ``rows`` are skipped.
     ``mask`` is the cluster multicast mask of identical loads to merge.
-    ``padded``: LDS rows ``ROW_STRIDE`` apart, else packed ``SLAB`` apart.
+    ``padded``: LDS rows ``ROW_STRIDE`` apart, else packed ``width`` apart.
     ``whole``: the first ``rows_per_wave`` rows in one copy, by the caller's
-    one wave."""
+    one wave. Widths and strides are in BF16 units, whatever the bytes hold."""
+    if padded and width != SLAB:
+        raise ValueError("only a SLAB-wide copy pads its LDS rows")
 
     wave = fx.Int32(rocdl.wave_id())
     row0 = fx.Int32(0) if whole else wave * rows_per_wave
     source = address + fx.Int64(row0) * fx.Int64(row_stride * 2)
-    pitch = ROW_STRIDE if padded else SLAB
+    pitch = ROW_STRIDE if padded else width
     destination = fx.Int32(fx.ptrtoint(lds)) + row0 * (pitch * 2)
     live = fx.max(fx.min(fx.Int32(rows) - row0, rows_per_wave), 0)
     group0 = vector.from_elements(
@@ -121,9 +124,9 @@ def load_rows(
             as_ir_value(value)
             for value in (
                 _i32(config),
-                _i32(SLAB << 16),
+                _i32(width << 16),
                 (live & 0xFFFF) << 16,
-                (live >> 16) | _i32(SLAB << 16),
+                (live >> 16) | _i32(width << 16),
                 live,
                 _i32(row_stride),
                 _i32(0),
