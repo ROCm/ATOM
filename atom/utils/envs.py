@@ -1051,8 +1051,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD": lambda: int(
         os.getenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "1024")
     ),
-    # Kimi-K3.1's latent TP MoE row-shards only from this many tokens: below it
-    # the reduce-scatters and all-gather cost more than the tail they split.
+    # Kimi-K3.1's latent TP MoE layer row-shards its attention residual and MoE
+    # tail only from this many tokens: below it the collectives cost more.
     "ATOM_KIMI_K3_MOE_ROW_SHARD_MIN_TOKENS": lambda: _nonnegative_int_env(
         "ATOM_KIMI_K3_MOE_ROW_SHARD_MIN_TOKENS", 8192
     ),
