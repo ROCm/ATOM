@@ -2223,10 +2223,14 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         prefix: str,
         num_heads: int,
         last_page_lens: torch.Tensor,
+        whole_rows: bool = False,
     ) -> None:
         """The persistent sparse prefill's work plan over ``attn_metadata``'s
         query rows, into the ``prefix`` set's buffers; none for the
-        non-persistent DCP sparse prefill, which reads no plan."""
+        non-persistent DCP sparse prefill, which reads no plan.
+
+        ``whole_rows`` plans one work item a row, which DCP needs: each owning
+        layer points the plan at its own keys (``patch_work_kv_ranges``)."""
         if self.dcp_sparse_prefill_nonps:
             return
         var = self.model_runner.forward_vars
@@ -2250,7 +2254,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             page_size=self.block_size,
             dtype_q=self.dtype_q,
             dtype_kv=self.dtype_kv,
-            kv_granularity=max(self.block_size, 16),
+            # No row selects more than index_topk_out keys.
+            kv_granularity=(
+                triton.next_power_of_2(self.index_topk_out)
+                if whole_rows
+                else max(self.block_size, 16)
+            ),
             max_seqlen_qo=1,
             uni_seqlen_qo=1,
             fast_mode=1,
@@ -2272,6 +2281,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 prefix,
                 self.sparse_prefill_num_heads,
                 attn_metadata.sparse_kv_last_page_lens,
+                whole_rows=self.dcp_world_size > 1,
             )
             if staged.pcp_split:
                 self._apply_pcp_reindex(
