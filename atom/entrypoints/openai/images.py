@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Chat image input from API clients: what may be sent, and loading it.
+"""Image input from API clients: what may be sent, and loading it.
 
 What a client may send follows DeepSeek's vision contract, which agrees with
 OpenAI's where the two overlap (docs/api_image_input.md). The offline engine
@@ -43,22 +43,27 @@ NO_FILES_API = "file references are not supported: this server has no Files API"
 _IMAGE_PARTS = frozenset({"image_url", "image", "file"})
 
 
-def check_chat_images(messages: Sequence[Any]) -> list[Any]:
+def check_chat_images(
+    messages: Sequence[Any], *, tool_results: bool = False
+) -> list[Any]:
     """``messages`` with each image part in its ``image_url`` form, checked
     before anything is fetched.
 
     A ``file`` part carries an image as base64 ``file_data``; the
     processor-style ``{"type": "image", "image": source}`` part is a source
     like any other, so it cannot name a server path either. Images belong to
-    ``user`` messages.
+    ``user`` messages, and with ``tool_results`` to ``tool`` messages too: the
+    Responses and Messages contracts take them there, chat's does not.
     """
+    roles = ("user", "tool") if tool_results else ("user",)
+    where = "user messages and tool results" if tool_results else "user messages"
     checked, count = [], 0
     for message in messages:
         content = message.content
         if isinstance(content, list) and any(map(_is_image, content)):
-            if message.role != "user":
+            if message.role not in roles:
                 raise ValueError(
-                    "images are allowed in user messages only, "
+                    f"images are allowed in {where} only, "
                     f"not in {message.role} messages"
                 )
             content = [_image_url_part(p) if _is_image(p) else p for p in content]

@@ -35,6 +35,22 @@ rules is HTTP 400 before generation.
 Whether a deployment serves images at all is the model's to say:
 DeepSeek-V4.1 refuses them under DSpark and DP attention.
 
+## Responses and Messages
+
+`/v1/responses` and `/v1/messages` take images where DeepSeek's contract has
+them, translate them to the parts above, and check and load them the same
+way.
+
+| Endpoint | Image | Where |
+|---|---|---|
+| `/v1/responses` | `{"type": "input_image", "image_url": ..., "detail": ...}` | `user` and `developer` messages, and the `output` of `function_call_output` and `custom_tool_call_output` |
+| `/v1/messages` | `{"type": "image", "source": {"type": "base64", "media_type": ..., "data": ...}}` or `{"source": {"type": "url", "url": ...}}` | `user` messages, and the `content` of `tool_result` |
+
+A `file_id` and a `file` source are refused, as there is no Files API, and so
+is an image anywhere else (`system`, `assistant`), or with `kv_transfer_params`:
+a PD prefill cannot hand an image request off. A request without images
+renders as before.
+
 ## Public URLs
 
 A URL is fetched only from a host that resolves to global addresses, and so

@@ -79,10 +79,14 @@ class MonoMetadataBuilder:
             return native_build(batch, *args, **kwargs)
         return result
 
-    def build_for_cudagraph_capture(self, bs, max_q_len=None):
+    def build_for_cudagraph_capture(
+        self, bs, max_q_len=None, *, decode_ubatch_slices=None
+    ):
         self._mono_batch = None
         self.prepare_mono()
-        return self._native.build_for_cudagraph_capture(bs, max_q_len)
+        return self._native.build_for_cudagraph_capture(
+            bs, max_q_len, decode_ubatch_slices=decode_ubatch_slices
+        )
 
     def blank_cache_write_targets(self):
         if self._mono_session is not None:

@@ -4,6 +4,7 @@
 import ast
 import pickle
 import sys
+import types
 from dataclasses import replace
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -214,7 +215,14 @@ def test_pd_checks_physical_layout_before_writing(
         _fp4_index_layout=False,
         pp_size=1,
         _consumer_region_map=lambda n, m, *args: list(range(n)),
+        _block_unit_specs=None,
+        _block_head_major_runs=(),
+        _per_block_bytes_list=[r.unit_bytes for r in src],
+        _MAX_RDMA_ENTRIES_PER_BATCH=4096,
         _rdma_write=writes,
+    )
+    connector._block_plan = types.MethodType(
+        mooncake_page_writer["_block_plan"], connector
     )
     request = {
         "consumer_block_base_addrs": [r.base_addr for r in dst],

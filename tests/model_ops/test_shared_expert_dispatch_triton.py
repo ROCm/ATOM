@@ -9,6 +9,7 @@ import torch
 
 pytest.importorskip("triton", reason="Triton dispatch tests require triton")
 
+from atom.model_ops.fused_moe.gathered_shared_ids import copy_shared_expert_ids_
 from atom.model_ops.fused_moe.shared_expert_dispatch import (
     _remap_torch,
     remap_topk_to_dispatch,
@@ -89,3 +90,56 @@ def test_empty_batch_matches_torch():
 
     assert ids_got.shape == (0, 9)
     assert w_got.shape == (0, 9)
+
+
+@pytest.mark.parametrize("rows", [1, 257, 4096])
+@pytest.mark.parametrize("num_shared", [1, 3])
+@pytest.mark.parametrize("strided", [False, True])
+@pytest.mark.parametrize("graph_replay", [False, True], ids=["eager", "graph"])
+def test_gathered_shared_ids_match_cpu_through_idle_replay(
+    rows, num_shared, strided, graph_replay
+):
+    """The fused copy preserves routed columns and the read-only template,
+    including strided views and a real -> all-idle -> real replay."""
+    top_k = 4
+    width = top_k + num_shared
+    step = 2 if strided else 1
+    storage = torch.full(
+        (rows + 2, width * step), -77, dtype=torch.int32, device="cuda"
+    )
+    ids = storage[1:-1, ::step]
+    template_storage = torch.full_like(storage, 99)
+    template = template_storage[1:-1, top_k * step :: step]
+    template[::2] = 8
+    before = template_storage.clone()
+    routed = (
+        torch.arange(rows * top_k, dtype=torch.int32, device="cuda").view(rows, top_k)
+        % 8
+    )
+    routed[::3] = -1
+    ids[:, :top_k] = routed
+
+    if graph_replay:
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            copy_shared_expert_ids_(ids, template, top_k)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            copy_shared_expert_ids_(ids, template, top_k)
+
+    for idle in (False, True, False):
+        ids[:, :top_k] = -1 if idle else routed
+        expected = ids.cpu()
+        copy_shared_expert_ids_(expected, template.cpu(), top_k)
+        if graph_replay:
+            graph.replay()
+        else:
+            copy_shared_expert_ids_(ids, template, top_k)
+        torch.cuda.synchronize()
+        assert torch.equal(ids.cpu(), expected)
+        assert torch.equal(template_storage, before)
+        assert (storage[[0, -1]] == -77).all()
+        if strided:
+            assert (storage[:, 1::2] == -77).all()

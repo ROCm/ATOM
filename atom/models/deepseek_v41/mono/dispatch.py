@@ -23,6 +23,7 @@ import logging
 import torch
 from torch import nn
 
+from atom.models.deepseek_v41.mono import hi_gate
 from atom.models.deepseek_v41.mono.config import (
     MAX_MOE_ROWS,
     MAX_REQUESTS,
@@ -31,6 +32,7 @@ from atom.models.deepseek_v41.mono.config import (
 )
 from atom.models.deepseek_v41.mono.draft_runner import DraftMonoRunner
 from atom.models.deepseek_v41.mono.runner import V41MonoDecodeRunner
+from atom.mono.runtime.consensus import MonoUnsupported
 from atom.mono.runtime.deployment import dp_attention_ranks
 from atom.mono.runtime.route import LazyRunner
 from atom.utils.forward_context import get_forward_context
@@ -64,7 +66,7 @@ def step_supported(input_ids: torch.Tensor, inputs_embeds, dp_ranks: int = 0) ->
     step = getattr(md, "step", None)
     if step is None or getattr(md, "image_mask", None) is not None:
         return False
-    return step.decode and step.width == rows
+    return step.decode and step.running_tokens == rows
 
 
 class MonoDecodeModel(nn.Module):
@@ -155,11 +157,38 @@ def install_mono_decode(
     """``model`` wrapped for mono decode (and ``drafter``'s DSpark draft model
     for its backbone), or ``model`` itself when this deployment is one mono
     does not serve."""
+    from atom.models.deepseek_v41.mono import gfx1250
+
+    if gfx1250.enabled():
+        from atom.models.deepseek_v41.mono.gfx1250.dispatch import (
+            install_single_step,
+        )
+
+        return install_single_step(model, atom_config, drafter)
     why = config_refusal(atom_config)
     if why is not None:
+        if hi_gate.mode() == "1":
+            raise RuntimeError(
+                f"ATOM_DSV41_MONO_HI=1, but V4.1 mono decode is off: {why}"
+            )
         logger.info("V4.1 mono decode off: %s", why)
         return model
     dp_ranks = dp_attention_ranks(atom_config)
+    # The decoder layers on the high-interactivity monokernels where they serve
+    # this deployment (``hi_gate``: ATOM_DSV41_MONO_HI, "auto" by default); any
+    # other takes ATOM's mono decode below, unchanged.
+    # A mismatch only the loaded model shows (``MonoUnsupported``, agreed over
+    # the TP group before anything is built: ``install_hi``) falls back as the
+    # gate's refusals do, on every rank.
+    if hi_gate.decide(atom_config, drafter, metadata_builder, dp_ranks):
+        from atom.models.deepseek_v41.mono.hi_dispatch import install_hi
+
+        try:
+            return install_hi(model, atom_config, drafter, metadata_builder, dp_ranks)
+        except MonoUnsupported as why:
+            if hi_gate.mode() == "1":
+                raise
+            hi_gate.log_once(logging.INFO, "V4.1 mono hi off: %s", why)
     if drafter is not None and hasattr(drafter.model, "block_backbone"):
         drafter.model = MonoDraftModel(drafter.model, dp_ranks)
     return MonoDecodeModel(
