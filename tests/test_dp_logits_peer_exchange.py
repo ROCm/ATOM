@@ -84,6 +84,10 @@ def _validate_peer_exchange():
             .reshape(local_rows, 129280)
         )
 
+    def copy_in(x, local_rows):
+        # Logits already computed: copied into this rank's slot of the pool.
+        return exchange.produce(lambda dst: dst.copy_(x), x.shape[0] // 4, local_rows)
+
     for rows in (384, 192, 144, 96, 6):
         local_rows = (
             rows if rows in (192, 144, 96) else (0 if rank == 0 else rows - rank)
@@ -96,7 +100,7 @@ def _validate_peer_exchange():
         x = storage[:, :32320]
         fill(x)
         expected = reference(x, local_rows)
-        actual = exchange(x, local_rows)
+        actual = copy_in(x, local_rows)
         torch.cuda.synchronize()
         assert torch.equal(expected.view(torch.int16), actual.view(torch.int16))
         # The lm_head's entry: a GEMM writes this rank's shard into the pool.
@@ -113,7 +117,7 @@ def _validate_peer_exchange():
         torch.cuda.synchronize()
         assert torch.equal(expected.view(torch.int16), actual.view(torch.int16))
         graph, actual = _capture(
-            lambda x=x, local_rows=local_rows: exchange(x, local_rows), stream
+            lambda x=x, local_rows=local_rows: copy_in(x, local_rows), stream
         )
         for iteration in range(7):
             fill(x)

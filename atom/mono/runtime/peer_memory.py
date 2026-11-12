@@ -16,12 +16,12 @@ from atom.mono.runtime.hip_ipc import (
     open_ipc_handle,
 )
 from atom.mono.runtime.uncached import (
-    DeviceBytes,
     alloc_uncached,
     fine_grained_bytes,
     ipc_heap,
     uncached_bytes,
 )
+from atom.utils.device_bytes import DeviceBytes
 
 
 class PeerBuffer:

@@ -73,7 +73,7 @@ def test_vocab_sharded_lm_head_matches_the_full_head(monkeypatch, embed_head, wo
     torch.nn.Module.__init__(head)
     head.num_embeddings, head.weight, head.bias = weight.shape[0], weight, None
     monkeypatch.setattr(
-        embed_head, "tgemm", SimpleNamespace(mm=lambda x, w, b: x @ w.t())
+        embed_head, "tgemm", SimpleNamespace(mm=lambda x, w, b, out=None: x @ w.t())
     )
 
     def on_each_rank(all_gather):

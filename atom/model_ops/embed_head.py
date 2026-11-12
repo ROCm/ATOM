@@ -365,8 +365,6 @@ class ParallelLMHead(VocabParallelEmbedding):
         vshard = self.num_embeddings // world
         vocab = slice(rank * vshard, (rank + 1) * vshard)
         bias = None if self.bias is None else self.bias[vocab]
-        if out is None:
-            return tgemm.mm(x, self.weight[vocab], bias)
         return tgemm.mm(x, self.weight[vocab], bias, out=out)
 
     def _sp_sharded_logits(self, x: torch.Tensor) -> torch.Tensor:
@@ -471,14 +469,10 @@ class ParallelLMHead(VocabParallelEmbedding):
             namespace=namespace,
         )
         # Compile reachable row buckets at startup, before benchmark requests.
-        # These are transport-only buffers; no model or request state is changed.
-        scratch = torch.zeros(
-            (4 * max_rows, self.num_embeddings // 4),
-            dtype=self.weight.dtype,
-            device=self.weight.device,
-        )
+        # Transport only: nothing is written into the pool, and no model or
+        # request state is changed.
         for rows in sorted(set(row_sizes), reverse=True):
-            self._dp_logits_exchange(scratch[: 4 * rows], rows)
+            self._dp_logits_exchange.produce(lambda dst: None, rows, rows)
         torch.cuda.synchronize()
         logger.info(
             "DP logits peer exchange ready: rank=%d max_rows=%d vocab=%d "
@@ -522,7 +516,6 @@ class ParallelLMHead(VocabParallelEmbedding):
 
         # [max_rows, dim] -> [dp_size * max_rows, dim] (rank-major concat).
         gathered = dp_group.all_gather(x.contiguous(), dim=0, use_custom=use_custom)
-        start = dp_rank * max_rows
         peer = self.__dict__.get("_dp_logits_exchange")
         if mode == "allgather" and peer is not None and max_rows <= peer.max_rows:
             if not self.__dict__.get("_dp_logits_peer_logged", False):
@@ -544,6 +537,7 @@ class ParallelLMHead(VocabParallelEmbedding):
 
         # [dp_size * max_rows, V/dp]
         logits_shard = self._vocab_shard_logits(gathered, dp_rank, dp_size)
+        start = dp_rank * max_rows
 
         if mode == "argmax":
             # Reduce each shard to (max, global_id); exchange only [Σrows, 2].

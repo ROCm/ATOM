@@ -9,7 +9,7 @@ import triton
 import triton.language as tl
 from aiter.dist.device_communicators.vmm_allocator import VMMBuffer, vmm_exchange
 
-from atom.mono.runtime.uncached import DeviceBytes
+from atom.utils.device_bytes import DeviceBytes
 
 
 @triton.jit
@@ -119,19 +119,6 @@ class PeerLogitsExchange:
         else:
             dist.all_reduce(self.token, group=self.barrier_group)
 
-    def __call__(self, x, local_rows):
-        """``produce`` from logits already computed: ``x`` is this rank's
-        ``[4 * rows, vocab]`` shard, copied into its slot of the pool."""
-        if (
-            x.ndim != 2
-            or x.shape[0] % 4
-            or x.shape[1] != self.vocab
-            or x.device != self.device
-            or x.dtype != self.dtype
-        ):
-            raise ValueError("Input does not match the peer pool geometry")
-        return self.produce(lambda dst: dst.copy_(x), x.shape[0] // 4, local_rows)
-
     def produce(self, fill, rows, local_rows):
         """Exchange this rank's ``[4 * rows, vocab]`` logits, which
         ``fill(dst)`` writes straight into its slot of the pool: this rank's
@@ -141,24 +128,26 @@ class PeerLogitsExchange:
         output = torch.empty(
             (local_rows, 4 * self.vocab), device=self.device, dtype=self.dtype
         )
+        # Copy raw 64-bit words. An integer pointer obtained from the peer table
+        # can lose alignment metadata in lowering; word-sized transport avoids
+        # scalar 16-bit XGMI transactions without changing any logits bits.
+        output_words = output.view(torch.int64)
+        vocab_words = self.vocab // 4
         self._barrier()
         fill(self.local[: 4 * rows * self.vocab].view(4 * rows, self.vocab))
         self._barrier()
-        self._gather_rows(output, rows, local_rows)
-        return output
-
-    def _gather_rows(self, output, rows, local_rows):
         if local_rows:
-            _gather[(triton.cdiv(local_rows * (self.vocab // 4), 4096), 4)](
+            _gather[(triton.cdiv(local_rows * vocab_words, 4096), 4)](
                 self.peers,
-                output.view(torch.int64),
+                output_words,
                 self.rank,
                 rows,
                 local_rows,
-                self.vocab // 4,
+                vocab_words,
                 4096,
                 num_warps=4,
             )
+        return output
 
     def close(self):
         torch.cuda.synchronize()
