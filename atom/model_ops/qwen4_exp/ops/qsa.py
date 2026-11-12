@@ -30,9 +30,9 @@ import triton
 import triton.language as tl
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
+from aiter.ops.flydsl.kernels.mqa_logits import qsa_flydsl_layout
 from aiter.ops.topk import top_k_per_row_prefill
 
-from atom.model_ops.qwen4_exp.ops import qsa_flydsl_layout
 from atom.model_ops.qwen4_exp.ops.qsa_gfx1250 import (
     qsa_gfx1250_supports,
     qsa_sparse_paged_gqa_gfx1250,
