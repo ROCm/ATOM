@@ -1,5 +1,5 @@
 //! The engine wire protocol: the messages generated from
-//! `atom/mesh/protocol/engine_v1.proto` (the spec) and the multipart
+//! `atom/model_engine/zmq_protocol/engine_v1.proto` (the spec) and the multipart
 //! frames they ride in.
 
 use prost::Message as _;

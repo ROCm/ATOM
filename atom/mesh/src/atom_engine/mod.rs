@@ -11,4 +11,4 @@ mod tests;
 pub mod wire;
 
 pub use link::{CoreLink, Interrupted};
-pub use spec::{EngineSpec, ModelSpec, ReasoningToggle};
+pub use spec::{CoreSpec, EngineSpec};

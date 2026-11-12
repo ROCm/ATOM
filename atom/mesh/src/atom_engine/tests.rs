@@ -11,7 +11,7 @@ use tempfile::TempDir;
 
 use super::{
     link::{self, CoreLink},
-    spec::{BalanceStrategy, CoreSpec, EngineSpec},
+    spec::{CoreSpec, EngineSpec},
     wire::{self, pb, Inbound, PROTOCOL_VERSION},
 };
 
@@ -95,12 +95,6 @@ fn a_malformed_message_or_an_out_of_bounds_ref_is_refused() {
 
 fn spec_json() -> serde_json::Value {
     json!({
-        "model": {
-            "served_name": "qwen",
-            "tokenizer_path": "/models/qwen",
-            "default_max_tokens": 256,
-        },
-        "balance": {"strategy": "least_tokens", "req_equiv": 512},
         "engines": [
             {"dp_rank": 0, "pid": 10, "input": "ipc:///i0", "control": "ipc:///c0", "output": "ipc:///o0"},
             {"dp_rank": 1, "pid": 11, "input": "ipc:///i1", "control": "ipc:///c1", "output": "ipc:///o1"},
@@ -109,12 +103,8 @@ fn spec_json() -> serde_json::Value {
 }
 
 #[test]
-fn a_spec_defaults_what_it_omits_and_refuses_cores_it_cannot_place() {
+fn a_spec_lists_its_cores_and_refuses_cores_it_cannot_place() {
     let spec = EngineSpec::from_json(&spec_json().to_string()).unwrap();
-    assert_eq!(spec.model.max_model_len, None);
-    assert!(spec.model.required_channel.is_none());
-    assert_eq!(spec.balance.strategy, BalanceStrategy::LeastTokens);
-    assert!(!spec.balance.session_affinity);
     assert_eq!(spec.engines[1].pid, 11);
 
     let mut no_cores = spec_json();

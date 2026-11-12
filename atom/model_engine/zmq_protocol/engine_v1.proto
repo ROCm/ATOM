@@ -136,8 +136,6 @@ enum DType {
   BFLOAT16 = 11;
   FLOAT32 = 12;
   FLOAT64 = 13;
-  COMPLEX64 = 14;
-  COMPLEX128 = 15;
 }
 
 enum TensorKind {
@@ -152,8 +150,6 @@ message Tensor {
   DType dtype = 2;
   repeated int64 shape = 3;
   TensorKind kind = 4;
-  string device = 5;        // torch only; empty means CPU
-  bool requires_grad = 6;   // torch only
 }
 
 message ValueList {
@@ -179,14 +175,13 @@ message Value {
     bool null_value = 1;      // set to true; the value is None
     bool bool_value = 2;
     sint64 int_value = 3;
-    string big_int_value = 4;  // decimal, for ints outside int64
-    double float_value = 5;
-    string string_value = 6;
-    bytes bytes_value = 7;
-    ValueList list_value = 8;
-    ValueList tuple_value = 9;
-    ValueMap map_value = 10;
-    Tensor tensor_value = 11;
+    double float_value = 4;
+    string string_value = 5;
+    bytes bytes_value = 6;
+    ValueList list_value = 7;
+    ValueList tuple_value = 8;
+    ValueMap map_value = 9;
+    Tensor tensor_value = 10;
     // Python-only escape hatch: a pickled object the typed kinds cannot
     // express. Non-Python clients never send it.
     BufferRef pickled_value = 15;
@@ -338,8 +333,7 @@ message AdminCommand {
   }
   Kind kind = 1;
   optional string request_id = 2;
-  optional double timeout = 3;   // seconds the sender will wait
-  optional double deadline = 4;  // the same, as an absolute wall-clock time
+  optional double timeout = 3;  // seconds the sender will wait
 }
 
 message Shutdown {}
@@ -358,19 +352,18 @@ message Completion {
   uint64 seq_id = 1;
   BufferRef completion_token_ids = 2;  // int32
   BufferRef logprobs = 3;              // float64, one per completion token
-  bool return_logprobs = 4;
-  uint32 num_prompt_tokens = 5;
+  uint32 num_prompt_tokens = 4;
   // Prompt tokens whose KV the Core holds: the whole prompt once prefill is
   // done. Not the prefix-cache hit -- that is StreamBatch.num_cached_tokens.
-  uint32 num_cached_tokens = 6;
-  double arrive_time = 7;
-  double first_token_time = 8;
-  double leave_time = 9;
-  string leave_reason = 10;
-  Value kv_transfer_params_output = 11;  // absent: None
-  optional string external_request_id = 12;
-  optional string parent_request_id = 13;
-  uint32 sibling_index = 14;
+  uint32 num_cached_tokens = 5;
+  double arrive_time = 6;
+  double first_token_time = 7;
+  double leave_time = 8;
+  string leave_reason = 9;
+  Value kv_transfer_params_output = 10;  // absent: None
+  optional string external_request_id = 11;
+  optional string parent_request_id = 12;
+  uint32 sibling_index = 13;
 }
 
 message Completions {
@@ -384,14 +377,12 @@ message Completions {
 // one call where a message per sequence costs one per field.
 message StreamBatch {
   repeated uint64 seq_ids = 1;
-  reserved 2;  // request_ids: always the seq_id
-  reserved "request_ids";
-  repeated uint32 token_counts = 3;  // how many of `tokens` each entry owns
-  repeated int32 tokens = 4;         // every entry's output tokens, in order
-  repeated bool finished = 5;
-  repeated int64 num_cached_tokens = 6;  // prefix-cache hit, as of this step
-  map<uint32, string> finish_reasons = 7;            // by entry; absent: None
-  map<uint32, Value> kv_transfer_params_outputs = 8;  // by entry; absent: None
+  repeated uint32 token_counts = 2;  // how many of `tokens` each entry owns
+  repeated int32 tokens = 3;         // every entry's output tokens, in order
+  repeated bool finished = 4;
+  repeated int64 num_cached_tokens = 5;  // prefix-cache hit, as of this step
+  map<uint32, string> finish_reasons = 6;            // by entry; absent: None
+  map<uint32, Value> kv_transfer_params_outputs = 7;  // by entry; absent: None
   // Token logprobs, as columns too. An entry listed in `logprob_entries` has
   // `logprob_counts` records (one per output token, possibly none) of
   // `logprob_widths` candidates each; an entry not listed has none (None).
@@ -399,11 +390,11 @@ message StreamBatch {
   // (logprob, rank, top_id_0, top_logprob_0, ...): its floats -- logprob, then
   // each top_logprob -- go to `logprob_floats`, its ints -- rank, then each
   // top_id -- to `logprob_ints`, records in entry order.
-  repeated uint32 logprob_entries = 9;
-  repeated uint32 logprob_counts = 10;
-  repeated uint32 logprob_widths = 11;
-  BufferRef logprob_floats = 12;  // float64
-  BufferRef logprob_ints = 13;    // int32
+  repeated uint32 logprob_entries = 8;
+  repeated uint32 logprob_counts = 9;
+  repeated uint32 logprob_widths = 10;
+  BufferRef logprob_floats = 11;  // float64
+  BufferRef logprob_ints = 12;    // int32
 }
 
 // The Core's metrics snapshot, pushed on its own clock. The dict's keys are

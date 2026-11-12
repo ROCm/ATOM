@@ -76,24 +76,15 @@ jobs:
           restore-keys: |
             atomesh-mocker-cargo-${{ runner.os }}-
 
-      - name: Test P/D router request lifecycle
+      - name: Run atomesh unit tests
         run: |
           set -euo pipefail
+          # Every unit test in the library, the optional ATOM engine runtime's
+          # included.
           cargo test \
             --manifest-path atom/mesh/Cargo.toml \
             --target-dir atom/mesh/mocker/target/mesh \
-            --release --lib routers::http_pd_router
-
-      - name: Test the ATOM engine runtime
-        run: |
-          set -euo pipefail
-          # The engine_v1 wire framing, the launch spec Python hands over and
-          # one EngineCore link (a fake Core on real ipc sockets).
-          cargo test \
-            --manifest-path atom/mesh/Cargo.toml \
-            --target-dir atom/mesh/mocker/target/mesh \
-            --release --lib -- \
-            atom_engine
+            --release --lib --features atom-engine
 
       - name: Run Atomesh test harness
         run: |
