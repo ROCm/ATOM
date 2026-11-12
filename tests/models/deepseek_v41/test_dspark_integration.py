@@ -337,6 +337,7 @@ def test_draft_graph_replay_reads_serving_slots_after_reorder(monkeypatch):
     draft = DeepseekV41DSpark.__new__(DeepseekV41DSpark)
     nn.Module.__init__(draft)
     draft.window_size = 4
+    draft.draft_src_buffers = None
     draft.draft_kv_dtype = "auto"
     layer = nn.Module()
     layer.attn = nn.Module()

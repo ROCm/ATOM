@@ -8,11 +8,15 @@ the *context* KV write: the target rows the drafter absorbs after every target
 forward.
 """
 
+from functools import cache
+
 import torch
 import triton
 import triton.language as tl
+from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from atom.model_ops.blockscale_kernels.quantization import FP8_DTYPE, fp8_groups
+from atom.model_ops.deepseek_v41.draft_block import DraftSrcIndices
 from atom.model_ops.sparse_attn_v4 import sparse_attn
 from atom.model_ops.v4_kernels import sparse_attn_v4_paged_2src
 
@@ -27,127 +31,194 @@ def draft_attention(query, context_kv, draft_kv, sink, step, scale):
     the two by concatenating. Neither touches `context_kv`.
     """
     src = step.src_indices
-    if (
-        src is not None
-        and query.is_contiguous()
+    if src is None:
+        keys = torch.cat((context_kv, draft_kv), dim=1)
+        return sparse_attn(query, keys, sink, step.indices, scale)
+    # `DraftAttention.forward` hands over a GEMM output, the gathered window
+    # and the keys it has just written, all dense. Anything else is a caller
+    # bug, not a reason to take the slower path without saying so.
+    assert (
+        query.is_contiguous()
         and context_kv.is_contiguous()
         and draft_kv.is_contiguous()
-    ):
-        batch, width, heads, dim = query.shape
-        output = sparse_attn_v4_paged_2src(
-            query.view(batch * width, heads, dim),
-            context_kv.view(-1, dim),
-            src[0],
-            src[1],
-            draft_kv.view(-1, dim),
-            src[2],
-            src[3],
-            sink,
-            scale,
-        )
-        return output.view(batch, width, heads, dim)
-    keys = torch.cat((context_kv, draft_kv), dim=1)
-    return sparse_attn(query, keys, sink, step.indices, scale)
-
-
-@triton.jit
-def _draft_src_count_kernel(
-    indices_ptr, counts_ptr, ring, width, rows, ENTRIES: tl.constexpr
-):
-    """Per draft row: how many ring and block entries are not -1 (`counts` is
-    `[2, rows]`)."""
-    t = tl.program_id(0)
-    slot = tl.arange(0, ENTRIES)
-    total = ring + width
-    index = tl.load(
-        indices_ptr + t.to(tl.int64) * total + slot, mask=slot < total, other=-1
+    ), "two-source draft attention needs a contiguous query, window and block"
+    batch, width, heads, dim = query.shape
+    output = sparse_attn_v4_paged_2src(
+        query.view(batch * width, heads, dim),
+        context_kv.view(-1, dim),
+        src.context,
+        src.context_ptr,
+        draft_kv.view(-1, dim),
+        src.block,
+        src.block_ptr,
+        sink,
+        scale,
     )
-    live = index >= 0
-    tl.store(counts_ptr + t, tl.sum((live & (slot < ring)).to(tl.int32), 0))
-    tl.store(counts_ptr + rows + t, tl.sum((live & (slot >= ring)).to(tl.int32), 0))
+    return output.view(batch, width, heads, dim)
 
 
-@triton.jit
-def _draft_src_fill_kernel(
-    indices_ptr,
-    ends_ptr,
-    ptrs_ptr,
-    context_ptr,
-    block_ptr,
-    ring,
-    width,
-    rows,
-    ENTRIES: tl.constexpr,
-):
-    """Per draft row: its live entries, in order, as rows of the flattened
-    `[B * ring]` window and `[B * width]` block, and its two indptr ends
-    (`ends` is the inclusive running count, `ptrs` the `[2, rows + 1]` indptr)."""
-    t = tl.program_id(0)
-    batch = t // width
-    slot = tl.arange(0, ENTRIES)
-    total = ring + width
-    index = tl.load(
-        indices_ptr + t.to(tl.int64) * total + slot, mask=slot < total, other=-1
-    )
-    history = (slot < ring) & (index >= 0)
-    block = (slot >= ring) & (slot < total) & (index >= 0)
-    history_end = tl.load(ends_ptr + t)
-    block_end = tl.load(ends_ptr + rows + t)
-    at = (
-        history_end
-        - tl.sum(history.to(tl.int32), 0)
-        + tl.cumsum(history.to(tl.int32), 0)
-        - 1
-    )
-    tl.store(context_ptr + at, batch * ring + index, mask=history)
-    at = (
-        block_end - tl.sum(block.to(tl.int32), 0) + tl.cumsum(block.to(tl.int32), 0) - 1
-    )
-    tl.store(block_ptr + at, batch * width + index - ring, mask=block)
-    tl.store(ptrs_ptr + 1 + t, history_end)
-    tl.store(ptrs_ptr + rows + 2 + t, block_end)
-    if t == 0:
-        tl.store(ptrs_ptr, 0)
-        tl.store(ptrs_ptr + rows + 1, 0)
+@cache
+def two_source_draft() -> bool:
+    """Whether the draft stages read the window and the block as two sources.
 
-
-def draft_src_indices(indices, ring):
-    """`draft_step_indices`' `[B, width, ring + width]` list as the two
-    sources `draft_attention` hands the sparse MLA kernel: `(context rows,
-    indptr, block rows, indptr)`, int32, -1 entries dropped.
-
-    Fixed-size buffers and no host read, so a draft graph captures it; built
-    once per step, every stage reads the same rows. The fill kernel writes
-    every indptr entry; with no rows nothing is launched and nothing reads
-    the buffers.
+    Only measured on gfx1250, and not bit-identical to the concatenating path
+    (it can move draft acceptance), so every other arch keeps that path.
     """
-    batch, width, total = indices.shape
-    rows = batch * width
-    device = indices.device
-    context = torch.empty(max(rows * ring, 1), dtype=torch.int32, device=device)
-    block = torch.empty(max(rows * width, 1), dtype=torch.int32, device=device)
-    ptrs = torch.empty(2, rows + 1, dtype=torch.int32, device=device)
-    if not rows:
-        return context, ptrs[0], block, ptrs[1]
-    entries = triton.next_power_of_2(total)
-    counts = torch.empty(2, rows, dtype=torch.int32, device=device)
-    _draft_src_count_kernel[(rows,)](
-        indices, counts, ring, width, rows, ENTRIES=entries, num_warps=4
+    return get_gfx_runtime() == "gfx1250"
+
+
+@triton.jit
+def _history_slots(anchor, slot, ring, window):
+    """The absolute position each ring slot holds for `anchor`, and whether a
+    draft row may attend to it.
+
+    Normalized because Triton's remainder carries the DIVIDEND's sign where
+    torch's follows the divisor, and `anchor - slot` is negative over most of a
+    partly-filled ring. Getting this wrong does not fail -- it points the draft
+    at the wrong rows.
+    """
+    residue = (anchor - slot) % ring
+    residue = tl.where(residue < 0, residue + ring, residue)
+    context = anchor - residue
+    valid = (
+        (slot < ring)
+        & (context >= 0)
+        & (context <= anchor)
+        & (context > anchor - window)
     )
-    ends = torch.cumsum(counts, 1, dtype=torch.int32)
-    _draft_src_fill_kernel[(rows,)](
-        indices,
-        ends,
-        ptrs,
-        context,
-        block,
-        ring,
-        width,
-        rows,
-        ENTRIES=entries,
-        num_warps=4,
+    return context, valid
+
+
+@triton.jit
+def _draft_src_kernel(
+    positions_ptr,  # [B] anchor position per request
+    context_ptr,  # out: window rows, packed
+    context_indptr_ptr,  # out: [B * width + 1]
+    block_ptr,  # out: [B * width * width] block rows
+    block_indptr_ptr,  # out: [B * width + 1]
+    batch_size,
+    ring,
+    window,
+    width,
+    BLOCK_B: tl.constexpr,  # next_pow2(B)
+    RING_BLOCK: tl.constexpr,  # next_pow2(ring)
+    WIDTH_BLOCK: tl.constexpr,  # next_pow2(width)
+):
+    """One program per draft row: its window rows, its block rows, and both
+    indptr entries.
+
+    A request's slots hold positions `anchor - ring + 1 .. anchor`, one each,
+    so exactly `min(anchor + 1, window, ring)` of them are valid (none for a
+    negative anchor). Every row of a request shares that list, which makes the
+    row's window offset `width * (rows before b) + t * count[b]`: a closed form
+    over the anchors, recomputed per program, so the build is one launch with
+    no count pass and no cumsum between kernels -- the same reason
+    `DSparkIndexBuffers.build` is one launch.
+    """
+    row = tl.program_id(0)  # flat (request, draft position)
+    request = row // width
+    t = row % width
+
+    everyone = tl.arange(0, BLOCK_B)
+    live = everyone < batch_size
+    anchors = tl.load(positions_ptr + everyone, mask=live, other=0).to(tl.int64)
+    counts = tl.minimum(tl.minimum(anchors + 1, window), ring)
+    counts = tl.where(live, tl.maximum(counts, 0), 0)
+    before = tl.sum(tl.where(everyone < request, counts, 0))
+    count = tl.sum(tl.where(everyone == request, counts, 0))
+    start = before * width + t * count
+
+    anchor = tl.load(positions_ptr + request).to(tl.int64)
+    slot = tl.arange(0, RING_BLOCK)
+    _, valid = _history_slots(anchor, slot, ring, window)
+    at = start + tl.cumsum(valid.to(tl.int64), 0) - 1
+    tl.store(context_ptr + at, (request * ring + slot).to(tl.int32), mask=valid)
+    tl.store(context_indptr_ptr + row, start.to(tl.int32))
+
+    # The whole block, for every row: its indptr is a ramp of `width`.
+    steps = tl.arange(0, WIDTH_BLOCK)
+    tl.store(
+        block_ptr + row.to(tl.int64) * width + steps,
+        (request * width + steps).to(tl.int32),
+        mask=steps < width,
     )
-    return context, ptrs[0], block, ptrs[1]
+    tl.store(block_indptr_ptr + row, (row * width).to(tl.int32))
+    if row == 0:
+        rows = batch_size * width
+        tl.store(context_indptr_ptr + rows, (tl.sum(counts) * width).to(tl.int32))
+        tl.store(block_indptr_ptr + rows, (rows * width).to(tl.int32))
+
+
+class DraftSrcBuffers:
+    """`draft_src_indices`' outputs, allocated once at the largest batch.
+
+    The `DSparkIndexBuffers` idiom: sized at `max_num_seqs` requests of the
+    full block width and only ever sliced, every slice prefix-stable in the
+    batch, so a captured draft graph replays the build. Allocated on the first
+    build, where the ring is known; an arch that keeps the concatenating path
+    never allocates.
+    """
+
+    def __init__(self, max_batch: int, max_width: int):
+        self.max_batch, self.max_width = max_batch, max_width
+        self.ring = None
+        self.context = self.block = self.indptr = None
+
+    def claim(self, batch: int, width: int, ring: int, device) -> DraftSrcIndices:
+        """This batch's slices, allocating the bundle on first use."""
+        if batch > self.max_batch or width > self.max_width:
+            raise ValueError(
+                f"Draft source buffers hold {self.max_batch} x {self.max_width} "
+                f"rows, not {batch} x {width}; they are sized at max_num_seqs."
+            )
+        if self.context is None:
+            rows = self.max_batch * self.max_width
+            i32 = {"dtype": torch.int32, "device": device}
+            self.context = torch.empty(rows * ring, **i32)
+            self.block = torch.empty(rows * self.max_width, **i32)
+            self.indptr = torch.empty(2, rows + 1, **i32)
+            self.ring = ring
+        elif ring != self.ring:
+            raise ValueError(f"Draft source buffers were cut for ring {self.ring}")
+        rows = batch * width
+        return DraftSrcIndices(
+            self.context[: rows * ring],
+            self.indptr[0, : rows + 1],
+            self.block[: rows * width],
+            self.indptr[1, : rows + 1],
+        )
+
+
+def draft_src_indices(positions, ring, window, width, buffers):
+    """`draft_step_indices`' index list as `draft_attention`'s two sources,
+    or None where the stages keep the concatenating path.
+
+    This is where the path is chosen: None without `buffers` or off
+    `two_source_draft()`. Otherwise fills `buffers` in one launch with no host
+    read; built once per step, every stage reads the same rows. With no rows
+    nothing is launched, and the attention has no query row to read an indptr.
+    """
+    if buffers is None or not two_source_draft():
+        return None
+    batch = positions.shape[0]
+    src = buffers.claim(batch, width, ring, positions.device)
+    if batch:
+        _draft_src_kernel[(batch * width,)](
+            positions,
+            src.context,
+            src.context_ptr,
+            src.block,
+            src.block_ptr,
+            batch,
+            ring,
+            window,
+            width,
+            BLOCK_B=triton.next_power_of_2(batch),
+            RING_BLOCK=triton.next_power_of_2(ring),
+            WIDTH_BLOCK=triton.next_power_of_2(width),
+            num_warps=4,
+        )
+    return src
 
 
 @triton.jit(do_not_specialize=["BATCH"])
@@ -380,14 +451,8 @@ def _draft_step_kernel(
     total = ring + width
     is_history = slot < ring
 
-    # The absolute position a ring slot currently holds. Normalized because
-    # Triton's remainder carries the DIVIDEND's sign where torch's follows the
-    # divisor, and `anchor - slot` is negative over most of a partly-filled
-    # ring. Getting this wrong does not fail -- it points the draft at the
-    # wrong rows.
-    residue = (anchor - slot) % ring
-    residue = tl.where(residue < 0, residue + ring, residue)
-    context = anchor - residue
+    # Shared with `_draft_src_kernel`, so the two index forms cannot disagree.
+    context, valid = _history_slots(anchor, slot, ring, window)
     if row == 0:
         tl.store(
             out_context_ptr + batch.to(tl.int64) * ring + slot,
@@ -395,9 +460,6 @@ def _draft_step_kernel(
             mask=is_history,
         )
 
-    valid = (
-        is_history & (context >= 0) & (context <= anchor) & (context > anchor - window)
-    )
     index = tl.where(valid, slot, -1)
     # Past the ring the block's own rows index themselves.
     index = tl.where(is_history, index, slot)

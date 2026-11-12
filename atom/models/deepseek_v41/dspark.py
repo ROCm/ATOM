@@ -8,7 +8,6 @@ from types import SimpleNamespace
 
 import torch
 from aiter.dist.parallel_state import get_tp_group
-from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.tuned_gemm import tgemm
 from torch import nn
 
@@ -17,6 +16,7 @@ from atom.model_ops.blockscale import native_quant_linear, quantize_fp8
 from atom.model_ops.blockscale_kernels.quantization import FP8_DTYPE
 from atom.model_ops.deepseek_v41.draft_block import DraftStep, draft_step, rotate_rows
 from atom.model_ops.deepseek_v41.dspark import (
+    DraftSrcBuffers,
     build_block_state,
     draft_attention,
     draft_attention_csr,
@@ -219,6 +219,12 @@ class DeepseekV41DSpark(DSparkDraftModel):
         self.draft_kv_dtype = config.dspark.draft_kv_dtype
         self.block_size = args.dspark_block_size
         self.window_size, self.vocab_size = args.sliding_window, args.vocab_size
+        # Serving hands over the engine config; an offline build has no batch
+        # bound and never runs `block_backbone`, the only reader.
+        max_batch = getattr(config, "max_num_seqs", None)
+        self.draft_src_buffers = (
+            None if max_batch is None else DraftSrcBuffers(max_batch, self.block_size)
+        )
         draft = copy(args)
         draft.n_routed_experts = args.dspark_n_routed_experts
         draft.num_experts_per_tok = args.dspark_num_experts_per_tok
@@ -617,8 +623,13 @@ class DeepseekV41DSpark(DSparkDraftModel):
         # single launch rather than the ~16 torch ops that spelled them out --
         # launch-floor work on [B, ring] rows, four of them an `arange`
         # rebuilding a constant.
+        ring = cache.geometry.ring_slots
         step_positions, indices, context_positions = draft_step_indices(
-            positions, cache.geometry.ring_slots, self.window_size, width
+            positions, ring, self.window_size, width
+        )
+        # The op picks the attention path; None keeps the concatenating one.
+        src = draft_src_indices(
+            positions, ring, self.window_size, width, self.draft_src_buffers
         )
         return self.draft_hidden(
             input_ids,
@@ -626,17 +637,7 @@ class DeepseekV41DSpark(DSparkDraftModel):
             context,
             context_positions,
             num_draft=num_draft,
-            step=DraftStep(
-                step_positions,
-                indices,
-                # The sparse MLA kernel's draft read is measured on gfx1250;
-                # elsewhere the stages keep the concatenating path.
-                src_indices=(
-                    draft_src_indices(indices, cache.geometry.ring_slots)
-                    if get_gfx_runtime() == "gfx1250"
-                    else None
-                ),
-            ),
+            step=DraftStep(step_positions, indices, src_indices=src),
         )
 
     def forward_spec(self, input_ids, positions, num_draft=None):
