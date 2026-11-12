@@ -39,7 +39,7 @@ from atom.models.kimi_k3.mono.kernels.stages import (
 from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import LDS_PAD
 from atom.models.kimi_k3.mono.kernels.token_tiling import WMMA_TOKEN_ROWS
 from atom.models.kimi_k3.mono.sources import SOURCES
-from atom.mono.device.ops import CM_DEV, bf_hi, bf_lo, rsrc, traced
+from atom.mono.device.ops import bf_hi, bf_lo, rsrc, traced
 from atom.mono.plan.architecture import GFX1250
 from atom.mono.runtime.abi import KernelAbi
 
@@ -86,13 +86,15 @@ FINISH_PACKED_FRONT_ABI = KernelAbi(
 
 def herd_scratch_layout(rows: int) -> dict[str, tuple[int, int]]:
     """``{name: (byte offset, words)}`` of a ``precompute_herd`` finish's
-    scratch past the grid epoch: the arrival counter, the ``tile_m`` and routed
-    scaling factor the host sets, and the HERD outputs (i32, f32
+    scratch past the grid epoch: the launch counter, the ``tile_m`` and routed
+    scaling factor the host sets, the routing CTAs' tagged candidates
+    (sigmoid, ``moe_gfx1250.herd_tag`` | expert) and the HERD outputs (i32, f32
     ``topk_weights``), each 64-byte aligned."""
 
-    layout = {"arrivals": (8, 1), "tile_m": (12, 1), "routed_scaling_factor": (16, 1)}
+    layout = {"launch": (8, 1), "tile_m": (12, 1), "routed_scaling_factor": (16, 1)}
     end = 64
     for name, words in (
+        ("candidates", 2 * rows * (TOPK + 1)),
         ("topk_ids", rows * TOPK),
         ("topk_weights", rows * TOPK),
         ("topids_to_rows", rows * TOPK),
@@ -126,10 +128,6 @@ def _direct_poll(requests):
 
 def _direct_put(pointer, index, value):
     bo.buffer_store(value, rsrc(pointer), index)
-
-
-def _device_put(pointer, index, value):
-    bo.buffer_store(value, rsrc(pointer), index, cache_modifier=CM_DEV)
 
 
 @traced
@@ -348,8 +346,6 @@ def build_packed_finish(
     )
 
     sources = SOURCES
-    # The finalizing CTA reads every token's candidates at device scope.
-    route_put = _device_put if precompute_herd else _direct_put
     # It is the CTA before the routing ones, and its one shared-down task goes
     # to the first CTA with a single one.
     herd_cta = plan.blocks - rows - 1
@@ -463,7 +459,17 @@ def build_packed_finish(
         # Without routed experts nothing below waits on a grid barrier, so
         # routing takes the CTAs with the fewest shared-down tasks.
         route_token = bid if include_routed else bid - (plan.blocks - rows)
+        launch_word = herd_at["launch"][0] // 4
+        candidates = scratch + fx.Int64(herd_at["candidates"][0])
+        launch = fx.Int32(
+            bo.buffer_load(rsrc(scratch), launch_word, vec_width=1, dtype=T.i32)
+        )
         if (route_token >= 0) & (route_token < rows):
+            herd_candidates = (
+                {"herd_candidates": (candidates, moe_gfx1250.herd_tag(launch))}
+                if precompute_herd
+                else {}
+            )
             context = {
                 "S": rows,
                 "tid": tid,
@@ -471,12 +477,13 @@ def build_packed_finish(
                 "wave": wave,
                 "red": route_role.red.ptr,
                 "poll": _direct_poll,
-                "put": route_put,
+                "put": _direct_put,
                 "peer": {"rlog_own": front_gathered},
                 "args": {"bias": router_bias},
                 "contiguous_logits": replicated_front,
                 "herd": herd,
                 **route_outputs,
+                **herd_candidates,
             }
             # One CTA owns one token.  The old candidate serialized all rows
             # through CTA 0 even though routing has no cross-token reduction.
@@ -485,26 +492,12 @@ def build_packed_finish(
                 route_token,
                 payload.local_bytes // 4,
             )
-            if const_expr(precompute_herd):
-                # The candidates were stored at device scope: arrive once they
-                # have landed.
-                rocdl.s_wait_storecnt(0)
-                gpu.barrier()
-                if tid == 0:
-                    protocol_device.epoch_arrive_system_atomic(
-                        scratch + fx.Int64(herd_at["arrivals"][0]), fx.Int32(1)
-                    )
         if const_expr(precompute_herd):
-            # The CTA before the routing ones has no shared-down task: it waits
-            # for every token's candidates and finishes HERD while the other
-            # CTAs run their shared down.
-            arrivals = scratch + fx.Int64(herd_at["arrivals"][0])
+            # The CTA before the routing ones has no shared-down task: it polls
+            # every token's tagged candidates and finishes HERD while the other
+            # CTAs run their shared down, then moves the launch counter on.
+            tag = moe_gfx1250.herd_tag(launch)
             if bid == herd_cta:
-                if tid == 0:
-                    arrived = protocol_device.epoch_load_system_acquire(arrivals)
-                    while arrived & (moe_gfx1250.HERD_LAUNCH_ARRIVALS - 1) != rows:
-                        arrived = protocol_device.epoch_load_system_acquire(arrivals)
-                gpu.barrier()
                 moe_gfx1250.stage_herd_finalize(
                     {
                         "tid": tid,
@@ -512,8 +505,7 @@ def build_packed_finish(
                         "wave": wave,
                         "threads": THREADS,
                         "waves": WAVES,
-                        "route": route,
-                        "route_weights": tile_route,
+                        "candidates": (candidates, tag),
                         **{
                             name: scratch + fx.Int64(herd_at[name][0])
                             for name in (
@@ -547,10 +539,7 @@ def build_packed_finish(
                     rows,
                 )
                 if tid == 0:
-                    protocol_device.epoch_arrive_system_atomic(
-                        arrivals,
-                        fx.Int32(moe_gfx1250.HERD_LAUNCH_ARRIVALS - rows),
-                    )
+                    bo.buffer_store(launch + 1, rsrc(scratch), launch_word)
 
         if include_shared and include_routed:
             pairs = rows * SHARED_INTERMEDIATE // 2

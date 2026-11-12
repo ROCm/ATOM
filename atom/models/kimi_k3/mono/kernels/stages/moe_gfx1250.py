@@ -355,6 +355,16 @@ def stage_route(c, token, front_payload_words=0):
             if const_expr(width != TOPK):
                 c["put"](c["route"], token * width + rank, expert)
                 c["put"](c["route_weights"], token * width + rank, my_sigmoid)
+                if const_expr("herd_candidates" in c):
+                    pairs, tag = c["herd_candidates"]
+                    bo.buffer_store(
+                        fx.Vector.from_elements(
+                            [my_sigmoid.bitcast(fx.Int32), tag | expert], fx.Int32
+                        ),
+                        rsrc(pairs),
+                        (token * width + rank) * 2,
+                        cache_modifier=CM_DEV,
+                    )
             elif const_expr("route_weights" in c):
                 c["put"](c["route"], token * TOPK + rank, expert)
                 c["put"](c["route_weights"], token * TOPK + rank, my_sigmoid * inverse)
@@ -368,10 +378,9 @@ def stage_route(c, token, front_payload_words=0):
     gpu.barrier()
 
 
-# The HERD finalize's arrival counter advances by this much a launch: the
-# routing CTAs add one each and the finalizing CTA the rest, so a power of two
-# keeps the modulo exact across the i32 wrap.
-HERD_LAUNCH_ARRIVALS = 64
+# A HERD candidate's tag word: the launch's tag over the expert id's bits.
+_HERD_EXPERT_BITS = 10
+assert EXPERTS <= 1 << _HERD_EXPERT_BITS
 # ``herd_finalize_words``' tail: the staged kept routes and their expert slots.
 _HERD_ROUTE_SLOTS = 48 * TOPK
 # A sort key's candidate index bits, below its expert id.
@@ -396,6 +405,12 @@ def _sort_network(n: int) -> list[tuple[int, int]]:
     return [(a, b) for a, b in pairs if b < n]
 
 
+def herd_tag(launch):
+    """Launch ``launch``'s candidate tag (the counter zeroed, then one up a
+    launch): never the last launch's, nor zeroed scratch's."""
+    return (launch + 1) << _HERD_EXPERT_BITS
+
+
 def herd_finalize_words(rows: int) -> dict[str, int]:
     """LDS i32 words ``stage_herd_finalize`` needs for ``rows`` tokens."""
     if rows * TOPK > _HERD_ROUTE_SLOTS:
@@ -416,7 +431,7 @@ def herd_finalize_words(rows: int) -> dict[str, int]:
 @traced
 def stage_herd_finalize(c, rows):
     """AITER's ``herd_route_psum`` for this launch's Top-(K+1) candidates, by
-    one CTA once every routing CTA has stored its token's.
+    one CTA polling the routing CTAs' tagged (sigmoid, tag | expert) pairs.
 
     As AITER drops it, each token loses its candidate of the lowest batch
     popularity (then value, then expert id); the K kept are ordered by expert
@@ -442,31 +457,40 @@ def stage_herd_finalize(c, rows):
         if expert < EXPERTS:
             fx.ptr_store(fx.Int32(0), popularity + expert)
             fx.ptr_store(fx.Int32(0), counts + expert)
-    loaded = []
-    for index in range_constexpr((candidates + threads - 1) // threads):
-        at = fx.min(tid + index * threads, candidates - 1)
-        loaded.append(
-            (
-                fx.Int32(
-                    bo.buffer_load(
-                        rsrc(c["route"]),
-                        at,
-                        vec_width=1,
-                        dtype=T.i32,
-                        cache_modifier=CM_DEV,
-                    )
-                ),
-                fx.Float32(
-                    bo.buffer_load(
-                        rsrc(c["route_weights"]),
-                        at,
-                        vec_width=1,
-                        dtype=T.f32,
-                        cache_modifier=CM_DEV,
-                    )
-                ),
+    pairs, tag = c["candidates"]
+    rounds = (candidates + threads - 1) // threads
+
+    def load_pairs():
+        words = []
+        for index in range_constexpr(rounds):
+            at = fx.min(tid + index * threads, candidates - 1)
+            pair = fx.Vector(
+                bo.buffer_load(
+                    rsrc(pairs), at * 2, vec_width=2, dtype=T.i32, cache_modifier=CM_DEV
+                )
             )
+            words += [pair[0], pair[1]]
+        return fx.Vector.from_elements(words, fx.Int32)
+
+    tag_bits = fx.Int32(-(1 << _HERD_EXPERT_BITS))
+
+    def stale(words):
+        late = (fx.Int32(words[1]) & tag_bits) != tag
+        for index in range_constexpr(1, rounds):
+            late = late | ((fx.Int32(words[2 * index + 1]) & tag_bits) != tag)
+        return late
+
+    words = load_pairs()
+    while stale(words):
+        rocdl.s_sleep(1)
+        words = load_pairs()
+    loaded = [
+        (
+            fx.Int32(words[2 * index + 1]) & ((1 << _HERD_EXPERT_BITS) - 1),
+            fx.Int32(words[2 * index]).bitcast(fx.Float32),
         )
+        for index in range(rounds)
+    ]
     gpu.barrier()
     for index in range_constexpr(len(loaded)):
         at = tid + index * threads
