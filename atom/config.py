@@ -1955,13 +1955,6 @@ def _check_fp4_kv(kv_cache_dtype: str, *, is_m3: bool, is_v41: bool) -> None:
         )
 
 
-def kv_pages_leave_pool(config) -> bool:
-    """Whether KV pages are moved out of the pool: any ``--kv-transfer-config``
-    connector, a P/D one or the offload one ``EngineArgs`` folds ``ATOM_KV_OFFLOAD``
-    into (nothing else reads that env)."""
-    return bool(config.kv_transfer_config)
-
-
 def resolve_draft_kv_dtype(spec, target_dtype: str, *, own_pool: bool) -> str:
     """The KV dtype of a speculative draft's pages: the target's, unless the draft has
     a pool of its own (``own_pool``) and asked for bf16 or fp8 through
@@ -3007,7 +3000,7 @@ class Config:
         if (
             self.speculative_config is not None
             and self.speculative_config.kv_cache_dtype != self.kv_cache_dtype
-            and kv_pages_leave_pool(self)
+            and self.kv_transfer_config
         ):
             # The offload namespace keys the target's KV dtype alone, so a
             # draft page of another dtype would share a key with the target's.

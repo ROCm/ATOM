@@ -15,13 +15,11 @@ def _mxfp4_kv_refusal(config) -> str | None:
     """
     import torch
 
-    from atom.config import kv_pages_leave_pool
-
     if config.torch_dtype != torch.bfloat16:
         # aiter's MXFP4 pa_decode only writes bf16; the attention output takes the
         # model dtype, so an fp16 checkpoint would fail in its first forward.
         return f"it needs a bfloat16 model, got {config.torch_dtype}"
-    if kv_pages_leave_pool(config):
+    if config.kv_transfer_config:
         # Offloaded pages (ATOM_KV_OFFLOAD, a P/D connector) are moved by a layout
         # that was never told this byte format, and its namespace keys no FP4.
         return "it does not run with KV offload or --kv-transfer-config"
