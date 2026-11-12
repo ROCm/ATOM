@@ -97,7 +97,12 @@ _ALLGATHER_MAX_PAYLOAD_BYTES = 512 * 1024
 
 
 def _mailbox_runtime():
-    """The private aiter pieces used only while opening a mailbox."""
+    """The private aiter IPC API used only while opening a mailbox.
+
+    Validated with ROCm/aiter@55cde6a0c49cc04f39f6141e312938a8c48e61fb.
+    ``CandidateMailbox`` uses ``create(raw_cached=True)``; cached hipIPC needs
+    ROCm 7.14 or later, and unsupported/VMM setups take the collective fallback.
+    """
     from aiter.dist.device_communicators.custom_all_reduce import (
         IPCBufferPool,
         _loaded_hip_runtime,
@@ -193,6 +198,10 @@ def _open_candidate_mailbox(device, max_rows: int) -> None:
     global _mailbox
     from aiter.jit.utils.chip_info import get_gfx_runtime
 
+    # The protocol is not intrinsically gfx1250-only. This gate is the validated
+    # scope: the fused kernel's cross-GPU `.wt`/`.cv` polling and performance
+    # have only been checked on gfx1250. Other architectures keep the collective
+    # exchange until they pass the same visibility, progress and performance tests.
     if _mailbox is not None or get_gfx_runtime() != "gfx1250":
         return
     group = get_indexer_cp_group()
