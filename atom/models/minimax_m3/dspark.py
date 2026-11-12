@@ -79,7 +79,6 @@ from atom.models.dspark_draft import (
     linear_out,
 )
 from atom.models.minimax_m3.model import MiniMaxM3MLP
-from atom.models.utils import PPMissingLayer
 from atom.utils.forward_context import get_forward_context
 
 if TYPE_CHECKING:
@@ -217,7 +216,7 @@ class M3DSparkAttention(nn.Module):
                 f"is not divisible by TP size {tp_size}."
             )
         # A P/D producer never runs the block pass
-        # (`ModelRunner._producer_skips_propose`); it only writes context K/V.
+        # (`Drafter.context_kv_only`); it only writes context K/V.
         producer = kv_config_has_producer(
             getattr(atom_config, "kv_transfer_config", None)
         )
@@ -522,19 +521,14 @@ class MiniMaxM3DSpark(DSparkDraftModel):
     # ---- weight-loading hooks ---------------------------------------------
 
     def share_with_target(self, target_base: nn.Module, loaded: set) -> None:
-        # The shared output head is present both under PP and on an unsplit
-        # target; the input embedding may belong to an earlier stage.
-        target_vocab = target_base.lm_head.num_embeddings
+        target_vocab = target_base.model.embed_tokens.num_embeddings
         if target_vocab != self.vocab_size:
             raise ValueError(
                 f"DSpark draft vocab {self.vocab_size} != target vocab "
                 f"{target_vocab}. The draft shares the target's embedding and LM "
                 "head, so the two must agree."
             )
-        # A later PP stage holds a placeholder; it only runs as a P/D
-        # producer, which never drafts.
-        embed = target_base.model.embed_tokens
-        self.embed_tokens = None if isinstance(embed, PPMissingLayer) else embed
+        self.embed_tokens = target_base.model.embed_tokens
         self.lm_head = target_base.lm_head
 
     # ---- drafting entry points (called by the proposer) --------------------

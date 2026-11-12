@@ -28,6 +28,14 @@ mod = pytest.importorskip(
 )
 
 
+@pytest.fixture(autouse=True)
+def _without_context_parallelism(monkeypatch):
+    # These row/broadcast tests use TP only and build no global engine config.
+    monkeypatch.setattr(mod, "get_pcp_world_size", lambda: 1)
+    monkeypatch.setattr(mod, "pcp_is_enabled", lambda: False)
+    monkeypatch.setattr(mod, "sp_is_enabled", lambda: False)
+
+
 def _batch(seqs, mask=None):
     from atom.model_engine.token_logprobs import LogprobRows, host_logprob_rows
 
@@ -55,6 +63,7 @@ def _runner(seen):
     """A ModelRunner carrying only what the no-spec branch of postprocess reads."""
     runner = object.__new__(mod.ModelRunner)
     runner.rank = 0
+    runner._served = None
 
     def _sampler(logits, temperatures, top_ks, top_ps, all_greedy, **kw):
         seen["logits_rows"] = logits.shape[0]
@@ -62,7 +71,7 @@ def _runner(seen):
         return torch.zeros(logits.shape[0], dtype=torch.int)
 
     runner.sampler = _sampler
-    runner.forward_done_event = types.SimpleNamespace(record=lambda: None)
+    runner.forward_done_event = types.SimpleNamespace(record=lambda stream=None: None)
     runner.tokenID_processor = types.SimpleNamespace(
         is_deferred_out=False,
         prev_batch=None,
@@ -347,27 +356,16 @@ def _payload_tensors(payload):
     )
 
 
-@pytest.mark.parametrize("producer", [False, True])
-@pytest.mark.parametrize("duplicates_propose", [False, True])
-def test_a_producer_skips_propose_only_when_nothing_rides_on_it(
-    producer, duplicates_propose
-):
-    """DSpark writes its context K/V apart from propose, so a producer skips it
-    on every DP rank; EAGLE's first draft step writes it, so it still runs."""
+@pytest.mark.parametrize("context_kv_only", [False, True])
+def test_a_context_only_producer_leaves_dp_draft_lockstep(context_kv_only):
+    """No DP peer is owed the collectives of a propose nobody runs."""
     runner = object.__new__(mod.ModelRunner)
-    runner.drafter = types.SimpleNamespace(
-        draft_kv_duplicates_propose=duplicates_propose
-    )
-    runner.tokenID_processor = types.SimpleNamespace(
-        is_pd_producer=producer, is_pipeline_parallel=False
-    )
+    runner.drafter = types.SimpleNamespace(context_kv_only=context_kv_only)
+    runner.tokenID_processor = types.SimpleNamespace(is_pipeline_parallel=False)
     runner.config = types.SimpleNamespace(
         parallel_config=types.SimpleNamespace(data_parallel_size=2)
     )
-    skips = producer and not duplicates_propose
-    assert runner._producer_skips_propose() is skips
-    # No DP peer is owed the collectives of a propose nobody runs.
-    assert runner._dp_draft_lockstep_active() is not skips
+    assert runner._dp_draft_lockstep_active() is not context_kv_only
 
 
 @pytest.mark.parametrize("deferred", [False, True])
@@ -397,7 +395,7 @@ def test_a_producer_skips_propose_on_either_output_path(
     runner._served = None
     runner.forward_done_event = types.SimpleNamespace(record=lambda stream=None: None)
     runner.drafter = types.SimpleNamespace(
-        draft_kv_duplicates_propose=False, prepare_inputs=torch.arange
+        context_kv_only=producer, prepare_inputs=torch.arange
     )
     proposed, sent, commits = [], [], []
     runner.attn_metadata_builder = types.SimpleNamespace(

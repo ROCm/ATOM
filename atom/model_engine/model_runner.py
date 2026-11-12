@@ -3801,7 +3801,7 @@ class ModelRunner:
                 self.tokenID_processor.prev_token_ids = next_token_ids
                 # A producer that skips propose keeps the bookkeeping above:
                 # its next step reads `prev_token_ids` like any other's.
-                if self._producer_skips_propose():
+                if self.drafter.context_kv_only:
                     self._commit_target_step(batch, anchors)
                 else:
                     draft_token_ids = self.propose_draft_token_ids(
@@ -3832,7 +3832,7 @@ class ModelRunner:
                 prev_rejected_num = np.zeros(batch.total_seqs_num, dtype=np.int32)
                 prev_bonus_num = np.zeros(batch.total_seqs_num, dtype=np.int32)
             if hasattr(self, "drafter"):
-                if self._producer_skips_propose():
+                if self.drafter.context_kv_only:
                     self._commit_target_step(batch, anchors)
                 else:
                     # Mid-prompt sequences get their anchor corrected inside
@@ -4034,15 +4034,7 @@ class ModelRunner:
             hasattr(self, "drafter")
             and self.config.parallel_config.data_parallel_size > 1
             and not self.tokenID_processor.is_pipeline_parallel
-            and not self._producer_skips_propose()
-        )
-
-    def _producer_skips_propose(self) -> bool:
-        """A producer's drafts are dropped (`mtp_k` 0); it skips propose when its
-        drafter writes context K/V apart from it (DSpark, not EAGLE)."""
-        return (
-            self.tokenID_processor.is_pd_producer
-            and not self.drafter.draft_kv_duplicates_propose
+            and not self.drafter.context_kv_only
         )
 
     def _producer_graph_shapes(self):
@@ -4642,7 +4634,7 @@ class ModelRunner:
             # drafter gets the capture builder already bound to this backend's
             # signature -- which of them takes a `max_q_len` is the runner's to
             # know, and it is the same probe the loop above ran.
-            if hasattr(self, "drafter") and not self._producer_skips_propose():
+            if hasattr(self, "drafter") and not self.drafter.context_kv_only:
 
                 def end_draft_trace(tag):
                     torch.cuda.synchronize()
