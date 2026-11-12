@@ -75,7 +75,11 @@ from atom.models.kimi_k3.mono.kernels.stages.k2_local_kernels_gfx1250 import (
 )
 from atom.models.kimi_k3.mono.kernels.token_tiling import GFX1250_MAX_TOKENS
 from atom.models.kimi_k3.mono.plan import _width, kda_metadata, width_key
-from atom.models.kimi_k3.mono.runner import K3MonoDecodeRunner, state_slots
+from atom.models.kimi_k3.mono.runner import (
+    K3MonoDecodeRunner,
+    _bf16_attn_res,
+    state_slots,
+)
 from atom.models.kimi_k3.mono.weights import bind_external_moe
 from atom.mono.plan.architecture import GFX1250
 from atom.mono.runtime.abi import KernelAbi
@@ -532,10 +536,12 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
         buffers = local.buffers
         stream = torch.cuda.current_stream()
         reset = weight.write_idx >= 0
-        x, prefix = self.inner.layers[plan.layer_id].mlp_attn_res(
+        x, prefix = _bf16_attn_res(
+            self.inner.layers[plan.layer_id].mlp_attn_res,
             None if reset else prefix,
             blocks[:, : weight.blocks + reset],
             attn_out,
+            None,
         )
         if local.grouped_experts:
             local.front.launcher(

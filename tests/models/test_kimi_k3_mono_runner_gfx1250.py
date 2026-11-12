@@ -168,6 +168,7 @@ def test_k1_reads_the_production_seam_and_hands_its_core_to_k2(layer_id):
 
     class Seam:
         out_quant_dtype = None
+        enabled = False
 
         def __call__(self, value, visible, add_hidden, add_hidden2):
             calls["seam"] = visible.shape[1]
@@ -233,22 +234,23 @@ def test_k1_seam_is_bf16_where_out_norm_folds_fp8_quant(monkeypatch, candidates)
         out_norm=SimpleNamespace(weight=torch.ones(hidden), eps=1e-5, dim=hidden),
     )
 
-    def apply_attn_res(*args, **kwargs):
-        calls["mix"] = (len(args), kwargs)
-        return args[0] + args[4] + 7, args[0] + args[4]
+    def mix(mixed_site, value, visible, add_hidden, add_hidden2):
+        calls["mix"] = (mixed_site, visible, add_hidden2)
+        return value + add_hidden + 7, value + add_hidden
 
     def rmsnorm(value, *_args):
         calls["norm"] = value.clone()
         return value + 3
 
-    monkeypatch.setattr(base_module, "apply_attn_res", apply_attn_res)
+    monkeypatch.setattr(base_module, "_mix_bf16", mix)
     monkeypatch.setattr(base_module, "rmsnorm2d_fwd_", rmsnorm)
     normed, out_prefix = base_module._bf16_attn_res(site, prefix, blocks, add, None)
 
     torch.testing.assert_close(out_prefix, prefix + add)
     if candidates:
-        # the mix itself, normed, with no quant dtype handed down
-        assert calls["mix"] == (8, {}) and "norm" not in calls
+        # the mix itself, normed, unquantized, over the blocks as handed in
+        assert calls["mix"][0] is site and calls["mix"][1] is blocks
+        assert calls["mix"][2] is None and "norm" not in calls
         torch.testing.assert_close(normed, prefix + add + 7)
     else:
         assert "mix" not in calls
@@ -387,6 +389,9 @@ def test_grouped_k2_projects_locally_then_runs_grouped_moe(monkeypatch, herd):
     monkeypatch.setattr(runner_module, "get_tp_group", lambda: group)
     monkeypatch.setattr(runner_module.torch.cuda, "current_stream", lambda: None)
     monkeypatch.setattr(
+        runner_module, "_bf16_attn_res", lambda site, *args: site(*args[:3])
+    )
+    monkeypatch.setattr(
         runner_module,
         "fused_moe",
         lambda *args, **kwargs: calls.setdefault("moe", (args, kwargs)),
@@ -483,6 +488,9 @@ def test_replicated_finalize_all_reduces_both_partials_once(monkeypatch):
     )
     monkeypatch.setattr(runner_module, "get_tp_group", lambda: group)
     monkeypatch.setattr(runner_module.torch.cuda, "current_stream", lambda: None)
+    monkeypatch.setattr(
+        runner_module, "_bf16_attn_res", lambda site, *args: site(*args[:3])
+    )
     monkeypatch.setattr(runner_module, "fused_moe", lambda *_args, **_kwargs: None)
 
     _, out = runner._routed_k2(

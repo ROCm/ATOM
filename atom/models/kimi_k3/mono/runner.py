@@ -38,6 +38,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass, replace
 
 import torch
+import triton
 from aiter.dist.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -45,7 +46,10 @@ from aiter.dist.parallel_state import (
 )
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
-from atom.model_ops.kimi_k3 import apply_attn_res
+from atom.model_ops.kimi_k3.attention_residual import (
+    _ATTN_RES_BF16_CONFIG,
+    _attn_res_fused_kernel,
+)
 from atom.model_ops.layernorm import rmsnorm2d_fwd_
 from atom.models.kimi_k3.mono.config import (
     MAX_ROWS,
@@ -118,33 +122,83 @@ class WidthBuild:
         )
 
 
+def _mix_bf16(site, prefix, blocks, add, add2):
+    """``apply_attn_res``'s unquantized mix of ``site``, reading ``blocks`` (a
+    slice of the runner's ``[T, blocks, H]`` buffer) in place: the op's wrapper
+    copies a non-contiguous block residual first, which its kernel, indexing
+    ``[T, B]`` by stride, does not need."""
+    if add2 is not None and add is None:
+        raise ValueError("add_hidden2 requires add_hidden")
+    if blocks.stride(-1) != 1 or prefix.dtype != torch.bfloat16:
+        raise MonoUnsupported(
+            f"AttnRes blocks stride {blocks.stride()} prefix {prefix.dtype}"
+        )
+    if site.score_weight is None:
+        site.process_weights_after_loading()
+    tokens, count, hidden = blocks.shape
+    sw = site.score_weight.contiguous()
+    ow = sw if site.out_norm is None else site.out_norm.weight.contiguous()
+    ps = prefix.contiguous()
+    y = torch.empty((tokens, hidden), device=ps.device, dtype=ps.dtype)
+    y_scale = torch.empty((1,), device=ps.device, dtype=torch.float32)
+    hs = ps if add is None else add.contiguous()
+    hs2 = ps if add2 is None else add2.contiguous()
+    pref = ps if add is None else torch.empty_like(ps)
+    warps, stages, tile = _ATTN_RES_BF16_CONFIG
+    _attn_res_fused_kernel[(tokens,)](
+        blocks,
+        ps,
+        sw,
+        y,
+        y_scale,
+        hs,
+        hs2,
+        pref,
+        ow,
+        count,
+        count + 1,
+        hidden,
+        float(site.eps),
+        float(site.out_eps),
+        1.0,
+        1.0,
+        blocks.stride(0),
+        blocks.stride(1),
+        ps.stride(0),
+        y.stride(0),
+        hs.stride(0),
+        hs2.stride(0),
+        pref.stride(0),
+        BL=tile,
+        BD=triton.next_power_of_2(hidden),
+        num_stages=stages,
+        num_warps=warps,
+        DO_ADD=add is not None,
+        DO_ADD2=add2 is not None,
+        WRITE_PREF=add is not None,
+        OUT_NORM=site.out_norm is not None,
+        QUANT=False,
+    )
+    return y, (prefix if add is None else pref)
+
+
 def _bf16_attn_res(site, prefix, blocks, add, add2):
-    """``AttnRes.forward`` with no quant folded into its out_norm. Where that
-    out_norm fuses a block-scale FP8 in_proj's quant, ``forward`` returns a
-    ``(quantized, scale)`` pair on both of its branches -- the mix as well as
-    the nothing-to-mix one -- while K1 reads the bf16 normed row."""
-    if site.out_quant_dtype is None:
-        return site(prefix, blocks, add, add2)
+    """``AttnRes.forward`` with no quant folded into its out_norm, mixing
+    ``blocks`` in place (``_mix_bf16``). Where that out_norm fuses a
+    block-scale FP8 in_proj's quant, ``forward`` returns a ``(quantized,
+    scale)`` pair on both of its branches -- the mix as well as the
+    nothing-to-mix one -- while K1 reads the bf16 normed row."""
     if prefix is None:
         prefix, add, add2 = add, add2, None
-    norm = site.out_norm
     if site.enabled and blocks.shape[1] > 0:
-        if site.score_weight is None:
-            site.process_weights_after_loading()
-        return apply_attn_res(
-            prefix,
-            blocks,
-            site.score_weight,
-            site.eps,
-            add,
-            norm.weight,
-            site.out_eps,
-            add2,
-        )
+        return _mix_bf16(site, prefix, blocks, add, add2)
+    if site.out_quant_dtype is None:
+        return site(prefix, blocks, add, add2)
     if add is not None:
         prefix = prefix + add
         if add2 is not None:
             prefix = prefix + add2
+    norm = site.out_norm
     return rmsnorm2d_fwd_(prefix, norm.weight, norm.eps, norm.dim), prefix
 
 
