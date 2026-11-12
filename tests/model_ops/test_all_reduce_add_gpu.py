@@ -219,16 +219,19 @@ def _rank(rank, init_method, results):
 def test_all_reduce_add_matches_add_then_all_reduce():
     if not torch.cuda.is_available() or torch.cuda.device_count() < _WORLD:
         pytest.skip(f"needs {_WORLD} GPUs")
-    from aiter.dist import communication_op
+    from aiter.dist.communication_op import (
+        tensor_model_parallel_all_reduce_add as aiter_all_reduce_add,
+    )
     from aiter.dist.device_communicators import custom_all_reduce
     from aiter.jit.utils.chip_info import get_gfx
 
     if get_gfx() != "gfx1250":
         pytest.skip("the HIP Lamport all-reduce add is gfx1250 only")
-    if not hasattr(communication_op, "tensor_model_parallel_all_reduce_add"):
-        pytest.skip("aiter predates tensor_model_parallel_all_reduce_add")
+    # aiter#7499 is required. A missing symbol fails this test instead of skipping.
+    assert callable(aiter_all_reduce_add)
+
     if not hasattr(custom_all_reduce.CustomAllreduce, "lamport_ar_add"):
-        pytest.skip("needs the HIP Lamport all-reduce add (ROCm/aiter#7499)")
+        pytest.fail("needs CustomAllreduce.lamport_ar_add from ROCm/aiter#7499")
     from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
 
     init_method = get_distributed_init_method(get_ip(), get_open_port())

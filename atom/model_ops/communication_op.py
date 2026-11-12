@@ -64,20 +64,17 @@ def tensor_model_parallel_all_reduce_add(
     """All-reduce ``x + y`` across the TP group.
 
     The result is the sum over ranks of each rank's ``x + y``, not
-    ``all_reduce(x) + y``. On gfx1250, aiter serves this with the HIP Lamport
-    one-shot kernel (``CustomAllreduce.lamport_ar_add``, ROCm/aiter#7499):
-    bf16 or fp16, up to 16 MiB at TP2 and 8 MiB at TP4
-    (``AITER_CUSTOM_AR_LAMPORT_RMS_MAX_SIZE``). The add happens as the kernel
-    sends, and the bits match ``tensor_model_parallel_all_reduce(x + y)``.
-
-    This function adds and all-reduces only on the TBO path and when aiter has
-    no fused op. Inputs the Lamport kernel does not take are added and
-    all-reduced inside aiter.
+    ``all_reduce(x) + y``. Requires aiter at or after ROCm/aiter#7499
+    (``06b7fd32``). aiter takes the gfx1250 HIP Lamport one-shot kernel where
+    the input fits and otherwise adds, then all-reduces. The TBO path stays
+    here, so it gets that materialized sum.
     """
-    from aiter.dist import communication_op as aiter_comm
     from aiter.dist.parallel_state import get_tp_group
 
-    fused = getattr(aiter_comm, "tensor_model_parallel_all_reduce_add", None)
-    if fused is None or _tbo_aware_tp_reduce(get_tp_group().world_size):
+    if _tbo_aware_tp_reduce(get_tp_group().world_size):
         return tensor_model_parallel_all_reduce(x + y)
-    return fused(x, y)
+    from aiter.dist.communication_op import (
+        tensor_model_parallel_all_reduce_add as aiter_all_reduce_add,
+    )
+
+    return aiter_all_reduce_add(x, y)
