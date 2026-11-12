@@ -1010,10 +1010,13 @@ models:
         # The decode runs the recipe: the drafter's linears unquantized,
         # max_num_seqs 2 * CONC (at least 32), ReplaySSM from CONC 16,
         # comm-group reuse from CONC 56. CONC 32 and 88 are not in the recipe:
-        # each takes the settings of the recipe point below it, CONC 16 and 72,
-        # except max_num_seqs. Only the prefill has a CPU tier: 128 GiB per rank
-        # at CONC 16 and 32. From CONC 48 the prefill's state cache is the PD
-        # recipe's
+        # each runs the decode of the recipe point below it, CONC 16 and 72,
+        # except max_num_seqs. Their prefills differ from those points: CONC 32
+        # runs the PP8xTP1 prefill instead of CONC 16's TP8EP8xDCP8, and CONC
+        # 88 adds ATOM_PP_MAX_INFLIGHT=16 and two offload copy and load workers
+        # to CONC 72's and skips GSM8K. Only the prefill has a CPU tier: 128
+        # GiB per rank at CONC 16 and 32. From CONC 48 the prefill's state
+        # cache is the PD recipe's
         # (recipes/mesh/Agentic-Kimi-K3.md): on-demand KDA checkpoints at
         # observed shared-prefix targets, and a 128 GiB state cap carved from a
         # 224 GiB per-rank pool, which leaves paged KV 96 GiB per rank once
