@@ -47,6 +47,7 @@ from atom.models.kimi_k3.mono.config import (
     TOPK,
 )
 from atom.models.kimi_k3.mono.external_collectives import FrontPayloadLayout
+from atom.models.kimi_k3.mono.grouped_moe_gfx1250 import GroupedMoe
 from atom.models.kimi_k3.mono.k1_local_runner_gfx1250 import (
     Gfx1250K1LocalRunner,
     K1LocalRuntime,
@@ -58,11 +59,13 @@ from atom.models.kimi_k3.mono.kernels.execution_plan import (
     Gfx1250KimiBuildPlan,
 )
 from atom.models.kimi_k3.mono.kernels.stages.k2_allreduce_gfx1250 import (
-    MAX_CTAS as ALLREDUCE_COUNTERS,
-)
-from atom.models.kimi_k3.mono.kernels.stages.k2_allreduce_gfx1250 import (
+    GATHER_ALLREDUCE_ABI,
     allreduce_peer_bytes,
     build_allreduce,
+    build_gather_allreduce,
+)
+from atom.models.kimi_k3.mono.kernels.stages.k2_allreduce_gfx1250 import (
+    MAX_CTAS as ALLREDUCE_COUNTERS,
 )
 from atom.models.kimi_k3.mono.kernels.stages.k2_finalize_tdm_gfx1250 import (
     build_replicated_finalize,
@@ -213,6 +216,10 @@ class Gfx1250RoutedK2Build:
     # the replicated finalize's all-reduce in a kernel, where the TP group's
     # symm_mem banks map (``K3Gfx1250MonoDecodeRunner.k2_peers``)
     allreduce: object | None = None
+    # AITER's grouped MoE launched here (the width's, shared by its builds),
+    # where it has a tile for the width; with ``allreduce`` that kernel then
+    # does the gather-reduce
+    grouped_moe: GroupedMoe | None = None
 
 
 @dataclass(frozen=True)
@@ -503,6 +510,14 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             buffers["front_scratch"] = torch.zeros(
                 front.scratch_bytes, dtype=torch.uint8, device=self.device
             )
+        grouped_moe = self._grouped_moe_for(rows) if herd else None
+        allreduce = None
+        if replicated and self.k2_peers is not None:
+            allreduce = (
+                build_gather_allreduce(self.tp, rows)
+                if grouped_moe is not None
+                else build_allreduce(self.tp, rows)
+            )
         return Gfx1250RoutedK2Build(
             plan,
             front,
@@ -522,12 +537,20 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                 if herd
                 else None
             ),
-            (
-                build_allreduce(self.tp, rows)
-                if replicated and self.k2_peers is not None
-                else None
-            ),
+            allreduce,
+            grouped_moe,
         )
+
+    def _grouped_moe_for(self, rows: int) -> GroupedMoe | None:
+        """The width's grouped MoE, shared by its K2 builds; None where AITER
+        has no tile for it, and ``grouped_gemm_gfx1250_a8w4`` runs instead."""
+        moes = self.__dict__.setdefault("grouped_moes", {})
+        if rows not in moes:
+            try:
+                moes[rows] = GroupedMoe(rows, self.dims.inter, self.device)
+            except MonoUnsupported:
+                moes[rows] = None
+        return moes[rows]
 
     def forward(
         self, input_ids: torch.Tensor, positions: torch.Tensor, qlen: int
@@ -645,8 +668,13 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             )
         self._finish(weight, local, gathered, stream)
         moe = self.inner.layers[plan.layer_id].block_sparse_moe
-        if local.herd_routes is not None:
-            self._grouped_moe(weight, local, moe)
+        # gemm2's grouped rows and their routes, held until the all-reduce that
+        # gathers them is queued
+        gathered = None
+        if local.grouped_moe is not None:
+            gathered = self._grouped_moe(weight, local, moe)
+        elif local.herd_routes is not None:
+            self._aiter_grouped_moe(weight, local, moe)
         elif local.grouped_experts:
             fused_moe(
                 buffers["latent_fp4"].view(torch.uint8).view(dtypes.fp4x2),
@@ -675,6 +703,7 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             if local.allreduce is not None:
                 local.allreduce.launcher(
                     buffers["reduce"].data_ptr(),
+                    *([] if gathered is None else [t.data_ptr() for t in gathered]),
                     self.k2_peers.peers.data_ptr(),
                     self.k2_peers.epochs.data_ptr(),
                     self.rank,
@@ -765,6 +794,29 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
         )
 
     def _grouped_moe(self, weight, local, moe):
+        """The grouped MoE on the lite finish's latent and HERD routes, into
+        ``routed``; or, where the all-reduce gathers, gemm2's grouped rows and
+        their routes for it."""
+        buffers = local.buffers
+        gathers = local.allreduce is not None and (
+            local.allreduce.abi is GATHER_ALLREDUCE_ABI
+        )
+        out = local.grouped_moe(
+            buffers["latent_fp4"].view(torch.uint8).view(dtypes.fp4x2),
+            buffers["latent_scales"],
+            weight.w13.view(dtypes.fp4x2),
+            weight.w2.view(dtypes.fp4x2),
+            moe.experts.w13_weight_scale,
+            moe.experts.w2_weight_scale,
+            local.herd_routes,
+            buffers["routed"],
+            SITU_BETA,
+            SITU_LINEAR_BETA,
+            gather=not gathers,
+        )
+        return out if gathers else None
+
+    def _aiter_grouped_moe(self, weight, local, moe):
         """``fused_moe``'s HERD call into the grouped MoE, with the lite
         finish's routes in place of the candidates it would finalize."""
         buffers = local.buffers

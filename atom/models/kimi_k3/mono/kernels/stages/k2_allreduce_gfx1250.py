@@ -31,7 +31,7 @@ from flydsl._mlir.dialects import llvm
 from flydsl.expr import gpu, range_constexpr
 from flydsl.expr.typing import Int32, Int64, T, as_ir_value
 
-from atom.models.kimi_k3.mono.config import HIDDEN, LATENT
+from atom.models.kimi_k3.mono.config import HIDDEN, LATENT, TOPK
 from atom.mono.device.ops import bf2_f32, load_ptr64, rsrc, spin_pause, traced
 from atom.mono.runtime.abi import KernelAbi
 
@@ -48,6 +48,11 @@ REDUCE_WIDTH = LATENT + HIDDEN
 assert REDUCE_WIDTH % LINE_ELEMENTS == 0
 
 ALLREDUCE_ABI = KernelAbi(("data", "peers", "epochs", "rank"))
+GATHER_ALLREDUCE_ABI = KernelAbi(
+    ("data", "grouped", "route_rows", "route_weights", "peers", "epochs", "rank")
+)
+# a routed row's words
+ROUTED_WORDS = LATENT // 2
 
 
 def allreduce_lines(rows: int) -> int:
@@ -131,6 +136,22 @@ def _store_line_sys(address, line):
     )
 
 
+def _push_line(bases, rank, lines, bank, epoch, line, words):
+    out = fx.Vector.from_elements(words + [epoch], fx.Int32)
+    at = fx.Int64(bank + (rank * lines + line) * LINE_WORDS) * 4
+    for base in bases:
+        _store_line_sys(base + at, out)
+
+
+def _local_words(local, line):
+    return [
+        fx.Int32(
+            bo.buffer_load(local, line * PAYLOAD_WORDS + w, vec_width=1, dtype=T.i32)
+        )
+        for w in range_constexpr(PAYLOAD_WORDS)
+    ]
+
+
 @traced
 def _push_lines(local, bases, rank, lines, bank, epoch, line, stride):
     """Lines ``line``, ``line + stride``, .. of this rank's partials, tagged
@@ -138,19 +159,123 @@ def _push_lines(local, bases, rank, lines, bank, epoch, line, stride):
     before the first store, since a load issued after a remote store waits for
     that store's fabric round trip."""
     while line < lines:
-        words = [
-            fx.Int32(
-                bo.buffer_load(
-                    local, line * PAYLOAD_WORDS + w, vec_width=1, dtype=T.i32
-                )
-            )
-            for w in range_constexpr(PAYLOAD_WORDS)
-        ]
-        out = fx.Vector.from_elements(words + [epoch], fx.Int32)
-        at = fx.Int64(bank + (rank * lines + line) * LINE_WORDS) * 4
-        for base in bases:
-            _store_line_sys(base + at, out)
+        _push_line(bases, rank, lines, bank, epoch, line, _local_words(local, line))
         line = line + stride
+
+
+def _gather_sum(values, weights):
+    """BF16 pair words weighted and summed in route order in fp32 from zero, to
+    a bf16 pair: ``moe_gather_reduce``'s arithmetic."""
+    low, high = fx.Float32(0.0), fx.Float32(0.0)
+    for value, weight in zip(values, weights):
+        value_low, value_high = bf2_f32(value)
+        low = low + weight * (fx.Float32(0.0) + value_low)
+        high = high + weight * (fx.Float32(0.0) + value_high)
+    return fx.Int32(
+        fx.Vector.from_elements([low, high], fx.Float32)
+        .to(fx.BFloat16)
+        .bitcast(fx.Int32)[0]
+    )
+
+
+def _routes_of(routes, first_token, token):
+    slot = (token - first_token) * (2 * TOPK)
+    rows = [fx.ptr_load(routes + slot + 2 * k).bitcast(fx.Int32) for k in range(TOPK)]
+    weights = [fx.ptr_load(routes + slot + 2 * k + 1) for k in range(TOPK)]
+    return rows, weights
+
+
+@traced
+def _gathered_words(local, grouped, routes, rows, first_token, line):
+    """A routed line's words, as AITER's ``moe_gather_reduce`` stores them (the
+    last routed line's shared words read as they are). ``routes``: the LDS
+    (row, weight) pairs of tokens ``first_token`` and the next. A line within
+    one token's row takes a 12 B load a route; one across two re-gathers its
+    second token's words."""
+    word = line * PAYLOAD_WORDS
+    token = fx.min(word // ROUTED_WORDS, first_token + 1)
+    column = word % ROUTED_WORDS
+    route_rows, weights = _routes_of(routes, first_token, token)
+    loaded = [
+        fx.Vector(
+            bo.buffer_load(
+                grouped,
+                row * ROUTED_WORDS + column,
+                vec_width=PAYLOAD_WORDS,
+                dtype=T.i32,
+            )
+        )
+        for row in route_rows
+    ]
+    plain = _local_words(local, line)
+    words = [
+        _gather_sum([fx.Int32(v[w]) for v in loaded], weights)
+        for w in range(PAYLOAD_WORDS)
+    ]
+    second = word + PAYLOAD_WORDS - 1
+    if (second // ROUTED_WORDS != word // ROUTED_WORDS) & (
+        second < rows * ROUTED_WORDS
+    ):
+        next_rows, next_weights = _routes_of(routes, first_token, token + 1)
+        for w in range_constexpr(1, PAYLOAD_WORDS):
+            at = (word + w) % ROUTED_WORDS
+            values = [
+                fx.Int32(
+                    bo.buffer_load(
+                        grouped, row * ROUTED_WORDS + at, vec_width=1, dtype=T.i32
+                    )
+                )
+                for row in next_rows
+            ]
+            crossed = (word + w) // ROUTED_WORDS != word // ROUTED_WORDS
+            words[w] = crossed.select(_gather_sum(values, next_weights), words[w])
+    return [
+        (word + w < rows * ROUTED_WORDS).select(words[w], plain[w])
+        for w in range(PAYLOAD_WORDS)
+    ]
+
+
+@traced
+def _stage_routes(routes, route_rows, route_weights, rows, first_token, tid):
+    """Tokens ``first_token`` and the next's (row, weight) route pairs to LDS."""
+    if tid < 2 * TOPK:
+        at = fx.min(first_token + tid // TOPK, rows - 1) * TOPK + tid % TOPK
+        row = bo.buffer_load(rsrc(route_rows), at, vec_width=1, dtype=T.i32)
+        weight = bo.buffer_load(rsrc(route_weights), at, vec_width=1, dtype=T.f32)
+        fx.ptr_store(fx.Int32(row).bitcast(fx.Float32), routes + 2 * tid)
+        fx.ptr_store(fx.Float32(weight), routes + 2 * tid + 1)
+    gpu.barrier()
+
+
+@traced
+def _push_gathered(c, line, routed, live, first_token):
+    """``_push_line`` of this thread's line, if ``live``: a ``routed`` one
+    gathered. Every thread of the CTA has its words before any pushes: a CU
+    with remote stores in flight holds back the gathers' loads behind them."""
+    first = second = third = fx.Int32(0)
+    if live & routed:
+        words = _gathered_words(
+            c["local"], c["grouped"], c["routes"], c["rows"], first_token, line
+        )
+        first = words[0]
+        second = words[1]
+        third = words[2]
+    elif live:
+        words = _local_words(c["local"], line)
+        first = words[0]
+        second = words[1]
+        third = words[2]
+    gpu.barrier()
+    if live:
+        _push_line(
+            c["bases"],
+            c["rank"],
+            c["lines"],
+            c["bank"],
+            c["epoch"],
+            line,
+            [first, second, third],
+        )
 
 
 @traced
@@ -225,3 +350,92 @@ def build_allreduce(tp: int, rows: int) -> K2AllReduceKernel:
 
     ALLREDUCE_ABI.check(kernel, launch)
     return K2AllReduceKernel(name, launch, (ctas,), (threads,), ctas)
+
+
+def build_gather_allreduce(tp: int, rows: int) -> K2AllReduceKernel:
+    """``build_allreduce`` whose routed lines this rank computes itself: AITER's
+    MoE gather-reduce of ``grouped`` (the grouped MoE's gemm2 rows, BF16) by
+    the routes' rows and weights (``[rows, TOPK]`` i32 and f32), bit for bit,
+    in place of reading them -- one launch fewer. A thread takes one line, so
+    a CTA's routed lines span at most two tokens, whose routes it stages in
+    LDS."""
+    lines = allreduce_lines(rows)
+    threads = allreduce_threads(rows)
+    ctas = allreduce_ctas(rows)
+    if lines > ctas * threads or threads * PAYLOAD_WORDS > ROUTED_WORDS:
+        raise ValueError(f"the gathering all-reduce takes a line a thread at {rows}")
+    routed_lines = -(-rows * LATENT // LINE_ELEMENTS)
+    bank_words = tp * lines * LINE_WORDS
+    name = f"k3_k2_gfx1250_gather_allreduce_tp{tp}_s{rows}"
+
+    @fx.struct
+    class Lds:
+        routes: fx.Array[fx.Float32, 4 * TOPK, 16]
+
+    @flyc.kernel(name=name, known_block_size=[threads, 1, 1])
+    def kernel(
+        data: Int64,
+        grouped: Int64,
+        route_rows: Int64,
+        route_weights: Int64,
+        peers: Int64,
+        epochs: Int64,
+        rank: Int32,
+    ):
+        tid = fx.Int32(fx.thread_idx.x)
+        bid = fx.Int32(fx.block_idx.x)
+        lds = fx.SharedAllocator().allocate(Lds).peek()
+        epoch = (
+            fx.Int32(bo.buffer_load(rsrc(epochs), bid, vec_width=1, dtype=T.i32)) + 1
+        )
+        bank = (epoch & 1) * bank_words
+        bases = [load_ptr64(peers, p) for p in range(tp)]
+        mine = rsrc(load_ptr64(peers, rank))
+        line = bid * threads + tid
+        first_token = bid * threads * PAYLOAD_WORDS // ROUTED_WORDS
+        if bid * threads < routed_lines:
+            _stage_routes(
+                lds.routes.ptr, route_rows, route_weights, rows, first_token, tid
+            )
+        _push_gathered(
+            {
+                "lines": lines,
+                "rows": rows,
+                "bases": bases,
+                "rank": rank,
+                "bank": bank,
+                "epoch": epoch,
+                "grouped": rsrc(grouped),
+                "routes": lds.routes.ptr,
+                "local": rsrc(data),
+            },
+            line,
+            line < routed_lines,
+            line < lines,
+            first_token,
+        )
+        _reduce_lines(data, mine, tp, lines, bank, epoch, line, fx.Int32(lines), lines)
+        gpu.barrier()
+        counter = bid + tid * ctas
+        if counter < MAX_CTAS:
+            bo.buffer_store(epoch, rsrc(epochs), counter)
+
+    @flyc.jit
+    def launch(
+        data: Int64,
+        grouped: Int64,
+        route_rows: Int64,
+        route_weights: Int64,
+        peers: Int64,
+        epochs: Int64,
+        rank: Int32,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+    ):
+        kernel(data, grouped, route_rows, route_weights, peers, epochs, rank).launch(
+            grid=(ctas,), block=(threads,), stream=stream
+        )
+
+    GATHER_ALLREDUCE_ABI.check(kernel, launch)
+    return K2AllReduceKernel(
+        name, launch, (ctas,), (threads,), ctas, GATHER_ALLREDUCE_ABI
+    )

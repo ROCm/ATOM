@@ -17,6 +17,9 @@ from atom.models.kimi_k3.mono.dispatch import MonoDecodeModel
 from atom.models.kimi_k3.mono.kernels.attention.kda_builder_gfx1250 import (
     K1LocalBuildSpec,
 )
+from atom.models.kimi_k3.mono.kernels.stages.k2_allreduce_gfx1250 import (
+    GATHER_ALLREDUCE_ABI,
+)
 from atom.models.kimi_k3.mono.runner import K3MonoDecodeRunner
 from atom.models.kimi_k3.mono.runner_gfx1250 import (
     Gfx1250WidthBuild,
@@ -461,6 +464,7 @@ def test_grouped_k2_projects_locally_then_runs_grouped_moe(monkeypatch, herd):
         replicated_finalize=False,
         herd=herd,
         herd_routes=None,
+        grouped_moe=None,
     )
     x = tensor(rows, 4)
     experts = SimpleNamespace(w13_weight_scale=tensor(2), w2_weight_scale=tensor(2))
@@ -516,8 +520,8 @@ def test_grouped_k2_projects_locally_then_runs_grouped_moe(monkeypatch, herd):
     assert calls["finalize"][0] == buffers["routed"].data_ptr()
 
 
-@pytest.mark.parametrize("kernel_ar", (False, True))
-def test_replicated_finalize_all_reduces_both_partials_once(monkeypatch, kernel_ar):
+@pytest.mark.parametrize("all_reduce", ("collective", "kernel", "gather"))
+def test_replicated_finalize_all_reduces_both_partials_once(monkeypatch, all_reduce):
     rows, layer_id, latent, hidden = 2, 3, 3584, 7168
     weight = SimpleNamespace(
         write_idx=-1,
@@ -569,11 +573,21 @@ def test_replicated_finalize_all_reduces_both_partials_once(monkeypatch, kernel_
     buffers["shared"] = reduce[rows * latent :].view(rows, hidden)
     calls = {"all_reduce": []}
 
-    def recorder(name):
+    def recorder(name, abi=None):
         return SimpleNamespace(
-            launcher=lambda *args, **_kwargs: calls.setdefault(name, args)
+            launcher=lambda *args, **_kwargs: calls.setdefault(name, args), abi=abi
         )
 
+    grouped_rows = [
+        torch.zeros(4, dtype=dtype)
+        for dtype in (torch.bfloat16, torch.int32, torch.float32)
+    ]
+
+    def grouped_moe(*args, gather):
+        calls["grouped_moe"] = (args, gather)
+        return tuple(grouped_rows)
+
+    gathering = all_reduce == "gather"
     local = SimpleNamespace(
         front=recorder("front"),
         finish=recorder("finish"),
@@ -581,9 +595,14 @@ def test_replicated_finalize_all_reduces_both_partials_once(monkeypatch, kernel_
         buffers=buffers,
         grouped_experts=True,
         replicated_finalize=True,
-        herd=False,
-        herd_routes=None,
-        allreduce=recorder("allreduce") if kernel_ar else None,
+        herd=gathering,
+        herd_routes=object() if gathering else None,
+        allreduce=(
+            None
+            if all_reduce == "collective"
+            else recorder("allreduce", GATHER_ALLREDUCE_ABI if gathering else None)
+        ),
+        grouped_moe=grouped_moe if gathering else None,
     )
     experts = SimpleNamespace(w13_weight_scale=None, w2_weight_scale=None)
     layer = SimpleNamespace(
@@ -618,16 +637,24 @@ def test_replicated_finalize_all_reduces_both_partials_once(monkeypatch, kernel_
         torch.zeros(rows, 3, 4),
     )
 
-    if kernel_ar:
+    if all_reduce == "collective":
+        assert [value is reduce for value in calls["all_reduce"]] == [True]
+    else:
         assert calls["all_reduce"] == []
+        gathered = [t.data_ptr() for t in grouped_rows] if gathering else []
         assert calls["allreduce"] == (
             reduce.data_ptr(),
+            *gathered,
             runner.k2_peers.peers.data_ptr(),
             runner.k2_peers.epochs.data_ptr(),
             3,
         )
-    else:
-        assert [value is reduce for value in calls["all_reduce"]] == [True]
+    if gathering:
+        args, gather = calls["grouped_moe"]
+        assert gather is False
+        assert args[0].data_ptr() == buffers["latent_fp4"].data_ptr()
+        assert args[1] is buffers["latent_scales"]
+        assert args[6] is local.herd_routes and args[7] is buffers["routed"]
     assert calls["finalize"] == (
         buffers["routed"].data_ptr(),
         buffers["shared"].data_ptr(),

@@ -36,3 +36,12 @@ def test_o_proj_all_reduce_gives_each_rank_whole_ctas_of_columns():
     # partials from every rank for its own columns, then every column's sum
     assert oar.bank_words(8, 40) == 2 * (8 * 40 * oar.own_pairs(8) + 40 * HIDDEN // 2)
     assert oar.oproj_peer_bytes(8, 48) == 2 * oar.bank_words(8, 48) * 4
+
+
+@pytest.mark.parametrize("rows", (1, 5, 16, 40, 48))
+def test_gathering_all_reduce_keeps_a_cta_within_two_tokens_rows(rows):
+    kernel = ar.build_gather_allreduce(8, rows)
+    assert kernel.abi is ar.GATHER_ALLREDUCE_ABI
+    assert kernel.grid == ar.build_allreduce(8, rows).grid
+    # a CTA's lines (one a thread) cover fewer words than a routed row
+    assert kernel.block[0] * ar.PAYLOAD_WORDS <= ar.ROUTED_WORDS
