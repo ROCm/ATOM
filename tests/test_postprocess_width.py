@@ -29,6 +29,15 @@ mod = pytest.importorskip(
 
 
 @pytest.fixture(autouse=True)
+def isolated_topology(monkeypatch):
+    # These runner-wiring tests do not enable sequence/context parallelism.
+    # Individual TP tests set their own group without inheriting global config.
+    monkeypatch.setattr(mod, "sp_is_enabled", lambda: False)
+    monkeypatch.setattr(mod, "pcp_is_enabled", lambda: False)
+    monkeypatch.setattr(mod, "get_pcp_world_size", lambda: 1)
+
+
+@pytest.fixture(autouse=True)
 def _without_context_parallelism(monkeypatch):
     # These row/broadcast tests use TP only and build no global engine config.
     monkeypatch.setattr(mod, "get_pcp_world_size", lambda: 1)
