@@ -752,7 +752,8 @@ def test_terminal_without_consumer_expires_but_live_rdma_cannot_expire(monkeypat
 
 
 @pytest.mark.parametrize("pp_size", [1, 3])
-def test_idle_engine_dispatches_terminal_metadata_to_all_stages(pp_size):
+@pytest.mark.parametrize("chunked", [False, True])
+def test_idle_engine_dispatches_terminal_metadata_to_all_stages(pp_size, chunked):
     from aiter_stub import stubbed_aiter
 
     with stubbed_aiter():
@@ -768,7 +769,7 @@ def test_idle_engine_dispatches_terminal_metadata_to_all_stages(pp_size):
         kv_connector=SimpleNamespace(
             is_producer=True,
             is_offload=False,
-            enable_chunked_transfer=True,
+            enable_chunked_transfer=chunked,
             build_connector_meta=lambda: meta,
         )
     )
@@ -1287,14 +1288,14 @@ def test_terminal_transfer_history_is_bounded_without_retaining_sources(monkeypa
 @pytest.mark.parametrize(
     "is_offload,enabled,is_producer,dispatches",
     [
-        (False, False, True, False),
+        (False, False, True, True),
         (False, False, False, False),
         (False, True, False, False),
         (False, True, True, True),
         (True, False, False, True),
     ],
 )
-def test_idle_dispatch_remains_opt_in(
+def test_idle_dispatch_accepts_terminal_producers_and_offload(
     pp_size, is_offload, enabled, is_producer, dispatches
 ):
     with stubbed_aiter():
