@@ -213,19 +213,17 @@ other_jobs_on_node() {
   done <<< "${listing}"
 }
 
-# Takes this host's GPUs for this job: other users' jobs on the host are
-# cancelled and every GPU holder killed. When the scheduler does not answer,
-# the holders are killed anyway. Another job of this CI user on the host
-# (a sibling cell) is left alone, and so are the GPUs.
+# The scheduler gave this host to this job, so whatever holds its GPUs goes,
+# whether or not the scheduler lists other jobs here or answers at all. The
+# only exception is another job of this CI user (a sibling cell), which is
+# left alone together with the GPUs.
 free_gpus_for_this_job() {
   local host others job uid user state
-  local -a cancel=()
   host="$(hostname -s)"
   compgen -G '/sys/class/kfd/kfd/proc/[0-9]*' >/dev/null || return 0
   if ! others="$(other_jobs_on_node)"; then
     echo "the scheduler did not answer for ${host}; killing its GPU holders anyway"
-    kill_gpu_holders
-    return 0
+    others=""
   fi
   while read -r job uid user state; do
     [[ -n "${job}" ]] || continue
@@ -233,12 +231,8 @@ free_gpus_for_this_job() {
       echo "keep GPU holders: ${host} also runs this user's job ${job} (${state})"
       return 0
     fi
-    cancel+=("${job}")
-    echo "cancel ${user}'s job ${job} (${state}) on ${host}"
+    echo "${host} also lists ${user}'s job ${job} (${state}); its GPU processes are killed too"
   done <<< "${others}"
-  if [[ "${#cancel[@]}" -gt 0 ]] && ! slurm_cmd scancel "${cancel[@]}"; then
-    echo "WARNING: scancel ${cancel[*]} failed; killing the GPU holders anyway" >&2
-  fi
   kill_gpu_holders
 }
 
