@@ -406,7 +406,9 @@ def test_channel_constraint_preserves_raw_logprobs(
         for logits in (bonus, target):
             if logits is not None:
                 logits[:, 1:] = -float("inf")
-        return (None, None)
+        # This fixture constrains both sampled rows, matching the active-state
+        # return value used to compose channel and other per-request masks.
+        return (None, torch.zeros(_batch.total_seqs_num, dtype=torch.int32))
 
     monkeypatch.setattr(
         "atom.model_engine.token_constraints.apply_required_channel", force_channel
