@@ -94,6 +94,7 @@ def get_indexer_cp_world_size() -> int:
 # BYTES and not the tokens/topk factorization -- which is why the threshold is
 # expressed in bytes rather than as a token count.
 _ALLGATHER_MAX_PAYLOAD_BYTES = 512 * 1024
+_MAILBOX_ARCHES = ("gfx950", "gfx1250")
 
 
 def _mailbox_runtime():
@@ -190,7 +191,7 @@ _mailbox: CandidateMailbox | None = None
 
 def candidate_mailbox() -> CandidateMailbox | None:
     """The one-launch exchange's mailbox, or None when decode keeps the
-    collective (not gfx1250, no graphs, or the mailbox could not be mapped)."""
+    collective (unsupported architecture, no graphs, or mapping failure)."""
     return _mailbox
 
 
@@ -198,11 +199,10 @@ def _open_candidate_mailbox(device, max_rows: int) -> None:
     global _mailbox
     from aiter.jit.utils.chip_info import get_gfx_runtime
 
-    # The protocol is not intrinsically gfx1250-only. This gate is the validated
-    # scope: the fused kernel's cross-GPU `.wt`/`.cv` polling and performance
-    # have only been checked on gfx1250. Other architectures keep the collective
-    # exchange until they pass the same visibility, progress and performance tests.
-    if _mailbox is not None or get_gfx_runtime() != "gfx1250":
+    # Validated on gfx950 and gfx1250: cross-GPU `.wt`/`.cv` lower to sc0 sc1,
+    # delayed-rank and 12K-call stress tests make progress, and the fused path
+    # beats the collective exchange. Other architectures retain the fallback.
+    if _mailbox is not None or get_gfx_runtime() not in _MAILBOX_ARCHES:
         return
     group = get_indexer_cp_group()
     try:
