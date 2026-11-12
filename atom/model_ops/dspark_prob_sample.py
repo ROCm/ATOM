@@ -99,8 +99,10 @@ _NUM_WARPS = 8
 # batch sizes (a few dozen rows against the full vocab).
 # A chunk reduces its columns per lane, then across the lanes; the chunks'
 # records are combined in column order, and a tie on a maximum goes to the
-# lowest column. The residual draw is a Gumbel max over the chunks' maxima;
-# the sums (row normalizer, residual mass) add the chunks' partial sums.
+# lowest column. The residual draw is a Gumbel max over the chunks' maxima.
+# The row normalizer rescales each chunk's sumexp from its own max to the row
+# max (`exp(m_c - m)`, `_combine_stats`) before summing; only the residual
+# mass and the top-p records are plain sums of the chunks' partial sums.
 _SPLIT_BLOCK = 2048
 _CHUNK = 8192
 assert _CHUNK % _SPLIT_BLOCK == 0, "_CHUNK must be a multiple of _SPLIT_BLOCK"
