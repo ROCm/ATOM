@@ -1,12 +1,19 @@
 # SPDX-License-Identifier: MIT
+import sys
 from queue import Queue
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
-from atom.model_engine.engine_core import EngineCore
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 
 
-def test_credit_ack_snapshot_does_not_suppress_finished_backlog():
+def test_credit_ack_snapshot_does_not_suppress_finished_backlog(monkeypatch):
+    # Backlog IPC does not construct the AITER-backed worker RPC manager.
+    # Keep the same import boundary as the engine scheduling tests.
+    async_proc = ModuleType("atom.model_engine.async_proc")
+    async_proc.AsyncIOProcManager = object
+    monkeypatch.setitem(sys.modules, "atom.model_engine.async_proc", async_proc)
+    from atom.model_engine.engine_core import EngineCore
+
     engine = EngineCore.__new__(EngineCore)
     engine.input_queue = Queue()
     engine.output_queue = Queue()
