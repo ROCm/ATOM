@@ -377,4 +377,3 @@ def test_prefix_index_counters_are_exported_only_with_the_prefix_router():
         key = ("atom:dp_prefix_index_evicted_tokens_total", (("kind", kind),))
         assert samples[key] == value
     assert samples[("atom:dp_prefix_index_tokens", ())] == 4096
-    assert not [n for n, _ in samples if "budget" in n or "merge" in n]

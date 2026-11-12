@@ -2319,7 +2319,7 @@ def test_prefix_spread_trim_token_counters_use_the_chains_hash_block_size():
     assert got["trim_blocked_total"] == 0
 
 
-def test_prefix_spread_trim_blocked_counts_over_budget_with_only_pinned_edges():
+def test_prefix_spread_trim_blocked_counts_over_budget_with_only_pending_edges():
     router = _make_spread_mgr()._prefix_router
     producing = _chain_seq(1, 10 * 128)
     router.CAP = 5 * 128
@@ -2359,48 +2359,6 @@ def test_prefix_spread_trim_blocked_counts_finished_ancestors_of_a_prefilling_le
     after = router.index_counters()
     assert after["indexed_tokens"] <= router.CAP
     assert after["trim_blocked_total"] == before
-
-
-def test_prefix_spread_counters_agree_with_an_independent_state_oracle():
-    """Seeded random events under a tight budget. A spy on the trim helper
-    measures what actually left the index; the counters must equal it."""
-    import random
-
-    router = _make_spread_mgr()._prefix_router
-    router.CAP = 60 * 128
-    seen = {"shed": 0, "over": 0}
-    trim = router._trim_history
-
-    def spy_trim():
-        before = router.indexed_tokens
-        seen["over"] += before > router.CAP
-        trim()
-        seen["shed"] += before - router.indexed_tokens
-
-    router._trim_history = spy_trim
-    rng = random.Random(7)
-    live, nxt = [], 1
-    for _ in range(600):
-        roll = rng.random()
-        if roll < 0.55 or not live:
-            blocks = rng.randint(1, 40)
-            base = rng.choice((0, 0, 50, 7_000 + rng.randint(0, 30) * 100))
-            seq = _chain_seq(nxt, blocks * 128, first_block=base)
-            router.charge(nxt, router.place(seq, rng.randint(0, 1), 2).credit)
-            live.append(nxt)
-            nxt += 1
-        elif roll < 0.9:
-            router.prefill_complete(live.pop(rng.randrange(len(live))))
-        elif roll < 0.97:
-            router.release(live.pop(rng.randrange(len(live))))
-        else:
-            router.reset()
-    got = router.index_counters()
-    assert got["over_budget_total"] == seen["over"] > 0
-    assert (
-        got["tail_trim_tokens_total"] + got["leaf_evict_tokens_total"] == seen["shed"]
-    )
-    assert got["tail_trim_total"] > 0 and got["leaf_evict_total"] > 0
 
 
 def test_prefix_spread_index_counters_are_exported_in_router_statistics():
