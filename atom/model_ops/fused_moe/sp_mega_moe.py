@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 
 import torch
 
@@ -99,8 +100,11 @@ def _unsupported_layer(layer):
 class SPMegaMoE:
     """Shared collective runtime; outputs own their storage across layer calls."""
 
-    def __init__(self, runtime, layer, num_layers, group):
+    def __init__(self, runtime, layer, num_layers, group, runtime_a16=None):
         self.runtime = runtime
+        # The BF16-activation runtime for the small steps the native MoE keeps
+        # in BF16 (ATOM_SP_MEGA_MOE_A16), or None.
+        self.runtime_a16 = runtime_a16
         # The layers share one expert format, so one of them decides for all.
         self.layer = layer
         self.num_layers = num_layers
@@ -136,6 +140,8 @@ class SPMegaMoE:
         if not self._uncopied:
             return
         flag = self.runtime.error_flag()
+        if self.runtime_a16 is not None:
+            flag = flag | self.runtime_a16.error_flag()
         if self._errors is None:
             self._errors = torch.empty_like(flag, device="cpu").pin_memory()
             self._errors_copied = torch.cuda.Event()
@@ -155,32 +161,38 @@ class SPMegaMoE:
         uncounted, which RESET_LAUNCHES' margin absorbs.
         """
         self._raise_on_timeout()
-        if not self.runs(rows):
+        runtime = self.runs(rows)
+        if not runtime:
             return
         self._uncopied = True
-        self.launches += self.num_layers * math.ceil(
-            rows / self.runtime.max_local_tokens
-        )
+        self.launches += self.num_layers * math.ceil(rows / runtime.max_local_tokens)
         if self.launches >= RESET_LAUNCHES:
             # reset() clears bits the copy above may not have read yet: read
             # them now, on every SP rank, which all run the same steps.
-            bits = group_max(self.runtime.poll_errors(), self.group)
+            bits = group_max(
+                max(r.poll_errors() for r in self._runtimes()), self.group
+            )
             if bits:
                 self._timed_out(bits)
-            self.runtime.reset()
+            for r in self._runtimes():
+                r.reset()
             self.launches = 0
+
+    def _runtimes(self):
+        return [r for r in (self.runtime, self.runtime_a16) if r is not None]
 
     def close(self):
         """Collective over the SP group: every rank calls it before the group
         is destroyed. Skipped after a timeout, which peers may not have seen:
         its CPU barrier would block this rank's exit instead."""
         if not self.failed:
-            self.runtime.close()
+            for r in self._runtimes():
+                r.close()
 
     def runs(self, rows):
-        """Whether MegaMoE takes a step: only where the native MoE quantizes
-        activations to FP4 too. Small decode batches keep BF16 activations,
-        which this MegaMoE kernel cannot produce.
+        """The runtime that takes a step, or False: the FP4 one where the
+        native MoE quantizes activations to FP4 too, the BF16 one (if any) for
+        the small decode batches that keep BF16 activations.
 
         ``rows`` is this rank's share of the padded tokens; the decision is
         on the global count, as the native SP gather sees it, so every rank
@@ -192,7 +204,17 @@ class SPMegaMoE:
 
             method = self.layer.quant_method
             tokens = rows * self.runtime.cfg.world_size
-            runs = method.activation_dtype(self.layer, tokens) == dtypes.fp4x2
+            act = method.activation_dtype(self.layer, tokens)
+            if act == dtypes.fp4x2:
+                runs = self.runtime
+            elif (
+                act == dtypes.bf16
+                and self.runtime_a16 is not None
+                and rows <= self.runtime_a16.max_local_tokens
+            ):
+                runs = self.runtime_a16
+            else:
+                runs = False
             self._runs[rows] = runs
         return runs
 
@@ -205,13 +227,14 @@ class SPMegaMoE:
     def forward(self, layer, hidden_states, router_logits):
         """The layer's output, shared expert included, for rows `runs` takes."""
         rows = hidden_states.shape[0]
+        runtime = self.runs(rows)
         weights, ids = self._route(layer, hidden_states, router_logits)
-        self.runtime.set_weights(**_weights(layer))
+        runtime.set_weights(**_weights(layer))
         out = torch.empty_like(hidden_states)
-        tile = self.runtime.max_local_tokens
+        tile = runtime.max_local_tokens
         for start in range(0, rows, tile):
             sl = slice(start, min(start + tile, rows))
-            self.runtime.forward(hidden_states[sl], weights[sl], ids[sl], out=out[sl])
+            runtime.forward(hidden_states[sl], weights[sl], ids[sl], out=out[sl])
         return out
 
 
@@ -286,46 +309,75 @@ def initialize_sp_mega_moe(model, config):
     )
 
     max_local_rows = local_token_tile(config.max_num_batched_tokens, group.world_size)
-    runtime = None
+    # BF16-activation runtime for the steps the native MoE keeps in BF16: the
+    # local row counts below the native MoE's FP4 threshold.
+    a16_rows = 0
+    if os.environ.get("ATOM_SP_MEGA_MOE_A16", "0") == "1":
+        from aiter import dtypes
+
+        method = layers[0].quant_method
+        for rows in range(1, max_local_rows + 1):
+            act = method.activation_dtype(layers[0], rows * group.world_size)
+            if act != dtypes.bf16:
+                break
+            a16_rows = rows
+    runtimes = []
     try:
-        runtime = MegaMoeTP(
-            MegaMoeTPConfig(
-                rank=group.rank_in_group,
-                world_size=group.world_size,
-                model_dim=hidden,
-                inter_dim=inter,
-                experts=experts,
-                topk=top_k + 1,
-                max_local_tokens=max_local_rows,
-                activation=activation,
-                swiglu_limit=swiglu_limit,
-                comm_mode="ag_rs",
-                comm_dtype="fp8",
-                fit_max_local=True,
-            ),
-            **_weights(layers[0]),
-            group=group.cpu_group,
-            device=layers[0].w13_weight.device,
-        )
-        # Every remainder of a local tile, so no graph bucket compiles during
-        # capture.
-        runtime.prepare_all()
+        for act_dtype, local_rows in (("fp4", max_local_rows), ("bf16", a16_rows)):
+            if not local_rows:
+                continue
+            runtimes.append(
+                MegaMoeTP(
+                    MegaMoeTPConfig(
+                        rank=group.rank_in_group,
+                        world_size=group.world_size,
+                        model_dim=hidden,
+                        inter_dim=inter,
+                        experts=experts,
+                        topk=top_k + 1,
+                        max_local_tokens=local_rows,
+                        activation=activation,
+                        swiglu_limit=swiglu_limit,
+                        comm_mode="ag_rs",
+                        comm_dtype="fp8",
+                        act_dtype=act_dtype,
+                        fit_max_local=True,
+                    ),
+                    **_weights(layers[0]),
+                    group=group.cpu_group,
+                    device=layers[0].w13_weight.device,
+                )
+            )
+            # Every remainder of a local tile, so no graph bucket compiles
+            # during capture.
+            runtimes[-1].prepare_all()
     except MegaMoeSetupError as exc:
         # AITER raises it on every rank alike, so the collective close() is safe.
-        if runtime is not None:
-            runtime.close()
+        for r in runtimes:
+            r.close()
         raise _refuse(f"MegaMoeTP setup failed: {exc}") from exc
     # The big-M warmup leaves a timed-out wait in the sticky bits only.
-    bits = group_max(runtime.poll_errors(), group.cpu_group)
+    bits = group_max(max(r.poll_errors() for r in runtimes), group.cpu_group)
     if bits:
-        runtime.close()
+        for r in runtimes:
+            r.close()
         raise _refuse(f"a MegaMoeTP warmup wait timed out (error bits {bits:#x})")
-    backend = SPMegaMoE(runtime, layers[0], len(layers), group.cpu_group)
+    runtime = runtimes[0]
+    runtime_a16 = runtimes[1] if len(runtimes) > 1 else None
+    backend = SPMegaMoE(
+        runtime, layers[0], len(layers), group.cpu_group, runtime_a16=runtime_a16
+    )
     for layer in layers:
         layer.sp_mega_moe = backend
     logger.info(
-        "SP MegaMoE enabled: %d layers, one shared runtime, tile=%d local tokens.",
+        "SP MegaMoE enabled: %d layers, one shared runtime, tile=%d local tokens"
+        "%s.",
         len(layers),
         runtime.max_local_tokens,
+        (
+            f"; BF16-activation runtime up to {runtime_a16.max_local_tokens} local tokens"
+            if runtime_a16 is not None
+            else ""
+        ),
     )
     return backend
