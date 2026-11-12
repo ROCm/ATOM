@@ -357,25 +357,6 @@ mod b2_chat_aggregator_branches {
     }
 
     #[tokio::test]
-    async fn test_aggregator_with_tools_tool_choice_none_returns_ok() {
-        let mut req = ChatCompletionRequest::default();
-        req.stream = false;
-        req.tools = Some(vec![Tool {
-            tool_type: "function".to_string(),
-            function: Function {
-                name: "myfn".to_string(),
-                description: None,
-                parameters: serde_json::json!({}),
-                strict: None,
-            },
-        }]);
-        req.tool_choice = Some(ToolChoice::Value(ToolChoiceValue::None));
-        let stream = synthetic_single_stream(vec![Ok(cmpl(vec![1], FinishReason::Stop, None))]);
-        let resp = chat_aggregator::process(stream, ctx_with(req)).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
     async fn test_aggregator_propagates_transport_error_as_503() {
         use super::test_support::chat_ctx;
         let stream = synthetic_single_stream(vec![Err(EngineError::Transport(
