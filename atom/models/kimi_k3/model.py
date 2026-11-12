@@ -1173,14 +1173,16 @@ class KimiKDAAttention(nn.Module):
         return self.in_proj, self.f_a_proj
 
     def process_weights_after_loading(self) -> None:
-        """Fuse all hidden-input projections into the single in-proj (one GEMM).
+        """Fuse all hidden-input projections into the single in-proj weight.
 
         Upstream already loads q/k/v/g into a single ``in_proj``
         (``MergedColumnParallelLinear``) via ``packed_modules_mapping``. Here we
         extend that fused weight in place with the two remaining projections that
         also consume ``hidden_states`` -- ``b_proj`` (beta) and ``f_a_proj`` --
-        so ``forward`` runs one ``self.in_proj(...)`` producing
-        ``[q | k | v | g | b | f_a]`` instead of three separate launches. The
+        so below ``_KDA_IN_PROJ_SPLIT_MIN_TOKENS`` tokens ``forward`` runs one
+        ``self.in_proj(...)`` GEMM producing ``[q | k | v | g | b | f_a]``
+        instead of three separate launches, and from it two GEMMs on the fused
+        weight's row slices ``[q | k | v | g]`` and ``[b | f_a]``. The
         tail storage is then released (the modules stay as empty shells; their
         bf16 post-load hooks are no-ops and never re-run). Runs once; idempotent.
 
@@ -1314,13 +1316,14 @@ class KimiKDAAttention(nn.Module):
         hidden_states = hidden_states[:num_actual_tokens]
         if hidden_states_scale is not None:
             hidden_states_scale = hidden_states_scale[:num_actual_tokens]
-        # Single fused in-proj GEMM producing [q | k | v | g]; slice out each
+        # The fused in-proj weight [q | k | v | g | b | f_a] runs as one GEMM
+        # below _KDA_IN_PROJ_SPLIT_MIN_TOKENS tokens and as two GEMMs on its
+        # row slices [q | k | v | g] and [b | f_a] from it; slice out each
         # part. `out_gate` is the KDA output gate consumed at o_norm below
         # (computed here so it rides the same GEMM instead of a separate one
         # after the recurrence). in_proj's weight was grown in
-        # process_weights_after_loading to the fused [q | k | v | g | b | f_a],
-        # so in_proj emits all six (in two GEMMs on a long prefill); f_b_proj stays a
-        # separate GEMM because it consumes f_a's output, not hidden_states.
+        # process_weights_after_loading; f_b_proj stays a separate GEMM because
+        # it consumes f_a's output, not hidden_states.
         lp = self.local_proj_size
         nlh = self.num_local_heads
         hd = self.head_dim
