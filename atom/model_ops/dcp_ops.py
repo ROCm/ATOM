@@ -512,6 +512,10 @@ def _dcp_a2a_unpack_combine_kernel(
     LSE_PACK: tl.constexpr,
     N_ROUNDED: tl.constexpr,
     WRITE_LSE: tl.constexpr,
+    recv_lse_ptr=None,  # [N, B, H_LOCAL] fp32 sent apart from recv, or packed in it
+    recv_lse_stride_n=0,
+    recv_lse_stride_b=0,
+    recv_lse_stride_h=0,
 ):
     """LSE-weighted combine along the KV-shard axis. One program per (token, head).
 
@@ -535,15 +539,22 @@ def _dcp_a2a_unpack_combine_kernel(
         + b * recv_stride_b
         + h * recv_stride_h
     )
+    if recv_lse_ptr is None:
+        lse_ptr = base + HEAD_DIM
+    else:
+        lse_ptr = (
+            recv_lse_ptr
+            + n_safe.to(tl.int64) * recv_lse_stride_n
+            + b * recv_lse_stride_b
+            + h * recv_lse_stride_h
+        )
 
     if LSE_PACK == 1:
-        lse = tl.load(base + HEAD_DIM, mask=valid, other=float("-inf"))
+        lse = tl.load(lse_ptr, mask=valid, other=float("-inf"))
         lse = lse.to(tl.float32)
     else:
-        hi = tl.load(base + HEAD_DIM, mask=valid, other=0).to(tl.uint16, bitcast=True)
-        lo = tl.load(base + HEAD_DIM + 1, mask=valid, other=0).to(
-            tl.uint16, bitcast=True
-        )
+        hi = tl.load(lse_ptr, mask=valid, other=0).to(tl.uint16, bitcast=True)
+        lo = tl.load(lse_ptr + 1, mask=valid, other=0).to(tl.uint16, bitcast=True)
         bits = (hi.to(tl.uint32) << 16) | lo.to(tl.uint32)
         lse = bits.to(tl.float32, bitcast=True)
         lse = tl.where(valid, lse, float("-inf"))
@@ -713,6 +724,7 @@ def cp_lse_a2a(
     return_lse: bool = False,
     owned_counts=None,
     quant_dtype=None,
+    head_major=False,
 ):
     """A2A backend: pack -> one all-to-all -> local LSE combine.
 
@@ -720,12 +732,15 @@ def cp_lse_a2a(
     output, same head ownership.
 
     Args:
-        cp_attn_out: ``[B, H, D]`` this rank's partial output over its KV shard.
+        cp_attn_out: ``[B, H, D]`` this rank's partial output over its KV shard,
+            or ``[H, B, D]`` with ``head_major``: then each destination's heads
+            are contiguous already, so nothing is packed and the LSE takes a
+            second all-to-all.
         cp_attn_lse: ``[B, H]`` matching log-sum-exp, fp32.
         cp_group: DCP GroupCoordinator.
         return_lse: also return the merged ``[B, H_local]`` global LSE.
         owned_counts: optional true rank-local sparse-KV count per row. Empty
-            rows are masked inside the existing A2A pack kernel.
+            rows are masked inside the A2A pack kernel, or in the head-major LSE.
         quant_dtype: when given (per-token FP8), the combine also quantizes and
             the call returns ``(out_fp8, scale)`` instead of ``out``. This
             deletes the standalone per-token quant launch that o_proj would
@@ -742,13 +757,19 @@ def cp_lse_a2a(
     ), "cp_lse_a2a: the fused-quant combine does not emit LSE"
 
     n_ranks = cp_group.world_size
+    if head_major and (n_ranks == 1 or quant_dtype is not None):
+        # shortcut: the fused-quant combine reads only the packed layout, so this
+        # input still pays the copy and the pack; extend it when a caller needs both.
+        cp_attn_out, head_major = cp_attn_out.transpose(0, 1), False
     if n_ranks == 1:
         if quant_dtype is not None:
             # Nothing to combine, so there is no kernel to fold the quant into.
             return cp_attn_out, None
         return (cp_attn_out, cp_attn_lse) if return_lse else cp_attn_out
 
-    b, h_total, head_dim = cp_attn_out.shape
+    b, h_total, head_dim = (
+        cp_attn_out.transpose(0, 1) if head_major else cp_attn_out
+    ).shape
     assert h_total % n_ranks == 0, (
         f"a2a merge needs the head count divisible by the DCP size; "
         f"got H={h_total}, N={n_ranks}"
@@ -761,6 +782,42 @@ def cp_lse_a2a(
 
     cp_attn_out = cp_attn_out.contiguous()
     cp_attn_lse = cp_attn_lse.contiguous().to(torch.float32)
+    if head_major:
+        if owned_counts is not None:
+            cp_attn_lse = mask_empty_dcp_lse(cp_attn_lse, owned_counts[:b])
+        send_lse = cp_attn_lse.t().contiguous()
+        recv = torch.empty_like(cp_attn_out)
+        recv_lse = torch.empty_like(send_lse)
+        group = cp_group.device_group
+        torch.distributed.all_to_all_single(recv, cp_attn_out, group=group)
+        torch.distributed.all_to_all_single(recv_lse, send_lse, group=group)
+        # [N, B, H_local] views of what arrived as [N, H_local, B].
+        recv = recv.view(n_ranks, h_local, b, head_dim).transpose(1, 2)
+        recv_lse = recv_lse.view(n_ranks, h_local, b).transpose(1, 2)
+        out = torch.empty((b, h_local, head_dim), dtype=dtype, device=dev)
+        out_lse = torch.empty((b, h_local), dtype=torch.float32, device=dev)
+        _dcp_a2a_unpack_combine_kernel[(b, h_local)](
+            recv,
+            out,
+            out_lse,
+            recv.stride(0),
+            recv.stride(1),
+            recv.stride(2),
+            out.stride(0),
+            out.stride(1),
+            out_lse.stride(0),
+            out_lse.stride(1),
+            n_ranks,
+            HEAD_DIM=head_dim,
+            LSE_PACK=1,
+            N_ROUNDED=triton.next_power_of_2(n_ranks),
+            WRITE_LSE=return_lse,
+            recv_lse_ptr=recv_lse,
+            recv_lse_stride_n=recv_lse.stride(0),
+            recv_lse_stride_b=recv_lse.stride(1),
+            recv_lse_stride_h=recv_lse.stride(2),
+        )
+        return (out, out_lse) if return_lse else out
     has_owned_counts = owned_counts is not None
     if has_owned_counts:
         owned_counts = owned_counts.contiguous()
@@ -857,6 +914,7 @@ def dcp_lse_merge(
     ctx=None,
     owned_counts=None,
     quant_dtype=None,
+    head_major=False,
 ):
     """Reconstruct the global softmax from the per-rank partials.
 
@@ -873,6 +931,8 @@ def dcp_lse_merge(
 
     ``ctx`` is the Triton context the AG+RS backend caches its launches in; the
     a2a backend does not use one.
+
+    ``head_major`` says ``cp_attn_out`` is ``[H, B, D]``; see ``cp_lse_a2a``.
     """
     if backend == "a2a":
         return cp_lse_a2a(
@@ -881,10 +941,13 @@ def dcp_lse_merge(
             cp_group,
             owned_counts=owned_counts,
             quant_dtype=quant_dtype,
+            head_major=head_major,
         )
     assert (
         quant_dtype is None
     ), "dcp_lse_merge: fused-quant combine is only implemented for backend=a2a"
+    if head_major:
+        cp_attn_out = cp_attn_out.transpose(0, 1)
     if owned_counts is not None:
         # AG+RS has no existing kernel before its LSE AllGather. The default
         # A2A path above fuses this mask and remains launch-free.

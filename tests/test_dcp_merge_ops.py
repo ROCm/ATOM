@@ -791,6 +791,81 @@ def test_a2a_scrubs_the_empty_rank():
     torch.testing.assert_close(got[0].float(), o[1][0].float(), rtol=8e-3, atol=8e-3)
 
 
+def _cp_lse_a2a_on_every_rank(monkeypatch, o, lse, owned_counts, **kwargs):
+    """``cp_lse_a2a`` as each rank in turn, its all-to-alls fed by every rank's sends.
+
+    What a rank sends depends on its own inputs alone, so a first pass records
+    each rank's sends and a second hands rank j, call by call, chunk j of every
+    rank's send -- the permutation ``all_to_all_single`` performs.
+    """
+    from atom.model_ops.dcp_ops import cp_lse_a2a
+
+    n = len(o)
+    group = SimpleNamespace(world_size=n, device_group=None)
+    sent = [[] for _ in range(n)]
+    rank, calls = 0, iter(())
+
+    def record(recv, send, group):
+        sent[rank].append(send.clone())
+
+    def serve(recv, send, group):
+        k = next(calls)
+        chunks = [sent[r][k].view(n, -1)[rank] for r in range(n)]
+        recv.view(n, -1).copy_(torch.stack(chunks))
+
+    for fake in (record, serve):
+        monkeypatch.setattr(torch.distributed, "all_to_all_single", fake)
+        outs = []
+        for rank in range(n):
+            calls = iter(range(len(sent[rank])))
+            x = (
+                o[rank].transpose(0, 1).contiguous()
+                if kwargs.get("head_major")
+                else o[rank]
+            )
+            outs.append(
+                cp_lse_a2a(
+                    x, lse[rank], group, owned_counts=owned_counts[rank], **kwargs
+                )
+            )
+    return outs
+
+
+@needs_gpu
+@pytest.mark.parametrize(
+    "dtype, quant",
+    [(torch.float32, False), (torch.bfloat16, False), (torch.bfloat16, True)],
+)
+def test_head_major_a2a_matches_the_packed_one_bitwise(monkeypatch, dtype, quant):
+    """Sending the head-major output with its LSE apart feeds the combine the
+    same values the pack did, so every rank's result is the same bits, the
+    dummy-backed empty row included. The fused quant keeps the packed path."""
+    b, h, d, n_ranks = 5, 16, 32, 4
+    g = torch.Generator(device=DEV).manual_seed(3)
+    o = [
+        torch.randn(b, h, d, generator=g, device=DEV).to(dtype) for _ in range(n_ranks)
+    ]
+    lse = [torch.randn(b, h, generator=g, device=DEV) for _ in range(n_ranks)]
+    o[0][1] = float("nan")
+    owned_counts = [
+        torch.ones(b, dtype=torch.int32, device=DEV) for _ in range(n_ranks)
+    ]
+    owned_counts[0][1] = 0
+    kwargs = {"quant_dtype": dtypes.fp8} if quant else {"return_lse": True}
+
+    packed = _cp_lse_a2a_on_every_rank(monkeypatch, o, lse, owned_counts, **kwargs)
+    head_major = _cp_lse_a2a_on_every_rank(
+        monkeypatch, o, lse, owned_counts, head_major=True, **kwargs
+    )
+
+    if not quant:
+        roundtrip = _a2a_roundtrip(o, lse, n_ranks, owned_counts)
+        assert torch.equal(torch.cat([out for out, _ in packed], dim=1), roundtrip)
+    for want, got in zip(packed, head_major, strict=True):
+        for x, y in zip(want, got, strict=True):
+            assert torch.equal(x.view(torch.uint8), y.view(torch.uint8))
+
+
 @needs_dcp_ops
 def test_lse_pack_slots_covers_the_transfer_dtypes():
     """fp32 needs one slot, 16-bit dtypes need two; anything else must raise
@@ -813,6 +888,19 @@ def test_cp_lse_a2a_is_a_no_op_without_a_dcp_group():
     assert cp_lse_a2a(o, lse, group) is o
     out, out_lse = cp_lse_a2a(o, lse, group, return_lse=True)
     assert out is o and out_lse is lse
+
+
+@needs_dcp_ops
+@pytest.mark.parametrize("backend", ["a2a", "ag_rs"])
+def test_head_major_merge_without_a_dcp_group_returns_b_h_d(backend):
+    """dcp==1: a head-major input comes back as the ``[B, H, D]`` o_proj reads."""
+    from atom.model_ops.dcp_ops import dcp_lse_merge
+
+    o = torch.randn(2, 4, 8)
+    group = SimpleNamespace(world_size=1)
+    head_major = o.transpose(0, 1).contiguous()
+    got = dcp_lse_merge(head_major, torch.randn(2, 4), group, backend, head_major=True)
+    assert torch.equal(got, o)
 
 
 # ─────────────────────────────────────────────────────────── DCPConfig parsing ──
