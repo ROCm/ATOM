@@ -216,56 +216,6 @@ def test_a_first_result_is_not_news():
     )
 
 
-def test_summary_row_shows_dated_c64_throughput_before_and_now_and_the_accuracy_change():
-    row = summary_row(
-        model("Alpha", pc(4, 50.0, 60.0), pc(64, 1040.0, 1000.0), ac(0.939, 0.941)),
-        "2026-11-14",
-    )
-    assert row == [
-        "Alpha",
-        "MLPerf Endpoint",
-        "1,000 (2026-11-07)",
-        "1,040 (2026-11-14)",
-        "🟢 +4.0%",
-        "−0.2 pts (now 93.9%)",
-    ]
-
-
-def test_summary_row_of_a_failed_run_shows_na():
-    row = summary_row(
-        model(
-            "Bravo",
-            pc(4, 50.0, 50.0),
-            pc(64, None, 900.0, status="fail", error="x"),
-            ac(None, 0.9, status="fail", error="x"),
-        ),
-        "2026-11-14",
-    )
-    assert row == [
-        "Bravo",
-        "MLPerf Endpoint",
-        "900 (2026-11-07)",
-        "N/A (2026-11-14)",
-        "N/A",
-        "N/A",
-    ]
-
-
-def test_summary_row_of_a_first_run_has_no_change():
-    row = summary_row(
-        model("Alpha", pc(4, 50.0, None), pc(64, 1000.0, None), ac(0.95, None)),
-        "2026-11-14",
-    )
-    assert row == [
-        "Alpha",
-        "MLPerf Endpoint",
-        "—",
-        "1,000 (2026-11-14)",
-        "first",
-        "first (now 95.0%)",
-    ]
-
-
 def test_detail_tables_compare_with_the_previous_session_by_date_and_name_an_older_one():
     a = model("Alpha", pc(4, 100.0, 100.0), pc(64, 1000.0, 1000.0), ac(0.95, 0.95))
     b = model(
@@ -315,13 +265,6 @@ GAINING = {
 }
 
 
-def test_a_problem_tags_the_owner_and_asks_them_to_look():
-    (line,) = highlights([model("Bravo", **FAILING)], owners={"bravo": "@bravo_owner"})
-    assert line.startswith("❌ Bravo: ") and line.endswith(
-        "@bravo_owner please take a look."
-    )
-
-
 def test_good_news_tags_the_owner_without_asking():
     (line,) = highlights(
         [model("Alpha", **GAINING)], owners={"alpha": "@alpha_owner @alpha_backup"}
@@ -341,3 +284,86 @@ def test_missing_owners_names_the_models_with_news_and_no_owner():
         model("Charlie", **FLAT),
     ]
     assert missing_owners(results, {"alpha": "@alpha_owner"}) == ["Bravo"]
+
+
+def test_summary_row_shows_c64_throughput_before_and_now_with_the_delta():
+    row = summary_row(
+        model("Alpha", pc(4, 50.0, 60.0), pc(64, 1040.0, 1000.0), ac(0.939, 0.941)),
+        "2026-11-14",
+        "2026-11-07",
+    )
+    assert row == [
+        "Alpha",
+        "MLPerf Endpoint",
+        "1,000",
+        "1,040",
+        "🟢 +40 (+4.0%)",
+        "−0.2 pts (now 93.9%)",
+    ]
+
+
+def test_summary_row_dates_a_previous_value_older_than_the_column():
+    row = summary_row(
+        model(
+            "Alpha",
+            pc(4, 50.0, 60.0),
+            pc(64, 340.0, 336.0, prev_date="2026-10-31"),
+            ac(0.961, 0.962, prev_date="2026-10-31"),
+        ),
+        "2026-11-14",
+        "2026-11-07",
+    )
+    assert row[2:] == [
+        "336 (2026-10-31)",
+        "340",
+        "+4 (+1.2%)",
+        "−0.1 pts (now 96.1%) (vs 2026-10-31)",
+    ]
+
+
+def test_summary_row_of_a_failed_run_shows_na():
+    row = summary_row(
+        model(
+            "Bravo",
+            pc(4, 50.0, 50.0),
+            pc(64, None, 900.0, status="fail", error="x"),
+            ac(None, 0.9, status="fail", error="x"),
+        ),
+        "2026-11-14",
+        "2026-11-07",
+    )
+    assert row == ["Bravo", "MLPerf Endpoint", "900", "N/A", "N/A", "N/A"]
+
+
+def test_summary_row_of_a_first_run_has_no_delta():
+    row = summary_row(
+        model("Alpha", pc(4, 50.0, None), pc(64, 1000.0, None), ac(0.95, None)),
+        "2026-11-14",
+        None,
+    )
+    assert row == [
+        "Alpha",
+        "MLPerf Endpoint",
+        "—",
+        "1,000",
+        "first",
+        "first (now 95.0%)",
+    ]
+
+
+def test_a_problem_just_tags_the_owner():
+    (line,) = highlights([model("Bravo", **FAILING)], owners={"bravo": "@bravo_owner"})
+    assert (
+        line.startswith("❌ Bravo: ")
+        and line.endswith(" @bravo_owner")
+        and "please" not in line
+    )
+
+
+def test_the_delta_matches_the_numbers_shown():
+    row = summary_row(
+        model("Alpha", pc(4, 50.0, 60.0), pc(64, 339.6, 336.4), ac(0.95, 0.95)),
+        "2026-11-14",
+        "2026-11-07",
+    )
+    assert row[2:5] == ["336", "340", "+4 (+1.0%)"]  # 340 − 336, not the unrounded 3.2

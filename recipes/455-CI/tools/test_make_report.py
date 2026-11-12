@@ -115,10 +115,7 @@ def test_a_saturday_report_has_highlights_a_dated_table_and_the_core_error_log(
         and "❌" in summary
         and "455-CI-report-20261114-detail.md" in summary
     )
-    assert (
-        "| Kimi-K3 (2.8T) | MLPerf Endpoint | 1,000 (2026-11-07) | N/A (2026-11-14) | N/A |"
-        in summary
-    )
+    assert "| Kimi-K3 (2.8T) | MLPerf Endpoint | 1,000 | N/A | N/A |" in summary
     assert "base" not in summary.split("## Highlights")[0].lower()
     assert "| Test date | 2026-11-14 |" in detail and "sha256:abc" in detail
     assert "Base image" not in detail and "Dependency" not in detail
@@ -126,7 +123,7 @@ def test_a_saturday_report_has_highlights_a_dated_table_and_the_core_error_log(
         "Traceback" in detail and "../runs/20261114/charts/perf-endpoint.png" in detail
     )
     assert "| Kimi-K3 (2.8T) | tp8dcp8 | 4 |" in detail
-    assert "@k3_owner please take a look." in summary
+    assert "@k3_owner" in summary and "please" not in summary
     assert not re.search(CJK, summary + detail)
 
 
@@ -150,8 +147,12 @@ def test_a_wednesday_report_covers_its_own_session_on_the_saturday_image(tmp_pat
     summary = (tmp_path / "reports" / "455-CI-report-20261118.md").read_text()
     detail = (tmp_path / "reports" / "455-CI-report-20261118-detail.md").read_text()
     assert summary.startswith("# 455-CI report · 2026-11-18 · 8K/1K")
-    assert "| GLM-5.2 | 8K/1K | 12,000 (2026-11-11) | 12,300 (2026-11-18) |" in summary
+    assert "| GLM-5.2 | 8K/1K | 12,000 | 12,300 | +300 (+2.5%) |" in summary
     assert "MLPerf Endpoint" not in summary
+    assert (
+        "| Model | Scenario | 2026-11-11 (tok/s/GPU) | 2026-11-18 (tok/s/GPU) | Delta | GSM8K delta |"
+        in summary
+    )
     assert "sha256:saturday" in detail and "| Test date | 2026-11-18 |" in detail
     assert "../runs/20261118/charts/perf-8k1k.png" in detail
 

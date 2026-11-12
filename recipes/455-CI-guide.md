@@ -460,7 +460,7 @@ recipes/
 
 大老板只看 Highlights，所以只写本次出了大事或跑挂的模型，每个一行：`<标记> <模型>: <发生了什么>`。不写场景，只给一个关键数字，例如 `⚠️ GLM-5.2: throughput down 4.2%.`、`❌ Qwen-35B-A3B: c64 failed (RuntimeError: …).`。持平、变化不大或第一次有数据的模型都不提；一个都没有时只写 `No failures or major changes.`。
 
-每条后面 @ 这个模型的 owner，让负责的人看到：出问题（❌、🔴、⚠️）写成 `… @owner please take a look.`，好消息（🟢、✅）只 @ 一下。owner 名单在 `recipes/455-CI/owners.csv`（两列：`model` 是 §1 的 slug，`owner` 是要 @ 的人，多人用空格隔开），由测试负责人维护。用 GitHub 账号还是 IM 里的名字，取决于 Highlights 贴到哪里：仓库里的 md 文件写 @ 不会触发 GitHub 通知，真正提醒到人的是把 Highlights 贴进 issue 或群聊那一下。有消息的模型没登记 owner 时，`make_report.py` 会打警告，提交前补上。
+每条后面 @ 这个模型的 owner，让负责的人看到，例如 `❌ Qwen-35B-A3B: c64 failed (…). @owner`。owner 名单在 `recipes/455-CI/owners.csv`（两列：`model` 是 §1 的 slug，`owner` 是要 @ 的人，多人用空格隔开），由测试负责人自己填写和维护，没填就不 @。用 GitHub 账号还是 IM 里的名字，取决于 Highlights 贴到哪里：仓库里的 md 文件写 @ 不会触发 GitHub 通知，真正提醒到人的是把 Highlights 贴进 issue 或群聊那一下。有消息的模型没登记 owner 时，`make_report.py` 会打警告，提交前补上。
 
 `make_report.py` 按下表比较本次和历史结果，生成草稿；测试 agent 读一遍再提交，可以改措辞，但不能删掉 ❌ 和 🔴 的条目，也不能改数字。
 
@@ -479,7 +479,7 @@ recipes/
 
 ### 5.2 报告：Highlights 和总表
 
-格式如下（周六那场，数字是编的）：
+格式如下（周六那场，数字是编的，owner 是占位名）：
 
 ```markdown
 # 455-CI report · <YYYY-MM-DD> · MLPerf Endpoint
@@ -488,22 +488,22 @@ Image `gfx1250-atom-ci455-<YYYYMMDD>` · ATOM `main@<sha 前 9 位>` · aiter `m
 
 ## Highlights
 
-- ❌ Qwen-35B-A3B: c64 failed (RuntimeError: HIP error: out of memory). @qwen35b_owner please take a look.
+- ❌ Qwen-35B-A3B: c64 failed (RuntimeError: HIP error: out of memory). @qwen35b_owner
 - 🟢 DeepSeek-V4.1-Flash: throughput up 6.9%. @v41_flash_owner
 - ✅ Kimi-K3: recovered from the previous failure. @k3_owner
 
 ## Summary
 
-| Model | Scenario | Previous (tok/s/GPU) | Current (tok/s/GPU) | Change | GSM8K change |
+| Model | Scenario | 2026-11-07 (tok/s/GPU) | 2026-11-14 (tok/s/GPU) | Delta | GSM8K delta |
 |---|---|---|---|---|---|
-| DeepSeek-V4.1-Flash | MLPerf Endpoint | 2,655 (2026-11-07) | 2,838 (2026-11-14) | 🟢 +6.9% | −0.2 pts (now 93.9%) |
-| Kimi-K3 (2.8T) | MLPerf Endpoint | 336 (2026-10-31) | 340 (2026-11-14) | +1.0% | −0.1 pts (now 96.1%) |
-| Qwen-35B-A3B | MLPerf Endpoint | 6,345 (2026-11-07) | N/A (2026-11-14) | N/A | −0.1 pts (now 90.1%) |
+| DeepSeek-V4.1-Flash | MLPerf Endpoint | 2,655 | 2,838 | 🟢 +183 (+6.9%) | −0.2 pts (now 93.9%) |
+| Kimi-K3 (2.8T) | MLPerf Endpoint | 336 (2026-10-31) | 340 | +4 (+1.0%) | −0.1 pts (now 96.1%) (vs 2026-10-31) |
+| Qwen-35B-A3B | MLPerf Endpoint | 6,345 | N/A | N/A | −0.1 pts (now 90.1%) |
 ```
 
-- 一个模型一行，依次是 Model、Scenario、Previous、Current、Change、GSM8K change。表格下面不加说明文字。
-- Previous 和 Current 是并发 64 的每卡吞吐（口径见 §4.1：endpoint 是输出 token，8K/1K 是输入加输出 token），括号里是场次日期。Previous 取该模型最近一次成功的那一场，所以不一定是上一场：例子里 Kimi-K3 上一场（11-07）跑挂了，就和 10-31 那场比。
-- GSM8K change 写掉了多少、现在多少，例如 `−4.6 pts (now 88.1%)`。
+- 一个模型一行，依次是 Model、Scenario、上一场、本场、Delta、GSM8K delta。表格下面不加说明文字。
+- 第三、四列是并发 64 的每卡吞吐（口径见 §4.1：endpoint 是输出 token，8K/1K 是输入加输出 token），表头写上一场和本场的日期。上一场取该模型最近一次成功的那一场：例子里 Kimi-K3 上一场（11-07）跑挂了，就和 10-31 那场比，并在格子里注明日期。
+- Delta 写差值和百分比，例如 `+183 (+6.9%)`，差值按表里显示的数算。GSM8K delta 写掉了多少、现在多少，例如 `−4.6 pts (now 88.1%)`。
 - N/A 表示跑挂、没有值；— 表示没有结果；first 表示第一次有数据，没有可比的。
 
 ### 5.3 详细报告

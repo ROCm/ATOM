@@ -44,6 +44,11 @@ def pts(x):
     return "0.0 pts" if v == 0 else f"{v:+.1f} pts".replace("-", "−")
 
 
+def shown(v):
+    """A value as the tables show it: one decimal under 100, else whole."""
+    return round(v, 1) if v < 100 else round(v)
+
+
 def num(v):
     return f"{v:,.1f}" if v < 100 else f"{v:,.0f}"
 
@@ -124,9 +129,9 @@ def _phrase(cells, top, key, template, flag=perf_flag):
 
 
 def _news(results):
-    """(category, slug, line, ask) per piece of news, most important first:
+    """(category, slug, line) per piece of news, most important first:
     failures, severe and plain regressions (throughput, then GSM8K), slow
-    slides below the best, progress, recoveries. `ask`: the owner should look."""
+    slides below the best, progress, recoveries."""
     items = []
     for r in results:
         who, top = short_name(r.name), headline(r)
@@ -143,7 +148,6 @@ def _news(results):
                     0,
                     r.slug,
                     f"❌ {who}: {what}" + (f" ({err})" if err else "") + ".",
-                    True,
                 )
             )
             continue
@@ -155,7 +159,6 @@ def _news(results):
                     1 if icon == "🔴" else 2,
                     r.slug,
                     f"{icon} {who}: {_phrase(down, top, lambda c: c.delta, '{subject} down {pct}')}.",
-                    True,
                 )
             )
         flag = acc_flag(r.acc.delta)
@@ -165,7 +168,6 @@ def _news(results):
                     1 if flag == "🔴" else 2,
                     r.slug,
                     f"{flag} {who}: GSM8K down {abs(r.acc.delta) * 100:.1f} points to {score(r.acc.value)}.",
-                    True,
                 )
             )
         slide = [
@@ -185,7 +187,6 @@ def _news(results):
                         f"{_phrase(slide, top, lambda c: c.delta_best, '{subject} {pct} below its best')}"
                         " (gradual decline)."
                     ),
-                    True,
                 )
             )
         up = [c for c in r.perf if perf_flag(c.delta) == "🟢"]
@@ -195,13 +196,10 @@ def _news(results):
                     4,
                     r.slug,
                     f"🟢 {who}: {_phrase(up, top, lambda c: c.delta, '{subject} up {pct}')}.",
-                    False,
                 )
             )
         if any(c.prev_failed for c in r.perf) or r.acc.prev_failed:
-            items.append(
-                (5, r.slug, f"✅ {who}: recovered from the previous failure.", False)
-            )
+            items.append((5, r.slug, f"✅ {who}: recovered from the previous failure."))
     return sorted(
         items, key=lambda item: item[0]
     )  # stable: model order within a category
@@ -209,22 +207,21 @@ def _news(results):
 
 def highlights(results, owners=None):
     """One short line per piece of news, "<flag> <model>: <what happened>",
-    then the model's owner (owners.csv): asked to take a look when something
-    is wrong, just tagged for good news. Flat models and first results are
+    then the model's owner from owners.csv. Flat models and first results are
     not news; with no news the list says so."""
     owners = owners or {}
     lines = []
-    for _, slug, line, ask in _news(results):
+    for _, slug, line in _news(results):
         owner = owners.get(slug, "").strip()
         if owner:
-            line = f"{line} {owner} please take a look." if ask else f"{line} {owner}"
+            line = f"{line} {owner}"
         lines.append(line)
     return lines or [NONE]
 
 
 def missing_owners(results, owners):
     """Models with news but no owner to tag, in report order."""
-    news = {slug for _, slug, _, _ in _news(results)}
+    news = {slug for _, slug, _ in _news(results)}
     return [
         r.name
         for r in results
@@ -235,22 +232,40 @@ def missing_owners(results, owners):
 # ------------------------------------------------------------------ tables
 
 
-def summary_row(r, date):
-    """Model, scenario, previous and current throughput (c64 tok/s per GPU,
-    each with its image date), change, GSM8K change. N/A: the run failed."""
+def signed(delta, size):
+    """A signed difference, with a decimal when the values are under 100."""
+    text = f"{delta:+,.1f}" if abs(size) < 100 else f"{delta:+,.0f}"
+    return text.replace("-", "−")
+
+
+def previous_column(results):
+    """The previous session's date: what the summary's previous column is
+    headed with."""
+    return max(
+        (headline(r).prev_date for r in results if headline(r).prev_date), default=None
+    )
+
+
+def summary_row(r, date, ref):
+    """Model, scenario, previous and current c64 tok/s per GPU (dated only
+    when the previous one is not from the `ref` session the column is headed
+    with), delta, GSM8K delta. N/A: the run failed."""
     c, a = headline(r), r.acc
-    prev = f"{num(c.prev)} ({c.prev_date})" if c.prev is not None else "—"
+    prev = (
+        "—"
+        if c.prev is None
+        else num(c.prev) + (f" ({c.prev_date})" if c.prev_date != ref else "")
+    )
     if c.status == "fail":
-        now, change = f"N/A ({date})", "N/A"
+        now, delta = "N/A", "N/A"
     elif c.value is None:
-        now, change = "—", "—"
+        now, delta = "—", "—"
     else:
-        now = f"{num(c.value)} ({date})"
-        change = (
-            "first"
-            if c.delta is None
-            else f"{perf_flag(c.delta)} {pct(c.delta)}".strip()
-        )
+        now = num(c.value)
+        if c.delta is None:
+            delta = "first"
+        else:
+            delta = f"{perf_flag(c.delta)} {signed(shown(c.value) - shown(c.prev), c.value)} ({pct(c.delta)})".strip()
     if a.status == "fail":
         acc = "N/A"
     elif a.value is None:
@@ -259,7 +274,9 @@ def summary_row(r, date):
         acc = f"first (now {score(a.value)})"
     else:
         acc = f"{acc_flag(a.delta)} {pts(a.delta)} (now {score(a.value)})".strip()
-    return [r.name, LABEL[r.scenario], prev, now, change, acc]
+        if a.prev_date and a.prev_date != ref:
+            acc += f" (vs {a.prev_date})"
+    return [r.name, LABEL[r.scenario], prev, now, delta, acc]
 
 
 def _perf_value(c):
@@ -311,6 +328,7 @@ def _labels(results):
 
 
 def summary_md(date, env, results, detail_name, mock=False, owners=None):
+    ref = previous_column(results)
     out = [
         f"# 455-CI report · {date} · {' + '.join(_labels(results))}"
         + (" · EXAMPLE" if mock else ""),
@@ -327,10 +345,10 @@ def summary_md(date, env, results, detail_name, mock=False, owners=None):
         "",
         "## Summary",
         "",
-        "| Model | Scenario | Previous (tok/s/GPU) | Current (tok/s/GPU) | Change | GSM8K change |",
+        f"| Model | Scenario | {ref or '—'} (tok/s/GPU) | {date} (tok/s/GPU) | Delta | GSM8K delta |",
         "|---|---|---|---|---|---|",
     ]
-    out += ["| " + " | ".join(summary_row(r, date)) + " |" for r in results]
+    out += ["| " + " | ".join(summary_row(r, date, ref)) + " |" for r in results]
     return "\n".join(out) + "\n"
 
 
