@@ -24,11 +24,11 @@ def _mxfp4_kv_refusal(config) -> str | None:
         # that was never told this byte format, and its namespace keys no FP4.
         return "it does not run with KV offload or --kv-transfer-config"
     spec = config.speculative_config
-    if spec is not None and spec.kv_cache_dtype == "fp4":
+    if spec is not None and spec.draft_kv_dtype == "fp4":
         # `resolve_draft_kv_dtype` leaves "fp4" only on a draft in the target's
         # pool (MTP; an MHA EAGLE3 or DSpark draft has its own pool): one with no
         # MXFP4 attention impl to write its rows. A draft with its own pool is
-        # fp8 / bf16 and passes.
+        # bf16 and passes.
         return "the speculative draft would have FP4 KV, which it has no layout for"
 
     text = getattr(config.hf_config, "text_config", None) or config.hf_config

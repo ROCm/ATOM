@@ -71,7 +71,7 @@ def draft_kv_builder(model_runner, draft_hf):
         draft_hf,
         world_size=model_runner.world_size,
         # settled once, by `Config`
-        kv_dtype=dtypes.d_dtypes[model_runner.config.speculative_config.kv_cache_dtype],
+        kv_dtype=dtypes.d_dtypes[model_runner.config.speculative_config.draft_kv_dtype],
     )
     # A way to build it, not the pool: how many rows it has is the walk's to
     # say, and this runs from the proposer's `__init__` -- `build_drafter`

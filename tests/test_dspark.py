@@ -2662,7 +2662,7 @@ def test_minimax_m31_dspark_refuses_tp_below_its_kv_heads(monkeypatch, tp):
 
 def test_standalone_draft_is_built_with_its_own_kv_dtype_target_untouched(monkeypatch):
     """The draft model reads its KV dtype off the config it is constructed
-    with, so the shallow copy carries the draft's (fp8 under a target fp4) and
+    with, so the shallow copy carries the draft's (bf16 under a target fp4) and
     the target's config keeps its own."""
     from atom.config import CompilationConfig
     from atom.spec_decode import draft_kv
@@ -2674,7 +2674,7 @@ def test_standalone_draft_is_built_with_its_own_kv_dtype_target_untouched(monkey
     p = DSparkProposer.__new__(DSparkProposer)
     spec = types.SimpleNamespace(
         draft_model_hf_config=types.SimpleNamespace(),
-        kv_cache_dtype="fp8",  # as `Config` resolved it, under an fp4 target
+        draft_kv_dtype="bf16",  # as `Config` resolved it, under an fp4 target
         use_dspark_with_draft=lambda: True,
     )
     p.speculative_config = spec
@@ -2691,7 +2691,7 @@ def test_standalone_draft_is_built_with_its_own_kv_dtype_target_untouched(monkey
 
     p._build_draft_model(model_class)
 
-    assert seen == {"dtype": "fp8"}
+    assert seen == {"dtype": "bf16"}
     assert p.config.kv_cache_dtype == "fp4"
 
 
@@ -2701,7 +2701,7 @@ def test_dtype_q_follows_the_drafts_dtype_not_the_targets():
     p = DSparkProposer.__new__(DSparkProposer)
     p.config = types.SimpleNamespace(kv_cache_dtype="fp4")
     p.dtype = torch.bfloat16
-    p.speculative_config = types.SimpleNamespace(kv_cache_dtype="bf16")
+    p.speculative_config = types.SimpleNamespace(draft_kv_dtype="bf16")
     p._bound_draft_k_cache = lambda fc: None
 
     assert p._resolve_dtype_q(None) == (torch.bfloat16, False)

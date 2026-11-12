@@ -1380,10 +1380,10 @@ class SpeculativeConfig:
     # probability that the first i+1 draft tokens are all accepted), filled in by
     # __post_init__. None => real draft/target rejection sampling.
     synthetic_acceptance_rates: list[float] | None = None
-    # The draft's KV dtype (--spec-decode-kv-cache-dtype). As given: None = not
-    # asked, "bf16" / "fp8". `resolve_draft_kv_dtype` (from `Config`, once
-    # the target is known) replaces it with the dtype the draft will use.
-    kv_cache_dtype: str | None = None
+    # The draft's KV dtype: None until `Config` settles it (`resolve_draft_kv_dtype`,
+    # once the target's dtype is known); every reader (the draft's pool, its
+    # attention, the calibration identity, the compile hash) reads this one.
+    draft_kv_dtype: str | None = field(default=None, init=False)
 
     # model_type → mtp_model_type mapping
     _MTP_TYPE_MAP: ClassVar[dict[str, str]] = {
@@ -1955,21 +1955,11 @@ def _check_fp4_kv(kv_cache_dtype: str, *, is_m3: bool, is_v41: bool) -> None:
         )
 
 
-def resolve_draft_kv_dtype(spec, target_dtype: str, *, own_pool: bool) -> str:
-    """The KV dtype of a speculative draft's pages: the target's, unless the draft has
-    a pool of its own (``own_pool``) and asked for bf16 or fp8 through
-    ``--spec-decode-kv-cache-dtype``; bf16 under an fp4 target, which has no draft
-    layout. A draft in the target's pool cannot ask for another dtype."""
-    asked = spec.kv_cache_dtype
-    if not own_pool:
-        if asked is not None and asked != target_dtype:
-            raise ValueError(
-                f"--spec-decode-kv-cache-dtype {asked} differs from "
-                f"--kv-cache-dtype {target_dtype}, but this draft caches in the "
-                "target's KV pool and cannot have its own dtype"
-            )
-        return target_dtype
-    return asked or ("bf16" if target_dtype == "fp4" else target_dtype)
+def resolve_draft_kv_dtype(target_dtype: str, *, own_pool: bool) -> str:
+    """The KV dtype of a speculative draft's pages: the target's, except bf16 for a
+    draft with a pool of its own (``own_pool``) under an fp4 target, which has no
+    draft layout. A draft in the target's pool has the target's dtype."""
+    return "bf16" if own_pool and target_dtype == "fp4" else target_dtype
 
 
 def indexer_cp_unsupported_reason(
@@ -2989,36 +2979,14 @@ class Config:
             spec = self.speculative_config
             # The one place the draft's pool and dtype are settled: everything
             # downstream (the draft builder, the proposer, the calibration identity)
-            # reads `spec.kv_cache_dtype`.
-            spec.kv_cache_dtype = resolve_draft_kv_dtype(
-                spec, self.kv_cache_dtype, own_pool=draft_owns_kv_pool(self)
+            # reads `spec.draft_kv_dtype`.
+            spec.draft_kv_dtype = resolve_draft_kv_dtype(
+                self.kv_cache_dtype, own_pool=draft_owns_kv_pool(self)
             )
         if is_m3:
             from atom.models.minimax_m3.config import validate_runtime_config
 
             validate_runtime_config(self)
-        if (
-            self.speculative_config is not None
-            and self.speculative_config.kv_cache_dtype != self.kv_cache_dtype
-            and self.kv_transfer_config
-        ):
-            # The offload namespace keys the target's KV dtype alone, so a
-            # draft page of another dtype would share a key with the target's.
-            # After the model's own refusal above: an fp4 target is refused there
-            # for the offload itself, and no draft dtype can match it.
-            raise ValueError(
-                f"draft KV dtype {self.speculative_config.kv_cache_dtype} differs "
-                f"from the target's {self.kv_cache_dtype}: not supported with KV "
-                "offload or --kv-transfer-config. Pass "
-                f"--spec-decode-kv-cache-dtype {self.kv_cache_dtype} to match the "
-                "target"
-                + (
-                    ""
-                    if self.kv_cache_dtype != "fp4"
-                    else " (an fp4 target has no draft layout: use a bf16 or fp8 "
-                    "target)"
-                )
-            )
 
         if self.hf_config.model_type == "deepseek_v41_text":
             # CSA2's index plane is paged by the same scorer GLM's is, so a
@@ -3454,7 +3422,7 @@ class Config:
             else (
                 spec.method,
                 spec.num_speculative_tokens,
-                spec.kv_cache_dtype,
+                spec.draft_kv_dtype,
             )
         )
 

@@ -313,19 +313,18 @@ def test_a_plugin_config_without_native_draft_fields_answers_no(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "target, asked, pool_dtype",
+    "target, pool_dtype",
     [
-        ("fp8", "bf16", "bf16"),  # the inverse overrides mismatch too
-        ("bf16", "fp8", "fp8"),
-        ("fp4", None, "bf16"),  # an fp4 target has no draft layout
-        ("fp8", None, "fp8"),
+        ("fp4", "bf16"),  # an fp4 target has no draft layout
+        ("fp8", "fp8"),
+        ("bf16", "bf16"),
     ],
 )
 def test_an_eagle3_draft_attention_is_built_at_the_dtype_of_its_pool(
-    target, asked, pool_dtype
+    target, pool_dtype
 ):
     """The draft's attention reads its cache dtype off the config it is built
-    with, and its pool is built at `speculative_config.kv_cache_dtype` (what
+    with, and its pool is built at `speculative_config.draft_kv_dtype` (what
     `draft_kv_builder` hands `make_kv_pool`). They are one value; the target's
     config keeps its own."""
     # eagle_proposer pulls aiter in through atom.distributed.pcp_utils
@@ -336,10 +335,9 @@ def test_an_eagle3_draft_attention_is_built_at_the_dtype_of_its_pool(
     spec = SimpleNamespace(
         method="eagle3",
         draft_model_hf_config=SimpleNamespace(),
-        kv_cache_dtype=asked,
     )
-    spec.kv_cache_dtype = resolve_draft_kv_dtype(spec, target, own_pool=True)
-    assert spec.kv_cache_dtype == pool_dtype
+    spec.draft_kv_dtype = resolve_draft_kv_dtype(target, own_pool=True)
+    assert spec.draft_kv_dtype == pool_dtype
 
     p = EagleProposer.__new__(EagleProposer)
     p.speculative_config = spec

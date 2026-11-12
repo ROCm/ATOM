@@ -151,7 +151,7 @@ def test_v4_fp8_kv_is_settled_by_config_with_the_arch_aiter_serves_it_on(
     )
 
     assert config.kv_cache_dtype == kv
-    assert spec.kv_cache_dtype == kv
+    assert spec.draft_kv_dtype == kv
 
 
 def test_v4_fp8_fallback_is_not_applied_under_a_plugin(monkeypatch):

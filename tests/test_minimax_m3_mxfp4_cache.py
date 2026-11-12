@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""MiniMax-M3.1's MXFP4 KV pool, its startup refusals, and the draft's own KV dtype.
+"""MiniMax-M3.1's MXFP4 KV pool, its startup refusals, and the draft's KV dtype under an fp4 target.
 
 The pool lays one (page, kv head) of K, of V and of the index key out as one
 8704 B field -- [128 x 64 B e2m1][128 x 4 B e8m0] -- which is what the aiter
@@ -9,7 +9,7 @@ handed, and the combinations that must fail at startup and not in a forward.
 `--kv-cache-dtype fp4` takes an all-indexed-sparse model (MiniMax-M3.1) and refuses,
 with no FP8 fallback, what it has no MXFP4 path for: dense attention layers, KV
 offload, an fp16 model, an FP4 draft. A DSpark draft with a pool of its own keeps
-the target's dtype unless asked (bf16 under an fp4 target, which has no draft layout);
+the target's dtype (bf16 under an fp4 target, which has no draft layout);
 the index dtype stays its own choice.
 """
 
@@ -247,7 +247,7 @@ def test_the_fp4_kv_refuses_a_draft_resolved_to_fp4(monkeypatch):
     with pytest.raises(ValueError, match="draft would have FP4 KV"):
         check(
             monkeypatch,
-            speculative_config=SimpleNamespace(method="eagle3", kv_cache_dtype="fp4"),
+            speculative_config=SimpleNamespace(method="eagle3", draft_kv_dtype="fp4"),
         )
 
 
@@ -306,35 +306,16 @@ def test_m3_fp4_hashes_apart_from_fp8(monkeypatch):
 # ────────────────────────────────────────────── the draft's own KV dtype ──
 
 
-def draft(method="dspark", **hf):
-    """A speculative config as `Config` holds it once built: just what
-    `resolve_draft_kv_dtype` reads."""
-    return SimpleNamespace(
-        method=method,
-        kv_cache_dtype=hf.pop("asked", None),
-        draft_model_hf_config=PretrainedConfig(model_type="minimax_m3", **hf),
-    )
-
-
-@pytest.mark.parametrize("target", ["bf16", "fp8", "fp4"])
 @pytest.mark.parametrize(
-    "asked, want",
-    [(None, None), ("fp8", "fp8"), ("bf16", "bf16")],  # None: the target's, fp8 for fp4
-)
-def test_an_own_pool_draft_keeps_the_targets_dtype_unless_asked(target, asked, want):
-    default = "bf16" if target == "fp4" else target  # fp4 has no draft layout
-    assert resolve_draft_kv_dtype(draft(asked=asked), target, own_pool=True) == (
-        want or default
-    )
+    "target, want", [("bf16", "bf16"), ("fp8", "fp8"), ("fp4", "bf16")]
+)  # fp4 has no draft layout
+def test_an_own_pool_draft_has_the_targets_dtype_except_under_fp4(target, want):
+    assert resolve_draft_kv_dtype(target, own_pool=True) == want
 
 
 def test_a_shared_pool_draft_has_the_targets_dtype():
-    assert resolve_draft_kv_dtype(draft("eagle3"), "fp4", own_pool=False) == "fp4"
-    with pytest.raises(ValueError, match="caches in the target's KV pool"):
-        resolve_draft_kv_dtype(draft("eagle3", asked="bf16"), "fp8", own_pool=False)
-    assert resolve_draft_kv_dtype(draft(), "bf16", own_pool=False) == "bf16"
-    with pytest.raises(ValueError, match="target's KV pool"):
-        resolve_draft_kv_dtype(draft(asked="fp8"), "bf16", own_pool=False)
+    for target in ("bf16", "fp8", "fp4"):
+        assert resolve_draft_kv_dtype(target, own_pool=False) == target
 
 
 @pytest.fixture(autouse=True)
@@ -361,24 +342,16 @@ def _dspark_spec(**kw):
     )
 
 
-def test_fp4_target_with_a_dspark_draft_resolves_and_hashes_the_draft_dtype(
-    monkeypatch,
-):
-    hashes = {}
-    for asked in (None, "bf16", "fp8"):
-        config = _m3(
-            monkeypatch,
-            kv_cache_dtype="fp4",
-            index_cache_dtype="fp4",
-            hf=sparse_hf(),
-            speculative_config=_dspark_spec(kv_cache_dtype=asked),
-        )
-        assert config.kv_cache_dtype == "fp4"
-        # unspecified is bf16: fp4 only when asked for, fp8 only when asked for
-        assert config.speculative_config.kv_cache_dtype == (asked or "bf16")
-        hashes[asked or "bf16"] = config.compute_hash()
-    # the draft dtype keys the compile cache
-    assert hashes["fp8"] != hashes["bf16"]
+def test_fp4_target_with_a_dspark_draft_resolves_the_draft_to_bf16(monkeypatch):
+    config = _m3(
+        monkeypatch,
+        kv_cache_dtype="fp4",
+        index_cache_dtype="fp4",
+        hf=sparse_hf(),
+        speculative_config=_dspark_spec(),
+    )
+    assert config.kv_cache_dtype == "fp4"
+    assert config.speculative_config.draft_kv_dtype == "bf16"
 
 
 OFFLOAD = {"kv_connector": "lmcache_offload", "kv_role": "offload"}
@@ -395,7 +368,7 @@ def test_an_own_pool_draft_without_a_flag_keeps_the_targets_dtype(monkeypatch, t
             speculative_config=_dspark_spec(),
             **extra,
         )
-        assert config.speculative_config.kv_cache_dtype == target
+        assert config.speculative_config.draft_kv_dtype == target
 
 
 def _eagle3_spec(**kw):
@@ -411,17 +384,14 @@ def _eagle3_spec(**kw):
     )
 
 
-@pytest.mark.parametrize("asked", [None, "bf16", "fp8"])
-def test_an_mha_eagle3_draft_has_a_pool_of_its_own_and_takes_its_own_dtype(
-    monkeypatch, asked
-):
+def test_an_mha_eagle3_draft_has_a_pool_of_its_own_at_the_targets_dtype(monkeypatch):
     config = _m3(
         monkeypatch,
         kv_cache_dtype="fp8",
         index_cache_dtype="fp8",
-        speculative_config=_eagle3_spec(kv_cache_dtype=asked),
+        speculative_config=_eagle3_spec(),
     )
-    assert config.speculative_config.kv_cache_dtype == (asked or "fp8")
+    assert config.speculative_config.draft_kv_dtype == "fp8"
 
 
 def test_an_fp4_target_with_an_mha_eagle3_draft_runs_the_draft_as_bf16(monkeypatch):
@@ -434,19 +404,7 @@ def test_an_fp4_target_with_an_mha_eagle3_draft_runs_the_draft_as_bf16(monkeypat
         hf=sparse_hf(),
         speculative_config=_eagle3_spec(),
     )
-    assert config.speculative_config.kv_cache_dtype == "bf16"
-
-
-def test_an_mtp_draft_still_shares_the_targets_pool(monkeypatch):
-    spec = _eagle3_spec(kv_cache_dtype="bf16")
-    spec.method = "mtp"
-    with pytest.raises(ValueError, match="caches in the target's KV pool"):
-        _m3(
-            monkeypatch,
-            kv_cache_dtype="fp8",
-            index_cache_dtype="fp8",
-            speculative_config=spec,
-        )
+    assert config.speculative_config.draft_kv_dtype == "bf16"
 
 
 def _v41_dspark_spec():
@@ -484,40 +442,15 @@ def test_a_plugin_config_with_a_v41_dspark_draft_never_asks_for_a_backend(
             index_cache_dtype="bf16",
             speculative_config=_v41_dspark_spec(),
         )
-        assert config.speculative_config.kv_cache_dtype == "bf16"
-
-
-def test_a_draft_dtype_beside_the_targets_cannot_share_the_offload_namespace(
-    monkeypatch,
-):
-    # the offload namespace keys the target's KV dtype alone
-    with pytest.raises(
-        ValueError,
-        match="draft KV dtype fp8 differs.*--spec-decode-kv-cache-dtype bf16",
-    ):
-        _m3(
-            monkeypatch,
-            kv_cache_dtype="bf16",
-            kv_transfer_config=OFFLOAD,
-            speculative_config=_dspark_spec(kv_cache_dtype="fp8"),
-        )
-    # the remedy it names works
-    config = _m3(
-        monkeypatch,
-        kv_cache_dtype="bf16",
-        kv_transfer_config=OFFLOAD,
-        speculative_config=_dspark_spec(kv_cache_dtype="bf16"),
-    )
-    assert config.speculative_config.kv_cache_dtype == "bf16"
+        assert config.speculative_config.draft_kv_dtype == "bf16"
 
 
 def test_an_fp4_target_beside_offload_is_refused_for_that_not_for_its_draft(
     monkeypatch,
 ):
-    """The draft (bf16 under an fp4 target) can never match it, so the draft-dtype
-    refusal would send the user to a flag value that does not exist: the real reason,
-    the fp4 KV beside offload, comes first."""
-    with pytest.raises(ValueError, match="KV offload") as err:
+    """The draft (bf16 under an fp4 target) can never match it: the real reason, the
+    fp4 KV beside offload, is what the refusal names."""
+    with pytest.raises(ValueError, match="KV offload"):
         _m3(
             monkeypatch,
             kv_cache_dtype="fp4",
@@ -526,17 +459,3 @@ def test_an_fp4_target_beside_offload_is_refused_for_that_not_for_its_draft(
             kv_transfer_config=OFFLOAD,
             speculative_config=_dspark_spec(),
         )
-    assert "spec-decode-kv-cache-dtype" not in str(err.value)
-
-
-def test_a_dspark_draft_with_a_pool_of_its_own_takes_its_dtype_on_any_model(
-    monkeypatch,
-):
-    """Not an M3 matter: the backend says whether the draft has its own pool."""
-    config = _make_config(
-        monkeypatch,
-        architectures=["LlamaForCausalLM"],
-        kv_cache_dtype="fp8",
-        speculative_config=_dspark_spec(kv_cache_dtype="bf16"),
-    )
-    assert config.speculative_config.kv_cache_dtype == "bf16"

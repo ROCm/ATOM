@@ -58,7 +58,7 @@ def identity_of(tmp_path, monkeypatch, **kw):
         index_cache_dtype="fp8",
         enforce_eager=False,
         # as `Config` resolves it: the target's, unless the draft owns a pool
-        speculative_config=SimpleNamespace(kv_cache_dtype="fp8"),
+        speculative_config=SimpleNamespace(draft_kv_dtype="fp8"),
     )
     for key, value in kw.items():
         setattr(config, key, value)
@@ -78,7 +78,7 @@ def test_mxfp4_kv_does_not_share_an_fp8_identity(tmp_path, monkeypatch):
 
 def test_a_draft_dtype_beside_the_targets_changes_the_identity(tmp_path, monkeypatch):
     def with_draft(dtype):
-        spec = SimpleNamespace(kv_cache_dtype=dtype)
+        spec = SimpleNamespace(draft_kv_dtype=dtype)
         return identity_of(tmp_path, monkeypatch, speculative_config=spec)
 
     # the target's own dtype leaves it as it was, so older profiles still match

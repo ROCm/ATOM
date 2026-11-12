@@ -435,7 +435,7 @@ class DSparkProposer(Drafter):
         draft_atom_config = copy.copy(self.config)
         draft_atom_config.hf_config = draft_hf
         # Before the model is built: its attention reads this at construction.
-        draft_atom_config.kv_cache_dtype = self.speculative_config.kv_cache_dtype
+        draft_atom_config.kv_cache_dtype = self.speculative_config.draft_kv_dtype
         draft_atom_config.compilation_config = copy.copy(self.config.compilation_config)
         draft_atom_config.compilation_config.level = CompilationLevel.NO_COMPILATION
         model = model_class(
@@ -519,7 +519,7 @@ class DSparkProposer(Drafter):
 
         # d_dtypes maps the "auto" cache dtype to None, and torch.empty would
         # silently read that as float32 rather than the model dtype.
-        kv_cache_dtype = self.speculative_config.kv_cache_dtype
+        kv_cache_dtype = self.speculative_config.draft_kv_dtype
         from_config = dtypes.d_dtypes.get(kv_cache_dtype) or self.dtype
 
         bound = self._bound_draft_k_cache(forward_context)
@@ -532,9 +532,8 @@ class DSparkProposer(Drafter):
             layer_num = self.model.first_attention_layer_num
             logger.warning(
                 "DSpark draft layer_%d is bound to a %s KV cache, but the draft's "
-                "KV dtype (speculative_config.kv_cache_dtype: the target's "
-                "--kv-cache-dtype, or --spec-decode-kv-cache-dtype for a draft with "
-                "a pool of its own, resolved once by Config) is %s, implying %s. "
+                "KV dtype (speculative_config.draft_kv_dtype, resolved once by "
+                "Config from the target's --kv-cache-dtype) is %s, implying %s. "
                 "Using the bound tensor's dtype for q_out so the fused write agrees "
                 "-- but the pool the draft binds into is allocated at that same "
                 "resolved dtype, so the two should not be able to differ. Check that "
