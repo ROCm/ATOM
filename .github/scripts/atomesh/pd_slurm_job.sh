@@ -264,28 +264,26 @@ busiest_gpu_over_limit() {
 # ones, release VRAM only after a while (over 90 s after a DeepSeek-V4 TP8
 # job), so poll for ATOMESH_GPU_IDLE_WAIT_SECONDS first. A busy host is
 # recorded in RUN_DIR/gpu-busy/ for pd_submit.sh to resubmit without it.
-# With ATOMESH_KILL_GPU_HOLDERS=1, a busy host that runs no other job gets
-# its GPU holders killed once before the wait.
+# With ATOMESH_KILL_GPU_HOLDERS=1, any process with the GPUs open on a host
+# that runs no other job is killed first, however little VRAM it holds.
 assert_gpus_idle() {
   local max_used_mb="${ATOMESH_GPU_BUSY_MB:-8192}"
   local wait_s="${ATOMESH_GPU_IDLE_WAIT_SECONDS:-300}"
   local deadline=$((SECONDS + wait_s))
   local busy
-  local kill_checked=0
+  if [[ "${ATOMESH_KILL_GPU_HOLDERS:-0}" == "1" ]] \
+    && compgen -G '/sys/class/kfd/kfd/proc/[0-9]*' >/dev/null; then
+    if node_runs_only_this_job; then
+      kill_gpu_holders
+    else
+      echo "keep GPU holders: the scheduler does not show $(hostname) as this job's alone"
+    fi
+  fi
   if ! command -v amd-smi >/dev/null 2>&1; then
     command -v rocm-smi >/dev/null 2>&1 && { rocm-smi --showmemuse 2>/dev/null | head -40 || true; }
     return 0
   fi
   while busy="$(busiest_gpu_over_limit)"; do
-    if [[ "${kill_checked}" -eq 0 && "${ATOMESH_KILL_GPU_HOLDERS:-0}" == "1" ]]; then
-      kill_checked=1
-      echo "$(hostname) GPU ${busy%% *} uses ${busy##* } MB VRAM before start"
-      if node_runs_only_this_job; then
-        kill_gpu_holders
-      else
-        echo "  keep GPU holders: the scheduler does not show $(hostname) as this job's alone"
-      fi
-    fi
     if (( SECONDS >= deadline )); then
       echo "ERROR: $(hostname) GPU ${busy%% *} already uses ${busy##* } MB VRAM (limit ${max_used_mb} MB). Spur co-scheduled another job on this node; refusing to start." >&2
       amd-smi monitor -v 2>/dev/null | head -20 >&2 || true
