@@ -160,3 +160,14 @@ class TestPagedCheckpointsAreRefusedWhereSizingWouldRaise:
         interior state to slice a checkpoint out of."""
         with tp_world(TP):
             assert not Builder.state_transfer(builder()).readable_midstep
+
+    def test_the_midstep_switch_is_refused_under_pipeline_parallelism(
+        self, monkeypatch
+    ):
+        """At startup, before the aiter signature probe."""
+        monkeypatch.setenv("ATOM_K3_KDA_STATE_MIDSTEP", "1")
+        with (
+            tp_world(TP),
+            pytest.raises(RuntimeError, match="pipeline_parallel_size=2"),
+        ):
+            Builder.state_transfer(builder(pp=2))

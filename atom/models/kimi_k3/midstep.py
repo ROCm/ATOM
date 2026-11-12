@@ -60,6 +60,22 @@ def require_flash_kda_snapshots(chunk_kimi_delta_attn) -> None:
         )
 
 
+def refuse_midstep_under_pipeline(pipeline_parallel_size: int) -> None:
+    """Refuse the switch at startup under pipeline parallelism.
+
+    Kimi-K3 keeps PAGE checkpoints under PP (ROCm/ATOM#2709), so the switch is
+    read there, but its scratch-slot checkpoints have not been validated with
+    a pipeline's forwards in flight on several stages. Without the switch, PP
+    cuts prefill chunks onto the checkpoint positions.
+    """
+    if pipeline_parallel_size > 1:
+        raise RuntimeError(
+            "ATOM_K3_KDA_STATE_MIDSTEP=1 is not supported with pipeline "
+            f"parallelism (pipeline_parallel_size={pipeline_parallel_size}); "
+            "unset it to cut prefill chunks onto the checkpoint positions instead"
+        )
+
+
 def kda_midstep_transfer(layout_id: str, conv_kernel_dim: int) -> StateTransfer:
     """The PAGE transfer of a midstep-readable Kimi-K3 state, for `layout_id`.
 
