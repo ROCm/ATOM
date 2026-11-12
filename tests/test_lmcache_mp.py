@@ -2468,10 +2468,11 @@ def test_drops_reach_the_workers_without_a_transfer():
         (2, 1, True, True),
     ],
 )
+@pytest.mark.parametrize("policy", ["prefix_spread", "share_cache"])
 def test_a_chunk_configured_differently_from_the_mp_server_stops_startup(
-    monkeypatch, dp, tp, enable_dp_attention, requires_match
+    monkeypatch, dp, tp, enable_dp_attention, requires_match, policy
 ):
-    """Only `prefix_spread` reads the configured chunk (to predict loads), so
+    """Shared-prefix routing reads the configured chunk to predict loads, so
     only an active prefix router is refused when the server runs on another
     one. Ordinary DP=1 and other strategies use the server's chunk as before;
     DP-attention's TP ranks are routable engines too."""
@@ -2480,7 +2481,7 @@ def test_a_chunk_configured_differently_from_the_mp_server_stops_startup(
     config = _config(dp=dp, tp=tp, enable_dp_attention=enable_dp_attention)
     config.dp_load_balance = "least_requests"
     deployment.require_chunk_matches_server(server_512, config)
-    config.dp_load_balance = "prefix_spread"
+    config.dp_load_balance = policy
     if requires_match:
         with pytest.raises(ValueError, match="configured chunk to match the server"):
             deployment.require_chunk_matches_server(server_512, config)

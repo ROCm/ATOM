@@ -11,6 +11,7 @@ from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload.dense.connector import DenseOffloadScheduler
 from atom.kv_transfer.offload.lookup_client import LookupClient, as_lookup_client
+from atom.model_engine.dp_routing.topology import shared_prefix_routing_enabled
 
 
 def test_owned_and_unavailable_lookup_identity():
@@ -88,3 +89,28 @@ def test_shared_backend_and_alignment_are_registration_capabilities(monkeypatch)
     assert KVConnectorFactory.lowers_hbm_hit_to_chunk(name)
     monkeypatch.setitem(KVConnectorFactory._shared_tier, name, False)
     assert name not in KVConnectorFactory.shared_offload_connectors()
+
+
+@pytest.mark.parametrize("policy", ["prefix_spread", "share_cache"])
+@pytest.mark.parametrize("stage_kind", ["pipeline", "rapidserve"])
+def test_shared_prefix_topology_excludes_stages_of_one_replica(policy, stage_kind):
+    config = SimpleNamespace(
+        dp_load_balance=policy,
+        data_parallel_size=2,
+        pipeline_parallel_size=2 if stage_kind == "pipeline" else 1,
+        enable_rapidserve=stage_kind == "rapidserve",
+    )
+    assert not shared_prefix_routing_enabled(config)
+
+
+@pytest.mark.parametrize("policy", ["prefix_spread", "share_cache"])
+def test_shared_prefix_topology_reads_folded_parallel_rank_count(policy):
+    config = SimpleNamespace(
+        dp_load_balance=policy,
+        data_parallel_size=1,
+        parallel_config=SimpleNamespace(data_parallel_size=2),
+        tensor_parallel_size=1,
+        enable_dp_attention=True,
+    )
+    assert shared_prefix_routing_enabled(config)
+    assert not shared_prefix_routing_enabled(config, routable_engines=1)

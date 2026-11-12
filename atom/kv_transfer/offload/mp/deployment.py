@@ -16,7 +16,7 @@ from dataclasses import replace
 from typing import Any
 
 from atom.kv_transfer.offload import config as offcfg
-from atom.model_engine.dp_routing.topology import prefix_spread_enabled
+from atom.model_engine.dp_routing.topology import shared_prefix_routing_enabled
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -55,7 +55,7 @@ def require_chunk_matches_server(adapter: Any, config: Any) -> None:
     checked. Called by both worker registrations (PAGE-only and native-state).
     """
     policy = getattr(config, "dp_load_balance", None)
-    if not prefix_spread_enabled(config) and policy != "share_cache":
+    if not shared_prefix_routing_enabled(config):
         return
     configured = offcfg.lmcache_chunk_tokens(_storage_kv_transfer_config(config))
     server = int(adapter.lmcache_tokens_per_chunk)
