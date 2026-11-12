@@ -13,6 +13,7 @@ A compile cached without --mark-trace has no layer markers: clear
 import argparse
 import os
 import random
+from glob import glob
 
 from transformers import AutoTokenizer
 
@@ -105,7 +106,8 @@ def main():
     llm.generate([profiled], params)
     llm.stop_profile()
     llm.close()
-    print(f"Rank 0 trace: {os.path.join(args.torch_profiler_dir, 'rank_0')}")
+    rank0 = os.path.join(args.torch_profiler_dir, "rank_0", "*.pt.trace.json.gz")
+    print(f"Rank 0 trace: {max(glob(rank0), key=os.path.getmtime)}")
 
 
 if __name__ == "__main__":
