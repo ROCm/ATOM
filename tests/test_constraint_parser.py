@@ -172,3 +172,43 @@ def test_late_registered_source_mask_composes_with_channel(monkeypatch, spec, ac
         if spec:
             assert step.target.argmax(-1).tolist() == [7]
         assert not step.failed(torch.tensor([[7, -1]]) if spec else torch.tensor([7])).any()
+
+
+def test_registry_preserves_legacy_channel_override():
+    from atom.entrypoints.openai.tool_parser.tool_parser import ToolCallParser
+    from atom.entrypoints.openai.tool_parser.registry import required_call_channel
+    class LegacyParser(ToolCallParser):
+        @classmethod
+        def required_call_channel(cls, tokenizer):
+            assert tokenizer is context
+            return native
+    context, native = object(), object()
+    assert required_call_channel(LegacyParser, context) is native
+
+
+def test_tool_grammar_validation_preserves_legacy_override():
+    from atom.entrypoints.openai.tool_parser.tool_parser import ToolCallParser
+    from atom.structured_output.validation import tool_call_grammar_format
+    class LegacyParser(ToolCallParser):
+        @classmethod
+        def tool_call_grammar(cls, functions, *, required, starts_in_reasoning):
+            assert functions == [{"name": "tool", "parameters": {"type": "object"}}]
+            assert required and not starts_in_reasoning
+            return 'start: "legacy"'
+    tools = [{"type": "function", "function": {"name": "tool", "parameters": {"type": "object"}}}]
+    result = tool_call_grammar_format(LegacyParser, tools, "required", False)
+    import json
+    assert json.loads(result)["grammar"] == 'start: "legacy"'
+
+
+def test_target_only_failure_tracks_accepted_prefix():
+    from types import SimpleNamespace
+    import torch
+    from atom.model_engine.token_constraints import TokenConstraints
+    step = TokenConstraints()
+    step.logits = torch.zeros(1, 8)
+    step.invalid = None
+    step.target_invalid = torch.tensor([False, True])
+    step.metadata = SimpleNamespace(cu_num_draft_tokens=torch.tensor([2]))
+    assert step.failed(torch.tensor([[7, -1, -1]])).tolist() == [False]
+    assert step.failed(torch.tensor([[7, 3, -1]])).tolist() == [True]

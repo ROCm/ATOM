@@ -178,10 +178,13 @@ class TokenConstraints:
             self.target = torch.index_select(self.source, 0, self.metadata.target_logits_indices)
 
     def failed(self, sampled):
-        if self.invalid is None:
+        if self.invalid is None and self.target_invalid is None:
             return None
+        invalid = self.invalid
+        if invalid is None:
+            invalid = torch.zeros(self.logits.shape[0], dtype=torch.bool, device=self.logits.device)
         if self.metadata is None:
-            return self.invalid
+            return invalid
         tokens = sampled.reshape(self.logits.shape[0], -1)
         md = self.metadata
         end = md.cu_num_draft_tokens
@@ -189,7 +192,7 @@ class TokenConstraints:
         width = torch.arange(tokens.shape[1], device=tokens.device)[None, :]
         rows = start[:, None] + width
         draft = width < (end - start)[:, None]
-        bad = self.invalid[:, None].expand_as(tokens)
+        bad = invalid[:, None].expand_as(tokens)
         if self.target_invalid is not None and self.target_invalid.numel():
             target_bad = self.target_invalid[
                 rows.clamp(max=self.target_invalid.numel() - 1).long()

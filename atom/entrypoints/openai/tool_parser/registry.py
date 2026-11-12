@@ -158,7 +158,7 @@ def required_call_channel(
     """
     if parser_cls is None:
         return None
-    return parser_cls.parse(parser_cls.channel_rule(), tokenizer)
+    return parser_cls.required_call_channel(tokenizer)
 
 
 def channel_for_request(
