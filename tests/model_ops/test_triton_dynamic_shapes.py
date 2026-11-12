@@ -358,3 +358,20 @@ def test_m3_local_topk_long_rows_match_torch(blocks):
     indices = (keys & 0xFFFF) - 1
     expected = scores.topk(16, dim=-1).indices * 4
     assert torch.equal(indices, expected)
+
+
+def test_m3_local_topk_full_grid_matches_torch():
+    from atom.model_ops.minimax_m3 import indexer_candidate_exchange as m
+
+    torch.manual_seed(46)
+    tokens, local = 256, 2048
+    # Wide enough a grid to filter the narrow tile, rows across every width.
+    assert 4 * tokens >= m._LOCAL_TOPK_FULL_GRID
+    row_local = torch.randint(16, local + 1, (tokens,), device="cuda")
+    scores = torch.randperm(4 * tokens * local, device="cuda").float()
+    scores = (scores - 2 * tokens * local).reshape(4, tokens, local)
+    lengths = (row_local * 4 * 128).to(torch.int32)
+    keys = m.local_candidate_keys(scores, lengths, 16, 0, 4, 1, local * 4)
+    past = torch.arange(local, device="cuda") >= row_local[:, None]
+    expected = scores.masked_fill(past, float("-inf")).topk(16, dim=-1).indices * 4
+    assert torch.equal((keys & 0xFFFF) - 1, expected)
