@@ -122,6 +122,16 @@ class _AtomMetricsCollector:
                 "Fraction of KV-cache blocks currently allocated.",
                 snapshot.get("kv_cache_usage_ratio", 0),
             ),
+            (
+                "atom:requests_deferred_free",
+                "Finished or aborted requests kept allocated as a whole until every connector releases them. Omits early-release offload leases.",
+                snapshot.get("requests_deferred_free", 0),
+            ),
+            (
+                "atom:kv_cache_blocks_deferred_free",
+                "Physical KV blocks those requests hold, shared prefixes counted once. On P/D prefill, source KV decode has not pulled yet. Omits early-release leases.",
+                snapshot.get("kv_blocks_deferred_free", 0),
+            ),
         )
         for name, documentation, value in gauges:
             metric = GaugeMetricFamily(name, documentation)
