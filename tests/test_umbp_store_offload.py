@@ -939,6 +939,55 @@ def test_m3_registration_packs_every_page_plane(server, monkeypatch):
         worker.close()
 
 
+def test_copy_streams_take_the_highest_priority_on_the_gpu_only(monkeypatch):
+    # (least, greatest): HIP and CUDA both count priority downwards. The
+    # non-GPU suite runs against a stub torch.cuda whose Stream lacks it.
+    monkeypatch.setattr(
+        torch.cuda.Stream,
+        "priority_range",
+        staticmethod(lambda: (0, -1)),
+        raising=False,
+    )
+    assert worker_mod._copy_stream_priority(torch.device("cuda", 0)) == -1
+    assert worker_mod._copy_stream_priority(torch.device("cpu")) is None
+
+
+@pytest.mark.usefixtures("one_rank")
+def test_registration_hands_the_copy_stream_priority_to_the_gpu_connector(
+    server, monkeypatch
+):
+    seen = []
+    monkeypatch.setattr(
+        worker_mod, "_copy_stream_priority", lambda device: seen.append(device) or -7
+    )
+    worker = UMBPStoreOffloadConnector(_registering_config())
+    try:
+        worker.register_kv_caches(_kv_caches(), num_blocks=8)
+        assert seen == [torch.device(worker._codec.device)]
+        assert worker._gpu_connector._stream_priority == -7
+    finally:
+        worker.close()
+
+
+def test_the_in_place_stream_takes_the_copy_stream_priority(monkeypatch):
+    made = []
+
+    class FakeStream:
+        def __init__(self, device=None, priority=0):
+            made.append((device, priority))
+
+    monkeypatch.setattr(worker_mod.torch.cuda, "Stream", FakeStream)
+    monkeypatch.setattr(worker_mod, "_copy_stream_priority", lambda device: -3)
+    worker = UMBPStoreOffloadConnector(_config(extra=_extra()))
+    try:
+        worker._codec = SimpleNamespace(device="cuda:0")
+        first = worker._in_place_stream()
+        assert worker._in_place_stream() is first  # one per copy thread
+        assert made == [(torch.device("cuda:0"), -3)]
+    finally:
+        worker.close()
+
+
 # --- the scheduler -----------------------------------------------------------
 
 

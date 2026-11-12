@@ -111,6 +111,23 @@ def _staging_buffer_bound() -> int:
     return _DEFAULT_GPU_STAGING_BYTES if bound is None else int(bound)
 
 
+def _copy_stream_priority(device: torch.device) -> int | None:
+    """The priority of this worker's pack, copy and in-place streams.
+
+    The highest the device offers. A GPU has few hardware queues and the
+    runtime spreads streams over them by priority; a copy stream of the
+    default priority may land on the queue of a forward stream and then runs
+    only behind every kernel queued ahead of it there. Each window's
+    block-id upload and final sync wait for that, so during a long prefill a
+    save could take a whole forward per window and fall far behind. Streams
+    of the highest priority take queues of their own, still ordered after the
+    forward that wrote the KV by the producer event. None off the GPU.
+    """
+    if device.type != "cuda":
+        return None
+    return int(torch.cuda.Stream.priority_range()[1])
+
+
 def _tp_group():
     from aiter.dist.parallel_state import get_tp_group
 
@@ -247,6 +264,7 @@ class UMBPStoreOffloadConnector(DenseOffloadConnector):
             virtual_block_size=self.virtual_block_size,
             source_safe_callback=self._source_group_safe,
             max_staging_bytes=_staging_buffer_bound(),
+            stream_priority=_copy_stream_priority(torch.device(device)),
         )
         client = pool = None
         try:
@@ -865,7 +883,10 @@ class UMBPStoreOffloadConnector(DenseOffloadConnector):
         """This copy thread's stream for in-place packs and unpacks."""
         stream = getattr(self._in_place_tls, "stream", None)
         if stream is None:
-            stream = torch.cuda.Stream(device=self._codec.device)
+            device = torch.device(self._codec.device)
+            stream = torch.cuda.Stream(
+                device=device, priority=_copy_stream_priority(device) or 0
+            )
             self._in_place_tls.stream = stream
         return stream
 
