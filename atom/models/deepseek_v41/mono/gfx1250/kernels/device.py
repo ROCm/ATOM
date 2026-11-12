@@ -11,6 +11,7 @@ All functions are traced inside a @flyc.kernel body.
 from __future__ import annotations
 
 import re as _re
+from flydsl.expr import gpu, range_constexpr
 
 import flydsl.expr as fx
 from flydsl._mlir import ir
@@ -77,7 +78,9 @@ def gload(addr, kind=fx.Int32, n=1, nt=False, scope=None, align=None):
     kw = dict(alignment=align or (kind.width // 8) * n)
     if nt:
         kw["nontemporal"] = True
-    if scope:
+    if scope == "system":
+        kw["ordering"] = llvm.AtomicOrdering.monotonic
+    elif scope:
         kw["ordering"] = llvm.AtomicOrdering.monotonic
         kw["syncscope"] = scope
     return _wrap(llvm.LoadOp(ty, gptr(addr), **kw).result, kind, n)
@@ -98,7 +101,9 @@ def gstore(addr, val, nt=False, scope=None, align=None):
     kw = {"alignment": align or tbytes(v.type)}
     if nt:
         kw["nontemporal"] = True
-    if scope:
+    if scope == "system":   # (v3) relaxed system-scope atomic store (SCOPE_SYS: past every non-coherent cache level)
+        kw["ordering"] = llvm.AtomicOrdering.monotonic
+    elif scope:
         kw["ordering"] = llvm.AtomicOrdering.monotonic
         kw["syncscope"] = scope
     llvm.StoreOp(v, gptr(addr), **kw)
@@ -301,7 +306,10 @@ def unlikely(b):
 # kernel goes on with whatever it read; a timeout therefore means wrong results. TOFLAG[0] (set by the step kernel to its
 # 'cyc' scratch) counts them: int32 [0] += 1, int32 [1] = the last site id. The runner reads it after a step.
 TOFLAG = [None]
-POLL_TICKS = 200000000   # a bounded poll gives up after this many clock ticks (~2 s) and records a timeout
+POLL_TICKS = 2000000000   # (v2 study) 20 s: the first launch's rank skew (module load) must not time out a poll (a timeout desyncs the TP receive halves for every later step)
+
+
+DIAG = [None]   # (v3 diag) the stamp array: a timed-out poll's code into its CTA's slot 1
 
 
 @_ASTR.transform
@@ -310,6 +318,8 @@ def note_timeout(t0, site):
         if clock() - t0 >= fx.Int64(POLL_TICKS):
             atomic_add(TOFLAG[0], 1)
             gstore(TOFLAG[0] + fx.Int64(4), fx.Int32(site))
+            if fx.const_expr(DIAG[0] is not None):
+                gstore(DIAG[0] + fx.Int64(opaque_s(fx.block_idx.x)) * fx.Int64(256) + fx.Int64(8), fx.Int64(site) | fx.Int64(1 << 40))
 
 
 
@@ -342,3 +352,133 @@ def handoff(cnt, t, hdev, n=256, site=None):
             wait_count(cnt, n, 5 if site is None else site)
             fence_acquire("agent")
         gpu.barrier()
+
+
+# ==============================================================================================================
+I32, I64 = fx.Int32, fx.Int64
+ASTRewriter = _ASTR
+# (merged from ll.py)
+# LL (data + tag) hand-off primitives for the v2 layer (TileRT-style point-to-point dependencies, no counters).
+# 
+# An LL word is 8 bytes: a 4-byte payload and a 4-byte tag written by ONE device-scope 8-byte store, so a reader that sees
+# the tag also sees the payload (no s_wait_storecnt / counter / fence). Two formats, as TileRT's tail kernel:
+#   - 32-bit tag (bf16 x2 / f32 / i32 payloads): tag = the site's 32-bit epoch;
+#   - FP8 packs: tag = epoch24 | (e8m0 scale << 24), so the block scale arrives with its data.
+# Epoch of a site: the step epoch (`tpep`, +1 a step), the layer and a site id -> unique over a step's sites and changes every
+# step, so a stale word from an earlier step never matches and the buffers are never zeroed (a 2^32 / 2^24 wrap is far beyond
+# any run: 1024 layer-site slots a step).
+
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+
+
+LL_SCOPE = "system"   # (v3) the LL words' scope: agent-scope writers were not enough across XCDs (rare 20 s stalls; Codex saw the same on gfx950)
+SITES = 16            # site ids a layer
+LAYER_SLOTS = 64      # layers (target + draft) a step
+
+
+def epoch32(tep, layer, site):
+    """32-bit tag of (step epoch, layer, site)."""
+    return (tep * (LAYER_SLOTS * SITES) + layer * SITES + site) | I32(-2147483648)   # bit 31 set: never equals a zeroed word
+
+
+def epoch24(tep, layer, site):
+    """24-bit epoch of an FP8 pack (low 24 bits of the tag)."""
+    return (tep * (LAYER_SLOTS * SITES) + layer * SITES + site + 1) & I32(0xFFFFFF)
+
+
+def _w64(lo, hi):
+    return (I64(hi) << I64(32)) | (I64(lo) & I64(0xFFFFFFFF))
+
+
+def put(addr, payload, tag):
+    """One LL word: payload (i32 bits) + tag, a single relaxed device-scope 8-byte store."""
+    gstore(addr, _w64(payload, tag), scope=LL_SCOPE, align=8)
+
+
+def put2(addr, p0, p1, tag):
+    """Two LL words (16 B): each half self-tagged, so the halves may land in any order."""
+    put(addr, p0, tag)
+    put(addr + I64(8), p1, tag)
+
+
+def put_fp8(addr, word, scale_code, ep24):
+    """An FP8 pack word (4 fp8 values) with its block's e8m0 scale in the tag's high byte."""
+    put(addr, word, ep24 | (I32(scale_code) << 24))
+
+
+def peek(addr):
+    """(payload, tag) of one LL word, one relaxed device-scope 8-byte load."""
+    w = gload(addr, I64, scope=LL_SCOPE, align=8)
+    return I32(w), I32(w >> I64(32))
+
+
+@ASTRewriter.transform
+def get(addr, tag, site):
+    """Spin until the LL word at addr carries tag (bounded: POLL_TICKS, a timeout counted at site); returns the payload."""
+    t0 = clock()
+    p, g = peek(addr)
+    while (g != tag) & (clock() - t0 < I64(POLL_TICKS)):
+        s_sleep(1)
+        p, g = peek(addr)
+    note_timeout(t0, I32(site * 65536) + (tag & I32(0x3FF)))   # (diag) site << 16 | the tag's layer / site bits
+    return p
+
+
+@ASTRewriter.transform
+def get_fp8(addr, ep24, site):
+    """Spin until the FP8 pack at addr carries epoch ep24 (low 24 tag bits); returns (word, e8m0 scale code)."""
+    t0 = clock()
+    p, g = peek(addr)
+    while ((g & I32(0xFFFFFF)) != ep24) & (clock() - t0 < I64(POLL_TICKS)):
+        s_sleep(1)
+        p, g = peek(addr)
+    note_timeout(t0, site)
+    return p, (g >> 24) & I32(0xFF)
+
+
+@ASTRewriter.transform
+def wait_flags(base, n, tag, w, l, site):
+    """(v3) Wave 0 waits for the n LL flags base + 8 i (lane l: flags l, l + 32, ..), every lane's peeks issued together
+    and re-polled together (one round trip a poll, not one a flag); the caller's barrier follows."""
+    if w == 0:
+        K = (n + 31) // 32
+        ad = [base + I64(fx.min(l + 32 * k, I32(n - 1))) * I64(8) for k in range(K)]
+        t0 = clock()
+        pg = [peek(ad[k]) for k in range(K)]
+        bad = I32(0)
+        for k in range_constexpr(K):
+            bad = bad | (pg[k][1] != tag).select(I32(1), I32(0))
+        while (bad != 0) & (clock() - t0 < I64(POLL_TICKS)):
+            s_sleep(1)
+            pg = [peek(ad[k]) for k in range(K)]
+            bad = I32(0)
+            for k in range_constexpr(K):
+                bad = bad | (pg[k][1] != tag).select(I32(1), I32(0))
+        note_timeout(t0, I32(site * 65536) + (tag & I32(0x3FF)))
+
+
+@ASTRewriter.transform
+def wait_flags2(base_a, n_a, na_max, base_b, n_b, tag, w, l, site):
+    """(v3) wave 0 waits for flags base_a + 8 i (i < n_a, runtime, <= na_max) and base_b + 8 j (j < n_b), all peeks
+    issued together (as wait_flags); the caller's barrier follows."""
+    if w == 0:
+        KA = (na_max + 31) // 32
+        KB = (n_b + 31) // 32
+        ia = [l + 32 * k for k in range(KA)]
+        ad = [base_a + I64(fx.min(ia[k], fx.max(n_a - 1, I32(0)))) * I64(8) for k in range(KA)]
+        ok = [ia[k] < n_a for k in range(KA)]
+        ad = ad + [base_b + I64(fx.min(l + 32 * k, I32(n_b - 1))) * I64(8) for k in range(KB)]
+        ok = ok + [l >= 0 for k in range(KB)]
+        t0 = clock()
+        pg = [peek(a) for a in ad]
+        bad = I32(0)
+        for k in range_constexpr(KA + KB):
+            bad = bad | (ok[k] & (pg[k][1] != tag)).select(I32(1), I32(0))
+        while (bad != 0) & (clock() - t0 < I64(POLL_TICKS)):
+            s_sleep(1)
+            pg = [peek(a) for a in ad]
+            bad = I32(0)
+            for k in range_constexpr(KA + KB):
+                bad = bad | (ok[k] & (pg[k][1] != tag)).select(I32(1), I32(0))
+        note_timeout(t0, I32(site * 65536) + (tag & I32(0x3FF)))

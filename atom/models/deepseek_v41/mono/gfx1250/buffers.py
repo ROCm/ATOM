@@ -104,6 +104,7 @@ FPTRS_ROLE = {
     "engs": SCRATCH,
     "engkv": SCRATCH,
     "engpart": SCRATCH,
+    "mroute": SCRATCH,  # a fixed route table (build moe_ids="mroute": the fixture's Zipf routing); unused by the server
 }
 
 # fp table, after FPTRS (ATAB): the attention's
@@ -297,6 +298,7 @@ def scratch_bytes(K, nlt: int) -> dict[str, int]:
         "engs": T * 192,
         "engkv": T * 25600 * 2,
         "engpart": 768 * 16 * 4,
+        "mroute": T * FS.TOPK * 4,
         # step tail
         "xh": T * HF.HID * 2,
         "logits": T * HF.VR * 4,

@@ -33,6 +33,8 @@ from flydsl.expr import gpu, range_constexpr
 from flydsl.expr.typing import Int64
 
 from atom.models.deepseek_v41.mono.gfx1250.kernels import device as hx
+from atom.models.deepseek_v41.mono.gfx1250.kernels import stamps as _ST
+import sys
 from atom.models.deepseek_v41.mono.gfx1250.kernels import dims as D
 from atom.models.deepseek_v41.mono.gfx1250.kernels import layout as LY
 from atom.models.deepseek_v41.mono.gfx1250.kernels import front as FS
@@ -53,7 +55,7 @@ DSPARK_W = D.DSPARK_W          # the DSpark block width: a build's draft request
 TENTRY_ROW = LY.TARGET_ENTRY_ROW       # the layer-table row of the target entry's attention front (tables.StepTables: after 40 + 3 layers and the draft entry)
 
 FRONT_LDS_OFF = LY.FRONT_LDS                # keep the TP payload ([TR][20] f32 at LDS 0) intact
-FPTRS = ['R', 'y', 'pre', 'post', 'comb', 'fnh', 'fnl', 'hsc', 'hbs', 'nw', 'gate', 'gbias', 'Rout', 'xn', 'fx8', 'fxs', 'part', 'plog', 'cand', 'cands', 'npre', 'npost', 'ncomb', 'ids', 'wts', 'mout', 'mid8', 'midc', 'afnh', 'afnl', 'ahsc', 'ahbs', 'anw', 'aRout', 'axn', 'anpre', 'anpost', 'ancomb', 'tp2out', 'cyc', 'y1', 'y2', 'shplane', 'kmeta', 'knsel', 'ksel', 'kvw', 'rpos', 'iq', 'iwp', 'iq_out', 'iqs_out', 'iw_out', 'xh', 'cpart', 'ilvl', 'aux8', 'auxs', 'tpep', 'kmeta_d', 'kvw_d', 'rpos_d', 'dR', 'dy', 'dpre', 'dpost', 'dcomb', 'emb', 'noise', 'x8', 'xs', 'ctxtab', 'dgeom', 'tids', 'eng8', 'engs', 'engkv', 'engpart']   # the step's pointers, in a device table (kernel arg `fp`):
+FPTRS = ['R', 'y', 'pre', 'post', 'comb', 'fnh', 'fnl', 'hsc', 'hbs', 'nw', 'gate', 'gbias', 'Rout', 'xn', 'fx8', 'fxs', 'part', 'plog', 'cand', 'cands', 'npre', 'npost', 'ncomb', 'ids', 'wts', 'mout', 'mid8', 'midc', 'afnh', 'afnl', 'ahsc', 'ahbs', 'anw', 'aRout', 'axn', 'anpre', 'anpost', 'ancomb', 'tp2out', 'cyc', 'y1', 'y2', 'shplane', 'kmeta', 'knsel', 'ksel', 'kvw', 'rpos', 'iq', 'iwp', 'iq_out', 'iqs_out', 'iw_out', 'xh', 'cpart', 'ilvl', 'aux8', 'auxs', 'tpep', 'kmeta_d', 'kvw_d', 'rpos_d', 'dR', 'dy', 'dpre', 'dpost', 'dcomb', 'emb', 'noise', 'x8', 'xs', 'ctxtab', 'dgeom', 'tids', 'eng8', 'engs', 'engkv', 'engpart', 'mroute']   # the step's pointers, in a device table (kernel arg `fp`):
 # as ~30 more kernel args they pushed SGPRs into spills and a 64-bit VGPR spill whose ~45 scratch reloads each waited,
 # by the in-order loadcnt, for every outstanding load of the stage they sat in
 ATAB = ("x8 xs wqkv wqkv_s qnw kvnw wqb wqb_s kv sel sink rcos rsin woa woa_s wob wob_s qkv_part qkv ss qr8 qrs kvn q "
@@ -73,7 +75,8 @@ def fptr(fp, name):
     return hx.sload64(fp + i64(FPTRS.index(name) * 8))
 
 
-def tp_epoch_begin(recv, fp, rank):
+@ASTRewriter.transform
+def tp_epoch_begin(recv, fp, rank, zero=None):
     """(this step's receive bases, its epoch). Step e uses half e & 1 of every rank's receive buffer; this rank zeroes its
     own other half (the next step's) now: a peer writes there only in step e + 1, which it reaches after this rank's step-e
     pushes (issued after these stores drained at the first handoff), and every step-e word for this rank lands before this
@@ -85,18 +88,23 @@ def tp_epoch_begin(recv, fp, rank):
     b = hx.opaque_s(fx.block_idx.x)
     zv = fx.Vector.from_elements([fx.Int32(0)] * 4, fx.Int32)
     n16 = RECV_HALF // 16
-    for k in range_constexpr((n16 + CTAS * THREADS - 1) // (CTAS * THREADS)):   # (the last pass clamped: repeated zeros)
-        hx.gstore(other + i64(fx.min(b * THREADS + t + k * (CTAS * THREADS), fx.Int32(n16 - 1))) * 16, zv, nt=True)
-    hx.wait_storecnt0()
+    if zero is None:
+        zero = fx.Int32(1) != fx.Int32(0)
+    if zero:
+        for k in range_constexpr((n16 + CTAS * THREADS - 1) // (CTAS * THREADS)):   # (the last pass clamped: repeated zeros)
+            hx.gstore(other + i64(fx.min(b * THREADS + t + k * (CTAS * THREADS), fx.Int32(n16 - 1))) * 16, zv, nt=True)
+        hx.wait_storecnt0()
     return [r + half for r in recv], ep
 
 
 @ASTRewriter.transform
-def tp_epoch_end(fp, ep):
+def tp_epoch_end(fp, ep, fin=None):
     """The next step's epoch (CTA 0 thread 0, after the last handoff: every CTA read this step's at its start)."""
     t = hx.opaque_v(fx.thread_idx.x)
     b = hx.opaque_s(fx.block_idx.x)
-    if (b == 0) & (t == 0):
+    if fin is None:
+        fin = fx.Int32(1) != fx.Int32(0)
+    if (b == 0) & (t == 0) & fin:
         hx.gstore(fptr(fp, "tpep"), ep + 1)
 
 
@@ -127,7 +135,7 @@ def cwith(c, **kw):
     return c.with_(**kw) if isinstance(c, LazyC) else dict(c, **kw)
 
 
-def entry_front(fp, sm, b, row, ne, topk):
+def entry_front(fp, sm, b, row, ne, topk, last=False):
     """A segment entry's attention front (front CTAs): the block state (dR / dy / dpre / dpost / dcomb) through the
     attention front of layer-table row `row` (its a* weights) -> axn / x8 / xs / the gates; R kept in LDS (first)."""
     nof = fx.Int32(0) != fx.Int32(0)
@@ -140,7 +148,7 @@ def entry_front(fp, sm, b, row, ne, topk):
               xs=fptr(fp, "xs"), part=fptr(fp, "part"), plog=fptr(fp, "plog"), cand=fptr(fp, "cand"),
               cands=fptr(fp, "cands"), npre=fptr(fp, "anpre"), npost=fptr(fp, "anpost"), ncomb=fptr(fp, "ancomb"),
               ids=fptr(fp, "ids"), wts=fptr(fp, "wts"), isffn=nof, xs32=fx.Int32(1) != fx.Int32(0), merge=nof,
-              rk=sm + RKOFF, first=fx.Int32(1) != fx.Int32(0), last=nof, hdev=True, ne=ne, topk=topk)
+              rk=sm + RKOFF, first=fx.Int32(1) != fx.Int32(0), last=(fx.Int32(1) != fx.Int32(0)) if last else nof, hdev=True, ne=ne, topk=topk)
     FS.front_any(cu, lambda k: None)
 
 
@@ -154,10 +162,19 @@ def gpub(base, b, t):
 
 
 @ASTRewriter.transform
-def gwait(base, b, t):
-    """A front CTA (g, p = b % 16): wait for the 16 TP CTAs of its column group."""
+def gpub3(base, b, t):
+    """(fx-v3) A TP owner b < 160 (cols 32 b ..) is out: count it in its 320-col group b // 10 (10 owners a group)."""
+    hx.wait_storecnt0()
+    gpu.barrier()
+    if (t == 0) & (b < 160):
+        hx.atomic_add(base + i64(b // 10) * 4, 1)
+
+
+@ASTRewriter.transform
+def gwait(base, b, t, n=16):
+    """A front CTA (g, p = b % 16): wait for the n TP CTAs of its column group (16; fx-v3 target: 10 owners)."""
     if t == 0:
-        hx.wait_count(lambda: base + i64(b % 16) * 4, 16, 7)
+        hx.wait_count(lambda: base + i64(b % 16) * 4, n, 7)
     gpu.barrier()
 
 
@@ -193,7 +210,10 @@ def iprefetch(kb):
         llvm.inline_asm(None, [], f"s_prefetch_inst_pc_rel {off}, null, 31", "", has_side_effects=True)
 
 
-def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sources=""):
+V3_DIAG = True   # (v3 diag) timeout codes per CTA into stamp slot 1
+
+
+def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sources="", moe_ids="ids", split=False):
     """The step kernel for TR target rows (TR // 6 requests) and trd draft rows (5 a request); NL target layers (NL < 40
     and ndr 0: a bring-up / shadow build of the first layers only). part: "all" (one launch), or the step as two launches
     on one stream: "target" (entry, target layers, head, sampling, verification) then "draft" (draft context, metadata,
@@ -202,7 +222,7 @@ def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sourc
     parameter is in `keyed`, which the kernel and the launcher reference: all of them reach FlyDSL's JIT cache key (an edit to a helper
     the cache walk does not reach still rebuilds)."""
     assert part in ("all", "target", "draft")
-    keyed = (("TR", TR), ("rank", rank), ("NL", NL), ("ndr", ndr), ("trd", trd), ("part", part), ("sources", sources))
+    keyed = (("TR", TR), ("rank", rank), ("NL", NL), ("ndr", ndr), ("trd", trd), ("part", part), ("sources", sources), ("moe_ids", moe_ids), ("split", split))
     L = smem_layout(TR)
     TPG = TR * 10 // 3
     stx = hx.stx_dev
@@ -213,29 +233,31 @@ def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sourc
 
     @flyc.kernel(known_block_size=[THREADS, 1, 1])
     def body(recv0: Int64, recv1: Int64, recv2: Int64, recv3: Int64, cnt: Int64, st: Int64, scale: fx.Float32, fp: Int64,
-             tp: Int64):
+             tp: Int64, lo: fx.Int32, hi: fx.Int32):
         recv = [recv0, recv1, recv2, recv3]
         hx.TOFLAG[0] = fptr(fp, "cyc")   # (poll-timeout counter: hx.note_timeout)
-        recv, tep = tp_epoch_begin(recv, fp, rank)
+        hx.DIAG[0] = st if V3_DIAG else None
+        recv, tep = tp_epoch_begin(recv, fp, rank, (lo == fx.Int32(0)) if split else None)
         for si in range_constexpr(len(SEGS)):   # layer segments, each its own loop and body (kind 1: target, 4: draft)
             seg_lo, seg_hi, seg_kind = SEGS[si]
             DRS = (seg_kind & 4) != 0
             FIRST_LY = -1
             if fx.const_expr(si == 0 and part != "draft"):
-                # the target entry: SinglePassHCState.from_embeddings (R = 4 copies of the token's embedding, pre = (1, 0, 0, 0),
-                # y = 0, post = 0, comb = I: stage_block_state with W = 1), then layer 0's attention front (its a*: layer-table
-                # row TENTRY_ROW): x8 / xs / the attention gates, R kept in LDS (layer 0's FFN front: first = 0)
-                t = hx.opaque_v(fx.thread_idx.x)
-                b = hx.opaque_s(fx.block_idx.x)
-                sm = hx.lds_base()
-                TCNT = cnt + i64((NL + NDR) * LCB)
-                CX.stage_block_state(dict(t=t, b=b, aid=fptr(fp, "tids"), emb=fptr(fp, "emb"), noise=fptr(fp, "noise"),
-                                          R=fptr(fp, "dR"), y=fptr(fp, "dy"), pre=fptr(fp, "dpre"), post=fptr(fp, "dpost"),
-                                          comb=fptr(fp, "dcomb")), TR, 1)
-                handoff(TCNT + i64(LY.TARGET_STATE), t, False)
-                if b < FS.FRONT_CTAS:
-                    entry_front(fp, sm, b, TENTRY_ROW, FS.NE, FS.TOPK)
-                handoff(TCNT + i64(LY.TARGET_FRONT), t, False)
+                if lo == 0:   # (split: only the launch that starts the step)
+                    # the target entry: SinglePassHCState.from_embeddings (R = 4 copies of the token's embedding, pre = (1, 0, 0, 0),
+                    # y = 0, post = 0, comb = I: stage_block_state with W = 1), then layer 0's attention front (its a*: layer-table
+                    # row TENTRY_ROW): x8 / xs / the attention gates, R kept in LDS (layer 0's FFN front: first = 0)
+                    t = hx.opaque_v(fx.thread_idx.x)
+                    b = hx.opaque_s(fx.block_idx.x)
+                    sm = hx.lds_base()
+                    TCNT = cnt + i64((NL + NDR) * LCB)
+                    CX.stage_block_state(dict(t=t, b=b, aid=fptr(fp, "tids"), emb=fptr(fp, "emb"), noise=fptr(fp, "noise"),
+                                              R=fptr(fp, "dR"), y=fptr(fp, "dy"), pre=fptr(fp, "dpre"), post=fptr(fp, "dpost"),
+                                              comb=fptr(fp, "dcomb")), TR, 1)
+                    handoff(TCNT + i64(LY.TARGET_STATE), t, False)
+                    if b < FS.FRONT_CTAS:
+                        entry_front(fp, sm, b, TENTRY_ROW, FS.NE, FS.TOPK, last=True)   # (v2) R -> aRout for layer 0's column owners
+                    handoff(TCNT + i64(LY.TARGET_FRONT), t, False)
             TRx = TRD if DRS else TR
             Lx = LD if DRS else L
             DSUF = "_d" if DRS else ""
@@ -262,210 +284,14 @@ def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sourc
                                           comb=fptr(fp, "dcomb")), TRD // DSPARK_W, DSPARK_W)
                 handoff(TCNT + i64(LY.DRAFT_STATE), t, False)
                 if b < FS.FRONT_CTAS:
-                    entry_front(fp, sm, b, NL + NDR, DRAFT_NE, DRAFT_TOPK)
+                    entry_front(fp, sm, b, NL + NDR, DRAFT_NE, DRAFT_TOPK, last=True)   # (R -> aRout for the owners)
                 handoff(TCNT + i64(LY.DRAFT_FRONT), t, False)
-            for Ly in range(seg_lo, seg_hi):
-                kind = seg_kind
-                t = hx.opaque_v(fx.thread_idx.x)
-                b = hx.opaque_s(fx.block_idx.x)
-                w = t // 32
-                l = t % 32
-                sm = hx.lds_base()
-                lc = cnt + i64(Ly) * LCB
-                # the attention pointers: re-read from the table at each use (scalar loads; as kernel args they pushed SGPRs
-                # into spills), the per-layer ones from the layer row
-                lz = {k: atab(fp, k) for k in ("tpout x8 xs kv sel qkv_part qkv qr8 qrs kvn q apart aml o8 y8 ys ypart out "
-                                               "opart").split()}
-                lz.update(os=atab(fp, "os_"), ss=atab(fp, "ss", i64(Ly) * (AS.SS_LAYER_F32 * 4)),
-                          recv=(lambda: [atab(fp, f"recv{o}")() + i64(tep & 1) * RECV_HALF for o in range(4)]))
-                lz.update({k: ltab(fp, Ly, k) for k in ("wqkv wqkv_s wqb wqb_s woa woa_s wob wob_s qnw kvnw sink rcos "
-                                                        "rsin").split()})
-                c = LazyC(lz, **dict(Lx, t=t, b=b, w=w, l=l, sm=sm, scale=scale, stx=stx, rank=rank, xcpol=0))
-                c["rpos"] = fptr(fp, "rpos" + DSUF)   # each row's RoPE position (int64 [T]), the product's cache.rope_positions
-                # the key geometry: step metadata, the layer's selection owner tables and ring start (a WINDOW layer: n_sel 0 table)
-                c._th.update(kmeta=lambda: fptr(fp, "kmeta" + DSUF), knsel=lambda: fptr(fp, "knsel"), ksel=lambda: fptr(fp, "ksel"),
-                             kvw=lambda: fptr(fp, "kvw" + DSUF))
-                for k_ in ("kmeta", "knsel", "ksel", "kvw"):
-                    dict.__setitem__(c, k_, None)
-                c._th.update(ksel=ltab(fp, Ly, "ksel"), knsel=ltab(fp, Ly, "knsel"))
-                c["kring_off"] = fx.Int32(ltab(fp, Ly, "kring")())
-                stp = st + i64(b) * (32 * 8)
-
-                def stamp(k):   # the layer-time stamps only: 0 (layer 0 start), 12 (layer 1 start), 18 (a layer's end)
-                    if fx.const_expr(k not in (0, 12, 18)):
-                        return
-                    if t == 0:
-                        hx.gstore(stp + i64(k * 8), hx.clock())
-
-                if Ly == 0:
-                    stamp(0)
-                if Ly == 1:
-                    stamp(12)
-                if fx.const_expr((kind & 1) != 0):   # the row before an Engram layer (lflags bit 7): its embeddings -> MXFP8
-                    if (ltab(fp, Ly, "lflags")() & fx.Int64(128)) != fx.Int64(0):
-                        ES.stage_engq(cwith(c, engemb=ltab(fp, Ly, "engemb")(), eng8=fptr(fp, "eng8"), engs=fptr(fp, "engs")))
-                stage_A(c)
-                pf_rows(c["wqb"] + i64(b) * (16 * QL), QL, 16, QL, t)
-                pf_rows(c["wqb"] + i64(b + CTAS) * (16 * QL), QL, 16, QL, t)
-                handoff(lc, t, True)   # LY.ATTN_A (offset 0)
-                if fx.const_expr((kind & 1) != 0):   # the next layer's Engram kv = emb . wkv^T (read by this layer's attention front)
-                    if (ltab(fp, Ly, "lflags")() & fx.Int64(128)) != fx.Int64(0):
-                        ES.stage_engkv(cwith(c, eng8=fptr(fp, "eng8"), engs=fptr(fp, "engs"), engw=ltab(fp, Ly, "engw")(),
-                                             engws=ltab(fp, Ly, "engws")(), engkv=fptr(fp, "engkv")))
-                stage_kv(c)
-                stage_C(c)
-                if fx.const_expr((kind & 1) != 0):   # an indexer layer: iq / iw beside kv / C (their inputs: A's q latent and ss, the front's axn)
-                    isidx = (ltab(fp, Ly, "lflags")() & fx.Int64(8)) != fx.Int64(0)   # lflags: bit0 special body, 1 compressor, 2 ratio 1, 3 indexer, 4 ctx tap, 5 candidate producer, 6 REINDEX, 7 next layer has Engram
-                    if isidx:
-                        ci = cwith(c, iqw=ltab(fp, Ly, "iqw")(), iqws=ltab(fp, Ly, "iqws")(), iww=ltab(fp, Ly, "iww")(),
-                                   iq=fptr(fp, "iq"), iwp=fptr(fp, "iwp"), axn=fptr(fp, "axn"))
-                        IS.stage_iq(ci)
-                        IS.stage_iw(ci)
-                        lfl = ltab(fp, Ly, "lflags")()
-                        hascomp = (lfl & fx.Int64(2)) != fx.Int64(0)
-                        r1 = (lfl & fx.Int64(4)) != fx.Int64(0)
-                        if hascomp:   # the compressor's wkv_gate GEMM (compressor)
-                            CS.stage_cgemm(cwith(c, cwkv=ltab(fp, Ly, "cwkv")(), axn=fptr(fp, "axn"), cpart=fptr(fp, "cpart")), r1)
-                handoff(lc + i64(LY.KV_C), t, True)
-                if fx.const_expr((kind & 1) != 0):   # iquant, then its own handoff (the scorer reads iq_out / iw_out; lc + 4 is free)
-                    if isidx:
-                        IS.stage_iquant(cwith(c, iq=fptr(fp, "iq"), iwp=fptr(fp, "iwp"), iq_out=fptr(fp, "iq_out"),
-                                              iqs_out=fptr(fp, "iqs_out"), iw_out=fptr(fp, "iw_out")))
-                        lfl2 = ltab(fp, Ly, "lflags")()
-                        if (lfl2 & fx.Int64(2)) != fx.Int64(0):   # the compressor's rows: main KV row + index row, and the ring
-                            r1b = (lfl2 & fx.Int64(4)) != fx.Int64(0)
-                            cc = cwith(c, cpart=fptr(fp, "cpart"), cnw=ltab(fp, Ly, "cnw")(), cape=ltab(fp, Ly, "cape")(),
-                                       cwk=ltab(fp, Ly, "cwk")(), cknw=ltab(fp, Ly, "cknw")(), cplan=ltab(fp, Ly, "cplan")(),
-                                       wplan=ltab(fp, Ly, "wplan")(), ccap=fx.Int32(ltab(fp, Ly, "ccap")()), wcap=fx.Int32(ltab(fp, Ly, "wcap")()), cmain=fx.Int32(ltab(fp, Ly, "cmain")()),
-                                       crpp=fx.Int32(ltab(fp, Ly, "crpp")()), cprow=fx.Int32(ltab(fp, Ly, "cprow")()), cplane=ltab(fp, Ly, "cplane")(), ckv=ltab(fp, Ly, "ckv")(),
-                                       cscore=ltab(fp, Ly, "cscore")(), cstate=ltab(fp, Ly, "cstate")(), btab=ltab(fp, Ly, "btab")(),
-                                       bstride=fx.Int32(ltab(fp, Ly, "bstride")()), slots=ltab(fp, Ly, "slots")())
-                            CS.stage_crow(cc, r1b)
-                            CS.stage_cring(cc, r1b)
-                        handoff(lc + i64(LY.INDEX_QUANT), t, True)
-                        if ltab(fp, Ly, "ibat")() != fx.Int64(0):   # a layer whose table has no scorer inputs skips it
-                            # FULL: the scores of every visible index row, then the top-512 -> isel / irow (the attention's ksel)
-                            cs_ = cwith(c, ibat=ltab(fp, Ly, "ibat")(), ibound=ltab(fp, Ly, "ibound")(), iplane=ltab(fp, Ly, "iplane")(),
-                                        irpp=fx.Int32(ltab(fp, Ly, "irpp")()), btab=ltab(fp, Ly, "btab")(), bstride=fx.Int32(ltab(fp, Ly, "bstride")()),
-                                        ilog=ltab(fp, Ly, "ilog")(), ilw=fx.Int32(ltab(fp, Ly, "ilw")()), isel=ltab(fp, Ly, "isel")(),
-                                        irow=ltab(fp, Ly, "irow")(), cprow=fx.Int32(ltab(fp, Ly, "cprow")()), imain=fx.Int32(ltab(fp, Ly, "imain")()),
-                                        iq_out=fptr(fp, "iq_out"), iw_out=fptr(fp, "iw_out"))
-                            lfl3 = ltab(fp, Ly, "lflags")()
-                            isrx = (lfl3 & fx.Int64(64)) != fx.Int64(0)      # bit 6: REINDEX (layer 20's candidates)
-                            cs_ = cwith(cs_, ibmax=ltab(fp, Ly, "ibmax")(), icand=ltab(fp, Ly, "icand")(), lvl=fptr(fp, "ilvl"),
-                                        iprod=(lfl3 & fx.Int64(32)) != fx.Int64(0),   # bit 5: produces the candidate blocks (layer 20)
-                                        ts=None)
-                            # one instance of the scorer (FULL and REINDEX, isrx traced) and of the selection code for every pass (I-cache)
-                            SC.stage_score_any(cs_, isrx)
-                            handoff(lc + i64(LY.SCORE), t, True)
-                            npass = isrx.select(fx.Int32(IDX_LEVELS), cs_["iprod"].select(fx.Int32(2 * IDX_LEVELS), fx.Int32(IDX_LEVELS)))
-                            for pi in range(npass):   # sel or rx levels, then (layer 20) the blk levels
-                                pmode = isrx.select(fx.Int32(TK.MODE_RX), (pi < IDX_LEVELS).select(fx.Int32(TK.MODE_SEL), fx.Int32(TK.MODE_BLK)))
-                                plev = pi % IDX_LEVELS
-                                TK.stage_select_any(cwith(cs_, ts=None), plev, IDX_LEVELS, pmode)
-                                handoff(lc + i64(LY.SELECT0) + i64(pi) * 4, t, True)
-                stage_D(c)
-                pf_rows(c["woa"] + i64(b // 4) * (32 * KWOA) + i64((b % 4) * 1024), KWOA, 32, 1024, t)
-                handoff(lc + i64(LY.ATTN_D), t, True)
-                stage_E(c)
-                pf_rows(c["wob"] + i64(b // 4) * (80 * NWOA) + i64((b % 4) * 512), NWOA, 80, 512, t)
-                # E -> F: wo_b CTA (cg, kq = b % 4) reads y8 cols 512 kq .. 512 kq + 511 only, written by the 64 wo_a CTAs
-                # 64 kq .. 64 kq + 63: each wo_a CTA counts into its quarter, each wo_b CTA waits for its quarter
-                hx.wait_storecnt0()
-                gpu.barrier()
-                if t == 0:
-                    hx.atomic_add(lc + i64(LY.WOA_QUARTERS) + i64(b // 64) * 4, 1)
-                    hx.wait_count(lc + i64(LY.WOA_QUARTERS) + i64(b % 4) * 4, 64, 8)
-                gpu.barrier()
-                stage_F_cluster(c)
-                gpu.barrier()
-                par = Ly % 2
-                tp_allreduce(cwith(c, ytgt=fptr(fp, 'y1')), par * 2, 2 * Ly + 1)
-                gpub(lc + i64(LY.TP1_GROUPS), b, t)
-                # the two fronts with one copy of the code: pass 0 = FFN front, MoE, TP2; pass 1 = attention front
-                for hf in range(hx.opaque_s(fx.Int32(2))):
-                    if hf == 0:
-                        iprefetch(28)   # the front (the attention-front pass reuses it warm)
-                    # a front CTA (g, p) reads y (TP1 / TP2's output) only in its cols 320p.. -- the 16 TP CTAs 16p..16p+15:
-                    # it waits for their column-group count, not a device-wide handoff (the idle CTAs do not wait at all)
-                    if b < FS.FRONT_CTAS:
-                        gwait(lc + (hf == 0).select(i64(LY.TP1_GROUPS), i64(LY.TP2_GROUPS)), b, t)
-                    if b < FS.FRONT_CTAS:
-                        isf = hf == 0
-
-                        def fsel(n0, n1):
-                            ix = isf.select(fx.Int32(FPTRS.index(n0) * 8), fx.Int32(FPTRS.index(n1) * 8))
-                            return hx.sload64(fp + i64(ix))
-                        tq = hx.opaque_v(fx.thread_idx.x)
-                        cu = dict(t=tq, b=b, w=tq // 32, l=tq % 32, sm=sm + FRONT_LDS_OFF, rms_eps=D.RMS_EPS, hc_eps=1e-6, norm_eps=D.RMS_EPS,
-                                  R=fsel("R", "Rout"), y=fsel("y1", "y2"), pre=fsel("pre", "npre"), post=fsel("post", "npost"),
-                                  comb=fsel("comb", "ncomb"), fnh=fsel("fnh", "afnh"), fnl=fsel("fnl", "afnl"),
-                                  hsc=fsel("hsc", "ahsc"), hbs=fsel("hbs", "ahbs"), nw=fsel("nw", "anw"),
-                                  gate=fptr(fp, "gate"), gbias=fptr(fp, "gbias"),
-                                  # the last layer of each segment writes the head input: target -> xh, draft -> dh
-                                  Rout=fsel("Rout", "aRout"), xn=((hf != 0) & (Ly == (NL + NDR - 1 if DRS else NL - 1))).select(ST.tptr(tp, "dh") if DRS else fptr(fp, "xh"), fsel("xn", "axn")), x8=isf.select(fptr(fp, "fx8"), c["x8"]),
-                                  xs=isf.select(fptr(fp, "fxs"), c["xs"]), part=fptr(fp, "part"), plog=fptr(fp, "plog"),
-                                  cand=fptr(fp, "cand"), cands=fptr(fp, "cands"), npre=fsel("npre", "anpre"),
-                                  npost=fsel("npost", "anpost"), ncomb=fsel("ncomb", "ancomb"), ids=fptr(fp, "ids"),
-                                  wts=fptr(fp, "wts"), isffn=isf, xs32=hf != 0, merge=isf, hdev=True, ne=RNE, topk=RTOPK)
-                        cu.update(fnh=lsel(fp, Ly, isf, "fnh", "afnh"), fnl=lsel(fp, Ly, isf, "fnl", "afnl"),
-                                  hsc=lsel(fp, Ly, isf, "hsc", "ahsc"), hbs=lsel(fp, Ly, isf, "hbs", "ahbs"),
-                                  nw=lsel(fp, Ly, isf, "nw", "anw"), gate=ltab(fp, Ly, "gate")(), gbias=ltab(fp, Ly, "gbias")())
-                        # the residual streams kept in LDS between the fronts; also to global (last) after the last layer and
-                        # for the tap layers' inputs (the attention fronts of layers TAP0..TAP0+2)
-                        tap0 = NL - 4
-                        cu.update(rk=sm + RKOFF, first=isf & (Ly == FIRST_LY), last=(hf != 0) & ((Ly == NL - 1) | ((Ly >= tap0) & (Ly <= tap0 + 2))))
-                        # the attention front before an Engram layer gates its value in (lflags bit 7; target body only)
-                        if fx.const_expr((kind & 1) != 0):
-                            cu.update(eng=(hf != 0) & ((ltab(fp, Ly, "lflags")() & fx.Int64(128)) != fx.Int64(0)),
-                                      engkv=fptr(fp, "engkv"), enggw=ltab(fp, Ly, "enggw")(), engpart=fptr(fp, "engpart"), TR=TRx)
-                        def x8pub(k):   # the FFN front's x8 / xs are out (front_C): count it (the early shared UG waits on it)
-                            if fx.const_expr(k == 5 and MS.sh_early((TRx + MS.MAXTOK - 1) // MS.MAXTOK)):
-                                if isf:
-                                    hx.wait_storecnt0()
-                                    gpu.barrier()
-                                    if tq == 0:
-                                        hx.atomic_add(lc + i64(LY.X8_PUB), 1)
-                        FS.front_any(cu, x8pub)
-                    if fx.const_expr(MS.sh_early((TRx + MS.MAXTOK - 1) // MS.MAXTOK)):
-                        # the FFN front's idle CTAs: the shared expert's UG, K split over SHE_CTAS CTAs a unit, once every front
-                        # CTA's x8 is out (the front leaves most CTAs idle)
-                        if (hf == 0) & (b >= FS.FRONT_CTAS) & (b < FS.FRONT_CTAS + ((TRx + MS.MAXTOK - 1) // MS.MAXTOK) * MS.NUG * MS.SHE_CTAS):
-                            tq3 = hx.opaque_v(fx.thread_idx.x)
-                            if tq3 == 0:
-                                hx.wait_count(lambda: lc + i64(LY.X8_PUB), FS.FRONT_CTAS, 6)
-                            gpu.barrier()
-                            ce = dict(t=tq3, b=b, w=tq3 // 32, l=tq3 % 32, sm=sm + FRONT_LDS_OFF, NP=TRx * RTOPK, topk=RTOPK,
-                                      x8=fptr(fp, "fx8"), xs=fptr(fp, "fxs"), shplane=ltab(fp, Ly, "shplane")(),
-                                      mid8=fptr(fp, "mid8"), midc=fptr(fp, "midc"), out=fptr(fp, "mout"))
-                            MS.ug_shared_early(ce, b - FS.FRONT_CTAS)
-                    if hf == 0:
-                        iprefetch(16)   # the routed MoE
-                        handoff(lc + i64(LY.FRONT), t, True)
-                        mfx8, mfxs, mwts, mout, mid8, midc = [fptr(fp, k) for k in ("fx8", "fxs", "wts", "mout", "mid8", "midc")]
-                        tq2 = hx.opaque_v(fx.thread_idx.x)
-                        cm = LazyC({'shplane': (lambda Ly=Ly: ltab(fp, Ly, 'shplane')())},   # (re-read at its uses: not live across the layer)
-                                   t=tq2, b=b, w=tq2 // 32, l=tq2 % 32, sm=sm + FRONT_LDS_OFF, NP=TRx * RTOPK, topk=RTOPK, nexp_max=96,
-                                   w13=ltab(fp, Ly, "mw13")(), s13=ltab(fp, Ly, "ms13")(), w2=ltab(fp, Ly, "mw2")(), s2=ltab(fp, Ly, "ms2")(), x8=mfx8, xs=mfxs, ids=fptr(fp, 'ids'), wts=mwts, out=mout,
-                                   mid8=mid8, midc=midc, shcnt=lc + i64(LY.SHARED_DOWN))
-                        MS.moe(cm, lc + i64(LY.MOE_UG))
-                        gpu.barrier()
-                        handoff(lc + i64(LY.MOE_DONE), t, True)
-                        # TP2 payload = the MoE output rows, result -> y2 (the attention front's y)
-                        MS.moe_combine(dict(t=hx.opaque_v(fx.thread_idx.x), b=b, out=fptr(fp, "mout"), topk=RTOPK), TRx, sm)
-                        tp_allreduce(cwith(c, tpout=fptr(fp, "tp2out"), ytgt=fptr(fp, "y2")), par * 2 + 1, 2 * Ly + 2)
-                        gpub(lc + i64(LY.TP2_GROUPS), b, t)
-                        # the next layer's stage-A weights (this CTA's wqkv tile: 16 rows x its K half) -> L2 while TP2
-                        # and the attention front run: the stage starts on warm lines after the layer's last handoff
-                        if (b < 224) & (Ly + 1 < seg_hi):
-                            pf_rows(ltab(fp, Ly + 1, "wqkv")() + i64((b // 2) * 16) * D.HID + i64((b % 2) * 2560), D.HID, 16, 2560, t)
-                handoff(lc + i64(LY.LAYER_END), t, True)
-                if fx.const_expr((kind & 1) != 0):   # the target body: the draft context taps (read before the next front rewrites aRout)
-                    if (ltab(fp, Ly, "lflags")() & fx.Int64(16)) != fx.Int64(0):
-                        tap0 = NL - 4
-                        CX.stage_tap1(dict(t=hx.opaque_v(fx.thread_idx.x), b=b, aux8=fptr(fp, "aux8"), auxs=fptr(fp, "auxs")),
-                                      TRx, Ly - tap0, fptr(fp, "aRout"))
-                stamp(18)
+            for Ly in range((lo if split and not DRS else seg_lo), (hi if split and not DRS else seg_hi)):
+                # (fx-v3) every layer, target and draft: the contract-v3 body (layer_v3); the draft segment with its
+                # shape (TRD rows, 128 experts top-3, the draft metadata) and its head input dh
+                target_layer(dict(S=sys.modules[__name__], fp=fp, cnt=cnt, st=st, scale=scale, tep=tep, rank=rank,
+                                     TR=TRD if DRS else TR, NL=NL, L0=seg_lo, LEND=seg_hi, DRS=DRS,
+                                     moe_ids="ids" if DRS else moe_ids, dh=ST.tptr(tp, "dh") if DRS else None), Ly)
         if fx.const_expr(part == "target"):   # the step's first launch ends with the head, sampling and verification
             t = hx.opaque_v(fx.thread_idx.x)
             b = hx.opaque_s(fx.block_idx.x)
@@ -481,17 +307,368 @@ def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sourc
             if t == 0:
                 hx.gstore(st + i64(b) * (32 * 8) + i64(26 * 8), hx.clock())
             ST.draft(tp, t, b, sm, st, cnt + i64((NL + NDR) * LCB), recv, rank, head_d=4)
-        tp_epoch_end(fp, tep)
+        tp_epoch_end(fp, tep, (hi == fx.Int32(NL)) if split else None)
         hx.TOFLAG[0] = None   # (the counter pointer belongs to this kernel's trace only)
+        hx.DIAG[0] = None
         _ = keyed
 
     @flyc.jit
     def launch(recv0: Int64, recv1: Int64, recv2: Int64, recv3: Int64, cnt: Int64, st: Int64, scale: fx.Float32, fp: Int64,
-               tp: Int64, stream: fx.Stream = fx.Stream(None)):
+               tp: Int64, lo: fx.Int32, hi: fx.Int32, stream: fx.Stream = fx.Stream(None)):
         """recv0..3: the 4 ranks' receive buffers; cnt: the step's zeroed handoff counters; st: stamps; scale: the
         attention softmax scale; fp: the pointer table (FPTRS, ATAB, layer rows); tp: the step tail's table."""
         _ = keyed
-        body(recv0, recv1, recv2, recv3, cnt, st, scale, fp, tp).launch(
+        body(recv0, recv1, recv2, recv3, cnt, st, scale, fp, tp, lo, hi).launch(
             grid=(CTAS,), block=(THREADS,), smem=max(L["LDS"], ST.HEAD_LDS if ndr else 0, FRONT_LDS_OFF + max(FS.FRONT_LDS, MS.MOE_LDS), RKOFF + FS.RK_BYTES), cluster=(CL, 1, 1), stream=stream)
 
     return launch, dict(L, TPG=TPG)
+
+
+# ==============================================================================================================
+# (merged from layer_v3.py)
+# (fx-v3) The target layer body, contract v3 (design 6.3 / 6.7), one path, no switches.
+# 
+# The draft segment keeps the old body (step.py); every target layer (0 .. NL - 1) is this function. The special target
+# layers (indexer, compressor, Engram, tap layers, the last layer) are runtime-gated sub-stages of the same chain.
+# 
+# Chain of one layer Ly (every data edge an LL tile flag unless named a handoff):
+#   A      (newA: x from the TP2 owners' apflags) wqkv -> q latent / kv latent        [indexer / Engram-next: + ATTN_A]
+#   kv, C  on A2 flags -> kv rows / q -> o-ready flags (kvflag, cflag)               [indexer / Engram-next: + KV_C]
+#   (idx)  iq / iw / compressor / iquant / scorer / selection (handoffs: indexer layers only)
+#   D      attention, on cflag / kvflag -> dflag;   D-idle CTAs: the attention mix partials + Sinkhorn of this layer
+#   E3     wo_a by (out tile, head), weights before the wait on dflag -> wflag;  E3F head fold -> eflag
+#   F3     wo_b (160 owners x 32 cols, full K), weights before the wait on eflag;  TP3 (TP1) -> y1
+#   post   FFN mHC post in the 160 owners -> pflag (x1, R')       mix partials -> MIX_POST / L1 / Sinkhorn (idle CTAs)
+#   router 128 CTAs (gate rows before the wait on pflag) -> LL scores;  shared UG (x8 self, on pflag)
+#   top-k  every CTA (own copy, LDS);  MoE UG -> down (LL per expert) -> combine (DN_BLK) -> TP3 (TP2) -> y2
+#   post   attention mHC post of layer Ly + 1 in the 160 owners -> apflag (next layer's A)   [last: xh]
+#   end    LAYER_END handoff only after the last layer and the tap layers
+
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# ruff: noqa
+# fmt: off
+
+
+# plog regions (bytes from plog)
+V3F0 = 917504            # the v3 LL flags: + site offset + (Ly % 2) * 4096
+P2A, X1A, P3A = 524288, 786432, 851968   # attention side: mix partials, x1, level-1 sums
+P2F, X1F, P3F = 65536, 327680, 458752    # FFN side
+UGF = 40960              # MoE UG -> down flags
+ENGP = 1081344           # Engram gate partials
+DNF = 999424             # the MoE's LL flags (UG groups -> down, shared UG -> down): [parity] x 40 KB
+# the v3 flag sites: (plog offset from V3F0, epoch32 site)
+F_D, F_E, F_A2, F_C, F_KV, F_P, F_X, F_AP, F_W, F_ENG = ((0, 4), (8192, 5), (16384, 6), (24576, 7), (32768, 8),
+                                                         (40960, 9), (49152, 10), (57344, 11), (65536, 12), (73728, 13))
+# layer counters (bytes from the layer's counter base)
+ATT_POST, AMIX_POST, AMIX_L1, ASINK = 440, 444, 448, 452
+
+
+@ASTRewriter.transform
+def _stamp(stp, t, k):
+    if t == 0:
+        hx.gstore(stp + i64(k * 8), hx.clock())
+
+
+@ASTRewriter.transform
+def target_layer(E, Ly):
+    """One target layer. E: S (the step module: fptr ltab atab LazyC cwith iprefetch FRONT_LDS_OFF LCB RECV_HALF),
+    fp cnt st scale tep rank TR NL moe_ids."""
+    S = E["S"]
+    fp, cnt, st, tep, rank, TR, NL = E["fp"], E["cnt"], E["st"], E["tep"], E["rank"], E["TR"], E["NL"]
+    fptr, ltab, cwith = S.fptr, S.ltab, S.cwith
+    moe_ids = E["moe_ids"]
+    DRS = E.get("DRS", False)            # (the draft segment: TRD rows, 128 experts top-3, the draft metadata)
+    RNE, RTOPK, DSUF = D.EXPERTS, FS.TOPK, ""
+    if fx.const_expr(DRS):
+        RNE, RTOPK, DSUF = D.DRAFT_EXPERTS, D.DRAFT_TOPK, "_d"
+    L0, LEND = E.get("L0", 0), E.get("LEND", NL)   # the segment's layer range (target 0 .. NL, draft NL .. NL + NDR)
+    FLO = S.FRONT_LDS_OFF
+    IDXL = S.IDX_LEVELS
+    t = hx.opaque_v(fx.thread_idx.x)
+    b = hx.opaque_s(fx.block_idx.x)
+    w = t // 32
+    l = t % 32
+    sm = hx.lds_base()
+    lc = cnt + i64(Ly) * S.LCB
+    par = Ly % 2
+    stp = st + i64(b) * (32 * 8)
+    Lp = fx.max(Ly - 1, fx.Int32(0))
+    XHP = fptr(fp, "xh")           # the segment's head input (target: xh, draft: the draft head's dh)
+    if fx.const_expr(DRS):
+        XHP = E["dh"]
+    newA = Ly >= L0 + 1            # a segment's first layer: x from its entry front
+    lastL = Ly >= LEND - 1
+
+    def plog(off):
+        return fptr(fp, "plog") + i64(off)
+
+    def flag(site, Lf):            # (pointer, tag) of a v3 flag site for layer Lf
+        return plog(V3F0 + site[0]) + i64(Lf % 2) * 4096, hx.epoch32(tep, Lf, site[1])
+
+    def lfl(bit):                  # lflags bit test (re-read at each use: not live across the layer)
+        return (ltab(fp, Ly, "lflags")() & fx.Int64(bit)) != fx.Int64(0)
+
+    dfl, dtg = flag(F_D, Ly)
+    efl, etg = flag(F_E, Ly)
+    a2fl, a2tg = flag(F_A2, Ly)
+    cfl, ctg = flag(F_C, Ly)
+    kvfl, kvtg = flag(F_KV, Ly)
+    pfl, ptg = flag(F_P, Ly)
+    apfl, aptg = flag(F_AP, Ly)
+    apnfl, apntg = flag(F_AP, Ly + 1)
+    wfl, wtg = flag(F_W, Ly)
+    engfl, engtg = flag(F_ENG, Ly)
+    fpf = dict(pflag=pfl, ptag=ptg)                     # FFN post (owners) -> x8_self / router / shared UG
+    v3a = dict(a2flag=a2fl, a2tag=a2tg, cflag=cfl, ctag=ctg, kvflag=kvfl, kvtag=kvtg)
+    v3f = dict(dflag=dfl, dtag=dtg, eflag=efl, etag=etg)
+
+    # the attention context: pointers re-read from the tables at each use
+    lz = {k: S.atab(fp, k) for k in ("tpout x8 xs kv sel qkv_part qkv qr8 qrs kvn q apart aml o8 y8 ys ypart out "
+                                     "opart").split()}
+    lz.update(os=S.atab(fp, "os_"), ss=S.atab(fp, "ss", i64(Ly) * (AS.SS_LAYER_F32 * 4)),
+              recv=(lambda: [S.atab(fp, f"recv{o}")() + i64(tep & 1) * S.RECV_HALF for o in range(4)]))
+    lz.update({k: ltab(fp, Ly, k) for k in "wqkv wqkv_s wqb wqb_s woa woa_s wob wob_s qnw kvnw sink rcos rsin".split()})
+    Lx = smem_layout(TR)
+    c = S.LazyC(lz, **dict(Lx, t=t, b=b, w=w, l=l, sm=sm, scale=E["scale"], stx=hx.stx_dev, rank=rank, xcpol=0))
+    c["rpos"] = fptr(fp, "rpos" + DSUF)
+    c._th.update(kmeta=lambda: fptr(fp, "kmeta" + DSUF), kvw=lambda: fptr(fp, "kvw" + DSUF),
+                 ksel=ltab(fp, Ly, "ksel"), knsel=ltab(fp, Ly, "knsel"))
+    for k_ in ("kmeta", "knsel", "ksel", "kvw"):
+        dict.__setitem__(c, k_, None)
+    c["kring_off"] = fx.Int32(ltab(fp, Ly, "kring")())
+    RPC = Lx["RPC"]
+    DCT = ((TR + RPC - 1) // RPC) * CL       # the D CTAs (row x key segment)
+
+    if Ly == 0:
+        _stamp(stp, t, 0)
+    if Ly == 1:
+        _stamp(stp, t, 12)
+    if lfl(128):   # the row before an Engram layer: its embeddings -> MXFP8
+        ES.stage_engq(cwith(c, engemb=ltab(fp, Ly, "engemb")(), eng8=fptr(fp, "eng8"), engs=fptr(fp, "engs")))
+    _stamp(stp, t, 27)
+
+    # ---- A: x from the TP2 owners (apflag), wqkv -> latents (A2 flags)
+    keepA = lfl(8 | 128)   # indexer / Engram-next layers: the KV_C handoff (iq / iw partials -> iquant: index-internal, contract 6.4)
+    # (fx-v3) the attention input x8 made once: CTAs 224..255 publish it (global + 32 LL flags), A reads it from global
+    pub = dict(pubflag=plog(DNF) + i64(par) * 40960 + i64(36864), pubtag=hx.epoch32(tep, Ly, 15))
+    if newA:
+        AS.stage_Apub(cwith(c, x1a=plog(X1A), part2=plog(P2A), anw=ltab(fp, Lp, "anw")(), apflag=apfl, aptag=aptg,
+                            axn=fptr(fp, "axn"), norm_eps=D.RMS_EPS, **pub))
+    stage_A(cwith(c, newA=newA, **pub, **v3a, apflag=apfl, aptag=aptg, attpost=lc + i64(ATT_POST), part2=plog(P2A),
+                  x1a=plog(X1A), anw=ltab(fp, Lp, "anw")(), norm_eps=D.RMS_EPS, axn=fptr(fp, "axn"), stp2=stp))
+    pf_rows(c["wqb"] + i64(b) * (16 * QL), QL, 16, QL, t)
+    pf_rows(c["wqb"] + i64(b + CTAS) * (16 * QL), QL, 16, QL, t)
+    if lfl(128):   # (Engram-next layers only: the Engram kv reads every CTA's eng8; indexer layers wait on LL flags below)
+        handoff(lc, t, True)   # LY.ATTN_A
+    _stamp(stp, t, 28)
+    if lfl(128):   # the next layer's Engram kv
+        ES.stage_engkv(cwith(c, eng8=fptr(fp, "eng8"), engs=fptr(fp, "engs"), engw=ltab(fp, Ly, "engw")(),
+                             engws=ltab(fp, Ly, "engws")(), engkv=fptr(fp, "engkv")))
+
+    # ---- kv, C (on A2 flags) -> kvflag / cflag
+    stage_kv(cwith(c, **v3a))
+    stage_C(cwith(c, **v3a))
+
+    # ---- indexer layers: iq / iw / compressor GEMM, iquant / compressor rows, scorer + selection
+    isidx = lfl(8)
+    if isidx:
+        # (contract 6.4) iq reads A2's q blocks + ss (the 40 q-block flags), iw / the compressor GEMM read axn (the 32
+        # publishers' flags; layer 0: the entry front's, before the loop): LL waits, not the ATTN_A handoff
+        ll_w = hx.opaque_v(fx.thread_idx.x) // 32
+        ll_l = hx.opaque_v(fx.thread_idx.x) % 32
+        hx.wait_flags(a2fl, AS.QL // 32, a2tg, ll_w, ll_l, 8)
+        if newA:
+            hx.wait_flags(pub["pubflag"], 32, pub["pubtag"], ll_w, ll_l, 9)
+        gpu.barrier()
+        ci = cwith(c, iqw=ltab(fp, Ly, "iqw")(), iqws=ltab(fp, Ly, "iqws")(), iww=ltab(fp, Ly, "iww")(),
+                   iq=fptr(fp, "iq"), iwp=fptr(fp, "iwp"), axn=fptr(fp, "axn"))
+        IS.stage_iq(ci)
+        IS.stage_iw(ci)
+        lfl1 = ltab(fp, Ly, "lflags")()
+        hascomp = (lfl1 & fx.Int64(2)) != fx.Int64(0)
+        r1 = (lfl1 & fx.Int64(4)) != fx.Int64(0)
+        if hascomp:
+            CS.stage_cgemm(cwith(c, cwkv=ltab(fp, Ly, "cwkv")(), axn=fptr(fp, "axn"), cpart=fptr(fp, "cpart")), r1)
+    if keepA:
+        handoff(lc + i64(LY.KV_C), t, True)
+    _stamp(stp, t, 29)
+    if isidx:
+        IS.stage_iquant(cwith(c, iq=fptr(fp, "iq"), iwp=fptr(fp, "iwp"), iq_out=fptr(fp, "iq_out"),
+                              iqs_out=fptr(fp, "iqs_out"), iw_out=fptr(fp, "iw_out")))
+        lfl2 = ltab(fp, Ly, "lflags")()
+        if (lfl2 & fx.Int64(2)) != fx.Int64(0):
+            r1b = (lfl2 & fx.Int64(4)) != fx.Int64(0)
+            cc = cwith(c, cpart=fptr(fp, "cpart"), cnw=ltab(fp, Ly, "cnw")(), cape=ltab(fp, Ly, "cape")(),
+                       cwk=ltab(fp, Ly, "cwk")(), cknw=ltab(fp, Ly, "cknw")(), cplan=ltab(fp, Ly, "cplan")(),
+                       wplan=ltab(fp, Ly, "wplan")(), ccap=fx.Int32(ltab(fp, Ly, "ccap")()), wcap=fx.Int32(ltab(fp, Ly, "wcap")()),
+                       cmain=fx.Int32(ltab(fp, Ly, "cmain")()), crpp=fx.Int32(ltab(fp, Ly, "crpp")()),
+                       cprow=fx.Int32(ltab(fp, Ly, "cprow")()), cplane=ltab(fp, Ly, "cplane")(), ckv=ltab(fp, Ly, "ckv")(),
+                       cscore=ltab(fp, Ly, "cscore")(), cstate=ltab(fp, Ly, "cstate")(), btab=ltab(fp, Ly, "btab")(),
+                       bstride=fx.Int32(ltab(fp, Ly, "bstride")()), slots=ltab(fp, Ly, "slots")())
+            CS.stage_crow(cc, r1b)
+            CS.stage_cring(cc, r1b)
+        handoff(lc + i64(LY.INDEX_QUANT), t, True)
+        if ltab(fp, Ly, "ibat")() != fx.Int64(0):
+            cs_ = cwith(c, ibat=ltab(fp, Ly, "ibat")(), ibound=ltab(fp, Ly, "ibound")(), iplane=ltab(fp, Ly, "iplane")(),
+                        irpp=fx.Int32(ltab(fp, Ly, "irpp")()), btab=ltab(fp, Ly, "btab")(), bstride=fx.Int32(ltab(fp, Ly, "bstride")()),
+                        ilog=ltab(fp, Ly, "ilog")(), ilw=fx.Int32(ltab(fp, Ly, "ilw")()), isel=ltab(fp, Ly, "isel")(),
+                        irow=ltab(fp, Ly, "irow")(), cprow=fx.Int32(ltab(fp, Ly, "cprow")()), imain=fx.Int32(ltab(fp, Ly, "imain")()),
+                        iq_out=fptr(fp, "iq_out"), iw_out=fptr(fp, "iw_out"))
+            lfl3 = ltab(fp, Ly, "lflags")()
+            isrx = (lfl3 & fx.Int64(64)) != fx.Int64(0)
+            cs_ = cwith(cs_, ibmax=ltab(fp, Ly, "ibmax")(), icand=ltab(fp, Ly, "icand")(), lvl=fptr(fp, "ilvl"),
+                        iprod=(lfl3 & fx.Int64(32)) != fx.Int64(0), ts=None)
+            SC.stage_score_any(cs_, isrx)
+            handoff(lc + i64(LY.SCORE), t, True)
+            npass = isrx.select(fx.Int32(IDXL), cs_["iprod"].select(fx.Int32(2 * IDXL), fx.Int32(IDXL)))
+            for pi in range(npass):
+                pmode = isrx.select(fx.Int32(TK.MODE_RX), (pi < IDXL).select(fx.Int32(TK.MODE_SEL), fx.Int32(TK.MODE_BLK)))
+                plev = pi % IDXL
+                TK.stage_select_any(cwith(cs_, ts=None), plev, IDXL, pmode)
+                handoff(lc + i64(LY.SELECT0) + i64(pi) * 4, t, True)
+    _stamp(stp, t, 5)
+
+    # ---- D (on cflag / kvflag) -> dflag;  D-idle CTAs: this layer's attention mix partials + Sinkhorn
+    # (design 8 A/B, 11-12: TileRT's separate A2 merge CTAs +2.1 us; the merge stays in the hardware cluster)
+    stage_D(cwith(c, stp=stp, **v3f, **v3a))
+    MX0 = DCT
+    NID = CTAS - MX0
+    if newA & (b >= MX0):
+        tqa = hx.opaque_v(fx.thread_idx.x)
+        for kk in range_constexpr((FS.NOWN + NID - 1) // NID):
+            ob = (b - MX0) + kk * NID
+            if ob < FS.NOWN:
+                FS.mix_owner_g(dict(t=tqa, b=ob, fnh=ltab(fp, Lp, "afnh")(), fnl=ltab(fp, Lp, "afnl")(), Rq=fptr(fp, "aRout"),
+                                    part2=plog(P2A), cnt2=lc + i64(AMIX_POST)), TR)
+        if (b >= FS.SK0) & (b < FS.SK0 + FS.NL1):
+            FS.mix_l1(dict(t=tqa, part2=plog(P2A), part3=plog(P3A), cnt2=lc + i64(AMIX_POST), cnt3=lc + i64(AMIX_L1)), b - FS.SK0)
+            if b == FS.SK0 + FS.NL1 - 1:
+                FS.sinkhorn2(dict(t=tqa, w=tqa // 32, l=tqa % 32, sm=sm + FLO + 160000, part3=plog(P3A),
+                                  hsc=ltab(fp, Lp, "ahsc")(), hbs=ltab(fp, Lp, "ahbs")(), npre=fptr(fp, "anpre"),
+                                  npost=fptr(fp, "anpost"), ncomb=fptr(fp, "ancomb"), rms_eps=D.RMS_EPS, hc_eps=1e-6,
+                                  cnt3=lc + i64(AMIX_L1), done=lc + i64(ASINK)))
+    _stamp(stp, t, 6)
+
+    # ---- wo_a by head (dflag -> wflag), head fold (-> eflag), wo_b 160 x 32 (eflag), TP1 -> y1
+    _stamp(stp, t, 7)
+    v3e = dict(wpart=c["ypart"], wflag=wfl, wtag=wtg, NDF=DCT)
+    AS.stage_E3(cwith(c, **v3f, **v3e))
+    AS.stage_E3F(cwith(c, **v3f, **v3e))
+    _stamp(stp, t, 8)
+    AS.stage_F3(cwith(c, **v3f))
+    AS.tp3(cwith(c, ytgt=fptr(fp, "y1")), par * 2, 2 * Ly + 1)
+    hx.wait_storecnt0()
+    gpu.barrier()
+    _stamp(stp, t, 10)
+
+    # ---- FFN mHC post in the 160 owners (-> pflag); the router's gate rows issued first; mix partials
+    tq6 = hx.opaque_v(fx.thread_idx.x)
+    if b >= FS.RCTA0:   # (router_v2) the CTA's 3 experts' gate rows -> LDS while the owner post runs
+        FS.router_gate_pre(dict(t=tq6, b=b, sm=sm + FLO, gate=ltab(fp, Ly, "gate")(), ne=RNE))
+    if newA:   # pre / post / comb from this layer's attention-side Sinkhorn
+        if tq6 == 0:
+            hx.wait_count(lc + i64(ASINK), 1, 15)
+        gpu.barrier()
+    if b < FS.NOWN:
+        FS.ffn_post_owner(dict(t=tq6, b=b, w=tq6 // 32, l=tq6 % 32, sm=sm + FLO, y=fptr(fp, "y1"),
+                               R=fptr(fp, "aRout"), Rout=fptr(fp, "Rout"), x1g=plog(X1F),
+                               pre=fptr(fp, "pre"), post=fptr(fp, "post"), comb=fptr(fp, "comb"),
+                               fnh=ltab(fp, Ly, "fnh")(), fnl=ltab(fp, Ly, "fnl")(),
+                               part2=plog(P2F), cnt=lc + i64(LY.FFN_POST), cnt2=lc + i64(LY.MIX_POST), stp=stp, **fpf), TR)
+    if (b >= FS.CL) & (b < FS.RCTA0):   # (the router CTAs run their mix after the router)
+        FS.ffn_mix_owner(dict(t=tq6, b=b, sm=sm + FLO, fnh=ltab(fp, Ly, "fnh")(), fnl=ltab(fp, Ly, "fnl")(),
+                              part2=plog(P2F), cnt2=lc + i64(LY.MIX_POST)), TR)
+    # (router_v2: 128 CTAs x 3 experts x every row, the gate read once; A/B 11-12 vs TileRT's per-row router: scores 47.5 vs 51.2 us)
+    if b >= FS.RCTA0:
+        FS.router_v2(dict(t=tq6, b=b, w=tq6 // 32, l=tq6 % 32, sm=sm + FLO, gate=ltab(fp, Ly, "gate")(), xn=fptr(fp, "xn"),
+                          x8pub=lc + i64(LY.X8_PUB), x8n=FS.CL, x1g=plog(X1F), nw=ltab(fp, Ly, "nw")(),
+                          postcnt=lc + i64(LY.FFN_POST), norm_eps=D.RMS_EPS, scores=fptr(fp, "plog"),
+                          tag=hx.epoch32(tep, Ly, 1), stp=stp, gate_pre=True, ne=RNE, **fpf), TR)
+        if b < FS.NOWN:   # the router CTAs' own mix partials (R'' kept in LDS past the router's)
+            FS.ffn_mix_owner(dict(t=tq6, b=b, sm=sm + FLO, fnh=ltab(fp, Ly, "fnh")(), fnl=ltab(fp, Ly, "fnl")(),
+                                  part2=plog(P2F), cnt2=lc + i64(LY.MIX_POST)), TR)
+    S.iprefetch(28)
+    if b < FS.CL:
+        tq7 = hx.opaque_v(fx.thread_idx.x)
+        FS.ffn_mix_owner(dict(t=tq7, b=b, sm=sm + FLO, fnh=ltab(fp, Ly, "fnh")(), fnl=ltab(fp, Ly, "fnl")(),
+                              part2=plog(P2F), cnt2=lc + i64(LY.MIX_POST)), TR)
+
+    # ---- (design 7) the FFN / MoE block per row (TileRT F0 / top-k wave 0 / H / I / G / G' / J)
+    mfl = plog(DNF) + i64(par) * 40960
+    cr = dict(t=t, b=b, w=w, l=l, sm=sm + FLO, rank=rank, recv=c["recv"], mflag=mfl, mtag=hx.epoch32(tep, Ly, 14),
+              shflag0=6 * MS.TOPK * MS.NUG, ids_lds=moe_ids == "ids", ids=fptr(fp, moe_ids), ktop=RTOPK,
+              w13=ltab(fp, Ly, "mw13")(), s13=ltab(fp, Ly, "ms13")(), w2=ltab(fp, Ly, "mw2")(), s2=ltab(fp, Ly, "ms2")(),
+              shplane=ltab(fp, Ly, "shplane")(), mid8=fptr(fp, "mid8"), midc=fptr(fp, "midc"), nw=ltab(fp, Ly, "nw")(),
+              x1g=plog(X1F), part2=plog(P2F), norm_eps=D.RMS_EPS,
+              NP=TR * RTOPK, topk=RTOPK, wts=fptr(fp, "wts"), wts_lds=True, x8=fptr(fp, "fx8"), xs=fptr(fp, "fxs"),
+              xflag=plog(V3F0 + F_X[0]) + i64(par) * 4096, xtag=hx.epoch32(tep, Ly, F_X[1]), **fpf)
+    S.iprefetch(16)
+    shc, rr_, ss_ = MS.rslot(b)
+    if shc:   # the shared expert's UG (all rows), then (6 of them) the FFN mix sums + Sinkhorn
+        FS.x8_self(dict(t=t, w=w, l=l, sm=sm + FLO, x1g=plog(X1F), part2=plog(P2F), nw=ltab(fp, Ly, "nw")(),
+                        norm_eps=D.RMS_EPS, **fpf), TR)
+        MS.shared_ug(cr, b - MS.SC0, TR)
+        _stamp(stp, t, 14)
+        if (b >= MS.SC0 + 6) & (b < MS.SC0 + 6 + FS.NL1):
+            FS.mix_l1(dict(t=t, part2=plog(P2F), part3=plog(P3F), cnt2=lc + i64(LY.MIX_POST), cnt3=lc + i64(LY.MIX_L1)),
+                      b - (MS.SC0 + 6))
+            if b == MS.SC0 + 6 + FS.NL1 - 1:
+                FS.sinkhorn2(dict(t=t, w=w, l=l, sm=sm + FLO + 160000, part3=plog(P3F), hsc=ltab(fp, Ly, "hsc")(),
+                                  hbs=ltab(fp, Ly, "hbs")(), npre=fptr(fp, "npre"), npost=fptr(fp, "npost"),
+                                  ncomb=fptr(fp, "ncomb"), rms_eps=D.RMS_EPS, hc_eps=1e-6,
+                                  cnt3=lc + i64(LY.MIX_L1), done=lc + i64(LY.SINK_DONE)))
+    else:
+        crr = dict(cr, row=fx.min(rr_, fx.Int32(TR - 1)))
+        if rr_ < TR:
+            MS.f0_row(crr, rr_)
+            if ss_ == 0:   # the row's x8 to global for the union UG (one CTA a row)
+                MS.x8_pub(crr, rr_)
+            MS.shdn_prefetch(crr, ss_)
+        # every row's top-k (wave r = row r) and the expert union (each (expert, group) of the UG once, its rows as N)
+        FS.topk_v2(dict(t=t, b=b, w=w, l=l, sm=sm + FLO, scores=fptr(fp, "plog"), gbias=ltab(fp, Ly, "gbias")(),
+                        tag=hx.epoch32(tep, Ly, 1), stp=stp, ne=RNE, ktop=RTOPK), TR, MS.O_PID, MS.O_WTS, moe_ids == "ids")
+        gpu.barrier()
+        _stamp(stp, t, 23)
+        MS.moe_union(crr)
+        _stamp(stp, t, 17)
+        MS.ug_union(crr, rr_ * MS.NRC + ss_, TR)
+        _stamp(stp, t, 2)
+        if rr_ < TR:
+            MS.dn_row(crr, ss_)
+            _stamp(stp, t, 3)
+            MS.push_row(crr, ss_, par * 2 + 1, 2 * Ly + 2)
+    if b < FS.NOWN:   # (J) the owner's 32 cols of y2 from the 4 ranks' row partials
+        MS.recv_owner(dict(t=t, b=b, rank=rank, recv=c["recv"], ytgt=fptr(fp, "y2")), par * 2 + 1, 2 * Ly + 2, TR)
+    hx.wait_storecnt0()
+    gpu.barrier()
+    _stamp(stp, t, 4)
+
+    # ---- the attention mHC post of layer Ly + 1 in the 160 owners (-> apflag of Ly + 1); the last layer: xh
+    if b < FS.NOWN:
+        tq5 = hx.opaque_v(fx.thread_idx.x)
+        if tq5 == 0:
+            hx.wait_count(lc + i64(LY.SINK_DONE), 1, 15)
+        gpu.barrier()
+        FS.ffn_post_owner(dict(t=tq5, b=b, w=tq5 // 32, l=tq5 % 32, sm=sm + FLO, y=fptr(fp, "y2"),
+                               R=fptr(fp, "Rout"), Rout=fptr(fp, "aRout"), x1g=plog(X1A),
+                               pre=fptr(fp, "npre"), post=fptr(fp, "npost"), comb=fptr(fp, "ncomb"),
+                               part2=plog(P2A), cnt=lc + i64(S.LCB + ATT_POST), pflag=apnfl, ptag=apntg,
+                               engkv=fptr(fp, "engkv"), enggw=ltab(fp, Ly, "enggw")(), eng=lfl(128),
+                               engp=plog(ENGP), engflag=engfl, engtag=engtg), TR)
+        if lastL & (b < 16):
+            FS.xh_out(dict(t=tq5, b=b, w=tq5 // 32, l=tq5 % 32, sm=sm + FLO, x1g=plog(X1A), part2=plog(P2A),
+                           nw=ltab(fp, Ly, "anw")(), norm_eps=D.RMS_EPS, xh=XHP, pflag=apnfl, ptag=apntg), TR)
+    # the next layer's stage-A weights (wqkv tile) and norm weight -> L2
+    if (b < 224) & (Ly + 1 < LEND):
+        pf_rows(ltab(fp, Ly + 1, "wqkv")() + i64((b // 2) * 16) * D.HID + i64((b % 2) * 2560), D.HID, 16, 2560, t)
+    if b < D.HID * 2 // 128:
+        pf_rows(ltab(fp, Ly, "anw")() + i64(b) * 128, 128, 1, 128, t)
+
+    # ---- end: a device handoff only before the head and around the tap layers
+    if lastL | lfl(16):
+        handoff(lc + i64(LY.LAYER_END), t, True)
+    if lfl(16):   # the draft context taps (before the next layer's post rewrites aRout)
+        CX.stage_tap1(dict(t=hx.opaque_v(fx.thread_idx.x), b=b, aux8=fptr(fp, "aux8"), auxs=fptr(fp, "auxs")),
+                      TR, Ly - (NL - 4), fptr(fp, "aRout"))
+    _stamp(stp, t, 18)

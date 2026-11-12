@@ -10,7 +10,7 @@ no two slots overlap.
 from __future__ import annotations
 
 # --- per-layer counters: cnt + layer * LAYER_BYTES + slot -----------------------------------------------------------
-LAYER_BYTES = 256
+LAYER_BYTES = 512
 ATTN_A = 0  # stage A (wqkv GEMV) done
 INDEX_QUANT = 4  # indexer layers: iquant / compressor rows done
 KV_C = 8  # kv / C (+ iq / iw / compressor GEMM) done
@@ -29,6 +29,11 @@ WOA_QUARTERS = 96  # wo_a done, by y8 column quarter: 4 x 4 B (wo_b CTA b waits 
 TP1_GROUPS = 128  # wo_b + TP1 column groups: 16 x 4 B
 TP2_GROUPS = 192  # combine + TP2 column groups: 16 x 4 B
 GROUPS = 16
+MIX_POST = 424  # (v2) the owners' mix partials done (sinkhorn2 waits for all 256)
+MIX_L1 = 432  # (v2) the mix's level-1 sums done (NL1 CTAs)
+SINK_DONE = 428  # (v2) the FFN mix's Sinkhorn done (the attention front's pre / post / comb)
+FFN_POST = 420  # (v2) the TP1 column owners' FFN mHC post done (ffn_post_owner; ffn_c2 waits for all 256)
+DN_BLK = 256  # (v2) routed + shared down units done, by 128-col hidden block: 40 x 4 B (the combine of a CTA's cols waits for its blocks)
 
 # --- tail counters: cnt + (NL + NDR) * LAYER_BYTES + slot -------------------------------------------------------------
 HEAD = 0  # target head start
@@ -72,4 +77,9 @@ def layer_slots() -> dict:
         "WOA_QUARTERS": (WOA_QUARTERS, 16),
         "TP1_GROUPS": (TP1_GROUPS, 4 * GROUPS),
         "TP2_GROUPS": (TP2_GROUPS, 4 * GROUPS),
+        "DN_BLK": (DN_BLK, 160),
+        "FFN_POST": (FFN_POST, 4),
+        "MIX_POST": (MIX_POST, 4),
+        "SINK_DONE": (SINK_DONE, 4),
+        "MIX_L1": (MIX_L1, 4),
     }
