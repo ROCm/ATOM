@@ -39,7 +39,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 
 from .op import exp
 
@@ -1364,7 +1364,7 @@ def _serial_launch_config(
         and HV == 48
         and V == 128
         and max_query_len == 4
-        and get_gfx() == "gfx1250"
+        and get_gfx_runtime() == "gfx1250"
     ):
         # gfx1250, Qwen3.8 H=16 HV=48 K=V=128 T=4, cold state, CUDA graph,
         # us at BV=64 -> chosen BV: bs1 9.3 -> 6.6 (BV16), bs4 9.5 -> 8.3

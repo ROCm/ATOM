@@ -7,7 +7,7 @@ import json
 import os
 
 import torch
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from torch import nn
 
 from atom.config import Config
@@ -87,7 +87,7 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         # The validated gfx1250 stack serves the checkpoint through the
         # online-MXFP4 MTP path. Other architectures follow the checkpoint's
         # own MTP quantization metadata.
-        quantized_mtp = get_gfx() == "gfx1250" or _mtp_weights_quantized(
+        quantized_mtp = get_gfx_runtime() == "gfx1250" or _mtp_weights_quantized(
             atom_config.model
         )
         quant_cls = (

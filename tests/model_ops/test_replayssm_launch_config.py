@@ -16,6 +16,7 @@ from atom.model_ops.fla_ops import replayssm
 
 def _bv(monkeypatch, gfx, N, HV, V=128, T=4, is_kda=False):
     monkeypatch.setattr(replayssm, "get_gfx", lambda: gfx)
+    monkeypatch.setattr(replayssm, "get_gfx_runtime", lambda: gfx)
     return replayssm._serial_launch_config(N, HV, V, T, is_kda)[0]
 
 
