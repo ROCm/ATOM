@@ -129,9 +129,9 @@ class TestForkMidstep:
         assert transfer.forks and not transfer.readable_midstep
 
     def test_on_reads_the_chunk_grid_and_the_conv_window(self, monkeypatch):
+        transfer = _fork_transfer(monkeypatch, midstep=True)
         from atom.model_ops.fla_ops.chunk import CHUNK_SIZE
 
-        transfer = _fork_transfer(monkeypatch, midstep=True)
         assert transfer.forks and transfer.readable_midstep
         assert transfer.midstep_grid == CHUNK_SIZE
         assert transfer.midstep_min_offset == 3
