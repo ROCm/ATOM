@@ -34,9 +34,7 @@ class PdAdmissionController:
 
     @classmethod
     def from_config(cls, config, connector, block_manager):
-        options = (getattr(config, "kv_transfer_config", None) or {}).get(
-            "pd_admission", {}
-        )
+        options = (config.kv_transfer_config or {}).get("pd_admission", {})
         if not isinstance(options, dict):
             raise TypeError("pd_admission must be an object")
         if type(options.get("enabled", False)) is not bool:
@@ -50,13 +48,11 @@ class PdAdmissionController:
         }
         if unknown:
             raise ValueError(f"Unknown pd_admission options: {sorted(unknown)}")
-        if not getattr(connector, "supports_pd_admission", False):
+        if connector is None or not connector.supports_pd_admission:
             raise ValueError("pd_admission requires a Mooncake consumer")
         if (
-            any(
-                getattr(config, name, 1) != 1
-                for name in ("pipeline_parallel_size", "decode_context_parallel_size")
-            )
+            config.pipeline_parallel_size != 1
+            or config.decode_context_parallel_size != 1
             # Ulysses SP runs over the PCP group, so this also covers SP.
             or pcp_group_size_of(config) != 1
         ):

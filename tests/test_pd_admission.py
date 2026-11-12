@@ -355,8 +355,8 @@ def test_ready_preempted_before_first_forward_releases_credit(build, chunked):
     sched.add(a)
     sched.schedule()
     sched._update_from_kv_xfer_finished(receive_success(a))
-    # The inherited decode capacity check needs another block for T0. There is
-    # no G reservation in this change, so it may safely preempt the ready row.
+    # The inherited decode capacity check needs another block for T0. No
+    # decode-slot reservation exists, so the ready row may be preempted.
     batch, _ = sched.schedule()
     assert not batch.req_ids
     assert not a.block_table
