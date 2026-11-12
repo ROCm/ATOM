@@ -2685,7 +2685,9 @@ class Scheduler:
             # request deferred here must leave nothing committed.
             pd_plan = None
             if self.pd_admission is not None and needs_remote_load:
-                admitted, pd_plan = self.pd_admission.check(seq, hbm_probe)
+                admitted, pd_plan = self.pd_admission.check(
+                    seq, hbm_probe, running=bool(self.running)
+                )
                 if not admitted:
                     self.waiting.appendleft(seq)
                     break
