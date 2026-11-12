@@ -8,14 +8,23 @@
 
 | 时间 | 做什么 |
 |---|---|
-| 周六开测前 | 按 §2 构建本周镜像：DSV4.1 MLPerf base 镜像 + 当时的 ATOM main 和 aiter main，推成 `rocm/fw-bringup-mlperf:gfx1250-atom-<周六日期>` |
+| 周六开测前 | 按 §2 构建本周镜像：DSV4.1 MLPerf base 镜像 + 当时的 ATOM main 和 aiter main，推成 `rocm/fw-bringup-mlperf:gfx1250-atom-ci455-<周六日期>` |
 | 周末（周六起） | 用本周镜像按 §3 跑 MLPerf Endpoint 的 4 个模型；按 §4 记录，按 §5 建本周汇总、画图，提交到 `455-CI` 分支 |
 | 周中 | 不重建镜像，用同一个本周镜像跑 8K/1K 的 4 个模型；记录，补全本周汇总，提交 |
 
 - 跑挂了就记下核心 error log，接着跑下一个模型。
 - 同一个镜像测出的所有结果都归在这个镜像名下（§4.3），存进 `455-CI` 分支。对比图上一个镜像就是一条曲线。
 
-**前置条件**：docker 已登录，且对 `rocm/fw-bringup-mlperf` 有 push 权限；测试机能访问 GitHub 和 PyPI；对 `ROCm/ATOM` 的 `455-CI` 分支有 push 权限。
+**前置条件**：
+
+- docker 已登录，且对 `rocm/fw-bringup-mlperf` 有 push 权限。账号和 token 找负责人要。token 不要出现在命令行上（会留在 shell history 和进程列表里），也不要写进脚本或这个仓库（455-CI 分支是公开的）：
+
+  ```bash
+  read -rs DOCKERHUB_TOKEN && echo "$DOCKERHUB_TOKEN" | docker login -u <账号> --password-stdin
+  ```
+
+- 测试机能访问 GitHub 和 PyPI。
+- 对 `ROCm/ATOM` 的 `455-CI` 分支有 push 权限。
 
 ## 1. 测试矩阵
 
@@ -46,12 +55,18 @@
 
 ### 2.2 命名和同名检查
 
-新镜像命名为 `rocm/fw-bringup-mlperf:gfx1250-atom-<YYYYMMDD>`，日期取周六构建当天（北京时间）。开始构建前查一次远端有没有同名镜像，push 前再查一次：
+新镜像命名为 `rocm/fw-bringup-mlperf:gfx1250-atom-ci455-<YYYYMMDD>`，日期取周六构建当天（北京时间），例如 `gfx1250-atom-ci455-20261114`。
+
+- **不用 `gfx1250-atom-<YYYYMMDD>`**：同一个仓库里大家每天出的镜像就是这个格式（还有 `-dsv41`、`-dsv4pro` 等后缀），周六很容易撞名。`ci455` 只给本 CI 用，现有的 tag 里都没有。
+- **同一周重建**要先经负责人同意，tag 末尾加 `-r2`、`-r3`。
+- **不另开新仓库**：往 org 里推一个不存在的仓库会自动创建它，可见性取决于 org 的默认设置，可能是公开的。
+
+开始构建前查一次远端有没有同名镜像，push 前再查一次：
 
 ```bash
 BASE_IMAGE=rocm/fw-bringup-mlperf:gfx1250-atom-20261110-dsv41
 DATE=$(TZ=Asia/Shanghai date +%Y%m%d)
-NEW_IMAGE=rocm/fw-bringup-mlperf:gfx1250-atom-${DATE}
+NEW_IMAGE=rocm/fw-bringup-mlperf:gfx1250-atom-ci455-${DATE}
 
 # 输出 present 或 absent；查询本身失败（未登录、网络问题）时返回非 0
 remote_tag_state() {
@@ -131,7 +146,7 @@ AITER_SHA=$(docker exec ci455-build-${DATE} git -C /app/aiter rev-parse HEAD)
 docker commit \
   --change "LABEL com.amd.ci455.date=${DATE} com.amd.ci455.base_image=${BASE_IMAGE}" \
   --change "LABEL com.amd.ci455.atom=main@${ATOM_SHA} com.amd.ci455.aiter=main@${AITER_SHA}" \
-  --change "LABEL com.amd.atom.commit=${ATOM_SHA} com.amd.aiter.commit=${AITER_SHA} image.atom_branch=main image.aiter_branch=main org.opencontainers.image.version=gfx1250-atom-${DATE}" \
+  --change "LABEL com.amd.atom.commit=${ATOM_SHA} com.amd.aiter.commit=${AITER_SHA} image.atom_branch=main image.aiter_branch=main org.opencontainers.image.version=gfx1250-atom-ci455-${DATE}" \
   ci455-build-${DATE} "$NEW_IMAGE"
 
 remote_tag_state "$NEW_IMAGE"          # push 前再查一次，必须是 absent
@@ -148,7 +163,7 @@ docker rm -f ci455-build-${DATE}
 周末和周中的所有测试机，包括 Kimi-K3 的两个节点，都 pull 同一个本周镜像。周中不重建、不重推，开测前先核对用的是本周镜像：
 
 ```bash
-NEW_IMAGE=rocm/fw-bringup-mlperf:gfx1250-atom-<本周六日期>    # README 索引第一行的镜像
+NEW_IMAGE=rocm/fw-bringup-mlperf:gfx1250-atom-ci455-<本周六日期>    # README 索引第一行的镜像
 docker buildx imagetools inspect "$NEW_IMAGE" --format '{{json .Image.Config.Labels}}' | tr ',' '\n' | grep ci455
 docker pull "$NEW_IMAGE"
 ```
@@ -324,11 +339,11 @@ recipes/
 每个镜像一份 `runs/<YYYYMMDD>/summary.md`，内容和顺序固定。周末测完创建，填镜像信息和 MLPerf Endpoint 一节，8K/1K 一节先写"待测（周中）"；周中测完补上 8K/1K。
 
 ````markdown
-# 455-CI · gfx1250-atom-<YYYYMMDD>
+# 455-CI · gfx1250-atom-ci455-<YYYYMMDD>
 
 | 项目 | 内容 |
 |---|---|
-| 测试 image | `rocm/fw-bringup-mlperf:gfx1250-atom-<YYYYMMDD>`（digest `sha256:<...>`） |
+| 测试 image | `rocm/fw-bringup-mlperf:gfx1250-atom-ci455-<YYYYMMDD>`（digest `sha256:<...>`） |
 | base image | `rocm/fw-bringup-mlperf:gfx1250-atom-20261110-dsv41` |
 | ATOM | `main` @ [`<sha 前 9 位>`](https://github.com/ROCm/ATOM/commit/<sha>)，<commit 日期> <标题> |
 | aiter | `main` @ [`<sha 前 9 位>`](https://github.com/ROCm/aiter/commit/<sha>)，<commit 日期> <标题> |
@@ -396,7 +411,7 @@ git clone --branch 455-CI --single-branch git@github.com:ROCm/ATOM.git atom-455-
 cd atom-455-ci
 # 放入 recipes/455-CI/runs/<YYYYMMDD>/，追加 history.csv，更新 README.md 的索引表
 git add recipes/455-CI
-git commit -m "[455-CI] gfx1250-atom-<YYYYMMDD>: MLPerf Endpoint results"    # 周中写 8K/1K results
+git commit -m "[455-CI] gfx1250-atom-ci455-<YYYYMMDD>: MLPerf Endpoint results"    # 周中写 8K/1K results
 git push origin 455-CI
 ```
 
@@ -408,7 +423,7 @@ git push origin 455-CI
 ```markdown
 | 镜像 | ATOM / aiter | MLPerf Endpoint | 8K/1K | 汇总 |
 |---|---|---|---|---|
-| `gfx1250-atom-<YYYYMMDD>` | `<sha 前 9 位>` / `<sha 前 9 位>` | 例：3/4 通过，Kimi-K3 失败；⚠️ 1 项 | 待测（周中） | [summary](runs/<YYYYMMDD>/summary.md) |
+| `gfx1250-atom-ci455-<YYYYMMDD>` | `<sha 前 9 位>` / `<sha 前 9 位>` | 例：3/4 通过，Kimi-K3 失败；⚠️ 1 项 | 待测（周中） | [summary](runs/<YYYYMMDD>/summary.md) |
 ```
 
 ## 6. 待补充
