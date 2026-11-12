@@ -4152,7 +4152,8 @@ class Scheduler:
         # surrendered blocks (the mutator half of `should_defer_free`'s escape).
         self._connector_release_stalled_save(seq)
         self.block_manager.deallocate(seq)
-        self.waiting.appendleft(seq)
+        pos = self._behind_settled_resumes()
+        self.waiting.insert(pos, seq)
         return True
 
     def _advance_prefill_on_schedule(
@@ -5069,19 +5070,20 @@ class Scheduler:
     def _prioritize_ready_remote_kv_requests(self) -> None:
         """Prioritize completed remote requests before sizing prefill work.
 
-        Offload completions are resolved once here, but a settled resume that
-        keeps its blocks stays ahead of fresh or preempted admissions on every
-        tick. Otherwise a preempted head can fail allocation while the resume
-        behind it holds the blocks needed to make progress. A P/D-only receive
-        is only reordered here; admission resolves it before its first decode.
+        Runs only when a load completed or failed. Offload completions are
+        resolved here, and every settled resume that keeps its blocks (not only
+        the ones that just completed) moves ahead of the other waiters in one
+        stable pass. Nothing is re-sorted on the ticks after: the ways a
+        blocker gets ahead of a resume are `preempt` and parking
+        (`_park_ready_offload_partial_prefills`), which both queue behind them.
+        A P/D-only receive is only reordered here; admission resolves it before
+        its first decode.
         """
         if not self.waiting:
             return
-        resolve = self._connector_flag("is_offload")
-        if not resolve and not (
-            self.finished_recving_kv_req_ids or self.failed_recving_kv_req_ids
-        ):
+        if not (self.finished_recving_kv_req_ids or self.failed_recving_kv_req_ids):
             return
+        resolve = self._connector_flag("is_offload")
         ready: deque[Sequence] = deque()
         blocked: deque[Sequence] = deque()
         while self.waiting:
@@ -5090,18 +5092,42 @@ class Scheduler:
                 self._has_req_id(self.finished_recving_kv_req_ids, seq.id)
                 or self._has_req_id(self.failed_recving_kv_req_ids, seq.id)
             ):
-                if resolve:
-                    self._resolve_offload_load(seq)
-                ready.append(seq)
-            elif (
-                seq.status == SequenceStatus.WAITING
-                and self._is_offload_prefill_resume(seq)
+                if not resolve:
+                    ready.append(seq)
+                    continue
+                self._resolve_offload_load(seq)
+            # With an offload tier only a resume that keeps its blocks goes
+            # ahead: a failed load that kept none is an ordinary waiter and
+            # must not sit in front of the resumes that hold the pool.
+            if seq.status == SequenceStatus.WAITING and (
+                self._is_offload_prefill_resume(seq)
             ):
                 ready.append(seq)
             else:
                 blocked.append(seq)
         self.waiting.extend(ready)
         self.waiting.extend(blocked)
+
+    def _behind_settled_resumes(self) -> int:
+        """Queue index behind the last settled offload resume of the leading run.
+
+        Settled resumes at the head hold blocks and are promoted once, when
+        their load ends. A preempted head that cannot allocate stops admission,
+        so in front of them it would starve the resume holding the blocks it
+        needs. In-flight loads inside that run are skipped by admission; they
+        stay in front only when a resume sits behind them, so a request put
+        back at the head never lands behind more in-flight loads than it must
+        (`_can_admit_head_prefill` reads only the first few queue entries).
+        """
+        pos = 0
+        if self._connector_flag("is_offload"):
+            for i, queued in enumerate(self.waiting):
+                if queued.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
+                    continue  # in flight, even if an earlier load left its flags
+                if not self._is_offload_prefill_resume(queued):
+                    break
+                pos = i + 1
+        return pos
 
     def _park_ready_offload_partial_prefills(self) -> None:
         if (
@@ -5128,7 +5154,11 @@ class Scheduler:
 
         self.running = keep_running
         if parked:
-            self.waiting.extendleft(reversed(parked))
+            # Not in front of a settled resume: event-free ticks never re-rank,
+            # so four parked loads there would hide it from admission probes.
+            pos = self._behind_settled_resumes()
+            for offset, seq in enumerate(parked):
+                self.waiting.insert(pos + offset, seq)
 
     def _update_from_kv_xfer_finished(self, kv_connector_output: KVConnectorOutput):
         """Reconcile scheduler state with completed KV transfers.
