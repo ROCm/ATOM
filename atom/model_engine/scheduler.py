@@ -5954,6 +5954,34 @@ class Scheduler:
                     self._has_req_id(self.finished_recving_kv_req_ids, seq.id)
                     or self._has_req_id(self.failed_recving_kv_req_ids, seq.id)
                 )
+            ) or (
+                seq.status == SequenceStatus.WAITING
+                and self._is_offload_prefill_resume(seq)
+            )
+
+        # An early load reserves resources without changing arrival order.
+        # Keep that order while the head can progress; if it cannot, the ready
+        # owner must run to release its blocks/slot, including on later ticks
+        # after its completion event has already been consumed.
+        head_blocked = False
+        if early and any(completed(seq) and seq.id in early for seq in queue):
+            head = next((seq for seq in queue if not completed(seq)), None)
+            slots_full = (
+                len(self.running) + self._num_parked_remote_kv >= self.max_num_seqs
+            )
+            head_blocked = (
+                head is not None
+                and head.status == SequenceStatus.WAITING
+                and (slots_full or self.block_manager.can_allocate_memoized(head) < 0)
+            )
+        ready: deque[Sequence] = deque()
+        blocked: deque[Sequence] = deque()
+        for seq in queue:
+            is_ready = completed(seq)
+            if (
+                is_ready
+                and resolve
+                and seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
             ):
                 if not resolve:
                     ready.append(seq)
