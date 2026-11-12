@@ -115,10 +115,33 @@ def forward_checked(
     return runner.finish_step(res)
 
 
+def _mono_xn4(sc: torch.Tensor, n: int) -> torch.Tensor:
+    """a4w4 builds: the MXFP4 xn rows (``xn4p`` / ``xs4p`` plain words, or the narrow build's tagged
+    ``xn4`` / ``xs4``) dequantized to bf16: the input the routed experts saw (so the xn
+    quantization error is not in a comparison made on it)."""
+    if wide_moe(n):
+        o, c = SCRATCH["xn4p"], SCRATCH["xs4p"]
+        words = sc[o : o + n * HIDDEN // 8 * 4].view(torch.int32)
+        codes = sc[c : c + n * HIDDEN // 32 * 4].view(torch.int32)
+    else:
+        o, c = SCRATCH["xn4"], SCRATCH["xs4"]
+        words = sc[o : o + n * HIDDEN // 8 * 8].view(torch.int32)[0::2]
+        codes = sc[c : c + n * HIDDEN // 32 * 8].view(torch.int32)[0::2]
+    b = words.contiguous().view(torch.uint8).view(n, HIDDEN // 2)
+    lut = torch.tensor(
+        [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6], device=sc.device
+    )
+    v = torch.stack([lut[(b & 15).long()], lut[(b >> 4).long()]], -1).view(n, HIDDEN // 32, 32)
+    scale = torch.ldexp(torch.ones_like(codes, dtype=torch.float32), codes.view(n, -1) - 127)
+    return (v * scale[..., None]).view(n, HIDDEN).to(torch.bfloat16)
+
+
 def mono_xn(runner, n: int) -> torch.Tensor:
     """The bf16 xn rows of the layer kernel's last launch, from its scratch: the narrow
     build's tagged words (``xnb``) or the wide one's plain words (``xnbp``)."""
     sc = runner.scratch4
+    if runner.moe_a4w4:
+        return _mono_xn4(sc, n)
     if wide_moe(n):
         off = SCRATCH["xnbp"]
         words = sc[off : off + n * HIDDEN // 2 * 4].view(torch.int32)

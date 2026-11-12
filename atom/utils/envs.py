@@ -647,7 +647,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the mono kernel published, so the MoE is compared on identical inputs (no attention difference, no routing flips).
     "ATOM_MONO_CHECK_MOE": lambda: os.getenv("ATOM_MONO_CHECK_MOE", "0") == "1",
     "ATOM_MONO_MOE_A16W4": lambda: os.getenv("ATOM_MONO_MOE_A16W4", "1") == "1",
-    "ATOM_MONO_SP_F32": lambda: os.getenv("ATOM_MONO_SP_F32", "1") == "1",
+    # The routed experts on MXFP4 activations (a4w4: xn and the swiglu mid per 1x32, E8M0 RoundUp, aiter's
+    # a4w4 convention; the shared expert stays MXFP8). Wins over ATOM_MONO_MOE_A16W4; needs the unfused
+    # MXFP8 shared expert (else ignored). Default off until the model-level accuracy is accepted.
+    "ATOM_MONO_MOE_A4W4": lambda: os.getenv("ATOM_MONO_MOE_A4W4", "0") == "1",
+    # f32 split -> merge partition outputs: off by default (the bf16 partitions of the earlier mono)
+    "ATOM_MONO_SP_F32": lambda: os.getenv("ATOM_MONO_SP_F32", "0") == "1",
     "ATOM_MONO_PROD_ROUND": lambda: os.getenv("ATOM_MONO_PROD_ROUND", "1") == "1",
     # DeepSeek-V4.1: how many of an attention layer's branches leave the main
     # stream. 0 none; 1 the compressor, on the MoE's `alt_stream`, waited at

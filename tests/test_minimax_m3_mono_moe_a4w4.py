@@ -55,7 +55,7 @@ def fp4_quant_kernel_rule(x):
 
 def _grid(nib):
     t = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0])
-    return t[nib]
+    return t.to(nib.device)[nib]
 
 
 def dq_fp4(x):

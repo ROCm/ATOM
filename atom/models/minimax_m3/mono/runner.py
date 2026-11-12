@@ -222,6 +222,8 @@ class MonoDecodeRunner:
         eps = config.rms_norm_eps
         route_scale = float(layers[N_DENSE].block_sparse_moe.routed_scaling_factor)
         self.shared_mxfp8 = self.sparse[0].shared_mxfp8
+        # routed experts on MXFP4 activations (a4w4): wins over a16w4; needs the unfused MXFP8 shared expert
+        self.moe_a4w4 = envs.ATOM_MONO_MOE_A4W4 and self.shared_mxfp8
         # NVFP4 K/V + index pages (single-buffer): every layer alike, both caches together
         self.nvfp4 = impl.kv_cache_dtype == "nvfp4"
         if any(
@@ -294,6 +296,7 @@ class MonoDecodeRunner:
             sh_first=envs.ATOM_MONO_SH_FIRST,
             attn_mxfp8=self.attn_mxfp8,
             moe_a16w4=envs.ATOM_MONO_MOE_A16W4,
+            moe_a4w4=self.moe_a4w4,
             sp_f32=envs.ATOM_MONO_SP_F32,
             prod_round=envs.ATOM_MONO_PROD_ROUND,
         )
