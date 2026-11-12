@@ -5,9 +5,6 @@
 
 from __future__ import annotations
 
-from atom.kv_transfer.offload.lookup_client import LookupClient
-
-
 import functools
 import logging
 import threading
@@ -17,6 +14,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from atom.kv_transfer.offload.lookup_client import LookupClient
 from atom.kv_transfer.offload.mp.deployment import _mp_session_id
 from atom.kv_transfer.offload.mp.lookup_driver import _DRIVER_POLL_S, _LookupDriver
 

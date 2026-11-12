@@ -13,9 +13,6 @@ Store objects, instead of the prompt's token ids.
 
 from __future__ import annotations
 
-from atom.kv_transfer.offload.lookup_client import LookupClient
-
-
 import functools
 import logging
 import time
@@ -28,6 +25,7 @@ from atom.kv_transfer.offload._offload_common import (
     validated_kv_role,
 )
 from atom.kv_transfer.offload.chunked_scheduler import ChunkedOffloadSchedulerBase
+from atom.kv_transfer.offload.lookup_client import LookupClient
 from atom.kv_transfer.offload.metadata import LMCacheReqMeta, LoadSpec, SaveSpec
 from atom.kv_transfer.offload.mooncake_store import client as store_client
 from atom.kv_transfer.offload.mooncake_store.async_lookup import (

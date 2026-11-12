@@ -5,9 +5,6 @@
 
 from __future__ import annotations
 
-from atom.kv_transfer.offload.lookup_client import as_lookup_client
-
-
 import logging
 import time
 
@@ -26,6 +23,7 @@ from atom.kv_transfer.offload._offload_common import (
 )
 from atom.kv_transfer.offload.config import min_load_tokens
 from atom.kv_transfer.offload.load_math import chunk_floor, tier_load_tokens
+from atom.kv_transfer.offload.lookup_client import as_lookup_client
 from atom.kv_transfer.offload.metadata import (
     LMCacheOffloadMetadata,
     LMCacheReqMeta,
