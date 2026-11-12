@@ -291,11 +291,17 @@ def fp4_rows(
             )
         )
         if layout in (NATURAL, MFMA):
+            opus_page_size, pages_per_block = page_size, band.pages_per_block
+            if layout == MFMA and page_size > 64 and page_size % 64 == 0:
+                # DSA blocks can span multiple physical OPUS groups. Keep
+                # their table IDs unchanged; V4.1's logical page-8 stays 8.
+                opus_page_size = 64
+                pages_per_block *= page_size // 64
             cfg = mqa_logits_mxfp4_config(
                 row_ends.device,
                 heads=heads,
-                page_size=page_size,
-                pages_per_block=band.pages_per_block,
+                page_size=opus_page_size,
+                pages_per_block=pages_per_block,
                 max_rows=end - first,
                 max_seqs=band.query_start_loc.numel() - 1,
                 max_qlen=band.max_qlen,

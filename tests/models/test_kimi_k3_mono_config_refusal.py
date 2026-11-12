@@ -128,6 +128,17 @@ def test_decode_context_parallelism_is_served(servable):
     assert config_refusal(atom_config) is None
 
 
+@pytest.mark.parametrize("connector", ["lmcache_mp", "lmcache_offload", "multi"])
+def test_lmcache_mp_can_run_beside_k3_and_shared_dsa_mono(servable, connector):
+    from atom.mono.dsa_indexer.dispatch import config_refusal as dsa_refusal
+
+    atom_config = _atom_config()
+    atom_config.kv_transfer_config = {"kv_connector": connector}
+    expected = None if connector == "lmcache_mp" else f"KV connector {connector}"
+    assert config_refusal(atom_config) == expected
+    assert dsa_refusal(atom_config) == expected
+
+
 def test_other_mono_models_still_refuse_decode_context_parallelism(servable):
     from atom.models.kimi_k3.mono.config import SUPPORTED_TP, Dims
 

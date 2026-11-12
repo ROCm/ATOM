@@ -249,7 +249,9 @@ def config_refusal(atom_config) -> str | None:
     # copy kernel of its own (`_served_connectors`).
     checks += (
         common_refusals(atom_config, Dims, SUPPORTED_TP, refuse_decode_cp=False)
-        + resident_grid_refusals(atom_config, _served_connectors(atom_config))
+        + resident_grid_refusals(
+            atom_config, _served_connectors(atom_config) + ("lmcache_mp",)
+        )
     ) + [
         # the KDA recurrence reads and writes fp32 state in place; a narrower
         # pool would be read as fp32 rather than converted

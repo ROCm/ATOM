@@ -47,6 +47,9 @@ class IndexerShape:
     # else the fused RoPE writer's (``indexer_qk_rope_quant_and_cache``)
     rope_dim: int
     rope_neox: bool = False  # the rotation's pairs: (d, d + half), else (2i, 2i + 1)
+    # FP4 must explicitly name OPUS's layout; the old FlyDSL plane has the
+    # same byte count but a different permutation.
+    cache_layout: str = "preshuffle"
 
     @property
     def qrows(self) -> int:
@@ -55,13 +58,19 @@ class IndexerShape:
 
     @property
     def row_bytes(self) -> int:
-        """A cache row: head_dim fp8 and an fp32 scale, padded to 16 B
-        (``aiter_mla.aligned_index_cache_dim``)."""
+        """Data plane bytes per row. FP8 includes an inline FP32 scale and
+        16 B padding; FP4 has a separate E8M0 plane."""
+        if self.kv_dtype == "fp4":
+            return self.head_dim // 2
         return -(-(self.head_dim + SCALE_BYTES) // 16) * 16
 
     @property
     def block_bytes(self) -> int:
         return self.block_rows * self.row_bytes
+
+    @property
+    def block_scale_bytes(self) -> int:
+        return self.block_rows * (self.head_dim // 32) if self.kv_dtype == "fp4" else 0
 
     @property
     def weights_scale(self) -> float:
@@ -74,6 +83,7 @@ class IndexerShape:
             f"h{self.heads}_d{self.head_dim}_topk{self.topk}_ql{self.q_lora}"
             f"_wq{self.wq_dtype}_kv{self.kv_dtype}_blk{self.block_rows}"
             f"_rope{self.rope_dim}{'n' if self.rope_neox else ''}"
+            + (f"_{self.cache_layout}" if self.kv_dtype == "fp4" else "")
         )
 
 
@@ -102,13 +112,33 @@ def scale_byte(shape: IndexerShape, row):
     return shape.block_rows * shape.head_dim + SCALE_BYTES * row
 
 
+def fp4_cache_byte(row, packed_col):
+    """OPUS gfx950: [group, 32-dim chunk, row, 16 packed bytes]."""
+    return row // 64 * 4096 + (packed_col // 16 * 64 + row % 64) * 16 + packed_col % 16
+
+
+def fp4_scale_byte(row, chunk):
+    """OPUS gfx950: [group, chunk % 2, row % 32, chunk // 2, row // 32]."""
+    return (
+        row // 64 * 256
+        + chunk % 2 * 128
+        + row % 32 * 4
+        + chunk // 2 * 2
+        + row % 64 // 32
+    )
+
+
 def unsupported(shape: IndexerShape) -> str:
     """Why the kernel cannot run an indexer of this shape, or ''. Each is a
     piece of the kernel written for one value, not a measured limit."""
     if shape.wq_dtype != "bf16":
         return f"wq_b {shape.wq_dtype}: the q GEMV reads bf16"
-    if shape.kv_dtype != "fp8":
-        return f"{shape.kv_dtype} index cache: the scorer reads FP8 keys"
+    if shape.kv_dtype not in ("fp8", "fp4"):
+        return f"{shape.kv_dtype} index cache: expected FP8 or MXFP4"
+    if shape.kv_dtype == "fp4" and (
+        shape.cache_layout != "mfma" or shape.block_rows % 64
+    ):
+        return "FP4 requires OPUS gfx950 mfma layout and complete 64-row groups"
     if shape.rope_dim not in (0, ROPE_DIM):
         return f"index RoPE {shape.rope_dim}: the rotation is written for {ROPE_DIM}"
     if shape.head_dim != 128:

@@ -185,7 +185,12 @@ def _cu_count() -> int | None:
 def resident_grid_refusals(atom_config, connectors=()) -> list[tuple[bool, str]]:
     """``(holds, why not)`` of a kernel whose CTAs, one a CU, are all resident
     and spin on each other (``plan.execution.BLOCKS``). ``connectors``: the KV
-    connectors a model admits, whose copy kernels finish on their own."""
+    connectors a model admits, whose copy kernels finish on their own.
+
+    ``lmcache_mp`` uses bounded block copies, with producer events before saves
+    and completion/restore fences before reuse. Its CTAs never wait on Mono;
+    they release their CUs even if a resident-grid kernel is partially launched.
+    """
     from atom.kv_transfer.disaggregation import KVConnectorFactory
 
     cus = _cu_count()

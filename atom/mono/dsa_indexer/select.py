@@ -26,19 +26,24 @@ A short row (``plan.short``) skips score and select: every key the
 rank holds, in local order (the original merge's answer whenever ctx <= K).
 """
 
+from dataclasses import dataclass
+
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T
 
+from atom.mono.device.mx import mfma_scaled
 from atom.mono.device.ops import (
     CM_DEV,
     CM_SYS,
+    ballot,
     block_excl_scan,
     butterfly,
     head_sum,
     ld_dev,
     mfma_fp8,
+    readlane,
     rsrc,
     traced,
     wave_incl_scan,
@@ -46,7 +51,8 @@ from atom.mono.device.ops import (
 )
 from atom.mono.device.queue import word
 from atom.mono.device.select import INT_MIN, f32_key, u32_gt
-from atom.mono.device.sync import publish, sleep_ticks
+from atom.mono.device.sync import preg, publish, sleep_ticks
+from atom.mono.dsa_indexer import fp4
 from atom.mono.dsa_indexer.plan import (
     SCORE_KEYS,
     TILE,
@@ -59,9 +65,56 @@ from atom.mono.dsa_indexer.plan import (
 from atom.mono.plan.arith import pick
 from atom.mono.plan.execution import BLOCKS, THREADS, WAVES
 
+
 # radix passes over the 32-bit key, most significant first; a pass is a round
 # trip to every rank whose cost grows with the bins pushed and polled
-DIGIT_BITS = (8, 8, 8, 8)
+@dataclass(frozen=True)
+class Radix:
+    bits: tuple[int, ...]
+    # Wider local digits never participate in the distributed mailbox ABI.
+    local: bool = False
+
+    def __post_init__(self):
+        limit = 11 if self.local else 8
+        if (
+            sum(self.bits) != 32
+            or not all(1 <= b <= limit for b in self.bits)
+            or max(self.bits) < 6
+        ):
+            raise ValueError(
+                f"radix requires 32 total bits and a 64..{1 << limit}-bin histogram"
+            )
+
+    @property
+    def passes(self):
+        return len(self.bits)
+
+    @property
+    def shifts(self):
+        return tuple(32 - sum(self.bits[: p + 1]) for p in range(self.passes))
+
+    @property
+    def bins(self):
+        return 1 << max(self.bits)
+
+    @property
+    def bins_per_thread(self):
+        return max(1, self.bins // THREADS)
+
+    @property
+    def waves(self):
+        return min(WAVES, self.bins // 64)
+
+    @property
+    def bins_per_lane(self):
+        return self.bins // (64 * self.waves)
+
+
+DEFAULT_RADIX = Radix((8, 8, 8, 8))
+LOCAL_RADIX = Radix((11, 11, 10), local=True)
+WIDE_RADIX = Radix((7, 7, 7, 7, 4))
+SHORT_WIDE_RADIX = Radix((6, 6, 6, 6, 6, 2))
+DIGIT_BITS = DEFAULT_RADIX.bits
 PASSES = len(DIGIT_BITS)
 SHIFTS = tuple(32 - sum(DIGIT_BITS[: p + 1]) for p in range(PASSES))
 BINS = 1 << max(DIGIT_BITS)
@@ -71,8 +124,8 @@ BINS = 1 << max(DIGIT_BITS)
 BINS_A_THREAD = max(1, BINS // THREADS)
 
 
-def _bin(tid, k):
-    return fx.min(tid + k * THREADS, BINS - 1)
+def _bin(tid, k, bins=BINS):
+    return fx.min(tid + k * THREADS, bins - 1)
 
 
 # the digit's choice (``_decide``): a lane's bins, over the first DEC_WAVES
@@ -85,6 +138,7 @@ DEC_A_LANE = BINS // (64 * DEC_WAVES)
 CHUNK = 4096
 CHUNK_LG = CHUNK.bit_length() - 1
 PT = CHUNK // THREADS
+LOCAL_SELECT_MAX = 8192
 # a segment's chunks at most, log2: 64 rows of 2^22 local keys fit
 CPS_LG_MAX = 8
 # the waves holding a step's segments, a thread each (``_sum_before``)
@@ -96,9 +150,10 @@ ARRIVED = 1 << COUNT_BITS
 # a row histogram's copies: segment g adds into copy g % ROW_COPIES (a word
 # takes fewer atomics), its readers sum them
 ROW_COPIES = 4
-# LDS ``rows`` words a row (``step_table``): context, keys here, long | split
-# << 1
+# LDS ``rows`` words a row: context, keys here, long | split << 1 |
+# short-verify-step << 2. The last flag is uniform over rows and ranks.
 ROW_WORDS = 3
+SHORT_VERIFY_CTX = 8192
 # ``own_rows``: a request's keys split over the ranks only past this many
 # (``split_keys``)
 SPLIT_MIN = 262144
@@ -106,25 +161,28 @@ SPLIT_MIN = 262144
 RG_MAX = 8
 TASK_UNITS_LG = 3
 TASK_UNITS = 1 << TASK_UNITS_LG  # a score task's units at most
+STREAM_UNITS = 4
 
 
-def peer_pairs(tokens: int, world: int, replicated: bool) -> dict:
+def peer_pairs(tokens: int, world: int, replicated: bool, radix=DEFAULT_RADIX) -> dict:
     return {
-        "hist": tokens * PASSES * world * BINS,
+        "hist": tokens * radix.passes * world * radix.bins,
         # replicated: (row, rank)'s winners in this rank's slab, their count
         "rcnt": tokens * world if replicated else 0,
+        # A producer cannot reuse its slab/count until every reader is done.
+        "rdone": tokens * world if replicated and world > 1 else 0,
         # this rank's own, plain words (two a pair): a row's histogram of
         # each pass, its segments' added (``_row_add``). It must be zero at
         # every launch's start: the indexer's own peer region, zeroed a step
         # and then by each row's last segment (``_row_clear``). Not the step
         # scratch: Kimi-K3's K1 / K2 leave their pairs there between two DSA
         # layers (counts on them: a wrong top-k or a fault)
-        "rowhist": tokens * PASSES * ROW_COPIES * BINS // 2,
+        "rowhist": tokens * radix.passes * ROW_COPIES * radix.bins // 2,
     }
 
 
-def hist_at(r, p, src, b, world):
-    return ((r * PASSES + p) * world + src) * BINS + b
+def hist_at(r, p, src, b, world, radix=DEFAULT_RADIX):
+    return ((r * radix.passes + p) * world + src) * radix.bins + b
 
 
 def radix_key(v):
@@ -138,14 +196,14 @@ def radix_key(v):
     return o ^ fx.Int32(INT_MIN)
 
 
-def digit(key, p):
+def digit(key, p, radix=DEFAULT_RADIX):
     """Pass p's digit of a key."""
-    return (key >> SHIFTS[p]) & ((1 << DIGIT_BITS[p]) - 1)
+    return (key >> radix.shifts[p]) & ((1 << radix.bits[p]) - 1)
 
 
-def under(key, p, prefix):
+def under(key, p, prefix, radix=DEFAULT_RADIX):
     """Whether the key's bits above pass p's digit are ``prefix``."""
-    used = 32 - SHIFTS[p] - DIGIT_BITS[p]
+    used = 32 - radix.shifts[p] - radix.bits[p]
     return ((key >> (32 - used)) & ((1 << used) - 1)) == prefix
 
 
@@ -172,8 +230,47 @@ def sflag_at(c, r):
 
 @traced
 def step_table(c):
-    """The step's rows and tasks once a CTA, on wave 0, a lane a row
-    (``kernel.MAX_TOKENS`` is a wave), behind one barrier:
+    # All rows need TopK but fit one local segment. The fixed short scorer
+    # does not consume a task prefix table, except BS1's two-query pieces.
+    if const_expr(c.get("fast_short", False)):
+        ql, s, tid, lane = c["qlen"], c["S"], c["tid"], c["lane"]
+        requests = s // ql
+        length = request_ctx(c, fx.min(lane, fx.Int32(requests - 1)) * ql)
+        bad = (lane < requests) & (
+            (length > SHORT_VERIFY_CTX) | (length < c["shape"].topk + ql)
+        )
+        fast = ballot(bad) == 0
+        if fast:
+            if tid < s:
+                ctx = request_ctx(c, tid) - (ql - 1 - tid % ql)
+                at = c["rows"] + ROW_WORDS * tid
+                fx.ptr_store(ctx, at)
+                fx.ptr_store(ctx, at + 1)
+                fx.ptr_store(fx.Int32(5), at + 2)
+                fx.ptr_store(tid, _seg_firsts(c) + tid)
+            if tid == 0:
+                tasks = fx.Int32(1)
+                if const_expr(s == ql):
+                    tasks = fx.Int32(0)
+                    for p in range_constexpr(ql // 2):
+                        fx.ptr_store(tasks, _score_firsts(c) + p)
+                        count = (length - ql + 2 * p + 2 + SCORE_KEYS - 1) // SCORE_KEYS
+                        tasks = tasks + count
+                fx.ptr_store(tasks, c["plan"] + PLAN_SCORE_TOTAL)
+                fx.ptr_store(fx.Int32(0), c["plan"] + PLAN_SCORE_LG)
+                fx.ptr_store(fx.Int32(s), c["plan"] + PLAN_SEG_TOTAL)
+                fx.ptr_store(fx.Int32(0), c["plan"] + PLAN_SEG_LG)
+            gpu.barrier()
+        else:
+            _step_table_generic(c)
+    else:
+        _step_table_generic(c)
+
+
+@traced
+def _step_table_generic(c):
+    """The step's rows and tasks once a CTA, on wave 0, behind one barrier.
+    Up to 64 rows use one lane each; wider plain decodes use 64-row tiles.
 
     - every row's ``_row_kind`` into LDS ``rows`` (context, keys here,
       long | split << 1): the step's later reads an LDS word each;
@@ -191,8 +288,14 @@ def step_table(c):
     power of two (a shift, not a division by a runtime value), that make them
     fit (sum_r ceil(a_r / cps) <= sum a_r / cps + rows <= BLOCKS). The step's
     rows decide it, not max_model_len -- V4.1's tree the same way."""
+    if const_expr(c["S"] > 64):
+        _step_table_wide(c)
+        return
     tid = c["tid"]
     s, ql, rg, ppr = c["S"], c["qlen"], c["rg"], c["ppr"]
+    short_owned = c.get("short_owned_verify", False)
+    short_score = c.get("short_score", False)
+    local_short = c.get("local_short", False)
     if tid < 64:
         r = fx.min(tid, fx.Int32(s - 1))
         live = tid < s
@@ -202,11 +305,26 @@ def step_table(c):
             # the step's requests' contexts: each counted on its first row's lane
             first = live & (r % ql == 0)
             total = _rows_sum(first.select(fx.max(rctx, fx.Int32(0)), fx.Int32(0)), s)
+        short_step = fx.Boolean(False)
+        if const_expr(short_owned):
+            if const_expr(c["max_ctx"] <= SHORT_VERIFY_CTX):
+                short_step = fx.Boolean(True)
+            else:
+                large = (first & (rctx > SHORT_VERIFY_CTX)).select(
+                    fx.Int32(1), fx.Int32(0)
+                )
+                short_step = _rows_sum(large, s) == 0
         ctx, n, long, split = _row_kind(c, r, rctx, total)
+        if const_expr(local_short):
+            n = short_step.select(fx.max(ctx, fx.Int32(0)), n)
+            split = split & ~short_step
+            long = (ctx > c["shape"].topk) & (n > 0)
         if live:
             flags = long.select(fx.Int32(1), fx.Int32(0))
             if const_expr(c["own_rows"]):
                 flags = flags | split.select(fx.Int32(2), fx.Int32(0))
+            if const_expr(short_owned):
+                flags = flags | short_step.select(fx.Int32(4), fx.Int32(0))
             at = c["rows"] + ROW_WORDS * tid
             fx.ptr_store(ctx, at)
             fx.ptr_store(n, at + 1)
@@ -214,9 +332,16 @@ def step_table(c):
         long = long & live
         # the row's piece, and its units on the piece's last row
         # (``score_units``)
-        pc = (r // ql) * ppr + r % ql // rg
-        lead, span = piece(c, pc)
-        last = live & (r == lead + span - 1)
+        if const_expr(short_score):
+            # One short request per active rank: 192/256 score CTAs for
+            # qlen 6/8 with two rows a piece, instead of only 64.
+            assert ppr == 1 and ql in (6, 8)
+            pc = short_step.select((r // ql) * (ql // 2) + r % ql // 2, r // ql)
+            last = live & short_step.select(r % 2 == 1, r % ql == ql - 1)
+        else:
+            pc = (r // ql) * ppr + r % ql // rg
+            lead, span = piece(c, pc)
+            last = live & (r == lead + span - 1)
         nu = row_units(n, last & long)
         lg = fx.Int32(TASK_UNITS_LG)
         for w in reversed(range(TASK_UNITS_LG)):
@@ -244,6 +369,116 @@ def step_table(c):
             c, _seg_firsts(c) + r, live, segs, s, (PLAN_SEG_TOTAL, PLAN_SEG_LG, slg)
         )
     gpu.barrier()
+
+
+@traced
+def _step_table_wide(c):
+    """Wide decode/verify: each lane holds successive 64-row tiles.
+    Reductions combine the tiles; prefix scans carry all earlier tiles' totals.
+    No inter-wave synchronization is needed until the complete table is ready.
+    """
+    tid, s = c["tid"], c["S"]
+    ql, rg, ppr = c["qlen"], c["rg"], c["ppr"]
+    local_short = c.get("local_short", False)
+    if tid < 64:
+        total = None
+        if const_expr(c["own_rows"]):
+            contexts = [
+                request_ctx(c, fx.min(tid + 64 * tile, fx.Int32(s - 1)))
+                for tile in range(-(-s // 64))
+            ]
+            # The split decision uses every live request, including upper tiles.
+            lengths = [
+                ((tid + 64 * tile < s) & ((tid + 64 * tile) % ql == 0)).select(
+                    fx.max(ctx, fx.Int32(0)), fx.Int32(0)
+                )
+                for tile, ctx in enumerate(contexts)
+            ]
+            total = _rows_sum(sum(lengths[1:], lengths[0]), 64)
+        short_step = fx.Boolean(False)
+        if const_expr(local_short):
+            large = [
+                ((tid + 64 * tile < s) & (ctx > SHORT_VERIFY_CTX)).select(
+                    fx.Int32(1), fx.Int32(0)
+                )
+                for tile, ctx in enumerate(contexts)
+            ]
+            short_step = _rows_sum(sum(large[1:], large[0]), 64) == 0
+        units, chunks, longs = [], [], []
+        for tile in range_constexpr(-(-s // 64)):
+            r = tid + 64 * tile
+            live = r < s
+            if const_expr(c["own_rows"]):
+                rctx = contexts[tile]
+            else:
+                rctx = request_ctx(c, fx.min(r, fx.Int32(s - 1)))
+            ctx, n, long, split = _row_kind(c, r, rctx, total)
+            if const_expr(local_short):
+                n = short_step.select(fx.max(ctx, fx.Int32(0)), n)
+                split = split & ~short_step
+                long = (ctx > c["shape"].topk) & (n > 0)
+            if live:
+                if const_expr(c["own_rows"]):
+                    flags = long.select(fx.Int32(1), fx.Int32(0))
+                    flags = flags | split.select(fx.Int32(2), fx.Int32(0))
+                    if const_expr(local_short):
+                        flags = flags | short_step.select(fx.Int32(4), fx.Int32(0))
+                at = c["rows"] + ROW_WORDS * r
+                fx.ptr_store(ctx, at)
+                fx.ptr_store(n, at + 1)
+                if const_expr(c["own_rows"]):
+                    fx.ptr_store(flags, at + 2)
+                else:
+                    fx.ptr_store(long.select(fx.Int32(1), fx.Int32(0)), at + 2)
+            long = long & live
+            pc = (r // ql) * ppr + r % ql // rg
+            lead, span = piece(c, pc)
+            units.append(row_units(n, long & (r == lead + span - 1)))
+            chunks.append(long.select((n + CHUNK - 1) // CHUNK, fx.Int32(0)))
+            longs.append(long.select(fx.Int32(1), fx.Int32(0)))
+
+        lg = fx.Int32(TASK_UNITS_LG)
+        for w in reversed(range(TASK_UNITS_LG)):
+            counts = [(n + (1 << w) - 1) >> w for n in units]
+            tasks = _rows_sum(sum(counts[1:], counts[0]), 64)
+            lg = (tasks <= BLOCKS).select(fx.Int32(w), lg)
+        counts = [(n + (fx.Int32(1) << lg) - 1) >> lg for n in units]
+        _lay_out_wide(
+            c, _score_firsts(c), counts, PLAN_SCORE_TOTAL, PLAN_SCORE_LG, lg, score=True
+        )
+
+        total = _rows_sum(sum(chunks[1:], chunks[0]), 64)
+        room = BLOCKS - _rows_sum(sum(longs[1:], longs[0]), 64)
+        slg = fx.Int32(0)
+        # At BLOCKS long rows room is zero: the largest shift makes each
+        # row one segment, since row_keys < 2**COUNT_BITS.
+        for w in range(1, COUNT_BITS - CHUNK_LG + 1):
+            slg = (total > (room << (w - 1))).select(fx.Int32(w), slg)
+        slg = (total <= BLOCKS).select(fx.Int32(0), slg)
+        counts = [(n + (fx.Int32(1) << slg) - 1) >> slg for n in chunks]
+        _lay_out_wide(c, _seg_firsts(c), counts, PLAN_SEG_TOTAL, PLAN_SEG_LG, slg)
+    gpu.barrier()
+
+
+@traced
+def _lay_out_wide(c, firsts, counts, total_at, lg_at, lg, score=False):
+    carry = fx.Int32(0)
+    for tile in range_constexpr(-(-c["S"] // 64)):
+        cnt = counts[tile]
+        incl = wave_incl_scan(cnt, c["lane"])
+        r = c["lane"] + 64 * tile
+        if const_expr(score):
+            pc = (r // c["qlen"]) * c["ppr"] + r % c["qlen"] // c["rg"]
+            lead, span = piece(c, pc)
+            if (r < c["S"]) & (r == lead + span - 1):
+                fx.ptr_store(carry + incl - cnt, firsts + pc)
+        else:
+            if r < c["S"]:
+                fx.ptr_store(carry + incl - cnt, firsts + r)
+        carry = carry + readlane(incl, 63)
+    if c["lane"] == 0:
+        fx.ptr_store(carry, c["plan"] + total_at)
+        fx.ptr_store(lg, c["plan"] + lg_at)
 
 
 def _row_kind(c, r, rctx, total):
@@ -290,7 +525,20 @@ def split_keys(c, rctx, total):
     a rank's share of the step's ``total`` -- its owner would score it
     alone while the others idle. Every rank reads the same contexts, so every
     rank decides alike."""
+    if const_expr(
+        c.get("short_owned_verify", False) and c["S"] // c["qlen"] < c["world"]
+    ):
+        return rctx > SHORT_VERIFY_CTX
     return (rctx > SPLIT_MIN) & (2 * c["world"] * rctx > total)
+
+
+def short_verify_step(c):
+    """All active requests fit the local-Q path; no row is key-split."""
+    if const_expr(not c.get("short_owned_verify", False)):
+        return fx.Boolean(False)
+    if const_expr(c["max_ctx"] <= SHORT_VERIFY_CTX):
+        return fx.Boolean(True)
+    return (fx.ptr_load(c["rows"] + 2) & 4) != 0
 
 
 def owner(c, r):
@@ -408,7 +656,9 @@ def _score_firsts(c):
 
 
 def _seg_firsts(c):
-    return c["plan"] + PLAN_FIRSTS + pieces(c)
+    # Both runtime score plans must fit before the fixed segment table.
+    reserve = c["S"] if c.get("short_score", False) else pieces(c)
+    return c["plan"] + PLAN_FIRSTS + reserve
 
 
 def _lanes(s):
@@ -475,11 +725,13 @@ def locate_segment(c, sid):
 
 
 # ---------------------------------------------------------------- score
-def _block_keys(c, blk, key, j):
+def _block_keys(c, blk, key, j, page=0):
     """A lane's key of one cache block: dims j*16 .. +16 and (4 + j)*16 ..
     +16 (two 16 B loads) and its scale, at device scope (the newest key was
     written by this launch, ``stage_k``)."""
     sh = c["shape"]
+    if sh.kv_dtype == "fp4":
+        return fp4.keys(c, blk, key, j, page)
     kv = [
         fx.Vector(
             bo.buffer_load(
@@ -526,6 +778,8 @@ def _query(sh, j, lane, q_at, w_at):
     """A row's FP8 query (an i64 of 8 E4M3 a 16-head half and MFMA step) and
     folded head weights, a lane's share: ``q_at(head, word)`` / ``w_at(head)``
     load 16 B of the row's query / weights from where it is held."""
+    if sh.kv_dtype == "fp4":
+        return fp4.query(sh, j, lane, q_at, w_at)
     qs, ws = [], []
     for hh in range_constexpr(sh.heads // TILE):
         head = TILE * hh + lane % 16
@@ -600,6 +854,30 @@ def _rows_store(c, vs):
             fx.ptr_store(v, c["qrows"] + at)
 
 
+def _dot_terms(sh, qs, ws, b64, ks, wide=False):
+    if sh.kv_dtype == "fp4":
+        return fp4.terms(sh, qs, ws, b64, ks)
+    terms = {}
+    for hh in range_constexpr(sh.heads // TILE):
+        acc = fx.Vector.filled(4, 0.0, fx.Float32)
+        if const_expr(wide):
+            # Both operands share the K permutation. Unit MX scales preserve
+            # the existing FP8 data and external query/key scales.
+            acc = mfma_scaled(
+                qs[hh].bitcast(fx.Int32),
+                b64.bitcast(fx.Int32),
+                acc,
+                fx.Int32(127),
+                fx.Int32(127),
+            )
+        else:
+            for x in range_constexpr(4):
+                acc = mfma_fp8(qs[hh][x], b64[x], acc)
+        for e in range_constexpr(4):
+            terms[hh, e] = (fx.max(acc[e] * ks, fx.Float32(0.0)), ws[hh][e])
+    return terms
+
+
 @traced
 def stage_score(c, p, u0, nu, width):
     """Piece p's score units u0 .. u0 + nu - 1 (nu <= ``width``, a build
@@ -664,6 +942,7 @@ def stage_score(c, p, u0, nu, width):
             rsrc(a["cache"] + fx.Int64(e) * fx.Int64(sh.block_bytes)),
             row + lane % 16,
             dg,
+            e,
         )
         for e, row in blocks
     ]
@@ -676,13 +955,7 @@ def stage_score(c, p, u0, nu, width):
             nxt = _staged_query(c, r + 1, dg, lane)
         for i in range_constexpr(width):
             b64, ks = keys[i]
-            terms = {}
-            for hh in range_constexpr(sh.heads // TILE):
-                acc = fx.Vector.filled(4, 0.0, fx.Float32)
-                for x in range_constexpr(4):
-                    acc = mfma_fp8(qs[hh][x], b64[x], acc)
-                for e in range_constexpr(4):
-                    terms[hh, e] = (fx.max(acc[e] * ks, fx.Float32(0.0)), ws[hh][e])
+            terms = _dot_terms(sh, qs, ws, b64, ks, wide=c.get("wide_fp8", False))
             col = SCORE_KEYS * (u0 + i) + TILE * wave + lane % 16
             score = fx.Float32(head_sum(terms))
             # the row's keys alone: the next row's ILOG starts past its last
@@ -698,7 +971,9 @@ def stage_score(c, p, u0, nu, width):
                 )
     c["stamp"](c["tl_score"] + 2)
     # thread k: the piece's row k // TASK_UNITS, unit k % TASK_UNITS
-    fr, fu = tid // TASK_UNITS, tid % TASK_UNITS
+    # Balanced short tasks can span 9..11 units instead of a power of two.
+    flag_width = max(TASK_UNITS, width)
+    fr, fu = tid // flag_width, tid % flag_width
     flag = sflag_at(c, lead + fx.min(fr, span - 1)) + u0 + fu
     publish(
         c["put"], c["sflag"], flag, fx.Int32(1), (fu < nu) & (fr < span)
@@ -707,25 +982,161 @@ def stage_score(c, p, u0, nu, width):
 
 
 @traced
-def score_task(c, p, t, lg):
+def score_task(c, p, t, lg, max_lg=TASK_UNITS_LG):
     """Score task t of piece p (``step_table``): up to 2^lg units, on the
     build of that width."""
     u0 = t << lg
     nu = fx.min(score_units(c, p) - u0, 1 << lg)
-    for w in range_constexpr(TASK_UNITS_LG + 1):
+    for w in range_constexpr(max_lg + 1):
         if lg == w:
             stage_score(c, p, u0, nu, 1 << w)
+
+
+def _stream_loads(c, r, u0, n, width):
+    """A tile's FP8 keys/scales, flat for the prefetch loop's carried state."""
+    sh, lane, wave = c["shape"], c["lane"], c["wave"]
+    u0 = fx.Int32(u0)
+    units = (n + SCORE_KEYS - 1) // SCORE_KEYS
+    blocks = [
+        key_block(c, r, fx.min(u0 + i, units - 1) * SCORE_KEYS + TILE * wave, n - 1)
+        for i in range(width)
+    ]
+    keys = [
+        _block_keys(
+            c,
+            rsrc(c["args"]["cache"] + fx.Int64(e) * fx.Int64(sh.block_bytes)),
+            row + lane % 16,
+            lane // 16,
+            e,
+        )
+        for e, row in blocks
+    ]
+    return [v for pair in keys for v in pair]
+
+
+@traced
+def _stream_tile(c, r, u0, n, qs, ws, state, width):
+    sh, lane, wave = c["shape"], c["lane"], c["wave"]
+    u0 = fx.Int32(u0)
+    for i in range_constexpr(width):
+        b64 = fx.Vector(state[2 * i])
+        ks = (
+            fx.Int32(state[2 * i + 1])
+            if const_expr(sh.kv_dtype == "fp4")
+            else fx.Float32(state[2 * i + 1])
+        )
+        terms = _dot_terms(sh, qs, ws, b64, ks)
+        col = SCORE_KEYS * (u0 + i) + TILE * wave + lane % 16
+        score = fx.Float32(head_sum(terms))
+        if (lane < 16) & (col < n):
+            bo.buffer_store(
+                score, rsrc(c["ilog"]), ilog_at(c, r) + col, cache_modifier=CM_DEV
+            )
+
+
+@traced
+def _stream_range(c, r, n, start, stop, stride, prefetch, width=STREAM_UNITS):
+    """Reuse Q across strided four-unit tiles; drain/publish once per range.
+
+    The next tile's device-scope reads overlap this tile's MFMAs. No score
+    needs another wave's values, so no intermediate barrier is required.
+    """
+    sh, tid, lane = c["shape"], c["tid"], c["lane"]
+    if start < stop:
+        c["stamp"](c["tl_score"])
+        if tid < sh.heads:
+            c["poll"]([(c["qq"], r * sh.heads + tid, 1)])
+        slot = fx.Int32(
+            bo.buffer_load(rsrc(c["args"]["slots"]), 2 * r, vec_width=1, dtype=T.i32)
+        )
+        if (tid == sh.heads) & (slot >= 0):
+            c["poll"]([(c["kdone"], r, 1)])
+        gpu.barrier()
+        c["stamp"](c["tl_score"] + 1)
+        qs, ws = _row_query(c, r, lane // 16, lane)
+        if const_expr(prefetch):
+            initial = _stream_loads(c, r, start, n, width)
+            for u0, state in range(start, stop - stride, stride, init=initial):
+                u = fx.Int32(u0)
+                nxt = _stream_loads(c, r, u + stride, n, width)
+                _stream_tile(c, r, u, n, qs, ws, state, width)
+                result = yield nxt
+            last = start + (stop - 1 - start) // stride * stride
+            _stream_tile(c, r, last, n, qs, ws, result, width)
+        else:
+            for u0 in range(start, stop, stride):
+                state = _stream_loads(c, r, u0, n, width)
+                _stream_tile(c, r, u0, n, qs, ws, state, width)
+        c["stamp"](c["tl_score"] + 2)
+        # Each thread announces one of this CTA's units, after every wave's
+        # score stores have drained. The other CTAs publish disjoint units.
+        owned = ((stop - 1 - start) // stride + 1) * width
+        for k in range((owned + THREADS - 1) // THREADS):
+            t = tid + k * THREADS
+            u = start + t // width * stride + t % width
+            publish(c["put"], c["sflag"], sflag_at(c, r) + u, fx.Int32(1), u < stop)
+        c["stamp"](c["tl_score"] + 3)
+
+
+@traced
+def _stream_rows(c, blocks, prefetch, width=STREAM_UNITS):
+    r, g = c["bid"] % c["S"], c["bid"] // c["S"]
+    groups = (blocks - 1 - r) // c["S"] + 1
+    _, n, long, _ = row_kind(c, r)
+    if long:
+        units = (n + SCORE_KEYS - 1) // SCORE_KEYS
+        _stream_range(c, r, n, g * width, units, groups * width, prefetch, width)
+
+
+@traced
+def score_row_stream(c):
+    """Mid-size DCP decode: stream Q-reusing tiles, balanced across the grid.
+
+    Power-of-two batches divide the CTAs evenly. Other widths take contiguous
+    equal-size ranges of the existing task plan, possibly spanning two rows.
+    Small plans keep the original single-round scorer (BS128 uses four units
+    per CTA without prefetch). Wide dual-CTA buckets use two-unit tiles to
+    retain the register headroom for two resident CTAs per CU.
+    """
+    total, lg = score_plan(c)
+    if lg < TASK_UNITS_LG:
+        if c["bid"] < BLOCKS:
+            if const_expr(c["S"] == 128):
+                _stream_rows(c, BLOCKS, False)
+            else:
+                for task in range(c["bid"], total, BLOCKS):
+                    p, t = locate_score(c, task)
+                    score_task(c, p, t, lg, max_lg=TASK_UNITS_LG - 1)
+    else:
+        if const_expr(c["S"] in (64, 128, 256)):
+            width = 2 if c["S"] > 128 else STREAM_UNITS
+            _stream_rows(c, c["score_blocks"], True, width)
+        else:
+            blocks = c["score_blocks"]
+            width = 2 if c["S"] > 128 else STREAM_UNITS
+            task = total * c["bid"] // blocks
+            end = total * (c["bid"] + 1) // blocks
+            while task < end:
+                r, rt = locate_score(c, task)
+                _, n, _, _ = row_kind(c, r)
+                units = (n + SCORE_KEYS - 1) // SCORE_KEYS
+                nt = fx.min((units + TASK_UNITS - 1) // TASK_UNITS - rt, end - task)
+                first = rt * TASK_UNITS
+                last = fx.min(units, (rt + nt) * TASK_UNITS)
+                _stream_range(c, r, n, first, last, fx.Int32(width), True, width)
+                task = task + nt
 
 
 # ---------------------------------------------------------------- select
 # LDS ``sel`` words: the pass's digit, the keys still needed, this rank's ties
 # taken; from ``SEL_ROWS`` a word a row (``rows_before``)
 SEL_DIGIT, SEL_NEED, SEL_TAKE = range(3)
+SEL_BUCKET = 3
 SEL_ROWS = 4
 
 
-def _chunk_keys(c, r, at, here):
-    """This thread's keys of the chunk at local key ``at`` (keys at + tid PT
+def _chunk_keys(c, r, at, here, pt=PT):
+    """This thread's keys of the chunk at local key ``at`` (keys at + tid pt
     ..; ``here`` of them live from ``at``), as radix keys, quad loads;
     (live, keys). A load past the row reads the next row's or, past the
     last, 0 (the ILOG's bound); neither is live."""
@@ -733,18 +1144,18 @@ def _chunk_keys(c, r, at, here):
     live, keys = [], []
     base = ilog_at(c, r)
     src = rsrc(c["ilog"], c["ilog_bytes"])
-    for qd in range_constexpr(PT // 4):
+    for qd in range_constexpr(pt // 4):
         w = fx.Vector(
             bo.buffer_load(
                 src,
-                base + at + tid * PT + 4 * qd,
+                base + at + tid * pt + 4 * qd,
                 vec_width=4,
                 dtype=T.i32,
                 cache_modifier=CM_DEV,
             )
         )
         for e in range_constexpr(4):
-            ok = tid * PT + 4 * qd + e < here
+            ok = tid * pt + 4 * qd + e < here
             live.append(ok)
             v = radix_key(fx.Int32(w[e]).bitcast(fx.Float32))
             keys.append(fx.Int32(ok.select(v, fx.Int32(0))))
@@ -753,8 +1164,9 @@ def _chunk_keys(c, r, at, here):
 
 def _zero_hist(c):
     """LDS ``hist`` cleared for a pass's counts."""
-    for k in range_constexpr(BINS_A_THREAD):
-        fx.ptr_store(fx.Int32(0), c["hist"] + _bin(c["tid"], k))
+    radix = c["radix"]
+    for k in range_constexpr(radix.bins_per_thread):
+        fx.ptr_store(fx.Int32(0), c["hist"] + _bin(c["tid"], k, radix.bins))
     gpu.barrier()
 
 
@@ -766,7 +1178,7 @@ def _count(c, live, keys, p, prefix):
     passes add each key under the prefix."""
     hist, pt = c["hist"], len(keys)
     if const_expr(p == 0):
-        ds = [digit(k, p) for k in keys]
+        ds = [digit(k, p, c["radix"]) for k in keys]
         run = fx.Int32(0)
         for i in range_constexpr(pt):
             run = run + live[i].select(fx.Int32(1), fx.Int32(0))
@@ -778,9 +1190,11 @@ def _count(c, live, keys, p, prefix):
             run = last.select(fx.Int32(0), run)
     else:
         for i in range_constexpr(pt):
-            if live[i] & under(keys[i], p, prefix):
+            if live[i] & under(keys[i], p, prefix, c["radix"]):
                 fx.llvm.atomic_add(
-                    hist + digit(keys[i], p), fx.Int32(1), syncscope="workgroup"
+                    hist + digit(keys[i], p, c["radix"]),
+                    fx.Int32(1),
+                    syncscope="workgroup",
                 )
 
 
@@ -789,9 +1203,9 @@ def _row_word(base, i):
     return word(base + fx.Int64(i) * fx.Int64(4))
 
 
-def _row_at(r, p, copy, b):
+def _row_at(r, p, copy, b, radix=DEFAULT_RADIX):
     """Row r's histogram of pass ``p``, copy ``copy``, bin ``b``: its ROWHIST word."""
-    return ((r * PASSES + p) * ROW_COPIES + copy) * BINS + b
+    return ((r * radix.passes + p) * ROW_COPIES + copy) * radix.bins + b
 
 
 @traced
@@ -801,12 +1215,13 @@ def _row_add(c, r, p, g):
     sum in any order), every bin also counting the segment in (``ARRIVED``):
     a bin's word says itself when its segments are all in."""
     tid = c["tid"]
-    for k in range_constexpr(BINS_A_THREAD):
-        b = _bin(tid, k)
+    radix = c["radix"]
+    for k in range_constexpr(radix.bins_per_thread):
+        b = _bin(tid, k, radix.bins)
         v = fx.ptr_load(c["hist"] + b)
-        if tid + k * THREADS < BINS:
+        if tid + k * THREADS < radix.bins:
             fx.llvm.atomic_add(
-                _row_word(c["rowhist"].value, _row_at(r, p, g % ROW_COPIES, b)),
+                _row_word(c["rowhist"].value, _row_at(r, p, g % ROW_COPIES, b, radix)),
                 v + ARRIVED, syncscope="agent",
             )  # fmt: skip
 
@@ -845,10 +1260,11 @@ def _row_counts(c, r, p, nseg):
     needs = [(nseg - k + ROW_COPIES - 1) // ROW_COPIES for k in range(ROW_COPIES)]
     # every thread's own counts read (``_row_add``) before any is overwritten
     gpu.barrier()
-    for k in range_constexpr(BINS_A_THREAD):
-        b = _bin(tid, k)
-        if tid + k * THREADS < BINS:
-            idxs = [_row_at(r, p, cp, b) for cp in range(ROW_COPIES)]
+    radix = c["radix"]
+    for k in range_constexpr(radix.bins_per_thread):
+        b = _bin(tid, k, radix.bins)
+        if tid + k * THREADS < radix.bins:
+            idxs = [_row_at(r, p, cp, b, radix) for cp in range(ROW_COPIES)]
             fx.ptr_store(_wait_bin(c, idxs, needs), c["hist"] + b)
     gpu.barrier()
 
@@ -860,7 +1276,8 @@ def _row_clear(c, r):
     (their drain does not wait on these): the step's next launch (the peer
     region is zeroed a step, not a launch) finds it as the step's first did."""
     tid = c["tid"]
-    quads = PASSES * ROW_COPIES * BINS // 4
+    radix = c["radix"]
+    quads = radix.passes * ROW_COPIES * radix.bins // 4
     zero = fx.Vector.filled(4, 0, fx.Int32)
     for k in range_constexpr(-(-quads // THREADS)):
         i = tid + k * THREADS
@@ -876,12 +1293,13 @@ def _lead_push(c, r, p):
     """The row's leader (its segment 0) under the key split: the row's
     histogram of pass ``p`` here (LDS ``hist``) pushed to every rank."""
     tid, world, rank = c["tid"], c["world"], c["rank"]
-    for k in range_constexpr(BINS_A_THREAD):
-        b = _bin(tid, k)
-        if tid + k * THREADS < BINS:
+    radix = c["radix"]
+    for k in range_constexpr(radix.bins_per_thread):
+        b = _bin(tid, k, radix.bins)
+        if tid + k * THREADS < radix.bins:
             v = fx.ptr_load(c["hist"] + b)
             for dst in range_constexpr(world):
-                c["put"](c["phist"][dst], hist_at(r, p, rank, b, world), v)
+                c["put"](c["phist"][dst], hist_at(r, p, rank, b, world, radix), v)
 
 
 @traced
@@ -897,16 +1315,38 @@ def _decide(c, r, p, nseg, split):
     # waves: one poll batch a lane, a wave scan, one exchange of the waves'
     # totals. The waves past them poll the last wave's bins again and decide
     # nothing (no value assigned under a traced branch).
-    at = fx.min(c["wave"], DEC_WAVES - 1) * 64 + c["lane"]
-    bins = [BINS - 1 - (DEC_A_LANE * at + k) for k in range(DEC_A_LANE)]
+    radix = c["radix"]
+    at = fx.min(c["wave"], radix.waves - 1) * 64 + c["lane"]
+    bins = [
+        radix.bins - 1 - (radix.bins_per_lane * at + k)
+        for k in range(radix.bins_per_lane)
+    ]
     if split:
-        _choose(c, p, bins, *_rank_counts(c, r, p, bins))
+        if const_expr(c["split_q"]):
+            _choose(c, p, bins, *_active_rank_counts(c, r, p, bins))
+        else:
+            _choose(c, p, bins, *_rank_counts(c, r, p, bins))
     else:
         # no other rank holds a key of the row
         if nseg > 1:
             _row_counts(c, r, p, nseg)
         vs = [fx.ptr_load(c["hist"] + b) for b in bins]
-        _choose(c, p, bins, vs, [fx.Int32(0)] * DEC_A_LANE, vs)
+        _choose(c, p, bins, vs, [fx.Int32(0)] * radix.bins_per_lane, vs)
+
+
+@traced
+def _active_rank_counts(c, r, p, bins):
+    """Only deciding waves poll; the others still join _choose's barriers."""
+    values = fx.Vector.filled(3 * len(bins), 0, fx.Int32)
+    if c["wave"] < c["radix"].waves:
+        vs, lowers, heres = _rank_counts(c, r, p, bins)
+        values = fx.Vector.from_elements(vs + lowers + heres, fx.Int32)
+    n = len(bins)
+    return (
+        [values[i] for i in range(n)],
+        [values[n + i] for i in range(n)],
+        [values[2 * n + i] for i in range(n)],
+    )
 
 
 def _rank_counts(c, r, p, bins):
@@ -916,7 +1356,7 @@ def _rank_counts(c, r, p, bins):
     world, rank = c["world"], c["rank"]
     got = c["poll"](
         [
-            (c["phist_own"], hist_at(r, p, src, b, world), 1)
+            (c["phist_own"], hist_at(r, p, src, b, world, c["radix"]), 1)
             for b in bins
             for src in range(world)
         ]
@@ -945,23 +1385,26 @@ def _choose(c, p, bins, vs, lowers, heres):
     need = fx.ptr_load(sel + SEL_NEED)
     c["stamp"](c["tl_pass"] + 3 * p + 2)
     mine = vs[0]
-    for k in range_constexpr(1, DEC_A_LANE):
+    radix = c["radix"]
+    for k in range_constexpr(1, radix.bins_per_lane):
         mine = mine + vs[k]
     incl = wave_incl_scan(mine, lane)
-    deciding = wave < DEC_WAVES
+    deciding = wave < radix.waves
     if deciding & (lane == 63):
         fx.ptr_store(incl, scan + wave)
     gpu.barrier()
     above = incl - mine
-    for w in range_constexpr(DEC_WAVES - 1):
+    for w in range_constexpr(radix.waves - 1):
         above = above + (w < wave).select(fx.ptr_load(scan + w), fx.Int32(0))
-    for k in range_constexpr(DEC_A_LANE):
+    for k in range_constexpr(radix.bins_per_lane):
         if deciding & (above < need) & (need <= above + vs[k]):
             fx.ptr_store(bins[k], sel + SEL_DIGIT)
             fx.ptr_store(need - above, sel + SEL_NEED)
+            if const_expr(radix.local):
+                fx.ptr_store(vs[k], sel + SEL_BUCKET)
             # the last pass: the threshold bin's count on the lower ranks
             # and here
-            if const_expr(p == PASSES - 1):
+            if const_expr(p == radix.passes - 1):
                 take = fx.min(need - above - lowers[k], heres[k])
                 fx.ptr_store(fx.max(take, 0), sel + SEL_TAKE)
         above = above + vs[k]
@@ -986,11 +1429,11 @@ def _emit_chunk(c, r, slots, gt, eq, at, run, ties):
     ``at``: every key above the threshold, a tie while ``run`` (the
     segment's equal keys before it) is under ``ties``."""
     chosen = []
-    for i in range_constexpr(PT):
+    for i in range_constexpr(len(slots)):
         tie = eq[i] & (run < ties)
         run = run + eq[i].select(fx.Int32(1), fx.Int32(0))
         chosen.append(gt[i] | tie)
-    for i in range_constexpr(PT):
+    for i in range_constexpr(len(slots)):
         if chosen[i]:
             _put_slot(c, r, slots[i], at)
         # advanced outside the branch: no value carried out of a traced if
@@ -1016,6 +1459,70 @@ def _sum_before(c, g):
         gt = gt + fx.ptr_load(scan + w)
         eq = eq + fx.ptr_load(scan + WAVES + w)
     return gt, eq
+
+
+@traced
+def stage_short_selection(c, r, sid, n):
+    """One CTA selects an owned <=8K row; retain the normal peer lifetime."""
+    # Q's reduction is complete. Reuse its 8 KiB LDS for three local passes;
+    # distributed histograms keep their existing, smaller mailbox layout.
+    c = {**c, "radix": LOCAL_RADIX, "hist": fx.recast_iter(fx.Int32, c["red"])}
+    tid, sh, radix = c["tid"], c["shape"], c["radix"]
+    sel = c["sel"]
+    units = (n + SCORE_KEYS - 1) // SCORE_KEYS
+    if tid < units:
+        c["poll"]([(c["sflag"], sflag_at(c, r) + tid, 1)])
+    if tid == 0:
+        fx.ptr_store(fx.Int32(sh.topk), sel + SEL_NEED)
+    gpu.barrier()
+    c["stamp"](4)
+    live, keys = _chunk_keys(c, r, fx.Int32(0), n, pt=LOCAL_SELECT_MAX // THREADS)
+    req = request_of(c, r)
+    slots = thread_slots(
+        c, req, fx.Int32(0), n, fx.Boolean(False), pt=LOCAL_SELECT_MAX // THREADS
+    )
+    at = fx.min(c["wave"], radix.waves - 1) * 64 + c["lane"]
+    bins = [
+        radix.bins - 1 - (radix.bins_per_lane * at + k)
+        for k in range(radix.bins_per_lane)
+    ]
+    prefix = fx.Int32(0)
+    done = fx.Boolean(False)
+    for p in range_constexpr(radix.passes):
+        if ~done:
+            _zero_hist(c)
+            _count(c, live, keys, p, prefix)
+            gpu.barrier()
+            vs = [fx.ptr_load(c["hist"] + b) for b in bins]
+            _choose(c, p, bins, vs, [fx.Int32(0)] * radix.bins_per_lane, vs)
+            prefix = (prefix << radix.bits[p]) | fx.ptr_load(sel + SEL_DIGIT)
+            # If the whole boundary bucket is needed, lower bits cannot
+            # change membership. Keep its lower bound for the final scan.
+            done = fx.ptr_load(sel + SEL_BUCKET) == fx.ptr_load(sel + SEL_NEED)
+        else:
+            prefix = prefix << radix.bits[p]
+    take = fx.ptr_load(sel + SEL_NEED)
+    c["stamp"](5)
+    gt, eq, packed = _marks(live, keys, prefix)
+    excl, _ = block_excl_scan(packed, c["lane"], c["wave"], c["scan"])
+    gt_before, eq_before = (excl >> 16) & 0xFFFF, excl & 0xFFFF
+    offset = fx.Int32(0)
+    if const_expr(c.get("direct", False)):
+        offset = fx.Int32(
+            bo.buffer_load(rsrc(c["args"]["out_ptr"]), r, vec_width=1, dtype=T.i32)
+        )
+    _emit_chunk(
+        c,
+        r,
+        slots,
+        gt,
+        eq,
+        offset + gt_before + fx.min(eq_before, take),
+        eq_before,
+        take,
+    )
+    if const_expr(not c.get("direct", False)):
+        _announce_row(c, r, fx.Int32(0), sid, fx.Boolean(True), fx.Int32(sh.topk))
 
 
 @traced
@@ -1054,7 +1561,8 @@ def stage_segment(c, r, g, sid, lg):
     req = request_of(c, r)
     slots = thread_slots(c, req, lo, n, split)
     prefix = fx.Int32(0)
-    for p in range_constexpr(PASSES):
+    radix = c["radix"]
+    for p in range_constexpr(radix.passes):
         _zero_hist(c)
         _count(c, live, keys, p, prefix)
         for kc in range(1, nck):
@@ -1071,13 +1579,13 @@ def stage_segment(c, r, g, sid, lg):
                 _row_counts(c, r, p, nseg)
             _lead_push(c, r, p)
         c["stamp"](c["tl_pass"] + 3 * p + 1)
-        if const_expr(p == PASSES - 1 and c["delay_rank"] >= 0):  # noqa: SIM102
+        if const_expr(p == radix.passes - 1 and c["delay_rank"] >= 0):  # noqa: SIM102
             # harness only (``IxBuild.delay_rank``): the last pass's pushes
             # have landed on every rank; this one reads its own late
             if c["rank"] == c["delay_rank"]:
                 sleep_ticks(c["delay_ticks"])
         _decide(c, r, p, nseg, split)
-        prefix = (prefix << DIGIT_BITS[p]) | fx.ptr_load(sel + SEL_DIGIT)
+        prefix = (prefix << radix.bits[p]) | fx.ptr_load(sel + SEL_DIGIT)
     take = fx.ptr_load(sel + SEL_TAKE)
     c["stamp"](5)
     # this segment's keys above the threshold and on it, a chunk's counts in
@@ -1169,16 +1677,16 @@ def key_slot(c, req, jj, split):
     return e * c["shape"].block_rows + row
 
 
-def thread_slots(c, req, at_key, n, split):
-    """A thread's PT keys of the chunk at local key ``at_key`` (``_chunk_keys``'
-    keys) as KV slots: PT consecutive keys from a multiple of PT share their
-    block (PT divides a block's rows and a replicated run), so one block
+def thread_slots(c, req, at_key, n, split, pt=PT):
+    """A thread's pt keys of the chunk at local key ``at_key`` (``_chunk_keys``'
+    keys) as KV slots: pt consecutive keys from a multiple of pt share their
+    block (pt divides a block's rows and a replicated run), so one block
     table load, issued with the keys -- not one a chosen key after the row's
     waits (``rows_before``)."""
-    first = at_key + c["tid"] * PT
+    first = at_key + c["tid"] * pt
     rows = c["shape"].block_rows
     e, _ = key_block(c, req, stored_at(c, fx.min(first, n - 1), split))
-    return [e * rows + stored_at(c, first + i, split) % rows for i in range(PT)]
+    return [e * rows + stored_at(c, first + i, split) % rows for i in range(pt)]
 
 
 def _put_slot(c, r, slot, at):
@@ -1186,7 +1694,9 @@ def _put_slot(c, r, slot, at):
     ``at`` of this rank's winners of the row, into this rank's own slab only:
     every rank reads them from it (``_replicated_long``), 16 B a load, not a
     4 B store a rank here."""
-    if const_expr(c["replicated"]):
+    if const_expr(c.get("direct", False)):
+        bo.buffer_store(slot, rsrc(c["args"]["out_idx"]), at)
+    elif const_expr(c["replicated"]):
         at = (r * c["world"] + c["rank"]) * c["shape"].topk + at
         bo.buffer_store(slot, rsrc(c["slab"]), at, cache_modifier=CM_SYS)
     else:
@@ -1207,8 +1717,17 @@ def rows_before(c, r):
             fx.ptr_store(fx.Int32(got[0][0]), sel + SEL_ROWS + tid)
     gpu.barrier()
     off = fx.Int32(0)
-    for q in range_constexpr(s):
-        off = off + (q < r).select(fx.ptr_load(sel + SEL_ROWS + q), fx.Int32(0))
+    if const_expr(s > 64):
+        # Each wave reduces all row tiles instead of every lane serially
+        # loading the whole prefix. Counts are integers, so the sum is exact.
+        for tile in range_constexpr(-(-s // 64)):
+            q = c["lane"] + 64 * tile
+            count = fx.ptr_load(sel + SEL_ROWS + fx.min(q, fx.Int32(s - 1)))
+            off = off + (q < r).select(count, fx.Int32(0))
+        off = wave_sum(off)
+    else:
+        for q in range_constexpr(s):
+            off = off + (q < r).select(fx.ptr_load(sel + SEL_ROWS + q), fx.Int32(0))
     gpu.barrier()
     return off
 
@@ -1274,7 +1793,37 @@ def _replicated_row(c, r):
                 e, row = key_block(c, req, j)
                 bo.buffer_store(e * c["shape"].block_rows + row, out, off + j)
     else:
-        _replicated_long(c, r, off, out, split)
+        if ~local_short_step(c):
+            _replicated_long(c, r, off, out, split)
+            if const_expr(c["world"] > 1):
+                _replicated_consumed(c, r, split)
+
+
+def local_short_step(c):
+    if const_expr(c.get("local_short", False)):
+        return short_verify_step(c)
+    return fx.Boolean(False)
+
+
+@traced
+def _replicated_consumed(c, r, split):
+    """Retire every peer read before a producer can enter its next layer."""
+    tid, world = c["tid"], c["world"]
+    src = owner(c, r)
+
+    def acknowledge(dsts, index, value):
+        if split:
+            for dst in dsts:
+                c["put"](dst, index, value)
+        else:
+            dst = preg(pick([a.value for a in dsts], src), 0, "rdone")
+            c["put"](dst, index, value)
+
+    publish(acknowledge, c["prdone"], r * world + c["rank"], fx.Int32(1), tid == 0)
+    if split | (src == c["rank"]):
+        if tid < world:
+            c["poll"]([(c["prdone_own"], r * world + tid, 1)])
+        gpu.barrier()
 
 
 @traced

@@ -1502,6 +1502,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 "index_dtype": dtypes.fp8,
                 "index_head_dim": hf_config.index_head_dim,
                 "index_fp4": self._indexer_fp4,
+                "index_layout": getattr(runner.config, "index_cache_layout", None)
+                or "preshuffle",
             }
             if runner.has_mla_indexer
             else {}
@@ -1884,11 +1886,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # MLA's latent projection is replicated across TP. Sparse MLA's
             # index-key projection/cache is replicated as well; only the query
             # heads and absorbed KV-B/output projections are TP-sharded.
-            # Consequently every PAGE byte published above is identical on
-            # every TP worker (DCP/PCP are separate axes and are rejected by
-            # the current LMCache MP connector).
-            tp_replication_factor=int(
-                getattr(runner.config, "tensor_parallel_size", 1) or 1
+            # DCP shards the token axis, so its PAGE bytes must stay per rank.
+            tp_replication_factor=(
+                1
+                if int(getattr(runner.config, "decode_context_parallel_size", 1) or 1)
+                > 1
+                else int(getattr(runner.config, "tensor_parallel_size", 1) or 1)
             ),
         )
 
@@ -2830,6 +2833,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             heads=self.index_n_heads,
             page_size=self.model_runner.block_size,
             storage=self._fp4_launches[ubatch],
+            layout=getattr(self.model_runner.config, "index_cache_layout", None)
+            or "preshuffle",
         )
 
     def _mtp_index_rows(
@@ -2958,6 +2963,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             heads=self.index_n_heads,
             page_size=self.model_runner.block_size,
             split=split,
+            layout=getattr(self.model_runner.config, "index_cache_layout", None)
+            or "preshuffle",
         )
 
     @staticmethod

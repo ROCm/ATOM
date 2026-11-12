@@ -9,15 +9,16 @@ that rule on ties, +-0, NaN and +-inf at every edge n.
 
 Thread i holds ``per_thread`` consecutive indices from i x per_thread, as
 keys in LDS, so thread order is index order and one block scan places the
-winners. Four 8-bit radix passes find the k-th key; integer counts, so the
-answer does not depend on arrival order.
+winners. Three radix passes (11, 11, 10 bits) find the k-th key, stopping
+early when the entire boundary bucket is needed. Integer counts make the
+answer independent of arrival order.
 """
 
 import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import Int32
 
-from atom.mono.device.ops import block_excl_scan, traced, wave_incl_scan, wave_max
+from atom.mono.device.ops import block_excl_scan, traced
 from atom.mono.device.select import INT_MIN, u32_lt
 from atom.mono.plan.execution import THREADS, WAVES
 
@@ -35,14 +36,15 @@ def key_bits(key):
     return (key < 0).select(key ^ INT_MIN, ~key)
 
 
-# a histogram: 256 bins, then a dummy bin a lane: a key outside the pass's
+# A histogram, then a dummy bin per lane: a key outside the pass's
 # prefix counts there, so the adds need no branch and no two lanes share one
-HIST_WORDS = 256 + 64
+RADIX_BITS = (11, 11, 10)
+HIST_WORDS = (1 << max(RADIX_BITS)) + 64
 
 
 def lds_words(per_thread: int = PER_THREAD) -> dict[str, int]:
     """The LDS the routine needs, in 32-bit words."""
-    return {"keys": THREADS * per_thread, "hist": 3 * HIST_WORDS, "buf": WAVES}
+    return {"keys": THREADS * per_thread, "hist": 3 * HIST_WORDS, "buf": WAVES + 3}
 
 
 def _no_extra():
@@ -81,56 +83,65 @@ def lds_topk(n, k, load, emit, lds, tid, per_thread=PER_THREAD, after_keys=None)
     prefix = Int32(0)
     mask = Int32(0)
     need = Int32(k)
+    done = fx.Boolean(False)
     n = fx.max(n, 0)
     # n <= k takes every key: no k-th to find
     if n > k:
-        # three histograms in rotation: pass p counts into p % 3 and clears
-        # (p + 2) % 3, which every wave finished reading before this pass's barrier
-        for p in range_constexpr(4):
-            shift = 24 - 8 * p
-            h = hist + (p % 3) * HIST_WORDS
-            dummy = 256 + lane
-            if const_expr(p == 0):
-                # a thread's keys are consecutive and logits share their top byte:
-                # a run of one bin goes in as one add at its end (the others add 0
-                # to the lane's own dummy bin), not an add a key on one hot bin
-                run_bin, run = Int32(dummy), Int32(0)
-                for d in range_constexpr(per_thread):
-                    bin_ = (base + d < n).select((kv[d] >> shift) & 255, dummy)
-                    same = bin_ == run_bin
-                    fx.llvm.atomic_add(
-                        h + same.select(dummy, run_bin), same.select(0, run),
-                        syncscope="workgroup",
-                    )  # fmt: skip
-                    run = same.select(run + 1, 1)
-                    run_bin = bin_
-                fx.llvm.atomic_add(h + run_bin, run, syncscope="workgroup")
-            else:
-                for d in range_constexpr(per_thread):
-                    key = kv[d]
-                    counted = (base + d < n) & ((key & mask) == prefix)
-                    bin_ = counted.select((key >> shift) & 255, dummy)
-                    fx.llvm.atomic_add(h + bin_, Int32(1), syncscope="workgroup")
-            gpu.barrier()
-            if (p + 2 < 4) & (tid < HIST_WORDS):
-                fx.ptr_store(Int32(0), hist + ((p + 2) % 3) * HIST_WORDS + tid)
-            # lane l: bins 255 - 4 l - q, highest first
-            cs = [fx.ptr_load(h + (255 - 4 * lane - q)) for q in range(4)]
-            s4 = cs[0] + cs[1] + cs[2] + cs[3]
-            before = wave_incl_scan(s4, lane) - s4
-            found = Int32(-1)
-            for q in range_constexpr(4):
-                hit = (before < need) & (need <= before + cs[q])
-                found = hit.select(
-                    ((255 - 4 * lane - q) << 16) | (need - before), found
+        # Pass p counts into histogram p and clears p + 2 ahead of its use.
+        for p in range_constexpr(len(RADIX_BITS)):
+            if ~done:
+                shift = sum(RADIX_BITS[p + 1 :])
+                bins = 1 << RADIX_BITS[p]
+                h = hist + p * HIST_WORDS
+                dummy = bins + lane
+                if const_expr(p == 0):
+                    run_bin, run = Int32(dummy), Int32(0)
+                    for d in range_constexpr(per_thread):
+                        bin_ = (base + d < n).select(
+                            (kv[d] >> shift) & (bins - 1), dummy
+                        )
+                        same = bin_ == run_bin
+                        fx.llvm.atomic_add(
+                            h + same.select(dummy, run_bin), same.select(0, run),
+                            syncscope="workgroup",
+                        )  # fmt: skip
+                        run = same.select(run + 1, 1)
+                        run_bin = bin_
+                    fx.llvm.atomic_add(h + run_bin, run, syncscope="workgroup")
+                else:
+                    for d in range_constexpr(per_thread):
+                        key = kv[d]
+                        counted = (base + d < n) & ((key & mask) == prefix)
+                        bin_ = counted.select((key >> shift) & (bins - 1), dummy)
+                        fx.llvm.atomic_add(h + bin_, Int32(1), syncscope="workgroup")
+                gpu.barrier()
+                if const_expr(p + 2 < len(RADIX_BITS)):
+                    for r in range_constexpr((HIST_WORDS + THREADS - 1) // THREADS):
+                        if tid + r * THREADS < HIST_WORDS:
+                            fx.ptr_store(
+                                Int32(0),
+                                hist + (p + 2) * HIST_WORDS + tid + r * THREADS,
+                            )
+                per = bins // THREADS
+                cs = [fx.ptr_load(h + (bins - 1 - per * tid - q)) for q in range(per)]
+                total = Int32(0)
+                for q in range_constexpr(per):
+                    total = total + cs[q]
+                before, _ = block_excl_scan(total, lane, wave, buf)
+                for q in range_constexpr(per):
+                    hit = (before < need) & (need <= before + cs[q])
+                    if hit:
+                        fx.ptr_store(Int32(bins - 1 - per * tid - q), buf + WAVES)
+                        fx.ptr_store(need - before, buf + WAVES + 1)
+                        fx.ptr_store(cs[q], buf + WAVES + 2)
+                    before = before + cs[q]
+                gpu.barrier()
+                prefix = prefix | (fx.ptr_load(buf + WAVES) << shift)
+                mask = mask | Int32(
+                    ((bins - 1) << shift) - (1 << 32) if p == 0 else (bins - 1) << shift
                 )
-                before = before + cs[q]
-            found = wave_max(found)
-            prefix = prefix | (((found >> 16) & 255) << shift)
-            mask = mask | Int32(
-                (255 << shift) - (1 << 32) if shift == 24 else 255 << shift
-            )
-            need = found & 0xFFFF
+                need = fx.ptr_load(buf + WAVES + 1)
+                done = fx.ptr_load(buf + WAVES + 2) == need
     take_all = n <= k
     # winners: keys above the k-th, then its ties lowest index first; one scan of
     # (above, ties) packed in 16-bit halves gives both prefixes
