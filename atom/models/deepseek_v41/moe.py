@@ -33,7 +33,6 @@ from atom.model_ops.deepseek_v41.router import (
     router_logits as fixed_order_router_logits,
 )
 from atom.model_ops.deepseek_v41.router import router_supported
-from atom.model_ops.deepseek_v41.router_topk import route_topk, route_topk_supported
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.topK import mm_topk
 from atom.model_ops.utils import atom_parameter
@@ -74,16 +73,6 @@ class MoE(V4MoE):
     def _topk(self, hidden_states, gating_output, topk, renormalize):
         image_mask = getattr(get_forward_context().attn_metadata, "image_mask", None)
         if image_mask is None:
-            bias = self.gate.e_score_correction_bias
-            if route_topk_supported(gating_output, bias, topk, renormalize):
-                # topk_gating's decode-width result, from a lighter kernel
-                return route_topk(
-                    gating_output,
-                    bias,
-                    topk,
-                    self.routed_scaling_factor,
-                    pass_scheduled_tokens_gpu(gating_output.shape[0]),
-                )
             return FusedMoE.select_experts(
                 hidden_states=hidden_states,
                 router_logits=gating_output,
