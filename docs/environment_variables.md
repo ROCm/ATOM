@@ -412,6 +412,23 @@ and catches it; set it when chasing a corruption that does not reproduce.
 | **ATOM_PREFIX_FAST_WALK** | bool | true | Look the prompt's chain up with C-speed `map` rounds (the first block alone, then 16, 64, ... blocks, so a cold prompt costs one lookup), compare tokens on the last hit block only (all blocks if that one differs), and let `allocate` claim the blocks `can_allocate` found instead of walking the prompt again; any block that changed in between sends it back to the block-by-block walk. `0` walks block by block with a token compare per block. |
 | **ATOM_PREFIX_WALK_MEMO** | bool | true | Reuse a waiting request's prefix walk across the probes that run every scheduler tick: the delayer's head check and probe, and the DP chunk-cost estimate (`BlockManager.can_allocate_memoized`). It walks again when a hash the walk read is evicted, remapped to another block or revoked by a republish of its block, the hash at its first miss is published, `clear_cache` runs, more than 8192 such changes happened since its last check, or the request's token count or seed changed. The fit, state gates and replay are re-asked on every tick, so the answer equals the exact probe; admission still probes exactly. `0` re-walks every tick. |
 
+## KV pool backend
+
+Who manages the paged KV pool. The default keeps it in the engine, as before.
+`umbp` hands it to a MORI-UMBP standalone server: UMBP allocates each rank's
+pool on that rank's GPU, the runner maps it, and DP ranks reuse each other's
+cached prefixes (a prefix another rank holds is copied into the requesting
+rank's own pool before the prefix walk). Needs MORI's `mori_umbp_l1` Python
+module on `PYTHONPATH` and a running `umbp_standalone_server`.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_KV_POOL_BACKEND** | str | local | `local`: the engine allocates and manages the pool. `umbp`: a UMBP standalone server owns the memory and the slot table. |
+| **ATOM_UMBP_L1_ADDRESS** | str | "" | gRPC address of the UMBP standalone server, e.g. `unix:///tmp/umbp.grpc.sock`. Required with `ATOM_KV_POOL_BACKEND=umbp`. |
+| **ATOM_UMBP_L1_NAMESPACE** | str | atom | Prefix of this engine's pool names (`<namespace>:dp<rank>:tp<rank>`). Two engines on one UMBP server need different ones. |
+| **ATOM_UMBP_L1_GROUP** | str | "" (derived) | Share group: pools exchange blocks only within a group. By default it is derived from the model, KV dtype, block size and draft settings. |
+| **ATOM_UMBP_L1_FETCH** | bool | true | `0` keeps the UMBP pool but never copies blocks in from other ranks' pools. |
+
 ## State checkpoints
 
 For models carrying per-request recurrent state (GDN: Qwen3-Next / Qwen3.5;

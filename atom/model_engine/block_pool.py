@@ -9,6 +9,7 @@ from heapq import heapify, heappop, heappush
 from itertools import islice
 
 from atom.model_engine.kv_block import Block
+from atom.model_engine.kv_block_pool import KVBlockPool
 
 
 @dataclass(frozen=True)
@@ -25,8 +26,11 @@ class BlockRetirement:
     moved_to: int
 
 
-class BlockPool:
+class BlockPool(KVBlockPool):
     """Paged blocks with ref counts and a content-addressed index.
+
+    ATOM's own `KVBlockPool`: the bookkeeping lives in this process, over a
+    tensor this process allocated.
 
     `BlockManager` owns the one instance, over the compressed KV blocks. This
     was split out when a second pool existed — the sliding window was its own

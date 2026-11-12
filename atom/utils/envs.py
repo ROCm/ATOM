@@ -165,6 +165,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # MoRIIO P/D: log the layers a receive left unchanged (debugging).
     "ATOM_MORIIO_VERIFY": lambda: _flag_env("ATOM_MORIIO_VERIFY", "0"),
+    # Who manages the paged KV pool: "local" (this process) or "umbp" (a UMBP
+    # standalone process that owns the GPU memory and shares it across engine
+    # ranks). See atom/model_engine/kv_block_pool.py.
+    "ATOM_KV_POOL_BACKEND": lambda: os.getenv("ATOM_KV_POOL_BACKEND", "local"),
+    # gRPC address of the UMBP standalone server, e.g. unix:///tmp/umbp.grpc.sock.
+    "ATOM_UMBP_L1_ADDRESS": lambda: os.getenv("ATOM_UMBP_L1_ADDRESS", ""),
+    # Prefix of this engine's pool names; two engines on one UMBP server need
+    # different ones.
+    "ATOM_UMBP_L1_NAMESPACE": lambda: os.getenv("ATOM_UMBP_L1_NAMESPACE", "atom"),
+    # 0 keeps the UMBP pool but never copies blocks in from other ranks' pools.
+    "ATOM_UMBP_L1_FETCH": lambda: os.getenv("ATOM_UMBP_L1_FETCH", "1") == "1",
+    # Overrides the derived share group (pools exchange blocks within a group).
+    "ATOM_UMBP_L1_GROUP": lambda: os.getenv("ATOM_UMBP_L1_GROUP", ""),
     # Protect reused KV prefixes from one-off prefill scans. Opt-in.
     "ATOM_PREFIX_CACHE_POLICY": lambda: os.getenv("ATOM_PREFIX_CACHE_POLICY", "lru"),
     "ATOM_PREFIX_CACHE_PROTECTED_RATIO": lambda: float(
