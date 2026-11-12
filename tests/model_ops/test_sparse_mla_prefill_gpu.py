@@ -13,6 +13,33 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def _forward_work_plan(meta, heads, dtype, topk_out):
+    """Plan `meta`'s DCP sparse prefill as the metadata builder does once a
+    forward, into its `sparse_prefill_*` buffers; each layer then patches it."""
+    from types import SimpleNamespace
+
+    from atom.model_ops.attentions.aiter_mla import AiterMLAMetadataBuilder
+
+    builder = SimpleNamespace(
+        dcp_sparse_prefill_nonps=False,
+        dcp_world_size=8,
+        block_size=1,
+        dtype_q=dtype,
+        dtype_kv=dtype,
+        index_topk_out=topk_out,
+        model_runner=SimpleNamespace(
+            forward_vars={
+                name: value
+                for name, value in vars(meta).items()
+                if name.startswith("sparse_prefill_")
+            }
+        ),
+    )
+    AiterMLAMetadataBuilder._sparse_prefill_work_plan(
+        builder, meta, "", heads, meta.sparse_kv_last_page_lens
+    )
+
+
 @pytest.mark.parametrize(
     "mla_heads,mla_dtype", [(16, "bf16"), (96, "bf16"), (96, "fp8")]
 )
@@ -210,6 +237,7 @@ def test_indexer_to_sparse_mla_matches_attention_reference(
                 for name, (shape, dtype) in zip(PERSISTENT_WORK_BUFFERS, sizes)
             },
         )
+        _forward_work_plan(meta, width, q.dtype, topk)
         return attn._forward_prefill_mla(q, cache, meta, return_lse=True)[0]
 
     modes = ("prefill", "decode", "decode_persistent")
@@ -305,7 +333,9 @@ def test_indexer_to_sparse_mla_matches_attention_reference(
         torch.testing.assert_close(
             output.cpu().float(), expected_out, rtol=0.02, atol=0.02 if fp8 else 0.002
         )
-        assert (output.cpu().float() - expected_out).norm() / expected_out.norm() < 0.01
+        # FP8 reduces each row in one work item, as it does in any large batch.
+        rel_error = (output.cpu().float() - expected_out).norm() / expected_out.norm()
+        assert rel_error < (0.02 if fp8 else 0.01)
 
         if length <= topk:
             # Independent dense attention over all causally visible keys.
@@ -363,11 +393,10 @@ def test_bf16_sparse_prefill_is_independent_of_batch_composition(candidate_width
     from itertools import accumulate
     from types import SimpleNamespace
 
-    import triton
     from aiter import get_mla_metadata_info_v1
     from aiter.mla import mla_decode_fwd
 
-    from atom.model_ops.attention_mla import MLAAttention
+    from atom.model_ops.sparse_mla_work_plan import patch_work_kv_ranges
 
     lengths = [1, 63, 64, 127, 128, 255, 256, 394, 479, 511, 512, 1025, candidate_width]
     gen = torch.Generator(device="cuda").manual_seed(3165 + candidate_width)
@@ -386,9 +415,6 @@ def test_bf16_sparse_prefill_is_independent_of_batch_composition(candidate_width
         "reduce_partial_map",
     )
     first = None
-    impl = SimpleNamespace(
-        _sparse_prefill_kv_granularity=triton.next_power_of_2(candidate_width)
-    )
     for rows in (65, 97, 162, 481):
         repeats = (rows + len(lengths) - 1) // len(lengths)
         q = fixed.repeat(repeats, 1, 1)[:rows].contiguous()
@@ -416,11 +442,13 @@ def test_bf16_sparse_prefill_is_independent_of_batch_composition(candidate_width
             for name, (shape, dtype) in zip(names, sizes)
         }
         meta = SimpleNamespace(
-            **{"sparse_prefill_" + name: value for name, value in work.items()}
+            sparse_cu_seqlens_q=qptr,
+            sparse_kv_indptr=kvptr,
+            sparse_kv_last_page_lens=last,
+            **{"sparse_prefill_" + name: value for name, value in work.items()},
         )
-        MLAAttention._rebuild_sparse_dcp_persistent_metadata(
-            impl, meta, q, kv, qptr, kvptr, last, 96, work_prefix="sparse_prefill_"
-        )
+        _forward_work_plan(meta, 96, q.dtype, candidate_width)
+        patch_work_kv_ranges(work["work_info_set"], work["work_indptr"], kvptr, rows)
         # Each live row has one whole interval, even at the smallest batch.
         info = work["work_info_set"][: int(work["work_indptr"][-1])].cpu()
         starts = kvptr.cpu().tolist()
@@ -570,6 +598,9 @@ def test_small_prefill_head_groups_refresh_graph_metadata(
         return lengths, packed
 
     update(0)
+    # One plan serves every state: no row outgrows its whole-row work item.
+    _forward_work_plan(meta, 128, q.dtype, 2048)
+    _forward_work_plan(base_meta, 128, q.dtype, 2048)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
