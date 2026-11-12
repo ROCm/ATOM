@@ -19,7 +19,9 @@ def _seq(seq_id, tokens):
         id=seq_id,
         num_prompt_tokens=len(tokens),
         dp_session_id=None,
-        prompt_hash_chain=SimpleNamespace(hash_block_size=HBS, hashes=hashes),
+        prompt_hash_chain=SimpleNamespace(
+            hash_block_size=HBS, hashes=hashes, cache_seed=None
+        ),
     )
 
 
@@ -55,8 +57,8 @@ def test_prefix_in_tier_is_credited_on_any_rank():
         router, _seq(2, PREFIX + list(range(10**6, 10**6 + 2_000))), backlog, reqs
     )
     assert route.rank != first.rank
-    # Credited the sampled prefix (multiple of STRIDE_TOKENS).
-    assert cost == 42_000 - (40_000 // 1024) * 1024
+    # The shared radix index retains every complete hash block.
+    assert cost == 42_000 - 40_000
 
 
 def test_prefix_still_prefilling_is_credited_only_on_its_rank():
@@ -65,7 +67,7 @@ def test_prefix_still_prefilling_is_credited_only_on_its_rank():
     first, _ = _route(router, _seq(1, PREFIX), backlog, reqs)
     other = 1 - first.rank
     seq = _seq(2, PREFIX + list(range(10**6, 10**6 + 2_000)))
-    hit = (40_000 // 1024) * 1024
+    hit = 40_000
     # The other rank pays the whole prompt; the producer's rank only the rest.
     route = router.select(seq, list(backlog), list(reqs))
     expected = min(
@@ -255,7 +257,7 @@ def test_a_promoted_backup_that_also_aborts_takes_the_entry_with_it():
     _route(router, _seq("B", PREFIX), backlog, reqs)
     router.release("A")
     router.release("B")
-    assert not router.index and not router.backups
+    assert not router.index and not router.pending
     router.select(_seq("C", PREFIX + [9] * 2_000), [0, 0], [0, 0])
     assert router.charge("C") == 0  # the prefix is cold again
 
@@ -268,19 +270,20 @@ def test_a_rank_that_did_not_find_the_prefix_drops_the_stale_entries():
     backlog, reqs = [0, 0], [0, 0]
     _route(router, _seq(1, PREFIX), backlog, reqs)
     router.prefill_complete(1)
-    route, cost = _route(router, _seq(2, PREFIX + [7] * 2_000), backlog, reqs)
+    _route_result, cost = _route(router, _seq(2, PREFIX + [7] * 2_000), backlog, reqs)
     assert cost < 42_000  # placed on the prefix the index lists
     # Its rank found only 8192 tokens.
     assert router.note_reuse(2, 8192)
-    _, src_rank, src_seq = router._longest_hit(_seq(3, PREFIX).prompt_hash_chain)
-    assert src_seq == 2 and src_rank == route.rank  # seq 2 produces the rest
+    path = router._path(_seq(3, PREFIX).prompt_hash_chain)
+    assert router._tier_hit(path) <= 8192 + HBS
+    assert 2 in router._produced  # seq 2 computes its missing suffix
     assert router.prefilling(2)
     # Once seq 2 completes, the whole prefix counts as loadable again.
     router.prefill_complete(2)
     _, cost3 = _route(router, _seq(3, PREFIX), backlog, reqs)
-    assert cost3 == 40_000 - (40_000 // 1024) * 1024
+    assert cost3 == 0
     # A report at the estimate (one hash block of replay below it) drops nothing.
-    assert not router.note_reuse(3, (40_000 // 1024) * 1024 - HBS)
+    assert not router.note_reuse(3, 40_000 - HBS)
 
 
 def test_reuse_reports_leave_entries_of_a_producer_still_prefilling():
@@ -288,10 +291,10 @@ def test_reuse_reports_leave_entries_of_a_producer_still_prefilling():
     backlog, reqs = [0, 0], [0, 0]
     first, _ = _route(router, _seq(1, PREFIX), backlog, reqs)
     backlog[1 - first.rank] = 10**9  # keep the second on the producer's rank
-    route, cost = _route(router, _seq(2, PREFIX + [7] * 2_000), backlog, reqs)
-    assert route.rank == first.rank and cost < 42_000
+    _route_result, cost = _route(router, _seq(2, PREFIX + [7] * 2_000), backlog, reqs)
+    assert _route_result.rank == first.rank and cost < 42_000
     assert not router.note_reuse(2, 0)  # seq 1 is still prefilling it
-    assert router._longest_hit(_seq(3, PREFIX).prompt_hash_chain)[2] == 1
+    assert 1 in router.pending.values()
 
 
 def test_a_released_placement_forgets_its_reuse_report():
@@ -302,7 +305,7 @@ def test_a_released_placement_forgets_its_reuse_report():
     _route(router, _seq(2, PREFIX), backlog, reqs)
     router.release(2)
     assert not router.note_reuse(2, 0)
-    assert router._placed == {}
+    assert router._reuse_pending == {}
 
 
 def test_the_manager_counts_stale_placements_from_rank_reports():
@@ -398,7 +401,7 @@ def test_every_backup_of_a_prefix_is_kept():
     router.prefill_complete("C")
     router.select(_seq("D", PREFIX + [9] * 2_000), [0, 0], [0, 0])
     assert router.charge("D") > 0
-    assert not router.backups
+    assert set(router.seq_hashes) == {"D"}
 
 
 def test_a_readmitted_partial_prefill_counts_in_the_backlog():

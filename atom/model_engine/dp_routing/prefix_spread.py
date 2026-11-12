@@ -33,7 +33,16 @@ if TYPE_CHECKING:
 class _PrefixInterval:
     """A compressed radix edge of consecutive chained block hashes."""
 
-    __slots__ = ("children", "domain", "hashes", "hbs", "parent", "root_hash", "start")
+    __slots__ = (
+        "children",
+        "domain",
+        "hashes",
+        "hbs",
+        "parent",
+        "remote_valid",
+        "root_hash",
+        "start",
+    )
 
     def __init__(self, hashes, start, hbs, parent, domain):
         self.hashes = hashes
@@ -43,6 +52,7 @@ class _PrefixInterval:
         self.root_hash = hashes[0] if parent is None else parent.root_hash
         self.parent = parent
         self.children = {}
+        self.remote_valid = True
 
     @property
     def end(self):
@@ -107,6 +117,10 @@ class PrefixSpreadRouter:
         self._in_flight: dict = {}
         # Placement-time credit backed independently of any pending producer.
         self._independent_credit: dict = {}
+        # Reuse reports for work-based placement, awaiting actual admission.
+        # The hash chain is the same object retained by the common index.
+        self._reuse_pending: dict = {}
+
         self._over_budget = 0
         self._tail_trim = 0
         self._tail_trim_tokens = 0
@@ -143,6 +157,7 @@ class PrefixSpreadRouter:
         self._produced.clear()
         self._in_flight.clear()
         self._independent_credit.clear()
+        self._reuse_pending.clear()
         self._prune_empty(affected)
         for edge in affected:
             self._refresh_evictable(edge)
@@ -177,6 +192,7 @@ class PrefixSpreadRouter:
             ):
                 continue  # this producer arrived after the completing request
             del self.pending[(edge, rank)]
+            edge.remote_valid = True
             produced = self._produced.get(producer)
             if produced is not None:
                 produced.discard(edge)
@@ -197,6 +213,7 @@ class PrefixSpreadRouter:
 
     def release(self, seq_id) -> dict:
         """Release a request; return extra prefill charges for its successors."""
+        self._reuse_pending.pop(seq_id, None)
         if seq_id not in self._in_flight:
             self.prefill_complete(seq_id)
             return {}
@@ -204,6 +221,102 @@ class PrefixSpreadRouter:
         return self._left_unprefilled(seq_id)
 
     # -- placement ------------------------------------------------------------
+
+    def select_work(
+        self,
+        seq: Any,
+        rank_tokens: list[int],
+        rank_reqs: list[int],
+        choose: Callable[[list[int], list[int], list[int], int | None], int],
+    ) -> Route:
+        """Use a work placement rule with the common prefix/producer index.
+
+        Every candidate gets its own HBM credit plus precisely the missing
+        prefix the configured tier can load. Pending producers only supply
+        local credit; the tier supplies completed prefixes.
+        """
+        chain = getattr(seq, "prompt_hash_chain", None)
+        path = self._path(chain)
+        hits, owner = self._rank_hits(len(rank_tokens), path, all_pending=True)
+        credits = [
+            self._credit(seq, rank, hits, None, path)
+            for rank in range(len(rank_tokens))
+        ]
+        costs = [max(0, seq.num_prompt_tokens - hit) for hit, _loaded in credits]
+        rank = choose(rank_tokens, rank_reqs, costs, owner)
+        hit, loaded = credits[rank]
+        self._record(
+            chain, rank, seq.id, hit, self._independent_hit(seq, rank, hit, path)
+        )
+        if hit:
+            self._reuse_pending[seq.id] = (chain, hit, rank)
+        decision = (
+            "share_cache_source_rank_total"
+            if hit
+            and rank == owner
+            and any((edge, rank) in self.pending for edge, _end in path)
+            else "share_cache_hit_total" if hit else "share_cache_cold_total"
+        )
+        return Route(rank, decision, hit, loaded)
+
+    def note_reuse(self, seq_id, reused: int) -> bool:
+        """Correct confirmed prefix hints after admission reports a real miss.
+
+        A replay can back off one hash block without indicating a cache miss.
+        Active producer intervals remain provisional and are never invalidated
+        by this report. Only confirmed history past the actual reuse is stale.
+        """
+        placed = self._reuse_pending.pop(seq_id, None)
+        if placed is None:
+            return False
+        chain, credit, rank = placed
+        hbs = int(chain.hash_block_size)
+        threshold = max(0, int(reused)) + hbs
+        if threshold >= credit:
+            return False
+        path = self._path(chain)
+        if not path:
+            return False
+        self._path(chain, create=True, boundary=credit // hbs)
+        path = self._path(chain, create=True, boundary=threshold // hbs)
+        producing = seq_id in self._in_flight
+        dropped = False
+        affected = []
+        for edge, end in path:
+            if end <= threshold or end > credit:
+                continue
+            holders = self.index[edge]
+            confirmed = [
+                owner for owner in holders if (edge, owner) not in self.pending
+            ]
+            if not confirmed:
+                continue
+            # The target's miss does not invalidate another rank's HBM.
+            # Only its own confirmed local holder and the remote-tier hint
+            # are unsupported by the actual admission report.
+            changed = edge.remote_valid or rank in confirmed
+            edge.remote_valid = False
+            if rank in confirmed:
+                del holders[rank]
+            if not changed:
+                continue
+            dropped = True
+            if producing and (edge, rank) not in self.pending:
+                holders[rank] = seq_id
+                self.pending[(edge, rank)] = seq_id
+                self._produced.setdefault(seq_id, set()).add(edge)
+            affected.append(edge)
+        if dropped:
+            if producing:
+                self._in_flight[seq_id] = min(self._in_flight[seq_id], threshold)
+                self._independent_credit[seq_id] = min(
+                    self._independent_credit.get(seq_id, 0), threshold
+                )
+            self._prune_empty(affected)
+            for edge in affected:
+                self._refresh_evictable(edge)
+            self._trim_history()
+        return dropped
 
     def select(
         self,
@@ -274,6 +387,8 @@ class PrefixSpreadRouter:
             credit,
             self._independent_hit(seq, rank, credit, path),
         )
+        if credit:
+            self._reuse_pending[seq.id] = (chain, credit, rank)
         return Route(rank, "explicit_total", credit, loaded)
 
     def _credit(self, seq, rank, hits, owner, path):
@@ -282,7 +397,7 @@ class PrefixSpreadRouter:
             return local, 0
         in_tier = self._tier_hit(path)
         loaded = self.tier.loadable_tokens(local, in_tier, seq.num_prompt_tokens)
-        return local + loaded, loaded
+        return self.tier.credited_tokens(local, loaded), loaded
 
     def _independent_hit(self, seq, rank, credit, path):
         """Credit available without waiting for a same-rank producer.
@@ -306,7 +421,7 @@ class PrefixSpreadRouter:
         loaded = self.tier.loadable_tokens(
             local, self._tier_hit(path), seq.num_prompt_tokens
         )
-        return min(credit, local + loaded)
+        return min(credit, self.tier.credited_tokens(local, loaded))
 
     def _idle_target(
         self,
@@ -401,6 +516,7 @@ class PrefixSpreadRouter:
         edge.parent = prefix
         prefix.children[edge.hashes[0]] = edge
         self.index[prefix] = dict(self.index[edge])
+        prefix.remote_valid = edge.remote_valid
         # Splitting copies interval ownership, not the requests relying on it.
         # Each request continues to retain one chain independent of tree depth.
         for rank in self.index[edge]:
@@ -423,6 +539,8 @@ class PrefixSpreadRouter:
             return
         (child,) = edge.children.values()
         holders = self.index[edge]
+        if edge.remote_valid != child.remote_valid:
+            return
         if list(holders.items()) != list(self.index[child].items()) or any(
             (e, rank) in self.pending for e in (edge, child) for rank in holders
         ):
@@ -438,14 +556,18 @@ class PrefixSpreadRouter:
 
     def _tier_hit(self, path) -> int:
         """Longest matching prefix with a finished holder on any rank."""
+        for index, (edge, _hit) in enumerate(path):
+            if not edge.remote_valid:
+                path = path[:index]
+                break  # a longer remote prefix cannot skip a missing interval
         for edge, hit in reversed(path):
-            if any(
+            if edge.remote_valid and any(
                 seq_id not in self._in_flight for seq_id in self.index[edge].values()
             ):
                 return hit
         return 0
 
-    def _rank_hits(self, n: int, path):
+    def _rank_hits(self, n: int, path, *, all_pending: bool = False):
         """Longest prefix per rank; equal-length owners use last-recorded order.
 
         Other ranks' unfinished producers do not supply a local hit. Seed and
@@ -462,7 +584,7 @@ class PrefixSpreadRouter:
                     continue
                 if owner is None:
                     owner = rank
-                elif seq_id in self._in_flight:
+                elif seq_id in self._in_flight and not all_pending:
                     continue
                 hits[rank] = hit
             if len(hits) == n:
