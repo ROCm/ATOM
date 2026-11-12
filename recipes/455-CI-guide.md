@@ -11,7 +11,7 @@
 | 周末验证 | 每周六 10:30–22:30，12 小时 | 2 个节点：e15-06、e15-07 | MLPerf Endpoint 的 4 个模型 | 开测前按 §2 构建本周镜像：取 `gfx1250-atom-<YYYYMMDD>` 系列里最新的一个作 base，装上当时的 ATOM main 和 aiter main，推成 `rocm/fw-bringup-mlperf:gfx1250-atom-ci455-<周六日期>` |
 | 周中验证 | 每周三 17:30–22:30，5 小时 | 1 个节点：e15-09 | 8K/1K 的 4 个模型 | 不构建，复用上一个周六的镜像（§2.5） |
 
-- 每场按 §3 逐个模型测，每个模型先测 GSM8K 精度、再测性能。跑挂了就记下核心 error log，接着测下一个模型。
+- 每场按 §3 逐个模型测，每个模型先测 GSM8K 精度、再测性能。跑挂了就记下核心 error log，接着测下一个模型。机器挂了不算跑挂：告诉 user，等 user 重启恢复机器后接着测没测完的（§3.6）。
 - **每测完一个模型，就把它的精度和性能数据推到 `455-CI` 分支**（§3.5），不攒到最后。数据按 §4 记录，历史数据都留在 `recipes/455-CI/` 里。
 - 全部测完后按 §5 出本场的报告 `455-CI-report-<场次日期>.md`：一个 md 文件，前面是简短 summary（Highlights 和总表，给老板看），后面是详细 summary。推到 `455-CI` 后，最后给出这个 md 文件的路径（§5.6）。
 - 只有周六构建镜像。周六构建失败时，这一周的两场都记 N/A（§2.1）。
@@ -59,6 +59,7 @@
 - **只重装 ATOM 和 aiter，且只用 `ROCm/ATOM` 和 `ROCm/aiter` 的 `main`。** 不 checkout 私有分支或 PR，不 cherry-pick，不打 patch。base 里自带的补丁（如 `/app/endpoints-recipe-*/patches`）也不用。
 - **其他组件保持 base 原样**（torch、triton、mori 等），只有 ATOM / aiter main 自己锁定版本的依赖跟着 main 走。例如 aiter main 锁定 `flydsl==0.5.0`，base 里的版本不同时，安装会把它换掉。这正是本 CI 要暴露的状态：不要手动换回，把变化记进 `image.json` 的 `dependency_changes`（§2.4）。
 - **构建失败**（clone、安装或 import 不通过）时，这一周两场的所有模型都记 N/A，error 写构建的核心报错。周三不另建镜像，要补建先和负责人确认。不要改用私有分支凑合。
+- **构建时机器挂了不算构建失败**：按 §3.6 告诉 user。恢复后先 `docker rm -f ci455-build-${DATE}`，再从 §2.2 重新来；§2.2 的同名检查会说明本周镜像是不是已经推上去了。
 
 ### 2.2 选 base、命名和同名检查
 
@@ -324,7 +325,7 @@ EOF
 
 ### 3.4 跑挂了
 
-下面任一情况都算失败：server 没起来或中途退出；GSM8K 或 bench 报错退出、卡住；结果文件缺失或不完整。
+下面任一情况都算失败：server 没起来或中途退出；GSM8K 或 bench 报错退出、卡住；结果文件缺失或不完整。机器挂了不算，按 §3.6 处理。
 
 1. **不盲目重试。** 纯环境问题（GPU 没释放、端口被占、下载失败）修好后可以重跑一次，并在报告里注明"重跑"。
 2. **摘核心 error log**，存到 `$RUN_DIR/$MODEL/error.log`，不超过 100 行。报告详细 summary 的 Failures 一节会贴出它的前 60 行：
@@ -365,6 +366,51 @@ CI 只负责记录。要查根因就另开任务，从 ATOM 的 `/debug-guide` �
 - 两个节点同时追加 CSV 不会冲突：`recipes/455-CI/.gitattributes` 给 `perf.csv`、`accuracy.csv` 设了 `merge=union`，rebase 时两边新加的行都保留。其他结果文件按模型分目录，互不影响。
 - 推不上去（例如网络问题）时本地 commit 还在，可以先接着测，下一个模型上传时会一起推。不要 force push。
 - commit message 不加 `Co-Authored-By` trailer，这是 ROCm/ATOM 维护者的要求。§5.6 的提交也一样。
+
+### 3.6 机器挂了
+
+测的过程中机器本身挂了，不是模型或软件的问题，**不记成错误**：不写 `perf.csv`、`accuracy.csv` 的行，也不写 `error.log`。停下来告诉 user，请 user 重启、恢复机器，恢复后接着测没测完的模型。机器由 user 来重启和修复，agent 不要自己重启。
+
+**先分清是机器挂了还是跑挂了。** 测试停下来后，在这个模型用到的每个节点上查（Kimi-K3 是两个）：
+
+```bash
+uptime -s                                                         # 开机时间晚于开测时间：中途重启过
+rocm-smi --showid | grep -o '^GPU\[[0-9]*\]' | sort -u | wc -l    # GPU 数，应该和开测前一样（1P4G 是 4）
+# 按 3.2 第 4 步清掉进程，等 2 分钟再看
+ls /sys/class/kfd/kfd/proc | wc -l                                # 应该是 0
+```
+
+| 现象 | 算什么 |
+|---|---|
+| 节点登不上（ssh 连不上、命令一直不返回）；中途重启过；GPU 少了或 `rocm-smi` 报错；进程杀不掉、GPU 一直释放不了；docker 没响应 | 机器挂了，按本节处理 |
+| 机器正常，只是 server、lm_eval 或 bench 报错退出或卡住；清掉进程后 GPU 都在、都空闲 | 跑挂了，按 §3.4 记录 |
+
+拿不准就先不记，问 user。周六只挂了一个节点时，另一个节点上的测试照常进行。
+
+**告诉 user**：哪个节点、什么时候、什么现象，当时在测什么，哪些已经测完上传、哪些还没测。例如：
+
+> e15-07 在 14:20 挂了：ssh 连不上。当时在测 Kimi-K3 的 c64 性能。已经测完并上传的：DeepSeek R1、DeepSeek-V4.1-Flash；还没测完的：Kimi-K3、Qwen-35B-A3B。请重启恢复 e15-07，好了告诉我，我从 Kimi-K3 接着测。
+
+agent 自己就跑在挂掉的机器上、会话也断了时，user 恢复机器后新开一个会话，从下面的"恢复后接着测"开始。
+
+**恢复后接着测**：
+
+```bash
+# 1) 机器好了：GPU 都在、都空闲，本周镜像还在（NEW_IMAGE 见 §2.5）
+rocm-smi --showid | grep -o '^GPU\[[0-9]*\]' | sort -u | wc -l    # 和开测前一样
+test "$(ls /sys/class/kfd/kfd/proc | wc -l)" = 0
+docker image inspect "$NEW_IMAGE" >/dev/null 2>&1 || docker pull "$NEW_IMAGE"
+
+# 2) 本场哪些模型已经上传了，以 455-CI 分支为准（checkout 不在了就按前置条件重新 clone）
+cd "$CI_DIR"
+git status -sb | head -1        # 有 [ahead N]：挂之前 commit 了还没推，先按 §3.5 的循环推上去
+git pull -q --rebase --autostash origin 455-CI
+awk -F, -v d=<YYYY-MM-DD> '$2 == d {print $4}' perf.csv accuracy.csv | sort -u
+```
+
+- 本场的模型里，列表上没有的都要测。挂掉时正在测的那个从头重测：重起 server，GSM8K 和两个并发都重来，不用挂之前的半截结果。测完照常按 §3.5 上传，`note` 注明是机器恢复后重测的。
+- 同一个模型重测时机器又挂了，可能是这个模型把机器弄挂的：停下来把两次的现象告诉 user，由 user 决定怎么记。不要自己记成跑挂，也不要测第三次。
+- 到场次结束时间还没恢复或没测完，问 user 是延后接着测，还是这场到此为止。没测成的模型不写任何行：报告里显示 —（没有结果），Highlights 里也不会出现，不算跑挂。
 
 ## 4. 记录
 
@@ -545,7 +591,7 @@ Image `gfx1250-atom-ci455-<YYYYMMDD>` · ATOM `main@<sha 前 9 位>` · aiter `m
 - 一个模型一行，依次是 Model、Scenario、上一场、本场、Delta、GSM8K delta。表格下面不加说明文字。
 - 第三、四列是并发 64 的每卡吞吐（口径见 §4.1：endpoint 是输出 token，8K/1K 是输入加输出 token），表头写上一场和本场的日期。上一场取该模型最近一次成功的那一场：例子里 Kimi-K3 上一场（11-07）跑挂了，就和 10-31 那场比，并在格子里注明日期。
 - Delta 只写百分比，例如 `+6.9%`。GSM8K delta 写掉了多少、现在多少，例如 `−4.6 pts (now 88.1%)`。
-- N/A 表示跑挂、没有值；— 表示没有结果；first 表示第一次有数据，没有可比的。
+- N/A 表示跑挂、没有值；— 表示没有结果（例如机器挂了没测成，§3.6）；first 表示第一次有数据，没有可比的。
 
 ### 5.3 详细 summary
 

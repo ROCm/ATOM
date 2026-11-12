@@ -174,7 +174,11 @@ def _news(results):
                     f"🟢 {who}: {_phrase(up, top, lambda c: c.delta, '{subject} up {pct}')}.",
                 )
             )
-        if any(c.prev_failed for c in r.perf) or r.acc.prev_failed:
+        # Only what ran this session can have recovered: a model left untested
+        # (say its machine went down, guide §3.6) has no rows and no news.
+        ran = [c for c in r.perf if c.status == "ok"]
+        ran += [r.acc] if r.acc.status == "ok" else []
+        if any(c.prev_failed for c in ran):
             items.append((5, r.slug, f"✅ {who}: recovered from the previous failure."))
     return sorted(
         items, key=lambda item: item[0]

@@ -394,3 +394,32 @@ def test_only_the_previous_session_counts_not_an_older_best():
         acc_cell([], "endpoint", "alpha", "2026-11-14"),
     )
     assert highlights([result]) == NONE
+
+
+def test_a_model_that_did_not_run_this_session_has_not_recovered():
+    # e.g. its machine went down before it ran (455-CI-guide.md §3.6): no rows
+    hl = highlights(
+        [
+            model(
+                "Alpha",
+                pc(4, None, 100.0, status="missing", prev_failed=True),
+                pc(64, None, 1000.0, status="missing", prev_failed=True),
+                ac(None, 0.95, status="missing", prev_failed=True),
+            )
+        ]
+    )
+    assert hl == NONE
+
+
+def test_summary_row_of_a_model_that_did_not_run_shows_dashes_not_na():
+    row = summary_row(
+        model(
+            "Alpha",
+            pc(4, None, 100.0, status="missing"),
+            pc(64, None, 1000.0, status="missing"),
+            ac(None, 0.95, status="missing"),
+        ),
+        "2026-11-14",
+        "2026-11-07",
+    )
+    assert row == ["Alpha", "MLPerf Endpoint", "1,000", "—", "—", "—"]

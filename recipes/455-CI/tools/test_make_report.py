@@ -185,3 +185,21 @@ def test_news_about_a_model_without_an_owner_is_flagged_on_the_console(
     main(["--date", "2026-11-14", "--data-dir", str(tmp_path)])
     out = capsys.readouterr().out
     assert "no owner" in out and "Kimi-K3" in out
+
+
+def test_a_model_left_untested_by_a_machine_failure_is_not_news(tmp_path):
+    # Kimi-K3 failed on 11-07; on 11-14 its node went down before it ran, so it
+    # has no rows (455-CI-guide.md §3.6): no failure, no recovery, only dashes.
+    write_csv(
+        tmp_path / "perf.csv",
+        PERF_COLUMNS,
+        [
+            perf("2026-10-31", 64, "1000"),
+            perf("2026-11-07", 64, "", status="fail", error="RuntimeError: x"),
+            perf("2026-11-14", 64, "1500", model="deepseek-r1"),
+        ],
+    )
+    main(["--date", "2026-11-14", "--data-dir", str(tmp_path)])
+    report = (tmp_path / "reports" / "455-CI-report-20261114.md").read_text()
+    assert "Kimi-K3" not in report.split("### Results")[0]
+    assert "| Kimi-K3 (2.8T) | MLPerf Endpoint | 1,000 | — | — | — |" in report
