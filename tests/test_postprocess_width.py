@@ -397,7 +397,8 @@ def test_channel_constraint_preserves_raw_logprobs(
     batch.top_logprobs = [3, 0]
     batch.required_channel = object()
 
-    def force_channel(_runner, _batch, bonus, _metadata, target):
+    def force_channel(_runner, _batch, bonus, _metadata, target, preserve_masks=False):
+        assert preserve_masks is False
         for logits in (bonus, target):
             if logits is not None:
                 logits[:, 1:] = -float("inf")
