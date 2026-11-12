@@ -1904,12 +1904,13 @@ def replayssm_sigmoid_gating_delta_rule(
 #
 # The unfused KDA decode / verify chain is `causal_conv1d_update`, the
 # `f_b_proj` GEMM and the kernel above, each over a few dozen rows. The
-# kernel below does all three from the in_proj output's column views. One program owns one head of one sequence: the head's q/k/v conv
-# channels, its checkpoint and its records. The conv state may be updated in
-# place and a flush rewrites the records the replay reads, so every read of
-# either has to land before any write. Only a barrier inside one program can
-# order that: `tl.debug_barrier` also orders the global memory accesses of
-# the program's warps.
+# kernel below does all three from the in_proj output's column views. One
+# program owns one head of one sequence: the head's q/k/v conv channels, its
+# checkpoint and its records. The conv state may be updated in place and a
+# flush rewrites the records the replay reads, so every read of either has to
+# land before any write. Only a barrier inside one program can order that:
+# `tl.debug_barrier` also orders the global memory accesses of the program's
+# warps.
 #
 # Whatever does not depend on the state -- the conv, the gate, the q / k
 # normalisation and exp(g) -- runs over the whole step up front, and the
