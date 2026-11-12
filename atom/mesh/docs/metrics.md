@@ -25,7 +25,7 @@ Two endpoints render the same registry:
 
 ```bash
 curl -s http://<router-host>:<router-port>/metrics \
-  | grep -E '^mesh_(route|session|selected_dp_rank)'
+  | grep -E '^mesh_(route|session)'
 ```
 
 Values accumulate from router start. Use `rate()` or `increase()` in
@@ -56,34 +56,22 @@ Counters carry the `_total` suffix; histograms expose `_bucket`, `_sum` and
 without PD disaggregation, otherwise `prefill` or `decode`. `policy` is one of
 `random`, `round_robin`, `power_of_two`, `cache_aware`, `prefix_hash` and
 `dp_sticky`.
-Decisions and dispatches are counted per attempt: a PD request adds one per
-pool, and a retry adds another.
+Decisions are counted per attempt: a PD request adds one per pool, and a retry
+adds another.
 
-"Since" is the change that starts recording the metric. #3141 already declares
-the #3142 metrics as planned, so a build with only #3141 renders no line for
-them.
-
-| Metric | Type / unit | Labels | Recorded when | Since |
-| --- | --- | --- | --- | --- |
-| `mesh_route_branch_total` | Counter, decisions | `pool`, `policy`, `branch` (see [Branches](#branches)) | Every selection, including one in a pool without candidates. | [#3141] |
-| `mesh_route_prefix_match_ratio` | Histogram, ratio 0 to 1 | `pool`, `policy` | `cache_aware` branches `affinity`, `relocate`, `stale_tenant`. | [#3141] |
-| `mesh_route_selected_worker_active_requests` | Histogram, active requests | `pool`, `policy`, `branch` | Every selection that picks a worker, before the router adds the request (see [below](#selected-workers-active-requests)). | [#3141] |
-| `mesh_session_affinity_total` | Counter, requests | `pool`, `result`: `hit`, `new`, `rebind`, `expired` | `dp_sticky` selected a worker for a request with a session ID. | [#3141] |
-| `mesh_session_worker_change_total` | Counter, requests | `pool`, `reason`: `rebind`, `expired`, `rank_mapping` | A `dp_sticky` session request is sent to a different worker (URL and DP rank) than the session's previous request (see [below](#worker-changes)). | [#3141] |
-| `mesh_selected_dp_rank_total` | Counter, dispatches | `pool`, `worker` (base URL), `dp_rank` (rank or `none`) | HTTP routers dispatch a request, after DP rank mapping. | [#3142] |
-| `mesh_route_cache_tokens_total` | Counter, tokens | `pool` (`regular` or `prefill`), `kind`: `prompt`, `cached` | HTTP routers; the response reported cached tokens. Any policy. | [#3142] |
-| `mesh_route_cache_estimate_tokens_total` | Counter, tokens | `pool`, `kind`: `prompt`, `estimated`, `actual` | The same, when the policy also estimated a hit; today only `cache_aware`. | [#3142] |
-| `mesh_route_cache_estimate_error_ratio` | Histogram, ratio -1 to 1 | `pool` | Same requests: (estimated - actual) / prompt tokens. | [#3142] |
-| `mesh_prefill_overlap_blocks` | Histogram, KV blocks | `pool`, `policy`, `medium`: `gpu`, `cpu`, `disk`, `remote` | Not recorded; reserved for routing on engine KV events. | planned |
-| `mesh_prefix_hash_policy_branch_total` | Counter, decisions | `branch` | `prefix_hash`, the same branches without `pool`. Deprecated by #3141 for `mesh_route_branch_total{policy="prefix_hash"}`. | before [#3141] |
+| Metric | Type / unit | Labels | Recorded when |
+| --- | --- | --- | --- |
+| `mesh_route_branch_total` | Counter, decisions | `pool`, `policy`, `branch` (see [Branches](#branches)) | Every selection, including one in a pool without candidates. |
+| `mesh_route_prefix_match_ratio` | Histogram, ratio 0 to 1 | `pool`, `policy` | `cache_aware` branches `affinity`, `relocate`, `stale_tenant`. |
+| `mesh_route_selected_worker_active_requests` | Histogram, active requests | `pool`, `policy`, `branch` | Every selection that picks a worker, before the router adds the request (see [below](#selected-workers-active-requests)). |
+| `mesh_session_affinity_total` | Counter, requests | `pool`, `result`: `hit`, `new`, `rebind`, `expired` | `dp_sticky` selected a worker for a request with a session ID. |
+| `mesh_session_worker_change_total` | Counter, requests | `pool`, `reason`: `rebind`, `expired`, `rank_mapping` | A `dp_sticky` session request is sent to a different worker (URL and DP rank) than the session's previous request (see [below](#worker-changes)). |
+| `mesh_prefix_hash_policy_branch_total` | Counter, decisions | `branch` | `prefix_hash`, the same branches without `pool`. Deprecated by [#3141] for `mesh_route_branch_total{policy="prefix_hash"}`. |
 
 Histogram buckets:
 
 - prefix match ratio: 0, 0.1, 0.2, ..., 0.9, 0.95, 1;
-- selected worker's active requests: 0, 1, 2, 4, ..., 4096;
-- estimate error ratio: -1, -0.5, -0.25, -0.1, -0.05, -0.01, 0, 0.01, 0.05,
-  0.1, 0.25, 0.5, 1;
-- overlap blocks: 0, 1, 2, 4, ..., 16384.
+- selected worker's active requests: 0, 1, 2, 4, ..., 4096.
 
 ## Branches
 
@@ -173,38 +161,6 @@ different DP rank than the previous one. A session that moves leaves its KV
 cache on the old worker. The HTTP routers and the external-processing PD
 executor record it; gRPC routers do not.
 
-### Router estimate and engine-reported cached tokens
-
-Recorded from [#3142]. `kind="cached"` is the engine's own count, read from the response usage
-(`usage.prompt_tokens_details.cached_tokens`,
-`usage.input_tokens_details.cached_tokens` or `usage.cache_read_input_tokens`).
-It is recorded on the pool that ran the prompt, `prefill` or `regular`, never
-`decode`. A streaming response carries usage only if the client asks for it,
-for example `stream_options.include_usage`; requests without a cached count
-are not recorded.
-
-`kind="estimated"` is the router's guess at selection time:
-round(prefix match ratio x prompt tokens). It exists only when `cache_aware`
-picked the worker holding the best match, which covers every `affinity`
-decision and any `relocate` that happened to pick it. The router drops it when
-it dispatches to a different DP rank than the policy chose, because ranks keep
-separate KV caches. `kind="actual"` repeats the engine count for exactly those
-requests, so `estimated` and `actual` compare like for like.
-
-The two differ because the ratio counts characters while the engine counts
-tokens in blocks, and the tree does not see engine eviction, chat templates or
-KV offload. A positive error means the router overestimated; a negative one
-means the engine reused more than predicted. Engine-side cache detail stays on
-the engines' own metrics, available through `/engine_metrics` (for ATOM, see
-[Prefix cache and KV reuse](../../../docs/metrics_guide.md#prefix-cache-and-kv-reuse)).
-
-### DP ranks
-
-Recorded from [#3142]. `mesh_selected_dp_rank_total` counts dispatches after
-the router maps the selection to a DP rank. `worker` is the base URL, which
-ranks behind one endpoint share; `dp_rank` is `none` for workers without ranks.
-Uneven counts across ranks of one endpoint show rank skew.
-
 ## Example queries
 
 Branch share per policy and pool:
@@ -228,17 +184,6 @@ Session worker changes per session request:
 sum by (pool, reason) (rate(mesh_session_worker_change_total[5m]))
   / ignoring (reason) group_left
     sum by (pool) (rate(mesh_session_affinity_total[5m]))
-```
-
-Engine-reported cache hit rate, and the router's estimate bias, from [#3142]:
-
-```promql
-sum by (pool) (rate(mesh_route_cache_tokens_total{kind="cached"}[5m]))
-  / sum by (pool) (rate(mesh_route_cache_tokens_total{kind="prompt"}[5m]))
-
-(sum(rate(mesh_route_cache_estimate_tokens_total{kind="estimated"}[5m]))
-  - sum(rate(mesh_route_cache_estimate_tokens_total{kind="actual"}[5m])))
-  / sum(rate(mesh_route_cache_estimate_tokens_total{kind="prompt"}[5m]))
 ```
 
 Median prefix match ratio:
@@ -287,4 +232,3 @@ Reading it:
   line.
 
 [#3141]: https://github.com/ROCm/ATOM/pull/3141
-[#3142]: https://github.com/ROCm/ATOM/pull/3142

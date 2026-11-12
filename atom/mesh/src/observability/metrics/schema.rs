@@ -198,20 +198,11 @@ pub mod labels {
     pub const WORKER_GRPC: &str = "grpc";
 
     // Routing decisions
-    pub const DP_RANK_NONE: &str = "none";
     pub const AFFINITY_HIT: &str = "hit";
     pub const AFFINITY_NEW: &str = "new";
     pub const AFFINITY_REBIND: &str = "rebind";
     pub const AFFINITY_EXPIRED: &str = "expired";
     pub const WORKER_CHANGE_RANK_MAPPING: &str = "rank_mapping";
-    pub const MEDIUM_GPU: &str = "gpu";
-    pub const MEDIUM_CPU: &str = "cpu";
-    pub const MEDIUM_DISK: &str = "disk";
-    pub const MEDIUM_REMOTE: &str = "remote";
-    pub const CACHE_PROMPT: &str = "prompt";
-    pub const CACHE_CACHED: &str = "cached";
-    pub const CACHE_ESTIMATED: &str = "estimated";
-    pub const CACHE_ACTUAL: &str = "actual";
 
     // Token types
     pub const TOKEN_INPUT: &str = "input";
@@ -275,11 +266,6 @@ pub mod names {
         "mesh_route_selected_worker_active_requests";
     pub const SESSION_AFFINITY_TOTAL: &str = "mesh_session_affinity_total";
     pub const SESSION_WORKER_CHANGE_TOTAL: &str = "mesh_session_worker_change_total";
-    pub const PREFILL_OVERLAP_BLOCKS: &str = "mesh_prefill_overlap_blocks";
-    pub const SELECTED_DP_RANK_TOTAL: &str = "mesh_selected_dp_rank_total";
-    pub const ROUTE_CACHE_TOKENS_TOTAL: &str = "mesh_route_cache_tokens_total";
-    pub const ROUTE_CACHE_ESTIMATE_TOKENS_TOTAL: &str = "mesh_route_cache_estimate_tokens_total";
-    pub const ROUTE_CACHE_ESTIMATE_ERROR_RATIO: &str = "mesh_route_cache_estimate_error_ratio";
 
     pub const WORKER_CB_STATE: &str = "mesh_worker_cb_state";
     pub const WORKER_CB_TRANSITIONS_TOTAL: &str = "mesh_worker_cb_transitions_total";
@@ -511,36 +497,6 @@ pub const METRIC_INVENTORY: &[MetricSpec] = &[
         status: MetricStatus::Active,
     },
     MetricSpec {
-        name: names::PREFILL_OVERLAP_BLOCKS,
-        kind: MetricKind::Histogram,
-        help: "Estimated KV overlap blocks of the selected candidate by pool, policy, medium",
-        status: MetricStatus::Planned,
-    },
-    MetricSpec {
-        name: names::SELECTED_DP_RANK_TOTAL,
-        kind: MetricKind::Counter,
-        help: "Dispatched requests after rank mapping by pool, worker (base URL), dp_rank",
-        status: MetricStatus::Planned,
-    },
-    MetricSpec {
-        name: names::ROUTE_CACHE_TOKENS_TOTAL,
-        kind: MetricKind::Counter,
-        help: "Tokens of routed requests whose response reported cached tokens by pool, kind (prompt/cached)",
-        status: MetricStatus::Planned,
-    },
-    MetricSpec {
-        name: names::ROUTE_CACHE_ESTIMATE_TOKENS_TOTAL,
-        kind: MetricKind::Counter,
-        help: "Tokens of routed requests with a router cache estimate by pool, kind (prompt/estimated/actual)",
-        status: MetricStatus::Planned,
-    },
-    MetricSpec {
-        name: names::ROUTE_CACHE_ESTIMATE_ERROR_RATIO,
-        kind: MetricKind::Histogram,
-        help: "Per-request (estimated - actual) cached tokens over prompt tokens by pool",
-        status: MetricStatus::Planned,
-    },
-    MetricSpec {
         name: names::WORKER_CB_STATE,
         kind: MetricKind::Gauge,
         help: "Circuit breaker state per worker (0=closed, 1=open, 2=half_open)",
@@ -648,19 +604,6 @@ pub(crate) const ROUTE_HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[
         names::ROUTE_SELECTED_WORKER_ACTIVE_REQUESTS,
         &[
             0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0,
-        ],
-    ),
-    (
-        names::PREFILL_OVERLAP_BLOCKS,
-        &[
-            0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0,
-            8192.0, 16384.0,
-        ],
-    ),
-    (
-        names::ROUTE_CACHE_ESTIMATE_ERROR_RATIO,
-        &[
-            -1.0, -0.5, -0.25, -0.1, -0.05, -0.01, 0.0, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0,
         ],
     ),
 ];
