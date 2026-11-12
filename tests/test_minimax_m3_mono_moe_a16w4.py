@@ -13,7 +13,7 @@ recomputes everything else in float64 / float32 from the logical (unshuffled) we
   routed, a8w4      : the same with xn and the mid quantized to MXFP8 (per 1x32, E8M0 ceil-pow2) first (the old kernel)
   shared (always)   : xn -> MXFP8, MXFP8 gate/up, swiglu, mid -> bf16 -> MXFP8, MXFP8 down
   ``prod_round`` off: routed f32 sum (slot weights applied in f32) + shared f32, rounded to bf16 once (the old kernel)
-  ``prod_round`` on : shared gate/up rounded to bf16 before swiglu, per-slot bf16(acc * w), routed = bf16(sum of the 4 slot
+  ``prod_round`` on : shared gate/up rounded to bf16 before swiglu, (a16w4) per-slot bf16(acc * w), routed = bf16(sum of the 4 slot
                       values), shared down rounded to bf16, out = bf16(routed + shared)  (PLAN.md section 0 / 3)
   (``a16w4`` alone keeps the f32 weight / sum / single rounding of the old kernel.)
 
@@ -195,7 +195,7 @@ def moe_oracle(h_in, gate, bias, g_post, experts, shared, routing, *, a16w4, pro
         t, s = (ids == e).nonzero(as_tuple=True)
         acc[t, s] = (midq[t, s] @ experts.dq2(e).T).float()
     slot = acc * w[..., None]
-    if prod_round:
+    if prod_round and a16w4:  # gemm2's epilogue; the a8w4 kernel's slots are summed across waves before any rounding
         slot = bf(slot)
     routed = slot[:, 0]
     for j in range(1, TOP_K):
@@ -302,7 +302,8 @@ LEGACY, NEW = (False, False), (True, True)
 def test_moe_matches_the_oracle(tokens, flags):
     got, want, d = run_case(tokens, *flags)
     assert torch.isfinite(got).all() and got.abs().max() > 0
-    assert d["rel"].median() <= 1e-3 and d["rel"].max() <= 5e-3, (d["rel"], d["rel_vs"])
+    med = 1e-3 if flags[0] else 2e-3  # the a8w4 kernel's own floor is higher (MXFP8 block flips)
+    assert d["rel"].median() <= med and d["rel"].max() <= 5e-3, (d["rel"], d["rel_vs"])
 
 
 if __name__ == "__main__":

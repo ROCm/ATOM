@@ -698,6 +698,7 @@ def moe_wide_defs(k4ctx):
             # the shared expert's units: its mid rows are the table's entry nu
             srow_b = fx.Int32(fx.ptr_load(urow + (nu * 16 + l16)))
             sw = fx.ptr_load(uwt + (nu * 16 + l16))
+            shacc = [fx.Float32(0.0) for _ in range(4)]
             for swv, ssc, skc, sok in sh_units:
                 scu = mfma_scaled(
                     a=swv,
@@ -707,20 +708,39 @@ def moe_wide_defs(k4ctx):
                     c=fx.Vector.filled(4, 0.0, fx.Float32),
                     a_fmt=FP8,
                 )
-                acc = [
-                    acc[e] + sok.select(scu[e] * sw, fx.Float32(0.0)) for e in range(4)
-                ]
+                if const_expr(prod_round):  # kept apart: production rounds each of the two
+                    shacc = [
+                        shacc[e] + sok.select(scu[e] * sw, fx.Float32(0.0))
+                        for e in range(4)
+                    ]
+                else:
+                    acc = [
+                        acc[e] + sok.select(scu[e] * sw, fx.Float32(0.0))
+                        for e in range(4)
+                    ]
         a0, a1, a2, a3 = acc
         fx.ptr_store(
             fx.Vector.from_elements([a0, a1, a2, a3], fx.Float32),
             red + (wave * 64 + lane) * 4,
         )
+        if const_expr(SH8 and prod_round):
+            # (the up partials' words: free in the down stage)
+            fx.ptr_store(
+                fx.Vector.from_elements(shacc, fx.Float32),
+                fpool + (W_UPP + (wave * 64 + lane) * 4),
+            )
         gpu.barrier()
         if tid < DN_ROWS * tokens:
             k = tid // DN_ROWS
             grp = (tid % DN_ROWS) // 16
             rr = tid % 16
-            tot = row_sum(red, rr, k, [grp * 4 + w for w in range(4)])
+            if const_expr(SH8 and prod_round):
+                grp_waves = [grp * 4 + w for w in range(4)]
+                tot = bf16_round(row_sum(red, rr, k, grp_waves)) + bf16_round(
+                    row_sum(fpool + W_UPP, rr, k, grp_waves)
+                )
+            else:
+                tot = row_sum(red, rr, k, [grp * 4 + w for w in range(4)])
             fx.ptr_store(bf16_round(tot), misc + tid)
         gpu.barrier()
         ffn_finish(td)
