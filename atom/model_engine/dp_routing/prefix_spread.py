@@ -60,6 +60,31 @@ class PrefixSpreadRouter:
     # the metrics exporter.
     DECISIONS = PREFIX_DECISIONS
     MOVED_TOKENS = PREFIX_MOVED_TOKENS
+    # Index-maintenance counters (`index_counters`), cumulative since the router
+    # was built; `reset` does not clear them. Plain integer increments made by the
+    # code that already does the work, under `CoreManager`'s lock: no extra walk.
+    #   over_budget_total   `_trim_history` calls that found the index over `CAP`
+    #   tail_trim_*         a leaf shortened from its tail (events, blocks, tokens)
+    #   leaf_evict_*        a whole leaf dropped by the budget (events, blocks,
+    #                       tokens; blocks/tokens are what the leaf held then)
+    #   trim_blocked_total  over-budget calls that ended still over `CAP` because
+    #                       only pinned (still-prefilling) edges were left
+    #   merge_total         `_merge_into_child` merges (a split undone)
+    #   reset_total         `reset` calls (the index itself survives them)
+    # Tail trim / leaf evict are the budget path only; `_prune_empty` drops of
+    # emptied edges are ordinary release bookkeeping and are not counted.
+    INDEX_COUNTERS = (
+        "over_budget_total",
+        "tail_trim_total",
+        "tail_trim_blocks_total",
+        "tail_trim_tokens_total",
+        "leaf_evict_total",
+        "leaf_evict_blocks_total",
+        "leaf_evict_tokens_total",
+        "trim_blocked_total",
+        "merge_total",
+        "reset_total",
+    )
 
     def __init__(
         self, idle_tokens: int, tier: OffloadTierProfile, max_seqs: int
@@ -95,12 +120,43 @@ class PrefixSpreadRouter:
         self._in_flight: dict = {}
         # Placement-time credit backed independently of any pending producer.
         self._independent_credit: dict = {}
+        self._over_budget = 0
+        self._tail_trim = 0
+        self._tail_trim_blocks = 0
+        self._tail_trim_tokens = 0
+        self._leaf_evict = 0
+        self._leaf_evict_blocks = 0
+        self._leaf_evict_tokens = 0
+        self._trim_blocked = 0
+        self._merges = 0
+        self._resets = 0
+
+    def index_counters(self) -> dict:
+        """Snapshot of the index-maintenance counters (`INDEX_COUNTERS`) plus the
+        current index size and budget. Read-only; call under the same lock as the
+        other router methods for a consistent view."""
+        return {
+            "over_budget_total": self._over_budget,
+            "tail_trim_total": self._tail_trim,
+            "tail_trim_blocks_total": self._tail_trim_blocks,
+            "tail_trim_tokens_total": self._tail_trim_tokens,
+            "leaf_evict_total": self._leaf_evict,
+            "leaf_evict_blocks_total": self._leaf_evict_blocks,
+            "leaf_evict_tokens_total": self._leaf_evict_tokens,
+            "trim_blocked_total": self._trim_blocked,
+            "merge_total": self._merges,
+            "reset_total": self._resets,
+            "indexed_tokens": self.indexed_tokens,
+            "budget_tokens": self.CAP,
+            "edges": len(self.index),
+        }
 
     def reset(self) -> None:
         """Forget in-flight state. The index stays: it describes the ranks'
         prefix caches, which outlive a batch."""
         # A dict, not a set: edges hash by address, and the order they are
         # refreshed below decides which history `_trim_history` evicts first.
+        self._resets += 1
         affected = dict.fromkeys(edge for edge, _rank in self.pending)
         for edge, rank in self.pending:
             holders = self.index.get(edge)
@@ -404,6 +460,7 @@ class PrefixSpreadRouter:
         child.parent = edge.parent
         siblings[child.hashes[0]] = child
         del self.index[edge]
+        self._merges += 1
 
     def _tier_hit(self, path) -> int:
         """Longest matching prefix with a finished holder on any rank."""
@@ -547,6 +604,7 @@ class PrefixSpreadRouter:
     def _trim_history(self):
         if self.indexed_tokens <= self.CAP:
             return
+        self._over_budget += 1
         # The budget covers unique edges, not replicated rank holders. Pinned
         # active edges may exceed it; releasing them makes them evictable.
         # A small overage shortens the oldest leaf from its tail (its head still
@@ -557,15 +615,28 @@ class PrefixSpreadRouter:
         # whole leaf, so one placement never takes more passes than whole-leaf
         # eviction did. Either way it is only approximately LRU: a recently used
         # leaf can lose a tail share while an older one is still held.
+        # Trade-off (synthetic workload, 400-block budget: 232 hot-prefix hits vs
+        # 553 with the whole-leaf eviction used before #3216; equal at 4000
+        # blocks): under a tight budget this plus `_merge_into_child` keeps a
+        # growing session's edge count bounded at the price of weaker LRU.
+        # `index_counters` shows whether this path runs.
         while self.indexed_tokens > self.CAP and self._evictable:
             edge = next(iter(self._evictable))
             excess = -(-(self.indexed_tokens - self.CAP) // edge.hbs)
             if excess < len(edge.hashes) and excess <= max(1, len(edge.hashes) // 8):
                 del edge.hashes[-excess:]
                 self.indexed_tokens -= excess * edge.hbs
+                self._tail_trim += 1
+                self._tail_trim_blocks += excess
+                self._tail_trim_tokens += excess * edge.hbs
                 self._refresh_evictable(edge)  # next victim: another history
             else:
+                self._leaf_evict += 1
+                self._leaf_evict_blocks += len(edge.hashes)
+                self._leaf_evict_tokens += len(edge.hashes) * edge.hbs
                 self._drop_edge(edge)
+        if self.indexed_tokens > self.CAP:
+            self._trim_blocked += 1
 
     def _left_unprefilled(self, seq_id) -> dict:
         """Transfer an unfinished producer's intervals and credit debt once."""
