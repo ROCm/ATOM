@@ -119,7 +119,7 @@ from atom.model_ops.v4_kernels import (
     swa_write,
     update_compressor_states,
 )
-from atom.models.dsv41_fused_shared_expert import (
+from atom.models.deepseek_v4.shared_expert_fusion import (
     fused_scale_kwargs,
     shared_expert_fused_act_enabled,
 )
