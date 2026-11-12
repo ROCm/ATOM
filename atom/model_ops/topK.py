@@ -10,7 +10,7 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 from atom.config import get_current_atom_config
 from atom.model_ops.fused_moe.expert_layout import SharedExpertMode
 from atom.model_ops.triton_topk_softmax import triton_topk_softmax
-from atom.moe_config import MoEExecutionPlan, moe_execution_plan_for_config
+from atom.moe_config import MoEExecutionPlan, get_moe_execution_plan
 from atom.quant_spec import fuses_mxfp8_shared_into_mxfp4
 from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
@@ -36,7 +36,7 @@ def is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
     # different mechanism, and an explicitly selected RCCL/none backend must
     # not be inferred from the mere presence of the ``mori`` Python package.
     # EPLB always fuses, otherwise the env decides.
-    plan = execution_plan or moe_execution_plan_for_config(config)
+    plan = execution_plan or get_moe_execution_plan(config)
     mori_selected = plan.transport in {"mori", "mori_v2", "mega"}
     if (
         dp_size > 1

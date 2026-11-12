@@ -3,10 +3,10 @@
 
 """MoE configuration shared by native and plugin execution.
 
-The backend request snapshots process settings; the mapping is resolved from
-the final worker topology, before creating weights. The execution plan owns
-the decision about who moves routed rows. None of the resolvers imports a GPU
-runtime, creates a process group, or examines tensors.
+Config snapshots process settings and resolves the logical mapping and transport
+before workers start. Workers project the same mapping onto their launch rank
+and validate their process groups. The resolvers never create a process group
+or examine tensors.
 """
 
 from dataclasses import dataclass
@@ -24,6 +24,7 @@ class MoEBackendConfig:
     mori_v2: bool = False
     fp4_dispatch: bool = False
     combine_quant: str = "none"
+    pcp_merge: bool = False
 
     def __post_init__(self):
         backend = str(self.backend).strip().lower()
@@ -78,6 +79,7 @@ def get_moe_backend_config(config) -> MoEBackendConfig:
         mori_v2=envs.ATOM_MORI_V2,
         fp4_dispatch=envs.ATOM_MORI_FP4_DISPATCH,
         combine_quant=envs.ATOM_MORI_COMBINE_QUANT,
+        pcp_merge=envs.ATOM_PCP_MOE_MERGE,
     )
     config.moe_backend_config = result
     return result
@@ -276,39 +278,20 @@ def resolve_moe_execution_plan(
     return MoEExecutionPlan(mapping, backend, implementation, fallback, reason)
 
 
-def moe_execution_plan_for_config(config) -> MoEExecutionPlan:
-    """Size-only plan for startup guards before worker groups are available.
+def get_moe_execution_plan(config) -> MoEExecutionPlan:
+    """Return the saved worker plan, or the saved rank-zero configuration plan."""
+    worker_plan = getattr(config, "worker_moe_execution_plan", None)
+    if worker_plan is not None:
+        return worker_plan
+    cached = getattr(config, "moe_execution_plan", None)
+    if cached is not None:
+        return cached
+    from atom.parallel_mapping import get_parallel_mapping
 
-    Native DP-attention turns each TP rank into a DP rank. Worker-side mapping
-    uses actual group ranks instead; neither path stores this preview as the
-    final mapping.
-    """
-    dp_attention = getattr(config, "enable_dp_attention", False)
-    tp_size = getattr(config, "tensor_parallel_size", 1)
-    parallel = getattr(config, "parallel_config", None)
-    dp_size = getattr(parallel, "data_parallel_size", 1)
-    local_dp = getattr(parallel, "data_parallel_size_local", None) or dp_size
-    if dp_attention:
-        dp_size *= tp_size
-        local_dp *= tp_size
-        tp_size = 1
-    sp = getattr(config, "sequence_parallel_size", 1)
-    pcp_size = max(getattr(config, "prefill_context_parallel_size", 1), sp)
-    from atom.utils import envs
-
-    mapping = MoEParallelMapping.make(
-        tp_size=tp_size,
-        dp_size=dp_size,
-        local_dp_size=local_dp,
-        dp_logical_size=getattr(config, "dp_logical_size", 0),
-        enable_ep=getattr(config, "enable_expert_parallel", False),
-        flatten_dp=dp_attention
-        or getattr(config, "moe_ep_flatten_tp_across_dp", False),
-        pcp_size=pcp_size,
-        merge_pcp=envs.ATOM_PCP_MOE_MERGE or sp > 1,
-    )
-    return resolve_moe_execution_plan(
-        mapping,
+    plan = resolve_moe_execution_plan(
+        get_parallel_mapping(config).for_rank(0).moe,
         get_moe_backend_config(config),
-        sequence_parallel_size=sp,
+        sequence_parallel_size=getattr(config, "sequence_parallel_size", 1),
     )
+    config.moe_execution_plan = plan
+    return plan

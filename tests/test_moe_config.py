@@ -12,7 +12,7 @@ from atom.moe_config import (
     MoEBackendConfig,
     MoEParallelMapping,
     get_moe_backend_config,
-    moe_execution_plan_for_config,
+    get_moe_execution_plan,
     resolve_moe_execution_plan,
 )
 
@@ -211,7 +211,7 @@ def test_backend_settings_are_a_snapshot_and_plans_are_immutable(monkeypatch):
         plan.transport = "local"
 
 
-def test_dp_attention_preview_survives_core_manager_topology_rewrite():
+def test_saved_dp_attention_plan_survives_runtime_field_updates():
     config = atom_config_double(
         tensor_parallel_size=8,
         parallel_config=SimpleNamespace(
@@ -221,12 +221,12 @@ def test_dp_attention_preview_survives_core_manager_topology_rewrite():
         enable_expert_parallel=True,
         moe_backend_config=MoEBackendConfig(mori_available=True),
     )
-    before = moe_execution_plan_for_config(config)
+    before = get_moe_execution_plan(config)
     config.tensor_parallel_size = 1
     config.parallel_config.data_parallel_size = 8
     config.parallel_config.data_parallel_size_local = 8
-    after = moe_execution_plan_for_config(config)
-    assert before == after
+    after = get_moe_execution_plan(config)
+    assert before is after
     assert after.mapping.ep_size == 8 and after.transport == "mori"
 
 
@@ -244,7 +244,7 @@ def test_tbo_guard_consumes_same_transport_plan(requested):
             all2all_backend=requested, mori_available=True
         ),
     )
-    plan = moe_execution_plan_for_config(config)
+    plan = get_moe_execution_plan(config)
     Config._resolve_tbo(config)
     assert config.enable_tbo is plan.supports_tbo
     assert config.enable_tbo_decode is plan.supports_tbo
@@ -263,7 +263,7 @@ def test_collective_tbo_guard_also_covers_tp_and_plugin_flattening(ep, dp_attent
         enable_tbo_decode=True,
         moe_backend_config=MoEBackendConfig(all2all_backend="none"),
     )
-    assert moe_execution_plan_for_config(config).needs_dp_gather_scatter
+    assert get_moe_execution_plan(config).needs_dp_gather_scatter
     Config._resolve_tbo(config)
     assert not config.enable_tbo and not config.enable_tbo_decode
 

@@ -269,13 +269,21 @@ Expert Parallelism distributes MoE experts across GPUs so that each GPU owns a s
 
 ### FusedMoEParallelConfig
 
-MoE topology and transport are resolved in `atom/moe_config.py`:
+Parallel topology is resolved at the end of configuration normalization,
+before workers or process groups are created:
 
 - `MoEBackendConfig` normalizes `moe_backend`, `moe_all2all_backend`, low-latency mode, and the MoRI environment settings once. `Config` carries this immutable snapshot into native workers and plugin execution.
-- `MoEParallelMapping` describes the final TP/DP/EP ranks, local EP width, simulated DP ratio, and whether DP and PCP participate in expert sharding. It does not import AITER or create process groups.
+- `ParallelMapping` in `atom/parallel_mapping.py` stores the final attention TP/DP, PP, and PCP dimensions, physical launch widths, logical expert width, and group rank order. Native DP-attention folds TP into DP here; plugin configurations have already translated their framework topology and are not folded again. `mapping.for_rank(global_rank)` derives worker coordinates and its `MoEParallelMapping` without reading AITER groups.
 - `MoEExecutionPlan` selects the implementation and the owner of routed-row communication. Weight partitioning, shared-expert routing, prepare/finalize construction, and DP gather/scatter consume this same plan. Startup logs report the resolved mapping, transport, and selection reason once per worker mapping.
 
-`FusedMoEParallelConfig.make()` reads the worker's actual groups **after** CoreManager or a plugin has finalized the topology and **before** MoE weights are created. Its existing TP/DP/EP properties delegate to the resolved mapping and plan.
+`Config` saves both the mapping and the rank-zero MoE execution plan. CoreManager
+uses the mapping for engine assignments and populates legacy runtime fields from
+it, rather than independently rewriting topology. Native and plugin launchers
+create or reuse groups with the resolved dimensions, then
+`bind_worker_parallel_mapping()` validates their sizes, rank coordinates, and
+member order before model construction. It projects the saved execution plan onto
+the worker's launch rank; it does not select transport again. MoE layers consume
+that worker plan through `FusedMoEParallelConfig.from_plan()`.
 
 DP participates in expert sharding only with DP-attention or `moe_ep_flatten_tp_across_dp`. PCP merge (including Ulysses SP) folds PCP into the sharding width in AITER's `DP x PCP x TP` rank order. EP is enabled only when that final width exceeds one. With EP, each device owns whole experts and the MoE TP size becomes one. Pure DP keeps independent expert replicas; enabling EP with TP1 alone does not turn a DP replica into an EP shard.
 
@@ -283,7 +291,9 @@ For the standard implementation, a real DP expert dispatch group uses explicit R
 
 Mega owns dispatch, expert compute, and combine. Its plan therefore uses dispatch-space expert IDs but allocates no standard prepare/finalize kernel and performs no outer DP/PCP gather/scatter or TP reduction, including with `--all2all-backend none` or `ATOM_DISABLE_MORI_EP=1`. These switches control the standard transport. Mega refuses EP1, unflattened DP replicas, simulated DP, or RCCL before weight preparation. Under Ulysses SP, Mega instead retains the native TP weight mapping and the existing per-step SP Mega eligibility checks.
 
-The compile cache key includes the normalized MoE backend snapshot and expert-sharding settings, so runs with different transport or backend decisions cannot reuse a graph from the other configuration.
+The compile cache key includes the normalized MoE backend snapshot, resolved
+parallel mapping, and expert-sharding settings. PCP merge is also captured in the
+snapshot, so later environment changes do not alter worker ownership.
 
 ### Expert distribution
 

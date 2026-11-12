@@ -127,45 +127,19 @@ def test_weight_method_factory_consumes_resolved_plan(
     assert mega.call_count == int(backend == "mega")
 
 
-def test_worker_mapping_uses_real_ranks_after_topology_rewrite(
+def test_parallel_facade_consumes_plan_without_runtime_resolution(
     monkeypatch, atom_modules
 ):
-    import aiter.dist.parallel_state as groups
-
     moe = atom_modules.moe
-    monkeypatch.setattr(moe, "get_tp_group", lambda: SimpleNamespace(rank_in_group=2))
-    monkeypatch.setattr(moe, "get_dp_group", lambda: SimpleNamespace(rank_in_group=1))
-    monkeypatch.setattr(
-        groups, "get_prefill_context_model_parallel_world_size", lambda: 1
-    )
-    monkeypatch.setattr(groups, "get_prefill_context_model_parallel_rank", lambda: 0)
-    monkeypatch.setattr(
-        groups, "get_ep_group", lambda: SimpleNamespace(world_size=8, rank_in_group=6)
-    )
-    monkeypatch.setattr(moe, "sp_is_enabled", lambda: False)
-    config = atom_config_double(
-        parallel_config=SimpleNamespace(
-            data_parallel_size=2, data_parallel_size_local=2
-        ),
-        moe_ep_flatten_tp_across_dp=True,
-        enable_expert_parallel=True,
-        moe_backend_config=MoEBackendConfig(mori_available=True),
-    )
-    parallel = moe.FusedMoEParallelConfig.make(4, 2, config)
-    assert (
-        parallel.tp_size,
-        parallel.ep_size,
-        parallel.ep_rank,
-        parallel.local_ep_size,
-    ) == (1, 8, 6, 8)
-    assert parallel.execution_plan.mapping.ep_rank == parallel.ep_rank
-    assert parallel.use_all2all_kernels and parallel.use_mori_kernels
-
-    monkeypatch.setattr(
-        groups, "get_ep_group", lambda: SimpleNamespace(world_size=16, rank_in_group=6)
-    )
-    with pytest.raises(ValueError, match="must match the dispatch EP group"):
-        moe.FusedMoEParallelConfig.make(4, 2, config)
+    plan = _plan()
+    refuse = Mock(side_effect=AssertionError("Layers must consume the saved plan"))
+    monkeypatch.setattr(moe, "resolve_moe_execution_plan", refuse)
+    monkeypatch.setattr(moe, "get_tp_group", refuse)
+    monkeypatch.setattr(moe, "get_dp_group", refuse)
+    parallel = moe.FusedMoEParallelConfig.from_plan(plan)
+    assert parallel.execution_plan is plan
+    assert parallel.ep_size == 2
+    refuse.assert_not_called()
 
 
 @pytest.mark.parametrize("transport", ["auto", "rccl"])

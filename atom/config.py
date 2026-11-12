@@ -27,8 +27,14 @@ from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
 )
 from atom.moe_config import (
     MoEBackendConfig,
+    MoEExecutionPlan,
     get_moe_backend_config,
-    moe_execution_plan_for_config,
+    get_moe_execution_plan,
+)
+from atom.parallel_mapping import (
+    ParallelMapping,
+    ParallelRankMapping,
+    resolve_parallel_mapping,
 )
 from atom.plugin import is_plugin_mode, is_vllm
 from atom.plugin.config import PluginConfig
@@ -2202,9 +2208,15 @@ class Config:
     # Post-routing routed-MoE implementation. This is deliberately separate
     # from all2all backend/mode: Mega owns dispatch, both GEMMs, and combine.
     moe_backend: str = "standard"
-    # Normalize entry-point flags/env once; resolve worker mappings after
-    # CoreManager/plugin topology changes, before creating weights.
+    # Resolve topology and transport after entry-point normalization; workers
+    # bind this saved mapping to process groups before constructing the model.
     moe_backend_config: MoEBackendConfig | None = field(default=None, init=False)
+    parallel_mapping: ParallelMapping | None = field(default=None, init=False)
+    moe_execution_plan: MoEExecutionPlan | None = field(default=None, init=False)
+    worker_parallel_mapping: ParallelRankMapping | None = field(
+        default=None, init=False
+    )
+    worker_moe_execution_plan: MoEExecutionPlan | None = field(default=None, init=False)
     runner_qualname: str = "atom.model_engine.model_runner.ModelRunner"
     # EPLB master switch + sub-config
     eplb_enable: bool = False
@@ -2253,10 +2265,12 @@ class Config:
 
         Gated on `fake_eplb` because such a run's output is garbage anyway;
         without it, an oversized `-tp` keeps raising in ModelRunner instead of
-        silently running smaller. A property, not a field: `enable_dp_attention`
-        rewrites `tensor_parallel_size` after Config is built.
+        silently running smaller. Once configuration is resolved, this reads
+        the saved runtime topology, including DP-attention's TP-to-DP fold.
         """
         tp = self.tensor_parallel_size
+        if getattr(self, "parallel_mapping", None) is not None:
+            return self.parallel_mapping.tp_world_size
         if not self.fake_eplb:
             return tp
         # Does not create a CUDA context, so it is safe in the parent process.
@@ -2439,6 +2453,20 @@ class Config:
             enable_ep=self.enable_expert_parallel,
             sequence_parallel_size=self.sequence_parallel_size,
         )
+
+    def _init_parallel_mapping(self) -> None:
+        visible = torch.cuda.device_count() if self.fake_eplb else None
+        self.parallel_mapping = resolve_parallel_mapping(self, visible_devices=visible)
+        get_moe_execution_plan(self)
+        mapping = self.parallel_mapping
+        if mapping.dp_logical_size > mapping.dp_size:
+            logger.warning(
+                "Simulated DP-attention: running %d of %d ranks; experts shard "
+                "%d ways. Model output is meaningless; benchmarking only.",
+                mapping.dp_size,
+                mapping.dp_logical_size,
+                mapping.dp_logical_size,
+            )
 
     def __post_init__(self):
         if self.sequence_parallel_size < 1:
@@ -2713,6 +2741,7 @@ class Config:
             # builds the model.
             self.offload_kv_encoding = snapshot_kv_encoding(self.hf_config)
         self._resolve_dynamic_chunking()
+        self._init_parallel_mapping()
         self._resolve_tbo()
         self._check_pp_support()
         self._check_tbo_support()
@@ -2964,7 +2993,7 @@ class Config:
         """Turn TBO off where it cannot run (`_check_tbo_support` refuses what
         it cannot run with), before anything sizes itself off
         `enable_tbo_decode`."""
-        moe_plan = moe_execution_plan_for_config(self)
+        moe_plan = get_moe_execution_plan(self)
         if moe_plan.transport == "rccl" and self.enable_tbo:
             logger.warning(
                 "Disabling TBO for the experimental RCCL routed MoE backend; "
@@ -3250,6 +3279,7 @@ class Config:
         factors.append(bool(getattr(self.dcp_config, "indexer_dcp_only", False)))
         factors.append(self.enable_dp_attention)
         factors.append(get_moe_backend_config(self))
+        factors.append(getattr(self, "parallel_mapping", None))
         factors.append(getattr(self, "enable_expert_parallel", False))
         factors.append(getattr(self, "moe_ep_flatten_tp_across_dp", False))
         factors.append(getattr(self, "dp_logical_size", 0))

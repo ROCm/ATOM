@@ -6,7 +6,7 @@ from abc import abstractmethod
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from enum import Enum
-from functools import cache, lru_cache
+from functools import lru_cache
 
 import torch
 from aiter import ActivationType, QuantType, dtypes, get_hip_quant, topk_gating
@@ -24,7 +24,6 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from atom.config import (
-    Config,
     QuantizationConfig,
     get_current_atom_config,
 )
@@ -279,84 +278,13 @@ class FusedMoEParallelConfig(MoEParallelMapping):
         return self.execution_plan.transport == "rccl"
 
     @staticmethod
-    def make(
-        tp_size_: int, dp_size_: int, parallel_config: Config
-    ) -> "FusedMoEParallelConfig":
-        from aiter.dist.parallel_state import (
-            get_ep_group,
-            get_prefill_context_model_parallel_rank,
-            get_prefill_context_model_parallel_world_size,
-        )
-
-        sp = sp_is_enabled()
-        mapping = MoEParallelMapping.make(
-            tp_size=tp_size_,
-            tp_rank=0 if tp_size_ == 1 else get_tp_group().rank_in_group,
-            dp_size=dp_size_,
-            dp_rank=0 if dp_size_ == 1 else get_dp_group().rank_in_group,
-            local_dp_size=parallel_config.parallel_config.data_parallel_size_local
-            or dp_size_,
-            dp_logical_size=parallel_config.dp_logical_size,
-            enable_ep=parallel_config.enable_expert_parallel,
-            flatten_dp=(
-                parallel_config.enable_dp_attention
-                or parallel_config.moe_ep_flatten_tp_across_dp
-            ),
-            pcp_size=get_prefill_context_model_parallel_world_size(),
-            pcp_rank=get_prefill_context_model_parallel_rank(),
-            merge_pcp=envs.ATOM_PCP_MOE_MERGE or sp,
-        )
-        backend = get_moe_backend_config(parallel_config)
-        plan = resolve_moe_execution_plan(
-            mapping,
-            backend,
-            sequence_parallel_size=parallel_config.sequence_parallel_size,
-        )
-        if parallel_config.enable_tbo and not plan.supports_tbo:
-            raise ValueError(
-                f"TBO is unsupported with the resolved MoE transport {plan.transport!r}; "
-                "disable TBO after changing the worker topology."
-            )
-        if plan.uses_routed_dispatch:
-            ep_group = get_ep_group()
-            if (mapping.ep_size, mapping.ep_rank) != (
-                ep_group.world_size,
-                ep_group.rank_in_group,
-            ):
-                raise ValueError(
-                    "MoE expert mapping must match the dispatch EP group: "
-                    f"mapping={mapping.ep_rank}/{mapping.ep_size}, "
-                    f"group={ep_group.rank_in_group}/{ep_group.world_size}. "
-                    "Check DP flattening and PCP merge settings."
-                )
-        _log_moe_execution_plan(plan)
+    def from_plan(plan: MoEExecutionPlan) -> "FusedMoEParallelConfig":
         return FusedMoEParallelConfig(
-            **asdict(mapping),
-            requested_all2all_backend=backend.all2all_backend,
-            low_latency=backend.low_latency,
+            **asdict(plan.mapping),
+            requested_all2all_backend=plan.backend_config.all2all_backend,
+            low_latency=plan.backend_config.low_latency,
             execution_plan=plan,
         )
-
-
-@cache
-def _log_moe_execution_plan(plan: MoEExecutionPlan) -> None:
-    # Once per worker mapping, at construction rather than inside a forward.
-    logger.info(
-        "MoE mapping: TP=%d/%d DP=%d/%d EP=%d/%d local_EP=%d "
-        "logical_DP_ratio=%d PCP_merge=%s backend=%s transport=%s (%s)",
-        plan.mapping.tp_rank,
-        plan.mapping.tp_size,
-        plan.mapping.dp_rank,
-        plan.mapping.dp_size,
-        plan.mapping.ep_rank,
-        plan.mapping.ep_size,
-        plan.mapping.local_ep_size,
-        plan.mapping.dp_logical_ratio,
-        plan.mapping.pcp_merge,
-        plan.implementation,
-        plan.transport,
-        plan.reason,
-    )
 
 
 def pad_for_all_gather(
@@ -3524,16 +3452,20 @@ class FusedMoE(torch.nn.Module):
             validate_nvfp4_online_target(quant_config, prefix)
         self.has_bias = has_bias
 
-        # Note: here we guard against accessing the TP and DP groups when
-        # uninitialized (this happens when testing)
-        # self.tp_size = 1
-        tp_size = tp_size if tp_size is not None else get_tp_group().world_size
-        dp_size = dp_size if dp_size is not None else get_dp_group().world_size
-
         atom_config = get_current_atom_config()
-        self.moe_parallel_config = FusedMoEParallelConfig.make(
-            tp_size, dp_size, atom_config
-        )
+        topology = atom_config.parallel_mapping
+        tp_size = tp_size if tp_size is not None else topology.tp_size
+        dp_size = dp_size if dp_size is not None else topology.dp_size
+        plan = atom_config.worker_moe_execution_plan
+        if plan is None:
+            raise ValueError(
+                "Bind the worker parallel mapping before constructing MoE layers"
+            )
+        if (tp_size, dp_size) != (topology.tp_size, topology.dp_size):
+            raise ValueError(
+                "MoE layer TP/DP sizes must match the resolved parallel mapping"
+            )
+        self.moe_parallel_config = FusedMoEParallelConfig.from_plan(plan)
         # Attached by `initialize_sp_mega_moe` under -sp --moe-backend mega.
         self.sp_mega_moe = None
         self._comm_fused_moe = None
