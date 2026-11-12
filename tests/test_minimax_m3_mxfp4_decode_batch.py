@@ -370,6 +370,18 @@ def test_a_split_decode_builds_no_whole_batch_scorer_state(mod, monkeypatch, spl
     assert kw["seq_lens"].shape[0] == 8 and kw["num_idx_heads"] == HEADS
 
 
+def test_another_index_cache_allocates_no_scorer_and_imports_no_aiter():
+    """`"" in` the allocation is the builder's MXFP4-index switch: empty for any other
+    index cache, and without touching aiter (the non-GPU suite runs this)."""
+    from atom.model_ops.minimax_m3.index_buffers import allocate_index_scorers
+
+    config = types.SimpleNamespace(index_cache_dtype="fp8")
+    got = allocate_index_scorers(
+        config, "cpu", max_bs=4, max_qlen=1, num_idx_heads=HEADS
+    )
+    assert got == {} and "" not in got
+
+
 def test_the_scorer_record_is_immutable_and_builds_without_aiter():
     """`IndexScoreBuffers` lives in a module that imports no aiter, so the non-GPU
     suite can build it; a step's record is the builder's with its map replaced."""
