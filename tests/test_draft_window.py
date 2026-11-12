@@ -248,3 +248,16 @@ def test_without_a_window_an_offload_load_resumes_where_it_ended(seq_factory):
     bm = BlockManager(cfg)
     seq = seq_factory(list(range(40)))
     assert bm.draft_window_resume(seq, 36) == 36
+
+
+def test_a_received_prompt_publishes_its_window(seq_factory):
+    """A P/D consumer runs no prefill: the window the producer wrote is
+    published with the KV, so the next turn on this node can reuse it."""
+    bm = _bm()
+    seq = seq_factory(list(range(20)))
+    _admit(bm, seq)
+    held = {i: b for i, b in enumerate(seq.draft_block_table) if b >= 0}
+    bm.register_received_prefix(seq)
+    for i, block_id in held.items():
+        if i < 5:
+            assert bm.draft_window.pool.block(block_id).hash != -1
