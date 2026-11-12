@@ -280,7 +280,7 @@ def test_summary_row_shows_c64_throughput_before_and_now_with_the_delta():
         "MLPerf Endpoint",
         "1,000",
         "1,040",
-        "🟢 +40 (+4.0%)",
+        "🟢 +4.0%",
         "−0.2 pts (now 93.9%)",
     ]
 
@@ -299,7 +299,7 @@ def test_summary_row_dates_a_previous_value_older_than_the_column():
     assert row[2:] == [
         "336 (2026-10-31)",
         "340",
-        "+4 (+1.2%)",
+        "+1.2%",
         "−0.1 pts (now 96.1%) (vs 2026-10-31)",
     ]
 
@@ -341,15 +341,6 @@ def test_a_problem_just_tags_the_owner():
         and line.endswith(" @bravo_owner")
         and "please" not in line
     )
-
-
-def test_the_delta_matches_the_numbers_shown():
-    row = summary_row(
-        model("Alpha", pc(4, 50.0, 60.0), pc(64, 339.6, 336.4), ac(0.95, 0.95)),
-        "2026-11-14",
-        "2026-11-07",
-    )
-    assert row[2:5] == ["336", "340", "+4 (+1.0%)"]  # 340 − 336, not the unrounded 3.2
 
 
 def test_only_the_previous_session_counts_not_an_older_best():

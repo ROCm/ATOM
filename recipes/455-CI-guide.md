@@ -497,14 +497,14 @@ Image `gfx1250-atom-ci455-<YYYYMMDD>` · ATOM `main@<sha 前 9 位>` · aiter `m
 
 | Model | Scenario | 2026-11-07 (tok/s/GPU) | 2026-11-14 (tok/s/GPU) | Delta | GSM8K delta |
 |---|---|---|---|---|---|
-| DeepSeek-V4.1-Flash | MLPerf Endpoint | 2,655 | 2,838 | 🟢 +183 (+6.9%) | −0.2 pts (now 93.9%) |
-| Kimi-K3 (2.8T) | MLPerf Endpoint | 336 (2026-10-31) | 340 | +4 (+1.0%) | −0.1 pts (now 96.1%) (vs 2026-10-31) |
+| DeepSeek-V4.1-Flash | MLPerf Endpoint | 2,655 | 2,838 | 🟢 +6.9% | −0.2 pts (now 93.9%) |
+| Kimi-K3 (2.8T) | MLPerf Endpoint | 336 (2026-10-31) | 340 | +1.0% | −0.1 pts (now 96.1%) (vs 2026-10-31) |
 | Qwen-35B-A3B | MLPerf Endpoint | 6,345 | N/A | N/A | −0.1 pts (now 90.1%) |
 ```
 
 - 一个模型一行，依次是 Model、Scenario、上一场、本场、Delta、GSM8K delta。表格下面不加说明文字。
 - 第三、四列是并发 64 的每卡吞吐（口径见 §4.1：endpoint 是输出 token，8K/1K 是输入加输出 token），表头写上一场和本场的日期。上一场取该模型最近一次成功的那一场：例子里 Kimi-K3 上一场（11-07）跑挂了，就和 10-31 那场比，并在格子里注明日期。
-- Delta 写差值和百分比，例如 `+183 (+6.9%)`，差值按表里显示的数算。GSM8K delta 写掉了多少、现在多少，例如 `−4.6 pts (now 88.1%)`。
+- Delta 只写百分比，例如 `+6.9%`。GSM8K delta 写掉了多少、现在多少，例如 `−4.6 pts (now 88.1%)`。
 - N/A 表示跑挂、没有值；— 表示没有结果；first 表示第一次有数据，没有可比的。
 
 ### 5.3 详细报告

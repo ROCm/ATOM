@@ -43,11 +43,6 @@ def pts(x):
     return "0.0 pts" if v == 0 else f"{v:+.1f} pts".replace("-", "−")
 
 
-def shown(v):
-    """A value as the tables show it: one decimal under 100, else whole."""
-    return round(v, 1) if v < 100 else round(v)
-
-
 def num(v):
     return f"{v:,.1f}" if v < 100 else f"{v:,.0f}"
 
@@ -212,12 +207,6 @@ def missing_owners(results, owners):
 # ------------------------------------------------------------------ tables
 
 
-def signed(delta, size):
-    """A signed difference, with a decimal when the values are under 100."""
-    text = f"{delta:+,.1f}" if abs(size) < 100 else f"{delta:+,.0f}"
-    return text.replace("-", "−")
-
-
 def previous_column(results):
     """The previous session's date: what the summary's previous column is
     headed with."""
@@ -229,7 +218,7 @@ def previous_column(results):
 def summary_row(r, date, ref):
     """Model, scenario, previous and current c64 tok/s per GPU (dated only
     when the previous one is not from the `ref` session the column is headed
-    with), delta, GSM8K delta. N/A: the run failed."""
+    with), the delta as a percentage, GSM8K delta. N/A: the run failed."""
     c, a = headline(r), r.acc
     prev = (
         "—"
@@ -245,7 +234,7 @@ def summary_row(r, date, ref):
         if c.delta is None:
             delta = "first"
         else:
-            delta = f"{perf_flag(c.delta)} {signed(shown(c.value) - shown(c.prev), c.value)} ({pct(c.delta)})".strip()
+            delta = f"{perf_flag(c.delta)} {pct(c.delta)}".strip()
     if a.status == "fail":
         acc = "N/A"
     elif a.value is None:

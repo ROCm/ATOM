@@ -147,7 +147,7 @@ def test_a_wednesday_report_covers_its_own_session_on_the_saturday_image(tmp_pat
     summary = (tmp_path / "reports" / "455-CI-report-20261118.md").read_text()
     detail = (tmp_path / "reports" / "455-CI-report-20261118-detail.md").read_text()
     assert summary.startswith("# 455-CI report · 2026-11-18 · 8K/1K")
-    assert "| GLM-5.2 | 8K/1K | 12,000 | 12,300 | +300 (+2.5%) |" in summary
+    assert "| GLM-5.2 | 8K/1K | 12,000 | 12,300 | +2.5% |" in summary
     assert "MLPerf Endpoint" not in summary
     assert (
         "| Model | Scenario | 2026-11-11 (tok/s/GPU) | 2026-11-18 (tok/s/GPU) | Delta | GSM8K delta |"
