@@ -94,7 +94,10 @@ jobs:
             test_atomesh_harness
 
   run_atomesh_mocker_benchmark:
-    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    # Not on pull requests: their numbers are compared against no baseline and
+    # published nowhere, yet the run took most of an hour. To benchmark a PR
+    # branch, run this workflow on it by hand.
+    if: ${{ github.event_name != 'pull_request' }}
     name: run_atomesh_mocker_benchmark
     needs: [run_atomesh_test_harness]
     runs-on: ubuntu-latest
