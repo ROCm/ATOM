@@ -261,4 +261,50 @@ mod tests {
         }
         assert!(logs(false, run).await.is_empty());
     }
+
+    #[tokio::test]
+    async fn a_retry_replaces_the_pools_selection() {
+        let sampled = logs(true, || {
+            record_selection(
+                "prefill",
+                "cache_aware",
+                Some(&prefill_rank(0)),
+                "affinity",
+                Some(0.75),
+            );
+            record_selection(
+                "prefill",
+                "round_robin",
+                Some(&prefill_rank(1)),
+                "round_robin",
+                None,
+            );
+            record_dispatch("prefill", &prefill_rank(1));
+        })
+        .await;
+
+        assert_eq!(sampled.matches("Selected worker").count(), 1, "{sampled}");
+        assert!(
+            sampled.contains(r#"policy="round_robin" branch="round_robin""#),
+            "{sampled}"
+        );
+        assert!(!sampled.contains("remapped_from"), "{sampled}");
+    }
+
+    #[tokio::test]
+    async fn a_selection_without_a_worker_logs_its_pool() {
+        let sampled = logs(true, || {
+            record_selection("decode", "round_robin", None, "no_healthy_workers", None);
+        })
+        .await;
+
+        for field in [
+            "No worker selected",
+            r#"pool="decode""#,
+            r#"policy="round_robin""#,
+            r#"branch="no_healthy_workers""#,
+        ] {
+            assert!(sampled.contains(field), "missing {field} in\n{sampled}");
+        }
+    }
 }
