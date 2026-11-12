@@ -293,6 +293,76 @@ def _merge_topk(
     )
 
 
+def _validate_local_candidate_inputs(
+    scores,
+    seq_lens,
+    topk,
+    rank,
+    world_size,
+    max_query_len,
+    global_blocks,
+    init_blocks,
+    local_blocks,
+):
+    """Validate the score/local-selection inputs shared by both paths."""
+    if scores.ndim != 3 or scores.dtype != torch.float32:
+        raise ValueError("scores must be FP32 [heads,tokens,local_blocks]")
+    heads, tokens, local = scores.shape
+    if world_size < 1 or not 0 <= rank < world_size:
+        raise ValueError("invalid context partition")
+    if max_query_len < 1 or tokens != seq_lens.numel() * max_query_len:
+        raise ValueError("score rows must equal batch * max_query_len")
+    if topk < 1 or topk > 512:
+        raise ValueError("unsupported top-k")
+    if min(init_blocks, local_blocks) < 0:
+        raise ValueError("forced-block counts must be non-negative")
+    _require_packable(global_blocks)
+    if (
+        not scores.is_contiguous()
+        or seq_lens.dtype != torch.int32
+        or not seq_lens.is_contiguous()
+        or not scores.is_cuda
+        or not seq_lens.is_cuda
+        or seq_lens.device != scores.device
+    ):
+        raise ValueError("scores and lengths must be contiguous FP32/int32 on one GPU")
+    return heads, tokens, local
+
+
+def _validate_merge_metadata(
+    block_table,
+    seq_lens,
+    tokens,
+    candidates,
+    topk,
+    init_blocks,
+    local_blocks,
+    max_query_len,
+    device,
+):
+    """Validate the table/length metadata shared by merge and fused paths."""
+    if max_query_len < 1 or tokens != seq_lens.numel() * max_query_len:
+        raise ValueError("key rows must equal batch * max_query_len")
+    if topk < 1 or topk > candidates:
+        raise ValueError("top-k must not exceed the gathered candidate count")
+    if min(init_blocks, local_blocks) < 0:
+        raise ValueError("forced-block counts must be non-negative")
+    if block_table.ndim != 2 or block_table.shape[0] != seq_lens.numel():
+        raise ValueError("block table must have one row per request")
+    if (
+        block_table.dtype != torch.int32
+        or seq_lens.dtype != torch.int32
+        or not seq_lens.is_contiguous()
+        or block_table.stride(1) != 1
+    ):
+        raise ValueError("metadata must be int32 with contiguous inner dimensions")
+    if any(
+        not tensor.is_cuda or tensor.device != device
+        for tensor in (block_table, seq_lens)
+    ):
+        raise ValueError("selection metadata must share the input GPU")
+
+
 def local_candidate_keys(
     scores,
     seq_lens,
@@ -312,20 +382,17 @@ def local_candidate_keys(
     block has to be pinned on the rank that owns it or it never reaches the
     merge to be pinned there.
     """
-    if scores.ndim != 3 or scores.dtype != torch.float32:
-        raise ValueError("scores must be FP32 [heads,tokens,local_blocks]")
-    heads, tokens, local = scores.shape
-    if world_size < 1 or not 0 <= rank < world_size:
-        raise ValueError("invalid context partition")
-    if max_query_len < 1 or tokens != seq_lens.numel() * max_query_len:
-        raise ValueError("score rows must equal batch * max_query_len")
-    if topk < 1 or topk > 512:
-        raise ValueError("unsupported top-k")
-    if min(init_blocks, local_blocks) < 0:
-        raise ValueError("forced-block counts must be non-negative")
-    _require_packable(global_blocks)
-    if not scores.is_contiguous() or seq_lens.dtype != torch.int32:
-        raise ValueError("scores must be contiguous and lengths int32")
+    heads, tokens, local = _validate_local_candidate_inputs(
+        scores,
+        seq_lens,
+        topk,
+        rank,
+        world_size,
+        max_query_len,
+        global_blocks,
+        init_blocks,
+        local_blocks,
+    )
     keys = torch.empty((heads, tokens, topk), dtype=torch.int64, device=scores.device)
     if tokens:
         # The tile must be at least as wide as the top-k it selects: the
@@ -381,25 +448,19 @@ def merge_candidate_keys(
         row_stride, key_stride = keys.stride()
     if key_stride != 1:
         raise ValueError("the candidate axis must be contiguous")
-    if max_query_len < 1 or tokens != seq_lens.numel() * max_query_len:
-        raise ValueError("key rows must equal batch * max_query_len")
-    if topk < 1 or topk > candidates:
-        raise ValueError("top-k must not exceed the gathered candidate count")
-    if min(init_blocks, local_blocks) < 0:
-        raise ValueError("forced-block counts must be non-negative")
-    if block_table.ndim != 2 or block_table.shape[0] != seq_lens.numel():
-        raise ValueError("block table must have one row per request")
-    if (
-        block_table.dtype != torch.int32
-        or seq_lens.dtype != torch.int32
-        or not seq_lens.is_contiguous()
-        or block_table.stride(1) != 1
-    ):
-        raise ValueError("metadata must be int32 with contiguous inner dimensions")
-    if any(
-        not x.is_cuda or x.device != keys.device for x in (keys, block_table, seq_lens)
-    ):
-        raise ValueError("merge inputs must share a GPU")
+    if not keys.is_cuda:
+        raise ValueError("candidate keys must be on a GPU")
+    _validate_merge_metadata(
+        block_table,
+        seq_lens,
+        tokens,
+        candidates,
+        topk,
+        init_blocks,
+        local_blocks,
+        max_query_len,
+        keys.device,
+    )
     indices = torch.empty((1, tokens, topk), dtype=torch.int32, device=keys.device)
     output, _ = _alloc_emit(tokens, 1, topk, block_table, True, keys.device)
     if tokens:
@@ -586,21 +647,37 @@ def select_exchanged_candidates(
     ``fits`` this call). Returns what ``merge_candidate_keys`` returns, bit for bit.
 
     Every rank of the group must make the same calls in the same order, as for
-    any collective. Inputs are the scorer output and CP metadata already
-    validated by the caller; rank/world and forced-block counts come from the
-    same CP configuration used by the collective fallback.
+    any collective.
     """
-    heads, tokens, local = scores.shape
+    if block_table.ndim != 2:
+        raise ValueError("block table must have one row per request")
+    global_blocks = block_table.shape[1]
+    heads, tokens, local = _validate_local_candidate_inputs(
+        scores,
+        seq_lens,
+        topk,
+        rank,
+        world_size,
+        max_query_len,
+        global_blocks,
+        init_blocks,
+        local_blocks,
+    )
+    _validate_merge_metadata(
+        block_table,
+        seq_lens,
+        tokens,
+        world_size * topk,
+        topk,
+        init_blocks,
+        local_blocks,
+        max_query_len,
+        scores.device,
+    )
     if world_size != mailbox.world or not mailbox.fits(heads, tokens, topk):
         raise ValueError(
             "the mailbox exchange needs one head a rank and room for the call"
         )
-    if scores.dtype != torch.float32 or not scores.is_contiguous():
-        raise ValueError("scores must be contiguous FP32 [heads,tokens,local_blocks]")
-    if tokens != seq_lens.numel() * max_query_len or seq_lens.dtype != torch.int32:
-        raise ValueError("score rows must equal batch * max_query_len, lengths int32")
-    global_blocks = block_table.shape[1]
-    _require_packable(global_blocks)
     indices = torch.empty((1, tokens, topk), dtype=torch.int32, device=scores.device)
     output, _ = _alloc_emit(tokens, 1, topk, block_table, True, scores.device)
     if tokens:
