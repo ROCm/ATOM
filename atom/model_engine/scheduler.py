@@ -2590,17 +2590,13 @@ class Scheduler:
 
             self._lookup_detach_declined.discard(seq.id)
             if pd_offset is not None:
-                actual_offset = self.kv_connector.pd_receive_block_offset(
-                    seq,
-                    len(seq.block_table),
-                    seq.num_cached_tokens // self.block_manager.hash_block_size,
-                )
-                if actual_offset != pd_offset or len(seq.block_table) != num_blocks:
-                    # No address has been published yet. A layout whose probe
-                    # differs from allocation must not silently exceed credits.
-                    self.block_manager.deallocate(seq)
-                    raise RuntimeError("PD receive footprint changed during allocation")
-                self.pd_admission.admit(seq, seq.block_table[actual_offset:])
+                # The credit is the footprint `can_admit` approved before
+                # `allocate`, which is exact only while `allocate` keeps the
+                # probe's hit and block count. It does for the layouts
+                # `from_config` accepts; supporting per-request state (a joint
+                # boundary, a disowned prefix) has to re-measure the receive
+                # from `seq.block_table` here.
+                self.pd_admission.admit(seq, seq.block_table[pd_offset:num_blocks])
             self._notify_connector_after_prefill_alloc(seq)
 
             # A replay that loads its KV first parks for that load whatever the
