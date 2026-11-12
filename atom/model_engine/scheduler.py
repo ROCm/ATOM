@@ -2238,6 +2238,9 @@ class Scheduler:
             batch, seqs = result
             if not batch.is_dummy_run:
                 self.pd_admission.scheduled(seqs.values())
+        # Here for the same reason as the tick: what this pass decided about
+        # blocks reaches the pool's backend once, whichever return was taken.
+        self.block_manager.kv.flush()
         self._record_throughput(num_prompt_tokens=_prompt_tokens_of(result))
         return result
 
@@ -5473,6 +5476,9 @@ class Scheduler:
         self.engine_stats.update_throughput(
             num_generation_tokens=num_new_generation_tokens
         )
+        # Blocks this pass filled and released become visible to the pool's
+        # backend (and through it to other engine ranks) here.
+        self.block_manager.kv.flush()
         return finished_seqs
 
     def _mark_finished(self, seq, reason, num_tokens):
