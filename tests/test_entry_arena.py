@@ -23,6 +23,7 @@ from atom.model_ops.attentions.pool_layout.entry_arena import (
     EntryField,
     EntryMajorArena,
     LayerMajorArena,
+    SplitEntryMajorArena,
     carve,
     checkpoint_ranges_for,
     entry_bytes_for,
@@ -198,6 +199,28 @@ class TestInitialFill:
                 assert torch.equal(live, torch.zeros_like(live))
             else:
                 assert torch.isneginf(live).all()
+
+    def test_split_arena_refills_the_live_tail_of_every_plane(self):
+        """The runner's state arena is a split one, so a refill has to reach
+        each plane, and stop at each plane's live tail."""
+        planes = [
+            EntryMajorArena(V4_LIKE[:4], 5, device="cpu", live_entries=2),
+            EntryMajorArena(V4_LIKE[4:], 5, device="cpu", live_entries=2),
+        ]
+        arena = SplitEntryMajorArena(planes)
+        for field in V4_LIKE:
+            arena.view(field.name).fill_(float("nan"))
+        arena.refill_live()
+        for plane in planes:
+            dead = plane.entries - plane.live_entries
+            for field in plane.fields:
+                view = arena.view(field.name)
+                assert torch.isnan(view[:, :dead]).all()
+                live = view[:, dead:]
+                if field.fill == 0.0:
+                    assert torch.equal(live, torch.zeros_like(live))
+                else:
+                    assert torch.isneginf(live).all()
 
 
 def test_carving_more_than_the_buffer_holds_is_refused():
