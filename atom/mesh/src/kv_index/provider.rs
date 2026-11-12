@@ -84,6 +84,8 @@ pub enum LowerHit {
 pub enum HitSource {
     Events,
     Predicted,
+    /// Only shared storage holds the prefix.
+    Storage,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

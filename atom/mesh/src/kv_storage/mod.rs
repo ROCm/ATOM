@@ -2,7 +2,9 @@
 //! looked up by token at routing time instead of being indexed from events, and projected
 //! onto the workers that can load from them (readers).
 
+pub mod hub;
 pub mod keys;
+pub mod merge;
 pub mod mock;
 pub mod source;
 #[cfg(test)]
@@ -14,7 +16,9 @@ use async_trait::async_trait;
 use serde::Serialize;
 
 pub use self::{
+    hub::Hub,
     keys::AtomChunk,
+    merge::WithStorage,
     mock::{MockPool, MockStore},
     source::{
         merge_pools, FailReason, Gate, GateReason, KeyRule, KeyState, PoolAnswer, RankProbe,

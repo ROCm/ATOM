@@ -1,10 +1,23 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use serde::Deserialize;
 
 use super::{
+    hub::Connect,
     keys::{chain_check, STORE_TAINT_KEY},
+    merge::merge,
     *,
+};
+use crate::{
+    config::KvStorageConfig,
+    core::{placement::test_support::make_regular_http, Worker},
+    kv_events::{
+        discovery::{OffloadBackend, OffloadReport},
+        Namespace,
+    },
+    kv_index::{
+        CacheHit, HitSource, IndexProvider, LoadPath, LowerHit, PrefixMatchProvider, PrefixRequest,
+    },
 };
 
 const VECTORS: &str = include_str!(concat!(
@@ -203,4 +216,228 @@ fn bench_atom_chunk_keys_100k_tokens() {
         let keys = rule.keys(&tokens).len();
         println!("AtomChunk keys, 100k tokens, chunk {chunk_tokens}: {keys} keys, p50 {p50:?}, p99 {p99:?}");
     }
+}
+
+fn workers(names: &[&str]) -> Vec<Arc<dyn Worker>> {
+    names
+        .iter()
+        .map(|name| make_regular_http(&format!("http://{name}:8000"), "m"))
+        .collect()
+}
+
+/// A DP replica of world 2 storing 4-token chunks and loading from 8 tokens on.
+fn report(namespace: &str, chain_check: Option<String>) -> OffloadReport {
+    OffloadReport {
+        backend: OffloadBackend::MooncakeStore,
+        masters: vec!["10.0.0.1:50051".into(), "10.0.0.3:50051".into()],
+        namespace: Some(namespace.into()),
+        chunk_tokens: 4,
+        world: Some(2),
+        min_load_tokens: 8,
+        chain_check,
+    }
+}
+
+fn hub(store: &Arc<MockStore>, config: KvStorageConfig) -> Hub {
+    let store = store.clone();
+    let connect: Connect =
+        Arc::new(move |_: &StorageBackendSpec| Some(store.clone() as Arc<dyn StorageBackend>));
+    Hub::new(config, connect)
+}
+
+/// A hub with one source, which worker `a` reads and `pools` serve.
+async fn reading(pools: Vec<MockPool>, config: KvStorageConfig) -> (Arc<MockStore>, Hub) {
+    let store = Arc::new(MockStore::new(pools));
+    let hub = hub(&store, config);
+    hub.on_worker_added("http://a:8000", "m", Some(&report(NS, None)))
+        .await;
+    (store, hub)
+}
+
+async fn lookup(hub: &Hub, tokens: &[u32], candidates: &[Arc<dyn Worker>]) -> StorageLookup {
+    let req = PrefixRequest::new("m", tokens, Namespace::default());
+    let mut lookups = hub.lookup_all(&req, candidates).await;
+    assert_eq!(lookups.len(), 1);
+    lookups.pop().unwrap().1
+}
+
+#[tokio::test]
+async fn chain_check_gates_sources_and_readers() {
+    let workers = workers(&["a", "b", "c", "d"]);
+    let hub = hub(&Arc::new(MockStore::default()), KvStorageConfig::default());
+    let passed = report(NS, Some(chain_check(4)));
+    // A rule that differs from the router's, here over 8-token chunks.
+    let changed = report(NS, Some(chain_check(8)));
+    let other = report("atomkv1-0123456789abcdef01234567", None);
+    for (worker, report) in workers.iter().zip([&passed, &passed, &changed, &other]) {
+        hub.on_worker_added(worker.url(), "m", Some(report)).await;
+    }
+
+    let status = hub.status();
+    assert_eq!(status.len(), 2);
+    assert_eq!(status[0].id, "atom-mooncake-b3fd64e0");
+    assert_eq!(status[0].chain_check, ChainCheck::Passed);
+    let endpoints = ["http://10.0.0.1:9003", "http://10.0.0.3:9003"];
+    assert_eq!(status[0].endpoints, endpoints);
+    assert_eq!(status[0].readers, [workers[0].url(), workers[1].url()]);
+    assert_eq!(status[1].id, "atom-mooncake-01234567");
+    assert_eq!(status[1].chain_check, ChainCheck::NotReported);
+    assert_eq!(hub.reader(workers[2].url()), ReaderInfo::default());
+    let source = SourceId(status[0].id.as_str().into());
+    let reader = ReaderInfo {
+        sources: vec![source.clone()],
+        load_path: Some(LoadPath::Storage(source)),
+    };
+    assert_eq!(hub.reader(workers[1].url()), reader);
+
+    hub.on_worker_removed(workers[0].url()).await;
+    hub.on_worker_removed(workers[1].url()).await;
+    assert_eq!(hub.status().len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn gate_and_deadline() {
+    let tokens: Vec<u32> = (0..24).collect();
+    let workers = workers(&["a", "b"]);
+    let (store, hub) = reading(pools(&tokens, "MM"), KvStorageConfig::default()).await;
+
+    let too_short = StorageLookup::Skipped(GateReason::TooShort);
+    assert_eq!(lookup(&hub, &tokens[..7], &workers).await, too_short);
+    let no_reader = StorageLookup::Skipped(GateReason::NoReaderInCandidates);
+    assert_eq!(lookup(&hub, &tokens, &workers[1..]).await, no_reader);
+    assert_eq!(store.queries(), 0);
+    assert_eq!(lookup(&hub, &tokens, &workers).await, hit(8, 8));
+
+    store.pools.lock()[0].delay = Duration::from_millis(10);
+    let timeout = StorageLookup::Unavailable(FailReason::Timeout);
+    assert_eq!(lookup(&hub, &tokens, &workers).await, timeout);
+    // A request for another model looks nothing up.
+    let req = PrefixRequest::new("other", &tokens, Namespace::default());
+    assert!(hub.lookup_all(&req, &workers).await.is_empty());
+    assert_eq!(store.queries(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn breaker_opens_after_five_failures_and_lets_one_probe_through() {
+    let tokens: Vec<u32> = (0..24).collect();
+    let workers = workers(&["a"]);
+    let (store, hub) = reading(pools(&tokens, "x"), KvStorageConfig::default()).await;
+
+    let failed = StorageLookup::Unavailable(FailReason::Transport);
+    for _ in 0..5 {
+        assert_eq!(lookup(&hub, &tokens, &workers).await, failed);
+    }
+    let open = StorageLookup::Skipped(GateReason::BreakerOpen);
+    assert_eq!(lookup(&hub, &tokens, &workers).await, open);
+    assert_eq!(store.queries(), 5);
+    assert_eq!(hub.status()[0].breaker, BreakerState::Open);
+
+    tokio::time::advance(Duration::from_secs(10)).await;
+    assert_eq!(hub.status()[0].breaker, BreakerState::HalfOpen);
+    *store.pools.lock() = pools(&tokens, "MM");
+    store.pools.lock()[0].delay = Duration::from_millis(1);
+    let (probe, other) = tokio::join!(
+        lookup(&hub, &tokens, &workers),
+        lookup(&hub, &tokens, &workers)
+    );
+    assert_eq!((probe, other), (hit(8, 8), open));
+    assert_eq!(hub.status()[0].breaker, BreakerState::Closed);
+}
+
+#[tokio::test(start_paused = true)]
+async fn lookups_beyond_the_inflight_cap_skip_the_source() {
+    let tokens: Vec<u32> = (0..24).collect();
+    let workers = workers(&["a"]);
+    let mut slow = pools(&tokens, "MM");
+    slow[0].delay = Duration::from_millis(1);
+    let config = KvStorageConfig {
+        max_inflight: 1,
+        ..KvStorageConfig::default()
+    };
+    let (_, hub) = reading(slow, config).await;
+    let (first, second) = tokio::join!(
+        lookup(&hub, &tokens, &workers),
+        lookup(&hub, &tokens, &workers)
+    );
+    let overloaded = StorageLookup::Skipped(GateReason::Overloaded);
+    assert_eq!((first, second), (hit(8, 8), overloaded));
+    assert_eq!(lookup(&hub, &tokens, &workers).await, hit(8, 8));
+}
+
+#[test]
+fn storage_hits_extend_reader_tiers_and_set_lower() {
+    let source = SourceId("s".into());
+    let reader = ReaderInfo {
+        sources: vec![source.clone()],
+        load_path: Some(LoadPath::Storage(source.clone())),
+    };
+    let events = |tokens| CacheHit {
+        tokens,
+        lower: LowerHit::None,
+        source: HitSource::Events,
+        exact: true,
+    };
+    let stored = [(source.clone(), hit(16, 24))];
+    let lower = LowerHit::Hit {
+        tokens: 24,
+        from: LoadPath::Storage(source.clone()),
+    };
+
+    let merged = merge(Some(events([8; 4])), &reader, &stored).unwrap();
+    assert_eq!((merged.tokens, &merged.lower), ([8, 8, 16, 24], &lower));
+    let merged = merge(Some(events([8, 20, 20, 20])), &reader, &stored).unwrap();
+    assert_eq!(merged.tokens, [8, 20, 20, 24]);
+    let stored_only = merge(None, &reader, &stored).unwrap();
+    let expected = (stored_only.tokens, stored_only.source, stored_only.exact);
+    assert_eq!(expected, ([0, 0, 16, 24], HitSource::Storage, false));
+    assert_eq!(merge(None, &reader, &[(source.clone(), hit(0, 0))]), None);
+
+    let failed = [(
+        source.clone(),
+        StorageLookup::Unavailable(FailReason::Timeout),
+    )];
+    let merged = merge(Some(events([8; 4])), &reader, &failed).unwrap();
+    assert_eq!(
+        (merged.tokens, merged.lower),
+        ([8; 4], LowerHit::Unknown(source))
+    );
+    let other = ReaderInfo::default();
+    assert_eq!(
+        merge(Some(events([8; 4])), &other, &stored),
+        Some(events([8; 4]))
+    );
+}
+
+#[tokio::test]
+async fn the_planner_lookup_reaches_readers_only() {
+    let tokens: Vec<u32> = (0..24).collect();
+    let workers = workers(&["a", "b"]);
+    let (_, hub) = reading(pools(&tokens, "MMS"), KvStorageConfig::default()).await;
+    let hub = Arc::new(hub);
+    let provider = WithStorage::new(IndexProvider::new(Duration::from_secs(60), 4), hub.clone());
+
+    let mut req = PrefixRequest::new("m", &tokens, Namespace::default());
+    assert_eq!(provider.match_workers(&req, &workers), [None, None]);
+    let lookups = hub.lookup_all(&req, &workers).await;
+    req.set_storage(lookups);
+    let lower = LowerHit::Hit {
+        tokens: 12,
+        from: LoadPath::Storage(SourceId("atom-mooncake-b3fd64e0".into())),
+    };
+    let expected = CacheHit {
+        tokens: [0, 0, 8, 12],
+        lower,
+        source: HitSource::Storage,
+        exact: false,
+    };
+    assert_eq!(
+        provider.match_workers(&req, &workers),
+        [Some(expected), None]
+    );
+
+    let none: Connect =
+        Arc::new(|_: &StorageBackendSpec| -> Option<Arc<dyn StorageBackend>> { None });
+    let empty = Hub::new(KvStorageConfig::default(), none);
+    let req = PrefixRequest::new("m", &tokens, Namespace::default());
+    assert!(empty.lookup_all(&req, &workers).await.is_empty());
 }
