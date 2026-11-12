@@ -1022,6 +1022,7 @@ def test_pcp_reindex_builds_work_plan_only_when_read(monkeypatch, nonps, plans):
         device="cpu",
         index_topk=2048,
         dcp_sparse_prefill_nonps=nonps,
+        dcp_world_size=1,
         padded_num_attention_heads=64,
         block_size=1,
         dtype_q=None,
@@ -1378,14 +1379,15 @@ def test_dcp_prefill_key_gather_ignores_padded_request_tables(monkeypatch, lengt
 
 
 def test_rebuild_sparse_dcp_persistent_metadata_call_sites_use_their_own_width():
-    """Pins gathered_num_heads at both call sites, not just the function.
+    """Pins gathered_num_heads at the decode call site, not just the function.
 
     Decode and sparse prefill round the gathered query width through
     different tables (mla_dcp_kernel_num_heads vs mla_dcp_sparse_prefill_
-    num_heads) and can disagree (e.g. num_heads=12, dcp=8 -> 96 vs 128).
+    num_heads) and can disagree (e.g. num_heads=12, dcp=4 -> 48 vs 64).
     Passing the wrong one plans persistent work descriptors for the wrong
     nhead; nothing importable on the CPU gate would notice a regression
-    here, so read the two call sites from source instead.
+    here, so read the call sites from source instead. Sparse prefill does
+    not rebuild: the metadata builder plans it once a forward.
     """
     tree = ast.parse(_ATTENTION_MLA_PATH.read_text(encoding="utf-8"))
 
@@ -1412,7 +1414,6 @@ def test_rebuild_sparse_dcp_persistent_metadata_call_sites_use_their_own_width()
 
     assert by_enclosing_func == {
         "_forward_decode": "self.dcp_kernel_num_heads",
-        "_forward_prefill_mla": "self.dcp_sparse_prefill_num_heads",
     }, (
         "a _rebuild_sparse_dcp_persistent_metadata call site is passing the "
         f"wrong gathered_num_heads (7th positional arg): got {by_enclosing_func}"

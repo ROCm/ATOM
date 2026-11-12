@@ -72,6 +72,7 @@ from atom.model_ops.dcp_ops import dcp_all_gather_prefill_query_heads
 from atom.model_ops.indexer.schedule import skips_index_topk
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import use_triton_gemm
+from atom.model_ops.sparse_mla_work_plan import patch_work_kv_ranges
 from atom.model_ops.triton_fused_mla_ctx_kv import fused_mla_ctx_norm_rope_cache
 from atom.model_ops.triton_fused_qkv_quant import (
     fused_kv_per_tensor_quant,
@@ -2356,10 +2357,10 @@ class MLAAttention(nn.Module):
             use_decode_kernel = self.kv_cache_dtype.startswith("fp8") or return_lse
             if use_decode_kernel:
                 is_fp8 = self.kv_cache_dtype.startswith("fp8")
-                # A full IndexShare layer rewrites the rank-local compact
-                # indptr, so the once-per-step work metadata (built from the
-                # GLOBAL sparse_kv_indptr) does not describe this rank's regions
-                # -- rebuild it here, or run non-persistent.
+                # A full indexer layer rewrites the rank-local compact indptr,
+                # so the forward's whole-row work plan (built once from the
+                # GLOBAL sparse_kv_indptr) is pointed at this layer's regions
+                # here -- or the layer runs non-persistent.
                 #
                 # Read from the same predicate the gathered pad width came from
                 # rather than re-deriving the gate: on the persistent kernel set
@@ -2412,15 +2413,11 @@ class MLAAttention(nn.Module):
                         kv_last_page_lens,
                     ) = head_groups.prepare(q, o, paged_kv_indptr, paged_kv_indices)
                 elif sparse_dcp_persistent and self.owns_sparse_indexer:
-                    self._rebuild_sparse_dcp_persistent_metadata(
-                        attn_metadata,
-                        q,
-                        kv_c_and_k_pe_cache,
-                        paged_cu_seqlens_q,
+                    patch_work_kv_ranges(
+                        attn_metadata.sparse_prefill_work_info_set,
+                        attn_metadata.sparse_prefill_work_indptr,
                         paged_kv_indptr,
-                        kv_last_page_lens,
-                        self.dcp_sparse_prefill_num_heads,
-                        work_prefix="sparse_prefill_",
+                        B,
                     )
                 # Not gated on is_fp8: the DCP arm's sparse_prefill_work_*
                 # buffers are allocated/filled for the layer's real dtype
@@ -2564,12 +2561,10 @@ class MLAAttention(nn.Module):
         sparse indptr. Shared IndexShare layers reuse the preceding full layer's
         indices, compact indptr, and work plan and therefore skip this call.
 
-        ``gathered_num_heads`` is the caller's own gathered/padded width, not
-        assumed here: decode (``dcp_kernel_num_heads``) and sparse prefill
-        (``dcp_sparse_prefill_num_heads``) round to different width tables and
-        can disagree for a gathered width outside the current power-of-two
-        models, so passing decode's here for a sparse-prefill call would plan
-        work descriptors for the wrong nhead.
+        ``gathered_num_heads`` is the caller's own gathered/padded width
+        (``dcp_kernel_num_heads``), not assumed here. Sparse prefill does not
+        rebuild: it patches the forward's whole-row plan
+        (``patch_work_kv_ranges``).
         """
         if not work_prefix:
             assert attn_metadata.max_seqlen_q == 1, (
@@ -2598,15 +2593,6 @@ class MLAAttention(nn.Module):
             page_size=1,
             dtype_q=q.dtype,
             dtype_kv=kv_buffer.dtype,
-            # Keep each BF16 prefill row whole: splitting its candidates
-            # according to batch occupancy changes the attention reduction
-            # order and can perturb downstream expert selection.
-            kv_granularity=(
-                self._sparse_prefill_kv_granularity
-                if work_prefix == "sparse_prefill_"
-                and q.dtype == kv_buffer.dtype == torch.bfloat16
-                else 16
-            ),
             max_seqlen_qo=1,
             uni_seqlen_qo=1,
             fast_mode=1,
