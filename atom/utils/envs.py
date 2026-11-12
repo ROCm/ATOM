@@ -636,15 +636,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # V4.1 step: where its time goes, averaged every 64 steps, logged and
     # appended to <prefix>_r<rank>.jsonl). Use with --enforce-eager.
     "ATOM_MONO_TIMELINE": lambda: os.getenv("ATOM_MONO_TIMELINE"),
-    # DeepSeek-V4.1 mono decode: raise on a step width mono refuses instead of
-    # letting that step take the original model's path. A width is refused when
-    # its build does not fit or when its kernels still need scratch after the
-    # lean rebuild (mono/runtime/widths.py, deepseek_v41/mono/builds.py). Off by
-    # default -- the silent decline IS the production behaviour, and a
-    # deployment that loses one width still serves the rest -- but an A/B that
-    # means to measure mono measures the fallback instead and cannot tell from
-    # its numbers, so turn it on there.
-    "ATOM_DSV41_MONO_STRICT": lambda: os.getenv("ATOM_DSV41_MONO_STRICT", "0") == "1",
     # Debug: the mono kernels bound every mailbox wait (10 s): a wait that gives up
     # records its region, pair and tags, and the runner raises with them at the end
     # of the step (mono/runner.py finish_step) instead of the GPU hanging. Use

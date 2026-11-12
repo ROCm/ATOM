@@ -16,7 +16,6 @@ import torch
 
 pytest.importorskip("aiter")
 
-from atom.models.deepseek_v41.mono import builds
 from atom.models.deepseek_v41.mono.builds import (
     RowsBuild,
     lean_width,
@@ -295,19 +294,3 @@ def test_a_mismatched_output_width_is_refused():
             8,
             0,
         )
-
-
-# ── the strict switch ─────────────────────────────────────────────────────
-
-
-def test_a_refused_width_is_silent_by_default(monkeypatch):
-    monkeypatch.delenv("ATOM_DSV41_MONO_STRICT", raising=False)
-    assert builds.strict() is False
-    assert builds.refuse(48) is None
-
-
-def test_a_refused_width_raises_under_the_strict_env(monkeypatch):
-    monkeypatch.setenv("ATOM_DSV41_MONO_STRICT", "1")
-    assert builds.strict() is True
-    with pytest.raises(RuntimeError, match="width 48 refused"):
-        builds.refuse(48)

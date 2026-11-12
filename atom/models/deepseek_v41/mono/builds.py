@@ -22,16 +22,9 @@ and its selection published into the buffers K2 would otherwise have filled
 itself (``runner.V41MonoDecodeRunner._publish_selection``). The same
 configuration, on kernels byte-identical to these, is what the out-of-tree
 AITER provider drives, so this is a build choice, not a new kernel.
-
-``strict`` is the other half of the same story: a width refused even after the
-lean rebuild is still a silent fallback to the original model's path, and
-``ATOM_DSV41_MONO_STRICT`` makes the runner say so rather than let a
-measurement report it as mono.
 """
 
 from dataclasses import dataclass, replace
-
-from atom.utils import envs
 
 
 @dataclass(frozen=True)
@@ -102,24 +95,3 @@ def lean_width(built: RowsBuild, spilled: list, rebuild):
     if not any(f in spilled for f in k2):
         return None
     return rebuild()
-
-
-def strict() -> bool:
-    """``ATOM_DSV41_MONO_STRICT``: refuse to fall back silently."""
-    return bool(envs.ATOM_DSV41_MONO_STRICT)
-
-
-def refuse(rows: int) -> None:
-    """Raise for a step width mono will not serve, under ``strict``.
-
-    Off (the default) this does nothing and the step takes the original
-    model's path, as every unserved width does. On, it is an error: the only
-    reason to ask for a width is a measurement, and a measurement that quietly
-    reports the original path is worse than no measurement.
-    """
-    if not strict():
-        return
-    raise RuntimeError(
-        f"V4.1 mono: width {rows} refused (the warning above names why); its "
-        "steps would take the original path (ATOM_DSV41_MONO_STRICT=1)"
-    )
