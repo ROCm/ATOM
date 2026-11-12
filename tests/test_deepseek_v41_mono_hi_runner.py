@@ -295,7 +295,7 @@ def test_postprocess_takes_the_heads_verdict_and_the_broadcast_ids(
     )
     runner.forward_done_event = SimpleNamespace(record=lambda stream=None: None)
     runner._served = None  # (no step override served this step)
-    runner.drafter = object()
+    runner.drafter = SimpleNamespace(context_kv_only=False)
     runner.structured_output = None
     runner.propose_draft_token_ids = propose
     batch = SimpleNamespace(
