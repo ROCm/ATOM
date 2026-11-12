@@ -1214,6 +1214,11 @@ class PagedAttentionImpl(nn.Module):
         )
 
 
+# What aiter's fused QK-norm / rope / cache writer calls a cache format (anything
+# else it takes as "auto"): ATOM's `fp4` is its "mxfp4". One table for both caches.
+_AITER_WRITER_DTYPE = {"fp8": "fp8", "fp4": "mxfp4"}
+
+
 class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
     """MiniMax-M3 sparse attention as a first-class ``PagedAttentionImpl``.
 
@@ -1426,23 +1431,19 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         cos_sin_cache = _minimax_m3_cos_sin_cache(self.rotary_emb, qkv)
 
         is_fp8 = self.kv_cache_dtype == "fp8"
-        kv_cache_dtype = "auto" if not is_fp8 else self.kv_cache_dtype
+        kv_cache_dtype = _AITER_WRITER_DTYPE.get(self.kv_cache_dtype, "auto")
         # fp8: the fused op computes per-token dynamic quant and writes the
         # per-token dequant scales into k_scale / v_scale (outputs).
         fused_k_scale = k_scale if is_fp8 else None
         fused_v_scale = v_scale if is_fp8 else None
         fused_index_cache_dtype = (
-            self.index_cache_dtype
-            if self.index_cache_dtype in ("fp8", "fp4")
-            and not self.skip_index_topk  # no index branch
-            else "auto"
+            "auto"  # no index branch
+            if self.skip_index_topk
+            else _AITER_WRITER_DTYPE.get(self.index_cache_dtype, "auto")
         )
-        if fused_index_cache_dtype == "fp4":  # the AITER writer's name for it
-            fused_index_cache_dtype = "mxfp4"
 
         if self.kv_cache_dtype == "fp4":
             fused_kv_block_size = SPARSE_BLOCK_SIZE
-            kv_cache_dtype = "mxfp4"
         else:
             # SHUFFLE page size (== ASM_PAGE_SIZE == 16)
             fused_kv_block_size = k_cache.shape[3]
