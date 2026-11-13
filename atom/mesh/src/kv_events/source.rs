@@ -51,6 +51,7 @@ pub enum TransportSpec {
 
 /// When lower-tier hits count toward the engine's `cached_tokens`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OffloadLoad {
     pub chunk_tokens: u32,
     pub min_load_tokens: u32,

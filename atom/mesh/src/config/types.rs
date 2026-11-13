@@ -257,6 +257,7 @@ pub enum KvDiscoveryMethod {
 
 /// Event endpoints of one worker, listed by DP rank.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StaticKvEventSource {
     pub endpoints: Vec<String>,
     #[serde(default)]
@@ -264,6 +265,10 @@ pub struct StaticKvEventSource {
     #[serde(default)]
     pub topic: String,
     pub model: Option<String>,
+    /// As in vLLM Router. Events of another block size are dropped; None takes each
+    /// event's own.
+    #[serde(default)]
+    pub block_size: Option<u32>,
     #[serde(default)]
     pub profile: WireProfile,
     #[serde(default)]
@@ -271,7 +276,7 @@ pub struct StaticKvEventSource {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct KvStorageBreakerConfig {
     pub failures: u32,
     pub open_secs: u64,
@@ -288,7 +293,7 @@ impl Default for KvStorageBreakerConfig {
 
 /// Defaults for shared-storage lookups.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct KvStorageConfig {
     /// Mooncake master admin port (its `metrics_port`).
     pub mooncake_admin_port: u16,
@@ -324,6 +329,7 @@ pub enum StorageBackendConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StorageGateConfig {
     pub min_tokens: u32,
 }
@@ -331,6 +337,7 @@ pub struct StorageGateConfig {
 /// A storage source discovery cannot find. With the id of a generated source, only the
 /// given fields override it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StorageSourceConfig {
     pub model: Option<String>,
     pub backend: Option<StorageBackendConfig>,
@@ -343,9 +350,10 @@ pub struct StorageSourceConfig {
     pub probe: Option<RankProbe>,
 }
 
-/// KV event ingestion and shared-storage lookups.
+/// KV event ingestion and shared-storage lookups. Unknown keys are errors: the section
+/// is new, so no saved config carries removed ones.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct KvEventsConfig {
     pub enabled: KvEventsMode,
     /// Tried in order; the first non-empty result wins.
@@ -797,6 +805,17 @@ mod tests {
         assert_eq!(generated.readers, ReaderRule::Discovered);
         assert_eq!(generated.probe, Some(RankProbe::All));
         assert!(serde_json::from_str::<StorageSourceConfig>(r#"{"readers": "all"}"#).is_err());
+        for typo in [
+            r#"{"static_sources": {"u": {"endpoints": [], "replay_endpoint": []}}}"#,
+            r#"{"storage": {"deadline": 3}}"#,
+            r#"{"offload_load": {"chunk_tokens": 256, "min_load_token": 0}}"#,
+            r#"{"kv_events": {}}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<KvEventsConfig>(typo).is_err(),
+                "{typo}"
+            );
+        }
 
         let mut legacy = serde_json::to_value(RouterConfig::default()).unwrap();
         legacy.as_object_mut().unwrap().remove("kv_events");

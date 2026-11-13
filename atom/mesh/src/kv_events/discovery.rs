@@ -69,7 +69,9 @@ pub struct EngineEventSource {
     pub block_size: Option<u32>,
     #[serde(default)]
     pub hash_algo: Option<String>,
-    #[serde(default)]
+    /// A report that does not parse or is out of bounds turns off storage reads for the
+    /// rank, not its events.
+    #[serde(default, deserialize_with = "bounded_offload")]
     pub offload: Option<OffloadReport>,
 }
 
@@ -99,6 +101,36 @@ pub struct OffloadReport {
     /// Hex digest of the key chain over tokens `0..chunk_tokens`, for the key-rule self check.
     #[serde(default)]
     pub chain_check: Option<String>,
+}
+
+impl OffloadReport {
+    /// The router builds keys per chunk and rank from these, at registration and on every
+    /// request.
+    fn in_bounds(&self) -> bool {
+        (1..=65_536).contains(&self.chunk_tokens)
+            && self.world.is_none_or(|world| (1..=1024).contains(&world))
+            && self.namespace.as_ref().is_none_or(|ns| ns.len() <= 128)
+            && self.masters.len() <= 64
+    }
+}
+
+fn bounded_offload<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<OffloadReport>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Lenient {
+        Report(OffloadReport),
+        Other(serde::de::IgnoredAny),
+    }
+    Ok(match Option::<Lenient>::deserialize(deserializer)? {
+        Some(Lenient::Report(report)) if report.in_bounds() => Some(report),
+        Some(_) => {
+            tracing::warn!("offload report malformed or out of bounds; storage reads are off");
+            None
+        }
+        None => None,
+    })
 }
 
 #[cfg(test)]
@@ -146,5 +178,19 @@ mod tests {
             sources[&1].offload.as_ref().unwrap().backend,
             OffloadBackend::Other
         );
+    }
+
+    #[test]
+    fn bad_offload_reports_only_turn_storage_off() {
+        let body = r#"{"0": {"endpoint": "tcp://a:1", "offload": {"backend": "mooncake_store",
+                "namespace": "x", "world": 1, "chunk_tokens": 4294967295, "min_load_tokens": 0}},
+            "1": {"endpoint": "tcp://a:2", "offload": {"backend": "nixl"}},
+            "2": {"endpoint": "tcp://a:3", "offload": {"backend": "mooncake_store",
+                "world": 0, "chunk_tokens": 256, "min_load_tokens": 0}},
+            "3": {"endpoint": "tcp://a:4", "offload": {"backend": "lmcache",
+                "chunk_tokens": 256, "min_load_tokens": 0}}}"#;
+        let sources: EngineEventSources = serde_json::from_str(body).unwrap();
+        let offload: Vec<bool> = sources.values().map(|s| s.offload.is_some()).collect();
+        assert_eq!(offload, [false, false, false, true]);
     }
 }
