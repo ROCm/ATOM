@@ -234,6 +234,7 @@ def _stateful_seq(
         num_cached_tokens=num_cached_tokens,
         block_table=list(range((num_prompt_tokens + 255) // 256)),
         has_per_req_cache=True,
+        cache_seed=-1,
         state_slot=group,
         prefix_hashes_published=True,
         _state_initialized_after_alloc=True,
@@ -246,10 +247,9 @@ def _commit_sidecar(
     seq: SimpleNamespace,
     boundary: int,
 ) -> int:
-    boundary_hash = _chained_prefix_hashes(
-        seq.token_ids,
-        sched.hash_block_size,
-    )[boundary]
+    boundary_hash = _chained_prefix_hashes(seq.token_ids, sched.hash_block_size, -1)[
+        boundary
+    ]
     sched._committed_sidecar_hashes.add(boundary_hash)
     return boundary_hash
 
@@ -2466,7 +2466,7 @@ def test_chained_prefix_hashes_match_block_manager_with_dcp_hash_size():
     block_manager = BlockManager(config)
     tokens = list(range(32))
 
-    actual = _chained_prefix_hashes(tokens, block_manager.hash_block_size)
+    actual = _chained_prefix_hashes(tokens, block_manager.hash_block_size, -1)
     expected = {}
     parent = -1
     for boundary in range(
@@ -2884,9 +2884,9 @@ def test_sidecar_hashes_are_computed_once_per_sequence_lifecycle(monkeypatch):
     calls = []
     original = _chained_prefix_hashes
 
-    def counted(token_ids, hash_block_size):
+    def counted(token_ids, hash_block_size, **kwargs):
         calls.append(len(token_ids) // hash_block_size)
-        return original(token_ids, hash_block_size)
+        return original(token_ids, hash_block_size, **kwargs)
 
     monkeypatch.setattr(
         "atom.kv_transfer.offload.hybrid.dsv4.connector._chained_prefix_hashes",
@@ -2937,7 +2937,7 @@ def test_sidecar_save_emits_at_regular_checkpoint_boundary():
         group=2,
     )
     sched._save_tracker["706"] = [seq, 0]
-    boundary_hash = _chained_prefix_hashes(seq.token_ids, 256)[16_384]
+    boundary_hash = _chained_prefix_hashes(seq.token_ids, 256, -1)[16_384]
 
     meta = sched.build_connector_meta()
 
@@ -3004,7 +3004,7 @@ def test_off_interval_terminal_saves_page_without_slot():
         group=2,
     )
     sched._save_tracker["707"] = [seq, 16_384]
-    regular_hash = _chained_prefix_hashes(seq.token_ids, 256)[16_384]
+    regular_hash = _chained_prefix_hashes(seq.token_ids, 256, -1)[16_384]
     sched._committed_sidecar_hashes.add(regular_hash)
     meta = sched.build_connector_meta()
 
@@ -3040,7 +3040,7 @@ def test_sidecar_only_save_emits_when_page_boundary_is_already_stored():
         group=2,
     )
     sched._save_tracker["708"] = [seq, 8192]
-    boundary_hash = _chained_prefix_hashes(seq.token_ids, 256)[8192]
+    boundary_hash = _chained_prefix_hashes(seq.token_ids, 256, -1)[8192]
 
     meta = sched.build_connector_meta()
 
@@ -4287,7 +4287,7 @@ def test_prefill_chunk_does_not_recut_committed_or_inflight_boundary():
         num_cached_tokens=12_288,
         group=2,
     )
-    boundary_hash = _chained_prefix_hashes(seq.token_ids, 256)[16_384]
+    boundary_hash = _chained_prefix_hashes(seq.token_ids, 256, -1)[16_384]
 
     sched._committed_sidecar_hashes.add(boundary_hash)
     assert sched.adjust_prefill_chunk_after_alloc(seq, 8192) == 8192
@@ -4841,6 +4841,7 @@ def test_worker_save_uses_lmcache_engine_store():
 
     req = SimpleNamespace(
         req_id=987,
+        cache_salt="",
         token_ids=list(range(12)),
         block_ids=[3, 4, 5],
         is_last_prefill=True,
@@ -4888,6 +4889,7 @@ def test_worker_save_waits_for_forward_event_before_store():
 
     req = SimpleNamespace(
         req_id=988,
+        cache_salt="",
         token_ids=list(range(8)),
         block_ids=[3, 4],
         is_last_prefill=True,
@@ -4901,7 +4903,10 @@ def test_worker_save_waits_for_forward_event_before_store():
     assert conn._done_save == {988}
 
 
-def test_worker_load_uses_lmcache_engine_retrieve_and_marks_done():
+@pytest.mark.parametrize(
+    "cache_salt, configs", [("", None), ("11", {"lmcache.tag.cache_salt": "11"})]
+)
+def test_worker_load_uses_lmcache_engine_retrieve_and_marks_done(cache_salt, configs):
     import torch
 
     if not hasattr(torch, "tensor"):
@@ -4931,6 +4936,7 @@ def test_worker_load_uses_lmcache_engine_retrieve_and_marks_done():
 
     req = SimpleNamespace(
         req_id=988,
+        cache_salt=cache_salt,
         token_ids=list(range(16)),
         block_ids=[3, 4, 5, 6],
         load_spec=SimpleNamespace(hbm_cached_tokens=4, lmcache_cached_tokens=12),
@@ -4946,6 +4952,7 @@ def test_worker_load_uses_lmcache_engine_retrieve_and_marks_done():
     assert mask == [False, False, False, False] + [True] * 8
     assert kwargs["block_ids"] == [3, 4, 5, 6]
     assert kwargs["req_id"] == "988"
+    assert kwargs.get("request_configs") == configs
 
 
 def test_worker_load_partial_retrieve_marks_failed():
@@ -5735,6 +5742,27 @@ def test_engine_id_pairs_scheduler_and_workers_of_one_replica():
 def test_engine_id_defaults_to_replica_zero():
     assert offcfg.lmcache_engine_id(_dp_config(0)) == "atom-offload-dp0"
     assert offcfg.lmcache_engine_id(SimpleNamespace()) == "atom-offload-dp0"
+
+
+def _server_config(server_id, dp_rank: int = 0, **kw):
+    cfg = _dp_config(dp_rank, **kw)
+    cfg.parallel_config.server_instance_id = server_id
+    return cfg
+
+
+def test_engine_id_splits_servers_on_one_host_and_their_replicas():
+    # One TP1 server per GPU: every one is DP rank 0 under one host directory.
+    same = {
+        offcfg.lmcache_engine_id(
+            _server_config("a", 3, pp_size=2, tp_size=4, pp_rank=pp)
+        )
+        for pp in range(2)
+    }
+    assert same == {"atom-offload-a-dp3"}
+    servers = [_server_config(str(gpu)) for gpu in range(8)]
+    replicas = [_server_config("0", rank) for rank in range(1, 8)]
+    ids = {offcfg.lmcache_engine_id(cfg) for cfg in servers + replicas}
+    assert len(ids) == 15
 
 
 def test_replica_world_size_counts_pp_and_tp_but_not_dp():
@@ -7809,6 +7837,51 @@ class TestStateLoadsAndStoresRunInSeparateLanes:
             assert tier.take_store_reports() == (set(), {op})
         finally:
             tier.shutdown()
+
+
+@pytest.mark.parametrize("cache_seed, salt", [(11, "11"), (12, "12"), (-1, "")])
+def test_a_dsv4_prompt_carries_its_media_salt_to_lookup_save_and_load(cache_seed, salt):
+    asked = []
+
+    class _SaltLookupClient(_LookupClient):
+        def lookup(self, token_ids, lookup_id, **kwargs):
+            asked.append(kwargs)
+            return self.hit
+
+    sched = _scheduler()
+    sched._lookup_client = _SaltLookupClient(hit=12)
+    loader, saver = _consumer_seq(950), _consumer_seq(951)
+    loader.cache_seed = saver.cache_seed = cache_seed
+    saver.num_cached_tokens = 16
+    sched._save_tracker["951"] = [saver, 0]
+
+    sched.get_num_new_matched_tokens(loader)
+    sched.update_state_after_alloc(loader)
+    load, save = sched.build_connector_meta().requests
+
+    expected = {"request_configs": {"lmcache.tag.cache_salt": salt}} if salt else {}
+    assert asked and all(kwargs == expected for kwargs in asked)
+    assert (load.load_spec is not None, load.cache_salt) == (True, salt)
+    assert (save.save_spec is not None, save.cache_salt) == (True, salt)
+
+
+@pytest.mark.parametrize("cache_seed", [11, -1])
+def test_a_dsv4_slot_boundary_hash_chains_from_the_cache_seed(cache_seed):
+    """The SLOT boundary hash is the one `BlockManager` chains from the same
+    `cache_seed`."""
+    sched = _stateful_scheduler(hit=0)
+    seq = _stateful_seq(
+        req_id=730, num_prompt_tokens=16_384, num_cached_tokens=8192, group=2
+    )
+    seq.cache_seed = cache_seed
+    sched._save_tracker["730"] = [seq, 0]
+
+    request = sched.build_connector_meta().requests[0]
+
+    parent = cache_seed
+    for start in range(0, 8192, 256):
+        parent = BlockManager.compute_hash(seq.token_ids[start : start + 256], parent)
+    assert request.slot_save_spec.boundary_block_hash == parent
 
 
 class TestAStateStoreWaitsForTheCopyThatFillsItsUnits:
