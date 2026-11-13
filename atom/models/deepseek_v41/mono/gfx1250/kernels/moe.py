@@ -37,7 +37,6 @@ from flydsl.expr import gpu, range_constexpr, rocdl
 from atom.models.deepseek_v41.mono.gfx1250.kernels import device as hx
 from atom.models.deepseek_v41.mono.gfx1250.kernels import dims as D
 from atom.models.deepseek_v41.mono.gfx1250.kernels import moe_plan as MP
-from atom.models.deepseek_v41.mono.gfx1250.kernels import stamps
 from atom.models.deepseek_v41.mono.gfx1250.kernels.attention import q8words, bf, e8m0_of, handoff, inv_pow2, rsq
 
 H, I, TOPK, NE, CTAS = D.HID, D.MOE_I, D.TOPK, D.EXPERTS, D.CTAS
@@ -517,7 +516,6 @@ def moe_ug(c):
             moe_dn_shared(cd)
 
 
-IDLE_HOOK = hx.TraceSlot()   # (v2) trace-time hook run between the UG and the UG -> down handoff
 TILE_UG = True   # (v2) the routed UG as TileRT's split: one 16-row tile a wave over the full K (a 40 KB contiguous stream)
 UG1_KB = 8       # K steps in flight a wave (v2 tile UG)
 
@@ -756,8 +754,6 @@ def ug_shared_early(c, bi):
         ra = [[lda8(ab + (i64(fx.min(k0 + j, I32(39))) * 4 + tile) * UNIT8, l) for tile in range(4)] for j in range(MAXS)]
         NV = [[hx.gload(c["nw"] + i64(cb[cc] + 8 * h) * 2, BF16, 8, align=16) for h in range(2)] for cc in range(4)]
         gpu.barrier()   # issued theirs before reaching this barrier
-        if c["t"] == 0:
-            hx.gstore(c["stp"] + i64(15 * 8), hx.clock())   # (study) owners' count seen by a shared-UG CTA
         XV = [[hx.gload(c["x1g"] + i64(row * H + cb[cc] + 8 * h) * 2, BF16, 8, align=16) for h in range(2)] for cc in range(4)]
         if w < rows_:
             pv = [hx.gload(c["part2"] + i64(((l + 32 * kq) * 8 + w) * 32 + 25) * 4, F32) for kq in range(256 // 32)]
@@ -791,8 +787,6 @@ def ug_shared_early(c, bi):
                 if c["t"] == 0:
                     hx.wait_count(c["x8cnt"], c["x8n"], 6)
             gpu.barrier()
-            if c["t"] == 0:
-                hx.gstore(c["stp"] + i64(15 * 8), hx.clock())   # (study) x8 seen by a shared-UG CTA
         rb = [ldb_x(c, row, fx.min(k0 + j, I32(39)), l) for j in range(MAXS)]
     acc = [fx.Vector.filled(8, 0.0, F32) for _ in range(4)]
     for j in range_constexpr(MAXS):
@@ -1120,30 +1114,20 @@ def she_fin(c):
 
 
 def moe(c, cnt_off):
-    """The whole routed MoE (all 256 CTAs). cnt_off: byte address of this step's handoff counter (zeroed). Phase stamps
-    (stamps.point 10..14): union, UG, UG -> down handoff, down staging, down."""
-    st = lambda k: stamps.point(10 + k)
+    """The whole routed MoE (all 256 CTAs). cnt_off: byte address of this step's handoff counter (zeroed)."""
     moe_union(c)
-    st(0)
     moe_ug(c)
-    st(1)
-    if fx.const_expr(IDLE_HOOK[0] is not None):   # (v2) work for the CTAs without UG units (before the UG -> down handoff)
-        IDLE_HOOK[0]()
     if fx.const_expr(not DN_OVL):
         handoff(cnt_off, c["t"], True)
     if fx.const_expr(SHE_IN_MOE):   # (v2) the shared UG units' K-slice sums + epilogue (partials of SHE_CTAS CTAs), counted
         she_fin(c)
-    st(2)
     if fx.const_expr(DN_V2):
-        st(4)
         moe_dn_v2(c)
     else:
         moe_dn_stage(c)
-        st(4)
         moe_dn(c)
     if fx.const_expr(not sh8_dnov((c["NP"] // c["topk"] + MAXTOK - 1) // MAXTOK)):
         moe_dn_shared(c)
-    st(3)
 
 
 def _rv_wmax(v):   # (the router's wave max: front imports moe, so a call-time import)
@@ -1445,7 +1429,6 @@ def recv_owner(c, region, tag, TR):
             bad = I32(0)
             for o in range_constexpr(4):
                 bad = bad | ((got[o][1] != tag) | (got[o][3] != tag)).select(I32(1), I32(0))
-        hx.note_timeout(t0, 6)
         for h in range_constexpr(2):
             sl = F32(0.0)
             sh = F32(0.0)

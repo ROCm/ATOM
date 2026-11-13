@@ -151,7 +151,6 @@ def poll_unit(addr, tag, site=3):
     t0 = hx.clock()
     while (hx.gload(addr + i64(12), I32, nt=True) != tag) & (hx.clock() - t0 < fx.Int64(hx.POLL_TICKS)):
         hx.s_sleep(0)
-    hx.note_timeout(t0, site)
     return hx.gload(addr, I32, 4, nt=True)
 
 

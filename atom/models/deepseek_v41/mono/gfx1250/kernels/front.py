@@ -504,28 +504,22 @@ def front_E2(c):
 
 
 @ASTRewriter.transform
-def front_any(c, stf):
+def front_any(c):
     """Both fronts with one copy of the code (c["isffn"] runtime: FFN front = + router D / E1, int8 block codes, top-6
-    merge; attention front = int32 codes, Sinkhorn only). stf(k): the FFN front's stamps. c["eng"] (optional, runtime):
+    merge; attention front = int32 codes, Sinkhorn only). c["eng"] (optional, runtime):
     the attention front before an Engram layer (front_A's _engram_gate)."""
     front_A(c)
-    stf(2)
     front_B(c)
-    stf(3)
     cluster_sync()
-    stf(4)
     front_C(c)
-    stf(5)
     if fx.const_expr(not c.get("norouter", False)):   # (v2: the router runs on its own CTAs, router_v2)
         if c["isffn"]:
             front_D(c)
             cluster_sync()
             front_E1(c)
-            stf(6)
             cluster_sync()
     front_E2(c)
     gpu.barrier()
-    stf(7)
 
 
 # ==============================================================================================================
@@ -629,7 +623,7 @@ def router_gate_pre(c):
 @ASTRewriter.transform
 def router_v2(c, TR):
     """c: t b w l sm (LDS: 4 KB scratch + EPR gate rows), gate (bf16 [NE][H]), xn (bf16 [T][H]), x8pub (counter),
-    scores (LL [T][NE] x 8 B), tag (epoch32), stp (stamps). The dot as bf16 WMMA 16x16x32 (experts as M, rows as N),
+    scores (LL [T][NE] x 8 B), tag (epoch32). The dot as bf16 WMMA 16x16x32 (experts as M, rows as N),
     the K split over the 8 waves (20 steps each), A from the LDS copy of the gate rows, B the rows' xn from global."""
     t, b, w, l, sm = c["t"], c["b"], c["w"], c["l"], c["sm"]
     NE_ = c.get("ne", NE)   # (draft: 128 experts, 1 a router CTA)
@@ -654,8 +648,6 @@ def router_v2(c, TR):
                 hx.wait_count(c["postcnt"], 160, 11)
             else:
                 hx.wait_count(c["x8pub"], c.get("x8n", FRONT_CTAS), 11)
-    if t == 0:
-        hx.gstore(c["stp"] + i64(14 * 8), hx.clock())
     gpu.barrier()
     if fx.const_expr(SELFN):
         # raw x1 rows -> LDS (low registers: nothing held across the barriers), the thread's square sums on the way
@@ -677,8 +669,6 @@ def router_v2(c, TR):
             if l == 0:
                 hx.lstore(sm + RS_OFF + (w * 8 + r_) * 4, s)
         gpu.barrier()
-        if t == 0:
-            hx.gstore(c["stp"] + i64(13 * 8), hx.clock())   # (study) x1 rows in, square sums done
         if t < TR:
             s = F32(0.0)
             for ww in range_constexpr(8):
@@ -692,8 +682,6 @@ def router_v2(c, TR):
                 o8 = [bf((xr[e].to(F32) * rs) * NV[j][e].to(F32)) for e in range(8)]
                 hx.lstore(sm + XN_OFF + r_ * GL_STR + q[j] * 16, fx.Vector.from_elements(o8, BF16), align=16)
         gpu.barrier()
-        if t == 0:
-            hx.gstore(c["stp"] + i64(11 * 8), hx.clock())   # (study) normed rows in LDS (over the owner's stamp 11)
     am = fx.min(l % 16, I32(EPR_ - 1))        # A row (expert; rows past EPR_ repeat the last: their outputs unused)
     bn = fx.min(l % 16, I32(TR - 1))          # B row (token)
     kh = (l // 16) * 16
@@ -711,8 +699,6 @@ def router_v2(c, TR):
         for i in range_constexpr(EPR_):
             hx.lstore(sm + ((w * EPR_ + i) * 8 + l) * 4, acc[i])
     gpu.barrier()
-    if t == 0:
-        hx.gstore(c["stp"] + i64(15 * 8), hx.clock())
     if t < TR * EPR_:
         r_ = t // EPR_
         e = t % EPR_
@@ -721,8 +707,6 @@ def router_v2(c, TR):
             s = s + hx.lload(sm + ((ww * EPR_ + e) * 8 + r_) * 4, F32)
         sc = _score(bf(s).to(F32))
         hx.put(c["scores"] + i64(r_ * NE_ + e0 + e) * 8, sc.bitcast(I32), c["tag"])
-    if t == 0:
-        hx.gstore(c["stp"] + i64(16 * 8), hx.clock())
 
 
 @ASTRewriter.transform
@@ -740,7 +724,6 @@ def scores_batch(base, tag, NI=NI):
         bad = I32(0)
         for i in range_constexpr(NI):
             bad = bad | (pg[i][1] != tag).select(I32(1), I32(0))
-    hx.note_timeout(t0, I32(12 * 65536) + (tag & I32(0x3FF)))
     return [pg[i][0] for i in range(NI)]
 
 
@@ -766,9 +749,6 @@ def topk_v2(c, TR, pid_off, wts_off, write_ids):
         bias = [hx.gload(c["gbias"] + i64(l + 32 * i) * 4, F32) for i in range(NI_)]   # before the scores arrive
         ipf(8)
         sw = scores_batch(c["scores"] + i64(row * NE_ + l) * 8, c["tag"], NI_)
-        if fx.const_expr("stp9" in c):
-            if (w == 0) & (l == 0):
-                hx.gstore(c["stp"] + i64(9 * 8), hx.clock())   # (study) row 0's scores in
         for i in range_constexpr(NI_):
             e = l + 32 * i
             sc = sw[i].bitcast(F32)
@@ -848,7 +828,7 @@ def router_v3(c, TR):
     The 24 gate rows go to VGPRs before the wait (thread t: 16-byte chunks t, t + 256, t + 512 < 640 of each row) with
     the norm weight; then the 160 owners' flags, the row's raw x1 (the same chunks), its rstd (CTA reduction), the
     normed bf16 x, 24 fp32 dot partials a thread, wave + LDS reductions in fixed order, sqrt(softplus(bf16 logit)) ->
-    LL score words (the same words topk_v2 reads). c: t w l sm gate nw x1g pflag ptag scores tag norm_eps stp."""
+    LL score words (the same words topk_v2 reads). c: t w l sm gate nw x1g pflag ptag scores tag norm_eps."""
     t, w, l, sm, b = c["t"], c["w"], c["l"], c["sm"], c["b"]
     r = (b - RV3_CTA0) // RV3_PER_ROW
     e0 = ((b - RV3_CTA0) % RV3_PER_ROW) * RV3_EPC
@@ -859,8 +839,6 @@ def router_v3(c, TR):
     ipf(8)
     hx.wait_flags(c["pflag"], 160, c["ptag"], w, l, 11)
     gpu.barrier()
-    if t == 0:
-        hx.gstore(c["stp"] + i64(13 * 8), hx.clock())   # (study) owners seen
     rr = fx.min(r, I32(TR - 1))
     X = [hx.gload(c["x1g"] + i64(rr * H + q[j] * 8) * 2, BF16, 8, align=16) for j in range(3)]
     s = F32(0.0)
@@ -901,16 +879,12 @@ def router_v3(c, TR):
         for e in range_constexpr(RV3_EPC):
             hx.lstore(sm + RS_OFF + 64 + (w * RV3_EPC + e) * 4, part[e])
     gpu.barrier()
-    if t == 0:
-        hx.gstore(c["stp"] + i64(15 * 8), hx.clock())   # (study) dot done
     if (t < RV3_EPC) & (r < TR):
         sacc = F32(0.0)
         for ww in range_constexpr(8):
             sacc = sacc + hx.lload(sm + RS_OFF + 64 + (ww * RV3_EPC + t) * 4, F32)
         sc = _score(bf(sacc).to(F32))
         hx.put(c["scores"] + i64(r * NE + e0 + t) * 8, sc.bitcast(I32), c["tag"])
-    if t == 0:
-        hx.gstore(c["stp"] + i64(16 * 8), hx.clock())   # (study) scores out
 
 
 # ==============================================================================================================
@@ -1001,9 +975,6 @@ def ffn_post_owner(c, TR):
         srs = fma(rq[j], rq[j], srs)
     x1 = bf(fma(q[3], rq[3], fma(q[2], rq[2], fma(q[1], rq[1], q[0] * rq[0]))))
     x1f = x1.to(F32)
-    if fx.const_expr("stp" in c):   # (study) inputs loaded + post computed (CTAs < 192: slot 13 unused there)
-        if (t == 0) & (b < 192):
-            hx.gstore(c["stp"] + i64(13 * 8), hx.clock())
     if live:
         for j in range_constexpr(4):
             hx.stx_dev(c["Rout"] + i64((r * 4 + j) * H + cc) * 2, rq[j].to(BF16))
@@ -1028,8 +999,6 @@ def ffn_post_owner(c, TR):
             hx.put(c["pflag"] + i64(b) * 8, I32(0), c["ptag"])
         else:
             hx.atomic_add(c["cnt"], 1)
-        if fx.const_expr("stp" in c):
-            hx.gstore(c["stp"] + i64(11 * 8), hx.clock())
 
 
 @ASTRewriter.transform
@@ -1074,9 +1043,6 @@ def ffn_c2(c, TR):
     else:
         if t == 0:
             hx.wait_count(c["cnt"], NOWN, 13)
-    if fx.const_expr("stp" in c):
-        if t == 0:
-            hx.gstore(c["stp"] + i64(14 * 8), hx.clock())
     gpu.barrier()
     # wave w = token: lane l sums owners l, l + 32, .. (8 loads in flight), then the wave sum
     pv = [hx.gload(c["part2"] + i64(((l + 32 * k) * 8 + w) * 32 + 25) * 4, F32) for k in range(NOWN // 32)]
@@ -1096,9 +1062,6 @@ def ffn_c2(c, TR):
             v = fx.Vector.from_elements([(w < TR).select(v[e], BF16(0.0)) for e in range(8)], BF16)
             hx.lstore(sm + O_X1 + (w * CP + cs[s_]) * 2, v, align=16)
     gpu.barrier()
-    if fx.const_expr("stp" in c):
-        if t == 0:
-            hx.gstore(c["stp"] + i64(15 * 8), hx.clock())
     rs = hx.lload(sm + O_RSTD + w * 4, F32)
     for s_ in range_constexpr(2):
         if (s_ == 0) | (l < 8):
@@ -1131,8 +1094,6 @@ def ffn_c2(c, TR):
             hx.put(c["xflag"] + i64(b) * 8, I32(0), c["xtag"])
         else:
             hx.atomic_add(c["x8pub"], 1)
-        if fx.const_expr("stp" in c):
-            hx.gstore(c["stp"] + i64(16 * 8), hx.clock())
 
 
 NL1 = 6          # level-1 summing CTAs of the mix partials (CTAs SK0 .. SK0 + 5: idle until the scores)

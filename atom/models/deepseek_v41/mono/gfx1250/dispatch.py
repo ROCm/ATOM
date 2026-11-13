@@ -14,16 +14,14 @@ from torch import nn
 
 from atom.models.deepseek_v41.mono.gfx1250 import refusal
 from atom.models.deepseek_v41.mono.gfx1250.config import MAX_ROWS, ROWS_PER_REQ
-from atom.models.deepseek_v41.mono.gfx1250.debug import CheckModel
 from atom.mono.runtime.route import LazyRunner
 from atom.mono.runtime.step_override import StepOverrideModel
-from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
 
 
-class SingleStepModel(CheckModel, StepOverrideModel, nn.Module):
+class SingleStepModel(StepOverrideModel, nn.Module):
     """The loaded V4.1 runtime model. ``ModelRunner`` offers it each decode step (``step_override``): it runs the
     step as the single launch, or declines and the production path runs (its forward, unchanged).
 
@@ -48,7 +46,6 @@ class SingleStepModel(CheckModel, StepOverrideModel, nn.Module):
         self._decode_batch = (
             None  # this step's batch when it is a decode step (``step_override``)
         )
-        self._step_batch = None
         if drafter is not None:
             self._wrap_drafter(drafter)
 
@@ -107,9 +104,6 @@ class SingleStepModel(CheckModel, StepOverrideModel, nn.Module):
         DSpark verify with nothing the kernel does not produce: no structured output, no logprobs, no required
         channel (it returns ids and the verdict, not logits), and request shapes the kernel takes (``precheck``).
         """
-        self._step_batch = batch  # (the ATOM_MONO_CHECK launch's sampling parameters)
-        if envs.ATOM_MONO_CHECK:  # the production path serves, the launch only compares
-            return None
         if batch is not None and (
             getattr(batch, "structured_requests", None)
             or batch.any_logprobs
@@ -129,8 +123,6 @@ class SingleStepModel(CheckModel, StepOverrideModel, nn.Module):
     def forward(self, input_ids, positions, inputs_embeds=None):
         # a production forward (prefill, or an eager decode): not the single launch's step
         self._served = self._decode_batch = None
-        if inputs_embeds is None and envs.ATOM_MONO_CHECK:
-            return self.check_forward(input_ids, positions)
         return self.model(input_ids, positions, inputs_embeds=inputs_embeds)
 
     def compute_logits(self, hidden_states):

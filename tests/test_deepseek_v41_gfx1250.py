@@ -245,12 +245,6 @@ def test_a_request_shape_the_kernel_refuses_takes_the_production_path(
     assert model.single_step_runner(_batch(), 48) is None
 
 
-def test_check_mode_never_serves(model, verify_step, monkeypatch):
-    monkeypatch.setenv("ATOM_MONO_CHECK", "1")
-    model._single.runner = _Runner()
-    assert model.single_step_runner(_batch(), 48) is None
-
-
 class _ServingRunner(_Runner):
     def __init__(self):
         super().__init__()

@@ -5,14 +5,14 @@
 """The step tail as two callable blocks of the step kernel:
 
     for Ly in range(NL):            layer_body(Ly)        # the target loop stays tail-free (instruction cache)
-    tail.target(tp, t, b, sm, st, cnt_tail, recv, rank)   # head -> 4-rank top-p sampling -> verify
+    tail.target(tp, t, b, sm, cnt_tail, recv, rank)   # head -> 4-rank top-p sampling -> verify
     for Ly in range(NL, NL + 3):    layer_body(Ly)        # draft layers (second copy of the layer code)
-    tail.draft(tp, t, b, sm, st, cnt_tail, recv, rank)    # draft head -> 4-rank Markov block sampling
+    tail.draft(tp, t, b, sm, cnt_tail, recv, rank)    # draft head -> 4-rank Markov block sampling
 
 Pointers come from a device table `tp` (TPTRS order, 8 B each), read wave-uniform like the layer table (kernel args
 push SGPRs into spills). `recv` = the 4 ranks' fine-grained receive buffers; the tail uses offsets SOFF (sampling, 1.18 MB)
 and SOFF2 (Markov, 2.5 KB) after the TP regions -> allocate >= 16*40960*16 + 2 MB. `cnt_tail` = 512 B of zeroed counters
-(reset every step), stamps (if st != 0) at slots 19 head, 20 sampling, 21 verify, 22 draft head, 24 Markov.
+(reset every step).
 Inputs/outputs (all per rank): xh [48][5120] bf16 final-normed target hidden; hw [32320 tiles packed][5120] bf16 head shard
 (head v3 layout); logits [48][32320] f32; s0..s3 sampling records; sids [48] i32; dids [8][5] i32 previous drafts;
 outtok [8][6], verdict [3][8], anc [8]; dh [48][5120] bf16 draft hidden (rows req*5+k); dlog [48][32320] f32;
@@ -57,40 +57,28 @@ def tptr(tp, name):
     return (fx.Int64(_ufl(v[1])) << 32) | (fx.Int64(_ufl(v[0])) & fx.Int64(0xFFFFFFFF))
 
 
-@ASTRewriter.transform
-def _stamp(st, b, t, k, on):
-    if fx.const_expr(on):
-        if t == 0:
-            hx.gstore(st + i64(b) * (32 * 8) + i64(k * 8), hx.clock())
-
-
 def _ctxp(ctx, t, b, T):   # (plain python) the draft context KV's 4 stages, run inside the sampling's exchanges
     return None if ctx is None else CX.ctx_parts(ctx, t, b, T, 65536)
 
 
 @ASTRewriter.transform
-def target(tp, t, b, sm, st, tc, recv, rank, stamps=True, head_d=4, ctx=None, T=None):
+def target(tp, t, b, sm, tc, recv, rank, head_d=4, ctx=None, T=None):
     P = {k: tptr(tp, k) for k in ('xh', 'hw', 'logits', 's0', 's1', 's2', 's3', 'sids', 'dids', 'outtok', 'verdict', 'anc')}
     handoff(tc, t, False)   # LY.HEAD (offset 0)
     HF.head_once_r(P['xh'], P['hw'], P['logits'], t, t % 32, t // 32, sm, b, head_d, 2, 4)
     handoff(tc + i64(LY.HEAD_DONE), t, False)
-    _stamp(st, b, t, 19, stamps)
     # sampling + verification in one (outtok / verdict / anc written by CTA 0 after its last handoff)
     SPF.sample_once_p(P['logits'], P['s0'], P['s1'], P['s2'], P['s3'], P['sids'], tc + i64(LY.SAMPLE), t, b, sm, HF.VR,
                       [r + i64(SOFF) for r in recv], rank, 1, tptr(tp, 'sparam'), tptr(tp, 'qlog'), P['dids'],
                       tptr(tp, 'prow'), P['outtok'], P['verdict'], P['anc'], tptr(tp, 'qids'),
                       ctxp=_ctxp(ctx, t, b, T))
-    _stamp(st, b, t, 20, stamps)
     handoff(tc + i64(LY.VERIFY_DONE), t, False)
-    _stamp(st, b, t, 21, stamps)
 
 
 @ASTRewriter.transform
-def draft(tp, t, b, sm, st, tc, recv, rank, stamps=True, head_d=4):
+def draft(tp, t, b, sm, tc, recv, rank, head_d=4):
     P = {k: tptr(tp, k) for k in ('hw', 'anc', 'dh', 'dlog', 'mw1', 'mw2', 'mids', 'memb', 'mbest')}
     HF.head_once_r(P['dh'], P['hw'], P['dlog'], t, t % 32, t // 32, sm, b, head_d, 2, 4)
     handoff(tc + i64(LY.DRAFT_HEAD_DONE), t, False)
-    _stamp(st, b, t, 22, stamps)
     MPF.markov_once(P['dlog'], P['anc'], P['mw1'], P['mw2'], P['mids'], P['memb'], P['mbest'], tc + i64(LY.MARKOV),
                     [r + i64(SOFF2) for r in recv], rank, 101, t, b, sm, tptr(tp, 'sparam'), tptr(tp, 'qlog'), tptr(tp, 'qids'))
-    _stamp(st, b, t, 24, stamps)

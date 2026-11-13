@@ -35,7 +35,6 @@ from atom.models.deepseek_v41.mono.gfx1250.config import (
     ROWS_PER_REQ,
     TP,
 )
-from atom.models.deepseek_v41.mono.gfx1250.debug import RunnerDebug, timeline
 from atom.models.deepseek_v41.mono.gfx1250.inputs import StepInputs
 from atom.models.deepseek_v41.mono.gfx1250.tables import StepTables
 from atom.mono.plan.build_key import source_digest
@@ -94,7 +93,7 @@ def import_kernels() -> dict:
     return {n: importlib.import_module(f"{KERNELS}.{n}") for n in names}
 
 
-class SingleStepRunner(StepInputs, RunnerDebug):
+class SingleStepRunner(StepInputs):
     def __init__(self, model, drafter, atom_config) -> None:
         if get_tensor_model_parallel_world_size() != TP:
             raise MonoUnsupported(
@@ -172,12 +171,7 @@ class SingleStepRunner(StepInputs, RunnerDebug):
         self.verify_ready = torch.cuda.Event()
         # the stream the verdict's copies run on: ModelRunner's output D2H waits for it, not for the draft launch
         self.output_stream = self._verify_stream = torch.cuda.Stream()
-        self._timer = timeline(self.rank)  # ATOM_MONO_TIMELINE (``debug``)
         self._eng_rows = None
-        # the poll-timeout counter's copy, read a launch late (``_check_timeouts``)
-        self._to_buf = torch.empty(2, dtype=torch.int32, pin_memory=True)
-        self._to_event = torch.cuda.Event()
-        self._to_pending, self._to_seen = False, 0
         # every width built now (each a compile or a disk-cache load, then a TP barrier: ``prepare``), not on its first
         # step: a width first met mid-serve stalled every request for its JIT (~18 s cold)
         t0 = time.perf_counter()
@@ -237,35 +231,12 @@ class SingleStepRunner(StepInputs, RunnerDebug):
         return (
             *self.recv,
             self.scratch["cnt"].data_ptr(),
-            self.scratch["st"].data_ptr(),
             float(self.base.layers[0].attn.softmax_scale),
             T_.fptab.data_ptr(),
             T_.tp.data_ptr(),
             0,   # lo / hi: the target layer range of a split launch (one launch: every layer)
             len(self.base.layers),
         )
-
-    def _check_timeouts(self) -> None:
-        """The kernel's poll-timeout counter (hx.note_timeout: scratch cyc int32 [0] count, [1] last site), read a
-        launch late without a sync; any timeout means that step computed on stale peer data.
-        """
-        if self._to_pending and self._to_event.query():
-            n, site = self._to_buf.tolist()
-            if n != self._to_seen:
-                logger.error(
-                    "V4.1 single-launch step: %d cross-rank poll timeouts so far (rank %d, last site %d)",
-                    n,
-                    self.rank,
-                    site,
-                )
-                self._to_seen = n
-            self._to_pending = False
-        if not self._to_pending:
-            self._to_buf.copy_(
-                self.scratch["cyc"].view(torch.int32)[:2], non_blocking=True
-            )
-            self._to_event.record()
-            self._to_pending = True
 
     def _layer_ids(self):
         ids = getattr(self, "_layer_ids_c", None)
@@ -281,10 +252,7 @@ class SingleStepRunner(StepInputs, RunnerDebug):
         if not self.prepare(rows):
             raise MonoUnsupported(f"single-launch step: {rows} rows")
         self._sampling(batch, rows // ROWS_PER_REQ)
-        self._hm("sampling")
         engs, key = self._host_inputs(input_ids, forward_context)
-        if getattr(self, "_t_rec", None) is not None:
-            self._timer.mark("k", self._t_rec)
         launches = self._fast_launchers(rows)
         args = (*self._launch_args(), torch.cuda.current_stream())
 
@@ -321,7 +289,6 @@ class SingleStepRunner(StepInputs, RunnerDebug):
             first()
         self._ev_verify.record()  # the verdict is ready here; the draft launch follows on the same stream
         launches[1](*args)
-        self._check_timeouts()
         self._qrow = self._qrow_next
 
     def run_step(self, input_ids, running_bs: int, forward_context, batch) -> None:
@@ -341,14 +308,7 @@ class SingleStepRunner(StepInputs, RunnerDebug):
         # the Engram stage (its lookups, the side-stream gather and the join) runs inside the launch's preparation graph
         # (``launch``): issued op by op here it was ~0.26 ms of host time between the verdict and the next launch
         self._eng_rows = rows if staged else None
-        self._t_rec = {} if self._timer is not None else None
-        if self._t_rec is not None:
-            self._timer.mark("a", self._t_rec)
         self.launch(input_ids, forward_context, batch)
-        if self._t_rec is not None:
-            self._timer.copy_st(self._t_rec, self.scratch["st"])
-            self._timer.mark("z", self._t_rec)
-            self._timer.step(self._t_rec, input_ids.numel())
 
     def verify_outputs(self, bs: int):
         """``(output_token_ids [bs, 6] int32, -1 past the emitted tokens; verdict [3, bs] int32: accepted drafts,

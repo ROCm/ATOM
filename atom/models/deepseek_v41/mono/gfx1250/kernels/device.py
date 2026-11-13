@@ -11,7 +11,6 @@ All functions are traced inside a @flyc.kernel body.
 from __future__ import annotations
 
 import re as _re
-import threading
 from flydsl.expr import gpu, range_constexpr
 
 import flydsl.expr as fx
@@ -328,47 +327,9 @@ def unlikely(b):
     return fx.Boolean(llvm.call_intrinsic(i1, "llvm.expect.i1", [_v(b), f], [], []))
 
 
-class TraceSlot:
-    """One trace-time value private to the tracing thread (used as ``slot[0]``).
-
-    The step kernel sets such slots while it traces (the poll-timeout counter pointer, a stamp hook) and clears them
-    when its body ends. FlyDSL >= 0.5 traces every kernel in its own MLIRContext, and a launcher may trace several
-    ranks' kernels in parallel threads; a module-level ``[None]`` list then hands one thread's IR value to another
-    thread's trace ("operand type from a different MLIRContext"). A thread-local slot keeps each trace's values in
-    its own context and behaves the same when tracing is serial.
-    """
-
-    def __init__(self):
-        self._local = threading.local()
-
-    def __getitem__(self, i):
-        assert i == 0
-        return getattr(self._local, "value", None)
-
-    def __setitem__(self, i, value):
-        assert i == 0
-        self._local.value = value
-
-
-# Poll timeouts made visible. Every bounded poll (cross-rank tag waits, device handoffs) gives up after 2 s and the
-# kernel goes on with whatever it read; a timeout therefore means wrong results. TOFLAG[0] (set by the step kernel to its
-# 'cyc' scratch) counts them: int32 [0] += 1, int32 [1] = the last site id. The runner reads it after a step.
-TOFLAG = TraceSlot()
+# Every bounded poll (cross-rank tag waits, device handoffs) gives up after POLL_TICKS clock ticks (20 s: the first
+# launch's rank skew, module load, must not hit it) and the kernel goes on with whatever it read.
 POLL_TICKS = 2000000000   # (v2 study) 20 s: the first launch's rank skew (module load) must not time out a poll (a timeout desyncs the TP receive halves for every later step)
-
-
-DIAG = TraceSlot()   # (v3 diag) the stamp array: a timed-out poll's code into its CTA's slot 1
-
-
-@_ASTR.transform
-def note_timeout(t0, site):
-    if fx.const_expr(TOFLAG[0] is not None):
-        if clock() - t0 >= fx.Int64(POLL_TICKS):
-            atomic_add(TOFLAG[0], 1)
-            gstore(TOFLAG[0] + fx.Int64(4), fx.Int32(site))
-            if fx.const_expr(DIAG[0] is not None):
-                gstore(DIAG[0] + fx.Int64(opaque_s(fx.block_idx.x)) * fx.Int64(256) + fx.Int64(8), fx.Int64(site) | fx.Int64(1 << 40))
-
 
 
 @_ASTR.transform
@@ -378,7 +339,6 @@ def wait_count(addr, n, site):
     t0 = clock()
     while (gload(addr() if callable(addr) else addr, fx.Int32, scope="agent") < n) & (clock() - t0 < fx.Int64(POLL_TICKS)):
         s_sleep(1)
-    note_timeout(t0, site)
 
 
 @_ASTR.transform
@@ -469,7 +429,6 @@ def get(addr, tag, site):
     while (g != tag) & (clock() - t0 < I64(POLL_TICKS)):
         s_sleep(1)
         p, g = peek(addr)
-    note_timeout(t0, I32(site * 65536) + (tag & I32(0x3FF)))   # (diag) site << 16 | the tag's layer / site bits
     return p
 
 
@@ -481,7 +440,6 @@ def get_fp8(addr, ep24, site):
     while ((g & I32(0xFFFFFF)) != ep24) & (clock() - t0 < I64(POLL_TICKS)):
         s_sleep(1)
         p, g = peek(addr)
-    note_timeout(t0, site)
     return p, (g >> 24) & I32(0xFF)
 
 
@@ -503,7 +461,6 @@ def wait_flags(base, n, tag, w, l, site):
             bad = I32(0)
             for k in range_constexpr(K):
                 bad = bad | (pg[k][1] != tag).select(I32(1), I32(0))
-        note_timeout(t0, I32(site * 65536) + (tag & I32(0x3FF)))
 
 
 @ASTRewriter.transform
@@ -529,4 +486,3 @@ def wait_flags2(base_a, n_a, na_max, base_b, n_b, tag, w, l, site):
             bad = I32(0)
             for k in range_constexpr(KA + KB):
                 bad = bad | (ok[k] & (pg[k][1] != tag)).select(I32(1), I32(0))
-        note_timeout(t0, I32(site * 65536) + (tag & I32(0x3FF)))

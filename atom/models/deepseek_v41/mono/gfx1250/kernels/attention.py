@@ -240,9 +240,6 @@ def stage_A(c):
                         if t == 0:   # (the poll first: a load issued before it would hold the poll until it lands)
                             hx.wait_count(c["attpost"], 160, 9)
                     gpu.barrier()
-                    if fx.const_expr("stp2" in c):
-                        if t == 0:
-                            hx.gstore(c["stp2"] + i64(30 * 8), hx.clock())   # (study) the owners' count seen
                     nv2 = [[hx.gload(c["anw"] + i64(cols[it] + 8 * h) * 2, BF16, 8, align=16) for h in range(4)] for it in range(NB)]
                     xv2 = [[hx.gload(c["x1a"] + i64((blks[it] // 80) * HID + cols[it] + 8 * h) * 2, BF16, 8, align=16) for h in range(4)] for it in range(NB)]
                     wr = fx.min(w, I32(TR - 1))
@@ -281,9 +278,6 @@ def stage_A(c):
                                         c["stx"](c["axn"] + i64(rr * HID + col + 8 * h) * 2,
                                                  fx.Vector.from_elements([nb[8 * h + e] for e in range(8)], BF16))
                     gpu.barrier()
-                    if fx.const_expr("stp2" in c):
-                        if t == 0:
-                            hx.gstore(c["stp2"] + i64(31 * 8), hx.clock())   # (study) x8 quantized into LDS
             if w < 5:
                 kk0 = kh * 20 + w * 4
                 arow = c["x8"] + i64(l % 16) * HID
@@ -755,9 +749,6 @@ def _d_merge(c, cl, jj, rcv, rsv):
     t, w, l, sm, o = c["t"], c["w"], c["l"], c["sm"], c["o"]
     TR, RPC, QV = c["TR"], c["RPC"], c["QV"]
     r0 = cl * RPC
-    if fx.const_expr("stp" in c):
-        if t == 0:
-            hx.gstore(c["stp"] + i64(8), hx.clock())
     c0 = cl * CL
     # merge: thread g < QV*4 owns dim dd = g // (QV/8) of this CTA's 32 and 8 consecutive qv: one b128 load a partial
     QW = 4 if QV * 32 // 4 <= THREADS else 8   # qv a thread (all 256 threads busy at 2 rows a cluster)
@@ -994,7 +985,6 @@ def tp_allreduce(c, region, tag):
         while ((hx.gload(gps[0] + i64(12), I32, nt=True) != tag) | (hx.gload(gps[1] + i64(12), I32, nt=True) != tag)
                | (hx.gload(gps[2] + i64(12), I32, nt=True) != tag)) & (hx.clock() - t0 < fx.Int64(hx.POLL_TICKS)):
             hx.s_sleep(0)
-        hx.note_timeout(t0, 6)
         gots = [hx.gload(gp, I32, 4, nt=True) for gp in gps]
         for got in gots:
             for q in range_constexpr(3):
@@ -1096,7 +1086,6 @@ def tp3(c, region, tag):
         while ((hx.gload(gps[0] + i64(12), I32, nt=True) != tag) | (hx.gload(gps[1] + i64(12), I32, nt=True) != tag)
                | (hx.gload(gps[2] + i64(12), I32, nt=True) != tag)) & (hx.clock() - t0 < fx.Int64(hx.POLL_TICKS)):
             hx.s_sleep(0)
-        hx.note_timeout(t0, 6)
         gots = [hx.gload(gp, I32, 4, nt=True) for gp in gps]
         for got in gots:
             for q in range_constexpr(3):

@@ -332,7 +332,6 @@ def scratch_bytes(K, nlt: int) -> dict[str, int]:
         "kvp": 3 * T * 512 * 2,
         # handoff counters, stamps
         "cnt": (nlt * M.LCB // 4 + 64) * 4 + 1024,
-        "st": 256 * 32 * 8,
     }
 
 

@@ -5,7 +5,6 @@ preparation the launch's graph captures (``_host_inputs`` / ``_device_inputs``),
 parameters (``_sampling``). ``SingleStepRunner`` inherits them."""
 
 import logging
-import time
 
 import numpy as np
 import torch
@@ -86,7 +85,6 @@ class StepInputs:
                 cache.num_slots,
             )
         gk = self._gk
-        self._hm("hi_geom")
         if gk != getattr(
             self, "_dgeom_key", None
         ):  # (static for a cache: an H2D copy only when it changes)
@@ -134,7 +132,6 @@ class StepInputs:
                         if nl > T_MAX:
                             raise MonoUnsupported(f"plan {r}: {nl} rows > {T_MAX}")
                         key += [src.data_ptr(), tuple(src.shape)]
-        self._hm("hi_key")
         # the Engram layers' embedding rows (staged on Engram's side stream: ``get`` makes this stream wait for them)
         emb = getattr(md, "engram_embeddings", None)
         engs = {}
@@ -169,7 +166,6 @@ class StepInputs:
                     st.candidates,
                 )
             ]
-        self._hm("host_inputs")
         return engs, tuple(key)
 
     def _device_inputs(self, input_ids, forward_context, engs):
@@ -238,13 +234,6 @@ class StepInputs:
         # Markov's per-(position, request) global argmax is an atomic max: it must restart from INT64_MIN every step
         # (as the fixture does), else the drafts keep earlier steps' winners
         self.scratch["mbest"].view(torch.int64).fill_(-(1 << 63))
-        self._hm("device_inputs")
-
-    def _hm(self, name) -> None:
-        """ATOM_MONO_TIMELINE: a host time mark inside the step's preparation (``debug.StepTimer``)."""
-        r = getattr(self, "_t_rec", None)
-        if r is not None:
-            r.setdefault("hm", []).append((name, time.perf_counter()))
 
     def _sampling(self, batch, req) -> None:
         """Each target row's sampling from its request (``ScheduledBatch`` temperatures / top_ps / top_ks), as the
