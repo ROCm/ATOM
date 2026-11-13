@@ -456,6 +456,9 @@ class Sequence:
         self.offload_load_failed = False
         # Tokens its tier load covers once the connector planned it.
         self.offload_loaded_tokens = 0
+        # `hbm_cached_tokens` the planned load started from (P/D / early load
+        # publication); None until a connector plans one.
+        self.offload_load_start_tokens = None
         # Prefix tokens `share_cache` routing credited this request when it
         # placed it, until its rank reports what it really reused.
         self.dp_est_cached_tokens = 0
