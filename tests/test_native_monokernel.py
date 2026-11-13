@@ -847,6 +847,7 @@ def test_glm_default_page_size_accepted_and_segmented_refused(monkeypatch):
         decode_context_parallel_size=1,
         prefill_context_parallel_size=1,
         pipeline_parallel_size=1,
+        is_multinode_tp=False,
         enable_expert_parallel=False,
         enable_tbo=False,
         enable_tbo_decode=False,

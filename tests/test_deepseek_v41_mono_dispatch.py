@@ -52,6 +52,7 @@ def _atom_config(**overrides):
         "enable_dp_attention": False,
         "parallel_config": SimpleNamespace(data_parallel_size=1),
         "pipeline_parallel_size": 1,
+        "is_multinode_tp": False,
         "decode_context_parallel_size": 1,
         "prefill_context_parallel_size": 1,
         "enable_tbo": False,
