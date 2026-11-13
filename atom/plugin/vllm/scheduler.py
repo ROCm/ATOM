@@ -27,6 +27,7 @@ vLLM says as much in its own warning.  ``select_scheduler_cls`` therefore picks
 the subclass matching the already-resolved ``async_scheduling`` value.
 """
 
+import functools
 import inspect
 import logging
 
@@ -176,6 +177,119 @@ class _HybridKVLoadFailureMixin:
         return affected_req_ids, total_affected_tokens, blocks_to_evict
 
 
+def apply_vllm_v41_local_hit_cap_patch() -> None:
+    """Wrap vLLM's local prefix-cache hit so V4.1's is capped. Idempotent.
+
+    Installed from ``register_model`` rather than from the platform hook:
+    vLLM does not always activate ``ATOMPlatform`` -- measured, it ran zero
+    times on a V4.1 serve while the model wrapper's own hook ran four -- so a
+    scheduler chosen there is a scheduler never chosen. The same reason the
+    STATE-tail reserve is installed from there.
+
+    A no-op for every model: the wrapper returns vLLM's own answer unless the
+    scheduler's connector carries a V4.1 planner.
+    """
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    # Private vLLM methods, so absence is a version difference rather than a
+    # bug. This runs from `register_model`, the plugin entry point for EVERY
+    # model, so raising here would stop GLM, M3 and K3 loading over a V4.1
+    # feature none of them use.
+    original = getattr(Scheduler, "_get_local_prefix_cache_hit", None)
+    if original is None:
+        logger.warning(
+            "ATOM DeepSeek-V4.1: vLLM has no Scheduler._get_local_prefix_cache_hit; "
+            "skipping this patch. V4.1 state checkpoints need it and refuse to "
+            "start without it (`v41_scheduler_patches_missing`)."
+        )
+        return
+    if getattr(original, "_atom_v41_hit_cap_patched", False):
+        return
+
+    def _hit_leaving(self, request, tail: int):
+        """vLLM's own hit, asked again to leave ``tail`` tokens to compute.
+
+        `get_computed_blocks` fixes the limit at one token short of the
+        request; the coordinator query beneath it takes the limit and only
+        reads. Asking it again lets every group agree on the boundary below,
+        where truncating the hit instead would leave a checkpoint group's last
+        block null. None when this vLLM does not expose the query.
+        """
+        manager = self.kv_cache_manager
+        coordinator = getattr(manager, "coordinator", None)
+        create = getattr(manager, "create_kv_cache_blocks", None)
+        if coordinator is None or create is None:
+            return None
+        found = coordinator.find_longest_cache_hit(
+            request.block_hashes, int(request.num_tokens) - tail
+        )
+        num = int(found[1])
+        uncached = int(found[2]) if len(found) > 2 else 0
+        return create(found[0]), num, (num + uncached if uncached else 0)
+
+    @functools.wraps(original)
+    def _wrapped(self, request, *args, **kwargs):
+        # Forwarded as given: vLLM 0.33 adds `max_cache_hit_length`, and this
+        # wraps the method for every plugin model.
+        blocks, num_local, boundary, divergent = original(
+            self, request, *args, **kwargs
+        )
+        if num_local <= 0:
+            return blocks, num_local, boundary, divergent
+        planner = getattr(getattr(self, "connector", None), "_v41_planner", None)
+        # The checkpoint scheduler's tail (`PagedStateCheckpointAdapter.
+        # prefill_tail`); one, vLLM's own floor, where none is bound.
+        st = getattr(self, "_atom_state_checkpoints", None)
+        tail = int(getattr(st, "prefill_tail", 1))
+        if int(request.num_tokens) - int(num_local) < tail:
+            # Under speculation a one-token tail is admitted as a padded verify
+            # row, which V4.1 refuses beside a prefill: re-ask for a hit that
+            # leaves the tail, rather than discard the whole hit (a resubmitted
+            # prompt of N * PAGE + 1 tokens would recompute from 0).
+            again = _hit_leaving(self, request, tail)
+            if again is not None:
+                blocks, num_local, boundary = again
+                divergent = False
+                if num_local <= 0:
+                    return blocks, num_local, boundary, divergent
+        if planner is not None:
+            capped = int(planner.cap_local_hit(request, int(num_local)))
+        elif int(request.num_tokens) - int(num_local) < tail:
+            # No connector, so vLLM's hit already sits on a held checkpoint.
+            # Under speculation a one-token tail would still be admitted as a
+            # padded verify row, which V4.1 refuses beside a prefill.
+            capped = 0
+        else:
+            return blocks, num_local, boundary, divergent
+        if capped >= num_local:
+            return blocks, num_local, boundary, divergent
+        block_size = int(self.cache_config.block_size)
+        # Whole blocks only: vLLM's hit is block-aligned, and the pair
+        # (blocks, num_computed) has to stay consistent or the request reads
+        # KV from blocks it was not told it has.
+        drop = -(-(int(num_local) - capped) // block_size)
+        from atom.plugin.vllm.deepseek_v4_prefix_patch import _drop_swa_warmup_blocks
+
+        return (
+            *_drop_swa_warmup_blocks(
+                self.kv_cache_manager,
+                blocks,
+                int(num_local),
+                boundary,
+                warmup_blocks=drop,
+                block_size=block_size,
+            ),
+            divergent,
+        )
+
+    _wrapped._atom_v41_hit_cap_patched = True
+    Scheduler._get_local_prefix_cache_hit = _wrapped
+    logger.info(
+        "ATOM DeepSeek-V4.1: local prefix-cache hits will be capped to a "
+        "boundary whose CSA2 state was stored."
+    )
+
+
 class VllmAtomScheduler(_HybridKVLoadFailureMixin, Scheduler):
     """Synchronous scheduler with hybrid-aware KV-load-failure recovery."""
 
@@ -235,3 +349,20 @@ def select_scheduler_cls(scheduler_config) -> str | None:
         name,
     )
     return f"atom.plugin.vllm.scheduler.{name}"
+
+
+def v41_scheduler_patches_missing() -> list[str]:
+    """The vLLM `Scheduler` methods V4.1's state checkpoints need but lack ATOM's
+    patch: a renamed method leaves local hits uncapped or prefill chunks off
+    the checkpoints (`SchedulerStateCheckpoints.chunk_len`), which is a
+    stale-state failure at serving time."""
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    return [
+        name
+        for name, marker in (
+            ("_get_local_prefix_cache_hit", "_atom_v41_hit_cap_patched"),
+            ("_mamba_block_aligned_split", "_atom_state_checkpoint_patched"),
+        )
+        if not getattr(getattr(Scheduler, name, None), marker, False)
+    ]

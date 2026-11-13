@@ -1094,3 +1094,160 @@ def test_v41_prefix_refuses_image_placeholders_as_the_history_does(
             _chat(handler, messages, chat_template_kwargs={"thinking_mode": "thinking"})
         assert exc.value.status_code == 400, handler.__name__
     assert not engine.prompts
+
+
+STRICT_PARAMETERS = {
+    "type": "object",
+    "properties": {"city": {"type": "string"}},
+    "required": ["city"],
+    "additionalProperties": False,
+}
+STRICT_TOOL = {
+    "type": "function",
+    "function": {"name": "weather", "strict": True, "parameters": STRICT_PARAMETERS},
+}
+
+
+@pytest.fixture
+def structured(engine, monkeypatch):
+    """What the chat handler hands structured-output setup and validation."""
+    seen = SimpleNamespace(configured=[], validated=[])
+
+    async def configure(_params, _schema, _channel, **kwargs):
+        seen.configured.append(kwargs["strict_schemas"])
+
+    monkeypatch.setattr(api_server, "_configure_structured_output", configure)
+    monkeypatch.setattr(
+        api_server,
+        "validate_tool_calls",
+        lambda schemas, _calls, _reason, declared: seen.validated.append(
+            (schemas, declared)
+        ),
+    )
+    _template(monkeypatch, engine, "<A>")
+    return seen
+
+
+@pytest.mark.parametrize(
+    "handler, tool_choice, strict",
+    [
+        (api_server.beta_chat_completions, "auto", True),
+        (api_server.beta_chat_completions, "none", False),
+        # /v1 keeps ignoring `strict`, as on main.
+        (api_server.chat_completions, "auto", False),
+    ],
+)
+def test_strict_tools_are_a_beta_feature(structured, handler, tool_choice, strict):
+    _chat(handler, [USER], tools=[STRICT_TOOL], tool_choice=tool_choice)
+    expected = {"weather": STRICT_PARAMETERS} if strict else {}
+    assert structured.configured == [expected]
+    # The non-streamed reply's calls are checked against the request's tools.
+    assert structured.validated == (
+        [(expected, frozenset({"weather"}))] if strict else []
+    )
+
+
+def test_a_prefix_cannot_be_continued_under_strict_tools(structured, engine):
+    with pytest.raises(HTTPException) as exc:
+        _chat(api_server.beta_chat_completions, [USER, PREFIX], tools=[STRICT_TOOL])
+    assert exc.value.status_code == 400
+    assert not engine.prompts and not structured.configured
+
+
+def test_a_strict_reply_is_read_literally(structured, engine):
+    """A reasoning marker the grammar let through, in a strict argument say,
+    is the model's words, as under `response_format`."""
+    engine.reply = "a <think> b"
+    message = _chat(api_server.beta_chat_completions, [USER], tools=[STRICT_TOOL])
+    assert message["content"] == "a <think> b"
+    assert not message.get("reasoning_content")
+
+
+def test_a_streamed_strict_reply_is_validated_and_read_literally(
+    structured, monkeypatch
+):
+    seen = {}
+
+    async def setup(*_args, **_kwargs):
+        return 7, None, 4
+
+    def stream(*_args, reasoning, **_kwargs):
+        seen["reasoning"] = reasoning
+
+        async def frames():
+            yield "data: [DONE]\n\n"
+
+        return frames()
+
+    def validate(gen, schema, strict_schemas, declared):
+        seen["validated"] = (schema, strict_schemas, declared)
+        return gen
+
+    monkeypatch.setattr(api_server, "setup_streaming_request", setup)
+    monkeypatch.setattr(api_server, "stream_chat_response", stream)
+    monkeypatch.setattr(api_server, "validate_chat_stream", validate)
+    request = BetaChatCompletionRequest(
+        model="m", messages=[USER], tools=[STRICT_TOOL], stream=True
+    )
+    asyncio.run(api_server.beta_chat_completions(request, None))
+    assert seen["validated"] == (
+        None,
+        {"weather": STRICT_PARAMETERS},
+        frozenset({"weather"}),
+    )
+    assert seen["reasoning"].literal_answer
+
+
+def test_strict_tools_alone_reach_the_grammar_setup(monkeypatch):
+    from atom.sampling_params import SamplingParams
+
+    seen = []
+
+    async def configure(*_args, **kwargs):
+        seen.append(kwargs["strict_schemas"])
+
+    monkeypatch.setattr(api_server, "configure_request", configure)
+    monkeypatch.setattr(api_server, "_get_engine_config", lambda: None)
+    for strict in ({"weather": STRICT_PARAMETERS}, {}):
+        asyncio.run(
+            api_server._configure_structured_output(
+                SamplingParams(),
+                None,
+                ReasoningChannel(),
+                tools=[STRICT_TOOL],
+                tool_choice="auto",
+                strict_schemas=strict,
+            )
+        )
+    # Without a schema or strict tools there is nothing to configure.
+    assert seen == [{"weather": STRICT_PARAMETERS}]
+
+
+def test_a_refusal_for_strict_tools_alone_names_them(monkeypatch):
+    """The refusals are worded for JSON Schema output: a client that sent
+    only strict tools is told those asked for the grammar."""
+    from atom.sampling_params import SamplingParams
+
+    async def refuse(*_args, **_kwargs):
+        raise ValueError("Structured output with tools requires a DSML tool parser")
+
+    monkeypatch.setattr(api_server, "configure_request", refuse)
+    monkeypatch.setattr(api_server, "_get_engine_config", lambda: None)
+
+    def configure(schema):
+        asyncio.run(
+            api_server._configure_structured_output(
+                SamplingParams(),
+                schema,
+                ReasoningChannel(),
+                tools=[STRICT_TOOL],
+                tool_choice="auto",
+                strict_schemas={"weather": STRICT_PARAMETERS},
+            )
+        )
+
+    with pytest.raises(ValueError, match="^strict function tools: Structured"):
+        configure(None)
+    # With `response_format` the client asked for structured output itself.
+    with pytest.raises(ValueError, match="^Structured output"):
+        configure(json.dumps({"type": "object"}))

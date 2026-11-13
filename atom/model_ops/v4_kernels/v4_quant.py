@@ -26,12 +26,13 @@ All constants and pack arithmetic mirror
 from __future__ import annotations
 
 import math
-from typing import Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
 from aiter import dtypes
+
+from atom.model_ops.blockscale_kernels.quantization import pow2_reciprocal
 
 V4_DIM_NOPE = 448
 V4_DIM_ROPE = 64
@@ -69,7 +70,7 @@ def _duplicate_each_lastdim(x: torch.Tensor) -> torch.Tensor:
 
 def quantize_v4_nope_bpad8(
     nope_src: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-tile (64-elt) E8M0 quantization of the NOPE segment.
 
     Returns ``(nope_fp8 [..., 448], scale_e8m0 [..., 7] uint8)``.
@@ -173,7 +174,7 @@ def dequantize_v4_2buff_to_bf16(
 
 def quantize_bf16_to_v4_2buff(
     bf16_src: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """End-to-end helper: bf16 [..., 512] -> (packed_fp8 [..., 512], rope_bf16 [..., 64]).
 
     Splits the input on the NoPE/RoPE boundary, quantizes the NoPE half via
@@ -245,17 +246,17 @@ def _bf16_to_v4_2buff_kernel(
         # ceil-log2 power-of-2 scale (matches _cast_scale_inv_to_ue8m0_pow2:
         # clamp_min(1e-4) guards log2 of an all-zero tile).
         e = tl.ceil(tl.log2(tl.maximum(scale_inv, 1e-4)))  # integer-valued fp32
-        scale_pow2 = tl.exp2(e)
-
-        xq = (x / scale_pow2[:, None]).to(packed_fp8_ptr.dtype.element_ty)
+        xq = (x * pow2_reciprocal((e + 127.0).to(tl.int32))[:, None]).to(
+            packed_fp8_ptr.dtype.element_ty
+        )
         tl.store(
             packed_fp8_ptr + row[:, None] * PACKED_ROW + cols[None, :],
             xq,
             mask=row_mask[:, None],
         )
 
-        # E8M0 byte = clamp(round(log2(scale_pow2)) + 127, 0, 254). scale_pow2 is
-        # an exact power of two so round(log2)==e. Written twice (dup layout).
+        # E8M0 byte = clamp(e + 127, 0, 254): the scale is exactly 2**e.
+        # Written twice (dup layout).
         byte_f = tl.minimum(tl.maximum(e + 127.0, 0.0), 254.0)
         byte = byte_f.to(tl.uint8)
         off = PACK_OFF_SCALE + 2 * t
@@ -277,7 +278,7 @@ def _bf16_to_v4_2buff_kernel(
 
 def quantize_bf16_to_v4_2buff_triton(
     bf16_src: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Triton port of :func:`quantize_bf16_to_v4_2buff` (compile-safe, single
     launch). ``bf16_src`` may have any leading shape; the last dim must be 512.
 
@@ -354,8 +355,8 @@ def _attn_decode_bf16_golden(
     kv_last_page_lens: torch.Tensor,  # [num_seqs]
     sm_scale: float,
     v_head_dim: int,
-    attn_sink: Optional[torch.Tensor] = None,  # [num_heads] or None
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    attn_sink: torch.Tensor | None = None,  # [num_heads] or None
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Pure-torch BF16 attention reference (FP32 accum).
 
     Per-batch loop, scaled-dot-product attention over the full D=NoPE+RoPE
@@ -465,12 +466,11 @@ def mla_decode_fwd_v4_nm_ref(
     (D = NoPE + RoPE = 512) to mirror the kernel, which ignores the passed
     value and hardcodes that scale.
     """
-    num_seqs = qo_indptr.numel() - 1
     num_heads = q.size(1)
     num_kv_heads = kv_buffer.size(2)
     gqa_ratio = num_heads // num_kv_heads
     v_head_dim = output.size(2)
-    total_q = num_seqs * max_seqlen_q
+    total_q = q.size(0)
     device = q.device
 
     # ---- sink validation (mirror the kernel wrapper's contract) ----

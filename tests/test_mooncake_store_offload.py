@@ -2877,12 +2877,14 @@ def test_under_pp_each_stage_fences_a_save_after_the_forwards_it_reads(cluster):
     seq = Sequence(list(range(64)), BLOCK, sampling_params=SamplingParams())
     engine.add(seq)
 
-    def runner(rpcs, *, store_saves=False):
+    def runner(rpcs, *, store_saves=False, acks=None):
         """A stage's workers: they run each call in order, on one stream."""
 
         def call_func(name, *args, **_kwargs):
             if name == "forward":
                 rpcs.append(("forward", args[0]))
+                if acks is not None and args[0].pp_completion_ack:
+                    acks.append((args[0].req_ids, None))
             elif name == "process_kvconnector_output":
                 rpcs.append(("fence", args[0]))  # `start_load_kv` records it
                 # Store each save at once, so that every step emits the next.
@@ -2896,7 +2898,7 @@ def test_under_pp_each_stage_fences_a_save_after_the_forwards_it_reads(cluster):
 
         return SimpleNamespace(call_func=call_func)
 
-    head_rpcs, sent = [], []
+    head_rpcs, sent, acks = [], [], deque()
     head = SimpleNamespace(
         pp_size=4,
         scheduler=engine,
@@ -2904,16 +2906,20 @@ def test_under_pp_each_stage_fences_a_save_after_the_forwards_it_reads(cluster):
         _in_flight=deque(),
         _defer_prefix_hash=False,
         _next_idle_kv_drain=0.0,
-        runner_mgr=runner(head_rpcs, store_saves=True),
-        # The socket to the downstream stages; no stage ever returns a token.
+        runner_mgr=runner(head_rpcs, store_saves=True, acks=acks),
+        # The socket to the downstream stages. Each middle chunk is acked as
+        # soon as the head has run it, as if the later stages took no time;
+        # no stage ever returns a token.
         pp_transport=SimpleNamespace(
-            send_metadata=sent.append, recv_completion=lambda **_: None
+            send_metadata=sent.append,
+            recv_completion=lambda **_: acks.popleft() if acks else None,
         ),
         _poll_kv_transfer_progress=lambda: None,
         _poll_dynamic_chunking_calibration=lambda: None,
     )
     for name, owner in (
         ("_dispatch_connector_only_batch", PPEngineCoreProc),
+        ("_collect_pp_completions", PPEngineCoreProc),
         ("_dispatch_idle_offload_work", PPEngineCoreProc),
         ("_queue_or_flush_prefill_hashes", PPEngineCoreProc),
         ("_advance_idle_kv_transfer", EngineCore),
@@ -2942,7 +2948,7 @@ def test_under_pp_each_stage_fences_a_save_after_the_forwards_it_reads(cluster):
             recv_metadata=lambda **_: queued.popleft() if queued else None
         ),
         pull_and_process_input_queue=lambda: not queued,  # stop once drained
-        _is_idle_rl_weights_offloaded=lambda: False,
+        _is_engine_held=lambda: False,
         _poll_and_send_kv_status=lambda: None,
     )
     PPEngineCoreProc._downstream_busy_loop(stage)

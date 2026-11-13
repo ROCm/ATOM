@@ -33,6 +33,7 @@ raw index keys so pooling can read them back.
 """
 
 import functools
+import logging
 from types import SimpleNamespace
 
 import aiter
@@ -56,6 +57,8 @@ from atom.model_ops.qwen4_exp.ops.qsa import (
     qsa_cache_formats,
     qsa_cache_row_layout,
     qsa_compress_groups,
+    qsa_expand_block_indices,
+    qsa_select_paged_groups,
     qsa_select_paged_tokens,
     qsa_sparse_paged_gqa,
     qsa_store_quantized_rows,
@@ -64,6 +67,8 @@ from atom.model_ops.qwen4_exp.ops.qsa import (
 from atom.plugin.prepare import is_plugin_mode
 from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
+
+logger = logging.getLogger(__name__)
 
 # Selection widths the aiter FlyDSL kernel accepts: 4T + 3 for T complete
 # four-token groups (T = 256, 512, 768, 1024), then the 0..3 causal tail.
@@ -85,6 +90,85 @@ def _flydsl_attention_op():
     from aiter.ops.qsa import qsa_sparse_prefill
 
     return qsa_sparse_prefill
+
+
+def qsa_rank_heads(
+    num_attention_heads: int, num_key_value_heads: int, tp_size: int
+) -> tuple[int, int]:
+    """Per-rank (query heads, KV heads) under TP. With fewer KV heads than
+    ranks each rank keeps one replicated KV head."""
+    if num_attention_heads % tp_size:
+        raise ValueError(f"TP={tp_size} must divide {num_attention_heads} q heads")
+    if num_key_value_heads >= tp_size:
+        if num_key_value_heads % tp_size:
+            raise ValueError(f"TP={tp_size} must divide the KV heads")
+        return num_attention_heads // tp_size, num_key_value_heads // tp_size
+    if tp_size % num_key_value_heads:
+        raise ValueError("TP size must be a multiple of the KV head count")
+    return num_attention_heads // tp_size, 1
+
+
+def flydsl_fallback_reason(
+    compress_ratio: int,
+    token_topk: int,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    *,
+    kv_bf16: bool,
+) -> str | None:
+    """Why QSA layers with this indexer, per-rank head shape and KV format
+    cannot take the aiter FlyDSL attention, or None if they can. The kernel
+    expects min(v // 4, T) blocks for a row with v visible tokens (width
+    4T + 3); another budget or ratio selects a different number, so padding
+    its selection would give wrong output. The one authority for the layer's
+    fallback and the SGLang bridge's layout build; the per-call conditions
+    (host layout, selection byte span, graph capture, query dtype) stay with
+    the layer. `ATOM_QSA_FLYDSL_ATTN` is checked by the callers."""
+    if not kv_bf16:
+        return "the KV cache is not BF16"
+    if compress_ratio != 4 or token_topk + 3 not in _FLYDSL_WIDTHS:
+        return f"indexer compress ratio {compress_ratio} / budget {token_topk}"
+    if num_kv_heads != 1 or num_heads not in (12, 6, 3) or head_dim != 256:
+        return (
+            f"per-rank head shape {num_heads} q / {num_kv_heads} kv heads "
+            f"x {head_dim} (needs 12, 6 or 3 q / 1 kv x 256)"
+        )
+    if not _flydsl_arch_supported():
+        return "the GPU is not gfx942"
+    return None
+
+
+@functools.cache
+def log_flydsl_fallback(reason: str) -> None:
+    """Warn once per distinct reason, so a server with the FlyDSL QSA attention
+    enabled shows whether, and why, QSA attention stays on the native kernel."""
+    logger.warning(
+        "FlyDSL QSA prefill attention is enabled, but QSA attention uses the "
+        "native kernel: %s",
+        reason,
+    )
+
+
+@functools.cache
+def _log_flydsl_active() -> None:
+    logger.info("QSA attention runs eager prefill on the aiter FlyDSL kernel")
+
+
+def _flydsl_call_fallback_reason(query, selected, width, qsa) -> str | None:
+    """Why this one laid-out prefill call cannot take the FlyDSL attention, or None."""
+    if width is None:
+        return f"selection wider than {_FLYDSL_WIDTHS[-1]} columns"
+    # aiter rejects a padded selection spanning 2**31 bytes or more.
+    if query.shape[0] * width * selected.element_size() >= 2**31:
+        return "padded selection spans 2**31 bytes or more"
+    if torch.cuda.is_current_stream_capturing():
+        return "graph capture"
+    if query.dtype != torch.bfloat16:
+        return f"query dtype {query.dtype}"
+    if sum(qsa.host_lens[0]) != query.shape[0]:
+        return "host query lengths do not cover the query rows"
+    return None
 
 
 def build_qwen4_exp_rope(config, head_size: int):
@@ -233,17 +317,9 @@ class Qwen4ExpAttention(nn.Module):
         self.layer_num = layer_num
         self.total_num_heads = int(config.num_attention_heads)
         self.total_num_kv_heads = int(config.num_key_value_heads)
-        if self.total_num_heads % tp_size:
-            raise ValueError(f"TP={tp_size} must divide {self.total_num_heads} q heads")
-        self.num_heads = self.total_num_heads // tp_size
-        if self.total_num_kv_heads >= tp_size:
-            if self.total_num_kv_heads % tp_size:
-                raise ValueError(f"TP={tp_size} must divide the KV heads")
-            self.num_kv_heads = self.total_num_kv_heads // tp_size
-        else:
-            if tp_size % self.total_num_kv_heads:
-                raise ValueError("TP size must be a multiple of the KV head count")
-            self.num_kv_heads = 1
+        self.num_heads, self.num_kv_heads = qsa_rank_heads(
+            self.total_num_heads, self.total_num_kv_heads, tp_size
+        )
         self.head_dim = int(config.head_dim)
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
@@ -394,8 +470,16 @@ class Qwen4ExpAttention(nn.Module):
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         qsa,
+        rows=None,
     ) -> torch.Tensor:
-        """Update both index caches, then return the per-token selection."""
+        """Update both index caches, then return the per-token selection.
+
+        The indexer is replicated, so with `rows` (the caller's token sharding:
+        `start`, `chunk`, `num_tokens` and a row `gather`) each rank scores and
+        selects only its own query rows and the selected groups are
+        all-gathered before the (cheap) expansion. Every row's selection
+        depends only on its own query, so the result is the same.
+        """
         index_q, raw_key = self.indexer.project_qk(hidden_states, positions)
         qsa_store_rows(self.raw_key_cache, qsa.slot_mapping, raw_key)
         if self.rope_position_cache is not None:
@@ -429,18 +513,45 @@ class Qwen4ExpAttention(nn.Module):
                 normalized,
             )
 
-        return qsa_select_paged_tokens(
-            index_q,
+        allow_flydsl = get_forward_context().context.is_prefill
+        if rows is None:
+            return qsa_select_paged_tokens(
+                index_q,
+                self.compressed_key_cache,
+                qsa.block_tables,
+                qsa.token_to_req,
+                qsa.logical_positions,
+                qsa.seq_lens,
+                self.indexer.token_topk,
+                self.indexer.compress_ratio,
+                max_seq_len=qsa.max_seq_len,
+                allow_flydsl=allow_flydsl,
+                compressed_k_scale=self.compressed_key_scale,
+            )
+        local = slice(rows.start, min(rows.start + rows.chunk, rows.num_tokens))
+        groups, width = qsa_select_paged_groups(
+            index_q[local],
             self.compressed_key_cache,
             qsa.block_tables,
-            qsa.token_to_req,
-            qsa.logical_positions,
+            qsa.token_to_req[local],
+            qsa.logical_positions[local],
             qsa.seq_lens,
             self.indexer.token_topk,
             self.indexer.compress_ratio,
             max_seq_len=qsa.max_seq_len,
-            allow_flydsl=get_forward_context().context.is_prefill,
+            allow_flydsl=allow_flydsl,
             compressed_k_scale=self.compressed_key_scale,
+        )
+        if groups.shape[0] < rows.chunk:
+            groups = nn.functional.pad(groups, (0, 0, 0, rows.chunk - groups.shape[0]))
+        return qsa_expand_block_indices(
+            rows.gather(groups),
+            qsa.logical_positions,
+            qsa.seq_lens,
+            qsa.token_to_req,
+            self.indexer.compress_ratio,
+            self.indexer.token_topk,
+            output_width=width,
         )
 
     def forward(
@@ -448,10 +559,12 @@ class Qwen4ExpAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         quantized: tuple[torch.Tensor, torch.Tensor] | None = None,
+        rows=None,
     ) -> torch.Tensor:
         """`quantized` is an optional `(fp8, scale)` copy of `hidden_states`
         that an FP8 `qkv_proj` takes instead of quantizing it again; the
-        indexer still reads the BF16 `hidden_states`."""
+        indexer still reads the BF16 `hidden_states`. `rows`: the decoder's
+        token sharding, see `_select_tokens`."""
         num_tokens = hidden_states.shape[0]
         qkv = (
             self.qkv_proj(hidden_states)
@@ -479,7 +592,7 @@ class Qwen4ExpAttention(nn.Module):
         else:
             qsa = qsa.for_tokens(num_tokens)
             self._store_kv(key, value, qsa.slot_mapping)
-            selected = self._select_tokens(hidden_states, positions, qsa)
+            selected = self._select_tokens(hidden_states, positions, qsa, rows)
             attn_out = None
             if forward_context.context.is_prefill:
                 attn_out = self._flydsl_attention(query, key, value, selected, qsa)
@@ -505,38 +618,40 @@ class Qwen4ExpAttention(nn.Module):
         return self.o_proj(gated)
 
     def _flydsl_attention(self, query, key, value, selected, qsa):
-        """aiter FlyDSL sparse attention for an eager prefill, or None for the native kernel."""
+        """aiter FlyDSL sparse attention for an eager prefill, or None for the
+        native kernel. With the flag on, the first FlyDSL call and each
+        distinct fallback reason are logged once."""
+        if not envs.ATOM_QSA_FLYDSL_ATTN:
+            return None
         width = next((w for w in _FLYDSL_WIDTHS if w >= selected.shape[1]), None)
-        if (
-            not envs.ATOM_QSA_FLYDSL_ATTN
-            or qsa.host_lens is None
-            or width is None
-            # aiter rejects a padded selection spanning 2**31 bytes or more.
-            or query.shape[0] * width * selected.element_size() >= 2**31
-            # Padding a selection laid out for another budget or ratio moves the
-            # causal tail: the kernel would read it at the wrong column.
-            or self.indexer.compress_ratio != 4
-            or self.indexer.token_topk + 3 not in _FLYDSL_WIDTHS
-            # The prefixed path gathers raw cache rows; the kernel takes BF16 only.
-            or self.k_scale_cache is not None
-            or not _flydsl_arch_supported()
-            or torch.cuda.is_current_stream_capturing()
-            or self.num_kv_heads != 1
-            or self.num_heads not in (12, 6, 3)
-            or self.head_dim != 256
-            or query.dtype != torch.bfloat16
-        ):
+        # The prefixed path gathers raw cache rows; the kernel takes BF16 only.
+        reason = flydsl_fallback_reason(
+            self.indexer.compress_ratio,
+            self.indexer.token_topk,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            kv_bf16=self.k_scale_cache is None,
+        )
+        if reason is None and qsa.host_lens is None:
+            # Not laid out for FlyDSL (target verify, warmup, ATOM's own
+            # runner); the SGLang bridge logs its own reasons for skipping.
             return None
+        reason = reason or _flydsl_call_fallback_reason(query, selected, width, qsa)
+        if reason is not None:
+            log_flydsl_fallback(reason)
+            return None
+        _log_flydsl_active()
         query_lens, seq_lens = qsa.host_lens
-        if sum(query_lens) != query.shape[0]:
-            return None
         if qsa.context_slots is None:
             k, v = key.contiguous(), value.contiguous()
         else:
             k = self.k_cache.flatten(0, 1).index_select(0, qsa.context_slots)
             v = self.v_cache.flatten(0, 1).index_select(0, qsa.context_slots)
-        # The expansion drops columns no row can reach; the kernel reads them as -1.
-        # It does not validate the layout: a malformed selection gives wrong output.
+        # The expansion drops columns no row can reach (short contexts select
+        # every complete block, then the tail, left-aligned), so padding with -1
+        # keeps each row's layout. The kernel does not validate it: a malformed
+        # selection gives wrong output.
         indices = torch.nn.functional.pad(
             selected, (0, width - selected.shape[1]), value=-1
         )

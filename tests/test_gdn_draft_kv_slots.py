@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 """Where an MTP draft mid-step writes its KV on a GDN hybrid (Qwen3.5 / Next).
 
-`EagleProposer.propose` takes the draft's write slots from what
+`EagleProposer._propose` takes the draft's write slots from what
 `prepare_mtp_decode` returns, and falls back to `kv_indices[kv_indptr[1:] - 1]`
 when it returns none. That fallback is a token slot only at page size 1 (MLA).
 The GDN builder used to return none, so at `block_size` 16 the draft wrote its
@@ -83,7 +83,7 @@ def builder(monkeypatch):
 
 
 def proposer_slots(workinfos, var, running_bs):
-    """The slots `EagleProposer.propose` hands the draft's KV write."""
+    """The slots `EagleProposer._propose` hands the draft's KV write."""
     if "slot_mapping" in workinfos:
         return workinfos["slot_mapping"][:running_bs]
     indptr = var["kv_indptr"].gpu

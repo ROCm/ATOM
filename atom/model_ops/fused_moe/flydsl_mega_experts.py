@@ -68,8 +68,8 @@ def _select_decode_mtpr(mtpr: int, context, *, tbo_active: bool) -> int:
 
     A decode rank can have a prefilling peer. Only ``running_tokens_are_unified``
     proves that every DP rank agreed on this shape. Do not gate on is_prefill or
-    is_dummy_run: a draft pass also runs on idle peers whose parent batch flags
-    can differ. TBO contexts keep the existing capacity. ``running_bs`` counts
+    on whether the rank has requests: a draft pass also runs on idle peers,
+    whose own batch differs. TBO contexts keep the existing capacity. ``running_bs`` counts
     requests and underestimates MTP verification rows.
     """
     if context is None or not context.running_tokens_are_unified or tbo_active:

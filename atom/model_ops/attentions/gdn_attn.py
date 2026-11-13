@@ -16,6 +16,8 @@ from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.state_runtime import StateTransfer, midstep_checkpoint_targets
 from atom.model_ops.attention_gdn import GatedDeltaNet
+from atom.model_ops.fla_ops.chunk import CHUNK_SIZE
+from atom.model_ops.fla_ops.index import prepare_chunk_offsets
 from atom.model_ops.fla_ops.replayssm import (
     replayssm_buffer_shapes,
     replayssm_commit,
@@ -353,6 +355,21 @@ class GDNStateMixin(PoolRowsMixin):
             "non_spec_state_indices_in": CpuGpuBuffer(max_bs, **kwargs),
         }
 
+    def h2d_group_members(self) -> dict[str, tuple[str, ...]]:
+        # Published with the attention metadata of either phase
+        # (`stage_prefill` / `stage_decode`).
+        members = super().h2d_group_members()
+        members["prefill_metadata"] = members.get("prefill_metadata", ()) + (
+            "non_spec_state_indices",
+            "non_spec_state_indices_in",
+        )
+        members["decode_metadata"] = members.get("decode_metadata", ()) + (
+            "spec_state_indices",
+            "non_spec_state_indices",
+            "non_spec_state_indices_in",
+        )
+        return members
+
     @property
     def spec_state_indices_tensor(self):
         return self.model_runner.forward_vars["spec_state_indices"]
@@ -364,6 +381,83 @@ class GDNStateMixin(PoolRowsMixin):
     @property
     def non_spec_state_indices_in_tensor(self):
         return self.model_runner.forward_vars["non_spec_state_indices_in"]
+
+    def stage_prefill(self, batch, running_bs, running_tokens, group):
+        """The attention metadata, and a prefill's state slots with it."""
+        built = super().stage_prefill(batch, running_bs, running_tokens, group)
+        self._stage_prefill_state_indices(batch, group)
+        return built
+
+    def stage_decode(self, batch, running_bs, running_tokens, max_seqlen_q, group):
+        """The attention metadata, and the state slots with it."""
+        built = super().stage_decode(
+            batch, running_bs, running_tokens, max_seqlen_q, group
+        )
+        self._stage_decode_state_indices(batch, running_bs, group)
+        return built
+
+    def finish_prefill(self, batch, attn_metadata, running_bs, running_tokens):
+        super().finish_prefill(batch, attn_metadata, running_bs, running_tokens)
+        if batch.block_tables == []:
+            if any(getattr(batch, "state_save_all", None) or ()):
+                raise RuntimeError(
+                    "midstep checkpoints reserved for a prefill with no GDN "
+                    "metadata; nothing would write them"
+                )
+            attn_metadata.gdn_metadata = None
+            return
+        # `stage_prefill` has already marshalled them, and the early return
+        # above is the only case where it would not have.
+        gdn_metadata = self.prepare_gdn_metadata(
+            batch, attn_metadata, is_prefill=True, prepare_block_tables=False
+        )
+
+        gdn_metadata.ssm_checkpoints = self._checkpoint_targets(batch)
+        gdn_metadata.ssm_conv_state_len = self._conv_state_len()
+        if gdn_metadata.ssm_checkpoints is not None:
+            # Same mapping the chunk kernel builds internally, computed once
+            # per step rather than per layer.
+            gdn_metadata.ssm_chunk_offsets = prepare_chunk_offsets(
+                gdn_metadata.non_spec_query_start_loc, CHUNK_SIZE
+            )
+
+        attn_metadata.gdn_metadata = gdn_metadata
+
+    def finish_decode(
+        self, batch, attn_metadata, running_bs, running_tokens, max_seqlen_q
+    ):
+        super().finish_decode(
+            batch, attn_metadata, running_bs, running_tokens, max_seqlen_q
+        )
+        # The common decode builder already filled the block-table source.
+        self._attach_gdn_decode_metadata(
+            batch, attn_metadata, prepare_block_tables=False
+        )
+
+    def _stage_prefill_state_indices(self, batch, group) -> None:
+        """A prefill's state slots, counted into ``group``."""
+        self.prepare_state_indices(batch, with_spec=False)
+        num_reqs = batch.total_seqs_num
+        group.set_count(self.non_spec_state_indices_tensor, num_reqs)
+        group.set_count(self.non_spec_state_indices_in_tensor, num_reqs)
+
+    def _stage_decode_state_indices(self, batch, running_bs, group) -> None:
+        """A decode's state slots, counted into ``group``. Every row past the
+        state-holding seqs is PAD on the host, so the `running_bs` rows a
+        replayed graph reads need no device-side fill."""
+        spec = self.use_spec_decode
+        self.prepare_state_indices(batch, with_spec=spec)
+        group.set_count(self.spec_state_indices_tensor, running_bs if spec else None)
+        # ReplaySSM mirrors a request's one slot into the 1-D tensor (`slot_idx`).
+        group.set_count(
+            self.non_spec_state_indices_tensor,
+            running_bs if not spec or self.replayssm else None,
+        )
+        # A spec step reads it only to fork (`fork_read_table`).
+        group.set_count(
+            self.non_spec_state_indices_in_tensor,
+            running_bs if not spec or self._has_state_fork else None,
+        )
 
     def _check_state_indices_writable(self):
         groups = getattr(self.model_runner, "h2d_groups", None)
@@ -863,9 +957,9 @@ class GDNStateMixin(PoolRowsMixin):
                 f"state checkpoint layout mismatch: op {op.layout_id!r} "
                 f"against this worker's {spec.layout_id!r}"
             )
-        if op.total_bytes != spec.image_bytes:
+        if op.total_bytes != spec.op_bytes:
             raise RuntimeError(
-                f"a checkpoint image is {spec.image_bytes} B but the op names "
+                f"a checkpoint image is {spec.op_bytes} B but the op names "
                 f"{op.total_bytes}"
             )
         if len(op.unit_ids) != spec.units_per_checkpoint:
@@ -1191,12 +1285,12 @@ class GDNStateMixin(PoolRowsMixin):
         rather than a place one has to be honoured.
 
         Every row past the state-holding seqs is reset to PAD_SLOT_ID, which
-        every GDN/KDA kernel skips. The rows a forward publishes are its
-        scheduled seqs, and a seq without a state slot is filtered out of
-        `batch.state_slots`, so such a row would otherwise keep whatever the
-        previous batch wrote there. The DP-sync dummy decode
-        (`ModelRunner.dummy_execution`: one seq, id -1, no slot) is that case.
-        An idle DP rank runs it while its own requests sit unscheduled, for
+        every GDN/KDA kernel skips. A forward publishes its rows out to
+        `running_bs`, while only the scheduled seqs holding a state slot (those
+        in `batch.state_slots`) are written here, so any other row would
+        otherwise keep whatever the previous batch wrote there. The DP-sync dummy
+        (`ModelRunner.dummy_execution`: no request, every row padding) is that
+        case. An idle DP rank runs it while its own requests sit unscheduled, for
         example between prefill chunks while the PrefillDelayer holds. With a
         stale index its decode updates the conv and recurrent state of the
         first request of the rank's last real batch in place. That request then
@@ -1297,26 +1391,31 @@ class GDNStateMixin(PoolRowsMixin):
         if prepare_block_tables:
             self.prepare_block_tables(batch)
 
-        # Prefill only: `prepare_prefill` pads this past the requests it
-        # scheduled, for a draft pass that follows. Decode's padding is older
+        # Prefill only: `stage_prefill` publishes this out to `running_bs`,
+        # for a draft pass that follows. Decode's padding is older
         # than that and everything below is written for it.
         query_start_loc = attn_metadata.cu_seqlens_q
         if is_prefill:
             query_start_loc = query_start_loc[: num_prefills + 1]
         nums_dict, batch_ptr, token_chunk_offset_ptr = None, None, None
+
+        def state_indices(buffer):
+            # The slots went up with the attention metadata
+            # (`stage_prefill` / `stage_decode`).
+            return buffer.gpu[:num_reqs]
+
         if not self.use_spec_decode or is_prefill:
-            self.prepare_state_indices(batch, with_spec=False)
             spec_token_indx = None
             non_spec_token_indx = None
             spec_state_indices_tensor = spec_state_indices_in_tensor = None
-            non_spec_state_indices_tensor = (
-                self.non_spec_state_indices_tensor.copy_to_gpu(num_reqs)
+            non_spec_state_indices_tensor = state_indices(
+                self.non_spec_state_indices_tensor
             )
             # Always its own buffer, never aliased to the write tensor: this
             # branch also serves non-spec decode, which runs from a captured
             # CUDAGraph where the argument address is baked in at capture.
-            non_spec_state_indices_in_tensor = (
-                self.non_spec_state_indices_in_tensor.copy_to_gpu(num_reqs)
+            non_spec_state_indices_in_tensor = state_indices(
+                self.non_spec_state_indices_in_tensor
             )
             spec_query_start_loc = None
             non_spec_query_start_loc = query_start_loc
@@ -1325,7 +1424,6 @@ class GDNStateMixin(PoolRowsMixin):
             num_spec_decodes = 0
             num_spec_decode_tokens = 0
         else:
-            self.prepare_state_indices(batch, with_spec=True)
             self.prepare_num_accepted_tokens(batch)
             # The published query prefix (including graph padding) ends at
             # the scheduled token count. Use its CPU value so ragged decode
@@ -1339,20 +1437,14 @@ class GDNStateMixin(PoolRowsMixin):
             non_spec_token_indx = self.non_spec_token_indx[:0]
             spec_sequence_masks = self.spec_sequence_masks[:num_reqs]
             spec_sequence_masks.fill_(True)
-            spec_state_indices_tensor = self.spec_state_indices_tensor.copy_to_gpu(
-                num_reqs
-            )
-            if self.replayssm:
-                # `prepare_state_indices` mirrored the single slot into the
-                # 1-D tensor too; ship that to the device for `slot_idx`.
-                self.non_spec_state_indices_tensor.copy_to_gpu(num_reqs)
+            spec_state_indices_tensor = state_indices(self.spec_state_indices_tensor)
             non_spec_state_indices_tensor = None
             # Only when forked: every other spec step ships None, as before.
             # A fork runs eagerly (pp>1), so a fresh read-side table is fine.
             non_spec_state_indices_in_tensor = spec_state_indices_in_tensor = None
             if self._has_state_fork:
-                non_spec_state_indices_in_tensor = (
-                    self.non_spec_state_indices_in_tensor.copy_to_gpu(num_reqs)
+                non_spec_state_indices_in_tensor = state_indices(
+                    self.non_spec_state_indices_in_tensor
                 )
                 spec_state_indices_in_tensor = fork_read_table(
                     spec_state_indices_tensor, non_spec_state_indices_in_tensor
@@ -1500,14 +1592,9 @@ class GDNStateMixin(PoolRowsMixin):
             prepare_block_tables=prepare_block_tables,
         )
 
-        # transfer data to ps buffer
-        if self.replayssm:
-            # Idle graph-padding entries must resolve to PAD so the kernel
-            # skips them instead of touching slot 0's checkpoint.
-            self.non_spec_state_indices_tensor.gpu[num_decodes:].fill_(PAD_SLOT_ID)
+        # The state slots past `num_decodes` are PAD already: published from
+        # the host with the attention metadata (`stage_decode`).
         if self.use_spec_decode:
-            self.spec_state_indices_tensor.gpu[num_decodes:, :].fill_(PAD_SLOT_ID)
-
             self.spec_sequence_masks[num_decodes:].fill_(False)
 
             self.spec_query_start_loc[: num_decodes + 1].copy_(
@@ -1526,9 +1613,6 @@ class GDNStateMixin(PoolRowsMixin):
             self.num_accepted_tokens[num_decodes:].fill_(1)
             gdn_metadata.num_accepted_tokens = self.num_accepted_tokens[:num_decodes]
         else:
-            self.non_spec_state_indices_tensor.gpu[num_decodes:].fill_(PAD_SLOT_ID)
-            self.non_spec_state_indices_in_tensor.gpu[num_decodes:].fill_(PAD_SLOT_ID)
-
             self.non_spec_query_start_loc[: num_decodes + 1].copy_(
                 gdn_metadata.non_spec_query_start_loc[: num_decodes + 1],
                 non_blocking=True,
@@ -1647,6 +1731,7 @@ def draft_kv_write_slots(
             context_lens,  # positions_in: unread, update_positions is False
             context_lens,  # positions_out: unread
             out,  # last_token_indices: unread
+            rows,
             num_rows,
             False,  # skip_update
             False,  # update_context_lens: the proposer already bumped them
@@ -1661,7 +1746,7 @@ def draft_kv_write_slots(
         pos = (context_lens[:num_rows].to(torch.int64) - 1).clamp(min=0)
         page = block_tables[:num_rows].gather(1, (pos // block_size).unsqueeze(1))
         out[:num_rows] = page.squeeze(1).to(torch.int64) * block_size + pos % block_size
-    out[num_rows:] = -1
+        out[num_rows:] = -1
     return out
 
 
@@ -1680,8 +1765,9 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         Off under pipeline parallelism and RapidServe. ``get_num_blocks``
         raises when a copying transfer meets either, and answering yes there
         would turn "this model keeps fork-slot checkpoints" into "this model
-        does not start". Kimi's ``_uses_paged_checkpoints`` is the same two
-        switches and no model-type set, because that builder is Kimi-only.
+        does not start". Kimi's ``_uses_paged_checkpoints`` has only the
+        RapidServe switch, since its PAGE checkpoints span pipeline stages,
+        and no model-type set, because that builder is Kimi-only.
         """
 
         config = self.model_runner.config
@@ -1943,66 +2029,6 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
             )
         return super().build_kv_cache_tensor(module)
 
-    def prepare_prefill(  # type: ignore[override]
-        self,
-        batch: ScheduledBatch,
-        running_bs: int,
-        running_tokens: int,
-    ) -> GDNAttentionMetadata:
-        attn_metadata, positions = super().prepare_prefill(
-            batch, running_bs, running_tokens
-        )
-        if batch.block_tables == []:
-            if any(getattr(batch, "state_save_all", None) or ()):
-                raise RuntimeError(
-                    "midstep checkpoints reserved for a prefill with no GDN "
-                    "metadata; nothing would write them"
-                )
-            attn_metadata.gdn_metadata = None
-            return attn_metadata, positions
-        # `super().prepare_prefill` has already marshalled them, and the early
-        # return above is the only case where it would not have.
-        gdn_metadata = self.prepare_gdn_metadata(
-            batch, attn_metadata, is_prefill=True, prepare_block_tables=False
-        )
-
-        gdn_metadata.ssm_checkpoints = self._checkpoint_targets(batch)
-        gdn_metadata.ssm_conv_state_len = self._conv_state_len()
-        if gdn_metadata.ssm_checkpoints is not None:
-            # Same mapping the chunk kernel builds internally, computed once
-            # per step rather than per layer.
-            from atom.model_ops.fla_ops.chunk import CHUNK_SIZE
-            from atom.model_ops.fla_ops.index import prepare_chunk_offsets
-
-            gdn_metadata.ssm_chunk_offsets = prepare_chunk_offsets(
-                gdn_metadata.non_spec_query_start_loc, CHUNK_SIZE
-            )
-
-        attn_metadata.gdn_metadata = gdn_metadata
-        return attn_metadata, positions
-
-    def prepare_decode(  # type: ignore[override]
-        self,
-        batch: ScheduledBatch,
-        running_bs: int,
-        running_tokens: int,
-        max_seqlen_q: int,
-    ) -> GDNAttentionMetadata:
-        attn_metadata, positions = super().prepare_decode(
-            batch, running_bs, running_tokens, max_seqlen_q
-        )
-        # publish_cu_seqlens_q already filled and uploaded the padded prefix
-        # before prepare_input_ids. Reuse it without rewriting a borrowed source.
-        attn_metadata.cu_seqlens_q = self.model_runner.forward_vars["cu_seqlens_q"].gpu[
-            : running_bs + 1
-        ]
-
-        # The common decode builder already filled the block-table source.
-        self._attach_gdn_decode_metadata(
-            batch, attn_metadata, prepare_block_tables=False
-        )
-        return attn_metadata, positions
-
     def prepare_mtp_decode(
         self,
         bs: int,
@@ -2033,7 +2059,9 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
 
         result = {}
         if self.block_size == 1024:
-            result = self.set_aiter_persistent_worker_buffers(running_bs)
+            result = self.set_aiter_persistent_worker_buffers(
+                running_bs, var["max_qlen"]
+            )
         # The draft advanced context_lens, and the planner bakes per-task tile
         # ranges from it. Inheriting prepare_decode's plan would attend over the
         # pre-bump context -- a wrong answer, and one the op cannot detect: the
@@ -2048,8 +2076,8 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         # a token slot. That lands the MTP layer's K/V in block `id //
         # block_size` -- some other request's KV, or the units of a PAGE state
         # checkpoint, whose image then restores corrupted.
-        # A dummy run's synthetic context_lens can point past block_tables, and
-        # its draft writes nowhere anyway: every row is padding.
+        # A warmup's fabricated context_lens can point past block_tables, and
+        # an idle rank's draft writes nowhere anyway: every row is padding.
         dummy = get_forward_context().context.is_dummy_run
         result["slot_mapping"] = draft_kv_write_slots(
             var["context_lens"].gpu[:running_bs],
@@ -2060,10 +2088,15 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         )
         return result
 
-    def build_for_cudagraph_capture(self, bs: int):
+    def build_for_cudagraph_capture(self, bs: int, *, decode_ubatch_slices=None):
+        if decode_ubatch_slices is not None:
+            raise ValueError(
+                "GDN builds no micro-batch metadata; TBO is refused for its "
+                "models (`Config._check_tbo_support`)"
+            )
         var = self.model_runner.forward_vars
         if self.block_size == 1024:
-            ctx_pa_ps = self.set_aiter_persistent_worker_buffers(bs)
+            ctx_pa_ps = self.set_aiter_persistent_worker_buffers(bs, var["max_qlen"])
         else:
             ctx_pa_ps = {}
         attn_metadata = AttentionMetaData(

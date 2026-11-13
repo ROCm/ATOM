@@ -686,7 +686,7 @@ def fake_pin(monkeypatch):
 
     monkeypatch.setattr(_ple(), "pin_rows", pin_rows)
     # Copies in plain memory: the device would see them where the host does.
-    monkeypatch.setattr(_ple(), "device_address", lambda address: address)
+    monkeypatch.setattr(_ple(), "device_address", lambda address, **_: address)
     return state
 
 
@@ -808,6 +808,8 @@ def test_ngram_embedding_on_host_matches_hbm_embedding(monkeypatch):
     group = SimpleNamespace(world_size=1, rank_in_group=0)
     monkeypatch.setattr(embed_head, "get_tp_group", lambda: group)
     monkeypatch.setattr(ple_layer, "get_tp_group", lambda: group)
+    # Where Mono refuses, gfx950 and gfx942 would put the table on the host too.
+    monkeypatch.setattr(ple_layer, "_host_table_available", lambda: False)
     config = SimpleNamespace(
         ngram_size=3,
         heads_per_ngram=8,

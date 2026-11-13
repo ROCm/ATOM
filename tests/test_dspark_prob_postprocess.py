@@ -48,9 +48,11 @@ def test_structured_verify_keeps_raw_logprobs(modules, monkeypatch, probabilisti
         top_logprobs=[1],
         structured_requests={0: object()},
         required_channel=None,
+        num_spec_step=1,
     )
     runner = object.__new__(mod.ModelRunner)
-    runner.forward_done_event = NS(record=lambda: None)
+    runner.forward_done_event = NS(record=lambda *args: None)
+    runner._served = None
     observed = {}
     prefixes = {0: object()}
 
@@ -84,7 +86,9 @@ def test_structured_verify_keeps_raw_logprobs(modules, monkeypatch, probabilisti
         observed["ratio_verification"] = True
         return verify(args[4], args[5])
 
-    def ordinary_verify(metadata, target_logits, bonus, *, target_token_ids):
+    def ordinary_verify(
+        metadata, target_logits, bonus, *, target_token_ids, ratio=None
+    ):
         return verify(target_logits, bonus, target_token_ids)
 
     monkeypatch.setattr(prob, "prob_rejection_sample", ratio_verify)
@@ -92,7 +96,7 @@ def test_structured_verify_keeps_raw_logprobs(modules, monkeypatch, probabilisti
         synthetic_acceptance_rates=None, forward=ordinary_verify
     )
     state = NS(src_for=lambda requests, count: torch.tensor([0]))
-    runner.drafter = NS(prob_state=state if probabilistic else None)
+    runner.drafter = NS(prob_state=state if probabilistic else None, lossless=None)
     monkeypatch.setattr(runner, "propose_draft_token_ids", lambda *args: None)
 
     def prepare(batch, ids, event, logprobs, **kwargs):
@@ -114,7 +118,7 @@ def test_structured_verify_keeps_raw_logprobs(modules, monkeypatch, probabilisti
         None,
         None,
         False,
-        hidden_states=None,
+        hidden_states=torch.zeros(2, 1),
     )
 
     assert observed["committed"].tolist() == [[1, 1]]

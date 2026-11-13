@@ -57,7 +57,7 @@ class _Step:
     """The fields the window write reads: one request and one padding row."""
 
     def __init__(self, tokens, slot, device):
-        self.width = tokens
+        self.running_tokens = tokens
         self.positions = torch.arange(tokens, device=device, dtype=torch.int32)
         self.batch_ids = torch.zeros(tokens, device=device, dtype=torch.int32)
         self.batch_ids[-1] = -1
@@ -288,7 +288,7 @@ def test_fused_seam_head_block_matches_a_program_a_head(monkeypatch, heads, sink
     head_block = sink in ("packed_ring", "bf16_ring", "prefill", "query") and (
         (heads & (heads - 1)) == 0
     )
-    expected_grid = (tokens, (1 if head_block else query_heads) + kv_half)
+    expected_grid = (tokens * ((1 if head_block else query_heads) + kv_half),)
 
     def run(flag):
         monkeypatch.setattr(rope_window, "_HEAD_BLOCK", flag)
@@ -331,7 +331,7 @@ def test_fused_seam_head_block_matches_a_program_a_head(monkeypatch, heads, sink
         return out, spy.launches
 
     (expected, default_launches), (actual, launches) = run(False), run(True)
-    assert default_launches == [((tokens, query_heads + kv_half), False)]
+    assert default_launches == [((tokens * (query_heads + kv_half),), False)]
     assert launches == [(expected_grid, head_block)]
     if sink in ("packed_ring", "bf16_ring", "prefill", "query"):
         assert not torch.equal(expected["query"], query)

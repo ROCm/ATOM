@@ -58,17 +58,19 @@ import torch
 import triton
 import triton.language as tl
 
-from atom.model_ops.dspark_markov_sample import (
-    _BLOCK_K,
-    _BLOCK_V,
-    _MAX_BLOCK_ROW,
-    _MIN_BLOCK_ROW,
+from atom.model_ops import dspark_markov_stage1 as _markov_stage1
+from atom.model_ops.dspark_markov_argmax import (
     _dspark_markov_argmax_stage2,
     argmax_gather,
 )
 from atom.model_ops.rejection_sampler import _draft_token, _finish_request
 from atom.model_ops.sampler import SAMPLER_EPS
 from atom.utils import envs
+
+_BLOCK_K = _markov_stage1.BLOCK_K
+_BLOCK_V = _markov_stage1.BLOCK_V
+_MAX_BLOCK_ROW = _markov_stage1.MAX_BLOCK_ROW
+_MIN_BLOCK_ROW = _markov_stage1.MIN_BLOCK_ROW
 
 logger = logging.getLogger("atom")
 
@@ -156,7 +158,7 @@ def _prob_markov_stage1(
     BLOCK_V: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    """`_dspark_markov_argmax_stage1` + store z + Gumbel-max on the scores."""
+    """`dspark_markov_argmax`'s stage 1 + store z + Gumbel-max on the scores."""
     tile = tl.program_id(0)
     offs_row = tl.program_id(1) * BLOCK_ROW + tl.arange(0, BLOCK_ROW)
     offs_v = tile * BLOCK_V + tl.arange(0, BLOCK_V)
@@ -289,7 +291,6 @@ def prob_markov_sample(
         out if packed is None else part_idx,
         num_rows,
         num_tiles,
-        vocab_size,
         out.stride(0) if packed is None else 0,
         part_val if packed is None else packed,
         BLOCK_TILE=triton.next_power_of_2(num_tiles),

@@ -88,6 +88,7 @@ class LayerPostBuild:
     index_bound_max: int = 0
     # the index plane is FP4 (``AttnPostBuild.index_fp4``)
     index_fp4: bool = False
+    index_mfma: bool = False
     experts: int = EXPERTS
     topk: int = TOPK
     # the TP size: every width a rank holds (``Dims``)
@@ -126,6 +127,7 @@ class LayerPostBuild:
             tokens=self.tokens,
             index_bound_max=self.index_bound_max,
             index_fp4=self.index_fp4,
+            index_mfma=self.index_mfma,
             tp=self.tp,
             timeline=self.timeline,
             diag_off=self.diag_off,
@@ -271,7 +273,8 @@ def build_layer_post(key: LayerPostBuild):
 
     name = kernel_symbol(
         "v41_layer_post", s=s, e=rs.experts, k=rs.topk, tl=int(timeline),
-        ix=int(key.index_bound_max > 0), i4=int(key.index_fp4), tpar=int(key.tok_par),
+        ix=int(key.index_bound_max > 0), i4=int(key.index_fp4),
+        im=int(key.index_mfma), tpar=int(key.tok_par),
         **({"ep": key.ep} if key.ep > 1 else {}),
         **({"mtp": key.moe_tp} if key.moe_tp > 1 else {}),
     )  # fmt: skip

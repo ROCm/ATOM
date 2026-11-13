@@ -329,6 +329,31 @@ def test_structured_admission_is_answered_by_the_hub_engine():
         hub.close()
 
 
+def test_strict_tools_alone_are_admitted_by_the_hub_engine():
+    """Strict tool arguments constrain decoding without a JSON Schema answer,
+    so such a request goes to the hub's admission too."""
+    seen = []
+    core = _FakeCoreManager()
+    hub = fw.FrontendHub(
+        core,
+        num_workers=1,
+        prepare_structured=lambda params, *_: seen.append(
+            params.structured_tool_format
+        ),
+    )
+    core.hub = hub
+    hub.start()
+    worker = fw.RemoteCoreManager(hub.connection_info(0))
+    try:
+        params = _Params(None)
+        params.structured_tool_format = '{"tools": []}'
+        worker.prepare_structured_request(params)
+        assert seen == ['{"tools": []}']
+    finally:
+        worker.close()
+        hub.close()
+
+
 def test_hub_without_an_engine_admission_refuses_structured_requests():
     core = _FakeCoreManager()
     hub = fw.FrontendHub(core, num_workers=1)

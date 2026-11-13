@@ -319,6 +319,7 @@ def _build_glm52_dsa_metadata(
         return None
 
     from atom.plugin.sglang.glm52_dsa_bridge import (
+        SHARED_SPARSE_INDICES_ATTR,
         build_atom_glm52_attention_metadata_from_sglang,
         get_draft_decode_sub_step,
         is_draft_decode_metadata,
@@ -415,6 +416,12 @@ def _build_glm52_dsa_metadata(
                         graph_cache
                     )
                 graph_cache[graph_cache_key] = attn_metadata
+    if attn_metadata is not None and token_to_kv_pool is not None:
+        # The selection the indexer writes and every sparse MLA layer reads:
+        # the buffer `bind_glm52_dsa_cache_views` binds onto the indexers.
+        attn_metadata.sparse_kv_indices = getattr(
+            token_to_kv_pool, SHARED_SPARSE_INDICES_ATTR, None
+        )
     return attn_metadata
 
 

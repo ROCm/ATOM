@@ -59,13 +59,18 @@ from atom.observability.tracing import TraceMiddleware, set_request_id
 from atom.observability.tracing import initialize as initialize_tracing
 from atom.observability.tracing import shutdown as shutdown_tracing
 from atom.sampling_params import RequiredChannel
+from atom.structured_output import is_structured
 from atom.structured_output.validation import (
     configure_request,
+    configure_tool_call_grammar,
+    declared_tool_names,
     schema_from_format,
+    strict_tool_schemas,
     structured_response_channel,
     validate_chat_stream,
     validate_output,
     validate_responses_output,
+    validate_tool_calls,
 )
 from atom.utils import envs
 from atom.utils.arg_parser import FlexibleArgumentParser
@@ -87,6 +92,7 @@ from .chat_encoders import (
     resolve_reasoning_toggle,
 )
 from .fim import FimFormat, resolve_fim_format
+from .images import check_chat_images, load_chat_images
 from .logprobs import LogprobCollector, TokenBytes
 from .metrics_setup import create_metrics_exporter
 from .prefix_completion import continue_prompt, take_assistant_prefix
@@ -764,16 +770,20 @@ def _prepare_multimodal_inputs(
     chat_template_kwargs: dict[str, Any],
     tools: Any = None,
 ) -> tuple[list[int], dict[str, Any]]:
+    # The images arrive decoded: the processor's media loader reads any
+    # source it is given, server paths included.
     conversation, media = parse_chat_messages(
-        [
-            {
-                **message.to_template_dict(
-                    preserve_tool_call_arguments=preserve_tool_call_arguments
-                ),
-                "content": message.content,
-            }
-            for message in messages
-        ]
+        load_chat_images(
+            [
+                {
+                    **message.to_template_dict(
+                        preserve_tool_call_arguments=preserve_tool_call_arguments
+                    ),
+                    "content": message.content,
+                }
+                for message in messages
+            ]
+        )
     )
     return prepare_multimodal_inputs(
         _get_engine_config(),
@@ -858,7 +868,7 @@ def _send_stream_chunk_tagged(
 
 
 async def _submit_engine_requests(seqs):
-    if not any(getattr(seq, "json_schema", None) is not None for seq in seqs):
+    if not any(is_structured(seq) for seq in seqs):
         engine.core_mgr.add_request(seqs)
         return
     # Admission RPCs must not block the API event loop. If the client cancels,
@@ -1387,6 +1397,64 @@ def _prepare_prompt(
     if not text:
         raise ValueError("The prompt is empty after truncation to the context")
     return token_ids, text
+
+
+async def _prepare_engine_input(
+    messages,
+    template_kwargs: dict[str, Any],
+    *,
+    tools,
+    max_tokens: int,
+    kv_transfer_params: dict[str, Any] | None,
+) -> tuple[PrefixEncoding | list[int], dict[str, Any] | None, bool]:
+    """``(engine_input, multimodal_data, starts_in_reasoning)`` for
+    ``/v1/messages`` and ``/v1/responses``.
+
+    A request with images is prepared as on the chat path, and is not cut to
+    the context: a cut could end inside an image. One without goes through
+    ``_prepare_prompt`` as before."""
+    if _has_multimodal_content(messages):
+        if kv_transfer_params is not None:
+            # A prefill leg cannot hand an image request off, so neither leg
+            # can finish it: refused here, not as a router error or a stall.
+            raise ValueError("image input cannot be combined with kv_transfer_params")
+        _get_multimodal_processor()  # on the loop, as the chat path does
+        token_ids, multimodal_data = await asyncio.to_thread(
+            _prepare_multimodal_inputs, messages, template_kwargs, tools
+        )
+        starts = prompt_tokens_start_in_reasoning(token_ids, tokenizer.decode)
+        return token_ids, multimodal_data, starts
+    engine_input, prompt = await asyncio.to_thread(
+        _prepare_prompt,
+        messages,
+        template_kwargs,
+        tools=tools,
+        preserve_tool_call_arguments=preserve_tool_call_arguments,
+        max_tokens=max_tokens,
+        kv_transfer_params=kv_transfer_params,
+    )
+    return engine_input, None, prompt_starts_in_reasoning(prompt)
+
+
+def _generate_nonstream(
+    engine_input,
+    multimodal_data: dict[str, Any] | None,
+    sampling_params: SamplingParams,
+    request_id: str,
+    kv_transfer_params: dict[str, Any] | None,
+) -> AsyncGenerator[dict[str, Any], None]:
+    """The engine call for what ``_prepare_engine_input`` returned."""
+    if multimodal_data is None:
+        return generate_async(
+            engine_input,
+            sampling_params,
+            request_id,
+            kv_transfer_params=kv_transfer_params,
+        )
+    # No PD handoff: `_prepare_engine_input` refused one with images.
+    return generate_async_multimodal(
+        engine_input, multimodal_data, sampling_params, request_id
+    )
 
 
 def _with_kv_transfer_params(response: dict, final_output: dict) -> dict:
@@ -1979,26 +2047,35 @@ async def _configure_structured_output(
     *,
     tools=None,
     tool_choice=None,
+    strict_schemas=None,
     kv_transfer=None,
     multimodal=False,
 ):
-    if schema is None:
+    if schema is None and not strict_schemas:
         return
-    await configure_request(
-        engine,
-        tokenizer,
-        _get_engine_config(),
-        sampling_params,
-        schema,
-        channel,
-        parser_cls=tool_call_parser_cls,
-        tools=tools,
-        tool_choice=tool_choice,
-        kv_transfer=kv_transfer,
-        multimodal=multimodal,
-        relaxed_mtp=envs.ATOM_ENABLE_RELAXED_MTP,
-        synthetic=synthetic_token_text is not None,
-    )
+    try:
+        await configure_request(
+            engine,
+            tokenizer,
+            _get_engine_config(),
+            sampling_params,
+            schema,
+            channel,
+            parser_cls=tool_call_parser_cls,
+            tools=tools,
+            tool_choice=tool_choice,
+            kv_transfer=kv_transfer,
+            multimodal=multimodal,
+            relaxed_mtp=envs.ATOM_ENABLE_RELAXED_MTP,
+            synthetic=synthetic_token_text is not None,
+            strict_schemas=strict_schemas,
+        )
+    except ValueError as exc:
+        if schema is not None:
+            raise
+        # Only strict tools asked for the grammar, and the refusals are
+        # worded for JSON Schema output: name what the client did ask for.
+        raise ValueError(f"strict function tools: {exc}") from exc
 
 
 @app.post("/v1/chat/completions")
@@ -2028,7 +2105,9 @@ async def _chat_completions(
     try:
         request.tools = normalize_chat_tools(request.tools)
         validate_chat_request(request)
-        messages = request.get_messages()
+        # Before any work: an image's source, form and place are the client's
+        # to get right, and nothing is fetched until they are.
+        messages = check_chat_images(request.get_messages())
         assistant_prefix = None
         if beta:
             messages, assistant_prefix = take_assistant_prefix(
@@ -2093,11 +2172,23 @@ async def _chat_completions(
                 app.state.logprob_codec = logprob_codec
 
         schema = schema_from_format(request.response_format)
-        if assistant_prefix is not None and schema is not None:
+        # Strict function tools are a beta feature; /v1 keeps ignoring `strict`.
+        strict_schemas = {}
+        if beta and request.tool_choice != "none":
+            tools = request.tools or ()
+            if any(tool["function"].get("strict") is True for tool in tools):
+                # Off the event loop: a new tool's meta-schema check takes
+                # milliseconds.
+                strict_schemas = await asyncio.to_thread(strict_tool_schemas, tools)
+            else:
+                # Nothing to check but how `strict` is spelled.
+                strict_schemas = strict_tool_schemas(tools)
+        if assistant_prefix is not None and (schema is not None or strict_schemas):
             # The grammar constrains the reply from its first token, and a
             # prefix has already written part of it.
             raise ValueError(
-                "an assistant prefix cannot be combined with structured output"
+                "an assistant prefix cannot be combined with structured output "
+                "or strict tools"
             )
 
         request_id = f"chatcmpl-{uuid.uuid4().hex}"
@@ -2173,11 +2264,28 @@ async def _chat_completions(
             _reasoning,
             tools=request.tools,
             tool_choice=request.tool_choice,
+            strict_schemas=strict_schemas,
             kv_transfer=request.kv_transfer_params,
             multimodal=_has_multimodal_content(messages),
         )
+        if schema is None and not strict_schemas and tool_call_parser_cls is not None:
+            await configure_tool_call_grammar(
+                engine,
+                _get_engine_config(),
+                sampling_params,
+                _reasoning,
+                parser_cls=tool_call_parser_cls,
+                tools=request_tools(request),
+                tool_choice=request.tool_choice,
+                kv_transfer=request.kv_transfer_params,
+                multimodal=_has_multimodal_content(messages),
+                relaxed_mtp=envs.ATOM_ENABLE_RELAXED_MTP,
+                synthetic=synthetic_token_text is not None,
+            )
 
-        _reasoning = structured_response_channel(_reasoning, schema)
+        _reasoning = structured_response_channel(
+            _reasoning, schema, bool(strict_schemas)
+        )
 
         # Streaming
         if request.stream:
@@ -2219,9 +2327,12 @@ async def _chat_completions(
                 usage_on_finish=compatibility.usage_on_finish,
                 include_usage=bool((request.stream_options or {}).get("include_usage")),
             )
-            if schema is not None:
-
-                gen = validate_chat_stream(gen, schema)
+            if sampling_params.json_schema is not None or strict_schemas:
+                # Also a tool-call grammar: its decode error ends the stream
+                # with an error event, not a truncated success.
+                gen = validate_chat_stream(
+                    gen, schema, strict_schemas, declared_tool_names(request.tools)
+                )
             return StreamingResponse(
                 _client_stream(gen, request_id),
                 media_type="text/event-stream",
@@ -2335,7 +2446,7 @@ async def _chat_completions(
                 logprob_codec=logprob_codec,
                 top_logprobs=sampling_params.top_logprobs,
             )
-        if schema is not None:
+        if schema is not None or strict_schemas:
 
             for choice in resp.choices:
                 validate_output(
@@ -2343,6 +2454,12 @@ async def _chat_completions(
                     choice["message"].get("content") or "",
                     choice.get("finish_reason"),
                     tool_calls=bool(choice["message"].get("tool_calls")),
+                )
+                validate_tool_calls(
+                    strict_schemas,
+                    choice["message"].get("tool_calls"),
+                    choice.get("finish_reason"),
+                    declared_tool_names(request.tools),
                 )
         _log_request_model("response", request_id, resp)
         # Bypass FastAPI's recursive conversion of the token ID list.
@@ -2690,7 +2807,9 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         # Apply chat template
         from .protocol import ChatMessage
 
-        messages = [ChatMessage(**m) for m in openai_messages]
+        messages = check_chat_images(
+            [ChatMessage(**m) for m in openai_messages], tool_results=True
+        )
 
         merged_kwargs = dict(default_chat_template_kwargs)
         # The request's `thinking` was dropped on the floor here, so the model
@@ -2750,14 +2869,14 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         request_id = uuid.uuid4().hex[:24]
         set_request_id(request_id)
         kv_transfer_params = _engine_kv_transfer_params(request.kv_transfer_params)
-        engine_input, prompt = await asyncio.to_thread(
-            _prepare_prompt,
-            messages,
-            merged_kwargs,
-            tools=anthropic_to_openai_tools(request.tools),
-            preserve_tool_call_arguments=preserve_tool_call_arguments,
-            max_tokens=sampling_params.max_tokens,
-            kv_transfer_params=kv_transfer_params,
+        engine_input, multimodal_data, starts_in_reasoning = (
+            await _prepare_engine_input(
+                messages,
+                merged_kwargs,
+                tools=anthropic_to_openai_tools(request.tools),
+                max_tokens=sampling_params.max_tokens,
+                kv_transfer_params=kv_transfer_params,
+            )
         )
 
         if request.stream:
@@ -2767,6 +2886,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                 sampling_params,
                 request_id,
                 kv_transfer_params=kv_transfer_params,
+                multimodal_data=multimodal_data,
             )
 
             async def generate_anthropic_stream():
@@ -2785,7 +2905,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                 # it is the model's, resolved at startup -- the filter used to
                 # carry none and closed on any registered dialect's marker.
                 reasoning_filter = reasoning_channel(
-                    prompt_starts_in_reasoning(prompt),
+                    starts_in_reasoning,
                     template_kwargs=merged_kwargs,
                 ).stream()
                 tool_parser = ToolCallStreamParser(
@@ -2941,11 +3061,12 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
 
         # Non-streaming response
         final_output = await _run_nonstream_with_disconnect(
-            generate_async(
+            _generate_nonstream(
                 engine_input,
+                multimodal_data,
                 sampling_params,
                 request_id,
-                kv_transfer_params=kv_transfer_params,
+                kv_transfer_params,
             ),
             raw_request,
             request_id,
@@ -2966,7 +3087,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         # interleaving at that line.
         events = read_whole_blocks(
             reasoning_channel(
-                prompt_starts_in_reasoning(prompt),
+                starts_in_reasoning,
                 template_kwargs=merged_kwargs,
             ),
             tool_call_parser_cls,
@@ -3108,7 +3229,9 @@ async def responses_create(raw_request: Request):
         validate_history_tool_calls(openai_messages)
         from .protocol import ChatMessage
 
-        messages = [ChatMessage(**m) for m in openai_messages]
+        messages = check_chat_images(
+            [ChatMessage(**m) for m in openai_messages], tool_results=True
+        )
 
         merged_kwargs = dict(default_chat_template_kwargs)
         if isinstance(request.tool_choice, str):
@@ -3164,19 +3287,19 @@ async def responses_create(raw_request: Request):
         schema = schema_from_format((text_config or {}).get("format"), responses=True)
         request_id = f"resp_{uuid.uuid4().hex[:24]}"
         set_request_id(request_id)
-        engine_input, prompt = await asyncio.to_thread(
-            _prepare_prompt,
-            messages,
-            merged_kwargs,
-            tools=openai_tools,
-            preserve_tool_call_arguments=preserve_tool_call_arguments,
-            max_tokens=sampling_params.max_tokens,
-            kv_transfer_params=kv_transfer_params,
+        engine_input, multimodal_data, starts_in_reasoning = (
+            await _prepare_engine_input(
+                messages,
+                merged_kwargs,
+                tools=openai_tools,
+                max_tokens=sampling_params.max_tokens,
+                kv_transfer_params=kv_transfer_params,
+            )
         )
 
         created_at = int(time.time())
         _reasoning = reasoning_channel(
-            prompt_starts_in_reasoning(prompt), template_kwargs=merged_kwargs
+            starts_in_reasoning, template_kwargs=merged_kwargs
         )
         await _configure_structured_output(
             sampling_params,
@@ -3185,6 +3308,7 @@ async def responses_create(raw_request: Request):
             tools=openai_tools,
             tool_choice=request.tool_choice,
             kv_transfer=kv_transfer_params,
+            multimodal=multimodal_data is not None,
         )
 
         _reasoning = structured_response_channel(_reasoning, schema)
@@ -3195,6 +3319,7 @@ async def responses_create(raw_request: Request):
                 sampling_params,
                 request_id,
                 kv_transfer_params=kv_transfer_params,
+                multimodal_data=multimodal_data,
             )
 
             async def generate_responses_stream():
@@ -3308,11 +3433,12 @@ async def responses_create(raw_request: Request):
             )
 
         final_output = await _run_nonstream_with_disconnect(
-            generate_async(
+            _generate_nonstream(
                 engine_input,
+                multimodal_data,
                 sampling_params,
                 request_id,
-                kv_transfer_params=kv_transfer_params,
+                kv_transfer_params,
             ),
             raw_request,
             request_id,

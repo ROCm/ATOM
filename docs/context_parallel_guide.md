@@ -128,9 +128,7 @@ Tips:
   long-sequence / high-concurrency workloads (not yet supported). Give all GPUs to
   PCP instead, e.g. `-tp 1 -pcp 8`.
 - Under PCP, TBO uses a **request-boundary split** (each micro-batch is a whole
-  subset of requests) — the non-default TBO split mode — instead of the
-  token-midpoint split used without PCP. `ATOM_TBO_PREFILL_TOKEN_SPLIT`
-  therefore has no effect when PCP is enabled.
+  subset of requests) instead of the token-midpoint split used without PCP.
 - `--torch-profiler-dir ./log` can be added to collect traces for performance
   analysis.
 

@@ -402,6 +402,11 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         methods = (getattr(c, name, None) for c in self._connectors)
         return [m for m in methods if callable(m)]
 
+    def drop_cached_kv(self) -> bool:
+        """Every sub-connector is asked, so each drops what it can."""
+        results = [bool(drop()) for drop in self._sub_methods("drop_cached_kv")]
+        return all(results)
+
     def can_detach_lookup(self, seq: Any, num_hbm_tokens: int) -> bool:
         """True only if every sub-connector with a tier lookup can detach it."""
         checks = self._sub_methods("can_detach_lookup")
@@ -678,6 +683,21 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         if c is None:
             return False
         return bool(c.enqueue_state_stores(stores))
+
+    def enqueue_state_touches(self, hashes) -> bool:
+        """State touches to the sub hosting the tier (`_state_tier_sub`);
+        False if none does."""
+        c = self._state_tier_sub()
+        if c is None:
+            return False
+        return bool(c.enqueue_state_touches(hashes))
+
+    def take_state_touch_verdicts(self) -> dict:
+        """`{hash: resident}` from the tier sub; empty if none."""
+        c = self._state_tier_sub()
+        if c is None:
+            return {}
+        return c.take_state_touch_verdicts()
 
     def take_state_reports(self):
         """`(indexed, failed)` from the tier sub, else two empty sets.

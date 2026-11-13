@@ -132,9 +132,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_OTEL_TRACE": lambda: os.getenv("ATOM_ENABLE_OTEL_TRACE", "0").lower()
     in {"1", "true"},
     "ATOM_TRACE_VERSION": lambda: os.getenv("ATOM_TRACE_VERSION", "unknown"),
-    # Forward metadata transport: direct or packed. Both keep source checks.
-    # Single-member groups and strided bindings retain direct copies.
-    "ATOM_H2D_BACKEND": lambda: os.getenv("ATOM_H2D_BACKEND", "packed"),
     # Opt-in single-HCA engine pool: "auto" or explicit comma-separated HCAs.
     "ATOM_MOONCAKE_MATCHED_RAILS": lambda: os.getenv("ATOM_MOONCAKE_MATCHED_RAILS", ""),
     # Prefill (`kv_producer`, plain `mooncake`) only: gather the MLA tokens a
@@ -321,8 +318,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_TRITON_MOE": lambda: os.getenv("ATOM_USE_TRITON_MOE", "0") == "1",
     # Qwen3.8-Flash-Next eager prefill on SGLang-ATOM: run QSA sparse attention
     # with aiter's FlyDSL kernel (gfx942, BF16 D256, one KV head per rank)
-    # instead of qsa_sparse_paged_gqa. Other steps keep the native kernel.
-    "ATOM_QSA_FLYDSL_ATTN": lambda: os.getenv("ATOM_QSA_FLYDSL_ATTN", "0") == "1",
+    # instead of qsa_sparse_paged_gqa. Other steps keep the native kernel. On by
+    # default; 0 / false / off disables. Needs aiter with ROCm/aiter#6576.
+    "ATOM_QSA_FLYDSL_ATTN": lambda: _flag_env("ATOM_QSA_FLYDSL_ATTN", "1"),
     # Split the routed experts by phase: FlyDSL fused_moe on prefill, the Triton
     # /gluon GUGU kernel on decode. Needs ATOM_USE_TRITON_MOE=1 (it narrows that
     # flag, it cannot enable Triton on its own) plus gfx1250 + ATOM_MOE_GU_ITLV=1
@@ -422,6 +420,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FUSED_COMPRESS_USE_FLYDSL": lambda: os.getenv(
         "ATOM_FUSED_COMPRESS_USE_FLYDSL", "auto"
     ).lower(),
+    # DeepSeek-V4/V4.1 FP4 scorer and matching Q/K layout, fixed before capture.
+    "ATOM_V4_UNIFIED_MQA": lambda: os.getenv("ATOM_V4_UNIFIED_MQA", "opus").lower(),
     # gather_kv_b_proj (the MLA cached-prefix expansion): swap the Triton op for
     # the flydsl a8w8 gather-GEMM. Added 2026-09-09.
     "ATOM_USE_FLYDSL_GATHER_KV_B_PROJ": lambda: (
@@ -611,14 +611,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # leaves the fused indexer running exactly as it does with CP off.
     "ATOM_GLM52_INDEXER_CP": lambda: os.getenv("ATOM_GLM52_INDEXER_CP", "0") == "1",
     # Debug: run each mono layer next to the original one and log the difference
-    # (atom/models/minimax_m3/mono/check.py). Use with --enforce-eager.
+    # (atom/models/minimax_m3/mono/check.py; the gfx1250 V4.1 step: the launch
+    # beside the production forward, mono/gfx1250/debug.py). Use with --enforce-eager.
     "ATOM_MONO_CHECK": lambda: os.getenv("ATOM_MONO_CHECK", "0") == "1",
     # Debug: append every mono step's input tokens, positions and top-2 logits to
     # this file (rank 0; check.trace_logits). Use with --enforce-eager.
     "ATOM_MONO_TRACE": lambda: os.getenv("ATOM_MONO_TRACE"),
     # Debug: the mono layer kernels' per-phase stamps, a few steps per decode
-    # token count saved under this path prefix (mono/timeline.py). Use with
-    # --enforce-eager.
+    # token count saved under this path prefix (mono/timeline.py; the gfx1250
+    # V4.1 step: where its time goes, averaged every 64 steps, logged and
+    # appended to <prefix>_r<rank>.jsonl). Use with --enforce-eager.
     "ATOM_MONO_TIMELINE": lambda: os.getenv("ATOM_MONO_TIMELINE"),
     # Debug: the mono kernels bound every mailbox wait (10 s): a wait that gives up
     # records its region, pair and tags, and the runner raises with them at the end
@@ -632,6 +634,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # periods and the noise floor under them are in the environment doc, and
     # end-to-end throughput is too coarse to see an effect that size.
     "ATOM_DSV41_SIDE_STREAMS": lambda: int(os.getenv("ATOM_DSV41_SIDE_STREAMS", "0")),
+    # DeepSeek-V4.1 mono decode's high-interactivity (hi) monokernels (the
+    # `mono/hi` package, imported only with this on): on the decode steps it
+    # serves, every decoder layer, the verify head, the DSpark draft and the
+    # round's glue run the hi programs (atom/models/deepseek_v41/mono/hi_*.py).
+    # "auto" (default): on for the deployment they serve (MI355X, TP4, BF16 KV,
+    # DSpark, ...: `mono/hi_gate.py`), any other keeps ATOM's mono path; "1":
+    # on, or an error naming why not; "0": off.
+    "ATOM_DSV41_MONO_HI": lambda: os.getenv("ATOM_DSV41_MONO_HI", "auto"),
     # Token-bucket TR graphs for prefill (`atom/utils/region_graph.py`): the
     # comma-separated token counts to record. A prefill longer than the largest
     # runs eagerly; empty records none. The default tops out at 3072 because
@@ -697,7 +707,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # DSpark block sampling: replace the Markov head's
     #   bias = W1[x] @ W2.float().t() ; argmax(base_logits + bias)
-    # with one fused Triton kernel (atom/model_ops/dspark_markov_sample.py).
+    # with one fused Triton kernel (atom/model_ops/dspark_markov_argmax.py).
     # The unfused spelling casts the whole [V, r] W2 table to fp32 INSIDE the
     # T-iteration loop (~252MB of traffic per iteration for a table that never
     # changes) and materializes two [B, V] fp32 tensors per iteration (42MB
@@ -720,9 +730,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # regression is suspected -- the fastest way to rule this kernel in or out,
     # since the two paths are not bit-identical by construction. Read once when
     # the Markov head is built, so it must be set before the server starts.
+    # Once ATOM_SPEC_LOSSLESS_SAMPLING arms, Kimi-K3 honours this only on steps
+    # that replay the greedy block (no row draws q).
     "ATOM_DSPARK_FUSED_MARKOV_SAMPLE": lambda: (
         os.getenv("ATOM_DSPARK_FUSED_MARKOV_SAMPLE", "1") == "1"
     ),
+    # Lossless speculative sampling: the DSpark draft samples its block from q
+    # and the verify accepts by the probability ratio (u * q < p). Off by
+    # default; needs an aiter with ROCm/aiter#6954 under TP; where it arms,
+    # ATOM_ENABLE_RELAXED_MTP is refused. See docs/model_ops_guide.md.
+    "ATOM_SPEC_LOSSLESS_SAMPLING": lambda: _flag_env("ATOM_SPEC_LOSSLESS_SAMPLING"),
     # DSpark probabilistic drafting (atom/model_ops/dspark_prob_sample.py):
     # sample the block from q = softmax(z / T) instead of its argmax and verify
     # with the p/q ratio test (lossless). Off by default; read when the drafter
@@ -993,9 +1010,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Qwen3.8-Flash-Next under TP: forwards with at least this many tokens
     # (eager prefill) keep the hyper-connection residual streams token-sharded
     # across the TP ranks (reduce-scatter + all-gather instead of all-reduce),
-    # so the replicated HC norm/GEMM work is split TP ways. 0 disables.
-    "ATOM_QWEN4_EXP_SP_MIN_TOKENS": lambda: int(
-        os.getenv("ATOM_QWEN4_EXP_SP_MIN_TOKENS", "1024")
+    # so the replicated HC norm/GEMM work is split TP ways. The target model
+    # additionally never shards forwards of at most HC_QUANT_ROWS_MAX (1024)
+    # tokens, so they keep the fused HC FP8 quant; the MTP drafter (no fused
+    # quant) follows this value alone. 0 disables.
+    "ATOM_QWEN4_EXP_SP_MIN_TOKENS": lambda: _nonnegative_int_env(
+        "ATOM_QWEN4_EXP_SP_MIN_TOKENS", 1024
     ),
     # Use gluon pa decode for some models
     "ATOM_USE_GLUON_PA_DECODE": lambda: (
@@ -1077,9 +1097,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # keep that expert placement for the rest of the process. Rebalances the
     # balancedness gate skips do not count. 0 (default) = no limit.
     "ATOM_EPLB_MAX_REBALANCES": lambda: _int_env("ATOM_EPLB_MAX_REBALANCES", 0),
+    # --- Structured output ---
+    # Hold tool calls to the declared schemas when the tool parser declares a
+    # grammar for them (Kimi-K3) and the structured-output extra is installed.
+    "ATOM_TOOL_CALL_GRAMMAR": lambda: (
+        os.getenv("ATOM_TOOL_CALL_GRAMMAR", "0").lower() == "1"
+    ),
     # --- MTP (relaxed mtp for quantized mtp) ---
     "ATOM_ENABLE_RELAXED_MTP": lambda: (
         os.getenv("ATOM_ENABLE_RELAXED_MTP", "0").lower() == "1"
+    ),
+    # --- API image input ---
+    # Let image URLs in API requests reach any address, through the system
+    # proxy if one is set. By default they must resolve to public addresses.
+    "ATOM_IMAGE_URL_ALLOW_PRIVATE": lambda: (
+        os.getenv("ATOM_IMAGE_URL_ALLOW_PRIVATE", "0").lower() == "1"
     ),
     # --- Atomesh ---
     # Build atomesh when installing ATOM from source.
@@ -1260,12 +1292,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # claims. "0" walks block by block with a token compare per block.
     "ATOM_PREFIX_FAST_WALK": lambda: os.getenv("ATOM_PREFIX_FAST_WALK", "1") == "1",
     # --- TBO prefill ubatch splitting ---
-    # Split prefill ubatches at the exact token midpoint (vLLM-DBO style),
-    # cutting through a request if needed for perfectly balanced 50/50 ubatches.
-    # Default on; set "0" to fall back to the request-boundary balanced split.
-    "ATOM_TBO_PREFILL_TOKEN_SPLIT": lambda: (
-        os.getenv("ATOM_TBO_PREFILL_TOKEN_SPLIT", "1") == "1"
-    ),
     # Minimum prefill tokens (per rank) required to TBO-split.
     "ATOM_TBO_PREFILL_MIN_TOKENS": lambda: int(
         os.getenv("ATOM_TBO_PREFILL_MIN_TOKENS", "8192")
@@ -1311,6 +1337,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # to 0 to fall back. Anything that would make it unsafe -- no CUDA, more TP
     # ranks than hash heads, a registration that will not fit -- falls back on
     # its own, so the switch is for taking the host path deliberately.
+    # Also governs the Qwen3.8 PLE n-gram table (~95 GiB): page-locked on the
+    # host and read over UVA by default on gfx950 / gfx942, in HBM elsewhere,
+    # for a dummy load, under the SGLang / RTP-LLM plugins and with 0, except
+    # where Qwen Mono serves the deployment (`atom/models/qwen38/mono/ple.py`),
+    # which ignores it.
     "ATOM_ENGRAM_UVA": lambda: os.getenv("ATOM_ENGRAM_UVA", "1") == "1",
     # How the UVA path page-locks a shard (`engram.host_memory`): 1 copies it
     # into page-locked memory of exactly its size (hipHostMalloc on base pages,

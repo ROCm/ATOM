@@ -28,10 +28,57 @@ The heads after the backbone are the same in every flavor, so they live here
 too: ``DSparkMarkovHead``, ``DSparkConfidenceHead`` and ``linear_out``.
 """
 
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
 import torch
 from torch import nn
 
 from atom.utils import envs
+
+if TYPE_CHECKING:
+    from atom.model_ops.spec_sampling.sparse_q_store import SparseQStore
+
+
+@dataclass(frozen=True)
+class DraftSampling:
+    """Everything the block sampler needs to draw -- and publish -- a real q.
+
+    Built once, when the runner has allocated the target's own sampling
+    inputs (`DSparkLossless.bind_target`), before any warmup or capture: the block head is cudagraph-captured
+    (``DSparkProposer._declare_draft_graphs``, ``capture_epilogue=True``), so
+    every address here is baked into the recording. That is also why the
+    per-step seed and row bases are device tensors rather than python ints:
+    their values are refreshed outside it.
+
+    The per-row tensors are sized at ``max_num_seqs``; the block runs at
+    ``running_bs <= max_num_seqs`` and slices.
+    """
+
+    #: [slots * T, K] -- q, the distribution each draft token was drawn from
+    #: (its top K entries; see `SparseQStore`), one block of T rows per live
+    #: request. Read a step later by the accept kernel, so it outlives the pass
+    #: and cannot live in the graph's private pool.
+    q_store: "SparseQStore"
+    #: [max_bs] int32, the first ``q_store`` row each batch row writes; block
+    #: position k goes to row ``base + k``. Negative writes nothing.
+    q_row_base: torch.Tensor
+    #: [1] int32, the Philox key. Must hold the same value on every TP rank.
+    seed: torch.Tensor
+    #: Preallocated scores and partials for the sampled op
+    #: (`dspark_markov_sample_scratch`), so the draft step allocates nothing and
+    #: the profiling run sees it.
+    scratch: torch.Tensor
+    #: The target's own per-row sampling inputs (`ModelRunner.forward_vars`),
+    #: so draft and target cannot disagree on them. [max_bs] fp32 temperatures,
+    #: clamped to ``SAMPLER_EPS``, where a row at ``SAMPLER_EPS`` is greedy
+    #: (`Sampler`'s predicate) and drafts its argmax.
+    temperatures: torch.Tensor
+    #: [max_bs] int32, the request's top-k the draft samples within; -1 is off.
+    top_k: torch.Tensor
+    #: [max_bs] fp32, the request's top-p, over the unfiltered q and
+    #: intersected with top-k (aiter's rule); 1.0 is off.
+    top_p: torch.Tensor
 
 
 def linear_out(output):
@@ -107,7 +154,7 @@ class DSparkMarkovHead(nn.Module):
         if self.fused_sample:
             # Imported here, not at module scope: the op imports Triton and
             # AITER, and this module stays importable without them.
-            from atom.model_ops.dspark_markov_sample import dspark_markov_argmax
+            from atom.model_ops.dspark_markov_argmax import dspark_markov_argmax
 
             return dspark_markov_argmax(
                 base_logits,
@@ -121,6 +168,69 @@ class DSparkMarkovHead(nn.Module):
         # .float() would only materialize it twice for the same sum.
         out.copy_((base_logits + bias).argmax(dim=-1))
         return markov_embed
+
+    def sample_block(
+        self,
+        base_logits: torch.Tensor,  # [B, T, V]
+        anchor_ids: torch.Tensor,  # [B]
+        sampling: "DraftSampling | None",
+    ) -> torch.Tensor:
+        """The block, left to right, each position from ``x_{k-1}`` into its
+        own column of one ``[B, T + 1]`` block whose first column is the
+        anchor; returns the drafts ``[B, T]``:
+
+            logits_k <- U_k + B(x_{k-1}, .)
+            x_k      <- argmax(logits_k)                      (``sampling`` None)
+            x_k      <- drawn from the top of softmax(logits_k / T),
+                        that q stored at q_store[base + k]     (lossless)
+
+        Kimi-K3's loop: one for greedy and lossless, so the column convention
+        and the noise counters cannot drift apart. V4, V4.1 and MiniMax-M3.1
+        keep their own greedy loops, because their confidence head reads each
+        position's ``W1[x_{k-1}]``, which the sampled op does not produce.
+        Lossless, each row writes its q
+        straight into the row block its request owns (``sampling.q_row_base``),
+        which the accept kernel reads a step later. The branch on
+        ``sampling`` is python, so a recording holds one side; an armed
+        drafter records both (`DSparkProposer.block_greedy`).
+        """
+        bs, num_draft, vocab = base_logits.shape
+        if sampling is not None:
+            # Imported here for the reason `sample_next` gives.
+            from atom.model_ops.spec_sampling.dspark_markov_sample import (
+                dspark_markov_sample,
+            )
+
+            # The noise counter stride is the buffer's max batch, not this
+            # step's, so the uniform a (position, row, id) draws does not move
+            # with the batch, and no two positions of one block share one.
+            position_stride = sampling.q_row_base.shape[0] * vocab
+        out_ids = anchor_ids.new_empty(bs, num_draft + 1)
+        out_ids[:, 0] = anchor_ids
+        for k in range(num_draft):
+            if sampling is None:
+                # Greedy: temperature/sampling is applied by the target's
+                # verify. The column is the op's destination, so no id is
+                # written twice.
+                self.sample_next(out_ids[:, k], base_logits[:, k], out_ids[:, k + 1])
+                continue
+            dspark_markov_sample(
+                base_logits[:, k],
+                out_ids[:, k],
+                self.markov_w1.weight,
+                self.markov_w2.weight,
+                out_ids[:, k + 1],
+                *sampling.q_store,
+                sampling.q_row_base[:bs],
+                k,
+                sampling.temperatures[:bs],
+                sampling.top_k[:bs],
+                sampling.top_p[:bs],
+                sampling.seed,
+                k * position_stride,
+                sampling.scratch,
+            )
+        return out_ids[:, 1:]
 
 
 class DSparkConfidenceHead(nn.Module):
@@ -185,6 +295,19 @@ class DSparkDraftModel(nn.Module):
     # the proposer plans. A draft that attends its block another way (MiniMax-
     # M3.1's per-row MHA decode) builds what it reads in `prepare_paged_block`.
     block_attention_is_mla = True
+
+    #: Does this flavor's block sampler hand ``draft_sampling`` to
+    #: ``DSparkMarkovHead.sample_block``, so it draws from, and publishes, a
+    #: real q? A class flag, not a probe: every flavor's head has the method.
+    #: ``DSparkProposer`` binds sampling buffers only where it is set.
+    supports_lossless_draft = False
+
+    #: The buffers the block sampler draws into, set once lossless speculative
+    #: sampling arms (`DSparkLossless.bind_target`), before any warmup or
+    #: capture; None keeps the greedy block sampler, as does
+    #: ``head_and_sample(..., greedy=True)`` whatever is set. The branch is
+    #: python, so a captured graph holds whichever side it was recorded with.
+    draft_sampling: "DraftSampling | None" = None
 
     def prepare_block(self, metadata_builder, num_draft, scheduled_bs, running_bs):
         """Mask padded writes for models whose draft pass mutates private KV."""
@@ -294,10 +417,14 @@ class DSparkDraftModel(nn.Module):
         """
         raise NotImplementedError
 
-    def head_and_sample(self, out, anchor_ids: torch.Tensor, num_draft: int):
+    def head_and_sample(
+        self, out, anchor_ids: torch.Tensor, num_draft: int, *, greedy: bool = False
+    ):
         """The sequential half: LM head, then Markov sampling over the block.
 
         ``out`` is what ``block_backbone`` returned; ``anchor_ids`` is the one
-        argument whose shape says how many requests there are.
+        argument whose shape says how many requests there are. ``greedy``
+        takes the greedy sampler whatever ``draft_sampling`` holds; only a
+        flavor with ``supports_lossless_draft`` is asked for it.
         """
         raise NotImplementedError

@@ -25,6 +25,7 @@ from aiter.dist.parallel_state import (
 )
 
 from atom.distributed.ulysses_sp import sp_is_enabled
+from atom.utils.tbo.ubatch_splitting import UBatchSlice
 
 
 class PcpBalGroup(NamedTuple):
@@ -34,7 +35,7 @@ class PcpBalGroup(NamedTuple):
     inside a sequence); each group is processed as an independent non-TBO PCP
     mini-batch (padded to a pcp multiple, round-robin striped, reindexed on its
     own). Consumed by ModelRunner.run_model (per-group stripe / restore) and the
-    attn builder's `_build_ubatch_prefill_metadata_balanced` (slice + reindex).
+    attn builder's `_finish_pcp_group` (slice + reindex).
     """
 
     req_start: int  # first request index of this group (inclusive)
@@ -86,6 +87,43 @@ def pcp_pad_len(
     if rem == 0:
         return total_tokens
     return total_tokens + (divisor - rem)
+
+
+def cut_pcp_prefill_ubatches(
+    num_scheduled_tokens: np.ndarray, num_reqs: int, pcp_size: int
+) -> tuple[tuple[UBatchSlice, ...], tuple[PcpBalGroup, ...]]:
+    """A PCP prefill's two TBO micro-batches, split at a request boundary
+    near the token midpoint.
+
+    Each group is an independent "non-TBO PCP mini-batch": padded to a pcp
+    multiple and round-robin striped as a whole, so every sequence stays intact
+    in one group. The slices' tokens are in the LOCAL concat space
+    [g0_local | g1_local] the runner's per-group stripe produces; the groups
+    carry the global token ranges the attention builder slices and reindexes.
+    """
+    per_req = np.asarray(num_scheduled_tokens[:num_reqs], dtype=np.int64)
+    total_tok = int(per_req.sum())
+    cum = np.cumsum(per_req)
+    # The request boundary whose cumulative token count is closest to half.
+    split_idx = int(np.searchsorted(cum, total_tok // 2, side="left")) + 1
+    split_idx = max(1, min(split_idx, num_reqs - 1))
+    b0 = int(cum[split_idx - 1])
+    h0 = pcp_pad_len(b0, pcp_size)
+    h1 = pcp_pad_len(total_tok - b0, pcp_size)
+    l0 = h0 // pcp_size
+    l1 = h1 // pcp_size
+    slices = (
+        UBatchSlice(request_slice=slice(0, split_idx), token_slice=slice(0, l0)),
+        UBatchSlice(
+            request_slice=slice(split_idx, num_reqs),
+            token_slice=slice(l0, l0 + l1),
+        ),
+    )
+    groups = (
+        PcpBalGroup(0, split_idx, 0, b0, h0),
+        PcpBalGroup(split_idx, num_reqs, b0, total_tok, h1),
+    )
+    return slices, groups
 
 
 def pcp_round_robin_split(

@@ -1076,7 +1076,11 @@ jobs:
               set -euo pipefail
               python3 - <<'"'"'PY'"'"'
           import os
+          import sys
           from pathlib import Path
+
+          sys.path.insert(0, "/workspace/.github/scripts")
+          from check_model_dir import incomplete_reason
 
           model_path = os.environ["MODEL_PATH"].strip().strip("/")
           normalized = model_path.rstrip("/")
@@ -1183,8 +1187,11 @@ jobs:
               seen.add(candidate)
               path = Path(candidate)
               if (path / "config.json").is_file():
-                  print(f"FOUND_LOCAL_MODEL={candidate}")
-                  raise SystemExit(0)
+                  reason = incomplete_reason(path)
+                  if reason is None:
+                      print(f"FOUND_LOCAL_MODEL={candidate}")
+                      raise SystemExit(0)
+                  print(f"Skipping incomplete local model {candidate}: {reason}")
 
           print("LOCAL_MODEL_NOT_FOUND")
           print("Checked candidates:")
@@ -1235,19 +1242,29 @@ jobs:
                   use_model_lock="false"
                 fi
 
+                model_dir_is_complete() {
+                  python3 /workspace/.github/scripts/check_model_dir.py "$MODEL_DIR"
+                }
+
                 download_model() {
                   if [ -f "$MODEL_DIR/config.json" ]; then
-                    echo "Model directory exists without a completion marker under ${MODEL_DIR}; validating download"
+                    echo "Model directory exists without a complete download under ${MODEL_DIR}; resuming download"
                   else
                     echo "Model not found under ${MODEL_DIR}; downloading model"
                   fi
 
                   rm -f "$completion_flag"
                   hf download "$MODEL_PATH" --local-dir "$MODEL_DIR"
+                  # Mark first so the check validates the downloaded shards rather
+                  # than the unmarked-directory heuristics; unmark if it fails.
                   touch "$completion_flag"
+                  if ! model_dir_is_complete; then
+                    rm -f "$completion_flag"
+                    exit 1
+                  fi
                 }
 
-                if [ -f "$completion_flag" ]; then
+                if [ -f "$completion_flag" ] && model_dir_is_complete; then
                   echo "Model already exists under ${MODEL_DIR}; skip download"
                 elif [ "$use_model_lock" != "true" ]; then
                   echo "Baremetal runner ${RUNNER_NAME} detected; skipping shared model download lock"
@@ -1263,7 +1280,7 @@ jobs:
                     exit 1
                   fi
 
-                  if [ -f "$completion_flag" ]; then
+                  if [ -f "$completion_flag" ] && model_dir_is_complete; then
                     echo "Model became available under ${MODEL_DIR} while waiting for the lock; skip download"
                   else
                     download_model

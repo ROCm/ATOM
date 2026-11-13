@@ -26,7 +26,11 @@ def make_runner(monkeypatch, *, pp_size=1, base=None):
     runner = ModelRunner.__new__(ModelRunner)
     runner.device = torch.device("cuda", 0)
     runner.config = SimpleNamespace(
-        pipeline_parallel_size=pp_size, enable_tbo=True, enable_tbo_decode=True
+        pipeline_parallel_size=pp_size,
+        enable_tbo=True,
+        enable_tbo_decode=True,
+        prefill_context_parallel_size=1,
+        max_num_seqs=4,
     )
     monkeypatch.setattr(atom.config, "_current_atom_config", runner.config)
     runner.enforce_eager = True
@@ -36,11 +40,18 @@ def make_runner(monkeypatch, *, pp_size=1, base=None):
     for name, capacity, dtype, group in (
         ("input_ids", 32, torch.int32, None),
         ("decode_src", 32, torch.int32, None),
+        ("batch_info", 32, torch.int32, None),
         ("positions", 32, torch.int64, "positions"),
         ("context_lens", 4, torch.int32, "context"),
         ("cu_seqlens_q", 5, torch.int32, "early"),
         ("cu_seqlens_k", 5, torch.int32, "cu_k"),
-        ("batch_id_per_q_token", 32, torch.int32, None),
+        ("batch_id_per_q_token", 32, torch.int32, "early"),
+        ("slot_mapping", 32, torch.int64, "prefill"),
+        ("num_cached_tokens", 4, torch.int32, "prefill"),
+        ("seq_starts", 4, torch.int32, "prefill"),
+        # A decode TBO runner's (`prepare_query_metadata`).
+        ("ubatch_token_order", 32, torch.int64, "early"),
+        ("ubatch_scheduled_tokens", 2, torch.int32, "early"),
     ):
         runner.forward_vars[name] = CpuGpuBuffer(
             capacity, dtype=dtype, device=runner.device, publication_group=group
@@ -60,14 +71,19 @@ def make_runner(monkeypatch, *, pp_size=1, base=None):
     builder.max_committed_hca = 4
     builder.block_table_cols = 4
     builder.max_spec_steps = 2
+    builder.max_model_len_idx = 8
+    # The fp8 decode kernel's split plan and the indexer's decode rows are
+    # not under test here.
+    builder._decode_split_plan = lambda rows, kv_len: None
+    builder._index_rows = lambda *args, **kwargs: None
     builder._unique_compress_ratios_overlap = [(4, True)]
     builder._indexer_fp4 = False
+    builder.csa_layers = [0]
     builder.indexer_layout = "fp8"
     builder._indexer_qsplit_world = 1
     builder.pool_geometry = SimpleNamespace(slot_positions=4)
     builder._alloc_v4_metadata_buffers()
     runner.attn_metadata_builder = builder
-    monkeypatch.setenv("ATOM_H2D_BACKEND", "direct")
     runner._init_forward_vars_ring()
     runner._init_h2d_publication()
     return runner, builder
@@ -76,7 +92,6 @@ def make_runner(monkeypatch, *, pp_size=1, base=None):
 def make_metadata(builder, lengths=(3, 5, 3), starts=(8, 16, 0), *, stage_map=True):
     from atom.model_ops.attentions.deepseek_v4_attn import AttentionMetaData_DSV4
     from atom.utils.forward_context import AttentionMetaData, AttnState
-    from atom.utils.tbo.ubatch_splitting import attach_tbo_cpu_lens
 
     lengths = np.asarray(lengths, dtype=np.int32)
     starts = np.asarray(starts, dtype=np.int32)
@@ -107,35 +122,52 @@ def make_metadata(builder, lengths=(3, 5, 3), starts=(8, 16, 0), *, stage_map=Tr
     md.state_slot_out = slots
     md.state_slot_in = slots
     md.state_slot_out_cpu = np.arange(len(lengths), dtype=np.int32)
+    md.n_committed_csa_per_seq_cpu = (starts + lengths) // 4
     if stage_map:
         builder._attach_v4_per_fwd_meta(
             md,
-            np.repeat(np.arange(len(lengths), dtype=np.int32), lengths),
+            builder._stage(
+                "batch_id_per_q_token",
+                np.repeat(np.arange(len(lengths), dtype=np.int32), lengths),
+            ),
             md.state_slot_out_cpu,
             len(lengths),
             len(positions),
             running_tokens=len(positions),
         )
-    for name, value in (
-        ("cu_seqlens_q", cu),
-        ("cu_seqlens_k", cu),
-        ("context_lens", starts + lengths),
-    ):
-        attach_tbo_cpu_lens(md, name, value.copy())
     return md, pos_gpu, cu, lengths
 
 
+def prefill_batch(builder, bs, **fields):
+    """The ``bs``-request prefill batch `make_metadata` staged the step of."""
+    var = builder.model_runner.forward_vars
+    return SimpleNamespace(
+        total_seqs_num_prefill=bs,
+        context_lens=var["context_lens"].np[:bs].copy(),
+        num_scheduled_tokens=np.diff(var["cu_seqlens_q"].np[: bs + 1]),
+        block_tables=[],
+        is_dummy_run=False,
+        **fields,
+    )
+
+
+def split_prefill(builder, md, slices, pcp_groups=None):
+    """`prepare_prefill`'s micro-batch half over the step ``md``: stage, the
+    one upload, finish. Returns the micro-batches' metadata."""
+    batch = prefill_batch(builder, len(md.state_slot_out_cpu))
+    ubatches = builder._prefill_ubatches(batch, slices, pcp_groups)
+    for group in builder.stage_ubatch_prefill(batch, md, ubatches, pcp_groups):
+        group.publish()
+    builder.finish_ubatch_prefill(batch, md, ubatches, pcp_groups)
+    return md.ubatches
+
+
 def set_pcp(monkeypatch, size, rank):
-    from atom.distributed.pcp_utils import pcp_round_robin_query_indices
     from atom.model_ops.attentions import deepseek_v4_attn as module
 
     monkeypatch.setattr(module, "pcp_is_enabled", lambda: True)
     monkeypatch.setattr(module, "get_pcp_world_size", lambda: size)
-    monkeypatch.setattr(
-        module,
-        "pcp_round_robin_query_indices",
-        lambda total, width: pcp_round_robin_query_indices(total, width, rank),
-    )
+    monkeypatch.setattr(module, "get_pcp_rank", lambda: rank)
 
 
 @pytest.mark.parametrize("pp_size", [1, 2])
@@ -155,7 +187,7 @@ def test_pcp_ragged_queries_publish_indexer_once(monkeypatch, pp_size, rank):
         buf = runner.forward_vars["v4_indexer_cu_committed"]
         buf.gpu.fill_(77)
         torch.cuda._sleep(5_000_000)
-        local = builder._apply_pcp_reindex(md, positions, 3, 11, cu)
+        local = builder._apply_pcp_reindex(md, positions, 3, 3, 11, cu)
         expected_cu = np.r_[0, np.cumsum(md.n_committed_csa_per_seq_cpu)].astype(
             np.int32
         )
@@ -171,7 +203,7 @@ def test_pcp_ragged_queries_publish_indexer_once(monkeypatch, pp_size, rank):
         )
         before = buf.cpu.clone()
         with pytest.raises(PublicationError, match="republish_reason"):
-            builder._build_v4_prefill_index_rows(md, local, 3, 3, None, "")
+            builder._stage_prefill_index_keys(md.n_committed_csa_per_seq_cpu, 3)
         assert torch.equal(buf.cpu, before)
         runner._mark_staging_h2d_enqueued()
         runner._record_forward_vars_event()
@@ -192,20 +224,22 @@ def test_prepare_prefill_defers_indexer_only_for_real_pcp(monkeypatch, balanced,
 
     runner, builder = make_runner(monkeypatch)
     set_pcp(monkeypatch, 4, 0)
-    runner._pcp_tbo_balanced_active = balanced
     runner._gate_staging_reuse()
     md, pos, _, _ = make_metadata(builder, stage_map=False)
+    # What `stage_ubatch_prefill` leaves on a PCP prefill cut into groups.
+    md.pcp_groups = (SimpleNamespace(),) * 2 if balanced else None
     monkeypatch.setattr(
-        CommonAttentionBuilder, "prepare_prefill", lambda *args: (md, pos)
+        CommonAttentionBuilder, "stage_prefill", lambda *args: (md, pos)
     )
-    batch = SimpleNamespace(
-        total_seqs_num_prefill=3,
+    batch = prefill_batch(
+        builder,
+        3,
         total_tokens_num_prefill=11,
-        is_dummy_run=dummy,
         state_slots_committed=[],
         state_fork_srcs=None,
     )
-    actual, _ = builder.prepare_prefill(batch, 3, batch.total_tokens_num)
+    batch.is_dummy_run = dummy
+    actual, _ = builder.prepare_prefill(batch, 3, batch.total_tokens_num_prefill)
     binding = runner.forward_vars["v4_indexer_cu_committed"]._publication
     assert (binding._epoch == runner.h2d_owner.epoch) == (dummy or not balanced)
     assert len(actual.batch_id_per_q_token) == (11 if dummy or balanced else 3)
@@ -213,35 +247,28 @@ def test_prepare_prefill_defers_indexer_only_for_real_pcp(monkeypatch, balanced,
 
 
 @pytest.mark.parametrize("pp_size", [1, 2])
-def test_token_split_tbo_resumes_epoch_and_preserves_both_prefixes(
+def test_token_split_tbo_publishes_with_the_step_and_preserves_both_prefixes(
     monkeypatch, pp_size
 ):
     from atom.utils.tbo.ubatch_splitting import UBatchSlice
 
     runner, builder = make_runner(monkeypatch, pp_size=pp_size)
     saved = []
+    slices = (
+        UBatchSlice(slice(0, 1), slice(0, 4)),
+        UBatchSlice(slice(0, 2), slice(4, 9)),
+    )
     for step in range(5):
         runner._advance_forward_vars()
         runner._gate_staging_reuse()
         md, _, _, _ = make_metadata(builder, (5, 4), (8 + 4 * step, 20))
-        runner._mark_staging_h2d_enqueued()
         epoch = runner.h2d_owner.epoch
-        ubatches = []
-        for index, sl in enumerate(
-            (
-                UBatchSlice(slice(0, 1), slice(0, 4)),
-                UBatchSlice(slice(0, 2), slice(4, 9)),
-            )
-        ):
-            torch.cuda._sleep(5_000_000)
-            ub = builder.build_ubatch_prefill_metadata(
-                md, sl, sl.request_slice.stop, index
-            )
-            assert runner.h2d_owner.epoch == epoch
-            assert runner.h2d_owner._state == "sealed"
+        torch.cuda._sleep(5_000_000)
+        ubatches = split_prefill(builder, md, slices)
+        assert runner.h2d_owner.epoch == epoch
+        for index, ub in enumerate(ubatches):
             buf = runner.forward_vars[f"ub{index}_cu_seqlens_q"]
             assert ub.cu_seqlens_q.data_ptr() == buf.gpu.data_ptr()
-            ubatches.append(ub)
         # Read after BOTH preparations. A snapshot taken before the second
         # producer could conceal a shared-storage overwrite.
         for index, ub in enumerate(ubatches):
@@ -263,13 +290,13 @@ def test_token_split_tbo_resumes_epoch_and_preserves_both_prefixes(
                     step,
                 )
             )
-        before = runner.forward_vars["ub0_context_lens"].cpu.clone()
+        before = runner.forward_vars["ub0_cu_seqlens_q"].cpu.clone()
+        batch = prefill_batch(builder, 2)
+        ubatches = builder._prefill_ubatches(batch, slices, None)
         with pytest.raises(PublicationError, match="republish_reason"):
-            builder.build_ubatch_prefill_metadata(
-                md, UBatchSlice(slice(0, 1), slice(0, 4)), 1, 0
-            )
-        assert runner.h2d_owner._state == "sealed"
-        assert torch.equal(runner.forward_vars["ub0_context_lens"].cpu, before)
+            builder.stage_ubatch_prefill(batch, md, ubatches, None)
+        assert torch.equal(runner.forward_vars["ub0_cu_seqlens_q"].cpu, before)
+        runner._mark_staging_h2d_enqueued()
         runner._record_forward_vars_event()
     torch.cuda.synchronize()
     for index, query, committed, step in saved:
@@ -279,22 +306,44 @@ def test_token_split_tbo_resumes_epoch_and_preserves_both_prefixes(
         )
 
 
+def test_tbo_prefill_state_slots_span_the_micro_batch_running_bs(monkeypatch):
+    """A micro-batch's state slots run out to its `running_bs`, as its query
+    prefix does: one with fewer requests (an idle rank's, none) still hands
+    `swa_write` a slot for every request its prefix describes."""
+    from atom.utils.tbo.ubatch_splitting import UBatchSlice
+
+    runner, builder = make_runner(monkeypatch)
+    runner._advance_forward_vars()
+    runner._gate_staging_reuse()
+    md, _, _, _ = make_metadata(builder, (5, 4), (8, 20))
+    [ub] = split_prefill(
+        builder, md, (UBatchSlice(slice(0, 1), slice(0, 4), running_bs=2),)
+    )
+    runner._mark_staging_h2d_enqueued()
+    assert ub.cu_seqlens_q.shape[0] == 3
+    assert ub.state_slot_out.shape[0] == ub.state_slot_in.shape[0] == 2
+    torch.cuda.synchronize()
+
+
 @pytest.mark.parametrize("rank", [0, 3])
 def test_balanced_pcp_tbo_uses_separate_indexer_buffers(monkeypatch, rank):
+    from atom.utils.tbo.ubatch_splitting import UBatchSlice
+
     runner, builder = make_runner(monkeypatch)
     set_pcp(monkeypatch, 4, rank)
-    runner._pcp_tbo_balanced_active = True
-    runner._pcp_bal_groups = [
+    groups = (
         SimpleNamespace(req_start=0, req_stop=2, tok_start=0, tok_end=8),
         SimpleNamespace(req_start=2, req_stop=4, tok_start=8, tok_end=15),
-    ]
+    )
+    slices = tuple(
+        UBatchSlice(slice(g.req_start, g.req_stop), slice(g.tok_start, g.tok_end))
+        for g in groups
+    )
     runner._gate_staging_reuse()
     md, _, _, _ = make_metadata(builder, (3, 5, 3, 4), (8, 16, 28, 40))
+    torch.cuda._sleep(5_000_000)
+    ubatches = split_prefill(builder, md, slices, groups)
     runner._mark_staging_h2d_enqueued()
-    ubatches = []
-    for index in range(2):
-        torch.cuda._sleep(5_000_000)
-        ubatches.append(builder.build_ubatch_prefill_metadata(md, None, 2, index))
     runner.h2d_owner.completion.synchronize()
     assert ubatches[0].index_rows.concat.cu_committed.cpu().tolist() == [0, 2, 7]
     assert ubatches[1].index_rows.concat.cu_committed.cpu().tolist() == [0, 7, 18]
@@ -314,33 +363,24 @@ def test_balanced_pcp_tbo_uses_separate_indexer_buffers(monkeypatch, rank):
         )
 
 
-def test_late_ubatch_failure_poisoning_and_wrong_stream_rejection(monkeypatch):
+def test_ubatch_staging_rejects_a_wrong_stream_before_writing(monkeypatch):
     from atom.utils.tbo.ubatch_splitting import UBatchSlice
 
     runner, builder = make_runner(monkeypatch)
     runner._gate_staging_reuse()
     md, _, _, _ = make_metadata(builder, (5, 4), (8, 20))
-    runner._mark_staging_h2d_enqueued()
-    sl = UBatchSlice(slice(0, 1), slice(0, 4))
+    batch = prefill_batch(builder, 2)
+    ubatches = builder._prefill_ubatches(
+        batch, (UBatchSlice(slice(0, 1), slice(0, 4)),), None
+    )
+    before = runner.forward_vars["ub0_cu_seqlens_q"].cpu.clone()
     with (
         torch.cuda.stream(torch.cuda.Stream()),
-        pytest.raises(PublicationError, match="original owner stream"),
+        pytest.raises(PublicationError, match="owner's current compute stream"),
     ):
-        builder.build_ubatch_prefill_metadata(md, sl, 1, 0)
-    assert runner.h2d_owner._state == "sealed"
-
-    def fail(*args, **kwargs):
-        raise RuntimeError("indexer consumer failed")
-
-    monkeypatch.setattr(builder, "_attach_v4_index_rows", fail)
-    with pytest.raises(RuntimeError, match="consumer failed"):
-        builder.build_ubatch_prefill_metadata(md, sl, 1, 0)
-    assert runner.h2d_owner._state == "failed"
-    before = runner.forward_vars["ub0_context_lens"].cpu.clone()
-    with pytest.raises(PublicationError, match="failed"):
-        builder.build_ubatch_prefill_metadata(md, sl, 1, 0)
-    assert torch.equal(runner.forward_vars["ub0_context_lens"].cpu, before)
-    runner.h2d_owner.drain()
+        builder.stage_ubatch_prefill(batch, md, ubatches, None)
+    assert torch.equal(runner.forward_vars["ub0_cu_seqlens_q"].cpu, before)
+    runner._mark_staging_h2d_enqueued()
 
 
 @pytest.mark.parametrize("pp_size", [1, 2])
@@ -350,10 +390,11 @@ def test_decode_ubatch_inputs_padding_and_graph_consumers(
     monkeypatch, pp_size, padded, kv_fp8
 ):
     from atom.model_ops.attentions import deepseek_v4_attn as module
+    from atom.model_ops.attentions.deepseek_v4_attn import AttentionMetaData_DSV4
     from atom.model_ops.attentions.pool_layout.v4_pool_geometry import (
         UnifiedPoolGeometry,
     )
-    from atom.utils.tbo.ubatch_wrapper import UBatchWrapper
+    from atom.utils.tbo.ubatch_splitting import cut_decode_ubatches
 
     runner, builder = make_runner(monkeypatch, pp_size=pp_size)
     builder.pool_geometry = UnifiedPoolGeometry([0, 4, 128], 8, 4, 6, 256)
@@ -362,7 +403,6 @@ def test_decode_ubatch_inputs_padding_and_graph_consumers(
     runner.enforce_eager = not padded
     if padded:
         monkeypatch.setattr(module, "get_forward_context", lambda: None)
-        monkeypatch.setattr(UBatchWrapper, "_decode_ub_running_bs", lambda *args: 2)
     names = [
         f"ub{i}_{name}"
         for i in range(2)
@@ -406,36 +446,43 @@ def test_decode_ubatch_inputs_padding_and_graph_consumers(
         )
         slots = np.arange(len(lens), dtype=np.int32)
         var["block_tables"].np[: len(lens)] = slots[:, None] + 1
-        kwargs = {
-            "scheduled_bs": len(lens),
-            "running_bs": 4 if padded else len(lens),
-            "max_seqlen_q": 3,
-            "context_lens_np": starts + lengths,
-            "state_slot_np": slots,
-            "state_slot_in_np": slots[::-1].copy(),
-            "positions_np": positions,
-            "extend_lens_np": lengths,
-        }
+        # The step's host mirrors, as `stage_decode` leaves them.
+        var["positions"].np[: len(positions)] = positions
+        var["context_lens"].np[: len(lens)] = starts + lengths
+        var["v4_meta_state_slot_out"].np[: len(lens)] = slots
+        var["v4_meta_state_slot_in"].np[: len(lens)] = slots[::-1]
+        cu = np.concatenate(([0], np.cumsum(lengths))).astype(np.int32)
+        running_bs = 4 if padded else len(lens)
+        args = (
+            len(lens),
+            lengths,
+            cu,
+            cut_decode_ubatches(running_bs, 3 * running_bs, lengths),
+            3,
+        )
         global_qo = np.minimum(np.arange(13, dtype=np.int32), len(positions))
         if kv_fp8:
             builder._stage("v4_qo_indptr", global_qo)
         torch.cuda._sleep(5_000_000)
-        builder._prepare_ubatch_decode(**kwargs)
+        md = AttentionMetaData_DSV4()
+        for group in builder.stage_ubatch_decode(md, *args):
+            group.publish()
+        builder.finish_ubatch_decode(md, args[0], args[3], args[4])
         if kv_fp8:
             # The actual serving path prepared the global verify prefix first.
             np.testing.assert_array_equal(var["v4_qo_indptr"].np[:13], global_qo)
             saved.append((var["v4_qo_indptr"].gpu[:13].clone(), global_qo.tolist()))
         graphs[runner._fv_idx].replay()
-        split = min(len(lens), 2) if padded else len(lens) // 2
-        for index, (lo, hi) in enumerate(((0, split), (split, len(lens)))):
-            width = 2 if padded else hi - lo
+        for index, ub in enumerate(args[3]):
+            lo, hi = ub.request_slice.start, ub.request_slice.stop
+            width, token_width = ub.running_bs, ub.running_tokens
             local_lens = lengths[lo:hi]
             tokens = int(local_lens.sum())
             local_pos = positions[
                 int(lengths[:lo].sum()) : int(lengths[:hi].sum())
             ].tolist()
             expected = {
-                "positions": local_pos + [0] * (3 * width - tokens),
+                "positions": local_pos + [0] * (token_width - tokens),
                 "context_lens": (starts + lengths)[lo:hi].tolist()
                 + [0] * (width - hi + lo),
                 "cu_seqlens_q": [0]
@@ -450,22 +497,20 @@ def test_decode_ubatch_inputs_padding_and_graph_consumers(
                 "batch_id_per_q_token": np.repeat(
                     np.arange(hi - lo), local_lens
                 ).tolist()
-                + [-1] * (3 * width - tokens),
+                + [-1] * (token_width - tokens),
             }
             if kv_fp8:
-                # Empty ubatches use the existing prefill fallback and never
-                # publish a decode query prefix.
-                expected["v4_qo_indptr"] = (
-                    list(range(tokens + 1)) + [tokens] * (3 * width - tokens)
-                    if tokens
-                    else []
+                # An empty ubatch still publishes its prefix out to its running
+                # rows: a replayed graph reads every one of them.
+                expected["v4_qo_indptr"] = list(range(tokens + 1)) + [tokens] * (
+                    token_width - tokens
                 )
             for suffix, values in expected.items():
                 name = f"ub{index}_{suffix}"
                 saved.append((outputs[runner._fv_idx][name].clone(), values))
         before = {name: var[name].cpu.clone() for name in names}
         with pytest.raises(PublicationError, match="republish_reason"):
-            builder._prepare_ubatch_decode(**kwargs)
+            builder.stage_ubatch_decode(AttentionMetaData_DSV4(), *args)
         assert all(torch.equal(var[name].cpu, before[name]) for name in names)
         runner._mark_staging_h2d_enqueued()
         runner._record_forward_vars_event()
@@ -480,8 +525,8 @@ def test_v4_decode_rejects_borrowed_positions_before_writing(monkeypatch):
 
     runner, builder = make_runner(monkeypatch)
     # The smaller indexer fixture names its common buffers separately.
-    runner.h2d_groups["prefill"] = runner.h2d_owner.group(
-        "prefill",
+    runner.h2d_groups["seq_metadata"] = runner.h2d_owner.group(
+        "seq_metadata",
         [
             runner.forward_vars[name]._publication
             for name in ("context_lens", "block_tables")

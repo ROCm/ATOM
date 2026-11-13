@@ -77,7 +77,8 @@ def test_engine_push_loops_use_shared_interval(monkeypatch, kind, configured, in
         utility_queue=None,
         kv_transfer_enabled=False,
         _is_rl_weights_offloaded=True,
-        _is_idle_rl_weights_offloaded=lambda: True,
+        _is_engine_held=lambda: True,
+        _report_held_kv_work=lambda: None,
         _drain_kv_work_at_exit=lambda: None,
         pull_and_process_input_queue=lambda: now[0] >= 2 * interval,
         _sync_dp_state=lambda unfinished, shutdown, offloaded: (False, shutdown, True),
@@ -159,6 +160,7 @@ def test_engine_receipt_includes_time_buffered_before_scheduler_admission(
         ),
     )
     engine = core.EngineCore.__new__(core.EngineCore)
+    engine._kv_progress_event = core.threading.Event()
     engine.label = "metrics-test"
     engine.input_queue = Queue()
     engine.process_input_sockets("input", "control")

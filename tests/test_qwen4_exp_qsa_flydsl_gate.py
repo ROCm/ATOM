@@ -44,6 +44,8 @@ def _call(layer, selected=None, tokens=8):
 def flydsl(monkeypatch):
     calls = []
     monkeypatch.setenv("ATOM_QSA_FLYDSL_ATTN", "1")
+    qsa_attention.log_flydsl_fallback.cache_clear()
+    qsa_attention._log_flydsl_active.cache_clear()
     monkeypatch.setattr(qsa_attention, "_flydsl_arch_supported", lambda: True)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     monkeypatch.setattr(
@@ -110,6 +112,51 @@ def test_flag_off_falls_back(flydsl, monkeypatch):
     assert flydsl == []
 
 
+def _warnings(caplog):
+    return [r.getMessage() for r in caplog.records if "native kernel" in r.message]
+
+
+def test_each_fallback_reason_is_logged_once(flydsl, monkeypatch, caplog):
+    budget = _layer(indexer=SimpleNamespace(compress_ratio=4, token_topk=1536))
+    with caplog.at_level("WARNING"):
+        for _ in range(3):
+            assert _call(budget, _selection(8, 1539)) is None
+        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+        for _ in range(3):
+            assert _call(_layer()) is None
+    reasons = _warnings(caplog)
+    assert len(reasons) == 2
+    assert "budget 1536" in reasons[0] and "graph capture" in reasons[1]
+
+
+def test_unlaid_forward_and_flag_off_log_nothing(flydsl, monkeypatch, caplog):
+    """A forward the bridge did not lay out (target verify, warmup) is not a
+    fallback, and with the flag off nothing is."""
+    no_layout = SimpleNamespace(host_lens=None, context_slots=None)
+    query = torch.zeros(8, 12, 256, dtype=torch.bfloat16)
+    with caplog.at_level("WARNING"):
+        assert (
+            Qwen4ExpAttention._flydsl_attention(
+                _layer(), query, query, query, _selection(8, 2051), no_layout
+            )
+            is None
+        )
+        monkeypatch.setenv("ATOM_QSA_FLYDSL_ATTN", "0")
+        assert (
+            _call(_layer(indexer=SimpleNamespace(compress_ratio=8, token_topk=2048)))
+            is None
+        )
+    assert _warnings(caplog) == [] and flydsl == []
+
+
+def test_first_flydsl_call_is_logged_once(flydsl, caplog):
+    with caplog.at_level("INFO"):
+        for _ in range(3):
+            assert _call(_layer()) is not None
+    active = [r for r in caplog.records if "FlyDSL kernel" in r.message]
+    assert len(active) == 1 and len(flydsl) == 3
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
 def test_mixed_prefix_batch_gathers_full_contexts(monkeypatch):
     """Prefixed and fresh requests with unequal lengths on non-consecutive
@@ -161,3 +208,113 @@ def test_mixed_prefix_batch_gathers_full_contexts(monkeypatch):
     assert torch.equal(v, -k)
     assert kwargs["query_lens"] == extends
     assert kwargs["prefix_lens"] == prefixes
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+@pytest.mark.parametrize(
+    "prefixes, extends",
+    [
+        ((0,), (7,)),
+        ((0,), (300,)),
+        ((0,), (512,)),
+        ((200,), (300,)),
+        ((0, 0, 100), (100, 37, 250)),
+        ((0,), (1000,)),
+    ],
+    ids=["7", "300", "512", "prefix-200+300", "mixed-3-requests", "1000-unpadded"],
+)
+def test_short_context_matches_native_kernel(monkeypatch, prefixes, extends):
+    """Short contexts shrink the selection (its width follows max_seq_len, not
+    the budget), so it is padded with -1 to the next FlyDSL width, past the
+    budget's own layout. Every row still lists all its complete blocks, then
+    its tail, left-aligned, so the real kernel must match the native
+    `qsa_sparse_paged_gqa` on the same selection."""
+    from atom.model_ops.qwen4_exp.ops.qsa import (
+        qsa_select_paged_tokens,
+        qsa_sparse_paged_gqa,
+    )
+    from atom.plugin.sglang.qwen4_exp_bridge import _flydsl_prefill_layout
+
+    if not qsa_attention._flydsl_arch_supported():
+        pytest.skip("FlyDSL QSA attention needs gfx942")
+    try:
+        qsa_attention._flydsl_attention_op()
+    except ImportError:
+        pytest.skip("aiter without FlyDSL QSA attention (ROCm/aiter#6576)")
+    monkeypatch.setenv("ATOM_QSA_FLYDSL_ATTN", "1")
+
+    device, block, ratio, budget, heads, dim = "cuda", 64, 4, 2048, 6, 256
+    gen = torch.Generator(device=device).manual_seed(0)
+
+    def randn(*shape):
+        return torch.randn(*shape, dtype=torch.bfloat16, device=device, generator=gen)
+
+    seqs = [p + e for p, e in zip(prefixes, extends)]
+    width = max(-(-s // block) for s in seqs)
+    pages = len(seqs) * width
+    tables = (
+        torch.randperm(pages, device=device, generator=gen)
+        .view(len(seqs), width)
+        .to(torch.int32)
+    )
+    positions = torch.cat(
+        [torch.arange(p, p + e, device=device) for p, e in zip(prefixes, extends)]
+    )
+    token_to_req = torch.cat(
+        [
+            torch.full((e,), r, dtype=torch.int32, device=device)
+            for r, e in enumerate(extends)
+        ]
+    )
+    selected = qsa_select_paged_tokens(
+        randn(positions.numel(), 4, 128),
+        randn(pages, block // ratio, 1, 128),
+        tables,
+        token_to_req,
+        positions,
+        torch.tensor(seqs, dtype=torch.int32, device=device),
+        budget,
+        ratio,
+        max_seq_len=max(seqs),
+        allow_flydsl=True,
+    )
+    if max(seqs) <= 512:
+        assert selected.shape[1] < 1027  # the padded case under review
+
+    k_cache, v_cache = randn(pages, block, 1, dim), randn(pages, block, 1, dim)
+    query = randn(positions.numel(), heads, dim)
+    slots = (
+        tables[token_to_req.long(), positions // block].long() * block
+        + positions % block
+    )
+    batch = SimpleNamespace(extend_seq_lens_cpu=list(extends), seq_lens_cpu=seqs)
+    host_lens, context_slots = _flydsl_prefill_layout(
+        batch, len(seqs), positions.numel(), tables, block
+    )
+    layer = _layer(
+        indexer=SimpleNamespace(compress_ratio=ratio, token_topk=budget),
+        num_heads=heads,
+        k_cache=k_cache,
+        v_cache=v_cache,
+    )
+    qsa = SimpleNamespace(host_lens=host_lens, context_slots=context_slots)
+    flydsl = Qwen4ExpAttention._flydsl_attention(
+        layer,
+        query,
+        k_cache.flatten(0, 1)[slots],
+        v_cache.flatten(0, 1)[slots],
+        selected,
+        qsa,
+    )
+    assert flydsl is not None
+    native = qsa_sparse_paged_gqa(
+        query,
+        k_cache,
+        v_cache,
+        selected,
+        tables,
+        token_to_req,
+        softmax_scale=layer.scaling,
+        num_decode_requests=None,
+    )
+    torch.testing.assert_close(flydsl, native, atol=1.6e-2, rtol=1.6e-2)

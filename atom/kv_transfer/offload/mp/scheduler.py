@@ -14,6 +14,7 @@ from typing import Any
 from atom.kv_transfer.disaggregation.types import (
     KVConnectorOutput,
     LoadOperationId,
+    req_id_of,
 )
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload._offload_common import validated_kv_role
@@ -266,37 +267,42 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
     def load_finished(self, req_id: Any) -> bool:
         finished = super().load_finished(req_id)
         if finished:
-            raw_id = req_id.req_id if hasattr(req_id, "req_id") else req_id
+            sid = req_id_of(req_id)
             try:
                 self._lookup_client.complete_retrieve(
-                    str(raw_id),
+                    sid,
                     succeeded=True,
                 )
             except Exception:
                 logger.warning(
                     "LMCache MP successful-load cleanup failed for request %s",
-                    raw_id,
+                    sid,
                     exc_info=True,
                 )
         return finished
 
     def load_failed(self, req_id: Any) -> bool:
-        raw_id = req_id.req_id if hasattr(req_id, "req_id") else req_id
-        active = self._active_load_operations.get(str(raw_id))
-        if isinstance(req_id, LoadOperationId):
-            is_current = active is not None and active[1] == req_id
-        else:
-            is_current = active is None
+        sid = req_id_of(req_id)
+        active = self._active_load_operations.get(sid)
+        # Only a submitted retrieve hands its lookup's read locks to the
+        # transfer. A promise withdrawn before dispatch (a raw request id) did
+        # not: the base's cleanup reaches `clear_lookup_status`, which frees
+        # them, as long as nothing popped the lookup first.
+        is_current = (
+            isinstance(req_id, LoadOperationId)
+            and active is not None
+            and active[1] == req_id
+        )
         if is_current:
             try:
                 self._lookup_client.complete_retrieve(
-                    str(raw_id),
+                    sid,
                     succeeded=False,
                 )
             except Exception:
                 logger.warning(
                     "LMCache MP failed-load cleanup failed for request %s",
-                    raw_id,
+                    sid,
                     exc_info=True,
                 )
         return super().load_failed(req_id)

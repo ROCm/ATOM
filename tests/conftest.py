@@ -295,6 +295,14 @@ def req_graph_recordings(monkeypatch):
     return recordings
 
 
+@pytest.fixture
+def offload_clock(monkeypatch):
+    """`state_offload`'s monotonic clock, advanced by hand."""
+    now = [1000.0]
+    monkeypatch.setattr("atom.model_engine.state_offload.monotonic", lambda: now[0])
+    return now
+
+
 @pytest.fixture(autouse=True)
 def mono_runs_on_gfx950(monkeypatch):
     """Mono's deployment checks see gfx950, the only arch its kernels are built

@@ -97,6 +97,12 @@ class PagedAttentionImpl(nn.Module):
         self.per_token_quant = True
         self.sinks = sinks
         self.sliding_window = sliding_window if sliding_window is not None else -1
+        # Fall back to Triton/Gluon for layouts unsupported by AITer PA ASM.
+        self.use_triton_attn = (
+            envs.ATOM_FORCE_ATTN_TRITON
+            or self.sliding_window != -1
+            or self.head_dim != 128
+        )
         self.rotary_emb = rotary_emb
         self.q_norm = q_norm
         self.k_norm = k_norm
@@ -256,13 +262,7 @@ class PagedAttentionImpl(nn.Module):
         k_scale = kv_cache_data[f"layer_{self.layer_num}"].k_scale
         v_scale = kv_cache_data[f"layer_{self.layer_num}"].v_scale
 
-        # Fall back to Triton/Gluon for layouts unsupported by AITer PA ASM.
-        use_triton_attn = (
-            envs.ATOM_FORCE_ATTN_TRITON
-            or self.sliding_window != -1
-            or self.head_dim != 128
-        )
-        self.use_triton_attn = use_triton_attn
+        use_triton_attn = self.use_triton_attn
 
         if (
             self.rotary_emb is not None
@@ -586,7 +586,7 @@ class PagedAttentionImpl(nn.Module):
             v_scales=v_scale,
             cu_seqlens_kv=cu_seqlens_k,
             # Built once per fwd by the prefill builder (same tensor for every
-            # layer); a ubatch gets its own by slicing in split_attn_metadata.
+            # layer); a ubatch's with its own metadata.
             batch_id_per_k_token=attn_metadata.batch_id_per_k_token,
             seq_starts=attn_metadata.seq_starts,
             dequant=self.kv_cache_dtype.startswith("fp8"),
@@ -613,16 +613,33 @@ class PagedAttentionImpl(nn.Module):
             return v_cache
         return self._view_v_cache_for_pa_decode_bf16_asm(v_cache, k_cache)
 
+    def _flydsl_may_take_decode(self) -> bool:
+        """The part of `_flydsl_takes_decode` this layer's configuration
+        decides, before the call's shapes."""
+        return not (
+            envs.ATOM_USE_UNIFIED_ATTN
+            or pa_decode_gluon_supports_arch()
+            or self.sliding_window > 0
+        )
+
+    def decode_reads_ragged_queries(self, max_qlen: int) -> bool:
+        """Whether every decode kernel this layer may run at ``max_qlen`` reads
+        each sequence's query rows off `cu_seqlens_q`, so sequences of
+        different query lengths are safe. `run_pa_decode` (gluon / FlyDSL) and
+        the persistent PA kernels lay a sequence's rows ``max_qlen`` apart."""
+        runner = self._dispatch_decode(max_qlen)
+        if runner == self.paged_attention_asm:
+            return True
+        if runner == self.paged_attention_unified:
+            return not self._flydsl_may_take_decode()
+        return False
+
     def _flydsl_takes_decode(self, q, k_cache, v_cache, attn_metadata) -> bool:
         """Without gluon decode (gfx1250): whether FlyDSL accepts this call.
 
         ATOM_USE_UNIFIED_ATTN keeps the call on unified_attention.
         """
-        if (
-            envs.ATOM_USE_UNIFIED_ATTN
-            or pa_decode_gluon_supports_arch()
-            or self.sliding_window > 0
-        ):
+        if not self._flydsl_may_take_decode():
             return False
         num_seqs = attn_metadata.context_lens.shape[0]
         return bool(
@@ -881,7 +898,7 @@ class PagedAttentionImpl(nn.Module):
 
             if int(attn_metadata.max_seqlen_k) > page_size:
                 final_lse = torch.empty(
-                    (batch_size * max_seqlen_q, self.num_heads),
+                    (q.shape[0], self.num_heads),
                     dtype=torch.float32,
                     device=q.device,
                 )
@@ -892,13 +909,11 @@ class PagedAttentionImpl(nn.Module):
                     attn_metadata.reduce_final_map,
                     attn_metadata.reduce_partial_map,
                     max_seqlen_q,
-                    output.view(
-                        batch_size * max_seqlen_q, self.num_heads, self.head_dim
-                    ),
+                    output.view(q.shape[0], self.num_heads, self.head_dim),
                     final_lse,
                 )
 
-            return output.view(batch_size * max_seqlen_q, self.num_heads, self.head_dim)
+            return output.view(q.shape[0], self.num_heads, self.head_dim)
 
     def _can_use_fp8_prefill_attention(
         self,
@@ -1027,12 +1042,12 @@ class PagedAttentionImpl(nn.Module):
 
         # `block_tables` is always populated by TritonMHAMetadataBuilder.
         # For pure prefill (no cached tokens) it is, by default, the fake table
-        # built in prepare_prefill that maps seq i to token indices
+        # built in its `finish_prefill` that maps seq i to token indices
         # [cu_seqlens_k[i], ..., cu_seqlens_k[i+1]-1], paired with raw K/V
         # treated as kv_cache with block_size=1.
         #
-        # Under ATOM_USE_UNIFIED_ATTN, prepare_prefill instead uploads the real
-        # per-seq block_table and reads from KV cache, the new tokens
+        # Under ATOM_USE_UNIFIED_ATTN, `stage_prefill` uploads the real per-seq
+        # block_table (`_prefill_block_table_rows`) and reads from KV cache, the new tokens
         # already written into the paged flash-layout cache during rope_cache
         # are read straight from `k_cache`/`v_cache`, identical to the
         # prefix-cache-hit path.
@@ -1373,9 +1388,6 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             layer.k_cache, layer.v_cache, layer.k_scale, layer.v_scale
         )
 
-        # M3 sparse attention is fixed to head_dim == 128 and the AITER fused
-        # path; there is no model-local Triton fallback here.
-        self.use_triton_attn = False
         self._cache_format = "SHUFFLE"
 
         sparse_metadata = getattr(attn_metadata, "sparse_attention_metadata", None)
@@ -1506,6 +1518,11 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         if fwd_ctx.context.is_prefill:
             return self._sparse_prefill
         return self._sparse_decode
+
+    def decode_reads_ragged_queries(self, max_qlen: int) -> bool:
+        """No: the sparse decode (top-k and attention) takes one
+        ``max_query_len`` for every sequence."""
+        return False
 
     def _sparse_metadata(self, fwd_ctx: ForwardContext):
         attn_metadata = fwd_ctx.attn_metadata

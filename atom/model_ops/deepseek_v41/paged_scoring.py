@@ -34,6 +34,7 @@ from atom.model_ops.indexer import (
 )
 
 from .candidate_table import lift_candidate_selection
+from .index_plane import FP4_FLYDSL, FP4_MFMA
 from .indexer import pick_candidate_blocks, pick_candidate_blocks_packed
 
 __all__ = [
@@ -44,7 +45,7 @@ __all__ = [
 ]
 
 
-def quantize_query_fp4(query, rope, positions):
+def quantize_query_fp4(query, rope, positions, *, layout=FP4_FLYDSL):
     """`(values, scales)` of the index query before its RoPE, `query` [rows,
     heads, dim], in one launch, the rotated values rounded to `query`'s dtype
     first as V4.1's RoPE writes them, then the official FP4 arithmetic (E2M1,
@@ -56,6 +57,7 @@ def quantize_query_fp4(query, rope, positions):
         positions,
         rope.rope_dim,
         fp4=True,
+        layout=layout,
         round_rope=True,
     )
 
@@ -132,7 +134,13 @@ def score_topk_quantized(
     # also scored inside someone else's would have two meanings for a column.
     assert not (candidate_count and candidates is not None)
     tile = units.values.shape[1]
-    cache = IndexCache(units.values, units.scales if units.fp4 else None, tile)
+    values, scales = units.values, units.scales
+    if units.layout == FP4_MFMA:
+        # Table entries still name 8-row pages; OPUS reads the same bytes as
+        # 64-row physical groups, including when a PAGE contains two groups.
+        values = values.view(-1, 4, 64, 16)
+        scales = scales.view(-1, 2, 32, 4)
+    cache = IndexCache(values, scales, tile, units.layout)
     if candidates is not None:
         # One number reached by two paths: the geometry pages the plane at
         # `candidate_block_size`, and this is where they have to agree.
@@ -207,6 +215,7 @@ def _index_rows(cache, scaled, table, bound, width, ragged, packed, workspace):
         ragged,
         heads=heads,
         page_size=cache.rows_per_block,
+        layout=cache.layout,
         row_tables=None if ragged is not None else table,
         row_starts=starts,
         bands=None if packed is None else packed.bands,

@@ -21,7 +21,10 @@ from atom.model_ops.deepseek_v41.dspark import (
 from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
 from atom.model_ops.deepseek_v41.rope_window import rope_quant_window
 from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
-from atom.model_ops.dspark_markov_sample import dspark_markov_argmax_tp
+from atom.model_ops.dspark_markov_argmax import (
+    dspark_markov_argmax_tp,
+    markov_weights_unsupported,
+)
 from atom.model_ops.layernorm import RMSNorm, rmsnorm2d_fwd_
 from atom.model_ops.linear import ReplicatedLinear
 from atom.model_ops.moe import FusedMoE
@@ -273,8 +276,8 @@ class DeepseekV41DSpark(DSparkDraftModel):
         # target just ran and what these buffers therefore hold. A padding row
         # belongs to a zero-length request in `cu_seqlens_q`, so it is
         # projected and then written nowhere.
-        hidden = self.project_context(aux_concat[: step.width].unsqueeze(0))
-        positions = positions[: step.width][None]
+        hidden = self.project_context(aux_concat[: step.running_tokens].unsqueeze(0))
+        positions = positions[: step.running_tokens][None]
         layers = self.context_layers
         fused = self._context_kv_fusion()
         if fused is None:
@@ -688,8 +691,10 @@ class DeepseekV41DSpark(DSparkDraftModel):
             and head.tp_size > 1
             and head.bias is None
             and markov.fused_sample
-            and markov.markov_w1.weight.dtype in (torch.bfloat16, torch.float16)
-            and markov.markov_w2.weight.dtype is markov.markov_w1.weight.dtype
+            and markov_weights_unsupported(
+                markov.markov_w1.weight, markov.markov_w2.weight
+            )
+            is None
         )
 
     def _head_and_sample_sharded(self, normed, hc_hidden, anchor_ids):

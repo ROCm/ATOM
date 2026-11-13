@@ -4,6 +4,7 @@
 import enum
 import fnmatch
 import hashlib
+import importlib.util
 import logging
 import os
 import re
@@ -32,8 +33,9 @@ from atom.quant_spec import (
     LayerQuantConfig,
     get_quant_parser,
 )
-from atom.utils import envs
+from atom.utils import envs, get_hf_text_config
 from atom.utils.distributed.utils import stateless_init_torch_distributed_process_group
+from atom.utils.selector import Family, attn_family, has_mla_indexer
 
 if TYPE_CHECKING:
     # Annotation only. Importing AITER here would put a GPU kernel build behind
@@ -2103,10 +2105,22 @@ class Config:
     num_kvcache_blocks: int = -1
     kv_cache_dtype: str = "bf16"
     index_cache_dtype: str | None = None
+    # V4/V4.1 FP4 physical layout, resolved before config is sent to scheduler
+    # and workers. Their PAGE namespace must describe the same stored bytes.
+    index_cache_layout: str | None = field(default=None, init=False)
     enable_prefix_caching: bool = True
     enable_chunked_prefill: bool = True
     enable_log_stats: bool = True
     enable_request_context_metrics: bool = False
+    # --sampler-independent-noise: draw a fresh exponential noise row per
+    # stochastic row of an unfiltered temperature batch instead of broadcasting
+    # one row, so ordinary n=1 requests (not only fan-out siblings and
+    # speculative verification) are sampled independently. Off by default; the
+    # option costs a (num_tokens, vocab_size) float32 allocation per sampler
+    # call and changes the RNG stream. The top-k/top-p path already draws
+    # per-row noise, so the option is inert there by design; greedy rows never
+    # draw noise. Native ATOM engine only.
+    sampler_independent_noise: bool = False
     # Seconds between engine-status lines. Validated > 0 by EngineStats.
     throughput_log_interval: float = 10.0
     # Forwards between engine-status lines, replacing the clock above when
@@ -2161,6 +2175,11 @@ class Config:
     torch_dtype: torch.dtype = field(init=False)
     speculative_config: SpeculativeConfig | None = None
     kv_transfer_config: dict = field(default_factory=dict)
+    # A frontend's own stable form of its speculative config, which the offload
+    # PAGE namespace hashes in place of `speculative_config`: only the frontend
+    # knows which of its fields differ between processes. None hashes
+    # `speculative_config` itself, as native ATOM does.
+    offload_speculative_config: Any = None
     kv_events_config: KVEventsConfig = field(default_factory=KVEventsConfig.from_env)
     # DSpark runtime knobs. Built once in the parent from --dspark-config (see
     # EngineArgs) and pickled into every worker. Read sites use `config.dspark.*`
@@ -2248,15 +2267,20 @@ class Config:
         Declared, not schedulable -- `ModelRunner` drops what its own token
         budget can never produce, a bound needing the drafter's resolved
         `mtp_k` that config cannot see. Returns a copy: the runner sorts and
-        filters in place.
+        filters in place. Under decode TBO a bucket past 2 is even, as
+        `max_num_seqs` is (`decode_bucket_splits`).
         """
         declared = self.compilation_config.cudagraph_capture_sizes
         if declared:
-            return list(declared)
-        sizes = self.compilation_config.cuda_graph_sizes
-        if len(sizes) == 1:
-            return list(range(1, 9)) + list(range(16, sizes[0] + 1, 16))
-        return list(sizes)
+            sizes = list(declared)
+        elif len(self.compilation_config.cuda_graph_sizes) == 1:
+            top = self.compilation_config.cuda_graph_sizes[0]
+            sizes = list(range(1, 9)) + list(range(16, top + 1, 16))
+        else:
+            sizes = list(self.compilation_config.cuda_graph_sizes)
+        if not self.enable_tbo_decode:
+            return sizes
+        return sorted({s + s % 2 if s > 2 else s for s in sizes})
 
     def _resolve_throughput_step_interval(self) -> None:
         """Keep the step trigger to the topologies it has been validated on.
@@ -2384,10 +2408,6 @@ class Config:
                 "Ulysses SP does not support multimodal checkpoints: it does "
                 "not shard the inputs_embeds a vision tower feeds the model."
             )
-        # Local import: atom.utils pulls in atom.config at module scope.
-        from atom.utils import get_hf_text_config
-        from atom.utils.selector import Family, attn_family
-
         hf_text = get_hf_text_config(self.hf_config)
         if attn_family(hf_text) is not Family.MHA:
             raise ValueError(
@@ -2437,14 +2457,6 @@ class Config:
                 "{'auto', 'mori', 'rccl', 'none'}, "
                 f"got {self.moe_all2all_backend!r}"
             )
-        if self.moe_all2all_backend == "rccl" and self.enable_tbo:
-            logger.warning(
-                "Disabling TBO for the experimental RCCL routed MoE backend; "
-                "the first implementation is synchronous."
-            )
-            self.enable_tbo = False
-            self.enable_tbo_decode = False
-
         self.prefill_admit_policy = self.prefill_admit_policy.strip().lower()
         if self.prefill_admit_policy not in PREFILL_ADMIT_POLICIES:
             raise ValueError(
@@ -2528,14 +2540,6 @@ class Config:
                     f"Speculative decode + DCP is only supported on gfx950 (needs "
                     f"the persistent cprr MLA kernel); got {gfx}. Disable DCP or "
                     f"speculative decode on this GPU."
-                )
-                # TBO slices its ubatch work buffers by request, while the
-                # sparse DCP indexer indexes them by query token. The two agree
-                # only at one query per sequence.
-                assert not self.enable_tbo_decode, (
-                    "Decode TBO (--enable-tbo all) combined with speculative "
-                    "decode and DCP is unverified. Use --enable-tbo (prefill "
-                    "only), or drop DCP or speculative decode."
                 )
         # DCP KV-cache interleave granularity S. S=1 (default) = token-level
         # round-robin (unchanged). S>1 = block-level interleave; must divide the
@@ -2723,7 +2727,9 @@ class Config:
             # builds the model.
             self.offload_kv_encoding = snapshot_kv_encoding(self.hf_config)
         self._resolve_dynamic_chunking()
+        self._resolve_tbo()
         self._check_pp_support()
+        self._check_tbo_support()
 
         if self.speculative_config is not None:
             num_spec = self.speculative_config.num_speculative_tokens
@@ -2771,6 +2777,7 @@ class Config:
                     f"num_speculative_tokens must be between 1 and {max_spec}, "
                     f"got {num_spec}."
                 )
+        self._even_decode_requests()
 
         # DeepSeek V4: paper §3.6.1 mandates classical KV cache block_size =
         # a multiple of lcm(m, m'). For V4-Pro / V4-Flash lcm(4, 128) = 128;
@@ -2928,12 +2935,201 @@ class Config:
 
             validate_runtime_config(self)
 
+        self._resolve_index_cache_layout()
+
         if is_deepseek_v4:
             from atom.model_ops.attentions.deepseek_v4_replay import (
                 state_replay_tokens,
             )
 
             self.state_replay_tokens = state_replay_tokens(self)
+
+    def _resolve_index_cache_layout(self) -> None:
+        self.index_cache_layout = None
+        if self.index_cache_dtype != "fp4":
+            return
+        is_v41 = self.hf_config.model_type == "deepseek_v41_text"
+        arches = getattr(self.hf_config, "architectures", None) or []
+        is_v4 = any(
+            str(a).startswith(("DeepseekV4For", "DeepseekV4MTP", "DeepseekV4DSpark"))
+            for a in arches
+        )
+        if not (is_v4 or is_v41):
+            return
+        from aiter.jit.utils.chip_info import get_gfx_runtime
+
+        arch = get_gfx_runtime()
+        if is_v4 and arch == "gfx942":
+            # The V4 runtime falls back to FP8 on gfx942, even for explicit FP4.
+            return
+        if is_v41:
+            from atom.model_ops.deepseek_v41.index_plane import (
+                fp4_index_layout_for_arch as layout_for_arch,
+            )
+        else:
+            from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
+                fp4_indexer_layout_for_arch as layout_for_arch,
+            )
+        self.index_cache_layout = layout_for_arch(
+            arch, backend=envs.ATOM_V4_UNIFIED_MQA
+        )
+
+    def _resolve_tbo(self) -> None:
+        """Turn TBO off where it cannot run (`_check_tbo_support` refuses what
+        it cannot run with), before anything sizes itself off
+        `enable_tbo_decode`."""
+        if self.moe_all2all_backend == "rccl" and self.enable_tbo:
+            logger.warning(
+                "Disabling TBO for the experimental RCCL routed MoE backend; "
+                "the first implementation is synchronous."
+            )
+            self.enable_tbo = False
+            self.enable_tbo_decode = False
+        # TBO's two concurrent ubatches are supported by the mori EP
+        # dispatch/combine path. The EP collective fallback instead issues
+        # full DP all-gather/reduce-scatter operations from both ubatch streams;
+        # those streams can enter the collectives in opposite order and hang.
+        # Keep the fallback usable by serializing it until it has dedicated
+        # per-ubatch communicators, analogous to the PCP/TP guard below.
+        mori_ep_enabled = (
+            getattr(self, "moe_all2all_backend", "auto") in {"auto", "mori"}
+            and not envs.ATOM_DISABLE_MORI_EP
+            and importlib.util.find_spec("mori") is not None
+        )
+        if (
+            self.enable_dp_attention
+            and self.enable_expert_parallel
+            and self.enable_tbo
+            and not mori_ep_enabled
+        ):
+            logger.warning(
+                "Disabling TBO for the DP-attention + EP collective fallback: "
+                "concurrent all-gather/reduce-scatter ubatches can deadlock. "
+                "Use mori EP or run the fallback without --enable-tbo."
+            )
+            self.enable_tbo = False
+            self.enable_tbo_decode = False
+        # PCP + TBO prefill: supported via coordinated splitting.
+        # PCP + TBO decode: not yet supported (pcp_all_reduce semantics under
+        # per-request ubatch split are unverified).
+        if self.prefill_context_parallel_size <= 1 or not self.enable_tbo:
+            return
+        # TBO overlaps compute with the attn<->MoE PCP collectives, which
+        # only exist in MoE merge mode (ATOM_PCP_MOE_MERGE=1). With
+        # ATOM_PCP_MOE_MERGE=0, MoE runs on each rank's 1/W token shard
+        # with NO extra comm between attn and MoE, so TBO has nothing
+        # to overlap and only adds ubatch-splitting overhead. Force it off.
+        if not envs.ATOM_PCP_MOE_MERGE:
+            logger.warning(
+                "Disabling TBO because ATOM_PCP_MOE_MERGE=0: in this "
+                "situation it runs MoE on each rank's 1/W token shard with "
+                "no extra attn<->MoE communication, so TBO has nothing to "
+                "overlap and only adds overhead."
+            )
+            self.enable_tbo = False
+            self.enable_tbo_decode = False
+        elif self.tensor_parallel_size > 1:
+            # Cross-communicator (PCP x TP) RCCL deadlock:
+            # under TBO the PCP collectives (comm_stream) run concurrently
+            # and UNORDERED with the TP-group all_reduces (compute_stream,
+            # from attention wo_b / MoE RowParallelLinear). On the TPxPCP
+            # rank grid with large collectives this forms a cross-rank
+            # circular wait -> hang (reproduced MI355 TP4PCP2/TP2PCP4 merge
+            # +TBO, 64k/c32). Serialized (non-TBO single stream) is fine, and
+            # TP=1 has no TP communicator so it cannot form the cycle. Only
+            # TP=1 + PCP keeps TBO; TP>1 falls back to non-TBO.
+            logger.warning(
+                "Disabling TBO: prefill_context_parallel_size > 1 (-pcp) "
+                "with tensor_parallel_size > 1 (-tp) hangs under TBO due to "
+                "a PCP<->TP cross-communicator RCCL deadlock (concurrent "
+                "unordered collectives on comm/compute streams; see "
+                "PCP_TBO.md 14.4). TBO with PCP is only supported at -tp 1 "
+                "(e.g. -tp 1 -pcp 8)."
+            )
+            self.enable_tbo = False
+            self.enable_tbo_decode = False
+
+    def _even_decode_requests(self) -> None:
+        """Under decode TBO a decode splits into two halves of as many
+        requests (`decode_bucket_splits`), so every request bucket is even, the
+        most a decode step can schedule included: `max_num_seqs`, and the
+        `max_num_batched_tokens` its tokens a request fit in. Rounded down,
+        never past either bound the user set."""
+        if not self.enable_tbo_decode:
+            return
+        spec = self.speculative_config
+        tokens_per_request = 1 + (spec.num_speculative_tokens if spec else 0)
+        bound = min(
+            self.max_num_seqs, self.max_num_batched_tokens // tokens_per_request
+        )
+        even = bound - bound % 2
+        if even < 2:
+            raise ValueError(
+                f"Decode TBO (--enable-tbo all) splits a decode into two halves "
+                f"of requests, but max_num_seqs={self.max_num_seqs} and "
+                f"max_num_batched_tokens={self.max_num_batched_tokens} at "
+                f"{tokens_per_request} tokens a request bound a decode to "
+                f"{bound}."
+            )
+        if even != self.max_num_seqs:
+            logger.info(
+                "Decode TBO: max_num_seqs %d -> %d (an even number of requests, "
+                "within max_num_batched_tokens=%d at %d tokens a request)",
+                self.max_num_seqs,
+                even,
+                self.max_num_batched_tokens,
+                tokens_per_request,
+            )
+        self.max_num_seqs = even
+
+    def _check_tbo_support(self) -> None:
+        """Refuse TBO on a linear-attention hybrid (GDN / KDA), whose state
+        metadata a micro-batch does not get; under PCP, decode TBO and
+        speculation; and decode TBO under speculation
+        on a sparse MLA model or under DCP: a verify's sparse layers run on
+        per-token persistent metadata (`sparse_mtp_*`, a per-token
+        `sparse_kv_indptr`), and the DCP indexer indexes its work buffers by
+        query token, neither of which a decode micro-batch, cut by request,
+        builds (`AiterMLAMetadataBuilder._ubatch_decode_metadata`)."""
+        if not self.enable_tbo:
+            return
+        hf_text = get_hf_text_config(self.hf_config)
+        family = attn_family(hf_text)
+        if family in (Family.GDN, Family.QSA_GDN, Family.KIMI_MLA):
+            raise ValueError(
+                f"TBO (--enable-tbo) is not supported on a {family} model: its "
+                "linear-attention layers' state metadata is built for the whole "
+                "step, not for each micro-batch."
+            )
+        if self.prefill_context_parallel_size > 1:
+            if self.enable_tbo_decode:
+                raise ValueError(
+                    "prefill_context_parallel_size > 1 (-pcp) combined with "
+                    "--enable-tbo all (decode TBO) is not supported yet. "
+                    "Use --enable-tbo (prefill only) with -pcp."
+                )
+            # TBO stripes positions per request group, the draft prefill split
+            # the batch as one sequence: their shards disagree. Keyed on
+            # config, so runs that would never reach TBO are refused too.
+            if self.speculative_config is not None:
+                raise ValueError(
+                    "prefill_context_parallel_size > 1 (-pcp) with speculative "
+                    "decoding is not supported under TBO: TBO's PCP prefill "
+                    "splits per request group, which the draft model's global "
+                    "round-robin query split does not match. Drop --enable-tbo, "
+                    "or run without a draft model. Note -tp > 1 already "
+                    "disables TBO under PCP, so this only affects -tp 1 "
+                    "(e.g. -tp 1 -pcp 8)."
+                )
+        if not self.enable_tbo_decode or self.speculative_config is None:
+            return
+        if has_mla_indexer(hf_text) or self.decode_context_parallel_size > 1:
+            raise ValueError(
+                "Decode TBO (--enable-tbo all) is not supported with speculative "
+                "decode on a sparse MLA model or under DCP: a verify's "
+                "micro-batches have no per-token metadata. Use --enable-tbo "
+                "(prefill only), or drop speculative decode."
+            )
 
     def _check_pp_support(self) -> None:
         """Refuse what PP does not wire yet: TBO, P/D consumers, and speculation
@@ -3081,6 +3277,10 @@ class Config:
         # graphs (early + late layers) instead of one; both compile under the
         # `backbone` tag, so the flag must key the artifacts.
         factors.append(getattr(self, "enable_decoder_swa_bounded_replay", True))
+        # The resolved layout changes traced Q-scale shapes and compressor
+        # writes in both V4 and V4.1. Hash the same snapshot their caches use.
+        if self.index_cache_layout is not None:
+            factors.append(("index_cache_layout", self.index_cache_layout))
         text_config = getattr(self.hf_config, "text_config", self.hf_config)
         factors.append(
             (
@@ -3150,6 +3350,21 @@ class Config:
             str(factors).encode(), usedforsecurity=False
         ).hexdigest()[:10]
         return hash_str
+
+
+def local_device_index(config: Config, rank: int) -> int:
+    """Node-local GPU index of worker ``rank`` (0..tp*pcp-1) of its stage.
+
+    On a single node the physical GPU index equals the global distributed rank
+    in the DPxPPxPCPxTP layout: each EngineCore (one per (dp,pp) stage) owns a
+    contiguous slice of `tp_world_size * pcp_group_size` GPUs.
+    """
+    pc = config.parallel_config
+    engine_index = (
+        pc.data_parallel_rank_local or 0
+    ) * config.pipeline_parallel_size + pc.pipeline_parallel_rank
+    stage_span = config.tp_world_size * config.pcp_group_size
+    return engine_index * stage_span + rank
 
 
 _current_atom_config: Config | None = None

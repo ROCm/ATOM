@@ -19,13 +19,13 @@ import torch
 import triton
 import triton.language as tl
 
-from atom.model_ops.dspark_markov_sample import (
-    _BLOCK_K,
-    _BLOCK_V,
-    _MAX_BLOCK_ROW,
-    _MIN_BLOCK_ROW,
-)
+from atom.model_ops import dspark_markov_stage1 as _markov_stage1
 from atom.model_ops.dspark_prob_sample import _GREEDY_T, _gumbel
+
+_BLOCK_K = _markov_stage1.BLOCK_K
+_BLOCK_V = _markov_stage1.BLOCK_V
+_MAX_BLOCK_ROW = _markov_stage1.MAX_BLOCK_ROW
+_MIN_BLOCK_ROW = _markov_stage1.MIN_BLOCK_ROW
 
 
 @triton.jit

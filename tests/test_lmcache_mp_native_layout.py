@@ -196,6 +196,18 @@ def test_unit_validation_rejects_missing_null_out_of_range_and_duplicate_units(i
         _layout(_transfer()).validate_unit_ids(ids)
 
 
+def test_transfer_nulls_every_image_chunk_but_the_boundary():
+    """PAGE names every chunk; each image ordinal only the last, -1 before it
+    (PAGE unit 0 is real data, so the server's null block id is -1)."""
+    layout = build_native_state_mp_layout(_transfer(), block_size=4, chunk_size=16)
+    assert layout.transfer_block_ids([10, 11, 12, 13], (4, 2, 3), 2) == [
+        [10, 11, 12, 13],
+        [-1, 4],
+        [-1, 2],
+        [-1, 3],
+    ]
+
+
 def test_equal_shape_unequal_stride_is_rejected_before_registration():
     # Last ordinal contains 4 bytes from each region: the second region has
     # stride 8, so LMCache cannot coalesce it with the first region's stride 4.

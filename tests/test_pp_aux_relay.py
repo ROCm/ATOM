@@ -39,7 +39,9 @@ class _FakeTarget(nn.Module):
         self.embed_tokens = nn.Identity() if with_embed else PPMissingLayer()
 
 
-_CTX = types.SimpleNamespace(is_draft=False, ubatch_token_offset=0)
+_CTX = types.SimpleNamespace(
+    is_draft=False, ubatch_token_offset=0, ubatch_token_order=None
+)
 
 
 @pytest.fixture(autouse=True)

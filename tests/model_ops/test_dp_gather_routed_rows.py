@@ -115,7 +115,7 @@ def test_eager_rows_travel_in_one_collective_with_the_dp_sizes():
     group = _TwoRankGroup(peer_rows=5)
     ctx = SimpleNamespace(
         dp_metadata=SimpleNamespace(get_sizes_across_dp=lambda: [3, 5]),
-        context=SimpleNamespace(scheduled_tokens=3),
+        context=SimpleNamespace(running_tokens=3),
     )
 
     rows, local_tokens, sizes = moe.dp_gather_routed_rows(sent, True, ctx, group)

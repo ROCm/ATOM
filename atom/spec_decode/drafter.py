@@ -3,7 +3,7 @@ import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 import torch
@@ -27,6 +27,9 @@ from atom.utils.forward_context import (
     set_forward_context,
 )
 from atom.utils.h2d import h2d_producer
+
+if TYPE_CHECKING:
+    from atom.spec_decode.dspark_lossless import DSparkLossless
 
 logger = logging.getLogger("atom")
 
@@ -134,8 +137,9 @@ def _identity_extract(output: Any, _module: nn.Module) -> torch.Tensor:
 
 
 def _aux_hook(extract, write):
-    """A target-layer forward hook handing ``write(tensor, row_offset)`` the
-    tap's aux tensor, on target forwards only."""
+    """A target-layer forward hook handing ``write(tensor, tokens)`` the tap's
+    aux tensor and the step's tokens it is for (a slice, or a split decode
+    micro-batch's packed positions), on target forwards only."""
 
     def _hook(module, _inputs, output):
         ctx = get_forward_context().context
@@ -147,10 +151,14 @@ def _aux_hook(extract, write):
         tensor = extract(output, module)
         if tensor is None:
             return
-        # The offset is 0 except under TBO, where this hook fires once per
-        # micro-batch on a disjoint token slice — writing at row 0
-        # unconditionally would make the ubatches overwrite each other.
-        write(tensor, ctx.ubatch_token_offset)
+        # Under TBO this hook fires once per micro-batch on its own tokens --
+        # writing at token 0 unconditionally would make the ubatches overwrite
+        # each other.
+        tokens = ctx.ubatch_token_order
+        if tokens is None:
+            offset = ctx.ubatch_token_offset
+            tokens = slice(offset, offset + tensor.shape[0])
+        write(tensor, tokens)
 
     return _hook
 
@@ -228,7 +236,10 @@ class Drafter(abc.ABC):
     concretes share — buffer setup, DP-metadata refresh, weight loading /
     sharing, anchor-index preparation, and spec-decode metadata — while the
     flavor hooks (``_resolve_mtp_k``, ``_build_draft_model``) and the hot
-    ``propose`` are subclass-supplied.
+    ``_propose`` are subclass-supplied. ``propose`` and ``warmup_draft_graphs``
+    are templates that do the lossless draft's step first (when ``lossless``
+    is armed), then ``_propose`` / ``_warmup_draft_graphs``; a flavor
+    overrides those, never the templates.
 
     The capability properties (``is_block_drafter`` / ``uses_confidence_schedule``
     / ``verify_scheduler``) are the typed replacements for the historical
@@ -236,8 +247,16 @@ class Drafter(abc.ABC):
     ModelRunner used to scatter through its code.
     """
 
+    #: Lossless speculative sampling's state, armed by a DSpark drafter
+    #: (`DSparkLossless.arm`); None keeps the greedy pair. The runner drives it
+    #: directly: binds it, stages it, and asks it for the verify's q.
+    lossless: "DSparkLossless | None" = None
+
     # The leading taps' rows relayed from earlier PP stages, as one block.
     _relayed_aux: torch.Tensor | None = None
+    # Whether a serial draft's steps 1+ reuse step 0's sparse top-k
+    # (`EagleProposer`); read once by the attention builder.
+    share_mtp_indices = False
 
     def __init__(self, atom_config: Config, device: torch.device, runner):
         self.config = atom_config
@@ -266,6 +285,9 @@ class Drafter(abc.ABC):
             self.config.max_num_seqs, self.mtp_k, self.device
         )
 
+        # Before the passes are declared: which passes there are may depend on
+        # whether lossless sampling armed.
+        self.lossless = self._arm_lossless_draft()
         self._build_draft_graphs()
 
     @staticmethod
@@ -283,6 +305,11 @@ class Drafter(abc.ABC):
             "bonus_logits_indices": CpuGpuBuffer(max_bs, dtype=torch.int64, **kwargs),
         }
 
+    def _arm_lossless_draft(self) -> "DSparkLossless | None":
+        """Arm lossless speculative sampling, or return None and keep the
+        greedy pair. Only a DSpark drafter arms it."""
+        return None
+
     # ---- draft passes ----
     def _declare_draft_graphs(self) -> tuple[DraftGraph, ...]:
         """Declare this drafter's warmable forwards. Opt-in.
@@ -299,16 +326,27 @@ class Drafter(abc.ABC):
             for pass_ in self._declare_draft_graphs()
         )
 
-    @torch.inference_mode()
     def warmup_draft_graphs(self, build_context, end_trace=None) -> None:
+        """Warm the draft passes: clear the lossless draft's destinations,
+        then the flavor's `_warmup_draft_graphs`. A template, so no flavor that
+        replaces the warmup can skip the step before it."""
+        if self.lossless is not None:
+            # The warmup runs the captured block directly, and after a
+            # sleep/wake recapture the last served step's row bases would
+            # overwrite live requests' q: aim every draft row at no q row.
+            self.lossless.clear_destinations()
+        self._warmup_draft_graphs(build_context, end_trace)
+
+    @torch.inference_mode()
+    def _warmup_draft_graphs(self, build_context, end_trace=None) -> None:
         """Run every declared pass once per captured size, paying its JIT here.
 
         aiter's flydsl hgemm builds a kernel per tile config, in-process, so a
         batch first seen mid-serve stalls that step and every restart pays
         again: `hipModuleLoadData` per rank went 6 -> 0 on the 16k/20/50c
-        reproducer, with this and `propose`'s padding.
+        reproducer, with this and `_propose`'s padding.
 
-        Warming `runner.capture_sizes` is the point -- `propose` runs at the batch
+        Warming `runner.capture_sizes` is the point -- `_propose` runs at the batch
         the target ran, which `ForwardMode.decide` picks out of that same list,
         so warmed and reachable are one set by construction rather than two
         that drift.
@@ -319,7 +357,7 @@ class Drafter(abc.ABC):
         all-reduce for the optional capture) and after `allocate_kv_cache`, so
         that context has real ring slots and `is_dummy_run=False`.
 
-        Whatever `propose` sets on the context, this must set too. A capture
+        Whatever `_propose` sets on the context, this must set too. A capture
         bakes every Python branch taken while it is made, so a guard that reads
         the context is decided once, here, for every replay -- `is_draft` gates
         the aux-capture hook away from the draft's own forward, and warming
@@ -383,7 +421,7 @@ class Drafter(abc.ABC):
         1 for a serial flavor, whose declared pass is the mid-step; a block
         flavor drafts its whole width in one pass and overrides. Read by
         `warmup_draft_graphs`, which must state the shape on a synthetic
-        context and cannot ask `propose`.
+        context and cannot ask `_propose`.
         """
         return 1
 
@@ -413,8 +451,33 @@ class Drafter(abc.ABC):
         ``arm_aux_capture`` turns the spec into forward hooks."""
         return self.aux_capture_spec(self.config)
 
-    @abc.abstractmethod
     def propose(
+        self,
+        target_token_ids: torch.Tensor,
+        target_positions: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+        num_reject_tokens: torch.Tensor,
+        next_token_ids: torch.Tensor,
+        last_token_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Draft this step's speculative tokens: claim the lossless draft's
+        staging for this forward (or refuse: a propose that skipped
+        `prepare_sample` would draft through stale row bases), then the
+        flavor's `_propose`. A template, so no flavor can skip the step before
+        it."""
+        if self.lossless is not None:
+            self.lossless.staging.consume()
+        return self._propose(
+            target_token_ids,
+            target_positions,
+            target_hidden_states,
+            num_reject_tokens,
+            next_token_ids,
+            last_token_indices,
+        )
+
+    @abc.abstractmethod
+    def _propose(
         self,
         target_token_ids: torch.Tensor,
         target_positions: torch.Tensor,
@@ -505,9 +568,9 @@ class Drafter(abc.ABC):
     def _make_aux_hook(self, buf_idx: int, extract):
         buffer = self._aux_buffers[buf_idx]
 
-        def write(tensor, off):
+        def write(tensor, tokens):
             # In-place write into the fixed buffer (cudagraph-safe).
-            buffer[off : off + tensor.shape[0]].copy_(tensor)
+            buffer[tokens] = tensor
 
         return _aux_hook(extract, write)
 
@@ -550,8 +613,7 @@ class Drafter(abc.ABC):
         """
         n = len(anchors)
         buf = self.runner.forward_vars["draft_next_tokens"]
-        if buf._publication is not None:
-            buf._publication.acquire_write()
+        buf.acquire_write()
         buf.np[:n] = anchors
         return buf.copy_to_gpu(n)
 
@@ -792,27 +854,22 @@ class Drafter(abc.ABC):
         var["target_logits_indices"].np[:sum_drafted_tokens] = target_logits_indices
         var["cu_num_draft_tokens"].np[:scheduled_bs] = cu_num_draft_tokens
         var["bonus_logits_indices"].np[:scheduled_bs] = bonus_logits_indices
-        group = publication_group
-        counts = group.counts
-        counts[group.indices["target_logits_indices"]] = sum_drafted_tokens
-        counts[group.indices["cu_num_draft_tokens"]] = scheduled_bs
-        counts[group.indices["bonus_logits_indices"]] = scheduled_bs
+        publication_group.set_counts(
+            {
+                "target_logits_indices": sum_drafted_tokens,
+                "cu_num_draft_tokens": scheduled_bs,
+                "bonus_logits_indices": scheduled_bs,
+            }
+        )
         return num_draft_tokens, sum_drafted_tokens
 
     def calc_spec_decode_metadata(
         self,
-        num_sampled_tokens: np.ndarray,
-        cu_num_sampled_tokens: np.ndarray,
         input_ids: torch.Tensor,
-        *,
-        prepared_indices: tuple[np.ndarray, int] | None = None,
+        prepared_indices: tuple[np.ndarray, int],
     ) -> SpecDecodeMetadata:
-        if prepared_indices is None:
-            group = self.runner.h2d_groups["spec_decode"]
-            prepared_indices = self.prepare_spec_decode_indices(
-                num_sampled_tokens, cu_num_sampled_tokens, group
-            )
-            group.publish(group.counts)
+        """The verify's index views, published with the token inputs
+        (`prepare_spec_decode_indices` returned ``prepared_indices``)."""
         num_draft_tokens, sum_drafted_tokens = prepared_indices
         scheduled_bs = len(num_draft_tokens)
         var = self.runner.forward_vars

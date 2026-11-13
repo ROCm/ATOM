@@ -32,15 +32,15 @@ from atom.kv_transfer.offload.metadata import (
 from atom.kv_transfer.offload.mp.deployment import (
     _model_namespace,
     _tp_replication_factor,
+    require_native_state_server,
 )
 from atom.kv_transfer.offload.mp.native_state_layout import (
     build_native_state_mp_layout,
+    stores_state_images,
 )
 from atom.kv_transfer.offload.mp.native_state_worker import (
     NATIVE_STATE_MP_STORE_CHANNEL,
     NativeStateLMCacheMPConnector,
-    require_native_state_server,
-    stores_state_images,
 )
 from atom.model_engine.arg_utils import (
     compose_kv_offload_config,
@@ -638,6 +638,7 @@ def test_registration_reserves_every_restore_descriptor_slot(monkeypatch):
     import types
 
     from atom.kv_transfer.offload.mp import native_state_layout, native_state_worker
+    from atom.kv_transfer.offload.mp import worker as mp_worker
 
     parallel_state = types.ModuleType("aiter.dist.parallel_state")
     parallel_state.get_tp_group = lambda: SimpleNamespace(rank_in_group=0)
@@ -647,12 +648,9 @@ def test_registration_reserves_every_restore_descriptor_slot(monkeypatch):
         register_kv_caches=lambda tensors, engine_group_infos: None,
         shutdown=lambda: None,
     )
-    monkeypatch.setattr(
-        native_state_worker, "_make_worker_adapter", lambda *_a, **_k: adapter
-    )
-    monkeypatch.setattr(
-        native_state_worker, "require_native_state_server", lambda *_a: None
-    )
+    # The registration both MP workers share lives on the base worker.
+    monkeypatch.setattr(mp_worker, "_make_worker_adapter", lambda *_a, **_k: adapter)
+    monkeypatch.setattr(mp_worker, "require_native_state_server", lambda *_a: None)
     monkeypatch.setattr(
         native_state_layout.NativeStateMPLayout, "engine_group_infos", lambda _s: []
     )
@@ -721,10 +719,10 @@ def test_raising_restore_keeps_its_descriptor_slot_until_the_deadline(
 
 
 def test_native_server_chunk_mismatch_fails_before_registration(monkeypatch):
-    from atom.kv_transfer.offload.mp import native_state_worker
+    from atom.kv_transfer.offload.mp import deployment
 
     monkeypatch.setattr(
-        native_state_worker.offcfg,
+        deployment.offcfg,
         "build_lmcache_config",
         lambda _: SimpleNamespace(chunk_size=256),
     )
@@ -764,3 +762,48 @@ def test_a_layout_without_images_has_a_namespace_of_its_own(monkeypatch):
     assert with_images != page_alone
     assert "::native-state-v1-" in with_images
     assert "::native-page-v1-" in page_alone
+
+
+def test_a_save_that_landed_during_the_forward_is_reported_that_step(worker):
+    """The scheduler admits at most `max_pending_saves` native saves (two by
+    default), so one reported a step late keeps the next out: the report
+    polls every save, on the step thread."""
+    req = request()
+    worker._submit_save(req, object())
+    worker.future.ready = True
+    completions = worker.get_finished().connector_completions
+    assert (
+        ConnectorCompletion(NATIVE_STATE_MP_STORE_CHANNEL, req.save_operation, True)
+        in completions
+    )
+
+
+def test_native_transfers_are_submitted_and_polled_on_the_step_thread():
+    """As native ATOM always has: a submit before the forward and a poll at
+    the report, the timing its save admission is sized to. No transfer
+    thread starts."""
+    import threading
+
+    instance = _make_worker()
+    submit, query = [], []
+    future = instance.future
+    real_query = future.query
+
+    def recording_query():
+        query.append(threading.current_thread() is threading.main_thread())
+        return real_query()
+
+    future.query = recording_query
+
+    def recording_submit(request_id, op, event):
+        submit.append(threading.current_thread() is threading.main_thread())
+        return future
+
+    instance._adapter.submit_store_request = recording_submit
+    threads = threading.active_count()
+    instance._submit_save(request(), object())
+    future.ready = True
+    assert submit == [True]
+    instance.get_finished()
+    assert query and all(query)
+    assert threading.active_count() == threads

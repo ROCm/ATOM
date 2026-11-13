@@ -25,6 +25,13 @@ MTP_K = 7
 NUM = MTP_K + 1  # anchor + drafts
 
 
+def _positions(ctx):
+    """`decode_positions` of a batch whose sequences each run `NUM` tokens."""
+    lengths = np.full(len(ctx), NUM, dtype=np.int32)
+    cu = np.concatenate(([0], np.cumsum(lengths))).astype(np.int32)
+    return decode_positions(ctx, lengths, cu)
+
+
 def _verify_ctx_lens(context_lens, num_rejected, is_deferred_out):
     processor = SimpleNamespace(
         num_rejected=num_rejected, is_deferred_out=is_deferred_out
@@ -59,7 +66,7 @@ def test_builder_positions_match_staged_window(
     batch = _decode_batch(seq_factory, 162, num_rejected, is_deferred_out)
     context_lens = np.asarray(batch.context_lens, dtype=np.int32)
     ctx = _verify_ctx_lens(context_lens, batch.num_rejected, is_deferred_out)
-    np.testing.assert_array_equal(decode_positions(ctx, NUM), batch.scheduled_tokens)
+    np.testing.assert_array_equal(_positions(ctx), batch.scheduled_tokens)
 
 
 @pytest.mark.parametrize("num_rejected", [0, 3, 6])
@@ -67,7 +74,7 @@ def test_undeferred_window_is_not_shifted_by_num_rejected(seq_factory, num_rejec
     # The deferred shift applied to undeferred output lands the window
     # `num_rejected - 1` slots early.
     batch = _decode_batch(seq_factory, 162, num_rejected, is_deferred_out=False)
-    stale = decode_positions(batch.context_lens - batch.num_rejected, NUM)
+    stale = _positions(batch.context_lens - batch.num_rejected)
     assert stale[0] == batch.scheduled_tokens[0] - (num_rejected - 1)
 
 

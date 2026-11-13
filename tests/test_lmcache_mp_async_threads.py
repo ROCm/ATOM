@@ -295,6 +295,99 @@ def test_transfer_thread_reraises_a_failed_submission_on_the_caller():
         thread.close(5.0)
 
 
+def test_an_asked_round_polls_before_the_rest_of_the_queue():
+    """A backlog of submissions must not hold back a finished load's report
+    or a fence: the round asked for runs after the submission in progress."""
+    order = []
+    gate = threading.Event()
+    running = threading.Event()
+
+    def first():
+        running.set()
+        gate.wait(5.0)
+        order.append("first")
+
+    thread = transfer_thread._TransferThread(
+        "mp-transfer-test", poll=lambda _thread: order.append("poll")
+    )
+    try:
+        thread.submit(first)
+        assert running.wait(5.0)
+        thread.submit(order.append, "second")
+        thread.submit(order.append, "third")
+        thread.look(0)
+        gate.set()
+        assert thread.drain(5.0)
+        after = order[order.index("first") :]
+        assert after[:2] == ["first", "poll"]
+    finally:
+        thread.close(5.0)
+
+
+def test_a_failed_poll_round_stops_the_polling(caplog):
+    """The failure is raised on the forward thread; another round would only
+    fail and log again, every `_IDLE_POLL_S`, until the engine stepped."""
+    rounds = []
+
+    def poll(_thread):
+        rounds.append(1)
+        raise RuntimeError("transfer deadline")
+
+    thread = transfer_thread._TransferThread("mp-transfer-test", poll=poll)
+    try:
+        assert thread.wait_round(thread.request_round(), 5.0)
+        assert not thread.wait_round(thread.request_round(), 5.0)
+        assert len(rounds) == 1
+        assert caplog.text.count("transfer poll failed") == 1
+        # Raised on every call: nothing else would report what is left.
+        for _ in range(2):
+            with pytest.raises(RuntimeError, match="transfer deadline"):
+                thread.raise_error()
+    finally:
+        thread.close(5.0)
+
+
+def test_the_polling_timer_runs_only_while_transfers_are_in_flight():
+    """Idle, a rank's thread waits for a submission or a request; with a
+    transfer in flight it polls on its own, for a rank that stopped stepping."""
+    in_flight = [False]
+    rounds = []
+
+    def poll(_thread):
+        rounds.append(1)
+        return in_flight[0]
+
+    thread = transfer_thread._TransferThread("mp-transfer-test", poll=poll)
+    try:
+        assert thread.wait_round(thread.request_round(), 5.0)
+        time.sleep(4 * transfer_thread._IDLE_POLL_S)
+        assert len(rounds) == 1
+        in_flight[0] = True
+        target = thread.request_round()
+        assert thread.wait_round(target + 2, 5.0)
+    finally:
+        thread.close(5.0)
+
+
+def test_a_handed_back_future_is_dropped_once_nothing_else_holds_it():
+    """One LMCache still references stays queued: its last reference would
+    otherwise be dropped by LMCache's next submission, on the transfer
+    thread."""
+    thread = transfer_thread._TransferThread(
+        "mp-transfer-test", poll=lambda _thread: None
+    )
+    try:
+        lmcache = [object()]
+        ident = id(lmcache[0])
+        thread.hand_back(lmcache[0])
+        assert thread.take_returned() == []
+        lmcache.clear()
+        assert [id(future) for future in thread.take_returned()] == [ident]
+        assert thread.take_returned() == []
+    finally:
+        thread.close(5.0)
+
+
 # ── worker: same-step saves go out behind the forward ───────────────────
 
 

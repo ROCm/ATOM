@@ -5,7 +5,9 @@ Covers the self-contained, GPU-free pieces: Markov head + Confidence head
 numerics, and SpeculativeConfig DSpark detection/routing.
 """
 
+import inspect
 import types
+from contextlib import nullcontext
 
 import numpy as np
 import pytest
@@ -22,6 +24,7 @@ pytest.importorskip(
 
 import torch
 
+import atom.model_ops.spec_sampling.dspark_markov_sample as dspark_markov_sample_mod
 import atom.spec_decode.drafter as mod_drafter
 from atom.model_ops.v4_kernels.dspark_fp8_indices import DSparkIndexBuffers
 from atom.models.deepseek_v4_dspark import (
@@ -105,6 +108,42 @@ def test_semi_autoregressive_bias_changes_argmax():
     combined = base + bias
     assert int(base.argmax(-1)) == 9
     assert int(combined.argmax(-1)) == 2
+
+
+def test_the_sampled_block_chains_positions_through_the_shared_head(monkeypatch):
+    """`DSparkMarkovHead.sample_block`, the block loop Kimi-K3 samples
+    through: position k draws from x_{k-1} into its own column, at store
+    position k, with the noise counter strided by the buffers' max batch."""
+    max_bs, bs, steps, V = 4, 3, 3, 10
+    head = DSparkMarkovHead(vocab_size=V, rank=2)
+    per_row = torch.zeros(max_bs)
+    sampling = types.SimpleNamespace(
+        q_store=(None, None, None),
+        q_row_base=torch.zeros(max_bs, dtype=torch.int32),
+        temperatures=per_row,
+        top_k=per_row,
+        top_p=per_row,
+        seed=None,
+        scratch=None,
+    )
+    calls = []
+    # The op's own parameters, as its fake (which torch requires to match) has
+    # them: the registered op itself is wrapped as (*args, **kwargs).
+    signature = inspect.signature(dspark_markov_sample_mod._dspark_markov_sample_fake)
+
+    def sample(*args, **kwargs):
+        # By name, so a reordered signature cannot read the wrong inputs.
+        a = signature.bind(*args, **kwargs).arguments
+        calls.append((a["q_row_base"].shape[0], a["position"], a["noise_offset"]))
+        assert torch.equal(a["base_logits"], base_logits[:, a["position"]])
+        a["out"].copy_(a["prev_ids"] + 1)
+
+    monkeypatch.setattr(dspark_markov_sample_mod, "dspark_markov_sample", sample)
+    base_logits = torch.randn(bs, steps, V)
+    anchors = torch.tensor([0, 3, 5])
+    drafts = head.sample_block(base_logits, anchors, sampling)
+    assert torch.equal(drafts, anchors[:, None] + torch.arange(1, steps + 1))
+    assert calls == [(bs, k, k * max_bs * V) for k in range(steps)]
 
 
 def _real_hf_config_override():
@@ -850,6 +889,7 @@ def _proposer_with_graph_bs(
     )
     p.device = torch.device("cpu")
     p.mtp_k = mtp_k
+    p.lossless = None  # lossless sampling off: the greedy draft
     p.model = types.SimpleNamespace(
         vocab_size=1024, window_size=window, supports_block_graph=True
     )
@@ -886,7 +926,14 @@ def _install_block_halves(p, inner):
     p.model.model = inner
     p.model.prepare_block = types.MethodType(DeepseekV4DSpark.prepare_block, p.model)
     p.model.block_backbone = lambda ids, pos, num_draft: inner(ids, pos, num_draft)
-    p.model.head_and_sample = lambda out, ids, _: inner.head_and_sample(*out, ids)
+    # Which head each call asked for, `greedy` or the bound sampling.
+    p.model.greedy_heads = []
+
+    def head_and_sample(out, ids, _, *, greedy=False):
+        p.model.greedy_heads.append(greedy)
+        return inner.head_and_sample(*out, ids)
+
+    p.model.head_and_sample = head_and_sample
     return p
 
 
@@ -1052,7 +1099,7 @@ def test_propose_puts_the_pass_on_the_path_its_own_shape_is_on(monkeypatch):
 class _BareFlavor(mod_drafter.Drafter):
     """The abstract methods, stubbed. `_publish_draft_shape` reads neither."""
 
-    _resolve_mtp_k = propose = staticmethod(lambda *a, **k: None)
+    _resolve_mtp_k = _propose = staticmethod(lambda *a, **k: None)
 
 
 def _bare_drafter(dp_size):
@@ -1433,6 +1480,61 @@ def test_both_flavors_declare_one_block_pass_bound_to_the_same_halves(monkeypatc
     assert p.draft_graphs == (p.block,)
     assert p.block.forward == p._block_backbone
     assert p.block.epilogue == p._block_head
+
+
+def _armed(draws_q):
+    """A lossless stand-in: only what `propose` and the declaration read."""
+    return types.SimpleNamespace(
+        staging=types.SimpleNamespace(draws_q=draws_q, consume=lambda: None)
+    )
+
+
+def test_an_armed_drafter_declares_a_greedy_block_beside_the_sampled_one(
+    monkeypatch,
+):
+    """Armed without DP: two passes over one backbone, the sampled head in
+    ``block`` and the greedy one in ``block_greedy``. With DP the choice
+    would be per rank, so only ``block`` is declared."""
+    p = _proposer_with_graph_bs(monkeypatch)
+    assert p.block_greedy is None
+    p.lossless = _armed(True)
+    p._build_draft_graphs()
+    assert p.draft_graphs == (p.block, p.block_greedy)
+    assert p.block_greedy.forward == p.block.forward == p._block_backbone
+    assert p.block.epilogue == p._block_head
+    assert p.block_greedy.epilogue == p._block_head_greedy
+    assert p.block_greedy.label(4, 8).endswith(" greedy")
+    assert not p.block.label(4, 8).endswith(" greedy")
+
+    p = _proposer_with_graph_bs(monkeypatch)
+    _on_two_dp_ranks(p)
+    p.lossless = _armed(True)
+    p._build_draft_graphs()
+    assert p.draft_graphs == (p.block,) and p.block_greedy is None
+
+
+@pytest.mark.parametrize("draws_q", [True, False])
+def test_a_step_that_draws_no_q_replays_the_greedy_block(monkeypatch, draws_q):
+    """The pass is picked once per step and carries the anchors, the run and
+    the profiler label; only the greedy one asks the head for ``greedy``."""
+    import atom.spec_decode.dspark_proposer as mod
+
+    seen, labels = {}, []
+    p = _proposer_with_graph_bs(monkeypatch)
+    p.lossless = _armed(draws_q)
+    p._build_draft_graphs()
+    monkeypatch.setattr(
+        mod, "record_function", lambda name: labels.append(name) or nullcontext()
+    )
+    fc = _stub_forward_context(scheduled_bs=8, target_bs=8)
+    _run_propose(p, fc, 8, monkeypatch, seen)
+
+    ran, idle = (p.block, p.block_greedy) if draws_q else (p.block_greedy, p.block)
+    assert p.model.greedy_heads == [not draws_q]
+    assert ran.buffer("anchor_ids", 8).tolist() == [5] * 8
+    assert idle.buffer("anchor_ids", 8).tolist() == [0] * 8
+    (label,) = [name for name in labels if name.startswith("propose_dspark")]
+    assert (" greedy" in label) is (not draws_q)
 
 
 def test_the_backbone_gets_the_positions_the_slot_mapping_was_built_from(monkeypatch):
@@ -2319,8 +2421,8 @@ def test_the_borrowed_page_is_given_back_even_when_the_generator_raises(monkeypa
 def test_the_metadata_build_is_gated_on_the_pool_not_on_the_dummy_flag(monkeypatch):
     """`is_dummy_run` covers two passes and only one of them lacks a pool.
 
-    `warmup_model()` runs before `allocate_kv_cache()`; `dummy_execution()`'s
-    DP-alignment step is a dummy whose pool is fully bound. Returning early on
+    `warmup_model()` runs before `allocate_kv_cache()`; a dynamic-chunking
+    profile runs after it, its pool fully bound. Returning early on
     the flag leaves a replay writing through the last real step's slots.
     """
     T = 7
@@ -2340,11 +2442,11 @@ def test_the_metadata_build_is_gated_on_the_pool_not_on_the_dummy_flag(monkeypat
         assert stale is not expect_written, f"pool bound={bound}: slots stale={stale}"
 
 
-def test_a_dp_sync_dummy_describes_every_row_of_the_block_as_pad(monkeypatch):
-    """The dummy has to RUN -- the peers mirror its collectives -- but its one
-    sequence is fabricated and its block table is [0], so no row of it owns a
-    page. Describing it as pad is what makes the pass write nothing, and the
-    width must not shrink: `scheduled_bs` still slices the ids the caller gets.
+def test_rows_past_scheduled_bs_are_described_as_pad(monkeypatch):
+    """Every row past `scheduled_bs` is described as pad, all of them for a
+    step that schedules none (an idle DP rank's, which still runs for its
+    peers' collectives), and the width does not shrink: `scheduled_bs` slices
+    the caller's ids.
     """
     p, _, _ = _paged_proposer(monkeypatch, max_model_len=256, block_size=64)
     T = p.draft_tokens_per_seq
@@ -2361,23 +2463,24 @@ def test_a_dp_sync_dummy_describes_every_row_of_the_block_as_pad(monkeypatch):
         type(p), "_publish_draft_shape", lambda self, *a, **k: None, raising=False
     )
     monkeypatch.setattr(type(p), "verify_scheduler", None, raising=False)
-    p.block = types.SimpleNamespace(
+    block = types.SimpleNamespace(
         label=lambda s, r: f"bs={s}/{r}",
         run=lambda bs, **staged: (torch.zeros(bs, T, dtype=torch.int32), None),
     )
 
-    for dummy, expect in ((False, 1), (True, 0)):
-        fc = _paged_fc(is_dummy_run=dummy)
+    for scheduled_bs in (1, 0):
+        fc = _paged_fc()
         fc.context.running_bs = 4
         out = p._propose_with_draft(
+            block,
             fc,
             fc.attn_metadata,
             {"anchor_positions": torch.zeros(4, dtype=torch.int64)},
-            1,
+            scheduled_bs,
         )
-        assert seen["described_bs"] == expect, f"is_dummy_run={dummy}"
+        assert seen["described_bs"] == scheduled_bs
         assert seen["rows"] == 4, "the width is the agreed batch either way"
-        assert out.shape == (1, T), "the ids are still sliced to the real rows"
+        assert out.shape == (scheduled_bs, T), "the ids are sliced to real rows"
 
 
 def _persistent_probe(monkeypatch, *, page_size, dcp_world_size, dcp_persistent):
@@ -2466,7 +2569,10 @@ def test_the_premise_check_passes_the_configuration_k3_actually_ships(monkeypatc
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
-def test_staged_anchors_clamp_the_id_and_repeat_the_last_row_into_the_pad():
+@pytest.mark.parametrize("scheduled_bs", [4, 0])
+def test_staged_anchors_clamp_the_id_and_zero_the_pad(scheduled_bs):
+    """A row past `scheduled_bs` is token 0 at position 0, a step with no
+    scheduled row included."""
     from atom.spec_decode.dspark_proposer import _stage_anchors_kernel
 
     running_bs, vocab_max = 6, 99
@@ -2476,10 +2582,17 @@ def test_staged_anchors_clamp_the_id_and_repeat_the_last_row_into_the_pad():
     ids = torch.full((running_bs,), -7, dtype=torch.int32, device="cuda")
     anchor_positions = torch.full((running_bs,), -7, dtype=torch.int64, device="cuda")
     _stage_anchors_kernel[(running_bs,)](
-        ids, anchor_positions, next_ids, positions, rows, 4, vocab_max
+        ids,
+        anchor_positions,
+        next_ids[:scheduled_bs],
+        positions,
+        rows[:scheduled_bs],
+        scheduled_bs,
+        vocab_max,
     )
-    assert ids.tolist() == [5, 0, 99, 7, 7, 7]
-    assert anchor_positions.tolist() == [6, 15, 27, 39, 39, 39]
+    pad = [0] * (running_bs - scheduled_bs)
+    assert ids.tolist() == [5, 0, 99, 7][:scheduled_bs] + pad
+    assert anchor_positions.tolist() == [6, 15, 27, 39][:scheduled_bs] + pad
 
 
 def test_page16_table_expands_every_page_into_its_eight_sub_pages():
