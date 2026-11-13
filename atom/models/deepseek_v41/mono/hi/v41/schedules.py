@@ -461,6 +461,7 @@ def knobs(
     if long_from and tokens >= long_from:
         base = kind.split(SPLIT)[0]
         entry = {**entry, **LONG.get(base, {}), **LONG_ROWS.get((base, rows), {})}
+        entry.update(_env_over(kind, rows))  # the tuning aid's knobs over LONG's too
     out = {**DEFAULT, **entry}
     for n, v in given.items():
         if n not in DEFAULT:
