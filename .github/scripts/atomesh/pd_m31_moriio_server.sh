@@ -37,6 +37,9 @@ M31_VLLM_ARGS=(
   --max-model-len 1048576
   --reasoning-parser minimax_m3 --tool-call-parser minimax_m3 --enable-auto-tool-choice
 )
+# vllm serve words for every server, e.g. an image's serving switches.
+read -r -a m31_extra_args <<< "${ATOMESH_M31_EXTRA_ARGS:-}"
+M31_VLLM_ARGS+=("${m31_extra_args[@]}")
 
 quote() {
   local a out=()
@@ -57,11 +60,20 @@ m31_overlay() {
   cp -a "${image_vllm}" "${M31_ROOT}/site/vllm" || return 2
   env "${M31_ENV[@]}" python3 - "${src}" "${M31_ROOT}/site" "${M31_ROOT}/overlay.txt" \
     "${ATOMESH_M31_VLLM_BASE_SHA}" "${RUN_DIR}/m31-stack-rank-${NODE_RANK}.json" <<'PY' || return 2
-import importlib.metadata, json, pathlib, re, shutil, sys
+import importlib.metadata, json, pathlib, re, shutil, subprocess, sys
 
 src, site, listing = map(pathlib.Path, sys.argv[1:4])
 base, out = sys.argv[4], pathlib.Path(sys.argv[5])
 changes = [line.split("\t") for line in listing.read_text().splitlines()]
+# An image that patched a file on top of the base commit would silently lose that patch.
+for status, rel in changes:
+    if status in ("M", "D"):
+        base_blob = subprocess.run(["git", "-C", str(src), "show", f"{base}:{rel}"],
+                                   check=True, capture_output=True).stdout
+        if (site / rel).read_bytes() != base_blob:
+            raise SystemExit(f"image {rel} differs from {base}; the overlay would drop the image's change")
+    elif status == "A" and (site / rel).exists():
+        raise SystemExit(f"image already has {rel}; the overlay would replace it")
 for status, rel in changes:
     if status == "D":
         (site / rel).unlink()

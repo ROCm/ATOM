@@ -16996,6 +16996,45 @@ models:
             common:
               <<: *m31_n967_c80_env
               ATOMESH_M31_D_MAX_SEQS: "18"
+        # The image of InferenceX #5035's MI355X aggregated lane (vLLM 4fab5a07 with the MiniMax-M3.1
+        # ROCm serving stack and amd_kernels), run as shipped, with that lane's serving switches: P DBO,
+        # breakable CUDA graphs (P up to 2048 tokens), 8 renderer workers, batch-sharded sampling, and
+        # none of the older opt-in ROCm switches. The PD side is the n967 C64 and C80 cases'.
+        - &m31_moriio_1p2d_m75_case
+          <<: *m31_moriio_1p2d_n967_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-m75-c64-dcap16
+          image: vllm/vllm-openai-rocm:minimax-m31-flash-75bc8cf1@sha256:f8e8ab239e5edb7c3070c5802fc7fc0cbb889513bf81183dfc98ce1c77e1dfe1
+          concurrency: [64]
+          env:
+            common: &m31_m75_env
+              <<: *m31_n967_env
+              ATOMESH_M31_VLLM_SHA: 4fab5a07475822c6eaa971dceb2e2220d0446808
+              ATOMESH_M31_VLLM_BASE_SHA: 4fab5a07475822c6eaa971dceb2e2220d0446808
+              ATOMESH_M31_EXTRA_ENV: DEBUG_HIP_IGNORE_STREAM_PRIORITY=0 VLLM_USE_BREAKABLE_CUDAGRAPH=1
+              ATOMESH_M31_EXTRA_ARGS: --renderer-num-workers 8 --enable-batch-sharded-sampling
+              ATOMESH_M31_P_DBO: "1"
+              ATOMESH_M31_P_EXTRA_ARGS: '--compilation-config {"max_cudagraph_capture_size":2048}'
+              ATOMESH_M31_D_MAX_SEQS: "16"
+              ATOMESH_M31_P_CPU_OFFLOAD_BYTES: "1349000000000"
+        - &m31_moriio_1p2d_m75_c80_case
+          <<: *m31_moriio_1p2d_m75_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-m75-c80-dcap20-cpu15-lpt4k
+          concurrency: [80]
+          env:
+            common: &m31_m75_c80_env
+              <<: *m31_m75_env
+              ATOMESH_M31_D_MAX_SEQS: "20"
+              ATOMESH_M31_P_CPU_OFFLOAD_BYTES: "1499000000000"
+              ATOMESH_M31_P_EXTRA_ARGS: '--compilation-config {"max_cudagraph_capture_size":2048} --long-prefill-token-threshold 4096'
+        # The same C80 with PR 65822 (MoRIIO WRITE skips the blocks the decoder prefix cache holds) laid
+        # over the image's vllm package.
+        - <<: *m31_moriio_1p2d_m75_c80_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-m75s-c80-dcap20-cpu15-lpt4k
+          env:
+            common:
+              <<: *m31_m75_c80_env
+              ATOMESH_M31_VLLM_REPO: https://github.com/whx-sjtu/vllm.git
+              ATOMESH_M31_VLLM_SHA: 8c7e9724ea67ba7c116c9c623798670ff7552fc1
         # The local 1P1D layout (P GPUs 0-3, D GPUs 4-7 of one node) with xgmi swapped for RDMA.
         - &m31_moriio_1p1d_sn_case
           <<: *m31_moriio_1p2d_case
