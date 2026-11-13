@@ -16996,6 +16996,53 @@ models:
             common:
               <<: *m31_n967_c80_env
               ATOMESH_M31_D_MAX_SEQS: "18"
+        # InferenceX #4973's five points with the image's MooncakeConnector (mooncake-transfer-engine-rocm
+        # 0.3.14, multi-protocol) in place of MoRIIO; vllm-router in Mooncake mode, same policies. Mooncake
+        # env as the ATOM K3 Mooncake RDMA cases (dma-buf registration, GID 1, TC 104).
+        - &m31_mc_1p2d_n967_case
+          <<: *m31_moriio_1p2d_n967_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-n967-mc-c64-dcap16
+          concurrency: [64]
+          env:
+            common: &m31_n967_mc_env
+              <<: *m31_n967_env
+              ATOMESH_M31_CONNECTOR: mooncake
+              MC_GID_INDEX: "1"
+              MC_IB_TC: "104"
+              MC_MAX_CONCURRENT_REG_MR: "1"
+              VLLM_MOONCAKE_CONNECTOR_TIMEOUT: "600"
+              ATOMESH_M31_D_MAX_SEQS: "16"
+        - <<: *m31_mc_1p2d_n967_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-n967-mc-c40-dcap10
+          concurrency: [40]
+          env:
+            common:
+              <<: *m31_n967_mc_env
+              ATOMESH_M31_D_MAX_SEQS: "10"
+        - <<: *m31_mc_1p2d_n967_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-n967-mc-c48-dcap12
+          concurrency: [48]
+          env:
+            common:
+              <<: *m31_n967_mc_env
+              ATOMESH_M31_D_MAX_SEQS: "12"
+        - <<: *m31_mc_1p2d_n967_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-n967-mc-c72-dcap18-cpu15
+          concurrency: [72]
+          env:
+            common:
+              <<: *m31_n967_mc_env
+              ATOMESH_M31_D_MAX_SEQS: "18"
+              ATOMESH_M31_P_CPU_OFFLOAD_BYTES: "1499000000000"
+        - <<: *m31_mc_1p2d_n967_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-n967-mc-c80-dcap20-cpu15-lpt4k
+          concurrency: [80]
+          env:
+            common:
+              <<: *m31_n967_mc_env
+              ATOMESH_M31_D_MAX_SEQS: "20"
+              ATOMESH_M31_P_CPU_OFFLOAD_BYTES: "1499000000000"
+              ATOMESH_M31_P_EXTRA_ARGS: --long-prefill-token-threshold 4096
         # The local 1P1D layout (P GPUs 0-3, D GPUs 4-7 of one node) with xgmi swapped for RDMA.
         - &m31_moriio_1p1d_sn_case
           <<: *m31_moriio_1p2d_case

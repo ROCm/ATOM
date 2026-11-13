@@ -5,10 +5,14 @@
 # test_scripts/pd/launch_pd_main.sh CONC --offload; only PYTHONPATH, hosts, MoRIIO ports, the rdma
 # backend, the offload size and the per-D max-num-seqs are adapted to the two-node layout. Workers
 # register with the rank-0 vllm-router sidecar (pd_slurm_job.sh) through MoRIIO discovery.
+# ATOMESH_M31_CONNECTOR=mooncake swaps MoRIIO for the image's MooncakeConnector (RDMA, P writes into D);
+# the router then runs in Mooncake mode on static P/D URLs, started once P and D are healthy.
 
 M31_ROOT="/tmp/atomesh-m31-${SLURM_JOB_ID:-local}-${NODE_RANK}"
 M31_HANDSHAKE_PORT=$((6301 + ATOMESH_SERVICE_PORT_OFFSET))
 M31_NOTIFY_PORT=$((61005 + ATOMESH_SERVICE_PORT_OFFSET))
+M31_MC_BOOTSTRAP_PORT=$((18998 + ATOMESH_SERVICE_PORT_OFFSET))
+M31_CONNECTOR="${ATOMESH_M31_CONNECTOR:-moriio}"
 
 m31_conc="${CONC_LIST//[[:space:]]/}"
 [[ "${m31_conc}" =~ ^[1-9][0-9]*$ ]] || {
@@ -57,7 +61,7 @@ m31_overlay() {
   cp -a "${image_vllm}" "${M31_ROOT}/site/vllm" || return 2
   env "${M31_ENV[@]}" python3 - "${src}" "${M31_ROOT}/site" "${M31_ROOT}/overlay.txt" \
     "${ATOMESH_M31_VLLM_BASE_SHA}" "${RUN_DIR}/m31-stack-rank-${NODE_RANK}.json" <<'PY' || return 2
-import importlib.metadata, json, pathlib, re, shutil, sys
+import importlib.metadata, json, os, pathlib, re, shutil, sys
 
 src, site, listing = map(pathlib.Path, sys.argv[1:4])
 base, out = sys.argv[4], pathlib.Path(sys.argv[5])
@@ -75,13 +79,16 @@ import vllm
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_connector import MoRIIOConnector  # noqa: F401
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import MultiConnector  # noqa: F401
 from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload_connector import SimpleCPUOffloadConnector  # noqa: F401
+if os.environ.get("ATOMESH_M31_CONNECTOR") == "mooncake":
+    # MooncakeConnector only logs a missing engine; fail before the servers start.
+    from mooncake.engine import TransferEngine  # noqa: F401
 
 assert vllm.__file__.startswith(str(site)), vllm.__file__
 # The diff is only exact if the image was built from the diff base.
 image_commit = re.search(r"\+g([0-9a-f]{7,40})", vllm.__version__)
 assert image_commit and base.startswith(image_commit.group(1)), (vllm.__version__, base)
 versions = {}
-for name in ("vllm", "torch", "triton", "amd-aiter", "mori"):
+for name in ("vllm", "torch", "triton", "amd-aiter", "mori", "mooncake-transfer-engine-rocm"):
     try:
         versions[name] = importlib.metadata.version(name)
     except importlib.metadata.PackageNotFoundError:
@@ -102,6 +109,30 @@ m31_moriio() {
   echo "{\"kv_connector\":\"MoRIIOConnector\",\"kv_role\":\"$1\",\"kv_connector_extra_config\":{\"proxy_ip\":\"${NODE0_ADDR}\",\"proxy_ping_port\":${VLLM_DISCOVERY_PORT},\"http_port\":$2,\"handshake_port\":$3,\"notify_port\":$4,\"backend\":\"rdma\",\"num_workers\":4,\"qp_per_transfer\":4,\"read_mode\":${ATOMESH_M31_MORIIO_READ_MODE:-false}}}"
 }
 
+# m31_mooncake ROLE: the MooncakeConnector settings of the ATOM K3 Mooncake RDMA cases.
+m31_mooncake() {
+  echo "{\"kv_connector\":\"MooncakeConnector\",\"kv_role\":\"$1\",\"kv_connector_extra_config\":{\"mooncake_protocol\":\"rdma\",\"num_workers\":10}}"
+}
+
+if [[ "${M31_CONNECTOR}" == mooncake ]]; then
+  # The Mooncake router queries P's bootstrap server once at startup, so pd_slurm_job.sh starts it on
+  # this request, written after P and D report healthy.
+  start_router() {
+    router_pid=""
+    local request="${RUN_DIR}/mooncake-router-${ATOMESH_EXECUTION_PHASE:-combined}.args" i
+    {
+      for i in "${!prefill_ips[@]}"; do
+        printf '%s\n' --prefill "http://${prefill_ips[i]}:${prefill_ports[i]}" \
+          $((M31_MC_BOOTSTRAP_PORT + prefill_ports[i] - PREFILL_PORT))
+      done
+      for i in "${!decode_ips[@]}"; do
+        printf '%s\n' --decode "http://${decode_ips[i]}:${decode_ports[i]}"
+      done
+    } > "${request}.tmp" && mv "${request}.tmp" "${request}"
+    echo "[router] requested Mooncake vllm-router: $(tr '\n' ' ' < "${request}")"
+  }
+fi
+
 start_vllm_server() {
   local role="$1" log_name="$2" server_port="$3" gpus idx xfer
   local -a cache_env=() role_env=() role_args=() pin=() p_extra_args=()
@@ -110,7 +141,12 @@ start_vllm_server() {
     # prefill_single_node: worker idx serves PREFILL_PORT+idx on the GPUs pd_server_atom.sh exported;
     # its handshake/notify bases sit 1000 apart, clear of the decode bases (+100 per D).
     gpus="${HIP_VISIBLE_DEVICES}" idx=$((server_port - PREFILL_PORT))
-    xfer="$(m31_moriio kv_producer "${server_port}" $((M31_HANDSHAKE_PORT + 1000 * idx)) $((M31_NOTIFY_PORT + 1000 * idx)))"
+    if [[ "${M31_CONNECTOR}" == mooncake ]]; then
+      xfer="$(m31_mooncake kv_producer)"
+      role_env=(VLLM_MOONCAKE_BOOTSTRAP_PORT=$((M31_MC_BOOTSTRAP_PORT + idx)) MC_MAX_MR_SIZE=1073741824)
+    else
+      xfer="$(m31_moriio kv_producer "${server_port}" $((M31_HANDSHAKE_PORT + 1000 * idx)) $((M31_NOTIFY_PORT + 1000 * idx)))"
+    fi
     xfer="{\"kv_connector\":\"MultiConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"connectors\":[${xfer},{\"kv_connector\":\"SimpleCPUOffloadConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"cpu_bytes_to_use\":${ATOMESH_M31_P_CPU_OFFLOAD_BYTES},\"lazy_offload\":${ATOMESH_M31_P_LAZY_OFFLOAD:-false}}}]}}"
     role_args=(--tensor-parallel-size "${PREFILL_TP_SIZE}" --max-num-seqs $((2 * m31_conc)) --port "${server_port}" --gpu-memory-utilization 0.85
       --max-num-batched-tokens 32768)
@@ -126,7 +162,12 @@ start_vllm_server() {
     gpus="${HIP_VISIBLE_DEVICES}" idx=$((server_port - DECODE_PORT))
     # single_node: prefill holds GPUs 0-3 of this node.
     [[ "${SINGLE_NODE_PD}" == "1" ]] && gpus=4,5,6,7
-    xfer="$(m31_moriio kv_consumer "${server_port}" $((M31_HANDSHAKE_PORT + 100 * (idx + 1))) $((M31_NOTIFY_PORT + 100 * (idx + 1))))"
+    if [[ "${M31_CONNECTOR}" == mooncake ]]; then
+      xfer="$(m31_mooncake kv_consumer)"
+      role_env+=(MC_MAX_MR_SIZE=268435456)
+    else
+      xfer="$(m31_moriio kv_consumer "${server_port}" $((M31_HANDSHAKE_PORT + 100 * (idx + 1))) $((M31_NOTIFY_PORT + 100 * (idx + 1))))"
+    fi
     # Every concurrency can land on one D under consistent_hash: FULL graphs for 1..max-num-seqs requests x 8
     # tokens. ATOMESH_M31_D_MAX_SEQS caps each D's decode batch (default CONC: no cap).
     local d_seqs="${ATOMESH_M31_D_MAX_SEQS:-${m31_conc}}"

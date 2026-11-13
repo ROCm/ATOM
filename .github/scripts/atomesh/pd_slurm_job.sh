@@ -361,9 +361,9 @@ EOF
       "${REPO_ROOT}" "${RUN_DIR}" "${DOCKER_IMAGE}" "${env_file}" "${JOB_ID}")" || return $?
   elif [[ "${rank}" -eq 0 && "${BACKEND}" == "vllm" ]]; then
     router_container="${container}-router"
-    if [[ "${ATOMESH_ENV_ATOMESH_C48_CASE:-}" == *-MC ]]; then
+    if [[ "${ATOMESH_ENV_ATOMESH_C48_CASE:-}" == *-MC || "${ATOMESH_ENV_ATOMESH_M31_CONNECTOR:-}" == mooncake ]]; then
       # The Mooncake router reads P's bootstrap server once at startup, so the
-      # container requests it after P and D report healthy (pd_c48_server.sh).
+      # container requests it after P and D report healthy (pd_c48_server.sh, pd_m31_moriio_server.sh).
       mooncake_router_request="${RUN_DIR}/mooncake-router-${execution_phase}.args"
       rm -f "${mooncake_router_request}"
     else
