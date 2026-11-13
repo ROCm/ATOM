@@ -104,13 +104,17 @@ def _mega_layer_slots() -> int:
     return int(layers or 0) + _MEGA_LAYER_SLOT_MARGIN
 
 
-def _max_tokens_hint(mega, context) -> int | None:
+def _max_tokens_hint(mega, fc) -> int | None:
     """This step's max rows over the DP group, identical on every EP rank.
 
     None (the staged route) when no such count is known: plugin bridges, TBO
     ubatches and missing metadata. A graph capture only takes the small-input
-    route; the large-input route is never captured.
+    route; the large-input route is never captured. The capture loop's warmup
+    forward (``fc.in_hipgraph``, not yet capturing) takes the same route as the
+    capture that follows it, so the kernels the capture launches are compiled
+    and their workspaces allocated before the capture starts.
     """
+    context = fc.context
     if context is None or is_plugin_mode():
         return None
     from atom.utils.tbo.ubatching import tbo_active
@@ -125,7 +129,8 @@ def _max_tokens_hint(mega, context) -> int | None:
         return None
     if rows <= 0:
         return None
-    if torch.cuda.is_current_stream_capturing() and rows > mega.small_m_mtpr:
+    in_capture = fc.in_hipgraph or torch.cuda.is_current_stream_capturing()
+    if in_capture and rows > mega.small_m_mtpr:
         return None
     return rows
 
@@ -374,7 +379,7 @@ def run_mega_moe(
     if _takes_max_tokens(type(mega)):
         from atom.utils.forward_context import get_forward_context
 
-        hint["max_tokens"] = _max_tokens_hint(mega, get_forward_context().context)
+        hint["max_tokens"] = _max_tokens_hint(mega, get_forward_context())
         if mega.large_m_available:
             # The weights are bound above; select this layer's protocol slot.
             slot = _MEGA_LAYER_SLOTS.setdefault(id(layer), len(_MEGA_LAYER_SLOTS))
