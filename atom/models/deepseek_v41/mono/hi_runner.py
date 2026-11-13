@@ -781,7 +781,7 @@ class HiLayers(HiDraft, HiPrograms):
             self.bounds, *self._geo(cache), rows, hidden, hidden.stride(0), self.h_in0,
             self.step, self.req, *eflat, self.imp, NMF=len(self.mf), WIN=WINDOW, DIM=HEAD_DIM,
             RB=self.RB, HIDDEN=hidden.shape[-1], BLOCK=1024, NHC=HC, **ke, INCR=1, RP=rp, NB=nb, BM=self.bmax,
-            RQP=triton.next_power_of_2(rows // nb),
+            RQP=triton.next_power_of_2(rows // nb), KV8=int(self.kv_fp8),
         )  # fmt: skip
         if rows in self.band_of:
             self._band_step(rows)
@@ -938,7 +938,7 @@ class HiLayers(HiDraft, HiPrograms):
             cache.pool, step.positions, step.batch_ids, step.slots, self.rings, self.ring_layers,
             *self._geo(cache), rows, *tp, last.gate_f, self.pre, self.post, self.comb, self.imp, NMF=len(self.mf),
             WIN=WINDOW, DIM=HEAD_DIM, HIDDEN=hidden, BLOCK=1024, NHC=HC, NMIX=MIX, **ke, NTAPS=len(taps),
-            PLANAR=self.planar_at_end, TRACK=1, NB=self.split[rows][0], BM=self.bmax,
+            PLANAR=self.planar_at_end, TRACK=1, NB=self.split[rows][0], BM=self.bmax, KV8=int(self.kv_fp8),
         )  # fmt: skip
 
 
