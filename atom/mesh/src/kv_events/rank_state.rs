@@ -122,6 +122,10 @@ impl<B> RankState<B> {
     }
 
     pub fn admit(&mut self, meta: BatchMeta, batch: B, now: Instant) -> Vec<Action<B>> {
+        // The replay end sentinel, never a batch.
+        if meta.seq == u64::MAX {
+            return vec![Action::Skip];
+        }
         let mut out = Vec::new();
         self.last_seen = Some(now);
         if self.phase == Phase::Stale {
@@ -164,8 +168,13 @@ impl<B> RankState<B> {
         vec![Action::ClearHolder]
     }
 
-    /// Live batches wait while a replay is pending.
+    /// Live batches wait while a replay is pending; a live clear ends the replay.
     fn route(&mut self, meta: BatchMeta, batch: B, out: &mut Vec<Action<B>>, now: Instant) {
+        if meta.clears && !meta.replayed && !self.duplicate(&meta) {
+            self.deadline = None;
+            self.held.clear();
+            self.phase = Phase::Live;
+        }
         if self.deadline.is_none() || meta.replayed {
             return self.step(meta, batch, out, now);
         }
@@ -179,10 +188,10 @@ impl<B> RankState<B> {
         if self.phase == Phase::Bootstrap && self.deadline.is_none() {
             return self.first(meta, batch, out, now);
         }
-        let behind = meta.seq < self.expected;
-        if behind && self.last_ts.is_none_or(|ts| meta.ts <= ts) {
+        if self.duplicate(&meta) {
             return out.push(Action::Skip);
         }
+        let behind = meta.seq < self.expected;
         if meta.clears {
             self.trust = Trust::Exact;
             self.lost = false;
@@ -191,7 +200,10 @@ impl<B> RankState<B> {
         }
         if behind {
             // The engine restarted and its first batches were missed.
-            *self = Self::new(self.policy);
+            *self = Self {
+                last_seen: self.last_seen,
+                ..Self::new(self.policy)
+            };
             out.push(Action::ClearHolder);
             return self.first(meta, batch, out, now);
         }
@@ -257,6 +269,10 @@ impl<B> RankState<B> {
         }
     }
 
+    fn duplicate(&self, meta: &BatchMeta) -> bool {
+        meta.seq < self.expected && self.last_ts.is_none_or(|ts| meta.ts <= ts)
+    }
+
     fn lose(&mut self, out: &mut Vec<Action<B>>) {
         if self.last_ts.is_some() {
             out.push(Action::ClearHolder);
@@ -267,7 +283,7 @@ impl<B> RankState<B> {
 
     fn accept(&mut self, meta: BatchMeta) {
         self.expected = meta.seq + 1;
-        self.last_ts = Some(meta.ts);
+        self.last_ts = Some(self.last_ts.map_or(meta.ts, |ts| ts.max(meta.ts)));
     }
 }
 
@@ -302,6 +318,10 @@ mod tests {
         old clear in a replay             | replay    | L0 -> apply 0; L1 -> apply 1; L2 -> apply 2; L5 -> replay 3; RC1 -> skip; R3 -> apply 3; R4 -> apply 4; E -> apply 5 | live exact
         held batch opens another gap      | replay    | L0 -> apply 0; L2 -> replay 1; L5; R1 -> apply 1; R2 -> apply 2; E -> skip, replay 3; R3 -> apply 3; R4 -> apply 4; E -> apply 5 | live exact
         new incarnation                   | replay    | L0 -> apply 0; X -> clear; ?bootstrap partial; L0@9 -> apply 0 | live exact
+        live clear ends a pending replay  | replay    | L0 -> apply 0; L3 -> replay 1; LC4 -> from_clear 4; E; L5 -> apply 5 | live exact
+        restart keeps the staleness clock | heartbeat | L0 -> apply 0; L1 -> apply 1; L0@9 -> clear, apply 0; T31 | stale partial
+        an older ts is not a restart      | replay    | L0@5 -> apply 0; L1@3 -> apply 1; R0@4 -> skip | live exact
+        the replay end sentinel is no batch | replay  | L0 -> apply 0; L18446744073709551615 -> skip; L1 -> apply 1 | live exact
     ";
 
     fn policy(name: &str) -> RankPolicy {
