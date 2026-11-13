@@ -55,6 +55,7 @@ class _Copier:
 for _name in (
     "execute_paged_state_copies",
     "_fold_replay_records",
+    "_materialize_in_place",
     "_validate_paged_state_op",
     "_checkpoint_copy_plan",
     "_checkpoint_slot_bases",
@@ -66,6 +67,7 @@ for _name in (
     "checkpoint_image_bytes",
     "_checkpoint_descriptor_device",
     "_is_kda",
+    "_checkpoint_targets",
 ):
     setattr(_Copier, _name, getattr(GDNStateMixin, _name))
 for _name in (
@@ -109,6 +111,8 @@ def _copier() -> _Copier:
     c.kv_pool = SimpleNamespace(cache=SimpleNamespace(view=lambda _n: runner.kv_cache))
     c.replayssm = True
     c.replayssm_max_query_len = T
+    c.device = DEV
+    c._conv_state_len = lambda: CONV[0]
     c.num_state_layers = lambda: LAYERS
     c._state_shape_for_runner = lambda: (CONV, (H, K, V))
     c._state_dtypes = lambda: (bf16, bf16)
@@ -260,3 +264,27 @@ def test_without_replayssm_the_plane_is_copied_as_is():
     before = r.mamba_v_cache[:, LIVE].clone()
     _round_trip(c, [(LIVE, DST)])
     assert torch.equal(r.mamba_v_cache[:, DST], before)
+
+
+def test_a_reused_midstep_scratch_is_stored_as_written():
+    """A scratch slot a decode left records in gets a whole midstep state."""
+    torch.manual_seed(7)
+    c = _copier()
+    r = c.model_runner
+    for accepted in (1, 2, 3):
+        _decode(c, LIVE, accepted, [_window() for _ in range(LAYERS)])
+    assert int(r.replayssm_write_pos[LIVE]) > 0
+    # The slot is freed and borrowed as midstep scratch: the forward writes a
+    # whole state into it, chosen through the shipped target path.
+    batch = SimpleNamespace(
+        state_save_all=[[(LIVE, 64)]],
+        state_rows=[0],
+        num_cached_tokens=[0],
+        num_scheduled_tokens=[64],
+        state_slots_committed=[PARKED],
+    )
+    assert c._checkpoint_targets(batch) is not None
+    whole = torch.randn_like(r.mamba_v_cache[:, LIVE])
+    r.mamba_v_cache[:, LIVE] = whole
+    _round_trip(c, [(LIVE, DST)])
+    assert torch.equal(r.mamba_v_cache[:, DST], whole)

@@ -1037,19 +1037,33 @@ class GDNStateMixin(PoolRowsMixin):
         # of the last window; a prefill-parked cursor (-1) has nothing to fold.
         steps = torch.where(runner.replayssm_write_pos[slots] >= 0, 0, -1)
         live = ssm[:, slots]
-        for layer in range(ssm.shape[0]):
-            replayssm_materialize(
-                ssm[layer],
-                runner.replayssm_buf_k[layer],
-                runner.replayssm_buf_u[layer],
-                runner.replayssm_buf_g[layer],
-                runner.replayssm_write_pos,
-                slots,
-                slots,
-                steps,
-                self.replayssm_max_query_len,
-            )
+        self._materialize_in_place(slots, steps)
         return slots, live
+
+    def _materialize_in_place(self, slots, steps) -> None:
+        """`replayssm_materialize` over every layer of `slots` in one launch."""
+        runner = self.model_runner
+        layers, num_slots = runner.mamba_v_cache.shape[:2]
+        # Layer-major caches flatten to one (layer, slot) row axis.
+        rows = (
+            torch.arange(layers, device=slots.device)[:, None] * num_slots + slots
+        ).flatten()
+        replayssm_materialize(
+            *(
+                c.view(layers * num_slots, *c.shape[2:])
+                for c in (
+                    runner.mamba_v_cache,
+                    runner.replayssm_buf_k,
+                    runner.replayssm_buf_u,
+                    runner.replayssm_buf_g,
+                )
+            ),
+            runner.replayssm_write_pos.repeat(layers),
+            rows,
+            rows,
+            steps.repeat(layers),
+            self.replayssm_max_query_len,
+        )
 
     def warmup_per_req_cache(self) -> None:
         """Run one checkpoint copy now, so the first real one is only a copy.
@@ -1079,6 +1093,12 @@ class GDNStateMixin(PoolRowsMixin):
             self._page_unit_bases([list(range(spec.units_per_checkpoint))]),
         )
         launch_copy_descriptor(staging.upload(0, plan.num_spans), plan)
+        if self.replayssm and not self._is_kda():
+            # Compile the store-time fold too; step -1 writes nothing.
+            idx = torch.zeros(
+                1, dtype=torch.int64, device=self.model_runner.mamba_v_cache.device
+            )
+            self._materialize_in_place(idx, idx - 1)
 
     def state_entry_views(self, slot: int) -> list[torch.Tensor]:
         """One contiguous slice per (cache, layer) — the slot's whole state.
@@ -1302,6 +1322,10 @@ class GDNStateMixin(PoolRowsMixin):
             return torch.tensor(col, dtype=torch.int32, device=self.device)
 
         rows, slots, offs, is_end, runtime = zip(*found)
+        if self.replayssm:
+            # A scratch slot gets a whole state, so a previous tenant's records
+            # must not be folded into it at store time.
+            self.model_runner.replayssm_write_pos[list(slots)] = -1
         return {
             "rows": mk(rows),
             "slots": mk(slots),
