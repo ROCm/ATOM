@@ -22,6 +22,8 @@ one is not readable through the other, and no size check can see the mismatch;
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from typing import Protocol
 
 import torch
 
@@ -83,6 +85,86 @@ def mha_kv_scale_fields(
     ]
 
 
+class KvLayout(Protocol):
+    """How one entry's K and V are declared and read: the pool names no model, a
+    backend passes in the layout its layers use. Hashable, so a row space can be
+    keyed by it."""
+
+    tag: str  # names the row space in logs and transfer regions; "" for SHUFFLE
+
+    def check(self, block_size: int, head_dim: int, blocks_per_entry: int) -> None:
+        """Refuse a geometry this layout cannot hold."""
+
+    def cache_fields(
+        self, layers: int, entry_tokens: int, num_kv_heads: int, head_dim: int
+    ) -> list[EntryField]:
+        """What K and V of one entry cost, K first as allocated."""
+
+    def scale_fields(
+        self, layers: int, entry_tokens: int, num_kv_heads: int
+    ) -> list[EntryField]:
+        """The dequant scale planes, a region after the cache; empty for none."""
+
+    def kv_views(
+        self, pool: MhaKvPool, layer: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """One layer's `(k, v)`, aliasing the pool."""
+
+
+@dataclass(frozen=True)
+class ShuffleLayout:
+    """The dtype-wide SHUFFLE cache every MHA model but MiniMax-M3's MXFP4 sparse
+    layers uses."""
+
+    kv_dtype: torch.dtype
+    tag = ""
+
+    @property
+    def x(self) -> int:
+        return shuffle_pack(self.kv_dtype)
+
+    def check(self, block_size: int, head_dim: int, blocks_per_entry: int) -> None:
+        if head_dim % self.x or block_size % self.x:
+            raise ValueError(
+                f"SHUFFLE packs {self.x} elements of {self.kv_dtype} per "
+                f"{_TILE_BYTES}B tile, which has to divide both head_dim "
+                f"{head_dim} and block_size {block_size}"
+            )
+
+    def cache_fields(self, layers, entry_tokens, num_kv_heads, head_dim):
+        return mha_kv_fields(
+            layers=layers,
+            entry_tokens=entry_tokens,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            kv_dtype=self.kv_dtype,
+        )
+
+    def scale_fields(self, layers, entry_tokens, num_kv_heads):
+        return mha_kv_scale_fields(
+            layers=layers,
+            entry_tokens=entry_tokens,
+            num_kv_heads=num_kv_heads,
+            kv_dtype=self.kv_dtype,
+        )
+
+    def kv_views(self, pool, layer):
+        """One layer's `(k, v)`, aliasing the pool, in SHUFFLE.
+
+        The one place the element order is written: the fused writer produces
+        it and `cp_mha_gather_cache_kernel` reads it in place, and declaring V
+        the other way round sends `_gather_prefix_and_concat_kv` down its
+        densifying branch. K's tokens are one head-major span where V's are
+        already split by the pack -- which fp8 hides, `x == block_size`
+        collapsing V's outer half to one.
+        """
+        x, nh, hd, bs = self.x, pool.num_kv_heads, pool.head_dim, pool.block_size
+        return (
+            pool.field_view("k", layer, self.kv_dtype, (-1, nh, hd // x, bs, x)),
+            pool.field_view("v", layer, self.kv_dtype, (-1, nh, bs // x, hd, x)),
+        )
+
+
 class MhaKvPool:
     """`layers` MHA layers' worth of paged KV, sized and addressed.
 
@@ -108,6 +190,7 @@ class MhaKvPool:
         blocks_per_entry: int = 1,
         flash_layout: bool = False,
         extra_fields: Sequence[EntryField] = (),
+        layout: KvLayout | None = None,
     ):
         if blocks_per_entry < 1:
             raise ValueError(
@@ -115,17 +198,13 @@ class MhaKvPool:
             )
         self.block_size = block_size
         # Which order every writer and reader of this pool uses: FLASH
-        # (`fa_views`, at one per-tensor scale) or SHUFFLE (`kv_views`).
+        # (`fa_views`, at one per-tensor scale) or the layout's (`kv_views`).
         # Explicit, not inferred from `blocks_per_entry`: at one block an entry
         # the shapes match while the element orders still differ.
         self.flash_layout = bool(flash_layout)
-        self.x = shuffle_pack(kv_dtype)
-        if not self.flash_layout and (head_dim % self.x or block_size % self.x):
-            raise ValueError(
-                f"SHUFFLE packs {self.x} elements of {kv_dtype} per "
-                f"{_TILE_BYTES}B tile, which has to divide both head_dim "
-                f"{head_dim} and block_size {block_size}"
-            )
+        self.layout = layout if layout is not None else ShuffleLayout(kv_dtype)
+        if not self.flash_layout:
+            self.layout.check(block_size, head_dim, blocks_per_entry)
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         self.kv_dtype = kv_dtype
@@ -138,12 +217,8 @@ class MhaKvPool:
         # `fa_views` shapes by and a draft riding another model's block ids
         # has to agree with.
         self.entry_tokens = entry_tokens = block_size * blocks_per_entry
-        self.cache_fields = mha_kv_fields(
-            layers=layers,
-            entry_tokens=entry_tokens,
-            num_kv_heads=num_kv_heads,
-            head_dim=head_dim,
-            kv_dtype=kv_dtype,
+        self.cache_fields = self.layout.cache_fields(
+            layers, entry_tokens, num_kv_heads, head_dim
         )
         # A FLASH pool is read at one scale for the whole cache
         # (`reshape_and_cache_flash` and `unified_attention` each take one),
@@ -151,12 +226,7 @@ class MhaKvPool:
         self.scale_fields = (
             []
             if self.flash_layout
-            else mha_kv_scale_fields(
-                layers=layers,
-                entry_tokens=entry_tokens,
-                num_kv_heads=num_kv_heads,
-                kv_dtype=kv_dtype,
-            )
+            else self.layout.scale_fields(layers, entry_tokens, num_kv_heads)
         )
         self.extra_fields = [f for f in extra_fields if f.layers]
         # The regions an entry is charged for, in layout order. One list, walked
@@ -263,23 +333,13 @@ class MhaKvPool:
         return self._views[name][layer].view(dtype).view(shape)
 
     def kv_views(self, layer: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """One layer's `(k, v)`, aliasing the pool, in SHUFFLE.
-
-        The fused writer produces it and `cp_mha_gather_cache_kernel` reads it
-        in place, and declaring V the other way round sends
-        `_gather_prefix_and_concat_kv` down its densifying branch. K's tokens
-        are one head-major span where V's are already split by the pack -- which
-        fp8 hides, `x == block_size` collapsing V's outer half to one.
+        """One layer's `(k, v)`, aliasing the pool, as its layout reads them.
 
         Raised on a FLASH pool, whose bytes this order would misread.
         """
         if self.flash_layout:
             raise ValueError("a FLASH-layout pool is read through `fa_views`")
-        x, nh, hd, bs = self.x, self.num_kv_heads, self.head_dim, self.block_size
-        return (
-            self.field_view("k", layer, self.kv_dtype, (-1, nh, hd // x, bs, x)),
-            self.field_view("v", layer, self.kv_dtype, (-1, nh, bs // x, hd, x)),
-        )
+        return self.layout.kv_views(self, layer)
 
     def fa_views(self, layer: int) -> tuple[torch.Tensor, torch.Tensor]:
         """One layer's `(k, v)`, aliasing the pool, in FLASH layout.

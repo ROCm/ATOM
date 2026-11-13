@@ -2809,6 +2809,49 @@ def test_minimax_m31_dspark_producer_holds_every_kv_head_and_never_drafts(
         attn(torch.zeros(2, dtype=torch.long), torch.zeros(2, 6144))
 
 
+def test_standalone_draft_is_built_with_its_own_kv_dtype_target_untouched(monkeypatch):
+    """The draft model reads its KV dtype off the config it is built with: the shallow
+    copy carries the draft's (bf16 under a target fp4); the target's keeps its own."""
+    from atom.config import CompilationConfig
+    from atom.spec_decode import draft_kv
+    from atom.spec_decode.dspark_proposer import DSparkProposer
+
+    seen = {}
+    monkeypatch.setattr(draft_kv, "draft_kv_builder", lambda runner, hf, model: None)
+    p = DSparkProposer.__new__(DSparkProposer)
+    p.speculative_config = types.SimpleNamespace(
+        draft_model_hf_config=types.SimpleNamespace(),
+        draft_kv_dtype="bf16",  # as `Config` resolved it, under an fp4 target
+        use_dspark_with_draft=lambda: True,
+    )
+    p.runner = types.SimpleNamespace()
+    p.config = types.SimpleNamespace(
+        kv_cache_dtype="fp4",
+        hf_config=types.SimpleNamespace(num_hidden_layers=3),
+        compilation_config=CompilationConfig(),
+    )
+
+    def model_class(cfg, layer_offset):
+        seen["dtype"] = cfg.kv_cache_dtype
+        return object()
+
+    p._build_draft_model(model_class)
+
+    assert seen == {"dtype": "bf16"} and p.config.kv_cache_dtype == "fp4"
+
+
+def test_dtype_q_follows_the_drafts_dtype_not_the_targets():
+    from atom.spec_decode.dspark_proposer import DSparkProposer
+
+    p = DSparkProposer.__new__(DSparkProposer)
+    p.config = types.SimpleNamespace(kv_cache_dtype="fp4")
+    p.dtype = torch.bfloat16
+    p.speculative_config = types.SimpleNamespace(draft_kv_dtype="bf16")
+    p._bound_draft_k_cache = lambda fc: None
+
+    assert p._resolve_dtype_q(None) == (torch.bfloat16, False)
+
+
 # ---- shared across the DSpark drafts: aux capture, slots, block plan ------
 #
 # `DSparkProposer` contracts every draft goes through, checked against the
