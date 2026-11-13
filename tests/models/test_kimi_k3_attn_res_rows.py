@@ -23,6 +23,7 @@ from tests.models.test_kimi_k3_moe_row_tail import (  # noqa: F401
     WORLD,
     _block,
     _weights,
+    no_row_floor,
     ranks,
     split_op_on_cpu,
     stub_block_parts,
@@ -251,6 +252,23 @@ def test_base_kernels_launch_in_order(
     for (want, want_log), (out, log) in zip(base, got):
         assert log == want_log
         assert log.count(("all_reduce", 13)) == 3
+        assert all(torch.equal(a, b) for a, b in zip(out, want))
+
+
+@pytest.mark.parametrize("floor", [None, "14"], ids=["default-floor", "below-floor"])
+def test_below_row_floor_all_reduces(logged, monkeypatch, floor):
+    """At threshold 0 an eager step below the row floor runs the base layer."""
+    monkeypatch.setenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "0")
+    if floor is None:
+        monkeypatch.delenv("ATOM_KIMI_K3_MOE_ROW_SHARD_MIN_TOKENS")
+    else:
+        monkeypatch.setenv("ATOM_KIMI_K3_MOE_ROW_SHARD_MIN_TOKENS", floor)
+    layers = _layers(BLOCK + 1)
+    inputs = _inputs(13)
+    base = logged(lambda rank: _base_forward(layers[rank], *inputs))
+    got = logged(lambda rank: layers[rank](None, *inputs))
+    for (want, want_log), (out, log) in zip(base, got):
+        assert log == want_log
         assert all(torch.equal(a, b) for a, b in zip(out, want))
 
 
