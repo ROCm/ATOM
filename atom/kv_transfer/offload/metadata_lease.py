@@ -24,6 +24,8 @@ class MetadataLease:
     completion: Any = None
     pool: Any = None
     generation: int = 1
+    # A kernel that reads the IDs was enqueued: only then is a failure uncertain.
+    launched: bool = False
 
 
 class MetadataLeasePool:
@@ -62,7 +64,7 @@ class MetadataLeasePool:
         if reusable:
             lease = min(reusable, key=lambda x: x.capacity)
             self.leases[:] = [x for x in self.leases if x is lease or x.state != "free"]
-            lease.state, lease.completion = "leased", None
+            lease.state, lease.completion, lease.launched = "leased", None, False
             lease.generation += 1
             return lease
         capacity = 1 << (count - 1).bit_length()

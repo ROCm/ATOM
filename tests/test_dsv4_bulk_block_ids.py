@@ -324,3 +324,39 @@ def test_legacy_launch_still_uploads_each_group(contract, monkeypatch, method):
         getattr(contract.codec, method)(_buffer(), group, stream=contract.stream)
     assert contract.uploads == [(5, 1), (2,)]
     assert [call[2][1].tolist() for call in contract.launches] == [[5, 1], [2]]
+
+
+def test_failure_before_any_launch_frees_the_lease_and_after_one_keeps_it(
+    contract, monkeypatch
+):
+    class DoneEvent:
+        def record(self, stream):
+            pass
+
+        def query(self):
+            return True
+
+    monkeypatch.setattr(torch.cuda, "Event", DoneEvent)
+    codec = contract.codec
+    for _ in range(6):  # more than the pool holds: each failure must free its lease
+        owner = _prepare(contract, [[[1], [2]]])
+        with pytest.raises(ValueError, match="invalid strided"):
+            codec.chunk_major_strided_buffer_to_gpu_prepared(
+                _buffer(64),
+                owner,
+                0,
+                stream=contract.stream,
+                items_per_chunk=2,
+                chunk_stride_bytes=1,
+            )
+        codec.finish_prepared_block_id_groups(owner, safe=False)
+    assert contract.launches == []
+    assert len(codec._metadata_tls.pool.leases) == 1
+    owner = _prepare(contract, [[[1], [2]]])
+    codec.chunk_major_device_buffer_to_gpu_prepared(
+        _buffer(8), owner, 0, stream=contract.stream
+    )
+    codec.finish_prepared_block_id_groups(owner, safe=False)
+    assert [lease.state for lease in codec._metadata_tls.pool.leases][-1] == (
+        "quarantined"
+    )
