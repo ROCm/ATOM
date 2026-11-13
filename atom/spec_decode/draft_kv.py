@@ -317,7 +317,16 @@ class DraftKvBuilder(PoolRowsMixin):
         return KVTransferTensors(
             # Described by its pool like the target's, under a namespace of its
             # own: its rows sit in the same block ids.
-            pages=pool.transfer_pages("draft", "draft", [m.layer_num for m in modules]),
+            pages=pool.transfer_pages(
+                "draft",
+                "draft",
+                [m.layer_num for m in modules],
+                # Each binding declares the page it reads its cache in.
+                [
+                    pool.block_size if m.page_tokens is None else m.page_tokens
+                    for m in modules
+                ],
+            ),
             # A paged MHA/GQA draft is a per-rank shard. Appending it to an
             # otherwise replicated target must disable whole-object collapse.
             tp_replication_factor=1,
