@@ -45,8 +45,7 @@ def snapshot(model: nn.Module) -> dict:
 
 class _Exporter:
     def __init__(self):
-        self.storages: dict[int, tuple] = {}
-        self.views: dict[int, torch.Tensor] = {}  # whole storages as uint8, for digests
+        self.views: dict[int, torch.Tensor] = {}  # whole storages as uint8
         self.bytes = 0
 
     def tensor(self, t: torch.Tensor) -> dict:
@@ -63,8 +62,7 @@ class _Exporter:
                 "dtype": t.dtype,
             }
         key = st.data_ptr()
-        if key not in self.storages:
-            self.storages[key] = st._share_cuda_()
+        if key not in self.views:
             self.views[key] = torch.empty(0, dtype=torch.uint8, device=t.device).set_(
                 st, 0, (st.nbytes(),), (1,)
             )
@@ -154,11 +152,16 @@ def build_export(model: nn.Module, before: dict, after: dict) -> dict:
             plan[path] = item
     return {
         "plan": plan,
-        "storages": ex.storages,
         "views": ex.views,
         "bytes": ex.bytes,
         "unshippable": unshippable,
     }
+
+
+def share_storages(views: dict) -> dict:
+    """IPC handles of the exported storages (``views``). Share last: torch
+    never frees a shared storage in this process, even with no consumer."""
+    return {key: v.untyped_storage()._share_cuda_() for key, v in views.items()}
 
 
 def _swap_param(old, new: nn.Parameter, attrs: dict) -> bool:

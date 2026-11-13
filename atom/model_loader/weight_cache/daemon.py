@@ -32,6 +32,7 @@ from atom.model_engine.model_setup import (
 from atom.model_loader.weight_cache.export import (
     _skip_prepare_finalize,
     build_export,
+    share_storages,
     snapshot,
 )
 from atom.model_loader.weight_cache.key import (
@@ -171,7 +172,7 @@ def _serve_rank(rank: int, config, ready) -> None:
         idle_timeout_s=envs.ATOM_PRELOAD_IDLE_TIMEOUT_S,
     )
     stop = threading.Event()
-    server = _load_and_serve(
+    server, pool = _load_and_serve(
         config,
         rank,
         device,
@@ -189,6 +190,7 @@ def _serve_rank(rank: int, config, ready) -> None:
     # Clients that mapped the weights keep them until they exit.
     server.close()
     lock.release()
+    del pool  # held while the weights in it are served
     logger.info(f"{_TAG} rank {rank}: stopped serving")
 
 
@@ -227,7 +229,7 @@ class _RecordingLoad:
         return model
 
 
-def _load_and_serve(config, rank, device, recorder, path, lock, on_idle, t0) -> _Server:
+def _load_and_serve(config, rank, device, recorder, path, lock, on_idle, t0):
     label = f"rank {rank}"
     load = _RecordingLoad(rank, recorder)
     model = get_model(config, device, load)
@@ -242,7 +244,8 @@ def _load_and_serve(config, rank, device, recorder, path, lock, on_idle, t0) -> 
         ) from None
     export = build_export(model, load.before, after)
     views = export.pop("views")
-    _release_other_memory(export, device, label)
+    pool = _release_other_memory(views, device, label)
+    export["storages"] = share_storages(views)
     payload = {
         "protocol": PROTOCOL_VERSION,
         "key": load.key,
@@ -283,12 +286,13 @@ def _load_and_serve(config, rank, device, recorder, path, lock, on_idle, t0) -> 
             f"{_TAG} {label}: loading created state that cannot be shared, so clients will "
             f"refuse this cache: {export['unshippable'][:10]}"
         )
-    return server
+    return server, pool
 
 
-def _release_other_memory(export: dict, device, label: str) -> None:
+def _release_other_memory(views: dict, device, label: str) -> torch.cuda.MemPool:
     """Everything but the weights is a client's KV cache lost: free all
-    other device memory this process holds."""
+    other device memory this process holds, and the gaps between the
+    weights (_compact). Returns the pool now holding the weights."""
     from aiter import destroy_dist_env
 
     with contextlib.suppress(Exception):
@@ -301,7 +305,7 @@ def _release_other_memory(export: dict, device, label: str) -> None:
     # The daemon runs nothing on the GPU but digests of what it exports,
     # so every other storage still alive (tensors the clients build for
     # themselves, such as RoPE tables, wherever they are held) can go.
-    shared = export["storages"]
+    shared = {v.untyped_storage().data_ptr() for v in views.values()}
     for obj in gc.get_objects():
         with contextlib.suppress(Exception):
             if isinstance(obj, torch.Tensor) and obj.is_cuda:
@@ -309,11 +313,12 @@ def _release_other_memory(export: dict, device, label: str) -> None:
                 if storage.nbytes() and storage.data_ptr() not in shared:
                     storage.resize_(0)
     torch.cuda.empty_cache()
+    pool = _compact(views, label)
     # Pinned staging buffers from loading stay cached in host memory.
     with contextlib.suppress(Exception):
         torch._C._host_emptyCache()
     free, total = torch.cuda.mem_get_info(device)
-    gib, weights = 1 << 30, export["bytes"]
+    gib, weights = 1 << 30, sum(v.numel() for v in views.values())
     reserved = torch.cuda.memory_reserved()
     logger.info(
         f"{_TAG} {label}: device memory used {(total - free) / gib:.2f} GiB: "
@@ -322,3 +327,33 @@ def _release_other_memory(export: dict, device, label: str) -> None:
         f"{(reserved - torch.cuda.memory_allocated()) / gib:.2f}, outside the allocator "
         f"{(total - free - reserved) / gib:.2f}"
     )
+    return pool
+
+
+def _compact(views: dict, label: str) -> torch.cuda.MemPool:
+    """Move the exported storages out of segments with free space in them,
+    into a pool of their own, so those segments can be returned. Loading
+    replaces construction-time tensors, and the replacements land in free
+    parts of other segments (about 0.9 GiB per GPU on DeepSeek-V4-Pro)."""
+    device = torch.cuda.current_device()
+    gappy = set()
+    for seg in torch.cuda.memory_snapshot():
+        free = sum(b["size"] for b in seg["blocks"] if b["state"] == "inactive")
+        # More than a segment's own rounding or packing leaves.
+        if seg["device"] == device and free >= 20 << 20:
+            gappy.update(
+                b["address"] for b in seg["blocks"] if b["state"] == "active_allocated"
+            )
+    pool = torch.cuda.MemPool()
+    for key, old in views.items():
+        if old.untyped_storage().data_ptr() not in gappy:
+            continue
+        try:
+            with torch.cuda.use_mem_pool(pool):
+                views[key] = torch.empty_like(old).copy_(old)
+        except torch.OutOfMemoryError:
+            logger.warning(f"{_TAG} {label}: no device memory left to compact the rest")
+            break
+        old.untyped_storage().resize_(0)
+    torch.cuda.empty_cache()  # outside the pool's context, which would only empty the pool
+    return pool

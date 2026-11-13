@@ -264,7 +264,9 @@ def toy_packages(monkeypatch):
 def _export(model, load):
     built, before = key.structure(model), export.snapshot(model)
     load(model)
-    return built, export.build_export(model, before, export.snapshot(model))
+    exp = export.build_export(model, before, export.snapshot(model))
+    exp["storages"] = export.share_storages(exp.pop("views"))
+    return built, exp
 
 
 def test_export_import_reproduces_the_load(toy_packages):
@@ -420,10 +422,35 @@ def test_zero_byte_cuda_buffer_is_rebuilt_locally():
     before = export.snapshot(daemon)
     daemon.e = torch.zeros(0, 5, device="cuda")  # loading replaced it
     exp = export.build_export(daemon, before, export.snapshot(daemon))
+    exp["storages"] = export.share_storages(exp.pop("views"))
     assert exp["plan"][""]["buffers"]["e"].get("empty")  # no allocation to share
     client = M()
     export.apply_export(client, exp, torch.device("cuda"))
     assert client.e.shape == (0, 5) and client.e.is_cuda
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_compact_moves_weights_out_of_segments_with_gaps():
+    from atom.model_loader.weight_cache import daemon
+
+    torch.cuda.empty_cache()
+    torch.empty(
+        100 << 20, dtype=torch.uint8, device="cuda"
+    )  # freed; its segment stays cached
+    kept = torch.arange(30 << 18, dtype=torch.float32, device="cuda")  # lands in it
+    small = torch.ones(1000, device="cuda")
+    views = {
+        i: torch.empty(0, dtype=torch.uint8, device="cuda").set_(
+            t.untyped_storage(), 0, (t.untyped_storage().nbytes(),), (1,)
+        )
+        for i, t in enumerate((kept, small))
+    }
+    expected = {k: v.cpu() for k, v in views.items()}
+    pool = daemon._compact(views, "test")
+    assert all(torch.equal(views[k].cpu(), expected[k]) for k in views)
+    assert kept.untyped_storage().nbytes() == 0  # moved out of the 70 MiB gap
+    assert small.untyped_storage().nbytes() > 0  # no gap worth moving it for
+    del views, pool
 
 
 # --------------------------------------------------------------------------
