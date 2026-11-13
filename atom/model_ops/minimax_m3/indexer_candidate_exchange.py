@@ -261,8 +261,9 @@ def merge_candidate_keys(
     init_blocks,
     local_blocks,
     max_query_len,
+    emit=True,
     pages_per_block=PAGES_PER_SPARSE_BLOCK,
-    block_page_stride=PAGES_PER_SPARSE_BLOCK,
+    block_page_stride=None,
 ):
     """Select the global top-k from gathered candidates for this rank's head.
 
@@ -271,9 +272,9 @@ def merge_candidate_keys(
     the [world, tokens, topk] layout the all-to-all writes. The 3D form is read
     with a stride rather than copied.
 
-    ``pages_per_block`` / ``block_page_stride`` shape the emitted sparse block
-    table as for the native selector: the page-16 SHUFFLE cache by default, one
-    page-128 page a block (1, 1) for the MXFP4 KV.
+    ``emit``, ``pages_per_block`` and ``block_page_stride`` are the native
+    selector's (``minimax_m3_index_topk_decode``): the page table the KV layout
+    wants, or with ``emit=False`` the block ids alone, returned as ``(indices,)``.
     """
     if keys.dtype != torch.int64 or keys.ndim not in (2, 3):
         raise ValueError(
@@ -309,8 +310,8 @@ def merge_candidate_keys(
     ):
         raise ValueError("merge inputs must share a GPU")
     indices = torch.empty((1, tokens, topk), dtype=torch.int32, device=keys.device)
-    output, _ = _alloc_emit(
-        tokens, 1, topk, block_table, True, keys.device, pages_per_block
+    output, (sparse_bt, sparse_ctx, _, sbt_stride) = _alloc_emit(
+        tokens, 1, topk, block_table, emit, keys.device, pages_per_block
     )
     if tokens:
         _merge_topk[(tokens,)](
@@ -318,17 +319,17 @@ def merge_candidate_keys(
             indices,
             seq_lens,
             block_table,
-            output[0],
-            output[1],
+            sparse_bt,
+            sparse_ctx,
             TABLE_STRIDE=block_table.stride(0),
-            SBT_STRIDE=output[0].stride(0),
+            SBT_STRIDE=sbt_stride,
             QUERY_LEN=max_query_len,
             TOPK=topk,
             INIT_BLOCKS=init_blocks,
             LOCAL_KEEP=local_blocks,
             NUM_KV_HEADS=1,
             PAGES_PER_BLOCK=pages_per_block,
-            BLOCK_PAGE_STRIDE=block_page_stride,
+            BLOCK_PAGE_STRIDE=block_page_stride or pages_per_block,
             KEYS_PER_SHARD=per_shard,
             SRC_STRIDE=src_stride,
             ROW_STRIDE=row_stride,
@@ -339,7 +340,7 @@ def merge_candidate_keys(
             # the sparse_bt row is only topk*pages_per_block wide. A padded
             # BLOCK_SIZE_T writes past the row into the next allocation.
             BLOCK_SIZE_T=triton.next_power_of_2(topk),
-            EMIT=True,
+            EMIT=emit,
             num_warps=DECODE_TOPK_NUM_WARPS,
         )
-    return indices, *output
+    return (indices, *output) if output else (indices,)
