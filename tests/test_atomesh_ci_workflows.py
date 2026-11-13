@@ -37,7 +37,7 @@ def test_atomesh_accuracy_uses_required_heavy_ci_gate():
         step["env"] for step in jobs["ci-gate"]["steps"] if step.get("id") == "gate"
     )
     assert gate_env["CI_GATE_WORKFLOW"] == "atomesh-accuracy-validation.yaml"
-    assert gate_env["CI_GATE_LABELS"] == "ci:full,ci:atomesh,ci:mesh"
+    assert gate_env["CI_GATE_LABELS"] == "ci:full,ci:mesh"
     assert "atom/mesh/**" in gate_env["CI_GATE_PATHS_INCLUDE"]
     assert ".github/benchmark/models_accuracy.json" in gate_env["CI_GATE_PATHS_INCLUDE"]
 
@@ -88,7 +88,7 @@ def test_atomesh_benchmark_uses_required_heavy_ci_gate():
         step["env"] for step in jobs["ci-gate"]["steps"] if step.get("id") == "gate"
     )
     assert gate_env["CI_GATE_WORKFLOW"] == "atomesh-benchmark.yaml"
-    assert gate_env["CI_GATE_LABELS"] == "ci:full,ci:atomesh,ci:mesh"
+    assert gate_env["CI_GATE_LABELS"] == "ci:full,ci:mesh"
     assert "atom/mesh/**" in gate_env["CI_GATE_PATHS_INCLUDE"]
     assert ".github/benchmark/models_atomesh.yaml" in gate_env["CI_GATE_PATHS_INCLUDE"]
 
