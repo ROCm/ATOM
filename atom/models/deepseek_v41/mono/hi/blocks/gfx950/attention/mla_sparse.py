@@ -432,12 +432,30 @@ def _ckv_addr(k, p: _SPlan, b, idx, uni: bool = True):
     """The 64-bit address of request b's compressed entry ``idx`` (clamped into [0, cache_len): a pad's read lands on
     a valid row) in ATOM's pool, through its block table (``paged.row_addr``; ``uni``: a wave-uniform entry).
     """
-    if p.kv8:  # (every read of the cache comes here: none may take an MXFP8 row for bf16)
-        raise NotImplementedError(
-            f"MLASparseAttn {p.name}: kv8 (ATOM's fp8 pool, MXFP8 rows dequantized on load) is not emitted yet"
-        )
     e = fx.min(fx.max(idx, 0), fx.Int32(p.cache_len - 1))
+    if p.kv8:  # ATOM's fp8 pool: its MXFP8 rows
+        return paged.row_addr(k, p.ckv, b, e, p.cratio, uni, row_bytes=paged.KV8_ROW_BYTES)
     return paged.row_addr(k, p.ckv, b, e, p.cratio, uni)
+
+
+def _kv8_issue(addr, byte, uni: bool):
+    """``kv8``: a lane's 8 values of the MXFP8 row at ``addr`` from byte ``byte`` (a multiple of 8, in one 32-dim
+    group) and the code word holding its group's code, as loaded (``_kv8_land`` converts them where they are used,
+    so the loads stay in flight). ``uni``: a wave-uniform row (buffer loads from it, as the bf16 row's), else a lane's
+    own (64-bit global loads)."""
+    if uni:
+        r_row = rsrc(addr)
+        return (fx.Vector(bo.buffer_load(r_row, byte // 4, vec_width=2, dtype=T.i32)),
+                fx.Int32(bo.buffer_load(r_row, HD // 4 + byte // 128, vec_width=1, dtype=T.i32)))  # fmt: skip
+    return fx.Vector(global_load(addr + fx.Int64(byte), 2)), fx.Int32(
+        global_load(addr + fx.Int64(HD + (byte // 128) * 4), 1)
+    )
+
+
+def _kv8_land(loaded, byte):
+    """``_kv8_issue``'s loads as the bf16 row's four words there (exact)."""
+    v, cw = loaded
+    return paged.kv8_words(v[0], v[1], paged.kv8_code_of(cw, byte // 32))
 
 
 def _gather_issue(k, p: _SPlan, b, r, c):
@@ -454,6 +472,9 @@ def _gather_issue(k, p: _SPlan, b, r, c):
                                                   dtype=T.i32)))  # fmt: skip
         oks.append(idx >= 0)
         idxs.append(idx)
+        if p.kv8:  # (ATOM's fp8 pool: a lane's 8 B of the 528 B row and its group's code)
+            vs.append(_kv8_issue(_ckv_addr(k, p, b, idx), k.lane * 8, True))
+            continue
         # (the row's page from the block table: a scalar load, then the 1 KiB row from its own base)
         vs.append(
             fx.Vector(
@@ -468,7 +489,8 @@ def _gather_issue(k, p: _SPlan, b, r, c):
 def _gather_land(k, p: _SPlan, oks, idxs, vs, b, base):
     for i in range(CH // WAVES):
         key = k.wave * (CH // WAVES) + i
-        words = [oks[i].select(vs[i][e], fx.Int32(0)) for e in range(4)]
+        v = _kv8_land(vs[i], k.lane * 8) if p.kv8 else vs[i]
+        words = [oks[i].select(v[e], fx.Int32(0)) for e in range(4)]
         if (
             p.new and p.new_early
         ):  # an entry this launch emits: from the LDS copy of the Compressor's channel
@@ -975,7 +997,11 @@ def _smerge(k, t, p: _SPlan):
         idx = fx.Int32(fx.ptr_load(k.lds + (p.m_i + c * CH + kq)))
         oks.append(idx >= 0)
         idxs.append(idx)
-        # (a lane's own key: its page by a vector table load, the 16 B by a 64-bit global load)
+        # (a lane's own key: its page by a vector table load, the 16 B by a 64-bit global load; ATOM's fp8 pool: 8 B
+        # and its group's code)
+        if p.kv8:
+            cv.append(_kv8_issue(_ckv_addr(k, p, b, idx, uni=False), s * SLICE + piece * 8, False))
+            continue
         off = fx.Int64((s * (SLICE // 2) + piece * 4) * 4)
         cv.append(fx.Vector(global_load(_ckv_addr(k, p, b, idx, uni=False) + off, 4)))
     for i in range(0 if p.ring8 else WINDOW // CH):
@@ -990,7 +1016,8 @@ def _smerge(k, t, p: _SPlan):
             piece,
         )
     for c in range(0 if p.ckv4 else NCH):
-        words = [oks[c].select(cv[c][e], fx.Int32(0)) for e in range(4)]
+        v = _kv8_land(cv[c], s * SLICE + piece * 8) if p.kv8 else cv[c]
+        words = [oks[c].select(v[e], fx.Int32(0)) for e in range(4)]
         if p.new:
             words = _mnew_entry(k, p, base, idxs[c], piece, words)
         _vt_store(k, p, (2 + c) * CH + kq - par, words, par, piece)
