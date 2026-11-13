@@ -418,7 +418,8 @@ class KVTransferTensors:
     # Per slot region, the byte runs one unit splits into, each sharded
     # contiguously over TP ranks: a peer at k times this side's TP holds the
     # q-th k-th of every run, concatenated in run order. None for a region
-    # that cannot move between unequal TP sizes.
+    # that cannot be split; a region in `slot_region_tp_replicated` ignores
+    # its segments and moves whole.
     slot_region_tp_segments: list[tuple[int, ...] | None] | None = None
     # Per slot region, whether every TP rank holds the same unit (ReplaySSM's
     # cursor), so a peer at any TP size takes it whole instead of a shard.

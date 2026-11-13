@@ -206,12 +206,19 @@ def plain_mla_model(config) -> bool:
 def mla_staging_model(config) -> bool:
     """Whether a producer stages ``config``'s MLA KV for a DCP consumer.
 
-    Plain MLA and the MLA hybrids (``Family.is_mla``), whose MLA pages are
-    staged while their slot regions go whole. Not DeepSeek-V4, its own family.
+    Plain MLA, and the MLA hybrids without a sparse indexer such as Kimi-K3,
+    whose MLA pages are staged while their slot regions go whole. Not a sparse
+    hybrid such as GLM-5.3-Flash, whose indexer region a DCP consumer cannot
+    take per token, nor DeepSeek-V4, its own family.
     """
 
+    from atom.utils import get_hf_text_config
+    from atom.utils.selector import Family, has_mla_indexer
+
     family = _attn_family(config)
-    return family is not None and family.is_mla
+    if family == Family.KIMI_MLA:
+        return not has_mla_indexer(get_hf_text_config(config.hf_config))
+    return family == Family.MLA
 
 
 def mla_staging_reserve_bytes(config) -> int:

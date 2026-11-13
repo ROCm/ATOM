@@ -63,6 +63,7 @@ from atom.kv_transfer.disaggregation.mooncake.mla_landing import (
 from atom.kv_transfer.disaggregation.mooncake.rail_engine_pool import RailEnginePool
 from atom.kv_transfer.disaggregation.pd_producer import (
     MLA_STAGING_SLOT_BYTES,
+    mla_staging_model,
     mla_staging_pool_bytes,
     mla_staging_reserve_bytes,
     mla_staging_slot_count,
@@ -1138,7 +1139,9 @@ class MooncakeConnector(KVConnectorBase):
         self._index_staging_slots = SlotPool()
         self._prepare_sharded_index = None
         self._gather_sharded_index = None
-        # MLA staging for DCP consumers (see _execute_staged_mla_regions).
+        # MLA staging for DCP consumers (see _execute_staged_mla_regions), for
+        # the models whose pool `mla_staging_reserve_bytes` holds back.
+        self._mla_staging_model = mla_staging_model(config)
         self._mla_staging: torch.Tensor | None = None
         self._mla_staging_slots = SlotPool()
         # Each send worker gathers on its own stream (see _send_worker_stream).
@@ -1287,7 +1290,8 @@ class MooncakeConnector(KVConnectorBase):
     _MAX_RDMA_CHUNK_BYTES = 2 * 1024 * 1024 * 1024 - 64 * 1024
     _MAX_RDMA_ENTRIES_PER_BATCH = 4096
     # Class-level so a connector built without __init__ keeps the per-token
-    # paths; register_kv_caches sets the instance values.
+    # paths; __init__ and register_kv_caches set the instance values.
+    _mla_staging_model = False
     _mla_staging: torch.Tensor | None = None
     _mla_landing: LandingReceiver | None = None
     _mla_landing_table_segments = 0
@@ -1656,11 +1660,17 @@ class MooncakeConnector(KVConnectorBase):
         worker gather those tokens into destination page order on the GPU and
         send them page-contiguous. One slot per send worker, capped by
         ``MLA_STAGING_POOL_BYTES``; ``mla_staging_reserve_bytes`` holds
-        the pool back from the KV cache budget. An MLA hybrid's slot regions
-        do not take part: only its MLA pages are staged, by
+        the pool back from the KV cache budget, for the models
+        ``mla_staging_model`` names. The slot regions of a hybrid it names do
+        not take part: only its MLA pages are staged, by
         ``_execute_block_slot_transfer``.
         """
-        if not self.is_producer or self.dcp_size > 1 or not envs.ATOM_PD_MLA_STAGING:
+        if (
+            not self.is_producer
+            or self.dcp_size > 1
+            or not envs.ATOM_PD_MLA_STAGING
+            or not self._mla_staging_model
+        ):
             return None
         views = tt.block_tensor_views
         if len(views) != len(tt.block_regions):
@@ -3792,16 +3802,48 @@ class MooncakeConnector(KVConnectorBase):
             1 if consumer_tp_size is None else max(1, consumer_tp_size // self.tp_size)
         )
         split = tp_ratio > 1 and tp_segments is not None
-        # A split slot is a k-th of this one; Phase 2a sizes it against its
-        # segments.
+        tp_part = 0
+        if split:
+            consumer_tp_rank = int(request_data["consumer_tp_rank"])
+            if consumer_tp_rank // tp_ratio != self.tp_rank:
+                raise RuntimeError(
+                    f"Consumer TP rank {consumer_tp_rank} of {consumer_tp_size} "
+                    f"holds no part of producer TP rank {self.tp_rank} of "
+                    f"{self.tp_size}'s sharded slot state (req {req_id})"
+                )
+            tp_part = consumer_tp_rank % tp_ratio
+        # A split slot is a k-th of this one, cut along its segments; a
+        # replicated region moves whole.
         for region_idx, (_, bps) in enumerate(self._slot_regions):
             cidx = slot_cmap[region_idx]
-            if not split and consumer_slot_bps[cidx] != bps:
+            dst_bps = consumer_slot_bps[cidx]
+            if not split and dst_bps != bps:
                 raise RuntimeError(
                     f"State slot size mismatch for req {req_id}: producer "
                     f"region {region_idx} has {bps} B, consumer region {cidx} "
-                    f"has {consumer_slot_bps[cidx]} B; prefill and decode must "
-                    "run the same model and spec config"
+                    f"has {dst_bps} B; prefill and decode must run the same "
+                    "model and spec config"
+                )
+            if not split:
+                continue
+            if tp_replicated and tp_replicated[region_idx]:
+                if dst_bps != bps:
+                    raise RuntimeError(
+                        f"Slot region {region_idx} is TP-replicated, but its "
+                        f"consumer unit differs for req {req_id}: {bps} B "
+                        f"here, {dst_bps} B there"
+                    )
+                continue
+            segments = tp_segments[region_idx]
+            if (
+                segments is None
+                or any(seg % tp_ratio for seg in segments)
+                or dst_bps * tp_ratio != bps
+            ):
+                raise RuntimeError(
+                    f"Slot region {region_idx} cannot split {tp_ratio} ways "
+                    f"for req {req_id}: segments={segments}, producer unit "
+                    f"{bps} B, consumer unit {dst_bps} B"
                 )
 
         # ---- Phase 1: Block transfer ----
@@ -3898,13 +3940,13 @@ class MooncakeConnector(KVConnectorBase):
                 srcs = src_base + src_ids * bpb
                 dsts = dst_base + dst_ids * consumer_block_bpb[cidx]
                 lens = np.full(src_ids.size, bpb, dtype=np.int64)
+            elif stages_sharded_mla and region_idx in self._mla_token_views:
+                staged_mla_regions.append((region_idx, dst_base, bpb))
+                continue
             else:
                 srcs, dsts, lens = self._dcp_token_descriptors(
                     region_idx, src_base, dst_base, bpb, sharded_runs
                 )
-                if stages_sharded_mla and region_idx in self._mla_token_views:
-                    staged_mla_regions.append((region_idx, dst_base, bpb))
-                    continue
             if not batch.add(srcs, dsts, lens):
                 logger.error("[PRODUCER] block transfer failed for req %s", req_id)
                 return False
@@ -3987,49 +4029,20 @@ class MooncakeConnector(KVConnectorBase):
         slot_dst: list[int] = []
         slot_sizes: list[int] = []
 
-        # Phase 2a: slot-indexed state, written direct (no staging)
-        tp_part = 0
-        if split:
-            consumer_tp_rank = int(request_data["consumer_tp_rank"])
-            if consumer_tp_rank // tp_ratio != self.tp_rank:
-                raise RuntimeError(
-                    f"Consumer TP rank {consumer_tp_rank} of {consumer_tp_size} "
-                    f"holds no part of producer TP rank {self.tp_rank} of "
-                    f"{self.tp_size}'s sharded slot state (req {req_id})"
-                )
-            tp_part = consumer_tp_rank % tp_ratio
+        # Phase 2a: slot-indexed state, written direct (no staging). Every
+        # unit and split was checked before Phase 1.
         for region_idx, (src_base, bps) in enumerate(self._slot_regions):
             cidx = slot_cmap[region_idx]
             dst_base = consumer_slot_addrs[cidx]
             dst_bps = consumer_slot_bps[cidx]
-            replicated = split and bool(tp_replicated and tp_replicated[region_idx])
-            if replicated and dst_bps != bps:
-                raise RuntimeError(
-                    f"Slot region {region_idx} is TP-replicated, but its "
-                    f"consumer unit differs for req {req_id}: {bps} B here, "
-                    f"{dst_bps} B there"
-                )
-            if not split or replicated:
-                # Both units are this one's size: an unsplit region was held
-                # to it before Phase 1, a replicated one just above.
+            if not split or (tp_replicated and tp_replicated[region_idx]):
                 slot_src.append(src_base + src_slot * bps)
                 slot_dst.append(dst_base + dst_slot * dst_bps)
                 slot_sizes.append(bps)
                 continue
-            segments = tp_segments[region_idx]
-            if (
-                segments is None
-                or any(seg % tp_ratio for seg in segments)
-                or dst_bps * tp_ratio != bps
-            ):
-                raise RuntimeError(
-                    f"Slot region {region_idx} cannot split {tp_ratio} ways "
-                    f"for req {req_id}: segments={segments}, producer unit "
-                    f"{bps} B, consumer unit {dst_bps} B"
-                )
             src_offset = src_base + src_slot * bps
             dst_offset = dst_base + dst_slot * dst_bps
-            for seg in segments:
+            for seg in tp_segments[region_idx]:
                 piece = seg // tp_ratio
                 slot_src.append(src_offset + tp_part * piece)
                 slot_dst.append(dst_offset)
