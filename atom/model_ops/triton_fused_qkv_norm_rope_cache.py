@@ -18,7 +18,7 @@ import triton.language as tl
 from torch import Tensor
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_slots"])
 def _fused_qkv_norm_rope_cache_kernel(
     # Separate Q, K, V input pointers (may be strided views from torch.split)
     q_ptr,
@@ -61,8 +61,9 @@ def _fused_qkv_norm_rope_cache_kernel(
     ks_stride_head,
     vs_stride_block,
     vs_stride_head,
-    # Slot mapping
+    # Slot mapping: [num_slots]; tokens at or past num_slots are padding
     slot_mapping_ptr,
+    num_slots,
     # M-RoPE parameters
     pos_stride_row,  # stride between position rows (for 2D positions)
     # Dimensions
@@ -253,7 +254,10 @@ def _fused_qkv_norm_rope_cache_kernel(
         v = tl.load(v_ptr + v_in_offset + d_offs)
 
         # === KV cache write (SHUFFLE layout) ===
-        slot = tl.load(slot_mapping_ptr + token_id).to(tl.int64)
+        # A padding token reads no slot and writes no cache.
+        slot = tl.load(
+            slot_mapping_ptr + token_id, mask=token_id < num_slots, other=-1
+        ).to(tl.int64)
         if slot >= 0:
             block_idx = slot // BLOCK_SIZE
             slot_in_block = slot % BLOCK_SIZE
@@ -348,6 +352,10 @@ def triton_fused_norm_rope_cache(
          + FP8 quant SHUFFLE cache write
     - V: FP8 quant SHUFFLE cache write (no norm, no RoPE)
 
+    Token t < slot_mapping.shape[0] goes to slot slot_mapping[t]; a negative
+    slot is not written. Tokens past the slot table are padding: they get
+    q_out and k_out rows, but no cache write.
+
     Returns contiguous (q_out, k_out).
     """
     T = q.shape[0]
@@ -425,6 +433,7 @@ def triton_fused_norm_rope_cache(
         v_scale.stride(0) if v_scale is not None and v_scale.dim() >= 1 else 0,
         v_scale.stride(1) if v_scale is not None and v_scale.dim() >= 2 else 0,
         slot_mapping,
+        slot_mapping.shape[0],
         pos_stride_row,
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
