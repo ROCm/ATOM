@@ -20,12 +20,13 @@ from unittest import mock
 # The ATOMesh config job runs these tests on a runner without torch.
 try:
     from torch import nn
+except ModuleNotFoundError:
+    nn = None
 
+if nn is not None:
     from atom.models.kimi_k3.mono import dispatch as k3_mono
     from atom.mono.runtime import route
     from atom.mono.runtime.consensus import MonoUnsupported
-except ModuleNotFoundError:
-    nn = None
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / ".github/scripts/atomesh"
@@ -373,7 +374,9 @@ class RejectedLogTest(unittest.TestCase):
     def write(self, name, *lines):
         (self.logs / name).write_text("".join(f"INFO {line}\n" for line in lines))
 
-    def check(self, aggregated="0", prefill=None, decode=None, when="", wait="60"):
+    def check(
+        self, aggregated="0", prefill=None, decode=None, when="", wait="60", **env
+    ):
         return subprocess.run(
             [
                 "bash",
@@ -391,12 +394,26 @@ class RejectedLogTest(unittest.TestCase):
                 AGGREGATED=aggregated,
                 PREFILL_REJECT_LOG=json.dumps(prefill) if prefill else "",
                 DECODE_REJECT_LOG=json.dumps(decode) if decode else "",
+                **env,
             ),
             capture_output=True,
             text=True,
             timeout=30,
             check=False,
         )
+
+    def test_a_log_it_cannot_read_fails_the_cell(self):
+        self.write("decode-rank-1.log", "Kimi-K3 mono decode on")
+        bin_dir = self.logs / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "grep").write_text("#!/bin/sh\necho 'grep: I/O error' >&2\nexit 2\n")
+        (bin_dir / "grep").chmod(0o755)
+        result = self.check(
+            decode=MONO_GONE, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}"
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("could not read", result.stderr)
+        self.assertIn("(grep exit 2)", result.stderr)
 
     def test_nothing_rejected_reads_no_log(self):
         # nor waits 60 s, which would outlast the 30 s timeout
@@ -616,7 +633,7 @@ class SubmitLogLinesTest(unittest.TestCase):
 
 class SubmitOnlineQuantTest(unittest.TestCase):
     """pd_submit.sh's per-role --online_quant_config, from the real PP8 C72
-    cell, whose prefill alone excludes the drafter's f_b_proj."""
+    cell, whose prefill alone keeps the target's KDA gate (f_b_proj) in bf16."""
 
     @classmethod
     def setUpClass(cls):

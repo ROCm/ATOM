@@ -2998,7 +2998,7 @@ check_expected_logs() {
 PREFILL_REJECT_LOG="${PREFILL_REJECT_LOG:-}"
 DECODE_REJECT_LOG="${DECODE_REJECT_LOG:-}"
 check_rejected_logs() {
-  local when="${1:-}" role rejected line log hit
+  local when="${1:-}" role rejected line log hit status
   local -a role_logs lines
   if [[ "${when}" == "last" && -n "${PREFILL_REJECT_LOG}${DECODE_REJECT_LOG}" ]]; then
     echo "[check] waiting ${ATOMESH_EXPECT_LOG_TIMEOUT}s for the servers' last lines to reach ${RUNTIME_LOG_DIR}"
@@ -3015,8 +3015,13 @@ check_rejected_logs() {
     collect_role_logs "${role}" "its reject_log"
     for log in "${role_logs[@]}"; do
       for line in "${lines[@]}"; do
-        if hit="$(grep -m1 -F -- "${line}" "${log}")"; then
+        status=0
+        hit="$(grep -m1 -F -- "${line}" "${log}")" || status=$?
+        if (( status == 0 )); then
           echo "[check][FAIL] ${log} logged '${line}': ${hit}" >&2
+          exit 1
+        elif (( status != 1 )); then
+          echo "[check][FAIL] could not read ${log} for '${line}' (grep exit ${status})" >&2
           exit 1
         fi
       done
