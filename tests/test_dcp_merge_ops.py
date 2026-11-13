@@ -1980,6 +1980,22 @@ def test_sparse_prefill_persistence_does_not_look_at_dtype():
 
 
 @pytest.mark.parametrize(
+    "dcp,q,causal,cp_world_size",
+    [(8, 1, True, 1), (8, 8, True, 8), (8, 8, False, 1), (1, 8, True, 1)],
+    ids=["one_row", "causal_verify", "draft_block", "no_dcp"],
+)
+def test_dcp_decode_call_is_the_one_forward_makes(dcp, q, causal, cp_world_size):
+    """Only a causal multi-row decode takes the round-robin kernel; aiter routes
+    gfx1250 to the asm table (no kernel) for cp_world_size > 1 without it."""
+    from atom.distributed.dcp_utils import mla_dcp_decode_call
+
+    call = mla_dcp_decode_call(dcp, q, causal)
+    assert call["cp_world_size"] == cp_world_size
+    assert call["cp_round_robin"] is (cp_world_size > 1)
+    assert call["causal"] is causal and call["return_lse"] is True
+
+
+@pytest.mark.parametrize(
     "supported,backend,expected",
     [
         (True, "asm", True),
@@ -2031,9 +2047,12 @@ def test_dcp_persistent_supported_reads_aiters_answer(
             (64, 1, dtype, dtype),
             {
                 "persistent": True,
-                "return_lse": True,
-                "cp_world_size": 8,
                 "page_size": 1,
+                # A one-row decode passes no round-robin arguments.
+                "return_lse": True,
+                "causal": True,
+                "cp_world_size": 1,
+                "cp_round_robin": False,
             },
         )
     ]

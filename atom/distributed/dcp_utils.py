@@ -54,6 +54,22 @@ def get_dcp_rank() -> int:
     return get_dcp_group().rank_in_group if dcp_is_enabled() else 0
 
 
+def mla_dcp_decode_call(
+    dcp_world_size: int, max_seqlen_q: int = 1, causal: bool = True
+) -> dict:
+    """How a DCP decode calls ``mla_decode_fwd``, as aiter's shape queries take
+    it. Mirrors ``MLAAttention._forward_decode``: only a causal decode of more
+    than one row masks on global positions, through the round-robin
+    (``g_kv_indptr``) kernel; every other decode runs as if DCP were off."""
+    round_robin = dcp_world_size > 1 and max_seqlen_q > 1 and causal
+    return {
+        "return_lse": True,
+        "causal": causal,
+        "cp_world_size": dcp_world_size if round_robin else 1,
+        "cp_round_robin": round_robin,
+    }
+
+
 def dcp_persistent_supported(
     num_heads: int, kv_cache_dtype: str, dcp_world_size: int
 ) -> bool:
@@ -77,9 +93,8 @@ def dcp_persistent_supported(
         dtype,
         dtype,
         persistent=True,
-        return_lse=True,
-        cp_world_size=dcp_world_size,
         page_size=max(envs.ATOM_MLA_PAGE_SIZE, 1),
+        **mla_dcp_decode_call(dcp_world_size),
     )
     # aiter has no table for the FlyDSL PS1 route and answers None there; a
     # None from any other route is a failed query, not a yes.
