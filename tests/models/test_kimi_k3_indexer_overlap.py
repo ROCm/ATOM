@@ -42,7 +42,9 @@ def dcp_prefill(monkeypatch):
         "triton_filter_and_convert_dcp_index_prefill",
         lambda *a, **k: calls.append(("filter", current())),
     )
-    monkeypatch.setattr(indexer_forward, "indexer_k_quant_and_cache", lambda *a: None)
+    monkeypatch.setattr(
+        indexer_forward, "indexer_k_quant_and_cache", lambda *a, **k: None
+    )
     monkeypatch.setattr(indexer_forward, "_index_cache", lambda *a: None)
     monkeypatch.setattr(indexer_forward, "get_dcp_world_size", lambda: 2)
     monkeypatch.setattr(indexer_forward, "get_dcp_rank", lambda: 0)
@@ -101,7 +103,7 @@ def test_capture_tbo_and_a_streamless_indexer_keep_the_serial_order(
     if serial == "graph capture":
         monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     if serial == "tbo":
-        monkeypatch.setattr(indexer_forward, "tbo_active", lambda: True)
+        monkeypatch.setattr(indexer_forward, "tbo_active", lambda: True, raising=False)
     calls, md = dcp_prefill(None if serial == "no stream" else torch.cuda.Stream())
     main = torch.cuda.current_stream()
     assert calls == [("score", main, True), ("filter", main)]
