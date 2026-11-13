@@ -10,7 +10,12 @@ from aiter.dist.parallel_state import get_tp_group
 from torch import nn
 
 from atom.model_loader.weight_names import WeightsMapper
-from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
+from atom.model_ops.deepseek_v41.mhc import (
+    SinglePassHCState,
+    precompile_post_shuffled,
+    res_preshuffle_rows,
+    unshuffle_residual,
+)
 from atom.model_ops.deepseek_v41.mhc_pre_delayed import (
     fuse_quant_supported,
     pack_mhc_fn,
@@ -18,6 +23,7 @@ from atom.model_ops.deepseek_v41.mhc_pre_delayed import (
 )
 from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
 from atom.model_ops.embed_head import VocabParallelEmbedding
+from atom.model_ops.engram.device.gate import precompile_shuffled_gate
 from atom.model_ops.engram.device.layer import EngramOp
 from atom.model_ops.engram.device.staging import EngramStagedRows
 from atom.model_ops.layernorm import RMSNorm
@@ -36,6 +42,10 @@ from .config import build_attention_topology
 from .layers import native_quant_config
 from .moe import MoE
 
+# (kernel, device, width) the shuffled-residual Triton kernels were compiled
+# for, so the first Block to load compiles them and the rest skip.
+_RES_SHUFFLE_PRECOMPILED: set = set()
+
 
 class Block(nn.Module):
     attention_cls = Attention
@@ -53,6 +63,9 @@ class Block(nn.Module):
     ):
         super().__init__()
         self.layer_name = f"v41.layers.{spec.layer_id}"
+        # Whether this layer's seams run on the shuffled residual: set by
+        # prepare_attention from its state, read by the FFN seam after it.
+        self._res_shuffled = False
         self.attn = self.attention_cls(
             config, spec, compress_stream=compress_stream, index_stream=index_stream
         )
@@ -120,6 +133,24 @@ class Block(nn.Module):
         self.hc_fuse_quant = (
             self.hc_attn_fn_packed is not None and fuse_quant_supported()
         )
+        if self.hc_attn_fn_packed is not None and res_preshuffle_rows(1):
+            self._precompile_res_shuffle()
+
+    def _precompile_res_shuffle(self):
+        """Compile the shuffled-residual Triton kernels at load, not in the
+        first decode step that reaches a new launch config."""
+        device = self.hc_attn_fn.device
+        hidden = self.attn_norm.weight.shape[-1]
+        key = ("post", str(device), hidden)
+        if key not in _RES_SHUFFLE_PRECOMPILED:
+            precompile_post_shuffled(hidden, device)
+            _RES_SHUFFLE_PRECOMPILED.add(key)
+        if self.engram is not None:
+            hc, dim = self.engram.hc_mult, self.engram.hidden_size
+            key = ("engram", str(device), hc, dim)
+            if key not in _RES_SHUFFLE_PRECOMPILED:
+                precompile_shuffled_gate(hc, dim, device)
+                _RES_SHUFFLE_PRECOMPILED.add(key)
 
     def attention_forward(self, normed, cache, step, rope):
         """Keep BF16 for auxiliary readers and reuse the optional QKV quant."""
@@ -130,22 +161,28 @@ class Block(nn.Module):
             )
         return self.attn(normed, None, cache, step, rope)
 
-    def engram_forward(self, residual, embeddings, image_mask):
+    def engram_forward(self, residual, embeddings, image_mask, res_preshuffle=False):
         if embeddings is None:
             raise ValueError("Engram rows must be prepared before model execution")
         return self.engram(
-            residual, embeddings, None if image_mask is None else ~image_mask
+            residual,
+            embeddings,
+            None if image_mask is None else ~image_mask,
+            res_preshuffle=res_preshuffle,
         )
 
     def prepare_attention(self, state, embeddings, image_mask):
+        shuffled = self._res_shuffled = state.res_shuffled
         if self.engram is not None:
             # Engram reads the residual between the post and the pre, so this
             # is the one seam that cannot fold: settling leaves nothing owed
             # and the projection below runs plain.
-            state = state.settle()
+            state = state.settle(keep_shuffled=shuffled)
             state = replace(
                 state,
-                residual=self.engram_forward(state.residual, embeddings, image_mask),
+                residual=self.engram_forward(
+                    state.residual, embeddings, image_mask, res_preshuffle=shuffled
+                ),
             )
         hc_fn = self.hc_attn_fn_packed
         residual, normed, pre, post, comb = pre_delayed(
@@ -162,6 +199,7 @@ class Block(nn.Module):
             sublayer_output=state.pending,
             post_mix=state.post_mix,
             combination=state.combination,
+            res_preshuffle=shuffled,
         )
         return normed, residual, pre, post, comb
 
@@ -182,13 +220,16 @@ class Block(nn.Module):
             sublayer_output=output,
             post_mix=post,
             combination=comb,
+            res_preshuffle=self._res_shuffled,
         )
         return normed, residual, pre, post, comb
 
     def finish_ffn(self, output, residual, pre, post, comb):
         # Owed, not applied: the next block's pre folds this post into its own
         # projection.
-        return SinglePassHCState(residual, pre, output, post, comb)
+        return SinglePassHCState(
+            residual, pre, output, post, comb, res_shuffled=self._res_shuffled
+        )
 
     def forward(
         self, state, cache, step, rope, embeddings=None, image_mask=None, queries=None
@@ -201,6 +242,10 @@ class Block(nn.Module):
         )
         output = self.attention_forward(normed, cache, step, rope)
         if queries is not None:
+            if self._res_shuffled:
+                # Rows of a shuffled residual are not rows of its tensor.
+                residual = unshuffle_residual(residual)
+                self._res_shuffled = False
             residual, pre, post, comb = queries.take(residual, pre, post, comb)
         return self.ffn_forward(output, residual, pre, post, comb)
 

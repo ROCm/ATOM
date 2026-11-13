@@ -262,7 +262,16 @@ class DeepseekV41DSpark(DSparkDraftModel):
         # this one leaves its FFN post owed, and `residual` is by definition
         # the value before it. The block pays the same post again into its own
         # pre, which is the one seam where the draft costs the target a kernel.
-        residual = inputs[0].settle().residual
+        state = inputs[0]
+        if state.res_shuffled:
+            # The stream mean read straight off the shuffled layout
+            # resS[k // 32][stream][token][k % 32].
+            residual = state.settle(keep_shuffled=True).residual
+            hc, dim = residual.shape[-2:]
+            rows = residual.numel() // (hc * dim)
+            blocks = residual.reshape(dim // 32, hc, rows, 32).mean(dim=1)
+            return blocks.permute(1, 0, 2).reshape(rows, dim)
+        residual = state.settle().residual
         return residual.mean(dim=-2).reshape(-1, residual.shape[-1])
 
     def project_context(self, aux_concat):

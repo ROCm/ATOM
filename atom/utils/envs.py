@@ -418,6 +418,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DSV41_MHC_BACKEND": lambda: os.getenv(
         "ATOM_DSV41_MHC_BACKEND", "auto"
     ).lower(),
+    # gfx1250 HIP Mega-MHC: carry the mHC residual of decode forwards in
+    # aiter's shuffled layout (mhc_res_shuffle, ks=32; `deepseek_v41/mhc.py`).
+    # On by default; 0 forces the plain layout.
+    "ATOM_DSV41_RES_PRESHUFFLE": lambda: os.getenv("ATOM_DSV41_RES_PRESHUFFLE", "1")
+    == "1",
     # --- Kernel Fusion Toggles ---
     # fused_compress_attn: switch between Triton (default historical) and a
     # flydsl drop-in for V4-Pro Compressor (Main BF16 + Indexer FP8) paths.

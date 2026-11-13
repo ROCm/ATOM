@@ -2,6 +2,7 @@
 """Single-Pass mHC math; incoming pre-mix belongs to the previous sublayer."""
 
 from dataclasses import dataclass
+from functools import cache
 
 import torch
 import triton
@@ -10,6 +11,56 @@ from aiter import mhc_post
 
 from atom.model_ops.deepseek_v41.projections import hc_projection
 from atom.model_ops.sparse_attn_v4 import hc_split_sinkhorn
+from atom.utils import envs
+
+
+@cache
+def _mega_mhc_res():
+    """aiter.ops.mega_mhc with its res_preshuffle-layout helpers, or None for
+    an aiter that predates them (the residual then stays plain)."""
+    try:
+        from aiter.ops import mega_mhc
+    except ImportError:
+        return None
+    return mega_mhc if hasattr(mega_mhc, "mega_mhc_post_shuffled") else None
+
+
+@cache
+def _res_preshuffle_supported() -> bool:
+    mega_mhc = _mega_mhc_res()
+    return (
+        mega_mhc is not None
+        and envs.ATOM_DSV41_MHC_BACKEND != "triton"
+        and mega_mhc.mega_mhc_res_preshuffle_supported()
+    )
+
+
+def res_preshuffle_rows(rows: int) -> bool:
+    """Whether a residual of ``rows`` tokens is carried shuffled: wherever the
+    HIP Mega-MHC supports it, unless ATOM_DSV41_RES_PRESHUFFLE=0."""
+    return envs.ATOM_DSV41_RES_PRESHUFFLE and rows > 0 and _res_preshuffle_supported()
+
+
+def shuffle_residual(residual):
+    """Plain (..., hc, H) residual -> the layout Mega-MHC reads, same shape."""
+    return _mega_mhc_res().mega_mhc_res_shuffle(residual)
+
+
+def unshuffle_residual(residual):
+    """Shuffled (..., hc, H) residual -> the plain layout, same shape."""
+    return _mega_mhc_res().mega_mhc_res_unshuffle(residual)
+
+
+def expand_residual_shuffled(sublayer_output, residual, post_mix, combination):
+    """`expand_residual` on a shuffled residual, writing the shuffled layout."""
+    return _mega_mhc_res().mega_mhc_post_shuffled(
+        sublayer_output, residual, post_mix, combination
+    )
+
+
+def precompile_post_shuffled(hidden: int, device) -> None:
+    """Compile the shuffled post's launch configs before graph capture."""
+    _mega_mhc_res().precompile_mega_mhc_post_shuffled(hidden, device)
 
 
 @triton.jit
@@ -98,30 +149,58 @@ class SinglePassHCState:
     pending: torch.Tensor | None = None
     post_mix: torch.Tensor | None = None
     combination: torch.Tensor | None = None
+    # `residual` is in Mega-MHC's res_preshuffle layout; see res_preshuffle_rows.
+    res_shuffled: bool = False
 
     @classmethod
-    def from_embeddings(cls, hidden: torch.Tensor, hc_mult: int):
-        residual = (
-            hidden.unsqueeze(-2)
-            .expand(*hidden.shape[:-1], hc_mult, hidden.shape[-1])
-            .contiguous()
-        )
+    def from_embeddings(
+        cls, hidden: torch.Tensor, hc_mult: int, res_shuffled: bool = False
+    ):
+        if res_shuffled:
+            residual = _mega_mhc_res().mega_mhc_res_repeat(hidden, hc_mult)
+        else:
+            residual = (
+                hidden.unsqueeze(-2)
+                .expand(*hidden.shape[:-1], hc_mult, hidden.shape[-1])
+                .contiguous()
+            )
         pre_mix = torch.zeros(
             (*hidden.shape[:-1], hc_mult), dtype=torch.float32, device=hidden.device
         )
         pre_mix[..., 0] = 1
-        return cls(residual, pre_mix)
+        return cls(residual, pre_mix, res_shuffled=res_shuffled)
 
-    def settle(self):
-        """This state with any owed post applied, so `residual` is current."""
+    def settle(self, keep_shuffled: bool = False):
+        """This state with any owed post applied, so `residual` is current.
+
+        The result is plain unless ``keep_shuffled`` and the residual is
+        already shuffled (an Engram seam, whose gate reads that layout).
+        """
+        if not self.res_shuffled:
+            if self.pending is None:
+                return self
+            return SinglePassHCState(
+                expand_residual(
+                    self.pending, self.residual, self.post_mix, self.combination
+                ),
+                self.pre_mix,
+            )
         if self.pending is None:
-            return self
-        return SinglePassHCState(
-            expand_residual(
+            residual = (
+                self.residual if keep_shuffled else unshuffle_residual(self.residual)
+            )
+        elif keep_shuffled:
+            residual = expand_residual_shuffled(
                 self.pending, self.residual, self.post_mix, self.combination
-            ),
-            self.pre_mix,
-        )
+            )
+        else:
+            residual = expand_residual(
+                self.pending,
+                unshuffle_residual(self.residual),
+                self.post_mix,
+                self.combination,
+            )
+        return SinglePassHCState(residual, self.pre_mix, res_shuffled=keep_shuffled)
 
     def fields(self):
         """The five tensors, in constructor order."""
@@ -236,5 +315,7 @@ def apply_sublayer(
         sinkhorn_eps=sinkhorn_eps,
         sinkhorn_iters=sinkhorn_iters,
     )
+    if state.res_shuffled:
+        raise ValueError("apply_sublayer reads the plain residual layout")
     output = sublayer(state.collapse())
     return SinglePassHCState(expand_residual(output, state.residual, post, comb), pre)

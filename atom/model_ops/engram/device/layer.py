@@ -61,6 +61,7 @@ class EngramOp(nn.Module):
         hidden_states: torch.Tensor,
         embeddings: torch.Tensor,
         token_mask: torch.Tensor | None = None,
+        res_preshuffle: bool = False,
     ) -> torch.Tensor:
         """Return the updated residual, with no BF16 gate or intermediate addition.
 
@@ -89,7 +90,12 @@ class EngramOp(nn.Module):
             )
         kv = self.wkv(embeddings)
         return engram_post_wkv(
-            hidden_states, kv, self.gate_weight, token_mask, self.norm_eps
+            hidden_states,
+            kv,
+            self.gate_weight,
+            token_mask,
+            self.norm_eps,
+            res_preshuffle=res_preshuffle,
         )
 
     @torch.no_grad()
