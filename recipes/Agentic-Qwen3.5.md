@@ -108,8 +108,11 @@ Notes:
   chunk boundary, so a request that shares a long prefix with another resumes
   mid-prompt instead of from zero. With midstep these checkpoints cost no extra
   forward.
-- `OFFLOAD_STATE_CPU_SIZE=110` keeps about 4680 GDN state images per rank;
-  the 32 GiB default drops checkpoints the engine still plans to load.
+- `OFFLOAD_STATE_CPU_SIZE=110` (GiB per rank) keeps about 4680 GDN state
+  images per rank at TP4 (24 MiB each) and about 2340 at TP2 (48 MiB each:
+  a TP2 rank holds twice the heads); the 32 GiB default drops checkpoints the
+  engine still plans to load. The TP2 LMCache points use the same per-rank
+  sizes as TP4 (`LMCACHE_MAX_LOCAL_CPU_SIZE=253`, `OFFLOAD_STATE_CPU_SIZE=110`).
 - Keep `ATOM_PREFILL_DECODE_INTERVAL=4`: shorter protection costs p90
   interactivity and throughput, longer protection gains nothing.
 
