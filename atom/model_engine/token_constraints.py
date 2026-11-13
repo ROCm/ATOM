@@ -13,7 +13,6 @@ import logging
 
 import torch
 
-from atom.constraint_parser import ConstraintBinding
 from atom.model_ops.required_channel import DeviceChannel
 
 logger = logging.getLogger("atom")
@@ -47,14 +46,8 @@ def needs_constraint_snapshot(batch, metadata):
 
 def _bindings(batch):
     for provider in _PROVIDERS:
-        if not provider.enabled(batch):
-            continue
-        binding = provider.bind(batch)
-        if binding is None:
-            raise ValueError(
-                f"Enabled constraint adapter {provider.backend} did not bind"
-            )
-        yield provider, binding
+        if provider.enabled(batch):
+            yield provider, provider.bind(batch)
 
 
 def prepare_token_constraints(runner, batch, metadata):
@@ -134,7 +127,7 @@ class TokenConstraints:
 
     The no-constraint path returns None without allocating a step or GPU buffers.
     Logprobs preserve the pre-mask model distribution. Speculative channel masks
-    operate on gathered copies, as the original verifier does.
+    operate on gathered copies.
     """
 
     @classmethod
@@ -253,7 +246,7 @@ class GrammarProvider:
 
     @staticmethod
     def hard_requests(binding, batch):
-        return list(binding.value)
+        return list(binding)
 
     @staticmethod
     def enabled(batch):
@@ -265,8 +258,7 @@ class GrammarProvider:
 
     @staticmethod
     def bind(batch):
-        requests = batch.structured_requests
-        return ConstraintBinding("grammar", requests) if requests else None
+        return batch.structured_requests
 
     @staticmethod
     def prepare(runner, batch, metadata, binding):
@@ -296,7 +288,7 @@ class GrammarProvider:
     def commit(step, tokens, batch, deferred, failure, binding):
         if step.prefixes:
             step.grammar.commit(
-                tokens if failure is None else _error_tokens(tokens, failure),
+                tokens if failure is None else error_tokens(tokens, failure),
                 batch,
                 step.prefixes,
             )
@@ -322,8 +314,7 @@ class ChannelProvider:
 
     @staticmethod
     def bind(batch):
-        channel = batch.required_channel
-        return ConstraintBinding("channel", channel) if channel is not None else None
+        return batch.required_channel
 
     @staticmethod
     def prepare(runner, batch, metadata, binding):
@@ -337,7 +328,7 @@ class ChannelProvider:
     @staticmethod
     def release(runner, request_ids):
         # Immutable device tables are server-wide; request carry belongs to
-        # tokenIDProcessor and follows its existing batch/output lifetime.
+        # tokenIDProcessor and follows its batch/output lifetime.
         pass
 
     @staticmethod
@@ -380,7 +371,7 @@ def _guard_empty_rows(logits, selected=None):
     return invalid
 
 
-def _error_tokens(tokens, failure):
+def error_tokens(tokens, failure):
     mask = failure if tokens.ndim == 1 else failure[:, None]
     return tokens.masked_fill(mask, -2)
 

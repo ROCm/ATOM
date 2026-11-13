@@ -84,6 +84,7 @@ from atom.model_engine.state_runtime import StateRuntime
 from atom.model_engine.token_constraints import (
     TokenConstraints,
     constraint_errors,
+    error_tokens,
     has_constraints,
     needs_constraint_snapshot,
     prepare_token_constraints,
@@ -440,12 +441,7 @@ class tokenIDProcessor:
     ) -> tuple[dict[int, tuple[int, ...]], dict[int, list[TokenLogprob]] | None]:
         output_ids = sampled_token_ids
         if constraint_failed is not None:
-            failure = (
-                constraint_failed
-                if sampled_token_ids.ndim == 1
-                else constraint_failed[:, None]
-            )
-            output_ids = sampled_token_ids.masked_fill(failure, -2)
+            output_ids = error_tokens(sampled_token_ids, constraint_failed)
             if self.is_deferred_out and sampled_token_ids.is_cuda:
                 # The caller recorded before this output-only transform. D2H
                 # must wait for its completion too, not copy uninitialized IDs.

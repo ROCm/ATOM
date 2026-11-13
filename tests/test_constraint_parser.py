@@ -56,7 +56,6 @@ def test_registered_provider_traverses_complete_lifecycle(monkeypatch):
 
     import torch
 
-    from atom.constraint_parser import ConstraintBinding
     from atom.model_engine import token_constraints as boundary
 
     events = []
@@ -80,25 +79,21 @@ def test_registered_provider_traverses_complete_lifecycle(monkeypatch):
 
         @staticmethod
         def bind(batch):
-            return (
-                ConstraintBinding("third", batch.third)
-                if Provider.enabled(batch)
-                else None
-            )
+            return batch.third
 
         @staticmethod
         def prepare(runner, batch, metadata, binding):
-            events.append(("prepare", binding.value))
+            events.append(("prepare", binding))
 
         @staticmethod
         def apply(step, binding):
-            events.append(("apply", binding.value))
+            events.append(("apply", binding))
             step.source[:, 1] = -float("inf")
 
         @staticmethod
         def commit(step, tokens, batch, deferred, failure, binding):
             assert tokens.tolist() == [0]
-            events.append(("commit", binding.value))
+            events.append(("commit", binding))
 
         @staticmethod
         def release(runner, ids):
@@ -131,7 +126,6 @@ def test_late_registered_source_mask_composes_with_channel(monkeypatch, spec, ac
 
     import torch
 
-    from atom.constraint_parser import ConstraintBinding
     from atom.model_engine import token_constraints as boundary
     from atom.model_ops.required_channel import constrain_logits_reference
     from atom.sampling_params import RequiredChannel
@@ -155,7 +149,7 @@ def test_late_registered_source_mask_composes_with_channel(monkeypatch, spec, ac
 
         @staticmethod
         def bind(batch):
-            return ConstraintBinding("third-source", 7)
+            return 7
 
         @staticmethod
         def prepare(*args):
@@ -171,9 +165,9 @@ def test_late_registered_source_mask_composes_with_channel(monkeypatch, spec, ac
 
         @staticmethod
         def apply(step, binding):
-            kept = step.source[:, binding.value].clone()
+            kept = step.source[:, binding].clone()
             step.source.fill_(-float("inf"))
-            step.source[:, binding.value] = kept
+            step.source[:, binding] = kept
 
     monkeypatch.setattr(boundary, "_PROVIDERS", list(boundary._PROVIDERS))
     boundary.register_constraint_provider(SourceMask)
@@ -252,7 +246,6 @@ def test_provider_failure_reports_preserve_previous_failures(monkeypatch, inplac
 
     import torch
 
-    from atom.constraint_parser import ConstraintBinding
     from atom.model_engine import token_constraints as boundary
 
     class First:
@@ -266,7 +259,7 @@ def test_provider_failure_reports_preserve_previous_failures(monkeypatch, inplac
 
         @staticmethod
         def bind(batch):
-            return ConstraintBinding("first", None)
+            return None
 
         @staticmethod
         def hard_requests(binding, batch):

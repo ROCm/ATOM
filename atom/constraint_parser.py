@@ -16,18 +16,6 @@ class ChannelRule:
     label: str
 
 
-@dataclass(frozen=True)
-class ConstraintBinding:
-    """A native rule value tagged for its execution adapter.
-
-    Bindings are rebuilt at the engine boundary; provider objects never cross
-    sequence IPC and do not replace native RequiredChannel/grammar objects.
-    """
-
-    backend: str
-    value: object
-
-
 class ConstraintParser:
     """Compile format declarations through one public interface.
 

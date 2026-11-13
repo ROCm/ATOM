@@ -21,7 +21,6 @@ import pytest
 import torch
 from aiter_stub import atom_without_aiter
 
-from atom.constraint_parser import ConstraintBinding
 from atom.model_engine import token_constraints as boundary
 
 mod = None  # the runner module, bound by `_runner_module` for the whole file
@@ -67,10 +66,10 @@ class FakeAdapter:
         return False
 
     def bind(self, batch):
-        return ConstraintBinding(self.backend, self.hard)
+        return self.hard
 
     def hard_requests(self, binding, batch):
-        return list(binding.value)
+        return list(binding)
 
     def prepare(self, runner, batch, metadata, binding):
         self.calls.append(("prepare", runner, batch, metadata, binding))
@@ -155,13 +154,6 @@ def test_only_one_adapter_may_return_gpu_carry():
     two.commit_result = torch.tensor([2])
     with pytest.raises(ValueError, match="Multiple constraint adapters"):
         step.commit(torch.tensor([1, 2]), batch, True, None)
-
-
-def test_enabled_adapter_must_bind():
-    adapter = register(FakeAdapter("nobind"))
-    adapter.bind = lambda batch: None
-    with pytest.raises(ValueError, match="did not bind"):
-        boundary.TokenConstraints.apply(None, active("nobind"), torch.zeros(2, 4), None)
 
 
 def test_grammar_commit_receives_error_sentinels_for_failed_rows():
@@ -387,7 +379,7 @@ def test_forward_prepares_constraints_after_staging_and_before_the_model_runs():
     assert events == ["staged", "prepare", "run_model"]
     (call,) = adapter.calls
     assert call[:2] == (runner, batch) and call[2] is metadata
-    assert call[3] == ConstraintBinding("prep", [])
+    assert call[3] == []
 
 
 def test_forward_without_constraints_prepares_nothing():
@@ -792,9 +784,9 @@ def test_postprocess_commits_with_the_failure_and_forwards_gpu_carry(deferred):
 
 def test_error_tokens_mark_failed_rows_in_both_layouts():
     failure = torch.tensor([False, True])
-    assert boundary._error_tokens(torch.tensor([5, 6]), failure).tolist() == [5, -2]
+    assert boundary.error_tokens(torch.tensor([5, 6]), failure).tolist() == [5, -2]
     wide = torch.tensor([[5, 6, 7], [8, 9, 1]])
-    assert boundary._error_tokens(wide, failure).tolist() == [[5, 6, 7], [-2, -2, -2]]
+    assert boundary.error_tokens(wide, failure).tolist() == [[5, 6, 7], [-2, -2, -2]]
 
 
 def test_adapter_errors_from_every_adapter_are_merged():
