@@ -210,6 +210,20 @@ def test_steps_are_counted_by_token_count(monkeypatch):
     assert mono.steps == {True: {4: 2}, False: {4: 1, 17: 1, 32: 1}}
 
 
+def test_install_hands_the_runner_its_replay_counter(monkeypatch):
+    """The model definition carries no replay hook: the installer attaches it, on the
+    causal LM itself or through a wrapper's ``language_model``."""
+    mono = _mono(monkeypatch, _forward_context(_decode_md(rows=4)))
+    lm = SimpleNamespace(_mono=mono, bind_mono_drafter=lambda drafter: None)
+    for model in (
+        lm,
+        SimpleNamespace(language_model=lm, bind_mono_drafter=lambda d: None),
+    ):
+        assert dispatch.install_mono_decode(model, None, None) is model
+        model.mono_note_replay(4)
+    assert mono.steps["production"] == {4: 2}
+
+
 def _step(n, pos_dtype=torch.int64):
     """(input_ids, positions) of an n-token decode step."""
     return torch.zeros(n, dtype=torch.long), torch.zeros(n, dtype=pos_dtype)

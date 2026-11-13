@@ -239,7 +239,13 @@ class MonoDecode:
 def install_mono_decode(
     model: torch.nn.Module, _atom_config, drafter, *, metadata_builder=None
 ):
-    """Bind MiniMax's in-model Mono router after drafter hooks are armed."""
+    """Bind MiniMax's in-model Mono router after drafter hooks are armed.
+
+    The runner reports each cudagraph replay as ``model.mono_note_replay(n)``;
+    it is attached here so the model definition carries no counter hook.
+    """
     if drafter is not None:
         model.bind_mono_drafter(drafter)
+    lm = getattr(model, "language_model", model)
+    model.mono_note_replay = lm._mono.note_replay
     return model
