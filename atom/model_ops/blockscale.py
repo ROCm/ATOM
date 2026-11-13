@@ -203,8 +203,13 @@ def native_quant_linear(
     k = stored_k * (2 if fp4 else 1)
     live_k = x.shape[-1]
     # A weight padded in K (``GROUP32_K_STEP``) takes the activations of its
-    # live K, padded here the same way.
-    padded = not fp4 and live_k < k and k - live_k < GROUP32_K_STEP
+    # live K, padded here the same way: only a live K the GEMM cannot step,
+    # against a weight padded to exactly the next step.
+    padded = (
+        not fp4
+        and live_k % GROUP32_K_STEP != 0
+        and k == -(-live_k // GROUP32_K_STEP) * GROUP32_K_STEP
+    )
     if k <= 0 or k % 32 or live_k % 32 or (live_k != k and not padded) or n <= 0:
         raise ValueError("Invalid matrix dimensions for group32 GEMM")
     if x_scale is None:

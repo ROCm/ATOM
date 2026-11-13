@@ -263,10 +263,22 @@ def test_preshuffled_gemm_zero_padded_k(m):
             weight_preshuffled=True,
             dtype=torch.bfloat16,
         )
+    # activations of a K the GEMM steps are never padded: 256 against a K of 320
+    # or 288 is refused (only a K it cannot step takes the padded copy of itself)
+    b320, s320 = pad_group32_k(b, b_scale, 320)
+    for w, s in ((b320, s320), (b, b_scale)):
+        with pytest.raises(ValueError, match="Invalid matrix dimensions"):
+            native_quant_linear(
+                torch.randn(m, 256, dtype=torch.bfloat16).cuda(),
+                _preshuffled(w.cuda()),
+                s.cuda(),
+                weight_group_rows=32,
+                weight_preshuffled=True,
+                dtype=torch.bfloat16,
+            )
     padded = run(x, b, b_scale)
     expected = _oracle(x, b, b_scale)
     torch.testing.assert_close(padded.float(), expected, **tolerance(expected))
     # the same GEMM at K = 320 with zero weight columns under nonzero activations
-    b320, s320 = pad_group32_k(b, b_scale, 320)
     x320 = torch.cat([x, torch.randn(m, 32, dtype=torch.bfloat16)], dim=1)
     assert torch.equal(padded, run(x320, b320, s320))

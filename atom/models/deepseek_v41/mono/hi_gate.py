@@ -29,11 +29,8 @@ from atom.utils import envs
 logger = logging.getLogger("atom")
 
 MODES = ("auto", "1", "0")
-SERVED_TPS = (
-    2,
-    4,
-    8,
-)  # the tensor-parallel sizes the hi programs are built for (MI355X, the validated configurations)
+# the tensor-parallel sizes the hi programs are built for (MI355X, the validated configurations)
+SERVED_TPS = (2, 4, 8)
 REQ_ROWS = 6  # a verify's rows a request: DSpark's 5 drafts + the anchor
 # the KV cache's page in tokens: ATOM's for V4.1 (``Config`` sets ``kv_cache_block_size`` to 128 for
 # ``deepseek_v41_text`` whatever ``--block-size`` asks); the cache bridge reads the page geometry from ATOM's cache

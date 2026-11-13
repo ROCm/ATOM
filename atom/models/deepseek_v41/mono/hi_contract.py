@@ -10,7 +10,7 @@ programs.
 
 Usage: python -m atom.models.deepseek_v41.mono.hi_contract CONFIG.json [WIDTH ...] [--tp N] [--fits]
 (``CONFIG.json``: the model's ``config.json``; widths default to every served one, ``hi_compose.ROWS``: the 108
-programs and their fits, about 10 minutes on 8 CPUs; ``--tp``: one served TP size, ``hi_gate.SERVED_TPS``, default
+programs and their fits, about 10 minutes a TP size on 8 CPUs; ``--tp``: one served TP size, ``hi_gate.SERVED_TPS``, default
 every one). The Linear prefetch fits are derived and held to the frozen table (``hi.blocks.gfx950.linear_fits``);
 ``--fits`` prints the table instead (to regenerate it: every fit of the TP sizes checked).
 """
