@@ -26,7 +26,10 @@ from atom.models.minimax_m3.mono.check import (
     trace_logits,
 )
 from atom.models.minimax_m3.mono.config import (
+    CP_MAX_Q,
+    LONG_FROM_BLOCKS,
     MAX_CONTEXT,
+    SPARSE_BLOCK,
     SUPPORTED_TP,
     Dims,
 )
@@ -110,6 +113,9 @@ class MonoDecode:
             envs.ATOM_MONO_CP_MIN_BLOCKS,
         )
         self._cp_refused: set[str] = set()
+        # read-only statistics (ATOM_MONO_STATS_EVERY): replayed mono steps of a CP run that held a long
+        # request, by graph rows: ``taken`` = the host-side image of the kernels' CP gate says the CP arm ran
+        self.cp_steps: dict[str, dict[int, int]] = {"taken": {}, "gate_closed": {}}
         # decode steps by path and token count; ``_graph_kind``: the path each
         # captured graph's rows took (its replays are counted by ``note_replay``)
         self.steps: dict[str, dict[int, int]] = {
@@ -181,9 +187,38 @@ class MonoDecode:
         ctx = get_forward_context().context
         return ctx is not None and not ctx.is_prefill
 
-    def note_replay(self, n: int) -> None:
+    def note_replay(self, n: int, batch=None) -> None:
         """A decode step replayed an n-row graph: counted under the path its capture took."""
-        self._count(n, self._graph_kind.get(n, PRODUCTION))
+        kind = self._graph_kind.get(n, PRODUCTION)
+        if batch is not None and kind == MONO and envs.ATOM_MONO_STATS_EVERY:
+            self._note_cp(n, batch)
+        self._count(n, kind)
+
+    def _note_cp(self, n: int, batch) -> None:
+        """Statistics only, no sync: the CP gate of the kernels (``index_score.cp_gate``) from the host's
+        sequence lengths (one token behind the device's at most), counted per graph size.
+        """
+        if not self.cp.enabled:
+            return
+        seqs = list(batch.seqs.values())
+        if not seqs:
+            return
+        q = max(batch.num_scheduled_tokens)
+        blocks = [-(-(len(s) + q - 1) // SPARSE_BLOCK) for s in seqs]
+        long_blocks = [b for b in blocks if b > LONG_FROM_BLOCKS]
+        if not long_blocks:
+            return
+        if n <= SMALL_MAX_ROWS:
+            taken = True  # the narrow builds: every long request
+        else:
+            taken = (
+                bool(self.cp.options(n))
+                and sum(long_blocks) >= self.cp.min_blocks * q
+                and n // q >= self.cp.min_batch
+                and q <= CP_MAX_Q
+            )
+        key = "taken" if taken else "gate_closed"
+        self.cp_steps[key][n] = self.cp_steps[key].get(n, 0) + 1
 
     def _count(self, n: int, kind: str) -> None:
         self.steps[kind][n] = self.steps[kind].get(n, 0) + 1
@@ -196,6 +231,8 @@ class MonoDecode:
             "mono": dict(sorted(self.steps[MONO].items())),
             "original": dict(sorted(self.steps[PRODUCTION].items())),
         }
+        if self.cp.enabled:
+            stats["cp"] = {k: dict(sorted(v.items())) for k, v in self.cp_steps.items()}
         if self.steps[HYBRID]:
             stats["hybrid"] = dict(sorted(self.steps[HYBRID].items()))
         if rank == 0:

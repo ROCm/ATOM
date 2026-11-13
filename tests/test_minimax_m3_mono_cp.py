@@ -41,3 +41,31 @@ def test_a_share_holds_at_least_topk_blocks(nb):
     for rank in range(TP):
         n = n_own(nb, rank, 1, 1)
         assert (n + 1) // 2 >= TOPK_BLOCKS and n - (n + 1) // 2 >= TOPK_BLOCKS
+
+
+def test_cp_step_statistics_follow_the_kernel_gate():
+    """MonoDecode._note_cp: the host-side image of the CP gate (statistics only)."""
+    from types import SimpleNamespace as NS
+
+    from atom.models.minimax_m3.mono.dispatch import MonoDecode
+    from atom.models.minimax_m3.mono.policy import IndexerCp
+
+    def run(n, lens, cp):
+        me = NS(cp=cp, cp_steps={"taken": {}, "gate_closed": {}})
+        batch = NS(
+            seqs={i: [0] * l for i, l in enumerate(lens)},
+            num_scheduled_tokens=[1] * len(lens),
+        )
+        MonoDecode._note_cp(me, n, batch)
+        return me.cp_steps
+
+    cp = IndexerCp(True, 16, 4096)
+    big = 66000  # > 512 blocks
+    assert run(16, [big] * 16, cp) == {"taken": {16: 1}, "gate_closed": {}}  # narrow
+    assert run(32, [big] * 32, cp)["taken"] == {32: 1}  # 32 * 516 blocks >= 4096
+    assert run(32, [big] * 4 + [100] * 28, cp)["gate_closed"] == {32: 1}  # 2064 < 4096
+    assert run(32, [100] * 32, cp) == {
+        "taken": {},
+        "gate_closed": {},
+    }  # no long request
+    assert run(32, [big] * 32, IndexerCp(False)) == {"taken": {}, "gate_closed": {}}

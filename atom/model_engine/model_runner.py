@@ -3412,7 +3412,7 @@ class ModelRunner:
                 head = self.req_graph.replay(key=graph_key)
                 note = getattr(self.model, "mono_note_replay", None)
                 if note is not None:
-                    note(running_tokens)
+                    note(running_tokens, batch)
                 hidden_states = self.forward_vars["outputs"][:running_tokens]
                 # Drafter aux buffers (if any) refresh on replay: their in-place
                 # copy ops were captured into the graph.
