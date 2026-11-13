@@ -106,7 +106,9 @@ def gluon_takes_pool_dtype_q(
         block_size=block_size,
         q_dtype=kv_dtype,
         kv_cache_dtype=kv_dtype,
+        v_cache_dtype=kv_dtype,  # K and V share the one pool's dtype
         all_decode=True,
+        spec_decode=False,  # aiter: equal_seqlen_q and not all_decode
         shuffled_kv_cache=False,
         use_alibi_slopes=False,
         use_qq_bias=False,
