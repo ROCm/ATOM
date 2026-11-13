@@ -529,6 +529,14 @@ class Drafter(abc.ABC):
         """
         return False
 
+    @property
+    def context_kv_only(self) -> bool:
+        """This producer writes draft context K/V without ever proposing tokens."""
+        return (
+            self.runner.tokenID_processor.is_pd_producer
+            and not self.draft_kv_duplicates_propose
+        )
+
     # ---- aux-hidden-state ownership (drafter-owned, hook-based) ----
     def arm_aux_capture(self, target_model: nn.Module) -> None:
         """Install drafter-owned forward hooks on the target's decoder layers per
@@ -573,6 +581,11 @@ class Drafter(abc.ABC):
         logger.info(
             f"{type(self).__name__} aux capture on target layers: {spec.layer_ids}"
         )
+
+    @property
+    def captures_aux(self) -> bool:
+        """Did `arm_aux_capture` tap target layers for this drafter?"""
+        return self._captures_aux
 
     def _make_aux_hook(self, buf_idx: int, extract):
         buffer = self._aux_buffers[buf_idx]
@@ -695,8 +708,11 @@ class Drafter(abc.ABC):
         # `model.head`) implement `share_with_target(target_base)` to do
         # their own setattr-rebinding and short-circuit the default path.
         if hasattr(self.model, "share_with_target"):
-            self.model.share_with_target(target_base, loaded)
-            check_shared_embedding(self.model)
+            # Context-only producers do not use the token embedding or output
+            # head; under PP the target embedding may live on an earlier stage.
+            if not self.context_kv_only:
+                self.model.share_with_target(target_base, loaded)
+                check_shared_embedding(self.model)
             if self.is_block_drafter and hasattr(self.model, "reset_kv_cache"):
                 # Allocate DSpark's private rolling target-KV window now that the
                 # device/dtype and max concurrency are known.
