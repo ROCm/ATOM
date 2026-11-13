@@ -130,6 +130,16 @@ _SAVE_RECONCILE_INTERVAL_S = 5.0
 # that is merely slow must not trip it.
 _RELEASE_WEDGE_ATTEMPTS = 12
 
+# Ready-suffix priority (`_schedule_ready_short_prefills`): a restored request
+# with at most this many rows left counts as a ready suffix, at most this many
+# are admitted ahead of cold prefill in one step, and cold prefill that made no
+# progress for this many steps while a suffix went first gets one step to itself.
+_READY_SUFFIX_MAX_TOKENS = 4096
+_READY_SUFFIX_PER_STEP = 4
+_READY_SUFFIX_COLD_STALL_STEPS = 3
+# How deep into `waiting` the ready-suffix pass looks.
+_READY_SUFFIX_SCAN_WINDOW = 128
+
 # Memoised result of `_offload_max_pending_saves`, a process constant likewise.
 _MAX_PENDING_OFFLOAD: int | None = None
 
@@ -1162,6 +1172,8 @@ class Scheduler:
                     cold_tokens=cold_tokens,
                 )
                 if not chunk:
+                    if self._slice_cold_partial(seq, start, resume):
+                        continue  # its slice is spent; later partials may fit
                     break
                 chunk = self._preview_prefill_chunk(seq, start, resume, chunk)
                 if self._slice_cold_partial(seq, start, resume):
@@ -1342,8 +1354,7 @@ class Scheduler:
         if left > 0:
             a = self._balance_token_weight + start
             room = int(math.sqrt(a * a + 2.0 * left) - a)
-        if not self._ready_short_admitted:
-            room = max(room, self._balance_min_tokens - batched_tokens)
+        room = max(room, self._balance_min_tokens - batched_tokens)
         return max(min(room, cap_room), 0)
 
     def _estimate_prefill_chunk_cost(self) -> float:
@@ -1374,7 +1385,7 @@ class Scheduler:
                     k = min(k, max(0, self._tick_cold_partial_cap - cold_tokens))
                     cold_tokens += k
                 if k <= 0:
-                    return cost
+                    continue
                 cost += self._chunk_cost(seq.num_cached_tokens, k)
                 tokens += k
         for seq in itertools.islice(self._waiting_prefills(), self.max_num_seqs):
@@ -2268,6 +2279,7 @@ class Scheduler:
         self._tick_cold_partial_cap = 0
         self._ready_short_admitted = 0
         skipped_waiting_requests: deque[Sequence] = deque()
+        ready_deferred: deque[Sequence] = deque()
         num_scheduled_tokens: list[int] = []
         scheduled_spec_decode_tokens: dict[int, np.ndarray] = {}
 
@@ -2380,27 +2392,7 @@ class Scheduler:
         if self.cost_balance and delayer_allows and self.prefill_delayer is not None:
             self._balance_prefill_step(prefill_cost)
 
-        priority_tick = self._ready_short_cold_stalls < 3
-        if delayer_allows and not priority_tick:
-            self._ready_short_cold_stalls = 0
-        force_waiting_cold = False
-        if (
-            delayer_allows
-            and not priority_tick
-            and len(self.running) < self.max_num_seqs
-        ):
-            head = next(
-                (
-                    seq
-                    for seq in self.waiting
-                    if seq.status == SequenceStatus.WAITING and not seq.offload_loaded
-                ),
-                None,
-            )
-            if head is not None and not self._offload_lookup_pending(head):
-                force_waiting_cold = (
-                    self.kv_connector is None or self.kv_connector.admission_ready(head)
-                ) and self.block_manager.can_allocate_memoized(head) >= 0
+        priority_tick, force_waiting_cold = self._ready_suffix_tick_plan(delayer_allows)
         if delayer_allows and priority_tick:
             num_seqs_prefill, num_batched_tokens = self._schedule_ready_short_prefills(
                 scheduled_seqs,
@@ -2476,8 +2468,8 @@ class Scheduler:
                         break
                     prefix_bypass_left -= 1
             seq = self.waiting.popleft()
-            if force_waiting_cold and self._ready_short_demand(seq, running=False):
-                skipped_waiting_requests.append(seq)
+            if force_waiting_cold and self._is_ready_short(seq, running=False):
+                ready_deferred.append(seq)
                 continue
 
             # Client disconnected before this seq ever ran: it holds no KV yet
@@ -2840,30 +2832,16 @@ class Scheduler:
                 len(skipped_waiting_requests),
             )
             self.waiting.extend(skipped_waiting_requests)
+        if ready_deferred:
+            # A cold step only defers ready suffixes: they keep their place.
+            self.waiting.extendleft(reversed(ready_deferred))
         if prefix_waiters:
             # Keep deferred requests in arrival order while bounded lookahead
             # admits independent work without extending their deadlines.
             self.waiting.extendleft(reversed(prefix_waiters))
 
         if delayer_allows:
-            cold_rows = sum(
-                width
-                for seq, width in zip(scheduled_seqs.values(), num_scheduled_tokens)
-                if not seq.offload_loaded
-            )
-            cold_waiting = any(
-                seq.is_partial_prefill
-                and not seq.offload_loaded
-                and seq.id not in self._checkpoint_holds
-                for seq in self.running
-            ) or any(
-                seq.status == SequenceStatus.WAITING and not seq.offload_loaded
-                for seq in self.waiting
-            )
-            if cold_rows or not cold_waiting:
-                self._ready_short_cold_stalls = 0
-            elif self._ready_short_admitted:
-                self._ready_short_cold_stalls += 1
+            self._ready_suffix_tick_end(scheduled_seqs, num_scheduled_tokens)
 
         if self._num_parked_remote_kv > 0 and self._schedule_tick % 1000 == 0:
             logger.info(
@@ -3994,7 +3972,7 @@ class Scheduler:
             if self.kv_connector is not None
             else 0
         )
-        if not cap or not self._partial_prefill_count:
+        if not cap or not self._partial_prefill_count or not self._num_parked_remote_kv:
             return 0
         cap = min(int(cap), self.max_num_batched_tokens)
         alignment = self._chunk_alignment()
@@ -4003,7 +3981,7 @@ class Scheduler:
             return 0
         for seq in self.waiting:
             if (
-                getattr(seq, "_counted_as_inflight_load", False)
+                seq._counted_as_inflight_load
                 and len(seq.block_table) > 0
                 and self._still_loading(seq)
                 and not seq.offload_loaded
@@ -4023,8 +4001,75 @@ class Scheduler:
             and not seq.offload_loaded
         )
 
-    def _ready_short_demand(self, seq: Sequence, *, running: bool) -> int:
-        """Actual Store suffix/replay rows, or zero if it is not a ready short."""
+    # ---- Ready-suffix priority -------------------------------------------
+    # A request whose Store restore finished needs only a short suffix before
+    # it decodes; running that ahead of cold prefill frees its slot sooner. All
+    # of the policy is in the methods of this section.
+
+    def _ready_suffix_enabled(self) -> bool:
+        return self.kv_connector is not None and self.kv_connector.ready_suffix_first
+
+    def _ready_suffix_tick_plan(self, delayer_allows: bool) -> tuple[bool, bool]:
+        """(priority_tick, force_waiting_cold) for this step.
+
+        On a priority tick ready suffixes are admitted first. After
+        `_READY_SUFFIX_COLD_STALL_STEPS` steps in which cold prefill made no
+        progress while a suffix went first, one tick is not a priority tick:
+        running ready suffixes are ordered last, and while the head of `waiting`
+        can be admitted, waiting ready suffixes sit the tick out in place."""
+        if (
+            not self._ready_suffix_enabled()
+            or self._ready_short_cold_stalls < _READY_SUFFIX_COLD_STALL_STEPS
+        ):
+            return True, False
+        if not delayer_allows:
+            return False, False
+        self._ready_short_cold_stalls = 0
+        if len(self.running) >= self.max_num_seqs:
+            return False, False
+        head = next(
+            (
+                seq
+                for seq in self.waiting
+                if seq.status == SequenceStatus.WAITING and not seq.offload_loaded
+            ),
+            None,
+        )
+        if head is None or self._offload_lookup_pending(head):
+            return False, False
+        return False, (
+            (self.kv_connector is None or self.kv_connector.admission_ready(head))
+            and self.block_manager.can_allocate_memoized(head) >= 0
+        )
+
+    def _ready_suffix_tick_end(
+        self, scheduled_seqs: dict[int, Sequence], num_scheduled_tokens: list[int]
+    ) -> None:
+        """Count steps where a suffix went first and cold prefill got nothing."""
+        if not self._ready_suffix_enabled():
+            return
+        cold_rows = sum(
+            width
+            for seq, width in zip(scheduled_seqs.values(), num_scheduled_tokens)
+            if not seq.offload_loaded
+        )
+        cold_waiting = any(
+            seq.is_partial_prefill
+            and not seq.offload_loaded
+            and seq.id not in self._checkpoint_holds
+            for seq in self.running
+        ) or any(
+            seq.status == SequenceStatus.WAITING and not seq.offload_loaded
+            for seq in self.waiting
+        )
+        if cold_rows or not cold_waiting:
+            self._ready_short_cold_stalls = 0
+        elif self._ready_short_admitted:
+            self._ready_short_cold_stalls += 1
+
+    def _is_ready_short(self, seq: Sequence, *, running: bool) -> bool:
+        """Whether `seq`'s restore finished and its Store suffix/replay rows
+        are at most `_READY_SUFFIX_MAX_TOKENS`."""
         if (
             not seq.block_table
             or seq.status == SequenceStatus.ABORTED
@@ -4032,14 +4077,14 @@ class Scheduler:
             or seq.state_fork_src >= 0
             or self._requires_atomic_prefill(seq)
         ):
-            return 0
+            return False
         if running:
             if (
                 not seq.is_partial_prefill
                 or not seq.offload_loaded
                 or seq.id in self._checkpoint_holds
             ):
-                return 0
+                return False
             start = self.block_manager.replay_start(
                 seq, seq.num_cached_tokens, hit=False
             )
@@ -4048,13 +4093,12 @@ class Scheduler:
                 SequenceStatus.WAITING,
                 SequenceStatus.WAITING_FOR_REMOTE_KVS,
             ) or not (self._tier_load_succeeded(seq) or seq.offload_loaded):
-                return 0
+                return False
             pair = self._tier_waiter_resume(seq)
             if pair is None:
-                return 0
+                return False
             _, start = pair
-        demand = seq.num_tokens - start
-        return demand if 0 < demand <= 4096 else 0
+        return 0 < seq.num_tokens - start <= _READY_SUFFIX_MAX_TOKENS
 
     def _schedule_ready_short_prefills(
         self,
@@ -4067,15 +4111,11 @@ class Scheduler:
 
         Existing running suffixes retain priority over newly completed loads.
         Waiting ready requests keep their relative order, but may pass fresh
-        cold arrivals. Only actual admissions count toward the four-per-tick
-        bound. A three-tick no-cold-progress limit restores original ordering
-        for one prefill tick; decode HOLDs never consume this fairness clock.
+        cold arrivals. Only actual admissions count toward
+        `_READY_SUFFIX_PER_STEP`. `_ready_suffix_tick_plan` restores original
+        ordering for one tick; decode HOLDs never consume this fairness clock.
         """
-        if not (
-            self.kv_connector.pending_load_partial_token_cap
-            if self.kv_connector is not None
-            else 0
-        ):
+        if not self._ready_suffix_enabled():
             return num_seqs_prefill, num_batched_tokens
         if any(
             seq.is_partial_prefill
@@ -4088,7 +4128,7 @@ class Scheduler:
 
         def room() -> bool:
             return (
-                self._ready_short_admitted < 4
+                self._ready_short_admitted < _READY_SUFFIX_PER_STEP
                 and num_seqs_prefill < self.max_num_seqs
                 and num_batched_tokens < self.max_num_batched_tokens
                 and self._tick_cost < self._tick_cost_limit
@@ -4097,7 +4137,7 @@ class Scheduler:
         for seq in list(self.running):
             if not room():
                 break
-            if not self._ready_short_demand(seq, running=True):
+            if not self._is_ready_short(seq, running=True):
                 continue
             resumed = self._schedule_running_partial(
                 seq,
@@ -4114,10 +4154,10 @@ class Scheduler:
 
         if self.delay_factor > 0 and not self._passed_delay(time.time()):
             return num_seqs_prefill, num_batched_tokens
-        for seq in list(itertools.islice(self.waiting, 0, 128)):
+        for seq in list(itertools.islice(self.waiting, 0, _READY_SUFFIX_SCAN_WINDOW)):
             if not room() or len(self.running) >= self.max_num_seqs:
                 break
-            if not self._ready_short_demand(seq, running=False):
+            if not self._is_ready_short(seq, running=False):
                 continue
             if self.kv_connector is not None and not self.kv_connector.admission_ready(
                 seq
@@ -4167,6 +4207,9 @@ class Scheduler:
             self._resume_prefill(seq, start, hit=False)
             chunk = self._finalize_prefill_chunk(seq, start, chunk)
         if chunk <= 0:
+            if self._slice_cold_partial(seq, start, resume):
+                # Its slice is spent: skip it, later partials may still fit.
+                return num_seqs_prefill, num_batched_tokens, cold_partial_tokens
             return None
         if self._slice_cold_partial(seq, start, resume):
             cold_partial_tokens += chunk

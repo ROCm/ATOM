@@ -454,6 +454,8 @@ class Sequence:
         self.offload_joint = OffloadJointRecord()
         self.offload_loaded = False
         self.offload_load_failed = False
+        # Counted in the scheduler's parked-remote-KV total.
+        self._counted_as_inflight_load = False
         # Tokens its tier load covers once the connector planned it.
         self.offload_loaded_tokens = 0
         # `hbm_cached_tokens` the planned load started from (P/D / early load

@@ -168,7 +168,11 @@ class KVConnectorSchedulerBase(ABC):
         """Preserve completions unless the backend consumes chunked P/D metadata."""
         return output
 
+    # Largest slice of a cold partial prefill one step may run while a restore
+    # is in flight (0: never slice).
     pending_load_partial_token_cap: int = 0
+    # Whether a restored request's short suffix runs ahead of cold prefill.
+    ready_suffix_first: bool = False
 
     def admission_ready(self, seq: Any) -> bool:
         """Whether the scheduler may allocate this request and start prefill."""

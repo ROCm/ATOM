@@ -58,7 +58,9 @@ def fixture():
     s.replay_history_tokens = 3
     s.advance_on_schedule = False
     s.delay_factor = 0
-    s.kv_connector = ConnectorView(is_offload=True, pending_load_partial_token_cap=8192)
+    s.kv_connector = ConnectorView(
+        is_offload=True, pending_load_partial_token_cap=8192, ready_suffix_first=True
+    )
     s._early_load = SimpleNamespace(
         entries={}, note_prefill=lambda sid: ledger.append(("prefill", sid))
     )
@@ -126,8 +128,8 @@ def test_actual_terminal_resolves_and_admits_before_cold():
     assert not s.waiting and list(s.running) == [cold, ready]
     assert s.finished_recving_kv_req_ids == [] and s._num_parked_remote_kv == 0
     assert ledger == [("publish", 2), ("prefill", 2), ("reuse", 2)]
-    # The original multi-cold floor counterexample: ready really occupies the
-    # batch first. Remaining cold sizing cannot manufacture 4096 floor rows.
+    # The ready suffix counts toward the balancing floor but does not switch it
+    # off: the last cold partial still fills the batch up to the floor.
     cold.num_tokens = 128
     other = deepcopy(cold)
     other.id = 3
@@ -138,8 +140,20 @@ def test_actual_terminal_resolves_and_admits_before_cold():
         if result is not None:
             n, used, _ = result
     assert list(selected) == [2, 1, 3]
-    assert widths == [338, 128, 240]
-    assert s._tick_cost <= s._tick_cost_limit
+    assert widths == [338, 128, 3568]
+    assert (
+        sum(widths) <= s._balance_min_tokens
+    )  # over the cost target only up to the floor
+
+
+def test_ready_suffix_switch_is_not_the_cold_slice_cap():
+    s, ready, _cold, _ = fixture()
+    s._tick_cost_limit = 64_000_000
+    s.kv_connector.pending_load_partial_token_cap = 0
+    assert list(stage(s)[0]) == [ready.id]
+    s, _ready, _cold, _ = fixture()
+    s.kv_connector.ready_suffix_first = False
+    assert not stage(s)[0]
 
 
 def test_resolve_then_budget_reject_retains_allocated_resume_for_retry():
@@ -193,7 +207,9 @@ def test_actual_ready_floor_exception_stops_other_ready_and_cold():
     assert list(selected) == [2] and widths == [338]
     assert s._tick_cost > s._tick_cost_limit  # Existing ready floor, not a new target.
     assert list(s.waiting) == [other] and s._ready_short_admitted == 1
-    assert s._schedule_running_partial(cold, selected, widths, n, used, 0) is None
+    # The floor still holds: cold takes what is left of it, no more.
+    _, used, _ = s._schedule_running_partial(cold, selected, widths, n, used, 0)
+    assert used <= s._balance_min_tokens
 
 
 def test_already_running_restored_small_replay_precedes_new_ready():
@@ -212,7 +228,7 @@ def test_already_running_restored_small_replay_precedes_new_ready():
     assert widths == [338, 338]
     assert list(s.running).count(warm) == 1
     warm.status = SequenceStatus.ABORTED
-    assert s._ready_short_demand(warm, running=True) == 0
+    assert not s._is_ready_short(warm, running=True)
 
 
 def schedule_fixture(s):
@@ -236,7 +252,7 @@ def schedule_fixture(s):
     s._local_prefill_coalescing = False
     s._probe_hbm_prefix = lambda seq: SimpleNamespace(num_cached_blocks=0)
     s._allocate_admitted_prefill = lambda *args: True
-    s._finish_prefill_admission = lambda seq: None
+    s._finish_prefill_admission = lambda seq, pd_plan=None: None
     s._confirm_remote_load_after_alloc = lambda *args: False
     s._adjust_prefill_chunk_after_alloc = lambda seq, chunk: chunk
     s._commit_calibration_arm = lambda: None
@@ -300,8 +316,8 @@ def test_complete_schedule_prioritizes_ready_in_multi_cold_counterexample():
     s._partial_prefill_count += 1
     result = capture_schedule(schedule_fixture(s), 64_000_000)
     assert result["ids"] == [2, 1, 3]
-    assert result["widths"] == [338, 128, 240]
-    assert result["cost"] <= 64_000_000
+    assert result["widths"] == [338, 128, 3568]
+    assert sum(result["widths"]) <= 4096  # past the cost target only up to the floor
 
 
 def test_complete_schedule_decode_hold_and_fresh_cold_starvation_clock():
@@ -389,6 +405,23 @@ def test_forced_tick_defers_running_ready_for_fresh_cold_but_not_blocked_head():
         result = capture_schedule(s)
         assert result["ids"] == ([warm.id] if blocked else [cold.id])
         assert list(s.running).count(warm) == 1
+
+
+def test_forced_cold_tick_keeps_the_deferred_ready_at_the_front():
+    s, ready, cold, _ = fixture()
+    schedule_fixture(s)
+    s.max_num_batched_tokens = 512
+    s._ready_short_cold_stalls = 3
+    cold.status = SequenceStatus.WAITING
+    cold.replay_kv_load = False
+    later = deepcopy(cold)
+    later.id = 4
+    s.running.clear()
+    s._partial_prefill_count = 0
+    s.waiting = deque([ready, cold, later])
+    result = capture_schedule(s)
+    assert result["ids"] == [cold.id]
+    assert list(s.waiting) == [ready, later]
 
 
 def test_active_cold_fork_retains_original_path_instead_of_overfilling_new_budget():

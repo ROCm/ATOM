@@ -155,12 +155,18 @@ def test_multiconnector_only_prefill_exposes_store_cap():
 
     c = object.__new__(MultiConnectorScheduler)
     c._connectors = [
-        SimpleNamespace(is_offload=True, pending_load_partial_token_cap=8192)
+        SimpleNamespace(
+            is_offload=True,
+            pending_load_partial_token_cap=8192,
+            ready_suffix_first=True,
+        )
     ]
     c.is_producer = True
     assert c.pending_load_partial_token_cap == 8192
+    assert c.ready_suffix_first
     c.is_producer = False
     assert c.pending_load_partial_token_cap == 0
+    assert not c.ready_suffix_first
 
 
 def test_cost_budget_can_reduce_slice_further(monkeypatch):
@@ -183,3 +189,19 @@ def test_cost_budget_can_reduce_slice_further(monkeypatch):
     counts = sizes(s)
     assert 0 < counts[cold.id] <= 4096
     assert s._tick_cost <= s._tick_cost_limit
+
+
+def test_spent_cap_skips_that_partial_not_the_scan():
+    s, cold, _load = fixture()
+    other = Sequence(list(range(300000, 365536)), block_size=256)
+    resumed = Sequence(list(range(400000, 420000)), block_size=256)
+    for seq, done in ((other, 256), (resumed, 10000)):
+        s.block_manager.allocate(seq)
+        seq.num_cached_tokens = done
+        seq.is_partial_prefill = True
+        seq.status = SequenceStatus.RUNNING
+        s.running.append(seq)
+        s._partial_prefill_count += 1
+    resumed.offload_loaded = True
+    # `other` finds the cap spent by `cold`; `resumed` is no cold partial.
+    assert sizes(s) == {cold.id: 8192, resumed.id: resumed.num_tokens - 10000}
