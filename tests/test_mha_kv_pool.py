@@ -348,6 +348,33 @@ class TestWhatABinderGetsBack:
         assert MhaKvPool(**TARGET, kv_dtype=torch.bfloat16).entry_bytes == cache
         assert scales * 64 == cache
 
+    def test_kv_views_refuses_a_flash_pool(self):
+        """Both views cover the same bytes, so the SHUFFLE one would read a FLASH
+        pool in the wrong order without any size check noticing."""
+        pool = MhaKvPool(
+            layers=1,
+            block_size=128,
+            num_kv_heads=2,
+            head_dim=64,
+            kv_dtype=torch.float8_e4m3fnuz,
+            flash_layout=True,
+        )
+        pool.allocate(2, "cpu")
+        with pytest.raises(ValueError, match="fa_views"):
+            pool.kv_views(0)
+        assert pool.scale_fields == []
+
+    def test_only_a_shuffle_pool_needs_the_pack_to_divide_its_page(self):
+        """`fa_views` never reads the SHUFFLE pack, so a FLASH pool takes a page
+        width the pack does not divide; a SHUFFLE pool refuses it."""
+        geometry = {"layers": 1, "block_size": 24, "num_kv_heads": 2, "head_dim": 64}
+        fp8 = torch.float8_e4m3fnuz
+        pool = MhaKvPool(**geometry, kv_dtype=fp8, flash_layout=True)
+        pool.allocate(2, "cpu")
+        assert pool.fa_views(0)[0].shape == (2, 24, 2, 64)
+        with pytest.raises(ValueError, match="SHUFFLE packs"):
+            MhaKvPool(**geometry, kv_dtype=fp8)
+
 
 class TestTheTransferGranularity:
 
