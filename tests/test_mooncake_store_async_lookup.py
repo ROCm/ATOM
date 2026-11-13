@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: MIT
 import time
 from concurrent.futures import Future
-from threading import Event
+from threading import Event, Thread
 from types import SimpleNamespace
 
 import pytest
+from conftest import MockConfig
 
 from atom.kv_transfer.disaggregation.multi.multi_connector import (
     MultiConnectorScheduler,
@@ -15,6 +16,61 @@ from atom.kv_transfer.offload.mooncake_store.layouts import (
     REPLAY_PAGE_CODEC_ID,
     mooncake_codec_id,
 )
+
+
+def test_arrival_offer_cannot_overtake_terminal_cleanup():
+    from atom.kv_transfer.offload.chunked_scheduler import ChunkedOffloadSchedulerBase
+    from atom.kv_transfer.offload.mooncake_store.scheduler import (
+        MooncakeStoreOffloadScheduler,
+    )
+    from atom.model_engine.sequence import Sequence, SequenceStatus
+
+    lookup = AsyncStoreLookup(SimpleNamespace(lookup=lambda *a, **kw: 0), capacity=1)
+    sched = MooncakeStoreOffloadScheduler.__new__(MooncakeStoreOffloadScheduler)
+    ChunkedOffloadSchedulerBase.__init__(
+        sched, MockConfig(kv_cache_block_size=16), chunk_size=256, lookup_client=lookup
+    )
+    entered, finishing, finished = Event(), Event(), Event()
+    seq = Sequence(list(range(512)), 16)
+    errors = []
+
+    def lookup_len(value):
+        entered.set()  # WAITING was observed; now let teardown run.
+        assert finishing.wait(5)
+        # Without the shared lock, deterministically finish cleanup before
+        # the late submit. With it, teardown must wait for this offer.
+        if not lookup.lock._is_owned():
+            assert finished.wait(5)
+        return value.num_prompt_tokens
+
+    sched._lookup_len = lookup_len
+
+    def finish():
+        try:
+            assert entered.wait(5)
+            seq.status = SequenceStatus.ABORTED
+            finishing.set()
+            sched.request_finished(seq)
+        except BaseException as exc:  # noqa: BLE001 - propagate thread failures below
+            errors.append(exc)
+        finally:
+            finished.set()
+
+    thread = Thread(target=finish)
+    thread.start()
+    try:
+        sched.offer_lookups([seq])
+        thread.join(5)
+        assert not thread.is_alive()
+        assert not errors
+        assert lookup.pending_ids() == set()
+        assert not lookup.discarded_hits
+        # No permanent terminal tombstone: a new lifecycle can reuse the ID.
+        assert lookup.submit(Sequence(list(range(512)), 16), str(seq.id))
+    finally:
+        finishing.set()
+        thread.join(5)
+        lookup.close()
 
 
 def test_async_lookup_preserves_media_request_configs():
