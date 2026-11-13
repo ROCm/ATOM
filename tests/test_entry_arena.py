@@ -160,6 +160,17 @@ class TestViewsAndEntriesAgree:
         assert arena.field_offset(last.name) + last.bytes_per_entry <= arena.entry_bytes
 
 
+def _assert_live_refilled(view, dead, fill):
+    """The first `dead` entries still hold the NaN a write left; the live
+    tail is back at the field's fill."""
+    assert torch.isnan(view[:, :dead]).all()
+    live = view[:, dead:]
+    if fill == 0.0:
+        assert torch.equal(live, torch.zeros_like(live))
+    else:
+        assert torch.isneginf(live).all()
+
+
 class TestInitialFill:
 
     def test_kv_zero_score_neg_inf(self):
@@ -192,13 +203,7 @@ class TestInitialFill:
             arena.view(field.name).fill_(float("nan"))
         arena.refill_live()
         for field in V4_LIKE:
-            view = arena.view(field.name)
-            assert torch.isnan(view[:, :dead]).all()
-            live = view[:, dead:]
-            if field.fill == 0.0:
-                assert torch.equal(live, torch.zeros_like(live))
-            else:
-                assert torch.isneginf(live).all()
+            _assert_live_refilled(arena.view(field.name), dead, field.fill)
 
     def test_split_arena_refills_the_live_tail_of_every_plane(self):
         """The runner's state arena is a split one, so a refill has to reach
@@ -214,13 +219,7 @@ class TestInitialFill:
         for plane in planes:
             dead = plane.entries - plane.live_entries
             for field in plane.fields:
-                view = arena.view(field.name)
-                assert torch.isnan(view[:, :dead]).all()
-                live = view[:, dead:]
-                if field.fill == 0.0:
-                    assert torch.equal(live, torch.zeros_like(live))
-                else:
-                    assert torch.isneginf(live).all()
+                _assert_live_refilled(arena.view(field.name), dead, field.fill)
 
 
 def test_carving_more_than_the_buffer_holds_is_refused():
