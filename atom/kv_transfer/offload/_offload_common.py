@@ -69,6 +69,31 @@ def tokens_to_tensor(tokens: list[int]) -> torch.Tensor:
     return torch.from_numpy(np.asarray(tokens, dtype=np.int64))
 
 
+#: The in-process LMCache key tag a prompt's `tier_cache_salt` travels under.
+CACHE_SALT_TAG = "lmcache.tag.cache_salt"
+
+
+def tier_cache_salt(seq) -> str:
+    """What keeps a multimodal prompt's tier keys apart from another's with
+    the same placeholder ids: its `cache_seed`, which also seeds
+    `BlockManager`'s chain. Empty for a text prompt, whose keys stay unsalted.
+    """
+    # The vLLM plugin's `SeqView` carries no `cache_seed`.
+    seed = getattr(seq, "cache_seed", -1)
+    return "" if seed == -1 else str(seed)
+
+
+def salt_kwargs(cache_salt: str) -> dict:
+    """`cache_salt` as a tier call's `request_configs` (the in-process engine's
+    key tag); no argument at all for an unsalted prompt."""
+    return {"request_configs": {CACHE_SALT_TAG: cache_salt}} if cache_salt else {}
+
+
+def tier_lookup_kwargs(seq) -> dict:
+    """A tier lookup's arguments past the prompt (`salt_kwargs`)."""
+    return salt_kwargs(tier_cache_salt(seq))
+
+
 def validated_kv_role(kvc: dict) -> str:
     role = kvc.get("kv_role", "offload")
     if role not in _VALID_KV_ROLES:

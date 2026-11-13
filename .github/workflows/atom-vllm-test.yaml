@@ -4,18 +4,9 @@ on:
   pull_request:
     branches: [main]  # Triggers on PRs targeting `main`
     types: [opened, synchronize, reopened, ready_for_review, labeled, closed]
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
-      - 'atom/plugin/sglang/**'
-      - 'atom/mesh/**'
-      - '.github/benchmark/models_atomesh.yaml'
-      - '.github/scripts/atomesh/**'
-      - '.github/workflows/atomesh-*.yaml'
-      - '.github/workflows/atom-sglang-*.yaml'
-      - '.github/benchmark/sglang_models_accuracy.json'
-      - 'LICENSE'
-      - '.gitignore'
+    # Do not use paths-ignore here. The required gate must be published for
+    # every PR; ci-gate below keeps the old path-ignore behavior for expensive
+    # jobs.
   pull_request_review:
     types: [submitted]
 
@@ -42,6 +33,7 @@ jobs:
     outputs:
       should_run: ${{ steps.gate.outputs.should_run }}
       reason: ${{ steps.gate.outputs.reason }}
+      decidable: ${{ steps.gate.outputs.decidable }}
     steps:
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
@@ -56,6 +48,8 @@ jobs:
             docs/**
             atom/plugin/sglang/**
             atom/mesh/**
+            .github/benchmark/models_atomesh.yaml
+            .github/scripts/atomesh/**
             .github/workflows/atomesh-*.yaml
             .github/scripts/atomesh_*.sh
             .github/dashboard/atomesh_*.html
@@ -322,3 +316,32 @@ jobs:
           name: oot-${{ matrix.model_name }}-artifacts
           path: plugin-ci-results/
           if-no-files-found: ignore
+
+  atom-vllm-test-gate:
+    name: ${{ (github.event_name != 'pull_request_review' || needs.ci-gate.outputs.should_run == 'true') && 'ATOM vLLM Test Gate' || 'ATOM vLLM Test Gate not requested' }}
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    needs:
+      - ci-gate
+      - check-signal
+      - download_aiter_wheel
+      - atom-vllm-oot
+    steps:
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v6
+
+      - name: Evaluate ATOM vLLM test gate
+        uses: ./.github/actions/evaluate-test-gate
+        with:
+          gate-name: ATOM vLLM Test Gate
+          suite-name: ATOM vLLM tests
+          should-run: ${{ needs.ci-gate.outputs.should_run }}
+          decidable: ${{ needs.ci-gate.outputs.decidable }}
+          reason: ${{ needs.ci-gate.outputs.reason }}
+          ci-gate-result: ${{ needs.ci-gate.result }}
+          required-results: |
+            check-signal=${{ needs.check-signal.result }}
+            download_aiter_wheel=${{ needs.download_aiter_wheel.result }}
+            atom-vllm-oot=${{ needs.atom-vllm-oot.result }}
