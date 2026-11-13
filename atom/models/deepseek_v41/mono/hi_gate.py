@@ -28,7 +28,7 @@ from atom.utils import envs
 logger = logging.getLogger("atom")
 
 MODES = ("auto", "1", "0")
-SERVED_TP = 4  # the tensor-parallel size the hi programs are built for (MI355X, the validated configuration)
+SERVED_TP = (4, 8)  # the tensor-parallel sizes the hi programs are built for (MI355X; TP4 the validated one)
 REQ_ROWS = 6  # a verify's rows a request: DSpark's 5 drafts + the anchor
 # the KV cache's page in tokens: ATOM's for V4.1 (``Config`` sets ``kv_cache_block_size`` to 128 for
 # ``deepseek_v41_text`` whatever ``--block-size`` asks); the cache bridge reads the page geometry from ATOM's cache
@@ -101,8 +101,8 @@ def refusal(atom_config, drafter, metadata_builder, dp_ranks: int) -> str:
     tp = int(getattr(cfg, "tensor_parallel_size", 1) or 1)
     if dp_ranks:
         return "DP attention"
-    if tp != SERVED_TP:
-        return f"TP{tp} (the hi path serves TP{SERVED_TP})"
+    if tp not in SERVED_TP:
+        return f"TP{tp} (the hi path serves TP{' and TP'.join(map(str, SERVED_TP))})"
     arch, cus = _device()
     if arch is not None and arch != ARCH:
         return f"{arch} (the hi path serves {ARCH})"

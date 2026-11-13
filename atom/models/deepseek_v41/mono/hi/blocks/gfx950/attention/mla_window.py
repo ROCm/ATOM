@@ -310,6 +310,15 @@ def _q_tile(k, p: _APlan, r, ht, pos):
         not p.ragged
     ):  # the tile's words (in this order: the 16-head programs' code as before)
         got = mb.poll([(k.mb[p.q], e0w + w, 2) for w in ws], k.tag)
+    else:  # a dead head's words are its tile's last live head's (``_APlan.head``)
+        r0w = (r * p.heads * HD) // 2
+        got = mb.poll(
+            [
+                (k.mb[p.q], r0w + p.head(ht, w // (HD // 2)) * (HD // 2) + w % (HD // 2), 2)
+                for w in ws
+            ],
+            k.tag,
+        )
     for j, w in enumerate(ws):
         hh, dw = w // (HD // 2), w % (HD // 2)
         vals = [v for word in got[j] for v in bf2_f32(word)]
