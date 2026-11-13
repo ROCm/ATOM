@@ -275,7 +275,7 @@ jobs:
         id: gate
         env:
           CI_GATE_WORKFLOW: atomesh-benchmark.yaml
-          CI_GATE_LABELS: ci:full,ci:atomesh
+          CI_GATE_LABELS: ci:full,ci:atomesh,ci:mesh
           CI_GATE_PATHS_INCLUDE: |
             atom/mesh/**
             .github/benchmark/models_atomesh.yaml
