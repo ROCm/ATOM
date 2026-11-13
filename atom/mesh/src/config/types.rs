@@ -78,6 +78,9 @@ pub struct RouterConfig {
     pub worker_startup_timeout_secs: u64,
     pub worker_startup_check_interval_secs: u64,
     pub dp_aware: bool,
+    /// Follow the KV cache events each worker reports at `/kv_event_sources`.
+    #[serde(default)]
+    pub kv_events: bool,
     pub api_key: Option<String>,
     pub metrics: Option<MetricsConfig>,
     pub log_dir: Option<String>,
@@ -445,6 +448,7 @@ impl Default for RouterConfig {
             worker_startup_timeout_secs: 1800, // 30 minutes for large model loading
             worker_startup_check_interval_secs: 30,
             dp_aware: false,
+            kv_events: false,
             api_key: None,
             metrics: None,
             log_dir: None,

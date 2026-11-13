@@ -248,6 +248,7 @@ Supported tool parsers: `json`, `python`, `xml`.
 | `GET` / `PUT` / `DELETE` | `/workers/{id}` | Inspect, update, or remove worker |
 | `POST` | `/flush_cache` | Flush cache across HTTP workers |
 | `GET` | `/get_loads` | Sample current worker loads |
+| `GET` | `/kv_events/sources` | With `--kv-events`: each worker rank's KV event stream and what it carried |
 
 ## Load balancing
 

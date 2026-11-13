@@ -15,6 +15,7 @@ use crate::{
         prepare_pool::PrepareHandle, steps::WorkflowEngines, JobQueue, LoadMonitor, WorkerRegistry,
         WorkerService,
     },
+    kv_events::KvEventMonitor,
     middleware::TokenBucket,
     observability::inflight_tracker::InFlightRequestTracker,
     policies::PolicyRegistry,
@@ -60,6 +61,8 @@ pub struct AppContext {
     pub worker_service: Arc<WorkerService>,
     pub inflight_tracker: Arc<InFlightRequestTracker>,
     pub atom_standalone_runtime: Option<Arc<AtomStandaloneRuntime>>,
+    /// Set with `kv_events` in the router config.
+    pub kv_event_monitor: Option<Arc<KvEventMonitor>>,
 }
 
 impl std::fmt::Debug for AppContext {
@@ -252,6 +255,11 @@ impl AppContextBuilder {
             &router_config,
             self.rate_limiter.clone(),
         ));
+        let kv_event_monitor = router_config
+            .kv_events
+            .then(|| KvEventMonitor::start(1).map(Arc::new))
+            .transpose()
+            .map_err(|_| AppContextBuildError("kv_event_monitor"))?;
         Ok(AppContext {
             prepare_pool: self
                 .prepare_pool
@@ -289,6 +297,7 @@ impl AppContextBuilder {
             worker_service,
             inflight_tracker: InFlightRequestTracker::new(),
             atom_standalone_runtime: self.atom_standalone_runtime,
+            kv_event_monitor,
         })
     }
 

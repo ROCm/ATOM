@@ -50,6 +50,7 @@ pub enum HealthStatus {
 /// Mock worker server for testing
 pub struct MockWorker {
     config: Arc<RwLock<MockWorkerConfig>>,
+    kv_event_sources: Arc<RwLock<serde_json::Value>>,
     shutdown_handle: Option<tokio::task::JoinHandle<()>>,
     shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
@@ -58,9 +59,15 @@ impl MockWorker {
     pub fn new(config: MockWorkerConfig) -> Self {
         Self {
             config: Arc::new(RwLock::new(config)),
+            kv_event_sources: Arc::new(RwLock::new(json!({}))),
             shutdown_handle: None,
             shutdown_tx: None,
         }
+    }
+
+    /// Where the worker's DP ranks publish KV events, served as ATOM serves them.
+    pub async fn set_kv_event_sources(&self, sources: serde_json::Value) {
+        *self.kv_event_sources.write().await = sources;
     }
 
     /// Start the mock worker server
@@ -71,7 +78,15 @@ impl MockWorker {
         let port = listener.local_addr()?.port();
         config.write().await.port = port;
 
+        let kv_event_sources = self.kv_event_sources.clone();
         let app = Router::new()
+            .route(
+                "/kv_event_sources",
+                get(move || {
+                    let sources = kv_event_sources.clone();
+                    async move { Json(sources.read().await.clone()) }
+                }),
+            )
             .route("/health", get(health_handler))
             .route("/health_generate", get(health_generate_handler))
             .route("/get_server_info", get(server_info_handler))

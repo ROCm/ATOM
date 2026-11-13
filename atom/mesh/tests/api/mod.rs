@@ -1,6 +1,7 @@
 //! API endpoint integration tests
 
 mod api_endpoints_test;
+mod kv_events_test;
 mod parser_endpoints_test;
 mod proxy_contract_test;
 mod request_formats_test;

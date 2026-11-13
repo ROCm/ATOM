@@ -244,6 +244,13 @@ async fn list_workers_rest(State(state): State<Arc<AppState>>) -> Response {
     state.context.worker_service.list_workers().into_response()
 }
 
+async fn kv_event_sources(State(state): State<Arc<AppState>>) -> Response {
+    match &state.context.kv_event_monitor {
+        Some(monitor) => Json(monitor.sources()).into_response(),
+        None => (StatusCode::NOT_FOUND, "KV events are off (--kv-events)").into_response(),
+    }
+}
+
 async fn get_worker(
     State(state): State<Arc<AppState>>,
     Path(worker_id_raw): Path<String>,
@@ -404,6 +411,7 @@ pub fn build_app(
     let admin_routes = Router::new()
         .route("/flush_cache", post(flush_cache))
         .route("/get_loads", get(get_loads))
+        .route("/kv_events/sources", get(kv_event_sources))
         .route("/parse/function_call", post(parse_function_call))
         .route("/parse/reasoning", post(parse_reasoning))
         // Tokenizer management endpoints
