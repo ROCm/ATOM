@@ -512,6 +512,21 @@ def test_a_pp_stage_places_its_rows_by_layer_number():
     assert tensors.slot_region_consumer_indices == [3, 4, 5, 9, 10, 11]
 
 
+def test_the_last_stage_places_the_drafters_mla_row_after_the_targets():
+    """The drafter's layer 8 is past the target's eight, so it has no target
+    MLA position; the peer lists draft rows after the target's two."""
+    builder = kimi_builder({"kv_connector": "mooncake"}, pp_size=2)
+    builder._pool_rows = {
+        **SECOND_STAGE_ROWS,
+        K3.MLA_ROWS: {_Layer(7): 0, _Layer(NUM_HIDDEN_LAYERS): 1},
+    }
+
+    mla, slots = builder._pp_consumer_region_indices(2, 6)
+
+    assert mla == [1, 2]
+    assert slots == [3, 4, 5, 9, 10, 11]
+
+
 def test_a_pp_stage_places_replayssm_records_and_the_cursor():
     """Three more per-layer groups, then the one cursor every layer shares."""
     builder = kimi_builder({"kv_connector": "mooncake"}, pp_size=2, replayssm=True)

@@ -3793,16 +3793,48 @@ class MooncakeConnector(KVConnectorBase):
             1 if consumer_tp_size is None else max(1, consumer_tp_size // self.tp_size)
         )
         split = tp_ratio > 1 and tp_segments is not None
-        # A split slot is a k-th of this one; Phase 2a sizes it against its
-        # segments.
+        tp_part = 0
+        if split:
+            consumer_tp_rank = int(request_data["consumer_tp_rank"])
+            if consumer_tp_rank // tp_ratio != self.tp_rank:
+                raise RuntimeError(
+                    f"Consumer TP rank {consumer_tp_rank} of {consumer_tp_size} "
+                    f"holds no part of producer TP rank {self.tp_rank} of "
+                    f"{self.tp_size}'s sharded slot state (req {req_id})"
+                )
+            tp_part = consumer_tp_rank % tp_ratio
+        # A split slot is a k-th of this one, cut along its segments; a
+        # replicated region moves whole.
         for region_idx, (_, bps) in enumerate(self._slot_regions):
             cidx = slot_cmap[region_idx]
-            if not split and consumer_slot_bps[cidx] != bps:
+            dst_bps = consumer_slot_bps[cidx]
+            if not split and dst_bps != bps:
                 raise RuntimeError(
                     f"State slot size mismatch for req {req_id}: producer "
                     f"region {region_idx} has {bps} B, consumer region {cidx} "
-                    f"has {consumer_slot_bps[cidx]} B; prefill and decode must "
-                    "run the same model and spec config"
+                    f"has {dst_bps} B; prefill and decode must run the same "
+                    "model and spec config"
+                )
+            if not split:
+                continue
+            if tp_replicated and tp_replicated[region_idx]:
+                if dst_bps != bps:
+                    raise RuntimeError(
+                        f"Slot region {region_idx} is TP-replicated, but its "
+                        f"consumer unit differs for req {req_id}: {bps} B "
+                        f"here, {dst_bps} B there"
+                    )
+                continue
+            segments = tp_segments[region_idx]
+            if (
+                segments is None
+                or any(seg % tp_ratio for seg in segments)
+                or dst_bps * tp_ratio != bps
+            ):
+                raise RuntimeError(
+                    f"Slot region {region_idx} cannot split {tp_ratio} ways "
+                    f"for req {req_id}: segments={segments}, producer unit "
+                    f"{bps} B, consumer unit {dst_bps} B"
                 )
 
         # ---- Phase 1: Block transfer ----
@@ -3964,49 +3996,20 @@ class MooncakeConnector(KVConnectorBase):
         slot_dst: list[int] = []
         slot_sizes: list[int] = []
 
-        # Phase 2a: slot-indexed state, written direct (no staging)
-        tp_part = 0
-        if split:
-            consumer_tp_rank = int(request_data["consumer_tp_rank"])
-            if consumer_tp_rank // tp_ratio != self.tp_rank:
-                raise RuntimeError(
-                    f"Consumer TP rank {consumer_tp_rank} of {consumer_tp_size} "
-                    f"holds no part of producer TP rank {self.tp_rank} of "
-                    f"{self.tp_size}'s sharded slot state (req {req_id})"
-                )
-            tp_part = consumer_tp_rank % tp_ratio
+        # Phase 2a: slot-indexed state, written direct (no staging). Every
+        # unit and split was checked before Phase 1.
         for region_idx, (src_base, bps) in enumerate(self._slot_regions):
             cidx = slot_cmap[region_idx]
             dst_base = consumer_slot_addrs[cidx]
             dst_bps = consumer_slot_bps[cidx]
-            replicated = split and bool(tp_replicated and tp_replicated[region_idx])
-            if replicated and dst_bps != bps:
-                raise RuntimeError(
-                    f"Slot region {region_idx} is TP-replicated, but its "
-                    f"consumer unit differs for req {req_id}: {bps} B here, "
-                    f"{dst_bps} B there"
-                )
-            if not split or replicated:
-                # Both units are this one's size: an unsplit region was held
-                # to it before Phase 1, a replicated one just above.
+            if not split or (tp_replicated and tp_replicated[region_idx]):
                 slot_src.append(src_base + src_slot * bps)
                 slot_dst.append(dst_base + dst_slot * dst_bps)
                 slot_sizes.append(bps)
                 continue
-            segments = tp_segments[region_idx]
-            if (
-                segments is None
-                or any(seg % tp_ratio for seg in segments)
-                or dst_bps * tp_ratio != bps
-            ):
-                raise RuntimeError(
-                    f"Slot region {region_idx} cannot split {tp_ratio} ways "
-                    f"for req {req_id}: segments={segments}, producer unit "
-                    f"{bps} B, consumer unit {dst_bps} B"
-                )
             src_offset = src_base + src_slot * bps
             dst_offset = dst_base + dst_slot * dst_bps
-            for seg in segments:
+            for seg in tp_segments[region_idx]:
                 piece = seg // tp_ratio
                 slot_src.append(src_offset + tp_part * piece)
                 slot_dst.append(dst_offset)

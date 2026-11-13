@@ -480,6 +480,31 @@ class TestChunkedAdmissionTopology:
             }
         )
 
+    @pytest.mark.parametrize("model_type", ["kimi_linear", "deepseek_v3"])
+    def test_a_dcp_decode_of_a_stateful_model_is_http_400(
+        self, monkeypatch, model_type
+    ):
+        monkeypatch.setattr(
+            api_server,
+            "engine",
+            SimpleNamespace(
+                config=SimpleNamespace(
+                    tensor_parallel_size=8,
+                    pipeline_parallel_size=1,
+                    decode_context_parallel_size=8,
+                    hf_config=SimpleNamespace(model_type=model_type),
+                )
+            ),
+        )
+        params = {"chunked_transfer": True, "do_remote_prefill": True}
+        if model_type == "deepseek_v3":
+            api_server._validate_chunked_receive(params)
+            return
+        with pytest.raises(api_server.HTTPException) as refused:
+            api_server._validate_chunked_receive(params)
+        assert refused.value.status_code == 400
+        assert "per-request state to a DCP decode" in refused.value.detail
+
     @pytest.mark.parametrize(
         "params",
         [
