@@ -97,6 +97,7 @@ from atom.models.minimax_m3.mono.kernels.stages.shared import (
 )
 from atom.models.minimax_m3.mono.layout import (
     AG_RS_FROM,
+    MID4N_WORDS,
     MID_ROW,
     O_K,
     O_ROW,
@@ -105,6 +106,8 @@ from atom.models.minimax_m3.mono.layout import (
     SCRATCH,
     SPLIT_KEYS,
     UG_PER_SLOT,
+    WIDE_FROM,
+    XN4_ROW,
     XN8_ROW,
     XSC_ROW,
     XSCB_ROW,
@@ -115,7 +118,11 @@ from atom.models.minimax_m3.mono.layout import (
     sym_layout,
     ug_ctas_per_token,
     ug_tasks_of,
+    wide_down4_layout,
+    wide_down_layout,
     wide_moe,
+    xb_lds_base,
+    xb_lds_rows,
 )
 from atom.models.minimax_m3.mono.sources import SOURCES
 from atom.mono.device.ops import CM_DEV, kernel_symbol, launcher, load_ptr64, rsrc
@@ -123,11 +130,10 @@ from atom.mono.device.ops import block_max as block_max_of
 from atom.mono.device.stamps import stamp as stamp_point
 from atom.mono.device.stamps import stamp_begin, stamp_flush
 from atom.mono.device.sync import Addr, Mailbox, preg, shift, sreg
-from atom.mono.plan.trace import Space
 from atom.mono.plan.build_key import key_tuple, symbol_params
-from atom.mono.plan.probe import parse as parse_probe
 from atom.mono.plan.execution import BLOCKS, THREADS, WAVES, first_task
-from atom.mono.plan.trace import enter_stage
+from atom.mono.plan.probe import parse as parse_probe
+from atom.mono.plan.trace import Space, enter_stage
 from atom.mono.runtime.abi import KernelAbi
 from atom.mono.runtime.debug import region_ids
 
@@ -185,6 +191,16 @@ class K4Build:
     attn_mxfp8: bool = (
         False  # qkv / o_proj are native MXFP8 1x32 (E8M0 scales), not ptpc fp8
     )
+    # numerics aligned with the production path (task-mono-align/PLAN.md); False = the
+    # previous behaviour, code object for code object
+    moe_a16w4: bool = True  # routed experts: bf16 activations (F1); False: MXFP8 (a8w4)
+    sp_f32: bool = True  # split -> merge partition outputs in f32 (F2); False: bf16
+    prod_round: bool = (
+        True  # shared swiglu on bf16 gate / up, production's output-sum roundings (F3, F4)
+    )
+    # routed experts on MXFP4 activations (a4w4: xn and the swiglu mid per 1x32 E8M0 RoundUp, aiter's a4w4
+    # convention), the shared expert stays MXFP8; wins over ``moe_a16w4`` (compiled out when set)
+    moe_a4w4: bool = False
 
 
 def build_post_attn_kernel(
@@ -210,6 +226,10 @@ def build_post_attn_kernel(
     probe: str = "",
     sh_first: int = 0,
     attn_mxfp8: bool = False,
+    moe_a16w4: bool = True,
+    sp_f32: bool = True,
+    prod_round: bool = True,
+    moe_a4w4: bool = False,
 ):
     """``@flyc.jit`` launcher of K4 for one rank of an ``npes``-way TP group and a
     decode step of ``tokens`` (<= MAX_TOKENS) rows, ``q_len`` consecutive rows a
@@ -234,7 +254,17 @@ def build_post_attn_kernel(
     the activations are quantized per 32 elements (E8M0 ceil-pow2) instead of per token.
     """
     assert not index_nvfp4 or fuse_k1, "the index cache is read by K1's scores"
+    moe_a16w4 = moe_a16w4 and not moe_a4w4  # a4w4 wins, a16w4 is compiled out
+    assert not (
+        moe_a16w4 and shared_mxfp8 and tokens < WIDE_FROM and (xn_flag or mid_flag)
+    ), "the narrow moe_a16w4 publishes its bf16 xn as tagged pairs: xn_flag = mid_flag = 0"
     assert 1 <= tokens <= MAX_TOKENS
+    assert (
+        not moe_a4w4 or shared_mxfp8
+    ), "the a4w4 experts need the unfused MXFP8 shared expert"
+    assert not (
+        moe_a4w4 and tokens < WIDE_FROM and xn_flag
+    ), "the narrow moe_a4w4 publishes its MXFP4 xn as tagged words: xn_flag = 0 (mid_flag 0 / 1 / 2 as for a8w4)"
     key = K4Build(
         npes=npes, tokens=tokens, init_blocks=init_blocks, local_blocks=local_blocks,
         index_heads=heads.count, index_own=heads.own, timeline=timeline,
@@ -243,6 +273,8 @@ def build_post_attn_kernel(
         swiglu_limit=swiglu_limit, debug=debug, xn_flag=xn_flag,
         shared_mxfp8=shared_mxfp8, mid_flag=mid_flag, kv_nvfp4=kv_nvfp4,
         index_nvfp4=index_nvfp4, probe=probe, sh_first=sh_first, attn_mxfp8=attn_mxfp8,
+        moe_a16w4=moe_a16w4, sp_f32=sp_f32, prod_round=prod_round,
+        moe_a4w4=moe_a4w4,
     )  # fmt: skip
     P = parse_probe(probe)
     build_key = key_tuple(key, SOURCES)  # the launcher references it: keyed
@@ -250,7 +282,15 @@ def build_post_attn_kernel(
     REGION_IDS = region_ids(
         d.name
         for d in mailbox_regions(
-            tokens, heads.count, fuse_k1, index_topk, xn_flag, mid_flag
+            tokens,
+            heads.count,
+            fuse_k1,
+            index_topk,
+            xn_flag,
+            mid_flag,
+            sp_f32,
+            True,
+            moe_a4w4,
         )
     )
     W = npes
@@ -260,6 +300,12 @@ def build_post_attn_kernel(
     # fuse_k1: K1's outputs are read device-coherent (K1 stores them so)
     CM_K1 = CM_DEV if fuse_k1 else 0
     WIDE = wide_moe(tokens)
+    # the narrow MoE's routed experts on bf16 activations (the wide one: pending); a build
+    # whose shared expert is one of the MXFP4 experts (no ``shared_mxfp8``) keeps a8w4
+    A16N = moe_a16w4 and not WIDE and shared_mxfp8
+    A16W = moe_a16w4 and WIDE and shared_mxfp8  # the wide (expert-grouped) one
+    A4N = moe_a4w4 and not WIDE  # (a4w4 implies shared_mxfp8)
+    A4W = moe_a4w4 and WIDE
     # the router tasks' xn goes out as plain words behind one flag a task (always
     # in the wide MoE; ``xn_flag`` 1 / 2 in the narrow one: the flag after / before
     # the logits), not as tagged pairs
@@ -269,7 +315,7 @@ def build_post_attn_kernel(
     # (``mid_flag`` 1), or (2) bf16 pairs with a tag each, half the bytes of f32 ones
     MID_FLAG = mid_flag == 1 and not WIDE
     MID_BF = mid_flag == 2 and not WIDE
-    POOL = pool_words(tokens)
+    POOL = pool_words(tokens, A16N or A16W, A4N or A4W)
     U_MAX = TOP_K * tokens + 1  # distinct routed experts at most, then the shared
 
     @fx.struct
@@ -600,11 +646,20 @@ def build_post_attn_kernel(
         XN8_WORDS = HIDDEN // 4
         XSC_WORDS = HIDDEN // 32
         XSC_LDS = tokens * XN8_ROW
+        # moe_a16w4 (narrow): the routed tasks' bf16 xn rows follow the MXFP8 rows and scales
+        XB_ROW = HIDDEN // 2
+        XB_LDS = xb_lds_base(tokens)
         MID16_WORDS = MOE_SLOTS * INTER // 2  # bf16 pairs, as the mids land
         MID8_WORDS = MOE_SLOTS * INTER // 4
         MID8_LDS = tokens * MID16_WORDS
         MIDSC_WORDS = MOE_SLOTS * INTER // 32
         MIDSC_LDS = MID8_LDS + tokens * MID8_WORDS
+        # moe_a4w4 (narrow): the routed tasks' MXFP4 xn rows (``XN4_ROW`` words a row) and their codes
+        # follow the MXFP8 rows; the down stage's MXFP4 routed mids and codes follow the MXFP8 mids
+        X4_LDS = xb_lds_base(tokens)
+        X4S_LDS = X4_LDS + xb_lds_rows(tokens) * XN4_ROW
+        MID4_LDS = MIDSC_LDS + tokens * MIDSC_WORDS
+        MIDSC4_LDS = MID4_LDS + tokens * MID4N_WORDS
 
         k4ctx.update(locals())
         k4ctx.update(router_defs(k4ctx))
@@ -623,6 +678,9 @@ def build_post_attn_kernel(
         DN_UNITS = TOP_K * DN_KC  # routed (slot, 128-k chunk) units per row group
         DN_UPW = (DN_UNITS + 3) // 4  # 4 waves per row group
         SH_UPW = (DN_KC + 3) // 4  # the shared expert's chunks, once for all tokens
+        assert (
+            not (A16N or A4N) or DN_UPW == DN_KC
+        )  # a wave a slot, its chunks the units
         # routed (token, slot, row group) tasks t < ROUTED_TASKS; the shared expert's
         # row groups (one GEMV with a column per token) are tasks ROUTED_TASKS + j,
         # run as task j of stage "shared" while the routing is still on its way, so
@@ -646,6 +704,14 @@ def build_post_attn_kernel(
         MID_ROW_WORDS = INTER // 4
         MIDSC_ROW_WORDS = INTER // 32
         W_MIDSC = (MID_ROWS + 1) * MID_ROW
+        # moe_a16w4: the down stage's pool (``layout.wide_down_layout``)
+        DNL = wide_down_layout(tokens)
+        MIDB_ROWS = DNL[
+            "rows"
+        ]  # the routed experts' bf16 mid rows, the zero row's index
+        assert not A16W or DNL["end"] <= POOL
+        DN4 = wide_down4_layout(tokens)  # moe_a4w4 (wide): the down stage's pool
+        assert not A4W or DN4["end"] <= POOL
         # up / gate tasks go in pairs, a CTA runs both: an MXFP8 block is 32 rows
         UG_PAIRS = UG_PER_SLOT // 2
         # the MXFP8 shared expert's pairs sit on UG_PAIRS CTAs, one each, that take

@@ -31,22 +31,38 @@ from atom.models.minimax_m3.mono.kernels.stages.shared import (
 )
 from atom.models.minimax_m3.mono.layout import (
     DN_ROWS,
+    MID4_ROW,
+    MID4_WORDS,
     MID_ROW,
+    MIDB_ROW,
     MIDSC_ROW,
     N_DN,
     N_ROUTER,
     SCORE_COPIES,
     UG_PER_SLOT,
     UG_ROWS,
+    XN4_WORDS,
     XN8_ROW,
     XSC_ROW,
 )
-from atom.mono.device.mx import FP4, FP8, fp4_tile_load, mfma_scaled
+from atom.mono.device.mx import (
+    FP4,
+    FP8,
+    fp4_pack2,
+    fp4_scale,
+    fp4_tile_load,
+    fp4x8_bf16,
+    mfma_scaled,
+)
 from atom.mono.device.ops import (
     CM_DEV,
     ballot,
+    bf16_pair,
     bf16_round,
+    butterfly,
     lanes_below,
+    ld_dev,
+    mfma_bf16,
     popcount,
     row_live,
     row_sum,
@@ -64,6 +80,9 @@ from atom.mono.plan.trace import enter_stage
 @traced
 def moe_wide_defs(k4ctx):
     """The functions of the expert-grouped MoE (S > 4)."""
+    A16W = k4ctx["A16W"]
+    A4W = k4ctx["A4W"]
+    DN4 = k4ctx["DN4"]
     BASE = k4ctx["BASE"]
     DN_DEPTH = k4ctx["DN_DEPTH"]
     DN_ROWS_AHEAD = k4ctx["DN_ROWS_AHEAD"]
@@ -77,6 +96,8 @@ def moe_wide_defs(k4ctx):
     UGW_ITERS = k4ctx["UGW_ITERS"]
     UG_SHARED_UNITS = k4ctx["UG_SHARED_UNITS"]
     UG_CPW = k4ctx["UG_CPW"]
+    DNL = k4ctx["DNL"]
+    MIDB_ROWS = k4ctx["MIDB_ROWS"]
     SH8 = k4ctx["shared_mxfp8"]
     SH_FIRST = SH8 and k4ctx["sh_first"] != 0
     UG_PAIRS = k4ctx["UG_PAIRS"]
@@ -104,12 +125,15 @@ def moe_wide_defs(k4ctx):
     l16 = k4ctx["l16"]
     lane = k4ctx["lane"]
     lds_b8 = k4ctx["lds_b8"]
+    lds_b4 = k4ctx["lds_b4"]
+    lds_bf8 = k4ctx["lds_bf8"]
     lds_i32 = k4ctx["lds_i32"]
     mb = k4ctx["mb"]
     mb_poll = k4ctx["mb_poll"]
     mb_put = k4ctx["mb_put"]
     misc = k4ctx["misc"]
     mr = k4ctx["mr"]
+    prod_round = k4ctx["prod_round"]
     mx8_q = k4ctx["mx8_q"]
     mx8_scale = k4ctx["mx8_scale"]
     red = k4ctx["red"]
@@ -220,13 +244,40 @@ def moe_wide_defs(k4ctx):
             scs.append([fp8_scale_load(r_s, row, HIDDEN, kc) for kc in kcs])
         return wts, scs
 
-    def wug_y(wts, scs, half, fp8=False):
-        return wug_reduce(*wug_mma(wts, scs, half, fp8))
+    def wug_y(wts, scs, half, fp8=False, xb=None, xq=None):
+        return wug_reduce(*wug_mma(wts, scs, half, fp8, xb, xq), rnd=fp8)
 
-    def wug_mma(wts, scs, half, fp8=False):
+    def wug_mma(wts, scs, half, fp8=False, xb=None, xq=None):
         """A task's up / gate GEMV for every token (B column l % 16 = token
         l % 16) -> swiglu: thread (row r, token k)'s mid value. ``half``: the
-        task's 16-row half of its 32-row scale block (compile time)."""
+        task's 16-row half of its 32-row scale block (compile time). ``xb`` (a16w4):
+        this lane's bf16 xn operands, ``xb[chunk][d]`` (``stage_moe_wide``)."""
+        if const_expr(xq is not None):
+            # a4w4: this lane's MXFP4 xn operand and code of chunk i (``xq[i]``), fp4 x fp4
+            cg_ = fx.Vector.filled(4, 0.0, fx.Float32)
+            cu_ = fx.Vector.filled(4, 0.0, fx.Float32)
+            for i in range_constexpr(UG_CPW):
+                sel = (i % 2) * 2 + half
+                cg_ = mfma_scaled(
+                    wts[0][i], xq[i][0], cg_, scs[0][i // 2], xq[i][1],
+                    a_fmt=FP4, b_fmt=FP4, sa_byte=sel,
+                )  # fmt: skip
+                cu_ = mfma_scaled(
+                    wts[1][i], xq[i][0], cu_, scs[1][i // 2], xq[i][1],
+                    a_fmt=FP4, b_fmt=FP4, sa_byte=sel,
+                )  # fmt: skip
+            return cg_, cu_
+        if const_expr(xb is not None):
+            cg_ = fx.Vector.filled(4, 0.0, fx.Float32)
+            cu_ = fx.Vector.filled(4, 0.0, fx.Float32)
+            for i in range_constexpr(UG_CPW):
+                sh8 = ((i % 2) * 2 + half) * 8
+                code_g = scs[0][i // 2] >> sh8
+                code_u = scs[1][i // 2] >> sh8
+                for d in range_constexpr(4):
+                    cg_ = mfma_bf16(fp4x8_bf16(wts[0][i][d], code_g), xb[i][d], cg_)
+                    cu_ = mfma_bf16(fp4x8_bf16(wts[1][i][d], code_u), xb[i][d], cu_)
+            return cg_, cu_
         col = fx.min(l16, tokens - 1)
         cg_ = fx.Vector.filled(4, 0.0, fx.Float32)
         cu_ = fx.Vector.filled(4, 0.0, fx.Float32)
@@ -250,8 +301,10 @@ def moe_wide_defs(k4ctx):
             )
         return cg_, cu_
 
-    def wug_reduce(cg_, cu_):
-        """The task's two accumulators -> swiglu: thread (row r, token k)'s mid value."""
+    def wug_reduce(cg_, cu_, rnd=False):
+        """The task's two accumulators -> swiglu: thread (row r, token k)'s mid value.
+        ``rnd`` (the shared expert's MXFP8 GEMVs): its gate / up are bf16 in production.
+        """
         fx.ptr_store(cg_, red + (wave * 64 + lane) * 4)
         fx.ptr_store(cu_, fpool + (W_UPP + (wave * 64 + lane) * 4))
         gpu.barrier()
@@ -259,6 +312,9 @@ def moe_wide_defs(k4ctx):
         k = fx.min(tid // UG_ROWS, tokens - 1)
         gsum = row_sum(red, r, k)
         usum = row_sum(fpool + W_UPP, r, k)
+        if const_expr(rnd and prod_round):
+            gsum = bf16_round(gsum)
+            usum = bf16_round(usum)
         gpu.barrier()  # red and the up partials are free for the next task
         return swiglu_mul_batch([gsum], [usum], fx.Float32(-swiglu_limit))[0]
 
@@ -267,11 +323,79 @@ def moe_wide_defs(k4ctx):
         lo = fx.Int32(rocdl.cvt_pk_fp8_f32(T.i32, q, xshfl(q, 1), fx.Int32(0), False))
         return lo | (xshfl(lo, 2) << 16)
 
-    def wug_publish(pr, y_lo, y_hi):
+    def wug_publish16(pr, y_lo, y_hi):
+        """a16w4: routed task pair pr's mid rows as bf16 plain words (``mid16p``, row
+        k TOP_K + slot), then the pair's flag. Thread (r, k) holds rows r and 16 + r
+        of the 32-row block; an even r stores its pair with r + 1's."""
+        u = pr // UG_PAIRS
+        blk_ = pr % UG_PAIRS
+        r = tid % UG_ROWS
+        k = fx.min(tid // UG_ROWS, tokens - 1)
+        lo = bf16_round(y_lo)
+        hi = bf16_round(y_hi)
+        nb_lo = xshfl(lo, 1)
+        nb_hi = xshfl(hi, 1)
+        e_u = fx.Int32(fx.ptr_load(uexp + u))
+        m_u = fx.Int32(fx.ptr_load(umask + u))
+        row = k * TOP_K + slot_of(k, e_u)
+        if (tid < UG_ROWS * tokens) & (((m_u >> k) & 1) != 0):
+            if r % 2 == 0:
+                for h, (a_, b_) in enumerate(((lo, nb_lo), (hi, nb_hi))):
+                    bo.buffer_store(
+                        bf16_pair(a_, b_).bitcast(fx.Int32),
+                        rsrc(mb("mid16p")),
+                        row * (INTER // 2) + blk_ * 16 + h * 8 + r // 2,
+                        cache_modifier=CM_DEV,
+                    )
+        publish(mb_put, mr("ugdone"), pr, fx.Int32(1), tid == 0)
+
+    def wug_publish4(pr, y_lo, y_hi):
+        """a4w4: routed task pair pr's mid rows as MXFP4 plain words (``mid4p``, row k TOP_K + slot:
+        a 32-row block is 4 words, rows 0..7 / 8..15 / 16..23 / 24..31, low nibble = lower row) and
+        its E8M0 code (``mids4p``), then the pair's flag. Thread (r, k) holds rows r and 16 + r of
+        the block: the 16 lanes of a token share the block's amax (as ``wug_publish``), an even
+        lane packs its neighbour's value beside its own, 4 even lanes' bytes make a word.
+        """
+        u = pr // UG_PAIRS
+        blk_ = pr % UG_PAIRS
+        r = tid % UG_ROWS
+        k = fx.min(tid // UG_ROWS, tokens - 1)
+        lo = bf16_round(y_lo)
+        hi = bf16_round(y_hi)
+        amax = butterfly(fx.max(fx.max(lo, -lo), fx.max(hi, -hi)), (1, 2, 4, 8), fx.max)
+        e4, sc4 = fp4_scale(amax)
+        words = []
+        for v in (lo, hi):
+            b = fp4_pack2(fx.Int32(0), v, xshfl(v, 1), sc4, 0) & 0xFF
+            b = b | (xshfl(b, 2) << 8)
+            words.append(b | (xshfl(b, 4) << 16))
+        e_u = fx.Int32(fx.ptr_load(uexp + u))
+        m_u = fx.Int32(fx.ptr_load(umask + u))
+        row = k * TOP_K + slot_of(k, e_u)
+        if (tid < UG_ROWS * tokens) & (((m_u >> k) & 1) != 0):
+            if r % 8 == 0:
+                for h in range_constexpr(2):
+                    bo.buffer_store(
+                        words[h],
+                        rsrc(mb("mid4p")),
+                        row * MID4_WORDS + blk_ * 4 + h * 2 + r // 8,
+                        cache_modifier=CM_DEV,
+                    )
+            if r == 0:
+                bo.buffer_store(
+                    e4,
+                    rsrc(mb("mids4p")),
+                    row * (INTER // 32) + blk_,
+                    cache_modifier=CM_DEV,
+                )
+        publish(mb_put, mr("ugdone"), pr, fx.Int32(1), tid == 0)
+
+    def wug_publish(pr, y_lo, y_hi, shared_row=False):
         """Task pair pr = (distinct expert pr / UG_PAIRS, 32-row block
         pr % UG_PAIRS): its mid rows (thread (r, k) holds rows r and 16 + r of
         the block) as the down stage's MXFP8 -- the rounding its bf16 staging
-        did, one 32-block a 16-lane group -- then the pair's flag."""
+        did, one 32-block a 16-lane group -- then the pair's flag. ``shared_row``
+        (a16w4): the shared expert's mid row of token k is row k."""
         u = pr // UG_PAIRS
         blk_ = pr % UG_PAIRS
         r = tid % UG_ROWS
@@ -282,7 +406,10 @@ def moe_wide_defs(k4ctx):
         words = [fp8_lanes4(mx8_q(v, inv)) for v in (lo, hi)]
         e_u = fx.Int32(fx.ptr_load(uexp + u))
         m_u = fx.Int32(fx.ptr_load(umask + u))
-        row = k * MOE_SLOTS + slot_of(k, e_u)
+        if const_expr(shared_row):
+            row = k
+        else:
+            row = k * MOE_SLOTS + slot_of(k, e_u)
         if (tid < UG_ROWS * tokens) & (((m_u >> k) & 1) != 0):
             if r % 4 == 0:
                 for h in range_constexpr(2):
@@ -316,9 +443,17 @@ def moe_wide_defs(k4ctx):
                 xt = fx.min(xk, tokens - 1)
                 xs_ = slot_of(xt, xe)
                 xh = (((xm >> xk) & 1) != 0) & (xu <= nu)
-                fx.ptr_store(
-                    xh.select(xt * MOE_SLOTS + xs_, fx.Int32(MID_ROWS)), urow + ix
-                )
+                if const_expr(A16W or A4W):
+                    # the routed experts' bf16 (a4w4: MXFP4) rows (k TOP_K + slot, the zero row last)
+                    # and the shared expert's MXFP8 rows (k, its own zero row)
+                    is_sh = xu == nu
+                    hit = is_sh.select(xt, xt * TOP_K + xs_)
+                    miss = is_sh.select(fx.Int32(tokens), fx.Int32(MIDB_ROWS))
+                    fx.ptr_store(xh.select(hit, miss), urow + ix)
+                else:
+                    fx.ptr_store(
+                        xh.select(xt * MOE_SLOTS + xs_, fx.Int32(MID_ROWS)), urow + ix
+                    )
                 fx.ptr_store(
                     xh.select(fx.ptr_load(rwt + (8 * xt + xs_)), fx.Float32(0.0)),
                     uwt + ix,
@@ -427,20 +562,83 @@ def moe_wide_defs(k4ctx):
             )
         gpu.barrier()
         acquire()
-        for base_w, n_row, lds_w, lds_row in (
-            (mb("xn8p"), XN8_WORDS, 0, XN8_ROW),
-            (mb("xscp"), XSC_WORDS, XSC_LDS, XSC_ROW),
-        ):
-            rows_to_lds(tid, base_w, tokens, n_row, xs + lds_w, lds_row)
+        xq = None
+        if const_expr(A4W):
+            # a4w4: this lane's MXFP4 xn operand and code of each of its wave's chunks for good (a
+            # lane's column is token l % 16, its wave's k eighth, 16 B a 128-k chunk), read once for
+            # every task; only the shared expert's CTAs hold MXFP8 rows
+            colx = fx.min(l16, tokens - 1)
+            xq = [
+                (
+                    fx.Vector(
+                        ld_dev(
+                            mb("xn4p"),
+                            colx * XN4_WORDS + (wave * UG_CPW + i) * 16 + g4 * 4,
+                            4,
+                        )
+                    ),
+                    fx.Int32(
+                        ld_dev(
+                            mb("xs4p"),
+                            colx * XSC_WORDS + (wave * UG_CPW + i) * 4 + g4,
+                            1,
+                        )
+                    ),
+                )
+                for i in range(UG_CPW)
+            ]
+            xb = None
+            if bid >= G - UG_PAIRS:
+                for base_w, n_row, lds_w, lds_row in (
+                    (mb("xn8p"), XN8_WORDS, 0, XN8_ROW),
+                    (mb("xscp"), XSC_WORDS, XSC_LDS, XSC_ROW),
+                ):
+                    rows_to_lds(tid, base_w, tokens, n_row, xs + lds_w, lds_row)
+        elif const_expr(A16W):
+            # a16w4: this lane's bf16 xn operands for good (a lane's column is token
+            # l % 16, its wave's k eighth, four 16 B pieces a 128-k chunk), read once
+            # for every task; only the shared expert's CTAs hold MXFP8 rows
+            colx = fx.min(l16, tokens - 1)
+            xb = [
+                [
+                    fx.Vector(
+                        ld_dev(
+                            mb("xnbp"),
+                            colx * (HIDDEN // 2)
+                            + (wave * UG_CPW + i) * 64
+                            + g4 * 16
+                            + d * 4,
+                            4,
+                        )
+                    ).bitcast(fx.BFloat16)
+                    for d in range(4)
+                ]
+                for i in range(UG_CPW)
+            ]
+            if bid >= G - UG_PAIRS:
+                for base_w, n_row, lds_w, lds_row in (
+                    (mb("xn8p"), XN8_WORDS, 0, XN8_ROW),
+                    (mb("xscp"), XSC_WORDS, XSC_LDS, XSC_ROW),
+                ):
+                    rows_to_lds(tid, base_w, tokens, n_row, xs + lds_w, lds_row)
+        else:
+            xb = None
+            for base_w, n_row, lds_w, lds_row in (
+                (mb("xn8p"), XN8_WORDS, 0, XN8_ROW),
+                (mb("xscp"), XSC_WORDS, XSC_LDS, XSC_ROW),
+            ):
+                rows_to_lds(tid, base_w, tokens, n_row, xs + lds_w, lds_row)
         gpu.barrier()
-        if const_expr(SH_FIRST):  # noqa: SIM102
+        if const_expr(SH_FIRST):
             if has_s:
                 # the second half's tiles follow the first's MFMAs
                 cg0, cu0 = wug_mma(sh_cur[0], sh_cur[1], 0, True)
                 sh_nxt = wsh_load(2 * jsh + 1, has_s)
-                y_lo = wug_reduce(cg0, cu0)
+                y_lo = wug_reduce(cg0, cu0, rnd=True)
                 y_hi = wug_y(sh_nxt[0], sh_nxt[1], 1, True)
-                wug_publish(n_routed * UG_PAIRS + jsh, y_lo, y_hi)
+                wug_publish(
+                    n_routed * UG_PAIRS + jsh, y_lo, y_hi, shared_row=A16W or A4W
+                )
         y_lo = fx.Float32(0.0)  # the pair's first half, until the second's
         for it in range_constexpr(UGW_ITERS):
             t, has_t = task(it)
@@ -451,9 +649,15 @@ def moe_wide_defs(k4ctx):
             if const_expr(it % 2 == 0):
                 pair_scs = cur[1]
             if has_t:
-                y = wug_y(cur[0], pair_scs, it % 2)  # a pair: row groups cg, cg + 1
+                y = wug_y(
+                    cur[0], pair_scs, it % 2, xb=xb, xq=xq
+                )  # a pair: row groups cg, cg + 1
                 if const_expr(it % 2 == 0):
                     y_lo = y
+                elif const_expr(A4W):
+                    wug_publish4(t // 2, y_lo, y)
+                elif const_expr(A16W):
+                    wug_publish16(t // 2, y_lo, y)
                 else:
                     wug_publish(t // 2, y_lo, y)
             if const_expr(it + 1 < UGW_ITERS):
@@ -470,10 +674,17 @@ def moe_wide_defs(k4ctx):
             if has_s:
                 y_lo = wug_y(sh_cur[0], sh_cur[1], 0, True)
                 y_hi = wug_y(sh_nxt[0], sh_nxt[1], 1, True)
-                wug_publish(n_routed * UG_PAIRS + jsh, y_lo, y_hi)
+                wug_publish(
+                    n_routed * UG_PAIRS + jsh, y_lo, y_hi, shared_row=A16W or A4W
+                )
         stamp(8)
         if has_dn:
-            wide_down(td)
+            if const_expr(A4W):
+                wide_down4(td)
+            elif const_expr(A16W):
+                wide_down16(td)
+            else:
+                wide_down(td)
             stamp(11)
 
     def wide_down(td):
@@ -601,6 +812,7 @@ def moe_wide_defs(k4ctx):
             # the shared expert's units: its mid rows are the table's entry nu
             srow_b = fx.Int32(fx.ptr_load(urow + (nu * 16 + l16)))
             sw = fx.ptr_load(uwt + (nu * 16 + l16))
+            shacc = [fx.Float32(0.0) for _ in range(4)]
             for swv, ssc, skc, sok in sh_units:
                 scu = mfma_scaled(
                     a=swv,
@@ -610,25 +822,348 @@ def moe_wide_defs(k4ctx):
                     c=fx.Vector.filled(4, 0.0, fx.Float32),
                     a_fmt=FP8,
                 )
-                acc = [
-                    acc[e] + sok.select(scu[e] * sw, fx.Float32(0.0)) for e in range(4)
-                ]
+                if const_expr(
+                    prod_round
+                ):  # kept apart: production rounds each of the two
+                    shacc = [
+                        shacc[e] + sok.select(scu[e] * sw, fx.Float32(0.0))
+                        for e in range(4)
+                    ]
+                else:
+                    acc = [
+                        acc[e] + sok.select(scu[e] * sw, fx.Float32(0.0))
+                        for e in range(4)
+                    ]
         a0, a1, a2, a3 = acc
         fx.ptr_store(
             fx.Vector.from_elements([a0, a1, a2, a3], fx.Float32),
             red + (wave * 64 + lane) * 4,
+        )
+        if const_expr(SH8 and prod_round):
+            # (the up partials' words: free in the down stage)
+            fx.ptr_store(
+                fx.Vector.from_elements(shacc, fx.Float32),
+                fpool + (W_UPP + (wave * 64 + lane) * 4),
+            )
+        gpu.barrier()
+        if tid < DN_ROWS * tokens:
+            k = tid // DN_ROWS
+            grp = (tid % DN_ROWS) // 16
+            rr = tid % 16
+            if const_expr(SH8 and prod_round):
+                grp_waves = [grp * 4 + w for w in range(4)]
+                tot = bf16_round(row_sum(red, rr, k, grp_waves)) + bf16_round(
+                    row_sum(fpool + W_UPP, rr, k, grp_waves)
+                )
+            else:
+                tot = row_sum(red, rr, k, [grp * 4 + w for w in range(4)])
+            fx.ptr_store(bf16_round(tot), misc + tid)
+        gpu.barrier()
+        ffn_finish(td)
+
+    def wide_down16(td):
+        enter_stage("down")
+        """a16w4: row group td's down GEMV over every distinct expert, B column l % 16 =
+        token l % 16's bf16 mid for it (the zero row where the token is not routed
+        there). Wave q of the row group takes the experts q, q + 4, .. of the step's
+        union whole (its 6 chunks chained into one accumulator), so production's
+        bf16(acc * w) per (expert, token) is the wave's own; the waves' sums, the
+        shared expert's MXFP8 GEMV (rounded to bf16) and the final bf16 add follow."""
+        nu = uniform(fx.ptr_load(uexp + (U_MAX + 1)))
+        rg_d = td * 2 + wave // 4
+        q = uniform(wave % 4)
+        n_ew = (U_MAX - 1 + 3) // 4  # routed experts a wave takes, at most
+        dn_w = n_ew * DN_KC
+
+        def unit_load(i):
+            """(weights, scale) of this wave's i-th (expert, 128-k chunk) unit,
+            zero-sized reads past its last expert."""
+            du = q + 4 * (i // DN_KC)
+            ok = du < nu
+            de = fx.min(
+                uniform(fx.ptr_load(uexp + fx.min(du, U_MAX - 1))), SHARED_EXPERT
+            )
+            dwv = fp4_tile_load(
+                wrsrc(
+                    "moed",
+                    w2 + fx.Int64(de) * W2_BYTES,
+                    ok.select(fx.Int32(W2_BYTES), fx.Int32(0)),
+                ),
+                0,
+                rg_d,
+                INTER,
+                i % DN_KC,
+                lane * 4,
+            )
+            dsc = e8m0_load(
+                wrsrc("moed", s2, ok.select(fx.Int32(S2_BYTES), fx.Int32(0))),
+                group_scale_byte(de, HIDDEN, rg_d, i % DN_KC, W2_SCALE_COLS),
+            )
+            return dwv, dsc
+
+        sh_units = []
+        for h in range_constexpr(2):
+            skc = q + 4 * h
+            sok = skc < DN_KC
+            skc = fx.min(skc, DN_KC - 1)
+            srow = rg_d * 16 + l16
+            sr_w = wrsrc("shd", w2s, sok.select(fx.Int32(W2S_BYTES), fx.Int32(0)))
+            sr_s = wrsrc("shd", s2s, sok.select(fx.Int32(S2S_BYTES), fx.Int32(0)))
+            sh_units.append(
+                (
+                    fp8_tile_load(sr_w, srow, INTER, skc),
+                    fp8_scale_load(sr_s, srow, INTER, skc),
+                    skc,
+                    sok,
+                )
+            )
+        inflight = [unit_load(i) for i in range(min(DN_DEPTH, dn_w))]
+        # every up / gate task pair's flag, then the bf16 mid rows of the routed experts,
+        # the shared expert's MXFP8 rows and scales (plain words, 16 B a load)
+        n_ug = (nu + 1) * UG_PAIRS
+        mb_poll(
+            [
+                (mr("ugdone"), fx.min(tid + THREADS * i, n_ug - 1), 1)
+                for i in range((U_MAX * UG_PAIRS + THREADS - 1) // THREADS)
+            ]
+        )
+        gpu.barrier()
+        acquire()
+        rows_to_lds(tid, mb("mid16p"), MIDB_ROWS, INTER // 2, xs, MIDB_ROW)
+        rows_to_lds(tid, mb("mid8p"), tokens, MID_ROW_WORDS, xs + DNL["sh8"], MID_ROW)
+        rows_to_lds(
+            tid, mb("midsp"), tokens, MIDSC_ROW_WORDS, xs + DNL["sh8sc"], MIDSC_ROW
+        )
+        if tid < INTER // 2:
+            fx.ptr_store(fx.Int32(0), xs + (MIDB_ROWS * MIDB_ROW + tid))
+        if tid < MID_ROW_WORDS:
+            fx.ptr_store(fx.Int32(0), xs + (DNL["sh8"] + tokens * MID_ROW + tid))
+        if tid < MIDSC_ROW_WORDS:
+            fx.ptr_store(fx.Int32(0), xs + (DNL["sh8sc"] + tokens * MIDSC_ROW + tid))
+        gpu.barrier()
+        stamp(10)
+        tot = [fx.Float32(0.0) for _ in range(4)]
+        for i in range_constexpr(dn_w):
+            dwv, dsc = inflight.pop(0)
+            if const_expr(i + DN_DEPTH < dn_w):
+                inflight.append(unit_load(i + DN_DEPTH))
+            kc = i % DN_KC
+            if const_expr(kc == 0):
+                du = q + 4 * (i // DN_KC)
+                ok = du < nu
+                duc = fx.min(du, U_MAX - 1)
+                drow = fx.Int32(fx.ptr_load(urow + (duc * 16 + l16)))
+                dw = ok.select(fx.ptr_load(uwt + (duc * 16 + l16)), fx.Float32(0.0))
+                cacc = fx.Vector.filled(4, 0.0, fx.Float32)
+            for d in range_constexpr(4):
+                cacc = mfma_bf16(
+                    fp4x8_bf16(dwv[d], dsc),
+                    lds_bf8(drow * MIDB_ROW + kc * 64 + g4 * 16 + d * 4),
+                    cacc,
+                )
+            if const_expr(kc == DN_KC - 1):
+                if const_expr(prod_round):
+                    # production's gemm2 epilogue: bf16(acc * topk weight) per (expert, token)
+                    r_ = [bf16_round(cacc[e] * dw) for e in range(4)]
+                else:
+                    r_ = [cacc[e] * dw for e in range(4)]
+                tot = [tot[e] + ok.select(r_[e], fx.Float32(0.0)) for e in range(4)]
+        # the shared expert's units: its mid rows are the table's entry nu
+        srow_b = fx.Int32(fx.ptr_load(urow + (nu * 16 + l16)))
+        sw = fx.ptr_load(uwt + (nu * 16 + l16))
+        shacc = [fx.Float32(0.0) for _ in range(4)]
+        for swv, ssc, skc, sok in sh_units:
+            scu = mfma_scaled(
+                a=swv,
+                sa=ssc,
+                b=lds_b8(DNL["sh8"] + srow_b * MID_ROW + skc * 32),
+                sb=lds_i32(DNL["sh8sc"] + srow_b * MIDSC_ROW + skc * 4 + g4),
+                c=fx.Vector.filled(4, 0.0, fx.Float32),
+                a_fmt=FP8,
+            )
+            shacc = [
+                shacc[e] + sok.select(scu[e] * sw, fx.Float32(0.0)) for e in range(4)
+            ]
+        fx.ptr_store(
+            fx.Vector.from_elements(tot, fx.Float32), red + (wave * 64 + lane) * 4
+        )
+        fx.ptr_store(
+            fx.Vector.from_elements(shacc, fx.Float32),
+            fpool + (DNL["shp"] + (wave * 64 + lane) * 4),
         )
         gpu.barrier()
         if tid < DN_ROWS * tokens:
             k = tid // DN_ROWS
             grp = (tid % DN_ROWS) // 16
             rr = tid % 16
-            tot = row_sum(red, rr, k, [grp * 4 + w for w in range(4)])
-            fx.ptr_store(bf16_round(tot), misc + tid)
+            waves = [grp * 4 + w for w in range(4)]
+            routed = row_sum(red, rr, k, waves)
+            shared = row_sum(fpool + DNL["shp"], rr, k, waves)
+            if const_expr(prod_round):
+                tot_k = bf16_round(routed) + bf16_round(shared)
+            else:
+                tot_k = routed + shared
+            fx.ptr_store(bf16_round(tot_k), misc + tid)
+        gpu.barrier()
+        ffn_finish(td)
+
+    def wide_down4(td):
+        enter_stage("down")
+        """a4w4: row group td's down GEMV over every distinct expert, B column l % 16 = token l % 16's
+        MXFP4 mid for it (the zero row where the token is not routed there), fp4 x fp4. As
+        ``wide_down16``: wave q of the row group takes the experts q, q + 4, .. whole (its 6 chunks
+        chained into one accumulator), so production's bf16(acc * w) per (expert, token) is the
+        wave's own; then the waves' sums, the shared expert's MXFP8 GEMV (rounded to bf16) and the
+        final bf16 add."""
+        nu = uniform(fx.ptr_load(uexp + (U_MAX + 1)))
+        rg_d = td * 2 + wave // 4
+        q = uniform(wave % 4)
+        n_ew = (U_MAX - 1 + 3) // 4  # routed experts a wave takes, at most
+        dn_w = n_ew * DN_KC
+
+        def unit_load(i):
+            """(weights, scale) of this wave's i-th (expert, 128-k chunk) unit,
+            zero-sized reads past its last expert."""
+            du = q + 4 * (i // DN_KC)
+            ok = du < nu
+            de = fx.min(
+                uniform(fx.ptr_load(uexp + fx.min(du, U_MAX - 1))), SHARED_EXPERT
+            )
+            dwv = fp4_tile_load(
+                wrsrc(
+                    "moed",
+                    w2 + fx.Int64(de) * W2_BYTES,
+                    ok.select(fx.Int32(W2_BYTES), fx.Int32(0)),
+                ),
+                0,
+                rg_d,
+                INTER,
+                i % DN_KC,
+                lane * 4,
+            )
+            dsc = e8m0_load(
+                wrsrc("moed", s2, ok.select(fx.Int32(S2_BYTES), fx.Int32(0))),
+                group_scale_byte(de, HIDDEN, rg_d, i % DN_KC, W2_SCALE_COLS),
+            )
+            return dwv, dsc
+
+        sh_units = []
+        for h in range_constexpr(2):
+            skc = q + 4 * h
+            sok = skc < DN_KC
+            skc = fx.min(skc, DN_KC - 1)
+            srow = rg_d * 16 + l16
+            sr_w = wrsrc("shd", w2s, sok.select(fx.Int32(W2S_BYTES), fx.Int32(0)))
+            sr_s = wrsrc("shd", s2s, sok.select(fx.Int32(S2S_BYTES), fx.Int32(0)))
+            sh_units.append(
+                (
+                    fp8_tile_load(sr_w, srow, INTER, skc),
+                    fp8_scale_load(sr_s, srow, INTER, skc),
+                    skc,
+                    sok,
+                )
+            )
+        inflight = [unit_load(i) for i in range(min(DN_DEPTH, dn_w))]
+        # every up / gate task pair's flag, then the MXFP4 mid rows and codes of the routed experts, the
+        # shared expert's MXFP8 rows and codes (plain words, 16 B a load)
+        n_ug = (nu + 1) * UG_PAIRS
+        mb_poll(
+            [
+                (mr("ugdone"), fx.min(tid + THREADS * i, n_ug - 1), 1)
+                for i in range((U_MAX * UG_PAIRS + THREADS - 1) // THREADS)
+            ]
+        )
+        gpu.barrier()
+        acquire()
+        rows_to_lds(tid, mb("mid4p"), MIDB_ROWS, MID4_WORDS, xs, MID4_ROW)
+        rows_to_lds(
+            tid, mb("mids4p"), MIDB_ROWS, INTER // 32, xs + DN4["sc4"], MIDSC_ROW
+        )
+        rows_to_lds(tid, mb("mid8p"), tokens, MID_ROW_WORDS, xs + DN4["sh8"], MID_ROW)
+        rows_to_lds(
+            tid, mb("midsp"), tokens, MIDSC_ROW_WORDS, xs + DN4["sh8sc"], MIDSC_ROW
+        )
+        if tid < MID4_WORDS:
+            fx.ptr_store(fx.Int32(0), xs + (MIDB_ROWS * MID4_ROW + tid))
+        if tid < INTER // 32:
+            fx.ptr_store(fx.Int32(0), xs + (DN4["sc4"] + MIDB_ROWS * MIDSC_ROW + tid))
+        if tid < MID_ROW_WORDS:
+            fx.ptr_store(fx.Int32(0), xs + (DN4["sh8"] + tokens * MID_ROW + tid))
+        if tid < MIDSC_ROW_WORDS:
+            fx.ptr_store(fx.Int32(0), xs + (DN4["sh8sc"] + tokens * MIDSC_ROW + tid))
+        gpu.barrier()
+        stamp(10)
+        tot = [fx.Float32(0.0) for _ in range(4)]
+        for i in range_constexpr(dn_w):
+            dwv, dsc = inflight.pop(0)
+            if const_expr(i + DN_DEPTH < dn_w):
+                inflight.append(unit_load(i + DN_DEPTH))
+            kc = i % DN_KC
+            if const_expr(kc == 0):
+                du = q + 4 * (i // DN_KC)
+                ok = du < nu
+                duc = fx.min(du, U_MAX - 1)
+                drow = fx.Int32(fx.ptr_load(urow + (duc * 16 + l16)))
+                dw = ok.select(fx.ptr_load(uwt + (duc * 16 + l16)), fx.Float32(0.0))
+                cacc = fx.Vector.filled(4, 0.0, fx.Float32)
+            cacc = mfma_scaled(
+                a=dwv,
+                sa=dsc,
+                b=lds_b4(drow * MID4_ROW + kc * 16),
+                sb=lds_i32(DN4["sc4"] + drow * MIDSC_ROW + kc * 4 + g4),
+                c=cacc,
+                a_fmt=FP4,
+                b_fmt=FP4,
+            )
+            if const_expr(kc == DN_KC - 1):
+                if const_expr(prod_round):
+                    # production's gemm2 epilogue: bf16(acc * topk weight) per (expert, token)
+                    r_ = [bf16_round(cacc[e] * dw) for e in range(4)]
+                else:
+                    r_ = [cacc[e] * dw for e in range(4)]
+                tot = [tot[e] + ok.select(r_[e], fx.Float32(0.0)) for e in range(4)]
+        # the shared expert's units: its mid rows are the table's entry nu
+        srow_b = fx.Int32(fx.ptr_load(urow + (nu * 16 + l16)))
+        sw = fx.ptr_load(uwt + (nu * 16 + l16))
+        shacc = [fx.Float32(0.0) for _ in range(4)]
+        for swv, ssc, skc, sok in sh_units:
+            scu = mfma_scaled(
+                a=swv,
+                sa=ssc,
+                b=lds_b8(DN4["sh8"] + srow_b * MID_ROW + skc * 32),
+                sb=lds_i32(DN4["sh8sc"] + srow_b * MIDSC_ROW + skc * 4 + g4),
+                c=fx.Vector.filled(4, 0.0, fx.Float32),
+                a_fmt=FP8,
+            )
+            shacc = [
+                shacc[e] + sok.select(scu[e] * sw, fx.Float32(0.0)) for e in range(4)
+            ]
+        fx.ptr_store(
+            fx.Vector.from_elements(tot, fx.Float32), red + (wave * 64 + lane) * 4
+        )
+        fx.ptr_store(
+            fx.Vector.from_elements(shacc, fx.Float32),
+            fpool + (DN4["shp"] + (wave * 64 + lane) * 4),
+        )
+        gpu.barrier()
+        if tid < DN_ROWS * tokens:
+            k = tid // DN_ROWS
+            grp = (tid % DN_ROWS) // 16
+            rr = tid % 16
+            waves = [grp * 4 + w for w in range(4)]
+            routed = row_sum(red, rr, k, waves)
+            shared = row_sum(fpool + DN4["shp"], rr, k, waves)
+            if const_expr(prod_round):
+                tot_k = bf16_round(routed) + bf16_round(shared)
+            else:
+                tot_k = routed + shared
+            fx.ptr_store(bf16_round(tot_k), misc + tid)
         gpu.barrier()
         ffn_finish(td)
 
     return {
+        "wide_down4": wide_down4,
+        "wug_publish4": wug_publish4,
         "slot_of": slot_of,
         "build_experts": build_experts,
         "wug_load": wug_load,
@@ -637,7 +1172,9 @@ def moe_wide_defs(k4ctx):
         "wug_reduce": wug_reduce,
         "fp8_lanes4": fp8_lanes4,
         "wug_publish": wug_publish,
+        "wug_publish16": wug_publish16,
         "down_tables": down_tables,
         "stage_moe_wide": stage_moe_wide,
         "wide_down": wide_down,
+        "wide_down16": wide_down16,
     }

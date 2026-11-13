@@ -18,8 +18,15 @@ from atom.models.minimax_m3.mono.config import (
 )
 from atom.models.minimax_m3.mono.kernels.common import ld_bf16x12
 from atom.models.minimax_m3.mono.kernels.stages.shared import XN_SLICE
-from atom.models.minimax_m3.mono.layout import N_ROUTER, SCORE_COPIES
-from atom.mono.device.mx import FP8_MAX, clamp_fp8, code_ceil, pow2
+from atom.models.minimax_m3.mono.layout import N_ROUTER, SCORE_COPIES, XN4_WORDS
+from atom.mono.device.mx import (
+    FP8_MAX,
+    clamp_fp8,
+    code_ceil,
+    fp4_pack2,
+    fp4_scale,
+    pow2,
+)
 from atom.mono.device.ops import (
     CM_DEV,
     bf2_f32,
@@ -33,6 +40,7 @@ from atom.mono.device.ops import (
     rsrc,
     traced,
     wave_sum,
+    xshfl,
 )
 from atom.mono.device.sync import preg, publish
 from atom.mono.plan.execution import THREADS, WAVES
@@ -42,6 +50,10 @@ from atom.mono.plan.execution import THREADS, WAVES
 def router_defs(k4ctx):
     """The functions of the router GEMV (and the MXFP8 operand helpers the experts
     share)."""
+    A16N = k4ctx["A16N"]
+    A16W = k4ctx["A16W"]
+    A4N = k4ctx["A4N"]
+    A4W = k4ctx["A4W"]
     AG_RS = k4ctx["AG_RS"]
     CM_K1 = k4ctx["CM_K1"]
     G = k4ctx["G"]
@@ -163,6 +175,18 @@ def router_defs(k4ctx):
             [h[j][e] for j in range(2) for e in range(4)], fx.Int32
         )
 
+    def lds_b4(word):
+        """This lane's MXFP4 B operand (a4w4) of the 128-k chunk at LDS word ``word``: k 32 g .. + 32
+        (g = lane // 16), 16 B, the fp4 A tile's K assignment (hip/fp4_mfma_probe.cpp).
+        """
+        return fx.Vector(fx.ptr_load(xs + (word + 4 * g4), result_type=v4f)).bitcast(
+            fx.Int32
+        )
+
+    def lds_bf8(word):
+        """16 B of LDS words ``word`` .. + 4 as eight bf16: a MFMA operand."""
+        return fx.Vector(fx.ptr_load(xs + word, result_type=v4f)).bitcast(fx.BFloat16)
+
     def bf16x2(word):
         return fx.Vector.from_elements([word], fx.Int32).bitcast(fx.BFloat16)
 
@@ -223,7 +247,7 @@ def router_defs(k4ctx):
                 for qq in range(2)
                 for i, f in enumerate(bf2_f32(arow[h][qq]))
             ]
-            if const_expr(AG_RS):  # noqa: SIM102
+            if const_expr(AG_RS):
                 # h_mid = bf16(bf16(sum) + residual): task t writes slice t
                 if tid // (XN_SLICE // RE) == t:
                     hw = (k * HIDDEN + tid * RE) // 2
@@ -263,6 +287,27 @@ def router_defs(k4ctx):
                 )
             gpu.barrier()
             stamp(25)
+            if const_expr(A16N):
+                # the slice's bf16 words for the routed experts (a16w4), tagged
+                if tid < XN_SLICE // 2:
+                    mb_put_words(
+                        mr("xnb"),
+                        k * (HIDDEN // 2) + t * (XN_SLICE // 2) + tid,
+                        [
+                            fx.ptr_load(xs + (t * (XN_SLICE // 2) + tid)).bitcast(
+                                fx.Int32
+                            )
+                        ],
+                    )
+            if const_expr(A16W):
+                # wide: the slice's bf16 words as plain words (the flag below follows them)
+                if tid < XN_SLICE // 2:
+                    bo.buffer_store(
+                        fx.ptr_load(xs + (t * (XN_SLICE // 2) + tid)).bitcast(fx.Int32),
+                        rsrc(mb("xnbp")),
+                        k * (HIDDEN // 2) + t * (XN_SLICE // 2) + tid,
+                        cache_modifier=CM_DEV,
+                    )
             if tid < XN_SLICE // 4:  # 4 elements a lane, 8 lanes a 32-block
                 w0 = t * (XN_SLICE // 2) + tid * 2
                 f = [
@@ -283,6 +328,33 @@ def router_defs(k4ctx):
                     mb_put_words(mr("xn8"), xw, [word])
                     if tid % 8 == 0:
                         mb_put_words(mr("xsc"), xsw, [e])
+                if const_expr(A4N or A4W):
+                    # the routed experts' MXFP4 xn (a4w4): the same 32-blocks, E8M0 RoundUp; a lane's 4
+                    # elements are 2 bytes, an even lane stores its neighbour's beside its own
+                    amax4 = fx.max(fx.max(f[0], -f[0]), fx.max(f[1], -f[1]))
+                    amax4 = fx.max(
+                        amax4, fx.max(fx.max(f[2], -f[2]), fx.max(f[3], -f[3]))
+                    )
+                    e4, sc4 = fp4_scale(butterfly(amax4, (1, 2, 4), fx.max))
+                    w16 = fp4_pack2(fx.Int32(0), f[0], f[1], sc4, 0)
+                    w16 = fp4_pack2(w16, f[2], f[3], sc4, 1) & 0xFFFF
+                    word4 = w16 | (xshfl(w16, 1) << 16)
+                    xw4 = k * XN4_WORDS + t * (XN_SLICE // 8) + tid // 2
+                    xsw4 = k * XSC_WORDS + t * (XN_SLICE // 32) + tid // 8
+                    if const_expr(A4W):
+                        if tid % 2 == 0:
+                            bo.buffer_store(
+                                word4, rsrc(mb("xn4p")), xw4, cache_modifier=CM_DEV
+                            )
+                        if tid % 8 == 0:
+                            bo.buffer_store(
+                                e4, rsrc(mb("xs4p")), xsw4, cache_modifier=CM_DEV
+                            )
+                    else:
+                        if tid % 2 == 0:
+                            mb_put_words(mr("xn4"), xw4, [word4])
+                        if tid % 8 == 0:
+                            mb_put_words(mr("xs4"), xsw4, [e4])
             if const_expr(XN_EARLY):
                 # the slice is out: its flag in front of the logits
                 publish(mb_put, mr("xndone"), tt, fx.Int32(1), tid == 0)
@@ -342,6 +414,8 @@ def router_defs(k4ctx):
         "mx8_scale": mx8_scale,
         "mx8_q": mx8_q,
         "lds_b8": lds_b8,
+        "lds_bf8": lds_bf8,
+        "lds_b4": lds_b4,
         "bf16x2": bf16x2,
         "lds_i32": lds_i32,
         "stage_router": stage_router,
