@@ -90,6 +90,7 @@ def test_structured_verify_keeps_raw_logprobs(modules, monkeypatch, probabilisti
 
     def ratio_verify(*args, **kwargs):
         observed["ratio_verification"] = True
+        observed["in_place"] = kwargs.get("in_place")
         # The ratio test may read the target rows of the full logits in place.
         logits = args[4]
         if kwargs.get("in_place"):
@@ -139,6 +140,10 @@ def test_structured_verify_keeps_raw_logprobs(modules, monkeypatch, probabilisti
     assert observed.get("ratio_verification", False) is probabilistic
     assert observed.get("ordinary_verification", False) is not probabilistic
     assert (runner._dspark_draft_temps is temperatures) is probabilistic
+    # No required channel, so the ratio test reads the full logits in place
+    # rather than a copy of the target rows.
+    if probabilistic:
+        assert observed["in_place"] is True
     payload = observed["logprobs"][0]
     torch.testing.assert_close(payload[:, 0], raw.log_softmax(-1)[:, 1])
     # Raw top candidate and sampled-token rank survive grammar masking.
