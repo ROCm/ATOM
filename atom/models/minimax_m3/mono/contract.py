@@ -41,6 +41,7 @@ def build_layer(
     sp_f32: bool = True,
     moe_a16w4: bool = True,
     moe_a4w4: bool = False,
+    moe_back: bool = False,
 ):
     """The layer kernel for ``tokens`` and ``index_heads`` (1 or TP), K1 fused in
     or not (``fuse_k1``), selecting or reusing a selection (``index_topk``), its
@@ -53,7 +54,30 @@ def build_layer(
         index_topk=index_topk, xn_flag=xn_flag, shared_mxfp8=shared_mxfp8, mid_flag=mid_flag,
         kv_nvfp4=kv_nvfp4, index_nvfp4=index_nvfp4, sh_first=sh_first,
         attn_mxfp8=attn_mxfp8, sp_f32=sp_f32, moe_a16w4=moe_a16w4, moe_a4w4=moe_a4w4,
+        moe_back=moe_back,
     )  # fmt: skip
+
+
+def build_front(tokens: int, n_split: int = 8, pipe: bool = False, nvfp4: bool = True):
+    """The front-half kernel (more than MAX_TOKENS rows: K1 .. the post-attention norm, ``front``)
+    for ``tokens`` rows, one index head, native MXFP8 attention + NVFP4 K/V / index pages
+    (``nvfp4``; else fp8 caches and ptpc attention) with ``n_split`` split tasks a token.
+    """
+    return build_post_attn_kernel(
+        TP, 0.088, 1e-6, 1.0, 1.0, 7.0, 1, 1, tokens, fuse_k1=True,
+        heads=IndexHeads(1, 0), shared_mxfp8=True, kv_nvfp4=nvfp4,
+        index_nvfp4=nvfp4, attn_mxfp8=nvfp4, front=True, n_split=n_split,
+        pipe=pipe and nvfp4,
+    )  # fmt: skip
+
+
+def check_front(tokens: int, n_split: int = 8, pipe: bool = False, nvfp4: bool = True):
+    """Trace ``build_front`` and check its hand-offs; raises ``ContractError``."""
+    check_traced(
+        build_front(tokens, n_split, pipe, nvfp4),
+        K4_ABI,
+        mailbox_regions(tokens, 1, True, True, 0, 0, front=True),
+    )
 
 
 def build_dense(tokens: int):
@@ -76,6 +100,7 @@ def check_build(
     sp_f32: bool = True,
     moe_a16w4: bool = True,
     moe_a4w4: bool = False,
+    moe_back: bool = False,
 ) -> None:
     """Trace ``build_layer`` and check its hand-offs; raises ``ContractError``."""
     check_traced(
@@ -94,6 +119,7 @@ def check_build(
             sp_f32,
             moe_a16w4,
             moe_a4w4,
+            moe_back,
         ),
         K4_ABI,
         mailbox_regions(
@@ -106,6 +132,8 @@ def check_build(
             sp_f32,
             moe_a16w4 and shared_mxfp8 and not moe_a4w4,
             moe_a4w4,
+            False,
+            moe_back,
         ),
     )
 
@@ -118,6 +146,23 @@ def check_dense_build(tokens: int) -> None:
 if __name__ == "__main__":
     sizes = [int(a) for a in sys.argv[1:]] or list(range(1, 17))
     for s in sizes:
+        if s > 16:
+            for ns, pipe in ((8, False), (8, True), (4, False), (4, True)):
+                check_front(s, ns, pipe)
+                print(f"S={s} front n_split={ns} pipe={pipe}: contract holds")
+            check_front(s, 8, False, False)
+            print(f"S={s} front fp8 / ptpc: contract holds")
+            if (
+                s % 16 == 0 and s <= 64
+            ):  # the 32 / 48 / 64-row whole-layer builds (front half + back half in one launch)
+                check_build(
+                    s, 1, shared_mxfp8=True, attn_mxfp8=True, kv_nvfp4=True, index_nvfp4=True, moe_a4w4=True,
+                    sp_f32=False, moe_back=True,
+                )  # fmt: skip
+                print(
+                    f"S={s} moe_back (front + router + a4w4 MoE + shared + FFN reduce): contract holds"
+                )
+            continue
         for ih in (1, TP):
             # a16w4 (the default) and the previous a8w4 experts (only a build with the
             # unfused MXFP8 shared expert, ``shared_mxfp8``, takes a16w4)
