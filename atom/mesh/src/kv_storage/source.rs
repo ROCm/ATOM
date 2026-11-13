@@ -20,7 +20,8 @@ pub enum KeyState {
 }
 
 impl KeyState {
-    /// Pools merge to the highest level, the ranks of a chunk to the lowest.
+    /// The ranks of a chunk merge to the lowest level, the pools that answered for a key
+    /// to the highest.
     pub(crate) fn level(self) -> u8 {
         match self {
             KeyState::Absent => 0,
@@ -153,40 +154,37 @@ pub struct PoolAnswer {
     pub tainted: bool,
 }
 
-/// Merges the pools' answers as `StorageBackend` describes. A tainted pool counts as
-/// empty; the backend fails only when every pool did.
+/// Merges the pools' answers key by key, as ATOM's scheduler does: a failed pool is left
+/// out and a tainted one holds nothing. A key is in the fastest tier any pool holds it in,
+/// absent if the pools that answered for it hold it nowhere, and unknown if none could
+/// answer for it. The backend fails only when every pool did.
 pub fn merge_pools(
     keys: usize,
     answers: &[Result<PoolAnswer, FailReason>],
 ) -> Result<Vec<KeyState>, FailReason> {
-    let failed = answers
-        .iter()
-        .find_map(|answer| answer.as_ref().err().copied());
-    if answers.iter().all(Result::is_err) {
-        return Err(failed.unwrap_or(FailReason::Transport));
-    }
-    let pools: Vec<&[KeyState]> = answers
+    let pools: Vec<&PoolAnswer> = answers
         .iter()
         .filter_map(|answer| answer.as_ref().ok())
-        .filter(|pool| !pool.tainted)
-        .map(|pool| pool.states.as_slice())
         .collect();
-    let floor = if failed.is_some() {
-        KeyState::Unknown
-    } else {
-        KeyState::Absent
-    };
+    if pools.is_empty() {
+        let failed = answers
+            .iter()
+            .find_map(|answer| answer.as_ref().err().copied());
+        return Err(failed.unwrap_or(FailReason::Transport));
+    }
     Ok((0..keys)
         .map(|key| {
             pools
                 .iter()
-                .map(|states| states.get(key).copied().unwrap_or(KeyState::Unknown))
-                .fold(floor, |merged, state| {
-                    if state.level() > merged.level() {
-                        state
-                    } else {
-                        merged
-                    }
+                .map(|pool| match pool.states.get(key) {
+                    _ if pool.tainted => KeyState::Absent,
+                    Some(state) => *state,
+                    None => KeyState::Unknown,
+                })
+                .fold(KeyState::Unknown, |merged, state| match (merged, state) {
+                    (KeyState::Unknown, state) | (state, KeyState::Unknown) => state,
+                    (merged, state) if state.level() > merged.level() => state,
+                    (merged, _) => merged,
                 })
         })
         .collect())

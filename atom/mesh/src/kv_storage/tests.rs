@@ -74,9 +74,9 @@ fn rule(probe: RankProbe) -> AtomChunk {
     }
 }
 
-/// Pools separated by spaces: `M`, `S` or `-` per chunk for every rank's object in
-/// memory, on SSD only or absent; `x` is a pool that fails, and a leading `t` marks a
-/// pool holding the taint marker.
+/// Pools separated by spaces: `M`, `S`, `-` or `?` per chunk for every rank's object in
+/// memory, on SSD only, absent or not answered for; `x` is a pool that fails, and a
+/// leading `t` marks a pool holding the taint marker.
 fn pools(tokens: &[u32], spec: &str) -> Vec<MockPool> {
     let keys = rule(RankProbe::All).keys(tokens);
     spec.split(' ')
@@ -93,6 +93,7 @@ fn pools(tokens: &[u32], spec: &str) -> Vec<MockPool> {
                 let state = match state {
                     'M' => KeyState::Memory,
                     'S' => KeyState::SsdOnly,
+                    '?' => KeyState::Unknown,
                     _ => KeyState::Absent,
                 };
                 for key in ranks {
@@ -126,10 +127,15 @@ async fn mock_pools_fold_to_leading_hit_tokens() {
         ("MMMSS", hit(12, 20)),
         // Memory in any pool wins, then SSD in any pool.
         ("MM SSSS", hit(8, 16)),
+        // As in ATOM, a tainted pool holds nothing and a failed pool is left out; a pool
+        // that answered for a key beats one that could not.
         ("tMMMMMM SS", hit(0, 8)),
-        // An unknown chunk before the first miss, and an unknown pool that changes nothing.
-        ("MM x", unknown),
-        ("MMMMMM x", hit(24, 24)),
+        ("tMM x", hit(0, 0)),
+        ("MM x", hit(8, 8)),
+        ("MM MM?M", hit(8, 8)),
+        // A chunk no pool answered for decides the hit only before the first miss.
+        ("MM?M", unknown),
+        ("MM-?", hit(8, 8)),
         ("x x", unknown),
     ];
     for (spec, expected) in cases {
