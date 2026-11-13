@@ -51,16 +51,26 @@ def _fill_random(dtype, pages, gen):
 
 
 def _fill_written(pages, gen):
-    """NVFP4 pages as the production writer makes them from bf16 keys with a
-    heavy-tailed per-channel spread and a few outlier tokens."""
-    from atom.model_ops.minimax_m3.nvfp4_write import nvfp4_insert_index
+    """NVFP4 index pages as the production writer (aiter's fused norm / RoPE / NVFP4 writer)
+    makes them: random qkv rows, norm weights that carry a random power of two per 16-wide
+    group (a spread of e4m3 scales). The K/V cache the op also fills is a scratch."""
+    import importlib.util
 
+    from atom.model_ops.minimax_m3.nvfp4_pages import kv_page_bytes
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    spec = importlib.util.spec_from_file_location(
+        "nvfp4_read_tests", os.path.join(here, "..", "test_minimax_m3_nvfp4_read.py")
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
     n = pages.shape[0] * BLOCK
-    chan = torch.exp(torch.randn(128, device="cuda", generator=gen) * 0.7)
-    keys = torch.randn(n, 128, device="cuda", generator=gen) * chan
-    keys[torch.rand(n, device="cuda", generator=gen) < 0.002] *= 8.0
+    kv = torch.zeros(
+        (pages.shape[0], kv_page_bytes(1)), dtype=torch.uint8, device="cuda"
+    )
+    one = torch.ones(1, device="cuda")
     slots = torch.arange(n, device="cuda", dtype=torch.int64)
-    nvfp4_insert_index(keys.to(torch.bfloat16), pages, slots)
+    mod.write_pages(kv, pages, slots, 1, 1, one, one, gen)
     return pages
 
 
