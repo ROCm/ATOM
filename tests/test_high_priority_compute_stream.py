@@ -62,11 +62,12 @@ class _FakeStream:
         return 0, -1
 
 
-@pytest.fixture
-def runner(monkeypatch):
-    """A bare ModelRunner with torch.cuda stubbed and nothing else built."""
-    from atom.model_engine.model_runner import ModelRunner
+class _FakeEvent:
+    """The pools record events; this keeps the tests off the device."""
 
+
+def _bare_runner(monkeypatch, cls, **config):
+    """An instance of `cls` with torch.cuda stubbed and nothing else built."""
     calls = []
     monkeypatch.setattr(torch.cuda, "Stream", _FakeStream)
     monkeypatch.setattr(
@@ -76,11 +77,34 @@ def runner(monkeypatch):
         torch.cuda, "set_stream", lambda stream: calls.append(("set_stream", stream))
     )
 
-    runner = ModelRunner.__new__(ModelRunner)
+    runner = cls.__new__(cls)
     runner.device = torch.device("cuda", 3)
-    runner.config = _config()
+    runner.config = _config(**config)
     runner.calls = calls
     return runner
+
+
+@pytest.fixture
+def runner(monkeypatch):
+    from atom.model_engine.model_runner import ModelRunner
+
+    return _bare_runner(monkeypatch, ModelRunner)
+
+
+@pytest.fixture
+def rapidserve_runner(monkeypatch):
+    """Builds a RapidServe runner that has entered its compute stream, as an
+    engine core does before it builds its stream pools."""
+    from atom.model_engine.model_runner import RapidServeModelRunner
+
+    def build():
+        runner = _bare_runner(
+            monkeypatch, RapidServeModelRunner, disagg_constrained=False
+        )
+        runner.compute_stream = runner._enter_compute_stream()
+        return runner
+
+    return build
 
 
 @needs_cuda_build
@@ -106,3 +130,24 @@ def test_decode_pool_matches_the_compute_stream(runner, monkeypatch):
 
     assert fallback.priority == compute_stream.priority
     assert fallback.device == runner.device
+
+
+@needs_cuda_build
+@pytest.mark.parametrize("flag", ["0", "1"])
+def test_rapidserve_prefill_and_decode_pools_share_a_priority(
+    rapidserve_runner, monkeypatch, flag
+):
+    """One side of a disaggregated rank must not outrank the other, and the
+    flag has to reach prefill as well as decode."""
+    monkeypatch.setenv(FLAG, flag)
+    monkeypatch.setattr(torch.cuda, "Event", _FakeEvent)
+    runner = rapidserve_runner()
+
+    runner.create_prefill_stream_pool()
+    runner.create_decode_stream_pool()
+
+    prefill = runner._prefill_streams[None]
+    decode = runner._decode_streams[None]
+    expected = _FakeStream.priority_range()[1] if flag == "1" else 0
+    assert (prefill.priority, decode.priority) == (expected, expected)
+    assert (prefill.device, decode.device) == (runner.device, runner.device)

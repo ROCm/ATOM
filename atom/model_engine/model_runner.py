@@ -1112,8 +1112,12 @@ class ModelRunner:
     def _new_compute_priority_stream(self) -> torch.cuda.Stream:
         """A new stream on this device at the priority the runner computes on.
 
-        One builder for every stream the runner computes on, so the decode
-        pool cannot drift from `_enter_compute_stream` in priority or device.
+        One builder for the full-CU streams the runner computes on, so the
+        RapidServe pools cannot drift from `_enter_compute_stream` in priority
+        or device. The CU-masked streams of a constrained RapidServe rank come
+        from `_stream_with_cu_mask` instead and stay at Normal priority; HIP
+        pools masked queues separately (`queueWithCUMaskPool_`), so they
+        already cannot share a queue with a graph's parallel streams.
         """
         _, high = torch.cuda.Stream.priority_range()
         return torch.cuda.Stream(self.device, priority=high)
@@ -5321,6 +5325,17 @@ class RapidServeModelRunner(ModelRunner):
     # CU fractions for which we pre-create masked streams.
     _CU_POOL_FRACTIONS: ClassVar[list[float]] = [0.5]
 
+    def _new_pool_fallback_stream(self) -> torch.cuda.Stream:
+        """The full-CU stream a prefill or decode pool falls back to.
+
+        Both pools follow the runner's compute priority, so neither side of a
+        disaggregated rank outranks the other and the flag reaches prefill as
+        well as decode.
+        """
+        if self.compute_stream is None:
+            return torch.cuda.Stream(self.device)
+        return self._new_compute_priority_stream()
+
     def create_prefill_stream_pool(self) -> bool:
         """Create a pool of CUDA streams for disaggregated prefill.
 
@@ -5337,7 +5352,7 @@ class RapidServeModelRunner(ModelRunner):
                 mask = self._cu_mask_for_fraction(f, upper=False)
                 self._prefill_streams[f] = self._stream_with_cu_mask(mask)
         # Full-CU fallback (no mask) — always present, sole entry in unconstrained mode
-        self._prefill_streams[None] = torch.cuda.Stream()
+        self._prefill_streams[None] = self._new_pool_fallback_stream()
         logger.info(
             f"Prefill stream pool created: fractions={list(self._prefill_streams.keys())}"
         )
@@ -5358,11 +5373,7 @@ class RapidServeModelRunner(ModelRunner):
                 mask = self._cu_mask_for_fraction(f, upper=True)
                 self._decode_streams[f] = self._stream_with_cu_mask(mask)
         # Full-CU fallback (no mask) — always present, sole entry in unconstrained mode
-        self._decode_streams[None] = (
-            self._new_compute_priority_stream()
-            if self.compute_stream is not None
-            else torch.cuda.Stream(self.device)
-        )
+        self._decode_streams[None] = self._new_pool_fallback_stream()
         self._model_fwd_event = torch.cuda.Event()
         self._done_event = torch.cuda.Event()
         logger.info(
