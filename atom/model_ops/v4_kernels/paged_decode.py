@@ -64,7 +64,6 @@ from atom.model_ops.v4_kernels.paged_decode_gluon import (
     _paged_decode_fused_gluon_kernel,
 )
 from atom.model_ops.v4_kernels.pool_index import row_offset
-from atom.model_ops.v4_kernels.v4_quant import V4_DIM_QK
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
 
@@ -1231,21 +1230,8 @@ def sparse_attn_v4_paged_decode(
     ``out`` optionally supplies a contiguous destination with matching rows,
     heads, dtype and device. FP8 ASM copies back only when it must pad heads.
     """
-    if out is not None:
-        query = q_packed_in if unified_kv_rope is not None else q
-        shape = (
-            (*query.shape[:2], V4_DIM_QK)
-            if unified_kv_rope is not None
-            else query.shape
-        )
-        dtype = torch.bfloat16 if unified_kv_rope is not None else query.dtype
-        if out.shape != shape or out.dtype != dtype or out.device != query.device:
-            raise ValueError(
-                f"decode output must have shape {tuple(shape)}, dtype {dtype} "
-                f"and device {query.device}"
-            )
-        if not out.is_contiguous():
-            raise ValueError("decode output must be contiguous")
+    if out is not None and not out.is_contiguous():
+        raise ValueError("decode output must be contiguous")
     if unified_kv_rope is not None:
         if (
             envs.ATOM_USE_V4_PREFILL_ASM_FOR_DECODE

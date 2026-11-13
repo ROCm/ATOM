@@ -30,7 +30,6 @@ def _dispatch(kind, kernel, gfx="gfx1250", **overrides):
         "pa_sparse_prefill_opus": kernel,
         "pa_decode_sparse": kernel,
         "_sparse_attn_v4_paged_2src_triton": kernel,
-        "V4_DIM_QK": 512,
     }
     namespace.update(overrides)
     exec(  # noqa: S102 -- execute the checked-in dispatcher, without GPU imports
@@ -112,24 +111,16 @@ def test_bf16_prefill_uses_independent_strides_when_query_differs(gfx):
 
 
 @pytest.mark.parametrize("path", ["bf16", "fp8", "hca", "prefill_asm"])
-@pytest.mark.parametrize("invalid", ["rows", "heads", "dim", "dtype", "device"])
-def test_decode_rejects_invalid_output_before_dispatch(path, invalid):
+def test_decode_rejects_strided_output_before_dispatch(path):
     def kernel(*args, **kwargs):
         pytest.fail("invalid output reached the kernel")
 
     run, q, kwargs = _decode_case(path, kernel)
-    shape = list(q.shape)
-    dtype, device = torch.bfloat16, q.device
-    if invalid in ("rows", "heads", "dim"):
-        shape[("rows", "heads", "dim").index(invalid)] -= 1
-    elif invalid == "dtype":
-        dtype = torch.float32
-    else:
-        device = "meta"
-    out = torch.empty(shape, dtype=dtype, device=device)
-    assert out.is_contiguous()
-    with pytest.raises(ValueError, match="decode output must have shape"):
+    parent = torch.full((*q.shape[:-1], q.shape[-1] * 2), -99.0, dtype=q.dtype)
+    out = parent[..., ::2]
+    with pytest.raises(ValueError, match="decode output must be contiguous"):
         run(*_args("decode", q), out=out, **kwargs)
+    assert torch.all(parent == -99)
 
 
 def _decode_case(path, kernel):
@@ -164,18 +155,23 @@ def _decode_case(path, kernel):
     return run, q, kwargs
 
 
-@pytest.mark.parametrize("path", ["fp8", "hca", "prefill_asm"])
-def test_fp8_decode_validates_unpadded_bf16_output(path):
+@pytest.mark.parametrize("path", ["bf16", "fp8", "hca", "prefill_asm"])
+def test_decode_reuses_unpadded_bf16_output(path):
     calls = []
 
     def kernel(*args, **kwargs):
-        calls.append(kwargs["out"])
-        return kwargs["out"]
+        destination = kwargs["out"]
+        assert destination.shape == q.shape
+        assert destination.dtype == torch.bfloat16
+        assert destination.device == q.device
+        calls.append(destination)
+        return torch.add(q, 1, out=destination)
 
     run, q, kwargs = _decode_case(path, kernel)
     parent = torch.full((5, *q.shape[1:]), -99.0, dtype=torch.bfloat16)
     out = parent[1:-1]
-    args = (None, *_args("decode", q)[1:])
+    args = (q if path == "bf16" else None, *_args("decode", q)[1:])
     assert run(*args, out=out, **kwargs) is out
     assert calls == [out]
-    assert torch.all(parent == -99)
+    torch.testing.assert_close(out, q + 1)
+    assert torch.all(parent[[0, -1]] == -99)
