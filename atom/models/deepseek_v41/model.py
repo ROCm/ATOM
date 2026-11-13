@@ -258,10 +258,8 @@ class DeepseekV41ForCausalLM(nn.Module):
         self.embed = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
         # One shared configuration owns all expert source/online quantization
         # rules. Native attention and Engram projections own their A8 layouts.
-        # V4.1's shared expert is native FP8 32x32 like the attention
-        # projections (the generic `dtypes.fp8` can be E4M3FNUZ and miss the
-        # native group32 path), and an online pattern may convert the routed
-        # experts (e.g. to ptpc_fp8 where there is no FP4 MFMA).
+        # Shared experts keep the native spec; online patterns may convert the
+        # routed experts.
         self.moe_quant_config = make_v4_quant_config(
             config,
             online_quant_config=online_quant_config,

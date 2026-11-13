@@ -653,10 +653,9 @@ def make_v4_quant_config(
     the same spec on the online path triggers the FusedMoE/Linear
     ``source == online_target`` early-return so those layers stay untouched.
 
-    ``shared_expert_spec`` pins the shared experts, on the source lookup and on
-    an online one that does not name them (by a layer pattern or a global
-    spec). With ``online_routed_experts`` an online layer pattern reaches the
-    routed experts, which otherwise keep their checkpoint spec on both lookups.
+    ``shared_expert_spec`` pins the shared experts unless an online pattern or
+    global spec names them. ``online_routed_experts`` lets an online layer
+    pattern convert the routed experts.
     """
 
     base = QuantizationConfig(hf_config, online_quant_config=online_quant_config)

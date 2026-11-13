@@ -294,9 +294,7 @@ class Attention(nn.Module):
         self.kv_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
         # Both latents are slices of the one `wqkv_a` output and neither norm
         # reads the other's result, so they are one launch rather than two.
-        # Where wq_b / indexer.wq_b run as BF16 GEMMs (native group32 FP8
-        # has no GEMM there), Q stays BF16 instead of a quantize/dequantize
-        # round trip.
+        # BF16 Q where wq_b / indexer.wq_b run in BF16.
         self.qk_norm = (
             DualRMSNormBF16(
                 self.q_norm, self.kv_norm, f"layers.{spec.layer_id}.qk_norm"
@@ -419,8 +417,7 @@ class Attention(nn.Module):
         """
         rows = output.shape[:-2].numel()
         if self.wo_a.weight.dtype == torch.bfloat16:
-            # wo_a was dequantized at load (no mxscale BMM here), so
-            # the inverse RoPE stays in BF16 -- no group quant to undo.
+            # wo_a is BF16 here: BF16 inverse RoPE and bmm.
             x = output.reshape(rows, self.heads, self.head_dim)
             if not x.is_contiguous():
                 x = x.contiguous()
@@ -434,8 +431,7 @@ class Attention(nn.Module):
                 pos,
                 rope.rope_dim,
             )
-            # Per-group [M, K] x [K, N] -> [M, G, N], written in place through a
-            # [G, M, N] view (ldc = G * N) so wo_b's input needs no transpose copy.
+            # Written through a [G, M, N] view: wo_b needs no transpose copy.
             w = self.wo_a.weight.view(self.groups, self.o_rank, -1)
             x = x.view(rows, self.groups, -1)
             y = torch.empty(

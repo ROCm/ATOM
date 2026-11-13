@@ -650,10 +650,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # DSpark, ...: `mono/hi_gate.py`), any other keeps ATOM's mono path; "1":
     # on, or an error naming why not; "0": off.
     "ATOM_DSV41_MONO_HI": lambda: os.getenv("ATOM_DSV41_MONO_HI", "auto"),
-    # DeepSeek-V4.1: fold the shared expert into the routed experts' per-channel
-    # FP8 buffers (one more expert in the clamped FP8 MoE instead of its own
-    # four launches). Its weights become per-channel FP8 and its input per-token
-    # FP8, as the routed experts' are. 0 keeps it a BF16 module.
+    # DeepSeek-V4.1 with ptpc_fp8 routed experts: fold the shared expert into
+    # their FP8 MoE. 0 keeps it a separate BF16 module.
     "ATOM_DSV41_FOLD_SHARED_EXPERT": lambda: (
         os.getenv("ATOM_DSV41_FOLD_SHARED_EXPERT", "1") == "1"
     ),

@@ -423,11 +423,8 @@ def _sparse_attn_v4_paged_2src_csa_split_kernel(
     BLOCK_D: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    # Split-KV (flash-decoding) form of `_sparse_attn_v4_paged_2src_csa_kernel`
-    # for few-token steps: a token's keys, prefix then extend, are one range cut
-    # into NUM_SPLITS BLOCK_K-aligned chunks, so a decode step fills the GPU
-    # instead of one workgroup per token. The sink and normalization are applied
-    # by `_sparse_attn_v4_split_combine_kernel`.
+    # Split-KV form of the CSA kernel for few-token steps: each program takes
+    # one of NUM_SPLITS chunks of a token's keys (prefix then extend).
     t = tl.program_id(0)
     pid_h = tl.program_id(1)
     s = tl.program_id(2)
@@ -484,7 +481,7 @@ def _sparse_attn_v4_paged_2src_csa_split_kernel(
         acc = acc * alpha[:, None] + tl.dot(p.to(kv.dtype), kv)
         m_i = m_new
 
-    # Extend part: positions [max(lo, p_len), hi), i.e. extend rows offset by p_len.
+    # Extend part: positions [max(lo, p_len), hi).
     e_lo = tl.maximum(lo, p_len) - p_len
     e_hi = hi - p_len
     for e_k_start in tl.range(e_lo, e_hi, BLOCK_K):
@@ -532,9 +529,7 @@ def _sparse_attn_v4_split_combine_kernel(
     BLOCK_D: tl.constexpr,
     BLOCK_DC: tl.constexpr,
 ):
-    # The splits' online-softmax states merged, then the same sink finalization
-    # as the unsplit kernel. A program owns BLOCK_DC of the D columns (grid axis
-    # 2), so a few-token step still spreads the merge over the GPU.
+    # Merge the splits, then finalize with the sink as the unsplit kernel does.
     t = tl.program_id(0)
     pid_h = tl.program_id(1)
     h_offs = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
@@ -577,23 +572,13 @@ def _sparse_attn_v4_split_combine_kernel(
     )
 
 
-# Split-KV for few-token CSA steps (decode): aim for two programs per CU, and
-# never cut a token's keys finer than `_SPLIT_MIN_KEYS`
-# (`ATOM_V4_ATTN_SPLIT_MIN_KEYS` overrides it). `ATOM_V4_ATTN_SPLIT_KV=0`
-# disables it.
-#
-# Tuned on V4.1-Flash TP4 (16 heads, ~640 keys a token): a decode step's keys
-# are scattered rows of a pool tens of GB large, so the split kernel waits on
-# TLB misses rather than on bandwidth (~2x slower than over a 1.5 GB pool) and
-# more, smaller splits keep more of them in flight: 32 keys a split and a
-# 16-key tile cut the split+combine time 1.4-1.9x at 1-32 tokens. The split
-# count is taken from a short list so a prefill of any length compiles at most
-# these variants (NUM_SPLITS is a constexpr).
+# Split-KV for few-token CSA steps: about two programs per CU, at least
+# `_SPLIT_MIN_KEYS` keys per split. A short list of split counts bounds the
+# compiled variants.
 _SPLIT_COUNTS = (20, 10, 5, 3, 2)
 _SPLIT_MIN_KEYS = int(os.environ.get("ATOM_V4_ATTN_SPLIT_MIN_KEYS", "32"))
 _SPLIT_BLOCK_K = 16
-# Columns of D a combine program owns.
-_COMBINE_BLOCK_DC = 64
+_COMBINE_BLOCK_DC = 64  # D columns per combine program
 
 
 @functools.lru_cache(maxsize=8)

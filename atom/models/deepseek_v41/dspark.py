@@ -170,7 +170,7 @@ class DeepseekV41DSpark(DSparkDraftModel):
         draft = copy(args)
         draft.n_routed_experts = args.dspark_n_routed_experts
         draft.num_experts_per_tok = args.dspark_num_experts_per_tok
-        # The backbone's rules (see DeepseekV41ForCausalLM) for the draft's stages.
+        # Same rules as the backbone.
         self.moe_quant_config = make_v4_quant_config(
             draft,
             online_quant_config=getattr(config, "online_quant_config", None),
@@ -394,9 +394,7 @@ class DeepseekV41DSpark(DSparkDraftModel):
             for s in shards
         }
         (group_rows, _, width, preshuffled), *others = layouts
-        # Where the native group32 linears run as dequantized BF16
-        # there are no FP8 weights and scales to fuse for `native_quant_linear`;
-        # the per-stage path projects through each stage's own linear.
+        # BF16 shards have no FP8 weights to fuse: per-stage path.
         bf16 = any(s.weight.dtype == torch.bfloat16 for s in shards)
         if (
             others

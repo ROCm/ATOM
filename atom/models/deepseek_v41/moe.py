@@ -23,10 +23,8 @@ expert dispatch, quantization, shared overlap and combination stay in V4.
 The shared expert stays its own module rather than taking a routed slot: both
 are scaled per 1x32, but the shared one is FP8 where the routed ones are FP4,
 and one buffer holds one dtype. V4's checkpoints are the same pair, so there is
-no fused variant to inherit. The exception is where the routed experts are
-re-quantized to per-channel FP8 at load: `_SharedExpertFold` moves the
-shared expert into the same buffers after loading
-(`ATOM_DSV41_FOLD_SHARED_EXPERT`).
+no fused variant to inherit. With per-channel FP8 routed experts,
+`_SharedExpertFold` folds it in after loading.
 """
 
 import weakref
@@ -69,9 +67,7 @@ def _append_shared_kernel(
 
 
 def _with_shared_slot(weights, ids, shared):
-    """[M, topk] int32 ids / fp32 weights -> contiguous [M, topk + 1], the last
-    slot expert `shared` at weight 1. Rows past the pass's scheduled count are
-    skipped by the MoE (num_local_tokens)."""
+    """Append expert `shared` at weight 1 to each row's top-k: [M, topk + 1]."""
     rows, topk = ids.shape
     out_ids = torch.empty(rows, topk + 1, dtype=torch.int32, device=ids.device)
     out_wts = torch.empty(rows, topk + 1, dtype=torch.float32, device=ids.device)
@@ -84,19 +80,11 @@ def _with_shared_slot(weights, ids, shared):
 
 
 class _SharedExpertFold(nn.Module):
-    """Fold the shared expert into the routed experts' FP8 buffers.
+    """Fold the shared expert into the routed experts' FP8 buffers as expert E,
+    taken by every token at weight 1: one MoE instead of four launches.
 
-    There the routed experts are online-quantized to per-channel FP8 and run by
-    the clamped FlyDSL MoE, and the shared expert -- the same shape per rank
-    (inter / TP) and the same clamped SwiGLU -- is four launches of its own
-    (gate_up GEMM, act, down GEMM, add). Folded in as expert `E` with weight 1
-    on every row, it costs the MoE one more expert's weights instead. Its
-    weights go from the checkpoint's 32x32-block FP8 (dequantized to BF16) to the
-    routed experts' per-channel FP8, and its input to their per-token FP8.
-
-    A child registered after `shared_experts`: the loader's pre-order
-    post-processing reaches it once both the routed experts are FP8 and the
-    shared expert's linears are BF16.
+    Registered after `shared_experts`, so post-loading reaches it once both
+    are processed.
     """
 
     def __init__(self, moe):
@@ -121,8 +109,7 @@ class _SharedExpertFold(nn.Module):
         q13, s13 = quant(w13, quant_dtype=dtypes.fp8)
         q2, s2 = quant(w2, quant_dtype=dtypes.fp8)
         assert q13.dtype == experts.w13_weight.dtype == experts.w2_weight.dtype
-        # The FlyDSL backend reads (16, 16)-preshuffled experts; each expert is
-        # shuffled on its own, so the shared one joins in the same layout.
+        # Same per-expert (16, 16) preshuffle as the routed experts.
         shuffled = getattr(experts.w13_weight, "is_shuffled", False)
         if shuffled:
             q13 = shuffle_weight(q13, layout=(16, 16))
@@ -140,7 +127,7 @@ class _SharedExpertFold(nn.Module):
         experts.w2_weight_scale = atom_parameter(
             torch.cat([experts.w2_weight_scale.data, s2.reshape(1, -1).float()])
         )
-        # Every row also runs it, as one more top-k slot after the routed ones.
+        # Every row takes it as one more top-k slot.
         route = experts.custom_routing_function
 
         def route_with_shared(**kwargs):
@@ -148,7 +135,7 @@ class _SharedExpertFold(nn.Module):
 
         experts.custom_routing_function = route_with_shared
         moe.shared_experts = None
-        # Nothing is left to overlap with the routed experts on `alt_stream`.
+        # Nothing left to overlap on `alt_stream`.
         moe._use_dual_stream = False
 
 
@@ -175,8 +162,7 @@ class MoE(V4MoE):
         args.quant_config = quant_config
         args.moe_fp8_activations = True
         super().__init__(layer_id, args, prefix=prefix, alt_stream=alt_stream)
-        # Registered after `shared_experts`; it folds only where the routed
-        # experts run the clamped FP8 MoE (see `_SharedExpertFold`).
+        # After `shared_experts` (see `_SharedExpertFold`).
         if (
             getattr(self, "shared_experts", None) is not None
             and envs.ATOM_DSV41_FOLD_SHARED_EXPERT

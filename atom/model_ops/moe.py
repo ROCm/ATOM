@@ -3298,13 +3298,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight.data[expert_id] = w2_q
                 layer.w2_weight_scale.data[expert_id] = w2_s.squeeze(-1)
 
-        # With a SwiGLU clamp: aiter's per-token FP8 one-stage kernels drop
-        # `swiglu_limit`, so aiter's fused_moe runs these layers on its FlyDSL
-        # MoE backend, which applies it (tuned rows, else its clamped-SiLU
-        # default). That takes clamped SiLU(gate) * up with dynamic per-token
-        # activation scales and per-channel fp32 weight scales only; any other
-        # activation (e.g. MiniMax-M3's swigluoai) or a static input scale
-        # keeps the asm path. A model may fold its shared expert in here.
+        # Clamped SiLU on per-token FP8: aiter runs it on its FlyDSL MoE, which
+        # takes [E, N] fp32 weight scales. A model may fold its shared expert in.
         self.ptpc_clamp = (
             get_gfx_runtime().startswith("gfx94")
             and getattr(layer, "swiglu_limit", 0.0) > 0
@@ -3966,10 +3961,7 @@ class FusedMoE(torch.nn.Module):
         batch_size = 8
         inter = self.intermediate_size_per_partition
 
-        # A source method may have padded the intermediate (MXFP4 pads it to its
-        # pad_align); the target buffers hold the logical size. As in the
-        # per-expert path, drop the pad after dequantizing: gate and up rows of
-        # w13, the K columns of w2. No-ops for an unpadded source.
+        # Drop the source's intermediate padding (MXFP4 pads to pad_align).
         def _trim_w13(bf16):
             half = bf16.shape[1] // 2
             if half <= inter:
@@ -3983,7 +3975,7 @@ class FusedMoE(torch.nn.Module):
 
         def _quantize(source, scale, trim):
             count, rows = source.shape[:2]
-            # dequant_moe_weight_online returns the experts' rows flattened.
+            # Returned flattened over experts.
             bf16 = dequant_moe_weight_online(
                 source,
                 scale,
@@ -4247,9 +4239,7 @@ class FusedMoE(torch.nn.Module):
         old_w13_data = self.w13_weight.data
         old_w2_data = self.w2_weight.data
         if getattr(self.quant_method, "need_normalize_e4m3fn_to_e4m3fnuz", False):
-            # Still the checkpoint's OCP E4M3 bytes: the source method would
-            # have fixed them up in its process_weights_after_loading, which
-            # never runs once it is replaced.
+            # Still OCP E4M3 bytes; the source method's FNUZ fixup never runs.
             old_w13_data = old_w13_data.view(torch.float8_e4m3fn)
             old_w2_data = old_w2_data.view(torch.float8_e4m3fn)
         old_w13_scale = self.w13_weight_scale.data if need_dequant else None
@@ -4286,10 +4276,7 @@ class FusedMoE(torch.nn.Module):
         # Switch quant_method and allocate target quantized-type buffers.
         if online_quant_dtype == dtypes.fp8:
             self.quant_method = Fp8MoEMethod(online_quant_config, self.moe_config)
-            # The online quantizer below emits the platform FP8
-            # as values, not OCP checkpoint bytes, so the e4m3fn -> e4m3fnuz
-            # fixup in process_weights_after_loading must not run: it would
-            # reinterpret them and double every scale.
+            # The quantizer emits target-dtype values: no FNUZ fixup.
             self.quant_method.need_normalize_e4m3fn_to_e4m3fnuz = False
         elif online_quant_dtype == dtypes.fp4x2:
             self.quant_method = _make_mxfp4_moe_method(
@@ -4367,9 +4354,7 @@ class FusedMoE(torch.nn.Module):
             else:
                 w1_bf16 = w13_local[:w1_size]
                 w3_bf16 = w13_local[w1_size:]
-            # A source method may have padded the intermediate (MXFP4 pads it to
-            # its pad_align); the target buffers hold the logical size, so drop
-            # the zero rows before quantizing.
+            # Drop the source's intermediate padding.
             w1_bf16 = w1_bf16[: self.intermediate_size_per_partition]
             w3_bf16 = w3_bf16[: self.intermediate_size_per_partition]
 
@@ -4437,8 +4422,7 @@ class FusedMoE(torch.nn.Module):
                     old_w2_scale[expert_id],
                     old_w2_scale_2[expert_id] if source_is_nvfp4 else None,
                 )
-            # Same padding on w2's K: trim it before any gather, or the pad
-            # columns would land between the ranks' slices.
+            # And from w2's K, before the gather.
             w2_local = w2_local[:, : self.intermediate_size_per_partition].contiguous()
             if need_gather_w2:
                 w2_full = tp_group.all_gather(w2_local, dim=1)

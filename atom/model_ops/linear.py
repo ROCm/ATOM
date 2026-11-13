@@ -161,12 +161,10 @@ def check_mxfp4_preshuffle_k(prefix: str, weight: torch.Tensor) -> None:
 
 
 def native_group32_runs_bf16() -> bool:
-    """Whether native E4M3/E8M0 group32 linears run as BF16 on this GPU.
+    """Whether native group32 FP8 linears run in BF16 here (no microscaling MFMA).
 
-    Without microscaling MFMA there is no group32 FP8 GEMM. There the
-    32x32 / 1x32 FP8 weights are dequantized once at load and the GEMM runs
-    in BF16 (hipBLASLt via tgemm). Asks the live GPU: `get_gfx()` follows
-    GPU_ARCHS and reports the last arch of a multi-arch list.
+    The weights are dequantized once at load; activations stay BF16, without
+    the A8 (MXFP8) rounding.
     """
     from aiter.jit.utils.chip_info import get_gfx_runtime
 
@@ -1300,8 +1298,7 @@ class LinearBase(nn.Module):
             if self.need_normalize_e4m3fn_to_e4m3fnuz and (
                 weight.dtype == torch.float8_e4m3fnuz
             ):
-                # Still the checkpoint's OCP E4M3 bytes: the E4M3FNUZ fixup in
-                # process_weights_after_loading runs after this.
+                # Still OCP E4M3 bytes; the FNUZ fixup runs later.
                 weight = weight.view(torch.float8_e4m3fn)
             weight = dequant_weight_online(
                 weight,
@@ -1336,9 +1333,7 @@ class LinearBase(nn.Module):
         self.layer_quant_config = online_layer_quant_config
         self._stream_online_quant = False
         self.quant_func = get_hip_quant(online_quant_type)
-        # The weight now holds values encoded in the target dtype, not OCP
-        # checkpoint bytes, so the E4M3FNUZ fixup must not run on it: it would
-        # double every scale.
+        # Already target-dtype values: the FNUZ fixup would double the scales.
         self.need_normalize_e4m3fn_to_e4m3fnuz = False
         if source_is_nvfp4:
             self.weight_scale_2 = None
@@ -1379,8 +1374,7 @@ class LinearBase(nn.Module):
                 and self.weight.dtype == torch.float8_e4m3fn
                 and native_group32_runs_bf16()
             ):
-                # No group32 FP8 GEMM here: keep the dequantized BF16 weight
-                # instead. The scales are folded in, so drop them.
+                # No group32 FP8 GEMM here: keep a BF16 weight.
                 self.weight = atom_parameter(
                     dequantize_native_group32_weight(
                         self.weight.data,
@@ -1654,7 +1648,7 @@ class LinearBase(nn.Module):
             self.native_a8_group_rows is not None
             and self.weight.dtype == torch.bfloat16
         ):
-            # BF16 fallback of a native group32 linear.
+            # BF16 fallback (`native_group32_runs_bf16`).
             y = tgemm.mm(x, self.weight, self.bias, otype=otype)
         elif self.native_a8_group_rows is not None:
             from atom.model_ops.blockscale import native_quant_linear

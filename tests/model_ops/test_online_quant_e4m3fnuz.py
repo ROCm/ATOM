@@ -1,11 +1,6 @@
 # SPDX-License-Identifier: MIT
-"""Online re-quantization where the platform FP8 is E4M3FNUZ.
-
-An FP8 checkpoint's OCP E4M3 bytes are copied unconverted into the E4M3FNUZ
-parameter and only fixed up after loading, so the online path has to decode
-them as E4M3; and the weight it re-quantizes is no checkpoint bytes, so that
-fixup must not run on it. The quantizer is plain torch, so only the 128x128
-source, whose dequant is a Triton kernel, needs a GPU.
+"""Online re-quantization where the platform FP8 is E4M3FNUZ: the source's OCP
+E4M3 bytes are decoded as E4M3, and the re-quantized weight gets no FNUZ fixup.
 """
 
 import importlib

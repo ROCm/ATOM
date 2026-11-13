@@ -1402,10 +1402,8 @@ def _dual_rmsnorm_bf16_kernel(
 
 
 class DualRMSNormBF16:
-    """`DualRMSNormMXFP8`'s BF16 twin: both norms in one launch, Q left in the
-    activation dtype with no scale (``None``). For targets whose Q consumer is
-    a BF16 GEMM anyway (where native group32 linears run in BF16), so a
-    Q quantized here would only be dequantized again."""
+    """BF16 `DualRMSNormMXFP8`: both norms in one launch, Q unquantized (scale
+    None), for where the Q GEMMs run in BF16."""
 
     def __init__(self, q_norm: nn.Module, k_norm: nn.Module, prefix: str = "") -> None:
         self.q_norm = q_norm
