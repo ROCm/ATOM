@@ -62,7 +62,7 @@ find_allowed_pr_label() {
 }
 
 check_relevant_paths() {
-  if [ -z "${CI_GATE_PATHS_IGNORE:-}" ]; then
+  if [ -z "${CI_GATE_PATHS_IGNORE:-}" ] && [ -z "${CI_GATE_PATHS_INCLUDE:-}" ]; then
     return 0
   fi
 
@@ -80,9 +80,14 @@ import os
 import sys
 
 files = [line.strip() for line in os.environ["CHANGED_FILES"].splitlines() if line.strip()]
-patterns = [
+ignore_patterns = [
     line.strip()
     for line in os.environ.get("CI_GATE_PATHS_IGNORE", "").splitlines()
+    if line.strip()
+]
+include_patterns = [
+    line.strip()
+    for line in os.environ.get("CI_GATE_PATHS_INCLUDE", "").splitlines()
     if line.strip()
 ]
 
@@ -97,7 +102,8 @@ def matches(pattern, path):
 relevant = [
     path
     for path in files
-    if not any(matches(pattern, path) for pattern in patterns)
+    if (not include_patterns or any(matches(pattern, path) for pattern in include_patterns))
+    and not any(matches(pattern, path) for pattern in ignore_patterns)
 ]
 
 print(f"Changed files: {len(files)}; relevant files for this workflow: {len(relevant)}")
