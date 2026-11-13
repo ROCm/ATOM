@@ -214,9 +214,7 @@ class StructuredOutput:
         with self.compile_lock:
             compiled = self.grammars.get(key)
             if compiled is None:
-                from atom.constraint_parser import ConstraintParser, GrammarRule
-
-                compiled = ConstraintParser.parse(GrammarRule(*key), self.compiler)
+                compiled = self.compiler.compile_json_schema(*key)
                 self.grammars[key] = compiled
                 if len(self.grammars) > 128:
                     self.grammars.popitem(last=False)

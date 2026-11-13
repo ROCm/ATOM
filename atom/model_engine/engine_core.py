@@ -12,7 +12,6 @@ import torch
 import zmq
 
 from atom.config import Config
-from atom.constraint_parser import needs_constraint_release
 from atom.kv_transfer.disaggregation import KVOutputAggregator
 from atom.kv_transfer.disaggregation.types import connector_metadata_has_work
 from atom.metrics.scheduler import SchedulerMetrics
@@ -33,6 +32,7 @@ from atom.model_engine.sequence import (
 )
 from atom.model_engine.state_runtime import StateRuntime
 from atom.observability import tracing
+from atom.structured_output import is_structured
 from atom.utils import (
     engine_process_name,
     envs,
@@ -553,9 +553,9 @@ class EngineCore:
                 logger.exception("KV event publish in engine-step finally failed")
 
     def _release_request_resources(self, sequences):
-        constraint_ids = [seq.id for seq in sequences if needs_constraint_release(seq)]
-        if constraint_ids:
-            self.runner_mgr.call_func("release_structured_requests", constraint_ids)
+        structured_ids = [seq.id for seq in sequences if is_structured(seq)]
+        if structured_ids:
+            self.runner_mgr.call_func("release_constraints", structured_ids)
         request_ids = [
             seq.id for seq in sequences if getattr(seq, "cache_seed", -1) != -1
         ]

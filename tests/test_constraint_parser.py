@@ -1,42 +1,29 @@
 # SPDX-License-Identifier: MIT
 """Public interface adoption and dependency boundaries."""
 
-import abc
 import subprocess
 import sys
 from typing import ClassVar
 
 import pytest
 
-from atom.constraint_parser import ConstraintParser, GrammarRule
+from atom.constraint_parser import ConstraintParser
 
 
 def test_rules_do_not_import_gpu_dependencies():
-    script = "import sys; from atom.constraint_parser import ConstraintParser, ChannelRule, GrammarRule; assert not any(n in sys.modules for n in ('torch', 'triton', 'aiter'))"
+    script = "import sys; from atom.constraint_parser import ConstraintParser, ChannelRule; assert not any(n in sys.modules for n in ('torch', 'triton', 'aiter'))"
     subprocess.run([sys.executable, "-c", script], check=True)
 
 
-def test_schema_adapter_receives_unchanged_rule():
-    class Compiler:
-        def compile_json_schema(self, *args):
-            assert args == ("{}", "format", "end")
-            return result
-
-    result = object()
-    assert (
-        ConstraintParser.parse(GrammarRule("{}", "format", "end"), Compiler()) is result
-    )
-
-
 def test_registry_uses_public_parser(monkeypatch):
+    from atom.constraint_parser import ChannelRule
     from atom.entrypoints.openai.tool_parser.kimi_k3_tool_parser import KimiK3Parser
     from atom.entrypoints.openai.tool_parser.registry import required_call_channel
 
-    rule = KimiK3Parser.channel_rule()
     calls = []
 
-    def parse(cls, actual, tokenizer):
-        assert actual == rule
+    def parse(cls, rule, tokenizer):
+        assert isinstance(rule, ChannelRule)
         calls.append(tokenizer)
         return result
 
@@ -47,21 +34,7 @@ def test_registry_uses_public_parser(monkeypatch):
     assert calls == [tokenizer, tokenizer]
 
 
-def test_tool_parsers_do_not_inherit_constraint_parser_names():
-    # Format parsers compose the common compiler; they must not take its
-    # generic names (parse/bind/register) onto their public class surface,
-    # where a format's own `parse` would collide with them.
-    from atom.entrypoints.openai.tool_parser.tool_parser import ToolCallParser
-
-    assert not issubclass(ToolCallParser, ConstraintParser)
-    for name in ("parse", "bind", "_adapters"):
-        assert not hasattr(ToolCallParser, name)
-    # `register` stays ABC's virtual-subclass hook rather than being shadowed
-    # by ConstraintParser.register(rule_type, backend, adapter).
-    assert ToolCallParser.register.__func__ is abc.ABCMeta.register
-
-
-def test_registered_rule_parser_and_binding():
+def test_registered_rule_parser():
     class Rule:
         pass
 
@@ -74,10 +47,8 @@ def test_registered_rule_parser_and_binding():
         assert actual is rule and adapter is context
         return native
 
-    Parser.register(Rule, "third", parse)
+    Parser.register(Rule, parse)
     assert Parser.parse(rule, context) is native
-    binding = Parser.bind(rule, context)
-    assert binding.backend == "third" and binding.value is native
 
 
 def test_registered_provider_traverses_complete_lifecycle(monkeypatch):
@@ -208,7 +179,12 @@ def test_late_registered_source_mask_composes_with_channel(monkeypatch, spec, ac
     boundary.register_constraint_provider(SourceMask)
     channel = RequiredChannel(after=(1,), opening=(2,), opens_at=1, end_ids=(3,))
     states = torch.tensor([1 if active else -1])
-    batch = SimpleNamespace(third=True, required_channel=channel, total_seqs_num=1)
+    batch = SimpleNamespace(
+        third=True,
+        required_channel=channel,
+        structured_requests=None,
+        total_seqs_num=1,
+    )
     metadata = (
         SimpleNamespace(
             cu_num_draft_tokens=torch.tensor([1]),
@@ -252,43 +228,6 @@ def test_late_registered_source_mask_composes_with_channel(monkeypatch, spec, ac
         assert not step.failed(
             torch.tensor([[7, -1]]) if spec else torch.tensor([7])
         ).any()
-
-
-def test_registry_preserves_legacy_channel_override():
-    from atom.entrypoints.openai.tool_parser.registry import required_call_channel
-    from atom.entrypoints.openai.tool_parser.tool_parser import ToolCallParser
-
-    class LegacyParser(ToolCallParser):
-        @classmethod
-        def required_call_channel(cls, tokenizer):
-            assert tokenizer is context
-            return native
-
-    context, native = object(), object()
-    assert required_call_channel(LegacyParser, context) is native
-
-
-def test_tool_grammar_validation_preserves_legacy_override():
-    from atom.entrypoints.openai.tool_parser.tool_parser import ToolCallParser
-    from atom.structured_output.validation import tool_call_grammar_format
-
-    class LegacyParser(ToolCallParser):
-        @classmethod
-        def tool_call_grammar(cls, functions, *, required, starts_in_reasoning):
-            assert functions == [{"name": "tool", "parameters": {"type": "object"}}]
-            assert required and not starts_in_reasoning
-            return 'start: "legacy"'
-
-    tools = [
-        {
-            "type": "function",
-            "function": {"name": "tool", "parameters": {"type": "object"}},
-        }
-    ]
-    result = tool_call_grammar_format(LegacyParser, tools, "required", False)
-    import json
-
-    assert json.loads(result)["grammar"] == 'start: "legacy"'
 
 
 def test_target_only_failure_tracks_accepted_prefix():
@@ -367,28 +306,6 @@ def test_provider_failure_reports_preserve_previous_failures(monkeypatch, inplac
     assert step.failed(torch.tensor([[3, -1], [4, -1]])).tolist() == [True, True]
 
 
-def test_request_resource_ownership_survives_native_pickle(monkeypatch):
-    import pickle
-
-    from atom import constraint_parser as parser
-    from atom.model_engine.sequence import Sequence
-    from atom.sampling_params import SamplingParams
-
-    monkeypatch.setattr(parser, "_REQUEST_OWNERS", dict(parser._REQUEST_OWNERS))
-    parser.register_constraint_request_owner(
-        "third-resource", lambda seq: getattr(seq, "third_resource", False)
-    )
-    ordinary = Sequence([1, 2], 16, SamplingParams(), id=71)
-    structured = Sequence([1, 2], 16, SamplingParams(json_schema="{}"), id=72)
-    third = Sequence([1, 2], 16, SamplingParams(), id=73)
-    third.third_resource = True
-    restored = pickle.loads(pickle.dumps(third))
-    assert not parser.needs_constraint_release(ordinary)
-    assert parser.needs_constraint_release(structured)
-    assert parser.needs_constraint_release(restored)
-    assert restored.id == 73
-
-
 class _CharTokenizer:
     """Each name in `whole` is one id; every other character is its own id."""
 
@@ -422,7 +339,7 @@ def test_k3_channel_rule_compiles_to_the_forced_opening():
     from atom.entrypoints.openai.tool_parser.kimi_k3_tool_parser import KimiK3Parser
 
     tokenizer = _CharTokenizer(K3_CONTROLS)
-    channel = ConstraintParser.parse(KimiK3Parser.channel_rule(), tokenizer)
+    channel = KimiK3Parser.required_call_channel(tokenizer)
     assert channel.after == tuple(tokenizer.encode(k3.RESPONSE_END))
     assert channel.end_ids == (tokenizer.ids["<|end_of_msg|>"],)
     start = tokenizer.encode(k3.TOOLS_START)
@@ -438,7 +355,7 @@ def test_k3_channel_is_not_held_when_a_control_token_is_split(split, caplog):
 
     tokenizer = _CharTokenizer(set(K3_CONTROLS) - {split})
     with caplog.at_level(logging.WARNING, logger="atom"):
-        assert ConstraintParser.parse(KimiK3Parser.channel_rule(), tokenizer) is None
+        assert KimiK3Parser.required_call_channel(tokenizer) is None
     (record,) = caplog.records
     message = record.getMessage()
     assert message.startswith("Kimi-K3 tool calls:")

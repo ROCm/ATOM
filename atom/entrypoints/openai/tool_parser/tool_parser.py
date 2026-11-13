@@ -33,7 +33,6 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
-from atom.constraint_parser import ConstraintParser
 from atom.sampling_params import RequiredChannel
 
 # A tool name is an identifier, which is what the model was given.
@@ -355,38 +354,20 @@ class ToolCallParser(ABC):
     DETECT_MARKERS: ClassVar[tuple[str, ...]] = ()
 
     @classmethod
-    def channel_rule(cls):
-        """Declare the tool channel a request that must call a tool is held to.
-
-        Returns a `ChannelRule` (the format's own control strings, compiled to
-        token ids once per server by the common `ConstraintParser`), or None to
-        leave the output unconstrained. None for every format but Kimi-K3,
-        whose answer either closes the message or opens the tools channel at
-        one token -- the place a model told it MUST call a tool still sometimes
-        ends instead.
-        """
-
-    @classmethod
     def required_call_channel(cls, tokenizer) -> RequiredChannel | None:
         """What a request that must call a tool holds the output to, in this
         format's token ids; None leaves it unconstrained.
 
-        Public hook, kept for formats and callers that override it: the default
-        compiles `channel_rule()` through the common `ConstraintParser`.
-        Derived once per server, where the parser is resolved
-        (`registry.required_call_channel`).
+        None for every format but Kimi-K3, whose answer either closes the
+        message or opens the tools channel at one token -- the place a model
+        told it MUST call a tool still sometimes ends instead.
         """
-        return ConstraintParser.parse(cls.channel_rule(), tokenizer)
+        return None
 
     @classmethod
-    def tool_grammar_rule(cls, functions, *, required, starts_in_reasoning):
-        """Declare a Lark (llguidance) grammar for the rest of the assistant
-        message as a `ToolGrammarRule`, or None to leave the output
-        unconstrained. Arguments are those of `tool_call_grammar`."""
-        return
-
-    @classmethod
-    def tool_call_grammar(cls, functions, *, required, starts_in_reasoning):
+    def tool_call_grammar(
+        cls, functions: list[dict], *, required: bool, starts_in_reasoning: bool
+    ) -> str | None:
         """A Lark (llguidance) grammar for the rest of the assistant message
         that holds this format's calls to ``functions``; None leaves the output
         unconstrained.
@@ -397,16 +378,8 @@ class ToolCallParser(ABC):
         request that declares tools and no response format when
         ATOM_TOOL_CALL_GRAMMAR=1 (`structured_output.validation.
         configure_tool_call_grammar`). None for every format but Kimi-K3.
-
-        Public hook, kept for formats and callers that override it: the default
-        compiles `tool_grammar_rule(...)` through the common `ConstraintParser`.
         """
-        return ConstraintParser.parse(
-            cls.tool_grammar_rule(
-                functions, required=required, starts_in_reasoning=starts_in_reasoning
-            ),
-            None,
-        )
+        return None
 
     @classmethod
     def opens_region(cls, marker: str) -> bool:
