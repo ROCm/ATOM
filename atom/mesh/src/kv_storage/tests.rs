@@ -292,25 +292,75 @@ async fn chain_check_gates_sources_and_readers() {
     }
 
     let status = hub.status();
-    assert_eq!(status.len(), 2);
-    assert_eq!(status[0].id, "atom-mooncake-b3fd64e0");
-    assert_eq!(status[0].chain_check, ChainCheck::Passed);
+    let ids: Vec<&str> = status.iter().map(|source| source.id.as_str()).collect();
+    let checks: Vec<ChainCheck> = status.iter().map(|source| source.chain_check).collect();
+    // The worker whose rule differs reads a store of its own, unreadable to the router.
+    let failed = "atom-mooncake-b3fd64e0-2";
+    assert_eq!(
+        ids,
+        ["atom-mooncake-b3fd64e0", failed, "atom-mooncake-01234567"]
+    );
+    use ChainCheck::*;
+    assert_eq!(checks, [Passed, Failed, NotReported]);
     let endpoints = ["http://10.0.0.1:9003", "http://10.0.0.3:9003"];
     assert_eq!(status[0].endpoints, endpoints);
     assert_eq!(status[0].readers, [workers[0].url(), workers[1].url()]);
-    assert_eq!(status[1].id, "atom-mooncake-01234567");
-    assert_eq!(status[1].chain_check, ChainCheck::NotReported);
-    assert_eq!(hub.reader(workers[2].url()), ReaderInfo::default());
-    let source = SourceId(status[0].id.as_str().into());
-    let reader = ReaderInfo {
-        sources: vec![source.clone()],
-        load_path: Some(LoadPath::Storage(source)),
+    let reads = |id: &str| {
+        let source = SourceId(id.into());
+        ReaderInfo {
+            sources: vec![source.clone()],
+            load_path: Some(LoadPath::Storage(source)),
+        }
     };
-    assert_eq!(hub.reader(workers[1].url()), reader);
+    assert_eq!(hub.reader(workers[1].url()), reads(ids[0]));
+    assert_eq!(hub.reader(workers[2].url()), reads(failed));
+    let tokens: Vec<u32> = (0..24).collect();
+    let req = PrefixRequest::new("m", &tokens, Namespace::default());
+    let unreadable = StorageLookup::Unavailable(FailReason::Unreadable);
+    assert_eq!(hub.lookup_all(&req, &workers[2..3]).await[1].1, unreadable);
 
+    // Another model gets its own source; a worker registered again keeps only its new role.
+    hub.on_worker_added("http://e:8000", "other", Some(&passed))
+        .await;
+    hub.on_worker_added(workers[2].url(), "m", None).await;
     hub.on_worker_removed(workers[0].url()).await;
     hub.on_worker_removed(workers[1].url()).await;
-    assert_eq!(hub.status().len(), 1);
+    let ids: Vec<String> = hub.status().into_iter().map(|source| source.id).collect();
+    assert_eq!(ids, ["atom-mooncake-01234567", "atom-mooncake-b3fd64e0-3"]);
+}
+
+#[tokio::test]
+async fn umbp_without_a_master_leaves_lower_unknown_and_multimodal_requests_skip() {
+    let tokens: Vec<u32> = (0..24).collect();
+    let workers = workers(&["a", "b"]);
+    let (store, hub) = reading(pools(&tokens, "MM"), KvStorageConfig::default()).await;
+    let umbp = OffloadReport {
+        backend: OffloadBackend::UmbpStore,
+        masters: Vec::new(),
+        ..report("atomumbp1-0123456789abcdef01234567", None)
+    };
+    hub.on_worker_added(workers[1].url(), "m", Some(&umbp))
+        .await;
+    let hub = Arc::new(hub);
+    let provider = WithStorage::new(IndexProvider::new(Duration::from_secs(60), 4), hub.clone());
+    let mut req = PrefixRequest::new("m", &tokens, Namespace::default());
+    req.set_storage(hub.lookup_all(&req, &workers).await);
+    let umbp = SourceId("atom-umbp-01234567".into());
+    let unknown = CacheHit {
+        tokens: [0; 4],
+        lower: LowerHit::Unknown(umbp.clone()),
+        source: HitSource::Storage,
+        exact: false,
+    };
+    assert_eq!(provider.match_workers(&req, &workers)[1], Some(unknown));
+    let status = &hub.status()[1];
+    assert_eq!((status.id.as_str(), status.endpoints.len()), (&*umbp.0, 0));
+
+    req.multimodal = true;
+    let skipped = StorageLookup::Skipped(GateReason::Multimodal);
+    let lookups = hub.lookup_all(&req, &workers).await;
+    assert!(lookups.iter().all(|(_, lookup)| *lookup == skipped));
+    assert_eq!(store.queries(), 1);
 }
 
 #[tokio::test(start_paused = true)]
