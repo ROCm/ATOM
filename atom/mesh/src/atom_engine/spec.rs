@@ -1,8 +1,8 @@
 //! `EngineSpec`: everything Python hands Rust once at launch, as JSON.
 //!
 //! Built by the Python launcher that spawns the Cores; after it is parsed Rust
-//! never calls back into Python. Fields added later default, so an older
-//! spec still parses.
+//! never calls back into Python. Every field is required; fields the spec
+//! does not know are ignored.
 
 use serde::Deserialize;
 

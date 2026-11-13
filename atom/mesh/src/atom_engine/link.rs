@@ -93,7 +93,7 @@ impl Peer {
 }
 
 /// One whole multipart, frames kept as ZMQ messages.
-pub fn recv_frames(socket: &zmq::Socket) -> zmq::Result<Vec<zmq::Message>> {
+pub(crate) fn recv_frames(socket: &zmq::Socket) -> zmq::Result<Vec<zmq::Message>> {
     let mut frames = vec![socket.recv_msg(0)?];
     while socket.get_rcvmore()? {
         frames.push(socket.recv_msg(0)?);
@@ -103,7 +103,7 @@ pub fn recv_frames(socket: &zmq::Socket) -> zmq::Result<Vec<zmq::Message>> {
 
 /// Whether `pid` is still a running process (not gone, not a zombie). Reads
 /// `/proc`, so Linux only, as the EngineCores are.
-pub fn process_alive(pid: u32) -> bool {
+pub(crate) fn process_alive(pid: u32) -> bool {
     std::fs::read_to_string(format!("/proc/{pid}/stat"))
         .ok()
         .and_then(|stat| {

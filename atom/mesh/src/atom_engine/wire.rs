@@ -55,10 +55,12 @@ impl Inbound {
     /// The bytes `r` names; an absent ref is an empty buffer.
     fn buffer(&self, r: Option<&pb::BufferRef>) -> Result<&[u8], String> {
         let Some(r) = r else { return Ok(&[]) };
+        if r.frame == 0 {
+            return Err("buffer refers to frame 0, which is the envelope".into());
+        }
         let frame = self
             .frames
             .get(r.frame as usize)
-            .filter(|_| r.frame >= 1)
             .ok_or_else(|| format!("buffer refers to missing frame {}", r.frame))?;
         let start = r.offset as usize;
         let end = start

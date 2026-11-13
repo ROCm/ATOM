@@ -1,6 +1,6 @@
 //! The wire framing, the launch spec and one Core's link: a message decodes
 //! back with its buffers and a malformed one is refused, `EngineSpec` parses
-//! what the Python launcher writes, and a `CoreLink` handshakes with a fake
+//! a hand-written spec, and a `CoreLink` handshakes with a fake
 //! Core on real ipc sockets and routes input and control to it.
 
 use std::thread;
@@ -87,7 +87,8 @@ fn a_malformed_message_or_an_out_of_bounds_ref_is_refused() {
     ])
     .unwrap();
     // Frame 0 is the envelope, never a buffer.
-    assert!(message.tokens(buffer(0, 0, 4).as_ref()).is_err());
+    let err = message.tokens(buffer(0, 0, 4).as_ref()).err().unwrap();
+    assert!(err.contains("envelope"), "{err}");
     assert!(message.tokens(buffer(1, 4, 8).as_ref()).is_err());
     // Within the frame, but not a whole number of elements.
     assert!(message.tokens(buffer(1, 0, 6).as_ref()).is_err());
