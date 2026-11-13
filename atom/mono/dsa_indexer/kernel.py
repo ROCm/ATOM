@@ -15,10 +15,12 @@ numbers, and ``plan.unsupported`` the shapes this kernel is not written for).
     k       (a token, on its owner rank only: slot >= 0) the original's
             LayerNorm -> bf16 (-> RoPE -> bf16) -> per-token power-of-two FP8
             -> the index cache row (preshuffled, ``plan.cache_byte``) and its
-            scale, KDONE
+            scale; FP4: a 32-dim group's E8M0 and E2M1 bytes into the cache's
+            two planes (``plan.fp4_byte`` / ``fp4_scale_byte``), KDONE
     iquant  (a (token, head), wave 0): the head's row groups (QRDY) (-> RoPE
             -> bf16) -> per-(token, head) FP8 q and its head weight (w q_scale
-            weights_scale) -> IQ8 / IW (the scorer's operands), QQ
+            weights_scale), FP4 E2M1 q, its E8M0 and the raw weight -> IQ8 / IW
+            (the scorer's operands), QQ
     score   (a long row's unit of 128 local keys, every CTA): ``select``
     select  (a long row's segments): its distributed selection (``select``)
     row     (a row, CTA 255 - r): a short row's every key; replicated, a long
@@ -40,6 +42,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import Int32, Int64, T
 
+from atom.model_ops.sparse_indexer_fp4 import FP4_QUANT_BLOCK_SIZE
 from atom.mono.device import gemv
 from atom.mono.device.mx import FP8_MAX, clamp_fp8
 from atom.mono.device.ops import (
@@ -68,7 +71,11 @@ from atom.mono.dsa_indexer.plan import (
     REPLICA_INTERLEAVE,
     IndexerShape,
     cache_byte,
+    fp4_byte,
+    fp4_scale_byte,
     local_len,
+    q_fp4_byte,
+    q_fp4_scale,
     scale_byte,
     unsupported,
 )
@@ -190,6 +197,9 @@ ABI = KernelAbi(
         "cs_ld",
         "maxpos",
         "cache",
+        # FP4: the index cache's E8M0 plane (``IndexerShape.scale_block_bytes``
+        # a block); FP8 passes 0
+        "cache_scale",
         "ctx",
         # a query token's request (``batch_id_per_q_token``; a verify's only:
         # a plain decode's token r is request r), its block table row and ctx
@@ -362,6 +372,96 @@ def _rope_q(c, t, lane, x0, x1):
     return fx.Float32(rope.select(y0, x0)), fx.Float32(rope.select(y1, x1))
 
 
+# ---------------------------------------------------------------- fp4
+# The FP4 writer's (``indexer_qk_rope_quant_and_cache``) arithmetic: its RoPE's
+# one fma a dim, its 32-dim E8M0 (amax floored at 6 * 2^-126, times fp32 1 / 6,
+# the exponent rounded up) and its E2M1 conversion (``v_cvt_scalef32_pk_fp4``).
+FP4_AMAX_FLOOR = 0x01C00000
+FP4_RCP_MAX = 0x3E2AAAAB
+
+
+def _rotate_fma(v, partner, cs, lead):
+    """``_rotate`` as the FP4 writer computes it: fma(v, c, -+ p s), p s rounded."""
+    cos_v, sin_v = cs
+    ps = partner * sin_v
+    lo = fx.Float32(fmath.fma(v, cos_v, -ps))
+    hi = fx.Float32(fmath.fma(v, cos_v, ps))
+    if isinstance(lead, bool):
+        return bf16_round(lo if lead else hi)
+    return bf16_round(fx.Float32(lead.select(lo, hi)))
+
+
+def fp4_code(amax):
+    """The E8M0 code of a 32-dim group's scale."""
+    a = fx.max(amax, fx.Int32(FP4_AMAX_FLOOR).bitcast(fx.Float32))
+    bits = (a * fx.Int32(FP4_RCP_MAX).bitcast(fx.Float32)).bitcast(fx.Int32)
+    e = (bits >> 23) & 0xFF
+    up = (e != 0xFF) & ((bits & 0x7FFFFF) != 0)
+    return e + up.select(fx.Int32(1), fx.Int32(0))
+
+
+def fp4_pair(lo, hi, code):
+    """Dims ``lo`` (low nibble) and ``hi`` as one E2M1 byte at scale ``code``."""
+    scale = (code << 23).bitcast(fx.Float32)
+    return (
+        fx.Int32(fx.rocdl.cvt_scalef32_pk_fp4_f32(T.i32, fx.Int32(0), lo, hi, scale, 0))
+        & 0xFF
+    )
+
+
+@traced
+def _stage_k_fp4(c, t):
+    """``stage_k`` into an FP4 cache (lane l: dims l and 64 + l): the FP4
+    writer's LayerNorm (each half of the dims reduced over the wave, then
+    added; eps through an fma), its RoPE on dims 0 .. 63, a 32-dim group's
+    E8M0 and E2M1 bytes (even dim low), into the cache's two planes."""
+    lane, wave = c["lane"], c["wave"]
+    a = c["args"]
+    slot = fx.Int32(bo.buffer_load(rsrc(a["slots"]), 2 * t, vec_width=1, dtype=T.i32))
+    if (wave == 0) & (slot >= 0):
+        dims = [lane, lane + 64]
+        x = [ld_f32(a["kp"], t * a["kw_ld"] + d, T.bf16) for d in dims]
+        g = [ld_f32(a["kn_w"], d) for d in dims]
+        b = [ld_f32(a["kn_b"], d) for d in dims]
+        _write_k_fp4(c, t, slot, x, g, b)
+    publish(c["put"], c["kdone"], t, fx.Int32(1), (c["tid"] == 0) & (slot >= 0))
+
+
+@traced
+def _write_k_fp4(c, t, slot, x, g, b):
+    lane, sh = c["lane"], c["shape"]
+    a = c["args"]
+    half = fx.Float32(1.0 / sh.head_dim)
+    offs = (1, 2, 4, 8, 16, 32)
+    mean = (butterfly(x[0], offs) + butterfly(x[1], offs)) * half
+    cs = [v - mean for v in x]
+    ss = butterfly(cs[0] * cs[0], offs) + butterfly(cs[1] * cs[1], offs)
+    r = hw_rsq(fx.Float32(fmath.fma(ss, half, fx.Float32(LN_EPS))))
+    y = [bf16_round(fx.Float32(fmath.fma(cs[i] * r, g[i], b[i]))) for i in range(2)]
+    y[0] = _rotate_fma(y[0], xshfl(y[0], 1), _rope_cs(c, t, lane // 2), lane % 2 == 0)
+    codes = [fp4_code(butterfly(abs(v), (1, 2, 4, 8, 16), fx.max)) for v in y]
+    pairs = [fp4_pair(v, xshfl(v, 1), code) for v, code in zip(y, codes)]
+    blk = slot // sh.block_rows
+    row = slot % sh.block_rows
+    base = rsrc(a["cache"] + fx.Int64(blk) * fx.Int64(sh.block_bytes))
+    sbase = rsrc(a["cache_scale"] + fx.Int64(blk) * fx.Int64(sh.scale_block_bytes))
+    for i in range_constexpr(2):
+        if lane % 2 == 0:
+            bo.buffer_store(
+                fx.Int8(pairs[i]),
+                base,
+                fp4_byte(sh, row, lane + 64 * i),
+                cache_modifier=CM_DEV,
+            )
+        if lane % FP4_QUANT_BLOCK_SIZE == 0:
+            bo.buffer_store(
+                fx.Int8(codes[i]),
+                sbase,
+                fp4_scale_byte(sh, row, lane // FP4_QUANT_BLOCK_SIZE + 2 * i),
+                cache_modifier=CM_DEV,
+            )
+
+
 # ---------------------------------------------------------------- k
 @traced
 def stage_k(c, t):
@@ -370,7 +470,11 @@ def stage_k(c, t):
     2^ceil(log2(amax / 448)) -> FP8 -> the cache row and its scale. The NoPE
     writer's LayerNorm (``nope.py``): mul / add unfused, the affine params
     through bf16; the fused RoPE writer's: fp32 params, scale and shift one
-    fma (its default contraction), then the rotation (dims 0 .. 63)."""
+    fma (its default contraction), then the rotation (dims 0 .. 63). An FP4
+    cache: ``_stage_k_fp4``."""
+    if const_expr(c["shape"].fp4):
+        _stage_k_fp4(c, t)
+        return
     lane, wave, sh = c["lane"], c["wave"], c["shape"]
     a = c["args"]
     slot = fx.Int32(bo.buffer_load(rsrc(a["slots"]), 2 * t, vec_width=1, dtype=T.i32))
@@ -430,7 +534,7 @@ def stage_iquant(c, bid, tokens):
     (``WAVES`` a round): every one is head bid % heads (BLOCKS a multiple of
     heads), so that head's row-group flags are polled once. A task is the
     original's per-(token, head) FP8 quant and the head weight folded with its
-    scale; each round's flags go out together."""
+    scale (FP4: ``_iquant_fp4``); each round's flags go out together."""
     tid, lane, wave, sh = c["tid"], c["lane"], c["wave"], c["shape"]
     assert BLOCKS % sh.heads == 0
     n = tokens * sh.heads
@@ -459,6 +563,9 @@ def iquant_task(c, task, lane):
         )
     )
     x0, x1 = bf2_f32(qw)
+    if const_expr(sh.fp4):
+        _iquant_fp4(c, t, h, lane, x0, x1)
+        return
     if const_expr(sh.rope_dim):
         x0, x1 = _rope_q(c, t, lane, x0, x1)
     amax = butterfly(
@@ -482,6 +589,43 @@ def iquant_task(c, task, lane):
         w = ld_f32(a["wp"], t * a["kw_ld"] + h, T.bf16)
         bo.buffer_store(
             (w * scale) * fx.Float32(sh.weights_scale),
+            rsrc(c["iw"]),
+            t * sh.heads + h,
+            cache_modifier=CM_DEV,
+        )
+
+
+@traced
+def _iquant_fp4(c, t, h, lane, x0, x1):
+    """FP4: the writer's q (lane l: dims 2 l, 2 l + 1): its RoPE on the pairs
+    of dims 0 .. 63, a 32-dim group's (16 lanes') E8M0 and E2M1 byte, to IQ8
+    as ``q_fp4_byte`` / ``q_fp4_scale``; the head weight raw (the scorer's
+    2 relu folds the writer's weight_scale / 2 in)."""
+    a, sh = c["args"], c["shape"]
+    half = sh.rope_dim // 2
+    cs = _rope_cs(c, t, fx.min(lane, fx.Int32(half - 1)))
+    rope = lane < half
+    y0, y1 = _rotate_fma(x0, x1, cs, True), _rotate_fma(x1, x0, cs, False)
+    x0, x1 = fx.Float32(rope.select(y0, x0)), fx.Float32(rope.select(y1, x1))
+    code = fp4_code(butterfly(fx.max(abs(x0), abs(x1)), (1, 2, 4, 8), fx.max))
+    iq = rsrc(c["iq8"])
+    bo.buffer_store(
+        fx.Int8(fp4_pair(x0, x1, code)),
+        iq,
+        q_fp4_byte(sh, t, h, 2 * lane),
+        cache_modifier=CM_DEV,
+    )
+    if lane % (FP4_QUANT_BLOCK_SIZE // 2) == 0:
+        bo.buffer_store(
+            fx.Int8(code),
+            iq,
+            q_fp4_scale(sh, t, h, lane // (FP4_QUANT_BLOCK_SIZE // 2)),
+            cache_modifier=CM_DEV,
+        )
+    if lane == 0:
+        w = ld_f32(a["wp"], t * a["kw_ld"] + h, T.bf16)
+        bo.buffer_store(
+            w * fx.Float32(sh.weights_scale / 2),
             rsrc(c["iw"]),
             t * sh.heads + h,
             cache_modifier=CM_DEV,
@@ -550,6 +694,7 @@ def build(key: IxBuild):
         cs_ld: Int32,
         maxpos: Int32,
         cache: Int64,
+        cache_scale: Int64,
         ctx: Int64,
         bids: Int64,
         bt: Int64,
@@ -636,6 +781,7 @@ def build(key: IxBuild):
                 "cs_ld": cs_ld,
                 "maxpos": maxpos,
                 "cache": cache,
+                "cache_scale": cache_scale,
                 "ctx": ctx,
                 "bids": bids,
                 "bt": bt,
@@ -721,6 +867,7 @@ def build(key: IxBuild):
         cs_ld: Int32,
         maxpos: Int32,
         cache: Int64,
+        cache_scale: Int64,
         ctx: Int64,
         bids: Int64,
         bt: Int64,
@@ -754,6 +901,7 @@ def build(key: IxBuild):
             cs_ld,
             maxpos,
             cache,
+            cache_scale,
             ctx,
             bids,
             bt,

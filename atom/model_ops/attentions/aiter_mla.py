@@ -3405,6 +3405,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             counts["index_mtp_row_ends"] = tokens
         return counts
 
+    def publish_capture_layout(self, bs: int, max_seqlen_q: int) -> None:
+        super().publish_capture_layout(bs, max_seqlen_q)
+        if self.is_sparse:
+            # The warmup MLA reads one selected key a row; an indexer writes
+            # only a row's context, which leaves a verify's early rows empty.
+            self._sparse_kv_indices_gpu[: bs * max_seqlen_q].zero_()
+
     def build_for_cudagraph_capture(
         self, bs: int, *, decode_ubatch_slices=None
     ) -> AttentionMetaData:

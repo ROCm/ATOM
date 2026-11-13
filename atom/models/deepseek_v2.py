@@ -1271,6 +1271,8 @@ class DeepseekV32IndexerCache(nn.Module):
         self.prefix = prefix
         self.cache_config = cache_config
         self.dtype = dtype
+        # an FP4 cache's E8M0 plane, bound beside kv_cache
+        self.kv_cache_scale: torch.Tensor | None = None
 
 
 def _dequant_fp8_block_to_bf16(
