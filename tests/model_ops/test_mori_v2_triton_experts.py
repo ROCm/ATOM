@@ -289,7 +289,6 @@ def _forward(monkeypatch, mega, context):
     monkeypatch.setattr(
         mv2, "get_forward_context", lambda: SimpleNamespace(context=context)
     )
-    monkeypatch.setattr(mv2, "get_dp_group", lambda: SimpleNamespace(world_size=2))
     prepare_finalize = SimpleNamespace(mega=mega, num_dispatchers=lambda: WORLD)
     kernel = mv2.MoriV2ModularKernel(prepare_finalize)
     experts = {
@@ -322,15 +321,64 @@ def test_decode_step_reaches_triton_mega_moe(monkeypatch):
         running_tokens_are_unified=True,
     )
     (call,) = _forward(monkeypatch, _mega(), context)
-    # What the group sent, below the arena's WORLD * MAX_TOKENS rows.
-    assert call["recv_token_bound"] == 14
-    assert call["m_eff"] == 4 * 2
+    # The Triton fallback uses the same MORI dispatch and exact device-side
+    # live count as the default experts; neither host trim applies.
+    assert call["recv_token_bound"] is None
+    assert call["m_eff"] is None
     assert call["n_local_experts"] == EPR
 
 
 def test_no_context_keeps_the_full_arena(monkeypatch):
     (call,) = _forward(monkeypatch, _mega(), None)
     assert call["recv_token_bound"] is None and call["m_eff"] is None
+
+
+@pytest.mark.parametrize(
+    "dispatch,expected_bound",
+    [(DispatchKind.MORI, None), (DispatchKind.COMPACT, 14)],
+)
+def test_default_mega_recv_bound_follows_dispatch_contract(
+    monkeypatch, dispatch, expected_bound
+):
+    calls = []
+
+    class DefaultMega:
+        max_tokens_per_rank = MAX_TOKENS
+        recipe = SimpleNamespace(
+            dispatch=dispatch,
+            combine=CombineKind.FUSED_SCATTER,
+        )
+
+        def __call__(self, hidden_states, _weights, _ids, **kwargs):
+            calls.append(kwargs)
+            return hidden_states
+
+    context = SimpleNamespace(running_tokens_across_dp=[3, 5, 2, 4])
+    monkeypatch.setattr(
+        mv2, "get_forward_context", lambda: SimpleNamespace(context=context)
+    )
+    monkeypatch.setattr(
+        mv2.MoriV2ModularKernel, "_assert_recipe_matches", lambda *_args: None
+    )
+    prepare_finalize = SimpleNamespace(
+        mega=DefaultMega(),
+        num_dispatchers=lambda: WORLD,
+        combine_wire_for_step=lambda: "bf16",
+    )
+    kernel = mv2.MoriV2ModularKernel(prepare_finalize)
+    hidden = torch.zeros(TOKENS, 8)
+    out = kernel.forward(
+        hidden,
+        torch.zeros(EPR, 8, 8),
+        torch.zeros(EPR, 8, 8),
+        torch.zeros(TOKENS, TOPK),
+        torch.zeros(TOKENS, TOPK, dtype=torch.int32),
+    )
+
+    assert out is hidden
+    # Mori v2 may deliver more rows than the host's v1-derived 14. Compact
+    # dispatch owns a different row contract and retains that original bound.
+    assert calls[0]["recv_token_bound"] == expected_bound
 
 
 @pytest.mark.parametrize(
