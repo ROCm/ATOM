@@ -186,10 +186,21 @@ jobs:
           ATOM_BOT_LOGIN: ${{ vars.ATOM_BOT_LOGIN }}
         if: env.ATOM_BOT_TOKEN != ''
         run: |
-          curl -s -X POST -H "Authorization: token $ATOM_BOT_TOKEN" \
+          # The 👀 is cosmetic, so this step must never fail the job -- but it must not
+          # report success for a reaction that was never added either. `>/dev/null || true`
+          # did both: the first live run on ATOM logged a green claim step and left no
+          # reaction on the comment. Print the status instead; a 4xx here is the earliest
+          # visible sign that the token cannot act on this repo, which is the same root
+          # cause that will silently break the card and the failure notice further down.
+          code=$(curl -s -o /tmp/eyes.json -w '%{http_code}' \
+            -X POST -H "Authorization: token $ATOM_BOT_TOKEN" \
             -H 'Accept: application/vnd.github+json' \
             "https://api.github.com/repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
-            -d '{"content":"eyes"}' >/dev/null || true
+            -d '{"content":"eyes"}' || echo 000)
+          case "$code" in
+            2*) echo "claimed 👀 (HTTP $code)" ;;
+            *)  echo "::warning title=atom-review-bot::could not claim 👀 as the bot (HTTP $code): $(head -c 300 /tmp/eyes.json 2>/dev/null)" ;;
+          esac
 
       - name: Review (headless GLM)
         id: review
