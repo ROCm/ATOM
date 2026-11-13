@@ -20,7 +20,6 @@ import threading
 import time
 
 import torch
-from torch import nn
 
 from atom.model_engine.model_runner import ModelRunner
 from atom.model_loader.loader import load_model
@@ -46,7 +45,11 @@ from atom.model_loader.weight_cache.transport import (
     gpu_identity,
     socket_path,
 )
-from atom.model_loader.weight_cache.values import _TAG, _entries, logger
+from atom.model_loader.weight_cache.values import (
+    _TAG,
+    logger,
+    release_digest_buffers,
+)
 from atom.utils import envs
 
 
@@ -136,6 +139,27 @@ def _engine_config(engine_args):
     return config
 
 
+def _groups_without_device_communicators() -> None:
+    """Build this process's parallel groups (their ranks decide what each GPU
+    loads) without device communicators. Loading runs no device collectives,
+    and RCCL plus the custom and quick all-reduce buffers take about 9 GiB
+    per GPU at creation, about 3 GiB of which stays behind after teardown.
+    (A collective would fall back to torch.distributed.)"""
+    import inspect
+
+    from aiter.dist import parallel_state
+
+    make = parallel_state.init_model_parallel_group
+    signature = inspect.signature(make)
+
+    def init_model_parallel_group(*args, **kwargs):
+        bound = signature.bind(*args, **kwargs)
+        bound.arguments["use_device_communicator"] = False
+        return make(*bound.args, **bound.kwargs)
+
+    parallel_state.init_model_parallel_group = init_model_parallel_group
+
+
 def _serve_rank(rank: int, config, ready) -> None:
     """One GPU's daemon process: the setup an engine's worker does, then the
     runner, which loads and serves; then wait to be stopped."""
@@ -149,6 +173,7 @@ def _serve_rank(rank: int, config, ready) -> None:
     tune_gc()
     with contextlib.suppress(Exception):  # locality only, as in the engine's workers
         numa_bind_to_node(local_device_index(config, rank), f"weight cache rank {rank}")
+    _groups_without_device_communicators()
     runner = WeightCacheDaemonRunner(rank, config)
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
@@ -280,25 +305,10 @@ class WeightCacheDaemonRunner(ModelRunner):
         logger.info(f"{_TAG} rank {self.rank}: stopped serving")
 
     def _release_serving_state(self, export: dict) -> None:
-        """Everything but the weights is a client's KV cache lost: drop the
-        communicators and runner buffers that only serving needs."""
+        """Everything but the weights is a client's KV cache lost: free all
+        other device memory this process holds."""
         from aiter import destroy_dist_env
 
-        # Tensors the clients build for themselves (unchanged buffers such
-        # as RoPE caches) need no device memory here.
-        shared = export["storages"]
-        for _, obj, kind, k, v in _entries(self.model):
-            if (
-                kind != "param"
-                and isinstance(v, torch.Tensor)
-                and not isinstance(v, nn.Parameter)
-                and v.is_cuda
-                and v.untyped_storage().data_ptr() not in shared
-            ):
-                if kind == "buffer":
-                    obj._buffers[k] = v.to("meta")
-                else:
-                    vars(obj)[k] = v.to("meta")
         with contextlib.suppress(Exception):
             destroy_dist_env()
         if torch.distributed.is_initialized():
@@ -312,16 +322,29 @@ class WeightCacheDaemonRunner(ModelRunner):
         ):
             if hasattr(self, name):
                 setattr(self, name, None)
+        release_digest_buffers()
         gc.collect()
+        # The daemon runs nothing on the GPU but digests of what it exports,
+        # so every other storage still alive (tensors the clients build for
+        # themselves, such as RoPE tables, wherever they are held) can go.
+        shared = export["storages"]
+        for obj in gc.get_objects():
+            with contextlib.suppress(Exception):
+                if isinstance(obj, torch.Tensor) and obj.is_cuda:
+                    storage = obj.untyped_storage()
+                    if storage.nbytes() and storage.data_ptr() not in shared:
+                        storage.resize_(0)
         torch.cuda.empty_cache()
         # Pinned staging buffers from loading stay cached in host memory.
         with contextlib.suppress(Exception):
             torch._C._host_emptyCache()
         free, total = torch.cuda.mem_get_info(self.device)
         gib, weights = 1 << 30, export["bytes"]
+        reserved = torch.cuda.memory_reserved()
         logger.info(
-            f"{_TAG} rank {self.rank}: after releasing serving state: device memory used "
-            f"{(total - free) / gib:.2f} GiB, weights {weights / gib:.2f} GiB, other allocated "
-            f"{(torch.cuda.memory_allocated() - weights) / gib:.2f} GiB, allocator reserved-but-free "
-            f"{(torch.cuda.memory_reserved() - torch.cuda.memory_allocated()) / gib:.2f} GiB"
+            f"{_TAG} rank {self.rank}: device memory used {(total - free) / gib:.2f} GiB: "
+            f"weights {weights / gib:.2f}, other allocated "
+            f"{(torch.cuda.memory_allocated() - weights) / gib:.2f}, allocator reserved-but-free "
+            f"{(reserved - torch.cuda.memory_allocated()) / gib:.2f}, outside the allocator "
+            f"{(total - free - reserved) / gib:.2f}"
         )
