@@ -52,7 +52,15 @@ from atom.models.kimi_k3.mono.kernels.stages.moe_layout import (
 )
 from atom.models.kimi_k3.mono.sources import SOURCES
 from atom.mono.device import queue as task_queue
-from atom.mono.device.ops import CM_DEV, ld_dev, rsrc, st_dev, traced, uniform
+from atom.mono.device.ops import (
+    CM_DEV,
+    ld_dev,
+    readlane,
+    rsrc,
+    st_dev,
+    traced,
+    uniform,
+)
 from atom.mono.plan.architecture import GFX1250
 
 THREADS = 256
@@ -200,6 +208,17 @@ def _weight_operand(stage, wave, lane, step, group_bytes=GROUP_TILE_BYTES):
     return fx.Vector.from_elements(parts, fx.Int32)
 
 
+def _situ(accumulator):
+    """AITER's SiTUv2 of a wave's 32x16 gate|up accumulator: its lane's 8
+    intermediates (each a GUGU pair of the 16)."""
+    consts = situv2_consts(fx.Float32(SITU_BETA), fx.Float32(SITU_LINEAR_BETA))
+    return batched_situv2(
+        [(accumulator[2 * e], accumulator[2 * e + 1]) for e in range(8)],
+        consts=consts,
+        range_constexpr=range_constexpr,
+    )
+
+
 @traced
 def _epilogue(
     lds,
@@ -213,26 +232,24 @@ def _epilogue(
     lane,
     in_row=False,
     pairs=TASK_ROWS // 64,
+    activated=False,
 ):
     """One MXFP4 block (waves 2 ``pair``, + 1: 64 GUGU rows) of M tile
     ``tile``: AITER's SiTUv2, the block's E8M0 scale, its FP4 words at each
     pick. A lane holds rows 8 (lane / 16) .. + 8 and 16 + those of a 32-row
     tile, its token's: the lanes of a pick hold 16 intermediates each.
     ``in_row``: a pick's row ``INTER_ROW_WORDS`` wide with its codes past the
-    FP4 words, stored at device scope for another CTA's down."""
+    FP4 words, stored at device scope for another CTA's down. ``activated``:
+    the waves left their ``_situ`` in ``red`` (8 a lane), not accumulators."""
     red = lds["red"]
-    consts = situv2_consts(fx.Float32(SITU_BETA), fx.Float32(SITU_LINEAR_BETA))
     logical = []
     for half in range_constexpr(2):
         slot = (2 * pair + half) * GFX1250.wave_size + lane
-        physical = [fx.ptr_load(red + slot * 16 + e) for e in range_constexpr(16)]
-        logical.append(
-            batched_situv2(
-                [(physical[2 * e], physical[2 * e + 1]) for e in range(8)],
-                consts=consts,
-                range_constexpr=range_constexpr,
-            )
-        )
+        if const_expr(activated):
+            logical.append([fx.ptr_load(red + slot * 8 + e) for e in range(8)])
+        else:
+            physical = [fx.ptr_load(red + slot * 16 + e) for e in range(16)]
+            logical.append(_situ(physical))
     peer = [[v.shuffle_xor(16, GFX1250.wave_size) for v in half] for half in logical]
     lower = logical[0][:4] + peer[0][:4] + logical[1][:4] + peer[1][:4]
     upper = peer[0][4:] + logical[0][4:] + peer[1][4:] + logical[1][4:]
@@ -706,6 +723,10 @@ assert GROUPS * GROUP_DOWN_BYTES == SLOT_BYTES
 # their own): a gate/up K tile's 6 row groups x 4 K steps x 32 rows, a down
 # tile's 8 x 3 x 32 -- 3 KB either way, read where a lane's row is.
 SCALE_WORDS = 768
+# The TDM copies' waves: a gate/up K tile's rows are waves 0..5's, so its two
+# copies leave their path (a down tile's rows are every wave's).
+WEIGHT_ISSUER = WAVES - 2
+SCALE_ISSUER = WAVES - 1
 assert UP_WAVES * STEPS * 32 == DOWN_STEPS * 8 * 32 == SCALE_WORDS
 FLAG_WORDS = UP_BLOCKS
 # A gate/up task's and a down tile's weight bytes, in 16 KB units: what the
@@ -814,7 +835,7 @@ def _down_share(union, bid, ups):
     return first, last - first
 
 
-def build_moe(rows: int, profile: bool = False) -> MoeKernel:
+def build_moe(rows: int, profile: bool = False, publish_at: int = 1) -> MoeKernel:
     """The routed experts of ``rows`` tokens in one resident 256-CTA launch,
     with no grid barrier and no queue: every CTA works out the same static,
     byte-balanced plan -- its gate/up tasks (an expert's 192 rows, each pick's
@@ -833,7 +854,7 @@ def build_moe(rows: int, profile: bool = False) -> MoeKernel:
     lds_bytes = 4 * (
         RING * (SLOT_BYTES // 4 + SCALE_WORDS)
         + rows * (LATENT_LDS_WORDS + LATENT_SCALES // 4)
-        + UP_WAVES * GFX1250.wave_size * 16
+        + UP_WAVES * GFX1250.wave_size * 8
         + 2 * EXPERTS
         + 4 * routes
         + WAVES
@@ -852,7 +873,7 @@ def build_moe(rows: int, profile: bool = False) -> MoeKernel:
         item_scales: fx.Array[fx.Int32, ring * SCALE_WORDS, 16]
         latq: fx.Array[fx.Int32, rows * LATENT_LDS_WORDS, 16]
         latsc: fx.Array[fx.Int32, rows * LATENT_SCALES // 4, 16]
-        red: fx.Array[fx.Float32, UP_WAVES * GFX1250.wave_size * 16, 16]
+        red: fx.Array[fx.Float32, UP_WAVES * GFX1250.wave_size * 8, 16]
         count: fx.Array[fx.Int32, EXPERTS, 16]
         slot: fx.Array[fx.Int32, EXPERTS, 16]
         expert: fx.Array[fx.Int32, routes, 16]
@@ -861,7 +882,7 @@ def build_moe(rows: int, profile: bool = False) -> MoeKernel:
         picks: fx.Array[fx.Int32, routes, 16]
         scan: fx.Array[fx.Int32, WAVES, 16]
 
-    name = f"k3_gfx1250_moe_s{rows}" + ("_profile" if profile else "")
+    name = f"k3_gfx1250_moe_s{rows}_p{publish_at}" + ("_profile" if profile else "")
     sources = SOURCES
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
@@ -926,17 +947,27 @@ def build_moe(rows: int, profile: bool = False) -> MoeKernel:
             g = first_down + i
             return g // DOWN_TILES, g % DOWN_TILES
 
+        # The experts the CTA streams, a lane each, read where an item issues
+        # (no LDS round trip there): lane n < 8 its n-th gate/up task's,
+        # lane 8 + j the j-th slot of its down run's.
+        first_slot = first_down // DOWN_TILES
+        experts = fx.ptr_load(
+            lds["expert"]
+            + fx.min(
+                (lane < 8).select((bid + lane * 256) // blocks, first_slot + lane - 8),
+                union - 1,
+            )
+        )
+
         def issue(item, stage):
             buffer = smem.stages.ptr + stage * (SLOT_BYTES // 4)
             scale_buffer = smem.item_scales.ptr + stage * SCALE_WORDS
             if item < up_items:
                 n = item // k_tiles
                 task = bid + n * 256
-                expert = uniform(
-                    fx.ptr_load(lds["expert"] + fx.min(task // blocks, union - 1))
-                )
+                expert = readlane(experts, n)
                 group0 = expert * (2 * 384 // 16) + task % blocks * UP_GROUPS
-                if wave == 0:
+                if wave == WEIGHT_ISSUER:
                     gemv_tdm.load_rows(
                         w13
                         + fx.Int64(group0) * (LATENT * 8)
@@ -953,7 +984,7 @@ def build_moe(rows: int, profile: bool = False) -> MoeKernel:
                 # n32k4: (expert, 32-row group, K step, row) words; a task's
                 # row groups are 28 K steps (3584 bytes) apart.
                 row_group0 = expert * (2 * 384 // 32) + task % blocks * UP_WAVES
-                if wave == 1:
+                if wave == SCALE_ISSUER:
                     gemv_tdm.load_rows(
                         w13s
                         + fx.Int64(
@@ -971,8 +1002,8 @@ def build_moe(rows: int, profile: bool = False) -> MoeKernel:
                     )
             else:
                 slot, tile = down_tile(item - up_items)
-                expert = uniform(fx.ptr_load(lds["expert"] + slot))
-                if wave == 0:
+                expert = readlane(experts, 8 + slot - first_slot)
+                if wave == WEIGHT_ISSUER:
                     gemv_tdm.load_rows(
                         w2
                         + fx.Int64(expert * DOWN_TASKS + tile * GROUPS)
@@ -986,7 +1017,7 @@ def build_moe(rows: int, profile: bool = False) -> MoeKernel:
                         whole=True,
                         width=GROUP_DOWN_BYTES // 2,
                     )
-                if wave == 1:
+                if wave == SCALE_ISSUER:
                     gemv_tdm.load_rows(
                         w2s
                         + fx.Int64((expert * (LATENT // 32) + tile * 8) * DOWN_STEPS)
@@ -1041,11 +1072,11 @@ def build_moe(rows: int, profile: bool = False) -> MoeKernel:
                 item = n * k_tiles + tile_k
                 before = clock()
                 wait_for(item)
-                if const_expr(tile_k == k_tiles - 2):
+                if const_expr(tile_k == publish_at):
                     rocdl.s_wait_storecnt(0)
                 _lds_barrier()
                 up_wait = up_wait + since(before)
-                if const_expr(tile_k == k_tiles - 2):  # noqa: SIM102
+                if const_expr(tile_k == publish_at):  # noqa: SIM102
                     if (tid == 0) & (pending >= 0):
                         publish(pending)
                 if item + ring - 1 < flat:
@@ -1092,10 +1123,11 @@ def build_moe(rows: int, profile: bool = False) -> MoeKernel:
             before = clock()
             for m in range_constexpr(tiles):
                 if m == 0 or m * 16 < count:
+                    # Each wave its own SiTU: 6 waves' share, not 3's.
                     if wave < UP_WAVES:
                         fx.ptr_store(
-                            accumulators[m],
-                            lds["red"] + (wave * GFX1250.wave_size + lane) * 16,
+                            fx.Vector.from_elements(_situ(accumulators[m]), fx.Float32),
+                            lds["red"] + (wave * GFX1250.wave_size + lane) * 8,
                         )
                     _lds_barrier()
                     if wave < UP_ROWS // 64:
@@ -1111,6 +1143,7 @@ def build_moe(rows: int, profile: bool = False) -> MoeKernel:
                             lane,
                             in_row=True,
                             pairs=UP_ROWS // 64,
+                            activated=True,
                         )
                     _lds_barrier()
             up_epilogue = up_epilogue + since(before)
@@ -1125,15 +1158,23 @@ def build_moe(rows: int, profile: bool = False) -> MoeKernel:
 
         rows_lds = lds["latq"]
         current = fx.Int32(-1)
+        start = fx.Int32(0)
+        count = fx.Int32(0)
+        first_pick = fx.Int32(0)
         waited = fx.Int32(0)
         switches = fx.Int32(0)
         down_wait = fx.Int32(0)
         i = fx.Int32(0)
         while i < downs:
             slot, tile = down_tile(i)
-            start = fx.ptr_load(lds["start"] + slot)
-            count = uniform(fx.ptr_load(lds["picks_n"] + slot))
+            # An expert's picks change only at a switch: its run's tiles carry
+            # them, off each tile's path.
             if slot != current:
+                start = fx.ptr_load(lds["start"] + slot)
+                count = uniform(fx.ptr_load(lds["picks_n"] + slot))
+                first_pick = fx.ptr_load(
+                    lds["picks"] + start + fx.min(lane % 16, count - 1)
+                )
                 before = fx.Int32(_realtime()) if profile else fx.Int32(0)
                 if tid == 0:
                     _bounded_wait(flags, slot, tag, state, bid)
@@ -1190,7 +1231,11 @@ def build_moe(rows: int, profile: bool = False) -> MoeKernel:
                             ),
                         )
                     if index < count:
-                        pick = fx.ptr_load(lds["picks"] + start + index)
+                        pick = (
+                            first_pick
+                            if m == 0
+                            else fx.ptr_load(lds["picks"] + start + index)
+                        )
                         for half in range_constexpr(2):
                             packed = (
                                 fx.Vector.from_elements(
