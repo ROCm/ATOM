@@ -47,16 +47,14 @@ def test_cp_step_statistics_follow_the_kernel_gate():
     """MonoDecode._note_cp: the host-side image of the CP gate (statistics only)."""
     from types import SimpleNamespace as NS
 
+    import numpy as np
+
     from atom.models.minimax_m3.mono.dispatch import MonoDecode
     from atom.models.minimax_m3.mono.policy import IndexerCp
 
     def run(n, lens, cp):
         me = NS(cp=cp, cp_steps={"taken": {}, "gate_closed": {}})
-        batch = NS(
-            seqs={i: [0] * l for i, l in enumerate(lens)},
-            num_scheduled_tokens=[1] * len(lens),
-        )
-        MonoDecode._note_cp(me, n, batch)
+        MonoDecode._note_cp(me, n, np.asarray(lens, dtype=np.int32), 1)
         return me.cp_steps
 
     cp = IndexerCp(True, 16, 4096)
