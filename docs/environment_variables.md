@@ -282,6 +282,7 @@ materializes two `[B, V]` fp32 tensors that only an `argmax` reads. See
 |----------|------|---------|-------------|
 | **ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION** | bool | 0 (false) | If set to `1`, fuse QK norm, RoPE, and cache quantization into one kernel for Qwen3 dense and MoE models. |
 | **ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS** | int | 8192 | With the fusion above on, Gemma-norm models (Qwen3-Next, Qwen3.5) run the q/k norm, RoPE and cache write as separate kernels when a batch has more tokens than this; the fused kernel is slower at prefill sizes. |
+| **ATOM_SPLITK_CONSUMER_REDUCE_MAX_M** | int | 64 | MiniMax-M3 on gfx1250: a batch of at most this many tokens whose tuned per-token FP8 QKV GEMM splits K leaves the split-K reduction to the q/k norm + RoPE + cache kernel that consumes the QKV (one kernel launch less per layer, same output bits). `0` keeps the standalone reduce kernel. |
 
 ### Llama-style
 

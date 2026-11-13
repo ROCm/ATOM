@@ -10,12 +10,27 @@ Accepts separate q, k, v tensors (after torch.split from QKVGParallelLinear):
   - V: FP8 quant + SHUFFLE cache write (no norm, no RoPE)
 
 Returns freshly allocated contiguous (q_out, k_out).
+
+With ``qkv_partials`` the q/k/v views are still unreduced: their GEMM
+(aiter.gemm_a8w8_bpreshuffle_splitk_deferred) left the fp32 split-K partials,
+which the kernel sums here exactly as aiter's standalone split-K reduce does and
+writes back into q/k/v, so they read as if the reduce kernel had run.
 """
 
 import torch
 import triton
 import triton.language as tl
 from torch import Tensor
+
+
+@triton.jit
+def _splitk_reduced(ptr, split_stride, offs, NUM_SPLITS: tl.constexpr):
+    # aiter's gemm_a8w8_splitk_reduce, element for element: an fp32 sum in split
+    # order, rounded once to bf16 (round to nearest even).
+    acc = tl.load(ptr + offs)
+    for s in tl.static_range(1, NUM_SPLITS):
+        acc += tl.load(ptr + s * split_stride + offs)
+    return acc.to(tl.bfloat16)
 
 
 @triton.jit
@@ -65,6 +80,14 @@ def _fused_qkv_norm_rope_cache_kernel(
     slot_mapping_ptr,
     # M-RoPE parameters
     pos_stride_row,  # stride between position rows (for 2D positions)
+    # Split-K partials of the packed row q/k/v slice (NUM_SPLITS > 0 only):
+    # fp32 [NUM_SPLITS, >= T, row], and q/k/v's columns in that row.
+    part_ptr,
+    part_stride_split,
+    part_stride_t,
+    q_part_col,
+    k_part_col,
+    v_part_col,
     # Dimensions
     num_heads: tl.constexpr,
     num_kv_heads: tl.constexpr,
@@ -87,6 +110,7 @@ def _fused_qkv_norm_rope_cache_kernel(
     MROPE_INTERLEAVED: tl.constexpr = False,
     MROPE_SH: tl.constexpr = 0,
     MROPE_SW: tl.constexpr = 0,
+    NUM_SPLITS: tl.constexpr = 0,
 ):
     # Grid: (num_tokens * (num_heads + num_kv_heads),)
     pid = tl.program_id(0)
@@ -103,7 +127,13 @@ def _fused_qkv_norm_rope_cache_kernel(
         q_in_offset = token_id * q_stride_t + h * BLOCK_D
 
         # Load q from strided input
-        q = tl.load(q_ptr + q_in_offset + d_offs).to(tl.float32)
+        if NUM_SPLITS > 0:
+            q_part = part_ptr + token_id * part_stride_t + q_part_col + h * BLOCK_D
+            q_red = _splitk_reduced(q_part, part_stride_split, d_offs, NUM_SPLITS)
+            tl.store(q_ptr + q_in_offset + d_offs, q_red)
+            q = q_red.to(tl.float32)
+        else:
+            q = tl.load(q_ptr + q_in_offset + d_offs).to(tl.float32)
 
         # GemmaRMSNorm: x * rsqrt(mean(x^2) + eps) * (1 + weight)
         variance = tl.sum(q * q, axis=0) / BLOCK_D
@@ -157,7 +187,13 @@ def _fused_qkv_norm_rope_cache_kernel(
             d_offs + ROTARY_DIM_HALF,
             tl.where(d_offs < ROTARY_DIM, d_offs - ROTARY_DIM_HALF, d_offs),
         )
-        q_gathered_raw = tl.load(q_ptr + q_in_offset + gather_idx).to(tl.float32)
+        if NUM_SPLITS > 0:
+            # Other lanes wrote the reduced row; recompute it rather than read it.
+            q_gathered_raw = _splitk_reduced(
+                q_part, part_stride_split, gather_idx, NUM_SPLITS
+            ).to(tl.float32)
+        else:
+            q_gathered_raw = tl.load(q_ptr + q_in_offset + gather_idx).to(tl.float32)
         qw_gathered = tl.load(qw_ptr + gather_idx).to(tl.float32)
         q_gathered_normed = (
             q_gathered_raw * tl.math.rsqrt(variance + eps) * (1.0 + qw_gathered)
@@ -180,7 +216,13 @@ def _fused_qkv_norm_rope_cache_kernel(
         # --- K: GemmaRMSNorm + RoPE → contiguous k_out + cache write ---
         # Input offset uses strided layout
         k_in_offset = token_id * k_stride_t + kv_h * BLOCK_D
-        k = tl.load(k_ptr + k_in_offset + d_offs).to(tl.float32)
+        if NUM_SPLITS > 0:
+            k_part = part_ptr + token_id * part_stride_t + k_part_col + kv_h * BLOCK_D
+            k_red = _splitk_reduced(k_part, part_stride_split, d_offs, NUM_SPLITS)
+            tl.store(k_ptr + k_in_offset + d_offs, k_red)
+            k = k_red.to(tl.float32)
+        else:
+            k = tl.load(k_ptr + k_in_offset + d_offs).to(tl.float32)
 
         # GemmaRMSNorm on k
         k_variance = tl.sum(k * k, axis=0) / BLOCK_D
@@ -231,7 +273,12 @@ def _fused_qkv_norm_rope_cache_kernel(
             d_offs + ROTARY_DIM_HALF,
             tl.where(d_offs < ROTARY_DIM, d_offs - ROTARY_DIM_HALF, d_offs),
         )
-        k_gathered_raw = tl.load(k_ptr + k_in_offset + gather_idx).to(tl.float32)
+        if NUM_SPLITS > 0:
+            k_gathered_raw = _splitk_reduced(
+                k_part, part_stride_split, gather_idx, NUM_SPLITS
+            ).to(tl.float32)
+        else:
+            k_gathered_raw = tl.load(k_ptr + k_in_offset + gather_idx).to(tl.float32)
         kw_gathered = tl.load(kw_ptr + gather_idx).to(tl.float32)
         k_gathered_normed = (
             k_gathered_raw * tl.math.rsqrt(k_variance + eps) * (1.0 + kw_gathered)
@@ -250,7 +297,12 @@ def _fused_qkv_norm_rope_cache_kernel(
 
         # --- V: load for cache write (no norm, no RoPE) ---
         v_in_offset = token_id * v_stride_t + kv_h * BLOCK_D
-        v = tl.load(v_ptr + v_in_offset + d_offs)
+        if NUM_SPLITS > 0:
+            v_part = part_ptr + token_id * part_stride_t + v_part_col + kv_h * BLOCK_D
+            v = _splitk_reduced(v_part, part_stride_split, d_offs, NUM_SPLITS)
+            tl.store(v_ptr + v_in_offset + d_offs, v)
+        else:
+            v = tl.load(v_ptr + v_in_offset + d_offs)
 
         # === KV cache write (SHUFFLE layout) ===
         slot = tl.load(slot_mapping_ptr + token_id).to(tl.int64)
@@ -338,6 +390,7 @@ def triton_fused_norm_rope_cache(
     v_scale: Tensor | None,
     slot_mapping: Tensor,
     kv_cache_dtype: str,
+    qkv_partials: Tensor | None = None,
 ) -> tuple[Tensor, Tensor]:
     """GemmaRMSNorm + RoPE + KV cache write for Qwen3-Next.
 
@@ -347,6 +400,10 @@ def triton_fused_norm_rope_cache(
     - K: GemmaRMSNorm + RoPE → freshly allocated contiguous k_out
          + FP8 quant SHUFFLE cache write
     - V: FP8 quant SHUFFLE cache write (no norm, no RoPE)
+
+    ``qkv_partials``: the claimed split-K partials (``aiter.splitk_partials``) of
+    the bf16 packed row that q, k and v slice, which must then cover that whole
+    row; they are reduced here and written back into q, k and v.
 
     Returns contiguous (q_out, k_out).
     """
@@ -391,6 +448,29 @@ def triton_fused_norm_rope_cache(
     total_heads = num_heads + num_kv_heads
     grid = (T * total_heads,)
 
+    num_splits = 0
+    part_cols = (0, 0, 0)
+    if qkv_partials is not None:
+        num_splits, _, row = qkv_partials.shape
+        base = q.storage_offset()
+        part_cols = tuple(t.storage_offset() - base for t in (q, k, v))
+        if not (
+            q.dtype == k.dtype == v.dtype == torch.bfloat16
+            and q.stride(0) == k.stride(0) == v.stride(0) == row
+            and q.untyped_storage().data_ptr() == k.untyped_storage().data_ptr()
+            and q.untyped_storage().data_ptr() == v.untyped_storage().data_ptr()
+            and base % row == 0
+            and part_cols == (0, q.shape[-1], q.shape[-1] + k.shape[-1])
+            and part_cols[2] + v.shape[-1] == row
+            and qkv_partials.dtype == torch.float32
+            and qkv_partials.shape[1] >= T
+            and qkv_partials.stride()[1:] == (row, 1)
+        ):
+            raise ValueError(
+                "qkv_partials must be the fp32 split-K partials of the bf16 packed "
+                "[q | k | v] row that q, k and v slice"
+            )
+
     _fused_qkv_norm_rope_cache_kernel[grid](
         q,
         q.stride(0),
@@ -426,6 +506,10 @@ def triton_fused_norm_rope_cache(
         v_scale.stride(1) if v_scale is not None and v_scale.dim() >= 2 else 0,
         slot_mapping,
         pos_stride_row,
+        qkv_partials if qkv_partials is not None else q,  # dummy when unused
+        qkv_partials.stride(0) if qkv_partials is not None else 0,
+        qkv_partials.stride(1) if qkv_partials is not None else 0,
+        *part_cols,
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
         eps=eps,
@@ -442,6 +526,7 @@ def triton_fused_norm_rope_cache(
         MROPE_INTERLEAVED=interleaved,
         MROPE_SH=sh,
         MROPE_SW=sw,
+        NUM_SPLITS=num_splits,
     )
 
     return q_out, k_out
