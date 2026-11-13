@@ -656,6 +656,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # DSpark, ...: `mono/hi_gate.py`), any other keeps ATOM's mono path; "1":
     # on, or an error naming why not; "0": off.
     "ATOM_DSV41_MONO_HI": lambda: os.getenv("ATOM_DSV41_MONO_HI", "auto"),
+    # The most requests a decode step the hi monokernels serve (1..8, default
+    # 8: every width `hi_compose.ROWS` lists); a wider step runs ATOM's mono path.
+    "ATOM_DSV41_MONO_HI_MAX_REQUESTS": lambda: int(
+        os.getenv("ATOM_DSV41_MONO_HI_MAX_REQUESTS", "8")
+    ),
     # Token-bucket TR graphs for prefill (`atom/utils/region_graph.py`): the
     # comma-separated token counts to record. A prefill longer than the largest
     # runs eagerly; empty records none. The default tops out at 3072 because

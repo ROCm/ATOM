@@ -131,6 +131,7 @@ from atom.models.deepseek_v41.mono.hi_gate import (  # noqa: F401 (REQ_ROWS re-e
     log_once,
 )
 from atom.mono.runtime.consensus import MonoUnsupported
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -1063,12 +1064,22 @@ def host_shard(host, consts: dict, layer: int, tp: int, rank: int) -> tuple:
     )
 
 
+def served_rows(max_requests: int) -> list[int]:
+    """The step widths of ``ROWS`` the hook serves under ``ATOM_DSV41_MONO_HI_MAX_REQUESTS``: those of at most
+    ``max_requests`` requests (a wider step runs ATOM's mono path)."""
+    if not 1 <= max_requests <= len(ROWS):
+        raise ValueError(
+            f"ATOM_DSV41_MONO_HI_MAX_REQUESTS={max_requests}: one of 1..{len(ROWS)}"
+        )
+    return list(ROWS[:max_requests])
+
+
 def install(model, atom_config, engram_mapping, draft) -> HiLayers | None:
     """The hook for this rank (the deployment is one the hi path serves: ``hi_gate.decide``). ``engram_mapping``:
     ATOM's Engram hash mapping (its runtime's), the source of the table lookup's hash constants (``engram_consts``);
     ``draft``: ATOM's DSpark draft model (loaded: the draft's weights are packed from its tensors). Collective (the
     peer groups): every rank calls it at the same point."""
-    widths = list(ROWS)
+    widths = served_rows(envs.ATOM_DSV41_MONO_HI_MAX_REQUESTS)
     max_ctx = MAX_CTX
     for p in hi_plan.plan_layers(
         model.topology, model.config.engram_layer_ids, engram_on=True
