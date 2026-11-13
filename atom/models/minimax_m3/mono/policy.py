@@ -123,16 +123,14 @@ class WidthPolicy:
 # at least ``min_batch`` requests and whose long requests together hold at least ``min_blocks`` blocks.
 # min_batch: ATOM's ``ATOM_M3_INDEXER_CP_MIN_BATCH`` (rows // max_query_len; 16 for NVFP4 / FP4 index caches,
 # 1 for the others). min_blocks: a step takes the CP arm when its long requests hold >= min_blocks * q_len
-# blocks in all (q_len: query rows a request). Measured on the merged scorer (TP4 nvfp4, 4 cards, front half a
-# layer, CP off vs on, tables byte-equal, 32 and 64 rows, uniform contexts, per-request block counts 2K-215K):
-# q1 loses below ~20K blocks in all (one live request +2.5..+3.8 us, 4-8K +6..+13, 16.4K +5.5..+6.2) and wins
-# above (26.9K -3.5 / -4.3 us, 33K -8.4, 65K -36, 108K -68); q2 +9..+12 at 8-13K blocks, -6.8 at 33K, -26 at 54K;
-# q4 +3.6..+12.5 at 8-20K, -1.9 at 27K, -6.2 at 31K; q8 (8 requests at most: < 16K blocks) +3..+16 everywhere. A
-# step without a long request pays +0.2..+0.9 us for the gate whatever the threshold. The break-even grows
-# with q_len, so the default 24576 blocks is per query row: q1 from 24.6K (past the ~20K crossing), q2 from 49K,
-# q4 from 98K (above the 31K blocks 16 requests of 250K hold: never), q8 never. ATOM's 16384 (its own
-# implementation, 16 requests x 128K) is a loss on mono (16.4K blocks: +5.5..+6.2 us).
-DEFAULT_CP_MIN_BLOCKS = 24_576
+# blocks in all (q_len: query rows a request). Measured with the CP list on the scorer's tile queue (TP4 nvfp4,
+# 4 cards, front half a layer, CP off vs on, tables byte-equal, 64 / 48 / 32 rows, per-request blocks 0.5K-1.7K,
+# live requests padded): CP on wins at q1 from ~2K blocks (live 1: +0.1 us at 1K blocks; 2K -1.0; 4K -2.4; 8K -3.2;
+# 16K -11.3; 33K -30; 65K -61) and at q4 from ~8K (6K -0.1, 8K -2.7, 16K -10.2, 27K -22); the gate and the q
+# exchange cost +0.4..+0.5 us when CP has nothing to win. The break-even grows with q_len, so the default is per
+# query row: 4096 blocks = q1 from 4.1K blocks, q2 from 8.2K, q4 from 16.4K (each past the measured crossing),
+# q8 from 32.8K (8 requests of 215K hold 13.4K: never).
+DEFAULT_CP_MIN_BLOCKS = 4_096
 NVFP4_CP_MIN_BATCH = 16
 
 
