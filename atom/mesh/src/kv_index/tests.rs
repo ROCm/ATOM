@@ -496,6 +496,14 @@ fn exact_sources_answer_alone_and_partial_ones_add_predictions() {
             None,
         ]
     );
+    let mut multimodal = PrefixRequest::new("m", &tokens, Namespace::default());
+    multimodal.multimodal = true;
+    provider.on_routed(workers[3].as_ref(), &multimodal);
+    assert_eq!(
+        provider.match_workers(&multimodal, &workers),
+        [None, None, None, None]
+    );
+    assert_eq!(summary(&provider)[3], None);
     let expired = IndexProvider::new(Duration::ZERO, 4);
     expired.on_routed(workers[2].as_ref(), &req);
     assert_eq!(summary(&expired)[2], None);

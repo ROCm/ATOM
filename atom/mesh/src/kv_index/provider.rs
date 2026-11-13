@@ -436,6 +436,9 @@ impl PrefixMatchProvider for IndexProvider {
         req: &PrefixRequest<'_>,
         workers: &[Arc<dyn Worker>],
     ) -> Vec<Option<CacheHit>> {
+        if req.multimodal {
+            return vec![None; workers.len()];
+        }
         let now = self.nanos(Instant::now());
         let mut evidence = vec![Evidence::default(); workers.len()];
         let mut walks = Vec::new();
@@ -490,6 +493,9 @@ impl PrefixMatchProvider for IndexProvider {
     /// Exact workers get predictions too, used once their trust drops. Expired blocks
     /// leave the index at most an eighth of the TTL late.
     fn on_routed(&self, worker: &dyn Worker, req: &PrefixRequest<'_>) {
+        if req.multimodal {
+            return;
+        }
         self.reclaim(Instant::now());
         // A prediction released meanwhile is replaced once.
         for _ in 0..2 {
