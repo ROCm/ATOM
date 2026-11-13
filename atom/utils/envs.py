@@ -1122,6 +1122,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4": lambda: (
         os.getenv("ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4", "0") == "1"
     ),
+    # MiniMax-M3.1 (MXFP4 routed + MXFP8 shared): run the shared expert inside the
+    # routed fused MoE (aiter FHMoE) without re-quantizing it: one kernel pair, one
+    # atomic add into the MoE output. Activation dtype per step: ATOM_M3_FHMOE_ACT
+    # = auto (MXFP8 for <= 4 rows, MXFP4 above) | a8 | a4. Unsupported configs are
+    # refused in the log and keep the unfused path. Off by default.
+    "ATOM_M3_FHMOE": lambda: os.getenv("ATOM_M3_FHMOE", "0") == "1",
+    "ATOM_M3_FHMOE_ACT": lambda: os.getenv("ATOM_M3_FHMOE_ACT", "auto").lower(),
     # Gate/Up interleave mode for MoE weight preshuffle and kernel gate_mode.
     # "0" (default) = SEPARATED layout; "1" = INTERLEAVE layout.
     "ATOM_MOE_GU_ITLV": lambda: os.getenv("ATOM_MOE_GU_ITLV", "0") == "1",

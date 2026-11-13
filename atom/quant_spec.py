@@ -250,9 +250,17 @@ def fuses_mxfp8_shared_into_mxfp4(
     """
     from atom.utils import envs
 
+    return envs.ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4 and is_mxfp8_shared_mxfp4_routed(
+        shared, routed
+    )
+
+
+def is_mxfp8_shared_mxfp4_routed(
+    shared: LayerQuantConfig, routed: LayerQuantConfig
+) -> bool:
+    """MXFP8 (per-1x32 E4M3) shared expert next to MXFP4 (per-1x32) routed experts."""
     return (
-        envs.ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4
-        and shared.quant_type == QuantType.per_1x32
+        shared.quant_type == QuantType.per_1x32
         and shared.quant_dtype == d_dtypes.get("fp8")
         and routed.quant_type == QuantType.per_1x32
         and routed.quant_dtype == d_dtypes.get("fp4x2")

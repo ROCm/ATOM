@@ -227,12 +227,15 @@ class SparseMoeLayer:
         experts = moe.experts
         qm = experts.quant_method
         shared8 = not moe.fuse_shared_experts
+        # FHMoE (ATOM_M3_FHMOE): the tables carry a dummy 129th row, the shared
+        # expert is still its MXFP8 MLP; mono reads the first 128 experts.
+        fh = getattr(moe, "fhmoe", None)
         # the shared expert is the 129th expert of the MXFP4 tables, or an MXFP8 MLP
         # of its own next to the 128 routed ones
         E = N_ROUTED + (0 if shared8 else 1)
         if shared8:
             _need(
-                experts.num_fused_shared_experts == 0
+                experts.num_fused_shared_experts == (fh is not None)
                 and moe.shared_experts is not None,
                 f"layer {layer_id}: shared expert",
             )
@@ -259,6 +262,9 @@ class SparseMoeLayer:
             f"layer {layer_id}: pad",
         )
         w13, w2 = experts.w13_weight, experts.w2_weight
+        s13, s2 = experts.w13_weight_scale, experts.w2_weight_scale
+        if fh is not None:
+            w13, w2, s13, s2 = fh.routed_tables
         _need(
             getattr(w13, "is_shuffled", False) and getattr(w2, "is_shuffled", False),
             f"layer {layer_id}: shuffle",
@@ -268,7 +274,6 @@ class SparseMoeLayer:
             and w2.numel() * w2.element_size() == E * HIDDEN * INTER // 2,
             f"layer {layer_id}: expert weight bytes",
         )
-        s13, s2 = experts.w13_weight_scale, experts.w2_weight_scale
         _need(
             s13.numel() == E * 2 * INTER * HIDDEN // 32
             and s2.numel() == E * HIDDEN * INTER // 32,
