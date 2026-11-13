@@ -2412,9 +2412,16 @@ class Scheduler:
             and self._tick_cost < self._tick_cost_limit
         ):
             if len(prefix_waiters) > early_waiting:
-                if prefix_bypass_left == 0:
-                    break
-                prefix_bypass_left -= 1
+                # A lookup waiter is parked, so each further head spends the
+                # bypass budget -- except an early load in flight, which is
+                # walked past for free, as `_can_admit_head_prefill` does.
+                head = self.waiting[0]
+                if not (
+                    head.id in self._early_load.entries and self._still_loading(head)
+                ):
+                    if prefix_bypass_left == 0:
+                        break
+                    prefix_bypass_left -= 1
             seq = self.waiting.popleft()
 
             # Client disconnected before this seq ever ran: it holds no KV yet

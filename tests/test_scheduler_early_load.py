@@ -824,3 +824,35 @@ def test_every_take_back_after_the_connector_was_told_cancels_the_preadmission(
     assert conn.allocs == [seq.id]
     assert conn.cancelled == [seq.id]
     assert not seq.block_table and seq.status == SequenceStatus.WAITING
+
+
+def test_early_loads_in_flight_do_not_spend_the_lookup_bypass_budget(
+    monkeypatch, seq_factory
+):
+    """With a lookup waiter parked, Phase 2 walks past up to `_prefix_bypass_limit`
+    further heads. Early loads in flight are walked past for free, as the
+    prefillable-work probe does, so a ready request behind them is admitted
+    whenever the probe says it can be."""
+
+    class _LookupConnector(_Connector):
+        waiter = None
+
+        def lookup_pending(self, seq):
+            return seq is self.waiter
+
+        def lookup_would_defer(self, seq):
+            return seq is self.waiter
+
+    monkeypatch.setenv("OFFLOAD_MIN_LOAD_TOKENS", "0")
+    sched = Scheduler(
+        MockConfig(max_num_seqs=64, max_num_batched_tokens=64, num_kvcache_blocks=2000)
+    )
+    conn = sched.kv_connector = _LookupConnector()
+    conn.match = (0, False)
+    waiter = conn.waiter = seq_factory(list(range(16)))
+    early = _parked(sched, seq_factory, sched._prefix_bypass_limit())
+    ready = seq_factory(list(range(16)))
+    sched.waiting.extend([waiter, *early, ready])
+    assert sched._can_admit_head_prefill()
+    _, scheduled = sched.schedule()
+    assert list(scheduled) == [ready.id]
