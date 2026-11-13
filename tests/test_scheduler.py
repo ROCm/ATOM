@@ -472,6 +472,8 @@ class TestSchedule:
         seq = SimpleNamespace(
             id=96,
             status=SequenceStatus.ABORTED,
+            offload_loaded=False,
+            offload_load_failed=False,
             _counted_as_inflight_load=True,
         )
         sched = Scheduler.__new__(Scheduler)
@@ -559,6 +561,8 @@ class TestSchedule:
         seq = SimpleNamespace(
             id=97,
             status=SequenceStatus.ABORTED,
+            offload_loaded=False,
+            offload_load_failed=False,
             block_table=[1],
             has_per_req_cache=False,
             _counted_as_inflight_load=True,
