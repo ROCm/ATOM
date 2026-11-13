@@ -327,11 +327,14 @@ def test_the_copy_still_covers_both_dispatch_arms():
             ("forward_hidden",),
             "e5d8ebd181754862",
         ),
+        # Core's `start` / `join` skip the lookup on a step the model's decode
+        # round serves (`EngramStep.served_by_round`); not ported: the plugin's
+        # runner has no decode round, so its steps are never served by one.
         (
             "atom/model_ops/engram/device/staging.py",
             "EngramStaging",
             ("start", "consume", "join"),
-            "7d1dcc8553e48b9d",
+            "74eade6acaa9b896",
         ),
     ],
 )

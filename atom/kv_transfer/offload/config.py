@@ -16,12 +16,15 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from collections.abc import Mapping
 from dataclasses import asdict, is_dataclass
 from math import isfinite
 from numbers import Integral
 from typing import Any
 
 import torch
+
+from atom.utils import envs
 
 # Version 3 adds the effective index-cache dtype to the PAGE identity. FP4 and
 # FP8 DSV4 indexers have different region counts and byte layouts, so they must
@@ -641,16 +644,60 @@ def scale_cpu_size_for_pp(cfg, config) -> None:
     )
 
 
+def connector_extras(kv_transfer_config: Mapping[str, Any] | None) -> Mapping[str, Any]:
+    """Read one connector's extra settings with a shared mapping contract."""
+    if kv_transfer_config is None:
+        return {}
+    if not isinstance(kv_transfer_config, Mapping):
+        raise ValueError("kv_transfer_config must be a JSON object")  # noqa: TRY004
+    extra = kv_transfer_config.get("kv_connector_extra_config", kv_transfer_config)
+    if extra is None:
+        return {}
+    if not isinstance(extra, Mapping):
+        raise ValueError(  # noqa: TRY004
+            "kv_connector_extra_config must be a JSON object"
+        )
+    return extra
+
+
+def connector_integer(
+    extra: Mapping[str, Any], name: str, default: int, *, minimum: int = 1
+) -> int:
+    """Read integer settings, accepting integer text but rejecting fractional values."""
+    value = extra.get(name, default)
+    if isinstance(value, str):
+        try:
+            value = int(value)
+        except ValueError as exc:
+            raise ValueError(f"{name} must be an integer") from exc
+    return _strict_integer(name, value, minimum=minimum)
+
+
+def lmcache_chunk_tokens(kv_transfer_config: Mapping[str, Any] | None) -> int:
+    """The LMCache chunk the connector is configured for, in tokens: the
+    ``lmcache.chunk_size`` extra, else ``LMCACHE_CHUNK_SIZE`` (`envs`), else
+    LMCache's default 256. Needs no LMCache import, so DP routing can read it
+    at startup."""
+    extra = connector_extras(kv_transfer_config)
+    # Python evaluates function arguments eagerly. An explicit override must
+    # not read (or validate) the lower-priority environment fallback.
+    if "lmcache.chunk_size" in extra:
+        return connector_integer(extra, "lmcache.chunk_size", 256)
+    return connector_integer(extra, "lmcache.chunk_size", envs.LMCACHE_CHUNK_SIZE)
+
+
 def apply_extra_overrides(cfg, kv_transfer_config: dict[str, Any] | None) -> None:
     """Apply ``{"lmcache.<field>": value}`` extras from kv_transfer_config."""
     if not kv_transfer_config:
         return
-    extra = kv_transfer_config.get("kv_connector_extra_config", kv_transfer_config)
+    extra = connector_extras(kv_transfer_config)
     for key, value in (extra or {}).items():
         if isinstance(key, str) and key.startswith("lmcache."):
             field = key[len("lmcache.") :]
             if not field or not hasattr(cfg, field):
                 raise ValueError(f"unknown LMCache override {key!r}")
+            if field == "chunk_size":
+                value = connector_integer(extra, key, 256)
             setattr(cfg, field, value)
 
 

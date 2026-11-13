@@ -256,7 +256,7 @@ class EagleProposer(Drafter):
             # to. A draft whose rows are the target's latent (K2.6 EAGLE 3.1)
             # binds into the target's pool and gets None here; model_runner
             # accounts for its +1 layer via num_nextn_predict_layers.
-            builder = draft_kv_builder(self.runner, draft_model_hf_config)
+            builder = draft_kv_builder(self.runner, draft_model_hf_config, model)
             if builder is not None:
                 self.runner.draft_kv_builder = builder
             return model
@@ -415,7 +415,7 @@ class EagleProposer(Drafter):
             "positions": positions,
         }
 
-    def warmup_draft_graphs(self, build_context, end_trace=None) -> None:
+    def _warmup_draft_graphs(self, build_context, end_trace=None) -> None:
         """Warm every size from the state the target's capture left behind.
 
         `_advance_decode_metadata` bumps `kv_indptr` and `context_lens` in
@@ -442,7 +442,7 @@ class EagleProposer(Drafter):
             return build_context(**kwargs)
 
         try:
-            super().warmup_draft_graphs(build_pristine_context, end_trace)
+            super()._warmup_draft_graphs(build_pristine_context, end_trace)
         finally:
             restore()
 
@@ -635,7 +635,7 @@ class EagleProposer(Drafter):
             attn_metadata.__dict__[k] = v
         return workinfos
 
-    def propose(
+    def _propose(
         self,
         # [num_tokens]
         target_token_ids: torch.Tensor,

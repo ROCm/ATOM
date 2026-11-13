@@ -957,9 +957,9 @@ class GDNStateMixin(PoolRowsMixin):
                 f"state checkpoint layout mismatch: op {op.layout_id!r} "
                 f"against this worker's {spec.layout_id!r}"
             )
-        if op.total_bytes != spec.image_bytes:
+        if op.total_bytes != spec.op_bytes:
             raise RuntimeError(
-                f"a checkpoint image is {spec.image_bytes} B but the op names "
+                f"a checkpoint image is {spec.op_bytes} B but the op names "
                 f"{op.total_bytes}"
             )
         if len(op.unit_ids) != spec.units_per_checkpoint:
@@ -1765,8 +1765,9 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         Off under pipeline parallelism and RapidServe. ``get_num_blocks``
         raises when a copying transfer meets either, and answering yes there
         would turn "this model keeps fork-slot checkpoints" into "this model
-        does not start". Kimi's ``_uses_paged_checkpoints`` is the same two
-        switches and no model-type set, because that builder is Kimi-only.
+        does not start". Kimi's ``_uses_paged_checkpoints`` has only the
+        RapidServe switch, since its PAGE checkpoints span pipeline stages,
+        and no model-type set, because that builder is Kimi-only.
         """
 
         config = self.model_runner.config
@@ -1824,7 +1825,7 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
     def checkpoint_page_unit_bytes(self) -> int | None:
         """Bytes of one MHA page that a transfer actually publishes.
 
-        ``ModelRunner`` sizes the checkpoint unit from the paged pool's
+        ``ModelRunner`` sizes the checkpoint unit from this builder's own PAGE
         ``entry_bytes`` unless a backend returns a number here. ``None`` keeps
         that charged size. Kimi's MLA pool needs no override: its charged
         entry is exactly the rows the page geometry walks.
@@ -1838,9 +1839,7 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         ``entry_bytes`` makes ``_page_unit_regions`` reject the mismatch.
         BF16 fields are often already aligned, so the two sizes coincide.
         Narrow dtypes (FP8, INT8) are where the padding dominates and the
-        sizes diverge. A draft pool merged into the same class is ordinary KV
-        appended after these regions and is not part of the state image, so
-        it is left out of this sum as well.
+        sizes diverge.
 
         The vLLM plugin never consults this. It is handed the tensors to move
         and sums ``numel * element_size``, which is already the published

@@ -50,7 +50,7 @@
   - Currently decorated: `deepseek_v2.py`, `deepseek_mtp.py`, `qwen3.py`, `qwen3_moe.py`, `qwen3_next.py`, `llama.py`, `mixtral.py`, `glm4_moe.py`, `gpt_oss.py`
 - **[CRITICAL] `--enforce-eager` and `--level 0` are independent.** `--enforce-eager` disables CUDA graphs only. `--level 0` disables torch.compile only. Debug instrumentation requires **both**: `--level 0 --enforce-eager`
 - **[CRITICAL] Do NOT add debug code in `run_model()`.** It runs during CUDA graph warmup within a Dynamo-traced context. Class variables and `forward_context` attribute access trigger `InternalTorchDynamoError`. **Put debug code in `forward()` instead** (has `@torch.inference_mode()`), guarded by `not batch.is_dummy_run`
-- **Instrument at call sites.** Add checks in `EagleProposer.propose()` for MTP, or `ModelRunner.forward()` for target model — never inside compiled model code
+- **Instrument at call sites.** Add checks in `EagleProposer._propose()` for MTP, or `ModelRunner.forward()` for target model — never inside compiled model code
 - **Clear compile cache after accidental modification:** `rm -rf ~/.cache/atom/torch_compile_cache/`
 
 ## GPU / CUDA
@@ -97,7 +97,7 @@
 ## Speculative Decoding / MTP
 
 - **Low acceptance rate:** Check the `[MTP Stats]` lines in the engine log (emitted by the spec section of `EngineStats`, `model_engine/engine_stats.py`), or read them on demand from `/debug/mtp_stats`. Distribution shows how many draft tokens (0..k) were accepted per step
-- **0% acceptance with correct output:** The MTP model produces all-zero hidden states → weight loading issue. **Diagnose:** Print `logits[0].float().norm()` in `EagleProposer.propose()`. If `0.0`:
+- **0% acceptance with correct output:** The MTP model produces all-zero hidden states → weight loading issue. **Diagnose:** Print `logits[0].float().norm()` in `EagleProposer._propose()`. If `0.0`:
   1. Check `fc.weight` dtype — BF16 checkpoint weight may be silently quantized to FP8 if `ColumnParallelLinear` lacks the correct `prefix` argument (see [Weight Loading](#weight-loading--quantization))
   2. Check `loaded_weights_record` from `load_model()` — is the weight present?
   3. Check `_share_if_not_loaded` log for `lm_head` sharing

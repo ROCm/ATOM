@@ -444,7 +444,8 @@ RUN echo "========== [ATOM] Installing MORI nightly ==========" && \
 # leaving dpkg in a broken state that blocks all subsequent apt-get install calls.
 ARG INSTALL_MOONCAKE=1
 ARG MOONCAKE_REPO="https://github.com/kvcache-ai/Mooncake.git"
-ARG MOONCAKE_COMMIT="v0.3.14-rc1"
+# Same Mooncake commit as docker/atom_release.dockerfile.
+ARG MOONCAKE_COMMIT="206d6340a8b578f44519ccef90bdbfe8483d0231"
 ARG VENV_PYTHON="/opt/venv/bin/python"
 
 # [MC 1/4] Clone

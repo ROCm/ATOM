@@ -315,6 +315,10 @@ def test_pools_refuse_another_layout_or_dtype():
     step_meta.QSAPools(G, fp8, fp8.clone(), raw, cmp, scale, scale.clone())
     with pytest.raises(ValueError, match="index_cmp"):
         step_meta.QSAPools(G, kv, kv.clone(), raw, raw)
+    rope = torch.zeros(blocks, bs, 1, 3, dtype=torch.int64)
+    step_meta.QSAPools(G, kv, kv.clone(), raw, cmp, rope_positions=rope)
+    with pytest.raises(ValueError, match="rope_positions"):
+        step_meta.QSAPools(G, kv, kv.clone(), raw, cmp, rope_positions=rope.int())
     conv = torch.zeros(5, 6, G.conv_dim, dtype=torch.bfloat16)
     pools = step_meta.GDNPools(G.gdn, conv, torch.zeros(5, 48, 128, 128))
     pools.check_window(4)
@@ -455,6 +459,50 @@ def test_fallback_draft_attention_runs_the_module_without_a_position_cache(
     ]
 
 
+# ------------------------------------------------------------------ a program's launches (GPU)
+
+
+def test_a_launch_does_not_trace_the_program_again(monkeypatch):
+    """After the first launch, ``MonoKernel.launch`` calls the compiled function: later launches trace nothing and
+    still pass their own ``layer``. The program's one task stores its launch's tag
+    (``step * LAYER_SLOTS + layer + 1``)."""
+    pytest.importorskip("flydsl")
+    pytest.importorskip("aiter")
+    from atom.models.qwen38.mono.kernels.target import MI355X, device_arch
+
+    if device_arch() != MI355X.arch:
+        pytest.skip("an MI355X program")
+    from flydsl.compiler.kernel_function import KernelFunction
+
+    from atom.models.qwen38.mono.kernels.device import buffer_ops as bo
+    from atom.models.qwen38.mono.kernels.device.ops import rsrc
+    from atom.models.qwen38.mono.kernels.kernel import MonoKernel
+    from atom.models.qwen38.mono.kernels.program import Program, Scenario, Stage
+
+    def store_tag(k, t):
+        bo.buffer_store(k.tag, rsrc(k.args["out"]), 0)
+
+    stage = Stage("tag", 1, store_tag, args=("out",), base=0)
+    kernel = MonoKernel(Program("launch_tag", Scenario(1, 1), [stage]))
+    bufs, out = kernel.buffers(), torch.zeros(1, dtype=torch.int32, device="cuda")
+    table = kernel.table({"out": out})
+    kernel.launch(table, bufs)
+    torch.cuda.synchronize()
+    assert out.item() == 1
+    emitted = []
+    emit = KernelFunction._emit_kernel
+    monkeypatch.setattr(
+        KernelFunction,
+        "_emit_kernel",
+        lambda *a, **k: emitted.append(1) or emit(*a, **k),
+    )
+    for layer in (1, 2):
+        kernel.launch(table, bufs, layer=layer)
+        torch.cuda.synchronize()
+        assert out.item() == layer + 1
+    assert not emitted
+
+
 # ------------------------------------------------------------------ the step prep launches (GPU)
 
 
@@ -535,15 +583,19 @@ def test_draft_metadata_replay_padding_and_epoch(prep_ops, spec, selected):
         if selected
         else None
     )
+    # the drafter's MRoPE positions [3, rows]: one past the cache row, plus an image request's offset
+    delta = torch.tensor([-900, 7, 5, -3], device="cuda").repeat_interleave(spec)
+    positions = (pos + 1 + delta).repeat(3, 1)
     metadata = {
         "seq_lens": torch.zeros(batch, device="cuda", dtype=torch.int32),
         "block_table": torch.zeros(batch, width, device="cuda", dtype=torch.int32),
         "sel": torch.full((batch,), -7, device="cuda", dtype=torch.int32),
+        "rope_off": torch.full((batch,), -7, device="cuda", dtype=torch.int32),
     }
     epoch = torch.tensor(9, device="cuda", dtype=torch.int32)
 
     def launch():
-        prep_ops.draft_meta(metadata, [epoch], pos, slots, table, select, batch, spec)
+        prep_ops.draft_meta(metadata, [epoch], pos, slots, table, select, positions, batch, spec)  # fmt: skip
 
     launch()
     graph = torch.cuda.CUDAGraph()
@@ -552,6 +604,7 @@ def test_draft_metadata_replay_padding_and_epoch(prep_ops, spec, selected):
     previous = epoch.item()
     for step in range(3):
         pos.add_(1)
+        positions.add_(1)
         slots[spec] = -1
         pos[2 * spec] = -1
         graph.replay()
@@ -567,6 +620,7 @@ def test_draft_metadata_replay_padding_and_epoch(prep_ops, spec, selected):
             metadata["block_table"][[0, 3]], table[[0, 3]].to(torch.int32)
         )
         assert bool((metadata["block_table"][[1, 2]] == -1).all())
+        assert metadata["rope_off"].tolist() == [-900, 0, 0, -3]
         expected = (
             select.to(torch.int32) if selected else torch.full_like(metadata["sel"], -7)
         )
@@ -609,6 +663,169 @@ def test_target_metadata_puts_match_the_reference_fill(prep_ops, batch):
     assert torch.equal(m["seq_lens"], torch.where(v, meta.context_lens - spec, 0))
     assert torch.equal(m["block_table"], torch.where(v[:, None], table, -1))
     assert all(c.item() == 6 for c in counters)
+
+
+# ------------------------------------------------------------------ ATOM's QSA RoPE position cache (GPU)
+# The target and draft programs, at a small table width, with zero weights (what a step writes to the position cache
+# does not depend on them): each must leave the cache as ATOM's ``Qwen4ExpAttention._select_tokens`` would, i.e.
+# ``qsa_store_rows`` of ``canonical_rope_positions(positions)`` at the step's slots and nothing elsewhere.
+
+BATCH, WIDTH, PAGES = 3, 16, 48
+TARGET_LAYER = 3  # a QSA layer
+UNWRITTEN = -7
+# request 0 text, 1 an image request (its MRoPE offset), 2 padding (slots -1) over real pages
+CONTEXT, DELTA, PADDED = [130, 515, 300], [0, -300, 0], 2
+
+
+@pytest.fixture(scope="module")
+def programs():
+    """The target's QSA kernels and the drafter's, built for ``BATCH`` requests."""
+    pytest.importorskip("flydsl")
+    pytest.importorskip("triton")
+    pytest.importorskip("aiter")
+    if not torch.cuda.is_available():
+        pytest.skip("requires a GPU")
+    from atom.models.qwen38.mono import runner
+    from atom.models.qwen38.mono.kernels.geometry import G
+
+    target = runner.Kernels("Qwen mono", ("qsa",), G)
+    target.build(BATCH, mono_config.SPEC, WIDTH)
+    draft = runner.Kernels("Qwen mono draft", ("mtp",), G)
+    for spec in (1, mono_config.SPEC):
+        draft.build(BATCH, spec, WIDTH)
+    # every weight arg's zeros: as large as the largest weight, the drafter's BF16 gate_up (routed + shared experts)
+    zeros = torch.zeros((G.experts + 1) * 2 * G.moe_inter * G.hidden, dtype=torch.bfloat16, device="cuda")  # fmt: skip
+    return target, draft, zeros
+
+
+def _zero_layer(programs, kernels, index, kind, spec):
+    from atom.models.qwen38.mono import runner
+
+    layer = runner.Layer(SimpleNamespace(index=index, kind=kind), kernels)
+    lk, _ = kernels.kernel(kind, BATCH, spec, WIDTH)
+    # (the step's runtime args replace their entries)
+    layer.bound = dict.fromkeys(lk.program.args, programs[2])
+    return layer
+
+
+def _pools(fp8, cached):
+    """A QSA layer's caches (``qsa_module``'s names); the position cache holds ``UNWRITTEN``."""
+    kv = torch.zeros(PAGES, 64, 2, 256, device="cuda").to(
+        torch.float8_e4m3fn if fp8 else torch.bfloat16
+    )
+    scale = torch.ones(PAGES, 64, 2, device="cuda") if fp8 else None
+    index = torch.zeros(PAGES, 64, 1, 128, dtype=torch.bfloat16, device="cuda")
+    rope = torch.full((PAGES, 64, 1, 3), UNWRITTEN, dtype=torch.int64, device="cuda")
+    return SimpleNamespace(k_cache=kv, v_cache=kv.clone(), k_scale_cache=scale, v_scale_cache=scale,
+                           raw_key_cache=index, compressed_key_cache=index[:, :16].contiguous(),
+                           rope_position_cache=rope if cached else None)  # fmt: skip
+
+
+def _addressing(spec):
+    """ATOM's addressing of the step: a permuted block table, each request's ``spec`` rows before ``CONTEXT``, their
+    slots (-1 for the padded request) and cache rows (-1 likewise, the drafter's logical positions).
+    """
+    table = torch.randperm(PAGES, generator=torch.Generator().manual_seed(spec))
+    table = table.view(BATCH, WIDTH).to(torch.int32)
+    rows = torch.tensor(CONTEXT)[:, None] - spec + torch.arange(spec)
+    slots = table.long().gather(1, rows // 64) * 64 + rows % 64
+    slots[PADDED], rows[PADDED] = -1, -1
+    return table.cuda(), slots.reshape(-1).cuda(), rows.reshape(-1).cuda()
+
+
+def _mrope(rows, shift):
+    """Decode rows' MRoPE positions [3, rows]: ``shift`` past the cache row, plus the request's offset."""
+    spec = rows.numel() // BATCH
+    delta = torch.tensor(DELTA, device="cuda").repeat_interleave(spec)
+    return (rows + shift + delta).repeat(3, 1)
+
+
+def _atom_writes(cache, slots, positions):
+    from atom.model_ops.qwen4_exp.ops.qsa import qsa_store_rows
+    from atom.model_ops.qwen4_exp.qsa_attention import canonical_rope_positions
+
+    want = cache.clone()
+    qsa_store_rows(want, slots, canonical_rope_positions(positions))
+    return want
+
+
+@pytest.mark.parametrize("cached", [True, False])
+def test_target_program_writes_the_rope_position_cache(programs, monkeypatch, cached):
+    """``TargetRunner``'s verify step (``prep.VerifyPrep``'s ``rope_off``, then the QSA program); a text-only pool has
+    no position cache (the program writes nothing: address 0)."""
+    from atom.models.qwen38.mono import runner
+    from atom.models.qwen38.mono.kernels.geometry import G
+    from atom.models.qwen38.mono.kernels.prep import VerifyPrep
+
+    kernels, spec = programs[0], mono_config.SPEC
+    t = runner.TargetRunner.__new__(runner.TargetRunner)
+    t.geo, t.kernels, t.ple_layers, t.prep = G, kernels, frozenset(), VerifyPrep(BATCH)
+    t.layers = {TARGET_LAYER: _zero_layer(programs, kernels, TARGET_LAYER, "qsa", spec)}
+    t.io = [torch.zeros(BATCH * spec, G.hc_width, dtype=torch.bfloat16, device="cuda") for _ in range(2)]  # fmt: skip
+    kernels.io.update(x.data_ptr() for x in t.io)
+    pools = _pools(fp8=True, cached=cached)
+    t._gdn_layers, t._qsa_layers = {}, {TARGET_LAYER: pools}
+    embedding = torch.zeros(8, G.hidden, dtype=torch.bfloat16, device="cuda")
+    t.model = SimpleNamespace(model=SimpleNamespace(
+        start_layer=TARGET_LAYER, end_layer=TARGET_LAYER + 1, hc_count=G.hc_count,
+        config=SimpleNamespace(hidden_size=G.hidden), embed_tokens=SimpleNamespace(weight=embedding)))  # fmt: skip
+    table, slots, rows = _addressing(spec)
+    positions = _mrope(rows, 0)
+    fwd = _fwd(BATCH)
+    fwd.kv_cache_data = {}
+    gdn = fwd.attn_metadata.gdn_metadata
+    gdn.spec_state_indices_tensor = gdn.spec_state_indices_tensor.cuda()
+    gdn.spec_state_indices_in_tensor = None
+    gdn.num_accepted_tokens = torch.ones(BATCH, dtype=torch.int32, device="cuda")
+    md = fwd.attn_metadata
+    md.block_tables, md.slot_mapping = table, slots
+    md.context_lens = torch.tensor(CONTEXT, dtype=torch.int32, device="cuda")
+    monkeypatch.setattr(runner, "get_forward_context", lambda: fwd)
+    ids = torch.zeros(BATCH * spec, dtype=torch.int32, device="cuda")
+    meta = t.step_meta(ids, positions, None, None)
+    assert meta is not None
+    if cached:
+        want = _atom_writes(pools.rope_position_cache, slots, positions)
+    t.forward(ids, meta)
+    torch.cuda.synchronize()
+    if cached:
+        assert torch.equal(pools.rope_position_cache, want)
+
+
+@pytest.mark.parametrize("spec", [1, mono_config.SPEC])
+def test_draft_program_writes_the_rope_position_cache(programs, monkeypatch, spec):
+    """``DraftRunner.serve``'s step (``prep.draft_meta``'s ``rope_off``, then the MTP program; its RoPE table rows
+    start at position 1): ATOM's drafter positions are its cache rows + 1 (``EagleProposer``).
+    """
+    from atom.model_ops.attentions.qwen4_exp_attn import Qwen4ExpQSAMetadata
+    from atom.models.qwen38.mono import draft_runner
+    from atom.models.qwen38.mono.kernels.geometry import G
+
+    kernels = programs[1]
+    d = draft_runner.DraftRunner.__new__(draft_runner.DraftRunner)
+    d.geo, d.idx, d.kernels, d.checked = G, G.layers, kernels, set()
+    d.layer = _zero_layer(programs, kernels, G.layers, "mtp", spec)
+    d.qsa = _pools(fp8=False, cached=True)
+    d.io = torch.zeros(BATCH, G.hc_width, dtype=torch.bfloat16, device="cuda")
+    table, slots, rows = _addressing(spec)
+    positions = _mrope(rows, 1)
+    qsa = Qwen4ExpQSAMetadata(
+        table, slots, slots.clone(), torch.arange(BATCH, device="cuda").repeat_interleave(spec).int(), rows,
+        torch.tensor(CONTEXT, dtype=torch.int32, device="cuda"), max(CONTEXT))  # fmt: skip
+    fwd = SimpleNamespace(
+        attn_metadata=SimpleNamespace(qsa_metadata=qsa),
+        context=SimpleNamespace(is_prefill=False),
+    )
+    monkeypatch.setattr(draft_runner, "get_forward_context", lambda: fwd)
+    model = SimpleNamespace(hc_count=G.hc_count, hidden_size=G.hidden, hyper_connection_mixer=SimpleNamespace(
+        mix_fused=lambda out, _: (out, (out, None))))  # fmt: skip
+    hidden = torch.zeros(BATCH * spec, G.hc_width, dtype=torch.bfloat16, device="cuda")
+    selected = None if spec == 1 else torch.arange(BATCH, device="cuda") * spec + 1
+    want = _atom_writes(d.qsa.rope_position_cache, slots, positions)
+    with torch.inference_mode():  # (as ATOM's drafter runs)
+        assert d.serve(model, positions, hidden, selected) is not None
+    torch.cuda.synchronize()
+    assert torch.equal(d.qsa.rope_position_cache, want)
 
 
 # ------------------------------------------------------------------ the PLE n-gram table in page-locked host memory
@@ -686,7 +903,7 @@ def fake_pin(monkeypatch):
 
     monkeypatch.setattr(_ple(), "pin_rows", pin_rows)
     # Copies in plain memory: the device would see them where the host does.
-    monkeypatch.setattr(_ple(), "device_address", lambda address: address)
+    monkeypatch.setattr(_ple(), "device_address", lambda address, **_: address)
     return state
 
 
@@ -808,6 +1025,8 @@ def test_ngram_embedding_on_host_matches_hbm_embedding(monkeypatch):
     group = SimpleNamespace(world_size=1, rank_in_group=0)
     monkeypatch.setattr(embed_head, "get_tp_group", lambda: group)
     monkeypatch.setattr(ple_layer, "get_tp_group", lambda: group)
+    # Where Mono refuses, gfx950 and gfx942 would put the table on the host too.
+    monkeypatch.setattr(ple_layer, "_host_table_available", lambda: False)
     config = SimpleNamespace(
         ngram_size=3,
         heads_per_ngram=8,

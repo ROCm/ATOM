@@ -11,6 +11,7 @@ import os
 HIP_IPC_HANDLE_BYTES = 64
 HIP_IPC_MEM_LAZY_ENABLE_PEER_ACCESS = 0x1
 HIP_DEVICE_MALLOC_UNCACHED = 0x3
+HIP_DEVICE_MALLOC_FINEGRAINED = 0x1
 _UNCACHED_PAGE = 4096
 _RANGE_START_ADDR = 11
 
@@ -161,11 +162,15 @@ class HipRuntime:
         error = self.library().hipIpcCloseMemHandle(ctypes.c_void_p(int(mapped_base)))
         self.check(error, operation="hipIpcCloseMemHandle")
 
-    def allocate_uncached(self, size: int) -> int:
+    def allocate_uncached(
+        self, size: int, flags: int = HIP_DEVICE_MALLOC_UNCACHED
+    ) -> int:
         """Allocate and zero uncached device memory, returning its raw pointer.
 
         The size is rounded up to whole 4 KiB pages: ``hipIpcGetMemHandle``
-        refuses an uncached allocation under 2 MiB that is not."""
+        refuses an uncached allocation under 2 MiB that is not. ``flags``:
+        ``HIP_DEVICE_MALLOC_FINEGRAINED`` for fine-grained (coherent, cached)
+        memory instead."""
 
         if size < 1:
             raise ValueError(f"allocation size must be positive, got {size}")
@@ -174,7 +179,7 @@ class HipRuntime:
         error = self.library().hipExtMallocWithFlags(
             ctypes.byref(buffer),
             ctypes.c_size_t(size),
-            ctypes.c_uint(HIP_DEVICE_MALLOC_UNCACHED),
+            ctypes.c_uint(flags),
         )
         self.check(error, operation="hipExtMallocWithFlags")
         if buffer.value is None:
@@ -227,6 +232,13 @@ def allocate_uncached(size: int) -> int:
     return _DEFAULT_RUNTIME.allocate_uncached(size)
 
 
+def allocate_fine_grained(size: int) -> int:
+    """Allocate and zero fine-grained HIP device memory (never freed, as the
+    uncached allocations)."""
+
+    return _DEFAULT_RUNTIME.allocate_uncached(size, HIP_DEVICE_MALLOC_FINEGRAINED)
+
+
 def load_runtime():
     """Return the process-wide configured HIP ctypes library."""
 
@@ -244,6 +256,7 @@ __all__ = [
     "HIP_IPC_HANDLE_BYTES",
     "HIP_IPC_MEM_LAZY_ENABLE_PEER_ACCESS",
     "HipRuntime",
+    "allocate_fine_grained",
     "allocate_uncached",
     "check_hip_error",
     "close_ipc_handle",

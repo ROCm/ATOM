@@ -7,9 +7,21 @@ use super::policy_apply::apply_policy;
 use super::traits::{PdPlanner, PolicySource, WorkerSource};
 use super::types::{PlacementError, PlacementPlan, Protocol, RequestDescriptor};
 use crate::core::{ConnectionMode, HashRing, Worker, WorkerType};
+use crate::observability::{
+    metrics::{metrics_labels, MeshMetrics},
+    route_trace,
+};
+use crate::policies::{LoadBalancingPolicy, NO_HEALTHY_WORKERS};
 
 fn health_filter(pool: Vec<Arc<dyn Worker>>) -> Vec<Arc<dyn Worker>> {
     pool.into_iter().filter(|w| w.is_available()).collect()
+}
+
+/// Records a selection that has no candidate in `pool`. The policy never runs,
+/// so it cannot report the failure itself.
+fn report_no_candidates(pool: &'static str, policy: &dyn LoadBalancingPolicy) {
+    MeshMetrics::record_route_branch(pool, policy.name(), NO_HEALTHY_WORKERS);
+    route_trace::record_selection(pool, policy.name(), None, NO_HEALTHY_WORKERS, None);
 }
 
 pub struct DefaultPlanner {
@@ -39,11 +51,12 @@ impl DefaultPlanner {
         regular_pool_raw: Vec<Arc<dyn Worker>>,
     ) -> Result<PlacementPlan, PlacementError> {
         let candidates = health_filter(regular_pool_raw);
+        let policy = self.policies.regular_policy(req.model_id);
         if candidates.is_empty() {
+            report_no_candidates(metrics_labels::WORKER_REGULAR, policy.as_ref());
             return Err(PlacementError::NoAvailableWorkers);
         }
 
-        let policy = self.policies.regular_policy(req.model_id);
         let hash_ring = self.hash_ring_for(req.model_id);
         let chosen = apply_policy(&candidates, policy.as_ref(), req, hash_ring).await?;
 
@@ -59,17 +72,19 @@ impl DefaultPlanner {
         prefill_pool_raw: Vec<Arc<dyn Worker>>,
         decode_pool_raw: Vec<Arc<dyn Worker>>,
     ) -> Result<PlacementPlan, PlacementError> {
+        let prefill_policy = self.policies.prefill_policy();
+        let decode_policy = self.policies.decode_policy();
         let prefill_candidates = health_filter(prefill_pool_raw);
         if prefill_candidates.is_empty() {
+            report_no_candidates(metrics_labels::WORKER_PREFILL, prefill_policy.as_ref());
             return Err(PlacementError::NoAvailableWorkers);
         }
         let decode_candidates = health_filter(decode_pool_raw);
         if decode_candidates.is_empty() {
+            report_no_candidates(metrics_labels::WORKER_DECODE, decode_policy.as_ref());
             return Err(PlacementError::NoAvailableWorkers);
         }
 
-        let prefill_policy = self.policies.prefill_policy();
-        let decode_policy = self.policies.decode_policy();
         let hash_ring = self.hash_ring_for(req.model_id);
 
         let prefill = apply_policy(
@@ -142,8 +157,16 @@ impl PdPlanner for DefaultPlanner {
         } else if !prefill_pool.is_empty() && !decode_pool.is_empty() {
             self.plan_pair(req, prefill_pool, decode_pool).await
         } else if prefill_pool.is_empty() && !decode_pool.is_empty() {
+            report_no_candidates(
+                metrics_labels::WORKER_PREFILL,
+                self.policies.prefill_policy().as_ref(),
+            );
             Err(PlacementError::NoPrefillWorkers)
         } else if !prefill_pool.is_empty() && decode_pool.is_empty() {
+            report_no_candidates(
+                metrics_labels::WORKER_DECODE,
+                self.policies.decode_policy().as_ref(),
+            );
             Err(PlacementError::NoDecodeWorkers)
         } else {
             Err(PlacementError::NoAvailableWorkers)

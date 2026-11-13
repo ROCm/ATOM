@@ -48,11 +48,15 @@ logger = logging.getLogger("atom")
 _DEEPSEEK_MTP_ARCHES: set[str] = {
     "DeepSeekMTPModel",
     "DeepseekV32MTPModel",
+    # GLM-5.3-Flash's draft subclasses ATOM's DeepSeekMTP and keeps its
+    # forward contract (spec_step_idx in, (sample, recycle) hidden out).
+    "Glm5NextMTPModel",
 }
 _MTP_MASK_INPUT_ARCH: set[str] = {
     "DeepSeekMTPModel",
     "DeepseekV32MTPModel",
     "Glm4MoeMTPModel",
+    "Glm5NextMTPModel",
 }
 _MTP_DRAFT_MODEL_ARCHES: set[str] = {
     "DeepSeekMTPModel",
@@ -61,6 +65,7 @@ _MTP_DRAFT_MODEL_ARCHES: set[str] = {
     "DeepseekV4MTPModel",
     "Qwen3NextMTP",
     "Glm4MoeMTPModel",
+    "Glm5NextMTPModel",
 }
 _EAGLE3_DRAFT_ARCH_TO_ATOM_ARCH: dict[str, str] = {
     # vLLM/HF draft arch name: ATOM server-mode draft class
@@ -170,6 +175,7 @@ _ATOM_MODEL_CLASSES: dict[str, str] = {
     "DeepseekV32MTPModel": "atom.models.deepseek_mtp:DeepSeekMTP",
     "DeepSeekV4MTPModel": "atom.plugin.vllm.models.deepseek_v4_mtp:DeepseekV4MTP",
     "Glm4MoeMTPModel": "atom.models.glm4_moe_mtp:Glm4MoeMTP",
+    "Glm5NextMTPModel": "atom.plugin.vllm.models.glm5_next:Glm5NextMTPVllm",
     "Qwen3NextForCausalLM": "atom.plugin.vllm.models.qwen3_next:Qwen3NextForCausalLM",
     "Qwen3NextMTP": "atom.models.qwen3_next_mtp:Qwen3NextMTP",
     "Qwen3_5MoeForConditionalGeneration": "atom.plugin.vllm.models.qwen3_5:Qwen3_5MoeForConditionalGeneration_",
@@ -177,6 +183,9 @@ _ATOM_MODEL_CLASSES: dict[str, str] = {
     "KimiK25ForConditionalGeneration": "atom.plugin.vllm.models.kimi_k25:KimiK25ForConditionalGeneration_",
     "KimiK3ForConditionalGeneration": (
         "atom.plugin.vllm.models.kimi_k3:KimiK3ForConditionalGeneration_"
+    ),
+    "Glm5NextForConditionalGeneration": (
+        "atom.plugin.vllm.models.glm5_next:Glm5NextForConditionalGeneration_"
     ),
     "MiniMaxM2ForCausalLM": "atom.models.minimax_m2:MiniMaxM2ForCausalLM",
     "DeepseekV4ForCausalLM": "atom.plugin.vllm.models.deepseek_v4:DeepseekV4ForCausalLM",

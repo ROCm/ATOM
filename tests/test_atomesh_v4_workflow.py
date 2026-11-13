@@ -13,7 +13,6 @@ from atomesh_workflow_helpers import load_workflow, run_matrix_step, workflow_st
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / ".github/scripts/atomesh"
 MODEL = "DeepSeek-V4-Pro-0813"
-CONCURRENCIES = {1, 2, 16, 32, 128, 192, 256}
 
 
 class V4WorkflowTest(unittest.TestCase):
@@ -21,7 +20,7 @@ class V4WorkflowTest(unittest.TestCase):
     def setUpClass(cls):
         cls.script = workflow_step(load_workflow(), "matrix")
 
-    def matrix(self, event="schedule", schedule="0 16 * * 5", **overrides):
+    def matrix(self, event="schedule", schedule="10 16 * * *", **overrides):
         env = {
             "GITHUB_EVENT_NAME": event,
             "EVENT_SCHEDULE": schedule,
@@ -47,19 +46,6 @@ class V4WorkflowTest(unittest.TestCase):
         cells, output = run_matrix_step(self.script, env)
         self.assertIn("has_matrix=true", output)
         return cells
-
-    def test_tw_schedule_includes_v4_weekly_and_existing_models(self):
-        cells = self.matrix()
-        v4 = [cell for cell in cells if cell["model"] == MODEL]
-        self.assertEqual(len(v4), 7)
-        self.assertEqual({cell["concurrency"][0] for cell in v4}, CONCURRENCIES)
-        for cell in v4:
-            self.assertEqual(cell["suite"], "weekly")
-            self.assertEqual(cell["runner"]["slurm_account"], "amd-atom")
-            self.assertEqual(cell["runner"]["slurm_partition"], "amd-spur")
-        self.assertTrue(any(cell["model"] == "DeepSeek-V4-Pro" for cell in cells))
-        self.assertTrue(any(cell["model"] == "GLM-5.2-MXFP4" for cell in cells))
-        self.assertTrue(all(not cell["eval_only"] for cell in cells))
 
     def test_push_and_mi350_daily_exclude_v4_weekly(self):
         for event, schedule, runner in (

@@ -81,6 +81,12 @@ class _Engine:
     _weight_sync_fenced = False
     _rl_weights_inconsistent = False
 
+    def prepare_weight_sync(self, deadline):
+        pass
+
+    def prepare_kv_change(self, *, weights, deadline):
+        pass
+
 
 def _handler(**kw):
     mgr = _RunnerMgr(**kw)

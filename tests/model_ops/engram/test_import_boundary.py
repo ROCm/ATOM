@@ -23,6 +23,7 @@ HOST_MODULES = (
     "atom.model_ops.engram.tables",
     "atom.model_ops.engram.host",
     "atom.model_ops.deepseek_v41.draft_block",
+    "atom.model_ops.qwen4_exp.ple_host_table",
 )
 
 # Answering "not here" is what a missing package looks like: `find_spec` gives

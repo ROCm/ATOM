@@ -56,6 +56,8 @@ logger = logging.getLogger("atom")
 # would fire one worker RPC round per spin; 1ms matches the PP head's existing
 # idle token-poll timeout and is far below any transfer latency.
 KV_IDLE_DRAIN_INTERVAL_S = 0.001
+# How long a busy loop that finds its engine held sleeps before it looks again.
+HELD_POLL_S = 0.01
 
 # Upper bound on the drain that runs after the loop exits. A peer that died
 # mid-transfer leaves a completion that never arrives; exiting late beats
@@ -89,6 +91,8 @@ class EngineCore:
         # failed after an in-place write, must not serve.
         self._weight_sync_fenced = False
         self._rl_weights_inconsistent = False
+        # pause_generation .. resume_generation: nothing new is scheduled.
+        self._generation_paused = False
         self.input_address = input_address
         self.output_address = output_address
         # Control traffic arrives on its own socket so CoreManager can keep the
@@ -415,16 +419,75 @@ class EngineCore:
             if engine is not None:
                 engine.exit()
 
-    def _is_idle_rl_weights_offloaded(self) -> bool:
-        """Check if weights are offloaded for RL training.
+    def _is_engine_held(self) -> bool:
+        """Whether this tick runs no forward: the weights are offloaded, a
+        weight sync is fenced, or generation is paused. A loop that finds it
+        held sleeps for ``HELD_POLL_S`` before it looks again."""
+        return (
+            self._is_rl_weights_offloaded
+            or self._weight_sync_fenced
+            or self._generation_paused
+        )
 
-        When offloaded, busy-wait with a short delay to avoid CPU spin.
-        Returns True if the caller should skip model execution this tick.
+    def _report_held_kv_work(self) -> None:
+        """Let transfers already in flight report back while no forward runs.
+
+        Starts none, and runs nothing while the weights (and so the KV pool)
+        may be released.
         """
-        if self._is_rl_weights_offloaded or self._weight_sync_fenced:
+        if not self._is_rl_weights_offloaded and self.has_pending_kv_work():
+            self._advance_idle_kv_transfer(dispatch_new=False)
+
+    def pause_generation(self, deadline: float) -> None:
+        """Schedule nothing until ``resume_generation``; what runs stays put."""
+        self._generation_paused = True
+
+    def resume_generation(self) -> None:
+        self._generation_paused = False
+
+    def prepare_weight_sync(self, deadline: float) -> None:
+        """Get ready for a weight sync's first update, or raise.
+
+        A single stage has nothing to wait for: its workers run the update
+        after any forward they were already sent.
+        """
+
+    def prepare_kv_change(self, *, weights: bool, deadline: float) -> None:
+        """Get the KV pool ready to be zeroed, freed or recomputed, or raise.
+
+        Waits until KV transfers in flight have reported back, then preempts
+        what is running so it recomputes on what follows. When the weights
+        change, the KV connector must also drop what it keeps for later
+        requests. Raises with the reason, changing nothing that was running.
+        """
+        if self.has_pending_kv_work():
+            logger.info(
+                f"{self.label}: waiting up to "
+                f"{max(0.0, deadline - time.monotonic()):.0f}s for KV transfers "
+                f"in flight before the KV pool changes"
+            )
+        while self.has_pending_kv_work():
+            if time.monotonic() >= deadline:
+                raise RuntimeError("KV transfers are still in flight")
+            self._next_idle_kv_drain = 0.0
+            self._advance_idle_kv_transfer(dispatch_new=False)
             time.sleep(0.01)
-            return True
-        return False
+        scheduler = self.scheduler
+        if not scheduler.can_recompute_prompts and not scheduler.is_finished():
+            raise RuntimeError(
+                f"{type(scheduler).__name__} cannot recompute the requests it "
+                f"has in flight"
+            )
+        connector = getattr(scheduler, "kv_connector", None)
+        if weights and connector is not None and not connector.drop_cached_kv():
+            raise RuntimeError(
+                f"{type(connector).__name__} cannot drop KV computed with the "
+                f"old weights"
+            )
+        # One that cannot recompute is idle here, having been refused above;
+        # a prefill scheduler has no preempt_running.
+        if scheduler.can_recompute_prompts:
+            scheduler.preempt_running()
 
     def busy_loop(self):
         shutdown = False
@@ -441,10 +504,12 @@ class EngineCore:
                 shutdown = shutdown or self.pull_and_process_input_queue()
                 if shutdown:
                     break
-                if self._is_idle_rl_weights_offloaded():
+                if self._is_engine_held():
                     # An RL rollout parks the weights for minutes. No forward
                     # can run meanwhile, so the window must not be charged.
                     self.scheduler.engine_stats.note_idle(now)
+                    self._report_held_kv_work()
+                    time.sleep(HELD_POLL_S)
                     continue
                 if not self.scheduler.is_finished():
                     # Keyed on the forward, not on having requests:
@@ -966,16 +1031,17 @@ class DPEngineCoreProc(EngineCore):
                     self.utility_handler.push_metrics()
                 self.scheduler.heartbeat_throughput(now)
                 shutdown = shutdown or self.pull_and_process_input_queue()
-                local_unfinished = not self.scheduler.is_finished() and not (
-                    self._is_rl_weights_offloaded or self._weight_sync_fenced
+                local_held = (
+                    self._is_rl_weights_offloaded
+                    or self._weight_sync_fenced
+                    or self._generation_paused
                 )
+                local_unfinished = not self.scheduler.is_finished() and not local_held
 
-                global_has_unfinished, global_shutdown, global_offloaded = (
-                    self._sync_dp_state(
-                        local_unfinished,
-                        shutdown,
-                        self._is_rl_weights_offloaded or self._weight_sync_fenced,
-                    )
+                # MAX-reduced: one held rank holds every rank of the group, so
+                # their forwards stay paired.
+                global_has_unfinished, global_shutdown, global_held = (
+                    self._sync_dp_state(local_unfinished, shutdown, local_held)
                 )
 
                 if global_shutdown and not global_has_unfinished:
@@ -984,9 +1050,10 @@ class DPEngineCoreProc(EngineCore):
                     )
                     break
 
-                if global_offloaded:
+                if global_held:
                     # Already engine-wide, which is what `note_idle` wants.
                     self.scheduler.engine_stats.note_idle(now)
+                    self._report_held_kv_work()
                     time.sleep(0.01)
                     continue
 
@@ -1034,17 +1101,17 @@ class DPEngineCoreProc(EngineCore):
         self,
         local_has_unfinished: bool,
         local_shutdown: bool = False,
-        local_offloaded: bool = False,
+        local_held: bool = False,
     ) -> tuple[bool, bool, bool]:
         if self._shutting_down:
-            return local_has_unfinished, True, local_offloaded
+            return local_has_unfinished, True, local_held
 
         try:
             state_tensor = torch.tensor(
                 [
                     1 if local_has_unfinished else 0,
                     1 if local_shutdown else 0,
-                    1 if local_offloaded else 0,
+                    1 if local_held else 0,
                 ],
                 dtype=torch.int64,
                 device="cpu",
@@ -1054,12 +1121,12 @@ class DPEngineCoreProc(EngineCore):
             )
             global_has_unfinished = state_tensor[0].item() == 1
             global_shutdown = state_tensor[1].item() == 1
-            global_offloaded = state_tensor[2].item() == 1
-            return global_has_unfinished, global_shutdown, global_offloaded
+            global_held = state_tensor[2].item() == 1
+            return global_has_unfinished, global_shutdown, global_held
         except RuntimeError as e:
             logger.warning(f"{self.label}: _sync_dp_state failed: {e}")
             self._shutting_down = True
-            return local_has_unfinished, True, local_offloaded
+            return local_has_unfinished, True, local_held
 
 
 # ---------------------------------------------------------------------------

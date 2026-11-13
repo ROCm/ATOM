@@ -551,7 +551,9 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
         var = self.model_runner.forward_vars
         token_to_req_gpu = var["qsa_token_to_req"].gpu[:num_tokens]
         logical_gpu = var["qsa_logical_positions"].gpu[:num_tokens]
-        block_tables = attn_metadata.block_tables
+        # A prefill uploads `running_bs` rows for the drafter; QSA pages
+        # through the `num_reqs` rows its `seq_lens` count.
+        block_tables = attn_metadata.block_tables[:num_reqs]
         slot_mapping = attn_metadata.slot_mapping[:num_tokens]
         persistent_slots = self.model_runner.forward_vars["qsa_compressed_slots"][
             :num_tokens

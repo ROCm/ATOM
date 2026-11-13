@@ -16,6 +16,7 @@ from dataclasses import replace
 from typing import Any
 
 from atom.kv_transfer.offload import config as offcfg
+from atom.model_engine.dp_routing.topology import prefix_spread_enabled
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -24,25 +25,45 @@ _MP_LAYOUT_VERSION = 3
 
 
 def _extra_config(config: Any) -> dict[str, Any]:
-    kvc = getattr(config, "kv_transfer_config", {}) or {}
-    extra = kvc.get("kv_connector_extra_config", {}) or {}
-    if not isinstance(extra, dict):
-        raise TypeError("kv_connector_extra_config must be a dictionary")
-    return extra
+    return dict(offcfg.connector_extras(getattr(config, "kv_transfer_config", None)))
 
 
 def _storage_kv_transfer_config(config: Any) -> dict[str, Any]:
     """Remove MP transport-only options before LMCache storage parsing."""
 
     kvc = dict(getattr(config, "kv_transfer_config", {}) or {})
-    extra = kvc.get("kv_connector_extra_config")
-    if isinstance(extra, dict):
-        kvc["kv_connector_extra_config"] = {
-            key: value
-            for key, value in extra.items()
-            if not (isinstance(key, str) and key.startswith("lmcache.mp."))
-        }
+    extra = {
+        key: value
+        for key, value in offcfg.connector_extras(kvc).items()
+        if not (isinstance(key, str) and key.startswith("lmcache.mp."))
+    }
+    if "kv_connector_extra_config" in kvc:
+        kvc["kv_connector_extra_config"] = extra
+    else:
+        kvc = extra
     return kvc
+
+
+def require_chunk_matches_server(adapter: Any, config: Any) -> None:
+    """Under `prefix_spread`, the chunk the router predicts loads with
+    (`offcfg.lmcache_chunk_tokens`) must be the one the MP server runs on.
+
+    The router reads the configured chunk before any server is asked; a
+    different server chunk would skew its load estimates. Nothing else reads
+    the configured value -- the connector itself runs on the server's chunk --
+    so other strategies and runs with only one routable engine are not
+    checked. Called by both worker registrations (PAGE-only and native-state).
+    """
+    if not prefix_spread_enabled(config):
+        return
+    configured = offcfg.lmcache_chunk_tokens(_storage_kv_transfer_config(config))
+    server = int(adapter.lmcache_tokens_per_chunk)
+    if configured != server:
+        raise ValueError(
+            "--dp-load-balance prefix_spread with LMCache MP needs the "
+            f"configured chunk to match the server: configured {configured} "
+            f"(lmcache.chunk_size or LMCACHE_CHUNK_SIZE), server {server}"
+        )
 
 
 def _mp_session_id(config: Any, request_id: Any) -> str:

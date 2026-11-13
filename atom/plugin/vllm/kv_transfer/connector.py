@@ -30,6 +30,11 @@ share it. Everything joint lives here: the lookup cap that keeps a missing state
 from ever producing a half-restored prefix, the block pins that hold a
 handed-off boundary block across its store, and the two-leg join that only
 reports a load finished once both halves have landed.
+
+Under the LMCache MP server there is no second leg: the state rides the PAGE
+object as a native-state image, so the two halves commit and restore as one
+object (``kda_ride`` for K3, ``v41_state`` for DeepSeek-V4.1's checkpoints,
+both through ``ride_mp_scheduler``).
 """
 
 import logging
@@ -47,6 +52,14 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 
 from atom.kv_transfer.disaggregation.types import ConnectorCompletion, req_id_of
 from atom.kv_transfer.offload._offload_common import offload_save_abandon_timeout_s
+from atom.kv_transfer.offload.config import select_offload_layout
+from atom.plugin.vllm.kv_transfer.kda_ride import (
+    KdaRidePlanner,
+    kda_ride_geometry,
+    kda_ride_page_order,
+    publish_kda_ride_state,
+    refuse_kda_ride_without_prerequisites,
+)
 from atom.plugin.vllm.kv_transfer.kda_state import (
     KdaBoundaryPlanner,
     KdaPageViews,
@@ -293,6 +306,9 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
     # -- takes the non-V4.1 path rather than raising AttributeError from a
     # branch that has nothing to do with what is under test.
     _is_deepseek_v41 = False
+    # Kimi-K3 (the `kimi_k3` offload layout), whose KDA state may ride the PAGE
+    # object over MP; see `_state_rides_mp`.
+    _is_kimi_k3 = False
     # The same, for the boundary planners: a stub that sets neither has none.
     _kda_planner = None
     _v41_planner = None
@@ -419,7 +435,8 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         # No-forward steps never call `wait_for_save`. Nothing writes the
         # boundary page on those steps, so `get_finished` may flush instead.
         self._kda_flush_stores_in_get_finished = False
-        # Scheduler half of the recurrent leg.
+        # Scheduler half of the recurrent leg: `KdaBoundaryPlanner` in-process,
+        # `KdaRidePlanner` when the state rides the PAGE object over MP.
         self._kda_planner = None
         # DeepSeek-V4.1's per-request CSA2 state, which rides the PAGE object:
         # only the scheduler half has anything to decide. None on every other
@@ -437,14 +454,22 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         self._requests: dict[str, Any] = {}
 
         self._offload_backend = self._resolve_offload_backend()
+        self._is_kimi_k3 = bool(self._mamba_groups) and (
+            select_offload_layout(self._config) == "kimi_k3"
+        )
         if self._is_deepseek_v41:
             self._refuse_v41_without_ride()
+        elif self._state_rides_mp:
+            # Kimi-K3's boundary state rides the PAGE object (`kda_ride`).
+            refuse_kda_ride_without_prerequisites(vllm_config)
         elif self._mamba_groups and self._offload_backend == "mp":
-            # The MP path carries recurrent state only as V4.1's checkpoint
-            # groups; a mamba group's boundary state has no leg there.
+            # The ride is sized and checked for K3's KDA layers over MLA planes
+            # only; another recurrent model's state has no leg on MP.
             raise ValueError(
-                "ATOM offload connector: recurrent (mamba) state offloads "
-                "in-process only; use atom.offload.backend='inproc'."
+                "ATOM offload connector: over the LMCache MP server only "
+                "Kimi-K3's KDA state rides the PAGE object; offload this "
+                "model's recurrent state in-process "
+                "(atom.offload.backend='inproc')."
             )
         elif role == KVConnectorRole.SCHEDULER:
             self._warn_unless_recompute()
@@ -456,12 +481,13 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 from .mp_worker_adapter import MPOffloadWorkerAdapter
 
                 # The PAGE-only worker, not the shell in `offload/mp/
-                # connector.py`: given V4.1's checkpoint spec the shell picks
-                # the native-state worker, which restores an image into an
-                # Active SLOT, while here the plugin restores it from the PAGE
-                # units a load fills. Its transfers are submitted and polled
-                # off the step thread: under the plugin's launch pressure both
-                # cost the step thread milliseconds.
+                # connector.py`: given a checkpoint spec the shell picks the
+                # native-state worker, which restores an image into an Active
+                # SLOT, while here the state is used from the PAGE units a load
+                # fills (V4.1 restores it from them, K3's KDA layers read them
+                # in place). Its transfers are submitted and polled off the
+                # step thread: under the plugin's launch pressure both cost
+                # the step thread milliseconds.
                 self._worker = MPOffloadWorkerAdapter(
                     LMCacheMPConnector(self._config, transfers_off_step=True)
                 )
@@ -479,28 +505,25 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 # vLLM owns the block pool and there is no such object, so the
                 # scheduler is constructed directly: the PAGE-only one that
                 # shell selects for a layout with no state checkpoints, or for
-                # V4.1, whose checkpoints vLLM holds and every transfer
-                # carries, `V41StateMPScheduler`. Both derive, as does
-                # `DenseOffloadScheduler`, from `ChunkedOffloadSchedulerBase`,
-                # which is where every method this connector calls on the
-                # scheduler half is defined.
+                # a model whose state vLLM holds and every transfer carries
+                # (V4.1's checkpoints, K3's KDA state), `StateRideMPScheduler`.
+                # Both derive, as does `DenseOffloadScheduler`, from
+                # `ChunkedOffloadSchedulerBase`, which is where every method
+                # this connector calls on the scheduler half is defined.
                 from atom.plugin.vllm.kv_transfer.plugin_schedulers import (
                     PluginMPScheduler,
                 )
 
                 if self._state_rides_mp:
-                    from atom.plugin.vllm.deepseek_v41_state_checkpoint import (
-                        v41_state_checkpoint_sizing,
-                    )
-                    from atom.plugin.vllm.kv_transfer.v41_mp_scheduler import (
-                        V41StateMPScheduler,
+                    from atom.plugin.vllm.kv_transfer.ride_mp_scheduler import (
+                        StateRideMPScheduler,
                     )
 
                     # Connected under the checkpoint spec's namespace, as the
-                    # workers register (`_publish_v41_state_checkpoints`).
-                    self._scheduler = V41StateMPScheduler(
-                        self._config,
-                        checkpoint_spec=v41_state_checkpoint_sizing(vllm_config).spec,
+                    # workers register (`_publish_v41_state_checkpoints`,
+                    # `_publish_kda_ride_state`).
+                    self._scheduler = StateRideMPScheduler(
+                        self._config, checkpoint_spec=self._ride_checkpoint_spec()
                     )
                 else:
                     self._scheduler = PluginMPScheduler(self._config)
@@ -510,7 +533,15 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 )
 
                 self._scheduler = PluginDenseScheduler(self._config)
-            if self._mamba_groups:
+            if self._mamba_groups and self._state_rides_mp:
+                self._kda_planner = KdaRidePlanner.from_vllm_config(
+                    vllm_config,
+                    kv_cache_config,
+                    self._mamba_groups,
+                    scheduler=self._scheduler,
+                    request_of=self._request_of,
+                )
+            elif self._mamba_groups:
                 self._kda_planner = KdaBoundaryPlanner.from_vllm_config(
                     vllm_config,
                     kv_cache_config,
@@ -525,7 +556,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                     scheduler=self._scheduler,
                     page_block_size=self._attn_block_size,
                     checkpoint_group_ids=self._v41_checkpoint_group_ids,
-                    request_of=self._v41_request_of,
+                    request_of=self._request_of,
                 )
             self._install_planners()
 
@@ -563,16 +594,41 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
 
     @property
     def _state_rides_mp(self) -> bool:
-        """True when DeepSeek-V4.1's checkpoint groups ride the PAGE object.
+        """True when recurrent state rides the PAGE object to the MP server.
 
-        A checkpoint is PAGE units of the same proxy pool, so every transfer
-        names them as a native-state image (`v41_mp_scheduler`) and the worker
-        registers them through the native layout.
+        Two models get there, and only these two. DeepSeek-V4.1's checkpoint
+        groups are PAGE units of its proxy pool; Kimi-K3's KDA mamba groups
+        alias its leading MLA planes (`kda_ride`). Either way the state at a
+        boundary is PAGE units, so every transfer names them as a native-state
+        image (`ride_mp_scheduler`) and the worker registers them through the
+        native layout. K3 is named by its offload layout rather than by its
+        mamba type: its KDA layers report `GDN_ATTN`, as Qwen's GDN layers do,
+        and those are refused on MP in `__init__`.
         """
-        return (
-            self._offload_backend == "mp"
-            and self._is_deepseek_v41
-            and bool(self._v41_checkpoint_group_ids)
+        if self._offload_backend != "mp":
+            return False
+        if self._is_deepseek_v41:
+            return bool(self._v41_checkpoint_group_ids)
+        return self._is_kimi_k3 and bool(self._mamba_groups)
+
+    def _ride_checkpoint_spec(self):
+        """The checkpoint spec the riding state's namespace is named by.
+
+        Built from vLLM's config on both halves, so the scheduler, which has
+        no tensors, looks up the namespace the workers register under.
+        """
+        if self._is_deepseek_v41:
+            from atom.plugin.vllm.deepseek_v41_state_checkpoint import (
+                v41_state_checkpoint_sizing,
+            )
+
+            return v41_state_checkpoint_sizing(self._vllm_config).spec
+        return self._kda_ride_geometry().spec
+
+    def _kda_ride_geometry(self):
+        """Where the KDA state sits in the PAGE unit; see `kda_ride_geometry`."""
+        return kda_ride_geometry(
+            self._kv_cache_config, self._attn_group_id, self._mamba_groups
         )
 
     def _refuse_v41_without_ride(self) -> None:
@@ -779,7 +835,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             )
         return others[0]
 
-    def _v41_request_of(self, seq):
+    def _request_of(self, seq):
         """The vLLM request a scheduler ``SeqView`` stands for, or None.
 
         The planner needs it for its block hashes. It is read off the
@@ -811,9 +867,9 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         (`install_hit_cap_hook`), so a second planner's cap would silently
         replace the first's and leave that leg's hits unchecked -- a prefix
         restored on somebody else's state. No supported configuration builds
-        two (V4.1 offloads only over mp, a recurrent model is refused there,
-        and V4.1's checkpoint groups are kept out of the recurrent leg); this
-        keeps a new one from doing it quietly.
+        two (a mamba model's leg is the KDA one on either backend, and V4.1's
+        checkpoint groups are kept out of it); this keeps a new one from doing
+        it quietly.
         """
         planners = self._planners
         if len(planners) > 1:
@@ -852,6 +908,12 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             tensors = build_kv_cache_tensors(attention_caches, self._attention_layers())
             if not tensors:
                 raise ValueError("ATOM offload connector: vLLM registered no KV caches")
+            if self._state_rides_mp:
+                # The image covers a leading run of PAGE planes: put the layers
+                # the KDA state aliases there (`kda_ride_page_order`).
+                tensors = kda_ride_page_order(
+                    tensors, self._kda_state_tensors(per_group, list(groups))
+                )
 
             # Every segment's per-block stride is derived from num_blocks, so it
             # has to be the count of blocks vLLM's block tables name, which is
@@ -881,8 +943,12 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 num_blocks=num_blocks,
                 tp_replication_factor=replication,
             )
-            if self._state_rides_mp:
+            if self._state_rides_mp and self._is_deepseek_v41:
                 self._publish_v41_state_checkpoints(transfer_tensors, replication)
+            elif self._state_rides_mp:
+                self._publish_kda_ride_state(
+                    self._kda_state_tensors(per_group, list(groups)), transfer_tensors
+                )
             logger.info(
                 "ATOM LMCache offload: publishing PAGE layout (%s), "
                 "tp_replication_factor=%d",
@@ -934,6 +1000,18 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 shape,
                 dtype,
             )
+
+    def _kda_state_tensors(self, per_group, groups) -> list:
+        """The mamba groups' registered layers, in group order and within a
+        group vLLM's own layer order (`gather_group_tensors`)."""
+        group_ids = [group_id for group_id, _ in self._mamba_groups]
+        return gather_group_tensors(per_group, groups, group_ids)
+
+    def _publish_kda_ride_state(self, tensors_by_group, transfer_tensors) -> None:
+        """Declare the KDA state's images on the PAGE layout (`kda_ride`)."""
+        publish_kda_ride_state(
+            transfer_tensors, tensors_by_group, self._kda_ride_geometry()
+        )
 
     def _publish_v41_state_checkpoints(self, transfer_tensors, replication: int):
         """Declare the PAGE units' checkpoint images, as native V4.1 does.
