@@ -2906,7 +2906,7 @@ class MooncakeConnector(KVConnectorBase):
         nbytes = len(dst_block_ids) * sum(self._per_block_bytes_list)
         logger.info(
             "Mooncake transfer stats: req=%s protocol=%s ok=%s blocks=%d "
-            "bytes=%d wait_ms=%.3f write_ms=%.3f gbps=%.1f",
+            "bytes=%d wait_ms=%.3f write_ms=%.3f gbps=%.1f tp=%d",
             request_data.get("request_id"),
             self.protocol,
             transfer_ok,
@@ -2915,6 +2915,7 @@ class MooncakeConnector(KVConnectorBase):
             (write_started - received) * 1e3,
             write_ms,
             nbytes / max(write_ms, 1e-6) / 1e6,
+            self.tp_rank,
         )
 
     def _acquire_chunked_reader(
