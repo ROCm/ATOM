@@ -343,6 +343,22 @@ def test_engine_boundary_checks_structured_requests_before_tokenization(fields):
     processor.structured_admission.assert_called_once()
 
 
+@pytest.mark.parametrize("fields", STRUCTURED)
+def test_engine_boundary_rejects_a_grammar_with_a_required_channel(fields):
+    from atom.model_engine.llm_engine import InputOutputProcessor
+    from atom.sampling_params import RequiredChannel, SamplingParams
+
+    processor = InputOutputProcessor.__new__(InputOutputProcessor)
+    processor.config = NS()
+    processor.structured_admission = Mock()
+    channel = RequiredChannel(after=(1,), opening=(2,), opens_at=1, end_ids=(3,))
+    with pytest.raises(ValueError, match="both a structured-output grammar"):
+        processor.preprocess_fanout(
+            "prompt", SamplingParams(required_channel=channel, **fields)
+        )
+    processor.structured_admission.assert_not_called()
+
+
 def test_speculative_schema_logprobs_refused_instead_of_wrong_distribution():
     from atom.sampling_params import SamplingParams
     from atom.structured_output.validation import validate_execution_options

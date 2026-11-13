@@ -103,13 +103,6 @@ class SingleStepModel(CheckModel, StepOverrideModel, nn.Module):
         self._served, self._decode_batch = runner, batch
         return runner
 
-    def decline_step(self, batch):
-        # Replay does not call Python forward. The production drafter must run
-        # and invalidate kept kernel q for this batch, rather than reuse the
-        # previously served batch's drafts or forget unrelated requests.
-        self._served = None
-        self._decode_batch = self._step_batch = batch
-
     def single_step_runner(self, batch, rows: int):
         """The runner when this decode step runs as the single launch, else None (the production path). Only a
         DSpark verify with nothing the kernel does not produce: no structured output, no logprobs, no required

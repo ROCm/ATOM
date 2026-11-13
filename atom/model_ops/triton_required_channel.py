@@ -1,5 +1,47 @@
 # SPDX-License-Identifier: MIT
-"""Triton kernels for required-channel masking and state transitions."""
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+"""Hold a step's target logits to each request's `RequiredChannel`.
+
+A request with a required channel (Kimi-K3's tools channel under
+`tool_choice="required"`) may not end before the channel opens, and once its
+output ends with `after` the next tokens are `opening`. Both are decided per
+logits row, from the state the output has reached by that row:
+
+* a decode row's state is its sequence's state after the anchor;
+* a verification row's state is that, advanced over the drafts before it --
+  the row checks the draft that follows those, so it must be constrained as
+  if they had been accepted;
+* the bonus row comes after every draft.
+
+Masking the target rows is enough for every sampling path. A sampled target
+row that disagrees with its draft rejects it, greedy verification compares
+against the argmax of the masked row, and the bonus is sampled from its masked
+row like a plain decode.
+
+Where the anchor's state comes from:
+
+* the host, when it has every token up to the anchor (`batch` state, staged
+  with the other sampling parameters);
+* the previous forward's output, on the GPU, when deferred output means the
+  host has not seen that forward's tokens yet (`carried_from` names the row).
+  `advance_states` computes that output after each forward from the tokens
+  actually emitted, so the next one reads it in place, as it reads the anchor
+  itself.
+
+The host cannot patch a token after the fact: the next forward has already
+taken the sampled ids as its input, and its KV and recurrent state with them.
+
+`constrain_logits` runs `VOCAB_PROGRAMS` programs per request: a forced row
+spans K3's whole 163,840-id vocabulary, and one program per request wrote it
+serially at ~58 us a row (~400 us for a DSpark7 step's seven). Each program
+writes every `VOCAB_PROGRAMS`-th block of the row, -inf everywhere but the
+forced id, without reading it. Few enough programs per request that a step
+with no forced row costs what one program per request did. `advance_states`
+runs one program per request. The pure-torch twins in
+`required_channel.py` follow `RequiredChannel.step` one token at a time and are
+what the CPU tests check.
+"""
 
 import torch
 import triton
@@ -63,7 +105,6 @@ def _constrain_row_block(
     OPEN_LEN: tl.constexpr,
     END_LEN: tl.constexpr,
     BLOCK_V: tl.constexpr,
-    preserve_masks,
 ):
     """Mask program `vb`'s share of one logits row for state `s`.
 
@@ -79,7 +120,7 @@ def _constrain_row_block(
         for first in range(vb * BLOCK_V, vocab_size, nprog * BLOCK_V):
             col = first + tl.arange(0, BLOCK_V)
             mask_token_columns(row_ptr, col, col != forced, col < vocab_size)
-        if (not preserve_masks) & ((forced // BLOCK_V) % nprog == vb):
+        if (forced // BLOCK_V) % nprog == vb:
             # Its own value, unless the model ruled it out too: then 0, so the
             # row keeps a finite logit and its softmax is not NaN.
             x = tl.load(row_ptr + forced)
@@ -109,8 +150,6 @@ def _constrain_logits_kernel(
     input_ids_ptr,  # the step's input ids
     target_logits_indices_ptr,  # [num_drafts]
     table_ptr,
-    preserve_ptr,
-    PER_REQUEST_PRESERVE: tl.constexpr,
     HAS_CARRY: tl.constexpr,
     HAS_DRAFTS: tl.constexpr,
     AFTER_LEN: tl.constexpr,
@@ -118,16 +157,12 @@ def _constrain_logits_kernel(
     OPENS_AT: tl.constexpr,
     END_LEN: tl.constexpr,
     BLOCK_V: tl.constexpr,
-    PRESERVE_MASKS: tl.constexpr,
 ):
     # Every one of the request's programs walks its drafts for the states;
     # each writes only its own share of the rows.
     i = tl.program_id(0)
     vb = tl.program_id(1)
     nprog = tl.num_programs(1)
-    preserve = PRESERVE_MASKS
-    if PER_REQUEST_PRESERVE:
-        preserve = tl.load(preserve_ptr + i)
     s = tl.load(states_ptr + i)
     if HAS_CARRY:
         src = tl.load(carried_from_ptr + i)
@@ -153,7 +188,6 @@ def _constrain_logits_kernel(
                 OPEN_LEN,
                 END_LEN,
                 BLOCK_V,
-                preserve,
             )
             draft = tl.load(input_ids_ptr + tl.load(target_logits_indices_ptr + r) + 1)
             s = _step(s, draft, table_ptr, AFTER_LEN, OPEN_LEN, OPENS_AT)
@@ -168,7 +202,6 @@ def _constrain_logits_kernel(
         OPEN_LEN,
         END_LEN,
         BLOCK_V,
-        preserve,
     )
 
 
@@ -208,7 +241,6 @@ def constrain_logits(
     cu_num_draft_tokens: torch.Tensor | None = None,
     input_ids: torch.Tensor | None = None,
     target_logits_indices: torch.Tensor | None = None,
-    preserve_masks: bool | torch.Tensor = False,
 ) -> torch.Tensor:
     """Mask the step's target rows in place; return each request's base state.
 
@@ -254,8 +286,6 @@ def constrain_logits(
         input_ids if has_drafts else states,
         target_logits_indices if has_drafts else states,
         channel.table,
-        preserve_masks if isinstance(preserve_masks, torch.Tensor) else states,
-        PER_REQUEST_PRESERVE=isinstance(preserve_masks, torch.Tensor),
         HAS_CARRY=has_carry,
         HAS_DRAFTS=has_drafts,
         AFTER_LEN=channel.after_len,
@@ -263,9 +293,6 @@ def constrain_logits(
         OPENS_AT=channel.opens_at,
         END_LEN=channel.end_len,
         BLOCK_V=BLOCK_V,
-        PRESERVE_MASKS=(
-            False if isinstance(preserve_masks, torch.Tensor) else preserve_masks
-        ),
     )
     return base
 

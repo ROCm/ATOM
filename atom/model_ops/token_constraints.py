@@ -10,12 +10,7 @@ import torch
 
 @dataclass(frozen=True)
 class TokenConstraint:
-    """A static allowed-token set used to compile grammar stop masks.
-
-    Small static ID lists can compile once to an allowed-token bitmask. Dynamic
-    grammars fill that representation directly; GPU channel state machines apply
-    the same allow/deny semantics without transferring lists to the host.
-    """
+    """A static allowed-token set, compiled once to a packed bitmask (the stop ids)."""
 
     token_ids: tuple[int, ...]
 

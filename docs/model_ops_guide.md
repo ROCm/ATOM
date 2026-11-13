@@ -29,7 +29,6 @@ ATOM (AiTer Optimized Model) wraps AITER kernels with model-level abstractions f
 | `RejectionSampler` | `rejection_sampler.py`, `verify_kernels.py`, `spec_sampling/` (`ratio_verify.py`, `ratio_target_p.py`) | Triton `rejection_greedy_sample_kernel`, `_ratio_*`, `rejection_relaxed_sample_kernel`, `rejection_synthetic_sample_kernel` | Speculative decoding |
 | `apply_packed_bitmask` | `triton_token_constraints.py` | Triton packed-bitmask kernel | JSON grammar masks on selected target logits |
 | `constrain_logits`, `advance_states` | `triton_required_channel.py` | Triton `_constrain_logits_kernel`, `_advance_states_kernel` | `tool_choice="required"` channel mask (Kimi-K3) |
-| `guard_empty_rows` | `triton_token_constraints.py` | Triton `_finite_tiles` | Detect empty hard-mask intersections across constraint adapters |
 
 ## AITER integration overview
 
@@ -507,17 +506,14 @@ keeps its packed vocabulary masks. Both use the shared token-column masking
 primitive rather than separate logits-write implementations. Internal
 `TokenConstraint.allow(ids)` compiles the grammar manager's static stop mask.
 
-Masks intersect: a K3 forced token cannot restore a token forbidden by Schema.
-An empty intersection produces a request error through the existing output-copy
-pipeline; its error marker never becomes a next-forward token. Accepted tokens
-advance grammar and channel state after verification and broadcasts. Grammar
-input copies still overlap target forward, and channel state uses the existing
-GPU carry when deferred output means the host is one step behind.
+A request carries at most one of the two: `LLMEngine.add_request` rejects a
+JSON Schema together with a required channel. Accepted tokens advance grammar
+and channel state after verification and broadcasts. Grammar input copies still
+overlap target forward, and channel state uses the existing GPU carry when
+deferred output means the host is one step behind. No constraints means no
+constraint-step allocation or new mask kernel.
 
-No constraints means no constraint-step allocation or new mask kernel. Schema
-plus channel additionally checks for an empty intersection.
-
-### Required channel (`required_channel.py`)
+### Required channel (`triton_required_channel.py`)
 
 Holds a request with a `RequiredChannel` (`atom/sampling_params.py`; today only
 Kimi-K3 under `tool_choice="required"`) to its tools channel by masking the
@@ -542,8 +538,9 @@ writing every 16th 1,024-column block of a forced row without reading it;
 `advance_states` runs one per request. On MI355X over K3's vocabulary a step
 with no forced row costs what one program per request did (5-7 us for a
 DSpark7 verify step at bs 1-64), and one with all seven draft rows forced
-15-52 us. A batch with no unopened channel launches neither kernel. `constrain_logits_reference` / `advance_states_reference` are
-the pure-torch twins the tests hold the kernels to.
+15-52 us. A batch with no unopened channel launches neither kernel.
+`constrain_logits_reference` / `advance_states_reference` (`required_channel.py`)
+are the pure-torch twins the tests hold the kernels to.
 
 ### `RejectionSampler` (`rejection_sampler.py`)
 

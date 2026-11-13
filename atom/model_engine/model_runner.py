@@ -84,7 +84,6 @@ from atom.model_engine.state_runtime import StateRuntime
 from atom.model_engine.token_constraints import (
     TokenConstraints,
     constraint_errors,
-    error_tokens,
     has_constraints,
     needs_constraint_snapshot,
     prepare_token_constraints,
@@ -437,17 +436,9 @@ class tokenIDProcessor:
         sync_event: torch.cuda.Event,
         sampled_logprobs: torch.Tensor | None = None,
         channel_states: torch.Tensor | None = None,
-        constraint_failed: torch.Tensor | None = None,
     ) -> tuple[dict[int, tuple[int, ...]], dict[int, list[TokenLogprob]] | None]:
-        output_ids = sampled_token_ids
-        if constraint_failed is not None:
-            output_ids = error_tokens(sampled_token_ids, constraint_failed)
-            if self.is_deferred_out and sampled_token_ids.is_cuda:
-                # The caller recorded before this output-only transform. D2H
-                # must wait for its completion too, not copy uninitialized IDs.
-                sync_event.record()
         if not self.is_deferred_out:
-            token_ids = output_ids.tolist()
+            token_ids = sampled_token_ids.tolist()
             req_ids = batch.req_ids
             if token_ids and isinstance(token_ids[0], list):
                 processed = self._batch_process_token_ids(token_ids)
@@ -465,7 +456,7 @@ class tokenIDProcessor:
         token_ids = self.recv_async_output(self.token_ids_cpu)
         logprobs = self.recv_logprobs()
         self.send_to_cpu_async(
-            output_ids,
+            sampled_token_ids,
             self.token_ids_cpu,
             sync_event,
             gpu_logprobs=sampled_logprobs,
@@ -3401,14 +3392,11 @@ class ModelRunner:
                     return logits, hidden_states
 
                 if self._step_override is not None:
-                    if has_constraints(batch):
-                        self.model.decline_step(batch)
-                    else:
-                        # The model ran the whole step (target, sampling, verify,
-                        # drafts): no logits; postprocess reads its outputs.
-                        self._served = self._step_override(input_ids, running_bs, batch)
-                        if self._served is not None:
-                            return None, None
+                    # The model ran the whole step (target, sampling, verify,
+                    # drafts): no logits; postprocess reads its outputs.
+                    self._served = self._step_override(input_ids, running_bs, batch)
+                    if self._served is not None:
+                        return None, None
 
                 graph_key = request_bucket(
                     running_bs, forward_context.attn_metadata.max_seqlen_q
@@ -3664,15 +3652,9 @@ class ModelRunner:
 
         # From the ids every rank now agrees on. Only a deferred step needs
         # it: otherwise the host has these ids before the next forward.
-        constraint_failed = (
-            constraints.failed(sampled_tokens) if constraints is not None else None
-        )
         channel_states = (
             constraints.commit(
-                sampled_tokens,
-                batch,
-                self.tokenID_processor.is_deferred_out,
-                constraint_failed,
+                sampled_tokens, batch, self.tokenID_processor.is_deferred_out
             )
             if constraints is not None
             else None
@@ -3706,21 +3688,7 @@ class ModelRunner:
             self.forward_done_event,
             sampled_logprobs,
             channel_states=channel_states,
-            constraint_failed=constraint_failed,
         )
-        output_errors = constraint_errors(self)
-        # Read only the output already delivered by the existing D2H pipeline.
-        # Keep safe sampled IDs for GPU carry; never feed the error sentinel back.
-        delivered = prev_batch if self.tokenID_processor.is_deferred_out else batch
-        if has_constraints(delivered):
-            for req_id, ids in tuple(token_id_dict.items()):
-                if -2 in ids:
-                    if output_errors is None:
-                        output_errors = {}
-                    output_errors[req_id] = (
-                        "Token constraints leave no valid continuation"
-                    )
-                    token_id_dict[req_id] = ()
         req_ids_out = list(token_id_dict)
         token_ids_out = list(token_id_dict.values())
 
@@ -3788,7 +3756,7 @@ class ModelRunner:
             num_bonus=prev_bonus_num,
             logprobs=logprobs_map,
             dspark_ell=dspark_ell,
-            constraint_errors=output_errors or None,
+            constraint_errors=constraint_errors(self),
         )
 
     def _kv_after_forward(self) -> None:

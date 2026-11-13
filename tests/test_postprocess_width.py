@@ -371,11 +371,8 @@ def _payload_tensors(payload):
 
 
 @pytest.mark.parametrize("speculative", [False, True])
-@pytest.mark.parametrize("schema", [False, True])
 @pytest.mark.parametrize("enabled", [False, True])
-def test_channel_constraint_preserves_raw_logprobs(
-    monkeypatch, speculative, schema, enabled
-):
+def test_channel_constraint_preserves_raw_logprobs(monkeypatch, speculative, enabled):
     from atom.model_engine.token_logprobs import LogprobRows, host_logprob_rows
 
     md = (
@@ -400,17 +397,10 @@ def test_channel_constraint_preserves_raw_logprobs(
     batch.top_logprobs = [3, 0]
     batch.required_channel = object()
 
-    def force_channel(_runner, _batch, bonus, _metadata, target, preserve_masks=False):
-        if schema:
-            assert preserve_masks.dtype == torch.bool
-            assert preserve_masks.tolist() == [True, False]
-        else:
-            assert preserve_masks is False
+    def force_channel(_runner, _batch, bonus, _metadata, target):
         for logits in (bonus, target):
             if logits is not None:
                 logits[:, 1:] = -float("inf")
-        # This fixture constrains both sampled rows, matching the active-state
-        # return value used to compose channel and other per-request masks.
         return (None, torch.zeros(_batch.total_seqs_num, dtype=torch.int32))
 
     monkeypatch.setattr(
@@ -434,16 +424,6 @@ def test_channel_constraint_preserves_raw_logprobs(
             gpu=torch.tensor([0, 3, 6] if speculative else [0, 1, 2])
         ),
     }
-    if schema:
-        batch.structured_requests = {0: ("schema", (), ())}
-
-        def grammar_mask(logits, *_):
-            logits[:, 4:] = -float("inf")
-            return {}
-
-        runner.structured_output = types.SimpleNamespace(
-            vocab_size=8, apply=grammar_mask, errors={}
-        )
     if speculative:
 
         def verify(_md, target, bonus, **_):
@@ -456,9 +436,7 @@ def test_channel_constraint_preserves_raw_logprobs(
     seen = {}
 
     def transfer(_batch, ids, _event, payload, **kwargs):
-        seen.update(
-            ids=ids.clone(), payload=payload, failed=kwargs["constraint_failed"]
-        )
+        seen.update(ids=ids.clone(), payload=payload)
         return {}, None
 
     runner.tokenID_processor.prepare_sampled_ids = transfer
@@ -479,7 +457,6 @@ def test_channel_constraint_preserves_raw_logprobs(
     )
     runner.postprocess(batch, raw.clone(), torch.ones(2), None, None, True, None)
     assert torch.all(seen["ids"] == 0)
-    assert seen["failed"] is None or not seen["failed"].any()
     if not enabled:
         assert seen["payload"] is None
         return

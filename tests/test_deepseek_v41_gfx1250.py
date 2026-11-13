@@ -333,7 +333,7 @@ def test_a_constrained_replay_declines_previous_served_drafts(served):
     batch = _batch(
         structured_requests=[1], total_seqs_num=1, req_ids=["current", "other"]
     )
-    m.decline_step(batch)
+    assert m.step_override(torch.zeros(48), 8, batch) is None
     drafter.compute_draft_kv()
     assert drafter.kv == 1
     assert drafter.propose(next_token_ids=torch.zeros(1)) == "production"

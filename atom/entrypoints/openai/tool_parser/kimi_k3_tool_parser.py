@@ -23,7 +23,7 @@ import logging
 import re
 from typing import ClassVar
 
-from atom.constraint_parser import ChannelRule, ConstraintParser
+from atom.constraint_parser import ChannelRule, parse_channel_rule
 from atom.sampling_params import RequiredChannel
 
 from .. import kimi_k3_tokens as k3
@@ -268,7 +268,7 @@ class KimiK3Parser(ToolCallParser):
         Derived once per server, where the parser is resolved
         (`registry.required_call_channel`).
         """
-        return ConstraintParser.parse(
+        return parse_channel_rule(
             ChannelRule(
                 after=k3.RESPONSE_END,
                 opening=k3.TOOLS_START + KIMI_K3_CALL_PREFIX,

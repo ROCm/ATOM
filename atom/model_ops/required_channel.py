@@ -1,45 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Hold a step's target logits to each request's `RequiredChannel`.
+"""A `RequiredChannel` as the kernels read it, and its pure-torch twins.
 
-A request with a required channel (Kimi-K3's tools channel under
-`tool_choice="required"`) may not end before the channel opens, and once its
-output ends with `after` the next tokens are `opening`. Both are decided per
-logits row, from the state the output has reached by that row:
-
-* a decode row's state is its sequence's state after the anchor;
-* a verification row's state is that, advanced over the drafts before it --
-  the row checks the draft that follows those, so it must be constrained as
-  if they had been accepted;
-* the bonus row comes after every draft.
-
-Masking the target rows is enough for every sampling path. A sampled target
-row that disagrees with its draft rejects it, greedy verification compares
-against the argmax of the masked row, and the bonus is sampled from its masked
-row like a plain decode.
-
-Where the anchor's state comes from:
-
-* the host, when it has every token up to the anchor (`batch` state, staged
-  with the other sampling parameters);
-* the previous forward's output, on the GPU, when deferred output means the
-  host has not seen that forward's tokens yet (`carried_from` names the row).
-  `advance_states` computes that output after each forward from the tokens
-  actually emitted, so the next one reads it in place, as it reads the anchor
-  itself.
-
-The host cannot patch a token after the fact: the next forward has already
-taken the sampled ids as its input, and its KV and recurrent state with them.
-
-`constrain_logits` runs `VOCAB_PROGRAMS` programs per request: a forced row
-spans K3's whole 163,840-id vocabulary, and one program per request wrote it
-serially at ~58 us a row (~400 us for a DSpark7 step's seven). Each program
-writes every `VOCAB_PROGRAMS`-th block of the row, -inf everywhere but the
-forced id, without reading it. Few enough programs per request that a step
-with no forced row costs what one program per request did. `advance_states`
-runs one program per request. The pure-torch twins follow
-`RequiredChannel.step` one token at a time and are what the CPU tests check.
+The kernels are in `triton_required_channel.py`. This module holds what they
+share with the CPU tests: `DeviceChannel`, the launch constants, and the twins
+that follow `RequiredChannel.step` one token at a time.
 """
 
 from typing import NamedTuple
@@ -81,15 +47,13 @@ class DeviceChannel(NamedTuple):
         )
 
 
-def _constrain_row_reference(
-    row: torch.Tensor, state: int, channel: RequiredChannel, preserve_masks=False
-):
+def _constrain_row_reference(row: torch.Tensor, state: int, channel: RequiredChannel):
     if state < 0:
         return
     if len(channel.after) <= state < len(channel.after) + len(channel.opening):
         forced = channel.table[state]
         kept = row[forced].clone()
-        if not preserve_masks and kept == float("-inf"):
+        if kept == float("-inf"):
             kept.zero_()
         row.fill_(float("-inf"))
         row[forced] = kept
@@ -108,7 +72,6 @@ def constrain_logits_reference(
     cu_num_draft_tokens: torch.Tensor | None = None,
     input_ids: torch.Tensor | None = None,
     target_logits_indices: torch.Tensor | None = None,
-    preserve_masks: bool | torch.Tensor = False,
 ) -> torch.Tensor:
     """Pure-torch twin of `constrain_logits`, runnable on CPU.
 
@@ -121,20 +84,15 @@ def constrain_logits_reference(
             if src >= 0:
                 base[i] = carried_states[src]
     for i, state in enumerate(base.tolist()):
-        preserve = (
-            bool(preserve_masks[i])
-            if isinstance(preserve_masks, torch.Tensor)
-            else preserve_masks
-        )
         if state < 0:
             continue
         if target_logits is not None:
             start = 0 if i == 0 else int(cu_num_draft_tokens[i - 1])
             for r in range(start, int(cu_num_draft_tokens[i])):
-                _constrain_row_reference(target_logits[r], state, channel, preserve)
+                _constrain_row_reference(target_logits[r], state, channel)
                 draft = int(input_ids[int(target_logits_indices[r]) + 1])
                 state = channel.step(state, draft)
-        _constrain_row_reference(last_logits[i], state, channel, preserve)
+        _constrain_row_reference(last_logits[i], state, channel)
     return base
 
 
