@@ -3235,16 +3235,14 @@ class Config:
         # draft layer's KV.
         if self.speculative_config is None or role == "kv_producer":
             return
-        from atom.models.registry import pp_speculative_methods
+        from atom.models.registry import pp_speculative_method, serves_pp_speculation
 
-        archs = getattr(self.hf_config, "architectures", None) or ()
-        spec = self.speculative_config
-        method = "dspark" if spec.use_dspark() else spec.method
-        if not any(method in pp_speculative_methods.get(a, ()) for a in archs):
+        if not serves_pp_speculation(self):
             raise ValueError(
                 "pipeline_parallel_size > 1 with speculative decoding supports "
                 "only the methods registry.pp_speculative_methods declares, got "
-                f"architectures={list(archs)}, method={method!r}."
+                f"architectures={getattr(self.hf_config, 'architectures', None)}, "
+                f"method={pp_speculative_method(self)!r}."
             )
         if self.dspark.confidence_schedule:
             raise ValueError(

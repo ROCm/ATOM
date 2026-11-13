@@ -690,8 +690,7 @@ class DSparkDraftModel(nn.Module):
                 f"vocab {target_vocab}. The draft shares the target's embedding "
                 "and LM head, so the two must agree."
             )
-        # A draft that loaded its own embedding (K3 DSpark on PP stage > 0)
-        # keeps it.
-        if self.embed_tokens is None:
-            self.embed_tokens = target_base.model.embed_tokens
+        # A stage without the target's embedding binds its PPMissingLayer,
+        # which the drafter's check_shared_embedding refuses.
+        self.embed_tokens = target_base.model.embed_tokens
         self.lm_head = target_base.lm_head
