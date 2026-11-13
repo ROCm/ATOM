@@ -722,8 +722,10 @@ staging pools and the dense or M3 PAGE codecs. What differs:
 
 Select it with
 `{"kv_connector": "umbp_store", "kv_role": "offload", "kv_connector_extra_config": {"umbp_store.address": "unix:///tmp/umbp/server.sock"}}`,
-alone or beside a P/D producer under `multi`. Settings, server start-up and a
-MiniMax-M3 walkthrough (aggregated and PD) are in
+alone or beside a P/D producer under `multi`. How to install, start and check UMBP, with the settings table, is in
+[`recipes/UMBP-KV-Offload.md`](../../../recipes/UMBP-KV-Offload.md). MiniMax-M3
+walkthroughs: aggregated TP4 in
+[`recipes/MiniMax-M3-UMBP.md`](../../../recipes/MiniMax-M3-UMBP.md), PD 1P1D in
 [`recipes/mesh/Agentic-MiniMax-M3-UMBP.md`](../../../recipes/mesh/Agentic-MiniMax-M3-UMBP.md).
 
 ## In-process `lmcache_offload` Architecture

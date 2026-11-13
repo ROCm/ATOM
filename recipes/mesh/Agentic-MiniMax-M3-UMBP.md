@@ -1,16 +1,12 @@
-# MiniMax-M3 with Mori UMBP KV Offload (`umbp_store`)
+# MiniMax-M3 PD 1P1D with a Mori UMBP tier on the prefill node
 
-This recipe runs MiniMax-M3 on ATOM with a Mori UMBP standalone server as the
-CPU KV tier, through the `umbp_store` offload connector. It covers two
-deployments:
+PD disaggregation for MiniMax-M3 with the prefill node's KV offload tier served by a
+Mori UMBP standalone server (`umbp_store`). It is the topology of
+[Agentic-MiniMax-M3.md](Agentic-MiniMax-M3.md), with `lmcache_offload` in the prefill
+node's `multi` connector replaced by `umbp_store`.
 
-- **Aggregated TP4 + UMBP**: the same server as
-  [MiniMax-M3-Agentic-InferenceX.md](../MiniMax-M3-Agentic-InferenceX.md), with
-  `lmcache_offload` replaced by `umbp_store`.
-- **PD 1P1D + UMBP on the prefill node**: the same topology as
-  [Agentic-MiniMax-M3.md](Agentic-MiniMax-M3.md), with the prefill node's
-  `multi` connector holding `mooncake` (P/D transfer) and `umbp_store`
-  (offload).
+- How to install, start and check UMBP: [UMBP-KV-Offload.md](../UMBP-KV-Offload.md)
+- The same model aggregated on TP4 with UMBP: [MiniMax-M3-UMBP.md](../MiniMax-M3-UMBP.md)
 
 The benchmark client and workload are the SemiAnalysis AgentX replay described
 in [MiniMax-M3-Agentic-InferenceX.md](../MiniMax-M3-Agentic-InferenceX.md).
@@ -42,84 +38,22 @@ in [MiniMax-M3-Agentic-InferenceX.md](../MiniMax-M3-Agentic-InferenceX.md).
 
 ## Prerequisites
 
-- An ATOM container whose Mori build includes UMBP. Check both pieces:
-
-  ```bash
-  python3 -c "import mori.umbp; print('umbp ok')"
-  python3 -c 'import mori.umbp,pathlib;print(pathlib.Path(mori.umbp.__file__).resolve().parents[1]/"umbp_standalone_server")'
-  ```
-
-- A Mori build that includes ROCm/mori#791 ("a lookup renews the keys it
-  finds"): `amd_mori_nightly` 1.2.6.dev20261109 or later, or Mori main.
-  Without it, a lookup does not refresh the LRU, so a prefix that keeps
-  hitting in HBM (the shared system-prompt head chunk above all) ages out of
-  UMBP first, and every later lookup of that conversation misses from chunk 0.
-
+- Mori with UMBP, including ROCm/mori#791: see
+  [UMBP-KV-Offload.md § Requirements](../UMBP-KV-Offload.md#1-requirements).
 - The model and EAGLE3 draft as in
   [MiniMax-M3-Agentic-InferenceX.md](../MiniMax-M3-Agentic-InferenceX.md).
 - For PD: RDMA between the prefill and decode GPUs (see
   [Agentic-MiniMax-M3.md](Agentic-MiniMax-M3.md) and the Mooncake notes in
   Troubleshooting below).
 
-## Step 1: Start the UMBP standalone server
+## Step 1: Start the UMBP server on the prefill node
 
-Run it in the same container as the ATOM server it serves. Size the pool for
-the whole node: the ranks share it, unlike a per-rank LMCache CPU tier.
+Follow [UMBP-KV-Offload.md § Start the server](../UMBP-KV-Offload.md#2-start-the-server),
+with `ROCR_VISIBLE_DEVICES` set to the prefill server's GPUs (`0,1,2,3` here) and the
+pool sized for the prefill node. Wait for the readiness check to pass. The decode node
+needs no UMBP server.
 
-```bash
-export UMBP_ADDR=unix:///tmp/umbp/server.sock
-UMBP_BIN=$(python3 -c 'import mori.umbp,pathlib;print(pathlib.Path(mori.umbp.__file__).resolve().parents[1]/"umbp_standalone_server")')
-mkdir -p /tmp/umbp && rm -f /tmp/umbp/server.sock*
-
-# Use the same visible GPUs as the ATOM server (see "HIP IPC device mismatch").
-ROCR_VISIBLE_DEVICES=0,1,4,5 \
-UMBP_DRAM_CAPACITY=$((1024 * (1 << 30))) \
-UMBP_DRAM_NUMA_NODE=0,1 \
-UMBP_DRAM_USE_HUGEPAGES=0 \
-UMBP_DRAM_PREFAULT_THREADS=16 \
-UMBP_SSD_ENABLED=0 \
-UMBP_STANDALONE_METRICS_PORT=9877 \
-MORI_UMBP_LOG_LEVEL=INFO \
-  nohup "$UMBP_BIN" "$UMBP_ADDR" > /workspace/logs/umbp_server.log 2>&1 &
-```
-
-The `UMBP_*` variables belong to the Mori server. ATOM adds none.
-
-A socket file is not proof the server is ready; prefaulting a large pool takes
-minutes. Wait until a real client connects:
-
-```bash
-until python3 - <<PY 2>/dev/null
-import mori.umbp as u
-c = u.UMBPConfig(); p = u.UMBPStandaloneProcessConfig()
-p.address = "$UMBP_ADDR"; p.auto_start = False; p.startup_timeout_ms = 10000
-c.standalone_process = p
-u.UMBPClient(c)
-PY
-do sleep 5; done; echo "umbp ready"
-```
-
-Restart the server together with the ATOM server between benchmark points so
-every point starts from an empty pool.
-
-## Step 2a: Aggregated TP4 + UMBP
-
-Take the server command from
-[MiniMax-M3-Agentic-InferenceX.md](../MiniMax-M3-Agentic-InferenceX.md)
-(the offload points) and change only the KV tier:
-
-- drop the `LMCACHE_*` variables;
-- keep `PYTHONHASHSEED=0`, `ATOM_PREFIX_CACHE_POLICY=slru`,
-  `ATOM_PREFIX_CACHE_PROTECTED_RATIO=0.5`, `ATOM_M3_INDEXER_CP=1` and
-  `ROCR_VISIBLE_DEVICES=0,1,4,5`;
-- replace the `--kv-transfer-config`:
-
-```bash
-  --kv-transfer-config '{"kv_connector":"umbp_store","kv_role":"offload",
-    "kv_connector_extra_config":{"umbp_store.address":"unix:///tmp/umbp/server.sock"}}'
-```
-
-## Step 2b: PD 1P1D with UMBP on the prefill node
+## Step 2: PD 1P1D with UMBP on the prefill node
 
 Follow [Agentic-MiniMax-M3.md](Agentic-MiniMax-M3.md), and on the prefill
 node replace `lmcache_offload` inside `multi` with `umbp_store`:
@@ -137,17 +71,7 @@ The router is unchanged (`atomesh launch --pd-disaggregation --backend atom`).
 
 ## `umbp_store` settings
 
-All settings live in `kv_connector_extra_config`; an unknown `umbp_store.*`
-key is an error.
-
-| Key | Default | Meaning |
-|-----|:-------:|---------|
-| `umbp_store.address` | required | The standalone server's address, e.g. `unix:///tmp/umbp/server.sock`. |
-| `umbp_store.startup_timeout_ms` | 10000 | How long a client waits for the server at connect. |
-| `umbp_store.chunk_tokens` | 256 | Tokens per UMBP object; a multiple of the KV block size. |
-| `umbp_store.load_pool_mib` | 1024 | HBM load staging per worker, MiB. |
-| `umbp_store.save_pool_mib` | 256 | HBM save staging per worker, MiB. |
-| `umbp_store.save_abandon_timeout_s` | 300 | Seconds before the engine reclaims an unreported save's source. |
+See the settings table in [UMBP-KV-Offload.md § Point ATOM at it](../UMBP-KV-Offload.md#3-point-atom-at-it).
 
 ## Validation Checklist
 
