@@ -4110,9 +4110,13 @@ class ModelRunner:
     def _dspark_prob_state(self, top_ks):
         """The drafter's ``ProbDraftState`` when probability-ratio verification
         applies to this batch, else None (feature off, top-k set, synthetic
-        acceptance, PCP > 1, no DSpark drafter)."""
+        acceptance, PCP > 1, a model-served step, no DSpark drafter)."""
         prob_state = getattr(getattr(self, "drafter", None), "prob_state", None)
         if prob_state is None or top_ks is not None:
+            return None
+        metadata = get_forward_context().attn_metadata
+        if self._served is not None or getattr(metadata, "served_by_round", False):
+            # Model-owned sampling/drafting does not publish this state's q.
             return None
         if self.rejection_sampler.synthetic_acceptance_rates is not None:
             return None
@@ -4187,8 +4191,14 @@ class ModelRunner:
         prob_state = getattr(self.drafter, "prob_state", None)
         if prob_state is not None:
             # Which request each row of the stored q belongs to; verification
-            # of the next step uses it only if no other draft ran in between.
-            if align_only or draft_token is None:
+            # of the next step uses it only if the ordinary draft wrote q.
+            # Step overrides and decode rounds can return IDs without q.
+            if (
+                align_only
+                or draft_token is None
+                or self._served is not None
+                or getattr(forward_context.attn_metadata, "served_by_round", False)
+            ):
                 prob_state.owner = None
             else:
                 prob_state.record_owner(batch.req_ids[: batch.total_seqs_num])

@@ -29,7 +29,9 @@ def test_structured_verify_keeps_raw_logprobs(modules, monkeypatch, probabilisti
         num_draft_tokens_np=[1],
     )
     monkeypatch.setattr(
-        mod, "get_forward_context", lambda: NS(spec_decode_metadata=metadata)
+        mod,
+        "get_forward_context",
+        lambda: NS(spec_decode_metadata=metadata, attn_metadata=None),
     )
     monkeypatch.setattr(mod, "get_tp_group", lambda: NS(world_size=1))
     monkeypatch.setattr(mod, "get_pcp_world_size", lambda: 1)
