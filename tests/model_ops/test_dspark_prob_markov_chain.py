@@ -138,8 +138,10 @@ def _compare(reference, fused):
         (3, True),
         (24, False),
         (32, True),
+        (33, False),
         (48, True),
         (96, False),
+        (97, True),
         (112, True),
         (128, False),
     ],
@@ -163,7 +165,7 @@ def test_matches_native_ids_q_bits_and_embeddings(weights, b, strided):
     "pattern",
     ["ties", "negative_inf", "positive_inf", "negative_zero", "nan_tile", "all_nan"],
 )
-@pytest.mark.parametrize("b", [3, 48])
+@pytest.mark.parametrize("b", [3, 33, 48])
 def test_maximum_edge_cases_preserve_native_choice(pattern, b):
     weights = tuple(
         torch.zeros(V, R, device="cuda", dtype=torch.bfloat16) for _ in range(2)
