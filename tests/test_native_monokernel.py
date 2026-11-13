@@ -468,6 +468,7 @@ def test_glm_announces_samples_once_on_rank_zero(monkeypatch):
         ):
             setattr(value, attribute, {})
         value._refused, value._announced = set(), set()
+        value._attention = module.AttentionWeight.FP8_PTPC
         value._cur_pos = None
         value._fused_indexer_on = False
         value._indexer_cp = False

@@ -17,6 +17,7 @@ from aiter import dtypes
 from atom.models.glm52.mono.kernels.geometry_config import (
     EPS,
     SOFTMAX_SCALE,
+    AttentionWeight,
     Mxfp4ScaleLayout,
     Mxfp4WeightLayout,
     glm5_tp_config,
@@ -31,8 +32,20 @@ from atom.mono.weights.layer import (
     LayerWeights,
     atom_mxfp4_storage_view,
     linear_bf16,
+    linear_bf16_rows,
     linear_ptpc_fp8,
 )
+
+# Production's attention projections: the kernel tensor each feeds and its
+# logical (rows, cols) on a TP rank.
+_PROJECTIONS = {
+    "fused_qkv_a_proj": ("qkv_a", lambda cfg: (cfg.qkv_a_rows, cfg.hidden)),
+    "q_b_proj": (
+        "q_b",
+        lambda cfg: (cfg.local_heads * (cfg.nope_dim + cfg.pe_dim), cfg.q_lora),
+    ),
+    "o_proj": ("o", lambda cfg: (cfg.hidden, cfg.local_heads * cfg.v_dim)),
+}
 
 # ``indexer.wk_weights_proj`` packs two row blocks into one BF16 linear: the
 # first ``INDEX_DIM`` rows are the index-K projection (`w_index_k`), the next
@@ -201,10 +214,22 @@ def _atom_byte_view(tensor: torch.Tensor) -> torch.Tensor:
 
 
 def layer_weights(
-    layer, rank: int, npes: int, *, with_indexer: bool = False
+    layer,
+    rank: int,
+    npes: int,
+    *,
+    attention: AttentionWeight,
+    with_indexer: bool = False,
 ) -> LayerWeights:
+    """``attention`` is the deployment's format (``attention_format``); a layer
+    stored any other way is refused."""
     cfg = glm5_tp_config(npes)
     attn = layer.self_attn
+    layer_attention = attention_format(layer)
+    need(
+        layer_attention is attention,
+        f"attention is {layer_attention.value}, the deployment's {attention.value}",
+    )
     moe = layer.mlp
     experts = moe.experts
     physical_experts = cfg.n_experts + cfg.num_shared_experts
@@ -296,24 +321,6 @@ def layer_weights(
         name="W_V",
         shape=(cfg.local_heads, cfg.v_dim, cfg.kv_lora),
     )
-    w_qkv_a, s_qkv_a = linear_ptpc_fp8(
-        attn.fused_qkv_a_proj,
-        name="fused_qkv_a_proj",
-        logical_rows=cfg.qkv_a_rows,
-        logical_cols=cfg.hidden,
-    )
-    w_q_b, s_q_b = linear_ptpc_fp8(
-        attn.q_b_proj,
-        name="q_b_proj",
-        logical_rows=cfg.local_heads * (cfg.nope_dim + cfg.pe_dim),
-        logical_cols=cfg.q_lora,
-    )
-    w_o, s_o = linear_ptpc_fp8(
-        attn.o_proj,
-        name="o_proj",
-        logical_rows=cfg.hidden,
-        logical_cols=cfg.local_heads * cfg.v_dim,
-    )
     bias = moe.gate.e_score_correction_bias
     need(
         bias is not None and bias.dtype is torch.float32,
@@ -339,16 +346,11 @@ def layer_weights(
             "post_attention_layernorm.weight",
             cfg.hidden,
         ),
-        "w_qkv_a": w_qkv_a,
-        "s_qkv_a": s_qkv_a,
-        "w_q_b": w_q_b,
-        "s_q_b": s_q_b,
+        **projection_weights(attn, cfg, attention),
         "w_uk": w_uk,
         "s_uk": s_uk,
         "w_uv": w_uv,
         "s_uv": s_uv,
-        "w_o": w_o,
-        "s_o": s_o,
         "w_r": linear_bf16(
             moe.gate,
             name="gate",
@@ -378,3 +380,48 @@ def layer_weights(
 def attention_impl(layer):
     wrapped = layer.self_attn.mla_attn
     return getattr(wrapped, "impl", wrapped)
+
+
+def attention_format(layer) -> AttentionWeight:
+    """The attention storage production loaded, which mono reads as is: PTPC
+    FP8 projections (``online_quant_config`` or an AttnFP8 checkpoint), or a
+    BF16 checkpoint's own BF16 projections. Either way production holds the
+    absorbed W_K / W_V per-tensor FP8; ``ATOM_MLA_ABSORB_BF16`` is refused."""
+
+    attn = layer.self_attn
+    kinds = {name: getattr(attn, name).quant_type.name for name in _PROJECTIONS}
+    need(len(set(kinds.values())) == 1, f"attention projections mix formats {kinds}")
+    impl = attention_impl(layer)
+    need(
+        impl.W_K_scale is not None and impl.W_V_scale is not None,
+        "BF16 W_K / W_V (ATOM_MLA_ABSORB_BF16)",
+    )
+    kind = kinds["o_proj"]
+    if kind == "per_Token":
+        return AttentionWeight.FP8_PTPC
+    need(kind == "No", f"attention projections are {kind}, not PTPC FP8 or BF16")
+    return AttentionWeight.BF16_ABSORB_FP8
+
+
+def projection_weights(attn, cfg, attention: AttentionWeight) -> dict:
+    """q_a / kv_a, q_b and W_o in the storage production holds them in."""
+
+    # q_a and kv_a lead fused_qkv_a; a layer that folds in its indexer's wk /
+    # weights_proj appends them after, where the kernel never reads.
+    need(
+        list(attn.qkv_a_split[:3]) == [cfg.q_lora, cfg.kv_lora, cfg.pe_dim],
+        f"fused_qkv_a split {attn.qkv_a_split}",
+    )
+    tensors = {}
+    for name, (key, shape) in _PROJECTIONS.items():
+        rows, cols = shape(cfg)
+        linear = getattr(attn, name)
+        if attention is AttentionWeight.FP8_PTPC:
+            tensors[f"w_{key}"], tensors[f"s_{key}"] = linear_ptpc_fp8(
+                linear, name=name, logical_rows=rows, logical_cols=cols
+            )
+        else:
+            tensors[f"w_{key}"] = linear_bf16_rows(
+                linear, name=name, logical_rows=rows, logical_cols=cols
+            )
+    return tensors

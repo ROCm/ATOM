@@ -133,6 +133,36 @@ def linear_ptpc_fp8(
     return weight.data, scale.data.view(-1)
 
 
+def linear_bf16_rows(
+    linear,
+    *,
+    name: str,
+    logical_rows: int,
+    logical_cols: int,
+) -> torch.Tensor:
+    """Return an unquantized linear's row-major BF16 weight in place; the
+    kernel reads its first ``logical_rows`` rows."""
+
+    weight = linear.weight
+    _need(
+        linear.quant_type.name == "No"
+        and linear.params_dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16,
+        f"{name} must be unquantized BF16",
+    )
+    _need(
+        not getattr(weight, "is_shuffled", False) and weight.is_contiguous(),
+        f"{name} BF16 weight must be row-major",
+    )
+    _need(
+        weight.ndim == 2
+        and weight.shape[0] >= logical_rows
+        and weight.shape[1] == logical_cols,
+        f"{name} weight shape {tuple(weight.shape)}",
+    )
+    return weight.data
+
+
 def linear_bf16(
     linear,
     *,
@@ -451,6 +481,7 @@ __all__ = [
     "LayerWeights",
     "atom_mxfp4_storage_view",
     "linear_bf16",
+    "linear_bf16_rows",
     "prepare_aiter_mxfp4_expert_storage",
     "prepare_mxfp4_expert_storage",
 ]

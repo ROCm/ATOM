@@ -67,7 +67,10 @@ from atom.models.glm52.mono.config import (
     FUSED_INDEX_MAX_SEQ,
     FUSED_INDEX_PAGE_SIZE,
 )
-from atom.models.glm52.mono.kernels.geometry_config import glm5_tp_config
+from atom.models.glm52.mono.kernels.geometry_config import (
+    AttentionWeight,
+    glm5_tp_config,
+)
 from atom.models.glm52.mono.runner import (
     Glm52MonoRunner,
     _GlmFusedLayerOp,
@@ -223,7 +226,13 @@ class _FailOnNthOp(_RecordingOp):
 
 
 def _build_ready_runner(
-    monkeypatch, *, fused_indexer_on, full_layers=1, shared_layers=1, query_length=1
+    monkeypatch,
+    *,
+    fused_indexer_on,
+    full_layers=1,
+    shared_layers=1,
+    query_length=1,
+    attention=AttentionWeight.FP8_PTPC,
 ):
     layers = [_fake_mono_layer(i, full=True) for i in range(full_layers)] + [
         _fake_mono_layer(full_layers + i, full=False) for i in range(shared_layers)
@@ -257,6 +266,7 @@ def _build_ready_runner(
     runner._fused_runtimes = {}
     runner._refused = set()
     runner._announced = set()
+    runner._attention = None
     runner._fused_indexer_on = fused_indexer_on
     # The CP switch is off here, which is the pre-switch build: these tests
     # pin fused-indexer dispatch, not CP. tests/models/glm52/
@@ -272,13 +282,16 @@ def _build_ready_runner(
     monkeypatch.setattr(runner_mod, "glm5_kernel_samples", lambda rows, ql: rows)
     monkeypatch.setattr(runner_mod, "bf16_vector", lambda *a, **k: None)
 
-    def _fake_layer_weights(layer, rank, npes, with_indexer=False):
-        return SimpleNamespace(layer_idx=layer.layer_idx, with_indexer=with_indexer)
+    def _fake_layer_weights(layer, rank, npes, *, attention, with_indexer=False):
+        return SimpleNamespace(
+            layer_idx=layer.layer_idx, attention=attention, with_indexer=with_indexer
+        )
 
+    monkeypatch.setattr(runner_mod, "attention_format", lambda layer: attention)
     monkeypatch.setattr(runner_mod, "layer_weights", _fake_layer_weights)
     monkeypatch.setattr(
         "atom.models.glm52.mono.kernels.op.prepare_glm5_weights",
-        lambda weights, attention_weight: {"weights": weights},
+        lambda weights, attention_weight: {"attention": attention_weight},
     )
 
     def _fake_tp_uniform(error, *, group, world_size, context):
@@ -320,6 +333,45 @@ def test_switched_on_builds_fused_only_for_full_layers(monkeypatch):
     assert len(runner._fused_ops) == 2
     full_layer_indices = {0, 1}
     assert {layer_idx for layer_idx, _ in runner._fused_ops} == full_layer_indices
+
+
+def test_bf16_attention_builds_only_the_external_indexer_path(monkeypatch):
+    # The kernel fuses its indexer only beside PTPC projections, so a BF16
+    # checkpoint must turn the fused path off before mapping or building it,
+    # and every base op must be built, and packed, in the format production
+    # loaded rather than the PTPC this runner used to hard-code.
+    _RecordingOp.instances = []
+    monkeypatch.setattr(runner_mod, "_GlmLayerOp", _RecordingOp)
+    monkeypatch.setattr(runner_mod, "_GlmFusedLayerOp", _RecordingOp)
+    runner = _build_ready_runner(
+        monkeypatch,
+        fused_indexer_on=True,
+        full_layers=2,
+        shared_layers=1,
+        attention=AttentionWeight.BF16_ABSORB_FP8,
+    )
+    assert runner._build(rows=1) is True
+    assert runner._fused_indexer_on is False
+    assert runner._fused_ops == {} and runner._fused_weights == {}
+    assert len(runner._ops) == 3
+    bf16 = AttentionWeight.BF16_ABSORB_FP8
+    assert {op.kwargs["attention_weight"] for op in runner._ops.values()} == {bf16}
+    assert {w.attention for w in runner._weights.values()} == {bf16}
+    assert {p["attention"] for p in runner._prepared.values()} == {bf16}
+
+
+def test_ranks_that_loaded_different_attention_formats_refuse_the_width(monkeypatch):
+    _RecordingOp.instances = []
+    monkeypatch.setattr(runner_mod, "_GlmLayerOp", _RecordingOp)
+    monkeypatch.setattr(runner_mod, "_GlmFusedLayerOp", _RecordingOp)
+    runner = _build_ready_runner(monkeypatch, fused_indexer_on=False)
+    # a peer's format code is above this rank's
+    monkeypatch.setattr(runner_mod, "group_max", lambda code, group: code + 1)
+    monkeypatch.setattr(runner_mod, "group_min", lambda code, group: code)
+    assert runner._build(rows=1) is False
+    assert 1 in runner._refused
+    assert runner._attention is None
+    assert runner._ops == {} and runner._weights == {}
 
 
 def test_build_forwards_query_length_and_block_table_stride_to_fused_op(monkeypatch):
@@ -433,7 +485,9 @@ def test_fused_weight_mapping_failure_falls_back_without_refusing_rows(monkeypat
         monkeypatch, fused_indexer_on=True, full_layers=2, shared_layers=1
     )
 
-    def _failing_fused_layer_weights(layer, rank, npes, with_indexer=False):
+    def _failing_fused_layer_weights(
+        layer, rank, npes, *, attention, with_indexer=False
+    ):
         if with_indexer:
             raise MonoUnsupported("indexer weights missing")
         return SimpleNamespace(layer_idx=layer.layer_idx, with_indexer=with_indexer)

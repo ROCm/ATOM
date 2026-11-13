@@ -452,5 +452,20 @@
     "accuracy_baseline": 0.9765,
     "accuracy_baseline_model": "zai-org/GLM-5.3",
     "_baseline_note": "Server args are the GLM-5.2-MXFP4 entry verbatim: the two checkpoints have byte-identical quantization_config, the same 1319-entry exclude list and the same 408 GB footprint, differing only in weights and a new moe_router_dtype key. Measured 2026-09-02, all 1319, chat 5-shot, temperature 0: flexible-extract=0.9765, strict-match=0.9773 -- level with the FP8 source (0.9719/0.9727), so MXFP4 costs nothing detectable here. Chat runs of this model have spanned 0.9719-0.9773 across five measurements, so 0.96 keeps ~1.6pp of headroom below the worst. The HF card ships this checkpoint with no evaluation at all. MUST run chat, not the default raw-completions client: GLM-5.3's template ends '<|assistant|><think>' and the server reports 'This chat template has no switch for reasoning', so few-shot completions suppress the reasoning the model is trained to do and score ~0.91 -- measured 0.9136 (MXFP4) and 0.9234 (FP8) over all 1319, which would fail this threshold on a healthy checkpoint. Chat 5-shot is also far steadier: two runs of identical code disagree on 13 of 1319 questions in chat versus 108 in 3-shot completions."
+  },
+  {
+    "model_name": "GLM-5.2-MXFP4 mono MTP3",
+    "model_path": "amd/GLM-5.2-MXFP4",
+    "extraArgs": "--trust-remote-code --kv_cache_dtype fp8 --index_cache_dtype fp4 --block-size 64 -tp 4 --method mtp --num-speculative-tokens 3 --max-num-seqs 2 --cudagraph-capture-sizes '[1,2]' --max-num-batched-tokens 16384 --gpu-memory-utilization 0.95 --enable_prefix_caching",
+    "client_command": "lm_eval --model local-chat-completions --model_args model=${MODEL_PATH},base_url=http://localhost:8000/v1/chat/completions,api_key=EMPTY,num_concurrent=2,max_retries=5,timeout=1800,tokenized_requests=False,max_length=1048576 --apply_chat_template --tasks gsm8k --gen_kwargs max_tokens=16384,temperature=0,top_p=1 --num_fewshot 5 --output_path ${OUTPUT_PATH} --log_samples",
+    "env_vars": "AITER_USE_FLYDSL_MOE_SORTING=1",
+    "runner": "linux-atom-do-mi350x-8",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.95,
+    "accuracy_timeout_minutes": 60,
+    "mtp_accept_threshold": 0.8,
+    "accuracy_baseline": 0.9697,
+    "accuracy_baseline_model": "amd/GLM-5.2-MXFP4",
+    "_baseline_note": "GLM-5.2 mono decode on the checkpoint's BF16 attention: no online_quant_config, and MTP3 with at most 2 sequences, so every decode step runs the mono kernel (ATOM_MONO_ENABLE defaults on). Measured 2026-11-13 on MI355X, all 1319, chat 5-shot, temperature 0: mono on 0.9697 flexible / 0.9697 strict, MTP acceptance 84.1%; mono off (ATOM_MONO_ENABLE=0) 0.9659 / 0.9666, 82.6%; paired, 18 questions only mono answered right and 13 only mono off (p 0.47). At 2 sequences the client takes about 30 minutes."
   }
 ]
