@@ -38,6 +38,7 @@ from ..blocks.base import Block, Channel, Fmt
 from ..blocks.gfx950.attention import mla_window as mw
 from ..device.gfx950 import buffer_ops as bo
 from ..device.gfx950 import mailbox as mb
+from ..device.gfx950 import paged
 from ..device.gfx950.ops import (
     bf2_f32,
     bf16_round,
@@ -88,10 +89,6 @@ class _BPlan(mw._APlan):
 def _ring_issue(k, p: _BPlan, slot, pos_w):
     """``mla_window._ring_issue`` from the engine's ring: the window's keys ``pos_w - 127 .. pos_w`` at their rows
     (a position below 0 reads a clamped row, dropped by ``_key_land``)."""
-    if p.kv8:  # (the ring's only read is here: none may take an MXFP8 row for bf16)
-        raise NotImplementedError(
-            f"MLABlockAttn {p.name}: kv8 (ATOM's fp8 pool, MXFP8 rows dequantized on load) is not emitted yet"
-        )
     g = k.args[p.geo]
     slot_rows, ring_slots = uniform(ld_i32(g, 1)), uniform(ld_i32(g, 2))
     stride, run = uniform(ld_i32(g, 3)), uniform(ld_i32(g, 4))
@@ -101,6 +98,13 @@ def _ring_issue(k, p: _BPlan, slot, pos_w):
         kp = pos_w - (WINDOW - 1) + k.wave * (WINDOW // WAVES) + i
         q = ((kp % ring_slots) + ring_slots) % ring_slots
         row = slot * slot_rows + (q // stride) * run + q % stride
+        if p.kv8:  # ATOM's fp8 pool: the lane's 8 E4M3 (dims 8 lane ..) and its group's code, as bf16 pairs
+            at = row * (paged.KV8_ROW_BYTES // 4)
+            v = fx.Vector(bo.buffer_load(r_ring, at + k.lane * 2, vec_width=2, dtype=T.i32))
+            cw = bo.buffer_load(r_ring, at + HD // 4 + k.lane // 16, vec_width=1, dtype=T.i32)
+            words = paged.kv8_words(v[0], v[1], paged.kv8_code_of(cw, k.lane // 4))
+            out.append(fx.Vector.from_elements(words, fx.Int32))
+            continue
         out.append(
             fx.Vector(
                 bo.buffer_load(

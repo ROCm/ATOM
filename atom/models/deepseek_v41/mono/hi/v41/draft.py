@@ -61,7 +61,17 @@ from ..blocks.gfx950.norm import (
 )
 from ..device.gfx950 import buffer_ops as bo
 from ..device.gfx950 import mailbox as mb
-from ..device.gfx950.ops import ld_i32, rsrc, traced, uniform
+from ..device.gfx950 import paged
+from ..device.gfx950.ops import (
+    bf2_f32,
+    butterfly,
+    fp8_pack4,
+    ld_i32,
+    rsrc,
+    traced,
+    uniform,
+    xshfl,
+)
 from ..device.gfx950.peer import from_rank, to_rank
 from ..plan.program import Program, Region, Scenario, Stage
 from ..plan.trace import Space
@@ -256,10 +266,6 @@ class _SPlan:
 
 @traced
 def _ring_store(k, r, p: _SPlan):
-    if p.kv8:  # (the ring's only store is here: none may write a bf16 row into an MXFP8 one)
-        raise NotImplementedError(
-            f"RingStore {p.name}: kv8 (ATOM's fp8 pool, the row quantized on store) is not emitted yet"
-        )
     g0 = p.stage * GEO
     geo = k.args[p.geo]
     num_slots = uniform(ld_i32(geo, g0))
@@ -284,8 +290,28 @@ def _ring_store(k, r, p: _SPlan):
     row = fx.max(slot, fx.Int32(0)) * slot_rows + (q // stride) * run + q % stride
     if k.tid < KVD // 2:
         w = mb.poll([(k.mb[p.kvn], (r * KVD) // 2 + k.tid, 1)], k.tag)[0][0]
-        if live:
-            bo.buffer_store(w, rsrc(k.args[p.ring]), row * (KVD // 2) + k.tid)
+        if const_expr(p.kv8):
+            _ring_store8(k, p, row, w, live)
+        if const_expr(not p.kv8):  # noqa: SIM102 (traced)
+            if live:
+                bo.buffer_store(w, rsrc(k.args[p.ring]), row * (KVD // 2) + k.tid)
+
+
+@traced
+def _ring_store8(k, p: _SPlan, row, w, live):
+    """``_ring_store``'s row into ATOM's fp8 pool: thread tid's pair (dims 2 tid, + 1; 16 threads a 32-dim group) as
+    ATOM's writer quantizes it (``paged.kv8_code``; the key is QAT'd already, ``KVPrep(kv8=True)``: the same values),
+    an even thread storing its pair and its neighbour's as one word, a group's first thread its code."""
+    v0, v1 = bf2_f32(w)
+    amax = butterfly(fx.max(fx.max(v0, -v0), fx.max(v1, -v1)), (1, 2, 4, 8), fx.max)
+    code = paged.kv8_code(amax)
+    s0, s1 = paged.kv8_scaled(v0, code), paged.kv8_scaled(v1, code)
+    word = fp8_pack4(s0, s1, xshfl(s0, 1), xshfl(s1, 1))
+    base = fx.Int64(k.args[p.ring]) + fx.Int64(row) * paged.KV8_ROW_BYTES
+    if live & ((k.tid % 2) == 0):
+        paged.global_store(base + fx.Int64(k.tid * 2), word)
+    if live & ((k.tid % 16) == 0):
+        paged.global_store(base + fx.Int64(KVD + k.tid // 16), code, 1)
 
 
 class RingStore(Block):
@@ -348,6 +374,8 @@ def context_blocks(
     if cols not in ("shard", "rep"):
         raise ValueError(f"cols {cols!r}: 'shard' or 'rep'")
     kn = {**KNOBS, **(knobs or {})}
+    # ATOM's draft rings in its fp8 pool: the keys QAT'd by its writer's code, stored as its MXFP8 rows
+    kv8 = kn["KV_FMT"] == "fp8"
     C = channels(tp, cols)
     shard = tp > 1 and cols == "shard"
     w8 = {"weight_format": "mxfp8"}
@@ -382,7 +410,7 @@ def context_blocks(
         blocks.append(NormQuant(f"cx_kvn{s}", C["kv"][s], C["kvq"][s], f"cx.kv_norm{s}.g", bf16_out=C["kvb"][s],
                                 spec=_nspec(KVD, 64, 4)))  # fmt: skip
     for s in range(STAGES):
-        blocks.append(KVPrep(f"cx_kvp{s}", C["kvb"][s], C["kvn"][s], "pos", "rope"))
+        blocks.append(KVPrep(f"cx_kvp{s}", C["kvb"][s], C["kvn"][s], "pos", "rope", kv8=kv8))
     for s in range(STAGES):
         blocks.append(
             RingStore(
@@ -392,7 +420,7 @@ def context_blocks(
                 "cx.geo",
                 s,
                 meta="cx.meta" if meta else "",
-                kv8=kn["KV_FMT"] == "fp8",
+                kv8=kv8,
             )
         )
     return blocks
