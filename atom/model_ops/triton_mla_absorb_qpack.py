@@ -99,7 +99,7 @@ def mla_absorb_q_pack(
     assert q_nope.stride(-1) == 1 and w_k.stride(-1) == 1 and q_out.stride(-1) == 1
     if num_tokens == 0:
         return
-    block_m = 256
+    block_m = 128 if num_tokens < 2048 else 256
     _mla_absorb_q_pack_kernel[(triton.cdiv(num_tokens, block_m), num_heads)](
         q_nope,
         w_k,
