@@ -657,16 +657,62 @@ def test_the_post_verify_is_the_forwards_head_output(no_aiter_sampler):
     assert pv.bufs[12]["target"].tolist() == [0, 1, 2, 3, 4, 6, 7, 8, 9, 10]
     assert pv.bufs[12]["bonus"].tolist() == [5, 11]
     assert pv.bufs[12]["cu"].tolist() == [5, 10]
-    out, verdict = pv.output(12)
+    out, verdict, nxt = pv.output(12)
     assert out is pv.bufs[12]["out"] and out.shape == (2, 6)
     assert verdict is pv.bufs[12]["verdict"] and verdict.shape == (3, 2)
+    assert nxt is pv.bufs[12]["next"] and nxt.shape == (2,) and nxt.dtype == torch.int32
     hook = object.__new__(hi_runner.HiLayers)
     hook.pv, hook.verified = pv, 0
     assert hook.head_output(12) is None  # (no post-verify this forward)
     hook.verified = 12
-    assert hook.head_output(12) == (out, verdict) and hook.head_output(6) is None
+    assert hook.head_output(12) == (out, verdict, nxt) and hook.head_output(6) is None
     hook.pv = None
     assert hook.head_output(12) is None
+
+
+def test_post_verify_stages_the_drafts_anchors_where_the_proposer_would(no_aiter_sampler):
+    """The post-verify's anchor destinations are the DSpark block passes' fixed inputs at the width's requests
+    (``_anchor_dests``: ``block`` and ``block_greedy``), and the proposer skips its staging (``anchors_staged``)
+    exactly when every input is the launched width's own: its next ids and verdict anchors (the runner took the head
+    output), the step positions it read, one of those destinations, the width's whole batch."""
+    import dataclasses
+
+    from atom.models.deepseek_v41.mono.round import post_verify
+    from atom.spec_decode.draft_graph import DraftGraph, StagedInput
+
+    def block():
+        g = DraftGraph(forward=lambda running_bs, **rows: None, inputs={
+            "anchor_ids": StagedInput(dtype=torch.int32), "anchor_positions": StagedInput(dtype=torch.int64)})
+        return g.bind(dataclasses.make_dataclass("C", [("max_num_seqs", int)])(8), torch.device("cpu"))
+
+    drafter = SimpleNamespace(block=block(), block_greedy=block(), model=SimpleNamespace(vocab_size=1000))
+    hook = SimpleNamespace(cx_drafter=drafter)
+    dests, vmax = post_verify._anchor_dests(hook, 2)
+    assert vmax == 999 and len(dests) == 2
+    for (ids, pos), g in zip(dests, (drafter.block, drafter.block_greedy)):
+        assert ids.data_ptr() == g.buffer("anchor_ids", 2).data_ptr() and ids.shape == (2,)
+        assert pos.data_ptr() == g.buffer("anchor_positions", 2).data_ptr() and pos.dtype == torch.int64
+    assert post_verify._anchor_dests(SimpleNamespace(cx_drafter=None), 2) == ([], 0)
+
+    pv = post_verify.PostVerify((6, 12), {6: (1, 6), 12: (2, 6)}, torch.device("cpu"))
+    positions = torch.zeros(12, dtype=torch.int64)
+    pv.anchor_dst[12] = (dests, positions)
+    out, verdict, nxt = pv.output(12)
+    g = drafter.block_greedy
+    args = (g.buffer("anchor_ids", 2), g.buffer("anchor_positions", 2), nxt[:2], positions[:12], verdict[:, :2][2])
+    assert not pv.anchors_staged(*args)  # (no launch at the width)
+    pv.launched.add(12)
+    assert pv.anchors_staged(*args)
+    bad = [
+        (g.buffer("anchor_ids", 1), args[1], nxt[:1], positions, verdict[:, :1][2]),  # a padded batch
+        (args[0], args[1], nxt.clone(), positions, args[4]),  # ids the runner gathered itself
+        (args[0], args[1], nxt, positions.clone(), args[4]),  # other positions
+        (args[0], args[1], nxt, positions, verdict[2].clone()),  # other anchors
+        (torch.zeros(2, dtype=torch.int32), args[1], nxt, positions, args[4]),  # not a pass's input
+    ]
+    assert not any(pv.anchors_staged(*b) for b in bad)
+    pv.anchor_dst[12] = None  # (launched with no drafter bound)
+    assert not pv.anchors_staged(*args)
 
 
 def test_post_verify_skips_the_commit_at_its_own_anchors(no_aiter_sampler):

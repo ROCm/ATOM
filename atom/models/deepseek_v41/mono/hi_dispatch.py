@@ -160,6 +160,12 @@ class HiDraftModel(MonoDraftModel):
             return _HI_DRAFT
         return super().block_backbone(input_ids, positions, num_draft)
 
+    def anchors_staged(self, ids, positions_out, next_ids, positions, rows) -> bool:
+        """Whether the target forward that just ran already wrote the DSpark proposer's anchors into ``ids`` /
+        ``positions_out`` (its post-verify: ``PostVerify.anchors_staged``), so ``_stage_anchors`` launches nothing."""
+        pv = self.hi.pv
+        return pv is not None and pv.anchors_staged(ids, positions_out, next_ids, positions, rows)
+
     def head_and_sample(self, out, anchor_ids, num_draft):
         if out is _HI_DRAFT:
             # a row of ids a request (``draft_run``): the hook's own buffer, allocated at install, rewritten only by the

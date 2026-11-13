@@ -87,9 +87,10 @@ def bump_phases(words: list) -> None:
 def _post_verify_kernel(
     out_ptr, verdict_ptr, cu_ptr, input_ids_ptr, target_idx_ptr, bonus_idx_ptr, head_ids_ptr, cond_rates_ptr,
     step_ptr, used_seed_ptr, cursor_ptr, cursor_stride, staging_ptr, staging_req_stride, staging_row_stride, starts_ptr,
-    slots_ptr, live_ptr, num_spec_steps, seed_base, ph0_ptr, ph1_ptr, ph2_ptr,
+    slots_ptr, live_ptr, num_spec_steps, seed_base, ph0_ptr, ph1_ptr, ph2_ptr, next_ptr, positions_ptr, aid0_ptr,
+    apos0_ptr, aid1_ptr, apos1_ptr, vocab_max,
     WIDTH: tl.constexpr, BLOCK: tl.constexpr, SP: tl.constexpr, SYNTHETIC: tl.constexpr, SHADOW: tl.constexpr,
-    NPH: tl.constexpr = 0,
+    NPH: tl.constexpr = 0, NANCH: tl.constexpr = 0,
 ):  # fmt: skip
     """Program b, request b: the verdict (ATOM's rejection kernels' arithmetic, its rows at once: the first rejected
     position is a min over the rows) and the commit (request b's accepted prefix's candidate cursor,
@@ -97,7 +98,11 @@ def _post_verify_kernel(
     request); ``SHADOW``: into ``cursor[b]``, the check's rows). The uniforms' seed is ``seed_base`` + the hook's
     launch-tag step (bumped by every forward's begin-step: the same on every TP rank), recorded in
     ``used_seed_ptr``. Program 0 also adds one to the first ``NPH`` of the int64 step-phase words ``ph*_ptr``
-    (``bump_phases``'s, ``HiLayers.end_step``)."""
+    (``bump_phases``'s, ``HiLayers.end_step``).
+
+    The next id (``next_ptr[b]``: the output row's id at the accepted count, the runner's gather) and, for the first
+    ``NANCH`` of the DSpark block passes' fixed inputs, the draft's anchor (``aid*[b]`` = the next id clamped to
+    ``[0, vocab_max]``, ``apos*[b]`` = ``positions[anchor row]``: the proposer's ``_stage_anchors``)."""
     b = tl.program_id(0)
     seed = seed_base + tl.load(step_ptr).to(tl.int64)
     if b == 0:
@@ -135,6 +140,17 @@ def _post_verify_kernel(
     tl.store(verdict_ptr + b, accepted)
     tl.store(verdict_ptr + nreq + b, num_spec_steps - accepted)
     tl.store(verdict_ptr + 2 * nreq + b, anchor)
+    # the next id: the row at the accepted count (``ModelRunner.postprocess``'s gather), and the draft's anchor
+    nxt = tl.sum(tl.where(p == accepted, row, 0), axis=0)
+    tl.store(next_ptr + b, nxt)
+    if NANCH > 0:
+        aid = tl.minimum(tl.maximum(nxt, 0), vocab_max)
+        apos = tl.load(positions_ptr + anchor)
+        tl.store(aid0_ptr + b, aid)
+        tl.store(apos0_ptr + b, apos)
+        if NANCH > 1:
+            tl.store(aid1_ptr + b, aid)
+            tl.store(apos1_ptr + b, apos)
     cols = tl.arange(0, BLOCK)
     keep = cols < WIDTH
     prefix = anchor - tl.load(starts_ptr + b)
@@ -164,12 +180,15 @@ class PostVerify:
         self.seed_base = _SYNTHETIC_RNG_BASE_SEED
         self.used_seed = torch.zeros(1, dtype=torch.int64, device=device)
         self.bufs, self.launched = {}, set()
+        # a width's anchor destinations as its launch (a capture's) wrote them: ((ids, positions) of each DSpark block
+        # pass, the step positions read), held so their storage outlives the recording (``anchors_staged``)
+        self.anchor_dst = {}
         i32 = {"dtype": torch.int32, "device": device}
         for rows in widths:
             nb, rq = split[rows]
             s = rq - 1
             self.bufs[rows] = {
-                "out": torch.zeros(nb, rq, **i32), "verdict": torch.zeros(3, nb, **i32),
+                "out": torch.zeros(nb, rq, **i32), "verdict": torch.zeros(3, nb, **i32), "next": torch.zeros(nb, **i32),
                 "cu": torch.arange(1, nb + 1, **i32) * s,
                 "target": torch.tensor([b * rq + j for b in range(nb) for j in range(s)], dtype=torch.long,
                                        device=device),
@@ -205,22 +224,51 @@ class PostVerify:
         phases = list(phases)
         here, rest = phases[:MAX_PHASES], phases[MAX_PHASES:]
         *ph, nph = _phase_args(here) if here else (self.used_seed,) * MAX_PHASES + (0,)
+        dests, vocab_max = _anchor_dests(hook, nb)
+        self.anchor_dst[rows] = (dests, step.positions) if dests else None
+        anch = [t for d in dests for t in d] + [bufs["next"]] * (4 - 2 * len(dests))
         self.launched.add(rows)
         _post_verify_kernel[(nb,)](
             bufs["out"], bufs["verdict"], bufs["cu"], hook.step_ids, bufs["target"], bufs["bonus"], hook.head_ids,
             cond, hook.step, self.used_seed, cursor, cursor.stride(0), staging, staging.stride(0), staging.stride(1),
-            step.cu_seqlens_q, step.slots, hook.req[REQ_LIVE:], rq - 1, self.seed_base, *ph,
-            WIDTH=cache.cursor.shape[1], BLOCK=triton.next_power_of_2(cache.cursor.shape[1]),
-            SP=triton.next_power_of_2(rq), SYNTHETIC=rates is not None, SHADOW=False, NPH=nph, num_warps=1,
+            step.cu_seqlens_q, step.slots, hook.req[REQ_LIVE:], rq - 1, self.seed_base, *ph, bufs["next"],
+            step.positions, *anch, vocab_max, WIDTH=cache.cursor.shape[1],
+            BLOCK=triton.next_power_of_2(cache.cursor.shape[1]), SP=triton.next_power_of_2(rq),
+            SYNTHETIC=rates is not None, SHADOW=False, NPH=nph, NANCH=len(dests), num_warps=1,
         )  # fmt: skip
         if rest:
             bump_phases(rest)
 
     def output(self, rows: int):
         """Width ``rows``' outputs, the forward's head output (``HiLayers.head_output``): (output ids [B, rq], verdict
-        [3, B])."""
+        [3, B], next ids [B]: each request's id at its accepted count, what the runner would gather)."""
         b = self.bufs[rows]
-        return b["out"], b["verdict"]
+        return b["out"], b["verdict"], b["next"]
+
+    def anchors_staged(self, ids, positions_out, next_ids, positions, rows) -> bool:
+        """Whether the DSpark proposer's anchors (``_stage_anchors`` into ``ids`` / ``positions_out``, a block pass's
+        fixed inputs at the padded batch, from ``next_ids``, ``positions`` and the anchor ``rows``) are already there:
+        the forward that just ran wrote them in its post-verify (``_post_verify_kernel``, ``NANCH``). True only when
+        every input is a launched width's own (its next ids and verdict anchors: the runner took this forward's head
+        output, so the replay that just ran wrote them; the step positions it read), the destinations are one of the
+        passes' it wrote, and the batch is the width's whole (no padded anchor rows). Host-side."""
+        for w in self.launched:
+            dst = self.anchor_dst.get(w)
+            b = self.bufs[w]
+            if dst is None or next_ids.data_ptr() != b["next"].data_ptr():
+                continue
+            dests, pos = dst
+            nb = b["next"].shape[0]
+            return (
+                next_ids.shape == (nb,)
+                and ids.shape[0] == nb
+                and rows.data_ptr() == b["verdict"][2].data_ptr()
+                and tuple(rows.shape) == (nb,)
+                and positions.data_ptr() == pos.data_ptr()
+                and any(ids.data_ptr() == i.data_ptr() and positions_out.data_ptr() == p.data_ptr()
+                        for i, p in dests)
+            )  # fmt: skip
+        return False
 
     def committed(self, metadata, anchors) -> bool:
         """The builder's commit (``HiRound.committed``) at ``anchors``: a step whose anchors are a width's in-graph
@@ -240,3 +288,28 @@ class PostVerify:
             raise RuntimeError("Tentative state was not prepared for this step")
         cache.pending = None
         return True
+
+
+def _anchor_dests(hook, nb: int) -> tuple[list, int]:
+    """The DSpark block passes' anchor inputs at ``nb`` requests (``block``, ``block_greedy``: (ids int32 [nb],
+    positions int64 [nb]) each, fixed storage bound at the drafter's init) and the draft vocabulary's last id; ([], 0)
+    without a bound drafter."""
+    drafter = getattr(hook, "cx_drafter", None)
+    if drafter is None:
+        return [], 0
+    try:
+        vocab = int(drafter.model.vocab_size)
+    except (AttributeError, TypeError):
+        return [], 0
+    dests = []
+    for name in ("block", "block_greedy"):
+        pass_ = getattr(drafter, name, None)
+        if pass_ is None:
+            continue
+        try:
+            ids, pos = pass_.buffer("anchor_ids", nb), pass_.buffer("anchor_positions", nb)
+        except (AssertionError, AttributeError, KeyError):
+            continue
+        if ids.dtype == torch.int32 and ids.is_contiguous() and pos.is_contiguous():
+            dests.append((ids, pos))
+    return dests, vocab - 1

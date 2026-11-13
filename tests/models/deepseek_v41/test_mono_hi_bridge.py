@@ -1711,10 +1711,16 @@ def check_post_verify_pad(pad_slot: int):
     # two peer groups' step-phase words (the peer tables' entry tp) due a bump, a third word not
     table = torch.tensor([11, 22, 7, 33, 5], dtype=torch.int64)
     ph = [table[2:3], table[4:5]]
+    # the next ids, and the anchors of two DSpark block passes (ids clamped to [0, 899], positions[anchor row])
+    nxt = torch.full((nb,), -5, **i32)
+    positions = torch.arange(rows, dtype=torch.int64) * 3 + 1000
+    aid = [torch.full((nb,), -5, **i32) for _ in range(2)]
+    apos = [torch.full((nb,), -5, dtype=torch.int64) for _ in range(2)]
     pv._post_verify_kernel[(nb,)](
         out, verdict, cu, seg, target, bonus, head, out, torch.zeros(1, **i32), torch.zeros(1, dtype=torch.int64),
         cursor, cursor.stride(0), staging, staging.stride(0), staging.stride(1), starts, slots, live[hb.REQ_LIVE :],
-        s, 0, *pv._phase_args(ph)[:3], WIDTH=W, BLOCK=W, SP=8, SYNTHETIC=False, SHADOW=False, NPH=len(ph),
+        s, 0, *pv._phase_args(ph)[:3], nxt, positions, aid[0], apos[0], aid[1], apos[1], 899, WIDTH=W, BLOCK=W, SP=8,
+        SYNTHETIC=False, SHADOW=False, NPH=len(ph), NANCH=2,
     )  # fmt: skip
     want = before.clone()
     for b in range(3):
@@ -1723,6 +1729,13 @@ def check_post_verify_pad(pad_slot: int):
     report(f"[pv] post-verify on a bs-4 graph with a padding request (its slot entry {pad_slot}): the live requests'"
            " cursors committed, no padding commit", torch.equal(cursor, want) and int(verdict[0, 0]) == 2,
            f"(rows {(cursor != want).any(1).nonzero().flatten().tolist()} differ; accepted {verdict[0].tolist()})")  # fmt: skip
+    gathered = torch.gather(out.view(nb, rq).long(), 1, verdict[0].view(-1, 1).long()).view(nb).int()
+    report("[pv] the post-verify's next ids == the runner's gather of its output ids at the accepted counts",
+           torch.equal(nxt, gathered), f"({nxt.tolist()} vs {gathered.tolist()})")  # fmt: skip
+    want_pos = positions[verdict[2].long()]
+    report("[pv] the post-verify's anchors == the proposer's _stage_anchors (both passes)",
+           all(torch.equal(a, gathered.clamp(0, 899)) and torch.equal(q, want_pos) for a, q in zip(aid, apos)),
+           f"({aid}, {apos} vs {want_pos.tolist()})")  # fmt: skip
     report("[pv] the post-verify bumps the step-phase words due once (program 0 of 4), nothing else",
            table.tolist() == [11, 22, 8, 33, 6], f"({table.tolist()})")  # fmt: skip
     for n in (1, 2, 3, 4, 7):
