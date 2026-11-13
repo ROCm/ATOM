@@ -608,10 +608,10 @@ def _topp_row(temps_ptr, top_p_ptr, top_p_scalar, req_idx, HAS_TOPP_PTR: tl.cons
 @triton.jit
 def _ge_records(row_ptr, lo, hi, inv_t, m, thr, K: tl.constexpr, SB: tl.constexpr):
     """Over columns [lo, hi) of a row: for each of the K thresholds, the mass
-    sum exp(y - m) and the count of y >= thr[j]; per-lane accumulation, one
-    final reduce."""
+    sum exp(y - m) and the count of y >= thr[j]. The mass accumulates per
+    lane with one final reduce; the integer count is reduced every block."""
     accm = tl.zeros((K, SB), tl.float32)
-    accc = tl.zeros((K, SB), tl.int32)
+    accc = tl.zeros((K,), tl.int32)
     for start in range(lo, hi, SB):
         offs = start + tl.arange(0, SB)
         y = (
@@ -621,8 +621,8 @@ def _ge_records(row_ptr, lo, hi, inv_t, m, thr, K: tl.constexpr, SB: tl.constexp
         e = tl.exp(y - m)
         ge = y[None, :] >= thr[:, None]
         accm += tl.where(ge, e[None, :], 0.0)
-        accc += ge.to(tl.int32)
-    return tl.sum(accm, axis=1), tl.sum(accc, axis=1)
+        accc += tl.sum(ge.to(tl.int32), axis=1)
+    return tl.sum(accm, axis=1), accc
 
 
 @triton.jit
@@ -815,40 +815,45 @@ def _final_interval(
     K: tl.constexpr,
     RB: tl.constexpr,
 ):
-    """(a, b, mass at or above b, threshold spacing, level 2 ran, index, k1):
-    the interval [a, b) holding the cutoff, from level 2 where it ran (the
-    level-1 interval held more than RB tokens); b is +inf for the top
-    interval."""
+    """(a, b, mass at or above b, threshold spacing, tokens in [a, b), level 2
+    ran, index, k1): the interval [a, b) holding the cutoff, from level 2
+    where it ran (the level-1 interval held more than RB tokens); b is +inf
+    for the top interval."""
     js = tl.arange(0, K)
     M, C = _sum_records(l1m_ptr + r * nch * K, l1c_ptr + r * nch * K, nch, K)
     thr = tl.load(thr1_ptr + r * K + js)
-    k1, a, b, mhi, n1, _ = _topp_level1_narrow(thr, M, C, target, K)
-    need2 = n1 > RB
+    k1, a, b, mhi, total, _ = _topp_level1_narrow(thr, M, C, target, K)
+    need2 = total > RB
     w = _pick(thr, js, 1) - _pick(thr, js, 0)
     kk = k1
     if need2:
         M2, C2 = _sum_records(l2m_ptr + r * nch * K, l2c_ptr + r * nch * K, nch, K)
         thr2 = tl.load(thr2_ptr + r * K + js)
-        kk, a, b, mhi, _, _ = _topp_narrow(
+        kk, a, b, mhi, total, _ = _topp_narrow(
             thr2, M2, C2, target, b, mhi, _pick(C, js, k1 + 1), K
         )
         w = w / K
-    return a, b, mhi, w, need2, kk, k1
+    return a, b, mhi, w, total, need2, kk, k1
 
 
 @triton.jit
-def _chunk_interval_count(l1c_ptr, l2c_ptr, r, nch, ch, need2, kk, k1, K: tl.constexpr):
-    """Chunk ch's count in the final interval: its count at or above a minus
-    its count at or above b (records of the level the interval came from)."""
-    base1 = l1c_ptr + (r * nch + ch) * K
-    above_b1 = tl.where(k1 + 1 < K, tl.load(base1 + tl.minimum(k1 + 1, K - 1)), 0)
-    cnt = tl.load(base1 + k1) - above_b1
+def _chunk_interval_counts(
+    l1c_ptr, l2c_ptr, r, nch, need2, kk, k1, K: tl.constexpr, NCH: tl.constexpr
+):
+    """Every chunk's count in the final interval, one lane per chunk (lanes
+    past nch hold 0): its count at or above a minus its count at or above b
+    (records of the level the interval came from)."""
+    chs = tl.arange(0, NCH)
+    live = chs < nch
+    base1 = l1c_ptr + (r * nch + chs) * K
+    above_b1 = tl.load(base1 + tl.minimum(k1 + 1, K - 1), live & (k1 + 1 < K), 0)
+    cnt = tl.load(base1 + k1, live, 0) - above_b1
     if need2:
-        base2 = l2c_ptr + (r * nch + ch) * K
+        base2 = l2c_ptr + (r * nch + chs) * K
         above = tl.where(
-            kk + 1 < K, tl.load(base2 + tl.minimum(kk + 1, K - 1)), above_b1
+            kk + 1 < K, tl.load(base2 + tl.minimum(kk + 1, K - 1), live, 0), above_b1
         )
-        cnt = tl.load(base2 + kk) - above
+        cnt = tl.load(base2 + kk, live, 0) - above
     return cnt
 
 
@@ -899,11 +904,13 @@ def _topp_compact_kernel(
     BLOCK: tl.constexpr,
     CHUNK: tl.constexpr,
     RB: tl.constexpr,
+    NCH: tl.constexpr,
     IN_PLACE: tl.constexpr,
 ):
     """Compact the final interval's tokens: each chunk writes at the sum of
-    the earlier chunks' counts, so the order is fixed. An interval of more
-    than RB tokens is left to `_topp_cutoff`."""
+    the earlier chunks' counts (all chunks' counts read at once, NCH >= nch
+    lanes), so the order is fixed. An interval of more than RB tokens is left
+    to `_topp_cutoff`."""
     req_idx = tl.program_id(0)
     k = tl.program_id(1)
     c = tl.program_id(2)
@@ -917,7 +924,7 @@ def _topp_compact_kernel(
     )
     if active & ((r % QTP) == rank_id):
         m, z, _ = _combine_stats(tstat_ptr + r * nch * 2, nch)
-        a, b, mhi, w, need2, kk, k1 = _final_interval(
+        a, b, mhi, w, total, need2, kk, k1 = _final_interval(
             thr1_ptr,
             l1m_ptr,
             l1c_ptr,
@@ -930,12 +937,8 @@ def _topp_compact_kernel(
             K,
             RB,
         )
-        total = tl.zeros((), tl.int32)
-        off = tl.zeros((), tl.int32)
-        for ch in range(nch):
-            cnt = _chunk_interval_count(l1c_ptr, l2c_ptr, r, nch, ch, need2, kk, k1, K)
-            off += tl.where(ch < c, cnt, 0)
-            total += cnt
+        cnt = _chunk_interval_counts(l1c_ptr, l2c_ptr, r, nch, need2, kk, k1, K, NCH)
+        off = tl.sum(tl.where(tl.arange(0, NCH) < c, cnt, 0), axis=0)
         if c == 0:
             tl.store(fin_ptr + r * 4, a)
             tl.store(fin_ptr + r * 4 + 1, b)
@@ -1057,8 +1060,8 @@ def _verify_stats_partial_kernel(
 ):
     """One CHUNK of a verified row's two full-vocab statistics passes -- the
     target's (on the rank owning the row) and the stored q's -- which
-    `_verify_row_stats_kernel` combines. A chunk past a row's end stores the
-    empty record (-inf, 0), argmax 0."""
+    `_verify_row_stats_kernel` combines. A q chunk past ``q_cols`` stores the
+    empty q record (-inf, 0); a row past its request's end stores nothing."""
     req_idx = tl.program_id(0)
     k = tl.program_id(1)
     c = tl.program_id(2)
@@ -1282,7 +1285,7 @@ def _block_residual_mass_kernel(
     QTP: tl.constexpr,
     BLOCK: tl.constexpr,
     CHUNK: tl.constexpr,
-    IN_PLACE: tl.constexpr = False,
+    IN_PLACE: tl.constexpr,
 ):
     """rm[row k, chunk c] = sum_v max(P_k p_k(v) - q_k(v), 0) for 1 <= k < n,
     over chunk c of this rank's vocab columns; `_prob_decide_kernel` sums the
@@ -1447,7 +1450,7 @@ def _prob_resample_kernel(
     QTP: tl.constexpr,
     BLOCK: tl.constexpr,
     CHUNK: tl.constexpr,
-    IN_PLACE: tl.constexpr = False,
+    IN_PLACE: tl.constexpr,
 ):
     """One vocab chunk of this rank's columns of the residual draw at the
     rejected row: norm(max(c p - q, 0)) (one-hot q: p without the draft), with
@@ -1770,6 +1773,7 @@ def prob_rejection_sample(
             BLOCK=_SPLIT_BLOCK,
             CHUNK=_CHUNK,
             RB=_TOPP_RB,
+            NCH=triton.next_power_of_2(nch_stats),
             IN_PLACE=in_place,
             num_warps=_NUM_WARPS,
         )
