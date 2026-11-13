@@ -194,6 +194,7 @@ class AiterBackend(AttentionBackend):
         target_block_size: int,
         layers: int,
         kv_dtype,
+        **pool_kwargs,
     ):
         """An MHA pool, which is the one this backend's kernels read."""
         return MhaKvPool.from_hf_config(
@@ -202,6 +203,7 @@ class AiterBackend(AttentionBackend):
             block_size=target_block_size,
             layers=layers,
             kv_dtype=kv_dtype,
+            **pool_kwargs,
         )
 
 
