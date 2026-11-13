@@ -1624,7 +1624,7 @@ class CoreManager:
     def _flush_credit_updates(self) -> None:
         """Send the successor credit corrections that are due, once, with no
         lock held. A failed send is offered again at the next flush."""
-        if not self._backlog.credit_updates:
+        if self._share_cache_router is None or not self._backlog.credit_updates:
             return
         with self._lb_lock:
             batches = self._backlog.take_credit_updates()
