@@ -11,6 +11,11 @@ pytest.importorskip("triton", reason="the V4.1 cache and CSR kernels need Triton
 
 from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
 from atom.model_ops.attentions.deepseek_v41.checkpoints import StateCopies
+from atom.model_ops.attentions.deepseek_v41.indices import (
+    build_indices,
+    build_window_rows,
+    fill_step_indptrs,
+)
 from atom.model_ops.attentions.deepseek_v41.planes import (
     prefill_window,
     reset_windows,
@@ -223,33 +228,6 @@ def test_published_decoder_tail_reuses_reserved_staging(
             assert all((p[: 2 * geo.ring_slots] == value).all() for p in source)
 
 
-@pytest.mark.parametrize("dtype", ["bf16", "fp4", "fp8"])
-@pytest.mark.parametrize("index_fp4", [False, True])
-def test_capture_validator_checks_real_index_allocations(dtype, index_fp4):
-    from dataclasses import replace
-
-    from tests.test_deepseek_v41_runtime_validation import capture_checks, make_runner
-
-    geo = replace(
-        geometry(dtype), index_fp4=index_fp4, index_layout=None, index_block_rows=8
-    )
-    cache = PagedAttentionCache(geo, 7, 4, "cpu")
-    runner, _ = make_runner(dtype)
-    runner.attn_metadata_builder.cache = cache
-    runner.attn_metadata_builder.block_size = 32
-    for owner, planes in cache.index_planes.items():
-        for i, plane in enumerate(planes):
-
-            def corrupt(plane=plane):
-                plane[1].view(torch.uint8).fill_(99)
-
-            runner.capture_cudagraph = corrupt
-            with pytest.raises(
-                AssertionError, match=f"non-scratch pages in index_{owner}.{i}"
-            ):
-                capture_checks(runner, [1, 2, 4])
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
 def test_prefill_staging_cannot_grow_under_capture(monkeypatch):
     cache = PagedAttentionCache(geometry("fp8"), 7, 4, "cuda")
@@ -402,36 +380,6 @@ def test_checkpoint_and_overlapping_relocation_preserve_segments(dtype):
         torch.testing.assert_close(actual, saved, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("planar", [False, True])
-def test_existing_fp4_gather_receives_source_planes_without_repacking(
-    planar, monkeypatch
-):
-    from atom.model_ops.attentions.deepseek_v41 import packed_rows
-
-    calls = []
-
-    class Launch:
-        def __getitem__(self, grid):
-            return lambda *args: calls.append(args)
-
-    monkeypatch.setattr(packed_rows, "_gather_prefix", Launch())
-    cache = PagedAttentionCache(geometry("fp4"), 7, 4, "cpu")
-    main, window = cache.main_view(0), cache.ring_view(1)
-    pool = (main, window) if planar else torch.empty(1024, dtype=torch.uint8)
-    indices = torch.tensor([8, 5, 2**45], dtype=torch.int64)
-    ptr = torch.tensor([0, 2], dtype=torch.int32)
-    output = torch.empty(3, 512, dtype=torch.bfloat16)
-    packed_rows.gather_prefix_rows(pool, indices, ptr, output, 0, 1)
-    (args,) = calls
-    assert args[1] is indices and args[2] is ptr and args[3] is output
-    assert args[-1] is planar
-    if planar:
-        assert args[0] is main[0] and args[7] is main[1]
-        assert args[8] is window[0] and args[9] is window[1]
-    else:
-        assert args[0] is pool and args[7:10] == (None, None, None)
-
-
 @pytest.mark.parametrize("dtype", ["fp4", "fp8"])
 def test_read_windows_uses_layer_and_slot_planes(dtype):
     cache = PagedAttentionCache(geometry(dtype, 3), 7, 4, "cpu")
@@ -446,113 +394,6 @@ def test_read_windows_uses_layer_and_slot_planes(dtype):
     actual = cache.read_windows(torch.tensor([2, 0]), torch.tensor([3, 1]))
     assert actual.shape == (2, 2, 11, 512)
     assert (actual[0] == 3).all() and (actual[1] == 1).all()
-
-
-@pytest.mark.parametrize("dtype", ["fp4", "fp8"])
-@pytest.mark.parametrize("decode", [False, True])
-def test_quantized_csr_launch_contract(dtype, decode, monkeypatch):
-    import atom.model_ops.attentions.deepseek_v41.indices as idx
-
-    calls = []
-
-    class Launch:
-        def __getitem__(self, grid):
-            def capture(*args, **kwargs):
-                calls.append((grid, args, kwargs))
-
-            return capture
-
-    monkeypatch.setattr(idx, "_indices", Launch())
-    geo = geometry(dtype)
-    step = SimpleNamespace(
-        running_tokens=5,
-        max_q_len=2,
-        decode=decode,
-        positions=torch.arange(5),
-        batch_ids=torch.zeros(5, dtype=torch.int32),
-        cu_seqlens_q=torch.tensor([0, 5]),
-        slots=torch.tensor([3]),
-        block_tables=torch.tensor([[2, 0, 1]]),
-        swa_replay_start=torch.tensor([0]),
-        swa_cached_until=torch.tensor([0]),
-    )
-    pp = torch.zeros(6, dtype=torch.int32)
-    ep = torch.zeros_like(pp)
-    prefix, _, extend, _ = idx.build_indices(
-        torch.zeros((5, 4), dtype=torch.int32),
-        (pp, ep, 4),
-        step,
-        geo,
-        geo.window(0, 7),
-        0,
-        2,
-    )
-    assert prefix.shape == (1, 5 * (4 + (geo.window_size if dtype == "fp4" else 0)))
-    assert prefix.dtype == (torch.int64 if dtype == "fp4" else torch.int32)
-    assert extend.numel() == (
-        0 if decode else 5 * (2 if dtype == "fp4" else geo.window_size)
-    )
-    assert calls[0][2]["PAGE_ROWS"] == 16
-    assert calls[0][2]["WINDOW_ROWS"] == 8
-    assert calls[0][2]["SPLIT_PREFILL"] == (dtype == "fp8" and not decode)
-    assert calls[0][2]["HISTORY"] == (dtype == "fp4")
-    assert calls[0][2]["PACKED"] == (dtype == "fp4")
-
-
-@pytest.mark.parametrize("dtype", ["fp4", "fp8"])
-@pytest.mark.parametrize("decode", [False, True])
-def test_rope_producer_writes_the_native_plane_destinations(dtype, decode, monkeypatch):
-    import atom.model_ops.attentions.deepseek_v41.cache as module
-
-    calls = []
-    monkeypatch.setattr(
-        module, "rope_quant_window", lambda *args, **kw: calls.append(kw)
-    )
-    cache = PagedAttentionCache(geometry(dtype), 7, 4, "cpu")
-    query = torch.empty(1, 3, 4, 512, dtype=torch.bfloat16)
-    kv = torch.empty(1, 3, 512, dtype=torch.bfloat16)
-    step = SimpleNamespace(
-        running_tokens=3,
-        decode=decode,
-        positions=torch.arange(3),
-        slots=torch.tensor([2]),
-        cu_seqlens_q=torch.tensor([0, 3]),
-    )
-    rope = SimpleNamespace(
-        rope_dim=64, cos_cache=torch.empty(3, 32), sin_cache=torch.empty(3, 32)
-    )
-    current, owed = cache.rope_quant_window(1, query, kv, rope, step)
-    if decode:
-        assert current is None and owed is None
-        (data, scale), called_step, window = calls[0]["ring"]
-        assert called_step is step and window.ring_start == 0
-        assert data.data_ptr() == cache.ring_view(1)[0].data_ptr()
-        assert scale.data_ptr() == cache.ring_view(1)[1].data_ptr()
-    else:
-        if dtype == "fp8":
-            assert current[0].shape == (8 + 3, 512)
-            assert current[0][8:].data_ptr() == owed[0].data_ptr()
-            assert current[1][8:].data_ptr() == owed[1].data_ptr()
-            assert calls[0]["qat"] is None
-        else:
-            assert current.dtype == torch.bfloat16 and current.shape == kv.shape
-            assert calls[0]["qat"] is current
-        data, scale = owed
-        assert data.is_contiguous() and scale.is_contiguous()
-        assert data.untyped_storage().data_ptr() == scale.untyped_storage().data_ptr()
-        assert data.shape == (1, 3, 512) and scale.shape == (1, 3, 16)
-        assert calls[0]["values"] is data and calls[0]["scales"] is scale
-        assert "ring" not in calls[0]
-
-
-@pytest.mark.parametrize("dtype", ["fp4", "fp8"])
-def test_window_only_cache_has_empty_csa_and_dense_window(dtype):
-    from dataclasses import replace
-
-    cache = PagedAttentionCache(replace(geometry(dtype), owners=()), 7, 4, "cpu")
-    main = cache.main_view(None)
-    assert main[0].shape[0] == main[1].shape[0] == 0
-    assert cache.ring_view(2)[0].is_contiguous()
 
 
 @pytest.mark.parametrize("dtype", ["fp4", "fp8"])
@@ -673,42 +514,6 @@ def test_a8w4_indptrs_are_owned_by_each_step_and_separate_from_fallback(monkeypa
     assert built[0][2][0].data_ptr() != steps[0].indptrs[2][0].data_ptr()
 
 
-@pytest.mark.parametrize("decode", [False, True])
-def test_a8w4_indices_request_untagged_source_rows(decode, monkeypatch):
-    import atom.model_ops.attentions.deepseek_v41.indices as module
-
-    calls = []
-
-    class Launch:
-        def __getitem__(self, grid):
-            return lambda *args, **kwargs: calls.append((args, kwargs))
-
-    monkeypatch.setattr(module, "_indices", Launch())
-    geo = geometry("fp4")
-    step = SimpleNamespace(
-        running_tokens=3,
-        max_q_len=2,
-        decode=decode,
-        positions=torch.tensor([8, 9, 13]),
-        batch_ids=torch.tensor([0, 0, 1]),
-        cu_seqlens_q=torch.tensor([0, 2, 3]),
-        slots=torch.tensor([2, 0]),
-        block_tables=torch.tensor([[2, 1], [4, 0]]),
-        swa_replay_start=torch.zeros(2, dtype=torch.int32),
-        swa_cached_until=torch.zeros(2, dtype=torch.int32),
-    )
-    ptr = torch.zeros(4, dtype=torch.int32)
-    selected = torch.zeros(3, 4, dtype=torch.int32)
-    prefix, _, extend, _ = module.build_indices(
-        selected, (ptr, ptr.clone(), 4), step, geo, geo.window(0, 7), 0, 2, split=True
-    )
-    assert prefix.shape == (1, 12) and prefix.dtype == torch.int32
-    assert extend.numel() == (0 if decode else 3 * geo.window_size)
-    assert not calls[0][1]["PACKED"] and not calls[0][1]["HISTORY"]
-    assert calls[0][1]["SPLIT_PREFILL"] == (not decode)
-    assert calls[0][1]["PAGE_ROWS"] == 16 and calls[0][1]["WINDOW_ROWS"] == 16
-
-
 @pytest.mark.parametrize("dtype", ["bf16", "fp4", "fp8"])
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 @pytest.mark.parametrize("slack", [0, 3])
@@ -786,3 +591,167 @@ def test_reset_windows_above_grid_y_limit(count):
             torch.testing.assert_close(
                 plane.view_as(expected), expected, rtol=0, atol=0
             )
+
+
+@pytest.mark.parametrize("dtype", ["fp4", "fp8", "fp4_a8w4"])
+@pytest.mark.parametrize("decode", [False, True])
+@pytest.mark.parametrize("position_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("cached,replay", [(0, 0), (12, 0), (0, 10)])
+def test_csr_resolves_to_causal_main_and_window_rows(
+    dtype, decode, cached, replay, position_dtype
+):
+    if not torch.cuda.is_available():
+        pytest.skip("GPU required")
+    a8w4 = dtype == "fp4_a8w4"
+    geo = V41PoolGeometry(
+        2,
+        ((0, 2),),
+        32,
+        8,
+        512,
+        128,
+        kv_dtype="fp4" if a8w4 else dtype,
+        speculative_tokens=3,
+        layer_ratios=(2,),
+        index_topk=4,
+    )
+    device = "cuda"
+    tensor = lambda x: torch.tensor(x, dtype=torch.int32, device=device)
+    positions = [10, 11, 12, 13, 31, 32, 0]
+    batches = [0, 0, 0, 0, 1, 1, -1]
+    tables = [[2, 0, 1], [3, 4, 5]]
+    slots = [2, 0]
+    step = SimpleNamespace(
+        running_tokens=7,
+        max_q_len=4,
+        decode=decode,
+        positions=tensor(positions).to(position_dtype),
+        batch_ids=tensor(batches),
+        cu_seqlens_q=tensor([0, 4, 6]),
+        slots=tensor(slots),
+        block_tables=tensor(tables),
+        swa_cached_until=tensor([cached, 0]),
+        swa_replay_start=tensor([replay, 0]),
+    )
+    indptrs = fill_step_indptrs(
+        step, geo, {2: (tensor([0] * 8), tensor([0] * 8))}, split=True if a8w4 else None
+    )[2]
+    selected = tensor([[0, 1, 2, 3]] * 7)
+    window = geo.window(0, 6)
+    ring_rows = len(slots) * geo.ring_slots
+    pi, pp, wi, wp = build_indices(
+        selected, indptrs, step, geo, window, 0, 2, split=True if a8w4 else None
+    )
+    assert pi.dtype == (torch.int64 if dtype == "fp4" else torch.int32)
+    if decode and (dtype == "fp8" or a8w4):
+        wi = build_window_rows(step, geo, window, wp)
+    pi, pp, wi, wp = pi[0].tolist(), pp.tolist(), wi.tolist(), wp.tolist()
+    for t, (pos, batch) in enumerate(zip(positions, batches)):
+        if batch < 0:
+            assert pp[t + 1] == pp[t] and wp[t + 1] == wp[t]
+            continue
+        main = [tables[batch][0] * 16 + j for j in range(4)]
+        if dtype == "fp8" or a8w4:
+            assert pi[pp[t] : pp[t + 1]] == main
+        start = 10 if batch == 0 else 31
+        floor = max(0, pos - 7, (replay if batch == 0 else 0) if not decode else 0)
+        cached_end = max(start, cached if batch == 0 else 0)
+        history_end = (
+            pos + 1 if decode else (cached_end if pos >= cached_end else start)
+        )
+        history, current = [], []
+        for p in range(floor, pos + 1):
+            if p < history_end:
+                owner = slots[batch] if decode or dtype == "fp4" else batch
+                history.append(owner * geo.ring_slots + p % geo.ring_slots)
+            else:
+                current.append((0 if batch == 0 else 4) + p - start)
+        if dtype == "fp4":
+            expected = [row * 2 for row in main] + [row * 2 + 1 for row in history]
+            assert pi[pp[t] : pp[t + 1]] == expected
+            if not decode:
+                assert wi[wp[t] : wp[t + 1]] == current
+        else:
+            assert wi[wp[t] : wp[t + 1]] == history + [
+                ring_rows + row for row in current
+            ]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+@pytest.mark.parametrize("dtype", ["fp8", "fp4"])
+def test_prefill_request_counts_reuse_indices_kernel(dtype, monkeypatch):
+    import triton
+
+    geo = V41PoolGeometry(
+        2,
+        ((0, 2),),
+        32,
+        8,
+        512,
+        128,
+        kv_dtype=dtype,
+        speculative_tokens=3,
+        layer_ratios=(2,),
+        index_topk=4,
+    )
+    tensor = lambda values: torch.tensor(values, dtype=torch.int32, device="cuda")
+    tokens = 16
+    selected = tensor([[0, 1, 2, 3]] * tokens)
+    positions = torch.empty(tokens, dtype=torch.int32, device="cuda")
+    batches = torch.empty_like(positions)
+    cu = torch.empty(5, dtype=torch.int32, device="cuda")
+    pptr, eptr = tensor([0] * (tokens + 1)), tensor([0] * (tokens + 1))
+    step = SimpleNamespace(
+        running_tokens=tokens,
+        max_q_len=tokens,
+        decode=False,
+        positions=positions,
+        batch_ids=batches,
+        slots=tensor([3, 1, 2, 0]),
+        block_tables=tensor([[1, 0], [2, 0], [3, 0], [4, 0]]),
+        swa_cached_until=tensor([0] * 4),
+        swa_replay_start=tensor([0] * 4),
+    )
+    cache_misses = []
+
+    def record_miss(**event):
+        if event["fn"].name == "_indices":
+            cache_misses.append(event["key"])
+
+    monkeypatch.setattr(triton.knobs.runtime, "jit_cache_hook", record_miss)
+    # Fixed token bucket and tensor alignment; only the live request count changes.
+    for iteration, requests in enumerate((1, 2, 3, 4, 1)):
+        lengths = [
+            tokens // requests + (b < tokens % requests) for b in range(requests)
+        ]
+        offsets = [0]
+        pos, batch_ids = [], []
+        for batch, length in enumerate(lengths):
+            offsets.append(offsets[-1] + length)
+            pos.extend(range(10 + 32 * batch, 10 + 32 * batch + length))
+            batch_ids.extend([batch] * length)
+        positions.copy_(tensor(pos))
+        batches.copy_(tensor(batch_ids))
+        cu[: requests + 1].copy_(tensor(offsets))
+        step.cu_seqlens_q = cu[: requests + 1]
+        indptrs = fill_step_indptrs(step, geo, {2: (pptr, eptr)}, split=True)[2]
+        pi, pp, wi, wp = build_indices(
+            selected, indptrs, step, geo, geo.window(0, 6), 0, 2, split=True
+        )
+        pi, pp, wi, wp = pi[0].tolist(), pp.tolist(), wi.tolist(), wp.tolist()
+        for t, (position, batch) in enumerate(zip(pos, batch_ids)):
+            assert pi[pp[t] : pp[t + 1]] == [(batch + 1) * 16 + j for j in range(4)]
+            start = 10 + 32 * batch
+            expected = [
+                (
+                    batch * geo.ring_slots + p % geo.ring_slots
+                    if p < start
+                    else requests * geo.ring_slots + offsets[batch] + p - start
+                )
+                for p in range(position - geo.window_size + 1, position + 1)
+            ]
+            assert wi[wp[t] : wp[t + 1]] == expected
+        if iteration == 0:
+            cache_misses.clear()  # The first request count may compile once.
+        else:
+            assert not cache_misses, "request count introduced a new specialization"

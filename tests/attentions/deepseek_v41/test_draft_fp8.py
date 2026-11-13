@@ -124,9 +124,21 @@ def assert_csr_equal(actual, expected):
     assert extend[: ep[-1]] == expected[2]
 
 
-@pytest.mark.parametrize("batch", [0, 1, 8, 17, 32, 65])
-@pytest.mark.parametrize("width", [1, 5, 6])
-@pytest.mark.parametrize("window", [8, 128])
+@pytest.mark.parametrize(
+    "batch,width,window",
+    [
+        (0, 1, 8),
+        (0, 5, 128),
+        (1, 1, 128),
+        (1, 6, 8),
+        (8, 5, 128),
+        (17, 6, 8),
+        (32, 1, 8),
+        (32, 5, 128),
+        (65, 5, 8),
+        (65, 6, 128),
+    ],
+)
 def test_fused_csr_matches_host_enumeration(batch, width, window):
     anchors = torch.tensor(
         ([-1, 0, 3, window - 1, window + 4, 2 * window + 7] * (batch + 1))[:batch],

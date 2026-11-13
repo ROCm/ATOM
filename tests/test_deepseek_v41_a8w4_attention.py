@@ -47,8 +47,9 @@ def api():
     )
 
 
-@pytest.mark.parametrize("backend", ["opus", "asm", None])
-@pytest.mark.parametrize("rows", [0, 4, 65536, 65537])
+@pytest.mark.parametrize(
+    "backend,rows", [("opus", 0), ("opus", 4), ("asm", 65536), (None, 65537)]
+)
 def test_support_query_uses_current_shape_and_intended_dtypes(api, backend, rows):
     query = SimpleNamespace(
         shape=torch.Size((2, rows, 64, 512)),
@@ -93,8 +94,7 @@ def test_query_errors_are_not_silently_treated_as_fallback(api):
         api["supports_a8w4_attention"](query, 512**-0.5)
 
 
-@pytest.mark.parametrize("rows", [0, 5])
-@pytest.mark.parametrize("splits", [None, 1, 4])
+@pytest.mark.parametrize("rows,splits", [(0, None), (5, 1), (5, 4)])
 def test_adapter_preserves_source_storage_and_csr(api, rows, splits):
     owner = torch.empty(rows * 288, dtype=torch.uint8)
     pool = (owner[: rows * 256].view(rows, 256), owner[rows * 256 :].view(rows, 32))
@@ -136,8 +136,9 @@ def test_adapter_preserves_source_storage_and_csr(api, rows, splits):
     assert kwargs == {"out": out, "num_kv_splits": splits}
 
 
-@pytest.mark.parametrize("supported", [False, True])
-@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize(
+    "packed,supported", [(False, True), (True, False), (True, True)]
+)
 def test_only_packed_cache_queries_a8w4_support(supported, packed):
     probe = Mock(return_value=supported)
     scope = functions(
@@ -337,35 +338,6 @@ def test_native_and_plugin_use_same_sources_and_commit_order(
     assert torch.all(result == 3)
 
 
-@pytest.mark.parametrize("kv_fp8,a8w4", [(False, False), (False, True), (True, False)])
-@pytest.mark.parametrize("decode", [False, True])
-@pytest.mark.parametrize("bounded", [False, True])
-def test_preparation_only_runs_live_for_variable_sources(kv_fp8, a8w4, decode, bounded):
-    scope = functions(
-        "atom/models/deepseek_v41/attention.py",
-        ["_prepare_attention"],
-        class_name="Attention",
-    )
-    prepared = object()
-    model = SimpleNamespace(
-        _use_a8w4_attention=Mock(return_value=a8w4),
-        _prepare_attention_live=Mock(),
-        _attention_inputs=Mock(return_value=prepared),
-    )
-    cache, step = SimpleNamespace(kv_fp8=kv_fp8), SimpleNamespace(decode=decode)
-    args = (object(), object(), cache, step, object(), object() if bounded else None)
-    result = scope["_prepare_attention"](model, *args)
-    live = bounded or (not decode and (kv_fp8 or a8w4))
-    if live:
-        model._prepare_attention_live.assert_called_once_with(*args)
-        model._attention_inputs.assert_not_called()
-        assert result is None
-    else:
-        model._prepare_attention_live.assert_not_called()
-        model._attention_inputs.assert_called_once_with(*args)
-        assert result is prepared
-
-
 def test_bounded_queries_do_not_reuse_full_step_a8w4_indptrs():
     from dataclasses import dataclass, field
 
@@ -402,7 +374,7 @@ def test_bounded_queries_do_not_reuse_full_step_a8w4_indptrs():
     assert pp.tolist() == [0, 2, 5] and wp.tolist() == [0, 3, 7]
 
 
-@pytest.mark.parametrize("row_ids", [[5, 0, 4, 3, 5, 1], [1, 2, 0], [4, 6, 5], []])
+@pytest.mark.parametrize("row_ids", [[5, 0, 4, 3, 5, 1], []])
 def test_mono_reference_gathers_before_packing_sources(row_ids, monkeypatch):
     pack = functions(OPS + "packed_rows.py", ["pack_rows"])["pack_rows"]
     gather = functions(

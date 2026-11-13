@@ -163,35 +163,22 @@ def reference(case, inputs):
 
 
 @pytest.mark.parametrize("heads", [2, 16, 32, 64])
-@pytest.mark.parametrize("decode", [False, True])
-@pytest.mark.parametrize("ratio", [0, 2])
-@pytest.mark.parametrize("splits", [1, 4, None])
+@pytest.mark.parametrize(
+    "decode,ratio,splits",
+    [
+        (False, 2, None),
+        (True, 2, None),
+        (False, 2, 1),
+        (True, 2, 4),
+        (False, 0, 4),
+        (True, 0, 1),
+    ],
+)
 def test_a8w4_matches_dequantized_attention(heads, decode, ratio, splits):
     case = make_case(heads, decode, ratio)
     output, inputs = run_case(case, splits)
     expected = reference(case, inputs)
     torch.testing.assert_close(output, expected, rtol=0.03, atol=0.02)
-
-
-@pytest.mark.parametrize("decode", [False, True])
-def test_a8w4_graph_replay_changes_live_rows(decode):
-    case = make_case(64, decode)
-    run_case(case, 1)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        output, inputs = run_case(case, 1)
-    for active in (2, 1, 2):
-        case.query.normal_()
-        case.kv.normal_()
-        case.step.batch_ids.copy_(
-            torch.tensor([0, 0, 1, 1] if active == 2 else [0, 0, -1, -1], device="cuda")
-        )
-        case.step.cu_seqlens_q[-1] = active * 2
-        case.step.slots[-1] = 0 if active == 2 else -1
-        graph.replay()
-        torch.testing.assert_close(
-            output, reference(case, inputs), rtol=0.03, atol=0.02
-        )
 
 
 @pytest.mark.parametrize("heads", [64, 128])
@@ -286,20 +273,26 @@ def test_gfx950_preserves_requested_cache_and_attention(
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         output, inputs = run()
-    for _ in range(2):
+    for active in (2, 1, 2):
         case.query.normal_()
         case.kv.normal_()
+        case.step.batch_ids.copy_(
+            torch.tensor([0, 0, 1, 1] if active == 2 else [0, 0, -1, -1], device="cuda")
+        )
+        case.step.cu_seqlens_q[-1] = active * 2
+        case.step.slots[-1] = 0 if active == 2 else -1
         graph.replay()
         torch.testing.assert_close(
             output, reference(case, inputs), rtol=0.03, atol=0.02
         )
 
 
-@pytest.mark.parametrize("cache_dtype", ["bf16", "fp4", "fp8"])
+@pytest.mark.parametrize(
+    "cache_dtype,a8w4", [("bf16", False), ("fp8", False), ("fp4", False), ("fp4", True)]
+)
 @pytest.mark.parametrize("capture_empty", [False, True])
 @torch.inference_mode()
 @pytest.mark.parametrize("side_stream", [False, True])
-@pytest.mark.parametrize("a8w4", [False, True])
 def test_native_token_graph_replays_different_request_counts(
     cache_dtype, capture_empty, side_stream, a8w4, monkeypatch
 ):

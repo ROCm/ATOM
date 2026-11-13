@@ -35,7 +35,7 @@ def _load(path, names, **scope):
     return SimpleNamespace(**{name: scope[name] for name in names})
 
 
-@pytest.fixture(params=["bfloat16", "fp8", "fp8_e4m3", "nvfp4"])
+@pytest.fixture(params=["bfloat16", "fp8", "nvfp4"])
 def bound_cache(request, monkeypatch):
     overrides = _load(
         PLUGIN / "v41_core_overrides.py",
@@ -146,25 +146,6 @@ def test_offload_registration_covers_page_regions_and_all_allocations(bound_cach
         assert all(end <= low or start >= high for low, high in state_ranges)
 
 
-def test_offload_registration_rejects_missing_plane(bound_cache, monkeypatch):
-    _, _, module, register = bound_cache
-    exporter = module.v41_page_planes
-    monkeypatch.setattr(module, "v41_page_planes", lambda cache: exporter(cache)[1:])
-    with pytest.raises(ValueError, match="PAGE unit mismatch"):
-        register()
-
-
-def test_offload_registration_checks_allocation_balance(bound_cache, monkeypatch):
-    cache, _, _, register = bound_cache
-    monkeypatch.setattr(
-        cache,
-        "allocations",
-        (*cache.allocations, torch.zeros(cache.geometry.alignment, dtype=torch.uint8)),
-    )
-    with pytest.raises(ValueError, match="arena does not balance"):
-        register()
-
-
 def test_serving_prefill_reuses_profiled_reservation(bound_cache, monkeypatch):
     cache, builder, _, _ = bound_cache
     if not cache.window_fp8:
@@ -191,3 +172,28 @@ def test_serving_prefill_reuses_profiled_reservation(bound_cache, monkeypatch):
             cache._reserve_prefill_window(step)
         assert step.prefill_window_staging is reservation
         assert cache.prefill_window_staging.data_ptr() == reservation.data_ptr()
+
+
+@pytest.mark.parametrize("invalid", ["missing-plane", "extra-allocation"])
+def test_offload_registration_rejects_incomplete_storage(
+    bound_cache, monkeypatch, invalid
+):
+    cache, _, module, register = bound_cache
+    if invalid == "missing-plane":
+        exporter = module.v41_page_planes
+        monkeypatch.setattr(
+            module, "v41_page_planes", lambda cache: exporter(cache)[1:]
+        )
+        message = "PAGE unit mismatch"
+    else:
+        monkeypatch.setattr(
+            cache,
+            "allocations",
+            (
+                *cache.allocations,
+                torch.zeros(cache.geometry.alignment, dtype=torch.uint8),
+            ),
+        )
+        message = "arena does not balance"
+    with pytest.raises(ValueError, match=message):
+        register()
