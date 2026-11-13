@@ -846,7 +846,10 @@ def _chunk_interval_counts(
     chs = tl.arange(0, NCH)
     live = chs < nch
     base1 = l1c_ptr + (r * nch + chs) * K
-    above_b1 = tl.load(base1 + tl.minimum(k1 + 1, K - 1), live & (k1 + 1 < K), 0)
+    # k1 is a scalar: broadcast it so the mask is a [NCH] vector, which the
+    # Triton interpreter requires.
+    has_b1 = live & (chs * 0 + k1 + 1 < K)
+    above_b1 = tl.load(base1 + tl.minimum(k1 + 1, K - 1), has_b1, 0)
     cnt = tl.load(base1 + k1, live, 0) - above_b1
     if need2:
         base2 = l2c_ptr + (r * nch + chs) * K
