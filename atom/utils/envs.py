@@ -214,8 +214,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MoRIIO P/D write mode, prefill side: serve and report pushes on a
     # dedicated thread as soon as they are asked for and land, instead of from
     # the engine step's get_finished, which adds up to a few steps. Off by
-    # default: under concurrency ATOM_MORIIO_VERIFY still finds a few receives
-    # whose PAGE blocks differ from the producer's.
+    # default: under concurrency the push can start before the prefill's
+    # EAGLE3 draft KV is final, so ATOM_MORIIO_VERIFY finds a few receives
+    # whose draft.k/v regions differ (the target's always match).
     "ATOM_MORIIO_WRITE_THREAD": lambda: _flag_env("ATOM_MORIIO_WRITE_THREAD", "0"),
     # MoRIIO P/D: log the layers a receive left unchanged (debugging). With
     # moriio_backend fabric: compare a digest of every PAGE region's blocks
