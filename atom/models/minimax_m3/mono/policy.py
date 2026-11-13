@@ -36,8 +36,15 @@ HYBRID_MAX_ROWS = 64
 #   production              32 rows 12.04 ms (200.3 us/layer)   64 rows 14.41 ms (242.4 us/layer)
 #   hybrid (mono front + production back)   11.68 (-3%)         15.30 (+6%)   (64: front 71 us + eager back)
 #   wide (whole layer, one kernel)           9.26 (-23%, 149.6 us/layer)   13.02 (-9.6%, 213.9 us/layer)
-# so the wide build wins at both and the hybrid is never chosen. Re-measure when the
-# kernels change; ATOM_MONO_WIDTHS overrides per run.
+# so the wide build wins at both and the hybrid is never chosen. The 48-row build (task-mono-nonexact
+# results/s0_*, same method, rocprofv3 on, graph replay of B live rows; production = exact graph):
+#   production   48 rows 13.71 ms (234.0 us/layer; 13.23 ms in the run above)
+#   wide 48      11.31 ms (184.5 us/layer): -17.5% (-14.5% vs 13.23); padded into the 64-row graph the same
+#                48 live rows cost 12.15 ms (196.7 us/layer): the 48-row build is -6.9% on top of padding.
+# Dead rows cost nothing inside a live 16-row group and ~9 us/layer (single rank) to 12-17 us/layer
+# (TP4, 33/40/48 live rows) per wholly dead group, so the builds sit on the group boundaries
+# (32, 48, 64) and 24 / 40 / 56 are not built. Re-measure when the kernels change;
+# ATOM_MONO_WIDTHS overrides per run.
 MEASURED_HYBRID: str | None = None
 MEASURED_WIDE: str | None = "32:mono,48:mono,64:mono"
 
