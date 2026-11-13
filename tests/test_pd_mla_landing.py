@@ -1519,6 +1519,35 @@ def test_unreadable_landing_fields_do_not_stop_the_write_listener(monkeypatch):
     assert conn._landing_credits.acquire("d0", 1, 0) == 0
 
 
+def test_a_chunked_write_request_adopts_its_landing_partition_on_arrival(
+    monkeypatch,
+):
+    # A chunked PAGE transfer waits for P's admission before a send worker
+    # takes it, and no worker adopts a partition: the listener does, as the
+    # request arrives, as for any other request.
+    mc = _mooncake()
+    conn = object.__new__(mc.MooncakeConnector)
+    conn._side_channel_port = 1
+    conn._landing_credits = LandingCredits()
+    conn._dispatch_ready_chunked_requests = lambda: None
+    request = {
+        "request_id": "r",
+        "consumer_host": "d",
+        "consumer_rpc_port": 1,
+        "chunked_transfer": True,
+        "mla_landing": {"epoch": 7, "base": 0, "slot_bytes": 64, "slots": [3]},
+    }
+    _listen(
+        monkeypatch,
+        mc,
+        conn._write_listener,
+        [(mc.MSG_WRITE_REQUEST, msgpack.dumps(request))],
+    )
+    [(queued, _)] = conn._pending_chunked_requests
+    assert queued == request
+    assert conn._landing_credits.acquire("d:1", 7, 0) == 3
+
+
 # ---------------------------------------------------------------------------
 # GPU scatter kernel
 # ---------------------------------------------------------------------------

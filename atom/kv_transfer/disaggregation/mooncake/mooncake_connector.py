@@ -79,9 +79,11 @@ from atom.kv_transfer.disaggregation.sharded_transfer import (
 from atom.kv_transfer.disaggregation.staging_config import (
     landing_reserve_bytes,
     landing_spec,
+    mha_staging_reserve_bytes,
     staging_reserve_bytes,
 )
 from atom.kv_transfer.disaggregation.transfer_plan import (
+    PAGE_UNITS,
     TOKEN_UNITS,
     RegionLayout,
     TransferPlan,
@@ -1255,6 +1257,7 @@ class MooncakeConnector(KVConnectorBase):
         self._kv_staging_slots = SlotPool()
         self._kv_source_views = {}
         self._kv_staging_reserve = staging_reserve_bytes(config)
+        self._page_staging_enabled = bool(mha_staging_reserve_bytes(config))
         self._send_worker_streams = threading.local()
         self._landing: LandingReceiver | None = None
         self._landing_spec = landing_spec(config)
@@ -1717,15 +1720,19 @@ class MooncakeConnector(KVConnectorBase):
         eligible = {
             i: view
             for i, (region, view) in enumerate(zip(tt.block_regions, views))
-            if region.semantic_role == MLA_KV_ROLE
+            if (self._page_staging_enabled or region.semantic_role == MLA_KV_ROLE)
             and view.is_cuda
             and view.dtype == torch.uint8
             and view.is_contiguous()
         }
-        if not eligible:
+        if not eligible or (self._page_staging_enabled and len(eligible) != len(views)):
             return None
         widest = max(tt.block_regions[i].unit_bytes for i in eligible)
-        slot_bytes = max(widest, STAGING_SLOT_BYTES // widest * widest)
+        slot_bytes = (
+            STAGING_SLOT_BYTES
+            if self._page_staging_enabled
+            else max(widest, STAGING_SLOT_BYTES // widest * widest)
+        )
         slots = staging_slot_count(
             self._num_send_workers, slot_bytes, reserve_bytes=self._kv_staging_reserve
         )
@@ -1759,7 +1766,9 @@ class MooncakeConnector(KVConnectorBase):
         if spec is None or self._has_slot_regions:
             return None
         regions = [
-            i for i, role in enumerate(self._block_region_roles) if role == MLA_KV_ROLE
+            i
+            for i, role in enumerate(self._block_region_roles)
+            if spec.wire_layout == PAGE_UNITS or role == MLA_KV_ROLE
         ]
         if not regions:
             return None
@@ -1777,11 +1786,12 @@ class MooncakeConnector(KVConnectorBase):
             table_segments=spec.table_segments,
         )
         logger.info(
-            "PD KV landing: %d slots x %.1f MiB, %s, %d units/PAGE",
+            "PD KV landing: %d slots x %.1f MiB, %s, %d units/PAGE, chunk=%s",
             LANDING_POOL_SLOTS,
             LANDING_SLOT_BYTES / (1 << 20),
             spec.wire_layout,
             spec.units_per_page,
+            spec.supports_chunks,
         )
         return receiver
 
@@ -2107,10 +2117,24 @@ class MooncakeConnector(KVConnectorBase):
             # landing partition it may write (see landing.py).
             stage_requests: dict[int, bytes] = {}
             landing = self._landing
-            if landing is not None and not meta.chunked_transfer:
+            if landing is not None and (
+                not meta.chunked_transfer
+                or (
+                    self._landing_spec is not None
+                    and self._landing_spec.supports_chunks
+                )
+            ):
                 for stage, addr in stage_addrs.items():
                     advertised = landing.advertise(addr, remote_pp_size)
                     if advertised is not None:
+                        if (
+                            self._landing_spec is not None
+                            and self._landing_spec.wire_layout != TOKEN_UNITS
+                        ):
+                            advertised = {
+                                **advertised,
+                                "layout": self._landing_spec.wire_layout,
+                            }
                         stage_requests[stage] = msgpack.dumps(
                             {**request_body, "mla_landing": advertised}
                         )
@@ -2121,6 +2145,15 @@ class MooncakeConnector(KVConnectorBase):
             # reclaim them. A landing request settles in the receiver instead
             # of the write-done tables.
             if stage_requests:
+                if meta.chunked_transfer:
+                    with self._completion_lock:
+                        self._pending_handoffs[req_id] = {
+                            "failed": False,
+                            "metadata": None,
+                            "landing_nonce": write_nonce,
+                            "expected": remote_pp_size,
+                            "stages": set(),
+                        }
                 landing.begin(req_id, write_nonce, dst_block_ids, stage_addrs)
             else:
                 with self._completion_lock:
@@ -2445,6 +2478,22 @@ class MooncakeConnector(KVConnectorBase):
                             request_data.get("consumer_host"),
                             request_data.get("consumer_rpc_port"),
                         )
+                        landing = request_data.get("mla_landing")
+                        if landing is not None:
+                            # Adopt the partition before any worker needs it,
+                            # chunked PAGE transfers included.
+                            try:
+                                self._landing_credits.sync(
+                                    f"{request_data['consumer_host']}:"
+                                    f"{request_data['consumer_rpc_port']}",
+                                    landing,
+                                )
+                            except Exception:
+                                # Not adopted: the transfer finds no credit and
+                                # stages its units, or fails on the same field.
+                                logger.exception(
+                                    "[PRODUCER] adopting a landing partition failed"
+                                )
                         if request_data.get("chunked_transfer"):
                             with self._completed_prefills_lock:
                                 self._pending_chunked_requests.append(
@@ -2452,21 +2501,6 @@ class MooncakeConnector(KVConnectorBase):
                                 )
                             self._dispatch_ready_chunked_requests()
                         else:
-                            landing = request_data.get("mla_landing")
-                            if landing is not None:
-                                # Adopt the partition before any worker needs it.
-                                try:
-                                    self._landing_credits.sync(
-                                        f"{request_data['consumer_host']}:"
-                                        f"{request_data['consumer_rpc_port']}",
-                                        landing,
-                                    )
-                                except Exception:
-                                    # Not adopted: the transfer finds no credit and
-                                    # stages its MLA rows, or fails on the same field.
-                                    logger.exception(
-                                        "[PRODUCER] adopting a landing partition failed"
-                                    )
                             self._send_executor.submit(
                                 self._execute_transfer, request_data
                             )
@@ -2954,6 +2988,7 @@ class MooncakeConnector(KVConnectorBase):
                 chunk_dst_block_ids = dst_block_ids[
                     dst_block_offset : dst_block_offset + num_chunk_dst_blocks
                 ]
+                request_data["_transfer_dst_offset"] = dst_block_offset
                 if has_slots:
                     ok = self._execute_block_slot_transfer(
                         request_data,
@@ -3297,6 +3332,30 @@ class MooncakeConnector(KVConnectorBase):
 
         staged_regions: list[tuple[int, int, int]] = []
         staged_token_regions: list[int] = []
+        # Head cuts are already in `plan`. Stage them when the destination
+        # slice fits; a slot that cannot hold that slice keeps the direct
+        # descriptors below. `plan` stays the unit plan either way.
+        if (
+            plan.cuts is not None
+            and self._kv_staging is not None
+            and kv_cache_ready_event is not None
+        ):
+            staging_plan = self._make_staging_plan(
+                request_data,
+                src_block_ids,
+                dst_block_ids,
+                cmap,
+                list(range(num_regions)),
+            )
+            if staging_plan.minimum_slot_bytes <= self._kv_staging.shape[1]:
+                return self._execute_staged_transfer(
+                    request_data,
+                    target,
+                    staging_plan,
+                    req_id,
+                    kv_cache_ready_event,
+                    engine=engine,
+                )
         source_blocks = np.asarray(src_block_ids, dtype=np.int64)
         destination_blocks = np.asarray(dst_block_ids, dtype=np.int64)
         for region_idx in range(num_regions):
@@ -3412,6 +3471,17 @@ class MooncakeConnector(KVConnectorBase):
                         return False
         return True
 
+    def _target_head_runs(self, request):
+        """Head runs per consumer region, from the unit layout or an explicit list."""
+        explicit = request.get("consumer_head_major_runs")
+        if explicit is not None:
+            return explicit
+        raw = request.get("consumer_unit_layout")
+        if not raw:
+            return None
+        units = msgpack.loads(raw) if isinstance(raw, (bytes, bytearray)) else raw
+        return [unit[5] for unit in units]
+
     def _make_staging_plan(
         self,
         request: dict,
@@ -3425,13 +3495,15 @@ class MooncakeConnector(KVConnectorBase):
         """Resolve rank ownership before byte addressing; no attention-family dispatch."""
         roles = request.get("consumer_region_roles")
         widths = request.get("consumer_block_bpb")
+        source_runs = self._block_head_major_runs
+        target_runs = self._target_head_runs(request)
+        # The unit layout already paired regions by spec. MHA pool roles are
+        # pool-local row labels, so they are not an identity across PP stages.
+        check_roles = roles is not None and not request.get("consumer_unit_layout")
         layouts = []
         for region in regions:
             consumer = cmap[region]
-            if (
-                roles is not None
-                and roles[consumer] != self._block_region_roles[region]
-            ):
+            if check_roles and roles[consumer] != self._block_region_roles[region]:
                 raise ValueError("KV staging region role mismatch")
             width = self._per_block_bytes_list[region]
             layouts.append(
@@ -3442,6 +3514,16 @@ class MooncakeConnector(KVConnectorBase):
                     width,
                     widths[consumer] if widths is not None else width,
                     token_contiguous=self._block_region_roles[region] == MLA_KV_ROLE,
+                    source_head_runs=(
+                        tuple(source_runs[region])
+                        if source_runs and source_runs[region]
+                        else None
+                    ),
+                    target_head_runs=(
+                        tuple(target_runs[consumer])
+                        if target_runs and target_runs[consumer]
+                        else None
+                    ),
                 )
             )
         plan = build_transfer_plan(
@@ -3465,6 +3547,12 @@ class MooncakeConnector(KVConnectorBase):
             view = self._kv_source_views[region.source_region]
             if last_source_unit >= view.numel() // region.gather.source_bytes:
                 raise ValueError("KV staging source unit out of bounds")
+        offset = request.get("_transfer_dst_offset", 0)
+        full_pages = request.get("dst_block_ids")
+        if full_pages is not None and list(
+            full_pages[offset : offset + len(dst_pages)]
+        ) != list(dst_pages):
+            raise ValueError("KV staging destination cursor mismatch")
         return plan
 
     def _execute_staged_transfer(
@@ -3551,7 +3639,10 @@ class MooncakeConnector(KVConnectorBase):
                                         "pp_rank": self.pp_rank,
                                         "seq": seq,
                                         "slot": credit,
-                                        "items": plan.ready_items(items),
+                                        "items": plan.ready_items(
+                                            items,
+                                            request.get("_transfer_dst_offset", 0),
+                                        ),
                                     }
                                 ),
                             ],
@@ -4359,6 +4450,29 @@ class MooncakeConnector(KVConnectorBase):
         window fail it (``_expire_pending_recvs``).
         """
         landing = self._landing
+        if landing is not None and getattr(self, "_pending_handoffs", None):
+            with self._completion_lock:
+                pending = getattr(self, "_pending_handoffs", {}).get(req_id)
+                if pending is not None and "landing_nonce" in pending:
+                    if (
+                        pending["landing_nonce"] != write_nonce
+                        or not 0 <= pp_rank < pending["expected"]
+                    ):
+                        return False
+                    if pp_rank in pending["stages"]:
+                        return False
+                    pending["stages"].add(pp_rank)
+                    try:
+                        if not success:
+                            raise ValueError("failed prefill stage")
+                        PrefillHandoff.from_wire(req_id, handoff)
+                        previous = pending["metadata"]
+                        if previous is not None and previous != handoff:
+                            raise ValueError("PP stages disagree on handoff")
+                        pending["metadata"] = handoff
+                    except (TypeError, ValueError):
+                        pending["failed"] = True
+                    success = success and not pending["failed"]
         if landing is not None and landing.stage_done(
             req_id, pp_rank, write_nonce, success, landed_slots
         ):
@@ -4551,6 +4665,10 @@ class MooncakeConnector(KVConnectorBase):
         """
         with self._completion_lock:
             pending_handoff = self._pending_handoffs.pop(req_id, None)
+            if pending_handoff is not None:
+                failed |= (
+                    pending_handoff["failed"] or pending_handoff["metadata"] is None
+                )
         if failed:
             hold_s = envs.ATOM_PD_FAILED_WRITE_HOLD_S
             if hold_s > 0:

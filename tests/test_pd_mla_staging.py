@@ -734,6 +734,7 @@ def test_staging_gathers_bytes_whatever_the_kv_dtype(monkeypatch):
     conn.dcp_size = 1
     conn.block_size = 16
     conn._has_slot_regions = False
+    conn._page_staging_enabled = False
     conn._num_send_workers = 16
     tt = SimpleNamespace(
         block_regions=[published.region], block_tensor_views=[_Bf16View()]
@@ -766,6 +767,7 @@ def test_kv_staging_follows_the_env_through_its_reserve(monkeypatch, enabled):
 
     conn = object.__new__(mc.MooncakeConnector)
     conn._has_slot_regions = False
+    conn._page_staging_enabled = False
     conn._num_send_workers = 1
     # What __init__ sets from the connector's config.
     conn._kv_staging_reserve = staging_reserve_bytes(_mla_producer_config(1))
