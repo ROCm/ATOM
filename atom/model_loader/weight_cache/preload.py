@@ -81,11 +81,11 @@ def _remove(*paths: str) -> None:
 
 def record_launch() -> None:
     """Called first thing by the API server (weight cache on). The time it
-    runs tells the runners which sources may have changed under them. A daemon
-    tells its runners its main process (stopping that stops the daemon). An
-    ATOM_PRELOAD server saves its command line and environment, to start a
-    daemon with them."""
-    # The engine's runners start, and import their code, after this moment.
+    runs tells the processes that load which sources may have changed under
+    them. A daemon tells its processes its main process (stopping that stops
+    the daemon). An ATOM_PRELOAD server saves its command line and
+    environment, to start a daemon with them."""
+    # The processes that load start, and import their code, after this moment.
     os.environ[_LAUNCH_T0_ENV] = repr(time.time())
     if envs.ATOM_WEIGHT_CACHE == "daemon":
         os.environ[_DAEMON_PID_ENV] = str(os.getpid())
@@ -223,26 +223,26 @@ def stop_daemon(path: str, timeout_s: float = 180) -> int | None:
         if state.get("pid") or time.monotonic() > deadline:
             break
         time.sleep(0.2)  # the lock is taken just before the state is written
-    runner, main = state.get("pid"), state.get("daemon_pid")
-    if not _pid_running(runner):
+    proc, main = state.get("pid"), state.get("daemon_pid")
+    if not _pid_running(proc):
         raise RuntimeError(
-            f"the daemon holding {path}.lock (pid {runner}) does not run in this PID "
+            f"the daemon holding {path}.lock (pid {proc}) does not run in this PID "
             "namespace (another container?); stop it where it runs"
         )
-    if not main or main not in _ancestors(runner):
+    if not main or main not in _ancestors(proc):
         raise RuntimeError(
-            f"cannot find the main process of the daemon holding {path}.lock (runner pid {runner})"
+            f"cannot find the main process of the daemon holding {path}.lock (process {proc})"
         )
     with contextlib.suppress(ProcessLookupError):
         os.kill(main, signal.SIGTERM)
     deadline = time.monotonic() + timeout_s
-    # The runner lets go of the lock early in its shutdown; its device memory
-    # is free only once the process has exited.
-    while daemon_alive(path) or _pid_running(runner):
+    # The GPU's process lets go of the lock early in its shutdown; its device
+    # memory is free only once the process has exited.
+    while daemon_alive(path) or _pid_running(proc):
         if time.monotonic() > deadline:
             raise RuntimeError(
                 f"the weight cache daemon (pid {main}) has not exited on this GPU "
-                f"{timeout_s:.0f}s after SIGTERM (runner pid {runner})"
+                f"{timeout_s:.0f}s after SIGTERM (process {proc})"
             )
         time.sleep(0.5)
     return main

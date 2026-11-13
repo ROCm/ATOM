@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Record the inputs Python code reads while the daemon's runner builds and
-loads its model; what loading read becomes part of the cache key.
+"""Record the inputs Python code reads while the daemon builds and loads its
+model; what loading read becomes part of the cache key.
 
 Recorded: environment variables and config fields that loading read,
 construction-time attributes (instance and class) that loading read, globals
-the loading code referenced, and files it opened. Phases: ``init`` (runner
-start to model construction), ``construct`` and ``load`` (checkpoint load and
+the loading code referenced, and files it opened. Phases: ``init`` (process
+setup), ``construct`` and ``load`` (checkpoint load and
 post-processing); recording stops there. Native code (C++ getenv, files opened
 by C++) is invisible here.
 """

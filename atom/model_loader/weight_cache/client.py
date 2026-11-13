@@ -12,8 +12,10 @@ import threading
 import time
 
 import torch
+from torch import nn
 
 from atom.distributed.group_agreement import group_agree, group_max, group_min
+from atom.model_engine.model_setup import build_model, load_from_disk
 from atom.model_loader.weight_cache.export import (
     _leftover_meta,
     _run_prepare_finalize,
@@ -109,16 +111,14 @@ def _fetch(path: str, label: str) -> tuple[socket.socket, dict]:
     return sock, payload
 
 
-def _check_payload(payload: dict, runner) -> list[str]:
+def _check_payload(payload: dict, config, rank: int, device) -> list[str]:
     """Why this payload cannot be used here (empty: it can)."""
     if payload.get("protocol") != PROTOCOL_VERSION:
         return [f"protocol {payload.get('protocol')} != {PROTOCOL_VERSION}"]
-    diffs = _diff_key(
-        payload["key"], compute_key(runner.config, runner.rank, runner.device)
-    )
+    diffs = _diff_key(payload["key"], compute_key(config, rank, device))
     if diffs:
         return ["checkpoint, model, rank, GPU or library versions differ:"] + diffs
-    diffs = diff_reads(payload["reads"], STATIC_READS, config=runner.config)
+    diffs = diff_reads(payload["reads"], STATIC_READS, config=config)
     if diffs:
         return ["settings the daemon's load read differ:"] + diffs
     try:
@@ -161,7 +161,7 @@ def _fail(
     )
 
 
-def _probe(path: str, label: str, runner, started: dict | None):
+def _probe(path: str, label: str, started: dict | None, config, rank, device):
     """This rank's daemon: (connection, payload, why it cannot be used, whether
     there is one). Waits for a daemon that is starting or loading."""
     sock, payload = None, None
@@ -170,7 +170,7 @@ def _probe(path: str, label: str, runner, started: dict | None):
             return None, None, [], False
         _wait_serving(path, label, started)
         sock, payload = _fetch(path, label)
-        reasons = _check_payload(payload, runner)
+        reasons = _check_payload(payload, config, rank, device)
     except _Miss as e:
         reasons = [str(e)]
     except Exception as e:  # noqa: BLE001 - every rank must reach the agreement
@@ -207,60 +207,68 @@ def _stop_and_reclaim(path: str, device: torch.device) -> None:
     )
 
 
-def _forward_context(runner) -> dict | None:
-    cc = getattr(runner.config, "compilation_config", None)
+def _forward_context(config) -> dict | None:
+    cc = getattr(config, "compilation_config", None)
     return getattr(cc, "static_forward_context", None)
 
 
-def _give_up(label, path, reasons, started, group, runner, layers) -> bool:
-    """The daemon this launch started cannot be used either: stop it and
-    load from disk (its memory is free again), or fail if it won't stop."""
+def _give_up(label, path, reasons, started, group, config, device, layers) -> None:
+    """The daemon this launch started cannot be used either: stop it so the
+    disk load has its memory, or fail if it won't stop."""
     err = None
     try:
-        _stop_and_reclaim(path, runner.device)
+        _stop_and_reclaim(path, device)
     except Exception as e:  # noqa: BLE001 - every rank must reach the agreement
         err = f"could not stop the daemon this launch started: {e}"
     if not group_agree(err is None, group):
         raise _fail(label, [err] if err else [], preload=True)
-    _drop_layers(runner, layers)
+    _drop_layers(config, layers)
     detail = "\n  ".join(reasons[:25]) if reasons else "another rank cannot use it"
     logger.warning(
         f"{_TAG} {label}: the weight cache daemon this launch started cannot be used, "
         f"so it was stopped and this server loads from disk (daemon log {started['log']}):"
         f"\n  {detail}"
     )
-    return False
 
 
-def _drop_layers(runner, layers) -> None:
+def _drop_layers(config, layers) -> None:
     """Unregister the layers a meta-built model registered (a disk load
     builds the model again)."""
-    ctx = _forward_context(runner)
+    ctx = _forward_context(config)
     if ctx is not None and layers is not None:
         for name in set(ctx) - layers:
             del ctx[name]
 
 
-def try_load_from_cache(runner, model_class) -> bool:
-    """Build ``runner.model`` from a daemon's weights; False: load from disk.
+def load_from_cache(config, model_class, device, *, rank: int) -> nn.Module:
+    """get_model's loader in client mode: the daemon's weights, else the
+    checkpoint's (see _from_daemon)."""
+    model = _from_daemon(config, model_class, device, rank)
+    return load_from_disk(config, model_class, device) if model is None else model
 
-    Client mode uses the daemon that is there: False when none of this
+
+def _from_daemon(config, model_class, device, rank: int) -> nn.Module | None:
+    """The model with a daemon's weights; None: load from disk.
+
+    Client mode uses the daemon that is there: None when none of this
     launch's GPUs has one, an error when one is there but cannot be used.
     ATOM_PRELOAD manages the daemon: it starts one when there is none, and
     when the one there cannot be used, stops it and starts a new one (once).
     If the daemon it started cannot be used either, or none can be started,
     it loads from disk. Every rank of the launch takes the same decisions."""
     t0 = time.perf_counter()
-    label = f"rank {runner.rank}"
+    label = f"rank {rank}"
     group = _agree_group()
     auto = envs.ATOM_PRELOAD
-    path = socket_path(runner.device)
+    path = socket_path(device)
     # The daemon this launch started (the API server may have already).
     started = _started_by_launch() if auto else None
     settled = False
     model, t_meta, layers = None, 0.0, None
     while True:
-        sock, payload, reasons, present = _probe(path, label, runner, started)
+        sock, payload, reasons, present = _probe(
+            path, label, started, config, rank, device
+        )
         status = 0 if not present else (2 if reasons else 1)
         lo, hi = group_min(status, group), group_max(status, group)
         summary = (payload or {}).get("summary", {})
@@ -269,7 +277,7 @@ def try_load_from_cache(runner, model_class) -> bool:
             logger.info(
                 f"{_TAG} {label}: no weight cache daemon on this launch's GPUs; loading from disk"
             )
-            return False
+            return None
         if lo == 0 and hi > 0 and started is None and not settled:
             # A daemon takes its GPUs one rank at a time: give the others a moment.
             settled = True
@@ -281,12 +289,11 @@ def try_load_from_cache(runner, model_class) -> bool:
             continue
         if lo == hi == 1:
             if model is None:  # built once: a model registers its layers globally
-                ctx = _forward_context(runner)
+                ctx = _forward_context(config)
                 layers = set(ctx) if ctx is not None else None
                 t_build = time.perf_counter()
                 with params_on_meta():
-                    model = model_class(runner.config)
-                torch.set_default_device(None)
+                    model = build_model(config, model_class, device)
                 t_meta = time.perf_counter() - t_build
             diffs = _diff_key(
                 payload["structure"],
@@ -314,7 +321,8 @@ def try_load_from_cache(runner, model_class) -> bool:
         if not auto:
             raise _fail(label, reasons, pid)
         if started is not None:
-            return _give_up(label, path, reasons, started, group, runner, layers)
+            _give_up(label, path, reasons, started, group, config, device, layers)
+            return None
         if hi > 0:
             err = _in_use_by_others(path)
             if not group_agree(err is None, group):
@@ -335,7 +343,7 @@ def try_load_from_cache(runner, model_class) -> bool:
                 )
             err = None
             try:
-                _stop_and_reclaim(path, runner.device)
+                _stop_and_reclaim(path, device)
             except Exception as e:  # noqa: BLE001 - every rank must reach the agreement
                 err = f"could not stop the daemon: {e}"
             if not group_agree(err is None, group):
@@ -351,12 +359,12 @@ def try_load_from_cache(runner, model_class) -> bool:
             err = str(e)
         if not group_agree(err is None, group):
             # No daemon holds these GPUs now: none was there, or it was stopped.
-            _drop_layers(runner, layers)
+            _drop_layers(config, layers)
             logger.warning(
                 f"{_TAG} {label}: {err or 'another rank could not start the daemon'}; "
                 "loading from disk"
             )
-            return False
+            return None
         logger.info(
             f"{_TAG} {label}: started weight cache daemon pid {started['pid']} (log {started['log']}); "
             "waiting for it to load"
@@ -365,7 +373,7 @@ def try_load_from_cache(runner, model_class) -> bool:
     t_map = time.perf_counter()
     error = None
     try:
-        mapped = apply_export(model, payload["export"], runner.device)
+        mapped = apply_export(model, payload["export"], device)
         left = _leftover_meta(model)
         if left:
             error = f"{len(left)} tensors still on meta after mapping: {left[:8]}"
@@ -377,8 +385,8 @@ def try_load_from_cache(runner, model_class) -> bool:
     torch.cuda.reset_peak_memory_stats()
     # Collective on EP setups; a failure here must not be swallowed.
     n_moe = _run_prepare_finalize(model)
-    runner.model = model
-    runner._weight_cache_conn = sock
+    # Holds the connection open for this process's lifetime: the daemon
+    # counts it as a server using its weights.
     threading.Thread(
         target=_watch_daemon, args=(sock, label, path), daemon=True
     ).start()
@@ -388,7 +396,7 @@ def try_load_from_cache(runner, model_class) -> bool:
         f"fetch+checks {t_map - t0 - t_meta:.2f}s, meta build {t_meta:.2f}s, "
         f"map {time.perf_counter() - t_map:.2f}s, {n_moe} MoE prepare/finalize)"
     )
-    return True
+    return model
 
 
 def _watch_daemon(sock: socket.socket, label: str, path: str) -> None:

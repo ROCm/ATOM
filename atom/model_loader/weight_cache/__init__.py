@@ -4,7 +4,8 @@
 
 A *daemon* is started like a server, with ``ATOM_WEIGHT_CACHE=daemon``: in
 place of an engine it starts one process per GPU that builds, loads and
-post-processes its shard as a serving runner would, then stops (daemon.py).
+post-processes its shard with a server's own entry points (``init_model_env``,
+``get_model``) and sets up nothing for serving (daemon.py).
 Each exports what loading produced as CUDA IPC handles on a Unix socket named
 after its GPU (transport.py). A *client* (``ATOM_WEIGHT_CACHE=client``) builds
 its model on the meta device and maps those tensors instead of reading the

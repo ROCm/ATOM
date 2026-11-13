@@ -693,12 +693,15 @@ class _Model(nn.Module):
         config.compilation_config.static_forward_context["layers.0"] = self
 
 
-def _runner():
+def _config():
     ctx = {"other": 1}
-    config = SimpleNamespace(
+    return SimpleNamespace(
         compilation_config=SimpleNamespace(static_forward_context=ctx)
     )
-    return SimpleNamespace(rank=0, device=torch.device("cpu"), config=config)
+
+
+def _from_daemon(config=None):
+    return client._from_daemon(config or _config(), _Model, torch.device("cpu"), 0)
 
 
 class _Conn:
@@ -711,8 +714,8 @@ class _Conn:
 
 @pytest.fixture
 def loop(monkeypatch):
-    """try_load_from_cache with the daemon replaced: ``probes`` lists what
-    each probe finds, (daemon there, why it cannot be used)."""
+    """The client with the daemon replaced: ``probes`` lists what each probe
+    finds, (daemon there, why it cannot be used)."""
     calls = SimpleNamespace(probes=[], spawned=0, stopped=0, attr_diffs=[])
     payload = {
         "summary": {"pid": 7, "daemon_pid": 7},
@@ -721,7 +724,7 @@ def loop(monkeypatch):
         "reads": {},
     }
 
-    def probe(path, label, runner, started):
+    def probe(path, label, started, config, rank, device):
         present, reasons = calls.probes.pop(0)
         if not present:
             return None, None, [], False
@@ -754,30 +757,31 @@ def loop(monkeypatch):
     return calls
 
 
-def test_client_mode_without_a_daemon_loads_from_disk(loop):
+def test_client_mode_without_a_daemon_loads_from_disk(loop, monkeypatch):
+    monkeypatch.setattr(client, "load_from_disk", lambda *a: "from disk")
     loop.probes = [(False, [])]
-    assert client.try_load_from_cache(_runner(), _Model) is False
+    loaded = client.load_from_cache(_config(), _Model, torch.device("cpu"), rank=0)
+    assert loaded == "from disk"
 
 
 def test_client_mode_refuses_a_daemon_it_cannot_use(loop):
     loop.probes = [(True, ["env X: daemon=1 client=2"])]
     with pytest.raises(RuntimeError, match="env X"):
-        client.try_load_from_cache(_runner(), _Model)
+        _from_daemon()
     assert loop.stopped == loop.spawned == 0
 
 
 def test_preload_starts_a_daemon_and_maps_it(loop, monkeypatch):
     monkeypatch.setenv("ATOM_PRELOAD", "1")
     loop.probes = [(False, []), (True, [])]
-    runner = _runner()
-    assert client.try_load_from_cache(runner, _Model) is True
-    assert loop.spawned == 1 and isinstance(runner.model, _Model)
+    assert isinstance(_from_daemon(), _Model)
+    assert loop.spawned == 1
 
 
 def test_preload_restarts_a_daemon_it_cannot_use_once(loop, monkeypatch):
     monkeypatch.setenv("ATOM_PRELOAD", "1")
     loop.probes = [(True, ["atom/model_loader/loader.py:load_model"]), (True, [])]
-    assert client.try_load_from_cache(_runner(), _Model) is True
+    assert isinstance(_from_daemon(), _Model)
     assert loop.stopped == 1 and loop.spawned == 1
 
 
@@ -788,11 +792,11 @@ def test_preload_loads_from_disk_when_its_own_daemon_does_not_fit(loop, monkeypa
     )
     loop.probes = [(True, [])]
     loop.attr_diffs = ["layers.0.interleave: daemon=True client=False"]
-    runner = _runner()
-    assert client.try_load_from_cache(runner, _Model) is False  # a disk load follows
+    config = _config()
+    assert _from_daemon(config) is None  # a disk load follows
     assert loop.stopped == 1 and loop.spawned == 0
     # The meta-built model is unregistered, so the disk load can build it again.
-    assert runner.config.compilation_config.static_forward_context == {"other": 1}
+    assert config.compilation_config.static_forward_context == {"other": 1}
 
 
 def test_preload_loads_from_disk_when_no_daemon_can_start(loop, monkeypatch):
@@ -803,7 +807,7 @@ def test_preload_loads_from_disk_when_no_daemon_can_start(loop, monkeypatch):
 
     monkeypatch.setattr(client, "_spawn_daemon", no_spawn)
     loop.probes = [(False, [])]
-    assert client.try_load_from_cache(_runner(), _Model) is False
+    assert _from_daemon() is None
 
 
 def test_preload_leaves_a_daemon_other_servers_use(loop, monkeypatch):
@@ -813,5 +817,5 @@ def test_preload_leaves_a_daemon_other_servers_use(loop, monkeypatch):
     )
     loop.probes = [(True, ["atom/model_loader/loader.py:load_model"])]
     with pytest.raises(RuntimeError, match="other running server"):
-        client.try_load_from_cache(_runner(), _Model)
+        _from_daemon()
     assert loop.stopped == loop.spawned == 0

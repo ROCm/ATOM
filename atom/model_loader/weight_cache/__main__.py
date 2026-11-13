@@ -29,7 +29,7 @@ def _running_daemons() -> dict:
         if daemon_alive(path):
             st = daemon_state(path) or {}
             launches.setdefault(
-                st.get("daemon_pid") or f"? (runner {st.get('pid')})", []
+                st.get("daemon_pid") or f"? (process {st.get('pid')})", []
             ).append((path, st))
     return launches
 
