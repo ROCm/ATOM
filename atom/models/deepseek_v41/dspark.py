@@ -208,7 +208,7 @@ class DeepseekV41DSpark(DSparkDraftModel):
 
     def __init__(self, config, *, max_length=None, alt_stream=None):
         super().__init__()
-        args = getattr(config, "hf_config", config)
+        args = config.hf_config
         if args.num_nextn_predict_layers < 1 or args.dspark_block_size < 1:
             raise ValueError(
                 "V4.1 DSpark needs draft stages and a positive block width"
