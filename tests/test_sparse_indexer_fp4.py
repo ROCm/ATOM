@@ -753,6 +753,51 @@ def test_builder_publishes_the_staging_indices_it_derives(device):
     assert tables.tolist() == [[0, 1, 0, 0, 0, 0], [2, 3, 4, 0, 0, 0]]
 
 
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_builder_hoists_the_opus_scale_index_out_of_the_layers(device):
+    """Under the OPUS (`mfma`) layout the builder publishes, once per forward,
+    each staged key's four e8m0 byte offsets -- the index the staging used to
+    rebuild from the rows in every layer -- and the rows in the int64 the
+    staging indexes with, at the preshuffle build's values."""
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires a ROCm GPU")
+    aiter_mla = _import_or_skip(
+        "atom.model_ops.attentions.aiter_mla",
+        reason="the MLA builder imports triton at module scope",
+    )
+    build = aiter_mla.AiterMLAMetadataBuilder._build_dcp_indexer_fp4_prefill_meta
+    block = 64
+    builder = SimpleNamespace(
+        model_runner=SimpleNamespace(block_size=block),
+        device=torch.device(device),
+        block_table_cols=4,
+    )
+    if device == "cuda":
+        rows = torch.arange(block, dtype=torch.int32, device=device)
+        builder._fp4_scale_row_lut = fp4_index_scale_rows(rows, block)
+    lpad, g_lens = np.array([block + 5, 2 * block + 3]), np.array([100, 150])
+    table = np.array([[7, 3, 0, 0], [11, 2, 9, 0]], dtype=np.int32)
+    args = (2, lpad, np.r_[0, lpad.cumsum()], np.r_[0, g_lens.cumsum()], g_lens, table)
+    preshuffle, opus = SimpleNamespace(), SimpleNamespace()
+    build(builder, preshuffle, *args)
+    build(builder, opus, *args, "mfma")
+
+    g = torch.arange(4)
+    for side in ("read", "stage"):
+        page = getattr(opus, f"dcp_indexer_fp4_{side}_page").cpu()
+        row = getattr(opus, f"dcp_indexer_fp4_{side}_row").cpu()
+        assert page.dtype == row.dtype == torch.int64, side
+        want_page = getattr(preshuffle, f"dcp_indexer_fp4_{side}_page").cpu()
+        want_row = getattr(preshuffle, f"dcp_indexer_fp4_{side}_row").cpu()
+        assert torch.equal(page, want_page.long()), side
+        assert torch.equal(row, want_row.long()), side
+        per_layer = (
+            g % 2 * 128 + row[:, None] % 32 * 4 + g // 2 * 2 + row[:, None] // 32
+        )
+        scale_at = getattr(opus, f"dcp_indexer_fp4_{side}_scale_at").cpu()
+        assert torch.equal(scale_at, page[:, None] * 256 + per_layer), side
+
+
 def _assert_picks(got, want, ends, topk):
     """Each row's selection: as many keys as it may keep, none past its
     bound, and the oracle's top-k but for near-ties."""
