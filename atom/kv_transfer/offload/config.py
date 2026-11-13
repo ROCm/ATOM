@@ -379,18 +379,24 @@ def build_page_namespace(
     if speculative is None:
         speculative = getattr(config, "speculative_config", None)
     speculative = _stable_config_value(speculative)
+    layout = select_offload_layout(config)
+    kv_dtype = str(getattr(config, "kv_cache_dtype", "auto"))
+    page_mode = {
+        "hybrid": "dsv4-page-regions",
+        "dsv41": "dsv4-page-regions",
+        "m3": "m3-page-regions",
+    }.get(layout, "dense-opaque-block")
+    if layout == "dsv41" and kv_dtype in ("fp4", "fp8"):
+        # Quantized V4.1 now stores contiguous data/scale planes instead of
+        # interleaved rows. Equal-size old PAGE objects must miss even when
+        # replay-based offload has no STATE checkpoint layout_id to check.
+        page_mode = "dsv41-source-buffer-v1"
     document = {
         "schema": "atom-page-namespace",
         "layout_version": layout_version,
         "model": base_model_name,
-        "page_mode": {
-            "hybrid": "dsv4-page-regions",
-            # V4.1 resolved to `hybrid` before it had a layout of its own: it
-            # keeps the namespace native ATOM's tiers were filled under.
-            "dsv41": "dsv4-page-regions",
-            "m3": "m3-page-regions",
-        }.get(select_offload_layout(config), "dense-opaque-block"),
-        "kv_cache_dtype": str(getattr(config, "kv_cache_dtype", "auto")),
+        "page_mode": page_mode,
+        "kv_cache_dtype": kv_dtype,
         "index_cache_dtype": str(getattr(config, "index_cache_dtype", "auto")),
         "block_size": _strict_integer(
             "PAGE block size",
