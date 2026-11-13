@@ -583,20 +583,15 @@ def target_layer(E, Ly):
                                pre=fptr(fp, "pre"), post=fptr(fp, "post"), comb=fptr(fp, "comb"),
                                fnh=ltab(fp, Ly, "fnh")(), fnl=ltab(fp, Ly, "fnl")(),
                                part2=plog(P2F), cnt=lc + i64(LY.FFN_POST), cnt2=lc + i64(LY.MIX_POST), **fpf), TR)
-    if (b >= FS.CL) & (b < FS.RCTA0):   # (the router CTAs run their mix after the router)
-        FS.ffn_mix_owner(dict(t=tq6, b=b, sm=sm + FLO, fnh=ltab(fp, Ly, "fnh")(), fnl=ltab(fp, Ly, "fnl")(),
-                              part2=plog(P2F), cnt2=lc + i64(LY.MIX_POST)), TR)
     # (router_v2: 128 CTAs x 3 experts x every row, the gate read once; A/B 11-12 vs TileRT's per-row router: scores 47.5 vs 51.2 us)
     if b >= FS.RCTA0:
         FS.router_v2(dict(t=tq6, b=b, w=tq6 // 32, l=tq6 % 32, sm=sm + FLO, gate=ltab(fp, Ly, "gate")(), xn=fptr(fp, "xn"),
                           x8pub=lc + i64(LY.X8_PUB), x8n=FS.CL, x1g=plog(X1F), nw=ltab(fp, Ly, "nw")(),
                           postcnt=lc + i64(LY.FFN_POST), norm_eps=D.RMS_EPS, scores=fptr(fp, "plog"),
                           tag=hx.epoch32(tep, Ly, 1), gate_pre=True, ne=RNE, **fpf), TR)
-        if b < FS.NOWN:   # the router CTAs' own mix partials (R'' kept in LDS past the router's)
-            FS.ffn_mix_owner(dict(t=tq6, b=b, sm=sm + FLO, fnh=ltab(fp, Ly, "fnh")(), fnl=ltab(fp, Ly, "fnl")(),
-                                  part2=plog(P2F), cnt2=lc + i64(LY.MIX_POST)), TR)
     S.iprefetch(28)
-    if b < FS.CL:
+    if b < FS.NOWN:   # every owner's mix partials: one copy of the code (it was inlined at 3 call sites, ~800
+        # instructions each); the router CTAs' after their router (R'' kept in LDS past the router's)
         tq7 = hx.opaque_v(fx.thread_idx.x)
         FS.ffn_mix_owner(dict(t=tq7, b=b, sm=sm + FLO, fnh=ltab(fp, Ly, "fnh")(), fnl=ltab(fp, Ly, "fnl")(),
                               part2=plog(P2F), cnt2=lc + i64(LY.MIX_POST)), TR)
