@@ -44,6 +44,7 @@ from atom.model_ops.linear import (
     MergedReplicatedLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    append_linear_rows,
     mxfp4_k_pad_align,
     use_fp4_non_shuffle_triton_gemm,
     use_mxfp4_preshuffle_triton_gemm,
@@ -137,7 +138,7 @@ def _kda_packed_modules_mapping(
         ".q_a_proj": (".fused_qkv_a_proj", 0),
         ".kv_a_proj_with_mqa": (".fused_qkv_a_proj", 1),
     }
-    projection_names = ("q_proj", "k_proj", "v_proj", "g_proj")
+    projection_names = ("q_proj", "k_proj", "v_proj", "g_proj", "b_proj")
     for layer_idx in kda_layer_indices:
         prefix = f".layers.{layer_idx}.self_attn."
         for shard_id, projection_name in enumerate(projection_names):
@@ -1047,9 +1048,10 @@ class KimiKDAAttention(nn.Module):
             raise ValueError(f"Duplicate layer: {self.layer_name}")
         compilation_config.static_forward_context[self.layer_name] = self
 
-        # The top-level model maps four separate checkpoint projections
-        # directly into this fused [q | k | v | g] parameter. Mapping keys
+        # The top-level model maps five separate checkpoint projections
+        # directly into this fused [q | k | v | g | b] parameter. Mapping keys
         # include the KDA layer index so KimiFullAttention.g_proj is untouched.
+        # Beta (b) is widened to fp32 in _run_kda.
         self.in_proj = MergedColumnParallelLinear(
             self.hidden_size,
             [
@@ -1057,19 +1059,11 @@ class KimiKDAAttention(nn.Module):
                 self.proj_size,
                 self.proj_size,
                 self.proj_size,
+                self.num_heads,
             ],
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.in_proj",
-        )
-        # Keep beta separate so the fused in-proj output width remains the
-        # tile-aligned 4 * local_proj_size. Beta is widened to fp32 in _run_kda.
-        self.b_proj = ColumnParallelLinear(
-            self.hidden_size,
-            self.num_heads,
-            bias=False,
-            quant_config=None,
-            prefix=f"{prefix}.b_proj",
         )
 
         self.q_conv1d = ColumnParallelLinear(
@@ -1170,50 +1164,37 @@ class KimiKDAAttention(nn.Module):
     def process_weights_after_loading(self) -> None:
         """Fuse all hidden-input projections into the single in-proj (one GEMM).
 
-        Upstream already loads q/k/v/g into a single ``in_proj``
+        Upstream already loads q/k/v/g/b into a single ``in_proj``
         (``MergedColumnParallelLinear``) via ``packed_modules_mapping``. Here we
-        extend that fused weight in place with the two remaining projections that
-        also consume ``hidden_states`` -- ``b_proj`` (beta) and ``f_a_proj`` --
-        so ``forward`` runs one ``self.in_proj(...)`` producing
-        ``[q | k | v | g | b | f_a]`` instead of three separate launches. The
-        tail storage is then released (the modules stay as empty shells; their
-        bf16 post-load hooks are no-ops and never re-run). Runs once; idempotent.
+        extend that fused weight in place with ``f_a_proj``, the remaining
+        projection that also consumes ``hidden_states`` but is replicated rather
+        than TP-split, so ``forward`` runs one ``self.in_proj(...)`` producing
+        ``[q | k | v | g | b | f_a]`` instead of two separate launches. The
+        tail storage is then released (the module stays an empty shell; its
+        post-load hook no-ops on the emptied weight). Runs once; idempotent.
 
         f_b_proj is NOT fused: it consumes ``f_a_proj``'s output, not
         ``hidden_states``, so it is a data-dependent second GEMM and cannot ride
         the same launch.
 
         Fused output width is ``4*local_proj + num_local_heads + head_dim``. The
-        two small tails (``b`` = num_local_heads, ``f_a`` = head_dim) make N a
+        two small blocks (``b`` = num_local_heads, ``f_a`` = head_dim) make N a
         non-multiple of the GEMM tile, so the fused shape may fall back to an
         untuned tgemm config until one is tuned for it; the saved launches
         dominate on the launch-bound decode path.
 
-        Assumes bf16 (unquantized) attention weights, which the Kimi-K3
-        checkpoint guarantees (``re:.*self_attn.*`` is in the quant ignore
-        list). A quantized-attention checkpoint would need per-shard scale
-        handling and is rejected loudly rather than silently mis-fused.
+        Supports bf16 or per-output-channel FP8 (``per_Token``) attention
+        weights; any other scheme is rejected (see ``append_linear_rows``).
         """
         if getattr(self, "_in_proj_fused", False):
             return
         # Order defines the forward-time slice boundaries below; keep in sync.
-        # in_proj already holds the fused [q | k | v | g] (4 * local_proj_size);
-        # b_proj and f_a_proj are appended as the two tails.
-        tails = (self.b_proj, self.f_a_proj)
-        assert all(m.quant_type == QuantType.No for m in (self.in_proj, *tails)), (
-            "KDA in-proj fusion assumes unquantized (bf16) attention weights; "
-            "this checkpoint quantizes self_attn projections."
-        )
-        fused = torch.cat(
-            [self.in_proj.weight.data, *[m.weight.data for m in tails]], dim=0
-        ).contiguous()
-        # Grow in_proj's weight in place so the existing module (and its
-        # unquantized tgemm.mm path) produces the wide fused output directly.
-        self.in_proj.weight = nn.Parameter(fused, requires_grad=False)
-        # Release the tail weight storage. The modules stay as empty shells;
-        # their bf16 post-load hooks are no-ops and are never re-run.
-        for m in tails:
-            m.weight.data = m.weight.data.new_empty(0)
+        # in_proj already holds the fused [q | k | v | g | b]; f_a_proj is
+        # appended as the tail. Grows in_proj's weight (and FP8 scale) in place
+        # so the existing module (and its tgemm path) produces the wide fused
+        # output directly; its own post-load hook runs after this one and
+        # pads/preshuffles the fused shape if FP8.
+        append_linear_rows(self.in_proj, (self.f_a_proj,))
 
         # Pre-concatenate the static q/k/v causal-conv weights once here instead
         # of rebuilding the [3*local_proj_size, K] tensor on every forward.
@@ -1249,8 +1230,8 @@ class KimiKDAAttention(nn.Module):
             # in-kernel with use_beta_sigmoid_in_kernel, and triton's sigmoid
             # follows the input dtype -- a bf16 beta yields a bf16 write
             # strength, which erodes the delta-rule state update across the 71
-            # KDA layers (measured gsm8k regression). b_proj stays bf16; only
-            # this reduction is widened.
+            # KDA layers (measured gsm8k regression). Beta is a slice of the
+            # fused in_proj output; only its dtype into the kernel is widened.
             beta=beta.float(),
             A_log=self.A_log,
             dt_bias=self.dt_bias,
@@ -1309,12 +1290,12 @@ class KimiKDAAttention(nn.Module):
         hidden_states = hidden_states[:num_actual_tokens]
         if hidden_states_scale is not None:
             hidden_states_scale = hidden_states_scale[:num_actual_tokens]
-        # Single fused in-proj GEMM producing [q | k | v | g]; slice out each
+        # Single fused in-proj GEMM producing [q | k | v | g | b | f_a]; slice out each
         # part. `out_gate` is the KDA output gate consumed at o_norm below
         # (computed here so it rides the same GEMM instead of a separate one
         # after the recurrence). in_proj's weight was grown in
         # process_weights_after_loading to the fused [q | k | v | g | b | f_a],
-        # so this single unquantized call emits all six; f_b_proj stays a
+        # so this single call emits all six; f_b_proj stays a
         # separate GEMM because it consumes f_a's output, not hidden_states.
         lp = self.local_proj_size
         nlh = self.num_local_heads

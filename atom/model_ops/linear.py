@@ -730,6 +730,55 @@ def weight_is_stored_preshuffled(
     return False
 
 
+def append_linear_rows(dst: nn.Module, tails) -> None:
+    """Append the output rows of ``tails`` to ``dst``'s weight, so one GEMM on
+    ``dst`` produces ``[dst | *tails]``. Call before ``dst``'s post-load hook,
+    which then preshuffles/pads the grown shape.
+
+    The modules must share one scheme: bf16, or per_Token FP8, whose per-row
+    scales concatenate in the weights' order. Compared by value: in a plugin
+    process QuantType members from different aiter imports differ. Bias is not
+    supported. ``dst`` keeps its Parameter objects (so their ``weight_loader``
+    attributes survive) and its ``output_size`` / ``output_partition_sizes``
+    grow by the appended local rows. The tails are left as empty shells; their
+    post-load hooks return early on an empty weight.
+    """
+    mods = (dst, *tails)
+    if any(m.bias is not None for m in mods):
+        raise NotImplementedError("Appending linear rows does not support bias.")
+    quant_values = {m.quant_type.value for m in mods}
+    if len(quant_values) != 1:
+        raise NotImplementedError(
+            "Appending linear rows needs one scheme across the modules; got "
+            f"{sorted({m.quant_type.name for m in mods})}."
+        )
+    value = quant_values.pop()
+    if value not in (QuantType.No.value, QuantType.per_Token.value):
+        raise NotImplementedError(
+            "Appending linear rows supports unquantized (bf16) or "
+            f"per-output-channel FP8 (per_Token) weights; got {dst.quant_type.name}."
+        )
+    if value == QuantType.per_Token.value:
+        # Before dst's weight grows: each scale is checked against its own rows.
+        scales = [m.weight_scale for m in mods]
+        if not all(
+            p is not None and p.data.shape[0] == m.weight.shape[0]
+            for p, m in zip(scales, mods)
+        ):
+            raise ValueError(
+                "per_Token weight scales must be one row per output channel"
+            )
+        dst.weight_scale.data = torch.cat([p.data for p in scales])
+    added = [m.weight.shape[0] for m in tails]
+    dst.weight.data = torch.cat([m.weight.data for m in mods], dim=0).contiguous()
+    dst.output_size += sum(added)
+    dst.output_partition_sizes = [*dst.output_partition_sizes, *added]
+    for m in tails:
+        m.weight.data = m.weight.data.new_empty(0)
+        if m.weight_scale is not None:
+            m.weight_scale.data = m.weight_scale.data.new_empty(0)
+
+
 class LinearBase(nn.Module):
     def __init__(
         self,
@@ -1214,11 +1263,12 @@ class LinearBase(nn.Module):
                 # per_Token: scale = max(|full_row|), tp_dim=1 has partial rows
                 need_gather = self.tp_dim == 1
             elif online_quant_type == QuantType.per_1x128:
-                # 128×128 blocks: misaligned if partition size % 128 != 0
-                if self.tp_dim == 0:
-                    need_gather = self.output_size % 128 != 0
-                else:
-                    need_gather = self.input_size % 128 != 0
+                # 128×128 blocks: misaligned if partition size % 128 != 0.
+                # Along the output dim (tp_dim=0) a gather can't help: rank r's
+                # rows start at r * output_size, on a block boundary only when
+                # output_size % 128 == 0, and then local quantization already
+                # matches. The local shard's own blocks are self-consistent.
+                need_gather = self.tp_dim == 1 and self.input_size % 128 != 0
             elif online_quant_type == QuantType.per_1x32:
                 # 1×32 blocks: row dim is 1 (always aligned), only column matters
                 # col qkv w13, tp_dim=0, [m, n] -> [m // tp, n] -> [m // tp, n // 32], don't need gather

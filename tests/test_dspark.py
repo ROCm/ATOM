@@ -2658,3 +2658,26 @@ def test_minimax_m31_dspark_refuses_tp_below_its_kv_heads(monkeypatch, tp):
     config = types.SimpleNamespace(num_attention_heads=64, num_key_value_heads=4)
     with pytest.raises(ValueError, match="needs TP >= 4"):
         m3_dspark.M3DSparkAttention(None, config, None, layer_num=0)
+
+
+def test_minimax_m31_draft_validates_its_given_quant_config():
+    """`_check_draft_quant` accepts BF16 or MXFP8 [1, 32] and rejects other
+    schemes; the draft opts out of the run's online quant."""
+    from aiter import QuantType, dtypes
+
+    from atom.config import QuantizationConfig
+    from atom.models.minimax_m3.dspark import MiniMaxM3DSpark, _check_draft_quant
+    from atom.quant_spec import LayerQuantConfig
+
+    def qc(quant_type, quant_dtype):
+        c = QuantizationConfig()
+        c.quant_method = "mxfp8"
+        c.global_spec = LayerQuantConfig(quant_type=quant_type, quant_dtype=quant_dtype)
+        return c
+
+    _check_draft_quant(QuantizationConfig())  # BF16
+    _check_draft_quant(qc(QuantType.per_1x32, dtypes.fp8))
+    with pytest.raises(ValueError, match="MXFP8"):
+        _check_draft_quant(qc(QuantType.per_1x32, dtypes.fp4x2))
+    # its shipped MXFP8 linears stay out of the run's --online_quant_config
+    assert MiniMaxM3DSpark.draft_skips_online_quant is True

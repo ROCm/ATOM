@@ -7,6 +7,7 @@ This guide targets **AMD MI355 (gfx950) only**, `-tp 8`.
 | Variant | Quantization | Description |
 |---------|-------------|-------------|
 | **MXFP4** | MXFP4 (w4a4, e8m0 scales, group_size=32) | Routed MoE expert weights in microscale FP4. On gfx950 the SiTU experts run the FlyDSL **native SiTUv2** grouped-MoE path. Attention, shared experts, and dense MLP remain BF16. |
+| **MXFP4-AttnFP8** (`amd/Kimi-K3-Quark-MXFP4-AttnFP8`) | MXFP4 MoE, FP8 attention (per output channel), MXFP4 dense MLP | Loads natively; not on the vLLM plugin path. Mono decode does not run on it (see [Mono decode](#mono-decode)). |
 
 **Validated (full 1319, GSM8K 5-shot, base completions, tp8, seed 42):**
 
@@ -75,6 +76,10 @@ context parallelism are all served:
   one and mono refuses the whole model -- the server answers correctly on the
   production path and says so once, e.g. `mono decode off: layer 1 shared
   gate_up_proj is torch.float8_e4m3fn`.
+- **Not on `amd/Kimi-K3-Quark-MXFP4-AttnFP8`.** That checkpoint stores the
+  attention projections in FP8, so `self_attn.in_proj` is not BF16 and mono
+  refuses the whole model at the first KDA layer (`mono decode off: layer 1
+  in_proj is ...`); decode runs on the production path.
 
 With a drafter:
 

@@ -93,17 +93,12 @@ def _draft_rope_theta(config) -> float:
     return float(theta)
 
 
-def _draft_quant_config(config) -> QuantizationConfig:
-    """The draft's own quantization, independent of the target's.
-
-    The draft checkpoint is MXFP8 (``quant_method: mxfp8``, ``[1, 32]`` blocks)
-    whatever the target is -- the M3.1 targets come as MXFP8 + NVFP4 experts,
-    Quark MXFP4, or BF16 -- so the target's config, which ``_build_draft_model``
-    copies onto the draft, cannot be trusted to describe these weights. The
-    checkpoint's own block goes through the registered parser here; a draft
-    config without one is BF16.
+def _check_draft_quant(draft_qc: QuantizationConfig) -> None:
+    """The draft checkpoint is MXFP8 (``quant_method: mxfp8``, ``[1, 32]``
+    blocks) or BF16, whatever the target is -- the M3.1 targets come as MXFP8 +
+    NVFP4 experts, Quark MXFP4, or BF16. ``Drafter._standalone_draft_config``
+    builds ``draft_qc`` from the draft's own checkpoint; refuse anything else.
     """
-    draft_qc = QuantizationConfig(config)
     spec = draft_qc.global_spec
     if draft_qc.quant_method and (spec.quant_type, spec.quant_dtype) != (
         QuantType.per_1x32,
@@ -114,7 +109,6 @@ def _draft_quant_config(config) -> QuantizationConfig:
             f"got quant_method={draft_qc.quant_method!r} ({spec.quant_type}, "
             f"{spec.quant_dtype})."
         )
-    return draft_qc
 
 
 def _page16_table(
@@ -439,6 +433,9 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         ".gate_proj": (".gate_up_proj", 0),
         ".up_proj": (".gate_up_proj", 1),
     }
+    # The shipped MXFP8 linears run as shipped; the run's --online_quant_config
+    # targets the backbone, and its exclude list does not name these layers.
+    draft_skips_online_quant: ClassVar[bool] = True
 
     def __init__(self, atom_config: "Config", layer_offset: int = 0) -> None:
         super().__init__()
@@ -448,7 +445,8 @@ class MiniMaxM3DSpark(DSparkDraftModel):
             )
         config = atom_config.hf_config
         self.hf_config = config
-        quant_config = _draft_quant_config(config)
+        quant_config = atom_config.quant_config
+        _check_draft_quant(quant_config)
 
         self.hidden_size = config.hidden_size
         self.noise_token_id = int(config.dspark_noise_token_id)

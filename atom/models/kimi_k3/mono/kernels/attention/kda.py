@@ -92,8 +92,8 @@ PROJ = NH * HD  # 1536
 QKV = 3 * PROJ
 G2_0 = QKV  # the output gate g
 # ATOM fuses the hidden projections as [q | k | v | g | beta | f_a]
-# (``KimiKDAAttention.process_weights_after_loading`` appends b_proj then
-# f_a_proj); vLLM's kernels were written for the opposite tail order
+# (b_proj is in_proj's fifth shard; ``KimiKDAAttention.process_weights_after_loading``
+# appends f_a_proj); vLLM's kernels were written for the opposite tail order
 BETA_0 = G2_0 + PROJ  # 6144
 FA_0 = BETA_0 + NH  # 6156
 FUSED = FA_0 + HD  # 6284: the rows ATOM's weight actually holds

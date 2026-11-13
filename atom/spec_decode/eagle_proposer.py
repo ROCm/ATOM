@@ -1,4 +1,3 @@
-import copy
 import logging
 
 import torch
@@ -6,7 +5,6 @@ import torch.nn.functional as F
 from torch import nn
 from torch.profiler import record_function
 
-from atom.config import CompilationLevel
 from atom.distributed.dcp_utils import get_dcp_world_size
 from atom.distributed.pcp_utils import (
     get_pcp_world_size,
@@ -18,7 +16,6 @@ from atom.distributed.pcp_utils import (
 from atom.model_ops.attentions.backends import PAD_SLOT_ID
 from atom.model_ops.embed_head import empty_token_ids
 from atom.spec_decode.draft_graph import DraftGraph, StagedInput
-from atom.spec_decode.draft_kv import draft_kv_builder
 from atom.spec_decode.drafter import Drafter
 from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
@@ -229,37 +226,11 @@ class EagleProposer(Drafter):
         return fwd_out, self.model.compute_draft_ids(fwd_out, out=ids)
 
     def _build_draft_model(self, model_class) -> nn.Module:
-        draft_model_hf_config = self.speculative_config.draft_model_hf_config
         if self.speculative_config.method == "eagle3":
-            # Eagle3 draft has its own architecture, so build it from the
-            # draft hf_config. Disable torch.compile for the draft to avoid
-            # Dynamo tracing issues with the separate KV cache binding.
-            # Shallow-copy instead of deepcopy: with MLA targets (K2.6), the
-            # atom_config holds non-picklable cuda.Stream objects under
-            # downstream fields that deepcopy can't traverse. We only mutate
-            # hf_config and compilation_config.level on the draft, so
-            # isolating just those two attrs is sufficient.
-            draft_atom_config = copy.copy(self.config)
-            draft_atom_config.hf_config = draft_model_hf_config
-            draft_atom_config.compilation_config = copy.copy(
-                self.config.compilation_config
-            )
-            draft_atom_config.compilation_config.level = CompilationLevel.NO_COMPILATION
-            # Draft attention layer_num must continue from the target model's
-            # layer count so it maps to the correct kv_cache_data entry.
-            model = model_class(
-                draft_atom_config,
-                layer_offset=self.config.hf_config.num_hidden_layers,
-            )
-            # Whether this draft needs a KV pool of its own is a property of
-            # the draft's config, answered by the backend that config resolves
-            # to. A draft whose rows are the target's latent (K2.6 EAGLE 3.1)
-            # binds into the target's pool and gets None here; model_runner
-            # accounts for its +1 layer via num_nextn_predict_layers.
-            builder = draft_kv_builder(self.runner, draft_model_hf_config)
-            if builder is not None:
-                self.runner.draft_kv_builder = builder
-            return model
+            # Eagle3 draft has its own architecture, built from the draft
+            # hf_config (torch.compile off: Dynamo trips on the separate KV
+            # cache binding).
+            return self._build_standalone_draft(model_class)
 
         return model_class(self.config)
 
