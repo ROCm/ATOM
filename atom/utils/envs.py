@@ -139,6 +139,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_TRACE_VERSION": lambda: os.getenv("ATOM_TRACE_VERSION", "unknown"),
     # Opt-in single-HCA engine pool: "auto" or explicit comma-separated HCAs.
     "ATOM_MOONCAKE_MATCHED_RAILS": lambda: os.getenv("ATOM_MOONCAKE_MATCHED_RAILS", ""),
+    # Prefill (`kv_producer`, plain `mooncake`) only: one INFO line per
+    # block transfer with its size and timings.
+    "ATOM_MOONCAKE_TRANSFER_STATS": lambda: _flag_env("ATOM_MOONCAKE_TRANSFER_STATS"),
     # Prefill (`kv_producer`, plain `mooncake`) only: gather the MLA tokens a
     # DCP decode rank owns into a GPU staging slot and send whole destination
     # pages instead of one RDMA descriptor per token. 0 = per-token path.
@@ -168,8 +171,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_MORIIO_WRITE_TIMEOUT_S": lambda: float(
         os.getenv("ATOM_MORIIO_WRITE_TIMEOUT_S", "600")
     ),
-    # MoRIIO P/D: log the layers a receive left unchanged (debugging).
+    # MoRIIO P/D: log the layers a receive left unchanged (debugging). With
+    # moriio_backend fabric: compare a digest of every PAGE region's blocks
+    # between the producer's source and the consumer's destination.
     "ATOM_MORIIO_VERIFY": lambda: _flag_env("ATOM_MORIIO_VERIFY", "0"),
+    # MoRIIO P/D with moriio_backend fabric: one INFO line per request transfer
+    # with its size and timings, in the format of ATOM_MOONCAKE_TRANSFER_STATS.
+    "ATOM_MORIIO_TRANSFER_STATS": lambda: _flag_env("ATOM_MORIIO_TRANSFER_STATS"),
     # Protect reused KV prefixes from one-off prefill scans. Opt-in.
     "ATOM_PREFIX_CACHE_POLICY": lambda: os.getenv("ATOM_PREFIX_CACHE_POLICY", "lru"),
     "ATOM_PREFIX_CACHE_PROTECTED_RATIO": lambda: float(

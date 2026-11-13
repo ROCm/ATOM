@@ -36,6 +36,15 @@ from atom.kv_transfer.disaggregation.moriio.moriio_common import (
     MoRIIOConstants,
     get_port_offset,
 )
+from atom.kv_transfer.disaggregation.moriio.fabric import (
+    allocate_fabric_pool,
+    block_runs,
+    desc_fabric_info,
+    is_fabric_backend,
+    page_digest,
+    page_offsets,
+    pool_span,
+)
 from atom.kv_transfer.disaggregation.moriio.moriio_engine import MoRIIOWrapper
 from atom.kv_transfer.disaggregation.types import (
     ConnectorMetadata,
@@ -62,6 +71,7 @@ from atom.utils.network import get_ip
 if _MORIIO_AVAILABLE:
     from mori.io import (
         BackendType,
+        FabricBackendConfig,
         IOEngine,
         IOEngineConfig,
         PollCqMode,
@@ -94,6 +104,9 @@ class MoRIIOConnector(KVConnectorBase):
     4. Tracking transfer completion and notifying the peer when done.
     5. Periodically pinging the proxy for service discovery.
     """
+
+    use_fabric = False
+    _transfer_stats = False
 
     def __init__(self, config: Config) -> None:
         self.tp_rank = get_tp_group().rank_in_group
@@ -149,32 +162,26 @@ class MoRIIOConnector(KVConnectorBase):
         )
         self.moriio_wrapper = MoRIIOWrapper(moriio_engine=self.moriio_engine)
 
-        qp_per_transfer = kv_transfer_config.get("qp_per_transfer", 4)
-        post_batch_size = kv_transfer_config.get("post_batch_size", -1)
-        num_worker_threads = kv_transfer_config.get("num_worker_threads", 4)
-        poll_mode = PollCqMode.POLLING
-        enable_notification = kv_transfer_config.get("enable_notification", False)
+        # FABRIC only, never RDMA next to it: mori would pick RDMA for any peer
+        # FABRIC cannot reach and the transfer would quietly leave the fabric.
+        self.use_fabric = is_fabric_backend(kv_transfer_config)
+        if self.use_fabric:
+            self._create_fabric_backend(kv_transfer_config)
+        else:
+            self._create_rdma_backend(kv_transfer_config)
 
-        rdma_cfg = RdmaBackendConfig(
-            qp_per_transfer,
-            post_batch_size,
-            num_worker_threads,
-            poll_mode,
-            enable_notification,
-        )
-        rdma_cfg.max_send_wr = kv_transfer_config.get("max_send_wr", 0)
-        rdma_cfg.max_cqe_num = kv_transfer_config.get("max_cqe_num", 0)
-        rdma_cfg.max_msg_sge = kv_transfer_config.get("max_msg_sge", 0)
-        logger.info(
-            "RdmaBackendConfig: qp_per_transfer=%d, workers=%d, "
-            "poll_mode=%s, notification=%s, transfer_mode=%s",
-            qp_per_transfer,
-            num_worker_threads,
-            poll_mode.name,
-            enable_notification,
-            self.transfer_mode,
-        )
-        self.moriio_wrapper.set_backend_type(BackendType.RDMA, rdma_cfg)
+        # PAGE layout (fabric): the one registered buffer's descriptor and,
+        # per PAGE region, (offset in it, bytes per block, semantic role).
+        self._page_desc: bytes | None = None
+        self._page_regions: list[tuple[int, int, str]] = []
+        self._page_views: list[Any] | None = None
+        self._transfer_stats = envs.ATOM_MORIIO_TRANSFER_STATS
+        # Read mode: (posted, bytes, blocks, segments) per request in flight.
+        self._page_reads: dict[ReqId, tuple[float, int, int, int]] = {}
+        # ATOM_MORIIO_VERIFY on the consumer: each pushed request's destination
+        # blocks, and the producer's digest of its source blocks.
+        self._verify_page_dst: dict[ReqId, list[int]] = {}
+        self._write_page_digests: dict[ReqId, int] = {}
 
         # Per-layer local metadata (populated in register_kv_caches)
         self.layer_name_to_local_kv_cache_metadata: dict[str, list[bytes]] = {}
@@ -271,6 +278,60 @@ class MoRIIOConnector(KVConnectorBase):
         # Transfer ID mapping (worker side)
         self.request_id_to_transfer_id: dict[ReqId, TransferId] = {}
 
+    def _create_rdma_backend(self, kv_transfer_config: dict) -> None:
+        qp_per_transfer = kv_transfer_config.get("qp_per_transfer", 4)
+        post_batch_size = kv_transfer_config.get("post_batch_size", -1)
+        num_worker_threads = kv_transfer_config.get("num_worker_threads", 4)
+        poll_mode = PollCqMode.POLLING
+        enable_notification = kv_transfer_config.get("enable_notification", False)
+
+        rdma_cfg = RdmaBackendConfig(
+            qp_per_transfer,
+            post_batch_size,
+            num_worker_threads,
+            poll_mode,
+            enable_notification,
+        )
+        rdma_cfg.max_send_wr = kv_transfer_config.get("max_send_wr", 0)
+        rdma_cfg.max_cqe_num = kv_transfer_config.get("max_cqe_num", 0)
+        rdma_cfg.max_msg_sge = kv_transfer_config.get("max_msg_sge", 0)
+        logger.info(
+            "RdmaBackendConfig: qp_per_transfer=%d, workers=%d, "
+            "poll_mode=%s, notification=%s, transfer_mode=%s",
+            qp_per_transfer,
+            num_worker_threads,
+            poll_mode.name,
+            enable_notification,
+            self.transfer_mode,
+        )
+        self.moriio_wrapper.set_backend_type(BackendType.RDMA, rdma_cfg)
+
+    def _create_fabric_backend(self, kv_transfer_config: dict) -> None:
+        import warnings
+
+        num_streams = int(kv_transfer_config.get("fabric_num_streams", 64))
+        num_events = int(kv_transfer_config.get("fabric_num_events", 64))
+        # mori only warns when its fabric copy kernel fails to load, and without
+        # it every copy of 4 MiB or more fails.
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            self.moriio_wrapper.set_backend_type(
+                BackendType.FABRIC, FabricBackendConfig(num_streams, num_events)
+            )
+        logger.info(
+            "FabricBackendConfig: streams=%d, events=%d, transfer_mode=%s",
+            num_streams,
+            num_events,
+            self.transfer_mode,
+        )
+
+    @classmethod
+    def allocate_kv_pool(cls, config, nbytes: int, device):
+        """moriio_backend fabric keeps the KV pool in fabric-exportable memory."""
+        if not is_fabric_backend(config.kv_transfer_config or {}):
+            return None
+        return allocate_fabric_pool(nbytes, device)
+
     def register_kv_caches(
         self,
         kv_caches: dict[str, Any],
@@ -288,8 +349,14 @@ class MoRIIOConnector(KVConnectorBase):
         metadata list layout:
         ``[k_chunk0, k_chunk1, ..., v_chunk0, v_chunk1, ...]``.
         ``self.num_k_chunks`` marks the K/V boundary.
+
+        With ``moriio_backend`` ``fabric`` the PAGE regions are registered
+        instead, see :meth:`_register_pages`.
         """
         self.kv_caches = kv_caches
+        if self.use_fabric:
+            self._register_pages(kv_caches, transfer_tensors, num_blocks)
+            return
         cache_tensor = None
 
         for layer_name, kv_cache in kv_caches.items():
@@ -380,6 +447,87 @@ class MoRIIOConnector(KVConnectorBase):
             state_slot_bytes={n: b for n, (_, b, _) in state.items()} or None,
             num_state_slots=self._num_state_slots,
         )
+        self._start_handshake_listener(metadata)
+
+    def _register_pages(
+        self, kv_caches: dict[str, Any], transfer_tensors: Any, num_blocks: int | None
+    ) -> None:
+        """Register every PAGE region as one fabric buffer and start the listener.
+
+        The regions all live in the paged KV pool (`allocate_kv_pool`), which
+        is registered once; each region is then addressed by its offset in the
+        pool and its bytes per block, and the peer gets that table in the
+        handshake. mori maps a peer's whole allocation per registered
+        descriptor, so one descriptor keeps it to one mapping per peer.
+        """
+        pages = list(getattr(transfer_tensors, "pages", None) or ())
+        if not pages:
+            raise NotImplementedError(
+                "moriio_backend fabric moves PAGE regions, and this model "
+                "publishes none"
+            )
+        if any(getattr(c, "per_request_state", False) for c in kv_caches.values()) or (
+            getattr(transfer_tensors, "swa_block_regions", None)
+        ):
+            raise NotImplementedError(
+                "moriio_backend fabric moves PAGE regions only, and this model "
+                "also keeps per-request state"
+            )
+        regions = [page.region for page in pages]
+        if any(region.reverse_indexed for region in regions):
+            raise NotImplementedError(
+                "moriio_backend fabric addresses PAGE blocks forward only"
+            )
+        base, size = pool_span([(r.base_addr, r.total_bytes) for r in regions])
+        view = pages[0].view
+        if view is not None and view.device.index is not None:
+            device_id = view.device.index
+        else:
+            import torch
+
+            device_id = torch.cuda.current_device()
+        desc = self.moriio_wrapper.register_local_buffer(base, size, device_id)
+        has_handle, vpod = desc_fabric_info(desc)
+        if not has_handle:
+            raise RuntimeError(
+                f"the KV pool at {base:#x} ({size} B) has no fabric handle, so "
+                "FABRIC cannot move it: it was not allocated by "
+                "MoRIIOConnector.allocate_kv_pool, or the device cannot export "
+                "fabric memory"
+            )
+        self._page_desc = desc
+        self._page_regions = [
+            (r.base_addr - base, r.unit_bytes, r.semantic_role or "") for r in regions
+        ]
+        views = [page.view for page in pages]
+        self._page_views = views if all(v is not None for v in views) else None
+        if self._verify_kv and self._page_views is None:
+            logger.warning("ATOM_MORIIO_VERIFY: PAGE regions without views; off")
+            self._verify_kv = False
+        self.num_blocks = int(num_blocks or getattr(transfer_tensors, "num_blocks", 0))
+        self.block_len = self.kv_cache_block_size
+        logger.info(
+            "MoRIIO fabric: registered %d PAGE regions (%d B per block) as one "
+            "buffer of %.2f GiB at %#x, %d blocks, vPOD %d",
+            len(regions),
+            sum(unit for _, unit, _ in self._page_regions),
+            size / (1 << 30),
+            base,
+            self.num_blocks,
+            vpod,
+        )
+        metadata = MoRIIOAgentMetadata(
+            engine_id=self.engine_id,
+            agent_metadata=self.moriio_wrapper.get_agent_metadata(),
+            num_blocks=self.num_blocks,
+            block_len=self.block_len,
+            attn_backend_name="aiter",
+            page_desc=desc,
+            page_regions=[list(region) for region in self._page_regions],
+        )
+        self._start_handshake_listener(metadata)
+
+    def _start_handshake_listener(self, metadata: MoRIIOAgentMetadata) -> None:
         ready_event = threading.Event()
         self._handshake_listener_thread = threading.Thread(
             target=self._handshake_listener,
@@ -653,7 +801,9 @@ class MoRIIOConnector(KVConnectorBase):
             self._fail_before_transfer(req_id, meta)
             return
 
-        if self._verify_kv:
+        if self._verify_kv and self.use_fabric:
+            self._verify_page_dst[req_id] = dst
+        elif self._verify_kv:
             first_layer = next(iter(self.layer_name_to_local_kv_cache_metadata))
             is_mla = self.kv_caches[first_layer].v_cache is None
             rows = self._verify_rows_for(dst, is_mla)
@@ -694,6 +844,8 @@ class MoRIIOConnector(KVConnectorBase):
         except Exception:
             # Same reasoning as the read path: this runs on the busy_loop.
             logger.exception("req %s: could not ask the producer to push KV", req_id)
+            if self.use_fabric:
+                self._verify_page_dst.pop(req_id, None)
             self._verify_rows.pop(req_id, None)
             self._verify_before.pop(req_id, None)
             self._verify_state_before.pop(req_id, None)
@@ -904,6 +1056,145 @@ class MoRIIOConnector(KVConnectorBase):
             self._built_state_sessions[engine_id] = sessions
         return self._built_state_sessions[engine_id]
 
+    def _get_or_build_page_session(
+        self, engine_id: str
+    ) -> tuple[Any, list[tuple[int, int]]]:
+        """The (local pool, remote pool) FABRIC session and the peer's regions.
+
+        The peer's regions come back as ``(offset in its pool, bytes per
+        block)``, paired with ours by position after checking that both ends
+        published the same regions in the same order.
+        """
+        remote = self.remote_moriio_metadata[engine_id]
+        if remote.page_desc is None or remote.page_regions is None:
+            raise ValueError(
+                f"{engine_id} advertised no PAGE layout; both ends need "
+                "moriio_backend fabric"
+            )
+        theirs = [(int(o), int(u), str(r)) for o, u, r in remote.page_regions]
+        if engine_id not in self._built_sessions:
+            if remote.page_desc == self._page_desc:
+                raise ValueError(
+                    f"{engine_id} advertised our own PAGE descriptor; every "
+                    "transfer would copy this rank onto itself"
+                )
+            ours = [(unit, role) for _, unit, role in self._page_regions]
+            if ours != [(unit, role) for _, unit, role in theirs]:
+                first = next(
+                    (
+                        i
+                        for i, (a, b) in enumerate(zip(ours, theirs))
+                        if a != (b[1], b[2])
+                    ),
+                    min(len(ours), len(theirs)),
+                )
+                raise ValueError(
+                    f"{engine_id} published {len(theirs)} PAGE regions to our "
+                    f"{len(ours)}; first difference at region {first}"
+                )
+            has_handle, vpod = desc_fabric_info(remote.page_desc)
+            if not has_handle:
+                raise RuntimeError(f"{engine_id}'s KV pool has no fabric handle")
+            unpack = self.moriio_wrapper.get_unpack_memory_metadata
+            session = self.moriio_wrapper.build_session(
+                unpack(self._page_desc), unpack(remote.page_desc)
+            )
+            if session is None:
+                raise RuntimeError(
+                    f"no FABRIC session to {engine_id} (vPOD {vpod}, ours "
+                    f"{desc_fabric_info(self._page_desc)[1]}): the peer is "
+                    "outside this vPOD or its pool cannot be imported"
+                )
+            self._built_sessions[engine_id] = [session]
+            logger.info(
+                "MoRIIO fabric: session to %s over %d PAGE regions",
+                engine_id,
+                len(theirs),
+            )
+        return self._built_sessions[engine_id][0], [(o, u) for o, u, _ in theirs]
+
+    def _page_batch(
+        self,
+        local_block_ids: list[int],
+        remote_block_ids: list[int],
+        remote_regions: list[tuple[int, int]],
+    ) -> tuple[list[int], list[int], list[int]]:
+        """Pool-relative (local offsets, remote offsets, sizes) of one request."""
+        runs = block_runs(local_block_ids, remote_block_ids)
+        local_regions = [(offset, unit) for offset, unit, _ in self._page_regions]
+        return page_offsets(local_regions, remote_regions, runs)
+
+    def _write_pages(
+        self, request: dict[str, Any], engine_id: str, src: list[int], dst: list[int]
+    ) -> list[Any]:
+        """Push every PAGE region's source blocks into the consumer's, as one batch."""
+        session, remote_regions = self._get_or_build_page_session(engine_id)
+        l_offs, r_offs, sizes = self._page_batch(src, dst, remote_regions)
+        if self._verify_kv:
+            request["page_digest"] = page_digest(self._page_views, src)
+        request["_page_stats"] = (time.monotonic(), sum(sizes), len(dst), len(sizes))
+        return [
+            self.moriio_wrapper.write_remote_data_status(sizes, l_offs, r_offs, session)
+        ]
+
+    def _log_transfer_stats(
+        self,
+        req: Any,
+        mode: str,
+        ok: bool,
+        stats: tuple[float, int, int, int],
+        waited_s: float,
+    ) -> None:
+        posted, nbytes, blocks, segments = stats
+        write_ms = (time.monotonic() - posted) * 1e3
+        logger.info(
+            "MoRIIO transfer stats: req=%s protocol=fabric-%s ok=%s blocks=%d "
+            "bytes=%d wait_ms=%.3f write_ms=%.3f gbps=%.1f segments=%d tp=%d",
+            req,
+            mode,
+            ok,
+            blocks,
+            nbytes,
+            waited_s * 1e3,
+            write_ms,
+            nbytes / max(write_ms, 1e-6) / 1e6,
+            segments,
+            self.tp_rank,
+        )
+
+    def _verify_page_landed(self, req_id: ReqId) -> None:
+        """Compare the destination blocks with the producer's source digest."""
+        dst = self._verify_page_dst.pop(req_id, None)
+        with self._write_reports_lock:
+            source = self._write_page_digests.pop(req_id, None)
+        if dst is None:
+            return
+        if source is None:
+            logger.error(
+                "[moriio-verify] req %s: the producer sent no PAGE digest", req_id
+            )
+            return
+        landed = page_digest(self._page_views, dst)
+        if landed != source:
+            logger.error(
+                "[moriio-verify] req %s: the %d PAGE regions of %d blocks differ "
+                "from the producer's (digest %d, producer %d) -- decode will "
+                "attend over KV that is not the prompt's",
+                req_id,
+                len(self._page_regions),
+                len(dst),
+                landed,
+                source,
+            )
+        else:
+            logger.info(
+                "[moriio-verify] req %s: all %d PAGE regions of %d blocks match "
+                "the producer",
+                req_id,
+                len(self._page_regions),
+                len(dst),
+            )
+
     def _verify_rows_for(self, local_block_ids: list[int], is_mla: bool) -> Any:
         """Row indices into dim 0 covered by the given blocks.
 
@@ -1097,16 +1388,40 @@ class MoRIIOConnector(KVConnectorBase):
         )
 
         dp_engine_id = self._engine_name_with_dp(dst_engine_id, remote_dp_rank)
-        sessions, _remote_meta = self._get_or_build_sessions(dp_engine_id)
-
-        is_mla, per_block_bytes = self._kv_layout()
-        groups = self._group_offsets(local_block_ids, remote_block_ids, per_block_bytes)
 
         # Notify port = base handshake port + offset(remote_dp_rank, local_tp_rank).
         # Strided by the *remote* TP size, since the port belongs to the peer.
         notify_port = remote_handshake_port + get_port_offset(
             remote_dp_rank, self.tp_rank, remote_tp_size or self.tp_size
         )
+
+        if self.use_fabric:
+            session, remote_regions = self._get_or_build_page_session(dp_engine_id)
+            local = local_block_ids
+            l_offs, r_offs, sizes = self._page_batch(
+                local, remote_block_ids[: len(local)], remote_regions
+            )
+            self._page_reads[request_id] = (
+                time.monotonic(),
+                sum(sizes),
+                len(local),
+                len(sizes),
+            )
+            status = self.moriio_wrapper.read_remote_data(
+                sizes, l_offs, r_offs, session
+            )
+            with self.moriio_wrapper.lock:
+                self._recving_transfers[request_id].append(status)
+                self._recving_transfers_callback_addr[request_id] = (
+                    remote_host,
+                    str(notify_port),
+                    dp_engine_id,
+                )
+            return
+
+        sessions, _remote_meta = self._get_or_build_sessions(dp_engine_id)
+        is_mla, per_block_bytes = self._kv_layout()
+        groups = self._group_offsets(local_block_ids, remote_block_ids, per_block_bytes)
 
         layer_names = list(self.layer_name_to_local_kv_cache_metadata.keys())
 
@@ -1228,6 +1543,8 @@ class MoRIIOConnector(KVConnectorBase):
         dst = [int(b) for b in request["dst_block_ids"]]
         src = [int(b) for b in request["src_block_ids"]]
         self._source_covers(f"transfer {request['transfer_id']}", dst, src)
+        if self.use_fabric:
+            return self._write_pages(request, engine_id, src[: len(dst)], dst)
         sessions, _remote_meta = self._get_or_build_sessions(engine_id)
         # Before any block write: a request that cannot carry its state must not
         # leave a half-filled destination behind.
@@ -1394,7 +1711,8 @@ class MoRIIOConnector(KVConnectorBase):
         transfer_id = int(request["transfer_id"])
         if transfer_id not in self._write_ids:
             self._write_ids[transfer_id] = None
-            self._pending_writes.append((request, time.monotonic()))
+            request["_accepted_at"] = time.monotonic()
+            self._pending_writes.append((request, request["_accepted_at"]))
         elif self._write_ids[transfer_id] is None:
             logger.warning(
                 "transfer %s: ignoring a second WRITE_REQ while the first is "
@@ -1499,6 +1817,15 @@ class MoRIIOConnector(KVConnectorBase):
         """Release the source blocks and tell the consumer how the push went."""
         transfer_id = int(request["transfer_id"])
         self._sending_writes.pop(transfer_id, None)
+        stats = request.get("_page_stats")
+        if self._transfer_stats and stats is not None:
+            self._log_transfer_stats(
+                transfer_id,
+                "write",
+                ok,
+                stats,
+                stats[0] - request.get("_accepted_at", stats[0]),
+            )
         finished = time.monotonic()
         self._write_ids[transfer_id] = finished
         self._finished_writes.append((finished, transfer_id))
@@ -1514,6 +1841,8 @@ class MoRIIOConnector(KVConnectorBase):
         report = {"decode_req_id": request["decode_req_id"], "ok": ok}
         if ok and "state_digest" in request:
             report["state_digest"] = request["state_digest"]
+        if ok and "page_digest" in request:
+            report["page_digest"] = request["page_digest"]
         try:
             self.moriio_wrapper.send_message(
                 [MoRIIOConstants.WRITE_DONE, msgpack.dumps(report)],
@@ -1647,6 +1976,7 @@ class MoRIIOConnector(KVConnectorBase):
                         report = msgpack.loads(parts[2])
                         req_id, ok = report["decode_req_id"], bool(report["ok"])
                         state_digest = report.get("state_digest")
+                        page_digest_ = report.get("page_digest")
                     except Exception:
                         logger.exception("Dropping undecodable WRITE_DONE")
                         continue
@@ -1654,6 +1984,8 @@ class MoRIIOConnector(KVConnectorBase):
                         self._write_reports[req_id] = ok
                         if state_digest is not None and self._verify_kv:
                             self._write_state_digests[req_id] = state_digest
+                        if page_digest_ is not None and self._verify_kv:
+                            self._write_page_digests[req_id] = page_digest_
 
                 else:
                     logger.error("Unexpected handshake message type: %s", msg)
@@ -1846,6 +2178,9 @@ class MoRIIOConnector(KVConnectorBase):
                     failed_peers.add(peer)
                 else:
                     done_req_ids.add(req_id)
+                stats = self._page_reads.pop(req_id, None) if self.use_fabric else None
+                if self._transfer_stats and stats is not None:
+                    self._log_transfer_stats(req_id, "read", not failed, stats, 0.0)
                 # Notify either way: the producer holds the source blocks until
                 # it hears back, so a dropped notify leaks them for the run.
                 # the Decode req_id(request_id) ,Prefill req_id(transfer_id)
@@ -1910,9 +2245,16 @@ class MoRIIOConnector(KVConnectorBase):
             # Outside _pop_done_transfers so the digests stay off the path
             # that holds the wrapper lock.
             for req_id in done_recving:
+                if self.use_fabric:
+                    self._verify_page_landed(req_id)
+                    continue
                 self._verify_landed(req_id)
                 self._verify_state_landed(req_id)
             for req_id in failed_recving:
+                if self.use_fabric:
+                    self._verify_page_dst.pop(req_id, None)
+                    with self._write_reports_lock:
+                        self._write_page_digests.pop(req_id, None)
                 self._verify_rows.pop(req_id, None)
                 self._verify_before.pop(req_id, None)
                 self._verify_state_before.pop(req_id, None)

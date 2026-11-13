@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 import threading
 from enum import Enum
-from typing import Optional
+from typing import Any, Optional
 
 import msgspec
 
@@ -68,6 +68,11 @@ class MoRIIOAgentMetadata(
     state_descs: dict[str, bytes] | None = None
     state_slot_bytes: dict[str, int] | None = None
     num_state_slots: int = 0
+    # PAGE layout (``moriio_backend`` ``fabric``): the packed descriptor of the
+    # one buffer holding every PAGE region, and per region, in publication
+    # order, ``[offset in that buffer, bytes per block, semantic role]``.
+    page_desc: bytes | None = None
+    page_regions: list[list[Any]] | None = None
 
 
 # ---------------------------------------------------------------------------
