@@ -443,6 +443,30 @@ def test_capture_hints_only_the_small_input_route(runtime):
     assert _events(runtime, "hint") == [256, SMALL_M_MTPR, None]
 
 
+def test_capture_warmup_hints_like_the_capture(runtime):
+    # The capture loop's warmup forward runs eagerly with in_hipgraph set; it
+    # must take the capture's route, or the capture launches kernels the
+    # warmup never compiled.
+    runtime.use_routed_aiter()
+    runtime.forward_context.in_hipgraph = True
+    runtime.run(_context(SMALL_M_MTPR))
+    runtime.run(_context(SMALL_M_MTPR + 1))
+    runtime.capturing = True
+    runtime.run(_context(SMALL_M_MTPR))
+    runtime.run(_context(SMALL_M_MTPR + 1))
+    runtime.capturing = False
+    runtime.forward_context.in_hipgraph = False
+    runtime.run(_context(SMALL_M_MTPR + 1))
+
+    assert _events(runtime, "hint") == [
+        SMALL_M_MTPR,
+        None,
+        SMALL_M_MTPR,
+        None,
+        SMALL_M_MTPR + 1,
+    ]
+
+
 def test_each_layer_selects_its_own_large_input_slot(runtime):
     runtime.use_routed_aiter(layers=61)
     layers = [_layer(value) for value in range(3)]
