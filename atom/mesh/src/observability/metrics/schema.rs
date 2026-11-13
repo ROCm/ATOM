@@ -203,6 +203,7 @@ pub mod labels {
     pub const AFFINITY_REBIND: &str = "rebind";
     pub const AFFINITY_EXPIRED: &str = "expired";
     pub const WORKER_CHANGE_RANK_MAPPING: &str = "rank_mapping";
+    pub const DP_RANK_NONE: &str = "none";
 
     // Token types
     pub const TOKEN_INPUT: &str = "input";
@@ -265,6 +266,7 @@ pub mod names {
     pub const ROUTE_SELECTED_WORKER_ACTIVE_REQUESTS: &str =
         "mesh_route_selected_worker_active_requests";
     pub const SESSION_WORKER_CHANGE_TOTAL: &str = "mesh_session_worker_change_total";
+    pub const SELECTED_DP_RANK_TOTAL: &str = "mesh_selected_dp_rank_total";
 
     pub const WORKER_CB_STATE: &str = "mesh_worker_cb_state";
     pub const WORKER_CB_TRANSITIONS_TOTAL: &str = "mesh_worker_cb_transitions_total";
@@ -502,6 +504,12 @@ pub const METRIC_INVENTORY: &[MetricSpec] = &[
         name: names::SESSION_WORKER_CHANGE_TOTAL,
         kind: MetricKind::Counter,
         help: "Session requests dispatched to a different worker (URL and DP rank) than the previous request, by pool, reason (rebind/expired/rank_mapping)",
+        status: MetricStatus::Active,
+    },
+    MetricSpec {
+        name: names::SELECTED_DP_RANK_TOTAL,
+        kind: MetricKind::Counter,
+        help: "Dispatched requests after rank mapping by pool, worker (base URL), dp_rank (HTTP routers)",
         status: MetricStatus::Active,
     },
     MetricSpec {
