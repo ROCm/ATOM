@@ -8,6 +8,9 @@ AgentX workload.
 The prefill CPU pool remains **224 GiB per TP rank**, shared by paged KV and KDA
 state. `OFFLOAD_STATE_CPU_SIZE=128` caps retained state at **128 GiB per rank**;
 when state reaches that cap, approximately 96 GiB of the pool remains for KV.
+Behind a PP prefill the stages pool that cap instead: every stage keeps the
+same number of state images, so a stage whose layers hold more state than the
+average stage retains more than 128 GiB, and its CPU pool has to fit that.
 This is a shared allocator, not two separately reserved pools. Plan for
 **1.75 TiB of CPU cache capacity across the eight prefill ranks**, plus process
 and model-loading memory.

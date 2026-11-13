@@ -163,6 +163,19 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
     def _build_state_tier(self, transfer_tensors) -> None:
         from aiter.dist.parallel_state import get_tp_group
 
+        # Refused before the spec is read: such a layout publishes no layout id
+        # under PP, and the warning below would blame a broken build for it.
+        pp_size = int(getattr(self._config, "pipeline_parallel_size", 1) or 1)
+        layout = offcfg.select_offload_layout(self._config) if pp_size > 1 else None
+        if layout is not None and not state_tier_spans_pipeline(layout):
+            logger.info(
+                "kimi_k3 offload: layout %r keeps no state tier at "
+                "pipeline_parallel_size=%d; state tier off.",
+                layout,
+                pp_size,
+            )
+            return
+
         # Under PP every stage builds its own tier over its own layers' image.
         # The key's worker id is `pp_aware_rank_and_world`'s, so stages at one
         # TP rank do not collide, and `PPKVAggregator` takes each store's and
