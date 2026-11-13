@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794531460453,
+  "lastUpdate": 1794601856572,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -4932,6 +4932,40 @@ window.BENCHMARK_DATA = {
             "value": 0.8863,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/43256173744 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202611111518 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1531 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "gbyu-amd",
+            "username": "gbyu-amd",
+            "email": "Guanbao.Yu@amd.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "ed372e0abd7f274527154226738ae9ea1bf636a9",
+          "message": "[fix] Kimi-K3.1 DSpark under PP: share the target's embedding on the last stage (#3023)\n\n* fix: share the target's embedding with the DSpark draft on the last PP stage\n\nKimi-K3.1-DSpark ships no embed_tokens, so under PP the last stage's draft\nloaded nothing into the embedding it built for itself. The target now keeps\nits embedding on the last stage when a drafter runs there, and the draft\nshares it on every stage, as it already did without PP. The `-1` aux tap\nstays first-stage only: the last stage's copy never runs the target forward.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n* review: test which PP stages hold the token embedding\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n* review: say why a last-stage embedding copy still relays the -1 tap\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n* review: decide the -1 tap's residency from layer 0\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n* review: re-wrap the relay's module docstring\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n* review: build the last stage's embedding only for a declared PP method\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n* review: test that the PP draft shares the target's embedding\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n* review: read the target vocab off the model so the embedding refusal fires\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n* review: drop the draft-owned embedding branch from the shared hook\n\nNo DSpark draft loads its own embedding any more, so share_with_target\nbinds the target's and the drafter's load check refuses a PPMissingLayer.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n---------\n\nCo-authored-by: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-13T16:43:59Z",
+          "url": "https://github.com/ROCm/ATOM/commit/ed372e0abd7f274527154226738ae9ea1bf636a9"
+        },
+        "date": 1794601855855,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.9492,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/43460277558 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202611131523 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9447 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b accuracy (GSM8K)",
+            "value": 0.8908,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/43460277558 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202611131523 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1539 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
