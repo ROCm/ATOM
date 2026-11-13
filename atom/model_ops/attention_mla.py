@@ -3,6 +3,7 @@
 
 import logging
 from dataclasses import dataclass
+from functools import cache
 from functools import partial as functools_partial
 from typing import ClassVar, Protocol
 
@@ -303,6 +304,45 @@ _MLA_DCP_MAX_KERNEL_HEADS = 128
 # (q > 1) query only at these gathered widths, and aiter does not fold the
 # others onto it, so a wider verify or draft-block decode is padded up to one.
 _MLA_DCP_KERNEL_WIDTHS_PS1_MULTI_TOKEN = (16, 96)
+# Widths a newer aiter adds to that set: it cuts a 32- or 64-head query longer
+# than 128 / heads rows into several qo tiles. Each is taken only where the
+# installed aiter reports it (`_ps1_multi_token_widths`).
+_MLA_DCP_KERNEL_WIDTHS_PS1_MULTI_TOKEN_TILED = (32, 64)
+
+
+@cache
+def _ps1_multi_token_widths(max_seqlen_q: int, kv_cache_dtype: str) -> tuple:
+    """Gathered widths gfx1250's PS1 kernel serves at `max_seqlen_q`.
+
+    `_MLA_DCP_KERNEL_WIDTHS_PS1_MULTI_TOKEN` always; each tiled width too when
+    aiter reports that shape on PS1 without a 16-head fold. An aiter without
+    that support (or without the query) keeps the base set, so a 64-head draft
+    block still pads to 96 there instead of aborting in mla_decode_fwd.
+    """
+    widths = set(_MLA_DCP_KERNEL_WIDTHS_PS1_MULTI_TOKEN)
+    try:
+        from aiter.ops.attention import MlaBackend, get_mla_decode_shape_support
+    except ImportError:
+        return tuple(sorted(widths))
+    dtype = dtypes.fp8 if kv_cache_dtype.startswith("fp8") else torch.bfloat16
+    for width in _MLA_DCP_KERNEL_WIDTHS_PS1_MULTI_TOKEN_TILED:
+        try:
+            support = get_mla_decode_shape_support(
+                width, max_seqlen_q, dtype, dtype, arch="gfx1250"
+            )
+        except (RuntimeError, ValueError, TypeError):
+            support = None  # an aiter that cannot answer for this shape
+        # `supported` is None for FlyDSL JIT, which has no availability table;
+        # only an explicit False rules the shape out.
+        if (
+            support is not None
+            and support.supported is not False
+            and support.fold_factor == 1
+            and support.backend in (MlaBackend.FLYDSL_PS1, MlaBackend.PS1_FP8_ASM)
+        ):
+            widths.add(width)
+    return tuple(sorted(widths))
+
 
 _MLA_DCP_KERNEL_WIDTHS_NON_PERSISTENT = (16, 32, 128)
 _MLA_DCP_KERNEL_WIDTHS_NON_PERSISTENT_FP8 = (16, 128)
@@ -325,6 +365,7 @@ def mla_dcp_kernel_num_heads(
     kv_cache_dtype: str,
     persistent: bool,
     multi_token: bool = False,
+    max_seqlen_q: int = 8,
 ) -> int:
     """Width to gather the query heads to for a DCP decode.
 
@@ -340,14 +381,16 @@ def mla_dcp_kernel_num_heads(
     fp8 lacks a gqa=32 kernel on top of that while bf16 does not.
 
     ``multi_token``: the decode takes more than one query per sequence (a
-    speculative verify pass, or a draft block). gfx1250's persistent kernel
-    serves that only at ``_MLA_DCP_KERNEL_WIDTHS_PS1_MULTI_TOKEN``.
+    speculative verify pass, or a draft block), of up to ``max_seqlen_q`` rows.
+    gfx1250's persistent kernel serves that only at the widths
+    ``_ps1_multi_token_widths`` reports for that length.
     """
     gathered = mla_kernel_num_heads(max(num_heads * dcp_world_size, min_kernel_heads))
     widest = _MLA_DCP_MAX_KERNEL_HEADS
     if persistent and multi_token and get_gfx() == "gfx1250":
-        widest = _MLA_DCP_KERNEL_WIDTHS_PS1_MULTI_TOKEN[-1]
-        for width in _MLA_DCP_KERNEL_WIDTHS_PS1_MULTI_TOKEN:
+        ps1_widths = _ps1_multi_token_widths(max(int(max_seqlen_q), 2), kv_cache_dtype)
+        widest = ps1_widths[-1]
+        for width in ps1_widths:
             if width >= gathered:
                 return width
     elif persistent:
@@ -990,6 +1033,7 @@ class MLAAttention(nn.Module):
         self.dcp_kernel_num_heads = self.num_heads
         self.dcp_head_pad = 0
         if dcp_world_size > 1:
+            spec_config = get_current_atom_config().speculative_config
             self.dcp_kernel_num_heads = mla_dcp_kernel_num_heads(
                 self.num_heads,
                 dcp_world_size,
@@ -1004,8 +1048,15 @@ class MLAAttention(nn.Module):
                     ),
                 ),
                 # A speculative run decodes several queries per sequence: the
-                # target's verify pass and the draft's block pass alike.
-                multi_token=get_current_atom_config().speculative_config is not None,
+                # target's verify pass and the draft's block pass alike. The
+                # verify pass is the longer one: the drafted tokens plus the one
+                # they follow.
+                multi_token=spec_config is not None,
+                max_seqlen_q=(
+                    int(getattr(spec_config, "num_speculative_tokens", 0) or 0) + 1
+                    if spec_config is not None
+                    else 1
+                ),
             )
             self.dcp_head_pad = (
                 self.dcp_kernel_num_heads - self.num_heads * dcp_world_size
