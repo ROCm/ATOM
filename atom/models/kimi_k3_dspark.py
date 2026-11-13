@@ -68,7 +68,6 @@ from torch import nn
 from atom.model_ops.activation import SiluAndMul
 from atom.model_ops.attention_mla import (
     MLAModules,
-    mla_min_query_heads,
     qrep_tp_override,
 )
 from atom.model_ops.base_attention import Attention
@@ -83,6 +82,7 @@ from atom.model_ops.linear import (
     mxfp4_k_pad_align,
     uses_mxfp4_n32k4_scale,
 )
+from atom.model_ops.mla_query_heads import mla_min_query_heads
 from atom.models.deepseek_v2 import _fuse_rmsnorm_quant, yarn_get_mscale
 from atom.models.dspark_draft import (
     DSparkDraftModel,
@@ -268,7 +268,9 @@ class K3DSparkMLAAttention(nn.Module):
             # aiter kernels available for it; the draft's own block width picks
             # the head padding that keeps one dispatchable.
             min_query_heads=mla_min_query_heads(
-                atom_config.kv_cache_dtype, _dspark_block_width(config, atom_config)
+                atom_config.kv_cache_dtype,
+                _dspark_block_width(config, atom_config),
+                self.num_local_heads,
             ),
             layer_num=layer_num,
             use_mla=True,
