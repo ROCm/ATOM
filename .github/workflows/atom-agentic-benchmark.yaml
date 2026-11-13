@@ -1,153 +1,823 @@
-name: ATOM Agentic Benchmark
-# GitHub displays the native run number beside this title (e.g. nightly #650).
-run-name: ${{ github.event_name == 'schedule' && 'nightly' || format('manual ({0})', github.actor) }}
-
-on:
-  schedule:
-    # Daily at 08:17 UTC / 16:17 Beijing time, outside the random benchmark crons.
-    - cron: '17 8 * * *'
-  workflow_dispatch:
-    inputs:
-      profile:
-        description: "Preset — test: TP4 / c=2,4 / 900s; nightly: TP2+TP4 / 3600s"
-        type: choice
-        options: [test, nightly]
-        default: test
-      models:
-        description: "Models (optional) — empty uses the preset; e.g. deepseek-v41-flash"
-        type: string
-        default: ""
-      concurrency:
-        description: "Concurrency (optional) — empty uses the preset; test defaults to 2,4"
-        type: string
-        default: ""
-      duration_seconds:
-        description: "Seconds per point (optional) — empty uses test: 900 / nightly: 3600; allowed 900–3600"
-        type: string
-        default: ""
-      dry_run:
-        description: "Preview configuration only (no GPU allocation)"
-        type: boolean
-        default: false
-      image:
-        description: "Advanced: image override — empty uses rocm/atom-dev:latest"
-        type: string
-        default: ""
-      runner:
-        description: "Advanced: runner override — empty uses the preset's GPU runner"
-        type: string
-        default: ""
-      extra_args:
-        description: "Advanced: extra ATOM server arguments"
-        type: string
-        default: ""
-      atom_commit:
-        description: "Advanced: ATOM revision override — empty runs the branch selected above"
-        type: string
-        default: ""
-      aiter_wheel:
-        description: "Advanced: AITER wheel — latest, HTTPS .whl URL, or artifact:<ID>; empty keeps image version"
-        type: string
-        default: ""
-      aiter_commit:
-        description: "Advanced: AITER revision override — empty keeps the image version"
-        type: string
-        default: ""
-      enable_profiler:
-        description: "Advanced: collect graph-capture traces and a 30-second replay profile"
-        type: boolean
-        default: false
-      enable_rtl:
-        description: "Advanced: collect rocm-trace-lite traces"
-        type: boolean
-        default: false
-
-permissions:
-  contents: read
-  actions: read
-
-concurrency:
-  group: atom-agentic-${{ github.ref }}-${{ github.event_name }}
-  cancel-in-progress: false
-
-jobs:
-  build-matrix:
-    name: Build agentic benchmark matrix
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    outputs:
-      configs_json: ${{ steps.build.outputs.configs_json }}
-      has_cells: ${{ steps.build.outputs.has_cells }}
-      checkout_sha: ${{ steps.revision.outputs.sha }}
-      aiter_wheel_artifact_id: ${{ steps.aiter-upload.outputs.artifact-id }}
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          ref: ${{ inputs.atom_commit || github.sha }}
-      - name: Record checked-out commit
-        id: revision
-        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-      - id: build
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          INPUTS_JSON: ${{ toJson(inputs) }}
-          AGENTIC_RUN_CONFIG_DIR: agentic-run-config
-          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
-          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
-        run: python3 .github/scripts/build_agentic_benchmark_matrix.py
-      - name: Download requested AITER wheel once
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.aiter_wheel != '' && inputs.dry_run != true }}
-        env:
-          AITER_WHEEL_REQUEST: ${{ inputs.aiter_wheel }}
-          GITHUB_TOKEN: ${{ github.token }}
-        run: python3 .github/scripts/prepare_benchmark_aiter_wheel.py
-      - name: Share pinned AITER wheel with all points
-        id: aiter-upload
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.aiter_wheel != '' && inputs.dry_run != true }}
-        uses: actions/upload-artifact@v7
-        with:
-          name: atom-agentic-aiter-wheel-${{ github.run_attempt }}
-          path: aiter-whl/
-          compression-level: 0
-          retention-days: 15
-          if-no-files-found: error
-      - name: Save run configuration
-        uses: actions/upload-artifact@v7
-        with:
-          name: atom-agentic-run-config-${{ github.run_attempt }}
-          path: agentic-run-config/
-          retention-days: 15
-          if-no-files-found: error
-
-  benchmark:
-    name: ${{ matrix.config.display }} agentic
-    needs: [build-matrix]
-    if: >-
-      !cancelled()
-      && needs.build-matrix.result == 'success'
-      && needs.build-matrix.outputs.has_cells == 'true'
-      && inputs.dry_run != true
-    strategy:
-      fail-fast: false
-      matrix:
-        config: ${{ fromJson(needs.build-matrix.outputs.configs_json) }}
-    uses: ./.github/workflows/benchmark-tmpl.yml
-    secrets: inherit
-    with:
-      display: ${{ matrix.config.display }}
-      prefix: ${{ matrix.config.prefix }}
-      suffix: ${{ matrix.config.suffix }}
-      model_path: ${{ matrix.config.model_path }}
-      server_args: ${{ matrix.config.server_args }}
-      bench_kind: ${{ matrix.config.bench_kind }}
-      env_vars: ${{ matrix.config.env_vars }}
-      runner: ${{ inputs.runner || matrix.config.runner }}
-      concurrency: ${{ matrix.config.concurrency }}
-      image: ${{ matrix.config.image }}
-      image_display: ${{ matrix.config.image_display }}
-      extra_args: ${{ inputs.extra_args || '' }}
-      atom_commit: ${{ needs.build-matrix.outputs.checkout_sha }}
-      aiter_commit: ${{ inputs.aiter_commit || '' }}
-      aiter_wheel_artifact_id: ${{ needs.build-matrix.outputs.aiter_wheel_artifact_id }}
-      enable_profiler: ${{ inputs.enable_profiler || false }}
-      enable_rtl: ${{ inputs.enable_rtl || false }}
+{
+  "name": "ATOM Agentic Benchmark",
+  "run-name": "PR3097 DPA4 c256 â€” main OFF vs head Store ON",
+  "on": {
+    "workflow_dispatch": {}
+  },
+  "permissions": {
+    "contents": "read",
+    "actions": "read"
+  },
+  "concurrency": {
+    "group": "pr3097-dpa4-c256-ab",
+    "cancel-in-progress": false
+  },
+  "jobs": {
+    "paired": {
+      "name": "Sequential main OFF â†’ head Store ON on same runner",
+      "runs-on": "linux-atom-pitt-mi350x-8",
+      "timeout-minutes": 360,
+      "env": {
+        "BENCH_KIND": "aiperf_agentic",
+        "MODEL_PATH": "deepseek-ai/DeepSeek-V4.1-Flash",
+        "ISL": "0",
+        "OSL": "0",
+        "CONC": "256",
+        "RANDOM_RANGE_RATIO": "0"
+      },
+      "steps": [
+        {
+          "name": "A â€” Show ROCm status (host)",
+          "run": "docker ps -a && rocm-smi --showmemuse 2>/dev/null || true",
+          "env": {
+            "BENCH_KIND": "aiperf_agentic",
+            "MODEL_PATH": "deepseek-ai/DeepSeek-V4.1-Flash",
+            "ARGS": "-tp 4 --enable-dp-attention --moe-backend standard --all2all-backend none --kv_cache_dtype bf16 --index-cache-dtype fp8 --max-model-len 262144 --gpu-memory-utilization 0.75 --max-num-seqs 24 --max-num-batched-tokens 1024 --attn-prefill-chunk-size 16384 --enable_prefix_caching --block-size 16 --state-checkpoint-interval-tokens 8192 --level 3 --cudagraph-mode FULL --cudagraph-capture-sizes '[1,2,4,8,16,24]' --method dspark --num-speculative-tokens 5 --tool-call-parser dsml_v41 --dspark-config '{\"confidence_schedule\":false}' --disable-uvicorn-access-log --dp-load-balance least_requests",
+            "ISL": "0",
+            "OSL": "0",
+            "CONC": "256",
+            "RANDOM_RANGE_RATIO": "0",
+            "RESULT_FILENAME": "pr3097-A-dpa4-c256"
+          }
+        },
+        {
+          "name": "A â€” Checkout ATOM repo",
+          "uses": "actions/checkout@v6",
+          "with": {
+            "ref": "74e389b7661fb53ffb0a7daa93b0d73afe4d7476"
+          },
+          "env": {
+            "BENCH_KIND": "aiperf_agentic",
+            "MODEL_PATH": "deepseek-ai/DeepSeek-V4.1-Flash",
+            "ARGS": "-tp 4 --enable-dp-attention --moe-backend standard --all2all-backend none --kv_cache_dtype bf16 --index-cache-dtype fp8 --max-model-len 262144 --gpu-memory-utilization 0.75 --max-num-seqs 24 --max-num-batched-tokens 1024 --attn-prefill-chunk-size 16384 --enable_prefix_caching --block-size 16 --state-checkpoint-interval-tokens 8192 --level 3 --cudagraph-mode FULL --cudagraph-capture-sizes '[1,2,4,8,16,24]' --method dspark --num-speculative-tokens 5 --tool-call-parser dsml_v41 --dspark-config '{\"confidence_schedule\":false}' --disable-uvicorn-access-log --dp-load-balance least_requests",
+            "ISL": "0",
+            "OSL": "0",
+            "CONC": "256",
+            "RANDOM_RANGE_RATIO": "0",
+            "RESULT_FILENAME": "pr3097-A-dpa4-c256"
+          }
+        },
+        {
+          "name": "A â€” Start container + download model",
+          "uses": "./.github/actions/atom-bench-container",
+          "with": {
+            "image": "rocm/atom-dev@sha256:167ce262f6ab188cd1a971dc7ae5f3d4e50586293a2d1c53ea1efbc92ab7491d",
+            "container-name": "pr3097-ab-${{ github.run_id }}-a",
+            "model-path": "deepseek-ai/DeepSeek-V4.1-Flash",
+            "runner": "linux-atom-pitt-mi350x-8",
+            "env-vars": "HIP_VISIBLE_DEVICES=0,1,2,3\nBENCHMARK_PRECISION=fp8\nPRECISION=fp8\nBENCHMARK_MODEL_KEY=dsv41flash\nATOM_BUNDLE_REQUIRE_FULL=1\nATOM_DSV41_BENCHMARK_SYNTHETIC=0\nAIPERF_UNSAFE_OVERRIDE=0\nAIPERF_BENCHMARK_DURATION=1800\nAIPERF_MAX_CONTEXT_LENGTH=262144\nAIPERF_WARMUP_REQUESTS_PER_LANE=10\nAIPERF_NUM_DATASET_ENTRIES=393\nAIPERF_SCENARIO=agentx\nAIPERF_PUBLIC_DATASET=semianalysis_cc_traces_weka_062126\nATOM_FRONTEND_PREFIX_HASH=1\nATOM_DP_SESSION_AFFINITY=0\nATOM_DSPARK_DISABLE_COMPILE=1\nATOM_DISABLE_MORI_EP=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_DISABLE_MMAP=true\nNCCL_IB_DISABLE=1\nNCCL_SOCKET_IFNAME=lo\nGLOO_SOCKET_IFNAME=lo\nATOM_HOST_IP=127.0.0.1\nMOONCAKE_DISABLE_HIP_DMABUF=1\nHSA_ENABLE_IPC_MODE_LEGACY=1\nATOM_KV_OFFLOAD=",
+            "hf-token": "${{ secrets.AMD_HF_TOKEN }}",
+            "download-required": "true",
+            "container-env": "-e ISL=${{ env.ISL }} -e OSL=${{ env.OSL }} -e ATOM_BENCHMARK_CAPTURE=1 -e BENCH_KIND=${{ env.BENCH_KIND }} -e CONC=${{ env.CONC }} -e RANDOM_RANGE_RATIO=${{ env.RANDOM_RANGE_RATIO }} -e ENABLE_TORCH_PROFILER=0 -e ENABLE_RTL_PROFILER=0 --label codex.task=pr3097-action-ab --label codex.run=${{ github.run_id }}"
+          },
+          "env": {
+            "BENCH_KIND": "aiperf_agentic",
+            "MODEL_PATH": "deepseek-ai/DeepSeek-V4.1-Flash",
+            "ARGS": "-tp 4 --enable-dp-attention --moe-backend standard --all2all-backend none --kv_cache_dtype bf16 --index-cache-dtype fp8 --max-model-len 262144 --gpu-memory-utilization 0.75 --max-num-seqs 24 --max-num-batched-tokens 1024 --attn-prefill-chunk-size 16384 --enable_prefix_caching --block-size 16 --state-checkpoint-interval-tokens 8192 --level 3 --cudagraph-mode FULL --cudagraph-capture-sizes '[1,2,4,8,16,24]' --method dspark --num-speculative-tokens 5 --tool-call-parser dsml_v41 --dspark-config '{\"confidence_schedule\":false}' --disable-uvicorn-access-log --dp-load-balance least_requests",
+            "ISL": "0",
+            "OSL": "0",
+            "CONC": "256",
+            "RANDOM_RANGE_RATIO": "0",
+            "RESULT_FILENAME": "pr3097-A-dpa4-c256"
+          }
+        },
+        {
+          "name": "A â€” Verify checked-out ATOM code",
+          "run": "docker exec -i -e EXPECTED_ATOM_SHA=\"$(git rev-parse HEAD)\" pr3097-ab-${{ github.run_id }}-a python3 - <<'PY'\nimport importlib.util\nimport os\nimport subprocess\nfrom pathlib import Path\n\nsource = Path(importlib.util.find_spec(\"atom\").origin).resolve().parent\nexpected_source = Path(\"/workspace/atom\").resolve()\nif source != expected_source:\n    raise SystemExit(f\"ATOM imports from {source}, expected {expected_source}\")\nsha = subprocess.check_output(\n    [\"git\", \"-c\", \"safe.directory=/workspace\", \"-C\", \"/workspace\", \"rev-parse\", \"HEAD\"],\n    text=True,\n).strip()\nif sha != os.environ[\"EXPECTED_ATOM_SHA\"]:\n    raise SystemExit(f\"Checkout SHA mismatch: {sha}\")\nprint(f\"Executing ATOM checkout {sha} from {source}; image supplies the runtime.\")\nPY\n",
+          "env": {
+            "BENCH_KIND": "aiperf_agentic",
+            "MODEL_PATH": "deepseek-ai/DeepSeek-V4.1-Flash",
+            "ARGS": "-tp 4 --enable-dp-attention --moe-backend standard --all2all-backend none --kv_cache_dtype bf16 --index-cache-dtype fp8 --max-model-len 262144 --gpu-memory-utilization 0.75 --max-num-seqs 24 --max-num-batched-tokens 1024 --attn-prefill-chunk-size 16384 --enable_prefix_caching --block-size 16 --state-checkpoint-interval-tokens 8192 --level 3 --cudagraph-mode FULL --cudagraph-capture-sizes '[1,2,4,8,16,24]' --method dspark --num-speculative-tokens 5 --tool-call-parser dsml_v41 --dspark-config '{\"confidence_schedule\":false}' --disable-uvicorn-access-log --dp-load-balance least_requests",
+            "ISL": "0",
+            "OSL": "0",
+            "CONC": "256",
+            "RANDOM_RANGE_RATIO": "0",
+            "RESULT_FILENAME": "pr3097-A-dpa4-c256"
+          }
+        },
+        {
+          "name": "A â€” Collect GPU info (inside container)",
+          "id": "A-gpu-info",
+          "env": {
+            "REQUESTED_IMAGE": "rocm/atom-dev@sha256:167ce262f6ab188cd1a971dc7ae5f3d4e50586293a2d1c53ea1efbc92ab7491d",
+            "IMAGE_DISPLAY": "rocm/atom-dev@sha256:167ce262f6ab188cd1a971dc7ae5f3d4e50586293a2d1c53ea1efbc92ab7491d",
+            "BENCH_KIND": "aiperf_agentic",
+            "MODEL_PATH": "deepseek-ai/DeepSeek-V4.1-Flash",
+            "ARGS": "-tp 4 --enable-dp-attention --moe-backend standard --all2all-backend none --kv_cache_dtype bf16 --index-cache-dtype fp8 --max-model-len 262144 --gpu-memory-utilization 0.75 --max-num-seqs 24 --max-num-batched-tokens 1024 --attn-prefill-chunk-size 16384 --enable_prefix_caching --block-size 16 --state-checkpoint-interval-tokens 8192 --level 3 --cudagraph-mode FULL --cudagraph-capture-sizes '[1,2,4,8,16,24]' --method dspark --num-speculative-tokens 5 --tool-call-parser dsml_v41 --dspark-config '{\"confidence_schedule\":false}' --disable-uvicorn-access-log --dp-load-balance least_requests",
+            "ISL": "0",
+            "OSL": "0",
+            "CONC": "256",
+            "RANDOM_RANGE_RATIO": "0",
+            "RESULT_FILENAME": "pr3097-A-dpa4-c256"
+          },
+          "run": "set -euo pipefail\nRUNNER_HINT=\"linux-atom-pitt-mi350x-8\"\nbash .github/scripts/collect_gpu_info.sh pr3097-ab-${{ github.run_id }}-a docker \"$RUNNER_HINT\"\n# A registry's latest may have changed since startup. Use the name\n# resolved with this run's digest, never a second remote lookup.\nDOCKER_IMAGE=\"$IMAGE_DISPLAY\"\nIMAGE_ID=$(docker inspect --format '{{.Image}}' pr3097-ab-${{ github.run_id }}-a)\nEXPECTED_IMAGE_ID=$(docker image inspect --format '{{.Id}}' \"$REQUESTED_IMAGE\")\ntest \"$IMAGE_ID\" = \"$EXPECTED_IMAGE_ID\"\necho \"image_digest=${IMAGE_ID}\" >> \"$GITHUB_OUTPUT\"\necho \"docker_image=${DOCKER_IMAGE}\" >> $GITHUB_OUTPUT\necho \"Docker: ${DOCKER_IMAGE}\"\n"
+        },
+        {
+          "name": "A â€” Run benchmark",
+          "timeout-minutes": 180,
+          "env": {
+            "EXTRA_LAUNCH_ARGS": "",
+            "BENCH_EXTRA_ARGS": "",
+            "GPU_NAME": "${{ steps.A-gpu-info.outputs.gpu_name }}",
+            "ROCM_VERSION": "${{ steps.A-gpu-info.outputs.rocm_version }}",
+            "DOCKER_IMAGE": "${{ steps.A-gpu-info.outputs.docker_image }}",
+            "ATOM_IMAGE_DIGEST": "${{ steps.A-gpu-info.outputs.image_digest }}",
+            "BENCH_KIND": "aiperf_agentic",
+            "MODEL_PATH": "deepseek-ai/DeepSeek-V4.1-Flash",
+            "ARGS": "-tp 4 --enable-dp-attention --moe-backend standard --all2all-backend none --kv_cache_dtype bf16 --index-cache-dtype fp8 --max-model-len 262144 --gpu-memory-utilization 0.75 --max-num-seqs 24 --max-num-batched-tokens 1024 --attn-prefill-chunk-size 16384 --enable_prefix_caching --block-size 16 --state-checkpoint-interval-tokens 8192 --level 3 --cudagraph-mode FULL --cudagraph-capture-sizes '[1,2,4,8,16,24]' --method dspark --num-speculative-tokens 5 --tool-call-parser dsml_v41 --dspark-config '{\"confidence_schedule\":false}' --disable-uvicorn-access-log --dp-load-balance least_requests",
+            "ISL": "0",
+            "OSL": "0",
+            "CONC": "256",
+            "RANDOM_RANGE_RATIO": "0",
+            "RESULT_FILENAME": "pr3097-A-dpa4-c256"
+          },
+          "run": "set -euo pipefail\nif [ -n \"${MODEL_HOST_ROOT:-}\" ]; then model_path=\"/models/deepseek-ai/DeepSeek-V4.1-Flash\"\nelse model_path=\"deepseek-ai/DeepSeek-V4.1-Flash\"; fi\n\n# Launch via stdin so the container's bash parses the shell quoting in\n# ARGS exactly once -- single-quoted JSON values survive intact (e.g.\n# --hf-overrides '{\"use_index_cache\": true, \"index_topk_freq\": 4}').\n# Substituting ${{ env.ARGS }} into a `bash -lc \"...\"` string instead\n# collides the JSON's double quotes with the outer quotes and strips\n# them (argparse: invalid loads value). Mirrors atom-test.yaml.\necho \"ENABLE_TORCH_PROFILER=0 \\\n  ENABLE_RTL_PROFILER=0 \\\n  .github/scripts/atom_test.sh launch $model_path $ARGS $EXTRA_LAUNCH_ARGS\" \\\n  | docker exec -i pr3097-ab-${{ github.run_id }}-a bash -l\n\necho \"========== Running benchmark ==========\"\ndocker exec \\\n  -e ENABLE_TORCH_PROFILER=\"0\" \\\n  -e RESULT_FILENAME=\"pr3097-A-dpa4-c256\" \\\n  -e SERVER_ARGS=\"$ARGS $EXTRA_LAUNCH_ARGS\" \\\n  -e BENCH_EXTRA_ARGS -e BENCH_KIND \\\n  -e GPU_NAME -e ROCM_VERSION \\\n  -e DOCKER_IMAGE -e ATOM_IMAGE_DIGEST \\\n  -e GITHUB_REPOSITORY -e GITHUB_RUN_ID -e GITHUB_RUN_ATTEMPT \\\n  -e GITHUB_JOB -e GITHUB_SHA -e GITHUB_WORKFLOW_REF \\\n  -e MP=\"$model_path\" \\\n  pr3097-ab-${{ github.run_id }}-a bash -lc '.github/scripts/atom_test.sh benchmark \"$MP\"'\n"
+        },
+        {
+          "name": "A â€” Dump server log",
+          "if": "always()",
+          "run": "docker exec pr3097-ab-${{ github.run_id }}-a cat /tmp/atom_server.log 2>/dev/null || true\n",
+          "env": {
+            "BENCH_KIND": "aiperf_agentic",
+            "MODEL_PATH": "deepseek-ai/DeepSeek-V4.1-Flash",
+            "ARGS": "-tp 4 --enable-dp-attention --moe-backend standard --all2all-backend none --kv_cache_dtype bf16 --index-cache-dtype fp8 --max-model-len 262144 --gpu-memory-utilization 0.75 --max-num-seqs 24 --max-num-batched-tokens 1024 --attn-prefill-chunk-size 16384 --enable_prefix_caching --block-size 16 --state-checkpoint-interval-tokens 8192 --level 3 --cudagraph-mode FULL --cudagraph-capture-sizes '[1,2,4,8,16,24]' --method dspark --num-speculative-tokens 5 --tool-call-parser dsml_v41 --dspark-config '{\"confidence_schedule\":false}' --disable-uvicorn-access-log --dp-load-balance least_requests",
+            "ISL": "0",
+            "OSL": "0",
+            "CONC": "256",
+            "RANDOM_RANGE_RATIO": "0",
+            "RESULT_FILENAME": "pr3097-A-dpa4-c256"
+          }
+        },
+        {
+          "name": "A â€” Dump client log",
+          "if": "always()",
+          "run": "docker exec pr3097-ab-${{ github.run_id }}-a cat /tmp/atom_client.log 2>/dev/null || true\n",
+          "env": {
+            "BENCH_KIND": "aiperf_agentic",
+            "MODEL_PATH": "deepseek-ai/DeepSeek-V4.1-Flash",
+            "ARGS": "-tp 4 --enable-dp-attention --moe-backend standard --all2all-backend none --kv_cache_dtype bf16 --index-cache-dtype fp8 --max-model-len 262144 --gpu-memory-utilization 0.75 --max-num-seqs 24 --max-num-batched-tokens 1024 --attn-prefill-chunk-size 16384 --enable_prefix_caching --block-size 16 --state-checkpoint-interval-tokens 8192 --level 3 --cudagraph-mode FULL --cudagraph-capture-sizes '[1,2,4,8,16,24]' --method dspark --num-speculative-tokens 5 --tool-call-parser dsml_v41 --dspark-config '{\"confidence_schedule\":false}' --disable-uvicorn-access-log --dp-load-balance least_requests",
+            "ISL": "0",
+            "OSL": "0",
+            "CONC": "256",
+            "RANDOM_RANGE_RATIO": "0",
+            "RESULT_FILENAME": "pr3097-A-dpa4-c256"
+          }
+        },
+        {
+          "name": "A â€” Inject GPU metadata into benchmark result",
+          "run": "docker exec \\\n  -e GPU_NAME=\"${{ steps.A-gpu-info.outputs.gpu_name }}\" \\\n  -e GPU_VRAM_GB=\"${{ steps.A-gpu-info.outputs.gpu_vram_gb }}\" \\\n  -e ROCM_VERSION=\"${{ steps.A-gpu-info.outputs.rocm_version }}\" \\\n  -e DOCKER_IMAGE=\"${{ steps.A-gpu-info.outputs.docker_image }}\" \\\n  -e RESULT_PATH=\"pr3097-A-dpa4-c256.json\" \\\n  -e DISPLAY_NAME=\"PR3097 A DPA4 main OFF\" \\\n  pr3097-ab-${{ github.run_id }}-a python3 -c \"\nimport json, os\np = os.environ['RESULT_PATH']\nif not os.path.exists(p):\n    print(f'{p} not found, skipping GPU metadata injection')\nelse:\n    with open(p) as f:\n        d = json.load(f)\n    d['gpu_name'] = os.environ.get('GPU_NAME', '')\n    d['gpu_vram_gb'] = int(os.environ.get('GPU_VRAM_GB') or 0)\n    d['rocm_version'] = os.environ.get('ROCM_VERSION', '')\n    d['docker_image'] = os.environ.get('DOCKER_IMAGE', '')\n    display_name = os.environ.get('DISPLAY_NAME', '')\n    if display_name:\n        d['benchmark_model_name'] = display_name\n    with open(p, 'w') as f:\n        json.dump(d, f, indent=2)\n\"\n",
+          "env": {
+            "BENCH_KIND": "aiperf_agentic",
+            "MODEL_PATH": "deepseek-ai/DeepSeek-V4.1-Flash",
+            "ARGS": "-tp 4 --enable-dp-attention --moe-backend standard --all2all-backend none --kv_cache_dtype bf16 --index-cache-dtype fp8 --max-model-len 262144 --gpu-memory-utilization 0.75 --max-num-seqs 24 --max-num-batched-tokens 1024 --attn-prefill-chunk-size 16384 --enable_prefix_caching --block-size 16 --state-checkpoint-interval-tokens 8192 --level 3 --cudagraph-mode FULL --cudagraph-capture-sizes '[1,2,4,8,16,24]' --method dspark --num-speculative-tokens 5 --tool-call-parser dsml_v41 --dspark-config '{\"confidence_schedule\":false}' --disable-uvicorn-access-log --dp-load-balance least_requests",
+            "ISL": "0",
+            "OSL": "0",
+            "CONC": "256",
+            "RANDOM_RANGE_RATIO": "0",
+            "RESULT_FILENAME": "pr3097-A-dpa4-c256"
+          }
+        },
+        {
+          "name": "A â€” Validate benchmark result completeness",
+          "run": "docker exec -i \\\n  -e RESULT_PATH=\"pr3097-A-dpa4-c256.json\" \\\n  pr3097-ab-${{ github.run_id }}-a python3 - <<'PY'\nimport json, os, sys\n\npath = os.environ[\"RESULT_PATH\"]\nwith open(path, encoding=\"utf-8\") as f:\n    data = json.load(f)\n\nif data.get(\"benchmark_kind\") == \"aiperf_agentic\":\n    completed = int(data.get(\"successful_requests\", 0))\n    duration = float(data.get(\"benchmark_duration_s\", 0))\n    if completed <= 0 or duration <= 0:\n        sys.exit(\"Agentic benchmark has no successful profiling requests or duration\")\n    print(f\"Validated agentic result: {completed} requests, {duration}s\")\n    sys.exit(0)\n\nnum_prompts = int(data.get(\"num_prompts\"))\ncompleted = int(data.get(\"completed\"))\nif completed != num_prompts:\n    print(\n        f\"::error::Invalid benchmark result in {path}: completed requests \"\n        f\"({completed}) did not match num_prompts ({num_prompts}).\",\n        file=sys.stderr,\n    )\n    sys.exit(1)\n\nprint(\n    f\"Validated benchmark result {path}: completed requests \"\n    f\"{completed}/{num_prompts}.\"\n)\nPY\n",
+          "env": {
+            "BENCH_KIND": "aiperf_agentic",
+            "MODEL_PATH": "deepseek-ai/DeepSeek-V4.1-Flash",
+            "ARGS": "-tp 4 --enable-dp-attention --moe-backend standard --all2all-backend none --kv_cache_dtype bf16 --index-cache-dtype fp8 --max-model-len 262144 --gpu-memory-utilization 0.75 --max-num-seqs 24 --max-num-batched-tokens 1024 --attn-prefill-chunk-size 16384 --enable_prefix_caching --block-size 16 --state-checkpoint-interval-tokens 8192 --level 3 --cudagraph-mode FULL --cudagraph-capture-sizes '[1,2,4,8,16,24]' --method dspark --num-speculative-tokens 5 --tool-call-parser dsml_v41 --dspark-config '{\"confidence_schedule\":false}' --disable-uvicorn-access-log --dp-load-balance least_requests",
+            "ISL": "0",
+            "OSL": "0",
+            "CONC": "256",
+            "RANDOM_RANGE_RATIO": "0",
+            "RESULT_FILENAME": "pr3097-A-dpa4-c256"
+          }
+        },
+        {
+          "name": "A â€” Copy profiler traces",
+          "if": "always() && false",
+          "run": "docker cp pr3097-ab-${{ github.run_id }}-a:/app/trace ./profiler-traces 2>/dev/null || true",
+          "env": {
+            "BENCH_KIND": "aiperf_agentic",
+            "MODEL_PATH": "deepseek-ai/DeepSeek-V4.1-Flash",
+            "ARGS": "-tp 4 --enable-dp-attention --moe-backend standard --all2all-backend none --kv_cache_dtype bf16 --index-cache-dtype fp8 --max-model-len 262144 --gpu-memory-utilization 0.75 --max-num-seqs 24 --max-num-batched-tokens 1024 --attn-prefill-chunk-size 16384 --enable_prefix_caching --block-size 16 --state-checkpoint-interval-tokens 8192 --level 3 --cudagraph-mode FULL --cudagraph-capture-sizes '[1,2,4,8,16,24]' --method dspark --num-speculative-tokens 5 --tool-call-parser dsml_v41 --dspark-config '{\"confidence_schedule\":false}' --disable-uvicorn-access-log --dp-load-balance least_requests",
+            "ISL": "0",
+            "OSL": "0",
+            "CONC": "256",
+            "RANDOM_RANGE_RATIO": "0",
+            "RESULT_FILENAME": "pr3097-A-dpa4-c256"
+          }
+        },
+        {
+          "name": "A â€” Upload profiler traces",
+          "if": "always() && false",
+          "uses": "actions/upload-artifact@v7",
+          "with": {
+            "name": "profiler-traces-pr3097-A-dpa4-c256",
+            "path": "profiler-traces/"
+          },
+          "env": {
+            "BENCH_KIND": "aiperf_agentic",
+            "MODEL_PATH": "deepseek-ai/DeepSeek-V4.1-Flash",
+            "ARGS": "-tp 4 --enable-dp-attention --moe-backend standard --all2all-backend none --kv_cache_dtype bf16 --index-cache-dtype fp8 --max-model-len 262144 --gpu-memory-utilization 0.75 --max-num-seqs 24 --max-num-batched-tokens 1024 --attn-prefill-chunk-size 16384 --enable_prefix_caching --block-size 16 --state-checkpoint-interval-tokens 8192 --level 3 --cudagraph-mode FULL --cudagraph-capture-sizes '[1,2,4,8,16,24]' --method dspark --num-speculative-tokens 5 --tool-call-parser dsml_v41 --dspark-config '{\"confidence_schedule\":false}' --disable-uvicorn-access-log --dp-load-balance least_requests",
+            "ISL": "0",
+            "OSL": "0",
+            "CONC": "256",
+            "RANDOM_RANGE_RATIO": "0",
+            "RESULT_FILENAME": "pr3097-A-dpa4-c256"
+          }
+        },
+        {
+          "name": "A â€” Stop server and collect RTL traces",
+          "if": "false",
+          "run": "docker exec pr3097-ab-${{ github.run_id }}-a bash -lc \\\n  \"ENABLE_RTL_PROFILER=1 .github/scripts/atom_test.sh stop\" || true\ndocker cp pr3097-ab-${{ github.run_id }}-a:/app/rtl_traces ./rtl-traces 2>/dev/null || true\n",
+          "env": {
+            "BENCH_KIND": "aiperf_agentic",
+            "MODEL_PATH": "deepseek-ai/DeepSeek-V4.1-Flash",
+            "ARGS": "-tp 4 --enable-dp-attention --moe-backend standard --all2all-backend none --kv_cache_dtype bf16 --index-cache-dtype fp8 --max-model-len 262144 --gpu-memory-utilization 0.75 --max-num-seqs 24 --max-num-batched-tokens 1024 --attn-prefill-chunk-size 16384 --enable_prefix_caching --block-size 16 --state-checkpoint-interval-tokens 8192 --level 3 --cudagraph-mode FULL --cudagraph-capture-sizes '[1,2,4,8,16,24]' --method dspark --num-speculative-tokens 5 --tool-call-parser dsml_v41 --dspark-config '{\"confidence_schedule\":false}' --disable-uvicorn-access-log --dp-load-balance least_requests",
+            "ISL": "0",
+            "OSL": "0",
+            "CONC": "256",
+            "RANDOM_RANGE_RATIO": "0",
+            "RESULT_FILENAME": "pr3097-A-dpa4-c256"
+          }
+        },
+        {
+          "name": "A â€” Upload RTL traces",
+          "if": "false",
+          "uses": "actions/upload-artifact@v7",
+          "with": {
+            "name": "rtl-traces-pr3097-A-dpa4-c256",
+            "path": "rtl-traces/"
+          },
+          "env": {
+            "BENCH_KIND": "aiperf_agentic",
+            "MODEL_PATH": "deepseek-ai/DeepSeek-V4.1-Flash",
+            "ARGS": "-tp 4 --enable-dp-attention --moe-backend standard --all2all-backend none --kv_cache_dtype bf16 --index-cache-dtype fp8 --max-model-len 262144 --gpu-memory-utilization 0.75 --max-num-seqs 24 --max-num-batched-tokens 1024 --attn-prefill-chunk-size 16384 --enable_prefix_caching --block-size 16 --state-checkpoint-interval-tokens 8192 --level 3 --cudagraph-mode FULL --cudagraph-capture-sizes '[1,2,4,8,16,24]' --method dspark --num-speculative-tokens 5 --tool-call-parser dsml_v41 --dspark-config '{\"confidence_schedule\":false}' --disable-uvicorn-access-log --dp-load-balance least_requests",
+            "ISL": "0",
+            "OSL": "0",
+            "CONC": "256",
+            "RANDOM_RANGE_RATIO": "0",
+            "RESULT_FILENAME": "pr3097-A-dpa4-c256"
+          }
+        },
+        {
+          "name": "A â€” Upload benchmark result",
+          "uses": "actions/upload-artifact@v7",
+          "with": {
+            "name": "benchmark-pr3097-A-dpa4-c256",
+            "path": "pr3097-A-dpa4-c256.json"
+          },
+          "env": {
+            "BENCH_KIND": "aiperf_agentic",
+            "MODEL_PATH": "deepseek-ai/DeepSeek-V4.1-Flash",
+            "ARGS": "-tp 4 --enable-dp-attention --moe-backend standard --all2all-backend none --kv_cache_dtype bf16 --index-cache-dtype fp8 --max-model-len 262144 --gpu-memory-utilization 0.75 --max-num-seqs 24 --max-num-batched-tokens 1024 --attn-prefill-chunk-size 16384 --enable_prefix_caching --block-size 16 --state-checkpoint-interval-tokens 8192 --level 3 --cudagraph-mode FULL --cudagraph-capture-sizes '[1,2,4,8,16,24]' --method dspark --num-speculative-tokens 5 --tool-call-parser dsml_v41 --dspark-config '{\"confidence_schedule\":false}' --disable-uvicorn-access-log --dp-load-balance least_requests",
+            "ISL": "0",
+            "OSL": "0",
+            "CONC": "256",
+            "RANDOM_RANGE_RATIO": "0",
+            "RESULT_FILENAME": "pr3097-A-dpa4-c256"
+          }
+        },
+        {
+          "name": "A â€” Prepare bundle summary",
+          "if": "always()",
+          "run": "python3 -m atom.benchmarks.results summary-package \\\n  \"benchmark-bundles/$RESULT_FILENAME\" --output \"bundle-summaries/$RESULT_FILENAME\"\n",
+          "env": {
+            "BENCH_KIND": "aiperf_agentic",
+            "MODEL_PATH": "deepseek-ai/DeepSeek-V4.1-Flash",
+            "ARGS": "-tp 4 --enable-dp-attention --moe-backend standard --all2all-backend none --kv_cache_dtype bf16 --index-cache-dtype fp8 --max-model-len 262144 --gpu-memory-utilization 0.75 --max-num-seqs 24 --max-num-batched-tokens 1024 --attn-prefill-chunk-size 16384 --enable_prefix_caching --block-size 16 --state-checkpoint-interval-tokens 8192 --level 3 --cudagraph-mode FULL --cudagraph-capture-sizes '[1,2,4,8,16,24]' --method dspark --num-speculative-tokens 5 --tool-call-parser dsml_v41 --dspark-config '{\"confidence_schedule\":false}' --disable-uvicorn-access-log --dp-load-balance least_requests",
+            "ISL": "0",
+            "OSL": "0",
+            "CONC": "256",
+            "RANDOM_RANGE_RATIO": "0",
+            "RESULT_FILENAME": "pr3097-A-dpa4-c256"
+          }
+        },
+        {
+          "name": "A â€” Upload versioned summary",
+          "id": "A-bundle-summary",
+          "if": "always()",
+          "uses": "actions/upload-artifact@v7",
+          "with": {
+            "name": "atom-benchmark-summary-v1-${{ github.run_attempt }}-pr3097-A-dpa4-c256",
+            "path": "bundle-summaries/pr3097-A-dpa4-c256/",
+            "if-no-files-found": "warn",
+            "retention-days": 15
+          },
+          "env": {
+            "BENCH_KIND": "aiperf_agentic",
+            "MODEL_PATH": "deepseek-ai/DeepSeek-V4.1-Flash",
+            "ARGS": "-tp 4 --enable-dp-attention --moe-backend standard --all2all-backend none --kv_cache_dtype bf16 --index-cache-dtype fp8 --max-model-len 262144 --gpu-memory-utilization 0.75 --max-num-seqs 24 --max-num-batched-tokens 1024 --attn-prefill-chunk-size 16384 --enable_prefix_caching --block-size 16 --state-checkpoint-interval-tokens 8192 --level 3 --cudagraph-mode FULL --cudagraph-capture-sizes '[1,2,4,8,16,24]' --method dspark --num-speculative-tokens 5 --tool-call-parser dsml_v41 --dspark-config '{\"confidence_schedule\":false}' --disable-uvicorn-access-log --dp-load-balance least_requests",
+            "ISL": "0",
+            "OSL": "0",
+            "CONC": "256",
+            "RANDOM_RANGE_RATIO": "0",
+            "RESULT_FILENAME": "pr3097-A-dpa4-c256"
+          }
+        },
+        {
+          "name": "A â€” Upload complete bundle",
+          "id": "A-bundle-full",
+          "if": "always()",
+          "uses": "actions/upload-artifact@v7",
+          "with": {
+            "name": "atom-benchmark-bundle-v1-${{ github.run_attempt }}-pr3097-A-dpa4-c256",
+            "path": "benchmark-bundles/pr3097-A-dpa4-c256/",
+            "if-no-files-found": "warn",
+            "compression-level": 0,
+            "retention-days": 15
+          },
+          "env": {
+            "BENCH_KIND": "aiperf_agentic",
+            "MODEL_PATH": "deepseek-ai/DeepSeek-V4.1-Flash",
+            "ARGS": "-tp 4 --enable-dp-attention --moe-backend standard --all2all-backend none --kv_cache_dtype bf16 --index-cache-dtype fp8 --max-model-len 262144 --gpu-memory-utilization 0.75 --max-num-seqs 24 --max-num-batched-tokens 1024 --attn-prefill-chunk-size 16384 --enable_prefix_caching --block-size 16 --state-checkpoint-interval-tokens 8192 --level 3 --cudagraph-mode FULL --cudagraph-capture-sizes '[1,2,4,8,16,24]' --method dspark --num-speculative-tokens 5 --tool-call-parser dsml_v41 --dspark-config '{\"confidence_schedule\":false}' --disable-uvicorn-access-log --dp-load-balance least_requests",
+            "ISL": "0",
+            "OSL": "0",
+            "CONC": "256",
+            "RANDOM_RANGE_RATIO": "0",
+            "RESULT_FILENAME": "pr3097-A-dpa4-c256"
+          }
+        },
+        {
+          "name": "A â€” Save logs after launch or packaging failure",
+          "if": "failure() || cancelled()",
+          "run": "docker exec -e EVIDENCE=\"/workspace/benchmark-evidence/$RESULT_FILENAME\" \\\n  pr3097-ab-${{ github.run_id }}-a bash -lc '\n    mkdir -p \"$EVIDENCE\"\n    for file in /tmp/atom_server.log /tmp/atom_client.log /tmp/atom-benchmark-launch.json; do\n      if [ -f \"$file\" ]; then cp \"$file\" \"$EVIDENCE/\"; fi\n    done\n  ' || true\n",
+          "env": {
+            "BENCH_KIND": "aiperf_agentic",
+            "MODEL_PATH": "deepseek-ai/DeepSeek-V4.1-Flash",
+            "ARGS": "-tp 4 --enable-dp-attention --moe-backend standard --all2all-backend none --kv_cache_dtype bf16 --index-cache-dtype fp8 --max-model-len 262144 --gpu-memory-utilization 0.75 --max-num-seqs 24 --max-num-batched-tokens 1024 --attn-prefill-chunk-size 16384 --enable_prefix_caching --block-size 16 --state-checkpoint-interval-tokens 8192 --level 3 --cudagraph-mode FULL --cudagraph-capture-sizes '[1,2,4,8,16,24]' --method dspark --num-speculative-tokens 5 --tool-call-parser dsml_v41 --dspark-config '{\"confidence_schedule\":false}' --disable-uvicorn-access-log --dp-load-balance least_requests",
+            "ISL": "0",
+            "OSL": "0",
+            "CONC": "256",
+            "RANDOM_RANGE_RATIO": "0",
+            "RESULT_FILENAME": "pr3097-A-dpa4-c256"
+          }
+        },
+        {
+          "name": "A â€” Preserve unpackaged failure evidence",
+          "id": "A-bundle-diagnostics",
+          "if": "failure() || cancelled()",
+          "uses": "actions/upload-artifact@v7",
+          "with": {
+            "name": "atom-benchmark-diagnostics-v1-${{ github.run_attempt }}-pr3097-A-dpa4-c256",
+            "path": "benchmark-evidence/pr3097-A-dpa4-c256/",
+            "if-no-files-found": "warn",
+            "retention-days": 14
+          },
+          "env": {
+            "BENCH_KIND": "aiperf_agentic",
+            "MODEL_PATH": "deepseek-ai/DeepSeek-V4.1-Flash",
+            "ARGS": "-tp 4 --enable-dp-attention --moe-backend standard --all2all-backend none --kv_cache_dtype bf16 --index-cache-dtype fp8 --max-model-len 262144 --gpu-memory-utilization 0.75 --max-num-seqs 24 --max-num-batched-tokens 1024 --attn-prefill-chunk-size 16384 --enable_prefix_caching --block-size 16 --state-checkpoint-interval-tokens 8192 --level 3 --cudagraph-mode FULL --cudagraph-capture-sizes '[1,2,4,8,16,24]' --method dspark --num-speculative-tokens 5 --tool-call-parser dsml_v41 --dspark-config '{\"confidence_schedule\":false}' --disable-uvicorn-access-log --dp-load-balance least_requests",
+            "ISL": "0",
+            "OSL": "0",
+            "CONC": "256",
+            "RANDOM_RANGE_RATIO": "0",
+            "RESULT_FILENAME": "pr3097-A-dpa4-c256"
+          }
+        },
+        {
+          "name": "A â€” Link agentic point artifacts",
+          "if": "always() && true",
+          "uses": "actions/github-script@v7",
+          "env": {
+            "POINT_DISPLAY": "PR3097 A DPA4 main OFF",
+            "POINT_STATUS": "${{ job.status }}",
+            "SUMMARY_URL": "${{ steps.A-bundle-summary.outputs.artifact-url }}",
+            "BUNDLE_URL": "${{ steps.A-bundle-full.outputs.artifact-url }}",
+            "DIAGNOSTICS_URL": "${{ steps.A-bundle-diagnostics.outputs.artifact-url }}",
+            "BENCH_KIND": "aiperf_agentic",
+            "MODEL_PATH": "deepseek-ai/DeepSeek-V4.1-Flash",
+            "ARGS": "-tp 4 --enable-dp-attention --moe-backend standard --all2all-backend none --kv_cache_dtype bf16 --index-cache-dtype fp8 --max-model-len 262144 --gpu-memory-utilization 0.75 --max-num-seqs 24 --max-num-batched-tokens 1024 --attn-prefill-chunk-size 16384 --enable_prefix_caching --block-size 16 --state-checkpoint-interval-tokens 8192 --level 3 --cudagraph-mode FULL --cudagraph-capture-sizes '[1,2,4,8,16,24]' --method dspark --num-speculative-tokens 5 --tool-call-parser dsml_v41 --dspark-config '{\"confidence_schedule\":false}' --disable-uvicorn-access-log --dp-load-balance least_requests",
+            "ISL": "0",
+            "OSL": "0",
+            "CONC": "256",
+            "RANDOM_RANGE_RATIO": "0",
+            "RESULT_FILENAME": "pr3097-A-dpa4-c256"
+          },
+          "with": {
+            "script": "const fs = require('fs');\nconst path = require('path');\nconst escape = value => String(value).replace(/[&<>\"']/g, char =>\n  ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;', \"'\": '&#39;'}[char]));\ncore.summary.addHeading(escape(`${process.env.POINT_DISPLAY} Ã‚Â· c=${process.env.CONC}`));\ncore.summary.addRaw(`Status before cleanup: ${escape(process.env.POINT_STATUS)}\\n\\n`);\nconst validationPath = path.join('benchmark-bundles', process.env.RESULT_FILENAME, 'validation.json');\nif (fs.existsSync(validationPath)) {\n  const validation = JSON.parse(fs.readFileSync(validationPath, 'utf8'));\n  core.summary.addRaw(`Bundle complete: ${validation.complete}; measurement valid: ${validation.measurement_valid}\\n\\n`);\n  for (const reason of validation.missing || []) {\n    core.summary.addRaw(`- ${escape(reason)}\\n`);\n    core.warning(`Bundle incomplete: ${reason}`);\n  }\n  core.summary.addRaw('\\n');\n}\nfor (const [label, url] of [\n  ['Summary bundle', process.env.SUMMARY_URL],\n  ['Full bundle', process.env.BUNDLE_URL],\n  ['Failure diagnostics', process.env.DIAGNOSTICS_URL],\n]) {\n  if (url) core.summary.addLink(label, url).addBreak();\n}\ncore.summary.addRaw('\\nA full-bundle upload may contain partial evidence after failure; check its manifest status.\\n');\nawait core.summary.write();\n"
+          }
+        },
+        {
+          "name": "A â€” Preserve Store diagnostics and runtime identity",
+          "if": "always()",
+          "run": "mkdir -p \"pr3097-A-dpa4-c256-runtime\"\ndocker inspect pr3097-ab-${{ github.run_id }}-a > \"pr3097-A-dpa4-c256-runtime/container-inspect.json\" 2>/dev/null || true\ndocker cp pr3097-ab-${{ github.run_id }}-a:/tmp/pr3097-store \"pr3097-A-dpa4-c256-runtime/\" 2>/dev/null || true\ndocker cp pr3097-ab-${{ github.run_id }}-a:/tmp/pr3097-private-store.log \"pr3097-A-dpa4-c256-runtime/\" 2>/dev/null || true\ndocker exec pr3097-ab-${{ github.run_id }}-a python3 -c \"import torch,atom;print(atom.__file__);print(torch.cuda.get_device_name());print(torch.cuda.get_device_properties(0))\" > \"pr3097-A-dpa4-c256-runtime/gpu.txt\" 2>&1 || true\nhostname > \"pr3097-A-dpa4-c256-runtime/hostname.txt\""
+        },
+        {
+          "name": "A â€” Upload runtime identity",
+          "if": "always()",
+          "uses": "actions/upload-artifact@v7",
+          "with": {
+            "name": "pr3097-A-dpa4-c256-runtime",
+            "path": "pr3097-A-dpa4-c256-runtime/",
+            "retention-days": 15
+          }
+        },
+        {
+          "name": "A â€” Stop only this Action container",
+          "if": "always()",
+          "run": "docker stop pr3097-ab-${{ github.run_id }}-a || true\ndocker rm pr3097-ab-${{ github.run_id }}-a || true"
+        },
+        {
+          "name": "B â€” Show ROCm status (host)",
+          "run": "docker ps -a && rocm-smi --showmemuse 2>/dev/null || true",
+          "env": {
+            "BENCH_KIND": "aiperf_agentic",
+            "MODEL_PATH": "deepseek-ai/DeepSeek-V4.1-Flash",
+            "ARGS": "-tp 4 --enable-dp-attention --moe-backend standard --all2all-backend none --kv_cache_dtype bf16 --index-cache-dtype fp8 --max-model-len 262144 --gpu-memory-utilization 0.75 --max-num-seqs 24 --max-num-batched-tokens 1024 --attn-prefill-chunk-size 16384 --enable_prefix_caching --block-size 16 --state-checkpoint-interval-tokens 8192 --level 3 --cudagraph-mode FULL --cudagraph-capture-sizes '[1,2,4,8,16,24]' --method dspark --num-speculative-tokens 5 --tool-call-parser dsml_v41 --dspark-config '{\"confidence_schedule\":false}' --disable-uvicorn-access-log --dp-load-balance share_cache",
+            "ISL": "0",
+            "OSL": "0",
+            "CONC": "256",
+            "RANDOM_RANGE_RATIO": "0",
+            "RESULT_FILENAME": "pr3097-B-dpa4-c256"
+          }
+        },
+        {
+          "name": "B â€” Checkout ATOM repo",
+          "uses": "actions/checkout@v6",
+          "with": {
+            "ref": "c545eef6de3eda2a1f7229f3730c64413f87bed6"
+          },
+          "env": {
+            "BENCH_KIND": "aiperf_agentic",
+            "MODEL_PATH": "deepseek-ai/DeepSeek-V4.1-Flash",
+            "ARGS": "-tp 4 --enable-dp-attention --moe-backend standard --all2all-backend none --kv_cache_dtype bf16 --index-cache-dtype fp8 --max-model-len 262144 --gpu-memory-utilization 0.75 --max-num-seqs 24 --max-num-batched-tokens 1024 --attn-prefill-chunk-size 16384 --enable_prefix_caching --block-size 16 --state-checkpoint-interval-tokens 8192 --level 3 --cudagraph-mode FULL --cudagraph-capture-sizes '[1,2,4,8,16,24]' --method dspark --num-speculative-tokens 5 --tool-call-parser dsml_v41 --dspark-config '{\"confidence_schedule\":false}' --disable-uvicorn-access-log --dp-load-balance share_cache",
+            "ISL": "0",
+            "OSL": "0",
+            "CONC": "256",
+            "RANDOM_RANGE_RATIO": "0",
+            "RESULT_FILENAME": "pr3097-B-dpa4-c256"
+          }
+        },
+        {
+          "name": "B â€” Start container + download model",
+          "uses": "./.github/actions/atom-bench-container",
+          "with": {
+            "image": "rocm/atom-dev@sha256:167ce262f6ab188cd1a971dc7ae5f3d4e50586293a2d1c53ea1efbc92ab7491d",
+            "container-name": "pr3097-ab-${{ github.run_id }}-b",
+            "model-path": "deepseek-ai/DeepSeek-V4.1-Flash",
+            "runner": "linux-atom-pitt-mi350x-8",
+            "env-vars": "HIP_VISIBLE_DEVICES=0,1,2,3\nBENCHMARK_PRECISION=fp8\nPRECISION=fp8\nBENCHMARK_MODEL_KEY=dsv41flash\nATOM_BUNDLE_REQUIRE_FULL=1\nATOM_DSV41_BENCHMARK_SYNTHETIC=0\nAIPERF_UNSAFE_OVERRIDE=0\nAIPERF_BENCHMARK_DURATION=1800\nAIPERF_MAX_CONTEXT_LENGTH=262144\nAIPERF_WARMUP_REQUESTS_PER_LANE=10\nAIPERF_NUM_DATASET_ENTRIES=393\nAIPERF_SCENARIO=agentx\nAIPERF_PUBLIC_DATASET=semianalysis_cc_traces_weka_062126\nATOM_FRONTEND_PREFIX_HASH=1\nATOM_DP_SESSION_AFFINITY=0\nATOM_DSPARK_DISABLE_COMPILE=1\nATOM_DISABLE_MORI_EP=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_DISABLE_MMAP=true\nNCCL_IB_DISABLE=1\nNCCL_SOCKET_IFNAME=lo\nGLOO_SOCKET_IFNAME=lo\nATOM_HOST_IP=127.0.0.1\nMOONCAKE_DISABLE_HIP_DMABUF=1\nHSA_ENABLE_IPC_MODE_LEGACY=1\nATOM_KV_OFFLOAD=mooncake_store\nATOM_KV_OFFLOAD_EXTRA_CONFIG={\"mooncake_store.master\": \"127.0.0.1:41871\", \"mooncake_store.metadata\": \"http://127.0.0.1:41872/metadata\", \"mooncake_store.protocol\": \"tcp\", \"mooncake_store.local_hostname\": \"127.0.0.1\", \"mooncake_store.load_pool_mib\": 256, \"mooncake_store.save_pool_mib\": 256}",
+            "hf-token": "${{ secrets.AMD_HF_TOKEN }}",
+            "download-required": "true",
+            "container-env": "-e ISL=${{ env.ISL }} -e OSL=${{ env.OSL }} -e ATOM_BENCHMARK_CAPTURE=1 -e BENCH_KIND=${{ env.BENCH_KIND }} -e CONC=${{ env.CONC }} -e RANDOM_RANGE_RATIO=${{ env.RANDOM_RANGE_RATIO }} -e ENABLE_TORCH_PROFILER=0 -e ENABLE_RTL_PROFILER=0 --label codex.task=pr3097-action-ab --label codex.run=${{ github.run_id }}"
+          },
+          "env": {
+            "BENCH_KIND": "aiperf_agentic",
+            "MODEL_PATH": "deepseek-ai/DeepSeek-V4.1-Flash",
+            "ARGS": "-tp 4 --enable-dp-attention --moe-backend standard --all2all-backend none --kv_cache_dtype bf16 --index-cache-dtype fp8 --max-model-len 262144 --gpu-memory-utilization 0.75 --max-num-seqs 24 --max-num-batched-tokens 1024 --attn-prefill-chunk-size 16384 --enable_prefix_caching --block-size 16 --state-checkpoint-interval-tokens 8192 --level 3 --cudagraph-mode FULL --cudagraph-capture-sizes '[1,2,4,8,16,24]' --method dspark --num-speculative-tokens 5 --tool-call-parser dsml_v41 --dspark-config '{\"confidence_schedule\":false}' --disable-uvicorn-access-log --dp-load-balance share_cache",
+            "ISL": "0",
+            "OSL": "0",
+            "CONC": "256",
+            "RANDOM_RANGE_RATIO": "0",
+            "RESULT_FILENAME": "pr3097-B-dpa4-c256"
+          }
+        },
+        {
+          "name": "B â€” Verify checked-out ATOM code",
+          "run": "docker exec -i -e EXPECTED_ATOM_SHA=\"$(git rev-parse HEAD)\" pr3097-ab-${{ github.run_id }}-b python3 - <<'PY'\nimport importlib.util\nimport os\nimport subprocess\nfrom pathlib import Path\n\nsource = Path(importlib.util.find_spec(\"atom\").origin).resolve().parent\nexpected_source = Path(\"/workspace/atom\").resolve()\nif source != expected_source:\n    raise SystemExit(f\"ATOM imports from {source}, expected {expected_source}\")\nsha = subprocess.check_output(\n    [\"git\", \"-c\", \"safe.directory=/workspace\", \"-C\", \"/workspace\", \"rev-parse\", \"HEAD\"],\n    text=True,\n).strip()\nif sha != os.environ[\"EXPECTED_ATOM_SHA\"]:\n    raise SystemExit(f\"Checkout SHA mismatch: {sha}\")\nprint(f\"Executing ATOM checkout {sha} from {source}; image supplies the runtime.\")\nPY\n",
+          "env": {
+            "BENCH_KIND": "aiperf_agentic",
+            "MODEL_PATH": "deepseek-ai/DeepSeek-V4.1-Flash",
+            "ARGS": "-tp 4 --enable-dp-attention --moe-backend standard --all2all-backend none --kv_cache_dtype bf16 --index-cache-dtype fp8 --max-model-len 262144 --gpu-memory-utilization 0.75 --max-num-seqs 24 --max-num-batched-tokens 1024 --attn-prefill-chunk-size 16384 --enable_prefix_caching --block-size 16 --state-checkpoint-interval-tokens 8192 --level 3 --cudagraph-mode FULL --cudagraph-capture-sizes '[1,2,4,8,16,24]' --method dspark --num-speculative-tokens 5 --tool-call-parser dsml_v41 --dspark-config '{\"confidence_schedule\":false}' --disable-uvicorn-access-log --dp-load-balance share_cache",
+            "ISL": "0",
+            "OSL": "0",
+            "CONC": "256",
+            "RANDOM_RANGE_RATIO": "0",
+            "RESULT_FILENAME": "pr3097-B-dpa4-c256"
+          }
+        },
+        {
+          "name": "B â€” Collect GPU info (inside container)",
+          "id": "B-gpu-info",
+          "env": {
+            "REQUESTED_IMAGE": "rocm/atom-dev@sha256:167ce262f6ab188cd1a971dc7ae5f3d4e50586293a2d1c53ea1efbc92ab7491d",
+            "IMAGE_DISPLAY": "rocm/atom-dev@sha256:167ce262f6ab188cd1a971dc7ae5f3d4e50586293a2d1c53ea1efbc92ab7491d",
+            "BENCH_KIND": "aiperf_agentic",
+            "MODEL_PATH": "deepseek-ai/DeepSeek-V4.1-Flash",
+            "ARGS": "-tp 4 --enable-dp-attention --moe-backend standard --all2all-backend none --kv_cache_dtype bf16 --index-cache-dtype fp8 --max-model-len 262144 --gpu-memory-utilization 0.75 --max-num-seqs 24 --max-num-batched-tokens 1024 --attn-prefill-chunk-size 16384 --enable_prefix_caching --block-size 16 --state-checkpoint-interval-tokens 8192 --level 3 --cudagraph-mode FULL --cudagraph-capture-sizes '[1,2,4,8,16,24]' --method dspark --num-speculative-tokens 5 --tool-call-parser dsml_v41 --dspark-config '{\"confidence_schedule\":false}' --disable-uvicorn-access-log --dp-load-balance share_cache",
+            "ISL": "0",
+            "OSL": "0",
+            "CONC": "256",
+            "RANDOM_RANGE_RATIO": "0",
+            "RESULT_FILENAME": "pr3097-B-dpa4-c256"
+          },
+          "run": "set -euo pipefail\nRUNNER_HINT=\"linux-atom-pitt-mi350x-8\"\nbash .github/scripts/collect_gpu_info.sh pr3097-ab-${{ github.run_id }}-b docker \"$RUNNER_HINT\"\n# A registry's latest may have changed since startup. Use the name\n# resolved with this run's digest, never a second remote lookup.\nDOCKER_IMAGE=\"$IMAGE_DISPLAY\"\nIMAGE_ID=$(docker inspect --format '{{.Image}}' pr3097-ab-${{ github.run_id }}-b)\nEXPECTED_IMAGE_ID=$(docker image inspect --format '{{.Id}}' \"$REQUESTED_IMAGE\")\ntest \"$IMAGE_ID\" = \"$EXPECTED_IMAGE_ID\"\necho \"image_digest=${IMAGE_ID}\" >> \"$GITHUB_OUTPUT\"\necho \"docker_image=${DOCKER_IMAGE}\" >> $GITHUB_OUTPUT\necho \"Docker: ${DOCKER_IMAGE}\"\n"
+        },
+        {
+          "name": "B â€” Start isolated CPU Store and verify real put/get",
+          "run": "set -euo pipefail\ndocker exec -i pr3097-ab-${{ github.run_id }}-b bash -c 'cat > /tmp/pr3097-private-store.py' <<'PY'\nimport json,signal,socket,subprocess,threading,time\nfrom pathlib import Path\nfrom mooncake.store import MooncakeDistributedStore\nout=Path('/tmp/pr3097-store');out.mkdir(exist_ok=True);stop=threading.Event()\nsignal.signal(signal.SIGTERM,lambda *unused:stop.set());signal.signal(signal.SIGINT,lambda *unused:stop.set())\ncommand=['mooncake_master','--rpc_address=127.0.0.1','--rpc_port=41871','--enable_http_metadata_server=true','--http_metadata_server_host=127.0.0.1','--http_metadata_server_port=41872','--metrics_port=41873','--client_ttl=600','--default_kv_lease_ttl=120s']\nlog=(out/'store-master.log').open('w');master=subprocess.Popen(command,stdout=log,stderr=subprocess.STDOUT);store=MooncakeDistributedStore()\ntry:\n    deadline=time.monotonic()+60\n    while True:\n        assert master.poll() is None,'private Store master exited'\n        try:\n            with socket.create_connection(('127.0.0.1',41871),timeout=1):break\n        except OSError:\n            if time.monotonic()>deadline:raise TimeoutError('private Store readiness')\n            stop.wait(.2)\n    assert store.setup('127.0.0.1','http://127.0.0.1:41872/metadata',0,16*1024**2,'tcp','','127.0.0.1:41871')==0\n    import os\n    available = int(next(line.split()[1] for line in Path('/proc/meminfo').read_text().splitlines() if line.startswith('MemAvailable:')))*1024\n    limits=[]\n    for cp in ['/sys/fs/cgroup/memory.max','/sys/fs/cgroup/memory/memory.limit_in_bytes']:\n        p=Path(cp)\n        if p.exists():\n            raw=p.read_text().strip()\n            if raw.isdigit() and int(raw)<2**60:limits.append(int(raw))\n    if limits:available=min(available,min(limits))\n    capacity_gib=min(1574,int(available//2//1024**3))\n    assert capacity_gib>=32, {'safe_capacity_gib':capacity_gib,'available_bytes':available}\n    allocated=0\n    while allocated<capacity_gib:\n        chunk=min(64,capacity_gib-allocated)*1024**3\n        result=store.allocate_and_mount_segment(chunk,'tcp','*')\n        assert result['ret']==0 and result['allocated_size']==chunk,result\n        allocated+=chunk//1024**3\n    key='pr3097-accuracy-gpu15-readiness-20261113';assert store.put(key,b'private-ready')==0 and store.get(key)==b'private-ready'\n    (out/'store-ready.json').write_text(json.dumps({'allocated_gib':capacity_gib,'available_bytes':available,'target_gib':1574,'master_pid':master.pid,'protocol':'tcp','cpu_readback':True,'gpu_page_roundtrip':'not_yet_tested','ready_epoch':time.time()}));print('PRIVATE_STORE_CPU_READY',flush=True)\n    while not stop.wait(2):assert master.poll() is None\nfinally:\n    (out/'store-ready.json').unlink(missing_ok=True);store.close();master.terminate()\n    try:master.wait(timeout=10)\n    except subprocess.TimeoutExpired:master.kill();master.wait()\n    log.close()\n\nPY\ndocker exec -d pr3097-ab-${{ github.run_id }}-b bash -lc \"python3 -u /tmp/pr3097-private-store.py > /tmp/pr3097-private-store.log 2>&1\"\nfor i in $(seq 1 120); do if docker exec pr3097-ab-${{ github.run_id }}-b test -f /tmp/pr3097-store/store-ready.json; then docker exec pr3097-ab-${{ github.run_id }}-b cat /tmp/pr3097-store/store-ready.json; exit 0; fi; sleep 1; done\ndocker exec pr3097-ab-${{ github.run_id }}-b cat /tmp/pr3097-private-store.log\nexit 1\n"
+        },
+        {
+          "name": "B â€” Gate real GPU Store roundtrip and source retirement",
+          "run": "set -euo pipefail\ndocker exec -e ATOM_TEST_MOONCAKE_STORE_MASTER=127.0.0.1:41871 -e ATOM_TEST_MOONCAKE_STORE_METADATA=http://127.0.0.1:41872/metadata -e ATOM_TEST_MOONCAKE_STORE_LOCAL_HOSTNAME=127.0.0.1 pr3097-ab-${{ github.run_id }}-b python3 -m pytest -q tests/test_mooncake_store_offload_gpu_e2e.py --junitxml=/tmp/pr3097-store/gpu-smoke.xml\ndocker exec -i pr3097-ab-${{ github.run_id }}-b python3 - <<'PY'\nimport xml.etree.ElementTree as ET\nr=ET.parse('/tmp/pr3097-store/gpu-smoke.xml').getroot()\ncases=list(r.iter('testcase'))\nassert len(cases)==2 and all(c.find('skipped') is None and c.find('failure') is None and c.find('error') is None for c in cases), ET.tostring(r)\nprint('REAL_GPU_STORE_ROUNDTRIP_2_PASS_NO_SKIP')\nPY\n",
+          "timeout-minutes": 10
+        },
+        {
+          "name": "B â€” Run benchmark",
+          "timeout-minutes": 180,
+          "env": {
+            "EXTRA_LAUNCH_ARGS": "",
+            "BENCH_EXTRA_ARGS": "",
+            "GPU_NAME": "${{ steps.B-gpu-info.outputs.gpu_name }}",
+            "ROCM_VERSION": "${{ steps.B-gpu-info.outputs.rocm_version }}",
+            "DOCKER_IMAGE": "${{ steps.B-gpu-info.outputs.docker_image }}",
+            "ATOM_IMAGE_DIGEST": "${{ steps.B-gpu-info.outputs.image_digest }}",
+            "BENCH_KIND": "aiperf_agentic",
+            "MODEL_PATH": "deepseek-ai/DeepSeek-V4.1-Flash",
+            "ARGS": "-tp 4 --enable-dp-attention --moe-backend standard --all2all-backend none --kv_cache_dtype bf16 --index-cache-dtype fp8 --max-model-len 262144 --gpu-memory-utilization 0.75 --max-num-seqs 24 --max-num-batched-tokens 1024 --attn-prefill-chunk-size 16384 --enable_prefix_caching --block-size 16 --state-checkpoint-interval-tokens 8192 --level 3 --cudagraph-mode FULL --cudagraph-capture-sizes '[1,2,4,8,16,24]' --method dspark --num-speculative-tokens 5 --tool-call-parser dsml_v41 --dspark-config '{\"confidence_schedule\":false}' --disable-uvicorn-access-log --dp-load-balance share_cache",
+            "ISL": "0",
+            "OSL": "0",
+            "CONC": "256",
+            "RANDOM_RANGE_RATIO": "0",
+            "RESULT_FILENAME": "pr3097-B-dpa4-c256"
+          },
+          "run": "set -euo pipefail\nif [ -n \"${MODEL_HOST_ROOT:-}\" ]; then model_path=\"/models/deepseek-ai/DeepSeek-V4.1-Flash\"\nelse model_path=\"deepseek-ai/DeepSeek-V4.1-Flash\"; fi\n\n# Launch via stdin so the container's bash parses the shell quoting in\n# ARGS exactly once -- single-quoted JSON values survive intact (e.g.\n# --hf-overrides '{\"use_index_cache\": true, \"index_topk_freq\": 4}').\n# Substituting ${{ env.ARGS }} into a `bash -lc \"...\"` string instead\n# collides the JSON's double quotes with the outer quotes and strips\n# them (argparse: invalid loads value). Mirrors atom-test.yaml.\necho \"ENABLE_TORCH_PROFILER=0 \\\n  ENABLE_RTL_PROFILER=0 \\\n  .github/scripts/atom_test.sh launch $model_path $ARGS $EXTRA_LAUNCH_ARGS\" \\\n  | docker exec -i pr3097-ab-${{ github.run_id }}-b bash -l\n\necho \"========== Running benchmark ==========\"\ndocker exec \\\n  -e ENABLE_TORCH_PROFILER=\"0\" \\\n  -e RESULT_FILENAME=\"pr3097-B-dpa4-c256\" \\\n  -e SERVER_ARGS=\"$ARGS $EXTRA_LAUNCH_ARGS\" \\\n  -e BENCH_EXTRA_ARGS -e BENCH_KIND \\\n  -e GPU_NAME -e ROCM_VERSION \\\n  -e DOCKER_IMAGE -e ATOM_IMAGE_DIGEST \\\n  -e GITHUB_REPOSITORY -e GITHUB_RUN_ID -e GITHUB_RUN_ATTEMPT \\\n  -e GITHUB_JOB -e GITHUB_SHA -e GITHUB_WORKFLOW_REF \\\n  -e MP=\"$model_path\" \\\n  pr3097-ab-${{ github.run_id }}-b bash -lc '.github/scripts/atom_test.sh benchmark \"$MP\"'\n"
+        },
+        {
+          "name": "B â€” Dump server log",
+          "if": "always()",
+          "run": "docker exec pr3097-ab-${{ github.run_id }}-b cat /tmp/atom_server.log 2>/dev/null || true\n",
+          "env": {
+            "BENCH_KIND": "aiperf_agentic",
+            "MODEL_PATH": "deepseek-ai/DeepSeek-V4.1-Flash",
+            "ARGS": "-tp 4 --enable-dp-attention --moe-backend standard --all2all-backend none --kv_cache_dtype bf16 --index-cache-dtype fp8 --max-model-len 262144 --gpu-memory-utilization 0.75 --max-num-seqs 24 --max-num-batched-tokens 1024 --attn-prefill-chunk-size 16384 --enable_prefix_caching --block-size 16 --state-checkpoint-interval-tokens 8192 --level 3 --cudagraph-mode FULL --cudagraph-capture-sizes '[1,2,4,8,16,24]' --method dspark --num-speculative-tokens 5 --tool-call-parser dsml_v41 --dspark-config '{\"confidence_schedule\":false}' --disable-uvicorn-access-log --dp-load-balance share_cache",
+            "ISL": "0",
+            "OSL": "0",
+            "CONC": "256",
+            "RANDOM_RANGE_RATIO": "0",
+            "RESULT_FILENAME": "pr3097-B-dpa4-c256"
+          }
+        },
+        {
+          "name": "B â€” Dump client log",
+          "if": "always()",
+          "run": "docker exec pr3097-ab-${{ github.run_id }}-b cat /tmp/atom_client.log 2>/dev/null || true\n",
+          "env": {
+            "BENCH_KIND": "aiperf_agentic",
+            "MODEL_PATH": "deepseek-ai/DeepSeek-V4.1-Flash",
+            "ARGS": "-tp 4 --enable-dp-attention --moe-backend standard --all2all-backend none --kv_cache_dtype bf16 --index-cache-dtype fp8 --max-model-len 262144 --gpu-memory-utilization 0.75 --max-num-seqs 24 --max-num-batched-tokens 1024 --attn-prefill-chunk-size 16384 --enable_prefix_caching --block-size 16 --state-checkpoint-interval-tokens 8192 --level 3 --cudagraph-mode FULL --cudagraph-capture-sizes '[1,2,4,8,16,24]' --method dspark --num-speculative-tokens 5 --tool-call-parser dsml_v41 --dspark-config '{\"confidence_schedule\":false}' --disable-uvicorn-access-log --dp-load-balance share_cache",
+            "ISL": "0",
+            "OSL": "0",
+            "CONC": "256",
+            "RANDOM_RANGE_RATIO": "0",
+            "RESULT_FILENAME": "pr3097-B-dpa4-c256"
+          }
+        },
+        {
+          "name": "B â€” Inject GPU metadata into benchmark result",
+          "run": "docker exec \\\n  -e GPU_NAME=\"${{ steps.B-gpu-info.outputs.gpu_name }}\" \\\n  -e GPU_VRAM_GB=\"${{ steps.B-gpu-info.outputs.gpu_vram_gb }}\" \\\n  -e ROCM_VERSION=\"${{ steps.B-gpu-info.outputs.rocm_version }}\" \\\n  -e DOCKER_IMAGE=\"${{ steps.B-gpu-info.outputs.docker_image }}\" \\\n  -e RESULT_PATH=\"pr3097-B-dpa4-c256.json\" \\\n  -e DISPLAY_NAME=\"PR3097 B DPA4 head Store ON\" \\\n  pr3097-ab-${{ github.run_id }}-b python3 -c \"\nimport json, os\np = os.environ['RESULT_PATH']\nif not os.path.exists(p):\n    print(f'{p} not found, skipping GPU metadata injection')\nelse:\n    with open(p) as f:\n        d = json.load(f)\n    d['gpu_name'] = os.environ.get('GPU_NAME', '')\n    d['gpu_vram_gb'] = int(os.environ.get('GPU_VRAM_GB') or 0)\n    d['rocm_version'] = os.environ.get('ROCM_VERSION', '')\n    d['docker_image'] = os.environ.get('DOCKER_IMAGE', '')\n    display_name = os.environ.get('DISPLAY_NAME', '')\n    if display_name:\n        d['benchmark_model_name'] = display_name\n    with open(p, 'w') as f:\n        json.dump(d, f, indent=2)\n\"\n",
+          "env": {
+            "BENCH_KIND": "aiperf_agentic",
+            "MODEL_PATH": "deepseek-ai/DeepSeek-V4.1-Flash",
+            "ARGS": "-tp 4 --enable-dp-attention --moe-backend standard --all2all-backend none --kv_cache_dtype bf16 --index-cache-dtype fp8 --max-model-len 262144 --gpu-memory-utilization 0.75 --max-num-seqs 24 --max-num-batched-tokens 1024 --attn-prefill-chunk-size 16384 --enable_prefix_caching --block-size 16 --state-checkpoint-interval-tokens 8192 --level 3 --cudagraph-mode FULL --cudagraph-capture-sizes '[1,2,4,8,16,24]' --method dspark --num-speculative-tokens 5 --tool-call-parser dsml_v41 --dspark-config '{\"confidence_schedule\":false}' --disable-uvicorn-access-log --dp-load-balance share_cache",
+            "ISL": "0",
+            "OSL": "0",
+            "CONC": "256",
+            "RANDOM_RANGE_RATIO": "0",
+            "RESULT_FILENAME": "pr3097-B-dpa4-c256"
+          }
+        },
+        {
+          "name": "B â€” Validate benchmark result completeness",
+          "run": "docker exec -i \\\n  -e RESULT_PATH=\"pr3097-B-dpa4-c256.json\" \\\n  pr3097-ab-${{ github.run_id }}-b python3 - <<'PY'\nimport json, os, sys\n\npath = os.environ[\"RESULT_PATH\"]\nwith open(path, encoding=\"utf-8\") as f:\n    data = json.load(f)\n\nif data.get(\"benchmark_kind\") == \"aiperf_agentic\":\n    completed = int(data.get(\"successful_requests\", 0))\n    duration = float(data.get(\"benchmark_duration_s\", 0))\n    if completed <= 0 or duration <= 0:\n        sys.exit(\"Agentic benchmark has no successful profiling requests or duration\")\n    print(f\"Validated agentic result: {completed} requests, {duration}s\")\n    sys.exit(0)\n\nnum_prompts = int(data.get(\"num_prompts\"))\ncompleted = int(data.get(\"completed\"))\nif completed != num_prompts:\n    print(\n        f\"::error::Invalid benchmark result in {path}: completed requests \"\n        f\"({completed}) did not match num_prompts ({num_prompts}).\",\n        file=sys.stderr,\n    )\n    sys.exit(1)\n\nprint(\n    f\"Validated benchmark result {path}: completed requests \"\n    f\"{completed}/{num_prompts}.\"\n)\nPY\n",
+          "env": {
+            "BENCH_KIND": "aiperf_agentic",
+            "MODEL_PATH": "deepseek-ai/DeepSeek-V4.1-Flash",
+            "ARGS": "-tp 4 --enable-dp-attention --moe-backend standard --all2all-backend none --kv_cache_dtype bf16 --index-cache-dtype fp8 --max-model-len 262144 --gpu-memory-utilization 0.75 --max-num-seqs 24 --max-num-batched-tokens 1024 --attn-prefill-chunk-size 16384 --enable_prefix_caching --block-size 16 --state-checkpoint-interval-tokens 8192 --level 3 --cudagraph-mode FULL --cudagraph-capture-sizes '[1,2,4,8,16,24]' --method dspark --num-speculative-tokens 5 --tool-call-parser dsml_v41 --dspark-config '{\"confidence_schedule\":false}' --disable-uvicorn-access-log --dp-load-balance share_cache",
+            "ISL": "0",
+            "OSL": "0",
+            "CONC": "256",
+            "RANDOM_RANGE_RATIO": "0",
+            "RESULT_FILENAME": "pr3097-B-dpa4-c256"
+          }
+        },
+        {
+          "name": "B â€” Copy profiler traces",
+          "if": "always() && false",
+          "run": "docker cp pr3097-ab-${{ github.run_id }}-b:/app/trace ./profiler-traces 2>/dev/null || true",
+          "env": {
+            "BENCH_KIND": "aiperf_agentic",
+            "MODEL_PATH": "deepseek-ai/DeepSeek-V4.1-Flash",
+            "ARGS": "-tp 4 --enable-dp-attention --moe-backend standard --all2all-backend none --kv_cache_dtype bf16 --index-cache-dtype fp8 --max-model-len 262144 --gpu-memory-utilization 0.75 --max-num-seqs 24 --max-num-batched-tokens 1024 --attn-prefill-chunk-size 16384 --enable_prefix_caching --block-size 16 --state-checkpoint-interval-tokens 8192 --level 3 --cudagraph-mode FULL --cudagraph-capture-sizes '[1,2,4,8,16,24]' --method dspark --num-speculative-tokens 5 --tool-call-parser dsml_v41 --dspark-config '{\"confidence_schedule\":false}' --disable-uvicorn-access-log --dp-load-balance share_cache",
+            "ISL": "0",
+            "OSL": "0",
+            "CONC": "256",
+            "RANDOM_RANGE_RATIO": "0",
+            "RESULT_FILENAME": "pr3097-B-dpa4-c256"
+          }
+        },
+        {
+          "name": "B â€” Upload profiler traces",
+          "if": "always() && false",
+          "uses": "actions/upload-artifact@v7",
+          "with": {
+            "name": "profiler-traces-pr3097-B-dpa4-c256",
+            "path": "profiler-traces/"
+          },
+          "env": {
+            "BENCH_KIND": "aiperf_agentic",
+            "MODEL_PATH": "deepseek-ai/DeepSeek-V4.1-Flash",
+            "ARGS": "-tp 4 --enable-dp-attention --moe-backend standard --all2all-backend none --kv_cache_dtype bf16 --index-cache-dtype fp8 --max-model-len 262144 --gpu-memory-utilization 0.75 --max-num-seqs 24 --max-num-batched-tokens 1024 --attn-prefill-chunk-size 16384 --enable_prefix_caching --block-size 16 --state-checkpoint-interval-tokens 8192 --level 3 --cudagraph-mode FULL --cudagraph-capture-sizes '[1,2,4,8,16,24]' --method dspark --num-speculative-tokens 5 --tool-call-parser dsml_v41 --dspark-config '{\"confidence_schedule\":false}' --disable-uvicorn-access-log --dp-load-balance share_cache",
+            "ISL": "0",
+            "OSL": "0",
+            "CONC": "256",
+            "RANDOM_RANGE_RATIO": "0",
+            "RESULT_FILENAME": "pr3097-B-dpa4-c256"
+          }
+        },
+        {
+          "name": "B â€” Stop server and collect RTL traces",
+          "if": "false",
+          "run": "docker exec pr3097-ab-${{ github.run_id }}-b bash -lc \\\n  \"ENABLE_RTL_PROFILER=1 .github/scripts/atom_test.sh stop\" || true\ndocker cp pr3097-ab-${{ github.run_id }}-b:/app/rtl_traces ./rtl-traces 2>/dev/null || true\n",
+          "env": {
+            "BENCH_KIND": "aiperf_agentic",
+            "MODEL_PATH": "deepseek-ai/DeepSeek-V4.1-Flash",
+            "ARGS": "-tp 4 --enable-dp-attention --moe-backend standard --all2all-backend none --kv_cache_dtype bf16 --index-cache-dtype fp8 --max-model-len 262144 --gpu-memory-utilization 0.75 --max-num-seqs 24 --max-num-batched-tokens 1024 --attn-prefill-chunk-size 16384 --enable_prefix_caching --block-size 16 --state-checkpoint-interval-tokens 8192 --level 3 --cudagraph-mode FULL --cudagraph-capture-sizes '[1,2,4,8,16,24]' --method dspark --num-speculative-tokens 5 --tool-call-parser dsml_v41 --dspark-config '{\"confidence_schedule\":false}' --disable-uvicorn-access-log --dp-load-balance share_cache",
+            "ISL": "0",
+            "OSL": "0",
+            "CONC": "256",
+            "RANDOM_RANGE_RATIO": "0",
+            "RESULT_FILENAME": "pr3097-B-dpa4-c256"
+          }
+        },
+        {
+          "name": "B â€” Upload RTL traces",
+          "if": "false",
+          "uses": "actions/upload-artifact@v7",
+          "with": {
+            "name": "rtl-traces-pr3097-B-dpa4-c256",
+            "path": "rtl-traces/"
+          },
+          "env": {
+            "BENCH_KIND": "aiperf_agentic",
+            "MODEL_PATH": "deepseek-ai/DeepSeek-V4.1-Flash",
+            "ARGS": "-tp 4 --enable-dp-attention --moe-backend standard --all2all-backend none --kv_cache_dtype bf16 --index-cache-dtype fp8 --max-model-len 262144 --gpu-memory-utilization 0.75 --max-num-seqs 24 --max-num-batched-tokens 1024 --attn-prefill-chunk-size 16384 --enable_prefix_caching --block-size 16 --state-checkpoint-interval-tokens 8192 --level 3 --cudagraph-mode FULL --cudagraph-capture-sizes '[1,2,4,8,16,24]' --method dspark --num-speculative-tokens 5 --tool-call-parser dsml_v41 --dspark-config '{\"confidence_schedule\":false}' --disable-uvicorn-access-log --dp-load-balance share_cache",
+            "ISL": "0",
+            "OSL": "0",
+            "CONC": "256",
+            "RANDOM_RANGE_RATIO": "0",
+            "RESULT_FILENAME": "pr3097-B-dpa4-c256"
+          }
+        },
+        {
+          "name": "B â€” Upload benchmark result",
+          "uses": "actions/upload-artifact@v7",
+          "with": {
+            "name": "benchmark-pr3097-B-dpa4-c256",
+            "path": "pr3097-B-dpa4-c256.json"
+          },
+          "env": {
+            "BENCH_KIND": "aiperf_agentic",
+            "MODEL_PATH": "deepseek-ai/DeepSeek-V4.1-Flash",
+            "ARGS": "-tp 4 --enable-dp-attention --moe-backend standard --all2all-backend none --kv_cache_dtype bf16 --index-cache-dtype fp8 --max-model-len 262144 --gpu-memory-utilization 0.75 --max-num-seqs 24 --max-num-batched-tokens 1024 --attn-prefill-chunk-size 16384 --enable_prefix_caching --block-size 16 --state-checkpoint-interval-tokens 8192 --level 3 --cudagraph-mode FULL --cudagraph-capture-sizes '[1,2,4,8,16,24]' --method dspark --num-speculative-tokens 5 --tool-call-parser dsml_v41 --dspark-config '{\"confidence_schedule\":false}' --disable-uvicorn-access-log --dp-load-balance share_cache",
+            "ISL": "0",
+            "OSL": "0",
+            "CONC": "256",
+            "RANDOM_RANGE_RATIO": "0",
+            "RESULT_FILENAME": "pr3097-B-dpa4-c256"
+          }
+        },
+        {
+          "name": "B â€” Prepare bundle summary",
+          "if": "always()",
+          "run": "python3 -m atom.benchmarks.results summary-package \\\n  \"benchmark-bundles/$RESULT_FILENAME\" --output \"bundle-summaries/$RESULT_FILENAME\"\n",
+          "env": {
+            "BENCH_KIND": "aiperf_agentic",
+            "MODEL_PATH": "deepseek-ai/DeepSeek-V4.1-Flash",
+            "ARGS": "-tp 4 --enable-dp-attention --moe-backend standard --all2all-backend none --kv_cache_dtype bf16 --index-cache-dtype fp8 --max-model-len 262144 --gpu-memory-utilization 0.75 --max-num-seqs 24 --max-num-batched-tokens 1024 --attn-prefill-chunk-size 16384 --enable_prefix_caching --block-size 16 --state-checkpoint-interval-tokens 8192 --level 3 --cudagraph-mode FULL --cudagraph-capture-sizes '[1,2,4,8,16,24]' --method dspark --num-speculative-tokens 5 --tool-call-parser dsml_v41 --dspark-config '{\"confidence_schedule\":false}' --disable-uvicorn-access-log --dp-load-balance share_cache",
+            "ISL": "0",
+            "OSL": "0",
+            "CONC": "256",
+            "RANDOM_RANGE_RATIO": "0",
+            "RESULT_FILENAME": "pr3097-B-dpa4-c256"
+          }
+        },
+        {
+          "name": "B â€” Upload versioned summary",
+          "id": "B-bundle-summary",
+          "if": "always()",
+          "uses": "actions/upload-artifact@v7",
+          "with": {
+            "name": "atom-benchmark-summary-v1-${{ github.run_attempt }}-pr3097-B-dpa4-c256",
+            "path": "bundle-summaries/pr3097-B-dpa4-c256/",
+            "if-no-files-found": "warn",
+            "retention-days": 15
+          },
+          "env": {
+            "BENCH_KIND": "aiperf_agentic",
+            "MODEL_PATH": "deepseek-ai/DeepSeek-V4.1-Flash",
+            "ARGS": "-tp 4 --enable-dp-attention --moe-backend standard --all2all-backend none --kv_cache_dtype bf16 --index-cache-dtype fp8 --max-model-len 262144 --gpu-memory-utilization 0.75 --max-num-seqs 24 --max-num-batched-tokens 1024 --attn-prefill-chunk-size 16384 --enable_prefix_caching --block-size 16 --state-checkpoint-interval-tokens 8192 --level 3 --cudagraph-mode FULL --cudagraph-capture-sizes '[1,2,4,8,16,24]' --method dspark --num-speculative-tokens 5 --tool-call-parser dsml_v41 --dspark-config '{\"confidence_schedule\":false}' --disable-uvicorn-access-log --dp-load-balance share_cache",
+            "ISL": "0",
+            "OSL": "0",
+            "CONC": "256",
+            "RANDOM_RANGE_RATIO": "0",
+            "RESULT_FILENAME": "pr3097-B-dpa4-c256"
+          }
+        },
+        {
+          "name": "B â€” Upload complete bundle",
+          "id": "B-bundle-full",
+          "if": "always()",
+          "uses": "actions/upload-artifact@v7",
+          "with": {
+            "name": "atom-benchmark-bundle-v1-${{ github.run_attempt }}-pr3097-B-dpa4-c256",
+            "path": "benchmark-bundles/pr3097-B-dpa4-c256/",
+            "if-no-files-found": "warn",
+            "compression-level": 0,
+            "retention-days": 15
+          },
+          "env": {
+            "BENCH_KIND": "aiperf_agentic",
+            "MODEL_PATH": "deepseek-ai/DeepSeek-V4.1-Flash",
+            "ARGS": "-tp 4 --enable-dp-attention --moe-backend standard --all2all-backend none --kv_cache_dtype bf16 --index-cache-dtype fp8 --max-model-len 262144 --gpu-memory-utilization 0.75 --max-num-seqs 24 --max-num-batched-tokens 1024 --attn-prefill-chunk-size 16384 --enable_prefix_caching --block-size 16 --state-checkpoint-interval-tokens 8192 --level 3 --cudagraph-mode FULL --cudagraph-capture-sizes '[1,2,4,8,16,24]' --method dspark --num-speculative-tokens 5 --tool-call-parser dsml_v41 --dspark-config '{\"confidence_schedule\":false}' --disable-uvicorn-access-log --dp-load-balance share_cache",
+            "ISL": "0",
+            "OSL": "0",
+            "CONC": "256",
+            "RANDOM_RANGE_RATIO": "0",
+            "RESULT_FILENAME": "pr3097-B-dpa4-c256"
+          }
+        },
+        {
+          "name": "B â€” Save logs after launch or packaging failure",
+          "if": "failure() || cancelled()",
+          "run": "docker exec -e EVIDENCE=\"/workspace/benchmark-evidence/$RESULT_FILENAME\" \\\n  pr3097-ab-${{ github.run_id }}-b bash -lc '\n    mkdir -p \"$EVIDENCE\"\n    for file in /tmp/atom_server.log /tmp/atom_client.log /tmp/atom-benchmark-launch.json; do\n      if [ -f \"$file\" ]; then cp \"$file\" \"$EVIDENCE/\"; fi\n    done\n  ' || true\n",
+          "env": {
+            "BENCH_KIND": "aiperf_agentic",
+            "MODEL_PATH": "deepseek-ai/DeepSeek-V4.1-Flash",
+            "ARGS": "-tp 4 --enable-dp-attention --moe-backend standard --all2all-backend none --kv_cache_dtype bf16 --index-cache-dtype fp8 --max-model-len 262144 --gpu-memory-utilization 0.75 --max-num-seqs 24 --max-num-batched-tokens 1024 --attn-prefill-chunk-size 16384 --enable_prefix_caching --block-size 16 --state-checkpoint-interval-tokens 8192 --level 3 --cudagraph-mode FULL --cudagraph-capture-sizes '[1,2,4,8,16,24]' --method dspark --num-speculative-tokens 5 --tool-call-parser dsml_v41 --dspark-config '{\"confidence_schedule\":false}' --disable-uvicorn-access-log --dp-load-balance share_cache",
+            "ISL": "0",
+            "OSL": "0",
+            "CONC": "256",
+            "RANDOM_RANGE_RATIO": "0",
+            "RESULT_FILENAME": "pr3097-B-dpa4-c256"
+          }
+        },
+        {
+          "name": "B â€” Preserve unpackaged failure evidence",
+          "id": "B-bundle-diagnostics",
+          "if": "failure() || cancelled()",
+          "uses": "actions/upload-artifact@v7",
+          "with": {
+            "name": "atom-benchmark-diagnostics-v1-${{ github.run_attempt }}-pr3097-B-dpa4-c256",
+            "path": "benchmark-evidence/pr3097-B-dpa4-c256/",
+            "if-no-files-found": "warn",
+            "retention-days": 14
+          },
+          "env": {
+            "BENCH_KIND": "aiperf_agentic",
+            "MODEL_PATH": "deepseek-ai/DeepSeek-V4.1-Flash",
+            "ARGS": "-tp 4 --enable-dp-attention --moe-backend standard --all2all-backend none --kv_cache_dtype bf16 --index-cache-dtype fp8 --max-model-len 262144 --gpu-memory-utilization 0.75 --max-num-seqs 24 --max-num-batched-tokens 1024 --attn-prefill-chunk-size 16384 --enable_prefix_caching --block-size 16 --state-checkpoint-interval-tokens 8192 --level 3 --cudagraph-mode FULL --cudagraph-capture-sizes '[1,2,4,8,16,24]' --method dspark --num-speculative-tokens 5 --tool-call-parser dsml_v41 --dspark-config '{\"confidence_schedule\":false}' --disable-uvicorn-access-log --dp-load-balance share_cache",
+            "ISL": "0",
+            "OSL": "0",
+            "CONC": "256",
+            "RANDOM_RANGE_RATIO": "0",
+            "RESULT_FILENAME": "pr3097-B-dpa4-c256"
+          }
+        },
+        {
+          "name": "B â€” Link agentic point artifacts",
+          "if": "always() && true",
+          "uses": "actions/github-script@v7",
+          "env": {
+            "POINT_DISPLAY": "PR3097 B DPA4 head Store ON",
+            "POINT_STATUS": "${{ job.status }}",
+            "SUMMARY_URL": "${{ steps.B-bundle-summary.outputs.artifact-url }}",
+            "BUNDLE_URL": "${{ steps.B-bundle-full.outputs.artifact-url }}",
+            "DIAGNOSTICS_URL": "${{ steps.B-bundle-diagnostics.outputs.artifact-url }}",
+            "BENCH_KIND": "aiperf_agentic",
+            "MODEL_PATH": "deepseek-ai/DeepSeek-V4.1-Flash",
+            "ARGS": "-tp 4 --enable-dp-attention --moe-backend standard --all2all-backend none --kv_cache_dtype bf16 --index-cache-dtype fp8 --max-model-len 262144 --gpu-memory-utilization 0.75 --max-num-seqs 24 --max-num-batched-tokens 1024 --attn-prefill-chunk-size 16384 --enable_prefix_caching --block-size 16 --state-checkpoint-interval-tokens 8192 --level 3 --cudagraph-mode FULL --cudagraph-capture-sizes '[1,2,4,8,16,24]' --method dspark --num-speculative-tokens 5 --tool-call-parser dsml_v41 --dspark-config '{\"confidence_schedule\":false}' --disable-uvicorn-access-log --dp-load-balance share_cache",
+            "ISL": "0",
+            "OSL": "0",
+            "CONC": "256",
+            "RANDOM_RANGE_RATIO": "0",
+            "RESULT_FILENAME": "pr3097-B-dpa4-c256"
+          },
+          "with": {
+            "script": "const fs = require('fs');\nconst path = require('path');\nconst escape = value => String(value).replace(/[&<>\"']/g, char =>\n  ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;', \"'\": '&#39;'}[char]));\ncore.summary.addHeading(escape(`${process.env.POINT_DISPLAY} Ã‚Â· c=${process.env.CONC}`));\ncore.summary.addRaw(`Status before cleanup: ${escape(process.env.POINT_STATUS)}\\n\\n`);\nconst validationPath = path.join('benchmark-bundles', process.env.RESULT_FILENAME, 'validation.json');\nif (fs.existsSync(validationPath)) {\n  const validation = JSON.parse(fs.readFileSync(validationPath, 'utf8'));\n  core.summary.addRaw(`Bundle complete: ${validation.complete}; measurement valid: ${validation.measurement_valid}\\n\\n`);\n  for (const reason of validation.missing || []) {\n    core.summary.addRaw(`- ${escape(reason)}\\n`);\n    core.warning(`Bundle incomplete: ${reason}`);\n  }\n  core.summary.addRaw('\\n');\n}\nfor (const [label, url] of [\n  ['Summary bundle', process.env.SUMMARY_URL],\n  ['Full bundle', process.env.BUNDLE_URL],\n  ['Failure diagnostics', process.env.DIAGNOSTICS_URL],\n]) {\n  if (url) core.summary.addLink(label, url).addBreak();\n}\ncore.summary.addRaw('\\nA full-bundle upload may contain partial evidence after failure; check its manifest status.\\n');\nawait core.summary.write();\n"
+          }
+        },
+        {
+          "name": "B â€” Preserve Store diagnostics and runtime identity",
+          "if": "always()",
+          "run": "mkdir -p \"pr3097-B-dpa4-c256-runtime\"\ndocker inspect pr3097-ab-${{ github.run_id }}-b > \"pr3097-B-dpa4-c256-runtime/container-inspect.json\" 2>/dev/null || true\ndocker cp pr3097-ab-${{ github.run_id }}-b:/tmp/pr3097-store \"pr3097-B-dpa4-c256-runtime/\" 2>/dev/null || true\ndocker cp pr3097-ab-${{ github.run_id }}-b:/tmp/pr3097-private-store.log \"pr3097-B-dpa4-c256-runtime/\" 2>/dev/null || true\ndocker exec pr3097-ab-${{ github.run_id }}-b python3 -c \"import torch,atom;print(atom.__file__);print(torch.cuda.get_device_name());print(torch.cuda.get_device_properties(0))\" > \"pr3097-B-dpa4-c256-runtime/gpu.txt\" 2>&1 || true\nhostname > \"pr3097-B-dpa4-c256-runtime/hostname.txt\""
+        },
+        {
+          "name": "B â€” Upload runtime identity",
+          "if": "always()",
+          "uses": "actions/upload-artifact@v7",
+          "with": {
+            "name": "pr3097-B-dpa4-c256-runtime",
+            "path": "pr3097-B-dpa4-c256-runtime/",
+            "retention-days": 15
+          }
+        },
+        {
+          "name": "B â€” Stop only this Action container",
+          "if": "always()",
+          "run": "docker stop pr3097-ab-${{ github.run_id }}-b || true\ndocker rm pr3097-ab-${{ github.run_id }}-b || true"
+        }
+      ]
+    }
+  }
+}
