@@ -686,6 +686,9 @@ class Scheduler:
     # A preempted sequence recomputes its prompt here, which a KV change relies
     # on to keep what was running (see `preempt_running`).
     can_recompute_prompts = True
+    # An abort of an advertised send handed to the connector since its last
+    # metadata, which carries the abort to the workers (`abort_request`).
+    _abort_awaits_meta = False
 
     def __init__(
         self,
@@ -2195,8 +2198,11 @@ class Scheduler:
         if self.cost_balance and delayer_allows and self.prefill_delayer is not None:
             self._balance_prefill_step(prefill_cost)
 
-        # Rejections may still need an empty batch to dispatch connector cleanup.
-        if not self.running and not self.waiting and not self._rejected:
+        # Rejections, and an abort handed to the connector, may still need an
+        # empty batch to dispatch connector cleanup.
+        if not (
+            self.running or self.waiting or self._rejected or self._abort_awaits_meta
+        ):
             return None
 
         # ---- Phase 1: resume partial prefills from running ----
@@ -2786,6 +2792,7 @@ class Scheduler:
                     scheduled_seqs, num_scheduled_tokens
                 )
                 connector_meta_output = self.kv_connector.build_connector_meta()
+                self._abort_awaits_meta = False
 
             # Freeze, per seq, whether this chunk is the last one this prefill
             # owes. Uses the pre-advance offsets so it is correct whether or not
@@ -2970,6 +2977,7 @@ class Scheduler:
             self._publish_state_stores()
             self._note_connector_scheduled_tokens(scheduled_seqs, num_scheduled_tokens)
             connector_meta_output = self.kv_connector.build_connector_meta()
+            self._abort_awaits_meta = False
 
         self._check_draft_writes_allocated(scheduled_seqs.values())
         decode_batch = ScheduledBatch(
@@ -3179,7 +3187,19 @@ class Scheduler:
             if seq.id == req_id:
                 seq.status = SequenceStatus.ABORTED
                 return True
-        return False
+        # Finished and parked while decode may still pull its advertised
+        # blocks: the connector reports the send done once no transfer of them
+        # can run, and refuses a later one.
+        seq = self._deferred_sequence(req_id)
+        if seq is None:
+            return False
+        abort = getattr(self.kv_connector, "abort_advertised_send", None)
+        if callable(abort):
+            abort(seq)
+            # An idle scheduler builds no metadata, so `_schedule` builds an
+            # empty batch to carry the abort to the workers.
+            self._abort_awaits_meta = True
+        return True
 
     def _abort_failed_remote_receive(self, req_id) -> None:
         """End a request whose P/D KV receive failed, as aborted.

@@ -846,6 +846,11 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         for connector in self._connectors:
             connector.abort_send(seq)
 
+    def abort_advertised_send(self, seq: Any) -> None:
+        # Only the sub holding the send claim acts; the others keep the default.
+        for abort in self._sub_methods("abort_advertised_send"):
+            abort(seq)
+
     def process_pd_completions(self, output: KVConnectorOutput) -> KVConnectorOutput:
         for connector in self._connectors:
             output = connector.process_pd_completions(output)

@@ -139,6 +139,16 @@ class KVConnectorSchedulerBase(ABC):
         """Retire an unsent abort; streaming senders must wait for reader drain."""
         self.send_finished(seq.id)
 
+    def abort_advertised_send(self, seq: Any) -> None:
+        """The request was aborted after it finished and advertised its blocks.
+
+        Unlike `abort_send`, the peer holds these addresses and may be reading
+        them. A backend that sees every transfer of the source blocks reports
+        the send in ``finished_sending`` once none can run, at once when none
+        has started, and refuses a later one. This default keeps the claim: a
+        backend that cannot see a transfer must not free blocks one may read.
+        """
+
     @abstractmethod
     def request_finished(self, seq: Any) -> None:
         """Populate KV transfer output metadata when a request completes."""
