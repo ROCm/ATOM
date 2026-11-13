@@ -859,7 +859,10 @@ def cp_lse_a2a(
         recv = torch.empty_like(send)
         recv_lse = torch.empty_like(send_lse)
         group = cp_group.device_group
-        torch.distributed.all_to_all_single(recv, send, group=group)
+        # RCCL rejects some fp8 dtypes; the all-to-all only moves bytes.
+        torch.distributed.all_to_all_single(
+            recv.view(torch.uint8), send.view(torch.uint8), group=group
+        )
         torch.distributed.all_to_all_single(recv_lse, send_lse, group=group)
         # [N, B, H_local] views of what arrived as [N, H_local, B].
         recv = recv.view(n_ranks, h_local, b, head_dim).transpose(1, 2)
