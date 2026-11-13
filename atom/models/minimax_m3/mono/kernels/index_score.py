@@ -4,7 +4,8 @@
 
 The Triton decode scorer's math, one 128-key block of index-K per task: bf16(fp8
 K) x bf16 index q on the MFMA, max over the causal keys, times fp32(sm_scale *
-log2 e). A context of <= TOPK_BLOCKS blocks keeps every block and is not scored;
+log2 e). (An NVFP4 index cache: K = e4m3_rn_satfinite(e2m1 x scale) and q e4m3,
+one fp8 16x16x128 MFMA a tile, like vLLM's NVFP4 indexer.) A context of <= TOPK_BLOCKS blocks keeps every block and is not scored;
 nor are the blocks the selector pins (the first ``init_blocks``, the last
 ``local_blocks``): their keys are forced. A scored block waits for the index keys
 K1 inserts this step only when it may hold one (``wait_new_keys``).
@@ -26,8 +27,8 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from aiter.ops.flydsl.kernels.kernels_common import LOG2E
-from flydsl.expr import const_expr, gpu, range_constexpr
-from flydsl.expr.typing import Int32, Int64, T
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr.typing import Int32, Int64, T, as_ir_value
 
 from atom.models.minimax_m3.mono.config import (
     HEAD_DIM,
@@ -41,6 +42,7 @@ from atom.models.minimax_m3.mono.config import (
     IndexHeads,
 )
 from atom.models.minimax_m3.mono.sources import SOURCES
+from atom.mono.device.mx import UNIT_SCALE, mfma_scaled
 from atom.mono.device.ops import (
     butterfly,
     fp8x8_bf16_pk,
@@ -62,8 +64,63 @@ from atom.mono.plan.execution import BLOCKS, THREADS, WAVES
 from atom.mono.plan.trace import Space
 
 INDEX_BLOCK_BYTES = SPARSE_BLOCK * HEAD_DIM  # one fp8 index-K block
+# an nvfp4 index page (one buffer): 128 keys x 64 B e2m1 (low nibble = even dim),
+# then 128 x 8 B e4m3 scales, one per 16 dims (aiter / vLLM single-buffer layout)
+NVFP4_PAGE_BYTES = 9216
+NVFP4_SCALES_AT = SPARSE_BLOCK * HEAD_DIM // 2
 KEY_TILES = SPARSE_BLOCK // 16  # MFMA row tiles of a block
 _CURRENT_STREAM = fx.Stream(None)
+
+
+E4M3_MAX = 448.0
+
+
+def e4m3_dwords(vals):
+    """Eight f32 -> two dwords of E4M3 (RNE, saturating at 448: the convert itself
+    does not saturate), the quantizer of vLLM's NVFP4 indexer for K and for Q."""
+    hi, lo = fx.Float32(E4M3_MAX), fx.Float32(-E4M3_MAX)
+    out = []
+    for d in range_constexpr(2):
+        packed = as_ir_value(fx.Int32(0))
+        for h in range_constexpr(2):
+            a, b = (vals[4 * d + 2 * h + i].minimumf(hi).maximumf(lo) for i in (0, 1))
+            packed = rocdl.cvt_pk_fp8_f32(
+                T.i32, as_ir_value(a), as_ir_value(b), packed, bool(h)
+            )
+        out.append(fx.Int32(packed))
+    return out
+
+
+def nvfp4_dword_e4m3x8(word, scale_byte):
+    """Eight e2m1 of ``word`` (low nibble first) times the e4m3 scale in the low
+    byte of ``scale_byte``, rounded to E4M3 (``k_round="e4m3"`` of aiter's scorer):
+    two dwords. ``v_cvt_scalef32_pk_f32_fp4`` takes only the exponent of its scale,
+    so the elements are widened at scale 1.0 and multiplied by the scale decoded to
+    f32 (exact: <= 6 significant bits)."""
+    sc = fx.Vector(
+        rocdl.cvt_pk_f32_fp8(
+            res=fx.Vector.make_type(2, fx.Float32),
+            src=as_ir_value(fx.Int32(scale_byte & 0xFF)),
+            word_sel=False,
+        )
+    )[0]
+    w = as_ir_value(fx.Int32(word))
+    one = as_ir_value(fx.Float32(1.0))
+    prod = []
+    for sel in range_constexpr(4):
+        pair = fx.Vector(rocdl.cvt_scalef32_pk_f32_fp4(T.vec(2, T.f32), w, one, sel))
+        prod += [fx.Float32(pair[0]) * sc, fx.Float32(pair[1]) * sc]
+    return e4m3_dwords(prod)
+
+
+def q_e4m3(frags):
+    """The four k-chunk fragments (bf16x8 each) of an index q -> the e4m3 B operand
+    of one 16x16x128 MFMA (8 dwords), as vLLM quantizes the index q."""
+    words = []
+    for f in frags:
+        v = fx.Vector(f).to(fx.Float32)
+        words += e4m3_dwords([fx.Float32(v[i]) for i in range(8)])
+    return fx.Vector.from_elements(words, fx.Int32)
 
 
 def _f32(x: float) -> float:
@@ -120,7 +177,7 @@ def emit_index_scores(
     slot, lane, wave, red, mb_put, iscore, q_frag, tokens, q_len, init_blocks,
     local_blocks, scale, index_cache, block_table, seq_lens, bt_width,
     wait_new_keys=None, prepare=None, heads=ONE_INDEX_HEAD, q_frag_head=None,
-    prepare_heads=None,
+    prepare_heads=None, nvfp4=False, strip=(),
 ):  # fmt: skip
     """This CTA's (``slot``) share of the step's score tasks: up to BLOCKS tasks,
     task u runs on CTA u, else on wave (u // BLOCKS) % WAVES of CTA u % BLOCKS
@@ -144,11 +201,15 @@ def emit_index_scores(
     pair k * MAX_INDEX_BLOCKS + h * (MAX_INDEX_BLOCKS / TP) + b / TP <- the score
     of token k's block b for head h. ``q_frag_head(k, s, h)``: head h's B operand
     (every lane its own h); ``prepare_heads()`` (with CTA barriers, on every CTA)
-    makes those requests' rows' heads first. The other requests score as above."""
+    makes those requests' rows' heads first. The other requests score as above.
+
+    ``nvfp4``: the index cache holds nvfp4 pages (``NVFP4_PAGE_BYTES``); a lane's
+    key operand of chunk s is dims 32 g4 + 8 s .. + 7 (its own 16 B of the key's
+    data, no transpose), so ``q_frag`` must return the same dims (its ``perm``)."""
     assert local_blocks >= 1, "the block of the current token must be pinned"
     l16 = lane % 16
     g4 = lane // 16
-    r_ic = rsrc(index_cache)
+    r_ic = rsrc(index_cache, 0 if "idx" in strip else None)
     rows = step_rows(seq_lens, tokens, q_len, heads)
     seq = rows.seq
     # every request's scored blocks in one list, a task per wave across the grid;
@@ -203,6 +264,30 @@ def emit_index_scores(
         the rows: 1M context, S = 16, scores 125 -> 100 us); ``split_tiles``
         makes them MFMA operands."""
         words = []
+        if const_expr(nvfp4):
+            # per tile: 16 B of data (dims 32 g4 .. + 31) and the 2 B of scales
+            # of its groups 2 g4, 2 g4 + 1
+            for i in tiles:
+                key = 16 * i + l16
+                base = page * NVFP4_PAGE_BYTES
+                w = fx.Vector(
+                    bo.buffer_load(
+                        r_ic,
+                        (base + key * (HEAD_DIM // 2) + 16 * g4) // 4,
+                        vec_width=4,
+                        dtype=T.i32,
+                    )
+                )
+                sc = fx.Int32(
+                    bo.buffer_load(
+                        r_ic,
+                        (base + NVFP4_SCALES_AT + key * 8 + 2 * g4) // 2,
+                        vec_width=1,
+                        dtype=T.i16,
+                    )
+                )
+                words += [w[e] for e in range(4)] + [sc]
+            return fx.Vector.from_elements(words, fx.Int32)
         for i in tiles:
             row = (page * INDEX_BLOCK_BYTES + (16 * i + l16) * HEAD_DIM + 32 * g4) // 4
             for h in range_constexpr(2):
@@ -212,12 +297,30 @@ def emit_index_scores(
                 words += [w[e] for e in range(4)]
         return fx.Vector.from_elements(words, fx.Int32)
 
+    def q_operand(frags):
+        return q_e4m3(frags) if const_expr(nvfp4) else frags
+
     def split_tiles(raw, tiles):
         """``load_raw``'s words -> per tile the MFMA A operands: tile i holds keys
         16 i + lane % 16, k = 32 s + 8 (lane / 16). A 4 x 4 transpose of the 8 B
         parts across the key's four lanes (permlane swaps) gives each lane part
         g4 of every chunk s."""
         out = []
+        if const_expr(nvfp4):
+            for n in range_constexpr(len(tiles)):
+                out.append(
+                    fx.Vector.from_elements(
+                        [
+                            w
+                            for s in range(4)
+                            for w in nvfp4_dword_e4m3x8(
+                                raw[5 * n + s], raw[5 * n + 4] >> (8 * (s // 2))
+                            )
+                        ],
+                        fx.Int32,
+                    )
+                )
+            return out
         for n in range_constexpr(len(tiles)):
             d = [raw[8 * n + e] for e in range(8)]
             # part j = dwords 2 j, 2 j + 1; lanes g4 and g4 ^ 2, then g4 ^ 1, trade
@@ -242,8 +345,13 @@ def emit_index_scores(
         v = fx.Float32(float("-inf"))
         for n, i in enumerate(tiles):
             c = fx.Vector.filled(4, 0.0, fx.Float32)
-            for s in range_constexpr(HEAD_DIM // 32):
-                c = mfma_bf16(fp8x8_bf16_pk(kw[n][s]), qb[s], c)
+            if const_expr(nvfp4):  # K and q e4m3: one fp8 MFMA over all 128 dims
+                c = mfma_scaled(
+                    kw[n], qb, c, fx.Int32(UNIT_SCALE), fx.Int32(UNIT_SCALE)
+                )
+            else:
+                for s in range_constexpr(HEAD_DIM // 32):
+                    c = mfma_bf16(fp8x8_bf16_pk(kw[n][s]), qb[s], c)
             # lane holds keys 16 i + 4 (lane / 16) + e of column lane % 16
             key0 = b * SPARSE_BLOCK + 16 * i + 4 * g4
             for e in range_constexpr(4):
@@ -277,7 +385,9 @@ def emit_index_scores(
                     f = p * 16 + l16
                     head = fx.min(f // q_len, TP - 1)
                     col = tk - (q_len - 1) + f % q_len
-                    qb = [q_frag_head(col, s, head) for s in range(HEAD_DIM // 32)]
+                    qb = q_operand(
+                        [q_frag_head(col, s, head) for s in range(HEAD_DIM // 32)]
+                    )
                     v = tiles_max(b, qb, lane_gather(seq_lane, col), tiles, kw)
                     if (lane < 16) & (f < n_cols):
                         mb_put(
@@ -318,7 +428,7 @@ def emit_index_scores(
             if const_expr(prepare is not None):
                 prepare(tk - (q_len - 1), tk)
             col, col_seq = cols_of(tk)
-            qb = [q_frag(col, s) for s in range(HEAD_DIM // 32)]
+            qb = q_operand([q_frag(col, s) for s in range(HEAD_DIM // 32)])
             v = tiles_max(b, qb, col_seq, [wave], split_tiles(raw, [wave]))
             if lane < 16:
                 fx.ptr_store(v, red + (wave * 16 + l16))
@@ -342,7 +452,7 @@ def emit_index_scores(
             raw = load_raw(page, tiles)
             col = tk - (q_len - 1) + fx.min(l16, q_len - 1)
             col_seq = lane_gather(seq_lane, col)
-            qb = [q_frag(col, s) for s in range(HEAD_DIM // 32)]
+            qb = q_operand([q_frag(col, s) for s in range(HEAD_DIM // 32)])
             put(b, col, tiles_max(b, qb, col_seq, tiles, split_tiles(raw, tiles)))
 
         # Every wave the same task count: task u on wave
@@ -363,7 +473,7 @@ def emit_index_scores(
             emit_cp_tasks()
 
 
-def q_frag_from(iq, heads=ONE_INDEX_HEAD):
+def q_frag_from(iq, heads=ONE_INDEX_HEAD, nvfp4=False):
     """(``q_frag``, ``q_frag_head``) reading index q from memory: [token][head]
     [HEAD_DIM] bf16, ``heads.count`` heads a token."""
 
@@ -372,7 +482,15 @@ def q_frag_from(iq, heads=ONE_INDEX_HEAD):
         return fx.Vector(
             bo.buffer_load(
                 rsrc(iq),
-                ((tk * heads.count + head) * HEAD_DIM + 32 * s + 8 * (lane // 16)) // 2,
+                (
+                    (tk * heads.count + head) * HEAD_DIM
+                    + (
+                        32 * (lane // 16) + 8 * s
+                        if nvfp4
+                        else 32 * s + 8 * (lane // 16)
+                    )
+                )
+                // 2,
                 vec_width=4,
                 dtype=T.i32,
             )
@@ -394,6 +512,7 @@ class ScoreBuild:
     index_heads: int = field(metadata={"sym": "ih"})
     index_own: int = field(metadata={"sym": "io"})
     sm_scale: float
+    nvfp4: bool = False
 
 
 def build_index_score_kernel(
@@ -402,6 +521,7 @@ def build_index_score_kernel(
     local_blocks: int,
     tokens: int = 1,
     heads: IndexHeads = ONE_INDEX_HEAD,
+    nvfp4: bool = False,
 ):
     """``@flyc.jit`` launcher of the score tasks alone (index q from memory,
     ``heads.count`` heads a token), for K4's harnesses: scores into mailbox
@@ -409,7 +529,7 @@ def build_index_score_kernel(
     assert 1 <= tokens <= MAX_TOKENS
     key = ScoreBuild(
         tokens=tokens, init_blocks=init_blocks, local_blocks=local_blocks,
-        index_heads=heads.count, index_own=heads.own, sm_scale=sm_scale,
+        index_heads=heads.count, index_own=heads.own, sm_scale=sm_scale, nvfp4=nvfp4,
     )  # fmt: skip
     build_key = key_tuple(key, SOURCES)  # the launcher references it: keyed
     scale = index_scale_log2e(sm_scale)
@@ -440,12 +560,13 @@ def build_index_score_kernel(
         mbox = Mailbox(layer)
         mb_put = mbox.put
         k_heads = IndexHeads(ih_count, ih_own)
-        q_frag, q_frag_head = q_frag_from(iq, k_heads)
+        q_frag, q_frag_head = q_frag_from(iq, k_heads, nvfp4)
         emit_index_scores(
             fx.block_idx.x, tid % 64, uniform(tid // 64), red, mb_put,
             Addr("iscore", Space.SCRATCH, iscore),
             q_frag, tokens, q_len, init_blocks, local_blocks, scale, index_cache,
             block_table, seq_lens, bt_width, heads=k_heads, q_frag_head=q_frag_head,
+            nvfp4=nvfp4,
         )  # fmt: skip
 
     @launcher(kernel_name)

@@ -18,12 +18,16 @@ from atom.models.minimax_m3.mono.config import (
 )
 from atom.models.minimax_m3.mono.kernels.stages.shared import (
     S2_BYTES,
+    S2S_BYTES,
     S13_BYTES,
+    S13S_BYTES,
     W2_BYTES,
     W2_SCALE_COLS,
+    W2S_BYTES,
     W13_BYTES,
     W13_ROWS,
     W13_SCALE_COLS,
+    W13S_BYTES,
 )
 from atom.models.minimax_m3.mono.layout import (
     DN_ROWS,
@@ -37,7 +41,7 @@ from atom.models.minimax_m3.mono.layout import (
     XN8_ROW,
     XSC_ROW,
 )
-from atom.mono.device.mx import FP4, fp4_tile_load, mfma_scaled
+from atom.mono.device.mx import FP4, FP8, fp4_tile_load, mfma_scaled
 from atom.mono.device.ops import (
     CM_DEV,
     ballot,
@@ -62,6 +66,7 @@ def moe_wide_defs(k4ctx):
     """The functions of the expert-grouped MoE (S > 4)."""
     BASE = k4ctx["BASE"]
     DN_DEPTH = k4ctx["DN_DEPTH"]
+    DN_ROWS_AHEAD = k4ctx["DN_ROWS_AHEAD"]
     DN_KC = k4ctx["DN_KC"]
     DN_WITERS = k4ctx["DN_WITERS"]
     G = k4ctx["G"]
@@ -70,7 +75,10 @@ def moe_wide_defs(k4ctx):
     MID_ROW_WORDS = k4ctx["MID_ROW_WORDS"]
     ROUTE_ITERS = k4ctx["ROUTE_ITERS"]
     UGW_ITERS = k4ctx["UGW_ITERS"]
+    UG_SHARED_UNITS = k4ctx["UG_SHARED_UNITS"]
     UG_CPW = k4ctx["UG_CPW"]
+    SH8 = k4ctx["shared_mxfp8"]
+    SH_FIRST = SH8 and k4ctx["sh_first"] != 0
     UG_PAIRS = k4ctx["UG_PAIRS"]
     U_MAX = k4ctx["U_MAX"]
     W_MIDSC = k4ctx["W_MIDSC"]
@@ -81,6 +89,12 @@ def moe_wide_defs(k4ctx):
     XSC_WORDS = k4ctx["XSC_WORDS"]
     acquire = k4ctx["acquire"]
     batch_ids = k4ctx["batch_ids"]
+    fp8_scale_load = k4ctx["fp8_scale_load"]
+    fp8_tile_load = k4ctx["fp8_tile_load"]
+    s2s = k4ctx["s2s"]
+    s13s = k4ctx["s13s"]
+    w2s = k4ctx["w2s"]
+    w13s = k4ctx["w13s"]
     bid = k4ctx["bid"]
     e8m0_load = k4ctx["e8m0_load"]
     ffn_finish = k4ctx["ffn_finish"]
@@ -104,7 +118,7 @@ def moe_wide_defs(k4ctx):
     rwt = k4ctx["rwt"]
     s13 = k4ctx["s13"]
     s2 = k4ctx["s2"]
-    scores_copy = k4ctx["scores_copy"]
+    scores_read = k4ctx["scores_read"]
     stamp = k4ctx["stamp"]
     start = k4ctx["start"]
     swiglu_limit = k4ctx["swiglu_limit"]
@@ -115,6 +129,7 @@ def moe_wide_defs(k4ctx):
     urow = k4ctx["urow"]
     uwt = k4ctx["uwt"]
     w13 = k4ctx["w13"]
+    wrsrc = k4ctx["wrsrc"]
     w2 = k4ctx["w2"]
     wave = k4ctx["wave"]
     xs = k4ctx["xs"]
@@ -161,11 +176,12 @@ def moe_wide_defs(k4ctx):
         u = t // UG_PER_SLOT
         cg = t % UG_PER_SLOT
         e_u = fx.min(uniform(fx.ptr_load(uexp + u)), SHARED_EXPERT)
-        r_w = rsrc(
+        r_w = wrsrc(
+            "moeu",
             w13 + fx.Int64(e_u) * W13_BYTES,
             has.select(fx.Int32(W13_BYTES), fx.Int32(0)),
         )
-        r_s = rsrc(s13, has.select(fx.Int32(S13_BYTES), fx.Int32(0)))
+        r_s = wrsrc("moeu", s13, has.select(fx.Int32(S13_BYTES), fx.Int32(0)))
         wts = []
         scs = []
         for gu in range_constexpr(2):
@@ -191,7 +207,23 @@ def moe_wide_defs(k4ctx):
                     )
         return wts, scs
 
-    def wug_y(wts, scs, half):
+    def wsh_load(cg, has):
+        """The shared expert's up / gate tiles of 16-row group ``cg`` (MXFP8, one scale
+        a tile): wts[gu][chunk], scs[gu][chunk]; without the task, zero-sized reads."""
+        r_w = wrsrc("shu", w13s, has.select(fx.Int32(W13S_BYTES), fx.Int32(0)))
+        r_s = wrsrc("shu", s13s, has.select(fx.Int32(S13S_BYTES), fx.Int32(0)))
+        wts, scs = [], []
+        for gu in range_constexpr(2):
+            row = (gu * UG_PER_SLOT + cg) * 16 + l16
+            kcs = [wave * UG_CPW + i for i in range(UG_CPW)]
+            wts.append([fp8_tile_load(r_w, row, HIDDEN, kc) for kc in kcs])
+            scs.append([fp8_scale_load(r_s, row, HIDDEN, kc) for kc in kcs])
+        return wts, scs
+
+    def wug_y(wts, scs, half, fp8=False):
+        return wug_reduce(*wug_mma(wts, scs, half, fp8))
+
+    def wug_mma(wts, scs, half, fp8=False):
         """A task's up / gate GEMV for every token (B column l % 16 = token
         l % 16) -> swiglu: thread (row r, token k)'s mid value. ``half``: the
         task's 16-row half of its 32-row scale block (compile time)."""
@@ -205,6 +237,10 @@ def moe_wide_defs(k4ctx):
         for i in range_constexpr(UG_CPW):
             kc = wave * UG_CPW + i
             xb = lds_b8(col * XN8_ROW + kc * 32)
+            if const_expr(fp8):  # the shared expert's tiles: a scale each
+                cg_ = mfma_scaled(wts[0][i], xb, cg_, scs[0][i], sbs[i], a_fmt=FP8)
+                cu_ = mfma_scaled(wts[1][i], xb, cu_, scs[1][i], sbs[i], a_fmt=FP8)
+                continue
             sel = (i % 2) * 2 + half
             cg_ = mfma_scaled(
                 wts[0][i], xb, cg_, scs[0][i // 2], sbs[i], a_fmt=FP4, sa_byte=sel
@@ -212,6 +248,10 @@ def moe_wide_defs(k4ctx):
             cu_ = mfma_scaled(
                 wts[1][i], xb, cu_, scs[1][i // 2], sbs[i], a_fmt=FP4, sa_byte=sel
             )
+        return cg_, cu_
+
+    def wug_reduce(cg_, cu_):
+        """The task's two accumulators -> swiglu: thread (row r, token k)'s mid value."""
         fx.ptr_store(cg_, red + (wave * 64 + lane) * 4)
         fx.ptr_store(cu_, fpool + (W_UPP + (wave * 64 + lane) * 4))
         gpu.barrier()
@@ -288,6 +328,14 @@ def moe_wide_defs(k4ctx):
         td = start("down")  # this CTA's down task (the split tasks come first)
         has_dn = td < N_DN
         td = fx.min(td, N_DN - 1)
+        if const_expr(SH_FIRST):
+            # the shared pair needs no routing: its first half's tiles go out now,
+            # while the router's scores are still on their way, and its GEMVs are
+            # the first thing a host does once the xn is in (``sh_first``)
+            jsh = fx.Int32(bid) - (G - UG_PAIRS)
+            has_s = jsh >= 0
+            jsh = fx.min(jsh, UG_PAIRS - 1)
+            sh_cur = wsh_load(2 * jsh, has_s)
         # every token's routing: wave w routes tokens w, w + WAVES, .., their
         # scores polled in one batch
         mine = bid % SCORE_COPIES
@@ -299,7 +347,7 @@ def moe_wide_defs(k4ctx):
         wave_toks = [fx.min(wave + WAVES * j, tokens - 1) for j in range(ROUTE_ITERS)]
         sg = mb_poll(
             [
-                (scores_copy(mine, k), (lane + 64 * h) * 2, 2)
+                (scores_read(mine, k), (lane + 64 * h) * 2, 2)
                 for k in wave_toks
                 for h in range(2)
             ]
@@ -335,11 +383,31 @@ def moe_wide_defs(k4ctx):
                 sk * 2 * MOE_SLOTS + MOE_SLOTS + sj,
                 fx.ptr_load(rwt + (8 * sk + sj)),
             )
-        n_pairs = (uniform(fx.ptr_load(uexp + (U_MAX + 1))) + 1) * UG_PAIRS
+        n_routed = uniform(fx.ptr_load(uexp + (U_MAX + 1)))
+        # the MXFP8 shared expert is not a task of the grouped loop (its tiles are fp8)
+        n_pairs = (n_routed + (0 if SH8 else 1)) * UG_PAIRS
+
+        # the MXFP8 shared expert's pairs (UG_PAIRS, each ``UG_SHARED_UNITS`` routed pairs' time) run
+        # on the last UG_PAIRS CTAs after their routed pairs: those carry that many pairs
+        # fewer, so every CTA ends within a pair of the others. Rounds (a round is
+        # one pair a CTA): the first ``full`` are every CTA's (pair round * G +
+        # bid); the last ``UG_SHARED_UNITS`` are the other G - UG_PAIRS CTAs' (the routed
+        # pairs left, in order). Not SH8: pair round * G + bid throughout
+        SH_HOST0 = G - UG_PAIRS
+        if const_expr(SH8):
+            rounds = (n_pairs + UG_SHARED_UNITS * UG_PAIRS + (G - 1)) // G
+            full = fx.max(rounds - UG_SHARED_UNITS, 0)
 
         def task(it):
-            """Iteration it's task: pair bid + (it / 2) G's half it % 2."""
-            pr = fx.Int32(bid + it // 2 * G)
+            """Iteration it's task: its pair's half it % 2."""
+            if const_expr(SH8):
+                rd = it // 2
+                tail = full * G + (fx.Int32(rd) - full) * SH_HOST0 + bid
+                pr = (fx.Int32(rd) < full).select(
+                    fx.Int32(rd * G) + bid, (bid < SH_HOST0).select(tail, n_pairs)
+                )
+            else:
+                pr = fx.Int32(bid + it // 2 * G)
             return fx.min(pr, n_pairs - 1) * 2 + it % 2, pr < n_pairs
 
         t0, h0 = task(0)
@@ -365,6 +433,14 @@ def moe_wide_defs(k4ctx):
         ):
             rows_to_lds(tid, base_w, tokens, n_row, xs + lds_w, lds_row)
         gpu.barrier()
+        if const_expr(SH_FIRST):  # noqa: SIM102
+            if has_s:
+                # the second half's tiles follow the first's MFMAs
+                cg0, cu0 = wug_mma(sh_cur[0], sh_cur[1], 0, True)
+                sh_nxt = wsh_load(2 * jsh + 1, has_s)
+                y_lo = wug_reduce(cg0, cu0)
+                y_hi = wug_y(sh_nxt[0], sh_nxt[1], 1, True)
+                wug_publish(n_routed * UG_PAIRS + jsh, y_lo, y_hi)
         y_lo = fx.Float32(0.0)  # the pair's first half, until the second's
         for it in range_constexpr(UGW_ITERS):
             t, has_t = task(it)
@@ -382,6 +458,19 @@ def moe_wide_defs(k4ctx):
                     wug_publish(t // 2, y_lo, y)
             if const_expr(it + 1 < UGW_ITERS):
                 cur = nxt
+        if const_expr(SH8 and not SH_FIRST):
+            # the shared expert's pair j (task pair n_routed * UG_PAIRS + j of the
+            # step's numbering) on CTA SH_HOST0 + j: both halves' tiles in flight
+            # before the first GEMV, the pair's flag after the second
+            jsh = fx.Int32(bid) - SH_HOST0
+            has_s = jsh >= 0
+            jsh = fx.min(jsh, UG_PAIRS - 1)
+            sh_cur = wsh_load(2 * jsh, has_s)
+            sh_nxt = wsh_load(2 * jsh + 1, has_s)
+            if has_s:
+                y_lo = wug_y(sh_cur[0], sh_cur[1], 0, True)
+                y_hi = wug_y(sh_nxt[0], sh_nxt[1], 1, True)
+                wug_publish(n_routed * UG_PAIRS + jsh, y_lo, y_hi)
         stamp(8)
         if has_dn:
             wide_down(td)
@@ -394,24 +483,31 @@ def moe_wide_defs(k4ctx):
         there), route-weighted per column -> ffn_finish."""
         nu = uniform(fx.ptr_load(uexp + (U_MAX + 1)))
         rg_d = td * 2 + wave // 4
-        # wave q of the row group takes chunks q and q + 4 of every expert, unit i
-        # being expert i // 2 for all 4: which wave adds a chunk, and in what
-        # order, follows from the expert alone, not its rank in the step's union,
-        # so another row's experts cannot regroup this row's sums
-        q = wave % 4
+        # wave q of the row group takes chunks q and q + 4 of every expert (units
+        # 2 e, 2 e + 1; only chunk q where q + 4 is past the last: unit e): which wave
+        # adds a chunk, and in what order, follows from the expert alone, not its
+        # rank in the step's union, so another row's experts cannot regroup this
+        # row's sums
+        q = uniform(wave % 4)
 
         def unit_load(i):
             """(weights, scale, unit) of this wave's i-th (expert, 128-k chunk)
             unit, zero-sized reads past the last."""
-            dkc = q + 4 * (i % 2)
-            ok = (dkc < DN_KC) & (fx.Int32(i // 2) <= nu)
+            # waves with one chunk an expert (q >= DN_KC - 4) take one expert a unit,
+            # not every other unit empty: all their units' weights are real loads
+            # in flight, their sums unchanged (the same units in the same order)
+            one = q >= DN_KC - 4
+            e_i = one.select(fx.Int32(i), fx.Int32(i // 2))
+            dkc = one.select(q, q + 4 * (i % 2))
+            ok = e_i < nu if SH8 else e_i <= nu
             # clamped into the table: a unit past the last reads a real or zero
             # row, never past urow (a garbage row is garbage B, and 0 * NaN)
-            du = fx.Int32(min(i // 2, U_MAX - 1))
+            du = fx.min(e_i, U_MAX - 1)
             dkc = fx.min(dkc, DN_KC - 1)
             de = fx.min(uniform(fx.ptr_load(uexp + du)), SHARED_EXPERT)
             dwv = fp4_tile_load(
-                rsrc(
+                wrsrc(
+                    "moed",
                     w2 + fx.Int64(de) * W2_BYTES,
                     ok.select(fx.Int32(W2_BYTES), fx.Int32(0)),
                 ),
@@ -422,7 +518,7 @@ def moe_wide_defs(k4ctx):
                 lane * 4,
             )
             dsc = e8m0_load(
-                rsrc(s2, ok.select(fx.Int32(S2_BYTES), fx.Int32(0))),
+                wrsrc("moed", s2, ok.select(fx.Int32(S2_BYTES), fx.Int32(0))),
                 group_scale_byte(de, HIDDEN, rg_d, dkc, W2_SCALE_COLS),
             )
             return dwv, dsc, du, dkc, ok
@@ -435,10 +531,30 @@ def moe_wide_defs(k4ctx):
             dw = ok.select(fx.ptr_load(uwt + (du * 16 + l16)), fx.Float32(0.0))
             return dwv, dsc, drow, dkc, dw, ok
 
+        if const_expr(SH8):
+            # the shared expert's two units of this wave (chunks q, q + 4: MXFP8
+            # tiles), their weights in flight with the pipeline's
+            sh_units = []
+            for h in range_constexpr(2):
+                skc = q + 4 * h
+                sok = skc < DN_KC
+                skc = fx.min(skc, DN_KC - 1)
+                srow = rg_d * 16 + l16
+                sr_w = wrsrc("shd", w2s, sok.select(fx.Int32(W2S_BYTES), fx.Int32(0)))
+                sr_s = wrsrc("shd", s2s, sok.select(fx.Int32(S2S_BYTES), fx.Int32(0)))
+                sh_units.append(
+                    (
+                        fp8_tile_load(sr_w, srow, INTER, skc),
+                        fp8_scale_load(sr_s, srow, INTER, skc),
+                        skc,
+                        sok,
+                    )
+                )
         # software pipeline: the first units' weights go out before the mids are
         # in; unit i + DN_DEPTH's before unit i's MFMA
         acc = [fx.Float32(0.0) for _ in range(4)]
         inflight = [unit_load(i) for i in range(min(DN_DEPTH, DN_WITERS))]
+        ahead = []  # the next units, their rows read (the rest of the pipeline is raw)
         # every up / gate task pair's flag, then the MXFP8 mid rows and their
         # scales, the pool's layout (plain words, 16 B a load)
         n_ug = (nu + 1) * UG_PAIRS
@@ -463,10 +579,13 @@ def moe_wide_defs(k4ctx):
         stamp(10)
         for i in range_constexpr(DN_WITERS):
             if const_expr(i == 0):  # the tables are in: the early units' rows
-                inflight = [with_rows(u) for u in inflight]
-            dwv, dsc, drow, dkc, dw, ok = inflight.pop(0)
+                ahead = [with_rows(u) for u in inflight[:DN_ROWS_AHEAD]]
+                inflight = inflight[DN_ROWS_AHEAD:]
+            dwv, dsc, drow, dkc, dw, ok = ahead.pop(0)
             if const_expr(i + DN_DEPTH < DN_WITERS):
-                inflight.append(with_rows(unit_load(i + DN_DEPTH)))
+                inflight.append(unit_load(i + DN_DEPTH))
+            if const_expr(len(inflight) > 0):
+                ahead.append(with_rows(inflight.pop(0)))
             dcu = mfma_scaled(
                 a=dwv,
                 sa=dsc,
@@ -478,6 +597,22 @@ def moe_wide_defs(k4ctx):
             # a unit past the last (or a wave's missing second chunk) adds
             # nothing, whatever its MFMA gave
             acc = [acc[e] + ok.select(dcu[e] * dw, fx.Float32(0.0)) for e in range(4)]
+        if const_expr(SH8):
+            # the shared expert's units: its mid rows are the table's entry nu
+            srow_b = fx.Int32(fx.ptr_load(urow + (nu * 16 + l16)))
+            sw = fx.ptr_load(uwt + (nu * 16 + l16))
+            for swv, ssc, skc, sok in sh_units:
+                scu = mfma_scaled(
+                    a=swv,
+                    sa=ssc,
+                    b=lds_b8(srow_b * MID_ROW + skc * 32),
+                    sb=lds_i32(W_MIDSC + srow_b * MIDSC_ROW + skc * 4 + g4),
+                    c=fx.Vector.filled(4, 0.0, fx.Float32),
+                    a_fmt=FP8,
+                )
+                acc = [
+                    acc[e] + sok.select(scu[e] * sw, fx.Float32(0.0)) for e in range(4)
+                ]
         a0, a1, a2, a3 = acc
         fx.ptr_store(
             fx.Vector.from_elements([a0, a1, a2, a3], fx.Float32),
@@ -498,6 +633,8 @@ def moe_wide_defs(k4ctx):
         "build_experts": build_experts,
         "wug_load": wug_load,
         "wug_y": wug_y,
+        "wug_mma": wug_mma,
+        "wug_reduce": wug_reduce,
         "fp8_lanes4": fp8_lanes4,
         "wug_publish": wug_publish,
         "down_tables": down_tables,
