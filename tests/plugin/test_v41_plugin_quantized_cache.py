@@ -197,3 +197,29 @@ def test_offload_registration_rejects_incomplete_storage(
         message = "arena does not balance"
     with pytest.raises(ValueError, match=message):
         register()
+
+
+def test_checkpoint_adapter_exposes_all_state_segments(bound_cache):
+    cache, _, _, _ = bound_cache
+    geo = cache.geometry
+    spec = SimpleNamespace(
+        page_unit_bytes=geo.paged_bytes,
+        slot_bytes=geo.state_bytes,
+        image_bytes=geo.checkpoint_image_bytes,
+        layout_id=geo.layout_id,
+        units_per_checkpoint=-(-geo.checkpoint_image_bytes // geo.paged_bytes),
+    )
+    copier_type = _load(
+        PLUGIN / "deepseek_v41_state_checkpoint.py", ["_PluginV41StateCopier"]
+    )._PluginV41StateCopier
+    copier = copier_type(cache, spec, cache.num_slots)
+    views = copier.state_entry_views(1)
+    assert [v.data_ptr() for v in views] == [v.data_ptr() for v in cache.state_views(1)]
+    assert sum(v.numel() * v.element_size() for v in views) == geo.state_bytes
+    # An offload restore must write every segment of this slot and no other slot.
+    untouched = [v.clone() for v in cache.state_views(0)]
+    for view in views:
+        view.fill_(29)
+    assert all((v == 29).all() for v in cache.state_views(1))
+    for actual, before in zip(cache.state_views(0), untouched):
+        torch.testing.assert_close(actual, before, rtol=0, atol=0)

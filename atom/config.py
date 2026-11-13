@@ -3052,10 +3052,13 @@ class Config:
             return
         from atom.utils.selector import Family, attn_family
 
+        if _is_minimax_m3_config(self.hf_config):
+            # MiniMax's model-specific restrictions are checked later in startup.
+            return
         if attn_family(self.hf_config) is not Family.CSA2:
             raise ValueError(
-                "--kv_cache_dtype=fp4 is only supported by the DeepSeek-V4.1 "
-                "(CSA2) attention backend; use bf16 or fp8 for this model."
+                "--kv_cache_dtype=fp4 is only supported by MiniMax-M3.1 and "
+                "DeepSeek-V4.1 (CSA2); use bf16 or fp8 for this model."
             )
         from atom.models.deepseek_v41.kv_cache_policy import warn_fp4_performance
 

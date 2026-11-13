@@ -33,6 +33,12 @@ def calibration_identity(config, device):
     # still match.
     if draft_dtype != config.kv_cache_dtype:
         identity["draft_kv_cache_dtype"] = draft_dtype
+    if config.hf_config.model_type == "deepseek_v41_text":
+        # V4.1's draft attention precision is independent of the target KV pool.
+        # Older profiles did not record it and cannot be matched safely.
+        identity["draft_attention_dtype"] = (
+            "fp8" if config.dspark.draft_kv_dtype == "fp8" else "bf16"
+        )
     return identity
 
 

@@ -67,6 +67,7 @@ def identity_of(tmp_path, monkeypatch, **kw):
 
 def test_mxfp4_kv_does_not_share_an_fp8_identity(tmp_path, monkeypatch):
     fp8 = identity_of(tmp_path, monkeypatch)
+    assert "draft_attention_dtype" not in fp8
     kv_mx = identity_of(tmp_path, monkeypatch, kv_cache_dtype="fp4")
     index_mx = identity_of(tmp_path, monkeypatch, index_cache_dtype="fp4")
     assert len({str(fp8), str(kv_mx), str(index_mx)}) == 3
@@ -74,3 +75,35 @@ def test_mxfp4_kv_does_not_share_an_fp8_identity(tmp_path, monkeypatch):
     data = {**profile(), "identity": fp8}
     with pytest.raises(ValueError):
         validate_calibration(data, kv_mx, width=5, max_batch=4)
+
+
+@pytest.mark.parametrize("target_dtype", ["fp8", "fp4"])
+def test_v41_calibration_requires_matching_draft_precision(
+    tmp_path, monkeypatch, target_dtype
+):
+    def identity(draft_dtype):
+        return identity_of(
+            tmp_path,
+            monkeypatch,
+            hf_config=SimpleNamespace(model_type="deepseek_v41_text"),
+            kv_cache_dtype=target_dtype,
+            speculative_config=SimpleNamespace(draft_kv_dtype=target_dtype),
+            dspark=SimpleNamespace(draft_kv_dtype=draft_dtype),
+        )
+
+    bf16, fp8 = identity("auto"), identity("fp8")
+    assert bf16["draft_attention_dtype"] == "bf16"
+    assert fp8["draft_attention_dtype"] == "fp8"
+    legacy = {k: v for k, v in bf16.items() if k != "draft_attention_dtype"}
+    for current, other in ((bf16, fp8), (fp8, bf16)):
+        validate_calibration(
+            {**profile(), "identity": current}, current, width=5, max_batch=4
+        )
+        for incompatible in (other, legacy):
+            with pytest.raises(ValueError, match="model/hardware/runtime"):
+                validate_calibration(
+                    {**profile(), "identity": incompatible},
+                    current,
+                    width=5,
+                    max_batch=4,
+                )
