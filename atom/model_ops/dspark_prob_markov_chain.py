@@ -20,11 +20,8 @@ import triton
 import triton.language as tl
 
 from atom.model_ops import dspark_markov_stage1 as _markov_stage1
-from atom.model_ops.dspark_prob_sample import (
-    _NO_HIT,
-    _draft_row_temps,
-    _sampled_tile_argmax,
-)
+from atom.model_ops.dspark_prob_sample import _draft_row_temps, _sampled_tile_argmax
+from atom.model_ops.tile_argmax import NO_HIT
 
 _BLOCK_K = _markov_stage1.BLOCK_K
 
@@ -141,7 +138,7 @@ def _prob_markov_chain_stage1(
         # exists. Such a tile has no valid argmax index and contributes no
         # key; neither do a tile past the vocabulary and its padded lanes.
         key = _pack_key(tile_max, tile_idx + vocab_offset)
-        best = tl.maximum(best, tl.where(tile_idx != _NO_HIT, key, 0))
+        best = tl.maximum(best, tl.where(tile_idx != NO_HIT, key, 0))
     # The next launch on this stream sees the completed reduction. No CTA
     # spins or attempts a device-wide barrier inside this kernel. An empty
     # row retains zero and decodes to safe id 0.
