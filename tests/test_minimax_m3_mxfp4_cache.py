@@ -38,11 +38,11 @@ def sparse_hf(layers=4, freq=None, **sparse):
     }
 
 
-def _m3(monkeypatch, *, hf=None, **overrides):
+def _m3(monkeypatch, *, hf=None, architectures=M3, **overrides):
     """A real `Config` for a MiniMax-M3 checkpoint, HF config, quantization and chip
     probe (gfx950) stubbed."""
     hf_config = PretrainedConfig(
-        architectures=M3, max_position_embeddings=8192, **(hf or {})
+        architectures=architectures, max_position_embeddings=8192, **(hf or {})
     )
     patch = monkeypatch.setattr
     patch(config_module, "get_hf_config", lambda _m, trust_remote_code=False: hf_config)

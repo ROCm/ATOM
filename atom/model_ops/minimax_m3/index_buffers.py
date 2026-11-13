@@ -9,6 +9,7 @@ from dataclasses import dataclass, replace
 
 import torch
 
+from atom.config import FP4_CACHE_DTYPES
 from atom.model_ops.minimax_m3.geometry import SPARSE_BLOCK_SIZE
 from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace
 
@@ -34,8 +35,8 @@ def allocate_index_scorers(
     config, device, *, max_bs: int, max_qlen: int, num_idx_heads: int
 ) -> dict[str, IndexScoreBuffers]:
     """The builder's records by ubatch prefix (``""`` the whole step, ``ub<i>_`` a decode
-    micro-batch); empty unless the index cache is MXFP4, so ``"" in`` the result is the
-    switch for "this model runs the MXFP4 index scorer".
+    micro-batch); empty unless the index cache is MXFP4 or NVFP4, so ``"" in`` the result is the
+    switch for "this model runs the FP4 index scorer".
 
     The scorer's grid is its work map's row count, so the block bound is the model
     length's and the map buffer is capacity (the exact grid is not monotonic in the
@@ -50,7 +51,7 @@ def allocate_index_scorers(
     q == 1 for its map; `cut_decode_ubatches` cuts ``max_bs`` requests at
     ``max_bs // 2``.
     """
-    if config.index_cache_dtype != "fp4":
+    if config.index_cache_dtype not in FP4_CACHE_DTYPES:
         return {}
     # once, at construction: this module must stay importable without aiter
     from aiter.ops.flydsl import minimax_m3_index_score_work_map_capacity
