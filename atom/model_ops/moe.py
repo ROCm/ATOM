@@ -4056,9 +4056,8 @@ class FusedMoE(torch.nn.Module):
                 old_w13_scale[start:end] if old_w13_scale is not None else None
             )
             w13_q, w13_s = _quantize(source_w13, source_w13_scale, _trim_w13)
-            source_w13_rows = min(source_w13.shape[1], 2 * inter)
-            source_half_rows = source_w13_rows // 2
-            w13_q = w13_q.reshape(count, source_w13_rows, w13_q.shape[1])
+            w13_q = w13_q.reshape(count, -1, w13_q.shape[1])
+            source_half_rows = w13_q.shape[1] // 2
             w13_s = _reshape_scale(w13_s, count)
 
             target_w13 = self.w13_weight.data[start:end]
