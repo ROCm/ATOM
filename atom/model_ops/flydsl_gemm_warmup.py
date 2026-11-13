@@ -17,6 +17,8 @@ from collections.abc import Callable
 import torch
 from torch import nn
 
+from atom.utils import envs
+
 logger = logging.getLogger("atom")
 
 _BLOCK = 128
@@ -61,7 +63,8 @@ def pretrace_mxscale_gemms(model: nn.Module, max_m: int, label: str = "") -> Non
         from aiter.ops.gemm_op_a8w8 import get_mxscale_bpreshuffle_config
     except ImportError:
         return
-    if get_gfx() != "gfx950":
+    # Without the preshuffled weights these layers take another GEMM.
+    if get_gfx() != "gfx950" or not envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE:
         return
     shapes = mxscale_gemm_shapes(model)
     if not shapes:
