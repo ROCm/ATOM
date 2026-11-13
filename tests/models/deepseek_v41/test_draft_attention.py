@@ -177,7 +177,7 @@ def test_draft_src_buffers_refuse_what_they_were_not_sized_for(two_source):
         draft_src_indices(
             torch.zeros(3, dtype=torch.long, device="cuda"), 8, 4, 5, buffers
         )
-    with pytest.raises(ValueError, match="max_num_seqs"):
+    with pytest.raises(ValueError, match="block width"):
         draft_src_indices(
             torch.zeros(2, dtype=torch.long, device="cuda"), 8, 4, 6, buffers
         )

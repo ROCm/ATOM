@@ -27,9 +27,8 @@ def draft_attention(query, context_kv, draft_kv, sink, step, scale):
     With `step.src_indices` (`draft_src_indices`), the window and the block
     are the two sources of `sparse_attn_v4_paged_2src`, the sparse kernel the
     target's BF16 path uses: it reads both where they lie, so there is no
-    concatenated copy. It launches one program per row and 16-head tile, the
-    same grid as the concatenating path. Without `step.src_indices`, joins the
-    two by concatenating. Neither touches `context_kv`.
+    concatenated copy. Without `step.src_indices`, joins the two by
+    concatenating. Neither touches `context_kv`.
     """
     src = step.src_indices
     if src is None:
