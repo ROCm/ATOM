@@ -107,6 +107,11 @@ class MoRIIOConnector(KVConnectorBase):
 
     use_fabric = False
     _transfer_stats = False
+    _write_service_thread: threading.Thread | None = None
+    # How long the write service sleeps between polls while a push is waiting
+    # or in flight, and at most between passes while idle.
+    _WRITE_POLL_S = 50e-6
+    _WRITE_IDLE_WAIT_S = 0.1
 
     def __init__(self, config: Config) -> None:
         self.tp_rank = get_tp_group().rank_in_group
@@ -247,9 +252,12 @@ class MoRIIOConnector(KVConnectorBase):
         self._failed_before_read: set[ReqId] = set()
 
         # Serial WRITE mode, producer side. The listener thread only queues
-        # requests; the worker thread, which owns every RDMA call, drains them,
-        # waits out each consumer's handshake, and tracks the writes in flight.
+        # requests; the write service thread (or, without it, the worker
+        # thread), which owns every transfer call, drains them, waits out each
+        # consumer's handshake, and tracks the writes in flight.
         self._write_requests: queue.Queue[dict[str, Any]] = queue.Queue()
+        self._write_wakeup = threading.Event()
+        self._write_service_stop = threading.Event()
         self._pending_writes: list[tuple[dict[str, Any], float]] = []
         self._write_handshakes: dict[EngineId, Future[set[str]]] = {}
         self._sending_writes: dict[int, tuple[list[Any], dict[str, Any]]] = {}
@@ -258,6 +266,17 @@ class MoRIIOConnector(KVConnectorBase):
         # second ask for the same transfer must not push again.
         self._write_ids: dict[int, float | None] = {}
         self._finished_writes: deque[tuple[float, int]] = deque()
+        # When each finished prefill's KV writes are done on the GPU, recorded
+        # by the runner after the forward. A push must not read its source
+        # blocks before then.
+        self._kv_ready_events: dict[int, Any] = {}
+        self._kv_ready_batches: deque[tuple[float, Any, list[int]]] = deque()
+        self._kv_ready_lock = threading.Lock()
+        # Consumer: this step's write requests and an event after every forward
+        # already queued. One of those may still be writing a block the
+        # scheduler has just freed and handed to one of these requests, so the
+        # producer is asked to push only once the event has completed.
+        self._gated_writes: deque[tuple[Any, list[tuple[ReqId, ReqMeta]]]] = deque()
 
         # Serial WRITE mode, consumer side: requests waiting on the producer's
         # report with the push deadline each one sent, and the reports the
@@ -543,6 +562,49 @@ class MoRIIOConnector(KVConnectorBase):
             name="moriio-handshake-listener",
         )
         self._handshake_listener_thread.start()
+        if (
+            self.is_producer
+            and self.transfer_mode == "write"
+            and envs.ATOM_MORIIO_WRITE_THREAD
+        ):
+            self._start_write_service()
+
+    def _start_write_service(self) -> None:
+        import torch
+
+        device = torch.cuda.current_device() if torch.cuda.is_available() else None
+        self._write_service_thread = threading.Thread(
+            target=self._write_service_loop,
+            args=(device,),
+            daemon=True,
+            name="moriio-write-service",
+        )
+        self._write_service_thread.start()
+
+    def _write_service_loop(self, device: int | None) -> None:
+        """Serve pushes on their own thread instead of from ``get_finished``.
+
+        A push starts as soon as its WRITE_REQ is queued and is reported as
+        soon as it lands, rather than at the next engine step that reaches
+        ``get_finished`` through the worker RPC. The consumer's blocks are
+        released from here too, so this thread is the producer's only sender.
+        """
+        if device is not None:
+            import torch
+
+            torch.cuda.set_device(device)
+        while not self._write_service_stop.is_set():
+            if not (self._pending_writes or self._sending_writes):
+                self._write_wakeup.wait(self._WRITE_IDLE_WAIT_S)
+            # Cleared before the pass, so a request queued during it is
+            # served by the next one rather than waiting out the idle timeout.
+            self._write_wakeup.clear()
+            try:
+                self._service_write_requests()
+            except Exception:
+                logger.exception("MoRIIO write service: a pass failed")
+            if self._pending_writes or self._sending_writes:
+                time.sleep(self._WRITE_POLL_S)
 
     def _register_state(self, layer_name: str, kv_cache: Any) -> None:
         """Register one layer's per-request state, one slot per dim-0 row.
@@ -627,8 +689,13 @@ class MoRIIOConnector(KVConnectorBase):
         self.request_id_to_transfer_id = metadata.request_id_to_transfer_id
 
         if self.transfer_mode == "write":
-            for req_id, meta in metadata.reqs_to_recv.items():
-                self._request_write(req_id, meta)
+            if metadata.reqs_to_recv:
+                import torch
+
+                event = torch.cuda.Event()
+                event.record(torch.cuda.current_stream())
+                self._gated_writes.append((event, list(metadata.reqs_to_recv.items())))
+                self._request_gated_writes()
             return
 
         for req_id, meta in metadata.reqs_to_recv.items():
@@ -765,6 +832,51 @@ class MoRIIOConnector(KVConnectorBase):
                 req_id,
                 meta.src_block_skip_factor,
             )
+            return True
+        return False
+
+    def _request_gated_writes(self) -> None:
+        """Ask for the pushes whose step's earlier forwards have finished."""
+        while self._gated_writes and self._gated_writes[0][0].query():
+            _, reqs = self._gated_writes.popleft()
+            for req_id, meta in reqs:
+                self._request_write(req_id, meta)
+
+    def record_kv_cache_ready(self, req_ids: list[ReqId]) -> None:
+        """Record when this prefill batch's KV writes are done on the GPU."""
+        if not (self.is_producer and self.transfer_mode == "write") or not req_ids:
+            return
+        import torch
+
+        event = torch.cuda.Event()
+        event.record(torch.cuda.current_stream())
+        now = time.monotonic()
+        ids = [int(req_id) for req_id in req_ids]
+        # Past the write timeout and the hold no push for it can start, and
+        # long before that its forward has finished.
+        cutoff = now - self._write_timeout_s - envs.ATOM_PD_FAILED_WRITE_HOLD_S
+        with self._kv_ready_lock:
+            for transfer_id in ids:
+                self._kv_ready_events[transfer_id] = event
+            self._kv_ready_batches.append((now, event, ids))
+            while self._kv_ready_batches and self._kv_ready_batches[0][0] < cutoff:
+                _, old, old_ids = self._kv_ready_batches.popleft()
+                for transfer_id in old_ids:
+                    if self._kv_ready_events.get(transfer_id) is old:
+                        del self._kv_ready_events[transfer_id]
+
+    def _source_ready(self, transfer_id: int) -> bool:
+        """Whether the prefill that wrote this transfer's source has finished.
+
+        No event means none was recorded, or it aged out long after its
+        forward finished.
+        """
+        with self._kv_ready_lock:
+            event = self._kv_ready_events.get(transfer_id)
+        if event is None or event.query():
+            with self._kv_ready_lock:
+                if self._kv_ready_events.get(transfer_id) is event:
+                    self._kv_ready_events.pop(transfer_id, None)
             return True
         return False
 
@@ -1176,15 +1288,24 @@ class MoRIIOConnector(KVConnectorBase):
             return
         landed = page_digest(self._page_views, dst)
         if landed != source:
+            import torch
+
+            # Read again once the device is idle: a match then means the push
+            # landed but was not yet visible here, not that it moved the
+            # wrong bytes.
+            torch.cuda.synchronize()
+            time.sleep(0.05)
+            again = page_digest(self._page_views, dst)
             logger.error(
                 "[moriio-verify] req %s: the %d PAGE regions of %d blocks differ "
-                "from the producer's (digest %d, producer %d) -- decode will "
-                "attend over KV that is not the prompt's",
+                "from the producer's (digest %d, producer %d, 50 ms later %s) "
+                "-- decode will attend over KV that is not the prompt's",
                 req_id,
                 len(self._page_regions),
                 len(dst),
                 landed,
                 source,
+                "matches" if again == source else f"still differs ({again})",
             )
         else:
             logger.info(
@@ -1632,9 +1753,10 @@ class MoRIIOConnector(KVConnectorBase):
     def _service_write_requests(self) -> None:
         """Start queued pushes and report the ones that have finished.
 
-        Runs on the worker thread from ``get_finished``, which the engine keeps
-        calling while finished prefills hold deferred blocks, so a request is
-        served even when no batch is running.
+        Runs on the write service thread, or without it on the worker thread
+        from ``get_finished``, which the engine keeps calling while finished
+        prefills hold deferred blocks, so a request is served even when no
+        batch is running.
         """
         while True:
             try:
@@ -1671,6 +1793,9 @@ class MoRIIOConnector(KVConnectorBase):
                 continue
             if not ready:
                 self._finish_write(request, ok=False)
+                continue
+            if not self._source_ready(int(request["transfer_id"])):
+                waiting.append((request, queued_at))
                 continue
             try:
                 statuses = self._write_blocks(request, self._write_engine_id(request))
@@ -1965,11 +2090,12 @@ class MoRIIOConnector(KVConnectorBase):
                 # A bad write frame is logged and dropped rather than raised:
                 # this thread also serves every other peer's handshake.
                 elif msg == MoRIIOConstants.WRITE_REQ:
-                    # Only queued; the worker thread owns the RDMA engine.
+                    # Only queued; the write service owns the transfer engine.
                     try:
                         self._write_requests.put(msgpack.loads(parts[2]))
                     except Exception:
                         logger.exception("Dropping undecodable WRITE_REQ")
+                    self._write_wakeup.set()
 
                 elif msg == MoRIIOConstants.WRITE_DONE:
                     try:
@@ -2227,8 +2353,11 @@ class MoRIIOConnector(KVConnectorBase):
         if self.is_producer:
             # Before done_sending is read below, so a push that finishes this
             # step releases its blocks this step.
-            self._service_write_requests()
+            if self._write_service_thread is None:
+                self._service_write_requests()
         else:
+            if self._gated_writes:
+                self._request_gated_writes()
             self._issue_ready_reads()
         done_recving, failed_reads = self._pop_done_transfers()
         for req_id in failed_reads:

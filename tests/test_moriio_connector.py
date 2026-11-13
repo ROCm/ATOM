@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import ast
 import os
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -501,6 +503,19 @@ class ConnectorBehaviourTest(unittest.TestCase):
         self.assertIn("the producer sent no state digest", logs.output[0])
 
 
+class FakeEvent:
+    """Stands in for torch.cuda.Event; ``done`` is flipped by the test."""
+
+    def __init__(self, *args, **kwargs):
+        self.done = False
+
+    def record(self, stream=None):
+        pass
+
+    def query(self):
+        return self.done
+
+
 class FakeStatus:
     """Stands in for mori's TransferStatus; ``state`` is flipped by the test."""
 
@@ -577,6 +592,8 @@ class WritePathTest(unittest.TestCase):
             for name in names
         }
         conn._write_requests = queue.Queue()
+        conn._write_wakeup = threading.Event()
+        conn._write_service_stop = threading.Event()
         conn._pending_writes = []
         conn._write_handshakes = {}
         conn._sending_writes = {}
@@ -601,6 +618,10 @@ class WritePathTest(unittest.TestCase):
         conn._done_sending_lock = threading.Lock()
         conn._write_ids = {}
         conn._finished_writes = collections.deque()
+        conn._kv_ready_events = {}
+        conn._kv_ready_batches = collections.deque()
+        conn._kv_ready_lock = threading.Lock()
+        conn._gated_writes = collections.deque()
         conn._state_tensors = {}
         conn._num_state_slots = 0
         conn._built_state_sessions = {}
@@ -710,6 +731,7 @@ class WritePathTest(unittest.TestCase):
         conn.side_channel_port = 7401
         advertised = []
         conn._handshake_listener = lambda metadata, *_rest: advertised.append(metadata)
+        conn._start_write_service = lambda: None
         conn.register_kv_caches(kv_caches)
         conn._handshake_listener_thread.join(timeout=5)
         return advertised[0]
@@ -814,6 +836,96 @@ class WritePathTest(unittest.TestCase):
                 ]
             ),
         )
+
+    def wait_for(self, predicate, timeout=5.0):
+        deadline = time.monotonic() + timeout
+        while not predicate():
+            if time.monotonic() > deadline:
+                self.fail("timed out")
+            time.sleep(0.001)
+
+    def test_the_write_service_pushes_and_reports_without_an_engine_step(self):
+        conn = self.make(producer=True)
+        statuses = [FakeStatus()]
+        conn._write_target_ready = lambda request: True
+        conn._write_blocks = lambda request, engine_id: statuses
+        conn._start_write_service()
+        try:
+            conn._write_requests.put(self.push_request())
+            conn._write_wakeup.set()
+            self.wait_for(lambda: 9 in conn._sending_writes)
+            self.assertEqual(conn.sent, [])
+            statuses[0].state = "ok"
+            self.wait_for(lambda: conn.sent)
+            self.assertEqual(conn.done_sending, {9})
+            self.assertEqual(conn.sent[0][0][0], self.constants.WRITE_DONE)
+        finally:
+            conn._write_service_stop.set()
+            conn._write_wakeup.set()
+            conn._write_service_thread.join(timeout=5)
+        self.assertFalse(conn._write_service_thread.is_alive())
+
+    def test_a_push_waits_for_its_prefill_to_finish_on_the_gpu(self):
+        conn = self.make(producer=True)
+        statuses = [FakeStatus()]
+        conn._write_target_ready = lambda request: True
+        conn._write_blocks = lambda request, engine_id: statuses
+        event = FakeEvent()
+        conn._kv_ready_events[9] = event
+        conn._write_requests.put(self.push_request())
+
+        conn._service_write_requests()
+        self.assertEqual(conn._sending_writes, {})
+        self.assertEqual(len(conn._pending_writes), 1)
+
+        event.done = True
+        conn._service_write_requests()
+        self.assertIn(9, conn._sending_writes)
+        self.assertEqual(conn._kv_ready_events, {})
+
+    def test_a_push_without_a_ready_event_starts_and_old_events_expire(self):
+        conn = self.make(producer=True)
+        conn._write_target_ready = lambda request: True
+        conn._write_blocks = lambda request, engine_id: [FakeStatus()]
+        conn._write_requests.put(self.push_request())
+        conn._service_write_requests()
+        self.assertIn(9, conn._sending_writes)
+
+        stale, kept = FakeEvent(), FakeEvent()
+        conn._kv_ready_events = {1: stale, 2: kept}
+        conn._kv_ready_batches.append((time.monotonic() - 1e6, stale, [1, 2]))
+        with mock.patch("torch.cuda.Event", FakeEvent), mock.patch(
+            "torch.cuda.current_stream", lambda: None
+        ):
+            conn.record_kv_cache_ready([2, 3])
+        self.assertNotIn(1, conn._kv_ready_events)
+        # Re-recorded since, so the stale batch must not drop it.
+        self.assertIs(conn._kv_ready_events[2], conn._kv_ready_events[3])
+
+    def test_the_consumer_asks_for_a_push_once_earlier_forwards_finished(self):
+        conn = self.make(producer=False)
+        asked = []
+        conn._request_write = lambda req_id, meta: asked.append(req_id)
+        first, second = FakeEvent(), FakeEvent()
+        conn._gated_writes.append((first, [("d1", None), ("d2", None)]))
+        conn._gated_writes.append((second, [("d3", None)]))
+
+        conn._request_gated_writes()
+        self.assertEqual(asked, [])
+        second.done = True
+        conn._request_gated_writes()
+        # In order: a later step's requests wait behind an earlier step's.
+        self.assertEqual(asked, [])
+        first.done = True
+        conn._request_gated_writes()
+        self.assertEqual(asked, ["d1", "d2", "d3"])
+        self.assertFalse(conn._gated_writes)
+
+    def test_get_finished_leaves_pushes_to_the_write_service(self):
+        conn = self.make(producer=True)
+        conn._write_service_thread = threading.current_thread()
+        conn._service_write_requests = lambda: self.fail("served from the step")
+        conn.get_finished()
 
     def test_the_producer_refuses_a_short_source(self):
         conn = self.make(producer=True)
