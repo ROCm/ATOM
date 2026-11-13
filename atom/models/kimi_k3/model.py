@@ -2150,8 +2150,19 @@ class KimiK3ForConditionalGeneration(KimiK3ForCausalLM):
         from atom.models.kimi_k3_vl import build_vision_modules
 
         self.vision_tower, self.mm_projector = build_vision_modules(vision_config)
-        self.media_placeholder_token_id = getattr(
-            atom_config.multimodal_config, "media_placeholder_token_id", 163605
+        from atom.models.kimi_k3.image_processing import (
+            load_kimi_k3_vision_pass_patches,
+            media_placeholder_token_id,
+        )
+
+        # Read by the shared runtime to encode a request's grids in bounded
+        # passes. Without a processor config, a budget of one patch puts each
+        # grid in a pass of its own.
+        self.vision_pass_patches = (
+            load_kimi_k3_vision_pass_patches(getattr(atom_config, "model", None)) or 1
+        )
+        self.media_placeholder_token_id = media_placeholder_token_id(
+            atom_config.multimodal_config
         )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -2162,7 +2173,7 @@ class KimiK3ForConditionalGeneration(KimiK3ForCausalLM):
     ) -> torch.Tensor:
         if not self.has_vision_tower:
             raise RuntimeError(
-                "Kimi-K3 image embeddings were requested on a pipeline rank "
+                "Kimi-K3 media embeddings were requested on a pipeline rank "
                 "that holds no vision tower; they belong on the first rank."
             )
         return self.mm_projector(self.vision_tower(pixel_values, grid_thw))
@@ -2177,7 +2188,7 @@ class KimiK3ForConditionalGeneration(KimiK3ForCausalLM):
         num_placeholders = int(mask.sum())
         if num_placeholders != vision_embeds.shape[0]:
             raise ValueError(
-                f"Kimi-K3 got {vision_embeds.shape[0]} image embeddings for "
+                f"Kimi-K3 got {vision_embeds.shape[0]} media embeddings for "
                 f"{num_placeholders} placeholder tokens. The prompt's "
                 "`<|media_pad|>` runs must be expanded to (h//2)*(w//2) tokens "
                 "per image, and an image prefill without embedding spans must "
