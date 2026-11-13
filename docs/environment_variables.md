@@ -133,6 +133,23 @@ cannot affect a server that does not use the feature.
 | **ATOM_DISABLE_VLLM_PLUGIN** | bool | 0 (false) | If set to `1`, disable the vLLM plugin registration entirely. |
 | **ATOM_V4_CG_INSTR_DIR** | str | — (off) | vLLM plugin, DeepSeek-V4 diagnostic: directory for per-process cudagraph dispatch counters (dispatched modes, steps whose uniform decode was overridden for a still-prefilling row, guard trips), one `cg_<pid>.json` per process, rewritten on every step. |
 
+## aiter kernel providers
+
+ATOM can enable out-of-tree AITER kernel Providers (the `aiter.plugin`
+interface stack). Enablement is opt-in and off by default: ATOM makes one
+`aiter.plugin.configure(source="atom <version>", enable=[...])` call per worker
+process before model loading/warm-up/CUDA-graph capture, and never raises when
+the interface or a provider is missing — the routed ops then run AITER's native
+path. `AITER_PLUGINS=0` is AITER's own kill switch (the only environment
+control; it can only turn routing off and records no decision), and ATOM does
+not manage that variable.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_AITER_PROVIDER_ENABLE** | str | unset (off) | Comma-separated AITER Provider names, in preference order; the operator/deployment override for `--aiter-provider-enable` / `Config.aiter_provider_enable`. Empty or unset means off (ATOM does not call `configure()`). A provider that does not serve an op, an API-version mismatch or a missing routed op falls back to native with a warning. |
+| **ATOM_ENABLE_A2A_GEMM** | bool | 0 (false) | Operator/deployment override for `--enable-a2a-gemm` / `Config.enable_a2a_gemm`: route the MiniMax-M3 SP4 attention tail (the pre-head-exchange FP8 send buffer + FP8 A8W8 `o_proj`) through the neutral `a2a_gemm_fused` v1 op, which folds the SP head exchange into the GEMM. The tail is one opaque fixed-schema custom op (`torch.ops.aiter.a2a_gemm_attend_project`), so it serves under **torch.compile** and **CUDA-graph capture/replay**: capture decisions and per-M provider pre-binds happen rank-uniformly in the eager capture-prep phase (address-stable send/scale/output cells; capture records an already-bound launch, replay repeats it), and every un-pre-bound/uncovered class is decided native on all ranks before capture. **The advertised fused mode is the captured decode graph**: a non-captured/eager forward stays on ATOM's native composition by default (the provider's per-new-M-class preparation is expensive in-model, so eager fusion is opt-in via `ATOM_A2A_GEMM_EAGER_FUSED`). Still requires `ATOM_AITER_PROVIDER_ENABLE` to name a provider that serves the op; the per-layer/deployment gate in `atom/model_ops/a2a_gemm.py` (gfx950, SP=4, TP=1, per-token FP8 `o_proj`, 16x16-preshuffled FP8 `[6144,8192]` weight, a covered M class) is authoritative. Coverage prefers the provider's cheap `covers(M)` predicate (arbitrary M 1..16384 through the frozen rule) and falls back to its 82+7 verified class table; the install-time rank vote agrees the provider's policy version (or the table when that is all it exposes). Every unsupported case keeps the native head-exchange + `o_proj` composition. Part of the compile cache key only when on. |
+| **ATOM_A2A_GEMM_EAGER_FUSED** | bool | 0 (false) | Opt-in for the **non-captured** fused tail (CUDA graphs are the default fused mode). Off means a non-captured/eager MiniMax-M3 forward -- notably prefill -- keeps ATOM's head-exchange + `o_proj`; this avoids the provider's collective SP4 bind on the first call of every new M class per layer, which otherwise turns P99 TTFT into minutes at large prefill widths. On routes the eager path too, with address-stable eager scratch (send/scale per class + shared out), so every call after the first is a provider binding hit (the first call per class still pays the bind). Requires `ATOM_ENABLE_A2A_GEMM=1` and a serving provider. |
+
 ## Kernel / backend selection
 
 | Variable | Type | Default | Description |

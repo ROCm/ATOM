@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import torch
 from transformers import AutoConfig, GenerationConfig, PretrainedConfig
 
+from atom.aiter_provider import normalize_provider_names
 from atom.model_engine.capabilities import pcp_group_size_of
 from atom.model_engine.prefill_delayer import PREFILL_ADMIT_POLICIES
 from atom.model_loader.weight_utils import (
@@ -2186,6 +2187,17 @@ class Config:
     # EngineArgs) and pickled into every worker. Read sites use `config.dspark.*`
     # (no os.environ lookups). Defaults to all-off.
     dspark: DSparkConfig = field(default_factory=DSparkConfig)
+    # Out-of-tree aiter kernel providers to enable, in preference order
+    # (aiter.plugin.configure(enable=...)). Empty = OFF and ATOM never calls
+    # configure(); this tuple is pickled into every spawned worker. Normalized
+    # in __post_init__ (ATOM_AITER_PROVIDER_ENABLE is the operator override).
+    aiter_provider_enable: tuple[str, ...] = ()
+    # Opt-in call site for the routed `a2a_gemm_fused` op: MiniMax-M3 SP4
+    # o_proj (SP head exchange + A8W8 o_proj as one aiter op). Default OFF keeps
+    # the existing composition byte-identical. Requires aiter_provider_enable to
+    # name a provider that serves the op; the per-layer/deployment matrix is
+    # checked in atom/model_ops/a2a_gemm.py before anything is bound.
+    enable_a2a_gemm: bool = False
 
     enable_tbo: bool = False
     enable_tbo_decode: bool = False
@@ -2447,6 +2459,17 @@ class Config:
             )
 
     def __post_init__(self):
+        # AITER provider enable list: programmatic tuple/CLI string, with the
+        # ATOM_AITER_PROVIDER_ENABLE deployment override read ONCE here (the env
+        # registry is lazy; workers receive the normalized tuple through spawn).
+        raw_providers = self.aiter_provider_enable or envs.ATOM_AITER_PROVIDER_ENABLE
+        self.aiter_provider_enable = normalize_provider_names(raw_providers)
+        # The routed-op call site is CLI-only, with a deployment override for
+        # runs whose launcher already owns the CLI.
+        if not self.enable_a2a_gemm:
+            self.enable_a2a_gemm = envs.ATOM_ENABLE_A2A_GEMM
+        if not isinstance(self.enable_a2a_gemm, bool):
+            raise TypeError("enable_a2a_gemm must be a bool")
         if self.sequence_parallel_size < 1:
             raise ValueError("sequence_parallel_size must be at least 1")
         self.moe_all2all_backend = (
@@ -3314,6 +3337,16 @@ class Config:
         # deploying it on top of a cache built with the other setting — reuses a
         # stale artifact and trips assert_size_stride at runtime.
         factors.append(bool(envs.ATOM_REPLICATE_VOCAB_EMBED))
+        # AITER provider enabling changes which kernel runs under an existing
+        # signature, and the `a2a_gemm` call site moves the MiniMax-M3 SP4 o_proj
+        # into one routed op with a different output composition. Both are
+        # graph-changing; key them only when on so the default OFF hash (and
+        # every existing compile-cache artifact) is unchanged.
+        provider_enable = tuple(getattr(self, "aiter_provider_enable", ()) or ())
+        if provider_enable:
+            factors.append(("aiter_providers", provider_enable))
+        if getattr(self, "enable_a2a_gemm", False):
+            factors.append("a2a_gemm_fused_v1")
         # ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4 decides whether the MoE calls
         # shared_experts() and how many experts it routes over (129 / top-5 vs
         # 128 / top-4), so it changes the compiled graph the same way.

@@ -7,6 +7,7 @@ import logging
 from dataclasses import dataclass, fields
 
 from atom import LLMEngine
+from atom.aiter_provider import normalize_provider_names
 from atom.config import (
     CompilationConfig,
     CUDAGraphMode,
@@ -185,6 +186,12 @@ class EngineArgs:
     online_quant_config: dict | None = None
     hf_overrides: dict | None = None
     dspark_config: dict | None = None
+    # Comma-separated aiter provider names, order = preference order. Parsed to
+    # the Config tuple in `_get_engine_kwargs()`; empty (default) = OFF.
+    aiter_provider_enable: str = ""
+    # Opt-in call site: route the MiniMax-M3 SP4 o_proj through the neutral
+    # aiter `a2a_gemm_fused` op. Unsupported layers/deployments keep native.
+    enable_a2a_gemm: bool = False
 
     eplb_enable: bool = False
     eplb_config: dict | None = None
@@ -879,6 +886,32 @@ class EngineArgs:
             ),
         )
 
+        provider_group = parser.add_argument_group("AITER kernel provider options")
+        provider_group.add_argument(
+            "--aiter-provider-enable",
+            type=str,
+            default="",
+            help=(
+                "Comma-separated aiter kernel Provider names to enable, in "
+                "preference order (aiter.plugin.configure(enable=...)). "
+                "Unset/empty (default) is OFF: ATOM never calls configure() and "
+                "every routed op runs native. A missing provider interface or a "
+                "provider error falls back to native with a warning; "
+                "AITER_PLUGINS=0 is aiter's own kill switch."
+            ),
+        )
+        provider_group.add_argument(
+            "--enable-a2a-gemm",
+            action="store_true",
+            help=(
+                "Call the neutral aiter `a2a_gemm_fused` routed op for the "
+                "MiniMax-M3 SP4 o_proj (SP head exchange + FP8 o_proj as one "
+                "op). Requires --aiter-provider-enable with a provider that "
+                "serves the op; every unsupported layer/deployment keeps the "
+                "current native composition, and the flag is OFF by default."
+            ),
+        )
+
         return parser
 
     @classmethod
@@ -976,6 +1009,11 @@ class EngineArgs:
         # --dcp-config (JSON dict) → DCPConfig object, passed through as
         # Config.dcp_config.
         kwargs["dcp_config"] = DCPConfig.from_dict(kwargs.pop("dcp_config"))
+        # --aiter-provider-enable (comma list) -> Config tuple; parsed here so
+        # the raw CLI string never reaches the pickled Config.
+        kwargs["aiter_provider_enable"] = normalize_provider_names(
+            kwargs.pop("aiter_provider_enable", "")
+        )
 
         # DP topology -> ParallelConfig. `data_parallel_size` stays in kwargs
         # too: LLMEngine still reads the loose kwarg on the legacy path.
