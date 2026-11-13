@@ -579,8 +579,13 @@ def state_tier_capability(config) -> StateTierCapability:
 
 def state_tier_cpu_bytes() -> int:
     """CPU bytes the state tier may keep per worker (`OFFLOAD_STATE_CPU_SIZE`,
-    GiB, default 32), carved from the paged-KV LMCache pool it shares. Under
-    PP the stages pool theirs; `state_tier_cpu_entries` splits the total.
+    GiB, default 32), carved from the paged-KV LMCache pool it shares.
+
+    Under PP this is the stages' average, not each stage's cap: the stages pool
+    it and every stage keeps the same number of images
+    (`state_tier_cpu_entries`), so a stage holds that count times its own image.
+    A stage whose image is larger than the average holds more than this, and
+    its LMCache CPU pool has to fit that.
     """
     return int(float(os.environ.get("OFFLOAD_STATE_CPU_SIZE", "32")) * (1 << 30))
 
