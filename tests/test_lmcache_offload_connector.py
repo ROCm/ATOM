@@ -94,7 +94,10 @@ from atom.kv_transfer.offload.hybrid.kimi_k3.state_tier import (
     StateOffloadTier,
     _JointPark,
 )
-from atom.kv_transfer.offload.hybrid.qwen.connector import QwenOffloadScheduler
+from atom.kv_transfer.offload.hybrid.qwen.connector import (
+    QwenOffloadConnector,
+    QwenOffloadScheduler,
+)
 from atom.kv_transfer.offload.metadata import (
     ATOMRawBytesLMCacheMetadata,
     LMCacheOffloadMetadata,
@@ -5963,6 +5966,93 @@ def test_only_k3_scales_the_default_pending_saves_with_pp(monkeypatch):
     assert KimiK3OffloadScheduler(config)._max_pending_saves == 16
     monkeypatch.setattr(offcfg, "select_offload_layout", lambda _config: "qwen")
     assert QwenOffloadScheduler(config)._max_pending_saves == 2
+
+
+def _pp2_stage_tier(monkeypatch, cls, layout, stage, spec):
+    """`cls`'s worker tier for one stage of a PP2 x TP2 run, at TP rank 0."""
+    import torch
+
+    from atom.kv_transfer.offload.hybrid.kimi_k3 import connector as k3_connector
+
+    monkeypatch.setattr(offcfg, "select_offload_layout", lambda _config: layout)
+    monkeypatch.setattr(offcfg, "build_lmcache_config", lambda _kvc: None)
+    monkeypatch.setattr(
+        offcfg, "build_lmcache_metadata", lambda *_: SimpleNamespace(model_name="m")
+    )
+    monkeypatch.setattr(k3_connector, "StagedTransfer", lambda *_a, **_k: None)
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.dist.parallel_state",
+        SimpleNamespace(
+            get_tp_group=lambda: SimpleNamespace(world_size=2, rank_in_group=0)
+        ),
+    )
+    image = spec.image_bytes if spec else 1 << 20
+    backend = SimpleNamespace(
+        model_runner=SimpleNamespace(
+            state_runtime=SimpleNamespace(checkpoint_spec=spec)
+        ),
+        state_entry_views=lambda _slot: [torch.empty(image, dtype=torch.uint8)],
+        page_unit_views=lambda *_: [],
+    )
+    worker = cls.__new__(cls)
+    worker._config = SimpleNamespace(
+        kv_transfer_config={},
+        pipeline_parallel_size=2,
+        parallel_config=SimpleNamespace(pipeline_parallel_rank=stage),
+    )
+    worker._engine = SimpleNamespace(
+        gpu_connector=SimpleNamespace(
+            device="cpu", release_gpu_staging_after_transfer=False
+        ),
+        storage_manager=None,
+    )
+    worker._state_tier = None
+    worker._build_state_tier(SimpleNamespace(state_backend=backend))
+    return worker._state_tier
+
+
+def test_pp_stages_build_k3_tiers_that_key_apart_and_match_the_engine_cap(
+    monkeypatch,
+):
+    """The 2 MiB and 1 MiB stages pool 2 GiB over a 3 MiB joint image, so both
+    keep 682 images, the cap the engine's index mirrors for the same spec."""
+    from atom.model_engine.state_offload import state_tier_cpu_entries
+
+    monkeypatch.setenv("OFFLOAD_STATE_CPU_SIZE", "1")
+    tiers = []
+    for stage, image in ((0, 2 << 20), (1, 1 << 20)):
+        # what each stage's checkpoint spec gives the tier
+        spec = SimpleNamespace(
+            layout_id="pp2-joint:tier-test",
+            image_bytes=image,
+            pipeline_op_bytes=3 << 20,
+        )
+        tier = _pp2_stage_tier(
+            monkeypatch, KimiK3OffloadConnector, "kimi_k3", stage, spec
+        )
+        tiers.append(tier)
+        assert tier.codec._max_entries == state_tier_cpu_entries(
+            spec, SimpleNamespace(pipeline_parallel_size=2)
+        )
+    for tier in tiers:
+        tier.shutdown()
+    assert [t.codec._max_entries for t in tiers] == [682, 682]
+    # Stage 1's TP rank 0 is worker 2 of 4, not stage 0's worker 0.
+    assert [(t.codec._worker_id, t.codec._world_size) for t in tiers] == [
+        (0, 4),
+        (2, 4),
+    ]
+
+
+def test_a_qwen_pp_worker_logs_the_pipeline_refusal(monkeypatch, caplog):
+    with caplog.at_level(logging.INFO, logger="atom"):
+        tier = _pp2_stage_tier(monkeypatch, QwenOffloadConnector, "qwen", 0, None)
+    assert tier is None
+    assert "layout 'qwen' keeps no state tier at pipeline_parallel_size=2" in (
+        caplog.text
+    )
+    assert "layout id" not in caplog.text
 
 
 def _k3_seq(*, hbm: int, joint: int = 0, kv: int = 0, claimed: int = 0):
