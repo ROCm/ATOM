@@ -11,7 +11,11 @@ from aiter.tuned_gemm import tgemm
 from torch import nn
 
 from atom.model_loader.weight_names import WeightsMapper
-from atom.model_ops.blockscale import native_quant_linear, quantize_fp8
+from atom.model_ops.blockscale import (
+    native_quant_linear,
+    quantize_fp8,
+    quantize_fp8_taps,
+)
 from atom.model_ops.deepseek_v41.draft_block import DraftStep, draft_step, rotate_rows
 from atom.model_ops.deepseek_v41.dspark import (
     build_block_state,
@@ -265,11 +269,11 @@ class DeepseekV41DSpark(DSparkDraftModel):
         residual = inputs[0].settle().residual
         return residual.mean(dim=-2).reshape(-1, residual.shape[-1])
 
-    def project_context(self, aux_concat):
-        first = self.mtp[0]
-        return first.main_norm(first.main_proj(aux_concat))
+    def project_context(self, taps):
+        """`main_norm(main_proj(concat(taps)))` as `[1, N, hidden]`."""
+        return self.mtp[0].main_norm(self._project_taps(taps))
 
-    def project_context_quant(self, aux_concat):
+    def project_context_quant(self, taps):
         """`project_context`, emitted as the fused KV GEMM's quantized input.
 
         Returns E4M3 values and their row-major group-32 UE8M0 scales, the
@@ -283,7 +287,19 @@ class DeepseekV41DSpark(DSparkDraftModel):
         `ATOM_USE_MODEL_SENSITIVE_RMSNORM` rounding mode, so `write_context_kv`
         keeps the chain when that is set.
         """
-        return self._main_norm_quant()(self.mtp[0].main_proj(aux_concat))
+        return self._main_norm_quant()(self._project_taps(taps))
+
+    def _project_taps(self, taps):
+        """`main_proj(concat(taps))` as `[1, N, hidden]`, before the norm.
+
+        `main_proj` quantizes its input with `quantize_fp8`; the taps are
+        quantized where they lie instead, to the same fp8 rows and scales,
+        minus the concatenated copy. `quantize_fp8_taps` joins them itself for
+        a shape its kernel does not take, and passes a single joined block
+        (a PP relay) through as it is.
+        """
+        x, x_scale = quantize_fp8_taps(taps)
+        return self.mtp[0].main_proj(x.unsqueeze(0), x_scale=x_scale.unsqueeze(0))
 
     def _main_norm_quant(self):
         """The fused norm built in ``__init__``."""
@@ -293,7 +309,7 @@ class DeepseekV41DSpark(DSparkDraftModel):
     def context_layers(self):
         return tuple(layer.attn for layer in self.mtp)
 
-    def write_context_kv(self, aux_concat, positions, slot_mapping=None):
+    def write_context_kv(self, taps, positions, slot_mapping=None):
         from atom.utils.forward_context import get_forward_context
 
         forward = get_forward_context()
@@ -308,17 +324,19 @@ class DeepseekV41DSpark(DSparkDraftModel):
             if not plan.tail.requests:
                 return
             rows, step = plan.tail_rows, plan.tail
-            aux_concat, positions = aux_concat[rows], positions[rows]
+            taps, positions = [tap[rows] for tap in taps], positions[rows]
         # The forward's own width, padding included, because that is what the
         # target just ran and what these buffers therefore hold. A padding row
         # belongs to a zero-length request in `cu_seqlens_q`, so it is
-        # projected and then written nowhere.
-        ctx = aux_concat[: step.running_tokens].unsqueeze(0)
-        positions = positions[: step.running_tokens][None]
+        # projected and then written nowhere. The rows are cut here, as views,
+        # and `project_context` takes every row it is given.
+        tokens = step.running_tokens
+        taps = [tap[:tokens] for tap in taps]
+        positions = positions[:tokens][None]
         layers = self.context_layers
         fused = self._context_kv_fusion()
         if fused is None:
-            hidden = self.project_context(ctx)
+            hidden = self.project_context(taps)
             for attention in layers:
                 keys = attention.project_context(
                     hidden, positions, self.rope, packed=cache.window_fp8
@@ -327,11 +345,11 @@ class DeepseekV41DSpark(DSparkDraftModel):
             return
         weight, weight_scale, group_rows, width, preshuffled = fused
         if envs.ATOM_USE_MODEL_SENSITIVE_RMSNORM:
-            hidden, hidden_scale = self.project_context(ctx), None
+            hidden, hidden_scale = self.project_context(taps), None
         else:
             # The norm emits the GEMM's quantized input, so the GEMM does not
             # run its own quantize_fp8 on the bf16 norm output.
-            hidden, hidden_scale = self.project_context_quant(ctx)
+            hidden, hidden_scale = self.project_context_quant(taps)
         kv = native_quant_linear(
             hidden,
             weight,

@@ -57,6 +57,7 @@ Inferact/Kimi-K3.1-DSpark (67 tensors) is the same tree with 96 heads (q_b_proj
 and no embed_tokens; its ``rope_interleave: true`` is the same interleaved rope.
 """
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, ClassVar
 
 import torch
@@ -605,11 +606,11 @@ class KimiK3DSpark(DSparkDraftModel):
 
     # ---- drafting entry points (called by the proposer) --------------------
 
-    def project_context(self, aux_concat: torch.Tensor) -> torch.Tensor:
-        """``context_norm(context_proj(concat(aux)))`` -- the shared context.
+    def project_context(self, taps: Sequence[torch.Tensor]) -> torch.Tensor:
+        """``context_norm(context_proj(concat(taps)))`` -- the shared context.
 
         Computed ONCE per step and reused by every layer: the reference hands
         the same projected tensor to all five, which each apply their own KV
         projection to it.
         """
-        return self.context_norm(linear_out(self.context_proj(aux_concat)))
+        return self.context_norm(linear_out(self.context_proj(self.concat_taps(taps))))

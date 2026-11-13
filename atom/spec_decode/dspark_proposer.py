@@ -692,8 +692,10 @@ class DSparkProposer(Drafter):
 
         Called once by the runner right after each target forward, while the
         forward context still holds the TARGET's slot mapping / cu_seqlens.
-        ``model.write_context_kv`` fans the projected context out to the
-        draft's context layers, each of which writes its own storage:
+        The model gets the taps as ``aux_for`` serves them (under PP the
+        leading ones may come joined) and joins them only if its projection
+        needs to. ``model.write_context_kv`` fans the projected context out to
+        the draft's context layers, each of which writes its own storage:
           * V4 / V4.1 (inline drafts): a private rolling target-KV window,
             addressed by position off the live forward context.
           * Kimi-K3 and MiniMax-M3.1 (standalone drafts): a paged pool, at the
@@ -726,13 +728,7 @@ class DSparkProposer(Drafter):
         forward_context = get_forward_context()
         scheduled_bs = forward_context.context.scheduled_bs
         num_rows = positions.shape[0]
-        # One block when every tap was relayed from earlier PP stages.
-        if len(aux_hidden_states) == 1:
-            main_hidden_all = aux_hidden_states[0][:num_rows]
-        else:
-            main_hidden_all = torch.cat(
-                [h[:num_rows] for h in aux_hidden_states], dim=-1
-            )
+        taps = [h[:num_rows] for h in aux_hidden_states]
         spec = self.model.kv_pool_spec
         if spec is not None and spec.needs_own_ctx_slots(self.config):
             ctx_slots = self.runner.forward_vars.get("draft_ctx_slots")
@@ -752,10 +748,8 @@ class DSparkProposer(Drafter):
             slot_mapping = forward_context.attn_metadata.slot_mapping
             if slot_mapping is not None:
                 slot_mapping = slot_mapping[:num_rows]
-        with record_function(
-            f"draft_kv[bs={scheduled_bs} tok={main_hidden_all.shape[0]}]"
-        ):
-            self.model.write_context_kv(main_hidden_all, positions, slot_mapping)
+        with record_function(f"draft_kv[bs={scheduled_bs} tok={num_rows}]"):
+            self.model.write_context_kv(taps, positions, slot_mapping)
 
     def _propose(
         self,

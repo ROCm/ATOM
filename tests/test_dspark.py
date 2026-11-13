@@ -648,8 +648,8 @@ def test_write_context_kv_stays_eager_and_still_writes():
     class _Wrapper(DSparkDraftModel):
         # project_context is stage 0's main_proj/main_norm; stub it so the test
         # covers the fan-out, not the projection.
-        def project_context(self, aux_concat):
-            return aux_concat
+        def project_context(self, taps):
+            return self.concat_taps(taps)
 
         @property
         def context_layers(self):
@@ -660,10 +660,67 @@ def test_write_context_kv_stays_eager_and_still_writes():
     saved = fc.get_forward_context
     fc.get_forward_context = lambda: type("_FC", (), {"context": _StubCtx()})()
     try:
-        DSparkDraftModel.write_context_kv(_Wrapper(), torch.zeros(4, 2), None)
+        DSparkDraftModel.write_context_kv(
+            _Wrapper(), [torch.zeros(4, 1), torch.zeros(4, 1)], None
+        )
     finally:
         fc.get_forward_context = saved
     assert calls == [4, 4, 4], "one rolling-KV write per stage"
+
+
+def test_concat_taps_joins_only_what_needs_joining():
+    from atom.models.dspark_draft import DSparkDraftModel
+
+    block = torch.randn(4, 6)
+    assert DSparkDraftModel.concat_taps([block]) is block
+    # Under PP a relayed pair can lead the list beside a tap captured here.
+    taps = [torch.randn(4, 4), torch.randn(4, 2)]
+    assert torch.equal(DSparkDraftModel.concat_taps(taps), torch.cat(taps, -1))
+
+
+@pytest.mark.parametrize("flavor", ["v4", "kimi_k3", "kimi_k3_gqa", "minimax_m3"])
+def test_concatenating_drafts_project_the_joined_taps(flavor):
+    """The proposers hand every draft the taps; a draft whose projection
+    takes the concatenation joins them itself, so it projects what the
+    proposer used to join for it."""
+    from torch import nn
+
+    seen = []
+
+    def proj(x):
+        seen.append(x)
+        return x
+
+    if flavor == "v4":
+        from atom.models.deepseek_v4_dspark import DeepseekV4DSpark
+
+        draft = DeepseekV4DSpark.__new__(DeepseekV4DSpark)
+        nn.Module.__init__(draft)
+        stage0 = types.SimpleNamespace(main_proj=proj, main_norm=lambda x: x)
+        draft.model = types.SimpleNamespace(mtp=[stage0])
+    elif flavor == "kimi_k3":
+        from atom.models.kimi_k3_dspark import KimiK3DSpark
+
+        draft = KimiK3DSpark.__new__(KimiK3DSpark)
+        nn.Module.__init__(draft)
+        draft.context_proj, draft.context_norm = proj, lambda x: x
+    elif flavor == "kimi_k3_gqa":
+        from atom.models.kimi_k3_dspark_gqa import KimiK3DSparkGQA
+
+        draft = KimiK3DSparkGQA.__new__(KimiK3DSparkGQA)
+        nn.Module.__init__(draft)
+        draft.fc, draft.hidden_norm = proj, lambda x: x
+    else:
+        from atom.models.minimax_m3.dspark import MiniMaxM3DSpark
+
+        draft = MiniMaxM3DSpark.__new__(MiniMaxM3DSpark)
+        nn.Module.__init__(draft)
+        draft.fc, draft.hidden_norm = proj, lambda x: x
+    taps = [torch.randn(5, 3) for _ in range(3)]
+    assert torch.equal(draft.project_context(taps), torch.cat(taps, -1))
+    joined = torch.randn(5, 9)
+    assert draft.project_context([joined]) is joined
+    assert len(seen) == 2
 
 
 def test_attention_is_reached_only_through_the_opaque_op():
