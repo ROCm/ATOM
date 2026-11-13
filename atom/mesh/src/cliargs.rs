@@ -569,7 +569,17 @@ impl CliArgs {
                     reason,
                 };
                 let text = std::fs::read_to_string(path).map_err(|e| invalid(e.to_string()))?;
-                serde_json::from_str(&text).map_err(|e| invalid(e.to_string()))?
+                let mut section: serde_json::Value =
+                    serde_json::from_str(&text).map_err(|e| invalid(e.to_string()))?;
+                // Also accepted as written in a config file: `{"kv_events": {...}}`.
+                if let Some(inner) = section
+                    .as_object_mut()
+                    .filter(|object| object.len() == 1)
+                    .and_then(|object| object.remove("kv_events"))
+                {
+                    section = inner;
+                }
+                serde_json::from_value(section).map_err(|e| invalid(e.to_string()))?
             }
             None => KvEventsConfig::default(),
         };
@@ -835,6 +845,11 @@ mod tests {
                 .unwrap();
         let config = args.to_router_config(Vec::new()).unwrap();
         assert_eq!(config.kv_events.enabled, crate::config::KvEventsMode::Off);
+
+        std::fs::write(path, r#"{"kv_events": {"enabled": "on"}}"#).unwrap();
+        let args = CliArgs::try_parse_from(["atomesh", "--kv-event-sources", path]).unwrap();
+        let config = args.to_router_config(Vec::new()).unwrap();
+        assert_eq!(config.kv_events.enabled, crate::config::KvEventsMode::On);
 
         std::fs::write(path, "{").unwrap();
         let args = CliArgs::try_parse_from(["atomesh", "--kv-event-sources", path]).unwrap();

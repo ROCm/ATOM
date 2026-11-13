@@ -24,6 +24,8 @@ pub enum FailReason {
     Timeout,
     Transport,
     BadResponse,
+    /// No client for the store, or its writer's keys differ from the router's.
+    Unreadable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,7 +65,7 @@ pub struct SglangKeyLayout(pub String);
 
 /// Computes the writer's object keys from tokens.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum KeyRule {
     /// ATOM's `{namespace}/w{rank}of{world}/{digest}` blake2b chunk chain.
     AtomChunk {

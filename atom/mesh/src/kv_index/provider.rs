@@ -12,6 +12,9 @@ pub struct PrefixRequest<'a> {
     pub model_id: &'a str,
     pub tokens: &'a [u32],
     pub ns: Namespace,
+    /// Set by the planner for inputs the token ids do not identify (images, audio): the
+    /// request scores no hit and records no prediction, but stays a candidate.
+    pub multimodal: bool,
     storage: Vec<(SourceId, StorageLookup)>,
 }
 
@@ -21,6 +24,7 @@ impl<'a> PrefixRequest<'a> {
             model_id,
             tokens,
             ns,
+            multimodal: false,
             storage: Vec::new(),
         }
     }
@@ -48,7 +52,8 @@ pub enum LoadPath {
 pub enum LowerHit {
     /// No lower tier, or the source declares no `offload_load`.
     None,
-    /// The storage source on the load path timed out, failed, was skipped or is open.
+    /// The storage source on the load path timed out, failed, was skipped, is open or
+    /// cannot be read.
     Unknown(SourceId),
     Hit {
         tokens: u32,
