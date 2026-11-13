@@ -34,11 +34,17 @@ def calibration_identity(config, device):
     if draft_dtype != config.kv_cache_dtype:
         identity["draft_kv_cache_dtype"] = draft_dtype
     if config.hf_config.model_type == "deepseek_v41_text":
-        # V4.1's draft attention precision is independent of the target KV pool.
-        # Older profiles did not record it and cannot be matched safely.
-        identity["draft_attention_dtype"] = (
-            "fp8" if config.dspark.draft_kv_dtype == "fp8" else "bf16"
-        )
+        # Before this option existed, even FP8 windows were decoded to BF16.
+        # Omit that default so already measured profiles keep matching.
+        if config.dspark.draft_kv_dtype == "fp8":
+            identity["draft_attention_dtype"] = "fp8"
+        if config.kv_cache_dtype == "fp4":
+            from atom.model_ops.attentions.deepseek_v41.a8w4_attention import (
+                configured_a8w4_attention,
+            )
+
+            if configured_a8w4_attention(config, device):
+                identity["target_attention_dtype"] = "a8w4"
     return identity
 
 

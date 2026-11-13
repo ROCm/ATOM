@@ -91,10 +91,8 @@ def prefill_window(history, step, ring):
     return planes, tuple(plane[rows:] for plane in planes)
 
 
-@triton.jit
-def _reset_windows(
-    ptrs, slots, NSLOTS: tl.constexpr, RING: tl.constexpr, D: tl.constexpr
-):
+@triton.jit(do_not_specialize=["NSLOTS"])
+def _reset_windows(ptrs, slots, NSLOTS, RING: tl.constexpr, D: tl.constexpr):
     pair = tl.program_id(0)
     layer, request = pair // NSLOTS, pair % NSLOTS
     slot = tl.load(slots + request).to(tl.int64)
@@ -120,13 +118,13 @@ def reset_windows(sources, ptrs, slots, ring, dim):
                 plane.view(plane.shape[0] // ring, -1).index_fill_(0, slots, 0)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["NSLOTS"])
 def _gather_windows(
     ptrs,
     layers,
     slots,
     output,
-    NSLOTS: tl.constexpr,
+    NSLOTS,
     RING: tl.constexpr,
     D: tl.constexpr,
 ):
@@ -247,9 +245,9 @@ def write_window_planes(values, scales, planes, step, window, dim, cached_until=
         )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["B"])
 def _gather_window_planes(
-    ptrs, layers, slots, data, scale, B: tl.constexpr, R: tl.constexpr, D: tl.constexpr
+    ptrs, layers, slots, data, scale, B, R: tl.constexpr, D: tl.constexpr
 ):
     pair = tl.program_id(1)
     layer = tl.load(layers + pair // B)

@@ -28,7 +28,7 @@ def draft_attention(query, context_kv, draft_kv, sink, step, scale):
     return sparse_attn(query, keys, sink, step.indices, scale)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["BATCH"])
 def _draft_csr(
     indices,
     prefix,
@@ -37,7 +37,7 @@ def _draft_csr(
     ep,
     WIDTH: tl.constexpr,
     RING: tl.constexpr,
-    BATCH: tl.constexpr,
+    BATCH,
     BLOCK_BATCH: tl.constexpr,
     ENTRIES: tl.constexpr,
 ):
