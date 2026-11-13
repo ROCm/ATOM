@@ -12,7 +12,8 @@ intermediate is never written.
 Numerics: the two-kernel path rounds the accumulator to bf16 before the FP8
 cast, this one does not, and the fp32 reduction order differs. Both only move a
 value across an e4m3 rounding boundary, so the stored code differs by at most
-one e4m3 step. The clamp to the finite FP8 range is the HIP pack's.
+one e4m3 step. The clamp to the finite FP8 range is the HIP pack's; Triton's
+cast saturates by itself on gfx950 but not on gfx942.
 """
 
 import torch
