@@ -21,11 +21,9 @@ decides which is which; the two paths hand each other the same tensors. A
 full-attention layer still runs K2 for everything after its attention
 (``_pre_o_core``), unless ``bind_model`` left it on the production path.
 
-The block-residual buffer is the one place the mono loop cannot reuse
-``KimiDecoderLayer.forward``: ``AttnRes.maybe_close_block`` grows the candidates
-with ``torch.cat``, while the kernels write their block into a slot of a buffer
-sized for the whole stack. ``_fallback`` is that same forward with the ``cat``
-replaced by a slot copy, so a fallback layer's numerics are the original path's.
+The kernels write their block into a slot of a buffer sized for the whole stack,
+as ``AttnRes.maybe_close_block`` does; ``_fallback`` is ``KimiDecoderLayer.forward``
+on that buffer, so a fallback layer's numerics are the original path's.
 
 ATOM carries two pending adds between layers (an MoE layer defers its routed and
 its shared output separately); K2 all-reduces one MoE output, so a mono layer
@@ -578,8 +576,7 @@ class K3MonoDecodeRunner:
         self.aux.write(layer_id, layer.aux_hidden_state((*out, None)))
 
     def _fallback(self, plan, positions, prefix, blocks, add, add2):
-        """``KimiDecoderLayer.forward`` with ``maybe_close_block``'s ``cat``
-        replaced by a slot copy."""
+        """``KimiDecoderLayer.forward`` rerun from its submodules."""
         layer, normed, prefix, before, write_idx = self._seam(
             plan, prefix, blocks, add, add2
         )
