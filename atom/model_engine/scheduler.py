@@ -1236,7 +1236,7 @@ class Scheduler:
             slots -= 1
             # The resume just consumed its virtual running slot; do not also
             # reserve that same request in the fresh-admission parked count.
-            if offload_resume and getattr(seq, "_counted_as_inflight_load", False):
+            if offload_resume and seq._counted_as_inflight_load:
                 parked -= 1
             if pending >= budget:
                 return True, budget
@@ -1382,7 +1382,7 @@ class Scheduler:
                 resume = seq.num_cached_tokens
                 start = self.block_manager.replay_start(seq, resume, hit=False)
                 if self._slice_cold_partial(seq, start, resume):
-                    k = min(k, max(0, self._tick_cold_partial_cap - cold_tokens))
+                    k = min(k, self._cold_slice_left(cold_tokens))
                     cold_tokens += k
                 if k <= 0:
                     continue
@@ -1465,9 +1465,7 @@ class Scheduler:
         if 0 < self.long_prefill_token_threshold < seq.num_tokens - cap_from:
             remaining = self.long_prefill_token_threshold + cap_from - start
         if self._slice_cold_partial(seq, start, resume):
-            remaining = min(
-                remaining, max(0, self._tick_cold_partial_cap - cold_tokens)
-            )
+            remaining = min(remaining, self._cold_slice_left(cold_tokens))
         chunk = self._chunked_prefill_size(
             remaining,
             self._prefill_room(batched_tokens, start),
@@ -3269,7 +3267,7 @@ class Scheduler:
             self.pd_admission.cancel(seq)
         self._inflight_prefix_wait.pop(seq.id, None)
         self._lookup_detach_declined.discard(seq.id)
-        has_inflight_load = bool(getattr(seq, "_counted_as_inflight_load", False))
+        has_inflight_load = seq._counted_as_inflight_load
         seq.status = SequenceStatus.FINISHED
         seq.leave_reason = reason
         seq.multimodal_data = None
@@ -3989,6 +3987,9 @@ class Scheduler:
             ):
                 return cap
         return 0
+
+    def _cold_slice_left(self, cold_tokens: int) -> int:
+        return max(0, self._tick_cold_partial_cap - cold_tokens)
 
     def _slice_cold_partial(self, seq: Sequence, start: int, resume: int) -> bool:
         # Do not shrink replay or a rollback needed to produce final logits.
@@ -4885,14 +4886,14 @@ class Scheduler:
         self._count_inflight_load(seq)
 
     def _count_inflight_load(self, seq: Sequence) -> None:
-        if not getattr(seq, "_counted_as_inflight_load", False):
+        if not seq._counted_as_inflight_load:
             if metrics := getattr(self, "metrics", None):
                 metrics.start_kv_wait(seq)
             self._num_parked_remote_kv += 1
             seq._counted_as_inflight_load = True
 
     def _uncount_inflight_load(self, seq: Sequence) -> None:
-        if getattr(seq, "_counted_as_inflight_load", False):
+        if seq._counted_as_inflight_load:
             # Normal completions already closed the timer when worker quorum
             # arrived. Abort/rejection must also release its bookkeeping.
             if metrics := getattr(self, "metrics", None):

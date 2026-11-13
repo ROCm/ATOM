@@ -1494,6 +1494,7 @@ class TestSchedule:
             id=2,
             status=SequenceStatus.RUNNING,
             is_partial_prefill=True,
+            _counted_as_inflight_load=False,
         )
         sched.running = deque([keep, ready])
 
