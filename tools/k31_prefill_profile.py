@@ -37,6 +37,7 @@ DEFAULT_ENV = {
     "AITER_CUSTOM_AR_DISABLE_LAMPORT": "1",
     "ATOM_DCP_PREFILL_QREP": "1",
     "ATOM_MLA_ABSORB_BF16": "1",
+    "ATOM_DCP_PREFILL_A2A_FP8": "1",
 }
 
 # The Kimi-K3.1 Pro TP8 + DCP8 serving flags, except prefix caching (off) and
