@@ -82,6 +82,19 @@ Monotone and never negative: throughput is neutral everywhere while interactivit
 
 > Arm verification does **not** use the `Engine kwargs` line — it prints the pre-override value and shows `indexer_dcp_only=False` on both arms. Use the `dcp_config.indexer_dcp_only enabled` startup line, the absence of a `disabled` line, and a `peak_torch` delta of ~0.13 GB (the widened `index_q` projection).
 
+### With the MXFP4 / NVFP4 index caches (`--index-cache-dtype fp4|nvfp4`)
+
+The CP chain scores with aiter's FlyDSL decode scorer (`score_flydsl_{fp4,nvfp4}` with `cp_world` / `cp_rank`; an aiter whose FP4 entry points forward those two arguments) instead of the Triton one; the exchange and merge are unchanged, and selection, order, `sparse_bt` and `sparse_ctx` equal the TP selector's exactly. The CP arm runs only for decode batches of at least `ATOM_M3_INDEXER_CP_MIN_BATCH` requests (default 16 for the FP4 caches, where the exchange costs ~9-10 us a layer and loses below it; 1 for bf16 / fp8); a smaller batch scores its own head on the TP path. The batch is fixed per CUDA graph, the context is not, so CP at CONC >= 16 still loses on short contexts. TPOT (ms per step, TP4, nvfp4 KV and index, uniform context, 192 decoded tokens, median of 2 reps):
+
+| B | ctx | CP off | CP on | delta |
+| ---: | ---: | ---: | ---: | ---: |
+| 16 | 8K | 9.53 | 10.09 | +6.0% |
+| 16 | 32K | 9.69 | 10.03 | +3.5% |
+| 16 | 131K | 10.37 | 10.19 | -1.8% |
+| 32 | 8K | 11.70 | 12.09 | +3.3% |
+| 32 | 32K | 11.92 | 11.90 | -0.2% |
+| 32 | 131K | 13.29 | 12.45 | -6.4% |
+
 ## Concurrency 40/48 — CPU offload
 
 Run the 40c and 48c points with LMCache CPU offload and the SLRU cache policy. Keep the server command above and add these to its `env \` block:
