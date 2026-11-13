@@ -3837,12 +3837,15 @@ class DeepseekV4ForCausalLM(nn.Module):
         """True when shared experts are NOT fused into the routed MoE kernel, so
         the weight loader must keep `ffn.shared_experts.*` on the standalone
         Expert module instead of rewriting them into the fused slot. Read from
-        the actual built MoE layers so it always agrees with model structure.
+        the actual built MoE layers so it always agrees with model structure;
+        where only some fuse (online quant excluding a layer), the loader
+        decides per layer.
         """
-        for m in self.model.modules():
-            if m.__class__.__name__ == "MoE":
-                return not getattr(m, "_fuse_shared_into_routed", True)
-        return False
+        return not any(
+            getattr(m, "_fuse_shared_into_routed", False)
+            for m in self.model.modules()
+            if m.__class__.__name__ == "MoE"
+        )
 
     def forward(
         self,

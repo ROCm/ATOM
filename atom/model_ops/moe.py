@@ -12,7 +12,7 @@ import torch
 from aiter import ActivationType, QuantType, dtypes, get_hip_quant, topk_gating
 from aiter.dist.parallel_state import get_dp_group, get_pcp_group, get_tp_group
 from aiter.fused_moe import fused_moe
-from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.flydsl.moe_common import GateMode
 from aiter.ops.shuffle import (
@@ -96,6 +96,7 @@ from atom.quant_spec import (
     NVFP4_GROUP_SIZE,
     LayerQuantConfig,
     fuses_mxfp8_shared_into_mxfp4,
+    fuses_ptpc_shared_into_online_ptpc,
     should_skip_online_quant,
     should_stream_online_quant,
     validate_nvfp4_global_scales,
@@ -3297,27 +3298,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight.data[expert_id] = w2_q
                 layer.w2_weight_scale.data[expert_id] = w2_s.squeeze(-1)
 
-        # Clamped SiLU on per-token FP8: aiter runs it on its FlyDSL MoE, which
-        # takes [E, N] fp32 weight scales. A model may fold its shared expert in.
-        self.ptpc_clamp = (
-            get_gfx_runtime().startswith("gfx94")
-            and getattr(layer, "swiglu_limit", 0.0) > 0
-            and getattr(layer, "activation", ActivationType.Silu) == ActivationType.Silu
-            and getattr(layer, "w13_input_scale", None) is None
-            and getattr(layer, "w2_input_scale", None) is None
-            and self.fused_experts is None
-            and getattr(layer, "expert_mask", None) is None
-        )
-        if self.ptpc_clamp:
-            num_experts = layer.w13_weight.shape[0]
-            layer.w13_weight_scale = atom_parameter(
-                layer.w13_weight_scale.data.reshape(num_experts, -1)
-                .float()
-                .contiguous()
-            )
-            layer.w2_weight_scale = atom_parameter(
-                layer.w2_weight_scale.data.reshape(num_experts, -1).float().contiguous()
-            )
         shuffle_weights(layer.w13_weight, layer.w2_weight)
 
     def _process_tensor_quant(self, layer: nn.Module) -> None:
@@ -3502,7 +3482,7 @@ class FusedMoE(torch.nn.Module):
         quant_config: Quantization configure.
     """
 
-    # Set in __init__ for an MXFP8 shared expert fused into MXFP4 experts.
+    # Set in __init__ for a shared expert staged into its fused slot.
     shared_mxfp8_into_mxfp4: Mxfp8SharedIntoMxfp4 | None = None
 
     def __init__(
@@ -3601,10 +3581,7 @@ class FusedMoE(torch.nn.Module):
             getattr(config, "n_shared_experts", 0) if fuse_shared_experts else 0
         )
 
-        # A shared expert in another format than the routed checkpoint is
-        # staged while loading and written into its slot afterwards: MXFP8
-        # re-quantized to MXFP4, or per-channel FP8 copied once online quant
-        # made the routed experts per-channel FP8 too.
+        # A shared expert in another format is staged, then written into its slot.
         shared_spec = (
             quant_config.get_layer_quant_config(
                 shared_expert_prefix, check_children=True
@@ -3612,12 +3589,12 @@ class FusedMoE(torch.nn.Module):
             if num_fused_shared_experts and layer_quant_config is not None
             else None
         )
-        stage_shared_ptpc = (
-            shared_spec is not None
-            and shared_spec.quant_type == QuantType.per_Token
-            and layer_quant_config.quant_type != QuantType.per_Token
+        stage_shared_ptpc = shared_spec is not None and (
+            fuses_ptpc_shared_into_online_ptpc(
+                quant_config, prefix, shared_spec, layer_quant_config
+            )
         )
-        stage_shared_mxfp8 = stage_shared_ptpc or bool(
+        stage_shared = stage_shared_ptpc or bool(
             shared_spec is not None
             and fuses_mxfp8_shared_into_mxfp4(shared_spec, layer_quant_config)
         )
@@ -3875,7 +3852,7 @@ class FusedMoE(torch.nn.Module):
                 self.intermediate_size_per_partition,
                 ptpc=stage_shared_ptpc,
             )
-            if stage_shared_mxfp8
+            if stage_shared
             else None
         )
         compilation_config = atom_config.compilation_config

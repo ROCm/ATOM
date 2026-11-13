@@ -19,6 +19,7 @@ tensors are copied into the slot once the routed buffers exist.
 import torch
 from aiter import QuantType, dtypes
 
+from atom.config import get_current_atom_config
 from atom.model_ops.fused_moe.expert_layout import expert_shard_dim
 from atom.model_ops.utils import normalize_e4m3fn_to_e4m3fnuz
 from atom.quant_spec import will_online_requant
@@ -34,13 +35,18 @@ _STAGED_SHARDS = {
 
 
 class Mxfp8SharedIntoMxfp4:
-    """The staging of one FusedMoE's MXFP8 shared experts. The layer calls
-    `load` from its weight_loader and `fuse` after its online quantization."""
+    """The staging of one FusedMoE's fused shared experts: MXFP8 into MXFP4, or
+    per-channel FP8 with ``ptpc``. The layer calls `load` from its
+    weight_loader and `fuse` after its online quantization."""
 
     def __init__(
         self, layer, quant_config, hidden_size: int, inter: int, ptpc: bool = False
     ):
-        name = "ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4"
+        name = (
+            "A fused per-channel FP8 shared expert"
+            if ptpc
+            else "ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4"
+        )
         if layer.expert_layout.shared_is_routed:
             # EPLB with all2all EP routes the shared expert as a logical expert
             # in the routed slots, so its tensors never reach a shared slot.
@@ -51,11 +57,12 @@ class Mxfp8SharedIntoMxfp4:
         self.ptpc = ptpc
         source = layer.layer_quant_config
         if ptpc:
-            if layer._stream_online_quant:
-                # Its buffers are still on meta here.
+            # Streaming buffers are still on meta here, and the FP8 online
+            # method has no all2all shared-expert dispatch.
+            if layer._stream_online_quant or layer.expert_layout.uses_all2all_fusion:
                 raise NotImplementedError(
-                    f"{layer.prefix}: a fused per-channel FP8 shared expert does "
-                    "not support streaming online quant."
+                    f"{layer.prefix}: {name} does not support streaming online "
+                    "quant or all2all EP."
                 )
         elif will_online_requant(
             quant_config, layer.prefix, source.quant_type, source.quant_dtype
@@ -99,8 +106,8 @@ class Mxfp8SharedIntoMxfp4:
         """Stage one checkpoint tensor of a shared expert.
 
         Returns whether ``expert_id`` (local) is a shared slot; its arrivals
-        never touch the MXFP4 buffers. Weights and E8M0 scales are TP-sharded
-        like any per_1x32 expert tensor.
+        never touch the routed buffers. Weights and scales are TP-sharded like
+        the routed experts'.
         """
         if expert_id < self.shared_lo:
             return False
@@ -108,14 +115,13 @@ class Mxfp8SharedIntoMxfp4:
             # `fuse` freed the staging; keeping it for the life of the process
             # only to serve a reload is not worth its memory.
             raise NotImplementedError(
-                f"{layer.prefix}: the MXFP8 shared expert was already "
-                "re-quantized into its MXFP4 slot; reloading it under "
-                "ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4 is not supported."
+                f"{layer.prefix}: the shared expert is already in its fused "
+                "slot; reloading it is not supported."
             )
         name = next((n for n in _STAGED_SHARDS if getattr(layer, n) is param), None)
         if name is None:
             raise ValueError(
-                f"{layer.prefix}: unexpected fused MXFP8 shared-expert tensor "
+                f"{layer.prefix}: unexpected fused shared-expert tensor "
                 f"for expert {expert_id} (shard {shard_id!r})."
             )
         if shard_id not in ("w1", "w2", "w3"):
@@ -137,12 +143,16 @@ class Mxfp8SharedIntoMxfp4:
         return True
 
     def fuse(self, layer) -> None:
-        """Re-quantize the staged shared experts into their MXFP4 slots, then
-        free the staging.
+        """Write the staged shared experts into their slots (re-quantized to
+        MXFP4, or copied with ``ptpc``), then free the staging.
 
         Runs after loading and before the quant method's own post-processing
         (shuffle) covers every expert; the gate/up halves are laid out as the
         routed experts' (``[0, I)`` and ``[half, half + I)``)."""
+        if not self.loaded and get_current_atom_config().load_dummy:
+            # `--load_dummy` loads nothing; the slot keeps its dummy values.
+            self.staged = None
+            return
         expected = {
             (name, self.shared_lo + i, shard)
             for i in range(self.num_shared)
@@ -152,7 +162,7 @@ class Mxfp8SharedIntoMxfp4:
         missing = expected - self.loaded
         if missing:
             raise RuntimeError(
-                f"{layer.prefix}: fused MXFP8 shared expert tensors were not "
+                f"{layer.prefix}: fused shared expert tensors were not "
                 f"loaded from the checkpoint: {sorted(missing)}"
             )
         staged, self.staged = self.staged, None
@@ -194,31 +204,18 @@ class Mxfp8SharedIntoMxfp4:
             )
 
     def _copy(self, layer, staged) -> None:
-        """The per-channel FP8 shared experts into their slots as they are."""
-
-        def put(dst, src):
-            region = dst[tuple(slice(n) for n in src.shape[: dst.dim()])]
-            layer._copy_quant_storage(region, src.reshape(region.shape))
-
+        """The per-channel FP8 shared experts into their (unpadded) slots as
+        they are."""
         fnuz = layer.w13_weight.dtype == torch.float8_e4m3fnuz
         for i in range(self.num_shared):
             expert_id = self.shared_lo + i
-            w13, s13 = staged["w13_weight"][i], staged["w13_weight_scale"][i]
-            w2, s2 = staged["w2_weight"][i], staged["w2_weight_scale"][i]
-            if fnuz:
-                # The online-quantized routed experts are FNUZ already.
-                w13, s13, _ = normalize_e4m3fn_to_e4m3fnuz(w13, s13)
-                w2, s2, _ = normalize_e4m3fn_to_e4m3fnuz(w2, s2)
-            slot = [layer.w13_weight, layer.w13_weight_scale]
-            slot += [layer.w2_weight, layer.w2_weight_scale]
-            # `_online_quant` filled the slot from unloaded bytes.
-            for p in slot:
-                p.data[expert_id].zero_()
-            w13_dst = layer.w13_weight.data[expert_id]
-            w13_scale_dst = layer.w13_weight_scale.data[expert_id]
-            half, dst_half = w13.shape[0] // 2, w13_dst.shape[0] // 2
-            for src_off, dst_off in ((0, 0), (half, dst_half)):
-                put(w13_dst[dst_off:], w13[src_off : src_off + half])
-                put(w13_scale_dst[dst_off:], s13[src_off : src_off + half])
-            put(layer.w2_weight.data[expert_id], w2)
-            put(layer.w2_weight_scale.data[expert_id], s2)
+            for w in ("w13", "w2"):
+                q, s = staged[f"{w}_weight"][i], staged[f"{w}_weight_scale"][i]
+                if fnuz:
+                    # The online-quantized routed experts are FNUZ already.
+                    q, s, _ = normalize_e4m3fn_to_e4m3fnuz(q, s)
+                layer._copy_quant_storage(
+                    getattr(layer, f"{w}_weight").data[expert_id], q
+                )
+                scale = getattr(layer, f"{w}_weight_scale").data[expert_id]
+                scale.copy_(s.reshape(scale.shape))

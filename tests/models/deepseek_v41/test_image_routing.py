@@ -10,6 +10,7 @@ from torch import nn
 if not torch.cuda.is_available():
     pytest.skip("ROCm router required", allow_module_level=True)
 
+from atom.model_ops import topK
 from atom.models.deepseek_v4 import MoE as V4MoE
 from atom.models.deepseek_v41.moe import MoE
 from atom.utils import forward_context
@@ -66,6 +67,28 @@ def test_image_router_against_unbiased_score_oracle(moe, metadata, rows, populat
     torch.testing.assert_close(
         weights.gather(-1, order), expected_weights.gather(-1, expected_order)
     )
+
+
+@pytest.mark.parametrize("population", ["text", "mixed"])
+def test_fused_shared_expert_takes_the_last_column(moe, metadata, population):
+    torch.manual_seed(17)
+    logits = torch.randn(17, 384, device="cuda")
+    hidden = torch.empty(17, 8, device="cuda")
+    if population == "mixed":
+        metadata.image_mask = torch.arange(17, device="cuda") % 2 == 0
+    weights, ids = moe._topk(hidden, logits, 6, True)
+    topK.init_aiter_topK_meta_data.cache_clear()
+    try:
+        topK.init_aiter_topK_meta_data(384, 1, 6, 0, 1, max_num_tokens=64)
+        moe.experts.num_fused_shared_experts = 1
+        fused_weights, fused_ids = moe._topk(hidden, logits, 6, True)
+        assert fused_ids.shape == (17, 7)
+        assert torch.equal(fused_ids[:, :6], ids) and (fused_ids[:, 6] == 384).all()
+        assert torch.equal(fused_weights[:, :6], weights)
+        assert (fused_weights[:, 6] == 1).all()
+    finally:
+        topK.init_aiter_topK_meta_data.cache_clear()
+        topK.aiter_topK_meta_data = None
 
 
 @pytest.mark.parametrize("fail", [False, True])

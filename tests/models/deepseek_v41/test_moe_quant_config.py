@@ -68,3 +68,19 @@ def test_model_owns_and_forwards_expert_quantization(
         assert config.get_layer_quant_config(shared).quant_type == QuantType.per_1x32
         online_shared = config.get_layer_quant_config(shared, use_online_quant=True)
         assert online_shared.quant_type == QuantType.per_1x32
+
+
+def test_shared_loading_follows_any_fused_layer():
+    """Online quant can leave a layer unfused; the loader then decides per layer."""
+    from torch import nn
+
+    from atom.models.deepseek_v4 import DeepseekV4ForCausalLM
+
+    moe = type("MoE", (nn.Module,), {})
+    layers = nn.ModuleList([moe(), moe()])
+    layers[0]._fuse_shared_into_routed = False
+    layers[1]._fuse_shared_into_routed = True
+    probe = DeepseekV4ForCausalLM.disable_fused_shared_loading.fget
+    assert probe(Mock(model=layers)) is False
+    layers[1]._fuse_shared_into_routed = False
+    assert probe(Mock(model=layers)) is True
