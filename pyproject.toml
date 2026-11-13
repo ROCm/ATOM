@@ -21,6 +21,10 @@ tracing = ["opentelemetry-api>=1.40,<2", "opentelemetry-sdk>=1.40,<2", "opentele
 # audio to the audio VAE's 32 kHz.
 diffusion = ["av", "pillow", "torchaudio"]
 
+[project.scripts]
+# Conversational deployment agent (stdlib only; see docs/atom_chat_guide.md).
+atom-chat = "atom.agent.cli:main"
+
 [project.urls]
 Homepage = "https://github.com/ROCm/ATOM"
 Repository = "https://github.com/ROCm/ATOM"

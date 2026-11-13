@@ -156,6 +156,20 @@ python -m atom.entrypoints.openai_server --model deepseek-ai/DeepSeek-R1 --kv-ca
   --method mtp --num-speculative-tokens 3
 ```
 
+### Deploy by conversation (ATOM Chat)
+
+Describe what you want served; the agent inspects the GPUs, adapts the
+matching recipe, starts the server, verifies it and explains failures,
+asking before anything that changes the machine. Its LLM can be ATOM itself.
+
+```bash
+atom-chat                                   # or: python -m atom.agent
+atom-chat --bootstrap /models/DeepSeek-V4.1-Flash --bootstrap-gpus 0,1,2,3
+claude mcp add atom -- python -m atom.agent mcp   # same tools for Claude Code
+```
+
+See the [ATOM Chat guide](docs/atom_chat_guide.md).
+
 ## 📊 Performance
 
 ### Live Benchmark Dashboard
@@ -265,6 +279,7 @@ lm_eval --model local-completions \
 | Serving & Benchmarks | OpenAI API server, benchmarking, profiling, speculative decoding | [Serving Guide](docs/serving_benchmarking_guide.md) |
 | Observability (experimental) | Opt-in request tracing, configuration and test tools | [OpenTelemetry Guide](docs/observability/README.md) |
 | Environment Variables | All `ATOM_*` variable definitions | [Env Vars](docs/environment_variables.md) |
+| ATOM Chat | Conversational deployment agent, MCP tools | [ATOM Chat Guide](docs/atom_chat_guide.md) |
 
 **Deployment Recipes:**
 
