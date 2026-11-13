@@ -4,7 +4,7 @@
 
 ``mono``        one persistent kernel a layer (front half, router, MoE, shared
                 expert, FFN all-reduce): n <= 16 as it always was, plus the
-                wide builds (``WIDE_BUILDS``: 32 and 64 rows) once accepted;
+                wide builds (``WIDE_BUILDS``: 32, 48 and 64 rows, the 16-row group boundaries above 16) once accepted;
 ``hybrid``      mono front half + the production back half (``hybrid.py``): the
                 stand-in while a wide build's MoE stages are being built, and a
                 fallback entry for a width the full kernel does not beat;
@@ -25,7 +25,7 @@ KINDS = (MONO, HYBRID, PRODUCTION)
 SMALL_MAX_ROWS = 16  # the n <= 16 kernels' MFMA B operand
 TABLE_MAX_ROWS = 64  # the table's reach; above it every step is production
 # widths the wide full-mono kernels are built for (ATOM_MONO_WIDE gates them)
-WIDE_BUILDS: tuple[int, ...] = (32, 64)
+WIDE_BUILDS: tuple[int, ...] = (32, 48, 64)
 # rows the hybrid front half serves
 HYBRID_MAX_ROWS = 64
 
@@ -39,7 +39,7 @@ HYBRID_MAX_ROWS = 64
 # so the wide build wins at both and the hybrid is never chosen. Re-measure when the
 # kernels change; ATOM_MONO_WIDTHS overrides per run.
 MEASURED_HYBRID: str | None = None
-MEASURED_WIDE: str | None = "32:mono,64:mono"
+MEASURED_WIDE: str | None = "32:mono,48:mono,64:mono"
 
 
 def parse_spec(spec: str | None) -> dict[int, str]:

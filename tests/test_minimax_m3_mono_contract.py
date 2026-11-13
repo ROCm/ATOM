@@ -58,7 +58,7 @@ def test_a_wrong_declaration_is_caught(traces):
         check(traces["layer"], wrong)
 
 
-@pytest.mark.parametrize("tokens", [32, 64])
+@pytest.mark.parametrize("tokens", [32, 48, 64])
 @pytest.mark.parametrize("n_split, pipe", [(8, False), (4, True)])
 def test_the_front_half_kernel_holds(tokens, n_split, pipe):
     """The front-half build (more than MAX_TOKENS rows: the split rounds hold the long
