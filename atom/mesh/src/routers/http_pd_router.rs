@@ -742,7 +742,7 @@ impl PDRouter {
             context.route,
             context.is_stream,
         );
-        let response = RetryExecutor::execute_response_with_retry(
+        let attempts = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
             |_attempt| {
                 let request = request.clone();
@@ -772,9 +772,12 @@ impl PDRouter {
                     endpoint,
                 );
             },
-        )
-        .await;
-        observation.wrap_response(response)
+        );
+        let (response, estimate) = crate::observability::route_trace::estimated(attempts).await;
+        // Decode returns the response, but its cached tokens are the ones prefill reused.
+        observation
+            .reconcile(metrics_labels::WORKER_PREFILL, estimate)
+            .wrap_response(response)
     }
 
     async fn plan_pd_pair(
@@ -2475,6 +2478,111 @@ mod tests {
             .collect();
         assert_eq!(request_counts.len(), 1, "{rendered}");
         assert!(request_counts[0].ends_with(" 1"), "{rendered}");
+        server.abort();
+    }
+
+    #[derive(Debug)]
+    struct EstimatingPolicy;
+    #[async_trait::async_trait]
+    impl crate::policies::LoadBalancingPolicy for EstimatingPolicy {
+        async fn select_with_decision(
+            &self,
+            _: &[Arc<dyn Worker>],
+            _: &crate::policies::SelectWorkerInfo<'_>,
+        ) -> (Option<usize>, crate::policies::RouteDecision) {
+            let decision = crate::policies::RouteDecision {
+                estimated_hit_ratio: Some(0.5),
+                ..crate::policies::RouteDecision::branch("affinity")
+            };
+            (Some(0), decision)
+        }
+        fn name(&self) -> &'static str {
+            "estimating-test"
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[tokio::test]
+    async fn pd_cached_tokens_are_reconciled_against_the_prefill_estimate() {
+        use crate::core::prepare_pool::PreparePoolRuntime;
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let usage = r#"{"usage":{"prompt_tokens":100,"completion_tokens":1,"prompt_tokens_details":{"cached_tokens":40}}}"#;
+        let app = axum::Router::new()
+            .fallback(move || async move { ([(CONTENT_TYPE, "application/json")], usage) });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let pool = PreparePoolRuntime::new(
+            crate::config::RouterConfig::default()
+                .resolved_prepare_pool()
+                .unwrap(),
+        )
+        .unwrap();
+        let config = crate::config::RouterConfig {
+            mode: crate::config::RoutingMode::PrefillDecode {
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                prefill_policy: None,
+                decode_policy: None,
+            },
+            ..Default::default()
+        };
+        let app_context = Arc::new(
+            crate::app_context::AppContext::from_config(config, 5, pool.handle())
+                .await
+                .unwrap(),
+        );
+        let mut router = create_test_pd_router();
+        router.worker_registry = app_context.worker_registry.clone();
+        router
+            .policy_registry
+            .set_prefill_policy(Arc::new(EstimatingPolicy));
+        router.worker_registry.register(Arc::new(
+            BasicWorkerBuilder::new(format!("{url}/prefill"))
+                .worker_type(WorkerType::Prefill {
+                    bootstrap_port: Some(8001),
+                })
+                .build(),
+        ));
+        router.worker_registry.register(Arc::new(
+            BasicWorkerBuilder::new(format!("{url}/decode"))
+                .worker_type(WorkerType::Decode)
+                .build(),
+        ));
+        let body = json!({"model": UNKNOWN_MODEL_ID, "prompt": "test"});
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let request = super::super::ingress::InferenceEnvelope::parse(
+            "/v1/completions".parse().unwrap(),
+            headers,
+            serde_json::to_vec(&body).unwrap().into(),
+            &app_context,
+        )
+        .await
+        .unwrap();
+
+        let response = router.route_inference(request, &app_context).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+
+        let rendered = handle.render();
+        for line in [
+            r#"mesh_route_cache_tokens_total{pool="prefill",kind="prompt"} 100"#,
+            r#"mesh_route_cache_tokens_total{pool="prefill",kind="cached"} 40"#,
+            r#"mesh_route_cache_estimate_tokens_total{pool="prefill",kind="estimated"} 50"#,
+            r#"mesh_route_cache_estimate_tokens_total{pool="prefill",kind="actual"} 40"#,
+        ] {
+            assert!(rendered.contains(line), "missing {line} in\n{rendered}");
+        }
+        assert!(!rendered.contains(r#"pool="decode",kind="#), "{rendered}");
         server.abort();
     }
 

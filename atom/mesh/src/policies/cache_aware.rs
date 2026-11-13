@@ -345,12 +345,22 @@ impl CacheAwarePolicy {
         if let (Some(text), Some(tree)) = (info.request_text, tree) {
             tree.insert(text, workers[idx].url());
         }
+        self.routed(info, workers[idx].as_ref());
         workers[idx].increment_processed();
         let decision = RouteDecision {
-            branch: "kv_affinity",
             match_ratio: Some(match_rate),
+            estimated_hit_ratio: Some(match_rate),
+            ..RouteDecision::branch("kv_affinity")
         };
         Some((Some(idx), decision))
+    }
+
+    /// Where the tree learns a request's text, the KV event index predicts its tokens.
+    fn routed(&self, info: &SelectWorkerInfo<'_>, worker: &dyn Worker) {
+        let tokens = info.tokens.filter(|tokens| !tokens.is_empty());
+        if let (Some(provider), Some(tokens)) = (self.kv_events.get(), tokens) {
+            provider.on_routed(tokens, worker);
+        }
     }
 }
 
@@ -394,6 +404,9 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 max_load,
                 min_load,
             );
+            if let Some(idx) = selected {
+                self.routed(info, workers[idx].as_ref());
+            }
             return (selected, RouteDecision::branch("imbalanced"));
         }
 
@@ -421,8 +434,8 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             let affinity = match_rate > self.config.cache_threshold;
             let tenant_url: &str = &result.tenant;
             let decision = RouteDecision {
-                branch: if affinity { "affinity" } else { "relocate" },
                 match_ratio: Some(match_rate as f64),
+                ..RouteDecision::branch(if affinity { "affinity" } else { "relocate" })
             };
 
             // Select worker without String allocation
@@ -440,10 +453,16 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             if let Some(idx) = selected_idx {
                 // Update the tree with this request (use worker URL directly, no allocation)
                 tree.insert(text, workers[idx].url());
+                self.routed(info, workers[idx].as_ref());
 
                 // Increment processed counter
                 workers[idx].increment_processed();
 
+                let decision = RouteDecision {
+                    estimated_hit_ratio: (workers[idx].url() == tenant_url)
+                        .then_some(match_rate as f64),
+                    ..decision
+                };
                 return (Some(idx), decision);
             }
 
@@ -707,26 +726,52 @@ mod tests {
             })
             .collect();
         policy.init_workers(&workers);
-        let info = SelectWorkerInfo {
-            request_text: Some("hello world"),
-            ..Default::default()
-        };
 
-        let select = || async {
-            let (selected, decision) = policy.select_with_decision(&workers, &info).await;
-            (selected.unwrap(), decision.branch, decision.match_ratio)
+        let select = |text: &'static str| {
+            let (policy, workers) = (&policy, &workers);
+            async move {
+                let info = SelectWorkerInfo {
+                    request_text: Some(text),
+                    ..Default::default()
+                };
+                let (selected, decision) = policy.select_with_decision(workers, &info).await;
+                let ratios = (decision.match_ratio, decision.estimated_hit_ratio);
+                (selected.unwrap(), decision.branch, ratios)
+            }
         };
+        let ratio = |matched: f32, input: f32| Some((matched / input) as f64);
 
-        let (first, branch, ratio) = select().await;
-        assert_eq!((branch, ratio), ("relocate", Some(0.0)));
-        assert_eq!(select().await, (first, "affinity", Some(1.0)));
+        let (first, branch, (match_ratio, _)) = select("hello world").await;
+        assert_eq!((branch, match_ratio), ("relocate", Some(0.0)));
+        assert_eq!(
+            select("hello world").await,
+            (first, "affinity", (Some(1.0), Some(1.0)))
+        );
+        // A relocation estimates a hit only on the worker that holds the match.
+        workers[first].increment_load();
+        assert_eq!(
+            select("help me").await,
+            (1 - first, "relocate", (ratio(3.0, 7.0), None))
+        );
+        workers[1 - first].increment_load();
+        workers[1 - first].increment_load();
+        assert_eq!(
+            select("hello, friend").await,
+            (first, "relocate", (ratio(5.0, 13.0), ratio(5.0, 13.0)))
+        );
         workers[first].set_healthy(false);
-        assert_eq!(select().await, (1 - first, "stale_tenant", None));
+        assert_eq!(
+            select("hello world").await,
+            (1 - first, "stale_tenant", (None, None))
+        );
         workers[first].set_healthy(true);
         for _ in 0..20 {
             workers[first].increment_load();
         }
-        assert_eq!(select().await, (1 - first, "imbalanced", None));
+        assert_eq!(
+            select("hello world").await,
+            (1 - first, "imbalanced", (None, None))
+        );
     }
 
     /// Hits of the KV event index, by worker URL.
@@ -750,6 +795,64 @@ mod tests {
     ) -> (usize, &'static str, Option<f64>) {
         let (selected, decision) = policy.select_with_decision(workers, info).await;
         (selected.unwrap(), decision.branch, decision.match_ratio)
+    }
+
+    /// The workers routed to, each then holding the whole prompt.
+    #[derive(Debug, Default)]
+    struct Routed(parking_lot::Mutex<Vec<String>>);
+
+    impl PrefixMatchProvider for Routed {
+        fn match_workers(&self, tokens: &[u32], workers: &[Arc<dyn Worker>]) -> Vec<Option<u32>> {
+            let routed = self.0.lock();
+            let held = |worker: &Arc<dyn Worker>| routed.iter().any(|url| url == worker.url());
+            let held = |worker| held(worker).then_some(tokens.len() as u32);
+            workers.iter().map(held).collect()
+        }
+
+        fn on_routed(&self, _tokens: &[u32], worker: &dyn Worker) {
+            self.0.lock().push(worker.url().into());
+        }
+    }
+
+    #[tokio::test]
+    async fn every_placement_the_tree_learns_with_tokens_is_predicted() {
+        let workers: Vec<Arc<dyn Worker>> = ["http://w1:8000", "http://w2:8000"]
+            .into_iter()
+            .map(|url| Arc::new(BasicWorkerBuilder::new(url).build()) as Arc<dyn Worker>)
+            .collect();
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            balance_abs_threshold: 5,
+            balance_rel_threshold: 2.0,
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+        policy.init_workers(&workers);
+        let routed = Arc::new(Routed::default());
+        policy.set_kv_events(routed.clone());
+        let tokens: Vec<u32> = (0..100).collect();
+        let info = SelectWorkerInfo {
+            request_text: Some("hello world"),
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+        let mut placed: Vec<usize> = Vec::new();
+        for branch in ["relocate", "kv_affinity", "imbalanced"] {
+            if branch == "imbalanced" {
+                for _ in 0..20 {
+                    workers[placed[1]].increment_load();
+                }
+            }
+            let (idx, taken, _) = decide(&policy, &workers, &info).await;
+            assert_eq!(taken, branch);
+            placed.push(idx);
+        }
+        let text = SelectWorkerInfo {
+            tokens: None,
+            ..info.clone()
+        };
+        decide(&policy, &workers, &text).await;
+        let urls: Vec<_> = placed.iter().map(|&idx| workers[idx].url()).collect();
+        assert_eq!(*routed.0.lock(), urls);
     }
 
     #[tokio::test]

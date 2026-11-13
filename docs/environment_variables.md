@@ -501,8 +501,9 @@ the host, give each its own endpoints.
 Discovery: `GET /kv_event_sources` maps the global DP rank of each engine the
 server runs to where its publisher binds: `endpoint`, offset per rank like the
 bind itself (a wildcard host stays a wildcard, so a consumer substitutes the
-server's address), `topic`, and `block_size`, the tokens per hashed block. It is
-`{}` with events off or the `null` publisher.
+server's address), `topic`, `block_size`, the tokens per hashed block, and
+`replay_endpoint`, offset alike, when replay is on. It is `{}` with events off or
+the `null` publisher.
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
