@@ -16,7 +16,7 @@ pub use self::{
     index::{HolderTable, PrefixIndex, MAX_HOLDERS},
     provider::{CacheHit, HitSource, LoadPath, LowerHit, PrefixMatchProvider, PrefixRequest},
 };
-use crate::kv_events::{PoolRole, Tier};
+use crate::kv_events::Tier;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PrefixHash(pub u64);
@@ -55,16 +55,6 @@ pub struct IndexStats {
     pub blocks: [u64; 3],
     pub holders: u32,
     pub approx_bytes: u64,
-}
-
-/// One entry of `GET /kv_index/stats`, served as `{"partitions": [...]}`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct PartitionStats {
-    pub model_id: String,
-    pub pool: PoolRole,
-    pub block_size: u32,
-    #[serde(flatten)]
-    pub stats: IndexStats,
 }
 
 /// One partition. A single writer task applies events; queries read concurrently.
