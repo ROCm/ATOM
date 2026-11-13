@@ -32,9 +32,14 @@ pub fn chain(
     seed: u64,
     buf: &mut Vec<u8>,
 ) -> PrefixHash {
-    buf.clear();
-    buf.extend(tokens.iter().flat_map(|token| token.to_le_bytes()));
-    let content = xxh3_64_with_seed(buf, seed);
+    let bytes: &[u8] = if cfg!(target_endian = "little") {
+        bytemuck::cast_slice(tokens)
+    } else {
+        buf.clear();
+        buf.extend(tokens.iter().flat_map(|token| token.to_le_bytes()));
+        buf
+    };
+    let content = xxh3_64_with_seed(bytes, seed);
     PrefixHash(match parent {
         None => content,
         Some(PrefixHash(parent)) => {

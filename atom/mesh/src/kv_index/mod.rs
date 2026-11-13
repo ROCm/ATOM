@@ -70,7 +70,8 @@ pub struct PartitionStats {
     pub stats: IndexStats,
 }
 
-/// One partition. A single writer task applies events; queries read concurrently.
+/// One partition. The partition's event task and routed predictions write one shard at a
+/// time; queries read concurrently.
 pub trait KvIndex: Send + Sync {
     fn apply(&self, holder: HolderId, ops: &[IndexOp]);
     /// `tier` None clears every tier of the holder.

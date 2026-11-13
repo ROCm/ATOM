@@ -686,8 +686,32 @@ pub const METRIC_INVENTORY: &[MetricSpec] = &[
     },
 ];
 
-/// Buckets for routing histograms whose values are not durations.
+/// Buckets for histograms the default duration buckets (from 1 ms) do not fit.
 pub(crate) const ROUTE_HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[
+    (
+        names::KV_INDEX_MATCH_DURATION_SECONDS,
+        &[25e-6, 50e-6, 100e-6, 200e-6, 500e-6, 1e-3, 5e-3],
+    ),
+    (
+        names::KV_STORAGE_KEY_DURATION_SECONDS,
+        &[25e-6, 50e-6, 100e-6, 250e-6, 500e-6, 1e-3, 5e-3],
+    ),
+    (
+        names::KV_STORAGE_LOOKUP_DURATION_SECONDS,
+        &[250e-6, 500e-6, 1e-3, 2e-3, 3e-3, 5e-3, 10e-3, 50e-3],
+    ),
+    (
+        names::KV_EVENTS_LAG_SECONDS,
+        &[1e-3, 5e-3, 10e-3, 50e-3, 0.1, 0.5, 1.0, 5.0, 30.0],
+    ),
+    (
+        names::KV_EVENTS_RECOVERY_SECONDS,
+        &[10e-3, 50e-3, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 120.0],
+    ),
+    (
+        names::KV_STORAGE_KEYS_PER_LOOKUP,
+        &[1.0, 4.0, 16.0, 64.0, 256.0, 1024.0, 4096.0],
+    ),
     (
         names::ROUTE_PREFIX_MATCH_RATIO,
         &[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 1.0],

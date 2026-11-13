@@ -15,7 +15,8 @@ use crate::{
         Worker,
     },
     kv_events::{
-        DropReason, EngineHash, Group, KvEvent, Namespace, PoolRole, StoredBlock, Tier, Trust,
+        DropReason, EngineHash, Group, GroupKind, KvEvent, Namespace, PoolRole, StoredBlock, Tier,
+        Trust,
     },
     policies::{LoadBalancingPolicy, RouteDecision, SelectWorkerInfo},
 };
@@ -317,6 +318,42 @@ fn token_less_blocks_need_a_known_engine_hash() {
     assert_eq!(index.stats().blocks, [2, 2, 0]);
 }
 
+/// vLLM stores a hybrid model's blocks once per group but removes them by group alone;
+/// `kv_cache_report_mode: "full"` re-reports held blocks as stored.
+#[test]
+fn holder_tables_skip_other_groups_cap_copies_and_drop_opaque_blocks() {
+    let (index, mut table, id) = (PrefixIndex::default(), HolderTable::default(), HolderId(0));
+    let seq: Vec<u32> = (0..8).collect();
+    let full = stored(0, &seq, 0..2, 4, Tier::Device, true);
+    let (mut window, mut opaque) = (full.clone(), full.clone());
+    if let (KvEvent::Stored { group, .. }, KvEvent::Stored { ns, .. }) = (&mut window, &mut opaque)
+    {
+        (group.idx, group.kind) = (1, GroupKind::SlidingWindow(128));
+        ns.opaque = true;
+    }
+    let removed = |idx| KvEvent::Removed {
+        hashes: vec![engine_hash(0, &seq[..4])],
+        tier: Tier::Device,
+        group: Group {
+            idx,
+            kind: GroupKind::Full,
+        },
+    };
+    // Event, times applied, Device blocks held after.
+    for (event, times, device) in [
+        (&full, 1, 2),
+        (&window, 1, 2),
+        (&removed(1), 1, 2),
+        (&full, 20, 2),
+        (&removed(0), 7, 2),
+        (&removed(0), 1, 1),
+    ] {
+        (0..times).for_each(|_| table.apply(&index, id, event).unwrap());
+        assert_eq!(index.stats().blocks[0], device);
+    }
+    assert_eq!(table.apply(&index, id, &opaque), Err(DropReason::Namespace));
+}
+
 fn resident_bytes() -> u64 {
     let statm = std::fs::read_to_string("/proc/self/statm").unwrap();
     statm
@@ -345,8 +382,8 @@ fn bench_query_16_workers_100k_tokens() {
         index.apply(holders[i as usize % 16], &[op]);
     }
     let tokens: Vec<u32> = (0..100_000).map(|i| (i * 7919 % 150_000) as u32).collect();
-    let started = Instant::now();
-    let prefix = hash::prefix_hashes(&tokens, BS, &Namespace::default());
+    let (ns, started) = (Namespace::default(), Instant::now());
+    let prefix = hash::prefix_hashes(&tokens, BS, &ns);
     println!("prefix hashes of 100k tokens: {:?}", started.elapsed());
     let mut held = [0; 16];
     for (name, full) in [
@@ -369,19 +406,23 @@ fn bench_query_16_workers_100k_tokens() {
             index.apply(*holder, &ops);
             held[k] = target;
         }
-        let mut samples: Vec<Duration> = (0..2000)
-            .map(|_| {
-                let started = Instant::now();
-                let found = index.find_matches(&MatchQuery {
-                    prefix: &prefix,
-                    holders: &holders,
-                });
-                assert_eq!(found.len(), 16);
-                started.elapsed()
-            })
-            .collect();
-        samples.sort();
-        println!("{name}: p50 {:?}, p99 {:?}", samples[1000], samples[1980]);
+        for hashing in [false, true] {
+            let mut samples: Vec<Duration> = (0..2000)
+                .map(|_| {
+                    let started = Instant::now();
+                    let fresh = hashing.then(|| hash::prefix_hashes(&tokens, BS, &ns));
+                    let found = index.find_matches(&MatchQuery {
+                        prefix: fresh.as_deref().unwrap_or(&prefix),
+                        holders: &holders,
+                    });
+                    assert_eq!(found.len(), 16);
+                    started.elapsed()
+                })
+                .collect();
+            samples.sort();
+            let (p50, p99) = (samples[1000], samples[1980]);
+            println!("{name}, hashing {hashing}: p50 {p50:?}, p99 {p99:?}");
+        }
     }
 }
 
@@ -450,19 +491,59 @@ fn exact_sources_answer_alone_and_partial_ones_add_predictions() {
         summary(&provider),
         [
             Some((8, HitSource::Events, true)),
-            Some((16, HitSource::Events, false)),
+            Some((16, HitSource::Predicted, false)),
             Some((16, HitSource::Predicted, false)),
             None,
         ]
     );
+    let mut multimodal = PrefixRequest::new("m", &tokens, Namespace::default());
+    multimodal.multimodal = true;
+    provider.on_routed(workers[3].as_ref(), &multimodal);
+    assert_eq!(
+        provider.match_workers(&multimodal, &workers),
+        [None, None, None, None]
+    );
+    assert_eq!(summary(&provider)[3], None);
     let expired = IndexProvider::new(Duration::ZERO, 4);
     expired.on_routed(workers[2].as_ref(), &req);
     assert_eq!(summary(&expired)[2], None);
     provider.remove_worker(workers[1].url());
     assert_eq!(summary(&provider)[1], None);
-    // Routing to an exact source recorded no prediction.
+    // The exact source's prediction counts once its trust drops.
     provider.set_trust(workers[0].url(), &key, Trust::Partial);
-    assert_eq!(summary(&provider)[0], Some((8, HitSource::Events, false)));
+    assert_eq!(
+        summary(&provider)[0],
+        Some((16, HitSource::Predicted, false))
+    );
+}
+
+#[test]
+fn predictions_extend_when_routed_again_and_idle_ones_give_back_their_lane() {
+    let ttl = Duration::from_millis(200);
+    let provider = IndexProvider::new(ttl, 4);
+    let workers = workers(&["a", "b"]);
+    let (a_tokens, b_tokens): (Vec<u32>, Vec<u32>) = ((0..16).collect(), (100..116).collect());
+    let first = PrefixRequest::new("m", &a_tokens, Namespace::default());
+    let second = PrefixRequest::new("m", &b_tokens, Namespace::default());
+    let predicted = |req: &PrefixRequest<'_>| -> Vec<Option<u32>> {
+        let hits = provider.match_workers(req, &workers);
+        hits.into_iter()
+            .map(|hit| hit.map(|hit| hit.tokens[0]))
+            .collect()
+    };
+    provider.on_routed(workers[0].as_ref(), &first);
+    std::thread::sleep(ttl * 3 / 5);
+    provider.on_routed(workers[0].as_ref(), &first);
+    std::thread::sleep(ttl * 3 / 5);
+    // Past the first deadline: this routing sweeps, and keeps the extended blocks.
+    provider.on_routed(workers[0].as_ref(), &second);
+    assert_eq!(predicted(&first), [Some(16), None]);
+    std::thread::sleep(ttl * 6 / 5);
+    assert_eq!(predicted(&first), [None, None]);
+    // `b` takes the lane `a` gave back, without `a`'s blocks.
+    provider.on_routed(workers[1].as_ref(), &second);
+    assert_eq!(predicted(&first), [None, None]);
+    assert_eq!(predicted(&second), [None, Some(16)]);
 }
 
 #[derive(Debug, Default)]
@@ -541,8 +622,9 @@ async fn prefill_and_decode_share_the_prefix_request() {
     assert_eq!(*regular.seen.lock(), [None]);
 }
 
-/// The query policies see: 16 partial workers, each holding (k+1)/16 of a 100k-token
-/// prefix by events and all of it by prediction, in one partition with 1M other entries.
+/// The query policies see, hashing the request included: 16 partial workers, each holding
+/// (k+1)/16 of a 100k-token prefix by events and all of it by prediction, in one partition
+/// with 1M other entries.
 #[test]
 #[ignore]
 fn bench_match_workers_16_partial_workers() {
@@ -575,6 +657,7 @@ fn bench_match_workers_16_partial_workers() {
     let mut samples: Vec<Duration> = (0..2000)
         .map(|_| {
             let started = Instant::now();
+            let req = PrefixRequest::new("m", &tokens, Namespace::default());
             let hits = provider.match_workers(&req, &workers);
             assert!(hits
                 .iter()
@@ -584,7 +667,7 @@ fn bench_match_workers_16_partial_workers() {
         .collect();
     samples.sort();
     println!(
-        "match_workers, 16 partial workers: p50 {:?}, p99 {:?}",
+        "match_workers with hashing, 16 partial workers: p50 {:?}, p99 {:?}",
         samples[1000], samples[1980]
     );
 }
