@@ -67,8 +67,9 @@ mono_decode_installers = {
 }
 # Speculative methods each architecture serves under pipeline_parallel_size > 1
 # (its drafts verified per stage, its drafter's aux taps relayed across stages).
-# Each one's drafter shares the target's embedding, which the last stage then
-# builds (models.utils.pp_holds_embedding).
+# Each one's drafter shares the target's embedding: the first stage builds it,
+# and the last stage builds a copy unless this is a P/D producer
+# (models.utils.pp_holds_embedding).
 pp_speculative_methods = {
     "KimiK3ForConditionalGeneration": ("dspark",),
 }

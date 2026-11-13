@@ -142,14 +142,15 @@ def pp_holds_embedding(atom_config) -> bool:
     producer's drafter only writes context K/V (`Drafter.context_kv_only`)."""
     from aiter.dist.parallel_state import get_pp_group
 
-    from atom.kv_transfer.disaggregation.types import kv_config_has_producer
+    from atom.kv_transfer.disaggregation import kv_config_has_producer
     from atom.models.registry import serves_pp_speculation
 
     pp = get_pp_group()
-    if pp.is_first_rank:
-        return True
-    producer = kv_config_has_producer(getattr(atom_config, "kv_transfer_config", None))
-    return pp.is_last_rank and serves_pp_speculation(atom_config) and not producer
+    return pp.is_first_rank or (
+        pp.is_last_rank
+        and serves_pp_speculation(atom_config)
+        and not kv_config_has_producer(atom_config.kv_transfer_config)
+    )
 
 
 # NOTE: don't use lru_cache here because it can prevent garbage collection

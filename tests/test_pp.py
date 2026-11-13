@@ -239,7 +239,7 @@ def test_pp_holds_embedding(
     config = types.SimpleNamespace(
         hf_config=types.SimpleNamespace(architectures=[arch]),
         speculative_config=spec,
-        kv_transfer_config={"kv_role": "kv_producer"} if producer else None,
+        kv_transfer_config={"kv_role": "kv_producer"} if producer else {},
     )
     assert pp_holds_embedding(config) is holds
 
