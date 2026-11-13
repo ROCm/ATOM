@@ -4426,7 +4426,7 @@ class Scheduler:
         num_placeholder = self.mtp_k + 1
 
         for seq in self.running:
-            error = getattr(fwd_output, "constraint_errors", {}).get(seq.id)
+            error = fwd_output.constraint_errors.get(seq.id)
             if error is not None:
                 logger.error(
                     "Structured decoding failed for request %s: %s", seq.id, error
