@@ -2447,7 +2447,11 @@ def test_engine_core_dispatches_idle_lookup_unpin_metadata(monkeypatch):
 
     core = EngineCore.__new__(EngineCore)
     core.kv_transfer_enabled = True
-    core.scheduler = SimpleNamespace(kv_connector=_Connector())
+    core.scheduler = SimpleNamespace(
+        kv_connector=_Connector(),
+        _publish_state_loads=lambda: None,
+        _publish_state_stores=lambda: None,
+    )
     core.runner_mgr = SimpleNamespace(
         call_func=lambda name, value: dispatched.append((name, value))
     )
@@ -5831,7 +5835,11 @@ def _idle_engine(meta: LMCacheOffloadMetadata):
     )
     return SimpleNamespace(
         kv_transfer_enabled=True,
-        scheduler=SimpleNamespace(kv_connector=connector),
+        scheduler=SimpleNamespace(
+            kv_connector=connector,
+            _publish_state_loads=lambda: None,
+            _publish_state_stores=lambda: None,
+        ),
         runner_mgr=_RecordingRunnerMgr(),
         pp_transport=_RecordingPPTransport(),
     )
@@ -5879,6 +5887,22 @@ def test_dispatch_skips_metadata_with_no_work_at_all():
 
     assert engine.runner_mgr.calls == []
     assert engine.pp_transport.sent == []
+
+
+def test_pp_head_shutdown_drain_publishes_no_state_work():
+    from atom.model_engine.pp_engine_core import PPEngineCoreProc
+
+    published = []
+    engine = _idle_engine(LMCacheOffloadMetadata())
+    engine.scheduler._publish_state_loads = lambda: published.append("loads")
+    engine.scheduler._publish_state_stores = lambda: published.append("stores")
+    engine._dispatch_connector_only_batch = lambda batch: None
+
+    PPEngineCoreProc._dispatch_idle_offload_work(engine, dispatch_new=False)
+    assert published == []
+
+    PPEngineCoreProc._dispatch_idle_offload_work(engine)
+    assert published == ["loads", "stores"]
 
 
 def test_multi_metadata_exposes_sub_meta_unpins():
@@ -5935,7 +5959,9 @@ def test_only_k3_scales_the_default_pending_saves_with_pp(monkeypatch):
     monkeypatch.setenv("OFFLOAD_COPY_WORKERS", "1")
     monkeypatch.setattr(DenseOffloadScheduler, "__init__", lambda self, config: None)
     config = SimpleNamespace(kv_transfer_config={}, pipeline_parallel_size=8)
+    monkeypatch.setattr(offcfg, "select_offload_layout", lambda _config: "kimi_k3")
     assert KimiK3OffloadScheduler(config)._max_pending_saves == 16
+    monkeypatch.setattr(offcfg, "select_offload_layout", lambda _config: "qwen")
     assert QwenOffloadScheduler(config)._max_pending_saves == 2
 
 

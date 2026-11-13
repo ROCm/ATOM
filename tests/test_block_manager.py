@@ -1027,6 +1027,24 @@ def test_pipeline_parallelism_hosts_the_state_tier(monkeypatch):
     assert bm.state_tier_capability.reason == ""
 
 
+def test_qwen_keeps_no_state_tier_under_pipeline_parallelism(monkeypatch):
+    """Qwen keeps fork checkpoints under PP, which do not span the stages, so
+    its worker turns the tier off and no index may offer loads against it."""
+    from atom.kv_transfer.offload import config as offcfg
+
+    monkeypatch.setattr(offcfg, "select_offload_layout", lambda _config: "qwen")
+    cfg = MockConfig(
+        enable_prefix_caching=True,
+        kv_transfer_config=_OFFLOAD_KVC,
+        pool_entries={"state": 4},
+        pool_entries_per_req={"state": 1},
+    )
+    cfg.pipeline_parallel_size = 2
+    bm = BlockManager(cfg)
+    assert bm.state_offload is None
+    assert "pipeline_parallel_size=2" in bm.state_tier_capability.reason
+
+
 def test_a_producer_role_stores_but_never_votes_for_a_load(monkeypatch):
     bm = _bm_with_state_tier(monkeypatch, {**_OFFLOAD_KVC, "kv_role": "kv_producer"})
     assert bm.state_offload is not None
