@@ -571,6 +571,11 @@ class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
     def close(self):
         self._lookup_client.close()
 
+    def _tier_lookup_kwargs(self, seq: Any) -> dict:
+        # Native Store keys chain from `Sequence.cache_seed`, the source of the
+        # media salt, so the lookup takes no salt argument.
+        return {}
+
     def _lookup_token_ids(self, seq: Any) -> Any:
         """The sequence itself: the lookup hashes its prompt once per sequence.
 

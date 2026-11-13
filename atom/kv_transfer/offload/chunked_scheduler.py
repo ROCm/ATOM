@@ -276,7 +276,9 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             if self._lookup_len(seq) <= 0:
                 continue
             budget -= 1
-            if submit(self._lookup_token_ids(seq), sid, **tier_lookup_kwargs(seq)):
+            if submit(
+                self._lookup_token_ids(seq), sid, **self._tier_lookup_kwargs(seq)
+            ):
                 self._perf_bump("lookup_prefetched")
         self._perf_bump("prefetch_us", int((time.perf_counter() - t0) * 1e6))
 
@@ -355,7 +357,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         client = self._lookup_client
         if sid not in client.pending_ids():
             if not client.submit(
-                self._lookup_token_ids(seq), sid, **tier_lookup_kwargs(seq)
+                self._lookup_token_ids(seq), sid, **self._tier_lookup_kwargs(seq)
             ):
                 return False
             self._perf_bump("lookup_detached_sent")
@@ -436,6 +438,11 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             self._save_tracker[sid][1] = tokens
             return True
         return False
+
+    def _tier_lookup_kwargs(self, seq) -> dict:
+        """A tier lookup's arguments past the prompt: the media salt, for a tier
+        that keys by it through the call."""
+        return tier_lookup_kwargs(seq)
 
     def lookup_pending(self, seq) -> bool:
         """True while admission should pass over `seq`: its lookup is in flight.
@@ -539,7 +546,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         _t0 = time.perf_counter()
         try:
             hit = self._lookup_client.lookup(
-                token_ids, lookup_id=sid, **tier_lookup_kwargs(seq)
+                token_ids, lookup_id=sid, **self._tier_lookup_kwargs(seq)
             )
             _us = int((time.perf_counter() - _t0) * 1e6)
             self._perf_bump("lookup_n")

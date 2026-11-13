@@ -1756,6 +1756,9 @@ def test_lookup_hashes_a_sequence_prompt_once(cluster):
     assert prompt_chunk_hashes(seq, CHUNK) == b"\x01" * 32
     media = _seq(5, 20, cache_seed=77)
     assert prompt_chunk_hashes(media, CHUNK) != _hashes(16)
+    # The salt rides in the keys; the lookup call takes no salt argument.
+    assert scheduler._tier_lookup_kwargs(media) == {}
+    assert _completed_lookup(scheduler._lookup_client, media) == 0
 
 
 # --- scheduler metadata -----------------------------------------------------
