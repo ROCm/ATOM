@@ -187,7 +187,7 @@ class PdAdmissionController:
             demand = probe.num_new_blocks - self._block_manager.draft_lookahead_blocks(
                 len(seq)
             )
-            reserve = self._growth_reserve(seq, running)
+            reserve = self._growth_reserve(seq, num_blocks, running)
             if self._block_manager.kv.num_free - demand < reserve:
                 hit.append("free_kv")
         if not hit:
@@ -204,7 +204,7 @@ class PdAdmissionController:
                 self.deferred[reason] += 1
         return False, plan
 
-    def _growth_reserve(self, seq, running) -> int:
+    def _growth_reserve(self, seq, num_blocks, running) -> int:
         """Blocks `seq` and every admitted request need to grow by the reserve.
 
         An admitted request is pending or running, counted once: a ready one
@@ -214,11 +214,9 @@ class PdAdmissionController:
         for entry in self.pending.values():
             if not entry.cancelled:
                 growing.setdefault(entry.sequence.id, entry.sequence)
-        # `seq` will hold just its prompt's blocks; `check` left its draft
-        # lookahead to this reserve.
-        reserve = self._growth_blocks(
-            seq, self._block_manager.num_pool_blocks(len(seq))
-        )
+        # `seq` will hold just its prompt's `num_blocks`; `check` left its
+        # draft lookahead to this reserve.
+        reserve = self._growth_blocks(seq, num_blocks)
         for admitted in growing.values():
             reserve += self._growth_blocks(admitted, len(admitted.block_table))
         return reserve
