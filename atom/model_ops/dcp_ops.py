@@ -452,7 +452,7 @@ def _dcp_a2a_pack_kernel(
     send_stride_b,
     send_stride_h,
     H_LOCAL: tl.constexpr,
-    H_BLOCK: tl.constexpr,
+    H_ROUNDED: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     LSE_PACK: tl.constexpr,
     HAS_OWNED_COUNTS: tl.constexpr,
@@ -463,14 +463,14 @@ def _dcp_a2a_pack_kernel(
     H_LOCAL-head slice: one program per (token, head) leaves the kernel
     launch-bound. Head ``h`` belongs to destination ``h // H_LOCAL`` -- the same
     contiguous split the ReduceScatter path uses, so a rank ends up owning
-    exactly the heads it owned before. H_BLOCK rounds H_LOCAL up to the power of
+    exactly the heads it owned before. H_ROUNDED rounds H_LOCAL up to the power of
     two ``tl.arange`` needs; the extra lanes alias lane 0 and are masked on
     store.
     """
     b = tl.program_id(axis=0).to(tl.int64)
     dst = tl.program_id(axis=1).to(tl.int64)
 
-    hb = tl.arange(0, H_BLOCK)
+    hb = tl.arange(0, H_ROUNDED)
     h_valid = hb < H_LOCAL
     # Padding lanes alias lane 0, so their loads read lane 0's (valid) data and
     # no pointer is formed past this destination's slice; only stores are masked.
@@ -771,6 +771,7 @@ def cp_lse_a2a(
         f"got H={h_total}, N={n_ranks}"
     )
     h_local = h_total // n_ranks
+    h_rounded = triton.next_power_of_2(h_local)
 
     dtype = cp_attn_out.dtype
     pack = _lse_pack_slots(dtype)
@@ -801,7 +802,7 @@ def cp_lse_a2a(
         send.stride(1),
         send.stride(2),
         H_LOCAL=h_local,
-        H_BLOCK=triton.next_power_of_2(h_local),
+        H_ROUNDED=h_rounded,
         HEAD_DIM=head_dim,
         LSE_PACK=pack,
         HAS_OWNED_COUNTS=has_owned_counts,
@@ -828,7 +829,7 @@ def cp_lse_a2a(
             n_ranks,
             HEAD_DIM=head_dim,
             H_LOCAL=h_local,
-            H_ROUNDED=triton.next_power_of_2(h_local),
+            H_ROUNDED=h_rounded,
             LSE_PACK=pack,
             N_ROUNDED=triton.next_power_of_2(n_ranks),
             FP8_MAX=float(torch.finfo(quant_dtype).max),

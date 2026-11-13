@@ -679,7 +679,7 @@ def _a2a_roundtrip(o_per_rank, lse_per_rank, n_ranks, owned_counts_per_rank=None
             send.stride(1),
             send.stride(2),
             H_LOCAL=h_local,
-            H_BLOCK=triton.next_power_of_2(h_local),
+            H_ROUNDED=triton.next_power_of_2(h_local),
             HEAD_DIM=d,
             LSE_PACK=pack,
             HAS_OWNED_COUNTS=has_owned_counts,
