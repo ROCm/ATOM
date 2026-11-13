@@ -97,6 +97,8 @@ class _Case:
             num_blocks=8,
             bytes_per_block=4,
             has_fused_chunk_major_staging=True,
+            record_prepared_block_id_completion=lambda owner: None,
+            finish_prepared_block_id_groups=lambda owner, *, safe: None,
             gpu_to_chunk_major_device_buffer=self.legacy_launch,
             chunk_major_device_buffer_to_gpu=self.legacy_launch,
         )
