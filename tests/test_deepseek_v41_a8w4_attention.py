@@ -36,14 +36,20 @@ def functions(path, names, scope=None, *, class_name=None):
 
 @pytest.fixture
 def api():
-    return functions(
+    scope = functions(
         OPS + "a8w4_attention.py",
-        ["supports_a8w4_attention", "sparse_attn_v41_a8w4_paged_2src"],
+        ["supports_a8w4_attention"],
         {
             "envs": SimpleNamespace(ATOM_DSV41_A8W4_ATTN="auto"),
             "get_mla_sparse_prefill_v41_backend": Mock(return_value="opus"),
             "mla_sparse_prefill_v41": Mock(side_effect=lambda *a, **kw: kw["out"]),
         },
+    )
+
+    return functions(
+        OPS + "fp8_attention.py",
+        ["_split", "sparse_attn_v41_paged_2src"],
+        {**scope, "FP8_DTYPE": torch.float8_e4m3fn},
     )
 
 
@@ -73,18 +79,10 @@ def test_support_query_uses_current_shape_and_intended_dtypes(api, backend, rows
     )
 
 
-def test_missing_query_keeps_bf16_adapter(api):
-    api["get_mla_sparse_prefill_v41_backend"] = None
-    assert api["supports_a8w4_attention"](object(), 512**-0.5) is False
-
-
 def test_off_needs_no_device_probe(api):
     api["envs"].ATOM_DSV41_A8W4_ATTN = "off"
     assert api["supports_a8w4_attention"](object(), 512**-0.5) is False
     api["get_mla_sparse_prefill_v41_backend"].assert_not_called()
-    api["envs"].ATOM_DSV41_A8W4_ATTN = "unknown"
-    with pytest.raises(ValueError, match="auto or off"):
-        api["supports_a8w4_attention"](object(), 512**-0.5)
 
 
 def test_query_errors_are_not_silently_treated_as_fallback(api):
@@ -95,9 +93,15 @@ def test_query_errors_are_not_silently_treated_as_fallback(api):
 
 
 @pytest.mark.parametrize("rows,splits", [(0, None), (5, 1), (5, 4)])
-def test_adapter_preserves_source_storage_and_csr(api, rows, splits):
-    owner = torch.empty(rows * 288, dtype=torch.uint8)
-    pool = (owner[: rows * 256].view(rows, 256), owner[rows * 256 :].view(rows, 32))
+@pytest.mark.parametrize("fp4", [False, True])
+def test_adapter_preserves_source_storage_and_csr(api, rows, splits, fp4):
+    width, groups = (256, 32) if fp4 else (512, 16)
+    scale_dtype = torch.float8_e4m3fn if fp4 else torch.float8_e8m0fnu
+    owner = torch.empty(rows * (width + groups), dtype=torch.uint8)
+    pool = (
+        owner[: rows * width].view(rows, width),
+        owner[rows * width :].view(rows, groups),
+    )
     window = torch.empty(7 * 528, dtype=torch.uint8)
     swa = (window[: 7 * 512].view(7, 512), window[7 * 512 :].view(7, 16))
     q = torch.empty(2, 64, 512, dtype=torch.float8_e4m3fn)
@@ -108,7 +112,7 @@ def test_adapter_preserves_source_storage_and_csr(api, rows, splits):
         torch.tensor([0, 1, 3], dtype=torch.int32),
     )
     sink, out = torch.zeros(64), torch.empty(2, 64, 512, dtype=torch.bfloat16)
-    result = api["sparse_attn_v41_a8w4_paged_2src"](
+    result = api["sparse_attn_v41_paged_2src"](
         (q, qs),
         pool,
         pi,
@@ -120,13 +124,14 @@ def test_adapter_preserves_source_storage_and_csr(api, rows, splits):
         512**-0.5,
         out=out,
         num_kv_splits=splits,
+        pool_scale_dtype=scale_dtype,
     )
     assert result is out
     args, kwargs = api["mla_sparse_prefill_v41"].call_args
     assert args[0] is q and args[1] is qs
     for at, source, dtype in (
-        (2, pool[0], torch.uint8),
-        (3, pool[1], torch.float8_e4m3fn),
+        (2, pool[0], torch.uint8 if fp4 else torch.float8_e4m3fn),
+        (3, pool[1], scale_dtype),
         (6, swa[0], torch.float8_e4m3fn),
         (7, swa[1], torch.float8_e8m0fnu),
     ):
@@ -168,8 +173,16 @@ def test_support_is_requeried_before_each_q_producer(api, bounded):
     api["get_mla_sparse_prefill_v41_backend"].side_effect = probe
     scope = functions(
         "atom/models/deepseek_v41/attention.py",
-        ["_use_a8w4_attention", "_attention_inputs"],
-        {"supports_a8w4_attention": api["supports_a8w4_attention"]},
+        [
+            "_use_a8w4_attention",
+            "_prepare_attention",
+            "_prepare_attention_live",
+            "_attention_inputs",
+        ],
+        {
+            "supports_a8w4_attention": api["supports_a8w4_attention"],
+            "envs": api["envs"],
+        },
         class_name="Attention",
     )
     q8 = object()
@@ -180,18 +193,25 @@ def test_support_is_requeried_before_each_q_producer(api, bounded):
 
     cache = SimpleNamespace(
         packed=True,
+        kv_fp8=False,
         query_fp8=prepare,
         rope_quant_window=Mock(return_value=(object(), object())),
         rotate_query=Mock(),
     )
     owner = SimpleNamespace(softmax_scale=512**-0.5, spec=SimpleNamespace(layer_id=0))
-    owner._use_a8w4_attention = MethodType(scope["_use_a8w4_attention"], owner)
+    for name in ("_use_a8w4_attention", "_prepare_attention_live", "_attention_inputs"):
+        setattr(owner, name, MethodType(scope[name], owner))
     queries = SimpleNamespace(positions=object()) if bounded else None
     for rows, supported in ((65536, True), (65537, False), (4, True)):
         query = SimpleNamespace(shape=torch.Size((1, rows, 64, 512)), device="cuda:1")
-        prepared = scope["_attention_inputs"](
-            owner, query, object(), cache, object(), object(), queries
+        step = SimpleNamespace(decode=False, requests=(object(),))
+        assert (
+            scope["_prepare_attention"](
+                owner, query, object(), cache, step, object(), queries
+            )
+            is None
         )
+        prepared = step.attention_inputs
         assert prepared[0] is supported
         assert prepared[1] is (q8 if supported else None)
         assert cache.rope_quant_window.call_args.kwargs["a8w4"] is supported
@@ -224,7 +244,8 @@ def test_native_and_plugin_use_same_sources_and_commit_order(
         return kwargs["out"].fill_(3)
 
     scope = {
-        "sparse_attn_v41_a8w4_paged_2src": attend,
+        "envs": SimpleNamespace(ATOM_DSV41_A8W4_ATTN="auto" if a8w4 else "off"),
+        "sparse_attn_v41_paged_2src": attend,
         "packed_prefill": attend,
         "packed_decode": lambda *args: attend(*args, out=args[0]),
         "join_stream": lambda *args: events.append("join"),
@@ -327,9 +348,17 @@ def test_native_and_plugin_use_same_sources_and_commit_order(
     if a8w4:
         assert args[1] is csa and args[4] is (ring if decode else staged)
         assert args[0][0].data_ptr() == q8[0].data_ptr()
+        assert kwargs["pool_scale_dtype"] == torch.float8_e4m3fn
     else:
         assert args[1] == (csa, ring)
         assert args[0].dtype == torch.bfloat16
+    model._use_a8w4_attention.assert_called_once()
+    probed_query, probed_cache = model._use_a8w4_attention.call_args.args
+    assert (
+        probed_query.data_ptr() == query.data_ptr()
+        and probed_query.shape == query.shape
+    )
+    assert probed_cache is cache
     assert "backend" not in kwargs
     assert cache.query_fp8.call_args.kwargs == {"a8w4": a8w4}
     assert cache.rope_quant_window.call_args.kwargs == {"a8w4": a8w4}

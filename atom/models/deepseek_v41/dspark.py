@@ -214,9 +214,7 @@ class DeepseekV41DSpark(DSparkDraftModel):
                 "V4.1 DSpark needs draft stages and a positive block width"
             )
         self.config = args
-        self.draft_kv_dtype = getattr(
-            getattr(config, "dspark", None), "draft_kv_dtype", "auto"
-        )
+        self.draft_kv_dtype = config.dspark.draft_kv_dtype
         self.block_size = args.dspark_block_size
         self.window_size, self.vocab_size = args.sliding_window, args.vocab_size
         draft = copy(args)
@@ -600,7 +598,7 @@ class DeepseekV41DSpark(DSparkDraftModel):
         # in the layer, so indexing them one at a time spent a gather and a
         # `.long()` cast apiece. The slices below are views.
         layer_ids = self._context_layer_ids(slots.device)
-        if getattr(self, "draft_kv_dtype", "auto") == "fp8":
+        if self.draft_kv_dtype == "fp8":
             windows = cache.read_window_planes(layer_ids, slots)
             context = {
                 layer.spec.layer_id: tuple(p[i] for p in windows)

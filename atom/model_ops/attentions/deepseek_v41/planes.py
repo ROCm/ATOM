@@ -66,11 +66,10 @@ def prefill_window(history, step, ring):
     batches = step.cu_seqlens_q.numel() - 1
     rows = batches * ring
     size = (rows + step.running_tokens) * (dim + dim // 32)
-    source = getattr(step, "prefill_window_staging", None)
+    source = step.prefill_window_staging
     if source is None:
-        # Standalone callers have no cache/builder to reserve scratch for them.
-        source = torch.empty(size, dtype=torch.uint8, device=history[0].device)
-    elif source.numel() < size:
+        raise ValueError("Prefill window staging must be reserved before preparation")
+    if source.numel() < size:
         raise ValueError("Prefill window staging is smaller than the live step")
     planes = split_source(source[:size], dim)
     if batches:

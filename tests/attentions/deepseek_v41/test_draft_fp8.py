@@ -190,6 +190,7 @@ def test_stages_share_one_live_csr_per_draft_round(monkeypatch, dtype, supplied_
     draft.embed = nn.Embedding(8, 32, device="cuda", dtype=torch.bfloat16)
     draft.head = nn.Identity()
     draft.block_size, draft.window_size = 5, 128
+    draft.draft_kv_dtype = "fp8" if dtype == "fp8" else "auto"
     draft.config = SimpleNamespace(hc_mult=4)
     draft.rope = None
     draft._noise_embedding = lambda: draft.embed.weight[0]

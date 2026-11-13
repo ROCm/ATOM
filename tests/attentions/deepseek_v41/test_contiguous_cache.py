@@ -303,7 +303,9 @@ def test_prefill_source_retains_history_until_ring_commit(dtype):
         request_cached_until=torch.tensor([104, 0]),
         swa_cached_until=torch.tensor([104, 0]),
     )
+    step.prefill_window_staging = torch.empty((2 * 8 + 12) * 528, dtype=torch.uint8)
     source, current = prefill_window(old, step, 8)
+    assert source[0].data_ptr() == step.prefill_window_staging.data_ptr()
     assert source[0].shape == (2 * 8 + 12, 512)
     assert (
         source[0].untyped_storage().data_ptr() == source[1].untyped_storage().data_ptr()
@@ -429,7 +431,9 @@ def test_prefill_scratch_depends_on_batch_capacity_and_keeps_slot_mapping(slots)
         slots=torch.tensor([slots - 1, -1, 1]),
         cu_seqlens_q=torch.tensor([0, 3, 4, 7]),
     )
+    step.prefill_window_staging = torch.empty((3 * 11 + 8) * 528, dtype=torch.uint8)
     source, current = prefill_window((data, scale), step, 11)
+    assert source[0].data_ptr() == step.prefill_window_staging.data_ptr()
     assert source[0].shape == (3 * 11 + 8, 512)
     assert source[1].shape == (3 * 11 + 8, 16)
     assert (source[0][:11] == slots - 1).all()
@@ -470,6 +474,7 @@ def test_a8w4_prefill_reuses_mxfp8_window_and_keeps_history(monkeypatch):
     assert cache.query_fp8(query) is None
     q8 = cache.query_fp8(query, a8w4=True)
     assert q8[0].shape == query.shape and q8[1].shape == (1, 3, 64, 16)
+    cache._reserve_prefill_window(step)
     source, pending = cache.rope_quant_window(1, query, kv, rope, step, q8, a8w4=True)
     assert source[0].shape == (19, 512) and source[1].shape == (19, 16)
     for plane, before, current, width in zip(source, snapshot, pending, (512, 16)):
@@ -755,3 +760,18 @@ def test_prefill_request_counts_reuse_indices_kernel(dtype, monkeypatch):
             cache_misses.clear()  # The first request count may compile once.
         else:
             assert not cache_misses, "request count introduced a new specialization"
+
+
+@pytest.mark.parametrize("size", [None, 527])
+def test_prefill_requires_a_sufficient_reserved_buffer(size):
+    cache = PagedAttentionCache(geometry("fp8"), 7, 4, "cpu")
+    step = SimpleNamespace(
+        running_tokens=1,
+        slots=torch.tensor([0]),
+        cu_seqlens_q=torch.tensor([0, 1]),
+        prefill_window_staging=(
+            None if size is None else torch.empty(size, dtype=torch.uint8)
+        ),
+    )
+    with pytest.raises(ValueError, match="staging"):
+        prefill_window(cache.ring_view(0), step, 8)

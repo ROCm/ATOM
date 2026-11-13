@@ -196,3 +196,12 @@ def test_vllm_proxy_and_native_preserve_the_same_fp4_pool(chip):
     assert actual == geometry(native)
     assert api["v41_kv_cache_dtype"](plugin) == "fp4"
     assert api["v41_proxy_geometry"](plugin) is actual
+
+
+def test_invalid_a8w4_mode_fails_at_startup_before_loading(monkeypatch):
+    monkeypatch.setenv("ATOM_DSV41_A8W4_ATTN", "unknown")
+    loader = Mock(side_effect=AssertionError("model loading started"))
+    monkeypatch.setattr(config_module, "get_hf_config", loader)
+    with pytest.raises(ValueError, match="ATOM_DSV41_A8W4_ATTN must be auto or off"):
+        Config(model="unused-local-config")
+    loader.assert_not_called()

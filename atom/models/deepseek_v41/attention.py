@@ -22,7 +22,6 @@ from aiter.ops.inverse_rope_group_quant import inverse_rope_group_quant
 from torch import nn
 
 from atom.model_ops.attentions.deepseek_v41.a8w4_attention import (
-    sparse_attn_v41_a8w4_paged_2src,
     supports_a8w4_attention,
 )
 from atom.model_ops.attentions.deepseek_v41.fp8_attention import (
@@ -50,7 +49,7 @@ from atom.model_ops.linear import (
 )
 from atom.model_ops.utils import atom_parameter
 from atom.model_ops.v4_kernels import sparse_attn_v4_paged_2src
-from atom.utils import forward_context
+from atom.utils import envs, forward_context
 from atom.utils.region_graph import eager_region, forks, join_stream
 
 from .config import AttentionMode
@@ -527,23 +526,30 @@ class Attention(nn.Module):
         Quantized prefill also stages per-request SWA history, and bounded
         replay may change the query rows, so those paths need live preparation.
         """
-        a8w4 = self._use_a8w4_attention(query, cache)
-        if queries is not None or (not step.decode and (cache.kv_fp8 or a8w4)):
+        if queries is not None or (
+            not step.decode
+            and (cache.kv_fp8 or (cache.packed and envs.ATOM_DSV41_A8W4_ATTN != "off"))
+        ):
+            # FP4 auto eligibility can change with live query dimensions.
+            # Query inside the live region, never in the captured caller too.
             self._prepare_attention_live(query, kv_normed, cache, step, rope, queries)
             return None
-        return self._attention_inputs(query, kv_normed, cache, step, rope, queries)
+        a8w4 = self._use_a8w4_attention(query, cache)
+        return self._attention_inputs(
+            query, kv_normed, cache, step, rope, queries, a8w4=a8w4
+        )
 
     @eager_region(live=_live_rows)
     def _prepare_attention_live(self, query, kv_normed, cache, step, rope, queries):
         """Keep request-dependent source addresses on the live step."""
         if not step.requests:
             return
+        a8w4 = self._use_a8w4_attention(query, cache)
         step.attention_inputs = self._attention_inputs(
-            query, kv_normed, cache, step, rope, queries
+            query, kv_normed, cache, step, rope, queries, a8w4=a8w4
         )
 
-    def _attention_inputs(self, query, kv_normed, cache, step, rope, queries):
-        a8w4 = self._use_a8w4_attention(query, cache)
+    def _attention_inputs(self, query, kv_normed, cache, step, rope, queries, *, a8w4):
         query_fp8 = cache.query_fp8(query, a8w4=a8w4)
         if queries is None:
             kv, window_kv = cache.rope_quant_window(
@@ -574,12 +580,11 @@ class Attention(nn.Module):
         if cache.packed and not a8w4:
             pool = (pool, cache.ring_view(self.spec.layer_id))
         kwargs = {"out": flat_query}
-        if a8w4:
-            attend = sparse_attn_v41_a8w4_paged_2src
-            attending = tuple(part.flatten(0, 1) for part in query_fp8)
-        elif cache.kv_fp8:
+        if a8w4 or cache.kv_fp8:
             attend = sparse_attn_v41_paged_2src
             attending = tuple(part.flatten(0, 1) for part in query_fp8)
+            if a8w4:
+                kwargs["pool_scale_dtype"] = torch.float8_e4m3fn
         else:
             attend = packed_prefill if cache.packed else sparse_attn_v4_paged_2src
             attending = flat_query

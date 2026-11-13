@@ -125,8 +125,6 @@ def _fused_compress_attn_kernel(
     # ── Optional latent echo, before the rotation ───────────────────────
     latent_out_ptr,  # [plan_capacity, head_dim]; dummy ptr when LATENT_OUT=0
     latent_out_row_stride,
-    rotated_out_ptr,  # post-RoPE echo for separate quantized planes
-    rotated_out_row_stride,
     # ── KV cache scatter (paged) ────────────────────────────────────────
     kv_cache_ptr,  # bf16: [NB, k_per_block, head_dim] / fp8: [NB, k_per_block, head_dim]
     kv_cache_block_stride,
@@ -155,7 +153,6 @@ def _fused_compress_attn_kernel(
     #   ≤ STATE_SIZE; used for `s = position - K + 1 + k_static` loop bound
     HAS_BLOCK_TABLE: tl.constexpr,
     LATENT_OUT: tl.constexpr,  # echo the post-norm pre-RoPE latent (CSA2 index key)
-    ROTATED_OUT: tl.constexpr,
     # `update_compressor_states`'s rows as this launch's last programs
     WRITE_RING: tl.constexpr,
     BLOCK_RING: tl.constexpr,  # = next_pow2(dim_full)
@@ -370,14 +367,6 @@ def _fused_compress_attn_kernel(
     new_odd = odd_v * cos_per_pair + even_v * sin_per_pair
     rotated = tl.interleave(new_even, new_odd)  # [BLOCK_D] fp32
 
-    # Separate value/scale planes quantize this exact BF16 value.
-    if ROTATED_OUT:
-        tl.store(
-            rotated_out_ptr + pid * rotated_out_row_stride + d,
-            rotated.to(rotated_out_ptr.dtype.element_ty),
-            mask=d_mask,
-        )
-
     # ── 4. Cache scatter (paged) ───────────────────────────────────────
     # The Compressor's BF16 return value was historically consumed by sparse
     # attention but is now vestigial — paged_decode/paged_2src read the
@@ -537,8 +526,6 @@ def fused_compress_attn(
     # row. V4 has no use for it -- its indexer compresses its own projection --
     # so this stays None on every V4 call and the store is constexpr'd away.
     latent_out: torch.Tensor | None = None,  # [plan_capacity, head_dim]
-    # Post-RoPE BF16 echo for a pool with separate value/scale planes.
-    rotated_out: torch.Tensor | None = None,
     # `update_compressor_states`' write plan, run as this launch's last
     # programs. The caller vouches that no ring
     # slot it writes is one a boundary here reads: the two launches order
@@ -619,12 +606,7 @@ def fused_compress_attn(
     # The flydsl kernel has no latent echo, no packed rows and no ring update,
     # and a caller that asked for one needs it: dropping to Triton is the only
     # correct answer, and saying so under `always` beats a buffer nobody wrote.
-    _triton_only = (
-        latent_out is not None
-        or rotated_out is not None
-        or packed
-        or write_plan is not None
-    )
+    _triton_only = latent_out is not None or packed or write_plan is not None
     _flydsl_use = (
         flydsl_fused_compress_attn is not None
         and _flydsl_mode in ("auto", "always")
@@ -852,8 +834,6 @@ def fused_compress_attn(
         cos_cache.stride(0),
         latent_out if latent_out is not None else cos_cache,  # placeholder
         latent_out.stride(0) if latent_out is not None else 0,
-        rotated_out if rotated_out is not None else cos_cache,  # placeholder
-        rotated_out.stride(0) if rotated_out is not None else 0,
         kv_cache if has_bt else cos_cache,  # placeholder when no scatter
         kv_cache.stride(0) if has_bt else 0,
         kv_cache.stride(1) if has_bt else 0,
@@ -875,7 +855,6 @@ def fused_compress_attn(
         K=K,
         HAS_BLOCK_TABLE=int(has_bt),
         LATENT_OUT=int(latent_out is not None),
-        ROTATED_OUT=int(rotated_out is not None),
         WRITE_RING=int(write_plan is not None),
         BLOCK_RING=triton.next_power_of_2(dim_full),
         PACKED=packed,

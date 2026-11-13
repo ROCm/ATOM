@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: MIT
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
+import torch
 
 from atom.config import DSparkConfig
 from atom.models.deepseek_v41 import draft_kv
@@ -19,7 +21,7 @@ def config():
         parallel_config=SimpleNamespace(data_parallel_size=1),
         kv_cache_dtype="bf16",
         index_cache_dtype="fp8",
-        hf_config=SimpleNamespace(),
+        hf_config=SimpleNamespace(num_attention_heads=64, head_dim=512),
         speculative_config=SimpleNamespace(
             method="dspark",
             num_speculative_tokens=5,
@@ -175,24 +177,9 @@ def test_dpa_media_rejected_before_tokenization_and_sequence_creation(
 
 @pytest.fixture
 def a8w8_runtime(monkeypatch):
-    modules = {
-        "aiter.jit.utils.chip_info": SimpleNamespace(get_gfx_runtime=lambda: "gfx950"),
-        "aiter.ops.mla_sparse_prefill": SimpleNamespace(
-            mla_sparse_prefill_v41=lambda: None
-        ),
-        "aiter.ops.opus.mla": SimpleNamespace(
-            opus_mla_v41_prefill_a8w8_gfx950_fwd=lambda: None,
-            opus_mla_v41_prefill_a8w8_gfx1250_fwd=lambda: None,
-        ),
-    }
-
-    def load(name):
-        if name not in modules:
-            raise ImportError(name)
-        return modules[name]
-
-    monkeypatch.setattr(draft_kv, "import_module", load)
-    return modules
+    query = Mock(return_value="opus")
+    monkeypatch.setattr(draft_kv, "get_mla_sparse_prefill_v41_backend", query)
+    return query
 
 
 @pytest.mark.parametrize("target_dtype", ["fp8", "fp4"])
@@ -227,50 +214,51 @@ def test_quantized_draft_requires_an_explicit_supported_dtype(dtype):
 
 
 @pytest.mark.parametrize("target_dtype", ["fp4", "fp8"])
-@pytest.mark.parametrize("gfx", ["gfx950", "gfx1250", "gfx942", "gfx1100"])
-def test_explicit_fp8_draft_checks_device_before_execution(
-    target_dtype, gfx, a8w8_runtime
+@pytest.mark.parametrize("tp,dpa", [(1, False), (4, False), (8, False), (4, True)])
+@pytest.mark.parametrize("backend", ["opus", "asm", None])
+def test_explicit_fp8_draft_uses_public_capability(
+    target_dtype, tp, dpa, backend, a8w8_runtime
 ):
     cfg = config()
     cfg.hf_config.model_type = "deepseek_v41_text"
     cfg.plugin_config = None
     cfg.kv_cache_dtype = target_dtype
-    a8w8_runtime["aiter.jit.utils.chip_info"].get_gfx_runtime = lambda: gfx
+    cfg.tensor_parallel_size = tp
+    cfg.enable_dp_attention = dpa
+    a8w8_runtime.return_value = backend
     setting = DSparkConfig(draft_kv_dtype="fp8")
-    if gfx in ("gfx950", "gfx1250"):
-        setting.validate_draft_kv(cfg)
-    else:
-        with pytest.raises(
-            ValueError, match=f"does not support {gfx}.*draft_kv_dtype=auto"
-        ):
+    if backend is None:
+        with pytest.raises(ValueError, match="AITER V4.1 A8W8.*draft_kv_dtype=auto"):
             setting.validate_draft_kv(cfg)
+    else:
+        setting.validate_draft_kv(cfg)
+    a8w8_runtime.assert_called_once_with(
+        torch.device("cuda"),
+        (1, 64 if dpa else 64 // tp, 512),
+        unified_kv_dtype=torch.float8_e4m3fn,
+        softmax_scale=512**-0.5,
+        q_dtype=torch.float8_e4m3fn,
+        q_scale_dtype=torch.float8_e8m0fnu,
+        unified_kv_scale_dtype=torch.float8_e8m0fnu,
+        kv_dtype=torch.float8_e4m3fn,
+        kv_scale_dtype=torch.float8_e8m0fnu,
+        layout="contiguous",
+    )
     assert cfg.kv_cache_dtype == target_dtype
 
 
-@pytest.mark.parametrize("gfx", ["gfx950", "gfx1250"])
-@pytest.mark.parametrize("missing", ["dispatcher", "kernel", "module"])
-def test_explicit_fp8_draft_requires_aiter_interfaces(gfx, missing, a8w8_runtime):
+def test_fp8_draft_capability_errors_are_not_hidden(a8w8_runtime):
     cfg = config()
     cfg.hf_config.model_type = "deepseek_v41_text"
     cfg.plugin_config = None
     cfg.kv_cache_dtype = "fp4"
-    a8w8_runtime["aiter.jit.utils.chip_info"].get_gfx_runtime = lambda: gfx
-    if missing == "module":
-        del a8w8_runtime["aiter.ops.mla_sparse_prefill"]
-    elif missing == "dispatcher":
-        a8w8_runtime["aiter.ops.mla_sparse_prefill"].mla_sparse_prefill_v41 = None
-    else:
-        delattr(
-            a8w8_runtime["aiter.ops.opus.mla"], f"opus_mla_v41_prefill_a8w8_{gfx}_fwd"
-        )
-    with pytest.raises(
-        ValueError, match="draft_kv_dtype=fp8.*AITER.*draft_kv_dtype=auto"
-    ):
+    a8w8_runtime.side_effect = RuntimeError("device query failed")
+    with pytest.raises(RuntimeError, match="device query failed"):
         DSparkConfig(draft_kv_dtype="fp8").validate_draft_kv(cfg)
 
 
-def test_default_draft_needs_no_a8w8_capability_probe(monkeypatch):
-    monkeypatch.setattr(draft_kv, "import_module", lambda name: pytest.fail(name))
+def test_default_draft_needs_no_a8w8_capability_probe(a8w8_runtime):
     setting = DSparkConfig()
     setting.validate_draft_kv(config())
+    a8w8_runtime.assert_not_called()
     assert setting.draft_kv_dtype == "auto"

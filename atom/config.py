@@ -1737,7 +1737,7 @@ class DSparkConfig:
             )
         from atom.models.deepseek_v41.draft_kv import validate_fp8_draft_support
 
-        validate_fp8_draft_support()
+        validate_fp8_draft_support(config)
 
     @classmethod
     def from_dict(cls, cfg: dict | None) -> "DSparkConfig":
@@ -2506,6 +2506,8 @@ class Config:
     def __post_init__(self):
         if self.sequence_parallel_size < 1:
             raise ValueError("sequence_parallel_size must be at least 1")
+        if envs.ATOM_DSV41_A8W4_ATTN not in ("auto", "off"):
+            raise ValueError("ATOM_DSV41_A8W4_ATTN must be auto or off")
         self.moe_all2all_backend = (
             str(self.moe_all2all_backend or "auto").strip().lower()
         )

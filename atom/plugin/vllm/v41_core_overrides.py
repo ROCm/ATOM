@@ -23,9 +23,6 @@ from functools import wraps
 import numpy as np
 import torch
 
-from atom.model_ops.attentions.deepseek_v41.a8w4_attention import (
-    sparse_attn_v41_a8w4_paged_2src,
-)
 from atom.model_ops.attentions.deepseek_v41.backend import (
     DeepseekV41MetadataBuilder,
 )
@@ -601,12 +598,11 @@ def _attend_block(
     if cache.packed and not a8w4:
         pool = (pool, cache.ring_view(self.spec.layer_id))
     kwargs = {"out": flat_query}
-    if a8w4:
-        attend = sparse_attn_v41_a8w4_paged_2src
-        attending = tuple(part.flatten(0, 1) for part in query_fp8)
-    elif cache.kv_fp8:
+    if a8w4 or cache.kv_fp8:
         attend = sparse_attn_v41_paged_2src
         attending = tuple(part.flatten(0, 1) for part in query_fp8)
+        if a8w4:
+            kwargs["pool_scale_dtype"] = torch.float8_e4m3fn
     else:
         attend = packed_prefill if cache.packed else sparse_attn_v4_paged_2src
         attending = flat_query

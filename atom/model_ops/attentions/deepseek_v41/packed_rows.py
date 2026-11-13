@@ -2,7 +2,7 @@
 """Compact FP4/FP8 row codecs shared by cache writers and sparse readers.
 
 Legacy rows contain value bytes followed by scale bytes; source buffers
-+store the same bytes in contiguous data and scale planes. Main KV uses E2M1 with
+store the same bytes in contiguous data and scale planes. Main KV uses E2M1 with
 E4M3 group16 scales; index rows use E2M1 with E8M0 group32 scales; SWA uses
 E4M3 with E8M0 group32 scales. Only requested rows are decoded.
 """

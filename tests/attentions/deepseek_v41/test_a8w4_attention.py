@@ -10,10 +10,12 @@ pytest.importorskip("triton", reason="the V4.1 cache and CSR kernels need Triton
 pytest.importorskip("aiter", reason="V4.1 device attention needs AITER")
 
 from atom.model_ops.attentions.deepseek_v41.a8w4_attention import (
-    sparse_attn_v41_a8w4_paged_2src,
     supports_a8w4_attention,
 )
 from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
+from atom.model_ops.attentions.deepseek_v41.fp8_attention import (
+    sparse_attn_v41_paged_2src,
+)
 from atom.model_ops.attentions.deepseek_v41.metadata import BatchStep, RequestSpan
 from atom.model_ops.attentions.pool_layout.v41_pool_geometry import (
     MAIN_FP4,
@@ -86,6 +88,7 @@ def make_case(heads, decode, ratio=2, *, cache_dtype="fp4"):
         swa_replay_start=tensor([0, 0]),
         swa_cached_until=tensor([0, 0]),
     )
+    cache._reserve_prefill_window(step)
     spec = SimpleNamespace(
         layer_id=0,
         kv_owner=0 if ratio else None,
@@ -121,7 +124,7 @@ def run_case(case, splits=None):
     query = tuple(value.flatten(0, 1) for value in q8)
     main = cache.main_view(case.spec.kv_owner)
     result = torch.empty_like(case.query.flatten(0, 1))
-    sparse_attn_v41_a8w4_paged_2src(
+    sparse_attn_v41_paged_2src(
         query,
         main,
         pi,
@@ -133,6 +136,7 @@ def run_case(case, splits=None):
         512**-0.5,
         out=result,
         num_kv_splits=splits,
+        pool_scale_dtype=torch.float8_e4m3fn,
     )
     if not step.decode:
         cache.write_window(0, pending, step)
@@ -140,6 +144,9 @@ def run_case(case, splits=None):
 
 
 def reference(case, inputs):
+    # This oracle checks attention arithmetic over the supplied CSR rows.
+    # Independent causal row membership is checked by test_contiguous_cache.py::
+    # test_csr_resolves_to_causal_main_and_window_rows.
     query, main, source, (pi, pp, wi, wp) = inputs
     q, csa, swa = (
         mxfp8(query),
@@ -231,18 +238,18 @@ def test_gfx950_preserves_requested_cache_and_attention(
         ),
     )
     calls = []
-    name = "sparse_attn_v41_a8w4_paged_2src" if packed else "sparse_attn_v41_paged_2src"
+    name = "sparse_attn_v41_paged_2src"
     attention = getattr(model_attention, name)
 
     def attend(*args, **kwargs):
+        assert kwargs.get("pool_scale_dtype", torch.float8_e8m0fnu) == (
+            torch.float8_e4m3fn if packed else torch.float8_e8m0fnu
+        )
         calls.append(True)
         return attention(*args, **kwargs)
 
     monkeypatch.setattr(model_attention, name, attend)
-    other = (
-        "sparse_attn_v41_paged_2src" if packed else "sparse_attn_v41_a8w4_paged_2src"
-    )
-    for name in (other, "packed_prefill", "packed_decode"):
+    for name in ("packed_prefill", "packed_decode"):
         monkeypatch.setattr(
             model_attention,
             name,
@@ -253,7 +260,14 @@ def test_gfx950_preserves_requested_cache_and_attention(
         step.begin_forward()
         step.selected[0] = case.selected
         prepared = Attention._attention_inputs(
-            owner, case.query, case.kv, cache, step, case.rope, None
+            owner,
+            case.query,
+            case.kv,
+            cache,
+            step,
+            case.rope,
+            None,
+            a8w4=owner._use_a8w4_attention(case.query, cache),
         )
         assert prepared[0] is packed
         assert prepared[1] is not None
