@@ -1360,6 +1360,10 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             # here, not per call: it needs FlyDSL, which other caches / families lack
             self._sparse_pa_mxfp4 = sparse_pa_mxfp4
             self._select_page_kwargs = {"pages_per_block": 1, "block_page_stride": 1}
+        elif self.kv_cache_dtype == "nvfp4":
+            from atom.model_ops.minimax_m3.nvfp4_pages import Nvfp4KvLayout
+
+            self.kv_layout = Nvfp4KvLayout()
         # Bound by AiterAttentionMetadataBuilder.build_kv_cache_tensor (Task 6):
         # the page-128 indexer-key cache. None until the runner binds it.
         self.index_cache: torch.Tensor | None = None
