@@ -297,10 +297,6 @@ impl Default for KvStorageBreakerConfig {
 pub struct KvStorageConfig {
     /// Mooncake master admin port (its `metrics_port`).
     pub mooncake_admin_port: u16,
-    /// UMBP master of ATOM's `umbp_store`. ATOM does not know it, so no UMBP source is
-    /// generated without it.
-    pub umbp_master: Option<String>,
-    /// Mooncake only; UMBP always probes every rank.
     pub probe: RankProbe,
     pub deadline_ms: u64,
     pub breaker: KvStorageBreakerConfig,
@@ -312,7 +308,6 @@ impl Default for KvStorageConfig {
     fn default() -> Self {
         Self {
             mooncake_admin_port: 9003,
-            umbp_master: None,
             probe: RankProbe::First,
             deadline_ms: 3,
             breaker: KvStorageBreakerConfig::default(),
@@ -761,8 +756,7 @@ mod tests {
                     "replay_endpoints": ["tcp://10.0.0.7:5657", "tcp://10.0.0.7:5658"],
                     "topic": "", "model": "zai-org/GLM-5.2", "profile": "vllm",
                     "tier_map": {"CPU": "drop"}}},
-                "storage": {"mooncake_admin_port": 9003, "umbp_master": "10.0.0.20:50051",
-                    "probe": "first", "deadline_ms": 3,
+                "storage": {"mooncake_admin_port": 9003, "probe": "first", "deadline_ms": 3,
                     "breaker": {"failures": 5, "open_secs": 10}, "max_inflight": 64},
                 "storage_sources": {"umbp-a": {"model": "zai-org/GLM-5.2",
                     "backend": {"umbp_master": "10.0.0.21:50051"},
@@ -789,10 +783,6 @@ mod tests {
             umbp.key_rule,
             Some(KeyRule::SglangPage { page_size: 64, .. })
         ));
-        assert_eq!(
-            config.storage.umbp_master.as_deref(),
-            Some("10.0.0.20:50051")
-        );
 
         let overrides: KvEventsConfig = serde_json::from_str(
             r#"{"enabled": "off", "storage_sources": {"atom-mooncake-5f0e3c9a":
