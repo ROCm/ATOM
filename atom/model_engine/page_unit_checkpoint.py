@@ -1039,7 +1039,7 @@ class PagedStateCheckpointCoordinator:
         enabled: bool,
         offload=None,
         readable_midstep: bool = False,
-        spec_step_settled: bool = True,
+        spec_step_settled: bool = False,
     ) -> None:
         self.enabled = enabled
         self.readable_midstep = bool(readable_midstep)

@@ -67,6 +67,10 @@ def _config(model_type, *, pp=1, rapidserve=False, wrapped=False):
 
 
 def _layout(monkeypatch, **kwargs):
+    return _transfer(monkeypatch, **kwargs).paged_layout_id
+
+
+def _transfer(monkeypatch, **kwargs):
     params = {
         "layers": 45,
         "shape_k": (3, 1536),
@@ -89,7 +93,7 @@ def _layout(monkeypatch, **kwargs):
         _state_shape_for_runner=lambda: (params["shape_k"], params["shape_v"]),
         _state_dtypes=lambda: (params["dtype_k"], params["dtype_v"]),
     )
-    return builder_cls.state_transfer(builder).paged_layout_id
+    return builder_cls.state_transfer(builder)
 
 
 class TestWhoCopies:
@@ -108,6 +112,11 @@ class TestWhoCopies:
     def test_pipeline_parallel_and_rapidserve_stay_on_fork(self):
         assert not _uses_paged_checkpoints(_config("qwen3_5_moe_text", pp=2))
         assert not _uses_paged_checkpoints(_config("qwen3_5_moe_text", rapidserve=True))
+
+    def test_a_copy_does_not_keep_spec_decode_checkpoints(self, monkeypatch):
+        """A verify leaves the GDN state in column `num_accepted - 1` and the
+        conv windows unrolled until the next forward."""
+        assert not _transfer(monkeypatch, num_spec=3).spec_step_settled
 
 
 class TestTheLayoutId:
