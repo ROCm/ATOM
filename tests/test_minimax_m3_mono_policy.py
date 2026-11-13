@@ -42,12 +42,12 @@ def test_spec_overrides_and_later_items_win():
     assert p.kind(16) == PRODUCTION and p.kind(8) == MONO
 
 
-def test_measured_wide_table_is_the_32_and_64_row_builds():
+def test_measured_wide_table_is_the_32_48_and_64_row_builds():
     p = WidthPolicy(wide=True)
-    assert p.kind(32) == MONO and p.kind(64) == MONO
+    assert p.kind(32) == p.kind(48) == p.kind(64) == MONO
     assert (
         p.kind(24) == PRODUCTION
-        and p.kind(48) == PRODUCTION
+        and p.kind(40) == PRODUCTION
         and p.kind(65) == PRODUCTION
     )
     assert (
@@ -75,6 +75,6 @@ def test_describe_runs():
         "1-16:mono, 17-64:hybrid, 65-up:production"
     )
     assert WidthPolicy(wide=True).describe() == (
-        "1-16:mono, 17-31:production, 32:mono, 33-63:production, 64:mono, 65-up:production"
+        "1-16:mono, 17-31:production, 32:mono, 33-47:production, 48:mono, 49-63:production, 64:mono, 65-up:production"
     )
     assert WidthPolicy().describe() == "1-16:mono, 17-64:production, 65-up:production"
