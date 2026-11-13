@@ -594,9 +594,8 @@ def emit_index_scores(
             prepare_heads()
         if const_expr(nvfp4):
             gpu.barrier()
-        if const_expr(
-            BIG
-        ):  # noqa: SIM102 -- every row's q of every head is in iq_out (the K1 exchange)
+        # BIG: every row's q of every head is in iq_out (the K1 exchange)
+        if const_expr(BIG):  # noqa: SIM102
             if slot + BLOCKS * wave < total_cp:
                 wait_index_q()
         tiles = range(KEY_TILES)

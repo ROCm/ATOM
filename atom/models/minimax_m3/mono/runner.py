@@ -155,7 +155,11 @@ class MonoDecodeRunner:
     refuses turns mono off on every rank instead of leaving the others waiting."""
 
     def __init__(
-        self, causal_lm, drafter=None, require_aux: bool = False, cp: IndexerCp | None = None
+        self,
+        causal_lm,
+        drafter=None,
+        require_aux: bool = False,
+        cp: IndexerCp | None = None,
     ) -> None:
         self.cp = cp or IndexerCp()  # the CP arm of the wide builds (policy.py)
         group = get_tp_group().cpu_group

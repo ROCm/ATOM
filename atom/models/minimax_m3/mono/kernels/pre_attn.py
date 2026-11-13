@@ -853,9 +853,12 @@ def emit_pre_attn(
         live = (tk < tokens) if index_topk else (tk < tokens) & (ht < IQ_TASK)
         if const_expr(cp is not None):
             # which of this wave's tokens' requests are context-parallel (loads out before the waits)
-            cp_row = lane_gather(
-                cp[5]().select(fx.Int32(1), fx.Int32(0)), fx.min(tk, tokens - 1)
-            ) != 0
+            cp_row = (
+                lane_gather(
+                    cp[5]().select(fx.Int32(1), fx.Int32(0)), fx.min(tk, tokens - 1)
+                )
+                != 0
+            )
         if live:
             d0 = l32 * ELEMS
             # slot_mapping is int64: this token's low word
@@ -930,9 +933,11 @@ def emit_pre_attn(
                         fx.Vector.from_elements(out, fx.Float32).to(fx.BFloat16),
                         rsrc(iq_out),
                         # (``cp``: iq_out is [row][head], this rank's head at its rank)
-                        tk * HEAD_DIM + d0
-                        if cp is None
-                        else (tk * TP + cp[2]) * HEAD_DIM + d0,
+                        (
+                            tk * HEAD_DIM + d0
+                            if cp is None
+                            else (tk * TP + cp[2]) * HEAD_DIM + d0
+                        ),
                         # BIG: the score tasks of other CTAs read it (``q_frag_from``)
                         cache_modifier=cm_out if BIG else 0,
                     )
@@ -956,7 +961,11 @@ def emit_pre_attn(
                             [
                                 (
                                     preg(cpq_sym, cpq_off, "iq_x"),
-                                    (((cpq_rk + 1 + cj) % TP * cpq_cap + tk) * (HEAD_DIM // 2) + l32 * 2),
+                                    (
+                                        ((cpq_rk + 1 + cj) % TP * cpq_cap + tk)
+                                        * (HEAD_DIM // 2)
+                                        + l32 * 2
+                                    ),
                                     2,
                                 )
                                 for cj in range_constexpr(TP - 1)
@@ -968,7 +977,8 @@ def emit_pre_attn(
                                     [cpq_got[cj][0], cpq_got[cj][1]], fx.Int32
                                 ),
                                 rsrc(iq_out),
-                                ((tk * TP + (cpq_rk + 1 + cj) % TP) * HEAD_DIM + d0) // 2,
+                                ((tk * TP + (cpq_rk + 1 + cj) % TP) * HEAD_DIM + d0)
+                                // 2,
                                 cache_modifier=cm_out,
                             )
                 if is_k:
@@ -1162,14 +1172,22 @@ def emit_k1(
             seq_k = fx.max(
                 fx.Int32(
                     bo.buffer_load(
-                        rsrc(seq_lens), fx.min(lane, tokens - 1), vec_width=1, dtype=T.i32
+                        rsrc(seq_lens),
+                        fx.min(lane, tokens - 1),
+                        vec_width=1,
+                        dtype=T.i32,
                     )
                 ),
                 1,
             )
             last_k = (lane < tokens) & (fx.Int32(lane) % q_len == q_len - 1)
             return cp_gate(
-                (seq_k + SPARSE_BLOCK - 1) // SPARSE_BLOCK, last_k, lane, tokens, q_len, cp[5]
+                (seq_k + SPARSE_BLOCK - 1) // SPARSE_BLOCK,
+                last_k,
+                lane,
+                tokens,
+                q_len,
+                cp[5],
             )  # cp[5]: (min_blocks, min_batch)
 
         cp_pre = (cp[0], cp[1], cp[2], cp[3], cp[4], cp_rows)
@@ -1216,7 +1234,9 @@ def emit_k1(
         if const_expr(tokens > MAX_TOKENS):
             # BIG: index q straight from the head tasks' ``iq_out`` (device scope), behind
             # one wait for every token's index-q head task, not rebuilt on every CTA
-            if const_expr(cp is not None):  # iq_out is [row][head]: every rank's, this one's at its rank
+            if const_expr(
+                cp is not None
+            ):  # iq_out is [row][head]: every rank's, this one's at its rank
                 q_frag_g, q_frag_head_g = q_frag_from(
                     iq_out, IndexHeads(TP, 0), index_nvfp4, CM_DEV, own=cp[2]
                 )

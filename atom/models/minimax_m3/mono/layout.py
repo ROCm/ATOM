@@ -250,7 +250,9 @@ def mailbox_regions(
                 exchange=True,
             )
         )
-        if index_cp:  # BIG context parallelism: both the local shares and the exchanged ones
+        if (
+            index_cp
+        ):  # BIG context parallelism: both the local shares and the exchanged ones
             regions += [
                 RegionDecl("sel_cp", P, "split", exchange=True),
                 RegionDecl("iq_x", P, "k1.head", exchange=True),

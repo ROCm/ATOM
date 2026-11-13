@@ -11,9 +11,9 @@ import torch
 
 pytest.importorskip("aiter")
 
-from atom.models.minimax_m3.mono import hybrid  # noqa: E402
-from atom.models.minimax_m3.mono.config import HIDDEN  # noqa: E402
-from atom.models.minimax_m3.mono.policy import IndexerCp  # noqa: E402
+from atom.models.minimax_m3.mono import hybrid
+from atom.models.minimax_m3.mono.config import HIDDEN
+from atom.models.minimax_m3.mono.policy import IndexerCp
 
 N = 3
 N_LAYERS = 3 + 4  # the dense prefix + four MoE layers
