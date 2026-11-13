@@ -22,7 +22,7 @@ from atom.model_engine.dynamic_chunking import (
 )
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import EngineUtilityHandler
-from atom.model_engine.prefill_backlog import flush_dp_reuse, prefill_backlog
+from atom.model_engine.prefill_backlog import prefill_backlog
 from atom.model_engine.prefix_hash import attach_shipped_chains
 from atom.model_engine.scheduler import DecodeScheduler, PrefillScheduler, Scheduler
 from atom.model_engine.sequence import (
@@ -64,6 +64,17 @@ HELD_POLL_S = 0.01
 # mid-transfer leaves a completion that never arrives; exiting late beats
 # never exiting.
 KV_SHUTDOWN_DRAIN_TIMEOUT_S = 2.0
+
+
+def flush_dp_reuse(scheduler, output_queue) -> None:
+    """Queue the scheduler's `share_cache` reuse reports (`Scheduler.
+    dp_reuse_reports`) for the CoreManager. Called before a step's outputs are
+    queued: a request's report then reaches the router before its first or
+    last output, which complete or release its placement."""
+    reports = scheduler.dp_reuse_reports
+    if reports:
+        scheduler.dp_reuse_reports = []
+        output_queue.put_nowait(("DP_REUSE", reports))
 
 
 class EngineCore:

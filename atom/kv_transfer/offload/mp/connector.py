@@ -199,34 +199,18 @@ class LMCacheMPConnectorScheduler(KVConnectorSchedulerBase):
             prefetch(seqs)
 
     def lookup_pending(self, seq: Any) -> bool:
-        pending = getattr(self._require_impl(), "lookup_pending", None)
-        return bool(pending(seq)) if callable(pending) else False
+        return self._require_impl().lookup_pending(seq)
 
-    @property
-    def supports_early_load(self) -> bool:
-        return self._require_impl().supports_early_load
-
-    @property
-    def chunk_size(self) -> int:
-        return int(self._require_impl().chunk_size or 0)
-
-    def lookup_ready(self, seq: Any) -> bool:
-        return self._require_impl().lookup_ready(seq)
-
-    def cancel_preadmission(self, seq: Any) -> None:
-        self._require_impl().cancel_preadmission(seq)
+    def lookup_would_defer(self, seq: Any) -> bool:
+        return self._require_impl().lookup_would_defer(seq)
 
     # The base class defines these as defaults, which would shadow `__getattr__`
     # and leave the impl's own unreached: forward each explicitly.
     def cancel_pending_load(self, seq: Any) -> None:
         self._require_impl().cancel_pending_load(seq)
 
-    def held_tier_hit(self, seq: Any) -> int:
-        return int(self._require_impl().held_tier_hit(seq))
-
-    @property
-    def lowers_hbm_hit_to_chunk(self) -> bool:
-        return self._require_impl().lowers_hbm_hit_to_chunk
+    def cancel_preadmission(self, seq: Any) -> None:
+        self._require_impl().cancel_preadmission(seq)
 
     def close(self) -> None:
         if self._impl is not None:

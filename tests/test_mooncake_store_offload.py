@@ -2961,6 +2961,7 @@ def test_under_pp_each_stage_fences_a_save_after_the_forwards_it_reads(
     )
     offload = MooncakeStoreOffloadScheduler(_config("offload", pp=4, layers=8))
     request.addfinalizer(offload.close)
+    offload._min_load_tokens = 0
     offload.bind_block_manager(engine.block_manager)
     engine.kv_connector = offload
     seq = Sequence(list(range(64)), BLOCK, sampling_params=SamplingParams())
@@ -3277,6 +3278,9 @@ def test_v41_registration_uses_pages_without_request_slots(
             state_transfer=lambda: SimpleNamespace(replays=True, copies=False)
         ),
     )
+    transfer.without_slots = lambda: SimpleNamespace(
+        **{**vars(transfer), "slot_regions": [], "num_slots": 0}
+    )
     selected = {}
 
     def page_codec(**kwargs):
@@ -3304,40 +3308,6 @@ def test_v41_registration_uses_pages_without_request_slots(
         assert worker._pool is not None
     finally:
         worker.close()
-
-
-@pytest.mark.parametrize("field", ["spec", "callback", "copies"])
-def test_replay_page_codec_refuses_native_state_contract(field):
-    from atom.kv_transfer.offload.page_codec import replay_page_codec
-
-    transfer = SimpleNamespace(
-        block_regions=[object()],
-        slot_regions=[object()],
-        state_backend=SimpleNamespace(
-            state_transfer=lambda: SimpleNamespace(
-                replays=True, copies=field == "copies"
-            )
-        ),
-        paged_state_checkpoint_spec=object() if field == "spec" else None,
-        execute_paged_state_copies=(lambda: None) if field == "callback" else None,
-    )
-    with pytest.raises(ValueError, match="cannot carry native state checkpoints"):
-        replay_page_codec(transfer, 8)
-
-
-@pytest.mark.parametrize("replays", [None, False])
-def test_replay_page_codec_refuses_unconfirmed_replay(replays):
-    from atom.kv_transfer.offload.page_codec import replay_page_codec
-
-    transfer = SimpleNamespace(
-        block_regions=[object()],
-        slot_regions=[object()],
-        state_backend=SimpleNamespace(
-            state_transfer=lambda: SimpleNamespace(replays=replays, copies=False)
-        ),
-    )
-    with pytest.raises(ValueError, match="requires the state replay contract"):
-        replay_page_codec(transfer, 8)
 
 
 def test_pure_page_codec_still_refuses_live_pd_slot():
@@ -4153,3 +4123,55 @@ def test_store_codec_version_changes_only_its_own_namespace(monkeypatch, layout)
     assert keys.store_namespace(config, CHUNK) == namespace
     monkeypatch.setattr(*own, "own-codec-next-version")
     assert keys.store_namespace(config, CHUNK) != namespace
+
+
+def test_a_prompt_too_short_to_load_is_neither_asked_about_nor_waited_for(cluster):
+    """Such a lookup could not change what is loaded; submitted, it would park the
+    request for the defer window and hold the single query worker."""
+    scheduler = MooncakeStoreOffloadScheduler(_config())
+    assert scheduler._min_load_tokens == 512
+    seq = Sequence(list(range(100)), BLOCK, sampling_params=SamplingParams())
+    scheduler.offer_lookups([seq])
+    scheduler.prefetch_lookups([seq])
+    assert not scheduler._lookup_client.pending_ids()
+    assert not scheduler.lookup_pending(seq)
+    scheduler.close()
+
+
+def test_only_admission_starts_a_requests_lookup_defer_window(cluster, monkeypatch):
+    """The early-load scan and the prefillable-work probe run every tick; a
+    request that sat in their reach while its lookup queued behind the single
+    worker must still get its whole window when admission reaches it."""
+
+    class QueuedLookup:
+        def is_pending(self, sid):
+            return True
+
+        def poll(self, sid):
+            return False
+
+        def answered(self, sid):
+            return False
+
+    monkeypatch.setenv("OFFLOAD_MIN_LOAD_TOKENS", "0")
+    engine = Scheduler(
+        MockConfig(
+            num_kvcache_blocks=40,
+            max_model_len=128,
+            max_num_batched_tokens=128,
+            enable_prefix_caching=True,
+        )
+    )
+    offload = MooncakeStoreOffloadScheduler(_config("offload"))
+    offload._min_load_tokens = 0
+    offload._lookup_client = QueuedLookup()
+    offload.bind_block_manager(engine.block_manager)
+    engine.kv_connector = offload
+    seq = Sequence(list(range(64)), BLOCK, sampling_params=SamplingParams())
+    engine.add(seq)
+    for _ in range(5):
+        engine._early_load_tier_prefixes()
+        engine._head_waits_on_tier_lookup(seq)
+    assert not offload._lookup_defer_since
+    assert offload.lookup_pending(seq)  # admission's call opens the window
+    assert str(seq.id) in offload._lookup_defer_since

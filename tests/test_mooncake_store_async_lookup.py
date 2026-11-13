@@ -46,7 +46,7 @@ def test_arrival_offer_cannot_overtake_terminal_cleanup():
             assert finished.wait(5)
         return value.num_prompt_tokens
 
-    sched._lookup_len = lookup_len
+    sched._lookup_wanted = lookup_len
 
     def finish():
         try:
@@ -137,20 +137,20 @@ def test_v41_page_path_does_not_admit_other_hybrid_models():
             assert mooncake_codec_id(config) == REPLAY_PAGE_CODEC_ID
 
 
-def test_multi_prefetch_only_on_producer_not_decode_receiver():
+def test_multi_prefetch_tier_is_the_offload_leaf():
     tier = SimpleNamespace(
         is_offload=True,
         chunk_size=256,
         lookup_ready=lambda s: True,
+        lowers_hbm_hit_to_chunk=True,
     )
     m = MultiConnectorScheduler.__new__(MultiConnectorScheduler)
     m._connectors = [SimpleNamespace(is_offload=False), tier]
-    m.is_producer = True
-    assert m.chunk_size == 256
-    assert m.lookup_ready(object())
-    m.is_producer = False
-    assert m.chunk_size == 0
-    assert not m.lookup_ready(object())
+    for producer in (True, False):  # with a P/D producer beside it, or alone
+        m.is_producer = producer
+        assert m.chunk_size == 256
+        assert m.lowers_hbm_hit_to_chunk
+        assert m.lookup_ready(object())
 
 
 def test_answered_is_read_only_and_marks_lookup_ready():

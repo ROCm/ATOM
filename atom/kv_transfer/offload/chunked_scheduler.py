@@ -163,6 +163,10 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         # by the OFFLOAD_UNALIGNED_HANDOFF env var; now unconditional.)
         self._min_load_tokens = config.offload_min_load_tokens
 
+    def close(self) -> None:
+        if self._lookup_client is not None:
+            self._lookup_client.close()
+
     def bind_block_manager(self, block_manager) -> None:
         if self._block_manager is not None and self._block_manager is not block_manager:
             raise RuntimeError("offload scheduler is already bound to a block manager")
@@ -186,6 +190,11 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
     def _lookup_len(self, seq) -> int:
         """`len(self._lookup_token_ids(seq))` without copying the prompt."""
         return int(seq.num_prompt_tokens)
+
+    def _lookup_wanted(self, seq) -> bool:
+        """Whether a tier lookup for `seq` can change what is loaded; a tier
+        that knows prompts it never loads from narrows this."""
+        return self._lookup_len(seq) > 0
 
     def install_hit_cap_hook(self, hook) -> None:
         """Let a hybrid connector shorten every hit this scheduler reports.
@@ -273,7 +282,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 continue
             if resumes_offload_prefill(seq):
                 continue
-            if self._lookup_len(seq) <= 0:
+            if not self._lookup_wanted(seq):
                 continue
             budget -= 1
             if submit(
@@ -332,7 +341,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         return (
             callable(supports_async)
             and bool(supports_async())
-            and self._lookup_len(seq) > 0
+            and self._lookup_wanted(seq)
         )
 
     def detach_lookup(self, seq, num_hbm_tokens: int) -> bool:
@@ -444,20 +453,32 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         that keys by it through the call."""
         return tier_lookup_kwargs(seq)
 
+    def _lookup_in_flight(self, seq) -> bool:
+        """Submitted, not answered; advances the client, starts no clock."""
+        client = self._lookup_client
+        sid = str(seq.id)
+        return client is not None and client.is_pending(sid) and not client.poll(sid)
+
+    def lookup_would_defer(self, seq) -> bool:
+        """What `lookup_pending` would answer, without starting the defer clock:
+        for probes that must not decide when `seq`'s window runs out."""
+        if not self._lookup_in_flight(seq):
+            return False
+        first = self._lookup_defer_since.get(str(seq.id))
+        return first is None or time.monotonic() - first <= envs.OFFLOAD_LOOKUP_DEFER_S
+
     def lookup_pending(self, seq) -> bool:
         """True while admission should pass over `seq`: its lookup is in flight.
 
         Waiting a step or two for an answer that may carry tens of thousands of
         prompt tokens is cheaper than either blocking the scheduler thread on
         it (every DP rank waits in lockstep) or admitting the request without
-        it (a recompute). Bounded by `OFFLOAD_LOOKUP_DEFER_S`, after which the
-        ordinary synchronous lookup waits for the answer.
+        it (a recompute). Bounded by `OFFLOAD_LOOKUP_DEFER_S` from the first
+        call here, which only Phase 2 makes; past it admission goes ahead with
+        whatever answer the lookup holds.
         """
-        client = self._lookup_client
-        if client is None:
-            return False
         sid = str(seq.id)
-        if not client.is_pending(sid) or client.poll(sid):
+        if not self._lookup_in_flight(seq):
             self._lookup_defer_since.pop(sid, None)
             return False
         now = time.monotonic()

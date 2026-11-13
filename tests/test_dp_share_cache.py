@@ -325,12 +325,12 @@ def test_a_released_placement_forgets_its_reuse_report():
 
 def test_the_manager_counts_stale_placements_from_rank_reports():
     mgr = _bare_mgr()
-    mgr._share_cache_router = ShareCacheRouter(_store_tier(512), 512)
+    mgr._prefix_router = ShareCacheRouter(_store_tier(512), 512)
     mgr._dp_route_counters = dict.fromkeys(ShareCacheRouter.DECISIONS, 0)
     backlog, reqs = [0, 0], [0, 0]
-    _route(mgr._share_cache_router, _seq(1, PREFIX), backlog, reqs)
-    mgr._share_cache_router.prefill_complete(1)
-    _route(mgr._share_cache_router, _seq(2, PREFIX), backlog, reqs)
+    _route(mgr._prefix_router, _seq(1, PREFIX), backlog, reqs)
+    mgr._prefix_router.prefill_complete(1)
+    _route(mgr._prefix_router, _seq(2, PREFIX), backlog, reqs)
     mgr._note_dp_reuse_locked([(2, 0), ("unknown", 0)])
     assert mgr._dp_route_counters["share_cache_stale_total"] == 1
 
@@ -359,6 +359,7 @@ def test_share_cache_refuses_a_store_split_into_per_nic_pools():
         mgr = _bare_mgr(ranks)
         mgr.global_engine_count = ranks
         mgr._dp_session_affinity_enabled = False
+        mgr._dp_lb_strategy = "share_cache"
         mgr._dp_lb_req_equiv = 512
         config = SimpleNamespace(
             offload_min_load_tokens=512,
@@ -370,7 +371,7 @@ def test_share_cache_refuses_a_store_split_into_per_nic_pools():
                 "kv_connector_extra_config": extra,
             },
         )
-        return mgr._build_share_cache_router(config)
+        return mgr._build_prefix_router(config)
 
     assert isinstance(build(one, 2), ShareCacheRouter)
     assert build(two, 1) is None  # one rank: nothing to share
@@ -451,7 +452,10 @@ def test_reuse_reports_are_queued_ahead_of_the_step_outputs():
     reaches the router before its first output completes its placement."""
     import queue
 
-    from atom.model_engine.prefill_backlog import flush_dp_reuse
+    from aiter_stub import stubbed_aiter
+
+    with stubbed_aiter():
+        from atom.model_engine.engine_core import flush_dp_reuse
 
     out = queue.Queue()
     sched = SimpleNamespace(dp_reuse_reports=[(1, 4096)])
@@ -537,7 +541,7 @@ def test_sibling_successor_debt_uses_contiguous_confirmed_prefix():
     assert route.credit == 1024  # depends on the active trunk producer
     assert router._independent_credit[4] == HBS
     charges = router.release(3)
-    assert charges == {4: 1024 - HBS}
+    assert charges == {4: (1024 - HBS, HBS)}
     assert router._in_flight[4] == HBS
     router.prefill_complete(4)
     path = router._path(_seq(5, right).prompt_hash_chain)

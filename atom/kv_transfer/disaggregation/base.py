@@ -30,8 +30,9 @@ class KVConnectorBase(ABC):
     is_producer: bool
 
     def set_forward_stream(self, stream: Any) -> None:
-        """The stream the model runner is about to run a forward on. Only a
-        connector that stages transfers on it (the Mooncake Store) keeps it."""
+        """The stream the model runner is about to run a forward on; only
+        `RapidServeModelRunner` reports one, per forward. Only a connector that
+        stages transfers on it (the Mooncake Store) keeps it."""
 
     @classmethod
     def kv_budget_reserve_bytes(cls, config: Any) -> int:
@@ -110,6 +111,15 @@ class KVConnectorSchedulerBase(ABC):
 
     def lookup_ready(self, seq: Any) -> bool:
         """Whether `seq`'s tier answer can be consumed without a round trip."""
+        return False
+
+    def lookup_pending(self, seq: Any) -> bool:
+        """Whether admission should pass over `seq` for its in-flight tier
+        lookup; the first call starts the request's defer window."""
+        return False
+
+    def lookup_would_defer(self, seq: Any) -> bool:
+        """`lookup_pending` without starting the window, for probes."""
         return False
 
     def held_tier_hit(self, seq: Any) -> int:

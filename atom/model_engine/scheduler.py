@@ -1073,17 +1073,16 @@ class Scheduler:
         predicate behind the supply of prefill, its token count, the
         prefillable probe, the chunk-cost estimate and the queue-age signal.
 
-        An aborted request or a statically rejected one is not. A request parked
-        for a tier load is once the load succeeded (admission resumes its suffix
-        on the blocks it holds); a failed load is not, until admission has
-        resolved it (`_consume_failed_remote_kv` may free and reallocate its
-        blocks, or park it again), and a load still in flight is not.
+        An aborted request or a statically rejected one is not. Nor is one
+        parked for a tier load: `_prioritize_ready_remote_kv_requests` resolves
+        a finished load before the tick sizes any work, so a request still
+        parked is in flight or failed and not yet resolved
+        (`_consume_failed_remote_kv` may free and reallocate its blocks, or
+        park it again).
         """
-        if seq.status == SequenceStatus.ABORTED:
-            return False
-        if (
-            seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
-            and not self._tier_load_succeeded(seq)
+        if seq.status in (
+            SequenceStatus.ABORTED,
+            SequenceStatus.WAITING_FOR_REMOTE_KVS,
         ):
             return False
         return self._unschedulable_reason(seq) is None
@@ -1126,16 +1125,6 @@ class Scheduler:
         return seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS and not (
             self._has_req_id(self.finished_recving_kv_req_ids, seq.id)
             or self._has_req_id(self.failed_recving_kv_req_ids, seq.id)
-        )
-
-    def _tier_load_succeeded(self, seq: Sequence) -> bool:
-        """Whether `seq` waits on a tier load that completed, reported last step:
-        Phase 2 resumes its suffix prefill this tick
-        (`_resolve_waiting_remote_kv`). A failed load is not one."""
-        return (
-            self._connector_flag("is_offload")
-            and self._has_req_id(self.finished_recving_kv_req_ids, seq.id)
-            and not self._has_req_id(self.failed_recving_kv_req_ids, seq.id)
         )
 
     def _local_prefill_pending_work(self) -> tuple[bool, int]:
@@ -1272,17 +1261,13 @@ class Scheduler:
         completed load admission has not resolved yet. `resume` is where its
         cached prefix ends and `start` where the forward begins (replay-adjusted).
         None for any other request."""
-        if self._tier_load_succeeded(seq):
-            cached = max(seq.num_cached_tokens, self._tier_loaded_tokens(seq))
-        elif self._is_offload_prefill_resume(seq):
-            cached = seq.num_cached_tokens
-        else:
+        if not self._is_offload_prefill_resume(seq):
             return None
-        resume = self._offload_prefill_start(seq, cached)
-        start = self.block_manager.replay_start(
-            seq, resume, hit=self.block_manager.tier_resume_replays(seq)
+        cached = seq.num_cached_tokens
+        return (
+            self._offload_prefill_start(seq, cached),
+            self._resume_start_after_tier_load(seq, cached),
         )
-        return resume, start
 
     def _new_prefill_tokens(
         self, seq: Sequence, cached_tokens: int, resume: int | None = None
@@ -1510,12 +1495,8 @@ class Scheduler:
                 examined += 1
                 continue
             if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
-                if self._tier_load_succeeded(seq):
-                    # Its tier load completed (reported last step): Phase 2
-                    # resumes its suffix prefill on its held blocks this tick
-                    # (`_resolve_waiting_remote_kv`). Missing it here made the
-                    # delayer fire vacuously and that prefill run alone.
-                    return True
+                # A finished load was resolved at the start of the tick and is
+                # WAITING again, below.
                 if seq.id in self._early_load.entries:
                     # Phase 2 walks past an early load in flight without
                     # counting it (`early_waiting`), so neither does this probe.
@@ -1558,16 +1539,19 @@ class Scheduler:
 
     def _head_waits_on_tier_lookup(self, seq: Sequence) -> bool:
         """Whether Phase 2 would skip `seq` for its in-flight tier lookup
-        (`prefix_waiters`): same conditions, same order of the cheap checks."""
+        (`prefix_waiters`): same conditions, same order of the cheap checks. A
+        probe: it never starts the lookup's defer window, which is Phase 2's."""
         if (
             self.kv_connector is None
             or self._is_offload_prefill_resume(seq)
-            or not self._offload_lookup_pending(seq)
+            or not self.kv_connector.lookup_would_defer(seq)
         ):
             return False
         return not (
             self._lookup_detach_enabled(seq)
-            and self._can_detach_tier_lookup(seq, self._probe_hbm_prefix(seq))
+            and self._can_detach_tier_lookup(
+                seq, self.block_manager.can_allocate_memoized(seq)
+            )
         )
 
     def _kv_usage(self) -> float:
@@ -1648,11 +1632,12 @@ class Scheduler:
         so the "queued work" signal counts only tokens this rank could actually
         prefill this step. Counting remote-KV / unschedulable tokens here would
         inflate the cross-rank aggregate and reach the fill target before a real
-        batch has accumulated. A request whose tier load has finished is
-        prefill work the admission pass resumes this tick
-        (`_tier_load_succeeded`): it counts what follows its loaded prefix,
-        like any waiting prefill; left out, the group's fill stays under target
-        and the delayer waits out its stall bound instead. The
+        batch has accumulated. A request whose tier load has finished was
+        resolved at the start of the tick
+        (`_prioritize_ready_remote_kv_requests`) and is prefill work the
+        admission pass resumes: it counts what follows its loaded prefix, like
+        any waiting prefill; left out, the group's fill stays under target and
+        the delayer waits out its stall bound instead. The
         `num_cached_tokens` discount is best-effort:
         an un-admitted seq has not been probed against the prefix cache yet, so
         this is an upper bound on new tokens for cache-hit prompts.
@@ -1759,8 +1744,7 @@ class Scheduler:
     def close_kv_connector(self) -> None:
         """Close the scheduler-side KV connector, if it holds threads or
         sockets (the Mooncake Store's lookup executor). Called by EngineCore on
-        engine shutdown: a non-daemon thread left running keeps the process
-        alive at exit."""
+        engine shutdown."""
         if self.kv_connector is None:
             return
         try:
@@ -2500,23 +2484,17 @@ class Scheduler:
             # below, so a request held back by the budget or the pool keeps
             # its prefetched lookup for the next pass. The HBM probe it needs
             # is kept and reused by the admission probe below.
-            hbm_probe = None
-            probed_tier_kv = (0, 0)
-            lookup_detachable = False
-            if (
-                not remote_ready_for_decode
-                and not offload_resume
-                and self._lookup_detach_enabled(seq)
-            ):
-                hbm_probe = self._probe_hbm_prefix(seq)
-                probed_tier_kv = self._tier_hit(seq)
-                lookup_detachable = self._can_detach_tier_lookup(seq, hbm_probe)
+            hbm_probe, probed_tier_kv, lookup_detachable = (
+                (None, (0, 0), False)
+                if remote_ready_for_decode or offload_resume
+                else self._admission_probe(seq)
+            )
             if (
                 not remote_ready_for_decode
                 and not offload_resume
                 and not lookup_detachable
                 and self.kv_connector is not None
-                and self._offload_lookup_pending(seq)
+                and self.kv_connector.lookup_pending(seq)
             ):
                 prefix_waiters.append(seq)
                 continue
@@ -2629,17 +2607,7 @@ class Scheduler:
             # (post-prefix-cache) remaining token count. V4 SWA correctness is
             # enforced inside can_allocate (_swa_bounded_hit bounds the hit to
             # where the trailing-window SWA is present); no post-hoc warmup trim.
-            # The detach probe predates `_query_connector_prefill_match`, and
-            # `can_allocate` reads the tier's answer (a replaying hit resumes at
-            # the tier hit or extends to its KV-only reach) and records the
-            # replay on `seq` -- for a replaying model only. Probe again if
-            # that answer moved.
-            if hbm_probe is None or (
-                getattr(self.block_manager, "state_replay_tokens", 0)
-                and seq.has_per_req_cache
-                and self._tier_hit(seq) != probed_tier_kv
-            ):
-                hbm_probe = self._probe_hbm_prefix(seq)
+            hbm_probe = self._reprobe_after_tier_answer(seq, hbm_probe, probed_tier_kv)
             num_cached_blocks = hbm_probe.num_cached_blocks
             if num_cached_blocks < 0:
                 self.waiting.appendleft(seq)
@@ -2750,6 +2718,8 @@ class Scheduler:
                 break
 
             self._finish_prefill_admission(seq, pd_plan)
+            # From here the connector has been told of the allocation: every
+            # take-back below goes through `_take_back_admission`.
 
             # A replay that loads its KV first parks for that load whatever the
             # lookup answered: the answer was the state-carrying hit, which a
@@ -2764,7 +2734,7 @@ class Scheduler:
                     # Disown could not be backed (finding #2); requeue for a
                     # clean recompute instead of parking a load into shared
                     # blocks.
-                    self.block_manager.deallocate(seq)
+                    self._take_back_admission(seq)
                     self.waiting.appendleft(seq)
                     break
                 self._park_for_remote_load(seq, skipped_waiting_requests)
@@ -2799,7 +2769,7 @@ class Scheduler:
                     else:
                         disowned = self.block_manager.disown_claimed_prefix(seq)
                     if not disowned:
-                        self.block_manager.deallocate(seq)
+                        self._take_back_admission(seq)
                         self.waiting.appendleft(seq)
                         break
                     seq.num_cached_tokens = 0
@@ -2858,7 +2828,7 @@ class Scheduler:
                 seq, seq.num_cached_tokens, chunk, seq.replay_until
             ):
                 # A replayed hit that cannot pass its hit this step waits too.
-                self.block_manager.deallocate(seq)
+                self._take_back_admission(seq)
                 self.waiting.appendleft(seq)
                 break
 
@@ -3493,6 +3463,42 @@ class Scheduler:
             int(conn.held_tier_hit(seq)),
         )
 
+    def _admission_probe(
+        self, seq: Sequence
+    ) -> tuple[AdmissionProbe | None, tuple[int, int], bool]:
+        """`(hbm_probe, probed_tier_kv, detachable)` for a request about to be
+        admitted: the HBM probe and tier answer the detach decision was made on,
+        and whether its lookup may be left unanswered. `(None, (0, 0), False)`
+        when detaching is off, for the admission to probe once it has the
+        connector's answer (`_reprobe_after_tier_answer`)."""
+        if not self._lookup_detach_enabled(seq):
+            return None, (0, 0), False
+        probe = self._probe_hbm_prefix(seq)
+        return (
+            probe,
+            self._tier_hit(seq),
+            self._can_detach_tier_lookup(seq, probe.num_cached_blocks),
+        )
+
+    def _reprobe_after_tier_answer(
+        self,
+        seq: Sequence,
+        probe: AdmissionProbe | None,
+        probed_tier_kv: tuple[int, int],
+    ) -> AdmissionProbe:
+        """The admission's HBM probe. The detach probe predates the connector's
+        answer, which `can_allocate` reads for a replaying model (a replaying
+        hit resumes at the tier hit or extends to its KV-only reach) and records
+        on `seq`: probe again if that answer moved."""
+        bm = self.block_manager
+        if probe is None or (
+            bm.state_replay_tokens
+            and seq.has_per_req_cache
+            and self._tier_hit(seq) != probed_tier_kv
+        ):
+            return self._probe_hbm_prefix(seq)
+        return probe
+
     def _probe_hbm_prefix(self, seq: Sequence) -> AdmissionProbe:
         """`can_allocate(record=False)`: the HBM hit in blocks (-1 if the
         request does not fit), the hash chain it walked and the demand its fit
@@ -3518,15 +3524,14 @@ class Scheduler:
             int(getattr(joint, "kv_only_tokens", 0) or 0),
         )
 
-    def _can_detach_tier_lookup(self, seq: Sequence, hbm_probe: AdmissionProbe) -> bool:
+    def _can_detach_tier_lookup(self, seq: Sequence, hit_blocks: int) -> bool:
         """Whether admission may proceed without waiting for `seq`'s lookup.
 
-        Side-effect free. Requires an HBM hit and the connector's consent
-        (`can_detach_lookup`, which applies `OFFLOAD_MIN_LOAD_TOKENS`). The
-        probe is the one admission uses, so it sees the HBM prefix
-        `_decide_load_after_alloc` will see.
+        Side-effect free. Requires an HBM hit (`hit_blocks`, from the probe
+        admission uses, so it is the prefix `_decide_load_after_alloc` will see)
+        and the connector's consent (`can_detach_lookup`, which applies
+        `OFFLOAD_MIN_LOAD_TOKENS`).
         """
-        hit_blocks = hbm_probe.num_cached_blocks
         if hit_blocks <= 0:
             return False
         num_hbm_tokens = hit_blocks * self.block_manager.hash_block_size
@@ -3541,11 +3546,6 @@ class Scheduler:
 
     def _decline_lookup_detach(self, seq: Sequence) -> None:
         self._lookup_detach_declined.add(seq.id)
-
-    def _offload_lookup_pending(self, seq: Sequence) -> bool:
-        """Whether the connector's lookup for `seq` is still in flight."""
-        pending = getattr(self.kv_connector, "lookup_pending", None)
-        return bool(pending(seq)) if pending is not None else False
 
     def _query_connector_prefill_match(self, seq: Sequence, *, skip: bool) -> bool:
         """Ask the connector whether this prefill should park for remote KV."""
@@ -4339,9 +4339,12 @@ class Scheduler:
             state.skip(seq.id, "admission_not_ready")
             return False
         # Never block the scheduler thread -- and every DP rank with it -- on a
-        # synchronous lookup: only an answered async lookup qualifies. (With a
-        # lookup driver thread the answer shows up between ticks.)
-        if self._offload_lookup_pending(seq) or not self.kv_connector.lookup_ready(seq):
+        # synchronous lookup: only an answered async lookup qualifies. A scan
+        # advances the lookup but starts no defer window (that is Phase 2's,
+        # `lookup_pending`).
+        if self.kv_connector.lookup_would_defer(
+            seq
+        ) or not self.kv_connector.lookup_ready(seq):
             state.skip(seq.id, "lookup_not_ready")
             return False
         return True
@@ -4380,7 +4383,7 @@ class Scheduler:
         if (
             self.kv_connector is None
             or not self._connector_flag("is_offload")
-            or not self._connector_flag("supports_early_load")
+            or not self.kv_connector.supports_early_load
         ):
             return 0
         total_blocks = int(bm.kv.num_blocks) if bm is not None else 0
@@ -4408,24 +4411,13 @@ class Scheduler:
                 # early loads behind it can never fill every slot first.
                 state.skip(seq.id, "seq_slots")
                 break
-            hbm_probe = None
-            probed_tier_kv = (0, 0)
-            if self._lookup_detach_enabled(seq):
-                hbm_probe = self._probe_hbm_prefix(seq)
-                probed_tier_kv = self._tier_hit(seq)
-                if self._can_detach_tier_lookup(seq, hbm_probe):
-                    state.skip(seq.id, "detach_no_load")
-                    state.settled.add(seq.id)
-                    continue  # no load possible: it prefills when a FIRE admits it
+            hbm_probe, probed_tier_kv, detachable = self._admission_probe(seq)
+            if detachable:
+                state.skip(seq.id, "detach_no_load")
+                state.settled.add(seq.id)
+                continue  # no load possible: it prefills when a FIRE admits it
             needs_remote_load = self._query_connector_prefill_match(seq, skip=False)
-            # As in Phase 2: the detach probe predates the connector's answer,
-            # which a replaying model's admission reads.
-            if hbm_probe is None or (
-                bm.state_replay_tokens
-                and seq.has_per_req_cache
-                and self._tier_hit(seq) != probed_tier_kv
-            ):
-                hbm_probe = self._probe_hbm_prefix(seq)
+            hbm_probe = self._reprobe_after_tier_answer(seq, hbm_probe, probed_tier_kv)
             if hbm_probe.num_cached_blocks < 0:
                 state.skip(seq.id, "pool_full")
                 break  # the pool cannot take it now; neither could Phase 2
@@ -4526,20 +4518,29 @@ class Scheduler:
         state.retry_at.pop(seq.id, None)
         return True
 
-    def _early_load_take_back(
-        self, seq: Sequence, prev_hit: int, *, cancel_state: bool = True
+    def _take_back_admission(
+        self, seq: Sequence, *, cancel_state: bool = False
     ) -> None:
-        """Undo `allocate` and the connector notification of an early admission
-        that turned out not to park; the request is back in `waiting` exactly as
-        unadmitted, and is not tried again."""
-        self.kv_connector.cancel_preadmission(seq)
+        """Undo `allocate` and the connector's notification of it
+        (`_finish_prefill_admission`) for a request that does not go ahead this
+        tick. The connector forgets what the allocation armed -- a pending
+        load, a save frontier, a producer's queued block ids -- before the
+        blocks are freed, so nothing it dispatches names them."""
+        if self.kv_connector is not None:
+            self.kv_connector.cancel_preadmission(seq)
         if cancel_state and seq.offload_joint.load_hash != -1:
             self.block_manager.cancel_state_load(seq)
         self.block_manager.deallocate(seq)
+
+    def _early_load_take_back(
+        self, seq: Sequence, prev_hit: int, *, cancel_state: bool = True
+    ) -> None:
+        """Undo an early admission that turned out not to park; the request is
+        back in `waiting` exactly as unadmitted, and is not tried again."""
+        self._take_back_admission(seq, cancel_state=cancel_state)
         seq.prefix_cache_hit_tokens = prev_hit
         state = self._early_load
         state.settled.add(seq.id)
-        state.takebacks += 1
         state.skip(seq.id, "taken_back")
 
     def _park_for_remote_load(
@@ -5602,8 +5603,8 @@ class Scheduler:
     def _prioritize_ready_remote_kv_requests(self) -> None:
         """Prioritize completed remote requests before sizing prefill work.
 
-        Runs only when a load completed or failed. Offload completions are
-        resolved here, and every settled resume that keeps its blocks (not only
+        Runs only when a load completed or failed, or an early-loaded request
+        is settled and waiting. Offload completions are resolved here, and every settled resume that keeps its blocks (not only
         the ones that just completed) moves ahead of the other waiters in one
         stable pass. Nothing is re-sorted on the ticks after: the ways a
         blocker gets ahead of a resume are `preempt` and parking
@@ -5613,27 +5614,29 @@ class Scheduler:
         """
         if not self.waiting:
             return
-        if not (
-            self.finished_recving_kv_req_ids
-            or self.failed_recving_kv_req_ids
-            or self._early_load.entries
-        ):
-            return
-        resolve = self._connector_flag("is_offload")
-        queue = list(self.waiting)
         early = self._early_load.entries
+        recving = {
+            str(req_id)
+            for req_id in itertools.chain(
+                self.finished_recving_kv_req_ids, self.failed_recving_kv_req_ids
+            )
+        }
 
         def completed(seq: Sequence) -> bool:
             return (
                 seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
-                and (
-                    self._has_req_id(self.finished_recving_kv_req_ids, seq.id)
-                    or self._has_req_id(self.failed_recving_kv_req_ids, seq.id)
-                )
+                and str(seq.id) in recving
             ) or (
                 seq.status == SequenceStatus.WAITING
                 and self._is_offload_prefill_resume(seq)
             )
+
+        # O(early loads), not O(waiting): an early load in flight leaves the
+        # queue as it is.
+        if not recving and not any(completed(seq) for seq, _ in early.values()):
+            return
+        resolve = self._connector_flag("is_offload")
+        queue = list(self.waiting)
 
         # An early load reserves resources without changing arrival order.
         # Keep that order while the head can progress; if it cannot, the ready
@@ -5641,14 +5644,21 @@ class Scheduler:
         # after its completion event has already been consumed.
         head_blocked = False
         if early and any(completed(seq) and seq.id in early for seq in queue):
-            head = next((seq for seq in queue if not completed(seq)), None)
+            # The head is the first entry Phase 2 would try: it walks past the
+            # loads in flight and the settled resumes this pass promotes.
+            head = next(
+                (
+                    seq
+                    for seq in queue
+                    if seq.status == SequenceStatus.WAITING and not completed(seq)
+                ),
+                None,
+            )
             slots_full = (
                 len(self.running) + self._num_parked_remote_kv >= self.max_num_seqs
             )
-            head_blocked = (
-                head is not None
-                and head.status == SequenceStatus.WAITING
-                and (slots_full or self.block_manager.can_allocate_memoized(head) < 0)
+            head_blocked = head is not None and (
+                slots_full or self.block_manager.can_allocate_memoized(head) < 0
             )
         ready: deque[Sequence] = deque()
         blocked: deque[Sequence] = deque()

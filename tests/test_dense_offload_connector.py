@@ -571,9 +571,7 @@ def test_block_gpu_connector_waits_on_actual_pack_stream_without_host_sync():
     pack_stream = SimpleNamespace(
         wait_event=lambda event: trace.append(("wait", event))
     )
-    state = SimpleNamespace(
-        pack_stream=pack_stream, copy_stream=object(), follows_compute_stream=False
-    )
+    state = SimpleNamespace(pack_stream=pack_stream, copy_stream=object())
     connector = BlockGPUConnector.__new__(BlockGPUConnector)
     connector._capture_transfer_stats = lambda: nullcontext(stats)
     connector._prepare_transfer = lambda *_args, **_kwargs: (state, [object()])

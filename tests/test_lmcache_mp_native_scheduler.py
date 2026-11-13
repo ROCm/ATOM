@@ -1203,7 +1203,10 @@ def _holding_engine(monkeypatch, adapter, **overrides):
     monkeypatch.setenv("ATOM_OFFLOAD_EARLY_LOAD_KV_WATERMARK", "0.95")
     engine, connector, _ = engine_scheduler(monkeypatch, adapter=adapter, **overrides)
     # Only the Mooncake Store opts in; these tests cover the scheduler's
-    # state-carrying early-load path through a connector that holds state.
+    # state-carrying early-load path through a connector that holds state, the
+    # scheduler-side implementation behind the shell.
+    connector = connector._require_impl()
+    engine.kv_connector = connector
     monkeypatch.setattr(type(connector), "supports_early_load", True)
     delayer = _EarlyDelayer()
     engine.set_prefill_delayer(delayer)
@@ -1316,3 +1319,15 @@ def test_early_load_abort_gives_the_native_load_back(monkeypatch):
     assert engine._num_parked_remote_kv == 0
     assert not engine._early_load.entries
     assert engine.block_manager.kv.num_free == free
+
+
+def test_the_shell_forwards_a_taken_back_admission_to_the_scheduler(monkeypatch):
+    """Phase 2 takes an admission back through the connector the engine holds;
+    the shell must hand it to the implementation that armed it."""
+    _, connector, _ = engine_scheduler(monkeypatch)
+    taken_back = []
+    monkeypatch.setattr(
+        connector._require_impl(), "cancel_preadmission", taken_back.append
+    )
+    connector.cancel_preadmission("seq")
+    assert taken_back == ["seq"]

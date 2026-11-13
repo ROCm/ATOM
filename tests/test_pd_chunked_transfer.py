@@ -2233,3 +2233,52 @@ def test_a_preempted_producer_request_rejected_on_readmission_hands_nothing_off(
     assert str(seq.id) not in producer._awaiting_send
     assert seq.id not in producer._reqs_need_save
     assert seq.id not in sched.deferred_free_blocks
+
+
+def test_a_withdrawn_producer_admission_dispatches_no_source_blocks(
+    monkeypatch, seq_factory
+):
+    """A chunked producer is told of every allocation (`update_state_after_alloc`
+    queues its block ids for the worker). An admission the scheduler takes back
+    after that must be cancelled before its blocks are freed, or the same tick's
+    metadata sends the freed ids and claims the source."""
+    from conftest import MockConfig
+
+    from atom.model_engine.scheduler import Scheduler
+
+    sched = Scheduler(
+        MockConfig(
+            max_num_batched_tokens=64,
+            num_kvcache_blocks=100,
+            kv_cache_block_size=4,
+            max_num_seqs=8,
+        )
+    )
+    producer = sched.kv_connector = scheduler_connector(monkeypatch, True)
+
+    def producer_seq(transfer_id):
+        return seq_factory(
+            list(range(10)),
+            kv_transfer_params={
+                "chunked_transfer": True,
+                "do_remote_decode": True,
+                "transfer_id": transfer_id,
+            },
+        )
+
+    first, withdrawn = producer_seq("a"), producer_seq("b")
+    sched.add(first)
+    sched.add(withdrawn)
+    producer._chunked_ready.update({first.id, withdrawn.id})  # D reserved both
+    # The post-allocation re-assert withdraws the second request's admission.
+    monkeypatch.setattr(
+        sched,
+        "_waits_below_resume",
+        lambda seq, start, chunk, resume: seq is withdrawn and bool(seq.block_table),
+    )
+    batch, scheduled = sched.schedule()
+    meta = batch.connector_meta_output
+    assert list(scheduled) == [first.id]
+    assert set(meta.reqs_to_save) == {first.id}
+    assert str(withdrawn.id) not in producer._awaiting_send
+    assert not withdrawn.block_table

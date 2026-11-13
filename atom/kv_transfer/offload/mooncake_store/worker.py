@@ -236,8 +236,9 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
             )
 
     # -- lifecycle --------------------------------------------------------
-    # The stream the forward runs on: seeded at registration, then reported by
-    # the model runner before each forward (`ModelRunner.prefill_forward`).
+    # The stream the forward runs on: seeded at registration, then reported
+    # before each forward by `RapidServeModelRunner`, the one runner that picks
+    # a stream per forward (`RapidServeModelRunner.prefill_forward`).
     _forward_stream: Any = None
 
     def set_forward_stream(self, stream: Any) -> None:

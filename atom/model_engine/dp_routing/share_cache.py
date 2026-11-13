@@ -40,7 +40,7 @@ class ShareCacheRouter(PrefixSpreadRouter):
 
     DECISIONS: ClassVar[dict[str, str]] = {
         "share_cache_hit_total": "Requests placed on a prefix the shared tier holds.",
-        "share_cache_source_rank_total": "Requests placed on a local prefix owner.",
+        "share_cache_source_rank_total": "Requests placed on the rank still prefilling their prefix.",
         "share_cache_cold_total": "Requests placed without a known prefix.",
         "share_cache_stale_total": "Actual reuse reports corrected stale prefix hints.",
     }
@@ -48,6 +48,12 @@ class ShareCacheRouter(PrefixSpreadRouter):
     def __init__(self, tier, req_equiv: int) -> None:
         super().__init__(idle_tokens=0, tier=tier, max_seqs=0)
         self.placement = SharedWorkPlacement(req_equiv)
+
+    def place(self, seq, rank, n_ranks):
+        route = super().place(seq, rank, n_ranks)
+        if route.credit:
+            self._reuse_pending[seq.id] = (seq.prompt_hash_chain, route.credit, rank)
+        return route
 
     def select(self, seq, rank_tokens, rank_reqs, rank_load, lightest):
         """`rank_tokens` is each rank's prefill backlog; the load callbacks of

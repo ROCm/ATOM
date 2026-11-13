@@ -286,7 +286,7 @@ class AsyncStoreLookup(LookupClient):
             logger.warning(
                 "Mooncake Store lease renewal for seq=%s did not finish in %.1fs; "
                 "the load is dispatched without it",
-                getattr(seq, "id", None),
+                seq.id,
                 RENEW_TIMEOUT_S,
             )
             return 0

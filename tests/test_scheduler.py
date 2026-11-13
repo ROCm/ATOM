@@ -1578,21 +1578,6 @@ class TestWaitingNewTokenCount:
         # Only the 8 admittable tokens count; the 10 remote-KV tokens are skipped.
         assert sched._waiting_new_token_count() == 8
 
-    def test_counts_finished_tier_load_beyond_its_loaded_prefix(self, seq_factory):
-        # A request whose tier load finished is resumed by this tick's admission:
-        # it counts the tokens after its loaded prefix, not zero and not the lot.
-        sched = self._sched()
-        sched.kv_connector = _ConnectorNamespace(is_offload=True)
-        loaded = seq_factory(list(range(40)))
-        loaded.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
-        loaded.num_cached_tokens = 8
-        loaded.offload_loaded_tokens = 32
-        sched.waiting = deque([loaded])
-        sched.finished_recving_kv_req_ids = []
-        assert sched._waiting_new_token_count() == 0  # load still in flight
-        sched.finished_recving_kv_req_ids = [loaded.id]
-        assert sched._waiting_new_token_count() == 8  # 40 - 32 loaded
-
     def test_skips_unschedulable_oversized_seq(self, seq_factory):
         # Prompt longer than max_model_len is permanently unschedulable → skipped.
         sched = self._sched()

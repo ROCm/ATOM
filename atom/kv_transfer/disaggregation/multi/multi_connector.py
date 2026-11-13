@@ -63,6 +63,7 @@ from atom.kv_transfer.disaggregation.base import (
     KVConnectorBase,
     KVConnectorSchedulerBase,
 )
+from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 from atom.kv_transfer.disaggregation.types import (
     ConnectorMetadata,
     KVConnectorOutput,
@@ -82,10 +83,6 @@ def validate_multi_config(kv_transfer_config: dict) -> list:
     a topology the composite cannot run. Builds nothing, so `Config` calls it
     before the model loads and `_build_subconnectors` before any sub is built.
     """
-    # Imported lazily: the factory module registers backends at import time and
-    # we must not create an import cycle with it.
-    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
-
     subs = kv_transfer_config.get("connectors")
     if not subs:
         raise ValueError(
@@ -120,14 +117,16 @@ def validate_multi_config(kv_transfer_config: dict) -> list:
     # keys its handling of a completed receive on the connector being an
     # offload one, so a received prefill would be resumed as a tier load and
     # its prompt prefilled again, never handed to first decode. No recipe runs
-    # this; refuse it rather than recompute every received prompt.
+    # this; refuse it rather than recompute every received prompt. A P/D leaf
+    # is a consumer unless its role is ``kv_producer``, as it builds itself
+    # (``kv_both`` included).
     consumers = [
         sub["kv_connector"]
         for sub in subs
         if not KVConnectorFactory.is_offload_backend(
             KVConnectorFactory.canonical_name(sub["kv_connector"])
         )
-        and sub.get("kv_role") == "kv_consumer"
+        and sub.get("kv_role", "kv_producer") != "kv_producer"
     ]
     if offload_subs and consumers:
         raise ValueError(
@@ -147,10 +146,6 @@ def _build_subconnectors(config: Any, role: str) -> list:
     sub-dict, and route through the normal factory — no recursion, since each
     sub names a concrete backend (moriio / lmcache_offload / ...), not ``multi``.
     """
-    # Imported lazily: the factory module registers backends at import time and
-    # we must not create an import cycle with it.
-    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
-
     kvc = getattr(config, "kv_transfer_config", None) or {}
     subs = validate_multi_config(kvc)
 
@@ -421,10 +416,8 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
     """Scheduler-side composite connector."""
 
     def _prefetch_tier(self):
-        # Prefill producer + one offload tier only; decode's P/D receive
-        # must not compete with a speculative Store read into the same blocks.
-        if not self.is_producer:
-            return None
+        # The one offload sub (`validate_multi_config` refuses a second, and a
+        # P/D consumer beside it).
         return next((c for c in self._connectors if c.is_offload), None)
 
     @property
@@ -459,11 +452,10 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
 
     def lookup_pending(self, seq: Any) -> bool:
         """True while any sub's external-tier lookup for `seq` is in flight."""
-        for connector in self._connectors:
-            pending = getattr(connector, "lookup_pending", None)
-            if callable(pending) and pending(seq):
-                return True
-        return False
+        return any(c.lookup_pending(seq) for c in self._connectors)
+
+    def lookup_would_defer(self, seq: Any) -> bool:
+        return any(c.lookup_would_defer(seq) for c in self._connectors)
 
     def close(self) -> None:
         """Close every sub-connector that holds threads (the offload tier's)."""

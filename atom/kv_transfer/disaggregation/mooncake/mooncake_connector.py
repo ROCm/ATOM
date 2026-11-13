@@ -699,7 +699,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
                 self.transfer_id_to_request_id[transfer_id] = seq.id
                 self.request_id_to_transfer_id[seq.id] = transfer_id
 
-        slot_index = getattr(seq, "state_slot", -1)
+        slot_index = seq.state_slot
 
         # Consumer side: queue for remote KV loading
         if params.get("do_remote_prefill"):
@@ -783,7 +783,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
                 self._reqs_need_save[seq.id] = (
                     seq,
                     list(seq.block_table),
-                    getattr(seq, "state_slot", -1),
+                    seq.state_slot,
                 )
             seq.kv_transfer_params_output = None
             return
@@ -807,7 +807,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             self._reqs_need_save[seq.id] = (
                 seq,
                 list(seq.block_table),
-                getattr(seq, "state_slot", -1),
+                seq.state_slot,
             )
 
         first_token_id = seq.output_tokens[0] if seq.output_tokens else None
@@ -815,7 +815,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         draft_token_ids = (
             [int(x) for x in drafts] if drafts is not None and len(drafts) else []
         )
-        final_state_slot = getattr(seq, "state_slot", -1)
+        final_state_slot = seq.state_slot
         seq.kv_transfer_params_output = {
             "do_remote_prefill": True,
             "do_remote_decode": False,

@@ -37,6 +37,7 @@ class _FakeSeq:
     ):
         self.id = seq_id
         self.num_prompt_tokens = num_prompt_tokens
+        self.prompt_hash_chain = None
         self.dp_session_id = dp_session_id
         self.dp_parent_session_id = dp_parent_session_id
         if data_parallel_rank is not None:
@@ -73,7 +74,7 @@ def _make_mgr(
     mgr._seq_load = {}
     mgr._prefix_router = None
     mgr._lb_lock = Lock()
-    mgr._backlog = BacklogLedger(n_ranks)
+    mgr._backlog = BacklogLedger(n_ranks) if strategy == "share_cache" else None
     return mgr
 
 
@@ -568,11 +569,9 @@ def test_concurrent_store_dispatch_accounts_in_socket_send_order():
     from atom.kv_transfer.offload.tier import OffloadTierProfile
     from atom.model_engine.dp_routing.share_cache import ShareCacheRouter
 
-    mgr = _make_mgr(1)
+    mgr = _make_mgr(1, strategy="share_cache")
 
-    mgr._share_cache_router = ShareCacheRouter(
-        OffloadTierProfile(True, 0, 256, True), 100
-    )
+    mgr._prefix_router = ShareCacheRouter(OffloadTierProfile(True, 0, 256, True), 100)
     first_sent, second_started = Event(), Event()
     order = []
 
@@ -822,7 +821,7 @@ def test_new_follower_discovers_a_pinned_producer_above_the_history_budget():
     assert route.credit == 65536
     router.charge(follower.id, route.credit)
     debt = router.release(1)
-    assert debt == {100: 65536}
+    assert debt == {100: (65536, 0)}
     for seq_id in list(router._in_flight):
         router.release(seq_id)
     assert not router.pending
@@ -1846,11 +1845,11 @@ def test_cancel_preserves_only_independent_tier_credit(
     assert router.release(source.id) == {}
     charges = router.release(producer.id)
     assert router._in_flight[follower.id] == expected
-    assert charges.get(follower.id, 0) == credited - expected
+    assert charges.get(follower.id, (0, 0))[0] == credited - expected
     assert router.release(producer.id) == {}
     charges = router.release(follower.id)
     assert router._in_flight[later.id] == expected
-    assert charges.get(later.id, 0) == later_credit - expected
+    assert charges.get(later.id, (0, 0))[0] == later_credit - expected
     router.prefill_complete(later.id)
     router.release(later.id)
     if tier_tokens and not finished:
@@ -1870,7 +1869,7 @@ def test_cancel_preserves_confirmed_local_credit_without_a_tier():
         if seq_id == 1:
             router.prefill_complete(seq_id)
             router.release(seq_id)
-    assert router.release(2) == {3: 4096}
+    assert router.release(2) == {3: (4096, 4096)}
     assert router._in_flight[3] == 4096
     router.release(3)
     assert not router._independent_credit
@@ -2339,9 +2338,9 @@ def test_store_floor_profile_matches_admission_without_double_credit():
 
 def test_late_reuse_miss_splits_a_merged_placement_credit_boundary():
     from atom.kv_transfer.offload.tier import OffloadTierProfile
-    from atom.model_engine.dp_routing.prefix_spread import PrefixSpreadRouter
+    from atom.model_engine.dp_routing.share_cache import ShareCacheRouter
 
-    router = PrefixSpreadRouter(1000, OffloadTierProfile(True, 0, 1), 64)
+    router = ShareCacheRouter(OffloadTierProfile(True, 0, 1), 64)
     a, b, c = (_chain_seq(11, 1280), _chain_seq(12, 1408), _chain_seq(13, 1408))
     for item in (a,):
         route = router.place(item, 0, 2)

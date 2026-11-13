@@ -332,7 +332,7 @@ def test_a_refused_park_is_taken_back_and_not_retried(setup):
     assert _free(sched) == free
     assert sched.kv_connector.cancelled == [seq.id]
     assert sched._num_parked_remote_kv == 0
-    assert sched._early_load.takebacks == 1
+    assert sched._early_load.skips["taken_back"] == 1
     sched.schedule()  # next tick: not tried again
     assert sched.kv_connector.allocs == [seq.id]
 
@@ -606,9 +606,9 @@ def test_a_completion_reported_as_a_string_id_is_recognised(monkeypatch, seq_fac
     seq = seq_factory(list(range(16)))
     seq.id = 123
     seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
-    assert not sched._tier_load_succeeded(seq)
+    assert sched._still_loading(seq)
     sched.finished_recving_kv_req_ids = ["123"]
-    assert sched._tier_load_succeeded(seq)
+    assert not sched._still_loading(seq)
 
 
 def test_pending_tokens_follow_the_replay_adjusted_resume_point(
@@ -627,21 +627,6 @@ def test_pending_tokens_follow_the_replay_adjusted_resume_point(
     # A failed load falls back to the HBM hit, replay-adjusted the same way.
     sched.failed_recving_kv_req_ids = [seq.id]
     assert sched.pending_prefill_tokens(seq) == 40 - (8 - hbs)
-
-
-def test_a_completed_tier_waiter_is_not_probed_for_a_new_allocation(
-    monkeypatch, seq_factory
-):
-    sched = _sched(monkeypatch)
-    seq = seq_factory(list(range(32)))
-    seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
-    seq.num_cached_tokens = 4
-    seq.offload_loaded_tokens = 16
-    sched.waiting.append(seq)
-    sched.finished_recving_kv_req_ids = [seq.id]
-    sched.block_manager.can_allocate_memoized = lambda s: pytest.fail("probed")
-    prefillable, pending = sched._probe_local_prefill_work()
-    assert prefillable and pending == 32 - 16
 
 
 def test_early_loads_in_flight_do_not_use_up_the_probe_budget(monkeypatch, seq_factory):
@@ -704,11 +689,16 @@ def test_a_finished_tier_load_has_an_age_and_a_failed_one_is_not_admittable(
     ok.arrive_time = failed.arrive_time = 1.0
     sched.waiting.extend([ok, failed])
     assert sched._oldest_waiting_prefill_age_ms() == 0.0  # both still loading
-    sched.finished_recving_kv_req_ids = [ok.id, failed.id]
+    # What `_prioritize_ready_remote_kv_requests` leaves a finished load: WAITING
+    # on its blocks. A failed one stays parked until admission resolves it.
+    ok.status = SequenceStatus.WAITING
+    ok.block_table = [0]
+    ok.offload_loaded = True
+    ok.num_cached_tokens = 8
     sched.failed_recving_kv_req_ids = [failed.id]
     assert list(sched._waiting_prefills()) == [ok]
     assert sched._oldest_waiting_prefill_age_ms() > 0.0
-    sched.finished_recving_kv_req_ids = [failed.id]
+    sched.waiting.remove(ok)
     assert list(sched._waiting_prefills()) == []
     assert sched._oldest_waiting_prefill_age_ms() == 0.0
 
@@ -768,3 +758,69 @@ def test_settled_early_owner_keeps_fifo_until_the_head_cannot_allocate(
     sched._prioritize_ready_remote_kv_requests()
     assert list(sched.waiting) == [owner, head]
     assert owner.block_table
+
+
+def test_a_load_in_flight_ahead_of_the_blocked_head_does_not_hide_it(
+    monkeypatch, seq_factory
+):
+    """The head is the first request Phase 2 would try, so loads in flight ahead
+    of it do not stop a finished early load from being promoted past a head that
+    waits for the blocks it holds."""
+    sched = _sched(monkeypatch)
+    head = seq_factory(list(range(16)))
+    loading, done = _parked(sched, seq_factory, 2)
+    sched.block_manager.allocate(done)
+    original = sched.block_manager.can_allocate_memoized
+    monkeypatch.setattr(
+        sched.block_manager,
+        "can_allocate_memoized",
+        lambda seq: -1 if seq is head else original(seq),
+    )
+    sched.waiting.extend([loading, head, done])
+    sched.finished_recving_kv_req_ids = [done.id]
+    sched._prioritize_ready_remote_kv_requests()
+    assert list(sched.waiting) == [done, loading, head]
+
+
+@pytest.mark.parametrize("site", ["state_leg", "joint_disown", "atomic_chunk"])
+def test_every_take_back_after_the_connector_was_told_cancels_the_preadmission(
+    monkeypatch, seq_factory, site
+):
+    sched = _sched(monkeypatch)
+    conn = sched.kv_connector
+    conn.match = (0, False)
+    seq = seq_factory(list(range(16)))
+    sched.add(seq)
+    if site == "state_leg":
+        monkeypatch.setattr(
+            sched, "_confirm_remote_load_after_alloc", lambda seq, needs: True
+        )
+        monkeypatch.setattr(sched, "_drop_state_leg_of_kv_load", lambda seq: False)
+    elif site == "joint_disown":
+        notify = sched._notify_connector_after_prefill_alloc
+
+        def notify_with_joint_boundary(seq):
+            notify(seq)
+            seq.offload_joint.boundary_tokens = 4
+
+        monkeypatch.setattr(
+            sched, "_notify_connector_after_prefill_alloc", notify_with_joint_boundary
+        )
+        monkeypatch.setattr(
+            sched.block_manager, "retreat_joint_to_hbm", lambda s: False
+        )
+        monkeypatch.setattr(
+            sched.block_manager, "disown_claimed_prefix", lambda s: False
+        )
+    else:
+        calls = []
+
+        def waits_after_allocation(*args):
+            calls.append(args)
+            return len(calls) > 1
+
+        monkeypatch.setattr(sched, "_waits_below_resume", waits_after_allocation)
+    sched.schedule()
+    assert conn.allocs == [seq.id]
+    assert conn.cancelled == [seq.id]
+    assert not seq.block_table and seq.status == SequenceStatus.WAITING

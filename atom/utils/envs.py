@@ -1407,7 +1407,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "OFFLOAD_ASYNC_LOOKUP_DEPTH", 16
     ),
     # How long admission may pass over a request whose async lookup has not
-    # answered before it waits for the answer instead.
+    # answered; after it `lmcache_mp` waits for the answer and the Mooncake
+    # Store admits the request without one.
     "OFFLOAD_LOOKUP_DEFER_S": lambda: _finite_float_env(
         "OFFLOAD_LOOKUP_DEFER_S", 2.0, allow_zero=True
     ),

@@ -1641,10 +1641,10 @@ class BlockManager:
         start there.
 
         A tier moves whole `chunk`-token chunks, so a load starts only on a
-        chunk boundary. An HBM hit that ends inside a chunk used to need a
-        hand-off prefill up to the next boundary, then the load, then the rest:
-        two prefill releases. Treat the part of the hit past the floor as a
-        miss instead. `allocate` then claims only the blocks below the floor
+        chunk boundary. Without lowering, an HBM hit that ends inside a chunk
+        needs a hand-off prefill up to the next boundary, then the load, then
+        the rest: two prefill releases. Lowering treats the part of the hit
+        past the floor as a miss. `allocate` then claims only the blocks below the floor
         and fills the rest with fresh ones, which the load writes whole; the
         shared blocks past the floor are left alone. The tier re-supplies at
         most `chunk - hash_block` tokens that HBM already held.

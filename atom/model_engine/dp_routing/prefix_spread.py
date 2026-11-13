@@ -212,7 +212,8 @@ class PrefixSpreadRouter:
         self._trim_history()
 
     def release(self, seq_id) -> dict:
-        """Release a request; return extra prefill charges for its successors."""
+        """Release a request. For each successor that inherits its unfinished
+        prefix, returns `(extra prefill charge, credit it retains)`."""
         self._reuse_pending.pop(seq_id, None)
         if seq_id not in self._in_flight:
             self.prefill_complete(seq_id)
@@ -237,18 +238,24 @@ class PrefixSpreadRouter:
         local credit; the tier supplies completed prefixes. `decisions` names
         the counters for a hit on a producer's rank, on the tier, and a miss.
         """
-        chain = getattr(seq, "prompt_hash_chain", None)
+        chain = seq.prompt_hash_chain
         path = self._path(chain)
         hits, owner = self._rank_hits(len(rank_tokens), path, all_pending=True)
+        # Rank-independent: one walk for every candidate.
+        in_tier = self._tier_hit(path)
         credits = [
-            self._credit(seq, rank, hits, None, path)
+            self._credit(seq, rank, hits, None, path, in_tier)
             for rank in range(len(rank_tokens))
         ]
         costs = [max(0, seq.num_prompt_tokens - hit) for hit, _loaded in credits]
         rank = choose(rank_tokens, rank_reqs, costs, owner)
         hit, loaded = credits[rank]
         self._record(
-            chain, rank, seq.id, hit, self._independent_hit(seq, rank, hit, path)
+            chain,
+            rank,
+            seq.id,
+            hit,
+            self._independent_hit(seq, rank, hit, path, in_tier),
         )
         if hit:
             self._reuse_pending[seq.id] = (chain, hit, rank)
@@ -345,7 +352,7 @@ class PrefixSpreadRouter:
         - Otherwise the owner. While the prefix's source is still prefilling
           this is what lets the request reuse it from HBM.
         """
-        chain = getattr(seq, "prompt_hash_chain", None)
+        chain = seq.prompt_hash_chain
         # One read-only walk serves every lookup below; only `_record` walks again.
         path = self._path(chain)
         hits, owner = self._rank_hits(len(rank_tokens), path)
@@ -377,7 +384,7 @@ class PrefixSpreadRouter:
 
     def place(self, seq: Any, rank: int, n_ranks: int) -> Route:
         """Index explicit placement with the same local/tier credit as a move."""
-        chain = getattr(seq, "prompt_hash_chain", None)
+        chain = seq.prompt_hash_chain
         if chain is None or not 0 <= rank < n_ranks:
             return Route(rank, "explicit_total")
         path = self._path(chain)
@@ -390,19 +397,18 @@ class PrefixSpreadRouter:
             credit,
             self._independent_hit(seq, rank, credit, path),
         )
-        if credit:
-            self._reuse_pending[seq.id] = (chain, credit, rank)
         return Route(rank, "explicit_total", credit, loaded)
 
-    def _credit(self, seq, rank, hits, owner, path):
+    def _credit(self, seq, rank, hits, owner, path, in_tier=None):
         local = hits.get(rank, 0)
         if rank == owner or not self.tier.loads:
             return local, 0
-        in_tier = self._tier_hit(path)
+        if in_tier is None:
+            in_tier = self._tier_hit(path)
         loaded = self.tier.loadable_tokens(local, in_tier, seq.num_prompt_tokens)
         return self.tier.credited_tokens(local, loaded), loaded
 
-    def _independent_hit(self, seq, rank, credit, path):
+    def _independent_hit(self, seq, rank, credit, path, in_tier=None):
         """Credit available without waiting for a same-rank producer.
 
         Keep the placement-time confirmed local prefix and load policy: an
@@ -415,9 +421,9 @@ class PrefixSpreadRouter:
         local = confirmed_path[-1][1] if confirmed_path else 0
         if not self.tier.loads:
             return min(credit, local)
-        loaded = self.tier.loadable_tokens(
-            local, self._tier_hit(path), seq.num_prompt_tokens
-        )
+        if in_tier is None:
+            in_tier = self._tier_hit(path)
+        loaded = self.tier.loadable_tokens(local, in_tier, seq.num_prompt_tokens)
         return min(credit, self.tier.credited_tokens(local, loaded))
 
     def _idle_target(
@@ -801,4 +807,7 @@ class PrefixSpreadRouter:
             self._refresh_evictable(edge)
         self._prune_empty(edges)
         self._trim_history()
-        return charges
+        return {
+            successor: (extra, self._in_flight[successor])
+            for successor, extra in charges.items()
+        }

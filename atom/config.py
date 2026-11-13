@@ -15,6 +15,8 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import torch
 from transformers import AutoConfig, GenerationConfig, PretrainedConfig
 
+from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+from atom.kv_transfer.disaggregation.multi.multi_connector import validate_multi_config
 from atom.model_engine.capabilities import pcp_group_size_of
 from atom.model_engine.prefill_delayer import PREFILL_ADMIT_POLICIES
 from atom.model_loader.weight_utils import (
@@ -2650,10 +2652,6 @@ class Config:
         ):
             # Refuse a composite the engine cannot run now, not when a worker
             # builds it after the weights are loaded.
-            from atom.kv_transfer.disaggregation.multi.multi_connector import (
-                validate_multi_config,
-            )
-
             validate_multi_config(self.kv_transfer_config)
         if self.sequence_parallel_size > 1:
             self._init_sequence_parallel()
@@ -3267,8 +3265,6 @@ class Config:
             )
 
     def _resolve_offload_min_load_tokens(self) -> None:
-        from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
-
         # Resolve once before spawning workers, identically for CLI and API.
         self.offload_min_load_tokens = KVConnectorFactory.resolve_min_load_tokens(self)
 
