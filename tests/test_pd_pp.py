@@ -1957,6 +1957,7 @@ def _pp_stage_connector(mc, nic, *, tp_size=1, tp_rank=0, ssm_segments=True):
     ]
     connector._slot_region_tp_replicated = [False, False, True]
     connector._gather_slot = None
+    connector._mla_staging = None
     connector._rdma_write = nic.write
     return connector
 
@@ -2060,6 +2061,65 @@ def test_a_tp_split_the_state_cannot_take_is_refused(
 
     with pytest.raises(RuntimeError, match=match):
         _run_slot_transfer(mc, connector, request)
+
+
+def test_pp_stage_stages_its_mla_pages_like_a_block_only_producer(monkeypatch):
+    """With the producer's MLA staging pool and the request's ready event, the
+    stateful path sends its MLA pages as `_execute_block_transfer` does:
+    gathered into destination pages, the bytes the per-token path writes."""
+    import ctypes
+    from contextlib import nullcontext
+
+    torch = pytest.importorskip("torch")
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    monkeypatch.setattr(mc.torch.cuda, "stream", lambda _s: nullcontext())
+    src = torch.arange(4 * _BPB, dtype=torch.uint8).view(4, _BPB)
+    stream = SimpleNamespace(wait_event=lambda _e: None, synchronize=lambda: None)
+    landed = []
+    for staged in (False, True):
+        dst = torch.zeros((2, 4, _BPB), dtype=torch.uint8)
+        labels = []
+
+        def write(_t, srcs, dsts, sizes, _r, label, *, labels=labels, **_kw):
+            for s, d, n in zip(srcs, dsts, sizes):
+                ctypes.memmove(int(d), int(s), int(n))
+            labels.append(label)
+            return True
+
+        conn = _pp_stage_connector(mc, SimpleNamespace(write=write))
+        conn._block_regions = [(src.data_ptr(), _BPB)]
+        conn._slot_regions = []
+        conn._slot_region_consumer_indices = None
+        conn._slot_region_tp_segments = None
+        conn._slot_region_tp_replicated = None
+        if staged:
+            conn._mla_staging = torch.empty((1, 2 * _BPB), dtype=torch.uint8)
+            conn._mla_staging_slots = mc.SlotPool(1)
+            conn._send_worker_stream = lambda: stream
+            conn._mla_token_views = {0: src.view(-1, _TOKEN_BYTES)}
+        request = _dcp_tp_request()
+        request.update(
+            consumer_block_base_addrs=[dst[0].data_ptr(), dst[1].data_ptr()],
+            consumer_slot_base_addrs=[],
+            consumer_slot_bps=[],
+            dst_slot_index=-1,
+        )
+        assert mc.MooncakeConnector._execute_block_slot_transfer(
+            conn,
+            request,
+            "consumer:1",
+            [0, 1, 2, 3],
+            [1, 2],
+            {"slot_index": -1},
+            "req-1",
+            object(),
+        )
+        landed.append(dst)
+        assert ("staged-mla" in labels) is staged
+    assert landed[0].any()
+    assert torch.equal(landed[0], landed[1])
 
 
 def test_dcp_index_staging_waits_for_request_ready_event():
