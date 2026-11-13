@@ -30,6 +30,7 @@ def _dispatch(kind, kernel, gfx="gfx1250", **overrides):
         "pa_sparse_prefill_opus": kernel,
         "pa_decode_sparse": kernel,
         "_sparse_attn_v4_paged_2src_triton": kernel,
+        "V4_DIM_QK": 512,
     }
     namespace.update(overrides)
     exec(  # noqa: S102 -- execute the checked-in dispatcher, without GPU imports
@@ -108,3 +109,73 @@ def test_bf16_prefill_uses_independent_strides_when_query_differs(gfx):
     assert result is out and len(calls) == 1 and calls[0] is out
     torch.testing.assert_close(out, q + 1)
     assert torch.all(parent[[0, -1]] == -99)
+
+
+@pytest.mark.parametrize("path", ["bf16", "fp8", "hca", "prefill_asm"])
+@pytest.mark.parametrize("invalid", ["rows", "heads", "dim", "dtype", "device"])
+def test_decode_rejects_invalid_output_before_dispatch(path, invalid):
+    def kernel(*args, **kwargs):
+        pytest.fail("invalid output reached the kernel")
+
+    run, q, kwargs = _decode_case(path, kernel)
+    shape = list(q.shape)
+    dtype, device = torch.bfloat16, q.device
+    if invalid in ("rows", "heads", "dim"):
+        shape[("rows", "heads", "dim").index(invalid)] -= 1
+    elif invalid == "dtype":
+        dtype = torch.float32
+    else:
+        device = "meta"
+    out = torch.empty(shape, dtype=dtype, device=device)
+    assert out.is_contiguous()
+    with pytest.raises(ValueError, match="decode output must have shape"):
+        run(*_args("decode", q), out=out, **kwargs)
+
+
+def _decode_case(path, kernel):
+    fp8 = path != "bf16"
+    q = torch.zeros(
+        3, 128 if path in ("hca", "prefill_asm") else 8, 512, dtype=torch.bfloat16
+    )
+    run = _dispatch(
+        "decode",
+        kernel,
+        gfx="gfx950" if path == "bf16" else "gfx1250",
+        os=SimpleNamespace(environ={"ATOM_USE_TRITON_ATTN": "1"}),
+        envs=SimpleNamespace(ATOM_USE_V4_PREFILL_ASM_FOR_DECODE=path == "prefill_asm"),
+        hca_persist=SimpleNamespace(
+            wanted=lambda **kw: path == "hca",
+            layout_ok=lambda *a: True,
+            workspace_ready=lambda *a: True,
+            hca_persist_decode=kernel,
+        ),
+        _sparse_attn_v4_paged_decode_asm=kernel,
+        _sparse_attn_v4_paged_decode_triton=kernel,
+        _sparse_attn_v4_paged_decode_prefill_asm=kernel,
+    )
+    kwargs = {}
+    if fp8:
+        kwargs = {
+            "q_packed_in": torch.zeros_like(q, dtype=torch.uint8),
+            "q_rope_in": torch.zeros(*q.shape[:2], 64, dtype=torch.bfloat16),
+            "unified_kv_rope": torch.zeros(1, 64, dtype=torch.bfloat16),
+            "empty_kv_indptr": torch.zeros(4, dtype=torch.int32),
+        }
+    return run, q, kwargs
+
+
+@pytest.mark.parametrize("path", ["fp8", "hca", "prefill_asm"])
+def test_fp8_decode_validates_unpadded_bf16_output(path):
+    calls = []
+
+    def kernel(*args, **kwargs):
+        calls.append(kwargs["out"])
+        return kwargs["out"]
+
+    run, q, kwargs = _decode_case(path, kernel)
+    parent = torch.full((5, *q.shape[1:]), -99.0, dtype=torch.bfloat16)
+    out = parent[1:-1]
+    args = (None, *_args("decode", q)[1:])
+    assert run(*args, out=out, **kwargs) is out
+    assert calls == [out]
+    assert torch.all(parent == -99)

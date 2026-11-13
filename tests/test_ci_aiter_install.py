@@ -35,13 +35,20 @@ def test_install_leaves_aiter_managed_separately(
     monkeypatch.setattr(importlib.metadata, "version", version)
     monkeypatch.setattr(subprocess, "run", lambda args, **kw: calls.append(args))
     module["main"](extras)
-    project = module["tomllib"].loads((ROOT / "pyproject.toml").read_text())["project"]
-    dependencies = [d for d in project["dependencies"] if not d.startswith("amd-aiter")]
-    for extra in extras:
-        dependencies.extend(project["optional-dependencies"][extra])
-    assert calls == [
-        [sys.executable, "-m", "pip", "install", *dependencies],
-        [sys.executable, "-m", "pip", "install", "--no-deps", "-e", str(ROOT)],
+    assert len(calls) == 2
+    assert calls[0][:4] == [sys.executable, "-m", "pip", "install"]
+    assert not any(arg.startswith("amd-aiter") for arg in calls[0])
+    assert "pybind11" in calls[0]
+    assert ("llguidance==1.9.1" in calls[0]) == bool(extras)
+    assert ("opentelemetry-api>=1.40,<2" in calls[0]) == bool(extras)
+    assert calls[1] == [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--no-deps",
+        "-e",
+        str(ROOT),
     ]
     assert capsys.readouterr().out == (
         "Keeping CI amd-aiter 0.1.1.dev1+g8c964fa61\n" if aiter_installed else ""

@@ -123,9 +123,8 @@ git clone https://github.com/ROCm/ATOM.git && pip install ./ATOM
 ATOM requires **AITER 0.1.28 or newer**, including the sparse prefill/decode
 `out=` APIs. This minimum is part of the base installation dependencies.
 Release wheels are published on [GitHub Releases](https://github.com/ROCm/aiter/releases);
-the default PyPI index may not carry a compatible version. CI uses a separately
-installed nightly wheel and checks its source commit against `v0.1.28`, since
-nightly package versions do not necessarily reflect the release tag.
+the default PyPI index may not carry a compatible version. CI keeps its separately
+installed nightly AITER, because nightly versions can fall below the release floor.
 
 ## 💡 Usage
 
