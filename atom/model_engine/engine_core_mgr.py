@@ -468,10 +468,15 @@ class CoreManager:
     def _start_distributed_store(
         self, config: Config, *, multinode: bool = False
     ) -> None:
-        """Bind the actual rendezvous server before publishing its port to workers."""
+        """Bind the actual rendezvous server before publishing its port to workers.
+
+        Also names the server (`server_instance_id`), which every engine of it
+        copies from `config`.
+        """
         from torch.distributed import TCPStore
 
         pc = config.parallel_config
+        pc.server_instance_id = uuid.uuid4().hex[:12]
         if multinode and pc.data_parallel_base_port == 0:
             raise ValueError(
                 "Multi-node DP requires the same nonzero --data-parallel-base-port "

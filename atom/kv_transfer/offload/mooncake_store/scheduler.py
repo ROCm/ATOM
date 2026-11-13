@@ -226,12 +226,21 @@ class _StoreLookup(LookupClient):
         self.stranded_objects = 0
         self._next_stats_at = time.monotonic() + _LOOKUP_STATS_INTERVAL_S
 
-    def lookup(self, seq: Any, lookup_id: str | None = None) -> int | None:
+    def lookup(
+        self,
+        seq: Any,
+        lookup_id: str | None = None,
+        request_configs: dict | None = None,
+    ) -> int | None:
         """Tokens of ``seq``'s prompt prefix the Store holds on every rank.
 
         None, not 0, when the Store did not answer -- no pool reached, or the
         keys no pool answered decide the hit: the scheduler retries a
         non-answer later, where a 0 would be remembered as a miss.
+
+        The shared lookup interface also carries LMCache request_configs.
+        Native Store keys instead chain from the Sequence.cache_seed, which
+        is the authoritative source of that same media salt.
         """
         started = time.perf_counter()
         hashes = prompt_chunk_hashes(seq, self._chunk_tokens)

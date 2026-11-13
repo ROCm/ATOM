@@ -127,25 +127,28 @@ class AsyncStoreLookup(LookupClient):
             self._next_failure_warning = now + 60.0
         logger.warning("Mooncake Store lookup failed; answer unavailable: %s", exc)
 
-    def _query(self, seq, sid):
+    def _query(self, seq, sid, request_configs=None):
         with self.backend_lock:
             with self.lock:
                 self.asked_at[sid] = time.monotonic()
                 self.asked_at.move_to_end(sid)
                 while len(self.asked_at) > 2 * self.capacity:
                     self.asked_at.popitem(last=False)
-            return self.backend.lookup(seq, lookup_id=sid)
+            kwargs = (
+                {} if request_configs is None else {"request_configs": request_configs}
+            )
+            return self.backend.lookup(seq, lookup_id=sid, **kwargs)
 
     def query_started(self, sid):
         """When the Store query behind `sid`'s answer was sent; None if unknown."""
         with self.lock:
             return self.asked_at.get(sid)
 
-    def submit(self, seq, sid):
+    def submit(self, seq, sid, request_configs=None):
         with self.lock:
             if self.closed or sid in self.pending or len(self.pending) >= self.capacity:
                 return False
-            future = self.executor.submit(self._query, seq, sid)
+            future = self.executor.submit(self._query, seq, sid, request_configs)
             if future is None:
                 return False
             self.pending[sid] = future
@@ -200,11 +203,11 @@ class AsyncStoreLookup(LookupClient):
     def __getattr__(self, name):
         return getattr(self.backend, name)
 
-    def lookup(self, seq, lookup_id=None):
+    def lookup(self, seq, lookup_id=None, request_configs=None):
         # Admission still reaches this after its defer window. A pending Store
         # query is a non-answer, not a reason to block the scheduler or a miss.
         sid = lookup_id or str(seq.id)
-        self.submit(seq, sid)
+        self.submit(seq, sid, request_configs)
         with self.lock:
             f = self.pending.get(sid)
         if f is None or not f.done():

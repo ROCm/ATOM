@@ -17,6 +17,29 @@ from atom.kv_transfer.offload.mooncake_store.layouts import (
 )
 
 
+def test_async_lookup_preserves_media_request_configs():
+    received = []
+
+    class Backend:
+        def lookup(self, seq, lookup_id=None, request_configs=None):
+            received.append((seq, lookup_id, request_configs))
+            return 8192
+
+    client = AsyncStoreLookup(Backend())
+    seq = SimpleNamespace(id="media", cache_seed=77)
+    configs = {"lmcache.tag.cache_salt": "77"}
+    try:
+        assert client.submit(seq, "media", request_configs=configs)
+        for _ in range(200):
+            if client.has_answer("media"):
+                break
+            time.sleep(0.005)
+        assert client.lookup(seq, "media", request_configs=configs) == 8192
+        assert received == [(seq, "media", configs)]
+    finally:
+        client.close()
+
+
 def test_failed_lookup_warning_is_rate_limited_and_preserves_nonanswer(caplog):
     client = AsyncStoreLookup(SimpleNamespace(lookup=lambda *args, **kwargs: None))
     try:

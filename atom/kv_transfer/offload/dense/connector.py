@@ -53,6 +53,7 @@ from atom.kv_transfer.offload._offload_common import (
     OffloadWorkerMixin,
     build_offload_engine,
     pp_aware_rank_and_world,
+    salt_kwargs,
     tokens_to_tensor,
     validated_kv_role,
 )
@@ -357,6 +358,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             mask=mask,
             block_ids=req.block_ids,
             req_id=str(req.req_id),
+            **salt_kwargs(req.cache_salt),
         )
         retrieve_ms = (time.perf_counter() - t_retrieve0) * 1000
         transfer_stats = self._last_gpu_connector_transfer_stats()
@@ -437,6 +439,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             "mask": mask,
             "block_ids": req.block_ids,
             "req_id": str(req.req_id),
+            **salt_kwargs(req.cache_salt),
         }
         if producer_event is not None:
             # LMCache forwards extra store kwargs to batched_from_gpu(), which
