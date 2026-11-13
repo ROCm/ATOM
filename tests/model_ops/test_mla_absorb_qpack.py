@@ -100,6 +100,10 @@ def test_absorb_into_q_out_matches_two_kernel_path(tokens, q_scale):
     assert not new_q[..., :LORA].float().isnan().any(), "nope half stores an FP8 NaN"
     steps = (_ordinal(new_q[..., :LORA]) - _ordinal(ref_q[..., :LORA])).abs()
     assert steps.max().item() <= 1, f"nope half off by {steps.max().item()} e4m3 steps"
+    # Rounding alone moves about 3% of codes one step; a systematic error
+    # under one step moves far more.
+    share = (steps == 1).float().mean().item()
+    assert share < 0.06, f"{share:.1%} of nope codes one step off"
 
 
 # GLM-5.x has 192 nope dims, which the absorb kernel does not compile for.
