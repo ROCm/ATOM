@@ -1,5 +1,10 @@
 # MiniMax-M3 PD 1P1D with a Mori UMBP tier on the prefill node
 
+> **Status: not supported yet.** `umbp_store` is currently supported as an
+> offload tier for aggregated serving only (see
+> [MiniMax-M3-UMBP.md](../MiniMax-M3-UMBP.md)). This page describes the planned
+> PD setup; it has not been validated and is not expected to work yet.
+
 PD disaggregation for MiniMax-M3 with the prefill node's KV offload tier served by a
 Mori UMBP standalone server (`umbp_store`). It is the topology of
 [Agentic-MiniMax-M3.md](Agentic-MiniMax-M3.md), with `lmcache_offload` in the prefill

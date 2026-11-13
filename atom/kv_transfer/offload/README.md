@@ -725,7 +725,8 @@ Select it with
 alone or beside a P/D producer under `multi`. How to install, start and check UMBP, with the settings table, is in
 [`recipes/UMBP-KV-Offload.md`](../../../recipes/UMBP-KV-Offload.md). MiniMax-M3
 walkthroughs: aggregated TP4 in
-[`recipes/MiniMax-M3-UMBP.md`](../../../recipes/MiniMax-M3-UMBP.md), PD 1P1D in
+[`recipes/MiniMax-M3-UMBP.md`](../../../recipes/MiniMax-M3-UMBP.md); PD 1P1D (not
+supported yet, planned setup only) in
 [`recipes/mesh/Agentic-MiniMax-M3-UMBP.md`](../../../recipes/mesh/Agentic-MiniMax-M3-UMBP.md).
 
 ## In-process `lmcache_offload` Architecture

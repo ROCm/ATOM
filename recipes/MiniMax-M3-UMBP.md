@@ -11,8 +11,8 @@ Like the LMCache tier there, the CPU tier pays at **high concurrency** (40 and
 Below that, run without offload.
 
 For the UMBP side (requirements, server settings, checks, limitations) see
-[UMBP-KV-Offload.md](UMBP-KV-Offload.md). For PD, see
-[mesh/Agentic-MiniMax-M3-UMBP.md](mesh/Agentic-MiniMax-M3-UMBP.md).
+[UMBP-KV-Offload.md](UMBP-KV-Offload.md). PD with UMBP is not supported yet; the
+planned setup is in [mesh/Agentic-MiniMax-M3-UMBP.md](mesh/Agentic-MiniMax-M3-UMBP.md).
 
 ```bash
 MODEL=/shared_nfs/huggingface_models/amd/MiniMax-M3-MXFP4

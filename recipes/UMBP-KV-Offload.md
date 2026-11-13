@@ -8,7 +8,7 @@ cache stays in front of it.
 This page is the model-independent how-to. Model walkthroughs:
 
 - [MiniMax-M3-UMBP.md](MiniMax-M3-UMBP.md): MiniMax-M3, aggregated TP4
-- [mesh/Agentic-MiniMax-M3-UMBP.md](mesh/Agentic-MiniMax-M3-UMBP.md): MiniMax-M3, PD 1P1D
+- [mesh/Agentic-MiniMax-M3-UMBP.md](mesh/Agentic-MiniMax-M3-UMBP.md): MiniMax-M3, PD 1P1D (not supported yet)
 
 Design notes are in
 [`atom/kv_transfer/offload/README.md`](../atom/kv_transfer/offload/README.md#mori-umbp-offload-umbp_store).
@@ -141,7 +141,9 @@ Offload only:
     "kv_connector_extra_config":{"umbp_store.address":"unix:///tmp/umbp/server.sock"}}'
 ```
 
-Next to a P/D producer (prefill node of a PD deployment):
+Next to a P/D producer (prefill node of a PD deployment). **Not supported
+yet**: the configuration below is the planned shape and has not been
+validated.
 
 ```bash
   --kv-transfer-config '{"kv_connector":"multi","connectors":[
