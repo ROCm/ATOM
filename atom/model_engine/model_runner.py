@@ -3572,6 +3572,16 @@ class ModelRunner:
         draft_token_ids: np.ndarray | None = None
         next_token_ids = None
         if hasattr(self, "drafter"):
+            # A served step already drew the drafts and returns no hidden
+            # states. Its wrapped drafter ignores the target inputs, but still
+            # goes through the KV-state commit and output bookkeeping below.
+            # Native forwards retain running (possibly padded) target rows.
+            draft_rows = (
+                batch.total_tokens_num
+                if self._served is not None
+                else hidden_states.shape[0]
+            )
+            draft_input_ids = self.tokenID_processor.input_ids.gpu[1 : draft_rows + 1]
             next_token_ids = torch.gather(
                 sampled_tokens.view(bs, batch.num_spec_step + 1),
                 1,
@@ -3587,9 +3597,7 @@ class ModelRunner:
                 self.tokenID_processor.prev_token_ids = next_token_ids
                 draft_token_ids = self.propose_draft_token_ids(
                     batch,
-                    self.tokenID_processor.input_ids.gpu[
-                        1 : hidden_states.shape[0] + 1
-                    ],
+                    draft_input_ids,
                     hidden_states,
                     next_token_ids,
                     num_reject_tokens,
@@ -3620,9 +3628,7 @@ class ModelRunner:
                 # propose_draft_token_ids, from `batch.next_token_ids`.
                 draft_token_ids = self.propose_draft_token_ids(
                     batch,
-                    self.tokenID_processor.input_ids.gpu[
-                        1 : hidden_states.shape[0] + 1
-                    ],
+                    draft_input_ids,
                     hidden_states,
                     next_token_ids,
                     num_reject_tokens,
