@@ -5,8 +5,8 @@
 Only completed Store answers are cached, scoped to one request lifecycle.
 The worker rechecks/renews before loading; a stale answer never authorizes
 reuse of missing bytes. One lookup executor serializes the arrival-time queries;
-a lease renewal has an executor of its own and skips an occupied backend,
-never waiting for arrival-time queries or earlier stalled renewals.
+a lease renewal has an executor of its own and takes the backend ahead of any
+queued query, waiting only for the call in flight.
 """
 
 import logging
@@ -16,15 +16,15 @@ import time
 from collections import OrderedDict
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FutureTimeout
-from threading import Lock, RLock
+from contextlib import contextmanager
+from threading import Condition, RLock
 
-from atom.kv_transfer.offload.lookup_client import LookupClient, as_lookup_client
+from atom.kv_transfer.offload.lookup_client import LookupClient
 
 logger = logging.getLogger("atom")
 
-# How long the scheduler thread waits for its own advisory renewal RPC.
-# Occupied backends are skipped immediately (see `renew`); a Store RPC that
-# is slow must not stall the scheduler and, through the DP lockstep, its peers.
+# How long the scheduler thread waits for its own advisory renewal RPC: a slow
+# Store RPC must not stall the scheduler and, through the DP lockstep, its peers.
 RENEW_TIMEOUT_S = 1.0
 
 
@@ -63,9 +63,6 @@ class DaemonExecutor:
             lambda _f, item=item: item.__setitem__(slice(1, 3), (None, ()))
         )
         self._queue.put(item)
-        # Hand the GIL over so the worker starts the call now, as starting a
-        # thread would have: a Store query is mostly waiting on the network.
-        time.sleep(0)
         return future
 
     def _run(self) -> None:
@@ -96,17 +93,43 @@ class DaemonExecutor:
         self._queue.put(None)
 
 
+class _BackendSlot:
+    """One call at a time into the synchronous Store client; a renewal takes the
+    slot ahead of every waiting query."""
+
+    def __init__(self) -> None:
+        self._cond = Condition()
+        self._busy = False
+        self._renewals = 0
+
+    @contextmanager
+    def take(self, renewal: bool = False):
+        with self._cond:
+            self._renewals += renewal
+            while self._busy or (self._renewals and not renewal):
+                self._cond.wait()
+            self._renewals -= renewal
+            self._busy = True
+        try:
+            yield
+        finally:
+            with self._cond:
+                self._busy = False
+                self._cond.notify_all()
+
+
 class AsyncStoreLookup(LookupClient):
     def __init__(self, backend, capacity=4096):
-        self.backend = as_lookup_client(backend)
+        self.backend = backend
         self.capacity = capacity
         self.lock = RLock()
         self.executor = DaemonExecutor("store-query", limit=capacity)
         # Renewals ride their own worker so a burst of arrival-time queries
-        # cannot queue one behind it; the lock keeps the synchronous Store
+        # cannot queue one behind it; the slot keeps the synchronous Store
         # client (and the pool state around it) to one call at a time.
-        self.renew_executor = DaemonExecutor("store-renew", limit=64)
-        self.backend_lock = Lock()
+        self.renew_executor = DaemonExecutor("store-renew")
+        self._renewing = False
+        self.backend_slot = _BackendSlot()
         self.pending = {}
         # sid -> when its Store query was sent: the read lease the answer grants
         # runs from then, not from when the scheduler takes the answer.
@@ -127,32 +150,35 @@ class AsyncStoreLookup(LookupClient):
             self._next_failure_warning = now + 60.0
         logger.warning("Mooncake Store lookup failed; answer unavailable: %s", exc)
 
-    def _query(self, seq, sid, request_configs=None):
-        with self.backend_lock:
+    def _query(self, seq, sid):
+        with self.backend_slot.take():
             with self.lock:
                 self.asked_at[sid] = time.monotonic()
                 self.asked_at.move_to_end(sid)
                 while len(self.asked_at) > 2 * self.capacity:
                     self.asked_at.popitem(last=False)
-            kwargs = (
-                {} if request_configs is None else {"request_configs": request_configs}
-            )
-            return self.backend.lookup(seq, lookup_id=sid, **kwargs)
+            return self.backend.lookup(seq, lookup_id=sid)
 
     def query_started(self, sid):
         """When the Store query behind `sid`'s answer was sent; None if unknown."""
         with self.lock:
             return self.asked_at.get(sid)
 
-    def submit(self, seq, sid, request_configs=None):
+    def submit(self, seq, sid):
         with self.lock:
             if self.closed or sid in self.pending or len(self.pending) >= self.capacity:
                 return False
-            future = self.executor.submit(self._query, seq, sid, request_configs)
+            future = self.executor.submit(self._query, seq, sid)
             if future is None:
                 return False
             self.pending[sid] = future
             return True
+
+    def submit_if(self, seq, sid, keep):
+        """`submit`, if `keep()` still holds. Terminal cleanup takes the same
+        lock, so a request cleaned up meanwhile never gets a lookup."""
+        with self.lock:
+            return keep() and self.submit(seq, sid)
 
     def pump(self):
         with self.lock:
@@ -166,8 +192,8 @@ class AsyncStoreLookup(LookupClient):
                             hit = f.result()
                             if hit is not None:
                                 self.discarded_hits[sid] = hit
-                        except Exception:  # noqa: BLE001, S110
-                            pass
+                        except Exception as exc:  # noqa: BLE001
+                            self._warn_lookup_failure(exc)
 
     def pending_ids(self):
         self.pump()
@@ -175,8 +201,10 @@ class AsyncStoreLookup(LookupClient):
             return set(self.pending)
 
     def is_pending(self, sid):
+        """Submitted and not answered yet."""
         with self.lock:
-            return sid in self.pending
+            f = self.pending.get(sid)
+            return f is not None and not f.done()
 
     def answered(self, sid):
         """Whether the lookup for `sid` has completed (read-only)."""
@@ -189,25 +217,11 @@ class AsyncStoreLookup(LookupClient):
             f = self.pending.get(sid)
             return f is not None and f.done()
 
-    def has_answer(self, sid):
-        with self.lock:
-            f = self.pending.get(sid)
-            if f is None or not f.done() or f.cancelled():
-                return False
-            try:
-                return f.result() is not None
-            except Exception as exc:  # noqa: BLE001
-                self._warn_lookup_failure(exc)
-                return False
-
-    def __getattr__(self, name):
-        return getattr(self.backend, name)
-
-    def lookup(self, seq, lookup_id=None, request_configs=None):
+    def lookup(self, seq, lookup_id=None):
         # Admission still reaches this after its defer window. A pending Store
         # query is a non-answer, not a reason to block the scheduler or a miss.
         sid = lookup_id or str(seq.id)
-        self.submit(seq, sid, request_configs)
+        self.submit(seq, sid)
         with self.lock:
             f = self.pending.get(sid)
         if f is None or not f.done():
@@ -244,29 +258,27 @@ class AsyncStoreLookup(LookupClient):
             return hits
 
     def _renew(self, seq, start, end):
-        # Advisory renewal must not wait behind a stalled lookup or renewal.
-        # Otherwise every request in a dispatch batch pays its own timeout.
-        if not self.backend_lock.acquire(blocking=False):
-            return 0
-        try:
+        with self.backend_slot.take(renewal=True):
             return self.backend.renew(seq, start, end)
-        finally:
-            self.backend_lock.release()
+
+    def _renewal_done(self, _future) -> None:
+        self._renewing = False
 
     def renew(self, seq, start, end):
         """Renew the read leases of tokens ``[start, end)``; 0 if it is not done in time.
 
-        Runs on the renewal executor and skips an occupied backend immediately.
-        The scheduler thread waits at most `RENEW_TIMEOUT_S` for its own RPC.
+        Runs on the renewal executor, ahead of any queued lookup. The scheduler
+        thread waits at most `RENEW_TIMEOUT_S` for it, and skips renewal while
+        an earlier one is still stuck behind a slow RPC.
         The load goes ahead whatever the answer (its all-or-nothing get fails on
         a chunk the Store lost and the request is prefilled), so a renewal that
         is late costs a lease, never correctness.
         """
-        if self.backend_lock.locked():
+        if self._renewing:
             return 0
+        self._renewing = True
         future = self.renew_executor.submit(self._renew, seq, start, end)
-        if future is None:  # earlier renewals are still stuck behind a slow RPC
-            return 0
+        future.add_done_callback(self._renewal_done)
         try:
             return future.result(timeout=RENEW_TIMEOUT_S)
         except FutureTimeout:

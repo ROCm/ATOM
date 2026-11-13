@@ -565,16 +565,10 @@ class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
             # own prefetch (`prefetch_lookups`), as the queue drains.
             if offered >= _MAX_OFFERS_PER_BATCH:
                 break
-            # Terminal cleanup takes this same reentrant lock. Keep the
-            # status observation and enqueue atomic with respect to cleanup,
-            # so an arrival cannot create a lookup after teardown cleared it.
-            # submit only queues work; no Store RPC runs under this lock.
-            with self._lookup_client.lock:
-                if seq.status != SequenceStatus.WAITING:
-                    continue
-                if self._lookup_len(seq) > 0:
-                    self._lookup_client.submit(seq, str(seq.id))
-                    offered += 1
+            if self._lookup_len(seq) > 0 and self._lookup_client.submit_if(
+                seq, str(seq.id), lambda seq=seq: seq.status == SequenceStatus.WAITING
+            ):
+                offered += 1
 
     def close(self):
         self._lookup_client.close()

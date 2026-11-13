@@ -1411,14 +1411,22 @@ def test_lookup_counts_rank_objects_past_the_shared_prefix(
     _store_chunks(cluster, hashes, [0, 1, 3, 4, 5], rank=1, world=2)  # hole at 2
     assert _completed_lookup(lookup, _seq(0, 48)) == 2 * CHUNK
     # Rank 0's chunks 2-5 are stranded: stored, unusable while rank 1 lacks 2.
-    assert (lookup.lookups, lookup.uneven_lookups, lookup.stranded_objects) == (
+    assert (
+        lookup.backend.lookups,
+        lookup.backend.uneven_lookups,
+        lookup.backend.stranded_objects,
+    ) == (
         1,
         1,
         4,
     )
     _store_chunks(cluster, hashes, [2], rank=1, world=2)
     assert _completed_lookup(lookup, _seq(0, 48)) == 6 * CHUNK
-    assert (lookup.lookups, lookup.uneven_lookups, lookup.stranded_objects) == (
+    assert (
+        lookup.backend.lookups,
+        lookup.backend.uneven_lookups,
+        lookup.backend.stranded_objects,
+    ) == (
         2,
         1,
         4,
@@ -1444,11 +1452,11 @@ def test_lookup_answers_nothing_on_any_store_error(cluster):
     assert _completed_lookup(lookup, _seq(0, 24)) is None
     store.exist_codes.clear()
     store.raise_on = "exists"
-    lookup._pools[0].paused_until = 0.0  # past the pause the failure started
+    lookup.backend._pools[0].paused_until = 0.0  # past the pause the failure started
     assert _completed_lookup(lookup, _seq(0, 24)) is None
     assert store.calls[-1][0] == "exists"
     # None is a non-answer: the scheduler does not remember it as a miss.
-    lookup._pools[0].paused_until = 0.0
+    lookup.backend._pools[0].paused_until = 0.0
     assert _completed_match(scheduler, _seq(3, 25)) == (0, False)
     assert scheduler._lookup_results == {}
 
@@ -1490,7 +1498,7 @@ def test_lookup_with_per_nic_pools_asks_every_pool(cluster):
     # so stage 0's chunks, which only the paused pool holds, are absent.
     cluster.objects["10.0.0.1:26151"].clear()
     assert _completed_lookup(lookup, _seq(0, 32)) == 0
-    assert [p.paused_until > 0 for p in lookup._pools] == [True, False]
+    assert [p.paused_until > 0 for p in lookup.backend._pools] == [True, False]
 
 
 def _two_pools(world=2):
@@ -1576,7 +1584,7 @@ def test_a_marked_pool_holds_nothing_beside_pools_that_are_not(cluster):
     cluster.objects[MASTER][keys.STORE_TAINT_KEY] = b""
     # The other pool still holds the prefix.
     assert _completed_lookup(lookup, _seq(0, 32)) == 32
-    assert [pool.tainted for pool in lookup._pools] == [True, False]
+    assert [pool.tainted for pool in lookup.backend._pools] == [True, False]
     # What only the marked pool holds is absent.
     cluster.objects["10.0.0.1:26151"].clear()
     assert _completed_lookup(lookup, _seq(0, 32)) == 0
@@ -1595,7 +1603,7 @@ def test_a_pool_that_cannot_say_whether_it_is_marked_answers_nothing(
     else:
         store.exist_codes[keys.STORE_TAINT_KEY] = code
     assert _completed_lookup(lookup, _seq(0, 41)) is None
-    assert lookup._pools[0].paused_until > scheduler_clock.now
+    assert lookup.backend._pools[0].paused_until > scheduler_clock.now
 
 
 def test_a_lookup_answers_what_unanswered_keys_cannot_change(cluster):
@@ -1611,19 +1619,19 @@ def test_a_lookup_answers_what_unanswered_keys_cannot_change(cluster):
     store.exist_codes = {
         _key(hashes, 4, rank=0, world=2, namespace=namespace): store_client.RPC_FAIL
     }
-    lookup._pools[0].paused_until = 0.0
+    lookup.backend._pools[0].paused_until = 0.0
     assert _completed_lookup(lookup, _seq(0, 48)) == 3 * CHUNK
     # An error before it could shorten it: no answer.
     store.exist_codes = {
         _key(hashes, 1, rank=0, world=2, namespace=namespace): store_client.RPC_FAIL
     }
-    lookup._pools[0].paused_until = 0.0
+    lookup.backend._pools[0].paused_until = 0.0
     assert _completed_lookup(lookup, _seq(0, 48)) is None
     # Neither can an error on the rank whose miss decides the hit.
     store.exist_codes = {
         _key(hashes, 3, rank=1, world=2, namespace=namespace): store_client.RPC_FAIL
     }
-    lookup._pools[0].paused_until = 0.0
+    lookup.backend._pools[0].paused_until = 0.0
     assert _completed_lookup(lookup, _seq(0, 48)) is None
 
 
@@ -1638,7 +1646,7 @@ def test_a_failed_lookup_pauses_the_next_ones(cluster, scheduler_clock):
         return sum(1 for call in store.calls if call[0] == "exists")
 
     for failure in ("raise", "code"):
-        lookup._pools[0].paused_until = 0.0
+        lookup.backend._pools[0].paused_until = 0.0
         if failure == "raise":
             store.raise_on = "exists"
         else:
@@ -1671,7 +1679,9 @@ def test_a_lookup_that_blocked_pauses_ten_times_as_long(cluster, scheduler_clock
 
     store.batch_is_exist = dead_master
     assert _completed_lookup(lookup, _seq(0, 16)) is None
-    assert lookup._pools[0].paused_until == pytest.approx(scheduler_clock.now + 43.0)
+    assert lookup.backend._pools[0].paused_until == pytest.approx(
+        scheduler_clock.now + 43.0
+    )
 
 
 def test_lookup_retries_an_unreachable_store_only_after_a_pause(cluster):
@@ -1682,7 +1692,7 @@ def test_lookup_retries_an_unreachable_store_only_after_a_pause(cluster):
     assert _completed_lookup(lookup, _seq(0, 16)) is None
     assert len(cluster.stores) == 1  # no reconnect on every step
     cluster.setup_rc = 0
-    lookup._pools[0].paused_until = 0.0
+    lookup.backend._pools[0].paused_until = 0.0
     assert _completed_lookup(lookup, _seq(0, 16)) == 0
     assert len(cluster.stores) == 2
 
@@ -1704,7 +1714,7 @@ def test_a_connect_that_blocked_pauses_ten_times_as_long(
     monkeypatch.setattr(FakeStore, "setup", unanswered_setup)
     assert _completed_lookup(lookup, _seq(0, 16)) is None
     # Paused from the failure, not from before the setup that blocked.
-    assert lookup._pools[0].paused_until == pytest.approx(
+    assert lookup.backend._pools[0].paused_until == pytest.approx(
         scheduler_clock.now + 10 * blocked_s
     )
     scheduler_clock.now += 0.01  # the next request's lookup
@@ -1952,7 +1962,9 @@ def _park_after_a_wait_for_blocks(cluster, scheduler_clock, store_engine, meanwh
     elif meanwhile == "store_error":
         store.exist_codes[key] = store_client.RPC_FAIL
     elif meanwhile == "lookups_paused":  # another prompt's lookup just failed
-        offload._lookup_client._pools[0].paused_until = scheduler_clock.now + 10.0
+        offload._lookup_client.backend._pools[0].paused_until = (
+            scheduler_clock.now + 10.0
+        )
     store_engine.withheld.on = False
     batch, _ = engine.schedule()
     # Admitted and parked, and its load dispatched in the same step.
