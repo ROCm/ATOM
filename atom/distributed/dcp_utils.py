@@ -57,12 +57,16 @@ def get_dcp_rank() -> int:
 def mla_dcp_decode_call(
     dcp_world_size: int, max_seqlen_q: int = 1, causal: bool = True
 ) -> dict:
-    """How a DCP decode calls ``mla_decode_fwd``, as aiter's shape queries take
-    it. Mirrors ``MLAAttention._forward_decode``: only a causal decode of more
-    than one row masks on global positions, through the round-robin
-    (``g_kv_indptr``) kernel; every other decode runs as if DCP were off."""
+    """How a persistent DCP decode calls ``mla_decode_fwd``, as aiter's shape
+    queries take it; both ``dcp_persistent_supported`` and the gfx1250 width
+    query ask with it. Mirrors ``MLAAttention._forward_decode``: only a causal
+    decode of more than one row masks on global positions, through the
+    round-robin (``g_kv_indptr``) kernel; every other decode, the DSpark draft's
+    non-causal block among them, runs as if DCP were off."""
     round_robin = dcp_world_size > 1 and max_seqlen_q > 1 and causal
     return {
+        "persistent": True,
+        "page_size": max(envs.ATOM_MLA_PAGE_SIZE, 1),
         "return_lse": True,
         "causal": causal,
         "cp_world_size": dcp_world_size if round_robin else 1,
@@ -71,10 +75,14 @@ def mla_dcp_decode_call(
 
 
 def dcp_persistent_supported(
-    num_heads: int, kv_cache_dtype: str, dcp_world_size: int
+    num_heads: int,
+    kv_cache_dtype: str,
+    dcp_world_size: int,
+    max_seqlen_q: int = 1,
+    causal: bool = True,
 ) -> bool:
     """Whether DCP decode can run in *persistent* mode at ``num_heads`` gathered
-    query heads.
+    query heads, for the call ``mla_dcp_decode_call`` describes.
 
     Asks aiter whether mla_decode_fwd has a persistent decode that returns the
     lse DCP's merge needs, for this call: gfx950's ASM kernels, and gfx1250's
@@ -89,12 +97,10 @@ def dcp_persistent_supported(
     dtype = dtypes.fp8 if kv_cache_dtype.startswith("fp8") else torch.bfloat16
     support = get_mla_decode_shape_support(
         num_heads,
-        1,
+        max_seqlen_q,
         dtype,
         dtype,
-        persistent=True,
-        page_size=max(envs.ATOM_MLA_PAGE_SIZE, 1),
-        **mla_dcp_decode_call(dcp_world_size),
+        **mla_dcp_decode_call(dcp_world_size, max_seqlen_q, causal),
     )
     # aiter has no table for the FlyDSL PS1 route and answers None there; a
     # None from any other route is a failed query, not a yes.
