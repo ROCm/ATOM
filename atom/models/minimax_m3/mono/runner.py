@@ -94,6 +94,8 @@ from atom.utils.forward_context import get_forward_context
 logger = logging.getLogger("atom")
 
 N_DENSE = 3
+# LLVM options of the rebuild of a layer kernel that needs scratch (``MonoDecodeRunner._lean_layer_kernels``)
+LEAN_LLVM_OPTIONS = {"amdgpu-use-amdgpu-trackers": True}
 # a width's kernels by kind (``_build_layer_kernels``): the sparse ones' is K4's
 _KERNEL_ABI = {
     "dense_pre0": K1_ABI,
@@ -159,8 +161,13 @@ class MonoDecodeRunner:
         # kernel of each kind the layers use (``self.k4[n][lw.index_topk]``) and,
         # with a mono dense prefix, the dense layers' (``self.k4[n]["dense_pre0"
         # | "dense_pre" | "dense_post"]``), built and compiled on its first step
+        self._width_of: dict[int, int] = {}
         self.k4 = WidthBuilds(
-            self._build_layer_kernels, self._layer_kernels, group, "MiniMax-M3 mono"
+            self._build_layer_kernels,
+            self._layer_kernels,
+            group,
+            "MiniMax-M3 mono",
+            lean=self._lean_layer_kernels,
         )
 
     def _build_layer_kernels(self, n: int) -> dict:
@@ -172,7 +179,22 @@ class MonoDecodeRunner:
             kernels["dense_pre0"] = self._build_dense_pre(n, plain_norm=True)
             kernels["dense_pre"] = self._build_dense_pre(n)
             kernels["dense_post"] = self._build_dense_post(n)
+        self._width_of[id(kernels)] = n
         return kernels
+
+    def _lean_layer_kernels(self, built: dict, spilled: list) -> dict | None:
+        """A width whose layer kernel needs scratch (fp8 caches + a4w4 at 6 and 8 tokens: the
+        compiler keeps a 36 B frame of two SGPR spill slots that no instruction touches, and any
+        schedule change flips it) is rebuilt unchanged except for the machine scheduler's
+        register-pressure trackers (``LEAN_LLVM_OPTIONS``), scratch-free at every width 1..16
+        (same arithmetic: only the instruction order moves)."""
+        lean = dict(built)
+        for kind, launch in built.items():
+            if isinstance(kind, bool) and launch in spilled:
+                n = self._width_of[id(built)]
+                lean[kind] = self._build_k4(n, index_topk=kind)
+                lean[kind].compile_hints["llvm_options"] = LEAN_LLVM_OPTIONS
+        return lean
 
     @staticmethod
     def _layer_kernels(kernels: dict) -> list:
