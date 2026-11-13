@@ -219,7 +219,8 @@ impl WireDecoder for VllmWireDecoder {
         let ts = fields
             .get("ts")
             .and_then(Value::as_f64)
-            .ok_or_else(|| malformed("missing ts"))?;
+            .filter(|ts| ts.is_finite())
+            .ok_or_else(|| malformed("missing or non-finite ts"))?;
         let events = fields
             .get("events")
             .and_then(Value::as_array)
@@ -242,7 +243,9 @@ impl WireDecoder for VllmWireDecoder {
                 Err(reason) => decoded.dropped.push(reason),
             }
         }
-        match decoded.dropped.first() {
+        let nonconforming =
+            |reason: &&DropReason| matches!(reason, DropReason::Decode | DropReason::UnknownTier);
+        match decoded.dropped.iter().find(nonconforming) {
             Some(&reason) if self.strict => Err(DecodeError::Strict(reason)),
             _ => Ok(decoded),
         }
