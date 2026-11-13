@@ -630,6 +630,22 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             self._load_winner.pop(sid, None)
         return result
 
+    @property
+    def supports_pd_admission(self) -> bool:
+        # The PD leg must win remote-prefill lookups before a cache tier can
+        # arm another load into the same destination table.
+        return (
+            bool(self._connectors)
+            and self._connectors[0].supports_pd_admission
+            and all(getattr(c, "is_offload", False) for c in self._connectors[1:])
+        )
+
+    def pd_receive_block_offset(self, seq, num_blocks, num_cached_blocks):
+        winner = self._load_winner.get(seq.id)
+        if winner is None:
+            return None
+        return winner.pd_receive_block_offset(seq, num_blocks, num_cached_blocks)
+
     def cancel_pending_load(self, seq: Any) -> None:
         """Forward a load cancellation to every sub that arms loads.
 

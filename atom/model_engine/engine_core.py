@@ -160,6 +160,7 @@ class EngineCore:
             # sliding-window pool each look up the class they declared, so
             # adding an architecture never touches this line.
             config.pool_entries = block_info.get("pool_entries", {})
+            config.pool_entry_bytes = block_info.get("pool_entry_bytes", {})
             config.pool_entries_per_req = block_info.get("pool_entries_per_req", {})
             self.state_runtime = StateRuntime.from_wire(block_info["state_runtime"])
             ret = self.runner_mgr.call_func(
