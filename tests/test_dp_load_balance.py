@@ -570,7 +570,9 @@ def test_concurrent_store_dispatch_accounts_in_socket_send_order():
 
     mgr = _make_mgr(1)
 
-    mgr._share_cache_router = ShareCacheRouter(OffloadTierProfile(True, 0, 256, True), 100)
+    mgr._share_cache_router = ShareCacheRouter(
+        OffloadTierProfile(True, 0, 256, True), 100
+    )
     first_sent, second_started = Event(), Event()
     order = []
 
