@@ -1235,6 +1235,52 @@ def test_failed_write_done_returns_the_staging_row_to_the_pool():
     assert "r1" in conn.failed_recving
 
 
+def test_a_landed_state_slot_is_scattered_before_the_request_is_done(monkeypatch):
+    """The receive-side twin of the staged gather's ready event.
+
+    `_scatter_slot` is an async copy enqueued on this notify-listener
+    thread's stream, which the decode forward no longer shares once the
+    runner computes on a High-priority stream. Nothing else makes decode's
+    read of the state slot wait for it, so the wait happens here, before the
+    request is published and before the staging row goes back for the next
+    RDMA write to overwrite.
+    """
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    order = []
+    conn = _make_connector(
+        _staging_slots=mc.SlotPool(),
+        _scatter_slot=lambda *args: order.append(("scatter", *args)),
+        _mla_landing=None,
+        _cuda_device=3,
+    )
+    release = conn._staging_slots.release
+    conn._staging_slots.release = lambda idx: (
+        order.append(("release", idx)),
+        release(idx),
+    )
+    devices = []
+    monkeypatch.setattr(
+        mc.torch.cuda,
+        "current_stream",
+        lambda device: devices.append(device)
+        or SimpleNamespace(synchronize=lambda: order.append("synchronize")),
+    )
+    conn._pending_recv_expected["r1"] = 1
+    conn._pending_recv.add("r1")
+    conn._pending_recv_slots["r1"] = (7, 3)
+
+    assert conn._record_write_done("r1", 0, 0, 0)
+
+    assert order == [("scatter", 7, 3), "synchronize", ("release", 3)]
+    # The listener thread's current device is not the KV cache's, so the
+    # stream it waits on has to be named by device.
+    assert devices == [conn._cuda_device]
+    assert conn._staging_slots.free == [3]
+    assert "r1" in conn.done_recving
+
+
 def test_failed_write_done_without_a_staging_row_is_a_noop():
     """Block-only transfers reserve no row; the failure path must not crash."""
     mc = pytest.importorskip(

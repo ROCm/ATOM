@@ -748,6 +748,35 @@ def test_a_staged_slot_gather_without_a_ready_event_keeps_its_pool_intact(monkey
     assert c.transfer_engine.writes.empty()
 
 
+@pytest.mark.parametrize("raiser", ["_gather_slot", "_rdma_write"])
+def test_a_raised_staged_slot_transfer_returns_its_slot(monkeypatch, raiser):
+    """Whatever the gather or the RDMA write raises, the slot goes back.
+
+    The NIC reads the staging row, so it is held across the write; one row
+    lost to a raise parks the next send worker on the pool for good.
+    """
+    c, _state, req, _, dst = producer()
+    staged_slot_state(c, req, dst, monkeypatch)
+    c._gather_slot = MagicMock()
+    ready = Event()
+    c._kv_cache_ready_events[7] = ready
+    setattr(c, raiser, MagicMock(side_effect=RuntimeError("transfer blew up")))
+
+    with pytest.raises(RuntimeError, match="transfer blew up"):
+        mc.MooncakeConnector._execute_block_slot_transfer(
+            c,
+            req,
+            "cpu:1",
+            [],
+            [],
+            {"slot_index": 1, "swa_block_ids": []},
+            req["request_id"],
+            ready,
+        )
+
+    assert c._staging_slots.free == [0]
+
+
 @pytest.mark.parametrize("reverse_indexed", [False, True])
 def test_swa_only_pool_transfers_final_relocated_slot(monkeypatch, reverse_indexed):
     import msgpack

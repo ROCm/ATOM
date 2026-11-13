@@ -4453,6 +4453,14 @@ class MooncakeConnector(KVConnectorBase):
             compute_slot, pool_idx = slot_info
             if pool_idx >= 0:
                 self._scatter_slot(compute_slot, pool_idx)
+                # The scatter is an async copy on this listener thread's
+                # stream, which the decode forward no longer shares once the
+                # runner computes on a High-priority one. Waiting for it here,
+                # before the request joins `done_recving`, is what keeps decode
+                # from reading a state slot that is still being written -- and
+                # keeps the next RDMA write off a staging row the scatter is
+                # still reading.
+                torch.cuda.current_stream(self._cuda_device).synchronize()
                 self._staging_slots.release(pool_idx)
         dst_blocks = self._pending_recv_blocks.pop(req_id, None)
         if dst_blocks:
