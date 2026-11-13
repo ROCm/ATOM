@@ -93,6 +93,7 @@ def test_minimax_sharing_only_requires_embedding_when_proposing(monkeypatch, pro
     draft_model.embed_tokens = draft_model.lm_head = None
     embed = PPMissingLayer() if producer else nn.Embedding(8, 4)
     head = nn.Linear(4, 8, bias=False)
+    head.num_embeddings = 8  # ParallelLMHead's logical vocabulary size.
     target = SimpleNamespace(model=SimpleNamespace(embed_tokens=embed), lm_head=head)
 
     drafter = object.__new__(DSparkProposer)
