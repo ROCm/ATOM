@@ -1575,7 +1575,7 @@ class MLAAttention(nn.Module):
         # QREP: q_proj emits the full DCP-group head set. group=True (decode)
         # keeps them all and uses W_K_qrep, so the caller skips the AllGather Q;
         # group=False (prefill / non-QREP) takes only this rank's heads.
-        # k_up_proj=False returns q_nope un-absorbed, (N, B, P), for a caller
+        # k_up_proj=False returns q_nope un-absorbed, (B, N, P), for a caller
         # that absorbs it into q_out itself.
         if self.qrep_enabled and not group:
             # Row-view weight: computes only this rank's heads, so the redundant
@@ -1588,11 +1588,11 @@ class MLAAttention(nn.Module):
             n_heads_out = self.qrep_num_heads if self.qrep_enabled else self.num_heads
             q = self.q_proj(x, x_scale).view(-1, n_heads_out, self.qk_head_dim)
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        if not k_up_proj:
+            return q_nope, q_pe
 
         # Convert from (B, N, P) to (N, B, P)
         q_nope = q_nope.transpose(0, 1)
-        if not k_up_proj:
-            return q_nope, q_pe
 
         if self.qrep_enabled and group:
             W_K, W_K_scale = self.W_K_qrep, self.W_K_qrep_scale
@@ -3311,7 +3311,10 @@ class MLAAttention(nn.Module):
                     )
                     if absorb_into_q_out:
                         mla_absorb_q_pack(
-                            q_nope, self.W_K_qrep, q_out_write, self._q_scale
+                            q_nope.transpose(0, 1),
+                            self.W_K_qrep,
+                            q_out_write,
+                            self._q_scale,
                         )
                 # q_out = self.fused_kv_bmm(q, q_scale, k_nope, k_rope, positions, kv_cache, attn_metadata)
 
