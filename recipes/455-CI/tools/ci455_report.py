@@ -195,21 +195,28 @@ PLACEHOLDER_OWNER = "@owner_tbd"
 PR_URL = re.compile(r"https?://github\.com/([\w.-]+/[\w.-]+)/pull/(\d+)")
 
 
-def _pr(url):
-    """A PR link, shown as "ROCm/ATOM#123"."""
+def pr_label(url):
+    """ "https://github.com/ROCm/ATOM/pull/123" -> "ROCm/ATOM#123"."""
     m = PR_URL.match(url)
-    if m:
-        return f"[{m.group(1)}#{m.group(2)}]({url})"
-    return f"<{url}>" if url else "(no link)"
+    return f"{m.group(1)}#{m.group(2)}" if m else url
+
+
+def _prs(links):
+    """Space-separated PR links (a fix may take several, e.g. an ATOM PR and
+    an aiter PR together), each shown as "ROCm/ATOM#123", joined by "+"."""
+    shown = [
+        f"[{pr_label(u)}]({u})" if PR_URL.match(u) else f"<{u}>" for u in links.split()
+    ]
+    return " + ".join(shown) or "(no link)"
 
 
 def _follow_text(f):
     """A problem's next step, from its followups.csv row."""
     action, link = (f or {}).get("action"), ((f or {}).get("link") or "").strip()
     if action == "open_pr":
-        return f"Fix in progress: {_pr(link)}."
+        return f"Fix in progress: {_prs(link)}."
     if action == "our_pr":
-        return f"Fixed by us in {_pr(link)}, verified."
+        return f"Fixed by us in {_prs(link)}, verified."
     if action == "repro":
         return f"No fix yet; [repro]({link})."
     return ""

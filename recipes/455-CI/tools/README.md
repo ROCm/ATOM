@@ -26,6 +26,7 @@ python3 -m pytest -q                         # 改了脚本先跑测试
 - `--date` 是场次日期：周六那场或周三那场。每场测完跑一次，连同历史数据重新生成。那天跑的是哪个场景，脚本从数据里看出来。
 - Highlights 里 @ 的 owner 取自 `../owners.csv`（两列：`model`、`owner`）。有消息的模型没登记 owner 时，`make_report.py` 会打警告。
 - 每个问题（❌ 🔴 ⚠️）的说法取自 `../followups.csv`（guide §3.7）：接在 Highlights 那一条后面，详细 summary 里有 Follow-ups 表。还有问题没写说法时，`make_report.py` 会打 `no follow-up` 的警告。
+- `../pending_fixes.csv` 登记某个模型在 main 上还在等的 PR。这个模型出了问题又没写说法时，`make_report.py` 会在警告下面列出这些 PR，并给出一行可以直接贴进 `followups.csv` 的说法。
 - 依赖：Python 3.10 以上、matplotlib；跑测试还要 pytest。没有字体文件也能画，会退回 DejaVu Sans。
 
 ## 样例

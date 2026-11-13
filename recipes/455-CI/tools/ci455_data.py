@@ -57,6 +57,9 @@ ACCURACY_COLUMNS = (
 # Columns of followups.csv: the next step for each problem in the highlights
 # (455-CI-guide.md §3.7).
 FOLLOWUP_COLUMNS = ("test_date", "model", "action", "link", "owner", "note")
+# Columns of pending_fixes.csv: unmerged PRs a model is known to need on main,
+# all of `prs` together (455-CI-guide.md §3.7).
+PENDING_COLUMNS = ("model", "prs", "note", "since")
 CONCURRENCIES = (4, 64)
 # The second perf metric of a scenario: endpoint E2E interactivity, 8K/1K ITL P50.
 SECOND = {"endpoint": "interactivity", "8k1k": "itl_p50_ms"}

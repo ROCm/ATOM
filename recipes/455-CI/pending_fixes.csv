@@ -1,0 +1,2 @@
+model,prs,note,since
+qwen-3.8-flash,https://github.com/ROCm/ATOM/pull/3225 https://github.com/ROCm/aiter/pull/7847,Both open as of 2026-11-13. ATOM#3225 has the gfx1250 fixes Qwen3.8 needs to run (a quantized MTP head: a BF16 one fails in warmup building the CK 2-stage BF16 MoE kernel; draft-graph padding that faulted at the first padded decode step) and a gfx1250 QSA kernel. aiter#7847 adds gfx1250 GEMM/MoE tunings and a faster QSA TopK (performance only).,2026-11-13

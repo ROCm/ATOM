@@ -9,7 +9,9 @@ reports/455-CI-report-<YYYYMMDD>.md: the short summary (highlights, tagging
 each model's owner from owners.csv, and the summary table), then the details
 (environment, every number, the trend charts of make_charts.py and each
 failure's core error log from runs/<YYYYMMDD>/<slug>/error.log). Each problem
-in the highlights gets its next step from followups.csv (455-CI-guide.md §3.7).
+in the highlights gets its next step from followups.csv (455-CI-guide.md §3.7);
+for one without, the unmerged PRs pending_fixes.csv lists for the model are
+suggested as a ready followups.csv row.
 Prints the highlights, a warning for news without an owner or a problem without
 a follow-up, and last the report's path.
 The image comes from runs/<image date>/image.json, written when the image was
@@ -17,6 +19,8 @@ built (455-CI-guide.md §2.4), else from the CSV rows.
 """
 
 import argparse
+import csv
+import io
 import json
 import os
 
@@ -26,6 +30,7 @@ from ci455_report import (
     highlights,
     missing_followups,
     missing_owners,
+    pr_label,
     report_md,
 )
 
@@ -135,10 +140,24 @@ def main(argv=None):
         print(
             f"WARNING: {name} is in the highlights but has no owner in owners.csv, so nobody is tagged."
         )
+    pending = {
+        r["model"]: (r.get("prs") or "").split()
+        for r in _rows(os.path.join(args.data_dir, "pending_fixes.csv"))
+    }
+    slug = {r.name: r.slug for r in results}
     for name in missing_followups(results, followups):
         print(
             f"WARNING: {name} is a problem in the highlights but has no follow-up in followups.csv: find an open PR, fix it, or write a repro (455-CI-guide.md §3.7)."
         )
+        prs = pending.get(slug[name])
+        if prs:
+            row = io.StringIO()
+            csv.writer(row, lineterminator="").writerow(
+                [day, slug[name], "open_pr", " ".join(prs), "", ""]
+            )
+            print(
+                f"  Known unmerged fix in pending_fixes.csv: {' + '.join(map(pr_label, prs))}. If it is still open and fixes this, add to followups.csv:\n  {row.getvalue()}"
+            )
     print(f"\nReport: {path}")
 
 

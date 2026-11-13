@@ -418,7 +418,7 @@ awk -F, -v d=<YYYY-MM-DD> '$2 == d {print $4}' perf.csv accuracy.csv | sort -u
 
 我们做的虽然是 validation，但不能只报一个错误或回退。老板不想只看到问题，要看到下一步怎么办，或者我们已经修好了。所以 Highlights 里的每一条 ❌、🔴、⚠️（§5.1）都要带一个说法。全部模型测完后，先按 §5.5 跑一遍 `make_report.py` 看 Highlights 草稿，再对每个问题按下面的顺序找说法：
 
-1. **先查有没有人在修**：在 `ROCm/ATOM` 和 `ROCm/aiter` 的公开 PR 里找正在解决这个问题的。开着的 PR 算；镜像构建之后才合进 main 的也算，说明 main 上已经修了。用报错里的关键字、kernel 名、模型名搜，点开确认修的就是这个问题：
+1. **先查有没有人在修**：先看 `pending_fixes.csv` 里有没有登记这个模型在等的 PR（见本节末尾），例如 Qwen-3.8 Flash 在等 ROCm/ATOM#3225 + ROCm/aiter#7847。登记的 PR 还开着、这次的问题正是它们修的，就用它们。没有登记或对不上，再到 `ROCm/ATOM` 和 `ROCm/aiter` 的公开 PR 里找正在解决这个问题的。开着的 PR 算；镜像构建之后才合进 main 的也算，说明 main 上已经修了。用报错里的关键字、kernel 名、模型名搜，点开确认修的就是这个问题：
 
    ```bash
    for repo in ROCm/ATOM ROCm/aiter; do
@@ -427,7 +427,7 @@ awk -F, -v d=<YYYY-MM-DD> '$2 == d {print $4}' perf.csv accuracy.csv | sort -u
    done
    ```
 
-   找到了，说法就是 `open_pr`，链接写这个 PR。
+   找到了，说法就是 `open_pr`，链接写这个 PR；要一起合入的一组 PR 都写上，空格隔开。
 
 2. **没人在修，就评估好不好修**：根因清楚、改动小、能在 455 机器上验证，就算好修。回退先看上一场和这一场之间 ATOM、aiter 的 commit（两场的 sha 在报告的 Environment 和 `perf.csv` 里），能定位到具体 commit 的通常好修。好修就自己修：
    - 从对应仓库的 main 拉分支，改动尽量小，按那个仓库的规矩跑测试和 lint（ATOM 见 `/ci-pr-guide`，commit 不加 `Co-Authored-By`）。
@@ -470,11 +470,20 @@ awk -F, -v d=<YYYY-MM-DD> '$2 == d {print $4}' perf.csv accuracy.csv | sort -u
 | `test_date` | 场次日期，`YYYY-MM-DD` |
 | `model` | §1 的 slug |
 | `action` | `open_pr`、`our_pr` 或 `repro`，对应上面三步 |
-| `link` | PR 的链接；`repro` 写复现文档的路径，相对 `recipes/455-CI/`，例如 `runs/20261114/qwen-35b-a3b/repro.md` |
+| `link` | PR 的链接，多个用空格隔开；`repro` 写复现文档的路径，相对 `recipes/455-CI/`，例如 `runs/20261114/qwen-35b-a3b/repro.md` |
 | `owner` | 跟进的人。填了就由他代替 `owners.csv` 里的模型 owner 出现在这一条后面；不填时，`repro` 显示 `@owner_tbd`，其余显示模型 owner |
 | `note` | 英文一句话：验证结果、怀疑的方向等 |
 
 `make_report.py` 把说法接在 Highlights 那一条后面，详细 summary 里还有一张 Follow-ups 表。还有问题没写说法时它会打 WARNING：**每个问题都有了说法，报告才能提交**（§5.6）。
+
+**已知还没合入的修复**登记在 `recipes/455-CI/pending_fixes.csv`。知道某个模型在 main 上要等一组 PR 合入才能跑通（或才有正常性能），就登记一行；PR 合入 main 后删掉这一行。这个模型出了问题又还没写说法时，`make_report.py` 会在 WARNING 下面列出这些 PR，并给出一行可以直接贴进 `followups.csv` 的说法。贴之前先用 `gh pr view` 确认 PR 还开着，并对一下这次的报错是不是它们修的。
+
+| 列 | 内容 |
+|---|---|
+| `model` | §1 的 slug |
+| `prs` | 这组 PR 的链接，空格隔开 |
+| `note` | 英文：每个 PR 修什么，方便和报错对上 |
+| `since` | 登记日期，`YYYY-MM-DD` |
 
 ## 4. 记录
 
@@ -564,6 +573,7 @@ recipes/
     ├── accuracy_baseline.csv   可选：精度图上的 baseline 参考线
     ├── owners.csv         每个模型的 owner，Highlights 里 @ 他们（§5.1）
     ├── followups.csv      每个问题的说法：已有 PR、我们的 PR 或复现文档（§3.7）
+    ├── pending_fixes.csv  已知还没合入、某个模型在等的 PR（§3.7）
     ├── .gitattributes     三个 CSV 设了 merge=union，两个节点同时提交不冲突（§3.5）
     ├── tools/             生成图和报告的脚本、样例（§5.5）
     ├── reports/           一场一份，YYYYMMDD 是场次日期

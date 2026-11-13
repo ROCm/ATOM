@@ -529,3 +529,14 @@ def test_the_details_list_each_problem_with_its_next_step_owner_and_note():
     )
     assert "| Charlie | Missing: needs a follow-up | — | — |" in table
     assert "Alpha" not in table
+
+
+def test_a_fix_that_takes_two_prs_links_both():
+    links = (
+        "https://github.com/ROCm/ATOM/pull/3225 https://github.com/ROCm/aiter/pull/7847"
+    )
+    (line,) = highlights(
+        [model("Bravo", **FAILING)], followups={"bravo": follow("open_pr", links)}
+    )
+    want = "Fix in progress: [ROCm/ATOM#3225](https://github.com/ROCm/ATOM/pull/3225) + [ROCm/aiter#7847](https://github.com/ROCm/aiter/pull/7847)."
+    assert line.endswith(want)

@@ -4,7 +4,12 @@ import csv
 import json
 import re
 
-from ci455_data import ACCURACY_COLUMNS, FOLLOWUP_COLUMNS, PERF_COLUMNS
+from ci455_data import (
+    ACCURACY_COLUMNS,
+    FOLLOWUP_COLUMNS,
+    PENDING_COLUMNS,
+    PERF_COLUMNS,
+)
 from make_report import main
 
 CJK = "[\u4e00-\u9fff]"
@@ -239,3 +244,63 @@ def test_follow_ups_reach_the_highlights_and_a_problem_without_one_is_flagged(
     out = capsys.readouterr().out
     assert "DeepSeek R1" in out and "no follow-up" in out
     assert out.rstrip().splitlines()[-1].startswith("Report: ")
+
+
+QWEN38_PRS = (
+    "https://github.com/ROCm/ATOM/pull/3225 https://github.com/ROCm/aiter/pull/7847"
+)
+
+
+def qwen38_failure(tmp_path):
+    q = {"scenario": "8k1k", "model": "qwen-3.8-flash"}
+    write_csv(
+        tmp_path / "perf.csv",
+        PERF_COLUMNS,
+        [
+            perf("2026-11-11", 64, "26000", tpot="16", **q),
+            perf("2026-11-18", 64, "", status="fail", error="RuntimeError: x", **q),
+        ],
+    )
+    write_csv(
+        tmp_path / "pending_fixes.csv",
+        PENDING_COLUMNS,
+        [
+            {
+                "model": "qwen-3.8-flash",
+                "prs": QWEN38_PRS,
+                "note": "gfx1250 fixes",
+                "since": "2026-11-13",
+            }
+        ],
+    )
+
+
+def test_a_failure_with_a_known_unmerged_fix_gets_a_ready_follow_up_row(
+    tmp_path, capsys
+):
+    qwen38_failure(tmp_path)
+    main(["--date", "2026-11-18", "--data-dir", str(tmp_path)])
+    out = capsys.readouterr().out
+    assert "ROCm/ATOM#3225 + ROCm/aiter#7847" in out
+    assert f"2026-11-18,qwen-3.8-flash,open_pr,{QWEN38_PRS},," in out
+
+
+def test_the_known_fix_is_not_suggested_once_a_follow_up_is_recorded(tmp_path, capsys):
+    qwen38_failure(tmp_path)
+    write_csv(
+        tmp_path / "followups.csv",
+        FOLLOWUP_COLUMNS,
+        [
+            {
+                "test_date": "2026-11-18",
+                "model": "qwen-3.8-flash",
+                "action": "open_pr",
+                "link": QWEN38_PRS,
+            }
+        ],
+    )
+    main(["--date", "2026-11-18", "--data-dir", str(tmp_path)])
+    out = capsys.readouterr().out
+    assert "pending_fixes.csv" not in out and "no follow-up" not in out
+    report = (tmp_path / "reports" / "455-CI-report-20261118.md").read_text()
+    assert "+ [ROCm/aiter#7847](https://github.com/ROCm/aiter/pull/7847)." in report
