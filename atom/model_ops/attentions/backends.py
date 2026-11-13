@@ -5,7 +5,7 @@ import logging
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Any, ClassVar, Generic, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 if TYPE_CHECKING:
     from atom.distributed.pcp_utils import PcpBalGroup
@@ -63,12 +63,6 @@ PAD_SLOT_ID = -1
 class AttentionBackend(ABC):
     """Abstract class for attention backends."""
 
-    #: Whether a *draft* of this flavor caches into a pool of its own. False
-    #: means its rows are the target's -- an MLA draft's latent is the target's
-    #: latent -- and `make_kv_pool` below is never asked. A property of the
-    #: flavor, so a class answer and not a call.
-    DRAFT_OWNS_KV_POOL: ClassVar[bool] = False
-
     @staticmethod
     @abstractmethod
     def get_name() -> str:
@@ -91,14 +85,22 @@ class AttentionBackend(ABC):
         target_block_size: int,
         layers: int,
         kv_dtype,
+        blocks_per_entry: int = 1,
+        flash_layout: bool = False,
     ):
         """A pool of `layers` rows at this config's geometry.
 
-        Asked of a *draft* model's backend, and only where `DRAFT_OWNS_KV_POOL`
-        — the target's layers are its builder's own business. Both counts are
-        told rather than read: `layers` only the walk knows, and the block only
-        the target builder, whose it is and not this backend's for the reason
-        in `DraftKvBuilder.kv_pool`.
+        Asked of a *draft* model's backend, and only for a family in
+        `selector.DRAFT_POOL_FAMILIES` — the target's layers are its builder's
+        own business. Both counts are told rather than read: `layers` only the
+        walk knows, and the block only the target builder, whose it is and not
+        this backend's for the reason in `DraftKvBuilder.kv_pool`.
+
+        `blocks_per_entry` and `flash_layout` are what a draft's
+        `DraftKvPoolSpec.pool_kwargs` adds: an entry spanning that many
+        `target_block_size` blocks, stored in the FLASH order. The defaults are
+        the generic pool, one block per entry in the SHUFFLE order, which is
+        all a draft without a `kv_pool_spec` is built with.
         """
         raise NotImplementedError
 

@@ -33,6 +33,7 @@ from atom.model_ops.deepseek_v41.index_plane import FP4_MFMA
 from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
 from atom.model_ops.v4_kernels.paged_decode import LOG2E
 from atom.models.deepseek_v41.config import AttentionMode
+from atom.models.deepseek_v41.dspark import DeepseekV41DSpark
 from atom.models.deepseek_v41.mono import index_plan as ip
 from atom.models.deepseek_v41.mono.check import (
     check_front,
@@ -211,7 +212,11 @@ class V41MonoDecodeRunner:
         self.aux = (
             AuxTaps((), ())
             if drafter is None
-            else bind_aux_taps(drafter, model.config.hidden_size)
+            else bind_aux_taps(
+                drafter,
+                model.config.hidden_size,
+                DeepseekV41DSpark._target_layer_input,
+            )
         )
         self.tok_par_from = TOK_PAR_FROM.get(self.tp, self.max_rows + 1)
         # DP attention gathers no rows: a rank's step is its own

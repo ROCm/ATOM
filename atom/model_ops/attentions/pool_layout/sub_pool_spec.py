@@ -86,6 +86,15 @@ def page_pool(entry_bytes: int) -> SubPoolSpec:
     return SubPoolSpec(Pool.PAGE, PAGED_CLASS, entry_bytes)
 
 
+def page_entry_bytes(specs: list[SubPoolSpec]) -> int:
+    """Bytes one declarer adds to each block of the shared PAGE class.
+
+    `merge_specs` sums every contributor into one class, so the plan's
+    `entry_bytes` cannot say which share is whose; this is one declarer's.
+    """
+    return sum(s.entry_bytes for s in specs if s.pool is Pool.PAGE)
+
+
 def state_pool(
     name: str,
     entry_bytes: int,

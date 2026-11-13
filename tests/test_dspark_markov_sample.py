@@ -488,8 +488,8 @@ def test_the_block_sampler_chains_the_op_through_its_bound_buffers():
     exactly as calling the op directly."""
     from types import SimpleNamespace
 
-    from atom.models.dspark_draft import DraftSampling
-    from atom.models.kimi_k3_dspark import DSparkMarkovHead, KimiK3DSpark
+    from atom.models.dspark_draft import DraftSampling, DSparkMarkovHead
+    from atom.models.kimi_k3_dspark import KimiK3DSpark
 
     max_bs, bs, steps, vocab, rank, width = 4, 3, 3, 3000, 32, 64
     head = DSparkMarkovHead(vocab, rank).to(DEV, torch.bfloat16)
@@ -542,8 +542,8 @@ def test_the_greedy_block_ignores_the_bound_sampling():
     the argmax chain whatever ``draft_sampling`` holds, and no q written."""
     from types import SimpleNamespace
 
-    from atom.models.dspark_draft import DraftSampling
-    from atom.models.kimi_k3_dspark import DSparkMarkovHead, KimiK3DSpark
+    from atom.models.dspark_draft import DraftSampling, DSparkMarkovHead
+    from atom.models.kimi_k3_dspark import KimiK3DSpark
 
     max_bs, bs, steps, vocab, rank, width = 4, 3, 3, 3000, 32, 64
     head = DSparkMarkovHead(vocab, rank).to(DEV, torch.bfloat16)

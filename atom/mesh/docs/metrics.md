@@ -25,13 +25,14 @@ Two endpoints render the same registry:
 
 ```bash
 curl -s http://<router-host>:<router-port>/metrics \
-  | grep -E '^mesh_(route|session)'
+  | grep -E '^mesh_(route|session|selected_dp_rank)'
 ```
 
 Values accumulate from router start. Use `rate()` or `increase()` in
 Prometheus, or subtract a scrape taken before a benchmark from one taken after
 it. A series appears once it has a sample, so a policy or branch that never ran
-has no line.
+has no line. `--route-log-sample-rate` logs individual decisions with the same
+fields (see [Logging](../README.md#logging)).
 
 Agentic PD CI runs every concurrency level against one router and saves three
 files per level under `metrics/` in the run artifact:
@@ -57,7 +58,8 @@ without PD disaggregation, otherwise `prefill` or `decode`. `policy` is one of
 `random`, `round_robin`, `power_of_two`, `cache_aware`, `prefix_hash` and
 `dp_sticky`.
 Decisions are counted per attempt: a PD request adds one per pool, and a retry
-adds another.
+adds another. Dispatches count the requests actually sent, so a decode worker
+skipped after a failed prefill adds none.
 
 | Metric | Type / unit | Labels | Recorded when |
 | --- | --- | --- | --- |
@@ -65,6 +67,7 @@ adds another.
 | `mesh_route_prefix_match_ratio` | Histogram, ratio 0 to 1 | `pool`, `policy` | `cache_aware` branches `affinity` and `relocate`. |
 | `mesh_route_selected_worker_active_requests` | Histogram, active requests | `pool`, `policy`, `branch` | Every selection that picks a worker, before the router adds the request (see [below](#selected-workers-active-requests)). |
 | `mesh_session_worker_change_total` | Counter, requests | `pool`, `reason`: `rebind`, `expired`, `rank_mapping` | A `dp_sticky` session request is sent to a different worker (URL and DP rank) than the session's previous request (see [below](#worker-changes)). |
+| `mesh_selected_dp_rank_total` | Counter, dispatches | `pool`, `worker` (base URL), `dp_rank` (rank or `none`) | HTTP routers send a request, after DP rank mapping (see [below](#dp-ranks)). |
 | `mesh_prefix_hash_policy_branch_total` | Counter, decisions | `branch` | `prefix_hash`, the same branches without `pool`. Deprecated by [#3141] for `mesh_route_branch_total{policy="prefix_hash"}`. |
 
 Histogram buckets:
@@ -161,6 +164,13 @@ different DP rank than the previous one. A session that moves leaves its KV
 cache on the old worker. The HTTP routers and the external-processing PD
 executor record it; gRPC routers do not.
 
+### DP ranks
+
+`mesh_selected_dp_rank_total` counts the requests the router sends, after it
+maps the selection to a DP rank. `worker` is the base URL, which ranks behind
+one endpoint share; `dp_rank` is `none` for workers without ranks. Uneven
+counts across ranks of one endpoint show rank skew.
+
 ## Example queries
 
 Branch share per policy and pool:
@@ -216,6 +226,8 @@ mesh_route_prefix_match_ratio_count{pool="prefill",policy="cache_aware"} 12
 mesh_route_selected_worker_active_requests_sum{pool="prefill",policy="cache_aware",branch="affinity"} 0
 mesh_route_selected_worker_active_requests_count{pool="prefill",policy="cache_aware",branch="affinity"} 9
 mesh_route_selected_worker_active_requests_count{pool="prefill",policy="cache_aware",branch="relocate"} 3
+mesh_selected_dp_rank_total{pool="decode",worker="http://127.0.0.1:20832",dp_rank="none"} 8
+mesh_selected_dp_rank_total{pool="decode",worker="http://127.0.0.1:20833",dp_rank="none"} 4
 ```
 
 Reading it:
@@ -229,5 +241,7 @@ Reading it:
 - The `dp_sticky` hit rate is 9 / 12 = 75%: each session's first turn is `new`.
   No session changed workers, so `mesh_session_worker_change_total` has no
   line.
+- Decode sent two sessions, 8 requests, to one worker and the third session to
+  the other. The mock workers have no DP ranks, so `dp_rank` is `none`.
 
 [#3141]: https://github.com/ROCm/ATOM/pull/3141

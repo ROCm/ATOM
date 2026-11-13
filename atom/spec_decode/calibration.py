@@ -13,7 +13,9 @@ import torch
 def calibration_identity(config, device):
     model = Path(config.model)
     files = ("config.json", "model.safetensors.index.json")
-    return {
+    spec = config.speculative_config
+    draft_dtype = spec.draft_kv_dtype if spec is not None else config.kv_cache_dtype
+    identity = {
         "model_files": {
             name: hashlib.sha256((model / name).read_bytes()).hexdigest()
             for name in files
@@ -27,6 +29,11 @@ def calibration_identity(config, device):
         "torch_version": torch.__version__,
         "hip_version": torch.version.hip,
     }
+    # Only when it is not the target's, so profiles from before it was a choice
+    # still match.
+    if draft_dtype != config.kv_cache_dtype:
+        identity["draft_kv_cache_dtype"] = draft_dtype
+    return identity
 
 
 def validate_calibration(profile, identity, *, width, max_batch):
