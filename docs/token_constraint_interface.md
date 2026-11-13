@@ -1,17 +1,16 @@
 # Constraint parser and execution adapter contract
 
-Tool output parsing remains in the shared ToolCallParser stream engine. A model
-format declares its original wire syntax and constraint rules; the common
+Tool output parsing is done by the shared ToolCallParser stream engine. A model
+format declares its wire syntax and constraint rules; the common
 ConstraintParser compiles those declarations through registered rule adapters.
-K3 declares its channel rule through its `required_call_channel` hook; its
-`tool_call_grammar` hook and JSON Schema compilation are unchanged. The compiled
-native RequiredChannel and grammar object retain their existing serialization,
-stop IDs, fields and backend semantics.
+K3 declares its channel rule through its `required_call_channel` hook and its
+grammar through `tool_call_grammar`. The compiled values are the native
+RequiredChannel and grammar objects.
 
 `ConstraintParser.register(rule_type, adapter)` adds a rule without changing
 parser dispatch. `parse(rule, context)` returns the native compiled value.
-Bindings (`ConstraintBinding`) are rebuilt at the engine boundary from native
-scheduled fields; provider classes and state never cross Sequence IPC.
+Provider classes and state never cross Sequence IPC; adapters read the native
+scheduled fields at the engine boundary.
 Importing `atom.constraint_parser` (rule declarations, `ConstraintParser`)
 requires no torch, Triton, AITER or llguidance. Format modules such as the Kimi-K3 tool parser import the tool parser
 and registry stack, which does require torch. Backend imports happen when the
@@ -23,8 +22,8 @@ Register adapters with `register_constraint_provider`. An adapter declares:
 
 - `backend`: unique name.
 - `enabled(batch)`: cheap host query, without allocations or backend imports.
-- `bind(batch)`: an enabled adapter returns a ConstraintBinding with native
-  payload. Disabled adapters are not bound. Enabled-but-unbound is an error.
+- `bind(batch)`: an enabled adapter returns its native payload from the batch;
+  disabled adapters are not bound.
 - `mask_stage`: source logits = 0; gathered sampler logits = 1. The registry
   orders masks by this stage, preserving registration order within a stage.
   A source adapter must finish before any sampler adapter can gather rows.
@@ -42,7 +41,7 @@ Register adapters with `register_constraint_provider`. An adapter declares:
   step.logits/step.target. Adapters preserve existing hard masks. They may report
   failure tensors; the executor combines failures by OR, never overwrites them.
 - `commit_order`: explicit lifecycle order independent of mask stage. The
-  original channel GPU advance runs at 0 and grammar commit at 10.
+  channel GPU advance runs at 0 and grammar commit at 10.
 - `commit(step, tokens, batch, deferred, failure, binding)`: receives synchronized
   accepted output tokens after broadcasts, including rejection sentinels. It
   never commits merely proposed draft IDs. The current GPU carry envelope allows
@@ -57,9 +56,9 @@ Register adapters with `register_constraint_provider`. An adapter declares:
 The executor counts declared hard-mask participation per request. The channel
 FSM preserves a forbidden forced token when that same request has another hard
 rule, even if the other adapter was registered later. Non-intersection channel
-requests keep their original forced-inf repair. After all masks, intersections
+requests use the forced-inf repair. After all masks, intersections
 are checked without relaxing either rule. The safe ID is GPU-only and failure
-travels through the existing output-copy pipeline; safe IDs are retained for GPU
+travels through the output-copy pipeline; safe IDs are retained for GPU
 carry, and error sentinels are only applied to delivered output.
 
 For speculative decoding, request participation is expanded using inclusive
@@ -76,14 +75,14 @@ return before bindings, steps or provider instances are allocated. A new adapter
 must not require a ModelRunner special case to disable head IDs or step override.
 ModelRunner centrally rejects those bypasses when has_constraints(batch) is true.
 
-Behavior note: a single request carrying both a forced K3 channel token and a
-JSON Schema/grammar rule now has its hard masks intersected without relaxing
+A single request carrying both a forced K3 channel token and a
+JSON Schema/grammar rule has its hard masks intersected without relaxing
 either rule. If the forced token is forbidden by the grammar, the request fails
 immediately with "no valid continuation". The OpenAI server clears
 `required_channel` whenever it configures a grammar, so only direct engine API
 use can reach this combination.
 
-Grammar release keeps its original asynchronous copy buffer leases. Channel
+Grammar release uses asynchronous copy buffer leases. Channel
 immutable device tables are server resources; tokenIDProcessor owns GPU carried
-request states through its existing output/batch lifecycle. Adapter release must
+request states through its output/batch lifecycle. Adapter release must
 not clear another component's buffers or reuse a still-in-flight buffer.
