@@ -18,7 +18,7 @@ from typing import NamedTuple
 import triton
 import triton.language as tl
 
-from atom.model_ops.tile_argmax import argmax_lowest_id
+from atom.model_ops.tile_argmax import NO_HIT, argmax_lowest_id
 
 # Chosen for headroom rather than peak: the stage-1 accumulator is
 # [BLOCK_ROW, BLOCK_V] fp32 (64x128 -> 16 VGPR/lane at 8 warps) and one pipeline
@@ -171,10 +171,10 @@ def publish_tile_argmax(
     # `v_mask` also covers the all--inf row: without it a padded lane, which
     # is -inf too, could win the id.
     tile_max, tile_idx = argmax_lowest_id(
-        vals, offs_v[None, :], v_mask[None, :], 2147483647
+        vals, offs_v[None, :], v_mask[None, :], NO_HIT
     )
     # Global id. A tile with no hit (all NaN) keeps `argmax_of_tiles`' one
-    # sentinel, unoffset, which it answers as id 0 for an all-NaN row.
-    tile_idx = tl.where(tile_idx != 2147483647, tile_idx + vocab_offset, 2147483647)
+    # sentinel, `NO_HIT`, unoffset; it answers that as id 0 for an all-NaN row.
+    tile_idx = tl.where(tile_idx != NO_HIT, tile_idx + vocab_offset, NO_HIT)
     tl.store(part_val_ptr + tile * num_rows + offs_row, tile_max, mask=row_mask)
     tl.store(part_idx_ptr + tile * num_rows + offs_row, tile_idx, mask=row_mask)
