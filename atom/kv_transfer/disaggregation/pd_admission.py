@@ -58,7 +58,7 @@ class PdAdmissionController:
         ):
             raise ValueError("pd_admission requires D PP=1, DCP=1, PCP=1 and SP=1")
         # Credits are counted in pages, so the paged KV must be the only pool.
-        entry_bytes = list((getattr(config, "pool_entry_bytes", None) or {}).values())
+        entry_bytes = list(config.pool_entry_bytes.values())
         if len(entry_bytes) != 1 or entry_bytes[0] <= 0:
             raise ValueError("pd_admission requires a single paged KV pool layout")
         block_bytes = entry_bytes[0]
