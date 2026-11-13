@@ -32,6 +32,7 @@ except ImportError:
     concat_and_cache_mla_seg = None
     fused_qk_rope_concat_and_cache_mla_seg = None
 from aiter.dist.parallel_state import get_dp_group, get_tensor_model_parallel_rank
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.mla import mla_decode_fwd, mla_prefill_fwd
 from aiter.ops.triton.attention.mla import mla_decode_fwd as triton_mla_decode_fwd
 from aiter.ops.triton.fusions.fused_kv_cache import (
@@ -1575,7 +1576,8 @@ class MLAAttention(nn.Module):
 
     def _absorb_into_q_out(self, use_qrep, is_prefill, kv_cache, dtype_q):
         # Prefill BF16 absorb at the replicated heads stores FP8 into q_out
-        # itself (mla_absorb_q_pack), so no bf16 [N, T, L] is written.
+        # itself (mla_absorb_q_pack), so no bf16 [N, T, L] is written. gfx950
+        # only: the kernel has not run on gfx942, where FP8 is e4m3fnuz.
         return (
             use_qrep
             and is_prefill
@@ -1584,6 +1586,7 @@ class MLAAttention(nn.Module):
             and not self.kv_shuffled
             and kv_cache.numel() > 0
             and dtype_q == dtypes.fp8
+            and get_gfx_runtime() == "gfx950"
             and mla_absorb_q_pack_supports(self.qk_nope_head_dim, self.kv_lora_rank)
         )
 

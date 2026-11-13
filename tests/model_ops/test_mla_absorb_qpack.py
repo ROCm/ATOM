@@ -9,6 +9,7 @@ if not torch.version.hip or not torch.cuda.is_available():
 
 from aiter import dtypes, fused_qk_rope_concat_and_cache_mla
 
+from atom.model_ops import attention_mla
 from atom.model_ops.attention_mla import MLAAttention
 from atom.model_ops.rotary_embedding import NoPositionalRotaryEmbedding
 from atom.model_ops.triton_mla_absorb_qpack import mla_absorb_q_pack
@@ -106,9 +107,20 @@ def test_absorb_into_q_out_matches_two_kernel_path(tokens, q_scale):
     assert share < 0.06, f"{share:.1%} of nope codes one step off"
 
 
-# GLM-5.x has 192 nope dims, which the absorb kernel does not compile for.
-@pytest.mark.parametrize("nope, absorbs", [(NOPE, True), (192, False)])
-def test_absorb_gate_takes_two_kernel_path_off_kernel_shapes(nope, absorbs):
+# GLM-5.x has 192 nope dims, which the absorb kernel does not compile for. The
+# kernel has not run on gfx942.
+@pytest.mark.parametrize(
+    "gfx, nope, absorbs",
+    [
+        ("gfx950", NOPE, True),
+        ("gfx950", 192, False),
+        ("gfx942", NOPE, False),
+    ],
+)
+def test_absorb_gate_takes_two_kernel_path_off_kernel_shapes(
+    monkeypatch, gfx, nope, absorbs
+):
+    monkeypatch.setattr(attention_mla, "get_gfx_runtime", lambda: gfx)
     layer = SimpleNamespace(
         W_K_qrep_scale=None,
         kv_shuffled=False,
