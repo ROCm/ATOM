@@ -66,7 +66,7 @@ def agree_kv_budget(
             f"the {connector_bytes / (1 << 30):.2f}GB the KV connector "
             "buffers need after the KV cache is sized; free GPU memory or "
             "turn those buffers off (ATOM_PD_MLA_STAGING=0 / "
-            "ATOM_PD_MLA_STAGING_CHUNK_PAGES=0 / ATOM_PD_MLA_LANDING=0)."
+            "ATOM_PD_MLA_LANDING=0)."
         )
     return AgreedKvBudget(
         free,
