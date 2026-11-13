@@ -3409,7 +3409,7 @@ class Scheduler:
     def _mark_offload_load_ready(self, seq: Sequence) -> None:
         """Turn a completed offload load into a suffix-prefill resume."""
         loaded = seq.offload_loaded_tokens
-        load_start = getattr(seq, "offload_load_start_tokens", None)
+        load_start = seq.offload_load_start_tokens
         logger.debug(
             "[OFFLOAD-WAKE] seq %s: loaded=%s prev_cached=%d num_tokens=%d",
             seq.id,
