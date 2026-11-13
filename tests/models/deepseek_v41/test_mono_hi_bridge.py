@@ -189,6 +189,12 @@ def kv8_encode(x: torch.Tensor) -> torch.Tensor:
 
 
 def kv8_rows(n: int, seed: int = 0) -> torch.Tensor:
+    """``_kv8_rows`` built on the host whatever the default device (a GPU run sets cuda)."""
+    with torch.device("cpu"):
+        return _kv8_rows(n, seed)
+
+
+def _kv8_rows(n: int, seed: int = 0) -> torch.Tensor:
     """n bf16 rows [n, 512] that reach every case of the encoding: groups from 2^-40 to 2^20 in scale, an all-zero
     group (the amax floor), +-0, exact powers of two at the clamp, values at the E4M3 midpoints (normal and
     subnormal: the rounding's ties), values below the smallest subnormal."""
