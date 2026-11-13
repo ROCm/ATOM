@@ -99,7 +99,7 @@ class HiDecodeModel(MonoDecodeModel):
         hook.served_widths.add(rows)
         # Every layer runs on the hi path: ATOM's mailboxes and K1 / K2 step metadata have no reader on this step
         # (``lean_host``). The begin-step expands ATOM's embedding rows into layer 0's streams.
-        hidden_in = model.embed(input_ids)
+        hidden_in = _embed(hook, model.embed, input_ids)
         model.begin_forward(hidden_in.view(1, rows, -1), None)
         # Engram staging's side-stream all-gather spins on CUs until every rank joins it: beside a kernel that needs
         # every CU resident it deadlocks, so it ends before the first one
@@ -152,7 +152,7 @@ class HiDraftModel(MonoDraftModel):
                 metadata.cache,
                 input_ids,
                 # ATOM's embedding rows of the anchors (as its own block draft looks them up)
-                self.model.embed(input_ids.view(-1)),
+                _embed(hook, self.model.embed, input_ids.view(-1)),
                 positions,
                 metadata.state_slot_out[:requests],
                 self.model._noise_embedding(),
@@ -208,6 +208,29 @@ def install_hi(
         raise
 
 
+def _replicated_embedding(embed) -> torch.Tensor | None:
+    """At TP8 the whole vocab embedding table on every rank (the shards all-gathered once, 1.3 GB a rank): the hi steps
+    look their rows up locally, the same rows as the sharded masked lookup and its all-reduce (one row's partials are
+    all zeros but its owner's), without the two all-reduces a step (the target's and the draft's anchors). None
+    elsewhere: ATOM's sharded lookup."""
+    import torch.distributed as dist
+    from aiter.dist.parallel_state import get_tp_group
+
+    w = embed.weight
+    tp = int(getattr(embed, "tp_size", 1))
+    if tp != 8 or w.shape[0] * tp != embed.num_embeddings:
+        return None
+    full = torch.empty((w.shape[0] * tp, w.shape[1]), dtype=w.dtype, device=w.device)
+    dist.all_gather_into_tensor(full, w.contiguous(), group=get_tp_group().device_group)
+    return full
+
+
+def _embed(hook, embed, ids: torch.Tensor) -> torch.Tensor:
+    """``ids``' embedding rows: the replicated table's local lookup where there is one, else ATOM's ``embed``."""
+    full = getattr(hook, "embed_full", None)
+    return embed(ids) if full is None else torch.nn.functional.embedding(ids, full)
+
+
 def _install_hi(
     model, atom_config, drafter, metadata_builder, dp_ranks: int
 ) -> nn.Module:
@@ -217,6 +240,7 @@ def _install_hi(
     # ATOM's own hash mapping)
     hook = hi_runner.install(model, atom_config, engram.mapping, drafter.model)
     hook.runner = metadata_builder.model_runner
+    hook.embed_full = _replicated_embedding(model.embed)
     if hook.eng:
         # the Engram lookup from ATOM's host shards, its staging skipped on served steps
         hook.use_host_tables(engram.host, engram.host.overlap)
