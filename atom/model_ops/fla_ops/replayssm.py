@@ -1930,3 +1930,87 @@ def replayssm_sigmoid_gating_delta_rule(
         num_stages=3,
     )
     return out
+
+
+def replayssm_kda_conv_hip(
+    mixed_qkv: torch.Tensor,
+    conv_state: torch.Tensor,
+    conv_weight: torch.Tensor,
+    conv_state_indices: torch.Tensor,
+    conv_state_indices_in: torch.Tensor | None,
+    num_accepted_tokens: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    ckpt: torch.Tensor,
+    buf_k: torch.Tensor,
+    buf_u: torch.Tensor,
+    buf_g: torch.Tensor,
+    write_pos: torch.Tensor,
+    slot_idx: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    max_query_len: int,
+    o: torch.Tensor,
+    use_qk_l2norm_in_kernel: bool = False,
+    lower_bound: float | None = None,
+    fork_slots: torch.Tensor | None = None,
+) -> bool:
+    """Speculative verify of a KDA layer as one aiter HIP kernel.
+
+    Under ``ATOM_REPLAYSSM_KDA_HIP=1``, runs the short convolution of
+    ``causal_conv1d_update`` (width 4, SiLU, with ``num_accepted_tokens``; the
+    conv state is rewritten in place) and
+    :func:`replayssm_sigmoid_gating_delta_rule` on its q / k / v in one kernel,
+    so q, k and v never go through memory.  ``mixed_qkv`` is the
+    ``[T, 3 * H * 128]`` conv input, ``o`` the ``[T, H, 128]`` output; the
+    rest as in the two calls it replaces.  Returns False, touching nothing,
+    when the flag is off or the kernel does not cover the call: the caller
+    then runs the two calls.
+    """
+    if not envs.ATOM_REPLAYSSM_KDA_HIP:
+        return False
+    hip = _kda_hip_op()
+    if hip is None or not hasattr(hip, "kda_replayssm_decode_conv"):
+        return False
+    num_heads = o.shape[-2]
+    if not hip.kda_replayssm_decode_conv_supported(
+        mixed_qkv,
+        conv_state,
+        conv_weight,
+        num_heads,
+        ckpt,
+        buf_k,
+        buf_u,
+        buf_g,
+        A_log,
+        dt_bias,
+        max_query_len,
+    ):
+        return False
+    seed_forked_slots(ckpt, fork_slots)
+    hip.kda_replayssm_decode_conv(
+        mixed_qkv,
+        conv_state,
+        conv_weight,
+        conv_state_indices,
+        num_accepted_tokens,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        ckpt,
+        buf_k,
+        buf_u,
+        buf_g,
+        write_pos,
+        slot_idx,
+        cu_seqlens,
+        max_query_len,
+        num_heads,
+        conv_state_indices_in=conv_state_indices_in,
+        o=o,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        lower_bound=lower_bound,
+    )
+    return True

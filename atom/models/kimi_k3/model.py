@@ -35,6 +35,7 @@ from atom.model_ops.fla_ops.fused_sigmoid_gating import (
     fused_sigmoid_gating_delta_rule_update,
 )
 from atom.model_ops.fla_ops.replayssm import (
+    replayssm_kda_conv_hip,
     replayssm_sigmoid_gating_delta_rule,
 )
 from atom.model_ops.layernorm import RMSNorm
@@ -1228,6 +1229,43 @@ class KimiKDAAttention(nn.Module):
         ).contiguous()
         self._in_proj_fused = True
 
+    def _spec_conv_replayssm_hip(
+        self, kda_metadata, mixed_qkv, conv_state, gate, beta, ssm_state, cache, out
+    ) -> bool:
+        """Speculative verify under ReplaySSM with ATOM_REPLAYSSM_KDA_HIP=1: the
+        short convolution and the recurrence as one aiter kernel, so q, k and v
+        never go through memory.  False when that does not apply; the caller
+        then runs causal_conv1d_update + replayssm_sigmoid_gating_delta_rule.
+        """
+        if not getattr(kda_metadata, "replayssm", False):
+            return False
+        nsd = kda_metadata.num_spec_decodes
+        state_indices_in = kda_metadata.spec_state_indices_in_tensor
+        return replayssm_kda_conv_hip(
+            mixed_qkv,
+            conv_state,
+            self.conv_weight,
+            kda_metadata.spec_state_indices_tensor[:nsd, 0],
+            None if state_indices_in is None else state_indices_in[:nsd, 0],
+            kda_metadata.num_accepted_tokens,
+            gate,
+            beta,
+            self.A_log,
+            self.dt_bias,
+            ckpt=ssm_state,
+            buf_k=cache.replay_buf_k,
+            buf_u=cache.replay_buf_u,
+            buf_g=cache.replay_buf_g,
+            write_pos=kda_metadata.write_pos,
+            slot_idx=kda_metadata.slot_idx[:nsd],
+            cu_seqlens=kda_metadata.spec_query_start_loc[: nsd + 1],
+            max_query_len=kda_metadata.replayssm_max_query_len,
+            o=out,
+            use_qk_l2norm_in_kernel=True,
+            lower_bound=self._kda_gate_lower_bound,
+            fork_slots=kda_metadata.replayssm_fork_slots,
+        )
+
     def _run_kda(
         self,
         q: torch.Tensor,
@@ -1498,6 +1536,12 @@ class KimiKDAAttention(nn.Module):
                     is_kda=True,
                     lower_bound=self._kda_gate_lower_bound,
                 )
+        elif kda_metadata.num_spec_decodes > 0 and self._spec_conv_replayssm_hip(
+            kda_metadata, mixed_qkv, conv_state, gate, beta, ssm_state, cache, out
+        ):
+            # Speculative verify done: conv + ReplaySSM ran as one aiter kernel
+            # (ATOM_REPLAYSSM_KDA_HIP=1) and wrote `out` in place.
+            pass
         elif kda_metadata.num_spec_decodes > 0:
             # Speculative-decode pass
             spec_state_indices = kda_metadata.spec_state_indices_tensor
