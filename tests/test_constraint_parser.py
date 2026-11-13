@@ -66,7 +66,7 @@ def test_registered_provider_traverses_complete_lifecycle(monkeypatch):
         commit_order = 20
 
         @staticmethod
-        def hard_requests(binding, batch):
+        def hard_requests(batch):
             return [0]
 
         @staticmethod
@@ -78,22 +78,18 @@ def test_registered_provider_traverses_complete_lifecycle(monkeypatch):
             return True
 
         @staticmethod
-        def bind(batch):
-            return batch.third
+        def prepare(runner, batch, metadata):
+            events.append(("prepare", batch.third))
 
         @staticmethod
-        def prepare(runner, batch, metadata, binding):
-            events.append(("prepare", binding))
-
-        @staticmethod
-        def apply(step, binding):
-            events.append(("apply", binding))
+        def apply(step):
+            events.append(("apply", step.batch.third))
             step.source[:, 1] = -float("inf")
 
         @staticmethod
-        def commit(step, tokens, batch, deferred, failure, binding):
+        def commit(step, tokens, batch, deferred, failure):
             assert tokens.tolist() == [0]
-            events.append(("commit", binding))
+            events.append(("commit", batch.third))
 
         @staticmethod
         def release(runner, ids):
@@ -144,12 +140,8 @@ def test_late_registered_source_mask_composes_with_channel(monkeypatch, spec, ac
             return True
 
         @staticmethod
-        def hard_requests(binding, batch):
+        def hard_requests(batch):
             return [0]
-
-        @staticmethod
-        def bind(batch):
-            return 7
 
         @staticmethod
         def prepare(*args):
@@ -164,10 +156,10 @@ def test_late_registered_source_mask_composes_with_channel(monkeypatch, spec, ac
             pass
 
         @staticmethod
-        def apply(step, binding):
-            kept = step.source[:, binding].clone()
+        def apply(step):
+            kept = step.source[:, 7].clone()
             step.source.fill_(-float("inf"))
-            step.source[:, binding] = kept
+            step.source[:, 7] = kept
 
     monkeypatch.setattr(boundary, "_PROVIDERS", list(boundary._PROVIDERS))
     boundary.register_constraint_provider(SourceMask)
@@ -258,15 +250,11 @@ def test_provider_failure_reports_preserve_previous_failures(monkeypatch, inplac
             return True
 
         @staticmethod
-        def bind(batch):
-            return None
-
-        @staticmethod
-        def hard_requests(binding, batch):
+        def hard_requests(batch):
             return []
 
         @staticmethod
-        def apply(step, binding):
+        def apply(step):
             step.invalid = torch.tensor([True, False])
             step.target_invalid = torch.tensor([False, True])
 
@@ -274,7 +262,7 @@ def test_provider_failure_reports_preserve_previous_failures(monkeypatch, inplac
         backend = "second"
 
         @staticmethod
-        def apply(step, binding):
+        def apply(step):
             invalid = torch.tensor([False, True])
             target_invalid = torch.tensor([True, False])
             if inplace:

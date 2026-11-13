@@ -24,7 +24,7 @@ def register_constraint_provider(provider):
     """Register an adapter in mask order, without changing the executor.
 
     Adapters own native field interpretation and resource lifecycle. The
-    executor only binds, prepares, applies and commits accepted token output.
+    executor only prepares, applies and commits accepted token output.
     """
     if any(existing.backend == provider.backend for existing in _PROVIDERS):
         raise ValueError(f"Duplicate constraint backend: {provider.backend}")
@@ -33,7 +33,7 @@ def register_constraint_provider(provider):
 
 
 def has_constraints(batch):
-    """Query adapters without creating bindings, instances or GPU work."""
+    """Query adapters without creating instances or GPU work."""
     return batch is not None and any(provider.enabled(batch) for provider in _PROVIDERS)
 
 
@@ -44,16 +44,16 @@ def needs_constraint_snapshot(batch, metadata):
     )
 
 
-def _bindings(batch):
+def _enabled_providers(batch):
     for provider in _PROVIDERS:
         if provider.enabled(batch):
-            yield provider, provider.bind(batch)
+            yield provider
 
 
 def prepare_token_constraints(runner, batch, metadata):
     """After deferred input assembly, before forward: overlap backend work."""
-    for provider, binding in _bindings(batch):
-        provider.prepare(runner, batch, metadata, binding)
+    for provider in _enabled_providers(batch):
+        provider.prepare(runner, batch, metadata)
 
 
 def release_token_constraints(runner, request_ids):
@@ -134,7 +134,7 @@ class TokenConstraints:
     def apply(cls, runner, batch, logits, metadata):
         if not has_constraints(batch):
             return None
-        bindings = tuple(_bindings(batch))
+        providers = tuple(_enabled_providers(batch))
         step = cls()
         step.runner, step.batch, step.metadata = runner, batch, metadata
         step.source = logits
@@ -143,17 +143,17 @@ class TokenConstraints:
         step.prefixes = {}
         step.channel = None
         step.invalid = step.target_invalid = None
-        step.providers = bindings
+        step.providers = providers
         step.rule_counts = None
-        if len(bindings) > 1:
+        if len(providers) > 1:
             step.rule_counts = torch.zeros(
                 batch.total_seqs_num, dtype=torch.int32, device=logits.device
             )
-            for provider, binding in bindings:
-                indices = provider.hard_requests(binding, batch)
+            for provider in providers:
+                indices = provider.hard_requests(batch)
                 if indices:
                     step.rule_counts[indices] += 1
-        for provider, binding in step.providers:
+        for provider in step.providers:
             previous, previous_target = step.invalid, step.target_invalid
             # Providers may reuse their failure output in place. Preserve the
             # accumulated failures before exposing those tensors to the next
@@ -162,11 +162,11 @@ class TokenConstraints:
                 previous = previous.clone()
             if previous_target is not None:
                 previous_target = previous_target.clone()
-            provider.apply(step, binding)
+            provider.apply(step)
             step.invalid = _merge_invalid(previous, step.invalid)
             step.target_invalid = _merge_invalid(previous_target, step.target_invalid)
         step.gather()
-        if len(bindings) > 1:
+        if len(providers) > 1:
             selected = step.rule_counts > 1
             step.invalid = _merge_invalid(
                 step.invalid, _guard_empty_rows(step.logits, selected)
@@ -185,12 +185,8 @@ class TokenConstraints:
     def commit(self, sampled_tokens, batch, deferred, failure):
         """Consume synchronized, accepted IDs, never unverified draft IDs."""
         channel_states = None
-        for provider, binding in sorted(
-            self.providers, key=lambda item: item[0].commit_order
-        ):
-            result = provider.commit(
-                self, sampled_tokens, batch, deferred, failure, binding
-            )
+        for provider in sorted(self.providers, key=lambda item: item.commit_order):
+            result = provider.commit(self, sampled_tokens, batch, deferred, failure)
             if result is not None:
                 if channel_states is not None:
                     raise ValueError("Multiple constraint adapters returned GPU carry")
@@ -245,8 +241,8 @@ class GrammarProvider:
     commit_order = 10
 
     @staticmethod
-    def hard_requests(binding, batch):
-        return list(binding)
+    def hard_requests(batch):
+        return list(batch.structured_requests)
 
     @staticmethod
     def enabled(batch):
@@ -257,11 +253,7 @@ class GrammarProvider:
         return True
 
     @staticmethod
-    def bind(batch):
-        return batch.structured_requests
-
-    @staticmethod
-    def prepare(runner, batch, metadata, binding):
+    def prepare(runner, batch, metadata):
         runner.structured_output.prepare(batch, metadata)
 
     @staticmethod
@@ -276,7 +268,7 @@ class GrammarProvider:
             grammar.release(request_ids)
 
     @staticmethod
-    def apply(step, binding):
+    def apply(step):
         step.grammar = step.runner.structured_output
         if step.source.shape[-1] != step.grammar.vocab_size:
             raise ValueError(
@@ -285,7 +277,7 @@ class GrammarProvider:
         step.prefixes = step.grammar.apply(step.source, step.batch, step.metadata)
 
     @staticmethod
-    def commit(step, tokens, batch, deferred, failure, binding):
+    def commit(step, tokens, batch, deferred, failure):
         if step.prefixes:
             step.grammar.commit(
                 tokens if failure is None else error_tokens(tokens, failure),
@@ -300,7 +292,7 @@ class ChannelProvider:
     commit_order = 0
 
     @staticmethod
-    def hard_requests(binding, batch):
+    def hard_requests(batch):
         # Effective states are resolved from GPU carry during apply.
         return []
 
@@ -313,11 +305,7 @@ class ChannelProvider:
         return metadata is None
 
     @staticmethod
-    def bind(batch):
-        return batch.required_channel
-
-    @staticmethod
-    def prepare(runner, batch, metadata, binding):
+    def prepare(runner, batch, metadata):
         # Channel state is assembled with the batch and carried on the GPU.
         pass
 
@@ -332,7 +320,7 @@ class ChannelProvider:
         pass
 
     @staticmethod
-    def apply(step, binding):
+    def apply(step):
         step.gather()
         preserve = False if step.rule_counts is None else step.rule_counts > 0
         step.channel = apply_required_channel(
@@ -342,7 +330,7 @@ class ChannelProvider:
             step.rule_counts += (step.channel[1] >= 0).to(step.rule_counts.dtype)
 
     @staticmethod
-    def commit(step, tokens, batch, deferred, failure, binding):
+    def commit(step, tokens, batch, deferred, failure):
         if step.channel is not None and deferred:
             from atom.model_ops.triton_required_channel import advance_states
 

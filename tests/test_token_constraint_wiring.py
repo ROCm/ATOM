@@ -65,14 +65,11 @@ class FakeAdapter:
     def masks_source(self, metadata):
         return False
 
-    def bind(self, batch):
-        return self.hard
+    def hard_requests(self, batch):
+        return list(self.hard)
 
-    def hard_requests(self, binding, batch):
-        return list(binding)
-
-    def prepare(self, runner, batch, metadata, binding):
-        self.calls.append(("prepare", runner, batch, metadata, binding))
+    def prepare(self, runner, batch, metadata):
+        self.calls.append(("prepare", runner, batch, metadata))
 
     def errors(self, runner):
         return None
@@ -80,12 +77,12 @@ class FakeAdapter:
     def release(self, runner, request_ids):
         self.calls.append(("release", list(request_ids)))
 
-    def apply(self, step, binding):
+    def apply(self, step):
         self.calls.append(("apply",))
         if self.on_apply is not None:
-            self.on_apply(step, binding)
+            self.on_apply(step)
 
-    def commit(self, step, tokens, batch, deferred, failure, binding):
+    def commit(self, step, tokens, batch, deferred, failure):
         self.calls.append(("commit", failure, deferred))
         return self.commit_result
 
@@ -124,9 +121,7 @@ def test_masks_run_by_stage_and_commits_by_commit_order():
     first = register(FakeAdapter("late_mask", stage=2, order=1))
     second = register(FakeAdapter("early_mask", stage=0, order=9))
     for adapter in (first, second):
-        adapter.on_apply = lambda step, binding, a=adapter: events.append(
-            ("apply", a.backend)
-        )
+        adapter.on_apply = lambda step, a=adapter: events.append(("apply", a.backend))
         adapter.commit = lambda *args, a=adapter: events.append(("commit", a.backend))
     batch = active("late_mask", "early_mask")
     step = boundary.TokenConstraints.apply(None, batch, torch.zeros(2, 4), None)
@@ -161,10 +156,10 @@ def test_grammar_commit_receives_error_sentinels_for_failed_rows():
     step = SimpleNamespace(prefixes={0: object()}, grammar=grammar)
     tokens = torch.tensor([5, 6, 7])
     failure = torch.tensor([False, True, False])
-    boundary.GrammarProvider.commit(step, tokens, "batch", False, failure, None)
+    boundary.GrammarProvider.commit(step, tokens, "batch", False, failure)
     sent = grammar.commit.call_args.args[0]
     assert sent.tolist() == [5, -2, 7]
-    boundary.GrammarProvider.commit(step, tokens, "batch", False, None, None)
+    boundary.GrammarProvider.commit(step, tokens, "batch", False, None)
     assert grammar.commit.call_args.args[0] is tokens
 
 
@@ -172,7 +167,7 @@ def test_grammar_commit_receives_error_sentinels_for_failed_rows():
 
 
 def _blank_rows(rows):
-    def blank(step, binding):
+    def blank(step):
         step.gather()
         step.logits[list(rows)] = -float("inf")
 
@@ -193,7 +188,7 @@ def test_empty_rows_fail_only_with_two_hard_rules():
 def test_speculative_target_rows_follow_their_request_owner():
     # request 0 (1 draft) has one rule, request 1 (2 drafts) has two. Only
     # request 1's target rows may be flagged, in draft-count order.
-    def blank_all(step, binding):
+    def blank_all(step):
         step.gather()
         step.logits[:] = -float("inf")
         step.target[:] = -float("inf")
@@ -279,7 +274,7 @@ def test_target_and_bonus_failures_compose_per_position():
 
 
 def test_bonus_only_adapter_through_the_real_executor():
-    def fail_bonus(step, binding):
+    def fail_bonus(step):
         step.gather()
         step.invalid = torch.tensor([True])
 
@@ -379,7 +374,7 @@ def test_forward_prepares_constraints_after_staging_and_before_the_model_runs():
     assert events == ["staged", "prepare", "run_model"]
     (call,) = adapter.calls
     assert call[:2] == (runner, batch) and call[2] is metadata
-    assert call[3] == []
+    assert len(call) == 3
 
 
 def test_forward_without_constraints_prepares_nothing():
@@ -547,7 +542,7 @@ def _quiet_batch(*backends):
 
 
 def test_failed_rows_are_delivered_as_errors_not_tokens():
-    def fail_row_one(step, binding):
+    def fail_row_one(step):
         step.invalid = torch.tensor([False, True])
 
     register(FakeAdapter("c", hard=[0, 1], on_apply=fail_row_one))
@@ -668,7 +663,7 @@ def _rapid_batch(*backends):
 
 
 def test_rapidserve_prefill_applies_registered_masks_before_sampling(monkeypatch):
-    def forbid_top(step, binding):
+    def forbid_top(step):
         step.gather()
         step.logits[:, 3] = -float("inf")
 
@@ -766,7 +761,7 @@ def test_ragged_failures_stay_on_their_own_request():
 def test_postprocess_commits_with_the_failure_and_forwards_gpu_carry(deferred):
     carry = torch.tensor([3, 4])
 
-    def fail_row_one(step, binding):
+    def fail_row_one(step):
         step.invalid = torch.tensor([False, True])
 
     adapter = register(FakeAdapter("c", hard=[0, 1], on_apply=fail_row_one))
@@ -811,7 +806,7 @@ def test_grammar_apply_requires_the_logits_vocabulary():
         metadata=None,
     )
     with pytest.raises(ValueError, match="do not match the prepared"):
-        boundary.GrammarProvider.apply(step, None)
+        boundary.GrammarProvider.apply(step)
 
 
 def _core_manager(prepare=None):
