@@ -33,6 +33,8 @@ from triton.experimental.gluon import language as gl
 
 from atom.model_ops.qwen4_exp.ops.qsa_split_k import reduce_split_k, split_k_buffers
 
+_BLOCK_H = 16
+
 
 @gluon.jit
 def _qsa_tile_rows(
@@ -407,7 +409,7 @@ def qsa_gfx1250_supports(q, k_cache, v_cache, k_scale=None, v_scale=None) -> boo
     tokens, q_heads, head_dim = q.shape
     pages, page_size, kv_heads, _ = k_cache.shape
     group_size = q_heads // kv_heads
-    if head_dim not in (64, 128, 256) or group_size > 16 or q.stride(2) != 1:
+    if head_dim not in (64, 128, 256) or group_size > _BLOCK_H or q.stride(2) != 1:
         return False
     strides = k_cache.stride()
     if v_cache.stride() != strides:
@@ -510,7 +512,7 @@ def qsa_sparse_paged_gqa_gfx1250(
         NUM_KV_HEADS=kv_heads,
         GROUP_SIZE=group_size,
         HEAD_DIM=head_dim,
-        BLOCK_H=16,
+        BLOCK_H=_BLOCK_H,
         BLOCK_K=block_k,
         KV_SPLITS=kv_splits,
         NUM_STAGES=num_stages,

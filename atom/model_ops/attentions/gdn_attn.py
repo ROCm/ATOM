@@ -648,7 +648,6 @@ class GDNStateMixin(PoolRowsMixin):
         """
         if not envs.ATOM_GDN_STATE_MIDSTEP:
             return StateTransfer.fork(1, readable_midstep=False)
-        from atom.model_ops.fla_ops.chunk import CHUNK_SIZE
 
         return StateTransfer.fork(
             1,
