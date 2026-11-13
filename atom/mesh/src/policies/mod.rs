@@ -9,6 +9,7 @@ use async_trait::async_trait;
 
 use crate::core::{HashRing, Worker};
 
+pub mod agentic;
 mod cache_aware;
 mod dp_sticky;
 mod factory;
