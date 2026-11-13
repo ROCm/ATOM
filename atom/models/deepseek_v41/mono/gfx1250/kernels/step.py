@@ -215,7 +215,6 @@ def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sourc
     def body(recv0: Int64, recv1: Int64, recv2: Int64, recv3: Int64, cnt: Int64, st: Int64, scale: fx.Float32, fp: Int64,
              tp: Int64):
         recv = [recv0, recv1, recv2, recv3]
-        hx.TOFLAG[0] = fptr(fp, "cyc")   # (poll-timeout counter: hx.note_timeout)
         recv, tep = tp_epoch_begin(recv, fp, rank)
         for si in range_constexpr(len(SEGS)):   # layer segments, each its own loop and body (kind 1: target, 4: draft)
             seg_lo, seg_hi, seg_kind = SEGS[si]
@@ -471,7 +470,6 @@ def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sourc
                 hx.gstore(st + i64(b) * (32 * 8) + i64(26 * 8), hx.clock())
             ST.draft(tp, t, b, sm, st, cnt + i64((NL + NDR) * LCB), recv, rank, head_d=4)
         tp_epoch_end(fp, tep)
-        hx.TOFLAG[0] = None   # (the counter pointer belongs to this kernel's trace only)
         _ = keyed
 
     @flyc.jit

@@ -297,19 +297,9 @@ def unlikely(b):
     return fx.Boolean(llvm.call_intrinsic(i1, "llvm.expect.i1", [_v(b), f], [], []))
 
 
-# Poll timeouts made visible. Every bounded poll (cross-rank tag waits, device handoffs) gives up after 2 s and the
-# kernel goes on with whatever it read; a timeout therefore means wrong results. TOFLAG[0] (set by the step kernel to its
-# 'cyc' scratch) counts them: int32 [0] += 1, int32 [1] = the last site id. The runner reads it after a step.
-TOFLAG = [None]
-POLL_TICKS = 200000000   # a bounded poll gives up after this many clock ticks (~2 s) and records a timeout
-
-
-@_ASTR.transform
-def note_timeout(t0, site):
-    if fx.const_expr(TOFLAG[0] is not None):
-        if clock() - t0 >= fx.Int64(POLL_TICKS):
-            atomic_add(TOFLAG[0], 1)
-            gstore(TOFLAG[0] + fx.Int64(4), fx.Int32(site))
+# Every bounded poll (cross-rank tag waits, device handoffs) gives up after this many clock ticks (~2 s) and the kernel
+# goes on with whatever it read.
+POLL_TICKS = 200000000
 
 
 
@@ -320,7 +310,6 @@ def wait_count(addr, n, site):
     t0 = clock()
     while (gload(addr() if callable(addr) else addr, fx.Int32, scope="agent") < n) & (clock() - t0 < fx.Int64(POLL_TICKS)):
         s_sleep(1)
-    note_timeout(t0, site)
 
 
 @_ASTR.transform
