@@ -1004,3 +1004,64 @@ def test_mxfp4_apply_refuses_a_shared_output_without_a_combine(
             shared_add=torch.randn_like(hidden_states),
             shared_ready=MagicMock(),
         )
+
+
+def _mxfp4_method_with_recording_experts(atom_modules):
+    """An ``Mxfp4MoEMethod`` on the modular-kernel path (no Triton experts),
+    whose ``fused_experts`` records what ``apply`` hands it."""
+    method = object.__new__(atom_modules.moe.Mxfp4MoEMethod)
+    values = {
+        "use_triton": False,
+        "use_triton_decode": False,
+        "use_triton_ep": False,
+        "is_guinterleave": False,
+        "fp8_activations": False,
+        "quant_type": object(),
+        "hidden_pad": 0,
+        "intermediate_pad": 0,
+        "fused_experts": MagicMock(return_value=torch.randn(4, 8)),
+    }
+    for name, value in values.items():
+        setattr(method, name, value)
+    layer = SimpleNamespace(
+        w13_weight=torch.empty(2, 16, 8),
+        w2_weight=torch.empty(2, 8, 8),
+        w13_weight_scale=None,
+        w2_weight_scale=None,
+        w13_bias=None,
+        w2_bias=None,
+        expert_mask=None,
+    )
+    return method, layer
+
+
+@pytest.mark.parametrize("with_shared", [True, False], ids=["shared", "plain"])
+def test_mxfp4_apply_hands_the_shared_output_to_fused_experts(
+    atom_modules, with_shared
+):
+    """The last hop: ``Mxfp4MoEMethod.apply`` passes the shared output and
+    its event on to the modular kernel (``fused_experts``), whose combine adds
+    it; without one, ``fused_experts`` is called without them."""
+    method, layer = _mxfp4_method_with_recording_experts(atom_modules)
+    hidden_states = torch.randn(4, 8)
+    shared = torch.randn_like(hidden_states) if with_shared else None
+    ready = MagicMock(name="shared_ready") if with_shared else None
+
+    output = method.apply(
+        layer=layer,
+        x=hidden_states,
+        topk_weights=torch.rand(4, 2),
+        topk_ids=torch.zeros(4, 2, dtype=torch.int32),
+        shared_add=shared,
+        shared_ready=ready,
+    )
+
+    method.fused_experts.assert_called_once()
+    assert output is method.fused_experts.return_value
+    passed = method.fused_experts.call_args.kwargs
+    assert passed["hidden_states"] is hidden_states
+    if with_shared:
+        assert passed["shared_add"] is shared
+        assert passed["shared_ready"] is ready
+    else:
+        assert "shared_add" not in passed and "shared_ready" not in passed
