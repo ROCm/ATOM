@@ -928,6 +928,47 @@ def test_project_merge_out_head_major_matches_the_packed_one(
         assert torch.equal(want, got)
 
 
+@needs_gpu
+def test_fp8_head_major_a2a_stays_within_e4m3_rounding_of_bf16(monkeypatch):
+    """The FP8 payload against the bf16 one at sparse prefill's DCP8 shape,
+    a dummy-backed empty row and a row empty on every rank included.
+
+    e4m3 moves a value by at most 2**-4 of it, or 2**-10 of its row's scale
+    below the normal range. The merge is a convex sum over ranks, and both
+    outputs round to bf16 (2**-9 each); 1% covers the cross terms.
+    """
+    b, h, d, n_ranks = 64, 96, 128, 8
+    g = torch.Generator(device=DEV).manual_seed(13)
+    o = [
+        torch.randn(b, h, d, generator=g, device=DEV).bfloat16() for _ in range(n_ranks)
+    ]
+    lse = [torch.randn(b, h, generator=g, device=DEV) * 3 for _ in range(n_ranks)]
+    counts = [torch.ones(b, dtype=torch.int32, device=DEV) for _ in range(n_ranks)]
+    o[0][1] = float("nan")
+    counts[0][1] = 0
+    for r in range(n_ranks):
+        counts[r][2] = 0
+    ref, got = (
+        torch.cat(
+            _cp_lse_a2a_on_every_rank(
+                monkeypatch, o, lse, counts, head_major=True, payload_dtype=payload
+            ),
+            dim=1,
+        ).float()
+        for payload in (None, dtypes.fp8)
+    )
+
+    empty = torch.stack(counts)[:, :, None] == 0
+    w = torch.softmax(torch.stack(lse).masked_fill(empty, NEG_INF), dim=0)
+    w = w.nan_to_num(0.0)[..., None]
+    x = torch.stack(o).float().masked_fill(empty[..., None], 0.0)
+    scale = x.abs().amax(-1, keepdim=True) / torch.finfo(dtypes.fp8).max
+    bound = (w * (x.abs() * 2.0**-4 + scale * 2.0**-10)).sum(0) + ref.abs() * 2.0**-8
+    assert torch.isfinite(got).all() and torch.all(got[2] == 0)
+    assert torch.all((got - ref).abs() <= bound * 1.01)
+    assert not torch.equal(got, ref)
+
+
 @needs_dcp_ops
 def test_lse_pack_slots_covers_the_transfer_dtypes():
     """fp32 needs one slot, 16-bit dtypes need two; anything else must raise

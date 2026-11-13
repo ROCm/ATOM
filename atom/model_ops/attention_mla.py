@@ -1338,7 +1338,14 @@ class MLAAttention(nn.Module):
         return self._qrep_local_proj
 
     def _dcp_merge(
-        self, o, lse, ctx=None, owned_counts=None, quant_dtype=None, head_major=False
+        self,
+        o,
+        lse,
+        ctx=None,
+        owned_counts=None,
+        quant_dtype=None,
+        head_major=False,
+        payload_dtype=None,
     ):
         """Bind this layer's DCP group and backend to ``dcp_ops.dcp_lse_merge``."""
         from atom.model_ops.dcp_ops import dcp_lse_merge
@@ -1352,6 +1359,7 @@ class MLAAttention(nn.Module):
             owned_counts=owned_counts,
             quant_dtype=quant_dtype,
             head_major=head_major,
+            payload_dtype=payload_dtype,
         )
 
     def _dcp_fused_quant_dtype(self):
@@ -1429,6 +1437,9 @@ class MLAAttention(nn.Module):
                 owned_counts=owned_counts,
                 quant_dtype=fused_quant,
                 head_major=head_major,
+                payload_dtype=(
+                    dtypes.fp8 if head_major and envs.ATOM_DCP_PREFILL_A2A_FP8 else None
+                ),
             )
         if fused_quant is not None:
             o, o_scale = o
