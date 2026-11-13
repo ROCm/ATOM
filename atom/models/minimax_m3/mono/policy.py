@@ -20,6 +20,10 @@ A width the table does not name is production.
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
+from atom.models.minimax_m3.mono.config import CP_MAX_Q
+
 MONO, HYBRID, PRODUCTION = "mono", "hybrid", "production"
 KINDS = (MONO, HYBRID, PRODUCTION)
 SMALL_MAX_ROWS = 16  # the n <= 16 kernels' MFMA B operand
@@ -111,3 +115,65 @@ class WidthPolicy:
         return ", ".join(
             f"{lo}-{hi}:{k}" if hi != lo else f"{lo}:{k}" for lo, hi, k in runs
         )
+
+
+# Indexer context parallelism in the wide builds (``ATOM_M3_INDEXER_CP``, the model-wide switch of ATOM's
+# own CP: the index q projection is then full width on every rank). The kernel decides per step from the
+# contexts (``index_score.cp_gate``): a long request (> LONG_FROM_BLOCKS blocks) of a graph whose batch is
+# at least ``min_batch`` requests and whose long requests together hold at least ``min_blocks`` blocks.
+# min_batch: ATOM's ``ATOM_M3_INDEXER_CP_MIN_BATCH`` (rows // max_query_len; 16 for NVFP4 / FP4 index caches,
+# 1 for the others). min_blocks: ATOM's measurements (task-atom-nvfp4-cp, TP4 nvfp4, uniform context, TPOT
+# CP on vs off: 16 requests 8K/32K/131K +6.0 / +3.5 / -1.8 %, 32 requests +3.3 / -0.2 / -6.4 %) put the break-even
+# at ~8-16K blocks summed over the requests (32 x 32K = 8K blocks: even; 16 x 128K = 16K blocks: -1.8 %);
+# the default is the cautious end; the mono measurements replace it.
+DEFAULT_CP_MIN_BLOCKS = 16_384
+NVFP4_CP_MIN_BATCH = 16
+
+
+class IndexerCp(NamedTuple):
+    """The CP arm of the wide builds: ``enabled`` (the model's full-width index q: ATOM_M3_INDEXER_CP), the
+    graph's ``min_batch`` and the step's ``min_blocks``; plain Python."""
+
+    enabled: bool = False
+    min_batch: int = 1
+    min_blocks: int = DEFAULT_CP_MIN_BLOCKS
+
+    @staticmethod
+    def parse(
+        enabled: bool,
+        nvfp4: bool,
+        min_batch: int | None = None,
+        min_blocks: str | int | None = None,
+    ) -> IndexerCp:
+        batch = (
+            min_batch if min_batch is not None else (NVFP4_CP_MIN_BATCH if nvfp4 else 1)
+        )
+        blocks = DEFAULT_CP_MIN_BLOCKS if min_blocks in (None, "") else int(min_blocks)
+        if batch < 1 or blocks < 0:
+            raise ValueError(
+                f"indexer CP: min batch {batch} (>= 1), min blocks {blocks} (>= 0)"
+            )
+        return IndexerCp(bool(enabled), batch, blocks)
+
+    def options(self, n: int) -> dict:
+        """The wide n-row build's options: CP in it, or nothing (the build of today). A graph of n rows holds
+        at most n requests: below ``min_batch`` rows CP can never run, so the build has none of it.
+        """
+        if not self.enabled or n <= SMALL_MAX_ROWS or n < self.min_batch:
+            return {}
+        return {
+            "index_cp": True,
+            "cp_min_batch": self.min_batch,
+            "cp_min_blocks": self.min_blocks,
+        }
+
+    def refuses(self, n: int, q_len: int) -> str | None:
+        """Why a wide decode step of n rows of ``q_len`` rows a request cannot run in a CP build, or None:
+        said, and the step takes the original path (whose CP arm serves it), never run without CP.
+        """
+        if self.options(n) and q_len > CP_MAX_Q:
+            return (
+                f"indexer CP (ATOM_M3_INDEXER_CP): {q_len} query rows a request, the wide builds'"
+                f" CP scorer takes at most {CP_MAX_Q}"
+            )
+        return None

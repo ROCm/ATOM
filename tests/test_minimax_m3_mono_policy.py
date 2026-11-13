@@ -5,9 +5,11 @@
 import pytest
 
 from atom.models.minimax_m3.mono.policy import (
+    DEFAULT_CP_MIN_BLOCKS,
     HYBRID,
     MONO,
     PRODUCTION,
+    IndexerCp,
     WidthPolicy,
     parse_spec,
 )
@@ -80,3 +82,40 @@ def test_describe_runs():
         "1-16:mono, 17-31:production, 32:mono, 33-47:production, 48:mono, 49-63:production, 64:mono, 65-up:production"
     )
     assert WidthPolicy().describe() == "1-16:mono, 17-64:production, 65-up:production"
+
+
+def test_indexer_cp_is_off_without_the_flag_and_changes_no_build():
+    for cp in (IndexerCp(), IndexerCp.parse(False, True), IndexerCp.parse(False, False, 4, 100)):
+        assert all(cp.options(n) == {} for n in (1, 16, 32, 48, 64))
+        assert cp.refuses(64, 16) is None
+
+
+def test_indexer_cp_defaults_follow_atoms_batch_threshold_by_index_cache():
+    nv, other = IndexerCp.parse(True, True), IndexerCp.parse(True, False)
+    assert nv.min_batch == 16 and other.min_batch == 1  # ATOM_M3_INDEXER_CP_MIN_BATCH unset
+    assert nv.min_blocks == other.min_blocks == DEFAULT_CP_MIN_BLOCKS
+    assert IndexerCp.parse(True, True, 4, "7000") == IndexerCp(True, 4, 7000)
+    assert IndexerCp.parse(True, True, None, "0").min_blocks == 0  # every long request
+
+
+def test_indexer_cp_options_are_for_the_wide_builds_a_graph_can_fill():
+    cp = IndexerCp.parse(True, True)
+    assert cp.options(32) == {"index_cp": True, "cp_min_batch": 16, "cp_min_blocks": DEFAULT_CP_MIN_BLOCKS}
+    assert cp.options(16) == cp.options(1) == {}  # the n <= 16 builds keep ATOM_M3_INDEXER_CP's CP as it was
+    # n rows are at most n requests: below the batch gate CP can never run, the width has no CP in it
+    assert IndexerCp.parse(True, True, 48, 0).options(32) == {}
+    assert IndexerCp.parse(True, True, 48, 0).options(48)["cp_min_batch"] == 48
+
+
+def test_indexer_cp_refuses_a_wide_step_its_scorer_cannot_serve_naming_why():
+    cp = IndexerCp.parse(True, True)
+    assert cp.refuses(64, 4) is None and cp.refuses(64, 8) is None
+    assert "query rows" in cp.refuses(64, 16)
+    assert cp.refuses(16, 16) is None  # not a wide build: no CP there
+    assert IndexerCp.parse(True, True, 64, 0).refuses(32, 16) is None  # a width with no CP in it
+
+
+@pytest.mark.parametrize("batch,blocks", [(0, None), (4, "-1"), (4, "lots")])
+def test_bad_indexer_cp_thresholds_are_refused(batch, blocks):
+    with pytest.raises(ValueError):
+        IndexerCp.parse(True, True, batch, blocks)

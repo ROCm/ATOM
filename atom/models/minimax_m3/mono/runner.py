@@ -72,6 +72,7 @@ from atom.models.minimax_m3.mono.kernels.pre_attn import (
 )
 from atom.models.minimax_m3.mono.layout import SCRATCH, diag_region_names, sym_layout
 from atom.models.minimax_m3.mono.layout import SCRATCH_BYTES as K4_SCRATCH_BYTES
+from atom.models.minimax_m3.mono.policy import IndexerCp
 from atom.models.minimax_m3.mono.weights import DenseLayer, SparseMoeLayer
 from atom.mono.plan.execution import BLOCKS
 from atom.mono.runtime.aux_taps import bind_aux_taps
@@ -153,7 +154,10 @@ class MonoDecodeRunner:
     shard, then all agree (``consensus.bind_agreed``) before the peer handshake, so a rank that
     refuses turns mono off on every rank instead of leaving the others waiting."""
 
-    def __init__(self, causal_lm, drafter=None, require_aux: bool = False) -> None:
+    def __init__(
+        self, causal_lm, drafter=None, require_aux: bool = False, cp: IndexerCp | None = None
+    ) -> None:
+        self.cp = cp or IndexerCp()  # the CP arm of the wide builds (policy.py)
         group = get_tp_group().cpu_group
         bind_agreed(lambda: self._bind(causal_lm, drafter, require_aux), group)
         self._allocate(group)
