@@ -34,6 +34,8 @@ Four deliberate divergences from that reference:
 
 from __future__ import annotations
 
+import weakref
+
 import torch
 
 from atom.utils.custom_register import direct_register_custom_op
@@ -217,28 +219,66 @@ def _pick_attn_res_config(tokens: int):
     return _ATTN_RES_CATCHALL
 
 
-# The zero addends the last row-sharded MoE layer handed back.
-_folded_zeros: list[torch.Tensor] = []
+# The zero addends row-sharded MoE layers handed back, by weak reference.
+_folded_zeros: list[weakref.ref] = []
 
 
-def folded_zeros_like(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Two fresh zero ``x``s, which ``apply_attn_res`` adds without loading.
+def folded_zero_like(x: torch.Tensor) -> torch.Tensor:
+    """A fresh ``x`` that stands for zero but is never written:
+    ``apply_attn_res`` adds it without loading, and a consumer that adds it
+    in torch zeroes it first (``materialize_folded_zeros``).
 
     Fresh, not cached: Inductor may write a later kernel into a custom op's
     output once that output is dead. Held here until an ``apply_attn_res``
-    takes them or the next call replaces them, so no other tensor can be
-    allocated at their addresses meanwhile."""
-    _folded_zeros[:] = (torch.zeros_like(x), torch.zeros_like(x))
-    return _folded_zeros[0], _folded_zeros[1]
+    takes it or it dies, so no other tensor is mistaken for it."""
+    zero = torch.empty_like(x)
+    _folded_zeros.append(weakref.ref(zero))
+    return zero
+
+
+def _is_folded_zero(t: torch.Tensor) -> bool:
+    return any(
+        (z := r()) is not None and z.data_ptr() == t.data_ptr() for r in _folded_zeros
+    )
 
 
 def _take_folded_zero(t: torch.Tensor) -> bool:
-    """Whether ``t`` is a held folded zero; a match releases it."""
-    for i, zero in enumerate(_folded_zeros):
-        if zero.data_ptr() == t.data_ptr():
-            del _folded_zeros[i]
-            return True
-    return False
+    """Whether ``t`` is a held folded zero; a match releases it, and dead
+    entries go with it."""
+    held = _is_folded_zero(t)
+    _folded_zeros[:] = [
+        r
+        for r in _folded_zeros
+        if (z := r()) is not None and z.data_ptr() != t.data_ptr()
+    ]
+    return held
+
+
+def _materialize_folded_zeros_op(
+    add_hidden: torch.Tensor | None, add_hidden2: torch.Tensor | None = None
+) -> None:
+    for add in (add_hidden, add_hidden2):
+        if add is not None and _is_folded_zero(add):
+            add.zero_()
+
+
+direct_register_custom_op(
+    op_name="kimi_k3_materialize_folded_zeros",
+    op_func=_materialize_folded_zeros_op,
+    mutates_args=["add_hidden", "add_hidden2"],
+    fake_impl=lambda add_hidden, add_hidden2=None: None,
+    # plain torch: the layer's aux reconstruction also runs on CPU tensors
+    dispatch_key="CompositeExplicitAutograd",
+)
+
+
+def materialize_folded_zeros(
+    add_hidden: torch.Tensor | None, add_hidden2: torch.Tensor | None = None
+) -> None:
+    """Zero whichever addends are folded zeros, for a consumer that adds them
+    in torch. Opaque, so the check runs at run time; the write orders it
+    before every later reader, ``apply_attn_res`` included."""
+    torch.ops.aiter.kimi_k3_materialize_folded_zeros(add_hidden, add_hidden2)
 
 
 def _apply_attn_res_impl(

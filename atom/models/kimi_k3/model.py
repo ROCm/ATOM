@@ -519,9 +519,11 @@ class KimiSparseMoeBlock(nn.Module):
 
         When ``shared`` is a tensor the two branches are left unsummed and
         ``first`` is the routed branch alone (on the row-sharded tail, the sum,
-        with ``shared`` zero): the caller's next apply_attn_res
-        folds both into its prefix on-load, so deferring the add removes a whole
-        [T, H] elementwise kernel and its HBM round-trip per MoE layer.
+        with ``shared`` a folded zero: unwritten, so a caller that adds it in
+        torch zeroes it first through ``materialize_folded_zeros``): the
+        caller's next apply_attn_res folds both into its prefix on-load, so
+        deferring the add removes a whole [T, H] elementwise kernel and its HBM
+        round-trip per MoE layer.
 
         When ``shared`` is None, ``first`` is the module's *complete* output --
         either because there are no shared experts, or because the two branches
@@ -618,16 +620,16 @@ class KimiSparseMoeBlock(nn.Module):
     def _row_sharded_split_moe_forward(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """`row_sharded_moe` over this step's rows. The second return is zeros:
-        the op's schema has no optional tensor."""
+        """`row_sharded_moe` over this step's rows. The second return is a
+        folded zero: the op's schema has no optional tensor."""
+        from atom.model_ops.kimi_k3.attention_residual import folded_zero_like
         from atom.models.qwen4_exp import _SequenceParallel
 
         rows = _SequenceParallel(
             hidden_states.shape[0], self.tp_size, get_tensor_model_parallel_rank()
         )
         output = self.row_sharded_moe(hidden_states, rows)
-        # Fresh, not cached: Inductor may write a later kernel into this output.
-        return output, torch.zeros_like(output)
+        return output, folded_zero_like(output)
 
     def row_sharded_moe(
         self,
@@ -1877,13 +1879,13 @@ class KimiDecoderLayer(nn.Module):
         reduce-scatter and mlp_attn_res runs on those rows; its normed output
         is all-gathered for the MoE, whose tail adds the prefix rows before
         its gather. The layer's output is then the whole residual, and its two
-        addends are zeros that `apply_attn_res` skips loading.
+        addends are folded zeros, left unwritten.
         """
         moe = self.block_sparse_moe
         if not moe.takes_row_tail(attn_partial.shape[0]):
             attn_out = tensor_model_parallel_all_reduce(attn_partial)
             return self._mlp(attn_out, prefix_sum, block_residual)
-        from atom.model_ops.kimi_k3.attention_residual import folded_zeros_like
+        from atom.model_ops.kimi_k3.attention_residual import folded_zero_like
         from atom.models.qwen4_exp import _SequenceParallel
 
         rows = _SequenceParallel(
@@ -1896,7 +1898,7 @@ class KimiDecoderLayer(nn.Module):
             rows.scatter(attn_partial),
         )
         residual = moe.row_sharded_moe(rows.gather(hidden_rows), rows, prefix_rows)
-        return residual, *folded_zeros_like(residual)
+        return residual, folded_zero_like(residual), folded_zero_like(residual)
 
     def forward(
         self,
@@ -1946,15 +1948,19 @@ class KimiDecoderLayer(nn.Module):
         NEXT layer's attn_res kernel can fold it into its on-load, and an MoE
         layer defers its routed and shared outputs separately so that same fold
         absorbs their sum too. So add the pendings back here. Each is None on
-        the layers that already folded it in.
+        the layers that already folded it in, and an unwritten folded zero on
+        a row-sharded step.
 
         This lives on the layer rather than in the drafter because it is a
         property of THIS layer's return protocol -- it has to change in lockstep
         with forward().
         """
+        from atom.model_ops.kimi_k3.attention_residual import materialize_folded_zeros
+
         prefix_sum, *pendings, _block_residual = output
         if prefix_sum is None:
             return None
+        materialize_folded_zeros(*pendings)
         for pending in pendings:
             if pending is not None:
                 prefix_sum = prefix_sum + pending
@@ -2135,10 +2141,9 @@ class KimiLinearModel(nn.Module):
             )
 
         if not get_pp_group().is_last_rank:
-            if pending_add is not None:
-                hidden_states = hidden_states + pending_add
-            if pending_add2 is not None:
-                hidden_states = hidden_states + pending_add2
+            hidden_states = KimiDecoderLayer.aux_hidden_state(
+                (hidden_states, pending_add, pending_add2, block_residual)
+            )
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "block_residual": block_residual}
             )
