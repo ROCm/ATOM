@@ -36,7 +36,9 @@ def test_hybrid_entries_need_the_switch_and_the_build_reach():
 
 
 def test_spec_overrides_and_later_items_win():
-    p = WidthPolicy(hybrid=True, spec="40-48:production,16:production,8:mono")
+    p = WidthPolicy(
+        hybrid=True, spec="17-64:hybrid,40-48:production,16:production,8:mono"
+    )
     assert p.kind(40) == p.kind(48) == PRODUCTION
     assert p.kind(39) == HYBRID and p.kind(49) == HYBRID
     assert p.kind(16) == PRODUCTION and p.kind(8) == MONO
