@@ -1977,6 +1977,12 @@ def resolve_draft_kv_dtype(target_dtype: str, *, own_pool: bool) -> str:
     return "bf16" if own_pool and target_dtype in FP4_CACHE_DTYPES else target_dtype
 
 
+# Below this context no decode batch up to 32 repaid the CP exchange (task-index-sh
+# cp_total_report, FlyDSL NVFP4 scorer); only a warning, since requests are not all
+# max_model_len long.
+INDEXER_CP_MIN_MODEL_LEN = 65536
+
+
 def indexer_cp_unsupported_reason(
     arches,
     tp_size: int,
@@ -1985,7 +1991,6 @@ def indexer_cp_unsupported_reason(
     dcp_size: int,
     enable_tbo: bool,
     plugin_mode: bool = False,
-    mxfp4_caches: bool = False,
 ) -> str | None:
     """Why MiniMax-M3 indexer-only context parallelism cannot run here, or None.
 
@@ -2013,8 +2018,6 @@ def indexer_cp_unsupported_reason(
         # error. ``indexer_cp_enabled`` refuses them at runtime; this clears the
         # flag so nothing downstream (log line, compile hash) disagrees.
         return "plugin mode (the vLLM/SGLang bridges keep the TP indexer path)"
-    if mxfp4_caches:
-        return "the MXFP4 caches are not wired to the CP scorer"
     if dcp_size > 1:
         return (
             "decode_context_parallel_size > 1 (KV-cache DCP owns the context "
@@ -2934,7 +2937,6 @@ class Config:
                 self.decode_context_parallel_size,
                 self.enable_tbo or self.enable_tbo_decode,
                 is_plugin_mode(),
-                bool({"fp4", "nvfp4"} & {self.index_cache_dtype, self.kv_cache_dtype}),
             )
             if indexer_cp_off is not None:
                 logger.warning(
@@ -2952,6 +2954,14 @@ class Config:
                     getattr(text_cfg, "num_key_value_heads", 0),
                     self.tensor_parallel_size,
                 )
+                if self.max_model_len < INDEXER_CP_MIN_MODEL_LEN:
+                    logger.warning(
+                        "dcp_config.indexer_dcp_only with max_model_len %d: indexer "
+                        "CP did not beat the TP path below ~%d tokens of context in "
+                        "the FP4 scorer's measurements.",
+                        self.max_model_len,
+                        INDEXER_CP_MIN_MODEL_LEN,
+                    )
 
         # Keep ``None`` intact until the model architecture is known so an
         # omitted index-cache option remains distinguishable from an explicit

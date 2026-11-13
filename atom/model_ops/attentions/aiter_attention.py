@@ -11,6 +11,12 @@ import triton
 import triton.language as tl
 
 from atom.config import _is_minimax_m3_config
+from atom.distributed.indexer_cp import (
+    get_indexer_cp_rank,
+    get_indexer_cp_world_size,
+    indexer_cp_enabled,
+    indexer_cp_min_batch,
+)
 from atom.distributed.ulysses_sp import local_num_kv_heads
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mha import PagedAttentionImpl, use_pa_decode_bf16_asm
@@ -290,6 +296,8 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 num_head_k * self.max_bs * max_qlen,
                 **i32_kwargs,
             )
+        # indexer-only CP: this rank's shard of the context (`indexer_cp.py`)
+        cp = indexer_cp_enabled()
         self._index_scorers = (
             allocate_index_scorers(
                 self.model_runner.config,
@@ -297,6 +305,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 max_bs=self.max_bs,
                 max_qlen=max_qlen,
                 num_idx_heads=self._num_idx_heads,
+                cp_world=get_indexer_cp_world_size() if cp else 1,
+                cp_rank=get_indexer_cp_rank() if cp else 0,
+                cp_min_batch=indexer_cp_min_batch() if cp else 1,
             )
             if self._has_sparse_attention
             else {}

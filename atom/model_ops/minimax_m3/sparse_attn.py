@@ -182,15 +182,27 @@ def make_sparse_decode_metadata(
     batch = seq_lens.shape[0]
     step_scorer = None
     if index_scorer is not None and batch > 0:
+        # the arm this step's layers run (`SparseMHAPagedAttentionImpl._sparse_decode`
+        # asks `indexer_cp_min_batch` the same question): the CP one scores every index
+        # head over this rank's blocks, the other its own head over all of them
+        cp = index_scorer.cp_decode(batch)
+        width = index_scorer.cp_max_block if cp else index_scorer.max_block
         step_scorer = replace(
             index_scorer,
             work_map=flydsl_ops().minimax_m3_index_score_work_map(
                 seq_lens,
-                index_scorer.max_block,
+                width,
                 max_query_len,
-                num_idx_heads,
+                index_scorer.cp_world if cp else num_idx_heads,
                 out=index_scorer.work_map,
+                **(
+                    {"cp_world": index_scorer.cp_world, "cp_rank": index_scorer.cp_rank}
+                    if cp
+                    else {}
+                ),
             ),
+            max_block=width,
+            cp_world=index_scorer.cp_world if cp else 1,
         )
     return MiniMaxM3SparseMetadata(
         seq_lens=seq_lens,

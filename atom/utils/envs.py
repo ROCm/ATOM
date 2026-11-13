@@ -596,6 +596,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # occupancy in the block scorer, winning above ~1M batch*context tokens and
     # losing below. Unset leaves the config field alone.
     "ATOM_M3_INDEXER_CP": lambda: os.getenv("ATOM_M3_INDEXER_CP"),
+    # Smallest decode batch (requests) that takes the indexer-CP arm; a smaller
+    # one scores on the TP path. Unset: 16 for an FP4/NVFP4 index cache (the CP
+    # exchange costs ~9-10us a layer, which the 1/P scoring only repays from 16
+    # requests), 1 for the other index caches.
+    "ATOM_M3_INDEXER_CP_MIN_BATCH": lambda: (
+        int(os.environ["ATOM_M3_INDEXER_CP_MIN_BATCH"])
+        if "ATOM_M3_INDEXER_CP_MIN_BATCH" in os.environ
+        else None
+    ),
     # Fused decode for measured model/deployment/step geometries. Unsupported
     # configurations and forwards keep the production path. 0 disables it.
     "ATOM_MONO_ENABLE": lambda: os.getenv("ATOM_MONO_ENABLE", "1") == "1",

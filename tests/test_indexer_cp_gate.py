@@ -20,6 +20,8 @@ assumed width reads 4x the rows it should. SGLang is exactly that bridge today,
 which is why it must keep answering False.
 """
 
+import inspect
+
 import pytest
 import torch
 
@@ -87,10 +89,12 @@ def test_topology_gate_reasons_are_human_readable():
     )
 
 
-def test_topology_gate_refuses_mxfp4_caches():
+def test_topology_gate_has_no_cache_dtype_term():
+    """The FP4 / NVFP4 index caches score through aiter's CP-aware FlyDSL scorer, so the
+    gate is topology alone: no parameter to refuse a cache dtype with."""
     assert indexer_cp_unsupported_reason(M3, 4, 4, 128, 1, False) is None
-    reason = indexer_cp_unsupported_reason(M3, 4, 4, 128, 1, False, mxfp4_caches=True)
-    assert reason is not None and "MXFP4" in reason
+    params = inspect.signature(indexer_cp_unsupported_reason).parameters
+    assert not [p for p in params if "cache" in p or "fp4" in p]
 
 
 # ───────────────────────────────────────────────────── compilation key ──
