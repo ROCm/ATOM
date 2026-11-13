@@ -1096,7 +1096,7 @@ def test_pp_stages_split_the_state_budget_by_image(monkeypatch):
     monkeypatch.setenv("OFFLOAD_STATE_CPU_SIZE", "1")
     spec = PagedStateCheckpointSpec(
         1 << 19, 3 << 19, "cap-test", image_bytes=1 << 20
-    ).for_pipeline("pp2-joint:cap-test", 4, 3 << 20, 2 << 20)
+    ).for_pipeline("pp2-joint:cap-test", 4, 3 << 20)
     cfg = MockConfig(
         enable_prefix_caching=True,
         kv_transfer_config=_OFFLOAD_KVC,
