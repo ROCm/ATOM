@@ -651,6 +651,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DSV41_A8W4_ATTN": lambda: os.getenv("ATOM_DSV41_A8W4_ATTN", "auto")
     .strip()
     .lower(),
+    # Plugin host kill switch (atom/plugin_host.py): "0" serves every seam
+    # natively and passes AITER an empty enable list. It cannot enable a plugin;
+    # only --plugin-recipe / --plugin-enable do.
+    "ATOM_PLUGIN_HOST": lambda: os.getenv("ATOM_PLUGIN_HOST", "1") != "0",
+    # "1": ask every owner of a seam and raise when two accept one call (their
+    # cells overlap). Off by default; like the switch above it enables nothing.
+    "ATOM_PLUGIN_HOST_STRICT": lambda: os.getenv("ATOM_PLUGIN_HOST_STRICT", "0") == "1",
     # DeepSeek-V4.1 mono decode's high-interactivity (hi) monokernels (the
     # `mono/hi` package, imported only with this on): on the decode steps it
     # serves, every decoder layer, the verify head, the DSpark draft and the
