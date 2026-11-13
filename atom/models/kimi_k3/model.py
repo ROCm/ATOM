@@ -1007,6 +1007,46 @@ def kda_attention_with_output(
     return self._forward_impl(hidden_states, hidden_states_scale)
 
 
+def _kda_dense_state_pool(pool: torch.Tensor, H: int, V: int, K: int) -> bool:
+    """fp32 ``[slots, H, V, K]`` with dense slots (``stride(0)`` may pad): the
+    layout FlashKDA's paged state cache addresses."""
+    return (
+        pool.dtype == torch.float32
+        and pool.dim() == 4
+        and tuple(pool.shape[1:]) == (H, V, K)
+        and pool.stride(-1) == 1
+        and pool.stride(-2) == K
+        and pool.stride(-3) == V * K
+        and pool.stride(0) >= H * V * K
+    )
+
+
+def _flash_kda_serves(
+    q: torch.Tensor, v: torch.Tensor, A_log: torch.Tensor, lower_bound: float | None
+) -> bool:
+    """Whether aiter routes the prefill call ``_run_kda`` makes to FlashKDA,
+    the only path with a paged state cache."""
+    try:
+        from aiter.ops.triton._triton_kernels.kimi_delta_attn.flash_kda import (
+            AITER_FDA_ENABLE,
+            FLASH_KDA_CHUNK,
+            flash_kda_supported,
+        )
+    except ImportError:
+        return False
+    return AITER_FDA_ENABLE and flash_kda_supported(
+        q=q,
+        v=v,
+        chunk_size=FLASH_KDA_CHUNK,
+        safe_gate=lower_bound is not None,
+        use_gate_in_kernel=True,
+        use_qk_l2norm_in_kernel=True,
+        use_beta_sigmoid_in_kernel=True,
+        lower_bound=lower_bound,
+        A_log=A_log,
+    )
+
+
 class KimiKDAAttention(nn.Module):
     @property
     def mamba_type(self) -> str:
@@ -1238,6 +1278,7 @@ class KimiKDAAttention(nn.Module):
         initial_state: torch.Tensor | None,
         cu_seqlens: torch.Tensor | None,
         output_final_state: bool,
+        **paged,
     ):
         from aiter.ops.triton.kimi_delta_attn import chunk_kimi_delta_attn
 
@@ -1267,7 +1308,60 @@ class KimiKDAAttention(nn.Module):
             # fused decode kernel writes. Without it the state comes back
             # K-first and decode reads it transposed.
             state_v_first=True,
+            # state_cache / state_indices / has_initial_state / out from
+            # _run_kda_paged
+            **paged,
         )
+
+    def _run_kda_paged(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        ssm_state: torch.Tensor,
+        state_indices: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        kda_metadata,
+    ) -> torch.Tensor | None:
+        """Prefill on the state pool in place (aiter FlashKDA's paged state
+        cache): each sequence's initial state is read from its slot (zeros
+        where ``has_initial_state`` is false) and its final state is written
+        back there, so the gather, the V-first transpose of the gathered
+        states and the scatter of the final states all go away -- same
+        kernels, same results.  None when that does not apply:
+        ATOM_KDA_PAGED_PREFILL=0, a state fork (read slot != write slot), a
+        pool that is not dense fp32 ``[slots, H, V, K]``, or a call FlashKDA
+        does not serve; the caller then gathers.
+        """
+        if (
+            not envs.ATOM_KDA_PAGED_PREFILL
+            or getattr(kda_metadata, "has_state_fork", True)
+            or kda_metadata.has_initial_state is None
+            or state_indices.numel() != cu_seqlens.numel() - 1
+            or not _kda_dense_state_pool(
+                ssm_state, v.shape[-2], v.shape[-1], q.shape[-1]
+            )
+            or not _flash_kda_serves(q, v, self.A_log, self._kda_gate_lower_bound)
+        ):
+            return None
+        out = torch.empty(v.shape, dtype=v.dtype, device=v.device)
+        self._run_kda(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            None,
+            cu_seqlens,
+            False,
+            out=out,
+            state_cache=ssm_state,
+            state_indices=state_indices,
+            has_initial_state=kda_metadata.has_initial_state,
+        )
+        return out
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # hidden_states is a (fp8, scale) tuple when input_layernorm fused the
@@ -1395,28 +1489,43 @@ class KimiKDAAttention(nn.Module):
             q = rearrange(q, "t (h d) -> 1 t h d", d=self.head_dim)
             k = rearrange(k, "t (h d) -> 1 t h d", d=self.head_dim)
             v = rearrange(v, "t (h d) -> 1 t h d", d=self.head_dim)
-            # Fused masked gather: ssm_state[state_indices] with fresh
-            # sequences (~has_initial_state) written as zeros in one pass,
-            # replacing the gather + separate zero-write.
-            from atom.model_ops.kimi_k3 import gather_kda_initial_state
-
-            initial = gather_kda_initial_state(
-                ssm_state, state_indices_in, kda_metadata.has_initial_state
-            )
-            kda_out, last_state = self._run_kda(
+            # The recurrence on the state pool in place when it can: FlashKDA
+            # reads each sequence's initial state from its slot and writes the
+            # final state back (no gather, no transpose, no scatter).
+            kda_out = self._run_kda_paged(
                 q,
                 k,
                 v,
                 gate,
                 beta,
-                initial,
+                ssm_state,
+                state_indices,
                 query_start_loc,
-                True,
+                kda_metadata,
             )
-            # last_state already has ssm_state's dtype (fla preserves the
-            # initial_state dtype; the gathered initial is allocated as such),
-            # so no .to() cast is needed.
-            ssm_state[state_indices] = last_state
+            if kda_out is None:
+                # Fused masked gather: ssm_state[state_indices] with fresh
+                # sequences (~has_initial_state) written as zeros in one pass,
+                # replacing the gather + separate zero-write.
+                from atom.model_ops.kimi_k3 import gather_kda_initial_state
+
+                initial = gather_kda_initial_state(
+                    ssm_state, state_indices_in, kda_metadata.has_initial_state
+                )
+                kda_out, last_state = self._run_kda(
+                    q,
+                    k,
+                    v,
+                    gate,
+                    beta,
+                    initial,
+                    query_start_loc,
+                    True,
+                )
+                # last_state already has ssm_state's dtype (fla preserves the
+                # initial_state dtype; the gathered initial is allocated as
+                # such), so no .to() cast is needed.
+                ssm_state[state_indices] = last_state
             # o_norm only reads this tensor, so keep the contiguous KDA output
             # instead of materializing an identical copy into `out`.
             assert kda_out.dtype == fused_in.dtype, (

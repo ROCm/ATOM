@@ -797,6 +797,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # always accumulates in fp32.  fp16 over bf16 when narrowing: the state is
     # O(1), so bf16's range buys nothing and its short mantissa costs accuracy.
     "ATOM_GDN_SSM_DTYPE": lambda: os.getenv("ATOM_GDN_SSM_DTYPE", "fp32").lower(),
+    # 1 (default): Kimi-K3 prefill runs the KDA recurrence on the state pool in
+    # place (aiter FlashKDA's paged state cache: no gather of the initial
+    # states, no V-first transpose copy, no scatter of the final states) when
+    # the pool is fp32 and the step forks no state; 0 gathers as before.
+    "ATOM_KDA_PAGED_PREFILL": lambda: os.getenv("ATOM_KDA_PAGED_PREFILL", "1") == "1",
     "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT": lambda: (
         os.getenv("ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT", "1") == "1"
     ),
