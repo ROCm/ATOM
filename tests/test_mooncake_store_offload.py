@@ -457,6 +457,8 @@ def _seq(req_id, num_prompt_tokens, *, offset=0, cached=0, **fields):
         num_prompt_tokens=num_prompt_tokens,
         num_cached_tokens=cached,
         block_table=list(range(-(-num_prompt_tokens // BLOCK))),
+        offload_loaded=False,
+        offload_load_failed=False,
     )
     for name, value in fields.items():
         setattr(seq, name, value)
@@ -3194,6 +3196,10 @@ def test_v41_registration_uses_pages_without_request_slots(
     pages = [object()]
     transfer = SimpleNamespace(
         block_regions=pages,
+        paged_state_checkpoint_spec=None,
+        execute_paged_state_copies=None,
+        slot_regions=[object()],
+        num_slots=64,
         block_tensor_views=[SimpleNamespace(device=torch.device("cpu"))],
         num_blocks=8,
         state_backend=SimpleNamespace(

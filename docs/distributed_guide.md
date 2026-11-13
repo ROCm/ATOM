@@ -226,6 +226,36 @@ All strategies break ties with a round-robin cursor.
 rank (one Mooncake Store, one LMCache MP server). Any rank can then load a
 prefix another rank computed, so a request's prefill work does not depend on
 where it lands and the router balances purely by work:
+
+- **Request cost**: the common compressed prefix index in
+  `atom/model_engine/dp_routing/prefix_spread.py` retains exact complete-block
+  matches and producer ownership for both `prefix_spread` and `share_cache`.
+  `share_cache` adds its work score through a placement adapter; it does not
+  maintain a second sampled index. A rank receives credit for its local
+  prefix and for the completed remote prefix that the shared offload tier can
+  load, using the same chunk alignment and `OFFLOAD_MIN_LOAD_TOKENS` contract
+  as `prefix_spread`. An in-flight producer only credits its own rank. The
+  history is a hint rather than proof of a completed publication or current
+  residency. Admission reports actual reuse. A smaller hit invalidates the
+  target's stale suffix and its remote-tier hint, while preserving other
+  ranks' confirmed local prefixes and active producers. The request that
+  recomputes the suffix becomes its producer, and `atom:dp_share_cache_stale`
+  counts the correction.
+- **Rank backlog**: each DP engine core reports `(requests ingested, prefill
+  tokens left)` when it changed, at most every 10 ms
+  (`EngineCoreRequestType.PREFILL_BACKLOG`). The reuse reports above go on
+  their own (`DP_REUSE`), queued ahead of the request's first output.
+  A started request counts `prompt - num_cached_tokens`, so HBM hits, tier
+  loads and finished chunks all shrink it as they happen; a request not yet
+  allocated counts the router's estimate. The CoreManager adds the charges of
+  requests sent after the rank's last report.
+
+It needs `--enable_prefix_caching` and `ATOM_FRONTEND_PREFIX_HASH=1`, and is
+mutually exclusive with `ATOM_DP_SESSION_AFFINITY=1`. With a Mooncake Store
+`OFFLOAD_MIN_LOAD_TOKENS` defaults to 512. With `lmcache_mp` set
+`OFFLOAD_MIN_LOAD_TOKENS` and `OFFLOAD_MIN_SAVE_TOKENS` low yourself (e.g.
+256-1024), so the tier holds what HBM holds.
+
 **`prefix_spread`.** The router remembers which ranks ran each prompt prefix (every complete block in the frontend prompt block-hash chain) and keeps a request on its prefix's rank, unless another rank has under `ATOM_DP_PREFIX_IDLE_TOKENS` queued prefill and a free request slot (about to idle) while the prefix's rank has over twice that, or has every request slot taken. Then the request goes to an idle rank, chosen by queued prefill -- with more than two ranks, among those within `ATOM_DP_PREFIX_IDLE_TOKENS / 2` of the least queued, the one holding the most of its prefix -- and loads the prefix from the offload tier. While both ranks have queued prefill a move adds no capacity under lockstep DP, so the request stays. New prefixes go to the lightest rank (`least_tokens` score). A request whose prefix source is still prefilling stays on the prefix's rank to reuse it from HBM unless that rank is backlogged and another is idle; then it moves and is credited what the target holds plus the longest part of the prefix some request already finished prefilling on any rank (which the tier can load); the rest of its prompt is charged as prefill. If the source leaves before finishing its prefill, the parts it was computing go to the earliest request still waiting on them on that rank, which is charged for recomputing them; with no such request they are forgotten. Another rank's part of the prefix counts as a local hit only once its source finished prefilling it. A load threshold applies to the missing transferable prefix beyond the target's local hit, after chunk alignment, rather than to the prompt length or prefix indexing. If that difference is below `OFFLOAD_MIN_LOAD_TOKENS`, the request still goes to the selected idle rank, reuses its local prefix and recomputes the remainder. Prompts shorter than 4096 tokens participate in prefix routing whenever they contain complete hash blocks. The index stores compressed intervals of consecutive chained hashes, retaining exact complete-block prefix lengths without one dictionary entry per block. Its unique-edge token budget is `PrefixSpreadRouter.CAP` tokens (a class attribute); active producer intervals are pinned and can exceed this history budget until their requests finish. Past the budget, finished history is shed oldest interval first. An overage of at most an eighth of that interval (at least one block) is cut from its tail, so a long session keeps its head and its rank, and the interval then queues behind the others; a larger overage, or one that covers the whole interval (a one-block interval is always dropped, never shortened), drops the interval whole, so one placement never takes more eviction passes than whole-interval eviction would. Eviction is therefore only approximately least-recently-used: a hot interval can lose part of its tail while an older one is still held. When a request finishes its prefill, the intervals along its chain that are finished, held by the same ranks in the same recency order and have no other child are merged back; so a session that keeps extending its own history stays a few intervals rather than one more per turn. Intervals that were split by a request ending mid-interval are merged back only by a later completion along the same chain, not eagerly, and divergent branches stay separate. Active requests keep one continuous prefix dependency record, so history eviction cannot hide a still-prefilling producer from new followers. A moved request is credited its prefix only if an offload tier shared by the DP ranks (`lmcache_mp`, `mooncake_store`; not the per-rank `lmcache_offload`), with a role that both saves and loads (`offload`, `kv_both`), can load it (at least `OFFLOAD_MIN_LOAD_TOKENS`); otherwise only its local part. Needs `--enable_prefix_caching` and `ATOM_FRONTEND_PREFIX_HASH=1`, and excludes `ATOM_DP_SESSION_AFFINITY` (startup fails otherwise); bypasses the offline backpressure dispatch. Tuning: `ATOM_DP_PREFIX_IDLE_TOKENS` (default 32768).
 
 The compressed prefix index stores consecutive chained-hash intervals, retaining exact complete-block matches without a dictionary entry for every hash block. Its history budget counts unique indexed tokens, independent of hash-block granularity; it is not a limit on all router memory. Active producer intervals are pinned so history eviction cannot hide them from new followers. Active request hash chains and dependencies remain until completion, cancellation or reset releases them, and may exceed the history budget.

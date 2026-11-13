@@ -47,8 +47,7 @@ class FakeSchedSub:
     ):
         self._match = match
         self.is_producer = is_producer
-        if is_offload:
-            self.is_offload = True
+        self.is_offload = is_offload
         self.alloc_calls = []
         self.finished_calls = []
         self.cancelled = []
@@ -118,6 +117,8 @@ class FakeSchedSub:
         self.load_failed_ids.append(req_id)
 
     def cancel_pending_load(self, seq):
+        if not self._offload:
+            return  # KVConnectorSchedulerBase's non-offload default.
         # Idempotent, like the real connector's `_load_lifecycles` guard.
         self.cancelled.append(seq)
         self.pending_load = False
@@ -166,7 +167,6 @@ class FakeSchedSub:
             "should_park_partial_prefill_for_load",
             "save_finished",
             "load_failed",
-            "cancel_pending_load",
             "process_completions",
             "has_pending_work",
             "enqueue_state_loads",
@@ -378,7 +378,7 @@ def test_cancel_pending_load_forwards_to_offload_subs():
     _sched([moriio, off]).cancel_pending_load(seq)
 
     assert off.cancelled == [seq]
-    assert not hasattr(moriio, "cancel_pending_load")
+    assert moriio.cancelled == []
 
 
 def test_cancel_preadmission_clears_tier_state_and_load_winner():

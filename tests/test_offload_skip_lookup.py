@@ -89,6 +89,8 @@ def _seq(n=64, sid=7):
         num_cached_tokens=0,
         token_ids=list(range(n)),
         block_table=[],
+        offload_loaded=False,
+        offload_load_failed=False,
     )
 
 
