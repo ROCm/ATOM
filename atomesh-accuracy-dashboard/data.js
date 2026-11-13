@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794416079332,
+  "lastUpdate": 1794531460453,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -4898,6 +4898,40 @@ window.BENCHMARK_DATA = {
             "value": 0.8992,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/43055935943 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202611111518 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1456 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "PerryZhang01",
+            "username": "PerryZhang01",
+            "email": "Perry.Zhang@amd.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "5b744ee31797fab9023428d693899d19d7167564",
+          "message": "ci(vllm): benchmark the PR CI models at the SGLang concurrencies, drop GLM-5.2-MXFP4-MTP (#3230)\n\n* ci(vllm-benchmark): benchmark the PR CI models at the SGLang concurrencies\n\nThe nightly vLLM benchmark ran a model set of its own. It now runs the\nseven cells the vLLM plugin PR CI (atom-vllm-test.yaml) gates on, under\nthe same display names and with the same serve arguments and env:\nDeepSeek-V4-Flash TP4, GLM-5.2-MXFP4-MTP TP4, MiniMax-M3-MXFP4 EAGLE3\nTP4, Kimi-K3 DSpark DCP8 TP8, DeepSeek-V4.1-Flash DSpark TP4,\nGLM-5.3-Flash kpool MTP prefix-cache TP4 and Qwen3.5-397B-A17B-MXFP4 TP4.\n\nWhere a PR CI recipe is sized for GSM8K rather than for the benchmark\nshapes, the catalog widens it: V4.1-Flash and GLM-5.3-Flash take\n--max-model-len 16384 (8192 cannot hold 8192/1024 or 1024/8192), and\nGLM-5.3-Flash takes --max-num-seqs 64 so c=64 is not a queue behind 32\nrunning requests. V4-Flash, V4.1-Flash and GLM-5.3-Flash also list\n--trust-remote-code, which the launcher already passes to vllm serve;\nthe benchmark client reads it from extra_args to load the tokenizer.\n\nConcurrency defaults to 4,8,16,32,64, the SGLang benchmark's default,\nand the matrix no longer adds 128 and 256 to every model.\n\nEAGLE3 and DSpark load a separate draft checkpoint; the catalog names it\nin draft_model_path and the benchmark job downloads it next to the\ntarget, or points the speculative config at its hub id when there is\nno /models mount.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n* ci(vllm): drop GLM-5.2-MXFP4-MTP from the PR CI and the benchmark\n\nThe vLLM plugin PR CI no longer runs the GLM-5.2-MXFP4-MTP TP4 cell, and\nthe vLLM benchmark, which runs the PR CI's models, drops it with it: six\nmodels remain in both, and the scheduled benchmark matrix has 85 cells.\n\nThe benchmark catalog keeps the variant, with its env back as it was\nbefore this branch.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n---------\n\nCo-authored-by: perzhang <perzhang@amd.com>\nCo-authored-by: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-12T12:40:30Z",
+          "url": "https://github.com/ROCm/ATOM/commit/5b744ee31797fab9023428d693899d19d7167564"
+        },
+        "date": 1794531459507,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.9454,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/43256173744 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202611111518 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9424 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b accuracy (GSM8K)",
+            "value": 0.8863,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/43256173744 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202611111518 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1531 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
