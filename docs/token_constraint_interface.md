@@ -3,17 +3,17 @@
 Tool output parsing remains in the shared ToolCallParser stream engine. A model
 format declares its original wire syntax and constraint rules; the common
 ConstraintParser compiles those declarations through registered rule adapters.
-K3 declares its channel rule and optional tool grammar, while JSON Schema uses a
-GrammarRule. The compiled native RequiredChannel and grammar object retain their
-existing serialization, stop IDs, fields and backend semantics.
+K3 declares its channel rule through its `required_call_channel` hook; its
+`tool_call_grammar` hook and JSON Schema compilation are unchanged. The compiled
+native RequiredChannel and grammar object retain their existing serialization,
+stop IDs, fields and backend semantics.
 
-`ConstraintParser.register(rule_type, backend, adapter)` adds a rule without
-changing parser dispatch. `parse(rule, context)` returns the native compiled
-value. `bind(rule, context)` tags that value with its backend. Bindings are rebuilt
-at the engine boundary from native scheduled fields; provider classes and state
-never cross Sequence IPC. Importing `atom.constraint_parser` (rule declarations,
-`ConstraintParser`, request-owner registry) requires no torch, Triton, AITER or
-llguidance. Format modules such as the Kimi-K3 tool parser import the tool parser
+`ConstraintParser.register(rule_type, adapter)` adds a rule without changing
+parser dispatch. `parse(rule, context)` returns the native compiled value.
+Bindings (`ConstraintBinding`) are rebuilt at the engine boundary from native
+scheduled fields; provider classes and state never cross Sequence IPC.
+Importing `atom.constraint_parser` (rule declarations, `ConstraintParser`)
+requires no torch, Triton, AITER or llguidance. Format modules such as the Kimi-K3 tool parser import the tool parser
 and registry stack, which does require torch. Backend imports happen when the
 corresponding adapter runs.
 
@@ -47,26 +47,10 @@ Register adapters with `register_constraint_provider`. An adapter declares:
   accepted output tokens after broadcasts, including rejection sentinels. It
   never commits merely proposed draft IDs. The current GPU carry envelope allows
   one adapter to return a native carry tensor; all other adapters return None.
-- `release(runner, request_ids)`: release only owned request resources. Optional
-  `errors(runner)` exposes backend request errors for output delivery.
-- Stateful adapters also declare a lightweight `owns_request(sequence)` predicate
-  over native request data. `register_constraint_provider` installs it in the
-  request-owner registry of the process that registers the adapter (normally a
-  worker). The registry is process-local: `EngineCore` and `CoreManager` import
-  only `atom.constraint_parser` and never `atom.model_engine.token_constraints`,
-  so an adapter registered only in a worker is invisible to them and their
-  terminal, abort and admission-failure cleanup would not send the release RPC.
-  An out-of-tree adapter therefore also calls
-  `atom.constraint_parser.register_constraint_request_owner(backend, predicate)`
-  from a module that the engine/coordinator process imports; this needs no
-  execution backend import and is idempotent for the same predicate. ATOM has
-  no plugin hook that imports out-of-tree modules into the spawned engine and
-  worker processes, so an out-of-tree adapter needs its embedding application to
-  import (and register) it in both; an in-tree adapter adds its predicate to the
-  default table in `atom.constraint_parser`, as the built-in grammar one does.
-  Ordinary requests and stateless channels do not acquire an extra cleanup RPC.
-  The built-in grammar predicate retains the original Schema/tool-format
-  ownership rules.
+- `errors(runner)`: backend request errors for output delivery, or None.
+- `release(runner, request_ids)`: release only owned request resources. Release
+  requests are sent for structured (grammar) requests only; stateless channels
+  acquire no cleanup RPC.
 - `release` failures are isolated per adapter: `release_token_constraints`
   releases every registered adapter, then re-raises the first error.
 
@@ -95,15 +79,9 @@ ModelRunner centrally rejects those bypasses when has_constraints(batch) is true
 Behavior note: a single request carrying both a forced K3 channel token and a
 JSON Schema/grammar rule now has its hard masks intersected without relaxing
 either rule. If the forced token is forbidden by the grammar, the request fails
-immediately with "no valid continuation" (the earlier code let the forced token
-override the grammar mask and reported the conflict at grammar commit). The
-OpenAI server clears `required_channel` whenever it configures a grammar, so only
-direct engine API use can reach this combination.
-
-These preparation and commit lifecycle guarantees apply to the regular sampling
-path. RapidServe disaggregated prefill applies stateless token masks before
-sampling; it does not run adapter preparation or commit. Stateful constraint
-adapters and JSON Schema remain unsupported across P/D handoff.
+immediately with "no valid continuation". The OpenAI server clears
+`required_channel` whenever it configures a grammar, so only direct engine API
+use can reach this combination.
 
 Grammar release keeps its original asynchronous copy buffer leases. Channel
 immutable device tables are server resources; tokenIDProcessor owns GPU carried

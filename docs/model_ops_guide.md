@@ -28,7 +28,7 @@ ATOM (AiTer Optimized Model) wraps AITER kernels with model-level abstractions f
 | `Sampler` | `sampler.py` | `aiter.mixed_sample_outer_exponential`, `aiter.ops.triton.topk.topk`, `aiter.ops.triton.softmax.softmax` | Token sampling |
 | `RejectionSampler` | `rejection_sampler.py`, `verify_kernels.py`, `spec_sampling/` (`ratio_verify.py`, `ratio_target_p.py`) | Triton `rejection_greedy_sample_kernel`, `_ratio_*`, `rejection_relaxed_sample_kernel`, `rejection_synthetic_sample_kernel` | Speculative decoding |
 | `apply_packed_bitmask` | `triton_token_constraints.py` | Triton packed-bitmask kernel | JSON grammar masks on selected target logits |
-| `constrain_logits`, `advance_states` | `required_channel.py` (lazy entry), `triton_required_channel.py` (kernels) | Triton `_constrain_logits_kernel`, `_advance_states_kernel` | `tool_choice="required"` channel mask (Kimi-K3) |
+| `constrain_logits`, `advance_states` | `triton_required_channel.py` | Triton `_constrain_logits_kernel`, `_advance_states_kernel` | `tool_choice="required"` channel mask (Kimi-K3) |
 | `guard_empty_rows` | `triton_token_constraints.py` | Triton `_finite_tiles` | Detect empty hard-mask intersections across constraint adapters |
 
 ## AITER integration overview
@@ -505,9 +505,7 @@ pre-sampling boundary for K3 required channels and JSON Schema. Each backend
 computes its allowed tokens: K3 keeps its GPU state machine, while llguidance
 keeps its packed vocabulary masks. Both use the shared token-column masking
 primitive rather than separate logits-write implementations. Internal
-`TokenConstraint.allow(ids)` compiles the grammar manager's static stop mask;
-there are no unused deny/force modes. This refactor adds no request parameter
-or minimum-output-length feature.
+`TokenConstraint.allow(ids)` compiles the grammar manager's static stop mask.
 
 Masks intersect: a K3 forced token cannot restore a token forbidden by Schema.
 An empty intersection produces a request error through the existing output-copy
@@ -517,9 +515,7 @@ input copies still overlap target forward, and channel state uses the existing
 GPU carry when deferred output means the host is one step behind.
 
 No constraints means no constraint-step allocation or new mask kernel. Schema
-plus channel additionally checks for an empty intersection. This is a mechanism
-refactor, not a claim that all masking is fused into one GPU launch or that
-constraint generation has no overhead.
+plus channel additionally checks for an empty intersection.
 
 ### Required channel (`required_channel.py`)
 
@@ -638,7 +634,8 @@ ATOM uses fused kernels to reduce memory traffic by combining multiple operation
 | `spec_sampling/sampling_filter_count.py` | `count_floor` — the floor of a top-k of at most 256 alone, counted |
 | `spec_sampling/softmax_tiles.py` | `tile_max_sumexp`, `softmax_combine_kernel` — the ratio verify's per-tile softmax statistics and their combine into each row's max, `1/Z` and argmax; the draft combines only the max and argmax |
 | `spec_sampling/sampling_scratch.py` | `Region`, `scratch_buffer`, `carve` — the draft's and the ratio verify's per-step scratch: one byte buffer allocated before KV sizing, carved into named views (a NamedTuple of `Region`s in, the same NamedTuple of tensors out) placed by the cache pools' `entry_arena.plan_regions` |
-| `required_channel.py` | `constrain_logits`, `advance_states` — `tool_choice="required"` channel mask (Kimi-K3) |
+| `required_channel.py` | `DeviceChannel` and the pure-torch twins of the channel kernels — `tool_choice="required"` channel mask (Kimi-K3) |
+| `triton_required_channel.py` | `constrain_logits`, `advance_states` — the channel mask kernels |
 | `base_config.py` | `QuantizeMethodBase` abstract class |
 | `utils.py` | Helper utilities: `shuffle_weights`, `normalize_e4m3fn_to_e4m3fnuz`, `per_tensor_dequantize`, etc. |
 

@@ -13,8 +13,6 @@ error delivery, release, and the RapidServe prefill path.
 
 import contextlib
 import random
-import subprocess
-import sys
 from types import SimpleNamespace
 from unittest import mock
 
@@ -23,7 +21,6 @@ import pytest
 import torch
 from aiter_stub import atom_without_aiter
 
-from atom import constraint_parser
 from atom.constraint_parser import ConstraintBinding
 from atom.model_engine import token_constraints as boundary
 
@@ -40,9 +37,8 @@ def _runner_module():
 
 @pytest.fixture(autouse=True)
 def isolated_registry(monkeypatch):
-    """Each test sees an empty adapter registry and its own owner table."""
+    """Each test sees an empty adapter registry."""
     monkeypatch.setattr(boundary, "_PROVIDERS", [])
-    monkeypatch.setattr(constraint_parser, "_REQUEST_OWNERS", {})
     monkeypatch.setattr(mod, "sp_is_enabled", lambda: False)
     monkeypatch.setattr(mod, "pcp_is_enabled", lambda: False)
     monkeypatch.setattr(mod, "get_pcp_world_size", lambda: 1)
@@ -79,6 +75,9 @@ class FakeAdapter:
     def prepare(self, runner, batch, metadata, binding):
         self.calls.append(("prepare", runner, batch, metadata, binding))
 
+    def errors(self, runner):
+        return None
+
     def release(self, runner, request_ids):
         self.calls.append(("release", list(request_ids)))
 
@@ -105,6 +104,8 @@ def active(*backends, **extra):
         total_seqs_num_prefill=0,
         total_seqs_num_decode=2,
         num_spec_step=0,
+        structured_requests=None,
+        required_channel=None,
         **extra,
     )
 
@@ -117,21 +118,6 @@ def test_duplicate_backend_registration_is_rejected():
     with pytest.raises(ValueError, match="Duplicate constraint backend: dup"):
         register(FakeAdapter("dup"))
     assert [p.backend for p in boundary._PROVIDERS] == ["dup"]
-
-
-def test_adapters_must_declare_their_contract():
-    class NoHard:
-        backend, mask_stage, commit_order = "x", 0, 0
-
-    class NoOrder:
-        backend = "y"
-        hard_requests = staticmethod(lambda binding, batch: [])
-
-    with pytest.raises(TypeError, match="hard_requests"):
-        boundary.register_constraint_provider(NoHard)
-    with pytest.raises(TypeError, match="mask_stage and commit_order"):
-        boundary.register_constraint_provider(NoOrder)
-    assert boundary._PROVIDERS == []
 
 
 def test_masks_run_by_stage_and_commits_by_commit_order():
@@ -326,7 +312,7 @@ def test_release_reaches_the_grammar_through_the_runner():
     boundary.register_constraint_provider(boundary.GrammarProvider)
     runner = object.__new__(mod.ModelRunner)
     runner.structured_output = grammar
-    mod.ModelRunner.release_structured_requests(runner, [3, 4])
+    mod.ModelRunner.release_constraints(runner, [3, 4])
     grammar.release.assert_called_once_with([3, 4])
 
 
@@ -362,41 +348,6 @@ def test_release_reports_the_first_failure_and_still_releases_everything():
     with pytest.raises(RuntimeError, match="first"):
         boundary.release_token_constraints(None, [1])
     assert ("release", [1]) in last.calls
-
-
-def test_request_owner_registered_for_the_engine_without_backend_imports():
-    # The engine process imports only atom.constraint_parser; the documented
-    # out-of-tree route is register_constraint_request_owner from there.
-    script = (
-        "import sys, types;"
-        "from atom.constraint_parser import needs_constraint_release, "
-        "register_constraint_request_owner;"
-        "seq = types.SimpleNamespace(third_rule=object(), json_schema=None, "
-        "structured_tool_format=None);"
-        "assert not needs_constraint_release(seq);"
-        "owns = lambda r: getattr(r, 'third_rule', None) is not None;"
-        "register_constraint_request_owner('third', owns);"
-        "register_constraint_request_owner('third', owns);"
-        "assert needs_constraint_release(seq);"
-        "assert 'atom.model_engine.token_constraints' not in sys.modules;"
-        "assert 'torch' not in sys.modules"
-    )
-    subprocess.run([sys.executable, "-c", script], check=True)
-
-
-def test_conflicting_request_owner_is_rejected():
-    constraint_parser.register_constraint_request_owner("x", lambda r: False)
-    with pytest.raises(ValueError, match="Duplicate constraint request owner"):
-        constraint_parser.register_constraint_request_owner("x", lambda r: True)
-
-
-def test_registering_an_adapter_installs_its_owner_in_this_process():
-    adapter = register(FakeAdapter("owned"))
-    adapter.owns_request = lambda request: getattr(request, "owned", False)
-    boundary._PROVIDERS.clear()
-    boundary.register_constraint_provider(adapter)
-    assert constraint_parser.needs_constraint_release(SimpleNamespace(owned=True))
-    assert not constraint_parser.needs_constraint_release(SimpleNamespace(owned=False))
 
 
 # -- runner call sites -------------------------------------------------------
@@ -598,6 +549,7 @@ def _quiet_batch(*backends):
         return_logprobs=[False, False],
         any_logprobs=False,
         required_channel=None,
+        structured_requests=None,
         num_spec_step=0,
     )
 
@@ -612,7 +564,7 @@ def test_failed_rows_are_delivered_as_errors_not_tokens():
     out = _postprocess(runner, batch)
     assert seen["failed"].tolist() == [False, True]
     assert out.token_ids == [(4,), ()]
-    assert out.structured_errors == {
+    assert out.constraint_errors == {
         11: "Token constraints leave no valid continuation"
     }
 
@@ -622,7 +574,7 @@ def test_adapter_errors_are_delivered_with_the_step_output():
     adapter.errors = lambda runner: {10: "adapter said no"}
     runner, _ = _postprocess_runner({10: (4,), 11: (5,)}, deferred=False)
     out = _postprocess(runner, _quiet_batch("c"))
-    assert out.structured_errors == {10: "adapter said no"}
+    assert out.constraint_errors == {10: "adapter said no"}
     assert out.token_ids == [(4,), (5,)]
 
 
@@ -634,7 +586,7 @@ def test_deferred_error_delivery_follows_the_previous_batch():
     runner, _ = _postprocess_runner({10: (-2,), 11: (6,)}, True, prev_batch=constrained)
     out = _postprocess(runner, plain)
     assert out.token_ids == [(), (6,)]
-    assert out.structured_errors == {
+    assert out.constraint_errors == {
         10: "Token constraints leave no valid continuation"
     }
     # A constrained current step must not turn an unconstrained previous
@@ -642,7 +594,7 @@ def test_deferred_error_delivery_follows_the_previous_batch():
     runner, _ = _postprocess_runner({10: (-2,), 11: (6,)}, True, prev_batch=plain)
     out = _postprocess(runner, constrained)
     assert out.token_ids == [(-2,), (6,)]
-    assert not out.structured_errors
+    assert not out.constraint_errors
 
 
 def test_unconstrained_step_never_rewrites_output():
@@ -651,7 +603,7 @@ def test_unconstrained_step_never_rewrites_output():
     out = _postprocess(runner, _quiet_batch())
     assert seen["failed"] is None
     assert out.token_ids == [(-2,), (6,)]
-    assert not out.structured_errors
+    assert not out.constraint_errors
 
 
 class _CudaIds(torch.Tensor):
@@ -715,7 +667,11 @@ def _rapid_runner(monkeypatch, logits):
 
 def _rapid_batch(*backends):
     return SimpleNamespace(
-        active=backends, total_seqs_num=2, cu_stream_fraction=0, required_channel=None
+        active=backends,
+        total_seqs_num=2,
+        cu_stream_fraction=0,
+        required_channel=None,
+        structured_requests=None,
     )
 
 
@@ -735,19 +691,6 @@ def test_rapidserve_prefill_without_constraints_samples_raw_logits(monkeypatch):
     logits = torch.tensor([[0.0, 1.0, 2.0, 9.0], [9.0, 1.0, 2.0, 3.0]])
     runner = _rapid_runner(monkeypatch, logits)
     assert runner.prefill_forward(_rapid_batch()) == [3, 0]
-
-
-def test_rapidserve_prefill_rejects_a_step_with_no_valid_continuation(monkeypatch):
-    def empty_row_one(step, binding):
-        step.gather()
-        step.logits[1] = -float("inf")
-        step.invalid = torch.tensor([False, True])
-
-    register(FakeAdapter("stateless", on_apply=empty_row_one))
-    logits = torch.tensor([[0.0, 1.0, 2.0, 9.0], [9.0, 1.0, 2.0, 3.0]])
-    runner = _rapid_runner(monkeypatch, logits)
-    with pytest.raises(ValueError, match="no valid continuation"):
-        runner.prefill_forward(_rapid_batch("stateless"))
 
 
 # -- failure positions over ragged drafts -------------------------------------
@@ -868,13 +811,13 @@ def test_no_adapter_errors_is_none():
     assert boundary.constraint_errors(None) is None
 
 
-def test_grammar_apply_requires_a_prepared_grammar_with_the_logits_vocabulary():
+def test_grammar_apply_requires_the_logits_vocabulary():
     step = SimpleNamespace(
-        runner=SimpleNamespace(), source=torch.zeros(1, 8), batch=None, metadata=None
+        runner=SimpleNamespace(structured_output=SimpleNamespace(vocab_size=7)),
+        source=torch.zeros(1, 8),
+        batch=None,
+        metadata=None,
     )
-    with pytest.raises(ValueError, match="must be prepared"):
-        boundary.GrammarProvider.apply(step, None)
-    step.runner.structured_output = SimpleNamespace(vocab_size=7)
     with pytest.raises(ValueError, match="do not match the prepared"):
         boundary.GrammarProvider.apply(step, None)
 
@@ -890,29 +833,19 @@ def _core_manager(prepare=None):
     return mgr
 
 
-def test_failed_admission_releases_requests_owned_by_any_adapter():
-    adapter = register(FakeAdapter("owned"))
-    adapter.owns_request = lambda request: getattr(request, "owned", False)
-    boundary._PROVIDERS.clear()
-    boundary.register_constraint_provider(adapter)
-    mgr = _core_manager()
+def test_failed_admission_releases_structured_requests():
+    mgr = _core_manager(prepare=lambda seqs: None)
     mgr._add_prepared_requests = mock.Mock(side_effect=RuntimeError("admission"))
-    seqs = [
-        SimpleNamespace(
-            id=1, owned=True, json_schema=None, structured_tool_format=None
-        ),
-        SimpleNamespace(
-            id=2, owned=False, json_schema=None, structured_tool_format=None
-        ),
-    ]
+    structured = SimpleNamespace(id=1, json_schema="{}", structured_tool_format=None)
+    plain = SimpleNamespace(id=2, json_schema=None, structured_tool_format=None)
     with pytest.raises(RuntimeError, match="admission"):
-        mgr.add_request(seqs)
+        mgr.add_request([structured, plain])
     mgr.broadcast_utility_command.assert_called_once_with(
-        "release_structured_requests", request_ids=[1]
+        "release_constraints", request_ids=[1]
     )
 
 
-def test_unowned_requests_never_send_a_release():
+def test_unstructured_requests_never_send_a_release():
     register(FakeAdapter("silent"))
     mgr = _core_manager()
     mgr._add_prepared_requests = mock.Mock(side_effect=RuntimeError("admission"))
