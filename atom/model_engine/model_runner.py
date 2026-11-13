@@ -29,6 +29,7 @@ from aiter.dist.parallel_state import (
     graph_capture,
 )
 from aiter.dist.utils import get_distributed_init_method
+from aiter.tuned_gemm import tgemm
 from torch.profiler import record_function
 
 from atom import structured_output
@@ -104,6 +105,7 @@ from atom.model_ops.decode_input_ids import (
     NEW_SEQUENCE,
     fill_deferred_decode_ids,
 )
+from atom.model_ops.embed_head import ParallelLMHead
 from atom.model_ops.eplb import (
     initialize_eplb_runtime,
     with_eplb_forward_monitor,
@@ -116,6 +118,7 @@ from atom.model_ops.required_channel import (
     constrain_logits,
 )
 from atom.model_ops.sampler import SAMPLER_EPS, sampler_from_config
+from atom.model_ops.vp_sampling import LocalLogits, vp_sample
 from atom.models.registry import mono_decode_installers, support_model_arch_dict
 from atom.mono.runtime.step_override import StepOverrideModel
 from atom.sampling_params import RequiredChannel
@@ -1033,6 +1036,12 @@ class ModelRunner:
             else None
         )
         self._served = None
+        # Vocab-parallel sampling of a speculative verify (`_vp_local_logits`): the
+        # target's LM head once ATOM_VP_SPEC_SAMPLING=1 arms it, and the verify
+        # steps it served and declined.
+        self._vp_lm_head = self._find_vp_lm_head()
+        self._vp_steps = 0
+        self._vp_declined = 0
         self._init_forward_vars_ring()
         self._init_h2d_publication()
         self.forward_done_event = torch.cuda.Event()
@@ -3452,8 +3461,90 @@ class ModelRunner:
         if isinstance(head, tuple) and self._head_ids_serve(head, batch):
             return head
         if head is None or isinstance(head, tuple):
+            local = self._vp_local_logits(hidden_states, batch)
+            if local is not None:
+                return local
             return self.model.compute_logits(hidden_states)
         return head
+
+    def _find_vp_lm_head(self):
+        """The target's LM head for vocab-parallel verify sampling, or None:
+        ATOM_VP_SPEC_SAMPLING=1 arms it under TP when the target has exactly one
+        `ParallelLMHead`, sharded over the TP group."""
+        if os.environ.get("ATOM_VP_SPEC_SAMPLING", "0") != "1":
+            return None
+        heads = [m for m in self.model.modules() if isinstance(m, ParallelLMHead)]
+        tp = get_tp_group().world_size
+        if tp <= 1 or len(heads) != 1 or heads[0].tp_size != tp:
+            logger.info(
+                "Vocab-parallel verify sampling not armed: TP %d, %d LM heads",
+                tp,
+                len(heads),
+            )
+            return None
+        logger.info(
+            "Vocab-parallel verify sampling armed: vocab %d, %d a rank",
+            heads[0].num_embeddings,
+            heads[0].num_embeddings_per_partition,
+        )
+        return heads[0]
+
+    def _vp_local_logits(self, hidden_states: torch.Tensor, batch):
+        """This rank's slice of the step's logits (`LocalLogits`) where
+        `postprocess` can sample the verify from it: armed, a speculative verify
+        whose rows are drawn from temperature alone, and read for nothing but the
+        picks (no top-k or top-p, logprobs, structured output, required channel,
+        lossless, relaxed or synthetic acceptance, PCP or SP, step override). None
+        otherwise, for the logits path. Every TP rank decides alike from the step's
+        batch."""
+        head = self._vp_lm_head
+        if head is None:
+            return None
+        forward_context = get_forward_context()
+        spec = forward_context.spec_decode_metadata
+        context = forward_context.context
+        bs = 0 if batch is None else batch.total_seqs_num
+        if (
+            spec is None
+            or batch is None
+            or context is None
+            or context.is_prefill
+            or getattr(self, "rejection_sampler", None) is None
+            or self.rejection_sampler.synthetic_acceptance_rates is not None
+            or batch.any_logprobs
+            or getattr(batch, "structured_requests", None)
+            or batch.required_channel is not None
+            or RELAXED_TOP_N > 1
+            or get_pcp_world_size() > 1
+            or pcp_is_enabled()
+            or sp_is_enabled()
+            or self._served is not None
+            or _draft_lossless(self) is not None
+            or not (batch.top_ks[:bs] == -1).all()
+            or not (batch.top_ps[:bs] >= 1.0).all()
+        ):
+            if spec is not None:
+                self._vp_declined += 1
+            return None
+        return LocalLogits(
+            tgemm.mm(hidden_states, head.weight, head.bias),
+            head.vocab_start_idx,
+            head.num_embeddings,
+        )
+
+    def _vp_seed(self) -> int:
+        """The verify step's noise seed, the same on every TP rank: they serve the
+        same verify steps in the same order. Logs the count now and then."""
+        self._vp_steps += 1
+        if (self._vp_steps == 1 or self._vp_steps % 2000 == 0) and (
+            get_tp_group().rank_in_group == 0
+        ):
+            logger.info(
+                "Vocab-parallel verify sampling: %d verify steps served, %d declined",
+                self._vp_steps,
+                self._vp_declined,
+            )
+        return (self._vp_steps * 0x9E3779B1 + 0x7F4A7C15) & 0x7FFFFFFF
 
     def _head_ids_serve(self, head, batch) -> bool:
         """Whether a head output's ids and verdict stand for this step in
@@ -3581,6 +3672,8 @@ class ModelRunner:
     ) -> ScheduledBatchOutput:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
         bs = batch.total_seqs_num
+        # The ids came out of a vocab-parallel verify, alike on every TP rank.
+        vp_synced = False
         # Keep probability payloads available on every participating rank.
         need_logprobs = batch.any_logprobs
         logprob_snapshot = None
@@ -3640,6 +3733,45 @@ class ModelRunner:
             # No drafts scored -> no verdict; the drafter anchors on each
             # segment's last row.
             anchors = None
+        elif isinstance(logits, LocalLogits):
+            # Vocab-parallel verify (`_vp_local_logits`): every target and bonus
+            # row picked over this rank's vocab slice with noise keyed on the
+            # global token id, and the winners exchanged, so every rank holds the
+            # same ids and no broadcast follows. The exact-match verify reads only
+            # the ids; its logits argument is checked for shape alone.
+            channel = None
+            md = spec_decode_metadata
+            target_rows = md.target_logits_indices
+            n_target = target_rows.shape[0]
+            request_of_row = torch.searchsorted(
+                md.cu_num_draft_tokens,
+                torch.arange(
+                    n_target,
+                    device=target_rows.device,
+                    dtype=md.cu_num_draft_tokens.dtype,
+                ),
+                right=True,
+            )
+            ids = vp_sample(
+                logits,
+                torch.cat([target_rows, md.bonus_logits_indices]),
+                torch.cat([temperatures[request_of_row], temperatures[:bs]]),
+                self._vp_seed(),
+                self.sampler.eps,
+                get_tp_group(),
+                envs.ATOM_USE_CUSTOM_ALL_GATHER,
+            )
+            sampled_tokens, verdict = self.rejection_sampler.forward(
+                md,
+                logits.local.new_empty((n_target, 1)),
+                ids[n_target:],
+                target_token_ids=ids[:n_target],
+                ratio=None,
+            )
+            num_bonus_tokens, num_reject_tokens, anchors = verdict
+            next_token_locs = num_bonus_tokens
+            spec_counts = verdict[:2]
+            vp_synced = True
         elif isinstance(logits, tuple):
             # The model's head picked every row and gave the verdict inside
             # the forward (`_head_output`: greedy, or draws seeded alike on
@@ -3728,6 +3860,7 @@ class ModelRunner:
         if (
             get_tp_group().world_size > 1
             and self._served is None
+            and not vp_synced
             and _needs_id_sync(
                 self.tokenID_processor.is_deferred_out, hasattr(self, "drafter")
             )
