@@ -28,7 +28,10 @@ from aiter.fused_moe import (
     quant_remap,
     resolve_activation_dtype,
 )
-from aiter.ops.flydsl.grouped_moe_gfx1250 import grouped_gemm_gfx1250_a8w4
+from aiter.ops.flydsl.grouped_moe_gfx1250 import (
+    flydsl_moe_gather_reduce,
+    grouped_gemm_gfx1250_a8w4,
+)
 from aiter.ops.flydsl.herd_topk import herd_finalize_candidates, herd_route_psum
 from aiter.ops.flydsl.moe_common import GateMode
 
@@ -86,6 +89,12 @@ from atom.models.kimi_k3.mono.kernels.stages.k2_local_kernels_gfx1250 import (
 from atom.models.kimi_k3.mono.kernels.stages.k2_oproj_ar_gfx1250 import (
     build_oproj_allreduce,
     oproj_peer_bytes,
+)
+from atom.models.kimi_k3.mono.kernels.stages.moe_tdm_gfx1250 import (
+    FLAG_WORDS,
+    INTER_ROW_WORDS,
+    MOE_STATE_WORDS,
+    build_moe,
 )
 from atom.models.kimi_k3.mono.kernels.token_tiling import GFX1250_MAX_TOKENS
 from atom.models.kimi_k3.mono.plan import _width, kda_metadata, width_key
@@ -220,6 +229,9 @@ class Gfx1250RoutedK2Build:
     # where it has a tile for the width; with ``allreduce`` that kernel then
     # does the gather-reduce
     grouped_moe: GroupedMoe | None = None
+    # the routed experts as one fused launch (moe_tdm_gfx1250.build_moe) at
+    # widths up to ATOM_KIMI_MONO_FUSED_MOE_ROWS, in place of AITER's
+    fused_moe: object | None = None
 
 
 @dataclass(frozen=True)
@@ -510,12 +522,23 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             buffers["front_scratch"] = torch.zeros(
                 front.scratch_bytes, dtype=torch.uint8, device=self.device
             )
-        grouped_moe = self._grouped_moe_for(rows) if herd else None
+        fused_moe = self._fused_moe_for(rows) if grouped else None
+        if fused_moe is not None:
+            routes = rows * TOPK
+            buffers["fused_inter"] = empty((routes, INTER_ROW_WORDS), torch.int32)
+            buffers["fused_grouped"] = empty((routes, LATENT), torch.bfloat16)
+            # a route's row of the fused output is the route itself
+            buffers["fused_rows"] = torch.arange(
+                routes, dtype=torch.int32, device=self.device
+            ).view(rows, TOPK)
+        grouped_moe = (
+            self._grouped_moe_for(rows) if herd and fused_moe is None else None
+        )
         allreduce = None
         if replicated and self.k2_peers is not None:
             allreduce = (
                 build_gather_allreduce(self.tp, rows)
-                if grouped_moe is not None
+                if grouped_moe is not None or fused_moe is not None
                 else build_allreduce(self.tp, rows)
             )
         return Gfx1250RoutedK2Build(
@@ -539,7 +562,29 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             ),
             allreduce,
             grouped_moe,
+            fused_moe,
         )
+
+    def _fused_moe_for(self, rows: int):
+        """The width's fused MoE launcher where ATOM_KIMI_MONO_FUSED_MOE_ROWS
+        covers it and its LDS fits, else None; its flags and epoch (one set
+        for every layer and width: launches never overlap) made on first use."""
+        if rows > envs.ATOM_KIMI_MONO_FUSED_MOE_ROWS:
+            return None
+        try:
+            kernel = build_moe(rows)
+        except ValueError:
+            return None
+        if "fused_moe_sync" not in self.__dict__:
+            self.fused_moe_sync = (
+                torch.zeros(
+                    GFX1250_MAX_TOKENS * TOPK * FLAG_WORDS,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+                torch.zeros(MOE_STATE_WORDS, dtype=torch.int32, device=self.device),
+            )
+        return kernel
 
     def _grouped_moe_for(self, rows: int) -> GroupedMoe | None:
         """The width's grouped MoE, shared by its K2 builds; None where AITER
@@ -671,7 +716,9 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
         # gemm2's grouped rows and their routes, held until the all-reduce that
         # gathers them is queued
         gathered = None
-        if local.grouped_moe is not None:
+        if local.fused_moe is not None:
+            gathered = self._fused_moe(weight, local, moe, stream)
+        elif local.grouped_moe is not None:
             gathered = self._grouped_moe(weight, local, moe)
         elif local.herd_routes is not None:
             self._aiter_grouped_moe(weight, local, moe)
@@ -792,6 +839,38 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             )
             .view(torch.uint8)
         )
+
+    def _fused_moe(self, weight, local, moe, stream):
+        """The fused MoE on the lite finish's latent and routes (HERD's, or
+        the plain top-k under HERD's widths): each route's BF16 rows, and the
+        identity (row, weight) routes the gathering all-reduce takes; or, with
+        no such all-reduce, their gather-reduce into ``routed``."""
+        buffers = local.buffers
+        if local.herd_routes is not None:
+            weights, ids = local.herd_routes.routes[:2]
+        else:
+            weights, ids = buffers["tile_route"], buffers["route"]
+        flags, state = self.fused_moe_sync
+        local.fused_moe.launcher(
+            ids.data_ptr(),
+            buffers["latent_fp4"].data_ptr(),
+            buffers["latent_scales"].data_ptr(),
+            weight.w13.data_ptr(),
+            moe.experts.w13_weight_scale.data_ptr(),
+            weight.w2.data_ptr(),
+            moe.experts.w2_weight_scale.data_ptr(),
+            buffers["fused_inter"].data_ptr(),
+            buffers["fused_grouped"].data_ptr(),
+            flags.data_ptr(),
+            state.data_ptr(),
+            stream=stream,
+        )
+        grouped = buffers["fused_grouped"].unsqueeze(0)
+        rows = buffers["fused_rows"]
+        if local.allreduce is not None and local.allreduce.abi is GATHER_ALLREDUCE_ABI:
+            return grouped, rows, weights
+        flydsl_moe_gather_reduce(grouped, rows, weights, out=buffers["routed"])
+        return None
 
     def _grouped_moe(self, weight, local, moe):
         """The grouped MoE on the lite finish's latent and HERD routes, into

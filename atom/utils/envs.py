@@ -620,6 +620,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_KIMI_MONO_KERNEL_AR": lambda: (
         os.getenv("ATOM_KIMI_MONO_KERNEL_AR", "0") == "1"
     ),
+    # Kimi-K3 gfx1250 mono: widths up to this many rows run the routed experts
+    # as one fused launch (moe_tdm_gfx1250.build_moe, bit-identical to AITER's
+    # grouped MoE) instead of AITER's; 0 keeps AITER's everywhere.
+    "ATOM_KIMI_MONO_FUSED_MOE_ROWS": lambda: int(
+        os.getenv("ATOM_KIMI_MONO_FUSED_MOE_ROWS", "16")
+    ),
     # Debug: run each mono layer next to the original one and log the difference
     # (atom/models/minimax_m3/mono/check.py). Use with --enforce-eager.
     "ATOM_MONO_CHECK": lambda: os.getenv("ATOM_MONO_CHECK", "0") == "1",

@@ -465,6 +465,7 @@ def test_grouped_k2_projects_locally_then_runs_grouped_moe(monkeypatch, herd):
         herd=herd,
         herd_routes=None,
         grouped_moe=None,
+        fused_moe=None,
     )
     x = tensor(rows, 4)
     experts = SimpleNamespace(w13_weight_scale=tensor(2), w2_weight_scale=tensor(2))
@@ -603,6 +604,7 @@ def test_replicated_finalize_all_reduces_both_partials_once(monkeypatch, all_red
             else recorder("allreduce", GATHER_ALLREDUCE_ABI if gathering else None)
         ),
         grouped_moe=grouped_moe if gathering else None,
+        fused_moe=None,
     )
     experts = SimpleNamespace(w13_weight_scale=None, w2_weight_scale=None)
     layer = SimpleNamespace(
@@ -662,6 +664,161 @@ def test_replicated_finalize_all_reduces_both_partials_once(monkeypatch, all_red
         buffers["final"].data_ptr(),
     )
     assert out is buffers["final"]
+
+
+@pytest.mark.parametrize("herd", (False, True))
+@pytest.mark.parametrize("gathering", (False, True))
+def test_fused_moe_reads_the_finish_routes_and_feeds_the_gather(
+    monkeypatch, herd, gathering
+):
+    rows, layer_id, latent, hidden, topk = 2, 3, 3584, 7168, 16
+    weight = SimpleNamespace(
+        write_idx=-1,
+        blocks=2,
+        **{
+            name: torch.zeros(8, dtype=torch.uint8)
+            for name in (
+                "w_gate",
+                "w_ld",
+                "w_sgu",
+                "bias",
+                "w_sd",
+                "w13",
+                "w13s",
+                "w2",
+                "w2s",
+                "w_up_full",
+            )
+        },
+        w_sgu_scale=None,
+        w_sd_scale=None,
+    )
+    reduce = torch.zeros(rows * (latent + hidden), dtype=torch.bfloat16)
+    buffers = {
+        name: torch.zeros(rows, 4, dtype=torch.uint8)
+        for name in (
+            "router_logits",
+            "latent_fp4",
+            "latent_scales",
+            "shared_gate_up",
+            "shared_hidden",
+            "flags",
+            "experts",
+            "kof",
+            "union_sizes",
+            "intermediate_fp4",
+            "intermediate_scales",
+            "finish_scratch",
+            "final",
+            "fused_inter",
+        )
+    }
+    buffers["route"] = torch.zeros(rows, topk, dtype=torch.int32)
+    buffers["tile_route"] = torch.zeros(rows, topk)
+    buffers["fused_grouped"] = torch.zeros(rows * topk, latent, dtype=torch.bfloat16)
+    buffers["fused_rows"] = torch.arange(rows * topk, dtype=torch.int32).view(
+        rows, topk
+    )
+    buffers["reduce"] = reduce
+    buffers["routed"] = reduce[: rows * latent].view(rows, latent)
+    buffers["shared"] = reduce[rows * latent :].view(rows, hidden)
+    calls = {"all_reduce": [], "gather_reduce": []}
+
+    def recorder(name, abi=None):
+        return SimpleNamespace(
+            launcher=lambda *args, **_kwargs: calls.setdefault(name, args), abi=abi
+        )
+
+    herd_weights = torch.zeros(rows, topk)
+    herd_ids = torch.zeros(rows, topk, dtype=torch.int32)
+    local = SimpleNamespace(
+        front=recorder("front"),
+        finish=recorder("finish"),
+        finalize=recorder("finalize"),
+        buffers=buffers,
+        grouped_experts=True,
+        replicated_finalize=True,
+        herd=herd,
+        herd_routes=SimpleNamespace(routes=(herd_weights, herd_ids)) if herd else None,
+        allreduce=recorder("allreduce", GATHER_ALLREDUCE_ABI) if gathering else None,
+        grouped_moe=None,
+        fused_moe=recorder("fused_moe"),
+    )
+    experts = SimpleNamespace(
+        w13_weight_scale=torch.zeros(4, dtype=torch.uint8),
+        w2_weight_scale=torch.zeros(4, dtype=torch.uint8),
+    )
+    layer = SimpleNamespace(
+        mlp_attn_res=lambda *_args: (torch.zeros(rows, 4), torch.zeros(rows, 4)),
+        block_sparse_moe=SimpleNamespace(
+            experts=experts, routed_expert_norm=lambda value: value
+        ),
+    )
+    runner = object.__new__(K3Gfx1250MonoDecodeRunner)
+    runner.rank = 1
+    runner.k2_peers = SimpleNamespace(
+        peers=torch.zeros(8, dtype=torch.int64),
+        epochs=torch.zeros(256, dtype=torch.int32),
+    )
+    runner.fused_moe_sync = (
+        torch.zeros(64, dtype=torch.int32),
+        torch.zeros(4, dtype=torch.int32),
+    )
+    runner.routed = {layer_id: weight}
+    runner.inner = SimpleNamespace(layers={layer_id: layer})
+    group = SimpleNamespace(
+        all_reduce=lambda value, ca_fp8_quant=False: calls["all_reduce"].append(value),
+    )
+    monkeypatch.setattr(runner_module, "get_tp_group", lambda: group)
+    monkeypatch.setattr(runner_module.torch.cuda, "current_stream", lambda: None)
+    monkeypatch.setattr(
+        runner_module, "_bf16_attn_res", lambda site, *args: site(*args[:3])
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "flydsl_moe_gather_reduce",
+        lambda *args, out: calls["gather_reduce"].append((args, out)),
+    )
+
+    runner._routed_k2(
+        SimpleNamespace(k2={layer_id: local}),
+        SimpleNamespace(layer_id=layer_id),
+        torch.zeros(rows, 4),
+        torch.zeros(rows, 4),
+        torch.zeros(rows, 3, 4),
+    )
+
+    weights, ids = (
+        (herd_weights, herd_ids) if herd else (buffers["tile_route"], buffers["route"])
+    )
+    flags, state = runner.fused_moe_sync
+    assert calls["fused_moe"] == (
+        ids.data_ptr(),
+        buffers["latent_fp4"].data_ptr(),
+        buffers["latent_scales"].data_ptr(),
+        weight.w13.data_ptr(),
+        experts.w13_weight_scale.data_ptr(),
+        weight.w2.data_ptr(),
+        experts.w2_weight_scale.data_ptr(),
+        buffers["fused_inter"].data_ptr(),
+        buffers["fused_grouped"].data_ptr(),
+        flags.data_ptr(),
+        state.data_ptr(),
+    )
+    if gathering:
+        assert calls["gather_reduce"] == [] and calls["all_reduce"] == []
+        assert calls["allreduce"][:4] == (
+            reduce.data_ptr(),
+            buffers["fused_grouped"].data_ptr(),
+            buffers["fused_rows"].data_ptr(),
+            weights.data_ptr(),
+        )
+    else:
+        ((args, out),) = calls["gather_reduce"]
+        assert args[0].shape == (1, rows * topk, latent)
+        assert args[1] is buffers["fused_rows"] and args[2] is weights
+        assert out is buffers["routed"]
+        assert [value is reduce for value in calls["all_reduce"]] == [True]
 
 
 def test_precomputed_herd_hands_over_routes_laid_out_for_the_tile(monkeypatch):
