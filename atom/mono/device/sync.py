@@ -126,13 +126,15 @@ class Mailbox:
     carries a live tag. Every address is an ``Addr``: its space picks the scope.
     """
 
-    def __init__(self, layer, diag=None, region_ids=None):
+    def __init__(self, layer, diag=None, region_ids=None, skip=()):
         """``diag`` (a debug build): the address of the per-CTA wait records, every
         wait bounded (``_spin_bounded``); ``region_ids``: region name -> the id a
-        record names it by."""
+        record names it by. ``skip`` (a timing probe, ``atom.mono.plan.probe``): the
+        regions whose polls load once and take whatever tag they find."""
         self.tag = layer + 1
         self.diag = diag
         self.region_ids = region_ids or {}
+        self.skip = frozenset(skip)
 
     def put(self, a, i, v):
         bits = v.bitcast(fx.Int32) if isinstance(v, fx.Float32) else fx.Int32(v)
@@ -216,7 +218,12 @@ class Mailbox:
                 bad = bad | (v[e] != tag)
             return bad
 
-        v = self.spin(specs[0][0], specs[0][1], load_all, pending)
+        if const_expr(
+            len(self.skip) > 0 and all(a.region in self.skip for a, _, _ in specs)
+        ):
+            v = load_all()
+        else:
+            v = self.spin(specs[0][0], specs[0][1], load_all, pending)
         outs, e = [], 0
         for _, _, n in specs:
             outs.append([v[e + 2 * q] for q in range(n)])

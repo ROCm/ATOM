@@ -24,6 +24,7 @@ from atom.mono.device.ops import (
     bf16_round,
     fp8_pack4,
     row_sum,
+    rows_to_lds,
     traced,
 )
 from atom.mono.plan.execution import THREADS, WAVES
@@ -35,15 +36,21 @@ def moe_narrow_defs(k4ctx):
     """The functions of the per-(token, slot) MoE (S <= 4)."""
     BASE = k4ctx["BASE"]
     CPT = k4ctx["CPT"]
+    ROUTED_TASKS = k4ctx["ROUTED_TASKS"]
     MID16_WORDS = k4ctx["MID16_WORDS"]
     MID8_LDS = k4ctx["MID8_LDS"]
+    MID_BF = k4ctx["MID_BF"]
+    MID_FLAG = k4ctx["MID_FLAG"]
     MID8_WORDS = k4ctx["MID8_WORDS"]
     MIDSC_LDS = k4ctx["MIDSC_LDS"]
     MIDSC_WORDS = k4ctx["MIDSC_WORDS"]
+    SH_FMT = k4ctx["SH_FMT"]
     UG_ITERS = k4ctx["UG_ITERS"]
+    XN_FLAG = k4ctx["XN_FLAG"]
     XN8_WORDS = k4ctx["XN8_WORDS"]
     XSC_LDS = k4ctx["XSC_LDS"]
     XSC_WORDS = k4ctx["XSC_WORDS"]
+    acquire = k4ctx["acquire"]
     bid = k4ctx["bid"]
     down_load = k4ctx["down_load"]
     down_load_shared = k4ctx["down_load_shared"]
@@ -53,6 +60,7 @@ def moe_narrow_defs(k4ctx):
     lane = k4ctx["lane"]
     lds_b8 = k4ctx["lds_b8"]
     lds_i32 = k4ctx["lds_i32"]
+    mb = k4ctx["mb"]
     mb_poll = k4ctx["mb_poll"]
     mb_put = k4ctx["mb_put"]
     misc = k4ctx["misc"]
@@ -63,7 +71,7 @@ def moe_narrow_defs(k4ctx):
     route = k4ctx["route"]
     route_top4 = k4ctx["route_top4"]
     rwt = k4ctx["rwt"]
-    scores_copy = k4ctx["scores_copy"]
+    scores_read = k4ctx["scores_read"]
     sh_compute = k4ctx["sh_compute"]
     sh_load = k4ctx["sh_load"]
     stamp = k4ctx["stamp"]
@@ -95,11 +103,39 @@ def moe_narrow_defs(k4ctx):
             if tid < XSC_WORDS:
                 fx.ptr_store(got[n_xw][0], xs + (XSC_LDS + k * XSC_ROW + tid))
 
+        def fetch_xn_flagged(tok=None):
+            """``fetch_xn`` for plain words behind a flag a router task: wave 0 polls
+            the tasks' flags, then the rows are read as plain words."""
+            n_f = (tokens if tok is None else 1) * N_ROUTER
+            f0 = 0 if tok is None else tok * N_ROUTER
+            if wave == 0:
+                mb_poll([(mr("xndone"), f0 + fx.min(lane, n_f - 1), 1)])
+            gpu.barrier()
+            acquire()
+
+            def rows(k):
+                for base, n_row, lds_w, lds_row in (
+                    (mb("xn8p"), XN8_WORDS, k * XN8_ROW, XN8_ROW),
+                    (mb("xscp"), XSC_WORDS, XSC_LDS + k * XSC_ROW, XSC_ROW),
+                ):
+                    rows_to_lds(
+                        tid, base + fx.Int64(k) * (n_row * 4), 1, n_row, xs + lds_w,
+                        lds_row,
+                    )  # fmt: skip
+
+            if const_expr(tok is None):
+                for k in range_constexpr(tokens):
+                    rows(k)
+            else:
+                rows(tok)
+
         def fetch_xn(tok=None):
             """Token tok's (default: every token's) MXFP8 xn and scales -> xs. Wave
             0 first polls the last word of each router task's slice: all 512
             threads of 256 CTAs spinning on the whole of it (S = 4) held the
             shared-expert CTAs' xn back 3 us."""
+            if const_expr(XN_FLAG):
+                return fetch_xn_flagged(tok)
             gate_tok = fx.min(lane // N_ROUTER, tokens - 1) if tok is None else tok
             if wave == 0:
                 mb_poll(
@@ -144,7 +180,7 @@ def moe_narrow_defs(k4ctx):
                 if wave == k:
                     got = mb_poll(
                         [
-                            (scores_copy(mine, k), (lane + 64 * h) * 2, 2)
+                            (scores_read(mine, k), (lane + 64 * h) * 2, 2)
                             for h in range(2)
                         ]
                     )
@@ -207,8 +243,31 @@ def moe_narrow_defs(k4ctx):
         """Every token's route-weighted down GEMV of row group ``t`` -> push bf16
         partial rows -> rank-ordered sum -> ar_out."""
 
+        def stage_mids_bf(k):
+            """``stage_mids`` for bf16 pairs behind a tag each: 4 elements a spec."""
+            mids = mb_poll(
+                [
+                    (
+                        mr("mid"),
+                        k * MOE_SLOTS * INTER // 2
+                        + fx.min((tid + i * THREADS) * 2, MOE_SLOTS * INTER // 2 - 2),
+                        2,
+                    )
+                    for i in range(2)
+                ]
+            )
+            for i in range_constexpr(2):
+                if (tid + i * THREADS) * 4 < MOE_SLOTS * INTER:
+                    for q in range_constexpr(2):
+                        fx.ptr_store(
+                            mids[i][q],
+                            xs + (k * MID16_WORDS + (tid + i * THREADS) * 2 + q),
+                        )
+
         def stage_mids(k):
             """Token k's mid rows (every slot) -> xs, as bf16 pairs."""
+            if const_expr(MID_BF):
+                return stage_mids_bf(k)
             mids = mb_poll(
                 [
                     (
@@ -232,8 +291,21 @@ def moe_narrow_defs(k4ctx):
                     )
 
         # every token's mid in one go: they land together (S = 4: -1.1 us)
-        for k in range_constexpr(tokens):
-            stage_mids(k)
+        if const_expr(MID_FLAG):
+            # plain bf16 rows behind a flag a up / gate task (routed, then shared)
+            n_f = ROUTED_TASKS + SH_TASKS
+            mb_poll(
+                [
+                    (mr("ugdone"), fx.min(tid + THREADS * i, n_f - 1), 1)
+                    for i in range((n_f + THREADS - 1) // THREADS)
+                ]
+            )
+            gpu.barrier()
+            acquire()
+            rows_to_lds(tid, mb("mid"), tokens, MID16_WORDS, xs, MID16_WORDS)
+        else:
+            for k in range_constexpr(tokens):
+                stage_mids(k)
         stamp(10)
         gpu.barrier()
         # then MXFP8 in a pass of its own: quantizing inside stage_mids (after
@@ -274,7 +346,7 @@ def moe_narrow_defs(k4ctx):
                     + g4
                 ),
                 c=fx.Vector.filled(4, 0.0, fx.Float32),
-                a_fmt=FP4,
+                a_fmt=SH_FMT,
             )
             sh = [sh[j4] + cu[j4] * wgt for j4 in range(4)]
         fx.ptr_store(
