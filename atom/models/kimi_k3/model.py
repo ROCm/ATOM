@@ -2151,7 +2151,7 @@ class KimiDecoderLayer(nn.Module):
         layer defers its routed and shared outputs separately so that same fold
         absorbs their sum too. So add the pendings back here. Each is None on
         the layers that already folded it in, and an unwritten folded zero on
-        a row-sharded step.
+        a row- or column-sharded step.
 
         This lives on the layer rather than in the drafter because it is a
         property of THIS layer's return protocol -- it has to change in lockstep
