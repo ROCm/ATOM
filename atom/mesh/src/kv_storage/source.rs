@@ -5,9 +5,7 @@ use std::{fmt, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::kv_index::PrefixRequest;
-
-/// `atom-mooncake-{ns8}` / `atom-umbp-{ns8}` when generated, the config name otherwise.
+/// `atom-{backend}-{ns8}`, generated from the readers' offload report.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SourceId(pub Arc<str>);
 
@@ -110,10 +108,6 @@ pub enum StorageBackendSpec {
     MooncakeAdmin {
         masters: Vec<String>,
     },
-    /// UMBP master `BatchLookup`.
-    UmbpMaster {
-        addr: String,
-    },
     Mock(Arc<dyn StorageBackend>),
 }
 
@@ -128,9 +122,29 @@ pub struct StorageSourceSpec {
     pub deadline: Duration,
 }
 
-/// Gating, deadline and breaker are applied by the hub, not by the source.
-#[async_trait]
-pub trait StorageHitSource: Send + Sync {
-    fn spec(&self) -> &StorageSourceSpec;
-    async fn lookup(&self, req: &PrefixRequest<'_>) -> StorageLookup;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OffloadBackend {
+    MooncakeStore,
+    Lmcache,
+    #[serde(other)]
+    Other,
+}
+
+/// ATOM's offload connector, reported with each rank by `/kv_event_sources`
+/// (ROCm/ATOM#3277). `lmcache` reports only `chunk_tokens` and `min_load_tokens`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OffloadReport {
+    pub backend: OffloadBackend,
+    #[serde(default)]
+    pub masters: Vec<String>,
+    #[serde(default)]
+    pub namespace: Option<String>,
+    pub chunk_tokens: u32,
+    #[serde(default)]
+    pub world: Option<u32>,
+    pub min_load_tokens: u32,
+    /// Hex digest of the key chain over tokens `0..chunk_tokens`, for the key-rule self check.
+    #[serde(default)]
+    pub chain_check: Option<String>,
 }
