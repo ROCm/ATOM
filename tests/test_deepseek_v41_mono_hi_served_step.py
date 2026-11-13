@@ -23,7 +23,7 @@ def proposer_module():
 
 def _context(monkeypatch, module, service):
     fwd = SimpleNamespace(
-        attn_metadata=SimpleNamespace(served_by_round=service),
+        attn_metadata=SimpleNamespace(served_by_round=service, slot_mapping=None),
         context=SimpleNamespace(scheduled_bs=1),
     )
     monkeypatch.setattr(module, "get_forward_context", lambda: fwd)
@@ -32,7 +32,8 @@ def _context(monkeypatch, module, service):
 def _proposer(module, writes):
     p = module.DSparkProposer.__new__(module.DSparkProposer)
     p.model = SimpleNamespace(
-        write_context_kv=lambda hidden, positions: writes.append(hidden.shape),
+        write_context_kv=lambda hidden, positions, slots: writes.append(hidden.shape),
+        kv_pool_spec=None,
         vocab_size=100,
     )
     p.aux_for = lambda hidden: [hidden, hidden]
