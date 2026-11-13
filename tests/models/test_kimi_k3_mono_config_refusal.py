@@ -146,9 +146,11 @@ def _with_transport(kv_transfer_config):
     return cfg
 
 
-def test_a_mooncake_pd_decode_is_served(servable):
+@pytest.mark.parametrize("name", ["mooncake", "Mooncake", " mooncake "])
+def test_a_mooncake_pd_decode_is_served(servable, name):
     # its receives are NIC writes; it queues no copy kernel beside mono's
-    assert config_refusal(_with_transport(dict(_MOONCAKE_DECODE))) is None
+    decode = dict(_MOONCAKE_DECODE, kv_connector=name)
+    assert config_refusal(_with_transport(decode)) is None
 
 
 @pytest.mark.parametrize(
