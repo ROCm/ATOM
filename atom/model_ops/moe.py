@@ -1617,7 +1617,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.intermediate_pad = (
             self.intermediate_size - layer.intermediate_size_per_partition
         )
-        # MXFP4 is target-only: it is never dequantized as an online source.
         # Fused gate_up_proj (column parallel)
         w13_weight = atom_parameter(
             torch.empty(
@@ -3959,19 +3958,17 @@ class FusedMoE(torch.nn.Module):
     ) -> None:
         """Batch row-local experts to accelerate streaming online quantization."""
         batch_size = 8
-        inter = self.intermediate_size_per_partition
+        inter, hidden = self.intermediate_size_per_partition, self.hidden_size
 
-        # Drop the source's intermediate padding (MXFP4 pads to pad_align).
+        # Drop the source's padding (MXFP4 pads intermediate and hidden).
         def _trim_w13(bf16):
             half = bf16.shape[1] // 2
-            if half <= inter:
-                return bf16
-            return torch.cat([bf16[:, :inter], bf16[:, half : half + inter]], dim=1)
+            if half > inter:
+                bf16 = torch.cat([bf16[:, :inter], bf16[:, half : half + inter]], dim=1)
+            return bf16[..., :hidden]
 
         def _trim_w2(bf16):
-            if bf16.shape[-1] <= inter:
-                return bf16
-            return bf16[..., :inter].contiguous()
+            return bf16[:, :hidden, :inter]
 
         def _quantize(source, scale, trim):
             count, rows = source.shape[:2]
@@ -3983,7 +3980,7 @@ class FusedMoE(torch.nn.Module):
                 source_quant_dtype,
             )
             bf16 = trim(bf16.view(count, rows, -1))
-            bf16 = bf16.reshape(-1, bf16.shape[-1])
+            bf16 = bf16.reshape(-1, bf16.shape[-1]).contiguous()
             quantized, quant_scale = quant_weight_online(
                 bf16,
                 online_quant_type=online_quant_type,
@@ -4083,14 +4080,13 @@ class FusedMoE(torch.nn.Module):
                 old_w2_scale[start:end] if old_w2_scale is not None else None
             )
             w2_q, w2_s = _quantize(source_w2, source_w2_scale, _trim_w2)
-            source_w2_rows = source_w2.shape[1]
-            w2_q = w2_q.reshape(count, source_w2_rows, w2_q.shape[1])
+            w2_q = w2_q.reshape(count, -1, w2_q.shape[1])
             w2_s = _reshape_scale(w2_s, count)
 
             target_w2 = self.w2_weight.data[start:end]
             target_w2_scale = self.w2_weight_scale.data[start:end]
             FusedMoE._copy_quant_storage(
-                target_w2[:, :source_w2_rows, : w2_q.shape[2]],
+                target_w2[:, : w2_q.shape[1], : w2_q.shape[2]],
                 w2_q,
             )
             _copy_scale(target_w2_scale, w2_s, split_gate_up=False)
@@ -4305,7 +4301,8 @@ class FusedMoE(torch.nn.Module):
             QuantType.per_1x128,
         )
         target_rows_are_batchable = online_quant_type != QuantType.per_1x128 or (
-            old_w13_data.shape[1] // 2 % 128 == 0 and old_w2_data.shape[1] % 128 == 0
+            self.intermediate_size_per_partition % 128 == 0
+            and self.hidden_size % 128 == 0
         )
         if (
             not source_is_nvfp4
@@ -4332,6 +4329,7 @@ class FusedMoE(torch.nn.Module):
             )
             return
 
+        inter, hidden = self.intermediate_size_per_partition, self.hidden_size
         for expert_id in range(self.local_num_experts):
             # --- w13 column-parallel ---
             w13_local = old_w13_data[expert_id]
@@ -4353,9 +4351,9 @@ class FusedMoE(torch.nn.Module):
             else:
                 w1_bf16 = w13_local[:w1_size]
                 w3_bf16 = w13_local[w1_size:]
-            # Drop the source's intermediate padding.
-            w1_bf16 = w1_bf16[: self.intermediate_size_per_partition]
-            w3_bf16 = w3_bf16[: self.intermediate_size_per_partition]
+            # Drop the source's padding.
+            w1_bf16 = w1_bf16[:inter, :hidden].contiguous()
+            w3_bf16 = w3_bf16[:inter, :hidden].contiguous()
 
             w1_q, w1_s = _quant_weight(w1_bf16)
             w3_q, w3_s = _quant_weight(w3_bf16)
@@ -4421,8 +4419,8 @@ class FusedMoE(torch.nn.Module):
                     old_w2_scale[expert_id],
                     old_w2_scale_2[expert_id] if source_is_nvfp4 else None,
                 )
-            # And from w2's K, before the gather.
-            w2_local = w2_local[:, : self.intermediate_size_per_partition].contiguous()
+            # And from w2, before the gather.
+            w2_local = w2_local[:hidden, :inter].contiguous()
             if need_gather_w2:
                 w2_full = tp_group.all_gather(w2_local, dim=1)
                 w2_q, w2_s = _quant_weight(w2_full)
