@@ -38,6 +38,9 @@ def build_layer(
     index_nvfp4: bool = False,
     sh_first: int = 0,
     attn_mxfp8: bool = False,
+    sp_f32: bool = True,
+    moe_a16w4: bool = True,
+    moe_a4w4: bool = False,
 ):
     """The layer kernel for ``tokens`` and ``index_heads`` (1 or TP), K1 fused in
     or not (``fuse_k1``), selecting or reusing a selection (``index_topk``), its
@@ -49,7 +52,7 @@ def build_layer(
         TP, 0.088, 1e-6, 1.0, 1.0, 7.0, 1, 1, tokens, fuse_k1=fuse_k1, heads=heads,
         index_topk=index_topk, xn_flag=xn_flag, shared_mxfp8=shared_mxfp8, mid_flag=mid_flag,
         kv_nvfp4=kv_nvfp4, index_nvfp4=index_nvfp4, sh_first=sh_first,
-        attn_mxfp8=attn_mxfp8,
+        attn_mxfp8=attn_mxfp8, sp_f32=sp_f32, moe_a16w4=moe_a16w4, moe_a4w4=moe_a4w4,
     )  # fmt: skip
 
 
@@ -70,6 +73,9 @@ def check_build(
     index_nvfp4: bool = False,
     sh_first: int = 0,
     attn_mxfp8: bool = False,
+    sp_f32: bool = True,
+    moe_a16w4: bool = True,
+    moe_a4w4: bool = False,
 ) -> None:
     """Trace ``build_layer`` and check its hand-offs; raises ``ContractError``."""
     check_traced(
@@ -85,9 +91,22 @@ def check_build(
             index_nvfp4,
             sh_first,
             attn_mxfp8,
+            sp_f32,
+            moe_a16w4,
+            moe_a4w4,
         ),
         K4_ABI,
-        mailbox_regions(tokens, index_heads, fuse_k1, index_topk, xn_flag, mid_flag),
+        mailbox_regions(
+            tokens,
+            index_heads,
+            fuse_k1,
+            index_topk,
+            xn_flag,
+            mid_flag,
+            sp_f32,
+            moe_a16w4 and shared_mxfp8 and not moe_a4w4,
+            moe_a4w4,
+        ),
     )
 
 
@@ -100,31 +119,51 @@ if __name__ == "__main__":
     sizes = [int(a) for a in sys.argv[1:]] or list(range(1, 17))
     for s in sizes:
         for ih in (1, TP):
-            for it in (True, False):
-                for xf in (0, 1, 2):
-                    check_build(s, ih, index_topk=it, xn_flag=xf)
+            # a16w4 (the default) and the previous a8w4 experts (only a build with the
+            # unfused MXFP8 shared expert, ``shared_mxfp8``, takes a16w4)
+            for a16 in (True, False):
+                tag = "a16w4" if a16 else "a8w4"
+                for it in (True, False):
+                    for xf in (0, 1, 2):
+                        check_build(s, ih, index_topk=it, xn_flag=xf, moe_a16w4=a16)
+                        print(
+                            f"S={s} index heads={ih} index_topk={it} xn_flag={xf} {tag}:"
+                            " contract holds"
+                        )
+                if s < WIDE_FROM and not a16:
+                    check_build(s, ih, xn_flag=1, mid_flag=1, moe_a16w4=False)
                     print(
-                        f"S={s} index heads={ih} index_topk={it} xn_flag={xf}:"
-                        " contract holds"
+                        f"S={s} index heads={ih} xn_flag=1 mid_flag=1: contract holds"
                     )
-            if s < WIDE_FROM:
-                check_build(s, ih, xn_flag=1, mid_flag=1)
-                print(f"S={s} index heads={ih} xn_flag=1 mid_flag=1: contract holds")
-            check_build(s, ih, shared_mxfp8=True)
-            print(f"S={s} index heads={ih} shared_mxfp8: contract holds")
-            if s >= WIDE_FROM:
-                for k in (1, 2, 4):
-                    check_build(s, ih, shared_mxfp8=True, sh_first=k)
-                    print(f"S={s} index heads={ih} sh_first={k}: contract holds")
-            check_build(s, ih, kv_nvfp4=True, index_nvfp4=True)
-            print(f"S={s} index heads={ih} nvfp4 K/V + index: contract holds")
-            for nv in (False, True):
-                check_build(
-                    s,
-                    ih,
-                    shared_mxfp8=True,
-                    attn_mxfp8=True,
-                    kv_nvfp4=nv,
-                    index_nvfp4=nv,
-                )
-                print(f"S={s} index heads={ih} attn_mxfp8 nvfp4={nv}: contract holds")
+                check_build(s, ih, shared_mxfp8=True, moe_a16w4=a16)
+                print(f"S={s} index heads={ih} shared_mxfp8 {tag}: contract holds")
+                if s >= WIDE_FROM:
+                    for k in (1, 2, 4):
+                        check_build(s, ih, shared_mxfp8=True, sh_first=k, moe_a16w4=a16)
+                        print(
+                            f"S={s} index heads={ih} sh_first={k} {tag}: contract holds"
+                        )
+                check_build(s, ih, kv_nvfp4=True, index_nvfp4=True, moe_a16w4=a16)
+                print(f"S={s} index heads={ih} nvfp4 K/V + index {tag}: contract holds")
+                for nv in (False, True):
+                    check_build(
+                        s,
+                        ih,
+                        shared_mxfp8=True,
+                        attn_mxfp8=True,
+                        kv_nvfp4=nv,
+                        index_nvfp4=nv,
+                        moe_a16w4=a16,
+                    )
+                    print(
+                        f"S={s} index heads={ih} attn_mxfp8 nvfp4={nv} {tag}: contract holds"
+                    )
+            # a4w4 routed experts (needs the unfused MXFP8 shared expert)
+            for spf in (True, False):
+                check_build(s, ih, shared_mxfp8=True, moe_a4w4=True, sp_f32=spf)
+                print(f"S={s} index heads={ih} a4w4 sp_f32={spf}: contract holds")
+            check_build(
+                s, ih, shared_mxfp8=True, attn_mxfp8=True, kv_nvfp4=True,
+                index_nvfp4=True, moe_a4w4=True, sp_f32=False,
+            )  # fmt: skip
+            print(f"S={s} index heads={ih} a4w4 attn_mxfp8 nvfp4: contract holds")

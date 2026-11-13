@@ -80,6 +80,7 @@ def split_defs(k4ctx):
     lane = k4ctx["lane"]
     mb_put = k4ctx["mb_put"]
     mb_put_bf = k4ctx["mb_put_bf"]
+    mb_put_words = k4ctx["mb_put_words"]
     mr = k4ctx["mr"]
     opart = k4ctx["opart"]
     p8 = k4ctx["p8"]
@@ -97,6 +98,16 @@ def split_defs(k4ctx):
     v_scale = k4ctx["v_scale"]
     wave = k4ctx["wave"]
     wrsrc = k4ctx["wrsrc"]
+    sp_f32 = k4ctx["sp_f32"]
+
+    def put_sp_o_f32(i, ov):
+        """The partition's 4 outputs at element ``i`` (a multiple of 4) as f32 words."""
+        for h in range_constexpr(2):
+            mb_put_words(
+                mr("sp_o32"),
+                i + 2 * h,
+                [ov[2 * h].bitcast(fx.Int32), ov[2 * h + 1].bitcast(fx.Int32)],
+            )
 
     # Each stage is its own function: flydsl carries a local reassigned inside a
     # dynamic if / for as region state, so names must not be shared across stages.
@@ -307,7 +318,10 @@ def split_defs(k4ctx):
                 for w in range_constexpr(1, WAVES):
                     acc = acc + fx.ptr_load(opart + (w * O_K + e0 + k))
                 ov.append((pscale * acc) * inv_l)
-            mb_put_bf(mr("sp_o"), ts * O_K + e0, ov)
+            if const_expr(sp_f32):
+                put_sp_o_f32(ts * O_K + e0, ov)
+            else:
+                mb_put_bf(mr("sp_o"), ts * O_K + e0, ov)
             if tid < H:
                 mb_put(
                     mr("sp_m"),
@@ -355,13 +369,16 @@ def split_defs(k4ctx):
 
             # (the task runs them before the loop moves on: ``ts`` is this task's)
             def put_o(e0, ov):
-                mb_put_bf(mr("sp_o"), ts * O_K + e0, ov)  # noqa: B023
+                if const_expr(sp_f32):
+                    put_sp_o_f32(ts * O_K + e0, ov)
+                else:
+                    mb_put_bf(mr("sp_o"), ts * O_K + e0, ov)
 
             def put_m(head, m):
-                mb_put(mr("sp_m"), ts * H + head, m)  # noqa: B023
+                mb_put(mr("sp_m"), ts * H + head, m)
 
             def put_l(head, lt):
-                mb_put(mr("sp_l"), ts * H + head, lt)  # noqa: B023
+                mb_put(mr("sp_l"), ts * H + head, lt)
 
             split_nvfp4_task(
                 tid, lane, wave, tok, t, blk, q, k_cache, kg, vg, sm_scale, hst, opart,
@@ -383,6 +400,7 @@ def merge_defs(k4ctx):
     mb_poll = k4ctx["mb_poll"]
     mb_put = k4ctx["mb_put"]
     mr = k4ctx["mr"]
+    sp_f32 = k4ctx["sp_f32"]
     stamp = k4ctx["stamp"]
     start = k4ctx["start"]
     tid = k4ctx["tid"]
@@ -411,7 +429,17 @@ def merge_defs(k4ctx):
         got = mb_poll(
             [(mr("sp_m"), (sp0 + i) * H + hm, 1) for i in range(N_SPLIT)]
             + [(mr("sp_l"), (sp0 + i) * H + hm, 1) for i in range(N_SPLIT)]
-            + [(mr("sp_o"), ((sp0 + i) * O_K + e0) // 2, 2) for i in range(N_SPLIT)],
+            + (
+                [
+                    (mr("sp_o32"), (sp0 + i) * O_K + e0 + 2 * h, 2)
+                    for i in range(N_SPLIT)
+                    for h in range(2)
+                ]
+                if sp_f32
+                else [
+                    (mr("sp_o"), ((sp0 + i) * O_K + e0) // 2, 2) for i in range(N_SPLIT)
+                ]
+            ),
             batch=3 * N_SPLIT,
         )
         mls = got[: 2 * N_SPLIT]
@@ -430,8 +458,12 @@ def merge_defs(k4ctx):
         av = [fx.Float32(0.0) for _ in range(4)]
         for i in range_constexpr(N_SPLIT):
             wi = sl[i] / gs
-            o01 = bf2_f32(ovs[i][0])
-            o23 = bf2_f32(ovs[i][1])
+            if const_expr(sp_f32):
+                o01 = [ovs[2 * i][e].bitcast(fx.Float32) for e in range(2)]
+                o23 = [ovs[2 * i + 1][e].bitcast(fx.Float32) for e in range(2)]
+            else:
+                o01 = bf2_f32(ovs[i][0])
+                o23 = bf2_f32(ovs[i][1])
             av = [
                 av[0] + wi * o01[0],
                 av[1] + wi * o01[1],
@@ -706,7 +738,7 @@ def o_defs(k4ctx):
             # to the row group's owner rank only
             push_rows("attn", t * O_ROWS, O_ROWS, t % W if AG_RS else None)
             gpu.barrier()
-            if const_expr(AG_RS):  # noqa: SIM102
+            if const_expr(AG_RS):
                 # the owner sums every peer's partials in rank order and gathers
                 # the sums to every rank's a_ag (h_mid: the router tasks)
                 if own_task(t, "attn") & (tid < O_ROWS // 2 * tokens):
@@ -727,7 +759,7 @@ def o_defs(k4ctx):
                             ptk * HIDDEN + row,
                             [t0, t1],
                         )
-            if const_expr(not AG_RS):  # noqa: SIM102
+            if const_expr(not AG_RS):
                 # this task's rows of the all-reduce, finished here (GLM's
                 # peer_reduce): every peer's partials summed in rank order, bf16, plus
                 # the residual -> h_mid and the 'a' mailbox. A router task then reads

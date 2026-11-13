@@ -466,7 +466,7 @@ def emit_index_scores(
 
         def score_cp(tk, b, page):
             """Block b of the request ending at token tk, at ``page``: every head."""
-            if const_expr(wait_new_keys is not None):  # noqa: SIM102
+            if const_expr(wait_new_keys is not None):
                 if (b + 1) * SPARSE_BLOCK > readlane(seq_lane, tk) - MAX_TOKENS:
                     wait_new_keys()
             kw = split_tiles(load_raw(page, tiles), tiles, tab)
@@ -514,7 +514,7 @@ def emit_index_scores(
         for u in range(slot, total, BLOCKS):
             tk, b = task_block(fx.Int32(u))
             page = uniform(page_of(tk, b))
-            if const_expr(wait_new_keys is not None):  # noqa: SIM102
+            if const_expr(wait_new_keys is not None):
                 if new_keys_in(tk, b):
                     wait_new_keys()
             raw = load_raw(page, [wave])
@@ -543,7 +543,7 @@ def emit_index_scores(
 
         def score_task(tk, b, page):
             """Block b of the request ending at token tk, at ``page``."""
-            if const_expr(wait_new_keys is not None):  # noqa: SIM102
+            if const_expr(wait_new_keys is not None):
                 if (b + 1) * SPARSE_BLOCK > readlane(seq_lane, tk) - MAX_TOKENS:
                     wait_new_keys()
             raw = load_raw(page, tiles)
@@ -564,7 +564,7 @@ def emit_index_scores(
             for i in range(fx.min((total - c0 + step - 1) // step, 64)):
                 i = fx.Int32(i)
                 score_task(readlane(tk_j, i), readlane(b_j, i), readlane(pages, i))
-    if const_expr(cp):  # noqa: SIM102
+    if const_expr(cp):
         # cold: a step without context-parallel requests runs none of it
         if unlikely(total_cp > 0):
             emit_cp_tasks()

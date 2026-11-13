@@ -341,13 +341,16 @@ def split_nvfp4_task(
     gpu.barrier()
 
 
-def build_split_nvfp4_kernel(sm_scale: float, tasks: int, timed: bool = False):
+def build_split_nvfp4_kernel(
+    sm_scale: float, tasks: int, timed: bool = False, sp_f32: bool = False
+):
     """``@flyc.jit`` launcher of ``tasks`` split tasks alone, one CTA each (K4's
     harness): task ts = (token ts // N_SPLIT, partition ts % N_SPLIT); ``tables``
     [tasks][32] i32 (16 page-16 ids, n_ctx at 16), ``q`` bf16 [token][O_K], the cache,
-    the f32 global scales [k, v]; writes ``sp_o`` bf16 [ts][O_K], ``sp_m`` / ``sp_l``
-    f32 [ts][H]. ``timed``: ``sp_l`` is followed by an i32 [tasks] of the task's
-    ``s_memrealtime`` ticks (100 MHz), first load of its page list to its last put."""
+    the f32 global scales [k, v]; writes ``sp_o`` bf16 [ts][O_K] (``sp_f32``: f32, as
+    K4's ``sp_f32`` build keeps it), ``sp_m`` / ``sp_l`` f32 [ts][H]. ``timed``:
+    ``sp_l`` is followed by an i32 [tasks] of the task's ``s_memrealtime`` ticks (100 MHz), first load of its page list to its last put.
+    """
     assert 1 <= tasks <= BLOCKS
 
     @fx.struct
@@ -357,7 +360,11 @@ def build_split_nvfp4_kernel(sm_scale: float, tasks: int, timed: bool = False):
         blk: fx.Array[fx.Int32, 32, 16]
 
     kernel_name = kernel_symbol(
-        "minimax_m3_split_nvfp4", s=tasks, sm=int(sm_scale * 1e6), t=int(timed)
+        "minimax_m3_split_nvfp4",
+        s=tasks,
+        sm=int(sm_scale * 1e6),
+        t=int(timed),
+        **({"f32": 1} if sp_f32 else {}),
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=[THREADS, 1, 1])
@@ -387,6 +394,11 @@ def build_split_nvfp4_kernel(sm_scale: float, tasks: int, timed: bool = False):
         vg = fx.Float32(bo.buffer_load(rsrc(gs), 1, vec_width=1, dtype=T.f32))
 
         def put_o(e0, ov):
+            if const_expr(sp_f32):
+                bo.buffer_store(
+                    _V.from_elements(ov, fx.Float32), rsrc(sp_o), ts * O_K + e0
+                )
+                return
             words = []
             for j in range_constexpr(2):
                 words.append(
@@ -408,7 +420,7 @@ def build_split_nvfp4_kernel(sm_scale: float, tasks: int, timed: bool = False):
             tid, lane, wave, ts // N_SPLIT, ts % N_SPLIT, blk, q, kv, kg, vg,
             sm_scale, lds.hst.ptr, lds.opart.ptr, n_ctx, put_o, put_m, put_l,
         )  # fmt: skip
-        if const_expr(timed):  # noqa: SIM102
+        if const_expr(timed):
             if tid == 0:
                 bo.buffer_store(fx.Int32(memrealtime() - t0), rsrc(tl), ts)
 
@@ -417,7 +429,7 @@ def build_split_nvfp4_kernel(sm_scale: float, tasks: int, timed: bool = False):
         tables: Int64, q: Int64, kv: Int64, gs: Int64, sp_o: Int64, sp_m: Int64,
         sp_l: Int64, tl: Int64, stream: fx.Stream = _CURRENT_STREAM,
     ):  # fmt: skip
-        _ = (sm_scale, tasks)  # build parameters
+        _ = (sm_scale, tasks, sp_f32)  # build parameters
         split_kernel(tables, q, kv, gs, sp_o, sp_m, sp_l, tl).launch(
             grid=(tasks,), block=(THREADS,), stream=stream
         )
