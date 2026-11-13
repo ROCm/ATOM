@@ -79,9 +79,9 @@ def post_comment(repo, pr, body, tok, _open=None):
             landed = getattr(resp, "url", url)
             try:
                 data = json.load(resp)
-            except Exception:                            # noqa: BLE001 - best effort
+            except Exception:  # noqa: BLE001 - best effort
                 data = None
-    except Exception as e:                               # noqa: BLE001 - must not fail CI
+    except Exception as e:  # noqa: BLE001 - must not fail CI
         return None, f"POST {url} raised: {e}"
 
     cid = data.get("id") if isinstance(data, dict) else None
@@ -90,8 +90,10 @@ def post_comment(repo, pr, body, tok, _open=None):
         # redirect means the repo moved, a 2xx without an id means the API changed.
         moved = "" if landed == url else f"; request was redirected to {landed}"
         kind = type(data).__name__
-        return None, (f"POST {url} -> HTTP {status} but no comment was created "
-                      f"(response was {kind}{moved})")
+        return None, (
+            f"POST {url} -> HTTP {status} but no comment was created "
+            f"(response was {kind}{moved})"
+        )
     return cid, f"HTTP {status}"
 
 

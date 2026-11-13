@@ -221,9 +221,11 @@ fi
 
 echo "[notify handoff]"
 # The report job stays quiet when _notify.py says it already spoke, so that flag must mean a
-# comment actually landed. _notify.py returns 0 without posting in three cases -- no status
-# file, no token, a POST that threw -- and claiming "notified" in any of them would trade a
-# visible failure for a silent one. Two of the three are testable without a network.
+# comment actually landed. _notify.py returns 0 without posting in four cases -- no status
+# file, no token, a POST that threw, and a POST GitHub answered 2xx without creating a comment
+# -- and claiming "notified" in any of them would trade a visible failure for a silent one.
+# Two of the four need no network and are checked here; _notify_test.py drives main() over a
+# fake transport for the two that do.
 notified_flag() {  # <status file contents or empty> -> what _notify.py wrote to GITHUB_OUTPUT
   local w o; w=$(mktemp -d); o=$(mktemp)
   [ -n "$1" ] && printf '%s\n' "$1" > "$w/.atom-review-status"

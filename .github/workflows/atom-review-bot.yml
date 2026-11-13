@@ -196,7 +196,7 @@ jobs:
             -X POST -H "Authorization: token $ATOM_BOT_TOKEN" \
             -H 'Accept: application/vnd.github+json' \
             "https://api.github.com/repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
-            -d '{"content":"eyes"}' || echo 000)
+            -d '{"content":"eyes"}')
           case "$code" in
             2*) echo "claimed 👀 (HTTP $code)" ;;
             *)  echo "::warning title=atom-review-bot::could not claim 👀 as the bot (HTTP $code): $(head -c 300 /tmp/eyes.json 2>/dev/null)" ;;
@@ -247,8 +247,10 @@ jobs:
             printf 'flow\tthe review step failed with no classified status (a hard timeout kill?) -- see the job log\n' > "$GITHUB_WORKSPACE/.atom-review-status"
           fi
           # _notify.py sets the `notified` output itself, and only once a post has actually
-          # landed. It returns 0 without posting in three cases -- no status file, no token, a
-          # POST that threw -- and in every one of them the report job must still speak.
+          # landed. It returns 0 without posting in four cases -- no status file, no token, a
+          # POST that threw, and a POST GitHub answered 2xx without creating a comment (a
+          # redirect downgrades it to a GET) -- and in every one of them the report job must
+          # still speak.
           python3 "${{ steps.rl.outputs.dir }}/_notify.py" "$PR"
 
   report:
