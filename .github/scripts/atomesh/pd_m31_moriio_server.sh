@@ -41,6 +41,9 @@ M31_VLLM_ARGS=(
   --max-model-len 1048576
   --reasoning-parser minimax_m3 --tool-call-parser minimax_m3 --enable-auto-tool-choice
 )
+# Arguments for every server, e.g. a recipe's engine flags shared by P and D.
+read -r -a m31_extra_args <<< "${ATOMESH_M31_EXTRA_ARGS:-}"
+M31_VLLM_ARGS+=("${m31_extra_args[@]}")
 
 quote() {
   local a out=()
@@ -134,7 +137,7 @@ if [[ "${M31_CONNECTOR}" == mooncake ]]; then
 fi
 
 start_vllm_server() {
-  local role="$1" log_name="$2" server_port="$3" gpus idx xfer
+  local role="$1" log_name="$2" server_port="$3" gpus idx xfer lru=""
   local -a cache_env=() role_env=() role_args=() pin=() p_extra_args=()
   build_server_cache_env "${role}" "${server_port}" cache_env
   if [[ "${role}" == prefill ]]; then
@@ -147,7 +150,8 @@ start_vllm_server() {
     else
       xfer="$(m31_moriio kv_producer "${server_port}" $((M31_HANDSHAKE_PORT + 1000 * idx)) $((M31_NOTIFY_PORT + 1000 * idx)))"
     fi
-    xfer="{\"kv_connector\":\"MultiConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"connectors\":[${xfer},{\"kv_connector\":\"SimpleCPUOffloadConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"cpu_bytes_to_use\":${ATOMESH_M31_P_CPU_OFFLOAD_BYTES},\"lazy_offload\":${ATOMESH_M31_P_LAZY_OFFLOAD:-false}}}]}}"
+    [[ -n "${ATOMESH_M31_P_CPU_LRU_EVICTION:-}" ]] && lru=",\"cpu_lru_eviction\":${ATOMESH_M31_P_CPU_LRU_EVICTION}"
+    xfer="{\"kv_connector\":\"MultiConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"connectors\":[${xfer},{\"kv_connector\":\"SimpleCPUOffloadConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"cpu_bytes_to_use\":${ATOMESH_M31_P_CPU_OFFLOAD_BYTES},\"lazy_offload\":${ATOMESH_M31_P_LAZY_OFFLOAD:-false}${lru}}}]}}"
     role_args=(--tensor-parallel-size "${PREFILL_TP_SIZE}" --max-num-seqs $((2 * m31_conc)) --port "${server_port}" --gpu-memory-utilization 0.85
       --max-num-batched-tokens 32768)
     [[ "${ATOMESH_M31_P_DBO:-1}" == 1 ]] &&

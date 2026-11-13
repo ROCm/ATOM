@@ -17043,6 +17043,59 @@ models:
               ATOMESH_M31_D_MAX_SEQS: "20"
               ATOMESH_M31_P_CPU_OFFLOAD_BYTES: "1499000000000"
               ATOMESH_M31_P_EXTRA_ARGS: --long-prefill-token-threshold 4096
+        # The n967 Mooncake points on InferenceX #5035's single-node stack: its image (vllm-internal
+        # 75bc8cf1 over 4fab5a074, run as shipped) and engine settings. Both roles: breakable CUDA
+        # graphs, DEBUG_HIP_IGNORE_STREAM_PRIORITY=0, PYTHONHASHSEED=0, 8 renderer workers, prompt-token
+        # details, batch-sharded sampling; none of the four old ROCm switches. P: DBO 16384/32768,
+        # graphs up to 2048 tokens, LRU eviction on the CPU tier. D keeps its 8192-token steps (below
+        # both DBO thresholds) and its 8..8*max-num-seqs FULL decode graphs.
+        - &m31_mc_1p2d_ax5035_case
+          <<: *m31_mc_1p2d_n967_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-ax5035-mc-c64-dcap16
+          image: vllm/vllm-openai-rocm:minimax-m31-flash-75bc8cf1@sha256:f8e8ab239e5edb7c3070c5802fc7fc0cbb889513bf81183dfc98ce1c77e1dfe1
+          concurrency: [64]
+          env:
+            common: &m31_ax5035_mc_env
+              <<: *m31_n967_mc_env
+              ATOMESH_M31_VLLM_SHA: 4fab5a07475822c6eaa971dceb2e2220d0446808
+              ATOMESH_M31_VLLM_BASE_SHA: 4fab5a07475822c6eaa971dceb2e2220d0446808
+              ATOMESH_M31_EXTRA_ENV: VLLM_USE_BREAKABLE_CUDAGRAPH=1 DEBUG_HIP_IGNORE_STREAM_PRIORITY=0 PYTHONHASHSEED=0
+              ATOMESH_M31_EXTRA_ARGS: --renderer-num-workers 8 --enable-prompt-tokens-details --enable-batch-sharded-sampling
+              ATOMESH_M31_P_DBO: "1"
+              ATOMESH_M31_P_EXTRA_ARGS: '--compilation-config {"max_cudagraph_capture_size":2048}'
+              ATOMESH_M31_P_CPU_LRU_EVICTION: "true"
+              ATOMESH_M31_D_MAX_SEQS: "16"
+        - <<: *m31_mc_1p2d_ax5035_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-ax5035-mc-c40-dcap10
+          concurrency: [40]
+          env:
+            common:
+              <<: *m31_ax5035_mc_env
+              ATOMESH_M31_D_MAX_SEQS: "10"
+        - <<: *m31_mc_1p2d_ax5035_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-ax5035-mc-c48-dcap12
+          concurrency: [48]
+          env:
+            common:
+              <<: *m31_ax5035_mc_env
+              ATOMESH_M31_D_MAX_SEQS: "12"
+        - <<: *m31_mc_1p2d_ax5035_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-ax5035-mc-c72-dcap18-cpu15
+          concurrency: [72]
+          env:
+            common:
+              <<: *m31_ax5035_mc_env
+              ATOMESH_M31_D_MAX_SEQS: "18"
+              ATOMESH_M31_P_CPU_OFFLOAD_BYTES: "1499000000000"
+        - <<: *m31_mc_1p2d_ax5035_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-ax5035-mc-c80-dcap20-cpu15-lpt4k
+          concurrency: [80]
+          env:
+            common:
+              <<: *m31_ax5035_mc_env
+              ATOMESH_M31_D_MAX_SEQS: "20"
+              ATOMESH_M31_P_CPU_OFFLOAD_BYTES: "1499000000000"
+              ATOMESH_M31_P_EXTRA_ARGS: '--compilation-config {"max_cudagraph_capture_size":2048} --long-prefill-token-threshold 4096'
         # The local 1P1D layout (P GPUs 0-3, D GPUs 4-7 of one node) with xgmi swapped for RDMA.
         - &m31_moriio_1p1d_sn_case
           <<: *m31_moriio_1p2d_case
