@@ -111,7 +111,6 @@ def runtime_config(**overrides):
         {"kv_transfer_config": {"connector": "moriio"}},
         {"enable_rapidserve": True},
         {"online_quant_config": {}},
-        {"eplb_enable": True},
         {"kv_cache_dtype": "fp16"},
         {"index_cache_dtype": "bf16"},
         {"kv_cache_block_size": 3},

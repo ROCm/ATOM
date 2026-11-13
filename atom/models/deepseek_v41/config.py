@@ -408,7 +408,6 @@ def validate_runtime_config(config):
         ),
         ("RapidServe", config.enable_rapidserve),
         ("online quantization", config.online_quant_config is not None),
-        ("EPLB", config.eplb_enable),
         (
             # The plane the paged scorer reads: FP8, or FP4 in the row-group
             # scorer's page-8 layout (`index_plane`). The main pool stays

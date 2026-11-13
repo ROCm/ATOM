@@ -75,5 +75,7 @@ def config_refusal(atom_config) -> str | None:
         # a side-stream compressor would run beside the persistent kernels and
         # contend for their CUs
         (envs.ATOM_DSV41_SIDE_STREAMS == 0, "ATOM_DSV41_SIDE_STREAMS"),
+        # the MoE kernel reads a rank's experts by logical id, not EPLB's slots
+        (not atom_config.eplb_enable, "EPLB"),
     ]
     return first_refusal(checks)
