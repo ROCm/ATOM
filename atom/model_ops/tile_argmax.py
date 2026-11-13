@@ -35,7 +35,7 @@ def argmax_of_tiles(part_val_ptr, part_idx_ptr, row, num_rows, num_tiles, BLOCK_
     """One row's ``(max, lowest id)`` from its tiles' pairs, stored
     ``[num_tiles, num_rows]``, picking among tiles that tie as
     `argmax_lowest_id` does within one. Tiles with no hit publish the
-    ``2147483647`` sentinel, so a row whose every tile is all NaN answers id
+    `NO_HIT` sentinel, so a row whose every tile is all NaN answers id
     0, as ``torch.argmax`` would."""
     offs_tile = tl.arange(0, BLOCK_TILE)
     tile_mask = offs_tile < num_tiles
@@ -43,7 +43,7 @@ def argmax_of_tiles(part_val_ptr, part_idx_ptr, row, num_rows, num_tiles, BLOCK_
         part_val_ptr + offs_tile * num_rows + row, mask=tile_mask, other=float("-inf")
     )
     idxs = tl.load(
-        part_idx_ptr + offs_tile * num_rows + row, mask=tile_mask, other=2147483647
+        part_idx_ptr + offs_tile * num_rows + row, mask=tile_mask, other=NO_HIT
     )
-    best, winner = argmax_lowest_id(vals, idxs, tile_mask, 2147483647)
-    return best, tl.where(winner == 2147483647, 0, winner)
+    best, winner = argmax_lowest_id(vals, idxs, tile_mask, NO_HIT)
+    return best, tl.where(winner == NO_HIT, 0, winner)
