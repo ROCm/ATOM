@@ -12,7 +12,9 @@ import logging
 import numpy as np
 import torch
 from aiter import dtypes, get_mla_metadata_info_v1, get_mla_metadata_v1
-from sglang.kernels.ops.attention.utils import create_flashinfer_kv_indices_triton
+from sglang.kernels.ops.attention.kv_indices import (
+    create_flashinfer_kv_indices_triton,
+)
 
 from atom.plugin.sglang.runtime.attention_backend_resolver import (
     resolve_sglang_runtime,

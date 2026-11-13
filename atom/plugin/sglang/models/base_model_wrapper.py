@@ -405,8 +405,19 @@ class _AtomCausalLMBaseForSglang(nn.Module):
         self.capture_aux_hidden_states = True
 
     def _make_dspark_aux_hook(self, index, extract, aux_hook):
-        def write(tensor, off):
-            end = off + tensor.shape[0]
+        def write(tensor, tokens):
+            n = int(tensor.shape[0])
+            if isinstance(tokens, slice):
+                start = 0 if tokens.start is None else int(tokens.start)
+                end = start + n if tokens.stop is None else int(tokens.stop)
+                assign = slice(start, end)
+            elif torch.is_tensor(tokens):
+                end = int(tokens.max().item()) + 1 if tokens.numel() else 0
+                assign = tokens
+            else:
+                start = int(tokens)
+                end = start + n
+                assign = slice(start, end)
             buffers = self._dspark_aux_buffers
             buf = buffers[index]
             width = int(tensor.shape[-1])
@@ -423,7 +434,7 @@ class _AtomCausalLMBaseForSglang(nn.Module):
                     grown[:capacity].copy_(buf)
                 buffers[index] = grown
                 buf = grown
-            buf[off:end].copy_(tensor)
+            buf[assign].copy_(tensor)
 
         return aux_hook(extract, write)
 
