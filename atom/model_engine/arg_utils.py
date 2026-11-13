@@ -411,6 +411,11 @@ class EngineArgs:
             "prompt-token load. 'least_tokens': route to the rank with "
             "the lowest combined in-flight token load (prompt tokens + "
             "per-request token-equivalent, tunable via ATOM_DP_LB_REQ_EQUIV). "
+            "'prefix_spread': keep a request on the rank holding its prompt's "
+            "prefix unless that rank has a prefill backlog and another is "
+            "about to idle (ATOM_DP_PREFIX_IDLE_TOKENS); the moved request "
+            "loads its prefix from the offload tier. Needs prefix caching; "
+            "excludes ATOM_DP_SESSION_AFFINITY. "
             "Has no effect when data_parallel_size == 1.",
         )
         parser.add_argument(

@@ -219,6 +219,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # and reads as 0. Keep it >= max_num_seqs; a smaller cap truncates every
     # rank's running batch. CoreManager warns when that happens.
     "ATOM_DP_DISPATCH_DEPTH": lambda: _nonnegative_int_env("ATOM_DP_DISPATCH_DEPTH", 0),
+    # `--dp-load-balance prefix_spread`: a rank with less queued prefill than
+    # this is about to idle and may take requests from a prefix's rank with
+    # over twice this queued. Must be positive; the default is two 16k prefill
+    # chunks.
+    "ATOM_DP_PREFIX_IDLE_TOKENS": lambda: _optional_int_env(
+        "ATOM_DP_PREFIX_IDLE_TOKENS", min_value=1
+    )
+    or 32768,
     # Place a new agent session on the lightest DP rank, then keep every later
     # request on that immutable cache owner. Existing sessions never spill;
     # child correlation ids are independently load-placed rather than
@@ -451,6 +459,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "ATOM_ENABLE_DS_QKNORM_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_DS_QKNORM_FUSION", "1") == "1"
+    ),
+    # DeepSeek-V4/V4.1 shared expert: clamp + silu(gate)*up + FP8 quant in one
+    # aiter triton kernel feeding w2. Ranks whose intermediate width is not a
+    # multiple of 128 keep the unfused path.
+    "ATOM_V4_USE_TRITON_FUSION": lambda: (
+        os.getenv("ATOM_V4_USE_TRITON_FUSION", "0") == "1"
     ),
     "ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION", "1") == "1"
@@ -1355,6 +1369,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # rather than copied once per rank -- and copies only if that is refused.
     # `tools/engram/bench_uva_shard.py` measures both.
     "ATOM_ENGRAM_UVA_COPY": lambda: os.getenv("ATOM_ENGRAM_UVA_COPY", "1") == "1",
+    # Optional override of the file that serializes shared in-place
+    # registration. Empty: host_memory names one from the checkpoint path.
+    "ATOM_ENGRAM_REG_LOCK": lambda: os.getenv("ATOM_ENGRAM_REG_LOCK", ""),
     # Where the compressed-vocab table is cached between runs. The table is
     # reproducible from the tokenizer, so this only trades startup time for
     # disk; point it at shared storage to let several servers build it once.
@@ -1466,6 +1483,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # rejected as not implemented). A kv_connector_extra_config
     # "lmcache.mp.mp_transfer_mode" takes precedence.
     "LMCACHE_MP_TRANSFER_MODE": lambda: os.getenv("LMCACHE_MP_TRANSFER_MODE", "auto"),
+    # LMCache's own chunk size, as the connector configures LMCache with it.
+    # Read on the ATOM side only by `prefix_spread`, which predicts loads with
+    # it and checks it against an LMCache MP server's chunk at registration.
+    "LMCACHE_CHUNK_SIZE": lambda: _int_env("LMCACHE_CHUNK_SIZE", 256),
 }
 
 

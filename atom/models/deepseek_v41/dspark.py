@@ -3,6 +3,7 @@
 
 import logging
 from copy import copy
+from types import SimpleNamespace
 
 import torch
 from aiter.dist.parallel_state import get_tp_group
@@ -35,6 +36,7 @@ from atom.models.deepseek_v4_dspark import (
     _DSparkInner,
 )
 from atom.models.dspark_draft import DSparkDraftModel
+from atom.spec_decode.drafter import AuxCaptureSpec
 from atom.utils import envs
 
 from .attention import Attention
@@ -199,6 +201,23 @@ class DeepseekV41DSpark(DSparkDraftModel):
             args.qk_rope_head_dim, capacity + self.block_size, base=args.rope_theta
         )
         self.embed = self.head = None
+        # Stage 0's main_norm, as a fused RMSNorm + MXFP8 quant. Outside the
+        # module tree so the loader looks for no new weight; it holds
+        # main_norm's own weight tensor, so loads and weight syncs reach it.
+        self._build_main_norm_quant()
+
+    def _build_main_norm_quant(self):
+        main = self.mtp[0].main_norm
+        norm = RMSNorm(
+            main.dim,
+            main.eps,
+            fused_quant=True,
+            quant_config=native_quant_config(),
+        )
+        norm.weight = main.weight
+        # A plain object, not a child module: assigning the RMSNorm itself
+        # would register it and make the loader look for a second weight.
+        self._main_norm_quant_holder = SimpleNamespace(norm=norm)
 
     @property
     def model(self):
@@ -228,9 +247,7 @@ class DeepseekV41DSpark(DSparkDraftModel):
     def share_with_target(self, target_base, loaded=None):
         self.embed, self.head = target_base.embed, target_base.head
 
-    def target_aux_capture_spec(self, layer_ids, hidden_size):
-        from atom.spec_decode.drafter import AuxCaptureSpec
-
+    def target_aux_capture_spec(self, layer_ids, hidden_size, _target_layers=None):
         # Published taps (37, 38, 39) have no Engram. A block pre-hook at an
         # Engram layer would read before its injection, violating the checkpoint.
         if set(layer_ids).intersection(self.config.engram_layer_ids):
@@ -252,11 +269,31 @@ class DeepseekV41DSpark(DSparkDraftModel):
         first = self.mtp[0]
         return first.main_norm(first.main_proj(aux_concat))
 
+    def project_context_quant(self, aux_concat):
+        """`project_context`, emitted as the fused KV GEMM's quantized input.
+
+        Returns E4M3 values and their row-major group-32 UE8M0 scales, the
+        `(x, x_scale)` pair `native_quant_linear` would otherwise make itself
+        with `quantize_fp8`, from one RMSNorm + MXFP8 launch.
+
+        Not bit-identical to `project_context` followed by that quantize: the
+        fused kernel quantizes the fp32 normalized value, where the chain
+        rounds it to bf16 first and quantizes the rounded value, so an element
+        near an E4M3 code boundary can land on the other code. It also has no
+        `ATOM_USE_MODEL_SENSITIVE_RMSNORM` rounding mode, so `write_context_kv`
+        keeps the chain when that is set.
+        """
+        return self._main_norm_quant()(self.mtp[0].main_proj(aux_concat))
+
+    def _main_norm_quant(self):
+        """The fused norm built in ``__init__``."""
+        return self._main_norm_quant_holder.norm
+
     @property
     def context_layers(self):
         return tuple(layer.attn for layer in self.mtp)
 
-    def write_context_kv(self, aux_concat, positions):
+    def write_context_kv(self, aux_concat, positions, slot_mapping=None):
         from atom.utils.forward_context import get_forward_context
 
         forward = get_forward_context()
@@ -276,11 +313,12 @@ class DeepseekV41DSpark(DSparkDraftModel):
         # target just ran and what these buffers therefore hold. A padding row
         # belongs to a zero-length request in `cu_seqlens_q`, so it is
         # projected and then written nowhere.
-        hidden = self.project_context(aux_concat[: step.running_tokens].unsqueeze(0))
+        ctx = aux_concat[: step.running_tokens].unsqueeze(0)
         positions = positions[: step.running_tokens][None]
         layers = self.context_layers
         fused = self._context_kv_fusion()
         if fused is None:
+            hidden = self.project_context(ctx)
             for attention in layers:
                 keys = attention.project_context(
                     hidden, positions, self.rope, packed=cache.window_fp8
@@ -288,12 +326,19 @@ class DeepseekV41DSpark(DSparkDraftModel):
                 cache.write_window(attention.spec.layer_id, keys, step)
             return
         weight, weight_scale, group_rows, width, preshuffled = fused
+        if envs.ATOM_USE_MODEL_SENSITIVE_RMSNORM:
+            hidden, hidden_scale = self.project_context(ctx), None
+        else:
+            # The norm emits the GEMM's quantized input, so the GEMM does not
+            # run its own quantize_fp8 on the bf16 norm output.
+            hidden, hidden_scale = self.project_context_quant(ctx)
         kv = native_quant_linear(
             hidden,
             weight,
             weight_scale,
             weight_group_rows=group_rows,
             weight_preshuffled=preshuffled,
+            x_scale=hidden_scale,
         ).unflatten(-1, (len(layers), width))
         tail = self._draft_kv_tail_fusion()
         if tail is None:

@@ -142,7 +142,7 @@ class OutputThreadStateTest(unittest.TestCase):
             )
             self.addCleanup(mgr.ctx.term)
             mgr._deliver_terminal_output = lambda seq: False
-            mgr._release_seq_load = lambda seq_id: None
+            mgr._release_seq = lambda seq_id: None
             mgr._shutdown_engine_core_rank = lambda rank: None
             url = f"inproc://outputs-{uuid.uuid4().hex}"
             receiver = mgr.ctx.socket(zmq.PULL)

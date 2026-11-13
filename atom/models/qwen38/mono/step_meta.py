@@ -200,7 +200,8 @@ class GDNPools:
 class QSAPools:
     """One QSA layer's paged caches (one block table): ``k``, ``v`` [blocks, bs, kv_heads, head_dim] (bf16, or fp8
     with fp32 ``k_scale`` / ``v_scale`` [blocks, bs, kv_heads]), ``index_raw`` [blocks, bs, 1, index_dim],
-    ``index_cmp`` [blocks, bs / compress, 1, index_dim] (bf16)."""
+    ``index_cmp`` [blocks, bs / compress, 1, index_dim] (bf16), and with a multimodal config the RoPE positions
+    ``rope_positions`` [blocks, bs, 1, 3] (int64)."""
 
     geo: object  # Geometry
     k: torch.Tensor
@@ -209,6 +210,7 @@ class QSAPools:
     index_cmp: torch.Tensor
     k_scale: torch.Tensor | None = None
     v_scale: torch.Tensor | None = None
+    rope_positions: torch.Tensor | None = None
 
     def __post_init__(self):
         g = self.geo
@@ -242,6 +244,15 @@ class QSAPools:
                     raise ValueError(
                         f"fp8 QSA caches need fp32 {name} [{n}, {bs}, {g.kv_heads}]"
                     )
+        p = self.rope_positions
+        if p is not None and (
+            tuple(p.shape) != (n, bs, 1, 3)
+            or p.dtype != torch.int64
+            or not p.is_contiguous()
+        ):
+            raise ValueError(
+                f"unsupported QSA rope_positions cache {tuple(p.shape)} {p.dtype}, want int64 [{n}, {bs}, 1, 3]"
+            )
         if bs % g.index_compress:
             raise ValueError(
                 f"QSA block size {bs} is not a multiple of {g.index_compress}"

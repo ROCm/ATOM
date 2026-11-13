@@ -15,6 +15,7 @@ from atom.distributed.ulysses_sp import local_num_kv_heads
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mha import PagedAttentionImpl, use_pa_decode_bf16_asm
 from atom.model_ops.minimax_m3.sparse_attn import (
+    ASM_PAGE_SIZE,
     make_sparse_decode_metadata,
     make_sparse_prefill_metadata,
 )
@@ -193,6 +194,7 @@ class AiterBackend(AttentionBackend):
         target_block_size: int,
         layers: int,
         kv_dtype,
+        **pool_kwargs,
     ):
         """An MHA pool, which is the one this backend's kernels read."""
         return MhaKvPool.from_hf_config(
@@ -201,6 +203,7 @@ class AiterBackend(AttentionBackend):
             block_size=target_block_size,
             layers=layers,
             kv_dtype=kv_dtype,
+            **pool_kwargs,
         )
 
 
@@ -666,21 +669,37 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         )
 
     def get_kv_transfer_tensors(self):
-        from atom.kv_transfer.disaggregation.page_region import page_region
         from atom.kv_transfer.disaggregation.types import KVTransferTensors
 
         if not self.kv_pools:
             return None
+        index = self._index_cache_spec()
+        index_rows = self.pool_rows.get(INDEX_ROWS, {})
+        pages = []
+        for geometry, pool in self.kv_pools.items():
+            # Each unit names its layer, so a PP stage's match the unsplit
+            # model's; M3's sparse layers view their cache in page-16 SHUFFLE.
+            modules = sorted(self.pool_rows[geometry], key=self.pool_rows[geometry].get)
+            extra = {}
+            if pool.extra_fields:
+                layers = sorted(index_rows, key=index_rows.get)
+                extra["index"] = ([m.layer_num for m in layers], index.dim, index.dtype)
+            pages += pool.transfer_pages(
+                "mha",
+                f"mha.{geometry}",
+                [m.layer_num for m in modules],
+                [
+                    (
+                        ASM_PAGE_SIZE
+                        if _is_indexed_sparse_attention(m)
+                        else pool.block_size
+                    )
+                    for m in modules
+                ],
+                extra,
+            )
         return KVTransferTensors(
-            # Every field of every pool, indexer cache included: a unit per
-            # (pool, field, layer), in declared order. The geometry is in the
-            # role because a hybrid declares two pools whose per-layer regions
-            # are otherwise named alike.
-            pages=[
-                page_region(tensor, semantic_role=f"mha.{geometry}.{role}")
-                for geometry, pool in self.kv_pools.items()
-                for role, tensor in pool.region_tensors()
-            ],
+            pages=pages,
             # GQA/MQA KV heads are sharded or only partially replicated across
             # TP. In particular MiniMax-M3 must keep one stored shard per rank;
             # whole-object TP collapse is unsafe for this PAGE layout.
