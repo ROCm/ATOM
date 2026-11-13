@@ -1456,6 +1456,11 @@ class MLAAttention(nn.Module):
         it the prefill gather fuses rank-to-token reordering with head
         padding, so attention receives its dispatch width directly.
         """
+        # The indexer may still be exchanging the selection on its own stream;
+        # joined before the query gather, the next DCP collective.
+        if attn_metadata.index_exchange_done is not None:
+            attn_metadata.index_exchange_done.wait()
+            attn_metadata.index_exchange_done = None
         if not use_qrep:
             q_out = dcp_all_gather_prefill_query_heads(
                 self.dcp_group, q_out, self.dcp_sparse_prefill_num_heads
