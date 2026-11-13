@@ -287,7 +287,9 @@ def test_hybrid_and_wide_widths_follow_the_table(monkeypatch):
     )
 
 
-def test_indexer_cp_refuses_a_wide_step_it_cannot_serve_and_says_so_once(monkeypatch, caplog):
+def test_indexer_cp_refuses_a_wide_step_it_cannot_serve_and_says_so_once(
+    monkeypatch, caplog
+):
     # 4 requests of 16 query rows: the CP scorer's columns (4 heads x q rows) hold 8 rows a request at most
     slots = torch.zeros(64, dtype=torch.int64)
     md = _forward_context(_decode_md(rows=4, slots=slots, max_query_len=16))
@@ -298,7 +300,9 @@ def test_indexer_cp_refuses_a_wide_step_it_cannot_serve_and_says_so_once(monkeyp
         assert not mono.supports(*_step(64), None, None)  # refused, not run without CP
         assert not mono.supports(*_step(64), None, None)
     assert sum("query rows a request" in r.message for r in caplog.records) == 1
-    q4 = _forward_context(_decode_md(rows=16, slots=torch.zeros(64, dtype=torch.int64), max_query_len=4))
+    q4 = _forward_context(
+        _decode_md(rows=16, slots=torch.zeros(64, dtype=torch.int64), max_query_len=4)
+    )
     mono = _mono(monkeypatch, q4, wide=True)
     mono.cp = dispatch.IndexerCp.parse(True, True, 1, 0)
     assert mono.supports(*_step(64), None, None)  # 16 requests x 4 rows: served

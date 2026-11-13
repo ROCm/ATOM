@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Indexer context parallelism in the wide builds: the block-ownership arithmetic the scorer, the selection and
-the exchange share (``index_score.own_first`` / the per-request task counts, ``select_long``'s shares), on the CPU."""
+the exchange share (``index_score.own_first`` / the per-request task counts, ``select_long``'s shares), on the CPU.
+"""
 
 import pytest
 
@@ -12,7 +13,9 @@ def own_first(rank, init):  # index_score.own_first
     return init + (rank + TP - init % TP) % TP
 
 
-def n_own(nb, rank, init, local):  # the scorer's per-request task count (index_score, BIG plan)
+def n_own(
+    nb, rank, init, local
+):  # the scorer's per-request task count (index_score, BIG plan)
     scored = nb - (init + local) if nb > TOPK_BLOCKS else 0
     return max(init + scored - own_first(rank, init) + TP - 1, 0) // TP
 
@@ -27,7 +30,9 @@ def test_the_ranks_own_blocks_partition_the_scored_blocks(nb, init):
         blocks = [first + TP * i for i in range(n)]
         assert all(b % TP == rank for b in blocks)  # ATOM's owner(block) = block % TP
         seen += blocks
-    assert sorted(seen) == list(range(init, nb - local))  # every scored block once, none pinned
+    assert sorted(seen) == list(
+        range(init, nb - local)
+    )  # every scored block once, none pinned
 
 
 @pytest.mark.parametrize("nb", [LONG_FROM_BLOCKS + 1, 1024, 8192])
