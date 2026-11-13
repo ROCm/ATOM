@@ -799,6 +799,8 @@ class ModelRunner:
     # the target's launch (`prepare_model`).
     compute_head: Callable | None = None
     spec_status_deferred = False
+    # The weight cache daemon's runner returns after loading (weight_cache/daemon.py).
+    weights_only = False
 
     def __init__(self, rank: int, config: Config):
         self.config = config
@@ -927,6 +929,8 @@ class ModelRunner:
         )
 
         self._build_and_load_model(model_class)
+        if self.weights_only:
+            return
         # After weight processing, before warmup and capture. Here rather than in
         # the loader so a runner that builds its model differently still sets it.
         from atom.model_ops.fused_moe.sp_mega_moe import initialize_sp_mega_moe
@@ -1080,6 +1084,13 @@ class ModelRunner:
         construct on the meta device and import weights via IPC instead.
         """
         config = self.config
+        # Subclasses load or share weights their own way (Config rejects them
+        # in cache mode too).
+        if envs.ATOM_WEIGHT_CACHE == "client" and type(self) is ModelRunner:
+            from atom.model_loader.weight_cache.client import try_load_from_cache
+
+            if try_load_from_cache(self, model_class):
+                return
         self.model = model_class(config)
         fused_shared_expert_load_fn = None
         if hasattr(self.model, "load_fused_expert_weights"):

@@ -3689,6 +3689,13 @@ def main():
     """Main entry point for the server."""
     global engine
 
+    if envs.ATOM_WEIGHT_CACHE != "off":
+        # ATOM_PRELOAD: remember this launch, to start a weight cache daemon
+        # with it; daemon: let its runners find this process to stop it.
+        from atom.model_loader.weight_cache.preload import record_launch
+
+        record_launch()
+
     parser = FlexibleArgumentParser(description="ATOM OpenAI API Server")
     EngineArgs.add_cli_args(parser)
     parser.add_argument("--host", type=str, default=DEFAULT_HOST, help="Server host")
@@ -3768,6 +3775,18 @@ def main():
     args = parser.parse_args()
     if args.api_server_count < 1:
         parser.error("--api-server-count must be at least 1")
+    if envs.ATOM_WEIGHT_CACHE == "daemon":
+        # A weight cache daemon serves weights, not requests: no front end,
+        # engine or HTTP server.
+        from atom.model_loader.weight_cache.daemon import run_daemon
+
+        run_daemon(EngineArgs.from_cli_args(args))
+        return
+    if envs.ATOM_PRELOAD and envs.ATOM_WEIGHT_CACHE == "client":
+        # Start the weight cache daemon now, so it loads while this starts up.
+        from atom.model_loader.weight_cache.preload import start_early
+
+        start_early()
 
     _setup_frontend(args)
 

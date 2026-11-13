@@ -2529,6 +2529,39 @@ class Config:
                 "atom.model_engine.model_runner.RapidServeModelRunner"
             )
 
+        # Weight cache (atom/model_loader/weight_cache/): a daemon loads the
+        # weights once per GPU and serves them; a client maps them. Clients
+        # share the daemon's memory, so runners that write weights in place
+        # (EPLB, RLHF weight updates, RapidServe's own weight sharing) cannot
+        # take part.
+        cache_mode = envs.ATOM_WEIGHT_CACHE
+        if cache_mode in ("daemon", "client"):
+            if self.runner_qualname != "atom.model_engine.model_runner.ModelRunner":
+                raise ValueError(
+                    f"ATOM_WEIGHT_CACHE={cache_mode} needs the default model "
+                    f"runner, not {self.runner_qualname}"
+                )
+            if self.eplb_enable:
+                raise ValueError(
+                    f"ATOM_WEIGHT_CACHE={cache_mode} does not support EPLB: it "
+                    "moves expert weights in place"
+                )
+            if self.pipeline_parallel_size > 1:
+                raise ValueError(
+                    f"ATOM_WEIGHT_CACHE={cache_mode} does not support pipeline "
+                    "parallelism yet"
+                )
+            if self.parallel_config.data_parallel_size > 1 or self.enable_dp_attention:
+                # The daemon starts one process per GPU of a single engine.
+                raise ValueError(
+                    f"ATOM_WEIGHT_CACHE={cache_mode} does not support data "
+                    "parallelism (or DP attention) yet"
+                )
+        elif cache_mode != "off":
+            raise ValueError(
+                f"ATOM_WEIGHT_CACHE must be off, client or daemon, not {cache_mode!r}"
+            )
+
         assert 1 <= self.tensor_parallel_size <= 8
         if self.decode_context_parallel_size > 1:
             assert self.tensor_parallel_size % self.decode_context_parallel_size == 0, (
