@@ -211,6 +211,7 @@ def iprefetch(kb):
         llvm.inline_asm(None, [], f"s_prefetch_inst_pc_rel {off}, null, 31", "", has_side_effects=True)
 
 
+CODE_END_OFF = 131024   # cyc scratch: the target / draft launches' end PCs (hx.code_end)
 V3_DIAG = True   # (v3 diag) timeout codes per CTA into stamp slot 1
 
 
@@ -273,6 +274,8 @@ def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sourc
                 b = hx.opaque_s(fx.block_idx.x)
                 sm = hx.lds_base()
                 TCNT = cnt + i64((NL + NDR) * LCB)
+                # the draft loop's code -> L2 (its first pass fetched it from HBM: draft layer 0 ran ~12 us slower)
+                hx.code_prefetch(t, b, fptr(fp, "cyc") + i64(CODE_END_OFF + 8), 1024)
                 if fx.const_expr(part == "all"):
                     if t == 0:
                         hx.gstore(st + i64(b) * (32 * 8) + i64(25 * 8), hx.clock())
@@ -314,6 +317,8 @@ def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sourc
                 hx.gstore(st + i64(b) * (32 * 8) + i64(26 * 8), hx.clock())
             ST.draft(tp, t, b, sm, st, cnt + i64((NL + NDR) * LCB), recv, rank, head_d=4)
         tp_epoch_end(fp, tep, (hi == fx.Int32(NL)) if split else None)
+        hx.code_end(hx.opaque_v(fx.thread_idx.x), hx.opaque_s(fx.block_idx.x),
+                    fptr(fp, "cyc") + i64(CODE_END_OFF + (8 if part == "draft" else 0)))
         hx.TOFLAG[0] = None   # (the counter pointer belongs to this kernel's trace only)
         hx.DIAG[0] = None
         _ = keyed

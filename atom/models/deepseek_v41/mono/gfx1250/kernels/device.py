@@ -176,6 +176,31 @@ def prefetch(addr):
     intrin(None, "llvm.amdgcn.global.prefetch", [gptr(addr), fx.Int32(0)])
 
 
+def getpc():
+    return fx.Int64(llvm.inline_asm(i64(), [], "s_getpc_b64 $0", "=s", has_side_effects=True))
+
+
+@_ASTR.transform
+def code_prefetch(t, b, endp, kb):
+    """Warm L2 with this kernel's code from here up to the end PC its previous run recorded at endp (code_end; 0 on the
+    first run: nothing), at most `kb` KB: one global_prefetch of a 128-byte line a thread, CTA-major. A launch's first
+    pass over its layer loop otherwise fetches the code from HBM (the step's weight stream evicts it); an unbounded
+    prefetch past the code object faults."""
+    pc = getpc()
+    end = gload(endp, fx.Int64)
+    nl = fx.min(fx.max((end - pc) // 128, fx.Int64(0)), fx.Int64(kb * 8))
+    i = fx.Int64(b) * 256 + fx.Int64(t)
+    if i < nl:
+        prefetch(pc + i * 128)
+
+
+@_ASTR.transform
+def code_end(t, b, endp):
+    """Record this kernel's PC near its end for the next run's code_prefetch."""
+    if (b == 0) & (t == 0):
+        gstore(endp, getpc())
+
+
 def async_to_lds_b128(gaddr, loff, cpol=0):
     """__builtin_amdgcn_global_load_async_to_lds_b128(g, l, 0, cpol)."""
     intrin(None, "llvm.amdgcn.global.load.async.to.lds.b128", [gptr(gaddr), lptr(loff), fx.Int32(0), fx.Int32(cpol)])
