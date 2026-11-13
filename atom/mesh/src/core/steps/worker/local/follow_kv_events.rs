@@ -69,7 +69,8 @@ impl StepExecutor<LocalWorkerWorkflowData> for FollowKvEventsStep {
             };
             match source {
                 Some((&rank, source)) => {
-                    monitor.attach(worker.url(), worker.model_id(), rank, source.clone());
+                    let pool = worker.worker_type().as_metric_label();
+                    monitor.attach(worker.url(), worker.model_id(), pool, rank, source.clone());
                 }
                 None => warn!(
                     worker = worker.url(),

@@ -57,9 +57,13 @@
     5. max_tree_size: (integer)
     Maximum nodes per tree. When exceeded, LRU leaf nodes are evicted
     during the next eviction cycle.
+
+    With --kv-events, a request the router can tokenize is placed by the KV
+    event index instead of the tree: the match rate is the share of its tokens
+    a worker's device cache holds, compared with cache_threshold as above.
 */
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use dashmap::{DashMap, DashSet};
@@ -71,7 +75,10 @@ use super::{
     get_healthy_worker_indices, normalize_model_key, tree::Tree, utils::PeriodicTask,
     CacheAwareConfig, LoadBalancingPolicy, RouteDecision, SelectWorkerInfo, NO_HEALTHY_WORKERS,
 };
-use crate::core::{Worker, WorkerType};
+use crate::{
+    core::{Worker, WorkerType},
+    kv_index::PrefixMatchProvider,
+};
 
 /// Prefill and decode workers hold entirely different cache state for the same
 /// model: P owns the prompt prefix, D owns the generated suffix. Sharing one
@@ -108,7 +115,25 @@ pub struct CacheAwarePolicy {
     /// Tree keys already reported as missing, so the request-path warning
     /// fires once per key instead of once per request.
     missing_tree_warned: Arc<DashSet<String>>,
+    kv_events: OnceLock<Arc<dyn PrefixMatchProvider>>,
     _eviction_task: Option<PeriodicTask>,
+}
+
+/// The least loaded of `healthy_indices`, ties broken at random so that equally loaded
+/// workers do not all collapse onto the lowest index. Loads are read once: `load()` is a
+/// live atomic, so reading it again could leave no worker at the minimum just computed.
+fn least_loaded(workers: &[Arc<dyn Worker>], healthy_indices: &[usize]) -> Option<usize> {
+    let loads: Vec<(usize, usize)> = healthy_indices
+        .iter()
+        .map(|&idx| (idx, workers[idx].load()))
+        .collect();
+    let min_load = loads.iter().map(|&(_, load)| load).min();
+    loads
+        .iter()
+        .copied()
+        .filter(|&(_, load)| Some(load) == min_load)
+        .map(|(idx, _)| idx)
+        .choose(&mut rand::rng())
 }
 
 impl CacheAwarePolicy {
@@ -148,8 +173,14 @@ impl CacheAwarePolicy {
             config,
             trees,
             missing_tree_warned: Arc::new(DashSet::new()),
+            kv_events: OnceLock::new(),
             _eviction_task: eviction_task,
         }
+    }
+
+    /// Places requests the router can tokenize by the KV event index from now on.
+    pub(crate) fn set_kv_events(&self, provider: Arc<dyn PrefixMatchProvider>) {
+        let _ = self.kv_events.set(provider);
     }
 
     /// Initialize the tree with worker URLs (used only during initial setup)
@@ -257,23 +288,8 @@ impl CacheAwarePolicy {
             );
         }
 
-        // Use shortest queue when imbalanced, breaking ties at random so a run
-        // of equally loaded ranks does not all collapse onto the lowest index.
-        // Snapshot load() first: it is a live atomic, so recomputing per
-        // comparison can leave no worker matching the min we just observed.
-        let min_load_idx = {
-            let loads: Vec<(usize, usize)> = healthy_indices
-                .iter()
-                .map(|&idx| (idx, workers[idx].load()))
-                .collect();
-            let m = loads.iter().map(|&(_, l)| l).min()?;
-            loads
-                .iter()
-                .copied()
-                .filter(|&(_, l)| l == m)
-                .map(|(idx, _)| idx)
-                .choose(&mut rand::rng())?
-        };
+        // Use shortest queue when imbalanced.
+        let min_load_idx = least_loaded(workers, healthy_indices)?;
 
         // Even in imbalanced mode, update the tree to maintain cache state
         if let Some(text) = request_text {
@@ -297,6 +313,50 @@ impl CacheAwarePolicy {
         workers[min_load_idx].increment_processed();
 
         Some(min_load_idx)
+    }
+
+    /// The tree's affinity and relocate branches, with the match rate of the KV event
+    /// index: the share of the request's tokens a worker's device cache holds, the
+    /// highest first, then the lower load. None leaves the request to the tree: it has no
+    /// tokens, or no candidate's events are indexed.
+    fn select_by_kv_events(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+        healthy_indices: &[usize],
+        model_id: &str,
+    ) -> Option<(Option<usize>, RouteDecision)> {
+        let tokens = info.tokens.filter(|tokens| !tokens.is_empty())?;
+        let hits = self.kv_events.get()?.match_workers(tokens, workers);
+        if healthy_indices.iter().all(|&idx| hits[idx].is_none()) {
+            return None;
+        }
+        let (best, cached) = healthy_indices
+            .iter()
+            .map(|&idx| (idx, hits[idx].unwrap_or(0)))
+            .max_by_key(|&(idx, cached)| (cached, std::cmp::Reverse(workers[idx].load())))?;
+        let match_rate = f64::from(cached) / tokens.len() as f64;
+        let affinity = match_rate > f64::from(self.config.cache_threshold);
+        let idx = if affinity {
+            best
+        } else {
+            least_loaded(workers, healthy_indices)?
+        };
+        // The tree keeps learning, for requests without tokens.
+        let tree = self.trees.get(model_id).map(|entry| entry.value().clone());
+        if let (Some(text), Some(tree)) = (info.request_text, tree) {
+            tree.insert(text, workers[idx].url());
+        }
+        workers[idx].increment_processed();
+        let decision = RouteDecision {
+            branch: if affinity {
+                "kv_affinity"
+            } else {
+                "kv_relocate"
+            },
+            match_ratio: Some(match_rate),
+        };
+        Some((Some(idx), decision))
     }
 }
 
@@ -343,6 +403,11 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             return (selected, RouteDecision::branch("imbalanced"));
         }
 
+        if let Some(selected) = self.select_by_kv_events(workers, info, &healthy_indices, &model_id)
+        {
+            return selected;
+        }
+
         // Use cache-aware routing when balanced
         let text = request_text.unwrap_or("");
 
@@ -374,22 +439,8 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                     .position(|w| w.url() == tenant_url)
                     .filter(|&idx| workers[idx].is_healthy())
             } else {
-                // Low cache match: use the least loaded worker, breaking ties at
-                // random. Snapshot load() first -- it is a live atomic, so a
-                // concurrent update can otherwise leave no worker matching the
-                // min we just computed. Deterministic tie-breaking would pin
-                // every cold-start session onto the first index.
-                let loads: Vec<(usize, usize)> = healthy_indices
-                    .iter()
-                    .map(|&idx| (idx, workers[idx].load()))
-                    .collect();
-                let min_load = loads.iter().map(|&(_, load)| load).min();
-                loads
-                    .iter()
-                    .copied()
-                    .filter(|&(_, load)| Some(load) == min_load)
-                    .map(|(idx, _)| idx)
-                    .choose(&mut rand::rng())
+                // Low cache match: use the least loaded worker.
+                least_loaded(workers, &healthy_indices)
             };
 
             if let Some(idx) = selected_idx {
@@ -458,6 +509,10 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
 
     fn needs_request_text(&self) -> bool {
         true // Cache-aware policy needs request text for cache affinity
+    }
+
+    fn wants_tokens(&self) -> bool {
+        self.kv_events.get().is_some()
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -678,6 +733,90 @@ mod tests {
             workers[first].increment_load();
         }
         assert_eq!(select().await, (1 - first, "imbalanced", None));
+    }
+
+    /// Hits of the KV event index, by worker URL.
+    #[derive(Debug)]
+    struct Hits(Vec<(&'static str, u32)>);
+
+    impl PrefixMatchProvider for Hits {
+        fn match_workers(&self, _tokens: &[u32], workers: &[Arc<dyn Worker>]) -> Vec<Option<u32>> {
+            let hit = |worker: &Arc<dyn Worker>| {
+                let found = self.0.iter().find(|(url, _)| *url == worker.url());
+                found.map(|&(_, hit)| hit)
+            };
+            workers.iter().map(hit).collect()
+        }
+    }
+
+    async fn decide(
+        policy: &CacheAwarePolicy,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+    ) -> (usize, &'static str, Option<f64>) {
+        let (selected, decision) = policy.select_with_decision(workers, info).await;
+        (selected.unwrap(), decision.branch, decision.match_ratio)
+    }
+
+    #[tokio::test]
+    async fn kv_events_place_requests_with_tokens_and_leave_the_rest_to_the_tree() {
+        let workers: Vec<Arc<dyn Worker>> = ["http://w1:8000", "http://w2:8000", "http://w3:8000"]
+            .into_iter()
+            .map(|url| Arc::new(BasicWorkerBuilder::new(url).build()) as Arc<dyn Worker>)
+            .collect();
+        let policy = |hits: Option<Vec<(&'static str, u32)>>| {
+            let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+                cache_threshold: 0.5,
+                eviction_interval_secs: 0,
+                ..Default::default()
+            });
+            policy.init_workers(&workers);
+            if let Some(hits) = hits {
+                policy.set_kv_events(Arc::new(Hits(hits)));
+            }
+            policy
+        };
+        let tokens: Vec<u32> = (0..100).collect();
+        let text = SelectWorkerInfo {
+            request_text: Some("hello world"),
+            ..Default::default()
+        };
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            ..text.clone()
+        };
+
+        let tree = policy(None);
+        assert!(!tree.wants_tokens());
+        assert_eq!(decide(&tree, &workers, &info).await.1, "relocate");
+        let events = policy(Some(vec![("http://w1:8000", 40), ("http://w2:8000", 80)]));
+        assert!(events.wants_tokens());
+        assert_eq!(
+            decide(&events, &workers, &info).await,
+            (1, "kv_affinity", Some(0.8))
+        );
+        // The tree learned that placement, for the request without tokens.
+        assert_eq!(
+            decide(&events, &workers, &text).await,
+            (1, "affinity", Some(1.0))
+        );
+        assert_eq!(
+            decide(&policy(Some(vec![])), &workers, &info).await.1,
+            "relocate"
+        );
+
+        workers[1].increment_load();
+        let tied = policy(Some(vec![("http://w1:8000", 60), ("http://w2:8000", 60)]));
+        assert_eq!(
+            decide(&tied, &workers, &info).await,
+            (0, "kv_affinity", Some(0.6))
+        );
+        workers[0].increment_load();
+        let cold = policy(Some(vec![("http://w1:8000", 30)]));
+        assert_eq!(
+            decide(&cold, &workers, &info).await,
+            (2, "kv_relocate", Some(0.3))
+        );
     }
 
     #[tokio::test]

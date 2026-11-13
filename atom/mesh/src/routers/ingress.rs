@@ -20,7 +20,7 @@ use crate::{
         prepare_pool::{JobContext, PrepareHandle},
         ConnectionMode, Worker, WorkerRegistry, WorkerType,
     },
-    policies::PolicyRegistry,
+    policies::{LoadBalancingPolicy, PolicyRegistry},
     routers::{
         comm::error::{IngressError, MeshLocalError},
         prepare::inference::{InferenceMetadata, InferenceRequest, ParsedInference},
@@ -28,6 +28,15 @@ use crate::{
     server::AppState,
     tokenizer::TokenizerRegistry,
 };
+
+/// What a request's policies do with its tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tokens {
+    Unused,
+    /// Used when the router can tokenize the request.
+    Wanted,
+    Needed,
+}
 
 const MAX_RESPONSE_ID_BYTES: usize = 256;
 /// Worker label listing the inference paths a backend serves.
@@ -489,14 +498,14 @@ impl InferenceEnvelope {
         if let Some(routed) = self.routed.take() {
             return Ok((self, routed));
         }
-        let (needs_text, needs_tokens) = routing.admit(&self.metadata)?;
-        if !needs_text && !needs_tokens {
+        let (needs_text, tokens) = routing.admit(&self.metadata)?;
+        if !needs_text && tokens == Tokens::Unused {
             let metadata = self.metadata.execution_metadata();
             return Ok((self, (metadata, None)));
         }
         let routing = routing.clone();
         self.prepare(pool, move |request, ctx| {
-            routing.prepare_text_and_tokens(&request.parsed, needs_tokens, ctx)
+            routing.prepare_text_and_tokens(&request.parsed, tokens, ctx)
         })
         .await
     }
@@ -611,27 +620,33 @@ impl IngressRouting {
             .then(|| Self::new(app))
     }
 
-    fn requirements(&self, model: Option<&str>) -> (bool, bool) {
+    fn requirements(&self, model: Option<&str>) -> (bool, Tokens) {
         let registry = &self.policy_registry;
-        if self.pd {
-            let prefill = registry.get_prefill_policy();
-            let decode = registry.get_decode_policy();
-            (
-                prefill.needs_request_text() || decode.needs_request_text(),
-                prefill.needs_tokens() || decode.needs_tokens(),
-            )
+        let policies = if self.pd {
+            [registry.get_prefill_policy(), registry.get_decode_policy()]
         } else {
             let policy = match model {
                 Some(model) => registry.get_policy_or_default(model),
                 None => registry.get_default_policy(),
             };
-            (policy.needs_request_text(), policy.needs_tokens())
-        }
+            [policy.clone(), policy]
+        };
+        let any = |uses: fn(&dyn LoadBalancingPolicy) -> bool| {
+            policies.iter().any(|policy| uses(policy.as_ref()))
+        };
+        let tokens = if any(|policy| policy.needs_tokens()) {
+            Tokens::Needed
+        } else if any(|policy| policy.wants_tokens()) {
+            Tokens::Wanted
+        } else {
+            Tokens::Unused
+        };
+        (any(|policy| policy.needs_request_text()), tokens)
     }
 
     #[cfg(feature = "ext-proc")]
     pub(crate) fn needs_tokens(&self, model: Option<&str>) -> bool {
-        self.requirements(model).1
+        self.requirements(model).1 == Tokens::Needed
     }
 
     /// Validate the request against this topology and prepare what its policy needs.
@@ -642,34 +657,41 @@ impl IngressRouting {
     ) -> Result<RoutingPreparation, IngressError> {
         ctx.check()?;
         let metadata = parsed.metadata_with_text(false);
-        let (needs_text, needs_tokens) = self.admit(&metadata)?;
-        if !needs_text && !needs_tokens {
+        let (needs_text, tokens) = self.admit(&metadata)?;
+        if !needs_text && tokens == Tokens::Unused {
             return Ok((metadata, None));
         }
-        self.prepare_text_and_tokens(parsed, needs_tokens, ctx)
+        self.prepare_text_and_tokens(parsed, tokens, ctx)
     }
 
     /// Validate the API and topology, then return whether the policy needs
-    /// request text and tokens.
-    fn admit(&self, metadata: &InferenceMetadata) -> Result<(bool, bool), IngressError> {
+    /// request text, and what it does with tokens.
+    fn admit(&self, metadata: &InferenceMetadata) -> Result<(bool, Tokens), IngressError> {
         let endpoint = EndpointSpec::find(metadata.route)
             .ok_or_else(|| IngressError::invalid("unsupported inference API"))?;
         endpoint.validate_topology(self.pd)?;
         Ok(self.requirements(metadata.model.as_deref()))
     }
 
-    /// Routing text, and tokens when `needs_tokens`, for an admitted request.
+    /// Routing text, and tokens as the policies use them, for an admitted request.
     fn prepare_text_and_tokens(
         &self,
         parsed: &ParsedInference,
-        needs_tokens: bool,
+        tokens: Tokens,
         ctx: &JobContext,
     ) -> Result<RoutingPreparation, IngressError> {
         let metadata = parsed.metadata();
-        let tokens = if needs_tokens {
-            Some(self.tokens(parsed, &metadata, ctx)?)
-        } else {
-            None
+        let tokens = match tokens {
+            Tokens::Needed => Some(self.tokens(parsed, &metadata, ctx)?),
+            Tokens::Wanted => match self.tokens(parsed, &metadata, ctx) {
+                Ok(tokens) => Some(tokens),
+                // Routed by its text, unless the job is cancelled or late.
+                Err(_) => {
+                    ctx.check()?;
+                    None
+                }
+            },
+            Tokens::Unused => None,
         };
         Ok((metadata, tokens))
     }

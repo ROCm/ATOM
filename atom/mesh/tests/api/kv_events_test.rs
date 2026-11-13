@@ -1,7 +1,7 @@
 //! With `--kv-events`, a worker registered through `/workers`, or each rank of a DP-aware
 //! one, is followed at the endpoint it reports at `/kv_event_sources` until it is
-//! removed, as `/kv_events/sources` shows. The batches are ATOM's own, from the decoder's
-//! samples.
+//! removed, as `/kv_events/sources` shows, and `cache_aware` places requests by the blocks
+//! it holds. The batches are ATOM's own, from the decoder's samples.
 
 use std::time::Duration;
 
@@ -178,6 +178,85 @@ async fn each_rank_of_a_dp_aware_worker_is_followed_until_the_worker_is_removed(
     sources_once(&app, None, |sources| sources == &json!([])).await;
     ctx.shutdown().await;
     worker.stop().await;
+}
+
+/// The worker that served a `/generate` request.
+async fn served_by(app: &Router, body: Value) -> String {
+    let request = Request::builder()
+        .method("POST")
+        .uri("/generate")
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    response.headers()["x-worker-id"].to_str().unwrap().into()
+}
+
+/// Registers a worker and waits until it is listed among `listed` workers.
+async fn register(app: &Router, url: &str, listed: usize) {
+    let (status, _) = call(app, "POST", "/workers", Some(json!({"url": url}))).await;
+    assert!(status.is_success(), "{status}");
+    for _ in 0..1500 {
+        let (_, workers) = call(app, "GET", "/workers", None).await;
+        if workers["workers"].as_array().map(Vec::len) == Some(listed) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("{url} was not listed");
+}
+
+/// With `cache_aware`, a request whose tokens a worker's device cache holds goes to that
+/// worker, whatever the tree learned, and one the router cannot tokenize is still served,
+/// by its text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cache_aware_places_requests_by_the_kv_event_index() {
+    let mut publisher = PubSocket::new();
+    let bound = publisher.bind("tcp://127.0.0.1:0").await.unwrap();
+    let port = bound.to_string().rsplit_once(':').unwrap().1.to_string();
+    let source = json!({"endpoint": format!("tcp://*:{port}"), "topic": "", "block_size": 4});
+    let mut workers = Vec::new();
+    for sources in [json!({"0": source}), json!({})] {
+        let mut worker = MockWorker::new(MockWorkerConfig {
+            port: 0,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        });
+        let url = worker.start().await.unwrap();
+        worker.set_kv_event_sources(sources).await;
+        let id = format!("worker-{}", url.rsplit_once(':').unwrap().1);
+        workers.push((worker, url, id));
+    }
+    let mut config = TestRouterConfig::cache_aware(3991);
+    config.kv_events = true;
+    let ctx = AppTestContext::new_with_config(config, vec![]).await;
+    let app = ctx.create_app().await;
+    let request = json!({"input_ids": (100..112).collect::<Vec<u32>>(),
+        "sampling_params": {"max_new_tokens": 1}});
+
+    // The tree learns the request on the worker without KV events, alone yet.
+    register(&app, &workers[1].1, 1).await;
+    assert_eq!(served_by(&app, request.clone()).await, workers[1].2);
+    register(&app, &workers[0].1, 2).await;
+    let joined = |sources: &Value| sources[0]["batches"].as_u64() > Some(0);
+    sources_once(&app, Some(&mut publisher), joined).await;
+    publish(&mut publisher, 1, sample("stored_root")).await;
+    sources_once(&app, None, |sources| sources[0]["indexed_blocks"] == 2).await;
+
+    // stored_root holds tokens 100..=107, two of the request's three blocks.
+    for _ in 0..4 {
+        assert_eq!(served_by(&app, request.clone()).await, workers[0].2);
+    }
+    let chat = json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}]});
+    let (status, _) = call(&app, "POST", "/v1/chat/completions", Some(chat)).await;
+    assert_eq!(status, StatusCode::OK);
+    ctx.shutdown().await;
+    for (mut worker, _, _) in workers {
+        worker.stop().await;
+    }
 }
 
 #[tokio::test]

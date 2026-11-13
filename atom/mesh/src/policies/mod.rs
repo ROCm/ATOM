@@ -112,6 +112,12 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         false
     }
 
+    /// The policy routes better with the request's tokens but routes without them too, so
+    /// the router tokenizes the request only when it can.
+    fn wants_tokens(&self) -> bool {
+        false
+    }
+
     /// Update worker load information
     ///
     /// This is called periodically with current load information for load-aware policies.
