@@ -56,5 +56,9 @@ zero hits, clamping cache credit, counter overflow, ties and empty candidates:
 cargo test --manifest-path atom/mesh/Cargo.toml --lib policies::agentic
 ```
 
+CI runs this suite in the `Test agentic prefill cost` step of
+`.github/workflows/atomesh-mocker-benchmark.yaml`, using the same `ci` profile and
+target directory as the P/D lifecycle tests so the test binary is reused.
+
 Joint validation must also check the provider adapter, final-rank accounting and
 the prefill charge's release timing, before measuring AgentX TTFT and throughput.
