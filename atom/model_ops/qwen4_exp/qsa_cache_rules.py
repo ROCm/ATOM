@@ -53,7 +53,7 @@ def qsa_cache_formats(atom_config) -> tuple[str, str]:
 def qsa_draft_rows(formats: tuple[str, str]) -> bool:
     """Whether the MTP draft layer keeps BF16 rows of its own under the
     target's `qsa_cache_formats`."""
-    return bool(envs.ATOM_QSA_DRAFT_KV_BF16) and formats != ("bf16", "bf16")
+    return envs.ATOM_QSA_DRAFT_KV_BF16 and formats != ("bf16", "bf16")
 
 
 def qsa_row_space(

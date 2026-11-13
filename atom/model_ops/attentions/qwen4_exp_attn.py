@@ -570,18 +570,24 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
 
         key, value = optional("k"), optional("v")
         k_scale, v_scale = optional("k_scale"), optional("v_scale")
-        raw, compressed = optional("index_raw"), optional("index_compressed")
-        rope = optional("rope_positions")
-        compressed_scale = optional("index_compressed_scale")
+        extras = {
+            name: optional(name)
+            for name in (
+                "index_raw",
+                "index_compressed",
+                "rope_positions",
+                "index_compressed_scale",
+            )
+        }
         module.bind_caches(
             key,
             value,
-            raw,
-            compressed,
-            rope,
+            extras["index_raw"],
+            extras["index_compressed"],
+            extras["rope_positions"],
             k_scale_cache=k_scale,
             v_scale_cache=v_scale,
-            compressed_key_scale=compressed_scale,
+            compressed_key_scale=extras["index_compressed_scale"],
         )
         return KVCacheTensor(
             layer_num=module.layer_num,
@@ -590,14 +596,7 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
             k_scale=k_scale,
             v_scale=v_scale,
             extra_planes=tuple(
-                (role, plane)
-                for role, plane in (
-                    ("index_raw", raw),
-                    ("index_compressed", compressed),
-                    ("rope_positions", rope),
-                    ("index_compressed_scale", compressed_scale),
-                )
-                if plane is not None
+                (role, plane) for role, plane in extras.items() if plane is not None
             ),
         )
 

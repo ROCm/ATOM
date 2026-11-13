@@ -62,7 +62,7 @@ def select_policy_for_slot(
         backend("decode") != "triton"
         and not lossy_decode
         and len(slot_shape) == 3
-        and tuple(slot_shape[-2:]) == (128, 128)
+        and slot_shape[-2:] == (128, 128)
         and dtype in (torch.bfloat16, torch.float32)
         and activation_dtype == torch.bfloat16
         and decode_device_supported(device)

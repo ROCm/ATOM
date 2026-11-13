@@ -131,7 +131,7 @@ _MP = {"kv_connector": "lmcache_mp", "kv_role": "offload"}
     ],
     ids=["no_transfer", "in_process", "lmcache_mp", "multi"],
 )
-def test_qwen38_runs_every_tier_that_reads_page_images(kv_transfer_config):
+def test_qwen38_runs_without_transfer_and_on_every_page_image_tier(kv_transfer_config):
     _check(kv_transfer_config)
 
 

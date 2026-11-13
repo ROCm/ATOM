@@ -18,7 +18,6 @@ from atom.model_ops.attentions.mha_kv_pool import MhaKvPool
 from atom.model_ops.attentions.pool_layout.entry_arena import (
     EntryField,
     LayerMajorArena,
-    published_bytes_for,
 )
 from atom.model_ops.attentions.pool_layout.layer_major_page_unit_geometry import (
     layer_major_page_unit_bases,
@@ -170,7 +169,7 @@ class TestMhaRegionsMatchThePublishedPages:
             "cpu",
         )
         bases, sizes = layer_major_page_unit_regions([arena])
-        published = published_bytes_for(arena.fields)
+        published = 2 * 16 * 3 + 2 * 16 * 4  # int8 k rows + fp32 k_scale, two layers
         assert len(bases) == 4 and int(sizes.sum()) == published < arena.entry_bytes
         blob = (torch.arange(published) % 251).to(torch.uint8)
         at = 0
