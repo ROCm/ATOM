@@ -29,6 +29,7 @@ class IndexScoreBuffers:
     scores: LogitsWorkspace
     work_map: torch.Tensor | None = None
     max_block: int = 0
+    nvfp4: bool = False  # the index cache is NVFP4 (else MXFP4)
 
 
 def allocate_index_scorers(
@@ -73,6 +74,7 @@ def allocate_index_scorers(
             scores=LogitsWorkspace(num_idx_heads * rows * max_block, device),
             work_map=work_map(max_bs, max_qlen),
             max_block=max_block,
+            nvfp4=config.index_cache_dtype == "nvfp4",
         )
     }
     if config.enable_tbo and config.enable_tbo_decode:
