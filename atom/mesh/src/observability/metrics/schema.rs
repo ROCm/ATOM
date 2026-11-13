@@ -629,7 +629,7 @@ pub const METRIC_INVENTORY: &[MetricSpec] = &[
     MetricSpec {
         name: names::KV_EVENTS_GAPS_TOTAL,
         kind: MetricKind::Counter,
-        help: "KV event sequence gaps by pool, result (replayed/snapshot/cleared)",
+        help: "KV event sequence gaps by pool, result (replayed/cleared)",
         status: MetricStatus::Planned,
     },
     MetricSpec {

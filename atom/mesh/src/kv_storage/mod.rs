@@ -10,12 +10,11 @@ use async_trait::async_trait;
 use serde::Serialize;
 
 pub use self::source::{
-    FailReason, Gate, GateReason, KeyRule, KeyState, RankProbe, ReaderRule, SourceId,
-    StorageBackend, StorageBackendSpec, StorageHitSource, StorageLookup, StorageSourceSpec,
+    FailReason, Gate, GateReason, KeyRule, KeyState, OffloadBackend, OffloadReport, RankProbe,
+    ReaderRule, SourceId, StorageBackend, StorageBackendSpec, StorageLookup, StorageSourceSpec,
 };
 use crate::{
     core::Worker,
-    kv_events::discovery::OffloadReport,
     kv_index::{LoadPath, PrefixRequest},
 };
 
@@ -44,12 +43,12 @@ pub enum ChainCheck {
     NotReported,
 }
 
-/// One entry of `GET /kv_storage/sources`, served as `{"sources": [...]}`.
+/// Status of one storage source, for the planned `GET /kv_storage/sources` (not served yet).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct StorageSourceStatus {
     pub id: String,
     pub model_id: String,
-    /// `mooncake_admin`, `umbp_master` or `mock`.
+    /// `mooncake_admin` or `mock`.
     pub backend: &'static str,
     pub endpoints: Vec<String>,
     pub key_rule: KeyRule,
@@ -62,8 +61,8 @@ pub struct StorageSourceStatus {
 
 #[async_trait]
 pub trait StorageHub: Send + Sync {
-    /// Adds the worker as a reader of the source its `offload` report describes (or of
-    /// configured sources whose readers match it), creating the source on first use.
+    /// Adds the worker as a reader of the source its `offload` report describes, creating
+    /// the source on first use.
     async fn on_worker_added(
         &self,
         worker_url: &str,

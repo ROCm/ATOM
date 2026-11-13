@@ -1,6 +1,7 @@
-//! Event source description: one `(worker, dp_rank)` event stream.
+//! Settings of one `(worker, dp_rank)` event stream: pool, wire profile, tier overrides and
+//! when lower-tier hits load.
 
-use std::{collections::HashMap, time::Duration};
+use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -38,49 +39,10 @@ pub enum WireProfile {
     Atom,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TransportSpec {
-    Zmq {
-        endpoint: String,
-        replay_endpoint: Option<String>,
-        topic: String,
-    },
-    /// In-memory channel registered under `name`, for tests and mock workers.
-    Mock { name: String },
-}
-
 /// When lower-tier hits count toward the engine's `cached_tokens`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OffloadLoad {
     pub chunk_tokens: u32,
     pub min_load_tokens: u32,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct SourceCaps {
-    /// ROUTER replay socket available.
-    pub replay: bool,
-    pub snapshot: bool,
-    /// The engine publishes an un-tiered `AllBlocksCleared` as its first batch.
-    pub startup_clear: bool,
-    /// Idle heartbeat interval; only sources that declare one can turn `Stale`.
-    pub heartbeat: Option<Duration>,
-    /// None: only Device hits count toward `cached_tokens`.
-    pub offload_load: Option<OffloadLoad>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KvEventSource {
-    /// Holder identity: the ATOMesh worker URL, `{base}@{rank}` with DP.
-    pub holder: String,
-    pub model_id: String,
-    pub pool: PoolRole,
-    pub transport: TransportSpec,
-    pub profile: WireProfile,
-    /// Block size from discovery. None (vLLM) accepts the size carried by each event.
-    pub block_size: Option<u32>,
-    pub caps: SourceCaps,
-    pub tier_map: TierMap,
-    pub incarnation: Option<String>,
 }
