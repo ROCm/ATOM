@@ -41,6 +41,7 @@ from atom.model_ops.eplb import (
     eplb_append_shared_map_and_record_fused,
     eplb_map_and_record_fused,
 )
+from atom.model_ops.fused_moe import fhmoe_m3
 from atom.model_ops.fused_moe.config import (
     FUSED_MOE_UNQUANTIZED_CONFIG,
     FusedMoEConfig,
@@ -97,6 +98,7 @@ from atom.quant_spec import (
     NVFP4_GROUP_SIZE,
     LayerQuantConfig,
     fuses_mxfp8_shared_into_mxfp4,
+    is_mxfp8_shared_mxfp4_routed,
     should_skip_online_quant,
     should_stream_online_quant,
     validate_nvfp4_global_scales,
@@ -2527,17 +2529,29 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 # writes the output in the model dtype, not x's.
                 a1_scale = x_scale
                 moe_extra_args["dtype"] = self.moe.in_dtype
-            return fused_moe(
+            w13, w2 = layer.w13_weight, layer.w2_weight
+            w13_scale, w2_scale = layer.w13_weight_scale, layer.w2_weight_scale
+            fh = getattr(layer, "fhmoe", None)
+            if fh is not None:
+                fused = fh.run(x, topk_weights, topk_ids, scheduled_tokens_gpu)
+                if fused is not None:
+                    return fused
+                # Above FHMoE's rows: the production routed call over the first 128
+                # experts (weights already carry the routed scale), then the MLP.
+                w13, w2, w13_scale, w2_scale = fh.routed_tables
+                topk_weights = topk_weights[:, : layer.top_k].contiguous()
+                topk_ids = topk_ids[:, : layer.top_k].contiguous()
+            out = fused_moe(
                 x,
-                layer.w13_weight,
-                layer.w2_weight,
+                w13,
+                w2,
                 topk_weights,
                 topk_ids,
                 expert_mask=layer.expert_mask,
                 activation=activation,
                 quant_type=self.quant_type,
-                w1_scale=layer.w13_weight_scale,
-                w2_scale=layer.w2_weight_scale,
+                w1_scale=w13_scale,
+                w2_scale=w2_scale,
                 a1_scale=a1_scale,
                 a2_scale=a2_scale,
                 doweight_stage1=apply_router_weight_on_input,
@@ -2546,6 +2560,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 num_local_tokens=scheduled_tokens_gpu,
                 **moe_extra_args,
             )
+            return out if fh is None else fh.add_shared(out, x)
         # Only the mori v2 modular kernel takes a shared output
         # (FusedMoE.combine_accepts_shared); the other kernels are not passed one.
         shared_kwargs = (
@@ -3637,6 +3652,7 @@ class FusedMoE(torch.nn.Module):
         pad_align: int | None = None,
         enable_comm_fused: bool = False,
         mxfp4_fp8_activations: bool = False,
+        fhmoe_m3_requested: bool = False,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -3699,6 +3715,27 @@ class FusedMoE(torch.nn.Module):
                 routed_expert_prefix=prefix,
             )
         )
+        # MiniMax-M3.1 FHMoE: the E+1 layout and the shared router column of the
+        # fused shared expert, but the shared weights stay in the model's MLP.
+        self.fhmoe = None
+        if fhmoe_m3_requested:
+            reason = self._fhmoe_m3_refusal(
+                atom_config,
+                quant_config,
+                shared_expert_prefix,
+                num_experts,
+                top_k,
+                intermediate_size,
+                hidden_size,
+                activation,
+                config,
+                mxfp4_fp8_activations,
+            )
+            if reason is None:
+                self.fhmoe = fhmoe_m3.FhmoeM3(self)
+            else:
+                fhmoe_m3.log_refusal(reason)
+        fuse_shared_experts = fuse_shared_experts or self.fhmoe is not None
         num_fused_shared_experts = (
             getattr(config, "n_shared_experts", 0) if fuse_shared_experts else 0
         )
@@ -4027,8 +4064,62 @@ class FusedMoE(torch.nn.Module):
             self.shared_expert_weight,
         )
 
+    def _fhmoe_m3_refusal(
+        self,
+        atom_config,
+        quant_config,
+        shared_expert_prefix,
+        num_experts,
+        top_k,
+        intermediate_size,
+        hidden_size,
+        activation,
+        config,
+        mxfp4_fp8_activations,
+    ) -> str | None:
+        """Why this layer cannot take the FHMoE layout (None: it can)."""
+        shared_ok = quant_config is not None and is_mxfp8_shared_mxfp4_routed(
+            quant_config.get_layer_quant_config(
+                shared_expert_prefix, check_children=True
+            ),
+            self.layer_quant_config,
+        )
+        gfx = get_gfx()
+        explicit = envs.is_set("ATOM_USE_TRITON_MOE")
+        triton = (
+            envs.ATOM_USE_TRITON_MOE
+            if explicit
+            else gfx.startswith("gfx95") and envs.ATOM_USE_TRITON_GEMM
+        )
+        return fhmoe_m3.refusal(
+            gfx=gfx,
+            tp_size=self.tp_size,
+            hidden=hidden_size,
+            inter=intermediate_size,
+            experts=num_experts,
+            top_k=top_k,
+            n_shared=getattr(config, "n_shared_experts", 0),
+            activation=activation,
+            shared_ok=shared_ok,
+            in_use={
+                "expert parallel": self.use_ep,
+                "data parallel": self.dp_size > 1,
+                "PCP merge": self.moe_parallel_config.pcp_merge,
+                "sequence parallel": sp_is_enabled(),
+                "EPLB": bool(getattr(atom_config, "eplb_enable", False)),
+                "a comm-fused MoE": self._comm_fused_moe is not None,
+                "online quantization": bool(quant_config and quant_config.online_quant),
+            },
+            gu_interleave=envs.ATOM_MOE_GU_ITLV or mxfp4_fp8_activations,
+            has_bias=self.has_bias,
+            lossy_shared_flag=envs.ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4,
+            triton=triton,
+        )
+
     def process_weights_after_loading(self):
         self._online_quant()
+        if getattr(self, "fhmoe", None) is not None:
+            self.fhmoe.fill_dummy_row()
         if self.shared_mxfp8_into_mxfp4 is not None:
             self.shared_mxfp8_into_mxfp4.fuse(self)
         self._validate_moe_backend()

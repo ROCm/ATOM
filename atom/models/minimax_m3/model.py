@@ -338,14 +338,18 @@ class MiniMaxM3MoE(nn.Module):
             prefix=f"{prefix}.experts",
             config=config,
             shared_expert_prefix=f"{prefix}.shared_experts",
+            **({"fhmoe_m3_requested": True} if envs.ATOM_M3_FHMOE else {}),
         )
         if hasattr(self.experts.quant_method, "intermediate_pad"):
             # MiniMax-M3 pads expert weights at load time; computing the full
             # padded intermediate avoids backend pad-skip precision issues.
             self.experts.quant_method.intermediate_pad = 0
         self.experts.swiglu_limit = getattr(config, "swiglu_limit", 7.0)
+        self.fhmoe = getattr(self.experts, "fhmoe", None)
+        # The shared expert is a row of the MXFP4 tables (FHMoE keeps its MLP).
         self.fuse_shared_experts = (
             getattr(self.experts, "num_fused_shared_experts", 0) > 0
+            and self.fhmoe is None
         )
 
         self.shared_experts: MiniMaxM3MLP | None = None
@@ -357,6 +361,8 @@ class MiniMaxM3MoE(nn.Module):
                 reduce_results=False,
                 prefix=f"{prefix}.shared_experts",
             )
+            if self.fhmoe is not None:
+                self.fhmoe.bind(self.shared_experts)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
@@ -367,6 +373,9 @@ class MiniMaxM3MoE(nn.Module):
             hidden_states=hidden_states,
             router_logits=router_logits,
         )
+        if self.fhmoe is not None:
+            # The op returns 2 * routed + shared: the routed scale is in the weights.
+            return routed_output.view(orig_shape)
         if not self.fuse_shared_experts and self.routed_scaling_factor != 1.0:
             routed_output = routed_output * self.routed_scaling_factor
 
