@@ -29,10 +29,11 @@ from atom.model_ops.dcp_ops import (
 from atom.model_ops.sparse_indexer_fp4 import FP4_QUANT_BLOCK_SIZE, fp4_q_scale_shape
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.forward_context import get_forward_context
+from atom.utils.tbo.ubatching import tbo_active
 
 from .nope import indexer_nope_quant_and_cache
 from .rows import IndexCache
-from .score import score_topk
+from .score import _gather_split, score_topk
 
 
 def _dcp_gather_indexer_k_prefill(
@@ -401,6 +402,7 @@ def sparse_attn_indexer(
     # A single-rank prefill's slot conversion subtracts concat rows' request
     # base itself; decode and the DCP filter read request-local ids.
     single_rank_prefill = context.is_prefill and get_dcp_world_size() == 1
+    exchange = _exchange_stream(indexer_module, context.is_prefill)
     topk_indices = score_topk(
         ((q_quant.unsqueeze(1), q_fp4_scale.unsqueeze(1)) if indexer_fp4 else q_quant),
         weights_mqa,
@@ -418,6 +420,7 @@ def sparse_attn_indexer(
             else None
         ),
         request_local=not single_rank_prefill,
+        gather=exchange is None,
     )
     if not context.is_prefill:
         if attn_metadata.max_seqlen_q > 1:
@@ -447,20 +450,29 @@ def sparse_attn_indexer(
         # WHOLE selection: the filter `.contiguous()`s what it gets, so a row
         # slice would copy what the in-place gather avoided moving, and its
         # grid follows `sparse_kv_indptr`, so the gather's tail is never read.
-        triton_filter_and_convert_dcp_index_prefill(
-            attn_metadata.sparse_kv_indptr,
-            attn_metadata.batch_id_per_q_token,
-            topk_indices,
-            attn_metadata.block_tables,
-            get_dcp_rank(),
-            get_dcp_world_size(),
-            runner_block_size,
-            out_kv_indptr=attn_metadata.dcp_sparse_kv_indptr,
-            owned_counts=attn_metadata.dcp_owned_counts,
-            NUM_TOPK_TOKENS=topk_tokens,
-            out=attn_metadata.sparse_kv_indices,
-            cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
-        )
+        if exchange is not None:
+            exchange.wait_stream(torch.cuda.current_stream())
+            # The op drops its last reference while the exchange still runs.
+            topk_indices.record_stream(exchange)
+        with torch.cuda.stream(exchange):
+            if exchange is not None:
+                _gather_split(topk_indices, rows.split)
+            triton_filter_and_convert_dcp_index_prefill(
+                attn_metadata.sparse_kv_indptr,
+                attn_metadata.batch_id_per_q_token,
+                topk_indices,
+                attn_metadata.block_tables,
+                get_dcp_rank(),
+                get_dcp_world_size(),
+                runner_block_size,
+                out_kv_indptr=attn_metadata.dcp_sparse_kv_indptr,
+                owned_counts=attn_metadata.dcp_owned_counts,
+                NUM_TOPK_TOKENS=topk_tokens,
+                out=attn_metadata.sparse_kv_indices,
+                cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+            )
+        if exchange is not None:
+            attn_metadata.index_exchange_done = exchange.record_event()
     else:
         triton_convert_req_index_to_global_index_dsa_prefill(
             attn_metadata.sparse_cu_seqlens_q,
@@ -474,6 +486,22 @@ def sparse_attn_indexer(
             out=attn_metadata.sparse_kv_indices,
             row_starts=None if rows.concat is None else rows.concat.row_starts,
         )
+
+
+def _exchange_stream(indexer, is_prefill):
+    """The stream a DCP prefill's top-k exchange (the all-gather and the owner
+    filter) runs on, beside the q path, or None to run it in order: an indexer
+    the model gave no stream, decode, graph capture and TBO."""
+    stream = getattr(indexer, "exchange_stream", None)
+    if (
+        stream is None
+        or not is_prefill
+        or get_dcp_world_size() == 1
+        or torch.cuda.is_current_stream_capturing()
+        or tbo_active()
+    ):
+        return None
+    return stream
 
 
 def _index_cache(indexer, kv_cache, attn_metadata, is_prefill) -> IndexCache:
