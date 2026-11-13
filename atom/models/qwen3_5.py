@@ -49,6 +49,96 @@ from atom.utils.region_graph import token_graph
 
 logger = logging.getLogger("atom")
 
+# ---------------------------------------------------------------------------
+# GDN in_proj merge decision
+# ---------------------------------------------------------------------------
+
+from atom.quant_spec import QuantType
+from atom.utils import envs
+
+_QWEN3_5_PACKED_MODULES_MAPPING = {
+    "q_proj": ("qkv_proj", "q"),
+    "k_proj": ("qkv_proj", "k"),
+    "v_proj": ("qkv_proj", "v"),
+    "gate_proj": ("gate_up_proj", 0),
+    "up_proj": ("gate_up_proj", 1),
+    "gate_up_proj": ["gate_proj", "up_proj"],
+    "in_proj_qkv": ("in_proj_qkvz", (0, 1, 2)),
+    "in_proj_z": ("in_proj_qkvz", 3),
+    "in_proj_b": ("in_proj_ba", 0),
+    "in_proj_a": ("in_proj_ba", 1),
+    ".gate.": (".gate.", 0),
+    "shared_expert_gate": ("gate", 1),
+}
+
+_MERGED_IN_PROJ_MAPPING = {
+    "in_proj_qkv": ("in_proj_qkvzba", (0, 1, 2)),
+    "in_proj_z": ("in_proj_qkvzba", 3),
+    "in_proj_b": ("in_proj_qkvzba", 4),
+    "in_proj_a": ("in_proj_qkvzba", 5),
+}
+
+
+def _linear_attention_prefixes(atom_config, layers_prefix: str) -> list[str]:
+    """`<layers_prefix>.<i>.linear_attn` for every GDN layer."""
+    hf_config = atom_config.hf_config
+    config = getattr(hf_config, "text_config", None) or hf_config
+    layer_types = getattr(config, "layer_types", None) or []
+    return [
+        f"{layers_prefix}.{i}.linear_attn"
+        for i, layer_type in enumerate(layer_types)
+        if layer_type == "linear_attention"
+    ]
+
+
+def gdn_in_proj_is_merged(atom_config, layers_prefix: str = "model.layers") -> bool:
+    """True when the GDN input projection is one ``in_proj_qkvzba`` layer.
+
+    BF16 checkpoints merge unconditionally, as they always have. A quantized
+    checkpoint merges only when, in every GDN layer, ``in_proj_qkvz``,
+    ``in_proj_ba`` and the merged ``in_proj_qkvzba`` name all carry the same
+    per-token spec: per-token activation scales are one value per row and
+    per-channel weight scales one per column, so concatenating along the output
+    dimension just concatenates the scales. A block-scale checkpoint must not
+    merge -- ``in_proj_ba`` contributes 32 columns per rank, which is not a whole
+    number of 128-column scale blocks.
+
+    ``layers_prefix`` is the decoder stack's module prefix as the layers are
+    built (``model.layers``, or ``language_model.model.layers`` under a multimodal
+    wrapper): exact-name quantization excludes only match the full name.
+    """
+    quant_config = atom_config.quant_config
+    if quant_config is None:
+        return False
+    if quant_config.global_quant_config.quant_dtype == torch.bfloat16:
+        return True
+    if not envs.ATOM_QWEN35_GDN_MERGE_QKVZBA:
+        return False
+    prefixes = _linear_attention_prefixes(atom_config, layers_prefix)
+    if not prefixes:
+        return False
+    for prefix in prefixes:
+        qkvz = quant_config.get_layer_quant_config(f"{prefix}.in_proj_qkvz")
+        ba = quant_config.get_layer_quant_config(f"{prefix}.in_proj_ba")
+        merged = quant_config.get_layer_quant_config(f"{prefix}.in_proj_qkvzba")
+        if not (qkvz == ba == merged):
+            return False
+        if qkvz.quant_type != QuantType.per_Token or qkvz.weight_block_size:
+            return False
+    return True
+
+
+def _apply_merged_in_proj_mapping(
+    mapping: dict, atom_config, layers_prefix: str = "model.layers"
+) -> dict:
+    if not gdn_in_proj_is_merged(atom_config, layers_prefix):
+        return mapping
+    mapping.pop("in_proj_qkvz", None)
+    mapping.pop("in_proj_ba", None)
+    mapping["in_proj_qkvzba"] = ("in_proj_qkvzba", None)
+    mapping.update(_MERGED_IN_PROJ_MAPPING)
+    return mapping
+
 
 def allreduce_norm_fusion_enabled() -> bool:
     """Whether row-parallel outputs skip their all-reduce and the following
@@ -275,7 +365,16 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
         )
 
     def create_qkvzba_proj(self, quant_config, prefix):
-        if self.quant_config.global_quant_config.quant_dtype == torch.bfloat16:
+        # One GEMM over [q|k|v|z|b|a] instead of in_proj_qkvz + in_proj_ba. The
+        # b/a half is 32 columns per rank at TP4, which the a8w8 preshuffle path
+        # pads to a full 128-column tile anyway, so on its own it costs about as
+        # much as the 5120-column qkvz GEMM beside it (7.92 vs 10.16 us per layer
+        # in the 2026-10-20 FP4 TP4 bs1 trace) while adding nothing. Merging also
+        # drops the second activation quant of the same normed hidden state
+        # (4.12 us). The merged N is 5152, padded to 5248, against qkvz's 5120.
+        # `gdn_in_proj_is_merged` decides, so the checkpoint mapping agrees.
+        # prefix is `<stack>.layers.<i>.linear_attn`.
+        if gdn_in_proj_is_merged(self.atom_config, prefix.rsplit(".", 2)[0]):
             self.in_proj_qkvzba = MergedColumnParallelLinear(
                 input_size=self.hidden_size,
                 output_sizes=[
@@ -288,7 +387,7 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
                 ],
                 bias=False,
                 quant_config=quant_config,
-                prefix=prefix,
+                prefix=f"{prefix}.in_proj_qkvzba",
             )
         else:
             self.in_proj_qkvz = self.create_qkvz_proj(
@@ -338,7 +437,14 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
         a_size = v_heads_tp
 
         if hasattr(self, "in_proj_qkvzba"):
-            qkvzba = self.in_proj_qkvzba(hidden_states)
+            # Take the pre-quantized activation when the input norm produced one,
+            # exactly as the unmerged in_proj_qkvz branch does; otherwise the
+            # merged layer would quantize the normed hidden state a second time
+            # and undo what folding the quant into the norm bought.
+            if x_fp8 is not None:
+                qkvzba = self.in_proj_qkvzba(x_fp8, x_scale=x_scale)
+            else:
+                qkvzba = self.in_proj_qkvzba(hidden_states)
             # Qwen3.5 layout is already contiguous [q|k|v|z|b|a]
             mixed_qkv, z_flat, b, a = torch.split(
                 qkvzba, [qkv_size, z_size, b_size, a_size], dim=-1
@@ -432,10 +538,15 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
             raise ValueError(f"Invalid model_type {config.model_type}")
 
         # Fold the FP8 per-group activation quant of the first projection into
-        # the input norm (as Qwen3NextDecoderLayer does); GDN layers also need
-        # the BF16 normed activation for in_proj_ba.
+        # the input norm (as Qwen3NextDecoderLayer does). A GDN layer whose
+        # input projection is not merged feeds the same normed activation to
+        # in_proj_qkvz and in_proj_ba, so the norm writes BF16 and each
+        # projection quantizes it; see `gdn_in_proj_is_merged`.
+        gdn_merged = gdn_in_proj_is_merged(atom_config, prefix.rsplit(".", 1)[0])
         if self.layer_type == "full_attention":
             input_norm_proj = f"{prefix}.self_attn.qkv_proj"
+        elif gdn_merged:
+            input_norm_proj = f"{prefix}.linear_attn.in_proj_qkvzba"
         else:
             input_norm_proj = f"{prefix}.linear_attn.in_proj_qkvz"
         input_norm_quant = (
@@ -447,7 +558,10 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
             config.hidden_size,
             eps=config.rms_norm_eps,
             quant_config=input_norm_quant,
-            write_bf16=self.layer_type == "linear_attention",
+            # A merged in_proj_qkvzba consumes the quantized activation
+            # directly, so the norm no longer has to emit the BF16 copy that
+            # the separate in_proj_ba needed.
+            write_bf16=self.layer_type == "linear_attention" and not gdn_merged,
             # Layer 0's input is the embedding, already complete on every rank.
             fused_allreduce=fuse_allreduce_norm and layer_num > 0,
         )
@@ -528,41 +642,6 @@ class Qwen3_5Model(Qwen3NextModel):
         )
 
 
-_QWEN3_5_PACKED_MODULES_MAPPING = {
-    "q_proj": ("qkv_proj", "q"),
-    "k_proj": ("qkv_proj", "k"),
-    "v_proj": ("qkv_proj", "v"),
-    "gate_proj": ("gate_up_proj", 0),
-    "up_proj": ("gate_up_proj", 1),
-    "gate_up_proj": ["gate_proj", "up_proj"],
-    "in_proj_qkv": ("in_proj_qkvz", (0, 1, 2)),
-    "in_proj_z": ("in_proj_qkvz", 3),
-    "in_proj_b": ("in_proj_ba", 0),
-    "in_proj_a": ("in_proj_ba", 1),
-    ".gate.": (".gate.", 0),
-    "shared_expert_gate": ("gate", 1),
-}
-
-
-_BF16_IN_PROJ_MAPPING = {
-    "in_proj_qkv": ("in_proj_qkvzba", (0, 1, 2)),
-    "in_proj_z": ("in_proj_qkvzba", 3),
-    "in_proj_b": ("in_proj_qkvzba", 4),
-    "in_proj_a": ("in_proj_qkvzba", 5),
-}
-
-
-def _apply_bf16_in_proj_mapping(mapping: dict, atom_config: Config) -> dict:
-    if atom_config.quant_config.global_quant_config.quant_dtype != torch.bfloat16:
-        return mapping
-
-    mapping.pop("in_proj_qkvz", None)
-    mapping.pop("in_proj_ba", None)
-    mapping["in_proj_qkvzba"] = ("in_proj_qkvzba", None)
-    mapping.update(_BF16_IN_PROJ_MAPPING)
-    return mapping
-
-
 class Qwen3_5ForCausalLMBase(nn.Module):
     packed_modules_mapping = _QWEN3_5_PACKED_MODULES_MAPPING
 
@@ -573,8 +652,10 @@ class Qwen3_5ForCausalLMBase(nn.Module):
         self.quant_config = atom_config.quant_config
 
         super().__init__()
-        self.packed_modules_mapping = _apply_bf16_in_proj_mapping(
-            dict(self.packed_modules_mapping), atom_config
+        self.packed_modules_mapping = _apply_merged_in_proj_mapping(
+            dict(self.packed_modules_mapping),
+            atom_config,
+            f"{maybe_prefix(prefix, 'model')}.layers",
         )
         self.config = config
         self.model = Qwen3_5Model(
@@ -690,7 +771,7 @@ class Qwen3_5ForConditionalGenerationTextOnly(nn.Module):
     def __init__(self, atom_config: Config, prefix: str = ""):
         super().__init__()
         self.config = atom_config.hf_config
-        self.packed_modules_mapping = _apply_bf16_in_proj_mapping(
+        self.packed_modules_mapping = _apply_merged_in_proj_mapping(
             dict(self.packed_modules_mapping), atom_config
         )
         self.visual = PPMissingLayer()
@@ -732,7 +813,7 @@ class Qwen3_5MoeForConditionalGenerationTextOnly(
     def __init__(self, atom_config: Config, prefix: str = ""):
         nn.Module.__init__(self)
         self.config = atom_config.hf_config
-        self.packed_modules_mapping = _apply_bf16_in_proj_mapping(
+        self.packed_modules_mapping = _apply_merged_in_proj_mapping(
             dict(self.packed_modules_mapping), atom_config
         )
         self.visual = PPMissingLayer()
@@ -836,8 +917,10 @@ class _Qwen3_5MultimodalBase(nn.Module):
             atom_config=atom_config,
             prefix=maybe_prefix("", "language_model"),
         )
-        self.packed_modules_mapping = _apply_bf16_in_proj_mapping(
-            dict(self.packed_modules_mapping), atom_config
+        self.packed_modules_mapping = _apply_merged_in_proj_mapping(
+            dict(self.packed_modules_mapping),
+            atom_config,
+            "language_model.model.layers",
         )
         self.image_token_id = getattr(multimodal_config, "image_token_id", 248056)
         self.video_token_id = getattr(multimodal_config, "video_token_id", 248057)

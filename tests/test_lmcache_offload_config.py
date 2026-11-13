@@ -59,6 +59,30 @@ def test_page_namespace_is_stable_for_equivalent_config():
     assert first.startswith("org/model::atom-page-v")
 
 
+def test_page_namespace_hashes_a_frontends_stable_speculative_form_even_empty():
+    """Supplied, it is what scheduler and workers agree on, empty or not: the
+    raw config it stands in for holds per-process fields."""
+    first, second = _config(), _config()
+    second.speculative_config.num_speculative_tokens = 5
+    for config in (first, second):
+        config.offload_speculative_config = {}
+    assert offcfg.build_page_namespace(
+        first, _lmcache_config(), 4
+    ) == offcfg.build_page_namespace(second, _lmcache_config(), 4)
+
+
+def test_page_namespace_stabilises_a_frontends_speculative_form():
+    """The frontend's form goes through the same canonical encoding: a dtype
+    hashes as its name, and a non-finite value is refused."""
+    torch = pytest.importorskip("torch")
+    config = _config()
+    config.offload_speculative_config = {"dtype": torch.bfloat16}
+    offcfg.build_page_namespace(config, _lmcache_config(), 4)
+    config.offload_speculative_config = {"acceptance": float("nan")}
+    with pytest.raises(ValueError, match="finite"):
+        offcfg.build_page_namespace(config, _lmcache_config(), 4)
+
+
 def test_page_namespace_supports_torch_dtype_in_speculative_config():
     torch = pytest.importorskip("torch")
     config = _config()
@@ -224,6 +248,21 @@ def test_offload_layout_override_cannot_downgrade_kimi_k3_to_dense():
     config.hf_config.compress_ratios = None
     config.hf_config.model_type = "kimi_linear"
     config.kv_transfer_config = {"offload_layout": "dense"}
+
+    with pytest.raises(ValueError, match="owns no tier"):
+        offcfg.select_offload_layout(config)
+
+
+@pytest.mark.parametrize(
+    ("model_type", "override"), [("kimi_linear", "qwen"), ("qwen3_next", "kimi_k3")]
+)
+def test_offload_layout_override_cannot_swap_the_two_state_tiers(model_type, override):
+    # `qwen` and `kimi_k3` both own a state tier, but each for its own family's
+    # state: neither restores the other's, so the swap is refused too.
+    config = _config()
+    config.hf_config.compress_ratios = None
+    config.hf_config.model_type = model_type
+    config.kv_transfer_config = {"offload_layout": override}
 
     with pytest.raises(ValueError, match="owns no tier"):
         offcfg.select_offload_layout(config)
@@ -492,3 +531,52 @@ def test_page_namespace_survives_a_worker_normalising_hf_config():
     assert offcfg.build_page_namespace(
         scheduler, _lmcache_config(), 4
     ) != offcfg.build_page_namespace(worker, _lmcache_config(), 4)
+
+
+@pytest.mark.parametrize(
+    "model_type, compress_ratios", [("deepseek_v4", [4, 128, 0]), ("llama", None)]
+)
+def test_only_v41_runs_on_its_layout(model_type, compress_ratios):
+    """Another model would run the dense codec under V4.1's namespace."""
+    config = _config()
+    config.hf_config.model_type = model_type
+    config.hf_config.compress_ratios = compress_ratios
+    config.kv_transfer_config = {"offload_layout": "dsv41"}
+    with pytest.raises(ValueError, match="DeepSeek-V4.1's layout"):
+        offcfg.select_offload_layout(config)
+
+
+@pytest.mark.parametrize("override", ["dsv41", "kimi_k3"])
+def test_a_state_owning_model_keeps_its_own_layout(override):
+    """Another state-owning layout has no tier for this model's state either."""
+    config = _config()
+    config.hf_config.compress_ratios = None
+    config.hf_config.model_type = "qwen3_next"
+    config.kv_transfer_config = {"offload_layout": override}
+    with pytest.raises(ValueError, match="owns no tier"):
+        offcfg.select_offload_layout(config)
+    config.kv_transfer_config = {"offload_layout": "qwen"}
+    assert offcfg.select_offload_layout(config) == "qwen"
+
+
+def test_v41_keeps_the_namespace_hybrid_gave_it(monkeypatch):
+    """V4.1 resolved to `hybrid` before it had a layout of its own, and keeps
+    the namespace native ATOM's tiers were filled under. Its window and
+    candidate-block fields move no namespace here, V4.1's or another model's:
+    only the vLLM plugin, which never had such tiers, hashes them."""
+    assert offcfg.PAGE_LAYOUT_VERSION == 3
+
+    def namespace(model_type, **fields):
+        config = _config()
+        config.hf_config.model_type = model_type
+        for name, value in fields.items():
+            setattr(config.hf_config, name, value)
+        return offcfg.build_page_namespace(config, _lmcache_config(), 4)
+
+    v41 = namespace("deepseek_v41", sliding_window=128, candidate_block_size=8)
+    assert v41 == namespace("deepseek_v41", sliding_window=256, candidate_block_size=8)
+    assert namespace("llama", compress_ratios=None) == namespace(
+        "llama", compress_ratios=None, sliding_window=4096, candidate_block_size=64
+    )
+    monkeypatch.setattr(offcfg, "select_offload_layout", lambda _config: "hybrid")
+    assert v41 == namespace("deepseek_v41", sliding_window=128, candidate_block_size=8)

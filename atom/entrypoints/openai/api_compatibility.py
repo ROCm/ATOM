@@ -5,13 +5,23 @@
 
 from dataclasses import dataclass
 
+from .reasoning_controls import DEFAULT_EFFORT_LEVEL, SUPPORTED_EFFORT_LEVELS
+
 
 @dataclass(frozen=True)
 class APICompatibility:
-    chat_usage_on_finish: bool = False
+    # Streamed usage rides on the last chunk, the one with `finish_reason`,
+    # and no usage-only chunk follows; `include_usage` only adds
+    # `usage: null` to the chunks before it. DeepSeek's contract, for Chat
+    # and /beta/completions (/v1/completions keeps its usage chunk).
+    usage_on_finish: bool = False
     chat_forced_tools_with_thinking: bool = True
     responses_ignored_fields: frozenset[str] = frozenset()
     anthropic_output_effort: bool = False
+    display_name: str | None = None
+    output_token_limit: int | None = None
+    effort_levels: tuple[str, ...] = ()
+    default_effort: str | None = None
 
     def responses_body(self, body: dict) -> dict:
         return {k: v for k, v in body.items() if k not in self.responses_ignored_fields}
@@ -29,7 +39,11 @@ class APICompatibility:
 
 DEFAULT_API_COMPATIBILITY = APICompatibility()
 DEEPSEEK_API_COMPATIBILITY = APICompatibility(
-    chat_usage_on_finish=True,
+    display_name="DeepSeek-V4.1-Flash",
+    output_token_limit=393216,
+    effort_levels=SUPPORTED_EFFORT_LEVELS,
+    default_effort=DEFAULT_EFFORT_LEVEL,
+    usage_on_finish=True,
     chat_forced_tools_with_thinking=False,
     anthropic_output_effort=True,
     # Explicit unsupported/ignored fields from DeepSeek's Responses support table.

@@ -165,7 +165,7 @@ def _hip_verify_tree_greedy(original, triton_impl):
 
 def _patch_hip_topk1_tree_kernel() -> None:
     try:
-        from sglang.srt.speculative import eagle_utils
+        import sglang.srt.speculative.eagle_utils as eagle_utils  # noqa: PLR0402
     except Exception:  # noqa: BLE001 - SGLang tree builder is optional
         return
     if not getattr(eagle_utils, "_is_hip", False):

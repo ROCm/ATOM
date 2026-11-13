@@ -17,11 +17,13 @@ closes each one:
   layer), so there is nothing to refuse: mono never reads a block table.
 * **batched rows across requests** -- a step is ``requests x qlen`` rows and the
   KDA stage places one task per (request, head, v-chunk). Rows of different
-  query lengths cannot share a build, so only a *uniform* spec-verify step is
-  served (``step_rows``), capped at ``MAX_ROWS``.
+  query lengths cannot share a build, so only a *uniform* step is served: a
+  spec verify, or a plain decode as one token a request (``plan.step_shape``),
+  capped at ``MAX_ROWS``.
 * **MTP / spec width** -- K1 reads a per-token snapshot slot
-  ``st_idx[request][token]``; ReplaySSM keeps that table's shape but leaves only
-  column 0 live, so it is refused rather than read wrong.
+  ``st_idx[request][token]``, or under ReplaySSM the request's checkpoint and
+  its committed (k, u, g) records (``KdaPreBuild.replay_cap``, read off the
+  allocated record buffers: ``runner._replay_cap``).
 * **TP sharding** -- ``SUPPORTED_TP``; ``Dims`` refuses any size that does not
   divide every width.
 * **weight layouts** -- ``weights.py`` checks each tensor it binds.
@@ -34,9 +36,12 @@ closes each one:
 
 from dataclasses import dataclass
 
-from atom.mono.plan.execution import BLOCKS
 from atom.mono.plan.shard import Shard, ShardError
-from atom.mono.runtime.deployment import common_refusals, first_refusal
+from atom.mono.runtime.deployment import (
+    common_refusals,
+    first_refusal,
+    resident_grid_refusals,
+)
 from atom.utils import envs
 
 # ---------------------------------------------------------------- model widths
@@ -133,7 +138,7 @@ SUPPORTED_TP = (8,)
 # the row count is bounded by LDS, not by anything the model asks for: the whole
 # 7168-wide row at 16 rows wants 229,632 B against gfx950's 163,840. The GEMV
 # stages a *column slab* at a time instead (``kernels.attention.kda.slab_plan``,
-# ``kernels.stages.gemv.slabs``), which is what would let a step be wider than
+# ``atom.mono.device.gemv.slabs``), which is what would let a step be wider than
 # 8. Both kernels still take one slab -- i.e. the whole row, exactly as before
 # -- at every row count up to 8.
 #
@@ -160,15 +165,40 @@ SUPPORTED_TP = (8,)
 # Measured at 16 rows (bs=2 x MTP7): target forward 23.393 -> 20.248 ms vs stock
 # production, 318.0 -> 365.0 output tok/s. The win *shrinks* with width --
 # -25.7% at 8 rows against a matched baseline, -17.4% at 16 -- because K1's GEMV
-# issues the same MFMAs at both widths while the staging does not. Nothing above
-# 16 is measured; do not extrapolate the trend.
+# issues the same MFMAs at both widths while the staging does not. Past 16 rows
+# (below) the numbers are in the run-k3-mono skill, measured width by width.
 #
 # Paired GSM8K at 16 rows showed no regression (recipes/Kimi-K3.md), but K2's
 # latent MoE still carries an unsettled MXFP4 activation-quant precision cost
 # (rel_L2 1.7e-1 .. 3.0e-1: the expert intermediate is bf16 in the reference and
 # MXFP4 here). The cap also arms mono for every CUDA-graph capture size inside
-# it and sizes the peer buffer that every step zeroes. Nothing above 16 is built.
-MAX_ROWS = 16
+# it and sizes the peer buffer that every step zeroes.
+#
+# Past 16 rows a step is token groups of ``TOKEN_GROUP`` rows, the last one the
+# rest (``group_rows``: a 24-row DSpark verify of 3 requests is 16 + 8): the
+# per-token stages run the <= 16-row code on a group's view, and every GEMV
+# multiplies a weight's bytes once against each group, so a token's outputs
+# equal its group's build run alone (bit for bit: each wide build is checked
+# against its groups run alone). A group's regions start g whole groups in, so
+# a partial last group changes no layout. The DSA layers' mono indexer
+# serves a plain decode or a verify up to its own bound
+# (``dsa_indexer.kernel.unfit``); a wider step runs the layer's own indexer.
+TOKEN_GROUP = 16
+MAX_ROWS = 64
+
+
+def groups(s: int) -> int:
+    """A step's token groups: ``TOKEN_GROUP`` rows each, the last one the rest."""
+    return -(-s // TOKEN_GROUP)
+
+
+def group_rows(s: int, g: int) -> int:
+    """Token group g's rows in an ``s``-row step: ``TOKEN_GROUP``, or fewer in
+    the last. A group starts ``g TOKEN_GROUP`` rows (and its regions ``g``
+    whole groups) in."""
+    return min(TOKEN_GROUP, s - g * TOKEN_GROUP)
+
+
 # tokens a request contributes at most (the conv rollback window the kernel
 # tiles for)
 MAX_QLEN = 16
@@ -211,35 +241,19 @@ def config_refusal(atom_config) -> str | None:
     # run under TR_HYBRID -- every measurement to date used FULL -- and arming
     # an untested path is worse than requiring one documented flag. Drop it
     # when there is a TR_HYBRID run to point at, not before.
-    checks += common_refusals(atom_config, Dims, SUPPORTED_TP) + [
-        # the kernels are one CTA a CU with every CTA resident: a spin wait on
-        # another CTA only makes progress while that CTA runs
-        (
-            _cu_count() in (None, BLOCKS),
-            f"{_cu_count()} CUs, the kernels need {BLOCKS}",
-        ),
-        # a connector's copy kernels run on another stream and can hold CUs,
-        # which wedges a kernel that waits on every one of them. The field is a
-        # dict that defaults to empty, so this is a truthiness test, as every
-        # other reader of it in ATOM does: `is None` refuses every deployment.
-        (
-            not getattr(atom_config, "kv_transfer_config", None),
-            "KV connector",
-        ),
+    # Decode CP is not refused: the K1 / K2 kernels run no attention (the MLA
+    # layers and their KV split stay on the production path), and the DSA
+    # layers' mono indexer is written for the DCP split -- it serves only
+    # under DCP = TP and is off otherwise (``dsa_indexer.bind._refusal``).
+    checks += (
+        common_refusals(atom_config, Dims, SUPPORTED_TP, refuse_decode_cp=False)
+        + resident_grid_refusals(atom_config)
+    ) + [
         # the KDA recurrence reads and writes fp32 state in place; a narrower
         # pool would be read as fp32 rather than converted
         (
             envs.ATOM_GDN_SSM_DTYPE == "fp32",
             f"ATOM_GDN_SSM_DTYPE={envs.ATOM_GDN_SSM_DTYPE}",
-        ),
-        # K1 resumes a request from ``st_idx[request][token]``, a snapshot slot
-        # a token. ReplaySSM keeps that table's shape but leaves only column 0
-        # live, rebuilding the rest from its (k, u, g) records. It defaults ON
-        # whenever spec decode is used -- which mono needs -- so without the
-        # override every step would be declined one at a time instead.
-        (
-            envs.ATOM_ENABLE_REPLAYSSM is False,
-            "ReplaySSM (mono needs ATOM_ENABLE_REPLAYSSM=0)",
         ),
         # the model's own widths, which the kernels bake
         ((hidden := getattr(hf, "hidden_size", None)) == HIDDEN, f"hidden {hidden}"),
@@ -307,27 +321,15 @@ def config_refusal(atom_config) -> str | None:
             == SITU_LINEAR_BETA,
             "SiTU linear beta",
         ),
-        # a step is a uniform spec verify: without a drafter there is none
-        (spec is not None, "no speculative decoding"),
-        # ...and the contract is DSpark specifically, as DeepSeek-V4.1's mono
-        # already states it (`deepseek_v41/mono/config.py`); another method
-        # would be admitted here on a path never built or measured for it
+        # With a drafter, a served step is a uniform verify, and the contract
+        # is DSpark specifically, as DeepSeek-V4.1's mono already states it
+        # (`deepseek_v41/mono/config.py`); another method would be admitted
+        # here on a path never built or measured for it. Without one, a served
+        # step is a plain decode (`plan.step_shape`).
         (spec is None or spec.method == "dspark", "not DSpark"),
         (
-            spec is None or 0 < spec.num_speculative_tokens + 1 <= MAX_ROWS,
-            f"speculative width past the {MAX_ROWS}-row buffers",
+            spec is None or 0 < spec.num_speculative_tokens + 1 <= MAX_QLEN,
+            f"speculative width past the {MAX_QLEN}-token query K1 tiles for",
         ),
     ]
     return first_refusal(checks)
-
-
-def _cu_count() -> int | None:
-    """This device's CUs, or None where there is no device (a contract check
-    builds compile-only and never binds one)."""
-    import torch
-
-    if not torch.cuda.is_available():
-        return None
-    return torch.cuda.get_device_properties(
-        torch.cuda.current_device()
-    ).multi_processor_count

@@ -18,7 +18,7 @@ from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
 from atom.models.deepseek_v41.dspark import DeepseekV41DSpark
 from atom.spec_decode.drafter import AuxCaptureSpec
 from atom.spec_decode.dspark_proposer import DSparkProposer
-from tests.attentions.deepseek_v41.helpers import metadata_buffers
+from tests.attentions.deepseek_v41.helpers import metadata_buffers, stage_query_layout
 
 
 def test_v41_draft_uses_shared_block_capture():
@@ -56,11 +56,13 @@ def test_capture_builder_uses_full_query_width_and_serving_storage(width):
     builder.prepare_model_inputs = lambda tokens, metadata: prepared.append(
         tokens.numel()
     )
+    # The runner publishes the capture's query layout (`stage_and_build`).
+    stage_query_layout(builder, (width, width), 2, 2 * width)
     metadata, context = builder.build_for_cudagraph_capture(2, width)
     assert prepared == [2 * width]
     assert context.running_tokens == context.scheduled_tokens == 2 * width
     assert not context.is_dummy_run and metadata.dummy
-    assert metadata.step.width == metadata.step.scheduled == 2 * width
+    assert metadata.step.running_tokens == metadata.step.scheduled_tokens == 2 * width
     # The bucket reaches the metadata, so `run_model` keys the right graph.
     assert metadata.step.max_q_len == metadata.max_seqlen_q == width
     # Behind a full window, not at 0: the capture has to record the branch a
@@ -112,7 +114,7 @@ def test_draft_context_write_spans_the_forwards_width_not_its_tokens(monkeypatch
         plans={},
     )
     # Three distinct numbers, so a slice by the wrong one cannot pass.
-    assert step.scheduled == 1 and step.width == 2
+    assert step.scheduled_tokens == 1 and step.running_tokens == 2
     written = []
     monkeypatch.setattr(
         cache,
@@ -139,8 +141,8 @@ def test_draft_context_write_spans_the_forwards_width_not_its_tokens(monkeypatch
     draft.write_context_kv(aux, torch.arange(4))
     layer, (hidden, positions), taken = written.pop()
     assert not written and layer == 0 and taken is step
-    torch.testing.assert_close(hidden, aux[: step.width].unsqueeze(0))
-    torch.testing.assert_close(positions, torch.arange(step.width)[None])
+    torch.testing.assert_close(hidden, aux[: step.running_tokens].unsqueeze(0))
+    torch.testing.assert_close(positions, torch.arange(step.running_tokens)[None])
 
 
 def test_draft_context_write_follows_a_replayed_decoder(monkeypatch):
@@ -148,7 +150,7 @@ def test_draft_context_write_follows_a_replayed_decoder(monkeypatch):
     window comes from the decoder's rows: it is written on the tail, through
     the tail's step, and not at all by a forward that ran no decoder."""
     written = []
-    outer = SimpleNamespace(replay=None, width=6)
+    outer = SimpleNamespace(replay=None, running_tokens=6)
     cache = SimpleNamespace(
         window_fp8=False,
         write_window=lambda layer, keys, taken: written.append((keys, taken)),
@@ -180,7 +182,7 @@ def test_draft_context_write_follows_a_replayed_decoder(monkeypatch):
     outer.replay = SimpleNamespace(tail=SimpleNamespace(requests=()))
     draft.write_context_kv(aux, torch.arange(6))
     assert not written
-    tail = SimpleNamespace(width=2, requests=(object(),))
+    tail = SimpleNamespace(running_tokens=2, requests=(object(),))
     outer.replay = SimpleNamespace(tail=tail, tail_rows=torch.tensor([3, 5]))
     draft.write_context_kv(aux, torch.arange(10, 16))
     (hidden, positions), taken = written.pop()
@@ -201,13 +203,20 @@ def capture_fixture(monkeypatch):
     proposer = DSparkProposer.__new__(DSparkProposer)
     proposer.model = draft
     proposer.speculative_config = SimpleNamespace(
-        draft_model_hf_config=SimpleNamespace(dspark_target_layer_ids=(0,))
+        draft_model_hf_config=SimpleNamespace(dspark_target_layer_ids=(0,)),
+        use_dspark=lambda: True,
     )
-    proposer.config = SimpleNamespace(hf_config=SimpleNamespace(hidden_size=8))
+    proposer.config = SimpleNamespace(
+        hf_config=SimpleNamespace(hidden_size=8),
+        speculative_config=proposer.speculative_config,
+    )
     proposer.max_num_tokens, proposer.device, proposer.dtype = 9, "cpu", torch.float32
     target = nn.Module()
     target.layers = nn.ModuleList([ShiftBlock()])
-    context = SimpleNamespace(is_draft=False, ubatch_token_offset=2)
+    proposer.runner = SimpleNamespace(model=target)
+    context = SimpleNamespace(
+        is_draft=False, ubatch_token_offset=2, ubatch_token_order=None
+    )
     monkeypatch.setattr(
         "atom.spec_decode.drafter.get_forward_context",
         lambda: SimpleNamespace(context=context),
@@ -236,7 +245,7 @@ def test_input_capture_uses_stream_mean_and_respects_offset_and_draft(monkeypatc
 
 def test_output_capture_remains_default(monkeypatch):
     proposer, target, _ = capture_fixture(monkeypatch)
-    proposer._aux_capture_spec = lambda _: AuxCaptureSpec(
+    proposer._aux_capture_spec = lambda: AuxCaptureSpec(
         (0,), 8, lambda output, block: output.residual.mean(-2).squeeze(0)
     )
     proposer.arm_aux_capture(target)
@@ -269,7 +278,11 @@ def test_decode_positions_use_accepted_prefix_and_full_reservation():
     builder.cache = PagedAttentionCache(builder.geometry, 20, 5, "cpu")
     builder.block_size, builder.device = 16, "cpu"
     builder.model_runner = SimpleNamespace(
-        tokenID_processor=SimpleNamespace(num_rejected=np.array([0, 4])),
+        # Deferred output (pp == 1): the verify window's shift is num_rejected.
+        tokenID_processor=SimpleNamespace(
+            num_rejected=np.array([0, 4]),
+            verify_ctx_lens=lambda ctx: ctx - np.array([0, 4]),
+        ),
         forward_vars=metadata_buffers(2, 4, 10, geometry=builder.geometry),
     )
     batch = SimpleNamespace(
@@ -285,8 +298,7 @@ def test_decode_positions_use_accepted_prefix_and_full_reservation():
         num_scheduled_tokens=(1, 3),
         block_tables=(tuple(range(10)), tuple(range(10, 20))),
     )
-    # Serving publishes this before input assembly and attention preparation.
-    builder.publish_cu_seqlens_q(batch, SimpleNamespace(running_bs=2))
+    stage_query_layout(builder, batch.num_scheduled_tokens, 2, 4)
     metadata, actual = builder.prepare_decode(batch, 2, 4, 3)
     assert [span.position for span in metadata.step.requests] == [129, 140]
     assert actual.tolist() == [129, 140, 141, 142]
@@ -360,7 +372,15 @@ def test_draft_graph_replay_reads_serving_slots_after_reorder(monkeypatch):
         )
         ids = torch.arange(len(slots), device="cuda", dtype=torch.int32)
         pos = torch.tensor(anchors, device="cuda", dtype=torch.int64)
-        staged = graph.stage(4, {"anchor_ids": ids, "anchor_positions": pos})
+        # The proposer stages every running row, the padding ones zero.
+        pad = 4 - len(slots)
+        staged = graph.stage(
+            4,
+            {
+                "anchor_ids": torch.nn.functional.pad(ids, (0, pad)),
+                "anchor_positions": torch.nn.functional.pad(pos, (0, pad)),
+            },
+        )
         actual, actual_pos, actual_ids = graph.run(4, **staged)
         expected = window[torch.tensor(slots, device="cuda")]
         torch.testing.assert_close(actual[: len(slots)], expected, rtol=0, atol=0)
@@ -413,3 +433,16 @@ def test_engram_rows_carry_live_tokens_and_dead_flags():
     # a capture's synthetic batch: no live token
     builder._prepare(batch, 2, 8, engram_live=False)
     assert rows.np[0] == 0
+
+
+def test_armed_capture_keeps_the_extract_its_hooks_run(monkeypatch):
+    """A mono step bypasses the hooks, so it needs the same function."""
+    proposer, target, _ = capture_fixture(monkeypatch)
+    proposer.aux_extract = None
+
+    def extract(output, block):
+        return output.residual.mean(-2).squeeze(0)
+
+    proposer._aux_capture_spec = lambda: AuxCaptureSpec((0,), 8, extract)
+    proposer.arm_aux_capture(target)
+    assert proposer.aux_extract is extract

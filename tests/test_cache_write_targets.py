@@ -38,6 +38,9 @@ class _FakeBuffer:
         self.gpu = np.full(size, fill, dtype=np.int64)
         self.uploads = 0
 
+    def acquire_write(self):
+        pass
+
     def copy_to_gpu(self, n: int | None = None):
         self.uploads += 1
         self.gpu[:] = self.np

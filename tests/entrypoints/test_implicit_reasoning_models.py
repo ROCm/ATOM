@@ -19,8 +19,8 @@ from __future__ import annotations
 import pytest
 
 from atom.entrypoints.openai.reasoning import (
+    ReasoningChannel,
     ReasoningFilter,
-    separate_reasoning,
     template_opens_reasoning_implicitly,
 )
 
@@ -52,23 +52,27 @@ class TestWhatItBuys:
 
     def test_unseeded_and_unflagged_the_end_marker_is_just_text(self):
         """The default, unchanged: nothing opened a channel, so nothing closed one."""
-        reasoning, content = separate_reasoning(self.RAW)
+        reasoning, content = ReasoningChannel().split(self.RAW, stopped=True)
         assert reasoning is None and content == self.RAW
 
     def test_flagged_the_reasoning_is_recovered(self):
-        reasoning, content = separate_reasoning(self.RAW, starts_thinking=True)
+        reasoning, content = ReasoningChannel(starts_open=True).split(
+            self.RAW, stopped=True
+        )
         assert reasoning == "Let me work it out."
         assert content == "\n\n2 + 2 = 4."
 
     def test_streaming_and_non_streaming_agree_once_flagged(self):
         """The flag is one value read by both paths, so they cannot diverge."""
-        reasoning, content = separate_reasoning(self.RAW, starts_thinking=True)
+        reasoning, content = ReasoningChannel(starts_open=True).split(
+            self.RAW, stopped=True
+        )
 
         rf = ReasoningFilter(starts_thinking=True)
         segments = []
         for i in range(0, len(self.RAW), 4):
             segments += rf.process(self.RAW[i : i + 4])
-        segments += rf.flush()
+        segments += rf.flush(stopped=True)
         streamed_r = "".join(s for f, s in segments if f == "reasoning_content")
         streamed_c = "".join(s for f, s in segments if f == "content")
 
@@ -136,11 +140,11 @@ class TestAskingForNoThinkingOnlyCountsWhereItCanBeHonoured:
         model reasons as always however the request was written. True by
         construction now: with no toggle there is no kwarg name to look for."""
         channel = self._channel(None, {"enable_thinking": False})
-        assert channel.split(self.ANSWER) == self.SEPARATED
+        assert channel.split(self.ANSWER, stopped=True) == self.SEPARATED
 
     def test_a_model_with_a_switch_takes_the_render_at_its_word(self):
         channel = self._channel(self.SWITCH, {"enable_thinking": False})
-        assert channel.split(self.ANSWER) == (None, self.ANSWER)
+        assert channel.split(self.ANSWER, stopped=True) == (None, self.ANSWER)
 
     @pytest.mark.parametrize(
         "kwargs",
@@ -151,7 +155,7 @@ class TestAskingForNoThinkingOnlyCountsWhereItCanBeHonoured:
         """Absent means unstated, and unstated leaves the model's own default
         alone -- at this layer as at the prompt layer."""
         channel = self._channel(self.SWITCH, kwargs)
-        assert channel.split(self.ANSWER) == self.SEPARATED
+        assert channel.split(self.ANSWER, stopped=True) == self.SEPARATED
 
     def test_a_kwarg_this_template_does_not_read_changes_nothing(self):
         """The name has to be the resolved toggle's. A Qwen-spelled switch
@@ -159,7 +163,7 @@ class TestAskingForNoThinkingOnlyCountsWhereItCanBeHonoured:
         thinks anyway -- and believing it would stop the channel being
         separated while the chain of thought went on being produced."""
         channel = self._channel(self.SWITCH, {"thinking": False})
-        assert channel.split(self.ANSWER) == self.SEPARATED
+        assert channel.split(self.ANSWER, stopped=True) == self.SEPARATED
 
     def test_an_operator_default_reaches_the_decision(self):
         """The defect. `--default-chat-template-kwargs '{"enable_thinking":
@@ -169,4 +173,4 @@ class TestAskingForNoThinkingOnlyCountsWhereItCanBeHonoured:
         answer came back as `reasoning_content` with `content` empty."""
         merged = {"enable_thinking": False}  # a server default, no request field
         channel = self._channel(self.SWITCH, merged)
-        assert channel.split(self.ANSWER) == (None, self.ANSWER)
+        assert channel.split(self.ANSWER, stopped=True) == (None, self.ANSWER)

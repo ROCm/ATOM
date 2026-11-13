@@ -1533,6 +1533,12 @@ def _fake_head(batch):
     head._dispatch_connector_only_batch = (
         PPEngineCoreProc._dispatch_connector_only_batch.__get__(head)
     )
+    head._queue_or_flush_prefill_hashes = (
+        PPEngineCoreProc._queue_or_flush_prefill_hashes.__get__(head)
+    )
+    head._collect_pp_completions = PPEngineCoreProc._collect_pp_completions.__get__(
+        head
+    )
     PPEngineCoreProc._pp_head_step(head)
     return head
 
@@ -1627,7 +1633,7 @@ def test_pp_downstream_skips_forward_for_request_less_batch():
         scheduler=MagicMock(),
         utility_handler=MagicMock(),
         utility_queue=MagicMock(),
-        _is_idle_rl_weights_offloaded=lambda: False,
+        _is_engine_held=lambda: False,
         _poll_and_send_kv_status=MagicMock(),
     )
     # One pass over the loop body, then shut down.
@@ -1653,7 +1659,7 @@ def _downstream_stage(**overrides):
         scheduler=MagicMock(),
         utility_handler=MagicMock(),
         utility_queue=MagicMock(),
-        _is_idle_rl_weights_offloaded=lambda: False,
+        _is_engine_held=lambda: False,
         _poll_and_send_kv_status=MagicMock(),
     )
     for key, value in overrides.items():
@@ -1669,6 +1675,28 @@ def _run_last_stage(batch):
     stage.runner_mgr.call_func.return_value = "fwd-out"
     PPEngineCoreProc._downstream_busy_loop(stage)
     return stage
+
+
+@pytest.mark.parametrize("weights_offloaded", [False, True])
+def test_a_held_stage_still_reports_its_kv_transfers(weights_offloaded):
+    """The head waits for every stage's report before a KV change. A stage
+    fenced by a weight sync stopped reporting, so the change waited out its
+    deadline and refused a sync that had already written. With its weights,
+    and so its KV pool, released, the stage runs nothing."""
+    PPEngineCoreProc = _pp_engine_core_cls()
+    stage = _downstream_stage(
+        kv_transfer_enabled=True,
+        _is_engine_held=lambda: True,
+        _is_rl_weights_offloaded=weights_offloaded,
+    )
+    stage.pull_and_process_input_queue = MagicMock(side_effect=[False, True])
+
+    PPEngineCoreProc._downstream_busy_loop(stage)
+
+    stage.pp_transport.recv_metadata.assert_not_called()
+    # The last call is the report every stage makes as it shuts down.
+    held_reports = stage._poll_and_send_kv_status.call_count - 1
+    assert held_reports == (0 if weights_offloaded else 1)
 
 
 def test_pp_downstream_skips_the_middle_chunk_ack_by_default():
@@ -1720,54 +1748,38 @@ def _head_for_batch(batch, *, dynamic_chunking_active=False):
     head.scheduler.take_rejected.return_value = None
     head.scheduler.dynamic_chunking_active = dynamic_chunking_active
     head._dispatch_connector_only_batch = MagicMock()
+    head._queue_or_flush_prefill_hashes = (
+        PPEngineCoreProc._queue_or_flush_prefill_hashes.__get__(head)
+    )
+    head._collect_pp_completions = PPEngineCoreProc._collect_pp_completions.__get__(
+        head
+    )
     return PPEngineCoreProc, head
 
 
-def test_pp_head_retires_a_middle_chunk_without_a_completion_ack():
+@pytest.mark.parametrize("dynamic_chunking_active", [False, True])
+def test_pp_head_waits_for_the_ack_of_a_middle_chunk(dynamic_chunking_active):
+    # Retired unacked, the chunk could still be in stage 1's queue when the
+    # head took its pipeline for empty and let a pause or a KV change go on.
     batch = _fake_batch([7], None)
     batch.produces_output = lambda: False
-    PPEngineCoreProc, head = _head_for_batch(batch)
-
-    PPEngineCoreProc._pp_head_step(head)
-
-    assert batch.pp_completion_ack is False
-    head.pp_transport.recv_completion.assert_not_called()
-    head.scheduler.release_pp_inflight.assert_called_once_with(batch)
-    assert len(head._in_flight) == 0
-
-
-def test_pp_head_waits_for_a_middle_chunk_ack_while_dynamic_chunking_is_active():
-    batch = _fake_batch([7], None)
-    batch.produces_output = lambda: False
-    PPEngineCoreProc, head = _head_for_batch(batch, dynamic_chunking_active=True)
-    head.pp_transport.recv_completion.return_value = ([7], None)
+    PPEngineCoreProc, head = _head_for_batch(
+        batch, dynamic_chunking_active=dynamic_chunking_active
+    )
+    head.pp_transport.recv_completion.return_value = None
 
     PPEngineCoreProc._pp_head_step(head)
 
     # Set before the metadata goes out, so the last stage reads the same flag.
     assert head.pp_transport.send_metadata.call_args.args[0].pp_completion_ack is True
-    head.pp_transport.recv_completion.assert_called()
-    head.scheduler.release_pp_inflight.assert_called_once_with(batch)
+    assert len(head._in_flight) == 1
+    head.scheduler.release_pp_inflight.assert_not_called()
 
-
-def test_pp_head_stops_asking_for_acks_once_dynamic_chunking_ends():
-    # Calibration gave up, or the fit was rejected: middle chunks go back to
-    # retiring locally rather than paying the ack for the life of the process.
-    first, second = _fake_batch([7], None), _fake_batch([8], None)
-    for batch in (first, second):
-        batch.produces_output = lambda: False
-    PPEngineCoreProc, head = _head_for_batch(first, dynamic_chunking_active=True)
     head.pp_transport.recv_completion.return_value = ([7], None)
-    PPEngineCoreProc._pp_head_step(head)
+    PPEngineCoreProc._collect_pp_completions(head, 0)
 
-    head.scheduler.dynamic_chunking_active = False
-    head.scheduler.schedule.side_effect = [(second, {8: SimpleNamespace(id=8)}), None]
-    head.pp_transport.recv_completion.reset_mock()
-    PPEngineCoreProc._pp_head_step(head)
-
-    assert first.pp_completion_ack is True
-    assert second.pp_completion_ack is False
-    head.pp_transport.recv_completion.assert_not_called()
+    assert len(head._in_flight) == 0
+    head.scheduler.release_pp_inflight.assert_called_once_with(batch)
 
 
 def test_pp_head_rejects_a_final_chunk_whose_tokens_are_out_of_order():
@@ -1797,6 +1809,9 @@ def test_dcp_block_descriptors_are_streamed_in_bounded_batches():
     connector._per_block_bytes_list = [bytes_per_block, bytes_per_block]
     connector._block_region_roles = [MLA_KV_ROLE, MLA_KV_ROLE]
     connector._block_region_consumer_indices = None
+    connector._block_unit_specs = None
+    connector._block_head_major_runs = ()
+    connector._unit_layout = None
     connector._consumer_region_map = lambda *_args, **_kwargs: [0, 1]
 
     batch_sizes = []
@@ -1863,6 +1878,9 @@ def test_dcp_index_staging_waits_for_request_ready_event():
     connector._per_block_bytes_list = [mla_block_bytes, index_block_bytes]
     connector._block_region_roles = [MLA_KV_ROLE, INDEX_CACHE_ROLE]
     connector._block_region_consumer_indices = None
+    connector._block_unit_specs = None
+    connector._block_head_major_runs = ()
+    connector._unit_layout = None
     connector._consumer_region_map = lambda *_args, **_kwargs: [0, 1]
     connector._index_staging_chunk_pages = 256
     gather_indices = object()
@@ -1924,6 +1942,9 @@ def test_dcp_index_staging_rejects_missing_request_ready_event():
     connector._per_block_bytes_list = [16 * 576, 16 * 144]
     connector._block_region_roles = [MLA_KV_ROLE, INDEX_CACHE_ROLE]
     connector._block_region_consumer_indices = None
+    connector._block_unit_specs = None
+    connector._block_head_major_runs = ()
+    connector._unit_layout = None
     connector._consumer_region_map = lambda *_args, **_kwargs: [0, 1]
     connector._index_staging_chunk_pages = 256
     connector._prepare_sharded_index = MagicMock(return_value=object())

@@ -124,6 +124,17 @@ class KVConnectorSchedulerBase(ABC):
         """Whether the scheduler may allocate this request and start prefill."""
         return True
 
+    def drop_cached_kv(self) -> bool:
+        """Forget KV computed with weights that are about to change.
+
+        True if nothing this connector holds can be found afterwards. A
+        connector that only moves a request's KV between engines keeps none
+        past the request. An offload tier keeps KV for later requests; until it
+        can drop its store it answers False, and the engine refuses the weight
+        change rather than serve old-weight KV from it.
+        """
+        return not getattr(self, "is_offload", False)
+
     def abort_send(self, seq: Any) -> None:
         """Retire an unsent abort; streaming senders must wait for reader drain."""
         self.send_finished(seq.id)

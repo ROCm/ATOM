@@ -4,14 +4,22 @@
 # from flash_attn import flash_attn_with_kvcache
 
 import torch
+from aiter.dist.parallel_state import get_pcp_group
 from torch import nn
 
 from atom.config import get_current_atom_config
+from atom.distributed.ulysses_sp import (
+    check_sp_attention_layer,
+    get_sp_world_size,
+    send_columns,
+    sp_head_shards,
+)
 from atom.plugin.prepare import is_plugin_mode
 from atom.utils.selector import Family, get_attn_backend
 
 from .attention_mla import MLAModules
 from .base_attention import BaseAttention
+from .sp_attention import head_exchange_comm, sp_fp8_attention_output_supported
 
 
 class Attention(BaseAttention):
@@ -37,11 +45,27 @@ class Attention(BaseAttention):
         q_norm: torch.nn.Module | None = None,
         k_norm: torch.nn.Module | None = None,
         impl_cls: type | None = None,
+        per_token_fp8_out: bool = False,
         **kwargs,
     ):
         assert (
             not is_plugin_mode()
         ), "ATOM native Attention is only supported for ATOM native/server mode"
+
+        # Projections keep all heads; attention and its KV pool own 1/SP.
+        sp_columns = sp_head_exchange = None
+        sp_size = get_sp_world_size()
+        if sp_size > 1:
+            check_sp_attention_layer(
+                prefix or f"layer {layer_num}", sinks, alibi_slopes, rotary_emb
+            )
+            impl = impl_cls or get_attn_backend(Family.MHA).get_impl_cls()
+            fields = impl.qkv_fields(num_heads, num_kv_heads, head_dim, **kwargs)
+            sp_columns = send_columns(fields, torch.cuda.current_device())
+            sp_head_exchange = head_exchange_comm(get_pcp_group())
+            num_heads = sp_head_shards(num_heads, sp_size)[0]
+            num_kv_heads = sp_head_shards(num_kv_heads, sp_size)[0]
+
         super().__init__(
             num_heads=num_heads,
             head_dim=head_dim,
@@ -73,6 +97,17 @@ class Attention(BaseAttention):
         self.kv_cache = torch.tensor([])
         self.indexer = mla_modules.indexer if mla_modules is not None else None
         self.sinks = sinks
+        # Ulysses SP: the fused-qkv columns each rank receives, and the
+        # communicator of the long-prefill head exchange.
+        self.sp_columns = sp_columns
+        self.sp_head_exchange = sp_head_exchange
+        # Under SP, hand an FP8 o_proj per-token FP8 `(out, scale)` straight
+        # from the head exchange instead of quantizing BF16 after it.
+        self.per_token_fp8_out = (
+            per_token_fp8_out
+            and sp_columns is not None
+            and sp_fp8_attention_output_supported()
+        )
 
         atom_config = get_current_atom_config()
         dtype = atom_config.torch_dtype
@@ -118,6 +153,13 @@ class Attention(BaseAttention):
         qkv: torch.Tensor = None,
         **kwargs,
     ):
+        if self.per_token_fp8_out:
+            # Allocated outside the op, in the compiled segment before it.
+            scale = query.new_empty((query.shape[0], 1), dtype=torch.float32)
+            output = torch.ops.aiter.sp_attention_fp8(
+                query, key, value, positions, self.layer_name, qkv, scale
+            )
+            return output, scale
         output = torch.ops.aiter.unified_attention_with_output_base(
             query, q_scale, key, value, positions, self.layer_name, self.use_mla, qkv
         )

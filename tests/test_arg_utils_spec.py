@@ -55,6 +55,22 @@ def test_request_context_metrics_cli_reaches_engine_kwargs(enabled):
     assert args._get_engine_kwargs()["enable_request_context_metrics"] is enabled
 
 
+@pytest.mark.parametrize(
+    "argv,want",
+    [([], "interval"), (["--prefill-admit-policy", "adaptive"], "adaptive")],
+)
+def test_prefill_admit_policy_cli_reaches_engine_kwargs(argv, want):
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = EngineArgs.from_cli_args(parser.parse_args(argv))
+    assert args._get_engine_kwargs()["prefill_admit_policy"] == want
+
+
+def test_prefill_admit_policy_cli_rejects_unknown():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--prefill-admit-policy", "eoq"])
+
+
 class TestFlexibleArgumentParser:
     """Unit tests for the dash/underscore aliasing, isolated from EngineArgs."""
 

@@ -81,6 +81,9 @@ def _load_encoder_from_dir(model_path: str) -> MessageEncoderAdapter | None:
             logger.debug("No model_type for encoder %s", enc_path, exc_info=True)
 
     logger.info(f"Loaded message encoder from {enc_path}")
+    # Its own message processing, for text placed after the render (an
+    # assistant prefix); see `MessageEncoderAdapter.process_image_messages`.
+    process = getattr(mod, "process_image_messages", None)
     # Handed to the adapter rather than applied in a wrapper here. A wrapper
     # runs *after* the adapter has filtered kwargs against the encoder's
     # signature, so the one kwarg it adds is the one the filter cannot remove:
@@ -94,6 +97,7 @@ def _load_encoder_from_dir(model_path: str) -> MessageEncoderAdapter | None:
         enc_path,
         defaults={"thinking_mode": "thinking"},
         model_type=model_type,
+        process_image_messages=process if callable(process) else None,
     )
 
 
@@ -276,6 +280,7 @@ def apply_chat_template(
     messages: list[dict] | list[ChatMessage],
     *,
     tools: list[dict] | None = None,
+    preserve_tool_call_arguments: bool = False,
     **kwargs: Any,
 ) -> str:
     """Render ``messages`` to a prompt string.
@@ -291,7 +296,10 @@ def apply_chat_template(
             custom_encoder is not None and custom_encoder.preserve_content
         )
         messages = [
-            message.to_template_dict(preserve_content=preserve_content)
+            message.to_template_dict(
+                preserve_content=preserve_content,
+                preserve_tool_call_arguments=preserve_tool_call_arguments,
+            )
             for message in messages
         ]
     if custom_encoder is not None:

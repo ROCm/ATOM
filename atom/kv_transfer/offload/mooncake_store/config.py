@@ -18,6 +18,7 @@ from numbers import Real
 from typing import Any, NamedTuple
 
 from atom.kv_transfer.offload import config as offcfg
+from atom.kv_transfer.offload.mooncake_store.layouts import require_mooncake_layout
 from atom.kv_transfer.offload.mooncake_store.nic import parse_device_list
 
 KEY_PREFIX = "mooncake_store."
@@ -89,6 +90,13 @@ class MooncakeStoreOffloadConfig:
 _FIELDS = tuple(field.name for field in fields(MooncakeStoreOffloadConfig))
 
 
+def store_chunk_tokens(kv_transfer_config: Mapping[str, Any] | None) -> int:
+    """The transfer granularity shared by routing and the Store connector."""
+    return offcfg.connector_integer(
+        offcfg.connector_extras(kv_transfer_config), "mooncake_store.chunk_tokens", 256
+    )
+
+
 def parse_mooncake_store_config(
     kv_transfer_config: Mapping[str, Any] | None,
 ) -> MooncakeStoreOffloadConfig:
@@ -101,12 +109,7 @@ def parse_mooncake_store_config(
             type or out of range, neither a shared master nor pools, or pools
             without rdma.
     """
-    kvc = kv_transfer_config or {}
-    extra = kvc.get("kv_connector_extra_config", kvc) or {}
-    if not isinstance(extra, Mapping):
-        raise ValueError(  # noqa: TRY004  # a settings error, like every other
-            "kv_connector_extra_config must be a JSON object"
-        )
+    extra = offcfg.connector_extras(kv_transfer_config)
     values: dict[str, Any] = {}
     for key, value in extra.items():
         if not (isinstance(key, str) and key.startswith(KEY_PREFIX)):
@@ -164,8 +167,8 @@ def parse_mooncake_store_config(
         ),
         protocol=protocol,
         local_hostname=_text("mooncake_store.local_hostname", local_hostname),
-        chunk_tokens=offcfg._strict_integer(
-            "mooncake_store.chunk_tokens", values.get("chunk_tokens", 256), minimum=1
+        chunk_tokens=offcfg.connector_integer(
+            extra, "mooncake_store.chunk_tokens", 256
         ),
         load_pool_mib=offcfg._strict_integer(
             "mooncake_store.load_pool_mib", values.get("load_pool_mib", 1024), minimum=1
@@ -181,23 +184,20 @@ def parse_mooncake_store_config(
 
 
 def check_engine_compatibility(cfg: MooncakeStoreOffloadConfig, config: Any) -> None:
-    """Refuse what phase 1 does not move: non-dense layouts, DCP, odd chunks.
+    """Accept dense, M3 PAGE, and V4.1 replay PAGEs; refuse other layouts and DCP.
 
-    The Store holds one object per (rank, chunk) of the dense codec's opaque
-    block bytes. A hybrid, M3 or Kimi-K3 layout needs PAGE regions or a state
-    tier this connector does not carry, and a DCP rank's pages cover a virtual
-    block that the chunk keys do not name.
+    M3 uses complete PAGE regions, including its NSA index cache. V4.1's PAGE
+    regions are stored the same way and its request state is rebuilt by replay.
+    That V4.1 on the Store needs bounded replay is the model's own runtime gate
+    (`deepseek_v41.config.validate_runtime_config`). Other hybrid layouts need a
+    state tier this connector does not carry. A DCP rank's pages cover a
+    virtual block that the chunk keys do not name.
 
     Raises:
-        ValueError: The model is not on the dense layout, DCP > 1, or the
+        ValueError: The model is neither dense, M3, nor V4.1, DCP > 1, or the
             chunk is not a whole number of KV blocks.
     """
-    layout = offcfg.select_offload_layout(config)
-    if layout != "dense":
-        raise ValueError(
-            f"the Mooncake Store offload moves only the dense KV layout; this "
-            f"model resolves to {layout!r}"
-        )
+    require_mooncake_layout(offcfg.select_offload_layout(config))
     dcp = int(getattr(config, "decode_context_parallel_size", 1) or 1)
     if dcp > 1:
         raise ValueError(
@@ -246,8 +246,7 @@ def _pools(value: Any) -> dict[str, StorePool]:
         return {}
     if not isinstance(value, Mapping) or not value:
         raise ValueError(
-            "mooncake_store.pools must be a non-empty JSON object keyed by RDMA "
-            "device"
+            "mooncake_store.pools must be a non-empty JSON object keyed by RDMA device"
         )
     pools = {}
     for device, pool in value.items():

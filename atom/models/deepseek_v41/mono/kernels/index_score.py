@@ -34,7 +34,6 @@ several chunks a task.
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr
-from flydsl.expr import math as fmath
 from flydsl.expr.typing import Int32, T
 
 from atom.models.deepseek_v41.mono import index_plan as ip
@@ -43,15 +42,15 @@ from atom.models.deepseek_v41.mono.kernels.token_par import own_rows
 from atom.models.deepseek_v41.mono.kernels.topk import key_bits, lds_topk
 from atom.models.deepseek_v41.mono.step_meta import KMETA
 from atom.mono.device.ops import (
-    CM_DEV,
     CM_SYS,
     butterfly,
+    head_sum,
     ld_dev,
     ld_i32,
     mfma_fp8,
     rsrc,
+    st_dev,
     traced,
-    xred,
 )
 from atom.mono.device.sync import POLL_MAX, preg, publish
 from atom.mono.plan.arith import pick, sel
@@ -80,24 +79,6 @@ def scratch_pairs(tokens: int, bound_max: int, tok_par: bool = False) -> dict[st
             slots = ip.list_slots(kind, level, bound_max)
             out[f"i{kind}{level}"] = tokens * slots * k * 2
     return out
-
-
-def _st_dev(v, ptr, i):
-    bo.buffer_store(v, rsrc(ptr), i, cache_modifier=CM_DEV)
-
-
-def _head_sum(terms):
-    """gluon's: k = 4 h + e; pairs (0,2)(1,3)(4,6)(5,7) fma(w_a r_a, w_b r_b);
-    (s0 + s2) + (s1 + s3); lane groups xor 32, then xor 16."""
-    rw = [terms[k // 4, k % 4] for k in range(8)]
-    firsts = [
-        fx.Float32(fmath.fma(rw[a][0], rw[a][1], rw[b][0] * rw[b][1]))
-        for a, b in ((0, 2), (1, 3), (4, 6), (5, 7))
-    ]
-    v = (firsts[0] + firsts[2]) + (firsts[1] + firsts[3])
-    for off in (32, 16):
-        v = xred(v, off, lambda x, y: x + y)
-    return v
 
 
 def _plane_ptr(plane, tile, byte):
@@ -204,9 +185,9 @@ def _score_chunk(c, t, bound, blocks, query, blk, ks, b64):
         for e in range_constexpr(4):
             terms[h, e] = (fx.max(acc[e] * ks, fx.Float32(0.0)), wts[e])
     live = col < bound
-    score = fx.Float32(live.select(_head_sum(terms), fx.Float32(NEG)))
+    score = fx.Float32(live.select(head_sum(terms), fx.Float32(NEG)))
     if lane < 16:
-        _st_dev(score, a["ilog"], t * a["lstride"] + col)
+        st_dev(score, a["ilog"], t * a["lstride"] + col)
     if a["iprod"] != 0:
         # a block's best visible score: its 8 rows are 8 lanes
         best = fx.Float32(fx.isnan(score).select(fx.Float32(NEG), score))
@@ -216,7 +197,7 @@ def _score_chunk(c, t, bound, blocks, query, blk, ks, b64):
         newest = blk == blocks - 1
         best = fx.Float32(newest.select(fx.Float32(float("inf")), best))
         if (lane < 16) & (r8 == 0) & (blk < blocks):
-            _st_dev(best, a["ibmax"], t * a["bstride"] + blk)
+            st_dev(best, a["ibmax"], t * a["bstride"] + blk)
 
 
 @traced
@@ -372,7 +353,7 @@ def _final(c, kind, t, pos, ident, rows=None):
         row, pool_row = rows
         # the attention reads the pool rows; the selection only check mode
         # compares, which never runs token parallel: this rank's alone
-        _st_dev(row, c["args"]["isel"], t * ip.TOPK + pos)
+        st_dev(row, c["args"]["isel"], t * ip.TOPK + pos)
         _st_out(c, pool_row, "irow", t * ip.TOPK + pos)
     else:
         _st_out(c, Int32(ident), "icout", t * ip.TOPK_BLOCKS + pos)
@@ -389,7 +370,7 @@ def _st_out(c, v, name, i):
         for p in range_constexpr(c["d"].tp):
             bo.buffer_store(v, rsrc(c["peer_addr"](p) + off), i, cache_modifier=CM_SYS)
     else:
-        _st_dev(v, a[name], i)
+        st_dev(v, a[name], i)
 
 
 def _publish_all(c, region, t):

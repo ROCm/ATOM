@@ -3,10 +3,9 @@
 
 """The per-token index arrays a decode step has to derive.
 
-The counterpart of `.prefill`, on a rectangular token axis: a decode step runs
-the same `max_seqlen_q` rows for every sequence, so sequence `i` forwards
-`[context_lens[i] - max_seqlen_q, context_lens[i])` and the flat axis is that
-range concatenated in sequence order.
+The counterpart of `.prefill`: sequence `i` forwards its last `lengths[i]`
+context tokens, `[context_lens[i] - lengths[i], context_lens[i])`, and the flat
+axis is those ranges concatenated in sequence order (`cu_seqlens_q`).
 
 The slot each of these positions maps to is `.slots`, shared with `.prefill`:
 the gather reads a position and a packed table, and neither cares which side
@@ -21,19 +20,36 @@ import numpy as np
 
 
 def decode_positions(
-    context_lens: np.ndarray, max_seqlen_q: int, out: np.ndarray | None = None
+    context_lens: np.ndarray,
+    lengths: np.ndarray,
+    cu_seqlens_q: np.ndarray,
+    out: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Each token's absolute index in its OWN sequence.
-
-    Broadcast rather than `tile(ramp) + repeat(start)`: the rectangle IS a 2-D
-    shape, so writing it as one leaves the token axis touched once instead of
-    three times (1.4-2.2x, `/app/logs_claude/tool/decode_positions_perf.py`).
-    """
-    bs = len(context_lens)
-    out = np.empty(bs * max_seqlen_q, dtype=np.int32) if out is None else out
+    """Each token's absolute index in its OWN sequence, for sequences of query
+    ``lengths`` laid out at ``cu_seqlens_q``."""
+    total = int(cu_seqlens_q[len(lengths)])
+    out = np.empty(total, dtype=np.int32) if out is None else out[:total]
     np.add(
-        (context_lens - max_seqlen_q)[:, None],
-        np.arange(max_seqlen_q, dtype=np.int32),
-        out=out.reshape(bs, max_seqlen_q),
+        np.arange(total, dtype=np.int32),
+        np.repeat(context_lens - lengths - cu_seqlens_q[: len(lengths)], lengths),
+        out=out,
     )
     return out
+
+
+def query_is_uniform(lengths: np.ndarray, max_seqlen_q: int) -> bool:
+    """Whether every scheduled sequence runs ``max_seqlen_q`` query tokens: the
+    one shape a decode kernel taking a single query length a sequence reads."""
+    return bool((lengths == max_seqlen_q).all())
+
+
+def ragged_decode_refusal(
+    owner: str, lengths: np.ndarray, max_seqlen_q: int
+) -> ValueError:
+    """The error refusing a decode step whose sequences run different query
+    ``lengths`` on ``owner``, a kernel that lays each sequence's queries
+    ``max_seqlen_q`` rows apart: run, it would read the wrong rows."""
+    return ValueError(
+        f"{owner} decodes one query length a sequence; this decode step's are "
+        f"{lengths.tolist()} against max_seqlen_q={max_seqlen_q}"
+    )

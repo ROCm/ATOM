@@ -12,18 +12,15 @@ from __future__ import annotations
 
 import ast
 import importlib
-import importlib.abc
-import importlib.util
-import sys
 from contextlib import contextmanager
 from dataclasses import dataclass
-from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 import torch
+from aiter_stub import ActivationType, GateMode, QuantType
 from conftest import atom_config_double
 
 
@@ -46,25 +43,6 @@ class _ShapeKey:
     add_shared: bool | None = True
     comm: str = "ar"
     gpu_model: str | None = None
-
-
-class _ActivationType(Enum):
-    Silu = 0
-    Swiglu = 1
-    Situv2 = 2
-
-
-class _QuantType(Enum):
-    No = 0
-    per_Tensor = 1
-    per_Token = 2
-    per_1x128 = 3
-    per_1x32 = 4
-
-
-class _GateMode(Enum):
-    INTERLEAVE = "interleave"
-    SEPARATED = "separated"
 
 
 class _CommFusedMoeRuntime:
@@ -96,129 +74,6 @@ class _State:
         self.shape_keys = []
         self.runner_calls = []
         self.missing_shape = False
-
-
-def _identity_decorator(*_args, **_kwargs):
-    return lambda function: function
-
-
-def _triton_jit(function=None, **_options):
-    """`triton.jit`, bare or with options (`@triton.jit(do_not_specialize=...)`)."""
-    return function if function is not None else (lambda function: function)
-
-
-def _external_module_attributes(name: str) -> dict[str, object]:
-    dtypes = SimpleNamespace(
-        bf16=torch.bfloat16,
-        fp32=torch.float32,
-        fp4x2=torch.uint8,
-        fp8=torch.float8_e4m3fnuz,
-        fp8_e8m0=torch.uint8,
-        i4x2=torch.uint8,
-        i8=torch.int8,
-        d_dtypes={},
-    )
-    return {
-        "aiter": {
-            "ActivationType": _ActivationType,
-            "QuantType": _QuantType,
-            "dtypes": dtypes,
-        },
-        "aiter.jit.utils.torch_guard": {
-            "torch_compile_guard": _identity_decorator,
-        },
-        "aiter.ops.flydsl.moe_common": {"GateMode": _GateMode},
-        "triton": {
-            "jit": _triton_jit,
-            "heuristics": _identity_decorator,
-        },
-        "triton.language": {"constexpr": object},
-    }.get(name, {})
-
-
-class _ExternalModuleLoader(importlib.abc.Loader):
-    def create_module(self, spec):
-        return None
-
-    def exec_module(self, module) -> None:
-        module.__file__ = f"<test stub for {module.__name__}>"
-        module.__path__ = []
-        module.__dict__.update(_external_module_attributes(module.__name__))
-
-        def resolve(attribute: str):
-            value = MagicMock(name=f"{module.__name__}.{attribute}")
-            setattr(module, attribute, value)
-            return value
-
-        module.__getattr__ = resolve
-
-
-class _ExternalModuleFinder(importlib.abc.MetaPathFinder):
-    def find_spec(self, fullname, path, target=None):
-        if fullname in {"aiter", "triton"} or fullname.startswith(
-            ("aiter.", "triton.")
-        ):
-            return importlib.util.spec_from_loader(
-                fullname, _ExternalModuleLoader(), is_package=True
-            )
-        return None
-
-
-@contextmanager
-def _stubbed_external_kernel_modules():
-    # Torch imports its own optional Triton integration lazily. Resolve that
-    # first so this test's deliberately small Triton stub cannot affect it.
-    importlib.import_module("torch._dynamo.config")
-
-    prefixes = ("aiter", "triton")
-    saved = {
-        name: module
-        for name, module in sys.modules.items()
-        if name in prefixes or name.startswith(("aiter.", "triton."))
-    }
-    for name in saved:
-        sys.modules.pop(name, None)
-
-    finder = _ExternalModuleFinder()
-    sys.meta_path.insert(0, finder)
-    try:
-        yield
-    finally:
-        sys.meta_path.remove(finder)
-        for name in list(sys.modules):
-            if name in prefixes or name.startswith(("aiter.", "triton.")):
-                sys.modules.pop(name, None)
-        sys.modules.update(saved)
-
-
-@pytest.fixture(scope="module")
-def atom_modules():
-    existing_atom_modules = {
-        name: module
-        for name, module in sys.modules.items()
-        if name == "atom" or name.startswith("atom.")
-    }
-    with _stubbed_external_kernel_modules():
-        try:
-            moe = importlib.import_module("atom.model_ops.moe")
-            comm = importlib.import_module("atom.model_ops.fused_moe.comm_fused_moe")
-            deepseek_v4 = importlib.import_module("atom.models.deepseek_v4")
-            host = importlib.import_module("aiter.ops.flydsl.comm_fused_moe_host")
-            runtime = importlib.import_module("aiter.ops.comm_fused_moe_runtime")
-            yield SimpleNamespace(
-                moe=moe,
-                comm=comm,
-                deepseek_v4=deepseek_v4,
-                host=host,
-                runtime=runtime,
-            )
-        finally:
-            for name in list(sys.modules):
-                if (name == "atom" or name.startswith("atom.")) and (
-                    name not in existing_atom_modules
-                ):
-                    sys.modules.pop(name, None)
-            sys.modules.update(existing_atom_modules)
 
 
 @pytest.fixture
@@ -430,12 +285,12 @@ def _initialize_backend(comm_fused_env, *, dpa=False):
             {
                 "layer_quant_config": SimpleNamespace(
                     quant_dtype=torch.bfloat16,
-                    quant_type=_QuantType.per_1x32,
+                    quant_type=QuantType.per_1x32,
                 )
             },
         ),
         ({"torch_dtype": torch.float16}, {}),
-        ({}, {"activation": _ActivationType.Swiglu}),
+        ({}, {"activation": ActivationType.Swiglu}),
         ({}, {"apply_router_weight_on_input": True}),
         ({"enable_tbo": True}, {}),
         ({"prefill_context_parallel_size": 2}, {}),
@@ -567,11 +422,10 @@ def test_forward_impl_bridges_fused_moe_state_to_runtime(comm_fused_env):
         assert runtime_args[name] is value
     for name, attribute in _RUNTIME_PASSTHROUGH.items():
         assert runtime_args[name] is getattr(layer, attribute)
-    assert runtime_args["gate_mode"] == _GateMode.INTERLEAVE.value
+    assert runtime_args["gate_mode"] == GateMode.INTERLEAVE.value
     assert runtime_args["reuse_is_synchronized"] is False
-    # Routing sends pad rows to expert -1, and a TP layer has no expert_mask
-    # to switch the runtime's missing-route handling on by itself.
-    assert runtime_args["routes_may_be_missing"] is True
+    # Pad rows go to expert -1 as whole rows: no missing-route clear.
+    assert "routes_may_be_missing" not in runtime_args
 
 
 def test_dpa_forward_fuses_local_shared_into_owned_rs_rows(comm_fused_env):

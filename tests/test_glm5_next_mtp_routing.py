@@ -175,7 +175,7 @@ def test_mtp_graph_stages_actual_residual_shape(architecture, expected, reuse_bu
     assert graph.inputs["hidden_states"].shape == expected
     assert proposer._reuse_step_buffers is reuse_buffers
     graph.bind(SimpleNamespace(max_num_seqs=8), "cpu")
-    source = torch.ones((1, *expected), dtype=torch.bfloat16)
+    source = torch.ones((4, *expected), dtype=torch.bfloat16)
     staged = graph.stage(4, {"hidden_states": source})["hidden_states"]
     assert staged.shape == (4, *expected)
-    torch.testing.assert_close(staged, source.expand_as(staged))
+    torch.testing.assert_close(staged, source)

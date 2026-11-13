@@ -21,6 +21,8 @@ import zmq
 import zmq.asyncio
 
 from atom.config import Config
+from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+from atom.model_engine.capabilities import pcp_group_size_of
 from atom.model_engine.collective_rpc import (
     COLLECTIVE_RPC_CMD,
     DISCARD_WEIGHT_SYNC_CMD,
@@ -30,16 +32,32 @@ from atom.model_engine.collective_rpc import (
     checked_timeout,
     engine_budget,
 )
+from atom.model_engine.dp_routing.policies import (
+    LoadPolicy,
+    PrefixPolicy,
+    SessionPolicy,
+)
+from atom.model_engine.dp_routing.prefix_spread import PrefixSpreadRouter
+from atom.model_engine.dp_routing.route import (
+    PREFIX_LABELS,
+    PREFIX_MOVED_TOKENS,
+    PREFIX_OWNER,
+    Route,
+)
+from atom.model_engine.dp_routing.topology import prefix_spread_enabled
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import (
     FIRE_AND_FORGET_UTILITY_CMDS,
+    PAUSE_GENERATION_CMD,
     WEIGHT_UPDATE_UTILITY_CMDS,
     completes_weight_sync,
+    kv_change,
 )
 from atom.model_engine.prefix_hash import take_shipped_chains
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence
 from atom.observability import tracing
+from atom.structured_output import is_structured
 from atom.utils import (
     envs,
     get_open_zmq_inproc_path,
@@ -56,10 +74,22 @@ _WEIGHT_SYNC_OWNED_CMDS = WEIGHT_UPDATE_UTILITY_CMDS | {
     DISCARD_WEIGHT_SYNC_CMD,
 }
 
+
+def _pp_head_first(cmd: str, args: dict) -> bool:
+    """Whether the PP head empties its pipeline before *cmd*: a weight update,
+    whose sync fences the later stages, a change to the KV pool, or a pause,
+    which holds them."""
+    return (
+        cmd in WEIGHT_UPDATE_UTILITY_CMDS
+        or cmd == PAUSE_GENERATION_CMD
+        or kv_change(cmd, args) is not None
+    )
+
+
 # Valid values for Config.dp_load_balance / --dp-load-balance, and the default.
 # Single source of truth for argparse (choices + default) so the CLI flag and
 # the Config field can never diverge.
-DP_LB_STRATEGIES = ("round_robin", "least_requests", "least_tokens")
+DP_LB_STRATEGIES = ("round_robin", "least_requests", "least_tokens", "prefix_spread")
 DP_LB_DEFAULT = "least_requests"
 
 # Engine sockets for a multi-node run cannot use IPC paths, and the two ends
@@ -231,10 +261,12 @@ class CoreManager:
         )
         self.ctx = zmq.Context(io_threads=2)
         self.outputs_queue = queue.Queue[list[Sequence]]()
+        self.keep_finished_outputs = config.keep_finished_outputs or config.asyncio_mode
         # Utility replies are matched to their caller by request id, not by
         # position on a shared queue, where a late or unasked-for reply became
         # the next caller's answer.
         self._rpc_router = RpcResponseRouter()
+        self.structured_request_prepare = None
         # Held across every bucket plus FINISH/abort. RLock lets the sender's
         # outer session call the same synchronous command method per bucket.
         self._weight_sync_lock = RLock()
@@ -245,9 +277,8 @@ class CoreManager:
         # Runner processes behind each engine -- EngineCore's own sizing -- so
         # an engine that never answers still fails one result per rank. Read
         # with defaults: managers are also built from bare stand-in configs.
-        self._rpc_ranks_per_engine = getattr(config, "tp_world_size", 1) * getattr(
-            config, "prefill_context_parallel_size", 1
-        )
+        tp_world_size = getattr(config, "tp_world_size", 1)
+        self._rpc_ranks_per_engine = tp_world_size * pcp_group_size_of(config)
         self._seq_id_to_callback = {}
         # Batched stream-flush hook, resolved lazily by the API server (avoids
         # an api_server <-> engine_core_mgr import cycle). Stays None on every
@@ -274,9 +305,10 @@ class CoreManager:
         # --- DP request load balancing (see _select_dp_rank_locked) ---
         # A subclass may fan out through its own add_request() and never charge
         # load at all, but the inherited output thread still calls
-        # _release_seq_load() on every finished sequence, so these MUST exist.
-        # Strategy: "round_robin" | "least_requests" | "least_tokens" (validated
-        # at the CLI by argparse choices=DP_LB_STRATEGIES).
+        # _release_seq() on every finished sequence, so these MUST exist.
+        # Strategy: "round_robin" | "least_requests" | "least_tokens" |
+        # "prefix_spread" (validated at the CLI by argparse
+        # choices=DP_LB_STRATEGIES).
         self._dp_lb_strategy = config.dp_load_balance
         # Token-equivalent weight of one in-flight request for "least_tokens".
         # Read once here: this is a construction-time config value (CoreManager
@@ -304,10 +336,22 @@ class CoreManager:
             "explicit_total": 0,
             "load_balanced_total": 0,
         }
+        # Prefix-spread routing (`atom/model_engine/dp_routing/prefix_spread.py`):
+        # keeps a request on the rank holding its prompt's prefix unless that
+        # rank has a prefill backlog and another is about to idle. Created only
+        # when this manager actually routes between eligible DP ranks.
+        self._prefix_router = self._build_prefix_router(config)
+        if self._prefix_router is not None:
+            self._dp_route_counters.update(
+                dict.fromkeys(
+                    PrefixSpreadRouter.DECISIONS + (PrefixSpreadRouter.MOVED_TOKENS,), 0
+                )
+            )
         self._rank_routed_total = [0] * self.global_engine_count
         # Authoritative local load per rank. Request count is in-flight until
         # finish/abort; token count is queued/in-flight PREFILL work and is
-        # released as soon as the first model output proves prefill completed.
+        # released as soon as the first model output proves prefill completed
+        # (under prefix_spread, by the finished sequence if no token came).
         # Guarded by _lb_lock because dispatch runs on the request thread while
         # completion/release runs on the per-rank output threads.
         self._rank_reqs = [0] * self.global_engine_count
@@ -338,7 +382,15 @@ class CoreManager:
         # after the caller has already seen the error. ``reset_dp_router``
         # clears it.
         self._bp_dispatch_paused = False
-        if self._bp_depth > 0 and self._dp_lb_strategy != "least_requests":
+        if self._bp_depth > 0 and self._get_dp_policy().stateful:
+            logger.warning(
+                "%s: ATOM_DP_DISPATCH_DEPTH=%d is ignored under "
+                "the configured stateful DP policy, which places every request "
+                "itself (offline batches are sent at once)",
+                label,
+                self._bp_depth,
+            )
+        elif self._bp_depth > 0 and self._dp_lb_strategy != "least_requests":
             logger.warning(
                 "%s: ATOM_DP_DISPATCH_DEPTH=%d balances on in-flight request "
                 "count and ignores dp_load_balance=%s",
@@ -375,10 +427,15 @@ class CoreManager:
     def _start_distributed_store(
         self, config: Config, *, multinode: bool = False
     ) -> None:
-        """Bind the actual rendezvous server before publishing its port to workers."""
+        """Bind the actual rendezvous server before publishing its port to workers.
+
+        Also names the server (`server_instance_id`), which every engine of it
+        copies from `config`.
+        """
         from torch.distributed import TCPStore
 
         pc = config.parallel_config
+        pc.server_instance_id = uuid.uuid4().hex[:12]
         if multinode and pc.data_parallel_base_port == 0:
             raise ValueError(
                 "Multi-node DP requires the same nonzero --data-parallel-base-port "
@@ -755,11 +812,12 @@ class CoreManager:
                         # once per step rather than twice per chunk.
                         dbg = logger.isEnabledFor(logging.DEBUG)
                         for seq_id, request_output in stream_outputs:
-                            # The first emitted model output means this
-                            # sequence's prompt prefill has completed. Keep the
-                            # request count charged for decode pressure, but
-                            # stop advertising its prompt as queued prefill.
-                            self._mark_seq_prefill_complete(seq_id)
+                            # A sampled token means this sequence's prompt
+                            # prefill has completed. Keep the request count
+                            # charged for decode pressure, but stop advertising
+                            # its prompt as queued prefill.
+                            if request_output.output_tokens:
+                                self._mark_seq_prefill_complete(seq_id)
                             callback = self._seq_id_to_callback.get(seq_id)
                             if dbg:
                                 logger.debug(
@@ -779,7 +837,10 @@ class CoreManager:
                                     )
                             if request_output.finished:
                                 self._seq_id_to_callback.pop(seq_id, None)
-                                self._release_seq_load(seq_id)
+                                # The router is released by the finished
+                                # sequence (`_release_terminal_seq`), which
+                                # knows whether its prefill completed.
+                                self._release_load(seq_id)
                                 if dbg:
                                     logger.debug(
                                         f"{self.label}: Cleaned up callback for finished sequence {seq_id}"
@@ -821,7 +882,7 @@ class CoreManager:
                         delivered = False
                         for seq in seqs:
                             delivered |= self._deliver_terminal_output(seq)
-                            self._release_seq_load(seq.id)
+                            self._release_terminal_seq(seq)
                         if delivered and self._flush_stream_batch_fn is not None:
                             # The callbacks above only buffer into a thread-local;
                             # without this flush the chunk never reaches the
@@ -833,7 +894,8 @@ class CoreManager:
                                     f"{self.label}: flush_stream_batch failed: {e}",
                                     exc_info=True,
                                 )
-                        self.outputs_queue.put_nowait(seqs)
+                        if self.keep_finished_outputs:
+                            self.outputs_queue.put_nowait(seqs)
                         # These completions freed slots on their ranks — re-feed
                         # from the pending pool so a fast rank never drains to
                         # empty while peers still have work. No-op when
@@ -998,6 +1060,36 @@ class CoreManager:
             )
 
     def add_request(self, seqs: list[Sequence]):
+        structured = [seq for seq in seqs if is_structured(seq)]
+        if structured:
+            try:
+                if self.structured_request_prepare is None:
+                    raise ValueError("Structured output requires engine admission")
+                self.structured_request_prepare(structured)
+                self._add_prepared_requests(seqs)
+            except BaseException:
+                self._release_structured_requests(structured)
+                raise
+        else:
+            self._add_prepared_requests(seqs)
+
+    def _release_structured_requests(self, seqs):
+        # The submitted/finished sequences own the cleanup information. There
+        # is no cross-thread registry: workers tolerate repeated releases.
+        ids = [seq.id for seq in seqs if is_structured(seq)]
+        if not ids:
+            return
+        try:
+            # Never wait for an RPC reply on the output receiver thread.
+            self.broadcast_utility_command(
+                "release_structured_requests", request_ids=ids
+            )
+        except Exception:
+            # Cleanup must neither interrupt terminal delivery nor hide the
+            # original admission failure. Worker teardown also frees state.
+            logger.exception("%s: structured cleanup failed for %s", self.label, ids)
+
+    def _add_prepared_requests(self, seqs: list[Sequence]):
         tracing.bind_sequences(seqs)
         logger.debug(
             f"{self.label}: Add request, sequence ids: {[seq.id for seq in seqs]}"
@@ -1018,6 +1110,40 @@ class CoreManager:
             self._send_request(0, _add_frame(seqs))
         else:
             self._dispatch_to_dp_ranks(seqs)
+
+    def _build_prefix_router(self, config) -> PrefixSpreadRouter | None:
+        """The `prefix_spread` router, or None.
+
+        None for another strategy, and when there is nothing to route: one
+        DP rank, or pipeline parallelism (requests enter at stage 0). The
+        strategy has no effect there, so its requirements are not enforced.
+        """
+        if not prefix_spread_enabled(
+            config, routable_engines=self._routable_engine_count
+        ):
+            return None
+        if self._dp_session_affinity_enabled:
+            # Both place every request by their own rule; a session pin
+            # would undo every move.
+            raise ValueError(
+                "--dp-load-balance prefix_spread and ATOM_DP_SESSION_AFFINITY=1 "
+                "are two routing policies; set only one"
+            )
+        if not (
+            getattr(config, "enable_prefix_caching", False)
+            and envs.ATOM_FRONTEND_PREFIX_HASH
+        ):
+            # No prompt hash chain reaches the router: every request is
+            # cold and goes to the lightest rank.
+            raise ValueError(
+                "--dp-load-balance prefix_spread needs --enable_prefix_caching "
+                "and ATOM_FRONTEND_PREFIX_HASH=1 (the frontend prompt hash chain)"
+            )
+        return PrefixSpreadRouter(
+            envs.ATOM_DP_PREFIX_IDLE_TOKENS,
+            KVConnectorFactory.offload_tier(config),
+            config.max_num_seqs,
+        )
 
     @property
     def _routable_engine_count(self) -> int:
@@ -1082,7 +1208,7 @@ class CoreManager:
         if (
             getattr(self, "_bp_depth", 0) > 0
             and getattr(self, "_bp_offline_batch", False)
-            and not self._dp_session_affinity_enabled
+            and not self._get_dp_policy().stateful
             and all(h is None for h in hints)
         ):
             self._bp_dispatch_or_refill(new_seqs=seqs, raise_on_error=True)
@@ -1091,19 +1217,20 @@ class CoreManager:
         # round_robin normally skips load bookkeeping. Session affinity still
         # needs queued-prefill counters even if the fallback strategy is RR.
         track_load = (
-            self._dp_lb_strategy != "round_robin" or self._dp_session_affinity_enabled
+            self._dp_lb_strategy != "round_robin" or self._get_dp_policy().stateful
         )
         engine_count = self._routable_engine_count
         dp_seqs = [[] for _ in range(engine_count)]
         reqs_snapshot = tokens_snapshot = None
         with self._lb_lock:
             for seq, hint in zip(seqs, hints):
-                dp_rank = self._select_dp_rank_for_seq_locked(seq, hint)
+                route = self._select_dp_rank_for_seq_locked(seq, hint)
+                dp_rank = route.rank
                 if track_load:
-                    self._charge_seq_load_locked(seq, dp_rank)
+                    self._charge_seq_load_locked(seq, dp_rank, credit=route.credit)
                 dp_seqs[dp_rank].append(seq)
             # Copy the counters under the lock so the snapshot log below is a
-            # consistent instant, not a torn read racing _release_seq_load.
+            # consistent instant, not a torn read racing a release.
             if track_load:
                 reqs_snapshot = list(self._rank_reqs)
                 tokens_snapshot = list(self._rank_tokens)
@@ -1129,7 +1256,7 @@ class CoreManager:
                     f"rank{dp_rank}: {len(rank_seqs)} req / {batch_prefill_tokens} tok"
                 )
         except Exception:
-            # Roll back only ranks we never handed off. _release_seq_load is
+            # Roll back only ranks we never handed off. _release_seq is
             # idempotent (pops from _seq_load), so even if a failing send had
             # already delivered its frames and the engine finished + released
             # those seqs on an output thread, this rollback cannot double-count:
@@ -1138,7 +1265,7 @@ class CoreManager:
                 for dp_rank, rank_seqs in enumerate(dp_seqs):
                     if rank_seqs and not dispatched[dp_rank]:
                         for seq in rank_seqs:
-                            self._release_seq_load(seq.id)
+                            self._release_seq(seq.id)
             raise
 
         # One line per add: the per-rank delta this add placed, plus (for the
@@ -1260,7 +1387,7 @@ class CoreManager:
         with self._lb_lock:
             for _rank, rank_seqs in reversed(failed):
                 for seq in rank_seqs:
-                    self._release_seq_load_locked(seq.id)
+                    self._release_seq_locked(seq.id)
                 self._bp_pending.extendleft(reversed(rank_seqs))
             stalled = sum(self._rank_reqs) == 0 and bool(self._bp_pending)
             if pause_always or stalled:
@@ -1273,7 +1400,23 @@ class CoreManager:
         ``LLMEngine.generate`` waits while the engine is alive and any request
         is unfinished. A dropped seq never finishes, so that wait never ends.
         The seqs are still in ``_bp_pending``; this only surfaces the error.
+        A pending seq with a stream callback is not reading that queue, so it
+        is taken out and ended through its callback, as abort does.
         """
+        with self._lb_lock:
+            waiting = [s for s in self._bp_pending if s.id in self._seq_id_to_callback]
+            for seq in waiting:
+                self._bp_pending.remove(seq)
+        delivered = False
+        for seq in waiting:
+            if not getattr(seq, "leave_reason", None):
+                seq.leave_reason = "aborted"
+            delivered |= self._deliver_terminal_output(seq)
+        if delivered and self._flush_stream_batch_fn is not None:
+            try:
+                self._flush_stream_batch_fn()
+            except Exception as e:  # noqa: BLE001 - the error below must still go out
+                logger.warning("%s: flush_stream_batch failed: %s", self.label, e)
         pending = len(getattr(self, "_bp_pending", ()))
         logger.error(
             "%s: backpressure send failed with nothing in flight; "
@@ -1291,7 +1434,7 @@ class CoreManager:
             )
         )
 
-    def _select_dp_rank_locked(self) -> int:
+    def _select_dp_rank_locked(self, *, strategy: str | None = None) -> int:
         """Pick a DP engine rank for a new request. Caller must hold _lb_lock.
 
         - "round_robin": load-agnostic rotation.
@@ -1299,14 +1442,16 @@ class CoreManager:
           the lighter in-flight prompt-token load. Request count keeps the
           lockstep DP ranks in phase; the token tie-break packs pending prefill
           work evenly across the equal-request ranks.
-        - "least_tokens": lowest combined load ``tokens + req_equiv * reqs``
+        - "least_tokens" and cold "prefix_spread": lowest combined load
+          ``tokens + req_equiv * reqs``
           (prefill pressure + decode-slot pressure).
 
         Fully-tied ranks are resolved by a rotating cursor so selection does not
         always fall on rank 0. See docs/distributed_guide.md for the rationale.
         """
         n = self._routable_engine_count
-        if self._dp_lb_strategy == "round_robin":
+        strategy = self._dp_lb_strategy if strategy is None else strategy
+        if strategy == "round_robin":
             dp_rank = self._rank_rotation_cursor % n
             self._rank_rotation_cursor += 1
             return dp_rank
@@ -1314,7 +1459,9 @@ class CoreManager:
         # argmin over per-rank load, scanned from a rotating start offset so a run
         # of fully-equal ranks spreads evenly. Scores are computed inline (no
         # intermediate list) — the loop reads the counters directly.
-        least_requests = self._dp_lb_strategy == "least_requests"
+        least_requests = strategy == "least_requests"
+        if strategy not in ("least_requests", "least_tokens", "prefix_spread"):
+            raise ValueError(f"Unknown DP load-balancing strategy {strategy!r}")
         best_rank = 0
         best_score = None
         offset = self._rank_rotation_cursor % n
@@ -1324,15 +1471,17 @@ class CoreManager:
                 # Lexicographic (request count, prompt-token load): tuples compare
                 # element-wise, so tokens only decide among request-count ties.
                 score = (self._rank_reqs[r], self._rank_tokens[r])
-            else:  # "least_tokens"
-                score = (
-                    self._rank_tokens[r] + self._dp_lb_req_equiv * self._rank_reqs[r]
-                )
+            else:  # explicitly least_tokens or prefix_spread's cold placement
+                score = self._rank_load(r)
             if best_score is None or score < best_score:
                 best_score = score
                 best_rank = r
         self._rank_rotation_cursor += 1
         return best_rank
+
+    def _rank_load(self, rank: int) -> int:
+        """The `least_tokens` score: queued prefill plus decode slots."""
+        return self._rank_tokens[rank] + self._dp_lb_req_equiv * self._rank_reqs[rank]
 
     def _stable_session_rank(self, session_id: str) -> int:
         """Map a session to a stable rank with rendezvous hashing.
@@ -1369,9 +1518,7 @@ class CoreManager:
         best_load = None
         best_hash = -1
         for rank in range(self._routable_engine_count):
-            load = (
-                self._rank_tokens[rank] + self._dp_lb_req_equiv * self._rank_reqs[rank]
-            )
+            load = self._rank_load(rank)
             tie_hash = int.from_bytes(
                 hashlib.blake2b(
                     session_key + rank.to_bytes(4, "little"), digest_size=8
@@ -1394,60 +1541,46 @@ class CoreManager:
         self._rank_routed_total[rank] += 1
         return rank
 
+    def _get_dp_policy(self) -> LoadPolicy:
+        """The configured placement policy; lifecycle calls share this object."""
+        policy = getattr(self, "_dp_policy", None)
+        router = self._prefix_router
+        if router is not None:
+            if not isinstance(policy, PrefixPolicy) or policy.router is not router:
+                policy = PrefixPolicy(
+                    router,
+                    lambda: self._rank_tokens,
+                    lambda: self._rank_reqs,
+                    self._rank_load,
+                    lambda: self._select_dp_rank_locked(strategy="least_tokens"),
+                )
+        elif self._dp_session_affinity_enabled:
+            if not isinstance(policy, SessionPolicy):
+                policy = SessionPolicy(
+                    self._select_dp_rank_locked,
+                    self._select_new_session_rank_locked,
+                    self._dp_session_owners,
+                    self._dp_session_prompt_tokens,
+                    self._routable_engine_count,
+                    self._record_ignored_parent,
+                )
+        elif policy is None or type(policy) is not LoadPolicy:
+            policy = LoadPolicy(self._select_dp_rank_locked)
+        self._dp_policy = policy
+        return policy
+
+    def _record_ignored_parent(self) -> None:
+        self._dp_route_counters["affinity_parent_ignored_total"] += 1
+
     def _select_dp_rank_for_seq_locked(
         self, seq: Sequence, explicit_rank: int | None
-    ) -> int:
-        """Route one sequence using explicit hint, strict owner, then load.
-
-        This intentionally matches SGLang Model Gateway's agentic routing
-        semantics: a stable correlation/session id selects one DP rank, and
-        every later turn stays there. Load cannot move an existing session;
-        doing so turns a cheap cache hit into a potentially huge prefill.
-
-        Parent lineage does not affect placement. Each child correlation id is
-        its own sticky session, preventing sibling subagents from dogpiling the
-        root's rank. Requests without a session retain normal load balancing.
-        """
-        if explicit_rank is not None:
-            if self._dp_session_affinity_enabled:
-                # An explicit placement is authoritative and becomes the
-                # session's owner for subsequent unhinted requests.
-                session_id = getattr(seq, "dp_session_id", None)
-                if session_id:
-                    old_owner = self._dp_session_owners.get(session_id)
-                    if old_owner is not None and old_owner != explicit_rank:
-                        # The new rank cannot be assumed to own the old prefix.
-                        self._dp_session_prompt_tokens.pop(session_id, None)
-                    self._dp_session_owners[session_id] = explicit_rank
-            return self._record_dp_route_locked("explicit_total", explicit_rank)
-
-        session_id = getattr(seq, "dp_session_id", None)
-        parent_id = getattr(seq, "dp_parent_session_id", None)
-        if not self._dp_session_affinity_enabled or not session_id:
-            rank = self._select_dp_rank_locked()
-            return self._record_dp_route_locked("load_balanced_total", rank)
-
-        owner = self._dp_session_owners.get(session_id)
-        if owner is None or not 0 <= owner < self._routable_engine_count:
-            owner = self._select_new_session_rank_locked(session_id)
-            self._dp_session_owners[session_id] = owner
-            if parent_id:
-                self._dp_route_counters["affinity_parent_ignored_total"] += 1
-            logger.debug(
-                "%s: DPA load-aware affinity new session=%s parent=%s owner=rank%d "
-                "load=%d tokens=%d reqs=%d",
-                self.label,
-                session_id,
-                parent_id,
-                owner,
-                self._rank_tokens[owner]
-                + self._dp_lb_req_equiv * self._rank_reqs[owner],
-                self._rank_tokens[owner],
-                self._rank_reqs[owner],
-            )
-            return self._record_dp_route_locked("affinity_new_total", owner)
-
-        return self._record_dp_route_locked("affinity_owner_hit_total", owner)
+    ) -> Route:
+        """Place a request and return its accounting from the selected policy."""
+        route = self._get_dp_policy().select(seq, explicit_rank)
+        if PREFIX_MOVED_TOKENS in self._dp_route_counters:
+            self._dp_route_counters[PREFIX_MOVED_TOKENS] += route.moved_tokens
+        self._record_dp_route_locked(route.decision, route.rank)
+        return route
 
     def get_dp_router_statistics(self) -> dict:
         """Return a consistent, non-mutating snapshot of DP routing state."""
@@ -1456,7 +1589,7 @@ class CoreManager:
             for rank in self._dp_session_owners.values():
                 if 0 <= rank < self._routable_engine_count:
                     sessions_per_rank[rank] += 1
-            return {
+            snapshot = {
                 "enabled": self._routable_engine_count > 1,
                 **self._dp_route_counters,
                 "requests_per_rank": list(self._rank_routed_total),
@@ -1464,21 +1597,22 @@ class CoreManager:
                 "queued_prefill_tokens_per_rank": list(self._rank_tokens),
                 "session_count_per_rank": sessions_per_rank,
             }
+            if self._prefix_router is not None:
+                snapshot["prefix_index"] = self._prefix_router.index_counters()
+            if PREFIX_OWNER in self._dp_route_counters:
+                snapshot["prefix_route"] = {
+                    label: self._dp_route_counters[name]
+                    for name, label in PREFIX_LABELS
+                }
+            return snapshot
 
-    def _charge_seq_load_locked(self, seq: Sequence, dp_rank: int) -> None:
+    def _charge_seq_load_locked(
+        self, seq: Sequence, dp_rank: int, credit: int = 0
+    ) -> None:
         """Record a seq's in-flight load on dp_rank. Caller must hold _lb_lock."""
         req_cost = 1
         prompt_tokens = int(getattr(seq, "num_prompt_tokens", 0) or 0)
-        tok_cost = prompt_tokens
-        session_id = getattr(seq, "dp_session_id", None)
-        if self._dp_session_affinity_enabled and session_id:
-            previous_prompt_tokens = self._dp_session_prompt_tokens.get(session_id)
-            if previous_prompt_tokens is not None:
-                # Agentic turns normally extend their previous prompt.  Charge
-                # only that extension; request-equivalent load still accounts
-                # for lookup/decode pressure when the delta is zero.
-                tok_cost = max(0, prompt_tokens - previous_prompt_tokens)
-            self._dp_session_prompt_tokens[session_id] = prompt_tokens
+        tok_cost = max(0, prompt_tokens - self._get_dp_policy().charge(seq, credit))
         self._rank_reqs[dp_rank] += req_cost
         self._rank_tokens[dp_rank] += tok_cost
         self._seq_load[seq.id] = (dp_rank, req_cost, tok_cost)
@@ -1497,6 +1631,7 @@ class CoreManager:
         and normal completions have had theirs popped by the STREAM that
         delivered them, so both answer False and keep their existing path.
         """
+        self._release_structured_requests([seq])
         callback = self._seq_id_to_callback.pop(seq.id, None)
         if callback is None:
             return False
@@ -1524,17 +1659,26 @@ class CoreManager:
         )
         return True
 
-    def _release_seq_load(self, seq_id) -> None:
-        """Undo a seq's in-flight load when it finishes or is aborted.
+    # Two releases. `_release_load` undoes a seq's per-rank charge only;
+    # `_release_seq` also releases its prefix-router state, then the charge.
+    # Both are idempotent: a seq is charged once and released once, so a
+    # repeated call (e.g. finish followed by abort) is a no-op.
+    #
+    # Only a caller that knows whether the prefill completed may release the
+    # router state: the finished sequence (`_release_terminal_seq`) and a
+    # dispatch rolled back before any engine saw the seq. An abort on the API
+    # thread and the finished STREAM on the output thread release the load
+    # alone. Releasing the router there, racing the STREAM that completes the
+    # prefill, would see the request still prefilling and drop prefix entries
+    # its prefill did produce.
 
-        Idempotent: a seq is only charged once and released once, so a repeated
-        call (e.g. finish followed by abort) is a no-op.
-        """
+    def _release_load(self, seq_id) -> None:
+        """Undo a seq's per-rank charge; leaves the prefix router alone."""
         with self._lb_lock:
-            self._release_seq_load_locked(seq_id)
+            self._release_load_locked(seq_id)
 
-    def _release_seq_load_locked(self, seq_id) -> None:
-        """``_release_seq_load`` for a caller that already holds ``_lb_lock``."""
+    def _release_load_locked(self, seq_id) -> None:
+        """``_release_load`` for a caller that already holds ``_lb_lock``."""
         entry = self._seq_load.pop(seq_id, None)
         if entry is None:
             return
@@ -1542,19 +1686,50 @@ class CoreManager:
         self._rank_reqs[dp_rank] -= req_cost
         self._rank_tokens[dp_rank] -= tok_cost
 
+    def _release_seq(self, seq_id) -> None:
+        """Release a seq's prefix-router state, then its per-rank charge."""
+        with self._lb_lock:
+            self._release_seq_locked(seq_id)
+
+    def _release_seq_locked(self, seq_id) -> None:
+        """``_release_seq`` for a caller that already holds ``_lb_lock``."""
+        self._release_route_locked(seq_id)
+        self._release_load_locked(seq_id)
+
+    def _release_route_locked(self, seq_id) -> None:
+        """Release the selected policy's state and apply any successor debt.
+
+        A prefix producer leaving before prefill hands its provisional entries
+        to a waiter, which is charged the credit it loses.
+        """
+        for successor, extra in self._get_dp_policy().release(seq_id).items():
+            successor_load = self._seq_load.get(successor)
+            if successor_load is not None:
+                rank, req_cost, tok_cost = successor_load
+                self._rank_tokens[rank] += extra
+                self._seq_load[successor] = (rank, req_cost, tok_cost + extra)
+
+    def _release_terminal_seq(self, seq) -> None:
+        """Release a returned sequence using its completed-forward fact,
+        including an abort before its first sampled token."""
+        if getattr(seq, "prefill_completed", False):
+            self._mark_seq_prefill_complete(seq.id)
+        self._release_seq(seq.id)
+
     def _mark_seq_prefill_complete(self, seq_id) -> None:
         """Release only a sequence's prefill-token charge, once."""
         # Every decode token reaches this path. The prefill charge may be zero
-        # at admission, or already released by the first output. Avoid taking
+        # at admission, or already released by the first output (or by an
+        # abort, which leaves the router's state to this thread). Avoid taking
         # the router lock for a no-op; re-read under the lock before changing
         # counters because abort/finish may release the charge concurrently.
-        entry = self._seq_load.get(seq_id)
-        if entry is None:
-            return
-        _, _, tok_cost = entry
-        if tok_cost == 0:
-            return
+        policy = self._get_dp_policy()
+        if not policy.prefilling(seq_id):
+            entry = self._seq_load.get(seq_id)
+            if entry is None or entry[2] == 0:
+                return
         with self._lb_lock:
+            policy.prefill_complete(seq_id)
             entry = self._seq_load.get(seq_id)
             if entry is None:
                 return
@@ -1587,9 +1762,14 @@ class CoreManager:
                     len(self._seq_load),
                 )
             self._rank_rotation_cursor = 0
-            self._rank_reqs = [0] * self._routable_engine_count
-            self._rank_tokens = [0] * self._routable_engine_count
+            self._rank_reqs[:] = [0] * self._routable_engine_count
+            self._rank_tokens[:] = [0] * self._routable_engine_count
             self._seq_load.clear()
+            self._get_dp_policy().reset()
+            # Clear dormant session bookkeeping too, including after a policy
+            # replacement; the public reset applies to all routing state.
+            self._dp_session_owners.clear()
+            self._dp_session_prompt_tokens.clear()
             pending = getattr(self, "_bp_pending", None)
             if pending:
                 logger.warning(
@@ -1599,8 +1779,6 @@ class CoreManager:
                     len(pending),
                 )
                 pending.clear()
-            self._dp_session_owners.clear()
-            self._dp_session_prompt_tokens.clear()
             self._bp_dispatch_paused = False
 
     def send_utility_command(self, cmd: str, dp_rank: int | None = None):
@@ -1670,9 +1848,10 @@ class CoreManager:
         pending_seq = self._bp_take_pending(req_id)
         # Release DP load bookkeeping now: an aborted seq may never emit a
         # finished STREAM output, so relying on the finish path alone would leak
-        # its in-flight count. _release_seq_load is idempotent. A pending seq
-        # was never charged, so this is a no-op for it.
-        self._release_seq_load(req_id)
+        # its in-flight count. _release_load is idempotent. A pending seq
+        # was never charged, so this is a no-op for it. The prefix router is
+        # released by the terminal output the abort leads to.
+        self._release_load(req_id)
         if pending_seq is not None:
             if not getattr(pending_seq, "leave_reason", None):
                 pending_seq.leave_reason = "aborted"
@@ -1690,6 +1869,8 @@ class CoreManager:
             return
         try:
             self.broadcast_utility_command("abort_request", req_id=req_id)
+            # Waiting/running cancellations return a finished Sequence through
+            # the ordinary output path, which releases grammar on every rank.
         except Exception as e:  # noqa: BLE001 - disconnect cleanup must not raise
             logger.warning(f"{self.label}: abort_request({req_id}) failed: {e}")
 
@@ -1836,12 +2017,14 @@ class CoreManager:
                 f"finishes or aborts them"
             )
 
-    def broadcast_utility_command(self, cmd: str, *, _dispatch_token=None, **kwargs):
+    def broadcast_utility_command(
+        self, cmd: str, *, _dispatch_token=None, _ranks=None, **kwargs
+    ):
         self._refuse_unowned_weight_sync_cmd(cmd, _dispatch_token)
         payload = {"cmd": cmd, **kwargs}
         # Serialize once and reuse for all ranks (optimization: avoid repeated pickle.dumps)
         serialized_payload = pickle.dumps((EngineCoreRequestType.UTILITY, payload))
-        for rank in range(len(self.control_sockets)):
+        for rank in range(len(self.control_sockets)) if _ranks is None else _ranks:
             logger.debug(
                 f"{self.label}: Broadcast utility command '{cmd}' to DP rank {rank}"
             )
@@ -1967,6 +2150,20 @@ class CoreManager:
             ctx.sync_id = uuid.uuid4().hex
         return responses
 
+    def _utility_phases(self, cmd: str, args: dict) -> list[range]:
+        """The engines *cmd* goes to, in the order it must reach them.
+
+        A command the PP head empties its pipeline for goes to the head first,
+        alone: the later stages forward what it sent until they run the command
+        themselves, and one the head refuses reaches none of them. Any other
+        command goes to every engine at once, as without PP.
+        """
+        engine_count = len(self.control_sockets)
+        if getattr(self, "pp_size", 1) > 1 and _pp_head_first(cmd, args):
+            # PP runs without DP, so engine 0 is the only head.
+            return [range(1), range(1, engine_count)]
+        return [range(engine_count)]
+
     def _broadcast_and_wait(self, cmd: str, timeout: float, **kwargs):
         """The round trip behind broadcast_utility_command_sync, unchecked.
 
@@ -1976,38 +2173,45 @@ class CoreManager:
         """
         timeout = checked_timeout(timeout)
         request_id = uuid.uuid4().hex
-        # The global engine count on a coordinator, as the broadcast reaches.
-        engine_count = len(self.control_sockets)
         deadline = time.monotonic() + timeout
         worker_deadline = time.time() + engine_budget(timeout)
         by_dp_rank: dict[int, object] = {}
+        sent: list[int] = []
         with self._rpc_router.register(request_id) as replies:
-            try:
-                self.broadcast_utility_command(
-                    cmd,
-                    _dispatch_token=self._weight_sync_dispatch_token,
-                    request_id=request_id,
-                    timeout=engine_budget(timeout),
-                    deadline=worker_deadline,
-                    **kwargs,
-                )
-            except Exception:
-                # The engines before the failed send already hold this update.
-                if cmd in WEIGHT_UPDATE_UTILITY_CMDS:
-                    self._discard_failed_weight_sync(cmd)
-                raise
-            while len(by_dp_rank) < engine_count:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
+            for ranks in self._utility_phases(cmd, kwargs):
                 try:
-                    dp_rank, body = replies.get(timeout=min(1.0, remaining))
-                except queue.Empty:
-                    continue
-                by_dp_rank.setdefault(dp_rank, body)
+                    self.broadcast_utility_command(
+                        cmd,
+                        _dispatch_token=self._weight_sync_dispatch_token,
+                        _ranks=ranks,
+                        request_id=request_id,
+                        timeout=engine_budget(timeout),
+                        deadline=worker_deadline,
+                        **kwargs,
+                    )
+                except Exception:
+                    # The engines before the failed send already hold this update.
+                    if cmd in WEIGHT_UPDATE_UTILITY_CMDS:
+                        self._discard_failed_weight_sync(cmd)
+                    raise
+                sent.extend(ranks)
+                while not by_dp_rank.keys() >= set(sent):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    try:
+                        dp_rank, body = replies.get(timeout=min(1.0, remaining))
+                    except queue.Empty:
+                        continue
+                    by_dp_rank.setdefault(dp_rank, body)
+                if not by_dp_rank.keys() >= set(sent) or any(
+                    isinstance(by_dp_rank[r], dict) and by_dp_rank[r].get("error")
+                    for r in ranks
+                ):
+                    break
 
         responses = [by_dp_rank[dp_rank] for dp_rank in sorted(by_dp_rank)]
-        missing = sorted(set(range(engine_count)) - set(by_dp_rank))
+        missing = sorted(set(sent) - set(by_dp_rank))
         if missing:
             if cmd in WEIGHT_UPDATE_UTILITY_CMDS:
                 self._discard_failed_weight_sync(cmd)
@@ -2186,6 +2390,9 @@ class DisaggCoreManager(CoreManager):
     The two processes coordinate via direct ZMQ PUSH/PULL sockets whose
     addresses are established here before spawning and passed through config.
     """
+
+    def _build_prefix_router(self, config) -> None:
+        """The prefill/decode pair fans out requests; neither engine is a DP target."""
 
     def __init__(self, config: Config):
         import copy

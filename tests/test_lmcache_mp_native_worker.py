@@ -32,15 +32,15 @@ from atom.kv_transfer.offload.metadata import (
 from atom.kv_transfer.offload.mp.deployment import (
     _model_namespace,
     _tp_replication_factor,
+    require_native_state_server,
 )
 from atom.kv_transfer.offload.mp.native_state_layout import (
     build_native_state_mp_layout,
+    stores_state_images,
 )
 from atom.kv_transfer.offload.mp.native_state_worker import (
     NATIVE_STATE_MP_STORE_CHANNEL,
     NativeStateLMCacheMPConnector,
-    require_native_state_server,
-    stores_state_images,
 )
 from atom.model_engine.arg_utils import (
     compose_kv_offload_config,
@@ -282,14 +282,14 @@ def _kv_only_load(hbm=8):
 
 
 def test_kv_only_load_reads_page_alone_under_the_request_session(page_worker):
-    req = _kv_only_load()
+    req = replace(_kv_only_load(), cache_salt="11")
     page_worker._submit_load(req, object())
     # The lookup that reported the reach also locked it, under this session.
     assert page_worker.submitted_request_ids == ["atom-offload-dp0:7"]
     [spec] = page_worker.submitted
     # PAGE for [8, 16) and nothing else: the layout has no image group.
     assert spec.block_ids == [[3, 4]]
-    assert spec.request_configs is None
+    assert spec.cache_salt == "11"
 
 
 def test_page_only_save_stores_page_alone(page_worker):
@@ -299,7 +299,7 @@ def test_page_only_save_stores_page_alone(page_worker):
     page_worker._submit_save(req, object())
     [spec] = page_worker.submitted
     assert spec.block_ids == [[1, 2, 3, 4]]
-    assert spec.request_configs is None
+    assert spec.cache_salt == ""
     page_worker.future.ready = True
     terminals = [
         completion
@@ -631,6 +631,40 @@ def test_native_restore_reports_success_and_returns_its_slot(worker, cuda):
     assert worker._native_loads == {}
 
 
+def test_restore_deadline_counts_from_the_restore_not_the_retrieve(
+    worker, cuda, monkeypatch
+):
+    """The host may first poll a retrieve long after submitting it. The
+    retrieve is terminal by then and its restore only just enqueued: the
+    deadline bounds the restore from there, and still stops the engine if that
+    copy never completes."""
+    from atom.kv_transfer.offload.mp import transfer
+
+    now = [1000.0]
+    monkeypatch.setattr(transfer.time, "monotonic", lambda: now[0])
+    worker._restore_descriptor_slots = [3]
+    worker._native_copy = lambda stores, restores, descriptor_slot=0: None
+    req = request(loading=True)
+    worker._submit_load(req, object())
+
+    now[0] += worker._transfer_deadline_s + 5
+    worker.future.value, worker.future.ready = True, True
+    first = worker.get_finished()
+    assert not first.finished_loading and not first.failed_loading
+    assert len(worker._native_loads) == 1
+
+    now[0] += worker._transfer_deadline_s - 1
+    assert not worker.get_finished().finished_loading
+    now[0] += 2
+    with pytest.raises(transfer.LMCacheTransferUnprovable):
+        worker.get_finished()
+    assert worker._restore_descriptor_slots == []
+
+    cuda.events[-1].done = True
+    assert worker.get_finished().finished_loading == {req.load_operation}
+    assert worker._restore_descriptor_slots == [3]
+
+
 def test_registration_reserves_every_restore_descriptor_slot(monkeypatch):
     """Pinned staging allocation synchronizes; the restore slots are reserved
     while registering, not on the connector thread mid-serving."""
@@ -638,6 +672,7 @@ def test_registration_reserves_every_restore_descriptor_slot(monkeypatch):
     import types
 
     from atom.kv_transfer.offload.mp import native_state_layout, native_state_worker
+    from atom.kv_transfer.offload.mp import worker as mp_worker
 
     parallel_state = types.ModuleType("aiter.dist.parallel_state")
     parallel_state.get_tp_group = lambda: SimpleNamespace(rank_in_group=0)
@@ -647,12 +682,9 @@ def test_registration_reserves_every_restore_descriptor_slot(monkeypatch):
         register_kv_caches=lambda tensors, engine_group_infos: None,
         shutdown=lambda: None,
     )
-    monkeypatch.setattr(
-        native_state_worker, "_make_worker_adapter", lambda *_a, **_k: adapter
-    )
-    monkeypatch.setattr(
-        native_state_worker, "require_native_state_server", lambda *_a: None
-    )
+    # The registration both MP workers share lives on the base worker.
+    monkeypatch.setattr(mp_worker, "_make_worker_adapter", lambda *_a, **_k: adapter)
+    monkeypatch.setattr(mp_worker, "require_native_state_server", lambda *_a: None)
     monkeypatch.setattr(
         native_state_layout.NativeStateMPLayout, "engine_group_infos", lambda _s: []
     )
@@ -721,10 +753,10 @@ def test_raising_restore_keeps_its_descriptor_slot_until_the_deadline(
 
 
 def test_native_server_chunk_mismatch_fails_before_registration(monkeypatch):
-    from atom.kv_transfer.offload.mp import native_state_worker
+    from atom.kv_transfer.offload.mp import deployment
 
     monkeypatch.setattr(
-        native_state_worker.offcfg,
+        deployment.offcfg,
         "build_lmcache_config",
         lambda _: SimpleNamespace(chunk_size=256),
     )
@@ -764,3 +796,48 @@ def test_a_layout_without_images_has_a_namespace_of_its_own(monkeypatch):
     assert with_images != page_alone
     assert "::native-state-v1-" in with_images
     assert "::native-page-v1-" in page_alone
+
+
+def test_a_save_that_landed_during_the_forward_is_reported_that_step(worker):
+    """The scheduler admits at most `max_pending_saves` native saves (two by
+    default), so one reported a step late keeps the next out: the report
+    polls every save, on the step thread."""
+    req = request()
+    worker._submit_save(req, object())
+    worker.future.ready = True
+    completions = worker.get_finished().connector_completions
+    assert (
+        ConnectorCompletion(NATIVE_STATE_MP_STORE_CHANNEL, req.save_operation, True)
+        in completions
+    )
+
+
+def test_native_transfers_are_submitted_and_polled_on_the_step_thread():
+    """As native ATOM always has: a submit before the forward and a poll at
+    the report, the timing its save admission is sized to. No transfer
+    thread starts."""
+    import threading
+
+    instance = _make_worker()
+    submit, query = [], []
+    future = instance.future
+    real_query = future.query
+
+    def recording_query():
+        query.append(threading.current_thread() is threading.main_thread())
+        return real_query()
+
+    future.query = recording_query
+
+    def recording_submit(request_id, op, event):
+        submit.append(threading.current_thread() is threading.main_thread())
+        return future
+
+    instance._adapter.submit_store_request = recording_submit
+    threads = threading.active_count()
+    instance._submit_save(request(), object())
+    future.ready = True
+    assert submit == [True]
+    instance.get_finished()
+    assert query and all(query)
+    assert threading.active_count() == threads

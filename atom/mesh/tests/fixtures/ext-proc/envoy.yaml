@@ -20,6 +20,7 @@ static_resources:
                     - name: models
                       domains: ["*"]
                       routes:
+                        # ext-proc validates paths against the shared endpoint table.
                         - match: {prefix: "/"}
                           route: {cluster: inference_workers, timeout: 1800s}
                 http_filters:

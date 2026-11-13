@@ -6,9 +6,6 @@ from typing import ClassVar
 
 import torch
 
-from atom.model_engine.scheduler import ScheduledBatch
-from atom.utils import envs
-
 from .aiter_attention import AiterAttentionMetadataBuilder, AiterBackend
 
 logger = logging.getLogger("atom")
@@ -44,46 +41,19 @@ class TritonMHAMetadataBuilder(AiterAttentionMetadataBuilder):
 
     BACKEND: ClassVar[type[AiterBackend]] = TritonMHABackend
 
-    def prepare_prefill(
-        self, batch: ScheduledBatch, running_bs: int, running_tokens: int
-    ):
-        attn_metadata, positions = super().prepare_prefill(
-            batch, running_bs, running_tokens
-        )
-
-        # When there are no cached tokens, the base builder leaves
-        # `block_tables=None` because AiterBackend's prefill consumes raw q/k/v
-        # via flash_attn_varlen_func. The unified_attention path used by
-        # TritonMHABackend instead requires a block_table even for pure prefill,
-        # so build a fake one here that treats raw K/V as a kv_cache with
-        # block_size=1: row i = [cu_seqlens_k[i], ..., cu_seqlens_k[i]+max-1].
-        # TritonMHABackend instead requires a block_table even for pure prefill.
+    def _finish_prefill_batch(self, batch, attn_metadata, prefix=""):
+        super()._finish_prefill_batch(batch, attn_metadata, prefix)
+        # `unified_attention` needs a block table even for pure prefill. With
+        # no paged one uploaded (`_prefill_block_table_rows`), a fake one with
+        # block_size=1 treats the raw K/V as the kv_cache: row i =
+        # [cu_seqlens_k[i], ..., cu_seqlens_k[i] + max - 1].
         if attn_metadata.block_tables is None:
-            if envs.ATOM_USE_UNIFIED_ATTN and batch.block_tables:
-                # Unified attention does better consuming paged KV: read the new
-                # tokens straight from the paged flash-layout KV cache (already
-                # written during rope_cache via slot_mapping) using the real
-                # per-seq block_table, identical to the prefix-cache-hit path.
-                # The base builder marshals `block_tables` every step but only
-                # uploads it when `has_cached`, so upload it here for pure
-                # prefill and flag the consumer to read from the cache.
-                bs = batch.total_seqs_num_prefill
-                attn_metadata.block_tables = self.model_runner.forward_vars[
-                    "block_tables"
-                ].copy_to_gpu(bs)
-            else:
-                # Fallback: build a fake block_size=1 block_table that treats
-                # raw K/V as a kv_cache. row i = [cu_seqlens_k[i], ...,
-                # cu_seqlens_k[i]+max-1].
-                cu_k = attn_metadata.cu_seqlens_k
-                # `cu_k` is padded past them; this table is one row per request.
-                num_seqs = batch.total_seqs_num_prefill
-                offsets = cu_k[:num_seqs]
-                attn_metadata.block_tables = offsets.unsqueeze(1) + torch.arange(
-                    attn_metadata.max_seqlen_k, dtype=torch.int32, device=cu_k.device
-                )
-
-        return attn_metadata, positions
+            cu_k = attn_metadata.cu_seqlens_k
+            # `cu_k` is padded past them; this table is one row per request.
+            offsets = cu_k[: batch.scheduled_bs]
+            attn_metadata.block_tables = offsets.unsqueeze(1) + torch.arange(
+                attn_metadata.max_seqlen_k, dtype=torch.int32, device=cu_k.device
+            )
 
     def build_kv_cache_tensor(self, module):
         """The parent's bind, plus the one thing that differs: the layout flag.

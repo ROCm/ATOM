@@ -55,7 +55,7 @@ def v41_begin_forward(hidden: torch.Tensor) -> None:
     # mismatch is not confined to staging: skipping the check for the plugin
     # left its main path to discover the same disagreement as a reshape error
     # inside a layer, or not at all, with padding rows read as real ones.
-    if hidden.shape[-2] != metadata.step.width:
+    if hidden.shape[-2] != metadata.step.running_tokens:
         raise ValueError("Token rows disagree with the width this step declared")
     if getattr(metadata, "staged_outside_forward", False):
         # The plugin staged this step in the metadata builder, where no graph

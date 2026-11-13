@@ -33,6 +33,9 @@ env:
 jobs:
   benchmark:
     name: c=${{ join(matrix.concurrency, ',') }}
+    # Defense-in-depth: current callers do not send PRs to this runner.
+    # Keep forked PRs off ATOMesh self-hosted runners if that changes later.
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
     runs-on: ${{ matrix.runner.slurm_submit_runner }}
     # Configs run in parallel, so this covers waiting in the Slurm queue; the
     # Slurm job's own --time (runner.time_limit) bounds the run itself.

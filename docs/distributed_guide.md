@@ -8,6 +8,7 @@ ATOM (AiTer Optimized Model) supports three parallelism strategies for distribut
 |-------------|----------|---------|---------------|
 | Tensor Parallel (TP) | `-tp N` / `--tensor-parallel-size N` | Shard weights across GPUs | NCCL AllReduce |
 | Data Parallel (DP) | `-dp N` / `--data-parallel-size N` | Replicate model, split requests | Gloo AllReduce (CPU) |
+| Sequence Parallel (SP) | `-sp N` / `--sequence-parallel-size N` | Split each batch's tokens across GPUs (Ulysses; `-tp 1`, `-pp 1`, DP1, no EP / TBO / speculative decoding / KV transfer / RapidServe / image input, MHA with heads divisible across the ranks; validated only on MiniMax-M3 MXFP4 at SP4; KV replication, i.e. fewer KV heads than SP ranks, untested) | NCCL All-to-All, AllGather/ReduceScatter |
 | Expert Parallel (EP) | `--enable-expert-parallel` | Distribute MoE experts across GPUs | MORI All-to-All |
 | DP Attention | `--enable-dp-attention` | Flatten DP into TP for MoE layers | NCCL AllGather/ReduceScatter |
 
@@ -135,8 +136,8 @@ This ensures:
 
 When a DP rank has no real work but other ranks do, it executes dummy batches to participate in collective operations:
 
-- **`_execute_dummy_batch()`** — runs `ModelRunner.dummy_execution`, a one-sequence decode dummy through the model, triggering AllReduce and MORI collectives so other ranks are not blocked.
-- **Dummy prefill** — when prefill token graphs are recorded and a peer prefills, `Scheduler.dummy_prefill` makes the same call a request-less prefill instead. `ForwardMode._pad_to_token_graph` raises it, and without the prefill delayer a decoding rank's rows too, to the bucket every rank of the step replays, since ranks replaying different buckets hang the group.
+- **`_execute_dummy_batch()`** — runs `ModelRunner.dummy_execution`, a batch with no request, through the model, triggering AllReduce and MORI collectives so other ranks are not blocked. `ForwardMode.decide` gives it the group's phase (prefill when any peer prefills) and its width: the group's `running_bs` / `running_tokens` on a decode or a token-graph prefill, one running token on a ragged step (two under TBO, so it splits). Its rows have batch id -1, slot -1 and position 0. It runs everything its peers run, the LM head included (its collective under the DP-sharded head), and samples nothing: `postprocess` cuts the logits to its zero scheduled rows. A pass where no rank has a request runs nothing: the busy loop skips it. A step that reaches the runner with no rank scheduling a request (requests exist but none could be scheduled) runs the same way on every rank, at the smallest captured `running_bs` (one request with none captured).
+- **Yielding a decode** — when prefill token graphs are recorded, a peer prefills and the group's prefill delayer (not a rank-local one) lets it, a decoding rank skips its own decode and runs the dummy too (`Scheduler._schedule`, on `_group_prefill_tick`). Its dummy brings back the tokens its last decode sampled (deferred output), which `_execute_dummy_batch` postprocesses like any step's whenever the rank has running requests. `ForwardMode._pad_to_token_graph` raises every rank to the bucket the step replays, since ranks replaying different buckets hang the group.
 
 ### Device assignment
 
@@ -205,6 +206,7 @@ The strategy is selected with `--dp-load-balance` (`Config.dp_load_balance`):
 | `round_robin` | none | Load-agnostic rotation (`cursor % n`). |
 | `least_requests` **(default)** | in-flight request count, then prompt-token load | `argmin((num_in_flight_reqs, in_flight_prompt_tokens))` — request count is primary; ties broken by the lighter prompt-token load, then the rotation cursor. |
 | `least_tokens` | combined token load per rank | `argmin(sum_prompt_tokens + ATOM_DP_LB_REQ_EQUIV * num_reqs)`. |
+| `prefix_spread` | prompt-prefix location, queued prefill per rank | Keep a request on the rank holding its prefix unless that rank has over `2 x ATOM_DP_PREFIX_IDLE_TOKENS` queued prefill and another has under `ATOM_DP_PREFIX_IDLE_TOKENS`; then move it there (it loads the prefix from the offload tier). New prefixes: `least_tokens`. See below. |
 
 `least_requests` (the default) keeps the number of in-flight requests even
 across ranks — the dominant lever for DP-lockstep efficiency (equal request
@@ -218,6 +220,33 @@ additionally weights by prompt-token load across *all* ranks, mirroring producti
 decode-slot pressure. It helps most with heterogeneous prompt lengths under
 moderate load; with uniform-length requests it degenerates to `least_requests`.
 All strategies break ties with a round-robin cursor.
+
+**`prefix_spread`.** The router remembers which ranks ran each prompt prefix (every complete block in the frontend prompt block-hash chain) and keeps a request on its prefix's rank, unless another rank has under `ATOM_DP_PREFIX_IDLE_TOKENS` queued prefill and a free request slot (about to idle) while the prefix's rank has over twice that, or has every request slot taken. Then the request goes to an idle rank, chosen by queued prefill -- with more than two ranks, among those within `ATOM_DP_PREFIX_IDLE_TOKENS / 2` of the least queued, the one holding the most of its prefix -- and loads the prefix from the offload tier. While both ranks have queued prefill a move adds no capacity under lockstep DP, so the request stays. New prefixes go to the lightest rank (`least_tokens` score). A request whose prefix source is still prefilling stays on the prefix's rank to reuse it from HBM unless that rank is backlogged and another is idle; then it moves and is credited what the target holds plus the longest part of the prefix some request already finished prefilling on any rank (which the tier can load); the rest of its prompt is charged as prefill. If the source leaves before finishing its prefill, the parts it was computing go to the earliest request still waiting on them on that rank, which is charged for recomputing them; with no such request they are forgotten. Another rank's part of the prefix counts as a local hit only once its source finished prefilling it. A load threshold applies to the missing transferable prefix beyond the target's local hit, after chunk alignment, rather than to the prompt length or prefix indexing. If that difference is below `OFFLOAD_MIN_LOAD_TOKENS`, the request still goes to the selected idle rank, reuses its local prefix and recomputes the remainder. Prompts shorter than 4096 tokens participate in prefix routing whenever they contain complete hash blocks. The index stores compressed intervals of consecutive chained hashes, retaining exact complete-block prefix lengths without one dictionary entry per block. Its unique-edge token budget is `PrefixSpreadRouter.CAP` tokens (a class attribute); active producer intervals are pinned and can exceed this history budget until their requests finish. Past the budget, finished history is shed oldest interval first. An overage of at most an eighth of that interval (at least one block) is cut from its tail, so a long session keeps its head and its rank, and the interval then queues behind the others; a larger overage, or one that covers the whole interval (a one-block interval is always dropped, never shortened), drops the interval whole, so one placement never takes more eviction passes than whole-interval eviction would. Eviction is therefore only approximately least-recently-used: a hot interval can lose part of its tail while an older one is still held. When a request finishes its prefill, the intervals along its chain that are finished, held by the same ranks in the same recency order and have no other child are merged back; so a session that keeps extending its own history stays a few intervals rather than one more per turn. Intervals that were split by a request ending mid-interval are merged back only by a later completion along the same chain, not eagerly, and divergent branches stay separate. Active requests keep one continuous prefix dependency record, so history eviction cannot hide a still-prefilling producer from new followers. A moved request is credited its prefix only if an offload tier shared by the DP ranks (`lmcache_mp`, `mooncake_store`; not the per-rank `lmcache_offload`), with a role that both saves and loads (`offload`, `kv_both`), can load it (at least `OFFLOAD_MIN_LOAD_TOKENS`); otherwise only its local part. Needs `--enable_prefix_caching` and `ATOM_FRONTEND_PREFIX_HASH=1`, and excludes `ATOM_DP_SESSION_AFFINITY` (startup fails otherwise); bypasses the offline backpressure dispatch. Tuning: `ATOM_DP_PREFIX_IDLE_TOKENS` (default 32768).
+
+The compressed prefix index stores consecutive chained-hash intervals, retaining exact complete-block matches without a dictionary entry for every hash block. Its history budget counts unique indexed tokens, independent of hash-block granularity; it is not a limit on all router memory. Active producer intervals are pinned so history eviction cannot hide them from new followers. Active request hash chains and dependencies remain until completion, cancellation or reset releases them, and may exceed the history budget.
+
+**Index budget trade-off and how to see it.** The index is bounded (`PrefixSpreadRouter.CAP` tokens of unique intervals; how many hash blocks that is depends on the hash block size, which is `block_size` times the DCP size), and over that budget the router sheds finished history oldest interval first, shortening an interval from its tail when the overage is small. To see whether it runs, read `atom:dp_prefix_index_events_total` (or the Python dict `LLMEngine.get_metrics_statistics()["dp_router"]["prefix_index"]`; there is no HTTP JSON endpoint for it): `tail_trim` and `leaf_evict` both 0 and `atom:dp_prefix_index_tokens` well under `CAP` mean the trade-off never applied. Nonzero counters mean old history was shed, not that hot prefixes were lost -- cold one-shot history is shed the same way; a rising `tail_trim` / `leaf_evict` rate together with a falling `atom:dp_prefix_route_total{decision="owner"}` share and `atom:dp_prefix_moved_tokens_total` is the pattern to look into. `blocked` rising means the index is still over budget after eviction ran out of evictable history: what is left is still-prefilling history and the finished ancestors of it, which cannot be shed while they have children. If it matters, raise `PrefixSpreadRouter.CAP` (there is no environment variable).
+
+With one routable engine or pipeline parallelism, `prefix_spread` has no effect and its routing requirements are not enforced. LMCache MP requires the configured chunk to match the server when this router is active; PAGE-only single-engine runs use the server's chunk. Native-state transfers retain their own chunk-matching requirement.
+
+When `prefix_spread` is active, Mooncake Store must expose one shared `(master, metadata)` pair to all DP ranks. Per-NIC aliases in `mooncake_store.pools` are accepted only when every alias names that same pair. Distinct per-NIC pools are rejected at router startup because a worker can load only from its selected NIC's pool; a scheduler lookup across pools does not make those prefixes transferable. Distinct pools remain available with other routing policies, or when this router is inactive.
+
+Choose `OFFLOAD_MIN_LOAD_TOKENS` for the model and backend. It measures the aligned missing prefix, so an owner with 16384 tokens and an idle target with 13312 tokens still sends the request to the target when the 3072-token difference is below the minimum; the target recomputes that difference. A warmed Qwen3-0.6B DP2/TP1 LMCache MP probe on MI355X, with a 512-token chunk and 13312 local tokens, favored recomputation at an 8192-token difference (median TTFT 102.2 ms versus 134.7 ms with loading), was near break-even at 12288, and favored loading at 16384 (150.6 ms versus 198.2 ms). Each arm used four samples. For that configuration, 16384 is a conservative minimum; it is not a measured default for other models, backends or decode load. Include restoration, replay and prefill scheduling in the comparison, rather than timing the copy alone.
+
+For Mooncake Store, routing and the connector share `mooncake_store.chunk_tokens`: only complete chunks beyond the local prefix are credited, and the minimum load applies to that aligned remainder. An unaligned head and tail remain prefill work. The index records execution history, not current HBM residency or completed Store publication. Admission performs an authoritative lookup and falls back to recomputation on a miss; placement estimates and `dp_prefix_moved_tokens` can still overestimate cache reuse after eviction or while a save is pending.
+
+For V4.1, use the [native Mooncake Store recipe](../recipes/DeepSeek-V4.1-Prefix-Spread-Store.md)
+to recover shared PAGEs without LMCache MP. Local HBM hits remain local. V4.1
+needs bounded replay on the Store (the default; refused at startup without it);
+this does not enable other hybrid models that require an independent state tier.
+The final recipe uses a configurable 4096-token minimum, an unmeasured policy
+cutoff rather than a measured optimum. It permits the 6144-token load that was
+slower than recomputation in the measured idle case; use 8192 if prioritizing
+that measured idle-case latency. The recipe bounds both waiting-queue
+coalescing and running partial-prefill coalescing. A queue-age bound alone
+does not limit a partial request already in the running list. Its measured
+latency results and configuration limits are recorded in the recipe.
+
 
 When `ATOM_DP_SESSION_AFFINITY=1`, session routing adds a cache-locality layer
 above the configured fallback strategy. A new correlation/session ID is placed
@@ -256,9 +285,9 @@ drained and warns if it is invoked while requests are still charged.
 - `ParallelConfig.data_parallel_rank` (int, default `0`): This rank's DP index.
 - `ParallelConfig.data_parallel_rank_local` (int, default `None`): Local DP rank on this node.
 - `Config.dp_load_balance` (str, default `"least_requests"`): DP routing strategy.
-- CLI: `--data-parallel-size N` or `-dp N`; `--dp-load-balance {round_robin,least_requests,least_tokens}`
+- CLI: `--data-parallel-size N` or `-dp N`; `--dp-load-balance {round_robin,least_requests,least_tokens,prefix_spread}`
 - Env: `ATOM_DP_LB_REQ_EQUIV` (int, default `512`): token-equivalent cost of one in-flight request for `least_tokens`.
-- Env: `ATOM_DP_DISPATCH_DEPTH` (int, default `0`): per-rank in-flight cap for lazy dispatch of an offline batch (`LLMEngine.generate` / `generate_multimodal`). Online API admission is unchanged. While it is positive, that offline routing balances on in-flight request count and ignores `round_robin` and `least_tokens`; init warns when `dp_load_balance` is not `least_requests`. A failed send returns the requests to the pending pool. `abort_request` removes a request that has not been sent yet.
+- Env: `ATOM_DP_DISPATCH_DEPTH` (int, default `0`): per-rank in-flight cap for lazy dispatch of an offline batch (`LLMEngine.generate` / `generate_multimodal`). Online API admission is unchanged. While it is positive, that offline routing balances on in-flight request count and ignores `round_robin` and `least_tokens`; init warns when `dp_load_balance` is not `least_requests`. Under `prefix_spread` the depth is ignored (init warns). A failed send returns the requests to the pending pool. `abort_request` removes a request that has not been sent yet.
 - Env: `ATOM_DP_SESSION_AFFINITY` (bool, default `0`): load-place each new
   session once, then keep all later turns on its cache owner without spill.
 
@@ -504,6 +533,9 @@ This means each GPU runs an independent attention computation (no TP AllReduce f
 | `atom/model_ops/linear.py` | `ColumnParallelLinear`, `RowParallelLinear`, `QKVParallelLinear`, `MergedColumnParallelLinear` |
 | `atom/model_ops/moe.py` | `FusedMoE`, `FusedMoEParallelConfig` (EP configuration and expert distribution) |
 | `atom/model_ops/fused_moe/mori_prepare_finalize.py` | `MoriPrepareAndFinalize` (MORI dispatch/combine for EP) |
+| `atom/model_engine/pp_engine_core.py` | Pipeline-parallel stage loops (head / downstream) |
+| `atom/distributed/pp_comm.py` | What crosses a PP stage boundary: `_PP_PROXY_KEYS` (`hidden_states`, `residual`, `block_residual`, ...) plus `PP_AUX_KEY` (`pp_aux`) |
+| `atom/spec_decode/pp_aux_relay.py` | `PPAuxRelay`: speculative decoding under PP. The drafter lives on the last stage; earlier stages capture the target aux hidden states they own and send them on under `pp_aux` |
 
 ---
 

@@ -11,6 +11,7 @@ from aiter.jit.utils.chip_info import get_cu_num
 import atom.model_ops.fused_moe.modular_kernel as mk
 from atom.model_ops.fused_moe.config import FusedMoEQuantConfig
 from atom.model_ops.fused_moe.routed_rows import RoutedRowsWire
+from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
 try:
@@ -25,6 +26,17 @@ except ImportError:
 # Decode launch geometry switches above this many tokens on the rank; see
 # MoriPrepareAndFinalize._get_dispatch_config.
 _DECODE_SMALL_TOKENS = 48
+
+
+def use_mori_low_latency(requested: bool, internode: bool) -> bool:
+    """Whether to build mori's low-latency kernel for this EP group.
+
+    Under ATOM_MORI_V1_LL that kernel is InterNodeV1LL alone: within a node
+    IntraNode serves low latency too, as in vLLM.
+    """
+    if envs.ATOM_MORI_V1_LL:
+        return requested and internode
+    return requested
 
 
 class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
@@ -57,6 +69,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         self.dispatch_format = dispatch_format
         self.quant_dtype = quant_dtype
         self._use_split_send_recv = low_latency and not internode
+        self._use_handle_launch = envs.ATOM_MORI_V1_LL and low_latency and internode
 
     @property
     def quant_type(self):
@@ -132,6 +145,14 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             return min(128, mp), 8
         return min(256, mp), 16
 
+    def _launch_geometry(self, num_tokens: int) -> tuple[int, int]:
+        """(block_num, warp_per_block) passed to a dispatch() / combine() call."""
+        if self._use_handle_launch:
+            # InterNodeV1LL keeps per-block state; -1 makes mori launch with the
+            # geometry the handle was built with, as vLLM does.
+            return -1, -1
+        return self._get_dispatch_config(num_tokens)
+
     # ---- Synchronous (non-TBO) path ----
 
     def prepare(
@@ -160,7 +181,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             not apply_router_weight_on_input
         ), "mori does not support apply_router_weight_on_input=True now."
         a1, scale = self._in_wire(a1, x_scale)
-        block_num, warp_per_block = self._get_dispatch_config(a1.shape[0])
+        block_num, warp_per_block = self._launch_geometry(a1.shape[0])
 
         (
             dispatch_a1,
@@ -199,7 +220,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
     ) -> torch.Tensor:
         num_token = topk_ids.shape[0]
 
-        block_num, warp_per_block = self._get_dispatch_config(num_token)
+        block_num, warp_per_block = self._launch_geometry(num_token)
 
         result = self._mori_ops[0].combine(
             fused_expert_output,
@@ -282,7 +303,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             tbo_yield_and_switch_from_compute_to_comm,
         )
 
-        block_num, warp_per_block = self._get_dispatch_config(a1.shape[0])
+        block_num, warp_per_block = self._launch_geometry(a1.shape[0])
         mori_op = self._current_tbo_mori_op()
 
         tbo_yield_and_switch_from_compute_to_comm()
@@ -368,7 +389,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             tbo_yield_and_switch_from_compute_to_comm,
         )
 
-        block_num, warp_per_block = self._get_dispatch_config(num_token)
+        block_num, warp_per_block = self._launch_geometry(num_token)
         mori_op = self._current_tbo_mori_op()
 
         # Yield to other thread FIRST, then switch to comm stream.

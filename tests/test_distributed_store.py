@@ -31,7 +31,11 @@ def manager(monkeypatch):
         monkeypatch.delenv(name, raising=False)
     manager = CoreManager.__new__(CoreManager)
     manager._init_shared_state(
-        SimpleNamespace(dp_load_balance="round_robin"),
+        SimpleNamespace(
+            dp_load_balance="round_robin",
+            keep_finished_outputs=False,
+            asyncio_mode=False,
+        ),
         label="test",
         local_engine_count=0,
     )
@@ -116,6 +120,8 @@ def test_separate_stores_have_distinct_ports_and_keys(manager):
         manager._start_distributed_store(config)
     ports = [config.parallel_config.data_parallel_base_port for config in configs]
     assert ports[0] != ports[1]
+    ids = [config.parallel_config.server_instance_id for config in configs]
+    assert all(ids) and ids[0] != ids[1]
     clients = [dist.TCPStore("127.0.0.1", port, is_master=False) for port in ports]
     for i, client in enumerate(clients):
         client.set("same-key", str(i))
@@ -183,9 +189,11 @@ def _model_runner_worker(pc, layout, global_rank):
     config = SimpleNamespace(
         parallel_config=pc,
         tensor_parallel_size=tp,
+        sequence_parallel_size=1,
         tp_world_size=tp,
         pipeline_parallel_size=pp,
         prefill_context_parallel_size=pcp,
+        pcp_group_size=pcp,
         decode_context_parallel_size=dcp,
         master_addr="127.0.0.1",
         port=0,
@@ -249,3 +257,50 @@ def test_standalone_model_runner_keeps_rank_zero_rendezvous(manager):
     _spawn_workers(
         _model_runner_worker, [(pc, (2, 1, 1, 1, 1), rank) for rank in range(2)]
     )
+
+
+@pytest.mark.parametrize(
+    "dp_size,dp_size_local,first_rank,worker_rank,raised",
+    [
+        (8, 8, 0, 0, False),
+        (8, 8, 0, 3, False),  # single-node DPA8, a non-zero rank
+        (16, 8, 0, 3, True),
+        (16, 8, 8, 11, True),
+    ],
+)
+def test_only_a_dp_group_across_nodes_raises_the_group_timeout(
+    monkeypatch, dp_size, dp_size_local, first_rank, worker_rank, raised
+):
+    from torch.distributed import distributed_c10d
+
+    from atom.utils.distributed.utils import raise_timeout_if_dp_spans_nodes
+
+    for name in ("ATOM_DP_SIZE", "ATOM_DP_SIZE_LOCAL", "ATOM_DP_RANK"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv("ATOM_MULTINODE_PG_TIMEOUT_S", raising=False)
+    monkeypatch.setattr(distributed_c10d, "default_pg_timeout", timedelta(minutes=30))
+    pc = ParallelConfig(
+        data_parallel_size=dp_size,
+        data_parallel_size_local=dp_size_local,
+        data_parallel_rank=first_rank,
+    )
+    # What CoreManager does to each engine's copy.
+    pc.data_parallel_rank = worker_rank
+    raise_timeout_if_dp_spans_nodes(pc)
+    expected = timedelta(hours=2) if raised else timedelta(minutes=30)
+    assert distributed_c10d.default_pg_timeout == expected
+
+
+def test_groups_without_a_timeout_outlast_a_slow_nodes_load(monkeypatch):
+    from torch.distributed import distributed_c10d
+
+    from atom.utils.distributed.utils import raise_default_group_timeout
+
+    monkeypatch.setattr(distributed_c10d, "default_pg_timeout", timedelta(minutes=30))
+    raise_default_group_timeout(7200)
+    # What a gloo group created without a timeout, as aiter's are, now gets.
+    gloo = distributed_c10d._get_default_timeout(dist.Backend.GLOO)
+    assert gloo == timedelta(hours=2)
+    # A longer default someone else chose is kept.
+    raise_default_group_timeout(60)
+    assert distributed_c10d._get_default_timeout(dist.Backend.GLOO) == gloo

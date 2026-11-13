@@ -18,6 +18,7 @@ from atom.config import (
 )
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 from atom.model_engine.engine_core_mgr import DP_LB_DEFAULT, DP_LB_STRATEGIES
+from atom.model_engine.prefill_delayer import PREFILL_ADMIT_POLICIES
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -122,6 +123,7 @@ class EngineArgs:
     decode_context_parallel_size: int = 1
     pipeline_parallel_size: int = 1
     prefill_context_parallel_size: int = 1
+    sequence_parallel_size: int = 1
     data_parallel_size: int = 1
     data_parallel_size_local: int | None = None
     data_parallel_rank: int = 0
@@ -145,6 +147,7 @@ class EngineArgs:
     enable_chunked_prefill: bool = True
     enable_log_stats: bool = True
     enable_request_context_metrics: bool = False
+    sampler_independent_noise: bool = False
     throughput_log_interval: float = 10.0
     throughput_log_interval_steps: int = 0
     cache_hit_rate_window: int = 1000
@@ -154,6 +157,7 @@ class EngineArgs:
     dynamic_chunking_smooth_factor: float | None = None
     dynamic_chunking_min_chunk_size: int = 4096
     scheduler_delay_factor: float = 0.0
+    prefill_admit_policy: str = "interval"
     max_num_seqs: int = 512
     gpu_memory_utilization: float = 0.9
     cudagraph_capture_sizes: str = "[1,2,3,4,5,6,7,8,16,32,48,64,128,256,512]"
@@ -227,6 +231,17 @@ class EngineArgs:
             default=1,
             help="Prefill context parallel size. Independent dimension "
             "(world = tp x pcp); splits the sequence during prefill.",
+        )
+        parser.add_argument(
+            "--sequence-parallel-size",
+            "-sp",
+            type=int,
+            default=1,
+            help="Ulysses sequence parallel size. Shards tokens across the "
+            "group and trades sequence for heads around attention via "
+            "all-to-all. Requires --tensor-parallel-size 1 and DP1/PP1; "
+            "refuses EP, TBO, speculative decoding, KV transfer and image "
+            "input. Attention heads must divide across the ranks.",
         )
         parser.add_argument(
             "--data-parallel-size",
@@ -396,6 +411,11 @@ class EngineArgs:
             "prompt-token load. 'least_tokens': route to the rank with "
             "the lowest combined in-flight token load (prompt tokens + "
             "per-request token-equivalent, tunable via ATOM_DP_LB_REQ_EQUIV). "
+            "'prefix_spread': keep a request on the rank holding its prompt's "
+            "prefix unless that rank has a prefill backlog and another is "
+            "about to idle (ATOM_DP_PREFIX_IDLE_TOKENS); the moved request "
+            "loads its prefix from the offload tier. Needs prefix caching; "
+            "excludes ATOM_DP_SESSION_AFFINITY. "
             "Has no effect when data_parallel_size == 1.",
         )
         parser.add_argument(
@@ -425,7 +445,8 @@ class EngineArgs:
             default="standard",
             choices=["standard", "mega"],
             help="MoE implementation. 'standard' uses the existing "
-            "prepare/GEMM/finalize path; 'mega' uses fused FlyDSL MegaMoE.",
+            "prepare/GEMM/finalize path; 'mega' uses fused FlyDSL MegaMoE, "
+            "or AITER MegaMoeTP under --sequence-parallel-size.",
         )
         parser.add_argument(
             "--method",
@@ -582,6 +603,24 @@ class EngineArgs:
             "diagnostic captures. Aggregate metrics are unaffected.",
         )
         parser.add_argument(
+            "--sampler-independent-noise",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help="Draw fresh per-row exponential noise for unfiltered "
+            "temperature sampling instead of broadcasting one row across the "
+            "batch, so ordinary n=1 stochastic requests are sampled "
+            "independently, not only fan-out siblings (n>1) and speculative "
+            "verification. Off by default; enabling it allocates a "
+            "(num_tokens, vocab_size) float32 noise tensor per sampler call "
+            "and changes the RNG stream, so identical seeds no longer "
+            "reproduce the default tokens. The top-k/top-p path already "
+            "draws per-row noise, so the option is inert there by design; "
+            "greedy rows never draw noise. Native ATOM "
+            "engine only (vLLM/SGLang plugin paths are unaffected). "
+            "Use --no-sampler-independent-noise to state the default "
+            "explicitly.",
+        )
+        parser.add_argument(
             "--enable-log-stats",
             action=argparse.BooleanOptionalAction,
             default=True,
@@ -683,6 +722,17 @@ class EngineArgs:
             default=0.0,
             help="Apply a delay (of delay factor multiplied by previous"
             "prompt latency) before scheduling next prompt.",
+        )
+        parser.add_argument(
+            "--prefill-admit-policy",
+            choices=list(PREFILL_ADMIT_POLICIES),
+            default="interval",
+            help="When the prefill delayer admits new prefills. 'interval' "
+            "(default) keeps ATOM_PREFILL_DECODE_INTERVAL and the coalescer. "
+            "'adaptive' fires once the held requests' accumulated cost reaches "
+            "the fixed prefill cost times the decode batch, fitted from measured "
+            "step times; on DP=1, PP=1 it enables the delayer as a positive "
+            "interval does.",
         )
         parser.add_argument(
             "--mark-trace",

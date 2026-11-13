@@ -77,6 +77,7 @@ def test_supported_deployment_has_no_refusal(native):
         ),
         ({"decode_context_parallel_size": 2}, "decode CP"),
         ({"prefill_context_parallel_size": 2}, "prefill CP"),
+        ({"sequence_parallel_size": 4}, "Ulysses SP"),
         ({"kv_cache_dtype": "bf16"}, "kv cache"),
         ({"index_cache_dtype": "bf16"}, "index cache"),
         ({"kv_cache_block_size": 16}, "block size"),

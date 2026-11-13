@@ -656,3 +656,26 @@ def test_partial_eviction_restores_by_group():
         b[1].block_id,
         a[2].block_id,
     ]
+
+
+def test_v4_decode_keeps_start_where_the_metadata_does(monkeypatch):
+    """Under MTP the input batch's count is an optimistic upper bound."""
+    import atom.plugin.vllm.paged_state_checkpoint as psc
+    from atom.plugin.vllm.deepseek_v4_bridge import (
+        _plan_deepseek_v4_state_checkpoint_ops,
+    )
+
+    seen = {}
+    monkeypatch.setattr(
+        psc, "plan_state_checkpoint_ops", lambda *a, **kw: seen.update(kw)
+    )
+    md = NS(
+        _atom_v4_real_rows=2,
+        _atom_v4_slot_groups=[[0], [1]],
+        _atom_v4_fresh_rows=[],
+        chunk_start_per_seq_cpu=torch.tensor([256, 300, 0], dtype=torch.int32),
+    )
+    common = NS(query_start_loc_cpu=torch.tensor([0, 4, 5, 5]))
+    _plan_deepseek_v4_state_checkpoint_ops(NS(), md, common)
+    assert seen["starts"].tolist() == [256, 300]
+    assert seen["lens"].tolist() == [4, 1]

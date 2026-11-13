@@ -202,7 +202,7 @@ def decode_keys(cache, spec, step):
     pb, wb = pptr.tolist(), wptr.tolist()
     rows = [
         torch.cat([prefix[pb[t] : pb[t + 1]], window[wb[t] : wb[t + 1]] + start])
-        for t in range(step.width)
+        for t in range(step.running_tokens)
     ]
     counts = torch.tensor([0] + [len(r) for r in rows], device=pptr.device)
     return torch.cat(rows), counts.cumsum(0).to(pptr.dtype)

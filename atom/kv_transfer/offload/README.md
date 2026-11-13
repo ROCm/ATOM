@@ -31,8 +31,12 @@ present (DSV4 PAGE+SLOT), and `dense` otherwise.
 `kv_transfer_config.offload_layout` can override compatible choices without
 giving scheduler and worker different connector names. MiniMax-M3 cannot be
 overridden away from `m3`, because the other codecs do not preserve its NSA
-index cache. A GDN or K3 model cannot be overridden onto a layout that owns
-no state tier (`dense`), because that would restore KV over a stale slot.
+index cache. A model with per-request state (GDN `qwen`, K3 `kimi_k3`,
+DeepSeek-V4.1 `dsv41`) accepts only its own layout as an override: any other
+one, `qwen` and `kimi_k3` for each other included, has no tier for its state
+and would restore KV over a stale slot. DeepSeek-V4.1 resolves to `dsv41` (its
+PAGE+STATE pool, offloaded over `lmcache_mp` only), and no other model may
+name `dsv41`.
 
 It is the **ATOM-native, in-engine** offload path: the connector plugs straight
 into ATOM's scheduler/worker via the shared
@@ -104,12 +108,20 @@ Four rules carry the module:
 | `atom_lmcache_staging.py` | Per-thread CUDA streams, staging buffer, ready/free events, env helpers. |
 | `mp/connector.py` | Capability-selected public `lmcache_mp` worker/scheduler shells. |
 | `mp/deployment.py` | LMCache MP configuration, topology, model namespace and server adapters. |
-| `mp/worker.py`, `mp/scheduler.py` | Generic PAGE-only LMCache MP connector halves. |
+| `mp/worker.py`, `mp/scheduler.py` | LMCache MP connector halves. The worker registers PAGE views, plus checkpoint image groups when the backend publishes them; the vLLM plugin builds it directly. |
+| `page_codec.py` | `pure_page_codec`: complete PAGE-only geometry (one tensor view per region, no SLOT state) and the `DSV4PageSlotCodec` shared by M3 and V4.1. |
+| `capabilities.py` | `publishes_native_state`, `copies_paged_state`, and `replays_state`: lightweight state-transfer capability checks, independent of Torch and byte codecs. |
+| `tier.py` | `OffloadTierProfile`: shared tier loadability and minimum-transfer contract consumed by the connector factory and DP routing. |
+| `load_math.py` | Pure functions for how many tokens a tier moves (`loadable_hit`, `tier_load_tokens`), used by the offload scheduler and by DP routing's `OffloadTierProfile`. |
+| `mp/token_shipping.py` | Incremental token shipping: the scheduler sends each transfer only the tokens past what the workers hold; the worker shell rebuilds the prefix. |
+| `mp/metadata.py` | MP-specific shipped/resolved token types and drop-only step metadata; shared metadata keeps plain token lists. |
+| `mp/transfer_thread.py` | The transfer thread: submits off the forward thread under `OFFLOAD_MP_TRANSFER_THREAD`, and also polls for a worker built with `transfers_off_step`; `_ProducerFences`, the reused producer events. |
 | `mp/lookup.py` | Scheduler-side MP lookups and read-lock bookkeeping. |
 | `mp/transfer.py` | Transfer identity, terminal detection and the fail-stop transfer deadline. |
 | `mp/page_views.py` | Shared validation of backend-published PAGE views. |
-| `mp/native_state_{layout,scheduler,worker}.py` | PAGE-backed native-state registration, scheduler leases, and worker transfer/restore lifecycle. |
-| `mooncake_store/config.py` | The `mooncake_store.*` settings (per-NIC Store pools included), and the dense/DCP=1 startup refusals. |
+| `mp/native_state_{layout,scheduler,worker}.py` | The PAGE-backed native-state layout and `stores_state_images`, scheduler leases, and the worker's restore into an Active SLOT. Its registration and block-id validation are `mp/worker.py`'s (shared with the plugin), and `require_native_state_server` is `mp/deployment.py`'s. |
+| `mooncake_store/config.py` | The `mooncake_store.*` settings (per-NIC Store pools included) and the startup refusals (layouts other than dense, M3 PAGE, and V4.1 PAGE, DCP > 1, odd chunks). |
+| `mooncake_store/layouts.py` | Which layouts this connector moves (dense, M3 PAGE, V4.1 replay PAGE), and the codec for each. |
 | `mooncake_store/keys.py` | Layout namespace, the prompt's 16-byte chunk hash chain, and Store key spelling. |
 | `mooncake_store/nic.py` | One PCI-local RDMA device per worker. |
 | `mooncake_store/client.py` | Pure zero-copy `MooncakeDistributedStore` client, result codes, per-call counters. |
@@ -122,6 +134,17 @@ The engine-side counterpart of the state tier lives outside this directory:
 store/finished/failed hash sets that `hybrid/kimi_k3/state_tier.py` reports back,
 so a later prefix hit knows which checkpoints the CPU tier can actually serve.
 
+State images and paged KV share one LocalCPU pool and one LRU, and a state hit
+is answered by the index rather than an LMCache lookup. So every voted hit is
+also sent to the workers as a touch (`LMCacheOffloadMetadata.state_touches`):
+each rank refreshes the image (`StateByteCodec.touch`) and reports on
+`k3_state_touch` whether it is still there; a gone image leaves the index. An
+admission that would load an image not confirmed within `tier_verified_for_s`
+(sized from `LMCACHE_MAX_LOCAL_CPU_SIZE`) is held a pass, at most
+`OFFLOAD_LOOKUP_DEFER_S`, for that verdict. Touches that only confirmed presence
+(the image is held by another backend only, or the touch raised) are counted in
+the connector statistic `state_touches_unrefreshed`.
+
 ## LMCache Multiprocess (`lmcache_mp`)
 
 The `lmcache_mp` connector selects one of two paths from capabilities published
@@ -133,7 +156,14 @@ by the attention backend:
   transfer.
 
 Selection does not inspect model names or layout-ID prefixes. A new backend can
-reuse the native path by implementing these shared contracts. The native path
+reuse the native path by implementing these shared contracts.
+
+The vLLM plugin does not go through this shell. For DeepSeek-V4.1 it builds
+`LMCacheMPConnector` (`mp/worker.py`) directly with `transfers_off_step=True`:
+the backend publishes PAGE views plus checkpoint image groups
+(`recurrent_page_groups`), a load restores the image from the PAGE units it
+fills, the transfer thread submits and polls, and vLLM's preemption fence
+(`fence`) waits on that thread's rounds. The native path
 leases existing READY checkpoint PAGE units; it does not snapshot the request's
 live Active SLOT again. Every running request therefore keeps its normal fixed
 SLOT.
@@ -168,6 +198,9 @@ For a large L1 and a high-concurrency DP-attention deployment, add:
 - `--l1-read-ttl-seconds` above the longest admission wait (for example 900).
   A lookup's read locks expire after this TTL; under a long queue its chunks
   can be evicted before the retrieve, which then fails into a full recompute.
+  Set `lmcache.mp.read_ttl_seconds` in `kv_connector_extra_config` to the same
+  value: with `OFFLOAD_MP_LOOKUP_THREAD`, ATOM releases and re-asks an answer
+  left unconsumed for 0.4 x that TTL, before its locks can expire.
 - `--eviction-trigger-watermark 0.98`; the default 0.8 evicts a fifth of a
   pool that is far from full.
 - Leave `--max-gpu-workers` at its default. Per-thread lazy initialisation
@@ -195,6 +228,12 @@ python -m atom.entrypoints.openai_server \
     }
   }'
 ```
+
+`tp_rank_collapse: auto` decides from the config alone, before any backend is
+built, and leaves every state-owning layout (`kimi_k3`, `qwen`, `dsv41`) one
+copy per rank. DeepSeek-V4.1's backend declares its PAGE and STATE identical
+across TP, so `true` stores one copy for the TP group; the worker still refuses
+to register a collapse its backend does not declare.
 
 ATOM's configured chunk size must equal the MP server chunk size, and both must
 align to ATOM's PAGE/hash block size. A native prefix is loadable only where
@@ -225,7 +264,9 @@ frees it. Instead, a transfer that is still not terminal after
 `lmcache.mp.transfer_deadline_s` (default 30 s) is fatal: the worker raises
 `LMCacheTransferUnprovable` and the engine stops. This is a per-transfer deadline
 from submission, including time queued at the MP server, not a model request
-timeout or a heartbeat timeout. It also catches a live server whose ZMQ handler
+timeout or a heartbeat timeout. A native-state load's restore is held to the same
+deadline, counted from when its copy is enqueued, not from submission.
+The deadline from submission also catches a live server whose ZMQ handler
 failed without replying; no LMCache transport changes are required. The scheduler
 independently watches dispatched operations with an additional 10 s margin for
 lost or never-aggregated completion reports. These checks run when the respective
@@ -243,7 +284,10 @@ The model namespace includes PAGE/model geometry, TP and speculation settings,
 native layout/image sizes, the Hugging Face commit when available, and the
 optional `lmcache.mp.model_revision`. Set that revision when weights are
 replaced in an existing local model directory; a directory name alone cannot
-identify changed contents.
+identify changed contents. DeepSeek-V4.1 resolved to `hybrid` before it had a
+layout of its own and keeps the namespace that gave it, so native ATOM's V4.1
+tiers stay reachable across the change. The vLLM plugin, which had no V4.1
+tiers before, also hashes V4.1's `sliding_window` and `candidate_block_size`.
 
 ### MP lifetime and representation
 
@@ -333,11 +377,21 @@ comparison, per-rank retrieve counts, one-writer storage, and promoted ranges.
 `ChunkedOffloadSchedulerBase` (save cadence, load decisions, early block
 release, exact operation completions), the `DenseOffloadConnector` worker
 plumbing (executors, per-step producer fence, completion reports),
-`BlockGPUConnector` and `DenseKVByteCodec`. What replaces LMCache is a Mooncake
+`BlockGPUConnector` and a byte codec (`DenseKVByteCodec`, or `DSV4PageSlotCodec`
+through `pure_page_codec` for M3 and V4.1). What replaces LMCache is a Mooncake
 Store whose memory belongs to separate owner processes -- on the prefill node's
 NUMA nodes and, across two nodes, on the decode node -- reached directly by
 every prefill worker. There is no CPU L1, no LMCache engine or lookup server,
 and no `import lmcache`.
+
+Dense layouts use `DenseKVByteCodec`. MiniMax-M3, M3.1, and V4.1 use
+`pure_page_codec`, which builds `DSV4PageSlotCodec` over the ordered PAGE
+regions in `KVTransferTensors.block_regions`, with no SLOT state and a tensor
+view for every region. M3's regions include the NSA index cache and the draft
+KV. The `m3-page-regions` codec namespace keeps these objects separate from
+dense KV objects and from V4.1's `v41-replay-page-v1` objects. V4.1 stores PAGE
+regions only; its request state is rebuilt by replay. Other stateful layouts
+and DCP greater than 1 remain unsupported.
 
 ### Data path
 
@@ -642,8 +696,9 @@ this worker config.
 
 ### Not supported in phase 1
 
-- Layouts other than dense (DSV4 PAGE+SLOT, MiniMax-M3, Kimi-K3 state tier) and
-  DCP > 1 on the offload side: refused at startup.
+- Layouts other than dense, MiniMax-M3/M3.1 PAGE, and V4.1's replay PAGEs
+  (DSV4 PAGE+SLOT, Kimi-K3 state tier) and DCP > 1 on the offload side: refused
+  at startup.
 - Decode-side offload, and reading the Store from decode workers: decode DRAM
   joins as Store owners only.
 - A second offload connector beside it in one `multi`.
@@ -1178,6 +1233,16 @@ Under `--kv_cache_dtype fp8`, each KV block carries its own `k_scale` / `v_scale
 (`dense/kv_byte_codec.py`). The scales travel with the quantized data, so a
 reloaded fp8 block dequantizes identically; no scale is recomputed or dropped.
 
+### Multimodal prompts: salted keys
+
+Image placeholder ids are the same for every picture, so a prompt with a
+`cache_seed` keys its tier objects by it as well (`tier_cache_salt`,
+`_offload_common.py`): `lmcache_mp` as `IPCCacheServerKey.cache_salt`, the
+in-process engine as the `lmcache.tag.cache_salt` key tag. Lookups, saves and
+loads of the chunked schedulers and of DSV4 PAGE+SLOT carry it. Text prompts
+key unchanged. DSV4's SLOT boundary hashes start from the same `cache_seed`, as
+`BlockManager`'s chain does; Mooncake seeds its chain (`chain_seed`).
+
 ### Invariants enforced in code
 
 | Invariant | Where | Why |
@@ -1409,7 +1474,8 @@ env var. This per-thread isolation is exactly why load and save never contend.
   `lookup_server_worker_ids=[0]` so rank 0 is the authoritative lookup answerer at
   TP>1. `build_lmcache_metadata()` fills `kv_shape` from `hf_config` and pins a
   shared `engine_id` so the scheduler's lookup client and the workers' lookup
-  servers derive the **same** ZMQ socket path.
+  servers derive the **same** ZMQ socket path, one per server
+  (`server_instance_id`) and DP rank.
 - **`metadata.py`** — `ATOMRawBytesLMCacheMetadata` overrides LMCache's allocation
   to hand out opaque `uint8` MemoryObjs (`get_shapes` returns
   `nblocks × bytes_per_block`) and asserts
@@ -1455,6 +1521,7 @@ LMCache version, these are what to re-check.**
 | `get_or_create(…, lambda t,s: None, lambda o,s: o)` | LMCache's trailing token-processing / output-transform callbacks | We don't use LMCache's token-shaping hooks — our codec moves raw bytes | Passed as no-op / identity callables |
 | `cfg.lookup_server_worker_ids = [0]` | default: every rank answers lookup, client takes `min()` | At TP>1 a non-rank-0 shard returning 0 would zero out a real hit; rank 0 is made authoritative | `config.py` (see [TP > 1 Notes](#tp--1-notes)) |
 | `cfg.use_gds = False` | LMCache may enable cufile GDS | cufile init hangs without NVMe-GDS hardware here | `config.py` |
+| `StateByteCodec.touch` | `LocalCPUBackend.touch_cache()` after `contains(pin=True)` | A pin needs a paired unpin, and `keys_in_request` belongs to the concurrent KV lookup | `cache_policy.update_on_hit(key, hot_cache)` under `cpu_lock`, resolved once at bind; if one is missing it warns and touches only confirm presence |
 
 ### 3. Fully delegated to LMCache (we never touch the implementation)
 

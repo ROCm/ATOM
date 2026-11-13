@@ -35,7 +35,9 @@ class EngramStep:
     `live`: the live leading tokens, on the device (0: nothing is read or
     written). `dead`: a token's no-own-id flag. `candidates`: a verify step's
     every accepted prefix (`commit_tentative` picks one); None advances
-    `cursor` in place.
+    `cursor` in place. `served_by_round`: the forward's
+    `AttentionMetaData.served_by_round` (the model's decode round runs every
+    layer and looks the rows up itself): `start` only advances the cursor.
     """
 
     input_ids: torch.Tensor
@@ -47,6 +49,7 @@ class EngramStep:
     cursor: torch.Tensor
     history_index: torch.Tensor
     candidates: torch.Tensor | None
+    served_by_round: bool = False
 
 
 class EngramStaging:
@@ -65,6 +68,8 @@ class EngramStaging:
             host.max_num_tokens, dtype=torch.int32, device=host.device
         )
         self.step = None
+        # the step `start` left to the model (`EngramStep.served_by_round`)
+        self._served = False
         self.flat = {
             layer: torch.empty(
                 host.max_num_tokens,
@@ -183,6 +188,12 @@ class EngramStaging:
             )
 
     def start(self, width):
+        # A step whose model looks the rows up itself: only the cursor advance
+        # (no snapshot, no side stream), and `join` waits on nothing.
+        self._served = self.step.served_by_round
+        if self._served:
+            self._advance_cursor(width)
+            return
         host = self.host
         self._snapshot(width)
         compute = torch.cuda.current_stream(host.device)
@@ -237,6 +248,8 @@ class EngramStaging:
             host.buffers[layer].gpu[:width].copy_(out)
 
     def join(self):
+        if self._served:
+            return
         # Close the fork even if a partial forward did not consume every layer.
         torch.cuda.current_stream(self.host.device).wait_stream(self.stream)
 

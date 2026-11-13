@@ -48,6 +48,7 @@ def server(monkeypatch):
         ],
         finish_reason="eos",
         cleanups=[],
+        stopped=[],
     )
 
     def encode(messages, **kwargs):
@@ -72,7 +73,8 @@ def server(monkeypatch):
         "engine": SimpleNamespace(
             config=SimpleNamespace(
                 generation_config=SimpleNamespace(), max_model_len=8192
-            )
+            ),
+            io_processor=SimpleNamespace(encode_prompt=lambda text: [1, 2]),
         ),
     }.items():
         monkeypatch.setattr(api_server, name, value)
@@ -105,6 +107,8 @@ def server(monkeypatch):
         return 1, Collector(), 2
 
     class Reasoning:
+        held_text = ""
+
         def stream(self):
             return self
 
@@ -115,10 +119,15 @@ def server(monkeypatch):
                 else [("content", text)]
             )
 
-        def flush(self):
+        def flush(self, *, stopped):
+            state.stopped.append(stopped)
             return []
 
-        def split(self, text):
+        def read_whole_events(self, text, *, stopped):
+            return self.process(text) + self.flush(stopped=stopped)
+
+        def split(self, text, *, stopped):
+            state.stopped.append(stopped)
             return "", text
 
     monkeypatch.setattr(api_server, "generate_async", generate)
@@ -139,6 +148,44 @@ def post(path, body):
             return await client.post(path, json=body)
 
     return asyncio.run(run())
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("effort", ["none", "low"])
+def test_flash_ignores_hosted_web_search_but_returns_answer(server, stream, effort):
+    response = post(
+        "/v1/responses",
+        {
+            "model": "renamed-model",
+            "input": "Say answer",
+            "tools": [{"type": "web_search"}],
+            "reasoning": {"effort": effort},
+            "stream": stream,
+        },
+    )
+    assert response.status_code == 200
+    assert "answer" in response.text
+    assert "web_search_call" not in response.text
+    if stream:
+        assert "response.completed" in response.text
+        assert "[DONE]" not in response.text
+
+
+def test_models_metadata_is_deployment_scoped(server, monkeypatch):
+    monkeypatch.setattr(api_server.engine.config, "method", "dspark", raising=False)
+
+    async def run():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=api_server.app), base_url="http://test"
+        ) as client:
+            return await client.get("/v1/models")
+
+    response = asyncio.run(run())
+    card = response.json()["data"][0]
+    assert card["id"] == "renamed-model"
+    assert card["context_window"] == card["max_output_tokens"] == 8192
+    assert card["input_modalities"] == ["text"]
+    assert card["effort"]["default_level"] == "high"
 
 
 @pytest.mark.parametrize("endpoint", ["chat/completions", "responses"])
@@ -319,6 +366,32 @@ def test_length_limit_is_incomplete(server, stream):
     assert result["status"] == "incomplete"
     assert result["incomplete_details"] == {"reason": "max_output_tokens"}
     assert result["output"][-1]["status"] == "incomplete"
+
+
+@pytest.mark.parametrize(
+    "path, body",
+    [
+        ("/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}]}),
+        ("/v1/messages", {"messages": [{"role": "user", "content": "hi"}]}),
+        ("/v1/responses", {"input": "hi"}),
+    ],
+    ids=["chat", "messages", "responses"],
+)
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    "reason, stopped", [("eos", True), ("stop_163586", True), ("max_tokens", False)]
+)
+def test_the_reasoning_reader_is_told_whether_the_model_stopped(
+    server, path, body, stream, reason, stopped
+):
+    """A skipped think channel is replayed as content only when the model
+    stopped itself; every endpoint, in both modes, has to say which it was."""
+    server.finish_reason = reason
+    server.chunks[0]["finish_reason"] = reason
+    body = {"model": "renamed-model", **body, "stream": stream}
+    response = post(path, body)
+    assert response.status_code == 200, response.text
+    assert server.stopped == [stopped]
 
 
 def test_stream_failure_closes_items_and_reports_failed(server):
@@ -743,34 +816,44 @@ def test_http_error_handler_preserves_status_headers_and_other_routes():
             ),
         )
 
-    response = asyncio.run(run("/v1/chat/completions"))
-    assert response.status_code == 429 and response.headers["Retry-After"] == "5"
-    assert json.loads(response.body)["error"]["message"] == "slow down"
+    for path in ("/v1/chat/completions", "/beta/completions"):
+        response = asyncio.run(run(path))
+        assert response.status_code == 429 and response.headers["Retry-After"] == "5"
+        assert json.loads(response.body)["error"]["message"] == "slow down"
     assert json.loads(asyncio.run(run("/server_info")).body) == {"detail": "slow down"}
 
 
 @pytest.mark.parametrize(
     "endpoint,body",
     [
-        ("chat/completions", {"messages": "invalid"}),
-        ("completions", {"prompt": {}, "max_tokens": "invalid"}),
-        ("responses", {"input": "hi", "max_output_tokens": "invalid"}),
-        ("messages", {"messages": "invalid", "max_tokens": 16}),
+        ("v1/chat/completions", {"messages": "invalid"}),
+        ("v1/completions", {"prompt": {}, "max_tokens": "invalid"}),
+        ("v1/responses", {"input": "hi", "max_output_tokens": "invalid"}),
+        ("v1/messages", {"messages": "invalid", "max_tokens": 16}),
+        ("beta/chat/completions", {"messages": "invalid"}),
+        ("beta/completions", {"prompt": {}, "suffix": 3}),
+        ("beta/completions", {"prompt": "p", "suffix": 3}),
+        # /v1 keeps main's models: a single stop string is still invalid.
+        ("v1/completions", {"prompt": "p", "stop": "x"}),
+        (
+            "v1/chat/completions",
+            {"messages": [{"role": "user", "content": "q"}], "stop": "x"},
+        ),
     ],
 )
 def test_pydantic_errors_use_endpoint_envelope_before_generation(
     server, endpoint, body
 ):
-    response = post("/v1/" + endpoint, {"model": "renamed-model", **body})
+    response = post("/" + endpoint, {"model": "renamed-model", **body})
     # Responses validates its rewritten body inside the endpoint, preserving
     # its existing 400; FastAPI's typed-body validation retains 422 elsewhere.
-    expected_status = 400 if endpoint == "responses" else 422
+    expected_status = 400 if endpoint == "v1/responses" else 422
     assert response.status_code == expected_status
     payload = response.json()
     assert "detail" not in payload
     assert payload["error"]["type"] == "invalid_request_error"
     assert payload["error"]["message"]
-    if endpoint == "messages":
+    if endpoint == "v1/messages":
         assert payload["type"] == "error"
     else:
         assert payload["error"]["code"] == expected_status
@@ -1014,6 +1097,8 @@ def test_responses_engine_failure_is_not_success(
             "text": "partial" if partial else "",
             "finish_reason": reason,
             "num_cached_tokens": 0,
+            "num_tokens_input": 2,
+            "num_tokens_output": 1 if partial else 0,
         }
 
     monkeypatch.setattr(api_server, "generate_async", generate)

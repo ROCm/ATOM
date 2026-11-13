@@ -71,9 +71,12 @@ from atom.model_ops.triton_fused_qkv_norm_rope_cache import (
     triton_fused_norm_rope_cache,
 )
 from atom.models.dspark_draft import (
+    AllocationCap,
     DSparkConfidenceHead,
     DSparkDraftModel,
-    DSparkMarkovHead,
+    DSparkGQADecoderLayer,
+    KVCacheBinding,
+    draft_quant_config,
     linear_out,
 )
 from atom.models.minimax_m3.model import MiniMaxM3MLP
@@ -91,30 +94,6 @@ def _draft_rope_theta(config) -> float:
     if not theta:
         raise ValueError("MiniMax-M3 DSpark draft config names no rope_theta.")
     return float(theta)
-
-
-def _draft_quant_config(config) -> QuantizationConfig:
-    """The draft's own quantization, independent of the target's.
-
-    The draft checkpoint is MXFP8 (``quant_method: mxfp8``, ``[1, 32]`` blocks)
-    whatever the target is -- the M3.1 targets come as MXFP8 + NVFP4 experts,
-    Quark MXFP4, or BF16 -- so the target's config, which ``_build_draft_model``
-    copies onto the draft, cannot be trusted to describe these weights. The
-    checkpoint's own block goes through the registered parser here; a draft
-    config without one is BF16.
-    """
-    draft_qc = QuantizationConfig(config)
-    spec = draft_qc.global_spec
-    if draft_qc.quant_method and (spec.quant_type, spec.quant_dtype) != (
-        QuantType.per_1x32,
-        dtypes.fp8,
-    ):
-        raise ValueError(
-            "MiniMax-M3 DSpark draft supports MXFP8 [1, 32] or BF16 weights, "
-            f"got quant_method={draft_qc.quant_method!r} ({spec.quant_type}, "
-            f"{spec.quant_dtype})."
-        )
-    return draft_qc
 
 
 def _page16_table(
@@ -160,7 +139,7 @@ def _window_rows(
     if window:
         torch.sub(positions, window - 1, out=start16)
         start16.clamp_(min=0).div_(ASM_PAGE_SIZE, rounding_mode="floor")
-        # Pad rows repeat the last real anchor but read one page.
+        # Pad rows read one page.
         start16[real_rows:].zero_()
     else:
         start16.zero_()
@@ -168,26 +147,6 @@ def _window_rows(
     out_lens.sub_(start16, alpha=ASM_PAGE_SIZE)
     start16.add_(row_req, alpha=P)  # each row's first entry in the flat buffer
     torch.index_select(bt16_flat.unfold(0, P, 1), 0, start16, out=out_tables)
-
-
-class KVCacheBinding(nn.Module):
-    """What the draft KV pool binds one layer's cache onto, and nothing else.
-
-    ``DraftKvBuilder`` recognizes a non-MLA attention module by these
-    attributes and sets ``k_cache`` / ``v_cache`` (5-D SHUFFLE), the fp8
-    per-token scales and ``max_model_len`` on it; the layer then reads and
-    writes the cache itself.
-    """
-
-    base_attention = None
-    use_mla = False
-
-    def __init__(self, layer_num: int) -> None:
-        super().__init__()
-        self.layer_num = layer_num
-        self.max_model_len = 0
-        self.k_cache = self.v_cache = torch.tensor([])
-        self.k_scale = self.v_scale = None
 
 
 class M3DSparkAttention(nn.Module):
@@ -270,7 +229,7 @@ class M3DSparkAttention(nn.Module):
         off % 16), only the view differs.
         """
         kv = self.kv
-        if kv.k_cache.numel() == 0:
+        if not kv.bound:
             return None
         return to_page16_shuffle(kv.k_cache, kv.v_cache, kv.k_scale, kv.v_scale)
 
@@ -370,7 +329,7 @@ class M3DSparkAttention(nn.Module):
         return out.view(rows, -1)
 
 
-class M3DSparkDecoderLayer(nn.Module):
+class M3DSparkDecoderLayer(DSparkGQADecoderLayer):
     """One draft layer: pre-norm attention + pre-norm dense SwiGLU-OAI MLP."""
 
     def __init__(
@@ -402,28 +361,14 @@ class M3DSparkDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-    def write_context_kv(self, ctx_hidden, positions) -> None:
-        """Populate this layer's context rows at the TARGET forward's slots,
-        which are still the installed metadata when the proposer calls this."""
-        slot_mapping = get_forward_context().attn_metadata.slot_mapping[
-            : ctx_hidden.shape[0]
-        ]
-        self.self_attn.write_context_kv(ctx_hidden, positions, slot_mapping)
-
-    def forward(self, positions, hidden_states, residual=None):
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = self.self_attn(positions, hidden_states)
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        return self.mlp(hidden_states), residual
-
 
 class MiniMaxM3DSpark(DSparkDraftModel):
     """Top-level standalone DSpark draft for MiniMax-M3.1 (GQA backbone +
-    Markov head + confidence head)."""
+    Markov head + confidence head).
+
+    The block is the base ``block_backbone``, with no embedding scale: the
+    reference embeds with the target's table as is.
+    """
 
     # Per-row MHA decode; its tables are built in `prepare_paged_block`.
     block_attention_is_mla = False
@@ -448,18 +393,22 @@ class MiniMaxM3DSpark(DSparkDraftModel):
             )
         config = atom_config.hf_config
         self.hf_config = config
-        quant_config = _draft_quant_config(config)
+        # The draft checkpoint is MXFP8 (``[1, 32]`` blocks) whatever the
+        # target is -- the M3.1 targets come as MXFP8 + NVFP4 experts, Quark
+        # MXFP4, or BF16.
+        quant_config = draft_quant_config(
+            config,
+            draft="MiniMax-M3 DSpark",
+            accepted={(QuantType.per_1x32, dtypes.fp8)},
+        )
 
         self.hidden_size = config.hidden_size
-        self.noise_token_id = int(config.dspark_noise_token_id)
-        self.target_layer_ids = tuple(config.dspark_target_layer_ids)
-        self.markov_rank = int(config.dspark_markov_rank)
         self.vocab_size = int(config.vocab_size)
 
         # Replicated: the aux hidden states arrive replicated, and the
         # checkpoint keeps this projection BF16 (an ignored layer).
         self.fc = ReplicatedLinear(
-            self.hidden_size * len(self.target_layer_ids),
+            self.hidden_size * len(config.dspark_target_layer_ids),
             self.hidden_size,
             bias=False,
             quant_config=None,
@@ -479,11 +428,11 @@ class MiniMaxM3DSpark(DSparkDraftModel):
             ]
         )
         self.final_norm = GemmaRMSNorm(self.hidden_size, eps=config.rms_norm_eps)
-        self.markov_head = DSparkMarkovHead(self.vocab_size, self.markov_rank)
+        self.init_block_fields(config)
         # 0 or absent: every block row attends the whole context.
         self.sliding_window = int(getattr(config, "sliding_window", 0) or 0)
         self.confidence_head = (
-            DSparkConfidenceHead(self.hidden_size, self.markov_rank, bias=True)
+            DSparkConfidenceHead(self.hidden_size, self.markov_head.rank, bias=True)
             if getattr(config, "enable_confidence_head", False)
             else None
         )
@@ -495,51 +444,15 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         # `prepare_paged_block`'s buffers, sized here and allocated on its
         # first call.
         self.max_num_seqs = atom_config.max_num_seqs
-        self.block_size = atom_config.kv_cache_block_size
         self._bt16 = None
 
-    @property
-    def first_attention_layer_num(self) -> int:
-        return self.layers[0].self_attn.kv.layer_num
-
-    # ---- weight-loading hooks ---------------------------------------------
-
-    def share_with_target(self, target_base: nn.Module, loaded: set) -> None:
-        target_vocab = target_base.model.embed_tokens.num_embeddings
-        if target_vocab != self.vocab_size:
-            raise ValueError(
-                f"DSpark draft vocab {self.vocab_size} != target vocab "
-                f"{target_vocab}. The draft shares the target's embedding and LM "
-                "head, so the two must agree."
-            )
-        self.embed_tokens = target_base.model.embed_tokens
-        self.lm_head = target_base.lm_head
-
     # ---- drafting entry points (called by the proposer) --------------------
-
-    def project_context(self, aux_concat: torch.Tensor) -> torch.Tensor:
-        """``hidden_norm(fc(concat(aux)))``, once per step for every layer.
-
-        A target layer id is that layer's output, the residual stream before
-        any final norm, which is what this checkpoint was trained on: feeding
-        the last one through the target's final norm instead (the NeMo recipe's
-        post-norm feature) dropped GSM8K acceptance from 51% to 39%.
-        """
-        return self.hidden_norm(linear_out(self.fc(aux_concat)))
-
-    @property
-    def context_layers(self):
-        return self.layers
 
     def _alloc_block_rows(self, P: int, T: int, device) -> None:
         """The first call is the warmup, ahead of any capture: these addresses
         are the ones every recording bakes in."""
         max_bs = self.max_num_seqs
-        self._alloc = torch.zeros(max_bs, dtype=torch.int32, device=device)
-        self._alloc_host = torch.zeros(max_bs, dtype=torch.int32, pin_memory=True)
-        # Recorded after each copy out of `_alloc_host`; a fresh event has
-        # nothing to wait for.
-        self._alloc_copied = torch.cuda.Event()
+        self._alloc_cap = AllocationCap(max_bs, device)
         # One row of slack past the last request: `_window_rows` reads every
         # row as a P-wide window of this buffer.
         self._bt16_flat = torch.zeros(
@@ -566,6 +479,7 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         ctx_lens: torch.Tensor,  # [running_bs] anchor + 1 + T
         allocated_pages,  # [>= scheduled_bs] host, pages each request holds
         scheduled_bs: int,
+        entry_tokens: int,  # tokens one page id spans, the slots' unit
     ) -> None:
         """Per-row paged decode tables for the block.
 
@@ -589,22 +503,9 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         if self._bt16 is None or self._bt16.shape[1] != P:
             self._alloc_block_rows(P, T, block_tables.device)
 
-        # Allocated tokens per request. At least one page: the warmup batch and
-        # the pad tail address page 0 by convention. The host can run a step
-        # ahead of the device, so the previous step's copy must have read the
-        # pinned buffer before it is rewritten.
-        self._alloc_copied.synchronize()
-        pages = self._alloc_host.numpy()[:running_bs]
-        n = min(len(allocated_pages), scheduled_bs)
-        pages[:n] = allocated_pages[:n]
-        pages[n:] = 1
-        pages.clip(min=1, out=pages)
-        alloc = self._alloc[:running_bs]
-        alloc.copy_(self._alloc_host[:running_bs], non_blocking=True)
-        self._alloc_copied.record()
-        alloc.mul_(self.block_size)
-
-        slots.masked_fill_(block_positions >= alloc.view(running_bs, 1), -1)
+        alloc = self._alloc_cap.apply(
+            allocated_pages, scheduled_bs, block_positions, slots, entry_tokens
+        )
         # The rows' own lengths; `ctx_lens` is left as the proposer built it.
         ctx_eff = self._ctx_eff[:running_bs]
         torch.minimum(ctx_lens, alloc, out=ctx_eff)
@@ -628,34 +529,6 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         )
         attn_metadata.dspark_bt16_rows = self._bt16_rows[:rows]
         attn_metadata.dspark_ctx_rows = self._ctx_rows[:rows]
-
-    def forward_spec(self, input_ids, positions, num_draft):
-        return self.head_and_sample(
-            self.block_backbone(input_ids, positions, num_draft),
-            input_ids,
-            num_draft,
-        )
-
-    def block_backbone(
-        self,
-        input_ids: torch.Tensor,  # [B]   verified anchor token per request
-        positions: torch.Tensor,  # [B*T] block absolute positions
-        num_draft: int,
-    ) -> torch.Tensor:
-        """Embed ``[anchor, MASK, ...]``, run the layers, final norm.
-
-        Returns the post-final-norm hidden states ``[B*T, hidden]``. No
-        embedding scale: the reference embeds with the target's table as is.
-        """
-        bs = input_ids.shape[0]
-        draft_ids = input_ids.new_full((bs, num_draft), self.noise_token_id)
-        draft_ids[:, 0] = input_ids
-        hidden = self.embed_tokens(draft_ids.view(-1))
-        residual = None
-        for layer in self.layers:
-            hidden, residual = layer(positions, hidden, residual)
-        hidden, _ = self.final_norm(hidden, residual)
-        return hidden
 
     def head_and_sample(self, hidden, anchor_ids, num_draft):
         bs = anchor_ids.shape[0]

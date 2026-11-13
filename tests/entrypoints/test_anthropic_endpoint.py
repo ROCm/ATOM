@@ -17,7 +17,7 @@ import pytest
 
 from atom.entrypoints.openai import api_server
 from atom.entrypoints.openai.protocol import ChatMessage
-from atom.entrypoints.openai.reasoning import separate_reasoning
+from atom.entrypoints.openai.reasoning import ReasoningChannel
 from atom.entrypoints.openai.reasoning_controls import apply_reasoning_controls
 from atom.entrypoints.openai.serving_anthropic import (
     AnthropicMessage,
@@ -784,7 +784,9 @@ class TestSeparationIsUnconditional:
     )
 
     def test_no_call_is_fabricated_from_reasoning(self):
-        reasoning, body = separate_reasoning(self.RAW, starts_thinking=False)
+        reasoning, body = ReasoningChannel(starts_open=False).split(
+            self.RAW, stopped=True
+        )
         _, calls = parse_tool_calls(body, None, parser_cls=QwenXmlParser)
         names = [c.function["name"] for c in calls]
         assert names == ["get_weather"], f"fabricated {names}"
@@ -794,7 +796,7 @@ class TestSeparationIsUnconditional:
         """The cost of the answer this replaces: tying the parse to `thinking`
         meant no `tool_use` block for any request that did not opt in, which
         is most of them."""
-        _, body = separate_reasoning(self.RAW, starts_thinking=False)
+        _, body = ReasoningChannel(starts_open=False).split(self.RAW, stopped=True)
         _, calls = parse_tool_calls(body, None, parser_cls=QwenXmlParser)
         assert len(calls) == 1
 

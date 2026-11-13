@@ -10,6 +10,7 @@ between. Scheduling, the KV byte layout and the completion protocol are the
 dense offload's; this package adds the transport:
 
 * ``config`` -- the ``mooncake_store.*`` settings, per-NIC pools included;
+* ``layouts`` -- which layouts this connector moves, and the codec for each;
 * ``keys`` -- the layout namespace, the prompt's chunk hash chain, Store keys;
 * ``nic`` -- one PCI-local RDMA device per worker;
 * ``client`` -- a pure zero-copy Store client;

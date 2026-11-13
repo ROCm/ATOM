@@ -125,10 +125,22 @@ def test_unimplemented_modes_fail_before_loading(override):
         validate_runtime_config(runtime_config(**override))
 
 
-def test_lmcache_mp_and_mooncake_are_the_kv_transfers_admitted():
+def test_mp_store_and_mooncake_are_the_kv_transfers_admitted():
     validate_runtime_config(
         runtime_config(kv_transfer_config={"kv_connector": "lmcache_mp"})
     )
+    validate_runtime_config(
+        runtime_config(
+            kv_transfer_config={"kv_connector": "mooncake_store"},
+            enable_encoder_swa_bounded_replay=True,
+            kv_cache_block_size=256,
+        )
+    )
+    # The Store's PAGE-only load is sound only where a hit's state is replayed.
+    with pytest.raises(ValueError, match="Mooncake Store without encoder SWA"):
+        validate_runtime_config(
+            runtime_config(kv_transfer_config={"kv_connector": "mooncake_store"})
+        )
     for role in ("kv_producer", "kv_consumer"):
         validate_runtime_config(
             runtime_config(
@@ -142,7 +154,8 @@ def test_lmcache_mp_and_mooncake_are_the_kv_transfers_admitted():
         )
     for connector in ("lmcache_offload", "moriio", "multi"):
         with pytest.raises(
-            ValueError, match="KV transfer other than lmcache_mp or mooncake"
+            ValueError,
+            match="KV transfer other than lmcache_mp, mooncake or mooncake_store",
         ):
             validate_runtime_config(
                 runtime_config(kv_transfer_config={"kv_connector": connector})
@@ -225,16 +238,12 @@ def test_plugin_mode_is_not_refused_by_the_model_validator():
     registers V4.1 at all -- so this gate guarded no reachable configuration
     while reading as though it did.
 
-    `is_vllm` survives only as a qualifier on the two capability gates whose
-    answer genuinely differs by path (non-DSpark speculation, prefix
-    caching), which is asserted elsewhere in this file.
+    The validator does not read `is_vllm` at all; the plugin's transport and
+    speculation gates are in `atom.plugin.vllm.platform` too.
     """
     validate_runtime_config(
         runtime_config(plugin_config=SimpleNamespace(is_vllm=False))
     )
-    # Through `vllm_plugin_config` for the vLLM arm: the capability gates
-    # it reaches (`enable_prefix_caching`) are fields a bare namespace does
-    # not carry, and reaching them is the point of this test.
     validate_runtime_config(vllm_plugin_config())
 
 
@@ -313,10 +322,10 @@ def test_width_invariant_is_checked_on_both_staging_paths(
     )
 
     # The width this step declared is accepted on both paths ...
-    runtime.v41_begin_forward(torch.zeros(1, step.width, 64))
+    runtime.v41_begin_forward(torch.zeros(1, step.running_tokens, 64))
     # ... and one row short is refused on both, staged or not.
     with pytest.raises(ValueError, match="width this step declared"):
-        runtime.v41_begin_forward(torch.zeros(1, step.width + 1, 64))
+        runtime.v41_begin_forward(torch.zeros(1, step.running_tokens + 1, 64))
 
 
 def test_a_forward_reads_nothing_the_forward_before_it_selected(monkeypatch):
@@ -601,6 +610,35 @@ def test_tbo_admission_is_stable_across_dp_normalization(tp, dp):
         cfg.tensor_parallel_size = 1
 
 
+@pytest.mark.parametrize("requested_block", [16, 128, 256])
+def test_store_geometry_uses_v41_effective_block_size(monkeypatch, requested_block):
+    from atom import config as config_module
+    from atom.config import CompilationConfig, Config
+
+    fixture = Path(__file__).parents[2] / "models/deepseek_v41/fixtures"
+    monkeypatch.setattr(config_module, "QuantizationConfig", lambda *a, **k: None)
+    cfg = Config(
+        model=str(fixture),
+        tensor_parallel_size=1,
+        compilation_config=CompilationConfig(level=0),
+        enforce_eager=True,
+        kv_cache_dtype="bf16",
+        index_cache_dtype="fp8",
+        kv_cache_block_size=requested_block,
+        kv_transfer_config={
+            "kv_connector": "mooncake_store",
+            "kv_role": "offload",
+            "kv_connector_extra_config": {
+                "mooncake_store.master": "127.0.0.1:50051",
+                "mooncake_store.metadata": "http://127.0.0.1:8080/metadata",
+                "mooncake_store.local_hostname": "127.0.0.1",
+                "mooncake_store.chunk_tokens": 128,
+            },
+        },
+    )
+    assert cfg.kv_cache_block_size == 128
+
+
 @pytest.mark.parametrize("explicit_parallel", [False, True])
 def test_legacy_engine_dp_reaches_v41_startup(monkeypatch, explicit_parallel):
     import atom.config as config_module
@@ -625,11 +663,12 @@ def test_legacy_engine_dp_reaches_v41_startup(monkeypatch, explicit_parallel):
         )
         assert config.parallel_config.data_parallel_master_port == 27123
         validated.append(config.parallel_config)
+        return SimpleNamespace()
 
     monkeypatch.setattr(engine_module, "CoreManager", start_core)
     monkeypatch.setattr(
         engine_module,
-        "_load_tokenizer",
+        "load_tokenizer",
         lambda *args: SimpleNamespace(bos_token_id=0, eos_token_id=1),
     )
     kwargs = {"data_parallel_size": 4, "data_parallel_master_port": 27123}

@@ -150,6 +150,7 @@ from atom.mono.device.ops import (
     div_rn,
     f8_word,
     fp8_pack4,
+    kernel_symbol,
     mem_realtime,
     read_lane_i32,
     spin_pause,
@@ -529,7 +530,19 @@ def build_glm5_monokernel(
     class Smem:
         work: fx.Array[fx.Float32, WORK_WORDS, 16]
 
-    @flyc.kernel(known_block_size=[THREADS, 1, 1])
+    kernel_name = kernel_symbol(
+        "glm5_mono",
+        s=S,
+        tp=npes,
+        n=launches_per_step,
+        ix=with_indexer,
+        cp=indexer_cp,
+        dcp=dcp_size,
+        kv=kv_cache_dtype,
+        t=timeline,
+    )
+
+    @flyc.kernel(name=kernel_name, known_block_size=[THREADS, 1, 1])
     def glm5_monokernel(
         h_in: Int64,
         x_out: Int64,

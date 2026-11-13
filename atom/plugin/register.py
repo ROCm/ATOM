@@ -475,7 +475,14 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                     and not _target_verify_graph_enabled()
                 ):
                     return False
-                if is_supported_model and is_draft_extend:
+                # Generic runners must not replay a draft-extend batch. The
+                # dedicated EAGLE draft-extend runner has its own can_run and
+                # is the path that stayed on in the passing MTP jobs.
+                if (
+                    is_supported_model
+                    and is_draft_extend
+                    and not isinstance(self, EAGLEDraftExtendCudaGraphRunner)
+                ):
                     return False
             except Exception:  # noqa: S110
                 pass
@@ -762,8 +769,21 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
 
     if not getattr(EagleDraftWorker, "_atom_dsv4_draft_extend_accept_patched", False):
         original_draft_extend_for_decode = EagleDraftWorker._draft_extend_for_decode
+        import inspect
 
-        def _draft_extend_for_decode(self, batch, batch_result):
+        decode_accepts_plan = (
+            "kv_loc_plan"
+            in inspect.signature(original_draft_extend_for_decode).parameters
+        )
+
+        def _draft_extend_for_decode(self, batch, batch_result, *, kv_loc_plan=None):
+            def _call_original():
+                if decode_accepts_plan:
+                    return original_draft_extend_for_decode(
+                        self, batch, batch_result, kv_loc_plan=kv_loc_plan
+                    )
+                return original_draft_extend_for_decode(self, batch, batch_result)
+
             try:
                 is_glm52 = _is_glm52_nextn_runner(getattr(self, "draft_runner", None))
                 is_dsv4 = _is_dsv4_nextn_runner(getattr(self, "draft_runner", None))
@@ -771,11 +791,11 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                     self, "cuda_graph_runner_for_draft_extend", None
                 )
                 if not is_glm52 and not is_dsv4:
-                    return original_draft_extend_for_decode(self, batch, batch_result)
+                    return _call_original()
                 if is_glm52 and uses_new_graph_api:
-                    return original_draft_extend_for_decode(self, batch, batch_result)
+                    return _call_original()
                 if is_dsv4 and draft_extend_graph_runner is None:
-                    return original_draft_extend_for_decode(self, batch, batch_result)
+                    return _call_original()
 
                 import torch
                 from sglang.srt.speculative.eagle_info import EagleDraftInput
@@ -784,7 +804,7 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                 if not hasattr(
                     EagleDraftInput, "prepare_for_extend_to_fill_draft_kvcache"
                 ):
-                    return original_draft_extend_for_decode(self, batch, batch_result)
+                    return _call_original()
 
                 num_draft_tokens = int(
                     getattr(self, "speculative_num_draft_tokens", 0)
@@ -792,7 +812,7 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                     or 0
                 )
                 if num_draft_tokens <= 0:
-                    return original_draft_extend_for_decode(self, batch, batch_result)
+                    return _call_original()
 
                 use_draft_extend_graph_runner = draft_extend_graph_runner
                 if (
@@ -805,7 +825,7 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
 
                 accept_lens = getattr(batch_result, "accept_lens", None)
                 if not torch.is_tensor(accept_lens):
-                    return original_draft_extend_for_decode(self, batch, batch_result)
+                    return _call_original()
 
                 # DRAFT_EXTEND_V2 materializes exactly `num_draft_tokens` slots
                 # per sequence.  `accept_lens` includes the target bonus token, so

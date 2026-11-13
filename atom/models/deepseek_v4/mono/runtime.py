@@ -4,9 +4,10 @@
 
 import torch
 
+from atom.distributed.group_agreement import group_agree
 from atom.mono.runtime.compile import _SYMBOL_KEY, _code_object
-from atom.mono.runtime.consensus import MonoUnsupported, tp_agree
-from atom.mono.runtime.peer_memory import _DeviceBytes, _ipc_heap
+from atom.mono.runtime.consensus import MonoUnsupported
+from atom.mono.runtime.uncached import DeviceBytes, alloc_uncached, ipc_heap
 
 
 def _entry_symbol(elf: bytes) -> str:
@@ -99,8 +100,9 @@ def require_resident_grid(launcher, grid: int, threads: int) -> None:
 class EpochPeerBuffer:
     """Dedicated IPC storage for an epoch-tagged complete-layer kernel.
 
-    The HIP calls reuse AITER's IPC helpers; there is no second HIP runtime.
-    A caching-allocator tensor can live inside a much larger segment, and HIP
+    The memory comes from ``uncached.alloc_uncached`` (ATOM's ctypes HIP,
+    ``runtime.hip_ipc``) and its IPC handles from aiter's heap
+    (``uncached.ipc_heap``). A caching-allocator tensor can live inside a much larger segment, and HIP
     exports that complete segment rather than the small tensor view. Multiple
     exact widths would then map many GiB of unrelated storage on every peer.
     Use one page-rounded uncached allocation so the exported handle covers only
@@ -131,25 +133,25 @@ class EpochPeerBuffer:
         self.storage = None
         failure = None
         try:
-            self.local_address = _ipc_heap().alloc_uncached(nbytes)
+            # kept until the process exits (``mono.runtime.uncached``)
+            self.local_address = alloc_uncached(nbytes)
             device = torch.device("cuda", torch.cuda.current_device())
             self.storage = torch.as_tensor(
-                _DeviceBytes(self.local_address, nbytes), device=device
+                DeviceBytes(self.local_address, nbytes), device=device
             )
             mine = None
             if npes > 1:
                 mine = (
-                    _ipc_heap().get_mem_handle_bytes(self.local_address),
+                    ipc_heap().get_mem_handle_bytes(self.local_address),
                     0,
                 )
         # HIP allocation/export failures use backend-specific exception types;
         # capture all of them so every TP rank reaches the agreement below.
         except Exception as error:  # noqa: BLE001
             failure = error
-        if not tp_agree(failure is None, group):
+        if not group_agree(failure is None, group):
             if self.local_address:
                 self.storage = None
-                _ipc_heap().free_device_mem(self.local_address)
                 self.local_address = 0
             raise MonoUnsupported(
                 "epoch peer allocation/export failed on a TP rank"
@@ -164,19 +166,18 @@ class EpochPeerBuffer:
                     if peer == rank:
                         addresses.append(self.local_address)
                     else:
-                        mapped = _ipc_heap().open_mem_handle(handle)
+                        mapped = ipc_heap().open_mem_handle(handle)
                         self._opened.append(mapped)
                         addresses.append(mapped + offset)
             # Mapping can fail through HIP, torch, or the IPC extension; keep
             # peers in the same handshake and report one agreed refusal.
             except Exception as error:  # noqa: BLE001
                 failure = error
-            if not tp_agree(failure is None, group):
+            if not group_agree(failure is None, group):
                 for mapped in self._opened:
-                    _ipc_heap().close_mem_handle(mapped)
+                    ipc_heap().close_mem_handle(mapped)
                 self._opened.clear()
                 self.storage = None
-                _ipc_heap().free_device_mem(self.local_address)
                 self.local_address = 0
                 raise MonoUnsupported("epoch peer memory handshake failed") from failure
             dist.barrier(group=group)
@@ -188,7 +189,7 @@ class EpochPeerBuffer:
         # Device table construction can raise from either torch or HIP.
         except Exception as error:  # noqa: BLE001
             failure = error
-        if not tp_agree(failure is None, group):
+        if not group_agree(failure is None, group):
             self.close()
             raise MonoUnsupported(
                 "epoch peer address table allocation failed"
@@ -210,7 +211,7 @@ class EpochPeerBuffer:
         pending, first = [], None
         for mapped in self._opened:
             try:
-                _ipc_heap().close_mem_handle(mapped)
+                ipc_heap().close_mem_handle(mapped)
             # Close all handles even when one backend-specific close fails.
             except Exception as error:  # noqa: BLE001
                 pending.append(mapped)
@@ -220,6 +221,5 @@ class EpochPeerBuffer:
             raise first
         if self.local_address:
             self.storage = None
-            _ipc_heap().free_device_mem(self.local_address)
             self.local_address = 0
         self.addresses = None

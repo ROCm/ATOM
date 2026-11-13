@@ -23,10 +23,8 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::{
     protocols::{
-        chat::ChatCompletionRequest,
-        completion::CompletionRequest,
-        generate::GenerateRequest,
-        responses::{ResponsesGetParams, ResponsesRequest},
+        chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
+        responses::ResponsesRequest,
     },
     routers::RouterTrait,
 };
@@ -476,16 +474,26 @@ impl RouterTrait for AtomStandaloneRouter {
         &self,
         _headers: Option<&HeaderMap>,
         _response_id: &str,
-        _params: &ResponsesGetParams,
+        _query: Option<&str>,
     ) -> Response {
         Self::not_implemented("responses_get")
     }
 
-    async fn cancel_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
+    async fn cancel_response(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _response_id: &str,
+        _query: Option<&str>,
+    ) -> Response {
         Self::not_implemented("responses_cancel")
     }
 
-    async fn delete_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
+    async fn delete_response(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _response_id: &str,
+        _query: Option<&str>,
+    ) -> Response {
         Self::not_implemented("responses_delete")
     }
 
@@ -493,6 +501,7 @@ impl RouterTrait for AtomStandaloneRouter {
         &self,
         _headers: Option<&HeaderMap>,
         _response_id: &str,
+        _query: Option<&str>,
     ) -> Response {
         Self::not_implemented("responses_input_items")
     }

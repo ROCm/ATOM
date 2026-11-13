@@ -284,7 +284,7 @@ run_container_rank() {
   local rank_dir="${RUN_DIR}/rank-${rank}"
   local bin_dir="${RUN_DIR}/bin"
   local video_gid render_gid host_ionic nccl_socket_ifname
-  local mori_socket_ifname socket_ifname
+  local mori_socket_ifname gloo_socket_ifname socket_ifname
   local docker_socket_gid docker_cli docker_root
 
   mkdir -p "${rank_dir}"
@@ -308,25 +308,29 @@ EOF
   host_ionic="$(readlink -f /usr/lib/x86_64-linux-gnu/libionic.so.1 2>/dev/null || true)"
   nccl_socket_ifname="${NCCL_SOCKET_IFNAME:-}"
   mori_socket_ifname="${MORI_SOCKET_IFNAME:-}"
+  # Gloo takes a plain interface name too, so an explicit MORI one serves both.
+  gloo_socket_ifname="${GLOO_SOCKET_IFNAME:-${MORI_SOCKET_IFNAME:-}}"
   local node_ip="${IPS[rank]}"
-  if [[ -z "${nccl_socket_ifname}" || -z "${mori_socket_ifname}" ]]; then
+  if [[ -z "${nccl_socket_ifname}" || -z "${mori_socket_ifname}" || -z "${gloo_socket_ifname}" ]]; then
     # Use the interface owning this worker's Spur address (10.19.x.x on
-    # TensorWave). Both NCCL and MORI bootstrap independently autodetect an
-    # interface; either can select a network that blocks local TCP traffic.
+    # TensorWave). NCCL, MORI and gloo bootstrap independently autodetect an
+    # interface; any can select a network that blocks local TCP traffic, and
+    # gloo's pick, the hostname, resolves to 127.0.1.1, which no peer reaches.
     if ! socket_ifname="$(ip -o -4 addr show | awk -v node_ip="${node_ip}" '
       { split($4, address, "/") }
       address[1] == node_ip { sub(/@.*/, "", $2); print $2; exit }
     ')" || [[ -z "${socket_ifname}" ]]; then
-      echo "ERROR: cannot find a local IPv4 interface for Spur address ${node_ip}; set NCCL_SOCKET_IFNAME and MORI_SOCKET_IFNAME explicitly" >&2
+      echo "ERROR: cannot find a local IPv4 interface for Spur address ${node_ip}; set NCCL_SOCKET_IFNAME, MORI_SOCKET_IFNAME and GLOO_SOCKET_IFNAME explicitly" >&2
       return 2
     fi
-    # NCCL uses '=' for an exact match; MORI requires a plain interface name.
-    # Keep explicit overrides independent: NCCL also accepts lists/patterns
-    # that cannot be passed to MORI as interface names.
+    # NCCL uses '=' for an exact match; MORI and gloo require a plain interface
+    # name. Keep explicit overrides independent: NCCL also accepts
+    # lists/patterns that cannot be passed to MORI as interface names.
     nccl_socket_ifname="${nccl_socket_ifname:-=${socket_ifname}}"
     mori_socket_ifname="${mori_socket_ifname:-${socket_ifname}}"
+    gloo_socket_ifname="${gloo_socket_ifname:-${socket_ifname}}"
   fi
-  echo "[network] rank=${rank} ip=${node_ip} NCCL_SOCKET_IFNAME=${nccl_socket_ifname} MORI_SOCKET_IFNAME=${mori_socket_ifname}"
+  echo "[network] rank=${rank} ip=${node_ip} NCCL_SOCKET_IFNAME=${nccl_socket_ifname} MORI_SOCKET_IFNAME=${mori_socket_ifname} GLOO_SOCKET_IFNAME=${gloo_socket_ifname}"
 
   bounded_docker_rm "${container}"
   if [[ "${execution_phase}" != "eval" || "${EVAL_ONLY:-false}" == "true" || "${EVAL_ONLY:-false}" == "1" ]]; then
@@ -444,6 +448,7 @@ EOF
   [[ -n "${render_gid}" ]] && docker_args+=(--group-add "${render_gid}")
   [[ -n "${nccl_socket_ifname}" ]] && docker_args+=(-e NCCL_SOCKET_IFNAME="${nccl_socket_ifname}")
   [[ -n "${mori_socket_ifname}" ]] && docker_args+=(-e MORI_SOCKET_IFNAME="${mori_socket_ifname}")
+  [[ -n "${gloo_socket_ifname}" ]] && docker_args+=(-e GLOO_SOCKET_IFNAME="${gloo_socket_ifname}")
   [[ -n "${host_ionic}" && -e "${host_ionic}" ]] && docker_args+=(-v "${host_ionic}:/usr/lib/x86_64-linux-gnu/libionic.so.1:ro")
   [[ -e /usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so ]] && docker_args+=(-v /usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so:/usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so:ro)
   [[ -e /etc/libibverbs.d/ionic.driver ]] && docker_args+=(-v /etc/libibverbs.d/ionic.driver:/etc/libibverbs.d/ionic.driver:ro)

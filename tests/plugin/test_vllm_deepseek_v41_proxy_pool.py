@@ -23,6 +23,7 @@ from atom.plugin.vllm.deepseek_v41_bridge import (
     ATOM_DEEPSEEK_V41_BLOCK_SIZE,
     AtomDeepseekV41ProxyAttention,
     _v41_dummy_batch,
+    _v41_dummy_lengths,
     _v41_scheduled_batch,
     is_deepseek_v41_vllm_config,
     snapshot_v41_batch,
@@ -245,8 +246,11 @@ class TestBatchSnapshot:
             bridge._v41_request_state_slots(snapshot, _vllm_config())
 
     def test_v2_snapshot_keeps_exact_lengths_and_persistent_indices(self, monkeypatch):
+        """Until the host lengths are exact, the step's are read from the
+        device, whatever the host upper bound says."""
         from atom.plugin.vllm import req_id_passthrough_patch as passthrough
 
+        monkeypatch.setattr(passthrough, "_SERVING_SYNCHRONOUSLY", False)
         batch = SimpleNamespace(
             num_reqs=2,
             num_reqs_after_padding=4,
@@ -267,6 +271,60 @@ class TestBatchSnapshot:
         assert snapshot.req_ids == ["B", "A"]
         assert snapshot.state_slots.tolist() == [5, 2]
         assert snapshot.num_computed.tolist() == [30, 20]
+
+    @staticmethod
+    def _serving_step(monkeypatch, host_rows):
+        """A V2 step whose device tensors cannot be read: what the snapshot
+        takes then has to come from the host."""
+        from atom.plugin.vllm import req_id_passthrough_patch as passthrough
+
+        class _Unread:
+            def __getitem__(self, _key):
+                return self
+
+            def cpu(self):
+                raise AssertionError("read from the device")
+
+        rows = passthrough._HostRows()
+        rows.rows.update(host_rows)
+        monkeypatch.setattr(passthrough, "_V2_HOST_ROWS", rows)
+        monkeypatch.setattr(passthrough, "_SERVING_SYNCHRONOUSLY", True)
+        batch = SimpleNamespace(
+            num_reqs=2,
+            num_reqs_after_padding=2,
+            req_ids=["B", "A"],
+            idx_mapping_np=np.asarray([5, 2], dtype=np.int32),
+            copies_whole_table=True,
+        )
+        monkeypatch.setattr(passthrough, "get_current_input_batch", lambda: batch)
+        common = _common_attn_metadata([1, 257], [0, 0])
+        common.seq_lens = _Unread()
+        common.seq_lens_cpu_upper_bound = torch.tensor([300, 257])
+        return common
+
+    def test_a_serving_step_reads_lengths_and_page_rows_on_the_host(self, monkeypatch):
+        common = self._serving_step(
+            monkeypatch, {"B": [[11, 12, 13], [90]], "A": [[21, 22], [91]]}
+        )
+        common.block_table_tensor = None
+        snapshot = snapshot_v41_batch(common, page_group=0)
+
+        assert snapshot.num_computed.tolist() == [299, 0]
+        assert snapshot.ends.tolist() == [300, 257]
+        # Two 256-token PAGEs each; B's third block is not this step's.
+        assert snapshot.block_rows == [(11, 12), (21, 22)]
+
+    @pytest.mark.parametrize(
+        "host_rows", [{"B": [[11, 12]]}, {"B": [[11]], "A": [[21, 22]]}]
+    )
+    def test_a_row_the_host_lacks_reads_the_device_table(self, monkeypatch, host_rows):
+        """A request not among the host rows, or holding fewer blocks than
+        the step reads, sends the whole step to the device table."""
+        common = self._serving_step(monkeypatch, host_rows)
+        common.block_table_tensor = torch.tensor([[31, 32, 33], [41, 42, 43]])
+        snapshot = snapshot_v41_batch(common, page_group=0)
+
+        assert snapshot.block_rows == [(31, 32), (41, 42)]
 
     def test_scheduled_batch_fields_line_up_row_for_row(self):
         snapshot = snapshot_v41_batch(
@@ -309,9 +367,9 @@ class TestDummyBatch:
 
     def _split(self, running_tokens, max_reqs=64):
         return _v41_dummy_batch(
-            running_tokens,
-            max_req_tokens=self.MAX_REQ_TOKENS,
-            max_reqs=max_reqs,
+            _v41_dummy_lengths(
+                running_tokens, max_req_tokens=self.MAX_REQ_TOKENS, max_reqs=max_reqs
+            )
         )
 
     @pytest.mark.parametrize(
@@ -348,8 +406,7 @@ class TestDummyBatch:
         assert batch.total_tokens_num == sum(batch.num_scheduled_tokens) < 40_000
 
     def test_every_row_carries_a_token(self):
-        # `_prepare` skips zero-token rows, so an empty row would silently
-        # shrink the batch it published a width for.
+        # A request is a row with tokens: `begin_step` refuses an empty span.
         for running_tokens in (1, 3, 17, 16385):
             batch = self._split(running_tokens)
             assert min(batch.num_scheduled_tokens) >= 1
@@ -422,6 +479,22 @@ def test_the_pool_is_sized_from_the_speculation_that_is_admitted():
     config.speculative_config = spec
     # Admitted, and nothing else about the config refused along the way.
     atom_platform_module().enforce_deepseek_v41_constraints(config)
+
+
+def test_the_connector_alone_does_not_admit_prefix_caching():
+    """Prefix caching needs the state checkpoints, and so does the connector:
+    naming it without `--mamba-cache-mode align` is refused here, with that
+    one requirement."""
+    config = _vllm_config()
+    config.model_config.architectures = list(
+        config.model_config.hf_config.architectures
+    )
+    config.cache_config.enable_prefix_caching = True
+    config.kv_transfer_config = SimpleNamespace(
+        kv_connector="AtomLMCacheOffloadConnector"
+    )
+    with pytest.raises(ValueError, match="only with its state checkpoints"):
+        atom_platform_module().enforce_deepseek_v41_constraints(config)
 
 
 def atom_platform_module():

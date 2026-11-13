@@ -286,7 +286,8 @@ current multi-chunk native schedule is slower. Set `ENABLE_MONO=0` to run C1/C2
 on the production path (MTP5, AL 3.61) for an A/B.
 
 Check the server log before using a mono number: an armed run logs
-`GLM-5.2 MonoKernel on: S=<width> ...` on its first served step, and a refused
+`GLM-5.2 MonoKernel on: atom::glm5_mono_s<width>_tp<N>_...` (the kernels it
+launched, by name) on its first served step at each width, and a refused
 deployment logs `GLM-5.2 MonoKernel off: <why>` and serves on the production
 path without any other sign.
 
@@ -374,8 +375,9 @@ TP=8 CONC=2   # C2: --max-num-seqs 2
 # then run the server block above unchanged
 ```
 
-An armed run logs `GLM-5.2 MonoKernel on: S=<width> ... indexer=external` on its
-first served step at each width (`S=4` for one request, `S=8` for two).
+An armed run logs `GLM-5.2 MonoKernel on: atom::glm5_mono_s<width>_tp8_..._ix0_...` (`ix0`:
+the external indexer) on its first served step at each width (`s4` for one
+request, `s8` for two).
 
 The numbers below are C1 only; TP8 C2 has not been measured yet.
 

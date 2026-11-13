@@ -5,7 +5,10 @@ Covers the self-contained, GPU-free pieces: Markov head + Confidence head
 numerics, and SpeculativeConfig DSpark detection/routing.
 """
 
+import importlib
+import inspect
 import types
+from contextlib import nullcontext
 
 import numpy as np
 import pytest
@@ -22,7 +25,9 @@ pytest.importorskip(
 
 import torch
 
+import atom.model_ops.spec_sampling.dspark_markov_sample as dspark_markov_sample_mod
 import atom.spec_decode.drafter as mod_drafter
+from atom.model_ops import layernorm, linear
 from atom.model_ops.v4_kernels.dspark_fp8_indices import DSparkIndexBuffers
 from atom.models.deepseek_v4_dspark import (
     DSparkConfidenceHead,
@@ -30,6 +35,10 @@ from atom.models.deepseek_v4_dspark import (
     _dspark_block_sparse_attention,
     _dspark_block_topk_idxs,
 )
+from atom.spec_decode.draft_kv import draft_kv_builder
+from atom.utils import CpuGpuBuffer
+from atom.utils.block_tables import block_table_state
+from atom.utils.forward_context import AttentionMetaData
 
 
 def _block_attn(q, kv, attn_sink, valid_target, scale):
@@ -105,6 +114,42 @@ def test_semi_autoregressive_bias_changes_argmax():
     combined = base + bias
     assert int(base.argmax(-1)) == 9
     assert int(combined.argmax(-1)) == 2
+
+
+def test_the_sampled_block_chains_positions_through_the_shared_head(monkeypatch):
+    """`DSparkMarkovHead.sample_block`, the block loop Kimi-K3 samples
+    through: position k draws from x_{k-1} into its own column, at store
+    position k, with the noise counter strided by the buffers' max batch."""
+    max_bs, bs, steps, V = 4, 3, 3, 10
+    head = DSparkMarkovHead(vocab_size=V, rank=2)
+    per_row = torch.zeros(max_bs)
+    sampling = types.SimpleNamespace(
+        q_store=(None, None, None),
+        q_row_base=torch.zeros(max_bs, dtype=torch.int32),
+        temperatures=per_row,
+        top_k=per_row,
+        top_p=per_row,
+        seed=None,
+        scratch=None,
+    )
+    calls = []
+    # The op's own parameters, as its fake (which torch requires to match) has
+    # them: the registered op itself is wrapped as (*args, **kwargs).
+    signature = inspect.signature(dspark_markov_sample_mod._dspark_markov_sample_fake)
+
+    def sample(*args, **kwargs):
+        # By name, so a reordered signature cannot read the wrong inputs.
+        a = signature.bind(*args, **kwargs).arguments
+        calls.append((a["q_row_base"].shape[0], a["position"], a["noise_offset"]))
+        assert torch.equal(a["base_logits"], base_logits[:, a["position"]])
+        a["out"].copy_(a["prev_ids"] + 1)
+
+    monkeypatch.setattr(dspark_markov_sample_mod, "dspark_markov_sample", sample)
+    base_logits = torch.randn(bs, steps, V)
+    anchors = torch.tensor([0, 3, 5])
+    drafts = head.sample_block(base_logits, anchors, sampling)
+    assert torch.equal(drafts, anchors[:, None] + torch.arange(1, steps + 1))
+    assert calls == [(bs, k, k * max_bs * V) for k in range(steps)]
 
 
 def _real_hf_config_override():
@@ -592,7 +637,7 @@ def test_write_context_kv_stays_eager_and_still_writes():
     calls = []
 
     class _StageStub:
-        def write_context_kv(self, ctx_hidden, positions):
+        def write_context_kv(self, ctx_hidden, positions, slot_mapping=None):
             calls.append(ctx_hidden.shape[0])
 
     class _StubCtx:
@@ -850,6 +895,7 @@ def _proposer_with_graph_bs(
     )
     p.device = torch.device("cpu")
     p.mtp_k = mtp_k
+    p.lossless = None  # lossless sampling off: the greedy draft
     p.model = types.SimpleNamespace(
         vocab_size=1024, window_size=window, supports_block_graph=True
     )
@@ -886,7 +932,14 @@ def _install_block_halves(p, inner):
     p.model.model = inner
     p.model.prepare_block = types.MethodType(DeepseekV4DSpark.prepare_block, p.model)
     p.model.block_backbone = lambda ids, pos, num_draft: inner(ids, pos, num_draft)
-    p.model.head_and_sample = lambda out, ids, _: inner.head_and_sample(*out, ids)
+    # Which head each call asked for, `greedy` or the bound sampling.
+    p.model.greedy_heads = []
+
+    def head_and_sample(out, ids, _, *, greedy=False):
+        p.model.greedy_heads.append(greedy)
+        return inner.head_and_sample(*out, ids)
+
+    p.model.head_and_sample = head_and_sample
     return p
 
 
@@ -1052,7 +1105,7 @@ def test_propose_puts_the_pass_on_the_path_its_own_shape_is_on(monkeypatch):
 class _BareFlavor(mod_drafter.Drafter):
     """The abstract methods, stubbed. `_publish_draft_shape` reads neither."""
 
-    _resolve_mtp_k = propose = staticmethod(lambda *a, **k: None)
+    _resolve_mtp_k = _propose = staticmethod(lambda *a, **k: None)
 
 
 def _bare_drafter(dp_size):
@@ -1433,6 +1486,61 @@ def test_both_flavors_declare_one_block_pass_bound_to_the_same_halves(monkeypatc
     assert p.draft_graphs == (p.block,)
     assert p.block.forward == p._block_backbone
     assert p.block.epilogue == p._block_head
+
+
+def _armed(draws_q):
+    """A lossless stand-in: only what `propose` and the declaration read."""
+    return types.SimpleNamespace(
+        staging=types.SimpleNamespace(draws_q=draws_q, consume=lambda: None)
+    )
+
+
+def test_an_armed_drafter_declares_a_greedy_block_beside_the_sampled_one(
+    monkeypatch,
+):
+    """Armed without DP: two passes over one backbone, the sampled head in
+    ``block`` and the greedy one in ``block_greedy``. With DP the choice
+    would be per rank, so only ``block`` is declared."""
+    p = _proposer_with_graph_bs(monkeypatch)
+    assert p.block_greedy is None
+    p.lossless = _armed(True)
+    p._build_draft_graphs()
+    assert p.draft_graphs == (p.block, p.block_greedy)
+    assert p.block_greedy.forward == p.block.forward == p._block_backbone
+    assert p.block.epilogue == p._block_head
+    assert p.block_greedy.epilogue == p._block_head_greedy
+    assert p.block_greedy.label(4, 8).endswith(" greedy")
+    assert not p.block.label(4, 8).endswith(" greedy")
+
+    p = _proposer_with_graph_bs(monkeypatch)
+    _on_two_dp_ranks(p)
+    p.lossless = _armed(True)
+    p._build_draft_graphs()
+    assert p.draft_graphs == (p.block,) and p.block_greedy is None
+
+
+@pytest.mark.parametrize("draws_q", [True, False])
+def test_a_step_that_draws_no_q_replays_the_greedy_block(monkeypatch, draws_q):
+    """The pass is picked once per step and carries the anchors, the run and
+    the profiler label; only the greedy one asks the head for ``greedy``."""
+    import atom.spec_decode.dspark_proposer as mod
+
+    seen, labels = {}, []
+    p = _proposer_with_graph_bs(monkeypatch)
+    p.lossless = _armed(draws_q)
+    p._build_draft_graphs()
+    monkeypatch.setattr(
+        mod, "record_function", lambda name: labels.append(name) or nullcontext()
+    )
+    fc = _stub_forward_context(scheduled_bs=8, target_bs=8)
+    _run_propose(p, fc, 8, monkeypatch, seen)
+
+    ran, idle = (p.block, p.block_greedy) if draws_q else (p.block_greedy, p.block)
+    assert p.model.greedy_heads == [not draws_q]
+    assert ran.buffer("anchor_ids", 8).tolist() == [5] * 8
+    assert idle.buffer("anchor_ids", 8).tolist() == [0] * 8
+    (label,) = [name for name in labels if name.startswith("propose_dspark")]
+    assert (" greedy" in label) is (not draws_q)
 
 
 def test_the_backbone_gets_the_positions_the_slot_mapping_was_built_from(monkeypatch):
@@ -2093,28 +2201,26 @@ def test_sparse_attention_sizes_on_the_q_not_positions():
 # ---- the paged block's metadata build (Kimi-K3) ------------------------------
 
 
-def test_paged_mla_drafts_keep_the_historical_layer_num_lookup():
-    """The proposer used to read ``layers[0].self_attn.mla_attn.layer_num``.
-
-    That lookup is the base default, so an MLA draft that does not override
-    it still resolves its paged KV. Only a different module layout overrides.
-    """
-    from atom.models.deepseek_v4_dspark import DeepseekV4DSpark
-    from atom.models.deepseek_v41.dspark import DeepseekV41DSpark
+def test_first_attention_layer_num_follows_the_kv_binding():
+    """The base reads ``layers[0].self_attn.kv.layer_num``, the
+    ``KVCacheBinding`` the GQA drafts bind their pool on; the MLA draft binds
+    on ``mla_attn`` and keeps its own lookup."""
     from atom.models.dspark_draft import DSparkDraftModel
     from atom.models.kimi_k3_dspark import KimiK3DSpark
+    from atom.models.kimi_k3_dspark_gqa import KimiK3DSparkGQA
     from atom.models.minimax_m3.dspark import MiniMaxM3DSpark
     from atom.spec_decode.dspark_proposer import DSparkProposer
 
     attn = types.SimpleNamespace(layer_num=17)
-    layer = types.SimpleNamespace(self_attn=types.SimpleNamespace(mla_attn=attn))
+    gqa_layer = types.SimpleNamespace(self_attn=types.SimpleNamespace(kv=attn))
+    mla_layer = types.SimpleNamespace(self_attn=types.SimpleNamespace(mla_attn=attn))
 
-    class _MlaDraft(DSparkDraftModel):
+    class _GqaDraft(DSparkDraftModel):
         def __init__(self):
             super().__init__()
-            self.layers = [layer]
+            self.layers = [gqa_layer]
 
-    draft = _MlaDraft()
+    draft = _GqaDraft()
     assert draft.first_attention_layer_num == 17
     cache = types.SimpleNamespace(k_cache=torch.zeros(2))
     proposer = DSparkProposer.__new__(DSparkProposer)
@@ -2125,31 +2231,124 @@ def test_paged_mla_drafts_keep_the_historical_layer_num_lookup():
         )
         is cache.k_cache
     )
-    # Kimi-K3 is that MLA layout. MiniMax-M3.1 binds a plain KV cache and
-    # must keep its own override; inheriting the default would look up
-    # ``mla_attn`` and fail.
-    assert (
-        KimiK3DSpark.first_attention_layer_num
-        is DSparkDraftModel.first_attention_layer_num
-    )
-    for draft_cls in (DeepseekV4DSpark, DeepseekV41DSpark):
+    for draft_cls in (KimiK3DSparkGQA, MiniMaxM3DSpark):
         assert (
             draft_cls.first_attention_layer_num
             is DSparkDraftModel.first_attention_layer_num
         ), draft_cls.__name__
-    assert (
-        MiniMaxM3DSpark.first_attention_layer_num
-        is not DSparkDraftModel.first_attention_layer_num
+    mla = KimiK3DSpark.__new__(KimiK3DSpark)
+    torch.nn.Module.__init__(mla)
+    mla.layers = [mla_layer]
+    assert mla.first_attention_layer_num == 17
+
+
+# The non-MLA drafts' TP. MiniMax-M3.1's draft needs one KV head per rank.
+_DRAFT_TP = 4
+
+
+def _non_mla_draft(monkeypatch, module, cls_name, *, dcp, max_model_len, block_size):
+    """A non-MLA block draft at a toy width, built by its own constructor.
+
+    Returns the draft and its config. The TP group is a stand-in, and
+    `get_rope` returns a cache of `max_model_len` rows, which is all the
+    constructors read off it.
+    """
+    mod = importlib.import_module(module)
+    group = types.SimpleNamespace(rank_in_group=0, world_size=_DRAFT_TP)
+    monkeypatch.setattr(linear, "get_tp_group", lambda: group)
+    for owner in (layernorm, mod):
+        monkeypatch.setattr(
+            owner,
+            "get_tensor_model_parallel_world_size",
+            lambda: _DRAFT_TP,
+            raising=False,
+        )
+    monkeypatch.setattr(
+        mod,
+        "get_rope",
+        lambda *a, **k: types.SimpleNamespace(cos_cache=torch.zeros(max_model_len, 1)),
+    )
+    hf = types.SimpleNamespace(
+        model_type="qwen3",
+        hidden_size=64,
+        intermediate_size=128,
+        dspark_ffn_hidden_size=128,
+        hidden_act="silu",
+        num_attention_heads=8,
+        num_key_value_heads=_DRAFT_TP,
+        head_dim=16,
+        num_hidden_layers=2,
+        vocab_size=256,
+        rms_norm_eps=1e-6,
+        max_position_embeddings=max_model_len,
+        rope_theta=10000.0,
+        dspark_target_layer_ids=[1, 2],
+        dspark_noise_token_id=255,
+        dspark_markov_rank=8,
+    )
+    atom_config = types.SimpleNamespace(
+        hf_config=hf,
+        max_num_seqs=8,
+        max_model_len=max_model_len,
+        kv_cache_block_size=block_size,
+        decode_context_parallel_size=dcp,
+        kv_cache_dtype="bf16",
+        speculative_config=types.SimpleNamespace(num_speculative_tokens=7),
+    )
+    return getattr(mod, cls_name)(atom_config), hf
+
+
+def test_the_built_gqa_draft_reads_through_one_read_built_for_its_pool(
+    monkeypatch,
+):
+    """Every layer reads through one block read, built for the pool
+    `draft_kv_builder` builds (`block_size * dcp` tokens an entry, the
+    configured KV dtype) and the heads the layers project, and refuses to bind
+    any other."""
+    if not torch.cuda.is_available():
+        pytest.skip("needs a GPU: the draft's allocation cap pins its staging")
+    draft, hf = _non_mla_draft(
+        monkeypatch,
+        "atom.models.kimi_k3_dspark_gqa",
+        "KimiK3DSparkGQA",
+        dcp=8,
+        max_model_len=256,
+        block_size=128,
+    )
+    attn = draft.layers[0].self_attn
+    read = attn.block_attn
+    assert all(layer.self_attn.block_attn is read for layer in draft.layers)
+    assert (read.block_size, read.num_kv_heads, read.head_size) == (
+        128 * 8,
+        attn.num_kv_heads,
+        hf.head_dim,
+    )
+    assert read.kv_dtype == torch.bfloat16 and not read.casts_q
+    assert all(
+        layer.self_attn.kv.check_cache == read.check_cache for layer in draft.layers
     )
 
 
-def _paged_proposer(monkeypatch, *, max_model_len, block_size, bound_pool=True):
+def _paged_proposer(
+    monkeypatch,
+    *,
+    max_model_len,
+    block_size,
+    bound_pool=True,
+    model=None,
+    draft_hf=None,
+    dcp=1,
+):
     """A DSparkProposer carrying only what `_build_paged_block_metadata` reads.
 
     The two calls in it that need a GPU are replaced: the Triton index
     generator by a recorder, and the aiter work planner by a no-op. Everything
     the tests below look at -- slots, context lengths, the borrowed column -- is
     decided before either runs.
+
+    `model` is a built draft in place of the MLA stand-in, with `draft_hf` its
+    config; its builder comes from `draft_kv_builder`, as in the proposer's
+    `__init__`. `dcp` is the target's DCP size; this proposer is rank 0.
     """
     import atom.model_ops.attentions.aiter_mla as mod_mla
     import atom.spec_decode.dspark_proposer as mod
@@ -2158,7 +2357,7 @@ def _paged_proposer(monkeypatch, *, max_model_len, block_size, bound_pool=True):
     p = DSparkProposer.__new__(DSparkProposer)
     p.device = torch.device("cpu")
     p.mtp_k = 7
-    p.dcp_world_size = 1
+    p.dcp_world_size = dcp
     p.dcp_rank = 0
     p.config = types.SimpleNamespace(
         max_num_seqs=8,
@@ -2166,17 +2365,39 @@ def _paged_proposer(monkeypatch, *, max_model_len, block_size, bound_pool=True):
         kv_cache_dtype="auto",
     )
     p.dtype = torch.bfloat16
-    p.model = types.SimpleNamespace(window_size=None, block_attention_is_mla=True)
+    p.model = model
+    if model is None:
+        p.model = types.SimpleNamespace(
+            window_size=None,
+            block_attention_is_mla=True,
+            kv_pool_spec=None,
+        )
     n_cols = max_model_len // block_size
-    block_tables = torch.zeros(p.config.max_num_seqs, n_cols, dtype=torch.int32)
+    tables = CpuGpuBuffer(
+        p.config.max_num_seqs,
+        n_cols,
+        dtype=torch.int32,
+        device=p.device,
+        pin_memory=False,
+    )
+    block_tables = tables.gpu
     p.runner = types.SimpleNamespace(
         block_size=block_size,
+        world_size=_DRAFT_TP,
+        config=types.SimpleNamespace(
+            kv_cache_dtype="bf16",
+            decode_context_parallel_size=dcp,
+            kv_cache_block_size=block_size,
+        ),
+        drafter=p,
         forward_vars={
-            "block_tables": types.SimpleNamespace(gpu=block_tables),
+            "block_tables": tables,
             "batch_info": types.SimpleNamespace(gpu=torch.zeros(3, dtype=torch.int32)),
         },
     )
     p._init_draft_block_buffers()
+    if model is not None:
+        p.runner.draft_kv_builder = draft_kv_builder(p.runner, draft_hf, model)
 
     # The pool predicate reads a bound k_cache off the draft's first layer.
     k_cache = torch.zeros(4) if bound_pool else torch.zeros(0)
@@ -2319,8 +2540,8 @@ def test_the_borrowed_page_is_given_back_even_when_the_generator_raises(monkeypa
 def test_the_metadata_build_is_gated_on_the_pool_not_on_the_dummy_flag(monkeypatch):
     """`is_dummy_run` covers two passes and only one of them lacks a pool.
 
-    `warmup_model()` runs before `allocate_kv_cache()`; `dummy_execution()`'s
-    DP-alignment step is a dummy whose pool is fully bound. Returning early on
+    `warmup_model()` runs before `allocate_kv_cache()`; a dynamic-chunking
+    profile runs after it, its pool fully bound. Returning early on
     the flag leaves a replay writing through the last real step's slots.
     """
     T = 7
@@ -2340,11 +2561,11 @@ def test_the_metadata_build_is_gated_on_the_pool_not_on_the_dummy_flag(monkeypat
         assert stale is not expect_written, f"pool bound={bound}: slots stale={stale}"
 
 
-def test_a_dp_sync_dummy_describes_every_row_of_the_block_as_pad(monkeypatch):
-    """The dummy has to RUN -- the peers mirror its collectives -- but its one
-    sequence is fabricated and its block table is [0], so no row of it owns a
-    page. Describing it as pad is what makes the pass write nothing, and the
-    width must not shrink: `scheduled_bs` still slices the ids the caller gets.
+def test_rows_past_scheduled_bs_are_described_as_pad(monkeypatch):
+    """Every row past `scheduled_bs` is described as pad, all of them for a
+    step that schedules none (an idle DP rank's, which still runs for its
+    peers' collectives), and the width does not shrink: `scheduled_bs` slices
+    the caller's ids.
     """
     p, _, _ = _paged_proposer(monkeypatch, max_model_len=256, block_size=64)
     T = p.draft_tokens_per_seq
@@ -2361,23 +2582,24 @@ def test_a_dp_sync_dummy_describes_every_row_of_the_block_as_pad(monkeypatch):
         type(p), "_publish_draft_shape", lambda self, *a, **k: None, raising=False
     )
     monkeypatch.setattr(type(p), "verify_scheduler", None, raising=False)
-    p.block = types.SimpleNamespace(
+    block = types.SimpleNamespace(
         label=lambda s, r: f"bs={s}/{r}",
         run=lambda bs, **staged: (torch.zeros(bs, T, dtype=torch.int32), None),
     )
 
-    for dummy, expect in ((False, 1), (True, 0)):
-        fc = _paged_fc(is_dummy_run=dummy)
+    for scheduled_bs in (1, 0):
+        fc = _paged_fc()
         fc.context.running_bs = 4
         out = p._propose_with_draft(
+            block,
             fc,
             fc.attn_metadata,
             {"anchor_positions": torch.zeros(4, dtype=torch.int64)},
-            1,
+            scheduled_bs,
         )
-        assert seen["described_bs"] == expect, f"is_dummy_run={dummy}"
+        assert seen["described_bs"] == scheduled_bs
         assert seen["rows"] == 4, "the width is the agreed batch either way"
-        assert out.shape == (1, T), "the ids are still sliced to the real rows"
+        assert out.shape == (scheduled_bs, T), "the ids are sliced to real rows"
 
 
 def _persistent_probe(monkeypatch, *, page_size, dcp_world_size, dcp_persistent):
@@ -2466,7 +2688,10 @@ def test_the_premise_check_passes_the_configuration_k3_actually_ships(monkeypatc
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
-def test_staged_anchors_clamp_the_id_and_repeat_the_last_row_into_the_pad():
+@pytest.mark.parametrize("scheduled_bs", [4, 0])
+def test_staged_anchors_clamp_the_id_and_zero_the_pad(scheduled_bs):
+    """A row past `scheduled_bs` is token 0 at position 0, a step with no
+    scheduled row included."""
     from atom.spec_decode.dspark_proposer import _stage_anchors_kernel
 
     running_bs, vocab_max = 6, 99
@@ -2476,10 +2701,17 @@ def test_staged_anchors_clamp_the_id_and_repeat_the_last_row_into_the_pad():
     ids = torch.full((running_bs,), -7, dtype=torch.int32, device="cuda")
     anchor_positions = torch.full((running_bs,), -7, dtype=torch.int64, device="cuda")
     _stage_anchors_kernel[(running_bs,)](
-        ids, anchor_positions, next_ids, positions, rows, 4, vocab_max
+        ids,
+        anchor_positions,
+        next_ids[:scheduled_bs],
+        positions,
+        rows[:scheduled_bs],
+        scheduled_bs,
+        vocab_max,
     )
-    assert ids.tolist() == [5, 0, 99, 7, 7, 7]
-    assert anchor_positions.tolist() == [6, 15, 27, 39, 39, 39]
+    pad = [0] * (running_bs - scheduled_bs)
+    assert ids.tolist() == [5, 0, 99, 7][:scheduled_bs] + pad
+    assert anchor_positions.tolist() == [6, 15, 27, 39][:scheduled_bs] + pad
 
 
 def test_page16_table_expands_every_page_into_its_eight_sub_pages():
@@ -2545,3 +2777,416 @@ def test_minimax_m31_dspark_refuses_tp_below_its_kv_heads(monkeypatch, tp):
     config = types.SimpleNamespace(num_attention_heads=64, num_key_value_heads=4)
     with pytest.raises(ValueError, match="needs TP >= 4"):
         m3_dspark.M3DSparkAttention(None, config, None, layer_num=0)
+
+
+# ---- shared across the DSpark drafts: aux capture, slots, block plan ------
+#
+# `DSparkProposer` contracts every draft goes through, checked against the
+# real draft classes (Kimi-K3 MLA, Kimi-K3 GQA, MiniMax-M3.1, V4.1).
+
+
+def _dspark_proposer_config(**kwargs):
+    """The config `DSparkProposer.aux_capture_spec` reads: a DSpark draft
+    tapping target layers 7 and 11 of a 16-wide target."""
+    return types.SimpleNamespace(
+        hf_config=types.SimpleNamespace(hidden_size=16),
+        speculative_config=types.SimpleNamespace(
+            use_dspark=lambda: True,
+            draft_model_hf_config=types.SimpleNamespace(
+                dspark_target_layer_ids=[7, 11]
+            ),
+        ),
+        **kwargs,
+    )
+
+
+def test_k3_dspark_mla_draft_resolves_to_the_generic_extractor():
+    """(b) REGRESSION GUARD. The Inferact MLA draft must NOT get the aggregate.
+
+    `Inferact/Kimi-K3-DSpark` was trained through vLLM/HF against the plain
+    residual stream. Measured, the aggregate costs it ~2.6 pp acceptance -- and
+    it is the draft `.github/benchmark/models_accuracy.json` tracks. It keeps
+    the prefix by not implementing the hook at all.
+    """
+    dspark = importlib.import_module("atom.models.kimi_k3_dspark")
+    proposer_mod = importlib.import_module("atom.spec_decode.dspark_proposer")
+    DSparkProposer = proposer_mod.DSparkProposer
+
+    assert not hasattr(dspark.KimiK3DSpark, "target_aux_capture_spec")
+
+    # ...and that absence must actually route it to the generic extractor.
+    proposer = DSparkProposer.__new__(DSparkProposer)
+    proposer.model = dspark.KimiK3DSpark.__new__(dspark.KimiK3DSpark)
+    proposer.config = _dspark_proposer_config()
+    spec = proposer._aux_capture_spec()
+    assert spec.extract is DSparkProposer._extract_layer_hidden
+    assert spec.capture == "output"
+    assert spec.layer_ids == (7, 11)
+
+
+def test_dsv41_dspark_still_owns_its_input_tap():
+    """(c) The signature widening must not disturb the other implementor.
+
+    V4.1 reads its feature off the tapped block's own input and needs nothing
+    from the target's layer stack; it takes the argument and ignores it. Pinned
+    because the call site passes it POSITIONALLY to every implementor -- there
+    is no `inspect.signature` sniffing that could quietly skip it.
+    """
+    v41 = importlib.import_module("atom.models.deepseek_v41.dspark")
+    model = v41.DeepseekV41DSpark.__new__(v41.DeepseekV41DSpark)
+    model.config = types.SimpleNamespace(engram_layer_ids=[1, 2, 3])
+
+    # V4.1 ignores the target's layers; any stack will do.
+    layers = [types.SimpleNamespace(layer_idx=i) for i in range(16)]
+    spec = model.target_aux_capture_spec((37, 38, 39), 7168, layers)
+    assert spec.layer_ids == (37, 38, 39)
+    assert spec.hidden_size == 7168
+    assert spec.capture == "input"
+    assert spec.extract is v41.DeepseekV41DSpark._target_layer_input
+
+    # The Engram guard still fires, i.e. the extra argument did not shift the
+    # ones it reads.
+    with pytest.raises(ValueError, match="Engram"):
+        model.target_aux_capture_spec((1, 37), 7168, layers)
+
+
+def test_dspark_proposer_hands_the_target_layers_to_the_draft():
+    """The call site passes the target's layer stack through, positionally.
+
+    This is the plumbing the K3 aggregate needs: without it the draft cannot
+    reach layer `lid + 1`'s scoring weights, and the feature silently degrades
+    to the prefix.
+    """
+    proposer_mod = importlib.import_module("atom.spec_decode.dspark_proposer")
+    from atom.spec_decode.drafter import AuxCaptureSpec
+
+    seen = {}
+
+    def own(layer_ids, hidden_size, target_layers):
+        seen.update(
+            layer_ids=layer_ids, hidden_size=hidden_size, target_layers=target_layers
+        )
+        return AuxCaptureSpec(layer_ids, hidden_size, lambda output, block: None)
+
+    proposer = proposer_mod.DSparkProposer.__new__(proposer_mod.DSparkProposer)
+    proposer.model = types.SimpleNamespace(target_aux_capture_spec=own)
+    proposer.config = _dspark_proposer_config()
+    target = types.SimpleNamespace(
+        layers=[types.SimpleNamespace(layer_idx=i) for i in range(16)]
+    )
+    proposer.runner = types.SimpleNamespace(model=target)
+
+    proposer._aux_capture_spec()
+    assert seen["layer_ids"] == (7, 11)
+    assert seen["hidden_size"] == 16
+    assert seen["target_layers"] is target.layers
+
+
+def test_dspark_proposer_refuses_a_drafts_own_spec_under_pp_before_reading_layers():
+    """Under PP a drafterless stage can only rebuild the default spec, so a
+    draft with its own contract is refused -- before the target's layers are
+    resolved, which a non-last stage may not even have."""
+    proposer_mod = importlib.import_module("atom.spec_decode.dspark_proposer")
+    calls = []
+
+    proposer = proposer_mod.DSparkProposer.__new__(proposer_mod.DSparkProposer)
+    proposer.model = types.SimpleNamespace(
+        target_aux_capture_spec=lambda *args: calls.append(args)
+    )
+    proposer.config = _dspark_proposer_config(pipeline_parallel_size=2)
+
+    with pytest.raises(NotImplementedError, match="pipeline parallelism"):
+        proposer._aux_capture_spec()
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "module,cls_name,sharded",
+    [
+        ("atom.models.kimi_k3_dspark", "KimiK3DSpark", True),
+        ("atom.models.kimi_k3_dspark_gqa", "KimiK3DSparkGQA", False),
+        ("atom.models.minimax_m3.dspark", "MiniMaxM3DSpark", True),
+    ],
+)
+def test_dcp_sharding_is_read_from_the_pool_spec(module, cls_name, sharded):
+    """Whether the draft addresses in per-rank terms comes from the same
+    declaration that shapes its pool."""
+    proposer = importlib.import_module("atom.spec_decode.dspark_proposer")
+    draft_cls = getattr(importlib.import_module(module), cls_name)
+    stub = types.SimpleNamespace(dcp_world_size=8, model=draft_cls)
+    assert proposer.DSparkProposer._draft_is_dcp_sharded.fget(stub) is sharded
+    stub.dcp_world_size = 1
+    assert proposer.DSparkProposer._draft_is_dcp_sharded.fget(stub) is False
+
+
+def _compute_draft_kv(
+    kv_pool_spec,
+    n_tok,
+    n_rows=None,
+    target_slots=True,
+    publish_ctx_slots=True,
+    dcp=8,
+):
+    """Drive the real `compute_draft_kv`; return what reached the model."""
+    import torch
+
+    proposer = importlib.import_module("atom.spec_decode.dspark_proposer")
+    from atom.utils import CpuGpuBuffer
+    from atom.utils.forward_context import RoundService
+
+    slots = CpuGpuBuffer(16, dtype=torch.int64, device="cpu", pin_memory=False)
+    slots.gpu.copy_(torch.arange(16) + 100)
+    seen = {}
+    stub = types.SimpleNamespace(
+        config=types.SimpleNamespace(
+            kv_cache_block_size=128, decode_context_parallel_size=dcp
+        ),
+        # Two taps, so the trim is checked on each before the concat.
+        aux_for=lambda h: [h, h + 1],
+        runner=types.SimpleNamespace(
+            forward_vars={"draft_ctx_slots": slots} if publish_ctx_slots else {}
+        ),
+        model=types.SimpleNamespace(
+            kv_pool_spec=kv_pool_spec,
+            write_context_kv=lambda aux, pos, slot_mapping: seen.update(
+                aux=aux, pos=pos.shape[0], slots=slot_mapping
+            ),
+        ),
+    )
+    fwd = types.SimpleNamespace(
+        context=types.SimpleNamespace(scheduled_bs=1),
+        attn_metadata=types.SimpleNamespace(
+            slot_mapping=torch.arange(16) + 500 if target_slots else None,
+            served_by_round=RoundService.NONE,
+        ),
+    )
+    orig = proposer.get_forward_context
+    proposer.get_forward_context = lambda: fwd
+    try:
+        proposer.DSparkProposer.compute_draft_kv(
+            stub, torch.arange(n_tok), torch.zeros(n_rows or n_tok, 4), None
+        )
+    finally:
+        proposer.get_forward_context = orig
+    return seen
+
+
+def test_the_proposer_hands_a_pooled_draft_its_own_slots():
+    """Under DCP a draft with a declared pool gets the builder's slots, one
+    per row."""
+    from atom.spec_decode.draft_kv import DraftKvPoolSpec
+
+    seen = _compute_draft_kv(DraftKvPoolSpec(), 5)
+    assert seen["aux"].shape == (5, 8)
+    assert seen["slots"].tolist() == [100, 101, 102, 103, 104]
+
+
+def test_a_pooled_draft_at_dcp1_writes_through_the_target_slots():
+    """At DCP 1 the target's slots address the draft's pool, so it is handed
+    those, and the builder publishes none of its own."""
+    from atom.spec_decode.draft_kv import DraftKvPoolSpec
+
+    seen = _compute_draft_kv(DraftKvPoolSpec(), 5, dcp=1, publish_ctx_slots=False)
+    assert seen["slots"].tolist() == [500, 501, 502, 503, 504]
+
+
+def test_a_pooled_draft_on_a_builder_without_ctx_slots_is_named():
+    """A draft that declares a pool needs the target's builder to publish
+    `draft_ctx_slots`; a builder that does not is named, not a KeyError."""
+    from atom.spec_decode.draft_kv import DraftKvPoolSpec
+
+    with pytest.raises(RuntimeError, match="draft_ctx_slots"):
+        _compute_draft_kv(DraftKvPoolSpec(), 5, publish_ctx_slots=False)
+
+
+def test_the_proposer_hands_other_drafts_the_target_slots():
+    """Every other draft writes at the target forward's slots, one per row;
+    a target whose metadata has none (V4.1) hands its positional draft None."""
+    assert _compute_draft_kv(None, 5)["slots"].tolist() == [500, 501, 502, 503, 504]
+    assert _compute_draft_kv(None, 5, target_slots=False)["slots"] is None
+
+
+@pytest.mark.parametrize("pooled", [True, False])
+def test_the_proposer_drops_padded_target_rows(pooled):
+    """Under TR_HYBRID the target runs `running_tokens` hidden rows but only
+    the scheduled rows have positions; only those rows reach any draft."""
+    import torch
+
+    from atom.spec_decode.draft_kv import DraftKvPoolSpec
+
+    spec = DraftKvPoolSpec() if pooled else None
+    seen = _compute_draft_kv(spec, 9, n_rows=12)
+    assert seen["pos"] == 9 and seen["slots"].numel() == 9
+    zeros = torch.zeros(9, 4)
+    assert torch.equal(seen["aux"], torch.cat([zeros, zeros + 1], dim=-1))
+
+
+# The two non-MLA block drafts: the K3 GQA draft under DCP 8, whose entry is
+# `block_size * 8` and whose pool is outside the DCP group, and MiniMax-M3.1,
+# which refuses DCP. `caps_in_place`: the GQA draft caps `ctx_lens` itself,
+# M3.1 caps its per-row lengths and leaves `ctx_lens` as the proposer built it.
+_NON_MLA_DRAFTS = [
+    pytest.param(
+        "atom.models.kimi_k3_dspark_gqa", "KimiK3DSparkGQA", 8, True, id="k3_gqa"
+    ),
+    pytest.param(
+        "atom.models.minimax_m3.dspark", "MiniMaxM3DSpark", 1, False, id="minimax_m31"
+    ),
+]
+
+
+@pytest.mark.parametrize("module,cls_name,dcp,caps_in_place", _NON_MLA_DRAFTS)
+def test_non_mla_block_drafts_skip_the_csr_and_the_mla_plan(
+    monkeypatch, module, cls_name, dcp, caps_in_place
+):
+    """The real `_build_paged_block_metadata` and `prepare_paged_block` of a
+    built non-MLA block draft.
+
+    The slots are at the draft's entry width, in global terms, and the pad row
+    reads one block. The draft drops the writes past each request's allocation
+    and caps the read to it. The path returns before the CSR generator and the
+    MLA plan, which a non-MLA read never consumes, so the CSR fields stay None.
+    """
+    proposer = importlib.import_module("atom.spec_decode.dspark_proposer")
+    mod_mla = importlib.import_module("atom.model_ops.attentions.aiter_mla")
+    block_size = 128
+    draft, hf = _non_mla_draft(
+        monkeypatch,
+        module,
+        cls_name,
+        dcp=dcp,
+        max_model_len=2 * block_size,
+        block_size=block_size,
+    )
+    p, _, _ = _paged_proposer(
+        monkeypatch,
+        max_model_len=2 * block_size,
+        block_size=block_size,
+        model=draft,
+        draft_hf=hf,
+        dcp=dcp,
+    )
+
+    def _no_csr(*a, **k):
+        raise AssertionError("a non-MLA block draft built the CSR or the MLA plan")
+
+    monkeypatch.setattr(proposer, "kv_indices_generate_triton", _no_csr)
+    monkeypatch.setattr(mod_mla, "get_mla_metadata_v1", _no_csr)
+
+    e = block_size * dcp
+    T = p.draft_tokens_per_seq
+    # Row 0 holds one entry and its block crosses into a second; row 1 stays
+    # inside its two; row 2's block runs past the table; row 3 is a pad row.
+    tables = p.runner.forward_vars["block_tables"]
+    block_table_state(tables).prepare([[5], [8, 9], [3, 4]], pad_to=4)
+    tables.copy_to_gpu()
+    md = AttentionMetaData()
+    p._build_paged_block_metadata(
+        _paged_fc(),
+        md,
+        torch.tensor([e - 2, e + 3, 2 * e - 2, 0]),
+        scheduled_bs=3,
+        max_seqlen_k=4 * e,
+    )
+
+    assert md.slot_mapping.view(4, T).tolist() == [
+        [6 * e - 1] + [-1] * (T - 1),
+        [9 * e + 4 + i for i in range(T)],
+        [5 * e - 1] + [-1] * (T - 1),
+        [-1] * T,
+    ]
+    # Each row's KV is its anchor + 1 + T, and a pad row's one block.
+    lens = [e - 1 + T, e + 4 + T, 2 * e - 1 + T, 1 + T]
+    capped = [e, e + 4 + T, 2 * e, 1 + T]
+    if caps_in_place:
+        assert md.context_lens.tolist() == capped
+    else:
+        assert md.context_lens.tolist() == lens
+        assert md.dspark_ctx_rows.tolist() == [n for n in capped for _ in range(T)]
+    assert md.causal is False
+    assert md.kv_indices is None and md.kv_indptr is None
+
+
+def test_lossless_sampling_arms_on_the_built_gqa_draft(monkeypatch):
+    """`DSparkLossless.arm` accepts the built `KimiK3DSparkGQA` under DCP 8:
+    the flavor declares a sampled block, its block is as wide as the verify,
+    and the fused sampled op runs its Markov tables."""
+    if not torch.cuda.is_available():
+        pytest.skip("needs a GPU: the fused op's weight check wants CUDA tables")
+    proposer = importlib.import_module("atom.spec_decode.dspark_proposer")
+    dspark_lossless = importlib.import_module("atom.spec_decode.dspark_lossless")
+    monkeypatch.setenv("ATOM_SPEC_LOSSLESS_SAMPLING", "1")
+    monkeypatch.delenv("ATOM_ENABLE_RELAXED_MTP", raising=False)
+    # A unit test has no PCP group; PCP 1 is the deployment under test.
+    monkeypatch.setattr(dspark_lossless, "get_pcp_world_size", lambda: 1)
+    draft, _ = _non_mla_draft(
+        monkeypatch,
+        "atom.models.kimi_k3_dspark_gqa",
+        "KimiK3DSparkGQA",
+        dcp=8,
+        max_model_len=256,
+        block_size=128,
+    )
+    # The served Markov tables: bf16, on the GPU.
+    draft.markov_head.to("cuda", torch.bfloat16)
+    p = proposer.DSparkProposer.__new__(proposer.DSparkProposer)
+    p.config = types.SimpleNamespace(
+        max_num_seqs=8,
+        pipeline_parallel_size=1,
+        kv_transfer_config={},
+        enable_rapidserve=False,
+        disagg_is_decode=False,
+    )
+    p.speculative_config = types.SimpleNamespace(synthetic_acceptance_rates=None)
+    p.device = torch.device("cuda")
+    p.runner = types.SimpleNamespace(rank=0)
+    p.metadata_buffers = {}
+    p.mtp_k = 7
+    p.model = draft
+
+    assert draft.supports_lossless_draft
+    assert p.draft_tokens_per_seq == p.mtp_k
+    assert dspark_lossless.lossless_unsupported_reason(p) is None
+    assert dspark_lossless.DSparkLossless.arm(p) is not None
+
+
+@pytest.mark.parametrize(
+    "module,cls_name,is_mla",
+    [
+        ("atom.models.kimi_k3_dspark", "KimiK3DSpark", True),
+        ("atom.models.kimi_k3_dspark_gqa", "KimiK3DSparkGQA", False),
+        ("atom.models.minimax_m3.dspark", "MiniMaxM3DSpark", False),
+    ],
+)
+def test_csr_buffers_are_allocated_only_for_mla_block_plans(module, cls_name, is_mla):
+    """Only the MLA block plan builds a CSR (`_blk_kv_indices` is max_bs x
+    max_model_len). A non-MLA draft returns from `_build_paged_block_metadata`
+    before the CSR build, so it gets none of the CSR buffers."""
+    torch = pytest.importorskip("torch")
+    proposer = importlib.import_module("atom.spec_decode.dspark_proposer")
+    draft_cls = getattr(importlib.import_module(module), cls_name)
+    assert draft_cls.block_attention_is_mla is is_mla
+
+    p = proposer.DSparkProposer.__new__(proposer.DSparkProposer)
+    p.config = types.SimpleNamespace(
+        max_num_seqs=8, max_model_len=4096, max_num_batched_tokens=1024
+    )
+    p.device = torch.device("cpu")
+    p.mtp_k = 7
+    p.model = types.SimpleNamespace(
+        block_attention_is_mla=draft_cls.block_attention_is_mla,
+        kv_pool_spec=draft_cls.kv_pool_spec,
+    )
+    p._init_draft_block_buffers()
+
+    csr = (
+        "_blk_kv_indices",
+        "_blk_kv_indptr",
+        "_blk_last_page_lens",
+        "_blk_saved_page0",
+    )
+    if is_mla:
+        assert p._blk_kv_indices.numel() == 8 * (4096 + 7)
+        assert all(hasattr(p, name) for name in csr)
+    else:
+        assert not any(hasattr(p, name) for name in csr)

@@ -26,7 +26,7 @@ push, and the mailbox tag tells the two layers apart. Between steps the region
 is zeroed and peer-fenced (``StepMailboxes.begin_step``).
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -34,6 +34,7 @@ from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import gpu, range_constexpr
 from flydsl.expr.typing import Int32, Int64, T
 
+from atom.models.kimi_k3.mono.kernels import token_groups
 from atom.models.kimi_k3.mono.kernels.attention.kda import (
     _SOURCES,
     COLS,
@@ -42,13 +43,18 @@ from atom.models.kimi_k3.mono.kernels.attention.kda import (
     NA,
     PROJ,
     ROWS,
+    TG,
+    groups,
+    seam_moves,
     stage_gate,
     stage_mix,
     stage_slice,
 )
+from atom.mono.device import gemv
 from atom.mono.device.ops import (
-    CM_NT,
+    bf2_f32,
     bf16_round,
+    kernel_symbol,
     mfma_bf16,
     row_sum,
     rsrc,
@@ -57,9 +63,9 @@ from atom.mono.device.ops import (
 from atom.mono.device.ranks import peer_bases, sum_partials
 from atom.mono.device.stamps import stamp, stamp_begin, stamp_flush
 from atom.mono.device.sync import Mailbox, preg, sreg
-from atom.mono.plan.build_key import key_tuple
+from atom.mono.plan.build_key import key_tuple, symbol_params
 from atom.mono.plan.execution import BLOCKS, THREADS, WAVES
-from atom.mono.plan.layout import pair_layout
+from atom.mono.plan.layout import PAIR_BYTES, pair_layout
 from atom.mono.runtime.abi import KernelAbi
 
 TP = 8
@@ -76,11 +82,13 @@ _STREAM = fx.Stream(None)
 
 @dataclass(frozen=True)
 class AttnPostBuild:
-    tokens: int
-    nblocks: int  # the MLP AttnRes block sources
+    # ``sym``: the field's short name in the kernel symbol (``symbol_params``)
+    tokens: int = field(metadata={"sym": "s"})
+    # the MLP AttnRes block sources
+    nblocks: int = field(metadata={"sym": "nb"})
     eps: float = 1e-5
     out_eps: float = 1e-5
-    timeline: bool = False
+    timeline: bool = field(default=False, metadata={"sym": "t"})
 
 
 ABI = KernelAbi(
@@ -104,13 +112,43 @@ ABI = KernelAbi(
 )
 
 
+# o_proj's all-reduce in two halves: a column's partials go to the rank owning
+# its OWN_COLS (OWN_TASKS of the AttnRes tasks), whose sum, rank order, goes to
+# every rank (``stage_reduce``). A rank pushes each peer an eighth of what
+# pushing every partial to every rank took.
+OWN_COLS = HIDDEN // TP  # 896
+OWN_TASKS = OWN_COLS // COLS  # 7
+
+
 def ar_pairs(s):
-    """The AR region: [src rank][token][column pair]."""
-    return TP * s * HIDDEN // 2
+    """The AR region, the partials of a rank's own columns: [token group][src
+    rank][token][column pair of OWN_COLS]."""
+    return TP * s * OWN_COLS // 2
+
+
+def dg_pairs(s):
+    """The DG region, the owners' reduced deltas: [token][column pair]."""
+    return s * HIDDEN // 2
+
+
+def group_view(c, g: int):
+    """``c`` seen from token group g (``token_groups.group_view``): the AttnRes
+    seam's moves (``kda.seam_moves``) plus o_proj's, the group's core rows,
+    its block of AR and its rows of DG (every peer's copy and this rank's)."""
+    rows, regions = seam_moves(c)
+    own = tuple(
+        (region + side, pairs * PAIR_BYTES)
+        for region, pairs in (("ar", ar_pairs(TG)), ("dg", dg_pairs(TG)))
+        for side in ("_peer", "_own")
+    )
+    return token_groups.group_view(
+        c, g, rows + ((("args", "core"), OK * 2),), regions + own
+    )
 
 
 def peer_bytes(max_tokens):
-    return ar_pairs(max_tokens) * 8
+    """The standalone launch's peer regions: AR, then DG."""
+    return (ar_pairs(max_tokens) + dg_pairs(max_tokens)) * 8
 
 
 def scratch_layout(key: AttnPostBuild) -> dict:
@@ -119,7 +157,7 @@ def scratch_layout(key: AttnPostBuild) -> dict:
         "part": NA * s * ns * 2,
         "wgt": s * (ns + 1),
         "msq": NA * s,
-        "xrdy": NA,
+        "xrdy": NA * groups(s),
     }
     return pair_layout(pairs.items())
 
@@ -128,32 +166,24 @@ def scratch_bytes(key: AttnPostBuild) -> int:
     return max(o + n for o, n in scratch_layout(key).values())
 
 
-def o_loads(c, rg):
-    """Rows 16 rg .. of o_proj, this wave's K chunks (wave, wave + 8 < 12): a lane
-    64 B of its row a chunk."""
+def o_task_or(own, task):
+    """o_proj task ``task`` while it exists, else the CTA's ``own`` task: the
+    round a CTA skips loads its own slab again (cache hits), not the last
+    task's slab on every such CTA at once."""
+    return (task < OTASKS).select(task, own)
+
+
+def o_loads(c, rg, paired=False):
+    """Rows 16 rg .. of o_proj, this wave's K chunks (wave, wave + 8 < 12),
+    ``gemv.chunk_ops``' each."""
     lane, wave = c["lane"], c["wave"]
     r_w = rsrc(c["args"]["w_o"])
-    row = rg * ROWS + lane % ROWS
-    g = lane // ROWS
-    out = []
-    for i in range(2):
-        ch = fx.min(wave + WAVES * i, OKCH - 1)
-        base = (row * OK + ch * 128 + g * 8) // 2
-        out.append(
-            [
-                fx.Vector(
-                    bo.buffer_load(
-                        r_w,
-                        base + 16 * q,
-                        vec_width=4,
-                        dtype=T.i32,
-                        cache_modifier=CM_NT,
-                    )
-                )
-                for q in range(4)
-            ]
+    return [
+        gemv.chunk_ops(
+            r_w, rg * ROWS, OK, fx.min(wave + WAVES * i, OKCH - 1) * 128, lane, paired
         )
-    return out
+        for i in range(2)
+    ]
 
 
 @traced
@@ -176,8 +206,8 @@ def load_core(c):
 
 @traced
 def stage_o(c, rg, ops):
-    """Rows 16 rg ..: GEMV -> bf16 partials -> every rank's AR region, this
-    rank's slot (thread: token, row pair; a put a peer)."""
+    """Rows 16 rg ..: GEMV -> bf16 partials -> the AR region of the rank owning
+    these columns, this rank's slot (thread: token, row pair)."""
     s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
     g = lane // ROWS
     t = fx.min(lane % ROWS, s - 1)
@@ -207,39 +237,53 @@ def stage_o(c, rg, ops):
         rp = tid % (ROWS // 2)
         v0 = bf16_round(row_sum(red, 2 * rp, tt))
         v1 = bf16_round(row_sum(red, 2 * rp + 1, tt))
-        at = (c["rank"] * s + tt) * HIDDEN + rg * ROWS + 2 * rp
+        groups_own = OWN_COLS // ROWS
         for p in range_constexpr(TP):
-            c["put_bf"](c["ar_peer"][p], at, [v0, v1])
+            if rg // groups_own == p:
+                at = (c["rank"] * s + tt) * OWN_COLS + (rg - p * groups_own) * ROWS
+                c["put_bf"](c["ar_peer"][p], at + 2 * rp, [v0, v1])
     gpu.barrier()
 
 
 @traced
 def stage_reduce(c, task):
-    """Columns 128 task ..: the 8 ranks' partials, rank order, -> bf16 delta in
-    LDS (thread: token, column pair).
+    """Columns 128 task .. -> bf16 delta in LDS (thread: token, column pair).
+    Their owner (``OWN_COLS``) sums the 8 ranks' partials (AR, rank order)
+    and sends the sum to every rank's DG; every other rank reads it there.
 
-    There are ``s * COLS / 2`` work items and ``THREADS`` threads, so the block
-    covers them in one pass only while ``s <= THREADS / (COLS / 2)`` -- which is
-    8. The pass is therefore strided: a wider step used to leave every token
-    from 8 on with **no delta at all**, i.e. whatever the last stage left in
-    ``delta_lds``. A build up to 8 rows takes exactly one iteration.
+    There are ``s * COLS / 2`` work items and ``THREADS`` threads, so the pass
+    is strided past 8 rows.
     """
     s, tid = c["S"], c["tid"]
     n = s * (COLS // 2)
+    owner = task // OWN_TASKS == c["rank"]
     for i in range_constexpr((n + THREADS - 1) // THREADS):
         e = tid + THREADS * i
         if e < n:
             t = e // (COLS // 2)
             cp = e % (COLS // 2)
             col = task * COLS + 2 * cp
-            lo, hi = sum_partials(
-                c["poll"],
-                c["ar_own"],
-                lambda src, t=t, col=col: ((src * s + t) * HIDDEN + col) // 2,
-                TP,
-            )
-            fx.ptr_store(bf16_round(lo), c["delta_lds"] + (t * COLS + 2 * cp))
-            fx.ptr_store(bf16_round(hi), c["delta_lds"] + (t * COLS + 2 * cp + 1))
+            # defined before the traced ``if``: a name its branches bind is
+            # not seen past it
+            lo, hi = fx.Float32(0.0), fx.Float32(0.0)
+            if owner:
+                lo, hi = sum_partials(
+                    c["poll"],
+                    c["ar_own"],
+                    lambda src, t=t, col=col: (
+                        (src * s + t) * OWN_COLS + col - c["rank"] * OWN_COLS
+                    )
+                    // 2,
+                    TP,
+                )
+                lo, hi = bf16_round(lo), bf16_round(hi)
+                for p in range_constexpr(TP):
+                    c["put_bf"](c["dg_peer"][p], t * HIDDEN + col, [lo, hi])
+            else:
+                w = c["poll"]([(c["dg_own"], (t * HIDDEN + col) // 2, 1)])[0][0]
+                lo, hi = bf2_f32(w)
+            fx.ptr_store(lo, c["delta_lds"] + (t * COLS + 2 * cp))
+            fx.ptr_store(hi, c["delta_lds"] + (t * COLS + 2 * cp + 1))
     gpu.barrier()
 
 
@@ -263,7 +307,7 @@ def build(key: AttnPostBuild):
         tls: fx.Array[fx.Int64, TL_POINTS, 16]
 
     keyed = key_tuple(key, _SOURCES)
-    name = f"k3_mono_attn_post_s{s}_nb{key.nblocks}_t{int(key.timeline)}"
+    name = kernel_symbol("k3_mono_attn_post", **symbol_params(key))
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def attn_post(
@@ -312,6 +356,8 @@ def build(key: AttnPostBuild):
             "xbuf": x_out,
             "ar_peer": [preg(b, 0, "ar") for b in bases],
             "ar_own": preg(load_own(peers, rank), 0, "ar"),
+            "dg_peer": [preg(b, ar_pairs(s) * 8, "dg") for b in bases],
+            "dg_own": preg(load_own(peers, rank), ar_pairs(s) * 8, "dg"),
             "args": {
                 "core": core,
                 "w_o": w_o,
@@ -332,7 +378,7 @@ def build(key: AttnPostBuild):
         if bid >= GEMV0:
             gi = bid - GEMV0
             # every task's weights in flight first: nothing here polls
-            ops = [o_loads(c, fx.min(gi + GEMV_N * j, OTASKS - 1)) for j in range(3)]
+            ops = [o_loads(c, o_task_or(gi, gi + GEMV_N * j)) for j in range(3)]
             load_core(c)
             stamp(on, tls, tid, 1)
             for j in range_constexpr(3):

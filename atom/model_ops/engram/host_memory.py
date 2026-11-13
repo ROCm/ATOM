@@ -12,6 +12,9 @@ In-place registrations go through a process-wide, reference-counted set of
 page runs (`_PageRuns`): ranges are widened to page boundaries, so ranges
 stored back to back (a layer's scales right before its values) share a page,
 and HIP refuses to register a range overlapping one already registered.
+Gaps are registered in 1 GiB pieces, and a table every DP-attention rank
+shares registers and unregisters under a per-checkpoint file lock
+(`_register_lock_file`), one process at a time.
 
 Every refused or failed HIP call clears HIP's last error (`_clear_hip_error`):
 HIP also leaves it as the runtime's sticky last error, which torch raises at
@@ -21,7 +24,8 @@ meant to allow.
 Ownership: each returned tensor's storage holds the lease on its memory, so
 the memory is released when the last tensor viewing it is collected -- never
 while one is alive, and not leaked when its owner is dropped without an
-explicit release.
+explicit release. In-place runs are also `mlock`ed while registered and
+unlocked with their last reference (`_PageRuns`).
 
 Release and the device: `hipHostFree` synchronizes the device before freeing,
 and an in-place registration synchronizes before unregistering, so kernels
@@ -32,12 +36,19 @@ at load, before capture, or at exit. A release that would have to synchronize
 during a capture is skipped, with a warning, rather than breaking it.
 """
 
+import contextlib
 import ctypes
+import dataclasses
+import errno
+import fcntl
 import functools
+import hashlib
 import logging
 import os
+import resource
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, wait
 
 import numpy as np
@@ -50,6 +61,7 @@ logger = logging.getLogger("atom")
 _PAGE = 4096
 _MADV_DONTNEED = 4
 _MADV_POPULATE_READ = 22  # Linux 5.14+; elsewhere EINVAL, and nothing is lost
+_MLOCK_ONFAULT = 1
 # `hipHostRegisterReadOnly`: the GPU only reads the range. Needed for a range
 # the process cannot write (the shared read-only checkpoint mapping), which
 # the default flags would ask to map writable.
@@ -73,6 +85,48 @@ _MIN_COPY_THREADS = 8
 # source is still mapped before it is dropped (`_source_dropper`).
 _CHUNK_BYTES = 256 << 20
 _MAX_COPY_THREADS = 16
+# Largest single cudaHostRegister. One ioctl covering a whole Engram table
+# does not return when several ranks issue it together.
+_REG_CHUNK_BYTES = 1 << 30
+# How long a waiter tolerates a registration lock whose holder shows no
+# progress (the holder touches the file after every faulted-in piece and every
+# registered chunk) before giving up. Once a path has timed out it is never
+# waited on again in this process.
+_REG_LOCK_TIMEOUT_S = 600
+_logged_lock_paths: set[str] = set()
+_timed_out_lock_paths: set[str] = set()
+# Descriptors of the registration lock files this process holds. Fault-in
+# worker threads touch them, so the list and each touch are under the lock: a
+# descriptor leaves the list before it is closed and is never touched after.
+_held_lock_fds: list[int] = []
+_held_lock_fds_lock = threading.Lock()
+
+
+def _lock_heartbeat() -> None:
+    """Touch the held registration lock files, so waiters see progress."""
+    with _held_lock_fds_lock:
+        for fd in _held_lock_fds:
+            with contextlib.suppress(OSError):
+                os.utime(fd)
+
+
+@functools.cache
+def _libc():
+    """This process's libc, with the calls used here declared once."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+    libc.mlock2.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+    libc.munlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    libc.prctl.argtypes = [ctypes.c_int] + [ctypes.c_ulong] * 4
+    return libc
+
+
+def _page_span(t: torch.Tensor) -> tuple[int, int]:
+    """`[lo, hi)`: the whole pages `t`'s bytes lie on."""
+    base = t.data_ptr()
+    lo = base - base % _PAGE
+    hi = -(-(base + t.numel() * t.element_size()) // _PAGE) * _PAGE
+    return lo, hi
 
 
 @functools.cache
@@ -123,6 +177,41 @@ def _hip_runtime():
     return None
 
 
+@functools.cache
+def _host_get_device_pointer():
+    """`hipHostGetDevicePointer` of the HIP runtime that page-locks
+    (`_hip_runtime`), resolved once; None without one."""
+    hip = _hip_runtime()
+    fn = None if hip is None else getattr(hip, "hipHostGetDevicePointer", None)
+    if fn is not None:
+        fn.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_uint]
+    return fn
+
+
+def device_address(
+    host_ptr: int, base: int | None = None, *, identity_without_hip: bool = False
+) -> int:
+    """The device's address of `host_ptr`, a byte of the page-locked host
+    range starting at `base` (default: `host_ptr` itself). Not always the host
+    address: memory registered in place is mapped at another device address,
+    and a kernel handed the host one faults.
+
+    Without a HIP runtime to ask it raises, or with `identity_without_hip`
+    returns `host_ptr` itself (where the caller's host memory is read at its
+    host address: copies the HIP allocator page-locked, or no device at all)."""
+    fn = _host_get_device_pointer()
+    if fn is None:
+        if identity_without_hip:
+            return host_ptr
+        raise RuntimeError("no HIP runtime loaded: no device address of host memory")
+    base = host_ptr if base is None else base
+    dev = ctypes.c_void_p()
+    rc = fn(ctypes.byref(dev), base, 0)
+    if rc != 0 or not dev.value:
+        raise RuntimeError(f"hipHostGetDevicePointer({base:#x}) failed ({rc})")
+    return dev.value + (host_ptr - base)
+
+
 def _clear_hip_error() -> None:
     """Reset HIP's last error after a refused or failed call.
 
@@ -162,7 +251,6 @@ class _HipHostAllocator:
         ]
         self._free.argtypes = [ctypes.c_void_p]
         self._prctl = libc.prctl
-        self._prctl.argtypes = [ctypes.c_int] + [ctypes.c_ulong] * 4
 
     def alloc(self, nbytes: int) -> int | None:
         was = self._prctl(_PR_GET_THP_DISABLE, 0, 0, 0, 0)
@@ -193,7 +281,7 @@ def _host_allocator():
     if hip is None:
         return None
     try:
-        return _HipHostAllocator(hip, ctypes.CDLL(None, use_errno=True))
+        return _HipHostAllocator(hip, _libc())
     except (OSError, AttributeError):
         logger.warning("engram: hipHostMalloc unavailable", exc_info=True)
         return None
@@ -386,8 +474,7 @@ def _source_dropper(src: torch.Tensor):
         pagemap = os.open("/proc/self/pagemap", os.O_RDONLY)
     except OSError:
         return None
-    libc = ctypes.CDLL(None, use_errno=True)
-    libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+    libc = _libc()
 
     def unmodified(lo: int, hi: int) -> bool:
         first, count = lo // _PAGE, (hi - lo) // _PAGE
@@ -465,7 +552,7 @@ def _as_bytes(t: torch.Tensor) -> torch.Tensor:
 
 
 def pin_rows(
-    sources: list[torch.Tensor], shared: bool = False
+    sources: list[torch.Tensor], shared: bool = False, copy: bool = False
 ) -> tuple[torch.Tensor, ...] | None:
     """`sources` (contiguous row ranges) as page-locked tensors of the same
     dtype and shape, owning their memory; all-or-nothing.
@@ -474,25 +561,28 @@ def pin_rows(
     page-locks too. Unless `ATOM_ENGRAM_UVA_COPY` says otherwise they are then
     registered in place (`copies`), and copied only if that is refused.
 
+    `copy` copies whatever `ATOM_ENGRAM_UVA_COPY` and `shared` say, and never
+    registers in place, not even without an allocator.
+
     None, with everything taken released, on any failure -- no memory, a
     refused registration, no thread to copy on -- so the TP group can fall
     back as one.
     """
-    plan = ["copy"] if copies(shared) else ["register"]
+    plan = ["copy"] if copy or copies(shared) else ["register"]
     if shared and _COPY_ENV not in os.environ:
         plan.append("copy")
     for how in plan:
         allocator = _host_allocator() if how == "copy" else None
         if how == "copy" and allocator is None:
-            if "register" in plan:
-                break  # registering was refused already
+            if copy or "register" in plan:
+                break  # registering is not wanted, or was refused already
             how = "register"
         leases: list[_Lease] = []
         try:
             if how == "copy":
                 out = _copy(allocator, sources, leases)
             else:
-                out = _register(sources, leases)
+                out = _register(sources, leases, shared=shared)
         except Exception:  # any failure is a fallback
             logger.warning("engram: page-locking the UVA shard failed", exc_info=True)
             out = None
@@ -545,8 +635,151 @@ def _read_only(lo: int, hi: int) -> bool:
     return False
 
 
+def _reg_chunk_bytes() -> int:
+    """Largest single `cudaHostRegister`, in bytes."""
+    return _REG_CHUNK_BYTES
+
+
+def _mapping_path(addr: int) -> str | None:
+    """Regular file mapped at `addr` (`/proc/self/maps`), or None."""
+    try:
+        with open("/proc/self/maps") as maps:
+            for line in maps:
+                fields = line.split(maxsplit=5)
+                lo, hi = (int(x, 16) for x in fields[0].split("-"))
+                if not lo <= addr < hi:
+                    continue
+                name = fields[5].strip() if len(fields) > 5 else ""
+                if name.startswith("/") and not name.startswith("/dev/"):
+                    return name
+                return None
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def _registration_lock_path(sources) -> str:
+    """Lock file for `sources`.
+
+    `ATOM_ENGRAM_REG_LOCK`, when set. Otherwise one file per checkpoint under
+    `/dev/shm`, so two servers loading different checkpoints do not share it.
+    """
+    explicit = envs.ATOM_ENGRAM_REG_LOCK
+    if explicit:
+        return explicit
+    mapped = _mapping_path(sources[0].data_ptr()) if sources else None
+    key = os.path.realpath(mapped) if mapped else "anonymous"
+    digest = hashlib.sha256(key.encode()).hexdigest()[:16]
+    return f"/dev/shm/engram-uva-{digest}.lock"
+
+
+def _flock_logging_wait(fd: int, path: str) -> None:
+    """Exclusive `flock` on `fd`.
+
+    A wait is logged. It is bounded by the holder's progress, not by its
+    total hold time: the holder touches the file after every faulted-in piece
+    and every registered chunk, and only `_REG_LOCK_TIMEOUT_S` without a
+    touch raises `TimeoutError` (an `OSError` subclass; callers must not
+    swallow it with `except OSError`).
+    """
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return
+    except BlockingIOError:
+        pass
+    logger.info("engram: waiting for %s; another process is page-locking", path)
+    start = time.monotonic()
+    wait_from = time.time()
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            last = max(wait_from, os.fstat(fd).st_mtime)
+            if time.time() - last >= _REG_LOCK_TIMEOUT_S:
+                logger.error(
+                    "engram: gave up on %s: its holder made no progress for "
+                    "%d s; not waiting on it again in this process",
+                    path,
+                    _REG_LOCK_TIMEOUT_S,
+                )
+                raise TimeoutError(
+                    f"engram registration lock {path}: holder made no progress "
+                    f"for {_REG_LOCK_TIMEOUT_S}s"
+                )
+            time.sleep(0.05)
+        else:
+            logger.info("engram: took %s after %.1f s", path, time.monotonic() - start)
+            return
+
+
+@contextlib.contextmanager
+def _register_lock_file(path: str):
+    """Hold the registration lock file `path`.
+
+    A file that cannot be opened or locked is logged and skipped. The `yield`
+    is outside the `except`, so an error during registration is not chained
+    onto that failure. A holder that makes no progress for
+    `_REG_LOCK_TIMEOUT_S` raises `TimeoutError`, and after that the path is
+    never waited on again in this process: every later call raises at once.
+    """
+    if path in _timed_out_lock_paths:
+        raise TimeoutError(f"engram registration lock {path} timed out earlier")
+    fd = None
+    held = False
+    open_error = None
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o666)
+    except OSError as exc:
+        open_error = exc
+    if open_error is not None:
+        logger.warning(
+            "engram: cannot open registration lock %s (%s); page-locking without it",
+            path,
+            open_error,
+        )
+    else:
+        if path not in _logged_lock_paths:
+            _logged_lock_paths.add(path)
+            logger.info("engram: page-locking serialized on %s", path)
+        try:
+            _flock_logging_wait(fd, path)
+        except TimeoutError:
+            _timed_out_lock_paths.add(path)
+            os.close(fd)
+            fd = None
+            raise
+        except OSError as exc:
+            logger.warning(
+                "engram: cannot lock %s (%s); page-locking without it", path, exc
+            )
+        else:
+            held = True
+            with _held_lock_fds_lock:
+                _held_lock_fds.append(fd)
+            _lock_heartbeat()
+    try:
+        yield
+    finally:
+        if held:
+            with _held_lock_fds_lock:
+                _held_lock_fds.remove(fd)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        if fd is not None:
+            os.close(fd)
+
+
+@dataclasses.dataclass
+class _Run:
+    """One in-place registration `[base, end)` and its references."""
+
+    end: int
+    refs: int
+
+
 class _PageRuns:
-    """This process's in-place page-locked runs, reference-counted.
+    """This process's in-place page-locked runs, reference-counted, each
+    `mlock`ed for as long as it is registered.
 
     `cudaHostRegister` needs page boundaries and refuses a range overlapping
     one already registered. Ranges stored back to back share their boundary
@@ -555,48 +788,102 @@ class _PageRuns:
     registers both whole -- so each range takes a reference on the runs that
     cover it and registers only the gaps between them. A run is unregistered
     with its last reference.
+
+    Why the `mlock`: a registration pins page-cache pages through a KFD
+    userptr BO, which the kernel still treats as reclaimable. Under host
+    memory pressure kswapd reclaim touches them, and every such MMU notifier
+    evicts all of the process's GPU queues until the BO is revalidated --
+    decode stalls of seconds, or a hang. `mlock` keeps reclaim off the pages;
+    kcompactd still migrates locked pages, firing the same notifier, unless
+    `vm.compact_unevictable_allowed=0`. Runs never overlap, so a run is
+    locked when it is created (`_fault_and_lock`, which also faults it in)
+    and unlocked when its last reference goes, before it is unregistered. A
+    refused lock warns; the registration stands.
     """
 
     def __init__(self):
-        self._runs: dict[int, list[int]] = {}  # base -> [end, references]
+        self._runs: dict[int, _Run] = {}
         self._lock = threading.RLock()
 
     def acquire(self, rt, lo: int, hi: int, flags: int = 0) -> list[int] | None:
         """References on the runs covering `[lo, hi)` (page-aligned), the
-        uncovered gaps registered first; None, holding nothing, if HIP
-        refuses one."""
+        uncovered gaps locked and registered first, in `_REG_CHUNK_BYTES`
+        pieces; None, holding nothing, if HIP refuses one. A read-only range
+        (`flags`) is faulted in even where its lock is refused. Rollback goes
+        through `_release_locked` and does not take the registration lock."""
         with self._lock:
             held: list[int] = []
+            created = created_bytes = 0
             cursor = lo
             overlapping = sorted(
-                b for b, (e, _) in self._runs.items() if b < hi and e > lo
+                b for b, run in self._runs.items() if b < hi and run.end > lo
             )
             for base in [*overlapping, None]:
                 gap_end = hi if base is None else base
                 if cursor < gap_end:
-                    if int(rt.cudaHostRegister(cursor, gap_end - cursor, flags)):
-                        _clear_hip_error()
-                        self.release(rt, held)
-                        return None
-                    self._runs[cursor] = [gap_end, 1]
-                    held.append(cursor)
+                    read_only = bool(flags & _HOST_REGISTER_READ_ONLY)
+                    _fault_and_lock(cursor, gap_end, read_only)
+                    c = cursor
+                    while c < gap_end:
+                        e = min(gap_end, c + _reg_chunk_bytes())
+                        logger.debug(
+                            "engram: cudaHostRegister %.2f GiB", (e - c) / 2**30
+                        )
+                        if int(rt.cudaHostRegister(c, e - c, flags)):
+                            _clear_hip_error()
+                            _libc().munlock(c, gap_end - c)
+                            self._release_locked(rt, held)
+                            return None
+                        self._runs[c] = _Run(e, 1)
+                        held.append(c)
+                        created += 1
+                        created_bytes += e - c
+                        _lock_heartbeat()
+                        c = e
                 if base is None:
                     break
-                self._runs[base][1] += 1
+                self._runs[base].refs += 1
                 held.append(base)
-                cursor = max(cursor, self._runs[base][0])
+                cursor = max(cursor, self._runs[base].end)
+            if created_bytes >= _REG_CHUNK_BYTES:
+                logger.info(
+                    "engram: registered %.2f GiB in-place as %d userptr BO(s)",
+                    created_bytes / 2**30,
+                    created,
+                )
             return held
 
-    def release(self, rt, bases) -> None:
+    def release(self, rt, bases, lock_path: str | None = None) -> None:
+        """Drop references taken by `acquire`. Lock order: the registration
+        lock file `lock_path` (a shared registration), then `self._lock`.
+
+        Best effort: if the lock file times out the runs are released without
+        it, so they never stay registered and locked for the process's life.
+        """
+        if lock_path:
+            try:
+                with _register_lock_file(lock_path), self._lock:
+                    self._release_locked(rt, bases)
+                return
+            except TimeoutError:
+                logger.warning(
+                    "engram: unregistering without %s, which timed out", lock_path
+                )
         with self._lock:
-            for base in bases:
-                run = self._runs[base]
-                run[1] -= 1
-                if run[1] == 0:
-                    del self._runs[base]
-                    if int(rt.cudaHostUnregister(base) or 0):
-                        _clear_hip_error()
-                        logger.warning("engram: cudaHostUnregister failed")
+            self._release_locked(rt, bases)
+
+    def _release_locked(self, rt, bases) -> None:
+        """`release` with `self._lock` already held by the caller."""
+        for base in bases:
+            run = self._runs[base]
+            run.refs -= 1
+            if run.refs == 0:
+                del self._runs[base]
+                _libc().munlock(base, run.end - base)
+                if int(rt.cudaHostUnregister(base) or 0):
+                    _clear_hip_error()
+                    logger.warning("engram: cudaHostUnregister failed")
+                _lock_heartbeat()
 
     def __len__(self) -> int:
         return len(self._runs)
@@ -605,21 +892,45 @@ class _PageRuns:
 _PAGE_RUNS = _PageRuns()
 
 
-def _populate(lo: int, hi: int) -> None:
-    """Fault `[lo, hi)` in ahead of registering it, on several threads.
+def _fault_and_lock(lo: int, hi: int, populate: bool) -> None:
+    """Lock `[lo, hi)` and fault it in on several threads, ahead of
+    registering it.
 
-    Registration would otherwise fault every page itself, on one thread and
-    under the HIP runtime lock (which stalls GPU allocations elsewhere in the
-    process). Best effort: a kernel without `MADV_POPULATE_READ` declines and
-    registration faults the pages as before.
+    `mlock2(MLOCK_ONFAULT)` marks the whole range locked in one call without
+    faulting it; `MADV_POPULATE_READ` per chunk then faults the pages in, in
+    parallel, and each is locked as it arrives. (A plain `mlock` faults on
+    the calling thread, and per-chunk `mlock`s scale poorly: on a warm 8 GiB
+    shared read-only mapping, 16 threads, this takes
+    0.27 s against 0.40 s for per-chunk `mlock` and 0.49 s for populate then
+    one `mlock`; populate alone 0.15 s.) Registration would otherwise fault
+    every page itself, on one thread and under the HIP runtime lock (which
+    stalls GPU allocations elsewhere in the process). Only a read-only range
+    (`populate`) is faulted in here, as before; the rest is locked as
+    registration faults it. A kernel without `MADV_POPULATE_READ` declines
+    and registration faults the pages as before. A refused lock warns once
+    per process and the range is still faulted in.
     """
-    libc = ctypes.CDLL(None, use_errno=True)
-    libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+    if _libc().mlock2(lo, hi - lo, _MLOCK_ONFAULT) != 0:
+        _warn_unlocked(ctypes.get_errno(), hi - lo)
+    if populate:
+        _populate(lo, hi)
+
+
+def _populate(lo: int, hi: int) -> None:
+    """`MADV_POPULATE_READ` over `[lo, hi)`, one chunk per thread.
+
+    Each finished chunk touches any registration lock this process holds:
+    `acquire` faults in under the lock what reclaim took back, and on a cold
+    cache that can outlast `_REG_LOCK_TIMEOUT_S` with no chunk registered.
+    """
+    libc = _libc()
     pieces = _chunks(lo, hi - lo, _CHUNK_BYTES)
 
     def fault(piece) -> bool:
         o, n = piece
-        return libc.madvise(lo + o, n, _MADV_POPULATE_READ) == 0
+        ok = libc.madvise(lo + o, n, _MADV_POPULATE_READ) == 0
+        _lock_heartbeat()
+        return ok
 
     threads = min(copy_threads(hi - lo), len(pieces))
     if threads <= 1:
@@ -631,24 +942,59 @@ def _populate(lo: int, hi: int) -> None:
         list(pool.map(fault, pieces))
 
 
-def _register(sources, leases):
+def _warn_unlocked(err: int, nbytes: int) -> None:
+    if _UNLOCKED_WARNED:
+        return
+    _UNLOCKED_WARNED.append(True)
+    hint = ""
+    soft, _ = resource.getrlimit(resource.RLIMIT_MEMLOCK)
+    if err in (errno.EPERM, errno.ENOMEM) and soft != resource.RLIM_INFINITY:
+        hint = f"; RLIMIT_MEMLOCK is {soft / 1024**3:.2f} GiB, raise it"
+    logger.warning(
+        "engram: mlock of %.2f GiB refused (%s)%s; reclaim can then stall "
+        "the GPU queues under host memory pressure",
+        nbytes / 1024**3,
+        os.strerror(err),
+        hint,
+    )
+
+
+# Set once a refused `mlock` has been logged (`_fault_and_lock`).
+_UNLOCKED_WARNED: list = []
+
+
+def _register(sources, leases, *, shared: bool = False):
     """Register the mapping in place; each range is widened to page
     boundaries, which registration requires (the extra bytes are neighbouring
     rows the kernel never addresses), and shares any page another range of
     this process already holds (`_PageRuns`). A read-only mapping (the shared
     checkpoint mapping) is faulted in on several threads first and registered
-    read-only."""
-    rt = torch.cuda.cudart()
+    read-only.
 
-    out = []
+    A `shared` table takes the registration lock file around `acquire` and
+    the matching `release`. Its fault-in runs before the lock, so ranks read
+    the page cache concurrently; `acquire` then faults in only what reclaim
+    took back before its `mlock`."""
+    rt = torch.cuda.cudart()
+    spans = []
     for src in sources:
+        lo, hi = _page_span(src)
+        flags = _HOST_REGISTER_READ_ONLY if _read_only(lo, hi) else 0
+        if shared and flags:
+            _populate(lo, hi)
+        spans.append((lo, hi, flags))
+    if not shared:
+        return _register_spans(rt, sources, spans, leases, None)
+    lock_path = _registration_lock_path(sources)
+    with _register_lock_file(lock_path):
+        return _register_spans(rt, sources, spans, leases, lock_path)
+
+
+def _register_spans(rt, sources, spans, leases, lock_path):
+    out = []
+    for src, (lo, hi, flags) in zip(sources, spans, strict=True):
         base = src.data_ptr()
         nbytes = src.numel() * src.element_size()
-        lo = base - (base % _PAGE)
-        hi = -(-(base + nbytes) // _PAGE) * _PAGE
-        flags = _HOST_REGISTER_READ_ONLY if _read_only(lo, hi) else 0
-        if flags:
-            _populate(lo, hi)
         runs = _PAGE_RUNS.acquire(rt, lo, hi, flags)
         if runs is None:
             logger.info("engram: page-lock registration of %d bytes refused", hi - lo)
@@ -657,7 +1003,7 @@ def _register(sources, leases):
         def unregister(_ptr, runs=runs):
             if torch.cuda.is_initialized():
                 torch.cuda.synchronize()
-            _PAGE_RUNS.release(rt, runs)
+            _PAGE_RUNS.release(rt, runs, lock_path)
 
         lease = _Lease(lo, hi - lo, unregister, keep=src)
         leases.append(lease)

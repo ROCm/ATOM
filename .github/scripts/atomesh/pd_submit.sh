@@ -180,6 +180,8 @@ exports = {
     "WAIT_ROUTER_TIMEOUT": cell["wait_router_timeout"],
     "PREFILL_WORKERS": prefill.get("workers", 1),
     "DECODE_WORKERS": decode.get("workers", 1),
+    "PREFILL_NODES_PER_WORKER": prefill.get("nodes_per_worker", 1),
+    "DECODE_NODES_PER_WORKER": decode.get("nodes_per_worker", 1),
     "PREFILL_TP": prefill.get("tp", 8),
     "DECODE_TP": decode.get("tp", 8),
     "PREFILL_DCP_SIZE": prefill.get("dcp", 1),

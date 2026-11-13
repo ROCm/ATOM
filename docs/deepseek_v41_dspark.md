@@ -33,8 +33,8 @@ Fixed acceptance schedules use the common `--spec-decode-acceptance-length`
 or `--spec-decode-acceptance-rate` options and the shared rejection sampler.
 
 Not admitted: packed speculative caches, multimodal speculation,
-relaxed MTP acceptance, and speculative output token logprobs — the
-current output protocol cannot return the last of these correctly. Both target
+and relaxed MTP acceptance. Text Chat logprobs support DSpark; see
+[Chat token logprobs](chat_logprobs.md) for probability semantics and limitations. Both target
 and draft MoE reuse V4 FusedMoE. Non-speculative vision and packed cache support
 are independent of all of this.
 
