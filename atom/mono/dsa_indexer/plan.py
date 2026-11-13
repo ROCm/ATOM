@@ -16,6 +16,7 @@ by 128-key runs (``REPLICA_INTERLEAVE``: a score unit's keys stay one run).
 
 from dataclasses import dataclass
 
+from atom.model_ops.sparse_indexer_fp4 import FP4_QUANT_BLOCK_SIZE
 from atom.mono.plan.arith import sel
 from atom.mono.plan.execution import BLOCKS, WAVES
 
@@ -29,9 +30,6 @@ REPLICA_INTERLEAVE = SCORE_KEYS
 # the index RoPE the kernel rotates: dims 0 .. 63, a q lane's pair or a k
 # lane and its partner lane (``kernel.stage_k`` / ``iquant_task``)
 ROPE_DIM = 64
-# FP4: one E8M0 scale per 32 dims; a block's scale dword is 4 keys 16 apart
-FP4_GROUP = 32
-FP4_BLOCK_ROWS = 64
 
 
 @dataclass(frozen=True)
@@ -76,7 +74,7 @@ class IndexerShape:
     @property
     def scale_block_bytes(self) -> int:
         """FP4: a block's E8M0 scales, one a key and 32 dims."""
-        return self.block_rows * self.head_dim // FP4_GROUP
+        return self.block_rows * self.head_dim // FP4_QUANT_BLOCK_SIZE
 
     @property
     def weights_scale(self) -> float:
@@ -122,7 +120,9 @@ def fp4_byte(shape: IndexerShape, row, col):
     ``col + 1`` (col even; the even dim in the low nibble): the cache writer's
     32-dim chunk planes of 16 B rows (``fp4_index_block_shapes``)."""
     return (
-        (col // FP4_GROUP) * shape.block_rows * 16 + row * 16 + (col % FP4_GROUP) // 2
+        (col // FP4_QUANT_BLOCK_SIZE) * shape.block_rows * 16
+        + row * 16
+        + (col % FP4_QUANT_BLOCK_SIZE) // 2
     )
 
 
@@ -144,7 +144,9 @@ def q_fp4_byte(sh: IndexerShape, t, h, col):
 
 def q_fp4_scale(sh: IndexerShape, t, h, chunk):
     """FP4 IQ8: token t, head h's 32-dim chunk's E8M0, past the token's values."""
-    return t * sh.qrows + sh.qrows // 2 + h * (sh.head_dim // FP4_GROUP) + chunk
+    return (
+        t * sh.qrows + sh.qrows // 2 + h * (sh.head_dim // FP4_QUANT_BLOCK_SIZE) + chunk
+    )
 
 
 def unsupported(shape: IndexerShape) -> str:
@@ -154,8 +156,6 @@ def unsupported(shape: IndexerShape) -> str:
         return f"wq_b {shape.wq_dtype}: the q GEMV reads bf16"
     if shape.kv_dtype not in ("fp8", "fp4"):
         return f"{shape.kv_dtype} index cache: the scorer reads FP8 or FP4 keys"
-    if shape.fp4 and shape.block_rows != FP4_BLOCK_ROWS:
-        return f"FP4 {shape.block_rows}-row blocks: the scale plane is {FP4_BLOCK_ROWS} rows"
     if shape.fp4 and (shape.rope_dim != ROPE_DIM or shape.rope_neox):
         return "FP4 without interleaved RoPE: the FP4 writer's is the only one written"
     if shape.rope_dim not in (0, ROPE_DIM):

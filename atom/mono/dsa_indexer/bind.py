@@ -171,7 +171,7 @@ def _cache_refusal(m, shape: IndexerShape) -> str:
     if cache.numel() % shape.block_bytes or not cache.is_contiguous():
         return f"index cache {tuple(cache.shape)}"
     if shape.fp4:
-        scale = getattr(m.k_cache, "kv_cache_scale", None)
+        scale = m.k_cache.kv_cache_scale
         blocks = cache.numel() // shape.block_bytes
         if (
             scale is None
@@ -293,7 +293,7 @@ def _routed_forward(module):
             weights,
             module.prefix,
             module.k_cache.kv_cache[0],
-            getattr(module.k_cache, "kv_cache_scale", None),
+            module.k_cache.kv_cache_scale,
             module.sparse_kv_indices_buffer,
             module.dcp_sparse_kv_indptr_buffer,
             module.dcp_owned_counts_buffer,

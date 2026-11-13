@@ -7,8 +7,9 @@ the stages).
     score   (a long row's block of local keys, wave w the keys 16 w ..): the cache
             block's preshuffled rows as the MFMA's B operand (two 16 B loads a
             lane), the row's FP8 q (IQ8) as A, 4 chained 16x16x32 FP8 MFMAs a
-            16-head half, relu(dot k_scale) w_h summed in gluon's head order
-            -> ILOG (device scope), SFLAG[row, block]
+            16-head half, relu(dot k_scale) w_h summed in gluon's head order;
+            FP4 one scaled E2M1 MFMA a 16-head half, summed in the FP4
+            scorer's order (``_score_fp4``) -> ILOG (device scope), SFLAG[row, block]
     select  (a long row, one CTA; every rank the same rows): the exact global
             top-K by (score desc, rank asc, local index asc) without moving a
             candidate -- 4 radix passes of 8 bits over the merge's ordinal,
@@ -32,6 +33,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
+from atom.model_ops.sparse_indexer_fp4 import FP4_QUANT_BLOCK_SIZE
 from atom.mono.device.mx import FP4, mfma_scaled
 from atom.mono.device.ops import (
     CM_DEV,
@@ -51,7 +53,6 @@ from atom.mono.device.queue import word
 from atom.mono.device.select import INT_MIN, f32_key, u32_gt
 from atom.mono.device.sync import publish, sleep_ticks
 from atom.mono.dsa_indexer.plan import (
-    FP4_GROUP,
     SCORE_KEYS,
     TILE,
     cache_byte,
@@ -522,7 +523,7 @@ def _block_keys_fp4(c, blk, sblk, key, j):
     kv = fx.Vector(
         bo.buffer_load(
             blk,
-            fp4_byte(sh, key, FP4_GROUP * j) // 4,
+            fp4_byte(sh, key, FP4_QUANT_BLOCK_SIZE * j) // 4,
             vec_width=4,
             dtype=T.i32,
             cache_modifier=CM_DEV,
@@ -814,12 +815,13 @@ def stage_score(c, p, u0, nu, width):
         if const_expr(r + 1 < rg):
             nxt = _staged_query(c, r + 1, dg, lane)
         for i in range_constexpr(width):
-            if const_expr(not sh.fp4):
-                terms = _terms_fp8(sh, qrow, keys[i])
-            col = SCORE_KEYS * (u0 + i) + TILE * wave + lane % 16
+            # FP8 takes its column after the MFMAs; hoisting it changes FP8's code
             if const_expr(sh.fp4):
+                col = SCORE_KEYS * (u0 + i) + TILE * wave + lane % 16
                 score = _score_fp4(sh, qrow, keys[i])
             else:
+                terms = _terms_fp8(sh, qrow, keys[i])
+                col = SCORE_KEYS * (u0 + i) + TILE * wave + lane % 16
                 score = fx.Float32(head_sum(terms))
             # the row's keys alone: the next row's ILOG starts past its last
             stored = (lane < 16) & (i < nu) & (col < ns[r])
