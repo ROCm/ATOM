@@ -256,7 +256,7 @@ class EagleProposer(Drafter):
             # to. A draft whose rows are the target's latent (K2.6 EAGLE 3.1)
             # binds into the target's pool and gets None here; model_runner
             # accounts for its +1 layer via num_nextn_predict_layers.
-            builder = draft_kv_builder(self.runner, draft_model_hf_config)
+            builder = draft_kv_builder(self.runner, draft_model_hf_config, model)
             if builder is not None:
                 self.runner.draft_kv_builder = builder
             return model

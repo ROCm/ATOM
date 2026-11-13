@@ -1236,7 +1236,7 @@ def _resolve_sequential_drafter_max_spec(
 # listed; they ship inside the target checkpoint and are told by
 # `dspark_block_size`.
 _STANDALONE_DSPARK_ARCHS: frozenset[str] = frozenset(
-    {"K3DSparkModel", "DSparkMiniMaxDraftModel"}
+    {"K3DSparkModel", "DSparkMiniMaxDraftModel", "K3DSparkGQAModel"}
 )
 # Where the standalone drafts name each field ATOM reads, in lookup order:
 # Kimi-K3's top-level names, then MiniMax-M3.1's `dspark_*` names and its DFlash
@@ -1551,6 +1551,10 @@ class SpeculativeConfig:
     ) -> None:
         # Eagle3 architecture mapping (architecture-level, not model_type)
         arch = (getattr(hf_config, "architectures", None) or [""])[0]
+        # The Kimi-K3 DSpark GQA draft (a SpecForge DFlash checkpoint).
+        if arch == "DSparkDraftModel":
+            hf_config.architectures = ["K3DSparkGQAModel"]
+            arch = "K3DSparkGQAModel"
         if arch in _STANDALONE_DSPARK_ARCHS:
             _normalize_draft_dspark_config(hf_config)
             return
@@ -2168,7 +2172,7 @@ class Config:
     # "round_robin" | "least_requests" (default) | "least_tokens" |
     # "prefix_spread". Only has an effect when more than one DP engine rank is
     # launched. See atom/model_engine/engine_core_mgr.py:_select_dp_rank_locked
-    # and, for "prefix_spread", atom/model_engine/prefix_spread.py. The literal
+    # and, for "prefix_spread", atom/model_engine/dp_routing/prefix_spread.py. The literal
     # default must stay in sync with engine_core_mgr.DP_LB_DEFAULT (config.py
     # cannot import it without a cycle: engine_core_mgr imports Config).
     dp_load_balance: str = "least_requests"

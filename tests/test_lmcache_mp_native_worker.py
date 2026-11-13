@@ -5,7 +5,9 @@
 
 import copy
 import json
-from dataclasses import replace
+import sys
+import types
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 
 import pytest
@@ -46,6 +48,29 @@ from atom.model_engine.arg_utils import (
 )
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
 from atom.model_ops.attentions.deepseek_v4_replay import state_replay_tokens
+
+
+@dataclass
+class _TransferSpec:
+    token_ids: list[int]
+    block_ids: list[list[int]]
+    start: int = 0
+    end: int = 0
+    request_configs: dict | None = None
+
+
+@pytest.fixture(autouse=True)
+def fake_lmcache_transfer_spec(monkeypatch):
+    """Keep transport-contract tests independent of optional LMCache installs."""
+    lmcache = types.ModuleType("lmcache")
+    integration = types.ModuleType("lmcache.integration")
+    atom = types.ModuleType("lmcache.integration.atom")
+    atom.AtomMPTransferSpec = _TransferSpec
+    lmcache.integration = integration
+    integration.atom = atom
+    monkeypatch.setitem(sys.modules, "lmcache", lmcache)
+    monkeypatch.setitem(sys.modules, "lmcache.integration", integration)
+    monkeypatch.setitem(sys.modules, "lmcache.integration.atom", atom)
 
 
 class Future:

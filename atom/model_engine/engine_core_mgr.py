@@ -32,14 +32,19 @@ from atom.model_engine.collective_rpc import (
     checked_timeout,
     engine_budget,
 )
-from atom.model_engine.dp_policy import LoadPolicy, PrefixPolicy, SessionPolicy
-from atom.model_engine.dp_route import (
+from atom.model_engine.dp_routing.policies import (
+    LoadPolicy,
+    PrefixPolicy,
+    SessionPolicy,
+)
+from atom.model_engine.dp_routing.prefix_spread import PrefixSpreadRouter
+from atom.model_engine.dp_routing.route import (
     PREFIX_LABELS,
     PREFIX_MOVED_TOKENS,
     PREFIX_OWNER,
     Route,
 )
-from atom.model_engine.dp_routing import prefix_spread_enabled
+from atom.model_engine.dp_routing.topology import prefix_spread_enabled
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import (
     FIRE_AND_FORGET_UTILITY_CMDS,
@@ -49,7 +54,6 @@ from atom.model_engine.engine_utility import (
     kv_change,
 )
 from atom.model_engine.prefix_hash import take_shipped_chains
-from atom.model_engine.prefix_spread import PrefixSpreadRouter
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence
 from atom.observability import tracing
@@ -332,10 +336,10 @@ class CoreManager:
             "explicit_total": 0,
             "load_balanced_total": 0,
         }
-        # Prefix-spread routing (`atom/model_engine/prefix_spread.py`): keeps a
-        # request on the rank holding its prompt's prefix unless that rank has
-        # a prefill backlog and another is about to idle. Created only when
-        # this manager actually routes between eligible DP ranks.
+        # Prefix-spread routing (`atom/model_engine/dp_routing/prefix_spread.py`):
+        # keeps a request on the rank holding its prompt's prefix unless that
+        # rank has a prefill backlog and another is about to idle. Created only
+        # when this manager actually routes between eligible DP ranks.
         self._prefix_router = self._build_prefix_router(config)
         if self._prefix_router is not None:
             self._dp_route_counters.update(
@@ -1593,6 +1597,8 @@ class CoreManager:
                 "queued_prefill_tokens_per_rank": list(self._rank_tokens),
                 "session_count_per_rank": sessions_per_rank,
             }
+            if self._prefix_router is not None:
+                snapshot["prefix_index"] = self._prefix_router.index_counters()
             if PREFIX_OWNER in self._dp_route_counters:
                 snapshot["prefix_route"] = {
                     label: self._dp_route_counters[name]

@@ -15,8 +15,10 @@ attends all of them in block order (no scores needed); otherwise the ``top_block
 score, equal scores to the lower block, in rank order. The incomplete block's tokens
 ``compress * cb .. L`` are implied by the position (the consumer appends them).
 
-The indexer also owns its two caches (Atom's, paged on the KV block table, ``kv_block`` tokens a
-page): it appends each step row's raw key to ``index_raw`` [pages, kv_block, 1, head_dim] and the
+The indexer also owns its three caches (Atom's, paged on the KV block table, ``kv_block`` tokens a
+page): it appends each step row's raw key to ``index_raw`` [pages, kv_block, 1, head_dim] (and at
+the same slot its RoPE position ``L + rope_off[b] + rope_shift``, on all three MRoPE axes, to
+``rope_positions`` [pages, kv_block, 1, 3] int64; a text-only pool has none, address 0) and the
 key of a block a row completes (``4 b + 3 == L``) to ``index_cmp`` [pages, kv_block / compress, 1,
 head_dim], as Atom's ``Qwen4ExpAttention._select_tokens`` does. Nothing in the launch reads
 those rows back: the step's raw keys come from the channel.
@@ -55,7 +57,8 @@ block-table entry is no page (a padded request: ``seq_lens`` 0, table row -1): n
 written. Args: ``iqk`` (channel), ``index_raw``, ``index_cmp``, ``block_table`` [batch,
 width] int32, ``seq_lens`` [batch] int32 (tokens cached before the step), ``<prefix>_w``
 (``pack``: bf16 q norm | k norm, ``head_dim`` each) and ``rope`` ([positions, rotary_dim]
-bf16: cos then sin of the ``rotary_dim / 2`` frequencies, ``rope_table``).
+bf16: cos then sin of the ``rotary_dim / 2`` frequencies, ``rope_table``),
+``rope_positions`` (0: none).
 """
 
 from __future__ import annotations
@@ -175,8 +178,11 @@ class _Cfg:
     seq_lens: str = "seq_lens"
     weights: str = "idx_w"
     rope: str = "rope"
-    # int32 [batch]: the request's RoPE position minus its cache row (ATOM's MRoPE offset, 0 for text)
+    # int32 [batch]: the request's RoPE table row minus its cache row (ATOM's MRoPE offset, 0 for text)
     rope_off: str = "rope_off"
+    positions: str = "rope_positions"
+    # the RoPE table's row ``i`` is position ``i + rope_shift`` (``recipe.rope_tables``)
+    rope_shift: int = 0
 
     @property
     def rows(self) -> int:
@@ -389,6 +395,12 @@ def _raw_addr(k, c: _Cfg, page, token, word):
     return fx.Int64(k.args[c.raw]) + fx.Int64(row) * (DIM * 2) + fx.Int64(word * 4)
 
 
+def _pos_addr(k, c: _Cfg, page, token, axis):
+    """64-bit address of ``token``'s RoPE position on ``axis`` (int64)."""
+    row = fx.max(page, 0) * c.blk + token % c.blk
+    return fx.Int64(k.args[c.positions]) + fx.Int64(row) * (3 * 8) + fx.Int64(axis * 8)
+
+
 # ------------------------------------------------------------------ scores
 
 
@@ -595,14 +607,18 @@ def mbx_pair(a, b):
 
 
 @traced
-def _append_raw(k, c: _Cfg, row, req, pos):
-    """The last wave: row ``pos``'s raw key (from the channel) to ``index_raw``."""
+def _append_row(k, c: _Cfg, row, req, pos):
+    """The last wave: row ``pos``'s raw key (from the channel) to ``index_raw``, its RoPE position to
+    ``rope_positions`` (lanes 0 .. 2, an axis each)."""
     if k.wave == WAVES - 1:
         e0 = row * c.src_width + c.col + c.heads * DIM + 2 * k.lane
         w = chan.poll_words([(k.mb[c.src], e0 // 2, 1)], k.tag)[0][0]
         page = _page_of(k, c, req, pos // c.compress)
         if page >= 0:
             global_store(_raw_addr(k, c, page, pos, k.lane), fx.Int32(w))
+            if (k.lane < 3) & (k.args[c.positions] != 0):
+                rp = pos + uniform(ld_i32(k.args[c.rope_off], req)) + c.rope_shift
+                global_store(_pos_addr(k, c, page, pos, k.lane), fx.Int64(rp))
 
 
 # ------------------------------------------------------------------ scores on the matrix cores
@@ -857,7 +873,7 @@ def _score_body_mfma(k, t, c: _Cfg):
                     _scored_new(k, c, row, req, l0, pos, nc, cb)
             else:
                 _unscored_last(k, c, row, req, l0, pos, nc, cb)
-            _append_raw(k, c, row, req, pos)
+            _append_row(k, c, row, req, pos)
             gpu.barrier()
 
 
@@ -1005,7 +1021,8 @@ class Indexer(Block):
     index queries (``heads x head_dim``) then its raw index key, from element ``col`` of a row
     of ``iqk_width``; ``sel``: the output channel name (``Fmt.I32``, ``top_blocks`` wide);
     ``table_width``: block-table entries per request (any width; Atom passes ``max_model_len /
-    kv_block``); ``kv_block``: tokens a page of the caches."""
+    kv_block``); ``kv_block``: tokens a page of the caches; ``rope_shift``: the position of the RoPE
+    table's row 0."""
 
     name = "indexer"
 
@@ -1028,10 +1045,12 @@ class Indexer(Block):
         q_norm: str = "self_attn.indexer.q_layernorm",
         k_norm: str = "self_attn.indexer.k_layernorm",
         kv_block: int = 0,
+        rope_shift: int = 0,
     ):
         check_geometry(geo)
         self.geo = geo
         self.blk = kv_block  # tokens a page of the caches
+        self.rope_shift = rope_shift
         if not kv_block or self.blk % geo.compress:
             raise ValueError(
                 f"Indexer: kv_block {kv_block} must be a positive multiple of compress {geo.compress}"
@@ -1073,6 +1092,7 @@ class Indexer(Block):
             col=self.col,
             sel=self.sel.name,
             prefix=self.prefix,
+            rope_shift=self.rope_shift,
             **self.names,
         )
         c = replace(c, spans=default_spans(sc, c.tiles))
@@ -1107,6 +1127,7 @@ class Indexer(Block):
                     c.weights,
                     c.rope,
                     c.rope_off,
+                    c.positions,
                 ),
                 key=(c,),
             )

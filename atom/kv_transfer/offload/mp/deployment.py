@@ -9,6 +9,7 @@ namespace, and the adapters both connector halves open to the server.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import logging
@@ -16,7 +17,7 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from atom.kv_transfer.offload import config as offcfg
-from atom.model_engine.dp_routing import prefix_spread_enabled
+from atom.model_engine.dp_routing.topology import prefix_spread_enabled
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -352,17 +353,10 @@ def _make_scheduler_adapter(
             # session -> `tier_cache_salt`, for salted prompts only.
             self.cache_salts: dict[str, str] = {}
 
-        def _create_key(
-            self,
-            token_ids: list[int],
-            start: int,
-            end: int,
-            request_id: str,
-            worker_id: int | None,
-        ) -> Any:
-            key = super()._create_key(token_ids, start, end, request_id, worker_id)
+        def _create_key(self, *args: Any, **kwargs: Any) -> Any:
+            key = super()._create_key(*args, **kwargs)
             key = replace(key, num_kv_readers=num_kv_readers)
-            salt = self.cache_salts.get(request_id)
+            salt = self.cache_salts.get(key.request_id)
             return replace(key, cache_salt=salt) if salt else key
 
         def salt_session(self, request_id: str, salt: str) -> None:
@@ -392,7 +386,7 @@ def _make_worker_adapter(
     from lmcache.integration.atom import AtomMPWorkerAdapter
 
     class _SaltedWorkerAdapter(AtomMPWorkerAdapter):
-        """Salt a transfer's keys with its prompt's media (`TransferSpec`)."""
+        """Salt a transfer's keys with its prompt's media (`transfer_spec`)."""
 
         def _create_key(self, request_id: str, spec: Any) -> Any:
             key = super()._create_key(request_id, spec)
@@ -413,16 +407,22 @@ def _make_worker_adapter(
     )
 
 
-@dataclass
-class TransferSpec:
-    """What LMCache's ATOM adapter reads off an `AtomMPTransferSpec`, plus the
-    prompt's media (`LMCacheReqMeta.cache_salt`) for the key."""
+def transfer_spec(**fields: Any) -> Any:
+    """LMCache's `AtomMPTransferSpec` plus the prompt's media
+    (`LMCacheReqMeta.cache_salt`) for the key. Built on first use: LMCache is
+    imported only where a transfer is submitted."""
+    from lmcache.integration.atom import AtomMPTransferSpec
 
-    token_ids: list[int]
-    block_ids: list[list[int]]
-    start: int
-    end: int
-    cache_salt: str = ""
+    return _salted_transfer_spec(AtomMPTransferSpec)(**fields)
+
+
+@functools.cache
+def _salted_transfer_spec(base: type) -> type:
+    @dataclass
+    class TransferSpec(base):
+        cache_salt: str = ""
+
+    return TransferSpec
 
 
 def require_native_state_server(adapter: Any, config: Any) -> None:

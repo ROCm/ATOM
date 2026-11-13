@@ -8,7 +8,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from atom.model_engine.dp_route import Route
+from atom.model_engine.dp_routing.route import Route
 
 
 class LoadPolicy:

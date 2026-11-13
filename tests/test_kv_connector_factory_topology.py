@@ -177,3 +177,21 @@ def test_offload_layout_that_reads_regions_is_not_a_whole_block_copier():
 
     assert KVConnectorFactory.topology_reads_block_regions(config)
     assert not KVConnectorFactory.topology_region_readers_copy_whole_blocks(config)
+
+
+def test_mooncake_store_m3_reads_regions_dense_does_not():
+    """M3 Mooncake packs PAGE regions; its dense codec still ignores the map.
+
+    The Store copies whole blocks of every region it packs, so a PAGE layout may
+    publish extra planes (`copies_whole_block_regions=True`).
+    """
+    dense = _config({"kv_connector": "mooncake_store"})
+    m3 = _config(
+        {"kv_connector": "mooncake_store"},
+        hf_config=SimpleNamespace(model_type="minimax_m3", architectures=[]),
+    )
+
+    assert not KVConnectorFactory.topology_reads_block_regions(dense)
+    assert not KVConnectorFactory.topology_region_readers_copy_whole_blocks(dense)
+    assert KVConnectorFactory.topology_reads_block_regions(m3)
+    assert KVConnectorFactory.topology_region_readers_copy_whole_blocks(m3)

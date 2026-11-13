@@ -555,7 +555,7 @@ def test_decode_bookkeeping_does_not_wait_for_an_unrelated_router_lock():
 
 def _make_spread_mgr(n_ranks=2, tier=None):
     from atom.kv_transfer.disaggregation.factory import OffloadTierProfile
-    from atom.model_engine.prefix_spread import PrefixSpreadRouter
+    from atom.model_engine.dp_routing.prefix_spread import PrefixSpreadRouter
 
     if tier is None:
         tier = OffloadTierProfile(loads=True, min_load_tokens=8192)
@@ -579,14 +579,22 @@ def _est(mgr, seq):
     return seq.num_prompt_tokens - mgr._seq_load[seq.id][2]
 
 
-def _chain_seq(seq_id, tokens, first_block=0, session=None):
+def _rank_hits(router, chain, n):
+    return router._rank_hits(n, router._path(chain))
+
+
+def _tier_hit(router, chain):
+    return router._tier_hit(router._path(chain))
+
+
+def _chain_seq(seq_id, tokens, first_block=0, session=None, hbs=128):
     import array
 
     from atom.model_engine.prefix_hash import ShippedChain
 
     seq = _FakeSeq(seq_id, num_prompt_tokens=tokens, dp_session_id=session)
-    blocks = array.array("Q", range(first_block, first_block + tokens // 128))
-    seq.prompt_hash_chain = ShippedChain(128, 0, tokens, 0, blocks)
+    blocks = array.array("Q", range(first_block, first_block + tokens // hbs))
+    seq.prompt_hash_chain = ShippedChain(hbs, 0, tokens, 0, blocks)
     return seq
 
 
@@ -679,7 +687,7 @@ def test_history_eviction_preserves_a_producers_follower_debt():
     mgr._charge_seq_load_locked(unrelated, 1, credit=placed.credit)
     mgr._mark_seq_prefill_complete(unrelated.id)
     assert router.indexed_tokens > router.CAP  # active intervals are pinned
-    assert router._rank_hits(producer.prompt_hash_chain, 2)[0][0] == 4096
+    assert _rank_hits(router, producer.prompt_hash_chain, 2)[0][0] == 4096
     mgr._release_seq(producer.id)
     assert _est(mgr, follower) == 0
     assert mgr._seq_load[follower.id][2] == 4224
@@ -703,9 +711,9 @@ def test_reindexing_an_evicted_prefix_keeps_its_inflight_producer():
     newcomer = _chain_seq(3, 4096)
     placed = router.place(newcomer, 0, 2)
     mgr._charge_seq_load_locked(newcomer, 0, credit=placed.credit)
-    assert router._rank_hits(producer.prompt_hash_chain, 2)[1] == 0
+    assert _rank_hits(router, producer.prompt_hash_chain, 2)[1] == 0
     mgr._release_seq(newcomer.id)
-    assert router._rank_hits(producer.prompt_hash_chain, 2)[1] == 0
+    assert _rank_hits(router, producer.prompt_hash_chain, 2)[1] == 0
     mgr._release_seq(producer.id)
     assert not router.pending
     assert not router.seq_hashes
@@ -790,8 +798,8 @@ def test_compressed_prefix_domains_do_not_mix_seeds_or_block_sizes():
     chain = seq.prompt_hash_chain
     other_seed = ShippedChain(chain.hash_block_size, 1, 4096, 0, chain.hashes)
     other_blocks = ShippedChain(16, chain.cache_seed, 512, 0, chain.hashes)
-    assert router._rank_hits(other_seed, 2) == ({}, None)
-    assert router._rank_hits(other_blocks, 2) == ({}, None)
+    assert _rank_hits(router, other_seed, 2) == ({}, None)
+    assert _rank_hits(router, other_blocks, 2) == ({}, None)
 
 
 def test_reusing_a_completed_request_id_does_not_hide_its_tier_history():
@@ -805,7 +813,7 @@ def test_reusing_a_completed_request_id_does_not_hide_its_tier_history():
     new = _chain_seq(9, 8192, first_block=10000)
     placed = router.place(new, 1, 2)
     router.charge(new.id, placed.credit)
-    assert router._tier_hit(warm.prompt_hash_chain) == 8192
+    assert _tier_hit(router, warm.prompt_hash_chain) == 8192
     router.release(new.id)
     assert not router.pending
     assert not router.seq_hashes
@@ -826,9 +834,9 @@ def test_completed_reuse_does_not_refresh_the_owner_again():
     producer = _chain_seq(3, 8192)
     placed = router.place(producer, 1, 2)
     router.charge(producer.id, placed.credit)
-    assert router._rank_hits(warm.prompt_hash_chain, 2)[1] == 1
+    assert _rank_hits(router, warm.prompt_hash_chain, 2)[1] == 1
     router.prefill_complete(reuse.id)
-    assert router._rank_hits(warm.prompt_hash_chain, 2)[1] == 1
+    assert _rank_hits(router, warm.prompt_hash_chain, 2)[1] == 1
 
 
 def test_an_older_request_cannot_confirm_a_later_reindexed_producer():
@@ -849,7 +857,7 @@ def test_an_older_request_cannot_confirm_a_later_reindexed_producer():
     router.charge(producer.id, placed.credit)
     router.prefill_complete(reuse.id)
     assert router.pending
-    assert router._tier_hit(warm.prompt_hash_chain) == 0
+    assert _tier_hit(router, warm.prompt_hash_chain) == 0
     router.release(producer.id)
     assert not router.pending
     assert not router.index
@@ -1020,8 +1028,8 @@ def test_idle_ratio_load_wins_over_a_partial_prefix():
 
 def test_partial_holder_still_prefilling_is_not_an_hbm_hit():
     mgr = _dp4_idle_ratio_mgr(partial_completed=False)
-    hits, owner = mgr._prefix_router._rank_hits(
-        _chain_seq(3, 110_000).prompt_hash_chain, 4
+    hits, owner = _rank_hits(
+        mgr._prefix_router, _chain_seq(3, 110_000).prompt_hash_chain, 4
     )
     assert owner == 0 and 2 not in hits
     (rank,) = _route(mgr, [_chain_seq(3, 110_000)])
@@ -1084,13 +1092,17 @@ def test_an_aborted_move_leaves_no_hit_on_its_destination():
 
     moved(2)
     mgr._release_seq(2)  # aborted before its load
-    hits, _ = mgr._prefix_router._rank_hits(_chain_seq(9, 100_000).prompt_hash_chain, 2)
+    hits, _ = _rank_hits(
+        mgr._prefix_router, _chain_seq(9, 100_000).prompt_hash_chain, 2
+    )
     assert other not in hits
 
     moved(3)
     mgr._mark_seq_prefill_complete(3)
     mgr._release_seq(3)
-    hits, _ = mgr._prefix_router._rank_hits(_chain_seq(9, 100_000).prompt_hash_chain, 2)
+    hits, _ = _rank_hits(
+        mgr._prefix_router, _chain_seq(9, 100_000).prompt_hash_chain, 2
+    )
     assert hits.get(other) == 99_968
 
 
@@ -1106,7 +1118,7 @@ def test_a_producer_abort_hands_the_prefix_and_debt_to_its_follower():
     assert mgr._seq_load[2][2] == 110_000
     assert mgr._rank_tokens[owner] == 110_000
     router = mgr._prefix_router
-    hits, src_owner = router._rank_hits(follower.prompt_hash_chain, 2)
+    hits, src_owner = _rank_hits(router, follower.prompt_hash_chain, 2)
     assert src_owner == owner and hits[owner] == 109_952
     assert router.pending
     mgr._release_seq(1)  # repeated producer release cannot charge twice
@@ -1115,7 +1127,7 @@ def test_a_producer_abort_hands_the_prefix_and_debt_to_its_follower():
     assert not router.pending
     mgr._release_seq(2)
     assert mgr._rank_tokens[owner] == 0
-    assert router._rank_hits(follower.prompt_hash_chain, 2)[0][owner] == 109_952
+    assert _rank_hits(router, follower.prompt_hash_chain, 2)[0][owner] == 109_952
 
 
 def test_an_aborted_move_does_not_replace_a_local_prefill_producer():
@@ -1144,7 +1156,7 @@ def test_an_aborted_move_does_not_replace_a_local_prefill_producer():
         for edge, _ in router._path(local.prompt_hash_chain)
     )
     mgr._mark_seq_prefill_complete(3)
-    assert router._rank_hits(local.prompt_hash_chain, 2)[0][1] == 8192
+    assert _rank_hits(router, local.prompt_hash_chain, 2)[0][1] == 8192
 
 
 def test_a_follower_branching_inside_a_producers_range_takes_over_the_shared_prefix():
@@ -1236,8 +1248,8 @@ def test_an_abort_racing_the_first_stream_keeps_the_prefix():
     mgr._mark_seq_prefill_complete(1)  # the STREAM, on the output thread
     mgr._release_seq(1)  # the terminal output
     assert not mgr._prefix_router.prefilling(1)
-    hits, src_owner = mgr._prefix_router._rank_hits(
-        _chain_seq(9, 100_000).prompt_hash_chain, 2
+    hits, src_owner = _rank_hits(
+        mgr._prefix_router, _chain_seq(9, 100_000).prompt_hash_chain, 2
     )
     assert src_owner == owner and hits[owner] == 99_968
     assert mgr._rank_reqs == [0, 0] and mgr._rank_tokens == [0, 0]
@@ -1437,8 +1449,8 @@ def test_a_terminal_output_completes_the_prefill_only_after_forward():
 
     (owner,) = _route(mgr, [_chain_seq(2, 100_000)])
     mgr._release_terminal_seq(SimpleNamespace(id=2, prefill_completed=True))
-    hits, src_owner = mgr._prefix_router._rank_hits(
-        _chain_seq(9, 100_000).prompt_hash_chain, 2
+    hits, src_owner = _rank_hits(
+        mgr._prefix_router, _chain_seq(9, 100_000).prompt_hash_chain, 2
     )
     assert src_owner == owner and hits[owner] == 99_968
     assert mgr._rank_reqs == [0, 0] and mgr._rank_tokens == [0, 0]
@@ -1495,11 +1507,11 @@ def test_a_pending_restore_makes_its_target_the_provisional_owner():
     probe = _chain_seq(9, 65536).prompt_hash_chain
     # While the move's load is in flight its target is the prefix's newest
     # (provisional) holder: followers reuse it there instead of loading again.
-    hits, actual_owner = mgr._prefix_router._rank_hits(probe, 2)
+    hits, actual_owner = _rank_hits(mgr._prefix_router, probe, 2)
     assert actual_owner == target
     assert hits[owner] == 65536
     mgr._mark_seq_prefill_complete(2)
-    hits, _ = mgr._prefix_router._rank_hits(probe, 2)
+    hits, _ = _rank_hits(mgr._prefix_router, probe, 2)
     assert hits[target] == 65536
 
 
@@ -1528,7 +1540,7 @@ def test_a_follower_completing_confirms_the_prefix_it_reused():
     router.place(c, owner, 2)
     mgr._release_seq(1)
     mgr._release_seq(3)
-    assert router._rank_hits(a.prompt_hash_chain, 2)[0].get(owner) == 8192
+    assert _rank_hits(router, a.prompt_hash_chain, 2)[0].get(owner) == 8192
 
 
 def test_the_tier_serves_a_prefix_any_finished_holder_put_there():
@@ -1667,11 +1679,11 @@ def test_owner_ties_go_to_the_rank_that_used_the_prefix_last():
         mgr._charge_seq_load_locked(seq, rank, credit=placed.credit)
         mgr._mark_seq_prefill_complete(seq_id)
     probe = _chain_seq(9, 8192).prompt_hash_chain
-    assert router._rank_hits(probe, 2)[1] == 1
+    assert _rank_hits(router, probe, 2)[1] == 1
     reuse = _chain_seq(3, 8192)
     placed = router.place(reuse, 0, 2)
     mgr._charge_seq_load_locked(reuse, 0, credit=placed.credit)
-    assert router._rank_hits(probe, 2)[1] == 0
+    assert _rank_hits(router, probe, 2)[1] == 0
 
 
 def test_an_owner_with_every_slot_taken_sends_its_prefix_to_an_idle_rank():
@@ -1803,3 +1815,562 @@ def test_independent_credit_does_not_survive_request_id_reuse_or_reset():
     assert router._independent_credit[2] == 0
     router.reset()
     assert not router._independent_credit
+
+
+def _count_router_calls(router, *names):
+    """Wrap router methods; returns {name: [kwargs-of-each-call]}."""
+    calls = {name: [] for name in names}
+    for name in names:
+        real = getattr(router, name)
+
+        def wrapper(*args, _real=real, _log=calls[name], **kwargs):
+            _log.append(kwargs)
+            return _real(*args, **kwargs)
+
+        setattr(router, name, wrapper)
+    return calls
+
+
+def _warm_prefix_on_rank0(mgr, length=8192):
+    """A finished prefix on rank 0, then both ranks idle."""
+    (owner,) = _route(mgr, [_chain_seq(1, length)])
+    assert owner == 0
+    mgr._mark_seq_prefill_complete(1)
+    mgr._rank_tokens = [0, 0]
+    mgr._rank_reqs = [0, 0]
+
+
+@pytest.mark.parametrize("shape", ["cold", "owner", "moved"])
+@pytest.mark.parametrize("loads", [True, False])
+def test_prefix_spread_placement_walks_the_hash_chain_one_read_and_one_create(
+    shape, loads
+):
+    from atom.kv_transfer.offload.tier import OffloadTierProfile
+
+    mgr = _make_spread_mgr(tier=OffloadTierProfile(loads, 1024, 512))
+    router = mgr._prefix_router
+    _warm_prefix_on_rank0(mgr)
+    if shape == "moved":
+        mgr._rank_tokens = [200_000, 0]
+    seq = _chain_seq(2, 8192 + 640, first_block=0 if shape != "cold" else 50_000)
+    calls = _count_router_calls(router, "_path")
+    before = _count(mgr, f"prefix_{shape}_total")
+    _route(mgr, [seq])
+    reads = [k for k in calls["_path"] if not k.get("create")]
+    creates = [k for k in calls["_path"] if k.get("create")]
+    # Lookups share one read-only walk; the only other walk creates/splits edges
+    # (two walks in all, down from four or five).
+    assert (len(reads), len(creates)) == (1, 1)
+    assert _count(mgr, f"prefix_{shape}_total") == before + 1
+
+
+def test_prefix_spread_explicit_placement_walks_the_hash_chain_one_read_and_one_create():
+    from atom.kv_transfer.offload.tier import OffloadTierProfile
+
+    router = _make_spread_mgr(tier=OffloadTierProfile(True, 1024, 512))._prefix_router
+    router.place(_chain_seq(1, 8192), 0, 2)
+    router.prefill_complete(1)
+    calls = _count_router_calls(router, "_path")
+    router.place(_chain_seq(2, 8192 + 640), 1, 2)
+    assert [bool(k.get("create")) for k in calls["_path"]] == [False, True]
+
+
+def test_prefix_spread_does_not_ask_the_tier_when_it_cannot_load():
+    from atom.kv_transfer.offload.tier import OffloadTierProfile
+
+    for loads, asked in ((False, 0), (True, 2)):
+        mgr = _make_spread_mgr(tier=OffloadTierProfile(loads, 1024, 512))
+        router = mgr._prefix_router
+        _warm_prefix_on_rank0(mgr)
+        mgr._rank_tokens = [200_000, 0]  # owner backlogged: the request moves
+        calls = _count_router_calls(router, "_tier_hit")
+        seq = _chain_seq(2, 8192 + 640)
+        assert _route(mgr, [seq]) == [1]
+        assert len(calls["_tier_hit"]) == asked
+        # No tier: the moved request keeps only what rank 1 holds (nothing).
+        assert _est(mgr, seq) == (8192 if loads else 0)
+
+
+def test_prefix_spread_reset_evicts_history_in_a_repeatable_order():
+    """`reset()` drops the in-flight claims; intervals another rank still holds
+    stay as history, refreshed oldest-placed first, so the trim that follows
+    drops the earliest ones. The same input always evicts the same history,
+    whatever the addresses of the edge objects are."""
+    import random
+
+    from atom.kv_transfer.offload.tier import OffloadTierProfile
+
+    router = _make_spread_mgr(tier=OffloadTierProfile())._prefix_router
+
+    def place(seq_id, first_block, rank):
+        seq = _chain_seq(seq_id, 128, first_block=first_block)
+        router.charge(seq_id, router.place(seq, rank, 2).credit)
+        return seq
+
+    # Fragment the heap: edges created afterwards reuse freed slots, at
+    # addresses unrelated to their creation order (which is what made the old
+    # set iteration order vary).
+    scratch = list(range(400))
+    for i in scratch:
+        place(i, 1_000_000 + i, 0)
+    random.Random(7).shuffle(scratch)
+    for seq_id in scratch[:300]:
+        router.release(seq_id)  # unfinished: its provisional interval is dropped
+    n, keep = 160, 40
+    for i in range(n):  # rank 1 holds finished history ...
+        place(1_000 + i, 5_000 + i, 1)
+        router.prefill_complete(1_000 + i)
+    for i in range(n):  # ... which rank 0 then claims provisionally, in order
+        place(2_000 + i, 5_000 + i, 0)
+    router.CAP = keep * 128
+    router.reset()
+    held = [
+        _rank_hits(
+            router, _chain_seq(0, 128, first_block=5_000 + i).prompt_hash_chain, 2
+        )[1]
+        is not None
+        for i in range(n)
+    ]
+    assert held == [False] * (n - keep) + [True] * keep
+
+
+def _finish_turn(mgr, seq):
+    mgr._mark_seq_prefill_complete(seq.id)
+    mgr._release_seq(seq.id)
+
+
+def test_prefix_spread_session_growing_each_turn_keeps_a_constant_edge_count():
+    import array
+
+    mgr = _make_spread_mgr()
+    router = mgr._prefix_router
+    for turn in range(1, 61):
+        seq = _chain_seq(turn, (8 + turn) * 128 + 5)
+        assert _route(mgr, [seq]) == [0]
+        assert _est(mgr, seq) == (8 + turn - 1) * 128 * (turn > 1)
+        _finish_turn(mgr, seq)
+        assert len(router.index) == 1
+    assert router.indexed_tokens == 68 * 128
+    # Every earlier turn's prompt is still answered exactly across the seam.
+    for turn in (1, 17, 59, 60):
+        probe = _chain_seq(999, (8 + turn) * 128).prompt_hash_chain
+        assert _rank_hits(router, probe, 2) == ({0: (8 + turn) * 128}, 0)
+    # A request that diverges inside the merged interval keeps its shared part
+    # (hashes are chained: everything after the divergence differs too).
+    from atom.model_engine.prefix_hash import ShippedChain
+
+    hashes = array.array("Q", [*range(20), *range(987_654_321, 987_654_331)])
+    diverging = ShippedChain(128, 0, 30 * 128 + 5, 0, hashes)
+    assert _rank_hits(router, diverging, 2)[0] == {0: 20 * 128}
+
+
+def _assert_edges_tile_their_chains(router):
+    """Every edge starts where its parent ends (roots start at 0)."""
+    for edge in router.index:
+        assert edge.start == (0 if edge.parent is None else edge.parent.end)
+        for child in edge.children.values():
+            assert child.parent is edge
+
+
+def test_prefix_spread_merged_edges_keep_their_place_in_the_tree():
+    mgr = _make_spread_mgr()
+    router = mgr._prefix_router
+    for turn in range(1, 6):
+        seq = _chain_seq(turn, (8 + turn) * 128 + 5)
+        _route(mgr, [seq])
+        _finish_turn(mgr, seq)
+        _assert_edges_tile_their_chains(router)
+    (edge,) = router.index
+    assert (edge.start, edge.end) == (0, 13)
+    assert edge.parent is None and not edge.children
+
+
+def test_prefix_spread_session_with_a_shorter_retry_each_turn_stays_one_edge():
+    """Each turn also resends the previous prompt minus its last 32 blocks, which
+    splits the session's interval; the next completion must merge it back."""
+    mgr = _make_spread_mgr()
+    router = mgr._prefix_router
+    seq_id = 0
+    for turn in range(1, 41):
+        blocks = 64 + 32 * turn
+        for tokens in (blocks * 128, (blocks - 32) * 128):
+            seq_id += 1
+            seq = _chain_seq(seq_id, tokens)
+            _route(mgr, [seq])
+            _finish_turn(mgr, seq)
+        _assert_edges_tile_their_chains(router)
+        assert len(router.index) <= 2, turn
+    assert len(router.index) <= 2
+
+
+def test_prefix_spread_edges_with_different_recency_order_stay_apart():
+    """Both ranks hold both halves, but rank 0 used the first half last and rank 1
+    the second: lookups that break ties by recency answer differently on either
+    side of the seam, so the halves must not merge."""
+    router = _make_spread_mgr()._prefix_router
+    whole, half = _chain_seq(1, 8192), _chain_seq(2, 4096)
+    for seq, rank in ((whole, 0), (_chain_seq(3, 8192), 1), (half, 0)):
+        router.place(seq, rank, 2)
+        router.prefill_complete(seq.id)
+    assert len(router.index) == 2
+    orders = {tuple(h) for h in router.index.values()}
+    assert orders == {(1, 0), (0, 1)}  # same ranks, different order
+
+
+def test_prefix_spread_edges_with_different_holders_stay_apart():
+    mgr = _make_spread_mgr()
+    router = mgr._prefix_router
+    follower = _chain_seq(2, 8192)
+    _route(mgr, [_chain_seq(1, 4096)])
+    mgr._mark_seq_prefill_complete(1)
+    _route(mgr, [follower])
+    mgr._mark_seq_prefill_complete(2)
+    assert len(router.index) == 1  # the same rank holds both halves
+    # Rank 1 holds only the first half: the halves differ, whatever completes.
+    router.place(_chain_seq(3, 4096), 1, 2)
+    router.prefill_complete(3)
+    assert len(router.index) == 2
+    router.place(_chain_seq(4, 8192 + 128), 0, 2)
+    router.prefill_complete(4)
+    assert len(router.index) == 2  # the new tail joined rank 0's half, not rank 1's
+    assert _rank_hits(router, follower.prompt_hash_chain, 2) == ({0: 8192, 1: 4096}, 0)
+    assert _rank_hits(router, _chain_seq(9, 4096).prompt_hash_chain, 2)[0] == {
+        0: 4096,
+        1: 4096,
+    }
+
+
+def test_prefix_spread_provisional_edges_are_not_merged():
+    mgr = _make_spread_mgr()
+    router = mgr._prefix_router
+    first, follower = _chain_seq(1, 4096), _chain_seq(2, 8192)
+    _route(mgr, [first])
+    _route(mgr, [follower])
+    mgr._mark_seq_prefill_complete(1)
+    assert len(router.index) == 2  # the follower's tail is still provisional
+    # The follower aborts before finishing: only what completed stays.
+    mgr._release_seq(2)
+    assert _rank_hits(router, follower.prompt_hash_chain, 2) == ({0: 4096}, 0)
+    assert len(router.index) == 1
+
+
+def _hit(router, chain, rank):
+    return _rank_hits(router, chain, 2)[0].get(rank, 0)
+
+
+def test_prefix_spread_trim_cuts_the_tail_of_the_oldest_history_and_keeps_its_head():
+    router = _make_spread_mgr()._prefix_router
+    old = _chain_seq(1, 100 * 128)
+    for rank, seq_id in ((0, 1), (1, 2)):  # both ranks hold the same history
+        router.place(_chain_seq(seq_id, 100 * 128), rank, 2)
+        router.prefill_complete(seq_id)
+    router.CAP = 100 * 128
+    newcomer = _chain_seq(3, 10 * 128, first_block=5_000)
+    router.charge(3, router.place(newcomer, 0, 2).credit)  # 10 blocks over budget
+    assert router.indexed_tokens == router.CAP
+    # Only the excess is shed, from the tail; every holder keeps the same head.
+    assert _hit(router, old.prompt_hash_chain, 0) == 90 * 128
+    assert _hit(router, old.prompt_hash_chain, 1) == 90 * 128
+    assert _hit(router, newcomer.prompt_hash_chain, 0) == 10 * 128
+    router.prefill_complete(3)
+    router.CAP = 0
+    router.reset()
+    assert not router.index and router.indexed_tokens == 0
+
+
+def test_prefix_spread_small_overages_spread_over_histories():
+    router = _make_spread_mgr()._prefix_router
+    chains = [_chain_seq(i + 1, 80 * 128, first_block=i * 1_000) for i in range(16)]
+    for seq in chains:
+        router.place(seq, 0, 2)
+        router.prefill_complete(seq.id)
+    router.CAP = router.indexed_tokens
+    for i in range(16):  # each newcomer is 4 blocks over the budget
+        newcomer = _chain_seq(100 + i, 4 * 128, first_block=50_000 + i * 10)
+        router.place(newcomer, 0, 2)
+        router.prefill_complete(newcomer.id)
+        assert router.indexed_tokens == router.CAP
+    kept = [_hit(router, seq.prompt_hash_chain, 0) // 128 for seq in chains]
+    # No history lost its owner pointer; the cut went round the leaves.
+    assert min(kept) > 0 and max(kept) < 80
+
+
+def test_prefix_spread_a_large_overage_drops_whole_histories_oldest_first():
+    router = _make_spread_mgr()._prefix_router
+    chains = [_chain_seq(i + 1, 80 * 128, first_block=i * 1_000) for i in range(16)]
+    for seq in chains:
+        router.place(seq, 0, 2)
+        router.prefill_complete(seq.id)
+    router.CAP = 16 * 80 * 128 // 2
+    drops = []
+    real = router._drop_edge
+    router._drop_edge = lambda edge: (drops.append(len(edge.hashes)), real(edge))
+    router.reset()  # trims to the budget
+    kept = [_hit(router, seq.prompt_hash_chain, 0) // 128 for seq in chains]
+    assert kept == [0] * 8 + [80] * 8
+    # One pass per dropped history, as with whole-interval eviction: no
+    # tail-shaving loop that visits a leaf many times.
+    assert drops == [80] * 8
+    assert router.indexed_tokens == router.CAP
+
+
+def test_prefix_spread_trim_of_a_short_history_cuts_one_block_or_drops_it():
+    router = _make_spread_mgr()._prefix_router
+    four, one = _chain_seq(1, 4 * 128), _chain_seq(2, 128, first_block=9_000)
+    for seq in (four, one):
+        router.place(seq, 0, 2)
+        router.prefill_complete(seq.id)
+    router.CAP = 4 * 128  # one block over: the oldest, a 4-block leaf, loses 1
+    router.reset()
+    assert _hit(router, four.prompt_hash_chain, 0) == 3 * 128
+    assert _hit(router, one.prompt_hash_chain, 0) == 128
+    # The shortened leaf went to the back; the 1-block leaf is now the oldest and
+    # one block over cannot be cut from it without emptying it: it goes whole.
+    router.CAP = 3 * 128
+    router.reset()
+    assert _hit(router, one.prompt_hash_chain, 0) == 0
+    assert _hit(router, four.prompt_hash_chain, 0) == 3 * 128
+    router.CAP = 0
+    router.reset()
+    assert not router.index and router.indexed_tokens == 0
+
+
+def test_prefix_spread_trim_never_cuts_an_interval_still_being_prefilled():
+    router = _make_spread_mgr()._prefix_router
+    history = _chain_seq(1, 50 * 128, first_block=1_000)
+    router.place(history, 0, 2)
+    router.prefill_complete(1)
+    producing = [
+        _chain_seq(2, 50 * 128, first_block=2_000),
+        _chain_seq(3, 10 * 128, first_block=3_000),
+    ]
+    router.CAP = 80 * 128
+    for seq in producing:
+        router.charge(seq.id, router.place(seq, 0, 2).credit)
+    # 110 blocks indexed against 80: only the finished history can pay, and 30
+    # blocks is far more than an eighth of it, so it goes whole.
+    assert _hit(router, history.prompt_hash_chain, 0) == 0
+    assert [_hit(router, s.prompt_hash_chain, 0) for s in producing] == [
+        50 * 128,
+        10 * 128,
+    ]
+    assert router.indexed_tokens == 60 * 128  # the pinned intervals alone
+    # Over budget with nothing finished left to shed: pinned edges stay whole.
+    router.CAP = 0
+    router.place(_chain_seq(4, 128, first_block=4_000), 1, 2)
+    assert [_hit(router, s.prompt_hash_chain, 0) for s in producing] == [
+        50 * 128,
+        10 * 128,
+    ]
+    for seq in producing:
+        router.release(seq.id)
+    router.reset()
+    assert not router.index and router.indexed_tokens == 0
+
+
+def test_prefix_spread_merge_waits_for_another_ranks_provisional_claim():
+    """Rank 1 is still computing two intervals (one producer) while rank 0
+    confirms the same two. Their holders then read alike -- rank 0 confirmed,
+    rank 1 naming the same producer -- but rank 1's claims are provisional and
+    keyed by interval, so the intervals must stay apart until rank 1 finishes
+    or gives up."""
+    router = _make_spread_mgr()._prefix_router
+    first, producer, follower = (
+        _chain_seq(1, 64 * 128),
+        _chain_seq(2, 96 * 128),
+        _chain_seq(3, 96 * 128),
+    )
+    for seq, rank in ((first, 0), (producer, 1), (follower, 0)):
+        router.charge(seq.id, router.place(seq, rank, 2).credit)
+    assert len(router.index) == 2
+    router.prefill_complete(3)  # rank 0 confirms both intervals
+    assert len(router.index) == 2
+    assert _rank_hits(router, follower.prompt_hash_chain, 2) == ({0: 96 * 128}, 0)
+    # Rank 1 gives up: its claims go, rank 0's confirmed history stays intact.
+    router.release(2)
+    assert _rank_hits(router, follower.prompt_hash_chain, 2) == ({0: 96 * 128}, 0)
+    router.release(1)
+    router.release(3)
+    assert not router.pending and not router._produced and not router._in_flight
+
+
+def test_prefix_spread_forked_prefix_is_not_merged_into_either_branch():
+    router = _make_spread_mgr()._prefix_router
+    trunk, left, right = (
+        _chain_seq(1, 4096),
+        _chain_seq(2, 8192),
+        _chain_seq(3, 8192, first_block=0),
+    )
+    # `right` shares the trunk but then runs on different blocks.
+    right.prompt_hash_chain.hashes[32:] = type(right.prompt_hash_chain.hashes)(
+        "Q", range(70_000, 70_032)
+    )
+    for seq in (trunk, left, right):
+        router.charge(seq.id, router.place(seq, 0, 2).credit)
+        router.prefill_complete(seq.id)
+    assert len(router.index) == 3  # the trunk and one edge per branch
+    for seq in (left, right):
+        assert _rank_hits(router, seq.prompt_hash_chain, 2) == ({0: 8192}, 0)
+    assert _rank_hits(router, trunk.prompt_hash_chain, 2) == ({0: 4096}, 0)
+
+
+# ── Prefix-spread index counters (trim / evict) ────────────────────
+
+_NO_BUDGET_COUNTERS = (
+    "over_budget_total",
+    "tail_trim_total",
+    "tail_trim_tokens_total",
+    "leaf_evict_total",
+    "leaf_evict_tokens_total",
+    "trim_blocked_total",
+)
+
+
+def test_prefix_spread_index_counters_are_zero_until_something_happens():
+    router = _make_spread_mgr()._prefix_router
+    fresh = router.index_counters()
+    assert set(fresh) == {*_NO_BUDGET_COUNTERS, "indexed_tokens"}
+    assert all(fresh[name] == 0 for name in _NO_BUDGET_COUNTERS)
+    assert fresh["indexed_tokens"] == 0
+    # Placements, completions and releases under the production budget never
+    # reach the budget path.
+    for sid in range(1, 6):
+        seq = _chain_seq(sid, 20 * 128, first_block=sid * 100)
+        router.charge(sid, router.place(seq, sid % 2, 2).credit)
+        router.prefill_complete(sid)
+        router.release(sid)
+    quiet = router.index_counters()
+    assert all(quiet[name] == 0 for name in _NO_BUDGET_COUNTERS)
+    assert quiet["indexed_tokens"] == 5 * 20 * 128
+
+
+def test_prefix_spread_tail_trim_counts_events_and_tokens():
+    router = _make_spread_mgr()._prefix_router
+    for rank, seq_id in ((0, 1), (1, 2)):
+        router.place(_chain_seq(seq_id, 100 * 128), rank, 2)
+        router.prefill_complete(seq_id)
+    router.CAP = 100 * 128
+    router.charge(
+        3, router.place(_chain_seq(3, 10 * 128, first_block=5_000), 0, 2).credit
+    )
+    got = router.index_counters()
+    # 10 blocks over, from a 100-block leaf (<= 1/8): one tail trim, no eviction.
+    assert got["tail_trim_total"] == 1
+    assert got["tail_trim_tokens_total"] == 10 * 128
+    assert got["over_budget_total"] == 1 and got["trim_blocked_total"] == 0
+    assert got["leaf_evict_total"] == got["leaf_evict_tokens_total"] == 0
+    assert got["indexed_tokens"] == router.CAP
+
+
+def test_prefix_spread_leaf_evict_counts_events_and_tokens():
+    router = _make_spread_mgr()._prefix_router
+    for seq_id, blocks in ((1, 4), (2, 1)):
+        router.place(_chain_seq(seq_id, blocks * 128, first_block=seq_id * 1_000), 0, 2)
+        router.prefill_complete(seq_id)
+    router.CAP = 4 * 128  # one block over: the oldest, 4 blocks, loses 1 (tail)
+    router.reset()
+    mid = router.index_counters()
+    assert (mid["tail_trim_total"], mid["tail_trim_tokens_total"]) == (1, 128)
+    assert mid["leaf_evict_total"] == 0
+    router.CAP = 3 * 128  # the 1-block leaf is oldest now and goes whole
+    router.reset()
+    mid = router.index_counters()
+    assert (mid["leaf_evict_total"], mid["leaf_evict_tokens_total"]) == (1, 128)
+    assert mid["tail_trim_total"] == 1
+    router.CAP = 0  # the 3-block leaf goes whole, with the blocks it holds now
+    router.reset()
+    end = router.index_counters()
+    assert (end["leaf_evict_total"], end["leaf_evict_tokens_total"]) == (2, 4 * 128)
+    assert end["tail_trim_tokens_total"] == 128
+    assert end["indexed_tokens"] == 0
+    assert end["trim_blocked_total"] == 0  # nothing was pinned: never "blocked"
+
+
+def test_prefix_spread_dropping_released_empty_edges_is_not_counted_as_eviction():
+    router = _make_spread_mgr()._prefix_router
+    for seq_id in (1, 2):
+        seq = _chain_seq(seq_id, 10 * 128, first_block=seq_id * 1_000)
+        router.charge(seq_id, router.place(seq, 0, 2).credit)
+    router.release(1)  # unfinished prefill released: its edge empties and goes
+    router.reset()  # the other one's pending claim is dropped: same
+    got = router.index_counters()
+    assert len(router.index) == 0 and got["indexed_tokens"] == 0
+    assert got["leaf_evict_total"] == got["tail_trim_total"] == 0
+    assert got["over_budget_total"] == got["trim_blocked_total"] == 0
+    assert got["leaf_evict_tokens_total"] == got["tail_trim_tokens_total"] == 0
+
+
+def test_prefix_spread_trim_token_counters_use_the_chains_hash_block_size():
+    router = _make_spread_mgr()._prefix_router
+    for seq_id, blocks in ((1, 100), (2, 4)):
+        seq = _chain_seq(seq_id, blocks * 16, first_block=seq_id * 1_000, hbs=16)
+        router.place(seq, 0, 2)
+        router.prefill_complete(seq_id)
+    router.CAP = 98 * 16  # 6 blocks over: 6 <= 100 / 8 -> one tail trim of 6 blocks
+    router.reset()
+    got = router.index_counters()
+    assert got["tail_trim_total"] == 1
+    assert got["tail_trim_tokens_total"] == 6 * 16
+    router.CAP = 0  # both leaves go whole: 94 and 4 blocks
+    router.reset()
+    got = router.index_counters()
+    assert got["leaf_evict_total"] == 2
+    assert got["leaf_evict_tokens_total"] == 98 * 16
+    assert got["trim_blocked_total"] == 0
+
+
+def test_prefix_spread_trim_blocked_counts_over_budget_with_only_pending_edges():
+    router = _make_spread_mgr()._prefix_router
+    producing = _chain_seq(1, 10 * 128)
+    router.CAP = 5 * 128
+    router.charge(1, router.place(producing, 0, 2).credit)
+    got = router.index_counters()
+    assert got["over_budget_total"] >= 1
+    assert got["trim_blocked_total"] == got["over_budget_total"]
+    assert got["tail_trim_total"] == got["leaf_evict_total"] == 0
+    router.prefill_complete(1)  # finished history can now pay: 5 of 10 blocks over
+    got = router.index_counters()
+    assert (got["leaf_evict_total"], got["leaf_evict_tokens_total"]) == (1, 10 * 128)
+    assert got["tail_trim_total"] == 0 and got["indexed_tokens"] == 0
+
+
+def test_prefix_spread_trim_blocked_counts_finished_ancestors_of_a_prefilling_leaf():
+    router = _make_spread_mgr()._prefix_router
+    router.place(_chain_seq(1, 10 * 128), 0, 2)
+    router.prefill_complete(1)
+    router.CAP = 3 * 128
+    # Shares 6 blocks with seq 1 and diverges: the finished 6-block edge gains a
+    # child that is still prefilling, so it is not evictable although it is done.
+    follower = _chain_seq(2, 10 * 128)
+    follower.prompt_hash_chain.hashes[6:] = type(follower.prompt_hash_chain.hashes)(
+        "Q", range(50_000, 50_004)
+    )
+    router.charge(2, router.place(follower, 0, 2).credit)
+    got = router.index_counters()
+    assert got["leaf_evict_total"] == 1  # seq 1's finished 4-block tail went
+    assert got["indexed_tokens"] > router.CAP
+    assert got["trim_blocked_total"] >= 1
+    finished = [e for e, holders in router.index.items() if e.children]
+    assert finished and all(
+        not any((e, r) in router.pending for r in router.index[e]) for e in finished
+    )
+    before = got["trim_blocked_total"]
+    router.prefill_complete(2)  # nothing pinned any more: the budget can be met
+    after = router.index_counters()
+    assert after["indexed_tokens"] <= router.CAP
+    assert after["trim_blocked_total"] == before
+
+
+def test_prefix_spread_index_counters_are_exported_in_router_statistics():
+    mgr = _make_spread_mgr()
+    router = mgr._prefix_router
+    router.CAP = 4 * 128
+    for seq_id, blocks in ((1, 4), (2, 1)):
+        router.place(_chain_seq(seq_id, blocks * 128, first_block=seq_id * 1_000), 0, 2)
+        router.prefill_complete(seq_id)
+    router.reset()
+    snapshot = mgr.get_dp_router_statistics()
+    assert snapshot["prefix_index"] == router.index_counters()
+    assert snapshot["prefix_index"]["tail_trim_total"] == 1
+    # Without the prefix router the section is absent.
+    assert "prefix_index" not in _make_mgr(2).get_dp_router_statistics()

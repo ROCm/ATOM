@@ -363,6 +363,7 @@ def test_scheduler_reserves_locks_for_every_collapsed_tp_reader(
 ):
     @dataclass(frozen=True)
     class Key:
+        request_id: str = "req"
         num_kv_readers: int = 1
 
     class AtomMPParallelConfig:
@@ -435,6 +436,7 @@ def _install_salt_adapters(monkeypatch, scheduler_base=None):
             return _SaltKey(request_id)
 
     adapter_module = types.ModuleType("lmcache.integration.atom")
+    adapter_module.AtomMPTransferSpec = _FakeLoadStoreOp
     adapter_module.AtomMPParallelConfig = AtomMPParallelConfig
     adapter_module.AtomMPSchedulerAdapter = scheduler_base or AtomMPSchedulerAdapter
     adapter_module.AtomMPWorkerAdapter = AtomMPWorkerAdapter
@@ -492,7 +494,10 @@ def test_mp_keys_carry_the_prompts_salt(monkeypatch, cache_seed, salt):
     assert sent == [expected] * 3
 
     worker_adapter = deployment._make_worker_adapter(_config(), rank=0)
-    spec = deployment.TransferSpec(list(range(8)), [[1]], 0, 8, cache_salt=salt)
+    spec = deployment.transfer_spec(
+        token_ids=list(range(8)), block_ids=[[1]], start=0, end=8, cache_salt=salt
+    )
+    assert isinstance(spec, _FakeLoadStoreOp)
     assert worker_adapter._create_key("load:7", spec).cache_salt == salt
 
 
@@ -1105,6 +1110,14 @@ def test_stale_load_failure_does_not_release_current_generation_locks():
 
 
 @dataclass
+class _FakeLoadStoreOp:
+    token_ids: list[int]
+    block_ids: list[list[int]]
+    start: int = 0
+    end: int = 0
+
+
+@dataclass
 class _FakeParallelConfig:
     world_size: int
     worker_id: int
@@ -1154,6 +1167,7 @@ def fake_lmcache_modules(monkeypatch):
     integration.__path__ = []
     atom = types.ModuleType("lmcache.integration.atom")
     atom.AtomMPParallelConfig = _FakeParallelConfig
+    atom.AtomMPTransferSpec = _FakeLoadStoreOp
     v1 = types.ModuleType("lmcache.v1")
     v1.__path__ = []
     multiprocess = types.ModuleType("lmcache.v1.multiprocess")
