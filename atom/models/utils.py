@@ -136,6 +136,17 @@ def make_layers(
     return start_layer, end_layer, modules
 
 
+def pp_holds_embedding(atom_config) -> bool:
+    """Whether this PP stage builds the token embedding: the first stage embeds
+    the prompt, and the last holds a copy for a drafter that shares it."""
+    from aiter.dist.parallel_state import get_pp_group
+
+    from atom.models.registry import serves_pp_speculation
+
+    pp = get_pp_group()
+    return pp.is_first_rank or (pp.is_last_rank and serves_pp_speculation(atom_config))
+
+
 # NOTE: don't use lru_cache here because it can prevent garbage collection
 _model_to_pp_missing_layer_names: dict[int, list[str]] = {}
 

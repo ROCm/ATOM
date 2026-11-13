@@ -1125,6 +1125,7 @@ class TestExplicitPlan:
         existing_plan=None,
         cap=8,
         head_dim=128,
+        segment=0,
     ):
         import torch
 
@@ -1140,7 +1141,22 @@ class TestExplicitPlan:
             existing_plan=existing_plan,
             plan_step_owner=owner,
             plan_cache_owner=cache_owner,
+            plan_segment=segment,
         )
+
+    def test_segments_of_one_call_keep_their_own_plans(self, monkeypatch):
+        """Equal-size slices of one call's rows must not share a plan: each is
+        refreshed from its own lengths (MXFP4 sparse decode runs more rows than
+        one plan takes in segments)."""
+        ba, built = self._setup(monkeypatch)
+        step = SimpleNamespace()
+        first = self._call(ba, owner=step, segment=0)
+        second = self._call(ba, owner=step, segment=1)
+        assert first is not second and len(built) == 2
+        # a later layer of the same step finds each segment's own plan
+        assert self._call(ba, owner=step, segment=0) is first
+        assert self._call(ba, owner=step, segment=1) is second
+        assert len(built) == 2
 
     def test_default_budget_needs_no_tuning_module(self, monkeypatch):
         """#5809 ships no tuned budgets and its old tuner module is gone."""

@@ -274,7 +274,12 @@ def _mega(dispatch=DispatchKind.MORI, combine=CombineKind.FUSED_SCATTER):
     return SimpleNamespace(recipe=recipe, max_tokens_per_rank=MAX_TOKENS)
 
 
-def _forward(monkeypatch, mega, context):
+def _forward(monkeypatch, mega, context, **shared):
+    calls, _ = _forward_with_output(monkeypatch, mega, context, **shared)
+    return calls
+
+
+def _forward_with_output(monkeypatch, mega, context, **shared):
     calls = []
 
     def triton_mega_moe(*args, **kwargs):
@@ -303,15 +308,16 @@ def _forward(monkeypatch, mega, context):
             "w2_swizzle_layout",
         )
     }
-    kernel.forward(
+    out = kernel.forward(
         torch.zeros(TOKENS, 8),
         torch.zeros(EPR, 8, 8),
         torch.zeros(EPR, 8, 8),
         torch.zeros(TOKENS, TOPK),
         torch.zeros(TOKENS, TOPK, dtype=torch.int32),
         moe_extra_args={"triton_experts": experts},
+        **shared,
     )
-    return calls
+    return calls, out
 
 
 def test_decode_step_reaches_triton_mega_moe(monkeypatch):
@@ -343,3 +349,61 @@ def test_no_context_keeps_the_full_arena(monkeypatch):
 def test_unsupported_pairings_are_refused(monkeypatch, dispatch, combine, message):
     with pytest.raises(RuntimeError, match=message):
         _forward(monkeypatch, _mega(dispatch, combine), None)
+
+
+def _stream_waits(monkeypatch):
+    waited = []
+    monkeypatch.setattr(
+        mv2.torch.cuda,
+        "current_stream",
+        lambda: SimpleNamespace(wait_event=waited.append),
+    )
+    return waited
+
+
+def test_triton_experts_add_the_shared_output_after_their_combine(monkeypatch):
+    waited = _stream_waits(monkeypatch)
+    shared = torch.full((TOKENS, 8), 2.0)
+    ready = object()
+    _, out = _forward_with_output(
+        monkeypatch, _mega(), None, shared_add=shared, shared_ready=ready
+    )
+    # The stand-in triton_mega_moe returns the (zero) hidden states.
+    torch.testing.assert_close(out, shared, rtol=0, atol=0)
+    assert waited == [ready]
+
+
+def test_megamoe_is_handed_the_shared_output(monkeypatch):
+    waited = _stream_waits(monkeypatch)
+    calls = []
+
+    class CallableMega(SimpleNamespace):
+        def __call__(self, *args, **kwargs):
+            calls.append(kwargs)
+            return args[0]
+
+    mega = CallableMega(**vars(_mega()))
+    monkeypatch.setattr(
+        mv2.MoriV2ModularKernel, "_assert_recipe_matches", lambda *_args: None
+    )
+    monkeypatch.setattr(
+        mv2, "get_forward_context", lambda: SimpleNamespace(context=None)
+    )
+    prepare_finalize = SimpleNamespace(
+        mega=mega, num_dispatchers=lambda: WORLD, combine_wire_for_step=lambda: "bf16"
+    )
+    kernel = mv2.MoriV2ModularKernel(prepare_finalize)
+    shared, ready = torch.ones(TOKENS, 8), object()
+    for kwargs in ({}, {"shared_add": shared, "shared_ready": ready}):
+        kernel.forward(
+            torch.zeros(TOKENS, 8),
+            torch.zeros(EPR, 8, 8),
+            torch.zeros(EPR, 8, 8),
+            torch.zeros(TOKENS, TOPK),
+            torch.zeros(TOKENS, TOPK, dtype=torch.int32),
+            **kwargs,
+        )
+    # Always passed: MegaMoE adds it in its combine and waits on the event.
+    assert calls[0]["shared_add"] is None and calls[0]["shared_ready"] is None
+    assert calls[1]["shared_add"] is shared and calls[1]["shared_ready"] is ready
+    assert waited == []

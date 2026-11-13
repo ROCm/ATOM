@@ -117,16 +117,22 @@ def _resolve_embedding(target_model: nn.Module) -> nn.Module:
     return embed
 
 
-def tap_is_resident(target_model: nn.Module, layers: nn.Module, lid: int) -> bool:
-    """Whether aux tap ``lid`` runs on this PP stage: a tap owned by another
-    stage sits on a ``PPMissingLayer``. Out-of-range ids are not resident."""
-    if lid == -1:
-        module = _resolve_embedding(target_model)
-    elif 0 <= lid < len(layers):
-        module = layers[lid]
-    else:
-        return False
-    return not isinstance(module, PPMissingLayer)
+def tap_is_resident(layers: nn.Module, lid: int) -> bool:
+    """Whether aux tap ``lid`` runs on this PP stage: a layer owned by another
+    stage is a ``PPMissingLayer``, and the embedding (``-1``) runs on the stage
+    that owns layer 0. Out-of-range ids are not resident."""
+    lid = 0 if lid == -1 else lid
+    return 0 <= lid < len(layers) and not isinstance(layers[lid], PPMissingLayer)
+
+
+def check_shared_embedding(draft: nn.Module) -> None:
+    """Refuse a draft that shared a ``PPMissingLayer`` as its embedding."""
+    if isinstance(getattr(draft, "embed_tokens", None), PPMissingLayer):
+        raise TypeError(
+            "The draft shares the target's embedding, which this PP stage does "
+            "not build: declare the method in registry.pp_speculative_methods "
+            "and build the embedding with models.utils.pp_holds_embedding."
+        )
 
 
 def _identity_extract(output: Any, _module: nn.Module) -> torch.Tensor:
@@ -224,6 +230,7 @@ support_draft_model_arch_dict = {
     "Eagle3DeepseekMLAModel": "atom.models.eagle3_deepseek_mla.Eagle3DeepseekMLAModel",
     "K3DSparkModel": "atom.models.kimi_k3_dspark.KimiK3DSpark",
     "DSparkMiniMaxDraftModel": "atom.models.minimax_m3.dspark.MiniMaxM3DSpark",
+    "K3DSparkGQAModel": "atom.models.kimi_k3_dspark_gqa.KimiK3DSparkGQA",
 }
 
 
@@ -280,6 +287,9 @@ class Drafter(abc.ABC):
         # Drafter-owned aux capture state (armed by arm_aux_capture).
         self._captures_aux = False
         self._aux_buffers: list[torch.Tensor] = []
+        # the extract the hooks run; a mono step that writes the taps itself
+        # calls it too (`AuxTaps.extract`)
+        self.aux_extract: Callable | None = None
 
         self.metadata_buffers = self._allocate_metadata_buffers(
             self.config.max_num_seqs, self.mtp_k, self.device
@@ -519,6 +529,14 @@ class Drafter(abc.ABC):
         """
         return False
 
+    @property
+    def context_kv_only(self) -> bool:
+        """This producer writes draft context K/V without ever proposing tokens."""
+        return (
+            self.runner.tokenID_processor.is_pd_producer
+            and not self.draft_kv_duplicates_propose
+        )
+
     # ---- aux-hidden-state ownership (drafter-owned, hook-based) ----
     def arm_aux_capture(self, target_model: nn.Module) -> None:
         """Install drafter-owned forward hooks on the target's decoder layers per
@@ -528,12 +546,11 @@ class Drafter(abc.ABC):
         spec = self._aux_capture_spec()
         if spec is None:
             return
+        self.aux_extract = spec.extract
         layers = _resolve_decoder_layers(target_model)
         # A tap on an earlier PP stage reaches `take_relayed_aux` instead, so it
         # gets no rows and no hook. install_aux_taps still rejects bad ids.
-        own = tuple(
-            lid for lid in spec.layer_ids if tap_is_resident(target_model, layers, lid)
-        )
+        own = tuple(lid for lid in spec.layer_ids if tap_is_resident(layers, lid))
         self._aux_buffers = [
             torch.zeros(
                 self.max_num_tokens if lid in own else 0,
@@ -564,6 +581,11 @@ class Drafter(abc.ABC):
         logger.info(
             f"{type(self).__name__} aux capture on target layers: {spec.layer_ids}"
         )
+
+    @property
+    def captures_aux(self) -> bool:
+        """Did `arm_aux_capture` tap target layers for this drafter?"""
+        return self._captures_aux
 
     def _make_aux_hook(self, buf_idx: int, extract):
         buffer = self._aux_buffers[buf_idx]
@@ -686,7 +708,11 @@ class Drafter(abc.ABC):
         # `model.head`) implement `share_with_target(target_base)` to do
         # their own setattr-rebinding and short-circuit the default path.
         if hasattr(self.model, "share_with_target"):
-            self.model.share_with_target(target_base, loaded)
+            # Context-only producers do not use the token embedding or output
+            # head; under PP the target embedding may live on an earlier stage.
+            if not self.context_kv_only:
+                self.model.share_with_target(target_base, loaded)
+                check_shared_embedding(self.model)
             if self.is_block_drafter and hasattr(self.model, "reset_kv_cache"):
                 # Allocate DSpark's private rolling target-KV window now that the
                 # device/dtype and max concurrency are known.
