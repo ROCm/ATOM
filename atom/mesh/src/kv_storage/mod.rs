@@ -48,7 +48,7 @@ pub enum BreakerState {
 }
 
 /// Outcome of checking the reported `chain_check` against the router's key rule; a
-/// failed source is not created.
+/// failed source answers every lookup `Unreadable`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChainCheck {

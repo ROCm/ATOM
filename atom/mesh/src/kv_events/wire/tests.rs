@@ -190,7 +190,11 @@ fn engine_samples_decode_as_specified() {
             .unwrap();
         assert_eq!(render(&batch), want.trim(), "{key}");
         let strict = VllmWireDecoder::new(profile, tier_map, true).decode(&payload);
-        assert_eq!(strict.is_ok(), batch.dropped.is_empty(), "{key}");
+        let conforming = !batch
+            .dropped
+            .iter()
+            .any(|reason| matches!(reason, DropReason::Decode | DropReason::UnknownTier));
+        assert_eq!(strict.is_ok(), conforming, "{key}");
         if batch.dropped.is_empty() {
             assert_eq!(decoded_keys(&batch), input_keys(&sample["events"]), "{key}");
         }

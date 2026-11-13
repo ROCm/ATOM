@@ -116,6 +116,13 @@ impl Shard {
     }
 }
 
+/// Tiers in column order.
+const TIERS: [Tier; 3] = [Tier::Device, Tier::Host, Tier::Disk];
+
+/// Copies counted per tier, as in SMG: vLLM's `kv_cache_report_mode: "full"` re-reports
+/// reused blocks as stored, with no matching remove.
+const MAX_COPIES: u16 = 8;
+
 /// Column of a tier in `HolderMatch::blocks`. Shared blocks are never indexed.
 fn column(tier: Tier) -> Option<usize> {
     match tier {
@@ -123,6 +130,15 @@ fn column(tier: Tier) -> Option<usize> {
         Tier::Host => Some(1),
         Tier::Disk => Some(2),
         Tier::Shared => None,
+    }
+}
+
+/// Columns a clear covers: one tier, or all when `tier` is None.
+fn columns(tier: Option<Tier>) -> Option<std::ops::Range<usize>> {
+    match tier.map(column) {
+        None => Some(0..3),
+        Some(Some(column)) => Some(column..column + 1),
+        Some(None) => None,
     }
 }
 
@@ -167,13 +183,11 @@ impl KvIndex for PrefixIndex {
         }
     }
 
+    /// Rebuilds every shard. A holder table clears through its own entries instead.
     fn clear(&self, holder: HolderId, tier: Option<Tier>) {
-        let columns = match tier.map(column) {
-            None => 0..3,
-            Some(Some(column)) => column..column + 1,
-            Some(None) => return,
+        let (Some(columns), lane @ 1..) = (columns(tier), lane(holder)) else {
+            return;
         };
-        let lane = lane(holder);
         for shard in &self.shards {
             let mut shard = shard.write();
             let mut kept = Shard::with_slots(shard.slots.len());
@@ -276,6 +290,8 @@ impl KvIndex for PrefixIndex {
 #[derive(Debug, Default)]
 pub struct HolderTable {
     slots: HashMap<EngineHash, Slot>,
+    /// Groups whose stores named another kind; removes carry no kind, only the group.
+    other_groups: u64,
 }
 
 #[derive(Debug)]
@@ -294,9 +310,15 @@ impl HolderTable {
         event: &KvEvent,
     ) -> Result<(), DropReason> {
         let mut ops = Vec::new();
+        let group_bit = |idx: u32| 1u64.checked_shl(idx).unwrap_or(0);
         let result = match event {
-            KvEvent::Stored { group, .. } | KvEvent::Removed { group, .. }
-                if group.kind != GroupKind::Full =>
+            KvEvent::Stored { group, .. } if group.kind != GroupKind::Full => {
+                self.other_groups |= group_bit(group.idx);
+                Ok(())
+            }
+            KvEvent::Removed { group, .. }
+                if group.kind != GroupKind::Full
+                    || self.other_groups & group_bit(group.idx) != 0 =>
             {
                 Ok(())
             }
@@ -312,8 +334,7 @@ impl HolderTable {
                 Ok(())
             }
             KvEvent::Cleared { tier } => {
-                self.clear(*tier);
-                index.clear(holder, *tier);
+                self.clear(*tier, &mut ops);
                 Ok(())
             }
         };
@@ -330,6 +351,9 @@ impl HolderTable {
         ops: &mut Vec<IndexOp>,
     ) -> Result<(), DropReason> {
         let column = column(tier).ok_or(DropReason::Storage)?;
+        if ns.opaque {
+            return Err(DropReason::Namespace);
+        }
         let mut prev = match parent {
             None => None,
             Some(parent) => Some(
@@ -355,7 +379,7 @@ impl HolderTable {
                 prefix,
                 counts: [0; 3],
             });
-            slot.counts[column] = slot.counts[column].saturating_add(1);
+            slot.counts[column] = (slot.counts[column] + 1).min(MAX_COPIES);
             if slot.counts[column] == 1 {
                 ops.push(IndexOp::Store { hash: prefix, tier });
             }
@@ -388,15 +412,23 @@ impl HolderTable {
         }
     }
 
-    fn clear(&mut self, tier: Option<Tier>) {
-        match tier.map(column) {
-            None => self.slots.clear(),
-            Some(Some(column)) => self.slots.retain(|_, slot| {
-                slot.counts[column] = 0;
-                slot.counts != [0; 3]
-            }),
-            Some(None) => {}
-        }
+    /// Removes the holder's own blocks, so a clear costs its entries, not the partition.
+    fn clear(&mut self, tier: Option<Tier>, ops: &mut Vec<IndexOp>) {
+        let Some(columns) = columns(tier) else {
+            return;
+        };
+        self.slots.retain(|_, slot| {
+            for column in columns.clone() {
+                if slot.counts[column] > 0 {
+                    slot.counts[column] = 0;
+                    ops.push(IndexOp::Remove {
+                        hash: slot.prefix,
+                        tier: TIERS[column],
+                    });
+                }
+            }
+            slot.counts != [0; 3]
+        });
     }
 }
 

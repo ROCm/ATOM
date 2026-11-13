@@ -132,6 +132,24 @@ async fn fold(rule: &AtomChunk, store: &MockStore, tokens: &[u32]) -> StorageLoo
     }
 }
 
+#[test]
+fn ranks_merge_to_the_slowest_and_pools_answering_other_counts_fail() {
+    use KeyState::*;
+    // A chunk is as slow as its slowest rank, and missing if any rank misses it.
+    let lookup = rule(RankProbe::All).fold(&[Memory, SsdOnly, Absent, Unknown]);
+    assert_eq!(lookup, hit(0, 4));
+    let answer = |states: Vec<KeyState>| {
+        Ok(PoolAnswer {
+            states,
+            tainted: false,
+        })
+    };
+    let short = answer(vec![Memory]);
+    let full = answer(vec![SsdOnly; 2]);
+    assert_eq!(merge_pools(2, &[short.clone(), full]), Ok(vec![SsdOnly; 2]));
+    assert_eq!(merge_pools(2, &[short]), Err(FailReason::BadResponse));
+}
+
 #[tokio::test]
 async fn mock_pools_fold_to_leading_hit_tokens() {
     let tokens: Vec<u32> = (0..24).collect();

@@ -1,8 +1,11 @@
 //! Per-worker cache hits for policies: event index, predicted source and shared storage.
 
 use std::{
-    collections::{HashMap, VecDeque},
-    sync::Arc,
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -21,6 +24,9 @@ pub struct PrefixRequest<'a> {
     pub model_id: &'a str,
     pub tokens: &'a [u32],
     pub ns: Namespace,
+    /// Set by the planner for inputs the token ids do not identify (images, audio): the
+    /// request scores no hit and records no prediction, but stays a candidate.
+    pub multimodal: bool,
     hashes: Mutex<Vec<(u32, Arc<[PrefixHash]>)>>,
     storage: Vec<(SourceId, StorageLookup)>,
 }
@@ -31,6 +37,7 @@ impl<'a> PrefixRequest<'a> {
             model_id,
             tokens,
             ns,
+            multimodal: false,
             hashes: Mutex::new(Vec::new()),
             storage: Vec::new(),
         }
@@ -72,7 +79,8 @@ pub enum LoadPath {
 pub enum LowerHit {
     /// No lower tier, or the source declares no `offload_load`.
     None,
-    /// The storage source on the load path timed out, failed, was skipped or is open.
+    /// The storage source on the load path timed out, failed, was skipped, is open or
+    /// cannot be read.
     Unknown(SourceId),
     Hit {
         tokens: u32,
@@ -137,9 +145,14 @@ impl Partition {
         })
     }
 
+    /// Gives back a lane that holds no blocks.
+    fn release_lane(&self, holder: HolderId) {
+        *self.lanes.lock() &= !(1 << holder.0);
+    }
+
     fn free_lane(&self, holder: HolderId) {
         self.index.remove_holder(holder);
-        *self.lanes.lock() &= !(1 << holder.0);
+        self.release_lane(holder);
     }
 }
 
@@ -152,36 +165,35 @@ struct Holder {
 }
 
 /// The routing decisions of one worker, each held for the TTL; routing the same prefix
-/// again extends it.
+/// again extends it. Queries read only the lane and `until`, so they never wait for a
+/// routing.
 struct Prediction {
     holder: Holder,
-    expiry: HashMap<PrefixHash, Instant>,
-    queue: VecDeque<(Instant, Arc<[PrefixHash]>)>,
+    /// End of the last routing's TTL, in nanoseconds since the provider's epoch.
+    until: AtomicU64,
+    state: Mutex<Predicted>,
 }
 
-impl Prediction {
-    fn expire(&mut self, now: Instant) {
-        let mut ops = Vec::new();
-        while let Some((deadline, hashes)) = self.queue.front() {
-            if *deadline > now {
-                break;
+struct Predicted {
+    /// Deadline of each predicted block.
+    expiry: HashMap<PrefixHash, Instant>,
+    next_sweep: Instant,
+    /// The lane went back to its partition, so the prediction takes no more blocks.
+    released: bool,
+}
+
+impl Predicted {
+    fn expire(&mut self, now: Instant, ops: &mut Vec<IndexOp>) {
+        self.expiry.retain(|&hash, deadline| {
+            let live = *deadline > now;
+            if !live {
+                ops.push(IndexOp::Remove {
+                    hash,
+                    tier: Tier::Device,
+                });
             }
-            for hash in hashes.iter() {
-                if self
-                    .expiry
-                    .get(hash)
-                    .is_some_and(|deadline| *deadline <= now)
-                {
-                    self.expiry.remove(hash);
-                    ops.push(IndexOp::Remove {
-                        hash: *hash,
-                        tier: Tier::Device,
-                    });
-                }
-            }
-            self.queue.pop_front();
-        }
-        self.holder.partition.index.apply(self.holder.id, &ops);
+            live
+        });
     }
 }
 
@@ -209,12 +221,18 @@ fn merge(into: &mut [u32; 3], hit: [u32; 3]) {
 
 impl Evidence {
     /// Exact sources answer alone; partial ones are a lower bound that predictions extend.
+    /// A Device depth raised by predictions is reported as predicted.
     fn into_hit(self) -> Option<CacheHit> {
         let (tiers, source) = match self.events {
             Some(events) if self.exact => (events, HitSource::Events),
             Some(mut events) => {
+                let source = if self.predicted[0] > events[0] {
+                    HitSource::Predicted
+                } else {
+                    HitSource::Events
+                };
                 merge(&mut events, self.predicted);
-                (events, HitSource::Events)
+                (events, source)
             }
             None if self.predicted[2] > 0 => (self.predicted, HitSource::Predicted),
             None => return None,
@@ -233,21 +251,30 @@ impl Evidence {
 pub struct IndexProvider {
     ttl: Duration,
     block_size: u32,
+    epoch: Instant,
     partitions: DashMap<PartitionKey, Arc<Partition>>,
     holders: DashMap<String, Vec<Holder>>,
-    predictions: DashMap<String, Prediction>,
+    predictions: DashMap<String, Arc<Prediction>>,
+    next_reclaim: Mutex<Instant>,
 }
 
 impl IndexProvider {
     /// Predictions last `ttl` and use `block_size` for workers without an event holder.
     pub fn new(ttl: Duration, block_size: u32) -> Self {
+        let epoch = Instant::now();
         Self {
             ttl,
             block_size,
+            epoch,
             partitions: DashMap::new(),
             holders: DashMap::new(),
             predictions: DashMap::new(),
+            next_reclaim: Mutex::new(epoch),
         }
+    }
+
+    fn nanos(&self, at: Instant) -> u64 {
+        at.saturating_duration_since(self.epoch).as_nanos() as u64
     }
 
     fn partition(&self, key: &PartitionKey) -> Arc<Partition> {
@@ -295,14 +322,99 @@ impl IndexProvider {
             holder.partition.free_lane(holder.id);
         }
         if let Some((_, prediction)) = self.predictions.remove(worker_url) {
+            prediction.state.lock().released = true;
             prediction.holder.partition.free_lane(prediction.holder.id);
         }
     }
 
-    fn exact(&self, worker_url: &str) -> bool {
-        self.holders.get(worker_url).is_some_and(|holders| {
-            !holders.is_empty() && holders.iter().all(|holder| holder.trust == Trust::Exact)
-        })
+    /// The worker's prediction. A new one goes to the partition of the worker's first
+    /// event holder, or of its model and pool at the configured block size. None when the
+    /// request has no full block there or the partition has no lane left.
+    fn prediction(&self, worker: &dyn Worker, req: &PrefixRequest<'_>) -> Option<Arc<Prediction>> {
+        if let Some(prediction) = self.predictions.get(worker.url()) {
+            return Some(prediction.clone());
+        }
+        let key = self
+            .holders
+            .get(worker.url())
+            .and_then(|holders| holders.first().map(|holder| holder.key.clone()))
+            .unwrap_or_else(|| PartitionKey {
+                model_id: worker.model_id().into(),
+                pool: PoolRole::from(worker.worker_type()),
+                block_size: self.block_size,
+            });
+        if req.hashes(key.block_size).is_empty() {
+            return None;
+        }
+        match self.predictions.entry(worker.url().to_string()) {
+            dashmap::Entry::Occupied(entry) => Some(entry.get().clone()),
+            dashmap::Entry::Vacant(entry) => {
+                let partition = self.partition(&key);
+                let id = partition.take_lane()?;
+                let prediction = Arc::new(Prediction {
+                    holder: Holder {
+                        key,
+                        partition,
+                        id,
+                        trust: Trust::Partial,
+                    },
+                    until: AtomicU64::new(0),
+                    state: Mutex::new(Predicted {
+                        expiry: HashMap::new(),
+                        next_sweep: Instant::now(),
+                        released: false,
+                    }),
+                });
+                entry.insert(prediction.clone());
+                Some(prediction)
+            }
+        }
+    }
+
+    /// Gives back the lanes of predictions whose last TTL has ended, so an idle or removed
+    /// worker keeps none. Runs at most once per eighth of the TTL.
+    fn reclaim(&self, now: Instant) {
+        {
+            let mut next = self.next_reclaim.lock();
+            if now < *next {
+                return;
+            }
+            *next = now + self.ttl / 8;
+        }
+        let now = self.nanos(now);
+        let idle: Vec<(String, Arc<Prediction>)> = self
+            .predictions
+            .iter()
+            .filter(|entry| entry.until.load(Ordering::Relaxed) <= now)
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect();
+        for (url, prediction) in idle {
+            let mut state = prediction.state.lock();
+            if state.released || prediction.until.load(Ordering::Relaxed) > now {
+                continue;
+            }
+            let ops: Vec<IndexOp> = state
+                .expiry
+                .drain()
+                .map(|(hash, _)| IndexOp::Remove {
+                    hash,
+                    tier: Tier::Device,
+                })
+                .collect();
+            prediction
+                .holder
+                .partition
+                .index
+                .apply(prediction.holder.id, &ops);
+            state.released = true;
+            drop(state);
+            self.predictions
+                .remove_if(&url, |_, current| Arc::ptr_eq(current, &prediction));
+            prediction
+                .holder
+                .partition
+                .release_lane(prediction.holder.id);
+        }
     }
 
     fn walk<'w>(walks: &'w mut Vec<Walk>, holder: &Holder) -> &'w mut Walk {
@@ -327,7 +439,10 @@ impl PrefixMatchProvider for IndexProvider {
         req: &PrefixRequest<'_>,
         workers: &[Arc<dyn Worker>],
     ) -> Vec<Option<CacheHit>> {
-        let now = Instant::now();
+        if req.multimodal {
+            return vec![None; workers.len()];
+        }
+        let now = self.nanos(Instant::now());
         let mut evidence = vec![Evidence::default(); workers.len()];
         let mut walks = Vec::new();
         for (i, worker) in workers.iter().enumerate() {
@@ -344,8 +459,11 @@ impl PrefixMatchProvider for IndexProvider {
             if evidence[i].exact {
                 continue;
             }
-            if let Some(mut prediction) = self.predictions.get_mut(worker.url()) {
-                prediction.expire(now);
+            if let Some(prediction) = self
+                .predictions
+                .get(worker.url())
+                .filter(|prediction| prediction.until.load(Ordering::Relaxed) > now)
+            {
                 Self::walk(&mut walks, &prediction.holder).lanes.push((
                     i,
                     prediction.holder.id,
@@ -375,55 +493,46 @@ impl PrefixMatchProvider for IndexProvider {
         evidence.into_iter().map(Evidence::into_hit).collect()
     }
 
+    /// Exact workers get predictions too, used once their trust drops. Expired blocks
+    /// leave the index at most an eighth of the TTL late.
     fn on_routed(&self, worker: &dyn Worker, req: &PrefixRequest<'_>) {
-        if self.exact(worker.url()) {
+        if req.multimodal {
             return;
         }
-        let now = Instant::now();
-        let mut prediction = match self.predictions.entry(worker.url().to_string()) {
-            dashmap::Entry::Occupied(entry) => entry.into_ref(),
-            dashmap::Entry::Vacant(entry) => {
-                let key = self
-                    .holders
-                    .get(worker.url())
-                    .and_then(|holders| holders.first().map(|holder| holder.key.clone()))
-                    .unwrap_or_else(|| PartitionKey {
-                        model_id: worker.model_id().into(),
-                        pool: PoolRole::from(worker.worker_type()),
-                        block_size: self.block_size,
-                    });
-                let partition = self.partition(&key);
-                let Some(id) = partition.take_lane() else {
-                    return;
-                };
-                entry.insert(Prediction {
-                    holder: Holder {
-                        key,
-                        partition,
-                        id,
-                        trust: Trust::Partial,
-                    },
-                    expiry: HashMap::new(),
-                    queue: VecDeque::new(),
-                })
+        self.reclaim(Instant::now());
+        // A prediction released meanwhile is replaced once.
+        for _ in 0..2 {
+            let Some(prediction) = self.prediction(worker, req) else {
+                return;
+            };
+            let mut state = prediction.state.lock();
+            if state.released {
+                continue;
             }
-        };
-        prediction.expire(now);
-        let hashes = req.hashes(prediction.holder.key.block_size);
-        let deadline = now + self.ttl;
-        let ops: Vec<IndexOp> = hashes
-            .iter()
-            .filter(|hash| prediction.expiry.insert(**hash, deadline).is_none())
-            .map(|&hash| IndexOp::Store {
-                hash,
-                tier: Tier::Device,
-            })
-            .collect();
-        prediction
-            .holder
-            .partition
-            .index
-            .apply(prediction.holder.id, &ops);
-        prediction.queue.push_back((deadline, hashes));
+            let now = Instant::now();
+            let mut ops = Vec::new();
+            if now >= state.next_sweep {
+                state.next_sweep = now + self.ttl / 8;
+                state.expire(now, &mut ops);
+            }
+            let deadline = now + self.ttl;
+            for &hash in req.hashes(prediction.holder.key.block_size).iter() {
+                if state.expiry.insert(hash, deadline).is_none() {
+                    ops.push(IndexOp::Store {
+                        hash,
+                        tier: Tier::Device,
+                    });
+                }
+            }
+            prediction
+                .holder
+                .partition
+                .index
+                .apply(prediction.holder.id, &ops);
+            prediction
+                .until
+                .store(self.nanos(deadline), Ordering::Relaxed);
+            return;
+        }
     }
 }
