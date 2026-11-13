@@ -9,12 +9,13 @@ to JSON. That token comes from the last chunk's logits, so it depends on every
 chunk and on nothing decode does.
 
 ``compare A.json B.json`` reports per prompt whether the greedy tokens match,
-how many top-20 ids the two share and the largest |delta probability|, and
-exits 1 when that delta exceeds --threshold anywhere. Probability, not logprob:
-rounding moves top-20 tail logprobs at -10 to -25 by several nats. The default
-threshold holds only on text the model predicts near-certainly, such as
-``pydoc_data/topics.py``: where two tokens nearly tie, as in GSM8K, rounding
-alone moves their probability by up to 0.25.
+how many top-20 ids the two share, and the largest |delta logprob| and
+|delta probability|. It exits 1 when the probability delta exceeds --threshold
+anywhere or a logprob is NaN. Probability gates, not logprob: rounding moves
+the far tail of the top 20 by whole nats while its probability barely changes.
+The default threshold holds only on text the model predicts near-certainly,
+such as ``pydoc_data/topics.py``: where two tokens nearly tie, rounding alone
+can move their probabilities past it.
 
 To run another tree, launch from its root with ``PYTHONPATH=<tree>``.
 """
@@ -118,9 +119,9 @@ def top_of(record):
 
 
 def gap(top_a, top_b, token):
-    """|delta probability| of one token, or the part of it the two top lists prove.
+    """|delta| of one token's logprob or probability, or the part the lists prove.
 
-    A token missing from a list sits at or below that list's last probability.
+    A token missing from a list sits at or below that list's last value.
     """
     if token not in top_b:
         return max(0.0, top_a[token] - min(top_b.values()))
@@ -130,16 +131,22 @@ def gap(top_a, top_b, token):
 
 
 def compare(a, b):
-    """Per prompt: (greedy tokens match, shared top ids, max |delta probability|)."""
+    """Per prompt: (greedy tokens match, shared top ids, max |delta logprob|,
+    max |delta probability|); both deltas are inf where a logprob is NaN."""
     if [p["sha256"] for p in a["prompts"]] != [p["sha256"] for p in b["prompts"]]:
         raise ValueError("the two runs were given different prompts")
     rows = []
     for pa, pb in zip(a["prompts"], b["prompts"]):
-        top_a = {t: math.exp(v) for t, v in zip(pa["top_ids"], pa["top_logprobs"])}
-        top_b = {t: math.exp(v) for t, v in zip(pb["top_ids"], pb["top_logprobs"])}
-        delta = max(gap(top_a, top_b, t) for t in top_a.keys() | top_b.keys())
+        lp_a = dict(zip(pa["top_ids"], pa["top_logprobs"]))
+        lp_b = dict(zip(pb["top_ids"], pb["top_logprobs"]))
+        p_a = {t: math.exp(v) for t, v in lp_a.items()}
+        p_b = {t: math.exp(v) for t, v in lp_b.items()}
+        ids = lp_a.keys() | lp_b.keys()
+        deltas = [max(gap(x, y, t) for t in ids) for x, y in [(lp_a, lp_b), (p_a, p_b)]]
+        if any(map(math.isnan, [*lp_a.values(), *lp_b.values()])):
+            deltas = [math.inf, math.inf]
         rows.append(
-            (pa["token"] == pb["token"], len(top_a.keys() & top_b.keys()), delta)
+            (pa["token"] == pb["token"], len(lp_a.keys() & lp_b.keys()), *deltas)
         )
     return rows
 
@@ -173,15 +180,15 @@ def main(argv=None):
             runs.append(json.load(f))
     rows = compare(*runs)
     print(f"A {runs[0]['commit']}  B {runs[1]['commit']}")
-    print("prompt  offset  match  overlap  max|delta p|")
-    for i, (prompt, (match, overlap, delta)) in enumerate(
+    print("prompt  offset  match  overlap  max|delta logprob|  max|delta p|")
+    for i, (prompt, (match, overlap, d_logprob, delta)) in enumerate(
         zip(runs[0]["prompts"], rows)
     ):
         print(
             f"{i:>6}  {prompt['offset']:>6}  {'yes' if match else 'no':>5}  "
-            f"{overlap:>4}/{TOP_LOGPROBS}  {delta:.4f}"
+            f"{overlap:>4}/{TOP_LOGPROBS}  {d_logprob:>18.2f}  {delta:.4f}"
         )
-    failed = [i for i, (_, _, delta) in enumerate(rows) if delta > args.threshold]
+    failed = [i for i, (*_, delta) in enumerate(rows) if delta > args.threshold]
     print(f"{'FAIL' if failed else 'PASS'} at threshold {args.threshold}: {failed}")
     return int(bool(failed))
 
