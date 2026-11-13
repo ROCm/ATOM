@@ -542,10 +542,10 @@ def front_any(c):
 # fmt: off
 
 
-RCTA0, NRC = 128, 128
+RCTA0, NRC = 160, 96   # the 96 CTAs past the owners: a router CTA that is also an owner started its MoE ~7 us late
 TKPUB, TKCTA = False, 124
 SHE_TOPK_FIRST = False   # (v2) the shared-UG CTAs run their top-k while their UG weights load, before waiting for x8   # (v2) one top-k CTA (idle: no shared UG, no router) publishes the picks as LL words
-EPR = NE // NRC          # 6 experts a router CTA
+EPR = -(-NE // NRC)          # 4 experts a router CTA (the draft's 128: 2)
 NCHUNK = H // 8          # 640 16-byte chunks a row
 NI = NE // 32            # 12 experts a lane in the top-k
 
@@ -611,10 +611,10 @@ def router_gate_pre(c):
     while the owner post runs, not after it (router_v2 with gate_pre then skips them)."""
     t, b, sm = c["t"], c["b"], c["sm"]
     NE_ = c.get("ne", NE)   # (draft: 128 experts, 1 a router CTA)
-    EPR_ = NE_ // NRC
+    EPR_ = -(-NE_ // NRC)
     e0 = (b - RCTA0) * EPR_
     q = [t, t + 256, fx.min(t + 512, I32(NCHUNK - 1))]
-    G = [[hx.gload(c["gate"] + i64((e0 + e) * H + q[j] * 8) * 2, BF16, 8, align=16) for j in range(3)] for e in range(EPR_)]
+    G = [[hx.gload(c["gate"] + i64(fx.min(e0 + e, I32(NE_ - 1)) * H + q[j] * 8) * 2, BF16, 8, align=16) for j in range(3)] for e in range(EPR_)]
     for e in range_constexpr(EPR_):
         for j in range_constexpr(3):
             hx.lstore(sm + GL_OFF + e * GL_STR + q[j] * 16, G[e][j], align=16)
@@ -627,11 +627,11 @@ def router_v2(c, TR):
     the K split over the 8 waves (20 steps each), A from the LDS copy of the gate rows, B the rows' xn from global."""
     t, b, w, l, sm = c["t"], c["b"], c["w"], c["l"], c["sm"]
     NE_ = c.get("ne", NE)   # (draft: 128 experts, 1 a router CTA)
-    EPR_ = NE_ // NRC
+    EPR_ = -(-NE_ // NRC)
     e0 = (b - RCTA0) * EPR_
     q = [t, t + 256, fx.min(t + 512, I32(NCHUNK - 1))]
     if fx.const_expr("gate_pre" not in c):
-        G = [[hx.gload(c["gate"] + i64((e0 + e) * H + q[j] * 8) * 2, BF16, 8, align=16) for j in range(3)] for e in range(EPR_)]
+        G = [[hx.gload(c["gate"] + i64(fx.min(e0 + e, I32(NE_ - 1)) * H + q[j] * 8) * 2, BF16, 8, align=16) for j in range(3)] for e in range(EPR_)]
     SELFN = "x1g" in c   # (v2) normalize x1 here (TileRT: the router reads x and computes the rms itself)
     if fx.const_expr(SELFN):   # the norm weight too, before the wait (not a second dependent trip after the x1 rows)
         NV = [hx.gload(c["nw"] + i64(q[j] * 8) * 2, BF16, 8, align=16) for j in range(3)]
@@ -706,7 +706,8 @@ def router_v2(c, TR):
         for ww in range_constexpr(8):
             s = s + hx.lload(sm + ((ww * EPR_ + e) * 8 + r_) * 4, F32)
         sc = _score(bf(s).to(F32))
-        hx.put(c["scores"] + i64(r_ * NE_ + e0 + e) * 8, sc.bitcast(I32), c["tag"])
+        if e0 + e < NE_:   # (the draft's 128 experts: 2 a CTA, the CTAs past them none)
+            hx.put(c["scores"] + i64(r_ * NE_ + e0 + e) * 8, sc.bitcast(I32), c["tag"])
 
 
 @ASTRewriter.transform
