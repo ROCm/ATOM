@@ -31,7 +31,11 @@ def manager(monkeypatch):
         monkeypatch.delenv(name, raising=False)
     manager = CoreManager.__new__(CoreManager)
     manager._init_shared_state(
-        SimpleNamespace(dp_load_balance="round_robin"),
+        SimpleNamespace(
+            dp_load_balance="round_robin",
+            keep_finished_outputs=False,
+            asyncio_mode=False,
+        ),
         label="test",
         local_engine_count=0,
     )
@@ -116,6 +120,8 @@ def test_separate_stores_have_distinct_ports_and_keys(manager):
         manager._start_distributed_store(config)
     ports = [config.parallel_config.data_parallel_base_port for config in configs]
     assert ports[0] != ports[1]
+    ids = [config.parallel_config.server_instance_id for config in configs]
+    assert all(ids) and ids[0] != ids[1]
     clients = [dist.TCPStore("127.0.0.1", port, is_master=False) for port in ports]
     for i, client in enumerate(clients):
         client.set("same-key", str(i))
@@ -183,9 +189,11 @@ def _model_runner_worker(pc, layout, global_rank):
     config = SimpleNamespace(
         parallel_config=pc,
         tensor_parallel_size=tp,
+        sequence_parallel_size=1,
         tp_world_size=tp,
         pipeline_parallel_size=pp,
         prefill_context_parallel_size=pcp,
+        pcp_group_size=pcp,
         decode_context_parallel_size=dcp,
         master_addr="127.0.0.1",
         port=0,

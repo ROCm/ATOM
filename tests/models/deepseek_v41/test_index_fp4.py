@@ -32,14 +32,14 @@ def _rope():
     ).cuda()  # fmt: skip
 
 
-def _pool(pages, per_page):
+def _pool(pages, per_page, layout="preshuffle"):
     """One owner's two FP4 planes, `[pages, rows, bytes]`, and their units."""
     from atom.model_ops.deepseek_v41.index_plane import IndexUnits
 
     values = torch.zeros(pages, per_page, DIM // 2, dtype=torch.uint8, device="cuda")
     scales = torch.zeros(pages, per_page, DIM // 32, dtype=torch.uint8, device="cuda")
     units = IndexUnits(
-        values.view(-1, PAGE, DIM // 2), scales.view(-1, PAGE, DIM // 32)
+        values.view(-1, PAGE, DIM // 2), scales.view(-1, PAGE, DIM // 32), layout
     )
     return values, scales, units
 
@@ -62,8 +62,11 @@ def _write(keys, table, per_page, ratio, rows, units, norm, rope, batch=0):
     return torch.where(plan[:, 1] >= 0, slots, -1)
 
 
+@pytest.mark.parametrize("layout", ["preshuffle", "natural", "mfma"])
 @pytest.mark.parametrize("ratio", [1, 2])
-def test_fp4_writer_stores_the_quantized_key_in_the_rowgroup_layout(monkeypatch, ratio):
+def test_fp4_writer_stores_the_quantized_key_in_the_selected_layout(
+    monkeypatch, ratio, layout
+):
     """Bytes equal to the model's own key chain (RMSNorm, RoPE, `quantize_fp4`)
     packed by the scorer's `pack_kv_cache` at the slot the plan and PAGE table
     give; a sentinel row writes nothing."""
@@ -74,9 +77,10 @@ def test_fp4_writer_stores_the_quantized_key_in_the_rowgroup_layout(monkeypatch,
     from atom.model_ops.blockscale import quantize_fp4
 
     torch.manual_seed(0)
-    pages, per_page = 4, 64
+    pages, per_page = 4, 128 // ratio
     norm, rope = _norm(monkeypatch), _rope()
     values, scales, units = _pool(pages, per_page)
+    units = units._replace(layout=layout)
     table = torch.tensor([[2, 0, 3, 1]], dtype=torch.int32, device="cuda")
     rows = pages * per_page
     keys = (3 * torch.randn(rows, DIM, device="cuda")).bfloat16()
@@ -90,13 +94,23 @@ def test_fp4_writer_stores_the_quantized_key_in_the_rowgroup_layout(monkeypatch,
     natural_s = torch.zeros(rows, DIM // 32, dtype=torch.uint8, device="cuda")
     natural_v[slots[live]] = ref_v.view(torch.uint8)[live]
     natural_s[slots[live]] = ref_s.view(torch.uint8)[live]
-    packed_v, packed_s = pack_kv_cache(natural_v, natural_s, PAGE)
+    if layout == "mfma":
+        packed_v = natural_v.view(-1, 64, 4, 16).permute(0, 2, 1, 3).contiguous()
+        packed_s = natural_s.view(-1, 2, 32, 2, 2).permute(0, 4, 2, 3, 1).contiguous()
+    else:
+        packed_v, packed_s = (
+            (natural_v, natural_s)
+            if layout == "natural"
+            else pack_kv_cache(natural_v, natural_s, PAGE)
+        )
     assert torch.equal(values.flatten(), packed_v.flatten())
     assert torch.equal(scales.flatten(), packed_s.flatten())
 
 
-@pytest.mark.parametrize("far", [False, True])
-def test_fp4_scorer_selects_the_official_top_k(monkeypatch, far):
+@pytest.mark.parametrize(
+    "layout,far", [("preshuffle", False), ("preshuffle", True), ("mfma", False)]
+)
+def test_fp4_scorer_selects_the_official_top_k(monkeypatch, far, layout):
     """The FP4 plane's scoring (`quantize_query_fp4` with the query's RoPE,
     `score_topk_quantized`) picks the rows the official FP4 arithmetic ranks
     highest (q after its bf16 RoPE and k through `quantize_fp4`, fp32 logits
@@ -113,7 +127,7 @@ def test_fp4_scorer_selects_the_official_top_k(monkeypatch, far):
     # pages past 4.5 GiB of values when far
     skip = (9 << 29) // (per_page * DIM // 2) if far else 0
     norm, rope = _norm(monkeypatch), _rope()
-    _, _, units = _pool(skip + pages, per_page)
+    _, _, units = _pool(skip + pages, per_page, layout)
     table = torch.tensor([[2, 0, 3, 1]], dtype=torch.int32, device="cuda") + skip
     width = pages * per_page
     keys = (3 * torch.randn(width, DIM, device="cuda")).bfloat16()
@@ -132,7 +146,7 @@ def test_fp4_scorer_selects_the_official_top_k(monkeypatch, far):
     visible = torch.tensor([0, 1, 33, 64, 129, 511, 512], device="cuda").int()
     weights_scale = (HEADS * DIM) ** -0.5
     selected, _ = scoring.score_topk_quantized(
-        scoring.quantize_query_fp4(query, rope, q_pos), weights, units, tiles,
+        scoring.quantize_query_fp4(query, rope, q_pos, layout=layout), weights, units, tiles,
         visible, topk=topk, weight_scale=weights_scale,
     )  # fmt: skip
 
@@ -159,9 +173,12 @@ def test_fp4_scorer_selects_the_official_top_k(monkeypatch, far):
             assert abs(row[i] - threshold) <= tol, (r, i, row[i], threshold)
 
 
+@pytest.mark.parametrize("layout", ["preshuffle", "mfma"])
 @pytest.mark.parametrize("band", [None, 3])
 @pytest.mark.parametrize("lengths", [(3, 2), (20, 1)])
-def test_fp4_rows_by_sequence_select_what_rows_alone_do(monkeypatch, band, lengths):
+def test_fp4_rows_by_sequence_select_what_rows_alone_do(
+    monkeypatch, band, lengths, layout
+):
     """A request's rows as one sequence (`ragged`: its rows share each key
     load) select exactly what scoring every row alone does: ragged requests (a
     decode step's few rows, or a prefill's more than one M tile holds), an
@@ -179,7 +196,7 @@ def test_fp4_rows_by_sequence_select_what_rows_alone_do(monkeypatch, band, lengt
         monkeypatch.setattr(chunk, "plane_rows", lambda width: band)
     torch.manual_seed(3)
     pages, per_page = 8, 128
-    _, _, units = _pool(pages, per_page)
+    _, _, units = _pool(pages, per_page, layout)
     for t in (units.values, units.scales):
         t.copy_(torch.randint(0, 256, t.shape, dtype=torch.uint8, device="cuda"))
     units.scales.clamp_(120, 132)
@@ -200,7 +217,7 @@ def test_fp4_rows_by_sequence_select_what_rows_alone_do(monkeypatch, band, lengt
     rows = visible.numel()
     query = scoring.quantize_query_fp4(
         torch.randn(rows, HEADS, DIM, device="cuda").bfloat16(), _rope(),
-        torch.randint(0, 1 << 16, (rows,), device="cuda"),
+        torch.randint(0, 1 << 16, (rows,), device="cuda"), layout=layout,
     )  # fmt: skip
     weights = torch.rand(rows, HEADS, device="cuda").bfloat16()
 
@@ -262,8 +279,9 @@ def _plan_step(workspace, seen):
     return score_layout(step, 1)
 
 
+@pytest.mark.parametrize("layout", ["preshuffle", "mfma"])
 @pytest.mark.parametrize("capacity", [1 << 16, 640])
-def test_fp4_packed_rows_select_and_pick_what_the_plane_does(capacity):
+def test_fp4_packed_rows_select_and_pick_what_the_plane_does(capacity, layout):
     """A whole-context layer's logits packed (`PackedRows`: each row at its
     band offset in a flat buffer) select the same rows and pick the same
     candidate blocks as the plane: one band, and bands of a row or two
@@ -274,7 +292,7 @@ def test_fp4_packed_rows_select_and_pick_what_the_plane_does(capacity):
 
     torch.manual_seed(5)
     pages, per_page = 8, 128
-    _, _, units = _pool(pages, per_page)
+    _, _, units = _pool(pages, per_page, layout)
     for t in (units.values, units.scales):
         t.copy_(torch.randint(0, 256, t.shape, dtype=torch.uint8, device="cuda"))
     units.scales.clamp_(120, 132)
@@ -288,7 +306,7 @@ def test_fp4_packed_rows_select_and_pick_what_the_plane_does(capacity):
     rows = visible.numel()
     query = scoring.quantize_query_fp4(
         torch.randn(rows, HEADS, DIM, device="cuda").bfloat16(), _rope(),
-        torch.randint(0, 1 << 16, (rows,), device="cuda"),
+        torch.randint(0, 1 << 16, (rows,), device="cuda"), layout=layout,
     )  # fmt: skip
     weights = torch.rand(rows, HEADS, device="cuda").bfloat16()
     ragged = Fp4MqaRaggedMetadata(starts, 3, tables, per_page // PAGE)
@@ -367,3 +385,84 @@ def test_fp4_scorer_builds_one_kernel_for_every_band_length():
             visible, topk=64, weight_scale=(HEADS * DIM) ** -0.5,
         )  # fmt: skip
     assert rg.compile_pa_mqa_logits_fp4_rowgroup.cache_info().misses == 1
+
+
+@pytest.mark.parametrize("per_page", [64, 128])
+def test_mfma_candidates_cross_groups_and_replay(per_page):
+    """Candidate IDs stay page-8 IDs across 64-row groups and PAGE boundaries."""
+    from atom.model_ops.blockscale import quantize_fp4
+    from atom.model_ops.deepseek_v41 import paged_scoring as scoring
+    from atom.model_ops.deepseek_v41.candidate_table import bind_candidates
+
+    torch.manual_seed(6952)
+    rows, topk = 3, 16
+    values, scales, units = _pool(4, per_page, "mfma")
+    key = torch.randn(4 * per_page, DIM, dtype=torch.bfloat16, device="cuda")
+    kv, ks = quantize_fp4(key, group_size=32, scale_dtype=torch.float8_e8m0fnu)
+    values.copy_(
+        kv.view(torch.uint8).view(-1, 64, 4, 16).permute(0, 2, 1, 3).reshape_as(values)
+    )
+    scales.copy_(
+        ks.view(torch.uint8)
+        .view(-1, 2, 32, 2, 2)
+        .permute(0, 4, 2, 3, 1)
+        .reshape_as(scales)
+    )
+    table = torch.tensor([[2, 0, 3, 1]], dtype=torch.int32, device="cuda")
+    ids = torch.tensor(
+        [[0, 1, 7, 8, 15, 16, 23, 25], [2, 3, 6, 9, 11, 20, 24, 31], [-1] * 8],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    owners = torch.tensor([0, 0, -1], dtype=torch.int32, device="cuda")
+    visible = torch.tensor([205, 256, 0], dtype=torch.int32, device="cuda")
+    q = torch.randn(rows, HEADS, DIM, dtype=torch.bfloat16, device="cuda")
+    rope, pos = _rope(), torch.tensor([201, 253, 0], device="cuda")
+    weights = torch.rand(rows, HEADS, dtype=torch.bfloat16, device="cuda")
+    query = scoring.quantize_query_fp4(q, rope, pos, layout="mfma")
+    kd = quantize_fp4(key, group_size=32, dequantize=True).float()
+    kd = kd.view(4, per_page, DIM)[table[0].long()].reshape(-1, DIM)
+    qd = quantize_fp4(rope(q[None], pos)[0], group_size=32, dequantize=True).float()
+
+    def run():
+        candidates = bind_candidates(
+            ids, table, owners, per_page // PAGE, visible, rows_per_block=PAGE
+        )
+        return scoring.score_topk_quantized(
+            query, weights, units, None, visible, topk=topk, candidates=candidates
+        )[0]
+
+    def check(selected):
+        logits = (
+            torch.einsum("rhd,kd->rkh", qd, kd).relu() * weights.float()[:, None]
+        ).sum(-1)
+        for r in range(rows):
+            eligible = (
+                ids[r, :, None] * PAGE + torch.arange(PAGE, device="cuda")
+            ).flatten()
+            eligible = eligible[(eligible >= 0) & (eligible < visible[r])].long()
+            got = selected[r][selected[r] >= 0].long()
+            assert got.numel() == min(topk, eligible.numel())
+            if not got.numel():
+                continue
+            assert torch.isin(got, eligible).all()
+            threshold = logits[r, eligible].topk(topk).values[-1]
+            assert (logits[r, got] >= threshold - 1e-4 * logits[r].abs().max()).all()
+
+    check(run())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        selected = run()
+    weights.mul_(0.7)
+    # Same pointers, different candidate tables, including the partial tail.
+    ids[0, :4] = torch.tensor([2, 3, 9, 10], device="cuda")
+    graph.replay()
+    check(selected)
+    # Relocate whole PAGEs, as pool transfer/prefix copies do: both ratio-2
+    # (one group) and ratio-1 (two groups) keep every group within its PAGE.
+    move = torch.tensor([2, 0, 3, 1], device="cuda")
+    values.copy_(values[move])
+    scales.copy_(scales[move])
+    table.copy_(move.argsort()[table.long()].int())
+    graph.replay()
+    check(selected)

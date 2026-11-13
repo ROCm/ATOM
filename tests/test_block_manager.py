@@ -2,11 +2,14 @@
 # Tests for atom/model_engine/block_manager.py — public API only
 
 import logging
+import sys
+from types import SimpleNamespace
 
 import pytest
 from conftest import MockConfig
 
 from atom.model_engine import block_manager as bm_module
+from atom.model_engine import state_offload as so
 from atom.model_engine.block_manager import BlockManager
 
 # ── compute_hash ───────────────────────────────────────────────────────────
@@ -1368,3 +1371,27 @@ class TestJointChunkProbeIsGated:
         # Exercise the missing dependency even in images with LMCache installed.
         assert bm._joint_chunk_tokens == 0
         assert "LMCache chunk size" in caplog.text
+
+
+class TestStateTierVerifyWindow:
+    """The state tier's confirmation window comes from the LMCache pool,
+    read in `state_offload`, not here."""
+
+    def test_the_block_manager_sizes_the_window_from_the_lmcache_pool(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "atom.kv_transfer.offload.config.build_lmcache_config",
+            lambda kvcfg: SimpleNamespace(chunk_size=256, max_local_cpu_size=100),
+        )
+        bm = _bm_with_state_tier(monkeypatch, _OFFLOAD_KVC)
+        assert bm._joint_chunk_tokens == 256
+        assert bm.state_offload.verified_for_s == pytest.approx(25.0)
+
+    def test_an_unreadable_lmcache_config_gets_the_floor(self, monkeypatch, caplog):
+        monkeypatch.setitem(sys.modules, "lmcache.v1.config", None)
+        with caplog.at_level(logging.WARNING, logger="atom"):
+            bm = _bm_with_state_tier(monkeypatch, _OFFLOAD_KVC)
+        assert bm._joint_chunk_tokens == 0
+        assert bm.state_offload.verified_for_s == so.tier_verified_for_s(0)
+        assert sum(r.exc_info is not None for r in caplog.records) == 1

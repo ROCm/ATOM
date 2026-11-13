@@ -113,3 +113,109 @@ def test_outer_only_fields_still_resolve():
 def test_flat_config_is_unaffected():
     cfg = build_offload_config(_vllm_config())
     assert cfg.hf_config.num_hidden_layers == 60
+
+
+def test_per_process_speculative_fields_stay_out_of_the_page_namespace():
+    """vLLM fills these in per process; hashed, they split one deployment's
+    PAGE namespace between its scheduler and its workers."""
+    from atom.kv_transfer.offload import config as offcfg
+
+    def namespace(rank, drop):
+        vllm_config = _vllm_config()
+        vllm_config.speculative_config = NS(
+            method="dspark",
+            model="/d",
+            num_speculative_tokens=3,
+            disable_eagle_block_drop=drop,
+            target_parallel_config=NS(rank=rank),
+            draft_parallel_config=NS(rank=rank),
+            target_model_config=NS(filled=rank),
+            draft_model_config=NS(filled=rank),
+            draft_load_config=NS(filled=rank),
+        )
+        cfg = build_offload_config(vllm_config)
+        assert cfg.offload_speculative_config == {
+            "method": "dspark",
+            "model": "/d",
+            "num_speculative_tokens": 3,
+        }
+        return offcfg.build_page_namespace(cfg, NS(chunk_size=256), 4)
+
+    assert namespace(0, False) == namespace(3, True)
+
+
+def _v41_vllm_config(cache_dtype="nvfp4", **kw):
+    cfg = _vllm_config(cache_dtype=cache_dtype, **kw)
+    cfg.model_config.hf_config = NS(
+        num_hidden_layers=43,
+        model_type="deepseek_v41",
+        architectures=["DeepseekV41ForCausalLM"],
+        sliding_window=128,
+        candidate_block_size=8,
+    )
+    return cfg
+
+
+@pytest.mark.parametrize("raw, expected", [("nvfp4", "fp4"), ("auto", "bf16")])
+def test_v41_names_its_pool_dtype_as_the_bridge_sizes_it(raw, expected):
+    """`nvfp4` is ATOM's packed fp4 pool, which the generic map refuses."""
+    assert build_offload_config(_v41_vllm_config(raw)).kv_cache_dtype == expected
+
+
+@pytest.mark.parametrize(
+    "given, resolved", [(None, True), ("auto", True), (False, False)]
+)
+def test_v41_resolves_auto_collapse_itself(given, resolved):
+    """The shared `auto` rule reads fields V4.1's pool does not describe."""
+    extra = {} if given is None else {"lmcache.mp.tp_rank_collapse": given}
+    cfg = build_offload_config(_v41_vllm_config(extra=extra))
+    assert cfg.kv_transfer_config["lmcache.mp.tp_rank_collapse"] is resolved
+    nested = cfg.kv_transfer_config["kv_connector_extra_config"]
+    assert nested["lmcache.mp.tp_rank_collapse"] is resolved
+
+
+def test_other_models_keep_auto_collapse_for_the_shared_rule():
+    cfg = build_offload_config(_vllm_config(extra={}))
+    assert "lmcache.mp.tp_rank_collapse" not in cfg.kv_transfer_config
+
+
+def test_a_worker_hashes_the_geometry_from_before_it_built_the_model():
+    """vLLM builds a worker's model before its KV connector, and an ATOM model
+    may normalise `hf_config` on the way (Kimi-K3 writes `head_dim`); the
+    scheduler builds none. The snapshot taken first keeps them on one
+    namespace."""
+    from atom.kv_transfer.offload import config as offcfg
+    from atom.plugin.vllm.kv_transfer.offload_config import remember_page_geometry
+
+    def namespace(vllm_config):
+        cfg = build_offload_config(vllm_config)
+        return offcfg.build_page_namespace(cfg, NS(chunk_size=256), 4)
+
+    scheduler, worker = _vllm_config(), _vllm_config()
+    remember_page_geometry(worker)
+    worker.model_config.hf_config.head_dim = 192
+    assert namespace(scheduler) == namespace(worker)
+
+    # Without the snapshot the live, normalised config splits the two.
+    unsnapshotted = _vllm_config()
+    unsnapshotted.model_config.hf_config.head_dim = 192
+    assert namespace(scheduler) != namespace(unsnapshotted)
+
+
+def test_v41_window_and_candidate_block_move_the_plugins_namespace():
+    """Either one moves the bytes a V4.1 object holds. Hashed by this frontend,
+    which never had V4.1 tiers to keep reachable; the worker's snapshot and
+    the scheduler's fallback hash the same."""
+    from atom.kv_transfer.offload import config as offcfg
+    from atom.plugin.vllm.kv_transfer.offload_config import remember_page_geometry
+
+    def namespace(vllm_config):
+        cfg = build_offload_config(vllm_config)
+        return offcfg.build_page_namespace(cfg, NS(chunk_size=256), 4)
+
+    narrow, wide = _v41_vllm_config(), _v41_vllm_config()
+    wide.model_config.hf_config.sliding_window = 256
+    assert namespace(narrow) != namespace(wide)
+    worker = _v41_vllm_config()
+    remember_page_geometry(worker)
+    assert namespace(worker) == namespace(narrow)

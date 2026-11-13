@@ -103,8 +103,20 @@ class V41PoolGeometry:
     # or the FP4 page-8 layout the row-group scorer reads, values and E8M0
     # scales in two planes (`index_planes`).
     index_fp4: bool = False
+    # Physical ordering supplied by the runtime, independent of byte widths.
+    # None preserves the original FP4 page-8 or FP8 layout for direct callers.
+    index_layout: str | None = None
 
     def __post_init__(self):
+        if self.index_layout is None:
+            object.__setattr__(
+                self, "index_layout", "preshuffle" if self.index_fp4 else "fp8"
+            )
+        layouts = ("preshuffle", "mfma", "natural") if self.index_fp4 else ("fp8",)
+        if self.index_layout not in layouts:
+            raise ValueError(
+                f"Index layout {self.index_layout!r} is not one of {layouts}"
+            )
         if self.speculative_tokens < 0:
             raise ValueError("Speculative window slack cannot be negative")
         if self.kv_dtype not in KV_DTYPES:
@@ -429,6 +441,7 @@ class V41PoolGeometry:
 
     @property
     def layout_id(self):
+        index_format = f"fp4-{self.index_layout}" if self.index_fp4 else "fp8"
         identity = (
             # v2: the compressor's incomplete-group tail became a K_pool ring.
             # Every other term below was already the same in v1, so without the
@@ -441,11 +454,9 @@ class V41PoolGeometry:
             # The index plane's format is here even though no STATE field holds
             # an index row: this string is what a resumed prefix is matched on,
             # and a plane at a different precision selects different rows, so
-            # the prefix is a different computation. It is spelled out rather
-            # than read off a field because FP8 is the only plane the scorer
-            # takes -- an image from a build that had another must not match.
-            # FP4 keeps the name it was published under.
-            f"dsv41-{'packed' if self.packed else self.kv_dtype}-index-fp8"
+            # the prefix is a different computation. FP4 layouts have equal
+            # byte widths but incompatible ordering, so name the layout too.
+            f"dsv41-{'packed' if self.packed else self.kv_dtype}-index-{index_format}"
             f"-state-v3:layers={self.layers}:owners={self.owners}"
             f":block={self.block_size}:window={self.window_size}"
             f":dims={self.head_dim},{self.index_dim}:history={self.history_size}"

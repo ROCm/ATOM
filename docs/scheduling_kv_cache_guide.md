@@ -112,27 +112,31 @@ A new prefill is scheduled only when the earliest waiting request has waited lon
 When a decode step cannot extend a sequence's KV cache (no free blocks), the scheduler preempts the **last** running sequence:
 
 ```python
-def preempt(self, seq: Sequence):
+def preempt(self, seq: Sequence) -> bool:
+    if not self._is_preemptable(seq):
+        return False
+    self.total_preemptions += 1
     seq.status = SequenceStatus.WAITING
-    # Strip placeholder + rejected draft tokens added by postprocess.
-    if self.mtp_k > 0:
-        strip = self.mtp_k + seq.num_rejected
-        if strip > 0:
-            del seq.token_ids[-strip:]
-            del seq.output_tokens[-strip:]
-            seq.num_tokens -= strip
-    seq.num_rejected = 0
-    seq.num_bonus_tokens = 0
-    seq.spec_token_ids = np.array([], dtype=np.int32)
+    # ... strip the placeholder tokens postprocess appended, reset the
+    # speculative state, reset partial-prefill accounting ...
     self.block_manager.deallocate(seq)
-    self.waiting.appendleft(seq)
+    pos = self._behind_settled_resumes()
+    self.waiting.insert(pos, seq)
+    return True
 ```
 
-The scheduler pushes the preempted sequence to the front of the waiting queue, fully deallocates its blocks, and re-prefills it on the next scheduling cycle.
+The scheduler fully deallocates the victim's blocks and re-prefills it from `waiting`. Where it is queued depends on whether an offload tier is configured:
 
-**MTP placeholder stripping:** When speculative decoding is active (`mtp_k > 0`), `postprocess()` appends placeholder tokens (EOS) to running sequences to reserve KV cache slots for the next step (see section 5.6). If a sequence is preempted before those placeholders are consumed, they must be removed so that re-prefill starts from the correct token history. The strip count is `mtp_k + seq.num_rejected` — this accounts for both the `mtp_k` placeholder slots and any tokens that were rejected during the last verification step. The method deletes that many trailing entries from both `seq.token_ids` and `seq.output_tokens` and decrements `seq.num_tokens` accordingly.
+- **No offload tier:** `_behind_settled_resumes()` returns `0`, so the victim goes to the front of `waiting`, as `appendleft` did.
+- **With an offload tier:** the victim is inserted behind the *leading run of settled offload resumes*, i.e. the requests at the head of `waiting` that are back in `WAITING` after a load that finished (or failed) and still holding blocks (`_is_offload_prefill_resume`). Those resumes already hold blocks, and a preempted head that cannot allocate stops admission, so putting the victim in front of them could starve the very resume whose blocks it needs. Requests still in `WAITING_FOR_REMOTE_KVS` (load in flight) inside that run are skipped over and do not end it, but the position is only advanced past them when a settled resume sits behind them; the scan stops at the first queued request that is neither. The victim therefore ends up ahead of all waiters outside that leading run (fresh requests, in-flight loads with no settled resume behind them, failed loads that kept no blocks); an in-flight load sandwiched between two settled resumes stays in front of it.
 
-**Speculative state reset:** After stripping, the sequence's speculative decoding state is fully cleared: `num_rejected` and `num_bonus_tokens` are zeroed, and `spec_token_ids` is set to an empty array. This ensures the sequence re-enters the scheduling pipeline with a clean state — no stale draft predictions or acceptance metadata carry over across preemption.
+**Parked partial prefills** follow the same rule. `_park_ready_offload_partial_prefills` moves a running sequence that the connector asks to park for a load (`should_park_partial_prefill_for_load`, e.g. a partial prefill that has reached a handoff boundary with a load pending) back to `waiting` as `WAITING_FOR_REMOTE_KVS`. It is inserted at `_behind_settled_resumes()` (parked requests keep their relative order), which is behind the leading settled resumes only when the connector is an offload tier and index 0 otherwise, instead of always at the front, so that they do not hide a settled resume from the admission probe, which reads only the first few queue entries.
+
+Settled resumes are promoted ahead of other waiters once, when a load completes or fails (`_prioritize_ready_remote_kv_requests`). Event-free ticks do not re-sort `waiting`; `preempt` and parking are the paths that insert at the head, and they queue behind the resumes.
+
+**Placeholder stripping:** When speculative decoding is active (`mtp_k > 0`) or deferred output is on (the default unless PP, or a P/D producer with recurrent state, turns it off), `postprocess()` appends placeholder tokens (EOS) to running sequences to reserve KV cache slots for the next step (see section 5.6). If a sequence is preempted before those placeholders are consumed, they must be removed so that re-prefill starts from the correct token history. The strip count is `seq.num_placeholder_tokens`, the width `postprocess()` recorded when it appended them (bounded by the generated tokens actually present). The method deletes that many trailing entries from both `seq.token_ids` and `seq.output_tokens` and decrements `seq.num_tokens` accordingly.
+
+**Speculative state reset:** After stripping, the sequence's speculative decoding state is fully cleared: `num_rejected`, `num_bonus_tokens` and `num_placeholder_tokens` are zeroed, and `spec_token_ids` is set to an empty array. This ensures the sequence re-enters the scheduling pipeline with a clean state — no stale draft predictions or acceptance metadata carry over across preemption.
 
 ## ScheduledBatch structure
 
@@ -176,7 +180,7 @@ class ScheduledBatch:
 | `total_seqs_num` | `int` | Total number of sequences in the batch |
 | `total_seqs_num_prefill` | `int` | Number of prefill sequences |
 | `total_seqs_num_decode` | `int` | Number of decode sequences |
-| `is_dummy_run` | `bool` | Whether this is a dummy/warmup run |
+| `is_dummy_run` | `bool` | A fabricated batch: the warmup forward (before the KV pool is bound) or a dynamic-chunking profile; never an idle DP rank's step, which has no request |
 | `num_spec_step` | `int` | Number of speculative decode steps (`mtp_k`) |
 | `scheduled_spec_decode_tokens` | `np.ndarray[int32]` | Draft tokens from the prior speculative step, densified to `[bs, num_spec_step]` in batch order (the constructor takes them keyed by request ID) |
 

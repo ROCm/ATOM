@@ -443,7 +443,7 @@ def test_downstream_reports_ready_without_waiting_for_a_forward(
     proc.utility_handler = MagicMock()
     proc.utility_queue = MagicMock()
     proc.pull_and_process_input_queue = MagicMock(side_effect=[False, True])
-    proc._is_idle_rl_weights_offloaded = lambda: False
+    proc._is_engine_held = lambda: False
     proc.runner_mgr = MagicMock()
     proc.pp_transport = MagicMock()
     report = KVConnectorOutput(

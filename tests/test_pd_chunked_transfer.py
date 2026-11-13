@@ -20,6 +20,7 @@ from atom.kv_transfer.disaggregation.chunked_prefill import (
     ChunkedPrefill,
     PrefillHandoff,
 )
+from atom.kv_transfer.disaggregation.pd_admission import PdAdmissionController
 from atom.kv_transfer.disaggregation.pp_kv_aggregator import PPKVAggregator
 from atom.kv_transfer.disaggregation.types import (
     ConnectorCompletion,
@@ -71,6 +72,9 @@ def producer(pp_rank=0, pp_size=1, num_tokens=10):
     c._start_layer = pp_rank
     c._end_layer = pp_rank + 1
     c._block_region_consumer_indices = None
+    c._block_unit_specs = None
+    c._block_head_major_runs = ()
+    c._unit_layout = None
     c._block_region_roles = [None]
     c._per_block_bytes_list = [4]
     c._completed_prefills_lock = threading.Lock()
@@ -524,7 +528,7 @@ def test_real_scheduler_pins_from_first_chunk_through_final_handoff(
             publish(state, int(batch.context_lens[0]))
         result = ScheduledBatchOutput(
             [seq.id],
-            [(42, 43, 44, 45) if sched.spec_decode_local else (42,)],
+            [(42, 43, 44, 45) if sched.use_spec else (42,)],
             np.array([0]),
             np.array([0]),
             np.array([[43, 44, 45]]) if draft_tokens else None,
@@ -818,6 +822,7 @@ def test_consumer_dispatches_all_pp_stages_without_source_block_ids(
     c._num_local_layers = 3
     c._block_regions = [(100, 4), (200, 4), (300, 4)]
     c._block_region_roles = [None] * 3
+    c._unit_layout = None
     c._has_slot_regions = False
     c.kv_caches_base_addr = [100, 200, 300]
     c._send_on_socket = MagicMock()
@@ -1367,8 +1372,9 @@ def pd_sequence(seq_factory, transfer_id="xfer-a", producer=True):
     )
 
 
+@pytest.mark.parametrize("byte_limit", [False, True])
 def test_opposite_admission_order_progresses_without_recompute(
-    monkeypatch, seq_factory
+    monkeypatch, seq_factory, byte_limit
 ):
     import msgpack
     from conftest import MockConfig
@@ -1376,9 +1382,14 @@ def test_opposite_admission_order_progresses_without_recompute(
     from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
 
     p = Scheduler(MockConfig(num_kvcache_blocks=3, max_num_batched_tokens=4))
-    d = Scheduler(MockConfig(num_kvcache_blocks=3, max_num_batched_tokens=4))
+    # With credits enabled, both prompts physically fit. Only W should stop
+    # the second reservation; P must follow D's admitted order even then.
+    d_blocks = 6 if byte_limit else 3
+    d = Scheduler(MockConfig(num_kvcache_blocks=d_blocks, max_num_batched_tokens=4))
     p.kv_connector = scheduler_connector(monkeypatch, True)
     d.kv_connector = scheduler_connector(monkeypatch, False)
+    if byte_limit:
+        d.pd_admission = PdAdmissionController(12, 4, d.kv_connector, d.block_manager)
     pa, pb = [pd_sequence(seq_factory, name) for name in ("xfer-a", "xfer-b")]
     da, db = [pd_sequence(seq_factory, name, False) for name in ("xfer-a", "xfer-b")]
     p.extend([pa, pb])
@@ -1423,7 +1434,13 @@ def test_opposite_admission_order_progresses_without_recompute(
         batch, seqs = d.schedule()
         assert not seqs
         # A 4-token batch budget still reserves all 10 prompt tokens on D.
-        assert len(ds.block_table) == 3 and d.block_manager.kv.num_free == 0
+        assert len(ds.block_table) == 3
+        assert d.block_manager.kv.num_free == d_blocks - 3
+        if byte_limit:
+            assert set(d.pd_admission.pending) == {str(ds.id)}
+            assert d.pd_admission.pending_bytes == 12
+            if ds is db:
+                assert not da.block_table
         dw.start_load_kv(batch.connector_meta_output)
         # Reserving D's pages alone cannot admit P: the write request still
         # waits in D's queue until prior GPU writes to those pages finish.
@@ -1445,6 +1462,11 @@ def test_opposite_admission_order_progresses_without_recompute(
                 publish(state, end)
                 pw._dispatch_ready_chunked_requests()
                 assert pw.transfer_engine.writes.get(timeout=5)[2] == [4]
+                if byte_limit:
+                    # Bytes are credited for the full destination, not each
+                    # completed chunk. P's final sampling still lies ahead.
+                    assert d.pd_admission.pending_bytes == 12
+                    assert not d.pd_admission.pending[str(ds.id)].ready
                 p.postprocess(
                     list(seqs.values()),
                     ScheduledBatchOutput([ps.id], [(42,)], None, None, None),
@@ -1458,7 +1480,12 @@ def test_opposite_admission_order_progresses_without_recompute(
         p._update_from_kv_xfer_finished(pw.get_finished())
         assert not ps.block_table and p.block_manager.kv.num_free == 3
         d._update_from_kv_xfer_finished(dw.get_finished())
+        if byte_limit:
+            assert d.pd_admission.pending_bytes == 12
+            assert d.pd_admission.pending[str(ds.id)].ready
         batch, seqs = d.schedule()
+        if byte_limit:
+            assert not d.pd_admission.pending
         assert list(seqs) == [ds.id]
         assert batch.total_seqs_num_decode == 1 and batch.total_seqs_num_prefill == 0
         assert d.postprocess(
@@ -1466,7 +1493,8 @@ def test_opposite_admission_order_progresses_without_recompute(
             ScheduledBatchOutput([ds.id], [(43,)], None, None, None),
             batch=batch,
         ) == [ds]
-    assert p.block_manager.kv.num_free == d.block_manager.kv.num_free == 3
+    assert p.block_manager.kv.num_free == 3
+    assert d.block_manager.kv.num_free == d_blocks
     assert not p.deferred_free_blocks and not d.deferred_free_blocks
     assert not pw._pending_chunked_requests and not pw._chunked_local_ids
     assert not p.kv_connector._chunked_waiting and not p.kv_connector._chunked_ready
@@ -1887,6 +1915,9 @@ def test_last_unadmitted_cancel_reaches_worker_despite_idle_throttle(
         dispatch(worker, request)
     assert p.abort_request(seq.id)
     core = EngineCore.__new__(EngineCore)
+    core._kv_progress_event = threading.Event()
+    core.input_queue = queue.Queue()
+    core.utility_queue = queue.Queue()
     core.scheduler = p
     core.kv_transfer_enabled = True
     core.label = "pd-cancel"
@@ -1975,8 +2006,9 @@ def test_admission_timeout_without_decode_retires_all_stages(
 
 @pytest.mark.parametrize("pp_size", [1, 3])
 @pytest.mark.parametrize("cancel_decode", [False, True])
+@pytest.mark.parametrize("admission", [False, True])
 def test_ready_but_capacity_blocked_timeout_preserves_decode_write_safety(
-    monkeypatch, seq_factory, pp_size, cancel_decode
+    monkeypatch, seq_factory, pp_size, cancel_decode, admission
 ):
     import msgpack
     from conftest import MockConfig
@@ -1992,6 +2024,8 @@ def test_ready_but_capacity_blocked_timeout_preserves_decode_write_safety(
         monkeypatch, True, pp_size, admission_timeout_s=10
     )
     d.kv_connector = scheduler_connector(monkeypatch, False)
+    if admission:
+        d.pd_admission = PdAdmissionController(12, 4, d.kv_connector, d.block_manager)
     occupied = seq_factory(list(range(10)))
     assert p.block_manager.allocate(occupied)
     ps = [pd_sequence(seq_factory, f"wait-{i}") for i in range(3)]
@@ -2045,9 +2079,14 @@ def test_ready_but_capacity_blocked_timeout_preserves_decode_write_safety(
     now[0] = 139.0
     d._update_from_kv_xfer_finished(dw.get_finished())
     assert ds.block_table and d.block_manager.kv.num_free == 0
+    if admission:
+        assert d.pd_admission.pending_bytes == 12
+        assert d.pd_admission.pending[str(ds.id)].cancelled is cancel_decode
     now[0] = 140.0
     d._update_from_kv_xfer_finished(dw.get_finished())
     assert not ds.block_table and d.block_manager.kv.num_free == 3
+    if admission:
+        assert not d.pd_admission.pending
     assert ds.leave_reason == "aborted"
     batch, scheduled = d.schedule()
     assert not scheduled and batch.total_seqs_num_prefill == 0
@@ -2086,3 +2125,110 @@ def test_admission_deadline_stops_at_source_allocation(monkeypatch, seq_factory)
     assert list(seq.block_table) == blocks
     assert not seq.kv_transfer_params.get("prefill_aborted")
     assert str(seq.id) in p.kv_connector._awaiting_send
+
+
+def test_a_producer_cancels_a_request_whose_prefill_never_completed(
+    monkeypatch, seq_factory
+):
+    """A request that ends without its prefill completing (rejected as
+    unschedulable before it ran) has no KV and no first token. The chunked
+    producer publishes a cancellation, as for an abort, instead of building a
+    handoff from `output_tokens[0]`; a request whose prefill completed still
+    hands off."""
+    producer = scheduler_connector(monkeypatch, True)
+    unrun = seq_factory(
+        list(range(10)),
+        kv_transfer_params={
+            "chunked_transfer": True,
+            "do_remote_decode": True,
+            "transfer_id": "unschedulable",
+        },
+    )
+    unrun.leave_reason = "unschedulable: prompt exceeds max_model_len"
+    assert not unrun.prefill_completed and len(unrun.output_tokens) == 0
+    producer.request_finished(unrun)
+    params = unrun.kv_transfer_params
+    assert params["prefill_aborted"] is True
+    assert "prefill_handoff" not in params
+    assert producer.build_connector_meta().reqs_to_save[unrun.id].prefill_aborted
+
+    done = seq_factory(
+        list(range(10)),
+        kv_transfer_params={
+            "chunked_transfer": True,
+            "do_remote_decode": True,
+            "transfer_id": "done",
+        },
+    )
+    done.prefill_completed = True
+    done.append_token(7)
+    done.leave_reason = "length"
+    producer.request_finished(done)
+    assert done.kv_transfer_params["prefill_aborted"] is False
+    assert done.kv_transfer_params["prefill_handoff"]["first_token_id"] == 7
+
+
+def test_a_preempted_producer_request_rejected_on_readmission_hands_nothing_off(
+    monkeypatch, seq_factory
+):
+    """A producer request that ran, was preempted (its blocks freed) and is
+    then rejected as unschedulable on re-admission (chunked prefill off, its
+    prompt plus output now over the batch budget) has no KV left to send. Its
+    prefill did complete, so only the reject reason tells the producer: it
+    must publish no handoff and take no send claim."""
+    import numpy as np
+    from conftest import MockConfig
+
+    from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
+    from atom.model_engine.sequence import SequenceStatus
+    from atom.sampling_params import SamplingParams
+
+    sched = Scheduler(
+        MockConfig(
+            max_num_batched_tokens=12,
+            enable_chunked_prefill=False,
+            num_kvcache_blocks=100,
+            kv_cache_block_size=4,
+        )
+    )
+    monkeypatch.setattr(mc, "get_ip", lambda: "127.0.0.1")
+    monkeypatch.setattr(mc, "get_open_port", lambda: 6400)
+    producer = sched.kv_connector = mc.MooncakeConnectorScheduler(
+        SimpleNamespace(
+            kv_transfer_config={"kv_role": "kv_producer"},
+            tensor_parallel_size=1,
+            pipeline_parallel_size=1,
+            parallel_config=SimpleNamespace(data_parallel_size=1, data_parallel_rank=0),
+            kv_cache_block_size=4,
+            decode_context_parallel_size=1,
+        )
+    )
+    seq = seq_factory(
+        list(range(10)),
+        sampling_params=SamplingParams(max_tokens=20, ignore_eos=True),
+        kv_transfer_params={"do_remote_decode": True, "transfer_id": "preempted"},
+    )
+    sched.add(seq)
+    for token in range(100, 104):
+        batch, seqs = sched.schedule()
+        sched.postprocess(
+            list(seqs.values()),
+            ScheduledBatchOutput(
+                [seq.id], [(token,)], np.array([0]), np.array([0]), None
+            ),
+            batch=batch,
+        )
+        if seq.num_tokens > 12:
+            break
+    assert seq.prefill_completed and seq.num_tokens > 12
+    assert sched.preempt(seq)
+    assert not seq.block_table
+
+    sched.schedule()
+
+    assert seq.status == SequenceStatus.FINISHED
+    assert seq.leave_reason.startswith("unschedulable")
+    assert seq.kv_transfer_params_output is None
+    assert str(seq.id) not in producer._awaiting_send
+    assert seq.id not in producer._reqs_need_save
+    assert seq.id not in sched.deferred_free_blocks

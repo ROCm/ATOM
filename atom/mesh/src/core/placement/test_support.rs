@@ -9,7 +9,9 @@ use http::HeaderMap;
 use super::traits::{PolicySource, WorkerSource};
 use super::types::RequestDescriptor;
 use crate::core::{BasicWorkerBuilder, ConnectionMode, HashRing, RuntimeType, Worker, WorkerType};
-use crate::policies::{LoadBalancingPolicy, RoundRobinPolicy, SelectWorkerInfo};
+use crate::policies::{
+    LoadBalancingPolicy, RoundRobinPolicy, RouteDecision, SelectWorkerInfo, NO_HEALTHY_WORKERS,
+};
 
 #[derive(Debug, Clone)]
 pub struct RecordedSelectInfo {
@@ -183,11 +185,11 @@ impl RecordingPolicy {
 
 #[async_trait]
 impl LoadBalancingPolicy for RecordingPolicy {
-    async fn select_worker(
+    async fn select_with_decision(
         &self,
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo<'_>,
-    ) -> Option<usize> {
+    ) -> (Option<usize>, RouteDecision) {
         self.calls.lock().unwrap().push(RecordedSelectInfo {
             request_text: info.request_text.map(|s| s.to_string()),
             tokens: info.tokens.map(|t| t.to_vec()),
@@ -195,7 +197,7 @@ impl LoadBalancingPolicy for RecordingPolicy {
             hash_ring: info.hash_ring.clone(),
             candidate_urls: workers.iter().map(|w| w.url().to_string()).collect(),
         });
-        self.inner.select_worker(workers, info).await
+        self.inner.select_with_decision(workers, info).await
     }
 
     fn name(&self) -> &'static str {
@@ -232,12 +234,12 @@ pub struct AlwaysNonePolicy;
 
 #[async_trait]
 impl LoadBalancingPolicy for AlwaysNonePolicy {
-    async fn select_worker(
+    async fn select_with_decision(
         &self,
         _workers: &[Arc<dyn Worker>],
         _info: &SelectWorkerInfo<'_>,
-    ) -> Option<usize> {
-        None
+    ) -> (Option<usize>, RouteDecision) {
+        (None, RouteDecision::branch(NO_HEALTHY_WORKERS))
     }
 
     fn name(&self) -> &'static str {
@@ -263,15 +265,15 @@ impl StaticNeedsTextPolicy {
 
 #[async_trait]
 impl LoadBalancingPolicy for StaticNeedsTextPolicy {
-    async fn select_worker(
+    async fn select_with_decision(
         &self,
         workers: &[Arc<dyn Worker>],
         _info: &SelectWorkerInfo<'_>,
-    ) -> Option<usize> {
+    ) -> (Option<usize>, RouteDecision) {
         if workers.is_empty() {
-            None
+            (None, RouteDecision::branch(NO_HEALTHY_WORKERS))
         } else {
-            Some(0)
+            (Some(0), RouteDecision::branch("first"))
         }
     }
 
@@ -491,12 +493,12 @@ mod fixture_smoke_tests {
         struct Delegate(AtomicUsize);
         #[async_trait]
         impl LoadBalancingPolicy for Delegate {
-            async fn select_worker(
+            async fn select_with_decision(
                 &self,
                 _: &[Arc<dyn Worker>],
                 _: &SelectWorkerInfo<'_>,
-            ) -> Option<usize> {
-                None
+            ) -> (Option<usize>, RouteDecision) {
+                (None, RouteDecision::branch(NO_HEALTHY_WORKERS))
             }
             fn name(&self) -> &'static str {
                 "delegate"

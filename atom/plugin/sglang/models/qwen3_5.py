@@ -29,6 +29,7 @@ from atom.models.qwen3_5 import (
     Qwen3_5ForCausalLMBase,
     Qwen3_5Model,
     Qwen3_5MoeForCausalLM,
+    _apply_merged_in_proj_mapping,
     detect_fused_expert_format,
     get_fused_expert_mapping,
     load_fused_expert_weights,
@@ -59,14 +60,6 @@ _PACKED_MODULES_MAPPING = {
     "in_proj_a": ("in_proj_ba", 1),
     ".gate.": (".gate.", 0),
     "shared_expert_gate": ("gate", 1),
-}
-
-
-_BF16_IN_PROJ_MAPPING = {
-    "in_proj_qkv": ("in_proj_qkvzba", (0, 1, 2)),
-    "in_proj_z": ("in_proj_qkvzba", 3),
-    "in_proj_b": ("in_proj_qkvzba", 4),
-    "in_proj_a": ("in_proj_qkvzba", 5),
 }
 
 
@@ -136,17 +129,6 @@ def _validate_qwen35_runtime_contract(
         )
 
 
-def _apply_bf16_in_proj_mapping(mapping: dict, atom_config: Any) -> dict:
-    if atom_config.quant_config.global_quant_config.quant_dtype != torch.bfloat16:
-        return mapping
-
-    mapping.pop("in_proj_qkvz", None)
-    mapping.pop("in_proj_ba", None)
-    mapping["in_proj_qkvzba"] = ("in_proj_qkvzba", None)
-    mapping.update(_BF16_IN_PROJ_MAPPING)
-    return mapping
-
-
 def _make_qwen35_hf_mapper(language_model_prefix: str) -> WeightsMapper:
     # Qwen3.5 uses the same HF checkpoint keys for both paths below, but the
     # language-model subtree differs: the SGLang outer wrapper nests it under
@@ -180,11 +162,14 @@ def _patch_qwen35_moe_text_for_sparse_moe_block(hf_config: Any) -> None:
 
 
 def remap_qwen35_quant_config_for_sglang_plugin(atom_config: Any) -> None:
+    # The split mapping, as ModelRunner remaps for the native model: each
+    # projection keeps its own per-layer spec, and `gdn_in_proj_is_merged`
+    # (asked afterwards, by the layers and the mapping below) sees them apart.
+    # A merged remap would fold the in_proj_qkv/z/b/a specs onto one name
+    # before that decision is made.
     atom_config.quant_config.remap_layer_name(
         atom_config.hf_config,
-        packed_modules_mapping=_apply_bf16_in_proj_mapping(
-            dict(_PACKED_MODULES_MAPPING), atom_config
-        ),
+        packed_modules_mapping=dict(_PACKED_MODULES_MAPPING),
         weights_mapper=_QWEN35_ATOM_HF_MAPPER,
     )
 
@@ -474,7 +459,8 @@ class _Qwen3_5ConditionalGenerationSglangBase:
         self.language_model = self.model
         self.atom_config = self.model.atom_config
         self.lm_head = self.model.lm_head
-        self.packed_modules_mapping = _apply_bf16_in_proj_mapping(
+        # The inner ATOM model is built with prefix "" (`model.layers.*`).
+        self.packed_modules_mapping = _apply_merged_in_proj_mapping(
             dict(type(self).packed_modules_mapping), self.atom_config
         )
         self.make_empty_intermediate_tensors = (

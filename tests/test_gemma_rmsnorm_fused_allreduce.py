@@ -30,6 +30,7 @@ from atom.rollout.weight_updater import WeightUpdaterMixin
 
 HIDDEN = 256
 PER_GROUP = SimpleNamespace(quant_type=QuantType.per_1x128)
+PER_TOKEN = SimpleNamespace(quant_type=QuantType.per_Token)
 
 
 @pytest.fixture
@@ -56,6 +57,9 @@ def calls(monkeypatch):
     )
     monkeypatch.setattr(
         layernorm_module, "fused_ar_gemma_per_group_supported", lambda: True
+    )
+    monkeypatch.setattr(
+        layernorm_module, "fused_ar_gemma_per_token_supported", lambda: True
     )
     monkeypatch.setattr(
         layernorm_module,
@@ -159,3 +163,116 @@ def test_support_is_read_off_the_group_method(monkeypatch):
         probe.cache_clear()
         assert probe() is has_flag
     probe.cache_clear()
+
+
+# ---------------------------------------------------------------------------
+# Per-token FP8 quant folded into the norm (ATOM_FUSED_NORM_PER_TOKEN_QUANT)
+# ---------------------------------------------------------------------------
+
+
+def _per_token_norm(monkeypatch, on):
+    monkeypatch.setenv("ATOM_FUSED_NORM_PER_TOKEN_QUANT", "1" if on else "0")
+    norm = GemmaRMSNorm(
+        HIDDEN,
+        quant_config=PER_TOKEN,
+        write_bf16=False,
+        fused_allreduce=True,
+    )
+    norm.weight.data.fill_(0.5)
+    return norm
+
+
+def test_per_token_quant_is_off_by_default(calls, monkeypatch):
+    # The flag changes the norm's return arity for every per-token model that
+    # reads `use_fused_quant`, so it stays opt-in until measured.
+    norm = _per_token_norm(monkeypatch, on=False)
+    assert norm.use_fused_quant is False
+    assert norm.per_token_quant is False
+    _run(norm)
+    assert calls[-1][0] == "bf16"
+
+
+def test_per_token_quant_asks_the_kernel_for_per_token(calls, monkeypatch):
+    norm = _per_token_norm(monkeypatch, on=True)
+    assert norm.use_fused_quant is True
+    assert norm.per_token_quant is True
+    _run(norm)
+    kind, weight, _, kw = calls[-1]
+    assert kind == "quant"
+    assert weight is norm.weight
+    assert kw["gemma_norm"] is True
+    assert kw["quant_type"] == "per_token"
+    # per-group-only arguments must not be sent: aiter's one-kernel per-token
+    # branch is keyed on the default group_size, and a per-token scale is a
+    # single column so there is nothing to transpose.
+    assert "group_size" not in kw
+    assert "transpose_scale" not in kw
+
+
+def test_per_group_arguments_are_unchanged(calls, monkeypatch):
+    monkeypatch.setenv("ATOM_FUSED_NORM_PER_TOKEN_QUANT", "1")
+    norm = _norm(quant=True)
+    _run(norm)
+    _, _, _, kw = calls[-1]
+    assert kw["quant_type"] == "per_group"
+    assert kw["group_size"] == 128
+    assert "transpose_scale" in kw
+
+
+def test_an_aiter_without_gemma_per_token_is_refused(calls, monkeypatch):
+    monkeypatch.setattr(
+        layernorm_module, "fused_ar_gemma_per_token_supported", lambda: False
+    )
+    with pytest.raises(ValueError, match="per-token"):
+        _per_token_norm(monkeypatch, on=True)
+
+
+def test_per_token_without_allreduce_norms_then_quantizes(monkeypatch):
+    """Layer 0 and any all-reduce-free configuration take the two-kernel path.
+
+    aiter's `rmsnorm_quant` has no `gemma_norm`, so this path cannot fuse
+    without silently normalizing with `x * w`. It must still return the same
+    (fp8, scale, bf16[, residual]) contract the all-reduce path returns, or the
+    decoder layer unpacks a different number of values depending on the layer
+    index.
+    """
+    monkeypatch.setenv("ATOM_FUSED_NORM_PER_TOKEN_QUANT", "1")
+    monkeypatch.setattr(
+        layernorm_module, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    norm = GemmaRMSNorm(HIDDEN, quant_config=PER_TOKEN, write_bf16=True)
+    assert norm.per_token_quant is True
+    assert norm.fused_allreduce is False
+
+    normed = torch.randn(3, HIDDEN)
+    res_out = torch.randn(3, HIDDEN)
+    quantized = torch.empty(3, HIDDEN, dtype=torch.uint8)
+    scale = torch.empty(3, 1)
+    seen = {}
+
+    monkeypatch.setattr(
+        GemmaRMSNorm, "forward_cuda", lambda self, x, r=None: (normed, res_out)
+    )
+
+    def hip_quant(quant_type):
+        seen["quant_type"] = quant_type
+
+        def run(x, quant_dtype=None):
+            seen["x"] = x
+            return quantized, scale
+
+        return run
+
+    import aiter
+
+    monkeypatch.setattr(aiter, "get_hip_quant", hip_quant)
+
+    out_fp8, out_scale, out_bf16, residual_out = norm(
+        torch.randn(3, HIDDEN), torch.randn(3, HIDDEN)
+    )
+    assert out_fp8 is quantized
+    assert out_scale is scale
+    assert out_bf16 is normed  # write_bf16: the pre-quant normed output
+    assert residual_out is res_out
+    assert seen["x"] is normed
+    assert seen["quant_type"] == QuantType.per_Token

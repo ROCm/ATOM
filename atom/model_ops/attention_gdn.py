@@ -168,6 +168,8 @@ class GatedDeltaNet(nn.Module):
     ):
         """Update speculative convolution state using the native cache layout."""
         spec_state_indices_tensor = gdn_metadata.spec_state_indices_tensor
+        spec_state_indices_in = gdn_metadata.spec_state_indices_in_tensor
+        nsd = gdn_metadata.num_spec_decodes
         return causal_conv1d_update(
             mixed_qkv_spec,
             conv_state,
@@ -176,9 +178,12 @@ class GatedDeltaNet(nn.Module):
             self.num_v_heads * self.head_v_dim // self.tp_size,
             self.conv1d.bias,
             self.activation,
-            conv_state_indices=spec_state_indices_tensor[:, 0][
-                : gdn_metadata.num_spec_decodes
-            ],
+            conv_state_indices=spec_state_indices_tensor[:nsd, 0],
+            conv_state_indices_in=(
+                None
+                if spec_state_indices_in is None
+                else spec_state_indices_in[:nsd, 0]
+            ),
             num_accepted_tokens=num_accepted_tokens,
             query_start_loc=gdn_metadata.spec_query_start_loc,
             # The verify window, which sizes the conv rollback window
@@ -428,6 +433,7 @@ class GatedDeltaNet(nn.Module):
                     is_kda=False,
                     route=gdn_metadata.replayssm_route,
                     o=(core_attn_out[: query_spec.shape[1]] if spec_only else None),
+                    fork_slots=gdn_metadata.replayssm_fork_slots,
                 )
                 last_recurrent_state = None
             else:
@@ -616,6 +622,7 @@ class GatedDeltaNet(nn.Module):
                 use_qk_l2norm_in_kernel=True,
                 is_kda=False,
                 route=gdn_metadata.replayssm_route,
+                fork_slots=gdn_metadata.replayssm_fork_slots,
             )
             last_recurrent_state = None
         elif gdn_metadata.num_decodes > 0:

@@ -319,8 +319,8 @@ def fill_step_indptrs(step, geometry, buffers):
     built = {}
     for ratio in ratios:
         prefix, extend = buffers[ratio]
-        pptr = prefix[: step.width + 1]
-        eptr = pptr if step.decode and not split else extend[: step.width + 1]
+        pptr = prefix[: step.running_tokens + 1]
+        eptr = pptr if step.decode and not split else extend[: step.running_tokens + 1]
         built[ratio] = (pptr, eptr, geometry.batch_topk(ratio))
     if ratios:
         _indptr_scan_all[(len(ratios),)](
@@ -329,7 +329,7 @@ def fill_step_indptrs(step, geometry, buffers):
             step.cu_seqlens_q,
             tuple(built[ratio][0] for ratio in ratios),
             tuple(built[ratio][1] for ratio in ratios),
-            step.width,
+            step.running_tokens,
             _replay_start(step),
             _cached_until(step),
             DECODE=step.decode,
@@ -337,7 +337,7 @@ def fill_step_indptrs(step, geometry, buffers):
             RATIOS=ratios,
             TOPKS=tuple(built[ratio][2] for ratio in ratios),
             SPLIT=split,
-            BLOCK=min(1024, triton.next_power_of_2(max(step.width, 1))),
+            BLOCK=min(1024, triton.next_power_of_2(max(step.running_tokens, 1))),
         )
     return built
 
@@ -349,12 +349,12 @@ def build_window_rows(step, geometry, window, eptr):
     rows leave to the reader's view.
     """
     rows = torch.empty(
-        step.width * geometry.window_size,
+        step.running_tokens * geometry.window_size,
         dtype=torch.int32,
         device=step.positions.device,
     )
-    if step.width:
-        _window_rows[(step.width,)](
+    if step.running_tokens:
+        _window_rows[(step.running_tokens,)](
             rows,
             eptr,
             step.positions,
@@ -389,19 +389,23 @@ def build_indices(
         # any scorer ran. Another width leaves every row a hole its reader
         # dereferences.
         raise ValueError(f"Scorer width {topk} is not the {reserved} reserved")
-    plane = step.width * (topk + geometry.window_size * history)
+    plane = step.running_tokens * (topk + geometry.window_size * history)
     prefix = torch.empty(
         layers * plane,
         dtype=torch.int64 if geometry.packed else torch.int32,
         device=step.positions.device,
     )
     extend = torch.empty(
-        0 if step.decode else step.width * min(step.max_q_len, geometry.window_size),
+        (
+            0
+            if step.decode
+            else step.running_tokens * min(step.max_q_len, geometry.window_size)
+        ),
         dtype=torch.int32,
         device=step.positions.device,
     )
-    if step.width and plane:
-        _indices[(step.width, layers)](
+    if step.running_tokens and plane:
+        _indices[(step.running_tokens, layers)](
             selected if topk else prefix,
             pptr,
             prefix,

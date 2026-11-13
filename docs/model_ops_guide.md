@@ -17,6 +17,7 @@ ATOM (AiTer Optimized Model) wraps AITER kernels with model-level abstractions f
 | Shared DSA indexer scorer | `indexer/` | `deepgemm_fp8_paged_mqa_logits`, `fp8_mqa_logits`, `flydsl_pa_mqa_logits_fp4`, `pa_mqa_logits_mxfp4`, `top_k_per_row_decode`, `top_k_per_row_prefill` | Scoring and top-k for every DSA indexer (DeepSeek-V3.2 / GLM-5.x, GLM-5.3 kpool, DeepSeek-V4, V4.1): the attention builder publishes a step's rows once (`attn_metadata.index_rows`: `fp8_rows`, `fp4_rows`, `concat_rows`, a DCP or TP rank's share by `RowSplit`) cut to its logits plane (`LogitsWorkspace`), and a model calls `score_topk` against its cache (`IndexCache`) |
 | DSA FP4 index cache | `sparse_indexer_fp4.py` | `indexer_qk_rope_quant_and_cache` | FP4 (E2M1 + e8m0) index-cache geometry and the DSA FP4 predicate |
 | `Fp4MqaRaggedMetadata` | `fp4_mqa_ragged_metadata.py` | `make_fp4_mqa_plan` | FP4 MQA scoring's ragged rows (DeepSeek-V4, V4.1, V3.2 decode and its DCP shard): rows grouped into sequences (`query_start_loc`, `max_qlen`, block tables, `pages_per_block`), each row's bound, and their shape-only launch plan |
+| `pack_row_selections` | `attentions/selection_pack.py` | Triton `_pack_selections_kernel` | Sparse MLA's MTP draft steps 1+ reuse step 0's top-k: chosen rows' selections packed in place to the front of the sparse index buffer, one program a sequence, each waiting on its predecessors' published lengths (an epoch-tagged flag, so eager-only) |
 | `FusedMoE` | `moe.py` | `aiter.fused_moe.fused_moe`, `asm_moe` | Mixture of experts |
 | `RMSNorm` | `layernorm.py` | `rmsnorm2d_fwd`, `rmsnorm2d_fwd_with_add`, `fused_add_rmsnorm_pad` | RMS normalization |
 | `LayerNorm` | `layernorm.py` | `layernorm2d_fwd`, `layernorm2d_fwd_with_add` | Layer normalization |
@@ -25,7 +26,7 @@ ATOM (AiTer Optimized Model) wraps AITER kernels with model-level abstractions f
 | `ParallelLMHead` | `embed_head.py` | `tgemm.mm` + `tensor_model_parallel_all_gather` | LM output head |
 | `RotaryEmbedding` | `rotary_embedding.py` | `aiter.rope_cached_positions_2c_fwd_inplace` | Rotary position embedding |
 | `Sampler` | `sampler.py` | `aiter.mixed_sample_outer_exponential`, `aiter.ops.triton.topk.topk`, `aiter.ops.triton.softmax.softmax` | Token sampling |
-| `RejectionSampler` | `rejection_sampler.py` | Triton `rejection_greedy_sample_kernel` | Speculative decoding |
+| `RejectionSampler` | `rejection_sampler.py`, `verify_kernels.py`, `spec_sampling/` (`ratio_verify.py`, `ratio_target_p.py`) | Triton `rejection_greedy_sample_kernel`, `_ratio_*`, `rejection_relaxed_sample_kernel`, `rejection_synthetic_sample_kernel` | Speculative decoding |
 | `apply_packed_bitmask` | `triton_structured_output.py` | Triton packed-bitmask kernel | JSON grammar masks on selected target logits |
 | `constrain_logits`, `advance_states` | `required_channel.py` | Triton `_constrain_logits_kernel`, `_advance_states_kernel` | `tool_choice="required"` channel mask (Kimi-K3) |
 
@@ -223,7 +224,7 @@ The `AttentionBackend` abstract class defines three required methods:
 - `get_builder_cls()` — Returns the `AttentionMetadataBuilder` subclass.
 - `get_impl_cls()` — Returns the attention implementation class.
 
-`CommonAttentionBuilder` provides shared metadata preparation (slot mapping, block tables, cumulative sequence lengths) used by both `AiterBackend` and `AiterMLABackend`. It marshals `block_tables` on every prefill step, whether or not that step also uploads the buffer, because the slot arithmetic in `token_layout/prefill.py` reads the packed table back rather than the batch's ragged rows.
+`CommonAttentionBuilder` provides shared metadata preparation (slot mapping, block tables, cumulative sequence lengths) used by both `AiterBackend` and `AiterMLABackend`. It marshals `block_tables` on every prefill step out to `running_bs`, zero rows past the scheduled requests, whether or not that step also uploads the buffer, because the slot arithmetic in `token_layout/prefill.py` reads the packed table back rather than the batch's ragged rows. A prefill that uploads it (`_prefill_block_table_rows`) uploads `running_bs` rows, like a decode.
 
 ### KV cache operations
 
@@ -526,12 +527,38 @@ the pure-torch twins the tests hold the kernels to.
 
 ### `RejectionSampler` (`rejection_sampler.py`)
 
-Implements rejection sampling for speculative decoding (MTP). Given draft token IDs and target model logits:
+Implements rejection sampling for speculative decoding (MTP, EAGLE, DSpark). Given the drafted token IDs, the target logits at each draft position and the bonus token sampled at each request's last row, it accepts each request's drafts until the first rejection and returns `(output_token_ids, verdict)`, where `verdict` is `[accepted, rejected, anchor row]` per request. One of four rules runs per launch:
 
-1. Computes `target_argmax = target_logits.argmax(dim=-1)`.
-2. Runs a Triton kernel `rejection_greedy_sample_kernel` that sequentially compares draft tokens against target argmax, accepting until first mismatch.
-3. On full acceptance, appends the bonus token.
-4. Returns `(output_token_ids, num_bonus_tokens)`.
+1. **Exact match** (default): a draft is accepted iff it equals the target's own token at that row — the lowest-id argmax for greedy requests (`topk_select(..., tie="low")`), the target's temperature/top-k/top-p draw (`Sampler.sample_verification_tokens`) otherwise. On mismatch the target's token is emitted. Kernel: `rejection_greedy_sample_kernel`.
+2. **Probability ratio** (`ATOM_SPEC_LOSSLESS_SAMPLING=1`, DSpark drafts sampled from `q`; `ratio_verify.py`): accept iff `u * q(x) < p(x)`; on rejection draw from `relu(p - q)` by an exponential race over the vocab. Greedy rows of the same batch take exact match.
+   - `p = softmax(logits / T)` is never materialized: per-tile statistics (`ratio_target_p.py`, `softmax_tiles.py`) give `p(x)`, and only a rejecting row is read across the vocab again.
+   - With top-k/top-p, `p` is `Sampler`'s filtered `p_f`, aiter's kept set: every id at or above one floor logit per row, found on the device by a radix descent (`sampling_filter_descent.py`) or, for a top-k of at most 256 alone, a count (`sampling_filter_count.py`). Both agree with aiter to fp32 rounding, not bit for bit: aiter ranks by fp32 `p`, which can tie two distinct logits near 0, and its top-p compares a sum against `top_p`.
+   - `q` comes from `dspark_markov_sample` (`dspark_markov_sample.py`): the top K entries (`sparse_q_store.Q_WIDTH`, 1024, cut further to the request's top-k/top-p) of `softmax((base + W1[x_{k-1}] W2^T) / T)`, renormalized, drawn from exactly (`sparse_q_select.py`) and kept in a per-request `SparseQStore` (`sparse_q_store.py`). `q` is 0 off the stored set; `p` is never truncated.
+   - No warmup or capture forward verifies, so `warmup_ratio_verify` compiles these kernels at startup.
+3. **Relaxed** (`ATOM_ENABLE_RELAXED_MTP=1`, all-greedy batches only; a sampled batch keeps exact match): accept a draft that is among the target's top `RELAXED_TOP_N` (10) ids with probability within `RELAXED_DELTA` (0.6) of the top-1's; on rejection emit the top-1. Not distribution-preserving, so `DSparkProposer` refuses it where `ATOM_SPEC_LOSSLESS_SAMPLING` arms. Kernel: `rejection_relaxed_sample_kernel`.
+4. **Synthetic** (`--spec-decode-acceptance-length` / `-rate`): forces a configured acceptance curve for benchmarking, ignoring the real comparison. Kernel: `rejection_synthetic_sample_kernel`.
+
+Every rank must reach the same verdict. Each rule gets there its own way:
+
+- **Probability ratio**: Philox (`tl.rand`) keyed on one SPMD step counter, the step each forward stages (`DraftQStaging`) and hands the verify in `RatioVerifyInputs.step`: the draft's noise, the accept coins and the residual race each under their own high key word -- so every TP rank draws the same coins without exchanging them.
+- **Exact match**: the target's own draw comes from `Sampler` and is broadcast from TP rank 0 before the kernel compares against it.
+- **Synthetic**: a per-device `torch.Generator` re-seeded from a step counter each step.
+- **Relaxed** and greedy rows draw nothing.
+
+Only the tokens are broadcast and every rank computes its own verdict, so every rule also needs the target logits bitwise equal across TP ranks; otherwise accepted counts differ while tokens follow rank 0, and `next_token_locs`, the KDA state commit and the KV release diverge silently. **Minimum aiter**: a build that includes ROCm/aiter#6954. From aiter `2039d2b96c` (2026-09-13) until that PR, the custom all-reduce's LL/LL128 paths summed ranks in a rank-dependent order.
+
+#### Lossless speculative sampling (`ATOM_SPEC_LOSSLESS_SAMPLING`)
+
+The flag arms both halves at once: the DSpark draft samples its block from `softmax(logits / T)` and the verify accepts by the ratio. Either half alone is a regression: the ratio rule over a greedy `q` is exact match, and a sampled draft is matched less often than a greedy one.
+
+- **Defaults off**: both rules are target-exact, but they are not the same draw.
+- **Filters and `Sampler`**: once armed, every `Sampler` draw keeps a tie group at the top-k cut whole, as aiter's fused kernel does, rather than taking aiter's top-k-first path (exactly k ids for a uniform top-k <= 256 with a top-p at a vocab >= 65536); on such a cut tokens can differ from the flag off. An engine that does not arm (a refused configuration, a P/D producer, another drafter) keeps aiter's own law, and says why once at startup. The native fallback keeps exactly k, so the verify does not arm there.
+- **Which draft block runs**: greedy rows keep exact-match acceptance. Armed with `data_parallel_size == 1`, `DSparkProposer` captures the block twice, sampled (`block`) and greedy (`block_greedy`), and a step in which no row draws a `q` (all-greedy, dummy, align-only, or every row mid-prompt; `DraftQStaging.draws_q`) replays the greedy one: the argmax op's two launches per draft position, the same ids the sampled op drafts for such rows, and no `q` written. Any other step runs the sampled block for every row, greedy rows included: six launches per draft position (the histogram, cut and compact programs of a greedy row return at once). With DP > 1 only the sampled block is declared, as the choice is per rank while a replay is agreed across the DP group. `ATOM_DSPARK_FUSED_MARKOV_SAMPLE=0` selects the reference block on Kimi-K3 only in the greedy block.
+- **Memory**, allocated before the KV cache is sized: the `q` store, `2 * max_num_seqs * T * (8 * K + 8)` bytes (128 MiB at `max_num_seqs=512`, T=16, K=1024); the draft's scratch, about 348 MiB at 512 (V=163840), of which 320 MiB are the `[max_num_seqs, V]` fp32 scores it keeps between its launches; the verify's per-step scratch, about 191 MiB, of which 160 MiB are the run maxima of the top-k count (`max_num_seqs * T * V / 8` bytes, `sampling_filter.CountRuns`), which only a batch with some top-k of at most 256 and no top-p reads. The `Lossless speculative sampling armed` log line prints the draft's; the verify's scratch is `RejectionSampler`'s (`arm_ratio`).
+- **Which K**: any K is exact, as the draft samples only the stored entries; a smaller K gives up `q`'s tail mass, i.e. some acceptance. The stored set is every id within 19 nats of the max, cut to K by 1/8-nat level (lowest ids first in the boundary level), which likewise only moves acceptance. K = V stores everything, for acceptance studies rather than throughput (~200-400 us per draft position on MI355X, vs ~5-20 us at 1024).
+- **Large batch**: the select reads the fp32 score scratch twice (histogram, then compact). On MI355X (V=163840, K=1024) it takes 15.7/17.5/45.9/263.8 us per draft position at B=1/8/64/512 sampled rows, vs 46.4/50.3/56.7/141.1 us for `aiter.topk_select` plus the store: faster up to at least B=64, ~120 us per position slower at B=512, mostly the re-read.
+  `topk_select` is not a drop-in: its stream backend at large B returns ids in a nondeterministic order, so TP ranks would store different rows, and the per-request top-k/top-p cut needs sorted output. Like K, the select moves acceptance only, not the law.
+- **Where it does not arm**: only a draft model with `supports_lossless_draft` (today both Kimi-K3 DSpark drafts, MLA and GQA); others keep the greedy pair and say so once. Where it would arm, `ATOM_ENABLE_RELAXED_MTP` and `synthetic_acceptance_rates` are refused. It warns and keeps the greedy pair where the Markov tables cannot run the fused sampled op (`markov_weights_unsupported`), where the draft block is narrower than the verify, under PP (`forward_vars` is ringed per in-flight step, and the draft binds one slot's filters), under PCP (draft ids are broadcast, their `q` is not), on a P/D producer (it drafts for handoff only), or without aiter's top-k/top-p ops. Read at drafter construction, so set it before the server starts.
 
 ## Fused kernel chains
 
@@ -572,10 +599,32 @@ ATOM uses fused kernels to reduce memory traffic by combining multiple operation
 | `topK.py` | `rocm_aiter_topk_softmax`, `rocm_aiter_grouped_topk`, `init_aiter_topK_meta_data` |
 | `triton_topk_softmax.py` | `triton_topk_softmax` -- renormalized softmax top-k, bit-identical to AITER's `topk_softmax` |
 | `sampler.py` | `Sampler` — unified greedy/random sampling |
-| `rejection_sampler.py` | `RejectionSampler` — speculative decoding rejection sampling |
+| `rejection_sampler.py` | `RejectionSampler` — speculative decoding rejection sampling; dispatches between the accept rules |
+| `verify_kernels.py` | `_draft_token`, `_finish_request` — the Triton helpers every verify kernel shares |
+| `tile_argmax.py` | `argmax_lowest_id`, `argmax_of_tiles` — the lowest-id tile argmax the greedy DSpark draft and the lossless sampling kernels share, and its combine over a row's tiles |
+| `spec_sampling/ratio_verify.py` | `RatioVerifyInputs`, `ratio_verify_scratch`, `warmup_ratio_verify`, `warmup_forms`, `filter_variant` — the probability-ratio accept rule: accept and a residual race that reads each rejecting row's `q` from the store |
+| `spec_sampling/ratio_target_p.py` | `_ratio_target_p`, `filter_floor` — the ratio verify's target p: per-row softmax statistics and raw argmax, then the filter floor |
+| `dspark_markov_stage1.py` | `markov_logits_tile`, `publish_tile_argmax`, `markov_launch_geometry` — stage 1 of both DSpark Markov ops: the bias GEMV tile, its (max, lowest id), and the launch both ops use |
+| `dspark_markov_argmax.py` | `dspark_markov_argmax` / `dspark_markov_argmax_tp` — the default greedy DSpark draft (full-vocab and vocab-sharded head) |
+| `spec_sampling/dspark_markov_sample.py` | `dspark_markov_sample` — the lossless DSpark draft: samples each block position and stores its top-K `q` for the ratio verify |
+| `spec_sampling/sparse_q_select.py` | `select_and_draw_q` — the lossless DSpark draft's top-K `q` select by level, its store, and the draw from exactly the stored entries |
+| `spec_sampling/sparse_q_store.py` | `SparseQStore`, `store_width` — the sparse draft `q` a drafter writes and the ratio verify reads, independent of any drafter |
+| `spec_sampling/sampling_filter.py` | `row_filters`, `FilterScratch` — the ratio verify's top-k/top-p floor: shared row helpers and work buffers (`ratio_target_p.filter_floor` dispatches) |
+| `spec_sampling/sampling_filter_descent.py` | `descend_floor` — the floor by a radix descent over the logit bits |
+| `spec_sampling/sampling_filter_count.py` | `count_floor` — the floor of a top-k of at most 256 alone, counted |
+| `spec_sampling/softmax_tiles.py` | `tile_max_sumexp`, `softmax_combine_kernel` — the ratio verify's per-tile softmax statistics and their combine into each row's max, `1/Z` and argmax; the draft combines only the max and argmax |
+| `spec_sampling/sampling_scratch.py` | `Region`, `scratch_buffer`, `carve` — the draft's and the ratio verify's per-step scratch: one byte buffer allocated before KV sizing, carved into named views (a NamedTuple of `Region`s in, the same NamedTuple of tensors out) placed by the cache pools' `entry_arena.plan_regions` |
 | `required_channel.py` | `constrain_logits`, `advance_states` — `tool_choice="required"` channel mask (Kimi-K3) |
 | `base_config.py` | `QuantizeMethodBase` abstract class |
 | `utils.py` | Helper utilities: `shuffle_weights`, `normalize_e4m3fn_to_e4m3fnuz`, `per_tensor_dequantize`, etc. |
+
+### `atom/spec_decode/` (lossless sampling)
+
+| File | Description |
+|---|---|
+| `draft_q_slots.py` | `DraftQSlots` — which `SparseQStore` rows each live request's draft `q` occupies across steps |
+| `draft_q_staging.py` | `DraftQStaging` — the host staging of each step's Philox key and q row bases (the draft reads the target's own temperatures and filters) |
+| `dspark_lossless.py` | `DSparkLossless` — arms the feature for `DSparkProposer` and owns its `q` store, scratch and staged inputs |
 
 ### `atom/model_ops/attentions/`
 
@@ -621,7 +670,7 @@ positions are ragged, and the one-token decode slot mapping comes from
 | `token_layout/prefill.py` | `prefill_positions` — where a ragged prefill chunk's tokens sit in their own sequences |
 | `token_layout/decode.py` | `decode_positions` — the same for the rectangular speculative decode step |
 | `token_layout/slots.py` | `slot_mapping` — which KV slot a token is written to, one gather for both sides |
-| `token_layout/batch_ids.py` | `build_batch_ids` — builds the token → sequence map every kernel resolves per-sequence data through. Query lengths in gives `batch_id_per_q_token`, context lengths in gives `batch_id_per_k_token`; the two axes are not interchangeable |
+| `token_layout/batch_ids.py` | `build_batch_ids` — builds the token → sequence map every kernel resolves per-sequence data through. Query lengths in gives `batch_id_per_q_token`, context lengths in gives `batch_id_per_k_token`; the two axes are not interchangeable. `build_query_layout` writes a step's `cu_seqlens_q` and `batch_id_per_q_token` out to its running width, `build_cu_seqlens` the offsets alone |
 
 ### `atom/model_ops/fused_moe/`
 

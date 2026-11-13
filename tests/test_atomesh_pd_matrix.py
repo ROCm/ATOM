@@ -26,6 +26,7 @@ def expand_cell(
     topology="test",
     prefill=None,
     decode=None,
+    env=None,
 ):
     with patch.dict(
         os.environ,
@@ -48,6 +49,7 @@ def expand_cell(
                 "isl": [128],
                 "osl": 128,
                 "concurrency": [1],
+                "env": env or {},
             },
             override_image=None,
             override_benchmark_concurrency=None,
@@ -122,6 +124,31 @@ class NodeSelectionTest(unittest.TestCase):
         cell = expand_cell(runner="atomesh-cicd-mi355-crusoe", nodes="n1,n2")
         self.assertEqual(cell["nodes"], [])
         self.assertEqual(cell["num_nodes"], 2)
+
+
+class KvConnectorPlacementTest(unittest.TestCase):
+    def test_a_connector_set_for_one_role_is_rejected(self):
+        for role in ("prefill", "decode"):
+            for common in ({}, {"KV_CONNECTOR": "moriio"}):
+                env = {"common": common, role: {"KV_CONNECTOR": "mooncake"}}
+                with (
+                    self.subTest(role=role, common=common),
+                    self.assertRaisesRegex(ValueError, f"env.{role} sets KV_CONNECTOR"),
+                ):
+                    expand_cell(env=env)
+
+    def test_a_common_connector_reaches_every_role(self):
+        cell = expand_cell(env={"common": {"KV_CONNECTOR": "moriio"}})
+        for role in ("common", "prefill", "decode"):
+            self.assertEqual(cell["env"][role]["KV_CONNECTOR"], "moriio")
+
+
+class SetFilterTest(unittest.TestCase):
+    def test_blank_and_all_mean_no_filter(self):
+        for value in (None, "", "all", " ALL , "):
+            with self.subTest(value=value):
+                self.assertIsNone(pd_matrix.parse_set_filter(value))
+        self.assertEqual(pd_matrix.parse_set_filter(" a, b ,all,"), {"a", "b"})
 
 
 DPA = {"tp": 8, "extra_args": "--enable-dp-attention --enable-expert-parallel"}

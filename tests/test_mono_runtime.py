@@ -12,6 +12,7 @@ import pytest
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from atom.distributed.group_agreement import group_agree
 from atom.mono.runtime.abi import KernelAbi
 from atom.mono.runtime.compile import (
     _COMPILE_ONLY,
@@ -19,7 +20,6 @@ from atom.mono.runtime.compile import (
     kernel_resources,
     scratch_bytes,
 )
-from atom.mono.runtime.consensus import tp_agree
 
 FRAMEWORK = pathlib.Path(__file__).resolve().parents[1] / "atom" / "mono"
 
@@ -98,12 +98,12 @@ def test_compile_only_is_scoped(monkeypatch, before):
 
 
 def test_agree_alone():
-    assert tp_agree(True, None) and not tp_agree(False, None)
+    assert group_agree(True, None) and not group_agree(False, None)
 
 
 def _agree_worker(rank, world, init, refuser, out):
     dist.init_process_group("gloo", init_method=init, rank=rank, world_size=world)
-    out[rank] = tp_agree(rank != refuser, dist.group.WORLD)
+    out[rank] = group_agree(rank != refuser, dist.group.WORLD)
     dist.destroy_process_group()
 
 
@@ -565,3 +565,57 @@ def test_aiter_stub_teardown_spares_modules_that_took_nothing():
         ):
             sys.modules.pop(name, None)
         sys.modules.update(saved)
+
+
+def _aux_drafter(aux_extract):
+    from types import SimpleNamespace
+
+    import torch
+
+    config = SimpleNamespace(dspark_target_layer_ids=(1, 3))
+    return SimpleNamespace(
+        speculative_config=SimpleNamespace(draft_model_hf_config=config),
+        _aux_buffers=[torch.zeros(4, 8, dtype=torch.bfloat16) for _ in range(2)],
+        aux_extract=aux_extract,
+    )
+
+
+def test_bind_aux_taps_carries_the_drafters_extract():
+    from atom.mono.runtime.aux_taps import bind_aux_taps
+
+    def extract(output, layer):
+        return output[0]
+
+    taps = bind_aux_taps(_aux_drafter(aux_extract=extract), 8)
+    assert taps.layer_ids == (1, 3)
+    assert taps.extract is extract
+
+
+def test_bind_aux_taps_refuses_tapped_layers_without_an_extract():
+    """`extract` is required whenever a layer is tapped; only the drafterless
+    `AuxTaps((), ())` has none."""
+    from atom.mono.runtime.aux_taps import AuxTaps, bind_aux_taps
+
+    for kernel in (None, lambda out, layer: out):
+        with pytest.raises(MonoUnsupported, match="no aux extract"):
+            bind_aux_taps(_aux_drafter(aux_extract=None), 8, kernel)
+    assert AuxTaps((), ()).extract is None
+
+
+def test_bind_aux_taps_refuses_an_extract_the_kernels_do_not_compute():
+    """A runner that writes the taps from its kernels never calls ``extract``,
+    so a drafter armed with another one would draft from two features."""
+    from atom.mono.runtime.aux_taps import bind_aux_taps
+    from atom.mono.runtime.consensus import MonoUnsupported
+
+    def kernel(output, layer):
+        return output[0]
+
+    def other(output, layer):
+        return output[1]
+
+    with pytest.raises(MonoUnsupported, match="aux extract"):
+        bind_aux_taps(_aux_drafter(aux_extract=other), 8, kernel)
+    assert bind_aux_taps(_aux_drafter(aux_extract=kernel), 8, kernel).extract is kernel
+    # a runner that calls the extract itself takes any
+    assert bind_aux_taps(_aux_drafter(aux_extract=other), 8).extract is other

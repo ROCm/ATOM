@@ -7,7 +7,8 @@ from __future__ import annotations
 import torch
 from typing_extensions import Self
 
-from atom.mono.runtime.consensus import MonoUnsupported, tp_agree
+from atom.distributed.group_agreement import group_agree
+from atom.mono.runtime.consensus import MonoUnsupported
 from atom.mono.runtime.hip_ipc import (
     close_ipc_handle,
     get_allocation_base,
@@ -17,6 +18,7 @@ from atom.mono.runtime.hip_ipc import (
 from atom.mono.runtime.uncached import (
     DeviceBytes,
     alloc_uncached,
+    fine_grained_bytes,
     ipc_heap,
     uncached_bytes,
 )
@@ -33,7 +35,7 @@ class PeerBuffer:
 
     The constructor is collective over ``group`` (the handle exchange, then an
     agreement that every rank mapped every peer): every rank must reach it, so a
-    runner reaches it only after ``tp_agree``. A failed mapping on any rank raises
+    runner reaches it only after ``group_agree``. A failed mapping on any rank raises
     ``MonoUnsupported`` on all of them.
     """
 
@@ -74,7 +76,7 @@ class PeerBuffer:
                         addresses.append(base)
             except RuntimeError as err:  # every rank must still reach the agreement
                 failure = err
-            if not tp_agree(failure is None, group):
+            if not group_agree(failure is None, group):
                 self.close()
                 raise MonoUnsupported(
                     f"peer memory handshake failed on {'this' if failure else 'another'}"
@@ -125,7 +127,14 @@ class SymmetricPeerBuffer:
     (``uncached``).
     """
 
-    def __init__(self, nbytes: int, rank: int = 0, npes: int = 1, group=None):
+    def __init__(
+        self,
+        nbytes: int,
+        rank: int = 0,
+        npes: int = 1,
+        group=None,
+        fine_grained: bool = False,
+    ):
         if nbytes <= 0:
             raise ValueError(f"nbytes must be positive, got {nbytes}")
         if not 0 <= rank < npes:
@@ -139,7 +148,9 @@ class SymmetricPeerBuffer:
 
         if npes == 1:
             device = torch.device("cuda", torch.cuda.current_device())
-            self.storage = uncached_bytes(nbytes, device)
+            self.storage = (fine_grained_bytes if fine_grained else uncached_bytes)(
+                nbytes, device
+            )
             self.local_address = self.storage.data_ptr()
             addresses = [self.local_address]
         else:
@@ -149,7 +160,9 @@ class SymmetricPeerBuffer:
             mine = None
             try:
                 device = torch.device("cuda", torch.cuda.current_device())
-                self.storage = uncached_bytes(nbytes, device)
+                self.storage = (fine_grained_bytes if fine_grained else uncached_bytes)(
+                    nbytes, device
+                )
                 self.local_address = self.storage.data_ptr()
                 base = get_allocation_base(self.local_address)
                 mine = (get_ipc_handle(base), self.local_address - base)

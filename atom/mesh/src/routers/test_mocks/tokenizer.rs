@@ -61,6 +61,7 @@ const TOKENIZER_CONFIG_JSON: &str = r#"{
 
 struct HfTokenizerHolder {
     tokenizer: Arc<dyn Tokenizer>,
+    path: String,
     _tempdir: TempDir,
 }
 
@@ -76,6 +77,7 @@ fn hf_tokenizer_holder() -> &'static HfTokenizerHolder {
             .expect("load HF tokenizer from tempdir");
         HfTokenizerHolder {
             tokenizer: Arc::new(hf),
+            path: tokenizer_path.to_str().unwrap().to_owned(),
             _tempdir: tempdir,
         }
     })
@@ -83,6 +85,11 @@ fn hf_tokenizer_holder() -> &'static HfTokenizerHolder {
 
 pub(crate) fn hf_tokenizer() -> Arc<dyn Tokenizer> {
     hf_tokenizer_holder().tokenizer.clone()
+}
+
+/// Path of the tokenizer.json backing [`hf_tokenizer`].
+pub(crate) fn hf_tokenizer_path() -> &'static str {
+    &hf_tokenizer_holder().path
 }
 
 pub(crate) fn tokenizer_registry_with_hf(name: &str) -> Arc<TokenizerRegistry> {

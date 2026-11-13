@@ -193,8 +193,10 @@ class _AtomMetricsCollector:
             (
                 "atom:dp_route_load_balanced",
                 (
-                    "Number of sessionless requests routed by the configured load "
-                    "balancer."
+                    "Number of sessionless requests placed by round_robin, "
+                    "least_requests or least_tokens (not by the offline "
+                    "backpressure pool). 0 under prefix_spread, whose placements "
+                    "are atom:dp_prefix_route."
                 ),
                 dp_router.get("load_balanced_total", 0),
             ),
@@ -202,6 +204,68 @@ class _AtomMetricsCollector:
             metric = CounterMetricFamily(name, documentation)
             metric.add_metric([], float(value))
             yield metric
+
+        decisions = dp_router.get("prefix_route")
+        if decisions is not None:
+            # Present only under `--dp-load-balance prefix_spread`.
+            routed = CounterMetricFamily(
+                "atom:dp_prefix_route",
+                "Prefix-spread placement decisions (not completed loads): owner "
+                "(kept on the rank holding the prefix), moved (placed on another "
+                "rank; where the tier holds the prefix and admission finds KV "
+                "for it, that rank restores it there) or cold (no known prefix).",
+                labels=["decision"],
+            )
+            for label, value in decisions.items():
+                routed.add_metric([label], float(value))
+            yield routed
+            moved_tokens = CounterMetricFamily(
+                "atom:dp_prefix_moved_tokens",
+                "Prefix tokens credited to moved prefix-spread requests at "
+                "placement (an estimate, not completed restores).",
+            )
+            moved_tokens.add_metric([], float(dp_router["prefix_moved_tokens"]))
+            yield moved_tokens
+
+        index = dp_router.get("prefix_index")
+        if index is not None:
+            # Prefix-index budget path (`prefix_spread`): shows whether eviction
+            # ever ran and how much history it shed.
+            events = CounterMetricFamily(
+                "atom:dp_prefix_index_events",
+                "Prefix-spread index budget events: tail_trim (an old history "
+                "shortened from its tail), leaf_evict (an old history dropped "
+                "whole), over_budget (budget checks that found the index over "
+                "budget), blocked (still over budget after eviction ran out of "
+                "evictable history: only still-prefilling edges and their "
+                "ancestors were left).",
+                labels=["event"],
+            )
+            for label, key in (
+                ("tail_trim", "tail_trim_total"),
+                ("leaf_evict", "leaf_evict_total"),
+                ("over_budget", "over_budget_total"),
+                ("blocked", "trim_blocked_total"),
+            ):
+                events.add_metric([label], float(index[key]))
+            yield events
+            shed = CounterMetricFamily(
+                "atom:dp_prefix_index_evicted_tokens",
+                "Prompt tokens of prefix history shed by the index budget, by "
+                "kind: tail_trim (cut from a leaf's tail) or leaf_evict (a whole "
+                "leaf).",
+                labels=["kind"],
+            )
+            shed.add_metric(["tail_trim"], float(index["tail_trim_tokens_total"]))
+            shed.add_metric(["leaf_evict"], float(index["leaf_evict_tokens_total"]))
+            yield shed
+            indexed = GaugeMetricFamily(
+                "atom:dp_prefix_index_tokens",
+                "Prompt tokens currently held by the prefix-spread index "
+                "(unique edges, not per-rank holders).",
+            )
+            indexed.add_metric([], float(index["indexed_tokens"]))
+            yield indexed
 
         metric = CounterMetricFamily(
             "atom:dp_requests_routed",
@@ -444,11 +508,14 @@ class _AtomMetricsCollector:
             metric.add_metric([], float(cache.get("offload_tokens", 0)))
             yield metric
 
-        yield from _gc_metrics(describe=describe)
+        yield from _gc_metrics(
+            describe=describe,
+            others=None if describe else self._exporter.other_processes_gc(),
+        )
 
 
 def _gc_metrics(
-    *, describe: bool = False
+    *, describe: bool = False, others: list[tuple[str, list, tuple]] | None = None
 ) -> Iterable[GaugeMetricFamily | CounterMetricFamily]:
     """This process's own collector -- the frontend's, not the engine's, since
     each interpreter keeps its own counters.
@@ -466,8 +533,19 @@ def _gc_metrics(
     `gc.get_stats()`, i.e. the cost freezing exists to remove -- for a number
     that changes twice in a process's life. It and the tracked-set size both
     live in `/debug/gc_census` now, which is asked for rather than scraped.
+
+    ``others`` are the same readings from the front-end worker processes
+    (``--api-server-count``), as ``(process, stats, thresholds)``. With them,
+    every series gets a ``process`` label and this process is ``hub``.
     """
     stats = [] if describe else gc.get_stats()
+    threshold_now = () if describe else gc.get_threshold()
+    readings = [("hub", stats, threshold_now)] + list(others or ())
+    labels = ["generation", "process"] if others else ["generation"]
+
+    def label_values(generation, process):
+        return [str(generation), process] if others else [str(generation)]
+
     for name, key, doc in (
         (
             "atom:gc_collections",
@@ -489,18 +567,22 @@ def _gc_metrics(
             "Objects found unreclaimable by this process's collector.",
         ),
     ):
-        metric = CounterMetricFamily(name, doc, labels=["generation"])
-        for generation, per_gen in enumerate(stats):
-            metric.add_metric([str(generation)], float(per_gen.get(key, 0)))
+        metric = CounterMetricFamily(name, doc, labels=labels)
+        for process, per_process, _ in readings:
+            for generation, per_gen in enumerate(per_process):
+                metric.add_metric(
+                    label_values(generation, process), float(per_gen.get(key, 0))
+                )
         yield metric
 
     threshold = GaugeMetricFamily(
         "atom:gc_threshold",
         "Collection threshold in effect in this process, per generation.",
-        labels=["generation"],
+        labels=labels,
     )
-    for generation, value in enumerate(() if describe else gc.get_threshold()):
-        threshold.add_metric([str(generation)], float(value))
+    for process, _, per_process in readings:
+        for generation, value in enumerate(per_process):
+            threshold.add_metric(label_values(generation, process), float(value))
     yield threshold
 
 
@@ -511,6 +593,8 @@ class AtomMetricsExporter:
 
     def __init__(self, *, stream_silence: Callable[[], float] | None = None):
         self._stream_silence = stream_silence
+        # Front-end worker readings (--api-server-count > 1), set by the hub.
+        self._frontend_board = None
         self._lock = threading.Lock()
         self._snapshot: Snapshot = {}
         self._refresh_errors = 0
@@ -544,11 +628,22 @@ class AtomMetricsExporter:
         # the engine state. The captured snapshot is immutable here.
         return copy.deepcopy(snapshot), refresh_errors, last_refresh
 
+    def attach_frontend_board(self, board) -> None:
+        """Export the front-end workers' silence and GC readings too.
+        ``board`` provides ``longest_silence()`` and ``gc_readings()``."""
+        self._frontend_board = board
+
+    def other_processes_gc(self) -> list[tuple[str, list, tuple]] | None:
+        board = self._frontend_board
+        return board.gc_readings() if board is not None else None
+
     def stream_silence(self) -> float:
         captured = self._render_silence.get()
         if captured is not None:
             return captured
-        return self._stream_silence() if self._stream_silence is not None else 0.0
+        local = self._stream_silence() if self._stream_silence is not None else 0.0
+        board = self._frontend_board
+        return max(local, board.longest_silence()) if board is not None else local
 
     def render(self, *, stream_silence: float | None = None) -> bytes:
         silence_token = self._render_silence.set(stream_silence)

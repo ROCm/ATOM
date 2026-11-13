@@ -100,6 +100,9 @@ def _one_omp_thread() -> None:
     searches that extension's dependency graph and selects the same runtime
     torch uses instead of loading a second OpenMP implementation.
     """
+    # torch sets a thread's OpenMP count to the process default on that
+    # thread's first ATen call; run it now, or it overwrites the 1 set below.
+    torch.get_num_threads()
     set_num_threads = ctypes.CDLL(torch._C.__file__).omp_set_num_threads
     set_num_threads.argtypes = [ctypes.c_int]
     set_num_threads.restype = None

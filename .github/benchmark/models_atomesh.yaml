@@ -1404,6 +1404,64 @@ models:
           accuracy:
             threshold: 0.90
 
+        # One prefill and one decode worker, each a DPA16 + EP16 instance on two
+        # nodes, decode on MoRI's low-latency kernels (InterNodeV1LL). EP8 leaves
+        # no room: every DP rank holds all 98 GiB of the non-expert weights.
+        - name: kimi-k3-mxfp4-2p2d-dpa16-ep16-ll-moriio-gsm8k
+          topology: 1p1d_dpa16_ep16_ll_moriio
+          display_topology: 2P2D-DPA16-EP16-LL-MORIIO
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [8192]
+          osl: 1024
+          concurrency: [32]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              enable_prefix_caching: false
+              extra_args: '--default-chat-template-kwargs {"thinking":false}'
+              # Across nodes the device reports more free memory than it has,
+              # so the KV budget cannot subtract MoRI's memory; this leaves it room.
+              gpu_memory_utilization: 0.70
+              # Per DP rank, and the KDA state pool keeps a 232 MB slot for each.
+              max_num_seqs: 32
+              # Unsharded under DP attention, f_b_proj is a 128 -> 12288 GEMM:
+              # aiter's FP8 kernel has no config for it and its fallback needs
+              # K > 192, so it stays BF16.
+              online_quant_config: '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*self_attn.[qkv]_conv1d*","*self_attn.f_b_proj*","*block_sparse_moe.experts*","*block_sparse_moe.routed_expert_*","*vision_tower*","*mm_projector*"]}'
+          prefill:
+            workers: 1
+            nodes_per_worker: 2
+            tp: 8
+            extra_args: "--enable-dp-attention --enable-expert-parallel"
+          decode:
+            workers: 1
+            nodes_per_worker: 2
+            tp: 8
+            extra_args: "--enable-dp-attention --enable-expert-parallel --all2all-backend low-latency"
+            cudagraph: "[1,2,4,8,16,32]"
+          env:
+            common:
+              KV_CONNECTOR: moriio
+              ATOM_MORIIO_MODE: write
+              ATOM_ENABLE_REPLAYSSM: "0"
+              MORI_SHMEM_HEAP_SIZE: 16G
+              HSA_NO_SCRATCH_RECLAIM: "1"
+              MORI_ENABLE_HOST_PROXY: "1"
+              ATOM_DP_LM_HEAD_MODE: default
+            decode:
+              ATOM_MORI_V1_LL: "1"
+              MORI_EP_BLOCK_NUM: "64"
+              MORI_EP_RDMA_BLOCK_NUM: "32"
+              MORI_EP_WARP_PER_BLOCK: "8"
+          benchmark:
+            wait_server_timeout: 7200
+          run_eval: true
+          eval_only: true
+          eval_concurrency: [32]
+          accuracy:
+            threshold: 0.90
+
     accuracy:
       task: gsm8k
       fewshot: 5
@@ -2250,6 +2308,9 @@ models:
   DeepSeek-V3:
     backend: atom
     model_path: "${ATOMESH_MODEL_ROOT}/deepseek-ai/DeepSeek-V3/"
+    model_path_by_runner:
+      # The Spur lane's model root has no DeepSeek-V3; the cluster keeps it here.
+      atomesh-cicd-mi350: /data/models2/DeepSeek-V3/
     precision: FP8
     env:
       common:

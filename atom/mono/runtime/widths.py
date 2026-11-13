@@ -6,8 +6,9 @@ import logging
 
 import torch.distributed as dist
 
+from atom.distributed.group_agreement import group_agree
 from atom.mono.runtime.compile import compile_kernels, kernel_names, scratch_bytes
-from atom.mono.runtime.consensus import MonoUnsupported, tp_agree
+from atom.mono.runtime.consensus import MonoUnsupported
 
 logger = logging.getLogger("atom")
 
@@ -53,9 +54,9 @@ class WidthBuilds:
         spilled = [launcher for launcher, n in scratch.items() if n]
         # any rank's spill sends every rank through the lean rebuild together,
         # if every rank has a leaner build (``lean`` None: nothing to swap)
-        if self._lean is not None and not tp_agree(not spilled, self._group):
+        if self._lean is not None and not group_agree(not spilled, self._group):
             lean = self._lean(built, spilled) if spilled else built
-            if tp_agree(lean is not None, self._group):
+            if group_agree(lean is not None, self._group):
                 logger.info(
                     "%s: %s need scratch, rebuilt lean",
                     self._what,
@@ -64,7 +65,7 @@ class WidthBuilds:
                 built, scratch = self._compiled(width, lambda: lean)
         if built is not None and not self._scratch_free(scratch):
             built = None
-        if not tp_agree(built is not None, self._group):
+        if not group_agree(built is not None, self._group):
             self._refused.add(width)
             return False
         self._built[width] = built
@@ -90,7 +91,7 @@ class WidthBuilds:
             )
             built = None
         # every rank's share in FlyDSL's disk cache before any rank reads it
-        if not tp_agree(built is not None, self._group):
+        if not group_agree(built is not None, self._group):
             return None, {}
         try:
             launchers = compile_kernels(kernels)

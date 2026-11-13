@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Renormalized softmax top-k routing, one Triton program per token,
-bit-identical to AITER's `topk_softmax` except on rows with NaN logits."""
+bit-identical to AITER's ``topk_softmax`` (with ``renormalize=True``) except
+on rows with NaN logits.
+
+When ``renormalize=False`` the softmax denominator is the sum over all N
+experts, not just the K winners.  This is used by Qwen3.5 / Qwen3-Next."""
 
 import torch
 import triton
@@ -23,6 +27,7 @@ def _topk_softmax_kernel(
     KP: tl.constexpr,
     NSH: tl.constexpr,
     HAS_NUM_VALID_ROWS: tl.constexpr,
+    RENORMALIZE: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     offs = tl.arange(0, E)
@@ -56,7 +61,12 @@ def _topk_softmax_kernel(
         iv = tl.where(kk == k, idx, iv)
         total += e
         key = tl.where(offs == idx, cleared, key)
-    wv = wv * (1.0 / total)
+    if RENORMALIZE:
+        wv = wv * (1.0 / total)
+    else:
+        ex = libdevice.exp(x - row_max)
+        full_denom = tl.sum(tl.where(nan, 0.0, ex), axis=0)
+        wv = wv * (1.0 / full_denom)
     if HAS_NUM_VALID_ROWS:
         pad = row >= tl.load(num_valid_rows_ptr)
         wv = tl.where(pad, 0.0, wv)
@@ -75,10 +85,15 @@ def triton_topk_softmax(
     gating_output: torch.Tensor,
     num_shared_experts: int = 0,
     num_valid_rows: torch.Tensor | None = None,
+    *,
+    renormalize: bool = True,
 ) -> None:
     """`topk_softmax(topk_weights, topk_ids, _, gating_output, True,
     num_shared_experts, "sigmoid", num_valid_rows)` as in AITER, with
     k = `topk_ids.shape[1]` and the shared columns sigmoid-scored.
+
+    When *renormalize* is False the softmax denominator covers all N experts,
+    not just the K winners.
 
     A NaN logit is picked only from a row of NaNs. AITER can also pick a NaN
     that is the first element of one of its vector loads (every 16th expert,
@@ -101,6 +116,7 @@ def triton_topk_softmax(
         KP=triton.next_power_of_2(k),
         NSH=num_shared_experts,
         HAS_NUM_VALID_ROWS=num_valid_rows is not None,
+        RENORMALIZE=renormalize,
         num_warps=1,
         # The weights match AITER bit for bit only without FMA contraction.
         enable_fp_fusion=False,

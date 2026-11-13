@@ -33,6 +33,7 @@ import pathlib
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 _SPARSE_ATTN = _ROOT / "atom" / "model_ops" / "minimax_m3" / "sparse_attn.py"
 _INDEX_TOPK = _ROOT / "atom" / "model_ops" / "minimax_m3" / "index_topk.py"
+_GEOMETRY = _ROOT / "atom" / "model_ops" / "minimax_m3" / "geometry.py"
 _PLUGIN = _ROOT / "atom" / "plugin" / "vllm" / "attention" / "minimax_m3_attnetion.py"
 
 
@@ -59,8 +60,11 @@ def _module_constants(
     """Evaluate the module's top-level integer assignments, without importing.
 
     `seed` stands in for names the module imports rather than assigns, which is
-    how the plugin gets `PAGES_PER_SPARSE_BLOCK`.
+    how the plugin gets `PAGES_PER_SPARSE_BLOCK`. The two kernel modules import
+    `SPARSE_BLOCK_SIZE` from `geometry.py`, so they are seeded with it.
     """
+    if path in (_SPARSE_ATTN, _INDEX_TOPK):
+        seed = {**_module_constants(_GEOMETRY), **(seed or {})}
     tree = ast.parse(path.read_text(encoding="utf-8"))
     values: dict[str, int] = dict(seed or {})
     for node in tree.body:

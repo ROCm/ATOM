@@ -1603,7 +1603,6 @@ class Indexer(nn.Module):
             assert_fp4_indexer_supported(
                 fused_writer=self.use_qk_rope_cache_fusion,
                 prefill_context_parallel=pcp_is_enabled(),
-                prefill_ubatching=get_current_atom_config().enable_tbo,
             )
 
         # TODO (zyongye) change dim to fp8 later to (self.head_dim + 4)

@@ -17,6 +17,7 @@ from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.moe_common import GateMode
 
 from atom.config import get_current_atom_config
+from atom.model_engine.capabilities import pcp_group_size_of
 from atom.model_ops.fused_moe.routed_rows import gather_rows
 from atom.model_ops.topK import reassign_gathered_shared_ids
 from atom.utils import envs
@@ -78,7 +79,7 @@ def create_comm_fused_moe_backend(
         or config.enable_expert_parallel
         or (parallel_config.dp_size != 1 and not use_dp_reduce_scatter)
         or parallel_config.use_ep
-        or config.prefill_context_parallel_size != 1
+        or pcp_group_size_of(config) != 1
         or parallel_config.tp_size == 1
     ):
         return None
@@ -408,8 +409,9 @@ class CommFusedMoeBackend:
             before_shared_add=before_shared_add,
             stage2_stream=stage2_stream,
             reduce_scatter_sizes=reduce_scatter_sizes,
-            # Routing sends the rows past `scheduled_tokens_gpu` to expert -1.
-            routes_may_be_missing=True,
+            # Rows past `scheduled_tokens_gpu` (and DPA pad rows) go to expert
+            # -1 as whole rows; each reduces into itself and is dropped, so
+            # their unwritten route scratch needs no clear.
             # The DPA input-gather phase completes only after every rank has
             # entered this invocation. It therefore also proves that every peer
             # finished reading the previous Direct partial before Stage2 reuses

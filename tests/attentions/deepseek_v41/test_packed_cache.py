@@ -154,50 +154,107 @@ def test_packed_decode_reuses_v4_with_ragged_rows(batch):
     assert scratch[selected.numel() :].count_nonzero() == 0
 
 
-@pytest.mark.parametrize("ratio", [1, 2])
-def test_packed_plan_scatter_graph_replay_preserves_other_fields(ratio):
+def _compress_inputs(ratio, rows):
+    """A compressor, its projections and a step whose `rows` plan slots (each
+    `(request, compressed row)` or `(-1, -1)`) each pool `ratio` fresh rows."""
     from types import SimpleNamespace
 
+    torch.manual_seed(ratio)
+    compressor = SimpleNamespace(
+        ratio=ratio,
+        ape=torch.zeros(ratio, 512, device="cuda"),
+        norm=SimpleNamespace(weight=torch.randn(512, device="cuda"), eps=1e-6),
+    )
+    values = torch.randn(1, len(rows) * ratio, 512, device="cuda") * 3
+    scores = None if ratio == 1 else torch.randn_like(values)
+    rope = SimpleNamespace(
+        cos_cache=torch.randn(512, 32, device="cuda").to(torch.bfloat16),
+        sin_cache=torch.randn(512, 32, device="cuda").to(torch.bfloat16),
+        rope_dim=64,
+    )
+    plan = torch.full((len(rows), 4), -1, device="cuda", dtype=torch.int32)
+    step = SimpleNamespace(
+        block_tables=torch.tensor([[3, 1], [5, 2]], device="cuda", dtype=torch.int32),
+        slots=torch.tensor([0, 1], device="cuda", dtype=torch.int32),
+        max_q_len=ratio,
+        plans={
+            ratio: SimpleNamespace(
+                compress_plan_gpu=plan,
+                write_plan_gpu=torch.full_like(plan, -1),
+                num_compress=len(rows),
+            )
+        },
+    )
+    return compressor, values, scores, rope, step
+
+
+def _plan_rows(rows, ratio):
+    """`rows` as plan rows: slot i a boundary pooling ragged rows i ratio ..
+    + ratio - 1, all from this forward's projections."""
+    plan = torch.full((len(rows), 4), -1, dtype=torch.int32)
+    for i, (batch, row) in enumerate(rows):
+        if batch >= 0:
+            plan[i] = torch.tensor(
+                [(i + 1) * ratio - 1, batch, (row + 1) * ratio - 1, 0]
+            )
+    return plan
+
+
+@pytest.mark.parametrize("kv_dtype", ["fp4", "fp8"])
+@pytest.mark.parametrize("ratio", [1, 2])
+def test_compressed_rows_land_packed_under_graph_replay(kv_dtype, ratio):
+    """`compress` writes a quantized pool's main rows in the kernel itself:
+    each the BF16 pool's row for the same inputs, quantized by the pool's rule
+    (`quantize_fp4` group16 / `quantize_fp8`) and packed, byte for byte; every
+    other byte of the backing as it was. Captured with sentinel rows only, then
+    replayed with live ones at the same plan address."""
     from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
 
-    geo = V41PoolGeometry(
-        3, ((0, 2), (1, 1), (2, 2)), 32, 128, 512, 128, kv_dtype="fp4"
+    owners = ((0, 2), (1, 1), (2, 2))
+    cache = PagedAttentionCache(
+        V41PoolGeometry(3, owners, 32, 128, 512, 128, kv_dtype=kv_dtype), 6, 2, "cuda"
     )
-    cache = PagedAttentionCache(geo, 6, 2, "cuda")
+    reference = PagedAttentionCache(
+        V41PoolGeometry(3, owners, 32, 128, 512, 128), 6, 2, "cuda"
+    )
     owner = 1 if ratio == 1 else 0
+    per_page = cache.geometry.rows_per_page(ratio)
     pages = cache.pages.view(f"main_{owner}")[0]
-    per_page = geo.rows_per_page(ratio)
-    tables = torch.tensor([[3, 1], [5, 2]], device="cuda", dtype=torch.int32)
-    plan = torch.full((4, 4), -1, device="cuda", dtype=torch.int32)
-    step = SimpleNamespace(
-        block_tables=tables,
-        plans={ratio: SimpleNamespace(compress_plan_gpu=plan)},
-    )
-    x = torch.randn(1, 4, 512, device="cuda", dtype=torch.bfloat16)
-    value = quantize_fp4(x, group_size=16, scale_dtype=torch.float8_e4m3fn)
-    packed = pack_rows(*value)[0]
-    # Compile and warm up before capture. All-sentinel capture must still
-    # produce writes when live rows arrive later at the same plan address.
-    cache._scatter_rows(pages, step, value, ratio)
+    compressor, values, scores, rope, step = _compress_inputs(ratio, [(-1, -1)] * 4)
+    plan = step.plans[ratio].compress_plan_gpu
+
+    def run(target):
+        target.compress(owner, compressor, values, scores, step, rope)
+
+    run(cache)  # compile and warm up before the capture
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        cache._scatter_rows(pages, step, value, ratio)
+        run(cache)
     for rows in (
         [(0, 0), (1, per_page), (-1, -1), (0, per_page + 1)],
         [(-1, -1), (1, 3), (0, per_page - 1), (-1, -1)],
         [(-1, -1)] * 4,
     ):
+        plan.copy_(_plan_rows(rows, ratio))
+        run(reference)
+        ref_pages = reference.pages.view(f"main_{owner}")[0]
         cache.page_bytes.fill_(97)
         before = cache.backing.clone()
         expected = cache.page_bytes.clone()
-        plan_cpu = torch.full((4, 4), -1, dtype=torch.int32, device="cpu")
-        for i, (batch, row) in enumerate(rows):
-            plan_cpu[i, 1:3] = torch.tensor([batch, row * ratio])
-            if batch >= 0:
-                page = int(tables[batch, row // per_page])
-                offset = pages.storage_offset() + (row % per_page) * pages.stride(1)
-                expected[page, offset : offset + packed.shape[-1]] = packed[i]
-        plan.copy_(plan_cpu)
+        for batch, row in rows:
+            if batch < 0:
+                continue
+            page = int(step.block_tables[batch, row // per_page])
+            latent = ref_pages[page, row % per_page][None]
+            packed = pack_rows(
+                *(
+                    quantize_fp4(latent, group_size=16, scale_dtype=torch.float8_e4m3fn)
+                    if kv_dtype == "fp4"
+                    else quantize_fp8(latent)
+                )
+            )[0]
+            offset = pages.storage_offset() + (row % per_page) * pages.stride(1)
+            expected[page, offset : offset + packed.numel()] = packed
         graph.replay()
         torch.cuda.synchronize()
         torch.testing.assert_close(cache.page_bytes, expected, rtol=0, atol=0)
@@ -248,3 +305,68 @@ def test_packed_window_keeps_rows_below_cached_until():
         expected[start : start + row_bytes] = 0
     assert not torch.equal(whole, expected)
     torch.testing.assert_close(kept, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("ratio", [1, 2])
+def test_ring_update_in_the_compress_launch_matches_its_own_launch(ratio, monkeypatch):
+    """A decode-sized step folds the ring update into the boundary kernel's
+    launch; the backing it leaves -- main rows, ring, everything -- is the one
+    the two launches leave, with boundaries reading the ring (ratio 2: each
+    request's first row closes a group the previous forward opened)."""
+    from types import SimpleNamespace
+
+    import atom.model_ops.deepseek_v41.compressor as compressor_module
+    from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
+
+    owners = ((0, 2), (1, 1), (2, 2))
+    # DSpark's 5 drafts: the ring the server runs (7 rows at ratio 2)
+    geo = V41PoolGeometry(
+        3, owners, 32, 128, 512, 128, kv_dtype="fp8", speculative_tokens=5
+    )
+    caches = [PagedAttentionCache(geo, 6, 2, "cuda") for _ in range(2)]
+    owner = 1 if ratio == 1 else 0
+    torch.manual_seed(7)
+    caches[0].page_bytes.copy_(
+        torch.randint(0, 255, caches[0].page_bytes.shape, dtype=torch.uint8)
+    )
+    for state in caches[0].compress_state(owner):
+        state.copy_(torch.randn_like(state))
+    caches[1].backing.copy_(caches[0].backing)
+    compressor, values, scores, rope, _ = _compress_inputs(ratio, [(-1, -1)] * 4)
+    # Two requests, two rows each, at positions (5, 6) and (9, 10)
+    rows = [(0, 5), (0, 6), (1, 9), (1, 10)]
+    boundaries = [
+        (i, batch, position, ratio - 1 - min(i % 2, ratio - 1))
+        for i, (batch, position) in enumerate(rows)
+        if (position + 1) % ratio == 0
+    ]
+    plan = torch.full((4, 4), -1, dtype=torch.int32)
+    plan[: len(boundaries)] = torch.tensor(boundaries, dtype=torch.int32)
+    write = torch.full((4, 4), -1, dtype=torch.int32)
+    write[:] = torch.tensor([(i, b, p, 0) for i, (b, p) in enumerate(rows)])
+
+    def step(max_q_len):
+        return SimpleNamespace(
+            block_tables=torch.tensor(
+                [[3, 1], [5, 2]], device="cuda", dtype=torch.int32
+            ),
+            slots=torch.tensor([0, 1], device="cuda", dtype=torch.int32),
+            max_q_len=max_q_len,
+            plans={
+                ratio: SimpleNamespace(
+                    compress_plan_gpu=plan.cuda(),
+                    write_plan_gpu=write.cuda(),
+                    num_compress=len(boundaries),
+                )
+            },
+        )
+
+    caches[1].compress(owner, compressor, values, scores, step(64), rope)
+
+    def separate_launch(*args, **kwargs):
+        raise AssertionError("a decode step's ring update ran as its own launch")
+
+    monkeypatch.setattr(compressor_module, "update_compressor_states", separate_launch)
+    caches[0].compress(owner, compressor, values, scores, step(2), rope)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(caches[0].backing, caches[1].backing, rtol=0, atol=0)

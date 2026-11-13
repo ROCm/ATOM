@@ -49,19 +49,27 @@ def server(monkeypatch):
     """Stub the engine and record what each endpoint hands to it."""
     calls = SimpleNamespace(generate=[], setup=[], template="<rendered prompt>")
 
+    def encode(text, **_kw):
+        return [0] * (LONG_PROMPT_TOKENS if text == "<long prompt>" else 2)
+
+    # Only what the engine does: count what it is handed. Any cut is the
+    # production code's (`_prepare_prompt`).
     async def fake_generate_async(prompt, _sampling, _request_id, **kwargs):
         calls.generate.append((prompt, kwargs))
-        output = {"text": "hello", "finish_reason": "eos", "num_cached_tokens": 0}
+        output = {
+            "text": "hello",
+            "finish_reason": "eos",
+            "num_cached_tokens": 0,
+            "num_tokens_input": len(prompt),
+            "num_tokens_output": 1,
+        }
         if kwargs.get("kv_transfer_params") is not None:
             output["kv_transfer_output_meta_info"] = PREFILL_OUTPUT
         yield output
 
     async def fake_setup_streaming_request(prompt, _sampling, _request_id, **kwargs):
         calls.setup.append((prompt, kwargs))
-        return 1, _FinishedCollector(), 2
-
-    def encode(text, **_kw):
-        return [0] * (LONG_PROMPT_TOKENS if text == "<long prompt>" else 2)
+        return 1, _FinishedCollector(), len(prompt)
 
     monkeypatch.setattr(api_server, "model_name", "m")
     monkeypatch.setattr(api_server, "_request_logger", None)
@@ -83,7 +91,8 @@ def server(monkeypatch):
         SimpleNamespace(
             config=SimpleNamespace(
                 generation_config=SimpleNamespace(), max_model_len=MAX_CTX
-            )
+            ),
+            io_processor=SimpleNamespace(encode_prompt=encode),
         ),
     )
     monkeypatch.setattr(api_server, "generate_async", fake_generate_async)
@@ -195,7 +204,7 @@ class TestBothLegsTruncateAlike:
         prefill = self._sent_prompt(server, endpoint, 1, HANDOFF)
         decode = self._sent_prompt(server, endpoint, 4096, HANDOFF)
 
-        assert prefill == decode == f"<{MAX_CTX - MAX_CTX // 8}>"
+        assert len(prefill) == len(decode) == MAX_CTX - MAX_CTX // 8
 
     @pytest.mark.parametrize("endpoint", ["messages", "responses"])
     def test_without_handoff_truncation_still_follows_max_tokens(
@@ -203,8 +212,61 @@ class TestBothLegsTruncateAlike:
     ):
         server.template = "<long prompt>"
 
-        assert self._sent_prompt(server, endpoint, 1, None) == "<long prompt>"
+        # max_tokens=1 leaves room for the whole prompt; 4096 does not.
+        assert len(self._sent_prompt(server, endpoint, 1, None)) == LONG_PROMPT_TOKENS
         assert (
-            self._sent_prompt(server, endpoint, 4096, None)
-            == f"<{MAX_CTX - MAX_CTX // 8}>"
+            len(self._sent_prompt(server, endpoint, 4096, None))
+            == MAX_CTX - MAX_CTX // 8
         )
+
+    @pytest.mark.parametrize("endpoint", ["messages", "responses"])
+    def test_input_tokens_are_the_engine_count_of_what_it_ran(self, server, endpoint):
+        server.template = "<long prompt>"
+        if endpoint == "messages":
+            usage = _messages(max_tokens=4096)["usage"]
+        else:
+            body = {"model": "m", "input": "hi", "max_output_tokens": 4096}
+            usage = _responses(body).json()["usage"]
+        assert usage["input_tokens"] == MAX_CTX - MAX_CTX // 8
+
+
+class TestStructuredResponsesCutFirst:
+    """A structured /v1/responses request builds its reasoning channel into the
+    sampling params before the engine call; both are seeded from the text the
+    engine runs."""
+
+    def test_over_the_cap_the_engine_gets_the_kept_ids(self, server, monkeypatch):
+        server.template = "<long prompt>"
+        configured = []
+        seeds = []
+
+        async def configure(_sampling, schema, channel, **_kw):
+            configured.append(schema)
+
+        monkeypatch.setattr(api_server, "_configure_structured_output", configure)
+        monkeypatch.setattr(
+            api_server,
+            "prompt_starts_in_reasoning",
+            lambda text: seeds.append(text) or False,
+        )
+        # The fake engine answers "hello", which is not JSON.
+        monkeypatch.setattr(
+            api_server, "validate_responses_output", lambda *a, **kw: None
+        )
+        response = _responses(
+            {
+                "model": "m",
+                "input": "hi",
+                "max_output_tokens": 4096,
+                "text": {"format": {"type": "json_object"}},
+            }
+        )
+
+        assert response.status_code == 200, response.text
+        sent, _kwargs = server.generate[0]
+        kept = MAX_CTX - MAX_CTX // 8
+        assert configured == ['{"type": "object"}']
+        # The engine is handed the kept ids, and does not tokenize again.
+        assert sent == [0] * kept
+        # The channel was seeded from the cut text, before the engine call.
+        assert seeds[0] == f"<{kept}>"

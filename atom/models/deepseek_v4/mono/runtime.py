@@ -4,8 +4,9 @@
 
 import torch
 
+from atom.distributed.group_agreement import group_agree
 from atom.mono.runtime.compile import _SYMBOL_KEY, _code_object
-from atom.mono.runtime.consensus import MonoUnsupported, tp_agree
+from atom.mono.runtime.consensus import MonoUnsupported
 from atom.mono.runtime.uncached import DeviceBytes, alloc_uncached, ipc_heap
 
 
@@ -148,7 +149,7 @@ class EpochPeerBuffer:
         # capture all of them so every TP rank reaches the agreement below.
         except Exception as error:  # noqa: BLE001
             failure = error
-        if not tp_agree(failure is None, group):
+        if not group_agree(failure is None, group):
             if self.local_address:
                 self.storage = None
                 self.local_address = 0
@@ -172,7 +173,7 @@ class EpochPeerBuffer:
             # peers in the same handshake and report one agreed refusal.
             except Exception as error:  # noqa: BLE001
                 failure = error
-            if not tp_agree(failure is None, group):
+            if not group_agree(failure is None, group):
                 for mapped in self._opened:
                     ipc_heap().close_mem_handle(mapped)
                 self._opened.clear()
@@ -188,7 +189,7 @@ class EpochPeerBuffer:
         # Device table construction can raise from either torch or HIP.
         except Exception as error:  # noqa: BLE001
             failure = error
-        if not tp_agree(failure is None, group):
+        if not group_agree(failure is None, group):
             self.close()
             raise MonoUnsupported(
                 "epoch peer address table allocation failed"

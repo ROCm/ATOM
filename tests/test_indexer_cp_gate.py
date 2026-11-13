@@ -87,6 +87,12 @@ def test_topology_gate_reasons_are_human_readable():
     )
 
 
+def test_topology_gate_refuses_mxfp4_caches():
+    assert indexer_cp_unsupported_reason(M3, 4, 4, 128, 1, False) is None
+    reason = indexer_cp_unsupported_reason(M3, 4, 4, 128, 1, False, mxfp4_caches=True)
+    assert reason is not None and "MXFP4" in reason
+
+
 # ───────────────────────────────────────────────────── compilation key ──
 
 
@@ -109,12 +115,16 @@ def _hash_with(indexer_dcp_only: bool) -> str:
         parallel_config=None,
         tensor_parallel_size=4,
         prefill_context_parallel_size=1,
+        sequence_parallel_size=1,
         dcp_config=SimpleNamespace(indexer_dcp_only=indexer_dcp_only),
         enable_dp_attention=False,
         index_cache_dtype="fp8",
+        kv_cache_dtype="fp8",
+        index_cache_layout=None,
         hf_config=SimpleNamespace(),
         max_model_len=4096,
         max_num_seqs=256,
+        max_num_batched_tokens=16384,
         speculative_config=None,
     )
     return Config.compute_hash(stub)

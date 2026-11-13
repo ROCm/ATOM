@@ -26,6 +26,7 @@ from typing import ClassVar
 from atom.sampling_params import RequiredChannel
 
 from .. import kimi_k3_tokens as k3
+from .kimi_k3_grammar import build_tool_call_grammar
 from .schema import build_param_types
 from .tool_parser import (
     RegionParse,
@@ -230,6 +231,16 @@ class KimiK3Parser(ToolCallParser):
         return (
             f'{k3.TOOLS_START}<|open|>call tool="{name}" index="0"{sep}'
             f"{body}{k3.CALL_END}{sep}{k3.TOOLS_END}{sep}"
+        )
+
+    @classmethod
+    def tool_call_grammar(
+        cls, functions: list[dict], *, required: bool, starts_in_reasoning: bool
+    ) -> str | None:
+        """Hold every call in the tools section to its tool's schema
+        (`kimi_k3_grammar.py`)."""
+        return build_tool_call_grammar(
+            functions, required=required, starts_in_reasoning=starts_in_reasoning
         )
 
     @classmethod

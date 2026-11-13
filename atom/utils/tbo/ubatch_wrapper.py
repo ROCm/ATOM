@@ -18,12 +18,28 @@ from atom.utils.forward_context import (
     get_forward_context,
 )
 
-from .ubatch_splitting import UBatchSlice
+from .ubatch_splitting import NUM_TBO_UBATCHES, UBatchSlice
 from .ubatching import make_tbo_contexts
 
 logger = logging.getLogger("atom")
 
 UBatchModelOutput: TypeAlias = torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]
+
+
+def _packed_tokens(
+    tensors: list[torch.Tensor], token_order: torch.Tensor | None
+) -> torch.Tensor:
+    """The micro-batches' tokens end to end, each put back at its packed token
+    (``token_order``, a permutation) when one is given."""
+    if token_order is None:
+        return torch.cat(tensors)
+    first = tensors[0]
+    out = first.new_empty((sum(t.shape[0] for t in tensors), *first.shape[1:]))
+    start = 0
+    for tensor in tensors:
+        out.index_copy_(0, token_order[start : start + tensor.shape[0]], tensor)
+        start += tensor.shape[0]
+    return out
 
 
 class UBatchWrapper(nn.Module):
@@ -41,11 +57,10 @@ class UBatchWrapper(nn.Module):
         self.dp_gather_scatter = dp_gather_scatter
         self.comm_stream: torch.cuda.Stream | None = None
         # Barrier: ubatch threads + main thread
-        self.ready_barrier = threading.Barrier(3)  # 2 ubatch threads + 1 main
+        self.ready_barrier = threading.Barrier(NUM_TBO_UBATCHES + 1)
 
-        # Persistent ubatch worker pool. Previously every forward spawned + joined
-        # 2 threads.
-        self._num_workers = 2
+        # Persistent ubatch worker pool, one thread a micro-batch.
+        self._num_workers = NUM_TBO_UBATCHES
         self._workers: list[threading.Thread] = []
         self._worker_jobs: list[callable | None] = [None] * self._num_workers
         self._worker_job_ready = [threading.Event() for _ in range(self._num_workers)]
@@ -66,6 +81,9 @@ class UBatchWrapper(nn.Module):
                 if job is not None:
                     job()
             finally:
+                # Drop the closure's tensors before the worker waits for its
+                # next job, including when subsequent steps do not use TBO.
+                job = None
                 self._worker_job_done[idx].set()
 
     def _ensure_workers(self, device: torch.device):
@@ -108,44 +126,30 @@ class UBatchWrapper(nn.Module):
 
         ub_dp_metadata = self._make_ubatch_dp_metadata(ctx, N)
 
-        full_running_bs = ctx.context.running_bs
         forward_contexts = []
         ub_inputs = []
 
-        # When using DP gather/scatter (no EP/all2all), compute the
-        # DP-synchronized per-ubatch row count so MoE's pad_for_all_gather can
-        # just read context.running_tokens.  MORI path doesn't need this.
-        dp_size = (
-            len(ctx.context.running_tokens_across_dp) if self.dp_gather_scatter else 1
-        )
-        ub_running_tokens_list = self._compute_ub_running_tokens(
-            ctx,
-            N,
-            full_running_bs,
-            dp_size,
-            input_ids.device,
-        )
+        # A split decode's micro-batches run their tokens in this order; a
+        # prefill's run them in place.
+        token_order = ctx.attn_metadata.ubatch_token_order
+        if token_order is not None:
+            input_ids = input_ids[token_order]
+            positions = positions[..., token_order]
 
         for i, ub_slice in enumerate(ctx.ubatch_slices):
-            ub_num_reqs = ub_slice.request_slice.stop - ub_slice.request_slice.start
-            if ctx.context.is_prefill:
-                ub_running_bs = ub_num_reqs
-            else:
-                ub_running_bs = self._decode_ub_running_bs(ctx, i, N, full_running_bs)
             ub_ctx = self._make_ubatch_context(
                 original_ctx,
                 ub_slice,
-                ub_running_bs,
                 i,
-                ub_num_reqs,
-                ub_running_tokens=ub_running_tokens_list[i],
+                positions,
+                token_order,
                 dp_metadata=ub_dp_metadata[i] if ub_dp_metadata is not None else None,
                 running_tokens_across_dp=self._ub_tokens_across_dp(ctx, N, i),
             )
             forward_contexts.append(ub_ctx)
             ub_token_slice = (
                 input_ids[ub_slice.token_slice],
-                positions[ub_slice.token_slice],
+                positions[..., ub_slice.token_slice],
             )
             # Empty ubatch would return immediately, leaving the partner
             # wedged at its next yield (see TBOContext.__exit__ comment).
@@ -155,7 +159,8 @@ class UBatchWrapper(nn.Module):
             assert ub_token_slice[0].numel() > 0, (
                 f"ubatch {i} produced an empty token slice "
                 f"(ts={ub_slice.token_slice}, rs={ub_slice.request_slice}); "
-                "check local_tbo_precompute / maybe_create_ubatch_slices."
+                "check prefill_tbo_vote / cut_prefill_ubatches / "
+                "cut_decode_ubatches."
             )
             ub_inputs.append(ub_token_slice)
 
@@ -248,28 +253,30 @@ class UBatchWrapper(nn.Module):
                 raise e
 
         sorted_results = [value for _, value in sorted(results)]
-        return self._concat_ubatch_outputs(sorted_results)
+        return self._merge_ubatch_outputs(sorted_results, token_order)
 
     @staticmethod
-    def _concat_ubatch_outputs(
-        outputs: list[UBatchModelOutput],
+    def _merge_ubatch_outputs(
+        outputs: list[UBatchModelOutput], token_order: torch.Tensor | None = None
     ) -> UBatchModelOutput:
-        """Concatenate Tensor or Eagle3 aux outputs from per-ubatch forwards."""
+        """The micro-batches' Tensor or Eagle3 aux outputs, end to end, put
+        back in the step's packed token order (``token_order``) when they ran
+        in another."""
         first = outputs[0]
         if isinstance(first, torch.Tensor):
             if not all(isinstance(output, torch.Tensor) for output in outputs):
                 raise TypeError("TBO ubatch outputs must have matching structures")
-            return torch.cat(outputs, dim=0)
+            return _packed_tokens(outputs, token_order)
 
         if not all(isinstance(output, tuple) for output in outputs):
             raise TypeError("TBO ubatch outputs must have matching structures")
 
-        hidden_states = torch.cat([output[0] for output in outputs], dim=0)
+        hidden_states = _packed_tokens([output[0] for output in outputs], token_order)
         num_aux = len(first[1])
         if not all(len(output[1]) == num_aux for output in outputs):
             raise ValueError("TBO ubatch aux output counts must match")
         aux_hidden_states = [
-            torch.cat([output[1][idx] for output in outputs], dim=0)
+            _packed_tokens([output[1][idx] for output in outputs], token_order)
             for idx in range(num_aux)
         ]
         return hidden_states, aux_hidden_states
@@ -301,166 +308,106 @@ class UBatchWrapper(nn.Module):
         context (the shared metadata is then reused, which is correct for the
         single-rank case). Otherwise returns a list of length ``N``.
 
-        Each ubatch's per-rank tokens are the step's sync's own
-        (`ub_tokens_across_dp`): `local_tbo_precompute` sizes them exactly as
-        the slices are cut, so no collective of its own is needed.
+        Each ubatch's per-rank tokens are known without a collective of its
+        own (`_ub_tokens_across_dp`).
         """
         if ctx.dp_metadata is None:
             return None
         return [
-            DPMetadata(np.asarray(ctx.ub_tokens_across_dp[i], dtype=np.int32))
+            DPMetadata(np.asarray(self._ub_tokens_across_dp(ctx, N, i), np.int32))
             for i in range(N)
         ]
 
     @staticmethod
     def _ub_tokens_across_dp(ctx: ForwardContext, N: int, i: int):
         """Ubatch ``i``'s per-rank token counts, or None if none were reduced.
+        A decode's every rank cuts the same bucket, so each runs the ubatch's
+        `running_tokens`, as does a group of one; a prefill's peers' are the
+        step's sync's (`ub_tokens_across_dp`, sized by `prefill_tbo_vote` as
+        the slices are cut).
 
         Passed down because inside a ubatch only this rank's split is in reach.
         """
+        running_tokens = ctx.ubatch_slices[i].running_tokens
+        if not ctx.context.is_prefill:
+            step_rows = ctx.context.running_tokens_across_dp
+            if step_rows is None:
+                return None
+            return (running_tokens,) * len(step_rows)
         rows = ctx.ub_tokens_across_dp
-        return None if rows is None or len(rows) != N else rows[i]
-
-    @staticmethod
-    def _decode_ub_running_bs(
-        ctx: ForwardContext, i: int, N: int, full_running_bs: int
-    ) -> int:
-        """Per-ubatch padded request count for a decode micro-batch.
-
-        Must be IDENTICAL across DP ranks: the MoE all_gather/reduce_scatter
-        pads each ubatch to this size, so a per-rank-local split (which differs
-        when ranks carry different decode batch sizes, e.g. during drain)
-        desyncs the collective and faults. Derive it from the DP-unified
-        ``ub_max_tokens_across_dp`` (MAX-reduced in ``ForwardMode.decide``),
-        converting the per-ubatch token max back to a request count via
-        ``max_seqlen_q``. Falls back to the local split only when DP is off or
-        the precomputed value is unavailable.
-        """
-        ub_max = ctx.ub_max_tokens_across_dp
-        if ub_max is not None and len(ub_max) == N:
-            max_q = getattr(ctx.attn_metadata, "max_seqlen_q", 1) or 1
-            return max(1, ub_max[i] // max_q)
-        # Fallback: local split (single-rank / value not precomputed).
-        if i < N - 1:
-            return full_running_bs // N
-        return full_running_bs - (full_running_bs // N) * (N - 1)
-
-    @staticmethod
-    def _compute_ub_running_tokens(
-        ctx: ForwardContext,
-        N: int,
-        full_running_bs: int,
-        dp_size: int,
-        device: torch.device,
-    ) -> list[int]:
-        """Per-ubatch ``running_tokens`` -- what each micro-batch's MoE pads to.
-
-        In TOKENS on both branches, which is why neither multiplies by
-        ``dp_size``: pad_for_all_gather gathers across ranks itself.
-
-        For prefill (eager only): the cross-DP per-ubatch token MAX that
-            ``ForwardMode.decide`` already packed into the single DP
-            all_reduce (``ctx.ub_max_tokens_across_dp``). Falls back to
-            local sizes when DP is off / value not precomputed.
-        For decode: the per-ubatch padded request count times ``max_seqlen_q``.
-        """
-        if ctx.context.is_prefill:
-            if (
-                dp_size > 1
-                and ctx.ub_max_tokens_across_dp is not None
-                and len(ctx.ub_max_tokens_across_dp) == N
-            ):
-                # Precomputed via the packed DP reduce — no extra all_reduce.
-                return list(ctx.ub_max_tokens_across_dp)
-            # A prefill ubatch runs the rows it scheduled.
-            return [
-                ub_slice.token_slice.stop - ub_slice.token_slice.start
-                for ub_slice in ctx.ubatch_slices
-            ]
-        max_q = int(getattr(ctx.attn_metadata, "max_seqlen_q", 1) or 1)
-        return [
-            UBatchWrapper._decode_ub_running_bs(ctx, i, N, full_running_bs) * max_q
-            for i in range(N)
-        ]
+        if rows is None or len(rows) != N:
+            return None
+        return (running_tokens,) if len(rows[i]) == 1 else rows[i]
 
     @staticmethod
     def _ubatch_scheduled_tokens_gpu(
-        step_scheduled_tokens_gpu: torch.Tensor | None, row_offset: int, rows: int
+        step_scheduled_tokens_gpu: torch.Tensor | None,
+        token_start: int,
+        token_stop: int,
     ) -> torch.Tensor | None:
-        """A micro-batch's real row count on the device: the step's past this
-        micro-batch's first row, within its `rows`. A step's padding is its
-        trailing rows however it splits (a graph splits the recorded bucket, an
-        eager step its scheduled requests), so that is the micro-batch's own.
+        """A micro-batch's scheduled token count on the device: the step's
+        within its own tokens, ``[token_start, token_stop)``. A step's tokens
+        past its scheduled ones trail it, so that is the micro-batch's own.
         Clamped here, not by the consumer: aiter's sorter reads the count as
         the row count."""
         if step_scheduled_tokens_gpu is None:
             return None
-        return (step_scheduled_tokens_gpu - row_offset).clamp_(0, rows)
+        return (step_scheduled_tokens_gpu - token_start).clamp_(
+            0, token_stop - token_start
+        )
 
     def _make_ubatch_context(
         self,
         ctx: ForwardContext,
         ub_slice: UBatchSlice,
-        ub_running_bs: int,
-        ubatch_idx: int = 0,
-        actual_num_reqs: int | None = None,
-        ub_running_tokens: int | None = None,
+        ubatch_idx: int,
+        positions: torch.Tensor,
+        token_order: torch.Tensor | None,
         dp_metadata=None,
         running_tokens_across_dp: tuple[int, ...] | None = None,
     ) -> ForwardContext:
-        """Build a ForwardContext for a single micro-batch."""
-        ub_num_reqs = ub_slice.request_slice.stop - ub_slice.request_slice.start
+        """Build a ForwardContext for a single micro-batch, over the metadata
+        the step built for it (`AttentionMetaData.ubatches`). ``positions`` are
+        the step's in its micro-batches' order, ``token_order`` that order."""
+        ub_attn = ctx.attn_metadata.ubatches[ubatch_idx]
 
-        if ctx.context.is_prefill:
-            ub_attn = self.attn_metadata_builder.build_ubatch_prefill_metadata(
-                ctx.attn_metadata,
-                ub_slice,
-                ub_running_bs,
-                ubatch_idx=ubatch_idx,
-            )
-        else:
-            attn_bs = actual_num_reqs if actual_num_reqs is not None else ub_running_bs
-            ub_attn = self.attn_metadata_builder.build_ubatch_metadata(
-                ubatch_idx,
-                attn_bs,
-            )
-
-        # Split Context
-        ub_scheduled_tokens = ub_slice.token_slice.stop - ub_slice.token_slice.start
-        if ub_running_tokens is not None:
-            running_tokens = ub_running_tokens
-        elif ctx.context.is_prefill:
-            running_tokens = ub_scheduled_tokens
-        else:
-            running_tokens = ub_running_bs * int(
-                getattr(ctx.attn_metadata, "max_seqlen_q", 1) or 1
+        # Split Context. Its tokens past its own requests' are padding.
+        ts = ub_slice.token_slice
+        ub_scheduled_bs = ub_slice.scheduled_bs(ctx.context.scheduled_bs)
+        ub_token_order = None if token_order is None else token_order[ts]
+        scheduled_tokens_gpu = ub_attn.scheduled_tokens_gpu
+        if scheduled_tokens_gpu is None:
+            scheduled_tokens_gpu = self._ubatch_scheduled_tokens_gpu(
+                ctx.context.scheduled_tokens_gpu,
+                ts.start,
+                ub_slice.scheduled_token_slice.stop,
             )
         ub_context = Context(
-            positions=ctx.context.positions[ub_slice.token_slice],
+            positions=positions[..., ts],
             is_prefill=ctx.context.is_prefill,
             is_dummy_run=ctx.context.is_dummy_run,
-            scheduled_bs=ub_num_reqs,
-            scheduled_tokens=ub_scheduled_tokens,
-            running_bs=ub_running_bs,
-            running_tokens=running_tokens,
+            scheduled_bs=ub_scheduled_bs,
+            scheduled_tokens=ub_slice.scheduled_tokens,
+            running_bs=ub_slice.running_bs,
+            running_tokens=ub_slice.running_tokens,
+            # Each rank runs its own micro-batch tokens exactly when it runs
+            # the step's own: a prefill's are gathered by every rank's count.
+            running_tokens_are_unified=ctx.context.running_tokens_are_unified,
             running_tokens_across_dp=running_tokens_across_dp,
             is_draft=ctx.context.is_draft,
             # Carry over per-ubatch slice of input_ids for hash MoE (PCP+TBO mode).
             # run_model stores local (1/pcp) ids; each ubatch takes its token_slice,
             # and the MoE hash-routes its local rows by them before any gather.
             input_ids=(
-                ctx.context.input_ids[ub_slice.token_slice]
-                if ctx.context.input_ids is not None
-                else None
+                None
+                if ctx.context.input_ids is None
+                else ctx.context.input_ids[
+                    ts if ub_token_order is None else ub_token_order
+                ]
             ),
-            # Where this ubatch's rows start on the full forward's token axis;
-            # drafter aux capture writes at this offset.
-            ubatch_token_offset=ub_slice.token_slice.start,
-            scheduled_tokens_gpu=self._ubatch_scheduled_tokens_gpu(
-                ctx.context.scheduled_tokens_gpu,
-                ub_slice.token_slice.start,
-                running_tokens,
-            ),
+            ubatch_token_offset=ts.start,
+            ubatch_token_order=ub_token_order,
+            scheduled_tokens_gpu=scheduled_tokens_gpu,
             pcp_split=ctx.context.pcp_split,
         )
 

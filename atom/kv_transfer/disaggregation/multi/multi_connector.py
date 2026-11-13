@@ -402,6 +402,11 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         methods = (getattr(c, name, None) for c in self._connectors)
         return [m for m in methods if callable(m)]
 
+    def drop_cached_kv(self) -> bool:
+        """Every sub-connector is asked, so each drops what it can."""
+        results = [bool(drop()) for drop in self._sub_methods("drop_cached_kv")]
+        return all(results)
+
     def can_detach_lookup(self, seq: Any, num_hbm_tokens: int) -> bool:
         """True only if every sub-connector with a tier lookup can detach it."""
         checks = self._sub_methods("can_detach_lookup")
@@ -548,6 +553,22 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             self._load_winner.pop(sid, None)
         return result
 
+    @property
+    def supports_pd_admission(self) -> bool:
+        # The PD leg must win remote-prefill lookups before a cache tier can
+        # arm another load into the same destination table.
+        return (
+            bool(self._connectors)
+            and self._connectors[0].supports_pd_admission
+            and all(getattr(c, "is_offload", False) for c in self._connectors[1:])
+        )
+
+    def pd_receive_block_offset(self, seq, num_blocks, num_cached_blocks):
+        winner = self._load_winner.get(seq.id)
+        if winner is None:
+            return None
+        return winner.pd_receive_block_offset(seq, num_blocks, num_cached_blocks)
+
     def cancel_pending_load(self, seq: Any) -> None:
         """Forward a load cancellation to every sub that arms loads.
 
@@ -678,6 +699,21 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         if c is None:
             return False
         return bool(c.enqueue_state_stores(stores))
+
+    def enqueue_state_touches(self, hashes) -> bool:
+        """State touches to the sub hosting the tier (`_state_tier_sub`);
+        False if none does."""
+        c = self._state_tier_sub()
+        if c is None:
+            return False
+        return bool(c.enqueue_state_touches(hashes))
+
+    def take_state_touch_verdicts(self) -> dict:
+        """`{hash: resident}` from the tier sub; empty if none."""
+        c = self._state_tier_sub()
+        if c is None:
+            return {}
+        return c.take_state_touch_verdicts()
 
     def take_state_reports(self):
         """`(indexed, failed)` from the tier sub, else two empty sets.

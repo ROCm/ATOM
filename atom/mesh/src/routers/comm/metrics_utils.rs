@@ -6,10 +6,11 @@ use crate::observability::metrics::metrics_labels;
 
 /// Map route path to endpoint label for metrics
 pub(crate) fn route_to_endpoint(route: &str) -> &'static str {
-    match route {
+    match route.split('?').next().unwrap_or(route) {
         "/v1/chat/completions" => metrics_labels::ENDPOINT_CHAT,
         "/generate" => metrics_labels::ENDPOINT_GENERATE,
         "/v1/completions" => metrics_labels::ENDPOINT_COMPLETIONS,
+        "/v1/messages" => "messages",
         "/v1/responses" => metrics_labels::ENDPOINT_RESPONSES,
         _ => "other",
     }

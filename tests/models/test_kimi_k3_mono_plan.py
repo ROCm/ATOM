@@ -88,6 +88,7 @@ def _metadata(**over):
         "spec_state_indices_tensor": torch.zeros(2, 4, dtype=torch.int32),
         "num_accepted_tokens": torch.ones(2, dtype=torch.int32),
         "replayssm": False,
+        "has_state_fork": False,
     }
     base.update(over)
     return SimpleNamespace(**base)
@@ -109,6 +110,7 @@ def test_step_rows_accepts_a_uniform_spec_verify():
         {"num_accepted_tokens": None},
         {"num_actual_tokens": 7},  # disagrees with the rows
         {"spec_state_indices_tensor": torch.zeros(2, 4, dtype=torch.int64)},
+        {"has_state_fork": True},  # K1 has no read-side slot index
     ],
 )
 def test_step_rows_refuses_every_other_shape(over):
@@ -126,6 +128,7 @@ def _plain_metadata(requests=3, **over):
         "num_spec_decodes": 0,
         "num_actual_tokens": requests,
         "non_spec_state_indices_tensor": torch.arange(requests, dtype=torch.int32),
+        "has_state_fork": False,
     }
     base.update(over)
     return SimpleNamespace(**base)
@@ -148,6 +151,7 @@ def test_step_rows_accepts_a_plain_decode_as_one_token_a_request():
         {"non_spec_state_indices_tensor": torch.arange(3, dtype=torch.int64)},
         # a strided slot table: K1 reads it at a stride of one
         {"non_spec_state_indices_tensor": torch.arange(6, dtype=torch.int32)[::2]},
+        {"has_state_fork": True},
     ],
 )
 def test_step_rows_refuses_every_other_plain_shape(over):
