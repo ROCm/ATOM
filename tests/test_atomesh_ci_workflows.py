@@ -6,12 +6,17 @@
 from pathlib import Path
 
 import yaml
+from atomesh_workflow_helpers import github_expressions
 
 WORKFLOWS = Path(__file__).resolve().parents[1] / ".github" / "workflows"
 
 
 def _jobs(filename):
     return yaml.safe_load((WORKFLOWS / filename).read_text())["jobs"]
+
+
+def _workflow(filename):
+    return yaml.safe_load((WORKFLOWS / filename).read_text())
 
 
 def test_empty_accuracy_model_list_skips_the_job_only_on_pull_requests():
@@ -126,6 +131,42 @@ def test_atomesh_benchmark_uses_required_heavy_ci_gate():
     assert "run-model-benchmark=${{ needs.run-model-benchmark.result }}" in (
         evaluate_inputs["optional-results"]
     )
+
+
+def test_atomesh_heavy_gate_concurrency_groups_separate_non_approval_reviews():
+    cases = [
+        ("atomesh-accuracy-validation.yaml", "Atomesh Accuracy Validation"),
+        ("atomesh-benchmark.yaml", "Atomesh Benchmark"),
+    ]
+
+    for filename, workflow_name in cases:
+        group = _workflow(filename)["concurrency"]["group"]
+        pull_request_group = github_expressions(
+            group,
+            "pull_request",
+            workflow=workflow_name,
+            pull_request_number="3313",
+            run_id="100",
+        )
+        approval_group = github_expressions(
+            group,
+            "pull_request_review",
+            workflow=workflow_name,
+            pull_request_number="3313",
+            review_state="approved",
+            run_id="200",
+        )
+        comment_group = github_expressions(
+            group,
+            "pull_request_review",
+            workflow=workflow_name,
+            pull_request_number="3313",
+            review_state="commented",
+            run_id="300",
+        )
+
+        assert approval_group == pull_request_group
+        assert comment_group == f"{pull_request_group}-review-300"
 
 
 def test_mocker_benchmark_stays_off_pull_requests():
