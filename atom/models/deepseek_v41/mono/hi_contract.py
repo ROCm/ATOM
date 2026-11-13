@@ -9,9 +9,11 @@ The engine's builds at load skip both (``serving``: FlyDSL's disk cache on) and 
 programs.
 
 Usage: python -m atom.models.deepseek_v41.mono.hi_contract CONFIG.json [WIDTH ...] [--fits]
-(``CONFIG.json``: the model's ``config.json``; widths default to every served one, ``hi_compose.ROWS``: the 108
-programs and their fits, about 10 minutes on 8 CPUs). The Linear prefetch fits are derived and held to the frozen
-table (``hi.blocks.gfx950.linear_fits``); ``--fits`` prints the table instead (to regenerate it).
+(``CONFIG.json``: the model's ``config.json``; widths default to every served one, ``hi_compose.ROWS``, in every FP4
+index layout the programs address, ``hi_gate.INDEX_LAYOUTS``: the index sources' programs differ by layout, and the
+engine serves gfx950 with ATOM's default "mfma"; about 10 minutes a layout on 8 CPUs). The Linear prefetch fits are
+derived and held to the frozen table (``hi.blocks.gfx950.linear_fits``); ``--fits`` prints the table instead (to
+regenerate it).
 """
 
 from __future__ import annotations
@@ -24,7 +26,7 @@ from types import SimpleNamespace
 
 from atom.models.deepseek_v41.config import build_attention_topology
 from atom.models.deepseek_v41.mono import hi_compose
-from atom.models.deepseek_v41.mono.hi_gate import MAX_CTX
+from atom.models.deepseek_v41.mono.hi_gate import INDEX_LAYOUTS, MAX_CTX
 
 TP = 4
 
@@ -36,9 +38,11 @@ def config(path: str) -> SimpleNamespace:
     return SimpleNamespace(**raw.get("text_config", raw))
 
 
-def check(cfg, widths=None, tp: int = TP, fits: bool = True) -> hi_compose.HiPrograms:
-    """Every hi program of ``widths`` (default ``hi_compose.ROWS``) at ``tp`` built for gfx950 compile-only, its trace
-    checked (module docstring); -> the composition. Raises ``ContractError`` on a violation. ``fits``: the Linear
+def check(
+    cfg, widths=None, tp: int = TP, fits: bool = True, index_layout: str = "preshuffle"
+) -> hi_compose.HiPrograms:
+    """Every hi program of ``widths`` (default ``hi_compose.ROWS``) at ``tp`` built for gfx950 compile-only on ATOM's
+    FP4 index plane in ``index_layout``, its trace checked (module docstring); -> the composition. Raises ``ContractError`` on a violation. ``fits``: the Linear
     prefetch fits derived by their probes, not read from the frozen table (``linear_fits``), and each held to the
     table's (``ContractError`` on a difference; a plan the table lacks: ``missing_fits``).
     """
@@ -50,7 +54,9 @@ def check(cfg, widths=None, tp: int = TP, fits: bool = True) -> hi_compose.HiPro
     widths = list(hi_compose.ROWS) if widths is None else list(widths)
     frozen, linear.FROZEN = linear.FROZEN, not fits
     try:
-        progs = hi_compose.HiPrograms(cfg, topology, widths, MAX_CTX, tp)
+        progs = hi_compose.HiPrograms(
+            cfg, topology, widths, MAX_CTX, tp, index_layout=index_layout
+        )
     finally:
         linear.FROZEN = frozen
     if fits:
@@ -104,17 +110,24 @@ def main(argv: list[str]) -> int:
         return 2
     write = "--fits" in argv
     argv = [a for a in argv if a != "--fits"]
-    t0 = time.time()
-    progs = check(config(argv[0]), [int(w) for w in argv[1:]] or None)
+    cfg, widths = config(argv[0]), [int(w) for w in argv[1:]] or None
+    built = {}
+    for layout in INDEX_LAYOUTS:
+        t0 = time.time()
+        built[layout] = (
+            len(check(cfg, widths, index_layout=layout).kernels()),
+            time.time() - t0,
+        )
     if (
         write
-    ):  # the frozen table, every fit of the composition (the derived ones it lacked included)
+    ):  # the frozen table, every fit of the compositions (the derived ones it lacked included)
         from .hi.blocks.gfx950 import linear
 
         print(fits_module(dict(linear.DERIVED)), end="")
         return 0
-    print(f"{len(progs.kernels())} hi programs built and checked in {time.time() - t0:.0f} s; "
-          f"{len(missing_fits())} fits not in the frozen table")  # fmt: skip
+    for layout, (n, secs) in built.items():
+        print(f"{layout}: {n} hi programs built and checked in {secs:.0f} s")
+    print(f"{len(missing_fits())} fits not in the frozen table")
     return 0
 
 
