@@ -1042,6 +1042,102 @@ async fn token_routing_is_prepared_in_the_parse_job_or_needs_the_pool_again() {
     assert!(tokens.is_some_and(|tokens| !tokens.is_empty()));
 }
 
+/// With `--kv-events`, `cache_aware` wants tokens, and a request whose model the router
+/// cannot tokenize is still prepared, by its text, its model warned about once.
+#[tokio::test]
+async fn wanted_tokens_fall_back_to_the_text() {
+    let pool = PreparePoolRuntime::new(default_pool()).unwrap();
+    let config = crate::config::RouterConfig {
+        policy: crate::config::PolicyConfig::CacheAware {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 32,
+            balance_rel_threshold: 1.5,
+            eviction_interval_secs: 60,
+            max_tree_size: 1000,
+        },
+        kv_events: true,
+        ..Default::default()
+    };
+    let app = AppContext::from_config(config, 5, pool.handle())
+        .await
+        .unwrap();
+    let tokenizer: Arc<dyn crate::tokenizer::traits::Tokenizer> =
+        Arc::new(crate::tokenizer::MockTokenizer::new());
+    app.tokenizer_registry
+        .load("mock-id", "m", "mock", || async { Ok(tokenizer) })
+        .await
+        .unwrap();
+    let chat = json!({"model": "untokenized", "messages": [{"role": "user", "content": "hi"}]});
+    for (path, body, model, tokenized) in [
+        (
+            "/generate",
+            json!({"model": "m", "text": "hello world"}),
+            "m",
+            true,
+        ),
+        ("/v1/chat/completions", chat, "untokenized", false),
+    ] {
+        let parsed = ParsedInference::parse(path, &serde_json::to_vec(&body).unwrap()).unwrap();
+        let text = parsed.metadata_with_text(true).text;
+        let routing = IngressRouting::new(&app);
+        let (metadata, tokens) = app
+            .prepare_pool
+            .submit(app.prepare_pool.prepare_deadline(), move |ctx| {
+                routing.prepare(&parsed, ctx)
+            })
+            .await
+            .unwrap()
+            .wait()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(metadata.text, text);
+        assert_eq!(tokens.is_some(), tokenized, "{model}");
+        assert_eq!(UNTOKENIZED_MODELS.contains(model), !tokenized, "{model}");
+    }
+}
+
+/// The template and encode stages `--kv-events` adds to a chat request `cache_aware`
+/// places, with the tokenizer.json at `MESH_BENCH_TOKENIZER`.
+#[test]
+#[ignore = "bench: cargo test --release --lib wanted_tokens_cost -- --ignored --nocapture"]
+fn wanted_tokens_cost() {
+    use crate::{
+        protocols::chat::ChatCompletionRequest,
+        routers::prepare::chat_template::process_chat_messages,
+        tokenizer::{traits::Encoder, HuggingFaceTokenizer},
+    };
+    let path = std::env::var("MESH_BENCH_TOKENIZER").expect("MESH_BENCH_TOKENIZER");
+    let tokenizer = HuggingFaceTokenizer::from_file(&path).unwrap();
+    let text = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md")).repeat(64);
+    let percentiles = |samples: &mut Vec<Duration>| {
+        samples.sort();
+        let at = |p: usize| samples[(samples.len() - 1) * p / 100];
+        format!("p50 {:.2?} p99 {:.2?}", at(50), at(99))
+    };
+    for chars in [4_000, 32_000, 128_000] {
+        let content: String = text.chars().take(chars).collect();
+        let chat: ChatCompletionRequest = serde_json::from_value(json!({"model": "m",
+            "messages": [{"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": content}]}))
+        .unwrap();
+        let (mut template, mut encode, mut tokens) = (Vec::new(), Vec::new(), 0);
+        for _ in 0..100 {
+            let started = Instant::now();
+            let prompt = process_chat_messages(&chat, &tokenizer).unwrap().text;
+            template.push(started.elapsed());
+            let started = Instant::now();
+            tokens = tokenizer.encode(&prompt, true).unwrap().token_ids().len();
+            encode.push(started.elapsed());
+        }
+        println!(
+            "{tokens} tokens: template {}, encode {}",
+            percentiles(&mut template),
+            percentiles(&mut encode)
+        );
+    }
+}
+
 #[test]
 fn untyped_item_references_are_accepted_as_state_references() {
     for (input, state) in [
