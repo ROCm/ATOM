@@ -8,6 +8,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+# swiglu_oai imports Triton, which the non-GPU CI image does not install.
+pytest.importorskip("triton")
+
 from atom.model_ops import swiglu_oai
 from atom.models.minimax_m3 import model as m3_model
 from atom.models.minimax_m3.model import MiniMaxM3MLP
