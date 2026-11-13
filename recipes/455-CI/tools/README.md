@@ -25,14 +25,15 @@ python3 -m pytest -q                         # 改了脚本先跑测试
 
 - `--date` 是场次日期：周六那场或周三那场。每场测完跑一次，连同历史数据重新生成。那天跑的是哪个场景，脚本从数据里看出来。
 - Highlights 里 @ 的 owner 取自 `../owners.csv`（两列：`model`、`owner`）。有消息的模型没登记 owner 时，`make_report.py` 会打警告。
+- 每个问题（❌ 🔴 ⚠️）的说法取自 `../followups.csv`（guide §3.7）：接在 Highlights 那一条后面，详细 summary 里有 Follow-ups 表。还有问题没写说法时，`make_report.py` 会打 `no follow-up` 的警告。
 - 依赖：Python 3.10 以上、matplotlib；跑测试还要 pytest。没有字体文件也能画，会退回 DejaVu Sans。
 
 ## 样例
 
 `examples/` 是 **EXAMPLE（示例）**：一份编出来的数据目录，结构和 `recipes/455-CI/` 一样，数字都不是真实测试数据，报告和图上都标了 EXAMPLE。里面是最近一周的两场：
 
-- 周六 11-14，MLPerf Endpoint：[报告](examples/reports/455-CI-report-20261114.md)。DeepSeek-V4.1-Flash 提升 6%，Kimi-K3 上一场跑挂这场恢复，Qwen-35B-A3B 的 c64 跑挂。
-- 周三 11-18，8K/1K（用 11-14 的镜像）：[报告](examples/reports/455-CI-report-20261118.md)。GLM-5.2 的 c64 回退 4%，MiniMax-M3 的 GSM8K 掉了 4.7 个点。
+- 周六 11-14，MLPerf Endpoint：[报告](examples/reports/455-CI-report-20261114.md)。DeepSeek-V4.1-Flash 提升 6%，Kimi-K3 上一场跑挂这场恢复，Qwen-35B-A3B 的 c64 跑挂（说法：[复现文档](examples/runs/20261114/qwen-35b-a3b/repro.md)，owner 是占位名）。
+- 周三 11-18，8K/1K（用 11-14 的镜像）：[报告](examples/reports/455-CI-report-20261118.md)。GLM-5.2 的 c64 回退 4%（说法：我们修好并验证的 PR），MiniMax-M3 的 GSM8K 掉了 4.7 个点（说法：别人正在修的 PR）。PR 链接是编的，指不到真实的 PR。
 
 ![MLPerf Endpoint 每卡吞吐趋势（EXAMPLE）](examples/runs/20261114/charts/perf-endpoint.png)
 

@@ -54,6 +54,9 @@ ACCURACY_COLUMNS = (
     "error",
     "note",
 )
+# Columns of followups.csv: the next step for each problem in the highlights
+# (455-CI-guide.md §3.7).
+FOLLOWUP_COLUMNS = ("test_date", "model", "action", "link", "owner", "note")
 CONCURRENCIES = (4, 64)
 # The second perf metric of a scenario: endpoint E2E interactivity, 8K/1K ITL P50.
 SECOND = {"endpoint": "interactivity", "8k1k": "itl_p50_ms"}

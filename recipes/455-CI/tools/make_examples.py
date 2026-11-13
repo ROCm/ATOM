@@ -6,8 +6,10 @@ to show what the reports look like. Each week has two sessions on one image:
 Saturday runs MLPerf Endpoint, Wednesday runs 8K/1K. In the newest Saturday
 session (11-14) DeepSeek-V4.1-Flash gains 6%, Kimi-K3 recovers from a failed
 11-07 and Qwen-35B-A3B fails at c64; in the Wednesday session after it
-(11-18) GLM-5.2 c64 drops 4% and MiniMax-M3 loses 4.7 GSM8K points. The
-charts and reports say EXAMPLE.
+(11-18) GLM-5.2 c64 drops 4% and MiniMax-M3 loses 4.7 GSM8K points. Each
+problem has a follow-up, one of each kind: a repro for Qwen, our verified PR
+for GLM, someone else's open PR for MiniMax. The charts and reports say
+EXAMPLE.
 """
 
 import csv
@@ -17,7 +19,7 @@ import os
 import random
 import shutil
 
-from ci455_data import ACCURACY_COLUMNS, PERF_COLUMNS
+from ci455_data import ACCURACY_COLUMNS, FOLLOWUP_COLUMNS, PERF_COLUMNS
 from make_charts import main as make_charts
 from make_report import main as make_report
 
@@ -34,6 +36,7 @@ IMAGES = [
     "2026-11-14",
 ]
 NEWEST = IMAGES[-1]
+WEDNESDAY = str(datetime.date.fromisoformat(NEWEST) + datetime.timedelta(days=4))
 # model: (GPUs, {concurrency: (x, tok/s per GPU)}), where x is the E2E
 # interactivity (endpoint) or the mean TPOT in ms (8k1k).
 ENDPOINT = {
@@ -84,6 +87,69 @@ GSM8K = {
 }
 FAILED = {("kimi-k3", "2026-11-07"): {4, 64, "gsm8k"}, ("qwen-35b-a3b", NEWEST): {64}}
 BASELINES = {"kimi-k3": 0.95, "glm-5.2": 0.94}
+# Next steps for the example problems (455-CI-guide.md §3.7). The PR numbers
+# are far beyond any real PR, so the links point at nothing.
+FOLLOWUPS = [
+    {
+        "test_date": NEWEST,
+        "model": "qwen-35b-a3b",
+        "action": "repro",
+        "link": f"runs/{NEWEST.replace('-', '')}/qwen-35b-a3b/repro.md",
+        "note": "(mock) OOM while capturing CUDA graphs, at c64 only",
+    },
+    {
+        "test_date": WEDNESDAY,
+        "model": "glm-5.2",
+        "action": "our_pr",
+        "link": "https://github.com/ROCm/ATOM/pull/99901",
+        "note": "(mock) verified on 455: c64 back to 12,830 tok/s/GPU",
+    },
+    {
+        "test_date": WEDNESDAY,
+        "model": "minimax-m3",
+        "action": "open_pr",
+        "link": "https://github.com/ROCm/aiter/pull/99902",
+        "note": "(mock) the open aiter PR fixes the MoE scale rounding",
+    },
+]
+REPRO = """\
+> ⚠️ **EXAMPLE**: a made-up repro that only illustrates the format.
+
+# Qwen-35B-A3B: c64 fails with HIP out of memory (455-CI 2026-11-14)
+
+## Environment
+
+- Image: `rocm/fw-bringup-mlperf:gfx1250-atom-ci455-20261114` (digest `sha256:0000mock`)
+- ATOM `main@000000000`, aiter `main@111111111`; last good session 2026-11-07
+- Machine: e15-06, 1 x MI455X; weights: `<HF repo> @ <revision>` (mock)
+
+## Steps
+
+1. Start the test container as in 455-CI-recipe.md.
+2. Start the server:
+
+   ```bash
+   python3 -m atom.entrypoints.openai_server --model /models/<Qwen-35B-A3B> --kv_cache_dtype fp8    # (mock)
+   ```
+
+3. Run the benchmark at concurrency 64, as in `bench_cmd.sh` of this run with `CONC=64`.
+
+## Expected vs actual
+
+- Expected: c64 completes, about 6,345 tok/s/GPU as on 2026-11-07.
+- Actual: the server exits while capturing CUDA graphs with
+  `RuntimeError: HIP error: out of memory (mock)`. 2 of 2 runs; c4 passes.
+
+## Logs
+
+[error.log](error.log), the core excerpt of the server log.
+
+## What we checked
+
+- Open and recently merged PRs in ROCm/ATOM and ROCm/aiter for "out of memory",
+  "cudagraph" and "Qwen": none about this.
+- Not tried yet: a lower `--gpu-memory-utilization`.
+"""
 ERROR = "RuntimeError: HIP error: out of memory (mock)"
 ERROR_LOG = """\
 (mock) INFO  [model_runner] capturing CUDA graphs for batch sizes 1..64
@@ -198,6 +264,9 @@ def main():
         os.path.join(run, "qwen-35b-a3b", "error.log"), "w", encoding="utf-8"
     ) as f:
         f.write(ERROR_LOG)
+    with open(os.path.join(OUT, FOLLOWUPS[0]["link"]), "w", encoding="utf-8") as f:
+        f.write(REPRO)
+    write_csv(os.path.join(OUT, "followups.csv"), FOLLOWUP_COLUMNS, FOLLOWUPS)
     with open(os.path.join(run, "image.json"), "w", encoding="utf-8") as f:
         json.dump(
             {
@@ -220,8 +289,7 @@ def main():
             ensure_ascii=False,
             indent=1,
         )
-    wednesday = str(datetime.date.fromisoformat(NEWEST) + datetime.timedelta(days=4))
-    for day in (NEWEST, wednesday):  # the two sessions on the newest image
+    for day in (NEWEST, WEDNESDAY):  # the two sessions on the newest image
         make_charts(["--date", day, "--data-dir", OUT, "--mock"])
         make_report(["--date", day, "--data-dir", OUT, "--mock"])
 

@@ -12,6 +12,7 @@
 | 周中验证 | 每周三 17:30–22:30，5 小时 | 1 个节点：e15-09 | 8K/1K 的 4 个模型 | 不构建，复用上一个周六的镜像（§2.5） |
 
 - 每场按 §3 逐个模型测，每个模型先测 GSM8K 精度、再测性能。跑挂了就记下核心 error log，接着测下一个模型。机器挂了不算跑挂：告诉 user，等 user 重启恢复机器后接着测没测完的（§3.6）。
+- **跑挂或大幅回退不能只报问题，每个都要给出说法**（§3.7）：按顺序找已经在修的公开 PR；没有就自己修好、验证、开 PR；修不了就写好复现文档，owner 先放占位名。
 - **每测完一个模型，就把它的精度和性能数据推到 `455-CI` 分支**（§3.5），不攒到最后。数据按 §4 记录，历史数据都留在 `recipes/455-CI/` 里。
 - 全部测完后按 §5 出本场的报告 `455-CI-report-<场次日期>.md`：一个 md 文件，前面是简短 summary（Highlights 和总表，给老板看），后面是详细 summary。推到 `455-CI` 后，最后给出这个 md 文件的路径（§5.6）。
 - 只有周六构建镜像。周六构建失败时，这一周的两场都记 N/A（§2.1）。
@@ -413,6 +414,68 @@ awk -F, -v d=<YYYY-MM-DD> '$2 == d {print $4}' perf.csv accuracy.csv | sort -u
 - 同一个模型重测时机器又挂了，可能是这个模型把机器弄挂的：停下来把两次的现象告诉 user，由 user 决定怎么记。不要自己记成跑挂，也不要测第三次。
 - 到场次结束时间还没恢复或没测完，问 user 是延后接着测，还是这场到此为止。没测成的模型不写任何行：报告里显示 —（没有结果），Highlights 里也不会出现，不算跑挂。
 
+### 3.7 跑挂和大幅回退都要给出说法（重点）
+
+我们做的虽然是 validation，但不能只报一个错误或回退。老板不想只看到问题，要看到下一步怎么办，或者我们已经修好了。所以 Highlights 里的每一条 ❌、🔴、⚠️（§5.1）都要带一个说法。全部模型测完后，先按 §5.5 跑一遍 `make_report.py` 看 Highlights 草稿，再对每个问题按下面的顺序找说法：
+
+1. **先查有没有人在修**：在 `ROCm/ATOM` 和 `ROCm/aiter` 的公开 PR 里找正在解决这个问题的。开着的 PR 算；镜像构建之后才合进 main 的也算，说明 main 上已经修了。用报错里的关键字、kernel 名、模型名搜，点开确认修的就是这个问题：
+
+   ```bash
+   for repo in ROCm/ATOM ROCm/aiter; do
+     gh pr list --repo $repo --state open --search "<关键词>" --limit 20
+     gh pr list --repo $repo --state merged --search "<关键词> merged:>=<镜像里这个仓库 commit 的日期>" --limit 20
+   done
+   ```
+
+   找到了，说法就是 `open_pr`，链接写这个 PR。
+
+2. **没人在修，就评估好不好修**：根因清楚、改动小、能在 455 机器上验证，就算好修。回退先看上一场和这一场之间 ATOM、aiter 的 commit（两场的 sha 在报告的 Environment 和 `perf.csv` 里），能定位到具体 commit 的通常好修。好修就自己修：
+   - 从对应仓库的 main 拉分支，改动尽量小，按那个仓库的规矩跑测试和 lint（ATOM 见 `/ci-pr-guide`，commit 不加 `Co-Authored-By`）。
+   - 在 455 机器上验证：用本周镜像另起一个容器，装上这个修复，重跑出问题的那一项（跑挂的那个并发或 GSM8K、回退的那个指标），确认好了。不要把修复装进 CI 镜像，也不要推镜像。
+   - 开 PR，描述里写清楚问题、根因和 455 上的验证结果。说法是 `our_pr`，链接写这个 PR，`note` 写验证结果。
+   - 验证的数字只写进 PR 和 `followups.csv`，不写进 `perf.csv`、`accuracy.csv`：那两个文件只记 main 的结果。
+   - 当场验证不完（例如场次时间到了），先按第 3 步处理，验证好以后把说法改成 `our_pr`，重新生成报告。
+
+3. **不好修、暂时没思路**：写一份复现文档，说法是 `repro`，链接写它的路径。owner 先放占位名 `@owner_tbd`（不填 owner 时报告里自动显示它），之后由 user 换成真正的负责人。复现文档放在 `runs/<YYYYMMDD>/<slug>/repro.md`，用英文写，别人照着就能复现：
+
+   ```markdown
+   # <model>: <one-line problem> (455-CI <YYYY-MM-DD>)
+
+   ## Environment
+   - Image: `rocm/fw-bringup-mlperf:gfx1250-atom-ci455-<YYYYMMDD>` (digest `<sha256:…>`)
+   - ATOM `main@<sha>`, aiter `main@<sha>`; last good session: <date>, ATOM `<sha>`, aiter `<sha>`
+   - Machine: <node>, <n> x MI455X; weights: <HF repo> @ <revision>
+
+   ## Steps
+   1. Start the test container: <docker run command>
+   2. Start the server: <server command, variables expanded>
+   3. Run the client: <gsm8k or bench command>
+
+   ## Expected vs actual
+   - Expected: <the last good session's result>
+   - Actual: <this session's result or error>; reproduced <n> of <m> runs
+
+   ## Logs
+   <core error log, or a link to error.log>
+
+   ## What we checked
+   - PRs searched: <keywords>; none about this
+   - <what was tried or ruled out>
+   ```
+
+说法写进 `recipes/455-CI/followups.csv`，一个问题模型一场一行；同一场改说法就再追加一行，以最后一行为准：
+
+| 列 | 内容 |
+|---|---|
+| `test_date` | 场次日期，`YYYY-MM-DD` |
+| `model` | §1 的 slug |
+| `action` | `open_pr`、`our_pr` 或 `repro`，对应上面三步 |
+| `link` | PR 的链接；`repro` 写复现文档的路径，相对 `recipes/455-CI/`，例如 `runs/20261114/qwen-35b-a3b/repro.md` |
+| `owner` | 跟进的人。填了就由他代替 `owners.csv` 里的模型 owner 出现在这一条后面；不填时，`repro` 显示 `@owner_tbd`，其余显示模型 owner |
+| `note` | 英文一句话：验证结果、怀疑的方向等 |
+
+`make_report.py` 把说法接在 Highlights 那一条后面，详细 summary 里还有一张 Follow-ups 表。还有问题没写说法时它会打 WARNING：**每个问题都有了说法，报告才能提交**（§5.6）。
+
 ## 4. 记录
 
 ### 4.1 指标口径
@@ -488,7 +551,7 @@ awk -F, -v d=<YYYY-MM-DD> '$2 == d {print $4}' perf.csv accuracy.csv | sort -u
 
 ### 4.4 455-CI 分支的目录结构
 
-`perf.csv`、`accuracy.csv` 已经建好，只有表头；`README.md` 在第一次提交报告时创建。
+`perf.csv`、`accuracy.csv`、`followups.csv` 已经建好，只有表头；`README.md` 在第一次提交报告时创建。
 
 ```text
 recipes/
@@ -500,7 +563,8 @@ recipes/
     ├── accuracy.csv       全部历史 GSM8K 精度
     ├── accuracy_baseline.csv   可选：精度图上的 baseline 参考线
     ├── owners.csv         每个模型的 owner，Highlights 里 @ 他们（§5.1）
-    ├── .gitattributes     两个 CSV 设了 merge=union，两个节点同时上传不冲突（§3.5）
+    ├── followups.csv      每个问题的说法：已有 PR、我们的 PR 或复现文档（§3.7）
+    ├── .gitattributes     三个 CSV 设了 merge=union，两个节点同时提交不冲突（§3.5）
     ├── tools/             生成图和报告的脚本、样例（§5.5）
     ├── reports/           一场一份，YYYYMMDD 是场次日期
     │   └── 455-CI-report-<YYYYMMDD>.md   简短 summary（Highlights 和总表）+ 详细 summary
@@ -511,7 +575,8 @@ recipes/
             ├── server_cmd.sh  gsm8k_cmd.sh  bench_cmd.sh
             ├── gsm8k/         lm_eval 的 results_*.json
             ├── c4/  c64/      性能结果文件
-            └── error.log      只在失败时有
+            ├── error.log      只在失败时有
+            └── repro.md       复现文档，只在 §3.7 第 3 步时有
 ```
 
 结果文件提交这些：
@@ -541,7 +606,13 @@ recipes/
 
 大老板只看 Highlights，所以只写本次出了大事或跑挂的模型，每个一行：`<标记> <模型>: <发生了什么>`。不写场景，只给一个关键数字，例如 `⚠️ GLM-5.2: throughput down 4.2%.`、`❌ Qwen-35B-A3B: c64 failed (RuntimeError: …).`。持平、变化不大或第一次有数据的模型都不提；一个都没有时只写 `No failures or major changes.`。
 
-每条后面 @ 这个模型的 owner，让负责的人看到，例如 `❌ Qwen-35B-A3B: c64 failed (…). @owner`。owner 名单在 `recipes/455-CI/owners.csv`（两列：`model` 是 §1 的 slug，`owner` 是要 @ 的人，多人用空格隔开），由测试负责人自己填写和维护，没填就不 @。用 GitHub 账号还是 IM 里的名字，取决于 Highlights 贴到哪里：仓库里的 md 文件写 @ 不会触发 GitHub 通知，真正提醒到人的是把 Highlights 贴进 issue 或群聊那一下。有消息的模型没登记 owner 时，`make_report.py` 会打警告，提交前补上。
+❌、🔴、⚠️ 这几条后面要接上说法（§3.7），不能只报问题。例如：
+
+- `❌ Qwen-35B-A3B: c64 failed (…). No fix yet; [repro](…). @owner_tbd`
+- `⚠️ GLM-5.2: throughput down 4.2%. Fixed by us in [ROCm/ATOM#…](…), verified. @owner`
+- `⚠️ MiniMax-M3: GSM8K down 4.6 points to 88.1%. Fix in progress: [ROCm/aiter#…](…). @owner`
+
+每条后面 @ 这个模型的 owner，让负责的人看到，例如 `❌ Qwen-35B-A3B: c64 failed (…). @owner`。owner 名单在 `recipes/455-CI/owners.csv`（两列：`model` 是 §1 的 slug，`owner` 是要 @ 的人，多人用空格隔开），由测试负责人自己填写和维护，没填就不 @。用 GitHub 账号还是 IM 里的名字，取决于 Highlights 贴到哪里：仓库里的 md 文件写 @ 不会触发 GitHub 通知，真正提醒到人的是把 Highlights 贴进 issue 或群聊那一下。有消息的模型没登记 owner 时，`make_report.py` 会打警告，提交前补上。有说法的问题条目，@ 的是 `followups.csv` 里的跟进人（§3.7）。
 
 `make_report.py` 按下表比较本次和历史结果，生成草稿；测试 agent 读一遍再提交，可以改措辞，但不能删掉 ❌ 和 🔴 的条目，也不能改数字。
 
@@ -572,7 +643,7 @@ Image `gfx1250-atom-ci455-<YYYYMMDD>` · ATOM `main@<sha 前 9 位>` · aiter `m
 
 ### Highlights
 
-- ❌ Qwen-35B-A3B: c64 failed (RuntimeError: HIP error: out of memory). @qwen35b_owner
+- ❌ Qwen-35B-A3B: c64 failed (RuntimeError: HIP error: out of memory). No fix yet; [repro](../runs/20261114/qwen-35b-a3b/repro.md). @owner_tbd
 - 🟢 DeepSeek-V4.1-Flash: throughput up 6.9%. @v41_flash_owner
 - ✅ Kimi-K3: recovered from the previous failure. @k3_owner
 
@@ -602,7 +673,8 @@ Image `gfx1250-atom-ci455-<YYYYMMDD>` · ATOM `main@<sha 前 9 位>` · aiter `m
 2. **Performance**：每个模型每个并发一行，列出并行策略（例如 `tp8dcp8`，不写 GPU 数）、tok/s/GPU 和第二指标（endpoint 是 E2E avg interactivity，8K/1K 是 ITL P50），以及各自和上一场比的变化。变化列的表头写上一场的日期，例如 `vs 2026-11-07`；某个模型上一场跑挂了，就和它最近一次成功的那场比，并在格子里注明，例如 `+1.0% (vs 2026-10-31)`。
 3. **Accuracy**：flexible-extract、strict-match、上一场的分数（表头写日期）和变化，写法同上。
 4. **Trends**：两张趋势图，见 §5.4。
-5. **Failures**：每个跑挂的 case 一小节，写一句话报错、`error.log` 的链接，以及核心 error log 段落（`error.log` 的前 60 行，§3.4 摘出来的那份）。
+5. **Follow-ups**：每个问题模型一行，写说法、跟进人和 note（§3.7）。
+6. **Failures**：每个跑挂的 case 一小节，写一句话报错、`error.log` 的链接，以及核心 error log 段落（`error.log` 的前 60 行，§3.4 摘出来的那份）。
 
 ### 5.4 趋势图
 
@@ -625,22 +697,24 @@ python3 make_report.py --date <YYYY-MM-DD>          # 写本场的报告（一�
 
 - 每场测完跑一次，连同历史数据重新生成。
 - 生成后按 §5.1 审一遍 Highlights，再提交。
+- 输出里有 `no follow-up` 的 WARNING，说明还有问题没写说法：按 §3.7 补上，再重新生成。
 - 改了脚本先跑测试：`python3 -m pytest -q recipes/455-CI/tools`。
 
 ### 5.6 提交报告，给出路径
 
-各模型的数据已经在 §3.5 推上去了，这里只提交本场的图、报告和 README 索引：
+各模型的数据已经在 §3.5 推上去了，这里提交本场的说法（`followups.csv` 和复现文档）、图、报告和 README 索引：
 
 ```bash
 cd "$CI_DIR"
 git pull -q --rebase --autostash origin 455-CI    # 先拉下另一个节点推的数据，报告才完整
-# 按 §5.5 生成图和报告，审过 Highlights，在 README.md 的索引最上面加一行（见下）
-git add README.md reports runs/<YYYYMMDD>/charts
+# 每个问题都按 §3.7 写好说法后，按 §5.5 生成图和报告，审过 Highlights，在 README.md 的索引最上面加一行（见下）
+git add README.md reports followups.csv runs/<YYYYMMDD>
 git commit -q -m "[455-CI] <YYYY-MM-DD> MLPerf Endpoint report"    # 周三写 8K/1K report
 git pull -q --rebase --autostash origin 455-CI && git push -q origin 455-CI
 git status -sb | head -1                # 不能有 [ahead N]
 ```
 
+- **还有问题没有说法时不提交**：`make_report.py` 打了 `no follow-up` 的 WARNING，就先回到 §3.7。
 - 不 force push，不改写历史；commit message 不加 `Co-Authored-By` trailer。
 
 `recipes/455-CI/README.md` 的索引表一场一行，最新的在最上面：

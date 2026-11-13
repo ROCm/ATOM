@@ -8,8 +8,10 @@ day; Wednesday: 8K/1K on the previous Saturday's image). Writes one file,
 reports/455-CI-report-<YYYYMMDD>.md: the short summary (highlights, tagging
 each model's owner from owners.csv, and the summary table), then the details
 (environment, every number, the trend charts of make_charts.py and each
-failure's core error log from runs/<YYYYMMDD>/<slug>/error.log). Prints the
-highlights, a warning for news without an owner, and last the report's path.
+failure's core error log from runs/<YYYYMMDD>/<slug>/error.log). Each problem
+in the highlights gets its next step from followups.csv (455-CI-guide.md §3.7).
+Prints the highlights, a warning for news without an owner or a problem without
+a follow-up, and last the report's path.
 The image comes from runs/<image date>/image.json, written when the image was
 built (455-CI-guide.md §2.4), else from the CSV rows.
 """
@@ -19,7 +21,13 @@ import json
 import os
 
 from ci455_data import MODELS, acc_cell, perf_cells, read_csv
-from ci455_report import ModelResult, highlights, missing_owners, report_md
+from ci455_report import (
+    ModelResult,
+    highlights,
+    missing_followups,
+    missing_owners,
+    report_md,
+)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -97,6 +105,16 @@ def main(argv=None):
 
     out = os.path.join(args.data_dir, "reports")
     path = os.path.abspath(os.path.join(out, f"455-CI-report-{tag}.md"))
+    followups = {}
+    for row in _rows(os.path.join(args.data_dir, "followups.csv")):
+        if row.get("test_date") != day:
+            continue
+        link = (row.get("link") or "").strip()
+        if row.get("action") == "repro" and link and "://" not in link:
+            # A repro's path is relative to the data dir; the report is in reports/.
+            link = os.path.relpath(os.path.join(args.data_dir, link), out)
+            row = {**row, "link": link}
+        followups[row["model"]] = row  # the same session rewritten: the last row wins
     os.makedirs(out, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         f.write(
@@ -108,13 +126,18 @@ def main(argv=None):
                 os.path.relpath(run_dir, out),
                 args.mock,
                 owners,
+                followups,
             )
         )
-    for line in highlights(results, owners):
+    for line in highlights(results, owners, followups):
         print("-", line)
-    for name in missing_owners(results, owners):
+    for name in missing_owners(results, owners, followups):
         print(
             f"WARNING: {name} is in the highlights but has no owner in owners.csv, so nobody is tagged."
+        )
+    for name in missing_followups(results, followups):
+        print(
+            f"WARNING: {name} is a problem in the highlights but has no follow-up in followups.csv: find an open PR, fix it, or write a repro (455-CI-guide.md §3.7)."
         )
     print(f"\nReport: {path}")
 

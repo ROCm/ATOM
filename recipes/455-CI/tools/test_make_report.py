@@ -4,7 +4,7 @@ import csv
 import json
 import re
 
-from ci455_data import ACCURACY_COLUMNS, PERF_COLUMNS
+from ci455_data import ACCURACY_COLUMNS, FOLLOWUP_COLUMNS, PERF_COLUMNS
 from make_report import main
 
 CJK = "[\u4e00-\u9fff]"
@@ -203,3 +203,39 @@ def test_a_model_left_untested_by_a_machine_failure_is_not_news(tmp_path):
     report = (tmp_path / "reports" / "455-CI-report-20261114.md").read_text()
     assert "Kimi-K3" not in report.split("### Results")[0]
     assert "| Kimi-K3 (2.8T) | MLPerf Endpoint | 1,000 | — | — | — |" in report
+
+
+def test_follow_ups_reach_the_highlights_and_a_problem_without_one_is_flagged(
+    tmp_path, capsys
+):
+    r1 = {"model": "deepseek-r1"}
+    write_csv(
+        tmp_path / "perf.csv",
+        PERF_COLUMNS,
+        [
+            perf("2026-11-07", 64, "1000"),
+            perf("2026-11-14", 64, "", status="fail", error="RuntimeError: x"),
+            perf("2026-11-07", 64, "1000", **r1),
+            perf("2026-11-14", 64, "800", **r1),
+        ],
+    )
+    write_csv(
+        tmp_path / "followups.csv",
+        FOLLOWUP_COLUMNS,
+        [
+            {
+                "test_date": "2026-11-14",
+                "model": "kimi-k3",
+                "action": "repro",
+                "link": "runs/20261114/kimi-k3/repro.md",
+            }
+        ],
+    )
+    main(["--date", "2026-11-14", "--data-dir", str(tmp_path)])
+    report = (tmp_path / "reports" / "455-CI-report-20261114.md").read_text()
+    assert (
+        "No fix yet; [repro](../runs/20261114/kimi-k3/repro.md). @owner_tbd" in report
+    )
+    out = capsys.readouterr().out
+    assert "DeepSeek R1" in out and "no follow-up" in out
+    assert out.rstrip().splitlines()[-1].startswith("Report: ")

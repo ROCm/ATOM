@@ -185,28 +185,83 @@ def _news(results):
     )  # stable: model order within a category
 
 
-def highlights(results, owners=None):
-    """One short line per piece of news, "<flag> <model>: <what happened>",
-    then the model's owner from owners.csv. Flat models and first results are
-    not news; with no news the list says so."""
-    owners = owners or {}
+# Highlight categories of _news that are problems (failures, severe and plain
+# regressions). Each needs a follow-up in followups.csv (455-CI-guide.md §3.7).
+PROBLEM = (0, 1, 2)
+ACTIONS = ("open_pr", "our_pr", "repro")
+# Stands in for whoever will take a problem that only has a repro so far.
+# Underscores are not allowed in GitHub logins, so it never tags anyone.
+PLACEHOLDER_OWNER = "@owner_tbd"
+PR_URL = re.compile(r"https?://github\.com/([\w.-]+/[\w.-]+)/pull/(\d+)")
+
+
+def _pr(url):
+    """A PR link, shown as "ROCm/ATOM#123"."""
+    m = PR_URL.match(url)
+    if m:
+        return f"[{m.group(1)}#{m.group(2)}]({url})"
+    return f"<{url}>" if url else "(no link)"
+
+
+def _follow_text(f):
+    """A problem's next step, from its followups.csv row."""
+    action, link = (f or {}).get("action"), ((f or {}).get("link") or "").strip()
+    if action == "open_pr":
+        return f"Fix in progress: {_pr(link)}."
+    if action == "our_pr":
+        return f"Fixed by us in {_pr(link)}, verified."
+    if action == "repro":
+        return f"No fix yet; [repro]({link})."
+    return ""
+
+
+def _owner(slug, problem, owners, followups):
+    """Who a line tags. For a problem, the follow-up's owner; a repro without
+    one gets the placeholder. Otherwise the model's owner from owners.csv."""
+    f = (followups or {}).get(slug) if problem else None
+    if f and (f.get("owner") or "").strip():
+        return f["owner"].strip()
+    if f and f.get("action") == "repro":
+        return PLACEHOLDER_OWNER
+    return (owners or {}).get(slug, "").strip()
+
+
+def highlights(results, owners=None, followups=None):
+    """One short line per piece of news, "<flag> <model>: <what happened>". A
+    problem (❌ 🔴 ⚠️) goes on with its next step from followups.csv, and every
+    line ends with the owner to tag. Flat models and first results are not
+    news; with no news the list says so."""
     lines = []
-    for _, slug, line in _news(results):
-        owner = owners.get(slug, "").strip()
-        if owner:
-            line = f"{line} {owner}"
-        lines.append(line)
+    for category, slug, line in _news(results):
+        problem = category in PROBLEM
+        step = _follow_text((followups or {}).get(slug)) if problem else ""
+        owner = _owner(slug, problem, owners, followups)
+        lines.append(" ".join(x for x in (line, step, owner) if x))
     return lines or [NONE]
 
 
-def missing_owners(results, owners):
+def missing_owners(results, owners, followups=None):
     """Models with news but no owner to tag, in report order."""
-    news = {slug for _, slug, _ in _news(results)}
-    return [
-        r.name
-        for r in results
-        if r.slug in news and not (owners or {}).get(r.slug, "").strip()
-    ]
+    untagged = {
+        slug
+        for category, slug, _ in _news(results)
+        if not _owner(slug, category in PROBLEM, owners, followups)
+    }
+    return [r.name for r in results if r.slug in untagged]
+
+
+def missing_followups(results, followups):
+    """Models with a problem in the highlights but no usable follow-up: one of
+    open_pr, our_pr or repro, with a link (455-CI-guide.md §3.7)."""
+    problems = {slug for category, slug, _ in _news(results) if category in PROBLEM}
+    missing = []
+    for r in results:
+        f = (followups or {}).get(r.slug) or {}
+        if r.slug in problems and (
+            f.get("action") not in ACTIONS or not (f.get("link") or "").strip()
+        ):
+            missing.append(r.name)
+    return missing
 
 
 # ------------------------------------------------------------------ tables
@@ -301,7 +356,7 @@ def _labels(results):
     ]
 
 
-def _summary(date, results, owners):
+def _summary(date, results, owners, followups):
     """The short summary, for the boss: the highlights, then each model's c64
     throughput against the previous session and its GSM8K change."""
     ref = previous_column(results)
@@ -310,7 +365,7 @@ def _summary(date, results, owners):
         "",
         "### Highlights",
         "",
-        *[f"- {h}" for h in highlights(results, owners)],
+        *[f"- {h}" for h in highlights(results, owners, followups)],
         "",
         "### Results",
         "",
@@ -355,7 +410,7 @@ def _vs(cell, text, ref, delta):
     return text
 
 
-def _details(date, env, results, charts_dir, runs_dir):
+def _details(date, env, results, charts_dir, runs_dir, owners=None, followups=None):
     """The detailed summary: environment, every number, trends and failures.
     Changes are against the previous session, whose date heads the column; a
     model whose last success is older says so in its cell."""
@@ -422,6 +477,26 @@ def _details(date, env, results, charts_dir, runs_dir):
             "",
             f"![{label} GSM8K]({charts_dir}/accuracy-{scenario}.png)",
         ]
+    problems = {slug for category, slug, _ in _news(results) if category in PROBLEM}
+    if problems:
+        missing = set(missing_followups(results, followups))
+        out += [
+            "",
+            "### Follow-ups",
+            "",
+            "| Model | Next step | Owner | Note |",
+            "|---|---|---|---|",
+        ]
+        for r in results:
+            if r.slug not in problems:
+                continue
+            f = (followups or {}).get(r.slug) or {}
+            step = (
+                "Missing: needs a follow-up" if r.name in missing else _follow_text(f)
+            )
+            owner = _owner(r.slug, True, owners, followups) or "—"
+            note = (f.get("note") or "").strip().replace("|", "\\|") or "—"
+            out.append(f"| {r.name} | {step} | {owner} | {note} |")
     out += ["", "### Failures", ""]
     broken = [r for r in results if _failed_parts(r)]
     if not broken:
@@ -458,7 +533,9 @@ def _details(date, env, results, charts_dir, runs_dir):
     return out
 
 
-def report_md(date, env, results, charts_dir, runs_dir, mock=False, owners=None):
+def report_md(
+    date, env, results, charts_dir, runs_dir, mock=False, owners=None, followups=None
+):
     """One session's report: the short summary (highlights and the table),
     then the details. `charts_dir` and `runs_dir` are relative to the report's
     directory."""
@@ -472,8 +549,8 @@ def report_md(date, env, results, charts_dir, runs_dir, mock=False, owners=None)
             f" · aiter `main@{_sha(env, 'aiter')}`"
         ),
         "",
-        *_summary(date, results, owners),
+        *_summary(date, results, owners, followups),
         "",
-        *_details(date, env, results, charts_dir, runs_dir),
+        *_details(date, env, results, charts_dir, runs_dir, owners, followups),
     ]
     return "\n".join(out).rstrip("\n") + "\n"

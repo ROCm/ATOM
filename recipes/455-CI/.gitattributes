@@ -1,5 +1,7 @@
-# perf.csv and accuracy.csv only grow by appended rows, and both Saturday nodes
-# push after each model (455-CI-guide.md §3.5): when two pushes race, the
-# rebase keeps both sides' new rows instead of stopping on a conflict.
+# perf.csv, accuracy.csv and followups.csv only grow by appended rows, and
+# both Saturday nodes push as they go (455-CI-guide.md §3.5, §3.7): when two
+# pushes race, the rebase keeps both sides' new rows instead of stopping on a
+# conflict.
 /perf.csv merge=union
 /accuracy.csv merge=union
+/followups.csv merge=union
