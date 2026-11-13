@@ -1952,6 +1952,11 @@ def qrep_for_step(
     return qrep_enabled and not use_seg_mla and (not is_prefill or prefill_qrep)
 
 
+# The FP4 cache dtypes: "fp4" is MXFP4 (e2m1 + e8m0 per 32), "nvfp4" is NVFP4
+# (e2m1 + e4m3 per 16).
+FP4_CACHE_DTYPES = ("fp4", "nvfp4")
+
+
 def _check_fp4_kv(kv_cache_dtype: str, *, is_m3: bool, is_v41: bool) -> None:
     """``--kv-cache-dtype fp4`` is MiniMax-M3.1's to ask for and DeepSeek-V4.1's own;
     refused for every other model. The guard admits the MiniMax-M3 architecture and
@@ -1961,13 +1966,15 @@ def _check_fp4_kv(kv_cache_dtype: str, *, is_m3: bool, is_v41: bool) -> None:
         raise ValueError(
             "--kv-cache-dtype fp4 is supported by MiniMax-M3.1 and DeepSeek-V4.1 only"
         )
+    if kv_cache_dtype == "nvfp4" and not is_m3:
+        raise ValueError("--kv-cache-dtype nvfp4 is supported by MiniMax-M3 only")
 
 
 def resolve_draft_kv_dtype(target_dtype: str, *, own_pool: bool) -> str:
     """The KV dtype of a speculative draft's pages: the target's, except bf16 for a
-    draft with a pool of its own (``own_pool``) under an fp4 target, which has no
+    draft with a pool of its own (``own_pool``) under an FP4 target, which has no
     draft layout. A draft in the target's pool has the target's dtype."""
-    return "bf16" if own_pool and target_dtype == "fp4" else target_dtype
+    return "bf16" if own_pool and target_dtype in FP4_CACHE_DTYPES else target_dtype
 
 
 def indexer_cp_unsupported_reason(
@@ -2927,7 +2934,7 @@ class Config:
                 self.decode_context_parallel_size,
                 self.enable_tbo or self.enable_tbo_decode,
                 is_plugin_mode(),
-                "fp4" in (self.index_cache_dtype, self.kv_cache_dtype),
+                bool({"fp4", "nvfp4"} & {self.index_cache_dtype, self.kv_cache_dtype}),
             )
             if indexer_cp_off is not None:
                 logger.warning(
@@ -2969,11 +2976,15 @@ class Config:
                 # load. Overriding it here would accept the flag and ignore it.
                 self.index_cache_dtype = "fp8"
             else:
-                # M3's fp4 KV needs the fp4 index (the MXFP4 attention reads the
+                # M3's FP4 KV needs the matching FP4 index (the FP4 attention reads the
                 # selector's rows, which only that scorer sizes to match), which is
                 # what following the KV dtype gives; an explicit other index dtype
                 # is refused by `validate_runtime_config`.
                 self.index_cache_dtype = self.kv_cache_dtype
+        if self.index_cache_dtype == "nvfp4" and not is_m3:
+            raise ValueError(
+                "--index-cache-dtype nvfp4 is supported by MiniMax-M3 only"
+            )
         if self.speculative_config is not None:
             from atom.spec_decode.draft_kv import draft_owns_kv_pool
 
