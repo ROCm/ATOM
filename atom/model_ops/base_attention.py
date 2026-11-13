@@ -1072,6 +1072,37 @@ def linear_attention_with_output_base(
     return ret
 
 
+def linear_attention_into_output_fake(
+    mixed_qkv: torch.Tensor,
+    b: torch.Tensor,
+    a: torch.Tensor,
+    core_attn_out: torch.Tensor,
+    layer_name: str,
+) -> None:
+    return None
+
+
+# The GDN layer written into the caller's `core_attn_out`. In a token-graph
+# recording the region then delivers no fresh tensor, so a replay has nothing
+# to copy into the next segment's input (a [tokens, 4096] bf16 copy a layer).
+@mark_spliting_op(
+    is_custom=True,
+    gen_fake=linear_attention_into_output_fake,
+    mutates_args=["core_attn_out"],
+)
+@eager_region()
+def linear_attention_into_output(
+    mixed_qkv: torch.Tensor,
+    b: torch.Tensor,
+    a: torch.Tensor,
+    core_attn_out: torch.Tensor,
+    layer_name: str,
+) -> None:
+    atom_config = get_current_atom_config()
+    self = atom_config.compilation_config.static_forward_context[layer_name]
+    self.impl.forward(mixed_qkv, b, a, core_attn_out, layer_name)
+
+
 class BaseAttention(nn.Module, ABC):
     """
     Abstract base class for attention
@@ -1179,7 +1210,13 @@ class LinearAttention(nn.Module):
         a: torch.Tensor,
         core_attn_out: torch.Tensor,
     ):
-        output = torch.ops.aiter.linear_attention_with_output_base(
+        if torch.compiler.is_compiling():
+            # The piecewise backend splits at the returning op; a mutating op
+            # traces as auto_functionalized and would not split.
+            return torch.ops.aiter.linear_attention_with_output_base(
+                mixed_qkv, b, a, core_attn_out, self.layer_name
+            )
+        torch.ops.aiter.linear_attention_into_output(
             mixed_qkv, b, a, core_attn_out, self.layer_name
         )
-        return output
+        return core_attn_out
