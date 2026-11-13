@@ -20,6 +20,17 @@ import torch
 import triton
 import triton.language as tl
 
+_BLOCK_N = 64
+
+
+def mla_absorb_q_pack_supports(nope_head_dim: int, kv_lora_rank: int) -> bool:
+    """Whether the kernel takes these dims: ``tl.arange(0, P)`` compiles only
+    for a power of two, and the loop over L has no tail mask."""
+    return (
+        nope_head_dim == triton.next_power_of_2(nope_head_dim)
+        and kv_lora_rank % _BLOCK_N == 0
+    )
+
 
 @triton.jit
 def _mla_absorb_q_pack_kernel(
@@ -88,7 +99,7 @@ def mla_absorb_q_pack(
     assert q_nope.stride(-1) == 1 and w_k.stride(-1) == 1 and q_out.stride(-1) == 1
     if num_tokens == 0:
         return
-    block_m, block_n = 256, 64
+    block_m = 256
     _mla_absorb_q_pack_kernel[(triton.cdiv(num_tokens, block_m), num_heads)](
         q_nope,
         w_k,
@@ -104,7 +115,7 @@ def mla_absorb_q_pack(
         P=p,
         L=l,
         BLOCK_M=block_m,
-        BLOCK_N=block_n,
+        BLOCK_N=_BLOCK_N,
         FP8_MAX=torch.finfo(q_out.dtype).max,
         num_warps=4,
         num_stages=2,

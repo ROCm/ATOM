@@ -78,7 +78,10 @@ from atom.model_ops.triton_fused_qkv_quant import (
     fused_kv_per_tensor_quant,
     fused_qkv_per_tensor_quant,
 )
-from atom.model_ops.triton_mla_absorb_qpack import mla_absorb_q_pack
+from atom.model_ops.triton_mla_absorb_qpack import (
+    mla_absorb_q_pack,
+    mla_absorb_q_pack_supports,
+)
 from atom.model_ops.utils import (
     dynamic_per_batched_tensor_quant,
     get_and_maybe_dequant_weights,
@@ -1569,6 +1572,20 @@ class MLAAttention(nn.Module):
         x = self._v_up_proj(x)
         # Convert from (B, N, V) to (B, N * V)
         return self.o_proj(x.reshape(-1, self.num_heads * self.v_head_dim))
+
+    def _absorb_into_q_out(self, use_qrep, is_prefill, kv_cache, dtype_q):
+        # Prefill BF16 absorb at the replicated heads stores FP8 into q_out
+        # itself (mla_absorb_q_pack), so no bf16 [N, T, L] is written.
+        return (
+            use_qrep
+            and is_prefill
+            and not is_rocm_aiter_fp4bmm_enabled()
+            and self.W_K_qrep_scale is None
+            and not self.kv_shuffled
+            and kv_cache.numel() > 0
+            and dtype_q == dtypes.fp8
+            and mla_absorb_q_pack_supports(self.qk_nope_head_dim, self.kv_lora_rank)
+        )
 
     @mark_trace(prefix="q_proj_and_k_up_proj", torch_compile=False)
     def _q_proj_and_k_up_proj(self, x, x_scale=None, group=False, k_up_proj=True):
@@ -3147,16 +3164,8 @@ class MLAAttention(nn.Module):
                 context.is_prefill,
                 envs.ATOM_DCP_PREFILL_QREP,
             )
-            # Prefill BF16 absorb at the replicated heads stores FP8 into q_out
-            # itself (mla_absorb_q_pack below), so no bf16 [N, T, L] is written.
-            absorb_into_q_out = (
-                use_qrep
-                and context.is_prefill
-                and not is_rocm_aiter_fp4bmm_enabled()
-                and self.W_K_qrep_scale is None
-                and not self.kv_shuffled
-                and kv_cache.numel() > 0
-                and attn_metadata.dtype_q == dtypes.fp8
+            absorb_into_q_out = self._absorb_into_q_out(
+                use_qrep, context.is_prefill, kv_cache, attn_metadata.dtype_q
             )
             q_nope, q_rope = self._q_proj_and_k_up_proj(
                 q,

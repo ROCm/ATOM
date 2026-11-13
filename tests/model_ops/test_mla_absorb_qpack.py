@@ -100,3 +100,17 @@ def test_absorb_into_q_out_matches_two_kernel_path(tokens, q_scale):
     assert not new_q[..., :LORA].float().isnan().any(), "nope half stores an FP8 NaN"
     steps = (_ordinal(new_q[..., :LORA]) - _ordinal(ref_q[..., :LORA])).abs()
     assert steps.max().item() <= 1, f"nope half off by {steps.max().item()} e4m3 steps"
+
+
+# GLM-5.x has 192 nope dims, which the absorb kernel does not compile for.
+@pytest.mark.parametrize("nope, absorbs", [(NOPE, True), (192, False)])
+def test_absorb_gate_takes_two_kernel_path_off_kernel_shapes(nope, absorbs):
+    layer = SimpleNamespace(
+        W_K_qrep_scale=None,
+        kv_shuffled=False,
+        qk_nope_head_dim=nope,
+        kv_lora_rank=LORA,
+    )
+    kv_cache = torch.empty(1, device="cuda", dtype=dtypes.fp8)
+    gate = MLAAttention._absorb_into_q_out(layer, True, True, kv_cache, dtypes.fp8)
+    assert gate == absorbs
