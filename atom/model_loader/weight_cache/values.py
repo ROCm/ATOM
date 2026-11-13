@@ -273,6 +273,32 @@ def _recursable(v: Any) -> bool:
     return not (mod == "atom.config" and t.__name__ in _CONFIG_CLASSES)
 
 
+def config_objects(config) -> list[tuple[str, Any]]:
+    """(path, object) for the config and the config objects under it."""
+    roots = [("config", config)]
+    hf = getattr(config, "hf_config", None)
+    if hf is not None:
+        roots.append(("hf_config", hf))
+    out, seen = [], set()
+    while roots:
+        path, obj = roots.pop()
+        if id(obj) in seen or not hasattr(obj, "__dict__") or isinstance(obj, type):
+            continue
+        seen.add(id(obj))
+        out.append((path, obj))
+        for k, v in vars(obj).items():
+            mod = type(v).__module__ or ""
+            if (
+                hasattr(v, "__dict__")
+                and not isinstance(v, (type, types.ModuleType))
+                and mod.startswith(("atom.", "transformers"))
+                and "tokeniz" not in mod
+                and path.count(".") < 3
+            ):
+                roots.append((f"{path}.{k}", v))
+    return out
+
+
 def _walk_objects(model: nn.Module):
     """(path, obj, is_module) for every module and the objects reachable from
     their attributes (``_DIFF_DEPTH`` levels). Paths: ``mod.path`` for

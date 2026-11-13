@@ -21,7 +21,6 @@ from atom.config import Config, local_device_index, set_current_atom_config
 from atom.distributed.simulated_tp import apply_simulated_tp, reject_simulated_tp
 from atom.distributed.ulysses_sp import check_aiter_sp_api, sp_is_enabled
 from atom.model_loader.loader import load_model
-from atom.model_loader.loading_core import rank_tag
 from atom.models.registry import support_model_arch_dict
 from atom.utils import resolve_obj_by_qualname
 from atom.utils.distributed.utils import raise_timeout_if_dp_spans_nodes
@@ -225,14 +224,14 @@ def load_drafter_from_disk(config: Config, device: torch.device, runner, target)
 
 
 def load_from_disk(
-    config: Config, model_class: type, device: torch.device, tag: str | None = None
+    config: Config, model_class: type, device: torch.device, tag: str
 ) -> nn.Module:
     """``tag``: how the log names this rank."""
     model = build_model(config, model_class, device)
     t0 = time.perf_counter()
     load_weights(model, config)
     logger.info(
-        f"[{tag or rank_tag()}] Model load done: {config.model} "
+        f"[{tag}] Model load done: {config.model} "
         f"(weights loaded in {time.perf_counter() - t0:.2f}s)"
     )
     return model

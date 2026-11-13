@@ -14,6 +14,7 @@ by C++) is invisible here.
 from __future__ import annotations
 
 import builtins
+import contextlib
 import importlib
 import io
 import os
@@ -35,6 +36,7 @@ from atom.model_loader.weight_cache.values import (
     _ref_name,
     _resolve,
     _walk_objects,
+    config_objects,
     key_fp,
 )
 
@@ -117,7 +119,7 @@ def _recording_open(file, mode="r", *args, **kwargs):
     rec = _REC
     if (
         rec is not None
-        and rec.files_on
+        and rec.on
         and isinstance(file, (str, bytes, os.PathLike))
         and not rec._busy()
         and not any(c in mode for c in "wax+")
@@ -148,12 +150,12 @@ class InputRecorder:
         self.env_by_line: dict[str, set] = {}
         self.attrs: dict[tuple, dict] = {}  # (kind, path, name) -> info
         self.paths: dict[int, tuple[str, str]] = {}  # id(obj) -> (kind, path)
+        self.configs: dict[str, Any] = {}  # path -> config object
         self.pre_load_fps: dict[tuple[str, str], Any] = {}
         self.pre_load_globals: dict[str, dict] = {}  # module -> name -> fingerprint
         self.files: dict[str, set] = {}
         self.globals: dict[tuple, Any] = {}
-        self.files_on = False
-        self.attrs_on = False
+        self.on = False
         self._patched: list[tuple[type, Any, bool]] = []
         self._local = threading.local()
         # (object id, name, phase) already handled: loading reads the same
@@ -179,15 +181,29 @@ class InputRecorder:
         if _OPEN_ORIG is None:
             _OPEN_ORIG = builtins.open
             builtins.open = io.open = _recording_open
-        self.files_on = True
-        self.attrs_on = True
+        self.on = True
 
     def enter_load(self, model) -> None:
         self.phase = "load"
-        self.attrs_on = True
+        self.on = True
+        self._local.busy = True  # these reads are not loading's
+        try:
+            self._take_pre_load_values(model)
+        finally:
+            self._local.busy = False
+
+    def _take_pre_load_values(self, model) -> None:
         # The construction-time values: what a client builds, and what loading
         # started from. (The first value loading reads may be one it wrote.)
         self.pre_load_globals = _module_globals()
+        for (kind, path, name), info in self.attrs.items():
+            # Read while constructing, which may have rewritten it since.
+            if kind == "config" and path in self.configs:
+                info["fp"] = _safe_key_fp(getattr(self.configs[path], name, None))
+            elif kind == "class":
+                with contextlib.suppress(Exception):
+                    cls = _import_qual(*path.split(":"))
+                    info["fp"] = _safe_key_fp(_raw_class_attr(cls, name))
         values = {}
         for path, obj, is_module in _walk_objects(model):
             self.paths[id(obj)] = ("model", path)
@@ -204,8 +220,7 @@ class InputRecorder:
     def finish_load(self, codes) -> None:
         """Stop recording; ``codes``: the code objects that ran during load."""
         global _REC, _ENV_ORIG, _OPEN_ORIG
-        self.attrs_on = False
-        self.files_on = False
+        self.on = False
         self._unpatch()
         if _OPEN_ORIG is not None:
             builtins.open = io.open = _OPEN_ORIG
@@ -262,28 +277,10 @@ class InputRecorder:
     # -- class patching --------------------------------------------------------
 
     def _register_config(self, config) -> None:
-        roots = [("config", config)]
-        hf = getattr(config, "hf_config", None)
-        if hf is not None:
-            roots.append(("hf_config", hf))
-        seen = set()
-        while roots:
-            path, obj = roots.pop()
-            if id(obj) in seen or not hasattr(obj, "__dict__") or isinstance(obj, type):
-                continue
-            seen.add(id(obj))
+        for path, obj in config_objects(config):
             self.paths.setdefault(id(obj), ("config", path))
+            self.configs[path] = obj
             self._patch_class(type(obj))
-            for k, v in vars(obj).items():
-                mod = type(v).__module__ or ""
-                if (
-                    hasattr(v, "__dict__")
-                    and not isinstance(v, (type, types.ModuleType))
-                    and mod.startswith(("atom.", "transformers"))
-                    and "tokeniz" not in mod
-                    and path.count(".") < 3
-                ):
-                    roots.append((f"{path}.{k}", v))
 
     def _patch_class(self, cls: type) -> None:
         if any(c is cls for c, _, _ in self._patched):
@@ -302,12 +299,12 @@ class InputRecorder:
             except AttributeError:
                 # nn.Module buffers/parameters are served by __getattr__
                 # after this raises.
-                if rec.attrs_on and name[:2] != "__" and name not in skip:
+                if rec.on and name[:2] != "__" and name not in skip:
                     hit = rec.paths.get(id(obj))
                     if hit is not None:
                         rec._on_missing(obj, hit, name)
                 raise
-            if rec.attrs_on and name[:2] != "__" and name not in skip:
+            if rec.on and name[:2] != "__" and name not in skip:
                 hit = rec.paths.get(id(obj))
                 if hit is not None:
                     rec._on_attr(obj, hit, name, value)

@@ -33,6 +33,7 @@ from atom.model_engine.model_setup import (
 from atom.model_loader.weight_cache.export import (
     _skip_prepare_finalize,
     build_export,
+    leave_out,
     process_export,
     process_snapshot,
     share_storages,
@@ -61,7 +62,7 @@ from atom.model_loader.weight_cache.values import (
     release_digest_buffers,
 )
 from atom.model_loader.weight_utils import local_model_dir
-from atom.utils import envs, worker_process_name
+from atom.utils import envs, get_hf_text_config, worker_process_name
 
 
 def run_daemon(engine_args) -> None:
@@ -180,11 +181,13 @@ def _serve_rank(rank: int, config, ready, index: int) -> None:
         functools.partial(_stop_launch, lock, stop),
         t0,
     )
-    signal.signal(signal.SIGTERM, lambda *_: stop.set())
-    signal.signal(signal.SIGINT, lambda *_: stop.set())
+    # Not stop.set(): a handler that runs inside stop.wait() would deadlock.
+    signaled = []
+    signal.signal(signal.SIGTERM, lambda *_: signaled.append(1))
+    signal.signal(signal.SIGINT, lambda *_: signaled.append(1))
     ready.put(index)
-    while not stop.wait(1.0):
-        pass
+    while not (signaled or stop.is_set()):
+        time.sleep(1.0)
     # Clients that mapped the weights keep them until they exit.
     server.close()
     lock.release()
@@ -196,11 +199,11 @@ def _stop_launch(lock, stop: threading.Event) -> None:
     """Idle timeout: shut the whole daemon down through its main process,
     as SIGTERM to the launch would."""
     main_pid = lock.info.get("daemon_pid")
-    if main_pid:
+    if main_pid and os.getppid() == main_pid:
         with contextlib.suppress(ProcessLookupError):
             os.kill(main_pid, signal.SIGTERM)
     else:
-        stop.set()  # main process unknown: at least stop serving
+        stop.set()  # main process unknown or gone: stop serving and exit
 
 
 class _RecordingLoad:
@@ -222,10 +225,10 @@ class _RecordingLoad:
             with self.tracer, _record_jit(self.kernels):
                 self.recorder.enter_load(model)
                 # Around the load only: what constructing does, clients do.
-                self.states = [process_snapshot()]
+                self.states = [process_snapshot(config)]
                 with _skip_prepare_finalize(model):
                     load_weights(model, config)
-                self.states.append(process_snapshot())
+                self.states.append(process_snapshot(config))
         finally:
             # Before anything else reads the model.
             self.recorder.finish_load(self.tracer.codes)
@@ -241,18 +244,26 @@ def _load_draft(config, device, target, rank: int):
     recorded on their own (each client binds them to its own target). None:
     not cached, and servers load the drafter from disk."""
     recorder, tracer, kernels = InputRecorder.start(), _CodeTracer(), {}
-    # What building a drafter reads from its runner.
-    runner = SimpleNamespace(model=target, config=config, device=device, rank=rank)
+    # What building a drafter reads from its runner, as ModelRunner sets it.
+    rope = getattr(get_hf_text_config(config.hf_config), "rope_parameters", None)
+    runner = SimpleNamespace(
+        model=target,
+        config=config,
+        device=device,
+        rank=rank,
+        world_size=config.tensor_parallel_size,
+        use_mrope="mrope_section" in (rope or {}),
+    )
     try:
         recorder.enter_construct(config)
         drafter = construct_drafter(config, device, runner)
         built, before = structure(drafter.model), snapshot(drafter.model)
         with tracer, _record_jit(kernels):
             recorder.enter_load(drafter.model)
-            states = [process_snapshot()]
+            states = [process_snapshot(config)]
             with _skip_prepare_finalize(drafter.model):
                 loaded = drafter.load_weights()
-            states.append(process_snapshot())
+            states.append(process_snapshot(config))
     except Exception as e:  # noqa: BLE001 - only the drafter goes uncached
         logger.warning(
             f"{_TAG} {worker_process_name(config, rank)}: the drafter is not cached "
@@ -262,6 +273,7 @@ def _load_draft(config, device, target, rank: int):
     finally:
         recorder.finish_load(tracer.codes)
     return SimpleNamespace(
+        drafter=drafter,
         model=drafter.model,
         built=built,
         before=before,
@@ -274,7 +286,7 @@ def _load_draft(config, device, target, rank: int):
     )
 
 
-def _draft_payload(d, label: str) -> dict | None:
+def _draft_payload(d, target, label: str) -> dict | None:
     """The drafter's part of the payload; None: servers load it from disk."""
     if d is None:
         return None
@@ -286,6 +298,8 @@ def _draft_payload(d, label: str) -> dict | None:
         export = build_export(d.model, d.before, d.after)
         process = process_export(d.states)
         why = export["unshippable"] + process["unshippable"]
+        if not why:
+            why = _leave_out_shared(d, target, export)
     if why:
         logger.warning(
             f"{_TAG} {label}: the drafter is not cached, servers load it from disk: "
@@ -300,6 +314,20 @@ def _draft_payload(d, label: str) -> dict | None:
         "code": code,
         "loaded": sorted(d.loaded),
     }
+
+
+def _leave_out_shared(d, target, export: dict) -> list[str]:
+    """Each client's attach_to_target replaces some drafter modules with the
+    target's (embed, lm_head); left out, the daemon holds no copies of them.
+    Returns why the drafter cannot be cached."""
+    before = dict(d.model.named_modules(remove_duplicate=False))
+    try:
+        d.drafter.attach_to_target(target, d.loaded)
+    except Exception as e:  # noqa: BLE001 - only the drafter goes uncached
+        return [f"attach_to_target failed: {e!r}"]
+    after = dict(d.model.named_modules(remove_duplicate=False))
+    leave_out(export, {p for p, m in before.items() if after.get(p) is not m})
+    return []
 
 
 def _load_and_serve(config, rank, device, recorder, path, lock, on_idle, t0):
@@ -317,7 +345,7 @@ def _load_and_serve(config, rank, device, recorder, path, lock, on_idle, t0):
     export = build_export(model, load.before, load.after)
     process = process_export(load.states)
     export["unshippable"] += process["unshippable"]
-    draft = _draft_payload(load.draft, label)
+    draft = _draft_payload(load.draft, model, label)
     parts = [export, process] + ([draft["export"], draft["process"]] if draft else [])
     keys = [list(p["views"]) for p in parts]
     views = {k: v for p in parts for k, v in p.pop("views").items()}

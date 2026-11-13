@@ -80,9 +80,9 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes:
     return bytes(buf)
 
 
-def _recv(sock: socket.socket) -> Any:
+def _recv(sock: socket.socket, limit: int = _MAX_MESSAGE) -> Any:
     (n,) = struct.unpack("<Q", _recv_exact(sock, 8))
-    if n > _MAX_MESSAGE:
+    if n > limit:
         raise ConnectionError(f"weight cache message of {n} bytes refused")
     return pickle.loads(_recv_exact(sock, n))
 
@@ -308,11 +308,14 @@ class _Server:
         peer = "?"
         try:
             _check_peer(conn)
-            req = _recv(conn)
+            conn.settimeout(30)  # a request is small and sent at once
+            req = _recv(conn, limit=1 << 20)
+            conn.settimeout(None)
             peer = req.get("who", "?")
             if req.get("cmd") == "ping":
                 with self._lock:
-                    clients, idle_s = self.clients, self._idle_for()
+                    # Connected servers and those still being served.
+                    clients, idle_s = self.pending, self._idle_for()
                 _send(
                     conn,
                     {

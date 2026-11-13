@@ -1060,7 +1060,7 @@ class ModelRunner:
         if envs.ATOM_WEIGHT_CACHE == "client":
             from atom.model_loader.weight_cache.client import load_from_cache
 
-            return partial(load_from_cache, rank=self.rank)
+            return partial(load_from_cache, rank=self.rank, tag=self.rank_name)
         return partial(load_from_disk, tag=self.rank_name)
 
     def _drafter_loader(self):

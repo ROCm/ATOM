@@ -56,6 +56,10 @@ def _flag_env(name: str, default: str = "0") -> bool:
 def _weight_cache_mode() -> str:
     """off / client / daemon; ATOM_PRELOAD on its own means client."""
     mode = os.getenv("ATOM_WEIGHT_CACHE", "off").strip().lower() or "off"
+    if mode not in ("off", "client", "daemon"):
+        raise ValueError(
+            f"ATOM_WEIGHT_CACHE must be off, client or daemon, not {mode!r}"
+        )
     if mode == "off" and _flag_env("ATOM_PRELOAD"):
         return "client"
     return mode

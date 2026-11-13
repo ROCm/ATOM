@@ -27,6 +27,7 @@ from atom.model_loader.weight_cache.values import (
     _resolve,
     _Unshippable,
     _walk_objects,
+    config_objects,
 )
 
 _DEEP_DEPTH = 6  # how far below a module the fingerprints of unwalked objects go
@@ -44,13 +45,10 @@ def snapshot(model: nn.Module) -> dict:
             entry["type"] = f"{type(obj).__module__}.{type(obj).__qualname__}"
             # Parameters are always exported, so their identity is enough.
             entry["params"] = {
-                k: ("P", id(p), tuple(p.shape), str(p.dtype))
+                k: None if p is None else ("P", id(p), tuple(p.shape), str(p.dtype))
                 for k, p in obj._parameters.items()
-                if p is not None
             }
-            entry["buffers"] = {
-                k: _fp(b) for k, b in obj._buffers.items() if b is not None
-            }
+            entry["buffers"] = {k: _fp(b) for k, b in obj._buffers.items()}
         walk[path] = entry
     return {"walk": walk, "deep": _unwalked(model)}
 
@@ -87,7 +85,6 @@ def _unwalked(model: nn.Module) -> dict:
 class _Exporter:
     def __init__(self):
         self.views: dict[int, torch.Tensor] = {}  # whole storages as uint8
-        self.bytes = 0
 
     def tensor(self, t: torch.Tensor) -> dict:
         t = t.detach()
@@ -107,7 +104,6 @@ class _Exporter:
             self.views[key] = torch.empty(0, dtype=torch.uint8, device=t.device).set_(
                 st, 0, (st.nbytes(),), (1,)
             )
-            self.bytes += st.nbytes()
         return {
             "storage": key,
             "offset": t.storage_offset(),
@@ -175,13 +171,19 @@ def build_export(model: nn.Module, before: dict, after: dict) -> dict:
         if is_module:
             for k, p in obj._parameters.items():
                 if p is None:
+                    if prev["params"].get(k) is not None:
+                        item["params"][k] = None  # loading set it to None
                     continue
                 meta = ex.tensor(p)
-                meta["pattrs"] = {a: v for a, v in vars(p).items() if _is_plain(v)}
+                meta["pattrs"] = {}
+                for a, v in vars(p).items():
+                    # Loaders (bound methods) are the client's own.
+                    with contextlib.suppress(_Unshippable):
+                        meta["pattrs"][a] = _pack(v, ex)
                 item["params"][k] = meta
             for k, b in obj._buffers.items():
-                if b is not None and prev["buffers"].get(k) != entry["buffers"].get(k):
-                    item["buffers"][k] = ex.tensor(b)
+                if prev["buffers"].get(k) != entry["buffers"].get(k):
+                    item["buffers"][k] = None if b is None else ex.tensor(b)
             item["delete"] += [
                 ("param", k) for k in prev["params"] if k not in entry["params"]
             ]
@@ -204,17 +206,41 @@ def build_export(model: nn.Module, before: dict, after: dict) -> dict:
     return {
         "plan": plan,
         "views": ex.views,
-        "bytes": ex.bytes,
         "unshippable": unshippable,
     }
 
 
-def process_snapshot() -> dict:
+def leave_out(export: dict, paths: set[str]) -> None:
+    """Drop the modules at ``paths`` from ``export``, with the storages
+    nothing left in it uses."""
+    plan = export["plan"]
+    for p in [p for p in plan if p.partition("::")[0] in paths]:
+        del plan[p]
+    used = set()
+
+    def note(meta: dict) -> None:
+        used.add(meta.get("storage"))
+
+    for item in plan.values():
+        for meta in (*item["params"].values(), *item["buffers"].values()):
+            if meta is not None:
+                note(meta)
+                for packed in meta.get("pattrs", {}).values():
+                    _unpack(packed, note)
+        for packed in item["attrs"].values():
+            _unpack(packed, note)
+    export["views"] = {k: v for k, v in export["views"].items() if k in used}
+
+
+def process_snapshot(config=None) -> dict:
     """What loading can change outside the model (daemon only): ATOM/AITER
     module globals, their classes' attributes, the attributes of the objects
-    the globals hold, and the environment."""
+    the globals hold, the config's objects and the environment."""
     own = __name__.rpartition(".")[0]  # this package's state is the daemon's
     modules, state = set(), {}
+    for path, obj in config_objects(config) if config is not None else ():
+        for a, x in list(vars(obj).items()):
+            state[("config", path, a)] = _state_fp(x)
     for name, mod in list(sys.modules.items()):
         if mod is None or name.startswith(own) or name.split(".")[0] not in _STATE:
             continue
@@ -253,7 +279,8 @@ def process_export(states: list[dict]) -> dict:
         changed.update(
             k
             for k in set(s0) | set(s1)
-            if k[1] in before["modules"] and s0.get(k) != s1.get(k)
+            if (k[0] == "config" or k[1] in before["modules"])
+            and s0.get(k) != s1.get(k)
         )
         e0, e1 = before["env"], after["env"]
         env.update(k for k in set(e0) | set(e1) if e0.get(k) != e1.get(k))
@@ -262,7 +289,7 @@ def process_export(states: list[dict]) -> dict:
     for key in sorted(changed, key=str):
         kind, module, *rest = key
         where = f"{module}:{'.'.join(rest)}"
-        if kind == "object":
+        if kind in ("object", "config"):
             unshippable.append(
                 f"{where}: changed during load, out of the cache's reach"
             )
@@ -281,7 +308,6 @@ def process_export(states: list[dict]) -> dict:
         "changes": changes,
         "env": {k: os.environ.get(k) for k in sorted(env)},
         "views": ex.views,
-        "bytes": ex.bytes,
         "unshippable": unshippable,
     }
 
@@ -378,9 +404,13 @@ def apply_export(model: nn.Module, export: dict, device: torch.device) -> int:
             else:
                 d.pop(k, None)
         for k, meta in item["params"].items():
-            _install_param(obj, k, make(meta), meta["pattrs"])
+            if meta is None:
+                obj._parameters[k] = None
+                continue
+            pattrs = {a: _unpack(x, make) for a, x in meta["pattrs"].items()}
+            _install_param(obj, k, make(meta), pattrs)
         for k, meta in item["buffers"].items():
-            obj._buffers[k] = make(meta)
+            obj._buffers[k] = None if meta is None else make(meta)
         for k, packed in item["attrs"].items():
             if is_module and (
                 k in obj._parameters or k in obj._buffers or k in obj._modules

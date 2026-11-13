@@ -106,6 +106,23 @@ def test_all_same_named_defs_are_hashed(tmp_path, no_source_stats):
     assert _hasher(tmp_path).digest("pkg", "mod.py", "Q.p") != p0
 
 
+def test_module_and_class_bodies_leave_function_bodies_out(tmp_path, no_source_stats):
+    # A module or class body that ran keys what it defines, not the bodies of
+    # its functions (those that ran are keyed on their own).
+    f = tmp_path / "mod.py"
+    _write(f, SRC)
+    h = _hasher(tmp_path)
+    mod0, q0 = h.digest("pkg", "mod.py", "<module>"), h.digest("pkg", "mod.py", "Q")
+    _write(f, SRC.replace("x + 1", "x + 2").replace("self._p = v", "self._p = -v"))
+    h = _hasher(tmp_path)
+    assert h.digest("pkg", "mod.py", "<module>") == mod0
+    assert h.digest("pkg", "mod.py", "Q") == q0
+    _write(f, SRC.replace("SCALE = 16", "SCALE = 32").replace("k = 1", "k = 2"))
+    h = _hasher(tmp_path)
+    assert h.digest("pkg", "mod.py", "<module>") != mod0
+    assert h.digest("pkg", "mod.py", "Q") != q0
+
+
 def test_source_edited_after_start_is_refused(tmp_path, monkeypatch):
     f = tmp_path / "mod.py"
     _write(f, SRC)
@@ -292,6 +309,28 @@ def test_export_import_reproduces_the_load(toy_packages):
     assert "bias" not in client.child._parameters
 
 
+def test_none_and_tensors_loading_sets_on_parameters_travel(toy_packages):
+    def load(m):
+        m.child.bias = None  # a registered parameter dropped by loading
+        m.w.scale = torch.full((2,), 3.0)  # a tensor hung on a parameter
+
+    _, exp = _export(Toy(), load)
+    assert exp["unshippable"] == []
+    with export.params_on_meta():
+        client = Toy()
+    export.apply_export(client, exp, torch.device("cpu"))
+    assert "bias" in client.child._parameters and client.child.bias is None
+    assert torch.equal(client.w.scale, torch.full((2,), 3.0))
+
+
+def test_config_written_during_load_is_refused():
+    config = SimpleNamespace(hf_config=SimpleNamespace(rope_theta=1.0), block_size=16)
+    before = export.process_snapshot(config)
+    config.hf_config.rope_theta = 2.0
+    exp = export.process_export([before, export.process_snapshot(config)])
+    assert any(u.startswith("hf_config:rope_theta") for u in exp["unshippable"])
+
+
 def test_unshareable_state_is_reported(toy_packages):
     class Kernel:
         pass
@@ -439,6 +478,23 @@ def test_attribute_written_then_read_keys_its_construction_value(layer_packages)
     assert ir.diff_reads(reads, ("attrs",), model=Layer()) == []
 
 
+def test_config_read_only_while_constructing_is_not_keyed():
+    class Cfg:
+        def __init__(self):
+            self.max_len, self.hf_config = 1, None
+
+    cfg = Cfg()
+    rec = ir.InputRecorder()
+    rec.enter_construct(cfg)
+    try:
+        assert cfg.max_len == 1  # constructing reads it...
+        cfg.max_len = 2  # ...and rewrites it; loading never reads it
+        rec.enter_load(nn.Module())
+    finally:
+        rec.finish_load(set())
+    assert rec.key_reads()["config"] == {}
+
+
 def test_recorder_keys_env_read_during_load_only(monkeypatch):
     monkeypatch.setattr(ir, "KEY_ENV_PREFIXES", ir.KEY_ENV_PREFIXES + ("tests/",))
     monkeypatch.setenv("ATOM_TEST_LOAD_FLAG", "1")
@@ -517,6 +573,36 @@ def test_compact_moves_weights_out_of_segments_with_gaps():
     assert kept.untyped_storage().nbytes() == 0  # moved out of the 70 MiB gap
     assert small.untyped_storage().nbytes() > 0  # no gap worth moving it for
     del views, pool
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_daemon_leaves_out_what_attaching_replaces():
+    """A drafter whose attach_to_target swaps its embedding for the target's:
+    the daemon holds no copy of the drafter's own."""
+    from atom.model_loader.weight_cache import daemon
+
+    class Draft(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Embedding(64, 32, device="cuda")
+            self.w = nn.Parameter(torch.zeros(32, device="cuda"), requires_grad=False)
+
+    class Drafter:
+        def __init__(self):
+            self.model = Draft()
+
+        def attach_to_target(self, target, loaded):
+            del self.model.embed
+            self.model.embed = target.embed
+
+    d, target = Drafter(), Draft()
+    before = export.snapshot(d.model)
+    d.model.w.fill_(1.0)  # its load
+    exp = export.build_export(d.model, before, export.snapshot(d.model))
+    load = SimpleNamespace(drafter=d, model=d.model, loaded=set())
+    assert daemon._leave_out_shared(load, target, exp) == []
+    assert set(exp["plan"]) == {""}
+    assert list(exp["views"]) == [d.model.w.untyped_storage().data_ptr()]
 
 
 # --------------------------------------------------------------------------
@@ -853,7 +939,7 @@ def loop(monkeypatch):
         "reads": {},
     }
 
-    def probe(path, label, started, config, rank, device):
+    def probe(path, label, started, held, own_key):
         present, reasons = calls.probes.pop(0)
         if not present:
             return None, None, [], client._NONE
@@ -895,7 +981,9 @@ def loop(monkeypatch):
 def test_client_mode_without_a_daemon_loads_from_disk(loop, monkeypatch):
     monkeypatch.setattr(client, "load_from_disk", lambda *a: "from disk")
     loop.probes = [(False, [])]
-    loaded = client.load_from_cache(_config(), _Model, torch.device("cpu"), rank=0)
+    loaded = client.load_from_cache(
+        _config(), _Model, torch.device("cpu"), rank=0, tag="TP0"
+    )
     assert loaded == "from disk"
 
 
@@ -946,6 +1034,32 @@ def test_drafter_comes_from_the_daemon_the_model_came_from(loop, monkeypatch):
     assert config.compilation_config.static_forward_context == {"other": 1}
 
 
+def test_drafter_modules_left_out_come_from_attaching(loop, monkeypatch):
+    monkeypatch.setenv("ATOM_PRELOAD", "1")
+    made = []
+    monkeypatch.setattr(
+        client,
+        "construct_drafter",
+        lambda c, d, r: made.append(_Drafter(c)) or made[-1],
+    )
+    monkeypatch.setattr(client, "load_drafter_from_disk", lambda *a: "from disk")
+    # The daemon left the drafter's embedding out: on meta until attached.
+    monkeypatch.setattr(
+        client,
+        "_leftover_meta",
+        lambda m: (
+            ["embed.weight"] if made and not hasattr(made[-1], "attached") else []
+        ),
+    )
+    loop.probes = [(True, [])]
+    config = _config()
+    target = _from_daemon(config)
+    drafter = client.load_drafter_from_cache(
+        config, torch.device("cpu"), None, target, rank=0
+    )
+    assert drafter is made[-1] and drafter.attached[0] is target
+
+
 def test_a_server_whose_sources_changed_leaves_the_daemon_alone(loop, monkeypatch):
     monkeypatch.setenv("ATOM_PRELOAD", "1")
     stale = ["key.py changed after this server started; restart it"]
@@ -953,6 +1067,26 @@ def test_a_server_whose_sources_changed_leaves_the_daemon_alone(loop, monkeypatc
     with pytest.raises(RuntimeError, match="restart it"):
         _from_daemon()
     assert loop.stopped == loop.spawned == 0
+
+
+def test_a_daemon_that_vanished_is_not_no_daemon(tmp_path):
+    # Its memory may still be in use: a disk load could run out of it.
+    path = str(tmp_path / "gpu.sock")
+    assert client._probe(path, "TP0", None, False, dict)[3] == client._NONE
+    _, _, reasons, status = client._probe(path, "TP0", None, True, dict)
+    assert status == client._UNUSABLE and "exited before serving" in reasons[0]
+
+
+def test_give_up_leaves_another_launchs_daemon(monkeypatch):
+    monkeypatch.setattr(client, "daemon_alive", lambda path: True)
+    monkeypatch.setattr(client, "daemon_state", lambda path: {"daemon_pid": 99})
+    monkeypatch.setattr(
+        client, "_stop_and_reclaim", lambda *a: pytest.fail("stopped another's daemon")
+    )
+    with pytest.raises(RuntimeError, match="another launch's daemon"):
+        client._give_up(
+            "TP0", "/x.sock", [], {"pid": 7, "log": "l"}, None, None, None, None
+        )
 
 
 def test_socket_dir_must_be_private(monkeypatch):

@@ -2550,10 +2550,6 @@ class Config:
                     f"ATOM_WEIGHT_CACHE={cache_mode} supports data parallelism "
                     "on one node only"
                 )
-        elif cache_mode != "off":
-            raise ValueError(
-                f"ATOM_WEIGHT_CACHE must be off, client or daemon, not {cache_mode!r}"
-            )
 
         assert 1 <= self.tensor_parallel_size <= 8
         if self.decode_context_parallel_size > 1:

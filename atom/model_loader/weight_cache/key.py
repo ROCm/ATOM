@@ -8,11 +8,11 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import copy
 import hashlib
 import importlib
 import importlib.metadata
 import os
-import struct
 import subprocess
 import sys
 import threading
@@ -28,6 +28,7 @@ from atom.model_loader.weight_cache.values import (
     _json,
     logger,
 )
+from atom.model_loader.weight_iterator import _MAX_SAFETENSORS_HEADER_BYTES
 
 
 class _SourceChanged(Exception):
@@ -56,9 +57,8 @@ def file_identity(path: str) -> str:
 
 
 def _checkpoint_digest(model_path: str) -> str:
-    """Every file in the checkpoint directory by name, size, mtime and inode
-    (a checkpoint rewritten in place changes them), with the content of small
-    files (configs) and the safetensors headers."""
+    """Every file in the checkpoint directory by name and file_identity, with
+    the safetensors headers (as bytes: parsing them takes ~1 s on V4-Pro)."""
     root = os.path.realpath(model_path)
     if not os.path.isdir(root):
         return f"path:{root}"
@@ -67,21 +67,11 @@ def _checkpoint_digest(model_path: str) -> str:
         dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
         for name in sorted(filenames):
             path = os.path.join(dirpath, name)
-            try:
-                st = os.stat(path)
-                rel = os.path.relpath(path, root)
-                h.update(
-                    f"{rel}\0{st.st_size}\0{st.st_mtime_ns}\0{st.st_ino}\n".encode()
-                )
-                with open(path, "rb") as f:
-                    if st.st_size <= _SMALL_FILE:
-                        h.update(f.read())
-                    elif name.endswith(".safetensors"):
-                        raw = f.read(8)
-                        (n,) = struct.unpack("<Q", raw)
-                        h.update(raw + f.read(n))
-            except (OSError, struct.error) as e:
-                h.update(f"{name}\0<{type(e).__name__}>\n".encode())
+            h.update(f"{os.path.relpath(path, root)}\0{file_identity(path)}\n".encode())
+            if name.endswith(".safetensors"):
+                with contextlib.suppress(OSError), open(path, "rb") as f:
+                    n = int.from_bytes(f.read(8), "little")
+                    h.update(f.read(min(n, _MAX_SAFETENSORS_HEADER_BYTES)))
     return h.hexdigest()
 
 
@@ -122,19 +112,19 @@ def _versions() -> dict:
         ("flydsl", ("flydsl", "FlyDSL")),
         ("mori", ("mori", "amd-mori")),
     ):
+        # Installed metadata only: whether a module is imported yet differs
+        # between processes.
         version = None
         for dist in dists:
             with contextlib.suppress(Exception):
                 version = importlib.metadata.version(dist)
                 break
-        if version is None and name in sys.modules:
-            version = getattr(sys.modules[name], "__version__", "?")
         out[name] = version or "absent"
     return out
 
 
 def compute_key(config, rank: int, device: torch.device) -> dict:
-    """Which checkpoint, model, shard, GPU and libraries."""
+    """Which checkpoint, model, drafter, shard, GPU and libraries."""
     import aiter
 
     hf = config.hf_config
@@ -147,9 +137,20 @@ def compute_key(config, rank: int, device: torch.device) -> dict:
     props = torch.cuda.get_device_properties(device)
     pc = config.parallel_config
     model_dir = local_model_dir(config.model)  # a hub id names a cache snapshot
+    spec = config.speculative_config
     return {
         "model": os.path.realpath(model_dir),
         "checkpoint": _checkpoint_digest(model_dir),
+        # The daemon holds this drafter's weights too.
+        "draft": (
+            {
+                "method": spec.method,
+                "checkpoint": spec.model
+                and _checkpoint_digest(local_model_dir(spec.model)),
+            }
+            if spec
+            else None
+        ),
         "hf_config": hashlib.sha256(_json(hf_dict).encode()).hexdigest(),
         "rank": rank,
         # The shard a rank holds depends on the whole layout (EP spans DP).
@@ -346,6 +347,17 @@ class _StripDocstrings(ast.NodeTransformer):
     visit_Module = visit_ClassDef = visit_FunctionDef = visit_AsyncFunctionDef = _strip
 
 
+class _Outline(ast.NodeTransformer):
+    """Function bodies left out: a module or class body that ran only defined
+    its functions, and those that ran are keyed on their own."""
+
+    def visit_FunctionDef(self, node):
+        node.body = [ast.Pass()]
+        return node
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+
 class _SourceHasher:
     """AST hashes (docstrings stripped) of functions in the atom/aiter packages.
 
@@ -421,9 +433,13 @@ class _SourceHasher:
         if tree is None:
             return "<unreadable>"
         parts = [] if qual == "<module>" else qual.split(".")
+        nodes = self._find_all(tree, parts)
+        if not parts or all(
+            isinstance(n, ast.ClassDef) and n.name == parts[-1] for n in nodes
+        ):
+            nodes = [_Outline().visit(copy.deepcopy(n)) for n in nodes]
         dumps = (
-            ast.dump(n, annotate_fields=False, include_attributes=False)
-            for n in self._find_all(tree, parts)
+            ast.dump(n, annotate_fields=False, include_attributes=False) for n in nodes
         )
         return hashlib.sha256("\n".join(dumps).encode()).hexdigest()[:16]
 
