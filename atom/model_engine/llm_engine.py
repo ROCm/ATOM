@@ -325,6 +325,9 @@ class LLMEngine:
     def print_mtp_statistics(self):
         self.core_mgr.send_utility_command("get_mtp_stats")
 
+    def reset_prefix_cache(self, timeout: float = 30.0) -> dict[str, Any]:
+        return self.core_mgr.reset_prefix_cache(timeout=timeout)
+
     def get_mtp_statistics(self, timeout: float = 30.0) -> dict[str, Any]:
         """Return aggregated speculative decoding statistics across DP ranks."""
         responses = self.core_mgr.broadcast_utility_command_sync(

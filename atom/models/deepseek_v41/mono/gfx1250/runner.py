@@ -47,6 +47,11 @@ from atom.utils.forward_context import get_forward_context
 logger = logging.getLogger("atom")
 
 
+
+# The TileRT-structured step (kernels/step.py: one row cluster a request, the mix partials' [8]-row layout) is the
+# c1 shape: one request (6 rows). Wider steps take the production path.
+MAX_STEP_ROWS = 6
+
 def _base_model(model):
     for m in model.modules():
         if (
@@ -186,7 +191,7 @@ class SingleStepRunner(StepInputs, RunnerDebug):
         )
 
     def prepare(self, rows: int) -> bool:
-        if rows % 6 or not 0 < rows <= buffers.T_MAX:
+        if rows % 6 or not 0 < rows <= MAX_STEP_ROWS:
             return False
         if rows not in self.builds:
             M = self.K["step"]
@@ -236,6 +241,8 @@ class SingleStepRunner(StepInputs, RunnerDebug):
             float(self.base.layers[0].attn.softmax_scale),
             T_.fptab.data_ptr(),
             T_.tp.data_ptr(),
+            0,   # lo / hi: the target layer range of a split launch (one launch: every layer)
+            len(self.base.layers),
         )
 
     def _check_timeouts(self) -> None:

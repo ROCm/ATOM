@@ -43,7 +43,7 @@ from atom.models.deepseek_v41.mono.gfx1250.kernels.attention import q8words, bf,
 H, I, TOPK, NE, CTAS = D.HID, D.MOE_I, D.TOPK, D.EXPERTS, D.CTAS
 UGU, NUG, DNU, NDN = 160, 18, 5, 320
 # the production routed-expert tensors (bytes): a 16-row tile, a 32-row scale super-row, an expert
-IP = 768                                   # (fixture) the packed planes pad I = 576 to 768
+IP = D.MOE_IPAD                             # I = 576 padded, as the production MoE stores its experts
 W13_TS, W13_KC, W13_E, S13_E = 16 * H // 2, H // 128 * 128, 2 * IP * H // 2, 2 * IP * H // 32
 W2_TS, W2_KC, W2_E, S2_E = 16 * IP // 2, IP // 128 * 128, H * IP // 2, H * IP // 32
 MAXTOK, MROW, CROW, KMID = 16, 640, 32, 640
@@ -517,7 +517,7 @@ def moe_ug(c):
             moe_dn_shared(cd)
 
 
-IDLE_HOOK = [None]   # (v2) trace-time hook run between the UG and the UG -> down handoff
+IDLE_HOOK = hx.TraceSlot()   # (v2) trace-time hook run between the UG and the UG -> down handoff
 TILE_UG = True   # (v2) the routed UG as TileRT's split: one 16-row tile a wave over the full K (a 40 KB contiguous stream)
 UG1_KB = 8       # K steps in flight a wave (v2 tile UG)
 

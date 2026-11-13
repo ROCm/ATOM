@@ -6,7 +6,9 @@ generated unless the trace sets ``HOOK[0]`` to a callable(slot) (the production 
 
 import flydsl.expr as fx
 
-HOOK = [None]
+from atom.models.deepseek_v41.mono.gfx1250.kernels.device import TraceSlot
+
+HOOK = TraceSlot()
 
 
 def point(k):

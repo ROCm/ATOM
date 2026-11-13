@@ -50,6 +50,7 @@ from atom.kv_transfer.disaggregation.mooncake.endpoint import (
 )
 from atom.model_engine.arg_utils import EngineArgs
 from atom.model_engine.llm_engine import load_tokenizer
+from atom.model_engine.prefix_cache_reset import PrefixCacheBusyError
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.segment_tokenizer import PrefixEncoding
 from atom.model_engine.sequence import new_token_ids
@@ -3542,6 +3543,31 @@ async def get_mtp_stats():
         raise HTTPException(
             status_code=500, detail=f"Failed to get MTP statistics: {e!s}"
         )
+
+
+@_engine_route("/reset_prefix_cache", methods=["POST"])
+async def reset_prefix_cache():
+    """Clear idle TP/DP prefix indexes, retaining weights, graphs and JIT.
+
+    This management RPC is synchronous on the API event loop. Cumulative
+    statistics are retained; compare counter deltas across requests.
+    """
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Engine is not initialized")
+    try:
+        return engine.reset_prefix_cache()
+    except PrefixCacheBusyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except NotImplementedError as exc:
+        raise HTTPException(status_code=501, detail=str(exc)) from exc
+    except TimeoutError as exc:
+        raise HTTPException(status_code=504, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Prefix reset failed; some ranks may already be cleared")
+        raise HTTPException(
+            status_code=500,
+            detail="Prefix reset failed; some ranks may already be cleared",
+        ) from exc
 
 
 @_engine_route("/debug/cache_stats")

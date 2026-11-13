@@ -11,6 +11,7 @@ All functions are traced inside a @flyc.kernel body.
 from __future__ import annotations
 
 import re as _re
+import threading
 from flydsl.expr import gpu, range_constexpr
 
 import flydsl.expr as fx
@@ -302,14 +303,36 @@ def unlikely(b):
     return fx.Boolean(llvm.call_intrinsic(i1, "llvm.expect.i1", [_v(b), f], [], []))
 
 
+class TraceSlot:
+    """One trace-time value private to the tracing thread (used as ``slot[0]``).
+
+    The step kernel sets such slots while it traces (the poll-timeout counter pointer, a stamp hook) and clears them
+    when its body ends. FlyDSL >= 0.5 traces every kernel in its own MLIRContext, and a launcher may trace several
+    ranks' kernels in parallel threads; a module-level ``[None]`` list then hands one thread's IR value to another
+    thread's trace ("operand type from a different MLIRContext"). A thread-local slot keeps each trace's values in
+    its own context and behaves the same when tracing is serial.
+    """
+
+    def __init__(self):
+        self._local = threading.local()
+
+    def __getitem__(self, i):
+        assert i == 0
+        return getattr(self._local, "value", None)
+
+    def __setitem__(self, i, value):
+        assert i == 0
+        self._local.value = value
+
+
 # Poll timeouts made visible. Every bounded poll (cross-rank tag waits, device handoffs) gives up after 2 s and the
 # kernel goes on with whatever it read; a timeout therefore means wrong results. TOFLAG[0] (set by the step kernel to its
 # 'cyc' scratch) counts them: int32 [0] += 1, int32 [1] = the last site id. The runner reads it after a step.
-TOFLAG = [None]
+TOFLAG = TraceSlot()
 POLL_TICKS = 2000000000   # (v2 study) 20 s: the first launch's rank skew (module load) must not time out a poll (a timeout desyncs the TP receive halves for every later step)
 
 
-DIAG = [None]   # (v3 diag) the stamp array: a timed-out poll's code into its CTA's slot 1
+DIAG = TraceSlot()   # (v3 diag) the stamp array: a timed-out poll's code into its CTA's slot 1
 
 
 @_ASTR.transform
