@@ -174,6 +174,7 @@ def _make_layer(num_experts, hidden, intermediate, seed=0):
     torch.manual_seed(seed)
     return SimpleNamespace(
         activation=moe_mod.ActivationType.Silu,
+        global_num_experts=num_experts,
         num_fused_shared_experts=0,
         w13_bias=None,
         w2_bias=None,
