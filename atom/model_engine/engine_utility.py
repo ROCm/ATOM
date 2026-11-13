@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import array
 import logging
 import queue
 import time
 import uuid
+from collections.abc import Iterable
 from typing import ClassVar
 
 import numpy as np
@@ -17,7 +17,7 @@ from atom.model_engine.collective_rpc import (
     RpcPayload,
     checked_timeout,
 )
-from atom.model_engine.sequence import SequenceStatus
+from atom.model_engine.sequence import BlockTable, SequenceStatus
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -58,25 +58,17 @@ def kv_change(cmd: str, args) -> str | None:
     return None
 
 
-def physical_block_count(tables, num_blocks: int) -> int:
+def physical_block_count(tables: Iterable[BlockTable], num_blocks: int) -> int:
     """Physical blocks across tables, a shared prefix counted once.
 
     A boolean mask over the pool, filled from each table's buffer. Building a
     Python set of every id costs tens to hundreds of milliseconds once finished
     requests hold a long context, and this runs on the engine thread.
     """
-    seen = None
+    seen = np.zeros(num_blocks, dtype=bool)
     for table in tables:
-        if not table:
-            continue
-        if isinstance(table, array.array):
-            ids = np.frombuffer(table, dtype=np.int32)
-        else:
-            ids = np.asarray(table, dtype=np.int32)
-        if seen is None:
-            seen = np.zeros(num_blocks, dtype=bool)
-        seen[ids] = True
-    return int(seen.sum()) if seen is not None else 0
+        seen[np.frombuffer(table, dtype=np.int32)] = True
+    return int(seen.sum())
 
 
 def completes_weight_sync(cmd: str, args: dict) -> bool:
@@ -993,9 +985,10 @@ class EngineUtilityHandler:
             }
             if kv_pool is not None:
                 reusable = kv_pool.num_reusable_free
-                # Whole-request deferrals only. On P/D prefill, the source KV
-                # decode has not pulled yet. Early-release offload leases are
-                # returned once the source read finishes and are not included.
+                # Finished or aborted requests held whole until every connector
+                # releases them: a P/D decode pull, a whole-request offload
+                # save, or a load still writing into their blocks. Early-release
+                # offload leases are excluded.
                 deferred_free = self.scheduler.deferred_free_blocks.values()
                 result |= {
                     "kv_blocks_used": kv_pool.num_used,
