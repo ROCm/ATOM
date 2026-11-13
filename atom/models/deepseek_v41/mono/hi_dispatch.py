@@ -162,9 +162,14 @@ class HiDraftModel(MonoDraftModel):
 
     def head_and_sample(self, out, anchor_ids, num_draft):
         if out is _HI_DRAFT:
-            # a row of ids a request (``draft_run``)
+            # a row of ids a request (``draft_run``): the hook's own buffer, allocated at install, rewritten only by the
+            # next draft (a replay hands it back without the clone: ``draft_graph.outside_pool``; its readers, the
+            # ids' D2H and the next step's ``fill_deferred_decode_ids``, run before the next draft, a whole target
+            # forward later on the same stream, as they did on the clone)
+            from atom.spec_decode.draft_graph import outside_pool
+
             requests = self.hi.dr_requests
-            return self.hi.mk_ids[:requests].view(requests, -1), None
+            return outside_pool(self.hi.mk_ids[:requests].view(requests, -1)), None
         return self.model.head_and_sample(out, anchor_ids, num_draft)
 
 
