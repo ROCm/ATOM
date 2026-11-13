@@ -2,7 +2,7 @@
 
 各模型在 455-CI 镜像（`rocm/fw-bringup-mlperf:gfx1250-atom-ci455-<YYYYMMDD>`，ATOM main + aiter main）上的 server、GSM8K 和 bench 命令。流程、指标口径和记录方式见 [`455-CI-guide.md`](455-CI-guide.md)；这里只写命令。
 
-目前收录 Kimi-K3 (2.8T)、GLM-5.2、MiniMax-M3 (428B)、DeepSeek R1、DeepSeek-V4.1-Flash、DeepSeek-V4-Pro 六个模型，其余 2 个见 [`455-CI-guide.md`](455-CI-guide.md) §1。
+目前收录 Kimi-K3 (2.8T)、GLM-5.2、MiniMax-M3 (428B)、DeepSeek R1、DeepSeek-V4.1-Flash、DeepSeek-V4-Pro、Qwen-3.8 Flash 七个模型，其余 1 个见 [`455-CI-guide.md`](455-CI-guide.md) §1。
 
 ## 通用约定
 
@@ -563,3 +563,65 @@ python3 -m atom.benchmarks.benchmark_serving \
 ### 参考值
 
 还没有：2026-11-12 在 main 和 `gfx1250-atom-20261111` 上都没起来（见上）。
+
+---
+
+## Qwen-3.8 Flash
+
+- 场景：8K/1K；GPU：1（1 card）
+- 并行：TP1；MTP，每步 3 个草稿 token，草稿层的 MoE 专家在线量化成 MXFP4；FP8 KV cache，BF16 index cache，block 16；开 prefix cache
+- MODEL_PATH：`/models/Qwen3.8-Flash-Next-Quark-MXFP4-ATOM-MTP`；PORT：`8000`
+- 权重来源待确认：原命令的模型在 `/home/memin/model/` 下。HF 上公开的是 [`amd/Qwen3.8-Flash-Next-Quark-MXFP4`](https://huggingface.co/amd/Qwen3.8-Flash-Next-Quark-MXFP4)，没有 `-ATOM-MTP` 后缀，是不是同一份要和提供命令的同事确认。
+
+**main 上还缺 [ROCm/ATOM#3225](https://github.com/ROCm/ATOM/pull/3225) + [ROCm/aiter#7847](https://github.com/ROCm/aiter/pull/7847)**（登记在 [`455-CI/pending_fixes.csv`](455-CI/pending_fixes.csv)）：ATOM#3225 是 gfx1250 上跑 Qwen3.8 需要的修复，aiter#7847 是 gfx1250 的性能调优。合入前在 main 上可能跑不起来或性能偏低，跑挂时按指南 §3.7 用这组 PR 作说法。
+
+命令由 Qwen3.8 的开发同事提供（2026-11-13），按 455-CI 的规矩改了四处，其余参数原样：
+- 去掉 `PYTHONPATH=/workspace/ATOM`：那是开发机上的 ATOM checkout，455-CI 只用镜像里 `/app/ATOM` 的 main；
+- 模型路径换成容器里的 `/models/...`，`--served-model-name` 跟着换，两者保持一样；
+- `python` 换成 `python3`：镜像里 ATOM 装在系统 Python 上，其他模型的命令也都用 `python3`；
+- 加 `HIP_VISIBLE_DEVICES=0`：只给它 1 张卡（指南 §3.2）。
+
+**`--spec-decode-acceptance-length 2.32` 只能用在性能测试。** 它让 MTP 的平均接受长度固定为 2.32，不看草稿和目标模型是否一致；打开时 server 返回的每个 token 文本都是 `synthetic `，吞吐和时延照常统计。所以：
+- GSM8K 要单独起一个不带这一项的 server，测完停掉，再用下面的完整命令起 server 测 c4 和 c64；
+- 性能是在接受长度固定为 2.32 下测的，不反映真实的接受率。`perf.csv` 的 `note` 写 `forced MTP acceptance length 2.32`。
+
+### server
+
+```bash
+HIP_VISIBLE_DEVICES=0 ENABLE_CK=0 GPU_ARCHS=gfx1250 \
+ATOM_MOE_GU_ITLV=1 ATOM_GDN_STATE_MIDSTEP=1 \
+python3 -m atom.entrypoints.openai_server \
+  --model /models/Qwen3.8-Flash-Next-Quark-MXFP4-ATOM-MTP \
+  --served-model-name /models/Qwen3.8-Flash-Next-Quark-MXFP4-ATOM-MTP \
+  --host 0.0.0.0 --server-port 8000 --trust-remote-code \
+  -tp 1 \
+  --max-num-seqs 160 \
+  --max-num-batched-tokens 16384 \
+  --gpu-memory-utilization 0.95 \
+  --enable_prefix_caching \
+  --timeout-keep-alive 60 \
+  --method mtp \
+  --num-speculative-tokens 3 \
+  --spec-decode-acceptance-length 2.32 \
+  --online_quant_config '{"layer_quant_config":{"mtp.layers.0.mlp.experts*":"mxfp4"}}' \
+  --kv_cache_dtype fp8 \
+  --index-cache-dtype bf16 \
+  --block-size 16 \
+  --cudagraph-capture-sizes '[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,18,20,22,24,26,28,30,32,36,40,44,48,52,56,60,64,68,72,76,80,84,88,92,96,100,104,108,112,116,120,124,128]'
+```
+
+### gsm8k
+
+先用上面的命令去掉 `--spec-decode-acceptance-length 2.32` 起 server，其余不变，再按指南 §3.3 测，`MODEL_PATH=/models/Qwen3.8-Flash-Next-Quark-MXFP4-ATOM-MTP`，`PORT=8000`。测完按指南 §3.2 第 4 步停掉 server，再用完整命令起 server 测性能。
+
+### bench
+
+```bash
+python3 -m atom.benchmarks.benchmark_serving \
+  --model=/models/Qwen3.8-Flash-Next-Quark-MXFP4-ATOM-MTP --backend=vllm --base-url=http://127.0.0.1:8000 \
+  --dataset-name=random --random-input-len=8192 --random-output-len=1024 --random-range-ratio=0.8 \
+  --max-concurrency=$CONC --num-prompts=$((CONC * 10)) --num-warmups=$((CONC * 2)) \
+  --request-rate=inf --ignore-eos --trust-remote-code \
+  --save-result --result-dir=$RESULT_DIR --result-filename=raw.json \
+  --percentile-metrics="ttft,tpot,itl,e2el"
+```

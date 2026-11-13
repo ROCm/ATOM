@@ -286,7 +286,7 @@ test "$(ls /sys/class/kfd/kfd/proc | wc -l)" = 0
 # 5) 按 §3.5 把这个模型的数据推到 455-CI，再测下一个模型
 ```
 
-- 精度和两个并发的性能用同一个 server，中间不重启。
+- 精度和两个并发的性能用同一个 server，中间不重启。recipe 另有规定的除外：例如 Qwen-3.8 Flash 的性能命令强制了 MTP 接受长度，server 返回的文本没有意义，GSM8K 要单独起一个 server。
 - GSM8K 分数低但 server 还活着时，照常测性能，在报告里标出精度回退。
 - MLPerf Endpoint 的 client 不要中途打断。ATOM 不会取消已断开连接的请求，打断之后必须重启 server、重新 warmup 再测。
 - Kimi-K3 跨两个节点：镜像 ENV 里 `NCCL_SOCKET_IFNAME=lo`、`GLOO_SOCKET_IFNAME=lo` 只适合单机，要按 recipe 换成节点之间的真实网卡。
