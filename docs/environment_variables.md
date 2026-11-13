@@ -178,6 +178,7 @@ cannot affect a server that does not use the feature.
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | **ATOM_MONO_ENABLE** | bool | 1 (true) | Enable fused decode for supported GLM-5.2, Kimi-K3, MiniMax-M3, DeepSeek-V4.1, and Qwen3.8-Flash-Next deployments and step geometries. Unsupported configurations and forwards keep the production path; `0` disables every Mono runner. Qwen3.8-Flash-Next (Quark MXFP4, TP1, MTP3) runs either GDN verify (ReplaySSM by default, or classic with `ATOM_ENABLE_REPLAYSSM=0`); see `recipes/Qwen3.8-Flash-Next-Mono-Program.md`. |
+| **ATOM_KIMI_K3_KDA_FUSED_DECODE** | bool | 1 (true) | Kimi-K3.1 and GLM-5.3 KDA layers under ReplaySSM: run a decode or verify step's conv, `f_b_proj` and recurrence as one kernel (`replayssm_kda_fused_update`) on the in_proj output, when the step's sequences times the rank's KDA heads fit one program per CU and `f_b_proj` is unquantized. Larger steps keep the conv and recurrence kernels: the fused kernel runs at occupancy 1, and past one wave it is slower on decode and short verify steps. Set `0` to keep them at every batch size. |
 
 ### MiniMax-M3
 
