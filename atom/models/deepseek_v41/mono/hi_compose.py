@@ -3,9 +3,10 @@
 """The hi programs of one TP rank: composed and built (compiled) for the served configuration, no tensors.
 
 ``HiPrograms`` is the composition the hi runner (``hi_runner.HiLayers``) serves with, and the one the CPU program checks
-compile: the layer plan, the widths and bands, then, in this order, the verify heads, the layer programs, the Engram
-token-only launch, the DSpark context write and the block draft's plans. Every program is a ``MonoKernel`` (built on
-construction; a build that does not fit takes the fallback the methods name).
+compile: the layer plan, the widths and bands, then, in this order, each width's verify head and layer programs (a
+width whose programs do not build is not served: its steps keep ATOM's mono decode), the Engram token-only launch, the
+DSpark context write and the block draft's plans. Every program is a ``MonoKernel`` (built on construction; a build that
+does not fit takes the fallback the methods name).
 """
 
 from __future__ import annotations
@@ -141,39 +142,8 @@ class HiPrograms:
         )
         self.cl = {r: hi_plan.n_max(max_ctx, r) for r in (1, 2)}
         self.eng = {f"eng{i}": i for i in self.mf if self.plan[i].engram}
-        # ---- programs: one a (kind, width), shared by the layers of the kind
-        # the verify head a width (before the layer programs: the last layer's chain role follows it): one request,
-        # the head at its width; B requests, one wide head at Scenario(B, rows) where hi builds it, else B
-        # launches of the one-request head at their rows ("split", ``head_launch_ids``) after a chain tail
+        # ---- programs: one a (kind, width), shared by the layers of the kind; a width's verify head first
         self.head_programs, self._heads, self.head_mode = {}, {}, {}
-        for s in self.widths:
-            b, rq = self.split[s]
-            kern = None
-            if b == 1:
-                self.head_mode[s] = "one"
-                kern = self._head_program(s, self.chain, (1, s))
-            elif s in self.band_of:
-                # a band: its wide head, a dyn_rows build (no split fallback: ids for 4 heads)
-                self.head_mode[s] = "wide"
-                kern = self._head_program(
-                    self.pwidth(s), self.chain, (self.band_of[s], rq), dyn=True
-                )
-            else:
-                try:
-                    kern = self._head_program(s, self.chain, (b, rq))
-                    self.head_mode[s] = "wide"
-                # PlanError / ResourceError: the hi runtime's head at B
-                except Exception as e:  # noqa: BLE001 - a build refusal
-                    logger.info("V4.1 mono hi: the verify head at %d x %d rows does not build (%s: %s): %d "
-                                "launches of the %d-row head", b, rq, type(e).__name__, str(e)[:160], b, rq)  # fmt: skip
-                if not self._agree(
-                    kern is not None
-                ):  # (another rank's did not build: every rank splits)
-                    kern = None
-            if kern is None:
-                self.head_mode[s] = "split"
-                kern = self._head_program(rq, False, (1, rq))
-            self.head_programs[s] = kern
         self.sources, self.programs = {}, {}
         for i in self.mf:
             p = self.plan[i]
@@ -181,12 +151,10 @@ class HiPrograms:
                 self.sources[i] = L.Source(p.ratio, self.cl[p.ratio], kv=p.kind == "kv+index source", index=True,
                                            n_max=self.cl[p.ratio], cand=p.cand,
                                            state_slots=SLOTS if p.ratio == 2 and p.kind == "kv+index source" else 0)  # fmt: skip
-            for s in self.widths:
-                key = self._key(i, s)
-                if key not in self.programs:
-                    self.programs[key] = self._program(
-                        p, s, *self.role(i, s), full_r_a=self.full_r_a(i, s)
-                    )
+        # a width whose programs do not build is not served (its steps take ATOM's own mono decode: ``serves_width``)
+        unbuilt = [s for s in self.widths if not self._agree(self._build_width(s))]
+        if unbuilt:
+            self._drop_widths(unbuilt)
         # a width's programs read / write the cross-launch region at the same offset (a step runs one width)
         for s in self.widths:
             chained = [k for key, k in self.programs.items() if key[1] == s] + [
@@ -241,6 +209,82 @@ class HiPrograms:
             if any(len(v) > 1 for v in offs.values()):
                 raise RuntimeError(f"the draft's chained programs ({n} requests) disagree on the cross-launch peer "
                                    f"regions: {offs}")  # fmt: skip
+
+    def _build_width(self, s: int) -> bool:
+        """Width s's verify head (before its layer programs: the last layer's chain role follows it) and layer
+        programs; -> whether they all built (a resource or plan refusal of any of them: False, logged).
+        """
+        from .hi.emit.compile import ResourceError
+        from .hi.plan.program import PlanError
+
+        try:
+            self.head_programs[s] = self._width_head(s)
+            for i in self.mf:
+                key = self._key(i, s)
+                if key not in self.programs:
+                    self.programs[key] = self._program(
+                        self.plan[i], s, *self.role(i, s), full_r_a=self.full_r_a(i, s)
+                    )
+        except (ResourceError, PlanError) as e:
+            logger.warning("V4.1 mono hi: width %d does not build (%s: %s): ATOM's mono decode serves it", s,
+                           type(e).__name__, str(e)[:160])  # fmt: skip
+            return False
+        return True
+
+    def _width_head(self, s: int):
+        """Width s's verify head: one request, the head at its width; B requests, one wide head at Scenario(B, rows)
+        where hi builds it, else B launches of the one-request head at their rows ("split", ``head_launch_ids``)
+        after a chain tail; a band, its wide head (a dyn_rows build: no split fallback, ids for 4 heads).
+        """
+        b, rq = self.split[s]
+        if b == 1:
+            self.head_mode[s] = "one"
+            return self._head_program(s, self.chain, (1, s))
+        if s in self.band_of:
+            self.head_mode[s] = "wide"
+            return self._head_program(
+                self.pwidth(s), self.chain, (self.band_of[s], rq), dyn=True
+            )
+        kern = None
+        try:
+            kern = self._head_program(s, self.chain, (b, rq))
+            self.head_mode[s] = "wide"
+        # PlanError / ResourceError: the hi runtime's head at B
+        except Exception as e:  # noqa: BLE001 - a build refusal
+            logger.info("V4.1 mono hi: the verify head at %d x %d rows does not build (%s: %s): %d "
+                        "launches of the %d-row head", b, rq, type(e).__name__, str(e)[:160], b, rq)  # fmt: skip
+        if not self._agree(
+            kern is not None
+        ):  # (another rank's did not build: every rank splits)
+            kern = None
+        if kern is None:
+            self.head_mode[s] = "split"
+            kern = self._head_program(rq, False, (1, rq))
+        return kern
+
+    def _drop_widths(self, unbuilt: list[int]) -> None:
+        """Take the widths whose programs did not build out of the served ones (``split``: the step's routing) and
+        their programs no served width shares out of the built ones."""
+        for s in unbuilt:
+            for table in (
+                self.width_plan,
+                self.split,
+                self.band_of,
+                self.head_programs,
+                self.head_mode,
+            ):
+                table.pop(s, None)
+        self.widths = sorted(self.split)
+        if not self.widths:
+            raise MonoUnsupported("V4.1 mono hi: no width's programs build")
+        kept = {self.pwidth(s) for s in self.widths}
+        self.programs = {k: v for k, v in self.programs.items() if k[1] in kept}
+        served = {id(k) for k in self.head_programs.values()}
+        self._heads = {k: v for k, v in self._heads.items() if id(v) in served}
+        self.bmax = max(
+            max(b for b, _ in self.split.values()),
+            max(self.band_of.values(), default=0),
+        )
 
     def _agree(self, ok: bool) -> bool:
         """``ok`` on every rank of the TP group (a build fallback every rank takes alike: the ranks' programs must
@@ -354,6 +398,9 @@ class HiPrograms:
             # ratio 2: Source(state_slots=) -> rejection-safe Compressor state (module docstring)
             if self.index_layout != "preshuffle":
                 ch["knobs"] = {"INDEX_KLAYOUT": self.index_layout}
+                # TP2's MFMA-layout readers in a band spill 2 VGPRs at the block's 16 merge heads, none at 8
+                if dyn and self.tp == 2 and p.kind == "index source":
+                    ch["knobs"]["SPARSE_MHEADS"] = 8
             blocks = L.window_layer_blocks(first=False, tp=self.tp, source=self.sources[p.layer_id],
                                            engram=p.engram, **ch)  # fmt: skip
         stages = L.moe_route_early([st for b in blocks for st in b.stages(sc)])
@@ -408,9 +455,11 @@ class HiPrograms:
         ids ``DRAFT_LAUNCH``); n requests with the hi runtime's stages at ``Scenario(n, W)``: the three stages once, then the
         head chained at n requests where it builds, else stage 2 a chain tail and an odd number of plain heads on
         their rows (ids 46-48: the plan's launch count stays even, so what follows it back to back on the draft's peer
-        group alternates parity); where the stages at n requests do not build, the one-request plan once a request.
+        group alternates parity); where the stages, or the heads, at n requests do not build, the one-request plan once
+        a request.
         """
-        from .hi.plan.program import Program, Scenario
+        from .hi.emit.compile import ResourceError
+        from .hi.plan.program import PlanError, Program, Scenario
 
         D, tp = self.D, self.tp
 
@@ -506,11 +555,21 @@ class HiPrograms:
             )
         )
         heads, r0 = [], 0
-        for lid, m in zip((DRAFT_LAUNCH[3], *HEAD_MORE[:2]), sizes, strict=False):
-            heads.append(
-                _DraftLaunch(("head", m, False), head(m, False), lid, r0, m, False, 3)
-            )
-            r0 += m
+        try:
+            for lid, m in zip((DRAFT_LAUNCH[3], *HEAD_MORE[:2]), sizes, strict=False):
+                heads.append(
+                    _DraftLaunch(
+                        ("head", m, False), head(m, False), lid, r0, m, False, 3
+                    )
+                )
+                r0 += m
+        # the Markov head at m requests (TP2's two-block head spills past one request)
+        except (ResourceError, PlanError) as e:
+            logger.info("V4.1 mono hi: the draft's plain heads at %d requests do not build (%s: %s): one request at "
+                        "a time", n, type(e).__name__, str(e)[:160])  # fmt: skip
+            heads = None
+        if not self._agree(heads is not None):
+            return _DraftPlan(n, one, per_request=True)
         if r0 != n:
             raise ValueError(
                 f"V4.1 mono hi draft: {n} requests: the fallback's heads cover {r0}"

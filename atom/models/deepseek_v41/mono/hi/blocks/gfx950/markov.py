@@ -9,7 +9,8 @@ plus the Markov bias in fp32, ties to the lowest id; ``W`` vocab-sharded bf16 (`
 the target head's packed tensor), ``W1`` / ``W2`` [V, r] bf16 (the whole tables; this rank reads ``W2``'s rows of its
 vocab). The positions are sequential: each one's bias needs the previous one's id, the argmax over every rank.
 
-One stage, ``ceil(n / 128)`` tasks (a task a CTA: every task must be resident, each waits for all of them):
+One stage, ``ceil(n / 128)`` tasks (a task a CTA: every task must be resident, each waits for all of them; where a
+rank's blocks outnumber the CUs, two 128-id blocks a task, ``MarkovHead(blocks=)``):
 
 1. the dot (``ArgmaxHead``'s: 8 row groups of 16 vocab rows a task over the whole K, bf16 MFMAs), the logits of the
    task's 128 ids for every row rounded to bf16 into LDS; the task's 128 ``W2`` rows into LDS;
@@ -65,6 +66,8 @@ THREADS, WAVES = MI355X.threads, MI355X.waves
 VT = WAVES * ah.RG  # ids a task: 128
 LAND_GROUP = 2  # B requests: x's poll batches in flight at once (each 12 two-pair specs a thread)
 INT_MAX = 2**31 - 1
+# several blocks a task: W1 words between the bias pass's scheduling fences
+BIAS_FENCE = 8
 
 
 @dataclass(frozen=True)
@@ -211,6 +214,11 @@ class MarkovHead(Block):
     def plan(self, sc: Scenario) -> _MPlan:
         p = _MPlan(self.name, sc.rows, self.x.width, self.n, sc.tp, self.x.name, "bf16", self.layout, self.prefetch,
                    False, "", self.lead, False, rank_r=self.rank_r, batch=sc.batch)  # fmt: skip
+        blocks = self.blocks or (
+            1 if p.tasks <= MI355X.cus or self.logits is not None else 2
+        )
+        if blocks > 1:
+            p = replace(p, blocks=blocks)
         if (
             sc.batch > 1 or p.lds_words * 4 > MI355X.lds_bytes
         ):  # x in K slices where it does not fit whole
@@ -293,6 +301,13 @@ def _mk(k, t, p: _MPlan, lg: str = ""):
                 _land_batch(k, p, specs, dests, words)
         rocdl.sched_barrier(0)
         q += [issue(i) for i in range(lead, n_pre)]
+        # the task's further blocks: their weight streams, one block after another
+        issues = [issue]
+        for blk in range_constexpr(1, p.blocks):
+            rg_b = (tb + blk) * WAVES + wave
+            issues.append(
+                partial(ah._issue, p, r_w, tb + blk, wave, rg_b, lane, rg_b < p.n_rg)
+            )
     gpu.barrier()
     first = k.rank * p.n if p.tp > 1 else fx.Int32(0)
     if const_expr(p.single):
@@ -303,7 +318,7 @@ def _mk(k, t, p: _MPlan, lg: str = ""):
         for j in range_constexpr(p.rows):
             xp = _position(k, p, t, j, xp, first)
     else:  # B requests: the dot over every row, then the requests' positions side by side
-        _stream_b(k, p, lane, issue, q)
+        _stream_b(k, p, lane, issues, q)
         _w2_tile(k, p, t, first)
         gpu.barrier()
         _anchors(
@@ -339,35 +354,44 @@ def _base_put(k, p: _MPlan, lane, vals):
             fx.ptr_store(vals[e], k.ldsf + (at + e))
 
 
-def _stream_b(k, p: _MPlan, lane, issue, q, blk: int = 0):
-    """B requests: ``ArgmaxHead._stream``'s MFMAs over 16-row chunks (x's next K slice landing between its steps);
-    the logits rounded to bf16 into LDS ``a_base`` [row][id in the task]."""
+def _stream_b(k, p: _MPlan, lane, issues, q):
+    """B requests: ``ArgmaxHead._stream``'s MFMAs over 16-row chunks (x's next K slice landing between its steps), the
+    task's blocks one after another (``issues``: a block's weight stream; ``q``: block 0's prefetch; a later block
+    lands x's first K slice again: a block's registers, not two, are live); the logits rounded to bf16 into LDS
+    ``a_base`` [row][id in the task]."""
     n_pre = len(q)
     xrows = [k.ldsf + fx.min(lane % 16 + ah.RG * ch, fx.Int32(p.rows - 1)) * p.pitch + (lane // 16) * 4
              for ch in range(p.rc)]  # fmt: skip
-    accs = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(p.rc)]
-    for i in range(p.steps):
+    for blk in range(p.blocks):
+        if blk:
+            if const_expr(p.kparts > 1):
+                gpu.barrier()
+                ah._land_x(k, p, 0)
+                gpu.barrier()
+            q = [issues[blk](i) for i in range(n_pre)]
+        accs = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(p.rc)]
+        for i in range(p.steps):
+            rocdl.sched_barrier(0)
+            if (
+                i and i % p.psteps == 0
+            ):  # the next K slice of x, once every wave is past the last one
+                gpu.barrier()
+                ah._land_x(k, p, i // p.psteps)
+                gpu.barrier()
+            if i + n_pre < p.steps:
+                q.append(issues[blk](i + n_pre))
+            for ch in range(p.rc):
+                b = fx.ptr_load(
+                    xrows[ch] + (i % p.psteps) * (ah.KSTEP // 2),
+                    result_type=fx.Vector.make_type(4, fx.Float32),
+                )
+                accs[ch] = mfma_bf16(
+                    q[i].bitcast(fx.BFloat16), b.bitcast(fx.BFloat16), accs[ch]
+                )
         rocdl.sched_barrier(0)
-        if (
-            i and i % p.psteps == 0
-        ):  # the next K slice of x, once every wave is past the last one
-            gpu.barrier()
-            ah._land_x(k, p, i // p.psteps)
-            gpu.barrier()
-        if i + n_pre < p.steps:
-            q.append(issue(i + n_pre))
-        for ch in range(p.rc):
-            b = fx.ptr_load(
-                xrows[ch] + (i % p.psteps) * (ah.KSTEP // 2),
-                result_type=fx.Vector.make_type(4, fx.Float32),
-            )
-            accs[ch] = mfma_bf16(
-                q[i].bitcast(fx.BFloat16), b.bitcast(fx.BFloat16), accs[ch]
-            )
-    rocdl.sched_barrier(0)
-    gpu.barrier()  # (x's LDS is not the base logits', but the last slice's readers finish before any reuse)
-    for ch, acc in enumerate(accs):
-        _base_put_ch(k, p, lane, ch, [bf16_round(acc[e]) for e in range(4)], blk)
+        gpu.barrier()  # (x's LDS is not the base logits', but the last slice's readers finish before any reuse)
+        for ch, acc in enumerate(accs):
+            _base_put_ch(k, p, lane, ch, [bf16_round(acc[e]) for e in range(4)], blk)
 
 
 @traced
@@ -514,25 +538,42 @@ def _bias_loop(k, p: _MPlan, j, first, w2a, part, seg, v, lid, ok):
     """B requests: each request's biases and the wave's best of position ``j``, a request at a time (a runtime loop:
     one request's registers live at once)."""
     for b in range(p.batch):
-        if const_expr(p.blocks == 1):
-            _bias_one(k, p, j, b, first, w2a, part, seg, v, lid, ok)
+        _bias_one(k, p, j, b, first, w2a, part, seg, v, lid, ok)
 
 
 def _bias_one(k, p: _MPlan, j, b, first, w2a, part, seg, v, lid, ok):
+    """Request ``b``'s position ``j``: the thread's id ``v`` of every block of the task (``w2a`` / ``lid`` / ``ok``:
+    block 0's), the best of them, then the wave's best."""
     w1a = p.a_w1 + b * p.rw + part * seg
-    acc = fx.Float32(0.0)
+    # every block's dot in one pass over the W1 row: a W1 word read once, never held for a later block
+    accs = [fx.Float32(0.0) for _ in range(p.blocks)]
     for w in range_constexpr(seg):
+        # (two blocks' LDS loads hoisted over the whole row spill 10 VGPRs: TP2)
+        if const_expr(p.blocks > 1 and w and w % BIAS_FENCE == 0):
+            rocdl.sched_barrier(0)
         a0, a1 = bf2_f32(fx.ptr_load(k.ldsf + (w1a + w)).bitcast(fx.Int32))
-        b0, b1 = bf2_f32(fx.ptr_load(k.ldsf + (w2a + w)).bitcast(fx.Int32))
-        acc = acc + a0 * b0
-        acc = acc + a1 * b1
-    acc = acc + xshfl(acc, 1)
-    acc = acc + xshfl(acc, 2)
-    val = fx.ptr_load(k.ldsf + (p.a_base + (b * p.pos + j) * VT + v)) + acc
-    bits = val.bitcast(fx.Int32)
-    bits = (bits == fx.Int32(INT_MIN)).select(fx.Int32(0), bits)  # -0 as +0
-    kk = ok.select(order_key(bits), fx.Int32(0))
-    ii = ok.select(lid + first, fx.Int32(INT_MAX))
+        for blk in range_constexpr(p.blocks):
+            b0, b1 = bf2_f32(
+                fx.ptr_load(k.ldsf + (w2a + blk * VT * p.w2pitch + w)).bitcast(fx.Int32)
+            )
+            accs[blk] = accs[blk] + a0 * b0
+            accs[blk] = accs[blk] + a1 * b1
+    kk, ii = None, None
+    for blk in range_constexpr(p.blocks):
+        acc = accs[blk]
+        acc = acc + xshfl(acc, 1)
+        acc = acc + xshfl(acc, 2)
+        val = (
+            fx.ptr_load(k.ldsf + (p.a_base + (b * p.pos + j) * p.vt + blk * VT + v))
+            + acc
+        )
+        bits = val.bitcast(fx.Int32)
+        bits = (bits == fx.Int32(INT_MIN)).select(fx.Int32(0), bits)  # -0 as +0
+        lid_b = lid + blk * VT
+        ok_b = ok if blk == 0 else (part == 0) & (lid_b < p.n)
+        kb = ok_b.select(order_key(bits), fx.Int32(0))
+        ib = ok_b.select(lid_b + first, fx.Int32(INT_MAX))
+        kk, ii = (kb, ib) if blk == 0 else ah._take(kk, ii, kb, ib)
     for off in (1, 2, 4, 8, 16, 32):
         kk, ii = ah._take(kk, ii, xshfl(kk, off), xshfl(ii, off))
     _wave_best_dyn(k, p, kk, ii, b)
