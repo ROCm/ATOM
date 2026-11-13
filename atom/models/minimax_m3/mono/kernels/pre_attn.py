@@ -1144,14 +1144,30 @@ def emit_k1(
             # one wait for every token's index-q head task, not rebuilt on every CTA
             q_frag_g, q_frag_head_g = q_frag_from(iq_out, heads, index_nvfp4, CM_DEV)
 
-            def wait_index_q():
-                mb_poll(
-                    [(hdone_mb, fx.min(lane, tokens - 1) * N_HEAD_TASKS + IQ_TASK, 1)],
-                    sleep=score_sleep,
-                )
-                fx.memory_fence(
-                    syncscope=rocdl.SyncScope.Agent, ordering=fx.AtomicOrdering.Acquire
-                )
+            def wait_index_q(tk=None):
+                """Index q of the request ending at row ``tk`` (nvfp4: the scorer reads it with
+                device-scope loads, ``CM_DEV``, so the flag alone orders them: no acquire fence);
+                ``tk`` None (an fp8 index cache): every row's, behind the fence."""
+                if const_expr(tk is None):
+                    mb_poll(
+                        [
+                            (
+                                hdone_mb,
+                                fx.min(lane, tokens - 1) * N_HEAD_TASKS + IQ_TASK,
+                                1,
+                            )
+                        ],
+                        sleep=score_sleep,
+                    )
+                    fx.memory_fence(
+                        syncscope=rocdl.SyncScope.Agent,
+                        ordering=fx.AtomicOrdering.Acquire,
+                    )
+                else:
+                    row = tk - (q_len - 1) + fx.min(lane, q_len - 1)
+                    mb_poll(
+                        [(hdone_mb, row * N_HEAD_TASKS + IQ_TASK, 1)], sleep=score_sleep
+                    )
 
             emit_index_scores(
                 (bid + (BLOCKS - score_base)) % BLOCKS, lane, uniform(wave), red, mb_put,

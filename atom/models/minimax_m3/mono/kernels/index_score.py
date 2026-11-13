@@ -71,6 +71,12 @@ INDEX_BLOCK_BYTES = SPARSE_BLOCK * HEAD_DIM  # one fp8 index-K block
 NVFP4_PAGE_BYTES = 9216
 NVFP4_SCALES_AT = SPARSE_BLOCK * HEAD_DIM // 2
 KEY_TILES = SPARSE_BLOCK // 16  # MFMA row tiles of a block
+# BIG nvfp4 scorer: 16-key tiles a wave keeps in flight (a queue carried across its blocks)
+SCORE_DEPTH = 4
+# a SIMD's two waves (w, w + WAVES / 2) share its issue slots; the older (the first dispatched) runs
+# ~4 % faster (``deepseek_v41``'s mono walk measured ~11 %), so it takes this share (percent) of the
+# pair's blocks
+OLDER_SHARE = 51
 _CURRENT_STREAM = fx.Stream(None)
 
 
@@ -140,6 +146,21 @@ def lut_lds():
     alloc = KernelFunction.get_current()._shared_allocator
     assert alloc is not None and alloc.is_static, "the kernel's SharedAllocator"
     return alloc.allocate(LutSmem).peek().tab.ptr
+
+
+@fx.struct
+class ScoreSmem:
+    stash: fx.Array[fx.Float32, WAVES * 64, 16]
+
+
+def score_lds():
+    """A wave's 64 floats of LDS (a CTA's WAVES * 64), where a wave of the BIG nvfp4 scorer holds its
+    blocks' scores until it stores them all at once (``emit_index_scores``: a global store among the
+    loads makes every later wait for a load a wait for all of them). Same allocator trick as
+    ``lut_lds``."""
+    alloc = KernelFunction.get_current()._shared_allocator
+    assert alloc is not None and alloc.is_static, "the kernel's SharedAllocator"
+    return alloc.allocate(ScoreSmem).peek().stash.ptr
 
 
 def e4m3_lut_row(scale_byte):
@@ -281,8 +302,11 @@ def emit_index_scores(
     gives every request's first task; a lane decodes its task by a 6-step binary search
     over the scan (``lane_gather``). Wave-per-task mode only (the task counts of
     these steps are not bounded by BLOCKS), one index head (no context parallelism), and
-    ``q_frag`` reads the index q the head tasks wrote, once ``wait_index_q`` says every
-    row's is there."""
+    ``q_frag`` reads the index q the head tasks wrote, once ``wait_index_q`` says it is there:
+    an fp8 index cache's tasks are strided over the waves behind one wait for every row's q;
+    an nvfp4 one's (``score_big``) are contiguous runs of the plan's bulk blocks, then its
+    tail blocks, one run a wave, ``wait_index_q(tk)`` (the request ending at row tk) a request
+    of the run."""
     assert local_blocks >= 1, "the block of the current token must be pinned"
     BIG = tokens > MAX_TOKENS
     assert not BIG or (
@@ -292,6 +316,7 @@ def emit_index_scores(
     g4 = lane // 16
     # nvfp4: the per-task-wave paths look K up in a CTA table (built before them)
     tab = lut_lds() if nvfp4 else None
+    stash = score_lds() if (BIG and nvfp4) else None
     tid = wave * 64 + lane
     r_ic = rsrc(index_cache, 0 if "idx" in strip else None)
     if const_expr(BIG):
@@ -307,9 +332,25 @@ def emit_index_scores(
         n_scored_k = last_k.select(
             scored_count(nb_k, init_blocks, local_blocks), fx.Int32(0)
         )
-        end_k = wave_incl_scan(n_scored_k, lane)  # request tasks: [end - n_scored, end)
-        start_k = end_k - n_scored_k
-        total = readlane(end_k, 63)
+        if const_expr(nvfp4):
+            # a request's TAIL blocks may hold keys this launch inserts (``new_keys_in``: within
+            # MAX_TOKENS keys of the end), so they wait for them and a row's causal cut can fall
+            # in them; every other (BULK) block is visible to all the request's columns whole
+            tail_k = fx.max(fx.max(seq_k - MAX_TOKENS, 0) // SPARSE_BLOCK, init_blocks)
+            n_tail_k = fx.max(init_blocks + n_scored_k - tail_k, 0)
+            n_bulk_k = n_scored_k - n_tail_k
+            end_k = wave_incl_scan(
+                n_bulk_k, lane
+            )  # bulk tasks: [end - n, end), then the tail's
+            start_k = end_k - n_bulk_k
+            tail_end_k = wave_incl_scan(n_tail_k, lane)
+            tail_start_k = tail_end_k - n_tail_k
+            total_bulk = readlane(end_k, 63)
+            total = total_bulk + readlane(tail_end_k, 63)
+        else:  # an fp8 cache: the one task list of the strided one below
+            end_k = wave_incl_scan(n_scored_k, lane)  # request tasks: [end - n, end)
+            start_k = end_k - n_scored_k
+            total = readlane(end_k, 63)
     else:
         rows = step_rows(seq_lens, tokens, q_len, heads)
         seq = rows.seq
@@ -347,14 +388,17 @@ def emit_index_scores(
             bo.buffer_load(r_bt, tk * bt_width + b, vec_width=1, dtype=T.i32)
         )
 
-    def task_block_big(u):
-        """Task u (per lane) -> (the request's last row, block b): the number of lanes whose
-        inclusive scan end is <= u is the row (a 6-step binary search)."""
+    def task_block_big(u, end, start, first=None):
+        """Task u (per lane) of the list whose per-row inclusive scan is ``end`` (``start``:
+        its exclusive scan, ``first``: each row's first block, else ``init_blocks``) -> (the
+        request's last row, block b): the number of lanes whose scan end is <= u is the row
+        (a 6-step binary search)."""
         tk = fx.Int32(0)
         for step in (32, 16, 8, 4, 2, 1):
-            e = lane_gather(end_k, tk + (step - 1))
+            e = lane_gather(end, tk + (step - 1))
             tk = tk + (e <= u).select(fx.Int32(step), fx.Int32(0))
-        return tk, init_blocks + u - lane_gather(start_k, tk)
+        b0 = init_blocks if first is None else lane_gather(first, tk)
+        return tk, b0 + u - lane_gather(start, tk)
 
     def new_keys_in(tk, b):
         """Block b of the request ending at token tk may hold keys this launch
@@ -544,6 +588,127 @@ def emit_index_scores(
                 i = fx.Int32(i)
                 score_cp(readlane(tk_j, i), readlane(b_j, i), readlane(pages, i))
 
+    def score_big():
+        """BIG, nvfp4: the plan's bulk blocks, then its tail blocks, cut into contiguous runs of the
+        one list, one a wave (aiter's scorer's structure: a wave's blocks are one request's
+        neighbours; a SIMD's two waves split their pair's run ``OLDER_SHARE`` : the rest). Bulk: a
+        request's blocks all-visible and with no new keys, so no mask and no wait; the wave's key
+        tiles stream through a queue of ``SCORE_DEPTH`` 16-key tiles in flight across the blocks
+        (a loop-carried state), the index q loaded once per request of the run, behind that
+        request's rows' own flags, the scores held in LDS and stored together after the run's
+        blocks (a store among the loads would make every wait for a tile a wait for all of them).
+        Tail: the exact per-task path (new keys, causal cut)."""
+        pairs = BLOCKS * (WAVES // 2)
+        gp = slot * (WAVES // 2) + wave % (WAVES // 2)
+        p0 = gp * total // pairs
+        p1 = (gp + 1) * total // pairs
+        mid = p0 + (p1 - p0) * OLDER_SHARE // 100
+        older = wave < WAVES // 2
+        t0 = older.select(p0, mid)
+        t1 = older.select(mid, p1)
+        fill_lut()
+        gpu.barrier()
+        stamp(7)
+        tiles = range(KEY_TILES)
+        zero4 = fx.Vector.filled(4, 0.0, fx.Float32)
+        words = 5  # a tile's key words: 16 B of e2m1 and the two scale bytes
+        mine = stash + wave * 64  # this wave's scores: slot (task * q_len + column)
+
+        def tile_words(page, i):
+            return [fx.Int32(w) for w in load_raw(page, [i])]
+
+        def q_of(tk):
+            """This lane's e4m3 B operand (8 dwords) of the request ending at row tk."""
+            col = tk - (q_len - 1) + fx.min(l16, q_len - 1)
+            return q_operand([q_frag(col, s) for s in range(HEAD_DIM // 32)], True)
+
+        # bulk: runs [t0, b_end) of the bulk list, a window of 64 // q_len blocks (<= 64 scores) at a
+        # time: its tasks decoded a lane each, walked, their scores stored at once
+        b_end = fx.min(t1, total_bulk)
+        n_win = 64 // q_len
+        for w in range((fx.max(b_end - t0, 0) + n_win - 1) // n_win):
+            c0 = t0 + fx.Int32(w) * n_win
+            u_j = fx.min(c0 + lane, b_end - 1)
+            tk_j, b_j = task_block_big(u_j, end_k, start_k)
+            pages = page_of(tk_j, b_j)
+            n_c = fx.min(b_end - c0, n_win)
+            stamp(9)
+            # the first block's first tiles go out before any wait: they do not need the index q
+            first = readlane(pages, 0)
+            init = []
+            for d in range_constexpr(SCORE_DEPTH):
+                init += tile_words(first, d)
+            init += [fx.Int32(0)] * 8 + [fx.Int32(-1)]
+            for i, st in range(0, n_c, 1, init=init):
+                i = fx.Int32(i)
+                tk = readlane(tk_j, i)
+                page_here = readlane(pages, i)
+                page_next = readlane(pages, fx.min(i + 1, n_c - 1))
+                queue = [
+                    [st[words * d + e] for e in range(words)]
+                    for d in range(SCORE_DEPTH)
+                ]
+                qb = fx.Vector.from_elements(
+                    [st[words * SCORE_DEPTH + e] for e in range(8)], fx.Int32
+                )
+                if tk != st[words * SCORE_DEPTH + 8]:  # a new request: its rows' q
+                    wait_index_q(tk)
+                    qb = q_of(tk)
+                v = fx.Float32(float("-inf"))
+                for t in range_constexpr(KEY_TILES):
+                    raw = queue.pop(0)
+                    ahead = t + SCORE_DEPTH
+                    queue.append(
+                        tile_words(page_here, ahead)
+                        if ahead < KEY_TILES
+                        else tile_words(page_next, ahead - KEY_TILES)
+                    )
+                    kw = split_tiles(raw, [t], tab)[0]
+                    c = mfma_scaled(
+                        kw, qb, zero4, fx.Int32(UNIT_SCALE), fx.Int32(UNIT_SCALE)
+                    )
+                    for e in range_constexpr(4):
+                        v = fx.max(v, c[e])
+                v = butterfly(v, (32, 16), fx.max)
+                if lane < q_len:  # column ``lane``'s score of task i
+                    fx.ptr_store(v, mine + (i * q_len + lane))
+                carried = yield [w for tile in queue for w in tile] + [
+                    qb[e] for e in range(8)
+                ] + [tk]  # fmt: skip
+            del carried
+            # the window's scores, a lane each: task lane // q_len, column lane % q_len
+            if lane < n_c * q_len:
+                ti = lane // q_len
+                col = lane_gather(tk_j, ti) - (q_len - 1) + (lane - ti * q_len)
+                mb_put(
+                    iscore,
+                    col * MAX_INDEX_BLOCKS + lane_gather(b_j, ti),
+                    fx.Float32(fx.ptr_load(mine + lane)) * scale,
+                )
+
+        # tail: [max(t0, total_bulk), t1)
+        t_lo = fx.max(t0, total_bulk)
+        seq_lane = seq_k
+        for c0 in range(t_lo, t1, 64):
+            c0 = fx.Int32(c0)
+            u_j = fx.min(c0 + lane, t1 - 1) - total_bulk
+            tk_j, b_j = task_block_big(u_j, tail_end_k, tail_start_k, tail_k)
+            pages = page_of(tk_j, b_j)
+            for i in range(fx.min(t1 - c0, 64)):
+                i = fx.Int32(i)
+                tk, b, page = readlane(tk_j, i), readlane(b_j, i), readlane(pages, i)
+                if const_expr(wait_new_keys is not None):  # noqa: SIM102
+                    if (b + 1) * SPARSE_BLOCK > readlane(seq_lane, tk) - MAX_TOKENS:
+                        wait_new_keys()
+                wait_index_q(tk)
+                raw = load_raw(page, tiles)
+                col = tk - (q_len - 1) + fx.min(l16, q_len - 1)
+                col_seq = lane_gather(seq_lane, col)
+                qb = q_operand([q_frag(col, s) for s in range(HEAD_DIM // 32)], True)
+                v = tiles_max(b, qb, col_seq, tiles, split_tiles(raw, tiles, tab))
+                put(b, col, v)
+        stamp(10)
+
     # Up to BLOCKS tasks: one a CTA, a key tile a wave, the columns' maxima met in
     # LDS; the keys go out before prepare() (only the task's request's rows), so
     # their latency hides under the index q's: the scores are on the step's
@@ -572,7 +737,10 @@ def emit_index_scores(
                         v = fx.max(v, fx.ptr_load(red + (w * 16 + l16)))
                     put(b, col, v)
                 gpu.barrier()
-    if total > (0 if BIG else BLOCKS):
+    if const_expr(BIG and nvfp4):
+        if total > 0:
+            score_big()
+    elif total > (0 if BIG else BLOCKS):
         if const_expr(nvfp4):
             fill_lut()
         if const_expr(prepare is not None):
@@ -584,7 +752,7 @@ def emit_index_scores(
             if (
                 slot + BLOCKS * wave < total
             ):  # (the waves without a task need no index q)
-                wait_index_q()
+                wait_index_q(None)
             stamp(8)
             seq_lane = seq_k
         else:
@@ -615,7 +783,7 @@ def emit_index_scores(
         for c0 in range(slot + BLOCKS * wave, total, step * 64):
             c0 = fx.Int32(c0)
             u_j = fx.min(c0 + step * lane, total - 1)
-            tk_j, b_j = task_block_big(u_j) if BIG else task_block(u_j)
+            tk_j, b_j = task_block_big(u_j, end_k, start_k) if BIG else task_block(u_j)
             pages = page_of(tk_j, b_j)
             if const_expr(BIG):
                 stamp(9)
