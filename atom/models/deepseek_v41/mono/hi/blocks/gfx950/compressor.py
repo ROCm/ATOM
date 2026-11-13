@@ -38,7 +38,8 @@ earlier position still needs: a verify step whose later rows are rejected leaves
 Outputs:
 
 - ``cache`` (ATOM's pool in place: the owner's main rows, ``device.gfx950.paged``): entry ``P // ratio`` := the
-  QAT'd (``qat``), rotated latent, for every emitting row of a live request (later launches read it);
+  QAT'd (``qat``), rotated latent, for every emitting row of a live request (later launches read it); ``kv8``: ATOM's
+  fp8 pool, the entry quantized to its MXFP8 row (``paged.KV8_ROW_BYTES``) as ATOM's writer does;
 - ``out`` (a tagged BF16 channel, 512): the same entry, row r (zeros on a row that does not emit): the in-launch
   hand-off for this layer's attention / indexer (plain stores are not visible to another XCD within a launch);
 - ``latent`` (optional tagged BF16 channel, 512): the normed latent before RoPE (what the indexer's ``wk``
@@ -126,6 +127,7 @@ class _Plan:
     qat: bool = (
         True  # the cache entry's FP4 QAT (False: the rotated bf16 latent, unquantized)
     )
+    kv8: bool = False  # the cache is ATOM's fp8 pool: the entry stored as its MXFP8 row (``paged.KV8_ROW_BYTES``)
 
     @property
     def rd(self) -> str:
@@ -302,6 +304,10 @@ def _publish_read(k, p: _Plan, b, first):
 
 def _pool(k, t, p: _Plan):
     """Row t; thread c = channel c."""
+    if p.kv8:  # (the cache entry's only store is here: none may write a bf16 entry into an MXFP8 row)
+        raise NotImplementedError(
+            f"Compressor {p.name}: kv8 (ATOM's fp8 pool, the entry quantized on store) is not emitted yet"
+        )
     c = k.tid
     b, j = t // p.spec, t % p.spec
     pos = uniform(ld_i32(k.args[p.pos], b)) + j
@@ -402,7 +408,8 @@ class Compressor(Block):
     def __init__(self, name: str, x: Channel, ratio: int, out: Channel, pos: str, rope: str, cache: str,
                  cache_len: int, latent: Channel | None = None, kv_state: str = "", score_state: str = "",
                  slots: int = 0, index_out: Channel | None = None, kslices: int = 4,
-                 tiles: int = 1, poll_batch: int = 0, eps: float = 1e-20, qat: bool = True):  # fmt: skip
+                 tiles: int = 1, poll_batch: int = 0, eps: float = 1e-20, qat: bool = True,
+                 kv8: bool = False):  # fmt: skip
         if ratio not in (1, 2):
             raise ValueError(
                 f"Compressor {name}: ratio 1 or 2 (DeepSeek-V4.1's), got {ratio}"
@@ -454,6 +461,8 @@ class Compressor(Block):
         # the cache entry's FP4 QAT (the official model's); False: the rotated bf16 latent as is (an engine's bf16
         # cache without the QAT, ATOM's). A numerics choice, not a schedule knob
         self.qat = qat
+        # the cache's rows: ATOM's fp8 pool (MXFP8, ``_Plan.kv8``) or its bf16 one; the deployment's
+        self.kv8 = kv8
 
     def plan(self, sc: Scenario) -> _Plan:
         spec = sc.spec
@@ -464,7 +473,7 @@ class Compressor(Block):
                      self.dots[0].part.name, self.dots[1].part.name if self.ratio == 2 else "", self.pos, self.rope,
                      self.aux, self.cache, self.cache_len, self.kv_state, self.score_state, self.out.name,
                      self.latent.name if self.latent else "", self.eps, self.poll_batch,
-                     self.index_out.name if self.index_out else "", flag, self.qat)  # fmt: skip
+                     self.index_out.name if self.index_out else "", flag, self.qat, kv8=self.kv8)  # fmt: skip
 
     def stages(self, sc: Scenario) -> list[Stage]:
         p = self.plan(sc)

@@ -3,10 +3,10 @@
 """Whether DeepSeek-V4.1's high-interactivity (hi) monokernels serve this deployment (``ATOM_DSV41_MONO_HI``).
 
 - "auto" (the default): on for exactly the deployment they are built for, gfx950 (MI355X, every CU) at TP4 without
-  DP attention, a bf16 KV cache with the FP4 index cache (either gfx950 layout, ``INDEX_LAYOUTS``), ATOM's 128-token
-  V4.1 pages, the DSpark draft with its 5 drafts, ATOM's Engram runtime on its UVA lookup with overlap staging, no KV
-  transfer, a context up to ``MAX_CTX`` (the programs' context bucket), DeepSeek-V4.1-Flash's geometry and FlyDSL
-  installed. Any other deployment keeps ATOM's own mono decode, unchanged, with one info line saying why.
+  DP attention, a bf16 or fp8 KV cache (``KV_DTYPES``) with the FP4 index cache (either gfx950 layout,
+  ``INDEX_LAYOUTS``), ATOM's 128-token V4.1 pages, the DSpark draft with its 5 drafts, ATOM's Engram runtime on its UVA
+  lookup with overlap staging, no KV transfer, a context up to ``MAX_CTX`` (the programs' context bucket),
+  DeepSeek-V4.1-Flash's geometry and FlyDSL installed. Any other deployment keeps ATOM's own mono decode, unchanged, with one info line saying why.
 - "1": the same, but a deployment they do not serve is an error (raised, naming why).
 - "0": never.
 
@@ -41,6 +41,9 @@ CUS = 256  # MI355X's CUs (one CTA a CU: a compute partition has fewer)
 # ATOM's FP4 index plane layouts the hi programs read and write in place (``Config.index_cache_layout`` on gfx950:
 # "mfma" with ``ATOM_V4_UNIFIED_MQA=opus``, the default, "preshuffle" with ``flydsl``; ``hi.device.gfx950.paged``)
 INDEX_LAYOUTS = ("preshuffle", "mfma")
+# ATOM's KV pool formats (``--kv_cache_dtype``) the hi programs read and write in place: bf16 rows, or MXFP8 rows
+# (512 E4M3 + 16 E8M0 group-32 scales, 528 B: dequantized on load, quantized on store, the math bf16 either way)
+KV_DTYPES = ("bf16", "fp8")
 ARCH = "gfx950"
 # DeepSeek-V4.1-Flash: the geometry the hi programs are composed for (``hi.v41.config.Geometry``, the verify head's
 # vocabulary, the draft's taps and stages, the Engram's n-grams and heads)
@@ -109,8 +112,8 @@ def refusal(atom_config, drafter, metadata_builder, dp_ranks: int) -> str:
     if cus is not None and cus != CUS:
         return f"{cus} CUs (the hi path serves a whole MI355X, {CUS})"
     kv = getattr(cfg, "kv_cache_dtype", None)
-    if kv != "bf16":
-        return f"--kv_cache_dtype {kv} (the hi path serves bf16)"
+    if kv not in KV_DTYPES:
+        return f"--kv_cache_dtype {kv} (the hi path serves {', '.join(KV_DTYPES)})"
     index = getattr(cfg, "index_cache_dtype", None)
     if index != "fp4":
         return f"--index-cache-dtype {index} (the hi path serves fp4)"

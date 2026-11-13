@@ -15,7 +15,12 @@ from dataclasses import dataclass
 
 from atom.models.deepseek_v41.mono import hi_plan
 from atom.models.deepseek_v41.mono.hi_bands import plan_widths
-from atom.models.deepseek_v41.mono.hi_gate import INDEX_LAYOUTS, MAX_CTX, REQ_ROWS
+from atom.models.deepseek_v41.mono.hi_gate import (
+    INDEX_LAYOUTS,
+    KV_DTYPES,
+    MAX_CTX,
+    REQ_ROWS,
+)
 from atom.mono.runtime.consensus import MonoUnsupported
 
 logger = logging.getLogger("atom")
@@ -78,10 +83,11 @@ class _DraftPlan:
 
 class HiPrograms:
     """The hi programs of one TP rank (module docstring): built from the model's config and attention topology,
-    the served widths, the context bucket and the TP size."""
+    the served widths, the context bucket and the TP size, for ATOM's FP4 index plane in ``index_layout`` and its KV
+    pool of ``kv_dtype`` (``hi_gate.KV_DTYPES``)."""
 
     def __init__(self, cfg, topology, widths, max_ctx: int, tp: int, group=None,
-                 index_layout: str = "preshuffle"):  # fmt: skip
+                 index_layout: str = "preshuffle", kv_dtype: str = "bf16"):  # fmt: skip
         from .hi.plan import program as mf_program
         from .hi.plan.program import Program, Scenario
         from .hi.runtime.kernel import MonoKernel
@@ -96,6 +102,14 @@ class HiPrograms:
                 f"V4.1 mono hi: FP4 index layout {index_layout!r}, the programs address {', '.join(INDEX_LAYOUTS)}"
             )
         self.index_layout = index_layout
+        # ATOM's KV pool's rows (``config.kv_cache_dtype``): bf16, or MXFP8 ("fp8"), which the programs that read or
+        # write it (the compressed layers, the DSpark context write and draft stages: their own builds, "_kv8")
+        # dequantize on load and quantize on store
+        if kv_dtype not in KV_DTYPES:
+            raise MonoUnsupported(
+                f"V4.1 mono hi: KV cache {kv_dtype!r}, the programs address {', '.join(KV_DTYPES)}"
+            )
+        self.kv_fp8 = kv_dtype == "fp8"
         # the TP group's CPU group: every build fallback below is taken by every rank or none (``_agree``); None: one
         # process (the CPU checks)
         self.group = group
@@ -215,9 +229,8 @@ class HiPrograms:
         self.D = D
         self.ctx_programs = {}
         for s in self.widths:
-            _, prog = D.context_program(
-                f"atom_v41_ctx_r{s}", Scenario(*self.split[s], self.tp), "shard", False
-            )
+            _, prog = D.context_program(f"atom_v41_ctx{self._kv8_tag}_r{s}", Scenario(*self.split[s], self.tp),
+                                        "shard", False, knobs=self._kv_knobs or None)  # fmt: skip
             self.ctx_programs[s] = MonoKernel(prog)
         W = int(getattr(cfg, "dspark_block_size", 5) or 5)
         if self.tp < 2:
@@ -296,6 +309,17 @@ class HiPrograms:
             return False
         return self.L.residual_layout(self.tp, rows=self.pwidth(s)) == "sharded"
 
+    @property
+    def _kv_knobs(self) -> dict:
+        """The knobs of a program that reads or writes ATOM's KV pool: ``KV_FMT`` "fp8" on the fp8 pool, none on
+        bf16 (the default's: the bf16 builds as they were)."""
+        return {"KV_FMT": "fp8"} if self.kv_fp8 else {}
+
+    @property
+    def _kv8_tag(self) -> str:
+        """Such a program's name suffix: "_kv8" on the fp8 pool."""
+        return "_kv8" if self.kv_fp8 else ""
+
     def _chain_peer(self) -> tuple[str, ...]:
         """The chain's cross-launch peer regions, pinned first in every program: the hi runtime's ``layer.CHAIN_PEER`` (the
         MoE partial and, from 6 rows, the owner's gathered sums ``moe.part.dag``)."""
@@ -346,7 +370,9 @@ class HiPrograms:
                 first=False, tp=self.tp, engram=p.engram, **ch
             )
         elif p.kind == "consumer":
-            # the consumer's ratio (its source's entries of the same step read from the bf16 ckv)
+            # the consumer's ratio (its source's entries of the same step read from the ckv: ATOM's pool's rows)
+            if self._kv_knobs:
+                ch["knobs"] = dict(self._kv_knobs)
             blocks = L.window_layer_blocks(
                 first=False, tp=self.tp, sparse=sparse, sparse_ratio=p.ratio, **ch
             )
@@ -354,6 +380,8 @@ class HiPrograms:
             # ratio 2: Source(state_slots=) -> rejection-safe Compressor state (module docstring)
             if self.index_layout != "preshuffle":
                 ch["knobs"] = {"INDEX_KLAYOUT": self.index_layout}
+            if self._kv_knobs:
+                ch["knobs"] = {**ch.get("knobs", {}), **self._kv_knobs}
             blocks = L.window_layer_blocks(first=False, tp=self.tp, source=self.sources[p.layer_id],
                                            engram=p.engram, **ch)  # fmt: skip
         stages = L.moe_route_early([st for b in blocks for st in b.stages(sc)])
@@ -364,7 +392,9 @@ class HiPrograms:
             + ("_tap" if full_r_a else "")
         )
         tag += "_band" if dyn else ""
-        tag += "_mfma" if "knobs" in ch else ""
+        kn = ch.get("knobs", {})
+        tag += "_mfma" if "INDEX_KLAYOUT" in kn else ""
+        tag += "_kv8" if "KV_FMT" in kn else ""
         dk = {"dyn_rows": True} if dyn else {}
         return MonoKernel(Program(f"atom_v41_{tag}_r{s}", sc, stages, sgpr_spill_ok=spill,
                                   peer_first=self._chain_peer() if self.chain else (), **dk))  # fmt: skip
@@ -421,8 +451,9 @@ class HiPrograms:
                 if tail:
                     D.STAGE_ROLES = {**roles, s: (roles[s][0], False, roles[s][2])}
                 try:
-                    return D.stage_program(f"atom_v41_draft{s}{'_tail' if tail else ''}_r{W}{f'_b{m}' if m > 1 else ''}",
-                                           s, Scenario(m, W, tp))[1]  # fmt: skip
+                    return D.stage_program(f"atom_v41_draft{s}{'_tail' if tail else ''}{self._kv8_tag}_r{W}"
+                                           f"{f'_b{m}' if m > 1 else ''}", s, Scenario(m, W, tp),
+                                           knobs=self._kv_knobs or None)[1]  # fmt: skip
                 finally:
                     D.STAGE_ROLES = roles
 
@@ -518,7 +549,7 @@ class HiPrograms:
         return _DraftPlan(n, stages + heads)
 
 
-def served(cfg, topology, tp: int, index_layout: str = "preshuffle") -> HiPrograms:
+def served(cfg, topology, tp: int, index_layout: str = "preshuffle", kv_dtype: str = "bf16") -> HiPrograms:  # fmt: skip
     """The programs the hook serves with: its widths (``ROWS``) and context bucket (``hi_gate.MAX_CTX``), on ATOM's
-    FP4 index plane in ``index_layout``."""
-    return HiPrograms(cfg, topology, list(ROWS), MAX_CTX, tp, index_layout=index_layout)
+    FP4 index plane in ``index_layout`` and its KV pool of ``kv_dtype``."""
+    return HiPrograms(cfg, topology, list(ROWS), MAX_CTX, tp, index_layout=index_layout, kv_dtype=kv_dtype)  # fmt: skip

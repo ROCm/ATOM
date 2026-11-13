@@ -251,10 +251,15 @@ class _SPlan:
     spec: int = (
         0  # B > 1 requests (``Scenario(B, spec)``): rows a request; 0: one request (the original build)
     )
+    kv8: bool = False  # the ring is in ATOM's fp8 pool: the row stored as its MXFP8 row (``paged.KV8_ROW_BYTES``)
 
 
 @traced
 def _ring_store(k, r, p: _SPlan):
+    if p.kv8:  # (the ring's only store is here: none may write a bf16 row into an MXFP8 one)
+        raise NotImplementedError(
+            f"RingStore {p.name}: kv8 (ATOM's fp8 pool, the row quantized on store) is not emitted yet"
+        )
     g0 = p.stage * GEO
     geo = k.args[p.geo]
     num_slots = uniform(ld_i32(geo, g0))
@@ -286,14 +291,14 @@ def _ring_store(k, r, p: _SPlan):
 class RingStore(Block):
     """Row r of ``kvn`` (a key, bf16 [KVD]) into an engine-owned window ring (module docstring: the address, the
     slot and the liveness), one task a row. Rows that are not the step's request's (padding, a dummy step) store
-    nothing; nothing else of the ring is written."""
+    nothing; nothing else of the ring is written. ``kv8``: the ring is in ATOM's fp8 pool (MXFP8 rows)."""
 
     def __init__(self, name: str, kvn: Channel, ring: str, geo: str, stage: int, pos: str = "pos",
-                 bids: str = "cx.bids", slots: str = "cx.slots", meta: str = ""):  # fmt: skip
+                 bids: str = "cx.bids", slots: str = "cx.slots", meta: str = "", kv8: bool = False):  # fmt: skip
         if kvn.fmt is not Fmt.BF16 or kvn.width != KVD or kvn.flagged:
             raise ValueError(f"RingStore {name}: a tagged BF16 channel of width {KVD}")
         self.p = _SPlan(name, kvn.name, ring, geo, stage, pos, bids if not meta else "", slots if not meta else "",
-                        meta)  # fmt: skip
+                        meta, kv8=kv8)  # fmt: skip
         self.name = name
 
     def stages(self, sc: Scenario) -> list[Stage]:
@@ -325,8 +330,9 @@ def channels(tp: int, cols: str = "shard"):
 
 
 # the Linears' K slices (None: the plan's choice). main_proj in 3 (240 tasks; the plan's 2: 160): 20.8 vs 22.1 µs a
-# launch, 4: 21.1; wkv in 2: 23.0 (TP4, 6 rows, CUDA-graph timing; bit-exact vs the reference in every variant)
-KNOBS = {"PROJ_KSPLIT": 3, "WKV_KSPLIT": None}
+# launch, 4: 21.1; wkv in 2: 23.0 (TP4, 6 rows, CUDA-graph timing; bit-exact vs the reference in every variant).
+# KV_FMT: ATOM's draft rings' rows (``schedules.DEFAULT``'s: the deployment's KV pool), "bf16" or "fp8" (MXFP8)
+KNOBS = {"PROJ_KSPLIT": 3, "WKV_KSPLIT": None, "KV_FMT": "bf16"}
 # by rows (``context_program``): main_proj in 6 K slices over 18 rows (3 leaves no task shape at 24 rows, 4 / 5 spill
 # SGPRs)
 KNOBS_ROWS = {r: {"PROJ_KSPLIT": 6} for r in range(19, 25)}
@@ -386,6 +392,7 @@ def context_blocks(
                 "cx.geo",
                 s,
                 meta="cx.meta" if meta else "",
+                kv8=kn["KV_FMT"] == "fp8",
             )
         )
     return blocks
@@ -484,6 +491,8 @@ def stage_blocks(
     from .recipe import window_layer_blocks
 
     first, push, prev = STAGE_ROLES[stage]
+    # ATOM's draft ring in its fp8 pool (``KV_FMT`` "fp8"): the block attention reads MXFP8 rows
+    kv8 = (knobs or {}).get("KV_FMT", "bf16") == "fp8"
     # (the draft's own chain keeps its residual replicated and its rs partials as pairs: the target's ``RESIDUAL`` /
     # ``RS_PACK`` are the target layers')
     knobs = {**(knobs or {}), "RESIDUAL": "replicated", "RS_PACK": "pair"}
@@ -497,7 +506,7 @@ def stage_blocks(
             b.name == "attn"
         ):  # (its output's inverse RoPE as the window attention's: ATTN_OUT_F32_ROPE)
             b = MLABlockAttn("attn", b.q, b.kvn, b.out, b.pos, b.rope, b.sink, "dr.ring", "dr.geo", "dr.slot",
-                             heads=b.heads, unrope_f32=b.unrope_f32)  # fmt: skip
+                             heads=b.heads, unrope_f32=b.unrope_f32, kv8=kv8)  # fmt: skip
         out.append(b)
     return out
 

@@ -36,7 +36,7 @@ Args a layer reads: ``h_in`` [rows, 4, 5120] bf16 (the streams R before seam A),
 previous FFN seam's gate; layer 0: the one-hot pre), ``pos`` [batch] int32, ``ring`` [batch, ring_slots, 512] bf16,
 ``rope`` / ``rope.sin`` (ATOM's bf16 RoPE caches), the weights (``layer_impl.pack``); compressed layers ``ckv`` (the
 compressed cache: the owner's rows in ATOM's pool, in place, with the request words and the page geometry,
-``paged.REQ``) and ``sel`` (consumers: the step rows' selection), sources their caches and states
+``paged.REQ``; bf16 rows, or MXFP8 ones with ``KV_FMT`` "fp8") and ``sel`` (consumers: the step rows' selection), sources their caches and states
 (``window_layer_blocks``). Written: ``r_f`` [rows, 4, 5120] bf16, ``gate_f`` [rows, 24] f32, ``ffn_out`` [rows, 5120]
 bf16, the ring, ATOM's caches (a live row's entries).
 
@@ -586,6 +586,10 @@ def window_layer_blocks(first: bool, split: bool = False, tp: int = 1, replay: b
     ring8 = (
         (6 if src is None else False) if k.SPARSE_RING8 == "auto" else k.SPARSE_RING8
     )
+    # ATOM's KV pool's rows (``KV_FMT``): the compressed layers read and the KV sources write MXFP8 rows with "fp8"
+    if k.KV_FMT not in ("bf16", "fp8"):
+        raise ValueError(f"KV_FMT 'bf16' or 'fp8', got {k.KV_FMT!r}")
+    kv8 = k.KV_FMT == "fp8"
     attn = (MLASparseAttn("attn", C.q, C.kvn, C.o, "ring", "pos", "rope", "attn.sink",
                           C.sel if src is not None and src.index else "sel", "ckv", sparse, heads=heads,
                           new=C.ckvn if src is not None and src.kv else None,
@@ -597,7 +601,7 @@ def window_layer_blocks(first: bool, split: bool = False, tp: int = 1, replay: b
                           wsplit=smerge and k.SPARSE_WSPLIT in (True, 1),
                           ckv4=ckv4, cache_ratio=src.ratio if src is not None else sparse_ratio, ring8=ring8,
                           lean=bool(k.SPARSE_LEAN), vtr=bool(k.SPARSE_VTR), kfirst=bool(k.SPARSE_KFIRST),
-                          unrope_f32=bool(k.ATTN_OUT_F32_ROPE))
+                          unrope_f32=bool(k.ATTN_OUT_F32_ROPE), kv8=kv8)
             if sparse else
             MLAWindowAttn("attn", C.q, C.kvn, C.o, "ring", "pos", "rope", "attn.sink", heads=heads,
                           ring_slots=rs, ring_first=bool(k.RING_FIRST), dsplit=k.ATTN_DSPLIT,
@@ -634,6 +638,7 @@ def window_layer_blocks(first: bool, split: bool = False, tp: int = 1, replay: b
                 kslices=k.COMP_KSLICES,
                 tiles=ctiles,
                 qat=bool(k.COMPRESS_QAT),
+                kv8=kv8,
             )
         ]
     if src is not None and src.index:

@@ -39,6 +39,9 @@ HC = 4
 MIX = HC * (HC + 2)
 WINDOW = 128
 HEAD_DIM = 512
+# a row of ATOM's fp8 pool (``--kv_cache_dtype fp8``): MXFP8, HEAD_DIM E4M3 values then their HEAD_DIM / 32 E8M0
+# group scales (``hi.device.gfx950.paged.KV8_ROW_BYTES``)
+KV8_ROW_BYTES = HEAD_DIM + HEAD_DIM // 32
 FP4_PAGE = 8  # ATOM's FP4 index plane: keys a unit (``FP4_INDEX_PAGE_ROWS``)
 IDX_DIM = 128
 

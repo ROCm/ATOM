@@ -137,6 +137,15 @@ def test_the_gate_reads_the_values_atom_settled_on(served):
     assert served.max_model_len <= hi_gate.MAX_CTX and not served.kv_transfer_config
 
 
+@pytest.mark.parametrize("kv", hi_gate.KV_DTYPES)
+def test_both_kv_formats_are_served(mi355x, kv):
+    """ATOM's bf16 pool, or its MXFP8 one (``--kv_cache_dtype fp8``: the programs dequantize on load and quantize on
+    store), from the served command line's ``Config``."""
+    cfg = _atom_config(SERVED_ARGS.replace("--kv_cache_dtype bf16", f"--kv_cache_dtype {kv}"))
+    assert cfg.kv_cache_dtype == kv
+    assert hi_gate.refusal(cfg, _drafter(), _builder(), 0) == ""
+
+
 @pytest.mark.parametrize("block", [1, 16, 64, 256])
 def test_any_block_size_flag_takes_atoms_v41_page(mi355x, block):
     """ATOM lays V4.1's KV out in 128-token pages whatever ``--block-size`` asks: served either way."""
@@ -150,7 +159,7 @@ UNSUPPORTED = {
     "TP2": ({"tensor_parallel_size": 2}, {}, "TP2"),
     "TP8": ({"tensor_parallel_size": 8}, {}, "TP8"),
     "DP attention": ({}, {"dp_ranks": 2}, "DP attention"),
-    "fp8 KV": ({"kv_cache_dtype": "fp8"}, {}, "kv_cache_dtype fp8"),
+    "fp4 KV": ({"kv_cache_dtype": "fp4"}, {}, "kv_cache_dtype fp4"),
     "fp8 index cache": ({"index_cache_dtype": "fp8"}, {}, "index-cache-dtype fp8"),
     "gfx1250's FP4 index layout": (
         {"index_cache_layout": "natural"},

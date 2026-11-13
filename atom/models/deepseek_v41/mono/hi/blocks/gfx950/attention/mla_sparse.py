@@ -39,7 +39,8 @@ MXFP8 copy.
 Args: ``pos``, ``ring``, ``rope`` (the layer's table: a compressed layer's YaRN one), ``sink`` as ``MLAWindowAttn``;
 ``sel`` int32 [batch x spec, 512] the step rows' compressed positions (raw: no window offset; -1 pads), ``ckv`` the
 compressed cache: the owner's main rows in ATOM's pool, read in place (``device.gfx950.paged``: a selected position's
-row through the request's block table; the request words and the page geometry, ``paged.REQ``, beside it). Both are
+row through the request's block table; the request words and the page geometry, ``paged.REQ``, beside it; ``kv8``:
+ATOM's fp8 pool, MXFP8 rows of ``paged.KV8_ROW_BYTES`` dequantized to bf16 as they land). Both are
 written by earlier launches (the KV / index source's): a consumer layer. Not yet: a source layer's own step entries
 and selection from its Compressor / Indexer channels.
 """
@@ -183,6 +184,8 @@ class _SPlan:
     kfirst: bool = False
     # the output's inverse RoPE quantized from f32 (``MLAWindowAttn(unrope_f32=)``): no bf16 rounding of the 64 dims
     unrope_f32: bool = False
+    # the compressed cache is ATOM's fp8 pool: MXFP8 rows (``paged.KV8_ROW_BYTES``) dequantized to bf16 on load
+    kv8: bool = False
 
     @property
     def tiles(
@@ -429,6 +432,10 @@ def _ckv_addr(k, p: _SPlan, b, idx, uni: bool = True):
     """The 64-bit address of request b's compressed entry ``idx`` (clamped into [0, cache_len): a pad's read lands on
     a valid row) in ATOM's pool, through its block table (``paged.row_addr``; ``uni``: a wave-uniform entry).
     """
+    if p.kv8:  # (every read of the cache comes here: none may take an MXFP8 row for bf16)
+        raise NotImplementedError(
+            f"MLASparseAttn {p.name}: kv8 (ATOM's fp8 pool, MXFP8 rows dequantized on load) is not emitted yet"
+        )
     e = fx.min(fx.max(idx, 0), fx.Int32(p.cache_len - 1))
     return paged.row_addr(k, p.ckv, b, e, p.cratio, uni)
 
@@ -1077,7 +1084,7 @@ class MLASparseAttn(Block):
                  new_early: bool = False, dsplit: int = 1, smerge: bool = False, mheads: int = TILE,
                  wsplit: bool = False, ckv4: bool | int = False, ring8: bool | int = False,
                  cache_ratio: int = 0, lean: bool = False, vtr: bool = False, kfirst: bool = False,
-                 unrope_f32: bool = False):  # fmt: skip
+                 unrope_f32: bool = False, kv8: bool = False):  # fmt: skip
         if heads < 1:
             raise ValueError(f"MLASparseAttn {name}: heads {heads}")
         if q.fmt is not Fmt.BF16 or q.width != heads * HD or q.flagged:
@@ -1171,6 +1178,8 @@ class MLASparseAttn(Block):
         self.kfirst = kfirst
         # the output's inverse RoPE quantized from f32 (``MLAWindowAttn(unrope_f32=)``): a numerics choice
         self.unrope_f32 = unrope_f32
+        # the compressed cache's rows: ATOM's fp8 pool (MXFP8, ``_SPlan.kv8``) or its bf16 one; the deployment's
+        self.kv8 = kv8
 
     @property
     def ring_parts(self) -> int:
@@ -1196,7 +1205,8 @@ class MLASparseAttn(Block):
                       self.new_early, self.dsplit,
                       self.smerge, self._mheads(sc), self.wsplit,
                       _from_rows(self.ckv4, sc), _from_rows(self.ring8, sc), max(self.cache_ratio, 1),
-                      lean=self.lean, vtr=self.vtr, kfirst=self.kfirst, unrope_f32=self.unrope_f32)  # fmt: skip
+                      lean=self.lean, vtr=self.vtr, kfirst=self.kfirst, unrope_f32=self.unrope_f32,
+                      kv8=self.kv8)  # fmt: skip
 
     def stages(self, sc: Scenario) -> list[Stage]:
         p = self.plan(sc)

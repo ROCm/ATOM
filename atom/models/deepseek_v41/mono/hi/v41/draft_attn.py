@@ -60,6 +60,7 @@ class _BPlan(mw._APlan):
     ring_arg: str = ""
     geo: str = ""
     slot: str = ""
+    kv8: bool = False  # the ring is in ATOM's fp8 pool: MXFP8 rows (``paged.KV8_ROW_BYTES``) dequantized on load
 
     @property
     def a_b(self):  # the block's key rows [spec][PITCH]
@@ -87,6 +88,10 @@ class _BPlan(mw._APlan):
 def _ring_issue(k, p: _BPlan, slot, pos_w):
     """``mla_window._ring_issue`` from the engine's ring: the window's keys ``pos_w - 127 .. pos_w`` at their rows
     (a position below 0 reads a clamped row, dropped by ``_key_land``)."""
+    if p.kv8:  # (the ring's only read is here: none may take an MXFP8 row for bf16)
+        raise NotImplementedError(
+            f"MLABlockAttn {p.name}: kv8 (ATOM's fp8 pool, MXFP8 rows dequantized on load) is not emitted yet"
+        )
     g = k.args[p.geo]
     slot_rows, ring_slots = uniform(ld_i32(g, 1)), uniform(ld_i32(g, 2))
     stride, run = uniform(ld_i32(g, 3)), uniform(ld_i32(g, 4))
@@ -250,7 +255,8 @@ class MLABlockAttn(Block):
     ``MLAWindowAttn``'s: 8 a rank at TP8)."""
 
     def __init__(self, name: str, q: Channel, kvn: Channel, out: Channel, pos: str, rope: str, sink: str, ring: str,
-                 geo: str, slot: str, heads: int = mw.HEADS, unrope_f32: bool = False):  # fmt: skip
+                 geo: str, slot: str, heads: int = mw.HEADS, unrope_f32: bool = False,
+                 kv8: bool = False):  # fmt: skip
         if heads < 1:
             raise ValueError(f"MLABlockAttn {name}: heads {heads}")
         if q.fmt is not Fmt.BF16 or q.width != heads * HD or q.flagged:
@@ -277,6 +283,8 @@ class MLABlockAttn(Block):
         # the output's inverse RoPE quantized from f32 (``MLAWindowAttn(unrope_f32=)``: ATOM's order, the draft's K2a
         # irq path); False: bf16-rounded first (the official order). A numerics choice, not a schedule knob
         self.unrope_f32 = unrope_f32
+        # the ring's rows: ATOM's fp8 pool (MXFP8, ``_BPlan.kv8``) or its bf16 one; the deployment's
+        self.kv8 = kv8
 
     def plan(self, sc: Scenario) -> _BPlan:
         if not 1 <= sc.spec <= BKEYS:
@@ -285,7 +293,8 @@ class MLABlockAttn(Block):
             )
         return _BPlan(self.name, sc.rows, sc.spec, self.q.name, self.kvn.name, self.ring, self.pos, self.rope,
                       self.sink, self.out.name, f"{self.name}.done", self.heads, WINDOW, False, 1,
-                      unrope_f32=self.unrope_f32, ring_arg=self.ring, geo=self.geo, slot=self.slot)  # fmt: skip
+                      unrope_f32=self.unrope_f32, ring_arg=self.ring, geo=self.geo, slot=self.slot,
+                      kv8=self.kv8)  # fmt: skip
 
     def stages(self, sc: Scenario) -> list[Stage]:
         p = self.plan(sc)

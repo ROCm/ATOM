@@ -121,6 +121,7 @@ from atom.models.deepseek_v41.mono.hi_draft import (
     _Arena,
     _buffers,
     _end_step,
+    _fp8_pool,
     _Streams,
 )
 from atom.models.deepseek_v41.mono.hi_gate import (  # noqa: F401 (REQ_ROWS re-exported)
@@ -168,7 +169,8 @@ class HiLayers(HiDraft, HiPrograms):
         # the programs (``hi_compose``: the plan, the widths, every program built)
         self._cpu_group = get_tp_group().cpu_group
         HiPrograms.__init__(self, cfg, model.topology, widths, max_ctx, self.tp, self._cpu_group,
-                            index_layout=atom_config.index_cache_layout)  # fmt: skip
+                            index_layout=atom_config.index_cache_layout,
+                            kv_dtype=atom_config.kv_cache_dtype)  # fmt: skip
         # lean host prep (``lean_host``) with every layer on the hi path; ``served_widths``: the widths a forward took this
         # hook's path at (a capture's included), the builder's lean-step test
         self.runs_every_layer = True
@@ -234,6 +236,10 @@ class HiLayers(HiDraft, HiPrograms):
         ):
             raise RuntimeError(
                 "V4.1 mono hi: the request words' layout differs between the bridge and the programs"
+            )
+        if paged.KV8_ROW_BYTES != ml.KV8_ROW_BYTES:
+            raise RuntimeError(
+                "V4.1 mono hi: the fp8 pool's row differs between the bridge and the programs"
             )
         self.req = z(ml.REQ_WORDS, dt=i32)
         self.req[ml.REQ_BID : ml.REQ_SLOT].fill_(-1)
@@ -667,7 +673,14 @@ class HiLayers(HiDraft, HiPrograms):
         if key == self._bound:
             return
         g = cache.geometry
-        if (
+        if self.kv_fp8:
+            # ATOM's fp8 pool: MXFP8 rows (``hi_bridge.KV8_ROW_BYTES``) as bytes, the programs' ``KV_FMT`` "fp8"
+            if not _fp8_pool(cache.pool, g.row_bytes):
+                raise RuntimeError(
+                    f"pool {tuple(cache.pool.shape)} {cache.pool.dtype}: not the fp8 [rows, "
+                    f"{ml.KV8_ROW_BYTES}] uint8 view"
+                )
+        elif (
             cache.pool.shape[-1] != HEAD_DIM
             or not cache.pool.is_contiguous()
             or g.row_bytes != 2 * HEAD_DIM
