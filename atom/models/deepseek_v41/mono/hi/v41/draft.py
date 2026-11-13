@@ -61,6 +61,7 @@ from ..blocks.gfx950.norm import (
 )
 from ..device.gfx950 import buffer_ops as bo
 from ..device.gfx950 import mailbox as mb
+from ..device.gfx950 import kv as kv_format
 from ..device.gfx950.ops import ld_i32, rsrc, traced, uniform
 from ..device.gfx950.peer import from_rank, to_rank
 from ..plan.program import Program, Region, Scenario, Stage
@@ -251,6 +252,7 @@ class _SPlan:
     spec: int = (
         0  # B > 1 requests (``Scenario(B, spec)``): rows a request; 0: one request (the original build)
     )
+    kv8: bool = False
 
 
 @traced
@@ -277,10 +279,15 @@ def _ring_store(k, r, p: _SPlan):
         live = (b0 >= 0) & (br == b0) & (slot >= 0) & (slot < num_slots)
     q = pos % ring_slots
     row = fx.max(slot, fx.Int32(0)) * slot_rows + (q // stride) * run + q % stride
-    if k.tid < KVD // 2:
-        w = mb.poll([(k.mb[p.kvn], (r * KVD) // 2 + k.tid, 1)], k.tag)[0][0]
+    if const_expr(p.kv8):
         if live:
-            bo.buffer_store(w, rsrc(k.args[p.ring]), row * (KVD // 2) + k.tid)
+            addr = fx.Int64(k.args[p.ring]) + fx.Int64(row) * kv_format.ROW_BYTES
+            kv_format.store_encoded(k, f"{p.kvn}.fp8", r, addr)
+    else:
+        if k.tid < KVD // 2:
+            w = mb.poll([(k.mb[p.kvn], (r * KVD) // 2 + k.tid, 1)], k.tag)[0][0]
+            if live:
+                bo.buffer_store(w, rsrc(k.args[p.ring]), row * (KVD // 2) + k.tid)
 
 
 class RingStore(Block):
@@ -289,11 +296,11 @@ class RingStore(Block):
     nothing; nothing else of the ring is written."""
 
     def __init__(self, name: str, kvn: Channel, ring: str, geo: str, stage: int, pos: str = "pos",
-                 bids: str = "cx.bids", slots: str = "cx.slots", meta: str = ""):  # fmt: skip
+                 bids: str = "cx.bids", slots: str = "cx.slots", meta: str = "", kv8: bool = False):  # fmt: skip
         if kvn.fmt is not Fmt.BF16 or kvn.width != KVD or kvn.flagged:
             raise ValueError(f"RingStore {name}: a tagged BF16 channel of width {KVD}")
         self.p = _SPlan(name, kvn.name, ring, geo, stage, pos, bids if not meta else "", slots if not meta else "",
-                        meta)  # fmt: skip
+                        meta, kv8=kv8)  # fmt: skip
         self.name = name
 
     def stages(self, sc: Scenario) -> list[Stage]:
@@ -342,6 +349,7 @@ def context_blocks(
     if cols not in ("shard", "rep"):
         raise ValueError(f"cols {cols!r}: 'shard' or 'rep'")
     kn = {**KNOBS, **(knobs or {})}
+    kv8 = bool(kn.get("KV_FP8", False))
     C = channels(tp, cols)
     shard = tp > 1 and cols == "shard"
     w8 = {"weight_format": "mxfp8"}
@@ -376,7 +384,9 @@ def context_blocks(
         blocks.append(NormQuant(f"cx_kvn{s}", C["kv"][s], C["kvq"][s], f"cx.kv_norm{s}.g", bf16_out=C["kvb"][s],
                                 spec=_nspec(KVD, 64, 4)))  # fmt: skip
     for s in range(STAGES):
-        blocks.append(KVPrep(f"cx_kvp{s}", C["kvb"][s], C["kvn"][s], "pos", "rope"))
+        blocks.append(
+            KVPrep(f"cx_kvp{s}", C["kvb"][s], C["kvn"][s], "pos", "rope", kv8=kv8)
+        )
     for s in range(STAGES):
         blocks.append(
             RingStore(
@@ -386,6 +396,7 @@ def context_blocks(
                 "cx.geo",
                 s,
                 meta="cx.meta" if meta else "",
+                kv8=kv8,
             )
         )
     return blocks
@@ -497,7 +508,7 @@ def stage_blocks(
             b.name == "attn"
         ):  # (its output's inverse RoPE as the window attention's: ATTN_OUT_F32_ROPE)
             b = MLABlockAttn("attn", b.q, b.kvn, b.out, b.pos, b.rope, b.sink, "dr.ring", "dr.geo", "dr.slot",
-                             heads=b.heads, unrope_f32=b.unrope_f32)  # fmt: skip
+                             heads=b.heads, unrope_f32=b.unrope_f32, kv8=b.kv8)  # fmt: skip
         out.append(b)
     return out
 

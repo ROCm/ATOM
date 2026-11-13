@@ -15,7 +15,12 @@ from dataclasses import dataclass
 
 from atom.models.deepseek_v41.mono import hi_plan
 from atom.models.deepseek_v41.mono.hi_bands import plan_widths
-from atom.models.deepseek_v41.mono.hi_gate import INDEX_LAYOUTS, MAX_CTX, REQ_ROWS
+from atom.models.deepseek_v41.mono.hi_gate import (
+    INDEX_LAYOUTS,
+    KV_DTYPES,
+    MAX_CTX,
+    REQ_ROWS,
+)
 from atom.mono.runtime.consensus import MonoUnsupported
 
 logger = logging.getLogger("atom")
@@ -37,6 +42,9 @@ MAX_BATCH = 4  # the most requests a static width serves
 # the step widths served (rows): B x 6 rows is B requests verifying 6 rows each (DSpark's 5 drafts and the anchor);
 # 1-4 requests on a width's own programs, 5-8 on the batch bands
 ROWS = tuple(REQ_ROWS * b for b in range(1, 9))
+# FP8 starts with the two dominant AgentX decode widths. Wider steps retain
+# K1/K2 and share the same ATOM pool; the bf16 deployment keeps every width.
+FP8_ROWS = (6, 12)
 # past MAX_BATCH requests, a width of B requests runs the smallest band of at least B (one ``Program.dyn_rows`` build
 # a band, launched with the step's live requests)
 BANDS = (6, 8)
@@ -81,7 +89,7 @@ class HiPrograms:
     the served widths, the context bucket and the TP size."""
 
     def __init__(self, cfg, topology, widths, max_ctx: int, tp: int, group=None,
-                 index_layout: str = "preshuffle"):  # fmt: skip
+                 index_layout: str = "preshuffle", kv_dtype: str = "bf16"):  # fmt: skip
         from .hi.plan import program as mf_program
         from .hi.plan.program import Program, Scenario
         from .hi.runtime.kernel import MonoKernel
@@ -96,6 +104,11 @@ class HiPrograms:
                 f"V4.1 mono hi: FP4 index layout {index_layout!r}, the programs address {', '.join(INDEX_LAYOUTS)}"
             )
         self.index_layout = index_layout
+        if kv_dtype not in KV_DTYPES:
+            raise MonoUnsupported(f"V4.1 mono hi: unsupported KV dtype {kv_dtype!r}")
+        self.kv_dtype = kv_dtype
+        self.kv_knobs = {"KV_FP8": True} if kv_dtype == "fp8" else {}
+        self.kv_tag = "_kv8" if kv_dtype == "fp8" else ""
         # the TP group's CPU group: every build fallback below is taken by every rank or none (``_agree``); None: one
         # process (the CPU checks)
         self.group = group
@@ -216,7 +229,11 @@ class HiPrograms:
         self.ctx_programs = {}
         for s in self.widths:
             _, prog = D.context_program(
-                f"atom_v41_ctx_r{s}", Scenario(*self.split[s], self.tp), "shard", False
+                f"atom_v41_ctx_r{s}{self.kv_tag}",
+                Scenario(*self.split[s], self.tp),
+                "shard",
+                False,
+                **({"knobs": self.kv_knobs} if self.kv_knobs else {}),
             )
             self.ctx_programs[s] = MonoKernel(prog)
         W = int(getattr(cfg, "dspark_block_size", 5) or 5)
@@ -321,6 +338,8 @@ class HiPrograms:
         L, sc = self.L, Scenario(nb, rq, self.tp)
         # the row-count-dependent choices (the 6-row MoE / seam exchanges)
         ch = {"push_moe": push, "prev_moe": prev, "rows": s}
+        if self.kv_knobs:
+            ch["knobs"] = dict(self.kv_knobs)
         # a DSpark aux tap's R_A whole under a sharded residual (``full_r_a``)
         if full_r_a:
             ch["full_r_a"] = True
@@ -339,7 +358,8 @@ class HiPrograms:
         )
         if p.kind == "window0":
             blocks = L.window_layer_blocks(first=True, tp=self.tp, push_moe=push, rows=s,
-                                           **({"full_r_a": True} if full_r_a else {}))  # fmt: skip
+                                           **({"full_r_a": True} if full_r_a else {}),
+                                           **({"knobs": self.kv_knobs} if self.kv_knobs else {}))  # fmt: skip
         # a non-first window layer: V4.1's layer 1, with its Engram
         elif p.kind == "window":
             blocks = L.window_layer_blocks(
@@ -353,7 +373,7 @@ class HiPrograms:
         else:
             # ratio 2: Source(state_slots=) -> rejection-safe Compressor state (module docstring)
             if self.index_layout != "preshuffle":
-                ch["knobs"] = {"INDEX_KLAYOUT": self.index_layout}
+                ch.setdefault("knobs", {})["INDEX_KLAYOUT"] = self.index_layout
             blocks = L.window_layer_blocks(first=False, tp=self.tp, source=self.sources[p.layer_id],
                                            engram=p.engram, **ch)  # fmt: skip
         stages = L.moe_route_early([st for b in blocks for st in b.stages(sc)])
@@ -364,7 +384,8 @@ class HiPrograms:
             + ("_tap" if full_r_a else "")
         )
         tag += "_band" if dyn else ""
-        tag += "_mfma" if "knobs" in ch else ""
+        tag += "_mfma" if "INDEX_KLAYOUT" in ch.get("knobs", {}) else ""
+        tag += self.kv_tag
         dk = {"dyn_rows": True} if dyn else {}
         return MonoKernel(Program(f"atom_v41_{tag}_r{s}", sc, stages, sgpr_spill_ok=spill,
                                   peer_first=self._chain_peer() if self.chain else (), **dk))  # fmt: skip
@@ -421,8 +442,9 @@ class HiPrograms:
                 if tail:
                     D.STAGE_ROLES = {**roles, s: (roles[s][0], False, roles[s][2])}
                 try:
-                    return D.stage_program(f"atom_v41_draft{s}{'_tail' if tail else ''}_r{W}{f'_b{m}' if m > 1 else ''}",
-                                           s, Scenario(m, W, tp))[1]  # fmt: skip
+                    return D.stage_program(f"atom_v41_draft{s}{'_tail' if tail else ''}_r{W}{f'_b{m}' if m > 1 else ''}{self.kv_tag}",
+                                           s, Scenario(m, W, tp),
+                                           **({"knobs": self.kv_knobs} if self.kv_knobs else {}))[1]  # fmt: skip
                 finally:
                     D.STAGE_ROLES = roles
 
@@ -518,7 +540,18 @@ class HiPrograms:
         return _DraftPlan(n, stages + heads)
 
 
-def served(cfg, topology, tp: int, index_layout: str = "preshuffle") -> HiPrograms:
+def served(
+    cfg, topology, tp: int, index_layout: str = "preshuffle", kv_dtype: str = "bf16"
+) -> HiPrograms:
     """The programs the hook serves with: its widths (``ROWS``) and context bucket (``hi_gate.MAX_CTX``), on ATOM's
     FP4 index plane in ``index_layout``."""
-    return HiPrograms(cfg, topology, list(ROWS), MAX_CTX, tp, index_layout=index_layout)
+    widths = FP8_ROWS if kv_dtype == "fp8" else ROWS
+    return HiPrograms(
+        cfg,
+        topology,
+        list(widths),
+        MAX_CTX,
+        tp,
+        index_layout=index_layout,
+        kv_dtype=kv_dtype,
+    )

@@ -37,6 +37,7 @@ from flydsl.expr.typing import T
 from ..blocks.base import Block, Channel, Fmt
 from ..blocks.gfx950.attention import mla_window as mw
 from ..device.gfx950 import buffer_ops as bo
+from ..device.gfx950 import kv
 from ..device.gfx950 import mailbox as mb
 from ..device.gfx950.ops import (
     bf2_f32,
@@ -96,13 +97,17 @@ def _ring_issue(k, p: _BPlan, slot, pos_w):
         kp = pos_w - (WINDOW - 1) + k.wave * (WINDOW // WAVES) + i
         q = ((kp % ring_slots) + ring_slots) % ring_slots
         row = slot * slot_rows + (q // stride) * run + q % stride
-        out.append(
-            fx.Vector(
-                bo.buffer_load(
-                    r_ring, row * (HD // 2) + k.lane * 4, vec_width=4, dtype=T.i32
+        if p.kv8:
+            addr = fx.Int64(k.args[p.ring_arg]) + fx.Int64(row) * kv.ROW_BYTES
+            out.append(kv.load8(addr, k.lane * 8))
+        else:
+            out.append(
+                fx.Vector(
+                    bo.buffer_load(
+                        r_ring, row * (HD // 2) + k.lane * 4, vec_width=4, dtype=T.i32
+                    )
                 )
             )
-        )
     return out
 
 
@@ -250,7 +255,8 @@ class MLABlockAttn(Block):
     ``MLAWindowAttn``'s: 8 a rank at TP8)."""
 
     def __init__(self, name: str, q: Channel, kvn: Channel, out: Channel, pos: str, rope: str, sink: str, ring: str,
-                 geo: str, slot: str, heads: int = mw.HEADS, unrope_f32: bool = False):  # fmt: skip
+                 geo: str, slot: str, heads: int = mw.HEADS, unrope_f32: bool = False,
+                 kv8: bool = False):  # fmt: skip
         if heads < 1:
             raise ValueError(f"MLABlockAttn {name}: heads {heads}")
         if q.fmt is not Fmt.BF16 or q.width != heads * HD or q.flagged:
@@ -277,6 +283,7 @@ class MLABlockAttn(Block):
         # the output's inverse RoPE quantized from f32 (``MLAWindowAttn(unrope_f32=)``: ATOM's order, the draft's K2a
         # irq path); False: bf16-rounded first (the official order). A numerics choice, not a schedule knob
         self.unrope_f32 = unrope_f32
+        self.kv8 = kv8
 
     def plan(self, sc: Scenario) -> _BPlan:
         if not 1 <= sc.spec <= BKEYS:
@@ -285,7 +292,7 @@ class MLABlockAttn(Block):
             )
         return _BPlan(self.name, sc.rows, sc.spec, self.q.name, self.kvn.name, self.ring, self.pos, self.rope,
                       self.sink, self.out.name, f"{self.name}.done", self.heads, WINDOW, False, 1,
-                      unrope_f32=self.unrope_f32, ring_arg=self.ring, geo=self.geo, slot=self.slot)  # fmt: skip
+                      unrope_f32=self.unrope_f32, kv8=self.kv8, ring_arg=self.ring, geo=self.geo, slot=self.slot)  # fmt: skip
 
     def stages(self, sc: Scenario) -> list[Stage]:
         p = self.plan(sc)

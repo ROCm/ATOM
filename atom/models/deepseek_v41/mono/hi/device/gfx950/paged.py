@@ -73,9 +73,11 @@ def main_row(k, b, e, ratio: int, uni: bool = True):
     return fx.Int64(page) * fx.Int64(page_rows) + fx.Int64(e % rpp(ratio))
 
 
-def row_addr(k, base_arg: str, b, e, ratio: int, uni: bool = True):
+def row_addr(
+    k, base_arg: str, b, e, ratio: int, uni: bool = True, row_bytes: int = ROW_BYTES
+):
     """Entry ``e``'s main row address (64-bit) in the owner's rows at ``k.args[base_arg]``."""
-    return fx.Int64(k.args[base_arg]) + main_row(k, b, e, ratio, uni) * ROW_BYTES
+    return fx.Int64(k.args[base_arg]) + main_row(k, b, e, ratio, uni) * row_bytes
 
 
 def key_unit(k, b, e, ratio: int, uni: bool = True):

@@ -150,7 +150,7 @@ UNSUPPORTED = {
     "TP2": ({"tensor_parallel_size": 2}, {}, "TP2"),
     "TP8": ({"tensor_parallel_size": 8}, {}, "TP8"),
     "DP attention": ({}, {"dp_ranks": 2}, "DP attention"),
-    "fp8 KV": ({"kv_cache_dtype": "fp8"}, {}, "kv_cache_dtype fp8"),
+    "fp4 KV": ({"kv_cache_dtype": "fp4"}, {}, "kv_cache_dtype fp4"),
     "fp8 index cache": ({"index_cache_dtype": "fp8"}, {}, "index-cache-dtype fp8"),
     "gfx1250's FP4 index layout": (
         {"index_cache_layout": "natural"},
@@ -237,10 +237,11 @@ def test_auto_without_flydsl(mi355x, served, monkeypatch):
 
 
 @pytest.mark.parametrize("layout", hi_gate.INDEX_LAYOUTS)
-def test_both_gfx950_fp4_index_layouts_are_served(mi355x, served, layout):
+@pytest.mark.parametrize("kv_dtype", hi_gate.KV_DTYPES)
+def test_both_gfx950_fp4_index_layouts_are_served(mi355x, served, layout, kv_dtype):
     """ATOM's FP4 index plane in either gfx950 layout (``ATOM_V4_UNIFIED_MQA``: opus -> mfma, flydsl ->
     preshuffle): the hi programs address both."""
-    cfg = _config(served, index_cache_layout=layout)
+    cfg = _config(served, index_cache_layout=layout, kv_cache_dtype=kv_dtype)
     assert hi_gate.refusal(cfg, _drafter(), _builder(), 0) == ""
 
 

@@ -168,7 +168,7 @@ class HiLayers(HiDraft, HiPrograms):
         # the programs (``hi_compose``: the plan, the widths, every program built)
         self._cpu_group = get_tp_group().cpu_group
         HiPrograms.__init__(self, cfg, model.topology, widths, max_ctx, self.tp, self._cpu_group,
-                            index_layout=atom_config.index_cache_layout)  # fmt: skip
+                            index_layout=atom_config.index_cache_layout, kv_dtype=atom_config.kv_cache_dtype)  # fmt: skip
         # lean host prep (``lean_host``) with every layer on the hi path; ``served_widths``: the widths a forward took this
         # hook's path at (a capture's included), the builder's lean-step test
         self.runs_every_layer = True
@@ -203,6 +203,17 @@ class HiLayers(HiDraft, HiPrograms):
         self.bounds = z(3, self.RB, dt=i32)  # (p + 1) // 2, p + 1, ceil((p + 1) / 8)
         # [layer, request slot, ring slot, 512]
         self.rings = z(len(self.mf), self.bmax, WINDOW, HEAD_DIM)
+        self.rings_fp8 = (
+            z(
+                len(self.mf),
+                self.bmax,
+                WINDOW,
+                HEAD_DIM + HEAD_DIM // 32,
+                dt=torch.uint8,
+            )
+            if self.kv_dtype == "fp8"
+            else None
+        )
         self.ring_layers = torch.tensor(self.mf, dtype=i32, device=dev)
         self.ring_of = {i: m for m, i in enumerate(self.mf)}
         # the block draft's first position clamp (``_draft_begin_kernel``)
@@ -361,6 +372,8 @@ class HiLayers(HiDraft, HiPrograms):
         out = self.sets[i % 2]
         io = {"pos": self.pos, "ring": self.rings[self.ring_of[i]], "r_f": out.r_f, "gate_f": out.gate_f,
               "ffn_out": out.ffn_out, **(self.rope_w if p.ratio == 0 else self.rope_c)}  # fmt: skip
+        if self.rings_fp8 is not None:
+            io["ring.fp8"] = self.rings_fp8[self.ring_of[i]]
         if i == 0:
             io.update(h_in=self.h_in0, gin=self.gin0)
         else:  # the previous hi layer's outputs, in place (the ping-pong pair)
@@ -667,13 +680,18 @@ class HiLayers(HiDraft, HiPrograms):
         if key == self._bound:
             return
         g = cache.geometry
+        kv8 = self.kv_dtype == "fp8"
+        width = HEAD_DIM + HEAD_DIM // 32 if kv8 else HEAD_DIM
+        dtype = torch.uint8 if kv8 else torch.bfloat16
         if (
-            cache.pool.shape[-1] != HEAD_DIM
+            cache.pool.dim() != 2
+            or cache.pool.shape[-1] != width
+            or cache.pool.dtype != dtype
             or not cache.pool.is_contiguous()
-            or g.row_bytes != 2 * HEAD_DIM
+            or g.row_bytes != (width if kv8 else 2 * width)
         ):
             raise RuntimeError(
-                f"pool {tuple(cache.pool.shape)}: not the bf16 [rows, 512] view"
+                f"pool {tuple(cache.pool.shape)} {cache.pool.dtype}: not the {self.kv_dtype} [rows, {width}] view"
             )
         if bt.dtype != torch.int32 or bt.stride(-1) != 1:
             raise RuntimeError(
@@ -769,6 +787,7 @@ class HiLayers(HiDraft, HiPrograms):
             self.step, self.req, *eflat, self.imp, NMF=len(self.mf), WIN=WINDOW, DIM=HEAD_DIM,
             RB=self.RB, HIDDEN=hidden.shape[-1], BLOCK=1024, NHC=HC, **ke, INCR=1, RP=rp, NB=nb, BM=self.bmax,
             RQP=triton.next_power_of_2(rows // nb),
+            KV_FP8=self.kv_dtype == "fp8",
         )  # fmt: skip
         if rows in self.band_of:
             self._band_step(rows)
@@ -926,6 +945,8 @@ class HiLayers(HiDraft, HiPrograms):
             *self._geo(cache), rows, *tp, last.gate_f, self.pre, self.post, self.comb, self.imp, NMF=len(self.mf),
             WIN=WINDOW, DIM=HEAD_DIM, HIDDEN=hidden, BLOCK=1024, NHC=HC, NMIX=MIX, **ke, NTAPS=len(taps),
             PLANAR=self.planar_at_end, TRACK=1, NB=self.split[rows][0], BM=self.bmax,
+            KV_FP8=self.kv_dtype == "fp8",
+            packed_rings=self.rings_fp8,
         )  # fmt: skip
 
 
@@ -1055,7 +1076,9 @@ def install(model, atom_config, engram_mapping, draft) -> HiLayers | None:
     ATOM's Engram hash mapping (its runtime's), the source of the table lookup's hash constants (``engram_consts``);
     ``draft``: ATOM's DSpark draft model (loaded: the draft's weights are packed from its tensors). Collective (the
     peer groups): every rank calls it at the same point."""
-    widths = list(ROWS)
+    from .hi_compose import FP8_ROWS
+
+    widths = list(FP8_ROWS if atom_config.kv_cache_dtype == "fp8" else ROWS)
     max_ctx = MAX_CTX
     for p in hi_plan.plan_layers(
         model.topology, model.config.engram_layer_ids, engram_on=True

@@ -142,14 +142,16 @@ class HiDraft:
         if self.cx_layers is None:
             raise RuntimeError("V4.1 mono hi draft: no DSpark draft bound (bind_draft)")
         pool = cache.pool
+        kv8 = self.kv_dtype == "fp8"
+        width = HEAD_DIM + HEAD_DIM // 32 if kv8 else HEAD_DIM
         if (
             pool.dim() != 2
-            or pool.shape[-1] != HEAD_DIM
+            or pool.shape[-1] != width
             or not pool.is_contiguous()
-            or pool.dtype != torch.bfloat16
+            or pool.dtype != (torch.uint8 if kv8 else torch.bfloat16)
         ):
             raise RuntimeError(
-                f"pool {tuple(pool.shape)} {pool.dtype}: not the bf16 [rows, 512] view"
+                f"pool {tuple(pool.shape)} {pool.dtype}: not the {self.kv_dtype} [rows, {width}] view"
             )
         geo, rings = [], []
         for layer in self.cx_layers:

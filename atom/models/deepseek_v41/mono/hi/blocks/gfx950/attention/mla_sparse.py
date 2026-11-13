@@ -58,7 +58,7 @@ from flydsl.expr.typing import T
 
 from ....device.gfx950 import buffer_ops as bo
 from ....device.gfx950 import channels as chan
-from ....device.gfx950 import gemv, paged
+from ....device.gfx950 import gemv, kv, paged
 from ....device.gfx950 import mailbox as mb
 from ....device.gfx950.ops import (
     CM_DEV,
@@ -183,6 +183,7 @@ class _SPlan:
     kfirst: bool = False
     # the output's inverse RoPE quantized from f32 (``MLAWindowAttn(unrope_f32=)``): no bf16 rounding of the 64 dims
     unrope_f32: bool = False
+    kv8: bool = False
 
     @property
     def tiles(
@@ -203,7 +204,7 @@ class _SPlan:
     ) -> _APlan:  # the window part's plan (MLAWindowAttn's LDS layout and names)
         return _APlan(self.name, self.rows, self.spec, self.q, self.kvn, self.ring, self.pos, self.rope, self.sink,
                       self.out, f"{self.name}.done", self.heads, ring_slots=self.ring_slots,
-                      ring_first=self.ring_first, dsplit=self.dsplit, unrope_f32=self.unrope_f32)  # fmt: skip
+                      ring_first=self.ring_first, dsplit=self.dsplit, unrope_f32=self.unrope_f32, kv8=self.kv8)  # fmt: skip
 
     # chunk task LDS (words): q tile at 0, the chunk's keys, S, P, the keys' valid flags
     @property
@@ -430,7 +431,9 @@ def _ckv_addr(k, p: _SPlan, b, idx, uni: bool = True):
     a valid row) in ATOM's pool, through its block table (``paged.row_addr``; ``uni``: a wave-uniform entry).
     """
     e = fx.min(fx.max(idx, 0), fx.Int32(p.cache_len - 1))
-    return paged.row_addr(k, p.ckv, b, e, p.cratio, uni)
+    return paged.row_addr(
+        k, p.ckv, b, e, p.cratio, uni, kv.ROW_BYTES if p.kv8 else paged.ROW_BYTES
+    )
 
 
 def _gather_issue(k, p: _SPlan, b, r, c):
@@ -448,13 +451,19 @@ def _gather_issue(k, p: _SPlan, b, r, c):
         oks.append(idx >= 0)
         idxs.append(idx)
         # (the row's page from the block table: a scalar load, then the 1 KiB row from its own base)
-        vs.append(
-            fx.Vector(
-                bo.buffer_load(
-                    rsrc(_ckv_addr(k, p, b, idx)), k.lane * 4, vec_width=4, dtype=T.i32
+        if p.kv8:
+            vs.append(kv.load8(_ckv_addr(k, p, b, idx), k.lane * 8))
+        else:
+            vs.append(
+                fx.Vector(
+                    bo.buffer_load(
+                        rsrc(_ckv_addr(k, p, b, idx)),
+                        k.lane * 4,
+                        vec_width=4,
+                        dtype=T.i32,
+                    )
                 )
             )
-        )
     return oks, idxs, vs
 
 
@@ -969,8 +978,15 @@ def _smerge(k, t, p: _SPlan):
         oks.append(idx >= 0)
         idxs.append(idx)
         # (a lane's own key: its page by a vector table load, the 16 B by a 64-bit global load)
-        off = fx.Int64((s * (SLICE // 2) + piece * 4) * 4)
-        cv.append(fx.Vector(global_load(_ckv_addr(k, p, b, idx, uni=False) + off, 4)))
+        if p.kv8:
+            cv.append(
+                kv.load8(_ckv_addr(k, p, b, idx, uni=False), s * SLICE + piece * 8)
+            )
+        else:
+            off = fx.Int64((s * (SLICE // 2) + piece * 4) * 4)
+            cv.append(
+                fx.Vector(global_load(_ckv_addr(k, p, b, idx, uni=False) + off, 4))
+            )
     for i in range(0 if p.ring8 else WINDOW // CH):
         kp = pos - (WINDOW - 1) + i * CH + kq
         ok = (kp >= 0) & (kp < base)
@@ -1077,7 +1093,7 @@ class MLASparseAttn(Block):
                  new_early: bool = False, dsplit: int = 1, smerge: bool = False, mheads: int = TILE,
                  wsplit: bool = False, ckv4: bool | int = False, ring8: bool | int = False,
                  cache_ratio: int = 0, lean: bool = False, vtr: bool = False, kfirst: bool = False,
-                 unrope_f32: bool = False):  # fmt: skip
+                 unrope_f32: bool = False, kv8: bool = False):  # fmt: skip
         if heads < 1:
             raise ValueError(f"MLASparseAttn {name}: heads {heads}")
         if q.fmt is not Fmt.BF16 or q.width != heads * HD or q.flagged:
@@ -1171,6 +1187,7 @@ class MLASparseAttn(Block):
         self.kfirst = kfirst
         # the output's inverse RoPE quantized from f32 (``MLAWindowAttn(unrope_f32=)``): a numerics choice
         self.unrope_f32 = unrope_f32
+        self.kv8 = kv8
 
     @property
     def ring_parts(self) -> int:
@@ -1196,7 +1213,7 @@ class MLASparseAttn(Block):
                       self.new_early, self.dsplit,
                       self.smerge, self._mheads(sc), self.wsplit,
                       _from_rows(self.ckv4, sc), _from_rows(self.ring8, sc), max(self.cache_ratio, 1),
-                      lean=self.lean, vtr=self.vtr, kfirst=self.kfirst, unrope_f32=self.unrope_f32)  # fmt: skip
+                      lean=self.lean, vtr=self.vtr, kfirst=self.kfirst, unrope_f32=self.unrope_f32, kv8=self.kv8)  # fmt: skip
 
     def stages(self, sc: Scenario) -> list[Stage]:
         p = self.plan(sc)

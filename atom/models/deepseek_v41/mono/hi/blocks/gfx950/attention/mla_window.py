@@ -40,7 +40,7 @@ from flydsl.expr.typing import T
 
 from ....device.gfx950 import buffer_ops as bo
 from ....device.gfx950 import channels as chan
-from ....device.gfx950 import gemv
+from ....device.gfx950 import gemv, kv
 from ....device.gfx950 import mailbox as mb
 from ....device.gfx950.ops import (
     bf2_f32,
@@ -110,11 +110,11 @@ def _qat_word(vals, code):
     return word, back
 
 
-def _group_code(vals):
+def _group_code(vals, kv8: bool = False):
     am = _ab(vals[0])
     for v in vals[1:]:
         am = fx.max(am, _ab(v))
-    return gemv.activation_code(am)
+    return kv.code(am) if kv8 else gemv.activation_code(am)
 
 
 def _rope_given(vals, cs):
@@ -151,6 +151,8 @@ class _KVPlan:
     kvn: str  # BF16 channel (512): out
     pos: str
     rope: str
+    kv8: bool = False
+    encoded: str = ""  # original MXFP8 bytes for the pool writer, beside the QAT output
 
 
 @traced
@@ -168,10 +170,15 @@ def _kvprep(k, r, p: _KVPlan):
         rot = vals  # (assigned before the dynamic if: its branches only rebind it)
         if g >= (HD - ROPE) // 32:
             rot = _rope_given(vals, cs)
-        code = _group_code(rot)
+        code = _group_code(rot, p.kv8)
         back = []
         for w in range_constexpr(8):
-            back += _qat_word(rot[4 * w : 4 * w + 4], code)[1]
+            packed, decoded = _qat_word(rot[4 * w : 4 * w + 4], code)
+            back += decoded
+            if const_expr(p.encoded):
+                chan.put_mxfp8_word(k.mb[f"{p.encoded}.q"], e0 // 4 + w, packed, k.tag)
+        if const_expr(p.encoded):
+            chan.put_mxfp8_scale(k.mb[f"{p.encoded}.s"], e0 // 32, code, k.tag)
         for j in range_constexpr(8):
             chan.put_bf16(
                 k.mb[p.kvn],
@@ -182,13 +189,23 @@ def _kvprep(k, r, p: _KVPlan):
 
 
 class KVPrep(Block):
-    def __init__(self, name: str, kv: Channel, kvn: Channel, pos: str, rope: str):
+    def __init__(
+        self,
+        name: str,
+        kv: Channel,
+        kvn: Channel,
+        pos: str,
+        rope: str,
+        kv8: bool = False,
+    ):
         for ch in (kv, kvn):
             if ch.fmt is not Fmt.BF16 or ch.width != HD or ch.flagged:
                 raise ValueError(
                     f"KVPrep {name}: kv / kvn are tagged BF16 channels of width {HD}"
                 )
         self.name, self.kv, self.kvn, self.pos, self.rope = name, kv, kvn, pos, rope
+        self.kv8 = kv8
+        self.encoded = Channel(f"{kvn.name}.fp8", HD, Fmt.MXFP8) if kv8 else None
 
     def stages(self, sc: Scenario) -> list[Stage]:
         p = _KVPlan(
@@ -199,8 +216,13 @@ class KVPrep(Block):
             self.kvn.name,
             self.pos,
             self.rope,
+            self.kv8,
+            self.encoded.name if self.encoded is not None else "",
         )
-        return [Stage(self.name, sc.rows, partial(_kvprep, p=p), writes=tuple(self.kvn.regions(sc.rows, (self.name,))),
+        writes = tuple(self.kvn.regions(sc.rows, (self.name,)))
+        if self.encoded is not None:
+            writes += tuple(self.encoded.regions(sc.rows, (self.name,)))
+        return [Stage(self.name, sc.rows, partial(_kvprep, p=p), writes=writes,
                       args=(self.pos, self.rope, rope_sin(self.rope)), key=(p,), row_tasks=1)]  # fmt: skip
 
 
@@ -235,6 +257,7 @@ class _APlan:
     unrope_f32: bool = (
         False  # the output's inverse RoPE quantized from f32 (no bf16 rounding of the 64 rotary dims)
     )
+    kv8: bool = False  # FP8 pool: QAT the rotated query as ATOM's FP8 attention does
 
     @property
     def tiles(self):
@@ -327,6 +350,10 @@ def _q_tile(k, p: _APlan, r, ht, pos):
                 is_rope.select(bf16_round(a), vals[2 * i]),
                 is_rope.select(bf16_round(b), vals[2 * i + 1]),
             ]
+        if p.kv8:
+            # Each lane holds four consecutive dims, eight adjacent lanes an MX group.
+            code = kv.code(gemv.group_amax(out, 8))
+            out = _qat_word(out, code)[1]
         for i in range(2):
             fx.ptr_store(
                 bf16_pair(out[2 * i], out[2 * i + 1]), k.ldsf + (hh * PITCH + dw + i)
@@ -662,7 +689,7 @@ class MLAWindowAttn(Block):
 
     def __init__(self, name: str, q: Channel, kvn: Channel, out: Channel, ring: str, pos: str, rope: str, sink: str,
                  heads: int = HEADS, ring_slots: int = WINDOW, ring_first: bool = False, dsplit: int = 1,
-                 unrope_f32: bool = False):  # fmt: skip
+                 unrope_f32: bool = False, kv8: bool = False):  # fmt: skip
         if heads < 1:
             raise ValueError(f"MLAWindowAttn {name}: heads {heads}")
         if dsplit not in (1, 2, 4):
@@ -690,12 +717,13 @@ class MLAWindowAttn(Block):
         # order); ``unrope_f32``: the f32 rotation quantized directly (an engine's arithmetic, ATOM's). A numerics
         # choice, not a schedule knob
         self.unrope_f32 = unrope_f32
+        self.kv8 = kv8
 
     def plan(self, sc: Scenario) -> _APlan:
         return _APlan(self.name, sc.rows, sc.spec, self.q.name, self.kvn.name, self.ring, self.pos, self.rope,
                       self.sink, self.out.name, f"{self.name}.done", self.heads,
                       self.ring_slots, self.ring_first,
-                      self.dsplit, unrope_f32=self.unrope_f32)  # fmt: skip
+                      self.dsplit, unrope_f32=self.unrope_f32, kv8=self.kv8)  # fmt: skip
 
     def stages(self, sc: Scenario) -> list[Stage]:
         p = self.plan(sc)
@@ -727,6 +755,7 @@ class _RPlan:
         ""  # another stage's ring-read flags (``MLASparseAttn(smerge=True)``'s merge), ``mper`` a row
     )
     mper: int = 0
+    kv8: bool = False
 
 
 @traced
@@ -749,6 +778,10 @@ def _ring_write(k, r, p: _RPlan):
             rsrc(k.args[p.ring]),
             ((b * p.ring_slots + pos % p.ring_slots) * HD) // 2 + k.tid,
         )
+    if const_expr(p.kv8):
+        row = b * p.ring_slots + pos % p.ring_slots
+        addr = fx.Int64(k.args[f"{p.ring}.fp8"]) + fx.Int64(row) * kv.ROW_BYTES
+        kv.store_encoded(k, f"{p.kvn}.fp8", r, addr)
 
 
 class RingWrite(Block):
@@ -759,13 +792,13 @@ class RingWrite(Block):
         a = self.attn
         md = a.ring_mdone(sc) if hasattr(a, "ring_mdone") else None
         p = _RPlan(self.name, sc.rows, sc.spec, a.kvn.name, a.ring, a.pos, f"{a.name}.done", a.heads, a.ring_slots,
-                   getattr(a, "ring_parts", getattr(a, "dsplit", 1)), *(md or ("", 0)))  # fmt: skip
+                   getattr(a, "ring_parts", getattr(a, "dsplit", 1)), *(md or ("", 0)), kv8=a.kv8)  # fmt: skip
         return [
             Stage(
                 self.name,
                 sc.rows,
                 partial(_ring_write, p=p),
-                args=(a.pos, a.ring),
+                args=(a.pos, a.ring) + ((f"{a.ring}.fp8",) if p.kv8 else ()),
                 key=(p,),
                 row_tasks=1,
             )

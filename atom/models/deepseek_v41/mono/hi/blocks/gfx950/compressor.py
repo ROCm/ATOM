@@ -62,6 +62,7 @@ from flydsl.expr.typing import T
 
 from ...device.gfx950 import buffer_ops as bo
 from ...device.gfx950 import channels as chan
+from ...device.gfx950 import kv as kv_format
 from ...device.gfx950 import mailbox as mb
 from ...device.gfx950 import paged
 from ...device.gfx950.ops import (
@@ -83,7 +84,7 @@ from ...device.gfx950.ops import (
 from ...plan.program import Region, Scenario, Stage
 from ...target import MI355X
 from ..base import Block, Channel, Fmt
-from .attention.mla_window import _rope_pair
+from .attention.mla_window import _qat_word, _rope_pair
 from .gathered import GatheredDot
 from .norm import dot2_bf16
 
@@ -126,6 +127,7 @@ class _Plan:
     qat: bool = (
         True  # the cache entry's FP4 QAT (False: the rotated bf16 latent, unquantized)
     )
+    kv8: bool = False
 
     @property
     def rd(self) -> str:
@@ -278,6 +280,12 @@ def _store_entry(addr, w, ok):
         paged.global_store(addr, w)
 
 
+@traced
+def _store_scale(addr, code, ok):
+    if ok:
+        paged.global_store(addr, code, 1)
+
+
 def _state_at(k, p: _Plan, b, slot):
     """Word index of channel 0 of request b's ring slot ``slot`` in ATOM's compress rings."""
     return paged.req_slot(k, b) * paged.ring_stride(k) + slot * HD
@@ -375,18 +383,35 @@ def _pool(k, t, p: _Plan):
         zero = fx.Float32(0.0)
         entry = emits.select(entry, zero)
         lat = emits.select(lat, zero)
+    if p.kv8:
+        # A thread holds one dim, 32 adjacent lanes an ATOM MX group.
+        amax = fx.max(entry, -entry)
+        for offset in (1, 2, 4, 8, 16):
+            amax = fx.max(amax, xshfl(amax, offset))
+        code = kv_format.code(amax)
+        word, back = _qat_word(
+            [entry, xshfl(entry, 1), xshfl(entry, 2), xshfl(xshfl(entry, 1), 2)], code
+        )
+        entry = bf16_round(back[0])
+        addr = paged.row_addr(
+            k, p.cache, b, pos // p.ratio, p.ratio, row_bytes=kv_format.ROW_BYTES
+        )
+        writing = live if emits is None else live & emits
+        _store_entry(addr + fx.Int64(c), word, writing & ((c & 3) == 0))
+        _store_scale(addr + HD + fx.Int64(c // 32), code, writing & ((c & 31) == 0))
     # outputs: a pair a even thread
     nxt = xshfl(entry, 1)
     even = (c & 1) == 0
     _put_pair(k, k.mb[p.out], t * HD + c, entry, nxt, even)
     # the entry into ATOM's pool, in place: the owner's main row of entry pos // ratio (``paged``)
-    addr = paged.row_addr(k, p.cache, b, pos // p.ratio, p.ratio) + fx.Int64(c * 2)
-    ok = even & live
-    _store_entry(
-        addr,
-        bf16_pair(entry, nxt).bitcast(fx.Int32),
-        ok if emits is None else ok & emits,
-    )
+    if not p.kv8:
+        addr = paged.row_addr(k, p.cache, b, pos // p.ratio, p.ratio) + fx.Int64(c * 2)
+        ok = even & live
+        _store_entry(
+            addr,
+            bf16_pair(entry, nxt).bitcast(fx.Int32),
+            ok if emits is None else ok & emits,
+        )
     if p.index_out:
         _index_key(k, t, p, c, b, pos, iload, lat, emits)
     gpu.barrier()  # the next task reuses the LDS
@@ -402,7 +427,8 @@ class Compressor(Block):
     def __init__(self, name: str, x: Channel, ratio: int, out: Channel, pos: str, rope: str, cache: str,
                  cache_len: int, latent: Channel | None = None, kv_state: str = "", score_state: str = "",
                  slots: int = 0, index_out: Channel | None = None, kslices: int = 4,
-                 tiles: int = 1, poll_batch: int = 0, eps: float = 1e-20, qat: bool = True):  # fmt: skip
+                 tiles: int = 1, poll_batch: int = 0, eps: float = 1e-20, qat: bool = True,
+                 kv8: bool = False):  # fmt: skip
         if ratio not in (1, 2):
             raise ValueError(
                 f"Compressor {name}: ratio 1 or 2 (DeepSeek-V4.1's), got {ratio}"
@@ -454,6 +480,7 @@ class Compressor(Block):
         # the cache entry's FP4 QAT (the official model's); False: the rotated bf16 latent as is (an engine's bf16
         # cache without the QAT, ATOM's). A numerics choice, not a schedule knob
         self.qat = qat
+        self.kv8 = kv8
 
     def plan(self, sc: Scenario) -> _Plan:
         spec = sc.spec
@@ -464,7 +491,7 @@ class Compressor(Block):
                      self.dots[0].part.name, self.dots[1].part.name if self.ratio == 2 else "", self.pos, self.rope,
                      self.aux, self.cache, self.cache_len, self.kv_state, self.score_state, self.out.name,
                      self.latent.name if self.latent else "", self.eps, self.poll_batch,
-                     self.index_out.name if self.index_out else "", flag, self.qat)  # fmt: skip
+                     self.index_out.name if self.index_out else "", flag, self.qat, self.kv8)  # fmt: skip
 
     def stages(self, sc: Scenario) -> list[Stage]:
         p = self.plan(sc)

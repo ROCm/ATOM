@@ -35,6 +35,8 @@ from __future__ import annotations
 import triton
 import triton.language as tl
 
+from atom.model_ops.blockscale_kernels.quantization import FP8_TL_DTYPE
+
 HC = 4
 MIX = HC * (HC + 2)
 WINDOW = 128
@@ -107,6 +109,7 @@ def _ring_in(
     m, b, s, rq, pool, positions, batch_ids, slots, rings, layer_ids, pos_out, bounds_out,
     ring_start0, slot_rows, ring_slots, num_slots, max_pos,
     WIN: tl.constexpr, DIM: tl.constexpr, RB: tl.constexpr, BM: tl.constexpr,
+    KV_FP8: tl.constexpr = False,
 ):  # fmt: skip
     """The hi runtime layer m's ring slot s of request b <- ATOM's ring row of the
     position q in [ctx - WIN, ctx) with q % WIN == s (zeros below position 0 or
@@ -117,7 +120,7 @@ def _ring_in(
         b, rq, positions, batch_ids, slots, num_slots, max_pos
     )
     _ring_row(m, b, s, ctx, slot, live, pool, rings, layer_ids, ring_start0, slot_rows, ring_slots, WIN, DIM,
-              BM)  # fmt: skip
+              BM, KV_FP8)  # fmt: skip
     if (m == 0) & (s == 0):
         _step_bounds(ctx, pos_out + b, bounds_out + b * rq, rq, RB)
 
@@ -126,6 +129,7 @@ def _ring_in(
 def _ring_row(
     m, b, s, ctx, slot, live, pool, rings, layer_ids, ring_start0, slot_rows, ring_slots,
     WIN: tl.constexpr, DIM: tl.constexpr, BM: tl.constexpr,
+    KV_FP8: tl.constexpr = False,
 ):  # fmt: skip
     """``_ring_in``'s copy: hi layer m's ring slot s of request b <- ATOM's ring row of position q in
     [ctx - WIN, ctx), q % WIN == s (zeros below 0 / on a pad request).
@@ -141,7 +145,14 @@ def _ring_row(
         + tl.maximum(q, 0) % ring_slots
     )
     d = tl.arange(0, DIM)
-    v = tl.load(pool + row * DIM + d, mask=ok & (d < DIM), other=0.0)
+    if KV_FP8:
+        base = pool + row * (DIM + DIM // 32)
+        qv = tl.load(base + d, mask=ok, other=0).to(FP8_TL_DTYPE, bitcast=True)
+        code = tl.load(base + DIM + d // 32, mask=ok, other=127).to(tl.int32)
+        scale = (code << 23).to(tl.float32, bitcast=True)
+        v = qv.to(tl.float32) * scale
+    else:
+        v = tl.load(pool + row * DIM + d, mask=ok & (d < DIM), other=0.0)
     at = ((m * BM + b) * WIN + s).to(tl.int64)
     tl.store(rings + at * DIM + d, v)
 
@@ -164,6 +175,7 @@ def _ring_out(
     m, j, rq, pool, positions, batch_ids, slots, rings, layer_ids,
     ring_start0, slot_rows, ring_slots, num_slots, max_pos,
     WIN: tl.constexpr, DIM: tl.constexpr, BM: tl.constexpr,
+    KV_FP8: tl.constexpr = False, packed_rings=None,
 ):  # fmt: skip
     """The hi runtime layer m's key row of step row j (request b = j // rq, its ring
     slot (ctx_b + j - b rq) % WIN) -> ATOM's ring at that position (the
@@ -178,9 +190,19 @@ def _ring_out(
     slot = tl.where(live, slot, 0)
     p = ctx + j - b * rq
     d = tl.arange(0, DIM)
-    v = tl.load(rings + ((m * BM + b) * WIN + p % WIN).to(tl.int64) * DIM + d)
+    ring_row = ((m * BM + b) * WIN + p % WIN).to(tl.int64)
     row = ring_start0 + layer * ring_slots + slot * slot_rows + p % ring_slots
-    tl.store(pool + row * DIM + d, v, mask=live & (d < DIM))
+    if KV_FP8:
+        # KVPrep's original bytes. Quantizing its bf16 QAT output again can
+        # halve a scale at a rounding boundary and change the stored bytes.
+        source = packed_rings + ring_row * (DIM + DIM // 32)
+        base = pool + row * (DIM + DIM // 32)
+        tl.store(base + d, tl.load(source + d), mask=live)
+        g = tl.arange(0, DIM // 32)
+        tl.store(base + DIM + g, tl.load(source + DIM + g), mask=live)
+    else:
+        v = tl.load(rings + ring_row * DIM + d)
+        tl.store(pool + row * DIM + d, v, mask=live & (d < DIM))
 
 
 # ---------------------------------------------------------------- Engram inputs
@@ -403,6 +425,7 @@ def _ring_in_incr(
     m, b, r, rq, positions, pool, batch_ids, slots, rings, layer_ids, pos_out, bounds_out,
     ring_start0, slot_rows, ring_slots, num_slots, max_pos, imp,
     WIN: tl.constexpr, DIM: tl.constexpr, RB: tl.constexpr, RP: tl.constexpr, BM: tl.constexpr,
+    KV_FP8: tl.constexpr = False,
 ):  # fmt: skip
     """Program (m, b, r) of the incremental ring import: layer m's slots r, r + RP, .. of request b that the last
     served step's rows wrote (all of them unless ``incr``), each ``_ring_row``; (0, b, 0) also pos / bounds.
@@ -413,7 +436,7 @@ def _ring_in_incr(
     for s in range(r, WIN, RP):
         if (~incr) | (((s - pctx % WIN + WIN) % WIN) < prow):
             _ring_row(m, b, s, ctx, slot, live, pool, rings, layer_ids, ring_start0, slot_rows, ring_slots, WIN, DIM,
-                      BM)  # fmt: skip
+                      BM, KV_FP8)  # fmt: skip
     if (m == 0) & (r == 0):
         _step_bounds(ctx, pos_out + b, bounds_out + b * rq, rq, RB)
 
@@ -431,6 +454,7 @@ def _begin_step_kernel(
     NB: tl.constexpr = 1, BM: tl.constexpr = 1, RQP: tl.constexpr = 1,
     fold_ids=None, fold_dst=None, fold_tmap=None, fold_dead=None, fold_cand=None, fold_cand_stride=0,
     fold_live=None, hist_stride=0, fold_cand_req_stride=0, EFOLD: tl.constexpr = 0, RPOW: tl.constexpr = 16,
+    KV_FP8: tl.constexpr = False,
 ):  # fmt: skip
     """Grid NMF * NB * RP + rows + NE0 + NE1 + EHIST:
     the ring import of each of the step's ``NB`` requests (and its pos /
@@ -462,10 +486,10 @@ def _begin_step_kernel(
         if INCR:
             _ring_in_incr(m, b, r, rq, positions, pool, batch_ids, slots, rings, layer_ids, pos_out, bounds_out,
                           ring_start0, slot_rows, ring_slots, num_slots, max_pos, imp, WIN, DIM, RB, RP,
-                          BM)  # fmt: skip
+                          BM, KV_FP8)  # fmt: skip
         else:
             _ring_in(m, b, r, rq, pool, positions, batch_ids, slots, rings, layer_ids, pos_out, bounds_out,
-                     ring_start0, slot_rows, ring_slots, num_slots, max_pos, WIN, DIM, RB, BM)  # fmt: skip
+                     ring_start0, slot_rows, ring_slots, num_slots, max_pos, WIN, DIM, RB, BM, KV_FP8)  # fmt: skip
         if (m == 0) & (r == 0):
             _req_words(b, rq, positions, batch_ids, slots, num_slots, max_pos, req, RQP)
         if pid == 0:
@@ -504,6 +528,7 @@ def _end_step_kernel(
     NTAPS: tl.constexpr, PLANAR: tl.constexpr, TRACK: tl.constexpr = 0,
     NB: tl.constexpr = 1, BM: tl.constexpr = 1,
     col_res=None, col_out=None, COLLAPSE: tl.constexpr = 0,
+    KV_FP8: tl.constexpr = False, packed_rings=None,
 ):  # fmt: skip
     """Grid (NMF + NTAPS + PLANAR (+ HIDDEN / BLOCK with COLLAPSE)) * rows, ``rows`` programs a
     segment: the ring export, the DSpark taps, and (PLANAR) the last
@@ -528,7 +553,7 @@ def _end_step_kernel(
             tl.store(imp + pid * 4 + 2, rq)
     if seg < NMF:
         _ring_out(seg, j, rq, pool, positions, batch_ids, slots, rings, layer_ids, ring_start0, slot_rows, ring_slots,
-                  num_slots, max_pos, WIN, DIM, BM)  # fmt: skip
+                  num_slots, max_pos, WIN, DIM, BM, KV_FP8, packed_rings)  # fmt: skip
     else:
         t = seg - NMF
         if t < NTAPS:

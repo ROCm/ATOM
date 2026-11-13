@@ -597,11 +597,11 @@ def window_layer_blocks(first: bool, split: bool = False, tp: int = 1, replay: b
                           wsplit=smerge and k.SPARSE_WSPLIT in (True, 1),
                           ckv4=ckv4, cache_ratio=src.ratio if src is not None else sparse_ratio, ring8=ring8,
                           lean=bool(k.SPARSE_LEAN), vtr=bool(k.SPARSE_VTR), kfirst=bool(k.SPARSE_KFIRST),
-                          unrope_f32=bool(k.ATTN_OUT_F32_ROPE))
+                          unrope_f32=bool(k.ATTN_OUT_F32_ROPE), kv8=bool(k.KV_FP8))
             if sparse else
             MLAWindowAttn("attn", C.q, C.kvn, C.o, "ring", "pos", "rope", "attn.sink", heads=heads,
                           ring_slots=rs, ring_first=bool(k.RING_FIRST), dsplit=k.ATTN_DSPLIT,
-                          unrope_f32=bool(k.ATTN_OUT_F32_ROPE)))  # fmt: skip
+                          unrope_f32=bool(k.ATTN_OUT_F32_ROPE), kv8=bool(k.KV_FP8)))  # fmt: skip
     comp, idx = [], []
     ctiles = k.SHARD_COMP_TILES if shard and k.SHARD_COMP_TILES else k.COMP_TILES
     if (
@@ -634,6 +634,7 @@ def window_layer_blocks(first: bool, split: bool = False, tp: int = 1, replay: b
                 kslices=k.COMP_KSLICES,
                 tiles=ctiles,
                 qat=bool(k.COMPRESS_QAT),
+                kv8=bool(k.KV_FP8),
             )
         ]
     if src is not None and src.index:
@@ -733,7 +734,7 @@ def window_layer_blocks(first: bool, split: bool = False, tp: int = 1, replay: b
             weight_format="mxfp8",
             group_rows=k.WQB_ROWS,
         ),
-        KVPrep("kvprep", C.kvb, C.kvn, "pos", "rope"),
+        KVPrep("kvprep", C.kvb, C.kvn, "pos", "rope", kv8=bool(k.KV_FP8)),
         attn,
         RingWrite("ringw", attn),
         # bf16 compute: the reference's wo_a is a plain bf16 einsum (the checkpoint's FP8 times its block scales, the
