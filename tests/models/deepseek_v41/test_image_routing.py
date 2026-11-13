@@ -34,7 +34,9 @@ def moe(metadata):
     layer.gate.e_score_correction_bias = torch.linspace(-2, 2, 384, device="cuda")
     layer.gate.bias_vl = -layer.gate.e_score_correction_bias
     layer.routed_scaling_factor = 1.5
-    layer.experts = SimpleNamespace(custom_routing_function=layer._topk)
+    layer.experts = SimpleNamespace(
+        custom_routing_function=layer._topk, num_fused_shared_experts=0
+    )
     return layer
 
 

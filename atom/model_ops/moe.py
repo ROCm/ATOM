@@ -3601,17 +3601,25 @@ class FusedMoE(torch.nn.Module):
             getattr(config, "n_shared_experts", 0) if fuse_shared_experts else 0
         )
 
-        # An MXFP8 shared expert fused into MXFP4 routed experts is staged
-        # while loading and re-quantized into its slot afterwards.
-        stage_shared_mxfp8 = bool(
-            num_fused_shared_experts
-            and layer_quant_config is not None
-            and fuses_mxfp8_shared_into_mxfp4(
-                quant_config.get_layer_quant_config(
-                    shared_expert_prefix, check_children=True
-                ),
-                layer_quant_config,
+        # A shared expert in another format than the routed checkpoint is
+        # staged while loading and written into its slot afterwards: MXFP8
+        # re-quantized to MXFP4, or per-channel FP8 copied once online quant
+        # made the routed experts per-channel FP8 too.
+        shared_spec = (
+            quant_config.get_layer_quant_config(
+                shared_expert_prefix, check_children=True
             )
+            if num_fused_shared_experts and layer_quant_config is not None
+            else None
+        )
+        stage_shared_ptpc = (
+            shared_spec is not None
+            and shared_spec.quant_type == QuantType.per_Token
+            and layer_quant_config.quant_type != QuantType.per_Token
+        )
+        stage_shared_mxfp8 = stage_shared_ptpc or bool(
+            shared_spec is not None
+            and fuses_mxfp8_shared_into_mxfp4(shared_spec, layer_quant_config)
         )
 
         eplb_enabled = self.use_ep and getattr(atom_config, "eplb_enable", False)
@@ -3861,7 +3869,11 @@ class FusedMoE(torch.nn.Module):
         self.quant_method.create_weights(layer=self, **self.moe_quant_params)
         self.shared_mxfp8_into_mxfp4 = (
             Mxfp8SharedIntoMxfp4(
-                self, quant_config, hidden_size, self.intermediate_size_per_partition
+                self,
+                quant_config,
+                hidden_size,
+                self.intermediate_size_per_partition,
+                ptpc=stage_shared_ptpc,
             )
             if stage_shared_mxfp8
             else None

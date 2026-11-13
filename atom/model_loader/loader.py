@@ -291,9 +291,12 @@ def load_model(
     def _fuse_shared_expert(
         shared_expert_prefix: str, routed_expert_prefix: str
     ) -> bool:
-        model_quant_config = getattr(
-            getattr(model, "atom_config", None), "quant_config", None
-        )
+        # The config the model's MoE layers were built with, if its own.
+        model_quant_config = getattr(model, "moe_quant_config", None)
+        if model_quant_config is None:
+            model_quant_config = getattr(
+                getattr(model, "atom_config", None), "quant_config", None
+            )
         if model_quant_config is None:
             model_quant_config = getattr(model, "quant_config", None)
         if model_quant_config is not None and hasattr(

@@ -12,7 +12,7 @@ from atom.model_ops.fused_moe.expert_layout import SharedExpertMode
 from atom.model_ops.fused_moe.gathered_shared_ids import copy_shared_expert_ids_
 from atom.model_ops.triton_topk_softmax import triton_topk_softmax
 from atom.model_ops.utils import _has_module
-from atom.quant_spec import fuses_mxfp8_shared_into_mxfp4
+from atom.quant_spec import fuses_mxfp8_shared_into_mxfp4, will_online_requant
 from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.forward_context import get_forward_context
@@ -63,6 +63,16 @@ def is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
             if routed_expert_prefix is not None
             else quant_config.global_quant_config
         )
+        if routed_expert_prefix is not None and will_online_requant(
+            quant_config,
+            routed_expert_prefix,
+            routed_spec.quant_type,
+            routed_spec.quant_dtype,
+        ):
+            # The routed experts run in their online format.
+            routed_spec = quant_config.get_layer_quant_config(
+                routed_expert_prefix, use_online_quant=True, check_children=True
+            )
         return (
             shared_spec.quant_dtype == routed_spec.quant_dtype
             and shared_spec.quant_type == routed_spec.quant_type
