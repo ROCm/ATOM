@@ -210,6 +210,20 @@ _cdiv, _lists, _lists_rt, _list_inputs_rt, _list_count_rt = IP.cdiv, IP.lists, I
 MODE_SEL, MODE_RX, MODE_BLK = 0, 1, 2
 
 
+@ASTRewriter.transform
+def selection_levels(c, isrx):
+    """Every wave reads the same row bounds, so every CTA executes the same handoffs."""
+    bound = I32(0)
+    for group in range_constexpr((c["TR"] + 31) // 32):
+        row = fx.min(c["l"] + group * 32, I32(c["TR"] - 1))
+        bound = fx.max(bound, hx.gload(c["ibound"] + i64(row) * 4, I32))
+    bound = wave_max(bound)
+    # REINDEX scores at most 2048 retained blocks x 8 rows.
+    sel = isrx.select(I32(2), IP.tree_levels(bound, KSEL))
+    blk = IP.tree_levels(_cdiv(bound, I32(8)), KBLK)
+    return sel, blk
+
+
 def rx_context(c, tok, bd):
     """A REINDEX token's compacted columns (index_plan.rx_context; its last kept block from icand)."""
     kept = IP.rx_kept(bd)
@@ -318,3 +332,99 @@ def stage_select_any(c, lev, nlev, mode):
             _emit_any(c, mode, lev, final, tok, j, q, k, lstride, cur, pbase, pos, bits, ii)
 
         lds_topk(n, k, load, emit, c["sm"], t)
+
+
+# ---- (c1) the FULL / REINDEX layers' top-KSEL by a grouped multi-CTA radix select -----------------------------------
+MC_ROWS = 8                       # row slots (TR <= 8)
+MC_G = 8                          # CTAs a row (CTAs MC_G r .. MC_G r + MC_G - 1; the rest skip to the stage's handoff)
+MC_HIST = 4 * MC_ROWS * 256 * 4   # bytes a layer: [4 rounds][rows][256] i32
+MC_CTR = MC_ROWS * 8 * 4          # bytes a layer: [rows] (above, ties, round 0..3 group counts, -, -) i32
+MC_LAYER = MC_HIST + MC_CTR
+O_MC = LDS_BYTES2                 # LDS: (prefix, mask, need, n) i32, then the CTA's 256-bin histogram
+O_MCH = O_MC + 16
+
+
+@ASTRewriter.transform
+def select_mc(c, hb, ctr, isrx):
+    """Every row's top KSEL of its n scores (FULL: n = bound, the ilog row; REINDEX: n = its compacted columns, lifted
+    at the emit) -> isel / irow (the tree's final emit), by MC_G CTAs a row: CTA g of row r takes keys
+    [g CH, (g + 1) CH), CH = ceil(n / MC_G); 4 radix rounds of 8 bits: its LDS histogram -> global atomics into
+    hb[round][r][256] (zeroed at the step's entry), the group's count ctr[r][2 + round] (release / acquire), every CTA of
+    the group scans the 256 bins alike; then the winners: keys above the k-th key's value take positions from
+    ctr[r][0], ties from ctr[r][1] (< need). n <= k: all, position = index; past min(n, k): -1 (the group's CTA 0)."""
+    t, b, sm, TR = c["t"], c["b"], c["sm"], c["TR"]
+    lane = t % 32
+    k = I32(KSEL)
+    vals, vstride = c["ilog"], c["ilw"]
+    mode = isrx.select(I32(MODE_RX), I32(MODE_SEL))
+    r = fx.min(b // MC_G, I32(TR - 1))
+    g = b % MC_G
+    if b < TR * MC_G:
+        if t == 0:
+            bd0 = hx.gload(c["ibound"] + i64(r) * 4, I32)
+            bd = fx.max(bd0, I32(0))
+            if isrx:
+                bd = fx.max(rx_context(c, r, bd0), I32(0))
+            hx.lstore(sm + O_MC, fx.Vector.from_elements([I32(0), I32(0), k, bd], I32))
+        gpu.barrier()
+        n = hx.lload(sm + O_MC + 12, I32)
+        CH = (n + (MC_G - 1)) // MC_G
+        i0 = g * CH
+        i1 = fx.min(i0 + CH, n)
+        rowp = vals + i64(r) * i64(vstride) * 4
+        if n > k:
+            for p in range(4):
+                shift = 24 - 8 * p
+                hx.lstore(sm + O_MCH + t * 4, I32(0))
+                gpu.barrier()
+                st4 = hx.lload(sm + O_MC, I32, 4)
+                for i in range(i0 + t, i1, 256):
+                    key = order_key(hx.gload(rowp + i64(i) * 4, I32))
+                    if (key & st4[1]) == st4[0]:
+                        hx.latomic_add_i32(sm + O_MCH + ((key >> shift) & 255) * 4, I32(1))
+                gpu.barrier()
+                v = hx.lload(sm + O_MCH + t * 4, I32)
+                if v != 0:
+                    hx.atomic_add(hb + i64(((p * MC_ROWS + r) * 256 + t) * 4), v)
+                gpu.barrier()
+                if t == 0:
+                    hx.fence_release("agent")
+                    hx.atomic_add(ctr + i64((r * 8 + 2 + p) * 4), 1)
+                    hx.wait_count(ctr + i64((r * 8 + 2 + p) * 4), MC_G, 8)
+                    hx.fence_acquire("agent")
+                gpu.barrier()
+                if t < 32:   # wave 0: the bin of the k-th key (lds_topk's scan, over the global bins)
+                    cs = [hx.gload(hb + i64(((p * MC_ROWS + r) * 256 + 255 - 8 * lane - q) * 4), I32, nt=True) for q in range(8)]
+                    s4 = cs[0]
+                    for q in range_constexpr(1, 8):
+                        s4 = s4 + cs[q]
+                    need = st4[2]
+                    before = wave_incl_scan(s4, lane) - s4
+                    found = I32(-1)
+                    for q in range_constexpr(8):
+                        hit = (before < need) & (need <= before + cs[q])
+                        found = hit.select(((255 - 8 * lane - q) << 16) | (need - before), found)
+                        before = before + cs[q]
+                    found = wave_max(found)
+                    if lane == 0:
+                        hx.lstore(sm + O_MC, fx.Vector.from_elements(
+                            [st4[0] | (((found >> 16) & 255) << shift), st4[1] | (I32(255) << shift), found & 0xFFFF, n], I32))
+                gpu.barrier()
+        st4 = hx.lload(sm + O_MC, I32, 4)
+        q = fx.max(hx.gload(c["ibat"] + i64(r) * 4, I32), I32(0))
+        for i in range(i0 + t, i1, 256):
+            pos = I32(-1)
+            if n <= k:
+                pos = i
+            else:
+                key = order_key(hx.gload(rowp + i64(i) * 4, I32))
+                if ult(st4[0], key):
+                    pos = hx.atomic_add(ctr + i64(r * 32), 1)
+                if key == st4[0]:
+                    tie = hx.atomic_add(ctr + i64(r * 32 + 4), 1)
+                    pos = (tie < st4[2]).select(k - st4[2] + tie, I32(-1))
+            if pos >= 0:
+                _emit_any(c, mode, I32(0), I32(1) > I32(0), r, I32(0), q, k, I32(0), c["lvl"], c["lvl"], pos, I32(0), i)
+        if g == 0:   # padding past min(n, k)
+            for pp in range(fx.min(n, k) + t, k, 256):
+                _emit_any(c, mode, I32(0), I32(1) > I32(0), r, I32(0), q, k, I32(0), c["lvl"], c["lvl"], pp, I32(0), I32(-1))

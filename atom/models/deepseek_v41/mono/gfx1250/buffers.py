@@ -105,6 +105,7 @@ FPTRS_ROLE = {
     "engkv": SCRATCH,
     "engpart": SCRATCH,
     "mroute": SCRATCH,  # a fixed route table (build moe_ids="mroute": the fixture's Zipf routing); unused by the server
+    "mchist": SCRATCH,  # the multi-CTA selection's radix histograms / position counters (step.MC_BYTES, zeroed a step)
 }
 
 # fp table, after FPTRS (ATAB): the attention's
@@ -206,10 +207,11 @@ CTPTRS_ROLE = {
 }
 
 
-# the scorer's row width: the widest index bound a step may have (2 selection levels: <= 8192 x 16 rows; 64K tokens of
-# context at compression 1 -- b09-2 Agentic first turns are ~30K tokens)
-ILW = 65536
-BCOLS = 4096  # block-table columns a request (16-token pages: 64K tokens)
+# the scorer's row width: the widest index bound a step may have -- 256K tokens at compression 1 (E13 c1 contexts pass
+# 128K); past 8192 x 16 rows the selection takes a third level (topk.selection_levels). (The full 1M sizing made short
+# contexts slower.)
+ILW = 262144
+BCOLS = ILW // 16  # block-table columns a request (16-token pages)
 
 
 def scratch_bytes(K, nlt: int) -> dict[str, int]:
@@ -221,6 +223,11 @@ def scratch_bytes(K, nlt: int) -> dict[str, int]:
     T, H = T_MAX, FS.H
     QV = S.smem_layout(T)["QV"]
     G = FS.NG * FS.CL * FS.TG
+    IP = M.TK
+    level_stride = max(
+        -(-ILW // IP.SEG) * IP.KSEL,
+        -(-(ILW // 8) // IP.SEG) * IP.KBLK,
+    )
     return {
         # attention
         "sel": T * 640 * 4,
@@ -286,7 +293,7 @@ def scratch_bytes(K, nlt: int) -> dict[str, int]:
         # the selection tree (M.IDX_LEVELS levels): a level's lists of (value, index) pairs a row, a level-0 list per
         # 8192 index rows of the bound (ILW), k a list -- 2048 for layer 20's candidate blocks (topk "blk": also
         # its dummy-row store, row T, lands there), 512 otherwise
-        "ilvl": M.IDX_LEVELS * (T + 1) * (-(-ILW // 8192) * 2048) * 8 + 64,
+        "ilvl": M.IDX_LEVELS * (T + 1) * level_stride * 8 + 64,
         "aux8": T * 15360,
         "auxs": T * 480,
         "dR": T * 4 * H * 2,
@@ -299,6 +306,7 @@ def scratch_bytes(K, nlt: int) -> dict[str, int]:
         "engkv": T * 25600 * 2,
         "engpart": 768 * 16 * 4,
         "mroute": T * FS.TOPK * 4,
+        "mchist": M.MC_BYTES,
         # step tail
         "xh": T * HF.HID * 2,
         "logits": T * HF.VR * 4,

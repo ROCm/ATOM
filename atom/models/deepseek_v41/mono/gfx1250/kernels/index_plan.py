@@ -24,6 +24,11 @@ def cdiv(a, b):
     return (a + (b - 1)) // b
 
 
+def tree_levels(n, k):
+    """Keep the original two passes; use a third only when two cannot merge all lists."""
+    return (n > SEG * (SEG // k)).select(I32(3), I32(2))
+
+
 def lists(n, lev, fan):
     """Lists at level lev (Python int) of a token with n inputs: segments, then / fan a level."""
     x = cdiv(fx.max(n, I32(0)), I32(SEG))

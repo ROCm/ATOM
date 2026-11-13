@@ -55,7 +55,7 @@ DSPARK_W = D.DSPARK_W          # the DSpark block width: a build's draft request
 TENTRY_ROW = LY.TARGET_ENTRY_ROW       # the layer-table row of the target entry's attention front (tables.StepTables: after 40 + 3 layers and the draft entry)
 
 FRONT_LDS_OFF = LY.FRONT_LDS                # keep the TP payload ([TR][20] f32 at LDS 0) intact
-FPTRS = ['R', 'y', 'pre', 'post', 'comb', 'fnh', 'fnl', 'hsc', 'hbs', 'nw', 'gate', 'gbias', 'Rout', 'xn', 'fx8', 'fxs', 'part', 'plog', 'cand', 'cands', 'npre', 'npost', 'ncomb', 'ids', 'wts', 'mout', 'mid8', 'midc', 'afnh', 'afnl', 'ahsc', 'ahbs', 'anw', 'aRout', 'axn', 'anpre', 'anpost', 'ancomb', 'tp2out', 'cyc', 'y1', 'y2', 'shplane', 'kmeta', 'knsel', 'ksel', 'kvw', 'rpos', 'iq', 'iwp', 'iq_out', 'iqs_out', 'iw_out', 'xh', 'cpart', 'ilvl', 'aux8', 'auxs', 'tpep', 'kmeta_d', 'kvw_d', 'rpos_d', 'dR', 'dy', 'dpre', 'dpost', 'dcomb', 'emb', 'noise', 'x8', 'xs', 'ctxtab', 'dgeom', 'tids', 'eng8', 'engs', 'engkv', 'engpart', 'mroute']   # the step's pointers, in a device table (kernel arg `fp`):
+FPTRS = ['R', 'y', 'pre', 'post', 'comb', 'fnh', 'fnl', 'hsc', 'hbs', 'nw', 'gate', 'gbias', 'Rout', 'xn', 'fx8', 'fxs', 'part', 'plog', 'cand', 'cands', 'npre', 'npost', 'ncomb', 'ids', 'wts', 'mout', 'mid8', 'midc', 'afnh', 'afnl', 'ahsc', 'ahbs', 'anw', 'aRout', 'axn', 'anpre', 'anpost', 'ancomb', 'tp2out', 'cyc', 'y1', 'y2', 'shplane', 'kmeta', 'knsel', 'ksel', 'kvw', 'rpos', 'iq', 'iwp', 'iq_out', 'iqs_out', 'iw_out', 'xh', 'cpart', 'ilvl', 'aux8', 'auxs', 'tpep', 'kmeta_d', 'kvw_d', 'rpos_d', 'dR', 'dy', 'dpre', 'dpost', 'dcomb', 'emb', 'noise', 'x8', 'xs', 'ctxtab', 'dgeom', 'tids', 'eng8', 'engs', 'engkv', 'engpart', 'mroute', 'mchist']   # the step's pointers, in a device table (kernel arg `fp`):
 # as ~30 more kernel args they pushed SGPRs into spills and a 64-bit VGPR spill whose ~45 scratch reloads each waited,
 # by the in-order loadcnt, for every outstanding load of the stage they sat in
 ATAB = ("x8 xs wqkv wqkv_s qnw kvnw wqb wqb_s kv sel sink rcos rsin woa woa_s wob wob_s qkv_part qkv ss qr8 qrs kvn q "
@@ -65,7 +65,8 @@ LKEYS = ("wqkv wqkv_s wqb wqb_s woa woa_s wob wob_s qnw kvnw sink fnh fnl hsc hb
 RECV_HALF = 16 * 40960 * 16 + (2 << 20)   # bytes a parity half of a receive buffer (TP regions + tail)
 RKOFF = LY.RKEEP        # LDS: the residual streams kept between the fronts
 LCB = LY.LAYER_BYTES             # (+ 128..255: the TP1 / TP2 column-group counters, gpub / gwait)  # bytes of handoff counters a layer (16: the indexer layers' extra phases use 4, 44.., 60)
-IDX_LEVELS = 2        # selection-tree levels (1: bound <= 8192 index rows; 2: <= 8192 x 16 -- the 64K-token ILW)
+IDX_LEVELS = 3        # selection-tree capacity (the index capacity buffers.ILW); actual passes depend on the current bound
+MC_BYTES = (D.LAYERS + 4) * (4 * 8 * 256 * 4 + 8 * 8 * 4)   # mchist: [layers] ([4 rounds][8 rows][256] + [8 rows][8]) i32
 IPF_KB = 32           # instruction prefetch (KB) before the fronts / the MoE
 FPF_SPLIT = True      # (front prefetch layout; the step build does not prefetch the front weights)
 
@@ -251,6 +252,11 @@ def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sourc
                     b = hx.opaque_s(fx.block_idx.x)
                     sm = hx.lds_base()
                     TCNT = cnt + i64((NL + NDR) * LCB)
+                    mz = fptr(fp, "mchist")   # the multi-CTA selection's histograms / position counters: zeroed a step
+                    for zz in range_constexpr((MC_BYTES // 16 + 65535) // 65536):
+                        u = b * 256 + t + zz * 65536
+                        if u < MC_BYTES // 16:
+                            hx.gstore(mz + i64(u) * 16, fx.Vector.filled(4, 0, fx.Int32))
                     CX.stage_block_state(dict(t=t, b=b, aid=fptr(fp, "tids"), emb=fptr(fp, "emb"), noise=fptr(fp, "noise"),
                                               R=fptr(fp, "dR"), y=fptr(fp, "dy"), pre=fptr(fp, "dpre"), post=fptr(fp, "dpost"),
                                               comb=fptr(fp, "dcomb")), TR, 1)
@@ -521,7 +527,15 @@ def target_layer(E, Ly):
             isrx = (lfl3 & fx.Int64(64)) != fx.Int64(0)
             cs_ = cwith(cs_, ibmax=ltab(fp, Ly, "ibmax")(), icand=ltab(fp, Ly, "icand")(), lvl=fptr(fp, "ilvl"),
                         iprod=(lfl3 & fx.Int64(32)) != fx.Int64(0), ts=None)
-            SC.stage_score_any(cs_, isrx)
+            if fx.const_expr(TR <= 6):   # (c1: one request) long FULL contexts score each key tile once for every row
+                lg = hx.opaque_v(fx.thread_idx.x) % 32   # (short contexts keep the per-row tasks: more CTAs in parallel)
+                bmx = TK.wave_max((lg < TR).select(hx.gload(cs_["ibound"] + i64(fx.min(lg, fx.Int32(TR - 1))) * 4, fx.Int32), fx.Int32(0)))
+                if isrx | (bmx <= fx.Int32(SC.GROUPED_MIN_BOUND)):
+                    SC.stage_score_any(cs_, isrx)
+                else:
+                    SC.stage_score_grouped(cs_)
+            else:
+                SC.stage_score_any(cs_, isrx)
             handoff(lc + i64(LY.SCORE), t, True)
             # (the selection tree's levels past the first only when a row has more than one level-0 list: every row's
             # input count n <= SEG -> level 0 already writes the final picks; its empty level-1 pass + handoff skipped)
@@ -531,13 +545,21 @@ def target_layer(E, Ly):
             if isrx:
                 nrow = TK.rx_context(cs_, fx.min(lnr, fx.Int32(TR - 1)), bdr)
             nmax = TK.wave_max((lnr < TR).select(nrow, fx.Int32(0)))
-            lsel = (nmax > fx.Int32(TK.SEG)).select(fx.Int32(IDXL), fx.Int32(1))
-            npass = isrx.select(lsel, cs_["iprod"].select(fx.Int32(2 * IDXL), lsel))
-            for pi in range(npass):
-                pmode = isrx.select(fx.Int32(TK.MODE_RX), (pi < IDXL).select(fx.Int32(TK.MODE_SEL), fx.Int32(TK.MODE_BLK)))
-                plev = pi % IDXL
-                TK.stage_select_any(cwith(cs_, ts=None), plev, IDXL, pmode)
-                handoff(lc + i64(LY.SELECT0) + i64(pi) * 4, t, True)
+            sel_levels, blk_levels = TK.selection_levels(cs_, isrx)   # (2, or 3 past 8192 x 16 index rows)
+            lsel = (nmax > fx.Int32(TK.SEG)).select(sel_levels, fx.Int32(1))
+            npass = isrx.select(lsel, cs_["iprod"].select(sel_levels + blk_levels, lsel))
+            if cs_["iprod"]:   # the candidate-block layer (its top-512 and top-2048 blocks): the selection tree
+                for pi in range(npass):
+                    pmode = isrx.select(fx.Int32(TK.MODE_RX), (pi < sel_levels).select(fx.Int32(TK.MODE_SEL), fx.Int32(TK.MODE_BLK)))
+                    plev = (pi < sel_levels).select(pi, pi - sel_levels)
+                    nlev = (pi < sel_levels).select(sel_levels, blk_levels)
+                    TK.stage_select_any(cwith(cs_, ts=None), plev, nlev, pmode)
+                    handoff(lc + i64(LY.SELECT0) + i64(pi) * 4, t, True)
+            else:   # FULL / REINDEX: every row's top-512 by 8 CTAs a row (4 radix rounds, a group count each), one handoff
+                mh = fptr(fp, "mchist")
+                TK.select_mc(cwith(cs_, ts=None), mh + i64(Ly) * TK.MC_LAYER,
+                             mh + i64(Ly) * TK.MC_LAYER + i64(TK.MC_HIST), isrx)
+                handoff(lc + i64(LY.SELECT0), t, False)
     _stamp(stp, t, 5)
 
     # ---- D (on cflag / kvflag) -> dflag;  D-idle CTAs: this layer's attention mix partials + Sinkhorn
