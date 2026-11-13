@@ -15,7 +15,8 @@ use crate::{
         Worker,
     },
     kv_events::{
-        DropReason, EngineHash, Group, KvEvent, Namespace, PoolRole, StoredBlock, Tier, Trust,
+        DropReason, EngineHash, Group, GroupKind, KvEvent, Namespace, PoolRole, StoredBlock, Tier,
+        Trust,
     },
     policies::{LoadBalancingPolicy, RouteDecision, SelectWorkerInfo},
 };
@@ -317,6 +318,42 @@ fn token_less_blocks_need_a_known_engine_hash() {
     assert_eq!(index.stats().blocks, [2, 2, 0]);
 }
 
+/// vLLM stores a hybrid model's blocks once per group but removes them by group alone;
+/// `kv_cache_report_mode: "full"` re-reports held blocks as stored.
+#[test]
+fn holder_tables_skip_other_groups_cap_copies_and_drop_opaque_blocks() {
+    let (index, mut table, id) = (PrefixIndex::default(), HolderTable::default(), HolderId(0));
+    let seq: Vec<u32> = (0..8).collect();
+    let full = stored(0, &seq, 0..2, 4, Tier::Device, true);
+    let (mut window, mut opaque) = (full.clone(), full.clone());
+    if let (KvEvent::Stored { group, .. }, KvEvent::Stored { ns, .. }) = (&mut window, &mut opaque)
+    {
+        (group.idx, group.kind) = (1, GroupKind::SlidingWindow(128));
+        ns.opaque = true;
+    }
+    let removed = |idx| KvEvent::Removed {
+        hashes: vec![engine_hash(0, &seq[..4])],
+        tier: Tier::Device,
+        group: Group {
+            idx,
+            kind: GroupKind::Full,
+        },
+    };
+    // Event, times applied, Device blocks held after.
+    for (event, times, device) in [
+        (&full, 1, 2),
+        (&window, 1, 2),
+        (&removed(1), 1, 2),
+        (&full, 20, 2),
+        (&removed(0), 7, 2),
+        (&removed(0), 1, 1),
+    ] {
+        (0..times).for_each(|_| table.apply(&index, id, event).unwrap());
+        assert_eq!(index.stats().blocks[0], device);
+    }
+    assert_eq!(table.apply(&index, id, &opaque), Err(DropReason::Namespace));
+}
+
 fn resident_bytes() -> u64 {
     let statm = std::fs::read_to_string("/proc/self/statm").unwrap();
     statm
@@ -345,8 +382,8 @@ fn bench_query_16_workers_100k_tokens() {
         index.apply(holders[i as usize % 16], &[op]);
     }
     let tokens: Vec<u32> = (0..100_000).map(|i| (i * 7919 % 150_000) as u32).collect();
-    let started = Instant::now();
-    let prefix = hash::prefix_hashes(&tokens, BS, &Namespace::default());
+    let (ns, started) = (Namespace::default(), Instant::now());
+    let prefix = hash::prefix_hashes(&tokens, BS, &ns);
     println!("prefix hashes of 100k tokens: {:?}", started.elapsed());
     let mut held = [0; 16];
     for (name, full) in [
@@ -369,19 +406,23 @@ fn bench_query_16_workers_100k_tokens() {
             index.apply(*holder, &ops);
             held[k] = target;
         }
-        let mut samples: Vec<Duration> = (0..2000)
-            .map(|_| {
-                let started = Instant::now();
-                let found = index.find_matches(&MatchQuery {
-                    prefix: &prefix,
-                    holders: &holders,
-                });
-                assert_eq!(found.len(), 16);
-                started.elapsed()
-            })
-            .collect();
-        samples.sort();
-        println!("{name}: p50 {:?}, p99 {:?}", samples[1000], samples[1980]);
+        for hashing in [false, true] {
+            let mut samples: Vec<Duration> = (0..2000)
+                .map(|_| {
+                    let started = Instant::now();
+                    let fresh = hashing.then(|| hash::prefix_hashes(&tokens, BS, &ns));
+                    let found = index.find_matches(&MatchQuery {
+                        prefix: fresh.as_deref().unwrap_or(&prefix),
+                        holders: &holders,
+                    });
+                    assert_eq!(found.len(), 16);
+                    started.elapsed()
+                })
+                .collect();
+            samples.sort();
+            let (p50, p99) = (samples[1000], samples[1980]);
+            println!("{name}, hashing {hashing}: p50 {p50:?}, p99 {p99:?}");
+        }
     }
 }
 
