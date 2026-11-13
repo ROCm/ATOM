@@ -1460,16 +1460,18 @@ class MooncakeConnector(KVConnectorBase):
                 and self._slot_region_consumer_indices is None
             ):
                 # Every stage writes its slot regions from the head's final
-                # slot, but without explicit indices they are placed group-major
-                # over `num_hidden_layers`, which is right only for a backend
-                # with one slot region per layer per group.
+                # slot. Without explicit indices, `consumer_region_indices`
+                # places them group-major from `start_layer`, in groups of this
+                # stage's layer count, which is right only for a backend with
+                # one slot region per layer per group.
                 logger.warning(
                     "PP-prefill with per-request slot regions and no explicit "
                     "consumer indices (pp_rank=%d, %d slot regions): they are "
-                    "placed group-major over all layers. Verify the backend "
-                    "keeps one slot region per layer.",
+                    "placed group-major by layer from start_layer=%d. Verify "
+                    "the backend keeps one slot region per layer.",
                     self.pp_rank,
                     len(self._slot_regions),
+                    self._start_layer,
                 )
         else:
             self._start_layer = 0
@@ -3113,6 +3115,45 @@ class MooncakeConnector(KVConnectorBase):
         ]
         return _UnitPlan(cmap, cuts, len(specs))
 
+    def _consumer_dcp_plan(
+        self, request_data: dict, src_block_ids: list[int], dst_block_ids: list[int]
+    ):
+        """The token plan an unsharded producer pushes to a DCP consumer."""
+        return build_dcp_shard_plan(
+            src_block_ids,
+            block_size=self.block_size,
+            dcp_size=request_data["consumer_dcp_size"],
+            dcp_rank=request_data["consumer_dcp_rank"],
+            interleave_size=request_data.get("consumer_dcp_interleave", 1),
+            dst_pages=len(dst_block_ids),
+        )
+
+    def _dcp_token_descriptors(
+        self, region_idx: int, src_base: int, dst_base: int, bpb: int, token_runs
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """One PAGE region's share of a DCP token relayout, as RDMA descriptors."""
+        role = self._block_region_roles[region_idx]
+        if role != MLA_KV_ROLE:
+            raise RuntimeError(
+                f"DCP token relayout refuses region {region_idx} with "
+                f"semantic_role={role!r}; declare {MLA_KV_ROLE} for "
+                "token-contiguous MLA pages or "
+                f"{INDEX_CACHE_ROLE} for staged index pages"
+            )
+        # The destination page is wider only in whole tokens and the plan
+        # already counts in its token space, so both ends scale by the
+        # source's per-token width.
+        if bpb % self.block_size:
+            raise RuntimeError(
+                f"Region {region_idx} stores {bpb} bytes per block, which "
+                f"block_size {self.block_size} does not divide. Addressing "
+                "a single token needs its bytes contiguous, which holds for "
+                "the MLA layout the token-unit relayout is built on."
+            )
+        unit = bpb // self.block_size
+        run_src, run_dst, run_len = token_runs
+        return src_base + run_src * unit, dst_base + run_dst * unit, run_len * unit
+
     def _execute_block_transfer(
         self,
         request_data: dict,
@@ -3161,13 +3202,8 @@ class MooncakeConnector(KVConnectorBase):
                     f"dcp={self.dcp_size}, consumer dcp={dcp_size}"
                 )
         elif dcp_size > 1:
-            sharded_plan = build_dcp_shard_plan(
-                src_block_ids,
-                block_size=self.block_size,
-                dcp_size=dcp_size,
-                dcp_rank=request_data["consumer_dcp_rank"],
-                interleave_size=interleave,
-                dst_pages=len(dst_block_ids),
+            sharded_plan = self._consumer_dcp_plan(
+                request_data, src_block_ids, dst_block_ids
             )
             sharded_runs = sharded_plan.token_runs(dst_block_ids)
             # Without the ready event the gather could read KV still being
@@ -3228,31 +3264,13 @@ class MooncakeConnector(KVConnectorBase):
                     logger.error("[PRODUCER] block transfer failed for req %s", req_id)
                     return False
                 continue
-            if role != MLA_KV_ROLE:
-                raise RuntimeError(
-                    f"DCP token relayout refuses region {region_idx} with "
-                    f"semantic_role={role!r}; declare {MLA_KV_ROLE} for "
-                    "token-contiguous MLA pages or "
-                    f"{INDEX_CACHE_ROLE} for staged index pages"
-                )
-            # The destination page is wider only in whole tokens and the plan
-            # already counts in its token space, so both ends scale by the
-            # source's per-token width.
-            if bpb % self.block_size:
-                raise RuntimeError(
-                    f"Region {region_idx} stores {bpb} bytes per block, which "
-                    f"block_size {self.block_size} does not divide. Addressing "
-                    "a single token needs its bytes contiguous, which holds for "
-                    "the MLA layout the token-unit relayout is built on."
-                )
+            descriptors = self._dcp_token_descriptors(
+                region_idx, src_base, dst_base, bpb, sharded_runs
+            )
             if stages_sharded_mla and region_idx in self._mla_token_views:
                 staged_mla_regions.append((region_idx, dst_base, bpb))
                 continue
-            unit = bpb // self.block_size
-            run_src, run_dst, run_len = sharded_runs
-            if not batch.add(
-                src_base + run_src * unit, dst_base + run_dst * unit, run_len * unit
-            ):
+            if not batch.add(*descriptors):
                 logger.error("[PRODUCER] block transfer failed for req %s", req_id)
                 return False
 
@@ -3846,13 +3864,8 @@ class MooncakeConnector(KVConnectorBase):
         consumer_dcp_size = max(1, request_data.get("consumer_dcp_size", 1))
         sharded_runs = None
         if consumer_dcp_size > 1 and self.dcp_size == 1:
-            sharded_runs = build_dcp_shard_plan(
-                src_block_ids,
-                block_size=self.block_size,
-                dcp_size=consumer_dcp_size,
-                dcp_rank=request_data["consumer_dcp_rank"],
-                interleave_size=request_data.get("consumer_dcp_interleave", 1),
-                dst_pages=len(dst_block_ids),
+            sharded_runs = self._consumer_dcp_plan(
+                request_data, src_block_ids, dst_block_ids
             ).token_runs(dst_block_ids)
         deadline = request_data.get("_deadline")
         batch = _RdmaBatch(
@@ -3878,18 +3891,9 @@ class MooncakeConnector(KVConnectorBase):
                 dsts = dst_base + dst_ids * consumer_block_bpb[cidx]
                 lens = np.full(src_ids.size, bpb, dtype=np.int64)
             else:
-                role = self._block_region_roles[region_idx]
-                if role != MLA_KV_ROLE or bpb % self.block_size:
-                    raise RuntimeError(
-                        f"DCP token relayout refuses region {region_idx} "
-                        f"(semantic_role={role!r}, {bpb} bytes per block): it "
-                        f"needs token-contiguous {MLA_KV_ROLE} pages"
-                    )
-                unit = bpb // self.block_size
-                run_src, run_dst, run_len = sharded_runs
-                srcs = src_base + run_src * unit
-                dsts = dst_base + run_dst * unit
-                lens = run_len * unit
+                srcs, dsts, lens = self._dcp_token_descriptors(
+                    region_idx, src_base, dst_base, bpb, sharded_runs
+                )
             if not batch.add(srcs, dsts, lens):
                 logger.error("[PRODUCER] block transfer failed for req %s", req_id)
                 return False
