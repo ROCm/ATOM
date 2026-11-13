@@ -1443,3 +1443,81 @@ def test_dense_request_finished_releases_the_failed_load_mark(monkeypatch):
 
     sched.request_finished(seq)
     assert sched._load_failed_seqs == {}
+
+
+@pytest.mark.parametrize("cache_seed, salt", [(11, "11"), (12, "12"), (-1, "")])
+def test_a_prompt_carries_its_media_salt_to_lookup_save_and_load(
+    monkeypatch, cache_seed, salt
+):
+    """Image placeholder ids are the same for every picture, so each tier key
+    of a seeded prompt carries its `cache_seed`; a text prompt carries none."""
+    sched = _lookup_scheduler(monkeypatch, hit=16)
+    asked = []
+
+    def lookup(_token_ids, lookup_id, **kwargs):
+        asked.append(kwargs)
+        return 16
+
+    sched._lookup_client.lookup = lookup
+    loader, saver = _load_seq(950, num_prompt_tokens=24), _load_seq(951)
+    loader.cache_seed = saver.cache_seed = cache_seed
+    saver.num_cached_tokens = 8
+    sched._save_tracker["951"] = [saver, 0]
+
+    sched.get_num_new_matched_tokens(loader)
+    sched.update_state_after_alloc(loader)
+    load, save = sched.build_connector_meta().requests
+
+    expected = {"request_configs": {"lmcache.tag.cache_salt": salt}} if salt else {}
+    assert asked and all(kwargs == expected for kwargs in asked)
+    assert (load.load_spec is not None, load.cache_salt) == (True, salt)
+    assert (save.save_spec is not None, save.cache_salt) == (True, salt)
+
+
+@pytest.mark.parametrize(
+    "cache_salt, configs", [("11", {"lmcache.tag.cache_salt": "11"}), ("", None)]
+)
+def test_dense_worker_loads_and_stores_under_the_prompts_salt(cache_salt, configs):
+    worker = DenseOffloadConnector(_config())
+    load = LMCacheReqMeta(
+        req_id=22,
+        token_ids=list(range(8)),
+        block_ids=[3],
+        load_spec=LoadSpec(hbm_cached_tokens=0, lmcache_cached_tokens=8, can_load=True),
+        load_operation=LoadOperationId(req_id=22, generation=1),
+        cache_salt=cache_salt,
+    )
+    save = LMCacheReqMeta(
+        req_id=23,
+        token_ids=list(range(8)),
+        block_ids=[4],
+        save_spec=SaveSpec(skip_leading_tokens=0),
+        cache_salt=cache_salt,
+    )
+    worker.chunk_size = 8
+    received = []
+
+    class Engine:
+        gpu_connector = None
+
+        @staticmethod
+        def retrieve(_tokens, *, mask, **kwargs):
+            received.append(kwargs.get("request_configs"))
+            return mask.clone()
+
+        @staticmethod
+        def store(_tokens, **kwargs):
+            received.append(kwargs.get("request_configs"))
+
+        @staticmethod
+        def lookup_unpin(_lookup_id):
+            pass
+
+    try:
+        worker._engine = Engine()
+        worker._do_load_req(load)
+        worker._do_save_req(save)
+    finally:
+        worker._save_executor.shutdown(wait=True)
+        worker._load_executor.shutdown(wait=True)
+    assert received == [configs, configs]
