@@ -98,7 +98,11 @@ def test_structured_verify_keeps_raw_logprobs(modules, monkeypatch, probabilisti
         synthetic_acceptance_rates=None, forward=ordinary_verify
     )
     state = NS(src_for=lambda requests, count: torch.tensor([0]))
-    runner.drafter = NS(prob_state=state if probabilistic else None, lossless=None)
+    runner.drafter = NS(
+        prob_state=state if probabilistic else None,
+        lossless=None,
+        context_kv_only=False,
+    )
     monkeypatch.setattr(runner, "propose_draft_token_ids", lambda *args: None)
 
     def prepare(batch, ids, event, logprobs, **kwargs):

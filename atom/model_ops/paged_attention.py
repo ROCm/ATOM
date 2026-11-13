@@ -94,6 +94,8 @@ class Attention(BaseAttention):
         self.layer_num = layer_num
         self.mla_modules = mla_modules
         self.base_attention = None
+        # The page it reads its paged cache in; None is the cache's own block.
+        self.page_tokens = None
         self.kv_cache = torch.tensor([])
         self.indexer = mla_modules.indexer if mla_modules is not None else None
         self.sinks = sinks
