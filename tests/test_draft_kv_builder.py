@@ -455,6 +455,40 @@ def test_gqa_draft_layers_share_one_bound_unit_scale_tensor():
     assert all(m.k_scale is scale and m.v_scale is scale for m in layers)
 
 
+def test_a_per_tensor_scale_stays_off_the_blockwise_kv_cache_data():
+    """The shared unit scale is the layers' own binding, not per-block data:
+    the entries published to `kv_cache_data` carry the draft's K/V only, so a
+    block-wise walker such as the LMCache offload codec accepts them."""
+    from atom.kv_transfer.offload.dense.kv_byte_codec import DenseKVByteCodec
+
+    pool = MhaKvPool(
+        layers=2,
+        block_size=128,
+        num_kv_heads=2,
+        head_dim=64,
+        kv_dtype=torch.bfloat16,
+        flash_layout=True,
+    )
+    pool.allocate(4, "cpu")
+    runner = _runner(draft_layers=2)
+    runner.config = SimpleNamespace(max_model_len=4096, kv_cache_dtype="fp8")
+    builder = DraftKvBuilder(
+        runner, lambda **_: pool, kv_scale=DraftKvPoolSpec().kv_scale
+    )
+    builder._kv_pool = pool
+
+    layers = [m for m in runner.drafter.model if isinstance(m, _PagedAttention)]
+    entries = {}
+    for i, m in enumerate(layers):
+        m.layer_num = i
+        entries[f"layer_{i}"] = builder.build_kv_cache_tensor(m)
+
+    assert all(e.k_scale is None and e.v_scale is None for e in entries.values())
+    assert all(m.k_scale.numel() == 1 for m in layers)  # the binding keeps it
+    codec = DenseKVByteCodec(entries, num_blocks=4)
+    assert codec.bytes_per_block > 0
+
+
 def _bind_first_layer(pool, kv_cache_dtype, kv_scale=None):
     """Bind one paged layer through the builder; return the module."""
     pool.allocate(2, "cpu")
