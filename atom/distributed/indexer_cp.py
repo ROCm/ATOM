@@ -50,6 +50,25 @@ def indexer_cp_enabled() -> bool:
     return bool(getattr(config.dcp_config, "indexer_dcp_only", False))
 
 
+# Measured (task-index-sh cp_total_report, FlyDSL NVFP4 scorer, S=4): CP loses at
+# every batch <= 8 up to 131K context and wins from batch 16 at >= ~131K.
+_FP4_MIN_BATCH = 16
+
+
+def indexer_cp_min_batch() -> int:
+    """Smallest decode batch (requests) that scores through the CP chain.
+
+    A captured decode graph fixes its batch, so this is a static choice per graph
+    bucket. Below it a layer scores its own head on the TP path. The attention impl
+    and the scorer-record builder each read it once at construction and must agree,
+    which one function and one process-wide config guarantee.
+    """
+    if envs.ATOM_M3_INDEXER_CP_MIN_BATCH is not None:
+        return envs.ATOM_M3_INDEXER_CP_MIN_BATCH
+    index_dtype = get_current_atom_config().index_cache_dtype
+    return _FP4_MIN_BATCH if index_dtype in ("fp4", "nvfp4") else 1
+
+
 def get_indexer_cp_group():
     """The process group the indexer shards context over.
 

@@ -25,9 +25,11 @@ class IndexScoreBuffers:
     block count it was built at: checked for an exact match, and fixed across graph
     replays. A prefill step's record has neither.
 
-    Under indexer CP (``cp_world > 1``) the decode scorer runs every index head over
-    this rank's blocks ``b % cp_world == cp_rank`` only: the map is that shard's and
-    ``max_block`` its bound, ``ceil(blocks / cp_world)``. A prefill stays TP.
+    Indexer CP (``cp_world`` > 1, this rank's shard ``cp_rank``): the builder's record
+    is for either arm, ``max_block`` the global bound and ``cp_min_batch`` the smallest
+    decode batch that takes the CP arm (`cp_decode`). A step's decode record (see
+    `make_sparse_decode_metadata`) is for the arm that step runs: ``cp_world`` stays
+    > 1 only on the CP arm, whose ``max_block`` is the shard's local bound.
     """
 
     scores: LogitsWorkspace
@@ -36,18 +38,16 @@ class IndexScoreBuffers:
     nvfp4: bool = False  # the index cache is NVFP4 (else MXFP4)
     cp_world: int = 1
     cp_rank: int = 0
+    cp_min_batch: int = 1
+
+    def cp_decode(self, batch: int) -> bool:
+        """Whether a decode step of ``batch`` requests scores through the CP chain."""
+        return self.cp_world > 1 and batch >= self.cp_min_batch
 
     @property
-    def shard(self) -> dict:
-        """The CP shard as aiter's work map and scorer take it."""
-        return _shard(self.cp_world, self.cp_rank)
-
-
-def _shard(cp_world: int, cp_rank: int) -> dict:
-    # nothing unsharded, so that launch keeps the exact call it has without CP
-    if cp_world == 1:
-        return {}
-    return {"cp_world": cp_world, "cp_rank": cp_rank}
+    def cp_max_block(self) -> int:
+        """A shard's local block bound: round-robin ownership gives rank 0 the most."""
+        return -(-self.max_block // self.cp_world)
 
 
 def allocate_index_scorers(
@@ -57,7 +57,9 @@ def allocate_index_scorers(
     max_bs: int,
     max_qlen: int,
     num_idx_heads: int,
-    cp: tuple[int, int] = (1, 0),
+    cp_world: int = 1,
+    cp_rank: int = 0,
+    cp_min_batch: int = 1,
 ) -> dict[str, IndexScoreBuffers]:
     """The builder's records by ubatch prefix (``""`` the whole step, ``ub<i>_`` a decode
     micro-batch); empty unless the index cache is MXFP4 or NVFP4, so ``"" in`` the result is the
@@ -76,46 +78,53 @@ def allocate_index_scorers(
     q == 1 for its map; `cut_decode_ubatches` cuts ``max_bs`` requests at
     ``max_bs // 2``.
 
-    ``cp`` is this rank's indexer-CP ``(world, rank)``: the decode map and bound are
-    the shard's, over ``num_idx_heads * world`` heads, and the workspace fits that
-    too. A prefill chunk still scores ``num_idx_heads`` heads over every block.
+    With indexer CP (``cp_world`` > 1) the map buffer and the workspace also cover the
+    CP arm's geometry: ``cp_world`` index heads over a shard's local blocks.
     """
     if config.index_cache_dtype not in FP4_CACHE_DTYPES:
         return {}
     # once, at construction: this module must stay importable without aiter
     from aiter.ops.flydsl import minimax_m3_index_score_work_map_capacity
 
-    cp_world, cp_rank = cp
     max_block = -(-config.max_model_len // SPARSE_BLOCK_SIZE)
-    decode_heads = num_idx_heads * cp_world
-    decode_block = -(-max_block // cp_world)
+
+    local_block = -(-max_block // cp_world)
 
     def work_map(batch: int, query_len: int) -> torch.Tensor:
         # allocated once: a captured graph bakes its pointer
         rows = 0
         if batch > 0:
             rows = minimax_m3_index_score_work_map_capacity(
-                batch,
-                decode_block,
-                query_len,
-                decode_heads,
-                **_shard(cp_world, cp_rank),
+                batch, max_block, query_len, num_idx_heads
             )
+            if cp_world > 1:
+                rows = max(
+                    rows,
+                    minimax_m3_index_score_work_map_capacity(
+                        batch,
+                        local_block,
+                        query_len,
+                        cp_world,
+                        cp_world=cp_world,
+                        cp_rank=cp_rank,
+                    ),
+                )
         return torch.empty((rows, 2), dtype=torch.int32, device=device)
 
     rows = max(max_bs * max_qlen, config.max_num_batched_tokens)
-    capacity = max(
+    cells = max(
         num_idx_heads * rows * max_block,
-        decode_heads * max_bs * max_qlen * decode_block,
+        cp_world * max_bs * max_qlen * local_block if cp_world > 1 else 0,
     )
     scorers = {
         "": IndexScoreBuffers(
-            scores=LogitsWorkspace(capacity, device),
+            scores=LogitsWorkspace(cells, device),
             work_map=work_map(max_bs, max_qlen),
-            max_block=decode_block,
+            max_block=max_block,
             nvfp4=config.index_cache_dtype == "nvfp4",
             cp_world=cp_world,
             cp_rank=cp_rank,
+            cp_min_batch=cp_min_batch,
         )
     }
     if config.enable_tbo and config.enable_tbo_decode:

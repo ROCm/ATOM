@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-from functools import cache
+from functools import cache, partial
 
 import aiter
 import torch
@@ -1327,15 +1327,18 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             get_indexer_cp_rank,
             get_indexer_cp_world_size,
             indexer_cp_enabled,
+            indexer_cp_min_batch,
         )
 
         self.indexer_cp_group = None
         self.indexer_cp_rank = 0
         self.indexer_cp_world = 1
+        self.indexer_cp_min_batch = 1
         if indexer_cp_enabled():
             self.indexer_cp_group = get_indexer_cp_group()
             self.indexer_cp_rank = get_indexer_cp_rank()
             self.indexer_cp_world = get_indexer_cp_world_size()
+            self.indexer_cp_min_batch = indexer_cp_min_batch()
         self.num_idx_heads = (
             self.indexer_cp_world if self.indexer_cp_group is not None else num_kv_heads
         )
@@ -1849,9 +1852,10 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         Only the shard's own top-k crosses the wire, so the payload is
         world*topk keys per token at any context length.
 
-        ``index_scorer`` (the MXFP4 index cache's, the step's record of this shard)
-        scores with aiter's FlyDSL scorer into its workspace; without one the
-        Triton scorer reads the BF16/FP8 cache.
+        ``index_scorer`` is the step's record (`_index_scorer`) for the FP4 index
+        caches, which score through aiter's FlyDSL scorer; the others use the
+        Triton one. Returns ``(topk_idx, sparse_bt, sparse_ctx)``, the last two
+        None where the KV layout takes the block ids alone (NVFP4).
         """
         from atom.distributed.indexer_cp import exchange_candidates
         from atom.model_ops.minimax_m3.indexer_candidate_exchange import (
@@ -1860,33 +1864,26 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         )
         from atom.model_ops.minimax_m3.indexer_context_parallel import (
             indexer_context_scores,
-            indexer_context_scores_mxfp4,
+            indexer_context_scores_fp4,
         )
 
         global_blocks = block_table.shape[1]
-        if index_scorer is not None:
-            scores = indexer_context_scores_mxfp4(
-                index_q,
-                self.index_cache,
-                block_table,
-                seq_lens,
-                max_seq_len,
-                max_query_len,
-                self.scale,
-                index_scorer,
-            )
-        else:
-            scores = indexer_context_scores(
-                index_q,
-                self.index_cache,
-                block_table,
-                seq_lens,
-                max_seq_len,
-                self.indexer_cp_rank,
-                self.indexer_cp_world,
-                max_query_len,
-                self.scale,
-            )
+        score = (
+            partial(indexer_context_scores_fp4, index_scorer=index_scorer)
+            if self.index_cache_dtype in FP4_CACHE_DTYPES
+            else indexer_context_scores
+        )
+        scores = score(
+            index_q,
+            self.index_cache,
+            block_table,
+            seq_lens,
+            max_seq_len,
+            self.indexer_cp_rank,
+            self.indexer_cp_world,
+            max_query_len,
+            self.scale,
+        )
         # Forced blocks are pinned in BOTH passes on purpose: one that lost its
         # owner shard's top-k would never arrive at the merge to be pinned.
         keys = local_candidate_keys(
@@ -1900,7 +1897,8 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             self.init_blocks,
             self.local_blocks,
         )
-        return merge_candidate_keys(
+        nvfp4 = self.kv_cache_dtype == "nvfp4"
+        selected = merge_candidate_keys(
             exchange_candidates(keys),
             block_table,
             seq_lens,
@@ -1908,8 +1906,10 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             self.init_blocks,
             self.local_blocks,
             max_query_len,
+            emit=not nvfp4,
             **self._select_page_kwargs,
         )
+        return (*selected, None, None) if nvfp4 else selected
 
     @mark_trace(prefix="sparse_attention_decode", torch_compile=False)
     def _sparse_decode(
@@ -1941,16 +1941,27 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             if index_q is None:
                 raise RuntimeError("MiniMax-M3 index cache miss on a skip-index layer")
             index_q = index_q[:rows]
-            if self.indexer_cp_group is not None:
+            # a graph bucket fixes its batch, so this is a static choice per bucket
+            cp_arm = (
+                self.indexer_cp_group is not None
+                and decode_md.seq_lens.shape[0] >= self.indexer_cp_min_batch
+            )
+            if cp_arm:
                 topk_idx, sparse_bt, sparse_ctx = self._cp_index_topk_decode(
                     index_q,
                     decode_md.block_table,
                     decode_md.seq_lens,
                     sparse_metadata.max_seq_len,
                     max_query_len,
-                    index_scorer=self._index_scorer(sparse_metadata),
+                    self._index_scorer(sparse_metadata),
                 )
             else:
+                if self.indexer_cp_group is not None:
+                    # a batch below `indexer_cp_min_batch` scores its own head on
+                    # the TP path, the slice of the wide projection prefill takes
+                    index_q = index_q[
+                        :, self.indexer_cp_rank : self.indexer_cp_rank + 1
+                    ]
                 nvfp4 = self.kv_cache_dtype == "nvfp4"
                 selected = minimax_m3_index_topk_decode(
                     index_q,

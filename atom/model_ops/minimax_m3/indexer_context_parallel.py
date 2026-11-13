@@ -10,11 +10,10 @@ from atom.model_ops.minimax_m3.index_topk import (
     PAGES_PER_SPARSE_BLOCK,
     _alloc_emit,
     _decode_score_chunks,
+    _fp4_index_ops,
     _launch_select,
     _require_packable,
-    flydsl_ops,
 )
-from atom.model_ops.minimax_m3.mxfp4_pages import page_views
 
 
 @triton.jit(do_not_specialize=["LOCAL_BLOCKS", "GLOBAL_BLOCKS", "CHUNK"])
@@ -167,56 +166,60 @@ def indexer_context_scores(
     return scores
 
 
-def indexer_context_scores_mxfp4(
+def indexer_context_scores_fp4(
     idx_q,
     index_cache,
     block_table,
     seq_lens,
     max_seq_len,
+    rank,
+    world_size,
     max_query_len,
     sm_scale,
     index_scorer,
 ):
-    """`indexer_context_scores` over the MXFP4 index cache, by aiter's FlyDSL scorer.
+    """`indexer_context_scores` for the MXFP4 / NVFP4 index cache, by aiter's FlyDSL decode
+    scorer: ``[heads, tokens, local]`` fp32, round-robin logical blocks.
 
-    ``index_scorer`` is the step's record of this rank's shard: the work map, the
-    shard's block bound ``max_block`` it was built at, and the workspace the scores
-    go into as a contiguous ``[heads, tokens, max_block]`` view, in the same
-    round-robin order. Unlike the BF16 scorer this one writes a row only up to its
-    own blocks. `local_candidate_keys` still loads each row up to ``max_block`` and
-    masks the lanes past the row's blocks with ``valid``, so what the workspace
-    holds there never reaches a key.
+    ``index_scorer`` is the step's record built for this shard (`cp_world`, `cp_rank`
+    and a work map of the CP geometry, `max_block` the LOCAL block bound); the scores
+    go into its workspace, ``local`` wide as the map was built, so the width is fixed
+    across graph replays. ``idx_q`` is the e4m3 query of every index head.
     """
-    if index_scorer.work_map is None:
+    if (index_scorer.cp_world, index_scorer.cp_rank) != (world_size, rank):
         raise ValueError(
-            "the MXFP4 index decode needs the step's index_scorer "
-            "(a work map and the score workspace)"
+            f"the index scorer record is for shard {index_scorer.cp_rank} of "
+            f"{index_scorer.cp_world}, not {rank} of {world_size}"
         )
+    if index_scorer.work_map is None:
+        raise ValueError("the CP index decode needs the step's index_scorer work map")
+    tokens, heads, _ = idx_q.shape
     local = index_scorer.max_block
-    if triton.cdiv(triton.cdiv(max_seq_len, 128), index_scorer.cp_world) > local:
+    if triton.cdiv(max_seq_len, 128) > local * world_size:
         raise ValueError(
             f"a context of {max_seq_len} tokens is wider than the {local} blocks a "
-            "shard of the index scorer's work map was built at"
+            f"shard of {world_size} the index scorer's work map was built at"
         )
-    tokens, heads, _ = idx_q.shape
-    # fails if the step outgrows the workspace
+    _require_packable(local * world_size)
+    views, _, score_decode = _fp4_index_ops(index_scorer)
+    k_data, k_scale = views(index_cache)
     scores = index_scorer.scores.logits(heads * tokens, local).view(
         heads, tokens, local
     )
-    k_data, k_scale = page_views(index_cache)
-    return flydsl_ops().minimax_m3_index_score_flydsl(
+    return score_decode(
         idx_q,
         k_data,
+        k_scale,
         block_table,
         seq_lens,
         max_query_len,
         heads,
         sm_scale,
         local,
-        out=scores,
         work_map=index_scorer.work_map,
-        k_scale=k_scale,
-        **index_scorer.shard,
+        out=scores,
+        cp_world=world_size,
+        cp_rank=rank,
     )
 
 

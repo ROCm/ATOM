@@ -172,11 +172,9 @@ def make_sparse_decode_metadata(
     """``index_scorer`` is the builder's MXFP4 index scorer record (None for any other
     index cache): the step's work map is built into its capacity buffer here, once, at
     its ``max_block``, and the metadata carries the record with that map; an empty batch
-    builds none. Under indexer CP the map is the record's shard over every index head
-    (``num_idx_heads``, this rank's, times the world). ``seq_lens`` and
-    ``block_table`` must be the requests whose rows the scorer, selector and attention
-    run (pad requests: length 0): the map and ``n_valid_column_per_row`` both follow
-    that batch.
+    builds none. ``seq_lens`` and ``block_table`` must be the requests whose rows the
+    scorer, selector and attention run (pad requests: length 0): the map and
+    ``n_valid_column_per_row`` both follow that batch.
     """
     decode = MiniMaxM3SparseDecodeMetadata(
         seq_lens=seq_lens, block_table=block_table, max_query_len=max_query_len
@@ -184,16 +182,27 @@ def make_sparse_decode_metadata(
     batch = seq_lens.shape[0]
     step_scorer = None
     if index_scorer is not None and batch > 0:
+        # the arm this step's layers run (`SparseMHAPagedAttentionImpl._sparse_decode`
+        # asks `indexer_cp_min_batch` the same question): the CP one scores every index
+        # head over this rank's blocks, the other its own head over all of them
+        cp = index_scorer.cp_decode(batch)
+        width = index_scorer.cp_max_block if cp else index_scorer.max_block
         step_scorer = replace(
             index_scorer,
             work_map=flydsl_ops().minimax_m3_index_score_work_map(
                 seq_lens,
-                index_scorer.max_block,
+                width,
                 max_query_len,
-                num_idx_heads * index_scorer.cp_world,
+                index_scorer.cp_world if cp else num_idx_heads,
                 out=index_scorer.work_map,
-                **index_scorer.shard,
+                **(
+                    {"cp_world": index_scorer.cp_world, "cp_rank": index_scorer.cp_rank}
+                    if cp
+                    else {}
+                ),
             ),
+            max_block=width,
+            cp_world=index_scorer.cp_world if cp else 1,
         )
     return MiniMaxM3SparseMetadata(
         seq_lens=seq_lens,

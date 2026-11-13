@@ -20,10 +20,12 @@ assumed width reads 4x the rows it should. SGLang is exactly that bridge today,
 which is why it must keep answering False.
 """
 
+import inspect
+
 import pytest
 import torch
 
-from atom.config import DCPConfig, indexer_cp_unsupported_reason
+from atom.config import indexer_cp_unsupported_reason
 
 M3 = ["MiniMaxM3SparseForCausalLM"]
 
@@ -87,26 +89,12 @@ def test_topology_gate_reasons_are_human_readable():
     )
 
 
-@pytest.mark.parametrize("kv_dtype", ["fp4", "bf16"])  # the MXFP4 index, with / without
-def test_mxfp4_caches_keep_the_cp_scorer(monkeypatch, caplog, kv_dtype):
-    """The MXFP4 index, alone or with the MXFP4 KV, keeps the CP flag: its decode
-    scorer takes the shard (`indexer_context_scores_mxfp4`)."""
-    from tests.test_minimax_m3_mxfp4_cache import _m3, sparse_hf
-
-    with caplog.at_level("INFO", logger="atom"):
-        config = _m3(
-            monkeypatch,
-            kv_cache_dtype=kv_dtype,
-            index_cache_dtype="fp4",
-            tensor_parallel_size=4,
-            hf={**sparse_hf(), "num_key_value_heads": 4},
-            dcp_config=DCPConfig(indexer_dcp_only=True),
-        )
-
-    assert (config.kv_cache_dtype, config.index_cache_dtype) == (kv_dtype, "fp4")
-    assert config.dcp_config.indexer_dcp_only is True
-    assert "indexer_dcp_only enabled" in caplog.text
-    assert "indexer_dcp_only disabled" not in caplog.text
+def test_topology_gate_has_no_cache_dtype_term():
+    """The FP4 / NVFP4 index caches score through aiter's CP-aware FlyDSL scorer, so the
+    gate is topology alone: no parameter to refuse a cache dtype with."""
+    assert indexer_cp_unsupported_reason(M3, 4, 4, 128, 1, False) is None
+    params = inspect.signature(indexer_cp_unsupported_reason).parameters
+    assert not [p for p in params if "cache" in p or "fp4" in p]
 
 
 # ───────────────────────────────────────────────────── compilation key ──

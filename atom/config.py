@@ -2013,6 +2013,12 @@ def resolve_draft_kv_dtype(target_dtype: str, *, own_pool: bool) -> str:
     return "bf16" if own_pool and target_dtype in FP4_CACHE_DTYPES else target_dtype
 
 
+# Below this context no decode batch up to 32 repaid the CP exchange (task-index-sh
+# cp_total_report, FlyDSL NVFP4 scorer); only a warning, since requests are not all
+# max_model_len long.
+INDEXER_CP_MIN_MODEL_LEN = 65536
+
+
 def indexer_cp_unsupported_reason(
     arches,
     tp_size: int,
@@ -3163,6 +3169,14 @@ class Config:
                     getattr(text_cfg, "num_key_value_heads", 0),
                     self.tensor_parallel_size,
                 )
+                if self.max_model_len < INDEXER_CP_MIN_MODEL_LEN:
+                    logger.warning(
+                        "dcp_config.indexer_dcp_only with max_model_len %d: indexer "
+                        "CP did not beat the TP path below ~%d tokens of context in "
+                        "the FP4 scorer's measurements.",
+                        self.max_model_len,
+                        INDEXER_CP_MIN_MODEL_LEN,
+                    )
 
         # Keep ``None`` intact until the model architecture is known so an
         # omitted index-cache option remains distinguishable from an explicit
