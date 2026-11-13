@@ -153,14 +153,11 @@ def wait_save_fence(event) -> None:
     """Block the save thread until the writes behind `event` have run.
 
     Fails closed on ``None``: a save without its fence must fail rather than read
-    a source nothing ordered. An event that only records (the unit-test double)
-    has no ``synchronize``.
+    a source nothing ordered.
     """
     if event is None:
         raise ValueError("a save was handed no producer fence")
-    synchronize = getattr(event, "synchronize", None)
-    if synchronize is not None:
-        synchronize()
+    event.synchronize()
 
 
 class SaveLifecycle:
