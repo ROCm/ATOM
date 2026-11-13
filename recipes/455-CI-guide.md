@@ -45,6 +45,7 @@
 | 周三 | 8K/1K | MiniMax-M3 (428B) | `minimax-m3` | 1 tray x 1P4G | 4 | 64、4 | — |
 | 周三 | 8K/1K | Qwen-3.8 Flash | `qwen-3.8-flash` | 1 card | 1 | 64、4 | — |
 
+- **DeepSeek R1 的权重固定用 [`amd/Deepseek-S3_sq_a05_v2_mlperf6_1`](https://huggingface.co/amd/Deepseek-S3_sq_a05_v2_mlperf6_1)**，即 MLPerf v6.1 closed division 的 Quark MXFP4 权重。不要换成其他 DeepSeek R1 checkpoint，换了数字就和历史对不上。
 - **GPU 数**是每卡吞吐的分母：1 tray x 1P4G 为 4 张，2 tray 为 8 张，1 card 为 1 张。
 - **slug** 用作目录名，以及 `perf.csv`、`accuracy.csv` 的 `model` 列。定下来就不要改，否则新旧数据对不上。
 - 每个模型都先测 GSM8K 精度（§3.3），再测表里的性能。

@@ -297,11 +297,11 @@ python3 -m atom.benchmarks.benchmark_serving \
 
 - 场景：MLPerf Endpoint；GPU：4（1 tray x 1P4G）
 - 并行：注意力 DP4（DP attention），MoE EP4；FP8 KV cache，block 64；不开 prefix cache 和 chunked prefill；`q_b_proj` 在线量化成 MXFP4
-- MODEL_PATH：`/models/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4/`（结尾的 `/` 是模型名的一部分，lm_eval 和 bench 要写成一样）；PORT：`8000`
+- MODEL_PATH：`/models/Deepseek-S3_sq_a05_v2_mlperf6_1/`（[`amd/Deepseek-S3_sq_a05_v2_mlperf6_1`](https://huggingface.co/amd/Deepseek-S3_sq_a05_v2_mlperf6_1) @ `1415311f5a898bc5fb0579612edacf4d4eb75bed`，MLPerf v6.1 closed division 的 Quark MXFP4 权重，455-CI 固定用它；结尾的 `/` 是模型名的一部分，lm_eval 和 bench 要写成一样）；PORT：`8000`
 
-**main 上能跑**（2026-11-13 复测）。偶发问题：2026-11-12 在 main 上第一次跑时，GSM8K 开始后 rank 0 退出过一次，报 `RuntimeError: Triton Error [HIP]: Code: 200, Message: device kernel image is invalid`。出错的是 o_proj 的 aiter Triton `gemm_a8w8`（`atom/model_ops/linear.py:615`）现场 JIT 出的一个新 M 档位 kernel，在加载（`hipModuleLoadDataEx`）时失败。之后同样的代码和命令又跑了两遍 GSM8K 和一轮完整性能测试，都没再出现，同一个 kernel 也能正常加载。这个 recipe 用 `--gpu-memory-utilization 0.975`，c64 时每卡空闲显存只剩 1–2 GiB，推断是新 kernel 加载时正好显存不够，没有证实。再遇到时按指南 §3.4 记失败，`note` 写明是这个问题。
+**旧权重 `DeepSeek-R1-0528-MXFP4-MTP-MoEFP4` 在 main 上能跑**（2026-11-13 复测，换 MLPerf v6.1 权重之前）。偶发问题：2026-11-12 在 main 上第一次跑时，GSM8K 开始后 rank 0 退出过一次，报 `RuntimeError: Triton Error [HIP]: Code: 200, Message: device kernel image is invalid`。出错的是 o_proj 的 aiter Triton `gemm_a8w8`（`atom/model_ops/linear.py:615`）现场 JIT 出的一个新 M 档位 kernel，在加载（`hipModuleLoadDataEx`）时失败。之后同样的代码和命令又跑了两遍 GSM8K 和一轮完整性能测试，都没再出现，同一个 kernel 也能正常加载。这个 recipe 用 `--gpu-memory-utilization 0.975`，c64 时每卡空闲显存只剩 1–2 GiB，推断是新 kernel 加载时正好显存不够，没有证实。再遇到时按指南 §3.4 记失败，`note` 写明是这个问题。旧权重的 o_proj 是 8-bit（走这个 `gemm_a8w8`），MLPerf v6.1 权重的 o_proj 是 MXFP4，新权重上还没验证过。
 
-命令取自 `gfx1250-atom-2026111x` 镜像里的 `/app/scripts/dsr1/serve_dsr1fp4_a8w8_dp4ep4_realEPLB.sh`，参数原样。不用同目录的 `serve_dsr1fp4_a8w8_dp4ep4.sh`：它默认 `FAKE_EPLB=1`，加 `--fake-eplb --hf-overrides '{"num_hash_layers": 0}'`，假路由输出乱码，GSM8K 没法测。c4 和 c64 用同一个 server。
+命令取自 `gfx1250-atom-2026111x` 镜像里的 `/app/scripts/dsr1/serve_dsr1fp4_a8w8_dp4ep4_realEPLB.sh`，模型换成了上面的 MLPerf v6.1 权重，其余参数原样。这些参数是按旧权重整理的，第一次用新权重时先确认 server 起得来、GSM8K 正常。不用同目录的 `serve_dsr1fp4_a8w8_dp4ep4.sh`：它默认 `FAKE_EPLB=1`，加 `--fake-eplb --hf-overrides '{"num_hash_layers": 0}'`，假路由输出乱码，GSM8K 没法测。c4 和 c64 用同一个 server。
 
 ### server
 
@@ -315,7 +315,7 @@ env ATOM_MLA_ABSORB_BF16_FUSE_QOUT=1 ATOM_MLA_KV_SHUFFLED=1 ATOM_MEGA_MASK_PAD_R
   AITER_USE_OPUS_MOE_SORTING=1 ATOM_MOE_GU_ITLV=1 ATOM_MORI_V2=1 ATOM_MORI_V2_FUSED=1 ATOM_MEGA_STAGE1_FUSED=0 \
   MEGA_DISPATCH=mori MORI_GPU_ARCHS=gfx1250 FLYDSL_GPU_ARCH=gfx1250 AITER_FLYDSL_GATHER_REDUCE_WAVE_MIN_TOKENS=-1 \
   ATOM_GC_THRESHOLD=20000,50,50 MEGA_DISPATCH_WIRE=fp4 \
-python3 -m atom.entrypoints.openai_server -tp 4 --model /models/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4/ \
+python3 -m atom.entrypoints.openai_server -tp 4 --model /models/Deepseek-S3_sq_a05_v2_mlperf6_1/ \
   --kv_cache_dtype fp8 --block-size 64 --no-enable_prefix_caching --no-enable-chunked-prefill \
   --enable-expert-parallel --enable-dp-attention \
   --online_quant_config '{"layer_quant_config":{"*.self_attn.q_b_proj":"mxfp4"}}' \
@@ -331,7 +331,7 @@ python3 -m atom.entrypoints.openai_server -tp 4 --model /models/DeepSeek-R1-0528
 
 ```bash
 HF_HUB_OFFLINE=0 lm_eval --model local-completions \
-  --model_args "model=/models/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4/,base_url=http://127.0.0.1:8000/v1/completions,num_concurrent=65,max_retries=3,max_gen_toks=2048,tokenized_requests=False,trust_remote_code=True" \
+  --model_args "model=/models/Deepseek-S3_sq_a05_v2_mlperf6_1/,base_url=http://127.0.0.1:8000/v1/completions,num_concurrent=65,max_retries=3,max_gen_toks=2048,tokenized_requests=False,trust_remote_code=True" \
   --tasks gsm8k --num_fewshot 3 --output_path "$ACC_DIR" > "$ACC_DIR/lm_eval.log" 2>&1
 ```
 
@@ -354,7 +354,7 @@ rm -rf $EP/dataset_cache/legacy_mlperf_deepseek_r1    # 缓存不跟数据集路
 cd $EP
 run_r1() {  # run_r1 <样本数> <输出上限> <report_dir>
   $EP/venv/bin/inference-endpoint benchmark online --endpoints http://127.0.0.1:8000 \
-    --model /models/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4/ --tokenizer /models/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4/ \
+    --model /models/Deepseek-S3_sq_a05_v2_mlperf6_1/ --tokenizer /models/Deepseek-S3_sq_a05_v2_mlperf6_1/ \
     --api-type openai_completions --dataset legacy_mlperf_deepseek_r1 --mode perf \
     --load-pattern concurrency --concurrency $CONC --num-samples $1 --streaming on \
     --max-output-tokens $2 --runtime.max-issue-duration-ms 600000 --timeout 14400 --report-dir $3
@@ -367,7 +367,7 @@ run_r1 4388 20000 $RESULT_DIR/report > $RESULT_DIR/bench.log 2>&1
 
 ### 参考值
 
-同一台机器，上面的命令：
+旧权重 `DeepSeek-R1-0528-MXFP4-MTP-MoEFP4`，同一台机器，其余参数和上面的命令相同。换成 MLPerf v6.1 权重后数字会变，只能看量级：
 
 | | GSM8K flexible / strict | c4 tok/s/GPU | c4 interactivity | c64 tok/s/GPU | c64 interactivity |
 |---|---|---|---|---|---|
