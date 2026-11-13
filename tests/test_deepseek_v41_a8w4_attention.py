@@ -2,7 +2,6 @@
 """A8W4 host contracts without importing AITER or initializing a device."""
 
 import ast
-import struct
 from dataclasses import replace
 from pathlib import Path
 from types import MethodType, SimpleNamespace
@@ -39,65 +38,64 @@ def functions(path, names, scope=None, *, class_name=None):
 def api():
     return functions(
         OPS + "a8w4_attention.py",
-        ["select_a8w4_backend", "sparse_attn_v41_a8w4_paged_2src"],
+        ["supports_a8w4_attention", "sparse_attn_v41_a8w4_paged_2src"],
         {
-            "struct": struct,
             "envs": SimpleNamespace(ATOM_DSV41_A8W4_ATTN="auto"),
-            "get_gfx_runtime": Mock(return_value="gfx950"),
+            "get_mla_sparse_prefill_v41_backend": Mock(return_value="opus"),
             "mla_sparse_prefill_v41": Mock(side_effect=lambda *a, **kw: kw["out"]),
-            "opus_mla_v41_prefill_a8w4_gfx950_fwd": object(),
-            "asm_mla_sparse_prefill_v41_fwd": object(),
-            "is_gfx1250_asm_supported": Mock(return_value=True),
         },
     )
 
 
-@pytest.mark.parametrize(
-    "gfx,heads,dim,stepping,scale,expected",
-    [
-        *(
-            ("gfx950", h, 512, True, 512**-0.5, "opus")
-            for h in (2, 4, 8, 16, 32, 64, 128)
-        ),
-        ("gfx1250", 64, 512, True, 512**-0.5, "asm"),
-        ("gfx1250", 32, 512, True, 512**-0.5, None),
-        ("gfx1250", 64, 512, False, 512**-0.5, None),
-        ("gfx1250", 64, 512, True, 0.125, None),
-        ("gfx950", 64, 128, True, 128**-0.5, None),
-        ("gfx942", 64, 512, True, 512**-0.5, None),
-    ],
-)
-def test_backend_eligibility(api, gfx, heads, dim, stepping, scale, expected):
-    api["get_gfx_runtime"].return_value = gfx
-    api["is_gfx1250_asm_supported"].return_value = stepping
-    assert api["select_a8w4_backend"](heads, dim, scale) == expected
-
-
-@pytest.mark.parametrize("backend", ["opus", "asm"])
-def test_missing_backend_keeps_old_adapter(api, backend):
-    api["get_gfx_runtime"].return_value = "gfx950" if backend == "opus" else "gfx1250"
-    symbol = (
-        "opus_mla_v41_prefill_a8w4_gfx950_fwd"
-        if backend == "opus"
-        else "asm_mla_sparse_prefill_v41_fwd"
+@pytest.mark.parametrize("backend", ["opus", "asm", None])
+@pytest.mark.parametrize("rows", [0, 4, 65536, 65537])
+def test_support_query_uses_current_shape_and_intended_dtypes(api, backend, rows):
+    query = SimpleNamespace(
+        shape=torch.Size((2, rows, 64, 512)),
+        device=torch.device("cuda:3"),
+        dtype=torch.bfloat16,
     )
-    api[symbol] = None
-    assert api["select_a8w4_backend"](64, 512, 512**-0.5) is None
+    probe = api["get_mla_sparse_prefill_v41_backend"]
+    probe.return_value = backend
+    assert api["supports_a8w4_attention"](query, 0.125) is (backend is not None)
+    probe.assert_called_once_with(
+        query.device,
+        (2 * rows, 64, 512),
+        unified_kv_dtype=torch.uint8,
+        softmax_scale=0.125,
+        q_dtype=torch.float8_e4m3fn,
+        q_scale_dtype=torch.float8_e8m0fnu,
+        unified_kv_scale_dtype=torch.float8_e4m3fn,
+        kv_dtype=torch.float8_e4m3fn,
+        kv_scale_dtype=torch.float8_e8m0fnu,
+        layout="contiguous",
+    )
 
 
-def test_off_needs_no_arch_probe(api):
+def test_missing_query_keeps_bf16_adapter(api):
+    api["get_mla_sparse_prefill_v41_backend"] = None
+    assert api["supports_a8w4_attention"](object(), 512**-0.5) is False
+
+
+def test_off_needs_no_device_probe(api):
     api["envs"].ATOM_DSV41_A8W4_ATTN = "off"
-    assert api["select_a8w4_backend"](64, 512, 512**-0.5) is None
-    api["get_gfx_runtime"].assert_not_called()
+    assert api["supports_a8w4_attention"](object(), 512**-0.5) is False
+    api["get_mla_sparse_prefill_v41_backend"].assert_not_called()
     api["envs"].ATOM_DSV41_A8W4_ATTN = "unknown"
     with pytest.raises(ValueError, match="auto or off"):
-        api["select_a8w4_backend"](64, 512, 512**-0.5)
+        api["supports_a8w4_attention"](object(), 512**-0.5)
 
 
-@pytest.mark.parametrize("backend", ["opus", "asm"])
+def test_query_errors_are_not_silently_treated_as_fallback(api):
+    api["get_mla_sparse_prefill_v41_backend"].side_effect = ValueError("bad metadata")
+    query = SimpleNamespace(shape=torch.Size((1, 2, 64, 512)), device="cuda")
+    with pytest.raises(ValueError, match="bad metadata"):
+        api["supports_a8w4_attention"](query, 512**-0.5)
+
+
 @pytest.mark.parametrize("rows", [0, 5])
 @pytest.mark.parametrize("splits", [None, 1, 4])
-def test_adapter_preserves_source_storage_and_csr(api, backend, rows, splits):
+def test_adapter_preserves_source_storage_and_csr(api, rows, splits):
     owner = torch.empty(rows * 288, dtype=torch.uint8)
     pool = (owner[: rows * 256].view(rows, 256), owner[rows * 256 :].view(rows, 32))
     window = torch.empty(7 * 528, dtype=torch.uint8)
@@ -120,7 +118,6 @@ def test_adapter_preserves_source_storage_and_csr(api, backend, rows, splits):
         wp,
         sink,
         512**-0.5,
-        backend=backend,
         out=out,
         num_kv_splits=splits,
     )
@@ -136,42 +133,87 @@ def test_adapter_preserves_source_storage_and_csr(api, backend, rows, splits):
         assert args[at].data_ptr() == source.data_ptr()
         assert args[at].dtype == dtype and args[at].is_contiguous()
     assert all(args[i] is value for i, value in ((4, pi), (5, pp), (8, wi), (9, wp)))
-    assert kwargs == {"out": out, "num_kv_splits": splits, "backend": backend}
+    assert kwargs == {"out": out, "num_kv_splits": splits}
 
 
-@pytest.mark.parametrize(
-    "backend,rows,packed,expected",
-    [
-        ("asm", 65536, True, "asm"),
-        ("asm", 65537, True, None),
-        ("opus", 65537, True, "opus"),
-        ("opus", 2, False, None),
-        (None, 2, True, None),
-    ],
-)
-def test_shape_fallback_precedes_q_preparation(backend, rows, packed, expected):
+@pytest.mark.parametrize("supported", [False, True])
+@pytest.mark.parametrize("packed", [False, True])
+def test_only_packed_cache_queries_a8w4_support(supported, packed):
+    probe = Mock(return_value=supported)
     scope = functions(
         "atom/models/deepseek_v41/attention.py",
-        ["_a8w4_attention_backend"],
+        ["_use_a8w4_attention"],
+        {"supports_a8w4_attention": probe},
         class_name="Attention",
     )
-    query = SimpleNamespace(shape=torch.Size((1, rows, 64, 512)))
-    assert (
-        scope["_a8w4_attention_backend"](
-            SimpleNamespace(_a8w4_backend=backend),
-            query,
-            SimpleNamespace(packed=packed),
-        )
-        == expected
+    query = object()
+    assert scope["_use_a8w4_attention"](
+        SimpleNamespace(softmax_scale=512**-0.5), query, SimpleNamespace(packed=packed)
+    ) is (packed and supported)
+    if packed:
+        probe.assert_called_once_with(query, 512**-0.5)
+    else:
+        probe.assert_not_called()
+
+
+@pytest.mark.parametrize("bounded", [False, True])
+def test_support_is_requeried_before_each_q_producer(api, bounded):
+    events = []
+
+    def probe(device, shape, **kwargs):
+        events.append(("probe", shape[0]))
+        return "asm" if shape[0] <= 65536 else None
+
+    api["get_mla_sparse_prefill_v41_backend"].side_effect = probe
+    scope = functions(
+        "atom/models/deepseek_v41/attention.py",
+        ["_use_a8w4_attention", "_attention_inputs"],
+        {"supports_a8w4_attention": api["supports_a8w4_attention"]},
+        class_name="Attention",
     )
+    q8 = object()
+
+    def prepare(query, *, a8w4):
+        events.append(("Q8" if a8w4 else "BF16", query.shape[1]))
+        return q8 if a8w4 else None
+
+    cache = SimpleNamespace(
+        packed=True,
+        query_fp8=prepare,
+        rope_quant_window=Mock(return_value=(object(), object())),
+        rotate_query=Mock(),
+    )
+    owner = SimpleNamespace(softmax_scale=512**-0.5, spec=SimpleNamespace(layer_id=0))
+    owner._use_a8w4_attention = MethodType(scope["_use_a8w4_attention"], owner)
+    queries = SimpleNamespace(positions=object()) if bounded else None
+    for rows, supported in ((65536, True), (65537, False), (4, True)):
+        query = SimpleNamespace(shape=torch.Size((1, rows, 64, 512)), device="cuda:1")
+        prepared = scope["_attention_inputs"](
+            owner, query, object(), cache, object(), object(), queries
+        )
+        assert prepared[0] is supported
+        assert prepared[1] is (q8 if supported else None)
+        assert cache.rope_quant_window.call_args.kwargs["a8w4"] is supported
+        if bounded:
+            assert cache.rotate_query.call_args.args[-1] is prepared[1]
+        else:
+            assert cache.rope_quant_window.call_args.args[-1] is prepared[1]
+    assert events == [
+        ("probe", 65536),
+        ("Q8", 65536),
+        ("probe", 65537),
+        ("BF16", 65537),
+        ("probe", 4),
+        ("Q8", 4),
+    ]
 
 
 @pytest.mark.parametrize("plugin", [False, True])
-@pytest.mark.parametrize("backend", ["opus", "asm"])
+@pytest.mark.parametrize("a8w4", [False, True])
 @pytest.mark.parametrize("decode", [False, True])
 @pytest.mark.parametrize("bounded", [False, True])
 def test_native_and_plugin_use_same_sources_and_commit_order(
-    plugin, backend, decode, bounded
+    plugin, a8w4, decode, bounded
 ):
     events, calls = [], []
 
@@ -182,6 +224,8 @@ def test_native_and_plugin_use_same_sources_and_commit_order(
 
     scope = {
         "sparse_attn_v41_a8w4_paged_2src": attend,
+        "packed_prefill": attend,
+        "packed_decode": lambda *args: attend(*args, out=args[0]),
         "join_stream": lambda *args: events.append("join"),
     }
     if plugin:
@@ -224,9 +268,12 @@ def test_native_and_plugin_use_same_sources_and_commit_order(
         packed=True,
         kv_fp8=False,
         current_step=step,
-        query_fp8=Mock(return_value=q8),
+        query_fp8=Mock(return_value=q8 if a8w4 else None),
         rope_quant_window=Mock(
-            side_effect=lambda *a, **k: (events.append("prepare") or staged, object())
+            side_effect=lambda *a, **k: (
+                events.append("prepare") or (staged if a8w4 else query),
+                object(),
+            )
         ),
         rotate_query=Mock(),
         attention_indices=Mock(return_value=csr),
@@ -248,7 +295,7 @@ def test_native_and_plugin_use_same_sources_and_commit_order(
         qk_norm=Mock(return_value=(None, None, None)),
         _fork_select=Mock(),
         wq_b=Mock(return_value=query.flatten(-2)),
-        _a8w4_attention_backend=Mock(return_value=backend),
+        _use_a8w4_attention=Mock(return_value=a8w4),
         _project_out=Mock(side_effect=lambda value, *args: value),
     )
     queries = (
@@ -276,24 +323,24 @@ def test_native_and_plugin_use_same_sources_and_commit_order(
         ["commit", "attention"] if decode else ["attention", "commit"]
     )
     ((args, kwargs),) = calls
-    assert args[1] is csa and args[4] is (ring if decode else staged)
-    assert args[0][0].data_ptr() == q8[0].data_ptr()
-    assert kwargs["backend"] == backend
-    assert cache.query_fp8.call_args.kwargs == {"a8w4": True}
-    assert cache.rope_quant_window.call_args.kwargs == {"a8w4": True}
+    if a8w4:
+        assert args[1] is csa and args[4] is (ring if decode else staged)
+        assert args[0][0].data_ptr() == q8[0].data_ptr()
+    else:
+        assert args[1] == (csa, ring)
+        assert args[0].dtype == torch.bfloat16
+    assert "backend" not in kwargs
+    assert cache.query_fp8.call_args.kwargs == {"a8w4": a8w4}
+    assert cache.rope_quant_window.call_args.kwargs == {"a8w4": a8w4}
     index_call = queries.indices if bounded else cache.attention_indices
-    assert index_call.call_args.kwargs == {"a8w4": True}
+    assert index_call.call_args.kwargs == {"a8w4": a8w4}
     assert torch.all(result == 3)
 
 
-@pytest.mark.parametrize(
-    "kv_fp8,backend", [(False, None), (False, "opus"), (True, None)]
-)
+@pytest.mark.parametrize("kv_fp8,a8w4", [(False, False), (False, True), (True, False)])
 @pytest.mark.parametrize("decode", [False, True])
 @pytest.mark.parametrize("bounded", [False, True])
-def test_preparation_only_runs_live_for_variable_sources(
-    kv_fp8, backend, decode, bounded
-):
+def test_preparation_only_runs_live_for_variable_sources(kv_fp8, a8w4, decode, bounded):
     scope = functions(
         "atom/models/deepseek_v41/attention.py",
         ["_prepare_attention"],
@@ -301,14 +348,14 @@ def test_preparation_only_runs_live_for_variable_sources(
     )
     prepared = object()
     model = SimpleNamespace(
-        _a8w4_attention_backend=Mock(return_value=backend),
+        _use_a8w4_attention=Mock(return_value=a8w4),
         _prepare_attention_live=Mock(),
         _attention_inputs=Mock(return_value=prepared),
     )
     cache, step = SimpleNamespace(kv_fp8=kv_fp8), SimpleNamespace(decode=decode)
     args = (object(), object(), cache, step, object(), object() if bounded else None)
     result = scope["_prepare_attention"](model, *args)
-    live = bounded or (not decode and (kv_fp8 or backend is not None))
+    live = bounded or (not decode and (kv_fp8 or a8w4))
     if live:
         model._prepare_attention_live.assert_called_once_with(*args)
         model._attention_inputs.assert_not_called()

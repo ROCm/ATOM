@@ -10,8 +10,8 @@ pytest.importorskip("triton", reason="the V4.1 cache and CSR kernels need Triton
 pytest.importorskip("aiter", reason="V4.1 device attention needs AITER")
 
 from atom.model_ops.attentions.deepseek_v41.a8w4_attention import (
-    select_a8w4_backend,
     sparse_attn_v41_a8w4_paged_2src,
+    supports_a8w4_attention,
 )
 from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
 from atom.model_ops.attentions.deepseek_v41.metadata import BatchStep, RequestSpan
@@ -42,10 +42,8 @@ def nvfp4(planes):
 def make_case(heads, decode, ratio=2, *, cache_dtype="fp4"):
     if not torch.cuda.is_available():
         pytest.skip("GPU required")
-    backend = (
-        select_a8w4_backend(heads, 512, 512**-0.5) if cache_dtype == "fp4" else None
-    )
-    if cache_dtype == "fp4" and backend is None:
+    query = torch.empty(1, 4, heads, 512, device="cuda", dtype=torch.bfloat16)
+    if cache_dtype == "fp4" and not supports_a8w4_attention(query, 512**-0.5):
         pytest.skip("This AITER/device combination has no A8W4 backend")
     torch.manual_seed(7407 + heads + ratio)
     geo = V41PoolGeometry(
@@ -100,7 +98,6 @@ def make_case(heads, decode, ratio=2, *, cache_dtype="fp4"):
         cache=cache,
         step=step,
         spec=spec,
-        backend=backend,
         query=torch.randn(1, 4, heads, 512, device="cuda", dtype=torch.bfloat16),
         kv=torch.randn(1, 4, 512, device="cuda", dtype=torch.bfloat16),
         selected=tensor([[0, 1, 2, 3]] * 4),
@@ -134,7 +131,6 @@ def run_case(case, splits=None):
         wp,
         case.sink,
         512**-0.5,
-        backend=case.backend,
         out=result,
         num_kv_splits=splits,
     )
@@ -234,10 +230,9 @@ def test_gfx950_preserves_requested_cache_and_attention(
         spec=case.spec,
         attn_sink=case.sink,
         softmax_scale=512**-0.5,
-        _a8w4_backend=select_a8w4_backend(heads, 512, 512**-0.5),
     )
-    owner._a8w4_attention_backend = (
-        lambda query, cache: Attention._a8w4_attention_backend(owner, query, cache)
+    owner._use_a8w4_attention = lambda query, cache: Attention._use_a8w4_attention(
+        owner, query, cache
     )
     monkeypatch.setattr(
         forward_context,
@@ -273,7 +268,7 @@ def test_gfx950_preserves_requested_cache_and_attention(
         prepared = Attention._attention_inputs(
             owner, case.query, case.kv, cache, step, case.rope, None
         )
-        assert prepared[0] == ("opus" if packed else None)
+        assert prepared[0] is packed
         assert prepared[1] is not None
         output = Attention._attend(owner, case.query, cache, step, None, prepared)
         source = cache.ring_view(0) if decode else prepared[2]
@@ -316,9 +311,11 @@ def test_native_token_graph_replays_different_request_counts(
 
     if not torch.cuda.is_available():
         pytest.skip("Native TokenGraph requires a GPU")
-    backend = select_a8w4_backend(16, 512, 512**-0.5)
-    if backend != "opus":
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    if get_gfx_runtime() != "gfx950":
         pytest.skip("This regression exercises gfx950 OPUS attention")
+    monkeypatch.setenv("ATOM_DSV41_A8W4_ATTN", "auto" if a8w4 else "off")
     torch.manual_seed(2989)
     width, ring, heads = 256, 128, 16
     geo = V41PoolGeometry(
@@ -397,7 +394,6 @@ def test_native_token_graph_replays_different_request_counts(
             index_group_start=0,
             index_group_size=1,
         ),
-        _a8w4_backend=backend if a8w4 else None,
         attn_sink=torch.zeros(heads, device="cuda"),
         softmax_scale=512**-0.5,
         index_stream=None,
@@ -418,7 +414,7 @@ def test_native_token_graph_replays_different_request_counts(
             marker.add_(1)
 
         owner._fork_select = MethodType(select, owner)
-    owner._a8w4_attention_backend = MethodType(Attention._a8w4_attention_backend, owner)
+    owner._use_a8w4_attention = MethodType(Attention._use_a8w4_attention, owner)
     for name in (
         "_prepare_attention",
         "_prepare_attention_live",

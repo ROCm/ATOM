@@ -577,8 +577,7 @@ def _attend_block(
     # decode allows it, the window write. `window_kv` is what is left for
     # `write_window` below, which is nothing when that fold happened. The
     # FP8 pool's attention reads the query as MXFP8 (`query_fp8`).
-    backend = self._a8w4_attention_backend(query, cache)
-    a8w4 = backend is not None
+    a8w4 = self._use_a8w4_attention(query, cache)
     query_fp8 = cache.query_fp8(query, a8w4=a8w4)
     if queries is None:
         kv, window_kv = cache.rope_quant_window(
@@ -605,7 +604,6 @@ def _attend_block(
     if a8w4:
         attend = sparse_attn_v41_a8w4_paged_2src
         attending = tuple(part.flatten(0, 1) for part in query_fp8)
-        kwargs["backend"] = backend
     elif cache.kv_fp8:
         attend = sparse_attn_v41_paged_2src
         attending = tuple(part.flatten(0, 1) for part in query_fp8)

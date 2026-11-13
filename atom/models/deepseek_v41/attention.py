@@ -22,8 +22,8 @@ from aiter.ops.inverse_rope_group_quant import inverse_rope_group_quant
 from torch import nn
 
 from atom.model_ops.attentions.deepseek_v41.a8w4_attention import (
-    select_a8w4_backend,
     sparse_attn_v41_a8w4_paged_2src,
+    supports_a8w4_attention,
 )
 from atom.model_ops.attentions.deepseek_v41.fp8_attention import (
     sparse_attn_v41_paged_2src,
@@ -270,9 +270,6 @@ class Attention(nn.Module):
             config.o_groups // tp_size,
         )
         self.softmax_scale = self.head_dim**-0.5
-        self._a8w4_backend = select_a8w4_backend(
-            self.heads, self.head_dim, self.softmax_scale
-        )
         self.attn_sink = atom_parameter(torch.empty(self.heads, dtype=torch.float32))
         # Fused [wq_a; wkv], as V4 declares it: one GEMM, and one
         # quantization of the residual instead of two of each.
@@ -443,13 +440,9 @@ class Attention(nn.Module):
         )
         return self.wo_b(y.view(*output.shape[:-2], -1))
 
-    def _a8w4_attention_backend(self, query, cache):
+    def _use_a8w4_attention(self, query, cache):
         """The choice precedes RoPE: Q8 production does not rotate BF16 Q."""
-        if not cache.packed:
-            return None
-        if self._a8w4_backend == "asm" and query.shape[:-2].numel() > 65536:
-            return None
-        return self._a8w4_backend
+        return cache.packed and supports_a8w4_attention(query, self.softmax_scale)
 
     def _fork_compress(self, hidden, cache, step, rope):
         """The compressor, issued before the projections, beside them.
@@ -534,10 +527,8 @@ class Attention(nn.Module):
         Quantized prefill also stages per-request SWA history, and bounded
         replay may change the query rows, so those paths need live preparation.
         """
-        backend = self._a8w4_attention_backend(query, cache)
-        if queries is not None or (
-            not step.decode and (cache.kv_fp8 or backend is not None)
-        ):
+        a8w4 = self._use_a8w4_attention(query, cache)
+        if queries is not None or (not step.decode and (cache.kv_fp8 or a8w4)):
             self._prepare_attention_live(query, kv_normed, cache, step, rope, queries)
             return None
         return self._attention_inputs(query, kv_normed, cache, step, rope, queries)
@@ -552,8 +543,7 @@ class Attention(nn.Module):
         )
 
     def _attention_inputs(self, query, kv_normed, cache, step, rope, queries):
-        a8w4_backend = self._a8w4_attention_backend(query, cache)
-        a8w4 = a8w4_backend is not None
+        a8w4 = self._use_a8w4_attention(query, cache)
         query_fp8 = cache.query_fp8(query, a8w4=a8w4)
         if queries is None:
             kv, window_kv = cache.rope_quant_window(
@@ -564,7 +554,7 @@ class Attention(nn.Module):
                 self.spec.layer_id, None, kv_normed, rope, step, a8w4=a8w4
             )
             cache.rotate_query(query, rope, queries.positions, query_fp8)
-        return a8w4_backend, query_fp8, kv, window_kv
+        return a8w4, query_fp8, kv, window_kv
 
     @eager_region(live=_live_rows)
     def _attend(self, query, cache, step, queries, prepared=None):
@@ -572,22 +562,21 @@ class Attention(nn.Module):
             return query
         if prepared is None:
             prepared = step.attention_inputs
-        a8w4_backend, query_fp8, kv, window_kv = prepared
+        a8w4, query_fp8, kv, window_kv = prepared
         step.attention_inputs = None
         prefix, prefix_indptr, second, second_indptr = (
-            cache.attention_indices(self.spec, step, a8w4=a8w4_backend is not None)
+            cache.attention_indices(self.spec, step, a8w4=a8w4)
             if queries is None
-            else queries.indices(cache, self.spec, a8w4=a8w4_backend is not None)
+            else queries.indices(cache, self.spec, a8w4=a8w4)
         )
         flat_query = query.flatten(0, 1)
         pool = cache.main_view(self.spec.kv_owner)
-        if cache.packed and a8w4_backend is None:
+        if cache.packed and not a8w4:
             pool = (pool, cache.ring_view(self.spec.layer_id))
         kwargs = {"out": flat_query}
-        if a8w4_backend is not None:
+        if a8w4:
             attend = sparse_attn_v41_a8w4_paged_2src
             attending = tuple(part.flatten(0, 1) for part in query_fp8)
-            kwargs["backend"] = a8w4_backend
         elif cache.kv_fp8:
             attend = sparse_attn_v41_paged_2src
             attending = tuple(part.flatten(0, 1) for part in query_fp8)
@@ -596,7 +585,7 @@ class Attention(nn.Module):
             attending = flat_query
         if step.decode:
             cache.write_window(self.spec.layer_id, window_kv, step)
-            if cache.packed and a8w4_backend is None:
+            if cache.packed and not a8w4:
                 output = packed_decode(
                     flat_query,
                     pool,
@@ -626,7 +615,7 @@ class Attention(nn.Module):
                 pool,
                 prefix,
                 prefix_indptr,
-                kv if cache.kv_fp8 or a8w4_backend is not None else kv.flatten(0, -2),
+                kv if cache.kv_fp8 or a8w4 else kv.flatten(0, -2),
                 second,
                 second_indptr,
                 self.attn_sink,
