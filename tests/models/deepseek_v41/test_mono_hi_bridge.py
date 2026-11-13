@@ -180,8 +180,8 @@ def kv8_encode(x: torch.Tensor) -> torch.Tensor:
     reciprocal (``pow2_reciprocal``), clamped to +-448, E4M3 rounded to nearest even."""
     n = x.shape[0]
     g = x.float().reshape(n, 16, 32)
-    amax = torch.maximum(g.abs().amax(-1), torch.tensor(1e-10, dtype=torch.float32))
-    t = (amax * torch.tensor(1 / 448, dtype=torch.float32)).view(torch.int32)
+    amax = torch.maximum(g.abs().amax(-1), torch.tensor(1e-10, dtype=torch.float32, device=x.device))
+    t = (amax * torch.tensor(1 / 448, dtype=torch.float32, device=x.device)).view(torch.int32)
     code = (t >> 23) + ((t & 0x7FFFFF) != 0).int()
     rcp = ((254 - code).clamp_min(0) << 23).view(torch.float32)
     q = (g * rcp[..., None]).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
