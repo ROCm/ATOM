@@ -980,6 +980,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_V4_HCA_PERSIST_MIN_ROWS": lambda: int(
         os.getenv("ATOM_V4_HCA_PERSIST_MIN_ROWS", "15")
     ),
+    # DeepSeek-V4 BF16 sparse decode through plugin_poc's FlyDSL kernel,
+    # imported directly: aiter has no contract for this op. Needs the
+    # plugin_poc package; calls it does not cover keep the Triton path.
+    "ATOM_V4_DECODE_FLYDSL": lambda: os.getenv("ATOM_V4_DECODE_FLYDSL", "0") == "1",
     # Route the paged decode to aiter's FlyDSL kernel (with its work planner)
     # instead of gluon. Needs aiter with #5809.
     "ATOM_PA_FLYDSL": lambda: os.getenv("ATOM_PA_FLYDSL", "0") == "1",
