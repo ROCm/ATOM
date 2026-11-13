@@ -157,7 +157,7 @@ def gpub(base, b, t):
 def gwait(base, b, t):
     """A front CTA (g, p = b % 16): wait for the 16 TP CTAs of its column group."""
     if t == 0:
-        hx.wait_count(lambda: base + i64(b % 16) * 4, 16)
+        hx.wait_count(lambda: base + i64(b % 16) * 4, 16, 7)
     gpu.barrier()
 
 
@@ -215,6 +215,7 @@ def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sourc
     def body(recv0: Int64, recv1: Int64, recv2: Int64, recv3: Int64, cnt: Int64, st: Int64, scale: fx.Float32, fp: Int64,
              tp: Int64):
         recv = [recv0, recv1, recv2, recv3]
+        hx.timeout_counter(fptr(fp, "cyc"))   # (poll-timeout counter: hx.note_timeout; this trace's only)
         recv, tep = tp_epoch_begin(recv, fp, rank)
         for si in range_constexpr(len(SEGS)):   # layer segments, each its own loop and body (kind 1: target, 4: draft)
             seg_lo, seg_hi, seg_kind = SEGS[si]
@@ -425,7 +426,7 @@ def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sourc
                         if (hf == 0) & (b >= FS.FRONT_CTAS) & (b < FS.FRONT_CTAS + ((TRx + MS.MAXTOK - 1) // MS.MAXTOK) * MS.NUG * MS.SHE_CTAS):
                             tq3 = hx.opaque_v(fx.thread_idx.x)
                             if tq3 == 0:
-                                hx.wait_count(lambda: lc + i64(LY.X8_PUB), FS.FRONT_CTAS)
+                                hx.wait_count(lambda: lc + i64(LY.X8_PUB), FS.FRONT_CTAS, 6)
                             gpu.barrier()
                             ce = dict(t=tq3, b=b, w=tq3 // 32, l=tq3 % 32, sm=sm + FRONT_LDS_OFF, NP=TRx * RTOPK, topk=RTOPK,
                                       x8=fptr(fp, "fx8"), xs=fptr(fp, "fxs"), shplane=ltab(fp, Ly, "shplane")(),
@@ -470,6 +471,7 @@ def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sourc
                 hx.gstore(st + i64(b) * (32 * 8) + i64(26 * 8), hx.clock())
             ST.draft(tp, t, b, sm, st, cnt + i64((NL + NDR) * LCB), recv, rank, head_d=4)
         tp_epoch_end(fp, tep)
+        hx.timeout_counter(None)
         _ = keyed
 
     @flyc.jit

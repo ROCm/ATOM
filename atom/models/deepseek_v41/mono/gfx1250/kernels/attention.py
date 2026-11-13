@@ -678,6 +678,7 @@ def tp_allreduce(c, region, tag):
         while ((hx.gload(gps[0] + i64(12), I32, nt=True) != tag) | (hx.gload(gps[1] + i64(12), I32, nt=True) != tag)
                | (hx.gload(gps[2] + i64(12), I32, nt=True) != tag)) & (hx.clock() - t0 < fx.Int64(hx.POLL_TICKS)):
             hx.s_sleep(0)
+        hx.note_timeout(t0, 6)
         gots = [hx.gload(gp, I32, 4, nt=True) for gp in gps]
         for got in gots:
             for q in range_constexpr(3):

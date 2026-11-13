@@ -11,6 +11,7 @@ All functions are traced inside a @flyc.kernel body.
 from __future__ import annotations
 
 import re as _re
+import threading as _threading
 
 import flydsl.expr as fx
 from flydsl._mlir import ir
@@ -297,23 +298,48 @@ def unlikely(b):
     return fx.Boolean(llvm.call_intrinsic(i1, "llvm.expect.i1", [_v(b), f], [], []))
 
 
-# Every bounded poll (cross-rank tag waits, device handoffs) gives up after this many clock ticks (~2 s) and the kernel
-# goes on with whatever it read.
-POLL_TICKS = 200000000
+# Poll timeouts made visible. Every bounded poll (cross-rank tag waits, device handoffs) gives up after 2 s and the
+# kernel goes on with whatever it read; a timeout therefore means wrong results. The step kernel's 'cyc' scratch counts
+# them: int32 [0] += 1, int32 [1] = the last site id; the runner reads it after a step. Its pointer is an IR value of the
+# trace that loaded it, so it is held per thread for that trace only (``timeout_counter``): FlyDSL traces a kernel on
+# the calling thread with thread-local compile state, and concurrent traces (several ranks' or widths' builds on
+# threads) must not see each other's values.
+_TRACE = _threading.local()
+POLL_TICKS = 200000000   # a bounded poll gives up after this many clock ticks (~2 s) and records a timeout
+
+
+def timeout_counter(ptr):
+    """The trace's poll-timeout counter (an address, its kernel's 'cyc'), or None: set at the start of a trace that
+    counts timeouts, cleared at its end."""
+    _TRACE.counter = ptr
+
+
+def _counter():
+    return getattr(_TRACE, "counter", None)
+
+
+@_ASTR.transform
+def note_timeout(t0, site):
+    flag = _counter()
+    if fx.const_expr(flag is not None):
+        if clock() - t0 >= fx.Int64(POLL_TICKS):
+            atomic_add(flag, 1)
+            gstore(flag + fx.Int64(4), fx.Int32(site))
 
 
 
 @_ASTR.transform
-def wait_count(addr, n):
-    """Spin until the agent-scope int32 counter at addr reaches n (bounded: POLL_TICKS, then it goes on).
+def wait_count(addr, n, site):
+    """Spin until the agent-scope int32 counter at addr reaches n (bounded: POLL_TICKS, a timeout counted at site).
     addr: an address, or a function giving it (evaluated in the loop, as the polls were written before this helper)."""
     t0 = clock()
     while (gload(addr() if callable(addr) else addr, fx.Int32, scope="agent") < n) & (clock() - t0 < fx.Int64(POLL_TICKS)):
         s_sleep(1)
+    note_timeout(t0, site)
 
 
 @_ASTR.transform
-def handoff(cnt, t, hdev, n=256):
+def handoff(cnt, t, hdev, n=256, site=None):
     """Device-wide handoff of n CTAs on counter cnt (thread t). hdev: the stages' exchange stores are device-scope ->
     every wave waits its stores, no fences; else release / acquire fences around the count."""
     if fx.const_expr(hdev):
@@ -321,13 +347,13 @@ def handoff(cnt, t, hdev, n=256):
         gpu.barrier()
         if t == 0:
             atomic_add(cnt, 1)
-            wait_count(cnt, n)
+            wait_count(cnt, n, 4 if site is None else site)
         gpu.barrier()
     else:
         gpu.barrier()
         if t == 0:
             fence_release("agent")
             atomic_add(cnt, 1)
-            wait_count(cnt, n)
+            wait_count(cnt, n, 5 if site is None else site)
             fence_acquire("agent")
         gpu.barrier()
