@@ -10,11 +10,11 @@
 # conftest.py supplies the atom.* / zmq stubs the import chain needs.
 
 import pickle
-from collections import deque
 from threading import Event, Lock, Thread
 
 import pytest
 
+from atom.model_engine.dp_routing.backlog import BacklogLedger
 from atom.model_engine.engine_core_mgr import (
     DP_LB_STRATEGIES,
     CoreManager,
@@ -72,22 +72,13 @@ def _make_mgr(
     mgr._seq_load = {}
     mgr._prefix_router = None
     mgr._lb_lock = Lock()
-    mgr._backlog_unseen = [[] for _ in range(n_ranks)]
-    mgr._backlog_unseen_tokens = [0] * n_ranks
-    mgr._backlog_unsent = {}
-    mgr._backlog_unsent_tokens = [0] * n_ranks
-    mgr._backlog_popped = [0] * n_ranks
-    mgr._backlog_report = [None] * n_ranks
-    mgr._backlog_sent = [0] * n_ranks
-    mgr._backlog_unseen_ids = [deque() for _ in range(n_ranks)]
-    mgr._backlog_objects = {}
-    mgr._backlog_prompt_tokens = {}
-    mgr._backlog_sent_ordinals = {}
-    mgr._backlog_credit_updates = {}
-    mgr._backlog_credit_sent = {}
-    mgr._backlog_credit_debts = {}
-    mgr._backlog_reported_credit_tokens = [0] * n_ranks
+    mgr._backlog = BacklogLedger(n_ranks)
     return mgr
+
+
+def _note_charged(mgr, seq, rank):
+    entry = mgr._seq_load.get(seq.id)
+    mgr._backlog.note_charged(seq, rank, entry[2] if entry else 0)
 
 
 def _route(mgr, seqs):
@@ -570,17 +561,15 @@ def test_decode_bookkeeping_does_not_wait_for_an_unrelated_router_lock():
 def test_concurrent_store_dispatch_accounts_in_socket_send_order():
     import pickle
     import time
-    from collections import deque
     from concurrent.futures import ThreadPoolExecutor
     from threading import Event
 
-    mgr = _make_mgr(1)
-    from atom.model_engine.share_cache import ShareCacheRouter
+    from atom.kv_transfer.offload.tier import OffloadTierProfile
+    from atom.model_engine.dp_routing.share_cache import ShareCacheRouter
 
-    mgr._store_router = ShareCacheRouter(0, 100)
-    mgr._backlog_report = [None]
-    mgr._backlog_sent = [0]
-    mgr._backlog_unseen = [deque()]
+    mgr = _make_mgr(1)
+
+    mgr._share_cache_router = ShareCacheRouter(OffloadTierProfile(True, 0, 1), 100)
     first_sent, second_started = Event(), Event()
     order = []
 
@@ -595,14 +584,14 @@ def test_concurrent_store_dispatch_accounts_in_socket_send_order():
             # caller has not returned to its bookkeeping yet.
             time.sleep(0.02)
 
-    original = mgr._backlog_note_sent_locked
+    original = mgr._backlog.note_sent
 
-    def account(rank, seqs):
+    def account(rank, seqs, seq_load):
         order.append(("account", seqs[0].id))
-        original(rank, seqs)
+        original(rank, seqs, seq_load)
 
     mgr._send_request = send
-    mgr._backlog_note_sent_locked = account
+    mgr._backlog.note_sent = account
 
     def second():
         assert first_sent.wait(2)
@@ -622,7 +611,7 @@ def test_concurrent_store_dispatch_accounts_in_socket_send_order():
         ("send", "second"),
         ("account", "second"),
     ]
-    assert list(mgr._backlog_unseen[0]) == [10, 20]
+    assert [charge for _, charge in mgr._backlog.unseen[0]] == [10, 20]
 
 
 # ── Prefix-spread routing ──────────────────────────────────────────────────
@@ -2291,11 +2280,14 @@ def test_prefix_spread_forked_prefix_is_not_merged_into_either_branch():
 
 
 def test_share_cache_explicit_rank_records_completed_prefix():
+    from atom.kv_transfer.offload.tier import OffloadTierProfile
     from atom.model_engine.dp_routing.policies import ShareCachePolicy
-    from atom.model_engine.share_cache import ShareCacheRouter
+    from atom.model_engine.dp_routing.share_cache import ShareCacheRouter
 
-    router = ShareCacheRouter(0, 100)
-    policy = ShareCachePolicy(router, lambda: [0, 0], lambda: [0, 0], lambda: 0)
+    router = ShareCacheRouter(OffloadTierProfile(True, 0, 1), 100)
+    policy = ShareCachePolicy(
+        router, lambda: [0, 0], lambda: [0, 0], lambda r: 0, lambda: 0
+    )
     first = _chain_seq(1, 768)
     route = policy.select(first, 0)
     policy.charge(first, route.credit)
@@ -2351,16 +2343,17 @@ def test_late_reuse_miss_splits_a_merged_placement_credit_boundary():
 
 
 def test_share_cache_completed_hit_is_not_a_producing_source():
-    from atom.model_engine.share_cache import ShareCacheRouter
+    from atom.kv_transfer.offload.tier import OffloadTierProfile
+    from atom.model_engine.dp_routing.share_cache import ShareCacheRouter
 
-    router = ShareCacheRouter(128, 100)
+    router = ShareCacheRouter(OffloadTierProfile(True, 128, 1), 100)
     first = _chain_seq(21, 768)
-    route = router.select(first, [0, 0], [0, 0])
+    route = router.select(first, [0, 0], [0, 0], None, None)
     router.charge(first.id, route.credit)
-    producing = router.select(_chain_seq(22, 768), [0, 0], [0, 0])
+    producing = router.select(_chain_seq(22, 768), [0, 0], [0, 0], None, None)
     assert producing.decision == "share_cache_source_rank_total"
     router.prefill_complete(first.id)
-    completed = router.select(_chain_seq(23, 768), [0, 0], [0, 0])
+    completed = router.select(_chain_seq(23, 768), [0, 0], [0, 0], None, None)
     assert completed.credit > 0
     assert completed.decision == "share_cache_hit_total"
 

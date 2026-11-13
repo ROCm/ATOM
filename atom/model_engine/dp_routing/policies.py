@@ -127,39 +127,10 @@ class PrefixPolicy(LoadPolicy):
         self.router.reset()
 
 
-class ShareCachePolicy(LoadPolicy):
-    """Shared-tier placement through the same DP lifecycle as other policies."""
-
-    stateful = True
-
-    def __init__(self, router, backlog, rank_reqs, lightest) -> None:
-        super().__init__(lightest)
-        self.router = router
-        self.backlog = backlog
-        self.rank_reqs = rank_reqs
-
-    def select(self, seq: Any, explicit_rank: int | None) -> Route:
-        if explicit_rank is not None:
-            placed = self.router.place(seq, explicit_rank, len(self.rank_reqs()))
-            return Route(
-                explicit_rank, "explicit_total", placed.credit, placed.moved_tokens
-            )
-        placed = self.router.select(seq, self.backlog(), self.rank_reqs())
-        return placed
+class ShareCachePolicy(PrefixPolicy):
+    """Shared-tier placement; the router balances on `rank_tokens`, each rank's
+    reported prefill backlog."""
 
     def charge(self, seq: Any, credit: int) -> int:
-        hit = self.router.charge(seq.id, credit)
-        seq.dp_est_cached_tokens = int(hit)
+        seq.dp_est_cached_tokens = hit = super().charge(seq, credit)
         return hit
-
-    def prefilling(self, seq_id: Any) -> bool:
-        return self.router.prefilling(seq_id)
-
-    def prefill_complete(self, seq_id: Any) -> None:
-        self.router.prefill_complete(seq_id)
-
-    def release(self, seq_id: Any) -> dict:
-        return self.router.release(seq_id)
-
-    def reset(self) -> None:
-        self.router.reset()

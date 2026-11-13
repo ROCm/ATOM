@@ -7,7 +7,6 @@ from __future__ import annotations
 
 from typing import ClassVar
 
-from atom.kv_transfer.offload.tier import OffloadTierProfile
 from atom.model_engine.dp_routing.prefix_spread import PrefixSpreadRouter
 
 
@@ -33,11 +32,10 @@ class SharedWorkPlacement:
 
 
 class ShareCacheRouter(PrefixSpreadRouter):
-    """Shared work strategy; all prefix state belongs to PrefixSpreadRouter.
+    """Shared-tier placement: the prefix router's index, balanced on backlog.
 
-    The adapter keeps the public shared-placement API, not a second sampled
-    prefix index or load-threshold algorithm. Production passes the registry's
-    complete OffloadTierProfile, including load role and chunk granularity.
+    All prefix state belongs to `PrefixSpreadRouter`; this class only picks the
+    placement rule and names the decision counters.
     """
 
     DECISIONS: ClassVar[dict[str, str]] = {
@@ -47,22 +45,21 @@ class ShareCacheRouter(PrefixSpreadRouter):
         "share_cache_stale_total": "Actual reuse reports corrected stale prefix hints.",
     }
 
-    def __init__(self, min_load_tokens: int, req_equiv: int, *, tier=None) -> None:
-        super().__init__(
-            idle_tokens=0,
-            tier=(
-                OffloadTierProfile(loads=True, min_load_tokens=int(min_load_tokens))
-                if tier is None
-                else tier
-            ),
-            max_seqs=0,
-        )
+    def __init__(self, tier, req_equiv: int) -> None:
+        super().__init__(idle_tokens=0, tier=tier, max_seqs=0)
         self.placement = SharedWorkPlacement(req_equiv)
 
-    def select(self, seq, rank_backlog, rank_reqs):
-        return self.select_work(seq, rank_backlog, rank_reqs, self.placement)
-
-    def charge(self, seq_id, credit=None) -> int:
-        if credit is None:
-            credit = self._reuse_pending.get(seq_id, (None, 0, None))[1]
-        return super().charge(seq_id, credit)
+    def select(self, seq, rank_tokens, rank_reqs, rank_load, lightest):
+        """`rank_tokens` is each rank's prefill backlog; the load callbacks of
+        the prefix policy are not used."""
+        return self.select_work(
+            seq,
+            rank_tokens,
+            rank_reqs,
+            self.placement,
+            (
+                "share_cache_source_rank_total",
+                "share_cache_hit_total",
+                "share_cache_cold_total",
+            ),
+        )

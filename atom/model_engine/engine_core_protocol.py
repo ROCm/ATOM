@@ -33,8 +33,9 @@ class EngineCoreRequestType(enum.Enum):
     UTILITY_RESPONSE = b"\x08"
     # Unsolicited metrics snapshot, pushed by EngineCore on its own clock.
     METRICS = b"\x09"
-    # (seqs ingested so far, prefill tokens still to compute), pushed by a DP
-    # engine core when either changes; read by `share_cache` DP routing.
+    # (seqs ingested so far, prefill tokens still to compute, applied
+    # DP_PREFIX_CREDIT updates), pushed by a DP engine core when the first two
+    # change or an update was applied; read by `share_cache` DP routing.
     PREFILL_BACKLOG = b"\x0a"
     # [(seq id, prompt tokens reused)] of requests `share_cache` placed on an
     # estimated prefix, sent ahead of their first output.

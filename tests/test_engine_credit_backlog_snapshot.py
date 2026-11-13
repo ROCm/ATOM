@@ -3,15 +3,10 @@ import sys
 from queue import Queue
 from types import ModuleType, SimpleNamespace
 
-import pytest
-
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 
 
-@pytest.mark.parametrize("core_class", ["EngineCore", "DecodeEngineCore"])
-def test_credit_ack_snapshot_does_not_suppress_finished_backlog(
-    monkeypatch, core_class
-):
+def test_credit_ack_snapshot_does_not_suppress_finished_backlog(monkeypatch):
     # Backlog IPC does not construct the AITER-backed worker RPC manager.
     # Keep the same import boundary as the engine scheduling tests.
     async_proc = ModuleType("atom.model_engine.async_proc")
@@ -19,8 +14,7 @@ def test_credit_ack_snapshot_does_not_suppress_finished_backlog(
     monkeypatch.setitem(sys.modules, "atom.model_engine.async_proc", async_proc)
     from atom.model_engine import engine_core
 
-    cls = getattr(engine_core, core_class)
-    engine = cls.__new__(cls)
+    engine = engine_core.EngineCore.__new__(engine_core.EngineCore)
     engine.input_queue = Queue()
     engine.output_queue = Queue()
     engine._ingested_seqs = 2
@@ -39,4 +33,4 @@ def test_credit_ack_snapshot_does_not_suppress_finished_backlog(
     assert engine.output_queue.get_nowait() == ("PREFILL_BACKLOG", (2, 512, [(2, 0)]))
     seq.num_completion_tokens = 1
     engine._report_prefill_backlog(1.0)
-    assert engine.output_queue.get_nowait() == ("PREFILL_BACKLOG", (2, 0))
+    assert engine.output_queue.get_nowait() == ("PREFILL_BACKLOG", (2, 0, ()))

@@ -168,17 +168,20 @@ def test_share_cache_accepts_a_pd_multi_connector_with_a_shared_tier():
         },
     }
     mgr = SimpleNamespace(
-        _dp_session_affinity_enabled=False, _dp_lb_req_equiv=512, global_engine_count=2
+        _dp_session_affinity_enabled=False,
+        _dp_lb_req_equiv=512,
+        _routable_engine_count=2,
     )
     cfg = SimpleNamespace(
+        dp_load_balance="share_cache",
         enable_prefix_caching=True,
         kv_transfer_config={"kv_connector": "multi", "connectors": [pd, store]},
     )
-    assert CoreManager._build_store_router(mgr, cfg) is not None
+    assert CoreManager._build_share_cache_router(mgr, cfg) is not None
 
     cfg.kv_transfer_config = {"kv_connector": "multi", "connectors": [pd]}
     with pytest.raises(ValueError, match="shares"):
-        CoreManager._build_store_router(mgr, cfg)
+        CoreManager._build_share_cache_router(mgr, cfg)
 
 
 def test_a_store_transfer_keeps_the_stream_it_began_on():

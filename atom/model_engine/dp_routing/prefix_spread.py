@@ -228,12 +228,14 @@ class PrefixSpreadRouter:
         rank_tokens: list[int],
         rank_reqs: list[int],
         choose: Callable[[list[int], list[int], list[int], int | None], int],
+        decisions: tuple[str, str, str],
     ) -> Route:
         """Use a work placement rule with the common prefix/producer index.
 
         Every candidate gets its own HBM credit plus precisely the missing
         prefix the configured tier can load. Pending producers only supply
-        local credit; the tier supplies completed prefixes.
+        local credit; the tier supplies completed prefixes. `decisions` names
+        the counters for a hit on a producer's rank, on the tier, and a miss.
         """
         chain = getattr(seq, "prompt_hash_chain", None)
         path = self._path(chain)
@@ -250,12 +252,13 @@ class PrefixSpreadRouter:
         )
         if hit:
             self._reuse_pending[seq.id] = (chain, hit, rank)
+        source_rank, tier_hit, cold = decisions
         decision = (
-            "share_cache_source_rank_total"
+            source_rank
             if hit
             and rank == owner
             and any((edge, rank) in self.pending for edge, _end in path)
-            else "share_cache_hit_total" if hit else "share_cache_cold_total"
+            else tier_hit if hit else cold
         )
         return Route(rank, decision, hit, loaded)
 

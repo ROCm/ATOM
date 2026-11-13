@@ -857,18 +857,12 @@ class EngineCore:
         if credit_updates:
             self.scheduler.correct_prefix_estimates(credit_updates)
             report = (self._ingested_seqs, prefill_backlog(self.scheduler))
-            self.output_queue.put_nowait(
-                (
-                    "PREFILL_BACKLOG",
-                    (*report, credit_updates),
-                )
-            )
+            self.output_queue.put_nowait(("PREFILL_BACKLOG", (*report, credit_updates)))
             self._last_backlog_report = report
 
-    # How often the backlog is recomputed. Walking `waiting` costs about 0.25 us
-    # a request (240 us at the 1024 the walk is capped at), on the engine
-    # thread every DP rank waits for; between two reports the CoreManager adds
-    # the charges of the requests it sent since, so a 10 ms old figure is fine.
+    # How often the backlog is recomputed: the walk runs on the engine thread
+    # every DP rank waits for, and between two reports the CoreManager adds the
+    # charges of the requests it sent since.
     BACKLOG_REPORT_INTERVAL_S = 0.01
 
     def _report_prefill_backlog(self, now: float) -> None:
@@ -887,7 +881,7 @@ class EngineCore:
         report = (self._ingested_seqs, backlog)
         if report != self._last_backlog_report:
             self._last_backlog_report = report
-            self.output_queue.put_nowait(("PREFILL_BACKLOG", report))
+            self.output_queue.put_nowait(("PREFILL_BACKLOG", (*report, ())))
 
     def _offer_tier_lookups(self, reqs) -> None:
         """Let an offload connector start tier lookups for arrived requests.
@@ -1638,23 +1632,14 @@ class DecodeEngineCore(EngineCore):
         """Override: add new sequences to waiting queue, then allocate blocks
         and send BlockAssignment to prefill for any that fit."""
         recv_reqs = []
-        credit_updates = []
         while not self.input_queue.empty():
             seqs = self.input_queue.get_nowait()
-            if (
-                isinstance(seqs, tuple)
-                and seqs[0] == EngineCoreRequestType.DP_PREFIX_CREDIT
-            ):
-                credit_updates.extend(seqs[1])
-                continue
             for seq in seqs:
                 if seq.status == SequenceStatus.EXIT_ENGINE:
                     return True
                 recv_reqs.append(seq)
         if recv_reqs:
             self.scheduler.extend(recv_reqs)
-            self._ingested_seqs += len(recv_reqs)
-        self._apply_prefix_credit_updates(credit_updates)
         for seq in self.scheduler.allocate_waiting():
             self._send_block_assignment(seq)
         return False

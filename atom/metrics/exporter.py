@@ -19,7 +19,7 @@ from prometheus_client import CollectorRegistry, generate_latest
 from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
 from prometheus_client.exposition import CONTENT_TYPE_LATEST
 
-from atom.model_engine.share_cache import ShareCacheRouter
+from atom.model_engine.dp_routing.share_cache import ShareCacheRouter
 
 Snapshot = dict[str, Any]
 SnapshotState = tuple[Snapshot, int, float]
