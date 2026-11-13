@@ -19,6 +19,8 @@ from atom.models.deepseek_v41.layers import native_quant_config
         None,
         {"global_quant_config": "ptpc_fp8"},
         {"layer_quant_config": {"*.ffn.experts*": "ptpc_fp8"}},
+        # Names the shared experts too, which stay pinned.
+        {"layer_quant_config": {"*experts*": "ptpc_fp8"}},
     ],
 )
 @pytest.mark.parametrize("entrypoint", ["runtime", "offline", "draft", "draft_offline"])
@@ -61,12 +63,8 @@ def test_model_owns_and_forwards_expert_quantization(
             assert online_routed.quant_type == QuantType.per_Token
         else:
             assert online_routed == source
-        # The shared expert keeps the native spec unless the online config
-        # names it (here, the global spec).
+        # Shared experts keep the native spec on both lookups.
         shared = f"{moe.prefix}.shared_experts.gate_up_proj"
         assert config.get_layer_quant_config(shared).quant_type == QuantType.per_1x32
         online_shared = config.get_layer_quant_config(shared, use_online_quant=True)
-        if expected_online and "global_quant_config" in expected_online:
-            assert online_shared.quant_type == QuantType.per_Token
-        else:
-            assert online_shared.quant_type == QuantType.per_1x32
+        assert online_shared.quant_type == QuantType.per_1x32

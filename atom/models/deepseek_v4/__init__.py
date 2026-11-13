@@ -653,9 +653,9 @@ def make_v4_quant_config(
     the same spec on the online path triggers the FusedMoE/Linear
     ``source == online_target`` early-return so those layers stay untouched.
 
-    ``shared_expert_spec`` pins the shared experts unless an online pattern or
-    global spec names them. ``online_routed_experts`` lets an online layer
-    pattern convert the routed experts.
+    ``shared_expert_spec`` pins the shared experts on both lookups.
+    ``online_routed_experts`` lets an online layer pattern convert the routed
+    experts.
     """
 
     base = QuantizationConfig(hf_config, online_quant_config=online_quant_config)
@@ -691,10 +691,6 @@ def make_v4_quant_config(
         )
 
     orig_lookup = base.get_layer_quant_config
-    raw_online = base.online_quant_config_raw
-    online_global = isinstance(raw_online, dict) and bool(
-        raw_online.get("global_quant_config")
-    )
 
     def overridden(layer_name, use_online_quant=False, *, check_children=False):
         # Routed experts → SKU-detected (FP4 for V4-Pro, FP8-block for V4-Flash).
@@ -719,12 +715,6 @@ def make_v4_quant_config(
                 )
             return routed_spec
         if shared_expert_spec is not None and ".shared_experts" in layer_name:
-            if use_online_quant and (
-                online_global or base.online_pattern_spec(layer_name) is not None
-            ):
-                return orig_lookup(
-                    layer_name, use_online_quant=True, check_children=check_children
-                )
             return shared_expert_spec
         # BF16 / fp32 raw paths
         if (
