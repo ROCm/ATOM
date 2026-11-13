@@ -111,10 +111,11 @@ python -m atom.entrypoints.openai_server --model <V4.1 checkpoint> \
   affinity (DP4, AgentX, 1800 s, same time), 256 concurrency gave throughput +5.0%,
   mean TTFT -47.5%, median -17.9%, ITL -0.3%; 512 gave +2.8%, -27.1%, -31.8%, and
   ITL +5.9%.
-- Use one Store every DP rank reaches. `share_cache` refuses per-NIC
-  `mooncake_store.pools` with more than one pool: each worker reads its own
-  NIC's pool, so a request placed on another rank would miss every load.
-- Give the owner enough DRAM for the prefixes you expect (512 GB held a 30-minute
+- Use one Store every DP rank reaches. `share_cache` refuses
+  `mooncake_store.pools` that name more than one (master, metadata) pair:
+  each worker reads its own NIC's pool, so a request placed on another rank
+  would miss every load. NIC aliases of one pair are accepted.
+- Give the owner enough DRAM for the prefixes you expect (768 GB held a 30-minute
   agentic run at 256 concurrency), and watch `OFFLOAD-STORE-STATS`: repeated
   `NO_AVAILABLE_HANDLE` failures mean the master dropped the owner's segment (raise
   the master's `--client_ttl` if the owner can be starved of CPU while the engine

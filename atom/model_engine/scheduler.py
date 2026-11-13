@@ -1098,7 +1098,7 @@ class Scheduler:
         once the load failed (the request then falls back to what HBM held)."""
         if self._has_req_id(self.failed_recving_kv_req_ids, seq.id):
             return 0
-        return int(getattr(seq, "offload_loaded_tokens", 0) or 0)
+        return int(seq.offload_loaded_tokens)
 
     def pending_prefill_tokens(self, seq: Sequence, *, estimate: bool = False) -> int:
         """Prefill tokens `seq` still has to compute on this rank (no side
@@ -3408,7 +3408,7 @@ class Scheduler:
 
     def _mark_offload_load_ready(self, seq: Sequence) -> None:
         """Turn a completed offload load into a suffix-prefill resume."""
-        loaded = getattr(seq, "offload_loaded_tokens", None)
+        loaded = seq.offload_loaded_tokens
         load_start = getattr(seq, "offload_load_start_tokens", None)
         logger.debug(
             "[OFFLOAD-WAKE] seq %s: loaded=%s prev_cached=%d num_tokens=%d",
@@ -3417,7 +3417,7 @@ class Scheduler:
             seq.num_cached_tokens,
             seq.num_tokens,
         )
-        if loaded is not None and loaded > seq.num_cached_tokens:
+        if loaded > seq.num_cached_tokens:
             promoted = 0
             if load_start is not None and load_start < loaded:
                 promoted = self.block_manager.publish_loaded_prefix(
@@ -4421,7 +4421,7 @@ class Scheduler:
             # As in Phase 2: the detach probe predates the connector's answer,
             # which a replaying model's admission reads.
             if hbm_probe is None or (
-                getattr(bm, "state_replay_tokens", 0)
+                bm.state_replay_tokens
                 and seq.has_per_req_cache
                 and self._tier_hit(seq) != probed_tier_kv
             ):
