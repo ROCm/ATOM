@@ -649,6 +649,28 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Mono wide MoE with the MXFP8 shared expert: 0 off; k > 0 the shared pairs run first on
     # their hosts, their tiles loaded before the router's scores arrive, hosts carry k routed pairs fewer.
     "ATOM_MONO_SH_FIRST": lambda: int(os.getenv("ATOM_MONO_SH_FIRST", "0")),
+    # MiniMax-M3 mono numerics, each 1 = as the production path computes it (default), 0 = the
+    # earlier mono behaviour: ATOM_MONO_MOE_A16W4 the routed experts on bf16 activations (aiter's a16w4;
+    # 0: MXFP8 activations, a8w4; needs the unfused MXFP8 shared expert, else a8w4 either way);
+    # ATOM_MONO_SP_F32 the split -> merge partition outputs in f32 (0: bf16); ATOM_MONO_PROD_ROUND
+    # the shared expert's swiglu on bf16 gate / up and the MoE output's bf16 roundings (routed sum,
+    # shared down, their sum; 0: one f32 sum rounded once).
+    # Debug, with ATOM_MONO_CHECK: compare the routed experts alone (the mono kernels' shared expert
+    # weight 0, the original layers' shared expert dropped), on the real activations.
+    "ATOM_MONO_CHECK_ROUTED_ONLY": lambda: os.getenv("ATOM_MONO_CHECK_ROUTED_ONLY", "0")
+    == "1",
+    # Debug, with ATOM_MONO_CHECK (a16w4 builds): also run the original layer's MoE module alone on the xn
+    # the mono kernel published, so the MoE is compared on identical inputs (no attention difference, no routing flips).
+    "ATOM_MONO_CHECK_MOE": lambda: os.getenv("ATOM_MONO_CHECK_MOE", "0") == "1",
+    "ATOM_MONO_MOE_A16W4": lambda: os.getenv("ATOM_MONO_MOE_A16W4", "1") == "1",
+    # The routed experts on MXFP4 activations (a4w4: xn and the swiglu mid per 1x32, E8M0 RoundUp, aiter's
+    # a4w4 convention; the shared expert stays MXFP8). Wins over ATOM_MONO_MOE_A16W4; needs the unfused
+    # MXFP8 shared expert (else ignored). Default on (GSM8K 500 paired 469 vs 463 with it off, needle 10/10);
+    # ATOM_MONO_MOE_A4W4=0 gives the earlier a16w4 numerics.
+    "ATOM_MONO_MOE_A4W4": lambda: os.getenv("ATOM_MONO_MOE_A4W4", "1") == "1",
+    # f32 split -> merge partition outputs: off by default (the bf16 partitions of the earlier mono)
+    "ATOM_MONO_SP_F32": lambda: os.getenv("ATOM_MONO_SP_F32", "0") == "1",
+    "ATOM_MONO_PROD_ROUND": lambda: os.getenv("ATOM_MONO_PROD_ROUND", "1") == "1",
     # DeepSeek-V4.1: how many of an attention layer's branches leave the main
     # stream. 0 none; 1 the compressor, on the MoE's `alt_stream`, waited at
     # the scorer that first reads it; 2 the indexer as well, on one of its own.
