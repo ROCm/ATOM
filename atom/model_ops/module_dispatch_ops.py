@@ -162,7 +162,9 @@ direct_register_custom_op(
 # runs the attention residual on this rank's rows (reduce-scatter, then an
 # all-gather of the MoE input) is decided at run time by T: no traced tensor
 # changes shape between the two. On the row-sharded path the residual comes
-# back whole as `prefix_sum`, and `routed` / `shared` are zeros.
+# back whole as `prefix_sum`, and `routed` / `shared` are folded zeros: left
+# unwritten, so a consumer that adds them in torch first zeroes them through
+# `materialize_folded_zeros`.
 
 
 def kimi_k3_post_attention_forward(

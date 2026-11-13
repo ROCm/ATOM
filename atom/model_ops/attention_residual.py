@@ -195,6 +195,11 @@ class AttnRes(nn.Module):
         # Nothing to mix (residuals off, or no candidates yet). Apply by hand
         # what the kernel would otherwise have folded into its load and store.
         if add_hidden is not None:
+            from atom.model_ops.kimi_k3.attention_residual import (
+                materialize_folded_zeros,
+            )
+
+            materialize_folded_zeros(add_hidden, add_hidden2)
             prefix_sum = prefix_sum + add_hidden
             if add_hidden2 is not None:
                 prefix_sum = prefix_sum + add_hidden2

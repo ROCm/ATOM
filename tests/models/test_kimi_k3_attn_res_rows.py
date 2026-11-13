@@ -224,7 +224,8 @@ def test_row_sharded_layer_sums_to_the_base(logged, monkeypatch, tokens, layer_n
             ("all_gather", chunk),
         ]
         residual, routed, shared, bank = got
-        assert not routed.any() and not shared.any()
+        routed.fill_(float("nan"))
+        shared.fill_(float("nan"))
         assert torch.equal(bank, want[3])
         # The row-sharded sum rounds to BF16 twice, the reference once.
         exact = sum(t.float() for t in want[:3])
@@ -275,8 +276,9 @@ def test_below_row_floor_all_reduces(logged, monkeypatch, floor):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
 @torch.inference_mode()
 def test_folded_zeros_are_added_without_loading(monkeypatch):
-    """`apply_attn_res` takes a row-sharded layer's zero addends as zero
-    without loading them, still returns a fresh prefix, and releases them."""
+    """`apply_attn_res` takes a row-sharded layer's folded zeros as zero
+    without loading them (NaN-poisoned here), still returns a fresh prefix,
+    and releases them."""
     from atom.model_ops.kimi_k3 import attention_residual as attn_res
 
     gen = torch.Generator().manual_seed(7)
@@ -305,7 +307,8 @@ def test_folded_zeros_are_added_without_loading(monkeypatch):
             prefix, bank, score_weight, 1e-6, add, norm, 1e-6, add2
         )
 
-    folded = call(*attn_res.folded_zeros_like(prefix))
+    poisoned = [attn_res.folded_zero_like(prefix).fill_(float("nan")) for _ in "ab"]
+    folded = call(*poisoned)
     loaded = call(torch.zeros_like(prefix), torch.zeros_like(prefix))
     assert flags == [(False, False, True), (True, True, True)]
     assert not attn_res._folded_zeros

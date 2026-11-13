@@ -43,6 +43,7 @@ from aiter.dist.parallel_state import (
 )
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
+from atom.model_ops.kimi_k3.attention_residual import materialize_folded_zeros
 from atom.models.kimi_k3.mono.config import (
     MAX_ROWS,
     Dims,
@@ -510,6 +511,8 @@ class K3MonoDecodeRunner:
                     plan, positions, prefix, blocks, add, add2
                 )
             else:
+                # a row-sharded fallback layer's addends are unwritten folded zeros
+                materialize_folded_zeros(add, add2)
                 delta = add if add2 is None else (add2 if add is None else add + add2)
                 core = self._k1(build, plan, prefix, delta, blocks, metadata)
             # K2 updates ``prefix`` in place: on a block-write layer it restarts
