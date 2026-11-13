@@ -318,7 +318,7 @@ jobs:
             echo '=== Installing ATOM ==='
             cd /workspace
             git config --global --add safe.directory /workspace
-            ATOM_MESH_BUILD=1 python3 .github/scripts/install_atom_with_ci_aiter.py
+            ATOM_MESH_BUILD=1 python -m pip install -e .
 
             echo '=== Installed package versions ==='
             pip show amd-aiter | grep -E '^(Name|Version):'

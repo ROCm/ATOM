@@ -10,7 +10,7 @@ readme = "README.md"
 description = "a lightweight vLLM implementation built from scratch"
 requires-python = ">=3.10"
 dynamic = ["version"]
-dependencies = ["amd-aiter>=0.1.28", "pybind11", "transformers==5.16.1", "zmq", "msgspec", "xxhash", "fastapi>=0.115,<0.137", "psutil", "prometheus_client>=0.25,<0.26", "protobuf", "uvicorn", "uvloop", "aiohttp", "datasets", "openpyxl", "tqdm", "setproctitle", "jsonschema>=4.25,<5"]
+dependencies = ["pybind11", "transformers==5.16.1", "zmq", "msgspec", "xxhash", "fastapi>=0.115,<0.137", "psutil", "prometheus_client>=0.25,<0.26", "protobuf", "uvicorn", "uvloop", "aiohttp", "datasets", "openpyxl", "tqdm", "setproctitle", "jsonschema>=4.25,<5"]
 
 [project.optional-dependencies]
 structured-output = ["llguidance==1.9.1", "google-re2>=1.1"]
