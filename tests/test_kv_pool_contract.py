@@ -27,9 +27,10 @@ ATTENTIONS = (
 # The draft's builder is not an attention backend -- it holds a pool without
 # knowing what flavor fills it -- but it answers the same runner hook, so the
 # same contract binds it.
-SOURCES = sorted(ATTENTIONS.glob("*.py")) + [
+DRAFT_KV = (
     pathlib.Path(__file__).resolve().parent.parent / "atom/spec_decode/draft_kv.py"
-]
+)
+SOURCES = sorted(ATTENTIONS.glob("*.py")) + [DRAFT_KV]
 
 HOOK = "allocate_kv_cache_tensors"
 RUNNER = (
@@ -227,6 +228,43 @@ def test_a_backend_that_can_build_a_draft_pool_says_so(cls):
     and the draft binds into the target's rows -- no error, no log, and a
     draft reading K and V that are not its own."""
     assert _sets_the_flag_true(cls)
+
+
+def _pool_kwargs_keys() -> set[str]:
+    """The keys `DraftKvPoolSpec.pool_kwargs` returns, read off its dict."""
+    tree = ast.parse(DRAFT_KV.read_text(), filename=str(DRAFT_KV))
+    (fn,) = [
+        fn
+        for cls in ast.walk(tree)
+        if isinstance(cls, ast.ClassDef) and cls.name == "DraftKvPoolSpec"
+        for fn in cls.body
+        if isinstance(fn, ast.FunctionDef) and fn.name == "pool_kwargs"
+    ]
+    (ret,) = [node for node in ast.walk(fn) if isinstance(node, ast.Return)]
+    assert isinstance(ret.value, ast.Dict)
+    return {key.value for key in ret.value.keys}
+
+
+@pytest.mark.parametrize(
+    "cls",
+    [
+        pytest.param(cls, id=f"{stem}.{cls.name}")
+        for stem, cls in _classes_defining_the_factory()
+    ],
+)
+def test_every_factory_takes_what_a_draft_spec_adds(cls):
+    """`draft_kv_builder` forwards a declared spec's `pool_kwargs` to whichever
+    backend owns the draft's pool. The declaration names them, so a backend
+    written to it accepts them; one that took only the geometry would raise
+    `TypeError` the first time such a draft is configured."""
+    (fn,) = [
+        fn
+        for fn in cls.body
+        if isinstance(fn, ast.FunctionDef) and fn.name == POOL_FACTORY
+    ]
+    keys = _pool_kwargs_keys()
+    assert keys
+    assert fn.args.kwarg is not None or keys <= {a.arg for a in fn.args.kwonlyargs}
 
 
 def test_a_geometry_row_space_names_itself_readably():
