@@ -64,6 +64,7 @@ from ..device.gfx950 import mailbox as mb
 from ..device.gfx950 import paged
 from ..device.gfx950.ops import (
     bf2_f32,
+    bf16_pair,
     butterfly,
     fp8_pack4,
     ld_i32,
@@ -80,6 +81,7 @@ from .config import G
 
 THREADS = MI355X.threads
 HIDDEN, KVD, EPS = G.hidden, G.head_dim, G.eps
+HC = G.hc_mult  # the residual streams (``TapQuant(streams=True)``)
 TAPS = 3  # dspark_target_layer_ids: 37, 38, 39
 STAGES = 3  # num_nextn_predict_layers
 AUX_W = TAPS * HIDDEN  # 15360
@@ -144,12 +146,44 @@ def _tapq_body(k, t, p: _TPlan):
     )
 
 
+@traced
+def _tapq_streams(k, t, p: _TPlan):
+    """``TapQuant(streams=True)``'s task t (as ``_tapq_body``): the tap row taken from the layer's settled streams
+    (``src`` bf16 [rows, HC, HIDDEN], a hi layer's whole R_A), the engine's DSpark tap: the bf16 streams summed in
+    stream order in fp32 from 0, times 1 / HC, rounded to bf16 (the end-step's ``hi_bridge._tap``, the same bits);
+    then the quantize-only norm into its columns of the concatenated channel."""
+    if k.wave < QSPEC.waves:
+        _tapq_streams_body(k, t, p)
+
+
+def _tapq_streams_body(k, t, p: _TPlan):
+    row, part = t // PER_TAP, t % PER_TAP
+    m = QSPEC.qmap
+    words = HIDDEN // 2
+    ld = [_map_load(m, k.args[p.src], (row * HC + h) * words + part * m.words, k.tid) for h in range(HC)]
+    q = []
+    for v in range(m.chunks):
+        ws = []
+        for j in range(m.wps):
+            lo, hi = fx.Float32(0.0), fx.Float32(0.0)
+            for h in range(HC):
+                a, b = bf2_f32(ld[h][v][j])
+                lo, hi = lo + a, hi + b
+            ws.append(bf16_pair(lo * (1.0 / HC), hi * (1.0 / HC)).bitcast(fx.Int32))
+        q.append(ws)
+    chunks = norm_quant(QSPEC, [(q, None)], None, k.ldsf, k.tid, k.lane, k.wave)[0]
+    put_row(QSPEC, k.mb[f"{p.out}.q"], k.mb[f"{p.out}.s"], None, row, k.tid, k.tag, chunks,
+            p.tap * PER_TAP + part)  # fmt: skip
+
+
 class TapQuant(Block):
     """The taps (plain bf16 args ``srcs``, [rows, HIDDEN] each) concatenated and quantized to MXFP8 (group 32, E8M0
     ceil scales: ``NormQuant``'s identity spec, the same codes as one quantize of the concatenated row): one stage a
-    tap, ``rows * PER_TAP`` tasks each."""
+    tap, ``rows * PER_TAP`` tasks each. ``streams``: each src is instead a tapped layer's settled streams (bf16
+    [rows, HC, HIDDEN]: the hi layer's R_A, written whole), the tap (their mean, ``_tapq_streams``) taken here: a
+    launch that does not follow the end-step's tap write (the verify head's, ``context_blocks(taps="streams")``)."""
 
-    def __init__(self, name: str, srcs: tuple[str, ...], out: Channel):
+    def __init__(self, name: str, srcs: tuple[str, ...], out: Channel, streams: bool = False):
         if (
             len(srcs) != TAPS
             or out.fmt is not Fmt.MXFP8
@@ -159,13 +193,18 @@ class TapQuant(Block):
             raise ValueError(
                 f"TapQuant {name}: {TAPS} taps into a tagged MXFP8 channel of width {AUX_W}"
             )
-        self.name, self.srcs, self.out = name, tuple(srcs), out
+        self.name, self.srcs, self.out, self.streams = name, tuple(srcs), out, streams
 
     def stages(self, sc: Scenario) -> list[Stage]:
         names = tuple(f"{self.name}{i}" for i in range(TAPS))
         writes = self.out.regions(
             sc.rows, names
         )  # declared once (the first stage), every tap's stage a writer
+        if self.streams:  # (its own key: the plain taps' builds keep theirs)
+            return [Stage(n, sc.rows * PER_TAP, partial(_tapq_streams, p=_TPlan(n, src, i, self.out.name)),
+                          writes=writes if i == 0 else (), args=(src,),
+                          key=("tapq_streams", HC, n, src, i, self.out.name, QSPEC))
+                    for i, (n, src) in enumerate(zip(names, self.srcs, strict=True))]  # fmt: skip
         return [Stage(n, sc.rows * PER_TAP, partial(_tapq, p=_TPlan(n, src, i, self.out.name)),
                       writes=writes if i == 0 else (), args=(src,), key=("tapq", n, src, i, self.out.name, QSPEC))
                 for i, (n, src) in enumerate(zip(names, self.srcs, strict=True))]  # fmt: skip
@@ -369,14 +408,18 @@ KNOBS_ROWS = {r: {"PROJ_KSPLIT": 6} for r in range(19, 25)}
 
 
 def context_blocks(
-    tp: int = 1, cols: str = "shard", meta: bool = False, knobs: dict | None = None
+    tp: int = 1, cols: str = "shard", meta: bool = False, knobs: dict | None = None, taps: str = "plain"
 ) -> list[Block]:
     """The context write's blocks (module docstring). ``cols``: "shard" (TP: main_proj column-sharded + ``ColGather``)
     or "rep" (every rank all 5120 columns: the same bits, 4x the weight bytes); ``meta``: the slot / liveness from the
     ``cx.meta`` snapshot (a launch after the target step's) instead of the step's ``cx.bids`` / ``cx.slots``;
-    ``knobs``: values over ``KNOBS``'."""
+    ``knobs``: values over ``KNOBS``'. ``taps``: "plain" (args ``cx.tap0..2``, the taps the end-step wrote) or
+    "streams" (args ``cx.ra0..2``: the tapped layers' settled streams [rows, HC, HIDDEN], the taps taken in the
+    program, ``TapQuant(streams=True)``: the context write inside the verify head's launch, before the end-step)."""
     if cols not in ("shard", "rep"):
         raise ValueError(f"cols {cols!r}: 'shard' or 'rep'")
+    if taps not in ("plain", "streams"):
+        raise ValueError(f"taps {taps!r}: 'plain' or 'streams'")
     kn = {**KNOBS, **(knobs or {})}
     # ATOM's draft rings in its fp8 pool: the keys QAT'd by its writer's code, stored as its MXFP8 rows
     kv8 = kn["KV_FMT"] == "fp8"
@@ -385,7 +428,9 @@ def context_blocks(
     w8 = {"weight_format": "mxfp8"}
     out = BF16Out(C["fcol"] if shard else C["fco"])
     blocks = [
-        TapQuant("cx_q", tuple(f"cx.tap{i}" for i in range(TAPS)), C["auxq"]),
+        TapQuant("cx_q", tuple(f"cx.tap{i}" for i in range(TAPS)), C["auxq"])
+        if taps == "plain"
+        else TapQuant("cx_q", tuple(f"cx.ra{i}" for i in range(TAPS)), C["auxq"], streams=True),
         Linear(
             "cx_proj",
             ("main_proj",),
@@ -438,12 +483,53 @@ def context_program(name: str, sc: Scenario, cols: str = "shard", meta: bool = F
     ``KNOBS``' (and ``KNOBS_ROWS[sc.rows]``'); ``program``: ``Program`` options. ``Scenario(B,
     rows, tp)``: B requests' rows, each at its request's position (``pos`` [B]) and ring slot.
     """
-    blocks = context_blocks(
-        sc.tp, cols, meta, {**KNOBS_ROWS.get(sc.rows, {}), **(knobs or {})}
-    )
+    blocks = context_blocks_at(sc, cols, meta, knobs)
     return blocks, Program(
         name, sc, [st for b in blocks for st in b.stages(sc)], **program
     )
+
+
+def context_blocks_at(sc: Scenario, cols: str = "shard", meta: bool = False, knobs: dict | None = None,
+                      taps: str = "plain") -> list[Block]:  # fmt: skip
+    """``context_blocks`` at ``sc`` (its rows' ``KNOBS_ROWS``, as ``context_program``)."""
+    return context_blocks(sc.tp, cols, meta, {**KNOBS_ROWS.get(sc.rows, {}), **(knobs or {})}, taps)
+
+
+def place_after(stages: list[Stage], tail: list[Stage], avoid: tuple[str, ...],
+                cus: int = MI355X.grid) -> list[Stage]:  # fmt: skip
+    """``stages`` + ``tail`` (a launch's own stages, then stages merged into it that it does not wait on: the context
+    write in the verify head's launch), ``tail`` on the widest window of CTAs that runs none of ``avoid`` (the host
+    program's long tasks: a tail stage queued behind one on its CTA starts when it ends). Every ``stages`` base stays
+    where ``plan`` puts it; each tail stage on the least loaded run of the window's CTAs (a stage wider than the
+    window: where ``plan`` puts it). Program order is unchanged (``tail`` after ``stages``), so the hand-offs are the
+    two programs' own."""
+    nxt, busy = 0, set()
+    for st in stages:
+        base = nxt % cus if st.base is None else st.base
+        nxt = base + st.tasks
+        if any(st.name == n for n in avoid):
+            busy |= {(base + t) % cus for t in range(min(st.tasks, cus))}
+    free = [c not in busy for c in range(cus)]
+    best, w0 = (0, 0), None  # (length, start) of the widest free run (cyclic)
+    for c in range(cus):
+        if free[c] and not free[c - 1]:
+            n = 0
+            while n < cus and free[(c + n) % cus]:
+                n += 1
+            best = max(best, (n, -c))
+    n, w0 = best[0], -best[1]
+    if all(free):
+        n, w0 = cus, 0
+    load = [0] * n  # the tail's tasks a window CTA so far
+    for st in tail:
+        if st.tasks > n:
+            continue  # (no window wide enough: plan's placement)
+        # the least loaded run of the stage's width, the first of them
+        at = min(range(n - st.tasks + 1), key=lambda a: (sum(load[a : a + st.tasks]), a))
+        for t in range(st.tasks):
+            load[at + t] += 1
+        st.base = (w0 + at) % cus
+    return stages + tail
 
 
 # ------------------------------------------------------------------ weights

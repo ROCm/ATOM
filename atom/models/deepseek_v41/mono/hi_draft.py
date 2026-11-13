@@ -2,8 +2,9 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """The DSpark draft on the hi path (``HiDraft``, a part of ``hi_runner.HiLayers``): the draft's context-KV write
 (``CTX`` a width: main_proj, the stages' wkv and norms over the target's DSpark taps, written into ATOM's draft rings
-inside the target graph) and the block draft (three chained stage launches and the Markov head: ``draft_run``), with
-their peer groups, buffers and weights (the stages' packed from ATOM's draft model, ``hi_weights``).
+inside the target graph; at a width of ``ctx_merged`` inside the verify head's launch, ``_head_ctx_tables``) and the
+block draft (three chained stage launches and the Markov head: ``draft_run``), with their peer groups, buffers and
+weights (the stages' packed from ATOM's draft model, ``hi_weights``).
 """
 
 from __future__ import annotations
@@ -120,9 +121,11 @@ class HiDraft:
         from .hi.runtime.peer import PeerGroup
 
         D = self.D
-        pb = max(k.program.peer_bytes for k in self.ctx_programs.values())
+        # (no CTX launch where every width's runs in its verify head: ``ctx_merged``)
+        pb = max([k.program.peer_bytes for k in self.ctx_programs.values()], default=0)
         self.cx_peers = PeerGroup(pb, self._cpu_group) if self.tp > 1 and pb else None
         self.cx_bufs = _buffers(self.ctx_programs, self.arena, dev, self.step)
+        self.hx_tables, self.hx_cur = {}, {}  # the merged heads' tables (``_head_ctx_tables``)
         self.cx_w = D.pack(
             hw.ctx_tensors(draft, D.STAGES), self.tp, self.rank, "shard", device=dev
         )
@@ -233,6 +236,7 @@ class HiDraft:
                 )
             self.cx_tables.clear()
             getattr(self, "dr_tables", {}).clear()
+            getattr(self, "hx_tables", {}).clear()
         self.cx_geo.copy_(torch.tensor(geo, dtype=torch.int32))
         self.cx_geo_key = repr(geo)
 
@@ -251,11 +255,65 @@ class HiDraft:
         # forward's other groups' at its end, ``_flush_phases``)
         _end_step(self.cx_peers, getattr(self, "phase_due", None))
 
+    def _ctx_streams(self) -> list:
+        """The tapped layers' R_A buffers in the draft's tap order (``cx.ra0..2`` of a verify head the context write
+        is merged into: ``TapQuant(streams=True)`` takes the taps from them as the end-step's ``_tap`` does from the
+        same buffers into ATOM's aux buffers): the aux taps' layer order once bound, else the config's."""
+        aux = self.aux
+        if aux is None and self.cx_drafter is not None:
+            self._ctx_taps()
+            aux = self.aux
+        ids = tuple(aux.layer_ids) if aux is not None else tuple(self.aux_ids)
+        if len(ids) != self.D.TAPS or any(i not in self.r_a for i in ids):
+            raise RuntimeError(f"V4.1 mono hi draft: taps of layers {ids}, the hi layers' R_A of {sorted(self.r_a)}")
+        return [self.r_a[i] for i in ids]
+
+    def _head_ctx_tables(self, rows: int, cache, step) -> None:
+        """A served step's begin (``begin_step``) at a width whose verify head runs the context write
+        (``ctx_merged``): the head's pointer tables with the context write's (``hx_cur``, read by the head launch),
+        built eagerly the first time for this pool / these step buffers (as ``_ctx_table``)."""
+        if step.replay is not None:
+            raise RuntimeError(
+                f"V4.1 mono hi draft: a served step of {rows} rows without the draft's context write"
+            )
+        # (in the key: a cache of other geometry at the same address)
+        geo, rings = self._ctx_rings(cache)
+        key = (rows, cache.pool.data_ptr(), step.batch_ids.data_ptr(), step.slots.data_ptr(), repr(geo))
+        tables = self.hx_tables.get(key)
+        if tables is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "V4.1 mono hi draft: the verify head's context-write tables first needed inside a graph capture"
+                )
+            self._set_cx_geo(geo)
+            io = {"pos": self.pos, **self.rope_d, "cx.geo": self.cx_geo}
+            io.update({f"cx.ra{i}": t for i, t in enumerate(self._ctx_streams())})
+            io.update({f"cx.ring{s}": r for s, r in enumerate(rings)})
+            io.update({"cx.bids": step.batch_ids, "cx.slots": step.slots})
+            kern = self.head_programs[rows]
+            tables = {}
+            for (s, b), ptrs in self.hx_ptrs.items():
+                if s != rows:
+                    continue
+                at = {**ptrs, **self.cx_w, **io}
+                missing = {a for a in set(kern.program.args) - set(at) if not a.startswith("_")}
+                if missing:
+                    raise KeyError(f"verify head + CTX: no pointer for {sorted(missing)}")
+                tables[b] = kern.table(
+                    {n: at[n] for n in kern.program.args if n in at}, device=self.dev, peers=self.peers
+                )
+            self.hx_tables[key] = tables
+        self.cx_captured |= torch.cuda.is_current_stream_capturing()
+        self.hx_cur[rows] = tables
+
     def _ctx_after_target(self, cache, step, rows: int) -> None:
         """A served step's end (``end_step``): ``CTX`` inside the target graph, after the end-step launch (the taps
         are written there), before the verdict. Every served step writes the draft's context rows here: the DSpark
-        proposer skips ATOM's write on it (``AttentionMetaData.served_by_round``).
+        proposer skips ATOM's write on it (``AttentionMetaData.served_by_round``). At a width whose verify head runs
+        it (``ctx_merged``): nothing here.
         """
+        if rows in self.ctx_merged and step.replay is None:
+            return
         if rows not in self.ctx_programs or step.replay is not None:
             raise RuntimeError(
                 f"V4.1 mono hi draft: a served step of {rows} rows without the draft's context write"

@@ -25,7 +25,9 @@ One served step:
 3. ``end_step`` (one launch, ``_end_step_kernel``): the ring export (the
    step's ring rows back into ATOM's pool), the DSpark taps of layers 37-39, the last layer's gates planar and
    ATOM's collapse into the runner's output rows; then the DSpark draft's
-   context-KV write (``CTX``, launch ``CTX_LAUNCH``) and the post-verify
+   context-KV write (``CTX``, launch ``CTX_LAUNCH``; at a width of
+   ``ctx_merged``, the TP8 one-request width, inside the verify head's launch
+   instead, ``hi_compose.MERGES``) and the post-verify
    (``post_verify``: verdict and Engram cursor commit), all inside
    the target graph.
 
@@ -349,10 +351,11 @@ class HiLayers(HiDraft, HiPrograms):
         self.aux = None
         logger.info(
             "V4.1 mono hi: %d layers on the hi path (TP%d rank %d), widths %s (requests x rows), ctx bucket %d, "
-            "%d programs, weights %.1f GiB, peer %d B, draft context write (launch %d) and block draft (launches %s) "
-            "on the hi path, residual %s, built in %.0f s",
+            "%d programs, weights %.1f GiB, peer %d B, draft context write (launch %d; in the verify head's at widths "
+            "%s) and block draft (launches %s) on the hi path, residual %s, launch merges %s, built in %.0f s",
             len(self.mf), self.tp, self.rank, self.split, max_ctx, len(self.programs), nbytes / 2**30, peer_bytes,
-            CTX_LAUNCH, DRAFT_LAUNCH, {s: L.residual_layout(self.tp, rows=s) for s in self.widths}, time.time() - t0,
+            CTX_LAUNCH, sorted(self.ctx_merged), DRAFT_LAUNCH, {s: L.residual_layout(self.tp, rows=s) for s in self.widths},
+            sorted(self.merge), time.time() - t0,
         )  # fmt: skip
         log_once(
             logging.INFO,
@@ -562,6 +565,9 @@ class HiLayers(HiDraft, HiPrograms):
         self.par_work_f = self.par_work.view(np.float32)
         # (the pinned slots' host views)
         self.par_ring_np = [t.numpy() for t in self.par_ring]
+        # a width whose head runs the context write (``ctx_merged``): its pointers here, its tables with the context
+        # write's at the first served step (``_head_ctx_tables``: the pool's rings and the step's buffers)
+        self.hx_ptrs = {}
         for (s, b), (r0, n) in launches.items():
             kern = self.head_programs[s]
             at = {
@@ -570,6 +576,9 @@ class HiLayers(HiDraft, HiPrograms):
             }
             o = self.par_blocks[s, b][0]
             at["head.par"] = self.head_par[o : o + 2 * n + 2]
+            if s in self.ctx_merged:
+                self.hx_ptrs[s, b] = {**args, **at}
+                continue
             missing = (
                 set(kern.program.args)
                 - set(args)
@@ -793,6 +802,9 @@ class HiLayers(HiDraft, HiPrograms):
             self._band_step(rows)
         if self.eng:
             self._engram_launch(rows)
+        if rows in self.ctx_merged:
+            # the verify head's tables with the context write's (it runs in the head's launch)
+            self._head_ctx_tables(rows, cache, step)
 
     def _band_step(self, rows: int) -> None:
         """A band's step (module docstring, "Widths"; device ops, captured with the step): the live words (rows,
@@ -894,7 +906,9 @@ class HiLayers(HiDraft, HiPrograms):
             # B requests: B launches of the one-request head at their rows (``head_launch_ids``)
             launches = self.split[rows][0] if self.head_mode[rows] == "split" else 1
             for b, lid in enumerate(head_launch_ids(i, launches)):
-                self.head_programs[rows].launch(self.tables[HEAD, rows, b], self.head_bufs[rows], layer=lid,
+                # (with the context write: the step's tables, ``begin_step``)
+                table = self.hx_cur[rows][b] if rows in self.ctx_merged else self.tables[HEAD, rows, b]
+                self.head_programs[rows].launch(table, self.head_bufs[rows], layer=lid,
                                                 stream=torch.cuda.current_stream())  # fmt: skip
             # the step's last launch on the group: 41 (odd) flip the step phase (at the forward's end,
             # ``_flush_phases``)
@@ -912,7 +926,8 @@ class HiLayers(HiDraft, HiPrograms):
 
     def end_step(self, cache, step, rows: int) -> None:
         """The end-step launch (the cache export, the DSpark taps, the last layer's gates planar and ATOM's
-        collapse); then the draft's context write and the post-verify, inside the target graph (module docstring).
+        collapse); then the draft's context write (unless the verify head ran it: ``ctx_merged``) and the
+        post-verify, inside the target graph (module docstring).
         """
         self._end_step(cache, step, rows)
         self._ctx_after_target(cache, step, rows)

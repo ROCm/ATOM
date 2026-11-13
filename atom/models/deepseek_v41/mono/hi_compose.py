@@ -11,6 +11,7 @@ construction; a build that does not fit takes the fallback the methods name).
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 
 from atom.models.deepseek_v41.mono import hi_plan
@@ -46,6 +47,28 @@ ROWS = tuple(REQ_ROWS * b for b in range(1, 9))
 # a band, launched with the step's live requests)
 BANDS = (6, 8)
 SLOTS = 7  # the ratio-2 sources' compressor state slots: ATOM's compress ring (2 + a verify's drafts), in place
+# launches merged into a neighbour's launch at a one-request width (each a launch fewer a step, its work on the
+# neighbour's idle CTAs): "ctx", the DSpark context write into the verify head's launch (``head_program(ctx=True)``,
+# its taps taken from the tapped layers' streams). On at the TP sizes of ``MERGE_TP``; env ATOM_DSV41_MONO_HI_MERGE
+# "0" turns every merge off, "1" every one on at any TP, or a comma list of them (e.g. "ctx") on at any TP
+MERGES = ("ctx",)
+MERGE_TP = (8,)
+MERGE_ENV = "ATOM_DSV41_MONO_HI_MERGE"
+
+
+def merges(tp: int) -> frozenset:
+    """The launch merges (``MERGES``) on at ``tp``: ``MERGE_TP``'s, or the env's (``MERGE_ENV``)."""
+    raw = os.environ.get(MERGE_ENV, "").strip().lower()
+    if raw in ("", "auto"):
+        return frozenset(MERGES) if tp in MERGE_TP else frozenset()
+    if raw in ("0", "off", "none", "false"):
+        return frozenset()
+    if raw in ("1", "on", "all", "true"):
+        return frozenset(MERGES)
+    got = frozenset(x.strip() for x in raw.split(",") if x.strip())
+    if got - set(MERGES):
+        raise ValueError(f"{MERGE_ENV}={raw!r}: 0, 1 or a list of {', '.join(MERGES)}")
+    return got
 
 
 @dataclass
@@ -155,6 +178,10 @@ class HiPrograms:
         )
         self.cl = {r: hi_plan.n_max(max_ctx, r) for r in (1, 2)}
         self.eng = {f"eng{i}": i for i in self.mf if self.plan[i].engram}
+        # the launch merges on at this TP (``merges``); ``ctx_merged``: the widths whose verify head runs the
+        # context write (set with the heads)
+        self.merge = merges(tp)
+        self.ctx_merged = set()
         # ---- programs: one a (kind, width), shared by the layers of the kind
         # the verify head a width (before the layer programs: the last layer's chain role follows it): one request,
         # the head at its width; B requests, one wide head at Scenario(B, rows) where hi builds it, else B
@@ -165,7 +192,11 @@ class HiPrograms:
             kern = None
             if b == 1:
                 self.head_mode[s] = "one"
-                kern = self._head_program(s, self.chain, (1, s))
+                # (the context write merged into it: a chained one-request head)
+                ctx = "ctx" in self.merge and self.chain and s not in self.band_of
+                kern = self._head_program(s, self.chain, (1, s), ctx=ctx)
+                if ctx:
+                    self.ctx_merged.add(s)
             elif s in self.band_of:
                 # a band: its wide head, a dyn_rows build (no split fallback: ids for 4 heads)
                 self.head_mode[s] = "wide"
@@ -229,6 +260,8 @@ class HiPrograms:
         self.D = D
         self.ctx_programs = {}
         for s in self.widths:
+            if s in self.ctx_merged:  # (in the verify head's launch, with the same KV_FMT knobs: ``_head_program``)
+                continue
             _, prog = D.context_program(f"atom_v41_ctx{self._kv8_tag}_r{s}", Scenario(*self.split[s], self.tp),
                                         "shard", False, knobs=self._kv_knobs or None)  # fmt: skip
             self.ctx_programs[s] = MonoKernel(prog)
@@ -400,20 +433,22 @@ class HiPrograms:
                                   peer_first=self._chain_peer() if self.chain else (), **dk))  # fmt: skip
 
     def _head_program(
-        self, s: int, chain: bool, split: tuple | None = None, dyn: bool = False
+        self, s: int, chain: bool, split: tuple | None = None, dyn: bool = False, ctx: bool = False
     ):
         """The verify head's program at ``s`` rows (module docstring), ``split`` = (requests, rows a request) of its
         scenario (default one request): ``chain``, its fold sums the last layer's pushed MoE partials
         (``hi_plan.chain_role``); its R into ``r_h``. One program a (rows, requests, chain), shared by the widths that run
-        it."""
+        it. ``ctx``: the DSpark context write merged into it (``MERGES``), with the CTX program's KV knobs
+        (``_kv_knobs``: ATOM's fp8 pool, the "_kv8" build's ring writes)."""
         from .hi.plan.program import Scenario
         from .hi.runtime.kernel import MonoKernel
         from .hi.v41 import head as H
 
         self.H = H
         nb, rq = split or (1, s)
-        if (s, nb, chain, dyn) not in self._heads:
-            tag = (f"_b{nb}" if nb > 1 else "") + ("_band" if dyn else "")
+        hkey = (s, nb, chain, dyn) + (("ctx", self._kv8_tag) if ctx else ())
+        if hkey not in self._heads:
+            tag = (f"_b{nb}" if nb > 1 else "") + ("_band" if dyn else "") + (f"_ctx{self._kv8_tag}" if ctx else "")
             name = f"atom_v41_head{'_chain' if chain else ''}_sample_race_r{s}{tag}"
             # sampling (a row with T > 0: one draw in its top-p nucleus), the rows with top_p >= 1 raced in the dot
             # epilogue (module docstring)
@@ -421,9 +456,13 @@ class HiPrograms:
             # (a band's head: launched with the step's live words, as its layers)
             if dyn:
                 knobs["dyn"] = True
-            self._heads[s, nb, chain, dyn] = MonoKernel(H.head_program(name, Scenario(nb, rq, self.tp), chain=chain,
-                                                                       res_out="r_h", **knobs))  # fmt: skip
-        return self._heads[s, nb, chain, dyn]
+            if ctx:
+                knobs["ctx"] = True
+                if self._kv_knobs:
+                    knobs["ctx_knobs"] = dict(self._kv_knobs)
+            self._heads[hkey] = MonoKernel(H.head_program(name, Scenario(nb, rq, self.tp), chain=chain,
+                                                          res_out="r_h", **knobs))  # fmt: skip
+        return self._heads[hkey]
 
     def _draft_kern(self, key: tuple, make):
         """A draft kernel, built once a key: ``make()`` -> ``Program``."""

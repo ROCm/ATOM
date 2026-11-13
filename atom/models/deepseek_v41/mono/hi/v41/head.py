@@ -204,10 +204,21 @@ def place(stages, cus: int = 256):
     return stages
 
 
-def head_program(name: str, sc, chain: bool = False, dyn: bool = False, **knobs):
+# ``head_program(ctx=True)``: the head's stages the merged context write keeps off (the dot and the pick: a context
+# task queued behind one of them on its CTA would start when it ends)
+CTX_AVOID = ("head", "head.pick")
+
+
+def head_program(name: str, sc, chain: bool = False, dyn: bool = False, ctx: bool = False,
+                 ctx_knobs: dict | None = None, **knobs):  # fmt: skip
     """The head's ``Program`` (``head_blocks``); ``chain``: after a ``push_moe`` layer launch, sharing its peer
     group (the chain's regions declared and pinned first). ``dyn``: a ``Program.dyn_rows`` build (a batch band's head,
-    launched with the step's live rows)."""
+    launched with the step's live rows). ``ctx``: the DSpark context write merged into the launch
+    (``draft.context_blocks(taps="streams")``: its taps from the tapped layers' streams, args ``cx.ra0..2``, not
+    the end-step's), after the head's stages in program order on the CTAs the dot and the pick leave idle
+    (``draft.place_after``); the two share no region, so each keeps its own hand-offs. One request (its
+    ``cx.bids`` / ``cx.slots`` are the step's). ``ctx_knobs``: the context write's knobs over ``draft.KNOBS``' (as
+    ``draft.context_program``'s: ``KV_FMT`` "fp8", ATOM's fp8 pool, its rings' rows written as the "_kv8" CTX's)."""
     from ..plan.program import Program
     from .layer import chain_peer_first, residual_layout
     from .schedules import KEY_TP
@@ -219,6 +230,13 @@ def head_program(name: str, sc, chain: bool = False, dyn: bool = False, **knobs)
             for st in b.stages(sc)
         ]
     )
+    if ctx:
+        from .draft import context_blocks_at, place_after
+
+        if sc.batch != 1 or dyn:
+            raise ValueError(f"{name}: the context write merges into a one-request head")
+        cx = [st for b in context_blocks_at(sc, "shard", False, ctx_knobs, taps="streams") for st in b.stages(sc)]
+        stages = place_after(stages, cx, CTX_AVOID)
     wide = (
         sc.tp > KEY_TP
     )  # past the entries' tp: SGPR spills into VGPR lanes allowed (TP8: up to 12)
