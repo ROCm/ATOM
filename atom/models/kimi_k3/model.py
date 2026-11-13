@@ -519,9 +519,11 @@ class KimiSparseMoeBlock(nn.Module):
 
         When ``shared`` is a tensor the two branches are left unsummed and
         ``first`` is the routed branch alone (on the row-sharded tail, the sum,
-        with ``shared`` zero): the caller's next apply_attn_res
-        folds both into its prefix on-load, so deferring the add removes a whole
-        [T, H] elementwise kernel and its HBM round-trip per MoE layer.
+        with ``shared`` a folded zero: unwritten, so a caller that adds it in
+        torch zeroes it first through ``materialize_folded_zeros``): the
+        caller's next apply_attn_res folds both into its prefix on-load, so
+        deferring the add removes a whole [T, H] elementwise kernel and its HBM
+        round-trip per MoE layer.
 
         When ``shared`` is None, ``first`` is the module's *complete* output --
         either because there are no shared experts, or because the two branches
