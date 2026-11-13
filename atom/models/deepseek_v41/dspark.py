@@ -293,16 +293,11 @@ class DeepseekV41DSpark(DSparkDraftModel):
     def context_layers(self):
         return tuple(layer.attn for layer in self.mtp)
 
-    def write_context_kv(
-        self, aux_concat, positions, slot_mapping=None, pcp_num_tokens=None
-    ):
+    def write_context_kv(self, aux_concat, positions, slot_mapping=None):
         from atom.utils.forward_context import get_forward_context
 
         forward = get_forward_context()
         if forward.context.is_dummy_run:
-            return
-        if pcp_num_tokens is not None:
-            self.write_split_context_kv(aux_concat, positions, pcp_num_tokens)
             return
         metadata = forward.attn_metadata
         cache, step = metadata.cache, metadata.step

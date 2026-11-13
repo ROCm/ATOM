@@ -733,23 +733,11 @@ def test_dspark_default_split_context_kv_gathers_the_aux_rows(monkeypatch):
     assert written == []
 
 
-def test_v41_dspark_write_context_kv_takes_the_split_stripe(monkeypatch):
-    """V4.1 overrides `write_context_kv`, so the proposer's split call must
-    reach its `write_split_context_kv` rather than raise a TypeError."""
-    v41 = _import_or_skip_dep("atom.models.deepseek_v41.dspark")
-
-    _split_ctx(monkeypatch, 4)
-    split = []
-    model = SimpleNamespace(write_split_context_kv=lambda *a: split.append(a))
-    aux, positions = torch.ones(3, 5), torch.arange(10)
-    v41.DeepseekV41DSpark.write_context_kv(model, aux, positions, pcp_num_tokens=10)
-    assert split == [(aux, positions, 10)]
-
-
 def test_every_dspark_draft_override_takes_pcp_num_tokens():
     """The proposer passes `pcp_num_tokens` to every draft model, and each
     override must act on it; read from source so a draft whose own extra deps
-    are missing here is still checked."""
+    are missing here is still checked. V4.1 refuses context parallel at
+    startup (`validate_runtime_config`), so its override never sees it."""
     import ast
     import pathlib
 
@@ -793,7 +781,9 @@ def test_every_dspark_draft_override_takes_pcp_num_tokens():
             break
         drafts |= more
     for cls, _ in classes:
-        if cls.name == "DSparkDraftModel" or cls.name not in drafts:
+        if cls.name in ("DSparkDraftModel", "DeepseekV41DSpark") or (
+            cls.name not in drafts
+        ):
             continue
         for fn in cls.body:
             if isinstance(fn, ast.FunctionDef) and fn.name == "write_context_kv":
@@ -802,4 +792,4 @@ def test_every_dspark_draft_override_takes_pcp_num_tokens():
                     assert _uses(fn, "pcp_num_tokens"), cls.name
                 else:
                     assert fn.args.kwarg and _forwards_kwargs(fn), cls.name
-    assert {"DeepseekV4DSpark", "DeepseekV41DSpark", "KimiK3DSparkDraft"} <= drafts
+    assert {"DeepseekV4DSpark", "KimiK3DSparkDraft"} <= drafts
