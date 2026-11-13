@@ -5,12 +5,16 @@
 Nothing is copied or re-laid-out: a kernel reads a parameter where the original
 model keeps it, so a layout the kernels were not written for must be refused here
 rather than read wrong. Every tensor is checked against the shape and dtype the
-kernels assume for the rank's shard.
+kernels assume for the rank's shard. The one exception is an FP8 weight the
+original path keeps row-major because its preshuffled GEMM runs no such K (the
+shared expert's down projection at TP8, K = 288: ``linear.weight_is_stored_preshuffled``):
+the kernels read the (16, 16)-preshuffled layout, so they get a shuffled copy.
 """
 
 from dataclasses import dataclass
 
 import torch
+from aiter.ops.shuffle import shuffle_weight
 
 from atom.models.deepseek_v41.config import AttentionMode
 from atom.models.deepseek_v41.mono.kernels.dims import Dims
@@ -130,6 +134,8 @@ def bind_layer(block, config, dims: Dims, moe_tp: int = 1) -> LayerWeights:
             )
         if not tensor.is_contiguous():
             raise MonoUnsupported(f"layer {spec.layer_id}: {name} not contiguous")
+        if dtype == FP8 and not getattr(tensor, "is_shuffled", False):
+            params[name] = shuffle_weight(tensor.data, layout=(16, 16))
     return LayerWeights(spec.layer_id, spec.mode, params)
 
 
