@@ -31,7 +31,7 @@ import torch
 # which couples to vLLM internals. ATOM imports triton directly everywhere else.
 import triton
 import triton.language as tl
-from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
+from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from . import prefill_policy as _prefill_policy
 
@@ -70,8 +70,6 @@ def _small_k_selector():
     return topk_per_row_small_k, topk_per_row_small_k_supported
 
 
-# Workgroups per compute unit the block-axis split aims for (_score_chunk_blocks).
-SCORE_CHUNK_CTAS_PER_CU = _prefill_policy.SCORE_CHUNK_CTAS_PER_CU
 # Stages, both score kernels. 2 -- triton's default -- was the worst of 1/2/3
 # nearly everywhere. Between 1 and 3, 3 wins on fp8 and ties on bf16; 1 wins the
 # short-context rows, which is not where a step spends its time.
@@ -92,7 +90,7 @@ _FP8_DTYPES = tuple(
 @functools.cache
 def _prefill_score_launch_config(dtype: torch.dtype) -> tuple[int, int]:
     """Return (warps, stages) without changing the tuned gfx950 path."""
-    if get_gfx() != "gfx1250":
+    if get_gfx_runtime() != "gfx1250":
         return 4, SCORE_NUM_STAGES
 
     # For FP8 on wave32, a single pipeline stage cuts LDS/register pressure
@@ -532,9 +530,40 @@ def _index_block_score_kernel(
     if blk_lo >= blk_end:
         return
     blk_hi = min(blk_lo + chunk_blocks, blk_end)
-    q_row = seq_start + pid_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
-    q_store_mask = (pid_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)) < q_len
-    if STORE_GROUP == 1:
+    if STORE_GROUP == 1 and not POST_REDUCE_SCALE:
+        # Preserve main's exact fallback body: short/underfilled shapes select
+        # this specialization, so the optimized kernel must not tax them.
+        for blk in tl.range(blk_lo, blk_hi):
+            i = blk * BLOCK_SIZE_K
+            page = tl.load(bt_row + blk).to(tl.int64)
+            pos = i + off_k
+            # Every page id names a fully allocated 128-row cache page; the
+            # causal mask below removes positions past the live sequence.
+            k = tl.load(
+                ik_cache_ptr
+                + page * stride_ik_blk
+                + off_k[None, :] * stride_ik_pos
+                + off_d[:, None] * stride_ik_d,
+            )
+            if k.dtype.is_fp8():
+                qk = tl.dot(q.to(k.dtype), k, out_dtype=tl.float32) * sm_scale_log2e
+            else:
+                qk = tl.dot(q, k, out_dtype=tl.float32) * sm_scale_log2e
+            if q_start < i + BLOCK_SIZE_K:
+                qk = tl.where(off_q[:, None] >= pos[None, :], qk, float("-inf"))
+            score = tl.max(qk, axis=1)
+            s_ptrs = (
+                score_ptr
+                + pid_h * stride_s_h
+                + (seq_start + pid_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q))
+                * stride_s_n
+                + blk * stride_s_k
+            )
+            q_store_mask = (pid_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)) < q_len
+            tl.store(s_ptrs, score, mask=q_store_mask)
+    elif STORE_GROUP == 1:
+        q_row = seq_start + pid_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
+        q_store_mask = (pid_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)) < q_len
         for blk in tl.range(blk_lo, blk_hi):
             page = tl.load(bt_row + blk).to(tl.int64)
             score = _index_block_score_page(
@@ -559,6 +588,8 @@ def _index_block_score_kernel(
             tl.store(s_ptrs, score, mask=q_store_mask)
     else:
         tl.static_assert(STORE_GROUP == 4)
+        q_row = seq_start + pid_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
+        q_store_mask = (pid_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)) < q_len
         slots = tl.arange(0, STORE_GROUP)
         num_groups = tl.cdiv(blk_hi - blk_lo, STORE_GROUP)
         for group in tl.range(0, num_groups):
@@ -838,8 +869,7 @@ def _alloc_emit(
 
 # Row widths (in 128-blocks) from which aiter's selector is the cheaper way to
 # serve the call; under them the fused Triton kernel is, being one launch that
-# also emits. Device us, MI355X, topk=16, rows 1..512, rocprofv3-attributed
-# (`/app/logs_claude/m3_emit_gate_device*.log`), as triton/aiter:
+# also emits. Device us, MI355X, topk=16, rows 1..512, as triton/aiter:
 #
 #     width        64     512    1024    2048    8192
 #     emit=True   0.6x    0.7x    1.0x    1.4x    3.7x
@@ -861,6 +891,7 @@ _GFX1250_AITER_MIN_WIDTH = 512
 _GFX1250_AITER_MIN_CELLS_PER_CU = 1 << 14
 
 
+@functools.cache
 def _aiter_selector_wins(
     width,
     emit,
@@ -868,8 +899,12 @@ def _aiter_selector_wins(
     arch=None,
     rows=1,
     compute_units=1,
+    decode_max_q=0,
 ):
     if arch == "gfx1250":
+        # This PR tunes prefill only. Decode keeps main's width crossover.
+        if decode_max_q > 0:
+            return width >= (_AITER_MIN_WIDTH_WITH_EMIT if emit else _AITER_MIN_WIDTH)
         return (
             width >= _GFX1250_AITER_MIN_WIDTH
             and rows * width >= compute_units * _GFX1250_AITER_MIN_CELLS_PER_CU
@@ -1020,6 +1055,7 @@ def _launch_parallel_prefill_selector(
     init_blocks,
     local_blocks,
     block_page_stride,
+    pages_per_block,
 ):
     """Select exact top-k, using sparse_bt as the partial-key workspace."""
     num_idx_heads, total_q, max_block = score.shape
@@ -1028,7 +1064,13 @@ def _launch_parallel_prefill_selector(
     block_size_t = triton.next_power_of_2(topk)
     sparse_bt, sparse_ctx, stride_bt_b, stride_sbt_n = emit_args
     partial_keys = sparse_bt.view(torch.int64).view(num_idx_heads, total_q, -1)
-    assert num_groups * block_size_t <= partial_keys.shape[2]
+    required_keys = num_groups * block_size_t
+    if required_keys > partial_keys.shape[2]:
+        raise RuntimeError(
+            "parallel prefill selector needs "
+            f"{required_keys} int64 workspace keys per row, but the emitted "
+            f"block table provides {partial_keys.shape[2]}"
+        )
     _prefill_partial_topk_kernel[(rows_per_req, batch * num_idx_heads, num_groups)](
         score,
         partial_keys,
@@ -1064,7 +1106,7 @@ def _launch_parallel_prefill_selector(
         SPARSE_BLOCK=SPARSE_BLOCK_SIZE,
         BLOCK_SIZE_T=block_size_t,
         MERGE_SIZE=triton.next_power_of_2(num_partial),
-        pages_per_block=PAGES_PER_SPARSE_BLOCK,
+        pages_per_block=pages_per_block,
         block_page_stride=block_page_stride,
         num_warps=1,
     )
@@ -1106,38 +1148,6 @@ def _select_with_aiter(
         flat_score, n_valid_column_per_row, flat_idx, topk, init_blocks, local_blocks
     )
     return True
-
-
-def _parallel_prefill_selector_enabled(
-    score, *, emit, topk, num_idx_heads, decode_max_q
-):
-    """Apply the cheap shape gates before querying the device policy."""
-    if not (
-        decode_max_q == 0
-        and emit
-        and topk == 16
-        and num_idx_heads == 1
-        and PREFILL_TOPK_MAX_BLOCK_SIZE_K
-        < score.shape[2]
-        <= 4 * PREFILL_TOPK_MAX_BLOCK_SIZE_K
-    ):
-        return False
-
-    device_index = (
-        score.device.index
-        if score.device.index is not None
-        else torch.cuda.current_device()
-    )
-    return _parallel_prefill_selector_wins(
-        arch=get_gfx_runtime(),
-        width=score.shape[2],
-        rows=score.shape[1],
-        compute_units=_compute_units(device_index),
-        emit=emit,
-        topk=topk,
-        num_idx_heads=num_idx_heads,
-        decode_max_q=decode_max_q,
-    )
 
 
 def _launch_sparse_block_table_emit(
@@ -1220,12 +1230,15 @@ def _launch_select(
         if score.device.index is not None
         else torch.cuda.current_device()
     )
+    arch = get_gfx_runtime()
+    compute_units = _compute_units(device_index)
     take_aiter = n_valid_column_per_row is not None and _aiter_selector_wins(
         score.shape[2],
         emit,
-        arch=get_gfx_runtime(),
+        arch=arch,
         rows=score.shape[0] * score.shape[1],
-        compute_units=_compute_units(device_index),
+        compute_units=compute_units,
+        decode_max_q=decode_max_q,
     )
     if take_aiter and _select_with_aiter(
         score, topk_idx, n_valid_column_per_row, topk, init_blocks, local_blocks
@@ -1248,12 +1261,16 @@ def _launch_select(
         return
 
     # The partial keys reuse sparse_bt until the merge overwrites that row.
-    if _parallel_prefill_selector_enabled(
-        score,
+    if _parallel_prefill_selector_wins(
+        arch=arch,
+        width=score.shape[2],
+        rows=score.shape[1],
+        compute_units=compute_units,
         emit=emit,
         topk=topk,
         num_idx_heads=num_idx_heads,
         decode_max_q=decode_max_q,
+        pages_per_block=pages_per_block,
     ):
         _launch_parallel_prefill_selector(
             score,
@@ -1267,6 +1284,7 @@ def _launch_select(
             init_blocks,
             local_blocks,
             block_page_stride,
+            pages_per_block,
         )
         return
 

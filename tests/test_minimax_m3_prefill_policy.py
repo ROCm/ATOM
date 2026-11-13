@@ -74,8 +74,27 @@ def test_parallel_prefill_selector_resource_bounds(
             topk=TOPK,
             num_idx_heads=heads,
             decode_max_q=decode_max_q,
+            pages_per_block=8,
         )
         == want
+    )
+
+
+@pytest.mark.parametrize("pages_per_block,want", [(8, True), (1, False)])
+def test_parallel_prefill_selector_fits_emitted_workspace(pages_per_block, want):
+    assert (
+        parallel_prefill_selector_wins(
+            arch="gfx1250",
+            width=1280,
+            rows=512,
+            compute_units=256,
+            emit=True,
+            topk=TOPK,
+            num_idx_heads=1,
+            decode_max_q=0,
+            pages_per_block=pages_per_block,
+        )
+        is want
     )
 
 

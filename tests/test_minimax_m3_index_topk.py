@@ -61,7 +61,7 @@ TOPK = 16
     ],
 )
 def test_prefill_score_launch_config(monkeypatch, arch, dtype, want):
-    monkeypatch.setattr(m, "get_gfx", lambda: arch)
+    monkeypatch.setattr(m, "get_gfx_runtime", lambda: arch)
     m._prefill_score_launch_config.cache_clear()
     try:
         assert m._prefill_score_launch_config(dtype) == want
@@ -574,6 +574,28 @@ class TestSelectorDispatch:
             == want
         )
 
+    @pytest.mark.parametrize(
+        "width,emit,want",
+        [
+            (1023, False, False),
+            (1024, False, True),
+            (2047, True, False),
+            (2048, True, True),
+        ],
+    )
+    def test_gfx1250_decode_keeps_main_width_gate(self, width, emit, want):
+        assert (
+            m._aiter_selector_wins(
+                width,
+                emit=emit,
+                arch="gfx1250",
+                rows=65536,
+                compute_units=256,
+                decode_max_q=4,
+            )
+            is want
+        )
+
 
 @gpu
 def test_the_two_selectors_agree_where_the_dispatch_switches():
@@ -741,6 +763,70 @@ def test_gfx1250_wave32_selector_matches_prefill_fallback(
         n_valid_column_per_row=None,
     )
     assert all(torch.equal(a, b) for a, b in zip(candidate, fallback))
+
+
+@gpu
+def test_page128_prefill_emit_uses_aiter_or_fallback_without_parallel_workspace(
+    monkeypatch,
+):
+    """MXFP4's one-page output is too small to alias as parallel-topk workspace."""
+    if m.get_gfx_runtime() != "gfx1250":
+        pytest.skip("gfx1250 page-128 selector regression")
+
+    rows, width = 4096, 1280
+    dev = "cuda"
+    score = torch.randn((1, rows, width), device=dev)
+    row_starts = torch.tensor([0, rows], dtype=torch.int32, device=dev)
+    prefix = width * SPARSE_BLOCK_SIZE - rows
+    row_prefix = torch.tensor([prefix], dtype=torch.int32, device=dev)
+    block_table = torch.arange(width, dtype=torch.int32, device=dev)[None, :]
+    bounds = m.build_n_valid_column_per_row(
+        row_starts,
+        row_prefix,
+        batch=1,
+        total_q=rows,
+        num_idx_heads=1,
+        decode_max_q=0,
+    )
+
+    def run(n_valid):
+        topk_idx = torch.empty((1, rows, TOPK), dtype=torch.int32, device=dev)
+        (sparse_bt, sparse_ctx), emit_args = m._alloc_emit(
+            rows, 1, TOPK, block_table, True, dev, pages_per_block=1
+        )
+        m._launch_select(
+            score,
+            topk_idx,
+            row_starts,
+            row_prefix,
+            1,
+            TOPK,
+            INIT,
+            LOCAL,
+            block_table,
+            emit_args,
+            1,
+            rows_per_req=rows,
+            decode_max_q=0,
+            block_size_k=m._prefill_topk_block_size_k(width),
+            num_warps=m.PREFILL_TOPK_NUM_WARPS,
+            emit=True,
+            block_page_stride=1,
+            n_valid_column_per_row=n_valid,
+            pages_per_block=1,
+        )
+        return topk_idx, sparse_bt, sparse_ctx
+
+    aiter_out = run(bounds)
+    monkeypatch.setattr(
+        m,
+        "_launch_parallel_prefill_selector",
+        lambda *args, **kwargs: pytest.fail(
+            "page-128 output cannot provide parallel-selector workspace"
+        ),
+    )
+    fallback_out = run(None)
+    assert all(torch.equal(a, b) for a, b in zip(aiter_out, fallback_out))
 
 
 @gpu

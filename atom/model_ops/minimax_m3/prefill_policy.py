@@ -55,6 +55,11 @@ def _floor_power_of_two(value: int) -> int:
     return 1 << (max(1, value).bit_length() - 1)
 
 
+def _next_power_of_two(value: int) -> int:
+    return 1 << (max(1, value) - 1).bit_length()
+
+
+@functools.lru_cache(maxsize=128)
 def parallel_prefill_selector_wins(
     arch: str,
     width: int,
@@ -64,9 +69,13 @@ def parallel_prefill_selector_wins(
     topk: int,
     num_idx_heads: int,
     decode_max_q: int,
+    pages_per_block: int,
 ) -> bool:
     """Whether parallel 1024-block local top-k passes repay their merge."""
     num_tiles = _cdiv(width, PREFILL_TOPK_MAX_BLOCK_SIZE_K)
+    partials_per_tile = _next_power_of_two(topk)
+    # sparse_bt is int32 and the partial keys are int64 views of the same row.
+    workspace_keys = topk * pages_per_block // 2
     return (
         arch == "gfx1250"
         and decode_max_q == 0
@@ -77,8 +86,8 @@ def parallel_prefill_selector_wins(
         and width - PREFILL_TOPK_MAX_BLOCK_SIZE_K >= compute_units
         # Pay for the merge only when the extra tiles add two CTAs per CU.
         and rows * (num_tiles - 1) >= 2 * compute_units
-        # Four local lists fit in sparse_bt's 128-int32 output row.
-        and width <= 4 * PREFILL_TOPK_MAX_BLOCK_SIZE_K
+        # Every local list must fit in the aliased emitted-table workspace.
+        and num_tiles * partials_per_tile <= workspace_keys
     )
 
 
