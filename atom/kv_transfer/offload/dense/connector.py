@@ -390,7 +390,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 total_ms,
             )
 
-    def _do_save_req(self, req: LMCacheReqMeta, *, producer_event=None) -> None:
+    def _do_save_req(self, req: LMCacheReqMeta, *, producer_event) -> None:
         ss = req.save_spec
         assert ss is not None
         toks = req.token_ids
@@ -409,8 +409,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         t_store0 = time.perf_counter()
         # Wait on the producing stream before this thread reads KV; the same
         # event is still handed to store() below.
-        if producer_event is not None:
-            wait_save_fence(producer_event)
+        wait_save_fence(producer_event)
         self._reset_gpu_connector_transfer_stats()
         gpu_connector = self._engine.gpu_connector
         track_source = getattr(gpu_connector, "track_save_source", None)
@@ -419,19 +418,18 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             if getattr(self, "_early_release", False) and callable(track_source)
             else nullcontext()
         )
+        # LMCache forwards extra store kwargs to batched_from_gpu(), which
+        # enqueues the wait on the pack stream of whichever thread reads KV.
+        # This is the one cross-repo assumption of the fence: `producer_fenced`
+        # in the transfer stats reports whether the connector actually saw the
+        # event.
         store_kwargs = {
             "mask": mask,
             "block_ids": req.block_ids,
             "req_id": str(req.req_id),
+            "producer_event": producer_event,
             **salt_kwargs(req.cache_salt),
         }
-        if producer_event is not None:
-            # LMCache forwards extra store kwargs to batched_from_gpu(), which
-            # enqueues the wait on the pack stream of whichever thread reads
-            # KV. This is the one cross-repo assumption of the fence:
-            # `producer_fenced` in the transfer stats reports whether the
-            # connector actually saw the event.
-            store_kwargs["producer_event"] = producer_event
         with source_context:
             self._engine.store(tok_tensor, **store_kwargs)
         store_ms = (time.perf_counter() - t_store0) * 1000
