@@ -15,10 +15,12 @@ numbers, and ``plan.unsupported`` the shapes this kernel is not written for).
     k       (a token, on its owner rank only: slot >= 0) the original's
             LayerNorm -> bf16 (-> RoPE -> bf16) -> per-token power-of-two FP8
             -> the index cache row (preshuffled, ``plan.cache_byte``) and its
-            scale, KDONE
+            scale; FP4: a 32-dim group's E8M0 and E2M1 bytes into the cache's
+            two planes (``plan.fp4_byte`` / ``fp4_scale_byte``), KDONE
     iquant  (a (token, head), wave 0): the head's row groups (QRDY) (-> RoPE
             -> bf16) -> per-(token, head) FP8 q and its head weight (w q_scale
-            weights_scale) -> IQ8 / IW (the scorer's operands), QQ
+            weights_scale), FP4 E2M1 q, its E8M0 and the raw weight -> IQ8 / IW
+            (the scorer's operands), QQ
     score   (a long row's unit of 128 local keys, every CTA): ``select``
     select  (a long row's segments): its distributed selection (``select``)
     row     (a row, CTA 255 - r): a short row's every key; replicated, a long
@@ -40,6 +42,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import Int32, Int64, T
 
+from atom.model_ops.sparse_indexer_fp4 import FP4_QUANT_BLOCK_SIZE
 from atom.mono.device import gemv
 from atom.mono.device.mx import FP8_MAX, clamp_fp8
 from atom.mono.device.ops import (
@@ -65,7 +68,6 @@ from atom.mono.device.stamps import stamp, stamp_begin, stamp_flush
 from atom.mono.device.sync import Mailbox, preg, publish, sreg
 from atom.mono.dsa_indexer import select as isel
 from atom.mono.dsa_indexer.plan import (
-    FP4_GROUP,
     REPLICA_INTERLEAVE,
     IndexerShape,
     cache_byte,
@@ -451,11 +453,11 @@ def _write_k_fp4(c, t, slot, x, g, b):
                 fp4_byte(sh, row, lane + 64 * i),
                 cache_modifier=CM_DEV,
             )
-        if lane % FP4_GROUP == 0:
+        if lane % FP4_QUANT_BLOCK_SIZE == 0:
             bo.buffer_store(
                 fx.Int8(codes[i]),
                 sbase,
-                fp4_scale_byte(sh, row, lane // FP4_GROUP + 2 * i),
+                fp4_scale_byte(sh, row, lane // FP4_QUANT_BLOCK_SIZE + 2 * i),
                 cache_modifier=CM_DEV,
             )
 
@@ -468,7 +470,8 @@ def stage_k(c, t):
     2^ceil(log2(amax / 448)) -> FP8 -> the cache row and its scale. The NoPE
     writer's LayerNorm (``nope.py``): mul / add unfused, the affine params
     through bf16; the fused RoPE writer's: fp32 params, scale and shift one
-    fma (its default contraction), then the rotation (dims 0 .. 63)."""
+    fma (its default contraction), then the rotation (dims 0 .. 63). An FP4
+    cache: ``_stage_k_fp4``."""
     if const_expr(c["shape"].fp4):
         _stage_k_fp4(c, t)
         return
@@ -531,7 +534,7 @@ def stage_iquant(c, bid, tokens):
     (``WAVES`` a round): every one is head bid % heads (BLOCKS a multiple of
     heads), so that head's row-group flags are polled once. A task is the
     original's per-(token, head) FP8 quant and the head weight folded with its
-    scale; each round's flags go out together."""
+    scale (FP4: ``_iquant_fp4``); each round's flags go out together."""
     tid, lane, wave, sh = c["tid"], c["lane"], c["wave"], c["shape"]
     assert BLOCKS % sh.heads == 0
     n = tokens * sh.heads
@@ -596,7 +599,7 @@ def iquant_task(c, task, lane):
 def _iquant_fp4(c, t, h, lane, x0, x1):
     """FP4: the writer's q (lane l: dims 2 l, 2 l + 1): its RoPE on the pairs
     of dims 0 .. 63, a 32-dim group's (16 lanes') E8M0 and E2M1 byte, to IQ8
-    as ``_q_fp4_byte`` / ``_q_fp4_scale``; the head weight raw (the scorer's
+    as ``q_fp4_byte`` / ``q_fp4_scale``; the head weight raw (the scorer's
     2 relu folds the writer's weight_scale / 2 in)."""
     a, sh = c["args"], c["shape"]
     half = sh.rope_dim // 2
@@ -612,11 +615,11 @@ def _iquant_fp4(c, t, h, lane, x0, x1):
         q_fp4_byte(sh, t, h, 2 * lane),
         cache_modifier=CM_DEV,
     )
-    if lane % (FP4_GROUP // 2) == 0:
+    if lane % (FP4_QUANT_BLOCK_SIZE // 2) == 0:
         bo.buffer_store(
             fx.Int8(code),
             iq,
-            q_fp4_scale(sh, t, h, lane // (FP4_GROUP // 2)),
+            q_fp4_scale(sh, t, h, lane // (FP4_QUANT_BLOCK_SIZE // 2)),
             cache_modifier=CM_DEV,
         )
     if lane == 0:

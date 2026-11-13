@@ -4,7 +4,12 @@
 replicated (128-key runs), against counting every position's owner."""
 
 import pytest
+import torch
 
+from atom.model_ops.sparse_indexer_fp4 import (
+    FP4_KV_BLOCK_SIZE,
+    FP4_QUANT_BLOCK_SIZE,
+)
 from atom.mono.dsa_indexer.plan import (
     REPLICA_INTERLEAVE,
     IndexerShape,
@@ -12,6 +17,8 @@ from atom.mono.dsa_indexer.plan import (
     fp4_scale_byte,
     key_pos,
     local_len,
+    q_fp4_byte,
+    q_fp4_scale,
     unsupported,
 )
 
@@ -32,7 +39,7 @@ def test_a_ranks_keys_are_the_positions_it_owns_in_order(world, interleave):
             assert got == owned[rank], (ctx, rank)
 
 
-def _shape(kv_dtype="fp4", block_rows=64, rope_neox=False):
+def _shape(kv_dtype="fp4", rope_neox=False):
     return IndexerShape(
         heads=32,
         head_dim=128,
@@ -40,32 +47,68 @@ def _shape(kv_dtype="fp4", block_rows=64, rope_neox=False):
         q_lora=2048,
         wq_dtype="bf16",
         kv_dtype=kv_dtype,
-        block_rows=block_rows,
+        block_rows=FP4_KV_BLOCK_SIZE,
         rope_dim=64,
         rope_neox=rope_neox,
     )
 
 
-def test_an_fp4_cache_is_served_only_in_the_writers_layout():
+def test_an_fp4_cache_is_served_only_with_the_writers_rope():
     assert unsupported(_shape()) == ""
-    assert "64 rows" in unsupported(_shape(block_rows=16))
     assert "interleaved RoPE" in unsupported(_shape(rope_neox=True))
 
 
-def test_fp4_bytes_are_where_the_scorers_packer_puts_them():
-    """Every key byte and E8M0 of a block, at the offset aiter's FP4 scorer
-    packs it to (the cache writer's layout, ``fp4_index_block_shapes``)."""
-    torch = pytest.importorskip("torch")
-    rowgroup = pytest.importorskip(
-        "aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_rowgroup"
+def _pack_block(kv, ks, rows):
+    """aiter's ``pack_kv_cache`` for a 64-row page (the cache writer's
+    layout): a block's bytes behind (k tile, chunk), its E8M0s four tiles'
+    keys 16 apart a dword."""
+    k_tiles = kv.shape[1] * 2 // 128
+    data = kv.reshape(rows, k_tiles, 4, 16).permute(1, 2, 0, 3)
+    scale = (
+        ks.reshape(rows, k_tiles, 4)
+        .permute(1, 2, 0)
+        .reshape(k_tiles, 4, rows // 16, 16)
+        .transpose(-1, -2)
     )
+    return data.flatten(), scale.flatten()
+
+
+def test_fp4_bytes_are_where_the_cache_writer_puts_them():
     sh = _shape()
-    rows, half, chunks = sh.block_rows, sh.head_dim // 2, sh.head_dim // 32
+    rows, half = sh.block_rows, sh.head_dim // 2
+    chunks = sh.head_dim // FP4_QUANT_BLOCK_SIZE
     kv = torch.arange(rows * half, dtype=torch.int32).view(rows, half)
     ks = torch.arange(rows * chunks, dtype=torch.int32).view(rows, chunks)
-    data, scale = (t.flatten() for t in rowgroup.pack_kv_cache(kv, ks, page_size=rows))
+    data, scale = _pack_block(kv, ks, rows)
+    assert (data.numel(), scale.numel()) == (sh.block_bytes, sh.scale_block_bytes)
     for r in range(rows):
         for j in range(half):
             assert data[fp4_byte(sh, r, 2 * j)] == kv[r, j], (r, j)
         for ch in range(chunks):
             assert scale[fp4_scale_byte(sh, r, ch)] == ks[r, ch], (r, ch)
+
+
+def test_a_tokens_fp4_query_fills_its_row_in_the_scorers_loads():
+    """IQ8: a token's E2M1 bytes and E8M0s take its row once each; a head's
+    bytes and the token's scales start 16 B aligned (the 16 B loads that stage
+    them), a head's four scales one dword."""
+    sh = _shape()
+    chunks = sh.head_dim // FP4_QUANT_BLOCK_SIZE
+    for t in range(3):
+        at = [
+            q_fp4_byte(sh, t, h, col)
+            for h in range(sh.heads)
+            for col in range(0, sh.head_dim, 2)
+        ]
+        at += [
+            q_fp4_scale(sh, t, h, ch) for h in range(sh.heads) for ch in range(chunks)
+        ]
+        assert sorted(at) == list(range(t * sh.qrows, t * sh.qrows + len(at)))
+        assert len(at) <= sh.qrows
+        assert q_fp4_scale(sh, t, 0, 0) % 16 == 0
+        for h in range(sh.heads):
+            assert q_fp4_byte(sh, t, h, 0) % 16 == 0
+            assert q_fp4_scale(sh, t, h, 0) % 4 == 0
+            assert [q_fp4_scale(sh, t, h, ch) for ch in range(chunks)] == [
+                q_fp4_scale(sh, t, h, 0) + ch for ch in range(chunks)
+            ]
