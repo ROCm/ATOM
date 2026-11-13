@@ -1,11 +1,13 @@
-//! Sampled `Selected worker` log of the routing decisions behind each dispatch.
+//! Sampled `Selected worker` log of the routing decisions behind each dispatch,
+//! and the router's cache estimate that the response's usage is reconciled with.
 //!
 //! While `--route-log-sample-rate` is above 0, inference requests pass through
 //! [`scope`], and a sampled request gets a trace. Policies select and routers
 //! dispatch on the request task, so both reach the trace through a task-local
 //! instead of the placement API. Work spawned off the request task, such as the
 //! detached Mooncake prefill, takes the trace and the request span along with
-//! [`carry`].
+//! [`carry`]. The HTTP routers run each request's attempts in [`estimated`],
+//! whatever the sample rate.
 
 use std::{cell::RefCell, future::Future, sync::Arc};
 
@@ -18,7 +20,10 @@ use axum::{
 use rand::Rng;
 use tracing::{info, Instrument};
 
-use crate::{core::Worker, observability::metrics::MeshMetrics};
+use crate::{
+    core::Worker,
+    observability::metrics::{metrics_labels, MeshMetrics},
+};
 
 /// Request header that logs the routing decisions of one request while the
 /// sample rate is above 0.
@@ -26,6 +31,13 @@ pub const ROUTE_TRACE_HEADER: &str = "x-mesh-route-trace";
 
 tokio::task_local! {
     static TRACE: RouteTrace;
+    static ESTIMATE: RefCell<Option<Estimate>>;
+}
+
+/// The estimate of the latest selection in the pool that computes the prompt.
+struct Estimate {
+    url: String,
+    hit_ratio: f64,
 }
 
 /// Latest policy selection per pool; retries replace it.
@@ -104,9 +116,56 @@ pub(crate) fn record_selection(
     });
 }
 
+/// Runs the attempts of one routed request, and returns the cache hit ratio its
+/// last selection expected on the worker that computes the prompt, unless the
+/// request went to another worker.
+pub(crate) async fn estimated<F: Future>(attempts: F) -> (F::Output, Option<f64>) {
+    ESTIMATE
+        .scope(RefCell::new(None), async {
+            let output = attempts.await;
+            let estimate = ESTIMATE.with(|estimate| estimate.take());
+            (output, estimate.map(|estimate| estimate.hit_ratio))
+        })
+        .await
+}
+
+fn computes_prompt(pool: &'static str) -> bool {
+    matches!(
+        pool,
+        metrics_labels::WORKER_REGULAR | metrics_labels::WORKER_PREFILL
+    )
+}
+
+/// Keeps the estimate of a selection in the pool that computes the prompt; a
+/// retry replaces it.
+pub(crate) fn record_estimate(
+    pool: &'static str,
+    worker: Option<&Arc<dyn Worker>>,
+    hit_ratio: Option<f64>,
+) {
+    if !computes_prompt(pool) {
+        return;
+    }
+    let _ = ESTIMATE.try_with(|estimate| {
+        *estimate.borrow_mut() = worker.zip(hit_ratio).map(|(worker, hit_ratio)| Estimate {
+            url: worker.url().to_string(),
+            hit_ratio,
+        });
+    });
+}
+
 /// Records the worker a request is sent to after rank mapping.
 pub(crate) fn record_dispatch(pool: &'static str, worker: &Arc<dyn Worker>) {
     MeshMetrics::record_selected_dp_rank(pool, worker.base_url(), worker.dp_rank());
+    if computes_prompt(pool) {
+        let _ = ESTIMATE.try_with(|estimate| {
+            let mut estimate = estimate.borrow_mut();
+            // DP ranks keep separate KV caches, so a remapped request loses the estimate.
+            if estimate.as_ref().is_some_and(|e| e.url != worker.url()) {
+                *estimate = None;
+            }
+        });
+    }
     let _ = TRACE.try_with(|trace| {
         let selections = trace.selections.borrow();
         let selection = selections.iter().find(|selection| selection.pool == pool);
@@ -252,6 +311,42 @@ mod tests {
         ] {
             assert!(rendered.contains(line), "missing {line} in\n{rendered}");
         }
+    }
+
+    #[tokio::test]
+    async fn the_estimate_follows_the_last_prompt_selection_until_a_remap() {
+        let worker = |url: &str, worker_type| -> Arc<dyn Worker> {
+            Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .worker_type(worker_type)
+                    .build(),
+            )
+        };
+        let regular = worker("http://regular:8000", WorkerType::Regular);
+        let decode = worker("http://decode:8000", WorkerType::Decode);
+
+        let (_, kept) = estimated(async {
+            record_estimate("prefill", Some(&prefill_rank(0)), Some(0.5));
+            record_estimate("decode", Some(&decode), Some(0.9));
+            record_dispatch("prefill", &prefill_rank(0));
+            record_dispatch("decode", &decode);
+        })
+        .await;
+        let (_, remapped) = estimated(async {
+            record_estimate("prefill", Some(&prefill_rank(0)), Some(0.5));
+            record_dispatch("prefill", &prefill_rank(1));
+        })
+        .await;
+        let (_, retried) = estimated(async {
+            record_estimate("regular", Some(&regular), Some(0.5));
+            record_estimate("regular", Some(&regular), None);
+            record_dispatch("regular", &regular);
+        })
+        .await;
+        assert_eq!((kept, remapped, retried), (Some(0.5), None, None));
+        // Outside `estimated` there is nothing to keep.
+        record_estimate("regular", Some(&regular), Some(0.5));
+        record_dispatch("regular", &regular);
     }
 
     #[tokio::test]

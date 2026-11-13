@@ -362,8 +362,8 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             let affinity = match_rate > self.config.cache_threshold;
             let tenant_url: &str = &result.tenant;
             let decision = RouteDecision {
-                branch: if affinity { "affinity" } else { "relocate" },
                 match_ratio: Some(match_rate as f64),
+                ..RouteDecision::branch(if affinity { "affinity" } else { "relocate" })
             };
 
             // Select worker without String allocation
@@ -399,6 +399,11 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 // Increment processed counter
                 workers[idx].increment_processed();
 
+                let decision = RouteDecision {
+                    estimated_hit_ratio: (workers[idx].url() == tenant_url)
+                        .then_some(match_rate as f64),
+                    ..decision
+                };
                 return (Some(idx), decision);
             }
 
@@ -658,26 +663,52 @@ mod tests {
             })
             .collect();
         policy.init_workers(&workers);
-        let info = SelectWorkerInfo {
-            request_text: Some("hello world"),
-            ..Default::default()
-        };
 
-        let select = || async {
-            let (selected, decision) = policy.select_with_decision(&workers, &info).await;
-            (selected.unwrap(), decision.branch, decision.match_ratio)
+        let select = |text: &'static str| {
+            let (policy, workers) = (&policy, &workers);
+            async move {
+                let info = SelectWorkerInfo {
+                    request_text: Some(text),
+                    ..Default::default()
+                };
+                let (selected, decision) = policy.select_with_decision(workers, &info).await;
+                let ratios = (decision.match_ratio, decision.estimated_hit_ratio);
+                (selected.unwrap(), decision.branch, ratios)
+            }
         };
+        let ratio = |matched: f32, input: f32| Some((matched / input) as f64);
 
-        let (first, branch, ratio) = select().await;
-        assert_eq!((branch, ratio), ("relocate", Some(0.0)));
-        assert_eq!(select().await, (first, "affinity", Some(1.0)));
+        let (first, branch, (match_ratio, _)) = select("hello world").await;
+        assert_eq!((branch, match_ratio), ("relocate", Some(0.0)));
+        assert_eq!(
+            select("hello world").await,
+            (first, "affinity", (Some(1.0), Some(1.0)))
+        );
+        // A relocation estimates a hit only on the worker that holds the match.
+        workers[first].increment_load();
+        assert_eq!(
+            select("help me").await,
+            (1 - first, "relocate", (ratio(3.0, 7.0), None))
+        );
+        workers[1 - first].increment_load();
+        workers[1 - first].increment_load();
+        assert_eq!(
+            select("hello, friend").await,
+            (first, "relocate", (ratio(5.0, 13.0), ratio(5.0, 13.0)))
+        );
         workers[first].set_healthy(false);
-        assert_eq!(select().await, (1 - first, "stale_tenant", None));
+        assert_eq!(
+            select("hello world").await,
+            (1 - first, "stale_tenant", (None, None))
+        );
         workers[first].set_healthy(true);
         for _ in 0..20 {
             workers[first].increment_load();
         }
-        assert_eq!(select().await, (1 - first, "imbalanced", None));
+        assert_eq!(
+            select("hello world").await,
+            (1 - first, "imbalanced", (None, None))
+        );
     }
 
     #[tokio::test]

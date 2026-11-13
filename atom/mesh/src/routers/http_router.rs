@@ -470,7 +470,7 @@ impl RouterTrait for Router {
             metadata.stream,
         );
         let endpoint = route_to_endpoint(metadata.route);
-        let response = RetryExecutor::execute_response_with_retry(
+        let attempts = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
             |_| async {
                 let response = self
@@ -494,9 +494,11 @@ impl RouterTrait for Router {
                     endpoint,
                 )
             },
-        )
-        .await;
-        observation.wrap_response(response)
+        );
+        let (response, estimate) = crate::observability::route_trace::estimated(attempts).await;
+        observation
+            .reconcile(metrics_labels::WORKER_REGULAR, estimate)
+            .wrap_response(response)
     }
 
     async fn health_generate(&self, req: Request<Body>) -> Response {
