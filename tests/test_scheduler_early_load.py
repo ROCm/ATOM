@@ -28,7 +28,7 @@ from atom.kv_transfer.offload.mp import scheduler as mp_scheduler
 from atom.model_engine.early_load import EarlyLoadState
 from atom.model_engine.prefill_delayer import PrefillDecision
 from atom.model_engine.scheduler import Scheduler
-from atom.model_engine.sequence import SequenceStatus
+from atom.model_engine.sequence import Replay, SequenceStatus
 
 META = object()
 
@@ -708,3 +708,42 @@ def test_a_routed_estimate_is_reported_once_with_the_reuse_found(
     unplaced = seq_factory(list(range(64)))
     sched._note_dp_reuse(unplaced)
     assert sched.dp_reuse_reports == [(seq.id, 16)]
+
+
+def test_a_routed_estimate_reports_the_hit_not_the_replay_start(
+    monkeypatch, seq_factory
+):
+    """A bounded replay rewinds `num_cached_tokens` below the hit; the report
+    carries the hit, or the router counts a real hit as stale."""
+    sched = _sched(monkeypatch)
+    seq = seq_factory(list(range(64)))
+    seq.dp_est_cached_tokens = 48
+    seq.num_cached_tokens = 32
+    seq.replay = Replay(48, False, (), 32)
+    sched._note_dp_reuse(seq)
+    assert sched.dp_reuse_reports == [(seq.id, 48)]
+
+
+def test_settled_early_owner_keeps_fifo_until_the_head_cannot_allocate(
+    monkeypatch, seq_factory
+):
+    sched, _, (head, owner) = _make(monkeypatch, seq_factory, n=2)
+    sched.kv_connector.not_ready_ids = {head.id}
+    sched.schedule()
+    assert owner.block_table and owner.id in sched._early_load.entries
+    sched.finished_recving_kv_req_ids.append(owner.id)
+    for _ in range(3):
+        sched.schedule()
+        assert owner.status == SequenceStatus.WAITING
+        assert owner.id in sched._early_load.entries
+        assert list(sched.waiting) == [head, owner]
+    assert owner.id not in sched.finished_recving_kv_req_ids
+    original = sched.block_manager.can_allocate_memoized
+    monkeypatch.setattr(
+        sched.block_manager,
+        "can_allocate_memoized",
+        lambda seq: -1 if seq is head else original(seq),
+    )
+    sched._prioritize_ready_remote_kv_requests()
+    assert list(sched.waiting) == [owner, head]
+    assert owner.block_table
