@@ -33,7 +33,7 @@ from torch.profiler import record_function
 
 from atom import structured_output
 from atom.config import Config, local_device_index, set_current_atom_config
-from atom.distributed.group_agreement import group_min
+from atom.distributed.group_agreement import agree_kv_budget, group_min
 from atom.distributed.pcp_utils import (
     PcpBalGroup,
     cut_pcp_prefill_ubatches,
@@ -1011,15 +1011,17 @@ class ModelRunner:
             logger.info("TBO enabled: model wrapped with UBatchWrapper")
         if sp_is_enabled():
             self.model = SPModelWrapper(self.model)
-        if getattr(self, "drafter", None) is not None:
-            self.drafter.arm_aux_capture(self.model)
+        drafter = getattr(self, "drafter", None)
+        if drafter is not None:
+            drafter.arm_aux_capture(self.model)
         self.pp_aux_relay = PPAuxRelay.build(self.config, self.model)
+        self._refuse_unrelayed_pp_taps(drafter)
         installer = mono_decode_installers.get(hf_config.architectures[0])
         if installer is not None:
             self.model = resolve_obj_by_qualname(installer)(
                 self.model,
                 config,
-                getattr(self, "drafter", None),
+                drafter,
                 metadata_builder=self.attn_metadata_builder,
             )
         # The installed model's own head output, where it has one: its
@@ -1452,9 +1454,10 @@ class ModelRunner:
         # torch.compile's mark_dynamic can't make a size-1 batch dim dynamic, so
         # a DSpark block drafter (rows == num_seqs) must first-compile at B >= 2
         # (EAGLE gets that free -- its first draft step is a many-row prefill).
-        # Other cases only need the usual >= 1 floor.
-        drafter = getattr(self, "drafter", None)
-        min_seqs = 2 if getattr(drafter, "is_block_drafter", False) else 1
+        # Other cases only need the usual >= 1 floor. From the config: under PP
+        # only the last stage has a drafter, and every stage runs the same rows.
+        spec_config = self.config.speculative_config
+        min_seqs = 2 if spec_config and spec_config.use_dspark() else 1
         num_seqs = max(num_seqs, min_seqs)
 
         # Split the token budget across the seqs so >1 sequences never exceed it
@@ -2054,20 +2057,16 @@ class ModelRunner:
                 "Reserving %.2fGB for KV connector buffers", connector_bytes / (1 << 30)
             )
             available_for_kv_budget -= connector_bytes
-        # This prevents OOM when other processes share the GPU. Free HBM must
-        # cover the connector buffers too.
-        free_for_kv = free - connector_bytes
-        if connector_bytes and free_for_kv <= 0:
-            # Otherwise the KV cache gets nothing and the connector allocates
-            # from memory that is not there.
-            raise RuntimeError(
-                f"Only {free / (1 << 30):.2f}GB is free on the GPU, less than "
-                f"the {connector_bytes / (1 << 30):.2f}GB the KV connector "
-                "buffers need after the KV cache is sized; free GPU memory or "
-                "turn those buffers off (ATOM_PD_MLA_STAGING=0 / "
-                "ATOM_PD_MLA_LANDING=0)."
-            )
-        available_for_kv = min(available_for_kv_budget, free_for_kv)
+        # Every worker builds its pool at rank 0's count, so take the group
+        # minimum before any rank raises alone and leaves the others waiting.
+        groups = (
+            (get_tp_group(), get_pcp_group())
+            if torch.distributed.is_initialized()
+            else ()
+        )
+        free, available_for_kv_budget, free_for_kv, available_for_kv = agree_kv_budget(
+            free, available_for_kv_budget, connector_bytes, groups
+        )
 
         torch.set_default_device(None)
 
@@ -3769,13 +3768,10 @@ class ModelRunner:
                     spec_counts, ready=self.forward_done_event
                 )
                 self.tokenID_processor.prev_token_ids = next_token_ids
-                draft_token_ids = self.propose_draft_token_ids(
-                    batch,
-                    self._draft_input_ids(batch, hidden_states),
-                    hidden_states,
-                    next_token_ids,
-                    num_reject_tokens,
-                    anchors,
+                # A producer that skips propose keeps the bookkeeping above:
+                # its next step reads `prev_token_ids` like any other's.
+                draft_token_ids = self._draft_or_commit(
+                    batch, hidden_states, next_token_ids, num_reject_tokens, anchors
                 )
 
             elif prev_batch is not None:
@@ -3796,17 +3792,9 @@ class ModelRunner:
             else:
                 prev_rejected_num = np.zeros(batch.total_seqs_num, dtype=np.int32)
                 prev_bonus_num = np.zeros(batch.total_seqs_num, dtype=np.int32)
-            # PP stages and P/D producers still run the drafter.
             if hasattr(self, "drafter"):
-                # Mid-prompt sequences get their anchor corrected inside
-                # propose_draft_token_ids, from `batch.next_token_ids`.
-                draft_token_ids = self.propose_draft_token_ids(
-                    batch,
-                    self._draft_input_ids(batch, hidden_states),
-                    hidden_states,
-                    next_token_ids,
-                    num_reject_tokens,
-                    anchors,
+                draft_token_ids = self._draft_or_commit(
+                    batch, hidden_states, next_token_ids, num_reject_tokens, anchors
                 )
 
         # DSpark Phase 2: carry this step's per-request ell back to the scheduler
@@ -3989,15 +3977,15 @@ class ModelRunner:
 
         Only under DP attention -- `_publish_draft_shape` returns early at
         `data_parallel_size <= 1`, where an output-less batch legitimately
-        drafts nothing. PP is excluded, and asked about directly:
-        `is_deferred_out` is also off on a P/D producer, a rank that keeps its
-        drafter loaded and still owes its peers the collectives propose()
-        carries.
+        drafts nothing. PP is excluded, and asked about directly. A producer
+        that keeps propose (EAGLE) still owes its peers its collectives; one
+        that skips it skips it on every rank.
         """
         return (
             hasattr(self, "drafter")
             and self.config.parallel_config.data_parallel_size > 1
             and not self.tokenID_processor.is_pipeline_parallel
+            and not self.drafter.context_kv_only
         )
 
     def _producer_graph_shapes(self):
@@ -4061,6 +4049,52 @@ class ModelRunner:
             rows = hidden_states.shape[0]
         return self.tokenID_processor.input_ids.gpu[1 : rows + 1]
 
+    def _refuse_unrelayed_pp_taps(self, drafter) -> None:
+        """Under PP, refuse a drafter whose taps no config spec declares: taps on
+        earlier stages never fire, so a producer would write wrong context K/V."""
+        if (
+            get_pp_group().world_size > 1
+            and drafter is not None
+            and drafter.captures_aux
+            and drafter.aux_capture_spec(self.config) is None
+        ):
+            raise NotImplementedError(
+                "pipeline parallel + a drafter tapping target layers without a "
+                "config-only aux_capture_spec (EAGLE3): PPAuxRelay cannot relay it"
+            )
+
+    def _draft_or_commit(
+        self, batch, hidden_states, next_token_ids, num_reject_tokens, anchors
+    ):
+        """This step's drafts; a context-only producer only commits the target
+        step and returns None."""
+        if self.drafter.context_kv_only:
+            self._commit_target_step(batch, anchors)
+            return None
+        # Mid-prompt sequences get their anchor corrected inside
+        # propose_draft_token_ids, from `batch.next_token_ids`.
+        return self.propose_draft_token_ids(
+            batch,
+            self._draft_input_ids(batch, hidden_states),
+            hidden_states,
+            next_token_ids,
+            num_reject_tokens,
+            anchors,
+        )
+
+    def _commit_target_step(self, batch: ScheduledBatch, anchors):
+        """Commit the target's tentative step at each request's anchor row and
+        return those rows; a producer that skips propose still owes this."""
+        last_token_indices = (
+            self.drafter.prepare_inputs(batch.total_seqs_num)
+            if anchors is None
+            else anchors
+        )
+        self.attn_metadata_builder.commit_speculative_state(
+            get_forward_context().attn_metadata, last_token_indices
+        )
+        return last_token_indices
+
     def propose_draft_token_ids(
         self,
         batch: ScheduledBatch,
@@ -4103,14 +4137,7 @@ class ModelRunner:
 
         assert isinstance(self.drafter, Drafter)
 
-        last_token_indices = (
-            self.drafter.prepare_inputs(batch.total_seqs_num)
-            if anchors is None
-            else anchors
-        )
-        self.attn_metadata_builder.commit_speculative_state(
-            forward_context.attn_metadata, last_token_indices
-        )
+        last_token_indices = self._commit_target_step(batch, anchors)
 
         draft_token = self.drafter.propose(
             target_token_ids=input_ids,
@@ -4591,7 +4618,7 @@ class ModelRunner:
             # drafter gets the capture builder already bound to this backend's
             # signature -- which of them takes a `max_q_len` is the runner's to
             # know, and it is the same probe the loop above ran.
-            if hasattr(self, "drafter"):
+            if hasattr(self, "drafter") and not self.drafter.context_kv_only:
 
                 def end_draft_trace(tag):
                     torch.cuda.synchronize()

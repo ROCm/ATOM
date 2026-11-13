@@ -2293,6 +2293,7 @@ def _non_mla_draft(monkeypatch, module, cls_name, *, dcp, max_model_len, block_s
         kv_cache_block_size=block_size,
         decode_context_parallel_size=dcp,
         kv_cache_dtype="bf16",
+        kv_transfer_config={},
         speculative_config=types.SimpleNamespace(num_speculative_tokens=7),
     )
     return getattr(mod, cls_name)(atom_config), hf
@@ -2775,8 +2776,37 @@ def test_minimax_m31_dspark_refuses_tp_below_its_kv_heads(monkeypatch, tp):
 
     monkeypatch.setattr(m3_dspark, "get_tensor_model_parallel_world_size", lambda: tp)
     config = types.SimpleNamespace(num_attention_heads=64, num_key_value_heads=4)
+    atom_config = types.SimpleNamespace(kv_transfer_config={})
     with pytest.raises(ValueError, match="needs TP >= 4"):
-        m3_dspark.M3DSparkAttention(None, config, None, layer_num=0)
+        m3_dspark.M3DSparkAttention(atom_config, config, None, layer_num=0)
+
+
+def test_minimax_m31_dspark_producer_holds_every_kv_head_and_never_drafts(
+    monkeypatch,
+):
+    """A TP1 P/D producer builds the draft with all 4 KV heads; its block pass,
+    which decodes one head per rank, refuses before writing anything."""
+    import atom.models.minimax_m3.dspark as m3_dspark
+
+    monkeypatch.setattr(m3_dspark, "get_tensor_model_parallel_world_size", lambda: 1)
+    for name in ("QKVParallelLinear", "RowParallelLinear", "GemmaRMSNorm", "get_rope"):
+        monkeypatch.setattr(m3_dspark, name, lambda *a, **k: torch.nn.Identity())
+    config = types.SimpleNamespace(
+        num_attention_heads=64,
+        num_key_value_heads=4,
+        head_dim=128,
+        hidden_size=6144,
+        rms_norm_eps=1e-6,
+        max_position_embeddings=4096,
+        rope_theta=5e6,
+    )
+    atom_config = types.SimpleNamespace(
+        kv_transfer_config={"kv_role": "kv_producer"}, kv_cache_dtype="fp8"
+    )
+    attn = m3_dspark.M3DSparkAttention(atom_config, config, None, layer_num=60)
+    assert attn.num_kv_heads == 4
+    with pytest.raises(RuntimeError, match="one KV head per rank"):
+        attn(torch.zeros(2, dtype=torch.long), torch.zeros(2, 6144))
 
 
 def test_standalone_draft_is_built_with_its_own_kv_dtype_target_untouched(monkeypatch):

@@ -22,6 +22,7 @@ import pytest
 import torch
 from torch import nn
 
+from atom.kv_transfer.disaggregation.sharded_transfer import consumer_head_slices
 from atom.model_ops.attentions.mha_kv_pool import MhaKvPool
 from atom.spec_decode.draft_kv import (
     DRAFT_KV_ROWS,
@@ -40,6 +41,7 @@ class _PagedAttention(nn.Module):
         self.base_attention = True
         self.use_mla = False
         self.impl = SimpleNamespace(kv_layout=None)
+        self.page_tokens = None
 
 
 class _Norm(nn.Module):
@@ -226,7 +228,7 @@ def test_draft_exports_zero_copy_mp_views_and_disables_tp_collapse():
     pool.allocate(2, "cpu")
     builder = DraftKvBuilder.__new__(DraftKvBuilder)
     builder._kv_pool = pool
-    layer = type("Layer", (), {"layer_num": 9})()
+    layer = type("Layer", (), {"layer_num": 9, "page_tokens": None})()
     builder._pool_rows = {DRAFT_KV_ROWS: {layer: 0}}
 
     transfer = builder.get_kv_transfer_tensors()
@@ -252,6 +254,97 @@ def test_draft_exports_zero_copy_mp_views_and_disables_tp_collapse():
             transfer.block_regions, transfer.block_tensor_views, strict=True
         )
     )
+
+
+def _paged(page):
+    """A binding's K, V and scale views of a pool row, in `page`-token pages."""
+
+    def views(pool, row):
+        (k, v), scales = pool.kv_views(row), pool.scale_views(row)
+        n, heads, x = k.shape[0] * pool.block_size // page, k.shape[1], k.shape[-1]
+        return (
+            k.view(n, heads, -1, page, x),
+            v.view(n, heads, page // x, -1, x),
+            *(s.view(n, heads, page) for s in scales),
+        )
+
+    return views
+
+
+def _cut_into_tp4(binding, views):
+    """Fill a TP1 draft per head through `views`, cut it for four TP4 ranks,
+    and return the values each rank reads back through `views`."""
+
+    def draft(heads):
+        pool = MhaKvPool(
+            layers=1,
+            block_size=128,
+            num_kv_heads=heads,
+            head_dim=128,
+            kv_dtype=torch.float8_e4m3fn,
+        )
+        pool.allocate(2, "cpu")
+        builder = DraftKvBuilder.__new__(DraftKvBuilder)
+        builder._kv_pool = pool
+        builder._pool_rows = {DRAFT_KV_ROWS: {binding: 0}}
+        return pool, builder.get_kv_transfer_tensors().pages
+
+    src, src_pages = draft(4)
+    for t in views(src, 0):
+        for head in range(4):
+            t[:, head] = torch.tensor(head + 1.0).to(t.dtype)
+    received = []
+    for rank in range(4):
+        dst, dst_pages = draft(1)
+        for s, d in zip(src_pages, dst_pages, strict=True):
+            cuts = consumer_head_slices(
+                s.region.unit_bytes,
+                d.region.unit_bytes,
+                s.head_major_runs,
+                d.head_major_runs,
+                rank,
+                4,
+                str(s.unit_spec),
+            )
+            for block in range(2):
+                for so, do, n in cuts.tolist():
+                    d.view[block].view(-1)[do : do + n] = s.view[block].view(-1)[
+                        so : so + n
+                    ]
+        received.append({v for t in views(dst, 0) for v in t.float().unique().tolist()})
+    return received
+
+
+@pytest.mark.parametrize("page", [128, 16])
+def test_each_tp4_rank_gets_its_head_in_the_pages_its_binding_views(page):
+    binding = type("Binding", (), {"layer_num": 60, "page_tokens": page})()
+    assert _cut_into_tp4(binding, _paged(page)) == [{1.0}, {2.0}, {3.0}, {4.0}]
+
+
+def test_the_m31_dspark_draft_is_cut_as_its_attention_views_it(monkeypatch):
+    dspark = pytest.importorskip("atom.models.minimax_m3.dspark", exc_type=ImportError)
+    from atom.model_ops.minimax_m3.sparse_attn import to_page16_shuffle
+
+    monkeypatch.setattr(dspark, "get_tensor_model_parallel_world_size", lambda: 4)
+    for name in ("QKVParallelLinear", "RowParallelLinear", "GemmaRMSNorm", "get_rope"):
+        monkeypatch.setattr(dspark, name, lambda *a, **k: nn.Identity())
+    config = SimpleNamespace(
+        num_attention_heads=64,
+        num_key_value_heads=4,
+        head_dim=128,
+        hidden_size=6144,
+        rms_norm_eps=1e-6,
+        max_position_embeddings=4096,
+        rope_theta=5e6,
+    )
+    atom_config = SimpleNamespace(kv_transfer_config={}, kv_cache_dtype="fp8")
+    attn = dspark.M3DSparkAttention(atom_config, config, None, layer_num=60)
+
+    def views(pool, row):
+        return to_page16_shuffle(*pool.kv_views(row), *pool.scale_views(row))
+
+    received = _cut_into_tp4(attn.kv, views)
+    assert received == [{1.0}, {2.0}, {3.0}, {4.0}]
 
 
 def test_rows_are_the_pool_layers_the_modules_index():
