@@ -116,7 +116,11 @@ sys.exit(0 if relevant else 1)
 PY
   )"; then
     echo "${filter_result}"
-    emit_decision "false" "ignored-paths-only"
+    local reason="ignored-paths-only"
+    if [ -n "${CI_GATE_PATHS_INCLUDE:-}" ] && [ -z "${CI_GATE_PATHS_IGNORE:-}" ]; then
+      reason="paths-not-included"
+    fi
+    emit_decision "false" "${reason}"
     exit 0
   fi
 
@@ -139,6 +143,7 @@ emit_decision() {
     smoke_requested="true"
   elif [ "${EVENT_NAME}" != "pull_request_review" ] \
     && [ "${reason}" != "ignored-paths-only" ] \
+    && [ "${reason}" != "paths-not-included" ] \
     && [ "${reason}" != "draft-pull-request" ] \
     && [ "${reason}" != "pull-request-closed" ]; then
     smoke_requested="true"
