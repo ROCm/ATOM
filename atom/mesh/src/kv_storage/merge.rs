@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use super::{ReaderInfo, SourceId, StorageHub, StorageLookup};
+use super::{GateReason, ReaderInfo, SourceId, StorageHub, StorageLookup};
 use crate::{
     core::Worker,
     kv_index::{CacheHit, HitSource, LoadPath, LowerHit, PrefixMatchProvider, PrefixRequest},
@@ -43,7 +43,8 @@ impl<P: PrefixMatchProvider> PrefixMatchProvider for WithStorage<P> {
 
 /// A reader's `tokens` become `[D, H, max(H, shared), max(K, disk, Shared)]`, the larger
 /// over the sources it reads. `lower` follows its load path, unknown unless that source
-/// answered.
+/// answered. A reader whose load path failed keeps a hit even without evidence, so the
+/// failure is not taken for a miss.
 pub fn merge(
     hit: Option<CacheHit>,
     reader: &ReaderInfo,
@@ -74,8 +75,17 @@ pub fn merge(
             stored |= disk > 0;
         }
     }
+    let mut failed = false;
     if let Some(LoadPath::Storage(id)) = &reader.load_path {
-        hit.lower = match lookup(id) {
+        let lookup = lookup(id);
+        failed = matches!(
+            lookup,
+            Some(
+                StorageLookup::Unavailable(_)
+                    | StorageLookup::Skipped(GateReason::BreakerOpen | GateReason::Overloaded)
+            )
+        );
+        hit.lower = match lookup {
             Some(StorageLookup::Hit { disk, .. }) => LowerHit::Hit {
                 tokens: disk,
                 from: LoadPath::Storage(id.clone()),
@@ -83,5 +93,5 @@ pub fn merge(
             _ => LowerHit::Unknown(id.clone()),
         };
     }
-    (evidence || stored).then_some(hit)
+    (evidence || stored || failed).then_some(hit)
 }

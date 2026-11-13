@@ -84,7 +84,8 @@ pub enum LowerHit {
 pub enum HitSource {
     Events,
     Predicted,
-    /// Only shared storage holds the prefix.
+    /// Only the shared-storage lookup speaks for the worker: it holds the prefix, or it
+    /// failed and `lower` is unknown.
     Storage,
 }
 

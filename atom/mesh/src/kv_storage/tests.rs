@@ -398,9 +398,21 @@ fn storage_hits_extend_reader_tiers_and_set_lower() {
     )];
     let merged = merge(Some(events([8; 4])), &reader, &failed).unwrap();
     assert_eq!(
-        (merged.tokens, merged.lower),
-        ([8; 4], LowerHit::Unknown(source))
+        (merged.tokens, &merged.lower),
+        ([8; 4], &LowerHit::Unknown(source.clone()))
     );
+    let unknown = merge(None, &reader, &failed).unwrap();
+    assert_eq!(
+        (unknown.tokens, unknown.lower),
+        ([0; 4], LowerHit::Unknown(source.clone()))
+    );
+    let open = [(
+        source.clone(),
+        StorageLookup::Skipped(GateReason::BreakerOpen),
+    )];
+    assert!(merge(None, &reader, &open).is_some());
+    let short = [(source, StorageLookup::Skipped(GateReason::TooShort))];
+    assert_eq!(merge(None, &reader, &short), None);
     let other = ReaderInfo::default();
     assert_eq!(
         merge(Some(events([8; 4])), &other, &stored),
