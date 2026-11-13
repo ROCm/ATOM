@@ -187,33 +187,30 @@ class MonoDecode:
         ctx = get_forward_context().context
         return ctx is not None and not ctx.is_prefill
 
-    def note_replay(self, n: int, batch=None) -> None:
-        """A decode step replayed an n-row graph: counted under the path its capture took."""
+    def note_replay(self, n: int, step_lens=None) -> None:
+        """A decode step replayed an n-row graph: counted under the path its capture took.
+        ``step_lens`` (statistics only): a callable giving the step's host context lengths and q_len.
+        """
         kind = self._graph_kind.get(n, PRODUCTION)
-        if batch is not None and kind == MONO and envs.ATOM_MONO_STATS_EVERY:
-            self._note_cp(n, batch)
+        if step_lens is not None and kind == MONO and envs.ATOM_MONO_STATS_EVERY:
+            self._note_cp(n, *step_lens())
         self._count(n, kind)
 
-    def _note_cp(self, n: int, batch) -> None:
+    def _note_cp(self, n: int, lens, q: int) -> None:
         """Statistics only, no sync: the CP gate of the kernels (``index_score.cp_gate``) from the host's
-        sequence lengths (one token behind the device's at most), counted per graph size.
-        """
+        context lengths (the engine's staging array), counted per graph size."""
         if not self.cp.enabled:
             return
-        seqs = list(batch.seqs.values())
-        if not seqs:
-            return
-        q = max(batch.num_scheduled_tokens)
-        blocks = [-(-(len(s) + q - 1) // SPARSE_BLOCK) for s in seqs]
-        long_blocks = [b for b in blocks if b > LONG_FROM_BLOCKS]
-        if not long_blocks:
+        blocks = -(-lens[lens > 0] // SPARSE_BLOCK)
+        long_blocks = blocks[blocks > LONG_FROM_BLOCKS]
+        if not long_blocks.size:
             return
         if n <= SMALL_MAX_ROWS:
             taken = True  # the narrow builds: every long request
         else:
             taken = (
                 bool(self.cp.options(n))
-                and sum(long_blocks) >= self.cp.min_blocks * q
+                and int(long_blocks.sum()) >= self.cp.min_blocks * q
                 and n // q >= self.cp.min_batch
                 and q <= CP_MAX_Q
             )
