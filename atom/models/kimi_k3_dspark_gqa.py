@@ -477,12 +477,12 @@ class KimiK3DSparkGQA(DSparkDraftModel):
 
         return AuxCaptureSpec(layer_ids, hidden_size, extract)
 
-    def write_context_kv(self, aux_concat, positions, slot_mapping=None) -> None:
+    def write_context_kv(self, taps, positions, slot_mapping=None) -> None:
         # Verify rows reach `mtp_k` past the request's last token, so past the
         # rope cache near `max_model_len` (`_check_rope_covers`). Out of place:
         # `positions` is the target's.
         super().write_context_kv(
-            aux_concat, positions.clamp(max=self._rope_max_row), slot_mapping
+            taps, positions.clamp(max=self._rope_max_row), slot_mapping
         )
 
     # -- DSparkDraftModel contract ----------------------------------------
