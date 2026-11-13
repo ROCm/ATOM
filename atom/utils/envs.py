@@ -128,9 +128,9 @@ def _finite_float_env(name: str, default: float, *, allow_zero: bool) -> float:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
-    # Opt in after validating AITER PR #7916 for the serving workload. Unsupported
-    # shapes, state forks and speculative decode retain ATOM's implementation.
-    "ATOM_USE_AITER_KDA_WRITEBACK": lambda: _flag_env("ATOM_USE_AITER_KDA_WRITEBACK"),
+    # Use AITER write-back when supported; set to 0 to force ATOM's implementation.
+    # Unsupported shapes, state forks and speculative decode retain ATOM's path.
+    "ATOM_USE_AITER_KDA_WRITEBACK": lambda: _flag_env("ATOM_USE_AITER_KDA_WRITEBACK", "1"),
     # Optional standalone OpenTelemetry tracing (read once per process).
     "ATOM_ENABLE_OTEL_TRACE": lambda: os.getenv("ATOM_ENABLE_OTEL_TRACE", "0").lower()
     in {"1", "true"},
