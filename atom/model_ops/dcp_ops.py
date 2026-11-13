@@ -1463,14 +1463,10 @@ def dcp_decode_candidate_exchange_fused(
     )
 
     # Half the payload of the (score, gid) exchange, on the custom all-gather:
-    # a pure copy, so the score bits arrive untouched.
-    n_cand = dcp_world_size * k_loc
-    gathered_sc = (
-        dcp_all_gather(get_dcp_group(), send, 0)
-        .view(dcp_world_size, num_decode_tokens, k_loc)
-        .permute(1, 0, 2)
-        .reshape(num_decode_tokens, n_cand)
-    )
+    # a pure copy, so the score bits arrive untouched. Gathered on the last dim,
+    # each row holds every rank's candidates in rank order: the merge's
+    # [rows, W * k_loc] input as it lands, with no transpose copy after it.
+    gathered_sc = dcp_all_gather(get_dcp_group(), send, -1)
 
     flydsl_dcp_topk_merge(
         gathered_sc,

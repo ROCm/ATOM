@@ -714,6 +714,66 @@ def test_fused_exchange_passes_the_kernels_one_row_per_query_token(monkeypatch):
         assert torch.equal(seen[name], token_bt), name
 
 
+def test_fused_exchange_hands_the_merge_the_gathered_scores_uncopied(monkeypatch):
+    """The merge reads candidate column c as rank c // k_loc's, row by row. A
+    last-dim gather lands in that layout, so the merge must get the gathered
+    buffer itself: an equal copy is the transpose the exchange no longer runs."""
+    import importlib
+    import sys
+
+    import aiter.ops.topk as topk_mod
+
+    importlib.import_module("aiter.ops.triton.pa_mqa_logits")
+    logits_mod = sys.modules["aiter.ops.triton.pa_mqa_logits"]
+
+    rows, world = 6, 4
+    send = torch.arange(rows * TOPK, dtype=torch.float32, device=DEV).view(rows, TOPK)
+    # Rank r sent this rank's scores plus r * numel: every (rank, row) differs.
+    sent = [send + r * send.numel() for r in range(world)]
+    seen = {}
+
+    def fake_topk(*args, values, **kwargs):
+        values.copy_(send)
+
+    def fake_all_gather(t, dim):
+        seen["gathered"] = torch.cat([t + r * t.numel() for r in range(world)], dim)
+        return seen["gathered"]
+
+    def fake_merge(scores, *args, **kwargs):
+        seen["scores"] = scores
+
+    monkeypatch.setattr(logits_mod, "deepgemm_fp8_paged_mqa_logits", lambda *a, **k: 0)
+    monkeypatch.setattr(topk_mod, "top_k_per_row_decode", fake_topk)
+    monkeypatch.setattr(topk_mod, "flydsl_dcp_topk_merge", fake_merge)
+    monkeypatch.setattr(dcp_ops, "get_dcp_world_size", lambda: world)
+    group = SimpleNamespace(all_gather=fake_all_gather)
+    monkeypatch.setattr(dcp_ops, "get_dcp_group", lambda: group)
+
+    dcp_decode_candidate_exchange_fused(
+        SimpleNamespace(
+            dcp_local_context_lens=torch.ones(rows, dtype=torch.int32, device=DEV),
+            token_block_tables=torch.zeros(rows, 1, dtype=torch.int32, device=DEV),
+        ),
+        torch.empty(rows, 1, 8, 16, device=DEV),
+        kv_cache=torch.empty(0, device=DEV),
+        weights=torch.empty(rows, 8, device=DEV),
+        dcp_rank=0,
+        num_decode_tokens=rows,
+        topk_tokens=TOPK,
+        max_model_len=MAX_MODEL_LEN,
+        runner_block_size=PAGE,
+        stable_topk=True,
+        cp_kv_cache_interleave_size=1,
+        out_kv_indices=torch.empty(rows * TOPK, dtype=torch.int32, device=DEV),
+        out_kv_indptr=torch.empty(rows + 1, dtype=torch.int32, device=DEV),
+        owned_counts=torch.empty(rows, dtype=torch.int32, device=DEV),
+    )
+
+    permuted = torch.stack(sent).permute(1, 0, 2).reshape(rows, world * TOPK)
+    assert torch.equal(seen["scores"], permuted)
+    assert seen["scores"].data_ptr() == seen["gathered"].data_ptr()
+
+
 @pytest.mark.parametrize("world", [2, 4, 8])
 @pytest.mark.parametrize("interleave", [1, 16, 128])
 def test_local_logits_width_covers_partial_interleave_groups(world, interleave):
