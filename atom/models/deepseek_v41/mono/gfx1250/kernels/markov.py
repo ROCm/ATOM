@@ -38,9 +38,9 @@ NREQ, TB, RK = D.MAX_REQ, D.DSPARK_W, 256          # requests, block positions, 
 VR = D.VR                        # vocab rows a rank
 NT = VR // 16
 ES = RK * 2 + 16                  # LDS row stride of the staged W1 rows (bytes)
-LX = 16 * ES                      # LDS: x_{k-1} ids [8] i32
-LB = LX + 64                      # LDS: per-request CTA best [8] i64
-LP = LB + 64                      # LDS: per-source maxima [4][8] i64
+LX = 16 * ES                      # LDS: x_{k-1} ids [NREQ] i32
+LB = LX + NREQ * 4                # LDS: per-request CTA best [NREQ] i64
+LP = LB + NREQ * 8                # LDS: per-source maxima [4][NREQ] i64
 LDS = LP + 4 * NREQ * 8
 F32, I32, BF16 = fx.Float32, fx.Int32, fx.BFloat16
 
@@ -59,7 +59,10 @@ def roff(k, src, req):
 
 
 @ASTRewriter.transform
-def markov_once(base, anchors, w1, w2s, ids_out, emb_out, best, cnt, recv, rank, tag0, t, b, sm, sp=None, qlog=None, qids=None):
+def markov_once(base, anchors, w1, w2s, ids_out, emb_out, best, cnt, recv, rank, tag0, t, b, sm, sp=None, qlog=None, qids=None,
+                nreq=8):
+    """nreq: the step's requests (<= NREQ = 16, the B operand's 16 rows: rows past nreq zero; the exchange's layout is
+    NREQ's)."""
     t = hx.opaque_v(t)
     b = hx.opaque_s(b)
     w = t // 32
@@ -67,31 +70,35 @@ def markov_once(base, anchors, w1, w2s, ids_out, emb_out, best, cnt, recv, rank,
     tile = fx.min(b * 8 + w, I32(NT - 1))
     act = b * 8 + w < NT
     wrow = w2s + (i64(tile * 16 + l % 16) * RK + i64((l // 16) * 16)) * 2
-    # zero LDS rows 8..15 of the B operand; x_{-1} = anchors
-    hx.lstore(sm + (8 + t // 32) * ES + (t % 32) * 16, fx.Vector.filled(4, 0, I32))
-    if t < NREQ:
+    # zero LDS rows nreq..15 of the B operand; x_{-1} = anchors
+    for zr in range_constexpr((16 - nreq + 7) // 8):
+        if nreq + t // 32 + 8 * zr < 16:
+            hx.lstore(sm + (nreq + t // 32 + 8 * zr) * ES + (t % 32) * 16, fx.Vector.filled(4, 0, I32))
+    if t < nreq:
         hx.lstore(sm + LX + t * 4, hx.gload(anchors + i64(t) * 4, I32))
     anyprob = I32(1) > I32(0)
     if fx.const_expr(sp is not None):   # (uniform) any request of the step drafting with T > 0
         np_ = I32(0)
-        for q in range_constexpr(NREQ):
+        for q in range_constexpr(nreq):
             np_ = np_ + (hx.gload(sp + i64(q * (TB + 1) * SPW * 4 + 12), I32) == I32(0)).select(I32(1), I32(0))
         anyprob = np_ > I32(0)
     gpu.barrier()
     for k in range(TB):
         # stage W1[x_{k-1}] rows; prefetch this wave's W2 tile meanwhile
         a = [hx.gload(wrow + i64(ks * 64), BF16, 16) for ks in range(RK // 32)]
-        req = t // 32
-        x = hx.lload(sm + LX + req * 4, I32)
-        hx.lstore(sm + req * ES + (t % 32) * 16, hx.gload(w1 + (i64(x) * RK + i64((t % 32) * 8)) * 2, BF16, 8))
-        if t < NREQ:
+        for sr in range_constexpr((nreq + 7) // 8):   # a wave a request's row
+            req = t // 32 + 8 * sr
+            if req < nreq:
+                x = hx.lload(sm + LX + req * 4, I32)
+                hx.lstore(sm + req * ES + (t % 32) * 16, hx.gload(w1 + (i64(x) * RK + i64((t % 32) * 8)) * 2, BF16, 8))
+        if t < nreq:
             hx.lstore(sm + LB + t * 8, I64MIN())
         gpu.barrier()
         acc = fx.Vector.filled(8, 0.0, F32)
         for ks in range_constexpr(RK // 32):
             bv = hx.lload(sm + (l % 16) * ES + (ks * 32 + (l // 16) * 16) * 2, BF16, 16)
             acc = hx.wmma_bf16(a[ks], bv, acc)
-        rq = fx.min(l % 16, I32(NREQ - 1))
+        rq = fx.min(l % 16, I32(nreq - 1))
         if fx.const_expr(sp is not None):   # this request's draft temperature / noise (row rq * 6 of the step's sp)
             spb = sp + i64(rq * (TB + 1)) * (SPW * 4)
             gq = hx.gload(spb + i64(12), I32) != I32(0)
@@ -115,18 +122,18 @@ def markov_once(base, anchors, w1, w2s, ids_out, emb_out, best, cnt, recv, rank,
                     bp = fx.max(bp, fx.Int64(skey(zs[i] * itd + g)) * fx.Int64(1 << 32) + (fx.Int64(c32(0xFFFFFFFF) - gj) & fx.Int64(0xFFFFFFFF)))
                 bl = gq.select(bl, bp)
         if fx.const_expr(qlog is not None):   # q's pre-temperature logits, 8 consecutive columns a lane
-            if act & (l % 16 < NREQ) & anyprob:
+            if act & (l % 16 < nreq) & anyprob:
                 qa = qlog + (i64(rq * TB + k) * VR + i64(tile * 16 + (l // 16) * 8)) * 4
                 hx.gstore(qa, fx.Vector.from_elements(zs[:4], F32))
                 hx.gstore(qa + i64(16), fx.Vector.from_elements(zs[4:], F32))
-        if act & (l % 16 < NREQ):
+        if act & (l % 16 < nreq):
             latomic_max64(sm + LB + rq * 8, bl)
         gpu.barrier()
-        if t < NREQ:
+        if t < nreq:
             gatomic_max64(best + i64(k * NREQ + t) * 8, hx.lload(sm + LB + t * 8, fx.Int64))
         handoff(cnt + i64(k) * 16, t, 256, site=1)
         tag = tag0 + k
-        if t < NREQ:
+        if t < nreq:
             mine = hx.gload(best + i64(k * NREQ + t) * 8, fx.Int64)
             hx.lstore(sm + LP + (rank * NREQ + t) * 8, mine)
             if b == 0:
@@ -135,12 +142,12 @@ def markov_once(base, anchors, w1, w2s, ids_out, emb_out, best, cnt, recv, rank,
                     if fx.const_expr(o != rank):
                         hx.gstore(recv[o] + roff(k, rank, t), v, nt=True)
         src = t // NREQ
-        if (t < 4 * NREQ) & (src != rank):
+        if (t < 4 * NREQ) & (src != rank) & (t % NREQ < nreq):
             got = poll_unit(recv[rank] + roff(k, src, t % NREQ), tag, site=9)
             hx.lstore(sm + LP + t * 8, got[0])
             hx.lstore(sm + LP + t * 8 + 4, got[1])
         gpu.barrier()
-        if t < NREQ:
+        if t < nreq:
             g = I64MIN()
             for o in range_constexpr(4):
                 g = fx.max(g, hx.lload(sm + LP + (o * NREQ + t) * 8, fx.Int64))
@@ -152,9 +159,12 @@ def markov_once(base, anchors, w1, w2s, ids_out, emb_out, best, cnt, recv, rank,
                     hx.gstore(qids + i64(t * TB + k) * 4, xi)
         gpu.barrier()
         if b == 0:   # W1[x_k] rows for the confidence head: [req][k][256] bf16
-            x2 = hx.lload(sm + LX + req * 4, I32)
-            hx.gstore(emb_out + (i64(req * TB + k) * RK + i64((t % 32) * 8)) * 2,
-                      hx.gload(w1 + (i64(x2) * RK + i64((t % 32) * 8)) * 2, BF16, 8))
+            for sr in range_constexpr((nreq + 7) // 8):
+                req = t // 32 + 8 * sr
+                if req < nreq:
+                    x2 = hx.lload(sm + LX + req * 4, I32)
+                    hx.gstore(emb_out + (i64(req * TB + k) * RK + i64((t % 32) * 8)) * 2,
+                              hx.gload(w1 + (i64(x2) * RK + i64((t % 32) * 8)) * 2, BF16, 8))
 
 
 def build(rank, rep=1):

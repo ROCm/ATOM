@@ -84,9 +84,9 @@ def block_excl_scan(v, lane, wave, buf):
 
 
 O_OUT = LDS_BYTES                        # lds_topk's staged outputs (k <= 2048: (bits, i) pairs)
-O_CNT = O_OUT + 2048 * 8                 # stage_select_any's per-row task counts [TR]
-O_RBD = O_CNT + 64 * 4                   # stage_select_any's per-row bound, batch slot and input count [TR] each
-LDS_BYTES2 = O_RBD + 3 * 64 * 4
+O_CNT = O_OUT + 2048 * 8                 # stage_select_any's per-row task counts [T]
+O_RBD = O_CNT + T * 4                    # stage_select_any's per-row bound, batch slot and input count [T] each
+LDS_BYTES2 = O_RBD + 3 * T * 4
 
 
 @ASTRewriter.transform
@@ -210,6 +210,20 @@ _cdiv, _lists, _lists_rt, _list_inputs_rt, _list_count_rt = IP.cdiv, IP.lists, I
 MODE_SEL, MODE_RX, MODE_BLK = 0, 1, 2
 
 
+@ASTRewriter.transform
+def selection_levels(c, isrx):
+    """Every wave reads the same row bounds, so every CTA executes the same handoffs."""
+    bound = I32(0)
+    for group in range_constexpr((c["TR"] + 31) // 32):
+        row = fx.min(c["l"] + group * 32, I32(c["TR"] - 1))
+        bound = fx.max(bound, hx.gload(c["ibound"] + i64(row) * 4, I32))
+    bound = wave_max(bound)
+    # REINDEX scores at most 2048 retained blocks x 8 rows.
+    sel = isrx.select(I32(2), IP.tree_levels(bound, KSEL))
+    blk = IP.tree_levels(_cdiv(bound, I32(8)), KBLK)
+    return sel, blk
+
+
 def rx_context(c, tok, bd):
     """A REINDEX token's compacted columns (index_plan.rx_context; its last kept block from icand)."""
     kept = IP.rx_kept(bd)
@@ -279,27 +293,18 @@ def stage_select_any(c, lev, nlev, mode):
     if t < TR:   # row t's count, bound, batch slot, inputs: the task loop reads them from LDS (no dependent global loads)
         hx.lstore(ocnt + t * 4, myc)
         hx.lstore(orb + t * 4, bdt)
-        hx.lstore(orb + (64 + t) * 4, qt)
-        hx.lstore(orb + (128 + t) * 4, nnt)
+        hx.lstore(orb + (T + t) * 4, qt)
+        hx.lstore(orb + (2 * T + t) * 4, nnt)
     gpu.barrier()
-    # the rows' inclusive task prefix (rows lane and lane + 32, TR <= 64) in every wave's lanes: no serial LDS walks
+    # the rows' inclusive task prefix in every wave's lanes (index_plan.task_prefix): no serial LDS walks
     ln = hx.fresh(t) % 32
-    c0 = hx.lload(ocnt + fx.min(ln, I32(TR - 1)) * 4, I32)
-    c1 = hx.lload(ocnt + fx.min(ln + 32, I32(TR - 1)) * 4, I32)
-    c0 = (ln < TR).select(c0, I32(0))
-    c1 = (ln + 32 < TR).select(c1, I32(0))
-    inc0 = wave_incl_scan(c0, ln)
-    tot0 = hx.lane_gather(inc0, I32(31))
-    inc1 = wave_incl_scan(c1, ln) + tot0
-    nt = hx.lane_gather(inc1, I32(31))
+    incs, nt = IP.task_prefix(lambda r_: hx.lload(ocnt + r_ * 4, I32), TR, ln, lambda v: wave_incl_scan(v, ln),
+                              lambda v: hx.lane_gather(v, I32(31)))
     for i in range(b, nt, 256):
         # the task's row: the rows whose inclusive prefix is <= i are before it; j = i - that prefix
-        p0 = inc0 <= i
-        p1 = inc1 <= i
-        tok = fx.min(_popc(_ballot(p0)) + _popc(_ballot(p1)), I32(TR - 1))
-        j = i - wave_max(fx.max(p0.select(inc0, I32(0)), p1.select(inc1, I32(0))))
-        q = fx.max(hx.lload(orb + (64 + tok) * 4, I32), I32(0))
-        nn = hx.lload(orb + (128 + tok) * 4, I32)
+        tok, j = IP.task_of(incs, i, TR, lambda p: _popc(_ballot(p)), wave_max)
+        q = fx.max(hx.lload(orb + (T + tok) * 4, I32), I32(0))
+        nn = hx.lload(orb + (2 * T + tok) * 4, I32)
         n = _list_inputs_rt(nn, lev, j, k, fan)
         final = (lev == nlev - 1) | (_lists_rt(nn, lev, fan) <= 1)
         lstride = _cdiv(vstride, I32(SEG)) * k

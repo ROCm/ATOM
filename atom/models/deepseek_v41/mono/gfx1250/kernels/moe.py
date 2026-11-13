@@ -47,28 +47,36 @@ IP = D.MOE_IPAD                             # I = 576 padded, as the production 
 W13_TS, W13_KC, W13_E, S13_E = 16 * H // 2, H // 128 * 128, 2 * IP * H // 2, 2 * IP * H // 32
 W2_TS, W2_KC, W2_E, S2_E = 16 * IP // 2, IP // 128 * 128, H * IP // 2, H * IP // 32
 MAXTOK, MROW, CROW, KMID = 16, 640, 32, 640
+NPMAX = D.T_MAX * TOPK                     # picks at the widest step (576)
+MAXCH = -(-D.T_MAX // MAXTOK)              # token chunks at the widest step (6): the shared pseudo-experts, and a hot
+                                           # routed expert's lists (its first + MAXCH - 1 overflow chunks)
+NRMAX = -(-NPMAX // 256)                   # pick rounds of 256 threads
 DUG = 16                                   # A units in flight (UG)
 MSLOT = 3                                  # experts a CTA stages for the down
 DN_PD = 2                                  # down tiles (x 5 A units) in flight ahead
 F32, I32, I64 = fx.Float32, fx.Int32, fx.Int64
 # LDS layout (bytes)
-NOV = 16                                   # overflow chunks (virtual experts V_OV0..): <= 2 a routed expert (<= 48 picks)
-V_OV0 = NE + 4
-NEX = NE + 4 + NOV                         # + the shared expert as <= 3 pseudo-experts of <= 16 tokens (ids NE..), + overflow chunks
+NOV = 36                                   # overflow chunks (virtual experts V_OV0..): <= MAXCH - 1 a routed expert (<= 96
+                                           # picks), <= NPMAX / 17 in all (each takes > 16 picks of its expert)
+MAXOV = MAXCH - 1
+OVL = 48                                   # overflowing experts listed (<= NPMAX / 17 = 33; two waves place them)
+V_OV0 = NE + MAXCH
+NEX = NE + MAXCH + NOV                     # + the shared expert as <= MAXCH pseudo-experts of <= 16 tokens (ids NE..), + overflow chunks
 O_CNT = 0                                  # int[NEX]
-O_PID = O_CNT + NEX * 4                    # int[288]
-O_LST = O_PID + 288 * 4                    # int[NEX][16]
+O_PID = O_CNT + NEX * 4                    # int[NPMAX]
+O_LST = O_PID + NPMAX * 4                  # int[NEX][16]
 O_UNI = O_LST + NEX * MAXTOK * 4           # int[NEX]
 O_NUNI = O_UNI + NEX * 4                   # int
 O_MQ = O_NUNI + 16                         # fp8 [MSLOT][16][KMID]
 O_MQS = O_MQ + MSLOT * MAXTOK * KMID       # int [MSLOT][16][5] (4 codes a K step)
-O_WTS = O_MQS + MSLOT * MAXTOK * 5 * 4     # f32 [288 + 48] route weights (then 1.0 for the shared pseudo-picks) (LDS: a global load in the down loop would
+O_WTS = O_MQS + MSLOT * MAXTOK * 5 * 4     # f32 [NPMAX + T_MAX] route weights (then 1.0 for the shared pseudo-picks) (LDS: a global load in the down loop would
                                            # wait, by the in-order loadcnt, for the prefetched weights)
-O_VEXP = O_WTS + (288 + 48) * 4           # int[NOV]: an overflow chunk's routed expert
-O_VBASE = O_VEXP + 16 * 4                  # int[NE]: the expert's first overflow chunk
+O_VEXP = O_WTS + (NPMAX + D.T_MAX) * 4     # int[NOV]: an overflow chunk's routed expert
+O_VBASE = O_VEXP + NOV * 4                 # int[NE]: the expert's first overflow chunk
 O_CNT2 = O_VBASE + NE * 4                  # int[NE]: overflow pick counters
-O_OVP = O_CNT2 + NE * 4                    # int[288]: the picks past 16
-O_OVN = O_OVP + 288 * 4                    # int: their count
+O_OVP = O_CNT2 + NE * 4                    # int[OVL]: the overflowing experts (their 17th arrival)
+O_OVB = O_OVP + OVL * 4                    # int[NRMAX * 8][OVL]: per (round, wave) ballot counts of each one's picks
+O_OVN = O_OVB + NRMAX * 8 * OVL * 4        # int: their count
 O_RED8 = O_OVN + 16                       # f32 [8 waves][4 tiles][8][32 lanes]: the FP8 shared UG unit's K-split partials
 MOE_LDS = O_RED8 + 8 * 4 * 8 * 32 * 4
 
@@ -272,11 +280,12 @@ def moe_union(c):
     # expert's list, else chunk rank // 16 - 1; the ranks from per-(round, wave, expert) ballot counts (O_OVP + 64).
     novf = hx.lload(sm + O_OVN, I32)
     if novf > 0:
-        if w == 0:
-            ok = l < novf
-            e = ok.select(hx.lload(sm + O_OVP + fx.min(l, I32(15)) * 4, I32), I32(NE))
+        if w < (OVL + 31) // 32:   # (a lane an overflowing expert: <= 33 of them at 576 picks)
+            li = w * 32 + l
+            ok = li < novf
+            e = ok.select(hx.lload(sm + O_OVP + fx.min(li, I32(OVL - 1)) * 4, I32), I32(NE))
             cn = hx.lload(sm + O_CNT + fx.min(e, I32(NE - 1)) * 4, I32)
-            nch = fx.min(fx.max(cn - 1, I32(0)) // MAXTOK, I32(2))
+            nch = fx.min(fx.max(cn - 1, I32(0)) // MAXTOK, I32(MAXOV))
             r = I32(0)
             vb = I32(0)
             for q in range(novf):
@@ -284,16 +293,16 @@ def moe_union(c):
                 before = eq < e
                 cq = hx.lload(sm + O_CNT + fx.min(eq, I32(NE - 1)) * 4, I32)
                 r = r + before.select(I32(1), I32(0))
-                vb = vb + before.select(fx.min(fx.max(cq - 1, I32(0)) // MAXTOK, I32(2)), I32(0))
+                vb = vb + before.select(fx.min(fx.max(cq - 1, I32(0)) // MAXTOK, I32(MAXOV)), I32(0))
             if ok:
                 hx.lstore(sm + O_VBASE + e * 4, vb)
                 hx.lstore(sm + O_CNT2 + e * 4, r)
-                for j in range_constexpr(2):
+                for j in range_constexpr(MAXOV):
                     if (j < nch) & (vb + j < NOV):
                         hx.lstore(sm + O_VEXP + (vb + j) * 4, e)
                         hx.lstore(sm + O_CNT + (V_OV0 + vb + j) * 4, fx.min(cn - MAXTOK * (j + 1), I32(MAXTOK)))
         gpu.barrier()
-        NR = (NP + 255) // 256
+        NR = (NP + 255) // 256   # (<= NRMAX)
         mine = []
         for k in range_constexpr(NR):
             p = t + 256 * k
@@ -304,7 +313,7 @@ def moe_union(c):
             for j in range(novf):
                 m = ballot(jj == j)
                 if l == 0:
-                    hx.lstore(sm + O_OVP + 64 + ((k * 8 + w) * 16 + j) * 4, popc(m))
+                    hx.lstore(sm + O_OVB + ((k * 8 + w) * OVL + j) * 4, popc(m))
                 rk = (jj == j).select(mbcnt(m), rk)
             mine.append((p, e, jj, rk))
         gpu.barrier()
@@ -313,7 +322,7 @@ def moe_union(c):
             if jj >= 0:
                 rank = rk
                 for sl in range(k * 8 + w):   # the earlier (round, wave) slots
-                    rank = rank + hx.lload(sm + O_OVP + 64 + (sl * 16 + jj) * 4, I32)
+                    rank = rank + hx.lload(sm + O_OVB + (sl * OVL + jj) * 4, I32)
                 inl = rank < MAXTOK
                 vi = hx.lload(sm + O_VBASE + e * 4, I32) + rank // MAXTOK - 1
                 dst = inl.select(e * MAXTOK + rank, (V_OV0 + vi) * MAXTOK + rank % MAXTOK)
@@ -362,12 +371,13 @@ def moe_union(c):
                 hx.lstore(sm + O_UNI + (base + mbcnt(m)) * 4, e)
             base = base + popc(m)
         # overflow chunks (before the shared pseudo-experts: those stay last)
-        ve = V_OV0 + (l % NOV)
-        has = (l < NOV) & (hx.lload(sm + O_CNT + ve * 4, I32) > 0)
-        m = ballot(has)
-        if has:
-            hx.lstore(sm + O_UNI + (base + mbcnt(m)) * 4, ve)
-        base = base + popc(m)
+        for rv in range_constexpr((NOV + 31) // 32):
+            ve = V_OV0 + fx.min(l + 32 * rv, I32(NOV - 1))
+            has = (l + 32 * rv < NOV) & (hx.lload(sm + O_CNT + ve * 4, I32) > 0)
+            m = ballot(has)
+            if has:
+                hx.lstore(sm + O_UNI + (base + mbcnt(m)) * 4, ve)
+            base = base + popc(m)
         for k in range_constexpr((NP // c["topk"] + MAXTOK - 1) // MAXTOK):
             nk = min(MAXTOK, NP // c["topk"] - MAXTOK * k)
             if l == 0:
@@ -389,17 +399,19 @@ def moe_combine(c, TR, sm_out):
     at sm_out (the layout tp_allreduce reads). One thread = 4 cols of a row (16-byte loads, all issued before the adds)."""
     t, b = c["t"], c["b"]
     NP = TR * c["topk"]
-    if t < TR * 5:
-        row = t // 5
-        c4 = (t % 5) * 4
-        col = (b // 4) * 80 + (b % 4) * 20 + c4
-        vb = [hx.gload(c["out"] + (i64(row * c["topk"] + k) * H + i64(col)) * 2, fx.BFloat16, 4) for k in range(c["topk"])]
-        vsh = hx.gload(c["out"] + (i64(NP + row) * H + i64(col)) * 4, F32, 4)   # the shared expert's row stays f32
-        acc = [vb[0][j].to(F32) for j in range(4)]
-        for k in range_constexpr(1, c["topk"]):
-            acc = [acc[j] + vb[k][j].to(F32) for j in range(4)]
-        acc = [acc[j] + vsh[j] for j in range(4)]
-        hx.lstore(sm_out + (row * 20 + c4) * 4, fx.Vector.from_elements(acc, F32), align=16)
+    for rh in range_constexpr((TR * 5 + 255) // 256):
+        tr = t + rh * 256
+        if tr < TR * 5:
+            row = tr // 5
+            c4 = (tr % 5) * 4
+            col = (b // 4) * 80 + (b % 4) * 20 + c4
+            vb = [hx.gload(c["out"] + (i64(row * c["topk"] + k) * H + i64(col)) * 2, fx.BFloat16, 4) for k in range(c["topk"])]
+            vsh = hx.gload(c["out"] + (i64(NP + row) * H + i64(col)) * 4, F32, 4)   # the shared expert's row stays f32
+            acc = [vb[0][j].to(F32) for j in range(4)]
+            for k in range_constexpr(1, c["topk"]):
+                acc = [acc[j] + vb[k][j].to(F32) for j in range(4)]
+            acc = [acc[j] + vsh[j] for j in range(4)]
+            hx.lstore(sm_out + (row * 20 + c4) * 4, fx.Vector.from_elements(acc, F32), align=16)
     gpu.barrier()
 
 
@@ -419,8 +431,8 @@ def ug_ring_init(wb, sb, lo, xrow, srow, l, KB):
 
 @ASTRewriter.transform
 def moe_ug(c):
-    """UG: routed units (wave w: u0 + w, + 8, ...) on the first CR CTAs; the FP8 shared expert's NCH * 18 units on the
-    last NDC (dedicated) CTAs, sh8_upc(NCH) a CTA; one epilogue copy."""
+    """UG: routed units by moe_plan's blocks / stripes on the first CR CTAs; the FP8 shared expert's NCH * 18 units
+    on the last NDC (dedicated) CTAs, sh8_upc(NCH) a CTA."""
     t, b, w, l, sm = c["t"], c["b"], c["w"], c["l"], c["sm"]
     tl = l % 16
     nuni = ufl(hx.lload(sm + O_NUNI, I32))
@@ -439,6 +451,26 @@ def moe_ug(c):
     if fx.const_expr(sh_early(NCH)):
         if b < NSHU:
             ug_shared_fin(c, b)
+    _ug_static(c, nuni, NCH, SH8_UPC, NSHU, CR, U, u1, wu, ded)
+    if fx.const_expr(SH8_DNOV):
+        # the dedicated CTAs: once all NSHU shared units' MID is out (a counter among them), the shared down
+        if ded:
+            hx.wait_storecnt0()
+            gpu.barrier()
+            if t == 0:
+                hx.atomic_add(c["shcnt"], 1)
+                hx.wait_count(c["shcnt"], NDC, 7)
+            gpu.barrier()
+            cd = {k: c[k] for k in c if k != "shcnt"}   # a plain dict (LazyC entries evaluated here)
+            cd.update(dn8_bi=b - CR, dn8_nct=NDC)
+            moe_dn_shared(cd)
+
+
+@ASTRewriter.transform
+def _ug_static(c, nuni, NCH, SH8_UPC, NSHU, CR, U, u1, wu, ded):
+    """The UG split at every width: routed units by moe_plan's blocks / stripes, the dedicated CTAs' shared units."""
+    b, w, l, sm = c["b"], c["w"], c["l"], c["sm"]
+    tl = l % 16
     STRIPE = MP.striped(NCH)
     nit = MP.unit_iters(STRIPE, U, CR, b, w, u1, wu)
     for it in range(ded.select(I32(SH8_UPC), fx.max(nit, I32(0)))):
@@ -463,18 +495,6 @@ def moe_ug(c):
             ex = i64(pslot(e, sm))
             acc = ug_body(c, pk, c["w13"] + ex * W13_E + i64(g) * (4 * W13_TS), c["s13"] + ex * S13_E + i64(g) * (2 * W13_KC))
         ug_epilogue(c, ui, g, n, acc)
-    if fx.const_expr(SH8_DNOV):
-        # the dedicated CTAs: once all NSHU shared units' MID is out (a counter among them), the shared down
-        if ded:
-            hx.wait_storecnt0()
-            gpu.barrier()
-            if t == 0:
-                hx.atomic_add(c["shcnt"], 1)
-                hx.wait_count(c["shcnt"], NDC, 7)
-            gpu.barrier()
-            cd = {k: c[k] for k in c if k != "shcnt"}   # a plain dict (LazyC entries evaluated here)
-            cd.update(dn8_bi=b - CR, dn8_nct=NDC)
-            moe_dn_shared(cd)
 
 
 @ASTRewriter.transform

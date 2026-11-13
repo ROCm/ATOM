@@ -43,7 +43,7 @@ TARGET_FRONT = 448  # target entry: attention front done
 
 # --- fixed LDS regions --------------------------------------------------------------------------------------------
 TP_PAYLOAD = 0  # [TR][20] f32 TP reduction payload, kept across the FFN front
-FRONT_LDS = 4096  # the fronts' / MoE's LDS (after the TP payload)
+FRONT_LDS = 8192  # the fronts' / MoE's LDS (after the TP payload: 96 rows x 80 B)
 RKEEP = 294912  # the residual streams kept between the fronts
 
 # --- layer-table rows -------------------------------------------------------------------------------------------------

@@ -76,9 +76,9 @@ class StepTables:
         # STATE (buffers.STATE): the prob drafter's q of the last kernel step, read by the next step's verification
         self.state = {
             "qlog": torch.zeros(
-                8 * 5 * K["markov"].VR, dtype=torch.float32, device=dev
+                buffers.TD_MAX * K["markov"].VR, dtype=torch.float32, device=dev
             ),
-            "qids": z32(8 * 5, -1),
+            "qids": z32(buffers.TD_MAX, -1),
         }
         self.pool = self.dummy  # cache.pool, bound by bind_pool
         # the indexer (IDX: the FULL / REINDEX layers' scorer and top-512 selection; their selections are the later
@@ -106,7 +106,10 @@ class StepTables:
         }
         if self.idx:
             self.step.update(
-                ibat=z32(T, -1), ibound1=z32(T), ibound2=z32(T), btab=z32(8 * BCOLS)
+                ibat=z32(T, -1),
+                ibound1=z32(T),
+                ibound2=z32(T),
+                btab=z32(buffers.MAX_REQ * BCOLS),
             )
             # the selecting layers: FULL (their own top-512) and REINDEX (24..36: they score layer 20's top-2048
             # candidate blocks, icand)
@@ -146,7 +149,7 @@ class StepTables:
                     cplan2=z32(T * 4, -1),
                     wplan1=z32(T * 4, -1),
                     wplan2=z32(T * 4, -1),
-                    slots=z32(8),
+                    slots=z32(buffers.MAX_REQ),
                 )
                 self.comp_w = {}
                 for i in self.selecting:
@@ -431,8 +434,21 @@ class StepTables:
                     raise MonoUnsupported(
                         "single-launch step: a packed pool (byte-addressed rows)"
                     )
+                units = cache.index_units[spec.kv_owner]
+                if g.index_fp4 and (
+                    units.scales is None or g.index_layout != "natural"
+                ):
+                    raise MonoUnsupported(
+                        f"single-launch step: FP4 index layout {g.index_layout} (the kernel reads natural)"
+                    )
                 vals = {
-                    "iplane": cache.index_units[spec.kv_owner].values.data_ptr(),
+                    "iplane": units.values.data_ptr(),
+                    # the FP4 plane's E8M0 scales (FP8: inside the values' blocks)
+                    "iscl": (
+                        units.scales.data_ptr()
+                        if g.index_fp4
+                        else self.dummy.data_ptr()
+                    ),
                     "irpp": g.rows_per_page(spec.ratio),
                     "imain": g.main_offset(spec.kv_owner),
                     "cprow": g.page_bytes // g.row_bytes,

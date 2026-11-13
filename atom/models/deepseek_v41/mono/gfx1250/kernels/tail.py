@@ -30,7 +30,8 @@ from atom.models.deepseek_v41.mono.gfx1250.kernels import sample_common as SF
 from atom.models.deepseek_v41.mono.gfx1250.kernels import sample as SPF
 from atom.models.deepseek_v41.mono.gfx1250.kernels import markov as MPF
 from atom.models.deepseek_v41.mono.gfx1250.kernels import draft_ctx as CX
-from atom.models.deepseek_v41.mono.gfx1250.kernels.attention import handoff
+from atom.models.deepseek_v41.mono.gfx1250.kernels import dims as D
+from atom.models.deepseek_v41.mono.gfx1250.kernels.attention import TP_TG, handoff
 
 TPTRS = ['xh', 'hw', 'logits', 's0', 's1', 's2', 's3', 'sids', 'dids', 'outtok', 'verdict', 'anc', 'dh', 'dlog', 'mw1',
          'mw2', 'mids', 'memb', 'mbest', 'sparam', 'qlog', 'prow', 'qids']
@@ -39,9 +40,22 @@ TPTRS = ['xh', 'hw', 'logits', 's0', 's1', 's2', 's3', 'sids', 'dids', 'outtok',
 # PROB_DRAFT + BLOCK_VERIFY), greedy rows the argmax match. qlog [8][5][32320] f32: this rank's draft logits of the step
 # (read by the next step's verification), qids [8][5] i32 the drafts it was kept for (both persistent across steps);
 # prow [48][8] f32 scratch.
-SOFF = 16 * 40960 * 16
-SOFF2 = SOFF + 4 * 4 * 48 * SF.UNITS * 16
-HEAD_LDS = 2 * HF.geom(2, 4)[3]      # LDS the head needs (launch smem >= this)
+SOFF = 16 * TP_TG * 16                         # after the TP regions (attention.tp_allreduce)
+SOFF2 = SOFF + 4 * 4 * SF.ROWS * SF.UNITS * 16   # after the sampling exchange (sample_common.roff)
+TAIL_BYTES = -(-(SOFF2 - SOFF + 4 * D.DSPARK_W * MPF.NREQ * 16) // (2 << 20)) * (2 << 20)   # + Markov's (markov.roff)
+HEAD_LDS = max(HF.head_lds(D.NARROW_T), HF.head_lds(D.T_MAX))   # LDS the head needs (launch smem >= this)
+
+
+def sample_shape(TR):
+    """(rows, CTAs a row) of the target sampling for TR rows: 48 rows x 5 CTAs up to 48, else 96 x 2."""
+    return (D.NARROW_T, SF.CPR) if TR <= D.NARROW_T else (D.T_MAX, 2)
+
+
+def ctx_lds(TR):
+    """The draft context KV's LDS offset inside the sampling: past the sampling's own (its z / q chunks)."""
+    rows, cpr = sample_shape(TR)
+    pt = ((HF.VR + cpr - 1) // cpr + 255) // 256
+    return max(65536, SPF.ZOFF + 2 * pt * 1024)
 
 
 def i64(x):
@@ -64,33 +78,39 @@ def _stamp(st, b, t, k, on):
             hx.gstore(st + i64(b) * (32 * 8) + i64(k * 8), hx.clock())
 
 
-def _ctxp(ctx, t, b, T):   # (plain python) the draft context KV's 4 stages, run inside the sampling's exchanges
-    return None if ctx is None else CX.ctx_parts(ctx, t, b, T, 65536)
+def _ctxp(ctx, t, b, T, kv8):   # (plain python) the draft context KV's 4 stages, run inside the sampling's exchanges
+    return None if ctx is None else CX.ctx_parts(ctx, t, b, T, ctx_lds(T), kv8)
 
 
 @ASTRewriter.transform
-def target(tp, t, b, sm, st, tc, recv, rank, stamps=True, head_d=4, ctx=None, T=None):
+def target(tp, t, b, sm, st, tc, recv, rank, stamps=True, head_d=4, ctx=None, T=None, kv8=False):
+    """T: the build's target rows (TR); kv8: an FP8 pool (the draft context rows' format)."""
     P = {k: tptr(tp, k) for k in ('xh', 'hw', 'logits', 's0', 's1', 's2', 's3', 'sids', 'dids', 'outtok', 'verdict', 'anc')}
     handoff(tc, t, False)   # LY.HEAD (offset 0)
-    HF.head_once_r(P['xh'], P['hw'], P['logits'], t, t % 32, t // 32, sm, b, head_d, 2, 4)
+    hrows, hd, htw, hnph = HF.head_shape(T)
+    HF.head_once_r(P['xh'], P['hw'], P['logits'], t, t % 32, t // 32, sm, b, hd, htw, hnph, hrows)
     handoff(tc + i64(LY.HEAD_DONE), t, False)
     _stamp(st, b, t, 19, stamps)
     # sampling + verification in one (outtok / verdict / anc written by CTA 0 after its last handoff)
     SPF.sample_once_p(P['logits'], P['s0'], P['s1'], P['s2'], P['s3'], P['sids'], tc + i64(LY.SAMPLE), t, b, sm, HF.VR,
                       [r + i64(SOFF) for r in recv], rank, 1, tptr(tp, 'sparam'), tptr(tp, 'qlog'), P['dids'],
                       tptr(tp, 'prow'), P['outtok'], P['verdict'], P['anc'], tptr(tp, 'qids'),
-                      ctxp=_ctxp(ctx, t, b, T))
+                      ctxp=_ctxp(ctx, t, b, T, kv8), rows=sample_shape(T)[0], cpr=sample_shape(T)[1],
+                      nreq=max(8, T // (D.DSPARK_W + 1)))
     _stamp(st, b, t, 20, stamps)
     handoff(tc + i64(LY.VERIFY_DONE), t, False)
     _stamp(st, b, t, 21, stamps)
 
 
 @ASTRewriter.transform
-def draft(tp, t, b, sm, st, tc, recv, rank, stamps=True, head_d=4):
+def draft(tp, t, b, sm, st, tc, recv, rank, stamps=True, head_d=4, TD=40):
+    """TD: the build's draft rows (5 a request)."""
     P = {k: tptr(tp, k) for k in ('hw', 'anc', 'dh', 'dlog', 'mw1', 'mw2', 'mids', 'memb', 'mbest')}
-    HF.head_once_r(P['dh'], P['hw'], P['dlog'], t, t % 32, t // 32, sm, b, head_d, 2, 4)
+    hrows, hd, htw, hnph = HF.head_shape(TD)
+    HF.head_once_r(P['dh'], P['hw'], P['dlog'], t, t % 32, t // 32, sm, b, hd, htw, hnph, hrows)
     handoff(tc + i64(LY.DRAFT_HEAD_DONE), t, False)
     _stamp(st, b, t, 22, stamps)
     MPF.markov_once(P['dlog'], P['anc'], P['mw1'], P['mw2'], P['mids'], P['memb'], P['mbest'], tc + i64(LY.MARKOV),
-                    [r + i64(SOFF2) for r in recv], rank, 101, t, b, sm, tptr(tp, 'sparam'), tptr(tp, 'qlog'), tptr(tp, 'qids'))
+                    [r + i64(SOFF2) for r in recv], rank, 101, t, b, sm, tptr(tp, 'sparam'), tptr(tp, 'qlog'), tptr(tp, 'qids'),
+                    nreq=max(8, TD // D.DSPARK_W))
     _stamp(st, b, t, 24, stamps)

@@ -89,16 +89,22 @@ class SingleStepModel(CheckModel, StepOverrideModel, nn.Module):
         """``ModelRunner.run_model``, each decode step: run it as the single launch and return the runner (its
         ``verify_outputs`` / ``output_stream`` for postprocess), or None for the production path.
         """
-        # the launch reads input_ids as 6 rows a request: any other step (a padded one, a ragged verify) takes the
-        # production path
+        # Mono consumes the scheduled verify rows. The production graph's
+        # running_bs may be a larger request bucket; it does not describe this
+        # input tensor. Require a complete six-row block for every live request.
         n = input_ids.numel()
+        fc = get_forward_context()
+        requests = fc.context.scheduled_bs
         runner = (
             self.single_step_runner(batch, n)
-            if n == running_bs * ROWS_PER_REQ
+            if batch is not None
+            and 0 < requests <= running_bs
+            and batch.total_seqs_num == requests
+            and n == requests * ROWS_PER_REQ
             else None
         )
         if runner is not None:
-            runner.run_step(input_ids, running_bs, get_forward_context(), batch)
+            runner.run_step(input_ids, requests, fc, batch)
         self._served, self._decode_batch = runner, batch
         return runner
 

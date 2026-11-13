@@ -32,18 +32,24 @@ from flydsl.expr import gpu, range_constexpr
 
 from atom.models.deepseek_v41.mono.gfx1250.kernels import device as hx
 from atom.models.deepseek_v41.mono.gfx1250.kernels import dims as D
-from atom.models.deepseek_v41.mono.gfx1250.kernels.attention import HID, T, e8m0_of, expf, inv_pow2, rsq
+from atom.models.deepseek_v41.mono.gfx1250.kernels import mxfp4 as MX4
+from atom.models.deepseek_v41.mono.gfx1250.kernels.attention import HID, KV8_ROWB, T, e8m0_of, expf, inv_pow2, m_tiles, rsq
 
 F32, I32, I64, BF16 = fx.Float32, fx.Int32, fx.Int64, fx.BFloat16
 LAT = D.KV_DIM                  # the compressed latent (head dim)
 KEYS = 128                 # the index key
 RING = 7                   # compress_ring_slots
-CROW0 = 192    # first CTA of stage_crow (8 rows a CTA)
+CROW0 = 192    # first CTA of stage_crow up to 48 rows (a CTA a row; crow0)
 CRING0 = 200   # first CTA of stage_cring
 
 
 def i64(x):
     return fx.Int64(x)
+
+
+def crow0(TR):
+    """First CTA of stage_crow: a CTA a compress-plan row, CTAS - T_MAX past 48 rows (the plan has <= TR rows)."""
+    return CROW0 if TR <= D.NARROW_T else D.CTAS - D.T_MAX
 
 
 @ASTRewriter.transform
@@ -56,17 +62,18 @@ def stage_cgemm(c, r1):
     ks = b % ks_n
     kper = HID // ks_n                          # 640 or 1280
     if (w >= 3) & (w < 6) & (w - 3 < MT):
-        mi = w - 3
+        mis = m_tiles(MT, w - 3)
         k0 = ks * kper
-        acc = fx.Vector.filled(8, 0.0, F32)
+        accs = [fx.Vector.filled(8, 0.0, F32) for _ in mis]
         for st in range(kper // 32):
             kk = k0 + st * 32 + (l // 16) * 16
-            av = hx.gload(c["axn"] + i64((mi * 16 + l % 16) * HID + kk) * 2, BF16, 16)
+            avs = [hx.gload(c["axn"] + i64((mi * 16 + l % 16) * HID + kk) * 2, BF16, 16) for mi in mis]
             bv = hx.gload(c["cwkv"] + i64((nt * 16 + l % 16) * HID + kk) * 2, BF16, 16)
-            acc = hx.wmma_bf16(av, bv, acc)
-        for i in range_constexpr(8):
-            tok = mi * 16 + (l // 16) * 8 + i
-            c["stx"](c["cpart"] + i64((ks * T + tok) * (2 * LAT) + nt * 16 + l % 16) * 4, acc[i])
+            accs = [hx.wmma_bf16(avs[j], bv, accs[j]) for j in range(len(mis))]
+        for j in range_constexpr(len(mis)):
+            for i in range_constexpr(8):
+                tok = mis[j] * 16 + (l // 16) * 8 + i
+                c["stx"](c["cpart"] + i64((ks * T + tok) * (2 * LAT) + nt * 16 + l % 16) * 4, accs[j][i])
 
 
 @ASTRewriter.transform
@@ -118,11 +125,14 @@ def stage_crow(c, r1):
     each lane's loads are 1/8 of a one-wave-a-row layout (that one held a lane's 4 x 8 x 16 floats in flight, VGPR
     bound). RMSNorm: wave sums, then the 8 partials in wave order from LDS. Keys: the CTA's latent row (bf16, LDS) .
     wk^T as WMMA N tiles (wave w: keys 16 w ..), then wave 0 normalizes / quantizes the 128 keys."""
+    kv8 = c.get("kv8", False)   # (a Python bool: read once, outside the traced branches)
+    idx4 = c.get("idx4", False)   # (a Python bool: read once, outside the traced branches)
     t, b, w, l = c["t"], c["b"], c["w"], c["l"]
     # the row index per lane (opaque_v): with a wave-uniform index LLVM selects a scaled-SGPR-offset global load that
     # gfx1250 rejects ("scale_offset is not supported for this instruction")
-    q = hx.opaque_v(b - CROW0)
-    act = (b >= CROW0) & (b - CROW0 < c["ccap"])
+    C0 = crow0(c["TR"])
+    q = hx.opaque_v(b - C0)
+    act = (b >= C0) & (b - C0 < c["ccap"])
     qq = fx.max(fx.min(q, c["ccap"] - 1), I32(0))
     rag = hx.gload(c["cplan"] + i64(qq * 4) * 4, I32)
     bat = hx.gload(c["cplan"] + i64(qq * 4 + 1) * 4, I32)
@@ -182,8 +192,23 @@ def stage_crow(c, r1):
             rot.append(isr.select(nrm[e] * cs - nrm[e + 1] * sn, nrm[e]))
             rot.append(isr.select(nrm[e + 1] * cs + nrm[e] * sn, nrm[e + 1]))
         mrow = i64(phys) * i64(c["cprow"]) + i64(c["cmain"] + ci % c["crpp"])
-        if live & (w < 4):
-            c["stx"](c["kv"] + (mrow * LAT + i64(d0)) * 2, fx.Vector.from_elements([rot[e].to(BF16) for e in range(4)], BF16).bitcast(fx.Int64)[0])
+        if fx.const_expr(kv8):
+            # the FP8 pool's row (quantize_fp8 of the bf16 rotated row): a 32-dim group's 8 lanes share its code
+            rb = [rot[e].to(BF16).to(F32) for e in range(4)]
+            mam = fx.max(fx.max(abs(rb[0]), abs(rb[1])), fx.max(abs(rb[2]), abs(rb[3])))
+            for o_ in range_constexpr(3):
+                mam = fx.max(mam, mam.shuffle_xor(1 << o_, 32))
+            mcode = e8m0_of(mam)
+            minv = inv_pow2(mcode)
+            mcl = [fx.min(fx.max(rb[e] * minv, F32(-448.0)), F32(448.0)) for e in range(4)]
+            mword = hx.cvt_pk_fp8_w(hx.cvt_pk_fp8_w(0, mcl[0], mcl[1], False), mcl[2], mcl[3], True)
+            if live & (w < 4):
+                c["stx"](c["kv"] + mrow * KV8_ROWB + i64(d0), mword)
+                if l % 8 == 0:
+                    c["stx"](c["kv"] + mrow * KV8_ROWB + i64(LAT + d0 // 32), mcode.to(fx.Int8))
+        else:
+            if live & (w < 4):
+                c["stx"](c["kv"] + (mrow * LAT + i64(d0)) * 2, fx.Vector.from_elements([rot[e].to(BF16) for e in range(4)], BF16).bitcast(fx.Int64)[0])
         if w < 4:
             hx.lstore(lb + d0 * 2, fx.Vector.from_elements([live.select(nrm[e], F32(0.0)).to(BF16) for e in range(4)], BF16))
         # M padding rows 1..15 of lb: zero (15 x 1024 B, 16 B a thread x 4)
@@ -221,20 +246,31 @@ def stage_crow(c, r1):
                 ev, od = kn[jj], kn[jj + 1]
                 kr.append(isr2.select((ev * cs2 - od * sn2).to(BF16).to(F32), ev))
                 kr.append(isr2.select((od * cs2 + ev * sn2).to(BF16).to(F32), od))
-            am = _lane_max(fx.max(fx.max(abs(kr[0]), abs(kr[1])), fx.max(abs(kr[2]), abs(kr[3]))))
-            code = e8m0_of(am)
-            inv = inv_pow2(code)
-            cl = [fx.min(fx.max(kr[jj] * inv, F32(-448.0)), F32(448.0)) for jj in range(4)]
-            word = hx.cvt_pk_fp8_w(hx.cvt_pk_fp8_w(0, cl[0], cl[1], False), cl[2], cl[3], True)
             row = posc // ratio2
             phys2 = hx.gload(c["btab"] + (i64(fx.max(bat, I32(0))) * i64(c["bstride"]) + i64(row // c["crpp"])) * 4, I32)
             flat = i64(phys2) * i64(c["crpp"]) + i64(row % c["crpp"])
-            tile = flat // 8
-            tt = flat % 8
-            blk = c["cplane"] + tile * 1056
-            c["stx"](blk + i64((l // 4) * 128) + tt * 16 + i64((l % 4) * 4), word)
-            if l == 0:
-                c["stx"](blk + 1024 + tt * 4, (code << 23).bitcast(F32))   # the fp32 scale 2^(code - 127)
+            if fx.const_expr(idx4):
+                # the FP4 plane (natural layout, index_write._write_index_fp4_kernel): 64 B a row, the even dim the low
+                # nibble; one ceil E8M0 a 32-dim group (8 lanes) in the scale plane, 4 B a row
+                am4 = fx.max(fx.max(abs(kr[0]), abs(kr[1])), fx.max(abs(kr[2]), abs(kr[3])))
+                for o_ in range_constexpr(3):
+                    am4 = fx.max(am4, am4.shuffle_xor(1 << o_, 32))
+                code4, qs4 = MX4.ceil_scale(am4)
+                c["stx"](c["cplane"] + flat * 64 + i64(l * 2), MX4.pack4(kr, qs4).to(fx.Int16))
+                if l % 8 == 0:
+                    c["stx"](c["iscl"] + flat * 4 + i64(l // 8), code4.to(fx.Int8))
+            else:
+                am = _lane_max(fx.max(fx.max(abs(kr[0]), abs(kr[1])), fx.max(abs(kr[2]), abs(kr[3]))))
+                code = e8m0_of(am)
+                inv = inv_pow2(code)
+                cl = [fx.min(fx.max(kr[jj] * inv, F32(-448.0)), F32(448.0)) for jj in range(4)]
+                word = hx.cvt_pk_fp8_w(hx.cvt_pk_fp8_w(0, cl[0], cl[1], False), cl[2], cl[3], True)
+                tile = flat // 8
+                tt = flat % 8
+                blk = c["cplane"] + tile * 1056
+                c["stx"](blk + i64((l // 4) * 128) + tt * 16 + i64((l % 4) * 4), word)
+                if l == 0:
+                    c["stx"](blk + 1024 + tt * 4, (code << 23).bitcast(F32))   # the fp32 scale 2^(code - 127)
 
 
 @ASTRewriter.transform

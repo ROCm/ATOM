@@ -69,12 +69,20 @@ def test_the_supported_deployment_is_not_refused():
     assert config.config_refusal(atom_config(), Dims) is None
 
 
+@pytest.mark.parametrize("kv", ["bf16", "fp8"])
+@pytest.mark.parametrize("index", ["fp8", "fp4"])
+def test_the_cache_formats_are_served(kv, index):
+    """BF16 / FP8 KV (FP8: the latest c16 recipe's, with its FP4 index) x FP8 / FP4 index."""
+    cfg = atom_config(kv_cache_dtype=kv, index_cache_dtype=index)
+    assert config.config_refusal(cfg, Dims) is None
+
+
 @pytest.mark.parametrize(
     "change, why",
     [
         ({"tensor_parallel_size": 8}, "TP 8"),
-        ({"kv_cache_dtype": "fp8"}, "kv cache fp8"),
-        ({"index_cache_dtype": "fp4"}, "index cache fp4"),
+        ({"kv_cache_dtype": "fp4"}, "kv cache fp4"),
+        ({"index_cache_dtype": "bf16"}, "index cache bf16"),
         (
             {"speculative_config": NS(method="mtp", num_speculative_tokens=5)},
             "speculative method mtp",
@@ -136,12 +144,17 @@ def model(monkeypatch):
     "rows",
     range(config.ROWS_PER_REQ, config.MAX_ROWS + 1, config.ROWS_PER_REQ),
 )
-def test_every_whole_request_width_up_to_eight_requests_is_served(model, rows):
+def test_every_whole_request_width_up_to_sixteen_requests_is_served(model, rows):
     assert model.step_ready(rows)
     assert model._single.asked == [rows]
 
 
-@pytest.mark.parametrize("rows", [0, 1, 5, 7, 13, 47, 54, 96])
+def test_c16_is_a_served_width():
+    """16 requests: 96 target rows (the kernel's widest build, 80 draft rows)."""
+    assert config.MAX_REQUESTS == 16 and config.MAX_ROWS == 96
+
+
+@pytest.mark.parametrize("rows", [0, 1, 5, 7, 13, 47, 53, 95, 97, 102, 108])
 def test_other_widths_take_the_production_path(model, rows):
     assert not model.step_ready(rows)
     assert model._single.asked == []
@@ -166,7 +179,7 @@ def test_off_when_mono_is_switched_off(monkeypatch):
 def test_a_refused_deployment_keeps_the_model(monkeypatch):
     inner = nn.Linear(1, 1)
     out = dispatch.install_single_step(
-        inner, atom_config(kv_cache_dtype="fp8"), drafter=None
+        inner, atom_config(kv_cache_dtype="fp4"), drafter=None
     )
     assert out is inner
 
@@ -520,6 +533,92 @@ def test_score_split(TR):
             assert tasks * tcols >= cx > (tasks - 1) * tcols
 
 
+class Lanes(list):
+    """A wave's 32 lane values (the kernel's per-lane Int32): elementwise arithmetic and comparisons."""
+
+    def _op(f):
+        def g(a, b):
+            bs = b if isinstance(b, list) else [b] * len(a)
+            return Lanes(f(int(x), int(y)) for x, y in zip(a, bs))
+
+        return g
+
+    __add__, __sub__ = _op(int.__add__), _op(int.__sub__)
+
+    def _cmp(f):
+        def g(a, b):
+            bs = b if isinstance(b, list) else [b] * len(a)
+            return LaneB(f(int(x), int(y)) for x, y in zip(a, bs))
+
+        return g
+
+    __lt__, __le__ = _cmp(int.__lt__), _cmp(int.__le__)
+
+
+class LaneB(list):
+    def select(self, a, b):
+        av = a if isinstance(a, list) else [a] * len(self)
+        bv = b if isinstance(b, list) else [b] * len(self)
+        return Lanes(x if p else y for p, x, y in zip(self, av, bv))
+
+
+def _lane_fx(f):
+    def g(a, b):
+        if isinstance(a, list) or isinstance(b, list):
+            n = len(a) if isinstance(a, list) else len(b)
+            av = a if isinstance(a, list) else [a] * n
+            bv = b if isinstance(b, list) else [b] * n
+            return Lanes(f(int(x), int(y)) for x, y in zip(av, bv))
+        return Z(f(int(a), int(b)))
+
+    return g
+
+
+def run_task_prefix(counts):
+    """index_plan.task_prefix / task_of as a wave runs them: 32 lanes, the wave's scan / ballot / max emulated."""
+    TR = len(counts)
+    ln = Lanes(range(IP.LANES))
+    lane_fx = NS(min=_lane_fx(min), max=_lane_fx(max), Int32=Z)
+    with mock.patch.object(IP, "fx", lane_fx):
+        incs, nt = IP.task_prefix(
+            lambda r: Lanes(counts[int(x)] for x in r),
+            TR,
+            ln,
+            lambda v: Lanes(sum(v[: i + 1]) for i in range(len(v))),
+            lambda v: Z(v[31]),
+        )
+        tasks = [
+            IP.task_of(
+                incs, Z(i), TR, lambda p: Z(sum(map(bool, p))), lambda v: Z(max(v))
+            )
+            for i in range(int(nt))
+        ]
+    return int(nt), [(int(r), int(j)) for r, j in tasks]
+
+
+@pytest.mark.parametrize("TR", [6, 30, 32, 33, 48, 63, 64, 65, 80, 90, 96])
+def test_task_prefix_runs_every_task_once(TR):
+    """Every (row, task) of a step is task i for exactly one i, at every width up to 96 rows (3 lane groups)."""
+    assert IP.row_groups(TR) * IP.LANES >= TR
+    rng = random.Random(TR)
+    for trial in range(30):
+        counts = [rng.choice([0, 0, 1, 2, 7, 33]) for _ in range(TR)]
+        if trial == 0:
+            counts = [1] * TR
+        nt, tasks = run_task_prefix(counts)
+        assert nt == sum(counts)
+        assert sorted(tasks) == [(r, j) for r in range(TR) for j in range(counts[r])]
+
+
+def test_index_row_metadata_does_not_overlap():
+    """The scorer's / selection's per-row LDS metadata: count, then 3 fields of T rows each (row r at r, T + r, 2 T + r)."""
+    T = 96
+    words = [("cnt", r) for r in range(T)] + [
+        (f, r) for f in range(3) for r in range(T)
+    ]
+    assert len(set(words)) == 4 * T
+
+
 # --- moe_plan -----------------------------------------------------------------------------------------------------
 NUG, CTAS, WAVES = 18, 256, 8
 
@@ -538,9 +637,9 @@ def assigned(nch, U):
     return seen
 
 
-@pytest.mark.parametrize("nch", [1, 2, 3])
+@pytest.mark.parametrize("nch", [1, 2, 3, 4, 5, 6])
 @pytest.mark.parametrize(
-    "U", [0, 1, 17, 18 * 6, 2034, 2048, 2049, 2600, 18 * (288 + 16)]
+    "U", [0, 1, 17, 18 * 6, 2034, 2048, 2049, 2600, 18 * (288 + 16), 18 * (384 + 36)]
 )
 def test_units_once(nch, U):
     seen = assigned(nch, U)
@@ -553,6 +652,13 @@ def test_schedules():
     assert MP.dedicated_ctas(3, NUG) == 0  # wide: the shared UG runs early in the front
     assert MP.dedicated_ctas(1, NUG) == NUG  # narrow: one shared unit a dedicated CTA
     assert MP.dedicated_ctas(2, NUG) == 2 * NUG
+    # past 48 rows (4..6 chunks): the front's idle CTAs no longer hold the shared units -> dedicated CTAs, striped
+    for n in (4, 5, 6):
+        assert not MP.sh_early(n) and MP.striped(n) and not MP.sh8_dnov(n)
+        assert MP.dedicated_ctas(n, NUG) == -(-n * NUG // 3)
+    # Standard C16 serving stalls in the dynamic UG path. Use the static
+    # coverage checked above at every width, retaining dedicated shared CTAs.
+    assert "MOE_DYN" not in LY.layer_slots()
 
 
 # --- layout -------------------------------------------------------------------------------------------------------

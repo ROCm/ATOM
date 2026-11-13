@@ -25,7 +25,7 @@ from flydsl.expr import gpu, range_constexpr
 
 from atom.models.deepseek_v41.mono.gfx1250.kernels import device as hx
 from atom.models.deepseek_v41.mono.gfx1250.kernels import dims as D
-from atom.models.deepseek_v41.mono.gfx1250.kernels.attention import e8m0_of, inv_pow2, ld_op, q8words, rsq
+from atom.models.deepseek_v41.mono.gfx1250.kernels.attention import KV8_ROWB, e8m0_of, inv_pow2, ld_op, q8words, rsq
 
 F32, I32, BF16 = fx.Float32, fx.Int32, fx.BFloat16
 H, NTAP, KVD, ROPE0, NDL = D.HID, 3, D.KV_DIM, 448, D.DRAFT_LAYERS
@@ -110,6 +110,7 @@ def stage_hnorm(c, T):
 @ASTRewriter.transform
 def stage_kvrow(c, T):
     """a wave a (draft layer, row): lane l holds cols 16 l .. 16 l + 15 (half a 32-group: lanes 2g, 2g+1 share one)."""
+    kv8 = c.get("kv8", False)   # (a Python bool: read once, outside the traced branches)
     b, w, l = c["b"], c["w"], c["l"]
     task = b * WAVES + w
     if task < NDL * T:
@@ -140,9 +141,18 @@ def stage_kvrow(c, T):
         kw = hx.gload(c["kvw"] + i64(r) * 4, I32)
         roff = (d == 0).select(c["roff0"], (d == 1).select(c["roff1"], c["roff2"]))
         if kw >= 0:
-            dst = c["ring"] + ((i64(kw) + i64(roff)) * KVD + i64(c0)) * 2
-            hx.gstore(dst, fx.Vector.from_elements([qv[i].to(BF16) for i in range(8)], BF16))
-            hx.gstore(dst + i64(16), fx.Vector.from_elements([qv[i].to(BF16) for i in range(8, 16)], BF16))
+            if fx.const_expr(kv8):   # the FP8 pool's row: E4M3 bytes, the group's code (even lanes)
+                cl = [fx.min(fx.max(ro[i] * inv, F32(-448.0)), F32(448.0)) for i in range(16)]
+                wds = [hx.cvt_pk_fp8_w(hx.cvt_pk_fp8_w(0, cl[4 * h], cl[4 * h + 1], False), cl[4 * h + 2], cl[4 * h + 3], True)
+                       for h in range(4)]
+                rowp = c["ring"] + (i64(kw) + i64(roff)) * KV8_ROWB
+                hx.gstore(rowp + i64(c0), fx.Vector.from_elements(wds, I32))
+                if l % 2 == 0:
+                    hx.gstore(rowp + i64(KVD + c0 // 32), e8m0_of(am).to(fx.Int8))
+            else:
+                dst = c["ring"] + ((i64(kw) + i64(roff)) * KVD + i64(c0)) * 2
+                hx.gstore(dst, fx.Vector.from_elements([qv[i].to(BF16) for i in range(8)], BF16))
+                hx.gstore(dst + i64(16), fx.Vector.from_elements([qv[i].to(BF16) for i in range(8, 16)], BF16))
 
 
 @ASTRewriter.transform
@@ -242,7 +252,7 @@ def _gemv_part_m(c, a8, as_, K, w8, ws, n0, T, k0, nk, MT):
     l = c["l"]
     ras = [fx.min(mi * 16 + l % 16, I32(T - 1)) for mi in range(MT)]
     brow = w8 + i64(n0 + l % 16) * K
-    D = min(4, nk)   # K steps in flight
+    D = min(4 if MT <= 3 else 2, nk)   # K steps in flight (MT A operands each: 2 past 3 row tiles, the registers)
     accs = [fx.Vector.filled(8, 0.0, F32) for _ in range(MT)]
 
     def fa(i, mi):
@@ -365,13 +375,13 @@ def ctptr(tab, name):
     return (fx.Int64(rf(v[1])) << 32) | (fx.Int64(rf(v[0])) & fx.Int64(0xFFFFFFFF))
 
 
-def ctx_parts(tab, t, b, T, smoff):
+def ctx_parts(tab, t, b, T, smoff, kv8=False):
     """ctx_tail's 4 stages as callables (no handoffs: the caller separates them by grid-wide barriers -- the target
     sampling's handoffs, which use the same agent-scope fences), LDS at lds_base + smoff."""
     c = {k: ctptr(tab, k) for k in CTPTRS if k != 'roff'}
     ro = ctptr(tab, 'roff')
     c.update(t=t, b=b, w=t // 32, l=t % 32, sm=hx.lds_base() + smoff, roff0=hx.gload(ro, I32), roff1=hx.gload(ro + i64(4), I32),
-             roff2=hx.gload(ro + i64(8), I32))
+             roff2=hx.gload(ro + i64(8), I32), kv8=kv8)
     return [lambda: stage_proj_skb(c, T), lambda: stage_hnorm(c, T), lambda: stage_wkv_skb(c, T), lambda: stage_kvrow(c, T)]
 
 

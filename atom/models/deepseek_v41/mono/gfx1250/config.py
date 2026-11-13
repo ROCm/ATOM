@@ -2,8 +2,9 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """The one deployment the single-launch step is written for, and why a deployment cannot run it.
 
-TP4, DSpark with a block of 5 (a verify of 6 rows a request), BF16 KV cache, FP8 index cache, up to 8 requests (48
-target rows, 40 draft rows), the 40 target layers and 3 draft stages of DeepSeek-V4.1-Flash.
+TP4, DSpark with a block of 5 (a verify of 6 rows a request), BF16 or FP8 KV cache (KV_DTYPES: FP8 rows of 512 E4M3 +
+16 E8M0, the latest c16 recipe's), FP8 or FP4 index cache (INDEX_DTYPES: FP4 in the natural layout), up to 16 requests (96
+target rows, 80 draft rows), the 40 target layers and 3 draft stages of DeepSeek-V4.1-Flash.
 """
 
 from atom.mono.runtime.deployment import common_refusals, first_refusal
@@ -12,9 +13,11 @@ TP = 4
 SUPPORTED_TP = (TP,)
 SPEC_TOKENS = 5
 ROWS_PER_REQ = SPEC_TOKENS + 1  # a request's verify rows: the anchor and its 5 drafts
-MAX_REQUESTS = 8
+MAX_REQUESTS = 16
 MAX_ROWS = MAX_REQUESTS * ROWS_PER_REQ
 NL, NDR = 40, 3  # target layers, draft stages
+KV_DTYPES = ("bf16", "fp8")
+INDEX_DTYPES = ("fp8", "fp4")
 
 
 def config_refusal(atom_config, dims) -> str | None:
@@ -29,11 +32,11 @@ def config_refusal(atom_config, dims) -> str | None:
     ]
     checks = shared + [
         (
-            atom_config.kv_cache_dtype == "bf16",
+            atom_config.kv_cache_dtype in KV_DTYPES,
             f"kv cache {atom_config.kv_cache_dtype}",
         ),
         (
-            atom_config.index_cache_dtype == "fp8",
+            atom_config.index_cache_dtype in INDEX_DTYPES,
             f"index cache {atom_config.index_cache_dtype}",
         ),
         (method == "dspark", f"speculative method {method}"),

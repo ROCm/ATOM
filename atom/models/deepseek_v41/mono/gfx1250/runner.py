@@ -3,7 +3,7 @@
 """The single-launch step's runner: per-width builds, the bound pointer tables, one launch a step.
 
 What ``ModelRunner`` asks of it on a served step (``ModelRunner._single_step``):
-- ``run_step(running_bs, forward_context)``: the step metadata (``write_step_meta`` / ``write_draft_step_meta``) and the
+- ``run_step(requests, forward_context)``: the step metadata (``write_step_meta`` / ``write_draft_step_meta``) and the
   one launch, on the current stream (graph-capturable: every pointer it binds stays put);
 - ``verify_outputs(bs)``: the rejection sampler's ``(output_token_ids [bs, k + 1] int32, -1 past the emitted tokens;
   verdict [3, bs] int32: accepted drafts, rejected drafts, anchor row)``;
@@ -30,12 +30,16 @@ from aiter.dist.parallel_state import (
 from atom.model_ops.engram.device.staging import EngramStagedRows
 from atom.models.deepseek_v41.mono.gfx1250 import buffers
 from atom.models.deepseek_v41.mono.gfx1250.config import (
+    MAX_REQUESTS,
     NDR,
     NL,
     ROWS_PER_REQ,
     TP,
 )
-from atom.models.deepseek_v41.mono.gfx1250.debug import RunnerDebug, timeline
+from atom.models.deepseek_v41.mono.gfx1250.debug import (
+    RunnerDebug,
+    timeline,
+)
 from atom.models.deepseek_v41.mono.gfx1250.inputs import StepInputs
 from atom.models.deepseek_v41.mono.gfx1250.tables import StepTables
 from atom.mono.plan.build_key import source_digest
@@ -60,11 +64,6 @@ def _base_model(model):
 
 
 KERNELS = __package__ + ".kernels"
-# the receive regions: 4 TP regions x 4 sources x 40960 16-byte words, the sampling and Markov exchange after them
-# (tail SOFF / SOFF2), 2 MB-rounded, doubled for the step epoch
-RECV_BYTES = 2 * (
-    (16 * 40960 * 16 + 4 * 4 * 48 * 256 * 16 + (2 << 20) - 1) // (2 << 20) * (2 << 20)
-)
 
 
 # the kernel sources' digest: part of every build's FlyDSL JIT key (an edit to any kernel module rebuilds)
@@ -109,6 +108,18 @@ class SingleStepRunner(StepInputs, RunnerDebug):
             ) from err
         # the kernel's ring slots (window + block width) and pool row width (bf16 elements) are compile-time constants
         AS = self.K["attention"]
+        g = cache.geometry
+        # the pool's and the index plane's formats are compile-time: BF16 rows or FP8 rows (E4M3 + E8M0), an FP8 or an
+        # FP4 (MXFP4, natural layout) index plane
+        self.kv8, self.idx4 = bool(g.window_fp8), bool(g.index_fp4)
+        if g.packed:
+            raise MonoUnsupported(
+                "packed (FP4) KV pool: the step kernel reads row-addressed pools"
+            )
+        if int(g.row_bytes) != (AS.KV8_ROWB if self.kv8 else 2 * AS.KG_ROW):
+            raise MonoUnsupported(f"pool row of {g.row_bytes} B ({g.kv_dtype})")
+        if self.idx4 and g.index_layout != "natural":
+            raise MonoUnsupported(f"FP4 index layout {g.index_layout}")
         if int(window.ring_slots) != AS.KG_RING:
             raise MonoUnsupported(
                 f"window ring {window.ring_slots} slots (the step kernel's: {AS.KG_RING})"
@@ -116,6 +127,11 @@ class SingleStepRunner(StepInputs, RunnerDebug):
         miss = buffers.check_catalog(self.K)
         if miss:
             raise MonoUnsupported(f"pointer catalog out of date: {miss[:4]}")
+        # the receive regions: 4 TP regions x 4 sources (attention.TP_TG 16-byte words each), the sampling and Markov
+        # exchange after them (tail SOFF / SOFF2): a parity half (step.RECV_HALF), 2 MB-rounded, doubled for the step epoch
+        recv_bytes = 2 * (
+            (self.K["step"].RECV_HALF + (2 << 20) - 1) // (2 << 20) * (2 << 20)
+        )
         self.scratch = {
             n: torch.zeros(b, dtype=torch.uint8, device=self.device)
             for n, b in buffers.scratch_bytes(self.K, NL + NDR).items()
@@ -123,7 +139,7 @@ class SingleStepRunner(StepInputs, RunnerDebug):
         # fine-grained, not uncached: the step's few-word peer pushes (Markov, sampling) waited ~80-100 us each for an
         # uncached store to become visible (fine-grained receive buffers did not, measured on the kernel's fixture)
         self.peer = SymmetricPeerBuffer(
-            RECV_BYTES,
+            recv_bytes,
             rank=self.rank,
             npes=TP,
             group=get_tp_group().cpu_group,
@@ -133,7 +149,7 @@ class SingleStepRunner(StepInputs, RunnerDebug):
         logger.info(
             "V4.1 single-launch step: %.1f MB scratch, %.1f MB receive (rank %d)",
             sum(t.numel() for t in self.scratch.values()) / 2**20,
-            RECV_BYTES / 2**20,
+            recv_bytes / 2**20,
             self.rank,
         )
         self.tables = StepTables(
@@ -190,7 +206,13 @@ class SingleStepRunner(StepInputs, RunnerDebug):
             return False
         if rows not in self.builds:
             M = self.K["step"]
-            kw = {"NL": NL, "ndr": NDR, "trd": rows // 6 * 5}
+            kw = {
+                "NL": NL,
+                "ndr": NDR,
+                "trd": rows // 6 * 5,
+                "kv8": self.kv8,
+                "idx4": self.idx4,
+            }
             # two launches: target .. verification, then the draft (the host reads the verdict between)
             launch = tuple(
                 M.build(rows, self.rank, part=pt, sources=SOURCES, **kw)[0]
@@ -317,11 +339,11 @@ class SingleStepRunner(StepInputs, RunnerDebug):
         self._check_timeouts()
         self._qrow = self._qrow_next
 
-    def run_step(self, input_ids, running_bs: int, forward_context, batch) -> None:
+    def run_step(self, input_ids, requests: int, forward_context, batch) -> None:
         """The served step: one launch (target layers, head, sampling, verify, draft layers, Markov drafts)."""
-        if input_ids.numel() != running_bs * ROWS_PER_REQ:
+        if input_ids.numel() != requests * ROWS_PER_REQ:
             raise MonoUnsupported(
-                f"single-launch step: {input_ids.numel()} rows for {running_bs} requests"
+                f"single-launch step: {input_ids.numel()} rows for {requests} requests"
             )
         # what the production forward opens and closes around its layers (runtime.v41_begin_forward / end_forward): the
         # Engram stage -- its history snapshot, each verify prefix's cursor candidate (the TentativeState staging that
@@ -354,14 +376,14 @@ class SingleStepRunner(StepInputs, RunnerDebug):
             self._verify_stream.wait_event(self._ev_verify)
             out = (
                 self.scratch["outtok"]
-                .view(torch.int32)[: 8 * ROWS_PER_REQ]
-                .view(8, ROWS_PER_REQ)[:bs]
+                .view(torch.int32)[: MAX_REQUESTS * ROWS_PER_REQ]
+                .view(MAX_REQUESTS, ROWS_PER_REQ)[:bs]
                 .clone()
             )
             verdict = (
                 self.scratch["verdict"]
-                .view(torch.int32)[:24]
-                .view(3, 8)[:, :bs]
+                .view(torch.int32)[: 3 * MAX_REQUESTS]
+                .view(3, MAX_REQUESTS)[:, :bs]
                 .clone()
             )
             self.verify_ready.record()
@@ -374,7 +396,7 @@ class SingleStepRunner(StepInputs, RunnerDebug):
         """The next step's drafts [bs, 5] (the kernel's Markov block sampling, mids), as ``Drafter.propose`` returns."""
         return (
             self.scratch["mids"]
-            .view(torch.int32)[: 8 * 5]
-            .view(8, 5)[:bs]
+            .view(torch.int32)[: MAX_REQUESTS * 5]
+            .view(MAX_REQUESTS, 5)[:bs]
             .to(torch.int64)
         )

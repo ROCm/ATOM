@@ -34,7 +34,7 @@ from atom.models.deepseek_v41.mono.gfx1250.kernels import device as hx
 from atom.models.deepseek_v41.mono.gfx1250.kernels import dims as D
 from atom.models.deepseek_v41.mono.gfx1250.kernels.device import _v, gptr, lptr
 
-ROWS, CPR, NB = D.T_MAX, 5, 256
+ROWS, CPR, NB = D.T_MAX, 5, 256   # ROWS: the exchange layout's rows (the widest step); CPR: CTAs a row up to 48 rows
 R = 16.0
 F32, I32, I64 = fx.Float32, fx.Int32, fx.Int64
 LN2 = 0.6931471805599453
@@ -172,9 +172,10 @@ def xchg_scalar(recv, rank, p, row, c, t, sm, w0, w1, tag):
 
 
 @ASTRewriter.transform
-def xchg_hist(recv, rank, p, row, c, t, sm, tag, mid=None):
-    """This rank's row histogram at LDS sm[0:256] -> global sum over ranks (rank order) back into sm[0:256]."""
-    if (t < 86) & (t % CPR == c):
+def xchg_hist(recv, rank, p, row, c, t, sm, tag, mid=None, cpr=CPR):
+    """This rank's row histogram at LDS sm[0:256] -> global sum over ranks (rank order) back into sm[0:256] (the 86
+    pushed units split over the row's cpr CTAs)."""
+    if (t < 86) & (t % cpr == c):
         vs = []
         for k in range_constexpr(3):
             bi = fx.min(t * 3 + k, I32(NB - 1))

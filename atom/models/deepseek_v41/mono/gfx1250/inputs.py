@@ -42,7 +42,7 @@ class StepInputs:
             bt = step.block_tables
             if any(end // r > ILW for r in (1, 2)):
                 why = f"index bound {end} > {ILW}"
-            elif -(-end // geom.block_size) > BCOLS or bt.shape[0] > 8:
+            elif -(-end // geom.block_size) > BCOLS or bt.shape[0] > buffers.MAX_REQ:
                 why = f"block table {bt.shape[0]} x {-(-end // geom.block_size)}"
             elif self.tables.comp:
                 for r in (1, 2):
@@ -109,9 +109,9 @@ class StepInputs:
                 if end // r > ILW:
                     raise MonoUnsupported(f"index bound {end // r} > {ILW}")
             bt = step.block_tables
-            if -(-end // geom.block_size) > BCOLS or bt.shape[0] > 8:
+            if -(-end // geom.block_size) > BCOLS or bt.shape[0] > buffers.MAX_REQ:
                 raise MonoUnsupported(
-                    f"block table: {bt.shape[0]} requests x {-(-end // geom.block_size)} columns > 8 x {BCOLS}"
+                    f"block table: {bt.shape[0]} requests x {-(-end // geom.block_size)} columns > {buffers.MAX_REQ} x {BCOLS}"
                 )
             key += [
                 t.data_ptr()

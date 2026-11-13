@@ -18,10 +18,16 @@ NLMAX = 3  # the deepest tree (IDX_LEVELS <= 3: n <= 1M)
 CHUNK = 128  # scorer columns a chunk
 SUB = 4  # chunks a scorer task at most
 TOPK = 512  # rows a selection keeps (rows with a context <= TOPK are not scored)
+LANES = 32  # a wave's lanes: the task prefix holds row 32 g + lane in lane `lane` of group g
 
 
 def cdiv(a, b):
     return (a + (b - 1)) // b
+
+
+def tree_levels(n, k):
+    """Keep the original two passes; use a third only when two cannot merge all lists."""
+    return (n > SEG * (SEG // k)).select(I32(3), I32(2))
 
 
 def lists(n, lev, fan):
@@ -93,3 +99,33 @@ def score_sub(TR, ctas):
 def score_tasks(cx, tcols):
     """Scorer tasks of a token with cx columns: none while the selection takes every column (cx <= TOPK)."""
     return (cx > TOPK).select((cx + (tcols - 1)) // tcols, I32(0))
+
+
+def row_groups(TR):
+    """Lane groups of the rows' task prefix (Python int): 2 up to 64 rows (the narrow builds' code), 3 at 96."""
+    return max(2, cdiv(TR, LANES))
+
+
+def task_prefix(cnt, TR, ln, scan, last):
+    """The rows' inclusive task prefix in every wave's lanes (no serial LDS walk): incs[g] in lane ln = the tasks of the
+    rows <= 32 g + ln (rows past TR: 0). cnt(row): a row's task count (row < TR); scan(v): the wave's inclusive scan;
+    last(v): lane 31's value. Returns (incs, the step's tasks)."""
+    incs, carry = [], I32(0)
+    for g in range(row_groups(TR)):
+        r = ln + LANES * g
+        cg = (r < TR).select(cnt(fx.min(r, I32(TR - 1))), I32(0))
+        inc = scan(cg) + carry
+        carry = last(inc)
+        incs.append(inc)
+    return incs, carry
+
+
+def task_of(incs, i, TR, count_true, wave_max):
+    """Task i's (row, index in the row): the rows whose inclusive prefix is <= i come before it (count_true(p): the
+    wave's lanes where p holds; wave_max: the wave's max)."""
+    r, before = I32(0), I32(0)
+    for inc in incs:
+        p = inc <= i
+        r = r + count_true(p)
+        before = fx.max(before, wave_max(p.select(inc, I32(0))))
+    return fx.min(r, I32(TR - 1)), i - before
