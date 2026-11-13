@@ -3652,8 +3652,9 @@ models:
         runner:
           # The A9 nodes plus g03, g07, g09, g24 and g40, which also deny the
           # privileged cache drop (g07 then compacted neither NUMA node in
-          # 1800 s), and g27 and g37, whose GPUs other jobs' containers held.
-          exclude_nodes: pit2-p03-g03,pit2-p03-g07,pit2-p03-g08,pit2-p03-g09,pit2-p03-g10,pit2-p03-g12,pit2-p03-g15,pit2-p03-g23,pit2-p03-g24,pit2-p03-g25,pit2-p03-g27,pit2-p03-g37,pit2-p03-g40
+          # 1800 s), g27, g37 and g51, whose GPUs other jobs' containers held,
+          # and g41, where a leftover router container holds port 8000.
+          exclude_nodes: pit2-p03-g03,pit2-p03-g07,pit2-p03-g08,pit2-p03-g09,pit2-p03-g10,pit2-p03-g12,pit2-p03-g15,pit2-p03-g23,pit2-p03-g24,pit2-p03-g25,pit2-p03-g27,pit2-p03-g37,pit2-p03-g40,pit2-p03-g41,pit2-p03-g51
           time_limit: 04:00:00
       - <<: *issue382_a9_1p3d_c264
         name: issue382-a9-1p3d-c180
