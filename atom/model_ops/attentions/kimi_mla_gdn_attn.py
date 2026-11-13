@@ -176,7 +176,7 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         if connector == "moriio":
             # MoRIIO reads none of the placement the Mooncake path below
             # publishes for a PP stage's MLA rows and KDA slots.
-            if getattr(config, "pipeline_parallel_size", 1) > 1:
+            if config.pipeline_parallel_size > 1:
                 raise NotImplementedError(
                     f"{model_type} disaggregated serving over moriio does not "
                     "support pipeline parallelism (pipeline_parallel_size="
@@ -186,9 +186,7 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             tensors.slot_regions, tensors.num_slots = self.state_slot_regions()
             return tensors
 
-        if getattr(config, "pipeline_parallel_size", 1) > 1 and getattr(
-            self.model_runner, "has_mla_indexer", False
-        ):
+        if config.pipeline_parallel_size > 1 and self.model_runner.has_mla_indexer:
             # A PP stage places its MLA rows and KDA slots by layer; a sparse
             # MLA model's indexer regions have no such placement.
             raise NotImplementedError(
@@ -222,11 +220,12 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
                 "(a conv unit is linear_conv_kernel_dim - 1 + num_spec rows of "
                 "[q | k | v]), which a decode at another TP needs"
             )
-        if getattr(config, "pipeline_parallel_size", 1) > 1:
-            # `_consumer_region_map` shifts a stage's regions onto the peer's
-            # list group-major over `num_hidden_layers`, but the MLA rows and
-            # KDA slots are each numbered over their own kind only; the shift
-            # would write one layer's KV or state over another's.
+        if config.pipeline_parallel_size > 1:
+            # Without explicit indices, `consumer_region_indices` places a
+            # stage's regions group-major from its `start_layer`, in groups of
+            # the stage's layer count. The MLA rows and KDA slots are each
+            # numbered over their own kind only, so that placement would write
+            # one layer's KV or state over another's.
             mla, slots = self._pp_consumer_region_indices(
                 len(tensors.block_regions), len(tensors.slot_regions)
             )

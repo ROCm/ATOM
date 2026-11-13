@@ -334,6 +334,26 @@ def test_symmetric_dcp_keeps_incremental_transfer():
     assert seq.kv_transfer_params["src_block_skip_factor"] == 1
 
 
+def test_per_request_state_keeps_the_dcp_block_ratio_on_a_full_transfer():
+    # Kimi-K3 from a PP prefill (dcp=1) to a DCP decode. Its KDA state rules
+    # out a block-only delta, so the transfer is full -- but the producer still
+    # pairs dcp_size source blocks with each destination block, and rejects
+    # the transfer outright if told the ratio is one.
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    sched = _mooncake_consumer_scheduler(mc, block_size=16, dcp_size=4)
+    seq = _remote_prefill_seq(remote_hash_block_size=16)
+    seq.kv_transfer_params["block_size"] = 16
+    seq.kv_transfer_params["dcp_size"] = 1
+    seq.has_per_req_cache = True
+
+    sched.update_state_after_alloc(seq)
+
+    assert seq.kv_transfer_params["num_computed_blocks"] == 0
+    assert seq.kv_transfer_params["src_block_skip_factor"] == 4
+
+
 def test_mismatched_producer_block_size_disables_incremental_transfer():
     mc = pytest.importorskip(
         "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
@@ -1863,6 +1883,183 @@ def test_dcp_block_descriptors_are_streamed_in_bounded_batches():
     assert batch_sizes == [4096, 1024]
     assert sum(batch_sizes) == 2 * descriptors_per_region
     assert transferred_bytes == 2 * descriptors_per_region * 576
+
+
+# ---------------------------------------------------------------------------
+# Stateful P/D from an unsharded PP stage to a DCP x TP decode (Kimi-K3:
+# PP8xTP1 prefill, TP8 DCP8 decode). The stub NIC copies bytes within one
+# address space, so each case checks what lands, not just what was asked for.
+# ---------------------------------------------------------------------------
+
+_TOKEN_BYTES = 8
+_BLOCK = 4
+_BPB = _BLOCK * _TOKEN_BYTES
+_CONV_ROWS = 2
+_CONV_RUN = 4  # one of q, k, v in a conv row, at producer TP
+_CONV_BPS = _CONV_ROWS * 3 * _CONV_RUN
+_SSM_BPS = 16
+_CURSOR_BPS = 4
+_SRC_SLOTS = 8
+# Producer regions, then the consumer's: two MLA layers, three KDA layers and
+# ReplaySSM's cursor.
+_MLA_SRC = 0
+_CONV_SRC = _MLA_SRC + 4 * _BPB
+_SSM_SRC = _CONV_SRC + _SRC_SLOTS * _CONV_BPS
+_CURSOR_SRC = _SSM_SRC + _SRC_SLOTS * _SSM_BPS
+_DST_MLA = [4096 + i * 4 * _BPB for i in range(2)]
+_DST_SLOT = [8192 + i * 1024 for i in range(7)]
+
+
+class _ByteNic:
+    def __init__(self):
+        np = pytest.importorskip("numpy")
+        self.mem = np.zeros(16384, dtype=np.uint8)
+
+    def write(
+        self, _target, src, dst, sizes, _req_id, _label, *, engine=None, deadline=None
+    ):
+        for s, d, n in zip(src, dst, sizes):
+            self.mem[d : d + n] = self.mem[s : s + n].copy()
+        return True
+
+
+def _pp_stage_connector(mc, nic, *, tp_size=1, tp_rank=0, ssm_segments=True):
+    from atom.kv_transfer.disaggregation.types import MLA_KV_ROLE
+
+    connector = object.__new__(mc.MooncakeConnector)
+    connector.dcp_size = 1
+    connector.block_size = _BLOCK
+    connector.tp_size = tp_size
+    connector.tp_rank = tp_rank
+    connector.pp_size = 2
+    connector._num_local_layers = 2
+    connector._start_layer = 4
+    connector._fp4_index_layout = False
+    connector._block_unit_specs = None
+    connector._block_regions = [(_MLA_SRC, _BPB)]
+    connector._per_block_bytes_list = [_BPB]
+    connector._block_region_roles = [MLA_KV_ROLE]
+    connector._block_head_major_runs = [None]
+    # This stage's one MLA layer is the peer's second, its one KDA layer the
+    # peer's third (conv region 2, SSM region 5), then the shared cursor.
+    connector._block_region_consumer_indices = [1]
+    connector._swa_block_regions = []
+    connector._slot_regions = [
+        (_CONV_SRC, _CONV_BPS),
+        (_SSM_SRC, _SSM_BPS),
+        (_CURSOR_SRC, _CURSOR_BPS),
+    ]
+    connector._slot_region_consumer_indices = [2, 5, 6]
+    connector._slot_region_tp_segments = [
+        (_CONV_RUN,) * (3 * _CONV_ROWS),
+        (_SSM_BPS,) if ssm_segments else None,
+        None,
+    ]
+    connector._slot_region_tp_replicated = [False, False, True]
+    connector._gather_slot = None
+    connector._rdma_write = nic.write
+    return connector
+
+
+def _dcp_tp_request(consumer_tp_size=2, consumer_tp_rank=1, ratio=2):
+    from atom.kv_transfer.disaggregation.types import MLA_KV_ROLE
+
+    return {
+        "consumer_block_base_addrs": _DST_MLA,
+        "consumer_block_bpb": [_BPB, _BPB],
+        "consumer_region_roles": [MLA_KV_ROLE, MLA_KV_ROLE],
+        "consumer_slot_base_addrs": _DST_SLOT,
+        "consumer_slot_bps": [_CONV_BPS // ratio] * 3
+        + [_SSM_BPS // ratio] * 3
+        + [_CURSOR_BPS],
+        "dst_slot_index": 3,
+        "consumer_dcp_size": 2,
+        "consumer_dcp_rank": 1,
+        "consumer_dcp_interleave": 1,
+        "consumer_tp_size": consumer_tp_size,
+        "consumer_tp_rank": consumer_tp_rank,
+    }
+
+
+def _run_slot_transfer(mc, connector, request_data):
+    return mc.MooncakeConnector._execute_block_slot_transfer(
+        connector,
+        request_data,
+        "consumer:1234",
+        [0, 1, 2, 3],
+        [1, 2],
+        {"slot_index": 5},
+        "req-1",
+    )
+
+
+def test_pp_stage_relayouts_kv_and_splits_kda_state_for_a_dcp_tp_consumer():
+    np = pytest.importorskip("numpy")
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    nic = _ByteNic()
+    # Token t of the prompt (block t // 4) is eight bytes of t + 1; every
+    # state byte is distinct.
+    for t in range(4 * _BLOCK):
+        nic.mem[_MLA_SRC + t * _TOKEN_BYTES : _MLA_SRC + (t + 1) * _TOKEN_BYTES] = t + 1
+    nic.mem[_CONV_SRC : _CURSOR_SRC + _SRC_SLOTS * _CURSOR_BPS] = np.arange(
+        _CURSOR_SRC + _SRC_SLOTS * _CURSOR_BPS - _CONV_SRC, dtype=np.uint8
+    )
+    before = nic.mem.copy()
+
+    assert _run_slot_transfer(mc, _pp_stage_connector(mc, nic), _dcp_tp_request())
+
+    conv = before[_CONV_SRC + 5 * _CONV_BPS : _CONV_SRC + 6 * _CONV_BPS]
+    ssm = before[_SSM_SRC + 5 * _SSM_BPS : _SSM_SRC + 6 * _SSM_BPS]
+    cursor = before[_CURSOR_SRC + 5 * _CURSOR_BPS : _CURSOR_SRC + 6 * _CURSOR_BPS]
+    landed = [
+        # DCP rank 1 of 2 at interleave 1 owns the odd tokens, packed in order
+        # into destination blocks 1 and 2 of the peer's second MLA layer.
+        (
+            _DST_MLA[1] + _BPB,
+            np.repeat(np.arange(2, 17, 2, dtype=np.uint8), _TOKEN_BYTES),
+        ),
+        # TP rank 1 of 2 holds the second half of every q, k and v run in each
+        # conv row and the second half of the SSM heads; the cursor lands whole.
+        (
+            _DST_SLOT[2] + 3 * (_CONV_BPS // 2),
+            conv.reshape(_CONV_ROWS, 3, 2, _CONV_RUN // 2)[:, :, 1].ravel(),
+        ),
+        (_DST_SLOT[5] + 3 * (_SSM_BPS // 2), ssm[_SSM_BPS // 2 :]),
+        (_DST_SLOT[6] + 3 * _CURSOR_BPS, cursor),
+    ]
+    written = np.zeros_like(nic.mem, dtype=bool)
+    for dst, want in landed:
+        assert (nic.mem[dst : dst + want.size] == want).all()
+        written[dst : dst + want.size] = True
+    assert (nic.mem[~written] == before[~written]).all()
+
+
+@pytest.mark.parametrize(
+    "producer_tp, consumer_tp, consumer_rank, ssm_segments, match",
+    [
+        # Consumer rank 2 of 4 holds heads [H/2, 3H/4), none of producer rank
+        # 0's [0, H/2): the `tp_rank % remote_tp_size` pairing, which is right
+        # for replicated KV and wrong for sharded state.
+        (2, 4, 2, True, "holds no part"),
+        (2, 3, 1, True, "not a multiple"),
+        (1, 2, 1, False, "cannot split"),
+    ],
+)
+def test_a_tp_split_the_state_cannot_take_is_refused(
+    producer_tp, consumer_tp, consumer_rank, ssm_segments, match
+):
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    connector = _pp_stage_connector(
+        mc, _ByteNic(), tp_size=producer_tp, ssm_segments=ssm_segments
+    )
+    request = _dcp_tp_request(consumer_tp, consumer_rank, consumer_tp // producer_tp)
+
+    with pytest.raises(RuntimeError, match=match):
+        _run_slot_transfer(mc, connector, request)
 
 
 def test_dcp_index_staging_waits_for_request_ready_event():
