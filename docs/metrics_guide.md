@@ -101,7 +101,7 @@ Observed in each scheduler; exported per DP rank. All carry
 | `atom:pd_kv_transfer_seconds` | Histogram, s | Decode-side PD KV load wait until all workers report completion; includes dispatch, handshake and notification. Successful loads only. |
 | `atom:pd_admission_pending_requests` | Gauge, requests | Decode-side PD requests holding admission credits, by `state` (`receiving`, `ready`, `cancel_draining`). |
 | `atom:pd_admission_pending_kv_bytes` | Gauge, bytes | Physical receive-target bytes those requests hold, per D rank. |
-| `atom:pd_admission_deferred` | Counter, requests | Requests deferred by an admission limit, once per request and `reason` (`bytes`). |
+| `atom:pd_admission_deferred` | Counter, requests | Requests deferred by an admission limit, once per admission wait and `reason` (`bytes`). |
 | `atom:decode_batch_size` | Histogram, requests | Real decode request rows per forward (`ScheduledBatch.total_seqs_num_decode`). Excludes dummy work and graph padding. |
 | `atom:prefill_request_tokens` | Histogram, tokens | `num_prompt_tokens - batch.num_cached_tokens` at first local prefill dispatch, floored at 0. Once per request. |
 | `atom:prefill_batch_tokens` | Histogram, tokens | `total_tokens_num_prefill` per real forward. One sample per chunk; excludes cached prefix, decode tokens and padding. |

@@ -96,7 +96,7 @@ class PdAdmissionController:
         self._block_manager = block_manager
         self.pending: dict[str, PendingReceive] = {}
         self._block_refs: dict[int, int] = {}
-        # Requests deferred, once per request and limit, for the metrics
+        # Requests deferred, once per admission wait and limit, for the metrics
         # snapshot. `_deferred_by` holds the limits each waiting request hit.
         self.deferred = {"bytes": 0}
         self._deferred_by: dict[str, set[str]] = {}
@@ -147,8 +147,8 @@ class PdAdmissionController:
         if self.pending_bytes + receive_blocks * self.block_bytes <= self.max_bytes:
             return True, plan
         reason = "bytes"
-        # One deferral per request and limit, however many passes it waits;
-        # a repeated wait allocates nothing.
+        # One deferral per admission wait and limit, however many passes it
+        # takes; a repeated pass allocates nothing.
         key = str(seq.id)
         reasons = self._deferred_by.get(key)
         if reasons is None:

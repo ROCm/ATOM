@@ -511,7 +511,7 @@ class _AtomMetricsCollector:
         )
         deferred = CounterMetricFamily(
             "atom:pd_admission_deferred",
-            "PD requests deferred by a credit limit, counted once per request and limit.",
+            "PD requests deferred by a credit limit, counted once per admission wait and limit.",
             labels=["dp_rank", "engine_role", "reason"],
         )
         for rank in ranks:
