@@ -403,6 +403,20 @@ for _key, _knobs in list(SCHEDULES.items()):
 _put(BOTH, range(33, 49), WQB_ROWS=None)
 _put((WINDOW, ENGRAM) + split((WINDOW, ENGRAM)), BAND_ROWS, SPILL_OK=True)
 
+# TP-keyed entries over the (kind, rows) ones (``knobs(tp=)``): (tp, kind, rows) -> knobs, a split kind taking its
+# base kind's. TP8 serves one request's verify (6 rows; the DSpark draft's stages at 5), measured on MI355X with the
+# step bench (a c1 decode step at 1K / 128K context, GSM8K-gated; runs/bench/hi_knobs):
+# - the routed MoE's ug at 4 row groups a task and down at 16, which puts down on its work queue: TP8's experts are
+#   288 columns wide a rank, half TP4's, and the (8, 32) the TP4 entry and the groups() rule pick leave the down tasks
+#   too few (128K: 2898 -> 2803 us a step; ug 8 / down 16, 4 / 32, 4 / 8 and 12 / 16 lose or do nothing);
+# - wkv in 2 K slices on the consumers and the index readers (on top: 128K 2803 -> 2785 us, 1K -2..-4 %).
+TP_SCHEDULES: dict[tuple, dict] = {}
+for _k in KINDS:
+    for _r in (5, 6):
+        TP_SCHEDULES[(8, _k, _r)] = {"MOE_UG_G": 4, "MOE_DOWN_G": 16}
+for _k in (*CONSUMERS, IDX1):
+    TP_SCHEDULES[(8, _k, 6)]["WKV_KSPLIT"] = 2
+
 # knobs a chain's launches must agree on (one reads the partials the previous one pushed, in their format): a step's,
 # by its rows (``recipe.rs_pack``), never in a (kind, rows) entry (``knobs`` refuses one)
 CHAIN_KNOBS = ("RS_PACK", "RS_PACK_ROWS")
@@ -426,13 +440,19 @@ def current() -> dict:
 
 
 def knobs(
-    kind: str, rows: int | None, over: dict | None = None, tokens: int = 0
+    kind: str,
+    rows: int | None,
+    over: dict | None = None,
+    tokens: int = 0,
+    tp: int | None = None,
 ) -> dict:
     """Every knob of a ``kind`` layer at ``rows`` (a copy): ``DEFAULT``, the schedule's entry for (kind, rows) and,
     an index source whose context bucket ``tokens`` (its Indexer's n_max x ratio) reaches ``IDX_LONG``, its kind's
     ``LONG``; then ``over``; a knob still "auto" takes ``AUTO``'s value (the recipe resolves the rest: module
     docstring)."""
     entry = copy.deepcopy(_entry(SCHEDULES, kind, rows))
+    if tp is not None:
+        entry.update(TP_SCHEDULES.get((tp, kind.split(SPLIT)[0], rows), {}))
     entry.update(_env_over(kind, rows))
     given = dict(over or {})
     long_from = given.get("IDX_LONG", "auto")
