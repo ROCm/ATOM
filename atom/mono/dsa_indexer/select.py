@@ -1268,21 +1268,11 @@ def _replicated_row(c, r):
     out = rsrc(a["out_idx"])
     if ~long:
         req = request_of(c, r)
-        # The MLA reads every slot of its indptr's span. A capture's warmup
-        # gives a verify row one slot past its context (none, at context 1);
-        # left unwritten it is whatever the buffer last held. Pad it with the
-        # request's first key -- a real step's span is the context itself.
-        end = fx.Int32(
-            bo.buffer_load(rsrc(a["out_ptr"]), r + 1, vec_width=1, dtype=T.i32)
-        )
-        e0, _ = key_block(c, req, fx.Int32(0))
         for k in range_constexpr(-(-topk // THREADS)):
             j = tid + k * THREADS
             if j < ctx:
                 e, row = key_block(c, req, j)
                 bo.buffer_store(e * c["shape"].block_rows + row, out, off + j)
-            if (j >= ctx) & (off + j < end):
-                bo.buffer_store(e0 * c["shape"].block_rows, out, off + j)
     else:
         _replicated_long(c, r, off, out, split)
 
