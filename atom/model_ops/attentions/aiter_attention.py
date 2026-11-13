@@ -299,11 +299,17 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         self._index_work_maps = {}
         self._index_score_workspaces = {}  # its LogitsWorkspace, by the same prefix
         self._index_work_map_blocks = 0
+        # Indexer CP over the NVFP4 index: the decode map, its bound and the scores are
+        # the shard's (blocks b % world == rank) over every index head; (1, 0) is TP.
+        self._index_cp = (1, 0)
         if (
             self._has_sparse_attention
             and self.model_runner.config.index_cache_dtype in ("fp4", "nvfp4")
         ):
             from atom.model_ops.minimax_m3.sparse_attn import SPARSE_BLOCK_SIZE
+
+            if self.model_runner.config.index_cache_dtype == "nvfp4":
+                self._index_cp = self._index_cp_shard()
 
             # The MXFP4 decode scorer's persistent dispatch map (aiter's FlyDSL scorer): its row
             # count is the grid, so the bound is the model length, and the buffer is
@@ -311,7 +317,8 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             # widest step; a plain decode step (S=1) builds into the same buffer. The
             # scores are allocated per call, like the Triton scorers'.
             self._index_work_map_blocks = cdiv(
-                self.model_runner.config.max_model_len, SPARSE_BLOCK_SIZE
+                cdiv(self.model_runner.config.max_model_len, SPARSE_BLOCK_SIZE),
+                self._index_cp[0],
             )
             self._index_work_maps[""] = self._alloc_index_work_map(
                 self.max_bs, max_qlen
@@ -384,7 +391,11 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         bakes a stable pointer; never filled (see
         `MiniMaxM3SparseMetadata.index_score_workspace`)."""
         return LogitsWorkspace(
-            self._num_idx_heads * max_rows * self._index_work_map_blocks, self.device
+            self._num_idx_heads
+            * self._index_cp[0]
+            * max_rows
+            * self._index_work_map_blocks,
+            self.device,
         )
 
     def _alloc_index_work_map(self, max_batch: int, max_query_len: int):
@@ -394,11 +405,13 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         if max_batch > 0:
             from aiter.ops.flydsl import minimax_m3_index_score_work_map_capacity
 
+            cp_world, cp_rank = self._index_cp
             rows = minimax_m3_index_score_work_map_capacity(
                 max_batch,
                 self._index_work_map_blocks,
                 max_query_len,
-                self._num_idx_heads,
+                self._num_idx_heads * cp_world,
+                **({"cp_world": cp_world, "cp_rank": cp_rank} if cp_world > 1 else {}),
             )
         return torch.empty((rows, 2), dtype=torch.int32, device=self.device)
 
@@ -769,7 +782,21 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             "index_work_map_out": work_map,
             "index_work_map_max_block": self._index_work_map_blocks,
             "index_score_workspace": self._index_score_workspaces[prefix],
+            "index_cp": self._index_cp,
         }
+
+    @staticmethod
+    def _index_cp_shard() -> tuple[int, int]:
+        """This rank's indexer-CP ``(world, rank)``, ``(1, 0)`` without CP."""
+        from atom.distributed.indexer_cp import (
+            get_indexer_cp_rank,
+            get_indexer_cp_world_size,
+            indexer_cp_enabled,
+        )
+
+        if not indexer_cp_enabled():
+            return 1, 0
+        return get_indexer_cp_world_size(), get_indexer_cp_rank()
 
     def _get_sparse_attention_block_tables(
         self,

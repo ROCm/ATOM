@@ -165,6 +165,68 @@ def indexer_context_scores(
     return scores
 
 
+def indexer_context_scores_nvfp4(
+    idx_q,
+    index_cache,
+    block_table,
+    seq_lens,
+    max_seq_len,
+    rank,
+    world_size,
+    max_query_len,
+    sm_scale,
+    work_map,
+    local_blocks,
+    workspace,
+):
+    """`indexer_context_scores` over the NVFP4 index cache, by aiter's FlyDSL scorer.
+
+    This rank scores every index head over its blocks ``b % world_size == rank`` into
+    a contiguous ``[heads, tokens, local_blocks]`` view of ``workspace`` (the
+    builder's persistent `LogitsWorkspace`), in the same round-robin order the
+    Triton scorer writes. ``work_map`` is the step's shard map, built in the decode
+    metadata at ``local_blocks`` = ``ceil(model blocks / world_size)`` over
+    ``heads`` heads. A row is written only up to its own blocks; `local_candidate_keys`
+    masks every column past them.
+    """
+    from aiter.ops.flydsl import minimax_m3_index_score_nvfp4_flydsl
+
+    from atom.model_ops.minimax_m3.index_topk import INDEX_NVFP4_K_ROUND
+    from atom.model_ops.minimax_m3.nvfp4_pages import index_page_views
+
+    if work_map is None or workspace is None:
+        raise ValueError(
+            "the NVFP4 index CP decode needs the step's shard work map and the "
+            "score workspace"
+        )
+    if triton.cdiv(triton.cdiv(max_seq_len, 128), world_size) > local_blocks:
+        raise ValueError(
+            f"a context of {max_seq_len} tokens is wider than the {local_blocks} "
+            "blocks a shard of the work map was built at"
+        )
+    tokens, heads, _ = idx_q.shape
+    scores = workspace.logits(heads * tokens, local_blocks).view(
+        heads, tokens, local_blocks
+    )
+    k_data, k_scale = index_page_views(index_cache)
+    return minimax_m3_index_score_nvfp4_flydsl(
+        idx_q,
+        k_data,
+        k_scale,
+        block_table,
+        seq_lens,
+        max_query_len,
+        heads,
+        sm_scale,
+        local_blocks,
+        out=scores,
+        work_map=work_map,
+        k_round=INDEX_NVFP4_K_ROUND,
+        cp_world=world_size,
+        cp_rank=rank,
+    )
+
+
 def select_global_blocks(
     scores, block_table, seq_lens, topk, init_blocks, local_blocks, max_query_len
 ):

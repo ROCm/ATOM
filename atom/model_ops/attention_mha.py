@@ -1860,7 +1860,13 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         return output
 
     def _cp_index_topk_decode(
-        self, index_q, block_table, seq_lens, max_seq_len, max_query_len
+        self,
+        index_q,
+        block_table,
+        seq_lens,
+        max_seq_len,
+        max_query_len,
+        sparse_metadata=None,
     ):
         """Decode top-k with the context sharded across the indexer-CP group.
 
@@ -1871,6 +1877,12 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
 
         Only the shard's own top-k crosses the wire, so the payload is
         world*topk keys per token at any context length.
+
+        The NVFP4 index cache is scored by aiter's FlyDSL scorer on the step's shard
+        work map, into the builder's workspace (``sparse_metadata``); without them (a
+        step whose metadata carries no scorer buffers) the map and the scores are
+        made here. The NVFP4 KV reads the logical block ids, so its merge emits no
+        page-16 block table.
         """
         from atom.distributed.indexer_cp import exchange_candidates
         from atom.model_ops.minimax_m3.indexer_candidate_exchange import (
@@ -1879,20 +1891,59 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         )
         from atom.model_ops.minimax_m3.indexer_context_parallel import (
             indexer_context_scores,
+            indexer_context_scores_nvfp4,
         )
 
         global_blocks = block_table.shape[1]
-        scores = indexer_context_scores(
-            index_q,
-            self.index_cache,
-            block_table,
-            seq_lens,
-            max_seq_len,
-            self.indexer_cp_rank,
-            self.indexer_cp_world,
-            max_query_len,
-            self.scale,
-        )
+        if self.index_cache_dtype == "nvfp4":
+            work_map = getattr(sparse_metadata, "index_work_map", None)
+            workspace = getattr(sparse_metadata, "index_score_workspace", None)
+            local = getattr(sparse_metadata, "index_work_map_max_block", 0)
+            if work_map is None or workspace is None:
+                from aiter.ops.flydsl import minimax_m3_index_score_work_map
+
+                from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace
+
+                world = self.indexer_cp_world
+                local = (-(-max_seq_len // 128) + world - 1) // world
+                heads = index_q.shape[1]
+                work_map = minimax_m3_index_score_work_map(
+                    seq_lens,
+                    local,
+                    max_query_len,
+                    heads,
+                    cp_world=self.indexer_cp_world,
+                    cp_rank=self.indexer_cp_rank,
+                )
+                workspace = LogitsWorkspace(
+                    heads * index_q.shape[0] * local, index_q.device
+                )
+            scores = indexer_context_scores_nvfp4(
+                index_q,
+                self.index_cache,
+                block_table,
+                seq_lens,
+                max_seq_len,
+                self.indexer_cp_rank,
+                self.indexer_cp_world,
+                max_query_len,
+                self.scale,
+                work_map,
+                local,
+                workspace,
+            )
+        else:
+            scores = indexer_context_scores(
+                index_q,
+                self.index_cache,
+                block_table,
+                seq_lens,
+                max_seq_len,
+                self.indexer_cp_rank,
+                self.indexer_cp_world,
+                max_query_len,
+                self.scale,
+            )
         # Forced blocks are pinned in BOTH passes on purpose: one that lost its
         # owner shard's top-k would never arrive at the merge to be pinned.
         keys = local_candidate_keys(
@@ -1914,6 +1965,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             self.init_blocks,
             self.local_blocks,
             max_query_len,
+            emit_sparse_block_table=self.kv_cache_dtype != "nvfp4",
         )
 
     @mark_trace(prefix="sparse_attention_decode", torch_compile=False)
@@ -1959,6 +2011,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                     decode_md.seq_lens,
                     sparse_metadata.max_seq_len,
                     max_query_len,
+                    sparse_metadata,
                 )
             else:
                 nvfp4 = self.kv_cache_dtype == "nvfp4"

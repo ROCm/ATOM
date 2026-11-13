@@ -175,6 +175,7 @@ def make_sparse_decode_metadata(
     index_work_map_out: torch.Tensor | None = None,
     index_work_map_max_block: int = 0,
     index_score_workspace: LogitsWorkspace | None = None,
+    index_cp: tuple[int, int] = (1, 0),
 ) -> MiniMaxM3SparseMetadata:
     """``index_score_workspace`` is the scorer's score storage (capacity at least
     ``heads * rows * index_work_map_max_block``), carried through to the selection.
@@ -186,6 +187,10 @@ def make_sparse_decode_metadata(
     selector and attention run (pad requests of a padded step: length 0): the map's
     encoding and grid and the head offsets of ``n_valid_column_per_row`` all follow
     that batch.
+    ``index_cp`` is this rank's indexer-CP ``(world, rank)``: under CP the map is the
+    shard's (blocks ``b % world == rank``), over every index head
+    (``num_idx_heads * world``), and ``index_work_map_max_block`` is the shard's
+    bound; ``n_valid_column_per_row`` (the TP selector's) keeps ``num_idx_heads``.
     """
     decode = MiniMaxM3SparseDecodeMetadata(
         seq_lens=seq_lens, block_table=block_table, max_query_len=max_query_len
@@ -195,12 +200,15 @@ def make_sparse_decode_metadata(
     if index_work_map_out is not None and batch > 0:
         from aiter.ops.flydsl import minimax_m3_index_score_work_map
 
+        cp_world, cp_rank = index_cp
+        shard = {"cp_world": cp_world, "cp_rank": cp_rank} if cp_world > 1 else {}
         index_work_map = minimax_m3_index_score_work_map(
             seq_lens,
             index_work_map_max_block,
             max_query_len,
-            num_idx_heads,
+            num_idx_heads * cp_world,
             out=index_work_map_out,
+            **shard,
         )
     return MiniMaxM3SparseMetadata(
         seq_lens=seq_lens,
