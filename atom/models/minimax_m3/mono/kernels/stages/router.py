@@ -247,7 +247,7 @@ def router_defs(k4ctx):
                 for qq in range(2)
                 for i, f in enumerate(bf2_f32(arow[h][qq]))
             ]
-            if const_expr(AG_RS):
+            if const_expr(AG_RS):  # noqa: SIM102
                 # h_mid = bf16(bf16(sum) + residual): task t writes slice t
                 if tid // (XN_SLICE // RE) == t:
                     hw = (k * HIDDEN + tid * RE) // 2
@@ -287,7 +287,7 @@ def router_defs(k4ctx):
                 )
             gpu.barrier()
             stamp(25)
-            if const_expr(A16N):
+            if const_expr(A16N):  # noqa: SIM102
                 # the slice's bf16 words for the routed experts (a16w4), tagged
                 if tid < XN_SLICE // 2:
                     mb_put_words(
@@ -299,7 +299,7 @@ def router_defs(k4ctx):
                             )
                         ],
                     )
-            if const_expr(A16W):
+            if const_expr(A16W):  # noqa: SIM102
                 # wide: the slice's bf16 words as plain words (the flag below follows them)
                 if tid < XN_SLICE // 2:
                     bo.buffer_store(

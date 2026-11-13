@@ -646,6 +646,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MiniMax-M3 mono: log (rank 0) how many decode steps took mono and how many the
     # original path, by token count, every this many counted decode steps; 0 off.
     "ATOM_MONO_STATS_EVERY": lambda: int(os.getenv("ATOM_MONO_STATS_EVERY", "0")),
+    # MiniMax-M3 hybrid decode (mono/hybrid.py): steps of 17..64 tokens run the mono front
+    # half + the production back half (router, aiter MoE, shared expert, FFN all-reduce).
+    # Off by default: n <= 16 stays on the full mono path either way.
+    "ATOM_MONO_HYBRID": lambda: os.getenv("ATOM_MONO_HYBRID", "0") == "1",
+    # The wide full-mono layer builds (32 / 64 rows: front half + MoE back half kernels, two
+    # launches a layer; mono/hybrid.py ``wide``). Off by default.
+    "ATOM_MONO_WIDE": lambda: os.getenv("ATOM_MONO_WIDE", "0") == "1",
+    # The per-width path table over the defaults (mono/policy.py): "17-64:hybrid,48:production".
+    "ATOM_MONO_WIDTHS": lambda: os.getenv("ATOM_MONO_WIDTHS"),
+    # The hybrid front half: "prod" (the original attention half; the stand-in) or "mono".
+    "ATOM_MONO_HYBRID_FRONT": lambda: os.getenv("ATOM_MONO_HYBRID_FRONT"),
     # Mono wide MoE with the MXFP8 shared expert: 0 off; k > 0 the shared pairs run first on
     # their hosts, their tiles loaded before the router's scores arrive, hosts carry k routed pairs fewer.
     "ATOM_MONO_SH_FIRST": lambda: int(os.getenv("ATOM_MONO_SH_FIRST", "0")),

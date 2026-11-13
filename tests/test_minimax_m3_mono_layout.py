@@ -77,3 +77,37 @@ def test_index_heads_locate_the_fused_projection_segments(count, own):
 def test_index_heads_reject_other_head_sets(count, own):
     with pytest.raises(AssertionError):
         IndexHeads(count, own)
+
+
+def test_row_capacity_is_whole_sixteen_row_groups():
+    assert [layout.row_cap(n) for n in (1, 16, 17, 32, 33, 64)] == [
+        16,
+        16,
+        32,
+        32,
+        48,
+        64,
+    ]
+
+
+def test_sixteen_row_layouts_are_the_default_ones():
+    """The n <= 16 builds' offsets (so their code objects) do not move."""
+    assert layout.scratch_layout(MAX_TOKENS) == layout.SCRATCH
+    assert layout.sym_layout(4, MAX_TOKENS) == layout.sym_layout(4)
+
+
+@pytest.mark.parametrize("rows", [32, 48, 64])
+def test_front_layouts_hold_every_row_and_the_hand_off_regions(rows):
+    sc = {n: e - s for n, s, e in _regions(layout.scratch_layout(rows))}
+    assert sc["xmoe"] >= rows * HIDDEN * 2 and sc["xmoe_done"] >= rows * 8
+    assert sc["attnq_s"] >= rows * 8 and sc["iscore"] >= rows * 8192 * 8
+    sy = {n: e - s for n, s, e in _regions(layout.sym_layout(4, rows))}
+    assert sy["attn"] >= 4 * rows * HIDDEN * 4 and sy["a_ag"] >= rows * HIDDEN * 4
+
+
+@pytest.mark.parametrize("tokens", [17, 24, 32, 40, 48, 56, 64])
+def test_front_stage_tasks_stay_in_order(tokens):
+    b = layout.front_stage_bases(tokens)
+    # split tasks first, then merge, o and post start past the tasks before them
+    assert b["merge"] == layout.N_SPLIT * tokens
+    assert b["o"] == b["merge"] + tokens and b["post"] == b["o"] + layout.N_O

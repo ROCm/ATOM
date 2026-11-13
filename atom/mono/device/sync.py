@@ -21,12 +21,12 @@ POLL_MAX = 12  # mailbox specs polled per batch (bounds live registers)
 
 
 @traced
-def _spin(load_all, pending):
-    """Re-issue ``load_all`` until ``pending`` clears; a side-effecting op in the
-    loop keeps the loads from being hoisted."""
+def _spin(load_all, pending, sleep=1):
+    """Re-issue ``load_all`` until ``pending`` clears (``sleep``: s_sleep units between the
+    loads); a side-effecting op in the loop keeps the loads from being hoisted."""
     v = load_all()
     while pending(v):
-        rocdl.s_sleep(1)
+        rocdl.s_sleep(sleep)
         v = load_all()
     return v
 
@@ -45,14 +45,14 @@ DIAG_TICKS = 10 * 100_000_000
 
 
 @traced
-def _spin_bounded(load_all, pending, diag, region_id, index, tag):
+def _spin_bounded(load_all, pending, diag, region_id, index, tag, sleep=1):
     """``_spin`` giving up after DIAG_TICKS: the CTA's record in ``diag`` names the
     wait (the runner raises with it after the step), and the kernel runs on."""
     t0 = memrealtime()
     v = load_all()
     late = fx.Int32(0)
     while pending(v) & (late == 0):
-        rocdl.s_sleep(1)
+        rocdl.s_sleep(sleep)
         v = load_all()
         late = (memrealtime() - t0 > DIAG_TICKS).select(fx.Int32(1), fx.Int32(0))
     if late != 0:
@@ -171,26 +171,30 @@ class Mailbox:
             cache_modifier=_SCOPE_CM[a.space],
         )
 
-    def spin(self, a, index, load_all, pending):
+    def spin(self, a, index, load_all, pending, sleep=1):
         """Re-issue ``load_all`` until ``pending`` clears: a wait in region
         ``a`` (its word ``index``), bounded and named in a debug build's
         report like every pair's (``poll``). A wait on plain words (counts
         that say themselves when they are in) comes this way too."""
         if const_expr(self.diag is None):
-            return _spin(load_all, pending)
+            return _spin(load_all, pending, sleep)
         rid = self.region_ids.get(a.region, -1)
-        return _spin_bounded(load_all, pending, self.diag, rid, index, self.tag)
+        return _spin_bounded(load_all, pending, self.diag, rid, index, self.tag, sleep)
 
-    def poll(self, specs, batch=POLL_MAX):
+    def poll(self, specs, batch=POLL_MAX, sleep=1):
         """Batched poll of pairs ``specs`` = [(Addr, pair index, npairs in {1, 2})],
         each loaded at its own space's scope.
 
         All pairs are re-loaded together while any tag is stale, so a batch costs
-        one round trip after its last producer lands. Returns the value words."""
+        one round trip after its last producer lands. Returns the value words. ``sleep``:
+        s_sleep units (64 clocks) between the re-loads, more for a wait many waves make on
+        the same lines."""
         if const_expr(len(specs) == 0):
             return []
         if const_expr(len(specs) > batch):
-            return self.poll(specs[:batch], batch) + self.poll(specs[batch:], batch)
+            return self.poll(specs[:batch], batch, sleep) + self.poll(
+                specs[batch:], batch, sleep
+            )
         cms = [_SCOPE_CM[a.space] for a, _, _ in specs]
         bases = [_noted(a, "poll") for a, _, _ in specs]
         tag = self.tag
@@ -223,7 +227,7 @@ class Mailbox:
         ):
             v = load_all()
         else:
-            v = self.spin(specs[0][0], specs[0][1], load_all, pending)
+            v = self.spin(specs[0][0], specs[0][1], load_all, pending, sleep)
         outs, e = [], 0
         for _, _, n in specs:
             outs.append([v[e + 2 * q] for q in range(n)])

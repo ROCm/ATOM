@@ -44,10 +44,13 @@ def _f32(x: float) -> float:
 
 TL_POINTS = 32  # timeline stamps per CTA
 K1_STAMPS = {1: 27, 2: 28, 3: 29, 4: 30, 6: 31}  # fuse_k1: K1's points -> K4's
+# (a front build's scorers also stamp their phases, K1 points 5, 7 - 9 on the MoE stages' free 11, 7 - 9)
+K1_STAMPS |= {5: 11, 7: 7, 8: 8, 9: 9, 10: 10, 11: 16, 12: 21}
 CAND_CAP = 256  # a long share's candidates counted against each other
 # blocks a thread keys in its split task's eighth of a context (<= MAX_INDEX_BLOCKS)
 CAND_BATCH = 2
 assert N_SPLIT * THREADS * CAND_BATCH >= MAX_INDEX_BLOCKS
+
 # Indexer context parallelism: a long context's split task p scans index head
 # p // 2's scores of half p % 2 of this rank's blocks -- as many as a TP split task
 # scans -- for the head's rank. A request is long past LONG_FROM_BLOCKS blocks in

@@ -9,7 +9,9 @@ from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T
 
 from atom.models.minimax_m3.mono.config import (
+    LONG_FROM_BLOCKS,
     MAX_INDEX_BLOCKS,
+    MAX_TOKENS,
     SPARSE_BLOCK,
     TOPK_BLOCKS,
     TP,
@@ -26,6 +28,7 @@ from atom.models.minimax_m3.mono.layout import (
 from atom.mono.device.ops import (
     rsrc,
     traced,
+    uniform,
     unlikely,
 )
 from atom.mono.device.select import (
@@ -72,6 +75,52 @@ def select_defs(k4ctx):
     tokens = k4ctx["tokens"]
     lane = k4ctx["lane"]
     wave = k4ctx["wave"]
+    BIG = tokens > MAX_TOKENS
+    NS = k4ctx["NS"]  # split tasks (and shares of a long selection) a token
+    SPT = TOPK_BLOCKS // NS  # selection slots (blocks) a split task
+    BLK_CTX = (
+        SPT * PAGES_PER_BLOCK
+    )  # blk: the task's pages, then its context length, then the tail flag
+    SH = N_SPLIT  # shares a long selection is made of, the split tasks each work SH // NS of them
+    SPS = SH // NS
+    # (rows past MAX_TOKENS: the rows' context, blocks, long / scored flags are loaded where
+    # they are used, not lists of ``tokens`` scalars)
+    q_len = k4ctx["q_len"]
+    seq_lens = k4ctx["seq_lens"]
+
+    def g_seq_rt(k):
+        """Row k's context, >= 1 (a graph's pad rows carry 0)."""
+        return fx.max(
+            uniform(bo.buffer_load(rsrc(seq_lens), k, vec_width=1, dtype=T.i32)), 1
+        )
+
+    def g_nblk_rt(k):
+        return (g_seq_rt(k) + SPARSE_BLOCK - 1) // SPARSE_BLOCK
+
+    def g_long_rt(k):
+        """The request's last row decides (``step_rows``)."""
+        return g_nblk_rt(k - k % q_len + (q_len - 1)) > LONG_FROM_BLOCKS
+
+    def g_scored_rt(k):
+        return g_nblk_rt(k) > TOPK_BLOCKS
+
+    def g_seq_pk(k):
+        return pick(seq_lens_k, k)
+
+    def g_nblk_pk(k):
+        return pick(n_blks, k)
+
+    def g_long_pk(k):
+        return pick(long_rows, k)
+
+    def g_scored_pk(k):
+        return pick(scored, k)
+
+    g_seq = g_seq_rt if BIG else g_seq_pk
+    g_nblk = g_nblk_rt if BIG else g_nblk_pk
+    g_long = g_long_rt if BIG else g_long_pk
+    g_scored = g_scored_rt if BIG else g_scored_pk
+
     # ``keys`` (LDS words): a share's entries, CAND_BATCH a thread (two words
     # each), then the candidates, their counter, the groups' maxima
     cand_at = 2 * THREADS * CAND_BATCH
@@ -170,9 +219,9 @@ def select_defs(k4ctx):
         sel = live & (rank < n_sel)
         is_tail = sel & (bb == tail)
         if is_tail:
-            fx.ptr_store(fx.Int32(1), blk + 17)
+            fx.ptr_store(fx.Int32(1), blk + (BLK_CTX + 1))
         gpu.barrier()
-        tail_sel = fx.ptr_load(blk + 17) != 0
+        tail_sel = fx.ptr_load(blk + (BLK_CTX + 1)) != 0
         n_full = n_sel - tail_sel.select(fx.Int32(1), fx.Int32(0))
         tail_first = (kt > key) | ((kt == key) & (tail > bb))
         slot = is_tail.select(
@@ -188,10 +237,11 @@ def select_defs(k4ctx):
         """A selected block's pages into blk (when its slot is split task
         ``part``'s) and, part 0, into the token's sparse table; thread 0 the
         sparse context length."""
-        if sel & (slot // 2 == part):
+        if sel & (slot // SPT == part):
             for j in range_constexpr(PAGES_PER_BLOCK):
                 fx.ptr_store(
-                    page * PAGES_PER_BLOCK + j, blk + ((slot % 2) * PAGES_PER_BLOCK + j)
+                    page * PAGES_PER_BLOCK + j,
+                    blk + ((slot % SPT) * PAGES_PER_BLOCK + j),
                 )
         if sel & (part == 0):
             for j in range_constexpr(PAGES_PER_BLOCK):
@@ -199,7 +249,7 @@ def select_defs(k4ctx):
                     page * PAGES_PER_BLOCK + j, table, slot * PAGES_PER_BLOCK + j
                 )
         if tid == 0:
-            fx.ptr_store(n_ctx, blk + 16)
+            fx.ptr_store(n_ctx, blk + BLK_CTX)
             if part == 0:
                 bo.buffer_store(n_ctx, table, TOPK_BLOCKS * PAGES_PER_BLOCK)
 
@@ -214,20 +264,28 @@ def select_defs(k4ctx):
         tail block (the one holding the current token) last. A block's slot
         follows from its rank, the count of blocks that beat it. k: token.
         A long request's blk is ``stage_select_long``'s: nothing runs here."""
-        if ~pick(long_rows, k):
-            place_short(k, t)
+        if const_expr(BIG):
+            # a long request's share is selected here, in its task's round (blk is the
+            # task's, a CTA runs a task a round): all the token's shares are in one round
+            if unlikely(g_long(k)):
+                select_long(k, t)
+            else:
+                place_short(k, t)
+        else:
+            if ~g_long(k):
+                place_short(k, t)
         gpu.barrier()
 
     def place_short(k, t):
         """``select_blocks`` of a short request's token k (every thread)."""
         iscore = shift(mr("iscore"), fx.Int64(k) * (MAX_INDEX_BLOCKS * 8))
-        n_blk = pick(n_blks, k)
-        seq_len = pick(seq_lens_k, k)
+        n_blk = g_nblk(k)
+        seq_len = g_seq(k)
         r_bt = rsrc(bt_row(k))
         table = table_of(k)
-        if tid < 2 * PAGES_PER_BLOCK + 2:
+        if tid < BLK_CTX + 2:
             fx.ptr_store(fx.Int32(0), blk + tid)
-        entry, page, kt = rank_blocks(iscore, n_blk, r_bt, pick(scored, k))
+        entry, page, kt = rank_blocks(iscore, n_blk, r_bt, g_scored(k))
         (sel, slot), n_ctx = place(entry, kt, n_blk, seq_len)
         write_slot(sel, slot, page, n_ctx, t, table)
 
@@ -239,9 +297,9 @@ def select_defs(k4ctx):
         cleared at the step's start and every selection of a token fills the
         same slots."""
         table = table_of(k)
-        if tid < 2 * PAGES_PER_BLOCK + 1:
-            j = (tid < 2 * PAGES_PER_BLOCK).select(
-                2 * t * PAGES_PER_BLOCK + tid, fx.Int32(TOPK_BLOCKS * PAGES_PER_BLOCK)
+        if tid < BLK_CTX + 1:
+            j = (tid < BLK_CTX).select(
+                SPT * t * PAGES_PER_BLOCK + tid, fx.Int32(TOPK_BLOCKS * PAGES_PER_BLOCK)
             )
             fx.ptr_store(
                 fx.Int32(bo.buffer_load(table, j, vec_width=1, dtype=T.i32)), blk + tid
@@ -258,64 +316,70 @@ def select_defs(k4ctx):
         rank's sel_long; with every index head (indexer context parallelism)
         head part // 2's scores of half part % 2 of this rank's blocks, to the
         head's rank's sel_cp -- the shares its own head's candidates come in."""
-        n_blk = pick(n_blks, k)
+        n_blk = g_nblk(k)
         iscore = shift(mr("iscore"), fx.Int64(k) * (MAX_INDEX_BLOCKS * 8))
-        first = k * (N_SPLIT * TOPK_BLOCKS)  # token k's candidates (pair pairs)
+        first = k * (SH * TOPK_BLOCKS)  # token k's candidates (pair pairs)
         table = table_of(k)
         if tid == 0:
-            fx.ptr_store(fx.Int32(0), blk + 17)
-        if const_expr(ih_count > 1):
-            own0 = init_blocks + (ih_own - init_blocks) % TP  # this rank's first
-            n_own = (n_blk - own0 + TP - 1) // TP
-            # the last scored one: the local blocks' slots hold no score
-            last = own0 + TP * ((n_blk - local_blocks - own0 + TP - 1) // TP - 1)
-            span = (n_own + 1) // 2
-            lo = (part % 2) * span
-            hi = fx.min(lo + span, n_own)
-            js = [lo + tid + THREADS * i for i in range(CAND_BATCH)]
-            blocks = [own0 + TP * j for j in js]
-            live = [j < hi for j in js]
-            src = shift(iscore, fx.Int64(part // 2) * (MAX_INDEX_BLOCKS // TP * 8))
-            slots = [fx.min(b, last) // TP for b in blocks]
-            out, out_slot = (
-                preg(peer_addr(part // 2), SY["sel_cp"], "sel_cp"),
-                2 * rank,
-            )
-            out_slot = out_slot + part % 2
-            got_from = preg(sym, SY["sel_cp"], "sel_cp")
-        else:
-            span = (n_blk + N_SPLIT - 1) // N_SPLIT
-            lo = part * span
-            hi = fx.min(lo + span, n_blk)
-            blocks = [lo + tid + THREADS * i for i in range(CAND_BATCH)]
-            live = [b < hi for b in blocks]
-            src = iscore
-            slots = [
-                fx.min(fx.max(b, init_blocks), n_blk - 1 - local_blocks) for b in blocks
-            ]
-            out, out_slot = mr("sel_long"), part
-            got_from = out
-        if const_expr(fuse_k1):
-            words = [w[0] for w in mb_poll([(src, sl, 1) for sl in slots])]
-        else:
-            words = [
-                fx.Int32(
-                    bo.buffer_load(rsrc(src.value), 2 * sl, vec_width=1, dtype=T.i32)
+            fx.ptr_store(fx.Int32(0), blk + (BLK_CTX + 1))
+        for sh in range_constexpr(SPS):
+            # (a split task works SPS of the SH shares one after the other, 1: its own)
+            share = part if SPS == 1 else part * SPS + sh
+            if const_expr(ih_count > 1):
+                own0 = init_blocks + (ih_own - init_blocks) % TP  # this rank's first
+                n_own = (n_blk - own0 + TP - 1) // TP
+                # the last scored one: the local blocks' slots hold no score
+                last = own0 + TP * ((n_blk - local_blocks - own0 + TP - 1) // TP - 1)
+                span = (n_own + 1) // 2
+                lo = (share % 2) * span
+                hi = fx.min(lo + span, n_own)
+                js = [lo + tid + THREADS * i for i in range(CAND_BATCH)]
+                blocks = [own0 + TP * j for j in js]
+                live = [j < hi for j in js]
+                src = shift(iscore, fx.Int64(share // 2) * (MAX_INDEX_BLOCKS // TP * 8))
+                slots = [fx.min(b, last) // TP for b in blocks]
+                out, out_slot = (
+                    preg(peer_addr(share // 2), SY["sel_cp"], "sel_cp"),
+                    2 * rank,
                 )
-                for sl in slots
-            ]
-        # the share's entry tid + THREADS i is its block i of this thread's
-        hs = [index_key(b, w, n_blk) for b, w in zip(blocks, words)]
-        cnts = rank_in_cta(list(zip(hs, blocks, live)), hi - lo)
-        # a share holds >= TOPK_BLOCKS blocks: its 16 best have distinct ranks
-        for h, b, lv, c in zip(hs, blocks, live, cnts):
-            if lv & (c < TOPK_BLOCKS):
-                mb_put_words(out, 2 * (first + out_slot * TOPK_BLOCKS + c), [h, b])
-        gpu.barrier()
+                out_slot = out_slot + share % 2
+                got_from = preg(sym, SY["sel_cp"], "sel_cp")
+            else:
+                span = (n_blk + SH - 1) // SH
+                lo = share * span
+                hi = fx.min(lo + span, n_blk)
+                blocks = [lo + tid + THREADS * i for i in range(CAND_BATCH)]
+                live = [b < hi for b in blocks]
+                src = iscore
+                slots = [
+                    fx.min(fx.max(b, init_blocks), n_blk - 1 - local_blocks)
+                    for b in blocks
+                ]
+                out, out_slot = mr("sel_long"), share
+                got_from = out
+            if const_expr(fuse_k1):
+                words = [w[0] for w in mb_poll([(src, sl, 1) for sl in slots])]
+            else:
+                words = [
+                    fx.Int32(
+                        bo.buffer_load(
+                            rsrc(src.value), 2 * sl, vec_width=1, dtype=T.i32
+                        )
+                    )
+                    for sl in slots
+                ]
+            # the share's entry tid + THREADS i is its block i of this thread's
+            hs = [index_key(b, w, n_blk) for b, w in zip(blocks, words)]
+            cnts = rank_in_cta(list(zip(hs, blocks, live)), hi - lo)
+            # a share holds >= TOPK_BLOCKS blocks: its 16 best have distinct ranks
+            for h, b, lv, c in zip(hs, blocks, live, cnts):
+                if lv & (c < TOPK_BLOCKS):
+                    mb_put_words(out, 2 * (first + out_slot * TOPK_BLOCKS + c), [h, b])
+            gpu.barrier()
         # the shares' candidates (every share sends TOPK_BLOCKS distinct ranks:
         # all live), a thread each, ranked among themselves (``count_beaten``);
         # a candidate's page load goes out before the count, under it
-        n_c = N_SPLIT * TOPK_BLOCKS
+        n_c = SH * TOPK_BLOCKS
         if tid < n_c:
             got = mb_poll([(got_from, 2 * (first + tid), 2)])[0]
             fx.ptr_store(got[1], keys + 2 * tid)  # put_key's (block, key)
@@ -331,7 +395,7 @@ def select_defs(k4ctx):
         stamp(19)
         # the tail block is a local one: its key is forced
         kt = index_key(n_blk - 1, fx.Int32(0), n_blk)
-        (sel, slot), n_ctx = place((ch, cl, cnt, held), kt, n_blk, pick(seq_lens_k, k))
+        (sel, slot), n_ctx = place((ch, cl, cnt, held), kt, n_blk, g_seq(k))
         write_slot(sel, slot, page, n_ctx, part, table)
         gpu.barrier()
 
@@ -340,10 +404,12 @@ def select_defs(k4ctx):
         split stage (``select_long``), each leaving its blk for its split task
         (a CTA runs at most one). Out of the split stage and cold: inline
         there, this code slowed the split for every context (64k: +1 us)."""
+        if const_expr(BIG):
+            return  # in the split stage's rounds (``select_blocks``)
         ts = start("split")
-        k = ts // N_SPLIT
-        if unlikely((ts < N_SPLIT * tokens) & pick(long_rows, k)):
-            select_long(k, ts % N_SPLIT)
+        k = ts // NS
+        if unlikely((ts < NS * tokens) & g_long(k)):
+            select_long(k, ts % NS)
 
     return {
         "bt_row": bt_row,

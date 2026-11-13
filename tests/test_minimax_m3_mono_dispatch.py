@@ -186,14 +186,16 @@ def _forward_context(md=None, is_prefill=False, ubatch_slices=None):
     )
 
 
-def _mono(monkeypatch, fwd, builds=True):
+def _mono(monkeypatch, fwd, builds=True, **policy):
     """An enabled MonoDecode whose runner already exists (no GPU work); its kernels
     build on every rank when ``builds``."""
     mono = dispatch.MonoDecode.__new__(dispatch.MonoDecode)
     mono._lm = SimpleNamespace(model=SimpleNamespace(aux_hidden_state_layers=()))
     mono._mono = LazyRunner(None, "MiniMax-M3 mono decode")
-    mono._mono.runner = SimpleNamespace(prepare=lambda n: builds)
-    mono.steps, mono._graph_mono, mono._counted = {False: {}, True: {}}, set(), 0
+    mono._mono.runner = SimpleNamespace(prepare=lambda n, *kind: builds)
+    mono.policy = dispatch.WidthPolicy(**policy)
+    mono.steps = {k: {} for k in ("production", "mono", "hybrid")}
+    mono._graph_kind, mono._graph_logged, mono._counted = {}, set(), 0
     monkeypatch.setattr(dispatch, "get_forward_context", lambda: fwd)
     return mono
 
@@ -204,10 +206,14 @@ def test_steps_are_counted_by_token_count(monkeypatch):
     assert mono.supports(*_step(4), None, None)
     assert not mono.supports(*_step(17), None, None)
     mono.note_replay(4)  # a graph replay: mono's only if its capture took mono
-    mono._graph_mono.add(4)
+    mono._graph_kind[4] = "mono"
     mono.note_replay(4)
     mono.note_replay(32)
-    assert mono.steps == {True: {4: 2}, False: {4: 1, 17: 1, 32: 1}}
+    assert mono.steps == {
+        "mono": {4: 2},
+        "production": {4: 1, 17: 1, 32: 1},
+        "hybrid": {},
+    }
 
 
 def test_install_hands_the_runner_its_replay_counter(monkeypatch):
@@ -255,6 +261,29 @@ def test_a_kernel_no_rank_could_build_is_declined_at_every_width(monkeypatch):
 def test_more_than_max_tokens_take_the_original_path(monkeypatch):
     md = _forward_context(_decode_md(rows=32))
     assert not _mono(monkeypatch, md).supports(*_step(17), None, None)
+
+
+def test_hybrid_and_wide_widths_follow_the_table(monkeypatch):
+    md = _forward_context(_decode_md(rows=64, slots=torch.zeros(64, dtype=torch.int64)))
+    on = _mono(
+        monkeypatch,
+        md,
+        hybrid=True,
+        wide=True,
+        spec="17-31:hybrid,33-63:hybrid,64:mono",
+    )
+    assert on.supports(*_step(17), None, None)  # hybrid
+    assert on.supports(*_step(32), None, None)  # wide mono
+    assert on.supports(*_step(64), None, None)  # wide mono
+    assert not on.supports(*_step(65), None, None)  # above the table
+    assert not _mono(monkeypatch, md).supports(*_step(17), None, None)  # switches off
+    # a pipeline no rank could build declines its widths only
+    assert (
+        _mono(monkeypatch, md, builds=False, hybrid=True).supports(
+            *_step(4), None, None
+        )
+        is False
+    )
 
 
 def test_check_mode_takes_the_same_steps(monkeypatch):
