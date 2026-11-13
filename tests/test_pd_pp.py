@@ -2090,13 +2090,17 @@ def test_a_tp_split_the_state_cannot_take_is_refused(
     mc = pytest.importorskip(
         "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
     )
+    nic = _ByteNic()
+    nic.mem[_MLA_SRC : _MLA_SRC + 4 * _BPB] = 1
     connector = _pp_stage_connector(
-        mc, _ByteNic(), tp_size=producer_tp, ssm_segments=ssm_segments
+        mc, nic, tp_size=producer_tp, ssm_segments=ssm_segments
     )
     request = _dcp_tp_request(consumer_tp, consumer_rank, consumer_tp // producer_tp)
 
     with pytest.raises(RuntimeError, match=match):
         _run_slot_transfer(mc, connector, request)
+    # Refused before Phase 1: no MLA page reached the peer.
+    assert not nic.mem[_DST_MLA[0] : _DST_SLOT[0]].any()
 
 
 def test_pp_stage_stages_its_mla_pages_like_a_block_only_producer(monkeypatch):
