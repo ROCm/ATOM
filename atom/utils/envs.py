@@ -656,6 +656,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # DSpark, ...: `mono/hi_gate.py`), any other keeps ATOM's mono path; "1":
     # on, or an error naming why not; "0": off.
     "ATOM_DSV41_MONO_HI": lambda: os.getenv("ATOM_DSV41_MONO_HI", "auto"),
+    # DeepSeek-V4.1 mono decode's layer kernels (`mono/aiter_gate.py`): "atom"
+    # (default) launches ATOM's in-tree K1 / K2; "aiter" calls AITER's routed
+    # deepseek_v41_decode_attn_pre / _layer_post v1 ops instead, with the
+    # indexer's scoring and top-k run by ATOM between them, and enables the
+    # provider below through `aiter.plugin.configure()`. Explicit opt-in only:
+    # with "aiter" the hi monokernels' "auto" resolves to off (hi "1" is an
+    # error), and the DSpark draft keeps ATOM's in-tree mono.
+    "ATOM_DSV41_MONO_BACKEND": lambda: os.getenv("ATOM_DSV41_MONO_BACKEND", "atom"),
+    # The AITER provider the "aiter" backend enables (its entry-point name).
+    "ATOM_DSV41_MONO_AITER_PROVIDER": lambda: os.getenv(
+        "ATOM_DSV41_MONO_AITER_PROVIDER", "dsv41-mono-provider"
+    ),
+    # With ATOM_DSV41_MONO_BACKEND=aiter: "1" (default) makes a call the
+    # provider does not serve an error (a startup refusal, a declined width, a
+    # call AITER routed to its pure-torch native reference), so an A/B never
+    # measures that fallback silently; "0" warns once and lets AITER fall back.
+    "ATOM_DSV41_MONO_AITER_STRICT": lambda: (
+        os.getenv("ATOM_DSV41_MONO_AITER_STRICT", "1") == "1"
+    ),
     # Token-bucket TR graphs for prefill (`atom/utils/region_graph.py`): the
     # comma-separated token counts to record. A prefill longer than the largest
     # runs eagerly; empty records none. The default tops out at 3072 because
