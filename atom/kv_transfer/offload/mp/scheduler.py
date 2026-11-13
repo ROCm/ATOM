@@ -244,6 +244,16 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         return self._token_shipper.ship(seq, end)
 
     def build_connector_meta(self) -> MPOffloadMetadata:
+        # Shared base advances lookups before it builds metadata. Retirements
+        # inside that build must not pump the same client a second time.
+        depth = self.__dict__.get("_metadata_build_depth", 0)
+        self._metadata_build_depth = depth + 1
+        try:
+            return self._build_mp_connector_meta()
+        finally:
+            self._metadata_build_depth = depth
+
+    def _build_mp_connector_meta(self) -> MPOffloadMetadata:
         try:
             metadata = super().build_connector_meta()
         finally:
@@ -421,9 +431,13 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         L1 objects until the read TTL. So the session ends only after its
         lookup has answered and released its locks.
         """
-        # Detached lookups are reconciled by every metadata build
-        # (`_reconcile_lookups_each_step`), also while the waiting queue, which
+        # Pumped on every pass: a detached lookup must be released even while
+        # its request is still transferring and the waiting queue, which
         # drives `prefetch_lookups`, is empty.
+        # Metadata has already advanced this step; terminal-only calls still
+        # need the shared reconciliation to free detached lookup locks.
+        if not self.__dict__.get("_metadata_build_depth", 0):
+            self._reconcile_lookups_each_step()
         client = self._lookup_client
         pending = self._pending_session_ends()
 
