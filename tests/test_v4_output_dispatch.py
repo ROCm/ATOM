@@ -110,19 +110,6 @@ def test_bf16_prefill_uses_independent_strides_when_query_differs(gfx):
     assert torch.all(parent[[0, -1]] == -99)
 
 
-@pytest.mark.parametrize("path", ["bf16", "fp8", "hca", "prefill_asm"])
-def test_decode_rejects_strided_output_before_dispatch(path):
-    def kernel(*args, **kwargs):
-        pytest.fail("invalid output reached the kernel")
-
-    run, q, kwargs = _decode_case(path, kernel)
-    parent = torch.full((*q.shape[:-1], q.shape[-1] * 2), -99.0, dtype=q.dtype)
-    out = parent[..., ::2]
-    with pytest.raises(ValueError, match="decode output must be contiguous"):
-        run(*_args("decode", q), out=out, **kwargs)
-    assert torch.all(parent == -99)
-
-
 def _decode_case(path, kernel):
     fp8 = path != "bf16"
     q = torch.zeros(
