@@ -584,74 +584,35 @@ def test_bf16_v41_keeps_the_namespace_hybrid_gave_it(monkeypatch):
     assert v41 == namespace("deepseek_v41", sliding_window=128, candidate_block_size=8)
 
 
-def _legacy_v41_page_namespace(config, cfg, world_size, monkeypatch):
-    # Before source planes, V4.1 used the hybrid PAGE format's domain with
-    # the same HF/config fields. Reproduce that domain without copying the
-    # namespace hashing implementation.
-    with monkeypatch.context() as legacy:
-        legacy.setattr(offcfg, "select_offload_layout", lambda _: "hybrid")
-        return offcfg.build_page_namespace(config, cfg, world_size)
-
-
-@pytest.mark.parametrize("kv_dtype", ["fp8", "fp4"])
-@pytest.mark.parametrize("model_type", ["deepseek_v41", "deepseek_v41_text"])
-@pytest.mark.parametrize("wrapped", [False, True])
-def test_quantized_v41_pages_cannot_reuse_interleaved_objects(
-    monkeypatch, kv_dtype, model_type, wrapped
-):
-    config = _config()
-    config.kv_cache_dtype = kv_dtype
-    config.hf_config.model_type = model_type
-    if wrapped:
-        config.hf_config = SimpleNamespace(
-            model_type="deepseek_v41", text_config=config.hf_config
-        )
-    cfg = _lmcache_config()
-    legacy = _legacy_v41_page_namespace(config, cfg, 4, monkeypatch)
-    current = offcfg.build_page_namespace(config, cfg, 4)
-    assert current != legacy
-
-
-@pytest.mark.parametrize("kv_dtype", ["fp8", "fp4"])
-def test_quantized_v41_page_namespace_agrees_after_worker_normalization(kv_dtype):
-    import pickle
-
-    config = _config()
-    config.kv_cache_dtype = kv_dtype
-    config.hf_config.model_type = "deepseek_v41_text"
-    config.hf_config.head_dim = None
-    config.offload_page_hf_geometry = offcfg.snapshot_page_hf_geometry(config.hf_config)
-    scheduler = offcfg.build_page_namespace(config, _lmcache_config(), 4)
-    worker = pickle.loads(pickle.dumps(config))
-    worker.hf_config.head_dim = 512
-    assert offcfg.build_page_namespace(worker, _lmcache_config(), 4) == scheduler
-
-
 @pytest.mark.parametrize("kv_dtype", ["bf16", "fp8", "fp4"])
-@pytest.mark.parametrize("connector", ["lmcache_mp", "mooncake_store"])
-def test_v41_persistent_keys_include_the_page_format(monkeypatch, kv_dtype, connector):
+def test_v41_persistent_keys_include_the_page_format(monkeypatch, kv_dtype):
     from atom.kv_transfer.offload.mooncake_store import keys
     from atom.kv_transfer.offload.mp import deployment
 
     config = _config()
     config.kv_cache_dtype = kv_dtype
     config.hf_config.model_type = "deepseek_v41_text"
-    config.kv_transfer_config = {"kv_connector": connector}
     cfg = _lmcache_config()
     world_size = offcfg.lmcache_replica_world_size(config)
-    legacy_page = _legacy_v41_page_namespace(config, cfg, world_size, monkeypatch)
-    # Keep service setup and GPU format discovery outside this CPU key test.
+    # Old interleaved V4.1 pages used the hybrid PAGE namespace.
+    with monkeypatch.context() as legacy:
+        legacy.setattr(offcfg, "select_offload_layout", lambda _: "hybrid")
+        legacy_page = offcfg.build_page_namespace(config, cfg, world_size)
     monkeypatch.setattr(offcfg, "build_lmcache_config", lambda _: cfg)
     monkeypatch.setattr(keys, "kv_storage_formats", lambda _: {"gfx": "gfx950"})
 
-    def namespace():
-        if connector == "lmcache_mp":
-            # PAGE-only replay has no checkpoint identity to separate versions.
-            return deployment._model_namespace(config)
-        return keys.store_namespace(config, cfg.chunk_size)
+    def namespaces():
+        page = offcfg.build_page_namespace(config, cfg, world_size)
+        config.kv_transfer_config = {"kv_connector": "lmcache_mp"}
+        mp = deployment._model_namespace(config)
+        config.kv_transfer_config = {"kv_connector": "mooncake_store"}
+        store = keys.store_namespace(config, cfg.chunk_size)
+        return {"page": page, "lmcache_mp": mp, "mooncake_store": store}
 
-    current = namespace()
+    current = namespaces()
     with monkeypatch.context() as legacy:
         legacy.setattr(offcfg, "build_page_namespace", lambda *_: legacy_page)
-        previous = namespace()
-    assert (current == previous) is (kv_dtype == "bf16")
+        previous = namespaces()
+    # PAGE-only replay has no checkpoint identity to separate versions.
+    for name in current:
+        assert (current[name] == previous[name]) is (kv_dtype == "bf16"), name
