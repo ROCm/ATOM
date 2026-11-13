@@ -44,6 +44,11 @@ check anything else with explain_flags or search_docs first.
 - Benchmark-only knobs (forced speculative acceptance) never belong in a \
 serving deployment.
 - Answer questions about ATOM from search_docs / read_doc and cite the path.
+- For benchmarks, accuracy checks (GSM8K), profiler traces and debugging, \
+follow the matching skill: load_skill, then do its steps with these tools. \
+The quick `benchmark` tool is only a sanity number; publishable numbers come \
+from the skill's benchmark_serving run. Report the skill's own result lines \
+(e.g. "Total Token throughput", the GSM8K flexible-extract score) verbatim.
 - Report numbers exactly as tools return them. When you explain a number \
 or a failure, say whether the explanation comes from tool output or is your \
 hypothesis, and how to check a hypothesis -- do not present guesses as facts.
@@ -103,3 +108,21 @@ def machine_brief(report: dict) -> str:
             + "; ".join(f"{s['user']} :{s['port']} {s['model']}" for s in servers)
         )
     return "\n".join(lines)
+
+
+def skills_brief(ctx) -> str:
+    """The skill catalog the agent may load, and how to run skill steps."""
+    from atom.agent.skills import ADAPTER_NOTES, catalog_text
+
+    catalog = ctx.skills
+    if not catalog:
+        return ""
+    return (
+        f"Skills ({ctx.skill_source}; profile {ctx.profile}) -- call load_skill "
+        "before following one:\n" + catalog_text(catalog) + "\n\n" + ADAPTER_NOTES
+    )
+
+
+def build_system_prompt(ctx, report: dict) -> str:
+    parts = [SYSTEM_PROMPT, machine_brief(report), skills_brief(ctx)]
+    return "\n".join(p for p in parts if p)

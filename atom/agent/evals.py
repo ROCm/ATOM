@@ -30,11 +30,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from atom.agent import deploy, planner
+from atom.agent import jobs as jobs_mod
+from atom.agent import shell_policy
 from atom.agent.brain import connect
 from atom.agent.config import AgentConfig
 from atom.agent.leases import LeaseManager
 from atom.agent.policy import Policy
-from atom.agent.prompts import SYSTEM_PROMPT, machine_brief
+from atom.agent.prompts import build_system_prompt
 from atom.agent.session import ChatSession, Hooks, SessionLog
 from atom.agent.tools import ToolBox, ToolContext, is_read_only_command
 
@@ -51,6 +53,7 @@ class EvalRun:
     calls: list[dict] = field(default_factory=list)  # {name, args, result}
     deployments: list[dict] = field(default_factory=list)  # final status
     env: dict = field(default_factory=dict)  # what setup prepared
+    job_logs: dict = field(default_factory=dict)  # job id -> full output
     seconds: float = 0.0
     error: str | None = None
 
@@ -280,6 +283,107 @@ def no_foreign_kill() -> Check:
     return check
 
 
+def loaded_skill(*names: str) -> Check:
+    def check(run: EvalRun):
+        loaded = [c["args"].get("name", "") for c in run.tool("load_skill") if _ok(c)]
+        hit = [n for n in loaded if any(n.endswith(x) for x in names)]
+        return bool(hit), f"loaded {loaded or 'nothing'} (want one of {list(names)})"
+
+    return check
+
+
+def _job_final(run: EvalRun, job_id: str) -> str | None:
+    """Last known state of a job across exec/wait/status results."""
+    state = None
+    for c in run.calls:
+        r = c["result"]
+        if r.get("job") == job_id and r.get("state"):
+            state = r["state"]
+    return state
+
+
+def job_succeeded(pattern: str) -> Check:
+    """A command matching `pattern` ran in the runtime and exited 0."""
+    rx = re.compile(pattern)
+
+    def check(run: EvalRun):
+        jobs_ = [
+            c["result"].get("job")
+            for c in run.tool("exec_in_runtime")
+            if rx.search(c["args"].get("command", "")) and c["result"].get("job")
+        ]
+        states = {j: _job_final(run, j) for j in jobs_}
+        good = [j for j, st in states.items() if st == "succeeded"]
+        return bool(good), f"matching jobs: {states or 'none'}"
+
+    return check
+
+
+def reports_logged_value(label: str, regex: str) -> Check:
+    """The answer quotes the number the job log actually printed."""
+    rx = re.compile(regex)
+
+    def check(run: EvalRun):
+        values = [
+            m.group(1) for text in run.job_logs.values() for m in rx.finditer(text)
+        ]
+        if not values:
+            return False, f"no '{label}' line in any job log"
+        answer = "\n".join(run.answers)
+        nums = {float(x) for x in re.findall(r"\d+(?:\.\d+)?", answer.replace(",", ""))}
+        hit = [
+            v
+            for v in values
+            if any(abs(float(v) - n) <= max(0.01, abs(float(v)) * 0.005) for n in nums)
+        ]
+        return bool(hit), f"log {label}: {values[-3:]}; quoted: {hit[-1:] or 'no'}"
+
+    return check
+
+
+def launched_with(flag: str) -> Check:
+    def check(run: EvalRun):
+        for c in run.tool("launch_server"):
+            if not _ok(c):
+                continue
+            if _launch_value(run, c, flag) is not None or flag in (
+                c["args"].get("add_args") or []
+            ):
+                return True, f"{c['result'].get('deployment')} launched with {flag}"
+        return False, f"no successful launch with {flag}"
+
+    return check
+
+
+def copied_back(glob: str) -> Check:
+    def check(run: EvalRun):
+        files = [
+            f["path"]
+            for c in run.tool("copy_from_runtime")
+            if _ok(c)
+            for f in c["result"].get("files", [])
+        ]
+        hit = [f for f in files if Path(f).match(glob) and Path(f).is_file()]
+        return bool(hit), f"on host: {hit[:2] or files[:2] or 'nothing copied'}"
+
+    return check
+
+
+def no_server_scripts() -> Check:
+    """Skill steps that start/stop servers were mapped to the agent's tools
+    (attempts count; listing or reading the scripts does not)."""
+
+    def check(run: EvalRun):
+        tried = [
+            c["args"].get("command")
+            for c in run.tool("exec_in_runtime") + run.tool("run_command")
+            if shell_policy.classify(c["args"].get("command", "")) == "forbidden"
+        ]
+        return not tried, f"lifecycle/kill commands attempted: {tried or 'none'}"
+
+    return check
+
+
 # --------------------------------------------------------------------------
 # Scenarios
 # --------------------------------------------------------------------------
@@ -396,6 +500,65 @@ def scenarios(small_model: str = SMALL_MODEL) -> list[Scenario]:
             setup=_foreign_job_setup,
             teardown=_foreign_job_teardown,
         ),
+        Scenario(
+            "benchmark_via_skill",
+            "Benchmark a deployment the way ATOM's run-atom-workload skill does.",
+            [
+                f"Deploy the test checkpoint at {small_model} on one free GPU. Then run "
+                "ATOM's standard serving benchmark on it -- ISL 512, OSL 128, "
+                "concurrency 4, prompt multiplier 2 -- following the ATOM team's "
+                "workflow, and tell me the total token throughput."
+            ],
+            [
+                loaded_skill("run-atom-workload", "benchmark-guide"),
+                job_succeeded(r"run_benchmark\.sh|atom\.benchmarks\.benchmark_serving"),
+                reports_logged_value(
+                    "Total Token throughput",
+                    r"Total [Tt]oken throughput \(tok/s\):\s+([\d.]+)",
+                ),
+                no_server_scripts(),
+                never_forced(),
+            ],
+            needs_small_model=True,
+        ),
+        Scenario(
+            "accuracy_via_skill",
+            "GSM8K on the first 20 samples through the repo's lm_eval workflow.",
+            [
+                f"Deploy the test checkpoint at {small_model} on one free GPU and check "
+                "its GSM8K accuracy on the first 20 samples (3-shot), following the "
+                "ATOM workflow. Report the flexible-extract score."
+            ],
+            [
+                loaded_skill("run-atom-workload"),
+                job_succeeded(r"run_gsm8k_eval\.sh|lm_eval"),
+                reports_logged_value(
+                    "flexible-extract",
+                    # lm_eval pads cells ("|    0|"); a placeholder such as the
+                    # skill's "0.XXXX" example must not count as a score.
+                    r"flexible-extract\s*\|[^|]*\|[^|]*\|[^|]*\|\s*(\d+(?:\.\d+)?)\s*\|",
+                ),
+                no_server_scripts(),
+            ],
+            needs_small_model=True,
+        ),
+        Scenario(
+            "trace_via_skill",
+            "Capture a profiler trace per the capture-trace skill and bring it back.",
+            [
+                f"Capture a short PyTorch profiler trace of the test checkpoint at "
+                f"{small_model} serving on one free GPU (ISL 256, OSL 64, "
+                "concurrency 2), following ATOM's capture-trace workflow, and copy "
+                "the trace files back to this machine."
+            ],
+            [
+                loaded_skill("capture-trace"),
+                launched_with("--torch-profiler-dir"),
+                copied_back("*.pt.trace.json.gz"),
+                no_server_scripts(),
+            ],
+            needs_small_model=True,
+        ),
     ]
 
 
@@ -445,7 +608,7 @@ def run_scenario(sc: Scenario, make_brain, out_dir: Path, base: AgentConfig) -> 
         session = ChatSession(
             make_brain(),
             box,
-            SYSTEM_PROMPT + "\n" + machine_brief(box.call("inspect_system", {})),
+            build_system_prompt(ctx, box.call("inspect_system", {})),
             Hooks(on_tool_start=start, on_tool_end=end),
             log=log,
         )
@@ -456,7 +619,15 @@ def run_scenario(sc: Scenario, make_brain, out_dir: Path, base: AgentConfig) -> 
     finally:
         run.seconds = round(time.monotonic() - t0, 1)
         run.deployments = [deploy.status(d) for d in ctx.store.all()]
+        for job in ctx.jobs.all():
+            try:
+                run.job_logs[job.id] = Path(job.log).read_text(errors="replace")
+            except OSError:
+                pass
         results = [(chk(run)) for chk in sc.checks] if not run.error else []
+        for job in ctx.jobs.all():
+            if jobs_mod.status(job, 0)["state"] == "running":
+                jobs_mod.cancel(ctx.jobs, job)
         for dep in ctx.store.active():
             deploy.stop(ctx.store, dep, grace_s=20, leases=ctx.leases)
         if sc.teardown:

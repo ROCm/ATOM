@@ -93,7 +93,13 @@ def handle(box: ToolBox, msg: dict) -> dict | None:
     }
 
 
-def serve(cfg: AgentConfig, stdin=None, stdout=None, mode: str = "auto") -> None:
+def serve(
+    cfg: AgentConfig,
+    stdin=None,
+    stdout=None,
+    mode: str = "auto",
+    profile: str = "developer",
+) -> None:
     stdin = stdin or sys.stdin
     stdout = stdout or sys.stdout
     ctx = ToolContext(
@@ -101,6 +107,7 @@ def serve(cfg: AgentConfig, stdin=None, stdout=None, mode: str = "auto") -> None
         policy=Policy(mode),
         progress=lambda line: print(line, file=sys.stderr, flush=True),
         session=f"mcp-{os.getpid()}",
+        profile=profile,
     )
     # switch_brain only means something inside atom-chat's own loop.
     box = ToolBox(ctx, include_brain_switch=False)

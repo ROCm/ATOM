@@ -24,7 +24,7 @@ from atom.agent import deploy, hardware
 from atom.agent.brain import Brain, connect, discover
 from atom.agent.config import DEFAULT_MODEL_ROOTS, DEFAULT_STATE_DIR, AgentConfig
 from atom.agent.policy import MODES, Policy
-from atom.agent.prompts import SYSTEM_PROMPT, machine_brief
+from atom.agent.prompts import build_system_prompt, machine_brief
 from atom.agent.session import ChatSession, Hooks, SessionLog
 from atom.agent.tools import ToolBox, ToolContext
 
@@ -142,6 +142,18 @@ def summarize_result(name: str, r: dict) -> str:
         return ", ".join(r.get("files", []))
     if name == "run_command":
         return f"exit {r.get('exit_code')}"
+    if name == "load_skill":
+        return f"{r.get('name')} ({r.get('kind')}, v{r.get('version') or '?'})"
+    if name in ("exec_in_runtime", "wait_job", "job_status") and r.get("job"):
+        code = r.get("exit_code")
+        last = (r.get("tail") or [""])[-1][:100]
+        return (
+            f"{r['job']}: {r.get('state')}"
+            + (f" (exit {code})" if code is not None else "")
+            + (f" -- {last}" if last else "")
+        )
+    if name == "copy_from_runtime":
+        return f"{r.get('file_count')} file(s) -> {r.get('copied_to')}"
     return "done"
 
 
@@ -502,6 +514,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--state-dir", default=str(DEFAULT_STATE_DIR))
     p.add_argument(
+        "--profile",
+        choices=["customer", "developer"],
+        default=os.environ.get("ATOM_CHAT_PROFILE", "customer"),
+        help="customer: deployment skills (benchmark, accuracy, trace, debug); "
+        "developer: every ATOM/AITER skill, incl. kernel authoring and PR review",
+    )
+    p.add_argument(
+        "--skills-dir",
+        action="append",
+        default=[],
+        metavar="DIR",
+        help="extra skills, laid out like a repo's .claude/ (skills/*/SKILL.md)",
+    )
+    p.add_argument(
         "--mode",
         choices=MODES,
         default=os.environ.get("ATOM_CHAT_MODE", "ask"),
@@ -529,12 +555,17 @@ def main(argv: list[str] | None = None) -> None:
         model_roots=tuple(args.model_root) + DEFAULT_MODEL_ROOTS,
         runtime=args.runtime,
         image=args.image,
+        skill_dirs=tuple(args.skills_dir),
     )
     if args.command == "mcp":
         from atom.agent.mcp_server import serve
 
         # The MCP client owns approvals; --mode read-only still binds.
-        serve(cfg, mode="read-only" if args.mode == "read-only" else "auto")
+        serve(
+            cfg,
+            mode="read-only" if args.mode == "read-only" else "auto",
+            profile=args.profile,
+        )
         return
     if args.command == "sessions":
         for sess in SessionLog.list(cfg.state_dir, limit=20):
@@ -569,6 +600,7 @@ def main(argv: list[str] | None = None) -> None:
             if chatting
             else f"cli-{args.command if not args.guided else 'guided'}"
         ),
+        profile=args.profile,
     )
     deploy.reconcile(ctx.store, ctx.leases)
 
@@ -613,7 +645,7 @@ def main(argv: list[str] | None = None) -> None:
     session = ChatSession(
         brain,
         toolbox,
-        SYSTEM_PROMPT + "\n" + machine_brief(report),
+        build_system_prompt(ctx, report),
         Hooks(
             on_content=term.content,
             on_reasoning=term.reasoning,
@@ -636,7 +668,12 @@ def main(argv: list[str] | None = None) -> None:
 
     print(st.bold("ATOM Chat") + st.dim(f" -- brain: {brain.describe()}"))
     resumed = f"resumed {log.id} ({len(history)} messages)" if history else log.id
-    print(st.dim(f"session {resumed}; mode {policy.mode}"))
+    print(
+        st.dim(
+            f"session {resumed}; mode {policy.mode}; profile {ctx.profile}, "
+            f"{len(ctx.skills)} skills ({ctx.skill_source})"
+        )
+    )
     print(st.dim(machine_brief(report)))
     print(
         st.dim("Describe what you want to serve. /help for commands, Ctrl-D to exit.\n")
@@ -684,6 +721,7 @@ def handle_slash(
             "/stop <id>     stop a deployment\n"
             "/log <id>      tail a deployment's log\n"
             "/brain [id|url] show or switch the agent's LLM\n"
+            "/skills        skills the agent can follow (profile-dependent)\n"
             "/mode [m]      show or set: read-only | ask | auto-safe | auto\n"
             "/yes           same as /mode auto\n"
             "/reset         forget the conversation\n"
@@ -719,6 +757,9 @@ def handle_slash(
                     Brain(pending["base_url"], pending["model"], label=pending["label"])
                 )
             print(res if res.get("error") else session.brain.describe())
+    elif cmd == "/skills":
+        for name, sk in sorted(ctx.skills.items()):
+            print(f"{name:34s} {sk.description[:90]}")
     elif cmd == "/yes":
         ctx.policy.mode = "auto"
         print("mode: auto (nothing asks from now on)")

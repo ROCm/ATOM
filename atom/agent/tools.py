@@ -21,9 +21,9 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from atom.agent import deploy, hardware, planner, probe
+from atom.agent import deploy, hardware, jobs, planner, probe, shell_policy, skills
 from atom.agent import image as image_mod
-from atom.agent.config import AgentConfig
+from atom.agent.config import AgentConfig, repo_root
 from atom.agent.knowledge import load_knowledge
 from atom.agent.leases import LeaseConflict, LeaseManager
 from atom.agent.models import find_models, inspect_model
@@ -72,6 +72,8 @@ class ToolContext:
     approve: Callable[[str, dict, str], bool] = lambda *a: False
     policy: Policy = field(default_factory=Policy)
     session: str = ""
+    # customer: deployment-side skills only; developer: all of ATOM's/AITER's.
+    profile: str = "customer"
     # Live progress lines for long tools (waiting for a server).
     progress: Callable[[str], None] = lambda line: None
     plans: dict[str, dict] = field(default_factory=dict)
@@ -82,6 +84,9 @@ class ToolContext:
         self.store = deploy.DeploymentStore(self.cfg.state_dir)
         self.leases = LeaseManager(self.cfg.lease_dir)
         self.audit = AuditLog(self.cfg.state_dir, self.session)
+        self.jobs = jobs.JobStore(self.cfg.state_dir)
+        self._skills: dict | None = None
+        self.skill_source = ""
         self._kb = None
         self.kb_source = ""
         self._images: dict[str, image_mod.ImageInfo | None] = {}
@@ -158,6 +163,43 @@ class ToolContext:
     def provenance(self, image: str | None) -> dict:
         info = self.image_info(image)
         return info.provenance() if info else image_mod.local_provenance()
+
+    @property
+    def all_skills(self) -> dict:
+        """Every skill the running ATOM/AITER ship, plus the user's own."""
+        if self._skills is None:
+            sources: list[tuple[str, Path]] = []
+            info = self.default_image_info()
+            if info:
+                sources += [
+                    ("atom", info.atom_dir / ".claude"),
+                    ("aiter", info.aiter_dir / ".claude"),
+                ]
+                self.skill_source = f"skills from {info.describe()}"
+            else:
+                root = repo_root()
+                if root:
+                    sources.append(("atom", root / ".claude"))
+                aiter_pkg = image_mod._package_dir("aiter")
+                if aiter_pkg:
+                    sources.append(("aiter", aiter_pkg.parent / ".claude"))
+                self.skill_source = "skills from this install"
+            for d in self.cfg.skill_dirs:
+                sources.append(("user", Path(d)))
+            self._skills = skills.load_catalog(sources)
+        return self._skills
+
+    @property
+    def skills(self) -> dict:
+        return skills.visible(self.all_skills, self.profile)
+
+    def runtime_cwd(self, dep: deploy.Deployment | None) -> str:
+        """Where a skill's "bash scripts/..." runs: the ATOM repo root."""
+        if dep is not None and dep.runtime == "docker":
+            info = self.image_info(dep.image)
+            return info.atom_root if info else "/app/ATOM"
+        root = repo_root()
+        return str(root) if root else str(Path.cwd())
 
     def deployment(self, key: str | None) -> deploy.Deployment:
         if key is None:
@@ -596,9 +638,14 @@ def t_export_deployment(ctx: ToolContext, deployment: str | None = None) -> dict
 
 
 def is_read_only_command(command: str) -> bool:
-    """True for commands that only read state (no pipes, redirects, chains)."""
+    """True for commands that only read state on this host.
+
+    Simple commands are checked against READ_ONLY_COMMANDS (incl. docker
+    ps/logs/...); compound ones (pipes, chains, loops) must be read-only in
+    every part by the shell policy, with no writes allowed at all.
+    """
     if _SHELL_META.search(command):
-        return False
+        return shell_policy.classify(command, scratch=()) == "workload"
     try:
         argv = shlex.split(command)
     except ValueError:
@@ -668,6 +715,187 @@ def t_switch_brain(ctx: ToolContext, deployment: str) -> dict:
         "label": dep.id,
     }
     return {"ok": True, "note": "the next turn runs on the new model"}
+
+
+# --------------------------------------------------------------------------
+# Skills and execution in the runtime
+# --------------------------------------------------------------------------
+
+# forbidden | workload | exec: see atom/agent/shell_policy.py.
+classify_exec = shell_policy.classify
+
+
+def t_list_skills(ctx: ToolContext) -> dict:
+    hidden = len(ctx.all_skills) - len(ctx.skills)
+    return {
+        "profile": ctx.profile,
+        "source": ctx.skill_source,
+        "skills": [
+            {"name": k, "kind": v.kind, "description": v.description[:400]}
+            for k, v in sorted(ctx.skills.items())
+        ],
+        "hidden_for_profile": hidden,
+    }
+
+
+def t_load_skill(ctx: ToolContext, name: str) -> dict:
+    sk = skills.resolve(ctx.skills, name)
+    if sk is None:
+        if skills.resolve(ctx.all_skills, name):
+            return {
+                "error": f"{name} is a developer skill; this agent runs with "
+                f"--profile {ctx.profile}"
+            }
+        return {"error": f"no skill {name!r}", "available": sorted(ctx.skills)}
+    _, body = skills.parse_frontmatter(sk.path.read_text(errors="replace"))
+    return {
+        "name": sk.name,
+        "kind": sk.kind,
+        "version": sk.meta.get("version"),
+        "source": ctx.skill_source,
+        "truncated": len(body) > skills.MAX_BODY_CHARS,
+        "body": body[: skills.MAX_BODY_CHARS],
+        "files": sk.files(),
+        "how_to_run": skills.ADAPTER_NOTES,
+    }
+
+
+def t_read_skill_file(ctx: ToolContext, name: str, path: str) -> dict:
+    sk = skills.resolve(ctx.skills, name)
+    if sk is None:
+        return {"error": f"no visible skill {name!r}"}
+    target = (sk.root / path).resolve()
+    if sk.root.resolve() not in target.parents or not target.is_file():
+        return {"error": f"{path!r} is not a file of {sk.name}", "files": sk.files()}
+    text = target.read_text(errors="replace")
+    return {
+        "name": sk.name,
+        "path": path,
+        "truncated": len(text) > 30_000,
+        "text": text[:30_000],
+    }
+
+
+def _exec_target(ctx: ToolContext, deployment: str | None):
+    """The deployment whose runtime a command runs in (None = local install)."""
+    dep = None
+    if deployment is not None or deploy.live(ctx.store):
+        dep = ctx.deployment(deployment)
+        if not deploy.is_alive(dep):
+            raise ValueError(f"{dep.id} is not running; nothing to execute in")
+    elif deploy.choose_runtime(ctx.cfg) == "docker":
+        raise ValueError(
+            "no running deployment to execute in; launch one first "
+            "(commands run inside its container)"
+        )
+    return dep
+
+
+def t_exec_in_runtime(
+    ctx: ToolContext,
+    command: str,
+    deployment: str | None = None,
+    background: bool = False,
+    timeout_s: int = 120,
+    env: dict | None = None,
+) -> dict:
+    command = command.strip()
+    if command.endswith("&") and not command.endswith("&&"):
+        command, background = command[:-1].rstrip(), True
+    kind = classify_exec(command)
+    if kind == "forbidden":
+        return {
+            "error": "refused: this starts/stops servers or resets GPUs behind the "
+            "lease system",
+            "use_instead": "launch_server (add_args / set_env), wait_until_ready, "
+            "stop_server",
+        }
+    dep = _exec_target(ctx, deployment)
+    where = f"{dep.id} ({dep.container or 'local'})" if dep else "the local install"
+    denied = ctx.authorize(
+        "exec_in_runtime",
+        {"command": command, "deployment": dep.id if dep else None},
+        f"run in {where}: {command[:160]}",
+        risk="exec_workload" if kind == "workload" else "exec",
+        detail=command,
+    )
+    if denied:
+        return denied
+    env = {k: str(v) for k, v in (env or {}).items()}
+    cwd = ctx.runtime_cwd(dep)
+    if background:
+        job = jobs.start(ctx.jobs, dep, command, cwd=cwd, env=env, label=command[:80])
+        return {
+            "job": job.id,
+            "state": "running",
+            "cwd": cwd,
+            "log": job.log,
+            "next": "wait_job (or job_log to peek)",
+        }
+    return jobs.run_foreground(
+        ctx.jobs, dep, command, cwd=cwd, env=env, timeout_s=min(timeout_s, 600)
+    )
+
+
+def _job(ctx: ToolContext, job_id: str) -> jobs.Job:
+    job = ctx.jobs.get(job_id)
+    if job is None:
+        raise ValueError(f"no job {job_id!r}")
+    return job
+
+
+def t_job_status(ctx: ToolContext, job: str | None = None) -> dict:
+    if job is None:
+        return {
+            "jobs": [
+                {k: v for k, v in jobs.status(j, 1).items() if k != "tail"}
+                for j in ctx.jobs.all()[-10:]
+            ]
+        }
+    return jobs.status(_job(ctx, job))
+
+
+def t_wait_job(ctx: ToolContext, job: str, timeout_min: float = 30) -> dict:
+    return jobs.wait(
+        _job(ctx, job), timeout_s=timeout_min * 60, on_progress=ctx.progress
+    )
+
+
+def t_job_log(
+    ctx: ToolContext, job: str, lines: int = 60, grep: str | None = None
+) -> dict:
+    j = _job(ctx, job)
+    try:
+        rows = jobs.tail(j, min(lines, 400), grep)
+    except re.error as e:
+        return {"error": f"bad regex: {e}"}
+    return {"job": j.id, "log": j.log, "lines": rows}
+
+
+def t_cancel_job(ctx: ToolContext, job: str) -> dict:
+    j = _job(ctx, job)
+    denied = ctx.authorize(
+        "cancel_job",
+        {"job": j.id},
+        f"cancel {j.id}: {j.command[:100]}",
+        risk="stop_own",
+    )
+    if denied:
+        return denied
+    return jobs.cancel(ctx.jobs, j)
+
+
+def t_copy_from_runtime(
+    ctx: ToolContext, path: str, deployment: str | None = None
+) -> dict:
+    dep = _exec_target(ctx, deployment)
+    dest = (
+        ctx.cfg.state_dir
+        / "artifacts"
+        / (dep.id if dep else "local")
+        / time.strftime("%Y%m%d-%H%M%S")
+    )
+    return jobs.copy_out(dep, path, dest, ctx.runtime_cwd(dep))
 
 
 # --------------------------------------------------------------------------
@@ -907,6 +1135,93 @@ _TOOL_SPECS = (
         True,
     ),
 )
+_SKILL_SPECS = (
+    (
+        "list_skills",
+        "Procedures ATOM's and AITER's engineers wrote down (benchmark, "
+        "accuracy, traces, debugging, ...), read from the image that runs.",
+        _obj({}),
+        t_list_skills,
+        False,
+    ),
+    (
+        "load_skill",
+        (
+            "Read a skill before following it (name like 'atom:capture-trace'). "
+            "Returns its steps, its files, and how to map its shell steps to "
+            "these tools."
+        ),
+        _obj({"name": S_STR}, ["name"]),
+        t_load_skill,
+        False,
+    ),
+    (
+        "read_skill_file",
+        "Read a reference or script that ships with a skill.",
+        _obj({"name": S_STR, "path": S_STR}, ["name", "path"]),
+        t_read_skill_file,
+        False,
+    ),
+    (
+        "exec_in_runtime",
+        (
+            "Run a shell command where ATOM runs: inside a deployment's container "
+            "(cwd = the ATOM repo, e.g. /app/ATOM). For skill steps such as "
+            "'bash scripts/run_benchmark.sh ...'. background=true for anything "
+            "over a minute, then wait_job. Server start/stop scripts are refused."
+        ),
+        _obj(
+            {
+                "command": S_STR,
+                "deployment": S_DEP,
+                "background": {"type": "boolean"},
+                "timeout_s": S_INT,
+                "env": {"type": "object", "additionalProperties": S_STR},
+            },
+            ["command"],
+        ),
+        t_exec_in_runtime,
+        True,
+    ),
+    (
+        "job_status",
+        "State, exit code and log tail of a background job; all recent jobs if omitted.",
+        _obj({"job": S_STR}),
+        t_job_status,
+        False,
+    ),
+    (
+        "wait_job",
+        "Block until a background job finishes (streams progress); returns its log tail.",
+        _obj({"job": S_STR, "timeout_min": {"type": "number"}}, ["job"]),
+        t_wait_job,
+        False,
+    ),
+    (
+        "job_log",
+        "Tail of a job's output, optionally filtered by a regex.",
+        _obj({"job": S_STR, "lines": S_INT, "grep": S_STR}, ["job"]),
+        t_job_log,
+        False,
+    ),
+    (
+        "cancel_job",
+        "Stop a background job (its whole process tree in the container).",
+        _obj({"job": S_STR}, ["job"]),
+        t_cancel_job,
+        True,
+    ),
+    (
+        "copy_from_runtime",
+        (
+            "Copy a file or directory (e.g. a trace dir, a result JSON) out of "
+            "the deployment's container to this host; returns the local paths."
+        ),
+        _obj({"path": S_STR, "deployment": S_DEP}, ["path"]),
+        t_copy_from_runtime,
+        False,
+    ),
+)
 _SWITCH_BRAIN_SPEC = (
     "switch_brain",
     (
@@ -920,7 +1235,11 @@ _SWITCH_BRAIN_SPEC = (
 
 
 def build_tools(include_brain_switch: bool = True) -> list[Tool]:
-    specs = _TOOL_SPECS + ((_SWITCH_BRAIN_SPEC,) if include_brain_switch else ())
+    specs = (
+        _TOOL_SPECS
+        + _SKILL_SPECS
+        + ((_SWITCH_BRAIN_SPEC,) if include_brain_switch else ())
+    )
     return [Tool(*spec) for spec in specs]
 
 

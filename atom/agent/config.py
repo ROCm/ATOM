@@ -43,6 +43,8 @@ class AgentConfig:
     image: str | None = None
     # Machine-wide GPU/port leases shared by every user's agent.
     lease_dir: Path | None = None
+    # Extra skill directories (each laid out like a repo's .claude/).
+    skill_dirs: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         self.state_dir = Path(self.state_dir)

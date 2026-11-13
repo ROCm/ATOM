@@ -35,8 +35,8 @@ from atom.agent.leases import current_user
 MODES = ("read-only", "ask", "auto-safe", "auto")
 
 # Risk classes a tool states when it asks for permission.
-SAFE_RISKS = {"launch", "stop_own", "switch_brain", "export"}
-RISKY = {"launch_forced", "command"}
+SAFE_RISKS = {"launch", "stop_own", "switch_brain", "export", "exec_workload"}
+RISKY = {"launch_forced", "command", "exec"}
 
 
 @dataclass
@@ -60,7 +60,7 @@ class Policy:
         if self.mode == "auto-safe":
             if risk in SAFE_RISKS:
                 return Decision("allow", f"auto-safe: {risk} on agent-owned resources")
-            if risk == "command" and any(
+            if risk in ("command", "exec") and any(
                 fnmatch.fnmatch(detail, pat) for pat in self.allow_commands
             ):
                 return Decision("allow", "auto-safe: command matches the allowlist")

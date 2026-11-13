@@ -111,6 +111,55 @@ Python can import torch and aiter, else docker), `--image` (default: newest
 local `rocm/atom*` image, else `rocm/atom:latest`), `--model-root DIR` (extra
 places to look for checkpoints).
 
+## Skills: ATOM's and AITER's own procedures
+
+The agent follows the playbooks ATOM and AITER engineers already wrote as
+Claude Code skills (`.claude/skills/*/SKILL.md`, `.claude/commands/*.md`),
+read from the image that will run so they match its code:
+
+| Profile (`--profile`) | Skills |
+|---|---|
+| `customer` (default) | `atom:run-atom-workload` (benchmark, GSM8K accuracy, sweeps), `atom:capture-trace`, `atom:benchmark-guide`, `atom:debug-guide` |
+| `developer` | all of ATOM's and AITER's, incl. `atom:dump-bisect-debug`, `aiter:aiter-config-shape`, `aiter:flydsl-kernel-authoring`, both `review-pr`s |
+
+Ask for "a benchmark the way the ATOM team runs it", "GSM8K on 20
+samples", or "a profiler trace" and the agent loads the skill and runs its
+steps where ATOM runs -- inside the deployment's container (`/app/ATOM`),
+as background jobs it can wait on, cancel, and copy results from:
+
+```text
+  ⚙ load_skill name=atom:run-atom-workload
+  ⚙ exec_in_runtime command=bash scripts/run_benchmark.sh /data/models/... 8002 512 128 4 2 background=true
+  ⚙ wait_job job=j1
+  ✓ j1: succeeded (exit 0) -- Total Token throughput (tok/s):          1623.96
+  ⚙ copy_from_runtime path=/app/logs_claude/benchmark.json
+```
+
+Skills were written for Claude Code in a shell, so the agent translates
+them: steps that start or stop servers (`start_atom_server.sh`,
+`stop_atom_server.sh`, ...) are refused and mapped to its own
+lease-respecting `launch_server` / `stop_server`; everything else runs via
+`exec_in_runtime`.
+
+Which commands run without asking in `auto-safe` is decided by
+`atom/agent/shell_policy.py`, which splits a command into its parts (across
+`;`, `&&`, `|`, `$(...)`, loops) and judges each:
+
+- runs: read-only tools, the repos' workload entry points
+  (`scripts/run_benchmark*.sh`, `run_gsm8k_eval.sh`, `wait_infer_drain.sh`,
+  `python -m atom.benchmarks.*`, `lm_eval`, `tools/parse_trace.py`),
+  `curl` to localhost, `python3 -c` limited to `json`/`sys`-style code, and
+  writes confined to `/app/logs_claude` or `/tmp` inside the container --
+  enough for the skills' own poll loops and trace inspection;
+- asks: anything else (writes elsewhere, `sed -i`, `find -delete`, nested
+  shells, `python3 -c` importing `os`/`subprocess`, remote URLs);
+- refused in every mode: server start/stop scripts, `pkill`/`killall`, GPU
+  resets -- even when hidden behind a variable.
+
+On the host (`run_command`) only read-only commands run without asking.
+Add your own skills with `--skills-dir DIR` (laid out like a repo's
+`.claude/`). In chat, `/skills` lists them.
+
 ## Permission modes
 
 | `--mode` | Behaviour |

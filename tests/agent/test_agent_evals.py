@@ -14,8 +14,8 @@ from atom.agent.evals import EvalRun
 REPO = Path(__file__).resolve().parents[2]
 
 
-def call(name, tool_args=None, **result):
-    return {"name": name, "args": tool_args or {}, "result": result}
+def call(tool, tool_args=None, **result):
+    return {"name": tool, "args": tool_args or {}, "result": result}
 
 
 def test_fail_then_fix_checks():
@@ -152,3 +152,43 @@ def test_foreign_job_setup_blocks_and_cleans_up(tmp_path):
     finally:
         evals._foreign_job_teardown(env)
     assert LeaseManager(tmp_path).held() == []
+
+
+def test_skill_workflow_checks(tmp_path):
+    trace = tmp_path / "rank_0" / "x.pt.trace.json.gz"
+    trace.parent.mkdir()
+    trace.write_bytes(b"x")
+    run = EvalRun(
+        "x",
+        calls=[
+            call("load_skill", {"name": "atom:run-atom-workload"}, name="atom:run-atom-workload"),
+            call("launch_server", {"plan_id": "p1", "add_args": ["--torch-profiler-dir", "/t"]}, deployment="d1"),
+            call("exec_in_runtime", {"command": "bash scripts/run_benchmark.sh /m 8002 512 128 4 2", "background": True}, job="j1", state="running"),
+            call("wait_job", {"job": "j1"}, job="j1", state="succeeded", exit_code=0),
+            call("copy_from_runtime", {"path": "/t"}, files=[{"path": str(trace)}], file_count=1),
+        ],
+        job_logs={"j1": "Total Token throughput (tok/s):          3398.80\n"},
+        answers=["Total token throughput was 3,398.8 tok/s."],
+    )  # fmt: skip
+    for chk in (
+        evals.loaded_skill("run-atom-workload"),
+        evals.job_succeeded(r"run_benchmark\.sh"),
+        evals.reports_logged_value(
+            "tput", r"Total [Tt]oken throughput \(tok/s\):\s+([\d.]+)"
+        ),
+        evals.launched_with("--torch-profiler-dir"),
+        evals.copied_back("*.pt.trace.json.gz"),
+        evals.no_server_scripts(),
+    ):
+        ok, detail = chk(run)
+        assert ok, detail
+    run.answers = ["throughput was about 3,000 tok/s"]  # not what the log said
+    assert not evals.reports_logged_value("t", r"\(tok/s\):\s+([\d.]+)")(run)[0]
+    run.calls.append(
+        call(
+            "exec_in_runtime",
+            {"command": "bash scripts/start_atom_server.sh /m 1 8000"},
+            error="refused",
+        )
+    )
+    assert not evals.no_server_scripts()(run)[0]

@@ -43,6 +43,9 @@ echo "=====ENV-NAMES====="
 grep -rhoE '\b(ATOM|AITER)_[A-Z0-9_]{2,}\b' ${A:+"$A"} ${B:+"$B"} --include=*.py 2>/dev/null | sort -u
 """
 
+# Bumped when info.json gains fields; older caches are re-probed.
+CACHE_FORMAT = 2
+
 # Paths copied out of the image, relative to the ATOM / AITER repo roots.
 ATOM_PATHS = (
     "recipes",
@@ -65,6 +68,9 @@ class ImageInfo:
     rocm: str = ""
     torch: str = ""
     env_names: set[str] = field(default_factory=set)
+    # Repo roots inside the image: where skills' "bash scripts/..." run.
+    atom_root: str = "/app/ATOM"
+    aiter_root: str = ""
 
     @property
     def atom_dir(self) -> Path:
@@ -149,8 +155,8 @@ def probe(image: str, state_dir: Path) -> ImageInfo | None:
     short = full_id.split(":")[-1][:16]
     cache = Path(state_dir) / "images" / short
     info_file = cache / "info.json"
-    if info_file.is_file():
-        data = json.loads(info_file.read_text())
+    data = json.loads(info_file.read_text()) if info_file.is_file() else {}
+    if data.get("format") == CACHE_FORMAT:
         return ImageInfo(
             image=image,
             image_id=full_id,
@@ -160,6 +166,8 @@ def probe(image: str, state_dir: Path) -> ImageInfo | None:
             rocm=data.get("rocm", ""),
             torch=data.get("torch", ""),
             env_names=set(data.get("env_names", [])),
+            atom_root=data.get("atom_root") or "/app/ATOM",
+            aiter_root=data.get("aiter_root", ""),
         )
     res = _run(
         ["docker", "run", "--rm", "--entrypoint", "sh", image, "-c", _INFO_PROBE], 120
@@ -177,8 +185,11 @@ def probe(image: str, state_dir: Path) -> ImageInfo | None:
     if kv.get("aiter_root"):
         _extract(image, kv["aiter_root"], AITER_PATHS, tmp / "aiter")
     data = {
+        "format": CACHE_FORMAT,
         "image": image,
         "image_id": full_id,
+        "atom_root": kv.get("atom_root", "").strip(),
+        "aiter_root": kv.get("aiter_root", "").strip(),
         "atom_commit": kv.get("atom_commit", "").strip(),
         "aiter_commit": kv.get("aiter_commit", "").strip(),
         "rocm": kv.get("rocm", "").strip(),

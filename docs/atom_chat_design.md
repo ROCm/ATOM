@@ -217,6 +217,24 @@ what makes AMD deployments get better over time.
 
 Unit tests: 78, no GPU needed (`pytest tests/agent --noconftest`).
 
+### Phase 2 status (2026-11-13): done
+
+| Item | Where | Validated |
+|---|---|---|
+| Skill catalog from the image (ATOM 6 skills + 7 commands, AITER 8 skills), namespaced, progressive disclosure | `atom/agent/skills.py`; tools `list_skills`, `load_skill`, `read_skill_file` | customer profile sees 4 of 21, developer all 21 |
+| Execution where ATOM runs: foreground and background jobs inside the deployment's container, process-group cancel, survive agent restarts, copy results out | `atom/agent/jobs.py`; tools `exec_in_runtime`, `job_status`, `wait_job`, `job_log`, `cancel_job`, `copy_from_runtime` | real `run_benchmark.sh` job in a container (exit 0, 15 s); cancel killed the job's tree inside the container |
+| Shell policy for unattended runs: commands split into parts, read-only / workload / scratch-write parts run in auto-safe, lifecycle scripts and killers refused on execution (not on mention) | `atom/agent/shell_policy.py` | 30+ cases incl. variable indirection, `$(...)`, escaped `find` groups, `python3 -c` imports |
+| Skill translation notes (server lifecycle -> lease-aware tools, Bash -> exec_in_runtime, fresh containers need no cleanup) | `skills.ADAPTER_NOTES`, system prompt | trace scenario recovered once the "clean after launch" mistake was named |
+| Customer / developer profiles | `--profile` | |
+| Evals: `benchmark_via_skill`, `accuracy_via_skill`, `trace_via_skill` | `atom/agent/evals.py` | reported numbers checked against the job logs; trace file checked on the host; full suite 8/8 with DeepSeek-V4.1-Flash on MI355X |
+
+What the GPU runs found (all fixed): the first shell classifier forced
+approval for the skills' own read-only poll loops and inspection one-liners,
+so unattended runs stalled; a lifecycle-script *name* in an `ls` was treated
+as running it; the GSM8K score regex matched the skill's `0.XXXX` doc
+placeholder; dash rejects `kill -- -PGID`, so cancel signalled nothing; the
+agent cleared the trace directory after launching (the skill says before).
+
 ## 7. Open decisions
 
 1. Customer profile: deployment/tuning skills only (recommended), or also code-editing developer skills?
