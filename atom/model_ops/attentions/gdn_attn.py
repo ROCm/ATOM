@@ -21,6 +21,7 @@ from atom.model_ops.fla_ops.index import prepare_chunk_offsets
 from atom.model_ops.fla_ops.replayssm import (
     replayssm_buffer_shapes,
     replayssm_commit,
+    replayssm_materialize,
 )
 from atom.model_ops.mamba_ops.causal_conv1d import (
     PAD_SLOT_ID,
@@ -986,6 +987,7 @@ class GDNStateMixin(PoolRowsMixin):
             return
         for op in (*store_ops, *restore_ops):
             self._validate_paged_state_op(op)
+        folded = self._fold_replay_records(store_ops)
 
         plan = self._checkpoint_copy_plan()
         slot_bases = self._checkpoint_slot_bases()
@@ -1014,6 +1016,40 @@ class GDNStateMixin(PoolRowsMixin):
             )
             at = end
         launch_copy_descriptor(staging.upload(descriptor_slot, total), plan)
+        if folded is not None:
+            slots, live = folded
+            self.model_runner.mamba_v_cache[:, slots] = live
+
+    def _fold_replay_records(self, store_ops):
+        """Fold each stored slot's ReplaySSM records into its SSM plane.
+
+        The image is resumed by prefill, which reads that plane alone. Returns
+        the live planes, to put back once the copy is issued.
+        """
+        if not store_ops or not self.replayssm or self._is_kda():
+            return None
+        runner = self.model_runner
+        ssm = runner.mamba_v_cache
+        slots = torch.tensor(
+            [op.src_slot for op in store_ops], dtype=torch.int64, pin_memory=True
+        ).to(ssm.device, non_blocking=True)
+        # Stores run before this step's commit, so the stored position is step 0
+        # of the last window; a prefill-parked cursor (-1) has nothing to fold.
+        steps = torch.where(runner.replayssm_write_pos[slots] >= 0, 0, -1)
+        live = ssm[:, slots]
+        for layer in range(ssm.shape[0]):
+            replayssm_materialize(
+                ssm[layer],
+                runner.replayssm_buf_k[layer],
+                runner.replayssm_buf_u[layer],
+                runner.replayssm_buf_g[layer],
+                runner.replayssm_write_pos,
+                slots,
+                slots,
+                steps,
+                self.replayssm_max_query_len,
+            )
+        return slots, live
 
     def warmup_per_req_cache(self) -> None:
         """Run one checkpoint copy now, so the first real one is only a copy.
