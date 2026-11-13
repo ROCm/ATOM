@@ -383,7 +383,7 @@ run_r1 4388 20000 $RESULT_DIR/report > $RESULT_DIR/bench.log 2>&1
 ## DeepSeek-V4.1-Flash
 
 - 场景：MLPerf Endpoint；GPU：4（1 tray x 1P4G）
-- MODEL_PATH：`/models/DeepSeek-V4.1-Flash`（`deepseek-ai/DeepSeek-V4.1-Flash` @ `dba1be0a40aa45a94ad051997016db3960a90277`）；PORT：`8000`
+- MODEL_PATH：`/models/DeepSeek-V4.1-Flash`（[`deepseek-ai/DeepSeek-V4.1-Flash`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) @ `dba1be0a40aa45a94ad051997016db3960a90277`）；PORT：`8000`。下载时要指定这个 revision：HF 上之后的提交没改权重和 config，但加了 `chat_template.jinja`、改了 encoding，endpoint 的 bench 发的是 chat 请求，请求格式可能跟着变
 - c4 和 c64 用两个不同的 server，和镜像里 `/app/endpoints-recipe-dsv41/run_ep.py` 的分法一致：c4 用 TP4（它 c8 的配置），c64 用 DEP4（EP4 + DP attention，`--max-num-seqs 64`）。GSM8K 在两个 server 上各测一次，accuracy.csv 记两行，`note` 写 TP4 / DEP4。
 - 宿主机要设 `echo Y > /sys/module/amdgpu/parameters/no_system_mem_limit`（DEP4 的 `ATOM_ENGRAM_UVA=1` 依赖它，机器重启后复位）。
 
@@ -513,7 +513,7 @@ cd $EP && HF_HUB_OFFLINE=1 $EP/venv/bin/inference-endpoint benchmark from-config
 
 - 场景：8K/1K；GPU：4（1 tray x 1P4G）
 - 并行：注意力 DP4（DP attention），MoE EP4（MegaMoE）；FP8 KV cache，FP4 index cache；不开 prefix cache
-- MODEL_PATH：`/models/DeepSeek-V4-Pro`；PORT：`8000`。2026-11-12 测的是 `DeepSeek-V4-Pro-0813` 这份 checkpoint（config 比另一份 `DeepSeek-V4-Pro` 多 `dspark_*` 字段，attention 权重的类型和 shape 相同）
+- MODEL_PATH：`/models/DeepSeek-V4-Pro`（[`deepseek-ai/DeepSeek-V4-Pro`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro) @ `b5968e9190ef611bbf34a7229255be88a0e937c1`，455-CI 固定用它）；PORT：`8000`。2026-11-12 摸底测的是另一份 `DeepSeek-V4-Pro-0813`（config 多 `dspark_*` 字段，attention 权重的类型和 shape 相同），下面的报错是在那份上看到的
 
 **当前 main 上跑不起来，预期记 N/A；`gfx1250-atom-20261111` 原样镜像同样跑不起来**：加载权重后录 CUDA graph 时，4 个 rank 都在 `layers.1.attn` 的 `wqkv_a` 上报 `IndexError: tuple index out of range`，位置是 aiter 的 FlyDSL gfx1250 mxfp8 GEMM（`aiter/ops/flydsl/mxfp8_bpreshuffle_gemm_gfx1250.py:411` → `kernels/tensor_shim.py:336`）。[ROCm/aiter#7178](https://github.com/ROCm/aiter/pull/7178)（已合入 main）给 `launch_gemm_a8w8` 加了带默认值的参数 `arg_scale_out`，dense mxfp8 的调用方没跟着改，少传参数，同一个 kernel 第二次走缓存时越界。镜像里带的是这个 PR 的预合入版，所以也崩。脚本默认的 `FAKE_EPLB=1` 和 `FAKE_EPLB=0` 结果一样。
 
