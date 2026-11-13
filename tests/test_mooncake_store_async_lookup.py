@@ -243,9 +243,12 @@ def test_renew_does_not_queue_behind_lookups_and_is_bounded(monkeypatch):
 
 
 def test_renewal_is_served_ahead_of_queued_lookups():
+    answered = []
+
     class Backend(LookupClient):
         def lookup(self, seq, lookup_id=None):
             time.sleep(0.05)
+            answered.append(lookup_id)
             return 1
 
         def renew(self, seq, start, end):
@@ -255,9 +258,9 @@ def test_renewal_is_served_ahead_of_queued_lookups():
     try:
         for i in range(40):  # two seconds of queued arrival lookups
             assert lookup.submit(SimpleNamespace(id=i), str(i))
-        started = time.monotonic()
         assert lookup.renew(SimpleNamespace(id=99), 0, 256) == 7
-        assert time.monotonic() - started < 0.5
+        # It waited for the call in flight, not for the queue behind it.
+        assert len(answered) < 10
     finally:
         lookup.close()
 

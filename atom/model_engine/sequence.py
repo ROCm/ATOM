@@ -454,6 +454,8 @@ class Sequence:
         self.offload_joint = OffloadJointRecord()
         self.offload_loaded = False
         self.offload_load_failed = False
+        # Tokens its tier load covers once the connector planned it.
+        self.offload_loaded_tokens = 0
         # Prefix tokens `share_cache` routing credited this request when it
         # placed it, until its rank reports what it really reused.
         self.dp_est_cached_tokens = 0
