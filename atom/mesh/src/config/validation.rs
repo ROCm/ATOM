@@ -31,6 +31,7 @@ impl ConfigValidator {
         Self::validate_circuit_breaker(&cb_cfg)?;
 
         Self::validate_tokenizer_cache(&config.tokenizer_cache)?;
+        Self::validate_kv_events(&config.kv_events)?;
 
         Ok(())
     }
@@ -320,6 +321,79 @@ impl ConfigValidator {
         Ok(())
     }
 
+    fn validate_kv_events(kv: &KvEventsConfig) -> ConfigResult<()> {
+        let invalid = |field: String, value: String, reason: String| ConfigError::InvalidValue {
+            field: format!("kv_events.{field}"),
+            value,
+            reason,
+        };
+        if kv.enabled != KvEventsMode::Off && kv.discovery.is_empty() {
+            let reason = "Must list a method unless kv_events is off".into();
+            return Err(invalid("discovery".into(), "[]".into(), reason));
+        }
+        let (storage, counts) = (&kv.storage, u64::from(u32::MAX));
+        // Durations are added to an `Instant`, so they are bounded too.
+        let mut ranges: Vec<(String, u64, u64)> = vec![
+            ("replay_timeout_ms".into(), kv.replay_timeout_ms, 3_600_000),
+            ("stale_after_secs".into(), kv.stale_after_secs, 86_400),
+            ("storage.deadline_ms".into(), storage.deadline_ms, 60_000),
+            (
+                "storage.breaker.open_secs".into(),
+                storage.breaker.open_secs,
+                86_400,
+            ),
+            (
+                "storage.breaker.failures".into(),
+                storage.breaker.failures.into(),
+                counts,
+            ),
+            (
+                "storage.max_inflight".into(),
+                storage.max_inflight.into(),
+                counts,
+            ),
+        ];
+        if let Some(load) = kv.offload_load {
+            ranges.push((
+                "offload_load.chunk_tokens".into(),
+                load.chunk_tokens.into(),
+                65_536,
+            ));
+        }
+        for (id, source) in &kv.storage_sources {
+            if source.backend.is_some() && source.key_rule.is_none() {
+                let field = format!("storage_sources.{id}.key_rule");
+                return Err(invalid(
+                    field,
+                    "null".into(),
+                    "Required with a backend".into(),
+                ));
+            }
+            if let Some(ms) = source.deadline_ms {
+                ranges.push((format!("storage_sources.{id}.deadline_ms"), ms, 60_000));
+            }
+        }
+        for (field, value, max) in ranges {
+            if !(1..=max).contains(&value) {
+                let reason = format!("Must be between 1 and {max}");
+                return Err(invalid(field, value.to_string(), reason));
+            }
+        }
+        for (url, source) in &kv.static_sources {
+            let (ranks, replay) = (source.endpoints.len(), source.replay_endpoints.len());
+            if ranks == 0 || (replay != 0 && replay != ranks) {
+                let value = format!("{ranks} endpoints, {replay} replay endpoints");
+                let reason = "Needs an endpoint per rank, and a replay endpoint per rank or none";
+                return Err(invalid(
+                    format!("static_sources.{url}"),
+                    value,
+                    reason.into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn validate_compatibility(config: &RouterConfig) -> ConfigResult<()> {
         {
             if let PolicyConfig::PowerOfTwo { .. } = &config.policy {
@@ -427,6 +501,43 @@ mod tests {
             assert!(error.to_string().contains("prepare_pool."), "{error}");
         }
         RouterConfig::default().validate().unwrap();
+    }
+
+    #[test]
+    fn kv_events_values_that_disable_or_overflow_are_rejected() {
+        let config = |kv: &str| RouterConfig {
+            kv_events: serde_json::from_str(kv).unwrap(),
+            ..Default::default()
+        };
+        for (field, kv) in [
+            ("discovery", r#"{"discovery": []}"#),
+            ("replay_timeout_ms", r#"{"replay_timeout_ms": 0}"#),
+            (
+                "open_secs",
+                r#"{"storage": {"breaker": {"open_secs": 18446744073709551615}}}"#,
+            ),
+            ("failures", r#"{"storage": {"breaker": {"failures": 0}}}"#),
+            ("max_inflight", r#"{"storage": {"max_inflight": 0}}"#),
+            ("storage.deadline_ms", r#"{"storage": {"deadline_ms": 0}}"#),
+            (
+                "chunk_tokens",
+                r#"{"offload_load": {"chunk_tokens": 0, "min_load_tokens": 0}}"#,
+            ),
+            (
+                "key_rule",
+                r#"{"storage_sources": {"s": {"backend": {"umbp_master": "u:1"}}}}"#,
+            ),
+            (
+                "w",
+                r#"{"static_sources": {"w": {"endpoints": ["a", "b"], "replay_endpoints": ["c"]}}}"#,
+            ),
+        ] {
+            let error = config(kv).validate().unwrap_err().to_string();
+            assert!(error.contains(field), "{field}: {error}");
+        }
+        let off =
+            r#"{"enabled": "off", "discovery": [], "static_sources": {"w": {"endpoints": ["a"]}}}"#;
+        config(off).validate().unwrap();
     }
 
     #[test]
