@@ -36,6 +36,9 @@ from atom.kv_transfer.disaggregation.types import (
 class FakeSchedSub:
     """Scheduler-side sub-connector mock."""
 
+    pending_load_partial_token_cap = 0
+    ready_suffix_first = False
+
     def lookup_pending(self, seq):
         return False
 
