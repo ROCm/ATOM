@@ -10,17 +10,12 @@ rank abort()s inside the Triton AMDGCN backend. So the cap is a hard one and the
 bound is exclusive.
 """
 
-import numpy as np
 import pytest
 import torch
 
 from atom.model_ops.sparse_indexer_chunk import (
     _BUFFER_DESCRIPTOR_LIMIT_BYTES,
-    ConcatKeyWorkspace,
-    LogitsWorkspace,
     capped_logits_rows,
-    concat_plane_width,
-    concat_window_bands,
     decode_band_rows,
     flat_view,
     indexer_qsplit_world,
@@ -192,120 +187,6 @@ def test_flat_view_shares_the_workspace_and_refuses_to_grow():
     assert flat[:8].eq(1).all() and flat[8:].eq(0).all()
     with pytest.raises(ValueError):
         flat_view(flat, 3, 4)
-
-
-def test_concat_plane_width_is_aiter_s_row_pitch():
-    """A concat band's rows sit `CONCAT_PLANE_ROW_ALIGN` columns apart, the
-    pitch aiter pads its own plane to."""
-    assert concat_plane_width(1) == 256
-    assert concat_plane_width(256) == 256
-    assert concat_plane_width(257) == 512
-    assert concat_plane_width(359_768) == 359_936
-
-
-@pytest.mark.parametrize("width", [1, 255, 256, 257, 610])
-def test_logits_workspace_reuses_storage_for_paged_and_concat_views(width):
-    """Both scorers use one allocation; concat's padding is not exposed as keys."""
-    pitch = concat_plane_width(width)
-    plane = LogitsWorkspace(3 * pitch, "cpu")
-    held = plane._logits.data_ptr()
-    plane._logits.fill_(-7)
-    concat = plane.logits(2, width, row_align=256)
-    assert concat.shape == (2, width)
-    assert concat.stride() == (pitch, 1)
-    assert concat.data_ptr() == held
-    concat.fill_(3)
-    storage = plane._logits.view(3, pitch)
-    assert storage[:2, :width].eq(3).all()
-    assert storage[:2, width:].eq(-7).all()
-    assert storage[2].eq(-7).all()
-    paged = plane.logits(3, width)
-    assert paged.data_ptr() == held and paged.stride() == (width, 1)
-    with pytest.raises(ValueError, match="exceeds"):
-        plane.logits(4, width, row_align=256)
-
-
-def _check_window_bands(first, end, row_cu, key_cu, plane, bands, windows):
-    """The bands tile `[first, end)`; each fits the plane at its window's pitch,
-    and its window holds every key its rows' requests have."""
-    assert bands[0][0] == first and bands[-1][1] == end
-    assert all(a < b == c for (a, b), (c, _) in zip(bands, bands[1:] + ((end, 0),)))
-    for (a, b), (lo, hi) in zip(bands, windows):
-        assert (b - a) * concat_plane_width(hi - lo) <= plane.capacity
-        for row in range(a, b):
-            request = np.searchsorted(row_cu, row, side="right") - 1
-            assert lo <= key_cu[request] and key_cu[request + 1] <= hi
-
-
-@pytest.mark.parametrize(
-    "rows, keys, capacity, expected",
-    [
-        # Everything fits one row's plane: one band against every key.
-        ([3, 2], [100, 50], 4096, [((0, 5), (0, 150))]),
-        # Two requests together outgrow the plane: one band each.
-        ([4, 4], [300, 300], 3072, [((0, 4), (0, 300)), ((4, 8), (300, 600))]),
-        # One request's rows outgrow the plane: cut, each piece its window.
-        ([5], [200], 512, [((0, 2), (0, 200)), ((2, 4), (0, 200)), ((4, 5), (0, 200))]),
-        # An empty request (a PCP rank owning none of its rows) widens a window.
-        ([2, 0, 2], [100, 100, 100], 4096, [((0, 4), (0, 300))]),
-    ],
-)
-def test_concat_window_bands(rows, keys, capacity, expected):
-    from itertools import accumulate
-
-    row_cu = np.array(list(accumulate(rows, initial=0)))
-    key_cu = np.array(list(accumulate(keys, initial=0)))
-    plane = LogitsWorkspace(capacity, "cpu")
-    bands, windows = concat_window_bands(0, row_cu[-1], row_cu, key_cu, plane)
-    assert list(zip(bands, windows)) == expected
-    _check_window_bands(0, row_cu[-1], row_cu, key_cu, plane, bands, windows)
-
-
-def test_concat_window_bands_fit_a_one_row_plane():
-    """1M context, 8 MiB budget: the plane holds one 1M-key row, two requests'
-    keys together do not; each row is scored against its own request's."""
-    width = concat_plane_width(1 << 20)
-    plane = LogitsWorkspace(width, "cpu")
-    row_cu, key_cu = np.array([0, 3, 6]), np.array([0, 525_312, 1_050_624])
-    bands, windows = concat_window_bands(0, 6, row_cu, key_cu, plane)
-    assert len(bands) == 6
-    _check_window_bands(0, 6, row_cu, key_cu, plane, bands, windows)
-
-
-@pytest.mark.parametrize("rank", range(8))
-def test_concat_window_bands_cover_a_dcp_rank_of_many_cached_requests(rank):
-    """DCP8, 32K context, 256 batched tokens: 64 requests each adding 4 rows
-    to a 30,720-key prefix fill 1.97M columns, the 32-row plane 1M."""
-    plane = LogitsWorkspace(32 * concat_plane_width(32_768), "cpu")
-    row_cu = np.arange(65) * 4
-    key_cu = np.arange(65) * (30_720 + 4)
-    first, end = rank * 32, rank * 32 + 32
-    bands, windows = concat_window_bands(first, end, row_cu, key_cu, plane)
-    _check_window_bands(first, end, row_cu, key_cu, plane, bands, windows)
-
-
-def test_concat_window_bands_refuse_a_request_wider_than_the_plane():
-    plane = LogitsWorkspace(512, "cpu")
-    with pytest.raises(ValueError, match="no row of request 1"):
-        concat_window_bands(0, 2, np.array([0, 1, 2]), np.array([0, 10, 600]), plane)
-
-
-def test_concat_key_workspace_hands_out_views_of_held_buffers():
-    """The gathered keys come back as views of buffers held across steps: a
-    step that fits takes no allocation, one past them doubles them once."""
-    ws = ConcatKeyWorkspace(64, 2, torch.uint8, "cpu", gathered_capacity=96)
-    values, scales = ws.keys(40)
-    assert values.shape == (40, 2) and scales.shape == (40, 1)
-    held = values.data_ptr()
-    # A long prefill's chunks: more keys every step, never a new buffer.
-    for total in range(8, 65, 8):
-        assert ws.keys(total)[0].data_ptr() == held
-    grown, grown_scales = ws.keys(65)
-    assert grown.shape == (65, 2) and grown_scales.shape == (65, 1)
-    assert ws.keys(128)[0].data_ptr() == grown.data_ptr()
-    shards, shard_scales = ws.gathered(96)
-    assert shards.shape == (96, 2) and shard_scales.dtype == torch.float32
-    assert ws.nbytes == 128 * 2 + 128 * 4 + 96 * 2 + 96 * 4
 
 
 # ---- DeepSeek-V4 prefill indexer split by query row across plain TP ---------

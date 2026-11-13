@@ -7,7 +7,7 @@ Paged rows (decode, and FP4 prefill) are each their own item with their own
 bound: FP8 reads a row's keys off its own block-table row -- or a request's
 `next_n` rows read their request's together -- and FP4 scores a request's
 rows together off the request's table, sharing each key load. FP8 prefill
-instead gathers its requests' keys end to end and scores each row's range
+instead gathers its requests' keys end to end and scores them densely
 (`ConcatKeys`), which reads each key once for all of a request's rows. Either
 way rows run in bands of the plane they were cut to, each band top-k'd as
 soon as it is scored, so nothing wider than one band is ever live. The result
@@ -21,9 +21,6 @@ requests, which a token bucket does not fix. Everything else -- the bands, the
 FP8 launch, the top-k -- follows the rows alone and is recorded.
 """
 
-import inspect
-import os
-
 import torch
 from aiter import cp_gather_indexer_k_quant_cache, dtypes
 from aiter.dist.parallel_state import get_tp_group
@@ -34,25 +31,11 @@ from aiter.ops.triton.attention.pa_mqa_logits import deepgemm_fp8_paged_mqa_logi
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 
 from atom.distributed.dcp_utils import get_dcp_group
-from atom.model_ops.sparse_indexer_chunk import CONCAT_PLANE_ROW_ALIGN
 from atom.utils import forward_context
 from atom.utils.region_graph import eager_region
 
 from .layout import MFMA, NATURAL
 from .rows import IndexCache, IndexRows
-from .workspace import LogitsWorkspace
-
-# Whether aiter's dense FP8 scorer writes into a caller's plane (`logits=`).
-# Without it each prefill band's logits are allocated per call.
-FP8_MQA_LOGITS_TAKES_OUT = "logits" in inspect.signature(fp8_mqa_logits).parameters
-# Packed output also needs the offset-aware FlyDSL top-k consumer.
-FP8_MQA_LOGITS_TAKES_PACKED = (
-    FP8_MQA_LOGITS_TAKES_OUT
-    and "out_offsets" in inspect.signature(fp8_mqa_logits).parameters
-    and "row_starts" in inspect.signature(top_k_per_row_decode).parameters
-    and os.environ.get("AITER_DISABLE_FLYDSL_TOPK_DECODE", "0")
-    not in ("1", "true", "True", "yes", "YES")
-)
 
 # gfx1250 scores the FP8 plane with FlyDSL's paged MQA logits (8-row pages
 # included); it reads the same packed preshuffled pages as the Triton kernel
@@ -90,11 +73,10 @@ def score_topk(
 
     `on_band(scores, span)`, when given, sees each band's logits before its
     top-k: a scorer that reads more than the top-k off them (a layer picking
-    its successors' candidate blocks) does it there. Rectangular concat columns
-    are local to the band's key window; packed rows start at `packed_offsets`
-    and hold request-local columns. `keys`: FP8 concat rows'
-    `(values, scales)` already gathered end to end (DCP's all-gathered
-    shards); gathered here from `cache` otherwise.
+    its successors' candidate blocks) does it there. `keys`: FP8 concat rows'
+    `(values, scales)` already gathered end to end; gathered here from
+    `cache` otherwise. Packed concat rows gather theirs pass by pass
+    (`rows.passes`), every rank its share of each pass.
 
     A striped split (`RowSplit.striped`) scores this rank's rows of `query`
     and `weights` into its slot and returns the gathered slots rank-major:
@@ -111,20 +93,22 @@ def score_topk(
         query, weights = _stripe_rows(query, weights, cache, split)
     if out is None:
         out = torch.empty(rows.out_rows, topk, dtype=torch.int32, device=weights.device)
+    if rows.passes is not None:
+        _score_concat_passes(query, weights, cache, rows, topk, stable, out)
+        if not request_local:  # places in the step's gathered run
+            n = rows.row_ends.shape[0]
+            picked, starts = out[:n], rows.concat.row_starts[:n].unsqueeze(1)
+            torch.where(picked < 0, picked, picked + starts, out=picked)
+        return out
     mine = out[split.slot : split.slot + split.stride] if split.stripe else out
-    _score_bands(
-        query,
-        weights,
-        cache,
-        rows,
-        topk,
-        weight_scale,
-        stable,
-        on_band,
-        mine,
-        keys,
-        request_local,
-    )
+    if rows.concat is not None:
+        _score_concat(
+            query, weights, cache, rows, topk, stable, mine, keys, request_local
+        )
+    else:
+        _score_paged(
+            query, weights, cache, rows, topk, weight_scale, stable, on_band, mine
+        )
     _gather_split(out, split)
     return out
 
@@ -156,104 +140,100 @@ def _gather_split(out, split):
     (`IndexRows.out_rows`). A world of one already holds them all."""
     if split.world == 1:
         return
-    region = out[: split.stride * split.world]
     group = get_tp_group() if split.group == "tp" else get_dcp_group()
+    _all_gather_slot(out, split.stride, split.rank, split.world, group)
+
+
+def _all_gather_slot(buffer, stride, rank, world, group):
+    """The `world` slots of `stride` rows at the front of `buffer`, gathered
+    in place from this rank's own slot."""
+    region = buffer[: stride * world]
     torch.distributed.all_gather_into_tensor(
-        region,
-        region[split.slot : split.slot + split.stride],
-        group=group.device_group,
+        region, region[rank * stride : (rank + 1) * stride], group=group.device_group
     )
 
 
-def _score_bands(
-    query,
-    weights,
-    cache,
-    rows,
-    topk,
-    weight_scale,
-    stable,
-    on_band,
-    out,
-    gathered=None,
-    request_local=True,
-):
-    """Score and consume one workspace band at a time for every indexer.
-
-    V4.1's paged/packed rows and FP8 concat rows share the buffer lifetime,
-    candidate callback and top-k loop. Only key addressing, the kernel launch
-    and the mapping of selected columns differ.
-    """
-    concat = rows.concat
+def _score_paged(query, weights, cache, rows, topk, weight_scale, stable, on_band, out):
+    """Paged rows, band by band into the plane, each band top-k'd at once."""
     workspace = rows.workspace
-    if concat is not None:
-        k_fp8, k_scale = (
-            _gather_concat(query, cache, concat) if gathered is None else gathered
+    # Without a workspace (rows cut to the logits budget alone), one band's
+    # plane for the call, a short band a prefix of it.
+
+    plane = (
+        None
+        if workspace is not None or not rows.bands
+        else torch.empty(
+            max(end - first for first, end in rows.bands),
+            rows.width,
+            dtype=torch.float32,
+            device=weights.device,
         )
-    elif workspace is None and rows.bands:
-        # Standalone paged calls have no builder-owned workspace. Hold one
-        # band's storage for the call and reuse it, including the short tail.
-        workspace = LogitsWorkspace(
-            max(end - first for first, end in rows.bands) * rows.width,
-            weights.device,
-        )
+    )
     group = rows.next_n
     for index, (first, end) in enumerate(rows.bands):
         count, span = end - first, slice(first, end)
+        # A band's bounds and tables: its rows', or its requests' when a
+        # request's rows share them.
         items = slice(first // group, end // group)
-        lo, width, alignment = 0, rows.width, 1
-        if concat is not None:
-            lo, hi = rows.key_windows[index] if rows.key_windows else (0, concat.total)
-            width, alignment = hi - lo, CONCAT_PLANE_ROW_ALIGN
         if rows.packed_offsets is not None:
             scores = workspace.packed_logits()
             offsets = rows.packed_offsets[span]
         else:
             scores = (
-                workspace.logits(count, width, row_align=alignment)
-                if workspace is not None
-                else None
+                plane[:count]
+                if plane is not None
+                else workspace.logits(count, rows.width)
             )
             offsets = None
-        if concat is not None:
-            starts = concat.row_starts[span]
-            if lo:
-                # PCP padding rows (start 0, length 0) stay empty.
-                starts = (starts - lo).clamp_min_(0)
-            stops = starts + rows.row_ends[span]
-            scores = fp8_mqa_logits(
-                Q=query[span],
-                KV=k_fp8[lo : lo + width],
-                kv_scales=k_scale[lo : lo + width],
-                weights=weights[span],
-                cu_starts=starts,
-                cu_ends=stops,
-                clean_logits=False,
-                **({"logits": scores} if scores is not None else {}),
-                **({"out_offsets": offsets} if offsets is not None else {}),
-            )
-        else:
-            _paged_band_logits(
-                query,
-                weights,
+        if cache.fp4:
+            values, scales = query
+            _fp4_band_logits(
+                values[span],
+                scales[span],
+                weights[span],
                 cache,
-                rows,
-                index,
-                span,
-                items,
                 scores,
                 offsets,
                 weight_scale,
+                index,
+                rows,
+            )
+        else:
+            _fp8_paged_mqa_logits(
+                query[span].view(
+                    count // group, group, weights.shape[1], query.shape[-1]
+                ),
+                cache.values.unsqueeze(-2),
+                weights[span],
+                scores,
+                rows.row_ends[items],
+                rows.row_tables[items],
+                rows.width,
+                KVBlockSize=cache.rows_per_block,
+                Preshuffle=True,
             )
         if on_band is not None:
             on_band(scores, span)
-        picked = out[span]
-        if offsets is not None:
+        if offsets is None:
+            top_k_per_row_decode(
+                scores,
+                group,
+                rows.row_ends[items],
+                out[span],
+                count,
+                scores.stride(0),
+                scores.stride(1),
+                k=topk,
+                stable=stable,
+            )
+        else:
+            # Packed: a row's logits start at its offset; the top-k is told
+            # the plane width the rows stand for, so it picks as that would.
             top_k_per_row_decode(
                 scores,
                 1,
                 rows.row_ends[span],
-                picked,
+                out[span],
                 count,
                 0,
                 1,
@@ -262,98 +242,102 @@ def _score_bands(
                 row_starts=offsets,
                 plane_width=rows.width,
             )
-            if concat is not None and not request_local:
-                torch.where(
-                    picked < 0,
-                    picked,
-                    picked + concat.row_starts[span].unsqueeze(1),
-                    out=picked,
-                )
-        elif concat is not None:
-            top_k_per_row_prefill(
-                scores,
-                starts,
-                stops,
-                picked,
-                None,
-                count,
-                scores.stride(0),
-                scores.stride(1),
-                k=topk,
-                stable=stable,
+
+
+def _score_concat_passes(query, weights, cache, rows, topk, stable, out):
+    """Packed FP8 prefill rows, pass by pass (`ConcatPass`): the pass's keys
+    gathered into the key workspace, this rank's rows of it scored band by
+    band into the packed plane, and the ranks' selections gathered back.
+    Ids come back local to each row's request."""
+    keys, scores = rows.concat, rows.workspace.packed_logits()
+    for p in rows.passes:
+        lo, hi = p.lo, p.hi
+        if not p.stride:
+            continue  # no rows in the pass, alike on every DCP rank
+        k_fp8, k_scale = _gather_pass_keys(cache, keys, p)
+        # Each row's key range within the pass; PCP padding (start 0, no
+        # keys) stays empty.
+        starts = (keys.row_starts[lo:hi] - p.key_base).clamp_min_(0)
+        ends = starts + rows.row_ends[lo:hi]
+        for first, end in p.bands:
+            span, local = slice(first, end), slice(first - lo, end - lo)
+            offsets = rows.packed_offsets[span]
+            fp8_mqa_logits(
+                Q=query[span],
+                KV=k_fp8,
+                kv_scales=k_scale,
+                weights=weights[span],
+                cu_starts=starts[local],
+                cu_ends=ends[local],
+                clean_logits=False,
+                out=scores,
+                out_offsets=offsets,
             )
-            # Window columns to request-local or whole-gather columns.
-            if request_local:
-                torch.where(
-                    picked < 0, picked, picked - starts.unsqueeze(1), out=picked
-                )
-            elif lo:
-                torch.where(picked < 0, picked, picked + lo, out=picked)
-        else:
+            # V4.1's packed consumer: a row's ids local to its offset.
             top_k_per_row_decode(
                 scores,
-                group,
-                rows.row_ends[items],
-                picked,
-                count,
-                scores.stride(0),
-                scores.stride(1),
+                1,
+                rows.row_ends[span],
+                out[span],
+                end - first,
+                0,
+                1,
                 k=topk,
                 stable=stable,
+                row_starts=offsets,
+                plane_width=rows.width,
+            )
+        if p.world > 1:
+            _all_gather_slot(
+                out[p.row_base :], p.stride, p.rank, p.world, get_dcp_group()
             )
 
 
-def _paged_band_logits(
-    query,
-    weights,
-    cache,
-    rows,
-    index,
-    span,
-    items,
-    scores,
-    offsets,
-    weight_scale,
-):
-    """A paged band's kernel launch, into the shared loop's output view."""
-    if cache.fp4:
-        values, scales = query
-        _fp4_band_logits(
-            values[span],
-            scales[span],
-            weights[span],
-            cache,
-            scores,
-            offsets,
-            weight_scale,
-            index,
-            rows,
+def _gather_pass_keys(cache, keys, p):
+    """Pass `p`'s committed keys, end to end, into the key workspace. Under
+    DCP each rank reads its shard into its slot of the gathered buffer, the
+    slots are all-gathered in place and put back in key order."""
+    workspace, tables = keys.workspace, keys.block_tables[p.first : p.end]
+    k_fp8, k_scale = workspace.keys(p.keys)
+    if p.dcp is None:
+        cu = keys.cu_committed[p.first : p.end + 1]
+        cp_gather_indexer_k_quant_cache(
+            cache.values,
+            k_fp8,
+            k_scale.view(dtypes.fp8),
+            tables,
+            cu - p.key_base if p.key_base else cu,
+            preshuffle=True,
         )
-    else:
-        count, group = span.stop - span.start, rows.next_n
-        _fp8_paged_mqa_logits(
-            query[span].view(count // group, group, weights.shape[1], query.shape[-1]),
-            cache.values.unsqueeze(-2),
-            weights[span],
-            scores,
-            rows.row_ends[items],
-            rows.row_tables[items],
-            rows.width,
-            KVBlockSize=cache.rows_per_block,
-            Preshuffle=True,
-        )
+        return k_fp8, k_scale
+    local_total, local_cu, gather_index = p.dcp
+    group = get_dcp_group()
+    rank, world = group.rank_in_group, group.world_size
+    shards, shard_scales = workspace.gathered(world * local_total)
+    slot = slice(rank * local_total, (rank + 1) * local_total)
+    cp_gather_indexer_k_quant_cache(
+        cache.values,
+        shards[slot],
+        shard_scales[slot].view(dtypes.fp8),
+        tables,
+        local_cu,
+        preshuffle=True,
+    )
+    # fp8 has no collective support; the keys move as bytes.
+    shard_bytes = shards.view(torch.uint8)
+    _all_gather_slot(shard_bytes, local_total, rank, world, group)
+    _all_gather_slot(shard_scales, local_total, rank, world, group)
+    torch.index_select(shard_bytes, 0, gather_index, out=k_fp8.view(torch.uint8))
+    torch.index_select(shard_scales, 0, gather_index, out=k_scale)
+    return k_fp8, k_scale
 
 
 def _gather_concat(query, cache, keys):
-    """The step's requests' committed keys, end to end: into `keys.workspace`
-    when it has one, else allocated for the step."""
-    if keys.workspace is not None:
-        k_fp8, k_scale = keys.workspace.keys(keys.total)
-    else:
-        k_fp8 = torch.empty(
-            (keys.total, query.shape[-1]), device=query.device, dtype=dtypes.fp8
-        )
-        k_scale = torch.empty((keys.total, 1), device=query.device, dtype=torch.float32)
+    """The step's requests' committed keys, end to end."""
+    k_fp8 = torch.empty(
+        (keys.total, query.shape[-1]), device=query.device, dtype=dtypes.fp8
+    )
+    k_scale = torch.empty((keys.total, 1), device=query.device, dtype=torch.float32)
     cp_gather_indexer_k_quant_cache(
         cache.values,
         k_fp8,
@@ -363,6 +347,47 @@ def _gather_concat(query, cache, keys):
         preshuffle=True,
     )
     return k_fp8, k_scale
+
+
+def _score_concat(
+    query, weights, cache, rows, topk, stable, out, gathered, request_local
+):
+    """FP8 prefill against the gathered keys. The top-k reports a key's place
+    in the gathered run; less its request's start it is the request's own."""
+    keys = rows.concat
+    k_fp8, k_scale = (
+        _gather_concat(query, cache, keys) if gathered is None else gathered
+    )
+    ends = keys.row_starts + rows.row_ends
+    for first, end in rows.bands:
+        span = slice(first, end)
+        # Allocated by the kernel, a band at a time: a prefill's temporaries
+        # are what the memory profile measures, so they are counted already.
+        scores = fp8_mqa_logits(
+            Q=query[span],
+            KV=k_fp8,
+            kv_scales=k_scale,
+            weights=weights[span],
+            cu_starts=keys.row_starts[span],
+            cu_ends=ends[span],
+            clean_logits=False,
+        )
+        top_k_per_row_prefill(
+            scores,
+            keys.row_starts[span],
+            ends[span],
+            out[span],
+            None,
+            end - first,
+            scores.stride(0),
+            scores.stride(1),
+            k=topk,
+            stable=stable,
+        )
+    if request_local and rows.bands:
+        scored = slice(rows.bands[0][0], rows.bands[-1][1])
+        picked, base = out[scored], keys.row_starts[scored].unsqueeze(1)
+        torch.where(picked < 0, picked, picked - base, out=picked)
 
 
 def _live_rows():

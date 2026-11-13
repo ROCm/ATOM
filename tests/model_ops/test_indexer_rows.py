@@ -97,134 +97,6 @@ def test_recorded_fp4_bands_keep_their_launch_arguments_in_place():
     assert second[1].tolist() == [0] * 4 + [1, 2, 3] + [3] * 4
 
 
-@pytest.mark.parametrize("request_local", [True, False])
-@pytest.mark.parametrize("world", [1, 2])
-def test_concat_bands_score_against_their_own_requests_keys(
-    monkeypatch, request_local, world
-):
-    """Each band reads only its window of the keys, into a plane row as wide as
-    the window; ids come back step- or request-local. Row 9 is PCP padding."""
-    cu_keys = np.array([0, 300, 310, 610])
-    cu_rows = np.array([0, 4, 5, 10])
-    requests = np.repeat(np.arange(3), np.diff(cu_rows))
-    row_starts = torch.tensor(cu_keys[requests], dtype=torch.int32)
-    row_starts[9] = 0
-    row_ends = torch.tensor([1, 2, 3, 4, 7, 1, 2, 3, 4, 0], dtype=torch.int32)
-    keys = rows_module.ConcatKeys(None, None, 610, row_starts)
-    plane = LogitsWorkspace(8 * chunk.concat_plane_width(310), "cpu")
-    gathered = torch.arange(610, dtype=torch.float32).view(610, 1)
-    windows = []
-
-    def fake_logits(**kwargs):
-        kv, logits = kwargs["KV"], kwargs["logits"]
-        lo = int(kv[0, 0]) if kv.shape[0] else 0
-        windows.append((lo, lo + kv.shape[0]))
-        assert logits.shape[1] == kv.shape[0]
-        assert logits.stride() == (chunk.concat_plane_width(kv.shape[0]), 1)
-        for a, b in zip(kwargs["cu_starts"].tolist(), kwargs["cu_ends"].tolist()):
-            assert 0 <= a <= b <= kv.shape[0]
-        return logits
-
-    def fake_topk(scores, starts, ends, out, _, rows, *strides, k, stable):
-        out[:, 0] = ends - 1  # each row's last visible key, in its window
-        out[:, 1:] = -1
-
-    monkeypatch.setattr(score_module, "fp8_mqa_logits", fake_logits)
-    monkeypatch.setattr(score_module, "top_k_per_row_prefill", fake_topk)
-    out = torch.zeros(10, 3, dtype=torch.int32)
-    for rank in range(world):
-        split = rows_module.RowSplit.of(10, rank, world)
-        rows = rows_module.concat_rows(
-            row_ends, keys, split, workspace=plane, requests=(cu_rows, cu_keys)
-        )
-        score_module._score_bands(
-            torch.zeros(10, 1, 1),
-            torch.zeros(10, 1),
-            None,
-            rows,
-            3,
-            1.0,
-            False,
-            None,
-            out,
-            (gathered, gathered),
-            request_local,
-        )
-    assert set(windows) == {(0, 310), (310, 610)}
-    expected = row_ends - 1 + (0 if request_local else row_starts)
-    expected[9] = -1
-    assert out[:, 0].tolist() == expected.tolist()
-    assert (out[:, 1:] == -1).all()
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
-@pytest.mark.parametrize("request_local", [True, False])
-def test_concat_workspace_bands_match_whole_run_on_gpu(request_local):
-    """Windowed FP8 bands reuse the paged scorer's workspace path without
-    changing top-k, including nonzero window starts and an empty padding row."""
-    if not score_module.FP8_MQA_LOGITS_TAKES_OUT:
-        pytest.skip("AITER fp8_mqa_logits(logits=) is required")
-    torch.manual_seed(3043)
-    device, count, heads, dim, topk = "cuda", 9, 32, 128, 64
-    cu_rows, cu_keys = np.array([0, 5, 9]), np.array([0, 513, 1282])
-    starts = torch.tensor([0] * 5 + [513] * 3 + [0], device=device, dtype=torch.int32)
-    visible = torch.tensor(
-        [509, 510, 511, 512, 513, 766, 767, 768, 0], device=device, dtype=torch.int32
-    )
-    query = torch.randn(count, heads, dim, device=device).to(score_module.dtypes.fp8)
-    keys = torch.randn(1282, dim, device=device).to(score_module.dtypes.fp8)
-    scales = torch.rand(1282, 1, device=device) + 0.5
-    weights = torch.rand(count, heads, device=device)
-    ends = starts + visible
-    whole = score_module.fp8_mqa_logits(
-        query, keys, scales, weights, starts, ends, clean_logits=True
-    )
-    expected = torch.empty(count, topk, dtype=torch.int32, device=device)
-    score_module.top_k_per_row_prefill(
-        whole,
-        starts,
-        ends,
-        expected,
-        None,
-        count,
-        whole.stride(0),
-        whole.stride(1),
-        k=topk,
-        stable=True,
-    )
-    if request_local:
-        expected = torch.where(expected < 0, expected, expected - starts[:, None])
-    workspace = LogitsWorkspace(2 * 1024, device)
-    held = workspace._logits.data_ptr()
-    rows = rows_module.concat_rows(
-        visible,
-        rows_module.ConcatKeys(None, None, 1282, starts),
-        workspace=workspace,
-        requests=(cu_rows, cu_keys),
-    )
-    observed = []
-
-    def observe(scores, span):
-        assert scores.data_ptr() == held
-        observed.append((span.start, span.stop, scores.shape[1]))
-
-    actual = score_module.score_topk(
-        query,
-        weights,
-        None,
-        rows,
-        topk=topk,
-        stable=True,
-        keys=(keys, scales),
-        request_local=request_local,
-        on_band=observe,
-    )
-    assert len(observed) > 1
-    assert {width for _, _, width in observed} == {513, 769}
-    assert sum(end - first for first, end, _ in observed) == count
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-
-
 @pytest.mark.parametrize("world", [2, 4, 8])
 @pytest.mark.parametrize("count", [1, 7, 12, 4097])
 def test_row_split_bands_only_this_rank_s_rows(world, count):
@@ -422,8 +294,15 @@ def test_striped_rows_come_back_rank_major(
 
     monkeypatch.setattr(
         score_module,
-        "_score_bands",
-        lambda query, weights, cache, rows, topk, scale, stable, on_band, out, keys, local: (
+        "_score_paged",
+        lambda query, weights, cache, rows, topk, scale, stable, on_band, out: (
+            score(query, weights, rows, out)
+        ),
+    )
+    monkeypatch.setattr(
+        score_module,
+        "_score_concat",
+        lambda query, weights, cache, rows, topk, stable, out, keys, local: (
             score(query, weights, rows, out)
         ),
     )

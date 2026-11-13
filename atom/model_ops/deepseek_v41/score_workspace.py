@@ -16,28 +16,13 @@ batch's live context rather than its rows times the model length.
 import numpy as np
 import torch
 
-from atom.model_ops.indexer.workspace import (
-    ROW_ALIGN,
-    LogitsWorkspace,
-    PackedRows,
-    aligned_spans,
-    band_offsets,
-)
-from atom.model_ops.sparse_indexer_chunk import flat_view as _view
+from atom.model_ops.indexer.workspace import ROW_ALIGN, aligned_spans, band_offsets
 from atom.model_ops.sparse_indexer_chunk import (
+    LogitsWorkspace,
     logits_rows,
     plane_rows,
 )
-
-__all__ = [
-    "ROW_ALIGN",
-    "LogitsWorkspace",
-    "PackedRows",
-    "ScoreWorkspace",
-    "aligned_spans",
-    "band_offsets",
-    "packed_capacity",
-]
+from atom.model_ops.sparse_indexer_chunk import flat_view as _view
 
 
 def packed_capacity(geometry, pages, max_tokens, plane_elements):
@@ -174,7 +159,7 @@ class ScoreWorkspace(LogitsWorkspace):
         """The packed logits, flat: a row at its `PackedRows` offset."""
         if not self.packed:
             raise ValueError("only the FP4 plane packs its logits")
-        return super().packed_logits()
+        return self._logits
 
     def packed_maxima(self):
         """The packed block maxima, flat: a row's at its `PackedRows` block

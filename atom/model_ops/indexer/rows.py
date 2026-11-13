@@ -7,12 +7,10 @@ step (`attn_metadata.index_rows`); a model reads both and computes neither."""
 
 from typing import Any, Literal, NamedTuple
 
-import numpy as np
 import torch
 
 from atom.model_ops.fp4_mqa_ragged_metadata import Fp4MqaRaggedMetadata
 from atom.model_ops.sparse_indexer_chunk import (
-    concat_window_bands,
     decode_band_rows,
     logits_rows,
     qsplit_rows,
@@ -42,8 +40,8 @@ class IndexCache(NamedTuple):
 
 class ConcatKeys(NamedTuple):
     """FP8 prefill: the step's requests' committed keys gathered end to end
-    (`cu_committed` [requests + 1], `total` rows). Row r sees
-    `[row_starts[r], row_starts[r] + row_ends[r])` of them. `workspace`:
+    (`cu_committed` [requests + 1], `total` rows) and scored densely, row r
+    over `[row_starts[r], row_starts[r] + row_ends[r])` of them. `workspace`:
     where they are gathered (`ConcatKeyWorkspace`); None, allocated per step."""
 
     block_tables: torch.Tensor
@@ -120,12 +118,12 @@ class IndexRows(NamedTuple):
     with `next_n` > 1, a request's `next_n` consecutive rows read their
     request's keys together, `row_ends` and `row_tables` then a request each
     and the bands whole requests; FP4 scores a request's rows together, band i
-    launched as `fp4_bands[i]` holds it. `packed_offsets`: FP4 or concat rows packed
-    into the workspace's flat logits, each at its offset from its band's
-    start, a band holding as many as fit. `concat`: FP8 prefill rows against
-    their requests' gathered keys (`ConcatKeys`), `width` then their total,
-    or the longest visible row for packed output;
-    `key_windows`: each band's `(lo, hi)` of those keys, None for all of them.
+    launched as `fp4_bands[i]` holds it. `packed_offsets`: FP4 or FP8 prefill
+    rows packed into the workspace's flat logits, each at its offset from its
+    band's start, a band holding as many as fit. `concat`: FP8 prefill rows
+    against their requests' gathered keys (`ConcatKeys`), `width` then their
+    total -- or, packed, the longest row -- and `passes` how they are gathered
+    and scored in the key workspace (`ConcatPass`).
     `split`: the bands are this rank's rows alone (`RowSplit`).
     `workspace`: the plane the bands were cut to (`LogitsWorkspace`, or one
     that also packs); None, a plane allocated as the rows are scored."""
@@ -140,13 +138,15 @@ class IndexRows(NamedTuple):
     concat: ConcatKeys | None = None
     next_n: int = 1
     workspace: Any = None
-    key_windows: tuple[tuple[int, int], ...] | None = None
+    passes: tuple | None = None
 
     @property
     def out_rows(self) -> int:
         """Rows of the selection: every rank's whole slot. Under a split those
         past the step's rows are slots' unscored tails, never used --
         between slots, under a striped split, whose rows stay rank-major."""
+        if self.passes:
+            return max(p.row_base + p.stride * p.world for p in self.passes)
         return self.split.stride * self.split.world
 
 
@@ -226,53 +226,39 @@ def fp8_rows(row_ends, width, workspace, row_tables, *, next_n=1) -> IndexRows:
     )
 
 
-def concat_rows(
-    row_ends,
-    keys: ConcatKeys,
-    split: RowSplit | None = None,
-    workspace=None,
-    requests=None,
-    *,
-    bands=None,
-    packed_offsets=None,
-    width=None,
-):
-    """FP8 prefill rows (this rank's, `split`) against their requests' keys: in
-    `workspace` banded by `concat_window_bands` over `requests`' host
-    `(rows, keys)` cumsums, else by the logits budget alone. Packed rows use
-    host-planned `bands` and uploaded `packed_offsets`; `width` bounds each
-    row's visible keys for top-k."""
+def concat_rows(row_ends, keys: ConcatKeys, split: RowSplit | None = None):
+    """FP8 prefill rows against their requests' gathered keys, banded by the
+    logits budget alone: a prefill's temporaries are allocated as it runs.
+    This rank's rows of them, `split` (every row by default)."""
     split = split or RowSplit.of(row_ends.shape[0])
-    windows = None
-    if packed_offsets is not None:
-        if workspace is None or bands is None:
-            raise ValueError("packed concat rows need a workspace and planned bands")
-        if requests is not None:
-            row_cu, key_cu = requests
-            windows = tuple(
-                (
-                    int(key_cu[np.searchsorted(row_cu, first, side="right") - 1]),
-                    int(key_cu[np.searchsorted(row_cu, end - 1, side="right")]),
-                )
-                for first, end in bands
-            )
-    elif workspace is None:
-        band = max(1, logits_rows(split.end - split.first, keys.total))
-        bands = _uniform_bands(split.first, split.end, band)
-    else:
-        row_cu, key_cu = requests or ((0, row_ends.shape[0]), (0, keys.total))
-        bands, windows = concat_window_bands(
-            split.first, split.end, row_cu, key_cu, workspace
-        )
+    band = max(1, logits_rows(split.end - split.first, keys.total))
     return IndexRows(
         row_ends,
-        keys.total if width is None else width,
-        bands,
+        keys.total,
+        _uniform_bands(split.first, split.end, band),
         split,
         concat=keys,
-        workspace=workspace,
-        key_windows=windows,
+    )
+
+
+def packed_concat_rows(
+    row_ends, keys: ConcatKeys, split, workspace, passes, packed_offsets, width
+):
+    """FP8 prefill rows packed into `workspace` as V4.1's FP4 rows are, their
+    keys gathered into `keys.workspace` pass by pass (`ConcatPass`).
+    `width`: the longest row, the plane the top-k picks as."""
+    if keys.workspace is None:
+        raise ValueError("packed concat rows gather into a key workspace")
+    bands = tuple(band for p in passes for band in p.bands)
+    return IndexRows(
+        row_ends,
+        width,
+        bands,
+        split,
         packed_offsets=packed_offsets,
+        concat=keys,
+        workspace=workspace,
+        passes=passes,
     )
 
 

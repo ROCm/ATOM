@@ -68,8 +68,6 @@ from atom.model_ops.glm5_next.geometry import (
     topk_output_width,
 )
 from atom.model_ops.indexer import (
-    FP8_MQA_LOGITS_TAKES_OUT,
-    FP8_MQA_LOGITS_TAKES_PACKED,
     ConcatKeys,
     Fp4LaunchStorages,
     IndexRows,
@@ -77,14 +75,15 @@ from atom.model_ops.indexer import (
     concat_rows,
     fp4_rows,
     fp8_rows,
+    packed_concat_rows,
 )
 from atom.model_ops.indexer.schedule import any_layer_skips_index_topk
-from atom.model_ops.indexer.workspace import LogitsWorkspace, band_offsets
-from atom.model_ops.sparse_indexer_chunk import (
+from atom.model_ops.indexer.workspace import (
     ConcatKeyWorkspace,
-    concat_plane_width,
-    logits_rows,
+    aligned_spans,
+    concat_passes,
 )
+from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace, plane_capacity
 from atom.model_ops.sparse_indexer_fp4 import (
     fp4_index_scale_rows,
     sparse_indexer_fp4_enabled,
@@ -270,14 +269,14 @@ def _global_index_cache_layer_ids(
 class StagedIndexRows:
     """A prefill's index rows as staged on the host, for the GPU build after
     the upload: `rows` query rows, the widest `width`; FP4 under PCP groups
-    them by its own `query_starts` entries; a pooled indexer's `pools`.
-    `packed_bands` partitions this DCP rank's FP8 rows in the logits buffer."""
+    them by its own `query_starts` entries; a pooled indexer's `pools`; FP8
+    the passes its keys are gathered and its rows packed in (`ConcatPass`)."""
 
     rows: int
     width: int
     query_starts: int | None = None
     pools: int | None = None
-    packed_bands: tuple[tuple[int, int], ...] | None = None
+    passes: tuple | None = None
 
 
 @dataclass(frozen=True)
@@ -556,7 +555,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         )
         self.index_n_heads = hf_config.index_n_heads if self.is_sparse else 0
         self.index_logits_workspace: LogitsWorkspace | None = None
-        # The FP8 prefill indexer's gathered keys (`_concat_prefill_scored`).
         self.index_prefill_key_workspace: ConcatKeyWorkspace | None = None
         self._fp4_launches = Fp4LaunchStorages(
             self.device, self.max_num_batched_tokens, self.max_bs
@@ -729,7 +727,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             mla_metadata["index_query_start_loc"] = CpuGpuBuffer(
                 self.max_bs + 2, publication_group="mla_sparse", **i32_kwargs
             )
-        if self._concat_prefill_scored() and FP8_MQA_LOGITS_TAKES_PACKED:
+        if self._concat_prefill_scored():
+            # Each packed FP8 prefill row's start in its band of the plane.
             mla_metadata["index_logits_offsets"] = CpuGpuBuffer(
                 self.max_num_batched_tokens,
                 publication_group="mla_sparse",
@@ -943,20 +942,15 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
         if self.is_sparse:
             sfc = config.compilation_config.static_forward_context
-            # The indexers' decode logits plane, every layer's in turn, which
-            # the step's rows are cut to. Allocated before the memory profile
-            # so the KV budget counts it. DCP decode scores in its fused
-            # exchange.
-            # The FP8 prefill (concat) scorer bands into the same plane: a
-            # forward publishes prefill or decode index rows, never both, so
-            # the plane is as large as the larger of the two needs.
+            # One logits plane for every indexer layer, allocated before the memory
+            # profile: decode rows (not DCP's) are cut to it, FP8 prefill rows packed.
             capacity = 0
             if self._publishes_decode_index_rows():
-                width = self._index_decode_width()
-                capacity = logits_rows(self.max_bs * max_seqlen_qo, width) * width
+                capacity = plane_capacity(
+                    self.max_bs * max_seqlen_qo, self._index_decode_width()
+                )
             if self._concat_prefill_scored():
-                self._alloc_prefill_concat_keys()
-                capacity = max(capacity, self._prefill_concat_plane_capacity())
+                capacity = max(capacity, self._alloc_prefill_concat())
             if capacity:
                 self.index_logits_workspace = LogitsWorkspace(capacity, self.device)
                 logger.info(
@@ -1918,7 +1912,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             ),
         )
 
-    def _build_dcp_indexer_prefill_meta(self, attn_metadata, bs: int, prefix: str):
+    def _build_dcp_indexer_prefill_meta(
+        self, attn_metadata, bs: int, prefix: str, passes=None
+    ):
         """Metadata for the DCP sparse-prefill indexer gather, off the
         ``prefix`` set's host mirrors.
 
@@ -1946,8 +1942,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             round-robin ``p%W`` / ``p//W``), hence
             ``src = owner(p) * sum(Lpad) + cu_pad[b] + local_index(p)``.
         """
-        from atom.model_ops.dcp_ops import dcp_local_index, dcp_owner_rank
-
         W = self.dcp_world_size
         S = self.cp_kv_cache_interleave_size
         var = self.model_runner.forward_vars
@@ -1958,25 +1952,16 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         lpad = ((g_lens + S * W - 1) // (S * W)) * S
         cu_pad = np.zeros(bs + 1, dtype=np.int64)
         np.cumsum(lpad, out=cu_pad[1:])
-        local_total = int(cu_pad[bs])
-        total_kv = int(g_cu[bs])
-
-        # Position within its sequence for every global KV token.
-        pos = np.arange(total_kv, dtype=np.int64) - np.repeat(g_cu[:bs], g_lens)
-        src = (
-            dcp_owner_rank(pos, W, S) * local_total
-            + np.repeat(cu_pad[:bs], g_lens)
-            + dcp_local_index(pos, W, S)
-        )
-
-        dev = self.device
-        attn_metadata.dcp_indexer_local_total = local_total
-        attn_metadata.dcp_indexer_local_cu_seqlens = torch.from_numpy(
-            cu_pad.astype(np.int32)
-        ).to(dev, non_blocking=True)
-        attn_metadata.dcp_indexer_gather_index = torch.from_numpy(
-            src.astype(np.int32)
-        ).to(dev, non_blocking=True)
+        # FP8 gathers its keys in passes (`ConcatPass`); FP4 a step at once.
+        ranges = [(0, bs)] if passes is None else [(p.first, p.end) for p in passes]
+        gathers = self._dcp_gathers(ranges, g_cu, g_lens, cu_pad)
+        if passes is not None:
+            return gathers
+        (
+            attn_metadata.dcp_indexer_local_total,
+            attn_metadata.dcp_indexer_local_cu_seqlens,
+            attn_metadata.dcp_indexer_gather_index,
+        ) = gathers[0]
         if self._indexer_fp4:
             self._build_dcp_indexer_fp4_prefill_meta(
                 attn_metadata,
@@ -2288,8 +2273,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         var = self.model_runner.forward_vars
         staged = self._sparse_prefill_staged.pop(prefix)
         if staged is not None:
+            gathers = None
             if self.dcp_world_size > 1:
-                self._build_dcp_indexer_prefill_meta(attn_metadata, bs, prefix)
+                gathers = self._build_dcp_indexer_prefill_meta(
+                    attn_metadata, bs, prefix, staged.index_rows.passes
+                )
             self._sparse_prefill_work_plan(
                 attn_metadata,
                 prefix,
@@ -2301,12 +2289,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                     attn_metadata, batch.scheduled_tokens, staged.sparse_counts, prefix
                 )
             self._finish_prefill_index_rows(
-                attn_metadata,
-                bs,
-                staged.index_rows,
-                staged.total_kv,
-                prefix,
-                staged.pcp_split,
+                attn_metadata, bs, staged.index_rows, staged.total_kv, prefix, gathers
             )
 
         if self._prefill_reads_token_csr(attn_metadata):
@@ -2795,65 +2778,86 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         and a pooled one's."""
         return self.is_sparse and not self._indexer_fp4 and self.index_kpool == 1
 
-    def _concat_requests(self, attn_metadata, bs, prefix, pcp_split, rows):
-        """Host cumsums of the ``prefix`` set's requests' index rows (under PCP
-        the rows this rank owns) and committed keys (`concat_rows`)."""
-        var = self.model_runner.forward_vars
-        cu_q = var[f"{prefix}cu_seqlens_q"].np[: bs + 1]
-        if pcp_split:
-            cu_q = pcp_owned_rows_by_request(
-                cu_q, get_pcp_rank(), get_pcp_world_size(), rows
-            )
-        committed = "cu_seqlens_k" if attn_metadata.has_cached else "cu_seqlens_q"
-        return cu_q, var[prefix + committed].np[: bs + 1]
-
-    def _prefill_concat_plane(self) -> LogitsWorkspace | None:
-        """The plane FP8 prefill bands are scored into; None when aiter's
-        scorer allocates its own."""
-        return self.index_logits_workspace if FP8_MQA_LOGITS_TAKES_OUT else None
-
-    def _alloc_prefill_concat_keys(self) -> None:
-        """Allocate the FP8 prefill indexer's gathered-key workspace: one
-        request of the model length plus a chunk, and under DCP the
-        all-gathered shards of that many keys. A step whose requests together
-        hold more grows it (`ConcatKeyWorkspace`).
-
-        Sized by the configuration, not the step: allocated per step these are
-        as long as the step's context, so every chunk of a long prefill asks
-        the caching allocator for a slightly larger block than the last,
-        which it never has, until HBM runs out."""
+    def _alloc_prefill_concat(self) -> int:
+        """Allocate the FP8 prefill indexer's gathered keys: a request of the
+        model length plus a step's tokens, a step past it gathered in passes
+        (`concat_passes`). Returns the fp32 elements its packed rows need: a
+        PCP/DCP rank's share of a step's rows within the logits budget, never
+        less than one row of the model length."""
         config = self.model_runner.config
-        world = self.dcp_world_size
-        keys = config.max_model_len + self.max_num_batched_tokens
-        gathered = 0
-        if world > 1:
-            # A request's shard is padded to its interleave super-block.
-            shard = -(-keys // world) + self.max_bs * self.cp_kv_cache_interleave_size
-            gathered = world * shard
-        self.index_prefill_key_workspace = ConcatKeyWorkspace(
-            keys, config.hf_config.index_head_dim, dtypes.fp8, self.device, gathered
+        keys = self.index_prefill_key_workspace = ConcatKeyWorkspace.for_config(
+            config.max_model_len,
+            self.max_num_batched_tokens,
+            self.max_bs,
+            config.hf_config.index_head_dim,
+            dtypes.fp8,
+            self.device,
+            self.dcp_world_size,
+            self.cp_kv_cache_interleave_size,
         )
         logger.info(
             "FP8 prefill indexer key workspace: %.2f GiB (%d keys)",
-            self.index_prefill_key_workspace.nbytes / (1 << 30),
-            keys,
+            keys.nbytes / (1 << 30),
+            keys.capacity,
         )
+        rows = cdiv(
+            cdiv(self.max_num_batched_tokens, get_pcp_world_size()),
+            self.dcp_world_size,
+        )
+        return plane_capacity(rows, int(aligned_spans(config.max_model_len)))
 
-    def _prefill_concat_plane_capacity(self) -> int:
-        """fp32 elements the logits plane needs for FP8 prefill bands: a
-        rank's share of a step's rows (`RowSplit`) across a request of the
-        model length, within the logits budget. 0 when aiter's scorer cannot
-        write into a plane: its bands are then allocated per call."""
-        if not FP8_MQA_LOGITS_TAKES_OUT:
-            logger.warning(
-                "aiter fp8_mqa_logits takes no logits buffer: FP8 prefill index "
-                "logits are allocated per band, a block that grows with the "
-                "context through a long prefill"
+    def _plan_concat_passes(self, bs, row_ends, pcp_split, has_cached, group, prefix):
+        """The FP8 prefill's passes (`concat_passes`) over the ``prefix`` set's
+        requests -- under PCP the rows this rank owns -- and this rank's rows'
+        packed offsets, on the host."""
+        var = self.model_runner.forward_vars
+        row_cu = var[f"{prefix}cu_seqlens_q"].np[: bs + 1]
+        if pcp_split:
+            row_cu = pcp_owned_rows_by_request(
+                row_cu, get_pcp_rank(), get_pcp_world_size(), len(row_ends)
             )
-            return 0
-        rows = -(-self.max_num_batched_tokens // self.dcp_world_size)
-        width = concat_plane_width(self.model_runner.config.max_model_len)
-        return logits_rows(rows, width) * width
+        committed = "cu_seqlens_k" if has_cached else "cu_seqlens_q"
+        name = f"{prefix}index_logits_offsets"
+        passes = concat_passes(
+            row_cu,
+            var[prefix + committed].np[: bs + 1],
+            row_ends,
+            var[name].np,
+            self.index_prefill_key_workspace.capacity,
+            self.index_logits_workspace.capacity,
+            self.dcp_rank,
+            self.dcp_world_size,
+        )
+        group.set_counts({name: len(row_ends)})
+        return passes
+
+    def _dcp_gathers(self, ranges, g_cu, g_lens, cu_pad):
+        """Per request range `(first, end)`: the shards' total, their local
+        cu-seqlens and each key's place in their all-gather (global sequence
+        position p lives on rank owner(p) at local_index(p))."""
+        from atom.model_ops.dcp_ops import dcp_local_index, dcp_owner_rank
+
+        W, S = self.dcp_world_size, self.cp_kv_cache_interleave_size
+
+        def upload(host):
+            return torch.from_numpy(host.astype(np.int32)).to(
+                self.device, non_blocking=True
+            )
+
+        gathers = []
+        for first, end in ranges:
+            lens, base = g_lens[first:end], cu_pad[first]
+            total = int(cu_pad[end] - base)
+            pos = np.arange(g_cu[end] - g_cu[first]) - np.repeat(
+                g_cu[first:end] - g_cu[first], lens
+            )
+            src = (
+                dcp_owner_rank(pos, W, S) * total
+                + np.repeat(cu_pad[first:end] - base, lens)
+                + dcp_local_index(pos, W, S)
+            )
+            gathers.append((total, upload(cu_pad[first : end + 1] - base), upload(src)))
+        return gathers
 
     def _publishes_decode_index_rows(self) -> bool:
         """Whether a decode step publishes its index rows (`IndexRows`): every
@@ -2977,26 +2981,16 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         rows = len(row_ends)
         var[f"{prefix}index_row_ends"].np[:rows] = row_ends
         group.set_counts({f"{prefix}index_row_ends": rows})
-        packed_bands = None
-        if self._concat_prefill_scored() and FP8_MQA_LOGITS_TAKES_PACKED:
-            split = RowSplit.of(rows, self.dcp_rank, self.dcp_world_size)
-            name = f"{prefix}index_logits_offsets"
-            offsets = var[name].np[:rows]
-            offsets.fill(0)
-            cuts = band_offsets(
-                row_ends[split.first : split.end],
-                self.index_logits_workspace.capacity,
-                offsets[split.first : split.end],
+        passes = None
+        if self._concat_prefill_scored():
+            passes = self._plan_concat_passes(
+                bs, row_ends, pcp_split, has_cached, group, prefix
             )
-            packed_bands = tuple(
-                (first + split.first, end + split.first) for first, end in cuts
-            )
-            group.set_counts({name: rows})
         return StagedIndexRows(
             rows,
             max(int(row_ends.max(initial=0)), 1),
             query_starts=query_starts,
-            packed_bands=packed_bands,
+            passes=passes,
         )
 
     def _finish_prefill_index_rows(
@@ -3006,7 +3000,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         staged: StagedIndexRows,
         total_kv: int,
         prefix: str,
-        pcp_split: bool,
+        gathers=None,
     ) -> None:
         """A prefill's index rows (`IndexRows`) over the ``prefix`` set's
         uploaded bounds: FP8 against the requests' keys gathered end to end,
@@ -3039,21 +3033,18 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 row_starts=attn_metadata.cu_seqlen_ks,
                 workspace=self.index_prefill_key_workspace,
             )
-            attn_metadata.index_rows = concat_rows(
+            passes = staged.passes
+            if gathers is not None:
+                # Under DCP each pass gathers every rank's shard of its keys.
+                passes = tuple(p._replace(dcp=g) for p, g in zip(passes, gathers))
+            attn_metadata.index_rows = packed_concat_rows(
                 ends,
                 keys,
                 split,
-                workspace=self._prefill_concat_plane(),
-                requests=self._concat_requests(
-                    attn_metadata, bs, prefix, pcp_split, rows
-                ),
-                bands=staged.packed_bands,
-                packed_offsets=(
-                    var[f"{prefix}index_logits_offsets"].gpu[:rows]
-                    if staged.packed_bands is not None
-                    else None
-                ),
-                width=staged.width if staged.packed_bands is not None else None,
+                self.index_logits_workspace,
+                passes,
+                var[f"{prefix}index_logits_offsets"].gpu[:rows],
+                staged.width,
             )
             return
         # A prefill is eager, so its plane is as wide as its longest row.

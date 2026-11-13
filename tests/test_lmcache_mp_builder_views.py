@@ -197,8 +197,6 @@ def mla_builder_cls():
         ),
         "atom.model_ops.indexer": _module(
             "atom.model_ops.indexer",
-            FP8_MQA_LOGITS_TAKES_OUT=False,
-            FP8_MQA_LOGITS_TAKES_PACKED=False,
             ConcatKeys=noop,
             RowSplit=noop,
             Fp4LaunchStorages=noop,
@@ -206,6 +204,13 @@ def mla_builder_cls():
             concat_rows=noop,
             fp4_rows=noop,
             fp8_rows=noop,
+            packed_concat_rows=noop,
+        ),
+        "atom.model_ops.indexer.workspace": _module(
+            "atom.model_ops.indexer.workspace",
+            ConcatKeyWorkspace=noop,
+            aligned_spans=noop,
+            concat_passes=noop,
         ),
         "atom.model_ops.indexer.schedule": _module(
             "atom.model_ops.indexer.schedule", any_layer_skips_index_topk=noop

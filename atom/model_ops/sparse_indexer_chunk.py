@@ -3,23 +3,18 @@
 
 """Row chunking for the dense ``fp8_mqa_logits`` indexer logits buffer.
 
-Rectangular sparse-MLA indexer prefill paths score queries against the committed KV through a dense
+Every sparse-MLA indexer prefill path (native DeepSeek V3.2/V4, GLM-5.x, and the
+vLLM plugin) scores queries against the committed KV through a dense
 ``[rows, row_width]`` fp32 logits matrix. ``row_width`` is the sum of all
 co-scheduled prefill contexts, which ``max_num_batched_tokens`` does not bound,
 so a burst of long-context requests can push one allocation to tens of GiB
 (issue #1376). Those paths therefore split the Q rows into chunks; this module
-owns their row limit and persistent storage. Packed FP8/FP4 callers use the
-shared row planner in `indexer.workspace` with the same flat storage.
+owns the one rule they all need to agree on.
 """
 
-import logging
-
-import numpy as np
 import torch
 
 from atom.utils import envs
-
-logger = logging.getLogger("atom")
 
 # A buffer resource descriptor addresses at most 2^31 bytes, so aiter's
 # fp8_mqa_logits drops to plain global load/store once the logits tensor reaches
@@ -85,6 +80,12 @@ def logits_rows(rows, width):
             rows, width, envs.ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB
         ),
     )
+
+
+def plane_capacity(rows, width):
+    """fp32 elements of a `width`-column plane for `rows` query rows, in as
+    many bands as the logits budget asks."""
+    return logits_rows(rows, width) * width
 
 
 def capped_logits_rows(rows, width, capacity, min_rows=1):
@@ -222,7 +223,7 @@ class LogitsWorkspace:
     def for_rows(cls, rows: int, width: int, device) -> "LogitsWorkspace":
         """A plane for `rows` query rows of `width` columns, in as many bands
         as the logits budget asks."""
-        return cls(logits_rows(rows, width) * width, device)
+        return cls(plane_capacity(rows, width), device)
 
     @property
     def nbytes(self) -> int:
@@ -233,123 +234,10 @@ class LogitsWorkspace:
         allocation, whichever is smaller, in whole groups of `group` rows."""
         return decode_band_rows(rows, width, group, self._logits.numel() // width)
 
-    def logits(self, rows: int, width: int, *, row_align: int = 1) -> torch.Tensor:
-        """A `[rows, width]` band, with an aligned row pitch when required.
-
-        Paged scorers use the logical width as the pitch. The FP8 concat
-        scorer needs 256-column alignment but must see only the key window's
-        columns. Both views are bounded by this workspace's storage.
-        """
-        if row_align == 1:
-            return flat_view(self._logits, rows, width)
-        pitch = max(row_align, -(-width // row_align) * row_align)
-        return flat_view(self._logits, rows, pitch)[:, :width]
+    def logits(self, rows: int, width: int) -> torch.Tensor:
+        """`[rows, width]` fp32, one band of the plane; fails past it."""
+        return flat_view(self._logits, rows, width)
 
     def packed_logits(self) -> torch.Tensor:
-        """The flat buffer, addressed by each packed row's band-local offset."""
+        """The flat plane, a packed row at its band-local offset."""
         return self._logits
-
-
-# aiter allocates a dense prefill plane with rows padded to this many columns;
-# a plane carved from a workspace keeps the same row pitch.
-CONCAT_PLANE_ROW_ALIGN = 256
-
-
-def concat_plane_width(keys: int) -> int:
-    """Row pitch of an FP8 prefill (concat) logits band over `keys` gathered
-    keys: `keys` rounded up to `CONCAT_PLANE_ROW_ALIGN`."""
-    align = CONCAT_PLANE_ROW_ALIGN
-    return max(align, -(-keys // align) * align)
-
-
-def concat_window_bands(first, end, row_cu, key_cu, plane: LogitsWorkspace):
-    """Bands of rows `[first, end)` in `plane`, each scored against a window
-    `(lo, hi)` of just its own requests' keys (`row_cu`/`key_cu` per request)."""
-    bands, windows = [], []
-    start = first
-    while start < end:
-        request = int(np.searchsorted(row_cu, start, side="right")) - 1
-        lo = int(key_cu[request])
-        stop, hi = start, lo
-        while stop < end:
-            next_stop = min(int(row_cu[request + 1]), end)
-            next_hi = int(key_cu[request + 1])
-            rows = next_stop - start
-            width = concat_plane_width(next_hi - lo)
-            fit = plane.logits_rows(rows, width) if width <= plane.capacity else 0
-            if fit < rows:
-                if stop == start:
-                    if fit < 1:
-                        raise ValueError(
-                            f"the logits plane holds no row of request {request}'s "
-                            f"{next_hi - lo} keys"
-                        )
-                    stop, hi = start + fit, next_hi
-                break
-            stop, hi = next_stop, next_hi
-            request += 1
-        bands.append((start, stop))
-        windows.append((lo, hi))
-        start = stop
-    return tuple(bands), tuple(windows)
-
-
-class ConcatKeyWorkspace:
-    """The FP8 prefill indexer's gathered keys (`ConcatKeys`): every scheduled
-    request's committed keys end to end, as FP8 rows and their fp32 scales,
-    and under DCP the all-gathered rank shards they are de-interleaved from.
-    Held for the server's life, like `LogitsWorkspace`.
-
-    Allocated per step these are as long as the step's context, so each chunk
-    of a long prefill asks for a slightly larger block than the last one: the
-    caching allocator never finds one to reuse and reserves another, chunk
-    after chunk, until HBM runs out. Sized from the configuration before the
-    memory profile, they are counted in it. A step whose keys outgrow a buffer
-    doubles it -- the only allocation after startup, and a rare one: one
-    request is at most the model length, a step past it is several long
-    requests scheduled together."""
-
-    def __init__(
-        self, capacity: int, dim: int, dtype, device, gathered_capacity: int = 0
-    ):
-        self.dim, self.dtype, self.device = dim, dtype, device
-        self._keys = self._buffers(capacity)
-        self._gathered = self._buffers(gathered_capacity)
-
-    def _buffers(self, rows: int) -> tuple[torch.Tensor, torch.Tensor]:
-        return (
-            torch.empty((rows, self.dim), dtype=self.dtype, device=self.device),
-            torch.empty((rows, 1), dtype=torch.float32, device=self.device),
-        )
-
-    @property
-    def nbytes(self) -> int:
-        return sum(t.numel() * t.element_size() for t in (*self._keys, *self._gathered))
-
-    def _grown(self, buffers, rows: int, what: str):
-        held = buffers[0].shape[0]
-        if rows <= held:
-            return buffers
-        grown = max(rows, 2 * held)
-        logger.warning(
-            "FP8 prefill indexer %s workspace: a step of %d keys outgrew %d; "
-            "growing it to %d",
-            what,
-            rows,
-            held,
-            grown,
-        )
-        return self._buffers(grown)
-
-    def keys(self, rows: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """`[rows, dim]` FP8 keys and `[rows, 1]` fp32 scales the scorer reads."""
-        self._keys = self._grown(self._keys, rows, "key")
-        values, scales = self._keys
-        return values[:rows], scales[:rows]
-
-    def gathered(self, rows: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """`[rows, dim]` FP8 and `[rows, 1]` fp32: DCP's all-gathered shards,
-        rank-major, which `keys` is de-interleaved from."""
-        self._gathered = self._grown(self._gathered, rows, "gathered-shard")
-        values, scales = self._gathered
-        return values[:rows], scales[:rows]
