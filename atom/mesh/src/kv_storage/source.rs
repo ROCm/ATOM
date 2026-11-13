@@ -156,8 +156,8 @@ pub struct PoolAnswer {
     pub tainted: bool,
 }
 
-/// Merges the pools' answers key by key, as ATOM's scheduler does: a failed pool is left
-/// out and a tainted one holds nothing. A key is in the fastest tier any pool holds it in,
+/// Merges the pools' answers key by key, as ATOM's scheduler does: a failed pool, or one
+/// answering for another number of keys, is left out and a tainted one holds nothing. A key is in the fastest tier any pool holds it in,
 /// absent if the pools that answered for it hold it nowhere, and unknown if none could
 /// answer for it. The backend fails only when every pool did.
 pub fn merge_pools(
@@ -167,12 +167,13 @@ pub fn merge_pools(
     let pools: Vec<&PoolAnswer> = answers
         .iter()
         .filter_map(|answer| answer.as_ref().ok())
+        .filter(|pool| pool.states.len() == keys)
         .collect();
     if pools.is_empty() {
         let failed = answers
             .iter()
             .find_map(|answer| answer.as_ref().err().copied());
-        return Err(failed.unwrap_or(FailReason::Transport));
+        return Err(failed.unwrap_or(FailReason::BadResponse));
     }
     Ok((0..keys)
         .map(|key| {
