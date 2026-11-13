@@ -264,7 +264,9 @@ frees it. Instead, a transfer that is still not terminal after
 `lmcache.mp.transfer_deadline_s` (default 30 s) is fatal: the worker raises
 `LMCacheTransferUnprovable` and the engine stops. This is a per-transfer deadline
 from submission, including time queued at the MP server, not a model request
-timeout or a heartbeat timeout. It also catches a live server whose ZMQ handler
+timeout or a heartbeat timeout. A native-state load's restore is held to the same
+deadline, counted from when its copy is enqueued, not from submission.
+The deadline from submission also catches a live server whose ZMQ handler
 failed without replying; no LMCache transport changes are required. The scheduler
 independently watches dispatched operations with an additional 10 s margin for
 lost or never-aggregated completion reports. These checks run when the respective
@@ -1231,6 +1233,16 @@ Under `--kv_cache_dtype fp8`, each KV block carries its own `k_scale` / `v_scale
 (`dense/kv_byte_codec.py`). The scales travel with the quantized data, so a
 reloaded fp8 block dequantizes identically; no scale is recomputed or dropped.
 
+### Multimodal prompts: salted keys
+
+Image placeholder ids are the same for every picture, so a prompt with a
+`cache_seed` keys its tier objects by it as well (`tier_cache_salt`,
+`_offload_common.py`): `lmcache_mp` as `IPCCacheServerKey.cache_salt`, the
+in-process engine as the `lmcache.tag.cache_salt` key tag. Lookups, saves and
+loads of the chunked schedulers and of DSV4 PAGE+SLOT carry it. Text prompts
+key unchanged. DSV4's SLOT boundary hashes start from the same `cache_seed`, as
+`BlockManager`'s chain does; Mooncake seeds its chain (`chain_seed`).
+
 ### Invariants enforced in code
 
 | Invariant | Where | Why |
@@ -1462,7 +1474,8 @@ env var. This per-thread isolation is exactly why load and save never contend.
   `lookup_server_worker_ids=[0]` so rank 0 is the authoritative lookup answerer at
   TP>1. `build_lmcache_metadata()` fills `kv_shape` from `hf_config` and pins a
   shared `engine_id` so the scheduler's lookup client and the workers' lookup
-  servers derive the **same** ZMQ socket path.
+  servers derive the **same** ZMQ socket path, one per server
+  (`server_instance_id`) and DP rank.
 - **`metadata.py`** — `ATOMRawBytesLMCacheMetadata` overrides LMCache's allocation
   to hand out opaque `uint8` MemoryObjs (`get_shapes` returns
   `nblocks × bytes_per_block`) and asserts
