@@ -51,6 +51,7 @@ from atom.kv_transfer.offload.dense.connector import (
     DenseOffloadConnector,
     DenseOffloadScheduler,
 )
+from atom.kv_transfer.offload.dense.kv_byte_codec import DenseKVByteCodec
 from atom.kv_transfer.offload.metadata import (
     LMCacheOffloadMetadata,
     LMCacheReqMeta,
@@ -720,7 +721,7 @@ def test_engine_compatibility_refuses_what_phase_one_does_not_move():
     check_engine_compatibility(cfg, _config())
     state_owning = _config()
     state_owning.hf_config.model_type = "kimi_linear"
-    with pytest.raises(ValueError, match="dense KV layout and V4.1's replay PAGEs"):
+    with pytest.raises(ValueError, match="M3 PAGE layout, and V4.1's replay PAGEs"):
         check_engine_compatibility(cfg, state_owning)
     with pytest.raises(ValueError, match="decode context parallelism"):
         check_engine_compatibility(cfg, _config(decode_context_parallel_size=4))
@@ -3180,9 +3181,10 @@ def test_v41_registration_uses_pages_without_request_slots(
     config = _registering_config()
     config.hf_config.model_type = "deepseek_v41"
     config.enable_encoder_swa_bounded_replay = True
-    pages = object()
+    pages = [object()]
     transfer = SimpleNamespace(
         block_regions=pages,
+        block_tensor_views=[SimpleNamespace(device=torch.device("cpu"))],
         num_blocks=8,
         state_backend=SimpleNamespace(
             state_transfer=lambda: SimpleNamespace(replays=True)
@@ -3194,14 +3196,13 @@ def test_v41_registration_uses_pages_without_request_slots(
         selected.update(kwargs)
         # The fixture's fake transfer engine uses CPU bytes. Keep its normal
         # codec while verifying which PAGE/SLOT contract registration selects.
-        codec = worker_mod.DenseKVByteCodec(_kv_caches(), num_blocks=8)
+        codec = DenseKVByteCodec(_kv_caches(), num_blocks=8)
         monkeypatch.setattr(
             type(codec), "has_fused_chunk_major_staging", property(lambda self: True)
         )
         return codec
 
     monkeypatch.setattr(dsv4_codec, "DSV4PageSlotCodec", page_codec)
-    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     worker = MooncakeStoreOffloadConnector(config)
     try:
         worker.register_kv_caches({}, transfer_tensors=transfer, num_blocks=8)
@@ -3820,13 +3821,16 @@ def test_mixed_windows_report_the_same_chunks(
 
 
 def test_v41_architecture_alias_and_codec_identity():
-    from atom.kv_transfer.offload.mooncake_store.config import uses_replay_pages
+    from atom.kv_transfer.offload.mooncake_store.layouts import (
+        REPLAY_PAGE_CODEC_ID,
+        mooncake_codec_id,
+    )
 
     config = _config()
     dense = keys.store_namespace(config, CHUNK)
     config.hf_config.model_type = "deepseek_v41"
     config.enable_encoder_swa_bounded_replay = True
-    assert uses_replay_pages(config)
+    assert mooncake_codec_id(config) == REPLAY_PAGE_CODEC_ID
     assert keys.store_namespace(config, CHUNK) != dense
 
 
@@ -3841,14 +3845,19 @@ def test_pure_page_codec_rejects_missing_or_invalid_count(blocks):
 def test_pure_page_codec_rejects_missing_fused_staging(monkeypatch):
     from atom.kv_transfer.offload import page_codec
 
-    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(
         page_codec,
         "DSV4PageSlotCodec",
         lambda **kw: SimpleNamespace(has_fused_chunk_major_staging=False),
     )
     with pytest.raises(RuntimeError, match="fused chunk-major PAGE"):
-        page_codec.pure_page_codec(SimpleNamespace(block_regions=[object()]), 8)
+        page_codec.pure_page_codec(
+            SimpleNamespace(
+                block_regions=[object()],
+                block_tensor_views=[SimpleNamespace(device=torch.device("cpu"))],
+            ),
+            8,
+        )
 
 
 def test_plain_v4_is_refused_before_weights_load():
@@ -3865,14 +3874,17 @@ def test_plain_v4_is_refused_before_weights_load():
     "model_type", ["deepseek_v41", "deepseek_v41_text", "deepseek_v41_dspark"]
 )
 def test_every_v41_spelling_is_admitted_with_bounded_replay(model_type):
-    from atom.kv_transfer.offload.mooncake_store.config import uses_replay_pages
+    from atom.kv_transfer.offload.mooncake_store.layouts import (
+        REPLAY_PAGE_CODEC_ID,
+        mooncake_codec_id,
+    )
 
     config = _config()
     config.hf_config.model_type = model_type
     config.hf_config.compress_ratios = [4, 128]
     config.enable_encoder_swa_bounded_replay = True
     check_engine_compatibility(parse_mooncake_store_config(_extra()), config)
-    assert uses_replay_pages(config)
+    assert mooncake_codec_id(config) == REPLAY_PAGE_CODEC_ID
 
 
 def test_store_reads_the_region_map_only_on_a_page_layout():
@@ -3884,3 +3896,73 @@ def test_store_reads_the_region_map_only_on_a_page_layout():
     v41 = _config(kv_transfer_config=store)
     v41.hf_config.model_type = "deepseek_v41"
     assert KVConnectorFactory.topology_reads_block_regions(v41)
+
+
+@pytest.mark.parametrize("model_type", ["minimax_m3", "minimax_m3_vl"])
+def test_m3_store_codec_includes_all_page_planes(model_type, monkeypatch):
+    from atom.kv_transfer.disaggregation.page_region import page_region
+    from atom.kv_transfer.disaggregation.types import KVTransferTensors
+    from atom.kv_transfer.offload.hybrid.dsv4.codec import DSV4PageSlotCodec
+    from atom.kv_transfer.offload.mooncake_store.layouts import build_mooncake_codec
+
+    # Exercise real PAGE geometry on CPU; GPU capability refusal is tested
+    # separately in test_m3_offload_codec.py.
+    monkeypatch.setattr(
+        DSV4PageSlotCodec, "has_fused_chunk_major_staging", property(lambda _: True)
+    )
+    config = _config()
+    config.hf_config.model_type = model_type
+    check_engine_compatibility(parse_mooncake_store_config(_extra()), config)
+    fields = {
+        name: torch.zeros((4, width), dtype=torch.uint8)
+        for name, width in [
+            ("k", 2048),
+            ("v", 2048),
+            ("k_scale", 64),
+            ("v_scale", 64),
+            ("index", 144),
+            ("draft", 2048),
+        ]
+    }
+    transfer = KVTransferTensors(
+        pages=[page_region(t, semantic_role=f"m3.{name}") for name, t in fields.items()]
+    )
+    transfer.set_block_count(4)
+    codec = build_mooncake_codec(
+        config, {}, transfer, 4, permit_per_request_state=False
+    )
+    assert codec.bytes_per_block == sum(t.shape[1] for t in fields.values())
+    for bad in (None, KVTransferTensors()):
+        with pytest.raises(ValueError, match="non-empty block_regions"):
+            build_mooncake_codec(config, {}, bad, 4, permit_per_request_state=False)
+
+
+def test_m3_store_namespace_separates_complete_pages_from_dense_codec(monkeypatch):
+    config = _config()
+    config.hf_config.model_type = "minimax_m3_vl"
+    # Even with an identical page namespace, a legacy dense object must not
+    # be interpreted as complete M3 PAGE bytes containing the index cache.
+    monkeypatch.setattr(offcfg, "build_page_namespace", lambda *args: "same-page")
+    m3_namespace = keys.store_namespace(config, CHUNK)
+    monkeypatch.setattr(offcfg, "select_offload_layout", lambda _: "dense")
+    assert keys.store_namespace(config, CHUNK) != m3_namespace
+
+
+@pytest.mark.parametrize("layout", ["dense", "m3"])
+def test_store_codec_version_changes_only_its_own_namespace(monkeypatch, layout):
+    from atom.kv_transfer.offload.hybrid.m3 import codec as m3_codec
+    from atom.kv_transfer.offload.mooncake_store import layouts
+
+    config = _config()
+    monkeypatch.setattr(offcfg, "select_offload_layout", lambda _: layout)
+    namespace = keys.store_namespace(config, CHUNK)
+    if layout == "m3":
+        own = (m3_codec, "M3_CODEC_ID")
+        other = (layouts, "DENSE_CODEC_ID")
+    else:
+        own = (layouts, "DENSE_CODEC_ID")
+        other = (m3_codec, "M3_CODEC_ID")
+    monkeypatch.setattr(*other, "other-codec-next-version")
+    assert keys.store_namespace(config, CHUNK) == namespace
+    monkeypatch.setattr(*own, "own-codec-next-version")
+    assert keys.store_namespace(config, CHUNK) != namespace

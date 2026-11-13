@@ -473,6 +473,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_DS_QKNORM_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_DS_QKNORM_FUSION", "1") == "1"
     ),
+    # DeepSeek-V4/V4.1 shared expert: clamp + silu(gate)*up + FP8 quant in one
+    # aiter triton kernel feeding w2. Ranks whose intermediate width is not a
+    # multiple of 128 keep the unfused path.
+    "ATOM_V4_USE_TRITON_FUSION": lambda: (
+        os.getenv("ATOM_V4_USE_TRITON_FUSION", "0") == "1"
+    ),
     "ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION", "1") == "1"
     ),
