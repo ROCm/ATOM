@@ -181,6 +181,54 @@ def test_a_dual_copy_scratch_takes_its_calibrated_word(monkeypatch):
         k.buffers(device="cpu", scratch=arena[256:], word=0)
 
 
+def test_a_launch_does_not_trace_the_program_again(monkeypatch):
+    """After the first launch, ``MonoKernel.launch`` calls the compiled function: later launches trace nothing and
+    still pass their own ``layer``. The program's one task stores its launch's tag
+    (``step * LAYER_SLOTS + layer + 1``)."""
+    pytest.importorskip("flydsl")
+    pytest.importorskip(
+        "aiter"
+    )  # (the hi device code re-exports atom.mono.device's primitives)
+    from atom.models.deepseek_v41.mono.hi.target import MI355X, device_arch
+
+    if device_arch() != MI355X.arch:
+        pytest.skip("an MI355X program")
+    import torch
+    from flydsl.compiler.kernel_function import KernelFunction
+
+    from atom.models.deepseek_v41.mono.hi.device.gfx950 import buffer_ops as bo
+    from atom.models.deepseek_v41.mono.hi.device.gfx950.ops import rsrc
+    from atom.models.deepseek_v41.mono.hi.plan.program import (
+        Program,
+        Scenario,
+        Stage,
+    )
+    from atom.models.deepseek_v41.mono.hi.runtime.kernel import MonoKernel
+
+    def store_tag(k, t):
+        bo.buffer_store(k.tag, rsrc(k.args["out"]), 0)
+
+    stage = Stage("tag", 1, store_tag, args=("out",), base=0)
+    kernel = MonoKernel(Program("launch_tag", Scenario(1, 1), [stage]))
+    bufs, out = kernel.buffers(), torch.zeros(1, dtype=torch.int32, device="cuda")
+    table = kernel.table({"out": out})
+    kernel.launch(table, bufs)
+    torch.cuda.synchronize()
+    assert out.item() == 1
+    emitted = []
+    emit = KernelFunction._emit_kernel
+    monkeypatch.setattr(
+        KernelFunction,
+        "_emit_kernel",
+        lambda *a, **k: emitted.append(1) or emit(*a, **k),
+    )
+    for layer in (1, 2):
+        kernel.launch(table, bufs, layer=layer)
+        torch.cuda.synchronize()
+        assert out.item() == layer + 1
+    assert not emitted
+
+
 def test_a_flydsl_change_keeps_flydsls_locations_and_warns_once(monkeypatch, caplog):
     """``atom.mono.runtime.srcloc.scoped``: on a fingerprint miss (a FlyDSL whose location capture is not the one
     reproduced) FlyDSL's own capture stays in place and one WARNING a process says what is skipped and its cost.

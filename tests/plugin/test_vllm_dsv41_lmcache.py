@@ -136,10 +136,10 @@ def test_a_finished_requests_save_still_finds_its_request():
     c = AtomLMCacheOffloadConnector.__new__(AtomLMCacheOffloadConnector)
     c._requests = {}
     request = SimpleNamespace(request_id="r0")
-    assert c._v41_request_of(SimpleNamespace(id="r0", _request=request)) is request
+    assert c._request_of(SimpleNamespace(id="r0", _request=request)) is request
     c._requests = {"r1": request}
-    assert c._v41_request_of(SimpleNamespace(id="r1")) is request
-    assert c._v41_request_of(SimpleNamespace(id="r2")) is None
+    assert c._request_of(SimpleNamespace(id="r1")) is request
+    assert c._request_of(SimpleNamespace(id="r2")) is None
 
 
 def test_an_unridable_finished_save_retires_and_frees_its_lease():
@@ -198,9 +198,10 @@ def _v41_scheduler(cached):
     Two checkpoint groups (1, 2), so an image is two units.
     """
     from atom.kv_transfer.offload.chunked_scheduler import ChunkedOffloadSchedulerBase
-    from atom.plugin.vllm.kv_transfer.v41_mp_scheduler import V41StateMPScheduler
+    from atom.kv_transfer.offload.mp.token_shipping import TokenShipper
+    from atom.plugin.vllm.kv_transfer.ride_mp_scheduler import StateRideMPScheduler
 
-    s = V41StateMPScheduler.__new__(V41StateMPScheduler)
+    s = StateRideMPScheduler.__new__(StateRideMPScheduler)
     ChunkedOffloadSchedulerBase.__init__(
         s,
         SimpleNamespace(
@@ -212,6 +213,9 @@ def _v41_scheduler(cached):
         ),
     )
     s._init_plugin_state()
+    # What `LMCacheMPConnectorScheduler.__init__` creates and this hand-built
+    # scheduler skips: the saves and loads below ship their tokens through it.
+    s._token_shipper = TokenShipper()
     s._mp_adapter = SimpleNamespace(end_session=lambda _session: None)
     s._scheduler_deadline_s = 3600.0
     s._transfer_seen_at = {}
@@ -224,6 +228,19 @@ def _v41_scheduler(cached):
     planner.bind_gpu_block_pool(pool)
     s.bind_planner(planner, lambda seq: seq._request)
     return s, planner, pool
+
+
+def _worker_tokens(request):
+    """The tokens a worker holds for `request` once it has resolved the step's
+    metadata: the scheduler ships them incrementally (`ShippedTokens`), and a
+    worker rebuilds the prefix (`WorkerTokens`)."""
+    from atom.kv_transfer.offload.mp.metadata import MPOffloadMetadata
+    from atom.kv_transfer.offload.mp.token_shipping import WorkerTokens, token_list
+
+    step = MPOffloadMetadata()
+    step.requests = [request]
+    WorkerTokens().resolve(step)
+    return token_list(request.token_ids)
 
 
 def _prompt(n, *, computed=None):
@@ -258,7 +275,7 @@ def test_a_save_carries_its_checkpoint_units_and_its_pin_ends_with_it():
     seq = _prompt(512)
     s.update_state_after_alloc(seq)
     [save] = s.build_connector_meta().requests
-    assert save.token_ids == list(range(512))
+    assert _worker_tokens(save) == list(range(512))
     assert save.native_state == NativeStateTransfer(
         (41, 42), 512, int.from_bytes(b"h512", "big")
     )
@@ -301,7 +318,7 @@ def test_a_finished_save_keeps_every_boundary_whose_checkpoint_exists(cached, le
         assert s.take_source_safe_releases() == [frozenset(leased)]
         return
     [save] = requests
-    assert save.token_ids == list(range(512))
+    assert _worker_tokens(save) == list(range(512))
     assert save.native_state.unit_ids == (41, 42)
     assert save.native_state.boundary_tokens == 512
     _store_landed(s, save.save_operation)
@@ -328,7 +345,7 @@ def test_a_load_carries_its_recorded_destination_or_is_declined(recorded):
         assert loads == [] and s.declined_loads == {"r0"}
         return
     [load] = loads
-    assert load.token_ids == list(range(512))
+    assert _worker_tokens(load) == list(range(512))
     assert load.native_state == NativeStateTransfer(
         (41, 42), 512, int.from_bytes(b"h512", "big")
     )

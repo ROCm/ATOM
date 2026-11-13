@@ -33,11 +33,15 @@ _VLLM_MODEL_REGISTRY_OVERRIDES: dict[str, str] = {
     "DeepseekV32MTPModel": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "DeepSeekV4MTPModel": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "Glm4MoeMTPModel": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
+    "Glm5NextMTPModel": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "Qwen3NextForCausalLM": "atom.plugin.vllm.models.qwen3_next:Qwen3NextForCausalLMVllm",
     "Qwen3NextMTP": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "Qwen3_5ForConditionalGeneration": "atom.plugin.vllm.models.qwen3_5:Qwen3_5ForConditionalGeneration",
     "Qwen3_5MoeForConditionalGeneration": "atom.plugin.vllm.models.qwen3_5:Qwen3_5MoeForConditionalGeneration",
     "KimiK25ForConditionalGeneration": "atom.plugin.vllm.models.kimi_k25:KimiK25ForConditionalGeneration",
+    "Glm5NextForConditionalGeneration": (
+        "atom.plugin.vllm.models.glm5_next:Glm5NextForCausalLMVllm"
+    ),
     "KimiK3ForConditionalGeneration": (
         "atom.plugin.vllm.models.kimi_k3:KimiK3ForConditionalGenerationVllm"
     ),
@@ -181,6 +185,14 @@ def _register_hf_configs() -> None:
         except ValueError as exc:
             if "already used by a Transformers config" not in str(exc):
                 raise
+
+    # GLM-5.3-Flash: vLLM reads the config itself but sizes the MLA cache at
+    # 512 per token, where ATOM's NoPE-padded entry is 576.
+    from atom.plugin.vllm.glm5_next_mla_head_size import (
+        install_glm5_next_mla_head_size_patch,
+    )
+
+    install_glm5_next_mla_head_size_patch()
 
 
 def _register_mxfp8_quantization_config() -> None:
