@@ -5,31 +5,114 @@
 
 The TBO branch is what keeps V4.1's comm-ahead ordering (its comm stream is
 already High), so it has to stay a branch rather than become a refactor
-casualty. The decision lives in `compute_stream` so these cases can be checked
-on a machine with no GPU build; importing the runner resolves the chip
-architecture through aiter, so only the cases below that build a stream are
-gated on a device.
+casualty. That decision lives in `compute_stream` and imports directly.
+
+The streams themselves are built by `ModelRunner`, which a CPU runner cannot
+import: aiter resolves the chip architecture through `rocminfo` on the way in.
+The builders are small and self-contained, so these tests compile them out of
+the module source and run in the pre-checkin suite rather than only where a
+device happens to be, as `test_model_runner_staging_fence` does for the
+staging-fence contracts.
 """
 
+import ast
+import logging
+import types
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-import torch
 
 from atom.model_engine.compute_stream import high_priority_compute_stream_enabled
 
 FLAG = "ATOM_HIGH_PRIORITY_COMPUTE_STREAM"
-
-needs_cuda_build = pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="importing ModelRunner resolves the chip architecture through aiter",
-)
+MODEL_RUNNER = Path(__file__).resolve().parents[1] / "atom/model_engine/model_runner.py"
+# The builders, by the class each belongs to: one that moves between the two
+# fails here rather than leaving the wrong one under test.
+STREAM_BUILDERS = {
+    "ModelRunner": ("_new_compute_priority_stream", "_enter_compute_stream"),
+    "RapidServeModelRunner": (
+        "_new_pool_fallback_stream",
+        "create_prefill_stream_pool",
+        "create_decode_stream_pool",
+    ),
+}
 
 
 def _config(**overrides):
     return SimpleNamespace(
         **{"enable_tbo": False, "enable_tbo_decode": False, **overrides}
     )
+
+
+class _FakeStream:
+    """Stand-in for torch.cuda.Stream that records device and priority."""
+
+    def __init__(self, device=None, priority=0):
+        self.device = device
+        self.priority = priority
+
+    @staticmethod
+    def priority_range():
+        return 0, -1
+
+
+class _FakeEvent:
+    """The decode pool records two events; this keeps the tests off a device."""
+
+
+def _stream_builders(calls):
+    """The runner's stream builders, compiled from the module source."""
+    module = ast.parse(MODEL_RUNNER.read_text())
+    methods = []
+    for class_name, names in STREAM_BUILDERS.items():
+        owner = next(
+            node
+            for node in module.body
+            if isinstance(node, ast.ClassDef) and node.name == class_name
+        )
+        for name in names:
+            methods.append(
+                next(
+                    node
+                    for node in owner.body
+                    if isinstance(node, ast.FunctionDef) and node.name == name
+                )
+            )
+    namespace = {
+        "torch": SimpleNamespace(
+            cuda=SimpleNamespace(
+                Stream=_FakeStream,
+                Event=_FakeEvent,
+                synchronize=lambda device=None: calls.append("synchronize"),
+                set_stream=lambda stream: calls.append(("set_stream", stream)),
+            )
+        ),
+        "logger": logging.getLogger(__name__),
+        "high_priority_compute_stream_enabled": high_priority_compute_stream_enabled,
+    }
+    exec(  # noqa: S102 - runs the production stream builders extracted above
+        compile(ast.Module(body=methods, type_ignores=[]), str(MODEL_RUNNER), "exec"),
+        namespace,
+    )
+    return namespace
+
+
+@pytest.fixture
+def runner():
+    """A bare runner carrying only what the stream builders read."""
+    calls = []
+    runner = SimpleNamespace(
+        device="cuda:3",
+        config=_config(),
+        calls=calls,
+        compute_stream=None,
+        _CU_POOL_FRACTIONS=[0.5],
+    )
+    for name, built in _stream_builders(calls).items():
+        if isinstance(built, types.FunctionType):
+            setattr(runner, name, types.MethodType(built, runner))
+    return runner
 
 
 def test_flag_off_keeps_the_default_stream(monkeypatch):
@@ -50,64 +133,6 @@ def test_tbo_wins_over_the_flag(monkeypatch, caplog, knob):
     assert FLAG in caplog.text
 
 
-class _FakeStream:
-    """Stand-in for torch.cuda.Stream that records device and priority."""
-
-    def __init__(self, device=None, priority=0):
-        self.device = device
-        self.priority = priority
-
-    @staticmethod
-    def priority_range():
-        return 0, -1
-
-
-class _FakeEvent:
-    """The pools record events; this keeps the tests off the device."""
-
-
-def _bare_runner(monkeypatch, cls, **config):
-    """An instance of `cls` with torch.cuda stubbed and nothing else built."""
-    calls = []
-    monkeypatch.setattr(torch.cuda, "Stream", _FakeStream)
-    monkeypatch.setattr(
-        torch.cuda, "synchronize", lambda device=None: calls.append("synchronize")
-    )
-    monkeypatch.setattr(
-        torch.cuda, "set_stream", lambda stream: calls.append(("set_stream", stream))
-    )
-
-    runner = cls.__new__(cls)
-    runner.device = torch.device("cuda", 3)
-    runner.config = _config(**config)
-    runner.calls = calls
-    return runner
-
-
-@pytest.fixture
-def runner(monkeypatch):
-    from atom.model_engine.model_runner import ModelRunner
-
-    return _bare_runner(monkeypatch, ModelRunner)
-
-
-@pytest.fixture
-def rapidserve_runner(monkeypatch):
-    """Builds a RapidServe runner that has entered its compute stream, as an
-    engine core does before it builds its stream pools."""
-    from atom.model_engine.model_runner import RapidServeModelRunner
-
-    def build():
-        runner = _bare_runner(
-            monkeypatch, RapidServeModelRunner, disagg_constrained=False
-        )
-        runner.compute_stream = runner._enter_compute_stream()
-        return runner
-
-    return build
-
-
-@needs_cuda_build
 def test_flag_on_switches_this_thread(runner, monkeypatch):
     monkeypatch.setenv(FLAG, "1")
 
@@ -121,27 +146,21 @@ def test_flag_on_switches_this_thread(runner, monkeypatch):
     assert runner.calls == ["synchronize", ("set_stream", stream)]
 
 
-@needs_cuda_build
-def test_decode_pool_matches_the_compute_stream(runner, monkeypatch):
-    monkeypatch.setenv(FLAG, "1")
-    compute_stream = runner._enter_compute_stream()
+def test_flag_off_builds_no_stream(runner, monkeypatch):
+    monkeypatch.delenv(FLAG, raising=False)
 
-    fallback = runner._new_compute_priority_stream()
-
-    assert fallback.priority == compute_stream.priority
-    assert fallback.device == runner.device
+    assert runner._enter_compute_stream() is None
+    assert runner.calls == []
 
 
-@needs_cuda_build
 @pytest.mark.parametrize("flag", ["0", "1"])
 def test_rapidserve_prefill_and_decode_pools_share_a_priority(
-    rapidserve_runner, monkeypatch, flag
+    runner, monkeypatch, flag
 ):
     """One side of a disaggregated rank must not outrank the other, and the
     flag has to reach prefill as well as decode."""
     monkeypatch.setenv(FLAG, flag)
-    monkeypatch.setattr(torch.cuda, "Event", _FakeEvent)
-    runner = rapidserve_runner()
+    runner.compute_stream = runner._enter_compute_stream()
 
     runner.create_prefill_stream_pool()
     runner.create_decode_stream_pool()
