@@ -496,8 +496,6 @@ class _StoreLookup(LookupClient):
 class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
     """Chunked offload scheduling with the Mooncake Store as the tier."""
 
-    pending_load_partial_token_cap = 8192
-
     # The Store reads whole chunks into fresh blocks, so an HBM hit that ends
     # inside a chunk can be lowered to the chunk floor (see
     # `BlockManager.lower_hit_to_chunk`).

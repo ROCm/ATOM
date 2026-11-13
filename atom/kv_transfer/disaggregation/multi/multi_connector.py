@@ -914,11 +914,6 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             if hasattr(c, "has_pending_work")
         )
 
-    @property
-    def pending_load_partial_token_cap(self) -> int:
-        tier = self._prefetch_tier()
-        return tier.pending_load_partial_token_cap if tier is not None else 0
-
     def admission_ready(self, seq: Any) -> bool:
         return all(connector.admission_ready(seq) for connector in self._connectors)
 
