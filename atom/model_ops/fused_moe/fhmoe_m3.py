@@ -33,6 +33,7 @@ _ACTS = ("auto", "a8", "a4")
 # Per-rank shape the rows are tuned for: MiniMax-M3.1 at TP4.
 _HIDDEN, _INTER, _ROUTED, _TOP_K, _TP = 6144, 768, 128, 4, 4
 _refused_logged = False
+_notes_logged: set[str] = set()
 
 
 def act_mode() -> str:
@@ -94,6 +95,12 @@ def refusal(
     return None
 
 
+def _note_once(key: str, msg: str, *args) -> None:
+    if key not in _notes_logged:
+        _notes_logged.add(key)
+        logger.info(msg, *args)
+
+
 def log_refusal(reason: str) -> None:
     global _refused_logged
     if not _refused_logged:
@@ -108,6 +115,13 @@ class FhmoeM3:
 
     def __init__(self, layer):
         self.layer = layer
+        _note_once(
+            "on",
+            "ATOM_M3_FHMOE=1: MXFP8 shared expert fused into the routed MoE "
+            "(129 experts / top-5, ATOM_M3_FHMOE_ACT=%s, up to %d rows a step)",
+            act_mode(),
+            MAX_ROWS,
+        )
         self.shared_mlp = None
         self._fh = None  # (shared w1, w2, w1 scale, w2 scale), FHMoE layout
         self._routed = None  # the first 128 rows of the routed tables
@@ -168,6 +182,11 @@ class FhmoeM3:
         """The routed + shared MoE of ``x`` in one fused_moe call; None above
         MAX_ROWS rows (the caller runs the unfused path)."""
         if x.shape[0] > MAX_ROWS:
+            _note_once(
+                "big",
+                "FHMoE: steps above %d rows use the unfused routed + shared path",
+                MAX_ROWS,
+            )
             return None
         from aiter import ActivationType, QuantType, dtypes
         from aiter.fused_moe import fused_moe
