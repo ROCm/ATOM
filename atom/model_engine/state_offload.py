@@ -411,6 +411,12 @@ _STATE_TIER_LAYOUTS = frozenset({"kimi_k3", "qwen"})
 #: tier off.
 _PP_STATE_TIER_LAYOUTS = frozenset({"kimi_k3"})
 
+
+def state_tier_spans_pipeline(layout: str) -> bool:
+    """Whether `layout` keeps its state tier under PP."""
+    return layout in _PP_STATE_TIER_LAYOUTS
+
+
 #: Roles from which the worker will save / load. Mirrors `_do_save` / `_do_load`
 #: in `OffloadWorkerMixin`; the state legs ride those same halves.
 _SAVE_ROLES = frozenset({"offload", "kv_both", "kv_producer"})
@@ -556,7 +562,7 @@ def state_tier_capability(config) -> StateTierCapability:
     if layout not in _STATE_TIER_LAYOUTS:
         return replace(none, reason=f"layout {layout!r} offloads no state")
     pp_size = int(getattr(config, "pipeline_parallel_size", 1) or 1)
-    if pp_size > 1 and layout not in _PP_STATE_TIER_LAYOUTS:
+    if pp_size > 1 and not state_tier_spans_pipeline(layout):
         return replace(
             none,
             reason=f"layout {layout!r} keeps no state tier at "

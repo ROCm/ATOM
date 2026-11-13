@@ -66,16 +66,9 @@ KV_SHUTDOWN_DRAIN_TIMEOUT_S = 2.0
 
 
 def publish_idle_state_work(scheduler) -> None:
-    """Publish the state loads and stores `scheduler` holds while no batch runs.
-
-    getattr, as for `kv_connector` in `_dispatch_idle_offload_work`: this path
-    is reached with scheduler doubles that implement only the connector
-    surface.
-    """
-    for name in ("_publish_state_loads", "_publish_state_stores"):
-        publish = getattr(scheduler, name, None)
-        if publish is not None:
-            publish()
+    """Publish the state loads and stores `scheduler` holds while no batch runs."""
+    scheduler._publish_state_loads()
+    scheduler._publish_state_stores()
 
 
 class EngineCore:

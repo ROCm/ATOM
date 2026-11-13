@@ -42,7 +42,10 @@ from atom.kv_transfer.offload.hybrid.kimi_k3.state_tier import (
     _JointPark,
 )
 from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata
-from atom.model_engine.state_offload import state_tier_cpu_entries
+from atom.model_engine.state_offload import (
+    state_tier_cpu_entries,
+    state_tier_spans_pipeline,
+)
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -674,9 +677,6 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
     `StateOffloadFace` and the shell's `has_state_tier`)."""
 
     _supports_early_block_release = False
-    # Whether the default `max_pending_saves` scales with the pipeline depth.
-    # Only this layout has been run with the scaled default under PP.
-    _pending_saves_scale_with_pp = True
 
     def __init__(self, config) -> None:
         super().__init__(config)
@@ -692,12 +692,16 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
         # A finished request whose save is queued keeps its blocks pinned
         # (`should_defer_free`), so the queue depth is also how much of the pool
         # a slow backend can hold. Same knob and default the DSV4 layout bounds
-        # its worker queue with, read from the other end.
+        # its worker queue with, read from the other end. The default scales
+        # with the pipeline depth only for a layout whose state tier spans the
+        # stages; only that one has been run with the scaled default under PP.
         pp_size = int(getattr(config, "pipeline_parallel_size", 1) or 1)
+        if not state_tier_spans_pipeline(offcfg.select_offload_layout(config)):
+            pp_size = 1
         self._max_pending_saves = max_pending_saves(
             getattr(config, "kv_transfer_config", None) or {},
             envs.OFFLOAD_COPY_WORKERS,
-            pp_size=pp_size if self._pending_saves_scale_with_pp else 1,
+            pp_size=pp_size,
         )
         self._save_inflight_since: dict[object, float] = {}
         self._save_stalled = False

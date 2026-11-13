@@ -773,7 +773,9 @@ def test_idle_engine_dispatches_terminal_metadata_to_all_stages(pp_size):
             is_offload=False,
             enable_chunked_transfer=True,
             build_connector_meta=lambda: meta,
-        )
+        ),
+        _publish_state_loads=lambda: None,
+        _publish_state_stores=lambda: None,
     )
     core.runner_mgr = MagicMock()
     core.pp_transport = MagicMock()
@@ -1315,7 +1317,11 @@ def test_idle_dispatch_remains_opt_in(
         enable_chunked_transfer=enabled,
         build_connector_meta=MagicMock(return_value=meta),
     )
-    core.scheduler = SimpleNamespace(kv_connector=connector)
+    core.scheduler = SimpleNamespace(
+        kv_connector=connector,
+        _publish_state_loads=lambda: None,
+        _publish_state_stores=lambda: None,
+    )
     core.runner_mgr = MagicMock()
     core.pp_transport = MagicMock()
     core._dispatch_idle_offload_work()
