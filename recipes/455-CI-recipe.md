@@ -2,7 +2,7 @@
 
 各模型在 455-CI 镜像（`rocm/fw-bringup-mlperf:gfx1250-atom-ci455-<YYYYMMDD>`，ATOM main + aiter main）上的 server、GSM8K 和 bench 命令。流程、指标口径和记录方式见 [`455-CI-guide.md`](455-CI-guide.md)；这里只写命令。
 
-目前收录 Kimi-K3 (2.8T)、GLM-5.2、MiniMax-M3 (428B)、DeepSeek R1、DeepSeek-V4.1-Flash、DeepSeek-V4-Pro、Qwen-3.8 Flash 七个模型，其余 1 个见 [`455-CI-guide.md`](455-CI-guide.md) §1。
+收录了 [`455-CI-guide.md`](455-CI-guide.md) §1 的全部 8 个模型：Kimi-K3 (2.8T)、GLM-5.2、MiniMax-M3 (428B)、DeepSeek R1、DeepSeek-V4.1-Flash、DeepSeek-V4-Pro、Qwen-3.8 Flash、Qwen-35B-A3B。
 
 ## 通用约定
 
@@ -16,20 +16,109 @@
   ```
 
 - `MODEL_PATH` 是容器内的模型路径，也是 server 的 `--model`。没有加 `--served-model-name` 的模型，请求里的模型名就是它（ATOM 会校验这个名字）。
-- **8K/1K 的 bench 所有模型用同一条命令**（指南 §3.1），只有 `MODEL_PATH` 和 `PORT` 取自各模型那一节：ATOM 的 `benchmark_serving`，随机数据，输入 8192、输出 1024，`--random-range-ratio 0.8`，请求数 `10 × CONC`，warmup `2 × CONC`（不计入结果），`--ignore-eos`。每卡吞吐按指南 §4.1 取 `total_token_throughput ÷ GPU 数`。
-
-  ```bash
-  python3 -m atom.benchmarks.benchmark_serving \
-    --model=$MODEL_PATH --backend=vllm --base-url=http://127.0.0.1:$PORT \
-    --dataset-name=random --random-input-len=8192 --random-output-len=1024 --random-range-ratio=0.8 \
-    --max-concurrency=$CONC --num-prompts=$((CONC * 10)) --num-warmups=$((CONC * 2)) \
-    --request-rate=inf --ignore-eos --trust-remote-code \
-    --save-result --result-dir=$RESULT_DIR --result-filename=raw.json \
-    --percentile-metrics="ttft,tpot,itl,e2el"
-  ```
-
-- MLPerf Endpoint 的 bench 还没有统一：DeepSeek R1 用 MLPerf 的 DeepSeek-R1 数据集（completions 接口），Kimi-K3 和 DeepSeek-V4.1-Flash 用 agentic 数据集，但两者的 client 版本、warmup 和配置写法不同。统一的写法定下来之前，按各模型那一节跑。
+- **性能命令按场景统一**（指南 §3.1）：MLPerf Endpoint 和 8K/1K 各一套，写在下面两节，所有模型都用它，各模型那一节只给和模型有关的几个值。精度命令可以按模型不同。
 - "参考值"是 2026-11-11 摸底时测的，用的不是 455-CI 镜像，GSM8K 也不是 §3.3 的口径。只用来判断量级，不是 baseline。
+
+### MLPerf Endpoint 的 bench（所有模型共用）
+
+四个模型都跑 MLPerf Endpoints 的 agentic 测试：同一个 client 版本（[`mlcommons/endpoints`](https://github.com/mlcommons/endpoints) @ `4b385eb`，不改代码）、同一份数据集、同一个配置模板和 warmup。各模型那一节只给三个值：
+
+- `SERVED_NAME`：请求里的模型名，也就是 server 的 `--served-model-name`，没设就是 `--model`；
+- `TOKENIZER`：client 所在宿主机上这个模型的目录，也就是挂进容器、成为 `/models/...` 的那个目录；
+- `SERVER`：server 的地址，单机是 `127.0.0.1:<PORT>`，Kimi-K3 是 node0 的 IP 加端口。
+
+client 装在宿主机上（不需要 GPU），每台机器装一次，数据集按 sha256 校验：
+
+```bash
+CLIENT=<宿主机上的目录>
+command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | env UV_NO_MODIFY_PATH=1 sh
+git clone -q https://github.com/mlcommons/endpoints.git $CLIENT/endpoints
+git -C $CLIENT/endpoints checkout -q --detach 4b385eb
+(cd $CLIENT/endpoints && UV_FROZEN=1 uv sync --frozen)
+mkdir -p $CLIENT/data
+curl -fsSL -o $CLIENT/data/mlperf_agentic_inference_dataset.jsonl \
+  https://endpoints.mlcommons-storage.org/mlperf_agentic_inference_dataset/mlperf_agentic_inference_dataset.jsonl
+echo "1beb24c882122df96571cf11b390acbea388944038bc55c78b891475459014ae  $CLIENT/data/mlperf_agentic_inference_dataset.jsonl" | sha256sum -c -
+```
+
+每个并发先 warmup，再正式测 10 分钟。warmup 用另一组 seed：C < 16 时 2C 条轨迹，否则 C 条，第一个 user 跑完就停。正式测试 613 条轨迹，发 10 分钟请求，整轮最长 4 小时。采样参数所有模型都一样：temperature 1.0、top_p 1.0、每轮最多生成 8192 个 token。
+
+```bash
+# point_yaml <name> <并发> <轨迹数> <warmup|run> <report_dir>
+point_yaml() {
+  cat << YAML
+name: "$1"
+version: "1.0"
+type: "online"
+model_params:
+  name: "$SERVED_NAME"
+  tokenizer_name: "$TOKENIZER"
+  temperature: 1.0
+  top_p: 1.0
+  max_new_tokens: 8192
+  streaming: "on"
+datasets:
+  - name: agentic_combined
+    type: performance
+    path: $CLIENT/data/mlperf_agentic_inference_dataset.jsonl
+    accuracy_config:
+      eval_method: agentic_inference_inline
+      num_repeats: 1
+    agentic_inference:
+      turn_timeout_s: 86400.0
+      enable_salt: true
+      inject_tool_delay: true
+      num_trajectories_to_issue: $3
+      stop_issuing_on_first_user_complete: true
+settings:
+  runtime:
+YAML
+  if [ "$4" = warmup ]; then
+    printf '    scheduler_random_seed: 1\n    dataloader_random_seed: 2\n'
+  else
+    printf '    max_issue_duration_ms: 600000\n'
+  fi
+  cat << YAML
+  timeouts:
+    run_timeout_s: 14400
+  load_pattern:
+    type: agentic_inference
+    target_concurrency: $2
+  client:
+    warmup_connections: 0
+    max_idle_time: 0.5
+endpoint_config:
+  endpoints: ["http://$SERVER"]
+  api_type: openai
+report_dir: $5
+YAML
+}
+run_point() { (ulimit -n 524288 && cd $CLIENT/endpoints && UV_FROZEN=1 uv run inference-endpoint benchmark from-config --config "$1" --mode perf); }
+
+NW=$(( CONC < 16 ? 2 * CONC : CONC ))
+point_yaml warmup-c$CONC $CONC $NW warmup $RESULT_DIR/warmup > $RESULT_DIR/warmup.yaml
+point_yaml run-c$CONC $CONC 613 run $RESULT_DIR/report > $RESULT_DIR/run.yaml
+run_point $RESULT_DIR/warmup.yaml > $RESULT_DIR/warmup.log 2>&1
+run_point $RESULT_DIR/run.yaml > $RESULT_DIR/bench.log 2>&1
+```
+
+- 结果在 `$RESULT_DIR/report/performance/result_summary.json`（指南 §4.1），inline 精度在 `$RESULT_DIR/report/scores.json`。
+- server 的上下文上限要够。按 4 个字符一个 token 估，数据集里每个对话的第一条请求就有约 3.7 万 token（system prompt 加 62 个工具定义），中位数约 4.3 万，最长约 17 万。上限更短的模型，超长的请求会失败，按指南 §4.1 把失败数写进 `note`。
+- 配置模板取自 Kimi-K3 的 MLPerf 复现手册，去掉了 `submission_ref`（client 只拿它做提交校验，以及在没写模型名时补上模型名，不影响测试），加了整轮 4 小时的上限。MLPerf 给每个模型的官方 yaml 里采样参数各不相同，这里统一用一组。
+
+### 8K/1K 的 bench（所有模型共用）
+
+ATOM 的 `benchmark_serving`：随机数据，输入 8192、输出 1024，`--random-range-ratio 0.8`，请求数 `10 × CONC`，warmup `2 × CONC`（不计入结果），`--ignore-eos`。各模型那一节只给 `MODEL_PATH` 和 `PORT`。每卡吞吐按指南 §4.1 取 `total_token_throughput ÷ GPU 数`。
+
+```bash
+python3 -m atom.benchmarks.benchmark_serving \
+  --model=$MODEL_PATH --backend=vllm --base-url=http://127.0.0.1:$PORT \
+  --dataset-name=random --random-input-len=8192 --random-output-len=1024 --random-range-ratio=0.8 \
+  --max-concurrency=$CONC --num-prompts=$((CONC * 10)) --num-warmups=$((CONC * 2)) \
+  --request-rate=inf --ignore-eos --trust-remote-code \
+  --save-result --result-dir=$RESULT_DIR --result-filename=raw.json \
+  --percentile-metrics="ttft,tpot,itl,e2el"
+```
 
 ---
 
@@ -106,82 +195,7 @@ accuracy.csv 的 `num_fewshot` 写 `5`。
 
 ### bench
 
-client 是官方的 [`mlcommons/endpoints`](https://github.com/mlcommons/endpoints) @ `4b385eb`，不改代码，装在 node0 的宿主机上（不需要 GPU）。数据集按 sha256 校验：
-
-```bash
-CLIENT=<node0 上的目录>
-command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | env UV_NO_MODIFY_PATH=1 sh
-git clone -q https://github.com/mlcommons/endpoints.git $CLIENT/endpoints
-git -C $CLIENT/endpoints checkout -q --detach 4b385eb
-(cd $CLIENT/endpoints && UV_FROZEN=1 uv sync --frozen)
-mkdir -p $CLIENT/data
-curl -fsSL -o $CLIENT/data/mlperf_agentic_inference_dataset.jsonl \
-  https://endpoints.mlcommons-storage.org/mlperf_agentic_inference_dataset/mlperf_agentic_inference_dataset.jsonl
-echo "1beb24c882122df96571cf11b390acbea388944038bc55c78b891475459014ae  $CLIENT/data/mlperf_agentic_inference_dataset.jsonl" | sha256sum -c -
-```
-
-每个并发先 warmup，再正式测 10 分钟。warmup 用另一组 seed：C < 16 时 2C 条轨迹，否则 C 条，第一个 user 跑完就停。正式测试用 seed set A，613 条轨迹，发 10 分钟请求。`TOKENIZER` 是 node0 宿主机上 `Kimi-K3` 目录的路径。
-
-```bash
-# point_yaml <name> <并发> <轨迹数> <cap 或 -> <submission|warmup> <report_dir>
-point_yaml() {
-  cat << YAML
-name: "$1"
-version: "1.0"
-type: "online"
-YAML
-  [ "$5" = submission ] && printf 'submission_ref:\n  model: moonshotai/Kimi-K3\n  ruleset: mlperf-endpoints-v1.0-2026-10-C1-A\n'
-  cat << YAML
-model_params:
-  name: "moonshotai/Kimi-K3"
-  tokenizer_name: "$TOKENIZER"
-  temperature: 1.0
-  top_p: 1.0
-  max_new_tokens: 8192
-  streaming: "on"
-datasets:
-  - name: agentic_combined
-    type: performance
-    path: $CLIENT/data/mlperf_agentic_inference_dataset.jsonl
-    accuracy_config:
-      eval_method: agentic_inference_inline
-      num_repeats: 1
-    agentic_inference:
-      turn_timeout_s: 86400.0
-      enable_salt: true
-      inject_tool_delay: true
-      num_trajectories_to_issue: $3
-      stop_issuing_on_first_user_complete: true
-settings:
-YAML
-  if [ "$4" != - ] || [ "$5" = warmup ]; then
-    echo "  runtime:"
-    [ "$4" != - ] && echo "    max_issue_duration_ms: $4"
-    [ "$5" = warmup ] && printf '    scheduler_random_seed: 1\n    dataloader_random_seed: 2\n'
-  fi
-  cat << YAML
-  load_pattern:
-    type: agentic_inference
-    target_concurrency: $2
-  client:
-    warmup_connections: 0
-    max_idle_time: 0.5
-endpoint_config:
-  endpoints: ["http://$NODE0_IP:8000"]
-  api_type: openai
-report_dir: $6
-YAML
-}
-run_point() { (ulimit -n 524288 && cd $CLIENT/endpoints && UV_FROZEN=1 uv run inference-endpoint benchmark from-config --config "$1" --mode perf); }
-
-NW=$(( CONC < 16 ? 2 * CONC : CONC ))
-point_yaml k3-c${CONC}-warmup $CONC $NW - warmup $RESULT_DIR/warmup > $RESULT_DIR/warmup.yaml
-point_yaml k3-c${CONC} $CONC 613 10m submission $RESULT_DIR > $RESULT_DIR/run.yaml
-run_point $RESULT_DIR/warmup.yaml > $RESULT_DIR/warmup.log 2>&1
-run_point $RESULT_DIR/run.yaml > $RESULT_DIR/bench.log 2>&1
-```
-
-结果在 `$RESULT_DIR/performance/result_summary.json`。
+按通用约定的 MLPerf Endpoint 命令：`SERVED_NAME=moonshotai/Kimi-K3`，`TOKENIZER=<node0 宿主机上 Kimi-K3 的目录>`，`SERVER=$NODE0_IP:8000`。client 装在 node0 的宿主机上。
 
 ---
 
@@ -332,37 +346,14 @@ HF_HUB_OFFLINE=0 lm_eval --model local-completions \
 
 ### bench
 
-client 用镜像里的 `/app/mlcommons-endpoints`（`mlcommons/endpoints` @ `d3c57f2`，自带 venv）。数据集是 MLPerf DeepSeek-R1 的 eval parquet（4388 条）。镜像里那份 `examples/07_DeepSeekR1_Example/data/deepseek_r1_eval.parquet` 只是 git-lfs 指针，要另外下载并校验：
+按通用约定的 MLPerf Endpoint 命令：`SERVED_NAME=/models/Deepseek-S3_sq_a05_v2_mlperf6_1/`，`TOKENIZER=<宿主机上的模型目录>/Deepseek-S3_sq_a05_v2_mlperf6_1`，`SERVER=127.0.0.1:8000`。
 
-```bash
-EP=/app/mlcommons-endpoints
-DSR1=<数据目录>/deepseek_r1_eval.parquet
-curl -fsSL -o $DSR1 https://media.githubusercontent.com/media/mlcommons/endpoints/d3c57f2/examples/07_DeepSeekR1_Example/data/deepseek_r1_eval.parquet
-echo "36facfae18f42587b7e4863e16a0e96446470761017d207791e609537d0f6f02  $DSR1" | sha256sum -c -
-```
-
-固定并发，流式，发 10 分钟请求。命令取自镜像 `/app/endpoints-recipe/06_bench_concurrency.sh`，另加 10 分钟上限。warmup 发 `CONC` 条、输出上限 2048，不计入结果。
-
-```bash
-export LEGACY_MLPERF_DEEPSEEK_R1_DATASET=$DSR1
-rm -rf $EP/dataset_cache/legacy_mlperf_deepseek_r1    # 缓存不跟数据集路径走，每次清
-cd $EP
-run_r1() {  # run_r1 <样本数> <输出上限> <report_dir>
-  $EP/venv/bin/inference-endpoint benchmark online --endpoints http://127.0.0.1:8000 \
-    --model /models/Deepseek-S3_sq_a05_v2_mlperf6_1/ --tokenizer /models/Deepseek-S3_sq_a05_v2_mlperf6_1/ \
-    --api-type openai_completions --dataset legacy_mlperf_deepseek_r1 --mode perf \
-    --load-pattern concurrency --concurrency $CONC --num-samples $1 --streaming on \
-    --max-output-tokens $2 --runtime.max-issue-duration-ms 600000 --timeout 14400 --report-dir $3
-}
-run_r1 $CONC 2048 $RESULT_DIR/warmup > $RESULT_DIR/warmup.log 2>&1
-run_r1 4388 20000 $RESULT_DIR/report > $RESULT_DIR/bench.log 2>&1
-```
-
-结果在 `$RESULT_DIR/report/performance/result_summary.json`。R1 的回答很长，c4 十分钟只能完成二十来条，发请求停止后还要等在途请求跑完，c64 一个点约 15 分钟。
+- R1 不在 MLPerf Endpoints 官方支持的模型里（官方是 Kimi K3、Qwen3.6-35B-A3B、DeepSeek-V4.1-Flash），这里按同一套 agentic 测试跑，数字只在 455-CI 里自己比。
+- R1 的上下文上限是 163,840 token，数据集里约 0.1% 的请求（集中在一个对话）超过它，会记为失败请求，按指南 §4.1 把个数写进 `note`。
 
 ### 参考值
 
-旧权重 `DeepSeek-R1-0528-MXFP4-MTP-MoEFP4`，同一台机器，其余参数和上面的命令相同。换成 MLPerf v6.1 权重后数字会变，只能看量级：
+旧权重 `DeepSeek-R1-0528-MXFP4-MTP-MoEFP4`，同一台机器，用统一前的 bench 测的（MLPerf 的 DeepSeek-R1 数据集，单轮问答）。现在权重和 bench 都换了，数字不能直接比，只能看量级：
 
 | | GSM8K flexible / strict | c4 tok/s/GPU | c4 interactivity | c64 tok/s/GPU | c64 interactivity |
 |---|---|---|---|---|---|
@@ -454,45 +445,11 @@ python3 -u -m atom.entrypoints.openai_server --model /models/DeepSeek-V4.1-Flash
 
 ### bench
 
-client 用镜像里的 `/app/mlcommons-endpoints`（`mlcommons/endpoints` @ `d3c57f2`，自带 venv），agentic 数据集和 Kimi-K3 一节相同（sha256 `1beb24c8…`）。client 配置照镜像 `run_ep.py` / `mkcfg.py` 生成：以 `examples/10_Agentic_Inference/dsv4_agentic_benchmark.yaml` 为底，只保留 performance 数据集，613 条轨迹，第一个 user 跑完就停，发 10 分钟请求。
-
-```bash
-EP=/app/mlcommons-endpoints
-DATASET=<数据目录>/mlperf_agentic_inference_dataset.jsonl
-$EP/venv/bin/python - $EP/examples/10_Agentic_Inference/dsv4_agentic_benchmark.yaml $DATASET /models/DeepSeek-V4.1-Flash $CONC $RESULT_DIR/report > $RESULT_DIR/client.yaml << 'PY'
-import sys, yaml
-base, dataset, model, c, report = sys.argv[1:]
-cfg = yaml.safe_load(open(base))
-cfg["model_params"].update(name=model, tokenizer_name=model)
-perf = next(d for d in cfg["datasets"] if d.get("type") == "performance")
-perf["path"] = dataset
-perf["accuracy_config"] = {"eval_method": "agentic_inference_inline", "num_repeats": 1}
-perf["agentic_inference"].update(num_trajectories_to_issue=613, enable_salt=True, inject_tool_delay=True,
-                                 stop_issuing_on_first_user_complete=True)
-cfg["datasets"] = [perf]
-cfg["settings"]["load_pattern"]["target_concurrency"] = int(c)
-cfg["settings"].setdefault("runtime", {})["max_issue_duration_ms"] = 600000
-cfg["settings"].setdefault("timeouts", {})["run_timeout_s"] = 14400
-cfg["endpoint_config"]["endpoints"] = ["http://127.0.0.1:8000"]
-cfg["report_dir"] = report
-print(yaml.safe_dump(cfg, sort_keys=False))
-PY
-# warmup（run_ep.py 的做法）：发一条带工具调用的 chat 请求，再清 prefix cache
-curl -sf -m 900 http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{"model": "/models/DeepSeek-V4.1-Flash", "max_tokens": 2048, "temperature": 1.0, "top_p": 0.95, "top_k": 0, "chat_template_kwargs": {"thinking": true, "reasoning_effort": "max"}, "tools": [{"type": "function", "function": {"name": "get_order", "description": "Look up an order", "parameters": {"type": "object", "properties": {"order_id": {"type": "string"}}, "required": ["order_id"]}}}], "messages": [{"role": "user", "content": "Where is my order 43E33A3CAA? Use the tool."}]}' > $RESULT_DIR/smoke.json
-for i in $(seq 12); do      # 刚结束的 smoke 请求还在清理时返回 409，和 run_ep.py 一样每 5 秒重试
-  code=$(curl -s -o $RESULT_DIR/prefix_cache_reset.json -w '%{http_code}' -X POST http://127.0.0.1:8000/reset_prefix_cache -H 'Content-Type: application/json' -d '{}')
-  [ "$code" = 409 ] || break; sleep 5
-done
-cd $EP && HF_HUB_OFFLINE=1 $EP/venv/bin/inference-endpoint benchmark from-config --config $RESULT_DIR/client.yaml --mode perf > $RESULT_DIR/bench.log 2>&1
-```
-
-结果在 `$RESULT_DIR/report/performance/result_summary.json`，inline 精度在 `$RESULT_DIR/report/scores.json`。
-
-- main 上没有 `/reset_prefix_cache`（返回 404，在 [ROCm/ATOM#2763](https://github.com/ROCm/ATOM/pull/2763)），这一步等于跳过。
+按通用约定的 MLPerf Endpoint 命令：`SERVED_NAME=/models/DeepSeek-V4.1-Flash`，`TOKENIZER=<宿主机上的模型目录>/DeepSeek-V4.1-Flash`，`SERVER=127.0.0.1:8000`。c4 和 c64 的 server 不同（见上），bench 命令相同。
 
 ### 参考值
 
-2026-11-12，同一台机器：
+2026-11-12，同一台机器，用统一前的 bench 写法测的（镜像里的 client `d3c57f2`、dsv4 yaml 的采样参数、一条 chat 请求做 warmup）：
 
 | | GSM8K flexible / strict | tok/s/GPU | E2E avg interactivity | inline 精度 |
 |---|---|---|---|---|
@@ -603,3 +560,39 @@ python3 -m atom.entrypoints.openai_server \
 ### bench
 
 按通用约定的 8K/1K 命令，`MODEL_PATH=/models/Qwen3.8-Flash-Next-Quark-MXFP4`，`PORT=8000`。
+
+---
+
+## Qwen-35B-A3B
+
+- 场景：MLPerf Endpoint；GPU：1（1 card）
+- 并行：TP1；MTP，每步 3 个草稿 token，草稿层的 MoE 专家在线量化成 MXFP4
+- MODEL_PATH：`/models/Qwen3.5-35B-A3B-MXFP4`（[`amd/Qwen3.5-35B-A3B-MXFP4`](https://huggingface.co/amd/Qwen3.5-35B-A3B-MXFP4) @ `2e19c6576db91e5d5a93455415619262218bf8a1`，仓库里带 MTP 层）；PORT：`8000`
+
+命令由测试负责人提供（2026-11-13），按 455-CI 的规矩改了四处，其余参数原样：
+- 模型路径 `/data/Qwen3.5-35B-A3B-MXFP4` 换成容器里的 `/models/Qwen3.5-35B-A3B-MXFP4`；
+- `python` 换成 `python3`；
+- 加 `HIP_VISIBLE_DEVICES=0`：只给它 1 张卡（指南 §3.2）；
+- `--max-model-len` 从 32768 改成 262144，这是这个模型的原生上限。MLPerf Endpoint 的数据集里每个对话的第一条请求就有约 3.7 万 token，最长约 17 万，32768 会让几乎所有请求被拒。
+
+MLPerf Endpoints 官方支持的是 Qwen3.6-35B-A3B，这里用的是 Qwen3.5，数字只在 455-CI 里自己比。
+
+### server
+
+```bash
+HIP_VISIBLE_DEVICES=0 python3 -m atom.entrypoints.openai_server \
+  --model /models/Qwen3.5-35B-A3B-MXFP4 \
+  --tensor-parallel-size 1 --max-model-len 262144 --server-port 8000 \
+  --method mtp --num-speculative-tokens 3 \
+  --online_quant_config '{"layer_quant_config":{"mtp.layers.*.mlp.experts":"mxfp4"}}'
+```
+
+c4 和 c64 用同一个 server。
+
+### gsm8k
+
+按指南 §3.3，`MODEL_PATH=/models/Qwen3.5-35B-A3B-MXFP4`，`PORT=8000`。
+
+### bench
+
+按通用约定的 MLPerf Endpoint 命令：`SERVED_NAME=/models/Qwen3.5-35B-A3B-MXFP4`，`TOKENIZER=<宿主机上的模型目录>/Qwen3.5-35B-A3B-MXFP4`，`SERVER=127.0.0.1:8000`。

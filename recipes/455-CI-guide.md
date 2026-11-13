@@ -222,7 +222,7 @@ docker pull "$NEW_IMAGE"
 
 - server 和 bench 命令一律取自 `455-CI-recipe.md`。GSM8K 用 §3.3 的统一命令；某个模型需要不同参数时，写进 recipe，以 recipe 为准。
 - 只替换和机器相关的部分（模型路径、端口、节点地址、结果目录），不改参数。要调参数，先改 recipe 再测，并在报告里注明。
-- **同一个场景的性能命令，所有模型都一样**，只有模型（`MODEL_PATH`、端口）不同，这样不同模型、不同场次之间才能比。8K/1K 的命令写在 recipe 的"通用约定"里，各模型只给 `MODEL_PATH` 和 `PORT`。精度命令可以按模型不同。
+- **同一个场景的性能命令，所有模型都一样**，只有模型不同，这样不同模型、不同场次之间才能比。两个场景的命令都写在 recipe 的"通用约定"里：MLPerf Endpoint 的四个模型都跑 MLPerf Endpoints 的 agentic 测试，client 固定在同一个 commit，各模型只给模型名、tokenizer 目录和 server 地址；8K/1K 各模型只给 `MODEL_PATH` 和端口。精度命令可以按模型不同。
 - 实际执行的命令（变量展开后）存成 `server_cmd.sh`、`gsm8k_cmd.sh`、`bench_cmd.sh`，跟结果一起提交。提交前把内网地址和 token 换成占位符：455-CI 分支在公开仓库里。
 - recipe 里没有某个模型时，该模型记 N/A，error 写"recipe 缺失"。
 
@@ -494,7 +494,7 @@ awk -F, -v d=<YYYY-MM-DD> '$2 == d {print $4}' perf.csv accuracy.csv | sort -u
 
 **GSM8K 精度**：lm_eval 结果 JSON 里的 `results.gsm8k["exact_match,flexible-extract"]`，3-shot，这是报告的分数。`exact_match,strict-match` 也记下，精度图上和 dashboard 一样画成虚线作参考。
 
-**MLPerf Endpoint**：读 client 输出的 `report_dir/performance/result_summary.json`。
+**MLPerf Endpoint**：四个模型都跑 MLPerf Endpoints 的 agentic 测试（同一个 client commit、同一份数据集，见 recipe 的"通用约定"），读 client 输出的 `report_dir/performance/result_summary.json`。
 
 | 指标 | 计算 |
 |---|---|
@@ -755,4 +755,4 @@ git status -sb | head -1                # 不能有 [ahead N]
 
 ## 6. 待补充
 
-- `455-CI-recipe.md`：各模型的 server 和 bench 命令（GSM8K 有特殊参数时也写上），按 §3.1 的结构写。
+- 统一后的 MLPerf Endpoint bench 还没在 455 上实际跑过。第一场要确认四个模型都能跑完，尤其是第一次跑 agentic 的 DeepSeek R1 和 Qwen-35B-A3B。
