@@ -272,6 +272,25 @@ parameter as it was. Weights may be resumed while fenced, since after
 ``sleep(level=2)`` only a resume gives released parameters storage again; the
 fence keeps serving off until that complete sync commits.
 
+What syncs the runners can take is asked once, at engine startup, of a runner
+that answers ``get_worker_capabilities``; one that cannot answer fails startup.
+A sync they cannot take -- a model a reload cannot rewrite in place, such as
+MLA, prefill context parallelism, expert-parallel or redundant-expert MoE, or
+weights in a format a full-precision write cannot produce -- is refused before
+its first update, with nothing preempted, written or fenced. The runners also
+refuse it themselves before writing. A sync whose updates every rank refused
+before writing, or that never reached a rank, leaves the fence as it was when
+the sync began.
+
+An RDMA stream is decided by the runners. Each waits for every broadcast for
+at most its weight group's ``timeout_s``, and the group is built to abort its
+communicator on a timeout rather than end the process. So a trainer that dies
+mid-stream fails the stream on every rank once that timeout passes, plus up to
+about a minute to tear the group down. The group then has to be joined again,
+and the engine stays fenced until a sync rewrites every parameter. A caller
+that stops waiting before the engine answers does not learn whether the stream
+was written, and the engine stays fenced the same way.
+
 ## Sequence lifecycle
 
 The `Sequence` class (in `atom/model_engine/sequence.py`) is the central data structure tracking a single request through the engine.

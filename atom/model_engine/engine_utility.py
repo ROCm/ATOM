@@ -82,8 +82,10 @@ _KV_QUIESCE_TIMEOUT_S = 30.0
 _FAILED_SYNC_CLEANUP_TIMEOUT_S = 1.0
 _CAPABILITY_TIMEOUT_S = 30.0
 # How long the engine waits for its runners to finish a weight stream. They
-# bound it themselves, by their group's collective timeout, and a rank that
-# dies is noticed at once; this only keeps the deadline finite.
+# bound each of its broadcasts by their group's collective timeout: one that
+# runs past it, as when the trainer is gone, fails the stream on every rank
+# and leaves the engine fenced. A rank that dies is noticed at once. This only
+# keeps the deadline finite.
 WEIGHT_STREAM_TIMEOUT_S = 24 * 3600.0
 
 

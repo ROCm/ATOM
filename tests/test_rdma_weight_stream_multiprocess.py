@@ -17,6 +17,7 @@ stream together, over a CPU group of their own.
 """
 
 import multiprocessing
+import os
 import queue
 import socket
 import sys
@@ -43,6 +44,8 @@ _ONE_RANK_REFUSES = ("one rank refuses", None, 2, None)
 _CLEAN_AGAIN = ("clean again", None, None, None)
 # Breaks the stream off, which leaves its groups unusable: streamed alone.
 _ONE_RANK_STARVED = ("one rank cannot take a frame", None, None, 2)
+# The trainer sends its first bucket and exits; also streamed alone.
+_SENDER_DIES = ("the sender dies mid-stream", None, None, None)
 
 
 def _checkpoint() -> dict[str, torch.Tensor]:
@@ -141,7 +144,30 @@ def _send(group, device: torch.device, version: int) -> None:
     header(0, 0, 0)
 
 
-def _rank_main(rank, world_size, ports, backend, scenarios, results):
+def _send_first_bucket(group, device: torch.device, version: int) -> None:
+    import json
+
+    import torch.distributed as dist
+
+    name, tensor = next(iter(_checkpoint().items()))
+    payload = tensor.to(device).contiguous().view(torch.uint8).reshape(-1)
+    entry = {
+        "name": name,
+        "shape": list(tensor.shape),
+        "dtype": str(tensor.dtype).removeprefix("torch."),
+        "offset": 0,
+        "nbytes": payload.numel(),
+    }
+    raw = json.dumps([entry], separators=(",", ":")).encode("utf-8")
+    metadata = torch.tensor(list(raw), dtype=torch.uint8, device=device)
+    frame = [1, metadata.numel(), payload.numel(), version]
+    header = torch.tensor(frame, dtype=torch.int64, device=device)
+    for part in (header, metadata, payload):
+        dist.broadcast(part, src=0, group=group)
+    torch.cuda.synchronize(device)
+
+
+def _rank_main(rank, world_size, ports, backend, scenarios, results, timeout_s):
     """One process: rank 0 is the trainer, the rest are one engine's ranks."""
     import torch.distributed as dist
 
@@ -170,25 +196,43 @@ def _rank_main(rank, world_size, ports, backend, scenarios, results):
         )
         votes = dist.new_group(ranks=list(range(1, world_size)), backend="gloo")
         if backend == "nccl":
-            group = stateless_init_torch_distributed_process_group(
-                "127.0.0.1",
-                stream_port,
-                rank,
-                world_size,
-                "nccl",
-                group_name="rdma-smoke",
-                timeout=timedelta(seconds=60),
-            )
+            # As init_rdma_weight_group builds it.
+            with receiver._aborted_not_ended_on_timeout():
+                group = stateless_init_torch_distributed_process_group(
+                    "127.0.0.1",
+                    stream_port,
+                    rank,
+                    world_size,
+                    "nccl",
+                    group_name="rdma-smoke",
+                    timeout=timedelta(seconds=timeout_s),
+                )
         else:
             group = dist.group.WORLD
     except Exception as exc:  # noqa: BLE001 - the parent reports it
         for scenario, *_ in scenarios:
             results.put((scenario, rank, "raised", f"{type(exc).__name__}: {exc}"))
         return
+    if backend == "nccl":
+        # As destroy_rdma_weight_group does; the gloo stream rides WORLD.
+        def leave():
+            dist.destroy_process_group(group)
+
+    else:
+
+        def leave():
+            pass
+
     try:
         for version, (scenario, failing, refusing, starved) in enumerate(
             scenarios, start=1
         ):
+            if rank == 0 and scenario == _SENDER_DIES[0]:
+                _send_first_bucket(group, device, version)
+                results.put((scenario, rank, "died", None))
+                results.close()
+                results.join_thread()
+                os._exit(0)
             if rank == 0:
                 try:
                     _send(group, device, version)
@@ -206,12 +250,17 @@ def _rank_main(rank, world_size, ports, backend, scenarios, results):
                     device=device,
                     version=version,
                     require_full=True,
+                    timeout=timedelta(seconds=timeout_s),
                     agree=lambda ballot: group_min(ballot, votes),
-                    leave=lambda: None,
+                    leave=leave,
                 )
                 state, detail = "written", runner.weights()
             except Exception as exc:  # noqa: BLE001 - the parent reports it
                 state, detail = "raised", f"{type(exc).__name__}: {exc}"
+            if scenario == _SENDER_DIES[0]:
+                # Past the second or so in which a watchdog that ends the
+                # process does so: a rank it ended reports nothing.
+                time.sleep(10)
             results.put((scenario, rank, state, detail))
     finally:
         dist.destroy_process_group()
@@ -228,12 +277,12 @@ def _free_ports(count: int) -> list[int]:
             probe.close()
 
 
-def _streams(world_size: int, backend: str, scenarios) -> dict:
+def _streams(world_size: int, backend: str, scenarios, timeout_s: int = 60) -> dict:
     """Run *scenarios* as streams across *world_size* processes, in order;
-    what each rank reported for each."""
+    what each rank reported for each. *timeout_s* is the stream group's."""
     ctx = multiprocessing.get_context("spawn")
     results = ctx.Queue()
-    args = (world_size, _free_ports(2), backend, scenarios, results)
+    args = (world_size, _free_ports(2), backend, scenarios, results, timeout_s)
     procs = [
         ctx.Process(target=_rank_main, args=(rank, *args), daemon=True)
         for rank in range(world_size)
@@ -330,3 +379,22 @@ def test_a_stream_lands_over_rccl():
     assert reports[0][0] == "sent", reports
     for rank in range(1, world_size):
         assert reports[rank] == ("written", _expected()), reports
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.device_count() < 2,
+    reason="needs two GPUs: one for the sender, one for a receiver",
+)
+def test_a_sender_that_dies_mid_stream_fails_it_on_every_receiver_over_rccl():
+    """RCCL does not raise when the sender is gone: each receiver sat in the
+    next header's broadcast until the group's timeout, when the NCCL watchdog
+    ended the process -- in ATOM the runner, and with it the engine. Each now
+    fails the stream, and is still there to say so."""
+    world_size = min(3, torch.cuda.device_count())
+    reports = _streams(world_size, "nccl", (_SENDER_DIES,), timeout_s=15)
+    reports = reports[_SENDER_DIES[0]]
+
+    assert reports[0][0] == "died", reports
+    for rank in range(1, world_size):
+        state, detail = reports[rank]
+        assert state == "raised" and "RDMAStreamOutOfStep" in detail, reports
