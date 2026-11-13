@@ -230,6 +230,7 @@ support_draft_model_arch_dict = {
     "Eagle3DeepseekMLAModel": "atom.models.eagle3_deepseek_mla.Eagle3DeepseekMLAModel",
     "K3DSparkModel": "atom.models.kimi_k3_dspark.KimiK3DSpark",
     "DSparkMiniMaxDraftModel": "atom.models.minimax_m3.dspark.MiniMaxM3DSpark",
+    "K3DSparkGQAModel": "atom.models.kimi_k3_dspark_gqa.KimiK3DSparkGQA",
 }
 
 
@@ -286,6 +287,9 @@ class Drafter(abc.ABC):
         # Drafter-owned aux capture state (armed by arm_aux_capture).
         self._captures_aux = False
         self._aux_buffers: list[torch.Tensor] = []
+        # the extract the hooks run; a mono step that writes the taps itself
+        # calls it too (`AuxTaps.extract`)
+        self.aux_extract: Callable | None = None
 
         self.metadata_buffers = self._allocate_metadata_buffers(
             self.config.max_num_seqs, self.mtp_k, self.device
@@ -534,6 +538,7 @@ class Drafter(abc.ABC):
         spec = self._aux_capture_spec()
         if spec is None:
             return
+        self.aux_extract = spec.extract
         layers = _resolve_decoder_layers(target_model)
         # A tap on an earlier PP stage reaches `take_relayed_aux` instead, so it
         # gets no rows and no hook. install_aux_taps still rejects bad ids.

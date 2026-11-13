@@ -282,10 +282,10 @@ def _k3_draft_sharing(embed):
     from atom.models.kimi_k3_dspark import KimiK3DSpark
 
     target = types.SimpleNamespace(
-        model=types.SimpleNamespace(embed_tokens=embed, vocab_size=16),
-        lm_head=nn.Identity(),
+        model=types.SimpleNamespace(embed_tokens=embed),
+        lm_head=types.SimpleNamespace(num_embeddings=16),
     )
-    draft = types.SimpleNamespace(hf_config=types.SimpleNamespace(vocab_size=16))
+    draft = types.SimpleNamespace(vocab_size=16, embed_tokens=None)
     KimiK3DSpark.share_with_target(draft, target, set())
     return draft
 
