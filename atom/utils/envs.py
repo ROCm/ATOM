@@ -561,6 +561,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the whole gathered q back to token-major; this removes both. Costs a
     # group-wide q GEMM + W_K bmm per prefill token. Off by default.
     "ATOM_DCP_PREFILL_QREP": lambda: os.getenv("ATOM_DCP_PREFILL_QREP", "0") == "1",
+    # DCP sparse prefill: send the head-major output all-to-all in FP8 with a
+    # scale per (token, head), half the bytes of bf16. Off by default.
+    "ATOM_DCP_PREFILL_A2A_FP8": lambda: (
+        os.getenv("ATOM_DCP_PREFILL_A2A_FP8", "0") == "1"
+    ),
     # DCP sparse prefill: use the non-persistent fp8 gqa64 MLA kernel, which
     # needs no work metadata. On by default; needs an aiter with ROCm/aiter#6132.
     "ATOM_DCP_SPARSE_PREFILL_NONPS": lambda: (
