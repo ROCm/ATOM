@@ -27,6 +27,7 @@ from atom.models.minimax_m3.mono.config import (
     TOPK_BLOCKS,
     IndexHeads,
 )
+from atom.models.minimax_m3.mono.kernels.common import NVFP4_PAGE_BYTES
 from atom.mono.runtime.consensus import MonoUnsupported
 
 
@@ -59,6 +60,51 @@ def _ptpc_fp8(
         f"{name}: scale",
     )
     return w.data, s.data.view(rows)
+
+
+def _mxfp8(
+    linear, rows: int, cols: int, name: str
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Weight + per-1x32 E8M0 scale of a native MXFP8 linear (the checkpoint's
+    bytes, row-major: neither preshuffled nor requantized)."""
+    w, s = linear.weight, getattr(linear, "weight_scale", None)
+    _need(
+        linear.quant_type.value == QuantType.per_1x32.value,
+        f"{name}: not per-1x32",
+    )
+    _need(
+        w.dtype == dtypes.fp8 and tuple(w.shape) == (rows, cols) and w.is_contiguous(),
+        f"{name}: weight {w.dtype} {tuple(w.shape)}",
+    )
+    _need(
+        weight_is_stored_preshuffled(
+            linear.quant_type,
+            linear.params_dtype,
+            native_group_rows=getattr(linear, "native_a8_group_rows", None),
+        ),
+        f"{name}: not preshuffled",
+    )
+    _need(not getattr(linear, "is_output_padded", False), f"{name}: output padded")
+    _need(
+        s is not None
+        and s.dtype in (torch.uint8, dtypes.fp8_e8m0)
+        and s.numel() == rows * cols // 32
+        and s.is_contiguous(),
+        f"{name}: scale {None if s is None else (s.dtype, tuple(s.shape))}",
+    )
+    return w.data, s.data
+
+
+def _attn_gemm(
+    linear, rows: int, cols: int, name: str
+) -> tuple[torch.Tensor, torch.Tensor, bool]:
+    """An attention linear's (weight, scale, native MXFP8?): the ptpc-FP8 requantization
+    (``_ptpc_fp8``: f32 scale a row, per-token activation quant) or the checkpoint's own
+    MXFP8 1x32 (``_mxfp8``: E8M0 scale a 32-block, per-32 activation quant), both over
+    the same (16, 16)-preshuffled fp8 weight."""
+    if linear.quant_type.value == QuantType.per_1x32.value:
+        return (*_mxfp8(linear, rows, cols, name), True)
+    return (*_ptpc_fp8(linear, rows, cols, name), False)
 
 
 def _bf16_vec(t: torch.Tensor, n: int, name: str) -> torch.Tensor:
@@ -109,6 +155,16 @@ class SparseMoeLayer:
     s13: torch.Tensor
     w2: torch.Tensor
     s2: torch.Tensor
+    # an unfused shared expert (``shared_mxfp8``): its own MXFP8 MLP, gate | up
+    # rows in one weight; ``w13`` / ``w2`` then hold the 128 routed experts only
+    shared_mxfp8: bool = False
+    w13s: torch.Tensor | None = None
+    s13s: torch.Tensor | None = None
+    w2s: torch.Tensor | None = None
+    s2s: torch.Tensor | None = None
+    # qkv_proj / o_proj are the checkpoint's MXFP8 1x32 (``s_qkv`` / ``s_o``: E8M0
+    # ``[rows, K / 32]``), not the ptpc-FP8 requantization (f32 ``[rows]``)
+    attn_mxfp8: bool = False
 
     @staticmethod
     def from_layer(layer, layer_id: int, heads: IndexHeads) -> "SparseMoeLayer":
@@ -131,26 +187,68 @@ class SparseMoeLayer:
         )
         impl = attn.attn.impl
         _need(
-            impl.kv_cache_dtype == "fp8" and impl.index_cache is not None,
+            impl.kv_cache_dtype in ("fp8", "nvfp4") and impl.index_cache is not None,
             f"layer {layer_id}: caches",
         )
-        _need(
-            impl.index_cache.dtype == dtypes.fp8,
-            f"layer {layer_id}: index cache {impl.index_cache.dtype}",
-        )
-        w_qkv, s_qkv = _ptpc_fp8(
+        if impl.kv_cache_dtype == "nvfp4":
+            # single-buffer pages: the kernels address page b at b * page bytes, so a
+            # layer's pool view must be dense; the f32 global K / V scales are tensors
+            _need(
+                impl.index_cache_dtype == "nvfp4"
+                and impl.index_cache.dtype == torch.uint8
+                and impl.index_cache.dim() == 2
+                and impl.index_cache.shape[1] == NVFP4_PAGE_BYTES
+                and impl.index_cache.stride() == (NVFP4_PAGE_BYTES, 1),
+                f"layer {layer_id}: index cache {impl.index_cache.dtype} "
+                f"{tuple(impl.index_cache.shape)} {impl.index_cache.stride()}",
+            )
+            for name in ("nvfp4_k_scale", "nvfp4_v_scale"):
+                t = getattr(impl, name, None)
+                _need(
+                    t is not None and t.dtype == torch.float32 and t.numel() == 1,
+                    f"layer {layer_id}: {name}",
+                )
+        else:
+            _need(
+                impl.index_cache.dtype == dtypes.fp8,
+                f"layer {layer_id}: index cache {impl.index_cache.dtype}",
+            )
+        w_qkv, s_qkv, mx_qkv = _attn_gemm(
             attn.qkv_proj, heads.rows, HIDDEN, f"layer {layer_id} qkv_proj"
         )
-        w_o, s_o = _ptpc_fp8(attn.o_proj, HIDDEN, O_K, f"layer {layer_id} o_proj")
+        w_o, s_o, mx_o = _attn_gemm(
+            attn.o_proj, HIDDEN, O_K, f"layer {layer_id} o_proj"
+        )
+        _need(
+            mx_qkv == mx_o, f"layer {layer_id}: qkv_proj / o_proj quantized differently"
+        )
 
         moe = layer.block_sparse_moe
         experts = moe.experts
         qm = experts.quant_method
-        E = N_ROUTED + 1
-        _need(
-            moe.fuse_shared_experts and experts.num_fused_shared_experts == 1,
-            f"layer {layer_id}: shared expert",
-        )
+        shared8 = not moe.fuse_shared_experts
+        # the shared expert is the 129th expert of the MXFP4 tables, or an MXFP8 MLP
+        # of its own next to the 128 routed ones
+        E = N_ROUTED + (0 if shared8 else 1)
+        if shared8:
+            _need(
+                experts.num_fused_shared_experts == 0
+                and moe.shared_experts is not None,
+                f"layer {layer_id}: shared expert",
+            )
+            sh = moe.shared_experts
+            w13s, s13s = _mxfp8(
+                sh.gate_up_proj, 2 * INTER, HIDDEN, f"layer {layer_id} shared gate_up"
+            )
+            w2s, s2s = _mxfp8(
+                sh.down_proj, HIDDEN, INTER, f"layer {layer_id} shared down_proj"
+            )
+        else:
+            _need(
+                experts.num_fused_shared_experts == 1,
+                f"layer {layer_id}: shared expert",
+            )
+            w13s = s13s = w2s = s2s = None
         _need(
             experts.top_k == TOP_K and not getattr(qm, "is_guinterleave", True),
             f"layer {layer_id}: moe layout",
@@ -213,6 +311,12 @@ class SparseMoeLayer:
             s13=s13.data,
             w2=w2.data,
             s2=s2.data,
+            shared_mxfp8=shared8,
+            w13s=w13s,
+            s13s=s13s,
+            w2s=w2s,
+            s2s=s2s,
+            attn_mxfp8=mx_qkv,
         )
 
 

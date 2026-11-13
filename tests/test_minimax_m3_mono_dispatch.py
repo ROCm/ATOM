@@ -57,6 +57,21 @@ def test_supported_deployment_has_no_refusal(native):
     assert dispatch._config_refusal(_atom_config()) is None
 
 
+def test_nvfp4_caches_are_supported_together_only(native):
+    nv = {"kv_cache_dtype": "nvfp4", "index_cache_dtype": "nvfp4"}
+    assert dispatch._config_refusal(_atom_config(**nv)) is None
+    assert (
+        dispatch._config_refusal(_atom_config(**{**nv, "index_cache_dtype": None}))
+        is None
+    )
+    assert "index cache fp8 with kv cache nvfp4" in dispatch._config_refusal(
+        _atom_config(kv_cache_dtype="nvfp4")
+    )
+    assert "index cache nvfp4 with kv cache fp8" in dispatch._config_refusal(
+        _atom_config(index_cache_dtype="nvfp4")
+    )
+
+
 @pytest.mark.parametrize(
     "overrides, reason",
     [
@@ -79,6 +94,7 @@ def test_supported_deployment_has_no_refusal(native):
         ({"prefill_context_parallel_size": 2}, "prefill CP"),
         ({"sequence_parallel_size": 4}, "Ulysses SP"),
         ({"kv_cache_dtype": "bf16"}, "kv cache"),
+        ({"kv_cache_dtype": "fp4"}, "kv cache fp4"),
         ({"index_cache_dtype": "bf16"}, "index cache"),
         ({"kv_cache_block_size": 16}, "block size"),
         ({"max_model_len": (1 << 20) + 1}, "max_model_len"),
@@ -177,8 +193,21 @@ def _mono(monkeypatch, fwd, builds=True):
     mono._lm = SimpleNamespace(model=SimpleNamespace(aux_hidden_state_layers=()))
     mono._mono = LazyRunner(None, "MiniMax-M3 mono decode")
     mono._mono.runner = SimpleNamespace(prepare=lambda n: builds)
+    mono.steps, mono._graph_mono, mono._counted = {False: {}, True: {}}, set(), 0
     monkeypatch.setattr(dispatch, "get_forward_context", lambda: fwd)
     return mono
+
+
+def test_steps_are_counted_by_token_count(monkeypatch):
+    md = _forward_context(_decode_md(rows=4))
+    mono = _mono(monkeypatch, md)
+    assert mono.supports(*_step(4), None, None)
+    assert not mono.supports(*_step(17), None, None)
+    mono.note_replay(4)  # a graph replay: mono's only if its capture took mono
+    mono._graph_mono.add(4)
+    mono.note_replay(4)
+    mono.note_replay(32)
+    assert mono.steps == {True: {4: 2}, False: {4: 1, 17: 1, 32: 1}}
 
 
 def _step(n, pos_dtype=torch.int64):

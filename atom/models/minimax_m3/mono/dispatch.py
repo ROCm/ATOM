@@ -5,12 +5,17 @@
 The configuration is checked once; a step is then routed to mono only when it is
 a decode of 1..MAX_TOKENS tokens (a cudagraph's pad rows counted; a speculative
 verify's q tokens of a request count as q).
+The attention linears may be the checkpoint's native MXFP8 1x32 (no online quantization) or the ptpc-FP8
+requantization: ``weights.SparseMoeLayer`` decides per model, the runner builds the matching K1 / K4
+(``attn_mxfp8``), and a model mixing the two is refused there.
 Every per-step input is TP-uniform: the kernels all-reduce in-kernel, so ranks
 that disagreed would wait on each other forever (a per-rank flag such as
 ``is_dummy_run`` must never gate this).
 """
 
+import json
 import logging
+import os
 
 import torch
 
@@ -51,10 +56,15 @@ def _dspark_mode_supported(atom_config) -> bool:
 def _config_refusal(atom_config) -> str | None:
     """Why this deployment cannot use mono, or None."""
     checks = common_refusals(atom_config, Dims, SUPPORTED_TP) + [
-        (atom_config.kv_cache_dtype == "fp8", f"kv cache {atom_config.kv_cache_dtype}"),
+        # fp8 K/V + fp8 index, or NVFP4 K/V + NVFP4 index (single-buffer pages), not mixed
         (
-            (atom_config.index_cache_dtype or atom_config.kv_cache_dtype) == "fp8",
-            "index cache not fp8",
+            atom_config.kv_cache_dtype in ("fp8", "nvfp4"),
+            f"kv cache {atom_config.kv_cache_dtype}",
+        ),
+        (
+            (atom_config.index_cache_dtype or atom_config.kv_cache_dtype)
+            == atom_config.kv_cache_dtype,
+            f"index cache {atom_config.index_cache_dtype} with kv cache {atom_config.kv_cache_dtype}",
         ),
         (
             atom_config.kv_cache_block_size == 128,
@@ -79,6 +89,11 @@ class MonoDecode:
         self._lm = causal_lm
         self._uses_dspark = _uses_dspark(atom_config)
         self._drafter = None
+        # decode steps by token count, [original, mono]; the rows of the graphs
+        # captured on mono
+        self.steps: dict[bool, dict[int, int]] = {False: {}, True: {}}
+        self._graph_mono: set[int] = set()
+        self._counted = 0
         # created on its first eligible step (``LazyRunner``)
         self._mono = LazyRunner(
             lambda: MonoDecodeRunner(
@@ -104,6 +119,52 @@ class MonoDecode:
         self._drafter = drafter
 
     def supports(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors,
+        inputs_embeds,
+    ) -> bool:
+        ok = self._supports(input_ids, positions, intermediate_tensors, inputs_embeds)
+        # a captured graph's forward runs once, at capture: its replays are
+        # counted by ``note_replay``; eager decode steps count here
+        n = input_ids.numel()
+        if torch.cuda.is_current_stream_capturing():
+            if ok:
+                self._graph_mono.add(n)
+        elif ok or self._is_decode():
+            self._count(n, ok)
+        return ok
+
+    def _is_decode(self) -> bool:
+        ctx = get_forward_context().context
+        return ctx is not None and not ctx.is_prefill
+
+    def note_replay(self, n: int) -> None:
+        """A decode step replayed an n-row graph: mono's if its capture took mono."""
+        self._count(n, n in self._graph_mono)
+
+    def _count(self, n: int, mono: bool) -> None:
+        self.steps[mono][n] = self.steps[mono].get(n, 0) + 1
+        every = envs.ATOM_MONO_STATS_EVERY
+        self._counted += 1
+        if not every or self._counted % every:
+            return
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        stats = {
+            "mono": dict(sorted(self.steps[True].items())),
+            "original": dict(sorted(self.steps[False].items())),
+        }
+        if rank == 0:
+            logger.info("MiniMax-M3 mono steps by token count: %s", stats)
+        path = os.environ.get(
+            "ATOM_MONO_STATS_FILE"
+        )  # a bench's proof, one file a rank
+        if path:
+            with open(f"{path}.rank{rank}.json", "w") as f:
+                json.dump(stats, f)
+
+    def _supports(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,

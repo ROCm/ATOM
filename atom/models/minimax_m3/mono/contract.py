@@ -18,19 +18,38 @@ from atom.models.minimax_m3.mono.kernels.dense_post import (
     build_dense_post_kernel,
 )
 from atom.models.minimax_m3.mono.kernels.post_attn import K4_ABI, build_post_attn_kernel
-from atom.models.minimax_m3.mono.layout import dense_mailbox_regions, mailbox_regions
+from atom.models.minimax_m3.mono.layout import (
+    WIDE_FROM,
+    dense_mailbox_regions,
+    mailbox_regions,
+)
 from atom.mono.runtime.compile import check_traced
 
 
 def build_layer(
-    tokens: int, index_heads: int, fuse_k1: bool = True, index_topk: bool = True
+    tokens: int,
+    index_heads: int,
+    fuse_k1: bool = True,
+    index_topk: bool = True,
+    xn_flag: int = 0,
+    shared_mxfp8: bool = False,
+    mid_flag: int = 0,
+    kv_nvfp4: bool = False,
+    index_nvfp4: bool = False,
+    sh_first: int = 0,
+    attn_mxfp8: bool = False,
 ):
     """The layer kernel for ``tokens`` and ``index_heads`` (1 or TP), K1 fused in
-    or not (``fuse_k1``), selecting or reusing a selection (``index_topk``)."""
+    or not (``fuse_k1``), selecting or reusing a selection (``index_topk``), its
+    xn behind flags (``xn_flag``), the shared expert an MXFP8 MLP of its own
+    (``shared_mxfp8``), NVFP4 K/V / index pages (``kv_nvfp4`` / ``index_nvfp4``), native MXFP8 qkv / o_proj
+    (``attn_mxfp8``)."""
     heads = IndexHeads(index_heads, 0)
     return build_post_attn_kernel(
         TP, 0.088, 1e-6, 1.0, 1.0, 7.0, 1, 1, tokens, fuse_k1=fuse_k1, heads=heads,
-        index_topk=index_topk,
+        index_topk=index_topk, xn_flag=xn_flag, shared_mxfp8=shared_mxfp8, mid_flag=mid_flag,
+        kv_nvfp4=kv_nvfp4, index_nvfp4=index_nvfp4, sh_first=sh_first,
+        attn_mxfp8=attn_mxfp8,
     )  # fmt: skip
 
 
@@ -40,13 +59,35 @@ def build_dense(tokens: int):
 
 
 def check_build(
-    tokens: int, index_heads: int, fuse_k1: bool = True, index_topk: bool = True
+    tokens: int,
+    index_heads: int,
+    fuse_k1: bool = True,
+    index_topk: bool = True,
+    xn_flag: int = 0,
+    shared_mxfp8: bool = False,
+    mid_flag: int = 0,
+    kv_nvfp4: bool = False,
+    index_nvfp4: bool = False,
+    sh_first: int = 0,
+    attn_mxfp8: bool = False,
 ) -> None:
     """Trace ``build_layer`` and check its hand-offs; raises ``ContractError``."""
     check_traced(
-        build_layer(tokens, index_heads, fuse_k1, index_topk),
+        build_layer(
+            tokens,
+            index_heads,
+            fuse_k1,
+            index_topk,
+            xn_flag,
+            shared_mxfp8,
+            mid_flag,
+            kv_nvfp4,
+            index_nvfp4,
+            sh_first,
+            attn_mxfp8,
+        ),
         K4_ABI,
-        mailbox_regions(tokens, index_heads, fuse_k1, index_topk),
+        mailbox_regions(tokens, index_heads, fuse_k1, index_topk, xn_flag, mid_flag),
     )
 
 
@@ -60,5 +101,30 @@ if __name__ == "__main__":
     for s in sizes:
         for ih in (1, TP):
             for it in (True, False):
-                check_build(s, ih, index_topk=it)
-                print(f"S={s} index heads={ih} index_topk={it}: contract holds")
+                for xf in (0, 1, 2):
+                    check_build(s, ih, index_topk=it, xn_flag=xf)
+                    print(
+                        f"S={s} index heads={ih} index_topk={it} xn_flag={xf}:"
+                        " contract holds"
+                    )
+            if s < WIDE_FROM:
+                check_build(s, ih, xn_flag=1, mid_flag=1)
+                print(f"S={s} index heads={ih} xn_flag=1 mid_flag=1: contract holds")
+            check_build(s, ih, shared_mxfp8=True)
+            print(f"S={s} index heads={ih} shared_mxfp8: contract holds")
+            if s >= WIDE_FROM:
+                for k in (1, 2, 4):
+                    check_build(s, ih, shared_mxfp8=True, sh_first=k)
+                    print(f"S={s} index heads={ih} sh_first={k}: contract holds")
+            check_build(s, ih, kv_nvfp4=True, index_nvfp4=True)
+            print(f"S={s} index heads={ih} nvfp4 K/V + index: contract holds")
+            for nv in (False, True):
+                check_build(
+                    s,
+                    ih,
+                    shared_mxfp8=True,
+                    attn_mxfp8=True,
+                    kv_nvfp4=nv,
+                    index_nvfp4=nv,
+                )
+                print(f"S={s} index heads={ih} attn_mxfp8 nvfp4={nv}: contract holds")

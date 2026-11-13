@@ -46,6 +46,9 @@ from atom.models.minimax_m3.mono.kernels.common import (
     ar_block_sums,
     ar_pack_sumsq,
     ld_bf16x4,
+    nvfp4_k_store,
+    nvfp4_row_store,
+    nvfp4_v_store,
     per_token_fp8_scale,
 )
 from atom.models.minimax_m3.mono.kernels.index_score import (
@@ -53,11 +56,13 @@ from atom.models.minimax_m3.mono.kernels.index_score import (
     index_scale_log2e,
     step_rows,
 )
+from atom.models.minimax_m3.mono.layout import XSCB_ROW
 from atom.models.minimax_m3.mono.sources import SOURCES
-from atom.mono.device.mx import FP8_MAX
+from atom.mono.device.mx import FP8_MAX, clamp_fp8, code_ceil, mfma_scaled, rcp_pow2
 from atom.mono.device.ops import (
     CM_DEV,
     CM_NT,
+    batched_rounds,
     bf16_pair,
     bf16_round,
     butterfly,
@@ -67,6 +72,7 @@ from atom.mono.device.ops import (
     kernel_symbol,
     lane_gather,
     launcher,
+    ld_dev,
     mfma_fp8,
     rows_to_lds,
     rsrc,
@@ -117,7 +123,18 @@ SCRATCH_X8S = SCRATCH_X8 + MAX_TOKENS * HIDDEN // 4 * 8  # and their scales
 # fused layer kernel only: a head task's / the residual's done flags
 SCRATCH_HDONE = SCRATCH_X8S + MAX_TOKENS * 8
 SCRATCH_RDONE = SCRATCH_HDONE + MAX_TOKENS * N_HEAD_TASKS * 8
-SCRATCH_BYTES = SCRATCH_RDONE + MAX_TOKENS * 8
+# ``attn_mxfp8``, S > 2: the norm tasks' per-1x32 E8M0 codes, 4 to a word (plain, behind x8s's flags)
+SCRATCH_XSC = SCRATCH_RDONE + MAX_TOKENS * 8
+SCRATCH_BYTES = SCRATCH_XSC + MAX_TOKENS * (HIDDEN // 128) * 4
+K_SCALE_BYTES = HIDDEN // 32  # an MXFP8 weight row's scale bytes
+CHUNKS_PER_MFMA = 2  # 64-k chunks per 16x16x128 scaled MFMA
+# rounds of 16 B loads of the rows + codes copy that go out together (the production copy's
+# 4: with the codes the S = 16 copy is 14 rounds, a fourth round trip; K1 has the registers)
+MXFP8_COPY_BATCH = 8
+
+
+def _or(a, b):
+    return a | b
 
 
 def ld_raw8(r, lt):
@@ -175,7 +192,8 @@ def head_norm_rope(e, lane, gw4, cs, sn, eps):
 def emit_pre_attn(
     tid, bid, lane, wave, x8, red, mb_put, mb_put_words, mb_poll, qkv_mb, x8_mb,
     x8s_mb, stamp, eps, tokens, heads, ptrs, signal=None, long_step=None,
-    index_topk=True, dense=False, plain_norm=False,
+    index_topk=True, dense=False, plain_norm=False, kv_nvfp4=False, index_nvfp4=False,
+    strip=(), attn_mxfp8=False, xsc=None, xsc_mb=None,
 ):  # fmt: skip
     """K1's body: the GEMV tasks (ROWS_PER_TASK of the ``heads`` projection's rows
     each: the rank's own on CTAs 0 .. ONE_GEMV, its other index q heads' on CTAs
@@ -186,7 +204,19 @@ def emit_pre_attn(
     ``dense`` (a dense layer, no index heads, ``index_topk`` off): K inserted as
     the dense path's Triton rope-cache does -- quantized from f32, page-128.
     ``plain_norm`` (layer 0: no all-reduce in front): the norm's output rounded
-    to bf16, then the linear's own per-token quant, as the original layer does."""
+    to bf16, then the linear's own per-token quant, as the original layer does.
+    ``kv_nvfp4``: K and V go to single-buffer NVFP4 K/V pages (``k_cache`` and
+    ``v_cache`` both the pool: K through the first, V through the second -- an unused
+    kernel argument leaves the layer kernel with a private segment; ``k_scale`` /
+    ``v_scale`` point at the layer's f32 global scales, not at per-token scales);
+    ``index_nvfp4``: index K goes to NVFP4 index pages.
+    ``attn_mxfp8``: the projection is a native MXFP8 1x32 one (``s_qkv``: row-major E8M0
+    ``[rows, HIDDEN / 32]``): the norm's bf16 output is quantized per 32 elements (E8M0
+    ceil-pow2 code, the native linear's ``quantize_fp8``), the codes 4 to a word in LDS
+    ``xsc`` (row pitch ``XSCB_ROW``; S > 2 handed over through ``xsc_mb``), and the GEMV
+    is one scaled 16x16x128 MFMA per 128 k, no per-token / per-row scale after it."""
+    assert not (dense and kv_nvfp4)
+    assert not (dense and attn_mxfp8)
     rows = heads.rows
     (
         ar,
@@ -275,9 +305,44 @@ def emit_pre_attn(
                 [accs[j][i][e] * rstd * (gs[i][e] + 1.0) for e in range(8)]
                 for i in range(2)
             ]
-            if const_expr(plain_norm):  # the norm's bf16 output is the linear's input
+            if const_expr(
+                plain_norm or attn_mxfp8
+            ):  # the norm's bf16 output is the linear's input
                 nj = [[bf16_round(x) for x in row] for row in nj]
             normed.append(nj)
+        if const_expr(attn_mxfp8):
+            # per 1x32 (the native linear's quantize_fp8): a 32-block is 4 consecutive
+            # logical threads = 4 lanes, so its amax is a quad butterfly inside the wave
+            for j in range_constexpr(len(toks)):
+                for i in range_constexpr(2):
+                    v = normed[j][i]
+                    am = fmath.absf(v[0])
+                    for e in range_constexpr(1, 8):
+                        am = fx.max(am, fmath.absf(v[e]))
+                    am = butterfly(am, (1, 2), fx.max)
+                    code = code_ceil(
+                        fx.max(am, fx.Float32(1e-10)) * fx.Float32(1.0 / FP8_MAX)
+                    )
+                    inv = rcp_pow2(code)
+                    q = [clamp_fp8(v[e] * inv) for e in range(8)]
+                    w01 = [
+                        fp8_pack4(q[0], q[1], q[2], q[3]),
+                        fp8_pack4(q[4], q[5], q[6], q[7]),
+                    ]
+                    xo = x8 + (j * (HIDDEN // 4) + lts[i] * 2)
+                    if (i == 0) | (lane < 32):
+                        fx.ptr_store(w01[0].bitcast(fx.Float32), xo)
+                        fx.ptr_store(w01[1].bitcast(fx.Float32), xo + 1)
+                    # 4 quads' codes (lanes 16 m + 4 k) in one word, byte k
+                    word = butterfly(code << (8 * ((lane // 4) % 4)), (4, 8), _or)
+                    if (lane % 16 == 0) & ((i == 0) | (lane < 32)):
+                        fx.ptr_store(
+                            word.bitcast(fx.Float32),
+                            xsc + (j * XSCB_ROW + lts[i] // 16),
+                        )
+            gpu.barrier()
+            stamp(2)
+            return [None] * len(toks)
         for j in range_constexpr(len(toks)):
             amax = fx.Float32(0.0)
             for e in range_constexpr(8):
@@ -344,7 +409,18 @@ def emit_pre_attn(
                         tk * (HIDDEN // 4) + lts[i] * 2,
                         cache_modifier=CM_DEV,
                     )
-            publish(mb_put, x8s_mb, tk, x_scale, tid == 0)
+            if const_expr(attn_mxfp8):
+                # the codes as plain words; the flag's value carries no scale
+                if tid < HIDDEN // 128:
+                    bo.buffer_store(
+                        fx.Int32(fx.ptr_load(xsc + tid).bitcast(fx.Int32)),
+                        rsrc(xsc_mb),
+                        tk * (HIDDEN // 128) + tid,
+                        cache_modifier=CM_DEV,
+                    )
+                publish(mb_put, x8s_mb, tk, fx.Float32(1.0), tid == 0)
+            else:
+                publish(mb_put, x8s_mb, tk, x_scale, tid == 0)
 
     # ============================================ GEMV tasks (one per CTA)
     enter_stage("k1.gemv")
@@ -374,7 +450,7 @@ def emit_pre_attn(
         # scheduling barrier keeps the compiler from interleaving them again (nothing
         # before it uses a loaded value, so it does not wait either)
         rocdl.sched_barrier(0)
-        r_w = rsrc(w_qkv)
+        r_w = rsrc(w_qkv, 0 if "qkv" in strip else None)
         # 64-k chunk kc of row group rg is 1 KB at ((rg*K/32 + 2kc)*512); lane l
         # holds row l%16, k = 64kc + 16(l/16) + [0, 16).
         wts = []
@@ -391,14 +467,25 @@ def emit_pre_attn(
                     )
                 )
             )
-        ws = fx.Float32(  # row tid % 16's scale, sampled below by tid < 16 tokens
-            bo.buffer_load(
-                rsrc(s_qkv),
-                rg * ROWS_PER_TASK + tid % ROWS_PER_TASK,
-                vec_width=1,
-                dtype=T.f32,
+        if const_expr(attn_mxfp8):
+            # this lane's row's E8M0 bytes of the wave's 24 blocks (6 MFMAs x 4), 8 B
+            # aligned: 4 + 2 dwords; MFMA i takes block g of dword i (shifted to byte 0)
+            r_ws = rsrc(s_qkv, 0 if "qkv" in strip else None)
+            w_row = ((rg * ROWS_PER_TASK + lane % 16) * K_SCALE_BYTES + 24 * wave) // 4
+            ws_dw = [
+                fx.Vector(bo.buffer_load(r_ws, w_row, vec_width=4, dtype=T.i32)),
+                fx.Vector(bo.buffer_load(r_ws, w_row + 4, vec_width=2, dtype=T.i32)),
+            ]
+            ws_dw = [ws_dw[0][e] for e in range(4)] + [ws_dw[1][e] for e in range(2)]
+        else:
+            ws = fx.Float32(  # row tid % 16's scale, sampled below by tid < 16 tokens
+                bo.buffer_load(
+                    rsrc(s_qkv, 0 if "qkv" in strip else None),
+                    rg * ROWS_PER_TASK + tid % ROWS_PER_TASK,
+                    vec_width=1,
+                    dtype=T.f32,
+                )
             )
-        )
         if const_expr(tokens <= 2):
             x_scales = norm_quant(
                 list(range(tokens)), raw_g, raw_ar, lambda j: bid == j
@@ -410,11 +497,47 @@ def emit_pre_attn(
             # the norm tasks' scales (each published after its row's plain x8 words),
             # then every row, 16 B a load
             got = mb_poll([(x8s_mb, tk, 1) for tk in range(tokens)])
-            x_scales = [got[tk][0].bitcast(fx.Float32) for tk in range(tokens)]
+            if const_expr(not attn_mxfp8):
+                x_scales = [got[tk][0].bitcast(fx.Float32) for tk in range(tokens)]
             fx.memory_fence(
                 syncscope=rocdl.SyncScope.Workgroup, ordering=fx.AtomicOrdering.Acquire
             )
-            rows_to_lds(tid, x8_mb, tokens, HIDDEN // 4, x8, HIDDEN // 4)
+            if const_expr(attn_mxfp8):
+                # the rows and their codes in one batched loop (a second one would add a
+                # round trip of the 16 B loads to the chain): loads v < n_x are x8's
+                n_x, n_s = tokens * (HIDDEN // 4) // 4, tokens * (HIDDEN // 128) // 4
+
+                def put_row_or_codes(v, w):
+                    if v < n_x:
+                        fx.ptr_store(w, x8 + v * 4)
+                    else:
+                        u = v - n_x
+                        fx.ptr_store(
+                            w,
+                            xsc
+                            + (
+                                u * 4 // (HIDDEN // 128) * XSCB_ROW
+                                + u * 4 % (HIDDEN // 128)
+                            ),
+                        )
+
+                batched_rounds(
+                    tid,
+                    n_x + n_s,
+                    lambda v: fx.Vector(
+                        ld_dev(
+                            x8_mb,
+                            (v < n_x).select(
+                                v * 4, (SCRATCH_XSC - SCRATCH_X8) // 4 + (v - n_x) * 4
+                            ),
+                            4,
+                        )
+                    ),
+                    put_row_or_codes,
+                    batch=MXFP8_COPY_BATCH,
+                )
+            else:
+                rows_to_lds(tid, x8_mb, tokens, HIDDEN // 4, x8, HIDDEN // 4)
             gpu.barrier()
             stamp(2)
         # 12 chunks per wave: two 16x16x32 FP8 MFMAs each (k halves of 8 bytes).
@@ -422,17 +545,55 @@ def emit_pre_attn(
         # token t's rows, the weight stream is the same for any token count.
         col_tok = fx.min(lane % 16, tokens - 1)
         c = fx.Vector.filled(4, 0.0, fx.Float32)
-        for cc in range_constexpr(CHUNKS_PER_WAVE):
-            kc = wave * CHUNKS_PER_WAVE + cc
-            xb = fx.Vector(
-                fx.ptr_load(
-                    x8 + (col_tok * (HIDDEN // 4) + kc * 16 + (lane // 16) * 4),
-                    result_type=fx.Vector.make_type(4, fx.Float32),
+        if const_expr(attn_mxfp8):
+            # one 16x16x128 scaled MFMA per two chunks (the K4 o_proj's operand packing):
+            # A = rows' E8M0 byte of block g of the 128-k chunk (kc128 = 6 w + i), B =
+            # the token's, both read as the low byte of a word
+            g4 = lane // 16
+            sbs = [
+                fx.ptr_load(xsc + (col_tok * XSCB_ROW + 6 * wave + i)).bitcast(fx.Int32)
+                >> (g4 * 8)
+                for i in range(CHUNKS_PER_WAVE // CHUNKS_PER_MFMA)
+            ]
+            for p in range_constexpr(CHUNKS_PER_WAVE // CHUNKS_PER_MFMA):
+                xb = [
+                    fx.Vector(
+                        fx.ptr_load(
+                            x8
+                            + (
+                                col_tok * (HIDDEN // 4)
+                                + (wave * CHUNKS_PER_WAVE + 2 * p + h) * 16
+                                + g4 * 4
+                            ),
+                            result_type=fx.Vector.make_type(4, fx.Float32),
+                        )
+                    ).bitcast(fx.Int32)
+                    for h in range(2)
+                ]
+                c = mfma_scaled(
+                    fx.Vector.from_elements(
+                        [wts[2 * p + h][e] for h in range(2) for e in range(4)],
+                        fx.Int32,
+                    ),
+                    fx.Vector.from_elements(
+                        [xb[h][e] for h in range(2) for e in range(4)], fx.Int32
+                    ),
+                    c,
+                    ws_dw[p] >> (g4 * 8),
+                    sbs[p],
                 )
-            ).bitcast(fx.Int64)
-            wa = wts[cc].bitcast(fx.Int64)
-            for h in range_constexpr(2):
-                c = mfma_fp8(wa[h], xb[h], c)
+        else:
+            for cc in range_constexpr(CHUNKS_PER_WAVE):
+                kc = wave * CHUNKS_PER_WAVE + cc
+                xb = fx.Vector(
+                    fx.ptr_load(
+                        x8 + (col_tok * (HIDDEN // 4) + kc * 16 + (lane // 16) * 4),
+                        result_type=fx.Vector.make_type(4, fx.Float32),
+                    )
+                ).bitcast(fx.Int64)
+                wa = wts[cc].bitcast(fx.Int64)
+                for h in range_constexpr(2):
+                    c = mfma_fp8(wa[h], xb[h], c)
         fx.ptr_store(c, red + (wave * 64 + lane) * 4)
         gpu.barrier()
         # sample column t of C: lanes t, 16 + t, 32 + t, 48 + t hold rows 4 (l/16) + e
@@ -444,14 +605,17 @@ def emit_pre_attn(
                 tot_r = tot_r + fx.ptr_load(
                     red + ((w * 64 + 16 * (r // 4) + tk) * 4 + r % 4)
                 )
-            x_scale = x_scales[0]
-            for k in range_constexpr(1, tokens):
-                x_scale = (tk == k).select(x_scales[k], x_scale)
-            mb_put(
-                qkv_mb,
-                tk * rows + rg * ROWS_PER_TASK + r,
-                bf16_round(tot_r * x_scale * ws),
-            )
+            if const_expr(attn_mxfp8):  # the scales are inside the MFMA
+                mb_put(qkv_mb, tk * rows + rg * ROWS_PER_TASK + r, bf16_round(tot_r))
+            else:
+                x_scale = x_scales[0]
+                for k in range_constexpr(1, tokens):
+                    x_scale = (tk == k).select(x_scales[k], x_scale)
+                mb_put(
+                    qkv_mb,
+                    tk * rows + rg * ROWS_PER_TASK + r,
+                    bf16_round(tot_r * x_scale * ws),
+                )
 
         stamp(3)
 
@@ -487,6 +651,15 @@ def emit_pre_attn(
             else:  # no index heads (g_iq / g_ik may be 0): V's unused gamma is k's
                 gw = is_q.select(g_q, g_k)
             gw4, cs, sn = head_rope_inputs(tk, gw, d0, cos_sin, positions)
+            if const_expr(kv_nvfp4):
+                gs_kv = is_v.select(
+                    fx.Float32(
+                        bo.buffer_load(rsrc(v_scale), 0, vec_width=1, dtype=T.f32)
+                    ),
+                    fx.Float32(
+                        bo.buffer_load(rsrc(k_scale), 0, vec_width=1, dtype=T.f32)
+                    ),
+                )
             got = mb_poll([(qkv_mb, base + d0, 2), (qkv_mb, base + d0 + 2, 2)])
             stamp(4)
             e = [
@@ -496,28 +669,36 @@ def emit_pre_attn(
                 got[1][1].bitcast(fx.Float32),
             ]
             if is_v:
-                # raw V: per-token amax over the head, scale = amax / FP8_MAX
-                am = fx.Float32(0.0)
-                for j in range_constexpr(ELEMS):
-                    am = fx.max(am, fmath.absf(e[j]))
-                am = butterfly(am, (16, 8, 4, 2, 1), fx.max)
-                vs = (am > 0.0).select(am / FP8_MAX, fx.Float32(1.0))
-                if slot >= 0:
-                    b = slot // PAGE16
-                    t = slot % PAGE16
-                    if l32 == 0:
-                        bo.buffer_store(
-                            vs, rsrc(v_scale), b * PAGE16 + t, cache_modifier=cm_out
-                        )
-                    r_v = rsrc(v_cache)
+                if const_expr(kv_nvfp4):
+                    if slot >= 0:
+                        nvfp4_v_store(
+                            rsrc(v_cache), v_cache, slot,
+                            [bf16_round(e[j]) for j in range(ELEMS)], l32, gs_kv,
+                            cm_out,
+                        )  # fmt: skip
+                else:
+                    # raw V: per-token amax over the head, scale = amax / FP8_MAX
+                    am = fx.Float32(0.0)
                     for j in range_constexpr(ELEMS):
-                        q8 = fp8_pack4(e[j] / vs, 0.0, 0.0, 0.0) & 0xFF
-                        bo.buffer_store(
-                            fx.Int8(q8),
-                            r_v,
-                            b * PAGE_BYTES + (d0 + j) * PAGE16 + t,
-                            cache_modifier=cm_out,
-                        )
+                        am = fx.max(am, fmath.absf(e[j]))
+                    am = butterfly(am, (16, 8, 4, 2, 1), fx.max)
+                    vs = (am > 0.0).select(am / FP8_MAX, fx.Float32(1.0))
+                    if slot >= 0:
+                        b = slot // PAGE16
+                        t = slot % PAGE16
+                        if l32 == 0:
+                            bo.buffer_store(
+                                vs, rsrc(v_scale), b * PAGE16 + t, cache_modifier=cm_out
+                            )
+                        r_v = rsrc(v_cache)
+                        for j in range_constexpr(ELEMS):
+                            q8 = fp8_pack4(e[j] / vs, 0.0, 0.0, 0.0) & 0xFF
+                            bo.buffer_store(
+                                fx.Int8(q8),
+                                r_v,
+                                b * PAGE_BYTES + (d0 + j) * PAGE16 + t,
+                                cache_modifier=cm_out,
+                            )
             else:
                 out = head_norm_rope(e, lane, gw4, cs, sn, eps)
                 if is_q:
@@ -534,53 +715,64 @@ def emit_pre_attn(
                         tk * HEAD_DIM + d0,
                     )
                 if is_k:
-                    am = fx.Float32(0.0)
-                    for j in range_constexpr(ELEMS):
-                        am = fx.max(am, fmath.absf(out[j]))
-                    am = butterfly(am, (16, 8, 4, 2, 1), fx.max)
-                    ksc = (am > 0.0).select(am / FP8_MAX, fx.Float32(1.0))
-                    if slot >= 0:
-                        b = slot // PAGE16
-                        t = slot % PAGE16
-                        if l32 == 0:
+                    if const_expr(kv_nvfp4):
+                        if slot >= 0:
+                            nvfp4_k_store(
+                                rsrc(k_cache), slot,
+                                [bf16_round(out[j]) for j in range(ELEMS)], l32,
+                                gs_kv, cm_out,
+                            )  # fmt: skip
+                    else:
+                        am = fx.Float32(0.0)
+                        for j in range_constexpr(ELEMS):
+                            am = fx.max(am, fmath.absf(out[j]))
+                        am = butterfly(am, (16, 8, 4, 2, 1), fx.max)
+                        ksc = (am > 0.0).select(am / FP8_MAX, fx.Float32(1.0))
+                        if slot >= 0:
+                            b = slot // PAGE16
+                            t = slot % PAGE16
+                            if l32 == 0:
+                                bo.buffer_store(
+                                    ksc,
+                                    rsrc(k_scale),
+                                    b * PAGE16 + t,
+                                    cache_modifier=cm_out,
+                                )
+                            if const_expr(dense):
+                                # the dense path's Triton rope-cache: K quantized
+                                # from f32, page-128 SHUFFLE [b128][d / 16][t][16]
+                                qk = [out[j] / ksc for j in range(ELEMS)]
+                                k_off = (
+                                    slot // DENSE_PAGE * (DENSE_PAGE * HEAD_DIM)
+                                    + (d0 // 16) * (DENSE_PAGE * 16)
+                                    + slot % DENSE_PAGE * 16
+                                    + d0 % 16
+                                )
+                            else:
+                                qk = [bf16_round(out[j]) / ksc for j in range(ELEMS)]
+                                k_off = (
+                                    b * PAGE_BYTES
+                                    + (d0 // 16) * (PAGE16 * 16)
+                                    + t * 16
+                                    + d0 % 16
+                                )
                             bo.buffer_store(
-                                ksc,
-                                rsrc(k_scale),
-                                b * PAGE16 + t,
+                                fp8_pack4(qk[0], qk[1], qk[2], qk[3]),
+                                rsrc(k_cache),
+                                k_off // 4,
                                 cache_modifier=cm_out,
                             )
-                        if const_expr(dense):
-                            # the dense path's Triton rope-cache: K quantized
-                            # from f32, page-128 SHUFFLE [b128][d / 16][t][16]
-                            qk = [out[j] / ksc for j in range(ELEMS)]
-                            k_off = (
-                                slot // DENSE_PAGE * (DENSE_PAGE * HEAD_DIM)
-                                + (d0 // 16) * (DENSE_PAGE * 16)
-                                + slot % DENSE_PAGE * 16
-                                + d0 % 16
-                            )
-                        else:
-                            qk = [bf16_round(out[j]) / ksc for j in range(ELEMS)]
-                            k_off = (
-                                b * PAGE_BYTES
-                                + (d0 // 16) * (PAGE16 * 16)
-                                + t * 16
-                                + d0 % 16
-                            )
-                        bo.buffer_store(
-                            fp8_pack4(qk[0], qk[1], qk[2], qk[3]),
-                            rsrc(k_cache),
-                            k_off // 4,
-                            cache_modifier=cm_out,
-                        )
                 if (ht == IK_TASK) & (slot >= 0):
                     qi = [bf16_round(out[j]) for j in range(ELEMS)]
-                    bo.buffer_store(
-                        fp8_pack4(qi[0], qi[1], qi[2], qi[3]),
-                        rsrc(index_cache),
-                        (slot * HEAD_DIM + d0) // 4,
-                        cache_modifier=cm_out,
-                    )
+                    if const_expr(index_nvfp4):
+                        nvfp4_row_store(rsrc(index_cache), slot, qi, l32, cm_out)
+                    else:
+                        bo.buffer_store(
+                            fp8_pack4(qi[0], qi[1], qi[2], qi[3]),
+                            rsrc(index_cache),
+                            (slot * HEAD_DIM + d0) // 4,
+                            cache_modifier=cm_out,
+                        )
 
         if const_expr(signal is not None):
             # every token's flag once the whole CTA's stores are out
@@ -599,7 +791,8 @@ K1_ARGS = (
 def emit_k1(
     tid, bid, lane, wave, x8, red, qs, stamp, layer, eps, index_scale, tokens,
     q_len, init_blocks, local_blocks, heads, ptrs, bt_width, signal=False, diag=None,
-    region_ids=None, index_topk=True, dense=False, plain_norm=False,
+    region_ids=None, index_topk=True, dense=False, plain_norm=False, kv_nvfp4=False,
+    index_nvfp4=False, skip=(), strip=(), attn_mxfp8=False, xsc=None,
 ):  # fmt: skip
     """K1 whole: the GEMV / head / norm tasks, then every CTA's indexer scores
     (``index_topk``; else the layer reuses a selection: no index q / k, no scores).
@@ -608,16 +801,21 @@ def emit_k1(
     verify rows). ``heads``: the index q heads of the fused projection
     (``IndexHeads``). ``signal`` (the fused layer kernel): the head tasks and
     residual writers publish done flags (SCRATCH_HDONE / SCRATCH_RDONE). ``diag``,
-    ``region_ids``: a debug build's bounded waits (``Mailbox``)."""
+    ``region_ids``: a debug build's bounded waits (``Mailbox``). ``kv_nvfp4`` /
+    ``index_nvfp4``: the K/V pool / index cache hold NVFP4 pages (``emit_pre_attn``);
+    the scores read them with the dims in the order the dequantized tile has.
+    ``attn_mxfp8``: native MXFP8 1x32 qkv (``emit_pre_attn``); ``xsc``: the codes' LDS,
+    ``tokens * XSC_ROW`` words."""
     (
         ar, res, h_out, g_in, w_qkv, s_qkv, g_q, g_k, g_iq, g_ik, cos_sin, positions,
         slot_mapping, k_cache, v_cache, k_scale, v_scale, index_cache, q_out, iq_out,
         block_table, seq_lens, iscore, scratch,
     ) = ptrs  # fmt: skip
-    mbox = Mailbox(layer, diag, region_ids)
+    mbox = Mailbox(layer, diag, region_ids, skip)
     qkv_mb = sreg(scratch, SCRATCH_QKV, "k1.qkv")
     x8_mb = scratch + fx.Int64(SCRATCH_X8)  # plain words, behind x8s's tags
     x8s_mb = sreg(scratch, SCRATCH_X8S, "k1.x8s")
+    xsc_mb = scratch + fx.Int64(SCRATCH_XSC)  # plain words, behind x8s's flags
     hdone_mb = sreg(scratch, SCRATCH_HDONE, "k1.hdone")
     rdone_mb = sreg(scratch, SCRATCH_RDONE, "k1.rdone")
     # Plain names, not method calls: flydsl's AST rewriter carries every local whose
@@ -664,7 +862,16 @@ def emit_k1(
         row = (tk * heads.count + head) * (HEAD_DIM // 2)
         return fx.Vector(
             fx.ptr_load(
-                qs + (row + (32 * s + 8 * (lane // 16)) // 2),
+                qs
+                + (
+                    row
+                    + (
+                        (32 * (lane // 16) + 8 * s)
+                        if index_nvfp4
+                        else (32 * s + 8 * (lane // 16))
+                    )
+                    // 2
+                ),
                 result_type=fx.Vector.make_type(4, fx.Float32),
             )
         ).bitcast(fx.BFloat16)
@@ -691,6 +898,12 @@ def emit_k1(
         index_topk,
         dense,
         plain_norm,
+        kv_nvfp4,
+        index_nvfp4,
+        strip,
+        attn_mxfp8,
+        xsc,
+        xsc_mb,
     )  # fmt: skip
     stamp(5)
 
@@ -711,7 +924,8 @@ def emit_k1(
             Addr("iscore", Space.SCRATCH, iscore),
             q_frag, tokens, q_len, init_blocks, local_blocks, index_scale, index_cache,
             block_table, seq_lens, bt_width, wait_new_keys if signal else None,
-            make_index_q, heads, q_frag_head, make_index_q_heads,
+            make_index_q, heads, q_frag_head, make_index_q_heads, nvfp4=index_nvfp4,
+            strip=strip,
         )  # fmt: skip
     stamp(6)
 
@@ -743,6 +957,9 @@ class K1Build:
     plain_norm: bool = field(metadata={"sym": "pn"})
     eps: float
     sm_scale: float
+    kv_nvfp4: bool = False
+    index_nvfp4: bool = False
+    attn_mxfp8: bool = False
 
 
 def build_pre_attn_kernel(
@@ -755,30 +972,47 @@ def build_pre_attn_kernel(
     heads: IndexHeads = ONE_INDEX_HEAD,
     dense: bool = False,
     plain_norm: bool = False,
+    kv_nvfp4: bool = False,
+    index_nvfp4: bool = False,
+    attn_mxfp8: bool = False,
 ):
     """``@flyc.jit`` launcher of K1 for this model's RMSNorm epsilon, attention
     scale and sparse pinned blocks, a decode batch of ``tokens`` (<= MAX_TOKENS)
     rows and the fused projection's index q ``heads``. ``dense``: a dense layer's
     (``dense_pre``): q | k | v rows only, no indexer, K inserted as the dense
     path's rope-cache does; ``plain_norm``: layer 0's input norm
-    (``emit_pre_attn``)."""
+    (``emit_pre_attn``). ``kv_nvfp4`` / ``index_nvfp4``: NVFP4 K/V / index pages
+    (``emit_k1``). ``attn_mxfp8``: ``s_qkv`` is a native MXFP8 1x32 weight's row-major
+    E8M0 scales ``[rows, HIDDEN / 32]`` (``emit_pre_attn``)."""
     assert 1 <= tokens <= MAX_TOKENS
     key = K1Build(
         tokens=tokens, init_blocks=init_blocks, local_blocks=local_blocks,
         index_heads=heads.count, index_own=heads.own, timeline=timeline,
         dense=dense, plain_norm=plain_norm, eps=eps, sm_scale=sm_scale,
+        kv_nvfp4=kv_nvfp4, index_nvfp4=index_nvfp4, attn_mxfp8=attn_mxfp8,
     )  # fmt: skip
     build_key = key_tuple(key, SOURCES)  # the launcher references it: keyed
     index_scale = index_scale_log2e(sm_scale)
 
     @fx.struct
-    class Smem:
+    class SmemPtpc:
         # FP8 activations, natural k order, one row per token
         x8: fx.Array[fx.Int32, tokens * HIDDEN // 4, 16]
         red: fx.Array[fx.Float32, WAVES * 64 * 4, 16]
         tls: fx.Array[fx.Int64, TL_POINTS if timeline else 1, 16]  # timeline stamps
         # every token's index q for the scorers, bf16 pairs
         qs: fx.Array[fx.Float32, HEAD_DIM // 2 * tokens * heads.count, 16]
+
+    @fx.struct
+    class SmemMx:
+        x8: fx.Array[fx.Int32, tokens * HIDDEN // 4, 16]
+        red: fx.Array[fx.Float32, WAVES * 64 * 4, 16]
+        tls: fx.Array[fx.Int64, TL_POINTS if timeline else 1, 16]
+        qs: fx.Array[fx.Float32, HEAD_DIM // 2 * tokens * heads.count, 16]
+        # the norm's per-1x32 E8M0 codes, a word each
+        xsc: fx.Array[fx.Int32, tokens * XSCB_ROW, 16]
+
+    Smem = SmemMx if attn_mxfp8 else SmemPtpc
 
     kernel_name = kernel_symbol("minimax_m3_pre_attn", **symbol_params(key))
 
@@ -826,6 +1060,7 @@ def build_pre_attn_kernel(
         red = lds.red.ptr
         tls = lds.tls.ptr
         qs = lds.qs.ptr
+        xsc = lds.xsc.ptr if attn_mxfp8 else None
 
         def stamp(k):
             """``timeline``: this CTA passing point k (``atom.mono.device.stamps``)."""
@@ -844,6 +1079,10 @@ def build_pre_attn_kernel(
             index_topk=not dense,
             dense=dense,
             plain_norm=plain_norm,
+            kv_nvfp4=kv_nvfp4,
+            index_nvfp4=index_nvfp4,
+            attn_mxfp8=attn_mxfp8,
+            xsc=xsc,
         )  # fmt: skip
         stamp_flush(timeline, tls, tl, tid, bid, TL_POINTS)
 
