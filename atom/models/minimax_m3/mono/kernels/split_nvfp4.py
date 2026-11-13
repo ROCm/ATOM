@@ -213,25 +213,30 @@ def dequant_quarter(raw, key_mask):
 @traced
 def split_nvfp4_task(
     tid, lane, wave, tok, t, blk, q, kv_addr, k_gs, v_gs, sm_scale, hst, opart, n_ctx,
-    put_o, put_m, put_l, cm=0, stamp=None,
+    put_o, put_m, put_l, cm=0, stamp=None, quarters=1,
 ):  # fmt: skip
     """Task (token ``tok``, partition ``t``): the partition's output, max and sum.
-    ``blk``: LDS ptr of its 16 page-16 ids; ``q``: Int64 address of the bf16 query
-    rows [token][O_K]; ``kv_addr``: the cache's Int64 base; ``k_gs`` / ``v_gs``: the
-    layer's global scales (f32); ``hst`` / ``opart``: LDS as the fp8 split's;
-    ``put_o(e0, ov)``, ``put_m(head, m)``, ``put_l(head, l)``; ``cm``: the cache
-    modifier of the page and query loads; ``stamp(k)``: the K4 timeline's points 12 -
+    ``blk``: LDS ptr of its page-16 ids (2 per quarter a wave, 8 waves); ``q``: Int64
+    address of the bf16 query rows [token][O_K]; ``kv_addr``: the cache's Int64 base;
+    ``k_gs`` / ``v_gs``: the layer's global scales (f32); ``hst`` / ``opart``: LDS as the
+    fp8 split's; ``put_o(e0, ov)``, ``put_m(head, m)``, ``put_l(head, l)``; ``cm``: the
+    cache modifier of the page and query loads; ``stamp(k)``: the K4 timeline's points 12 -
     15 (the dequantized tiles ready, the max exchanged, the PV done, the partition
-    summed). Runs under barriers every thread of the CTA reaches."""
+    summed). Runs under barriers every thread of the CTA reaches.
+    ``quarters``: 32-key quarters a wave works (1: a 256-key partition, 2: 512 keys, the
+    wave's two quarters one softmax)."""
     l16 = lane % 16
     g4 = lane // 16
     c = fx.Float32(sm_scale) * k_gs
-    # this wave's quarter: its first entry's block and quarter, scalars
-    p16 = uniform(fx.ptr_load(blk + wave * PPW))
-    block = p16 // 8
-    quarter = (p16 % 8) // 2
-    r_page = rsrc(kv_addr + fx.Int64(block) * KV_PAGE_BYTES, KV_PAGE_BYTES)
-    raw = load_quarter(r_page, quarter, l16, g4, cm)
+    split_keys = quarters * WAVES * KPW
+    # this wave's quarters: each one's first entry's block and quarter, scalars
+    raws = []
+    for qi in range_constexpr(quarters):
+        p16 = uniform(fx.ptr_load(blk + (wave * PPW * quarters + 2 * qi)))
+        block = p16 // 8
+        quarter = (p16 % 8) // 2
+        r_page = rsrc(kv_addr + fx.Int64(block) * KV_PAGE_BYTES, KV_PAGE_BYTES)
+        raws.append(load_quarter(r_page, quarter, l16, g4, cm))
     # Q^T fragments: head l16, dims 32 g + 8 s .. + 7, bf16 -> f16
     qb = []
     r_q = rsrc(q)
@@ -248,36 +253,47 @@ def split_nvfp4_task(
         qb.append(
             w4.bitcast(fx.BFloat16).to(fx.Float32).to(fx.Float16).bitcast(fx.Int32)
         )
-    key0 = t * SPLIT_KEYS + wave * KPW
     # Masks by integer arithmetic, not compares: a compare's result is a pair of
     # scalar registers, and the layer kernel has none to spare (with eight of them
     # live the build needed a private segment). ``nl``: this lane's keys of its 8 in
     # the context; a V operand dword of two keys has 16 bits a live key.
-    nl = n_ctx - (key0 + 8 * g4)
-    key_mask = [
-        fx.Int32(
-            (
-                (fx.Int64(1) << (fx.Int64(fx.min(fx.max(nl - 2 * i, 0), 2)) * 16))
-                - fx.Int64(1)
+    nls, kfs, vfs = [], [], []
+    for qi in range_constexpr(quarters):
+        key0 = t * split_keys + (wave * quarters + qi) * KPW
+        nl = n_ctx - (key0 + 8 * g4)
+        key_mask = [
+            fx.Int32(
+                (
+                    (fx.Int64(1) << (fx.Int64(fx.min(fx.max(nl - 2 * i, 0), 2)) * 16))
+                    - fx.Int64(1)
+                )
+                & fx.Int64(0xFFFFFFFF)
             )
-            & fx.Int64(0xFFFFFFFF)
-        )
-        for i in range(4)
-    ]
-    kf, vf = dequant_quarter(raw, key_mask)
+            for i in range(4)
+        ]
+        kf, vf = dequant_quarter(raws[qi], key_mask)
+        nls.append(nl)
+        kfs.append(kf)
+        vfs.append(vf)
     if stamp is not None:
         stamp(12)
-    sc = []
-    for st in range_constexpr(2):
-        acc = _V.filled(4, 0.0, fx.Float32)
-        for s in range_constexpr(4):
-            acc = _mfma_f16(kf[st][s], qb[s], acc)
-        sc.append([_masked(acc[e] * c, nl - 1 - (4 * st + e)) for e in range(4)])
-    # head l16's max over this wave's 32 keys: its 8, then the four lane groups
-    m = sc[0][0]
-    for st in range_constexpr(2):
-        for e in range_constexpr(4):
-            m = fx.max(m, sc[st][e])
+    scs = []
+    for qi in range_constexpr(quarters):
+        sc = []
+        for st in range_constexpr(2):
+            acc = _V.filled(4, 0.0, fx.Float32)
+            for s in range_constexpr(4):
+                acc = _mfma_f16(kfs[qi][st][s], qb[s], acc)
+            sc.append(
+                [_masked(acc[e] * c, nls[qi] - 1 - (4 * st + e)) for e in range(4)]
+            )
+        scs.append(sc)
+    # head l16's max over this wave's keys: its 8 a quarter, then the four lane groups
+    m = scs[0][0][0]
+    for qi in range_constexpr(quarters):
+        for st in range_constexpr(2):
+            for e in range_constexpr(4):
+                m = fx.max(m, scs[qi][st][e])
     m = fx.max(m, xshfl(m, 16))
     m = fx.max(m, xshfl(m, 32))
     if g4 == 0:
@@ -288,25 +304,38 @@ def split_nvfp4_task(
     mx = fx.ptr_load(hst + l16)
     for w in range_constexpr(1, WAVES):
         mx = fx.max(mx, fx.ptr_load(hst + (w * H + l16)))
-    p = [[hw_exp2((sc[st][e] - mx) * LOG2E) for e in range(4)] for st in range(2)]
-    ls = p[0][0]
-    for st in range_constexpr(2):
-        for e in range_constexpr(4):
-            if (st, e) != (0, 0):
-                ls = ls + p[st][e]
+    ps = [
+        [[hw_exp2((sc[st][e] - mx) * LOG2E) for e in range(4)] for st in range(2)]
+        for sc in scs
+    ]
+    ls = ps[0][0][0]
+    for qi in range_constexpr(quarters):
+        for st in range_constexpr(2):
+            for e in range_constexpr(4):
+                if (qi, st, e) != (0, 0, 0):
+                    ls = ls + ps[qi][st][e]
     ls = ls + xshfl(ls, 16)
     ls = ls + xshfl(ls, 32)
     if g4 == 0:
         fx.ptr_store(ls, hst + (WAVES * H + wave * H + l16))
-    pt = _V.from_elements(
-        [_pk_f16(p[st][2 * h], p[st][2 * h + 1]) for st in range(2) for h in range(2)],
-        fx.Int32,
-    )
+    pts = [
+        _V.from_elements(
+            [
+                _pk_f16(p[st][2 * h], p[st][2 * h + 1])
+                for st in range(2)
+                for h in range(2)
+            ],
+            fx.Int32,
+        )
+        for p in ps
+    ]
     # O^T tile dt: lane (n, g) rows 4 g + e = dims 32 g + 8 e + dt of head n
     for e in range_constexpr(4):
         outs = []
         for dt in range_constexpr(8):
-            cv = _mfma_f16(vf[dt], pt, _V.filled(4, 0.0, fx.Float32))
+            cv = _V.filled(4, 0.0, fx.Float32)
+            for qi in range_constexpr(quarters):
+                cv = _mfma_f16(vfs[qi][dt], pts[qi], cv)
             outs.append(cv[e])
         base = opart + (wave * O_K + l16 * HEAD_DIM + 32 * g4 + 8 * e)
         fx.ptr_store(_V.from_elements(outs[:4], fx.Float32), base)
@@ -420,7 +449,7 @@ def build_split_nvfp4_kernel(
             tid, lane, wave, ts // N_SPLIT, ts % N_SPLIT, blk, q, kv, kg, vg,
             sm_scale, lds.hst.ptr, lds.opart.ptr, n_ctx, put_o, put_m, put_l,
         )  # fmt: skip
-        if const_expr(timed):
+        if const_expr(timed):  # noqa: SIM102
             if tid == 0:
                 bo.buffer_store(fx.Int32(memrealtime() - t0), rsrc(tl), ts)
 

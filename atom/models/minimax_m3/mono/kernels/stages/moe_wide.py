@@ -338,7 +338,7 @@ def moe_wide_defs(k4ctx):
         e_u = fx.Int32(fx.ptr_load(uexp + u))
         m_u = fx.Int32(fx.ptr_load(umask + u))
         row = k * TOP_K + slot_of(k, e_u)
-        if (tid < UG_ROWS * tokens) & (((m_u >> k) & 1) != 0):
+        if (tid < UG_ROWS * tokens) & (((m_u >> k) & 1) != 0):  # noqa: SIM102
             if r % 2 == 0:
                 for h, (a_, b_) in enumerate(((lo, nb_lo), (hi, nb_hi))):
                     bo.buffer_store(
@@ -629,7 +629,7 @@ def moe_wide_defs(k4ctx):
             ):
                 rows_to_lds(tid, base_w, tokens, n_row, xs + lds_w, lds_row)
         gpu.barrier()
-        if const_expr(SH_FIRST):
+        if const_expr(SH_FIRST):  # noqa: SIM102
             if has_s:
                 # the second half's tiles follow the first's MFMAs
                 cg0, cu0 = wug_mma(sh_cur[0], sh_cur[1], 0, True)

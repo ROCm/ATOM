@@ -70,79 +70,106 @@ SPARSE_TABLE_WORDS = TOPK_BLOCKS * PAGES_PER_BLOCK + 2
 # best (key, block) (indexer context parallelism: the peers' sel_cp)
 SEL_LONG_PAIRS = N_SPLIT * TOPK_BLOCKS * 2
 
-# every region holds MAX_TOKENS rows (token k at k * the one-token size)
-SCRATCH = _layout(
-    [
+
+def row_cap(tokens):
+    """Token rows a build's mailboxes hold: ``MAX_TOKENS`` up to that many tokens, else
+    whole 16-row token groups (K1's GEMV / head tasks and the o_proj work a group at a time).
+    """
+    return MAX_TOKENS if tokens <= MAX_TOKENS else -(-tokens // MAX_TOKENS) * MAX_TOKENS
+
+
+def scratch_layout(rows=MAX_TOKENS, n_split=N_SPLIT):
+    """Every region holds ``rows`` token rows (token k at k * the one-token size). The K4 scratch regions for a build of up to ``rows`` token rows (``MAX_TOKENS``: the
+    n <= 16 layout; more: 16-row token groups, the regions that grow with the tokens scaled
+    and the front half's hand-off to the router stage appended). ``n_split``: split tasks a token.
+    """
+    sel_long_pairs = (
+        N_SPLIT * TOPK_BLOCKS * 2
+    )  # (shares of a long selection: always N_SPLIT)
+    items = [
         # indexer block scores, token k's block b at pair k * MAX_INDEX_BLOCKS + b
-        ("iscore", MAX_INDEX_BLOCKS * MAX_TOKENS),
-        ("sparse_table", SPARSE_TABLE_WORDS // 2 * MAX_TOKENS),
-        ("sp_o", N_SPLIT * H * HEAD_DIM // 2 * MAX_TOKENS),  # packed bf16 pairs
-        ("sp_m", N_SPLIT * H * MAX_TOKENS),
-        ("sp_l", N_SPLIT * H * MAX_TOKENS),
-        ("attnq", O_K // 4 * MAX_TOKENS // 2),  # merged attention, plain FP8 words
-        ("attnq_s", MAX_TOKENS),  # and its per-token scale
+        ("iscore", MAX_INDEX_BLOCKS * rows),
+        ("sparse_table", SPARSE_TABLE_WORDS // 2 * rows),
+        ("sp_o", n_split * H * HEAD_DIM // 2 * rows),  # packed bf16 pairs
+        ("sp_m", n_split * H * rows),
+        ("sp_l", n_split * H * rows),
+        ("attnq", O_K // 4 * rows // 2),  # merged attention, plain FP8 words
+        ("attnq_s", rows),  # and its per-token scale
         # the finished attention all-reduce + residual, bf16 pairs (o tasks -> router)
-        ("a", HIDDEN // 2 * MAX_TOKENS),
-        ("xn8", HIDDEN // 4 * MAX_TOKENS),  # MXFP8 xn, 4 fp8 per word
-        ("xsc", HIDDEN // 32 * MAX_TOKENS),  # and its per-1x32 E8M0 scales
-        # copy c, token k at pairs [(c * MAX_TOKENS + k) * N_ROUTED, ..)
+        ("a", HIDDEN // 2 * rows),
+        ("xn8", HIDDEN // 4 * rows),  # MXFP8 xn, 4 fp8 per word
+        ("xsc", HIDDEN // 32 * rows),  # and its per-1x32 E8M0 scales
+        # copy c, token k at pairs [(c * rows + k) * N_ROUTED, ..)
         # per expert (routing key, sigmoid) pairs, see route_key
-        ("scores", 2 * N_ROUTED * MAX_TOKENS * SCORE_COPIES),
-        ("mid", MOE_SLOTS * INTER * MAX_TOKENS),
+        ("scores", 2 * N_ROUTED * rows * SCORE_COPIES),
+        ("mid", MOE_SLOTS * INTER * rows),
         # routing record read by the tests: token k's expert ids, then weights
-        ("sel", 2 * MOE_SLOTS * MAX_TOKENS),
+        ("sel", 2 * MOE_SLOTS * rows),
         # token k's split task p's candidates: rank r at pairs 2 ((k N_SPLIT + p)
         # TOPK_BLOCKS + r) + (0 key, 1 block)
-        ("sel_long", SEL_LONG_PAIRS * MAX_TOKENS),
+        ("sel_long", sel_long_pairs * rows),
         # wide: the MXFP8 xn and scales as plain words (every token's row), and a
         # done flag per router task
-        ("xn8p", HIDDEN // 4 * MAX_TOKENS // 2),
-        ("xscp", HIDDEN // 32 * MAX_TOKENS // 2),
-        ("xndone", N_ROUTER * MAX_TOKENS),
+        ("xn8p", HIDDEN // 4 * rows // 2),
+        ("xscp", HIDDEN // 32 * rows // 2),
+        ("xndone", N_ROUTER * rows),
         # and the mid rows as MXFP8 words, their E8M0 scales a word each (the down
         # stage's LDS layout), a done flag per up / gate task pair
-        ("mid8p", MOE_SLOTS * INTER * MAX_TOKENS // 8),
-        ("midsp", MOE_SLOTS * INTER // 32 * MAX_TOKENS // 2),
-        ("ugdone", (TOP_K * MAX_TOKENS + 1) * UG_PER_SLOT // 2),
+        ("mid8p", MOE_SLOTS * INTER * rows // 8),
+        ("midsp", MOE_SLOTS * INTER // 32 * rows // 2),
+        ("ugdone", (TOP_K * rows + 1) * UG_PER_SLOT // 2),
         # dense layers (dense_post): the post-attention norm's per-token FP8 rows
         # as plain words, each row's scale (its pair is the flag), and the MLP's
         # bf16 mid pairs
-        ("dx8", HIDDEN // 4 * MAX_TOKENS // 2),
-        ("dxs", MAX_TOKENS),
-        ("dmid", DENSE_INTER // 2 * MAX_TOKENS),
+        ("dx8", HIDDEN // 4 * rows // 2),
+        ("dxs", rows),
+        ("dmid", DENSE_INTER // 2 * rows),
         # and (S > 2) each mid row's per-token FP8 as plain words, then its scale
-        ("dmid8", DENSE_INTER // 4 * MAX_TOKENS // 2),
-        ("dmids", MAX_TOKENS),
+        ("dmid8", DENSE_INTER // 4 * rows // 2),
+        ("dmids", rows),
         # a debug build's wait records, one a CTA; last, so the regions above
         # keep their offsets in every build
         ("diag", BLOCKS * DIAG_WORDS * 4 // PAIR_BYTES),
         # ``attn_mxfp8``: the merged attention's per-1x32 E8M0 codes, 4 to a plain word
         # (behind ``attnq_s``'s flags); after ``diag`` so every region above keeps its offset
-        ("attnq_sc", MAX_TOKENS * (O_K // 128) // 2),
+        ("attnq_sc", rows * (O_K // 128) // 2),
         # ``sp_f32``: the partitions' outputs as f32 words (``sp_o``'s bf16 pairs, unrounded)
-        ("sp_o32", N_SPLIT * H * HEAD_DIM * MAX_TOKENS),
+        ("sp_o32", N_SPLIT * H * HEAD_DIM * rows),
         # ``moe_a16w4``: the router tasks' bf16 xn (narrow: tagged words, a pair a word)
-        ("xnb", HIDDEN // 2 * MAX_TOKENS),
+        ("xnb", HIDDEN // 2 * rows),
         # wide ``moe_a16w4``: the bf16 xn (every token's row) and the routed experts' bf16 mid rows
         # (row k TOP_K + slot) as plain words, behind the xn / up-gate flags
-        ("xnbp", HIDDEN // 2 * MAX_TOKENS // 2),
-        ("mid16p", TOP_K * INTER // 2 * MAX_TOKENS // 2),
+        ("xnbp", HIDDEN // 2 * rows // 2),
+        ("mid16p", TOP_K * INTER // 2 * rows // 2),
         # ``moe_a4w4``: the routed experts' MXFP4 xn (packed e2m1, 8 to a word, low nibble = lower k) and its
         # per-32 E8M0 codes (a word each): narrow tagged (``xn4`` / ``xs4``), wide plain words behind the
         # xn flag (``xn4p`` / ``xs4p``); wide: the routed mid rows (row k TOP_K + slot) and their codes
         # as plain words behind the up-gate flag (``mid4p`` / ``mids4p``)
-        ("xn4", HIDDEN // 8 * MAX_TOKENS),
-        ("xs4", HIDDEN // 32 * MAX_TOKENS),
-        ("xn4p", HIDDEN // 8 * MAX_TOKENS // 2),
-        ("xs4p", HIDDEN // 32 * MAX_TOKENS // 2),
-        ("mid4p", TOP_K * INTER // 8 * MAX_TOKENS // 2),
-        ("mids4p", TOP_K * INTER // 32 * MAX_TOKENS // 2),
+        ("xn4", HIDDEN // 8 * rows),
+        ("xs4", HIDDEN // 32 * rows),
+        ("xn4p", HIDDEN // 8 * rows // 2),
+        ("xs4p", HIDDEN // 32 * rows // 2),
+        ("mid4p", TOP_K * INTER // 8 * rows // 2),
+        ("mids4p", TOP_K * INTER // 32 * rows // 2),
     ]
-)
+    if rows > MAX_TOKENS:
+        items += [
+            # the front half's output for the router stage (``post_norm``): x_moe, the post-attention
+            # norm of every token as plain bf16 words (one row = HIDDEN * 2 B), and its per-token
+            # done flag (a pair, polled; the row's stores are drained before it)
+            ("xmoe_done", rows),
+            ("xmoe", rows * HIDDEN // 4),
+            # the wide back half's work-stealing counters (``moe_back``): a word a layer (layer & 127)
+            ("claim", 64),
+        ]
+    return _layout(items)
+
+
+SCRATCH = scratch_layout()
 SCRATCH_BYTES = SCRATCH["_bytes"]
 
 
-def sym_layout(npes: int):
+def sym_layout(npes: int, rows: int = MAX_TOKENS, n_split: int = N_SPLIT):
     """Per-rank symmetric buffer: attn / ffn partial regions, [src rank][token][HIDDEN],
     and the peers' index-selection candidates (``sel_cp``).
 
@@ -154,20 +181,20 @@ def sym_layout(npes: int):
     every peer's layer-L attention push, and a peer only pushes that after it
     finished reading layer L-1's FFN region. So ranks are at most half a layer
     apart and the two regions double-buffer each other."""
-    rows = npes * MAX_TOKENS * HIDDEN // 2
+    part = npes * rows * HIDDEN // 2
     # a_ag / ffn_ag: the finished attention / FFN all-reduce rows, each written by
     # its owner rank (the reduce-scatter + all-gather form, S >= AG_RS_FROM)
-    ag = MAX_TOKENS * HIDDEN // 2
+    ag = rows * HIDDEN // 2
     return _layout(
         [
-            ("attn", rows),
-            ("ffn", rows),
+            ("attn", part),
+            ("ffn", part),
             ("a_ag", ag),
             ("ffn_ag", ag),
             # indexer context parallelism: token k's candidates for this rank's
             # index head, source rank s's half h's r-th best at pairs
             # 2 ((k N_SPLIT + 2 s + h) TOPK_BLOCKS + r) + (0 key, 1 block)
-            ("sel_cp", SEL_LONG_PAIRS * MAX_TOKENS),
+            ("sel_cp", N_SPLIT * TOPK_BLOCKS * 2 * rows),
         ]
     )
 
@@ -182,6 +209,8 @@ def mailbox_regions(
     sp_f32: bool = True,
     moe_a16w4: bool = True,
     moe_a4w4: bool = False,
+    front: bool = False,
+    moe_back: bool = False,
 ) -> list[RegionDecl]:
     """The fused layer kernel's mailbox regions for a build: each one's space and
     the one stage that puts it (``atom.mono.plan.check``; the stages are the ones
@@ -208,7 +237,13 @@ def mailbox_regions(
         regions.append(
             RegionDecl("sel_cp", P, "select_long", exchange=True)
             if index_heads > 1
-            else RegionDecl("sel_long", S, "select_long", exchange=True)
+            else RegionDecl(
+                "sel_long",
+                S,
+                # more than MAX_TOKENS rows: the shares run in the split stage's rounds
+                "split" if tokens > MAX_TOKENS else "select_long",
+                exchange=True,
+            )
         )
     sp_o = "sp_o32" if sp_f32 else "sp_o"
     regions += [RegionDecl(n, S, "split") for n in (sp_o, "sp_m", "sp_l")]
@@ -218,6 +253,12 @@ def mailbox_regions(
     regions.append(
         RegionDecl("a_ag", P, "o") if tokens >= AG_RS_FROM else RegionDecl("a", S, "o")
     )
+    if (
+        front or moe_back
+    ):  # the front half ends with the post-attention norm (``post_norm``)
+        regions.append(RegionDecl("xmoe_done", S, "post"))
+    if front:  # ... and a front-only build stops there
+        return regions
     regions.append(RegionDecl("scores", S, "router"))
     if wide_moe(tokens):
         regions += [RegionDecl("xndone", S, "router"), RegionDecl("ugdone", S, "ug")]
@@ -240,6 +281,20 @@ def mailbox_regions(
     if tokens >= AG_RS_FROM:
         regions.append(RegionDecl("ffn_ag", P, "down", exchange=True))
     return regions
+
+
+def front_stage_bases(tokens: int, n_split: int = N_SPLIT):
+    """The front-half build's stage bases for more than MAX_TOKENS rows: split tasks from CTA 0
+    (``N_SPLIT * tokens`` of them: a round of BLOCKS at 32 rows, two at 64), the merge tasks
+    on the CTAs the split tasks leave (past them), the o tasks after those, the post-attention
+    norm tasks after the o tasks. Task t of a stage runs on CTA (base + t) % BLOCKS."""
+    tasks = n_split * tokens
+    return {
+        "split": 0,
+        "merge": tasks,
+        "o": tasks + tokens,
+        "post": tasks + tokens + N_O,
+    }
 
 
 def dense_mailbox_regions(tokens: int) -> list[RegionDecl]:

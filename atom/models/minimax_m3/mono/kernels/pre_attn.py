@@ -34,6 +34,7 @@ from atom.models.minimax_m3.mono.config import (
     HIDDEN,
     LOCAL_Q_HEADS,
     MAX_QKV_ROWS,
+    MAX_ROWS,
     MAX_TOKENS,
     ONE_INDEX_HEAD,
     PAGE16,
@@ -54,9 +55,10 @@ from atom.models.minimax_m3.mono.kernels.common import (
 from atom.models.minimax_m3.mono.kernels.index_score import (
     emit_index_scores,
     index_scale_log2e,
+    q_frag_from,
     step_rows,
 )
-from atom.models.minimax_m3.mono.layout import XSCB_ROW
+from atom.models.minimax_m3.mono.layout import XSCB_ROW, row_cap
 from atom.models.minimax_m3.mono.sources import SOURCES
 from atom.mono.device.mx import FP8_MAX, clamp_fp8, code_ceil, mfma_scaled, rcp_pow2
 from atom.mono.device.ops import (
@@ -67,6 +69,7 @@ from atom.mono.device.ops import (
     bf16_round,
     butterfly,
     div_rn,
+    first_rounds,
     fp8_pack4,
     hw_rsq,
     kernel_symbol,
@@ -111,21 +114,50 @@ HT0 = ONE_GEMV
 NT0 = HT0 + N_HEAD_TASKS
 XT0 = NT0 + MAX_TOKENS
 assert XT0 + OTHER_GEMV <= BLOCKS
+TG = MAX_TOKENS  # token rows of a group: the MFMA B operand's columns, a head CTA's half waves
+
+
+def k1_roles(tokens):
+    """(token groups, head CTAs, first norm CTA) of a build of ``tokens`` rows. Up to
+    MAX_TOKENS rows: one group, the head tasks then the norm tasks. More: a group's 20 head
+    tasks each (a group's tokens on the half waves, as one 16-row step), and the norm
+    tasks after them while that fits the grid, else on the head CTAs themselves (a CTA
+    runs its norm task first, then its head task: the GEMV waits on the norm, the head
+    on the GEMV, nothing earlier waits on a later role)."""
+    groups = -(-tokens // TG)
+    heads = N_HEAD_TASKS * groups
+    if groups == 1:
+        return 1, heads, NT0
+    return groups, heads, (HT0 + heads if HT0 + heads + tokens <= BLOCKS else HT0)
+
+
 assert MAX_TOKENS * 32 <= THREADS
 assert HIDDEN // 4 % THREADS == 0
 
 # The launch goes on the caller's current stream (graph capture included).
 _CURRENT_STREAM = fx.Stream(None)
 
-SCRATCH_QKV = 0  # (value, tag) pairs, one per qkv row
-SCRATCH_X8 = MAX_TOKENS * MAX_QKV_ROWS * 8  # S > 2: the norm tasks' x8 rows, words
-SCRATCH_X8S = SCRATCH_X8 + MAX_TOKENS * HIDDEN // 4 * 8  # and their scales
-# fused layer kernel only: a head task's / the residual's done flags
-SCRATCH_HDONE = SCRATCH_X8S + MAX_TOKENS * 8
-SCRATCH_RDONE = SCRATCH_HDONE + MAX_TOKENS * N_HEAD_TASKS * 8
-# ``attn_mxfp8``, S > 2: the norm tasks' per-1x32 E8M0 codes, 4 to a word (plain, behind x8s's flags)
-SCRATCH_XSC = SCRATCH_RDONE + MAX_TOKENS * 8
-SCRATCH_BYTES = SCRATCH_XSC + MAX_TOKENS * (HIDDEN // 128) * 4
+
+def k1_scratch(rows=MAX_TOKENS):
+    """K1's scratch byte offsets for a build of up to ``rows`` token rows."""
+    qkv = 0  # (value, tag) pairs, one per qkv row
+    x8 = rows * MAX_QKV_ROWS * 8  # S > 2: the norm tasks' x8 rows, words
+    x8s = x8 + rows * HIDDEN // 4 * 8  # and their scales
+    # fused layer kernel only: a head task's / the residual's done flags
+    hdone = x8s + rows * 8
+    rdone = hdone + rows * N_HEAD_TASKS * 8
+    # ``attn_mxfp8``, S > 2: the norm tasks' per-1x32 E8M0 codes, 4 to a word (plain, behind x8s's flags)
+    xsc = rdone + rows * 8
+    return {
+        "QKV": qkv, "X8": x8, "X8S": x8s, "HDONE": hdone, "RDONE": rdone, "XSC": xsc,
+        "BYTES": xsc + rows * (HIDDEN // 128) * 4,
+    }  # fmt: skip
+
+
+_K1 = k1_scratch()
+SCRATCH_QKV, SCRATCH_X8, SCRATCH_X8S = _K1["QKV"], _K1["X8"], _K1["X8S"]
+SCRATCH_HDONE, SCRATCH_RDONE, SCRATCH_XSC = _K1["HDONE"], _K1["RDONE"], _K1["XSC"]
+SCRATCH_BYTES = _K1["BYTES"]
 K_SCALE_BYTES = HIDDEN // 32  # an MXFP8 weight row's scale bytes
 CHUNKS_PER_MFMA = 2  # 64-k chunks per 16x16x128 scaled MFMA
 # rounds of 16 B loads of the rows + codes copy that go out together (the production copy's
@@ -193,7 +225,7 @@ def emit_pre_attn(
     tid, bid, lane, wave, x8, red, mb_put, mb_put_words, mb_poll, qkv_mb, x8_mb,
     x8s_mb, stamp, eps, tokens, heads, ptrs, signal=None, long_step=None,
     index_topk=True, dense=False, plain_norm=False, kv_nvfp4=False, index_nvfp4=False,
-    strip=(), attn_mxfp8=False, xsc=None, xsc_mb=None,
+    strip=(), attn_mxfp8=False, xsc=None, xsc_mb=None, pipe=False, copy_batch=MXFP8_COPY_BATCH,
 ):  # fmt: skip
     """K1's body: the GEMV tasks (ROWS_PER_TASK of the ``heads`` projection's rows
     each: the rank's own on CTAs 0 .. ONE_GEMV, its other index q heads' on CTAs
@@ -218,6 +250,13 @@ def emit_pre_attn(
     assert not (dense and kv_nvfp4)
     assert not (dense and attn_mxfp8)
     rows = heads.rows
+    BIG = tokens > MAX_TOKENS  # token groups of TG rows (``k1_roles``)
+    assert not BIG or (heads.count == 1 and not dense), "one index head, no dense K1"
+    # ``pipe`` (BIG, ``attn_mxfp8``): every row's norm task awaited once, up front (a flag a
+    # thread), and a group's x8 rows loaded into registers while the group before it is in its MFMAs
+    pipe = pipe and BIG and attn_mxfp8
+    n_groups, n_head_ctas, nt0 = k1_roles(tokens)
+    scr = k1_scratch(row_cap(tokens))
     (
         ar,
         res,
@@ -389,8 +428,8 @@ def emit_pre_attn(
     # (S <= 2 the GEMV tasks normalize every token themselves: S = 2 fused layer
     # 43.8 -> 43.6 us; S = 4 57.5 -> 59.4 us the other way round)
     if const_expr(tokens > 2):  # noqa: SIM102
-        if (bid >= NT0) & (bid < NT0 + tokens):
-            tk = bid - NT0
+        if (bid >= nt0) & (bid < nt0 + tokens):
+            tk = bid - nt0
             raw_g, raw_ar = load_norm_inputs([tk])
             x_scale = norm_quant([tk], raw_g, raw_ar, lambda j: True)[0]
             if const_expr(signal is not None):
@@ -442,6 +481,140 @@ def emit_pre_attn(
             head = other + (other >= heads.own).select(1, 0)
             rg = (LOCAL_Q_HEADS + 2 + head) * HEAD_ROW_GROUPS + xt % HEAD_ROW_GROUPS
             gemv = long_step()
+
+    def copy_parts(t0, gt):
+        """(``attn_mxfp8``) group rows t0 .. t0 + gt's x8 words and codes as one batched 16 B copy:
+        (loads n, ``load(v)``, ``put(v, w)`` into LDS)."""
+        n_x, n_s = gt * (HIDDEN // 4) // 4, gt * (HIDDEN // 128) // 4
+
+        def put_row_or_codes(v, w):
+            if v < n_x:
+                fx.ptr_store(w, x8 + v * 4)
+            else:
+                u = v - n_x
+                fx.ptr_store(
+                    w,
+                    xsc
+                    + (u * 4 // (HIDDEN // 128) * XSCB_ROW + u * 4 % (HIDDEN // 128)),
+                )
+
+        def load(v):
+            return fx.Vector(
+                ld_dev(
+                    x8_mb,
+                    (v < n_x).select(
+                        t0 * (HIDDEN // 4) + v * 4,
+                        (scr["XSC"] - scr["X8"]) // 4
+                        + t0 * (HIDDEN // 128)
+                        + (v - n_x) * 4,
+                    ),
+                    4,
+                )
+            )
+
+        return n_x + n_s, load, put_row_or_codes
+
+    def gemv_group(t0, gt, wts, ws, pre=None, nxt=None):
+        """Token rows t0 .. t0 + gt of the CTA's row group (``BIG``): their norm tasks' x8 rows
+        (+ codes) into LDS, one scaled MFMA a 128 k per wave pair with the rows as B columns
+        (the weights ``wts`` / scales ``ws`` stay in registers over the groups), the eight
+        waves' partials summed in wave order, the qkv pairs out: row for row what the
+        n <= MAX_TOKENS build computes for these tokens. ``pipe``: ``pre`` is this group's first
+        batch of row loads (issued by the group before), ``nxt`` = (t0, gt) of the next group,
+        whose first batch is issued here, before the MFMAs; -> that batch."""
+        if const_expr(not pipe):
+            got = mb_poll([(x8s_mb, t0 + tk, 1) for tk in range(gt)], batch=TG)
+            if const_expr(not attn_mxfp8):
+                x_scales = [got[tk][0].bitcast(fx.Float32) for tk in range(gt)]
+            fx.memory_fence(
+                syncscope=rocdl.SyncScope.Workgroup, ordering=fx.AtomicOrdering.Acquire
+            )
+        if const_expr(attn_mxfp8):
+            n_c, load, put = copy_parts(t0, gt)
+            batched_rounds(tid, n_c, load, put, batch=copy_batch, first=pre)
+        else:
+            rows_to_lds(
+                tid, x8_mb + fx.Int64(t0 * HIDDEN), gt, HIDDEN // 4, x8, HIDDEN // 4
+            )
+        gpu.barrier()
+        stamp(2)
+        pre_next = None
+        if const_expr(pipe and nxt is not None):
+            n_n, load_n, _ = copy_parts(*nxt)
+            pre_next = first_rounds(tid, n_n, load_n, copy_batch)
+        col_tok = fx.min(lane % 16, gt - 1)
+        c = fx.Vector.filled(4, 0.0, fx.Float32)
+        if const_expr(attn_mxfp8):
+            g4 = lane // 16
+            sbs = [
+                fx.ptr_load(xsc + (col_tok * XSCB_ROW + 6 * wave + i)).bitcast(fx.Int32)
+                >> (g4 * 8)
+                for i in range(CHUNKS_PER_WAVE // CHUNKS_PER_MFMA)
+            ]
+            for p in range_constexpr(CHUNKS_PER_WAVE // CHUNKS_PER_MFMA):
+                xb = [
+                    fx.Vector(
+                        fx.ptr_load(
+                            x8
+                            + (
+                                col_tok * (HIDDEN // 4)
+                                + (wave * CHUNKS_PER_WAVE + 2 * p + h) * 16
+                                + g4 * 4
+                            ),
+                            result_type=fx.Vector.make_type(4, fx.Float32),
+                        )
+                    ).bitcast(fx.Int32)
+                    for h in range(2)
+                ]
+                c = mfma_scaled(
+                    fx.Vector.from_elements(
+                        [wts[2 * p + h][e] for h in range(2) for e in range(4)],
+                        fx.Int32,
+                    ),
+                    fx.Vector.from_elements(
+                        [xb[h][e] for h in range(2) for e in range(4)], fx.Int32
+                    ),
+                    c,
+                    ws[p] >> (g4 * 8),
+                    sbs[p],
+                )
+        else:
+            for cc in range_constexpr(CHUNKS_PER_WAVE):
+                kc = wave * CHUNKS_PER_WAVE + cc
+                xb = fx.Vector(
+                    fx.ptr_load(
+                        x8 + (col_tok * (HIDDEN // 4) + kc * 16 + (lane // 16) * 4),
+                        result_type=fx.Vector.make_type(4, fx.Float32),
+                    )
+                ).bitcast(fx.Int64)
+                wa = wts[cc].bitcast(fx.Int64)
+                for h in range_constexpr(2):
+                    c = mfma_fp8(wa[h], xb[h], c)
+        fx.ptr_store(c, red + (wave * 64 + lane) * 4)
+        gpu.barrier()
+        if tid < ROWS_PER_TASK * gt:
+            r = tid % ROWS_PER_TASK
+            tk = tid // ROWS_PER_TASK
+            tot_r = fx.Float32(0.0)
+            for w in range_constexpr(WAVES):
+                tot_r = tot_r + fx.ptr_load(
+                    red + ((w * 64 + 16 * (r // 4) + tk) * 4 + r % 4)
+                )
+            if const_expr(attn_mxfp8):
+                mb_put(
+                    qkv_mb, (t0 + tk) * rows + rg * ROWS_PER_TASK + r, bf16_round(tot_r)
+                )
+            else:
+                x_scale = x_scales[0]
+                for k in range_constexpr(1, gt):
+                    x_scale = (tk == k).select(x_scales[k], x_scale)
+                mb_put(
+                    qkv_mb,
+                    (t0 + tk) * rows + rg * ROWS_PER_TASK + r,
+                    bf16_round(tot_r * x_scale * ws),
+                )
+        return pre_next
+
     if gemv:
         if const_expr(tokens <= 2):
             raw_g, raw_ar = load_norm_inputs(list(range(tokens)))
@@ -486,145 +659,177 @@ def emit_pre_attn(
                     dtype=T.f32,
                 )
             )
-        if const_expr(tokens <= 2):
-            x_scales = norm_quant(
-                list(range(tokens)), raw_g, raw_ar, lambda j: bid == j
-            )
-            if const_expr(signal is not None):  # noqa: SIM102
-                if bid < tokens:
-                    publish_done(signal[1], bid)  # the residual
-        else:
-            # the norm tasks' scales (each published after its row's plain x8 words),
-            # then every row, 16 B a load
-            got = mb_poll([(x8s_mb, tk, 1) for tk in range(tokens)])
-            if const_expr(not attn_mxfp8):
-                x_scales = [got[tk][0].bitcast(fx.Float32) for tk in range(tokens)]
-            fx.memory_fence(
-                syncscope=rocdl.SyncScope.Workgroup, ordering=fx.AtomicOrdering.Acquire
-            )
-            if const_expr(attn_mxfp8):
-                # the rows and their codes in one batched loop (a second one would add a
-                # round trip of the 16 B loads to the chain): loads v < n_x are x8's
-                n_x, n_s = tokens * (HIDDEN // 4) // 4, tokens * (HIDDEN // 128) // 4
-
-                def put_row_or_codes(v, w):
-                    if v < n_x:
-                        fx.ptr_store(w, x8 + v * 4)
-                    else:
-                        u = v - n_x
-                        fx.ptr_store(
-                            w,
-                            xsc
-                            + (
-                                u * 4 // (HIDDEN // 128) * XSCB_ROW
-                                + u * 4 % (HIDDEN // 128)
-                            ),
-                        )
-
-                batched_rounds(
-                    tid,
-                    n_x + n_s,
-                    lambda v: fx.Vector(
-                        ld_dev(
-                            x8_mb,
-                            (v < n_x).select(
-                                v * 4, (SCRATCH_XSC - SCRATCH_X8) // 4 + (v - n_x) * 4
-                            ),
-                            4,
-                        )
-                    ),
-                    put_row_or_codes,
-                    batch=MXFP8_COPY_BATCH,
+        if const_expr(BIG):
+            # token groups of TG rows, the weights (``wts``) held over all of them: a group's x8
+            # rows in LDS one at a time, its MFMAs, its qkv pairs published for its head tasks
+            if const_expr(pipe):
+                # every row's x8 words are in: one wait, a flag a thread
+                mb_poll([(x8s_mb, fx.min(tid, tokens - 1), 1)])
+                gpu.barrier()
+                fx.memory_fence(
+                    syncscope=rocdl.SyncScope.Workgroup,
+                    ordering=fx.AtomicOrdering.Acquire,
                 )
+            pre = None
+            for g in range_constexpr(n_groups):
+                t0 = g * TG
+                nxt = (
+                    (t0 + TG, min(TG, tokens - t0 - TG))
+                    if pipe and g + 1 < n_groups
+                    else None
+                )
+                pre = gemv_group(
+                    t0, min(TG, tokens - t0), wts, ws_dw if attn_mxfp8 else ws, pre, nxt
+                )
+        else:
+            if const_expr(tokens <= 2):
+                x_scales = norm_quant(
+                    list(range(tokens)), raw_g, raw_ar, lambda j: bid == j
+                )
+                if const_expr(signal is not None):  # noqa: SIM102
+                    if bid < tokens:
+                        publish_done(signal[1], bid)  # the residual
             else:
-                rows_to_lds(tid, x8_mb, tokens, HIDDEN // 4, x8, HIDDEN // 4)
-            gpu.barrier()
-            stamp(2)
-        # 12 chunks per wave: two 16x16x32 FP8 MFMAs each (k halves of 8 bytes).
-        # B column l % 16 is token l % 16 (token 0 past the last): C column t is
-        # token t's rows, the weight stream is the same for any token count.
-        col_tok = fx.min(lane % 16, tokens - 1)
-        c = fx.Vector.filled(4, 0.0, fx.Float32)
-        if const_expr(attn_mxfp8):
-            # one 16x16x128 scaled MFMA per two chunks (the K4 o_proj's operand packing):
-            # A = rows' E8M0 byte of block g of the 128-k chunk (kc128 = 6 w + i), B =
-            # the token's, both read as the low byte of a word
-            g4 = lane // 16
-            sbs = [
-                fx.ptr_load(xsc + (col_tok * XSCB_ROW + 6 * wave + i)).bitcast(fx.Int32)
-                >> (g4 * 8)
-                for i in range(CHUNKS_PER_WAVE // CHUNKS_PER_MFMA)
-            ]
-            for p in range_constexpr(CHUNKS_PER_WAVE // CHUNKS_PER_MFMA):
-                xb = [
-                    fx.Vector(
+                # the norm tasks' scales (each published after its row's plain x8 words),
+                # then every row, 16 B a load
+                got = mb_poll([(x8s_mb, tk, 1) for tk in range(tokens)])
+                if const_expr(not attn_mxfp8):
+                    x_scales = [got[tk][0].bitcast(fx.Float32) for tk in range(tokens)]
+                fx.memory_fence(
+                    syncscope=rocdl.SyncScope.Workgroup,
+                    ordering=fx.AtomicOrdering.Acquire,
+                )
+                if const_expr(attn_mxfp8):
+                    # the rows and their codes in one batched loop (a second one would add a
+                    # round trip of the 16 B loads to the chain): loads v < n_x are x8's
+                    n_x, n_s = (
+                        tokens * (HIDDEN // 4) // 4,
+                        tokens * (HIDDEN // 128) // 4,
+                    )
+
+                    def put_row_or_codes(v, w):
+                        if v < n_x:
+                            fx.ptr_store(w, x8 + v * 4)
+                        else:
+                            u = v - n_x
+                            fx.ptr_store(
+                                w,
+                                xsc
+                                + (
+                                    u * 4 // (HIDDEN // 128) * XSCB_ROW
+                                    + u * 4 % (HIDDEN // 128)
+                                ),
+                            )
+
+                    batched_rounds(
+                        tid,
+                        n_x + n_s,
+                        lambda v: fx.Vector(
+                            ld_dev(
+                                x8_mb,
+                                (v < n_x).select(
+                                    v * 4, (scr["XSC"] - scr["X8"]) // 4 + (v - n_x) * 4
+                                ),
+                                4,
+                            )
+                        ),
+                        put_row_or_codes,
+                        batch=MXFP8_COPY_BATCH,
+                    )
+                else:
+                    rows_to_lds(tid, x8_mb, tokens, HIDDEN // 4, x8, HIDDEN // 4)
+                gpu.barrier()
+                stamp(2)
+            # 12 chunks per wave: two 16x16x32 FP8 MFMAs each (k halves of 8 bytes).
+            # B column l % 16 is token l % 16 (token 0 past the last): C column t is
+            # token t's rows, the weight stream is the same for any token count.
+            col_tok = fx.min(lane % 16, tokens - 1)
+            c = fx.Vector.filled(4, 0.0, fx.Float32)
+            if const_expr(attn_mxfp8):
+                # one 16x16x128 scaled MFMA per two chunks (the K4 o_proj's operand packing):
+                # A = rows' E8M0 byte of block g of the 128-k chunk (kc128 = 6 w + i), B =
+                # the token's, both read as the low byte of a word
+                g4 = lane // 16
+                sbs = [
+                    fx.ptr_load(xsc + (col_tok * XSCB_ROW + 6 * wave + i)).bitcast(
+                        fx.Int32
+                    )
+                    >> (g4 * 8)
+                    for i in range(CHUNKS_PER_WAVE // CHUNKS_PER_MFMA)
+                ]
+                for p in range_constexpr(CHUNKS_PER_WAVE // CHUNKS_PER_MFMA):
+                    xb = [
+                        fx.Vector(
+                            fx.ptr_load(
+                                x8
+                                + (
+                                    col_tok * (HIDDEN // 4)
+                                    + (wave * CHUNKS_PER_WAVE + 2 * p + h) * 16
+                                    + g4 * 4
+                                ),
+                                result_type=fx.Vector.make_type(4, fx.Float32),
+                            )
+                        ).bitcast(fx.Int32)
+                        for h in range(2)
+                    ]
+                    c = mfma_scaled(
+                        fx.Vector.from_elements(
+                            [wts[2 * p + h][e] for h in range(2) for e in range(4)],
+                            fx.Int32,
+                        ),
+                        fx.Vector.from_elements(
+                            [xb[h][e] for h in range(2) for e in range(4)], fx.Int32
+                        ),
+                        c,
+                        ws_dw[p] >> (g4 * 8),
+                        sbs[p],
+                    )
+            else:
+                for cc in range_constexpr(CHUNKS_PER_WAVE):
+                    kc = wave * CHUNKS_PER_WAVE + cc
+                    xb = fx.Vector(
                         fx.ptr_load(
-                            x8
-                            + (
-                                col_tok * (HIDDEN // 4)
-                                + (wave * CHUNKS_PER_WAVE + 2 * p + h) * 16
-                                + g4 * 4
-                            ),
+                            x8 + (col_tok * (HIDDEN // 4) + kc * 16 + (lane // 16) * 4),
                             result_type=fx.Vector.make_type(4, fx.Float32),
                         )
-                    ).bitcast(fx.Int32)
-                    for h in range(2)
-                ]
-                c = mfma_scaled(
-                    fx.Vector.from_elements(
-                        [wts[2 * p + h][e] for h in range(2) for e in range(4)],
-                        fx.Int32,
-                    ),
-                    fx.Vector.from_elements(
-                        [xb[h][e] for h in range(2) for e in range(4)], fx.Int32
-                    ),
-                    c,
-                    ws_dw[p] >> (g4 * 8),
-                    sbs[p],
-                )
-        else:
-            for cc in range_constexpr(CHUNKS_PER_WAVE):
-                kc = wave * CHUNKS_PER_WAVE + cc
-                xb = fx.Vector(
-                    fx.ptr_load(
-                        x8 + (col_tok * (HIDDEN // 4) + kc * 16 + (lane // 16) * 4),
-                        result_type=fx.Vector.make_type(4, fx.Float32),
+                    ).bitcast(fx.Int64)
+                    wa = wts[cc].bitcast(fx.Int64)
+                    for h in range_constexpr(2):
+                        c = mfma_fp8(wa[h], xb[h], c)
+            fx.ptr_store(c, red + (wave * 64 + lane) * 4)
+            gpu.barrier()
+            # sample column t of C: lanes t, 16 + t, 32 + t, 48 + t hold rows 4 (l/16) + e
+            if tid < ROWS_PER_TASK * tokens:
+                r = tid % ROWS_PER_TASK
+                tk = tid // ROWS_PER_TASK
+                tot_r = fx.Float32(0.0)
+                for w in range_constexpr(WAVES):
+                    tot_r = tot_r + fx.ptr_load(
+                        red + ((w * 64 + 16 * (r // 4) + tk) * 4 + r % 4)
                     )
-                ).bitcast(fx.Int64)
-                wa = wts[cc].bitcast(fx.Int64)
-                for h in range_constexpr(2):
-                    c = mfma_fp8(wa[h], xb[h], c)
-        fx.ptr_store(c, red + (wave * 64 + lane) * 4)
-        gpu.barrier()
-        # sample column t of C: lanes t, 16 + t, 32 + t, 48 + t hold rows 4 (l/16) + e
-        if tid < ROWS_PER_TASK * tokens:
-            r = tid % ROWS_PER_TASK
-            tk = tid // ROWS_PER_TASK
-            tot_r = fx.Float32(0.0)
-            for w in range_constexpr(WAVES):
-                tot_r = tot_r + fx.ptr_load(
-                    red + ((w * 64 + 16 * (r // 4) + tk) * 4 + r % 4)
-                )
-            if const_expr(attn_mxfp8):  # the scales are inside the MFMA
-                mb_put(qkv_mb, tk * rows + rg * ROWS_PER_TASK + r, bf16_round(tot_r))
-            else:
-                x_scale = x_scales[0]
-                for k in range_constexpr(1, tokens):
-                    x_scale = (tk == k).select(x_scales[k], x_scale)
-                mb_put(
-                    qkv_mb,
-                    tk * rows + rg * ROWS_PER_TASK + r,
-                    bf16_round(tot_r * x_scale * ws),
-                )
+                if const_expr(attn_mxfp8):  # the scales are inside the MFMA
+                    mb_put(
+                        qkv_mb, tk * rows + rg * ROWS_PER_TASK + r, bf16_round(tot_r)
+                    )
+                else:
+                    x_scale = x_scales[0]
+                    for k in range_constexpr(1, tokens):
+                        x_scale = (tk == k).select(x_scales[k], x_scale)
+                    mb_put(
+                        qkv_mb,
+                        tk * rows + rg * ROWS_PER_TASK + r,
+                        bf16_round(tot_r * x_scale * ws),
+                    )
 
         stamp(3)
 
     # ======================================= head tasks: norm / rope / cache
     enter_stage("k1.head")
     # one CTA per head, token k on the half wave of threads 32 k .. 32 k + 31
-    if (bid >= HT0) & (bid < HT0 + N_HEAD_TASKS):
-        ht = bid - HT0
-        tk = tid // 32
+    if (bid >= HT0) & (bid < HT0 + n_head_ctas):
+        ht = (bid - HT0) % N_HEAD_TASKS if BIG else bid - HT0
+        # BIG: CTA group g of N_HEAD_TASKS holds tokens TG g ..
+        tk = tid // 32 + ((bid - HT0) // N_HEAD_TASKS) * TG if BIG else tid // 32
         l32 = tid % 32
         is_q = ht < LOCAL_Q_HEADS
         is_k = ht == LOCAL_Q_HEADS
@@ -713,6 +918,8 @@ def emit_pre_attn(
                         fx.Vector.from_elements(out, fx.Float32).to(fx.BFloat16),
                         rsrc(iq_out),
                         tk * HEAD_DIM + d0,
+                        # BIG: the score tasks of other CTAs read it (``q_frag_from``)
+                        cache_modifier=cm_out if BIG else 0,
                     )
                 if is_k:
                     if const_expr(kv_nvfp4):
@@ -776,7 +983,13 @@ def emit_pre_attn(
 
         if const_expr(signal is not None):
             # every token's flag once the whole CTA's stores are out
-            publish_done(signal[0], tid * N_HEAD_TASKS + ht, tid < tokens)
+            if const_expr(BIG):
+                tk0 = ((bid - HT0) // N_HEAD_TASKS) * TG + tid
+                publish_done(
+                    signal[0], tk0 * N_HEAD_TASKS + ht, (tid < TG) & (tk0 < tokens)
+                )
+            else:
+                publish_done(signal[0], tid * N_HEAD_TASKS + ht, tid < tokens)
 
 
 # the fused layer kernel's K1 pointers that do not change per step, in its device
@@ -792,7 +1005,8 @@ def emit_k1(
     tid, bid, lane, wave, x8, red, qs, stamp, layer, eps, index_scale, tokens,
     q_len, init_blocks, local_blocks, heads, ptrs, bt_width, signal=False, diag=None,
     region_ids=None, index_topk=True, dense=False, plain_norm=False, kv_nvfp4=False,
-    index_nvfp4=False, skip=(), strip=(), attn_mxfp8=False, xsc=None,
+    index_nvfp4=False, skip=(), strip=(), attn_mxfp8=False, xsc=None, pipe=False,
+    score_sleep=1, copy_batch=MXFP8_COPY_BATCH,
 ):  # fmt: skip
     """K1 whole: the GEMV / head / norm tasks, then every CTA's indexer scores
     (``index_topk``; else the layer reuses a selection: no index q / k, no scores).
@@ -812,12 +1026,13 @@ def emit_k1(
         block_table, seq_lens, iscore, scratch,
     ) = ptrs  # fmt: skip
     mbox = Mailbox(layer, diag, region_ids, skip)
-    qkv_mb = sreg(scratch, SCRATCH_QKV, "k1.qkv")
-    x8_mb = scratch + fx.Int64(SCRATCH_X8)  # plain words, behind x8s's tags
-    x8s_mb = sreg(scratch, SCRATCH_X8S, "k1.x8s")
-    xsc_mb = scratch + fx.Int64(SCRATCH_XSC)  # plain words, behind x8s's flags
-    hdone_mb = sreg(scratch, SCRATCH_HDONE, "k1.hdone")
-    rdone_mb = sreg(scratch, SCRATCH_RDONE, "k1.rdone")
+    scr = k1_scratch(row_cap(tokens))
+    qkv_mb = sreg(scratch, scr["QKV"], "k1.qkv")
+    x8_mb = scratch + fx.Int64(scr["X8"])  # plain words, behind x8s's tags
+    x8s_mb = sreg(scratch, scr["X8S"], "k1.x8s")
+    xsc_mb = scratch + fx.Int64(scr["XSC"])  # plain words, behind x8s's flags
+    hdone_mb = sreg(scratch, scr["HDONE"], "k1.hdone")
+    rdone_mb = sreg(scratch, scr["RDONE"], "k1.rdone")
     # Plain names, not method calls: flydsl's AST rewriter carries every local whose
     # method is called inside a dynamic if/for as loop state.
     mb_put = mbox.put
@@ -904,12 +1119,17 @@ def emit_k1(
         attn_mxfp8,
         xsc,
         xsc_mb,
+        pipe,
+        copy_batch,
     )  # fmt: skip
     stamp(5)
 
     def wait_new_keys():
         """Every token's index_k head task done, its key visible to this wave."""
-        mb_poll([(hdone_mb, fx.min(lane, tokens - 1) * N_HEAD_TASKS + IK_TASK, 1)])
+        mb_poll(
+            [(hdone_mb, fx.min(lane, tokens - 1) * N_HEAD_TASKS + IK_TASK, 1)],
+            sleep=score_sleep,
+        )
         fx.memory_fence(
             syncscope=rocdl.SyncScope.Agent, ordering=fx.AtomicOrdering.Acquire
         )
@@ -917,16 +1137,39 @@ def emit_k1(
     if const_expr(index_topk):
         # the scorers: the idle CTAs first (the norm tasks' come first but finish
         # early), then the GEMV CTAs, the head CTAs last
-        score_base = ONE_GEMV + N_HEAD_TASKS
+        score_base = ONE_GEMV + k1_roles(tokens)[1]
         enter_stage("k1.score")
-        emit_index_scores(
-            (bid + (BLOCKS - score_base)) % BLOCKS, lane, uniform(wave), red, mb_put,
-            Addr("iscore", Space.SCRATCH, iscore),
-            q_frag, tokens, q_len, init_blocks, local_blocks, index_scale, index_cache,
-            block_table, seq_lens, bt_width, wait_new_keys if signal else None,
-            make_index_q, heads, q_frag_head, make_index_q_heads, nvfp4=index_nvfp4,
-            strip=strip,
-        )  # fmt: skip
+        if const_expr(tokens > MAX_TOKENS):
+            # BIG: index q straight from the head tasks' ``iq_out`` (device scope), behind
+            # one wait for every token's index-q head task, not rebuilt on every CTA
+            q_frag_g, q_frag_head_g = q_frag_from(iq_out, heads, index_nvfp4, CM_DEV)
+
+            def wait_index_q():
+                mb_poll(
+                    [(hdone_mb, fx.min(lane, tokens - 1) * N_HEAD_TASKS + IQ_TASK, 1)],
+                    sleep=score_sleep,
+                )
+                fx.memory_fence(
+                    syncscope=rocdl.SyncScope.Agent, ordering=fx.AtomicOrdering.Acquire
+                )
+
+            emit_index_scores(
+                (bid + (BLOCKS - score_base)) % BLOCKS, lane, uniform(wave), red, mb_put,
+                Addr("iscore", Space.SCRATCH, iscore),
+                q_frag_g, tokens, q_len, init_blocks, local_blocks, index_scale, index_cache,
+                block_table, seq_lens, bt_width, wait_new_keys if signal else None,
+                None, heads, q_frag_head_g, None, nvfp4=index_nvfp4, strip=strip,
+                wait_index_q=wait_index_q, stamp=stamp,
+            )  # fmt: skip
+        else:
+            emit_index_scores(
+                (bid + (BLOCKS - score_base)) % BLOCKS, lane, uniform(wave), red, mb_put,
+                Addr("iscore", Space.SCRATCH, iscore),
+                q_frag, tokens, q_len, init_blocks, local_blocks, index_scale, index_cache,
+                block_table, seq_lens, bt_width, wait_new_keys if signal else None,
+                make_index_q, heads, q_frag_head, make_index_q_heads, nvfp4=index_nvfp4,
+                strip=strip,
+            )  # fmt: skip
     stamp(6)
 
 
@@ -984,7 +1227,7 @@ def build_pre_attn_kernel(
     (``emit_pre_attn``). ``kv_nvfp4`` / ``index_nvfp4``: NVFP4 K/V / index pages
     (``emit_k1``). ``attn_mxfp8``: ``s_qkv`` is a native MXFP8 1x32 weight's row-major
     E8M0 scales ``[rows, HIDDEN / 32]`` (``emit_pre_attn``)."""
-    assert 1 <= tokens <= MAX_TOKENS
+    assert 1 <= tokens <= MAX_ROWS
     key = K1Build(
         tokens=tokens, init_blocks=init_blocks, local_blocks=local_blocks,
         index_heads=heads.count, index_own=heads.own, timeline=timeline,
@@ -994,23 +1237,27 @@ def build_pre_attn_kernel(
     build_key = key_tuple(key, SOURCES)  # the launcher references it: keyed
     index_scale = index_scale_log2e(sm_scale)
 
+    # up to TG rows at a time in LDS (a group's), the index q of the BIG scorers from memory
+    gtok = min(tokens, TG)
+    qs_words = 1 if tokens > MAX_TOKENS else HEAD_DIM // 2 * tokens * heads.count
+
     @fx.struct
     class SmemPtpc:
         # FP8 activations, natural k order, one row per token
-        x8: fx.Array[fx.Int32, tokens * HIDDEN // 4, 16]
+        x8: fx.Array[fx.Int32, gtok * HIDDEN // 4, 16]
         red: fx.Array[fx.Float32, WAVES * 64 * 4, 16]
         tls: fx.Array[fx.Int64, TL_POINTS if timeline else 1, 16]  # timeline stamps
         # every token's index q for the scorers, bf16 pairs
-        qs: fx.Array[fx.Float32, HEAD_DIM // 2 * tokens * heads.count, 16]
+        qs: fx.Array[fx.Float32, qs_words, 16]
 
     @fx.struct
     class SmemMx:
-        x8: fx.Array[fx.Int32, tokens * HIDDEN // 4, 16]
+        x8: fx.Array[fx.Int32, gtok * HIDDEN // 4, 16]
         red: fx.Array[fx.Float32, WAVES * 64 * 4, 16]
         tls: fx.Array[fx.Int64, TL_POINTS if timeline else 1, 16]
-        qs: fx.Array[fx.Float32, HEAD_DIM // 2 * tokens * heads.count, 16]
+        qs: fx.Array[fx.Float32, qs_words, 16]
         # the norm's per-1x32 E8M0 codes, a word each
-        xsc: fx.Array[fx.Int32, tokens * XSCB_ROW, 16]
+        xsc: fx.Array[fx.Int32, gtok * XSCB_ROW, 16]
 
     Smem = SmemMx if attn_mxfp8 else SmemPtpc
 

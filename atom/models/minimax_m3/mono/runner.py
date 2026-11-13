@@ -157,6 +157,11 @@ class MonoDecodeRunner:
         group = get_tp_group().cpu_group
         bind_agreed(lambda: self._bind(causal_lm, drafter, require_aux), group)
         self._allocate(group)
+        self._refused: set[str] = set()
+        self.pipelines = (
+            {}
+        )  # name -> ``hybrid.HybridDecode``, made by ``prepare(n, name)``
+        self.parts = None  # ``hybrid._Parts``
         # per decode batch size (every graph captures its own) a sparse layer
         # kernel of each kind the layers use (``self.k4[n][lw.index_topk]``) and,
         # with a mono dense prefix, the dense layers' (``self.k4[n]["dense_pre0"
@@ -395,9 +400,32 @@ class MonoDecodeRunner:
                 torch.tensor([ptrs[a] for a in K1_ARGS], dtype=torch.int64, device=dev)
             )
 
-    def prepare(self, n: int) -> bool:
-        """Whether every rank holds the n-token kernel (``WidthBuilds``)."""
+    def prepare(self, n: int, kind: str = "mono") -> bool:
+        """Whether every rank holds the n-token kernel (``WidthBuilds``); kind
+        "hybrid" | "wide": the n-row step of that pipeline (``hybrid.HybridDecode``)."""
+        if kind != "mono":
+            return self._pipeline(kind) is not None and self.pipelines[kind].prepare(n)
         return self.k4.prepare(n)
+
+    def _pipeline(self, kind: str):
+        """The ``kind`` pipeline, made on first use (collective): None if any rank
+        could not make it (a half's kernel module missing, a buffer that did not
+        fit), and then it stays refused."""
+        if kind not in self.pipelines and kind not in self._refused:
+            from atom.distributed.group_agreement import group_agree
+
+            made = None
+            try:
+                from atom.models.minimax_m3.mono.hybrid import HybridDecode
+
+                made = HybridDecode(self, kind)
+            except Exception:
+                logger.exception("MiniMax-M3 %s decode: building it failed", kind)
+            if group_agree(made is not None, get_tp_group().cpu_group):
+                self.pipelines[kind] = made
+            else:
+                self._refused.add(kind)
+        return self.pipelines.get(kind)
 
     def close(self) -> None:
         """Free the peer memory now (once no rank can launch another step)."""

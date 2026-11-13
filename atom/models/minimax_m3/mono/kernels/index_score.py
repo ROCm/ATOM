@@ -57,6 +57,7 @@ from atom.mono.device.ops import (
     traced,
     uniform,
     unlikely,
+    wave_incl_scan,
 )
 from atom.mono.device.sync import Addr, Mailbox
 from atom.mono.plan.arith import pick
@@ -244,7 +245,7 @@ def emit_index_scores(
     slot, lane, wave, red, mb_put, iscore, q_frag, tokens, q_len, init_blocks,
     local_blocks, scale, index_cache, block_table, seq_lens, bt_width,
     wait_new_keys=None, prepare=None, heads=ONE_INDEX_HEAD, q_frag_head=None,
-    prepare_heads=None, nvfp4=False, strip=(),
+    prepare_heads=None, nvfp4=False, strip=(), wait_index_q=None, stamp=None,
 ):  # fmt: skip
     """This CTA's (``slot``) share of the step's score tasks: up to BLOCKS tasks,
     task u runs on CTA u, else on wave (u // BLOCKS) % WAVES of CTA u % BLOCKS
@@ -272,34 +273,64 @@ def emit_index_scores(
 
     ``nvfp4``: the index cache holds nvfp4 pages (``NVFP4_PAGE_BYTES``); a lane's
     key operand of chunk s is dims 32 g4 + 8 s .. + 7 (its own 16 B of the key's
-    data, no transpose), so ``q_frag`` must return the same dims (its ``perm``)."""
+    data, no transpose), so ``q_frag`` must return the same dims (its ``perm``).
+
+    More than MAX_TOKENS rows (``BIG``): the step's plan is lane-resident, not unrolled over
+    the rows (n scalar chains do not fit the registers at 64 rows): lane k holds row k's
+    context, block count and, for a request's last row, its task count, whose wave scan
+    gives every request's first task; a lane decodes its task by a 6-step binary search
+    over the scan (``lane_gather``). Wave-per-task mode only (the task counts of
+    these steps are not bounded by BLOCKS), one index head (no context parallelism), and
+    ``q_frag`` reads the index q the head tasks wrote, once ``wait_index_q`` says every
+    row's is there."""
     assert local_blocks >= 1, "the block of the current token must be pinned"
+    BIG = tokens > MAX_TOKENS
+    assert not BIG or (
+        heads.count == 1 and prepare is None and wait_index_q is not None
+    )
     l16 = lane % 16
     g4 = lane // 16
     # nvfp4: the per-task-wave paths look K up in a CTA table (built before them)
     tab = lut_lds() if nvfp4 else None
     tid = wave * 64 + lane
     r_ic = rsrc(index_cache, 0 if "idx" in strip else None)
-    rows = step_rows(seq_lens, tokens, q_len, heads)
-    seq = rows.seq
-    # every request's scored blocks in one list, a task per wave across the grid;
-    # context-parallel requests' (this rank's blocks) in a second
-    cp = heads.count > 1
-    first_own = init_blocks + (heads.own - init_blocks) % TP
-    pre = [fx.Int32(0)]
-    pre_cp = [fx.Int32(0)]
-    for k in range_constexpr(tokens):
-        last = fx.Int32(k) % q_len == q_len - 1
-        n_scored = scored_count(rows.n_blks[k], init_blocks, local_blocks)
-        if const_expr(cp):
-            long = rows.long[k]
-            n_own = fx.max(init_blocks + n_scored - first_own + TP - 1, 0) // TP
-            pre.append(pre[-1] + (last & ~long).select(n_scored, fx.Int32(0)))
-            pre_cp.append(pre_cp[-1] + (last & long).select(n_own, fx.Int32(0)))
-        else:
-            pre.append(pre[-1] + last.select(n_scored, fx.Int32(0)))
-    total = pre[tokens]
-    total_cp = pre_cp[-1]  # 0 without context parallelism
+    if const_expr(BIG):
+        rows = seq = pre = pre_cp = None
+        cp, first_own, total_cp = False, 0, 0
+        # lane k: row k (rows past ``tokens`` repeat the last: a lane's loads stay in range)
+        row_l = fx.min(lane, tokens - 1)
+        seq_k = fx.max(
+            fx.Int32(bo.buffer_load(rsrc(seq_lens), row_l, vec_width=1, dtype=T.i32)), 1
+        )
+        nb_k = (seq_k + SPARSE_BLOCK - 1) // SPARSE_BLOCK
+        last_k = (lane < tokens) & (fx.Int32(lane) % q_len == q_len - 1)
+        n_scored_k = last_k.select(
+            scored_count(nb_k, init_blocks, local_blocks), fx.Int32(0)
+        )
+        end_k = wave_incl_scan(n_scored_k, lane)  # request tasks: [end - n_scored, end)
+        start_k = end_k - n_scored_k
+        total = readlane(end_k, 63)
+    else:
+        rows = step_rows(seq_lens, tokens, q_len, heads)
+        seq = rows.seq
+        # every request's scored blocks in one list, a task per wave across the grid;
+        # context-parallel requests' (this rank's blocks) in a second
+        cp = heads.count > 1
+        first_own = init_blocks + (heads.own - init_blocks) % TP
+        pre = [fx.Int32(0)]
+        pre_cp = [fx.Int32(0)]
+        for k in range_constexpr(tokens):
+            last = fx.Int32(k) % q_len == q_len - 1
+            n_scored = scored_count(rows.n_blks[k], init_blocks, local_blocks)
+            if const_expr(cp):
+                long = rows.long[k]
+                n_own = fx.max(init_blocks + n_scored - first_own + TP - 1, 0) // TP
+                pre.append(pre[-1] + (last & ~long).select(n_scored, fx.Int32(0)))
+                pre_cp.append(pre_cp[-1] + (last & long).select(n_own, fx.Int32(0)))
+            else:
+                pre.append(pre[-1] + last.select(n_scored, fx.Int32(0)))
+        total = pre[tokens]
+        total_cp = pre_cp[-1]  # 0 without context parallelism
 
     r_bt = rsrc(block_table)
 
@@ -315,6 +346,15 @@ def emit_index_scores(
         return fx.Int32(
             bo.buffer_load(r_bt, tk * bt_width + b, vec_width=1, dtype=T.i32)
         )
+
+    def task_block_big(u):
+        """Task u (per lane) -> (the request's last row, block b): the number of lanes whose
+        inclusive scan end is <= u is the row (a 6-step binary search)."""
+        tk = fx.Int32(0)
+        for step in (32, 16, 8, 4, 2, 1):
+            e = lane_gather(end_k, tk + (step - 1))
+            tk = tk + (e <= u).select(fx.Int32(step), fx.Int32(0))
+        return tk, init_blocks + u - lane_gather(start_k, tk)
 
     def new_keys_in(tk, b):
         """Block b of the request ending at token tk may hold keys this launch
@@ -466,7 +506,7 @@ def emit_index_scores(
 
         def score_cp(tk, b, page):
             """Block b of the request ending at token tk, at ``page``: every head."""
-            if const_expr(wait_new_keys is not None):
+            if const_expr(wait_new_keys is not None):  # noqa: SIM102
                 if (b + 1) * SPARSE_BLOCK > readlane(seq_lane, tk) - MAX_TOKENS:
                     wait_new_keys()
             kw = split_tiles(load_raw(page, tiles), tiles, tab)
@@ -510,47 +550,62 @@ def emit_index_scores(
     # critical path (keys after: S = 1, 3k context +1 us). More: a task a wave,
     # every row's index q first (a wave's task count differs: no barrier inside),
     # the pages of a wave's next 64 tasks fetched at once, a lane each.
-    if total <= BLOCKS:
-        for u in range(slot, total, BLOCKS):
-            tk, b = task_block(fx.Int32(u))
-            page = uniform(page_of(tk, b))
-            if const_expr(wait_new_keys is not None):
-                if new_keys_in(tk, b):
-                    wait_new_keys()
-            raw = load_raw(page, [wave])
-            if const_expr(prepare is not None):
-                prepare(tk - (q_len - 1), tk)
-            col, col_seq = cols_of(tk)
-            qb = q_operand([q_frag(col, s) for s in range(HEAD_DIM // 32)])
-            v = tiles_max(b, qb, col_seq, [wave], split_tiles(raw, [wave]))
-            if lane < 16:
-                fx.ptr_store(v, red + (wave * 16 + l16))
-            gpu.barrier()
-            if wave == 0:
-                for w in range_constexpr(1, WAVES):
-                    v = fx.max(v, fx.ptr_load(red + (w * 16 + l16)))
-                put(b, col, v)
-            gpu.barrier()
-    if total > BLOCKS:
+    if const_expr(not BIG):  # noqa: SIM102
+        if total <= BLOCKS:
+            for u in range(slot, total, BLOCKS):
+                tk, b = task_block(fx.Int32(u))
+                page = uniform(page_of(tk, b))
+                if const_expr(wait_new_keys is not None):  # noqa: SIM102
+                    if new_keys_in(tk, b):
+                        wait_new_keys()
+                raw = load_raw(page, [wave])
+                if const_expr(prepare is not None):
+                    prepare(tk - (q_len - 1), tk)
+                col, col_seq = cols_of(tk)
+                qb = q_operand([q_frag(col, s) for s in range(HEAD_DIM // 32)])
+                v = tiles_max(b, qb, col_seq, [wave], split_tiles(raw, [wave]))
+                if lane < 16:
+                    fx.ptr_store(v, red + (wave * 16 + l16))
+                gpu.barrier()
+                if wave == 0:
+                    for w in range_constexpr(1, WAVES):
+                        v = fx.max(v, fx.ptr_load(red + (w * 16 + l16)))
+                    put(b, col, v)
+                gpu.barrier()
+    if total > (0 if BIG else BLOCKS):
         if const_expr(nvfp4):
             fill_lut()
         if const_expr(prepare is not None):
             prepare(fx.Int32(0), fx.Int32(tokens - 1))
         if const_expr(nvfp4):
             gpu.barrier()
+        if const_expr(BIG):
+            stamp(7)
+            if (
+                slot + BLOCKS * wave < total
+            ):  # (the waves without a task need no index q)
+                wait_index_q()
+            stamp(8)
+            seq_lane = seq_k
+        else:
+            seq_lane = pick(seq, fx.min(lane, tokens - 1))  # lane k: token k's context
         tiles = range(KEY_TILES)
-        seq_lane = pick(seq, fx.min(lane, tokens - 1))  # lane k: token k's context
 
         def score_task(tk, b, page):
             """Block b of the request ending at token tk, at ``page``."""
-            if const_expr(wait_new_keys is not None):
+            if const_expr(wait_new_keys is not None):  # noqa: SIM102
                 if (b + 1) * SPARSE_BLOCK > readlane(seq_lane, tk) - MAX_TOKENS:
                     wait_new_keys()
+            if const_expr(BIG):
+                stamp(11)
             raw = load_raw(page, tiles)
             col = tk - (q_len - 1) + fx.min(l16, q_len - 1)
             col_seq = lane_gather(seq_lane, col)
             qb = q_operand([q_frag(col, s) for s in range(HEAD_DIM // 32)], True)
-            put(b, col, tiles_max(b, qb, col_seq, tiles, split_tiles(raw, tiles, tab)))
+            v = tiles_max(b, qb, col_seq, tiles, split_tiles(raw, tiles, tab))
+            if const_expr(BIG):
+                stamp(12)
+            put(b, col, v)
 
         # Every wave the same task count: task u on wave
         # (u // BLOCKS) % WAVES of CTA u % BLOCKS; lane j decodes task c0 + step j
@@ -559,18 +614,23 @@ def emit_index_scores(
         step = BLOCKS * WAVES
         for c0 in range(slot + BLOCKS * wave, total, step * 64):
             c0 = fx.Int32(c0)
-            tk_j, b_j = task_block(fx.min(c0 + step * lane, total - 1))
+            u_j = fx.min(c0 + step * lane, total - 1)
+            tk_j, b_j = task_block_big(u_j) if BIG else task_block(u_j)
             pages = page_of(tk_j, b_j)
+            if const_expr(BIG):
+                stamp(9)
             for i in range(fx.min((total - c0 + step - 1) // step, 64)):
                 i = fx.Int32(i)
                 score_task(readlane(tk_j, i), readlane(b_j, i), readlane(pages, i))
-    if const_expr(cp):
+        if const_expr(BIG):
+            stamp(10)
+    if const_expr(cp):  # noqa: SIM102
         # cold: a step without context-parallel requests runs none of it
         if unlikely(total_cp > 0):
             emit_cp_tasks()
 
 
-def q_frag_from(iq, heads=ONE_INDEX_HEAD, nvfp4=False):
+def q_frag_from(iq, heads=ONE_INDEX_HEAD, nvfp4=False, cm=0):
     """(``q_frag``, ``q_frag_head``) reading index q from memory: [token][head]
     [HEAD_DIM] bf16, ``heads.count`` heads a token."""
 
@@ -590,6 +650,7 @@ def q_frag_from(iq, heads=ONE_INDEX_HEAD, nvfp4=False):
                 // 2,
                 vec_width=4,
                 dtype=T.i32,
+                cache_modifier=cm,
             )
         ).bitcast(fx.BFloat16)
 
