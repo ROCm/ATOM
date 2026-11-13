@@ -68,7 +68,7 @@ impl Partition {
     }
 }
 
-/// A rank's lane, held by the task that follows the rank.
+/// A rank's lane, held while the rank is followed.
 pub(crate) struct Holder {
     id: HolderId,
     partition: Arc<Partition>,
