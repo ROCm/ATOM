@@ -31,7 +31,7 @@ from atom.model_ops.attention_mla import MLAModules, qrep_tp_override
 from atom.model_ops.attention_residual import AttnRes
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
-from atom.model_ops.fla_ops.fused_sigmoid_gating import (
+from atom.model_ops.fla_ops.kda_decode_dispatch import (
     fused_sigmoid_gating_delta_rule_update,
 )
 from atom.model_ops.fla_ops.replayssm import (
