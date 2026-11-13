@@ -13,6 +13,7 @@ What a stream writes, and the fence around it, are the engine's weight sync:
 """
 
 import json
+import os
 import sys
 from datetime import timedelta
 from pathlib import Path
@@ -284,10 +285,24 @@ def test_the_receiver_reads_the_header_in_the_documented_order(monkeypatch):
 
     trainer = _Trainer([torch.tensor([1, 10, 20, 7], dtype=torch.int64)])
     monkeypatch.setattr(receiver, "dist", SimpleNamespace(broadcast=trainer.broadcast))
-    assert receiver._recv_header(None, device=torch.device("cpu")) == (1, 10, 20, 7)
+    header = receiver._recv_header(
+        None, device=torch.device("cpu"), timeout=timedelta(seconds=60)
+    )
+    assert header == (1, 10, 20, 7)
 
 
 # ── the stream: one rank's failure must not strand the others ──────────────
+
+
+class _Work:
+    """A broadcast's handle; *waits* gets each wait's timeout."""
+
+    def __init__(self, waits):
+        self.waits = waits
+
+    def wait(self, timeout=None):
+        self.waits.append(timeout)
+        return True
 
 
 class _Trainer:
@@ -295,14 +310,16 @@ class _Trainer:
 
     def __init__(self, frames):
         self.frames = list(frames)
+        self.waits = []
 
-    def broadcast(self, tensor, src=0, group=None):
-        assert src == 0
+    def broadcast(self, tensor, src=0, group=None, async_op=False):
+        assert src == 0 and async_op, "a broadcast left to the watchdog"
         frame = self.frames.pop(0)
         # A receiver out of step posts a broadcast of the wrong size, which
         # RCCL does not check; here it fails loudly instead.
         assert tensor.numel() == frame.numel(), "receiver fell out of step"
         tensor.copy_(frame)
+        return _Work(self.waits)
 
 
 def _frames(buckets, version=1):
@@ -387,6 +404,7 @@ def _receive(
         device=torch.device("cpu"),
         version=version,
         require_full=require_full,
+        timeout=timedelta(seconds=60),
         agree=agree,
         leave=leave,
         refusal=refusal,
@@ -673,11 +691,11 @@ def test_a_rank_whose_broadcast_failed_leaves_the_group_before_it_votes(
     trainer = _Trainer(_frames(_three_buckets()))
     calls, order = [], []
 
-    def failing(tensor, src=0, group=None):
+    def failing(tensor, src=0, group=None, async_op=False):
         calls.append(1)
         if len(calls) == 5:  # the second frame's metadata
             raise RuntimeError("broadcast timed out")
-        trainer.broadcast(tensor, src=src, group=group)
+        return trainer.broadcast(tensor, src=src, group=group, async_op=async_op)
 
     peers = _peers()
 
@@ -1078,8 +1096,71 @@ def test_a_rank_out_of_step_leaves_the_group(monkeypatch):
         worker.receive_weights_rdma("g", 2)
 
 
+def test_every_broadcast_is_waited_on_for_the_groups_timeout(monkeypatch):
+    """Left to the watchdog, a broadcast the trainer never finished ended the
+    runner at the group's timeout, and the engine with it."""
+    trainer = _Trainer(_stream_of_w(5.0))
+    worker = _joined_worker(monkeypatch, trainer)
+    frames = len(trainer.frames)
+
+    worker.receive_weights_rdma("g", 1)
+
+    assert trainer.waits == [timedelta(seconds=600)] * frames
+
+
+def test_the_weight_group_aborts_on_a_timeout_rather_than_end_the_runner(
+    monkeypatch,
+):
+    """A ProcessGroupNCCL reads its error handling once, when it is built;
+    under torch's default its watchdog takes the whole process down."""
+    import atom.utils.distributed.utils as dist_utils
+
+    seen = []
+
+    def build(*args, **kwargs):
+        seen.append(os.environ.get("TORCH_NCCL_ASYNC_ERROR_HANDLING"))
+        return object()
+
+    monkeypatch.setattr(
+        dist_utils, "stateless_init_torch_distributed_process_group", build
+    )
+    monkeypatch.setenv("TORCH_NCCL_ASYNC_ERROR_HANDLING", "3")
+
+    _Worker().init_rdma_weight_group(
+        "127.0.0.1", 29500, base_rank=1, world_size=2, group_name="g"
+    )
+
+    assert seen == ["2"]
+    assert (
+        os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] == "3"
+    ), "the engine's other groups keep the process's setting"
+
+
+def test_a_trainer_gone_mid_stream_breaks_it_off_at_the_timeout(monkeypatch):
+    """Its first bucket arrived and nothing after: the wait on the next
+    header raises at the group's timeout, and the stream fails as written."""
+
+    class _Gone(_Trainer):
+        def broadcast(self, tensor, src=0, group=None, async_op=False):
+            if self.frames:
+                return super().broadcast(tensor, src, group, async_op)
+
+            def wait(timeout=None):
+                raise RuntimeError("WorkNCCL timed out in blocking wait")
+
+            return SimpleNamespace(wait=wait)
+
+    worker = _joined_worker(monkeypatch, _Gone(_stream_of_w(5.0)[:-1]))
+    (group,) = [g.group for g in worker._rdma_groups.values()]
+
+    with pytest.raises(receiver.RDMAStreamOutOfStep, match="timed out"):
+        worker.receive_weights_rdma("g", 1)
+
+    assert worker.destroyed == [group] and not worker._rdma_groups
+
+
 def test_a_peer_whose_broadcast_failed_leaves_the_group_too(monkeypatch):
-    def peer_left(tensor, src=0, group=None):
+    def peer_left(tensor, src=0, group=None, async_op=False):
         raise RuntimeError("peer left the broadcast")
 
     worker = _joined_worker(monkeypatch, SimpleNamespace(broadcast=peer_left))

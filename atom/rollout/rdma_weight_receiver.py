@@ -25,8 +25,10 @@ command, which fences serving around it as it does any other sync.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
+import os
 import time
 import traceback
 from collections.abc import Callable
@@ -81,10 +83,42 @@ class RDMAStreamOutOfStep(RuntimeError):
     """
 
 
+@contextlib.contextmanager
+def _aborted_not_ended_on_timeout():
+    """Build a group under TORCH_NCCL_ASYNC_ERROR_HANDLING=2, which a
+    ProcessGroupNCCL reads once, when built: a collective of it that times
+    out -- a trainer gone mid-stream -- aborts its communicator, and its wait
+    raises. Under torch's default the watchdog ended the runner, and the
+    engine with it. The engine's other groups keep the process's setting."""
+    name = "TORCH_NCCL_ASYNC_ERROR_HANDLING"
+    saved = os.environ.get(name)
+    os.environ[name] = "2"
+    try:
+        yield
+    finally:
+        if saved is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = saved
+
+
+def _receive(tensor: torch.Tensor, group, timeout: timedelta) -> None:
+    """Take *tensor* from the trainer's broadcast, raising if it has not
+    arrived within *timeout*.
+
+    Waited on here: a broadcast on a communicator aborted for a timeout
+    returns with *tensor* never written -- read as an END marker of version
+    0, or as weights.
+    """
+    dist.broadcast(tensor, src=0, group=group, async_op=True).wait(timeout=timeout)
+
+
 @dataclass
 class _WeightGroup:
     group: object
     join: dict
+    # Each broadcast's bound: the group's collective timeout.
+    timeout: timedelta
     # Versions rise within a group; a new group is a new sender, e.g. a
     # restarted trainer counting from 1 again.
     last_version: int | None = None
@@ -130,9 +164,11 @@ def _unreceivable(
     return None
 
 
-def _recv_header(group, *, device: torch.device) -> tuple[int, int, int, int]:
+def _recv_header(
+    group, *, device: torch.device, timeout: timedelta
+) -> tuple[int, int, int, int]:
     header = torch.empty(_HEADER_WORDS, dtype=torch.int64, device=device)
-    dist.broadcast(header, src=0, group=group)
+    _receive(header, group, timeout)
     command, metadata_bytes, payload_bytes, version = (
         int(v) for v in header.cpu().tolist()
     )
@@ -150,6 +186,184 @@ def _decode_frame(
     return decode_bucket(metadata, payload)
 
 
+class _Votes:
+    """How the ranks taking a stream decide on it, and what this rank owes
+    them if it breaks off between two votes."""
+
+    def __init__(self, agree: Callable[[int], int]):
+        self._agree = agree
+        # Set by the vote that is every rank's last, and by no other.
+        self.decided = False
+        self.failed = False
+
+    def _cast(self, ballot: int) -> int:
+        try:
+            return self._agree(ballot)
+        except Exception:
+            self.failed = True
+            raise
+
+    def on_frame(self, receivable: bool) -> bool:
+        """Whether every rank receives the frame just announced; if not, that
+        was every rank's last vote."""
+        if self._cast(_RECEIVING if receivable else _BROKEN_OFF) == _RECEIVING:
+            return True
+        self.decided = True
+        return False
+
+    def at_end(self) -> bool:
+        """Every rank's last vote, at the end marker: whether a rank left."""
+        left = self._cast(_ENDED) == _LEFT
+        self.decided = True
+        return left
+
+    def break_off(self, leave: Callable[[], object], version: int) -> None:
+        """Broken off between votes, in a broadcast a peer may still be in:
+        *leave* this rank's end of the group, which releases that peer, then
+        cast the ballot it waits for."""
+        if self.decided:
+            return
+        try:
+            leave()
+        except Exception:  # the stream's own failure is raised
+            logger.exception(
+                "RDMA weight stream v%d: leaving its group failed", version
+            )
+        if not self.failed:
+            try:
+                self._agree(_LEFT)
+            except Exception:  # the stream's own failure is raised
+                logger.exception(
+                    "RDMA weight stream v%d: its last vote failed", version
+                )
+
+
+@dataclass
+class _Received:
+    """What this rank has made of a stream so far."""
+
+    # Raised at the end marker; the rest of the stream is still received.
+    failure: Exception | None
+    opened: bool = False
+    applied: bool = False
+    ended: bool = False
+    updated: int = 0
+    buckets: int = 0
+    bytes: int = 0
+
+    def stats(self, seconds: float) -> dict[str, float]:
+        return {
+            "updated": self.updated,
+            "buckets": self.buckets,
+            "bytes": self.bytes,
+            "seconds": seconds,
+            "gbps": (self.bytes * 8 / 1e9 / seconds) if seconds > 0 else 0.0,
+        }
+
+
+def _open_sync_for_stream(runner, got: _Received, version: int) -> None:
+    if got.failure is None:
+        try:
+            if runner._sync is not None:
+                raise RuntimeError("another weight sync is open on this rank")
+            runner._open_sync()
+            got.opened = True
+        except Exception as exc:  # noqa: BLE001 - raised at the end marker
+            got.failure = exc
+    if got.failure is not None:
+        logger.error(
+            "RDMA weight stream v%d refused on this rank, receiving it before "
+            "reporting that: %s",
+            version,
+            got.failure,
+        )
+
+
+def _take_frames(
+    group,
+    runner,
+    got: _Received,
+    votes: _Votes,
+    *,
+    device: torch.device,
+    version: int,
+    timeout: timedelta,
+) -> None:
+    """Receive frames up to the end marker, writing each bucket unless this
+    rank has failed already; see ``receive_weight_stream``."""
+    while True:
+        # The last bucket goes before anything else is allocated, or two are
+        # resident at the peak.
+        metadata_tensor = payload = weights = None
+        command, metadata_bytes, payload_bytes, frame_version = _recv_header(
+            group, device=device, timeout=timeout
+        )
+        # Checked on every header: a version change mid-stream means two
+        # senders are interleaving on one group.
+        if got.failure is None and frame_version != version:
+            got.failure = RuntimeError(
+                f"RDMA weight version mismatch: expected {version}, "
+                f"got {frame_version}"
+            )
+        if command == _CMD_END:
+            # The contract is [END, 0, 0, version].
+            if got.failure is None and (metadata_bytes != 0 or payload_bytes != 0):
+                got.failure = RuntimeError(
+                    f"invalid RDMA end marker: metadata_bytes={metadata_bytes} "
+                    f"payload_bytes={payload_bytes}, both must be 0"
+                )
+            got.ended = True
+            return
+        frame = (
+            f"command={command} metadata_bytes={metadata_bytes} "
+            f"payload_bytes={payload_bytes}"
+        )
+        # Free memory differs between ranks; a header that frames no bucket is
+        # the same on every rank, so all leave at it together.
+        reason = _frames_no_bucket(
+            command, metadata_bytes, payload_bytes
+        ) or _unreceivable(device, metadata_bytes, payload_bytes)
+        if reason is None:
+            try:
+                metadata_tensor = torch.empty(
+                    metadata_bytes, dtype=torch.uint8, device=device
+                )
+                payload = torch.empty(payload_bytes, dtype=torch.uint8, device=device)
+            except RuntimeError as exc:  # out of memory, within the bounds
+                metadata_tensor = payload = None
+                reason = str(exc)
+        if not votes.on_frame(reason is None):
+            raise RDMAStreamOutOfStep(
+                f"RDMA weight frame cannot be received: {frame} "
+                f"({reason or 'not by every rank taking the stream'})"
+            )
+
+        _receive(metadata_tensor, group, timeout)
+        _receive(payload, group, timeout)
+        if got.failure is not None:
+            continue
+        try:
+            weights = _decode_frame(metadata_tensor, payload)
+            got.applied = True
+            counts = runner._apply_named_tensors(weights)
+            runner._refuse_unwritten(counts)
+        except Exception as exc:  # noqa: BLE001 - raised at the end marker
+            # Kept until the end marker; its frames must not keep this bucket
+            # alive while the rest of the stream is drained.
+            traceback.clear_frames(exc.__traceback__)
+            got.failure = exc
+            logger.error(
+                "RDMA weight bucket %d failed on this rank, receiving the rest "
+                "of the stream before reporting it: %s",
+                got.buckets + 1,
+                exc,
+            )
+            continue
+        got.updated += counts["updated"]
+        got.bytes += payload_bytes
+        got.buckets += 1
+
+
 @torch.no_grad()
 def receive_weight_stream(
     group,
@@ -158,6 +372,7 @@ def receive_weight_stream(
     device: torch.device,
     version: int,
     require_full: bool,
+    timeout: timedelta,
     agree: Callable[[int], int],
     leave: Callable[[], object],
     refusal: Exception | None = None,
@@ -178,7 +393,8 @@ def receive_weight_stream(
     header's sizes being all that is needed to stay in step, and the failure
     is raised at the end marker. What breaks the stream off before then -- a
     header that frames no bucket, a frame some rank cannot receive, a
-    broadcast that fails -- raises ``RDMAStreamOutOfStep``. *leave* tears
+    broadcast that fails or does not arrive within *timeout*, as when the
+    trainer is gone -- raises ``RDMAStreamOutOfStep``. *leave* tears
     down this rank's end of *group* before its last vote: a peer still in the
     failed broadcast is released only once that end is gone.
 
@@ -189,168 +405,47 @@ def receive_weight_stream(
     stream is a ``WeightReloadRefused``, so the engine can tell that nothing
     was written here.
     """
-    total_bytes = 0
-    total_buckets = 0
-    updated = 0
     started = time.perf_counter()
-    failure: Exception | None = refusal
-    opened = False
-    applied = False
-    ended = False
-    # Set by the vote that is every rank's last, and by no other.
-    decided = False
-    vote_failed = False
-
-    def decide(ballot: int) -> int:
-        nonlocal vote_failed
-        try:
-            return agree(ballot)
-        except Exception:
-            vote_failed = True
-            raise
-
+    got = _Received(failure=refusal)
+    votes = _Votes(agree)
     try:
-        if failure is None:
-            try:
-                if runner._sync is not None:
-                    raise RuntimeError("another weight sync is open on this rank")
-                runner._open_sync()
-                opened = True
-            except Exception as exc:  # noqa: BLE001 - raised at the end marker
-                failure = exc
-        if failure is not None:
-            logger.error(
-                "RDMA weight stream v%d refused on this rank, receiving it "
-                "before reporting that: %s",
-                version,
-                failure,
-            )
-        while True:
-            # The last bucket goes before anything else is allocated, or two
-            # are resident at the peak.
-            metadata_tensor = payload = weights = None
-            command, metadata_bytes, payload_bytes, frame_version = _recv_header(
-                group, device=device
-            )
-            # Checked on every header: a version change mid-stream means two
-            # senders are interleaving on one group.
-            if failure is None and frame_version != version:
-                failure = RuntimeError(
-                    f"RDMA weight version mismatch: expected {version}, "
-                    f"got {frame_version}"
-                )
-            if command == _CMD_END:
-                # The contract is [END, 0, 0, version].
-                if failure is None and (metadata_bytes != 0 or payload_bytes != 0):
-                    failure = RuntimeError(
-                        f"invalid RDMA end marker: metadata_bytes={metadata_bytes} "
-                        f"payload_bytes={payload_bytes}, both must be 0"
-                    )
-                ended = True
-                break
-            frame = (
-                f"command={command} metadata_bytes={metadata_bytes} "
-                f"payload_bytes={payload_bytes}"
-            )
-            # Free memory differs between ranks; a header that frames no
-            # bucket is the same on every rank, so all leave at it together.
-            reason = _frames_no_bucket(
-                command, metadata_bytes, payload_bytes
-            ) or _unreceivable(device, metadata_bytes, payload_bytes)
-            if reason is None:
-                try:
-                    metadata_tensor = torch.empty(
-                        metadata_bytes, dtype=torch.uint8, device=device
-                    )
-                    payload = torch.empty(
-                        payload_bytes, dtype=torch.uint8, device=device
-                    )
-                except RuntimeError as exc:  # out of memory, within the bounds
-                    metadata_tensor = payload = None
-                    reason = str(exc)
-            if decide(_RECEIVING if reason is None else _BROKEN_OFF) != _RECEIVING:
-                decided = True
-                raise RDMAStreamOutOfStep(
-                    f"RDMA weight frame cannot be received: {frame} "
-                    f"({reason or 'not by every rank taking the stream'})"
-                )
-
-            dist.broadcast(metadata_tensor, src=0, group=group)
-            dist.broadcast(payload, src=0, group=group)
-            if failure is not None:
-                continue
-            try:
-                weights = _decode_frame(metadata_tensor, payload)
-                applied = True
-                counts = runner._apply_named_tensors(weights)
-                runner._refuse_unwritten(counts)
-            except Exception as exc:  # noqa: BLE001 - raised at the end marker
-                # Kept until the end marker; its frames must not keep this
-                # bucket alive while the rest of the stream is drained.
-                traceback.clear_frames(exc.__traceback__)
-                failure = exc
-                logger.error(
-                    "RDMA weight bucket %d failed on this rank, receiving the "
-                    "rest of the stream before reporting it: %s",
-                    total_buckets + 1,
-                    exc,
-                )
-                continue
-            updated += counts["updated"]
-            total_bytes += payload_bytes
-            total_buckets += 1
-
-        if failure is None:
+        _open_sync_for_stream(runner, got, version)
+        _take_frames(
+            group,
+            runner,
+            got,
+            votes,
+            device=device,
+            version=version,
+            timeout=timeout,
+        )
+        if got.failure is None:
             try:
                 runner._complete_sync(require_full)
             except Exception as exc:  # noqa: BLE001 - raised after the vote
-                failure = exc
-        if decide(_ENDED) == _LEFT:
-            decided = True
+                got.failure = exc
+        if votes.at_end():
             # Counts as written, so the engine stays fenced, as it should: the
             # stream broke off, and what the other ranks wrote is unknown even
             # where this one wrote nothing.
             raise RDMAStreamOutOfStep(
                 f"RDMA weight stream v{version}: a rank taking it left its group"
-            ) from failure
-        decided = True
-        if failure is not None:
-            if applied or isinstance(failure, WeightReloadRefused):
-                raise failure
-            raise WeightReloadRefused(str(failure)) from failure
+            ) from got.failure
+        if got.failure is not None:
+            if got.applied or isinstance(got.failure, WeightReloadRefused):
+                raise got.failure
+            raise WeightReloadRefused(str(got.failure)) from got.failure
     except Exception as exc:
-        if not decided:
-            # Broken off between votes, in a broadcast a peer may still be in.
-            try:
-                leave()
-            except Exception:  # the stream's own failure is raised
-                logger.exception(
-                    "RDMA weight stream v%d: leaving its group failed", version
-                )
-            if not vote_failed:
-                try:
-                    agree(_LEFT)
-                except Exception:  # the stream's own failure is raised
-                    logger.exception(
-                        "RDMA weight stream v%d: its last vote failed", version
-                    )
-        if opened:
+        votes.break_off(leave, version)
+        if got.opened:
             runner._discard_failed_weight_sync()
-        if not isinstance(exc, RDMAStreamOutOfStep) and (not ended or vote_failed):
+        if not isinstance(exc, RDMAStreamOutOfStep) and (not got.ended or votes.failed):
             # Counts as written and keeps the engine fenced, as above.
             raise RDMAStreamOutOfStep(
                 f"RDMA weight stream v{version} broke off: {exc}"
             ) from exc
         raise
-
-    elapsed = time.perf_counter() - started
-    return {
-        "updated": updated,
-        "buckets": total_buckets,
-        "bytes": total_bytes,
-        "seconds": elapsed,
-        "gbps": (total_bytes * 8 / 1e9 / elapsed) if elapsed > 0 else 0.0,
-    }
+    return got.stats(time.perf_counter() - started)
 
 
 class RDMAWeightReceiverMixin:
@@ -486,18 +581,18 @@ class RDMAWeightReceiverMixin:
             )
             return True
 
-        self._rdma_groups[group_name] = _WeightGroup(
-            stateless_init_torch_distributed_process_group(
+        timeout = timedelta(seconds=int(timeout_s))
+        with _aborted_not_ended_on_timeout():
+            group = stateless_init_torch_distributed_process_group(
                 master_addr,
                 int(master_port),
                 rank,
                 int(world_size),
                 "nccl",  # RCCL on ROCm
                 group_name=group_name,
-                timeout=timedelta(seconds=int(timeout_s)),
-            ),
-            join,
-        )
+                timeout=timeout,
+            )
+        self._rdma_groups[group_name] = _WeightGroup(group, join, timeout)
         logger.info(
             "%s: joined RDMA weight group %s as rank %d/%d (worker %d)",
             self.label,
@@ -551,6 +646,7 @@ class RDMAWeightReceiverMixin:
                 device=self.device,
                 version=version,
                 require_full=require_full,
+                timeout=weight_group.timeout,
                 agree=lambda ballot: self._vote_with_engine_peers(ballot)[0],
                 leave=lambda: self.destroy_rdma_weight_group(group_name),
                 refusal=None if refusal is None else WeightReloadRefused(refusal),
