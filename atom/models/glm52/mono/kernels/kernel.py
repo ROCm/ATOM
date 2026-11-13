@@ -3087,121 +3087,226 @@ def build_glm5_monokernel(
         UV_R = UV_TILE // 16
         UV_WPR = WAVES // UV_R
         UV_UNITS = UV_NKC // (absorb_k_chunks_per_unit * UV_WPR)
-        for tt in range(start("uv"), S * N_UV, G):
-            tt = fx.Int32(tt)
-            stamp("uv", tt, 0)
-            s = tt // N_UV  # sample
-            t = tt % N_UV  # global 64-row tile
-            local_t = dcp_local_uv_tile(t, L)
-            head = t // (V_DIM // UV_TILE)
+        # From four rows a task takes a (sample, head) and 16 * WAVES of its rows: one
+        # per UV_TILE re-merged the head's split partials for every tile, and those
+        # polls cost more than the extra tasks gained.
+        UV_PARTS = V_DIM // (16 * WAVES)
+        UV_BY_HEAD = S >= 4 and D == 1 and V_DIM % (16 * WAVES) == 0 and THREADS == KV_LORA and N_SPLIT <= 64
+        if const_expr(UV_BY_HEAD):
+            UVH_UNITS = UV_NKC // absorb_k_chunks_per_unit
+            UVH_SPLITS = N_SPLIT // 2  # a thread sums one half of the splits
+            for tt in range(start("uv"), S * H * UV_PARTS, G):
+                tt = fx.Int32(tt)
+                stamp("uv", tt, 0)
+                s = tt // (H * UV_PARTS)
+                head = (tt // UV_PARTS) % H
+                part = tt % UV_PARTS
 
-            def u_uv(c):
-                kc = ((wave % UV_WPR) * UV_UNITS + c) * absorb_k_chunks_per_unit
-                return unit_attention(
-                    r_wuv,
-                    r_suv,
-                    local_t * UV_R + wave // UV_WPR,
-                    kc,
-                    UV_NKC,
-                    KV_LORA,
-                    128,
-                    attention_b_word(kc * 64, absorbed=True),
-                    scale_rows=uv_scale_rows,
-                    coef=((lambda: lds_ld(misc, N_SPLIT + 2 + kc // 2)) if const_expr(absorb_ptpc) else None),
-                    absorbed=True,
-                )
+                def u_uvh(c):
+                    kc = c * absorb_k_chunks_per_unit
+                    return unit_attention(
+                        r_wuv,
+                        r_suv,
+                        (head * UV_PARTS + part) * WAVES + wave,
+                        kc,
+                        UV_NKC,
+                        KV_LORA,
+                        128,
+                        attention_b_word(kc * 64, absorbed=True),
+                        scale_rows=uv_scale_rows,
+                        coef=((lambda: lds_ld(misc, N_SPLIT + 2 + kc // 2)) if const_expr(absorb_ptpc) else None),
+                        absorbed=True,
+                    )
 
-            pre = [u_uv(c) for c in range(UV_UNITS)]
-            hint_wait(N_SPLIT, lambda k: (mb("sp_l"), (s * N_SPLIT + k) * H + head), mark=("uv", tt))
-            pre_poll(N_SPLIT, lambda k: (mb("sp_l"), (s * N_SPLIT + k) * H + head))
-            stamp("uv", tt, 5)
-            # Four 16-split quarters keep each poll and its live payload bounded.
-            # Every thread owns one (quarter, half-of-latent) pair and processes
-            # its two latent-pair positions sequentially; red holds quarter sums.
-            SPH = N_SPLIT // 4
-            dp_lo = tid % (KV_LORA // 4)
-            hf = tid // (KV_LORA // 4)
-            spi = fx.min(lane, N_SPLIT - 1)
-            ml = (s * N_SPLIT + spi) * H + head
-            ml_got = poll([(mb("sp_m"), ml, 1), (mb("sp_l"), ml, 1)])
-            if wave == 0:  # per-split weights exp(m - M) / L for this head -> misc[sp]
-                ok_sp = lane < N_SPLIT
-                m_sp = ok_sp.select(ml_got[0][0].bitcast(fx.Float32), fx.Float32(NEG))
-                l_sp = ok_sp.select(ml_got[1][0].bitcast(fx.Float32), fx.Float32(0.0))
-                m_all = wave_max(m_sp)
-                w_sp = _exp(m_sp - m_all)
-                den = wave_sum(l_sp * w_sp)
-                if ok_sp:
-                    lds_st(misc, lane, w_sp * (den > 0.0).select(_rcp(den), fx.Float32(0.0)))
-                if lane == 0:
-                    lds_st(misc, N_SPLIT, m_all)
-                    lds_st(misc, N_SPLIT + 1, den)
-            gpu.barrier()
-            for dh in range_constexpr(2):
-                dp = dp_lo + dh * (KV_LORA // 4)
+                pre = [u_uvh(c) for c in range(UVH_UNITS)]
+                hint_wait(N_SPLIT, None, mark=("uv", tt))
+                if wave == 0:
+                    spi = fx.min(lane, N_SPLIT - 1)
+                    ml = (s * N_SPLIT + spi) * H + head
+                    ml_got = poll([(mb("sp_m"), ml, 1), (mb("sp_l"), ml, 1)])
+                    ok_sp = lane < N_SPLIT
+                    m_sp = ok_sp.select(ml_got[0][0].bitcast(fx.Float32), fx.Float32(NEG))
+                    l_sp = ok_sp.select(ml_got[1][0].bitcast(fx.Float32), fx.Float32(0.0))
+                    m_all = wave_max(m_sp)
+                    w_sp = _exp(m_sp - m_all)
+                    den = wave_sum(l_sp * w_sp)
+                    if ok_sp:
+                        lds_st(misc, lane, w_sp * (den > 0.0).select(_rcp(den), fx.Float32(0.0)))
+                    if lane == 0:
+                        lds_st(misc, N_SPLIT, m_all)
+                        lds_st(misc, N_SPLIT + 1, den)
+                gpu.barrier()
+                stamp("uv", tt, 5)
+                hf = tid // (KV_LORA // 2)
+                dp = tid % (KV_LORA // 2)
                 got = poll(
                     [
-                        (mb("sp_acc"), ((s * N_SPLIT + hf * SPH + j) * H + head) * (KV_LORA // 2) + dp, 1)
-                        for j in range(SPH)
-                    ]
+                        (mb("sp_acc"), ((s * N_SPLIT + hf * UVH_SPLITS + i) * H + head) * (KV_LORA // 2) + dp, 1)
+                        for i in range(UVH_SPLITS)
+                    ],
+                    batch=UVH_SPLITS,
                 )
                 o0 = fx.Float32(0.0)
                 o1 = fx.Float32(0.0)
-                for j in range_constexpr(SPH):
-                    wj = lds_ld(misc, hf * SPH + j)
-                    a0, a1 = bf2_f32(got[j][0])
+                for i in range_constexpr(UVH_SPLITS):
+                    wj = lds_ld(misc, hf * UVH_SPLITS + i)
+                    a0, a1 = bf2_f32(got[i][0])
                     o0 = o0 + a0 * wj
                     o1 = o1 + a1 * wj
                 lds_st(red, (hf * (KV_LORA // 2) + dp) * 2, o0)
                 lds_st(red, (hf * (KV_LORA // 2) + dp) * 2 + 1, o1)
-            gpu.barrier()
-            uv_valid = tid < KV_LORA // 2
-            uv0, uv1 = fx.Float32(0.0), fx.Float32(0.0)
-            if uv_valid:
-                o0 = fx.Float32(0.0)
-                o1 = fx.Float32(0.0)
-                for q in range_constexpr(4):
-                    o0 = o0 + lds_ld(red, (q * (KV_LORA // 2) + tid) * 2)
-                    o1 = o1 + lds_ld(red, (q * (KV_LORA // 2) + tid) * 2 + 1)
-                uv0, uv1 = bf16_round(o0), bf16_round(o1)
-                if const_expr(not absorb_ptpc):
-                    lds_st(xs, tid, bf16_pair(uv0, uv1))
-            if const_expr(absorb_ptpc):
-                uv_max = wave_max(uv_valid.select(fx.max(fmath.absf(uv0), fmath.absf(uv1)), fx.Float32(0.0)))
-                if (lane == 0) & (wave < KV_LORA // 128):
-                    lds_st(misc, N_SPLIT + 2 + wave, (uv_max == 0.0).select(fx.Float32(1.0), uv_max * (1.0 / FP8_MAX)))
-            gpu.barrier()
-            if const_expr(absorb_ptpc):
-                if uv_valid:
-                    uv_scale = lds_ld(misc, N_SPLIT + 2 + tid // 64)
-                    uv_rcp = 1.0 / uv_scale
-                    st_ptpc(tid * 2, div_rn(uv0, uv_scale, uv_rcp), div_rn(uv1, uv_scale, uv_rcp))
                 gpu.barrier()
-            # Debug stamp placed HERE, not after the per-split weights where it
-            # used to sit, so ``timeline_report``'s "stage" and "compute" cut
-            # this stage where the question is: everything above reconstructs
-            # ONE sample's attention latent (two polls of `sp_acc`, the
-            # weighted sum, the FP8 quant) and is per (sample, head); every-
-            # thing below is the UV GEMM, whose weight tile depends only on
-            # ``t`` and is therefore re-read identically by all S samples.
-            # Merging the samples into the MFMA's spare N columns would divide
-            # the second by S and leave the first alone -- but it also cuts the
-            # stage to ``N_UV`` tasks, a quarter of the grid. So it pays only
-            # if "compute" dominates "stage"; this stamp is what says which.
-            stamp("uv", tt, 2)
-            owner = dcp_merge_latent(s, t)
-            if owner:
-                acc = run_units(u_uv, UV_UNITS, UV_UNITS, pre)
+                uv_valid = tid < KV_LORA // 2
+                uv0, uv1 = fx.Float32(0.0), fx.Float32(0.0)
+                if uv_valid:
+                    o0 = lds_ld(red, tid * 2) + lds_ld(red, (KV_LORA // 2 + tid) * 2)
+                    o1 = lds_ld(red, tid * 2 + 1) + lds_ld(red, (KV_LORA // 2 + tid) * 2 + 1)
+                    uv0, uv1 = bf16_round(o0), bf16_round(o1)
+                    if const_expr(not absorb_ptpc):
+                        lds_st(xs, tid, bf16_pair(uv0, uv1))
                 if const_expr(absorb_ptpc):
-                    reduce_rows(UV_R, acc, emit_ptpc_scalar(UV_TILE, ld_f32(r_suv, 0)))
+                    uv_max = wave_max(uv_valid.select(fx.max(fmath.absf(uv0), fmath.absf(uv1)), fx.Float32(0.0)))
+                    if (lane == 0) & (wave < KV_LORA // 128):
+                        lds_st(misc, N_SPLIT + 2 + wave, (uv_max == 0.0).select(fx.Float32(1.0), uv_max * (1.0 / FP8_MAX)))
+                gpu.barrier()
+                if const_expr(absorb_ptpc):
+                    if uv_valid:
+                        uv_scale = lds_ld(misc, N_SPLIT + 2 + tid // 64)
+                        uv_rcp = 1.0 / uv_scale
+                        st_ptpc(tid * 2, div_rn(uv0, uv_scale, uv_rcp), div_rn(uv1, uv_scale, uv_rcp))
+                    gpu.barrier()
+                stamp("uv", tt, 2)
+                acc = run_units(u_uvh, UVH_UNITS, UVH_UNITS, pre)
+                if const_expr(absorb_ptpc):
+                    reduce_rows(WAVES, acc, emit_ptpc_scalar(16 * WAVES, ld_f32(r_suv, 0)), count=1)
                 else:
-                    reduce_rows(UV_R, acc, emit_out(UV_TILE))
+                    reduce_rows(WAVES, acc, emit_out(16 * WAVES), count=1)
                 stamp("uv", tt, 3)
                 gpu.barrier()
-                if tid < UV_TILE // 4:
+                if tid < 16 * WAVES // 4:
                     r = tid * 4
-                    put_bf(mb("o"), s * O_K + local_t * UV_TILE + r, [lds_ld(outs, r + j) for j in range(4)])
-            stamp("uv", tt, 4)
+                    put_bf(
+                        mb("o"),
+                        s * O_K + head * V_DIM + part * (16 * WAVES) + r,
+                        [lds_ld(outs, r + e) for e in range(4)],
+                    )
+                stamp("uv", tt, 4)
+        if const_expr(not UV_BY_HEAD):
+            for tt in range(start("uv"), S * N_UV, G):
+                tt = fx.Int32(tt)
+                stamp("uv", tt, 0)
+                s = tt // N_UV  # sample
+                t = tt % N_UV  # global 64-row tile
+                local_t = dcp_local_uv_tile(t, L)
+                head = t // (V_DIM // UV_TILE)
+
+                def u_uv(c):
+                    kc = ((wave % UV_WPR) * UV_UNITS + c) * absorb_k_chunks_per_unit
+                    return unit_attention(
+                        r_wuv,
+                        r_suv,
+                        local_t * UV_R + wave // UV_WPR,
+                        kc,
+                        UV_NKC,
+                        KV_LORA,
+                        128,
+                        attention_b_word(kc * 64, absorbed=True),
+                        scale_rows=uv_scale_rows,
+                        coef=((lambda: lds_ld(misc, N_SPLIT + 2 + kc // 2)) if const_expr(absorb_ptpc) else None),
+                        absorbed=True,
+                    )
+
+                pre = [u_uv(c) for c in range(UV_UNITS)]
+                hint_wait(N_SPLIT, lambda k: (mb("sp_l"), (s * N_SPLIT + k) * H + head), mark=("uv", tt))
+                pre_poll(N_SPLIT, lambda k: (mb("sp_l"), (s * N_SPLIT + k) * H + head))
+                stamp("uv", tt, 5)
+                # Four 16-split quarters keep each poll and its live payload bounded.
+                # Every thread owns one (quarter, half-of-latent) pair and processes
+                # its two latent-pair positions sequentially; red holds quarter sums.
+                SPH = N_SPLIT // 4
+                dp_lo = tid % (KV_LORA // 4)
+                hf = tid // (KV_LORA // 4)
+                spi = fx.min(lane, N_SPLIT - 1)
+                ml = (s * N_SPLIT + spi) * H + head
+                ml_got = poll([(mb("sp_m"), ml, 1), (mb("sp_l"), ml, 1)])
+                if wave == 0:  # per-split weights exp(m - M) / L for this head -> misc[sp]
+                    ok_sp = lane < N_SPLIT
+                    m_sp = ok_sp.select(ml_got[0][0].bitcast(fx.Float32), fx.Float32(NEG))
+                    l_sp = ok_sp.select(ml_got[1][0].bitcast(fx.Float32), fx.Float32(0.0))
+                    m_all = wave_max(m_sp)
+                    w_sp = _exp(m_sp - m_all)
+                    den = wave_sum(l_sp * w_sp)
+                    if ok_sp:
+                        lds_st(misc, lane, w_sp * (den > 0.0).select(_rcp(den), fx.Float32(0.0)))
+                    if lane == 0:
+                        lds_st(misc, N_SPLIT, m_all)
+                        lds_st(misc, N_SPLIT + 1, den)
+                gpu.barrier()
+                for dh in range_constexpr(2):
+                    dp = dp_lo + dh * (KV_LORA // 4)
+                    got = poll(
+                        [
+                            (mb("sp_acc"), ((s * N_SPLIT + hf * SPH + j) * H + head) * (KV_LORA // 2) + dp, 1)
+                            for j in range(SPH)
+                        ]
+                    )
+                    o0 = fx.Float32(0.0)
+                    o1 = fx.Float32(0.0)
+                    for j in range_constexpr(SPH):
+                        wj = lds_ld(misc, hf * SPH + j)
+                        a0, a1 = bf2_f32(got[j][0])
+                        o0 = o0 + a0 * wj
+                        o1 = o1 + a1 * wj
+                    lds_st(red, (hf * (KV_LORA // 2) + dp) * 2, o0)
+                    lds_st(red, (hf * (KV_LORA // 2) + dp) * 2 + 1, o1)
+                gpu.barrier()
+                uv_valid = tid < KV_LORA // 2
+                uv0, uv1 = fx.Float32(0.0), fx.Float32(0.0)
+                if uv_valid:
+                    o0 = fx.Float32(0.0)
+                    o1 = fx.Float32(0.0)
+                    for q in range_constexpr(4):
+                        o0 = o0 + lds_ld(red, (q * (KV_LORA // 2) + tid) * 2)
+                        o1 = o1 + lds_ld(red, (q * (KV_LORA // 2) + tid) * 2 + 1)
+                    uv0, uv1 = bf16_round(o0), bf16_round(o1)
+                    if const_expr(not absorb_ptpc):
+                        lds_st(xs, tid, bf16_pair(uv0, uv1))
+                if const_expr(absorb_ptpc):
+                    uv_max = wave_max(uv_valid.select(fx.max(fmath.absf(uv0), fmath.absf(uv1)), fx.Float32(0.0)))
+                    if (lane == 0) & (wave < KV_LORA // 128):
+                        lds_st(misc, N_SPLIT + 2 + wave, (uv_max == 0.0).select(fx.Float32(1.0), uv_max * (1.0 / FP8_MAX)))
+                gpu.barrier()
+                if const_expr(absorb_ptpc):
+                    if uv_valid:
+                        uv_scale = lds_ld(misc, N_SPLIT + 2 + tid // 64)
+                        uv_rcp = 1.0 / uv_scale
+                        st_ptpc(tid * 2, div_rn(uv0, uv_scale, uv_rcp), div_rn(uv1, uv_scale, uv_rcp))
+                    gpu.barrier()
+                # Debug stamp placed HERE, not after the per-split weights where it
+                # used to sit, so ``timeline_report``'s "stage" and "compute" cut
+                # this stage where the question is: everything above reconstructs
+                # ONE sample's attention latent (two polls of `sp_acc`, the
+                # weighted sum, the FP8 quant) and is per (sample, head); every-
+                # thing below is the UV GEMM, whose weight tile depends only on
+                # ``t`` and is therefore re-read identically by all S samples.
+                # Merging the samples into the MFMA's spare N columns would divide
+                # the second by S and leave the first alone -- but it also cuts the
+                # stage to ``N_UV`` tasks, a quarter of the grid. So it pays only
+                # if "compute" dominates "stage"; this stamp is what says which.
+                stamp("uv", tt, 2)
+                owner = dcp_merge_latent(s, t)
+                if owner:
+                    acc = run_units(u_uv, UV_UNITS, UV_UNITS, pre)
+                    if const_expr(absorb_ptpc):
+                        reduce_rows(UV_R, acc, emit_ptpc_scalar(UV_TILE, ld_f32(r_suv, 0)))
+                    else:
+                        reduce_rows(UV_R, acc, emit_out(UV_TILE))
+                    stamp("uv", tt, 3)
+                    gpu.barrier()
+                    if tid < UV_TILE // 4:
+                        r = tid * 4
+                        put_bf(mb("o"), s * O_K + local_t * UV_TILE + r, [lds_ld(outs, r + j) for j in range(4)])
+                stamp("uv", tt, 4)
 
         # ====================== 7. W_o + attention TP peer reduce + residual -> a
         # 2 row groups x 32 chunks: 4 waves per row group, 8 chunks each
@@ -3220,7 +3325,11 @@ def build_glm5_monokernel(
                     r_wo, r_so, t * O_R + wave // O_WPR, kc, O_NKC, O_K, 128, attention_b_word(n_sel() * O_K + kc * 64)
                 )
 
-            pre = [u_o(c) for c in range(O_UNITS)]
+            # A wave's loads complete in issue order, so the input polls below wait for
+            # every W_o load issued ahead of them: from four rows issue at most four
+            # units (128 B a lane) first, the rest once the inputs are in.
+            O_PRE = min(O_UNITS, 4) if S >= 4 else O_UNITS
+            pre = [u_o(c) for c in range(O_PRE)]
             hint_wait(
                 S * N_UV, lambda k: (mb("o"), (k // N_UV) * O_K + (k % N_UV) * UV_TILE + UV_TILE - 1), mark=("o", t)
             )
@@ -3228,6 +3337,7 @@ def build_glm5_monokernel(
                 o_scales = stage_x_pairs_ptpc("o", S, O_K, lambda k: k)
             else:
                 stage_x_pairs("o", S * O_K, lambda k: k)
+            pre += [u_o(c) for c in range(O_PRE, O_UNITS)]
             stamp("o", t, 2)
             gpu.barrier()
             acc = run_units(u_o, O_UNITS, O_UNITS, pre)
