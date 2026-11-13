@@ -11,10 +11,7 @@ use super::{
 use crate::{
     config::KvStorageConfig,
     core::{placement::test_support::make_regular_http, Worker},
-    kv_events::{
-        discovery::{OffloadBackend, OffloadReport},
-        Namespace,
-    },
+    kv_events::Namespace,
     kv_index::{
         CacheHit, HitSource, IndexProvider, LoadPath, LowerHit, PrefixMatchProvider, PrefixRequest,
     },
@@ -330,31 +327,24 @@ async fn chain_check_gates_sources_and_readers() {
 }
 
 #[tokio::test]
-async fn umbp_without_a_master_leaves_lower_unknown_and_multimodal_requests_skip() {
+async fn an_unreadable_source_leaves_lower_unknown_and_multimodal_requests_skip() {
     let tokens: Vec<u32> = (0..24).collect();
     let workers = workers(&["a", "b"]);
     let (store, hub) = reading(pools(&tokens, "MM"), KvStorageConfig::default()).await;
-    let umbp = OffloadReport {
-        backend: OffloadBackend::UmbpStore,
-        masters: Vec::new(),
-        ..report("atomumbp1-0123456789abcdef01234567", None)
-    };
-    hub.on_worker_added(workers[1].url(), "m", Some(&umbp))
+    let changed = report(NS, Some(chain_check(8)));
+    hub.on_worker_added(workers[1].url(), "m", Some(&changed))
         .await;
     let hub = Arc::new(hub);
     let provider = WithStorage::new(IndexProvider::new(Duration::from_secs(60), 4), hub.clone());
     let mut req = PrefixRequest::new("m", &tokens, Namespace::default());
     req.set_storage(hub.lookup_all(&req, &workers).await);
-    let umbp = SourceId("atom-umbp-01234567".into());
     let unknown = CacheHit {
         tokens: [0; 4],
-        lower: LowerHit::Unknown(umbp.clone()),
+        lower: LowerHit::Unknown(SourceId("atom-mooncake-b3fd64e0-2".into())),
         source: HitSource::Storage,
         exact: false,
     };
     assert_eq!(provider.match_workers(&req, &workers)[1], Some(unknown));
-    let status = &hub.status()[1];
-    assert_eq!((status.id.as_str(), status.endpoints.len()), (&*umbp.0, 0));
 
     req.multimodal = true;
     let skipped = StorageLookup::Skipped(GateReason::Multimodal);

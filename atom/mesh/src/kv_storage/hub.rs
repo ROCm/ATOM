@@ -18,14 +18,13 @@ use tracing::warn;
 
 use super::{
     keys::{self, AtomChunk},
-    BreakerState, ChainCheck, FailReason, Gate, GateReason, RankProbe, ReaderInfo, ReaderRule,
-    SourceId, StorageBackend, StorageBackendSpec, StorageHub, StorageLookup, StorageSourceSpec,
-    StorageSourceStatus,
+    BreakerState, ChainCheck, FailReason, Gate, GateReason, OffloadBackend, OffloadReport,
+    ReaderInfo, ReaderRule, SourceId, StorageBackend, StorageBackendSpec, StorageHub,
+    StorageLookup, StorageSourceSpec, StorageSourceStatus,
 };
 use crate::{
     config::KvStorageConfig,
     core::Worker,
-    kv_events::discovery::{OffloadBackend, OffloadReport},
     kv_index::{LoadPath, PrefixRequest},
 };
 
@@ -203,15 +202,6 @@ impl StorageHub for Hub {
                 let backend = StorageBackendSpec::MooncakeAdmin { masters };
                 ("mooncake", backend, self.config.probe)
             }
-            // ATOM does not know the UMBP master; UMBP probes every rank.
-            OffloadBackend::UmbpStore => {
-                let addr = self.config.umbp_master.clone().unwrap_or_default();
-                (
-                    "umbp",
-                    StorageBackendSpec::UmbpMaster { addr },
-                    RankProbe::All,
-                )
-            }
             _ => return,
         };
         let (Some(namespace), Some(world)) = (&report.namespace, report.world) else {
@@ -242,10 +232,6 @@ impl StorageHub for Hub {
                     StorageBackendSpec::MooncakeAdmin { masters: known },
                     StorageBackendSpec::MooncakeAdmin { masters },
                 ) => known == masters,
-                (
-                    StorageBackendSpec::UmbpMaster { addr: known },
-                    StorageBackendSpec::UmbpMaster { addr },
-                ) => known == addr,
                 _ => false,
             };
             backends
@@ -284,9 +270,7 @@ impl StorageHub for Hub {
             },
             deadline: Duration::from_millis(self.config.deadline_ms),
         };
-        let no_master =
-            matches!(&spec.backend, StorageBackendSpec::UmbpMaster { addr } if addr.is_empty());
-        let readable = chain_check != ChainCheck::Failed && !no_master;
+        let readable = chain_check != ChainCheck::Failed;
         let backend = readable.then(|| (self.connect)(&spec.backend)).flatten();
         sources.push(Arc::new(Source {
             spec,
@@ -351,10 +335,6 @@ impl StorageHub for Hub {
                     StorageBackendSpec::MooncakeAdmin { masters } => {
                         ("mooncake_admin", masters.clone())
                     }
-                    StorageBackendSpec::UmbpMaster { addr } => (
-                        "umbp_master",
-                        Vec::from_iter((!addr.is_empty()).then(|| addr.clone())),
-                    ),
                     StorageBackendSpec::Mock(_) => ("mock", Vec::new()),
                 };
                 let took = source.last_lookup_us.load(Ordering::Relaxed);
