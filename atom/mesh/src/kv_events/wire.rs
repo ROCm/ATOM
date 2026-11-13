@@ -214,11 +214,10 @@ impl WireDecoder for VllmWireDecoder {
         let malformed = |reason: &str| DecodeError::Malformed(reason.to_string());
         let batch = rmpv::decode::read_value(&mut &*payload)
             .map_err(|e| DecodeError::Malformed(e.to_string()))?;
-        let fields = match &batch {
-            Value::Array(items) => Fields::Array(items, BATCH_FIELDS),
-            Value::Map(pairs) => Fields::Map(pairs),
-            _ => return Err(malformed("batch is neither an array nor a map")),
+        let Value::Array(items) = &batch else {
+            return Err(malformed("batch is not an array"));
         };
+        let fields = Fields::Array(items, BATCH_FIELDS);
         let ts = fields
             .get("ts")
             .and_then(Value::as_f64)
@@ -230,7 +229,6 @@ impl WireDecoder for VllmWireDecoder {
             .ok_or_else(|| malformed("missing events"))?;
         let dp_rank = fields
             .get("data_parallel_rank")
-            .or_else(|| fields.get("attn_dp_rank"))
             .map(|rank| as_u32(rank).ok_or_else(|| malformed("bad data_parallel_rank")))
             .transpose()?;
 
