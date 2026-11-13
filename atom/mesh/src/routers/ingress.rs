@@ -33,7 +33,7 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tokens {
     Unused,
-    /// Used when the router can tokenize the request.
+    /// Used when the router can tokenize the request and it carries no media.
     Wanted,
     Needed,
 }
@@ -683,6 +683,7 @@ impl IngressRouting {
         let metadata = parsed.metadata();
         let tokens = match tokens {
             Tokens::Needed => Some(self.tokens(parsed, &metadata, ctx)?),
+            Tokens::Wanted if parsed.carries_media() => None,
             Tokens::Wanted => match self.tokens(parsed, &metadata, ctx) {
                 Ok(tokens) => Some(tokens),
                 // Routed by its text, unless the job is cancelled or late.
