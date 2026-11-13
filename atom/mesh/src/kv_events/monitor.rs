@@ -1,4 +1,4 @@
-//! Follows the KV event stream of every registered worker rank, one task each on threads
+//! Follows the KV event stream of every registered worker rank, one task each on a thread
 //! of the monitor's own, so that decoding never holds up the request path. A task's SUB
 //! socket connects once the engine binds, and reconnects after the engine restarts.
 //! What each stream carried is what `/kv_events/sources` shows.
@@ -82,9 +82,9 @@ pub struct SourceStatus {
 }
 
 impl KvEventMonitor {
-    pub fn start(threads: usize) -> std::io::Result<Self> {
+    pub fn start() -> std::io::Result<Self> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(threads)
+            .worker_threads(1)
             .thread_name("kv-events")
             .enable_all()
             .build()?;
@@ -110,9 +110,9 @@ impl KvEventMonitor {
         self.subscriptions.insert(worker.into(), subscription);
     }
 
-    /// Stops following `worker`'s stream; false if there was none.
-    pub fn detach(&self, worker: &str) -> bool {
-        self.subscriptions.remove(worker).is_some()
+    /// Stops following `worker`'s stream, if any.
+    pub fn detach(&self, worker: &str) {
+        self.subscriptions.remove(worker);
     }
 
     pub fn sources(&self) -> Vec<SourceStatus> {
@@ -144,6 +144,16 @@ async fn follow(source: KvEventSource, dp_rank: u32, status: Arc<Mutex<SourceSta
     let mut admission = RankState::default();
     loop {
         tokio::select! {
+            // A lost connection counts before the batches of the next one.
+            biased;
+            Some(event) = events.next() => match event {
+                SocketEvent::Connected(..) => status.lock().connected = true,
+                SocketEvent::Disconnected(_) => {
+                    status.lock().connected = false;
+                    admission.disconnected();
+                }
+                _ => {}
+            },
             message = socket.recv() => match message {
                 Ok(message) => {
                     let batch = batch(&message.into_vec(), source.block_size, dp_rank);
@@ -151,11 +161,6 @@ async fn follow(source: KvEventSource, dp_rank: u32, status: Arc<Mutex<SourceSta
                 }
                 // The socket reconnects by itself.
                 Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
-            },
-            Some(event) = events.next() => match event {
-                SocketEvent::Connected(..) => status.lock().connected = true,
-                SocketEvent::Disconnected(_) => status.lock().connected = false,
-                _ => {}
             },
         }
     }
@@ -204,7 +209,7 @@ fn record(
     status.batches += 1;
     for event in &batch.events {
         match event {
-            KvEvent::Stored { blocks, .. } => status.stored_blocks += blocks.len() as u64,
+            KvEvent::Stored { hashes } => status.stored_blocks += hashes.len() as u64,
             KvEvent::Removed { hashes } => status.removed_blocks += hashes.len() as u64,
             KvEvent::Cleared => status.clears += 1,
         }
@@ -288,7 +293,7 @@ mod tests {
             .unwrap()
             .port();
         let endpoint = format!("tcp://127.0.0.1:{port}");
-        let monitor = KvEventMonitor::start(1).unwrap();
+        let monitor = KvEventMonitor::start().unwrap();
         let source = KvEventSource {
             endpoint: endpoint.clone(),
             topic: "kv".into(),
@@ -331,8 +336,8 @@ mod tests {
         assert!(restarted.connected && restarted.resets > status.resets);
         assert_eq!(restarted.trust, Trust::Exact);
 
-        assert!(monitor.detach(WORKER));
-        assert!(monitor.sources().is_empty() && !monitor.detach(WORKER));
+        monitor.detach(WORKER);
+        assert!(monitor.sources().is_empty());
     }
 
     #[test]

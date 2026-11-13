@@ -257,9 +257,12 @@ impl AppContextBuilder {
         ));
         let kv_event_monitor = router_config
             .kv_events
-            .then(|| KvEventMonitor::start(1).map(Arc::new))
+            .then(|| KvEventMonitor::start().map(Arc::new))
             .transpose()
-            .map_err(|_| AppContextBuildError("kv_event_monitor"))?;
+            .map_err(|e| {
+                tracing::error!(error = %e, "Cannot start the KV event monitor's thread");
+                AppContextBuildError("kv_event_monitor")
+            })?;
         Ok(AppContext {
             prepare_pool: self
                 .prepare_pool

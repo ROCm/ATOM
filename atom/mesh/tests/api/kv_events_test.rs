@@ -1,6 +1,7 @@
-//! With `--kv-events`, a worker registered through `/workers` is followed at the
-//! endpoint it reports at `/kv_event_sources` until it is removed, as
-//! `/kv_events/sources` shows. The batches are ATOM's own, from the decoder's samples.
+//! With `--kv-events`, a worker registered through `/workers`, or each rank of a DP-aware
+//! one, is followed at the endpoint it reports at `/kv_event_sources` until it is
+//! removed, as `/kv_events/sources` shows. The batches are ATOM's own, from the decoder's
+//! samples.
 
 use std::time::Duration;
 
@@ -119,6 +120,59 @@ async fn a_registered_worker_is_followed_until_removed() {
 
     let (_, workers) = call(&app, "GET", "/workers", None).await;
     let id = workers["workers"][0]["id"].as_str().unwrap();
+    let (status, _) = call(&app, "DELETE", &format!("/workers/{id}"), None).await;
+    assert!(status.is_success(), "{status}");
+    sources_once(&app, None, |sources| sources == &json!([])).await;
+    ctx.shutdown().await;
+    worker.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_rank_of_a_dp_aware_worker_is_followed_until_the_worker_is_removed() {
+    let mut publishers = Vec::new();
+    let mut ports = Vec::new();
+    for _ in 0..2 {
+        let mut publisher = PubSocket::new();
+        let bound = publisher.bind("tcp://127.0.0.1:0").await.unwrap();
+        ports.push(bound.to_string().rsplit_once(':').unwrap().1.to_string());
+        publishers.push(publisher);
+    }
+    let mut worker = MockWorker::new(MockWorkerConfig {
+        port: 0,
+        worker_type: WorkerType::Regular,
+        health_status: HealthStatus::Healthy,
+        response_delay_ms: 0,
+        fail_rate: 0.0,
+    });
+    let url = worker.start().await.unwrap();
+    worker.set_dp_size(2).await;
+    let source =
+        |port: &str| json!({"endpoint": format!("tcp://*:{port}"), "topic": "", "block_size": 4});
+    worker
+        .set_kv_event_sources(json!({"0": source(&ports[0]), "1": source(&ports[1])}))
+        .await;
+    let mut config = TestRouterConfig::random(3992);
+    config.kv_events = true;
+    config.dp_aware = true;
+    let ctx = AppTestContext::new_with_config(config, vec![]).await;
+    let app = ctx.create_app().await;
+
+    let (status, added) = call(&app, "POST", "/workers", Some(json!({"url": url}))).await;
+    assert!(status.is_success(), "{status}");
+    let connected = |sources: &Value| {
+        let sources = sources.as_array().unwrap();
+        sources.len() == 2 && sources.iter().all(|source| source["connected"] == true)
+    };
+    let sources = sources_once(&app, None, connected).await;
+    for (rank, port) in ports.iter().enumerate() {
+        let want = json!({"worker": format!("{url}@{rank}"), "dp_rank": rank,
+            "endpoint": format!("tcp://127.0.0.1:{port}")});
+        for (key, value) in want.as_object().unwrap() {
+            assert_eq!(&sources[rank][key], value, "rank {rank} {key}");
+        }
+    }
+
+    let id = added["worker_id"].as_str().unwrap();
     let (status, _) = call(&app, "DELETE", &format!("/workers/{id}"), None).await;
     assert!(status.is_success(), "{status}");
     sources_once(&app, None, |sources| sources == &json!([])).await;

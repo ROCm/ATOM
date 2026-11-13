@@ -53,21 +53,28 @@ impl StepExecutor<LocalWorkerWorkflowData> for FollowKvEventsStep {
                 }
             })?;
         for worker in workers {
-            // Each subscription follows one rank, so a worker that is not DP-aware is
-            // followed only if it runs a single rank.
-            let rank = worker.dp_rank().unwrap_or(0) as u32;
-            match sources.get(&rank) {
-                Some(source) if worker.is_dp_aware() || sources.len() == 1 => {
+            // Each subscription follows one rank: a DP-aware worker's own, or the only
+            // rank of a worker that is not.
+            let source = match worker.dp_rank().filter(|_| worker.is_dp_aware()) {
+                Some(rank) => sources.get_key_value(&(rank as u32)),
+                None if sources.len() == 1 => sources.first_key_value(),
+                None => {
+                    warn!(
+                        worker = worker.url(),
+                        ranks = sources.len(),
+                        "Register the worker DP-aware to follow the KV events of each rank"
+                    );
+                    continue;
+                }
+            };
+            match source {
+                Some((&rank, source)) => {
                     monitor.attach(worker.url(), worker.model_id(), rank, source.clone());
                 }
-                Some(_) => warn!(
-                    worker = worker.url(),
-                    ranks = sources.len(),
-                    "Register the worker DP-aware to follow the KV events of each rank"
-                ),
                 None => warn!(
                     worker = worker.url(),
-                    rank, "No KV events reported for the rank"
+                    rank = worker.dp_rank(),
+                    "No KV events reported for the rank"
                 ),
             }
         }

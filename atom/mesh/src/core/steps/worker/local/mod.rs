@@ -211,16 +211,14 @@ pub fn create_local_worker_workflow(
 ///
 /// DAG structure:
 /// ```text
-///     find_workers_to_remove
-///              │
-///     remove_from_policy_registry
-///              │
+///               find_workers_to_remove
+///                 │                │
+///     remove_from_policy_registry  stop_following_kv_events
+///                 │
 ///     remove_from_worker_registry
-///              │
+///                 │
 ///     update_remaining_policies
 /// ```
-///
-/// with `stop_following_kv_events` after `find_workers_to_remove`.
 pub fn create_worker_removal_workflow() -> WorkflowDefinition<WorkerRemovalWorkflowData> {
     WorkflowDefinition::new("worker_removal", "Remove worker from router")
         .add_step(
