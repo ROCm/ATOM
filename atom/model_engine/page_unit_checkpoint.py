@@ -224,6 +224,8 @@ class CheckpointStoreOp:
     unit_ids: tuple[int, ...]
     total_bytes: int
     layout_id: str
+    # Past the prompt: a decode left the slot, not a prefill or midstep write.
+    decoded: bool = False
 
 
 @dataclass(frozen=True)
@@ -1039,9 +1041,11 @@ class PagedStateCheckpointCoordinator:
         enabled: bool,
         offload=None,
         readable_midstep: bool = False,
+        hash_block_size: int = 0,
     ) -> None:
         self.enabled = enabled
         self.readable_midstep = bool(readable_midstep)
+        self.hash_block_size = int(hash_block_size)
         # The state pool scratch slots are borrowed from, and how many stores
         # one batch's copy descriptor has room for. Set by
         # `attach_midstep_scratch`; a readable coordinator without them
@@ -1066,10 +1070,11 @@ class PagedStateCheckpointCoordinator:
         # one overwrite the earlier before either was stored. Re-reaching the
         # *same* hash still collapses, which is what the hash in the key is
         # for -- that is one boundary reached twice, not two boundaries.
-        self._pending: dict[tuple[int, int], tuple[Sequence, int]] = {}
+        # `(seq, hash, decoded)`; see `CheckpointStoreOp.decoded`.
+        self._pending: dict[tuple[int, int], tuple[Sequence, int, bool]] = {}
         # Boundaries whose forward is in the batch being built, held back from
         # that batch's drain; see `checkpoint_when_scheduled`.
-        self._staged: dict[tuple[int, int], tuple[Sequence, int]] = {}
+        self._staged: dict[tuple[int, int], tuple[Sequence, int, bool]] = {}
         self._store_ops: list[CheckpointStoreOp] = []
         # External loads write temporary PAGE images before a runner gathers
         # them into an Active Slot. Owners include a transfer generation, so a
@@ -1230,10 +1235,10 @@ class PagedStateCheckpointCoordinator:
         the bytes allow: the newer boundary is the one the slot actually holds,
         so it wins and the older is dropped rather than mis-stored.
         """
-        del boundary_blocks
         if self.applies(seq) and seq.state_slot >= 0:
             self._supersede(id(seq))
-            self._pending[(id(seq), h)] = (seq, h)
+            decoded = boundary_blocks * self.hash_block_size > seq.num_prompt_tokens
+            self._pending[(id(seq), h)] = (seq, h, decoded)
 
     def checkpoint_when_scheduled(self, seq: Sequence, h: int) -> None:
         """File a boundary whose forward is in the batch being built.
@@ -1247,7 +1252,7 @@ class PagedStateCheckpointCoordinator:
         retire, the chunk after the boundary has been issued and written it.
         """
         if self.applies(seq) and seq.state_slot >= 0:
-            self._staged[(id(seq), h)] = (seq, h)
+            self._staged[(id(seq), h)] = (seq, h, False)
 
     def _supersede(self, seq_id: int) -> None:
         """Drop this seq's earlier pending boundaries; the slot has moved on.
@@ -1288,7 +1293,7 @@ class PagedStateCheckpointCoordinator:
         self,
     ) -> tuple[tuple[CheckpointStoreOp, ...], tuple[CheckpointRestoreOp, ...]]:
         pending, self._pending = self._pending, {}
-        for seq, h in pending.values():
+        for seq, h, decoded in pending.values():
             # Safe to read now because `checkpoint` keeps at most one pending
             # boundary per seq: this slot holds the state as of that boundary
             # and no other. See `_supersede`.
@@ -1299,7 +1304,7 @@ class PagedStateCheckpointCoordinator:
             if op is None:
                 self.checkpoints_dropped += 1
                 continue
-            self._store_ops.append(op)
+            self._store_ops.append(replace(op, decoded=decoded))
             self.checkpoints_kept += 1
         restores = self.store.take_restore_ops()
         if self._scratch_queued:
@@ -1446,7 +1451,7 @@ class PagedStateCheckpointCoordinator:
         # same boundary. All of them lose it together.
         stale = 0
         for filed in (self._pending, self._staged):
-            keys = [key for key, (_, filed_h) in filed.items() if filed_h == h]
+            keys = [key for key, (_, filed_h, _) in filed.items() if filed_h == h]
             for key in keys:
                 del filed[key]
             stale += len(keys)

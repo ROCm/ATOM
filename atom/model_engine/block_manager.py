@@ -381,6 +381,7 @@ class BlockManager:
                 checkpoint_spec,
                 enabled=enabled,
                 readable_midstep=state_runtime.transfer.readable_midstep,
+                hash_block_size=self.hash_block_size,
             )
         # The rolling state class: per-request slots plus a content index over
         # the free ones. A checkpoint IS a free slot whose content is still

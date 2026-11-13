@@ -21,6 +21,7 @@ from atom.model_ops.fla_ops.index import prepare_chunk_offsets
 from atom.model_ops.fla_ops.replayssm import (
     replayssm_buffer_shapes,
     replayssm_commit,
+    replayssm_materialize,
 )
 from atom.model_ops.mamba_ops.causal_conv1d import (
     PAD_SLOT_ID,
@@ -986,6 +987,7 @@ class GDNStateMixin(PoolRowsMixin):
             return
         for op in (*store_ops, *restore_ops):
             self._validate_paged_state_op(op)
+        folded = self._fold_replay_records(store_ops)
 
         plan = self._checkpoint_copy_plan()
         slot_bases = self._checkpoint_slot_bases()
@@ -1014,6 +1016,52 @@ class GDNStateMixin(PoolRowsMixin):
             )
             at = end
         launch_copy_descriptor(staging.upload(descriptor_slot, total), plan)
+        if folded is not None:
+            slots, live = folded
+            self.model_runner.mamba_v_cache[:, slots] = live
+
+    def _fold_replay_records(self, store_ops):
+        """Fold each decoded slot's ReplaySSM records into its SSM plane.
+
+        The image is resumed by prefill, which reads that plane alone. Returns
+        the live planes, to put back once the copy is issued.
+        """
+        decoded = [op.src_slot for op in store_ops if op.decoded]
+        if not decoded or not self.replayssm or self._is_kda():
+            return None
+        ssm = self.model_runner.mamba_v_cache
+        slots = torch.tensor(decoded, dtype=torch.int64, pin_memory=True).to(
+            ssm.device, non_blocking=True
+        )
+        live = ssm[:, slots]
+        # Stores run before this step's commit: the image is the last window's step 0.
+        self._materialize_in_place(slots, torch.zeros_like(slots))
+        return slots, live
+
+    def _materialize_in_place(self, slots, steps) -> None:
+        """`replayssm_materialize` over every layer of `slots` in one launch."""
+        runner = self.model_runner
+        layers, num_slots = runner.mamba_v_cache.shape[:2]
+        # Layer-major caches flatten to one (layer, slot) row axis.
+        rows = (
+            torch.arange(layers, device=slots.device)[:, None] * num_slots + slots
+        ).flatten()
+        replayssm_materialize(
+            *(
+                c.view(layers * num_slots, *c.shape[2:])
+                for c in (
+                    runner.mamba_v_cache,
+                    runner.replayssm_buf_k,
+                    runner.replayssm_buf_u,
+                    runner.replayssm_buf_g,
+                )
+            ),
+            runner.replayssm_write_pos.repeat(layers),
+            rows,
+            rows,
+            steps.repeat(layers),
+            self.replayssm_max_query_len,
+        )
 
     def warmup_per_req_cache(self) -> None:
         """Run one checkpoint copy now, so the first real one is only a copy.
@@ -1043,6 +1091,12 @@ class GDNStateMixin(PoolRowsMixin):
             self._page_unit_bases([list(range(spec.units_per_checkpoint))]),
         )
         launch_copy_descriptor(staging.upload(0, plan.num_spans), plan)
+        if self.replayssm and not self._is_kda():
+            # Compile the store-time fold too; step -1 writes nothing.
+            idx = torch.zeros(
+                1, dtype=torch.int64, device=self.model_runner.mamba_v_cache.device
+            )
+            self._materialize_in_place(idx, idx - 1)
 
     def state_entry_views(self, slot: int) -> list[torch.Tensor]:
         """One contiguous slice per (cache, layer) — the slot's whole state.
