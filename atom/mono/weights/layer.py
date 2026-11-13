@@ -145,8 +145,8 @@ def linear_bf16_rows(
 
     weight = linear.weight
     _need(
-        getattr(getattr(linear, "quant_type", None), "name", None) == "No"
-        and getattr(linear, "params_dtype", None) == torch.bfloat16
+        linear.quant_type.name == "No"
+        and linear.params_dtype == torch.bfloat16
         and weight.dtype == torch.bfloat16,
         f"{name} must be unquantized BF16",
     )

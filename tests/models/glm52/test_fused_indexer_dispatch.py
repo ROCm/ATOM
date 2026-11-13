@@ -360,6 +360,20 @@ def test_bf16_attention_builds_only_the_external_indexer_path(monkeypatch):
     assert {p["attention"] for p in runner._prepared.values()} == {bf16}
 
 
+def test_ranks_that_loaded_different_attention_formats_refuse_the_width(monkeypatch):
+    _RecordingOp.instances = []
+    monkeypatch.setattr(runner_mod, "_GlmLayerOp", _RecordingOp)
+    monkeypatch.setattr(runner_mod, "_GlmFusedLayerOp", _RecordingOp)
+    runner = _build_ready_runner(monkeypatch, fused_indexer_on=False)
+    # a peer's format code is above this rank's
+    monkeypatch.setattr(runner_mod, "group_max", lambda code, group: code + 1)
+    monkeypatch.setattr(runner_mod, "group_min", lambda code, group: code)
+    assert runner._build(rows=1) is False
+    assert 1 in runner._refused
+    assert runner._attention is None
+    assert runner._ops == {} and runner._weights == {}
+
+
 def test_build_forwards_query_length_and_block_table_stride_to_fused_op(monkeypatch):
     # C2/Important#2, at the _build -> _GlmFusedLayerOp boundary: the runner's
     # own query length and max_model_len // kv_cache_block_size must reach

@@ -18,7 +18,11 @@ from atom.models.glm52.mono.kernels.geometry_config import (
     AttentionWeight,
     glm5_tp_config,
 )
-from atom.models.glm52.mono.weights import attention_format, projection_weights
+from atom.models.glm52.mono.weights import (
+    attention_format,
+    layer_weights,
+    projection_weights,
+)
 from atom.mono.runtime.consensus import MonoUnsupported
 
 CFG = glm5_tp_config(4)
@@ -104,6 +108,11 @@ def test_ptpc_checkpoint_keeps_its_mapping():
 def test_other_attention_storage_is_refused(storage, why):
     with pytest.raises(MonoUnsupported, match=why):
         attention_format(_layer(**storage))
+
+
+def test_a_layer_stored_unlike_the_deployment_is_refused():
+    with pytest.raises(MonoUnsupported, match="attention is bf16_absorb_fp8"):
+        layer_weights(_layer(), 0, 4, attention=AttentionWeight.FP8_PTPC)
 
 
 def test_bf16_storage_the_kernel_cannot_read_in_place_is_refused():

@@ -36,7 +36,16 @@ from atom.mono.weights.layer import (
     linear_ptpc_fp8,
 )
 
-_PROJECTIONS = ("fused_qkv_a_proj", "q_b_proj", "o_proj")
+# Production's attention projections: the kernel tensor each feeds and its
+# logical (rows, cols) on a TP rank.
+_PROJECTIONS = {
+    "fused_qkv_a_proj": ("qkv_a", lambda cfg: (cfg.qkv_a_rows, cfg.hidden)),
+    "q_b_proj": (
+        "q_b",
+        lambda cfg: (cfg.local_heads * (cfg.nope_dim + cfg.pe_dim), cfg.q_lora),
+    ),
+    "o_proj": ("o", lambda cfg: (cfg.hidden, cfg.local_heads * cfg.v_dim)),
+}
 
 # ``indexer.wk_weights_proj`` packs two row blocks into one BF16 linear: the
 # first ``INDEX_DIM`` rows are the index-K projection (`w_index_k`), the next
@@ -380,10 +389,7 @@ def attention_format(layer) -> AttentionWeight:
     absorbed W_K / W_V per-tensor FP8; ``ATOM_MLA_ABSORB_BF16`` is refused."""
 
     attn = layer.self_attn
-    kinds = {
-        name: getattr(getattr(getattr(attn, name), "quant_type", None), "name", None)
-        for name in _PROJECTIONS
-    }
+    kinds = {name: getattr(attn, name).quant_type.name for name in _PROJECTIONS}
     need(len(set(kinds.values())) == 1, f"attention projections mix formats {kinds}")
     impl = attention_impl(layer)
     need(
@@ -400,11 +406,6 @@ def attention_format(layer) -> AttentionWeight:
 def projection_weights(attn, cfg, attention: AttentionWeight) -> dict:
     """q_a / kv_a, q_b and W_o in the storage production holds them in."""
 
-    shapes = {
-        "fused_qkv_a_proj": (cfg.qkv_a_rows, cfg.hidden),
-        "q_b_proj": (cfg.local_heads * (cfg.nope_dim + cfg.pe_dim), cfg.q_lora),
-        "o_proj": (cfg.hidden, cfg.local_heads * cfg.v_dim),
-    }
     # q_a and kv_a lead fused_qkv_a; a layer that folds in its indexer's wk /
     # weights_proj appends them after, where the kernel never reads.
     need(
@@ -412,7 +413,8 @@ def projection_weights(attn, cfg, attention: AttentionWeight) -> dict:
         f"fused_qkv_a split {attn.qkv_a_split}",
     )
     tensors = {}
-    for (name, (rows, cols)), key in zip(shapes.items(), ("qkv_a", "q_b", "o")):
+    for name, (key, shape) in _PROJECTIONS.items():
+        rows, cols = shape(cfg)
         linear = getattr(attn, name)
         if attention is AttentionWeight.FP8_PTPC:
             tensors[f"w_{key}"], tensors[f"s_{key}"] = linear_ptpc_fp8(

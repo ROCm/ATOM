@@ -1058,9 +1058,8 @@ def build_glm5_monokernel(
             return ("bf16", wv, None, b_word + (lane // 16) * 4)
 
         def unit_attention(
-            w_rsrc, s_rsrc, rg, kc, NKC, K, BK, b_word, ln=None, scale_rows=SCALE_BM, coef=None, absorbed=False
+            w_rsrc, s_rsrc, rg, kc, NKC, K, BK, b_word, ln=None, scale_rows=SCALE_BM, coef=None, ptpc=attention_ptpc
         ):
-            ptpc = absorb_ptpc if absorbed else attention_ptpc
             if const_expr(attention_bf16 and not ptpc):
                 if const_expr(attention_bf16_rows):
                     return unit_bf16_rows(w_rsrc, rg, kc, K, b_word, ln)
@@ -1184,8 +1183,8 @@ def build_glm5_monokernel(
                 value = (index == i).select(values[i], value)
             return value
 
-        def attention_b_word(element, absorbed=False):
-            return element // 4 if const_expr(absorb_ptpc if absorbed else attention_ptpc) else element // 2
+        def attention_b_word(element, ptpc=attention_ptpc):
+            return element // 4 if const_expr(ptpc) else element // 2
 
         def emit_ptpc(stride, row_base, scale_rsrc, x_scales):
             def f(rl, n, v):
@@ -2109,7 +2108,7 @@ def build_glm5_monokernel(
                     UK_NKC,
                     NOPE_DIM,
                     64,
-                    attention_b_word(n_sel() * NOPE_DIM + c * 64, absorbed=True),
+                    attention_b_word(n_sel() * NOPE_DIM + c * 64, ptpc=absorb_ptpc),
                     coef=(
                         (
                             lambda: pick(
@@ -2119,7 +2118,7 @@ def build_glm5_monokernel(
                         if const_expr(absorb_ptpc)
                         else None
                     ),
-                    absorbed=True,
+                    ptpc=absorb_ptpc,
                 )
 
             pre = [u_uk(c) for c in range(UK_NKC)]
@@ -3118,10 +3117,10 @@ def build_glm5_monokernel(
                         UV_NKC,
                         KV_LORA,
                         128,
-                        attention_b_word(kc * 64, absorbed=True),
+                        attention_b_word(kc * 64, ptpc=absorb_ptpc),
                         scale_rows=uv_scale_rows,
                         coef=((lambda: lds_ld(misc, N_SPLIT + 2 + kc // 2)) if const_expr(absorb_ptpc) else None),
-                        absorbed=True,
+                        ptpc=absorb_ptpc,
                     )
 
                 pre = [u_uvh(c) for c in range(UVH_UNITS)]
@@ -3216,10 +3215,10 @@ def build_glm5_monokernel(
                         UV_NKC,
                         KV_LORA,
                         128,
-                        attention_b_word(kc * 64, absorbed=True),
+                        attention_b_word(kc * 64, ptpc=absorb_ptpc),
                         scale_rows=uv_scale_rows,
                         coef=((lambda: lds_ld(misc, N_SPLIT + 2 + kc // 2)) if const_expr(absorb_ptpc) else None),
-                        absorbed=True,
+                        ptpc=absorb_ptpc,
                     )
 
                 pre = [u_uv(c) for c in range(UV_UNITS)]
