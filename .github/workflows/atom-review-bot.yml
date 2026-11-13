@@ -196,7 +196,6 @@ jobs:
             -X POST -H "Authorization: token $ATOM_BOT_TOKEN" \
             -H 'Accept: application/vnd.github+json' \
             "https://api.github.com/repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
-<<<<<<< HEAD
             -d '{"content":"eyes"}') || true   # `|| true` AFTER the assignment, not inside
           # the substitution: the step runs under `bash -e`, so an unguarded `code=$(curl ...)`
           # aborts it on a connection failure (exit 7) -- and this step must never fail the
@@ -207,7 +206,6 @@ jobs:
           else
             echo "::warning title=atom-review-bot::could not claim 👀 as the bot (HTTP $code): $(head -c 300 /tmp/eyes.json 2>/dev/null)"
           fi
->>>>>>> fe7e6110 (review-pr: simplify the notify-proof change; selftest now runs _notify_test)
 
       - name: Review (headless GLM)
         id: review
