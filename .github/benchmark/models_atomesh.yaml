@@ -1295,6 +1295,7 @@ models:
               ATOM_PP_MAX_INFLIGHT: "16"
               OFFLOAD_COPY_WORKERS: "2"
               OFFLOAD_LOAD_WORKERS: "2"
+              ATOM_PD_MLA_STAGING: "0"
             decode: *kimi_k3_pd_opus_decode_env
           # C72's GSM8K gates OPUS, which this decode runs as C72's does, at a
           # larger batch.
