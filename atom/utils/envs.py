@@ -714,7 +714,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # A GDN prefill zeroes the speculative tail of its slots' conv window, which
     # it neither reads nor writes, so no checkpoint image carries stale bytes.
     "ATOM_GDN_ZERO_DEAD_CONV": lambda: os.getenv("ATOM_GDN_ZERO_DEAD_CONV", "1") == "1",
-
     # Qwen3-Next / Qwen3.5 GDN prefill without speculative tokens (64 tokens or
     # more): the chunk KKT kernel computes the gates g and beta of its key
     # head's value heads from the in_proj rows, in place of the
@@ -724,7 +723,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # vectors (w, u) from the Gluon kernel fused_inverse_recompute_gfx1250
     # instead of the Triton fused_inverse_recompute. Off by default.
     "ATOM_GDN_GLUON_INVERSE": lambda: os.getenv("ATOM_GDN_GLUON_INVERSE", "0") == "1",
-
     # gfx1250 GDN prefill state walk (chunk_h): the four operand copies of a
     # chunk as two fused TDM loads, k^T's operand read before the first product.
     "ATOM_GDN_CHUNK_H_PAIRED_LOADS": lambda: (
@@ -736,7 +734,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_GDN_CHUNK_O_FAST_NORM": lambda: (
         os.getenv("ATOM_GDN_CHUNK_O_FAST_NORM", "0") == "1"
     ),
-
     # Both zeroings above in one Triton launch each (`pool_layout/zero_spans.py`)
     # instead of an `index_fill_` per pool field -- per field AND per layer once
     # a pool passes 2 GiB, each writing a byte a lane. The same bytes zeroed,
@@ -1209,7 +1206,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # A step that writes state checkpoints, or holds more prefill requests than
     # ATOM_GDN_GRAPH_MAX_SEQS, runs eagerly as before. 0 keeps every GDN
     # prefill eager.
-    "ATOM_GDN_PREFILL_IN_GRAPH": lambda: os.getenv("ATOM_GDN_PREFILL_IN_GRAPH", "1") == "1",
+    "ATOM_GDN_PREFILL_IN_GRAPH": lambda: os.getenv("ATOM_GDN_PREFILL_IN_GRAPH", "1")
+    == "1",
     # Drain the compute stream before a step's state maintenance copies
     # (checkpoint stores / restores, slot relocations). 1 (the default) keeps
     # the host from running ahead of the GPU across them; see
@@ -1442,6 +1440,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_MTP_DRAFT_PRESENCE_PENALTY": lambda: _flag_env(
         "ATOM_MTP_DRAFT_PRESENCE_PENALTY", "0"
     ),
+    # Speculative rejection sampling (model_ops/spec_rejection.py, TP1 draft LM
+    # head): the draft passes draw their tokens from the draft head's
+    # distribution q with the verify's sampler (aiter topk_topp_sample: top
+    # ATOM_MTP_RS_DRAFT_TOPK logits, the request's temperature and top-p, the draft
+    # presence penalty in its kernel) and keep its record of q; a verify row
+    # accepts its draft with min(1, p/q) and otherwise draws from max(0, p - q),
+    # p the official sampler's own distribution. Exact like the default rule
+    # (draft = argmax, kept when the target's own sample equals it); more drafts
+    # stand when q is close to p. Verify steps the fused sampler does not serve,
+    # or with top_k not an int <= ATOM_MTP_RS_MAX_TOPK (at most 64), keep the
+    # default rule (still exact with sampled drafts).
+    "ATOM_MTP_REJECTION_SAMPLING": lambda: _flag_env(
+        "ATOM_MTP_REJECTION_SAMPLING", "0"
+    ),
+    "ATOM_MTP_RS_DRAFT_TOPK": lambda: int(os.getenv("ATOM_MTP_RS_DRAFT_TOPK", "20")),
+    "ATOM_MTP_RS_MAX_TOPK": lambda: int(os.getenv("ATOM_MTP_RS_MAX_TOPK", "64")),
     # The MTP draft passes' LM head from a 128x128-block FP8 (e8m0 scales) copy of
     # the head (TP1): half the bytes a pass. The verify rows keep the bf16 head, so
     # only how often drafts are accepted can change, not the output distribution.

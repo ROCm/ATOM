@@ -428,11 +428,15 @@ class ParallelLMHead(VocabParallelEmbedding):
         # (the logits from the FP8 copy of this head). Either needs written logits.
         draft_presence = getattr(self, "draft_presence", None)
         draft_fp8 = getattr(self, "draft_fp8", None)
-        if (draft_presence is not None or draft_fp8 is not None) and not getattr(
-            get_forward_context().context, "is_draft", False
-        ):
-            draft_presence = draft_fp8 = None
-        draft_options_off = draft_presence is None and draft_fp8 is None
+        # ATOM_MTP_REJECTION_SAMPLING: the draft is drawn from q, not its argmax.
+        draft_rs = getattr(self, "spec_rs", None)
+        if (
+            draft_presence is not None or draft_fp8 is not None or draft_rs is not None
+        ) and not getattr(get_forward_context().context, "is_draft", False):
+            draft_presence = draft_fp8 = draft_rs = None
+        draft_options_off = (
+            draft_presence is None and draft_fp8 is None and draft_rs is None
+        )
         # Pure-DP draft: shard the vocab across the DP group instead of a
         # replicated full-vocab GEMM. Skip plugin mode -- its caller decides the
         # collective count per chunk (a mismatch would deadlock DP) -- and skip
@@ -495,6 +499,13 @@ class ParallelLMHead(VocabParallelEmbedding):
             # `tie="low"` keeps the lowest-index pick promised above; `logits`
             # stays bf16, since the reduction widens as it reads.
             rows, width = logits.shape
+            if draft_rs is not None:
+                # The verify's sampler draws the draft, the draft presence
+                # penalty applied in its kernel (no separate vocab pass).
+                draft_rs.sample_draft(logits, out, draft_presence)
+                if draft_presence is not None:
+                    draft_presence.record(out)
+                return out
             if draft_presence is not None:
                 draft_presence.apply(logits)
             if not self._argmax_row_lens or self._argmax_row_lens[-1].numel() < rows:
@@ -513,9 +524,10 @@ class ParallelLMHead(VocabParallelEmbedding):
             if draft_presence is not None:
                 draft_presence.record(out)
             return out
-        assert (
-            draft_options_off
-        ), "ATOM_MTP_DRAFT_PRESENCE_PENALTY / _LM_HEAD_FP8 serve the TP1 LM head only"
+        assert draft_options_off, (
+            "ATOM_MTP_DRAFT_PRESENCE_PENALTY / _LM_HEAD_FP8 / ATOM_MTP_REJECTION_SAMPLING"
+            " serve the TP1 LM head only"
+        )
         if envs.ATOM_ARGMAX_HEAD_AR_GATHER and out.is_contiguous():
             # The packs' all-gather as an exact all-reduce of their byte images
             # (lm_head_argmax.py): the plain all-reduce is the cheaper collective

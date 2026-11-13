@@ -936,6 +936,8 @@ class ModelRunner:
         # presence_penalty: per-request generated-token masks, made on first use
         self._presence_state: PresencePenaltyState | None = None
         self._presence_step: PresencePenaltyStep | None = None
+        # ATOM_MTP_REJECTION_SAMPLING (`spec_rejection.SpecRejectionSampling`)
+        self._spec_rs = None
         self.arange_np = np.arange(
             max(
                 self.config.max_num_seqs + 1,
@@ -990,6 +992,8 @@ class ModelRunner:
                 self._install_draft_presence_penalty()
             if envs.ATOM_MTP_DRAFT_LM_HEAD_FP8:
                 self._install_draft_lm_head_fp8()
+            if envs.ATOM_MTP_REJECTION_SAMPLING:
+                self._install_spec_rejection_sampling()
             # A block drafter's width reads the loaded draft model's window.
             self.tokenID_processor.draft_tokens_per_seq = (
                 self.drafter.draft_tokens_per_seq
@@ -3495,6 +3499,50 @@ class ModelRunner:
             mtp_k,
         )
 
+    def _install_spec_rejection_sampling(self) -> None:
+        """ATOM_MTP_REJECTION_SAMPLING: sampled MTP drafts and the min(1, p/q)
+        verify (`spec_rejection.SpecRejectionSampling`); TP1 draft LM heads."""
+        from atom.model_ops.spec_rejection import SpecRejectionSampling
+
+        drafter = getattr(self, "drafter", None)
+        head = getattr(getattr(drafter, "model", None), "lm_head", None)
+        mtp_k = getattr(drafter, "mtp_k", 0)
+        if head is None or not hasattr(head, "compute_argmax_token") or mtp_k <= 0:
+            logger.warning(
+                "ATOM_MTP_REJECTION_SAMPLING: no MTP draft LM head; not applied"
+            )
+            return
+        if getattr(head, "tp_size", 1) != 1 or get_tp_group().world_size != 1:
+            logger.warning(
+                "ATOM_MTP_REJECTION_SAMPLING: TP %d; not applied (TP1 only)",
+                getattr(head, "tp_size", 1),
+            )
+            return
+        sizes = self.config.compilation_config.cudagraph_capture_sizes or []
+        rows = max([self.config.max_num_seqs, *sizes])
+        vocab = head.num_embeddings_per_partition
+        rs = SpecRejectionSampling(
+            max_rows=rows,
+            mtp_k=mtp_k,
+            max_num_seqs=self.config.max_num_seqs,
+            device=self.device,
+            draft_k=envs.ATOM_MTP_RS_DRAFT_TOPK,
+            max_k=envs.ATOM_MTP_RS_MAX_TOPK,
+        )
+        rs.warm(vocab, draft_presence=getattr(head, "draft_presence", None))
+        head.spec_rs = rs
+        drafter.spec_rs = rs
+        self._spec_rs = rs
+        logger.info(
+            "ATOM_MTP_REJECTION_SAMPLING: drafts drawn from q (top %d), verify "
+            "min(1, p/q) for top_k <= %d (%d rows, %d drafts, %d slots)",
+            rs.draft_k,
+            rs.max_k,
+            rows,
+            mtp_k,
+            rs.num_slots,
+        )
+
     def _greedy_ids_step(self, batch: ScheduledBatch | None, all_greedy: bool) -> bool:
         """Whether this step's LM head may hand back argmax ids instead of logits.
 
@@ -3549,8 +3597,10 @@ class ModelRunner:
         ):
             return 0
         head = self._greedy_lm_head()
-        if head is None or head.tp_size <= 1 or not hasattr(
-            head, "compute_topk_candidates"
+        if (
+            head is None
+            or head.tp_size <= 1
+            or not hasattr(head, "compute_topk_candidates")
         ):
             return 0
         return k
@@ -3614,6 +3664,17 @@ class ModelRunner:
         filters as the two calls, independent noise per row as both had."""
         rows = target_logits_indices.numel()
         device = target_logits_indices.device
+        rs = getattr(self, "_spec_rs", None)
+        if rs is not None and rs.applies(logits, top_ks, top_ps):
+            # ATOM_MTP_REJECTION_SAMPLING: each verify row's min(1, p/q) decision
+            # as its target token, and the bonus rows' draws (TP1, no broadcast).
+            return rs.verify(
+                logits,
+                get_forward_context().spec_decode_metadata,
+                temperatures,
+                top_ks,
+                top_ps,
+            )
         if isinstance(logits, torch.Tensor) and fused_topk_topp_applicable(
             logits, top_ks, top_ps
         ):
@@ -3807,7 +3868,10 @@ class ModelRunner:
             logger.info(
                 "ATOM_GLUE_STEP_SAMPLE: verify sampling in the step kernel "
                 "(rank %d, top_k %d, %d candidates a shard, shard top-k %s)",
-                self.rank, top_k, cands.k, envs.ATOM_GLUE_SHARD_TOPK,
+                self.rank,
+                top_k,
+                cands.k,
+                envs.ATOM_GLUE_SHARD_TOPK,
             )
         step = self._presence_step
         out, verdict, nxt = self._glue_sampler.sample(
@@ -3825,16 +3889,25 @@ class ModelRunner:
         )
         if envs.ATOM_GLUE_CHECK and get_tp_group().world_size > 1:
             # every rank must have drawn the same tokens: compare, else take rank 0's
-            mine = torch.stack([out.to(torch.int64).sum(), verdict.to(torch.int64).sum()])
+            mine = torch.stack(
+                [out.to(torch.int64).sum(), verdict.to(torch.int64).sum()]
+            )
             ref = broadcast_from_rank0(mine.contiguous(), get_tp_group())
             if not torch.equal(mine, ref):
                 logger.error(
                     "ATOM_GLUE_CHECK: rank %d sampled differently from rank 0 "
-                    "(%s vs %s); taking rank 0's tokens", self.rank, mine.tolist(), ref.tolist()
+                    "(%s vs %s); taking rank 0's tokens",
+                    self.rank,
+                    mine.tolist(),
+                    ref.tolist(),
                 )
                 out = broadcast_from_rank0(out.contiguous(), get_tp_group())
                 verdict = broadcast_from_rank0(verdict.contiguous(), get_tp_group())
-                nxt = torch.gather(out, 1, verdict[0].view(-1, 1).long()).view(-1).to(torch.int32)
+                nxt = (
+                    torch.gather(out, 1, verdict[0].view(-1, 1).long())
+                    .view(-1)
+                    .to(torch.int32)
+                )
         return out, verdict, nxt
 
     @_profile_runner_stage
@@ -3852,6 +3925,11 @@ class ModelRunner:
     ) -> ScheduledBatchOutput:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
         bs = batch.total_seqs_num
+        spec_rs = getattr(self, "_spec_rs", None)
+        if spec_rs is not None:
+            # This step's requests: their draft records for the verify below and
+            # the draft passes after it, and the passes' sampling parameters.
+            spec_rs.stage_step(batch.req_ids[:bs], temperatures, top_ps)
         # Set when the sampled tokens are already identical on every TP rank.
         tokens_tp_synced = False
         # ATOM_GLUE_STEP_SAMPLE's kernel or the fused verify epilogue
@@ -3911,7 +3989,9 @@ class ModelRunner:
             elif isinstance(logits, GreedyTokenIds):
                 # All-greedy: the head already reduced every row to its argmax,
                 # which is what the greedy sampler and verify would take.
-                bonus_token_ids = torch.index_select(logits.ids, 0, bonus_logits_indices)
+                bonus_token_ids = torch.index_select(
+                    logits.ids, 0, bonus_logits_indices
+                )
                 target_token_ids = torch.index_select(
                     logits.ids, 0, target_logits_indices
                 )
