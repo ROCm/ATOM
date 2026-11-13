@@ -39,6 +39,7 @@ from atom.models.minimax_m3.mono.config import (
     ONE_INDEX_HEAD,
     PAGE16,
     ROTARY_DIM,
+    SPARSE_BLOCK,
     TP,
     IndexHeads,
     qkv_rows,
@@ -53,6 +54,7 @@ from atom.models.minimax_m3.mono.kernels.common import (
     per_token_fp8_scale,
 )
 from atom.models.minimax_m3.mono.kernels.index_score import (
+    cp_gate,
     emit_index_scores,
     index_scale_log2e,
     q_frag_from,
@@ -85,7 +87,7 @@ from atom.mono.device.ops import (
 )
 from atom.mono.device.stamps import stamp as stamp_point
 from atom.mono.device.stamps import stamp_begin, stamp_flush
-from atom.mono.device.sync import Addr, Mailbox, publish, sreg
+from atom.mono.device.sync import Addr, Mailbox, preg, publish, sreg
 from atom.mono.plan.build_key import key_tuple, symbol_params
 from atom.mono.plan.execution import BLOCKS, THREADS, WAVES
 from atom.mono.plan.trace import Space, enter_stage
@@ -226,6 +228,7 @@ def emit_pre_attn(
     x8s_mb, stamp, eps, tokens, heads, ptrs, signal=None, long_step=None,
     index_topk=True, dense=False, plain_norm=False, kv_nvfp4=False, index_nvfp4=False,
     strip=(), attn_mxfp8=False, xsc=None, xsc_mb=None, pipe=False, copy_batch=MXFP8_COPY_BATCH,
+    cp=None,
 ):  # fmt: skip
     """K1's body: the GEMV tasks (ROWS_PER_TASK of the ``heads`` projection's rows
     each: the rank's own on CTAs 0 .. ONE_GEMV, its other index q heads' on CTAs
@@ -246,12 +249,16 @@ def emit_pre_attn(
     ``[rows, HIDDEN / 32]``): the norm's bf16 output is quantized per 32 elements (E8M0
     ceil-pow2 code, the native linear's ``quantize_fp8``), the codes 4 to a word in LDS
     ``xsc`` (row pitch ``XSCB_ROW``; S > 2 handed over through ``xsc_mb``), and the GEMV
-    is one scaled 16x16x128 MFMA per 128 k, no per-token / per-row scale after it."""
+    is one scaled 16x16x128 MFMA per 128 k, no per-token / per-row scale after it.
+    ``cp`` (BIG, indexer context parallelism, ``emit_k1``): (peer_addr, sym, rank, the ``iq_x`` region's
+    offset, rows a region holds, ``cp_rows`` -> per lane: row k's request is context-parallel): the index-q
+    head task of such a row pushes its q to the other ranks and takes theirs, so ``iq_out`` holds
+    [row][head] when its done flag is out."""
     assert not (dense and kv_nvfp4)
     assert not (dense and attn_mxfp8)
     rows = heads.rows
     BIG = tokens > MAX_TOKENS  # token groups of TG rows (``k1_roles``)
-    assert not BIG or (heads.count == 1 and not dense), "one index head, no dense K1"
+    assert not BIG or (heads.count in (1, TP) and not dense), "no dense K1"
     # ``pipe`` (BIG, ``attn_mxfp8``): every row's norm task awaited once, up front (a flag a
     # thread), and a group's x8 rows loaded into registers while the group before it is in its MFMAs
     pipe = pipe and BIG and attn_mxfp8
@@ -474,7 +481,7 @@ def emit_pre_attn(
         ),
     )
     gemv = bid < (ONE_GEMV if index_topk else own_q)
-    if const_expr(heads.count > 1 and index_topk):
+    if const_expr(heads.count > 1 and index_topk and not BIG):
         xt = bid - XT0
         if (xt >= 0) & (xt < OTHER_GEMV):
             other = xt // HEAD_ROW_GROUPS  # the other heads in head order, own skipped
@@ -844,6 +851,11 @@ def emit_pre_attn(
         # without index_topk the index heads' rows are not made: their tasks
         # only publish their flags
         live = (tk < tokens) if index_topk else (tk < tokens) & (ht < IQ_TASK)
+        if const_expr(cp is not None):
+            # which of this wave's tokens' requests are context-parallel (loads out before the waits)
+            cp_row = lane_gather(
+                cp[5]().select(fx.Int32(1), fx.Int32(0)), fx.min(tk, tokens - 1)
+            ) != 0
         if live:
             d0 = l32 * ELEMS
             # slot_mapping is int64: this token's low word
@@ -917,10 +929,48 @@ def emit_pre_attn(
                     bo.buffer_store(
                         fx.Vector.from_elements(out, fx.Float32).to(fx.BFloat16),
                         rsrc(iq_out),
-                        tk * HEAD_DIM + d0,
+                        # (``cp``: iq_out is [row][head], this rank's head at its rank)
+                        tk * HEAD_DIM + d0
+                        if cp is None
+                        else (tk * TP + cp[2]) * HEAD_DIM + d0,
                         # BIG: the score tasks of other CTAs read it (``q_frag_from``)
                         cache_modifier=cm_out if BIG else 0,
                     )
+                if const_expr(cp is not None):  # noqa: SIM102
+                    if is_iq & cp_row:
+                        # the other ranks' q of this row: push ours (a pair a word) to each, then poll
+                        # theirs (every rank pushes before it polls: an exchange) into iq_out
+                        cpq_peer, cpq_sym, cpq_rk, cpq_off, cpq_cap = cp[:5]
+                        cpq_words = [
+                            bf16_pair(out[0], out[1]).bitcast(fx.Int32),
+                            bf16_pair(out[2], out[3]).bitcast(fx.Int32),
+                        ]
+                        for cj in range_constexpr(TP - 1):
+                            cpq_other = (cpq_rk + 1 + cj) % TP
+                            mb_put_words(
+                                preg(cpq_peer(cpq_other), cpq_off, "iq_x"),
+                                (cpq_rk * cpq_cap + tk) * (HEAD_DIM // 2) + l32 * 2,
+                                cpq_words,
+                            )
+                        cpq_got = mb_poll(
+                            [
+                                (
+                                    preg(cpq_sym, cpq_off, "iq_x"),
+                                    (((cpq_rk + 1 + cj) % TP * cpq_cap + tk) * (HEAD_DIM // 2) + l32 * 2),
+                                    2,
+                                )
+                                for cj in range_constexpr(TP - 1)
+                            ]
+                        )
+                        for cj in range_constexpr(TP - 1):
+                            bo.buffer_store(
+                                fx.Vector.from_elements(
+                                    [cpq_got[cj][0], cpq_got[cj][1]], fx.Int32
+                                ),
+                                rsrc(iq_out),
+                                ((tk * TP + (cpq_rk + 1 + cj) % TP) * HEAD_DIM + d0) // 2,
+                                cache_modifier=cm_out,
+                            )
                 if is_k:
                     if const_expr(kv_nvfp4):
                         if slot >= 0:
@@ -1006,7 +1056,7 @@ def emit_k1(
     q_len, init_blocks, local_blocks, heads, ptrs, bt_width, signal=False, diag=None,
     region_ids=None, index_topk=True, dense=False, plain_norm=False, kv_nvfp4=False,
     index_nvfp4=False, skip=(), strip=(), attn_mxfp8=False, xsc=None, pipe=False,
-    score_sleep=1, copy_batch=MXFP8_COPY_BATCH,
+    score_sleep=1, copy_batch=MXFP8_COPY_BATCH, cp=None,
 ):  # fmt: skip
     """K1 whole: the GEMV / head / norm tasks, then every CTA's indexer scores
     (``index_topk``; else the layer reuses a selection: no index q / k, no scores).
@@ -1019,7 +1069,9 @@ def emit_k1(
     ``index_nvfp4``: the K/V pool / index cache hold NVFP4 pages (``emit_pre_attn``);
     the scores read them with the dims in the order the dequantized tile has.
     ``attn_mxfp8``: native MXFP8 1x32 qkv (``emit_pre_attn``); ``xsc``: the codes' LDS,
-    ``tokens * XSC_ROW`` words."""
+    ``tokens * XSC_ROW`` words. ``cp`` (BIG; indexer context parallelism by exchanging the index
+    q): (peer_addr, sym, rank, ``iq_x`` offset, rows a region holds, (min_blocks, min_batch)): the requests ``cp_gate`` picks are scored on this rank's quarter of the
+    blocks for every head."""
     (
         ar, res, h_out, g_in, w_qkv, s_qkv, g_q, g_k, g_iq, g_ik, cos_sin, positions,
         slot_mapping, k_cache, v_cache, k_scale, v_scale, index_cache, q_out, iq_out,
@@ -1101,6 +1153,27 @@ def emit_k1(
         head (indexer context parallelism)."""
         return step_rows(seq_lens, tokens, q_len, heads).any_long()
 
+    cp_pre = None
+    if const_expr(cp is not None):
+        assert tokens > MAX_TOKENS, "BIG context parallelism"
+
+        def cp_rows():
+            """Lane k (row k): its request is context-parallel in this step (``cp_gate``)."""
+            seq_k = fx.max(
+                fx.Int32(
+                    bo.buffer_load(
+                        rsrc(seq_lens), fx.min(lane, tokens - 1), vec_width=1, dtype=T.i32
+                    )
+                ),
+                1,
+            )
+            last_k = (lane < tokens) & (fx.Int32(lane) % q_len == q_len - 1)
+            return cp_gate(
+                (seq_k + SPARSE_BLOCK - 1) // SPARSE_BLOCK, last_k, lane, tokens, q_len, cp[5]
+            )  # cp[5]: (min_blocks, min_batch)
+
+        cp_pre = (cp[0], cp[1], cp[2], cp[3], cp[4], cp_rows)
+
     emit_pre_attn(
         tid, bid, lane, wave, x8, red, mb_put, mb_put_words, mb_poll, qkv_mb, x8_mb,
         x8s_mb, stamp, eps, tokens, heads,
@@ -1121,6 +1194,7 @@ def emit_k1(
         xsc_mb,
         pipe,
         copy_batch,
+        cp_pre,
     )  # fmt: skip
     stamp(5)
 
@@ -1142,7 +1216,15 @@ def emit_k1(
         if const_expr(tokens > MAX_TOKENS):
             # BIG: index q straight from the head tasks' ``iq_out`` (device scope), behind
             # one wait for every token's index-q head task, not rebuilt on every CTA
-            q_frag_g, q_frag_head_g = q_frag_from(iq_out, heads, index_nvfp4, CM_DEV)
+            if const_expr(cp is not None):  # iq_out is [row][head]: every rank's, this one's at its rank
+                q_frag_g, q_frag_head_g = q_frag_from(
+                    iq_out, IndexHeads(TP, 0), index_nvfp4, CM_DEV, own=cp[2]
+                )
+            else:
+                # iq_out [row][1] (the head tasks' own head: ``heads.count`` is the projection's width)
+                q_frag_g, q_frag_head_g = q_frag_from(
+                    iq_out, ONE_INDEX_HEAD, index_nvfp4, CM_DEV
+                )
 
             def wait_index_q(tk=None):
                 """Index q of the request ending at row ``tk`` (nvfp4: the scorer reads it with
@@ -1176,6 +1258,8 @@ def emit_k1(
                 block_table, seq_lens, bt_width, wait_new_keys if signal else None,
                 None, heads, q_frag_head_g, None, nvfp4=index_nvfp4, strip=strip,
                 wait_index_q=wait_index_q, stamp=stamp,
+                cp_rank=None if cp is None else cp[2],
+                cp_gate_args=(0, 1) if cp is None else cp[5],
             )  # fmt: skip
         else:
             emit_index_scores(

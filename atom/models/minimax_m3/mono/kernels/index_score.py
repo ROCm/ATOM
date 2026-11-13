@@ -32,6 +32,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, T, as_ir_value
 
 from atom.models.minimax_m3.mono.config import (
+    CP_MAX_Q,
     HEAD_DIM,
     LONG_FROM_BLOCKS,
     MAX_INDEX_BLOCKS,
@@ -261,12 +262,38 @@ def step_rows(seq_lens, tokens: int, q_len, heads: IndexHeads) -> StepRows:
     return StepRows(seq, n_blks, [nb > LONG_FROM_BLOCKS for nb in req_blks])
 
 
+def cp_gate(nb_k, last_k, lane, tokens, q_len, gate):
+    """BIG (lane k = row k; ``nb_k``: row k's blocks, ``last_k``: row k ends its request): lane k's
+    request is context-parallel in this step. Every consumer (the index-q exchange, the scorers,
+    the selection) evaluates this pure function of ``seq_lens`` / ``q_len``, and the ranks all read
+    the same ones, so they agree: a long request (> LONG_FROM_BLOCKS blocks, decided by its last
+    row) of a graph of >= ``min_batch`` requests (tokens // q_len, ATOM's batch) and of a step whose
+    long requests hold >= ``min_blocks`` blocks in all (0: every long request). ``gate``:
+    (min_blocks, min_batch)."""
+    min_blocks, min_batch = gate
+    last_of = fx.min(lane - lane % q_len + (q_len - 1), tokens - 1)
+    long_k = lane_gather(nb_k, last_of) > LONG_FROM_BLOCKS
+    total = readlane(
+        wave_incl_scan((last_k & long_k).select(nb_k, fx.Int32(0)), lane), 63
+    )
+    return (
+        (lane < tokens) & long_k & (total >= min_blocks)
+        & (tokens // q_len >= min_batch) & (q_len <= CP_MAX_Q)
+    )  # fmt: skip
+
+
+def own_first(rank, init_blocks):
+    """The first block >= init_blocks rank ``rank`` owns (block b is owned by b % TP); ``rank`` runtime."""
+    return init_blocks + (rank + TP - init_blocks % TP) % TP
+
+
 @traced
 def emit_index_scores(
     slot, lane, wave, red, mb_put, iscore, q_frag, tokens, q_len, init_blocks,
     local_blocks, scale, index_cache, block_table, seq_lens, bt_width,
     wait_new_keys=None, prepare=None, heads=ONE_INDEX_HEAD, q_frag_head=None,
     prepare_heads=None, nvfp4=False, strip=(), wait_index_q=None, stamp=None,
+    cp_rank=None, cp_gate_args=(0, 1),
 ):  # fmt: skip
     """This CTA's (``slot``) share of the step's score tasks: up to BLOCKS tasks,
     task u runs on CTA u, else on wave (u // BLOCKS) % WAVES of CTA u % BLOCKS
@@ -301,17 +328,22 @@ def emit_index_scores(
     context, block count and, for a request's last row, its task count, whose wave scan
     gives every request's first task; a lane decodes its task by a 6-step binary search
     over the scan (``lane_gather``). Wave-per-task mode only (the task counts of
-    these steps are not bounded by BLOCKS), one index head (no context parallelism), and
-    ``q_frag`` reads the index q the head tasks wrote, once ``wait_index_q`` says it is there:
-    an fp8 index cache's tasks are strided over the waves behind one wait for every row's q;
-    an nvfp4 one's (``score_big``) are contiguous runs of the plan's bulk blocks, then its
-    tail blocks, one run a wave, ``wait_index_q(tk)`` (the request ending at row tk) a request
-    of the run."""
+    these steps are not bounded by BLOCKS), and ``q_frag`` reads the index q the head tasks
+    wrote, once ``wait_index_q`` says it is there: an fp8 index cache's tasks are strided over
+    the waves behind one wait for every row's q; an nvfp4 one's (``score_big``) are contiguous
+    runs of the plan's bulk blocks, then its tail blocks, one run a wave, ``wait_index_q(tk)``
+    (the request ending at row tk) a request of the run. Context parallelism there
+    (``cp_rank``, this rank's runtime id: the K1 head tasks exchanged every head's q into
+    ``iq_out`` [row][head], ``q_frag_head`` reads it): the requests ``cp_gate`` selects
+    score this rank's blocks of every head (pair
+    ``k * MAX_INDEX_BLOCKS + h * (MAX_INDEX_BLOCKS / TP) + b / TP``), a second lane-resident
+    list; the other requests are the ordinary list."""
     assert local_blocks >= 1, "the block of the current token must be pinned"
     BIG = tokens > MAX_TOKENS
     assert not BIG or (
-        heads.count == 1 and prepare is None and wait_index_q is not None
+        heads.count in (1, TP) and prepare is None and wait_index_q is not None
     )
+    cp_big = BIG and cp_rank is not None
     l16 = lane % 16
     g4 = lane // 16
     # nvfp4: the per-task-wave paths look K up in a CTA table (built before them)
@@ -329,9 +361,18 @@ def emit_index_scores(
         )
         nb_k = (seq_k + SPARSE_BLOCK - 1) // SPARSE_BLOCK
         last_k = (lane < tokens) & (fx.Int32(lane) % q_len == q_len - 1)
-        n_scored_k = last_k.select(
-            scored_count(nb_k, init_blocks, local_blocks), fx.Int32(0)
-        )
+        scored_k = scored_count(nb_k, init_blocks, local_blocks)
+        if const_expr(cp_big):
+            cp = True
+            cp_k = cp_gate(nb_k, last_k, lane, tokens, q_len, cp_gate_args)
+            first_own = own_first(cp_rank, init_blocks)
+            own_k = fx.max(init_blocks + scored_k - first_own + TP - 1, 0) // TP
+            end_cp_k = wave_incl_scan((last_k & cp_k).select(own_k, fx.Int32(0)), lane)
+            start_cp_k = end_cp_k - (last_k & cp_k).select(own_k, fx.Int32(0))
+            total_cp = readlane(end_cp_k, 63)
+            n_scored_k = (last_k & ~cp_k).select(scored_k, fx.Int32(0))
+        else:
+            n_scored_k = last_k.select(scored_k, fx.Int32(0))
         if const_expr(nvfp4):
             # a request's TAIL blocks may hold keys this launch inserts (``new_keys_in``: within
             # MAX_TOKENS keys of the end), so they wait for them and a row's causal cut can fall
@@ -399,6 +440,15 @@ def emit_index_scores(
             tk = tk + (e <= u).select(fx.Int32(step), fx.Int32(0))
         b0 = init_blocks if first is None else lane_gather(first, tk)
         return tk, b0 + u - lane_gather(start, tk)
+
+    def task_block_big_cp(u):
+        """Task u (per lane) of the context-parallel list -> (the request's last row, its block
+        first_own + TP * the task's place in the request)."""
+        tk = fx.Int32(0)
+        for step in (32, 16, 8, 4, 2, 1):
+            e = lane_gather(end_cp_k, tk + (step - 1))
+            tk = tk + (e <= u).select(fx.Int32(step), fx.Int32(0))
+        return tk, first_own + TP * (u - lane_gather(start_cp_k, tk))
 
     def new_keys_in(tk, b):
         """Block b of the request ending at token tk may hold keys this launch
@@ -544,8 +594,14 @@ def emit_index_scores(
             prepare_heads()
         if const_expr(nvfp4):
             gpu.barrier()
+        if const_expr(
+            BIG
+        ):  # noqa: SIM102 -- every row's q of every head is in iq_out (the K1 exchange)
+            if slot + BLOCKS * wave < total_cp:
+                wait_index_q()
         tiles = range(KEY_TILES)
-        seq_lane = pick(seq, fx.min(lane, tokens - 1))  # lane k: token k's context
+        # lane k: token k's context
+        seq_lane = seq_k if BIG else pick(seq, fx.min(lane, tokens - 1))
         n_cols = TP * q_len
 
         def score_cp(tk, b, page):
@@ -556,7 +612,7 @@ def emit_index_scores(
             kw = split_tiles(load_raw(page, tiles), tiles, tab)
             # every pass unrolled, the unused ones skipped: a runtime pass loop
             # slowed the whole kernel's short contexts (S = 1, 3k: +0.6 us)
-            for p in range_constexpr(TP * MAX_TOKENS // 16):
+            for p in range_constexpr((TP * CP_MAX_Q if BIG else TP * MAX_TOKENS) // 16):
                 if p * 16 < n_cols:
                     f = p * 16 + l16
                     head = fx.min(f // q_len, TP - 1)
@@ -580,9 +636,11 @@ def emit_index_scores(
         step = BLOCKS * WAVES
         for c0 in range(slot + BLOCKS * wave, total_cp, step * 64):
             c0 = fx.Int32(c0)
-            tk_j, b_j = task_block(
-                fx.min(c0 + step * lane, total_cp - 1), pre_cp, first_own, TP
-            )
+            u_j = fx.min(c0 + step * lane, total_cp - 1)
+            if const_expr(BIG):
+                tk_j, b_j = task_block_big_cp(u_j)
+            else:
+                tk_j, b_j = task_block(u_j, pre_cp, first_own, TP)
             pages = page_of(tk_j, b_j)
             for i in range(fx.min((total_cp - c0 + step - 1) // step, 64)):
                 i = fx.Int32(i)
@@ -798,9 +856,10 @@ def emit_index_scores(
             emit_cp_tasks()
 
 
-def q_frag_from(iq, heads=ONE_INDEX_HEAD, nvfp4=False, cm=0):
+def q_frag_from(iq, heads=ONE_INDEX_HEAD, nvfp4=False, cm=0, own=None):
     """(``q_frag``, ``q_frag_head``) reading index q from memory: [token][head]
-    [HEAD_DIM] bf16, ``heads.count`` heads a token."""
+    [HEAD_DIM] bf16, ``heads.count`` heads a token; ``own``: this rank's head, if not
+    ``heads.own`` (a runtime rank)."""
 
     def q_frag_head(tk, s, head):
         lane = fx.thread_idx.x % 64
@@ -823,7 +882,7 @@ def q_frag_from(iq, heads=ONE_INDEX_HEAD, nvfp4=False, cm=0):
         ).bitcast(fx.BFloat16)
 
     def q_frag(tk, s):
-        return q_frag_head(tk, s, heads.own)
+        return q_frag_head(tk, s, heads.own if own is None else own)
 
     return q_frag, q_frag_head
 

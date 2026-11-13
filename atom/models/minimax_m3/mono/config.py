@@ -97,6 +97,9 @@ MAX_QKV_ROWS = qkv_rows(TP)
 # path (with every index head: context-parallel); up to it one CTA ranks every
 # block, one a thread (THREADS: a second a thread slows every context)
 LONG_FROM_BLOCKS = 512
+# context parallelism in the wide (BIG) builds: B columns of the scorer's MFMA = TP heads x q_len rows of a
+# request, two 16-column passes at most (``index_score.emit_index_scores``)
+CP_MAX_Q = 8
 
 
 @dataclass(frozen=True)

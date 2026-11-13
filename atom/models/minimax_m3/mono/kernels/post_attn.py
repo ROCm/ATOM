@@ -242,6 +242,13 @@ class K4Build:
     # 16 B load rounds of a token group's x8 copy (K1, front builds) that go out together: the whole
     # group (13 rounds) in flight hides the memory latency the copy is bound by
     copy_batch: int = 8
+    # indexer context parallelism in a BIG build (more than MAX_TOKENS rows): the requests ``cp_gate`` picks
+    # (long ones, in a step whose long requests hold >= ``cp_min_blocks`` blocks) are scored on this rank's
+    # quarter of the blocks for every head, the index q exchanged by K1's head tasks, the candidates by the
+    # selection (``sel_cp``); with the standard TP projection (``index_heads`` 1)
+    index_cp: bool = False
+    cp_min_blocks: int = 0
+    cp_min_batch: int = 1
 
 
 def build_post_attn_kernel(
@@ -282,6 +289,9 @@ def build_post_attn_kernel(
     pipe: bool = False,
     score_sleep: int = 1,
     copy_batch: int = 8,
+    index_cp: bool = False,
+    cp_min_blocks: int = 0,
+    cp_min_batch: int = 1,
 ):
     """``@flyc.jit`` launcher of K4 for one rank of an ``npes``-way TP group and a
     decode step of ``tokens`` (<= MAX_TOKENS) rows, ``q_len`` consecutive rows a
@@ -333,6 +343,9 @@ def build_post_attn_kernel(
         n_split == N_SPLIT // 2 and kv_nvfp4 and (front or moe_back)
     )
     assert not pipe or ((front or moe_back) and attn_mxfp8)
+    assert not index_cp or (
+        tokens > MAX_TOKENS and fuse_k1 and index_topk
+    ), "BIG context parallelism: a front / whole-layer build, K1 fused"
     key = K4Build(
         npes=npes, tokens=tokens, init_blocks=init_blocks, local_blocks=local_blocks,
         index_heads=heads.count, index_own=heads.own, timeline=timeline,
@@ -345,6 +358,7 @@ def build_post_attn_kernel(
         moe_a4w4=moe_a4w4,
         front=front, moe_back=moe_back, back_dn_depth=back_dn_depth, back_sh_units=back_sh_units, back_steal=back_steal, back_dn_split=back_dn_split, back_dn_bdepth=back_dn_bdepth,
         n_split=n_split, pipe=pipe, score_sleep=score_sleep, copy_batch=copy_batch,
+        index_cp=index_cp, cp_min_blocks=cp_min_blocks, cp_min_batch=cp_min_batch,
     )  # fmt: skip
     P = parse_probe(probe)
     build_key = key_tuple(key, SOURCES)  # the launcher references it: keyed
@@ -363,6 +377,7 @@ def build_post_attn_kernel(
             moe_a4w4,
             front,
             moe_back,
+            index_cp,
         )
     )
     W = npes
@@ -453,6 +468,12 @@ def build_post_attn_kernel(
         sym_extra["ss"] = score_sleep
     if copy_batch != 8:
         sym_extra["cb"] = copy_batch
+    if index_cp:
+        sym_extra["cp"] = 1
+        if cp_min_blocks:
+            sym_extra["cm"] = cp_min_blocks
+        if cp_min_batch != 1:
+            sym_extra["cn"] = cp_min_batch
     kernel_name = kernel_symbol(
         "minimax_m3_mono_layer" if fuse_k1 else "minimax_m3_post_attn",
         **symbol_params(key),
@@ -468,7 +489,7 @@ def build_post_attn_kernel(
     QS_CP = GT * (HIDDEN // 4 + (XSCB_ROW if attn_mxfp8 else 0))
     assert not attn_mxfp8 or QS_CP <= POOL, "K1's x8 rows + codes outgrow the pool"
     assert not attn_mxfp8 or GT * (O_ROW + OSC_ROW) <= POOL, "o_proj rows + codes"
-    assert not (fuse_k1 and heads.count > 1) or (
+    assert not (fuse_k1 and heads.count > 1 and not BIG) or (
         QS_CP + HEAD_DIM // 2 * tokens * heads.count <= POOL
     )
 
@@ -656,8 +677,18 @@ def build_post_attn_kernel(
                 ar_in, g_in, w_qkv, s_qkv, g_q, g_k, g_iq, g_ik, cos_sin, index_cache,
                 iq_out, scratch1,
             ) = [load_ptr64(k1_args, i) for i in range(len(K1_ARGS))]  # fmt: skip
+            k1_cp = None
+            if const_expr(index_cp):
+                k1_cp = (
+                    peer_addr,
+                    sym,
+                    rank,
+                    SY["iq_x"],
+                    ROWS,
+                    (cp_min_blocks, cp_min_batch),
+                )
             qs_k1 = lds.qs.ptr
-            if const_expr(ih_count > 1):
+            if const_expr(ih_count > 1 and not BIG):
                 qs_k1 = fpool + QS_CP
             emit_k1(
                 tid, bid, lane, wave, xs, red, qs_k1, k1_stamp, layer,
@@ -682,6 +713,7 @@ def build_post_attn_kernel(
                 pipe=pipe,
                 score_sleep=score_sleep,
                 copy_batch=copy_batch,
+                cp=k1_cp,
             )  # fmt: skip
             gpu.barrier()
             k1_mbox = Mailbox(layer, diag, REGION_IDS, P.skip)
