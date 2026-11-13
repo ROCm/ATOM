@@ -433,6 +433,7 @@ def knobs(
     ``LONG``; then ``over``; a knob still "auto" takes ``AUTO``'s value (the recipe resolves the rest: module
     docstring)."""
     entry = copy.deepcopy(_entry(SCHEDULES, kind, rows))
+    entry.update(_env_over(kind, rows))
     given = dict(over or {})
     long_from = given.get("IDX_LONG", "auto")
     if isinstance(long_from, str) and long_from == "auto":
@@ -451,6 +452,25 @@ def knobs(
     for n, v in AUTO.items():
         if isinstance(out[n], str) and out[n] == "auto":
             out[n] = v
+    return out
+
+
+def _env_over(kind: str, rows: int | None) -> dict:
+    """``ATOM_DSV41_MONO_HI_KNOBS`` (a tuning aid): a JSON dict of {"*" | kind | "kind@rows": {knob: value}}, applied
+    over the schedule's entry in that order (most specific last)."""
+    import json
+    import os
+
+    raw = os.environ.get("ATOM_DSV41_MONO_HI_KNOBS")
+    if not raw:
+        return {}
+    table = json.loads(raw)
+    out = {}
+    for key in ("*", kind.split(SPLIT)[0], kind, f"{kind}@{rows}"):
+        out.update(table.get(key, {}))
+    for n in out:
+        if n not in DEFAULT:
+            raise KeyError(f"ATOM_DSV41_MONO_HI_KNOBS: no V4.1 knob {n}")
     return out
 
 
