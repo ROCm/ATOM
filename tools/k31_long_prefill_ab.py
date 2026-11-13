@@ -9,8 +9,12 @@ to JSON. That token comes from the last chunk's logits, so it depends on every
 chunk and on nothing decode does.
 
 ``compare A.json B.json`` reports per prompt whether the greedy tokens match,
-how many top-20 ids the two share and the largest |delta logprob|, and exits 1
-when that delta exceeds --threshold anywhere.
+how many top-20 ids the two share and the largest |delta probability|, and
+exits 1 when that delta exceeds --threshold anywhere. Probability, not logprob:
+rounding moves top-20 tail logprobs at -10 to -25 by several nats. The default
+threshold holds only on text the model predicts near-certainly, such as
+``pydoc_data/topics.py``: where two tokens nearly tie, as in GSM8K, rounding
+alone moves their probability by up to 0.25.
 
 To run another tree, launch from its root with ``PYTHONPATH=<tree>``.
 """
@@ -18,6 +22,7 @@ To run another tree, launch from its root with ``PYTHONPATH=<tree>``.
 import argparse
 import hashlib
 import json
+import math
 import os
 import subprocess
 import sys
@@ -113,9 +118,9 @@ def top_of(record):
 
 
 def gap(top_a, top_b, token):
-    """|delta logprob| of one token, or the part of it the two top lists prove.
+    """|delta probability| of one token, or the part of it the two top lists prove.
 
-    A token missing from a list sits at or below that list's last logprob.
+    A token missing from a list sits at or below that list's last probability.
     """
     if token not in top_b:
         return max(0.0, top_a[token] - min(top_b.values()))
@@ -125,13 +130,13 @@ def gap(top_a, top_b, token):
 
 
 def compare(a, b):
-    """Per prompt: (greedy tokens match, shared top ids, max |delta logprob|)."""
+    """Per prompt: (greedy tokens match, shared top ids, max |delta probability|)."""
     if [p["sha256"] for p in a["prompts"]] != [p["sha256"] for p in b["prompts"]]:
         raise ValueError("the two runs were given different prompts")
     rows = []
     for pa, pb in zip(a["prompts"], b["prompts"]):
-        top_a = dict(zip(pa["top_ids"], pa["top_logprobs"]))
-        top_b = dict(zip(pb["top_ids"], pb["top_logprobs"]))
+        top_a = {t: math.exp(v) for t, v in zip(pa["top_ids"], pa["top_logprobs"])}
+        top_b = {t: math.exp(v) for t, v in zip(pb["top_ids"], pb["top_logprobs"])}
         delta = max(gap(top_a, top_b, t) for t in top_a.keys() | top_b.keys())
         rows.append(
             (pa["token"] == pb["token"], len(top_a.keys() & top_b.keys()), delta)
@@ -155,8 +160,8 @@ def main(argv=None):
     compare_parser.add_argument(
         "--threshold",
         type=float,
-        default=0.5,
-        help="Largest |delta logprob| that passes (default: %(default)s).",
+        default=0.01,
+        help="Largest |delta probability| that passes (default: %(default)s).",
     )
     args = parser.parse_args(argv)
     if args.command == "run":
@@ -168,7 +173,7 @@ def main(argv=None):
             runs.append(json.load(f))
     rows = compare(*runs)
     print(f"A {runs[0]['commit']}  B {runs[1]['commit']}")
-    print("prompt  offset  match  overlap  max|delta logprob|")
+    print("prompt  offset  match  overlap  max|delta p|")
     for i, (prompt, (match, overlap, delta)) in enumerate(
         zip(runs[0]["prompts"], rows)
     ):
