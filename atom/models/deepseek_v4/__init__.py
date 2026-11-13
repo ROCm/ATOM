@@ -78,6 +78,7 @@ from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
 )
 from atom.model_ops.communication_op import (
     tensor_model_parallel_all_reduce,
+    tensor_model_parallel_all_reduce_add,
 )
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.indexer import (
@@ -3044,13 +3045,17 @@ class MoE(nn.Module):
         shared: torch.Tensor | None,  # [num_tokens, dim] or None
         prefix: str = "",
     ) -> torch.Tensor:  # [num_tokens, dim]
-        """Add shared-expert contribution (when not fused into routed) and
-        all-reduce across TP ranks.
+        """Add the shared-expert contribution (when it is not already fused into
+        the routed output) and all-reduce across TP ranks.
+
+        At TP > 1 the shared-expert add is folded into that all-reduce.
         """
         if shared is not None:
             # Both on this rank's rows: the routed experts' PCP reduction
             # (ATOM_PCP_MOE_MERGE) happens inside FusedMoE, and the shared
             # expert, sharded by TP alone, never takes part in it.
+            if self.tp_size > 1:
+                return tensor_model_parallel_all_reduce_add(routed, shared)
             routed = routed + shared
         if self.tp_size > 1:
             # ATOM AR layer decides internally (via _tbo_aware_tp_reduce) whether

@@ -36,6 +36,7 @@ from atom.models.deepseek_v4_dspark import (
     _DSparkInner,
 )
 from atom.models.dspark_draft import DSparkDraftModel
+from atom.spec_decode.drafter import AuxCaptureSpec
 from atom.utils import envs
 
 from .attention import Attention
@@ -246,9 +247,7 @@ class DeepseekV41DSpark(DSparkDraftModel):
     def share_with_target(self, target_base, loaded=None):
         self.embed, self.head = target_base.embed, target_base.head
 
-    def target_aux_capture_spec(self, layer_ids, hidden_size):
-        from atom.spec_decode.drafter import AuxCaptureSpec
-
+    def target_aux_capture_spec(self, layer_ids, hidden_size, _target_layers=None):
         # Published taps (37, 38, 39) have no Engram. A block pre-hook at an
         # Engram layer would read before its injection, violating the checkpoint.
         if set(layer_ids).intersection(self.config.engram_layer_ids):
@@ -294,7 +293,7 @@ class DeepseekV41DSpark(DSparkDraftModel):
     def context_layers(self):
         return tuple(layer.attn for layer in self.mtp)
 
-    def write_context_kv(self, aux_concat, positions):
+    def write_context_kv(self, aux_concat, positions, slot_mapping=None):
         from atom.utils.forward_context import get_forward_context
 
         forward = get_forward_context()
