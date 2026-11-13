@@ -87,7 +87,7 @@ def mla_absorb_q_pack(
     assert q_nope.stride(-1) == 1 and w_k.stride(-1) == 1 and q_out.stride(-1) == 1
     if num_tokens == 0:
         return
-    block_m, block_n = 64, 128
+    block_m, block_n = 256, 64
     _mla_absorb_q_pack_kernel[(triton.cdiv(num_tokens, block_m), num_heads)](
         q_nope,
         w_k,
@@ -106,4 +106,5 @@ def mla_absorb_q_pack(
         BLOCK_N=block_n,
         FP8_MAX=torch.finfo(q_out.dtype).max,
         num_warps=4,
+        num_stages=2,
     )
