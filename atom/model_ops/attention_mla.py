@@ -2676,14 +2676,20 @@ class MLAAttention(nn.Module):
                 kv_buffer = kv_c_and_k_pe_cache.view(
                     -1, self.kv_cache_block_size, 1, q.shape[-1]
                 )
+            # The Triton decode takes max_seqlen_q rows of q per sequence. In a
+            # step a DP peer prefills, q keeps this rank's own rows while the
+            # per-sequence metadata stays padded to the group's batch with
+            # query-less tail sequences, which the kernel would read as a
+            # zero-row query length and skip every sequence.
+            num_seqs = q.shape[0] // attn_metadata.max_seqlen_q
             triton_mla_decode_fwd(
                 q,
                 kv_buffer,
                 o,
-                attn_metadata.cu_seqlens_q,
-                attn_metadata.context_lens,
+                attn_metadata.cu_seqlens_q[: num_seqs + 1],
+                attn_metadata.context_lens[:num_seqs],
                 int(attn_metadata.max_seqlen_k),
-                attn_metadata.block_tables,
+                attn_metadata.block_tables[:num_seqs],
                 self.scale,
                 self.kv_lora_rank,
                 self.qk_rope_head_dim,
