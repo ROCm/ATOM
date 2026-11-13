@@ -293,29 +293,21 @@ def _gather_pass_keys(cache, keys, p):
     workspace, tables = keys.workspace, keys.block_tables[p.first : p.end]
     k_fp8, k_scale = workspace.keys(p.keys)
     if p.dcp is None:
+        dst, dst_scales = k_fp8, k_scale
         cu = keys.cu_committed[p.first : p.end + 1]
-        cp_gather_indexer_k_quant_cache(
-            cache.values,
-            k_fp8,
-            k_scale.view(dtypes.fp8),
-            tables,
-            cu - p.key_base if p.key_base else cu,
-            preshuffle=True,
-        )
-        return k_fp8, k_scale
-    local_total, local_cu, gather_index = p.dcp
-    group = get_dcp_group()
-    rank, world = group.rank_in_group, group.world_size
-    shards, shard_scales = workspace.gathered(world * local_total)
-    slot = slice(rank * local_total, (rank + 1) * local_total)
+        cu = cu - p.key_base if p.key_base else cu
+    else:
+        local_total, gather_index = p.dcp.local_total, p.dcp.gather_index
+        group = get_dcp_group()
+        rank, world = group.rank_in_group, group.world_size
+        shards, shard_scales = workspace.gathered(world * local_total)
+        slot = slice(rank * local_total, (rank + 1) * local_total)
+        dst, dst_scales, cu = shards[slot], shard_scales[slot], p.dcp.local_cu
     cp_gather_indexer_k_quant_cache(
-        cache.values,
-        shards[slot],
-        shard_scales[slot].view(dtypes.fp8),
-        tables,
-        local_cu,
-        preshuffle=True,
+        cache.values, dst, dst_scales.view(dtypes.fp8), tables, cu, preshuffle=True
     )
+    if p.dcp is None:
+        return k_fp8, k_scale
     # fp8 has no collective support; the keys move as bytes.
     shard_bytes = shards.view(torch.uint8)
     _all_gather_slot(shard_bytes, local_total, rank, world, group)

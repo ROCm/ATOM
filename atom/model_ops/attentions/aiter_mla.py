@@ -80,8 +80,11 @@ from atom.model_ops.indexer import (
 from atom.model_ops.indexer.schedule import any_layer_skips_index_topk
 from atom.model_ops.indexer.workspace import (
     ConcatKeyWorkspace,
+    ConcatPass,
+    DcpGather,
     aligned_spans,
     concat_passes,
+    dcp_gather_index,
 )
 from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace, plane_capacity
 from atom.model_ops.sparse_indexer_fp4 import (
@@ -276,7 +279,7 @@ class StagedIndexRows:
     width: int
     query_starts: int | None = None
     pools: int | None = None
-    passes: tuple | None = None
+    passes: tuple[ConcatPass, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -1946,7 +1949,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             attn_metadata.dcp_indexer_local_total,
             attn_metadata.dcp_indexer_local_cu_seqlens,
             attn_metadata.dcp_indexer_gather_index,
-        ) = self._dcp_gathers([(0, bs)], g_cu, g_lens, cu_pad)[0]
+        ) = self._dcp_gathers([(0, bs)], cu_pad, g_cu)[0]
         if self._indexer_fp4:
             self._build_dcp_indexer_fp4_prefill_meta(
                 attn_metadata,
@@ -2827,36 +2830,20 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
     def _dcp_pass_gathers(self, attn_metadata, bs, prefix, passes):
         """The FP8 prefill's DCP key gather, a pass at a time (`ConcatPass.dcp`)."""
-        g_cu, g_lens, _, cu_pad = self._dcp_shard_lengths(attn_metadata, bs, prefix)
-        ranges = [(p.first, p.end) for p in passes]
-        return self._dcp_gathers(ranges, g_cu, g_lens, cu_pad)
+        g_cu, _, _, cu_pad = self._dcp_shard_lengths(attn_metadata, bs, prefix)
+        return self._dcp_gathers([(p.first, p.end) for p in passes], cu_pad, g_cu)
 
-    def _dcp_gathers(self, ranges, g_cu, g_lens, cu_pad):
-        """Per request range: the shards' total, their local cu-seqlens and each
-        key's place in their all-gather (position p: rank owner(p), local_index(p))."""
-        from atom.model_ops.dcp_ops import dcp_local_index, dcp_owner_rank
-
+    def _dcp_gathers(self, ranges, cu_pad, g_cu):
+        """`dcp_gather_index` per request range, uploaded."""
         W, S = self.dcp_world_size, self.cp_kv_cache_interleave_size
-
-        def upload(host):
-            return torch.from_numpy(host.astype(np.int32)).to(
-                self.device, non_blocking=True
+        return [
+            DcpGather(
+                g.local_total,
+                upload_numpy(g.local_cu.astype(np.int32), self.device),
+                upload_numpy(g.gather_index.astype(np.int32), self.device),
             )
-
-        gathers = []
-        for first, end in ranges:
-            lens, base = g_lens[first:end], cu_pad[first]
-            total = int(cu_pad[end] - base)
-            pos = np.arange(g_cu[end] - g_cu[first]) - np.repeat(
-                g_cu[first:end] - g_cu[first], lens
-            )
-            src = (
-                dcp_owner_rank(pos, W, S) * total
-                + np.repeat(cu_pad[first:end] - base, lens)
-                + dcp_local_index(pos, W, S)
-            )
-            gathers.append((total, upload(cu_pad[first : end + 1] - base), upload(src)))
-        return gathers
+            for g in dcp_gather_index(ranges, g_cu, cu_pad, W, S)
+        ]
 
     def _publishes_decode_index_rows(self) -> bool:
         """Whether a decode step publishes its index rows (`IndexRows`): every
@@ -2999,7 +2986,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         staged: StagedIndexRows,
         total_kv: int,
         prefix: str,
-        gathers=None,
+        gathers: list[DcpGather] | None = None,
     ) -> None:
         """A prefill's index rows (`IndexRows`) over the ``prefix`` set's
         uploaded bounds: FP8 against the requests' keys gathered end to end,

@@ -1335,8 +1335,8 @@ def test_dcp_prefill_key_gather_ignores_padded_request_tables(monkeypatch, lengt
     from aiter import dtypes, indexer_k_quant_and_cache
 
     from atom.model_ops.indexer import score
+    from atom.model_ops.indexer import workspace as ws
     from atom.model_ops.indexer.rows import ConcatKeys, IndexCache
-    from atom.model_ops.indexer.workspace import ConcatKeyWorkspace, ConcatPass
 
     total = sum(lengths)
     keys = torch.ones(total, 128, dtype=torch.bfloat16, device=DEV)
@@ -1362,10 +1362,10 @@ def test_dcp_prefill_key_gather_ignores_padded_request_tables(monkeypatch, lengt
     backing = torch.tensor(
         cums + [0, total, total, total], dtype=torch.int32, device=DEV
     )
-    gather = (total, backing[: len(cums)], torch.arange(total, device=DEV).int())
-    workspace = ConcatKeyWorkspace(total, 128, dtypes.fp8, DEV, total)
+    gather = ws.DcpGather(total, backing[: len(cums)], torch.arange(total, device=DEV))
+    workspace = ws.ConcatKeyWorkspace(total, 128, dtypes.fp8, DEV, total)
     step = ConcatKeys(table, None, total, None, workspace)
-    whole = ConcatPass(0, len(lengths), 0, total, 0, 0, 0, 1, 0, 0, (), gather)
+    whole = ws.ConcatPass(0, len(lengths), 0, total, 0, 0, 0, 1, 0, 0, (), gather)
     group = SimpleNamespace(rank_in_group=0, world_size=1)
     monkeypatch.setattr(score, "get_dcp_group", lambda: group)
     monkeypatch.setattr(score, "_all_gather_slot", lambda *args: None)

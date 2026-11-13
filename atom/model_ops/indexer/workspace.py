@@ -12,7 +12,9 @@ from typing import NamedTuple
 import numpy as np
 import torch
 
-from atom.model_ops.sparse_indexer_chunk import cdiv, qsplit_rows
+from atom.distributed.dcp_layout import dcp_local_index, dcp_owner_rank
+from atom.model_ops.sparse_indexer_chunk import qsplit_rows
+from atom.mono.plan.shard import cdiv
 
 # Packed rows (V4.1's FP4, FP8 prefill) start 256-byte aligned: 64 fp32 logits.
 ROW_ALIGN = 64
@@ -88,10 +90,38 @@ class ConcatKeyWorkspace:
         return _rows(self._gathered, rows, "gathered-shard")
 
 
+class DcpGather(NamedTuple):
+    """A pass's DCP key gather: each rank's padded shard length, the shards'
+    local cu-seqlens and every key's place in their all-gather."""
+
+    local_total: int
+    local_cu: torch.Tensor | np.ndarray
+    gather_index: torch.Tensor | np.ndarray
+
+
+def dcp_gather_index(ranges, g_cu, cu_pad, world, interleave):
+    """`DcpGather` on the host per request range `(first, end)`: global position
+    p of a request lives on rank owner(p) at local_index(p) of its padded shard."""
+    gathers = []
+    for first, end in ranges:
+        lens, base = np.diff(g_cu[first : end + 1]), cu_pad[first]
+        total = int(cu_pad[end] - base)
+        pos = np.arange(g_cu[end] - g_cu[first]) - np.repeat(
+            g_cu[first:end] - g_cu[first], lens
+        )
+        src = (
+            dcp_owner_rank(pos, world, interleave) * total
+            + np.repeat(cu_pad[first:end] - base, lens)
+            + dcp_local_index(pos, world, interleave)
+        )
+        gathers.append(DcpGather(total, cu_pad[first : end + 1] - base, src))
+    return gathers
+
+
 class ConcatPass(NamedTuple):
     """Requests `[first, end)` gathered together: keys `[key_base, +keys)` of the
     step's run; rows from `row_base`, `stride` a slot of `world`, this rank's
-    `[lo, hi)` in `bands`. `dcp`: `(local_total, local_cu, gather_index)`."""
+    `[lo, hi)` in `bands`. `dcp`: the pass's key gather under DCP."""
 
     first: int
     end: int
@@ -104,7 +134,7 @@ class ConcatPass(NamedTuple):
     lo: int
     hi: int
     bands: tuple[tuple[int, int], ...]
-    dcp: tuple[int, torch.Tensor, torch.Tensor] | None = None
+    dcp: DcpGather | None = None
 
 
 def concat_passes(
@@ -159,7 +189,6 @@ def _rows(buffers, rows, what):
     values, scales = buffers
     if rows > values.shape[0]:
         raise ValueError(
-            f"{rows} keys exceed the {values.shape[0]}-key FP8 prefill indexer "
-            f"{what} workspace"
+            f"{rows} keys exceed the {values.shape[0]}-key {what} workspace"
         )
     return values[:rows], scales[:rows]
