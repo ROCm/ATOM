@@ -8,6 +8,7 @@ import pytest
 
 from atom.kv_transfer.offload import atom_lmcache_staging
 from atom.kv_transfer.offload.chunked_scheduler import ChunkedOffloadSchedulerBase
+from atom.kv_transfer.offload.lookup_client import LookupClient
 from atom.kv_transfer.offload.mooncake_store.async_lookup import AsyncStoreLookup
 from atom.kv_transfer.offload.mooncake_store.worker import MooncakeStoreOffloadConnector
 from atom.kv_transfer.offload.mp.deployment import require_chunk_matches_server
@@ -16,7 +17,7 @@ from atom.kv_transfer.offload.mp.deployment import require_chunk_matches_server
 def test_terminal_arrival_cancels_queued_lookup_but_live_discard_does_not():
     started, release = threading.Event(), threading.Event()
 
-    class Backend:
+    class Backend(LookupClient):
         def lookup(self, _seq, lookup_id):
             assert lookup_id in ("1", "3")
             started.set()

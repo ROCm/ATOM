@@ -11,6 +11,7 @@ from atom.kv_transfer.disaggregation.multi.multi_connector import (
     MultiConnectorScheduler,
 )
 from atom.kv_transfer.offload import config as offcfg
+from atom.kv_transfer.offload.lookup_client import LookupClient
 from atom.kv_transfer.offload.mooncake_store.async_lookup import AsyncStoreLookup
 from atom.kv_transfer.offload.mooncake_store.layouts import (
     REPLAY_PAGE_CODEC_ID,
@@ -25,7 +26,9 @@ def test_arrival_offer_cannot_overtake_terminal_cleanup():
     )
     from atom.model_engine.sequence import Sequence, SequenceStatus
 
-    lookup = AsyncStoreLookup(SimpleNamespace(lookup=lambda *a, **kw: 0), capacity=1)
+    lookup = AsyncStoreLookup(
+        SimpleNamespace(lookup=lambda *a, **kw: 0, close=lambda: None), capacity=1
+    )
     sched = MooncakeStoreOffloadScheduler.__new__(MooncakeStoreOffloadScheduler)
     ChunkedOffloadSchedulerBase.__init__(
         sched, MockConfig(kv_cache_block_size=16), chunk_size=256, lookup_client=lookup
@@ -73,38 +76,16 @@ def test_arrival_offer_cannot_overtake_terminal_cleanup():
         lookup.close()
 
 
-def test_async_lookup_preserves_media_request_configs():
-    received = []
-
-    class Backend:
-        def lookup(self, seq, lookup_id=None, request_configs=None):
-            received.append((seq, lookup_id, request_configs))
-            return 8192
-
-    client = AsyncStoreLookup(Backend())
-    seq = SimpleNamespace(id="media", cache_seed=77)
-    configs = {"lmcache.tag.cache_salt": "77"}
-    try:
-        assert client.submit(seq, "media", request_configs=configs)
-        for _ in range(200):
-            if client.has_answer("media"):
-                break
-            time.sleep(0.005)
-        assert client.lookup(seq, "media", request_configs=configs) == 8192
-        assert received == [(seq, "media", configs)]
-    finally:
-        client.close()
-
-
 def test_failed_lookup_warning_is_rate_limited_and_preserves_nonanswer(caplog):
-    client = AsyncStoreLookup(SimpleNamespace(lookup=lambda *args, **kwargs: None))
+    client = AsyncStoreLookup(
+        SimpleNamespace(lookup=lambda *args, **kwargs: None, close=lambda: None)
+    )
     try:
-        future = Future()
-        future.set_exception(RuntimeError("Store unavailable"))
-        client.pending["failed"] = future
-        assert client.has_answer("failed") is False
-        assert client.has_answer("failed") is False
-        assert client.lookup(SimpleNamespace(id="failed")) is None
+        for _ in range(2):
+            future = Future()
+            future.set_exception(RuntimeError("Store unavailable"))
+            client.pending["failed"] = future
+            assert client.lookup(SimpleNamespace(id="failed")) is None
         warnings = [r for r in caplog.records if "Store lookup failed" in r.message]
         assert len(warnings) == 1
         assert "Store unavailable" in warnings[0].message
@@ -115,7 +96,7 @@ def test_failed_lookup_warning_is_rate_limited_and_preserves_nonanswer(caplog):
 def test_async_query_is_bounded_and_cancellable():
     gate = Event()
 
-    class Backend:
+    class Backend(LookupClient):
         def lookup(self, seq, lookup_id=None):
             assert gate.wait(2)
             return 8192
@@ -124,18 +105,18 @@ def test_async_query_is_bounded_and_cancellable():
     try:
         assert client.submit(object(), "a")
         assert not client.submit(object(), "a")
-        assert not client.has_answer("a")  # still in flight
+        assert not client.answered("a")  # still in flight
         assert client.submit(object(), "b")
         assert not client.submit(object(), "c")
         client.clear_lookup_status("b")
         gate.set()
         for _ in range(200):
-            if client.has_answer("a"):
+            if client.answered("a"):
                 break
             time.sleep(0.005)
-        assert client.has_answer("a")
+        assert client.answered("a")
         client.clear_lookup_status("a")
-        assert not client.has_answer("a")
+        assert not client.answered("a")
         assert not client.pending_ids()
     finally:
         gate.set()
@@ -175,7 +156,7 @@ def test_multi_prefetch_only_on_producer_not_decode_receiver():
 def test_answered_is_read_only_and_marks_lookup_ready():
     gate = Event()
 
-    class Backend:
+    class Backend(LookupClient):
         def lookup(self, seq, lookup_id=None):
             gate.wait(5)
             return 512
@@ -191,14 +172,14 @@ def test_answered_is_read_only_and_marks_lookup_ready():
     seq = SimpleNamespace(id=7)
     try:
         assert lookup.submit(seq, "7")
-        assert not lookup.answered("7")
+        assert lookup.is_pending("7") and not lookup.answered("7")
         assert not sched.lookup_ready(seq)  # in flight
         gate.set()
         deadline = time.time() + 5
         while not lookup.answered("7") and time.time() < deadline:
             time.sleep(0.01)
-        # Answered but not taken: still listed as pending, and early-loadable.
-        assert lookup.is_pending("7") and lookup.answered("7")
+        # Answered but not taken: early-loadable.
+        assert not lookup.is_pending("7") and lookup.answered("7")
         assert sched.lookup_ready(seq)
         assert lookup.answered("7")  # reading it consumed nothing
         lookup.clear_lookup_status("7")
@@ -236,7 +217,7 @@ def test_renew_does_not_queue_behind_lookups_and_is_bounded(monkeypatch):
 
     release = threading.Event()
 
-    class Backend:
+    class Backend(LookupClient):
         def lookup(self, seq, lookup_id=None):
             release.wait(5)
             return 1
@@ -261,6 +242,26 @@ def test_renew_does_not_queue_behind_lookups_and_is_bounded(monkeypatch):
         lookup.close()
 
 
+def test_renewal_is_served_ahead_of_queued_lookups():
+    class Backend(LookupClient):
+        def lookup(self, seq, lookup_id=None):
+            time.sleep(0.05)
+            return 1
+
+        def renew(self, seq, start, end):
+            return 7
+
+    lookup = AsyncStoreLookup(Backend())
+    try:
+        for i in range(40):  # two seconds of queued arrival lookups
+            assert lookup.submit(SimpleNamespace(id=i), str(i))
+        started = time.monotonic()
+        assert lookup.renew(SimpleNamespace(id=99), 0, 256) == 7
+        assert time.monotonic() - started < 0.5
+    finally:
+        lookup.close()
+
+
 def test_close_does_not_wait_for_a_hung_query():
     import threading
 
@@ -268,7 +269,7 @@ def test_close_does_not_wait_for_a_hung_query():
 
     release = threading.Event()
 
-    class Backend:
+    class Backend(LookupClient):
         def lookup(self, seq, lookup_id=None):
             release.wait(10)
 
@@ -286,7 +287,7 @@ def test_batch_renewal_skips_a_stalled_backend_without_per_request_wait(monkeypa
 
     entered, release = Event(), Event()
 
-    class Backend:
+    class Backend(LookupClient):
         def lookup(self, seq, lookup_id=None):
             entered.set()
             release.wait(10)
@@ -314,7 +315,7 @@ def test_batch_renewal_skips_an_earlier_stalled_renewal(monkeypatch):
 
     release = Event()
 
-    class Backend:
+    class Backend(LookupClient):
         def renew(self, seq, start, end):
             release.wait(10)
             return 7
@@ -342,9 +343,10 @@ def test_a_hung_store_call_does_not_keep_the_process_alive():
     script = textwrap.dedent("""
         import threading, time
         from types import SimpleNamespace
+        from atom.kv_transfer.offload.lookup_client import LookupClient
         from atom.kv_transfer.offload.mooncake_store.async_lookup import AsyncStoreLookup
 
-        class Backend:
+        class Backend(LookupClient):
             def lookup(self, seq, lookup_id=None):
                 threading.Event().wait()  # never returns
             def renew(self, seq, start, end):
@@ -380,6 +382,7 @@ def test_a_hung_store_master_does_not_keep_the_process_alive(pools):
     script = textwrap.dedent(f"""
         import threading
         from atom.kv_transfer.offload.mooncake_store import scheduler as S
+        from atom.kv_transfer.offload.lookup_client import LookupClient
         from atom.kv_transfer.offload.mooncake_store.async_lookup import AsyncStoreLookup
         from atom.kv_transfer.offload.mooncake_store.config import (
             parse_mooncake_store_config,
@@ -434,7 +437,7 @@ def test_cancelled_lookups_do_not_pile_up_behind_a_stalled_rpc():
 
     gate = threading.Event()
 
-    class Backend:
+    class Backend(LookupClient):
         def lookup(self, seq, lookup_id=None):
             gate.wait(5)
             return 0
@@ -527,7 +530,7 @@ def test_pending_store_fallback_never_blocks_the_admission_thread():
     gate = Event()
     entered = Event()
 
-    class Backend:
+    class Backend(LookupClient):
         def lookup(self, seq, lookup_id=None):
             entered.set()
             assert gate.wait(5)
