@@ -12,14 +12,14 @@ import pytest
 import torch
 
 triton = pytest.importorskip("triton")
-import triton.language as tl
+import triton.language as tl  # noqa: E402 - guarded by importorskip
 
-from atom.model_ops.blockscale_kernels.quantization import (
+from atom.model_ops.blockscale_kernels.quantization import (  # noqa: E402
     AMAX_FLOOR,
     FP8_DTYPE,
     quantize_fp8_kernel,
 )
-from atom.models.deepseek_v41.mono import hi_bridge as bridge
+from atom.models.deepseek_v41.mono import hi_bridge as bridge  # noqa: E402
 
 INTERPRET = os.environ.get("TRITON_INTERPRET") == "1"
 
