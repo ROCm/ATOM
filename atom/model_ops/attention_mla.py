@@ -78,6 +78,7 @@ from atom.model_ops.triton_fused_qkv_quant import (
     fused_kv_per_tensor_quant,
     fused_qkv_per_tensor_quant,
 )
+from atom.model_ops.triton_mla_absorb_qpack import mla_absorb_q_pack
 from atom.model_ops.utils import (
     dynamic_per_batched_tensor_quant,
     get_and_maybe_dequant_weights,
@@ -215,6 +216,9 @@ if fused_qk_rope_concat_and_cache_mla_seg is not None:
         prefix="rope_and_kv_cache",
         torch_compile=False,
     )
+mla_absorb_q_pack = mark_trace(
+    mla_absorb_q_pack, prefix="k_up_proj_q_pack", torch_compile=False
+)
 mla_prefill_fwd = mark_trace(mla_prefill_fwd, prefix="mla_prefill", torch_compile=False)
 mla_decode_fwd = mark_trace(mla_decode_fwd, prefix="mla_decode", torch_compile=False)
 
@@ -1567,10 +1571,12 @@ class MLAAttention(nn.Module):
         return self.o_proj(x.reshape(-1, self.num_heads * self.v_head_dim))
 
     @mark_trace(prefix="q_proj_and_k_up_proj", torch_compile=False)
-    def _q_proj_and_k_up_proj(self, x, x_scale=None, group=False):
+    def _q_proj_and_k_up_proj(self, x, x_scale=None, group=False, k_up_proj=True):
         # QREP: q_proj emits the full DCP-group head set. group=True (decode)
         # keeps them all and uses W_K_qrep, so the caller skips the AllGather Q;
         # group=False (prefill / non-QREP) takes only this rank's heads.
+        # k_up_proj=False returns q_nope un-absorbed, (N, B, P), for a caller
+        # that absorbs it into q_out itself.
         if self.qrep_enabled and not group:
             # Row-view weight: computes only this rank's heads, so the redundant
             # group-wide GEMM never happens (the old code projected all group
@@ -1585,6 +1591,8 @@ class MLAAttention(nn.Module):
 
         # Convert from (B, N, P) to (N, B, P)
         q_nope = q_nope.transpose(0, 1)
+        if not k_up_proj:
+            return q_nope, q_pe
 
         if self.qrep_enabled and group:
             W_K, W_K_scale = self.W_K_qrep, self.W_K_qrep_scale
@@ -3139,8 +3147,22 @@ class MLAAttention(nn.Module):
                 context.is_prefill,
                 envs.ATOM_DCP_PREFILL_QREP,
             )
+            # Prefill BF16 absorb at the replicated heads stores FP8 into q_out
+            # itself (mla_absorb_q_pack below), so no bf16 [N, T, L] is written.
+            absorb_into_q_out = (
+                use_qrep
+                and context.is_prefill
+                and not is_rocm_aiter_fp4bmm_enabled()
+                and self.W_K_qrep_scale is None
+                and not self.kv_shuffled
+                and kv_cache.numel() > 0
+                and attn_metadata.dtype_q == dtypes.fp8
+            )
             q_nope, q_rope = self._q_proj_and_k_up_proj(
-                q, x_scale=q_scale, group=use_qrep
+                q,
+                x_scale=q_scale,
+                group=use_qrep,
+                k_up_proj=not absorb_into_q_out,
             )
 
             # ---- Prefill Context Parallel --------------------------------
@@ -3254,7 +3276,20 @@ class MLAAttention(nn.Module):
                     # Q RoPE for all tokens (incl. slot=-1 non-owned). Non-DCP
                     # keeps the default (early-return on padded tokens).
                     fused_qk_rope_concat_and_cache_mla(
-                        q_nope,
+                        # Absorbing into q_out, this op is wanted only for the
+                        # rope half and the KV write: a one-row stand-in keeps
+                        # it off q_nope, and the absorb below overwrites the
+                        # nope half it stores. shortcut: that nope store is one
+                        # wasted FP8 q_out[..., :L] write; drop it once the
+                        # absorb kernel also writes the rope half, or aiter's
+                        # q_nope_prestored writer runs off gfx1250.
+                        (
+                            q_rope.new_empty(self.kv_lora_rank).expand(
+                                *q_rope.shape[:2], -1
+                            )
+                            if absorb_into_q_out
+                            else q_nope
+                        ),
                         q_rope,
                         k_nope,
                         k_rope,
@@ -3274,6 +3309,10 @@ class MLAAttention(nn.Module):
                         is_nope_first=True,
                         compute_all_q_rope=self.dcp_world_size > 1,
                     )
+                    if absorb_into_q_out:
+                        mla_absorb_q_pack(
+                            q_nope, self.W_K_qrep, q_out_write, self._q_scale
+                        )
                 # q_out = self.fused_kv_bmm(q, q_scale, k_nope, k_rope, positions, kv_cache, attn_metadata)
 
                 if pcp:
