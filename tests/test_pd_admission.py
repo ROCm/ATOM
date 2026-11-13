@@ -321,7 +321,8 @@ def test_decode_reserve_counts_each_growing_request_once():
     candidate = SizedSeq(id=4, block_table=[4])
     # READY is pending and already RUNNING: counted once. CANCELLED drains
     # without decoding. NEARLY_DONE may emit one more token.
-    assert policy._growth_reserve(candidate, [ready, nearly_done]) == 4 + 1 + 4
+    reserve = policy._growth_reserve(candidate, len(candidate), [ready, nearly_done])
+    assert reserve == 4 + 1 + 4
 
 
 def test_decode_reserve_starts_from_the_blocks_a_request_holds():
@@ -334,7 +335,42 @@ def test_decode_reserve_starts_from_the_blocks_a_request_holds():
     spent = SizedSeq(id=3, block_table=[9, 10, 11], num_tokens=1, max_tokens=1)
     candidate = SizedSeq(id=4, block_table=[12])
     running = [ahead, lagging, spent]
-    assert policy._growth_reserve(candidate, running) == 2 + 5 + 0 + 4
+    assert policy._growth_reserve(candidate, len(candidate), running) == 2 + 5 + 0 + 4
+
+
+@pytest.mark.parametrize("num_kvcache_blocks, b_admitted", [(6, True), (5, False)])
+@pytest.mark.parametrize("chunked", [False, True])
+def test_decode_reserve_counts_the_draft_lookahead_once(
+    build, chunked, num_kvcache_blocks, b_admitted
+):
+    sched, request = build(
+        chunked=chunked,
+        num_kvcache_blocks=num_kvcache_blocks,
+        speculative_config=SimpleNamespace(
+            num_speculative_tokens=3, use_dspark=lambda: True
+        ),
+        options={"enabled": True, "num_reserved_decode_tokens": 4},
+    )
+    bm = sched.block_manager
+    assert bm.draft_lookahead_blocks(8) == 1
+    a, b = request(), request()
+    sched.extend([a, b])
+    sched.schedule()
+    # A receives its two prompt blocks; its lookahead block waits for its
+    # first decode. B takes two blocks too, and A and B each need one more to
+    # grow by 4 tokens, their lookahead included: 6 blocks admit B with none
+    # to spare and 5 do not. Charging B's lookahead now, or reserving it on
+    # top of the growth, would defer B at 6; leaving it out of the reserve
+    # would admit B at 5.
+    assert len(a.block_table) == 2
+    assert bool(b.block_table) is b_admitted
+    assert sched.pd_admission.deferred["free_kv"] == (0 if b_admitted else 1)
+    sched._update_from_kv_xfer_finished(receive_success(a))
+    batch, _ = sched.schedule()
+    # A's first decode takes the lookahead block the reserve kept free.
+    assert a.id in batch.req_ids
+    assert bm.draft_writes_allocated(a)
+    assert sched.total_preemptions == 0
 
 
 @pytest.mark.parametrize("chunked", [False, True])
