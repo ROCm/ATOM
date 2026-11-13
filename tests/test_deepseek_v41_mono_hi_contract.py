@@ -25,7 +25,9 @@ CONFIG = Path(__file__).parent / "models" / "deepseek_v41" / "fixtures" / "confi
 def test_the_one_request_programs_hold(monkeypatch, tmp_path, layout):
     # (FlyDSL's runtime cache dir: its compiled programs and the hi fit cache, ``linear.fit_cache``)
     monkeypatch.setenv("FLYDSL_RUNTIME_CACHE_DIR", str(tmp_path / "flydsl"))
-    progs = hi_contract.check(hi_contract.config(str(CONFIG)), [6], index_layout=layout)
+    progs = hi_contract.check(
+        hi_contract.config(str(CONFIG)), [6], tp=4, index_layout=layout
+    )
     kinds = {key[0] for key in progs.kernels()}
     # the index sources' Indexers built for the layout checked (``Indexer(kmfma=)``: ATOM's FP4 plane in its mfma
     # layout, gfx950's default)

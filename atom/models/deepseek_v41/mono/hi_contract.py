@@ -9,11 +9,12 @@ The engine's builds at load skip both (``serving``: FlyDSL's disk cache on) and 
 programs.
 
 Usage: python -m atom.models.deepseek_v41.mono.hi_contract CONFIG.json [WIDTH ...] [--fits]
-(``CONFIG.json``: the model's ``config.json``; widths default to every served one, ``hi_compose.ROWS``, in every FP4
-index layout the programs address, ``hi_gate.INDEX_LAYOUTS``: the index sources' programs differ by layout, and the
-engine serves gfx950 with ATOM's default "mfma"; about 10 minutes a layout on 8 CPUs). The Linear prefetch fits are
-derived and held to the frozen table (``hi.blocks.gfx950.linear_fits``); ``--fits`` prints the table instead (to
-regenerate it).
+(``CONFIG.json``: the model's ``config.json``; widths default to every served one, ``hi_compose.ROWS``, at every served
+TP size, ``hi_gate.SERVED_TPS``, in every FP4 index layout the programs address, ``hi_gate.INDEX_LAYOUTS``: the index
+sources' programs differ by layout, and the engine serves gfx950 with ATOM's default "mfma"; about 10 minutes a TP size
+and layout on 8 CPUs). The Linear prefetch fits are derived and held to the frozen table
+(``hi.blocks.gfx950.linear_fits``); ``--fits`` prints the table instead (to regenerate it: every served TP size's and
+layout's fits).
 """
 
 from __future__ import annotations
@@ -26,9 +27,7 @@ from types import SimpleNamespace
 
 from atom.models.deepseek_v41.config import build_attention_topology
 from atom.models.deepseek_v41.mono import hi_compose
-from atom.models.deepseek_v41.mono.hi_gate import INDEX_LAYOUTS, MAX_CTX
-
-TP = 4
+from atom.models.deepseek_v41.mono.hi_gate import INDEX_LAYOUTS, MAX_CTX, SERVED_TPS
 
 
 def config(path: str) -> SimpleNamespace:
@@ -39,7 +38,7 @@ def config(path: str) -> SimpleNamespace:
 
 
 def check(
-    cfg, widths=None, tp: int = TP, fits: bool = True, index_layout: str = "preshuffle"
+    cfg, widths=None, *, tp: int, fits: bool = True, index_layout: str = "preshuffle"
 ) -> hi_compose.HiPrograms:
     """Every hi program of ``widths`` (default ``hi_compose.ROWS``) at ``tp`` built for gfx950 compile-only on ATOM's
     FP4 index plane in ``index_layout``, its trace checked (module docstring); -> the composition. Raises
@@ -113,12 +112,11 @@ def main(argv: list[str]) -> int:
     argv = [a for a in argv if a != "--fits"]
     cfg, widths = config(argv[0]), [int(w) for w in argv[1:]] or None
     built = {}
-    for layout in INDEX_LAYOUTS:
-        t0 = time.time()
-        built[layout] = (
-            len(check(cfg, widths, index_layout=layout).kernels()),
-            time.time() - t0,
-        )
+    for tp in SERVED_TPS:
+        for layout in INDEX_LAYOUTS:
+            t0 = time.time()
+            progs = check(cfg, widths, tp=tp, index_layout=layout)
+            built[tp, layout] = (len(progs.kernels()), progs.widths, time.time() - t0)
     if (
         write
     ):  # the frozen table, every fit of the compositions (the derived ones it lacked included)
@@ -126,8 +124,10 @@ def main(argv: list[str]) -> int:
 
         print(fits_module(dict(linear.DERIVED)), end="")
         return 0
-    for layout, (n, secs) in built.items():
-        print(f"{layout}: {n} hi programs built and checked in {secs:.0f} s")
+    for (tp, layout), (n, served, secs) in built.items():
+        print(
+            f"TP{tp} {layout}: {n} hi programs built and checked in {secs:.0f} s, widths {served}"
+        )
     print(f"{len(missing_fits())} fits not in the frozen table")
     return 0
 

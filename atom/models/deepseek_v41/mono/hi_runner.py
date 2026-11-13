@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """DeepSeek-V4.1's high-interactivity (hi) monokernels inside ATOM's V4.1 mono decode
-(``ATOM_DSV41_MONO_HI``, MI355X / gfx950, TP4).
+(``ATOM_DSV41_MONO_HI``, MI355X / gfx950, TP2 / TP4).
 
 On a step this hook serves, every one of V4.1's 40 decoder layers runs its
 hi layer program (the ``mono/hi`` package: ``layer.window_layer_blocks``, one
@@ -32,7 +32,7 @@ One served step:
 The block draft runs on the hi path too (``draft_run``: three chained stage
 launches and the Markov head a step, from ``MonoDraftModel.block_backbone``).
 
-**Widths.** ``hi_compose.ROWS`` lists the step widths served: a width of
+**Widths.** ``hi_compose.ROWS`` lists the step widths served (those whose programs build: ``HiPrograms``): a width of
 B x 6 rows serves B requests verifying 6 rows each (DSpark's 5 drafts and the
 anchor; a bs-B graph whose query bucket is 6, ATOM laying request b's rows out
 at b x 6), the hi runtime's ``Scenario(B, 6, tp)``. Up to ``MAX_BATCH`` requests a

@@ -46,8 +46,8 @@ _HI_DRAFT = object()
 class HiDecodeModel(MonoDecodeModel):
     """``MonoDecodeModel`` with the hi hook (module docstring): a decode step the hook serves runs every decoder layer
     on the hi path (``_hi_forward``); any other decode step takes ATOM's K1 / K2 (``V41MonoDecodeRunner``, created on
-    the first such step only: none at the served deployment, whose decode steps are all hi widths), and every other
-    forward ATOM's model."""
+    the first such step only: at the served deployment, the widths whose hi programs do not build, as TP2's 18 rows),
+    and every other forward ATOM's model."""
 
     def __init__(
         self, model, drafter, max_model_len, index_fp4, dp_ranks, hook

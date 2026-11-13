@@ -220,8 +220,8 @@ def head_program(name: str, sc, chain: bool = False, dyn: bool = False, **knobs)
         ]
     )
     wide = (
-        sc.tp > KEY_TP
-    )  # past the entries' tp: SGPR spills into VGPR lanes allowed (TP8: up to 12)
+        sc.tp != KEY_TP
+    )  # off the entries' tp: SGPR spills into VGPR lanes allowed (TP8: up to 12; TP2: 2)
     # a sharded fold (the rank columns of R): SGPR spills into VGPR lanes allowed (B = 4: 1, 5 with sampling)
     spill = residual_layout(sc.tp, rows=sc.rows) == "sharded" or wide
     return Program(name, sc, stages, host_regions=chain_regions(sc), peer_first=chain_peer_first(sc.tp, rows=sc.rows),
