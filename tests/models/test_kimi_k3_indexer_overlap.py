@@ -35,6 +35,7 @@ def dcp_prefill(monkeypatch):
         indexer_forward,
         "_gather_split",
         lambda out, split: calls.append(("gather", current())),
+        raising=False,
     )
     monkeypatch.setattr(
         indexer_forward,
@@ -62,8 +63,9 @@ def dcp_prefill(monkeypatch):
                 ),
             ),
         )
-        rows = SimpleNamespace(out_rows=8, concat=None, split=SimpleNamespace())
-        md = AttentionMetaData(run_sparse=True, index_rows=rows)
+        md = AttentionMetaData()
+        md.run_sparse = True
+        md.index_rows = SimpleNamespace(out_rows=8, concat=None, split=None)
         monkeypatch.setattr(
             indexer_forward,
             "get_forward_context",
@@ -124,10 +126,9 @@ def test_sparse_prefill_joins_the_exchange_before_its_query_gather(
         _dcp_project_merge_out=lambda *a, **k: calls.append("merge"),
     )
     prefill = MethodType(attention_mla.MLAAttention._dcp_sparse_prefill, layer)
-    md = AttentionMetaData(
-        dcp_owned_counts=torch.zeros(4, dtype=torch.int32),
-        index_exchange_done=SimpleNamespace(wait=lambda: calls.append("join")),
-    )
+    md = AttentionMetaData()
+    md.dcp_owned_counts = torch.zeros(4, dtype=torch.int32)
+    md.index_exchange_done = SimpleNamespace(wait=lambda: calls.append("join"))
     gather = [] if use_qrep else ["query gather"]
     prefill(torch.zeros(4, 1), None, md, use_qrep=use_qrep)
     assert calls == ["join", *gather, "mla", "merge"]
