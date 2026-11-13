@@ -208,8 +208,8 @@ async fn register(app: &Router, url: &str, listed: usize) {
 }
 
 /// With `cache_aware`, a request whose tokens a worker's device cache holds goes to that
-/// worker, whatever the tree learned, and one the router cannot tokenize is still served,
-/// by its text.
+/// worker, whatever the tree learned; one with media, or one the router cannot tokenize,
+/// is placed by its text.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cache_aware_places_requests_by_the_kv_event_index() {
     let mut publisher = PubSocket::new();
@@ -246,6 +246,10 @@ async fn cache_aware_places_requests_by_the_kv_event_index() {
     publish(&mut publisher, 1, sample("stored_root")).await;
     sources_once(&app, None, |sources| sources[0]["indexed_blocks"] == 2).await;
 
+    // With media, the tree places it: an engine keys a media prompt's blocks by the media.
+    let mut media = request.clone();
+    media["image_data"] = json!("https://example.com/cat.png");
+    assert_eq!(served_by(&app, media).await, workers[1].2);
     // stored_root holds tokens 100..=107, two of the request's three blocks.
     for _ in 0..4 {
         assert_eq!(served_by(&app, request.clone()).await, workers[0].2);

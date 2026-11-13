@@ -1,7 +1,7 @@
 //! Validated routing views; callers retain raw request bodies.
 use crate::protocols::{
-    chat::ChatCompletionRequest,
-    common::{GenerationRequest, InputIds, StringOrArray},
+    chat::{ChatCompletionRequest, ChatMessage, MessageContent},
+    common::{ContentPart, GenerationRequest, InputIds, StringOrArray},
     completion::CompletionRequest,
     generate::GenerateRequest,
     validated::Normalizable,
@@ -275,6 +275,36 @@ impl ParsedInference {
             _ => Ok(None),
         }
     }
+
+    /// Images, video, audio or embeddings, which the request's tokens do not show but an
+    /// engine keys every KV block of the prompt by.
+    pub(crate) fn carries_media(&self) -> bool {
+        match self {
+            Self::Chat(chat) => chat.messages.iter().any(|message| {
+                let content = match message {
+                    ChatMessage::System { content, .. }
+                    | ChatMessage::User { content, .. }
+                    | ChatMessage::Tool { content, .. }
+                    | ChatMessage::Developer { content, .. } => Some(content),
+                    ChatMessage::Assistant { content, .. } => content.as_ref(),
+                    ChatMessage::Function { .. } => None,
+                };
+                let media = |part: &ContentPart| !matches!(part, ContentPart::Text { .. });
+                matches!(content, Some(MessageContent::Parts(parts)) if parts.iter().any(media))
+            }),
+            Self::Generate(generate) => {
+                let media = [
+                    &generate.image_data,
+                    &generate.video_data,
+                    &generate.audio_data,
+                    &generate.input_embeds,
+                ];
+                media.iter().any(|data| data.is_some())
+            }
+            Self::Completion(_) | Self::Messages(_) | Self::Responses(_) => false,
+        }
+    }
+
     pub fn chat(&self) -> Option<&ChatCompletionRequest> {
         if let Self::Chat(chat) = self {
             Some(chat)
@@ -440,6 +470,32 @@ mod tests {
                 ParsedInference::parse(route, body.as_bytes()).is_err(),
                 "{body}"
             );
+        }
+    }
+
+    #[test]
+    fn media_is_told_from_text() {
+        let image = r#"{"type":"image_url","image_url":{"url":"https://x/cat.png"}}"#;
+        for (route, body, media) in [
+            (
+                "/v1/chat/completions",
+                r#"{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}"#.to_string(),
+                false,
+            ),
+            (
+                "/v1/chat/completions",
+                format!(r#"{{"model":"m","messages":[{{"role":"user","content":[{image}]}}]}}"#),
+                true,
+            ),
+            ("/generate", r#"{"input_ids":[1,2]}"#.into(), false),
+            (
+                "/generate",
+                r#"{"input_ids":[1,2],"image_data":"https://x/cat.png"}"#.into(),
+                true,
+            ),
+        ] {
+            let parsed = ParsedInference::parse(route, body.as_bytes()).unwrap();
+            assert_eq!(parsed.carries_media(), media, "{body}");
         }
     }
 }
