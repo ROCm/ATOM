@@ -24,6 +24,7 @@ catches it and the width runs production end to end, with no mono kernel
 launched at all.
 """
 
+from collections import namedtuple
 from types import SimpleNamespace
 
 import pytest
@@ -104,3 +105,48 @@ def test_a_non_mono_layers_pool_is_not_checked(monkeypatch):
     caches[3] = _pools(WINDOW + 7, conv=torch.float16)
     runner = _runner(monkeypatch, caches)
     assert runner._state_len() == WINDOW
+
+
+def test_an_fp16_recurrent_pool_is_admitted(monkeypatch):
+    # the recurrence widens fp16 to fp32 and rounds each state it writes back;
+    # a bf16 pool is refused (`test_a_later_mono_layers_bad_pool_is_refused_at_bind`)
+    runner = _runner(monkeypatch, {lid: _pools(rec=torch.float16) for lid in range(4)})
+    assert runner._state_len() == WINDOW
+    assert runner._state_dtype() == torch.float16
+
+
+def test_mono_layers_that_disagree_on_the_recurrent_dtype_are_refused(monkeypatch):
+    # like the window, the dtype is one build constant baked into every K1 key
+    caches = {lid: _pools() for lid in range(4)}
+    caches[2] = _pools(rec=torch.float16)
+    runner = _runner(monkeypatch, caches)
+    with pytest.raises(MonoUnsupported, match="disagree on the recurrent state dtype"):
+        runner._state_dtype()
+
+
+class _PastTheChecks(Exception):
+    pass
+
+
+def _past_the_checks(*_):
+    raise _PastTheChecks
+
+
+@pytest.mark.parametrize("state16", [False, True])
+@pytest.mark.parametrize("rec", [torch.float32, torch.float16])
+def test_a_step_takes_only_the_pool_its_build_was_made_for(monkeypatch, rec, state16):
+    # K1 reads the pool at the element size its key was built for, so `_k1`
+    # checks the dtype against the key, as it checks the window; `state_slots`
+    # is the first thing it does past the checks
+    runner = _runner(monkeypatch, {lid: _pools(rec=rec) for lid in range(4)})
+    runner.ones = None
+    monkeypatch.setattr(runner_mod, "state_slots", _past_the_checks)
+    key = namedtuple("Key", "state_len state16")(WINDOW, state16)
+    build = SimpleNamespace(k1_keys={1: key}, k1_launchers={key: None})
+    plan = SimpleNamespace(layer_id=1, kda=None)
+    if (rec == torch.float16) == state16:
+        with pytest.raises(_PastTheChecks):
+            runner._k1(build, plan, None, None, None, None)
+    else:
+        with pytest.raises(MonoUnsupported, match="recurrent state .* != the built"):
+            runner._k1(build, plan, None, None, None, None)

@@ -265,6 +265,7 @@ def test_k2_builds_cover_full_attention_layers_and_k1_builds_do_not(runner_modul
     runner = object.__new__(runner_module.K3MonoDecodeRunner)
     runner.debug = False
     runner.state_len = 3
+    runner.state16 = False
     runner.replay_cap = 0  # no ReplaySSM record buffers
     runner.plans = [
         _plan(1, kda=_stub_kda(), moe=_stub_moe()),
@@ -276,6 +277,18 @@ def test_k2_builds_cover_full_attention_layers_and_k1_builds_do_not(runner_modul
     # same blocks, same eps: the full-attention layer reuses the KDA layer's build
     keys = runner._k2_keys(8)
     assert keys[1] == keys[3]
+
+
+@pytest.mark.parametrize("fp16", [False, True])
+def test_k1_keys_carry_the_recurrent_state_dtype(runner_module, fp16):
+    # K1 reads the pool at its element size, so the dtype is part of the key
+    runner = object.__new__(runner_module.K3MonoDecodeRunner)
+    runner.debug = False
+    runner.state_len = 3
+    runner.state16 = fp16
+    runner.replay_cap = 0
+    runner.plans = [_plan(1, kda=_stub_kda(), moe=_stub_moe())]
+    assert [key.state16 for key in runner._k1_keys(8, 8).values()] == [fp16]
 
 
 # ----------------------------------------------------------- forward_pre_o
