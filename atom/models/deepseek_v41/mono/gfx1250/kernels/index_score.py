@@ -40,10 +40,12 @@ def i64(x):
     return fx.Int64(x)
 
 
-# LDS (bytes from the stage's base): the task's row's query and head weights (room for 8 rows), the per-row chunk counts
+# LDS (bytes from the stage's base): four tasks' queries/head weights, up to
+# three consecutive query rows per FULL task. REINDEX keeps one row per task.
+QUERY_SLOTS = 12
 O_Q = 512                        # (the first 512 B unused: kept so the layout matches the validated build)
-O_W = O_Q + 8 * HEADS * DIM
-SCORE_LDS = O_W + 8 * HEADS * 4
+O_W = O_Q + QUERY_SLOTS * HEADS * DIM
+SCORE_LDS = O_W + QUERY_SLOTS * HEADS * 4
 
 
 O_SCNT = SCORE_LDS               # per-row chunk counts [T]
@@ -53,12 +55,20 @@ O_PF = O_SRB + 3 * T * 4         # a batch's key rows [RB][SUB][256] int64
 
 
 @ASTRewriter.transform
-def stage_score_any(c, isrx):
+def stage_score_general(c, isrx):
     """(see the module doc) isrx traced: FULL (context = the bound) and REINDEX (context = rx_context, the columns
     lifted through icand) with one code instance."""
     t, b, w, l, sm = c["t"], c["b"], c["w"], c["l"], c["sm"]
     TR = c["TR"]
     idx4 = c.get("idx4", False)
+    GROUP = c.get("score_group", 1)
+    assert GROUP in (1, 3) and SCORE_RB * GROUP <= QUERY_SLOTS
+    if fx.const_expr(GROUP > 1):
+        # The target's six-row verify blocks align to groups of three. A
+        # REINDEX row has its own candidate list and cannot share these keys.
+        qn = isrx.select(I32(1), I32(GROUP))
+    else:
+        qn = I32(1)
     SUB_ = IP.score_sub(TR, CTAS)
     TCOLS_ = SUB_ * CHUNK
     ocnt = sm + O_SCNT
@@ -70,7 +80,15 @@ def stage_score_any(c, isrx):
     qt = hx.gload(c["ibat"] + i64(tc) * 4, I32)
     osr = sm + O_SRB
     if t < TR:   # the task loop reads the row's context / bound / batch slot from LDS (no dependent global loads)
-        hx.lstore(ocnt + t * 4, IP.score_tasks(cxt, TCOLS_))
+        task_cx = cxt
+        if fx.const_expr(GROUP > 1):
+            last = fx.min(tc + GROUP - 1, I32(TR - 1))
+            bd_last = hx.gload(c["ibound"] + i64(last) * 4, I32)
+            task_cx = isrx.select(cxt, fx.max(cxt, bd_last))
+            tasks = (isrx | (tc % GROUP == 0)).select(IP.score_tasks(task_cx, TCOLS_), I32(0))
+        else:
+            tasks = IP.score_tasks(task_cx, TCOLS_)
+        hx.lstore(ocnt + t * 4, tasks)
         hx.lstore(osr + t * 4, cxt)
         hx.lstore(osr + (T + t) * 4, bdt)
         hx.lstore(osr + (2 * T + t) * 4, qt)
@@ -99,16 +117,22 @@ def stage_score_any(c, isrx):
         rr = []
         for k in range_constexpr(RB):
             r0_, ch0, cx0, bd0, q0 = tmap(fx.min(base_i + k * CTAS, nt - 1))
-            if fx.const_expr(idx4):   # the row's MXFP4 query (2 KB) then its codes (128 B), in the slot's first half
-                if t < HEADS * DIM // 2 // 16:
-                    hx.lstore(sm + O_Q + k * (HEADS * DIM) + t * 16, hx.gload(c["iq_out"] + i64(r0_ * HEADS * DIM // 2) + i64(t) * 16, I32, 4))
+            for qr in range(qn):
+                rq = r0_ + qr
+                slot = k * GROUP + qr
+                if fx.const_expr(idx4):   # MXFP4 query (2 KB) then its 128 B of scale codes
+                    if t < HEADS * DIM // 2 // 16:
+                        hx.lstore(sm + O_Q + slot * (HEADS * DIM) + t * 16, hx.gload(c["iq_out"] + i64(rq * HEADS * DIM // 2) + i64(t) * 16, I32, 4))
+                    if t < HEADS:
+                        hx.lstore(sm + O_Q + slot * (HEADS * DIM) + HEADS * DIM // 2 + t * 4,
+                                  hx.gload(c["iqs_out"] + i64((rq * HEADS + t) * 4), I32))
+                else:
+                    hx.lstore(sm + O_Q + slot * (HEADS * DIM) + t * 16, hx.gload(c["iq_out"] + i64(rq * HEADS * DIM) + i64(t) * 16, I32, 4))
                 if t < HEADS:
-                    hx.lstore(sm + O_Q + k * (HEADS * DIM) + HEADS * DIM // 2 + t * 4,
-                              hx.gload(c["iqs_out"] + i64((r0_ * HEADS + t) * 4), I32))
-            else:
-                hx.lstore(sm + O_Q + k * (HEADS * DIM) + t * 16, hx.gload(c["iq_out"] + i64(r0_ * HEADS * DIM) + i64(t) * 16, I32, 4))
-            if t < HEADS:
-                hx.lstore(sm + O_W + k * (HEADS * 4) + t * 4, hx.gload(c["iw_out"] + i64(r0_ * HEADS + t) * 4, F32))
+                    hx.lstore(sm + O_W + slot * (HEADS * 4) + t * 4, hx.gload(c["iw_out"] + i64(rq * HEADS + t) * 4, F32))
+            if fx.const_expr(GROUP > 1):
+                bd_last = hx.lload(osr + (T + fx.min(r0_ + GROUP - 1, I32(TR - 1))) * 4, I32)
+                bd0 = isrx.select(bd0, fx.max(bd0, bd_last))
             for u in range_constexpr(SUB_):
                 pcols.append(ch0 * TCOLS_ + u * CHUNK + w * 16 + l % 16)
                 qs.append(q0)
@@ -143,43 +167,174 @@ def stage_score_any(c, isrx):
                     kbs.append(fx.Vector.from_elements([kp[cc][e] for cc in range(4) for e in range(4)], I32))
                     kss.append(hx.gload(kbase + 1024 + tt * 4, F32))
                 cols.append(col)
-            qvs = []
-            qss = []
-            for mi in range_constexpr(2):
-                if fx.const_expr(idx4):
-                    qrow = sm + O_Q + k * (HEADS * DIM) + (mi * 16 + l % 16) * (DIM // 2)
-                    qvs.append(MX4.ld8(qrow, l, lambda a_: hx.lload(a_, I32, 4)))
-                    qss.append(hx.lload(sm + O_Q + k * (HEADS * DIM) + HEADS * DIM // 2 + (mi * 16 + l % 16) * 4, I32))
-                else:
-                    qrow = sm + O_Q + k * (HEADS * DIM) + (mi * 16 + l % 16) * DIM
-                    qp = [hx.lload(qrow + (l // 16) * 16 + cc * 32, I32, 4) for cc in range(4)]
-                    qvs.append(fx.Vector.from_elements([qp[cc][e] for cc in range(4) for e in range(4)], I32))
-            hwvs = [hx.lload(sm + O_W + k * (HEADS * 4) + (mi * 16 + (l // 16) * 8) * 4, F32, 8) for mi in range(2)]
-            for u in range_constexpr(SUB_):
-                col = cols[u]
-                tot = F32(0.0)
+            for qr in range(qn):
+                rq = r + qr
+                slot = k * GROUP + qr
+                cx = hx.lload(osr + rq * 4, I32)
+                bd = hx.lload(osr + (T + rq) * 4, I32)
+                qvs = []
+                qss = []
                 for mi in range_constexpr(2):
                     if fx.const_expr(idx4):
-                        acc = MX4.wmma4(qvs[mi], qss[mi], kbs[u], kss[u], fx.Vector.filled(8, 0.0, F32))
-                        for i_ in range_constexpr(8):
-                            tot = tot + fx.max(acc[i_], F32(0.0)) * hwvs[mi][i_]
+                        qrow = sm + O_Q + slot * (HEADS * DIM) + (mi * 16 + l % 16) * (DIM // 2)
+                        qvs.append(MX4.ld8(qrow, l, lambda a_: hx.lload(a_, I32, 4)))
+                        qss.append(hx.lload(sm + O_Q + slot * (HEADS * DIM) + HEADS * DIM // 2 + (mi * 16 + l % 16) * 4, I32))
                     else:
-                        acc = hx.wmma_mx(qvs[mi], ONE4, kbs[u], ONE4, fx.Vector.filled(8, 0.0, F32))
-                        for i_ in range_constexpr(8):
-                            tot = tot + fx.max(acc[i_] * kss[u], F32(0.0)) * hwvs[mi][i_]
-                sc = tot + tot.shuffle_xor(16, 32)
-                v = (col < cx).select(sc, F32(float("-inf")))
-                if live & (l < 16) & (col < ((cx + (CHUNK - 1)) // CHUNK) * CHUNK):   # (as before: the context's whole 128-column chunks)
-                    c["stx"](c["ilog"] + i64(r * c["ilw"] + col) * 4, v)
-                if iprod:   # layer 20: the 8-row block maxima (NaN ignored, capped finite, the newest block +inf)
-                    m = (v != v).select(F32(float("-inf")), v)
-                    for o_ in range_constexpr(3):
-                        m = fx.max(m, m.shuffle_xor(1 << o_, 32))
-                    m = fx.min(m, F32(FLT_MAX))
-                    bk = col // 8
-                    nblk = (bd + 7) // 8
-                    m = (bk == nblk - 1).select(F32(float("inf")), m)
-                    if live & (l < 16) & (l % 8 == 0) & (bk < nblk):
-                        c["stx"](c["ibmax"] + i64(r * (c["ilw"] // 8) + bk) * 4, m)
+                        qrow = sm + O_Q + slot * (HEADS * DIM) + (mi * 16 + l % 16) * DIM
+                        qp = [hx.lload(qrow + (l // 16) * 16 + cc * 32, I32, 4) for cc in range(4)]
+                        qvs.append(fx.Vector.from_elements([qp[cc][e] for cc in range(4) for e in range(4)], I32))
+                hwvs = [hx.lload(sm + O_W + slot * (HEADS * 4) + (mi * 16 + (l // 16) * 8) * 4, F32, 8) for mi in range(2)]
+                for u in range_constexpr(SUB_):
+                    col = cols[u]
+                    tot = F32(0.0)
+                    for mi in range_constexpr(2):
+                        if fx.const_expr(idx4):
+                            acc = MX4.wmma4(qvs[mi], qss[mi], kbs[u], kss[u], fx.Vector.filled(8, 0.0, F32))
+                            for i_ in range_constexpr(8):
+                                tot = tot + fx.max(acc[i_], F32(0.0)) * hwvs[mi][i_]
+                        else:
+                            acc = hx.wmma_mx(qvs[mi], ONE4, kbs[u], ONE4, fx.Vector.filled(8, 0.0, F32))
+                            for i_ in range_constexpr(8):
+                                tot = tot + fx.max(acc[i_] * kss[u], F32(0.0)) * hwvs[mi][i_]
+                    sc = tot + tot.shuffle_xor(16, 32)
+                    v = (col < cx).select(sc, F32(float("-inf")))
+                    if live & (l < 16) & (col < ((cx + (CHUNK - 1)) // CHUNK) * CHUNK):   # (as before: the context's whole 128-column chunks)
+                        c["stx"](c["ilog"] + i64(rq * c["ilw"] + col) * 4, v)
+                    if iprod:   # layer 20: the 8-row block maxima (NaN ignored, capped finite, the newest block +inf)
+                        m = (v != v).select(F32(float("-inf")), v)
+                        for o_ in range_constexpr(3):
+                            m = fx.max(m, m.shuffle_xor(1 << o_, 32))
+                        m = fx.min(m, F32(FLT_MAX))
+                        bk = col // 8
+                        nblk = (bd + 7) // 8
+                        m = (bk == nblk - 1).select(F32(float("inf")), m)
+                        if live & (l < 16) & (l % 8 == 0) & (bk < nblk):
+                            c["stx"](c["ibmax"] + i64(rq * (c["ilw"] // 8) + bk) * 4, m)
 
         gpu.barrier()
+
+
+@ASTRewriter.transform
+def stage_score_query_resident(c):
+    """FULL FP4 GROUP3: one fixed query group per CTA, weighted key splits.
+
+    Each nonempty group gets one CTA and a cumulative-floor share of the
+    remaining CTAs. Four key-task page lookahead and SUB key fragments stay
+    unchanged; query operands and weights are prepared once before that loop.
+    REINDEX must use stage_score_general because candidate tables differ by row.
+    """
+    t, b, w, l, sm = c["t"], c["b"], c["w"], c["l"], c["sm"]
+    TR, GROUP, RB = c["TR"], 3, SCORE_RB
+    assert c.get("idx4", False) and TR % GROUP == 0
+    SUB_ = IP.score_sub(TR, CTAS)
+    TCOLS_ = SUB_ * CHUNK
+    tc = fx.min(t, I32(TR - 1))
+    bound = fx.max(hx.gload(c["ibound"] + i64(tc) * 4, I32), I32(0))
+    batch = hx.gload(c["ibat"] + i64(tc) * 4, I32)
+    osr, ocnt = sm + O_SRB, sm + O_SCNT
+    if t < TR:
+        last = fx.min(tc + GROUP - 1, I32(TR - 1))
+        maximum = fx.max(bound, hx.gload(c["ibound"] + i64(last) * 4, I32))
+        count = (tc % GROUP == 0).select(IP.score_tasks(maximum, TCOLS_), I32(0))
+        hx.lstore(ocnt + t * 4, count)
+        hx.lstore(osr + t * 4, bound)
+        hx.lstore(osr + (T + t) * 4, batch)
+    gpu.barrier()
+    ln = hx.fresh(t) % 32
+    task_inc, total = IP.task_prefix(lambda r: hx.lload(ocnt + r * 4, I32), TR, ln,
+                                    lambda v: TK.wave_incl_scan(v, ln), lambda v: hx.lane_gather(v, I32(31)))
+    active_inc, active = IP.task_prefix(lambda r: (hx.lload(ocnt + r * 4, I32) > 0).select(I32(1), I32(0)), TR, ln,
+                                      lambda v: TK.wave_incl_scan(v, ln), lambda v: hx.lane_gather(v, I32(31)))
+    if total > 0:
+        allocations = []
+        for g in range_constexpr(IP.row_groups(TR)):
+            valid = ln + 32 * g < TR
+            allocations.append(valid.select(active_inc[g] + (CTAS - active) * task_inc[g] // total, I32(CTAS)))
+        row, split = IP.task_of(allocations, b, TR, lambda p: TK._popc(TK._ballot(p)), TK.wave_max)
+        end = I32(0)
+        for g in range_constexpr(IP.row_groups(TR)):
+            allocation_end = hx.lane_gather(allocations[g], row % 32)
+            end = (row // 32 == g).select(allocation_end, end)
+        splits = end - b + split
+        maximum = fx.max(hx.lload(osr + row * 4, I32), hx.lload(osr + (row + GROUP - 1) * 4, I32))
+        tasks = IP.score_tasks(maximum, TCOLS_)
+        batch = fx.max(hx.lload(osr + (T + row) * 4, I32), I32(0))
+        nme = fx.max((tasks - split + splits - 1) // splits, I32(0))
+        if nme > 0:
+            for qr in range_constexpr(GROUP):
+                rq = row + qr
+                if t < HEADS * DIM // 2 // 16:
+                    hx.lstore(sm + O_Q + qr * HEADS * DIM + t * 16,
+                              hx.gload(c["iq_out"] + i64(rq * HEADS * DIM // 2) + i64(t) * 16, I32, 4))
+                if t < HEADS:
+                    hx.lstore(sm + O_Q + qr * HEADS * DIM + HEADS * DIM // 2 + t * 4,
+                              hx.gload(c["iqs_out"] + i64((rq * HEADS + t) * 4), I32))
+                    hx.lstore(sm + O_W + qr * HEADS * 4 + t * 4,
+                              hx.gload(c["iw_out"] + i64(rq * HEADS + t) * 4, F32))
+            gpu.barrier()
+            qa, qb, sa, sb, wa, wb, bounds = [], [], [], [], [], [], []
+            for qr in range_constexpr(GROUP):
+                base = sm + O_Q + qr * HEADS * DIM
+                qa.append(MX4.ld8(base + (l % 16) * (DIM // 2), l, lambda a: hx.lload(a, I32, 4)))
+                qb.append(MX4.ld8(base + (16 + l % 16) * (DIM // 2), l, lambda a: hx.lload(a, I32, 4)))
+                sa.append(hx.lload(base + HEADS * DIM // 2 + (l % 16) * 4, I32))
+                sb.append(hx.lload(base + HEADS * DIM // 2 + (16 + l % 16) * 4, I32))
+                wa.append(hx.lload(sm + O_W + qr * HEADS * 4 + (l // 16) * 8 * 4, F32, 8))
+                wb.append(hx.lload(sm + O_W + qr * HEADS * 4 + (16 + (l // 16) * 8) * 4, F32, 8))
+                bounds.append(hx.lload(osr + (row + qr) * 4, I32))
+            for gb in range((nme + RB - 1) // RB):
+                key_rows = []
+                for k in range_constexpr(RB):
+                    chunk = fx.min(split + (gb * RB + k) * splits, tasks - 1)
+                    for u in range_constexpr(SUB_):
+                        col = chunk * TCOLS_ + u * CHUNK + w * 16 + l % 16
+                        key_rows.append(IP.key_row(col, maximum))
+                pages = [hx.gload(c["btab"] + (i64(batch) * i64(c["bstride"]) + i64(key_rows[j] // c["irpp"])) * 4, I32)
+                         for j in range(RB * SUB_)]
+                for j in range_constexpr(RB * SUB_):
+                    hx.lstore(sm + O_PF + (j * 256 + t) * 8, i64(pages[j]) * i64(c["irpp"]) + i64(key_rows[j] % c["irpp"]))
+                gpu.barrier()
+                for k in range(fx.min(nme - gb * RB, I32(RB))):
+                    chunk = split + (gb * RB + k) * splits
+                    keys, scales = [], []
+                    for u in range_constexpr(SUB_):
+                        flat = hx.lload(sm + O_PF + ((k * SUB_ + u) * 256 + t) * 8, I64)
+                        keys.append(MX4.ld8(c["iplane"] + flat * 64, l, lambda a: hx.gload(a, I32, 4)))
+                        scales.append(hx.gload(c["iscl"] + flat * 4, I32))
+                    for qr in range_constexpr(GROUP):
+                        cx = bounds[qr]
+                        rq = row + qr
+                        for u in range_constexpr(SUB_):
+                            col = chunk * TCOLS_ + u * CHUNK + w * 16 + l % 16
+                            acc0 = MX4.wmma4(qa[qr], sa[qr], keys[u], scales[u], fx.Vector.filled(8, 0.0, F32))
+                            total_score = F32(0.0)
+                            for i in range_constexpr(8):
+                                total_score = total_score + fx.max(acc0[i], F32(0.0)) * wa[qr][i]
+                            acc1 = MX4.wmma4(qb[qr], sb[qr], keys[u], scales[u], fx.Vector.filled(8, 0.0, F32))
+                            for i in range_constexpr(8):
+                                total_score = total_score + fx.max(acc1[i], F32(0.0)) * wb[qr][i]
+                            score = total_score + total_score.shuffle_xor(16, 32)
+                            value = (col < cx).select(score, F32(float("-inf")))
+                            if (l < 16) & (col < ((cx + CHUNK - 1) // CHUNK) * CHUNK):
+                                c["stx"](c["ilog"] + i64(rq * c["ilw"] + col) * 4, value)
+                            if c["iprod"]:
+                                m = (value != value).select(F32(float("-inf")), value)
+                                for o in range_constexpr(3):
+                                    m = fx.max(m, m.shuffle_xor(1 << o, 32))
+                                m = fx.min(m, F32(FLT_MAX))
+                                block = col // 8
+                                m = (block == ((cx + 7) // 8 - 1)).select(F32(float("inf")), m)
+                                if (l < 16) & (l % 8 == 0) & (block < ((cx + 7) // 8)):
+                                    c["stx"](c["ibmax"] + i64(rq * (c["ilw"] // 8) + block) * 4, m)
+                gpu.barrier()
+
+
+@ASTRewriter.transform
+def stage_score_any(c, isrx):
+    if fx.const_expr(c.get("score_query_resident", False)):
+        if isrx:
+            stage_score_general(c, isrx)
+        else:
+            stage_score_query_resident(c)
+    else:
+        stage_score_general(c, isrx)

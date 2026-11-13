@@ -193,7 +193,8 @@ def iprefetch(kb):
         llvm.inline_asm(None, [], f"s_prefetch_inst_pc_rel {off}, null, 31", "", has_side_effects=True)
 
 
-def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sources="", kv8=False, idx4=False):
+def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sources="", kv8=False, idx4=False,
+          score_query_resident=True):
     """The step kernel for TR target rows (TR // 6 requests) and trd draft rows (5 a request); NL target layers (NL < 40
     and ndr 0: a bring-up / shadow build of the first layers only). part: "all" (one launch), or the step as two launches
     on one stream: "target" (entry, target layers, head, sampling, verification) then "draft" (draft context, metadata,
@@ -204,8 +205,11 @@ def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sourc
     parameter is in `keyed`, which the kernel and the launcher reference: all of them reach FlyDSL's JIT cache key (an edit to a helper
     the cache walk does not reach still rebuilds)."""
     assert part in ("all", "target", "draft")
+    score_query_resident = bool(score_query_resident and idx4 and TR > 48 and part != "draft")
     keyed = (("TR", TR), ("rank", rank), ("NL", NL), ("ndr", ndr), ("trd", trd), ("part", part), ("sources", sources),
              ("kv8", kv8), ("idx4", idx4))
+    if score_query_resident:
+        keyed = keyed + (("score_query_resident", True),)
     L = smem_layout(TR, kv8)
     TPG = TR * 10 // 3
     stx = hx.stx_dev
@@ -357,7 +361,8 @@ def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sourc
                                         ilog=ltab(fp, Ly, "ilog")(), ilw=fx.Int32(ltab(fp, Ly, "ilw")()), isel=ltab(fp, Ly, "isel")(),
                                         irow=ltab(fp, Ly, "irow")(), cprow=fx.Int32(ltab(fp, Ly, "cprow")()), imain=fx.Int32(ltab(fp, Ly, "imain")()),
                                         iq_out=fptr(fp, "iq_out"), iw_out=fptr(fp, "iw_out"), iqs_out=fptr(fp, "iqs_out"),
-                                        iscl=ltab(fp, Ly, "iscl")())
+                                        iscl=ltab(fp, Ly, "iscl")(), score_group=3 if idx4 and not DRS and TR > 48 else 1,
+                                        score_query_resident=score_query_resident and idx4 and not DRS and TR > 48)
                             lfl3 = ltab(fp, Ly, "lflags")()
                             isrx = (lfl3 & fx.Int64(64)) != fx.Int64(0)      # bit 6: REINDEX (layer 20's candidates)
                             cs_ = cwith(cs_, ibmax=ltab(fp, Ly, "ibmax")(), icand=ltab(fp, Ly, "icand")(), lvl=fptr(fp, "ilvl"),
