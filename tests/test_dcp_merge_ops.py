@@ -657,8 +657,8 @@ def _a2a_roundtrip(o_per_rank, lse_per_rank, n_ranks, owned_counts_per_rank=None
 
     sends = []
     for r in range(n_ranks):
-        # Poison the staging buffer: a record the pack kernel skipped must
-        # reach the result as NaN, not as a small numeric drift.
+        # An unwritten record is NaN, not stale data, so the combine drops it
+        # and the reference comparison fails.
         send = torch.full(
             (n_ranks, b, h_local, d + pack), float("nan"), dtype=dtype, device=DEV
         )
@@ -749,8 +749,9 @@ def test_a2a_handles_a_non_power_of_two_head_split():
     with the top 4 masked. Those lanes must neither write outside the
     destination's slice nor drop a real head.
 
-    _a2a_roundtrip fills the staging buffer with NaN before packing, so a head
-    the pack kernel skipped arrives as NaN rather than as a small numeric drift.
+    _a2a_roundtrip fills the staging buffer with NaN before packing: a head the
+    pack kernel skipped is NaN, not stale data, so the combine drops it and the
+    reference comparison fails.
     """
     b, h, d, n_ranks = 3, 96, 128, 8
     assert (h // n_ranks) & (h // n_ranks - 1), "meaningless if H_LOCAL is 2**k"
@@ -764,7 +765,6 @@ def test_a2a_handles_a_non_power_of_two_head_split():
     got = _a2a_roundtrip(o, lse, n_ranks)
     ref = _merge_partials(torch.stack(o), torch.stack(lse))
 
-    assert torch.isfinite(got).all(), "a NaN from the staging buffer reached the output"
     torch.testing.assert_close(got.float(), ref.float(), rtol=3e-2, atol=3e-2)
 
 
