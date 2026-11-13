@@ -411,9 +411,9 @@ class KVTransferTensors:
     paged_state_region_count: int | None = None
     # `slot_regions`' twin of `block_region_consumer_indices`: where each
     # region sits in a whole-model peer's slot region list, for a layout the
-    # connector's group-major inference (groups of the stage's layer count,
-    # from its `start_layer`) cannot place: a PP stage of a hybrid, whose slot
-    # regions count recurrent layers only.
+    # connector's group-major inference (layer l of group g at
+    # g * (peer regions / groups) + `start_layer` + l) cannot place: a PP stage
+    # of a hybrid, whose slot regions count recurrent layers only.
     slot_region_consumer_indices: list[int] | None = None
     # Per slot region, the byte runs one unit splits into, each sharded
     # contiguously over TP ranks: a peer at k times this side's TP holds the

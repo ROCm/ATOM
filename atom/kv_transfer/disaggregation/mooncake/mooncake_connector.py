@@ -1461,9 +1461,9 @@ class MooncakeConnector(KVConnectorBase):
             ):
                 # Every stage writes its slot regions from the head's final
                 # slot. Without explicit indices, `consumer_region_indices`
-                # places them group-major from `start_layer`, in groups of this
-                # stage's layer count, which is right only for a backend with
-                # one slot region per layer per group.
+                # puts layer l of group g at g * (peer regions / groups) +
+                # `start_layer` + l, which is right only for a backend with one
+                # slot region per layer per group.
                 logger.warning(
                     "PP-prefill with per-request slot regions and no explicit "
                     "consumer indices (pp_rank=%d, %d slot regions): they are "
