@@ -33,7 +33,7 @@ from torch.profiler import record_function
 
 from atom import structured_output
 from atom.config import Config, local_device_index, set_current_atom_config
-from atom.distributed.group_agreement import group_min
+from atom.distributed.group_agreement import agree_kv_budget, group_min
 from atom.distributed.pcp_utils import (
     PcpBalGroup,
     cut_pcp_prefill_ubatches,
@@ -2054,20 +2054,16 @@ class ModelRunner:
                 "Reserving %.2fGB for KV connector buffers", connector_bytes / (1 << 30)
             )
             available_for_kv_budget -= connector_bytes
-        # This prevents OOM when other processes share the GPU. Free HBM must
-        # cover the connector buffers too.
-        free_for_kv = free - connector_bytes
-        if connector_bytes and free_for_kv <= 0:
-            # Otherwise the KV cache gets nothing and the connector allocates
-            # from memory that is not there.
-            raise RuntimeError(
-                f"Only {free / (1 << 30):.2f}GB is free on the GPU, less than "
-                f"the {connector_bytes / (1 << 30):.2f}GB the KV connector "
-                "buffers need after the KV cache is sized; free GPU memory or "
-                "turn those buffers off (ATOM_PD_MLA_STAGING=0 / "
-                "ATOM_PD_MLA_STAGING_CHUNK_PAGES=0 / ATOM_PD_MLA_LANDING=0)."
-            )
-        available_for_kv = min(available_for_kv_budget, free_for_kv)
+        # Every worker builds its pool at rank 0's count, so take the group
+        # minimum before any rank raises alone and leaves the others waiting.
+        groups = (
+            (get_tp_group(), get_pcp_group())
+            if torch.distributed.is_initialized()
+            else ()
+        )
+        free, available_for_kv_budget, free_for_kv, available_for_kv = agree_kv_budget(
+            free, available_for_kv_budget, connector_bytes, groups
+        )
 
         torch.set_default_device(None)
 
