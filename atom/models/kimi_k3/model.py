@@ -777,6 +777,7 @@ class KimiFullAttention(nn.Module):
         atom_config: Config,
         quant_config: QuantizationConfig | None,
         prefix: str = "",
+        alt_stream: torch.cuda.Stream | None = None,
     ):
         super().__init__()
         config = _text_config(atom_config.hf_config)
@@ -892,6 +893,10 @@ class KimiFullAttention(nn.Module):
             if has_indexer
             else None
         )
+        if self.indexer is not None:
+            # A DCP prefill's top-k exchange runs there while `self.attn`
+            # projects q (`sparse_attn_indexer`).
+            self.indexer.exchange_stream = alt_stream
         mla_modules = MLAModules(
             q_lora_rank=self.q_lora_rank,
             kv_lora_rank=self.kv_lora_rank,
@@ -1709,7 +1714,10 @@ class KimiDecoderLayer(nn.Module):
             self.is_linear_attn = True
         else:
             self.self_attn = KimiFullAttention(
-                atom_config, quant_config, prefix=f"{prefix}.self_attn"
+                atom_config,
+                quant_config,
+                prefix=f"{prefix}.self_attn",
+                alt_stream=alt_stream,
             )
             self.is_linear_attn = False
 
@@ -1974,8 +1982,9 @@ class KimiLinearModel(nn.Module):
             self.embed_tokens = PPMissingLayer()
 
         # Shared second stream for dual-stream MoE (shared-expert GEMMs overlap the
-        # routed path). Created once and threaded into every decoder layer; only
-        # used when the model has shared experts.
+        # routed path) and a DSA layer's top-k exchange (overlaps its q path).
+        # Created once and threaded into every decoder layer; only created when
+        # the model has shared experts.
         self.alt_stream = None
         if getattr(config, "num_shared_experts", 0):
             self.alt_stream = torch.cuda.Stream()
