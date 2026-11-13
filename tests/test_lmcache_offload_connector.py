@@ -6017,15 +6017,17 @@ def test_pp_stages_build_k3_tiers_that_key_apart_and_match_the_engine_cap(
 ):
     """The 2 MiB and 1 MiB stages pool 2 GiB over a 3 MiB joint image, so both
     keep 682 images, the cap the engine's index mirrors for the same spec."""
-    from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
     from atom.model_engine.state_offload import state_tier_cpu_entries
 
     monkeypatch.setenv("OFFLOAD_STATE_CPU_SIZE", "1")
     tiers = []
     for stage, image in ((0, 2 << 20), (1, 1 << 20)):
-        spec = PagedStateCheckpointSpec(
-            1 << 20, image, f"stage-{stage}", image_bytes=image
-        ).for_pipeline("pp2-joint:tier-test", 2, 3 << 20, 2 << 20)
+        # what each stage's checkpoint spec gives the tier
+        spec = SimpleNamespace(
+            layout_id="pp2-joint:tier-test",
+            image_bytes=image,
+            pipeline_op_bytes=3 << 20,
+        )
         tier = _pp2_stage_tier(
             monkeypatch, KimiK3OffloadConnector, "kimi_k3", stage, spec
         )
