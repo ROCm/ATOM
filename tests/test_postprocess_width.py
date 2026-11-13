@@ -491,6 +491,7 @@ def test_channel_constraint_preserves_raw_logprobs(
     torch.testing.assert_close(ids[0].long(), top_ids)
     assert torch.all(ranks == 8)
 
+
 @pytest.mark.parametrize("context_kv_only", [False, True])
 def test_a_context_only_producer_leaves_dp_draft_lockstep(context_kv_only):
     """No DP peer is owed the collectives of a propose nobody runs."""
