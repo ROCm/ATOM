@@ -95,5 +95,8 @@ def test_absorb_into_q_out_matches_two_kernel_path(tokens, q_scale):
     torch.testing.assert_close(
         new_q[..., LORA:].view(torch.uint8), ref_q[..., LORA:].view(torch.uint8)
     )
+    # The NaN code sits one step past the largest finite one, which the
+    # step bound below would accept.
+    assert not new_q[..., :LORA].float().isnan().any(), "nope half stores an FP8 NaN"
     steps = (_ordinal(new_q[..., :LORA]) - _ordinal(ref_q[..., :LORA])).abs()
     assert steps.max().item() <= 1, f"nope half off by {steps.max().item()} e4m3 steps"
