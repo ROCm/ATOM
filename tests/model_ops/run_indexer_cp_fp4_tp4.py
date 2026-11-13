@@ -174,6 +174,7 @@ def run_case(dtype, batch, ctx, q_len, kind, seed, rank, world):
         me, q, table, lens, ctx, q_len, md_cp.index_scorer
     )
     off = off if isinstance(off, tuple) else (off,)
+    on = tuple(x for x in on if x is not None)  # NVFP4 KV: the ids, no page table
     exact = [bool(torch.equal(a, b)) for a, b in zip(on, off)]
     rows = batch * q_len
     a, b = on[0].view(rows, TOPK), off[0].view(rows, TOPK)
