@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: MIT
-from types import SimpleNamespace
+import importlib.util
+import sys
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 import torch
 
 from atom.config import DSparkConfig
-from atom.models.deepseek_v41 import draft_kv
 from atom.models.deepseek_v41.config import (
     DeepseekV41TextConfig,
     validate_speculative_config,
@@ -177,8 +179,18 @@ def test_dpa_media_rejected_before_tokenization_and_sequence_creation(
 
 @pytest.fixture
 def a8w8_runtime(monkeypatch):
+    """Load the real validator with only the external AITER query stubbed."""
     query = Mock(return_value="opus")
-    monkeypatch.setattr(draft_kv, "get_mla_sparse_prefill_v41_backend", query)
+    api = ModuleType("aiter.ops.mla_sparse_prefill")
+    api.get_mla_sparse_prefill_v41_backend = query
+    name = "atom.models.deepseek_v41.draft_kv"
+    path = Path(__file__).resolve().parents[3] / "atom/models/deepseek_v41/draft_kv.py"
+    spec = importlib.util.spec_from_file_location(name, path)
+    draft_kv = importlib.util.module_from_spec(spec)
+    with monkeypatch.context() as imports:
+        imports.setitem(sys.modules, api.__name__, api)
+        spec.loader.exec_module(draft_kv)
+    monkeypatch.setitem(sys.modules, name, draft_kv)
     return query
 
 
