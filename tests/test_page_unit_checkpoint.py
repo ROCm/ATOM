@@ -753,3 +753,26 @@ def test_backend_published_unit_overrides_the_share():
 def test_page_unit_needs_target_page_bytes():
     with pytest.raises(RuntimeError, match="declares no PAGE bytes"):
         published_page_unit_bytes(_Builder([state_pool("s", 64, entries_per_req=1)]))
+
+
+def test_only_a_boundary_past_the_prompt_is_marked_decoded():
+    """A decode left that slot's ReplaySSM records behind its SSM; a prefill or
+    midstep write did not, and must be copied as is."""
+    from types import SimpleNamespace
+
+    c = PagedStateCheckpointCoordinator(
+        BlockPool(20),
+        PagedStateCheckpointSpec(10, 25, "layout-v1", image_bytes=25),
+        enabled=True,
+        hash_block_size=16,
+    )
+
+    def seq(slot):
+        return SimpleNamespace(
+            has_per_req_cache=True, state_slot=slot, num_prompt_tokens=100
+        )
+
+    c.checkpoint(seq(1), 8, 101)  # 128 tokens: generated
+    c.checkpoint(seq(2), 6, 102)  # 96 tokens: the prompt
+    stores, _ = c.take_checkpoint_ops()
+    assert {(op.src_slot, op.decoded) for op in stores} == {(1, True), (2, False)}

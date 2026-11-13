@@ -1021,23 +1021,21 @@ class GDNStateMixin(PoolRowsMixin):
             self.model_runner.mamba_v_cache[:, slots] = live
 
     def _fold_replay_records(self, store_ops):
-        """Fold each stored slot's ReplaySSM records into its SSM plane.
+        """Fold each decoded slot's ReplaySSM records into its SSM plane.
 
         The image is resumed by prefill, which reads that plane alone. Returns
         the live planes, to put back once the copy is issued.
         """
-        if not store_ops or not self.replayssm or self._is_kda():
+        decoded = [op.src_slot for op in store_ops if op.decoded]
+        if not decoded or not self.replayssm or self._is_kda():
             return None
-        runner = self.model_runner
-        ssm = runner.mamba_v_cache
-        slots = torch.tensor(
-            [op.src_slot for op in store_ops], dtype=torch.int64, pin_memory=True
-        ).to(ssm.device, non_blocking=True)
-        # Stores run before this step's commit, so the stored position is step 0
-        # of the last window; a prefill-parked cursor (-1) has nothing to fold.
-        steps = torch.where(runner.replayssm_write_pos[slots] >= 0, 0, -1)
+        ssm = self.model_runner.mamba_v_cache
+        slots = torch.tensor(decoded, dtype=torch.int64, pin_memory=True).to(
+            ssm.device, non_blocking=True
+        )
         live = ssm[:, slots]
-        self._materialize_in_place(slots, steps)
+        # Stores run before this step's commit: the image is the last window's step 0.
+        self._materialize_in_place(slots, torch.zeros_like(slots))
         return slots, live
 
     def _materialize_in_place(self, slots, steps) -> None:
@@ -1322,10 +1320,6 @@ class GDNStateMixin(PoolRowsMixin):
             return torch.tensor(col, dtype=torch.int32, device=self.device)
 
         rows, slots, offs, is_end, runtime = zip(*found)
-        if self.replayssm:
-            # A scratch slot gets a whole state, so a previous tenant's records
-            # must not be folded into it at store time.
-            self.model_runner.replayssm_write_pos[list(slots)] = -1
         return {
             "rows": mk(rows),
             "slots": mk(slots),

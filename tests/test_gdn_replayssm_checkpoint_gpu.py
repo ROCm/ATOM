@@ -166,14 +166,14 @@ def _decode(c, slot, accepted, windows):
     ]
 
 
-def _round_trip(c, pairs):
+def _round_trip(c, pairs, decoded=()):
     """Store each `src` in one call, then restore each image into its `dst`."""
     spec = c.model_runner.state_runtime.checkpoint_spec
     n = spec.units_per_checkpoint
     units = [tuple(range(i * n, (i + 1) * n)) for i in range(len(pairs))]
     c.execute_paged_state_copies(
         [
-            CheckpointStoreOp(src, u, spec.op_bytes, LAYOUT)
+            CheckpointStoreOp(src, u, spec.op_bytes, LAYOUT, decoded=src in decoded)
             for (src, _), u in zip(pairs, units)
         ],
         [],
@@ -230,7 +230,7 @@ def test_a_decode_store_resumes_as_the_window_s_first_token(steps):
     r.replayssm_write_pos[REF] = live[-1]
     parked = _slot(c, PARKED)
 
-    _round_trip(c, [(LIVE, DST), (PARKED, DST2)])
+    _round_trip(c, [(LIVE, DST), (PARKED, DST2)], decoded=(LIVE,))
 
     for before, after in zip(live, _slot(c, LIVE)):
         assert torch.equal(before, after), "the store changed the live slot"
