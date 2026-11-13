@@ -5,8 +5,8 @@ use serde_json::Value as Json;
 
 use super::*;
 
-/// Payloads from the engines' own serializers (vLLM 3a104103, SGLang 0c44fbff, ATOM PR-1),
-/// one JSON object per line with the events as serialized.
+/// Payloads from the engines' own serializers (vLLM 3a104103, SGLang 0c44fbff, ATOM main
+/// and ROCm/ATOM#3275), one JSON object per line with the events by field name.
 const SAMPLES: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/kv_events/samples.jsonl"
@@ -23,7 +23,7 @@ const EXPECTED: &str = r#"
     vllm/dp_rank_1                   | rank 1: stored device 2x4
     vllm/salt_first_block            | rank 0: stored device 2x4 salt salt-abc; stored device 1x4 child
     vllm/lora_salt                   | rank 0: stored device 2x4 lora my-lora salt salt-abc
-    vllm/multimodal                  | rank 0: drop namespace
+    vllm/multimodal                  | rank 0: stored device 1x4; drop namespace
     vllm/sliding_window_group        | rank 0: stored device 2x4; stored device 2x4 group 1:slidingwindow(128)
     vllm/lookahead_token_ids         | rank 0: stored device 2x4
     vllm/mooncake_cpu                | rank 0: drop unknowntier
@@ -51,6 +51,8 @@ const EXPECTED: &str = r#"
     atom/remote_kv_gpu               | rank 0: stored device 2x4 child
     atom/multimodal_extra_keys       | rank 0: drop namespace
     atom/dp_rank_2                   | rank 2: stored device 2x4
+    atom/main_stored_root            | rank 0: stored device 2x4
+    atom/main_removed                | rank 0: removed device 1; removed device 1; removed device 1
 "#;
 
 fn render(batch: &DecodedBatch) -> String {
@@ -203,6 +205,10 @@ fn engine_samples_decode_as_specified() {
     assert_eq!(decoded.len(), samples.len(), "unchecked samples");
     let first = |name: &str| decoded_keys(&decoded[name]).remove(0).0;
     assert_eq!(first("vllm/stored_bytes_hashes"), first("vllm/stored_root"));
+    for name in ["stored_root", "removed"] {
+        let main = &decoded[&*format!("atom/main_{name}")];
+        assert_eq!(main, &decoded[&*format!("atom/{name}")]);
+    }
 }
 
 fn msgpack(json: Json) -> Value {
@@ -232,37 +238,6 @@ fn decode(batch: &str) -> Result<DecodedBatch, DecodeError> {
 }
 
 #[test]
-fn array_encoded_events_decode_like_maps() {
-    let arrays = decode(
-        r#"[1.0, [["BlockStored", [1, 2], null, [1, 2, 3, 4, 5, 6, 7, 8], 4, null, "GPU", "trailing field"],
-            ["BlockRemoved", [2], "CPU"], ["AllBlocksCleared"]]]"#,
-    );
-    let maps = decode(
-        r#"[1.0, [{"type": "BlockStored", "block_hashes": [1, 2], "token_ids": [1, 2, 3, 4, 5, 6, 7, 8],
-            "block_size": 4, "medium": "GPU"}, {"type": "BlockRemoved", "block_hashes": [2], "medium": "CPU"},
-            {"type": "AllBlocksCleared"}]]"#,
-    );
-    let arrays = arrays.unwrap();
-    assert_eq!(arrays, maps.unwrap());
-    assert_eq!(
-        render(&arrays),
-        "rank -: stored device 2x4; removed host 1; cleared"
-    );
-}
-
-#[test]
-fn a_multimodal_block_ends_the_event() {
-    let batch = decode(
-        r#"[1.0, [{"type": "BlockStored", "block_hashes": [1, 2, 3], "token_ids": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
-            "block_size": 4, "extra_keys": [null, [["mm-hash", 0]], null]}]]"#,
-    );
-    assert_eq!(
-        render(&batch.unwrap()),
-        "rank -: stored device 1x4; drop namespace"
-    );
-}
-
-#[test]
 fn malformed_input_fails_the_batch_or_drops_the_event() {
     let malformed = VllmWireDecoder::default().decode(&[0xc1]);
     assert!(matches!(malformed, Err(DecodeError::Malformed(_))));
@@ -277,6 +252,4 @@ fn malformed_input_fails_the_batch_or_drops_the_event() {
         render(&batch.unwrap()),
         "rank -: drop decode; drop decode; drop decode"
     );
-    let map_batch = decode(r#"{"ts": 1.0, "events": [], "attn_dp_rank": 3}"#);
-    assert_eq!(map_batch.unwrap().dp_rank, Some(3));
 }

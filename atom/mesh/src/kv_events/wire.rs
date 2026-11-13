@@ -1,11 +1,14 @@
 //! Payload decoding into canonical events.
 //!
-//! All engines publish vLLM's msgpack format: a batch is `[ts, events, data_parallel_rank]`
-//! and each event is a map tagged by `type` (`BlockStored`, `BlockRemoved`,
-//! `AllBlocksCleared`); array-encoded events are accepted too and unknown fields are ignored.
+//! All engines publish vLLM's msgpack format: a batch is `[ts, events, data_parallel_rank]`.
+//! vLLM and SGLang encode each event as a map tagged by `type` (`BlockStored`,
+//! `BlockRemoved`, `AllBlocksCleared`); ATOM does so from ROCm/ATOM#3275 (unmerged), while
+//! ATOM main still encodes events `array_like`, tag first. Both forms are accepted and
+//! unknown fields are ignored.
 //! A block's `extra_keys` entry holds, untagged: the LoRA name, `[mm_identifier, offset]`
-//! pairs, then the cache salt. Any pair marks the block multimodal. ATOM (PR-1) sends one
-//! `[[seed_hex, 0]]` entry per block of a multimodal request and never sends LoRA or salt.
+//! pairs, then the cache salt. Any pair marks the block multimodal. ATOM with #3275 sends
+//! one `[[seed_hex, 0]]` entry per block of a multimodal request and never sends LoRA or
+//! salt; ATOM main sends no `extra_keys`.
 
 use std::sync::Arc;
 
@@ -211,11 +214,10 @@ impl WireDecoder for VllmWireDecoder {
         let malformed = |reason: &str| DecodeError::Malformed(reason.to_string());
         let batch = rmpv::decode::read_value(&mut &*payload)
             .map_err(|e| DecodeError::Malformed(e.to_string()))?;
-        let fields = match &batch {
-            Value::Array(items) => Fields::Array(items, BATCH_FIELDS),
-            Value::Map(pairs) => Fields::Map(pairs),
-            _ => return Err(malformed("batch is neither an array nor a map")),
+        let Value::Array(items) = &batch else {
+            return Err(malformed("batch is not an array"));
         };
+        let fields = Fields::Array(items, BATCH_FIELDS);
         let ts = fields
             .get("ts")
             .and_then(Value::as_f64)
@@ -227,7 +229,6 @@ impl WireDecoder for VllmWireDecoder {
             .ok_or_else(|| malformed("missing events"))?;
         let dp_rank = fields
             .get("data_parallel_rank")
-            .or_else(|| fields.get("attn_dp_rank"))
             .map(|rank| as_u32(rank).ok_or_else(|| malformed("bad data_parallel_rank")))
             .transpose()?;
 

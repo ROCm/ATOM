@@ -123,23 +123,18 @@ const TIERS: [Tier; 3] = [Tier::Device, Tier::Host, Tier::Disk];
 /// reused blocks as stored, with no matching remove.
 const MAX_COPIES: u16 = 8;
 
-/// Column of a tier in `HolderMatch::blocks`. Shared blocks are never indexed.
-fn column(tier: Tier) -> Option<usize> {
+/// Column of a tier in `HolderMatch::blocks`.
+fn column(tier: Tier) -> usize {
     match tier {
-        Tier::Device => Some(0),
-        Tier::Host => Some(1),
-        Tier::Disk => Some(2),
-        Tier::Shared => None,
+        Tier::Device => 0,
+        Tier::Host => 1,
+        Tier::Disk => 2,
     }
 }
 
 /// Columns a clear covers: one tier, or all when `tier` is None.
-fn columns(tier: Option<Tier>) -> Option<std::ops::Range<usize>> {
-    match tier.map(column) {
-        None => Some(0..3),
-        Some(Some(column)) => Some(column..column + 1),
-        Some(None) => None,
-    }
+fn columns(tier: Option<Tier>) -> std::ops::Range<usize> {
+    tier.map_or(0..3, |tier| column(tier)..column(tier) + 1)
 }
 
 fn lane(holder: HolderId) -> u64 {
@@ -167,9 +162,7 @@ impl KvIndex for PrefixIndex {
         }
         for op in ops {
             let (IndexOp::Store { hash, tier } | IndexOp::Remove { hash, tier }) = *op;
-            let Some(column) = column(tier) else {
-                continue;
-            };
+            let column = column(tier);
             let mut shard = self.shards[shard_of(hash)].write();
             if matches!(op, IndexOp::Store { .. }) {
                 shard.upsert(key(hash))[column] |= lane;
@@ -185,7 +178,7 @@ impl KvIndex for PrefixIndex {
 
     /// Rebuilds every shard. A holder table clears through its own entries instead.
     fn clear(&self, holder: HolderId, tier: Option<Tier>) {
-        let (Some(columns), lane @ 1..) = (columns(tier), lane(holder)) else {
+        let (columns, lane @ 1..) = (columns(tier), lane(holder)) else {
             return;
         };
         for shard in &self.shards {
@@ -350,7 +343,7 @@ impl HolderTable {
         ns: &Namespace,
         ops: &mut Vec<IndexOp>,
     ) -> Result<(), DropReason> {
-        let column = column(tier).ok_or(DropReason::Storage)?;
+        let column = column(tier);
         if ns.opaque {
             return Err(DropReason::Namespace);
         }
@@ -390,9 +383,7 @@ impl HolderTable {
 
     /// Hashes the holder never stored here were stored before the router subscribed.
     fn remove(&mut self, hashes: &[EngineHash], tier: Tier, ops: &mut Vec<IndexOp>) {
-        let Some(column) = column(tier) else {
-            return;
-        };
+        let column = column(tier);
         for hash in hashes {
             let Some(slot) = self.slots.get_mut(hash) else {
                 continue;
@@ -414,9 +405,7 @@ impl HolderTable {
 
     /// Removes the holder's own blocks, so a clear costs its entries, not the partition.
     fn clear(&mut self, tier: Option<Tier>, ops: &mut Vec<IndexOp>) {
-        let Some(columns) = columns(tier) else {
-            return;
-        };
+        let columns = columns(tier);
         self.slots.retain(|_, slot| {
             for column in columns.clone() {
                 if slot.counts[column] > 0 {
