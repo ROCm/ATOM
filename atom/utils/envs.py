@@ -666,6 +666,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # V4.1 step: where its time goes, averaged every 64 steps, logged and
     # appended to <prefix>_r<rank>.jsonl). Use with --enforce-eager.
     "ATOM_MONO_TIMELINE": lambda: os.getenv("ATOM_MONO_TIMELINE"),
+    # The output ids a model's own head picked in the forward (greedy, or
+    # drawn seeded alike on every rank) are not broadcast from TP rank 0 when
+    # the model says they agree (`identical_head_ids`): "1" broadcasts them as
+    # other ids, "check" broadcasts them and warns on every step whose ids
+    # differed from rank 0's.
+    "ATOM_HEAD_IDS_SYNC": lambda: os.getenv("ATOM_HEAD_IDS_SYNC", "0"),
     # Debug: the mono kernels bound every mailbox wait (10 s): a wait that gives up
     # records its region, pair and tags, and the runner raises with them at the end
     # of the step (mono/runner.py finish_step) instead of the GPU hanging. Use

@@ -1050,6 +1050,9 @@ class ModelRunner:
         # The installed model's own head output, where it has one: its
         # forward's logits, or a verify's token ids and verdict (`_head_output`).
         self.compute_head = getattr(self.model, "compute_head", None)
+        # Whether that head picks the same output ids on every TP rank, so
+        # `postprocess` need not broadcast them: the model says so.
+        self.identical_head_ids = bool(getattr(self.model, "identical_head_ids", False))
         # A model that can run a whole decode step itself (sampling and
         # verification included); see run_model.
         self._step_override = (
@@ -3593,15 +3596,35 @@ class ModelRunner:
         # Drafter input must agree across TP ranks. Ids only: the verdict is
         # deterministic on TP ranks' bit-identical inputs.
         # (An overridden step's ids are identical on every TP rank, and the
-        # broadcast would wait for the work it queued after them.)
+        # broadcast would wait for the work it queued after them. So are those
+        # of a head that picked every row in the forward, greedy or drawn
+        # seeded alike on every rank, when its model says so
+        # (`identical_head_ids`): ATOM_HEAD_IDS_SYNC=check broadcasts them
+        # anyway and counts the steps whose ids differed.)
+        head_ids = (
+            isinstance(logits, tuple)
+            and getattr(self, "identical_head_ids", False)
+            and envs.ATOM_HEAD_IDS_SYNC != "1"
+        )
         if (
             get_tp_group().world_size > 1
             and self._served is None
+            and (not head_ids or envs.ATOM_HEAD_IDS_SYNC == "check")
             and _needs_id_sync(
                 self.tokenID_processor.is_deferred_out, hasattr(self, "drafter")
             )
         ):
-            sampled_tokens = get_tp_group().broadcast(sampled_tokens, src=0)
+            synced = get_tp_group().broadcast(
+                sampled_tokens.clone() if head_ids else sampled_tokens, src=0
+            )
+            if head_ids and not torch.equal(synced, sampled_tokens):
+                self._head_ids_mismatch = getattr(self, "_head_ids_mismatch", 0) + 1
+                logger.warning(
+                    "rank %d: head ids differ from rank 0's (%d steps so far)",
+                    self.rank,
+                    self._head_ids_mismatch,
+                )
+            sampled_tokens = synced
 
         # From the ids every rank now agrees on. Only a deferred step needs
         # it: otherwise the host has these ids before the next forward.
