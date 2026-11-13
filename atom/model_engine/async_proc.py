@@ -100,6 +100,8 @@ class AsyncIOProc:
         rpc_output_addr: Optional ZMQ endpoint for generic collective-RPC
             replies. Every rank owns one, unlike the primary channel which
             only rank 0 has, so the caller can prove all ranks answered.
+        is_remote: This rank runs on another node than the engine
+            (tp_multinode.py) and reads the broadcast queue over TCP.
     """
 
     # Function names whose output goes to the KV channel instead of primary
@@ -116,6 +118,7 @@ class AsyncIOProc:
         all_ranks_barrier=None,
         *args,
         rpc_output_addr: str | None = None,
+        is_remote: bool = False,
         **kwargs,
     ):
         # Bind this worker's lifetime to its parent EngineCore: if the parent
@@ -174,7 +177,7 @@ class AsyncIOProc:
         self.rpc_queue: queue.Queue | None = None
 
         self.rpc_broadcast_mq = MessageQueue.create_from_handle(input_shm_handle, rank)
-        if self.rpc_broadcast_mq._is_remote_reader:
+        if is_remote:
             from atom.model_engine.tp_multinode import await_release
 
             await_release(self.rpc_broadcast_mq)
@@ -809,9 +812,7 @@ class AsyncIOProcManager:
                 for rank in range(self.proc_num)
             ]
 
-        if payload.barrier and getattr(self, "local_proc_num", self.proc_num) < (
-            self.proc_num
-        ):
+        if payload.barrier and self.local_proc_num < self.proc_num:
             error = (
                 f"cannot run barrier RPC {func_name!r}: the TP ranks on other "
                 f"nodes share no barrier with this one"

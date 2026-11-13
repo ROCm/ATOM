@@ -1366,10 +1366,6 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
         self.padded_num_attention_heads = mla_kernel_num_heads(
             max(self.num_attention_heads, self.min_query_heads)
         )
-        # Whether DCP decode can run in persistent mode on this GPU (gfx950 has
-        # the lse persistent kernel, gfx942 does not — see dcp_utils). Cached
-        # once to gate both the metadata sizing and the runtime persistent path.
-        self.dcp_persistent_supported = dcp_persistent_supported()
         # DCP decode all-gathers Q across the DCP group on the head dim, so the
         # head count reaching mla_decode_fwd (and thus the persistent decode
         # metadata) is the gathered width padded up to a dispatchable kernel.
@@ -1379,18 +1375,25 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
         # stays non-persistent where this metadata is unused, so keep the
         # original per-rank sizing.
         dcp_size = self.parallel_config.decode_context_parallel_size
-        if dcp_size > 1 and self.dcp_persistent_supported:
-            self.persistent_num_heads = mla_dcp_kernel_num_heads(
-                self.num_attention_heads,
-                dcp_size,
-                self.min_query_heads,
-                kv_cache_dtype=config.cache_config.cache_dtype,
-                # These descriptors are only ever handed to the kernel on the
-                # persistent path (`if use_persistent_metadata` in
-                # build()), so the width they must describe is the persistent
-                # one whatever the step later decides.
-                persistent=True,
-            )
+        # These descriptors are only ever handed to the kernel on the
+        # persistent path (`if use_persistent_metadata` in build()), so the
+        # width they must describe is the persistent one whatever the step
+        # later decides.
+        dcp_persistent_width = mla_dcp_kernel_num_heads(
+            self.num_attention_heads,
+            dcp_size,
+            self.min_query_heads,
+            kv_cache_dtype=config.cache_config.cache_dtype,
+            persistent=True,
+        )
+        # Whether aiter runs DCP decode persistent at that width (see
+        # dcp_utils). Cached once to gate both the metadata sizing and the
+        # runtime persistent path.
+        self.dcp_persistent_supported = dcp_size > 1 and dcp_persistent_supported(
+            dcp_persistent_width, config.cache_config.cache_dtype, dcp_size
+        )
+        if self.dcp_persistent_supported:
+            self.persistent_num_heads = dcp_persistent_width
         else:
             self.persistent_num_heads = self.padded_num_attention_heads
         # DCP rank + a persistent buffer for locally derived decode seq lens.

@@ -299,10 +299,14 @@ def test_groups_without_a_timeout_outlast_a_slow_nodes_load(monkeypatch):
     from atom.utils.distributed.utils import raise_default_group_timeout
 
     monkeypatch.setattr(distributed_c10d, "default_pg_timeout", timedelta(minutes=30))
+    monkeypatch.setattr(
+        distributed_c10d, "default_pg_nccl_timeout", timedelta(minutes=10)
+    )
     raise_default_group_timeout(7200)
-    # What a gloo group created without a timeout, as aiter's are, now gets.
-    gloo = distributed_c10d._get_default_timeout(dist.Backend.GLOO)
-    assert gloo == timedelta(hours=2)
+    # What gloo and NCCL groups created without a timeout, as aiter's are, get.
+    for backend in (dist.Backend.GLOO, dist.Backend.NCCL):
+        assert distributed_c10d._get_default_timeout(backend) == timedelta(hours=2)
     # A longer default someone else chose is kept.
     raise_default_group_timeout(60)
-    assert distributed_c10d._get_default_timeout(dist.Backend.GLOO) == gloo
+    for backend in (dist.Backend.GLOO, dist.Backend.NCCL):
+        assert distributed_c10d._get_default_timeout(backend) == timedelta(hours=2)

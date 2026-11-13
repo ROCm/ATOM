@@ -142,12 +142,8 @@ def common_refusals(
         ),
         (pcp_group_size_of(atom_config) == 1, "prefill CP or Ulysses SP"),
         # Mono's peer buffers are HIP IPC mappings, which cannot reach a GPU on
-        # another node. Read like `compilation_config` below: a config without
-        # the attribute (plugin modes) is a single-node one.
-        (
-            not getattr(atom_config, "is_multinode_tp", False),
-            "TP group spans nodes (HIP IPC peer memory)",
-        ),
+        # another node.
+        (not atom_config.is_multinode_tp, "TP group spans nodes (HIP IPC peer memory)"),
         (not (atom_config.enable_tbo or atom_config.enable_tbo_decode), "TBO"),
         (not (is_vllm() or is_sglang()), "plugin mode"),
         (

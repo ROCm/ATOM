@@ -1270,7 +1270,7 @@ def test_sparse_prefill_builder_allocates_for_its_consumer(
     for module in (backends, aiter_mla):
         monkeypatch.setattr(module, "get_dcp_world_size", lambda: world)
         monkeypatch.setattr(module, "get_dcp_rank", lambda: 0)
-    monkeypatch.setattr(aiter_mla, "dcp_persistent_supported", lambda: True)
+    monkeypatch.setattr(aiter_mla, "dcp_persistent_supported", lambda *_: True)
     cfg = SimpleNamespace(
         hf_config=SimpleNamespace(
             num_attention_heads=96,

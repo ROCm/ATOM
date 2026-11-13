@@ -42,6 +42,7 @@ def atom_config(**overrides):
         "pipeline_parallel_size": 1,
         "decode_context_parallel_size": 1,
         "prefill_context_parallel_size": 1,
+        "is_multinode_tp": False,
         "enable_tbo": False,
         "enable_tbo_decode": False,
         "compilation_config": NS(level=0),

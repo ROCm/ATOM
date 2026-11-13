@@ -35,15 +35,21 @@ def get_tcp_uri(ip: str, port: int) -> str:
 def raise_default_group_timeout(seconds: int) -> None:
     """Raise, never lower, the timeout torch gives groups created without one.
 
-    aiter builds its gloo groups that way. Across nodes their first collective
-    after the weight load waits for the slowest node, and a cold read of a large
-    checkpoint from NFS can trail another node's by more than the 30 minutes.
+    The default group and aiter's gloo and NCCL groups are built that way.
+    Across nodes their first collective after the weight load waits for the
+    slowest node, and a cold read of a large checkpoint from NFS can trail
+    another node's by more than torch's defaults (30 minutes for gloo, 10 for
+    NCCL).
     """
     from torch.distributed import distributed_c10d
 
+    floor = timedelta(seconds=seconds)
     distributed_c10d.default_pg_timeout = max(
-        distributed_c10d.default_pg_timeout, timedelta(seconds=seconds)
+        distributed_c10d.default_pg_timeout, floor
     )
+    nccl = distributed_c10d.default_pg_nccl_timeout
+    if nccl is not None:  # None in a torch built without NCCL
+        distributed_c10d.default_pg_nccl_timeout = max(nccl, floor)
 
 
 def raise_timeout_if_dp_spans_nodes(parallel_config) -> None:
@@ -55,6 +61,13 @@ def raise_timeout_if_dp_spans_nodes(parallel_config) -> None:
     match ranks 1.. of a single-node group.
     """
     if parallel_config.data_parallel_size_local < parallel_config.data_parallel_size:
+        raise_default_group_timeout(envs.ATOM_MULTINODE_PG_TIMEOUT_S)
+
+
+def raise_timeout_if_tp_spans_nodes(config) -> None:
+    """Apply ATOM_MULTINODE_PG_TIMEOUT_S when the TP group has ranks on other
+    nodes (tp_multinode.py), as raise_timeout_if_dp_spans_nodes does for DP."""
+    if config.is_multinode_tp:
         raise_default_group_timeout(envs.ATOM_MULTINODE_PG_TIMEOUT_S)
 
 

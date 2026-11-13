@@ -815,7 +815,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # How long the nodes of a TP group that spans nodes wait for each other at
     # startup: a remote node for the engine's endpoints, the engine for every
     # remote rank to subscribe to its broadcast queue, a rank on the
-    # model-runner store and in its process groups' first collectives.
+    # model-runner store. Process groups take ATOM_MULTINODE_PG_TIMEOUT_S.
     "ATOM_MULTINODE_TP_TIMEOUT_S": lambda: _positive_float_env(
         "ATOM_MULTINODE_TP_TIMEOUT_S", "1800"
     ),

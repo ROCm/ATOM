@@ -886,7 +886,6 @@ class MLAAttention(nn.Module):
         self._qrep_local_proj = None
         self._qrep_local_src = None
 
-        self.dcp_persistent_supported = dcp_persistent_supported()
         self.dcp_prefill_merge_bf16_ok = dcp_prefill_merge_bf16_ok()
         # Every sparse DCP shape is per-token q_len=1 rows -- one per sequence
         # in decode, one per query token in sparse prefill and MTP verify.
@@ -936,6 +935,19 @@ class MLAAttention(nn.Module):
         # dispatchable one. The pad sits entirely inside _forward_decode: it goes
         # on after the gather and comes off before the cross-rank combine, so it
         # never costs collective traffic.
+        # Whether aiter runs this layer's DCP decode persistent, at the width
+        # the persistent path gathers to.
+        self.dcp_persistent_supported = dcp_world_size > 1 and dcp_persistent_supported(
+            mla_dcp_kernel_num_heads(
+                self.num_heads,
+                dcp_world_size,
+                self.min_query_heads,
+                kv_cache_dtype=self.kv_cache_dtype,
+                persistent=True,
+            ),
+            self.kv_cache_dtype,
+            dcp_world_size,
+        )
         self.dcp_kernel_num_heads = self.num_heads
         self.dcp_head_pad = 0
         if dcp_world_size > 1:

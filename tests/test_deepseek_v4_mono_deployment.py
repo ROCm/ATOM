@@ -44,6 +44,7 @@ def _atom_config(**overrides):
         "pipeline_parallel_size": 1,
         "prefill_context_parallel_size": 1,
         "decode_context_parallel_size": 1,
+        "is_multinode_tp": False,
         "parallel_config": SimpleNamespace(data_parallel_size=1),
         "kv_cache_dtype": "fp8",
         "index_cache_dtype": "fp4",

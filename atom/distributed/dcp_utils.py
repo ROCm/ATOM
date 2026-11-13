@@ -7,7 +7,7 @@ state), mirroring ``pcp_utils.py``.
 
 Scope: the world-size / group wrappers are ATOM native (server) mode only —
 the vLLM plugin resolves those from ``vllm.distributed`` instead.
-``dcp_persistent_supported()`` is the one exception (arch-based, shared by
+``dcp_persistent_supported`` is the one exception (an aiter query, shared by
 both). DCP compute / communication primitives live in ``atom.model_ops.dcp_ops``;
 this module is only the distributed-access layer.
 """
@@ -54,24 +54,34 @@ def get_dcp_rank() -> int:
     return get_dcp_group().rank_in_group if dcp_is_enabled() else 0
 
 
-def dcp_persistent_supported() -> bool:
-    """Whether DCP decode can run in *persistent* mode on this GPU.
+def dcp_persistent_supported(
+    num_heads: int, kv_cache_dtype: str, dcp_world_size: int
+) -> bool:
+    """Whether DCP decode can run in *persistent* mode at ``num_heads`` gathered
+    query heads.
 
-    Needs an lse-emitting persistent decode kernel: gfx950's ASM one, and on
-    gfx1250 the PS1 FP8 one that AITER_MLA_DECODE_PS1_FLYDSL=1 selects (aiter
-    #5844 added DCP to it); without that, gfx1250's non-persistent decode takes
-    only 64-token pages. gfx942 falls back to the triton stage2 reduce instead.
-    Cache the result once per ``__init__`` — calling this per-forward would
-    graph-break on ``get_gfx()``.
+    Asks aiter whether mla_decode_fwd has a persistent decode that returns the
+    lse DCP's merge needs, for this call: gfx950's ASM kernels, and gfx1250's
+    PS1 ones when AITER_MLA_DECODE_PS1_FLYDSL=1 selects them. gfx942 has none
+    and falls back to the triton stage2 reduce. Cache the result once per
+    ``__init__``; it is not for the forward pass.
     """
-    import os
+    import torch
+    from aiter import dtypes
+    from aiter.ops.attention import get_mla_decode_shape_support
 
-    from aiter.jit.utils.chip_info import get_gfx
-
-    gfx = get_gfx()
-    if gfx == "gfx1250":
-        return os.environ.get("AITER_MLA_DECODE_PS1_FLYDSL", "0") == "1"
-    return gfx == "gfx950"
+    dtype = dtypes.fp8 if kv_cache_dtype.startswith("fp8") else torch.bfloat16
+    support = get_mla_decode_shape_support(
+        num_heads,
+        1,
+        dtype,
+        dtype,
+        persistent=True,
+        return_lse=True,
+        cp_world_size=dcp_world_size,
+        page_size=max(envs.ATOM_MLA_PAGE_SIZE, 1),
+    )
+    return support.supported is not False
 
 
 def mla_dcp_decode_is_persistent(

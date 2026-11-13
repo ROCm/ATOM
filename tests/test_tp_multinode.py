@@ -25,6 +25,7 @@ def _clean_environment(monkeypatch):
         "ATOM_DP_MASTER_PORT",
         "ATOM_DP_BASE_PORT",
         "ATOM_MULTINODE_TP_TIMEOUT_S",
+        "ATOM_MULTINODE_PG_TIMEOUT_S",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -140,27 +141,24 @@ def test_a_rank_store_client_waits_as_long_as_tp_setup(
 
 
 @pytest.mark.parametrize("spans_nodes", [True, False])
-def test_groups_without_a_timeout_wait_as_long_as_tp_setup(monkeypatch, spans_nodes):
+def test_a_tp_group_across_nodes_raises_the_group_timeout(monkeypatch, spans_nodes):
     from torch.distributed import distributed_c10d
 
-    monkeypatch.setenv("ATOM_MULTINODE_TP_TIMEOUT_S", "3600")
+    from atom.utils.distributed.utils import raise_timeout_if_tp_spans_nodes
+
+    monkeypatch.setenv("ATOM_MULTINODE_PG_TIMEOUT_S", "3600")
     monkeypatch.setattr(distributed_c10d, "default_pg_timeout", timedelta(minutes=30))
     monkeypatch.setattr(
         distributed_c10d, "default_pg_nccl_timeout", timedelta(minutes=10)
     )
-    config = SimpleNamespace(is_multinode_tp=spans_nodes)
-    tp_multinode.raise_timeout_if_tp_spans_nodes(config)
+    raise_timeout_if_tp_spans_nodes(SimpleNamespace(is_multinode_tp=spans_nodes))
     # What the default group and aiter's groups, created without one, get.
     gloo = distributed_c10d._get_default_timeout(dist.Backend.GLOO)
     nccl = distributed_c10d._get_default_timeout(dist.Backend.NCCL)
-    if not spans_nodes:
+    if spans_nodes:
+        assert gloo == nccl == timedelta(hours=1)
+    else:
         assert (gloo, nccl) == (timedelta(minutes=30), timedelta(minutes=10))
-        return
-    assert gloo == nccl == timedelta(hours=1)
-    # A longer default is kept.
-    monkeypatch.setenv("ATOM_MULTINODE_TP_TIMEOUT_S", "60")
-    tp_multinode.raise_timeout_if_tp_spans_nodes(config)
-    assert distributed_c10d._get_default_timeout(dist.Backend.NCCL) == nccl
 
 
 def test_a_remote_rank_replies_to_an_ipv6_host():
@@ -304,3 +302,49 @@ def test_the_engine_stops_when_a_worker_node_reports(monkeypatch):
             break
         time.sleep(0.01)
     assert exited and reported
+
+
+class _Socket:
+    """The broadcast queue's remote socket: replays *incoming*, records sends."""
+
+    def __init__(self, *incoming):
+        self.incoming, self.sent = list(incoming), []
+
+    def poll(self, timeout):
+        return bool(self.incoming)
+
+    def recv(self):
+        return self.incoming.pop(0)
+
+    def send(self, msg):
+        self.sent.append(msg)
+
+
+def test_remote_readers_are_released_once_all_subscribe():
+    sock = _Socket(b"\x01", b"\x01")
+    tp_multinode.release_remote_readers(
+        SimpleNamespace(remote_socket=sock), 2, lambda: True
+    )
+    assert sock.sent == [tp_multinode._READY]
+    tp_multinode.await_release(SimpleNamespace(remote_socket=_Socket(*sock.sent)))
+
+
+def test_remote_readers_that_never_subscribe_time_out(monkeypatch):
+    monkeypatch.setenv("ATOM_MULTINODE_TP_TIMEOUT_S", "0.01")
+    sock = _Socket(b"\x01")
+    with pytest.raises(TimeoutError, match="1 of 2 TP ranks"):
+        tp_multinode.release_remote_readers(
+            SimpleNamespace(remote_socket=sock), 2, lambda: True
+        )
+    assert sock.sent == []
+
+
+@pytest.mark.parametrize(
+    "incoming,error",
+    [((b"\x01data",), RuntimeError), ((), TimeoutError)],
+    ids=["wrong_first_message", "timeout"],
+)
+def test_a_remote_reader_refuses_anything_but_the_release(monkeypatch, incoming, error):
+    monkeypatch.setenv("ATOM_MULTINODE_TP_TIMEOUT_S", "0.01")
+    with pytest.raises(error):
+        tp_multinode.await_release(SimpleNamespace(remote_socket=_Socket(*incoming)))

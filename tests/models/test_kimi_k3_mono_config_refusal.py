@@ -74,6 +74,7 @@ def _atom_config(**hf_overrides):
         enable_expert_parallel=False,
         decode_context_parallel_size=1,
         prefill_context_parallel_size=1,
+        is_multinode_tp=False,
         enable_tbo=False,
         enable_tbo_decode=False,
         kv_transfer_config=None,

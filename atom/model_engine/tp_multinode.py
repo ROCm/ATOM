@@ -67,28 +67,6 @@ def managed_store_client(config):
     )
 
 
-def raise_timeout_if_tp_spans_nodes(config) -> None:
-    """Apply ATOM_MULTINODE_TP_TIMEOUT_S to the process groups created without a
-    timeout when the TP group spans nodes.
-
-    The default group and aiter's TP groups are. Across nodes their first
-    collectives wait for the slowest node's load, which torch's defaults (30
-    minutes for gloo, 10 for NCCL) need not cover. Raises those defaults and
-    never lowers them.
-    """
-    if not config.is_multinode_tp:
-        return
-    from torch.distributed import distributed_c10d
-
-    from atom.utils.distributed.utils import raise_default_group_timeout
-
-    seconds = envs.ATOM_MULTINODE_TP_TIMEOUT_S
-    raise_default_group_timeout(seconds)
-    nccl = distributed_c10d.default_pg_nccl_timeout
-    if nccl is not None:
-        distributed_c10d.default_pg_nccl_timeout = max(nccl, timedelta(seconds=seconds))
-
-
 def _engine_key(engine_id: str, name: str) -> str:
     return f"atom/tp_multinode/{engine_id}/{name}"
 
@@ -245,7 +223,10 @@ def serve_remote_tp_ranks(engine_args) -> int:
                 config,
                 *runner_args,
             ),
-            kwargs={"rpc_output_addr": info["rpc_output_addrs"][rank]},
+            kwargs={
+                "rpc_output_addr": info["rpc_output_addrs"][rank],
+                "is_remote": True,
+            },
         )
         proc.start()
         procs.append(proc)

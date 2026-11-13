@@ -90,10 +90,7 @@ from atom.model_engine.token_logprobs import (
     pack_token_logprobs,
     unpack_token_logprobs,
 )
-from atom.model_engine.tp_multinode import (
-    managed_store_client,
-    raise_timeout_if_tp_spans_nodes,
-)
+from atom.model_engine.tp_multinode import managed_store_client
 from atom.model_loader.loader import load_model
 from atom.model_ops.attentions.pool_layout.entry_arena import plan_regions
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import (
@@ -135,7 +132,10 @@ from atom.utils import (
     resolve_obj_by_qualname,
     worker_process_name,
 )
-from atom.utils.distributed.utils import raise_timeout_if_dp_spans_nodes
+from atom.utils.distributed.utils import (
+    raise_timeout_if_dp_spans_nodes,
+    raise_timeout_if_tp_spans_nodes,
+)
 from atom.utils.forward_context import (
     Context,
     ForwardMode,
