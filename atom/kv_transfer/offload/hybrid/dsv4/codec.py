@@ -717,6 +717,9 @@ class DSV4PageSlotCodec:
             return
         pool = lease.pool
         pool.assert_thread()
+        # Before any launch only the ID upload is on the stream, and its event
+        # says when the buffer is free again; a launched kernel may still read it.
+        safe = safe or not lease.launched
         event = lease.completion
         if safe and event is None:
             try:
@@ -791,6 +794,8 @@ class DSV4PageSlotCodec:
                 if gather
                 else self._triton_page_slot._scatter_region_items_unchecked
             )
+            if owner._metadata_lease is not None:
+                owner._metadata_lease.launched = True
             copy(
                 owner._region_plan,
                 item_ids,

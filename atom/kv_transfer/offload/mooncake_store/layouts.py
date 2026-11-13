@@ -111,8 +111,8 @@ def require_mooncake_layout(name: str) -> MooncakeLayout:
 
 def metadata_reserve_bytes(config: Any) -> int:
     """HBM one transfer thread's metadata lease pool may hold."""
-    layout = require_mooncake_layout(offcfg.select_offload_layout(config))
-    return METADATA_GPU_RESERVE_BYTES if layout.metadata_leases else 0
+    layout = MOONCAKE_LAYOUTS.get(offcfg.select_offload_layout(config))
+    return METADATA_GPU_RESERVE_BYTES if layout and layout.metadata_leases else 0
 
 
 def mooncake_codec_id(config: Any) -> str:
