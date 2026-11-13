@@ -8,14 +8,13 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EngineHash(pub u64);
 
-/// Cache tiers, fastest load first. Engine events only produce Device, Host and Disk;
-/// Shared comes from the shared-storage path.
+/// Engine cache tiers, fastest load first. Shared storage is not one: it is looked up per
+/// request (`kv_storage`), never indexed from events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Tier {
     Device,
     Host,
-    Shared,
     Disk,
 }
 
