@@ -145,6 +145,52 @@ def test_split_partitions_match_the_exact_reference(
         assert err < 6e-3, (t, err.item())
 
 
+def _merged(sp_o, sp_m, sp_l, n_part):
+    """The partitions merged as K4's merge_token does, in float64: [16, HEAD_DIM]."""
+    m, l, o = (
+        sp_m[:n_part].double(),
+        sp_l[:n_part].double(),
+        sp_o[:n_part].view(n_part, 16, HEAD_DIM).double(),
+    )
+    w = torch.exp(m - m.max(0).values) * l
+    return (w[..., None] * o).sum(0) / w.sum(0)[:, None]
+
+
+def test_f32_partition_outputs_merge_closer_to_the_exact_reference():
+    """``sp_f32``: the partitions' outputs stored unrounded (K4 rounds each 256-key
+    partition to bf16 otherwise) merge closer to the float64 attention over all the
+    keys; the f32 outputs are the bf16 ones up to that rounding."""
+    n_logical, n_sel, tail, k_gs, v_gs = 40, 16, 77, 0.8, 1.3
+    ref, pages, page_of, sel, q, _ctx, _ = _case(3, n_logical, n_sel, tail, k_gs, v_gs)
+    tbl, n_keys, n_part = _tables(page_of, sel, tail, 1)
+    gs = torch.tensor([k_gs, v_gs], device="cuda", dtype=torch.float32)
+    sp_m = torch.zeros(N_SPLIT, H, device="cuda", dtype=torch.float32)
+    sp_l = torch.zeros(N_SPLIT, H, device="cuda", dtype=torch.float32)
+    outs = {}
+    for f32 in (False, True):
+        sp_o = torch.zeros(
+            N_SPLIT, O_K, device="cuda", dtype=torch.float32 if f32 else torch.bfloat16
+        )
+        build_split_nvfp4_kernel(SM_SCALE, N_SPLIT, sp_f32=f32)(
+            tbl.data_ptr(), q.data_ptr(), pages.data_ptr(), gs.data_ptr(),
+            sp_o.data_ptr(), sp_m.data_ptr(), sp_l.data_ptr(), 0,
+        )  # fmt: skip
+        torch.cuda.synchronize()
+        outs[f32] = _merged(sp_o, sp_m, sp_l, n_part)
+    want = _reference(ref, pages, page_of, sel, q, n_keys, k_gs, v_gs)
+    m = torch.stack([w[1] for w in want])
+    l = torch.stack([w[2] for w in want])
+    o = torch.stack([w[0] for w in want])
+    w = torch.exp(m - m.max(0).values) * l
+    exact = (w[..., None] * o).sum(0) / w.sum(0)[:, None]
+    err = {f: ((outs[f] - exact).norm() / exact.norm()).item() for f in outs}
+    print(
+        f"merged rel L2 vs the float64 reference: bf16 partitions {err[False]:.3e}, f32 {err[True]:.3e}"
+    )
+    assert err[True] < err[False]
+    assert err[True] < 3e-3
+
+
 @pytest.mark.skipif(not PA_KERNELS, reason="needs the aiter nvfp4 sparse pa kernels")
 def test_merged_split_equals_aiter_sparse_pa_decode():
     import aiter.ops.flydsl.kernels as pkg
