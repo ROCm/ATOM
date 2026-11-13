@@ -34,9 +34,7 @@ def test_atomesh_accuracy_uses_required_heavy_ci_gate():
 
     jobs = workflow["jobs"]
     gate_env = next(
-        step["env"]
-        for step in jobs["ci-gate"]["steps"]
-        if step.get("id") == "gate"
+        step["env"] for step in jobs["ci-gate"]["steps"] if step.get("id") == "gate"
     )
     assert gate_env["CI_GATE_WORKFLOW"] == "atomesh-accuracy-validation.yaml"
     assert gate_env["CI_GATE_LABELS"] == "ci:full,ci:atomesh"
@@ -67,12 +65,14 @@ def test_atomesh_accuracy_uses_required_heavy_ci_gate():
         if step.get("uses") == "./.github/actions/evaluate-test-gate"
     )
     evaluate_inputs = evaluate_step["with"]
-    assert "atomesh-test=${{ needs.atomesh-test.result }}" in evaluate_inputs[
-        "optional-results"
-    ]
-    assert "load-test-models=${{ needs.load-test-models.result }}" in evaluate_inputs[
-        "required-results"
-    ]
+    assert (
+        "atomesh-test=${{ needs.atomesh-test.result }}"
+        in evaluate_inputs["optional-results"]
+    )
+    assert (
+        "load-test-models=${{ needs.load-test-models.result }}"
+        in evaluate_inputs["required-results"]
+    )
 
 
 def test_atomesh_benchmark_uses_required_heavy_ci_gate():
@@ -85,16 +85,12 @@ def test_atomesh_benchmark_uses_required_heavy_ci_gate():
 
     jobs = workflow["jobs"]
     gate_env = next(
-        step["env"]
-        for step in jobs["ci-gate"]["steps"]
-        if step.get("id") == "gate"
+        step["env"] for step in jobs["ci-gate"]["steps"] if step.get("id") == "gate"
     )
     assert gate_env["CI_GATE_WORKFLOW"] == "atomesh-benchmark.yaml"
     assert gate_env["CI_GATE_LABELS"] == "ci:full,ci:atomesh"
     assert "atom/mesh/**" in gate_env["CI_GATE_PATHS_INCLUDE"]
-    assert ".github/benchmark/models_atomesh.yaml" in gate_env[
-        "CI_GATE_PATHS_INCLUDE"
-    ]
+    assert ".github/benchmark/models_atomesh.yaml" in gate_env["CI_GATE_PATHS_INCLUDE"]
 
     assert jobs["load-config"]["needs"] == ["ci-gate"]
     assert jobs["rdma-smoke-test"]["needs"] == ["ci-gate", "load-config"]
@@ -115,9 +111,10 @@ def test_atomesh_benchmark_uses_required_heavy_ci_gate():
         if step.get("uses") == "./.github/actions/evaluate-test-gate"
     )
     evaluate_inputs = evaluate_step["with"]
-    assert "load-config=${{ needs.load-config.result }}" in evaluate_inputs[
-        "required-results"
-    ]
+    assert (
+        "load-config=${{ needs.load-config.result }}"
+        in evaluate_inputs["required-results"]
+    )
     assert "run-model-benchmark=${{ needs.run-model-benchmark.result }}" in (
         evaluate_inputs["optional-results"]
     )

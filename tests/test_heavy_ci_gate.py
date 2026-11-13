@@ -322,7 +322,8 @@ def test_paths_outside_include_remain_gated(tmp_path):
     )
 
     assert result["should_run"] == "false"
-    assert result["reason"] == "ignored-paths-only"
+    assert result["reason"] == "paths-not-included"
+    assert result["smoke_requested"] == "false"
 
 
 def _previous_run(**updates):
