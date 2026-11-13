@@ -5,7 +5,7 @@ on:
     branches: [main]
     paths:
       - 'atom/mesh/**'
-      - 'atom/model_engine/zmq_protocol/**'  # engine_v1.proto, built by --features atom-engine
+      - 'atom/model_engine/zmq_protocol/**'  # engine_v1.proto, built by atom/mesh/build.rs
       - '.github/scripts/atomesh/atomesh_mocker_benchmark.sh'
       - '.github/scripts/atomesh/atomesh_mocker_benchmark_summary.py'
       - '.github/workflows/atomesh-mocker-benchmark.yaml'
@@ -16,7 +16,7 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - 'atom/mesh/**'
-      - 'atom/model_engine/zmq_protocol/**'  # engine_v1.proto, built by --features atom-engine
+      - 'atom/model_engine/zmq_protocol/**'  # engine_v1.proto, built by atom/mesh/build.rs
       - '.github/scripts/atomesh/atomesh_mocker_benchmark.sh'
       - '.github/scripts/atomesh/atomesh_mocker_benchmark_summary.py'
       - '.github/workflows/atomesh-mocker-benchmark.yaml'
@@ -105,12 +105,11 @@ jobs:
       - name: Run atomesh unit tests
         run: |
           set -euo pipefail
-          # Every unit test in the library, the optional ATOM engine runtime's
-          # included.
+          # Every unit test in the library.
           cargo test \
             --manifest-path atom/mesh/Cargo.toml \
             --target-dir atom/mesh/mocker/target/mesh \
-            --profile ci --lib --features atom-engine
+            --profile ci --lib
 
       # Nothing else builds the optional ext-proc feature or its protox
       # codegen; checking it, its tests included, keeps that path compiling.

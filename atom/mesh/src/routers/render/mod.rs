@@ -2,6 +2,7 @@
 
 pub mod chat_aggregator;
 pub mod chat_streaming;
+pub mod completion;
 pub mod generate_aggregator;
 pub mod generate_streaming;
 pub(crate) mod logprob_conversion;

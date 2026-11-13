@@ -14,7 +14,6 @@ use crate::{
         prepare::response_context::{ProtocolRequest, ResponseContext},
         render::logprob_conversion::{input_logprobs_to_generate, output_logprobs_to_generate},
         token_handle::{
-            engine_error::EngineError,
             token_chunk::{FinishReason, MatchedStop, TokenChunk},
             token_handle::TokenHandle,
         },
@@ -143,7 +142,7 @@ async fn collect_completes(mut stream: TokenHandle) -> Result<Vec<TokenChunk>, R
         match item {
             Ok(chunk @ TokenChunk::Complete { .. }) => completes.push(chunk),
             Ok(TokenChunk::Partial { .. }) => continue,
-            Err(e) => return Err(engine_error_to_response(e)),
+            Err(e) => return Err(e.into_response()),
         }
     }
     stream.mark_completed();
@@ -164,31 +163,5 @@ fn finish_reason_to_generate(r: &FinishReason, completion_tokens: u32) -> Genera
         }
         FinishReason::Abort => GenerateFinishReason::Other(Value::String("abort".to_string())),
         FinishReason::Other(s) => GenerateFinishReason::Other(Value::String(s.clone())),
-    }
-}
-
-fn engine_error_to_response(err: EngineError) -> Response {
-    match err {
-        EngineError::Transport(s) => {
-            error::service_unavailable("engine_transport_error", format!("transport error: {}", s))
-        }
-        EngineError::Prefill(m) => {
-            error::internal_error("engine_prefill_error", format!("prefill error: {}", m))
-        }
-        EngineError::DecodeError(m) => {
-            error::internal_error("engine_decode_error", format!("decode error: {}", m))
-        }
-        EngineError::PrefillEarlyClose => error::internal_error(
-            "engine_prefill_early_close",
-            "prefill stream closed without Complete",
-        ),
-        EngineError::DecodeIncomplete => error::internal_error(
-            "engine_decode_incomplete",
-            "decode stream closed without Complete",
-        ),
-        EngineError::ConnectionAcquireFailed(r) => {
-            error::service_unavailable("engine_connection_failed", r)
-        }
-        EngineError::RequestBuildFailed(r) => error::bad_request("engine_request_build_failed", r),
     }
 }
