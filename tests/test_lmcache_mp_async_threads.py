@@ -10,7 +10,13 @@ import time
 from types import SimpleNamespace
 
 import pytest
-from test_lmcache_mp import _config, _WorkerAdapter, fake_lmcache_modules  # noqa: F401
+from test_lmcache_mp import (  # noqa: F401
+    _config,
+    _install_salt_adapters,
+    _SaltKey,
+    _WorkerAdapter,
+    fake_lmcache_modules,
+)
 from test_lmcache_mp_async_lookup import CHUNK, _Adapter, _Client, _Future
 
 from atom.kv_transfer.offload.chunked_scheduler import ChunkedOffloadSchedulerBase
@@ -20,6 +26,7 @@ from atom.kv_transfer.offload.metadata import (
     SaveSpec,
 )
 from atom.kv_transfer.offload.mp import lookup as mp_lookup
+from atom.kv_transfer.offload.mp import scheduler as mp_scheduler
 from atom.kv_transfer.offload.mp import transfer_thread
 from atom.kv_transfer.offload.mp import worker as mp_worker
 from atom.kv_transfer.offload.mp.lookup_driver import _LockedAdapter
@@ -83,6 +90,28 @@ def test_driver_sends_and_answers_an_offered_lookup_without_a_pump():
         assert len(fake.lookups) == 1
     finally:
         client.close()
+
+
+@pytest.mark.parametrize("salt", ["11", ""])
+def test_offered_and_submitted_lookups_key_under_the_prompts_salt(monkeypatch, salt):
+    class AtomMPSchedulerAdapter(_Adapter):
+        def __init__(self, **_kwargs):
+            super().__init__(_PerRequestClient(chunks=1))
+
+        def _create_key(self, token_ids, start, end, request_id, worker_id):
+            return _SaltKey(request_id)
+
+    _install_salt_adapters(monkeypatch, scheduler_base=AtomMPSchedulerAdapter)
+    adapter = mp_scheduler._make_scheduler_adapter(_config())
+    client = _driven_client(adapter)
+    configs = {"request_configs": {"lmcache.tag.cache_salt": salt}} if salt else {}
+    try:
+        assert client.offer("offered", lambda: list(range(8)), **configs)
+        assert client.submit(list(range(8)), "submitted", **configs)
+        assert _wait_until(lambda: len(adapter._client.lookups) == 2)
+    finally:
+        client.close()
+    assert [key.cache_salt for key, _ in adapter._client.lookups] == [salt, salt]
 
 
 def test_driver_keeps_answered_plus_in_flight_lookups_within_the_window():

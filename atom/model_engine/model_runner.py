@@ -33,7 +33,7 @@ from torch.profiler import record_function
 
 from atom import structured_output
 from atom.config import Config, local_device_index, set_current_atom_config
-from atom.distributed.group_agreement import group_min
+from atom.distributed.group_agreement import agree_kv_budget, group_min
 from atom.distributed.pcp_utils import (
     PcpBalGroup,
     cut_pcp_prefill_ubatches,
@@ -68,7 +68,7 @@ from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.output_transfer import D2HQueue
 from atom.model_engine.page_unit_checkpoint import (
     PagedStateCheckpointSpec,
-    resolve_checkpoint_page_unit_bytes,
+    published_page_unit_bytes,
 )
 from atom.model_engine.run_labels import build_run_label
 from atom.model_engine.scheduler import (
@@ -97,6 +97,7 @@ from atom.model_ops.attentions.pool_layout.sub_pool_spec import (
     Pool,
     PoolPlan,
     SubPoolSpec,
+    page_entry_bytes,
     page_pool,
     plan_pools,
 )
@@ -2041,9 +2042,7 @@ class ModelRunner:
         # None means the backend has not narrowed its image: carry it all.
         narrowed = self.attn_metadata_builder.checkpoint_image_bytes()
         return PagedStateCheckpointSpec(
-            page_unit_bytes=resolve_checkpoint_page_unit_bytes(
-                self.attn_metadata_builder
-            ),
+            page_unit_bytes=published_page_unit_bytes(self.attn_metadata_builder),
             slot_bytes=slot_bytes,
             image_bytes=slot_bytes if narrowed is None else int(narrowed),
             layout_id=transfer.paged_layout_id,
@@ -2140,20 +2139,16 @@ class ModelRunner:
                 "Reserving %.2fGB for KV connector buffers", connector_bytes / (1 << 30)
             )
             available_for_kv_budget -= connector_bytes
-        # This prevents OOM when other processes share the GPU. Free HBM must
-        # cover the connector buffers too.
-        free_for_kv = free - connector_bytes
-        if connector_bytes and free_for_kv <= 0:
-            # Otherwise the KV cache gets nothing and the connector allocates
-            # from memory that is not there.
-            raise RuntimeError(
-                f"Only {free / (1 << 30):.2f}GB is free on the GPU, less than "
-                f"the {connector_bytes / (1 << 30):.2f}GB the KV connector "
-                "buffers need after the KV cache is sized; free GPU memory or "
-                "turn those buffers off (ATOM_PD_MLA_STAGING=0 / "
-                "ATOM_PD_MLA_LANDING=0)."
-            )
-        available_for_kv = min(available_for_kv_budget, free_for_kv)
+        # Every worker builds its pool at rank 0's count, so take the group
+        # minimum before any rank raises alone and leaves the others waiting.
+        groups = (
+            (get_tp_group(), get_pcp_group())
+            if torch.distributed.is_initialized()
+            else ()
+        )
+        free, available_for_kv_budget, free_for_kv, available_for_kv = agree_kv_budget(
+            free, available_for_kv_budget, connector_bytes, groups
+        )
 
         torch.set_default_device(None)
 
@@ -2420,9 +2415,7 @@ class ModelRunner:
         for builder, size in zip(builders, sizes):
             if not size:
                 continue
-            charged = blocks * sum(
-                s.entry_bytes for s in builder.sub_pool_specs() if s.pool is Pool.PAGE
-            )
+            charged = blocks * page_entry_bytes(builder.sub_pool_specs())
             if size != charged:
                 raise ValueError(
                     f"{type(builder).__name__} wants {size} B of the paged pool "

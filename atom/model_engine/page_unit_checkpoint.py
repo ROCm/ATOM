@@ -14,7 +14,7 @@ from time import monotonic
 from atom.kv_transfer.disaggregation.types import StateStoreOperationId
 from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.sequence import Sequence
-from atom.model_ops.attentions.pool_layout.sub_pool_spec import Pool
+from atom.model_ops.attentions.pool_layout.sub_pool_spec import page_entry_bytes
 
 _CHANGE_LOG_LIMIT = 4096
 
@@ -177,30 +177,32 @@ class PagedStateCheckpointSpec:
         )
 
 
-def resolve_checkpoint_page_unit_bytes(builder: object) -> int:
-    """Bytes of one block that a PAGE-backed state checkpoint moves.
+def published_page_unit_bytes(builder) -> int:
+    """Bytes of one PAGE unit a checkpoint transfer publishes for `builder`.
 
-    The plan's PAGE `entry_bytes` is what a block id is charged, and other
-    contributors share that class: a draft pool's KV and the routed-expert
-    capture rows ride the same block ids but are not part of the state
-    image. Only the target builder's own PAGE specs are. Within those the
-    backend may narrow further (MHA alignment padding is not a region).
+    The state image lives in the target's own PAGE rows, so the unit is the
+    target builder's share of the paged class, not the merged entry: a draft
+    KV pool joined to the same class is ordinary KV after those rows, and the
+    routed-expert capture rows are charged to the block id but not declared
+    by the builder. A
+    backend whose charged share exceeds what it publishes (alignment padding
+    that is not a region) narrows it with `checkpoint_page_unit_bytes()`;
+    `None` keeps the share.
     """
-    page_unit_bytes = sum(
-        s.entry_bytes for s in builder.sub_pool_specs() if s.pool is Pool.PAGE
-    )
+    unit = page_entry_bytes(builder.sub_pool_specs())
+    if unit <= 0:
+        raise RuntimeError(f"{type(builder).__name__} declares no PAGE bytes")
     published_unit = getattr(builder, "checkpoint_page_unit_bytes", None)
-    if callable(published_unit):
-        published = published_unit()
-        if published is not None:
-            published = int(published)
-            if published <= 0 or published > page_unit_bytes:
-                raise RuntimeError(
-                    f"checkpoint PAGE unit is {published} B but the "
-                    f"builder's paged entry is {page_unit_bytes} B"
-                )
-            page_unit_bytes = published
-    return int(page_unit_bytes)
+    published = published_unit() if callable(published_unit) else None
+    if published is None:
+        return unit
+    published = int(published)
+    if published <= 0 or published > unit:
+        raise RuntimeError(
+            f"checkpoint PAGE unit is {published} B but "
+            f"{type(builder).__name__} declares {unit} B per block"
+        )
+    return published
 
 
 def checkpoint_copy_ops_per_batch(max_num_seqs: int) -> int:

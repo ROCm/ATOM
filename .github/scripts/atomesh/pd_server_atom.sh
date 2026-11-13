@@ -2453,6 +2453,18 @@ wait_for_torch_traces() {
   done
 }
 
+# Saves the router's /metrics with its scrape time. A failed scrape only warns.
+save_router_metrics() {
+  local output="$1"
+  local scraped_at metrics
+  scraped_at="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
+  if metrics="$(curl -sSf --max-time 10 "http://127.0.0.1:${ROUTER_PORT}/metrics")"; then
+    printf '# scraped_at %s\n%s\n' "${scraped_at}" "${metrics}" > "${output}"
+  else
+    echo "[aiperf] WARNING: router /metrics snapshot failed" >&2
+  fi
+}
+
 run_aiperf_agentic_benchmark() {
   ensure_agentx_harness
 
@@ -2522,6 +2534,12 @@ run_aiperf_agentic_benchmark() {
         > >(tee "${out_dir}/torch_profile.log") 2>&1 &
       profile_pid=$!
     fi
+    # collect_metrics.py creates metrics/ itself, so the baseline waits outside it.
+    local router_before="${out_dir}/router-metrics-before.prom"
+    rm -f "${router_before}"
+    if [[ "${AGGREGATED}" != "1" ]]; then
+      save_router_metrics "${router_before}"
+    fi
     AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT="${AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT}" \
     AIPERF_HTTP_TCP_USER_TIMEOUT="${AIPERF_HTTP_TCP_USER_TIMEOUT}" \
     AIPERF_DATASET_CONFIGURATION_TIMEOUT="${AIPERF_DATASET_CONFIGURATION_TIMEOUT}" \
@@ -2563,6 +2581,22 @@ run_aiperf_agentic_benchmark() {
     echo "${aiperf_pid}" > "${aiperf_pid_file}"
     local aiperf_rc=0
     wait "${aiperf_pid}" || aiperf_rc=$?
+    if [[ "${AGGREGATED}" != "1" ]]; then
+      # Every concurrency level shares this router, so the counters after the
+      # run include the earlier levels. Stage the baseline and this run's
+      # increase with the latency report.
+      local router_metrics="${out_dir}/metrics"
+      mkdir -p "${router_metrics}"
+      save_router_metrics "${router_metrics}/router-metrics.prom"
+      if [[ -f "${router_before}" ]]; then
+        mv "${router_before}" "${router_metrics}/"
+      fi
+      python3 "${ATOMESH_SCRIPT_DIR}/observability/router_metrics_delta.py" \
+        "${router_metrics}/router-metrics-before.prom" \
+        "${router_metrics}/router-metrics.prom" \
+        --output "${router_metrics}/router-metrics-delta.prom" \
+        || echo "[aiperf] WARNING: router metrics increase not computed" >&2
+    fi
 
     if [[ -n "${profile_pid}" ]]; then
       touch "${profile_done}"
