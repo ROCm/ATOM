@@ -1,8 +1,6 @@
 //! Per-rank admission and recovery state. Ranks are independent: a broken stream only
-//! affects its own `url@rank` holder.
-//!
-//! No engine offers snapshots yet, so the snapshot branches of the admission table wait
-//! for one; a gap that replay cannot fill clears the holder.
+//! affects its own `url@rank` holder. No engine offers snapshots, so a gap that replay
+//! cannot fill clears the holder.
 
 use std::{
     collections::VecDeque,
@@ -60,7 +58,7 @@ pub struct BatchMeta {
     pub clears: bool,
 }
 
-/// From the source's caps: `replay`, and `stale_after` only if it declares a heartbeat.
+/// `replay` if the source has a replay socket; `stale_after` only if it declares a heartbeat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RankPolicy {
     pub replay: bool,
@@ -114,11 +112,6 @@ impl<B> RankState<B> {
 
     pub fn phase(&self) -> Phase {
         self.phase
-    }
-
-    /// Timestamp of the newest applied batch.
-    pub fn last_ts(&self) -> Option<f64> {
-        self.last_ts
     }
 
     pub fn admit(&mut self, meta: BatchMeta, batch: B, now: Instant) -> Vec<Action<B>> {
@@ -306,7 +299,6 @@ mod tests {
         clear makes a gap irrelevant      | none      | L0 -> apply 0; L3 -> clear, apply 3; LC4 -> from_clear 4; L5 -> apply 5 | live exact
         restart, first batches missed     | replay    | L0 -> apply 0; L1 -> apply 1; L2 -> apply 2; L1@9 -> clear, replay 0; R0@8 -> apply 0; R1@9 -> apply 1; E -> skip | live exact
         restart with the startup clear    | replay    | L0 -> apply 0; L1 -> apply 1; LC0@9 -> from_clear 0 | live exact
-        contiguous                        | replay    | L0 -> apply 0; L1 -> apply 1; L2 -> apply 2 | live exact
         gap filled by replay              | replay    | L0 -> apply 0; L3 -> replay 1; L4; ?recovering exact; R1 -> apply 1; R2 -> apply 2; R3 -> apply 3; E -> skip, apply 4 | live exact
         replay timeout gives the gap up   | replay    | L0 -> apply 0; L3 -> replay 1; L4; T4; T1 -> clear, apply 3, apply 4; E | live partial
         replay window gone                | replay    | L0 -> apply 0; L4 -> replay 1; R3 -> clear, apply 3; R4 -> apply 4; E -> skip | live partial
