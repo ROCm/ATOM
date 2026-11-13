@@ -211,6 +211,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_MORIIO_WRITE_TIMEOUT_S": lambda: float(
         os.getenv("ATOM_MORIIO_WRITE_TIMEOUT_S", "600")
     ),
+    # MoRIIO P/D write mode, prefill side: serve and report pushes on a
+    # dedicated thread as soon as they are asked for and land, instead of from
+    # the engine step's get_finished, which adds up to a few steps. Off by
+    # default: under concurrency ATOM_MORIIO_VERIFY still finds a few receives
+    # whose PAGE blocks differ from the producer's.
+    "ATOM_MORIIO_WRITE_THREAD": lambda: _flag_env("ATOM_MORIIO_WRITE_THREAD", "0"),
     # MoRIIO P/D: log the layers a receive left unchanged (debugging). With
     # moriio_backend fabric: compare a digest of every PAGE region's blocks
     # between the producer's source and the consumer's destination.
