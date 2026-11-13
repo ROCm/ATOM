@@ -12,7 +12,6 @@ architecture string participates in the decision.
 
 from __future__ import annotations
 
-from copy import copy
 from typing import Any
 
 from atom.kv_transfer.disaggregation.base import (
@@ -87,12 +86,7 @@ class LMCacheMPConnector(KVConnectorBase):
             # The forward rebuilds the state from the PAGE below any hit
             # (`StateTransfer.replay`), a tier load's included, so PAGE alone
             # is all a load has to bring.
-            # A composite P/D connector also publishes live STATE slots for
-            # Mooncake. Offload reconstructs those slots instead of loading
-            # them; keep the shared descriptor intact for the P/D transport.
-            transfer_tensors = copy(transfer_tensors)
-            transfer_tensors.num_slots = 0
-            transfer_tensors.slot_regions = []
+            transfer_tensors = transfer_tensors.without_slots()
             impl = mp_worker.LMCacheMPConnector(self._config)
         elif _has_per_request_state(kv_caches):
             # Fork-slot GDN (pipeline parallelism, RapidServe) publishes no

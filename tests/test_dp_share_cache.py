@@ -161,7 +161,6 @@ def test_a_released_unsent_seq_gives_its_charge_back():
 
 def test_load_threshold_is_per_config_and_preserves_explicit_override(monkeypatch):
     from atom.config import Config
-    from atom.kv_transfer.offload.config import min_load_tokens
 
     monkeypatch.delenv("OFFLOAD_MIN_LOAD_TOKENS", raising=False)
     store = {"kv_connector": "mooncake_store", "kv_role": "offload"}
@@ -174,20 +173,20 @@ def test_load_threshold_is_per_config_and_preserves_explicit_override(monkeypatc
         return config
 
     first = snapshot(store)
-    assert min_load_tokens(first) == 512
-    assert (
-        min_load_tokens(snapshot({"kv_connector": "multi", "connectors": [pd, store]}))
-        == 512
-    )
-    assert min_load_tokens(snapshot({"kv_connector": "lmcache_mp"})) == 8192
-    assert min_load_tokens(snapshot({})) == 8192
+    assert first.offload_min_load_tokens == 512
+    multi = snapshot({"kv_connector": "multi", "connectors": [pd, store]})
+    assert multi.offload_min_load_tokens == 512
+    assert snapshot({"kv_connector": "lmcache_mp"}).offload_min_load_tokens == 8192
+    assert snapshot({}).offload_min_load_tokens == 8192
     assert "OFFLOAD_MIN_LOAD_TOKENS" not in os.environ
     monkeypatch.setenv("OFFLOAD_MIN_LOAD_TOKENS", "2048")
-    assert min_load_tokens(snapshot(store)) == 2048
-    assert min_load_tokens(snapshot({"kv_connector": "lmcache_mp"})) == 2048
-    assert min_load_tokens(first) == 512  # workers retain their parent's snapshot
+    assert snapshot(store).offload_min_load_tokens == 2048
+    assert snapshot({"kv_connector": "lmcache_mp"}).offload_min_load_tokens == 2048
+    assert (
+        first.offload_min_load_tokens == 512
+    )  # workers retain their parent's snapshot
     monkeypatch.setenv("OFFLOAD_MIN_LOAD_TOKENS", "0")
-    assert min_load_tokens(snapshot(store)) == 0
+    assert snapshot(store).offload_min_load_tokens == 0
 
 
 def test_a_newcomer_does_not_take_a_prefix_from_an_owner_still_prefilling_it():
@@ -248,10 +247,16 @@ def test_the_backlog_report_skips_aborted_requests_and_bounds_its_scan():
     # 10 scanned, 90 extrapolated.
     assert prefill_backlog(_scheduler_with([live] * 100), scan=10) == 10_000
     decoding = SimpleNamespace(
-        status=SequenceStatus.RUNNING, tokens=500, num_completion_tokens=3
+        status=SequenceStatus.RUNNING,
+        tokens=500,
+        num_completion_tokens=3,
+        is_partial_prefill=False,
     )
     prefilling = SimpleNamespace(
-        status=SequenceStatus.RUNNING, tokens=40, num_completion_tokens=0
+        status=SequenceStatus.RUNNING,
+        tokens=40,
+        num_completion_tokens=0,
+        is_partial_prefill=False,
     )
     assert prefill_backlog(_scheduler_with([], [decoding, prefilling])) == 40
 
@@ -356,6 +361,7 @@ def test_share_cache_refuses_a_store_split_into_per_nic_pools():
         mgr._dp_session_affinity_enabled = False
         mgr._dp_lb_req_equiv = 512
         config = SimpleNamespace(
+            offload_min_load_tokens=512,
             dp_load_balance="share_cache",
             enable_prefix_caching=True,
             kv_transfer_config={

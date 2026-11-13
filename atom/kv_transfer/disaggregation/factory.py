@@ -21,6 +21,7 @@ from atom.kv_transfer.disaggregation.base import (
     KVConnectorSchedulerBase,
 )
 from atom.kv_transfer.offload import register_backends
+from atom.kv_transfer.offload.config import DEFAULT_MIN_LOAD_TOKENS, connector_extras
 from atom.kv_transfer.offload.tier import OffloadTierProfile
 from atom.utils import envs
 
@@ -104,6 +105,7 @@ class KVConnectorFactory:
     # A backend's transfer granularity, read off its connector config alone:
     # "module:function" taking the leaf's `kv_transfer_config`. Absent means 1.
     _chunk_tokens: ClassVar[dict[str, str]] = {}
+    _lowers_hbm_hit_to_chunk: ClassVar[dict[str, bool]] = {}
 
     @classmethod
     def register(
@@ -122,6 +124,7 @@ class KVConnectorFactory:
         min_load_tokens: int | None = None,
         shared_tier: bool = False,
         chunk_tokens: str | None = None,
+        lowers_hbm_hit_to_chunk: bool = False,
     ) -> None:
         """Register a KV connector backend.
 
@@ -133,6 +136,9 @@ class KVConnectorFactory:
             scheduler_class: Class name within *scheduler_module*.
             offload: The backend is a KV offload tier; a ``multi`` runs at most
                 one (`is_offload_backend`).
+            min_load_tokens: This tier's own default for the smallest hit worth
+                loading (`resolve_min_load_tokens`); None keeps the global
+                default.
             reads_block_regions: Whether this backend reads the PAGE region
                 map. A predicate of the engine config is asked when the answer
                 depends on the model. The default is True.
@@ -141,6 +147,8 @@ class KVConnectorFactory:
             chunk_tokens: ``"module:function"`` returning the tier's transfer
                 granularity in tokens from the leaf's ``kv_transfer_config``
                 (`offload_tier`).
+            lowers_hbm_hit_to_chunk: Admission may reload an unaligned HBM tail
+                from the preceding transfer chunk, rather than recompute it.
         """
         cls._registry[name] = {
             "worker_module": worker_module,
@@ -172,6 +180,7 @@ class KVConnectorFactory:
         cls._offload[name] = bool(offload)
         cls._min_load_tokens[name] = min_load_tokens
         cls._shared_tier[name] = bool(shared_tier)
+        cls._lowers_hbm_hit_to_chunk[name] = bool(lowers_hbm_hit_to_chunk)
         if chunk_tokens:
             cls._chunk_tokens[name] = chunk_tokens
 
@@ -214,17 +223,24 @@ class KVConnectorFactory:
         return cls._lowers_hbm_hit_to_chunk.get(name, False)
 
     @classmethod
-    def offload_min_load_tokens(cls, config: Any) -> int | None:
-        """The configured offload tier's own default `min_load_tokens`, or None.
+    def resolve_min_load_tokens(cls, config: Any) -> int:
+        """`OFFLOAD_MIN_LOAD_TOKENS` for this configuration: the user's value,
+        else the configured offload tier's own default, else
+        `DEFAULT_MIN_LOAD_TOKENS`.
 
-        A ``multi`` runs at most one offload tier, so this reads that leaf, not
-        the P/D transport beside it.
+        Called once, by `Config`, which keeps it in `offload_min_load_tokens`;
+        it is never written into the process environment, so another engine in
+        the process keeps its own. A ``multi`` runs at most one offload tier, so
+        this reads that leaf, not the P/D transport beside it.
         """
-
+        override = envs.OFFLOAD_MIN_LOAD_TOKENS
+        if override is not None:
+            return override
         for name, _ in cls.leaf_connectors(config) or ():
             if cls.is_offload_backend(name):
-                return cls._min_load_tokens.get(name)
-        return None
+                tier = cls._min_load_tokens.get(name)
+                return DEFAULT_MIN_LOAD_TOKENS if tier is None else tier
+        return DEFAULT_MIN_LOAD_TOKENS
 
     @classmethod
     def offload_tier(cls, config: Any) -> OffloadTierProfile:
@@ -235,13 +251,13 @@ class KVConnectorFactory:
             return OffloadTierProfile()
         tier = shared = False
         chunk_tokens = 1
+        lowers_hbm_hit_to_chunk = False
         for name, sub in cls.leaf_connectors(config) or ():
             role = (getattr(sub, "kv_transfer_config", None) or {}).get(
                 "kv_role", "offload"
             )
             if cls.is_offload_backend(name) and role in ("offload", "kv_both"):
                 if name == "mooncake_store":
-                    from atom.kv_transfer.offload.config import connector_extras
                     from atom.kv_transfer.offload.mooncake_store.config import (
                         parse_mooncake_store_config,
                     )
@@ -261,6 +277,7 @@ class KVConnectorFactory:
                             )
                 tier = True
                 shared |= cls._shared_tier.get(name, False)
+                lowers_hbm_hit_to_chunk |= cls._lowers_hbm_hit_to_chunk.get(name, False)
                 hook = cls._chunk_tokens.get(name)
                 if hook:
                     module, _, attr = hook.partition(":")
@@ -271,8 +288,9 @@ class KVConnectorFactory:
             return OffloadTierProfile()
         return OffloadTierProfile(
             loads=shared,
-            min_load_tokens=int(envs.OFFLOAD_MIN_LOAD_TOKENS),
+            min_load_tokens=config.offload_min_load_tokens,
             load_chunk_tokens=chunk_tokens,
+            lowers_hbm_hit_to_chunk=lowers_hbm_hit_to_chunk,
         )
 
     @classmethod

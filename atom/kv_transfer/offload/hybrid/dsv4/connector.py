@@ -63,7 +63,6 @@ from atom.kv_transfer.offload._offload_common import (
     tokens_to_tensor,
     validated_kv_role,
 )
-from atom.kv_transfer.offload.config import min_load_tokens
 from atom.kv_transfer.offload.hybrid.dsv4.codec import (
     HEADER_BYTES,
     DSV4CheckpointCodec,
@@ -1915,7 +1914,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         # chunk-aligned, recompute the misaligned head up to the next chunk
         # boundary, then load the aligned remainder from CPU. (Previously gated
         # by the OFFLOAD_UNALIGNED_HANDOFF env var; now unconditional.)
-        self._min_load_tokens = min_load_tokens(config)
+        self._min_load_tokens = config.offload_min_load_tokens
 
         world = offcfg.lmcache_replica_world_size(config)
         meta = offcfg.build_lmcache_metadata(config, cfg, world, 0)
@@ -2248,7 +2247,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             return False, "stateful_nonzero_hbm_floor", hbm, lmc, need, chunk
         if hbm % chunk != 0:
             return False, "unaligned_hbm_prefill", hbm, lmc, need, chunk
-        min_load = int(getattr(self, "_min_load_tokens", 8192))
+        min_load = int(self._min_load_tokens)
         if not tier_load_tokens(hbm, lmc, chunk, min_load):
             return False, "too_small", hbm, lmc, need, chunk
         return True, "aligned_large_hit", hbm, lmc, need, chunk
