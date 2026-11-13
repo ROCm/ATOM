@@ -55,7 +55,9 @@ def test_structured_verify_keeps_raw_logprobs(modules, monkeypatch, probabilisti
     runner = object.__new__(mod.ModelRunner)
     runner.forward_done_event = NS(record=lambda *args: None)
     runner._served = None
-    # No bonus side stream off-device: the draw stays inline.
+    # object.__new__ skips __init__, so the runner has no bonus side stream:
+    # with _bonus_stream None the draw stays inline even though the
+    # probabilistic step asks for the overlap.
     runner._bonus_stream = runner._bonus_ready = None
     observed = {}
     prefixes = {0: object()}

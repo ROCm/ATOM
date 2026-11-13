@@ -66,7 +66,7 @@ from atom.model_ops.dspark_markov_argmax import (
 from atom.model_ops.dspark_markov_stage1 import markov_logits_tile
 from atom.model_ops.rejection_sampler import _draft_token, _finish_request
 from atom.model_ops.sampler import SAMPLER_EPS
-from atom.model_ops.tile_argmax import argmax_lowest_id
+from atom.model_ops.tile_argmax import NO_HIT, argmax_lowest_id
 from atom.utils import envs
 
 _BLOCK_K = _markov_stage1.BLOCK_K
@@ -92,8 +92,6 @@ GREEDY_T = float(torch.tensor(SAMPLER_EPS, dtype=torch.float32).item())
 _GREEDY_T = tl.constexpr(GREEDY_T)
 # Smallest positive value of Triton's fp32 tl.rand.
 _RAND_MIN = tl.constexpr(4.6566127342e-10)
-# `argmax_lowest_id`'s answer for a tile with no hit: past every column.
-_NO_HIT = tl.constexpr(2147483647)
 # Top-p search: coarse bisection passes over the row, then the tokens left in
 # the bracket are compacted (<= _CAND_CAP) and the search finishes on them.
 _COARSE_ITERS = 12
@@ -179,8 +177,9 @@ def _sampled_tile_argmax(
     """One (row tile, V tile) of a sampled block position: the biased logits
     z (`markov_logits_tile`), stored to ``q_out`` (fp32, pre-temperature:
     verification rebuilds q from exactly these), then the Gumbel-perturbed
-    scores' (max, lowest local column); a tile with no hit (all NaN) answers
-    `_NO_HIT`. Shared by `_prob_markov_stage1` and the fused chain."""
+    scores' (max, lowest local column). A tile with no hit answers `NO_HIT`:
+    one with no lane inside the vocabulary as well as an all-NaN one. Shared
+    by `_prob_markov_stage1` and the fused chain."""
     z = markov_logits_tile(
         base_ptr,
         prev_ids_ptr,
@@ -216,7 +215,7 @@ def _sampled_tile_argmax(
     g = _gumbel(seed, noise_offs)
     # Padded lanes hold z = -inf, hence score -inf, and are masked anyway.
     score = tl.where(greedy[:, None], z, z * inv_t[:, None] + g)
-    return argmax_lowest_id(score, offs_v[None, :], v_mask[None, :], _NO_HIT)
+    return argmax_lowest_id(score, offs_v[None, :], v_mask[None, :], NO_HIT)
 
 
 @triton.jit
@@ -285,7 +284,7 @@ def _prob_markov_stage1(
         BLOCK_K,
         FROM_PACKED=False,
     )
-    tile_idx = tl.where(tile_idx != _NO_HIT, tile_idx + vocab_offset, vocab_size)
+    tile_idx = tl.where(tile_idx != NO_HIT, tile_idx + vocab_offset, vocab_size)
     tl.store(part_val_ptr + tile * num_rows + offs_row, tile_max, mask=row_mask)
     tl.store(part_idx_ptr + tile * num_rows + offs_row, tile_idx, mask=row_mask)
 
