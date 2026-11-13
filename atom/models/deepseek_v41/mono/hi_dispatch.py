@@ -133,8 +133,9 @@ class HiDecodeModel(MonoDecodeModel):
 
 
 class HiDraftModel(MonoDraftModel):
-    """``MonoDraftModel`` with the hi hook's block draft (module docstring): up to ``HiLayers.dr_bmax`` requests run on
-    the hi path. (The context-KV write of a served step is the hook's ``CTX`` launch, inside the target graph.)
+    """The bf16 block draft uses hi up to ``HiLayers.dr_bmax`` requests. FP8
+    keeps the native mono draft arithmetic; target and context writes use hi.
+    The context write of a served step is inside the target graph.
     """
 
     def __init__(self, draft: nn.Module, dp_ranks: int, hook) -> None:
@@ -143,6 +144,8 @@ class HiDraftModel(MonoDraftModel):
 
     def block_backbone(self, input_ids, positions, num_draft):
         hook = self.hi
+        if getattr(hook, "kv_dtype", "bf16") == "fp8":
+            return super().block_backbone(input_ids, positions, num_draft)
         width = self.model.block_size if num_draft is None else num_draft
         requests = input_ids.numel()
         if hook.draft_serves(requests, width):

@@ -131,6 +131,7 @@ class _Plan:
         True  # the cache entry's FP4 QAT (False: the rotated bf16 latent, unquantized)
     )
     kv8: bool = False
+    native_pool: bool = False
 
     @property
     def rd(self) -> str:
@@ -356,7 +357,10 @@ def _pool(k, t, p: _Plan):
         m = fx.max(s0, sc)
         e0, e1 = fx.Float32(fmath.exp(s0 - m)), fx.Float32(fmath.exp(sc - m))
         tot = e0 + e1
-        y = bf16_round(kv0 * (e0 / tot) + kv * (e1 / tot))
+        if p.native_pool:
+            y = (kv0 * e0 + kv * e1) / tot
+        else:
+            y = bf16_round(kv0 * (e0 / tot) + kv * (e1 / tot))
         # state: the step's last row of each slot writes it (after the first row has read its partner)
         slot = pos % p.slots
         last = j + p.slots >= p.spec
@@ -373,15 +377,21 @@ def _pool(k, t, p: _Plan):
         vals = [
             fx.Float32(fx.ptr_load(k.ldsf + (8 * lane + 2 * w + e))) for e in range(2)
         ]
-        word = bf16_pair(vals[0], vals[1]).bitcast(fx.Int32)
-        ss = dot2_bf16(word, word, ss)
+        if p.native_pool:
+            ss = ss + vals[0] * vals[0] + vals[1] * vals[1]
+        else:
+            word = bf16_pair(vals[0], vals[1]).bitcast(fx.Int32)
+            ss = dot2_bf16(word, word, ss)
     tot = wave_sum(
         ss
     )  # every wave computes it (wave 0's is the one), no second barrier
     rstd = hw_rsq(tot * (1.0 / HD) + fx.Float32(p.eps))
-    lat = bf16_round(y * rstd * gamma)
+    normed = y * rstd * gamma
+    lat = bf16_round(normed)
     # RoPE on the last 64 channels (adjacent pairs), at the group's first position
-    entry = _rope_lanes(lat, c, HD - ROPE, cs)
+    entry = _rope_lanes(normed if p.native_pool else lat, c, HD - ROPE, cs)
+    if p.native_pool:
+        entry = bf16_round(entry)
     if emits is not None:
         zero = fx.Float32(0.0)
         entry = emits.select(entry, zero)
@@ -431,7 +441,7 @@ class Compressor(Block):
                  cache_len: int, latent: Channel | None = None, kv_state: str = "", score_state: str = "",
                  slots: int = 0, index_out: Channel | None = None, kslices: int = 4,
                  tiles: int = 1, poll_batch: int = 0, eps: float = 1e-20, qat: bool = True,
-                 kv8: bool = False):  # fmt: skip
+                 kv8: bool = False, native_pool: bool = False):  # fmt: skip
         if ratio not in (1, 2):
             raise ValueError(
                 f"Compressor {name}: ratio 1 or 2 (DeepSeek-V4.1's), got {ratio}"
@@ -484,6 +494,7 @@ class Compressor(Block):
         # cache without the QAT, ATOM's). A numerics choice, not a schedule knob
         self.qat = qat
         self.kv8 = kv8
+        self.native_pool = kv8 and native_pool
 
     def plan(self, sc: Scenario) -> _Plan:
         spec = sc.spec
@@ -494,7 +505,8 @@ class Compressor(Block):
                      self.dots[0].part.name, self.dots[1].part.name if self.ratio == 2 else "", self.pos, self.rope,
                      self.aux, self.cache, self.cache_len, self.kv_state, self.score_state, self.out.name,
                      self.latent.name if self.latent else "", self.eps, self.poll_batch,
-                     self.index_out.name if self.index_out else "", flag, self.qat, self.kv8)  # fmt: skip
+                     self.index_out.name if self.index_out else "", flag, self.qat, self.kv8,
+                     self.native_pool)  # fmt: skip
 
     def stages(self, sc: Scenario) -> list[Stage]:
         p = self.plan(sc)

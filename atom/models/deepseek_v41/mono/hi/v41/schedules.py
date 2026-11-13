@@ -126,6 +126,7 @@ DEFAULT: dict = {
     # the gate's reference is the ATOM-arithmetic one, keyed by these three) or the official
     # model's (True / False / False, the hw reference's). Numerics choices, never schedule entries
     "KV_FP8": False,  # ATOM's MXFP8 pool (512 E4M3 + 16 E8M0 bytes), dequantized for the bf16 attention MFMA
+    "KV8_POOL_F32": True,  # fp8 only: retain ATOM's fused compressor FP32 pool and norm intermediates
     "COMPRESS_QAT": False,  # the KV sources' compressed-cache entry: the rotated bf16 latent as is (ATOM's bf16 pool;
     #                         Compressor(qat=False)) or FP4 QAT'd (True: the official model's)
     "IDX_SCORE_F32": True,  # the index scores in f32 (q . k, relu(s) w, the head sum, an F32 channel, TopK's f32 mode;

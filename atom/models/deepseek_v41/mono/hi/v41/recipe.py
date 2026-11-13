@@ -635,6 +635,7 @@ def window_layer_blocks(first: bool, split: bool = False, tp: int = 1, replay: b
                 tiles=ctiles,
                 qat=bool(k.COMPRESS_QAT),
                 kv8=bool(k.KV_FP8),
+                native_pool=bool(k.KV8_POOL_F32),
             )
         ]
     if src is not None and src.index:

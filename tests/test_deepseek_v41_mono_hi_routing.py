@@ -49,6 +49,34 @@ class _Hook:
         self.invalidated.append(step)
 
 
+@pytest.mark.parametrize("kv_dtype", ["bf16", "fp8"])
+def test_draft_precision_route(D, monkeypatch, kv_dtype):
+    calls = []
+    draft = D.HiDraftModel.__new__(D.HiDraftModel)
+    torch.nn.Module.__init__(draft)
+    draft.model = SimpleNamespace(
+        block_size=5, embed=lambda ids: ids, _noise_embedding=lambda: None
+    )
+    draft.hi = SimpleNamespace(
+        kv_dtype=kv_dtype,
+        draft_serves=lambda requests, width: True,
+        draft_run=lambda *args: calls.append("hi"),
+    )
+
+    def native(self, ids, positions, width):
+        calls.append("native")
+        return "native output"
+
+    monkeypatch.setattr(D.MonoDraftModel, "block_backbone", native)
+    metadata = SimpleNamespace(cache=None, state_slot_out=torch.zeros(2))
+    monkeypatch.setattr(
+        D, "get_forward_context", lambda: SimpleNamespace(attn_metadata=metadata)
+    )
+    output = draft.block_backbone(torch.zeros(2), torch.zeros(2), 5)
+    assert calls == (["native"] if kv_dtype == "fp8" else ["hi"])
+    assert output == "native output" if kv_dtype == "fp8" else output is D._HI_DRAFT
+
+
 class _K12:
     def __init__(self, made):
         made.append(self)
