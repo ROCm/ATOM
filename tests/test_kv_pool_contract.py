@@ -27,9 +27,10 @@ ATTENTIONS = (
 # The draft's builder is not an attention backend -- it holds a pool without
 # knowing what flavor fills it -- but it answers the same runner hook, so the
 # same contract binds it.
-SOURCES = sorted(ATTENTIONS.glob("*.py")) + [
+DRAFT_KV = (
     pathlib.Path(__file__).resolve().parent.parent / "atom/spec_decode/draft_kv.py"
-]
+)
+SOURCES = sorted(ATTENTIONS.glob("*.py")) + [DRAFT_KV]
 
 HOOK = "allocate_kv_cache_tensors"
 RUNNER = (
@@ -166,14 +167,14 @@ def test_neither_has_a_default(path, cls, fn, arg):
 
 # ── Who builds a draft a pool of its own ───────────────────────────────────
 #
-# Two members that have to agree: the flag `draft_kv_builder` reads, and the
-# factory it calls once the flag says yes. Getting the flag wrong is the silent
-# half -- a backend that builds pools but forgets to say so leaves its drafts
-# sharing the target's rows, which is a real layout for MLA and a wrong one
-# here. The other half is loud: the base factory raises.
+# Two members that have to agree: the families `DRAFT_POOL_FAMILIES` says own a
+# draft pool, and the backends that define the factory `draft_kv_builder` calls
+# for them. A family listed without a factory is the loud half (the base factory
+# raises); a factory no family reaches is the silent one -- a backend that builds
+# pools but is not in the table leaves its drafts sharing the target's rows, a real
+# layout for MLA and a wrong one here.
 
 POOL_FACTORY = "make_kv_pool"
-DRAFT_FLAG = "DRAFT_OWNS_KV_POOL"
 # The declaration, which defines the factory in order to refuse it.
 FACTORY_DECLARATION = "AttentionBackend"
 
@@ -191,27 +192,47 @@ def _classes_defining_the_factory() -> list[tuple[str, ast.ClassDef]]:
     ]
 
 
-def _sets_the_flag_true(cls: ast.ClassDef) -> bool:
-    """Whether this class body assigns `DRAFT_OWNS_KV_POOL = True`, annotated
-    or not. Its own body: an inheriting backend gets the answer with the
-    factory, and the two cannot part."""
-    for stmt in cls.body:
-        targets = (
-            [stmt.target]
-            if isinstance(stmt, ast.AnnAssign)
-            else getattr(stmt, "targets", [])
-        )
-        if any(isinstance(t, ast.Name) and t.id == DRAFT_FLAG for t in targets):
-            return stmt.value is not None and getattr(stmt.value, "value", None) is True
-    return False
+def _backend_class_name(family) -> str:
+    from atom.utils.selector import get_attn_backend_cls
+
+    return get_attn_backend_cls(family, False, False).rsplit(".", 1)[-1]
 
 
-def test_the_factory_is_declared_where_the_flag_is():
-    """Both on `AttentionBackend`, so a backend inherits a coherent pair
-    (no pool, and a factory that says so) rather than half of one."""
+def test_the_factory_is_declared_on_the_backend_base():
+    """So a backend outside the table inherits a factory that refuses, not none."""
     declarations = _classes_defining_the_factory()
 
     assert FACTORY_DECLARATION in [cls.name for _, cls in declarations]
+
+
+def test_a_backend_that_can_build_a_draft_pool_is_in_the_table():
+    """The silent direction: out of the table, `draft_kv_builder` returns None and
+    the draft binds into the target's rows -- no error, no log."""
+    from atom.utils.selector import DRAFT_POOL_FAMILIES, Family
+
+    builders = {
+        cls.name
+        for _, cls in _classes_defining_the_factory()
+        if cls.name != FACTORY_DECLARATION
+    }
+    listed = {_backend_class_name(f) for f in DRAFT_POOL_FAMILIES}
+    # `get_attn_backend_cls` is asked per family with no plugin and no unified attn
+    assert builders == listed, (builders, listed, list(Family))
+
+
+def _pool_kwargs_keys() -> set[str]:
+    """The keys `DraftKvPoolSpec.pool_kwargs` returns, read off its dict."""
+    tree = ast.parse(DRAFT_KV.read_text(), filename=str(DRAFT_KV))
+    (fn,) = [
+        fn
+        for cls in ast.walk(tree)
+        if isinstance(cls, ast.ClassDef) and cls.name == "DraftKvPoolSpec"
+        for fn in cls.body
+        if isinstance(fn, ast.FunctionDef) and fn.name == "pool_kwargs"
+    ]
+    (ret,) = [node for node in ast.walk(fn) if isinstance(node, ast.Return)]
+    assert isinstance(ret.value, ast.Dict)
+    return {key.value for key in ret.value.keys}
 
 
 @pytest.mark.parametrize(
@@ -219,14 +240,21 @@ def test_the_factory_is_declared_where_the_flag_is():
     [
         pytest.param(cls, id=f"{stem}.{cls.name}")
         for stem, cls in _classes_defining_the_factory()
-        if cls.name != FACTORY_DECLARATION
     ],
 )
-def test_a_backend_that_can_build_a_draft_pool_says_so(cls):
-    """The silent direction. Without the flag `draft_kv_builder` returns None
-    and the draft binds into the target's rows -- no error, no log, and a
-    draft reading K and V that are not its own."""
-    assert _sets_the_flag_true(cls)
+def test_every_factory_takes_what_a_draft_spec_adds(cls):
+    """`draft_kv_builder` forwards a declared spec's `pool_kwargs` to whichever
+    backend owns the draft's pool. The declaration names them, so a backend
+    written to it accepts them; one that took only the geometry would raise
+    `TypeError` the first time such a draft is configured."""
+    (fn,) = [
+        fn
+        for fn in cls.body
+        if isinstance(fn, ast.FunctionDef) and fn.name == POOL_FACTORY
+    ]
+    keys = _pool_kwargs_keys()
+    assert keys
+    assert fn.args.kwarg is not None or keys <= {a.arg for a in fn.args.kwonlyargs}
 
 
 def test_a_geometry_row_space_names_itself_readably():
@@ -237,6 +265,12 @@ def test_a_geometry_row_space_names_itself_readably():
     its error messages. Pinned by value because a shape is what a reader
     recognizes."""
     from atom.model_ops.attentions.pool_layout.pool_rows import KvGeometry
+    from atom.model_ops.minimax_m3.mxfp4_pages import Mxfp4KvLayout
 
     assert str(KvGeometry(2, 256)) == "h2d256"
     assert f"mha.{KvGeometry(8, 128)}.k.layer_0" == "mha.h8d128.k.layer_0"
+    # MiniMax-M3's MXFP4 sparse-layer pool is named by its format too
+    assert (
+        f"mha.{KvGeometry(8, 128, Mxfp4KvLayout())}.k.layer_0"
+        == "mha.h8d128fp4.k.layer_0"
+    )
