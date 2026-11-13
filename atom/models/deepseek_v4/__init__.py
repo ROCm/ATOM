@@ -3020,6 +3020,7 @@ class MoE(nn.Module):
         before_stage2_for_rows=None,
         before_shared_add=None,
         stage2_stream: torch.cuda.Stream | None = None,
+        shared_ready: torch.cuda.Event | None = None,
     ) -> tuple[torch.Tensor, bool]:
         """Gate + FusedMoE routed-expert pass.
 
@@ -3036,6 +3037,7 @@ class MoE(nn.Module):
             before_stage2_for_rows=before_stage2_for_rows,
             before_shared_add=before_shared_add,
             stage2_stream=stage2_stream,
+            shared_ready=shared_ready,
         )
 
     @mark_trace
@@ -3086,10 +3088,27 @@ class MoE(nn.Module):
         """Run shared_experts on `alt_stream` in parallel with routed_experts
         on the current stream. Mirrors V2's pattern. Both reads of `x` are
         independent; main stream waits on alt_stream's completion before
-        combining.
+        combining, unless the routed combine adds the shared output itself
+        (`FusedMoE.combine_accepts_shared`): then only the combine waits for it.
         """
         routed_stream = torch.cuda.current_stream(x.device)
         self.alt_stream.wait_stream(routed_stream)
+        if self.experts.combine_accepts_shared(x.shape[0]):
+            with torch.cuda.stream(self.alt_stream):
+                shared = self.shared_experts.forward(x)
+                shared_ready = torch.cuda.Event()
+                shared_ready.record(self.alt_stream)
+            shared.record_stream(routed_stream)
+            routed, is_complete = self.routed_expert_forward(
+                x, shared_partial=shared, shared_ready=shared_ready
+            )
+            if is_complete:
+                raise RuntimeError(
+                    "a comm-fused step reached the shared-in-combine path"
+                )
+            return self.combine_outputs(
+                routed, None, prefix=f"{self.prefix}.combine_outputs"
+            )
         shared_produced = False
         shared_waited = False
 
