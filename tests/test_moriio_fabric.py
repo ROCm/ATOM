@@ -123,6 +123,10 @@ class PageDigestTest(unittest.TestCase):
         self.assertNotEqual(
             fabric.page_digest(src, [1, 2]), fabric.page_digest(dst, [5, 6])
         )
+        src_terms = fabric.page_region_digests(src, [1, 2])
+        dst_terms = fabric.page_region_digests(dst, [5, 6])
+        self.assertEqual(sum(src_terms), fabric.page_digest(src, [1, 2]))
+        self.assertEqual([s == d for s, d in zip(src_terms, dst_terms)], [True, True, False])
 
     def test_swapped_regions_change_the_digest(self):
         a = torch.arange(32, dtype=torch.uint8).view(2, 1, 16)
