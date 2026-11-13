@@ -1068,12 +1068,12 @@ class CoreManager:
                 self.structured_request_prepare(structured)
                 self._add_prepared_requests(seqs)
             except BaseException:
-                self._release_structured_requests(structured)
+                self._release_constraints(structured)
                 raise
         else:
             self._add_prepared_requests(seqs)
 
-    def _release_structured_requests(self, seqs):
+    def _release_constraints(self, seqs):
         # The submitted/finished sequences own the cleanup information. There
         # is no cross-thread registry: workers tolerate repeated releases.
         ids = [seq.id for seq in seqs if is_structured(seq)]
@@ -1081,9 +1081,7 @@ class CoreManager:
             return
         try:
             # Never wait for an RPC reply on the output receiver thread.
-            self.broadcast_utility_command(
-                "release_structured_requests", request_ids=ids
-            )
+            self.broadcast_utility_command("release_constraints", request_ids=ids)
         except Exception:
             # Cleanup must neither interrupt terminal delivery nor hide the
             # original admission failure. Worker teardown also frees state.
@@ -1631,7 +1629,7 @@ class CoreManager:
         and normal completions have had theirs popped by the STREAM that
         delivered them, so both answer False and keep their existing path.
         """
-        self._release_structured_requests([seq])
+        self._release_constraints([seq])
         callback = self._seq_id_to_callback.pop(seq.id, None)
         if callback is None:
             return False

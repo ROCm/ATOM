@@ -6,8 +6,8 @@ The LM head emits one row per sequence the step FORWARDED. On a prefill that is
 per-request parameters are `scheduled_bs` wide, because they describe requests.
 Every step between the two has to happen on the same side of the cut.
 
-Skipped where `model_engine.model_runner` cannot import (it needs aiter at
-module load); nothing here touches a GPU.
+The runner module is imported against AITER/Triton stand-ins on a CPU job, so
+the wiring runs there too; nothing here touches a GPU.
 """
 
 import types
@@ -15,17 +15,27 @@ import types
 import numpy as np
 import pytest
 import torch
+from aiter_stub import atom_without_aiter
 
-# Not `importorskip("aiter")`: the non-GPU runner has `aiter` as a namespace
-# package, so that import succeeds and `model_runner` still fails on a symbol.
-# Naming the module we actually need catches both, and `exc_type` is what makes
-# a non-ModuleNotFoundError ImportError a skip rather than a collection error --
-# one of which takes the whole suite down with it. See tests/import_guard.py.
-mod = pytest.importorskip(
-    "atom.model_engine.model_runner",
-    reason="model_runner imports aiter at module load",
-    exc_type=ImportError,
-)
+mod = None  # bound by `_runner_module` for the whole file
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _runner_module():
+    """The real runner module; AITER and Triton are stood in for on a CPU job."""
+    global mod
+    with atom_without_aiter() as load:
+        mod = load("atom.model_engine.model_runner")
+        yield mod
+
+
+@pytest.fixture(autouse=True)
+def isolated_topology(monkeypatch):
+    # These runner-wiring tests do not enable sequence/context parallelism.
+    # Individual TP tests set their own group without inheriting global config.
+    monkeypatch.setattr(mod, "sp_is_enabled", lambda: False)
+    monkeypatch.setattr(mod, "pcp_is_enabled", lambda: False)
+    monkeypatch.setattr(mod, "get_pcp_world_size", lambda: 1)
 
 
 @pytest.fixture(autouse=True)
@@ -55,6 +65,7 @@ def _batch(seqs, mask=None):
         logprob_requested=requested,
         logprob_rows=rows,
         required_channel=None,
+        structured_requests=None,
         num_spec_step=0,
     )
 
@@ -64,6 +75,7 @@ def _runner(seen):
     runner = object.__new__(mod.ModelRunner)
     runner.rank = 0
     runner._served = None
+    runner.structured_output = None
 
     def _sampler(logits, temperatures, top_ks, top_ps, all_greedy, **kw):
         seen["logits_rows"] = logits.shape[0]
@@ -292,11 +304,13 @@ def test_a_masked_row_still_reports_the_models_logprob(
             vocab_size=8, apply=mask_schema_rows, errors={}
         )
 
-    def force_column_zero(_batch, logits, *_args):
+    def force_column_zero(_runner, _batch, logits, *_args):
         if with_channel:
             logits[:, 1:] = float("-inf")  # the sampler samples id 0
 
-    runner._constrain_required_channel = force_column_zero
+    monkeypatch.setattr(
+        "atom.model_engine.token_constraints.apply_required_channel", force_column_zero
+    )
     runner.tokenID_processor.prepare_sampled_ids = lambda b, ids, ev, lp, **_: (
         captured.update(logprobs=lp) or ({}, {})
     )
@@ -354,6 +368,105 @@ def _payload_tensors(payload):
         payload[..., k + 1 : 2 * k + 1].view(torch.int32),
         payload[..., -1].view(torch.int32),
     )
+
+
+@pytest.mark.parametrize("speculative", [False, True])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_channel_constraint_preserves_raw_logprobs(monkeypatch, speculative, enabled):
+    from atom.model_engine.token_logprobs import LogprobRows, host_logprob_rows
+
+    md = (
+        types.SimpleNamespace(
+            target_logits_indices=torch.tensor([0, 1, 3, 4]),
+            bonus_logits_indices=torch.tensor([2, 5]),
+            cu_num_draft_tokens=torch.tensor([2, 4]),
+            num_draft_tokens_np=np.array([2, 2]),
+        )
+        if speculative
+        else None
+    )
+    monkeypatch.setattr(
+        mod,
+        "get_forward_context",
+        lambda: types.SimpleNamespace(spec_decode_metadata=md),
+    )
+    monkeypatch.setattr(
+        mod, "get_tp_group", lambda: types.SimpleNamespace(world_size=1)
+    )
+    batch = _batch(2, [enabled, False])
+    batch.top_logprobs = [3, 0]
+    batch.required_channel = object()
+
+    def force_channel(_runner, _batch, bonus, _metadata, target):
+        for logits in (bonus, target):
+            if logits is not None:
+                logits[:, 1:] = -float("inf")
+        return (None, torch.zeros(_batch.total_seqs_num, dtype=torch.int32))
+
+    monkeypatch.setattr(
+        "atom.model_engine.token_constraints.apply_required_channel", force_channel
+    )
+    if enabled:
+        batch.logprob_rows = LogprobRows(
+            *(
+                torch.from_numpy(a)
+                for a in host_logprob_rows(
+                    [0],
+                    np.array([3, 3]) if speculative else None,
+                    3 if speculative else 1,
+                )
+            )
+        )
+    runner = _runner({})
+    runner.forward_vars = {
+        "positions": types.SimpleNamespace(gpu=torch.arange(6 if speculative else 2)),
+        "cu_seqlens_q": types.SimpleNamespace(
+            gpu=torch.tensor([0, 3, 6] if speculative else [0, 1, 2])
+        ),
+    }
+    if speculative:
+
+        def verify(_md, target, bonus, **_):
+            sampled = torch.cat(
+                (target.argmax(-1).reshape(2, 2), bonus[:, None]), dim=1
+            )
+            return sampled, torch.tensor([[2, 2], [0, 0], [0, 0]])
+
+        runner.rejection_sampler = types.SimpleNamespace(forward=verify)
+    seen = {}
+
+    def transfer(_batch, ids, _event, payload, **kwargs):
+        seen.update(ids=ids.clone(), payload=payload)
+        return {}, None
+
+    runner.tokenID_processor.prepare_sampled_ids = transfer
+    if not enabled:
+        monkeypatch.setattr(
+            mod,
+            "capture_token_logits",
+            lambda *a, **kw: pytest.fail("disabled snapshot"),
+        )
+        monkeypatch.setattr(
+            mod,
+            "gather_token_logprobs",
+            lambda *a, **kw: pytest.fail("disabled scoring"),
+        )
+    raw = (
+        torch.arange((6 if speculative else 2) * 8, dtype=torch.float32).view(-1, 8)
+        / 10
+    )
+    runner.postprocess(batch, raw.clone(), torch.ones(2), None, None, True, None)
+    assert torch.all(seen["ids"] == 0)
+    if not enabled:
+        assert seen["payload"] is None
+        return
+    values, ids, ranks = _payload_tensors(seen["payload"])
+    reference = torch.log_softmax(raw[: 3 if speculative else 1], dim=-1)
+    torch.testing.assert_close(values[0, :, 0], reference[:, 0])
+    top_values, top_ids = reference.topk(3)
+    torch.testing.assert_close(values[0, :, 1:], top_values)
+    torch.testing.assert_close(ids[0].long(), top_ids)
+    assert torch.all(ranks == 8)
 
 
 @pytest.mark.parametrize("context_kv_only", [False, True])

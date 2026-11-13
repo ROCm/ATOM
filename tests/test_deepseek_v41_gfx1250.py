@@ -326,6 +326,21 @@ def test_a_production_step_drafts_from_the_drafter(served):
     ]  # this batch's requests: their kept q no longer match their drafts
 
 
+def test_a_constrained_replay_declines_previous_served_drafts(served):
+    m, drafter = served
+    runner = m._single.runner
+    assert m.step_override(torch.zeros(48), 8, _batch()) is runner
+    batch = _batch(
+        structured_requests=[1], total_seqs_num=1, req_ids=["current", "other"]
+    )
+    assert m.step_override(torch.zeros(48), 8, batch) is None
+    drafter.compute_draft_kv()
+    assert drafter.kv == 1
+    assert drafter.propose(next_token_ids=torch.zeros(1)) == "production"
+    assert runner.steps == 1
+    assert runner.forgot == ["current"]
+
+
 def test_a_prefill_keeps_the_running_requests_kernel_q(served):
     m, drafter = served
     runner = m._single.runner

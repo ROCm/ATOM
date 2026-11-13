@@ -844,6 +844,11 @@ class InputOutputProcessor:
             multimodal=multimodal_data is not None,
         )
         if is_structured(sampling_params):
+            if sampling_params.required_channel is not None:
+                raise ValueError(
+                    "A request cannot carry both a structured-output grammar "
+                    "(json_schema or structured_tool_format) and a required_channel"
+                )
             if self.structured_admission is None:
                 raise ValueError("Structured output requires engine admission")
             self.structured_admission(
