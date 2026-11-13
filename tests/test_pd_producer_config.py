@@ -190,6 +190,16 @@ def test_mla_staging_reserve_covers_the_connector_pool(monkeypatch):
             },
             {},
         ),
+        # A sparse MLA hybrid: a DCP consumer cannot take its indexer region
+        # per token, so it never stages.
+        (
+            {
+                "hf_config": SimpleNamespace(
+                    model_type="glm5_next_text", kv_lora_rank=512, index_topk=2048
+                )
+            },
+            {},
+        ),
         ({"decode_context_parallel_size": 4}, {}),
         (
             {

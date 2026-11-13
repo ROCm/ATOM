@@ -13,6 +13,7 @@ for the NIC, so every destination byte is compared, not just the plan.
 import ctypes
 import threading
 from contextlib import nullcontext
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -584,7 +585,7 @@ def test_staging_gathers_bytes_whatever_the_kv_dtype(monkeypatch):
     conn.is_producer = True
     conn.dcp_size = 1
     conn.block_size = 16
-    conn._has_slot_regions = False
+    conn._mla_staging_model = True
     conn._num_send_workers = 16
     tt = SimpleNamespace(
         block_regions=[published.region], block_tensor_views=[_Bf16View()]
@@ -599,9 +600,65 @@ def test_mla_staging_is_disabled_by_env(monkeypatch):
     conn = object.__new__(mc.MooncakeConnector)
     conn.is_producer = True
     conn.dcp_size = 1
-    conn._has_slot_regions = False
+    conn._mla_staging_model = True
     assert conn._build_mla_staging(object()) is None
     assert conn._mla_staging is None
+
+
+@pytest.mark.parametrize(
+    "hf_config, stages",
+    [
+        (SimpleNamespace(model_type="kimi_linear", kv_lora_rank=512), True),
+        (
+            SimpleNamespace(
+                model_type="glm5_next_text", kv_lora_rank=512, index_topk=2048
+            ),
+            False,
+        ),
+    ],
+    ids=["kimi-k3", "glm-5.3-flash"],
+)
+def test_a_hybrid_producer_stages_only_its_mla_pages(monkeypatch, hf_config, stages):
+    """Built from the published views alone: Kimi-K3's state is in slot
+    regions, so only its MLA pages get a pool, and a block region of another
+    role keeps its own path. A sparse hybrid gets none, as it reserves none."""
+    from atom.kv_transfer.disaggregation.page_region import page_region
+    from atom.kv_transfer.disaggregation.pd_producer import mla_staging_model
+
+    class _DeviceBytes:
+        is_cuda = True
+        dtype = torch.uint8
+
+        def __init__(self, tensor):
+            self.tensor = tensor
+
+        def view(self, *shape):
+            return self.tensor.view(*shape)
+
+    mc = _mooncake()
+    monkeypatch.delenv("ATOM_PD_MLA_STAGING", raising=False)
+    regions = [
+        page_region(torch.zeros((4, 16, 576), dtype=torch.bfloat16), semantic_role=r)
+        for r in (MLA_KV_ROLE, INDEX_CACHE_ROLE)
+    ]
+    conn = object.__new__(mc.MooncakeConnector)
+    conn.is_producer = True
+    conn.dcp_size = 1
+    conn.block_size = 16
+    conn._num_send_workers = 16
+    conn._mla_staging_model = mla_staging_model(SimpleNamespace(hf_config=hf_config))
+    tt = SimpleNamespace(
+        block_regions=[p.region for p in regions],
+        block_tensor_views=[_DeviceBytes(p.view) for p in regions],
+    )
+    region = conn._build_mla_staging(tt)
+    assert (region is not None) is stages
+    if stages:
+        assert list(conn._mla_token_views) == [0]
+        assert conn._mla_token_views[0].shape == (4 * 16, 576 * 2)
+        assert region.total_bytes == conn._mla_staging.numel()
+    else:
+        assert conn._mla_staging is None
 
 
 class _DeviceNic:

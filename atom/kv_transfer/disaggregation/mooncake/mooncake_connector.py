@@ -63,6 +63,7 @@ from atom.kv_transfer.disaggregation.mooncake.mla_landing import (
 from atom.kv_transfer.disaggregation.mooncake.rail_engine_pool import RailEnginePool
 from atom.kv_transfer.disaggregation.pd_producer import (
     MLA_STAGING_SLOT_BYTES,
+    mla_staging_model,
     mla_staging_pool_bytes,
     mla_staging_reserve_bytes,
     mla_staging_slot_count,
@@ -1138,7 +1139,9 @@ class MooncakeConnector(KVConnectorBase):
         self._index_staging_slots = SlotPool()
         self._prepare_sharded_index = None
         self._gather_sharded_index = None
-        # MLA staging for DCP consumers (see _execute_staged_mla_regions).
+        # MLA staging for DCP consumers (see _execute_staged_mla_regions), for
+        # the models whose pool `mla_staging_reserve_bytes` holds back.
+        self._mla_staging_model = mla_staging_model(config)
         self._mla_staging: torch.Tensor | None = None
         self._mla_staging_slots = SlotPool()
         # Each send worker gathers on its own stream (see _send_worker_stream).
@@ -1287,7 +1290,8 @@ class MooncakeConnector(KVConnectorBase):
     _MAX_RDMA_CHUNK_BYTES = 2 * 1024 * 1024 * 1024 - 64 * 1024
     _MAX_RDMA_ENTRIES_PER_BATCH = 4096
     # Class-level so a connector built without __init__ keeps the per-token
-    # paths; register_kv_caches sets the instance values.
+    # paths; __init__ and register_kv_caches set the instance values.
+    _mla_staging_model = False
     _mla_staging: torch.Tensor | None = None
     _mla_landing: LandingReceiver | None = None
     _mla_landing_table_segments = 0
@@ -1656,11 +1660,17 @@ class MooncakeConnector(KVConnectorBase):
         worker gather those tokens into destination page order on the GPU and
         send them page-contiguous. One slot per send worker, capped by
         ``MLA_STAGING_POOL_BYTES``; ``mla_staging_reserve_bytes`` holds
-        the pool back from the KV cache budget. An MLA hybrid's slot regions
-        do not take part: only its MLA pages are staged, by
+        the pool back from the KV cache budget, for the models
+        ``mla_staging_model`` names. The slot regions of a hybrid it names do
+        not take part: only its MLA pages are staged, by
         ``_execute_block_slot_transfer``.
         """
-        if not self.is_producer or self.dcp_size > 1 or not envs.ATOM_PD_MLA_STAGING:
+        if (
+            not self.is_producer
+            or self.dcp_size > 1
+            or not envs.ATOM_PD_MLA_STAGING
+            or not self._mla_staging_model
+        ):
             return None
         views = tt.block_tensor_views
         if len(views) != len(tt.block_regions):
@@ -3898,13 +3908,13 @@ class MooncakeConnector(KVConnectorBase):
                 srcs = src_base + src_ids * bpb
                 dsts = dst_base + dst_ids * consumer_block_bpb[cidx]
                 lens = np.full(src_ids.size, bpb, dtype=np.int64)
+            elif stages_sharded_mla and region_idx in self._mla_token_views:
+                staged_mla_regions.append((region_idx, dst_base, bpb))
+                continue
             else:
                 srcs, dsts, lens = self._dcp_token_descriptors(
                     region_idx, src_base, dst_base, bpb, sharded_runs
                 )
-                if stages_sharded_mla and region_idx in self._mla_token_views:
-                    staged_mla_regions.append((region_idx, dst_base, bpb))
-                    continue
             if not batch.add(srcs, dsts, lens):
                 logger.error("[PRODUCER] block transfer failed for req %s", req_id)
                 return False
