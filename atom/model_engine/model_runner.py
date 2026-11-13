@@ -3499,7 +3499,7 @@ class ModelRunner:
             commit_pp_send_work(self._pp_pending_send)
         return True
 
-    def release_structured_requests(self, request_ids):
+    def release_constraints(self, request_ids):
         release_token_constraints(self, request_ids)
 
     def prepare_structured_output(
@@ -3792,7 +3792,7 @@ class ModelRunner:
             num_bonus=prev_bonus_num,
             logprobs=logprobs_map,
             dspark_ell=dspark_ell,
-            structured_errors=output_errors or None,
+            constraint_errors=output_errors or None,
         )
 
     def _kv_after_forward(self) -> None:
@@ -5344,17 +5344,9 @@ class RapidServeModelRunner(ModelRunner):
             # Masked in place with no pre-mask copy, unlike `postprocess`: this
             # path returns token ids only and computes no logprobs, so nothing
             # reads the unmasked row.
-            constraints = TokenConstraints.apply(self, batch, logits, None)
+            TokenConstraints.apply(self, batch, logits, None)
             sampled = self.sampler(logits, temperatures, top_ks, top_ps, all_greedy)
-            if constraints is not None and constraints.invalid is not None:
-                sampled = sampled.masked_fill(constraints.failed(sampled), -2)
             sampled_cpu = sampled.view(-1).tolist()
-            if (
-                constraints is not None
-                and constraints.invalid is not None
-                and -2 in sampled_cpu
-            ):
-                raise ValueError("Token constraints leave no valid continuation")
             self._record_forward_vars_event()
         # Synchronize so decode's default stream sees all KV writes.
         stream.synchronize()

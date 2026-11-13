@@ -645,7 +645,7 @@ class WorkerGrammarPreflight:
             if request_ids:
                 # Another rank may have prepared successfully. Release those
                 # states before propagating an admission failure to the caller.
-                rpc("release_structured_requests", args=(request_ids,), timeout=60)
+                rpc("release_constraints", args=(request_ids,), timeout=60)
                 raise
             with self.lock:
                 self.pending.pop(key, None)
