@@ -19,6 +19,7 @@ from aiter.dist.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from aiter.jit.utils.chip_info import get_cu_num
 from aiter.tuned_gemm import tgemm
 from einops import rearrange
 from torch import nn
@@ -37,6 +38,7 @@ from atom.model_ops.fla_ops.fused_sigmoid_gating import (
     fused_sigmoid_gating_delta_rule_update,
 )
 from atom.model_ops.fla_ops.replayssm import (
+    replayssm_kda_fused_update,
     replayssm_sigmoid_gating_delta_rule,
 )
 from atom.model_ops.layernorm import RMSNorm
@@ -1541,7 +1543,22 @@ class KimiKDAAttention(nn.Module):
         # Otherwise the plain contiguous copy runs and f_b_proj quantizes (or
         # not) exactly as before.
         f_a_view = tail[..., nlh : nlh + hd]
-        if self.fuse_f_a_quant:
+        # A ReplaySSM decode or verify step runs the conv, f_b_proj and the
+        # recurrence as one kernel while each (sequence, head) program gets a
+        # CU: the kernel runs at occupancy 1, and a second wave loses to the
+        # separate kernels on short steps.
+        num_seqs = 0
+        if kda_metadata.num_prefills <= 0 and getattr(kda_metadata, "replayssm", False):
+            num_seqs = kda_metadata.num_decodes or kda_metadata.num_spec_decodes
+        fused = (
+            envs.ATOM_KIMI_K3_KDA_FUSED_DECODE
+            and 0 < num_seqs * nlh <= get_cu_num()
+            and self.f_b_proj.quant_type == QuantType.No
+            and self.conv_kernel_size == 4
+        )
+        if fused:
+            gate = None
+        elif self.fuse_f_a_quant:
             from atom.model_ops.kimi_k3 import strided_per_token_quant
 
             f_a, f_a_scale = strided_per_token_quant(f_a_view, dtypes.fp8)
@@ -1554,7 +1571,8 @@ class KimiKDAAttention(nn.Module):
                 f_a_view.shape, dtype=f_a_view.dtype, device=f_a_view.device
             )
             gate = self.f_b_proj(f_a.copy_(f_a_view))
-        gate = rearrange(gate, "t (h d) -> 1 t h d", d=self.head_dim)
+        if gate is not None:
+            gate = rearrange(gate, "t (h d) -> 1 t h d", d=self.head_dim)
         # Prefill returns its own contiguous output. Allocate this buffer only
         # for decode/spec-decode, where the recurrence writes into it directly.
         if kda_metadata.num_prefills <= 0:
@@ -1627,6 +1645,43 @@ class KimiKDAAttention(nn.Module):
             )
             assert kda_out.is_contiguous(), "KDA output must be contiguous for o_norm"
             out = kda_out.squeeze(0)
+        elif fused:
+            if kda_metadata.num_decodes > 0:
+                cu, accepted = query_start_loc, None
+                conv_idx, conv_idx_in = state_indices, state_indices_in
+            else:
+                # Column 0 of the verify slot table is the live conv slot.
+                spec_in = kda_metadata.spec_state_indices_in_tensor
+                cu = kda_metadata.spec_query_start_loc
+                conv_idx = kda_metadata.spec_state_indices_tensor[:, 0]
+                conv_idx_in = None if spec_in is None else spec_in[:, 0]
+                accepted = kda_metadata.num_accepted_tokens
+            replayssm_kda_fused_update(
+                mixed_qkv,
+                f_a_view,
+                beta,
+                conv_state,
+                conv_weights,
+                self.f_b_proj.weight,
+                self.A_log,
+                self.dt_bias,
+                ckpt=ssm_state,
+                buf_k=cache.replay_buf_k,
+                buf_u=cache.replay_buf_u,
+                buf_g=cache.replay_buf_g,
+                write_pos=kda_metadata.write_pos,
+                slot_idx=kda_metadata.slot_idx[:num_seqs],
+                cu_seqlens=cu[: num_seqs + 1],
+                max_query_len=kda_metadata.replayssm_max_query_len,
+                conv_state_indices=conv_idx[:num_seqs],
+                conv_state_indices_in=(
+                    None if conv_idx_in is None else conv_idx_in[:num_seqs]
+                ),
+                num_accepted_tokens=accepted,
+                o=out,
+                lower_bound=self._kda_gate_lower_bound,
+                fork_slots=kda_metadata.replayssm_fork_slots,
+            )
         elif kda_metadata.num_decodes > 0:
             # Slice the per-token cache-slot indices once (used for both the
             # conv update and the fused recurrence below).

@@ -1061,6 +1061,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_KIMI_K3_MOE_ROW_SHARD_MIN_TOKENS": lambda: _nonnegative_int_env(
         "ATOM_KIMI_K3_MOE_ROW_SHARD_MIN_TOKENS", 8192
     ),
+    # Kimi-K3.1's ReplaySSM KDA decode / verify step as one kernel.
+    "ATOM_KIMI_K3_KDA_FUSED_DECODE": lambda: (
+        os.getenv("ATOM_KIMI_K3_KDA_FUSED_DECODE", "1").lower() == "1"
+    ),
     # Fuse into a per-rank replica without EPLB. EPLB always fuses it as routed.
     "ATOM_FUSE_SHARED_EXPERT": lambda: (
         os.getenv("ATOM_FUSE_SHARED_EXPERT", "1").lower() == "1"
