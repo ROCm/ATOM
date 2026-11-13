@@ -48,6 +48,20 @@ pub fn lookup_tokenizer(
     })
 }
 
+/// The instance to encode with on this thread: a preparation worker's group
+/// copy, which does not contend on the shared BPE cache, else the shared one.
+fn thread_encoder(
+    model_id: &str,
+    registry: &TokenizerRegistry,
+    shared: &Arc<dyn Tokenizer>,
+) -> Arc<dyn Tokenizer> {
+    registry
+        .get_by_name(model_id)
+        .or_else(|| registry.get_by_id(model_id))
+        .map(|entry| thread_tokenizer::encoder(&entry))
+        .unwrap_or_else(|| shared.clone())
+}
+
 pub fn prepare_chat(
     req: Arc<ChatCompletionRequest>,
     headers: Option<HeaderMap>,
@@ -65,7 +79,7 @@ pub fn prepare_chat(
     let processed = process_chat_messages(&body_ref, &*tokenizer)
         .map_err(|e| error::bad_request("process_messages_failed", e))?;
 
-    let encoding = tokenizer
+    let encoding = thread_encoder(model_id_str, &components.tokenizer_registry, &tokenizer)
         .encode(&processed.text, false)
         .map_err(|e| error::internal_error("tokenization_failed", format!("{}", e)))?;
     let token_ids = encoding.token_ids().to_vec();
@@ -124,13 +138,27 @@ pub fn prepare_generate(
     model_id: Option<String>,
     components: &AppContext,
 ) -> Result<(GenerationPayload, ResponseContext), Response> {
+    prepare_generate_with(req, headers, model_id, components, false)
+}
+
+/// `prepare_generate`, tokenizing a text prompt with the tokenizer's special
+/// tokens (BOS) when `add_special_tokens`, as an OpenAI completions server
+/// does with a raw prompt.
+pub fn prepare_generate_with(
+    req: Arc<GenerateRequest>,
+    headers: Option<HeaderMap>,
+    model_id: Option<String>,
+    components: &AppContext,
+    add_special_tokens: bool,
+) -> Result<(GenerationPayload, ResponseContext), Response> {
     let model_id_str = model_id.as_deref().ok_or_else(|| {
         error!("model_id not set");
         error::internal_error("model_id_not_set", "model_id not set in request")
     })?;
     let tokenizer = lookup_tokenizer(model_id_str, &components.tokenizer_registry)?;
 
-    let (original_text, token_ids) = resolve_generate_input(&req, &tokenizer)
+    let encoder = thread_encoder(model_id_str, &components.tokenizer_registry, &tokenizer);
+    let (original_text, token_ids) = resolve_generate_input(&req, &encoder, add_special_tokens)
         .map_err(|e| error::bad_request("resolve_input_failed", e))?;
 
     let params = req.sampling_params.as_ref();
@@ -285,10 +313,11 @@ pub(crate) fn build_generate_payload(
 fn resolve_generate_input(
     req: &GenerateRequest,
     tokenizer: &Arc<dyn Tokenizer>,
+    add_special_tokens: bool,
 ) -> Result<(Option<String>, Vec<u32>), String> {
     if let Some(text) = &req.text {
         let encoding = tokenizer
-            .encode(text, false)
+            .encode(text, add_special_tokens)
             .map_err(|e| format!("Tokenization failed: {}", e))?;
         return Ok((Some(text.clone()), encoding.token_ids().to_vec()));
     }
