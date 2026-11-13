@@ -570,14 +570,13 @@ python3 -m atom.benchmarks.benchmark_serving \
 
 - 场景：8K/1K；GPU：1（1 card）
 - 并行：TP1；MTP，每步 3 个草稿 token，草稿层的 MoE 专家在线量化成 MXFP4；FP8 KV cache，BF16 index cache，block 16；开 prefix cache
-- MODEL_PATH：`/models/Qwen3.8-Flash-Next-Quark-MXFP4-ATOM-MTP`；PORT：`8000`
-- 权重来源待确认：原命令的模型在 `/home/memin/model/` 下。HF 上公开的是 [`amd/Qwen3.8-Flash-Next-Quark-MXFP4`](https://huggingface.co/amd/Qwen3.8-Flash-Next-Quark-MXFP4)，没有 `-ATOM-MTP` 后缀，是不是同一份要和提供命令的同事确认。
+- MODEL_PATH：`/models/Qwen3.8-Flash-Next-Quark-MXFP4`（[`amd/Qwen3.8-Flash-Next-Quark-MXFP4`](https://huggingface.co/amd/Qwen3.8-Flash-Next-Quark-MXFP4) @ `b71e28afcd4b43add751159862235035613a58ab`）；PORT：`8000`。仓库里带 MTP 层（`mtp.layers.0.*`），`--method mtp` 不用另配草稿模型
 
 **main 上还缺 [ROCm/ATOM#3225](https://github.com/ROCm/ATOM/pull/3225) + [ROCm/aiter#7847](https://github.com/ROCm/aiter/pull/7847)**（登记在 [`455-CI/pending_fixes.csv`](455-CI/pending_fixes.csv)）：ATOM#3225 是 gfx1250 上跑 Qwen3.8 需要的修复，aiter#7847 是 gfx1250 的性能调优。合入前在 main 上可能跑不起来或性能偏低，跑挂时按指南 §3.7 用这组 PR 作说法。
 
 命令由 Qwen3.8 的开发同事提供（2026-11-13），按 455-CI 的规矩改了四处，其余参数原样：
 - 去掉 `PYTHONPATH=/workspace/ATOM`：那是开发机上的 ATOM checkout，455-CI 只用镜像里 `/app/ATOM` 的 main；
-- 模型路径换成容器里的 `/models/...`，`--served-model-name` 跟着换，两者保持一样；
+- 模型换成 HF 上的 `amd/Qwen3.8-Flash-Next-Quark-MXFP4`（原命令用的是开发机上的 `/home/memin/model/Qwen3.8-Flash-Next-Quark-MXFP4-ATOM-MTP`），放在容器里的 `/models/...`，`--served-model-name` 跟着换，两者保持一样；
 - `python` 换成 `python3`：镜像里 ATOM 装在系统 Python 上，其他模型的命令也都用 `python3`；
 - 加 `HIP_VISIBLE_DEVICES=0`：只给它 1 张卡（指南 §3.2）。
 
@@ -591,8 +590,8 @@ python3 -m atom.benchmarks.benchmark_serving \
 HIP_VISIBLE_DEVICES=0 ENABLE_CK=0 GPU_ARCHS=gfx1250 \
 ATOM_MOE_GU_ITLV=1 ATOM_GDN_STATE_MIDSTEP=1 \
 python3 -m atom.entrypoints.openai_server \
-  --model /models/Qwen3.8-Flash-Next-Quark-MXFP4-ATOM-MTP \
-  --served-model-name /models/Qwen3.8-Flash-Next-Quark-MXFP4-ATOM-MTP \
+  --model /models/Qwen3.8-Flash-Next-Quark-MXFP4 \
+  --served-model-name /models/Qwen3.8-Flash-Next-Quark-MXFP4 \
   --host 0.0.0.0 --server-port 8000 --trust-remote-code \
   -tp 1 \
   --max-num-seqs 160 \
@@ -612,13 +611,13 @@ python3 -m atom.entrypoints.openai_server \
 
 ### gsm8k
 
-先用上面的命令去掉 `--spec-decode-acceptance-length 2.32` 起 server，其余不变，再按指南 §3.3 测，`MODEL_PATH=/models/Qwen3.8-Flash-Next-Quark-MXFP4-ATOM-MTP`，`PORT=8000`。测完按指南 §3.2 第 4 步停掉 server，再用完整命令起 server 测性能。
+先用上面的命令去掉 `--spec-decode-acceptance-length 2.32` 起 server，其余不变，再按指南 §3.3 测，`MODEL_PATH=/models/Qwen3.8-Flash-Next-Quark-MXFP4`，`PORT=8000`。测完按指南 §3.2 第 4 步停掉 server，再用完整命令起 server 测性能。
 
 ### bench
 
 ```bash
 python3 -m atom.benchmarks.benchmark_serving \
-  --model=/models/Qwen3.8-Flash-Next-Quark-MXFP4-ATOM-MTP --backend=vllm --base-url=http://127.0.0.1:8000 \
+  --model=/models/Qwen3.8-Flash-Next-Quark-MXFP4 --backend=vllm --base-url=http://127.0.0.1:8000 \
   --dataset-name=random --random-input-len=8192 --random-output-len=1024 --random-range-ratio=0.8 \
   --max-concurrency=$CONC --num-prompts=$((CONC * 10)) --num-warmups=$((CONC * 2)) \
   --request-rate=inf --ignore-eos --trust-remote-code \
