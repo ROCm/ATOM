@@ -729,9 +729,11 @@ WEIGHT_ISSUER = WAVES - 2
 SCALE_ISSUER = WAVES - 1
 assert UP_WAVES * STEPS * 32 == DOWN_STEPS * 8 * 32 == SCALE_WORDS
 FLAG_WORDS = UP_BLOCKS
-# A gate/up task's and a down tile's weight bytes, in 16 KB units: what the
-# fused MoE balances CTAs by.
-UP_UNITS = UP_GROUPS * LATENT * 8 // 16384
+# What the fused MoE balances CTAs by: a down tile (48 KB) is 3 units, a
+# gate/up task (7 tiles' bytes) 15 -- measured, not its bytes' 21: counted at
+# its bytes, the CTAs with one fewer task took so many down tiles they ran
+# last (S16..S48, several routings).
+UP_UNITS = 15
 DOWN_UNITS = GROUPS * GROUP_DOWN_BYTES // 16384
 # The fused MoE's state words: unused, the CTAs done, the epoch, and a
 # timed-out wait's record (0: none).
@@ -807,7 +809,7 @@ def _bounded_wait(flags, slot, tag, state, bid):
         st_dev(record, state, 3)
 
 
-def _down_share(union, bid, ups):
+def _down_share(union, bid, ups, up_units=UP_UNITS):
     """CTA ``bid``'s down tiles (slot-major, ``DOWN_TILES`` an expert): a run
     of the early experts' and then one of the late experts' -- those whose
     gate/up is the last round's, by CTAs that run one more task -- as (first
@@ -825,9 +827,9 @@ def _down_share(union, bid, ups):
     late_slot = late_round * (256 // UP_BLOCKS)
     early_tiles = late_slot * DOWN_TILES
     late_tiles = tiles - early_tiles
-    total = tasks * UP_UNITS + early_tiles * DOWN_UNITS
-    more = fx.max(total - 256 * (ups + 1) * UP_UNITS, 0)
-    fewer = fx.max(total - 256 * ups * UP_UNITS, 0)
+    total = tasks * up_units + early_tiles * DOWN_UNITS
+    more = fx.max(total - 256 * (ups + 1) * up_units, 0)
+    fewer = fx.max(total - 256 * ups * up_units, 0)
     first_class = 256 - rest
 
     def before(j):
@@ -846,7 +848,9 @@ def _down_share(union, bid, ups):
     return first, last - first, late_first, late_last - late_first
 
 
-def build_moe(rows: int, profile: bool = False, publish_at: int = 1) -> MoeKernel:
+def build_moe(
+    rows: int, profile: bool = False, publish_at: int = 1, up_units: int = UP_UNITS
+) -> MoeKernel:
     """The routed experts of ``rows`` tokens in one resident 256-CTA launch,
     with no grid barrier and no queue: every CTA works out the same static,
     byte-balanced plan -- its gate/up tasks (an expert's 192 rows, each pick's
@@ -893,7 +897,9 @@ def build_moe(rows: int, profile: bool = False, publish_at: int = 1) -> MoeKerne
         picks: fx.Array[fx.Int32, routes, 16]
         scan: fx.Array[fx.Int32, WAVES, 16]
 
-    name = f"k3_gfx1250_moe_s{rows}_p{publish_at}" + ("_profile" if profile else "")
+    name = f"k3_gfx1250_moe_s{rows}_p{publish_at}_u{up_units}" + (
+        "_profile" if profile else ""
+    )
     sources = SOURCES
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
@@ -949,7 +955,7 @@ def build_moe(rows: int, profile: bool = False, publish_at: int = 1) -> MoeKerne
         tasks = union * blocks
         ups = tasks // 256
         mine = (tasks - bid + 255) // 256
-        first_down, early, first_late, late = _down_share(union, bid, ups)
+        first_down, early, first_late, late = _down_share(union, bid, ups, up_units)
         downs = early + late
         up_items = mine * k_tiles
         flat = up_items + downs
