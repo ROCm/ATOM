@@ -348,3 +348,34 @@ def test_a_remote_reader_refuses_anything_but_the_release(monkeypatch, incoming,
     monkeypatch.setenv("ATOM_MULTINODE_TP_TIMEOUT_S", "0.01")
     with pytest.raises(error):
         tp_multinode.await_release(SimpleNamespace(remote_socket=_Socket(*incoming)))
+
+
+@pytest.mark.parametrize(
+    "start,rank,device", [(0, 0, 0), (0, 3, 3), (4, 4, 0), (4, 7, 3)]
+)
+def test_a_worker_nodes_ranks_use_its_own_gpus_from_zero(start, rank, device):
+    from atom.config import local_device_index
+
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            data_parallel_rank_local=0, pipeline_parallel_rank=0
+        ),
+        pipeline_parallel_size=1,
+        tp_world_size=8,
+        pcp_group_size=1,
+        tp_rank_start=start,
+    )
+    assert local_device_index(config, rank) == device
+
+
+@pytest.mark.parametrize(
+    "pp,multinode_tp,reduced",
+    [(1, False, False), (2, False, True), (1, True, True)],
+)
+def test_kv_blocks_reduce_to_the_minimum_when_ranks_can_differ(
+    pp, multinode_tp, reduced
+):
+    from atom.utils.distributed.utils import kv_blocks_differ_across_ranks
+
+    config = SimpleNamespace(pipeline_parallel_size=pp, is_multinode_tp=multinode_tp)
+    assert kv_blocks_differ_across_ranks(config) is reduced

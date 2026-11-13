@@ -16,10 +16,9 @@ from vllm.v1.attention.backend import (
 )
 
 from atom.config import get_current_atom_config
-from atom.distributed.dcp_utils import dcp_persistent_supported
 from atom.model_ops.attention_mla import (
     _MLA_MIN_HEADS,
-    mla_dcp_kernel_num_heads,
+    mla_dcp_persistent_width,
     mla_kernel_num_heads,
 )
 from atom.plugin.vllm.attention.layer_mla import (
@@ -1370,32 +1369,25 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
         # head count reaching mla_decode_fwd (and thus the persistent decode
         # metadata) is the gathered width padded up to a dispatchable kernel.
         # dcp size is sourced from the parallel config so it is available here in
-        # __init__. dcp=1 -> equals padded_num_attention_heads (zero regression
-        # for non-DCP). Only scale by dcp on gfx950 (DCP persistent); gfx942
-        # stays non-persistent where this metadata is unused, so keep the
-        # original per-rank sizing.
+        # __init__. Only where aiter runs DCP decode persistent does it scale by
+        # dcp (gfx942 stays non-persistent, where this metadata is unused);
+        # elsewhere, and with dcp=1, it keeps the per-rank sizing. Cached once to
+        # gate both the metadata sizing and the runtime persistent path.
         dcp_size = self.parallel_config.decode_context_parallel_size
-        # Whether aiter runs DCP decode persistent (see dcp_utils). Cached once
-        # to gate both the metadata sizing and the runtime persistent path.
-        self.dcp_persistent_supported = False
-        self.persistent_num_heads = self.padded_num_attention_heads
-        if dcp_size > 1:
-            # These descriptors are only ever handed to the kernel on the
-            # persistent path (`if use_persistent_metadata` in build()), so the
-            # width they must describe is the persistent one whatever the step
-            # later decides.
-            dcp_persistent_width = mla_dcp_kernel_num_heads(
-                self.num_attention_heads,
-                dcp_size,
-                self.min_query_heads,
-                kv_cache_dtype=config.cache_config.cache_dtype,
-                persistent=True,
-            )
-            self.dcp_persistent_supported = dcp_persistent_supported(
-                dcp_persistent_width, config.cache_config.cache_dtype, dcp_size
-            )
-            if self.dcp_persistent_supported:
-                self.persistent_num_heads = dcp_persistent_width
+        # These descriptors are only ever handed to the kernel on the
+        # persistent path (`if use_persistent_metadata` in build()), so the
+        # width they must describe is the persistent one whatever the step
+        # later decides.
+        dcp_persistent_width = mla_dcp_persistent_width(
+            self.num_attention_heads,
+            dcp_size,
+            self.min_query_heads,
+            kv_cache_dtype=config.cache_config.cache_dtype,
+        )
+        self.dcp_persistent_supported = dcp_persistent_width is not None
+        self.persistent_num_heads = (
+            dcp_persistent_width or self.padded_num_attention_heads
+        )
         # DCP rank + a persistent buffer for locally derived decode seq lens.
         # Only the DSpark draft step needs the buffer (see build()); allocating
         # it unconditionally under DCP keeps that branch allocation-free.

@@ -68,7 +68,7 @@ def dcp_persistent_supported(
     """
     import torch
     from aiter import dtypes
-    from aiter.ops.attention import get_mla_decode_shape_support
+    from aiter.ops.attention import MlaBackend, get_mla_decode_shape_support
 
     dtype = dtypes.fp8 if kv_cache_dtype.startswith("fp8") else torch.bfloat16
     support = get_mla_decode_shape_support(
@@ -81,7 +81,11 @@ def dcp_persistent_supported(
         cp_world_size=dcp_world_size,
         page_size=max(envs.ATOM_MLA_PAGE_SIZE, 1),
     )
-    return support.supported is not False
+    # aiter has no table for the FlyDSL PS1 route and answers None there; a
+    # None from any other route is a failed query, not a yes.
+    return bool(support.supported) or (
+        support.supported is None and support.backend is MlaBackend.FLYDSL_PS1
+    )
 
 
 def mla_dcp_decode_is_persistent(
@@ -96,7 +100,8 @@ def mla_dcp_decode_is_persistent(
     Settled at construction time (mirrors the live per-step decision in
     ``_forward_decode``) because the gathered head width must be fixed before
     forward. Sparse MLA needs the caller to rebuild work/reduce metadata per
-    full indexer layer first; only gfx950 supports persistent mode at all.
+    full indexer layer first; ``dcp_persistent_supported`` says where aiter has a
+    persistent kernel at all.
 
     Lives here, not in ``atom.model_ops.attention_mla``: dependency-free, so
     it stays importable without triton/aiter, and
@@ -147,7 +152,8 @@ def mla_dcp_sparse_prefill_uses_nonps(
 ) -> bool:
     """Whether DCP sparse prefill uses the non-persistent fp8 gqa64 MLA kernel.
 
-    Applies with fp8 q/KV, 64 gathered heads, gfx950 and page_size 1. It needs
+    Applies with fp8 q/KV, 64 gathered heads, gfx950 and page_size 1 (gfx1250's
+    non-persistent decode takes only 64-token pages). It needs
     no work metadata, so the per-layer `get_mla_metadata_v1` rebuild is skipped.
     Every prefill token of a step is one q row, so a step budget above
     NONPS_MAX_Q_ROWS stays on the persistent path.

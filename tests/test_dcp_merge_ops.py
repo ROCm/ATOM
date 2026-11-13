@@ -1270,7 +1270,9 @@ def test_sparse_prefill_builder_allocates_for_its_consumer(
     for module in (backends, aiter_mla):
         monkeypatch.setattr(module, "get_dcp_world_size", lambda: world)
         monkeypatch.setattr(module, "get_dcp_rank", lambda: 0)
-    monkeypatch.setattr(aiter_mla, "dcp_persistent_supported", lambda *_: True)
+    from atom.model_ops import attention_mla
+
+    monkeypatch.setattr(attention_mla, "dcp_persistent_supported", lambda *_: True)
     cfg = SimpleNamespace(
         hf_config=SimpleNamespace(
             num_attention_heads=96,
@@ -1975,6 +1977,66 @@ def test_sparse_prefill_persistence_does_not_look_at_dtype():
         "the DCP sparse-prefill persistence predicate must not key off KV "
         f"cache dtype; got parameters {list(params)}"
     )
+
+
+@pytest.mark.parametrize(
+    "supported,backend,expected",
+    [
+        (True, "asm", True),
+        (False, "asm", False),
+        (None, "flydsl_ps1", True),
+        # A failed asm query is not a yes.
+        (None, "asm", False),
+    ],
+)
+@pytest.mark.parametrize("kv_cache_dtype", ["fp8", "bf16"])
+def test_dcp_persistent_supported_reads_aiters_answer(
+    monkeypatch, supported, backend, expected, kv_cache_dtype
+):
+    import enum
+    import sys
+    import types
+
+    from atom.distributed.dcp_utils import dcp_persistent_supported
+
+    class MlaBackend(str, enum.Enum):
+        ASM = "asm"
+        FLYDSL_PS1 = "flydsl_ps1"
+
+    calls = []
+
+    def get_mla_decode_shape_support(*args, **kwargs):
+        calls.append((args, kwargs))
+        return SimpleNamespace(supported=supported, backend=MlaBackend(backend))
+
+    fp8 = object()
+    aiter = types.ModuleType("aiter")
+    aiter.dtypes = SimpleNamespace(fp8=fp8)
+    ops = types.ModuleType("aiter.ops")
+    attention = types.ModuleType("aiter.ops.attention")
+    attention.MlaBackend = MlaBackend
+    attention.get_mla_decode_shape_support = get_mla_decode_shape_support
+    for name, module in (
+        ("aiter", aiter),
+        ("aiter.ops", ops),
+        ("aiter.ops.attention", attention),
+    ):
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setenv("ATOM_MLA_PAGE_SIZE", "1")
+
+    assert dcp_persistent_supported(64, kv_cache_dtype, 8) is expected
+    dtype = fp8 if kv_cache_dtype == "fp8" else torch.bfloat16
+    assert calls == [
+        (
+            (64, 1, dtype, dtype),
+            {
+                "persistent": True,
+                "return_lse": True,
+                "cp_world_size": 8,
+                "page_size": 1,
+            },
+        )
+    ]
 
 
 @pytest.mark.parametrize("dcp_world_size", [1, 2, 8])

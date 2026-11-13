@@ -357,6 +357,30 @@ def mla_dcp_kernel_num_heads(
     return gathered
 
 
+def mla_dcp_persistent_width(
+    num_heads: int,
+    dcp_world_size: int,
+    min_kernel_heads: int = _MLA_MIN_HEADS,
+    *,
+    kv_cache_dtype: str,
+) -> int | None:
+    """Gathered width a persistent DCP decode runs at, or None when DCP is off
+    or aiter has no persistent kernel at that width (``dcp_persistent_supported``).
+    """
+    if dcp_world_size <= 1:
+        return None
+    width = mla_dcp_kernel_num_heads(
+        num_heads,
+        dcp_world_size,
+        min_kernel_heads,
+        kv_cache_dtype=kv_cache_dtype,
+        persistent=True,
+    )
+    if not dcp_persistent_supported(width, kv_cache_dtype, dcp_world_size):
+        return None
+    return width
+
+
 def mla_dcp_sparse_prefill_num_heads(
     num_heads: int,
     dcp_world_size: int,
@@ -937,16 +961,14 @@ class MLAAttention(nn.Module):
         # never costs collective traffic.
         # Whether aiter runs this layer's DCP decode persistent, at the width
         # the persistent path gathers to.
-        self.dcp_persistent_supported = dcp_world_size > 1 and dcp_persistent_supported(
-            mla_dcp_kernel_num_heads(
+        self.dcp_persistent_supported = (
+            mla_dcp_persistent_width(
                 self.num_heads,
                 dcp_world_size,
                 self.min_query_heads,
                 kv_cache_dtype=self.kv_cache_dtype,
-                persistent=True,
-            ),
-            self.kv_cache_dtype,
-            dcp_world_size,
+            )
+            is not None
         )
         self.dcp_kernel_num_heads = self.num_heads
         self.dcp_head_pad = 0
@@ -977,6 +999,8 @@ class MLAAttention(nn.Module):
         self.dcp_sparse_prefill_num_heads = self.num_heads
         self.dcp_sparse_prefill_nonps = False
         if dcp_world_size > 1 and self.is_sparse_mla:
+            from aiter.jit.utils.chip_info import get_gfx_runtime
+
             self.dcp_sparse_prefill_persistent = mla_dcp_sparse_prefill_is_persistent(
                 dcp_world_size,
                 self.dcp_persistent_supported,
@@ -996,7 +1020,7 @@ class MLAAttention(nn.Module):
                 dcp_world_size,
                 self.num_heads * dcp_world_size,
                 self.kv_cache_dtype.startswith("fp8"),
-                self.dcp_persistent_supported,
+                get_gfx_runtime() == "gfx950",
                 get_current_atom_config().max_num_batched_tokens,
             )
             (

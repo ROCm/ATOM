@@ -1058,7 +1058,8 @@ class AsyncIOProcManager:
                     sentinels, timeout=None if remote is None else remote.poll_s
                 )
             ):
-                if not getattr(self_ref(), "still_running", False):
+                mgr = self_ref()
+                if mgr is None or not mgr.still_running:
                     return
                 if failure := remote.failure():
                     break

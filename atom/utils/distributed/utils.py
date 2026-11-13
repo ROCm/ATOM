@@ -71,6 +71,13 @@ def raise_timeout_if_tp_spans_nodes(config) -> None:
         raise_default_group_timeout(envs.ATOM_MULTINODE_PG_TIMEOUT_S)
 
 
+def kv_blocks_differ_across_ranks(config) -> bool:
+    """Whether ranks can size different KV pools: PP stages hold different
+    layers, and ranks on another node have their own free memory. Only rank
+    0's count reaches the scheduler, so these reduce to the global minimum."""
+    return config.pipeline_parallel_size > 1 or config.is_multinode_tp
+
+
 def init_gloo_process_group(
     backend: Backend,
     prefix_store: PrefixStore,

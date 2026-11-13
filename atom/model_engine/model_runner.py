@@ -133,6 +133,7 @@ from atom.utils import (
     worker_process_name,
 )
 from atom.utils.distributed.utils import (
+    kv_blocks_differ_across_ranks,
     raise_timeout_if_dp_spans_nodes,
     raise_timeout_if_tp_spans_nodes,
 )
@@ -2135,11 +2136,7 @@ class ModelRunner:
         # single source for every entry count, so it must never disagree with
         # the number the pool is actually built at.
         num_kvcache_blocks = plan.paged_entries
-        # Only rank 0's answer reaches the scheduler; ranks on another node can
-        # have less memory free.
-        if (
-            config.pipeline_parallel_size > 1 or config.is_multinode_tp
-        ) and torch.distributed.is_initialized():
+        if kv_blocks_differ_across_ranks(config) and torch.distributed.is_initialized():
             t = torch.tensor(
                 [num_kvcache_blocks], dtype=torch.int64, device=self.device
             )
