@@ -31,12 +31,10 @@ _DECODE_SMALL_TOKENS = 48
 def use_mori_low_latency(requested: bool, internode: bool) -> bool:
     """Whether to build mori's low-latency kernel for this EP group.
 
-    Under ATOM_MORI_V1_LL that kernel is InterNodeV1LL alone: within a node
-    IntraNode serves low latency too, as in vLLM.
+    The LL (split send/recv) kernel is only valid for inter-node EP.
+    Intra-node EP uses the IntraNode dispatch/combine path instead.
     """
-    if envs.ATOM_MORI_V1_LL:
-        return requested and internode
-    return requested
+    return requested and internode
 
 
 class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
