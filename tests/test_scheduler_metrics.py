@@ -222,7 +222,7 @@ def test_scheduler_abort_releases_pending_metric_state(clock):
     )
     scheduler.add(seq)
     scheduler._count_inflight_load(seq)
-    scheduler._reject_aborted_waiting(seq)
+    scheduler._finish_rejected_waiting(seq)
     scheduler._update_from_kv_xfer_finished(
         KVConnectorOutput(finished_recving={seq.id})
     )
@@ -574,6 +574,7 @@ def test_prefill_context_records_full_prompt_once_and_chunk_batch_totals(monkeyp
         _connector_release_stalled_save=lambda seq: None,
         block_manager=SimpleNamespace(deallocate=lambda seq: None),
         waiting=deque(),
+        _behind_settled_resumes=lambda: 0,
     )
     assert Scheduler.preempt(owner, first)
     metrics.enqueue(first)
@@ -644,6 +645,7 @@ def test_decode_request_context_gauge_records_first_dispatch_once(monkeypatch):
         _connector_release_stalled_save=lambda seq: None,
         block_manager=SimpleNamespace(deallocate=lambda seq: None),
         waiting=deque(),
+        _behind_settled_resumes=lambda: 0,
     )
     assert Scheduler.preempt(owner, seqs[1])
     metrics.enqueue(seqs[1])

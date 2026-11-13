@@ -23,7 +23,7 @@ from test_lmcache_mp_async_lookup import CHUNK, _Adapter, _Client
 from atom.kv_transfer.offload.chunked_scheduler import ChunkedOffloadSchedulerBase
 from atom.kv_transfer.offload.metadata import LoadSpec
 from atom.kv_transfer.offload.mp import lookup as mp_lookup
-from atom.kv_transfer.offload.mp import scheduler as mp_scheduler
+from tests.lmcache_mp_support import bare_mp_scheduler
 
 MIN_LOAD = 32
 
@@ -34,9 +34,7 @@ def _scheduler(monkeypatch, *, chunks=8, lookup_done=False):
     client = mp_lookup._MPLookupClient(
         adapter, config=_config(), timeout=1.0, poll_interval=0.01
     )
-    sched = mp_scheduler.LMCacheMPConnectorScheduler.__new__(
-        mp_scheduler.LMCacheMPConnectorScheduler
-    )
+    sched = bare_mp_scheduler()
     sched._mp_adapter = adapter
     ChunkedOffloadSchedulerBase.__init__(
         sched, _config(), chunk_size=CHUNK, lookup_client=client
