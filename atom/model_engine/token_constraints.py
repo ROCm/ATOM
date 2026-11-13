@@ -13,12 +13,8 @@ import logging
 
 import torch
 
-from atom.constraint_parser import ConstraintBinding, register_constraint_request_owner
-from atom.model_ops.required_channel import (
-    DeviceChannel,
-    advance_states,
-    constrain_logits,
-)
+from atom.constraint_parser import ConstraintBinding
+from atom.model_ops.required_channel import DeviceChannel
 
 logger = logging.getLogger("atom")
 
@@ -33,23 +29,6 @@ def register_constraint_provider(provider):
     """
     if any(existing.backend == provider.backend for existing in _PROVIDERS):
         raise ValueError(f"Duplicate constraint backend: {provider.backend}")
-    if not callable(getattr(provider, "hard_requests", None)):
-        raise TypeError(
-            "Constraint adapters must declare hard_requests(binding, batch)"
-        )
-    if not hasattr(provider, "mask_stage") or not hasattr(provider, "commit_order"):
-        raise TypeError("Constraint adapters must declare mask_stage and commit_order")
-    owns_request = getattr(provider, "owns_request", None)
-    if owns_request is not None:
-        # Process-local: the engine/coordinator process must register the same
-        # predicate itself (see docs/token_constraint_interface.md).
-        register_constraint_request_owner(provider.backend, owns_request)
-        logger.info(
-            "Constraint adapter %s registered its request-owner predicate in "
-            "this process only; the engine process must call "
-            "register_constraint_request_owner for release RPCs",
-            provider.backend,
-        )
     _PROVIDERS.append(provider)
     _PROVIDERS.sort(key=lambda adapter: adapter.mask_stage)
 
@@ -109,8 +88,7 @@ def release_token_constraints(runner, request_ids):
 def constraint_errors(runner):
     errors = None
     for provider in _PROVIDERS:
-        collect = getattr(provider, "errors", None)
-        current = collect(runner) if collect is not None else None
+        current = provider.errors(runner)
         if current is not None:
             if errors is None:
                 errors = {}
@@ -121,7 +99,9 @@ def constraint_errors(runner):
 def apply_required_channel(
     runner, batch, logits, metadata=None, target=None, preserve_masks=False
 ):
-    """GPU-only force/deny backend, also used by disaggregated prefill."""
+    """GPU-only required-channel backend, also used by disaggregated prefill."""
+    from atom.model_ops.triton_required_channel import constrain_logits
+
     channel = batch.required_channel
     if channel is None:
         return None
@@ -277,7 +257,7 @@ class GrammarProvider:
 
     @staticmethod
     def enabled(batch):
-        return bool(getattr(batch, "structured_requests", None))
+        return bool(batch.structured_requests)
 
     @staticmethod
     def masks_source(metadata):
@@ -285,7 +265,7 @@ class GrammarProvider:
 
     @staticmethod
     def bind(batch):
-        requests = getattr(batch, "structured_requests", None)
+        requests = batch.structured_requests
         return ConstraintBinding("grammar", requests) if requests else None
 
     @staticmethod
@@ -294,20 +274,18 @@ class GrammarProvider:
 
     @staticmethod
     def errors(runner):
-        grammar = getattr(runner, "structured_output", None)
+        grammar = runner.structured_output
         return grammar.errors if grammar is not None else None
 
     @staticmethod
     def release(runner, request_ids):
-        grammar = getattr(runner, "structured_output", None)
+        grammar = runner.structured_output
         if grammar is not None:
             grammar.release(request_ids)
 
     @staticmethod
     def apply(step, binding):
-        step.grammar = getattr(step.runner, "structured_output", None)
-        if step.grammar is None:
-            raise ValueError("Structured output must be prepared before enqueue")
+        step.grammar = step.runner.structured_output
         if step.source.shape[-1] != step.grammar.vocab_size:
             raise ValueError(
                 "Target logits do not match the prepared structured vocabulary"
@@ -336,7 +314,7 @@ class ChannelProvider:
 
     @staticmethod
     def enabled(batch):
-        return getattr(batch, "required_channel", None) is not None
+        return batch.required_channel is not None
 
     @staticmethod
     def masks_source(metadata):
@@ -344,13 +322,17 @@ class ChannelProvider:
 
     @staticmethod
     def bind(batch):
-        channel = getattr(batch, "required_channel", None)
+        channel = batch.required_channel
         return ConstraintBinding("channel", channel) if channel is not None else None
 
     @staticmethod
     def prepare(runner, batch, metadata, binding):
         # Channel state is assembled with the batch and carried on the GPU.
         pass
+
+    @staticmethod
+    def errors(runner):
+        return None
 
     @staticmethod
     def release(runner, request_ids):
@@ -371,6 +353,8 @@ class ChannelProvider:
     @staticmethod
     def commit(step, tokens, batch, deferred, failure, binding):
         if step.channel is not None and deferred:
+            from atom.model_ops.triton_required_channel import advance_states
+
             return advance_states(*step.channel, tokens)
 
 

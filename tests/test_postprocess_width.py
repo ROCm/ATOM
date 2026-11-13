@@ -65,6 +65,7 @@ def _batch(seqs, mask=None):
         logprob_requested=requested,
         logprob_rows=rows,
         required_channel=None,
+        structured_requests=None,
         num_spec_step=0,
     )
 
@@ -74,6 +75,7 @@ def _runner(seen):
     runner = object.__new__(mod.ModelRunner)
     runner.rank = 0
     runner._served = None
+    runner.structured_output = None
 
     def _sampler(logits, temperatures, top_ks, top_ps, all_greedy, **kw):
         seen["logits_rows"] = logits.shape[0]

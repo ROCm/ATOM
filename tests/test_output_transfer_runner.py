@@ -101,6 +101,7 @@ def test_postprocess_submits_prefill_or_final_broadcast_counts(
         drafter=SimpleNamespace(lossless=None),
         forward_done_event=mock.Mock(),
         _served=None,
+        structured_output=None,
     )
     with pytest.raises(StatusSubmitted):
         runner_module.ModelRunner.postprocess(
@@ -110,6 +111,7 @@ def test_postprocess_submits_prefill_or_final_broadcast_counts(
                 return_logprobs=[False] * bs,
                 any_logprobs=False,
                 required_channel=None,
+                structured_requests=None,
                 num_spec_step=2 if verified else 0,
             ),
             torch.zeros(4, 8),
@@ -173,6 +175,7 @@ def test_a_filtered_batch_reaches_one_law_for_every_draw(
         rejection_sampler=SimpleNamespace(forward=mock.Mock(side_effect=_Reached)),
         drafter=drafter,
         _served=None,
+        structured_output=None,
     )
     runner.sampler.sample_verification_tokens = mock.Mock(
         return_value=torch.zeros(bs, dtype=torch.int32)
@@ -185,6 +188,7 @@ def test_a_filtered_batch_reaches_one_law_for_every_draw(
                 return_logprobs=[False] * bs,
                 any_logprobs=False,
                 required_channel=None,
+                structured_requests=None,
                 num_spec_step=2 if verified else 0,
             ),
             torch.zeros(4, 8),
@@ -244,6 +248,7 @@ def test_a_uniform_k_reaches_the_sampler_as_a_scalar(ks, ps):
         top_ks=np.array(ks, np.int32),
         top_ps=np.array(ps, np.float32),
         required_channel=None,
+        structured_requests=None,
     )
     _, top_ks, _, _, _ = runner_module.ModelRunner.prepare_sample(runner, batch, group)
     assert type(top_ks) is int and top_ks == ks[0]
@@ -280,6 +285,7 @@ def test_a_lossless_draft_gets_every_rows_filters_published(ks, ps):
         top_ks=np.array(ks, np.int32),
         top_ps=np.array(ps, np.float32),
         required_channel=None,
+        structured_requests=None,
         is_dummy_run=False,
         total_tokens_num_prefill=0,
     )
@@ -330,6 +336,7 @@ def test_the_draft_q_lookup_is_gated_like_its_consumer(temps, prefill, verifies)
         top_ks=np.full(bs, -1, np.int32),
         top_ps=np.ones(bs, np.float32),
         required_channel=None,
+        structured_requests=None,
         is_dummy_run=False,
         total_tokens_num_prefill=prefill,
     )

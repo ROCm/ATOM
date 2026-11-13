@@ -57,7 +57,6 @@ def test_failure_uses_output_copy_without_poisoning_gpu_carry(deferred, spec):
 def test_channel_cannot_restore_schema_forbidden_token(device):
     from atom.model_ops.required_channel import (
         DeviceChannel,
-        constrain_logits,
         constrain_logits_reference,
     )
     from atom.sampling_params import RequiredChannel
@@ -69,6 +68,8 @@ def test_channel_cannot_restore_schema_forbidden_token(device):
     logits[0, 2] = -float("inf")
     states = torch.tensor([1], dtype=torch.int32, device=device)
     if device == "cuda":
+        from atom.model_ops.triton_required_channel import constrain_logits
+
         constrain_logits(
             DeviceChannel.of(channel, torch.device(device)),
             states,
@@ -124,9 +125,9 @@ def test_channel_kernel_per_request_preserve_matches_reference(speculative, pres
     CPU reference row by row, for bonus and target rows."""
     from atom.model_ops.required_channel import (
         DeviceChannel,
-        constrain_logits,
         constrain_logits_reference,
     )
+    from atom.model_ops.triton_required_channel import constrain_logits
     from atom.sampling_params import RequiredChannel
 
     channel = RequiredChannel(after=(1,), opening=(2,), opens_at=1, end_ids=(3,))

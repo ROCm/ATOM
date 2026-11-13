@@ -3,6 +3,7 @@
 
 """Hard token sets and sampling-boundary invariants, independent of a model."""
 
+import sys
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -14,7 +15,7 @@ from atom.model_engine import token_constraints as boundary
 
 def test_unconstrained_step_does_not_touch_backend_or_logits():
     runner = SimpleNamespace(structured_output=Mock())
-    batch = SimpleNamespace(required_channel=None)
+    batch = SimpleNamespace(required_channel=None, structured_requests=None)
     assert boundary.TokenConstraints.apply(runner, batch, None, None) is None
     boundary.prepare_token_constraints(runner, batch, None)
     assert runner.structured_output.mock_calls == []
@@ -66,7 +67,11 @@ def test_masks_precede_sampling_and_commit_uses_final_ids(
     monkeypatch.setattr(boundary, "apply_required_channel", channel_mask)
     states = torch.tensor([3, 5])
     advance = Mock(return_value=states)
-    monkeypatch.setattr(boundary, "advance_states", advance)
+    monkeypatch.setitem(
+        sys.modules,
+        "atom.model_ops.triton_required_channel",
+        SimpleNamespace(advance_states=advance),
+    )
     step = boundary.TokenConstraints.apply(runner, batch, logits, metadata)
     assert events == ["grammar", "channel"]
     if speculative:
@@ -92,7 +97,7 @@ def test_masks_precede_sampling_and_commit_uses_final_ids(
 
 def test_prepare_preserves_deferred_metadata_identity():
     runner = SimpleNamespace(structured_output=Mock())
-    batch = SimpleNamespace(structured_requests={0: object()})
+    batch = SimpleNamespace(structured_requests={0: object()}, required_channel=None)
     metadata = object()
     boundary.prepare_token_constraints(runner, batch, metadata)
     runner.structured_output.prepare.assert_called_once_with(batch, metadata)
@@ -115,12 +120,18 @@ def test_channel_backend_keeps_gpu_carry_and_draft_metadata(monkeypatch, carry):
             "required_channel_states": SimpleNamespace(gpu=torch.tensor([0, 0]))
         },
     )
-    batch = SimpleNamespace(required_channel=channel, total_seqs_num=2)
+    batch = SimpleNamespace(
+        required_channel=channel, structured_requests=None, total_seqs_num=2
+    )
     metadata = SimpleNamespace(
         cu_num_draft_tokens=object(), input_ids=object(), target_logits_indices=object()
     )
     kernel = Mock(return_value=object())
-    monkeypatch.setattr(boundary, "constrain_logits", kernel)
+    monkeypatch.setitem(
+        sys.modules,
+        "atom.model_ops.triton_required_channel",
+        SimpleNamespace(constrain_logits=kernel),
+    )
     bonus, target = object(), object()
     result = boundary.apply_required_channel(runner, batch, bonus, metadata, target)
     assert result == (device_channel, kernel.return_value)

@@ -46,10 +46,7 @@ from typing import NamedTuple
 
 import torch
 
-from atom.sampling_params import (
-    UNCONSTRAINED,  # noqa: F401 - public compatibility export
-    RequiredChannel,
-)
+from atom.sampling_params import RequiredChannel
 
 BLOCK_V = 1024
 """Vocabulary columns a `constrain_logits` program writes at a time."""
@@ -62,8 +59,6 @@ rows forced takes 14 / 20 / 52 us at bs 1 / 16 / 64, and one with none forced
 5 / 7 / 7 us, as with one program per request. A program per block (160)
 halves the first at bs 1 but quadruples the second at bs 64, and that is the
 step a request takes every time until its channel opens."""
-
-# The host's own sentinel, so both sides keep one definition of it.
 
 
 class DeviceChannel(NamedTuple):
@@ -84,18 +79,6 @@ class DeviceChannel(NamedTuple):
             channel.opens_at,
             len(channel.end_ids),
         )
-
-
-def constrain_logits(*args, **kwargs):
-    from atom.model_ops.triton_required_channel import constrain_logits as execute
-
-    return execute(*args, **kwargs)
-
-
-def advance_states(*args, **kwargs):
-    from atom.model_ops.triton_required_channel import advance_states as execute
-
-    return execute(*args, **kwargs)
 
 
 def _constrain_row_reference(
