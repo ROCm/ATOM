@@ -25,9 +25,11 @@ _BLOCK_N = 64
 
 def mla_absorb_q_pack_supports(nope_head_dim: int, kv_lora_rank: int) -> bool:
     """Whether the kernel takes these dims: ``tl.arange(0, P)`` compiles only
-    for a power of two, and the loop over L has no tail mask."""
+    for a power of two, the 256-row tile of a P over 256 overruns gfx950's
+    160 KiB of shared memory, and the loop over L has no tail mask."""
     return (
         nope_head_dim == triton.next_power_of_2(nope_head_dim)
+        and nope_head_dim <= 256
         and kv_lora_rank % _BLOCK_N == 0
     )
 
@@ -95,7 +97,9 @@ def mla_absorb_q_pack(
     """
     num_heads, num_tokens, p = q_nope.shape
     l = w_k.shape[1]
-    assert w_k.shape == (num_heads, l, p) and q_out.shape[1] == num_heads
+    assert w_k.shape == (num_heads, l, p)
+    assert q_out.shape[:2] == (num_tokens, num_heads) and q_out.shape[2] >= l
+    assert mla_absorb_q_pack_supports(p, l), f"no absorb kernel for P={p}, L={l}"
     assert q_nope.stride(-1) == 1 and w_k.stride(-1) == 1 and q_out.stride(-1) == 1
     if num_tokens == 0:
         return

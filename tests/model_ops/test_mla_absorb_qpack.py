@@ -107,13 +107,14 @@ def test_absorb_into_q_out_matches_two_kernel_path(tokens, q_scale):
     assert share < 0.06, f"{share:.1%} of nope codes one step off"
 
 
-# GLM-5.x has 192 nope dims, which the absorb kernel does not compile for. The
-# kernel has not run on gfx942.
+# GLM-5.x has 192 nope dims, which the absorb kernel does not compile for, and
+# 512 overruns gfx950's shared memory. The kernel has not run on gfx942.
 @pytest.mark.parametrize(
     "gfx, nope, absorbs",
     [
         ("gfx950", NOPE, True),
         ("gfx950", 192, False),
+        ("gfx950", 512, False),
         ("gfx942", NOPE, False),
     ],
 )
@@ -130,3 +131,14 @@ def test_absorb_gate_takes_two_kernel_path_off_kernel_shapes(
     kv_cache = torch.empty(1, device="cuda", dtype=dtypes.fp8)
     gate = MLAAttention._absorb_into_q_out(layer, True, True, kv_cache, dtypes.fp8)
     assert gate == absorbs
+
+
+# L=96 would store its second 64-column block over half the rope columns.
+@pytest.mark.parametrize("nope, lora", [(NOPE, 96), (192, LORA), (512, LORA)])
+def test_absorb_q_pack_rejects_shapes_its_kernel_cannot_take(nope, lora):
+    tokens = 2048
+    q_nope = torch.randn(HEADS, tokens, nope, device="cuda", dtype=torch.bfloat16)
+    w_k = torch.randn(HEADS, lora, nope, device="cuda", dtype=torch.bfloat16)
+    q_out = torch.zeros(tokens, HEADS, lora + PE, device="cuda", dtype=dtypes.fp8)
+    with pytest.raises(AssertionError, match="no absorb kernel"):
+        mla_absorb_q_pack(q_nope, w_k, q_out, torch.ones(1, device="cuda"))
