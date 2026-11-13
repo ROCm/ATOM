@@ -316,6 +316,10 @@ class MhaKvPool:
     def _arenas(self) -> list[LayerMajorArena]:
         return [a for a in (self.cache, self.scale, self.extra) if a is not None]
 
+    @property
+    def entries(self) -> int:
+        return self.cache.entries
+
     def region_tensors(self) -> list[tuple[str, torch.Tensor]]:
         """One `(role, tensor)` per (field, layer), in declared field order.
 

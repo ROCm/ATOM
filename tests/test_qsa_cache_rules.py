@@ -43,14 +43,8 @@ def test_cache_formats_reject_unserved(kv, index):
         qsa_cache_formats(SimpleNamespace(kv_cache_dtype=kv, index_cache_dtype=index))
 
 
-def _check(kv_transfer_config, kv_cache_dtype="bf16", index_cache_dtype=None):
-    check_kv_transfer(
-        SimpleNamespace(
-            kv_transfer_config=kv_transfer_config,
-            kv_cache_dtype=kv_cache_dtype,
-            index_cache_dtype=index_cache_dtype,
-        )
-    )
+def _check(kv_transfer_config):
+    check_kv_transfer(SimpleNamespace(kv_transfer_config=kv_transfer_config))
 
 
 _PD = "disaggregated.*kv_connector={!r}"
@@ -128,48 +122,17 @@ _MP = {"kv_connector": "lmcache_mp", "kv_role": "offload"}
 
 
 @pytest.mark.parametrize(
-    "kv_cache_dtype, index_cache_dtype",
-    [
-        ("fp8", None),  # the index cache follows the KV cache
-        ("fp8", "fp8"),
-        ("fp8", "bf16"),
-        ("bf16", "fp8"),
-        ("bf16", "fp4"),
-        ("auto", "fp4"),
-    ],
-)
-@pytest.mark.parametrize(
     "kv_transfer_config",
     [
+        None,
         _IN_PROCESS,
+        _MP,
         {"kv_connector": "multi", "connectors": [_MP, _IN_PROCESS]},
     ],
+    ids=["no_transfer", "in_process", "lmcache_mp", "multi"],
 )
-def test_qwen38_runs_in_process_offload_of_quantized_caches(
-    kv_transfer_config, kv_cache_dtype, index_cache_dtype
-):
-    """The in-process codec carries the QSA scale planes (`k_scale`, `v_scale`,
-    `extra_planes`)."""
-    _check(kv_transfer_config, kv_cache_dtype, index_cache_dtype)
-
-
-@pytest.mark.parametrize(
-    "kv_transfer_config, kv_cache_dtype, index_cache_dtype",
-    [
-        (_IN_PROCESS, "bf16", "bf16"),
-        (_IN_PROCESS, "bf16", None),
-        (_IN_PROCESS, "auto", "bfloat16"),
-        (_IN_PROCESS, None, None),
-        (_MP, "fp8", None),
-        (_MP, "fp8", "fp4"),
-        (_MP, "bf16", "fp8"),
-        (None, "fp8", "fp8"),
-    ],
-)
-def test_qwen38_keeps_bf16_in_process_and_every_lmcache_mp_cache(
-    kv_transfer_config, kv_cache_dtype, index_cache_dtype
-):
-    _check(kv_transfer_config, kv_cache_dtype, index_cache_dtype)
+def test_qwen38_runs_every_tier_that_reads_page_images(kv_transfer_config):
+    _check(kv_transfer_config)
 
 
 _MTP = SimpleNamespace(method="mtp")
@@ -197,9 +160,10 @@ def test_the_draft_rows_and_the_page_namespace_read_one_rule(
         speculative_config=spec,
     )
     assert qsa_page_segments(config)["draft_kv"] == ("bf16" if draft else "target")
+    formats = qsa_cache_formats(config)
     if spec is _MTP:
-        assert qsa_row_space(config, 40, 40) == (QSA_DRAFT_ROWS if draft else QSA_ROWS)
-    assert qsa_row_space(config, 39, 40) == QSA_ROWS
+        assert qsa_row_space(formats, 40, 40) == (QSA_DRAFT_ROWS if draft else QSA_ROWS)
+    assert qsa_row_space(formats, 39, 40) == QSA_ROWS
 
 
 _KV = ((4, 2, 8), torch.bfloat16)

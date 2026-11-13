@@ -35,7 +35,7 @@ import torch
 from atom.kv_transfer.disaggregation.page_region import page_region
 from atom.kv_transfer.disaggregation.types import KVTransferTensors
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
-from atom.model_ops.fla_ops.gdn_flydsl import select_policy
+from atom.model_ops.fla_ops.gdn_flydsl import select_policy_for_slot
 from atom.model_ops.qwen4_exp.ops.qsa import (
     qsa_cache_row_layout,
     qsa_compressed_slots,
@@ -191,31 +191,32 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
 
     BACKEND = Qwen4ExpBackend
 
-    def _gdn_flydsl_policy(self, module, state):
-        attention = module.impl
-        return select_policy(
-            allowed=attention.allow_aiter_flydsl,
-            replayssm=self.replayssm,
-            lossy_decode=envs.ATOM_ENABLE_GDN_DECODE_LOSSY_FAST,
-            state=state,
-            activation_dtype=attention.dt_bias.dtype,
-        )
-
     @cached_property
-    def _ssm_storage(self) -> str:
-        """`vk` when FlyDSL decode keeps the SSM state transposed, else `kv`.
-
-        Asked of a one-slot probe: the layout id is spelled before any state
-        is allocated.
+    def _gdn_flydsl_policies(self) -> dict:
+        """Each GDN layer's FlyDSL policy, decided once from the SSM state's
+        slot shape, dtype and device: the layout id spells the storage order
+        before any state is allocated, and the binding follows the same value.
         """
         _, shape_v = self._state_shape_for_runner()
         _, dtype_v = self._state_dtypes()
-        probe = torch.empty((1, *shape_v), dtype=dtype_v, device=self.device)
-        transposed = {
-            self._gdn_flydsl_policy(module, probe).decode
+        return {
+            module: select_policy_for_slot(
+                allowed=module.impl.allow_aiter_flydsl,
+                replayssm=self.replayssm,
+                lossy_decode=envs.ATOM_ENABLE_GDN_DECODE_LOSSY_FAST,
+                slot_shape=tuple(shape_v),
+                dtype=dtype_v,
+                device=self.device,
+                activation_dtype=module.impl.dt_bias.dtype,
+            )
             for module in self.pool_rows.get(LINEAR_STATE_ROWS, {})
             if hasattr(module, "base_linear_attention")
         }
+
+    @cached_property
+    def _ssm_storage(self) -> str:
+        """`vk` when FlyDSL decode keeps the SSM state transposed, else `kv`."""
+        transposed = {policy.decode for policy in self._gdn_flydsl_policies.values()}
         if len(transposed) > 1:
             raise RuntimeError("GDN layers disagree on the SSM storage order")
         return "vk" if True in transposed else "kv"
@@ -224,15 +225,7 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
         cache = super().build_kv_cache_tensor(module)
         if hasattr(module, "base_linear_attention"):
             attention = module.impl
-            policy = self._gdn_flydsl_policy(module, cache.v_cache)
-            if self._uses_paged_checkpoints() and policy.decode != (
-                self._ssm_storage == "vk"
-            ):
-                raise RuntimeError(
-                    "GDN SSM state is bound "
-                    f"{'VK' if policy.decode else 'KV'} but the checkpoint "
-                    f"layout id says ssm_storage={self._ssm_storage}"
-                )
+            policy = self._gdn_flydsl_policies[module]
             attention.gdn_flydsl_policy = policy
             self._flydsl_prefill_enabled = (
                 getattr(self, "_flydsl_prefill_enabled", False) or policy.prefill
@@ -543,7 +536,7 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
         slots = entries.get(PLE_STATE_SLOT_CLASS, 0)
         for plane in self._ple_planes:
             caches[plane.name] = torch.full(
-                (slots, *plane.shape), plane.fill, dtype=plane.dtype, device="cuda"
+                (slots, *plane.shape), plane.fill, dtype=plane.dtype, device=self.device
             )
         return caches
 
@@ -597,8 +590,13 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
             k_scale=k_scale,
             v_scale=v_scale,
             extra_planes=tuple(
-                plane
-                for plane in (raw, compressed, rope, compressed_scale)
+                (role, plane)
+                for role, plane in (
+                    ("index_raw", raw),
+                    ("index_compressed", compressed),
+                    ("rope_positions", rope),
+                    ("index_compressed_scale", compressed_scale),
+                )
                 if plane is not None
             ),
         )

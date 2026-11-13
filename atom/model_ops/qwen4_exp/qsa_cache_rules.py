@@ -24,17 +24,24 @@ QSA_ROWS = "qsa"
 QSA_DRAFT_ROWS = "qsa_draft"
 
 
-def qsa_cache_formats(atom_config) -> tuple[str, str]:
-    """`(K/V format, compressed index-key format)` this engine serves.
+def normalize_qsa_cache_formats(atom_config) -> tuple[str, str]:
+    """`(K/V format, compressed index-key format)` as asked, served or not.
 
-    The raw index keys stay BF16 whatever is asked: they are mean-pooled
-    before normalization, and a group can straddle a prefill chunk.
     An unset index dtype follows the KV cache's, as `Config` resolves it.
     """
     kv = getattr(atom_config, "kv_cache_dtype", "bf16") or "bf16"
     kv = "bf16" if kv in ("auto", "bfloat16") else kv
     index = getattr(atom_config, "index_cache_dtype", None) or kv
-    index = "bf16" if index in ("auto", "bfloat16") else index
+    return kv, "bf16" if index in ("auto", "bfloat16") else index
+
+
+def qsa_cache_formats(atom_config) -> tuple[str, str]:
+    """`(K/V format, compressed index-key format)` this engine serves.
+
+    The raw index keys stay BF16 whatever is asked: they are mean-pooled
+    before normalization, and a group can straddle a prefill chunk.
+    """
+    kv, index = normalize_qsa_cache_formats(atom_config)
     if kv not in ("bf16", "fp8") or index not in QSA_CACHE_FORMATS:
         raise ValueError(
             f"Qwen QSA serves bf16/fp8 KV and bf16/fp8/fp4 index caches, got "
@@ -43,15 +50,17 @@ def qsa_cache_formats(atom_config) -> tuple[str, str]:
     return kv, index
 
 
-def qsa_draft_rows(config) -> bool:
-    if not envs.ATOM_QSA_DRAFT_KV_BF16:
-        return False
-    return qsa_cache_formats(config) != ("bf16", "bf16")
+def qsa_draft_rows(formats: tuple[str, str]) -> bool:
+    """Whether the MTP draft layer keeps BF16 rows of its own under the
+    target's `qsa_cache_formats`."""
+    return bool(envs.ATOM_QSA_DRAFT_KV_BF16) and formats != ("bf16", "bf16")
 
 
-def qsa_row_space(config, layer_num: int, num_target_layers: int) -> str:
+def qsa_row_space(
+    formats: tuple[str, str], layer_num: int, num_target_layers: int
+) -> str:
     """The MTP draft layer sits past the `num_target_layers` target stack."""
-    if layer_num >= num_target_layers and qsa_draft_rows(config):
+    if layer_num >= num_target_layers and qsa_draft_rows(formats):
         return QSA_DRAFT_ROWS
     return QSA_ROWS
 
@@ -67,7 +76,9 @@ def qsa_caches_rope_positions(config) -> bool:
 def qsa_page_segments(config) -> dict:
     """What besides the namespace's own fields changes the PAGE segment set."""
     spec = getattr(config, "speculative_config", None)
-    draft = getattr(spec, "method", None) == "mtp" and qsa_draft_rows(config)
+    draft = getattr(spec, "method", None) == "mtp" and qsa_draft_rows(
+        qsa_cache_formats(config)
+    )
     return {
         "image_input": qsa_caches_rope_positions(config),
         "draft_kv": "bf16" if draft else "target",

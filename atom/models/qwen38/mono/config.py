@@ -16,6 +16,7 @@ caches.
 
 import torch
 
+from atom.model_ops.qwen4_exp.qsa_cache_rules import normalize_qsa_cache_formats
 from atom.models.qwen38.mono.kernels.geometry import REPLAY_MAX
 from atom.mono.plan.shard import Shard
 from atom.mono.runtime.deployment import (
@@ -133,14 +134,6 @@ def _quark_mxfp4(atom_config) -> bool:
     return {"*linear_attn.*", "*self_attn.*"} <= fp8 or (not fp8 and acts == "fp4")
 
 
-def _cache_formats(atom_config) -> tuple[str, str]:
-    """(K / V, index) cache formats as ATOM's QSA resolves them (``qwen4_exp.qsa_cache_rules.qsa_cache_formats``)."""
-    kv = getattr(atom_config, "kv_cache_dtype", "bf16") or "bf16"
-    kv = "bf16" if kv in ("auto", "bfloat16") else kv
-    index = getattr(atom_config, "index_cache_dtype", None) or kv
-    return kv, "bf16" if index in ("auto", "bfloat16") else index
-
-
 def _deployment_checks(atom_config) -> list[tuple[bool, str]]:
     """The checkpoint, parallelism, speculative decode and cache format Mono serves."""
     spec = getattr(atom_config, "speculative_config", None)
@@ -154,8 +147,8 @@ def _deployment_checks(atom_config) -> list[tuple[bool, str]]:
             "not MTP3 speculative decode",
         ),
         (
-            _cache_formats(atom_config) == ("fp8", "bf16"),
-            f"KV / index caches {_cache_formats(atom_config)}",
+            normalize_qsa_cache_formats(atom_config) == ("fp8", "bf16"),
+            f"KV / index caches {normalize_qsa_cache_formats(atom_config)}",
         ),
         (
             atom_config.kv_cache_block_size == KV_BLOCK,

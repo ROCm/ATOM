@@ -56,6 +56,16 @@ _PAGE_ROLES: tuple[str, ...] = (
     "index_scale",
 )
 
+# What ``KVCacheTensor.extra_planes`` may name, published after ``_PAGE_ROLES``
+# in this order: QSA's side caches, each present only under the formats that
+# use it. Fixed for the same reason as the list above.
+_EXTRA_PLANE_ROLES: tuple[str, ...] = (
+    "index_raw",
+    "index_compressed",
+    "rope_positions",
+    "index_compressed_scale",
+)
+
 # The recurrent planes. They are deliberately NOT published through the PAGE
 # layout: a recurrent group counts in its own block id space and only its last
 # snapshot is meaningful, so ``base + block_id * unit_bytes`` on the attention
@@ -85,13 +95,26 @@ def _movable_planes(tensor: KVCacheTensor) -> list[tuple[str, torch.Tensor]]:
         # absence both have to mean "no plane".
         if isinstance(plane, torch.Tensor) and plane.numel():
             planes.append((role, plane))
+    extra = dict(tensor.extra_planes)
+    unknown = set(extra) - set(_EXTRA_PLANE_ROLES)
+    if unknown:
+        raise ValueError(
+            f"ATOM LMCache MP: layer {int(tensor.layer_num)} carries extra "
+            f"plane(s) {sorted(unknown)} the PAGE layout does not publish; a "
+            "plane left behind is restored as the previous occupant's bytes. "
+            "Add it to _EXTRA_PLANE_ROLES."
+        )
+    for role in _EXTRA_PLANE_ROLES:
+        plane = extra.get(role)
+        if plane is not None and plane.numel():
+            planes.append((role, plane))
     return planes
 
 
 def _check_roles_exhaustive() -> None:
     """Fail if ``KVCacheTensor`` grew a plane this module would leave behind."""
     fields = getattr(KVCacheTensor, "__dataclass_fields__", {})
-    unknown = set(fields) - set(_PAGE_ROLES) - _NON_PAGE_ROLES
+    unknown = set(fields) - set(_PAGE_ROLES) - {"extra_planes"} - _NON_PAGE_ROLES
     if unknown:
         raise ValueError(
             "ATOM LMCache MP: KVCacheTensor carries plane(s) "

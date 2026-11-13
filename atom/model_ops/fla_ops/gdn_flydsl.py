@@ -37,6 +37,22 @@ def decode_device_supported(device):
 
 
 def select_policy(*, allowed, replayssm, lossy_decode, state, activation_dtype):
+    return select_policy_for_slot(
+        allowed=allowed,
+        replayssm=replayssm,
+        lossy_decode=lossy_decode,
+        slot_shape=tuple(state.shape[1:]),
+        dtype=state.dtype,
+        device=state.device,
+        activation_dtype=activation_dtype,
+    )
+
+
+def select_policy_for_slot(
+    *, allowed, replayssm, lossy_decode, slot_shape, dtype, device, activation_dtype
+):
+    """`select_policy` for a state pool described by one slot's shape, its
+    dtype and device, which is all of it the choice reads."""
     # ReplaySSM kernels address a contiguous KV pool. Do not reinterpret it as
     # VK even when K == V makes the shape identical. Keep both stages original.
     if not allowed or replayssm:
@@ -45,11 +61,11 @@ def select_policy(*, allowed, replayssm, lossy_decode, state, activation_dtype):
     decode_enabled = (
         backend("decode") != "triton"
         and not lossy_decode
-        and state.ndim == 4
-        and state.shape[-2:] == (128, 128)
-        and state.dtype in (torch.bfloat16, torch.float32)
+        and len(slot_shape) == 3
+        and tuple(slot_shape[-2:]) == (128, 128)
+        and dtype in (torch.bfloat16, torch.float32)
         and activation_dtype == torch.bfloat16
-        and decode_device_supported(state.device)
+        and decode_device_supported(device)
     )
     if not (prefill_enabled or decode_enabled) or ops() is None:
         return GDNFlyDSLPolicy()

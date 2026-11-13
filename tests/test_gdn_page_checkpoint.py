@@ -29,9 +29,12 @@ from atom.model_ops.attentions.pool_layout.layer_major_page_unit_geometry import
 )
 
 
-def _published_bytes(pool):
-    """What `GDNAttentionMetadataBuilder._published_page_unit_bytes` sums."""
-    return sum(published_bytes_for(group) for group in pool.field_groups)
+def _published_bytes(*, layers, entry_tokens, kv_dtype, num_kv_heads=1, head_dim=256):
+    """One entry's K and V for every layer, head and token, plus an fp32 scale
+    per head and token when the cache is narrower than its values."""
+    scale = torch.float32.itemsize if kv_dtype.itemsize == 1 else 0
+    per_token = num_kv_heads * (head_dim * kv_dtype.itemsize + scale)
+    return layers * 2 * entry_tokens * per_token
 
 
 def _builder_cls():
@@ -140,7 +143,9 @@ def _pool(*, kv_dtype, layers=15, block_size=16):
 class TestMhaRegionsMatchThePublishedPages:
     def test_bf16_published_bytes_are_the_whole_entry(self):
         pool = _pool(kv_dtype=torch.bfloat16)
-        published = _published_bytes(pool)
+        published = _published_bytes(
+            layers=15, entry_tokens=16, kv_dtype=torch.bfloat16
+        )
         _, sizes = layer_major_page_unit_regions([pool])
         assert published == int(sizes.sum()) == pool.entry_bytes
 
@@ -148,7 +153,7 @@ class TestMhaRegionsMatchThePublishedPages:
         """fp8-width fields declare scales. Their group is padded to 256 B,
         and that padding is not a transfer region."""
         pool = _pool(kv_dtype=torch.int8)
-        published = _published_bytes(pool)
+        published = _published_bytes(layers=15, entry_tokens=16, kv_dtype=torch.int8)
         _, sizes = layer_major_page_unit_regions([pool])
         assert published == int(sizes.sum())
         assert published < pool.entry_bytes
@@ -216,7 +221,9 @@ class TestMhaRegionsMatchThePublishedPages:
         pool.allocate(4, "cpu")
         regions = layer_major_page_unit_regions([pool])
         bases, sizes = regions
-        assert int(sizes.sum()) == _published_bytes(pool)
+        assert int(sizes.sum()) == _published_bytes(
+            layers=2, entry_tokens=256, kv_dtype=torch.int8
+        )
         got = layer_major_page_unit_bases(regions, [[0, 2], [1, 3]])
         want = []
         for image in ([0, 2], [1, 3]):

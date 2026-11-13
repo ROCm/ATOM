@@ -30,9 +30,10 @@ def layer_major_page_unit_regions(pools: Iterable) -> tuple[np.ndarray, np.ndarr
     """Base address and per-block stride of every published region.
 
     Order is the pools' ``region_tensors``: all of one field, then the next,
-    which is the order ``AiterAttentionMetadataBuilder.get_kv_transfer_tensors``
-    publishes. One region is one layer of one field, and its stride is one
-    scheduler block.
+    which is the order the builder's ``get_kv_transfer_tensors`` publishes
+    (``AiterAttentionMetadataBuilder``'s MHA pool, or Qwen3.8's QSA arena).
+    One region is one layer of one field, and its stride is one scheduler
+    block.
     """
 
     bases: list[int] = []

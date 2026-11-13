@@ -605,9 +605,9 @@ class LayerMajorArena:
 
     def region_tensors(self) -> list[tuple[str, torch.Tensor]]:
         """One `(role, view(name)[layer])` per (field, layer), in field order."""
-        return [
-            (f"{field.name}.layer_{layer}", view[layer])
-            for field in self.fields
-            for view in (self.view(field.name),)
-            for layer in range(field.layers)
-        ]
+        regions = []
+        for field in self.fields:
+            view = self.view(field.name)
+            for layer in range(field.layers):
+                regions.append((f"{field.name}.layer_{layer}", view[layer]))
+        return regions

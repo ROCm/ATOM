@@ -23,6 +23,7 @@ from atom.model_ops.attentions.qwen4_exp_attn import (
     Qwen4ExpBackend,
     Qwen4ExpMetadataBuilder,
 )
+from atom.plugin.vllm.kv_transfer.mp_page_layout import build_mp_transfer_tensors
 
 
 def qsa_like_fields(block=4):
@@ -198,25 +199,15 @@ def _flydsl_builder(monkeypatch, *, replayssm=False):
 def test_ssm_storage_follows_the_decode_switches(
     monkeypatch, one_tp_rank, env, replayssm, storage
 ):
+    """The layout id and the binding read one decision."""
+    from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadataBuilder
     from atom.model_ops.fla_ops import gdn_flydsl
 
     for name, value in env.items():
         monkeypatch.setenv(name, value)
     try:
-        builder, cls, _ = _flydsl_builder(monkeypatch, replayssm=replayssm)
-        assert builder._ssm_storage == storage
-        layout = _layout_id(builder, cls)
-        assert f":ssm_storage={storage}:" in layout
-    finally:
-        gdn_flydsl.backend.cache_clear()
-
-
-def test_binding_refuses_an_ssm_order_the_layout_id_does_not_say(monkeypatch):
-    from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadataBuilder
-    from atom.model_ops.fla_ops import gdn_flydsl
-
-    try:
-        builder, cls, layer = _flydsl_builder(monkeypatch)
+        builder, cls, layer = _flydsl_builder(monkeypatch, replayssm=replayssm)
+        assert f":ssm_storage={storage}:" in _layout_id(builder, cls)
         state = torch.zeros(2, 2, 128, 128)
         monkeypatch.setattr(
             GDNAttentionMetadataBuilder,
@@ -224,29 +215,28 @@ def test_binding_refuses_an_ssm_order_the_layout_id_does_not_say(monkeypatch):
             lambda self, module: SimpleNamespace(v_cache=state),
         )
         bound = cls._build_gdn_cache_tensor(builder, layer)
-        assert bound.v_cache.stride() == state.transpose(-1, -2).stride()
-        builder._ssm_storage = "kv"
-        with pytest.raises(RuntimeError, match="ssm_storage=kv"):
-            cls._build_gdn_cache_tensor(builder, layer)
+        assert bound.v_cache.is_contiguous() == (storage == "kv")
     finally:
         gdn_flydsl.backend.cache_clear()
 
 
-def test_allocated_ple_state_is_what_the_layout_id_spells(monkeypatch):
-    builder, cls = _builder()
+def test_allocated_ple_state_is_what_the_layout_id_spells(monkeypatch, one_tp_rank):
     from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadataBuilder
 
-    if not torch.cuda.is_available():
-        pytest.skip("allocates the PLE state on the GPU")
+    builder, cls = _builder()
+    builder.device = torch.device("cpu")
     builder.slots_per_req = lambda: 1
     monkeypatch.setattr(
         GDNAttentionMetadataBuilder, "allocate_per_req_cache", lambda self, e: {}
     )
     caches = cls.allocate_per_req_cache(builder, {PLE_STATE_SLOT_CLASS: 4})
     conv, ngram = caches["ple_conv_state"], caches["ple_ngram_state"]
-    # `:ple_conv=(16,10),torch.bfloat16:ple_ngram=(3,),torch.int64`.
-    assert (tuple(conv.shape), conv.dtype) == ((4, 16, 10), torch.bfloat16)
-    assert (tuple(ngram.shape), ngram.dtype) == ((4, 3), torch.int64)
+    assert conv.shape[0] == ngram.shape[0] == 4
+    spelled = "".join(
+        f":ple_{tag}={tuple(state.shape[1:])},{state.dtype}".replace(" ", "")
+        for tag, state in (("conv", conv), ("ngram", ngram))
+    )
+    assert _layout_id(builder, cls).endswith(spelled)
     assert bool((ngram == builder.eos_token_id).all())
     assert cls._ple_state_spec(builder).entry_bytes == conv[0].nbytes + ngram[0].nbytes
 
@@ -364,7 +354,8 @@ def test_a_bf16_target_gives_the_mtp_draft_layer_its_own_rows():
     for layer, row in ((target, 0), (draft, 1)):
         tensor = cls.build_kv_cache_tensor(builder, layer)
         caches, scales = layer.bound
-        handed = (tensor.k_cache, tensor.v_cache, *tensor.extra_planes)
+        assert [role for role, _ in tensor.extra_planes] == names[2:]
+        handed = (tensor.k_cache, tensor.v_cache, *dict(tensor.extra_planes).values())
         for name, bound, view in zip(names, caches, handed, strict=False):
             assert view.data_ptr() == arena.view(name)[row].data_ptr(), name
             assert view.data_ptr() == bound.data_ptr(), name
@@ -401,7 +392,8 @@ def test_every_quantized_qsa_layer_hands_the_codec_the_rows_it_binds(
     kv_cache_dtype, index_cache_dtype, draft_space
 ):
     """The in-process codec moves exactly what a layer registers: every field
-    of its row space, its own row, in the stored order."""
+    of its row space, its own row, in the stored order. The vLLM MP publisher
+    names the same planes after those fields."""
     builder, cls = _builder()
     del builder._qsa_fields  # the real declaration, not `_builder`'s stand-in
     config = builder.model_runner.config
@@ -423,20 +415,22 @@ def test_every_quantized_qsa_layer_hands_the_codec_the_rows_it_binds(
         sfx = "_draft" if layer.qsa_row_space == "qsa_draft" else ""
         row = builder.pool_rows[layer.qsa_row_space][layer]
         tensor = cls.build_kv_cache_tensor(builder, layer)
+        stored = [name for name in _STORED_ORDER if name + sfx in names]
         handed = [
             t.data_ptr()
             for t in (tensor.k_cache, tensor.v_cache, tensor.k_scale, tensor.v_scale)
-            + tensor.extra_planes
+            + tuple(dict(tensor.extra_planes).values())
             if t is not None
         ]
-        assert handed == [
-            arena.view(name + sfx)[row].data_ptr()
-            for name in _STORED_ORDER
-            if name + sfx in names
-        ]
+        assert handed == [arena.view(name + sfx)[row].data_ptr() for name in stored]
         caches, scales = layer.bound
         bound = (*caches, *scales.values())
         assert {t.data_ptr() for t in bound if t is not None} == set(handed)
+        published = build_mp_transfer_tensors([tensor], num_blocks=2).pages
+        roles = {"k": "k_cache", "v": "v_cache"}
+        assert [page.region.semantic_role for page in published] == [
+            f"L{layer.layer_num:04d}.{roles.get(name, name)}" for name in stored
+        ]
 
 
 def test_a_released_arena_leaves_no_page_pools():

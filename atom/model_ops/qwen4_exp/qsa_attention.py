@@ -64,7 +64,6 @@ from atom.model_ops.qwen4_exp.ops.qsa import (
     qsa_store_rows,
 )
 from atom.model_ops.qwen4_exp.qsa_cache_rules import (
-    QSA_DRAFT_ROWS,
     QSA_ROWS,
     qsa_cache_formats,
     qsa_row_space,
@@ -396,19 +395,19 @@ class Qwen4ExpAttention(nn.Module):
         self.v_scale_cache: torch.Tensor | None = None
         self.compressed_key_scale: torch.Tensor | None = None
         # Plugin hosts allocate and bind BF16 caches of their own.
-        self.kv_format, self.index_format = (
-            ("bf16", "bf16") if is_plugin_mode() else qsa_cache_formats(atom_config)
-        )
-        # The MTP draft layer sits past the target stack. It keeps BF16 caches
-        # under quantized target caches, in a row space of its own: an FP8
-        # draft KV costs ~3.5% of the real acceptance length, a BF16 one none.
-        self.qsa_row_space = (
-            QSA_ROWS
-            if is_plugin_mode()
-            else qsa_row_space(atom_config, layer_num, int(config.num_hidden_layers))
-        )
-        if self.qsa_row_space == QSA_DRAFT_ROWS:
-            self.kv_format = self.index_format = "bf16"
+        self.kv_format = self.index_format = "bf16"
+        self.qsa_row_space = QSA_ROWS
+        if not is_plugin_mode():
+            formats = qsa_cache_formats(atom_config)
+            # The MTP draft layer sits past the target stack. It keeps BF16
+            # caches under quantized target caches, in a row space of its own:
+            # an FP8 draft KV costs ~3.5% of the real acceptance length, a BF16
+            # one none.
+            self.qsa_row_space = qsa_row_space(
+                formats, layer_num, int(config.num_hidden_layers)
+            )
+            if self.qsa_row_space == QSA_ROWS:
+                self.kv_format, self.index_format = formats
         self.profile_block_size = getattr(atom_config, "kv_cache_block_size", 64)
 
     def bind_caches(

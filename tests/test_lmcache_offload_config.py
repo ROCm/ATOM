@@ -43,6 +43,16 @@ def _config():
     )
 
 
+def _gdn_config(model_type):
+    """`_config()` turned into a GDN hybrid: neither the compressed attention
+    the hybrid branch claims nor the latent rank `attn_family` reads as MLA."""
+    config = _config()
+    config.hf_config.compress_ratios = None
+    config.hf_config.kv_lora_rank = None
+    config.hf_config.model_type = model_type
+    return config
+
+
 def _lmcache_config():
     return SimpleNamespace(chunk_size=8192)
 
@@ -180,11 +190,8 @@ def test_unknown_explicit_offload_layout_is_rejected(override):
 )
 def test_gdn_linear_model_offload_uses_the_page_image_tier(model_type):
     # The PAGE-image tier already packs `page_unit_views`. Falling through to
-    # `dense` would restore KV over a stale slot. Clear `compress_ratios` so
-    # the hybrid branch does not claim the model first.
-    config = _config()
-    config.hf_config.compress_ratios = None
-    config.hf_config.model_type = model_type
+    # `dense` would restore KV over a stale slot.
+    config = _gdn_config(model_type)
 
     assert offcfg.select_offload_layout(config) == "qwen"
 
@@ -235,9 +242,7 @@ def test_gdn_page_namespace_names_ordinary_mha_pages(model_type):
     # lmcache_mp hashes the PAGE bytes through select_offload_layout. The
     # family name is ``qwen``, which is not a page-mode key, so the pages stay
     # the dense MHA mode. An illegal offload_layout override fails here too.
-    config = _config()
-    config.hf_config.compress_ratios = None
-    config.hf_config.model_type = model_type
+    config = _gdn_config(model_type)
 
     namespace = offcfg.build_page_namespace(config, _lmcache_config(), 4)
     assert namespace.startswith("org/model::atom-page-v")
@@ -276,10 +281,7 @@ def test_qwen38_page_namespace_separates_the_draft_cache_format(monkeypatch):
 def test_draft_cache_format_leaves_other_page_namespaces_unchanged(
     monkeypatch, model_type
 ):
-    config = _config()
-    if model_type is not None:
-        config.hf_config.compress_ratios = None
-        config.hf_config.model_type = model_type
+    config = _config() if model_type is None else _gdn_config(model_type)
     monkeypatch.setenv("ATOM_QSA_DRAFT_KV_BF16", "1")
     before = offcfg.build_page_namespace(config, _lmcache_config(), 4)
     monkeypatch.setenv("ATOM_QSA_DRAFT_KV_BF16", "0")
@@ -291,10 +293,7 @@ def test_image_input_leaves_other_page_namespaces_unchanged(model_type):
     # Their segment set does not depend on it: keying it would only split a
     # tier that text-only and image servers can share, and orphan what is
     # already stored.
-    config = _config()
-    if model_type is not None:
-        config.hf_config.compress_ratios = None
-        config.hf_config.model_type = model_type
+    config = _config() if model_type is None else _gdn_config(model_type)
     before = offcfg.build_page_namespace(config, _lmcache_config(), 4)
     config.multimodal_config = SimpleNamespace()
     assert offcfg.build_page_namespace(config, _lmcache_config(), 4) == before
@@ -307,9 +306,7 @@ def test_image_input_leaves_other_page_namespaces_unchanged(model_type):
 def test_gdn_state_tier_is_not_downgraded_to_dense(model_type):
     # An explicit `dense` override must not strip the state tier. Otherwise a
     # KV prefix is restored over a stale slot.
-    config = _config()
-    config.hf_config.compress_ratios = None
-    config.hf_config.model_type = model_type
+    config = _gdn_config(model_type)
     config.kv_transfer_config = {"offload_layout": "dense"}
 
     with pytest.raises(ValueError, match="owns no tier"):
@@ -335,9 +332,7 @@ def test_offload_layout_override_cannot_downgrade_kimi_k3_to_dense():
 def test_offload_layout_override_cannot_swap_the_two_state_tiers(model_type, override):
     # `qwen` and `kimi_k3` both own a state tier, but each for its own family's
     # state: neither restores the other's, so the swap is refused too.
-    config = _config()
-    config.hf_config.compress_ratios = None
-    config.hf_config.model_type = model_type
+    config = _gdn_config(model_type)
     config.kv_transfer_config = {"offload_layout": override}
 
     with pytest.raises(ValueError, match="owns no tier"):
@@ -625,9 +620,7 @@ def test_only_v41_runs_on_its_layout(model_type, compress_ratios):
 @pytest.mark.parametrize("override", ["dsv41", "kimi_k3"])
 def test_a_state_owning_model_keeps_its_own_layout(override):
     """Another state-owning layout has no tier for this model's state either."""
-    config = _config()
-    config.hf_config.compress_ratios = None
-    config.hf_config.model_type = "qwen3_next"
+    config = _gdn_config("qwen3_next")
     config.kv_transfer_config = {"offload_layout": override}
     with pytest.raises(ValueError, match="owns no tier"):
         offcfg.select_offload_layout(config)

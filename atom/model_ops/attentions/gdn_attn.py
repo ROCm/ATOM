@@ -768,8 +768,8 @@ class GDNStateMixin(PoolRowsMixin):
     #
     # Dormant under `StateTransfer.fork`: nothing produces a store op unless a
     # subclass declares `copy()`. `_KimiMLAGDNCommon` does, over its MLA pool.
-    # `GDNAttentionMetadataBuilder` does for the Qwen GDN/MHA family, over the
-    # MHA pool.
+    # `GDNAttentionMetadataBuilder` does for the Qwen GDN hybrids, over the MHA
+    # pool, and `Qwen4ExpMetadataBuilder` (Qwen3.8) over its QSA arena.
 
     def _checkpoint_layer_ranges(self) -> list[list[tuple[int, int]]]:
         """Per plane, one `(offset, nbytes)` per layer for slot 0.
@@ -1776,7 +1776,8 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
     fuse_mtp_decode_position_update = False
 
     def _uses_paged_checkpoints(self) -> bool:
-        """PAGE image for the Qwen GDN/MHA family; fork otherwise.
+        """PAGE image for the Qwen GDN hybrids, whose pages are the MHA pool or,
+        for Qwen3.8, the QSA arena; fork otherwise.
 
         Off under pipeline parallelism and RapidServe. ``get_num_blocks``
         raises when a copying transfer meets either, and answering yes there
@@ -1943,11 +1944,10 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         """``page_unit_views`` as raw addresses and sizes, for the store's gather."""
         regions = self._page_unit_regions()
         spec = self.model_runner.state_runtime.checkpoint_spec
-        first_region = self._page_unit_pools()[0].region_tensors()[0][1]
         return layer_major_page_unit_segments(
             regions,
             unit_ids,
-            entries=int(first_region.shape[0]),
+            entries=self._page_unit_pools()[0].entries,
             image_bytes=int(spec.image_bytes),
         )
 

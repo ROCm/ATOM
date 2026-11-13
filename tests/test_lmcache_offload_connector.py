@@ -1219,12 +1219,73 @@ def test_dense_codec_keeps_qsa_side_caches_and_ignores_absent_ones():
     v = torch.zeros(blocks, 8, dtype=torch.bfloat16)
     raw = torch.zeros(blocks, 4, dtype=torch.bfloat16)
     comp = torch.zeros(blocks, 2, dtype=torch.bfloat16)
-    qsa = KVCacheTensor(layer_num=0, k_cache=k, v_cache=v, extra_planes=(raw, comp))
+    qsa = KVCacheTensor(
+        layer_num=0,
+        k_cache=k,
+        v_cache=v,
+        extra_planes=(("index_raw", raw), ("index_compressed", comp)),
+    )
     plain = KVCacheTensor(layer_num=1, k_cache=k, v_cache=v)
     qsa_codec = DenseKVByteCodec({"qsa": qsa}, num_blocks=blocks)
     plain_codec = DenseKVByteCodec({"mha": plain}, num_blocks=blocks)
     assert qsa_codec.bytes_per_block == (8 + 8 + 4 + 2) * 2
     assert plain_codec.bytes_per_block == (8 + 8) * 2
+
+
+def _block_planes(blocks, *widths):
+    import torch
+
+    return [torch.zeros(blocks, width, dtype=torch.uint8) for width in widths]
+
+
+def test_mp_page_layout_publishes_qsa_side_planes_by_name():
+    """The vLLM MP publisher names each extra plane after its field, whichever
+    of them a layer's formats leave out, and a layer with none publishes only
+    its KV."""
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+    from atom.config import KVCacheTensor
+    from atom.plugin.vllm.kv_transfer.mp_page_layout import build_mp_transfer_tensors
+
+    blocks = 4
+    k, v, raw, comp, scale, latent = _block_planes(blocks, 8, 8, 4, 2, 1, 8)
+    # No `rope_positions`: the layout has no image input.
+    qsa = KVCacheTensor(
+        layer_num=0,
+        k_cache=k,
+        v_cache=v,
+        extra_planes=(
+            ("index_raw", raw),
+            ("index_compressed", comp),
+            ("index_compressed_scale", scale),
+        ),
+    )
+    mla = KVCacheTensor(layer_num=1, k_cache=latent)
+    pages = build_mp_transfer_tensors([qsa, mla], num_blocks=blocks).pages
+    assert [page.region.semantic_role for page in pages] == [
+        "L0000.k_cache",
+        "L0000.v_cache",
+        "L0000.index_raw",
+        "L0000.index_compressed",
+        "L0000.index_compressed_scale",
+        "L0001.k_cache",
+    ]
+
+
+def test_mp_page_layout_refuses_an_extra_plane_it_cannot_name():
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+    from atom.config import KVCacheTensor
+    from atom.plugin.vllm.kv_transfer.mp_page_layout import build_mp_transfer_tensors
+
+    k, other = _block_planes(4, 8, 2)
+    tensor = KVCacheTensor(layer_num=0, k_cache=k, extra_planes=(("other", other),))
+    with pytest.raises(ValueError, match="other"):
+        build_mp_transfer_tensors([tensor], num_blocks=4)
 
 
 def test_lmcache_connector_maps_dcp_ranges_on_virtual_block_grid():
