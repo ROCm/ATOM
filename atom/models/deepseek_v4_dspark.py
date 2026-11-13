@@ -571,6 +571,7 @@ class DSparkLayer(Block):  # type: ignore[misc]
         self,
         main_x: torch.Tensor,  # [T, dim]  target hidden(s)
         positions: torch.Tensor,  # [T]
+        slot_mapping: torch.Tensor | None = None,  # unused: addressed by position
     ) -> None:
         """Write target-KV rows into each request's rolling window.
 

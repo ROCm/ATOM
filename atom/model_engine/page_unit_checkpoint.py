@@ -14,6 +14,7 @@ from time import monotonic
 from atom.kv_transfer.disaggregation.types import StateStoreOperationId
 from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.sequence import Sequence
+from atom.model_ops.attentions.pool_layout.sub_pool_spec import page_entry_bytes
 
 _CHANGE_LOG_LIMIT = 4096
 
@@ -141,6 +142,32 @@ class PagedStateCheckpointSpec:
             pipeline_units=wire.get("pipeline_units", 0),  # type: ignore[arg-type]
             pipeline_op_bytes=wire.get("pipeline_op_bytes", 0),  # type: ignore[arg-type]
         )
+
+
+def published_page_unit_bytes(builder) -> int:
+    """Bytes of one PAGE unit a checkpoint transfer publishes for `builder`.
+
+    The state image lives in the target's own PAGE rows, so the unit is the
+    target builder's share of the paged class, not the merged entry: a draft
+    KV pool joined to the same class is ordinary KV after those rows. A
+    backend whose charged share exceeds what it publishes (alignment padding
+    that is not a region) narrows it with `checkpoint_page_unit_bytes()`;
+    `None` keeps the share.
+    """
+    unit = page_entry_bytes(builder.sub_pool_specs())
+    if unit <= 0:
+        raise RuntimeError(f"{type(builder).__name__} declares no PAGE bytes")
+    published_unit = getattr(builder, "checkpoint_page_unit_bytes", None)
+    published = published_unit() if callable(published_unit) else None
+    if published is None:
+        return unit
+    published = int(published)
+    if published <= 0 or published > unit:
+        raise RuntimeError(
+            f"checkpoint PAGE unit is {published} B but "
+            f"{type(builder).__name__} declares {unit} B per block"
+        )
+    return published
 
 
 def checkpoint_copy_ops_per_batch(max_num_seqs: int) -> int:
