@@ -618,8 +618,12 @@ class WritePathTest(unittest.TestCase):
         conn._done_sending_lock = threading.Lock()
         conn._write_ids = {}
         conn._finished_writes = collections.deque()
-        conn._kv_ready_events = {}
+        # The prefill of the transfer push_request asks for has finished.
+        prefilled = FakeEvent()
+        prefilled.done = True
+        conn._kv_ready_events = {9: prefilled}
         conn._kv_ready_batches = collections.deque()
+        conn._kv_ready_expired = {}
         conn._kv_ready_lock = threading.Lock()
         conn._gated_writes = collections.deque()
         conn._state_tensors = {}
@@ -881,16 +885,43 @@ class WritePathTest(unittest.TestCase):
         event.done = True
         conn._service_write_requests()
         self.assertIn(9, conn._sending_writes)
-        self.assertEqual(conn._kv_ready_events, {})
+        # Another consumer rank may still ask for this transfer.
+        self.assertIs(conn._kv_ready_events[9], event)
 
-    def test_a_push_without_a_ready_event_starts_and_old_events_expire(self):
+    def test_a_push_waits_until_its_prefill_records_a_forward(self):
+        # The head rank returned the token, this rank's forward is not done.
         conn = self.make(producer=True)
+        conn._kv_ready_events = {}
         conn._write_target_ready = lambda request: True
         conn._write_blocks = lambda request, engine_id: [FakeStatus()]
         conn._write_requests.put(self.push_request())
         conn._service_write_requests()
+        self.assertEqual(conn._sending_writes, {})
+        self.assertEqual(len(conn._pending_writes), 1)
+
+        with mock.patch("torch.cuda.Event", FakeEvent), mock.patch(
+            "torch.cuda.current_stream", lambda: None
+        ):
+            conn.record_kv_cache_ready([9])
+        conn._kv_ready_events[9].done = True
+        conn._service_write_requests()
         self.assertIn(9, conn._sending_writes)
 
+    def test_a_push_whose_prefill_never_reports_fails_after_the_write_timeout(self):
+        conn = self.make(producer=True)
+        conn._kv_ready_events = {}
+        conn._write_target_ready = lambda request: True
+        conn._write_blocks = lambda request, engine_id: self.fail("pushed")
+        finished = []
+        conn._finish_write = lambda request, ok: finished.append(ok)
+        conn._pending_writes = [(self.push_request(), time.monotonic() - 601.0)]
+        with self.assertLogs("atom", "ERROR") as logs:
+            conn._service_write_requests()
+        self.assertEqual(finished, [False])
+        self.assertIn("no finished forward", logs.output[0])
+
+    def test_old_ready_events_expire_but_their_prefills_stay_finished(self):
+        conn = self.make(producer=True)
         stale, kept = FakeEvent(), FakeEvent()
         conn._kv_ready_events = {1: stale, 2: kept}
         conn._kv_ready_batches.append((time.monotonic() - 1e6, stale, [1, 2]))
@@ -899,8 +930,11 @@ class WritePathTest(unittest.TestCase):
         ):
             conn.record_kv_cache_ready([2, 3])
         self.assertNotIn(1, conn._kv_ready_events)
+        self.assertTrue(conn._source_ready(1))
         # Re-recorded since, so the stale batch must not drop it.
         self.assertIs(conn._kv_ready_events[2], conn._kv_ready_events[3])
+        self.assertNotIn(2, conn._kv_ready_expired)
+        self.assertFalse(conn._source_ready(2))
 
     def test_the_consumer_asks_for_a_push_once_earlier_forwards_finished(self):
         conn = self.make(producer=False)
