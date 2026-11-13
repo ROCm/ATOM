@@ -882,9 +882,8 @@ class BlockGPUConnector:
         Each group flows ``stage_a`` -> ``stage_b`` on their respective streams,
         handed off via the staging buffer's ready event; the free event gates a
         later group's reuse of the same buffer. ``stage_b``'s stream produces
-        the observable result. A fresh completion event fences only this
-        operation's submitted work. An exception fences both streams; an
-        unconfirmed fence permanently
+        the observable result; a fresh completion event fences this operation. An
+        exception fences both streams; an unconfirmed fence permanently
         quarantines that tensor and its prepared block IDs, forcing fresh
         allocation on the next call.
         """
@@ -899,17 +898,33 @@ class BlockGPUConnector:
                     self._quarantined_block_id_owners.append(block_id_owner)
             return False
 
-        run_staged_pipeline(
-            state,
-            groups,
-            stage_a=stage_a,
-            stage_b=stage_b,
-            ensure_buffer=self._ensure_staging_buffer,
-            group_nbytes=lambda group: group.nbytes,
-            release_buffer=self._release_staging_buffer_if_requested,
-            recover_buffer=recover,
-            stage_b_enqueued=stage_b_enqueued,
-        )
+        def group_enqueued(group, operation):
+            if stage_b_enqueued is not None:
+                stage_b_enqueued(group, operation)
+            if block_id_owner is not None and group is groups[-1]:
+                self.codec.record_prepared_block_id_completion(block_id_owner)
+
+        try:
+            run_staged_pipeline(
+                state,
+                groups,
+                stage_a=stage_a,
+                stage_b=stage_b,
+                ensure_buffer=self._ensure_staging_buffer,
+                group_nbytes=lambda group: group.nbytes,
+                release_buffer=self._release_staging_buffer_if_requested,
+                recover_buffer=recover,
+                stage_b_enqueued=group_enqueued,
+            )
+        except BaseException:
+            if block_id_owner is not None:
+                self.codec.finish_prepared_block_id_groups(block_id_owner, safe=False)
+            raise
+        else:
+            # run_staged_pipeline already performed its operation completion fence;
+            # no new synchronize is introduced, and failure never frees IDs.
+            if block_id_owner is not None:
+                self.codec.finish_prepared_block_id_groups(block_id_owner, safe=True)
 
     def from_gpu(self, memory_obj: Any, start: int, end: int, **kwargs) -> None:
         self.batched_from_gpu([memory_obj], [start], [end], **kwargs)

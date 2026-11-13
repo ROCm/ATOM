@@ -19,6 +19,7 @@ import atom.kv_transfer.offload.hybrid.m3.codec as m3_codec
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload.capabilities import replays_state
 from atom.kv_transfer.offload.dense.kv_byte_codec import DenseKVByteCodec
+from atom.kv_transfer.offload.metadata_lease import METADATA_GPU_RESERVE_BYTES
 from atom.kv_transfer.offload.page_codec import pure_page_codec
 
 # Bumped when the dense codec's per-chunk byte layout changes.
@@ -36,6 +37,8 @@ class MooncakeLayout:
 
     codec_id: Callable[[], str]
     build: CodecBuilder
+    # PAGE codecs upload their block IDs through a per-thread metadata lease.
+    metadata_leases: bool = False
 
 
 def _dense_codec_id() -> str:
@@ -88,8 +91,10 @@ def _build_replay_pages(
 
 MOONCAKE_LAYOUTS: dict[str, MooncakeLayout] = {
     "dense": MooncakeLayout(_dense_codec_id, _build_dense),
-    "m3": MooncakeLayout(_m3_codec_id, _build_m3),
-    "dsv41": MooncakeLayout(_replay_codec_id, _build_replay_pages),
+    "m3": MooncakeLayout(_m3_codec_id, _build_m3, metadata_leases=True),
+    "dsv41": MooncakeLayout(
+        _replay_codec_id, _build_replay_pages, metadata_leases=True
+    ),
 }
 
 
@@ -102,6 +107,12 @@ def require_mooncake_layout(name: str) -> MooncakeLayout:
             "the Mooncake Store offload moves the dense KV layout, M3 PAGE "
             f"layout, and V4.1's replay PAGEs; this model resolves to {name!r}"
         ) from None
+
+
+def metadata_reserve_bytes(config: Any) -> int:
+    """HBM one transfer thread's metadata lease pool may hold."""
+    layout = require_mooncake_layout(offcfg.select_offload_layout(config))
+    return METADATA_GPU_RESERVE_BYTES if layout.metadata_leases else 0
 
 
 def mooncake_codec_id(config: Any) -> str:

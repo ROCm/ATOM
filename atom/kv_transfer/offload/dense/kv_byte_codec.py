@@ -200,6 +200,16 @@ class DenseKVByteCodec:
     def has_fused_chunk_major_staging(self) -> bool:
         return self._fused_kv_staging is not None
 
+    # Dense prepared IDs hold no pooled metadata, and a Store slot run is
+    # restored through the contiguous view only.
+    supports_strided_restore = False
+
+    def record_prepared_block_id_completion(self, owner) -> None:
+        pass
+
+    def finish_prepared_block_id_groups(self, owner, *, safe: bool) -> None:
+        pass
+
     # -- helpers ----------------------------------------------------------
     def _device_ctx(self):
         if self._device.type == "cuda":

@@ -119,6 +119,21 @@ def contract(monkeypatch):
     for api in ("synchronize", "current_stream", "current_device", "Stream", "Event"):
         monkeypatch.setattr(torch.cuda, api, forbidden)
     monkeypatch.setattr(codec, "_region_plan", lambda kind, *, stream: plan)
+
+    class FakeCpuGpuBuffer:
+        def __init__(self, n, *, dtype, device):
+            assert dtype == torch.int64 and device == codec.device
+            self.cpu = torch.zeros(n, dtype=dtype)
+            self.np = self.cpu.numpy()
+            self.gpu = self.cpu.clone().as_subclass(_CudaTensor)
+
+        def copy_to_gpu(self, n):
+            self.gpu[:n].copy_(upload(self.np[:n].tolist(), codec.device))
+            return self.gpu[:n]
+
+    monkeypatch.setattr(
+        "atom.kv_transfer.offload.hybrid.dsv4.codec.CpuGpuBuffer", FakeCpuGpuBuffer
+    )
     monkeypatch.setattr(module, "_static_device_i64", upload)
     monkeypatch.setattr(module, "_device_i64", forbidden)
     monkeypatch.setattr(module, "_gather_region_items_kernel", Kernel("gather"))
@@ -137,6 +152,27 @@ def _prepare(contract, groups):
     return contract.codec.prepare_block_id_groups(
         groups, device=contract.codec.device, stream=contract.stream
     )
+
+
+def test_retired_prepared_owner_cannot_read_reused_metadata(contract, monkeypatch):
+    class DoneEvent:
+        def record(self, stream):
+            assert stream is contract.stream
+
+        def query(self):
+            return True
+
+    monkeypatch.setattr(torch.cuda, "Event", DoneEvent)
+    owner = _prepare(contract, [[[1], [2]]])
+    contract.codec.record_prepared_block_id_completion(owner)
+    contract.codec.finish_prepared_block_id_groups(owner, safe=True)
+    next_owner = _prepare(contract, [[[3], [4]]])
+    assert next_owner._metadata_lease is owner._metadata_lease
+    assert next_owner._metadata_generation > owner._metadata_generation
+    with pytest.raises(ValueError, match="no longer active"):
+        contract.codec.chunk_major_device_buffer_to_gpu_prepared(
+            _buffer(8), owner, 0, stream=contract.stream
+        )
 
 
 @pytest.mark.parametrize(
@@ -165,7 +201,10 @@ def test_one_upload_preserves_group_order_and_kernel_arguments(
     for _, _, args, kwargs in contract.launches:
         assert args[0] is payload
         assert args[9:] == (0, 4)
-        assert kwargs == {"REVERSE": False, "TILE": 1024, "num_warps": 8}
+        expected_kwargs = {"REVERSE": False, "TILE": 1024, "num_warps": 8}
+        if direction == "scatter":
+            expected_kwargs.update(ITEMS_PER_CHUNK=1, CHUNK_STRIDE=4)
+        assert kwargs == expected_kwargs
         assert (
             args[1].untyped_storage().data_ptr()
             == owner._device_ids.untyped_storage().data_ptr()

@@ -203,6 +203,8 @@ def _scatter_region_items_kernel(
     tile_valid_bytes,
     input_buffer_offset,
     bytes_per_item,
+    ITEMS_PER_CHUNK: tl.constexpr,
+    CHUNK_STRIDE: tl.constexpr,
     REVERSE: tl.constexpr,
     TILE: tl.constexpr,
 ):
@@ -224,7 +226,8 @@ def _scatter_region_items_kernel(
     source = (
         input
         + input_buffer_offset
-        + item_pos.to(tl.int64) * bytes_per_item
+        + (item_pos.to(tl.int64) // ITEMS_PER_CHUNK) * CHUNK_STRIDE
+        + (item_pos.to(tl.int64) % ITEMS_PER_CHUNK) * bytes_per_item
         + tl.load(tile_output_offset + tile_id).to(tl.int64)
         + lanes
     )
@@ -367,6 +370,8 @@ def _scatter_region_items_unchecked(
     buffer_offset: int,
     stream: torch.cuda.Stream | None,
     prepared_item_ids: torch.Tensor | None = None,
+    items_per_chunk: int = 1,
+    chunk_stride_bytes: int | None = None,
 ) -> None:
     """Launch a scatter whose plan, ids, buffer, offset, and stream are validated."""
 
@@ -393,6 +398,12 @@ def _scatter_region_items_unchecked(
             plan.tile_valid_bytes,
             offset,
             plan.bytes_per_item,
+            ITEMS_PER_CHUNK=items_per_chunk,
+            CHUNK_STRIDE=(
+                plan.bytes_per_item
+                if chunk_stride_bytes is None
+                else chunk_stride_bytes
+            ),
             REVERSE=plan.reverse,
             TILE=TILE_BYTES,
             num_warps=8,
